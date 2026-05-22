@@ -55,7 +55,7 @@ void validateExternalWeightTensor(nvinfer1::ICudaEngine const& engine, Tensor co
             + ", external weight dtype=" + std::to_string(static_cast<int32_t>(tensor.getDataType())));
 
     // Externalized weights are exported with fully-static shapes (see
-    // experimental/llm_loader/external_weights.py::_add_external_weight_inputs),
+    // tensorrt_edgellm/external_weights.py::_add_external_weight_inputs),
     // so the engine's declared shape carries no -1 dims.
     nvinfer1::Dims const expectedDims = engine.getTensorShape(tensorName.c_str());
     ELLM_CHECK(!hasDynamicDims(expectedDims),

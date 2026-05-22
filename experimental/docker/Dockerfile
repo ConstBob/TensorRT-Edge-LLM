@@ -49,7 +49,7 @@ WORKDIR ${EDGELLM_HOME}
 RUN experimental/docker/build.sh
 
 ENV EDGELLM_PLUGIN_PATH=/opt/TensorRT-Edge-LLM/build/libNvInfer_edgellm_plugin.so \
-    PYTHONPATH=/opt/TensorRT-Edge-LLM:/opt/TensorRT-Edge-LLM/experimental:/opt/TensorRT-Edge-LLM/build/pybind \
+    PYTHONPATH=/opt/TensorRT-Edge-LLM:/opt/TensorRT-Edge-LLM/build/pybind \
     LD_LIBRARY_PATH=/opt/TensorRT-Edge-LLM/build:/opt/TensorRT-Edge-LLM/build/pybind:${TRT_PACKAGE_DIR}/lib:${TRT_PACKAGE_DIR}/lib64:/usr/local/cuda/lib64:/usr/local/cuda/targets/sbsa-linux/lib:/usr/local/cuda/targets/aarch64-linux/lib:${LD_LIBRARY_PATH}
 
 WORKDIR /opt/TensorRT-Edge-LLM

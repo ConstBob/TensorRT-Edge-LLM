@@ -139,16 +139,15 @@ def check_requirements(*, _module_import_guard: bool = False) -> None:
 
 check_requirements(_module_import_guard=True)
 
-_EXPERIMENTAL = os.path.join(str(_REPO_ROOT), "experimental")  # noqa: E402
-if _EXPERIMENTAL not in sys.path:
-    sys.path.insert(0, _EXPERIMENTAL)
-from llm_loader.config import NVFP4_MOE_BACKEND_THOR, QUANT_NVFP4
-from llm_loader.config import ModelConfig as LLConfig  # noqa: E402
-from llm_loader.config import QuantConfig as LLQuantConfig
-from llm_loader.models.linear import NVFP4Linear  # noqa: E402
-from llm_loader.models.nemotron_h.modeling_nemotron_h import \
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from tensorrt_edgellm.config import NVFP4_MOE_BACKEND_THOR, QUANT_NVFP4
+from tensorrt_edgellm.config import ModelConfig as LLConfig  # noqa: E402
+from tensorrt_edgellm.config import QuantConfig as LLQuantConfig
+from tensorrt_edgellm.models.linear import NVFP4Linear  # noqa: E402
+from tensorrt_edgellm.models.nemotron_h.modeling_nemotron_h import \
     NemotronHMoEMLP  # noqa: E402
-from llm_loader.models.qwen3_moe.modeling_qwen3_moe import \
+from tensorrt_edgellm.models.qwen3_moe.modeling_qwen3_moe import \
     Qwen3SparseMoeBlock  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -453,7 +452,7 @@ def _create_toy_qwen3_moe_block(
     dim = I.  NemotronHMoEMLP forces both up and down to use the same
     ``moe_intermediate_size``, so we repack manually.
     """
-    from llm_loader.checkpoint.repacking import (
+    from tensorrt_edgellm.checkpoint.repacking import (
         repack_nvfp4_expert_down_prefill_raw,
         repack_nvfp4_expert_up_prefill_raw)
 

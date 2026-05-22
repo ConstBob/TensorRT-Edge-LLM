@@ -161,11 +161,10 @@ from pathlib import Path
 
 source_files = [
     Path("requirements.txt"),
-    Path("experimental/llm_loader/requirements.txt"),
+    Path("requirements-server.txt"),
 ]
 skip_prefixes = (
     "torch",
-    "torchvision",
     "numpy",
 )
 seen = set()
@@ -187,9 +186,6 @@ Path("/tmp/tensorrt_edge_llm_requirements.txt").write_text("\n".join(lines) + "\
 PY
 
 "${PIP_INSTALL[@]}" -r /tmp/tensorrt_edge_llm_requirements.txt
-"${PIP_INSTALL[@]}" \
-    fastapi \
-    'uvicorn[standard]'
 "${PIP_INSTALL[@]}" --no-deps -e .
 
 pybind11_dir="$(python3 -m pybind11 --cmakedir)"

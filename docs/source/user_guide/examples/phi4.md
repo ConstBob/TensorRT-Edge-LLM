@@ -15,7 +15,7 @@ export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Phi-4-multimodal-instruct
 export MODEL_DIR=$WORKSPACE_DIR/$MODEL_NAME
 export EDGE_LLM_PATH=$HOME/tensorrt-edge-llm   # path to TensorRT-Edge-LLM repo root
-export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
+export PYTHONPATH=$EDGE_LLM_PATH:$PYTHONPATH
 mkdir -p $WORKSPACE_DIR
 cd $WORKSPACE_DIR
 
@@ -24,21 +24,21 @@ git clone https://huggingface.co/microsoft/Phi-4-multimodal-instruct
 cd Phi-4-multimodal-instruct && git lfs pull && cd ..
 
 # Merge vision LoRA adapter into base model
-python -m llm_loader.lora.merge_lora_cli \
+tensorrt-edgellm-merge-lora \
   --model_dir Phi-4-multimodal-instruct \
   --lora_dir Phi-4-multimodal-instruct/vision-lora \
   --output_dir $MODEL_DIR/merged
 
 # Quantize merged model
 cd $EDGE_LLM_PATH
-python -m experimental.quantization llm \
+tensorrt-edgellm-quantize llm \
   --model_dir $MODEL_DIR/merged \
   --output_dir $MODEL_DIR/quantized \
   --quantization nvfp4 \
   --lm_head_quantization nvfp4
 
 # Export language model and visual encoder
-python -m llm_loader.export_all_cli \
+tensorrt-edgellm-export \
   $MODEL_DIR/quantized \
   $MODEL_DIR/onnx
 ```

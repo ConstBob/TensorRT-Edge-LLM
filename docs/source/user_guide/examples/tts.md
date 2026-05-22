@@ -12,7 +12,7 @@ This guide covers the full pipeline for running Qwen3-TTS: export on x86 host, e
 
 ## Part 0: Install Export Dependencies (x86 Host)
 
-Qwen3-TTS export is handled by `llm_loader` directly. No external Qwen3-TTS
+Qwen3-TTS export is handled by `tensorrt_edgellm` directly. No external Qwen3-TTS
 Python package is required for export.
 
 ```bash
@@ -20,23 +20,22 @@ cd TensorRT-Edge-LLM
 python3 -m venv venv
 source venv/bin/activate
 pip3 install -r requirements.txt
-pip3 install -r experimental/llm_loader/requirements.txt
 ```
 
 ---
 
 ## Part 1: Export on x86 Host
 
-Qwen3-TTS has three components: Talker, CodePredictor, and Code2Wav. Export all of them with `llm_loader.export_all_cli`.
+Qwen3-TTS has three components: Talker, CodePredictor, and Code2Wav. Export all of them with `tensorrt-edgellm-export`.
 
 ```bash
 cd TensorRT-Edge-LLM
-export PYTHONPATH=$PWD/experimental:$PYTHONPATH
+export PYTHONPATH=$PWD:$PYTHONPATH
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export TTS_MODEL=Qwen3-TTS-12Hz-1.7B-CustomVoice
 export ONNX_OUTPUT_DIR=$WORKSPACE_DIR/$TTS_MODEL/onnx
 
-python3 -m llm_loader.export_all_cli \
+tensorrt-edgellm-export \
     Qwen/$TTS_MODEL \
     $ONNX_OUTPUT_DIR
 ```

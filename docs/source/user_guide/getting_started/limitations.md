@@ -4,8 +4,8 @@ This page documents the known limitations and issues for each release version of
 
 ## 0.7.0
 
-- ~~`experimental.quantization` exposes FP8 visual-tower quantization for supported VLM checkpoints. Other visual-tower precisions are not exposed in this release.~~ Fixed in 0.7.1.
-- ~~Qwen3-TTS is supported end-to-end through a hybrid export workflow: `llm_loader` exports Talker and CodePredictor, while Code2Wav tokenizer-decoder export uses the deprecated audio exporter.~~ Fixed in 0.7.1.
+- ~~`tensorrt-edgellm-quantize` exposes FP8 visual-tower quantization for supported VLM checkpoints. Other visual-tower precisions are not exposed in this release.~~ Fixed in 0.7.1.
+- ~~Qwen3-TTS is supported end-to-end through a hybrid export workflow.~~ Fixed in 0.7.1.
 - Reduced-vocabulary exports with packed INT4 LM heads require `group_size=128` and a reduced vocabulary size that is a multiple of 128.
 
 ## 0.6.1

@@ -114,7 +114,7 @@ Per iteration, per slot with a channel:
 
 Key property: output is always well-formed UTF-8, whether the input contained valid multi-token codepoints, adversarial isolated continuation bytes, or both.
 
-## Non-streaming back-compat
+## Non-Streaming Path
 
 When `request.streamChannels.empty()`, `slotStreams[i].channel` is null, all five insertion points short-circuit. Zero overhead on the non-streaming path. One intentional content-level change: `Tokenizer::decode` routes output through `sanitizeUtf8Streaming + Flush` so invalid-byte adversarial outputs surface as U+FFFD in `response.outputTexts` — a latent-bug fix, bytes are identical for all valid outputs.
 

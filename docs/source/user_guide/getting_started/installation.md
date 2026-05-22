@@ -3,14 +3,14 @@
 
 TensorRT Edge-LLM has two separate components that need to be installed on different systems:
 
-1. **Experimental Quantization and `llm_loader`** (runs on x86 host with GPU)
+1. **Quantization and `tensorrt_edgellm`** (runs on x86 host with GPU)
 2. **C++ Runtime** (Jetson Thor, NVIDIA DRIVE / DriveOS, or optional x86 developer build)
 
 ---
 
-## Part 1: Experimental Quantization and `llm_loader` (x86 Host with GPU)
+## Part 1: Quantization and `tensorrt_edgellm` (x86 Host with GPU)
 
-The experimental quantization package and `llm_loader` convert and quantize models. This must run on an x86 Linux system with an NVIDIA GPU.
+The quantization package and `tensorrt_edgellm` convert and quantize models. This must run on an x86 Linux system with an NVIDIA GPU.
 
 ### System Requirements
 
@@ -91,56 +91,53 @@ python3 -m venv venv
 source venv/bin/activate
 ```
 
-Install the base and checkpoint-based loader dependencies. Add the standalone
-quantization dependencies only when you run `experimental.quantization`. Do not
-install the repository as a pip package for this workflow; the examples run
-directly from the checkout through `PYTHONPATH`.
+Install the base checkpoint export dependencies. Optional tool dependencies stay
+out of the base environment so export-only and server images do not pull
+quantization, audio, and LoRA-merge packages unnecessarily.
 
 ```bash
-# Required for llm_loader export, high-level API, and server workflows
+# Required for checkpoint export
 pip3 install -r requirements.txt
-pip3 install -r experimental/llm_loader/requirements.txt
 
-# Required only when running experimental.quantization
-pip3 install -r experimental/quantization/requirements.txt
+# Required for quantization, LoRA merge, vocabulary reduction, audio preprocessing,
+# and tokenizer helpers
+pip3 install ".[tools]"
+
+# Required only for experimental/server
+pip3 install -r requirements-server.txt
 ```
 
-This installs all required Python dependencies including:
+The base install includes:
 - PyTorch
 - Transformers
-- NVIDIA Model Optimizer
 - ONNX
 - ONNX Script and ONNX GraphSurgeon
-- And all other required dependencies
 
-> **Note:** For specific version requirements, please refer to `requirements.txt`, `experimental/llm_loader/requirements.txt`, `experimental/quantization/requirements.txt`, and `pyproject.toml`.
+The optional `tools` extra adds NVIDIA Model Optimizer, calibration datasets,
+audio preprocessing dependencies, LoRA merge dependencies, and tokenizer helpers.
 
-**3. Configure and Verify the Experimental Export Workflow**
+> **Note:** Accuracy evaluation dependencies live under `examples/accuracy/requirements.txt`.
+
+**3. Configure and Verify the Checkpoint Export Workflow**
 
 Use the virtual environment created in Step 2 for this checkout. Do not mix
 packages from older release branches into the same environment.
 
-The recommended export path is `experimental.quantization` -> `llm_loader`.
+The recommended export path is `tensorrt-edgellm-quantize` -> `tensorrt-edgellm-export`.
 Use the quantization package only when you need to create a unified quantized
 checkpoint from an FP16/BF16 source checkpoint before export. Pre-quantized
-HuggingFace checkpoints can be exported directly with `llm_loader`.
+HuggingFace checkpoints can be exported directly with `tensorrt-edgellm-export`.
 
 ```bash
 export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
-export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
+export PYTHONPATH=$EDGE_LLM_PATH:$PYTHONPATH
 
 # Verify the recommended quantization, export, LoRA, and vocabulary tools
-python -m experimental.quantization --help
-python -m llm_loader.export_all_cli --help
-python -m llm_loader.lora.merge_lora_cli --help
-python -m llm_loader.vocab_reduction --help
+tensorrt-edgellm-quantize --help
+tensorrt-edgellm-export --help
+tensorrt-edgellm-merge-lora --help
+tensorrt-edgellm-reduce-vocab --help
 ```
-
-The deprecated `tensorrt_edgellm/` export package remains available in 0.7.1 for
-compatibility and for components that are not yet fully covered by
-`llm_loader`. It will be removed in 0.8.0 after the
-`experimental/quantization` -> `experimental/llm_loader` workflow reaches full
-feature parity for all models and features.
 
 **4. Configure HuggingFace Access (Optional)**
 
@@ -164,7 +161,7 @@ hf auth login
 
 > **For the quick start guide:** You can skip this step and proceed to verification.
 
-**You're done with export pipeline setup!** You can now quantize and export models with the experimental workflow. The ONNX files will be transferred to the Edge device for runtime deployment.
+**You're done with export pipeline setup!** You can now quantize and export models with the checkpoint-based workflow. The ONNX files will be transferred to the Edge device for runtime deployment.
 
 ---
 
@@ -303,12 +300,12 @@ After installation, proceed to the [Quick Start Guide](quick-start-guide.md) for
 **Issue: Python module import errors**
 
 Solution: Ensure the virtual environment is activated and `PYTHONPATH` points to
-both the repository root and `experimental/`:
+the repository root:
 ```bash
 source venv/bin/activate
 export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
-export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
-python -m llm_loader.export_all_cli --help
+export PYTHONPATH=$EDGE_LLM_PATH:$PYTHONPATH
+tensorrt-edgellm-export --help
 ```
 
 **Issue: `nvcc: command not found`**
@@ -346,7 +343,7 @@ make -j  # Instead of make -j$(nproc)
 
 ## Uninstalling
 
-**Experimental Quantization and `llm_loader` (x86 Host):**
+**Quantization and `tensorrt_edgellm` (x86 Host):**
 - Deactivate and remove virtual environment: `deactivate && rm -rf venv`
 - Remove repository (optional): `rm -rf TensorRT-Edge-LLM`
 

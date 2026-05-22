@@ -1,6 +1,6 @@
 # LoRA (Low-Rank Adaptation)
 
-TensorRT Edge-LLM supports LoRA through the checkpoint-based `llm_loader` workflow.
+TensorRT Edge-LLM supports LoRA through the checkpoint-based `tensorrt_edgellm` workflow.
 
 Use dynamic LoRA when you need to select adapters at runtime. Use static LoRA
 merge when the adapter is always required, such as the Phi-4-Multimodal
@@ -10,7 +10,7 @@ merge when the adapter is always required, such as the Phi-4-Multimodal
 
 ```bash
 export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
-export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
+export PYTHONPATH=$EDGE_LLM_PATH:$PYTHONPATH
 ```
 
 ## Dynamic Runtime LoRA
@@ -20,21 +20,21 @@ graph, processes HuggingFace adapter weights, then builds an engine with a
 maximum adapter rank.
 
 ```bash
-# Step 1: Export the base model with llm_loader
-python -m llm_loader.export_all_cli \
+# Step 1: Export the base model with tensorrt_edgellm
+tensorrt-edgellm-export \
   /path/to/base_model \
   /tmp/onnx_output
 
 # Step 2: Insert LoRA support into the exported LLM graph
-python -m llm_loader.lora.insert_lora_cli \
+tensorrt-edgellm-insert-lora \
   --onnx_dir /tmp/onnx_output/llm
 
 # Step 3: Convert each adapter to the runtime sidecar format
-python -m llm_loader.lora.process_lora_weights_cli \
+tensorrt-edgellm-process-lora \
   --input_dir /path/to/adapter1 \
   --output_dir /tmp/onnx_output/llm/lora_weights/adapter1
 
-python -m llm_loader.lora.process_lora_weights_cli \
+tensorrt-edgellm-process-lora \
   --input_dir /path/to/adapter2 \
   --output_dir /tmp/onnx_output/llm/lora_weights/adapter2
 
@@ -59,20 +59,20 @@ checkpoint before optional quantization and ONNX export.
 
 ```bash
 # Step 1: Merge LoRA into the base checkpoint
-python -m llm_loader.lora.merge_lora_cli \
+tensorrt-edgellm-merge-lora \
   --model_dir Phi-4-multimodal-instruct \
   --lora_dir Phi-4-multimodal-instruct/vision-lora \
   --output_dir merged_model
 
 # Step 2: Optional quantization of the merged checkpoint
-python -m experimental.quantization llm \
+tensorrt-edgellm-quantize llm \
   --model_dir merged_model \
   --output_dir quantized_model \
   --quantization nvfp4 \
   --lm_head_quantization nvfp4
 
-# Step 3: Export the checkpoint with llm_loader
-python -m llm_loader.export_all_cli \
+# Step 3: Export the checkpoint with tensorrt_edgellm
+tensorrt-edgellm-export \
   quantized_model \
   onnx_output
 ```
@@ -111,16 +111,16 @@ omit `lora_name` or set it to an empty string.
 
 ## Script Reference
 
-### `llm_loader.lora.insert_lora_cli`
+### `tensorrt-edgellm-insert-lora`
 
-Inserts LoRA patterns into an exported `llm_loader` ONNX model and creates
+Inserts LoRA patterns into an exported `tensorrt_edgellm` ONNX model and creates
 `lora_model.onnx` in the same directory.
 
 | Argument | Required | Description |
 |----------|----------|-------------|
 | `--onnx_dir` | Yes | Directory containing `model.onnx` and `config.json` |
 
-### `llm_loader.lora.process_lora_weights_cli`
+### `tensorrt-edgellm-process-lora`
 
 Processes HuggingFace LoRA adapter weights for runtime use.
 
@@ -131,7 +131,7 @@ Processes HuggingFace LoRA adapter weights for runtime use.
 
 The output contains `processed_adapter_model.safetensors` and `config.json`.
 
-### `llm_loader.lora.merge_lora_cli`
+### `tensorrt-edgellm-merge-lora`
 
 Permanently merges LoRA weights into a base HuggingFace checkpoint.
 

@@ -31,7 +31,8 @@ from typing import Dict, List, Optional, Tuple
 # TODO: Restore thresholds after baselines stabilize
 # Original values: CORRECTNESS=0.01, ROUGE=0.20, PERF=0.20
 CORRECTNESS_ACCURACY_THRESHOLD = 0.05
-ROUGE_ACCURACY_THRESHOLD = 0.50
+ROUGE_ACCURACY_THRESHOLD = float(
+    os.environ.get('BASELINE_ROUGE_ACCURACY_THRESHOLD', '0.50'))
 PERF_THRESHOLD = 0.50
 
 ACCURACY_COLUMNS = (
@@ -171,7 +172,7 @@ class BaselineData:
             case_name = _build_case_name(model_type_value, test_func,
                                          param_str)
             return self._data.get(case_name)
-        # fallback: substring search (legacy / direct lookups)
+        # Fallback: substring search for callers that do not pass model type.
         key = f"[{param_str}]"
         for name, data in self._data.items():
             if key in name:

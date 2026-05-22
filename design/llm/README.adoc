@@ -3,5 +3,4 @@
 :description: Index of design notes for LLM-related components in TensorRT Edge-LLM
 
 == Index
-- `laurel_support.adoc`: LAuReL residual support in decoder layers and exports
-- `llm_loader_design.adoc`: llm_loader package — checkpoint loading, model construction, and dynamo ONNX export pipeline (including hybrid Mamba+Attention models). This is the recommended export path; the source currently lives under `experimental/llm_loader/`.
+- `tensorrt_edgellm_design.adoc`: tensorrt_edgellm package — checkpoint loading, model construction, and dynamo ONNX export pipeline (including hybrid Mamba+Attention models). This is the recommended export path; the source currently lives under `tensorrt_edgellm/`.

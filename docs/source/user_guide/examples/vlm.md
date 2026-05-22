@@ -14,20 +14,20 @@ Complete workflow for vision-language models with image understanding capabiliti
 
 ```bash
 export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
-export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
+export PYTHONPATH=$EDGE_LLM_PATH:$PYTHONPATH
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Qwen2.5-VL-3B-Instruct
 mkdir -p $WORKSPACE_DIR
 cd $WORKSPACE_DIR
 
 # Quantize the LLM weights to a unified checkpoint
-python -m experimental.quantization llm \
+tensorrt-edgellm-quantize llm \
   --model_dir Qwen/Qwen2.5-VL-3B-Instruct \
   --quantization fp8 \
   --output_dir $MODEL_NAME/quantized
 
 # Export the language model and FP16 visual encoder
-python -m llm_loader.export_all_cli \
+tensorrt-edgellm-export \
   $MODEL_NAME/quantized \
   $MODEL_NAME/onnx
 ```

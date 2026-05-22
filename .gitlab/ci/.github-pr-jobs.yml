@@ -30,14 +30,14 @@
     - rm -rf /tmp/github_pr_${CI_PIPELINE_ID}
     - echo "Cleanup complete"
 
-github_pr_l0_ampere_export:
+github_pr_l0_checkpoint_export_ampere:
   stage: l0_test
   variables:
     CUDA_VERSION: "12.9"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/github_pr_$CI_PIPELINE_ID"
-    TEST_CACHE_DIR: "$L0_CACHE_DIR/ampere_model_export"
-    PRIORITY: l0_export_ampere
+    TEST_CACHE_DIR: "$L0_CACHE_DIR/checkpoint_export_ampere"
+    PRIORITY: l0_checkpoint_export_ampere
     ONNX_DIR: "$TEST_CACHE_DIR/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
   tags:
@@ -46,20 +46,20 @@ github_pr_l0_ampere_export:
   extends:
     - .github_pr_clone
     - .github_pr_cleanup
-    - .export_onnx_template
+    - .checkpoint_export_template
     - .github_pr_rules_manual
 
 github_pr_l0_a30:
   stage: l0_test
   needs:
-    - github_pr_l0_ampere_export
+    - github_pr_l0_checkpoint_export_ampere
   variables:
     CUDA_VERSION: "12.9"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/github_pr_$CI_PIPELINE_ID"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/a30"
     PRIORITY: l0_pipeline_a30
-    ONNX_DIR: "$L0_CACHE_DIR/ampere_model_export/onnx"
+    ONNX_DIR: "$L0_CACHE_DIR/checkpoint_export_ampere/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$CUDA_VERSION"
