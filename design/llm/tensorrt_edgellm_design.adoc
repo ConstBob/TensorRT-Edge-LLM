@@ -791,7 +791,7 @@ The following model families are not yet supported.  Each requires new model cla
 |Model family |Notes
 
 |**EAGLE draft models**
-|Export the EAGLE draft model (a shallow decoder that predicts speculative tokens) separately from the base model.  Requires: a draft-model wrapper that shares the base embedding, a separate ``OnnxSpec`` for the draft graph, and end-to-end testing against the existing ``LLMInferenceSpecDecodeRuntime``.
+|Export the EAGLE draft model (a shallow decoder that predicts speculative tokens) separately from the base model.  Requires: a draft-model wrapper that shares the base embedding, a separate ``OnnxSpec`` for the draft graph, and end-to-end testing against the existing ``LLMInferenceRuntime``.
 
 |**Alpamayo models**
 |Support the Alpamayo model family.  Architecture details and required custom ops TBD based on the model spec.

@@ -592,8 +592,7 @@ InferenceDims LLMEngineConfig::resetDims() const
 {
     // Clean-slate binding for CUDA-graph capture reset. ropeBatch is hardcoded
     // to 1 even for MRope — the reset is a placeholder binding, not an
-    // inference step. This matches the pre-migration behavior in both
-    // llmInferenceRuntime.cpp and llmInferenceSpecDecodeRuntime.cpp.
+    // inference step.
     // startIndexLen=1 matches batch=1; the reset is a placeholder bind, not a
     // real initial-prefill (which would need shape [0]).
     return InferenceDims{

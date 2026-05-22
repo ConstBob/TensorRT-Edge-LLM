@@ -26,7 +26,7 @@
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
 #include "requestFileParser.h"
-#include "runtime/llmInferenceSpecDecodeRuntime.h"
+#include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/qwen3OmniTTSRuntime.h"
 #include "runtime/streaming.h"
@@ -507,7 +507,7 @@ int main(int argc, char* argv[])
     }
 
     // Create unified runtime (handles both vanilla and speculative decoding modes)
-    std::unique_ptr<rt::LLMInferenceSpecDecodeRuntime> runtime{nullptr};
+    std::unique_ptr<rt::LLMInferenceRuntime> runtime{nullptr};
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
@@ -517,7 +517,7 @@ int main(int argc, char* argv[])
             args.specDecodeArgs.draftTopK, args.specDecodeArgs.draftStep, args.specDecodeArgs.verifySize};
         try
         {
-            runtime = std::make_unique<rt::LLMInferenceSpecDecodeRuntime>(
+            runtime = std::make_unique<rt::LLMInferenceRuntime>(
                 args.engineDir, args.multimodalEngineDir, loraWeightsMap, draftingConfig, stream);
         }
         catch (std::exception const& e)
@@ -531,7 +531,7 @@ int main(int argc, char* argv[])
         // Standard vanilla-only mode (no draft model)
         try
         {
-            runtime = std::make_unique<rt::LLMInferenceSpecDecodeRuntime>(
+            runtime = std::make_unique<rt::LLMInferenceRuntime>(
                 args.engineDir, args.multimodalEngineDir, loraWeightsMap, stream);
         }
         catch (std::exception const& e)
@@ -785,7 +785,7 @@ int main(int argc, char* argv[])
 
         // Non-streaming path: build batched Omni requests and call Talker once.
         // Fetch Thinker prefill embeddings / hidden states from the runtime portal
-        // (see LLMInferenceSpecDecodeRuntime::getBaseModelHiddenStates contract).
+        // (see LLMInferenceRuntime::getBaseModelHiddenStates contract).
         rt::Tensor const* prefillEmbedsAll = runtime->getBaseModelHiddenStates(0);
         std::vector<int32_t> const requiredLayers
             = ttsRuntime ? ttsRuntime->getThinkerHiddenLayerIndices() : std::vector<int32_t>{};

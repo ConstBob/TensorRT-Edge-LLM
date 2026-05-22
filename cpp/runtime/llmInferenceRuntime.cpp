@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "llmInferenceSpecDecodeRuntime.h"
+#include "llmInferenceRuntime.h"
 #include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
@@ -58,22 +58,21 @@ constexpr int32_t kDecodeProfile{1};
 namespace rt
 {
 
-LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& engineDir,
-    std::string const& multimodalEngineDir, std::unordered_map<std::string, std::string> const& loraWeightsMap,
-    SpecDecodeDraftingConfig const& draftingConfig, cudaStream_t stream)
+LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
+    std::unordered_map<std::string, std::string> const& loraWeightsMap, SpecDecodeDraftingConfig const& draftingConfig,
+    cudaStream_t stream)
 {
     initializeCommon(engineDir, multimodalEngineDir, loraWeightsMap, draftingConfig, stream);
 }
 
-LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& engineDir,
-    std::string const& multimodalEngineDir, std::unordered_map<std::string, std::string> const& loraWeightsMap,
-    cudaStream_t stream)
+LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
+    std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream)
 {
     initializeCommon(engineDir, multimodalEngineDir, loraWeightsMap, std::nullopt, stream);
 }
 
-void LLMInferenceSpecDecodeRuntime::initializeCommon(std::string const& engineDir,
-    std::string const& multimodalEngineDir, std::unordered_map<std::string, std::string> const& loraWeightsMap,
+void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::string const& multimodalEngineDir,
+    std::unordered_map<std::string, std::string> const& loraWeightsMap,
     std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream)
 {
     // -----------------------------------------------------------------------
@@ -212,29 +211,29 @@ void LLMInferenceSpecDecodeRuntime::initializeCommon(std::string const& engineDi
     try
     {
         mIdsInput = rt::Tensor({mMaxRuntimeBatchSize, maxInputLength}, rt::DeviceType::kGPU, DataType::kINT32,
-            "LLMInferenceSpecDecodeRuntime::mIdsInput");
+            "LLMInferenceRuntime::mIdsInput");
 
         mSamplingWorkspace = rt::Tensor({maxSamplingWorkspaceSize}, rt::DeviceType::kGPU, DataType::kINT8,
-            "LLMInferenceSpecDecodeRuntime::mSamplingWorkspace");
-        mSamplingIndices = rt::Tensor({maxSamplingSize}, rt::DeviceType::kGPU, DataType::kINT32,
-            "LLMInferenceSpecDecodeRuntime::mSamplingIndices");
-        mSamplingScores = rt::Tensor({maxSamplingSize}, rt::DeviceType::kGPU, DataType::kFLOAT,
-            "LLMInferenceSpecDecodeRuntime::mSamplingScores");
+            "LLMInferenceRuntime::mSamplingWorkspace");
+        mSamplingIndices = rt::Tensor(
+            {maxSamplingSize}, rt::DeviceType::kGPU, DataType::kINT32, "LLMInferenceRuntime::mSamplingIndices");
+        mSamplingScores = rt::Tensor(
+            {maxSamplingSize}, rt::DeviceType::kGPU, DataType::kFLOAT, "LLMInferenceRuntime::mSamplingScores");
 
         // Batch mapping tensor for batch eviction.
-        mDeviceBatchMapping = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kGPU, DataType::kINT32,
-            "LLMInferenceSpecDecodeRuntime::mDeviceBatchMapping");
+        mDeviceBatchMapping = rt::Tensor(
+            {mMaxRuntimeBatchSize}, rt::DeviceType::kGPU, DataType::kINT32, "LLMInferenceRuntime::mDeviceBatchMapping");
 
         mHostPackedTokenIds = rt::Tensor({mMaxRuntimeBatchSize, maxInputLength}, rt::DeviceType::kCPU, DataType::kINT32,
-            "LLMInferenceSpecDecodeRuntime::mHostPackedTokenIds");
+            "LLMInferenceRuntime::mHostPackedTokenIds");
         mHostSelectedTokenIds = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32,
-            "LLMInferenceSpecDecodeRuntime::mHostSelectedTokenIds");
+            "LLMInferenceRuntime::mHostSelectedTokenIds");
         mHostReuseKVCacheLengths = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32,
-            "LLMInferenceSpecDecodeRuntime::mHostReuseKVCacheLengths");
+            "LLMInferenceRuntime::mHostReuseKVCacheLengths");
 
         // Pre-allocate multimodal indices tensor (used for audio/vision embedding lookup).
         mMultimodalIndices = rt::Tensor({mMaxRuntimeBatchSize, maxInputLength}, rt::DeviceType::kGPU, DataType::kINT32,
-            "LLMInferenceSpecDecodeRuntime::mMultimodalIndices");
+            "LLMInferenceRuntime::mMultimodalIndices");
     }
     catch (std::exception const& e)
     {
@@ -351,7 +350,7 @@ void LLMInferenceSpecDecodeRuntime::initializeCommon(std::string const& engineDi
     int64_t const sharedContextMemorySize = std::max({baseContextMemorySize, strategyContextMemorySize,
         visionContextMemorySize, audioContextMemorySize, actionContextMemorySize});
     mSharedExecContextMemory = rt::Tensor({sharedContextMemorySize}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8,
-        "LLMInferenceSpecDecodeRuntime::mSharedExecContextMemory");
+        "LLMInferenceRuntime::mSharedExecContextMemory");
     mBaseExecutor->setContextMemory(mSharedExecContextMemory);
     if (mDecoderRegistry)
     {
@@ -378,7 +377,7 @@ void LLMInferenceSpecDecodeRuntime::initializeCommon(std::string const& engineDi
         static_cast<size_t>(audioContextMemorySize), static_cast<size_t>(actionContextMemorySize));
 }
 
-void LLMInferenceSpecDecodeRuntime::buildDecodingRuntimeContext()
+void LLMInferenceRuntime::buildDecodingRuntimeContext()
 {
     BaseEngineResources baseResources{*mBaseExecutor, mBaseTensorMap, *mSharedResources,
         *mSharedResources->cacheManagers[0], *mPipelineIO, [this](InferenceDims const& dims, cudaStream_t stream) {
@@ -391,7 +390,7 @@ void LLMInferenceSpecDecodeRuntime::buildDecodingRuntimeContext()
         mDeployment, mMaxRuntimeBatchSize, baseResources, preprocessResources, *mTokenizer, sampling});
 }
 
-void LLMInferenceSpecDecodeRuntime::setActionNoiseSeed(int32_t seed) noexcept
+void LLMInferenceRuntime::setActionNoiseSeed(int32_t seed) noexcept
 {
     if (mActionRunner)
     {
@@ -399,7 +398,7 @@ void LLMInferenceSpecDecodeRuntime::setActionNoiseSeed(int32_t seed) noexcept
     }
 }
 
-bool LLMInferenceSpecDecodeRuntime::handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response,
+bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response,
     cudaStream_t stream, bool outputThinkerEmbeddings)
 {
     // Clear per-request portal state. Buffers themselves stay allocated and are
@@ -896,7 +895,7 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(LLMGenerationRequest const& re
     return true;
 }
 
-bool LLMInferenceSpecDecodeRuntime::validateRequestConfig(LLMGenerationRequest const& request)
+bool LLMInferenceRuntime::validateRequestConfig(LLMGenerationRequest const& request)
 {
     int32_t const activeBatchSize = static_cast<int32_t>(request.requests.size());
     bool const hasAudio = std::any_of(
@@ -945,7 +944,7 @@ bool LLMInferenceSpecDecodeRuntime::validateRequestConfig(LLMGenerationRequest c
     return true;
 }
 
-bool LLMInferenceSpecDecodeRuntime::multiModalRuntimePreprocess(
+bool LLMInferenceRuntime::multiModalRuntimePreprocess(
     LLMGenerationRequest const& request, DecodingInferenceContext& context, cudaStream_t stream)
 {
     int32_t const activeBatchSize = static_cast<int32_t>(request.requests.size());
@@ -1067,7 +1066,7 @@ bool LLMInferenceSpecDecodeRuntime::multiModalRuntimePreprocess(
     return true;
 }
 
-bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(DecodingInferenceContext& context)
+bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context)
 {
     TIME_STAGE(metrics::StageNames::kLLM_PREFILL, context.stream);
     NVTX_SCOPED_RANGE(nvtx_base_prefill,
@@ -1186,7 +1185,7 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(DecodingInferenceContext
     return true;
 }
 
-bool LLMInferenceSpecDecodeRuntime::captureBaseGraphWithLoraFanout(InferenceDims const& dims, cudaStream_t stream)
+bool LLMInferenceRuntime::captureBaseGraphWithLoraFanout(InferenceDims const& dims, cudaStream_t stream)
 {
     auto captureOnce = [&](std::string const& loraName) -> bool {
         if (mSharedResources->loraManager)
@@ -1219,12 +1218,12 @@ bool LLMInferenceSpecDecodeRuntime::captureBaseGraphWithLoraFanout(InferenceDims
     return ok;
 }
 
-bool LLMInferenceSpecDecodeRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
+bool LLMInferenceRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
 {
     return mDecoderRegistry ? mDecoderRegistry->captureCudaGraphs(stream) : true;
 }
 
-void LLMInferenceSpecDecodeRuntime::restoreRecurrentStates(
+void LLMInferenceRuntime::restoreRecurrentStates(
     int32_t batchIdx, SystemPromptKVCache const& cachedStates, cudaStream_t stream)
 {
     auto& cacheMgrBase = *mSharedResources->cacheManagers[0];
@@ -1268,7 +1267,7 @@ void LLMInferenceSpecDecodeRuntime::restoreRecurrentStates(
     }
 }
 
-void LLMInferenceSpecDecodeRuntime::zeroRecurrentStates(int32_t batchIdx, cudaStream_t stream)
+void LLMInferenceRuntime::zeroRecurrentStates(int32_t batchIdx, cudaStream_t stream)
 {
     auto& cacheMgrBase = *mSharedResources->cacheManagers[0];
     auto& mambaMgr = cacheMgrBase.getMambaCacheManager();
@@ -1293,8 +1292,7 @@ void LLMInferenceSpecDecodeRuntime::zeroRecurrentStates(int32_t batchIdx, cudaSt
     }
 }
 
-bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(
-    DecodingInferenceContext& context, DecodingStrategy& strategy)
+bool LLMInferenceRuntime::setUpForPrefillExecution(DecodingInferenceContext& context, DecodingStrategy& strategy)
 {
     NVTX_SCOPED_RANGE(nvtx_setup, "SETUP_PREFILL_EXECUTION", nvtx_colors::PALE_GREEN);
 
@@ -1409,8 +1407,7 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(
     return true;
 }
 
-bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(
-    DecodingInferenceContext& context, int32_t genAndSaveBatchIdx)
+bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(DecodingInferenceContext& context, int32_t genAndSaveBatchIdx)
 {
     std::string const& loraWeightsName = context.loraWeightsName;
     std::string const prompt = context.systemPrompts[genAndSaveBatchIdx];
@@ -1517,7 +1514,7 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(
     return true;
 }
 
-bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(
+bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     std::string const& prompt, std::string const& loraWeightsName, cudaStream_t stream)
 {
     if (prompt.empty())
@@ -1547,7 +1544,7 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(
     return genAndSaveSystemPromptKVCache(tempContext, 0);
 }
 
-bool LLMInferenceSpecDecodeRuntime::performBatchEvict(DecodingInferenceContext& context, DecodingStrategy& strategy)
+bool LLMInferenceRuntime::performBatchEvict(DecodingInferenceContext& context, DecodingStrategy& strategy)
 {
     // Check if any batch has finished
     bool hasFinishedBatch = false;

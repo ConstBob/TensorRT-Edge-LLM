@@ -26,7 +26,7 @@
 #include "common/trtUtils.h"
 #include "profiling/metrics.h"
 #include "runtime/imageUtils.h"
-#include "runtime/llmInferenceSpecDecodeRuntime.h"
+#include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
 
 #include <chrono>
@@ -92,7 +92,7 @@ private:
     cudaStream_t mStream{nullptr};
 };
 
-//! Unified Python wrapper for LLMInferenceSpecDecodeRuntime.
+//! Unified Python wrapper for LLMInferenceRuntime.
 //! Supports both vanilla decoding (no draft model) and Eagle speculative decoding
 //! through constructor overloading — mirrors the C++ unified runtime.
 class PyLLMRuntime
@@ -103,8 +103,7 @@ public:
         std::unordered_map<std::string, std::string> const& loraWeightsMap)
     {
         mPluginHandle = loadEdgellmPluginLib();
-        mRuntime = std::make_unique<LLMInferenceSpecDecodeRuntime>(
-            engineDir, multimodalEngineDir, loraWeightsMap, mStream.get());
+        mRuntime = std::make_unique<LLMInferenceRuntime>(engineDir, multimodalEngineDir, loraWeightsMap, mStream.get());
     }
 
     //! Eagle speculative decoding constructor.
@@ -114,7 +113,7 @@ public:
     {
         mPluginHandle = loadEdgellmPluginLib();
         SpecDecodeDraftingConfig draftingConfig{draftTopK, draftStep, verifyTreeSize};
-        mRuntime = std::make_unique<LLMInferenceSpecDecodeRuntime>(
+        mRuntime = std::make_unique<LLMInferenceRuntime>(
             engineDir, multimodalEngineDir, loraWeightsMap, draftingConfig, mStream.get());
     }
 
@@ -163,7 +162,7 @@ public:
 
 private:
     CudaStreamWrapper mStream;
-    std::unique_ptr<LLMInferenceSpecDecodeRuntime> mRuntime;
+    std::unique_ptr<LLMInferenceRuntime> mRuntime;
     std::unique_ptr<void, DlDeleter> mPluginHandle;
 };
 

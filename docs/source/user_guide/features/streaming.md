@@ -7,7 +7,7 @@ Stream generated tokens to your application one chunk at a time instead of waiti
 Attach a `StreamChannel` per request, submit on a worker thread, consume chunks on your main thread.
 
 ```cpp
-#include "runtime/llmInferenceSpecDecodeRuntime.h"
+#include "runtime/llmInferenceRuntime.h"
 #include "runtime/streaming.h"
 
 using namespace trt_edgellm;
