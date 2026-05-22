@@ -15,7 +15,7 @@
 """Quantization recipe configurations for ModelOpt."""
 
 import copy
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import modelopt.torch.quantization as mtq
 
@@ -274,6 +274,86 @@ def _disable_groups(*pattern_groups) -> Dict[str, Dict[str, bool]]:
     return out
 
 
+def _dict_entry_to_list_entry(pattern: str, value: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert legacy dict-style quant cfg entry to ModelOpt list-style entry."""
+    entry: Dict[str, Any] = {"quantizer_name": "*" if pattern == "default" else pattern}
+    if set(value.keys()) == {"enable"}:
+        entry["enable"] = value["enable"]
+        return entry
+
+    cfg_payload = {k: v for k, v in value.items() if k != "enable"}
+    if cfg_payload:
+        entry["cfg"] = cfg_payload
+    if "enable" in value:
+        entry["enable"] = value["enable"]
+    return entry
+
+
+def _merge_quant_cfg(target: Any, extra: Any) -> Any:
+    """Merge quant cfg data while supporting both dict and list structures."""
+    if isinstance(target, dict):
+        if isinstance(extra, dict):
+            target.update(extra)
+            return target
+        if isinstance(extra, list):
+            for item in extra:
+                if not isinstance(item, dict):
+                    continue
+                quantizer_name = item.get("quantizer_name")
+                if not quantizer_name:
+                    continue
+                pattern = "default" if quantizer_name == "*" else quantizer_name
+                merged_value: Dict[str, Any] = {}
+                if isinstance(item.get("cfg"), dict):
+                    merged_value.update(item["cfg"])
+                if "enable" in item:
+                    merged_value["enable"] = item["enable"]
+                target[pattern] = merged_value
+            return target
+        raise TypeError(f"Unsupported quant_cfg source type for dict target: {type(extra)}")
+
+    if isinstance(target, list):
+        pending_entries: List[Dict[str, Any]] = []
+        if isinstance(extra, dict):
+            for pattern, value in extra.items():
+                if isinstance(value, dict):
+                    pending_entries.append(_dict_entry_to_list_entry(pattern, value))
+        elif isinstance(extra, list):
+            for item in extra:
+                if isinstance(item, dict) and item.get("quantizer_name"):
+                    pending_entries.append(copy.deepcopy(item))
+        else:
+            raise TypeError(f"Unsupported quant_cfg source type for list target: {type(extra)}")
+
+        index_by_name = {}
+        for idx, item in enumerate(target):
+            if isinstance(item, dict) and item.get("quantizer_name"):
+                index_by_name[item["quantizer_name"]] = idx
+
+        for entry in pending_entries:
+            quantizer_name = entry["quantizer_name"]
+            if quantizer_name in index_by_name:
+                target[index_by_name[quantizer_name]] = entry
+            else:
+                index_by_name[quantizer_name] = len(target)
+                target.append(entry)
+        return target
+
+    raise TypeError(f"Unsupported quant_cfg target type: {type(target)}")
+
+
+def _remove_lm_head_quantizers(quant_cfg: Any) -> Any:
+    """Remove lm_head-related quantizers from dict/list quant cfg."""
+    if isinstance(quant_cfg, dict):
+        return {k: v for k, v in quant_cfg.items() if "lm_head" not in k}
+    if isinstance(quant_cfg, list):
+        return [
+            item for item in quant_cfg
+            if not ("lm_head" in str(item.get("quantizer_name", "")))
+        ]
+    raise TypeError(f"Unsupported quant_cfg type when removing lm_head: {type(quant_cfg)}")
+
+
 def build_quant_config(
     quantization: Optional[str] = None,
     lm_head_quantization: Optional[str] = None,
@@ -305,8 +385,8 @@ def build_quant_config(
     if quantization is None:
         cfg = {"quant_cfg": {"default": {"enable": False}}, "algorithm": "max"}
     elif quantization in _BACKBONE_CFG_MAP:
-        # Deep-copy so subsequent ``cfg["quant_cfg"].update(...)`` calls do
-        # not mutate the shared module-level dict that ModelOpt reuses for
+        # Deep-copy so subsequent quant cfg merges do not mutate the shared
+        # module-level dict/list that ModelOpt reuses for
         # every quant_algo (``mtq.NVFP4_DEFAULT_CFG`` and friends are
         # singletons; ``.copy()`` only copies the outer mapping, leaving
         # the inner ``quant_cfg`` aliased to the global).
@@ -320,16 +400,15 @@ def build_quant_config(
             raise ValueError(
                 f"Unsupported lm_head_quantization: {lm_head_quantization}. "
                 f"Choose from: {list(_LM_HEAD_CFG_MAP)}")
-        cfg["quant_cfg"] = {
-            k: v
-            for k, v in cfg["quant_cfg"].items() if "*lm_head" not in k
-        }
-        cfg["quant_cfg"].update(
-            _LM_HEAD_CFG_MAP[lm_head_quantization]["quant_cfg"])
+        cfg["quant_cfg"] = _remove_lm_head_quantizers(cfg["quant_cfg"])
+        cfg["quant_cfg"] = _merge_quant_cfg(
+            cfg["quant_cfg"],
+            _LM_HEAD_CFG_MAP[lm_head_quantization]["quant_cfg"],
+        )
 
     if kv_cache_quantization == "fp8":
-        cfg["quant_cfg"].update(mtq.FP8_KV_CFG["quant_cfg"])
-        cfg["quant_cfg"].update(FP8_ATTN["quant_cfg"])
+        cfg["quant_cfg"] = _merge_quant_cfg(cfg["quant_cfg"], mtq.FP8_KV_CFG["quant_cfg"])
+        cfg["quant_cfg"] = _merge_quant_cfg(cfg["quant_cfg"], FP8_ATTN["quant_cfg"])
 
     # Disable every non-LLM group by default. Re-enable the ones the user
     # explicitly asked to quantize.
@@ -338,7 +417,10 @@ def build_quant_config(
         groups_to_disable.append(_VISUAL_PATTERNS)
     if audio_quantization is None:
         groups_to_disable.append(_AUDIO_PATTERNS)
-    cfg["quant_cfg"].update(_disable_groups(*groups_to_disable))
+    cfg["quant_cfg"] = _merge_quant_cfg(
+        cfg["quant_cfg"],
+        _disable_groups(*groups_to_disable),
+    )
 
     # When visual != backbone, layer an explicit override. When visual ==
     # backbone we don't need overrides — the backbone's generic wildcards
@@ -349,15 +431,19 @@ def build_quant_config(
             raise ValueError(
                 f"Unsupported visual_quantization: {visual_quantization}. "
                 f"Choose from: {list(_VISUAL_CFG_MAP)}")
-        cfg["quant_cfg"].update(
-            _VISUAL_CFG_MAP[visual_quantization]["quant_cfg"])
+        cfg["quant_cfg"] = _merge_quant_cfg(
+            cfg["quant_cfg"],
+            _VISUAL_CFG_MAP[visual_quantization]["quant_cfg"],
+        )
 
     if (audio_quantization is not None and audio_quantization != quantization):
         if audio_quantization not in _AUDIO_CFG_MAP:
             raise ValueError(
                 f"Unsupported audio_quantization: {audio_quantization}. "
                 f"Choose from: {list(_AUDIO_CFG_MAP)}")
-        cfg["quant_cfg"].update(
-            _AUDIO_CFG_MAP[audio_quantization]["quant_cfg"])
+        cfg["quant_cfg"] = _merge_quant_cfg(
+            cfg["quant_cfg"],
+            _AUDIO_CFG_MAP[audio_quantization]["quant_cfg"],
+        )
 
     return cfg
