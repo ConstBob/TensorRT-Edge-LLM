@@ -63,7 +63,9 @@ class AutoModel:
                         reduced_vocab_dir: "str | None" = None,
                         nvfp4_moe_backend: "str | None" = None,
                         mtp_base: bool = False,
-                        mtp_draft: bool = False) -> nn.Module:
+                        mtp_draft: bool = False,
+                        tp_size: int = 1,
+                        tp_rank: int = 0) -> nn.Module:
         """Construct and load a model from *model_dir*.
 
         Reads ``config.json`` via :class:`~config.ModelConfig`, looks up the
@@ -91,6 +93,11 @@ class AutoModel:
                             the dense MTP base variant.
             mtp_draft:      When True, build the dedicated Qwen3.5 dense MTP
                             draft model from the base checkpoint config.
+            tp_size:        Tensor-parallel world size.  When >1 the config
+                            is reduced to per-rank shapes via
+                            :meth:`ModelConfig.for_rank`, and weights
+                            are sharded on assignment.  Default 1 = no TP.
+            tp_rank:        This rank's index in [0, tp_size).
 
         Returns:
             Loaded ``nn.Module`` in eval mode.
@@ -105,6 +112,8 @@ class AutoModel:
             config.eagle_base = True
         if mtp_base or config.mtp_base:
             config.mtp_base = True
+        if tp_size > 1:
+            config = config.for_rank(tp_rank, tp_size)
 
         variant = _resolve_model_variant(config,
                                          eagle_base=eagle_base,
@@ -162,7 +171,8 @@ class AutoModel:
                      device=device,
                      key_remap=key_remap,
                      key_prefix=key_prefix,
-                     pre_repack_hook=pre_repack_hook)
+                     pre_repack_hook=pre_repack_hook,
+                     mapping=config.mapping)
         if reduced_vocab_dir is not None and pre_repack_hook is None:
             from .vocab_reduction.onnx_export import \
                 apply_reduced_vocab_from_dir

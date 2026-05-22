@@ -430,3 +430,72 @@ def test_checkpoint_lora_export(test_param: str, test_logger,
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_llm_loader_tp_export(test_param: str, test_logger,
+                              env_config: EnvironmentConfig):
+    """Export per-rank ONNX for TP=2 via tensorrt_edgellm.scripts.export --tp-size 2.
+
+    Validates:
+      - Per-rank files exist: model_tp2_rank{0,1}.onnx and matching .data
+      - Each rank's external-data file has distinct content (regression
+        guard for the per-rank filename collision in onnx/export.py
+        _fix_initializer_dtypes — without the fix both ranks share
+        model.onnx.data and the second-written wins).
+    """
+    import hashlib
+
+    config = TestConfig.from_param_string(test_param, ModelType.LLM,
+                                          TaskType.EXPORT, env_config)
+
+    torch_dir = config.get_torch_model_dir()
+    if not os.path.exists(torch_dir):
+        raise FileNotFoundError(f"Model checkpoint not found: {torch_dir}")
+
+    llm_onnx_dir = config.get_llm_onnx_dir()
+    os.makedirs(llm_onnx_dir, exist_ok=True)
+
+    tmp_dir = tempfile.mkdtemp(prefix="llm_loader_tp_export_")
+    try:
+        export_cmd = [
+            "python3",
+            "-m",
+            "tensorrt_edgellm.scripts.export",
+            torch_dir,
+            tmp_dir,
+            "--tp-size",
+            "2",
+        ]
+        _run_checkpoint_export(export_cmd, 600, test_logger,
+                               f"TP=2 export for {config.model_name}")
+
+        llm_output = os.path.join(tmp_dir, "llm")
+        if not os.path.isdir(llm_output):
+            pytest.fail(
+                f"llm_loader did not produce llm/ output directory in {tmp_dir}"
+            )
+        shutil.copytree(llm_output, llm_onnx_dir, dirs_exist_ok=True)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # Validate per-rank files exist and external-data files are distinct.
+    rank_files = []
+    for rank in (0, 1):
+        onnx_path = os.path.join(llm_onnx_dir, f"model_tp2_rank{rank}.onnx")
+        data_path = onnx_path + ".data"
+        if not os.path.exists(onnx_path):
+            pytest.fail(f"Missing per-rank ONNX: {onnx_path}")
+        if not os.path.exists(data_path):
+            pytest.fail(f"Missing per-rank external data: {data_path}")
+        rank_files.append((onnx_path, data_path))
+
+    # Distinct .data content — catches the model.onnx.data collision bug.
+    md5s = []
+    for _, data_path in rank_files:
+        with open(data_path, "rb") as f:
+            md5s.append(hashlib.md5(f.read()).hexdigest())
+    if md5s[0] == md5s[1]:
+        pytest.fail(
+            f"TP=2 rank0 and rank1 external-data files have identical content "
+            f"({md5s[0]}); per-rank sharding collapsed (likely the "
+            f"model.onnx.data filename collision in onnx/export.py)")

@@ -26,6 +26,9 @@ packed uint8 weights and fp8 block scales; AWQ — ``qweight`` ``[in,out//8]``,
 """
 
 import logging
+from abc import ABC, abstractmethod
+from enum import Enum
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -33,10 +36,12 @@ import torch.nn.functional as F
 
 from ..config import (QUANT_FP8, QUANT_FP16, QUANT_INT4_AWQ,
                       QUANT_INT4_AWQ_MODELOPT, QUANT_INT4_GPTQ, QUANT_INT8_SQ,
-                      QUANT_MXFP8, QUANT_NVFP4, ModelConfig, module_quant_type)
-from .ops import (fp8_dequantize, fp8_quantize, int4_groupwise_gemm,
-                  int8_sq_act_qdq, int8_sq_weight_dq, mxfp8_act_qdq,
-                  mxfp8_weight_dq, nvfp4_act_qdq, nvfp4_dequantize)
+                      QUANT_MXFP8, QUANT_NVFP4, Mapping, ModelConfig,
+                      module_quant_type)
+from .ops import (fp8_dequantize, fp8_quantize, fused_gemm_allreduce,
+                  int4_groupwise_gemm, int8_sq_act_qdq, int8_sq_weight_dq,
+                  mxfp8_act_qdq, mxfp8_weight_dq, nvfp4_act_qdq,
+                  nvfp4_dequantize)
 
 logger = logging.getLogger(__name__)
 
@@ -48,23 +53,95 @@ def _require_fp16_input(hidden_states: torch.Tensor, layer_name: str) -> None:
 
 
 __all__ = [
+    "LinearBase",
+    "LinearMethodBase",
+    "NVFP4LinearMethod",
+    "ColumnParallelLinear",
+    "RowParallelLinear",
+    "is_nvfp4_linear",
     "FP16Linear",
     "FP8Linear",
     "MXFP8Linear",
-    "NVFP4Linear",
     "AWQLinear",
     "ModelOptAWQPrepackedLinear",
     "GPTQLinear",
     "INT8SQLinear",
+    "TPMode",
     "make_linear",
 ]
+
+
+class TPMode(str, Enum):
+    """Tensor-parallel sharding mode tag.
+    """
+    REPLICATED = "replicated"
+    COL = "col"
+    ROW = "row"
+
+
+# ---------------------------------------------------------------------------
+# LinearBase
+# ---------------------------------------------------------------------------
+
+
+class LinearBase(nn.Module):
+    """Common base for quantized / TP-aware linear layers."""
+
+    def tp_split_dim(self, attr: str) -> Optional[int]:
+        """Axis to shard *attr* along under TP, or None if replicated.
+
+        Default: every attribute is replicated. Subclasses override
+        (directly or via composed :class:`LinearMethodBase`). The base
+        loader handles the actual slice
+        (:func:`checkpoint.loader._shard_for_module`).
+        """
+        return None
+
+
+# ---------------------------------------------------------------------------
+# LinearMethodBase
+# ---------------------------------------------------------------------------
+
+
+class LinearMethodBase(ABC):
+    """Per-quant-format extension point.
+
+    Owns buffer allocation, forward kernel, per-rank shard, and any
+    quant-specific post-processing. The Linear class (Col / Row) owns the
+    TP mode and forward shell (which ``apply_*`` to call).
+    """
+
+    @abstractmethod
+    def create_weights(self, module: "LinearBase", in_features: int,
+                       out_features: int, bias: bool,
+                       dtype: torch.dtype) -> None:
+        ...
+
+    @abstractmethod
+    def apply(self, module: "LinearBase", x: torch.Tensor) -> torch.Tensor:
+        ...
+
+    def apply_linear_allreduce(self, module: "LinearBase",
+                               x: torch.Tensor) -> torch.Tensor:
+        """Forward for row-parallel layers (local GEMM + AllReduce).
+
+        Subclasses with a fused gemm+allreduce kernel override.
+        Default raises so missing-row-parallel-support is loud, not silent.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support row-parallel forward")
+
+    def shardable_attrs(self, tp_mode: TPMode) -> set:
+        """Buffer names that participate in TP under the given tp_mode."""
+        return set()
+
 
 # ---------------------------------------------------------------------------
 # FP16Linear
 # ---------------------------------------------------------------------------
 
 
-class FP16Linear(nn.Module):
+class FP16Linear(LinearBase):
     """Plain float16 linear (embed_tokens, lm_head, non-quantised).
 
     Activations must be float16 (no bfloat16/float32 inputs for now).
@@ -99,7 +176,7 @@ class FP16Linear(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class FP8Linear(nn.Module):
+class FP8Linear(LinearBase):
     """FP8 E4M3 linear.
 
     Export emits standard ONNX ``QuantizeLinear`` (``output_dtype=float8e4m3fn``)
@@ -142,58 +219,190 @@ class FP8Linear(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# NVFP4Linear
+# NVFP4LinearMethod
 # ---------------------------------------------------------------------------
 
 
-class NVFP4Linear(nn.Module):
-    """NVFP4 E2M1 linear with FP8 per-group scales.
+class NVFP4LinearMethod(LinearMethodBase):
+    """NVFP4 (FP4 E2M1) with FP8 per-group scales.
 
-    Forward emits ``trt::DequantizeLinear(weight, weight_scale, weight_scale_2,
-    block_size=group_size)`` (trt domain) followed by ``F.linear``.
-
-    ``input_scale`` is stored for TRT's activation-quantisation pass; it is
-    not emitted as an ONNX op here.
+    Owns the NVFP4 buffer layout (weight + per-group fp8 scale +
+    global scale + activation scale), the dequant+matmul forward, the
+    FusedGemmAllReduce row-parallel forward, and the per-mode shard
+    declaration. Used by both :class:`ColumnParallelLinear` and
+    :class:`RowParallelLinear` via composition.
     """
 
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        group_size: int = 16,
-        bias: bool = False,
-    ) -> None:
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.group_size = group_size
-        num_groups = in_features // group_size
+    def __init__(self, group_size: int = 16) -> None:
+        self.group_size: int = group_size
 
+    def create_weights(self, module: "LinearBase", in_features: int,
+                       out_features: int, bias: bool,
+                       dtype: torch.dtype) -> None:
+        num_groups = in_features // self.group_size
+        # forward path needs group_size on the module
+        module.group_size = self.group_size
         # weight: packed fp4 stored as int8 (same bits as uint8, TRT needs int8)
-        self.register_buffer(
+        module.register_buffer(
             "weight",
             torch.empty(out_features, in_features // 2, dtype=torch.int8))
         # Per-group fp8 scale [out, num_groups]
-        self.register_buffer(
+        module.register_buffer(
             "weight_scale",
             torch.ones(out_features, num_groups, dtype=torch.float32))
-        self.register_buffer("weight_scale_2", torch.ones(1))
-        self.register_buffer("input_scale", torch.ones(1))
+        module.register_buffer("weight_scale_2", torch.ones(1))
+        module.register_buffer("input_scale", torch.ones(1))
         if bias:
-            self.register_buffer("bias", torch.empty(out_features))
+            module.register_buffer("bias", torch.empty(out_features))
         else:
-            self.bias = None
+            module.bias = None
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        _require_fp16_input(hidden_states, "NVFP4Linear")
+    def apply(self, module: "LinearBase", x: torch.Tensor) -> torch.Tensor:
+        _require_fp16_input(x, type(module).__name__)
         # Activation: DynQ + 2x trt::DQ -> float16 activations
-        # input_scale is float32: amax / (6.0 * 448.0)
-        hidden_states_dq = nvfp4_act_qdq(hidden_states, self.input_scale)
+        x_dq = nvfp4_act_qdq(x, module.input_scale)
         # Weight: 2xstandard-ONNX DQ -> w_dq (float16)
-        w_dq = nvfp4_dequantize(self.weight, self.weight_scale,
-                                self.weight_scale_2, self.group_size)
-        bias = self.bias.to(torch.float16) if self.bias is not None else None
-        return F.linear(hidden_states_dq, w_dq, bias)
+        w_dq = nvfp4_dequantize(module.weight, module.weight_scale,
+                                module.weight_scale_2, module.group_size)
+        bias = module.bias.to(
+            torch.float16) if module.bias is not None else None
+        return F.linear(x_dq, w_dq, bias)
+
+    def apply_linear_allreduce(self, module: "LinearBase",
+                               x: torch.Tensor) -> torch.Tensor:
+        _require_fp16_input(x, type(module).__name__)
+        # Single op: TRT_FP4DynamicQuantize + DequantizeLinear +
+        # FusedGemmAllReducePlugin. Output is FP16, already AllReduced.
+        out = fused_gemm_allreduce(
+            x,
+            module.input_scale,
+            module.weight,
+            module.weight_scale,
+            module.weight_scale_2,
+            tp_size=module.tp_size,
+            fuse_residual_rmsnorm=0,
+        )
+        if module.bias is not None:
+            out = out + module.bias.to(torch.float16)
+        return out
+
+    def shardable_attrs(self, tp_mode: TPMode) -> set:
+        if tp_mode == TPMode.COL:
+            return {"weight", "weight_scale", "bias"}
+        if tp_mode == TPMode.ROW:
+            return {"weight", "weight_scale"}
+        return set()
+
+
+# ---------------------------------------------------------------------------
+# ColumnParallelLinear / RowParallelLinear  (TP-aware Linear classes)
+# ---------------------------------------------------------------------------
+
+
+class ColumnParallelLinear(LinearBase):
+    """Column-parallel or replicated linear.
+
+    Shards the weight [out_features, in_features] along dim 0, so each rank owns
+    ``out_features / tp_size`` output channels. No collective on the
+    forward path because the output is already per-rank.
+
+    ``out_features`` is the per-rank output size. The caller is expected
+    to pass values already adjusted by :meth:`ModelConfig.for_rank` when
+    ``tp_size>1``.
+    When ``tp_mode=REPLICATED`` (or ``tp_size==1``), this class is the
+    degenerate non-TP case, which is what :class:`ReplicatedLinear`
+    selects.
+    """
+
+    def __init__(self,
+                 in_features: int,
+                 out_features: int,
+                 bias: bool,
+                 dtype: torch.dtype,
+                 mapping: Mapping,
+                 quant_method: LinearMethodBase,
+                 tp_mode: TPMode = TPMode.COL) -> None:
+        super().__init__()
+        self.mapping = mapping or Mapping()
+        self.tp_mode = TPMode(tp_mode)
+        self.tp_size = self.mapping.tp_size
+        self.tp_rank = self.mapping.tp_rank
+        self.in_features = in_features
+        self.out_features = out_features
+        self.quant_method = quant_method
+        self.quant_method.create_weights(self, in_features, out_features, bias,
+                                         dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.quant_method.apply(self, x)
+
+    def tp_split_dim(self, attr: str) -> Optional[int]:
+        return 0 if attr in self.quant_method.shardable_attrs(
+            self.tp_mode) else None
+
+
+class ReplicatedLinear(ColumnParallelLinear):
+    """Non-TP linear. Same compute path as ColumnParallelLinear with
+    ``tp_mode=REPLICATED``. The full weight is loaded on every rank and
+    no sharding happens at load time (the empty
+    :meth:`LinearMethodBase.shardable_attrs` for REPLICATED makes
+    :func:`tp_split_dim` return ``None`` for every attr).
+    """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool,
+                 dtype: torch.dtype, mapping: Mapping,
+                 quant_method: LinearMethodBase) -> None:
+        super().__init__(in_features,
+                         out_features,
+                         bias,
+                         dtype,
+                         mapping,
+                         quant_method,
+                         tp_mode=TPMode.REPLICATED)
+
+
+class RowParallelLinear(LinearBase):
+    """Row-parallel linear with AllReduce on output.
+
+    Shards the weight [out_features, in_features] along dim 1: each rank owns
+    ``in_features / tp_size`` input channels and computes a partial sum.
+    An AllReduce across ranks turns the partial sums into the full
+    output.
+    ``in_features`` is the per-rank input size. The caller is expected
+    to pass values already adjusted by :meth:`ModelConfig.for_rank` when
+    ``tp_size>1``.
+    """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool,
+                 dtype: torch.dtype, mapping: Mapping,
+                 quant_method: LinearMethodBase) -> None:
+        super().__init__()
+        self.mapping = mapping
+        self.tp_mode = TPMode.ROW
+        self.tp_size = self.mapping.tp_size
+        self.tp_rank = self.mapping.tp_rank
+        self.in_features = in_features
+        self.out_features = out_features
+        self.quant_method = quant_method
+        self.quant_method.create_weights(self, in_features, out_features, bias,
+                                         dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.quant_method.apply_linear_allreduce(self, x)
+
+    def tp_split_dim(self, attr: str) -> Optional[int]:
+        return 1 if attr in self.quant_method.shardable_attrs(
+            TPMode.ROW) else None
+
+
+def is_nvfp4_linear(module: nn.Module) -> bool:
+    """True if module is an NVFP4-quantized linear (col or row parallel).
+
+    Replaces ``isinstance(module, NVFP4Linear)`` call-sites after the
+    LinearMethodBase migration.
+    """
+    return (isinstance(module, LinearBase) and isinstance(
+        getattr(module, "quant_method", None), NVFP4LinearMethod))
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +410,7 @@ class NVFP4Linear(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class MXFP8Linear(nn.Module):
+class MXFP8Linear(LinearBase):
     """MXFP8 E4M3 linear with E8M0 per-block scales (block_size=32).
 
     Expects a **unified checkpoint** from ``modelopt.torch.export.export_hf_checkpoint``
@@ -253,7 +462,7 @@ class MXFP8Linear(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class AWQLinear(nn.Module):
+class AWQLinear(LinearBase):
     """INT4 AWQ linear (column-packed checkpoint layout).
 
     Checkpoints use ``qweight`` ``[in, out//8]`` int32; :func:`loader.load_weights`
@@ -311,7 +520,7 @@ class AWQLinear(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class ModelOptAWQPrepackedLinear(nn.Module):
+class ModelOptAWQPrepackedLinear(LinearBase):
     """W4A16 AWQ linear with prepacked uint8 weights.
 
     Checkpoint: ``weight`` ``[out//2, in]`` uint8, ``weight_scale`` ``[out, in//g]``
@@ -371,7 +580,7 @@ class ModelOptAWQPrepackedLinear(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class GPTQLinear(nn.Module):
+class GPTQLinear(LinearBase):
     """GPTQ INT4 linear (symmetric or asymmetric, group-quantized) -- int4_gptq format.
 
     GPTQ packs 8 int4 nibbles per int32 along the *input* axis (row-packed),
@@ -446,7 +655,7 @@ class GPTQLinear(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class INT8SQLinear(nn.Module):
+class INT8SQLinear(LinearBase):
     """INT8 SmoothQuant W8A8 linear (per-channel weight, per-tensor activation).
 
     Checkpoint layout (keys match exactly):
@@ -508,6 +717,7 @@ def make_linear(
     out_features: int,
     bias: bool = False,
     module_name: str = "",
+    tp_mode: TPMode = TPMode.REPLICATED,
 ) -> nn.Module:
     """Return the right linear layer class for *module_name* under *config*.
 
@@ -525,28 +735,52 @@ def make_linear(
         out_features:  Output feature dimension.
         bias:          Include bias term.
         module_name:   Module path relative to the model root (e.g. ``"lm_head"``).
+        tp_mode:       Tensor-parallel sharding mode: ``'col'`` (output dim
+                       sharded, no comm), ``'row'`` (input dim sharded,
+                       AllReduce on output) or ``'none'`` (replicated).
+                       Only takes effect when ``config.tp_size > 1``.
     """
     quant_type = module_quant_type(module_name, config)
 
-    if quant_type == QUANT_FP16:
-        return FP16Linear(in_features, out_features, bias)
-    if quant_type == QUANT_FP8:
-        return FP8Linear(in_features, out_features, bias)
-    if quant_type == QUANT_MXFP8:
-        return MXFP8Linear(in_features, out_features, config.quant.group_size,
-                           bias)
+    # NVFP4 routes through the new composition design.
+    tp_mode = TPMode(tp_mode)
     if quant_type == QUANT_NVFP4:
-        return NVFP4Linear(in_features, out_features, config.quant.group_size,
-                           bias)
-    if quant_type == QUANT_INT4_AWQ:
-        return AWQLinear(in_features, out_features, config.quant.group_size,
-                         bias)
-    if quant_type == QUANT_INT4_AWQ_MODELOPT:
-        return ModelOptAWQPrepackedLinear(in_features, out_features,
-                                          config.quant.group_size, bias)
-    if quant_type == QUANT_INT4_GPTQ:
-        return GPTQLinear(in_features, out_features, config.quant.group_size,
-                          config.quant.gptq_zero_point_offset, bias)
-    if quant_type == QUANT_INT8_SQ:
-        return INT8SQLinear(in_features, out_features, bias)
-    raise ValueError(f"Unknown quant_type: {quant_type!r}")
+        method = NVFP4LinearMethod(group_size=config.quant.group_size)
+        if config.tp_size == 1:
+            return ReplicatedLinear(in_features, out_features, bias,
+                                    torch.float16, config.mapping, method)
+        if tp_mode == TPMode.ROW:
+            return RowParallelLinear(in_features, out_features, bias,
+                                     torch.float16, config.mapping, method)
+        return ColumnParallelLinear(in_features,
+                                    out_features,
+                                    bias,
+                                    torch.float16,
+                                    config.mapping,
+                                    method,
+                                    tp_mode=tp_mode)
+
+    if quant_type == QUANT_FP16:
+        layer = FP16Linear(in_features, out_features, bias)
+    elif quant_type == QUANT_FP8:
+        layer = FP8Linear(in_features, out_features, bias)
+    elif quant_type == QUANT_MXFP8:
+        layer = MXFP8Linear(in_features, out_features, config.quant.group_size,
+                            bias)
+    elif quant_type == QUANT_INT4_AWQ:
+        layer = AWQLinear(in_features, out_features, config.quant.group_size,
+                          bias)
+    elif quant_type == QUANT_INT4_AWQ_MODELOPT:
+        layer = ModelOptAWQPrepackedLinear(in_features, out_features,
+                                           config.quant.group_size, bias)
+    elif quant_type == QUANT_INT4_GPTQ:
+        layer = GPTQLinear(in_features, out_features, config.quant.group_size,
+                           config.quant.gptq_zero_point_offset, bias)
+    elif quant_type == QUANT_INT8_SQ:
+        layer = INT8SQLinear(in_features, out_features, bias)
+    else:
+        raise ValueError(f"Unknown quant_type: {quant_type!r}")
+
+    # Tag with TP sharding mode so the checkpoint loader can shard on assignment.
+    layer.tp_mode = tp_mode if config.tp_size > 1 else TPMode.REPLICATED
+    return layer
