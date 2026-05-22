@@ -141,12 +141,13 @@ check_requirements(_module_import_guard=True)
 
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
-from tensorrt_edgellm.config import NVFP4_MOE_BACKEND_THOR, QUANT_NVFP4
-from tensorrt_edgellm.config import ModelConfig as LLConfig  # noqa: E402
-from tensorrt_edgellm.config import QuantConfig as LLQuantConfig
+from tensorrt_edgellm.config import NVFP4_MOE_BACKEND_THOR  # noqa: E402
+from tensorrt_edgellm.config import QUANT_NVFP4, ModelConfig, QuantConfig
 from tensorrt_edgellm.models.linear import NVFP4Linear  # noqa: E402
 from tensorrt_edgellm.models.nemotron_h.modeling_nemotron_h import \
     NemotronHMoEMLP  # noqa: E402
+from tensorrt_edgellm.models.qwen3_5_moe.modeling_qwen3_5_moe import \
+    Qwen3_5SparseMoeBlock  # noqa: E402
 from tensorrt_edgellm.models.qwen3_moe.modeling_qwen3_moe import \
     Qwen3SparseMoeBlock  # noqa: E402
 
@@ -364,7 +365,7 @@ def _create_toy_nemotron_h_moe_mlp(
     e_ct = int(num_experts)
     tk = int(top_k)
 
-    cfg = LLConfig(
+    cfg = ModelConfig(
         model_type="nemotron_h",
         hidden_size=h,
         num_hidden_layers=1,
@@ -384,7 +385,7 @@ def _create_toy_nemotron_h_moe_mlp(
         topk_group=topk_group,
         norm_topk_prob=norm_topk_prob,
         routed_scaling_factor=float(routed_scaling_factor),
-        quant=LLQuantConfig(quant_type=QUANT_NVFP4, group_size=16),
+        quant=QuantConfig(quant_type=QUANT_NVFP4, group_size=16),
     )
     mlp = NemotronHMoEMLP(cfg, module_prefix="backbone.layers.0.mixer")
     mlp.eval()
@@ -3203,7 +3204,7 @@ def run_nvfp4_w4a16_moe_plugin_accuracy_case(
     )
 
     # New FE: build NemotronHMoEMLP populated from the HF model's actual weights
-    cfg = LLConfig(
+    cfg = ModelConfig(
         model_type="nemotron_h",
         hidden_size=h,
         num_hidden_layers=1,
@@ -3223,7 +3224,7 @@ def run_nvfp4_w4a16_moe_plugin_accuracy_case(
         topk_group=1,
         norm_topk_prob=True,
         routed_scaling_factor=2.5,
-        quant=LLQuantConfig(quant_type=QUANT_NVFP4, group_size=16),
+        quant=QuantConfig(quant_type=QUANT_NVFP4, group_size=16),
     )
     mod = NemotronHMoEMLP(cfg, module_prefix="backbone.layers.0.mixer")
     mod.eval()
@@ -3760,7 +3761,7 @@ def _run_nvfp4_moe_plugin_prefill_accuracy_case(
 
     # New FE: build NemotronHMoEMLP populated from the HF moe's (scaled) weights
     h_sz = int(hidden_size)
-    cfg = LLConfig(
+    cfg = ModelConfig(
         model_type="nemotron_h",
         hidden_size=h_sz,
         num_hidden_layers=1,
@@ -3780,7 +3781,7 @@ def _run_nvfp4_moe_plugin_prefill_accuracy_case(
         topk_group=1,
         norm_topk_prob=True,
         routed_scaling_factor=2.5,
-        quant=LLQuantConfig(quant_type=QUANT_NVFP4, group_size=16),
+        quant=QuantConfig(quant_type=QUANT_NVFP4, group_size=16),
     )
     mod = NemotronHMoEMLP(cfg, module_prefix="backbone.layers.0.mixer")
     mod.eval()
@@ -4108,7 +4109,7 @@ def test_nvfp4_moe_plugin_prefill_accuracy(
 def test_qwen3_sparse_moe_block_thor_prepare_contract() -> None:
     """Real Qwen3SparseMoeBlock Thor path prepares plugin buffers and traces the prefill-sized shape."""
     hidden_size, moe_inter_size, num_experts, top_k = 64, 64, 4, 2
-    cfg = LLConfig(
+    cfg = ModelConfig(
         model_type="qwen3_moe",
         hidden_size=hidden_size,
         num_hidden_layers=1,
@@ -4124,9 +4125,9 @@ def test_qwen3_sparse_moe_block_thor_prepare_contract() -> None:
         num_experts_per_tok=top_k,
         moe_intermediate_size=moe_inter_size,
         decoder_sparse_step=1,
-        quant=LLQuantConfig(quant_type=QUANT_NVFP4,
-                            group_size=16,
-                            nvfp4_moe_backend=NVFP4_MOE_BACKEND_THOR),
+        quant=QuantConfig(quant_type=QUANT_NVFP4,
+                          group_size=16,
+                          nvfp4_moe_backend=NVFP4_MOE_BACKEND_THOR),
     )
     block = Qwen3SparseMoeBlock(cfg).eval()
 
@@ -4166,6 +4167,132 @@ def test_qwen3_sparse_moe_block_thor_prepare_contract() -> None:
     # The custom-op eager stub returns zeros_like, but this still verifies that
     # the real module path wires all Thor plugin inputs for a prefill-sized
     # token count (B*S > 16).
+    hidden = torch.randn(1,
+                         17,
+                         hidden_size,
+                         generator=gen,
+                         dtype=torch.float16)
+    out = block(hidden)
+    assert out.shape == hidden.shape
+    assert out.dtype == hidden.dtype
+
+
+@pytest.mark.skipif(not hasattr(torch, "float8_e4m3fn"),
+                    reason="needs torch.float8_e4m3fn")
+def test_qwen3_5_moe_sparse_block_thor_prepare_contract() -> None:
+    """Qwen3_5SparseMoeBlock Thor path: inherited NVFP4 repack + shared-expert addition.
+
+    Verifies the subclass (used by Qwen3.5 / Qwen3.6 35B-A3B) correctly composes
+    on top of Qwen3SparseMoeBlock: routed-expert NVFP4 buffers come from the
+    inherited ``_prepare_moe_weights``, while shared_expert + shared_expert_gate
+    survive the repack and participate in forward.
+
+    Uses E=8 / top_k=4 (parent test uses E=4 / top_k=2) so the per-expert
+    loop, top-k tile, and shared-expert path are all exercised on a different
+    profile, while keeping H / I small for fast CI. The shape contract is
+    dim-parametric — verified to hold at full Qwen3.6 35B-A3B production dims
+    (H=2048, I=512, E=256, top_k=8) during initial bring-up.
+    """
+    hidden_size, moe_inter_size, num_experts, top_k = 64, 64, 8, 4
+    cfg = ModelConfig(
+        model_type="qwen3_5_moe_text",
+        hidden_size=hidden_size,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        intermediate_size=moe_inter_size,
+        head_dim=hidden_size,
+        rms_norm_eps=1e-6,
+        vocab_size=128,
+        rope_theta=10000.0,
+        max_position_embeddings=4096,
+        num_experts=num_experts,
+        num_experts_per_tok=top_k,
+        moe_intermediate_size=moe_inter_size,
+        moe_shared_expert_intermediate_size=moe_inter_size,
+        decoder_sparse_step=1,
+        quant=QuantConfig(
+            quant_type=QUANT_NVFP4,
+            group_size=16,
+            nvfp4_moe_backend=NVFP4_MOE_BACKEND_THOR,
+            # Mirror NVIDIA's NVFP4 recipe: ``shared_expert_gate`` is in the
+            # ignore list, so ``make_linear`` returns an FP16Linear for it.
+            excluded={"model.layers.0.mlp.shared_expert_gate"},
+        ),
+    )
+    block = Qwen3_5SparseMoeBlock(cfg, layer_idx=0).eval()
+
+    gen = torch.Generator()
+    gen.manual_seed(91532)
+    block.gate.weight.data.copy_(
+        torch.randn(num_experts,
+                    hidden_size,
+                    generator=gen,
+                    dtype=torch.float16))
+    for expert in block.experts:
+        _populate_nvfp4_linear(
+            expert.gate_proj,
+            torch.randn(moe_inter_size, hidden_size, generator=gen) * 0.25,
+            input_scale_value=2e-3)
+        _populate_nvfp4_linear(
+            expert.up_proj,
+            torch.randn(moe_inter_size, hidden_size, generator=gen) * 0.25,
+            input_scale_value=3e-3)
+        _populate_nvfp4_linear(
+            expert.down_proj,
+            torch.randn(hidden_size, moe_inter_size, generator=gen) * 0.25,
+            input_scale_value=4e-3)
+    # Shared expert: same NVFP4Linear shape contract as routed experts.
+    _populate_nvfp4_linear(
+        block.shared_expert.gate_proj,
+        torch.randn(moe_inter_size, hidden_size, generator=gen) * 0.25,
+        input_scale_value=2e-3)
+    _populate_nvfp4_linear(
+        block.shared_expert.up_proj,
+        torch.randn(moe_inter_size, hidden_size, generator=gen) * 0.25,
+        input_scale_value=3e-3)
+    _populate_nvfp4_linear(
+        block.shared_expert.down_proj,
+        torch.randn(hidden_size, moe_inter_size, generator=gen) * 0.25,
+        input_scale_value=4e-3)
+    # Shared-expert gate is excluded → FP16Linear with a [1, H] weight.
+    block.shared_expert_gate.weight.data.copy_(
+        torch.randn(1, hidden_size, generator=gen, dtype=torch.float16))
+
+    block._prepare_moe_weights()
+
+    # Inherited Thor plugin buffers — shapes computed dim-parametrically per
+    # the schema in ``tensorrt_edgellm/llm_models/layers/nvfp4_moe_plugin.py``:
+    # FC1 SwiGLU has 2*I along the N axis; SF tensors use the 128x4 atom
+    # padding (padUp(M, 128), padUp(K/16, 4)).
+    def pad_up(x: int, m: int) -> int:
+        return ((x + m - 1) // m) * m
+
+    assert tuple(block.fc_up_qweights.shape) == (num_experts, hidden_size,
+                                                 moe_inter_size)
+    assert tuple(
+        block.fc_up_blocks_scale.shape) == (num_experts,
+                                            pad_up(2 * moe_inter_size, 128),
+                                            pad_up(hidden_size // 16, 4))
+    assert tuple(block.fc_down_qweights.shape) == (num_experts, moe_inter_size,
+                                                   hidden_size // 2)
+    assert tuple(
+        block.fc_down_blocks_scale.shape) == (num_experts,
+                                              pad_up(hidden_size, 128),
+                                              pad_up(moe_inter_size // 16, 4))
+    assert tuple(block.hidden_global_scale.shape) == (2, )
+    assert tuple(block.e_score_correction_bias.shape) == (num_experts, )
+    assert len(block.experts) == 0  # parent clears per-expert ModuleList
+
+    # Shared-expert sub-modules survive the repack.
+    for proj_name in ("gate_proj", "up_proj", "down_proj"):
+        assert hasattr(block.shared_expert, proj_name), \
+            f"shared_expert.{proj_name} lost during repack"
+    assert hasattr(block, "shared_expert_gate")
+
+    # Forward: ``routed + shared * sigmoid(shared_expert_gate)`` returns
+    # FP16 hidden states with the input shape. The custom-op stub yields zeros,
+    # so this just verifies all op signatures wire correctly and dtypes match.
     hidden = torch.randn(1,
                          17,
                          hidden_size,
