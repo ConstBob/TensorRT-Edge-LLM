@@ -168,8 +168,9 @@ class AutoModel:
                 apply_reduced_vocab_from_dir
             apply_reduced_vocab_from_dir(model, reduced_vocab_dir)
 
-        # Post-load optimisation: fuse GDN input projections for Qwen3.5.
-        if config.model_type == "qwen3_5_text" and not mtp_draft:
+        # Post-load optimisation: fuse GDN input projections for Qwen3.5 / Qwen3.5-MoE.
+        if (config.model_type in ("qwen3_5_text", "qwen3_5_moe_text")
+                and not mtp_draft):
             from .models.qwen3_5 import fuse_gdn_input_projections
             fuse_gdn_input_projections(model)
 
