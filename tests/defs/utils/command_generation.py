@@ -87,7 +87,6 @@ def _llm_quant_shell(
         "llm",
         f"--model_dir={input_model_dir}",
         f"--output_dir={output_model_dir}",
-        f"--dataset={config.get_cnn_dailymail_dataset_dir()}",
     ]
     if needs_weight_quant:
         args.append(f"--quantization={config.llm_precision}")
