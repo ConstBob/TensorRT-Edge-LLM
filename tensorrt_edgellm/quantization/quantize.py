@@ -429,6 +429,8 @@ def _skip_resmooth_for_hybrid(model, quantization: str = ""):
 def _calibrate_multimodal(model, batches):
     """Forward-loop calibration pass for multimodal ``BatchFeature`` dicts."""
     device = model.device
+    valid_batches = 0
+    skipped_nan_batches = 0
     for batch in tqdm(batches, desc="Calibrating (multimodal)"):
         kwargs = {}
         for k, v in batch.items():
@@ -441,7 +443,40 @@ def _calibrate_multimodal(model, batches):
             kwargs[k] = v
         kwargs.setdefault("use_cache", False)
         with torch.no_grad():
-            model(**kwargs)
+            try:
+                model(**kwargs)
+                valid_batches += 1
+            except AssertionError as exc:
+                # Some multimodal samples can produce non-finite activations
+                # during calibrator collection. Skip those samples so the
+                # calibration run can complete with remaining valid batches.
+                if "detected nan values in amax" in str(exc):
+                    skipped_nan_batches += 1
+                    continue
+                raise
+    if valid_batches == 0:
+        raise RuntimeError("All multimodal calibration batches were skipped due to NaN amax.")
+    if skipped_nan_batches > 0:
+        print(f"[WARN] Skipped {skipped_nan_batches} multimodal calibration batch(es) with NaN amax.")
+
+
+def _ensure_legacy_quantizer_amax_attr(model) -> None:
+    """Backfill ``_amax`` for newer TensorQuantizer variants.
+
+    Some ModelOpt export paths still reference ``_amax`` directly. Newer
+    quantizer objects expose only ``amax``. Mirror ``amax`` into ``_amax`` to
+    keep export_hf_checkpoint compatible across mixed ModelOpt versions.
+    """
+    from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
+
+    for module in model.modules():
+        if not isinstance(module, TensorQuantizer):
+            continue
+        if hasattr(module, "_amax"):
+            continue
+        amax = getattr(module, "amax", None)
+        if amax is not None:
+            module._amax = amax
 
 
 def _calibrate_asr_multimodal(model, batch_iter):
@@ -596,6 +631,7 @@ def quantize_and_export(
 
     _fix_generation_config_for_strict_validate(model)
     _normalize_tied_weights_keys(model)
+    _ensure_legacy_quantizer_amax_attr(model)
 
     os.makedirs(output_dir, exist_ok=True)
     with torch.inference_mode(), _skip_resmooth_for_hybrid(
