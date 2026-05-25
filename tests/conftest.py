@@ -15,6 +15,7 @@
 import logging
 import os
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -150,6 +151,15 @@ def env_config():
 def setup_environment(env_config):
     """Setup environment and library paths"""
     os.makedirs(env_config.onnx_dir, exist_ok=True)
+    # Fail fast with a clear message if ONNX_DIR points to a read-only mount.
+    try:
+        with tempfile.NamedTemporaryFile(dir=env_config.onnx_dir, delete=True):
+            pass
+    except OSError as exc:
+        raise ValueError(
+            f"ONNX_DIR is not writable: '{env_config.onnx_dir}'. "
+            "Please set ONNX_DIR to a writable local path."
+        ) from exc
     if env_config.engine_dir:
         os.makedirs(env_config.engine_dir, exist_ok=True)
     os.makedirs(env_config.test_log_dir, exist_ok=True)

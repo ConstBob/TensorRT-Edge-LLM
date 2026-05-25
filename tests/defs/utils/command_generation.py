@@ -309,13 +309,22 @@ def generate_post_tensorrt_edgellm_commands(
         ]
         commands.append((insert_cmd, 120))
 
-        if config.model_name not in AVAILABLE_LORA_WEIGHTS:
+        # Support quantized/export variant names by falling back to the base model name.
+        base_model_name = TestConfig._strip_model_quant_suffixes(
+            config.model_name)
+        model_name_candidates = [config.model_name, base_model_name]
+        lora_model_name = None
+        for candidate in dict.fromkeys(model_name_candidates):
+            if candidate in AVAILABLE_LORA_WEIGHTS:
+                lora_model_name = AVAILABLE_LORA_WEIGHTS[candidate]
+                break
+        if lora_model_name is None:
             raise ValueError(
-                f"No LoRA weights available for {config.model_name}. "
+                f"No LoRA weights available for {config.model_name} "
+                f"(also tried base model: {base_model_name}). "
                 f"Please add it to AVAILABLE_LORA_WEIGHTS")
         edgellm_data_dir = os.environ.get("EDGELLM_DATA_DIR",
                                           "/scratch.edge_llm_cache")
-        lora_model_name = AVAILABLE_LORA_WEIGHTS[config.model_name]
         lora_weights_dir = _find_directory(edgellm_data_dir, lora_model_name,
                                            DEFAULT_SEARCH_DEPTH)
         if not lora_weights_dir:

@@ -42,6 +42,7 @@ tools = [
     "librosa==0.11.0",
     "tiktoken==0.13.0",
     "torchvision==0.27.0",
+    "backoff",
 ]
 server = [
     "fastapi==0.136.1",
