@@ -27,6 +27,7 @@ import pytest
 from conftest import EnvironmentConfig
 from pytest_helpers import run_command, timer_context
 
+from .ckpt_layout_validator import validate_ckpt_layout
 from .config import ModelType, TaskType, TestConfig
 from .utils.checkpoint_export_helpers import run_command_list
 from .utils.command_generation import generate_pre_export_commands
@@ -112,16 +113,40 @@ def validate_quantization_result(config: TestConfig) -> None:
     needs_audio_quant = bool(config.audio_precision == "fp8")
 
     if needs_weight_quant or needs_visual_quant or needs_audio_quant:
-        _require_hf_quant_checkpoint(config.get_quantized_model_dir(),
-                                     "Quantized model")
+        ckpt_dir = config.get_quantized_model_dir()
+        _require_hf_quant_checkpoint(ckpt_dir, "Quantized model")
+        validate_ckpt_layout(
+            ckpt_dir,
+            body_precision=config.llm_precision,
+            lm_head_precision=config.lm_head_precision,
+            visual_precision=config.visual_precision,
+            audio_precision=config.audio_precision,
+            label="Quantized model",
+        )
     elif needs_kv_cache_quant:
-        _require_hf_quant_checkpoint(config.get_kv_cache_quantized_model_dir(),
-                                     "KV-cache quantized model")
+        ckpt_dir = config.get_kv_cache_quantized_model_dir()
+        _require_hf_quant_checkpoint(ckpt_dir, "KV-cache quantized model")
+        # KV-only quantization: body stays fp16; we still verify nothing weird
+        # snuck in (e.g. body silently quantized when name doesn't say so).
+        validate_ckpt_layout(
+            ckpt_dir,
+            body_precision="fp16",
+            lm_head_precision="fp16",
+            visual_precision="fp16",
+            audio_precision="fp16",
+            label="KV-cache quantized model",
+        )
 
     if (config.is_eagle and not config.is_mtp and config.draft_llm_precision
             and config.draft_llm_precision not in ("fp16", "int4_gptq")):
-        _require_hf_quant_checkpoint(config.get_quantized_draft_model_dir(),
-                                     "Quantized draft model")
+        draft_dir = config.get_quantized_draft_model_dir()
+        _require_hf_quant_checkpoint(draft_dir, "Quantized draft model")
+        validate_ckpt_layout(
+            draft_dir,
+            body_precision=config.draft_llm_precision,
+            lm_head_precision=config.draft_lm_head_precision,
+            label="Quantized draft model",
+        )
 
 
 # ---------------------------------------------------------------------------

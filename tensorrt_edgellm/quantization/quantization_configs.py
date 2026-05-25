@@ -19,18 +19,27 @@ from typing import Any, Dict, List, Optional
 
 import modelopt.torch.quantization as mtq
 
+# LM-head overrides layer on top of the backbone recipe. Each entry must
+# enable only the lm_head quantizers — never a global ``"default": {"enable":
+# False}`` here. Such a wildcard merged into the list as ``{"quantizer_name":
+# "*", "enable": False}`` lands AFTER the backbone's ``*weight_quantizer``
+# enables, silently disabling every body Linear's weight_quantizer. The
+# backbone CFG (``mtq.FP8_DEFAULT_CFG`` / ``NVFP4_DEFAULT_CFG`` / ...) already
+# disables everything by default; only that one should — re-disabling here
+# is the producer-side bug that left 100+ checkpoints with fp16 bodies
+# despite ``-LMFP8`` / ``-LMNVFP4`` names.
+
 FP8_LM_HEAD = {
     "quant_cfg": {
         "*lm_head.input_quantizer": {
             "num_bits": (4, 3),
-            "axis": None
+            "axis": None,
+            "enable": True,
         },
         "*lm_head.weight_quantizer": {
             "num_bits": (4, 3),
-            "axis": None
-        },
-        "default": {
-            "enable": False
+            "axis": None,
+            "enable": True,
         },
     }
 }
@@ -44,9 +53,6 @@ INT4_AWQ_LM_HEAD = {
                 "type": "static"
             },
             "enable": True,
-        },
-        "default": {
-            "enable": False
         },
     }
 }
@@ -73,9 +79,6 @@ NVFP4_LM_HEAD = {
             "axis": None,
             "enable": True,
         },
-        "default": {
-            "enable": False
-        },
     }
 }
 
@@ -98,9 +101,6 @@ MXFP8_LM_HEAD = {
                 "scale_bits": (8, 0)
             },
             "enable": True,
-        },
-        "default": {
-            "enable": False
         },
     }
 }

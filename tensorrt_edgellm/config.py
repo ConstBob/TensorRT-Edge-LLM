@@ -873,23 +873,22 @@ def _strip_vl_prefix(name: str) -> str:
 
 
 def _normalize_module_name(name: str) -> str:
-    """Normalise a checkpoint / hf_quant_config module name to the namespace
-    that ``make_linear`` uses (``model.layers.N...``, ``lm_head``, etc.).
+    """Normalise a checkpoint / hf_quant_config module name to the short
+    namespace that ``make_linear`` uses (``layers.N...``, ``lm_head``, etc.).
 
-    Handles compound VL prefixes like ``model.language_model.`` (Qwen3.5-VL)
-    which must be stripped and replaced with ``model.`` to match the module
-    tree built by the modeling code.  Single VL prefixes (``language_model.``,
-    ``text_model.``, ``llm.``) and the generic ``model.`` are stripped
-    without replacement.  At most one prefix is removed per key.
+    LLM ``make_linear`` callers pass names without any ``model.`` prefix
+    (see ``modeling_default.py``: ``module_name=f"layers.{i}.mlp.gate_proj"``).
+    For multimodal checkpoints whose keys are
+    ``model.language_model.layers.N...`` the entire compound prefix must be
+    stripped so the resulting short name matches what ``module_quant_type``
+    looks up.  Single VL prefixes and bare ``model.`` follow the same rule.
 
     Used by ``_effective_excluded_modules``, ``_detect_modelopt_unquantized_linears``,
     and ``_parse_mixed_precision`` so that ``excluded``, ``layer_overrides``,
     and ``module_name`` all share the same name space.
     """
-    # Compound VL prefix: strip outer wrapper, keep inner ``model.``.
-    # Must be checked before "model." to avoid partial strip.
     if name.startswith("model.language_model."):
-        return "model." + name[len("model.language_model."):]
+        return name[len("model.language_model."):]
     for prefix in _VL_LLM_PREFIXES + ("model.", ):
         if name.startswith(prefix):
             return name[len(prefix):]
