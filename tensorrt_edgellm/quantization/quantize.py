@@ -28,7 +28,6 @@ from typing import Any, Optional
 
 import modelopt.torch.quantization as mtq
 import torch
-from datasets import load_dataset
 from modelopt.torch.export import export_hf_checkpoint
 from modelopt.torch.quantization.utils import is_quantized
 from torch.utils.data import DataLoader
@@ -49,6 +48,7 @@ def _text_calib_dataloader(tokenizer,
                            num_samples=512,
                            max_length=512):
     """Return a DataLoader of tokenised ``input_ids`` for calibration."""
+    from datasets import load_dataset
     if "cnn_dailymail" in dataset_name:
         ds = load_dataset(dataset_name, name="3.0.0", split="train")
         texts = ds["article"][:num_samples]
@@ -118,6 +118,7 @@ def _iter_image_question_pairs(dataset_name: str):
 
     Splits are tried in the order ``dev`` → ``validation`` → ``train``.
     """
+    from datasets import load_dataset
     last_err: Optional[Exception] = None
     ds = None
     for split in ("dev", "validation", "train"):
