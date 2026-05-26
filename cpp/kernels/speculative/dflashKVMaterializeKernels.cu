@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "common/cudaMacros.h"
+#include "common/checkMacros.h"
 #include "dflashKVMaterializeKernels.h"
 
 #include <cassert>

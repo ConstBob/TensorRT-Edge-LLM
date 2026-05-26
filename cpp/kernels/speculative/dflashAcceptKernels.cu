@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "common/cudaMacros.h"
+#include "common/checkMacros.h"
 #include "kernels/speculative/dflashAcceptKernels.h"
 
 #include <cfloat>

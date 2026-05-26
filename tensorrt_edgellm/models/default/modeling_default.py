@@ -482,9 +482,12 @@ class Transformer(nn.Module):
         # consumes exactly this tensor.
         self.last_pre_norm_hidden_states = hidden_states
 
-        # DFlash hidden concat: concatenate target-layer hidden states
-        dflash_hidden_concat = (torch.cat(dflash_hidden_list, dim=-1)
-                                if dflash_hidden_list else None)
+        # DFlash hidden concat: concatenate target-layer hidden states.
+        # Stored as an attribute (like last_pre_norm_hidden_states) so that
+        # Transformer.forward() keeps its 3-value return signature and
+        # downstream callers (TTS talker, Qwen3.5 text, etc.) are unaffected.
+        self.dflash_hidden_concat = (torch.cat(dflash_hidden_list, dim=-1)
+                                     if dflash_hidden_list else None)
 
         normed = self.norm(hidden_states)
 
@@ -492,8 +495,7 @@ class Transformer(nn.Module):
             all_hidden_states.append(normed)
 
         return (normed, tuple(present_key_values_list),
-                tuple(all_hidden_states) if output_hidden_states else None,
-                dflash_hidden_concat)
+                tuple(all_hidden_states) if output_hidden_states else None)
 
 
 # ---------------------------------------------------------------------------
@@ -717,7 +719,7 @@ class CausalLM(nn.Module):
         dflash_target_layer_ids = getattr(self.config,
                                           'dflash_target_layer_ids', None)
 
-        hidden_states, present_key_values, all_hidden_states, dflash_hidden_concat = self.model(
+        hidden_states, present_key_values, all_hidden_states = self.model(
             inputs_embeds,
             past_key_values,
             rope_rotary_cos_sin,
@@ -730,6 +732,8 @@ class CausalLM(nn.Module):
             dflash_target_layer_ids=dflash_target_layer_ids
             if dflash_base else None,
         )
+        dflash_hidden_concat = getattr(self.model, 'dflash_hidden_concat',
+                                       None)
 
         # Select hidden states for specified token positions before lm_head.
         # last_token_ids: [batch, num_tokens] int64 -- indices into the seq dim.
