@@ -88,29 +88,37 @@ struct ProfileBenchArgs
     std::string engineDir;
     bool debug{false};
     int32_t batchSize{1};
-    int32_t inputLen{-1};
+    int32_t inputLen{-1}; // Input sequence length per batch (required for prefill modes)
     int32_t iterations{10};
     int32_t warmup{3};
-    bool noProfile{true};
-    std::string outputDir;
-    int32_t imageHeight{0};
-    int32_t imageWidth{0};
+    bool noProfile{true};   // Layer profiling is disabled by default; --profile enables it.
+    std::string outputDir;  // Directory to dump output CSV files (layer profiling and E2E timing)
+    int32_t imageHeight{0}; // Image height in pixels (required for visual mode)
+    int32_t imageWidth{0};  // Image width in pixels (required for visual mode)
 
+    // Mode parameter - no default
     BenchMode mode{BenchMode::kNONE};
 
-    int32_t reuseKVLen{0};
-    int32_t pastKVLen{-1};
+    // KV cache parameters - no defaults for required params
+    int32_t reuseKVLen{0}; // For prefill: reused KV cache length per batch
+    int32_t pastKVLen{-1}; // For decode/verify/draft: past KV cache length per batch (required)
 
-    int32_t verifyTreeSize{-1};
-    int32_t draftTreeSize{-1};
+    // Speculative decoding parameters - no defaults
+    int32_t verifyTreeSize{-1}; // For spec_verify
+    int32_t draftTreeSize{-1};  // For spec_draft_proposal/spec_draft_prefill
 
-    int32_t osl{1};
-    int32_t acceptRate{5};
-    int32_t draftStep{6};
+    int32_t osl{1};        // Output sequence length (LLM OSL per batch, default: 1)
+    int32_t acceptRate{5}; // Avg accepted tokens per spec-decode iteration (default: 5)
+    int32_t draftStep{6};  // Number of drafting steps per spec-decode iteration (default: 6)
 
+    // Random seed for reproducibility
     uint64_t seed{0};
+
+    // CUDA graph is enabled by default for decode/EAGLE E2E timing.
     bool noCudaGraph{false};
 
+    // Metadata extraction flags - disabled by default for performance.
+    // Set via --extractLayerInfo <comma-separated list>.
     ExtractLayerInfo extractLayerInfo;
 
     BenchOutputParams toOutputParams() const
