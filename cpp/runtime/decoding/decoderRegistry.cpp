@@ -18,6 +18,7 @@
 #include "runtime/decoding/decoderRegistry.h"
 
 #include "common/logger.h"
+#include "runtime/decoding/dflashDecoder.h"
 #include "runtime/decoding/eagleDecoder.h"
 #include "runtime/decoding/mtpDecoder.h"
 #include "runtime/decoding/vanillaDecoder.h"
@@ -43,6 +44,10 @@ DecoderRegistry::DecoderRegistry(DecodingRuntimeContext& runtime, DecoderRegistr
         case SpecDecodeMode::kEAGLE:
             mSpeculativeDecoder
                 = std::make_unique<EagleDecoder>(runtime, config.engineDir, *config.draftingConfig, config.stream);
+            break;
+        case SpecDecodeMode::kDFlash:
+            mSpeculativeDecoder
+                = std::make_unique<DFlashDecoder>(runtime, config.engineDir, *config.draftingConfig, config.stream);
             break;
         case SpecDecodeMode::kNONE:
             throw std::runtime_error("SpecDecode drafting config was set but no mode is active.");

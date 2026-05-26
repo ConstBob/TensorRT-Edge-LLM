@@ -67,6 +67,13 @@ std::unique_ptr<EngineExecutor> EngineExecutor::createForSpecDecodeDraft(
     return std::unique_ptr<EngineExecutor>(new EngineExecutor(enginePath, std::move(registry)));
 }
 
+std::unique_ptr<EngineExecutor> EngineExecutor::createForDFlashDraft(
+    std::filesystem::path const& enginePath, DeploymentConfig const& bundle)
+{
+    auto registry = buildRegistryForDFlashDraft(bundle);
+    return std::unique_ptr<EngineExecutor>(new EngineExecutor(enginePath, std::move(registry)));
+}
+
 EngineExecutor::~EngineExecutor() noexcept
 {
     for (auto& [hash, cg] : mGraphs)

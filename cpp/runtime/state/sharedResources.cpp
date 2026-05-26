@@ -168,8 +168,9 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
     // budget so the accepted recurrent/conv snapshot can be committed after
     // base verification.
     {
-        int32_t const baseMaxIntermediateSeqLen
-            = (bundle.base.specDecodeType == SpecDecodeMode::kMTP && bundle.base.numLinearAttnLayers > 0)
+        int32_t const baseMaxIntermediateSeqLen = ((bundle.base.specDecodeType == SpecDecodeMode::kMTP
+                                                       || bundle.base.specDecodeType == SpecDecodeMode::kDFlash)
+                                                      && bundle.base.numLinearAttnLayers > 0)
             ? bundle.specConfig->maxVerifySize
             : 0;
         rt::KVCacheManager::Config kvCfg{

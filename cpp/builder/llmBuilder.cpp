@@ -24,6 +24,7 @@
 #include "common/trtUtils.h"
 #include "common/version.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <fstream>
 #include <string>
@@ -177,11 +178,11 @@ bool LLMBuilder::build()
     std::string engineFileName;
     if (mBuilderConfig.eagleDraft)
     {
-        engineFileName = "eagle_draft.engine";
+        engineFileName = "spec_draft.engine";
     }
     else if (mBuilderConfig.eagleBase)
     {
-        engineFileName = "eagle_base.engine";
+        engineFileName = "spec_base.engine";
     }
     else
     {
@@ -259,7 +260,18 @@ bool LLMBuilder::parseConfig()
     mHiddenSize = mModelConfig["hidden_size"].get<int32_t>();
     // For MTP draft, base model outputs hidden_size (1x); for EAGLE3 draft, it outputs hidden_size * 3.
     std::string const modelType = mModelConfig.value("model_type", "");
-    mTargetModelOutputHiddenDim = (modelType == "mtp_draft") ? mHiddenSize : mHiddenSize * 3;
+    if (modelType == "mtp_draft")
+    {
+        mTargetModelOutputHiddenDim = mHiddenSize;
+    }
+    else if (modelType == "dflash_draft" && mModelConfig.contains("base_model_hidden_size"))
+    {
+        mTargetModelOutputHiddenDim = mModelConfig["base_model_hidden_size"].get<int32_t>();
+    }
+    else
+    {
+        mTargetModelOutputHiddenDim = mHiddenSize * 3;
+    }
     mNumKVHeads = mModelConfig["num_key_value_heads"].get<int32_t>();
     auto numAttentionHeads = mModelConfig["num_attention_heads"].get<int32_t>();
 
@@ -315,6 +327,22 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
 
     bool result = true;
 
+    std::string const modelType = mModelConfig.value("model_type", "");
+    if (modelType == "dflash_draft")
+    {
+        result &= setupDFlashDraftProfiles(*contextProfile, *generationProfile);
+        if (!result)
+        {
+            LOG_ERROR("Failed to setup DFlash draft optimization profiles");
+            return false;
+        }
+        LOG_DEBUG("%s", printOptimizationProfile(contextProfile, "context_profile", &network).c_str());
+        LOG_DEBUG("%s", printOptimizationProfile(generationProfile, "generation_profile", &network).c_str());
+        config.addOptimizationProfile(contextProfile);
+        config.addOptimizationProfile(generationProfile);
+        return true;
+    }
+
     // Setup common profiles
     result &= setupCommonProfiles(*contextProfile, *generationProfile);
 
@@ -329,8 +357,7 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
     }
 
     // Setup intermediate state profiles for MTP base models
-    std::string const modelType = mModelConfig.value("model_type", "");
-    if (modelType == "mtp_base")
+    if (modelType == "mtp_base" || modelType == "dflash_base")
     {
         result &= setupIntermediateRecurrentStateProfiles(*contextProfile, *generationProfile);
         result &= setupIntermediateConvStateProfiles(*contextProfile, *generationProfile);
@@ -514,6 +541,76 @@ bool LLMBuilder::setupEagleProfiles(
             createDims({mBuilderConfig.maxBatchSize, maxTokens}));
     }
 
+    return result;
+}
+
+bool LLMBuilder::setupDFlashDraftProfiles(
+    nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
+{
+    bool result = true;
+
+    int64_t const maxDraftTokens = std::max<int64_t>(1, mBuilderConfig.maxDraftTreeSize);
+    int64_t const optDraftTokens = std::max<int64_t>(1, maxDraftTokens / 2);
+    int64_t const maxTargetHiddenLen = std::max<int64_t>(1, mBuilderConfig.maxKVCacheCapacity);
+    int64_t const optTargetHiddenLen = std::max<int64_t>(1, maxTargetHiddenLen / 2);
+
+    int32_t const attnMaskAlignSize = 32;
+    int64_t const packedMaskLen
+        = static_cast<int64_t>((maxDraftTokens + attnMaskAlignSize - 1) / attnMaskAlignSize * attnMaskAlignSize);
+    int64_t const optPackedMaskLen
+        = static_cast<int64_t>((optDraftTokens + attnMaskAlignSize - 1) / attnMaskAlignSize * attnMaskAlignSize);
+
+    auto setupOneProfile = [&](nvinfer1::IOptimizationProfile& profile) {
+        bool ok = true;
+        // inputs_embeds: [batch, block_seq, hiddenSize]
+        ok &= setOptimizationProfile(&profile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, optDraftTokens, mHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, maxDraftTokens, mHiddenSize}));
+        // target_hidden_concat: [batch, delta_seq, baseOutputHiddenDim]
+        ok &= setOptimizationProfile(&profile, binding_names::kDFlashTargetHiddenConcat,
+            createDims({1, 1, mTargetModelOutputHiddenDim}),
+            createDims({mBuilderConfig.maxBatchSize, optTargetHiddenLen, mTargetModelOutputHiddenDim}),
+            createDims({mBuilderConfig.maxBatchSize, maxTargetHiddenLen, mTargetModelOutputHiddenDim}));
+        // rope_rotary_cos_sin: [1, kv_capacity, rotaryDim]
+        ok &= setOptimizationProfile(&profile, binding_names::kRopeCosSin, createDims({1, 1, mRotaryDim}),
+            createDims({1, mBuilderConfig.maxKVCacheCapacity, mRotaryDim}),
+            createDims({1, mBuilderConfig.maxKVCacheCapacity, mRotaryDim}));
+        // context_lengths: [batch]
+        ok &= setOptimizationProfile(&profile, binding_names::kContextLengths, createDims({1}),
+            createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+        // kvcache_start_index: [batch]
+        ok &= setOptimizationProfile(&profile, binding_names::kKVCacheStartIndex, createDims({1}),
+            createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+        // delta_lengths: [batch]
+        ok &= setOptimizationProfile(&profile, binding_names::kDFlashDeltaLengths, createDims({1}),
+            createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+        // attention_mask: [batch, block_seq, packed_mask_len]
+        ok &= setOptimizationProfile(&profile, binding_names::kAttentionMask, createDims({1, 1, 1}),
+            createDims({mBuilderConfig.maxBatchSize, optDraftTokens, optPackedMaskLen}),
+            createDims({mBuilderConfig.maxBatchSize, maxDraftTokens, packedMaskLen}));
+        // attention_pos_id: [batch, block_seq]
+        ok &= setOptimizationProfile(&profile, binding_names::kAttentionPosId, createDims({1, 1}),
+            createDims({mBuilderConfig.maxBatchSize, optDraftTokens}),
+            createDims({mBuilderConfig.maxBatchSize, maxDraftTokens}));
+        // KV cache per-layer: [batch, 2, numKVHeads, kv_capacity, headDim]
+        for (int32_t i = 0; i < mNbKVCacheInputs; ++i)
+        {
+            std::string pastName = std::string(binding_names::kPastKeyValuesTemplate) + "_" + std::to_string(i);
+            std::string presentName = std::string(binding_names::kPresentKeyValuesTemplate) + "_" + std::to_string(i);
+            ok &= setOptimizationProfile(&profile, pastName.c_str(), createDims({1, 2, mNumKVHeads, 1, mHeadSize}),
+                createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize}),
+                createDims(
+                    {mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize}));
+            ok &= setOptimizationProfile(&profile, presentName.c_str(), createDims({1, 2, mNumKVHeads, 1, mHeadSize}),
+                createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize}),
+                createDims(
+                    {mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize}));
+        }
+        return ok;
+    };
+
+    result &= setupOneProfile(contextProfile);
+    result &= setupOneProfile(generationProfile);
     return result;
 }
 
@@ -955,9 +1052,9 @@ bool LLMBuilder::copyTokenizerFiles()
 
 bool LLMBuilder::copyEagleFiles()
 {
-    // Copy d2t.safetensors for Eagle3 draft models only. MTP draft shares vocab with base and has no d2t mapping.
+    // Copy d2t.safetensors for Eagle3 draft models only. MTP/DFlash drafts share vocab with base and have no d2t.
     std::string const modelType = mModelConfig.value("model_type", "");
-    if (mBuilderConfig.eagleDraft && modelType != "mtp_draft")
+    if (mBuilderConfig.eagleDraft && modelType != "mtp_draft" && modelType != "dflash_draft")
     {
         std::string const d2tPath = (mOnnxDir / "d2t.safetensors").string();
         std::string const targetD2tPath = (mEngineDir / "d2t.safetensors").string();

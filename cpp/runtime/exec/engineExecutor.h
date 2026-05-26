@@ -69,6 +69,11 @@ public:
     static std::unique_ptr<EngineExecutor> createForSpecDecodeDraft(
         std::filesystem::path const& enginePath, DeploymentConfig const& bundle);
 
+    //! Build an EngineExecutor for the DFlash draft engine. DFlash draft has a
+    //! distinct non-KV block-drafting binding contract.
+    static std::unique_ptr<EngineExecutor> createForDFlashDraft(
+        std::filesystem::path const& enginePath, DeploymentConfig const& bundle);
+
     EngineExecutor(EngineExecutor const&) = delete;
     EngineExecutor& operator=(EngineExecutor const&) = delete;
 

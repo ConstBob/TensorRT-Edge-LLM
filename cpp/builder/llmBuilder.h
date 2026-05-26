@@ -214,6 +214,12 @@ private:
     bool setupEagleProfiles(
         nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
 
+    //! Set up optimization profiles for DFlash draft models.
+    //! DFlash draft has no KV cache and consumes target_hidden_concat plus
+    //! position_offset instead of EAGLE/MTP draft bindings.
+    bool setupDFlashDraftProfiles(
+        nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
+
     //! Set up optimization profiles for Deepstack embeddings (Qwen3VL).
     //! Configures deepstack embedding inputs with the same profile as inputs_embeds.
     //! @param contextProfile Optimization profile for context processing

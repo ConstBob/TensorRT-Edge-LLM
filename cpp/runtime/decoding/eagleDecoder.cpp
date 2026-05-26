@@ -121,10 +121,9 @@ EagleDecoder::EagleDecoder(DecodingRuntimeContext& runtime, std::filesystem::pat
     }
 }
 
-char const* EagleDecoder::unsupportedReason(LLMGenerationRequest const&) const noexcept
+char const* EagleDecoder::unsupportedReason(LLMGenerationRequest const& request) const noexcept
 {
-    // Greedy override is handled by the runtime (handleRequest forces greedy when spec-decode is active).
-    return nullptr;
+    return spec_decode_utils::isGreedyCompatible(request);
 }
 
 int64_t EagleDecoder::getRequiredContextMemorySize() const noexcept

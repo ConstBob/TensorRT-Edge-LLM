@@ -42,6 +42,7 @@ enum class SpecDecodeMode : int32_t
     kNONE,
     kEAGLE,
     kMTP,
+    kDFlash,
 };
 
 //! Unified configuration for base, vanilla decode, and SpecDecode draft engines.
@@ -125,6 +126,16 @@ struct LLMEngineConfig
     //! `base.hiddenSize` for MTP. The deployment factory copies this into
     //! `DeploymentConfig::specDecode->baseOutputHiddenDim`.
     int32_t baseModelHiddenSize{0};
+
+    //! DFlash draft block size. Parsed from `dflash_config.block_size` or
+    //! top-level `block_size` on DFlash base/draft configs.
+    int32_t dflashBlockSize{0};
+
+    //! DFlash mask token ID used to seed draft input blocks.
+    int32_t dflashMaskTokenId{0};
+
+    //! Target decoder-layer IDs whose hidden states are concatenated for DFlash.
+    std::vector<int32_t> dflashTargetLayerIds{};
 
     // --- Per-layer type routing (hybrid cache) ---
 

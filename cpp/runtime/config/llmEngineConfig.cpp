@@ -27,6 +27,7 @@
 
 #include <fstream>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 
@@ -99,6 +100,79 @@ void parseRequiredStateDtype(Json const& json, char const* key, nvinfer1::DataTy
         std::string("parseEngineConfig: config.json missing required field '") + key
             + "'. Re-export the model with the latest llm_export.py to record it.");
     out = parseStateDtype(json[key].get<std::string>(), key);
+}
+
+void validateDFlashTargetLayerIds(
+    std::vector<int32_t> const& targetLayerIds, int32_t numDecoderLayers, char const* layerCountOwner)
+{
+    for (int32_t layerId : targetLayerIds)
+    {
+        ELLM_CHECK(layerId >= 0 && layerId < numDecoderLayers,
+            "parseEngineConfig: DFlash target layer id " + std::to_string(layerId) + " is outside [0, "
+                + layerCountOwner + ".num_hidden_layers).");
+    }
+}
+
+void parseDFlashFields(
+    Json const& configJson, LLMEngineConfig& cfg, std::optional<int32_t> targetLayerValidationUpperBound = std::nullopt)
+{
+    if (cfg.specDecodeType != SpecDecodeMode::kDFlash)
+    {
+        return;
+    }
+
+    Json const empty = Json::object();
+    Json const& dflashConfig = configJson.contains("dflash_config") ? configJson["dflash_config"] : empty;
+
+    cfg.dflashBlockSize = dflashConfig.value("block_size", configJson.value("block_size", 16));
+    cfg.dflashMaskTokenId = dflashConfig.value("mask_token_id", configJson.value("dflash_mask_token_id", 248070));
+    ELLM_CHECK(cfg.dflashBlockSize > 0,
+        "parseEngineConfig: invalid DFlash block_size: " + std::to_string(cfg.dflashBlockSize) + " (must be positive)");
+    ELLM_CHECK(cfg.dflashMaskTokenId >= 0,
+        "parseEngineConfig: invalid DFlash mask_token_id: " + std::to_string(cfg.dflashMaskTokenId)
+            + " (must be non-negative)");
+
+    if (dflashConfig.contains("target_layer_ids"))
+    {
+        ELLM_CHECK(dflashConfig["target_layer_ids"].is_array(),
+            "parseEngineConfig: dflash_config.target_layer_ids must be an array");
+        for (auto const& id : dflashConfig["target_layer_ids"])
+        {
+            cfg.dflashTargetLayerIds.push_back(id.get<int32_t>());
+        }
+    }
+    else if (configJson.contains("dflash_target_layer_ids"))
+    {
+        ELLM_CHECK(configJson["dflash_target_layer_ids"].is_array(),
+            "parseEngineConfig: dflash_target_layer_ids must be an array");
+        for (auto const& id : configJson["dflash_target_layer_ids"])
+        {
+            cfg.dflashTargetLayerIds.push_back(id.get<int32_t>());
+        }
+    }
+
+    if (targetLayerValidationUpperBound.has_value())
+    {
+        validateDFlashTargetLayerIds(cfg.dflashTargetLayerIds, *targetLayerValidationUpperBound, "base");
+    }
+}
+
+bool isDFlashDraftConfig(LLMEngineConfig const& config)
+{
+    return config.specDecodeType == SpecDecodeMode::kDFlash && !config.isSpecDecodeBase;
+}
+
+bool engineHasTensor(EngineExecutor const& executor, std::string const& tensorName)
+{
+    int32_t const numIOTensors = executor.getNumIOTensors();
+    for (int32_t i = 0; i < numIOTensors; ++i)
+    {
+        if (tensorName == executor.getIOTensorName(i))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 //! Fields shared by base and draft engines. Parses top-level model dims and
@@ -258,6 +332,10 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     {
         cfg.specDecodeType = SpecDecodeMode::kEAGLE;
     }
+    else if (modelType == "dflash_base" || modelType == "dflash_draft")
+    {
+        cfg.specDecodeType = SpecDecodeMode::kDFlash;
+    }
 
     // Shared core fields (layers, kv heads, head_dim, hidden_size, kv_cache_dtype,
     // batch/input/kv limits, RoPE, common positivity checks).
@@ -281,6 +359,7 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     cfg.recurrentStateSize = configJson.value("recurrent_state_size", 0);
     cfg.convDim = configJson.value("conv_dim", 0);
     cfg.convKernel = configJson.value("conv_kernel", 0);
+    parseDFlashFields(configJson, cfg, cfg.numDecoderLayers);
 
     auto const& bc = configJson["builder_config"];
     cfg.maxSupportedLoraRank = bc.value("max_lora_rank", 0);
@@ -363,6 +442,10 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath)
     {
         cfg.specDecodeType = SpecDecodeMode::kEAGLE;
     }
+    else if (modelType == "dflash_base" || modelType == "dflash_draft")
+    {
+        cfg.specDecodeType = SpecDecodeMode::kDFlash;
+    }
 
     // Shared core fields (layers, kv heads, head_dim, hidden_size, kv_cache_dtype,
     // batch/input/kv limits, RoPE, common positivity checks).
@@ -378,6 +461,7 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath)
     cfg.rotaryDim = static_cast<int32_t>(cfg.headDim * configJson.value("partial_rotary_factor", 1.0F));
     cfg.vocabSize = configJson.value("draft_vocab_size", configJson.value("vocab_size", 0));
     cfg.outputVocabSize = cfg.vocabSize;
+    parseDFlashFields(configJson, cfg);
 
     // Draft engines do not own hybrid runtime cache state in this path.
     cfg.isSpecDecodeBase = false; // This IS the draft engine, not the base.
@@ -441,6 +525,11 @@ std::string formatEngineConfig(LLMEngineConfig const& cfg)
     if (cfg.maxDraftTreeSize > 0)
     {
         ss << " maxDraftTreeSize=" << cfg.maxDraftTreeSize;
+    }
+    if (cfg.specDecodeType == SpecDecodeMode::kDFlash)
+    {
+        ss << " dflashBlockSize=" << cfg.dflashBlockSize << " dflashMaskTokenId=" << cfg.dflashMaskTokenId
+           << " dflashTargetLayerIds=" << cfg.dflashTargetLayerIds.size();
     }
     ss << " }";
     return ss.str();
@@ -551,6 +640,63 @@ InferenceDims LLMEngineConfig::acceptDims(int64_t batch, int64_t acceptLen) cons
 
 void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& executor, char const* engineLabel)
 {
+    if (isDFlashDraftConfig(config))
+    {
+        // DFlash cached draft engines require KV cache bindings (cached-KV path).
+        // Validate required bindings exist and have correct dtype.
+        LOG_INFO("DFlash draft engine (%s): validating cached-path bindings.", engineLabel);
+
+        // Required cached-path bindings (fail if missing → old explicit DFlash engine)
+        static char const* const kRequiredBindings[] = {
+            binding_names::kInputsEmbeds,
+            binding_names::kDFlashTargetHiddenConcat,
+            binding_names::kLogits,
+            binding_names::kContextLengths,
+            binding_names::kKVCacheStartIndex,
+            binding_names::kDFlashDeltaLengths,
+            binding_names::kRopeCosSin,
+            binding_names::kAttentionMask,
+            binding_names::kAttentionPosId,
+        };
+        for (auto const* name : kRequiredBindings)
+        {
+            ELLM_CHECK(engineHasTensor(executor, std::string(name)),
+                std::string("DFlash cached draft engine (") + engineLabel + ") is missing required binding '" + name
+                    + "'. This engine may be from the old explicit DFlash path. Re-export and rebuild.");
+        }
+
+        // Require KV cache layer 0
+        if (config.numAttentionLayers > 0)
+        {
+            std::string const kvPastName = binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/true);
+            std::string const kvPresentName = binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/false);
+            ELLM_CHECK(engineHasTensor(executor, kvPastName),
+                std::string("DFlash cached draft engine (") + engineLabel + ") missing KV cache binding '" + kvPastName
+                    + "'. Old explicit DFlash engines are not compatible. Re-export and rebuild.");
+            ELLM_CHECK(engineHasTensor(executor, kvPresentName),
+                std::string("DFlash cached draft engine (") + engineLabel + ") missing KV cache binding '"
+                    + kvPresentName + "'.");
+
+            auto const engineDtype = executor.getBindingDataType(kvPastName.c_str());
+            ELLM_CHECK(engineDtype == config.kvCacheDtype,
+                std::string("KV cache dtype mismatch (") + engineLabel + "): config says "
+                    + getDataTypeString(config.kvCacheDtype) + ", engine reports " + getDataTypeString(engineDtype)
+                    + " for binding '" + kvPastName + "'.");
+        }
+
+        // Old explicit DFlash engines have position_offset but no context_lengths.
+        // Fail if the old binding exists (ambiguous engine version).
+        if (engineHasTensor(executor, std::string(binding_names::kDFlashPositionOffset)))
+        {
+            LOG_WARNING(
+                "DFlash draft engine (%s) has legacy 'position_offset' binding. "
+                "This engine may be from the old explicit path. Proceeding but results may be incorrect.",
+                engineLabel);
+        }
+
+        return;
+    }
+
     // KV cache binding: validated on layer 0; all layers share the same dtype.
     // TRT-native-ops engines split KV into separate `k_cache_%d` / `v_cache_%d`
     // bindings; plugin-path engines use a combined `past_key_values_%d`. Query
@@ -561,6 +707,8 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
         std::string const kvBindingName = config.useTrtNativeOps
             ? binding_names::formatKCacheName(/*layerIdx=*/0, /*isPast=*/true)
             : binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/true);
+        ELLM_CHECK(engineHasTensor(executor, kvBindingName),
+            std::string("Missing KV cache binding (") + engineLabel + "): expected '" + kvBindingName + "'.");
         auto const engineDtype = executor.getBindingDataType(kvBindingName.c_str());
         ELLM_CHECK(engineDtype == config.kvCacheDtype,
             std::string("KV cache dtype mismatch (") + engineLabel + "): config says "
@@ -572,6 +720,8 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
     if (config.numLinearAttnLayers > 0)
     {
         std::string const recBindingName = binding_names::formatRecurrentStateName(/*layerIdx=*/0, /*isPast=*/true);
+        ELLM_CHECK(engineHasTensor(executor, recBindingName),
+            std::string("Missing recurrent-state binding (") + engineLabel + "): expected '" + recBindingName + "'.");
         auto const recEngineDtype = executor.getBindingDataType(recBindingName.c_str());
         ELLM_CHECK(recEngineDtype == config.recurrentStateDtype,
             std::string("Recurrent state dtype mismatch (") + engineLabel + "): config says "
@@ -580,6 +730,8 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
                 + "'. Re-export the engine with matching recurrent_state_dtype.");
 
         std::string const convBindingName = binding_names::formatConvStateName(/*layerIdx=*/0, /*isPast=*/true);
+        ELLM_CHECK(engineHasTensor(executor, convBindingName),
+            std::string("Missing conv-state binding (") + engineLabel + "): expected '" + convBindingName + "'.");
         auto const convEngineDtype = executor.getBindingDataType(convBindingName.c_str());
         ELLM_CHECK(convEngineDtype == config.convStateDtype,
             std::string("Conv state dtype mismatch (") + engineLabel + "): config says "
