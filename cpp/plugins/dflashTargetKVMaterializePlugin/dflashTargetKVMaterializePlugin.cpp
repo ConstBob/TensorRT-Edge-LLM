@@ -32,7 +32,6 @@ namespace
 {
 char const* const kPLUGIN_NAME = "DFlashTargetKVMaterialize";
 char const* const kPLUGIN_VERSION = "1";
-char const* const kPLUGIN_NAMESPACE = "trt_edgellm";
 constexpr int32_t kNUM_INPUTS{6};
 constexpr int32_t kNUM_OUTPUTS{1};
 

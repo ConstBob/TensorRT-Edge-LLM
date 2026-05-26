@@ -302,7 +302,8 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
     check::check(
         mDraftTargetHidden.reshape({activeBatchSize, maxDeltaLen, mBaseOutputHiddenDim}), "Tensor reshape failed");
     {
-        size_t const rowBytes = static_cast<size_t>(mBaseOutputHiddenDim) * sizeof(int16_t);
+        size_t const elementBytes = utils::getTypeSize(mDraftTargetHidden.getDataType());
+        size_t const rowBytes = static_cast<size_t>(mBaseOutputHiddenDim) * elementBytes;
         size_t const dstPitch = static_cast<size_t>(maxDeltaLen) * rowBytes;
         size_t const srcPitch = static_cast<size_t>(sourceSeqLen) * rowBytes;
         size_t const widthBytes = static_cast<size_t>(maxDeltaLen) * rowBytes;
@@ -685,9 +686,10 @@ bool DFlashDecoder::runSystemPromptPrefill(DecodingInferenceContext& context)
     // Target hidden delta = full prefill hidden states
     check::check(
         mDraftTargetHidden.reshape({activeBatchSize, prefillLen, mBaseOutputHiddenDim}), "Tensor reshape failed");
+    size_t const targetHiddenBytes = static_cast<size_t>(activeBatchSize) * prefillLen * mBaseOutputHiddenDim
+        * utils::getTypeSize(mDraftTargetHidden.getDataType());
     CUDA_CHECK(cudaMemcpyAsync(mDraftTargetHidden.rawPointer(), mRuntime.base.pipelineIO.baseHiddenStates.rawPointer(),
-        activeBatchSize * prefillLen * mBaseOutputHiddenDim * sizeof(int16_t), cudaMemcpyDeviceToDevice,
-        context.stream));
+        targetHiddenBytes, cudaMemcpyDeviceToDevice, context.stream));
 
     // Upload delta_lengths for system prompt prefill (uniform prefillLen)
     {

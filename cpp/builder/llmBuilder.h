@@ -215,8 +215,8 @@ private:
         nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
 
     //! Set up optimization profiles for DFlash draft models.
-    //! DFlash draft has no KV cache and consumes target_hidden_concat plus
-    //! position_offset instead of EAGLE/MTP draft bindings.
+    //! DFlash draft consumes proposal embeddings, target_hidden_concat, per-batch
+    //! delta_lengths, and per-layer KV cache bindings.
     bool setupDFlashDraftProfiles(
         nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
 

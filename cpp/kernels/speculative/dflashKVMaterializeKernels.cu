@@ -76,8 +76,8 @@ __global__ void dflashKVMaterializeKernel(half const* __restrict__ kDelta, half 
 
     // --- Read k_delta and v_delta ---
     // Layout: [B, deltaLen, numKVHeads, headDim]
-    int64_t const kvDeltaOffset
-        = static_cast<int64_t>(b) * deltaLen * numKVHeads * headDim + t * numKVHeads * headDim + h * headDim;
+    int64_t const kvDeltaOffset = static_cast<int64_t>(b) * deltaLen * numKVHeads * headDim
+        + static_cast<int64_t>(t) * numKVHeads * headDim + static_cast<int64_t>(h) * headDim;
 
     // Load k_delta elements
     half kVals[kVecSize];
@@ -170,11 +170,13 @@ void launchDFlashKVMaterialize(half const* kDelta, half const* vDelta, half* kvC
     }
 
     int32_t const threadsPerToken = (headDim + kVecSize - 1) / kVecSize;
+    assert(threadsPerToken <= 1024 && "DFlash KV materialize exceeds CUDA max threads per block");
     dim3 const grid(deltaLen, numKVHeads, batchSize);
     dim3 const block(threadsPerToken);
 
     dflashKVMaterializeKernel<<<grid, block, 0, stream>>>(kDelta, vDelta, kvCache, cosSinCache, deltaStartPositions,
         deltaLengths, deltaLen, numKVHeads, headDim, maxSeqLen, rotaryDim, cosSinBatch, cosSinSeqLen);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 // -----------------------------------------------------------------------
@@ -234,11 +236,13 @@ void launchDFlashPrepareProposalInputs(int32_t const* oldDraftCacheLengths, int3
         return;
     }
 
+    assert(blockSize <= 1024 && "DFlash proposal block size exceeds CUDA max threads per block");
     dim3 const grid(batchSize);
     dim3 const block(blockSize);
 
     dflashPrepareProposalInputsKernel<<<grid, block, 0, stream>>>(
         oldDraftCacheLengths, deltaLengths, blockSize, packedAttentionMask, attentionPosId, contextLengths);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace kernel

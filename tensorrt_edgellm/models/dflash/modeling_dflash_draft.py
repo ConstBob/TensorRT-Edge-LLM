@@ -370,10 +370,10 @@ class DFlashDraftModel(nn.Module):
                 if self.fc.bias is not None else None)
         h_delta_acc = F.linear(target_hidden_concat.to(torch.float32),
                                self.fc.weight.to(torch.float32), bias)
-        h_delta = self.hidden_norm(h_delta_acc).to(torch.float16)
+        h_delta = self.hidden_norm(h_delta_acc).to(inputs_embeds.dtype)
 
         # Run through decoder layers
-        hidden_states = inputs_embeds.to(torch.float16)
+        hidden_states = inputs_embeds.to(h_delta.dtype)
         present_key_values = []
 
         for i, layer in enumerate(self.layers):

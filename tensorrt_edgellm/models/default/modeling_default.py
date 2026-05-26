@@ -445,7 +445,7 @@ class Transformer(nn.Module):
         attention_pos_id: "torch.Tensor | None" = None,
         output_hidden_states: bool = False,
         dflash_target_layer_ids: "List[int] | None" = None,
-    ) -> Tuple[torch.Tensor, Tuple, "Tuple | None"]:
+    ) -> Tuple[torch.Tensor, Tuple, "Tuple | None", "torch.Tensor | None"]:
         hidden_states = inputs_embeds
         present_key_values_list: List[torch.Tensor] = []
         all_hidden_states: list = []

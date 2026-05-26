@@ -560,6 +560,8 @@ bool LLMBuilder::setupDFlashDraftProfiles(
     int64_t const optPackedMaskLen
         = static_cast<int64_t>((optDraftTokens + attnMaskAlignSize - 1) / attnMaskAlignSize * attnMaskAlignSize);
 
+    // DFlash draft has one cached block-proposal execution shape. The runtime
+    // still carries both profile slots, so expose the same dynamic ranges for both.
     auto setupOneProfile = [&](nvinfer1::IOptimizationProfile& profile) {
         bool ok = true;
         // inputs_embeds: [batch, block_seq, hiddenSize]

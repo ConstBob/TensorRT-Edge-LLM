@@ -161,25 +161,19 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
 
         if (cfg.base.specDecodeType == SpecDecodeMode::kDFlash)
         {
+            static constexpr int32_t kDFlashMaxVerifySize = 16;
             ELLM_CHECK(specConfig.draftingTopK == 1 && specConfig.draftingStep == 1,
                 "DFlash Phase 1 supports draftingTopK=1 and draftingStep=1 only.");
             ELLM_CHECK(specConfig.verifySize <= specConfig.maxDraftProposalSize,
                 "DFlash verifySize=" + std::to_string(specConfig.verifySize)
                     + " exceeds draft.maxDraftTreeSize=" + std::to_string(specConfig.maxDraftProposalSize)
                     + ". DFlash drafts one full verify block per iteration.");
-            // For hybrid models with GDN/causal-conv layers, cap verifySize at
-            // the CuTe DSL MTP verifier's compiled token upper bound.
-            // Dense models (no linear attention) can use verifySize up to 16.
             bool const hasLinearAttnLayers = (cfg.base.numLinearAttnLayers > 0);
-            if (hasLinearAttnLayers)
-            {
-                static constexpr int32_t kDFlashHybridMaxVerifySize = 16;
-                ELLM_CHECK(specConfig.verifySize <= kDFlashHybridMaxVerifySize,
-                    "DFlash verifySize=" + std::to_string(specConfig.verifySize) + " exceeds hybrid model limit of "
-                        + std::to_string(kDFlashHybridMaxVerifySize)
-                        + ". Qwen3.5 GDN/causal-conv intermediate-state handling requires verifySize <= "
-                        + std::to_string(kDFlashHybridMaxVerifySize) + ".");
-            }
+            std::string const verifyLimitReason
+                = hasLinearAttnLayers ? "Qwen3.5 GDN/causal-conv intermediate-state limit" : "DFlash limit";
+            ELLM_CHECK(specConfig.verifySize <= kDFlashMaxVerifySize,
+                "DFlash verifySize=" + std::to_string(specConfig.verifySize) + " exceeds " + verifyLimitReason + " of "
+                    + std::to_string(kDFlashMaxVerifySize) + ".");
         }
 
         cfg.specConfig = specConfig;

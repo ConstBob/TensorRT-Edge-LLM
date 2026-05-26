@@ -135,7 +135,7 @@ class AutoModel:
                         "target_layer_ids", [1, 8, 15, 22, 29])
                     config.dflash_block_size = dflash_cfg.get("block_size", 16)
                     config.dflash_mask_token_id = dflash_cfg.get(
-                        "mask_token_id", 0)
+                        "mask_token_id", 248070)
             if not config.dflash_target_layer_ids:
                 config.dflash_target_layer_ids = [1, 8, 15, 22, 29]
         if tp_size > 1:

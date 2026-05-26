@@ -112,6 +112,15 @@ Json makeHybridDFlashBaseConfig(int32_t maxVerifyTreeSize, int32_t maxBatchSize 
     return config;
 }
 
+Json makeDenseDFlashBaseConfig(int32_t maxVerifyTreeSize, int32_t maxBatchSize = 2)
+{
+    Json config = makeBaseConfig(maxVerifyTreeSize, /*maxDraft=*/0, maxBatchSize);
+    config["model_type"] = "dflash_base";
+    config["dflash_config"]
+        = Json{{"block_size", 16}, {"mask_token_id", 248070}, {"target_layer_ids", Json::array({1, 8})}};
+    return config;
+}
+
 Json makeDFlashDraftConfig(int32_t maxDraftTreeSize, int32_t maxBatchSize = 2)
 {
     Json config = makeDraftConfig(/*maxVerify=*/0, maxDraftTreeSize, maxBatchSize);
@@ -297,6 +306,81 @@ TEST_F(DeploymentConfigTest, DFlashHybridVerifySizeAbove16Throws)
     drafting.draftingTopK = 1;
     drafting.draftingStep = 1;
     drafting.verifySize = 17;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
+}
+
+TEST_F(DeploymentConfigTest, DFlashDenseVerifySizeAbove16Throws)
+{
+    Json const baseJson = makeDenseDFlashBaseConfig(/*maxVerify=*/32);
+    Json const draftJson = makeDFlashDraftConfig(/*maxDraft=*/32);
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto const draftPath = writeJsonToTempFile(draftJson, "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 1;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 17;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
+}
+
+TEST_F(DeploymentConfigTest, DFlashRejectsMultiTopKOrStep)
+{
+    Json const baseJson = makeDenseDFlashBaseConfig(/*maxVerify=*/16);
+    Json const draftJson = makeDFlashDraftConfig(/*maxDraft=*/16);
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto const draftPath = writeJsonToTempFile(draftJson, "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 2;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 8;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
+
+    drafting.draftingTopK = 1;
+    drafting.draftingStep = 2;
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
+}
+
+TEST_F(DeploymentConfigTest, DFlashTargetLayerOutOfRangeThrows)
+{
+    Json const baseJson = makeDenseDFlashBaseConfig(/*maxVerify=*/16);
+    Json draftJson = makeDFlashDraftConfig(/*maxDraft=*/16);
+    draftJson["dflash_config"]["target_layer_ids"] = Json::array({1, 99});
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto const draftPath = writeJsonToTempFile(draftJson, "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 1;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 8;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
+}
+
+TEST_F(DeploymentConfigTest, DFlashBaseDraftModeMismatchThrows)
+{
+    Json const baseJson = makeDenseDFlashBaseConfig(/*maxVerify=*/16);
+    Json const draftJson = makeDraftConfig(/*maxVerify=*/0, /*maxDraft=*/16);
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto const draftPath = writeJsonToTempFile(draftJson, "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 1;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 8;
 
     EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
                      std::optional<SpecDecodeDraftingConfig>{drafting}),

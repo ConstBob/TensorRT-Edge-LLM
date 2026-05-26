@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "common/cudaMacros.h"
 #include "kernels/speculative/dflashAcceptKernels.h"
 
 #include <cfloat>
@@ -190,11 +191,13 @@ void dflashSequentialAccept(rt::Tensor const& baseLogits, rt::Tensor const& draf
     // Phase 1: Parallel argmax — one CTA per position, 256 threads cooperate
     dflashParallelArgmaxKernel<<<totalPositions, kArgmaxBlockSize, 0, stream>>>(
         static_cast<float const*>(baseLogits.rawPointer()), argmaxResults, totalPositions, vocabSize);
+    CUDA_CHECK(cudaGetLastError());
 
     // Phase 2: Sequential accept walk — one thread per batch (trivially fast)
     dflashSequentialAcceptWalkKernel<<<batchSize, 1, 0, stream>>>(argmaxResults,
         static_cast<int32_t const*>(draftTokenIds.rawPointer()), static_cast<int32_t*>(acceptedTokenIds.rawPointer()),
         static_cast<int32_t*>(acceptLength.rawPointer()), verifyLen);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void dflashBuildVerifyTokens(rt::Tensor const& lastAcceptedTokens, rt::Tensor const& draftTokenIds,
@@ -208,6 +211,7 @@ void dflashBuildVerifyTokens(rt::Tensor const& lastAcceptedTokens, rt::Tensor co
         static_cast<int32_t const*>(lastAcceptedTokens.rawPointer()),
         static_cast<int32_t const*>(draftTokenIds.rawPointer()), static_cast<int32_t*>(verifyTokenIds.rawPointer()),
         blockSize, totalThreads);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace kernel
