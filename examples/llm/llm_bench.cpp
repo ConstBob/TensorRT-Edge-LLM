@@ -867,8 +867,8 @@ int main(int argc, char** argv)
         LOG_INFO("Prefill mode: InputLen=%d, ReuseKVLen=%d", args.inputLen, args.reuseKVLen);
 
         // Reshape inputsEmbeds for this bench config
-        check::check(io->inputsEmbeds.reshape({B, args.inputLen, deployment.base.hiddenSize}),
-            "inputsEmbeds reshape failed");
+        check::check(
+            io->inputsEmbeds.reshape({B, args.inputLen, deployment.base.hiddenSize}), "inputsEmbeds reshape failed");
 
         // Set context lengths on PipelineIO (host side, for StepPreparer)
         int32_t const contextLen = args.reuseKVLen + args.inputLen;
@@ -910,8 +910,7 @@ int main(int argc, char** argv)
         LOG_INFO("OSL=%d: will run %d decode steps for E2E timing", osl, decodeTokens);
         LOG_INFO(args.noCudaGraph ? "CUDA graph disabled; using non-CUDA-graph execution" : "CUDA graph enabled");
 
-        check::check(
-            io->inputsEmbeds.reshape({B, 1, deployment.base.hiddenSize}), "inputsEmbeds reshape failed");
+        check::check(io->inputsEmbeds.reshape({B, 1, deployment.base.hiddenSize}), "inputsEmbeds reshape failed");
 
         pastKVLenVec.assign(B, args.pastKVLen);
 
@@ -922,16 +921,14 @@ int main(int argc, char** argv)
             resources->cacheManagers[kvCacheIndex]->resetForNewSequences(reuseKVCacheLengths, stream);
         };
         step = [&, dims]() {
-            stepPreparer->prepare(
-                rt::InferencePhase::kDecode, B, *resources->cacheManagers[kvCacheIndex], *io, stream);
+            stepPreparer->prepare(rt::InferencePhase::kDecode, B, *resources->cacheManagers[kvCacheIndex], *io, stream);
             if (!executor->prepare(kDecodeProfile, dims, tensorMap, stream))
                 return false;
             return executor->execute(stream);
         };
         captureGraph = [&, dims]() {
             resetState();
-            stepPreparer->prepare(
-                rt::InferencePhase::kDecode, B, *resources->cacheManagers[kvCacheIndex], *io, stream);
+            stepPreparer->prepare(rt::InferencePhase::kDecode, B, *resources->cacheManagers[kvCacheIndex], *io, stream);
             if (!executor->prepare(kDecodeProfile, dims, tensorMap, stream))
                 return false;
             return executor->captureGraph(stream);
@@ -963,8 +960,8 @@ int main(int argc, char** argv)
         check::check(io->contextLengths.reshape({B}), "contextLengths reshape failed");
         {
             std::vector<int32_t> ctxVec(B, args.pastKVLen + args.verifyTreeSize);
-            CUDA_CHECK(cudaMemcpyAsync(io->contextLengths.rawPointer(), ctxVec.data(), B * sizeof(int32_t),
-                cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                io->contextLengths.rawPointer(), ctxVec.data(), B * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
         }
 
         if (deepstack)
@@ -1008,8 +1005,7 @@ int main(int argc, char** argv)
         pastKVLenVec.assign(B, args.pastKVLen);
 
         int32_t const draftHiddenSize = deployment.draft->hiddenSize;
-        check::check(io->inputsEmbeds.reshape({B, args.draftTreeSize, draftHiddenSize}),
-            "inputsEmbeds reshape failed");
+        check::check(io->inputsEmbeds.reshape({B, args.draftTreeSize, draftHiddenSize}), "inputsEmbeds reshape failed");
 
         // selectTokenIndices: for proposal, select draftTreeSize tokens
         check::check(io->selectTokenIndices.reshape({B, args.draftTreeSize}), "selectTokenIndices reshape failed");
@@ -1020,8 +1016,8 @@ int main(int argc, char** argv)
         check::check(io->contextLengths.reshape({B}), "contextLengths reshape failed");
         {
             std::vector<int32_t> ctxVec(B, args.pastKVLen + args.draftTreeSize);
-            CUDA_CHECK(cudaMemcpyAsync(io->contextLengths.rawPointer(), ctxVec.data(), B * sizeof(int32_t),
-                cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                io->contextLengths.rawPointer(), ctxVec.data(), B * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
         }
 
         // The draft proposal uses proposalDims. draftTopK = draftTreeSize for bench
@@ -1064,8 +1060,7 @@ int main(int argc, char** argv)
         LOG_INFO("Spec Draft Prefill mode: InputLen=%d, ReuseKVLen=%d", args.inputLen, args.reuseKVLen);
 
         int32_t const draftHiddenSize = deployment.draft->hiddenSize;
-        check::check(io->inputsEmbeds.reshape({B, args.inputLen, draftHiddenSize}),
-            "inputsEmbeds reshape failed");
+        check::check(io->inputsEmbeds.reshape({B, args.inputLen, draftHiddenSize}), "inputsEmbeds reshape failed");
 
         // Set context lengths on PipelineIO (host side, for StepPreparer)
         int32_t const contextLen = args.reuseKVLen + args.inputLen;
