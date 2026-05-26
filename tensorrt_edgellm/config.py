@@ -1313,12 +1313,24 @@ def _parse_mixed_precision(quantized_layers: dict) -> "tuple[str, int, dict]":
     dominant_algo = algo_count.most_common(1)[0][0]
     dominant_type = _algo_to_quant_type(dominant_algo)
     dominant_group_size = algo_group_size.get(dominant_algo, 1)
-    # Store ALL quantized layers so unlisted modules default to FP16
+    # Expand fused projection keys (``self_attn.qkv_proj``,
+    # ``mlp.gate_up_proj``) into the split names ``make_linear`` looks up
+    # (``q_proj``/``k_proj``/``v_proj`` and ``gate_proj``/``up_proj``).
     layer_overrides: dict = {}
     for name, layer_cfg in quantized_layers.items():
         algo = layer_cfg.get("quant_algo", "").upper()
         short_name = _normalize_module_name(name)
-        layer_overrides[short_name] = _algo_to_quant_type(algo)
+        quant_type = _algo_to_quant_type(algo)
+        if short_name.endswith(".self_attn.qkv_proj"):
+            prefix = short_name[:-len("qkv_proj")]
+            for proj in ("q_proj", "k_proj", "v_proj"):
+                layer_overrides[f"{prefix}{proj}"] = quant_type
+        elif short_name.endswith(".mlp.gate_up_proj"):
+            prefix = short_name[:-len("gate_up_proj")]
+            for proj in ("gate_proj", "up_proj"):
+                layer_overrides[f"{prefix}{proj}"] = quant_type
+        else:
+            layer_overrides[short_name] = quant_type
     return dominant_type, dominant_group_size, layer_overrides
 
 
