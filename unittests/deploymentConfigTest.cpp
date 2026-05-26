@@ -76,6 +76,7 @@ Json makeBaseConfig(
 Json makeDraftConfig(int32_t /*maxVerifyTreeSize*/, int32_t maxDraftTreeSize, int32_t maxBatchSize = 2)
 {
     Json config;
+    config["model_type"] = "eagle3_draft";
     config["num_hidden_layers"] = 1;
     config["num_key_value_heads"] = 4;
     config["head_dim"] = 64;
@@ -90,6 +91,33 @@ Json makeDraftConfig(int32_t /*maxVerifyTreeSize*/, int32_t maxDraftTreeSize, in
     bc["max_kv_cache_capacity"] = 256;
     bc["max_draft_tree_size"] = maxDraftTreeSize;
     config["builder_config"] = bc;
+    return config;
+}
+
+Json makeHybridDFlashBaseConfig(int32_t maxVerifyTreeSize, int32_t maxBatchSize = 2)
+{
+    Json config = makeBaseConfig(maxVerifyTreeSize, /*maxDraft=*/0, maxBatchSize);
+    config["model_type"] = "dflash_base";
+    config["num_attention_layers"] = 8;
+    config["num_linear_attn_layers"] = 4;
+    config["recurrent_state_num_heads"] = 4;
+    config["recurrent_state_head_dim"] = 64;
+    config["recurrent_state_size"] = 64;
+    config["conv_dim"] = 768;
+    config["conv_kernel"] = 4;
+    config["recurrent_state_dtype"] = "fp16";
+    config["conv_state_dtype"] = "fp16";
+    config["dflash_config"]
+        = Json{{"block_size", 16}, {"mask_token_id", 248070}, {"target_layer_ids", Json::array({1, 8})}};
+    return config;
+}
+
+Json makeDFlashDraftConfig(int32_t maxDraftTreeSize, int32_t maxBatchSize = 2)
+{
+    Json config = makeDraftConfig(/*maxVerify=*/0, maxDraftTreeSize, maxBatchSize);
+    config["model_type"] = "dflash_draft";
+    config["dflash_config"]
+        = Json{{"block_size", 16}, {"mask_token_id", 248070}, {"target_layer_ids", Json::array({1, 8})}};
     return config;
 }
 
@@ -236,6 +264,43 @@ TEST_F(DeploymentConfigTest, ConsistentBundleValidatesOk)
     ASSERT_TRUE(bundle.specConfig.has_value());
     EXPECT_EQ(bundle.base.maxVerifyTreeSize, 32);
     EXPECT_EQ(bundle.draft->maxDraftTreeSize, 24);
+}
+
+TEST_F(DeploymentConfigTest, DFlashHybridVerifySize16ValidatesOk)
+{
+    Json const baseJson = makeHybridDFlashBaseConfig(/*maxVerify=*/16);
+    Json const draftJson = makeDFlashDraftConfig(/*maxDraft=*/16);
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto const draftPath = writeJsonToTempFile(draftJson, "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 1;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 16;
+
+    DeploymentConfig bundle = createDeploymentConfig(
+        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<SpecDecodeDraftingConfig>{drafting});
+
+    EXPECT_EQ(bundle.specDecodeMode(), SpecDecodeMode::kDFlash);
+    ASSERT_TRUE(bundle.specConfig.has_value());
+    EXPECT_EQ(bundle.specConfig->verifySize, 16);
+}
+
+TEST_F(DeploymentConfigTest, DFlashHybridVerifySizeAbove16Throws)
+{
+    Json const baseJson = makeHybridDFlashBaseConfig(/*maxVerify=*/32);
+    Json const draftJson = makeDFlashDraftConfig(/*maxDraft=*/32);
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto const draftPath = writeJsonToTempFile(draftJson, "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 1;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 17;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
 }
 
 // ===========================================================================

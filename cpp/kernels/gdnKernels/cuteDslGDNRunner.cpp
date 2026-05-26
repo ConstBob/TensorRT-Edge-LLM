@@ -364,7 +364,7 @@ int CuteDslGDNRunner::runDecodeMTP(GDNParams const& params, cudaStream_t stream)
     }
 
     // Must match T_MAX_AOT in gdn_decode_mtp.py.
-    constexpr int32_t kMTPMaxSeqLen = 8;
+    constexpr int32_t kMTPMaxSeqLen = 16;
     if (seq_len > kMTPMaxSeqLen)
     {
         LOG_ERROR("CuTe DSL GDN MTP decode requires seq_len <= %d, got %d", kMTPMaxSeqLen, seq_len);
