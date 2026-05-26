@@ -46,7 +46,7 @@ class Qwen3_5MtpDecoderLayer(nn.Module):
         self.self_attn = GatedAttention(config, layer_idx=layer_idx)
         self.post_attention_layernorm = Qwen3_5RMSNorm(config.hidden_size,
                                                        config.rms_norm_eps)
-        self.mlp = MLP(config)
+        self.mlp = MLP(config, layer_idx=layer_idx)
 
     def _forward_attention(
         self,
