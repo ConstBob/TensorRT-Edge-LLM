@@ -279,6 +279,10 @@ def _determine_model_type(config) -> str:
         return "eagle3_draft"
     if config.eagle_base:
         return "eagle3_base"
+    if config.is_dflash_draft:
+        return "dflash_draft"
+    if config.dflash_base:
+        return "dflash_base"
     if config.is_mtp_draft:
         return "mtp_draft"
     if config.mtp_base:
@@ -400,6 +404,31 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
         out.update({
             "draft_vocab_size": config.vocab_size,
             "base_model_hidden_size": config.hidden_size,
+        })
+
+    if config.is_dflash_draft:
+        out.update({
+            "draft_vocab_size":
+            config.vocab_size,
+            "base_model_hidden_size":
+            len(config.dflash_target_layer_ids) * config.hidden_size,
+            "block_size":
+            config.dflash_block_size,
+            "dflash_config": {
+                "target_layer_ids": list(config.dflash_target_layer_ids),
+                "block_size": config.dflash_block_size,
+                "mask_token_id": config.dflash_mask_token_id,
+            },
+        })
+
+    if config.dflash_base:
+        out.update({
+            "dflash_base": True,
+            "dflash_config": {
+                "target_layer_ids": list(config.dflash_target_layer_ids),
+                "block_size": config.dflash_block_size,
+                "mask_token_id": config.dflash_mask_token_id,
+            },
         })
 
     if config.eagle_base:

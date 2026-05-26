@@ -773,6 +773,32 @@ def _fused_gemm_allreduce_translation(
     )
 
 
+# ---------------------------------------------------------------------------
+# DFlash target KV materialize op
+# ---------------------------------------------------------------------------
+
+
+@script()
+def _dflash_target_kv_materialize_translation(
+    k_delta: onnxscript.FLOAT16,
+    v_delta: onnxscript.FLOAT16,
+    past_key_value: onnxscript.FLOAT16,
+    rope_cos_sin: onnxscript.FLOAT,
+    delta_start_positions: onnxscript.INT32,
+    delta_lengths: onnxscript.INT32,
+) -> onnxscript.FLOAT16:
+    """DFlash target KV materialize: apply RoPE to k_delta, write k+v into cache."""
+    present_kv = _trt_edgellm.DFlashTargetKVMaterialize(
+        k_delta,
+        v_delta,
+        past_key_value,
+        rope_cos_sin,
+        delta_start_positions,
+        delta_lengths,
+    )
+    return present_kv
+
+
 def build_custom_translation_table() -> dict:
     """Return the ``custom_translation_table`` for ``torch.onnx.export(dynamo=True)``.
 
@@ -825,6 +851,8 @@ def build_custom_translation_table() -> dict:
         _nvfp4_moe_plugin_translation,
         torch.ops.trt_edgellm.NvFP4MoEPluginGeforce.default:
         _nvfp4_moe_plugin_geforce_translation,
+        torch.ops.trt_edgellm.dflash_target_kv_materialize.default:
+        _dflash_target_kv_materialize_translation,
         # TRT native attention ops (used by EdgeLLMAttentionTRTNative / Alpamayo)
         torch.ops.trt.rope_onnx.default:
         _rope_onnx_translation,
