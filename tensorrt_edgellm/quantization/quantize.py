@@ -455,9 +455,12 @@ def _calibrate_multimodal(model, batches):
                     continue
                 raise
     if valid_batches == 0:
-        raise RuntimeError("All multimodal calibration batches were skipped due to NaN amax.")
+        raise RuntimeError(
+            "All multimodal calibration batches were skipped due to NaN amax.")
     if skipped_nan_batches > 0:
-        print(f"[WARN] Skipped {skipped_nan_batches} multimodal calibration batch(es) with NaN amax.")
+        print(
+            f"[WARN] Skipped {skipped_nan_batches} multimodal calibration batch(es) with NaN amax."
+        )
 
 
 def _ensure_legacy_quantizer_amax_attr(model) -> None:
@@ -467,7 +470,8 @@ def _ensure_legacy_quantizer_amax_attr(model) -> None:
     quantizer objects expose only ``amax``. Mirror ``amax`` into ``_amax`` to
     keep export_hf_checkpoint compatible across mixed ModelOpt versions.
     """
-    from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
+    from modelopt.torch.quantization.nn.modules.tensor_quantizer import \
+        TensorQuantizer
 
     for module in model.modules():
         if not isinstance(module, TensorQuantizer):

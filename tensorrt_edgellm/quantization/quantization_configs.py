@@ -274,9 +274,12 @@ def _disable_groups(*pattern_groups) -> Dict[str, Dict[str, bool]]:
     return out
 
 
-def _dict_entry_to_list_entry(pattern: str, value: Dict[str, Any]) -> Dict[str, Any]:
+def _dict_entry_to_list_entry(pattern: str,
+                              value: Dict[str, Any]) -> Dict[str, Any]:
     """Convert legacy dict-style quant cfg entry to ModelOpt list-style entry."""
-    entry: Dict[str, Any] = {"quantizer_name": "*" if pattern == "default" else pattern}
+    entry: Dict[str, Any] = {
+        "quantizer_name": "*" if pattern == "default" else pattern
+    }
     if set(value.keys()) == {"enable"}:
         entry["enable"] = value["enable"]
         return entry
@@ -310,20 +313,25 @@ def _merge_quant_cfg(target: Any, extra: Any) -> Any:
                     merged_value["enable"] = item["enable"]
                 target[pattern] = merged_value
             return target
-        raise TypeError(f"Unsupported quant_cfg source type for dict target: {type(extra)}")
+        raise TypeError(
+            f"Unsupported quant_cfg source type for dict target: {type(extra)}"
+        )
 
     if isinstance(target, list):
         pending_entries: List[Dict[str, Any]] = []
         if isinstance(extra, dict):
             for pattern, value in extra.items():
                 if isinstance(value, dict):
-                    pending_entries.append(_dict_entry_to_list_entry(pattern, value))
+                    pending_entries.append(
+                        _dict_entry_to_list_entry(pattern, value))
         elif isinstance(extra, list):
             for item in extra:
                 if isinstance(item, dict) and item.get("quantizer_name"):
                     pending_entries.append(copy.deepcopy(item))
         else:
-            raise TypeError(f"Unsupported quant_cfg source type for list target: {type(extra)}")
+            raise TypeError(
+                f"Unsupported quant_cfg source type for list target: {type(extra)}"
+            )
 
         index_by_name = {}
         for idx, item in enumerate(target):
@@ -351,7 +359,8 @@ def _remove_lm_head_quantizers(quant_cfg: Any) -> Any:
             item for item in quant_cfg
             if not ("lm_head" in str(item.get("quantizer_name", "")))
         ]
-    raise TypeError(f"Unsupported quant_cfg type when removing lm_head: {type(quant_cfg)}")
+    raise TypeError(
+        f"Unsupported quant_cfg type when removing lm_head: {type(quant_cfg)}")
 
 
 def build_quant_config(
@@ -407,8 +416,10 @@ def build_quant_config(
         )
 
     if kv_cache_quantization == "fp8":
-        cfg["quant_cfg"] = _merge_quant_cfg(cfg["quant_cfg"], mtq.FP8_KV_CFG["quant_cfg"])
-        cfg["quant_cfg"] = _merge_quant_cfg(cfg["quant_cfg"], FP8_ATTN["quant_cfg"])
+        cfg["quant_cfg"] = _merge_quant_cfg(cfg["quant_cfg"],
+                                            mtq.FP8_KV_CFG["quant_cfg"])
+        cfg["quant_cfg"] = _merge_quant_cfg(cfg["quant_cfg"],
+                                            FP8_ATTN["quant_cfg"])
 
     # Disable every non-LLM group by default. Re-enable the ones the user
     # explicitly asked to quantize.

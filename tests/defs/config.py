@@ -718,8 +718,7 @@ class TestConfig:
 
     @classmethod
     def resolve_quantized_draft_checkpoint_dir_name(
-            cls, param_str: str,
-            model_type: ModelType) -> Optional[str]:
+            cls, param_str: str, model_type: ModelType) -> Optional[str]:
         """Hub folder name for EAGLE draft from test_param only (no real paths)."""
         env_stub = EnvironmentConfig(
             llm_sdk_dir=".",
@@ -1176,12 +1175,12 @@ class TestConfig:
         # the same model ships under multiple folder names (e.g. ``InternVL3-1B``
         # as ``InternVL3-1B-hf`` or ``InternVL3-1B``).
         base_model_name = self._strip_model_quant_suffixes(self.model_name)
-        use_torch_base = (
-            not prefer_hub_quant and base_model_name != self.model_name
-            and base_model_name in LLM_MODELS_DIR_MAP)
-        use_torch_gptq = (
-            not prefer_hub_quant and self.llm_precision == "int4_gptq"
-            and base_model_name in GPTQ_MODELS_DIR_MAP)
+        use_torch_base = (not prefer_hub_quant
+                          and base_model_name != self.model_name
+                          and base_model_name in LLM_MODELS_DIR_MAP)
+        use_torch_gptq = (not prefer_hub_quant
+                          and self.llm_precision == "int4_gptq"
+                          and base_model_name in GPTQ_MODELS_DIR_MAP)
 
         if use_torch_base:
             search_dir = self.llm_models_dir
@@ -1217,8 +1216,9 @@ class TestConfig:
             else:
                 all_models = list(LLM_MODELS_DIR_MAP.keys()) + list(
                     GPTQ_MODELS_DIR_MAP.keys())
-                raise ValueError(f"Unsupported model name: '{self.model_name}'. "
-                                 f"Supported models: {', '.join(all_models)}")
+                raise ValueError(
+                    f"Unsupported model name: '{self.model_name}'. "
+                    f"Supported models: {', '.join(all_models)}")
 
         # Keep candidate order but remove duplicates.
         candidates = list(dict.fromkeys(candidates))
@@ -1383,9 +1383,8 @@ class TestConfig:
             candidates.append(
                 f"quantized-draft/quantized-{self.draft_model_id}-"
                 f"{self.draft_llm_precision}-{lm_head}")
-            candidates.append(
-                f"{base_model_name}_{self.draft_model_id}-"
-                f"{self.draft_llm_precision.upper()}")
+            candidates.append(f"{base_model_name}_{self.draft_model_id}-"
+                              f"{self.draft_llm_precision.upper()}")
         candidates = list(dict.fromkeys(candidates))
         return self._resolve_draft_model_dir(candidates,
                                              self._draft_hub_search_roots())
@@ -1416,7 +1415,8 @@ class TestConfig:
             onnx_model_id += "-fp8kv"
         if self.reduced_vocab_size:
             onnx_model_id += f"-rvs{self.reduced_vocab_size}"
-        return os.path.join(self.get_onnx_base_dir(), f"{prefix}-{onnx_model_id}")
+        return os.path.join(self.get_onnx_base_dir(),
+                            f"{prefix}-{onnx_model_id}")
 
     def get_tts_tokenizer_dir(self) -> str:
         """
@@ -1495,7 +1495,8 @@ class TestConfig:
     def get_eagle_draft_checkpoint_dir(self) -> str:
         """Resolve EAGLE draft HF checkpoint for checkpoint export (hub/local)."""
         if not self.is_eagle or self.is_mtp:
-            raise ValueError("get_eagle_draft_checkpoint_dir requires EAGLE config")
+            raise ValueError(
+                "get_eagle_draft_checkpoint_dir requires EAGLE config")
         if (self.draft_llm_precision
                 and self.draft_llm_precision not in ("fp16", "int4_gptq")):
             local_quant = self.get_quantized_draft_model_dir()

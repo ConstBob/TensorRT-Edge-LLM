@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Post-quantization layout validator.
 
 After ``tensorrt_edgellm`` writes a quantized checkpoint to
@@ -16,7 +30,6 @@ Failing here keeps such checkpoints from being uploaded to the hub.
 from __future__ import annotations
 
 import json
-import os
 import struct
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -24,14 +37,12 @@ from typing import Dict, List, Optional, Tuple
 
 from tensorrt_edgellm.config import _VL_LLM_PREFIXES
 from tensorrt_edgellm.quantization.quantization_configs import (
-    _AUDIO_PREFIXES,
-    _VISUAL_PREFIXES,
-)
-
+    _AUDIO_PREFIXES, _VISUAL_PREFIXES)
 
 # ---------------------------------------------------------------------------
 # Safetensors header reader (no torch dependency — just parse the JSON header)
 # ---------------------------------------------------------------------------
+
 
 def _read_safetensors_header(fpath: Path) -> Dict[str, str]:
     """Return ``{tensor_name: dtype_string}`` from a single safetensors file."""
@@ -73,6 +84,7 @@ def _safetensors_index(ckpt_dir: Path) -> Dict[str, str]:
 # Per-module precision classifier
 # ---------------------------------------------------------------------------
 
+
 def _classify_module(suffixes: Dict[str, str]) -> Optional[str]:
     """Infer the precision of a single Linear-style module from its tensor
     suffixes (``weight``, ``weight_scale``, ``weight_scale_2``, ``qweight``)."""
@@ -113,8 +125,11 @@ _VL_LLM_ROOTS = tuple(p.rstrip(".") for p in _VL_LLM_PREFIXES)
 # Eagle3 feature combiner (``fc``). Visual / audio markers are checked
 # first, so a visual encoder's own ``layers.N`` won't be mis-classified.
 _BODY_MARKERS = (
-    "model.layers", "layers",
-    "model.mtp", "mtp", "eagle",
+    "model.layers",
+    "layers",
+    "model.mtp",
+    "mtp",
+    "eagle",
     "fc",
 )
 
@@ -142,8 +157,8 @@ def _bucket(mod: str) -> str:
     # Norm: HF naming (``input_layernorm`` / ``post_attention_layernorm`` /
     # ``rms_norm``) plus the bare top-level ``norm`` that Eagle3 / some
     # drafts use for the final RMSNorm.
-    if (any(tag in mod for tag in ("layernorm", "rms_norm"))
-            or mod == "norm" or mod.endswith(".norm")):
+    if (any(tag in mod for tag in ("layernorm", "rms_norm")) or mod == "norm"
+            or mod.endswith(".norm")):
         return "norm"
     if any(f".{p}." in padded for p in _VL_LLM_ROOTS):
         return "body"
@@ -178,6 +193,7 @@ def _normalize(p: Optional[str]) -> str:
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
+
 
 def validate_ckpt_layout(
     ckpt_dir: str,
@@ -250,11 +266,12 @@ def validate_ckpt_layout(
             continue
         if got != expected:
             sample_mod = examples.get((bucket, got), "?")
-            distribution = ", ".join(
-                f"{k}={n}" for k, n in actual[bucket].most_common())
+            distribution = ", ".join(f"{k}={n}"
+                                     for k, n in actual[bucket].most_common())
             mismatches.append(
                 f"{bucket}: expected {expected} but checkpoint actually "
-                f"contains {{ {distribution} }} (example module: {sample_mod})")
+                f"contains {{ {distribution} }} (example module: {sample_mod})"
+            )
 
     if mismatches:
         # Surface the hf_quant_config.json that produced this mess — that's

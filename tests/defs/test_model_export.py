@@ -50,14 +50,14 @@ def _require_hf_checkpoint(dir_path: str,
 
     config_json = os.path.join(dir_path, "config.json")
     if not os.path.isfile(config_json):
-        raise FileNotFoundError(
-            f"{label} missing config.json: {dir_path}")
+        raise FileNotFoundError(f"{label} missing config.json: {dir_path}")
 
     weight_globs = glob.glob(os.path.join(dir_path, "*.safetensors"))
     weight_globs.extend(glob.glob(os.path.join(dir_path, "*.bin")))
     if not weight_globs:
         raise FileNotFoundError(
-            f"{label} missing weight files (*.safetensors / *.bin): {dir_path}")
+            f"{label} missing weight files (*.safetensors / *.bin): {dir_path}"
+        )
 
     if require_quant_config:
         quant_cfg = os.path.join(dir_path, "hf_quant_config.json")
@@ -74,7 +74,8 @@ def _require_hf_quant_checkpoint(dir_path: str, label: str) -> None:
 def _require_reduced_vocab_artifacts(config: TestConfig) -> None:
     reduced_dir = config.get_reduced_vocab_dir()
     if not os.path.isdir(reduced_dir):
-        raise FileNotFoundError(f"Reduced vocab output not found: {reduced_dir}")
+        raise FileNotFoundError(
+            f"Reduced vocab output not found: {reduced_dir}")
 
     vocab_map = os.path.join(reduced_dir, VOCAB_MAP_NAME)
     if not os.path.isfile(vocab_map):
