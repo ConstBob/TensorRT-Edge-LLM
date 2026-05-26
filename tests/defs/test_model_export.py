@@ -27,7 +27,6 @@ import pytest
 from conftest import EnvironmentConfig
 from pytest_helpers import run_command, timer_context
 
-from .ckpt_layout_validator import validate_ckpt_layout
 from .config import ModelType, TaskType, TestConfig
 from .utils.checkpoint_export_helpers import run_command_list
 from .utils.command_generation import generate_pre_export_commands
@@ -112,6 +111,12 @@ def validate_quantization_result(config: TestConfig) -> None:
     needs_kv_cache_quant = bool(config.fp8_kv_cache)
     needs_visual_quant = bool(config.visual_precision == "fp8")
     needs_audio_quant = bool(config.audio_precision == "fp8")
+
+    if not (needs_weight_quant or needs_kv_cache_quant or needs_visual_quant
+            or needs_audio_quant or config.is_eagle):
+        return
+
+    from .ckpt_layout_validator import validate_ckpt_layout
 
     if needs_weight_quant or needs_visual_quant or needs_audio_quant:
         ckpt_dir = config.get_quantized_model_dir()
