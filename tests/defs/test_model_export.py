@@ -129,6 +129,16 @@ def validate_export_result(config: TestConfig) -> None:
                     f"d2t.safetensors not found for reduced-vocab EAGLE: "
                     f"{d2t_path}")
 
+    if config.model_type == ModelType.VLA:
+        fp16_visual_onnx_dir = config.get_visual_onnx_dir("fp16")
+        if not os.path.exists(fp16_visual_onnx_dir):
+            raise FileNotFoundError(
+                f"VLA visual ONNX not found: {fp16_visual_onnx_dir}")
+        action_onnx = os.path.join(config.get_action_onnx_dir(), "model.onnx")
+        if not os.path.exists(action_onnx):
+            raise FileNotFoundError(
+                f"VLA action expert ONNX not found: {action_onnx}")
+
 
 # ---------------------------------------------------------------------------
 # Test class
@@ -296,4 +306,10 @@ class TestModelExport:
                                env_config: EnvironmentConfig):
         """OMNI (multimodal LLM + visual + audio) export test entry point"""
         self.test_model_export(test_param, test_logger, ModelType.OMNI,
+                               env_config)
+
+    def test_alpamayo_model_export(self, test_param: str, test_logger,
+                                   env_config: EnvironmentConfig):
+        """Alpamayo VLA (LLM + visual + action expert) export entry point"""
+        self.test_model_export(test_param, test_logger, ModelType.VLA,
                                env_config)

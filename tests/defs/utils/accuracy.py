@@ -19,6 +19,7 @@ This module provides functions to check the accuracy of model predictions agains
 """
 
 import json
+import math
 import os
 import re
 
@@ -57,7 +58,10 @@ def check_accuracy_with_dataset(output_json_file,
     # Datasets that use WER (Word Error Rate) for ASR / LibriSpeech
     WER_DATASETS = ["librispeech_clean_test", "asr_basic"]
 
-    # Other datasets to be handled later (TTS output is audio, not text — skip accuracy)
+    # Datasets that use minADE for VLA trajectory prediction.
+    MINADE_DATASETS = ["alpamayo_action_644", "alpamayo_action_chat"]
+
+    # Other datasets to be handled later (TTS output is audio, not text — skip accuracy).
     OTHER_DATASETS = [
         "mtbench", "coco", "aime", "humaneval", "math500", "tts_basic"
     ]
@@ -89,6 +93,9 @@ def check_accuracy_with_dataset(output_json_file,
         "librispeech_clean_test": 25.0,
         "asr_basic": 25.0,
     }
+
+    # minADE threshold (meters). PyTorch reference: 0.82113 m on 644 clips.
+    MINADE_THRESHOLD = 0.90
 
     # Load the output JSON to get prediction count
     with open(output_json_file, 'r', encoding='utf-8') as f:
@@ -264,6 +271,60 @@ def check_accuracy_with_dataset(output_json_file,
 
         except Exception as e:
             raise RuntimeError(f"Failed to run WER script: {str(e)}")
+
+    elif test_case_name in MINADE_DATASETS:
+        # gt.json sits next to input.json in each dataset folder.
+        minade_script = 'examples/accuracy/scripts/compute_minade.py'
+        input_dir = os.path.dirname(os.path.abspath(reference_json_file))
+        gt_json = os.path.join(input_dir, 'gt.json')
+        try:
+            cmd = [
+                'python3',
+                minade_script,
+                '--input',
+                reference_json_file,
+                '--output',
+                output_json_file,
+                '--gt',
+                gt_json,
+            ]
+            if logger:
+                logger.info("Running minADE: %s", ' '.join(cmd))
+            run_result = run_command(cmd,
+                                     remote_config=None,
+                                     timeout=600,
+                                     logger=logger)
+            if not run_result['success']:
+                raise RuntimeError(
+                    f"minADE script failed: {run_result.get('error')}")
+
+            stdout = run_result.get('output', '')
+            minade_6s = None
+            minade_3s = None
+            for line in stdout.splitlines():
+                if line.startswith("MINADE_6S="):
+                    minade_6s = float(line.split("=", 1)[1])
+                elif line.startswith("MINADE_3S="):
+                    minade_3s = float(line.split("=", 1)[1])
+            if minade_6s is None or math.isnan(minade_6s):
+                raise RuntimeError(
+                    "minADE script produced no usable MINADE_6S value "
+                    "(all clips skipped or output missing)")
+
+            result['metric_type'] = 'minADE'
+            result['minade_6s'] = minade_6s
+            result['minade_3s'] = minade_3s
+
+            if minade_6s > MINADE_THRESHOLD:
+                result['threshold_failure'] = "\n".join([
+                    f"minADE@6.4s above threshold for {test_case_name}",
+                    f"minADE@6.4s: {minade_6s:.5f} m (max allowed: {MINADE_THRESHOLD} m)",
+                    f"minADE@3s:   {minade_3s:.5f} m"
+                    if minade_3s is not None else "minADE@3s: n/a",
+                    f"PyTorch reference: 0.82113 m",
+                ])
+        except Exception as e:
+            raise RuntimeError(f"Failed to run minADE script: {str(e)}")
 
     elif test_case_name in OTHER_DATASETS:
         # Skip validation for these datasets
