@@ -464,26 +464,6 @@ def _calibrate_multimodal(model, batches):
         )
 
 
-def _ensure_legacy_quantizer_amax_attr(model) -> None:
-    """Backfill ``_amax`` for newer TensorQuantizer variants.
-
-    Some ModelOpt export paths still reference ``_amax`` directly. Newer
-    quantizer objects expose only ``amax``. Mirror ``amax`` into ``_amax`` to
-    keep export_hf_checkpoint compatible across mixed ModelOpt versions.
-    """
-    from modelopt.torch.quantization.nn.modules.tensor_quantizer import \
-        TensorQuantizer
-
-    for module in model.modules():
-        if not isinstance(module, TensorQuantizer):
-            continue
-        if hasattr(module, "_amax"):
-            continue
-        amax = getattr(module, "amax", None)
-        if amax is not None:
-            module._amax = amax
-
-
 def _calibrate_asr_multimodal(model, batch_iter):
     """Forward-loop calibration pass for joint ASR (audio + text) batches.
 
@@ -636,7 +616,6 @@ def quantize_and_export(
 
     _fix_generation_config_for_strict_validate(model)
     _normalize_tied_weights_keys(model)
-    _ensure_legacy_quantizer_amax_attr(model)
 
     os.makedirs(output_dir, exist_ok=True)
     with torch.inference_mode(), _skip_resmooth_for_hybrid(
