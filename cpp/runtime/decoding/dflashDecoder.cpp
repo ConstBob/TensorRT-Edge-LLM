@@ -23,8 +23,7 @@
 #include "common/mathUtils.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
 #include "kernels/speculative/dflashAcceptKernels.h"
-#include "kernels/speculative/dflashKVMaterializeKernels.h"
-#include "kernels/speculative/eagleUtilKernels.h"
+#include "kernels/speculative/dflashRuntimeKernels.h"
 #include "profiling/metrics.h"
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
@@ -47,6 +46,10 @@ namespace
 {
 constexpr int32_t kPrefillProfile{0};
 constexpr int32_t kDecodeProfile{1};
+int32_t dflashDraftProfileForRound(int32_t generationRound)
+{
+    return generationRound == 0 ? kPrefillProfile : kDecodeProfile;
+}
 } // namespace
 
 DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::path const& engineDir,
@@ -71,10 +74,10 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
     int32_t const maxBatch = deployment.maxRuntimeBatchSize();
     int32_t const maxSeqForDraft = baseCfg.maxKVCacheCapacity;
 
-    // Load draft engine using the DFlash-specific registry (now WITH KV cache bindings)
+    // Load draft engine using the registry selected from the deployment's spec-decode mode.
     auto const draftEnginePath = engineDir / "spec_draft.engine";
     LOG_INFO("DFlashDecoder: loading draft engine from %s", draftEnginePath.string().c_str());
-    mDraftExecutor = EngineExecutor::createForDFlashDraft(draftEnginePath, deployment);
+    mDraftExecutor = EngineExecutor::createForDraft(draftEnginePath, deployment);
     validateAgainstEngine(*deployment.draft, *mDraftExecutor, "dflash_draft");
 
     // Allocate draft engine I/O tensors
@@ -163,25 +166,6 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
     mArgmaxScratch
         = Tensor({maxBatch * mBlockSize}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "DFlash::argmaxScratch");
 
-    // Pre-allocate causal attention mask [maxBatch, BS, BS]: lower-triangular, built once.
-    mCausalMask
-        = Tensor({maxBatch, mBlockSize, mBlockSize}, DeviceType::kGPU, nvinfer1::DataType::kINT8, "DFlash::causalMask");
-    {
-        std::vector<int8_t> hostMask(maxBatch * mBlockSize * mBlockSize, 0);
-        for (int32_t b = 0; b < maxBatch; ++b)
-        {
-            for (int32_t i = 0; i < mBlockSize; ++i)
-            {
-                for (int32_t j = 0; j <= i; ++j)
-                {
-                    hostMask[b * mBlockSize * mBlockSize + i * mBlockSize + j] = 1;
-                }
-            }
-        }
-        CUDA_CHECK(cudaMemcpyAsync(mCausalMask.rawPointer(), hostMask.data(), hostMask.size() * sizeof(int8_t),
-            cudaMemcpyHostToDevice, stream));
-    }
-
     mLastAcceptedTokens
         = Tensor({maxBatch}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "DFlash::lastAcceptedTokens");
 
@@ -266,7 +250,7 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
 
     if (context.generationRound == 0)
     {
-        // Bug 3 fix: use per-batch effective prefill lengths, not uniform max.
+        // Prompts may be padded to a batch max; materialize only each sequence's effective prefill length.
         sourceSeqLen = mRuntime.base.pipelineIO.baseHiddenStates.getShape()[1];
         maxDeltaLen = 0;
         for (int32_t b = 0; b < activeBatchSize; ++b)
@@ -294,7 +278,6 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
     CUDA_CHECK(cudaMemcpyAsync(mDraftDeltaLens.rawPointer(), mHostDeltaLens.rawPointer(),
         activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
 
-    // Bug 1 fix: strided per-batch copy of target hidden states.
     // Source: baseHiddenStates [B, sourceSeqLen, Hout] — stride = sourceSeqLen * Hout
     // Dest:   mDraftTargetHidden [B, maxDeltaLen, Hout] — stride = maxDeltaLen * Hout
     // Copy the first maxDeltaLen rows per batch. Rows beyond delta_lengths[b] are padding
@@ -313,7 +296,7 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
     }
 
     // Step 4: Prepare proposal attention inputs.
-    // Bug 2 fix: use per-batch deltaLengths (GPU tensor) instead of scalar.
+    // KV length advancement is per sequence, so proposal positions and masks must consume delta_lengths[b].
     {
         int32_t const pmLen = divUp(BS, 32);
         check::check(mDraftPackedAttentionMask.reshape({activeBatchSize, BS, pmLen}), "Tensor reshape failed");
@@ -344,9 +327,8 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
 
     cudaGetLastError();
 
-    // Use kDecodeProfile (1), matching CUDA graph capture. Profile 0 is reserved for
-    // prefill-sized context (round 0 with large deltaLen), which falls back to enqueueV3.
-    bool draftSuccess = mDraftExecutor->prepare(kDecodeProfile, draftDims, mDraftTensorMap, context.stream);
+    bool draftSuccess = mDraftExecutor->prepare(
+        dflashDraftProfileForRound(context.generationRound), draftDims, mDraftTensorMap, context.stream);
     if (draftSuccess)
     {
         draftSuccess = mDraftExecutor->execute(context.stream);
@@ -357,13 +339,11 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
         return false;
     }
 
-    // Step 6: Commit delta length to draft cache manager.
-    // Round 0: uniform prefillLen for all batches.
-    // Round > 0: per-batch acceptLen from previous verify (use mAcceptLength GPU tensor).
+    // Step 6: Commit per-batch delta lengths to the draft cache manager.
+    // Round 0 uses effective prefill lengths; later rounds use accept lengths from verification.
     {
         if (context.generationRound == 0)
         {
-            // Bug 3 fix: commit per-batch delta lengths (not uniform maxDeltaLen).
             check::check(mDraftDeltaLenCommit.reshape({activeBatchSize}), "Tensor reshape failed");
             CUDA_CHECK(cudaMemcpyAsync(mDraftDeltaLenCommit.rawPointer(), mHostDeltaLens.rawPointer(),
                 activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
@@ -421,7 +401,7 @@ bool DFlashDecoder::runBaseVerification(DecodingInferenceContext& context)
     check::check(mRuntime.base.pipelineIO.baseHiddenStates.reshape({selectTokenSize, mBaseOutputHiddenDim}),
         "Tensor reshape failed");
 
-    // Step 4: Prepare attention mask and position IDs using pre-allocated causal mask
+    // Step 4: Prepare packed causal attention mask and position IDs for base verification.
     {
         int32_t const verifySize = BS;
         check::check(mRuntime.base.pipelineIO.packedAttentionMask.reshape(
@@ -434,11 +414,11 @@ bool DFlashDecoder::runBaseVerification(DecodingInferenceContext& context)
             "Tensor reshape failed");
 
         Tensor const& baseKVCacheLengths = mRuntime.base.cacheManager.getKVCacheLengths();
-        check::check(mCausalMask.reshape({activeBatchSize, verifySize, verifySize}), "Tensor reshape failed");
-
-        kernel::prepareEagleBaseTreeDecodingInputs(mCausalMask, baseKVCacheLengths,
-            mRuntime.base.pipelineIO.packedAttentionMask, mRuntime.base.pipelineIO.specDecodePositionIds,
-            mRuntime.base.pipelineIO.selectTokenIndices, mRuntime.base.pipelineIO.contextLengths, context.stream);
+        kernel::launchDFlashPrepareBaseVerifyInputs(baseKVCacheLengths.dataPointer<int32_t>(), verifySize,
+            mRuntime.base.pipelineIO.packedAttentionMask.dataPointer<int32_t>(),
+            mRuntime.base.pipelineIO.specDecodePositionIds.dataPointer<int32_t>(),
+            mRuntime.base.pipelineIO.selectTokenIndices.dataPointer<int64_t>(),
+            mRuntime.base.pipelineIO.contextLengths.dataPointer<int32_t>(), activeBatchSize, context.stream);
     }
 
     if (mRuntime.preprocess.deepstack)
@@ -594,7 +574,6 @@ bool DFlashDecoder::captureCudaGraphs(cudaStream_t stream)
             check::check(mRuntime.base.pipelineIO.inputsEmbeds.reshape(
                              {batchSize, verifySize, mRuntime.deployment.base.hiddenSize}),
                 "Tensor reshape failed");
-            check::check(mCausalMask.reshape({batchSize, verifySize, verifySize}), "Tensor reshape failed");
             check::check(mRuntime.base.pipelineIO.packedAttentionMask.reshape(
                              {batchSize, verifySize, static_cast<int64_t>(divUp(verifySize, 32))}),
                 "Tensor reshape failed");
@@ -605,9 +584,11 @@ bool DFlashDecoder::captureCudaGraphs(cudaStream_t stream)
                 "Tensor reshape failed");
 
             Tensor const& baseKVCacheLengths = mRuntime.base.cacheManager.getKVCacheLengths();
-            kernel::prepareEagleBaseTreeDecodingInputs(mCausalMask, baseKVCacheLengths,
-                mRuntime.base.pipelineIO.packedAttentionMask, mRuntime.base.pipelineIO.specDecodePositionIds,
-                mRuntime.base.pipelineIO.selectTokenIndices, mRuntime.base.pipelineIO.contextLengths, stream);
+            kernel::launchDFlashPrepareBaseVerifyInputs(baseKVCacheLengths.dataPointer<int32_t>(), verifySize,
+                mRuntime.base.pipelineIO.packedAttentionMask.dataPointer<int32_t>(),
+                mRuntime.base.pipelineIO.specDecodePositionIds.dataPointer<int32_t>(),
+                mRuntime.base.pipelineIO.selectTokenIndices.dataPointer<int64_t>(),
+                mRuntime.base.pipelineIO.contextLengths.dataPointer<int32_t>(), batchSize, stream);
 
             if (mRuntime.preprocess.deepstack)
             {
@@ -720,7 +701,7 @@ bool DFlashDecoder::runSystemPromptPrefill(DecodingInferenceContext& context)
         activeBatchSize, BS, draftKVCapacity, prefillLen, BS, 1, static_cast<int64_t>(pmLen), activeBatchSize};
 
     cudaGetLastError();
-    bool ok = mDraftExecutor->prepare(kDecodeProfile, draftDims, mDraftTensorMap, context.stream);
+    bool ok = mDraftExecutor->prepare(kPrefillProfile, draftDims, mDraftTensorMap, context.stream);
     if (ok)
         ok = mDraftExecutor->execute(context.stream);
     if (!ok)

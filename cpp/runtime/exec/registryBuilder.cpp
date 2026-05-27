@@ -321,7 +321,7 @@ TensorRegistry buildRegistryForDFlashDraft(DeploymentConfig const& bundle)
     reg.addTensor({binding_names::kInputsEmbeds, TensorIO::kInput, nvinfer1::DataType::kHALF,
         {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(draftHiddenSize)}});
 
-    // target_hidden_concat: [batch, selectLen, baseOutputHiddenDim] HALF — target hidden delta
+    // dflash_target_hidden_concat: [batch, selectLen, baseOutputHiddenDim] HALF — target hidden delta
     reg.addTensor({binding_names::kDFlashTargetHiddenConcat, TensorIO::kInput, nvinfer1::DataType::kHALF,
         {sym(&InferenceDims::batch), sym(&InferenceDims::selectLen), fixed(baseOutputHiddenDim)}});
 
@@ -337,7 +337,7 @@ TensorRegistry buildRegistryForDFlashDraft(DeploymentConfig const& bundle)
     reg.addTensor({binding_names::kKVCacheStartIndex, TensorIO::kInput, nvinfer1::DataType::kINT32,
         {sym(&InferenceDims::startIndexLen)}});
 
-    // delta_lengths: [batch] INT32 — per-batch delta lengths for multi-batch
+    // dflash_delta_lengths: [batch] INT32 — per-batch delta lengths for multi-batch
     reg.addTensor({binding_names::kDFlashDeltaLengths, TensorIO::kInput, nvinfer1::DataType::kINT32,
         {sym(&InferenceDims::batch)}});
 

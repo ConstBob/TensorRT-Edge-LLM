@@ -215,8 +215,8 @@ private:
         nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
 
     //! Set up optimization profiles for DFlash draft models.
-    //! DFlash draft consumes proposal embeddings, target_hidden_concat, per-batch
-    //! delta_lengths, and per-layer KV cache bindings.
+    //! DFlash draft consumes proposal embeddings, dflash_target_hidden_concat,
+    //! dflash_delta_lengths, and per-layer KV cache bindings.
     bool setupDFlashDraftProfiles(
         nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
 

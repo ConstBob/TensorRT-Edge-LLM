@@ -76,21 +76,14 @@ inline constexpr char const* kOutputHiddenStates = "hidden_states";
  *
  * Shape: [batch_size, context_length, base_output_hidden_dim] (FLOAT16)
  */
-inline constexpr char const* kDFlashTargetHiddenConcat = "target_hidden_concat";
-
-/*!
- * @brief DFlash draft model input: target-model position offset.
- *
- * Shape: [batch_size] (INT32)
- */
-inline constexpr char const* kDFlashPositionOffset = "position_offset";
+inline constexpr char const* kDFlashTargetHiddenConcat = "dflash_target_hidden_concat";
 
 /*!
  * @brief DFlash draft model input: per-batch delta lengths for multi-batch.
  *
  * Shape: [batch_size] (INT32)
  */
-inline constexpr char const* kDFlashDeltaLengths = "delta_lengths";
+inline constexpr char const* kDFlashDeltaLengths = "dflash_delta_lengths";
 
 /*! @} */
 

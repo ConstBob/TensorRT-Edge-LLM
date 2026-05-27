@@ -70,5 +70,24 @@ void launchDFlashPrepareProposalInputs(int32_t const* oldDraftCacheLengths, int3
     int32_t blockSize, int32_t* packedAttentionMask, int32_t* attentionPosId, int32_t* contextLengths,
     int32_t batchSize, cudaStream_t stream);
 
+/// Launch kernel to prepare DFlash base verification attention inputs.
+///
+/// DFlash verifies a linear block, so the base tree mask is always causal:
+/// token i attends to proposal tokens [0, i]. This writes the packed INT32 mask
+/// consumed by AttentionPlugin directly, without materializing an intermediate
+/// unpacked [B, BS, BS] INT8 mask.
+///
+/// @param baseKVCacheLengths [B] INT32 — committed base cache lengths (GPU)
+/// @param verifySize DFlash verify block size (BS)
+/// @param packedAttentionMask [B, BS, divUp(BS,32)] INT32 — output
+/// @param attentionPosId [B, BS] INT32 — output
+/// @param selectTokenIndices [B, BS] INT64 — output
+/// @param contextLengths [B] INT32 — output
+/// @param batchSize batch size
+/// @param stream CUDA stream
+void launchDFlashPrepareBaseVerifyInputs(int32_t const* baseKVCacheLengths, int32_t verifySize,
+    int32_t* packedAttentionMask, int32_t* attentionPosId, int64_t* selectTokenIndices, int32_t* contextLengths,
+    int32_t batchSize, cudaStream_t stream);
+
 } // namespace kernel
 } // namespace trt_edgellm

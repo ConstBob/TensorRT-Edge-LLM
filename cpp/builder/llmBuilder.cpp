@@ -550,25 +550,25 @@ bool LLMBuilder::setupDFlashDraftProfiles(
     bool result = true;
 
     int64_t const maxDraftTokens = std::max<int64_t>(1, mBuilderConfig.maxDraftTreeSize);
-    int64_t const optDraftTokens = std::max<int64_t>(1, maxDraftTokens / 2);
-    int64_t const maxTargetHiddenLen = std::max<int64_t>(1, mBuilderConfig.maxKVCacheCapacity);
-    int64_t const optTargetHiddenLen = std::max<int64_t>(1, maxTargetHiddenLen / 2);
+    int64_t const optDraftTokens = maxDraftTokens;
+    int64_t const maxPrefillTargetHiddenLen = std::max<int64_t>(1, mBuilderConfig.maxInputLen);
+    int64_t const optPrefillTargetHiddenLen = std::max<int64_t>(1, maxPrefillTargetHiddenLen / 2);
+    int64_t const maxDecodeTargetHiddenLen = maxDraftTokens;
+    int64_t const optDecodeTargetHiddenLen = maxDraftTokens;
 
-    int32_t const attnMaskAlignSize = 32;
-    int64_t const packedMaskLen
-        = static_cast<int64_t>((maxDraftTokens + attnMaskAlignSize - 1) / attnMaskAlignSize * attnMaskAlignSize);
-    int64_t const optPackedMaskLen
-        = static_cast<int64_t>((optDraftTokens + attnMaskAlignSize - 1) / attnMaskAlignSize * attnMaskAlignSize);
+    int64_t const packedMaskLen = static_cast<int64_t>(divUp(maxDraftTokens, 32));
+    int64_t const optPackedMaskLen = static_cast<int64_t>(divUp(optDraftTokens, 32));
 
-    // DFlash draft has one cached block-proposal execution shape. The runtime
-    // still carries both profile slots, so expose the same dynamic ranges for both.
-    auto setupOneProfile = [&](nvinfer1::IOptimizationProfile& profile) {
+    // Profile 0 handles round-0/system-prompt materialization, where target hidden spans the prompt.
+    // Profile 1 handles steady-state block proposal, where target hidden delta is bounded by block size.
+    auto setupOneProfile = [&](nvinfer1::IOptimizationProfile& profile, int64_t optTargetHiddenLen,
+                               int64_t maxTargetHiddenLen) {
         bool ok = true;
         // inputs_embeds: [batch, block_seq, hiddenSize]
         ok &= setOptimizationProfile(&profile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
             createDims({mBuilderConfig.maxBatchSize, optDraftTokens, mHiddenSize}),
             createDims({mBuilderConfig.maxBatchSize, maxDraftTokens, mHiddenSize}));
-        // target_hidden_concat: [batch, delta_seq, baseOutputHiddenDim]
+        // dflash_target_hidden_concat: [batch, delta_seq, baseOutputHiddenDim]
         ok &= setOptimizationProfile(&profile, binding_names::kDFlashTargetHiddenConcat,
             createDims({1, 1, mTargetModelOutputHiddenDim}),
             createDims({mBuilderConfig.maxBatchSize, optTargetHiddenLen, mTargetModelOutputHiddenDim}),
@@ -583,7 +583,7 @@ bool LLMBuilder::setupDFlashDraftProfiles(
         // kvcache_start_index: [batch]
         ok &= setOptimizationProfile(&profile, binding_names::kKVCacheStartIndex, createDims({1}),
             createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
-        // delta_lengths: [batch]
+        // dflash_delta_lengths: [batch]
         ok &= setOptimizationProfile(&profile, binding_names::kDFlashDeltaLengths, createDims({1}),
             createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
         // attention_mask: [batch, block_seq, packed_mask_len]
@@ -611,8 +611,8 @@ bool LLMBuilder::setupDFlashDraftProfiles(
         return ok;
     };
 
-    result &= setupOneProfile(contextProfile);
-    result &= setupOneProfile(generationProfile);
+    result &= setupOneProfile(contextProfile, optPrefillTargetHiddenLen, maxPrefillTargetHiddenLen);
+    result &= setupOneProfile(generationProfile, optDecodeTargetHiddenLen, maxDecodeTargetHiddenLen);
     return result;
 }
 

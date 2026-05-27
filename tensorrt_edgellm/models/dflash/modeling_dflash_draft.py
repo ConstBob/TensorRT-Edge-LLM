@@ -265,8 +265,8 @@ def _make_flat_wrapper_dflash(model: nn.Module, num_layers: int) -> nn.Module:
     """
     # Build explicit parameter list
     param_names = ([
-        "inputs_embeds", "target_hidden_concat", "rope_rotary_cos_sin",
-        "context_lengths", "kvcache_start_index", "delta_lengths",
+        "inputs_embeds", "dflash_target_hidden_concat", "rope_rotary_cos_sin",
+        "context_lengths", "kvcache_start_index", "dflash_delta_lengths",
         "attention_mask", "attention_pos_id"
     ] + [f"past_key_values_{i}" for i in range(num_layers)])
 
@@ -274,9 +274,9 @@ def _make_flat_wrapper_dflash(model: nn.Module, num_layers: int) -> nn.Module:
                                              for i in range(num_layers)))
 
     body = (f"    logits, present_kv_list = self._model(\n"
-            f"        inputs_embeds, target_hidden_concat,\n"
+            f"        inputs_embeds, dflash_target_hidden_concat,\n"
             f"        rope_rotary_cos_sin, context_lengths,\n"
-            f"        kvcache_start_index, delta_lengths,\n"
+            f"        kvcache_start_index, dflash_delta_lengths,\n"
             f"        attention_mask, attention_pos_id,\n"
             f"        list({past_kv_tuple}))\n"
             f"    return (logits,) + tuple(present_kv_list)\n")
@@ -463,11 +463,11 @@ class DFlashDraftModel(nn.Module):
 
         input_names = [
             "inputs_embeds",
-            "target_hidden_concat",
+            "dflash_target_hidden_concat",
             "rope_rotary_cos_sin",
             "context_lengths",
             "kvcache_start_index",
-            "delta_lengths",
+            "dflash_delta_lengths",
             "attention_mask",
             "attention_pos_id",
         ]
@@ -492,7 +492,7 @@ class DFlashDraftModel(nn.Module):
             {
                 0: batch,
                 1: delta_seq
-            },  # target_hidden_concat
+            },  # dflash_target_hidden_concat
             {
                 1: kv_len
             },  # rope_rotary_cos_sin (ropeBatch=1 fixed)
@@ -504,7 +504,7 @@ class DFlashDraftModel(nn.Module):
             },  # kvcache_start_index
             {
                 0: batch
-            },  # delta_lengths
+            },  # dflash_delta_lengths
             {
                 0: batch,
                 1: block_seq,

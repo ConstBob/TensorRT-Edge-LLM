@@ -105,9 +105,6 @@ private:
     //! Pre-allocated argmax scratch buffer for dflashSequentialAccept [maxBatch * BS] INT32
     Tensor mArgmaxScratch;
 
-    //! Pre-allocated causal attention mask for base verification [maxBatch, BS, BS] INT8
-    Tensor mCausalMask;
-
     //! Last accepted token per batch [maxBatch] INT32 (GPU)
     Tensor mLastAcceptedTokens;
 

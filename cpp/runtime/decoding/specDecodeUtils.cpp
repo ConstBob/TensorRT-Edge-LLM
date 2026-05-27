@@ -47,7 +47,7 @@ std::unique_ptr<EngineExecutor> loadDraftEngine(std::filesystem::path const& eng
     std::unique_ptr<EngineExecutor> draftExecutor;
     try
     {
-        draftExecutor = EngineExecutor::createForSpecDecodeDraft(draftEnginePath, deployment);
+        draftExecutor = EngineExecutor::createForDraft(draftEnginePath, deployment);
     }
     catch (std::exception const& e)
     {

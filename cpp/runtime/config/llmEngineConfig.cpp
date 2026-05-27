@@ -684,16 +684,6 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
                     + " for binding '" + kvPastName + "'.");
         }
 
-        // Old explicit DFlash engines have position_offset but no context_lengths.
-        // Fail if the old binding exists (ambiguous engine version).
-        if (engineHasTensor(executor, std::string(binding_names::kDFlashPositionOffset)))
-        {
-            LOG_WARNING(
-                "DFlash draft engine (%s) has legacy 'position_offset' binding. "
-                "This engine may be from the old explicit path. Proceeding but results may be incorrect.",
-                engineLabel);
-        }
-
         return;
     }
 

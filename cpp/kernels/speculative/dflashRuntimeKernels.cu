@@ -16,7 +16,7 @@
  */
 
 #include "common/checkMacros.h"
-#include "dflashKVMaterializeKernels.h"
+#include "dflashRuntimeKernels.h"
 
 #include <cassert>
 #include <cstdint>
@@ -242,6 +242,73 @@ void launchDFlashPrepareProposalInputs(int32_t const* oldDraftCacheLengths, int3
 
     dflashPrepareProposalInputsKernel<<<grid, block, 0, stream>>>(
         oldDraftCacheLengths, deltaLengths, blockSize, packedAttentionMask, attentionPosId, contextLengths);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// -----------------------------------------------------------------------
+// DFlash base verification input preparation kernel
+// -----------------------------------------------------------------------
+//
+// Grid: (batchSize)
+// Block: (verifySize)
+
+__global__ void dflashPrepareBaseVerifyInputsKernel(int32_t const* __restrict__ baseKVCacheLengths,
+    int32_t verifySize, int32_t* __restrict__ packedAttentionMask, int32_t* __restrict__ attentionPosId,
+    int64_t* __restrict__ selectTokenIndices, int32_t* __restrict__ contextLengths)
+{
+    int32_t const b = blockIdx.x;
+    int32_t const i = threadIdx.x; // position within the verified block [0, verifySize)
+
+    if (i >= verifySize)
+    {
+        return;
+    }
+
+    int32_t const baseLen = baseKVCacheLengths[b];
+    int32_t const packedMaskLen = (verifySize + 31) / 32;
+
+    attentionPosId[b * verifySize + i] = baseLen + i;
+    selectTokenIndices[b * verifySize + i] = i;
+    if (i == 0)
+    {
+        contextLengths[b] = baseLen + verifySize;
+    }
+
+    // Causal packed mask for linear verification: row i has bits [0, i] set.
+    for (int32_t w = 0; w < packedMaskLen; ++w)
+    {
+        int32_t const bitStart = w * 32;
+        int32_t const bitEnd = min(bitStart + 32, verifySize);
+        int32_t const validBits = bitEnd - bitStart;
+
+        uint32_t mask = 0;
+        if (i >= bitEnd - 1)
+        {
+            mask = (validBits == 32) ? 0xFFFFFFFFu : ((1u << validBits) - 1u);
+        }
+        else if (i >= bitStart)
+        {
+            mask = (1u << (i - bitStart + 1)) - 1u;
+        }
+        packedAttentionMask[b * verifySize * packedMaskLen + i * packedMaskLen + w] = static_cast<int32_t>(mask);
+    }
+}
+
+void launchDFlashPrepareBaseVerifyInputs(int32_t const* baseKVCacheLengths, int32_t verifySize,
+    int32_t* packedAttentionMask, int32_t* attentionPosId, int64_t* selectTokenIndices, int32_t* contextLengths,
+    int32_t batchSize, cudaStream_t stream)
+{
+    if (batchSize == 0 || verifySize == 0)
+    {
+        return;
+    }
+
+    assert(verifySize <= 1024 && "DFlash verify block size exceeds CUDA max threads per block");
+    dim3 const grid(batchSize);
+    dim3 const block(verifySize);
+
+    dflashPrepareBaseVerifyInputsKernel<<<grid, block, 0, stream>>>(
+        baseKVCacheLengths, verifySize, packedAttentionMask, attentionPosId, selectTokenIndices, contextLengths);
     CUDA_CHECK(cudaGetLastError());
 }
 
