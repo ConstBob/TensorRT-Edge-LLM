@@ -132,6 +132,7 @@ class ModelType(enum.Enum):
     TTS = "tts"
     ASR = "asr"
     OMNI = "omni"
+    VLA = "vla"  # Vision-Language-Action (e.g. Alpamayo-R1-10B)
 
 
 class TaskType(enum.Enum):
@@ -225,6 +226,8 @@ class TestConfig:
     min_time_steps: Optional[int] = None
     max_time_steps: Optional[int] = None
 
+    max_kv_cache_capacity: Optional[int] = None
+
     # Inference parameters
     test_case: Optional[str] = None
 
@@ -278,7 +281,7 @@ class TestConfig:
                 TaskType.KERNEL_BENCH
             }, {
                 ModelType.LLM, ModelType.VLM, ModelType.TTS, ModelType.ASR,
-                ModelType.OMNI
+                ModelType.OMNI, ModelType.VLA
             }),
         ParameterSpec(
             "max_input_len", "mxil", {
@@ -286,7 +289,7 @@ class TestConfig:
                 TaskType.KERNEL_BENCH
             }, {
                 ModelType.LLM, ModelType.VLM, ModelType.TTS, ModelType.ASR,
-                ModelType.OMNI
+                ModelType.OMNI, ModelType.VLA
             }),
         ParameterSpec(
             "max_seq_len", "mxsl", {
@@ -294,7 +297,7 @@ class TestConfig:
                 TaskType.KERNEL_BENCH
             }, {
                 ModelType.LLM, ModelType.VLM, ModelType.TTS, ModelType.ASR,
-                ModelType.OMNI
+                ModelType.OMNI, ModelType.VLA
             }),
         ParameterSpec("max_lora_rank",
                       "mxlr",
@@ -385,26 +388,32 @@ class TestConfig:
                       {TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE},
                       {ModelType.ASR, ModelType.OMNI}),
 
-        # VLM-specific parameters
+        # VLM/OMNI/VLA visual-encoder parameters
         ParameterSpec("min_image_tokens", "mnit",
                       {TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE},
-                      {ModelType.VLM, ModelType.OMNI}),
+                      {ModelType.VLM, ModelType.OMNI, ModelType.VLA}),
         ParameterSpec("max_image_tokens", "mxit",
                       {TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE},
-                      {ModelType.VLM, ModelType.OMNI}),
+                      {ModelType.VLM, ModelType.OMNI, ModelType.VLA}),
         # mxpiit is optional — most VLM/OMNI test cases use the same value
         # (512), so set_defaults() falls back to 512 when not in the param
         # string. Override per-test by including ``-mxpiit<N>``.
         ParameterSpec("max_image_tokens_per_image",
                       "mxpiit",
                       {TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE},
-                      {ModelType.VLM, ModelType.OMNI},
+                      {ModelType.VLM, ModelType.OMNI, ModelType.VLA},
                       is_required=False),
         ParameterSpec("visual_precision",
                       "vit", {
                           TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
                           TaskType.INFERENCE
-                      }, {ModelType.VLM, ModelType.OMNI},
+                      }, {ModelType.VLM, ModelType.OMNI, ModelType.VLA},
+                      is_required=False),
+        ParameterSpec("max_kv_cache_capacity",
+                      "mxkvc", {
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
+                          TaskType.INFERENCE
+                      }, {ModelType.VLA},
                       is_required=False),
         ParameterSpec("audio_precision",
                       "aud", {
@@ -417,12 +426,12 @@ class TestConfig:
         ParameterSpec("test_case", "",
                       {TaskType.INFERENCE, TaskType.E2E_BENCH}, {
                           ModelType.LLM, ModelType.VLM, ModelType.TTS,
-                          ModelType.ASR, ModelType.OMNI
+                          ModelType.ASR, ModelType.OMNI, ModelType.VLA
                       }),
         ParameterSpec("batch_size",
                       "bs", {TaskType.E2E_BENCH, TaskType.INFERENCE}, {
                           ModelType.LLM, ModelType.VLM, ModelType.TTS,
-                          ModelType.ASR, ModelType.OMNI
+                          ModelType.ASR, ModelType.OMNI, ModelType.VLA
                       },
                       is_required=False),
 
@@ -582,6 +591,8 @@ class TestConfig:
                 parsed_params['max_image_tokens'] = int(part[4:])
             elif part.startswith('mxpiit'):
                 parsed_params['max_image_tokens_per_image'] = int(part[6:])
+            elif part.startswith('mxkvc'):
+                parsed_params['max_kv_cache_capacity'] = int(part[5:])
             elif part.startswith('mxlr'):
                 parsed_params['max_lora_rank'] = int(part[4:])
             # For benchmark parameters
@@ -698,11 +709,16 @@ class TestConfig:
                     self.lora = self.max_lora_rank > 0
                 if self.fp8_kv_cache is None:
                     self.fp8_kv_cache = False
-                # max_image_tokens_per_image: VLM/OMNI default. Most test
-                # cases use 512; override via ``-mxpiit<N>`` in the param.
-                if (self.model_type in (ModelType.VLM, ModelType.OMNI)) and (
-                        self.max_image_tokens_per_image is None):
+                if (self.model_type
+                        in (ModelType.VLM, ModelType.OMNI, ModelType.VLA
+                            )) and (self.max_image_tokens_per_image is None):
                     self.max_image_tokens_per_image = 512
+                if (self.model_type == ModelType.VLA
+                        and self.max_kv_cache_capacity is None):
+                    self.max_kv_cache_capacity = 4096
+                if (self.model_type == ModelType.VLA
+                        and self.visual_precision is None):
+                    self.visual_precision = "fp16"
                 if self.is_eagle is None:
                     self.is_eagle = False
                 if self.is_mtp is None:
@@ -860,6 +876,8 @@ class TestConfig:
             "Qwen3.5-27B",
             "Phi-4-multimodal-instruct":
             "Phi-4-multimodal-instruct",
+            "Alpamayo-R1-10B":
+            "Alpamayo-R1-10B",
             # Pre-quantized models in llm_models_dir
             "Llama-3.2-1B-FP8":
             "llama-3.2-models/Llama-3.2-1B-FP8",
@@ -1115,6 +1133,20 @@ class TestConfig:
         p = precision or self.audio_precision
         return os.path.join(self.get_onnx_base_dir(), f"code2wav-{p}")
 
+    def get_action_onnx_dir(self) -> str:
+        return os.path.join(self.get_onnx_base_dir(), "action-fp16")
+
+    def get_action_engine_dir(self) -> str:
+        # action_build appends /action to --engineDir, so passing
+        # get_visual_engine_dir() lands action.engine next to visual.engine
+        # under the same parent dir, which is what action_inference
+        # --multimodalEngineDir expects.
+        return os.path.join(self.get_visual_engine_dir(), "action")
+
+    def get_alpamayo_dataset_dir(self) -> str:
+        # Resolves $ALPAMAYO_DATASET_DIR to the active test_case's folder.
+        return os.path.dirname(self.get_test_case_file())
+
     def get_draft_onnx_model_id(self) -> str:
         """Generate unique draft model identifier including draft_model_id"""
         if self.draft_model_id is None:
@@ -1253,6 +1285,10 @@ class TestConfig:
             "tests/test_cases/vlm_basic.json",
             "vlm_lora":
             "tests/test_cases/vlm_lora.json",
+            "alpamayo_action_chat":
+            f"{self.edgellm_data_dir}/updated_datasets/alpamayo_action_chat/input.json",
+            "alpamayo_action_644":
+            f"{self.edgellm_data_dir}/updated_datasets/alpamayo_eval_dataset/input.json",
             "mtbench":
             f"{self.edgellm_data_dir}/updated_datasets/updated_MTBench/{mtbench_dataset}",
             "mmmu":
