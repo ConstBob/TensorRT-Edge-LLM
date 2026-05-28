@@ -65,7 +65,6 @@ _SCRIPT_DIR = Path(__file__).parent.resolve()
 _DEFAULT_OUTPUT_DIR = (_SCRIPT_DIR / "../cpp/kernels/cuteDSLArtifact").resolve()
 _CUTLASS_DSL_VERSION = "4.5.1"
 _CUPY_VERSIONS = {12: ("cupy-cuda12x", "12.3.0"), 13: ("cupy-cuda13x", "13.6.0")}
-_SM110_MOE_GROUP = "nvfp4_moe"
 _SM110_PATCH_SCRIPT = (
     _SCRIPT_DIR / "nvfp4_moe_cutedsl" / "patch_cutlass_dsl_sm110a.py"
 )
@@ -1099,7 +1098,7 @@ def check_dependencies(sm=None, selected_groups=None):
     except importlib.metadata.PackageNotFoundError:
         errors.append("cuda-python not found.\n  Fix: pip install cuda-python")
 
-    if sm == 110 and _SM110_MOE_GROUP in selected_groups and lib_dir is not None:
+    if sm == 110 and "nvfp4_moe" in selected_groups and lib_dir is not None:
         errors.extend(_check_sm110_cutedsl_patch())
 
     if errors:
