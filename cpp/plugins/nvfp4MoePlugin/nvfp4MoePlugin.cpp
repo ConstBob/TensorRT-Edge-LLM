@@ -38,7 +38,6 @@
 #include <NvInferRuntime.h>
 
 #include <algorithm>
-#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -385,8 +384,13 @@ int32_t Nvfp4MoePlugin::getNbOutputs() const noexcept
 int32_t Nvfp4MoePlugin::getOutputDataTypes(
     DataType* outputTypes, int32_t nbOutputs, DataType const* inputTypes, int32_t nbInputs) const noexcept
 {
-    assert(nbOutputs == 1);
-    (void) nbOutputs;
+    // Always-on contract check (assert() would be a no-op in release builds and
+    // could silently write past `outputTypes`).
+    if (nbOutputs != 1)
+    {
+        LOG_ERROR("Nvfp4MoePlugin: getOutputDataTypes expected 1 output, got %d", nbOutputs);
+        return -1;
+    }
     (void) nbInputs;
     (void) inputTypes;
     outputTypes[0] = DataType::kHALF; // v1 always FP16 out.
@@ -396,9 +400,14 @@ int32_t Nvfp4MoePlugin::getOutputDataTypes(
 int32_t Nvfp4MoePlugin::getOutputShapes(DimsExprs const* inputs, int32_t nbInputs, DimsExprs const* shapeInputs,
     int32_t nbShapeInputs, DimsExprs* outputs, int32_t nbOutputs, IExprBuilder& exprBuilder) noexcept
 {
-    assert(nbInputs == kNbPluginInputs && nbOutputs == 1);
-    (void) nbInputs;
-    (void) nbOutputs;
+    // Always-on contract check (assert() would be a no-op in release builds and
+    // could silently dereference past the input/output arrays).
+    if (nbInputs != kNbPluginInputs || nbOutputs != 1)
+    {
+        LOG_ERROR("Nvfp4MoePlugin: getOutputShapes expected %d inputs and 1 output, got %d inputs and %d outputs",
+            kNbPluginInputs, nbInputs, nbOutputs);
+        return -1;
+    }
     (void) shapeInputs;
     (void) nbShapeInputs;
     // Output shares B and S with hidden_states; final dim is the plugin-configured hidden_size.
@@ -414,9 +423,14 @@ int32_t Nvfp4MoePlugin::getOutputShapes(DimsExprs const* inputs, int32_t nbInput
 bool Nvfp4MoePlugin::supportsFormatCombination(
     int32_t pos, DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
 {
-    assert(nbInputs == kNbPluginInputs && nbOutputs == 1);
-    (void) nbInputs;
-    (void) nbOutputs;
+    // Always-on contract check (assert() would be a no-op in release builds).
+    if (nbInputs != kNbPluginInputs || nbOutputs != 1)
+    {
+        LOG_ERROR("Nvfp4MoePlugin: supportsFormatCombination expected %d inputs and 1 output, got %d inputs and %d "
+                  "outputs",
+            kNbPluginInputs, nbInputs, nbOutputs);
+        return false;
+    }
 
     auto const& td = inOut[pos].desc;
 
@@ -726,9 +740,16 @@ size_t Nvfp4MoePlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, i
 {
     (void) outputs;
     (void) nbOutputs;
-    assert(nbInputs == kNbPluginInputs);
+    // Always-on contract check (assert() would be a no-op in release builds).
+    // Returning 0 forces the caller to skip the runner workspace allocation,
+    // which makes the subsequent enqueue fail loudly instead of dereferencing
+    // out-of-bounds workspace pointers.
+    if (nbInputs != kNbPluginInputs)
+    {
+        LOG_ERROR("Nvfp4MoePlugin: getWorkspaceSize expected %d inputs, got %d", kNbPluginInputs, nbInputs);
+        return 0;
+    }
     (void) inputs;
-    (void) nbInputs;
 
 #if defined(CUTE_DSL_NVFP4_FUSED_MOE_ENABLED) || defined(CUTE_DSL_NVFP4_MOE_ENABLED)
     try
