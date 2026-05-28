@@ -18,3 +18,23 @@ tests:
   # === Qwen3-TTS-12Hz-0.6B-CustomVoice FP16 (Talker + CodePredictor + Code2Wav) ===
   - tests/defs/test_audio_pipeline.py::TestTTSPipeline::test_engine_build[Qwen3-TTS-12Hz-0.6B-CustomVoice-fp16-mxsl4096-mxbs1-mxil4096]
   - tests/defs/test_audio_pipeline.py::TestTTSPipeline::test_inference[Qwen3-TTS-12Hz-0.6B-CustomVoice-fp16-mxsl4096-mxbs1-mxil4096-tts_basic]
+
+  # === SM110 NVFP4 MoE plugin accuracy (Qwen3 + Nemotron, decode + prefill) ===
+  # NOTE: These currently skip in this CI job because pytest runs on the x86
+  # GitLab runner via .device_test_template and the test requires
+  # torch.cuda.get_device_capability() == (11, 0). Entries are listed here so
+  # they auto-activate once on-board Python (torch + tensorrt + numpy + pytest)
+  # is provisioned on the Thor CI image and the test is invoked via a
+  # remote_config SSH wrapper. Plugin .so path can be overridden with
+  # EDGELLM_NVFP4_MOE_PLUGIN_SO; otherwise the test discovers build*/.
+  # Per-scope scale-mode bisection tests (small shape, h=256/i=128)
+  - tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py::test_sm110_plugin_scale_all_ones_accuracy
+  - tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py::test_sm110_plugin_scale_input_only_accuracy
+  - tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py::test_sm110_plugin_scale_down_only_accuracy
+  - tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py::test_sm110_plugin_scale_alpha_only_accuracy
+  - tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py::test_sm110_plugin_scale_full_non_uniform_accuracy
+  # Per-model decode + prefill tests (real Qwen3/Nemotron MoE shapes)
+  - tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py::test_sm110_plugin_qwen3_decode_accuracy
+  - tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py::test_sm110_plugin_qwen3_prefill_accuracy
+  - tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py::test_sm110_plugin_nemotron_decode_accuracy
+  - tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py::test_sm110_plugin_nemotron_prefill_accuracy

@@ -14,16 +14,16 @@
 # limitations under the License.
 """SM110 TensorRT accuracy tests for Nvfp4MoePlugin.
 
-The tests are opt-in because they require a Thor SM110 system, TensorRT Python,
-and a plugin built with ``-DENABLE_CUTE_DSL=nvfp4_moe``.
-Set ``EDGELLM_RUN_SM110_PLUGIN_ACCURACY=1`` and
-``EDGELLM_NVFP4_MOE_PLUGIN_SO=/path/to/libNvInfer_edgellm_plugin.so`` to run.
+The tests auto-skip unless the host is a Thor SM110 (compute capability 11.0)
+with TensorRT Python and a plugin built with ``-DENABLE_CUTE_DSL=nvfp4_moe``.
+Hardware/runtime gating lives in :func:`check_requirements`. To point the test
+at a specific plugin ``.so`` (rather than the default ``build*/`` discovery),
+set ``EDGELLM_NVFP4_MOE_PLUGIN_SO=/path/to/libNvInfer_edgellm_plugin.so``.
 """
 
 from __future__ import annotations
 
 import ctypes
-import json
 import math
 import os
 import shutil
@@ -37,27 +37,20 @@ from typing import Any
 import numpy as np
 import pytest
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-_RUN_ENV = "EDGELLM_RUN_SM110_PLUGIN_ACCURACY"
-_PLUGIN_ENV = "EDGELLM_NVFP4_MOE_PLUGIN_SO"
-_SCALE_SWEEP_JSON_ENV = "EDGELLM_SM110_SCALE_SWEEP_JSON"
-_SF_VEC_SIZE = 16
-_ROW_TILE = 128
-_FP4_LEVELS = np.asarray(
+REPO_ROOT = Path(__file__).resolve().parents[2]
+PLUGIN_ENV = "EDGELLM_NVFP4_MOE_PLUGIN_SO"
+SF_VEC_SIZE = 16
+ROW_TILE = 128
+FP4_LEVELS = np.asarray(
     [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
     dtype=np.float32,
 )
-_SM110_NUM_EXPERTS = 128
-_SM110_TOP_K = 8
-
-pytestmark = pytest.mark.skipif(
-    os.environ.get(_RUN_ENV, "0") != "1",
-    reason=f"set {_RUN_ENV}=1 on Thor to run SM110 plugin accuracy",
-)
+SM110_NUM_EXPERTS = 128
+SM110_TOP_K = 8
 
 
 @dataclass(frozen=True)
-class _Sm110CaseConfig:
+class Sm110CaseConfig:
     name: str
     hidden_size: int
     intermediate_size: int
@@ -68,11 +61,16 @@ class _Sm110CaseConfig:
     max_mag_ratio: float
     activation_type: int = 2
     scale_mode: str = "config"
+    # Number of input tokens. ``num_tokens=1`` exercises the SM110 fast-decode
+    # fused setup path (only fires for hidden_size=2048 per
+    # cuteDslNvfp4MoeSm110Runner.cpp::useFastDecodeSetup); ``num_tokens>1``
+    # exercises the general gather + grouped-GEMM path.
+    num_tokens: int = 1
 
 
 @dataclass
-class _Sm110Case:
-    config: _Sm110CaseConfig
+class Sm110Case:
+    config: Sm110CaseConfig
     router_logits: np.ndarray
     hidden_states: np.ndarray
     fc1_qweights: np.ndarray
@@ -83,16 +81,17 @@ class _Sm110Case:
     fc2_alpha: np.ndarray
     input_global_scale: np.ndarray
     down_input_scale: np.ndarray
+    e_score_correction_bias: np.ndarray
 
 
-def _resolve_plugin_so() -> Path:
-    env = os.environ.get(_PLUGIN_ENV, "").strip()
+def resolve_plugin_so() -> Path:
+    env = os.environ.get(PLUGIN_ENV, "").strip()
     if env:
         return Path(env).expanduser().resolve()
     candidates = [
-        _REPO_ROOT / "build_thor_sm110" / "libNvInfer_edgellm_plugin.so",
-        _REPO_ROOT / "build" / "cpp" / "libNvInfer_edgellm_plugin.so",
-        _REPO_ROOT / "build" / "libNvInfer_edgellm_plugin.so",
+        REPO_ROOT / "build_thor_sm110" / "libNvInfer_edgellm_plugin.so",
+        REPO_ROOT / "build" / "cpp" / "libNvInfer_edgellm_plugin.so",
+        REPO_ROOT / "build" / "libNvInfer_edgellm_plugin.so",
     ]
     for candidate in candidates:
         if candidate.is_file():
@@ -100,7 +99,7 @@ def _resolve_plugin_so() -> Path:
     return candidates[0].resolve()
 
 
-def _check_requirements() -> tuple[Any, Any]:
+def check_requirements() -> tuple[Any, Any]:
     torch = pytest.importorskip("torch", reason="torch required for CUDA execution and FP8 reference")
     if not torch.cuda.is_available():
         pytest.skip("CUDA device required")
@@ -109,53 +108,53 @@ def _check_requirements() -> tuple[Any, Any]:
     if not hasattr(torch, "float8_e4m3fn"):
         pytest.skip("torch.float8_e4m3fn required for FP8 scale reference")
     trt = pytest.importorskip("tensorrt", reason="TensorRT Python required")
-    plugin_so = _resolve_plugin_so()
+    plugin_so = resolve_plugin_so()
     if not plugin_so.is_file():
         pytest.skip(f"missing plugin library: {plugin_so}")
     return torch, trt
 
 
-def _scale_shape(rows: int, cols: int, experts: int = _SM110_NUM_EXPERTS) -> tuple[int, int, int, int, int, int]:
-    sf_cols = cols // _SF_VEC_SIZE
-    return (experts, math.ceil(rows / _ROW_TILE), math.ceil(sf_cols / 4), 32, 4, 4)
+def scale_shape(rows: int, cols: int, experts: int = SM110_NUM_EXPERTS) -> tuple[int, int, int, int, int, int]:
+    sf_cols = cols // SF_VEC_SIZE
+    return (experts, math.ceil(rows / ROW_TILE), math.ceil(sf_cols / 4), 32, 4, 4)
 
 
-def _atom_offsets(rows: int, sf_cols: int) -> np.ndarray:
+def atom_offsets(rows: int, sf_cols: int) -> np.ndarray:
     m_idx = np.arange(rows, dtype=np.int64).reshape(rows, 1)
     k_idx = np.arange(sf_cols, dtype=np.int64).reshape(1, sf_cols)
     inner_k = k_idx % 4
-    inner_m = (m_idx % _ROW_TILE) // 32
+    inner_m = (m_idx % ROW_TILE) // 32
     outer_m = m_idx % 32
     k_tile = k_idx // 4
     num_k_tiles = (sf_cols + 3) // 4
-    m_tile = m_idx // _ROW_TILE
+    m_tile = m_idx // ROW_TILE
     return m_tile * num_k_tiles * 512 + k_tile * 512 + outer_m * 16 + inner_m * 4 + inner_k
 
 
-def _fp8_bytes_to_float(raw: np.ndarray) -> np.ndarray:
+def fp8_bytes_to_float(raw: np.ndarray) -> np.ndarray:
     import torch
 
     raw_u8 = np.ascontiguousarray(raw, dtype=np.uint8)
     return torch.from_numpy(raw_u8).view(torch.float8_e4m3fn).float().numpy()
 
 
-def _float_to_fp8_bytes(values: np.ndarray | list[float]) -> np.ndarray:
+def float_to_fp8_bytes(values: np.ndarray | list[float]) -> np.ndarray:
     import torch
 
     tensor = torch.as_tensor(np.asarray(values, dtype=np.float32), dtype=torch.float32)
     return tensor.to(torch.float8_e4m3fn).view(torch.uint8).cpu().numpy()
 
 
-def _make_scale_tensor(
+def make_scale_tensor(
     rng: np.random.Generator,
     rows: int,
     cols: int,
     *,
     non_uniform: bool,
 ) -> np.ndarray:
-    shape = _scale_shape(rows, cols)
+    shape = scale_shape(rows, cols)
     scale_values = np.asarray([0.00390625, 0.005859375, 0.0078125, 0.01171875], dtype=np.float32)
-    scale_bytes = _float_to_fp8_bytes(scale_values)
+    scale_bytes = float_to_fp8_bytes(scale_values)
     if not non_uniform:
         out = np.empty(shape, dtype=np.uint8)
         out.fill(int(scale_bytes[2]))
@@ -164,33 +163,33 @@ def _make_scale_tensor(
     return scale_bytes[indices].astype(np.uint8, copy=False).view(np.int8)
 
 
-def _make_qweights(rng: np.random.Generator, shape: tuple[int, ...]) -> np.ndarray:
+def make_qweights(rng: np.random.Generator, shape: tuple[int, ...]) -> np.ndarray:
     # Random bytes intentionally exercise all FP4 nibbles while keeping memory
     # bounded. The reference dequantizes the exact selected bytes that TRT sees.
     return rng.integers(0, 256, size=shape, dtype=np.uint8).view(np.int8)
 
 
-def _topk_logits_from_scores(expert_ids: np.ndarray, scores: np.ndarray) -> np.ndarray:
-    logits = np.full((expert_ids.shape[0], _SM110_NUM_EXPERTS), -120.0, dtype=np.float32)
+def topk_logits_from_scores(expert_ids: np.ndarray, scores: np.ndarray) -> np.ndarray:
+    logits = np.full((expert_ids.shape[0], SM110_NUM_EXPERTS), -120.0, dtype=np.float32)
     for token in range(expert_ids.shape[0]):
-        for slot in range(_SM110_TOP_K):
+        for slot in range(SM110_TOP_K):
             score = max(float(scores[token, slot]), 1e-12)
             logits[token, int(expert_ids[token, slot])] = np.float32(math.log(score) + 25.0)
     return logits
 
 
-def _topk_softmax(router_logits: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def topk_softmax(router_logits: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     logits = np.asarray(router_logits, dtype=np.float32)
     probs = np.exp(logits - np.max(logits, axis=1, keepdims=True), dtype=np.float32)
     probs /= np.sum(probs, axis=1, keepdims=True)
-    top_ids = np.zeros((logits.shape[0], _SM110_TOP_K), dtype=np.int32)
-    top_weights = np.zeros((logits.shape[0], _SM110_TOP_K), dtype=np.float32)
+    top_ids = np.zeros((logits.shape[0], SM110_TOP_K), dtype=np.int32)
+    top_weights = np.zeros((logits.shape[0], SM110_TOP_K), dtype=np.float32)
     for token in range(logits.shape[0]):
-        used = np.zeros((_SM110_NUM_EXPERTS,), dtype=bool)
-        for slot in range(_SM110_TOP_K):
+        used = np.zeros((SM110_NUM_EXPERTS,), dtype=bool)
+        for slot in range(SM110_TOP_K):
             best_expert = -1
             best_prob = -1.0
-            for expert in range(_SM110_NUM_EXPERTS):
+            for expert in range(SM110_NUM_EXPERTS):
                 if used[expert]:
                     continue
                 prob = float(probs[token, expert])
@@ -204,41 +203,41 @@ def _topk_softmax(router_logits: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return top_ids, top_weights
 
 
-def _round_fp4(values: np.ndarray) -> np.ndarray:
+def round_fp4(values: np.ndarray) -> np.ndarray:
     values_f32 = np.asarray(values, dtype=np.float32)
-    distances = np.abs(values_f32[..., None] - _FP4_LEVELS.reshape((1,) * values_f32.ndim + (16,)))
+    distances = np.abs(values_f32[..., None] - FP4_LEVELS.reshape((1,) * values_f32.ndim + (16,)))
     return np.argmin(distances, axis=-1).astype(np.uint8)
 
 
-def _fp4_roundtrip_linear_sf(values: np.ndarray, global_scale: float) -> np.ndarray:
-    return (_fp4_roundtrip_linear_sf_raw(values, global_scale) * np.float32(global_scale)).astype(np.float32)
+def fp4_roundtrip_linear_sf(values: np.ndarray, global_scale: float) -> np.ndarray:
+    return (fp4_roundtrip_linear_sf_raw(values, global_scale) * np.float32(global_scale)).astype(np.float32)
 
 
-def _fp4_roundtrip_linear_sf_raw(values: np.ndarray, global_scale: float) -> np.ndarray:
+def fp4_roundtrip_linear_sf_raw(values: np.ndarray, global_scale: float) -> np.ndarray:
     arr = np.ascontiguousarray(values, dtype=np.float32)
-    if arr.shape[-1] % _SF_VEC_SIZE != 0:
-        raise ValueError(f"last dimension must be divisible by {_SF_VEC_SIZE}, got {arr.shape[-1]}")
+    if arr.shape[-1] % SF_VEC_SIZE != 0:
+        raise ValueError(f"last dimension must be divisible by {SF_VEC_SIZE}, got {arr.shape[-1]}")
     out = np.zeros_like(arr, dtype=np.float32)
     flat = arr.reshape(-1, arr.shape[-1])
     scale = max(float(global_scale), 1e-12)
     for row in range(flat.shape[0]):
-        for begin in range(0, flat.shape[1], _SF_VEC_SIZE):
-            end = begin + _SF_VEC_SIZE
+        for begin in range(0, flat.shape[1], SF_VEC_SIZE):
+            end = begin + SF_VEC_SIZE
             block = flat[row, begin:end]
             vec_max = float(np.max(np.abs(block)))
             if vec_max == 0.0:
                 continue
             sf_value = (vec_max / 6.0) / scale
-            sf_back = float(_fp8_bytes_to_float(_float_to_fp8_bytes([sf_value]))[0])
+            sf_back = float(fp8_bytes_to_float(float_to_fp8_bytes([sf_value]))[0])
             effective_scale = sf_back * scale
             if effective_scale <= 0.0 or not np.isfinite(effective_scale):
                 continue
-            codes = _round_fp4(block / effective_scale)
-            out.reshape(-1, arr.shape[-1])[row, begin:end] = _FP4_LEVELS[codes] * sf_back
+            codes = round_fp4(block / effective_scale)
+            out.reshape(-1, arr.shape[-1])[row, begin:end] = FP4_LEVELS[codes] * sf_back
     return out
 
 
-def _dequant_weight(
+def dequant_weight(
     qweights: np.ndarray,
     scale6d: np.ndarray,
     expert: int,
@@ -253,55 +252,55 @@ def _dequant_weight(
     nibbles = np.empty((rows, cols), dtype=np.uint8)
     nibbles[:, 0::2] = lo
     nibbles[:, 1::2] = hi
-    values = _FP4_LEVELS[nibbles].astype(np.float32, copy=False)
+    values = FP4_LEVELS[nibbles].astype(np.float32, copy=False)
 
-    sf_cols = cols // _SF_VEC_SIZE
-    offsets = _atom_offsets(rows, sf_cols)
+    sf_cols = cols // SF_VEC_SIZE
+    offsets = atom_offsets(rows, sf_cols)
     sf_bytes = np.ascontiguousarray(scale6d[expert], dtype=np.int8).view(np.uint8).reshape(-1)[offsets]
-    scales = np.repeat(_fp8_bytes_to_float(sf_bytes), _SF_VEC_SIZE, axis=1)[:, :cols]
+    scales = np.repeat(fp8_bytes_to_float(sf_bytes), SF_VEC_SIZE, axis=1)[:, :cols]
     return (values * scales * np.float32(alpha)).astype(np.float32)
 
 
-def _silu(values: np.ndarray) -> np.ndarray:
+def silu(values: np.ndarray) -> np.ndarray:
     return values / (1.0 + np.exp(-values, dtype=np.float32))
 
 
-def _apply_swiglu_interleaved(projection: np.ndarray) -> np.ndarray:
+def apply_swiglu_interleaved(projection: np.ndarray) -> np.ndarray:
     if projection.shape[0] % 128 != 0:
         raise ValueError(f"SwiGLU projection must be 128-interleaved, got {projection.shape[0]}")
     chunks = projection.reshape(-1, 128)
     up = chunks[:, :64]
     gate = chunks[:, 64:]
-    return (up * _silu(gate)).reshape(-1).astype(np.float32)
+    return (up * silu(gate)).reshape(-1).astype(np.float32)
 
 
-def _fc1_input_n(intermediate_size: int, activation_type: int) -> int:
+def fc1_input_n(intermediate_size: int, activation_type: int) -> int:
     return 2 * intermediate_size if int(activation_type) == 2 else intermediate_size
 
 
-def _apply_fc1_activation(projection: np.ndarray, activation_type: int) -> np.ndarray:
+def apply_fc1_activation(projection: np.ndarray, activation_type: int) -> np.ndarray:
     if int(activation_type) == 2:
-        return _apply_swiglu_interleaved(projection)
+        return apply_swiglu_interleaved(projection)
     if int(activation_type) == 4:
         return np.square(np.maximum(projection, 0.0)).astype(np.float32)
     raise ValueError(f"unsupported SM110 activation_type: {activation_type}")
 
 
-def _compute_reference(case: _Sm110Case) -> np.ndarray:
+def compute_reference(case: Sm110Case) -> np.ndarray:
     cfg = case.config
     hidden = np.asarray(case.hidden_states, dtype=np.float16).reshape(-1, cfg.hidden_size).astype(np.float32)
-    top_ids, top_weights = _topk_softmax(case.router_logits)
+    top_ids, top_weights = topk_softmax(case.router_logits)
 
     fc1_cache: dict[int, np.ndarray] = {}
     fc2_cache: dict[int, np.ndarray] = {}
     active_slots: list[tuple[int, int, float, np.ndarray]] = []
-    n1 = _fc1_input_n(cfg.intermediate_size, cfg.activation_type)
+    n1 = fc1_input_n(cfg.intermediate_size, cfg.activation_type)
 
     for token in range(hidden.shape[0]):
-        for slot in range(_SM110_TOP_K):
+        for slot in range(SM110_TOP_K):
             expert = int(top_ids[token, slot])
             if expert not in fc1_cache:
-                fc1_cache[expert] = _dequant_weight(
+                fc1_cache[expert] = dequant_weight(
                     case.fc1_qweights,
                     case.fc1_blocks_scale,
                     expert,
@@ -309,19 +308,19 @@ def _compute_reference(case: _Sm110Case) -> np.ndarray:
                     cols=cfg.hidden_size,
                     alpha=float(case.fc1_alpha[expert]),
                 )
-            hidden_raw = _fp4_roundtrip_linear_sf_raw(
+            hidden_raw = fp4_roundtrip_linear_sf_raw(
                 hidden[token:token + 1], float(case.input_global_scale[expert])
             )[0]
             projection = fc1_cache[expert] @ hidden_raw
             projection *= np.float32(case.input_global_scale[expert])
-            activated = _apply_fc1_activation(projection, cfg.activation_type)
+            activated = apply_fc1_activation(projection, cfg.activation_type)
             active_slots.append((token, expert, float(top_weights[token, slot]), activated))
 
     output = np.zeros((hidden.shape[0], cfg.hidden_size), dtype=np.float32)
     for token, expert, router_weight, activated in active_slots:
-        activated_raw = _fp4_roundtrip_linear_sf_raw(activated[None, :], float(case.down_input_scale[expert]))[0]
+        activated_raw = fp4_roundtrip_linear_sf_raw(activated[None, :], float(case.down_input_scale[expert]))[0]
         if expert not in fc2_cache:
-            fc2_cache[expert] = _dequant_weight(
+            fc2_cache[expert] = dequant_weight(
                 case.fc2_qweights,
                 case.fc2_blocks_scale,
                 expert,
@@ -337,51 +336,72 @@ def _compute_reference(case: _Sm110Case) -> np.ndarray:
     return output.reshape(1, hidden.shape[0], cfg.hidden_size)
 
 
-def _make_case(config: _Sm110CaseConfig) -> _Sm110Case:
+def make_case(config: Sm110CaseConfig) -> Sm110Case:
     rng = np.random.default_rng(config.seed)
-    selected = np.asarray([[0, 7, 19, 31, 47, 64, 96, 127]], dtype=np.int32)
-    scores = np.asarray([[0.28, 0.21, 0.16, 0.12, 0.09, 0.06, 0.045, 0.035]], dtype=np.float32)
-    router_logits = _topk_logits_from_scores(selected, scores)
-    hidden = rng.normal(0.0, 0.05, size=(1, 1, config.hidden_size)).astype(np.float16)
-    n1 = _fc1_input_n(config.intermediate_size, config.activation_type)
-    fc1_q = _make_qweights(rng, (_SM110_NUM_EXPERTS, n1, config.hidden_size // 2))
-    fc2_q = _make_qweights(rng, (_SM110_NUM_EXPERTS, config.hidden_size, config.intermediate_size // 2))
-    fc1_scale = _make_scale_tensor(rng, n1, config.hidden_size, non_uniform=config.non_uniform_scales)
-    fc2_scale = _make_scale_tensor(
+    num_tokens = max(1, int(config.num_tokens))
+    if num_tokens == 1:
+        # Hand-picked spread covers low/mid/high expert indices for the
+        # single-token decode path.
+        selected = np.asarray([[0, 7, 19, 31, 47, 64, 96, 127]], dtype=np.int32)
+        scores = np.asarray(
+            [[0.28, 0.21, 0.16, 0.12, 0.09, 0.06, 0.045, 0.035]],
+            dtype=np.float32,
+        )
+    else:
+        selected = np.zeros((num_tokens, SM110_TOP_K), dtype=np.int32)
+        for token in range(num_tokens):
+            selected[token] = rng.choice(SM110_NUM_EXPERTS, size=SM110_TOP_K, replace=False)
+        base_scores = np.asarray(
+            [0.28, 0.21, 0.16, 0.12, 0.09, 0.06, 0.045, 0.035], dtype=np.float32,
+        )
+        jitter = rng.uniform(0.9, 1.1, size=(num_tokens, SM110_TOP_K)).astype(np.float32)
+        scores = base_scores * jitter
+    router_logits = topk_logits_from_scores(selected, scores)
+    hidden = rng.normal(0.0, 0.05, size=(1, num_tokens, config.hidden_size)).astype(np.float16)
+    n1 = fc1_input_n(config.intermediate_size, config.activation_type)
+    fc1_q = make_qweights(rng, (SM110_NUM_EXPERTS, n1, config.hidden_size // 2))
+    fc2_q = make_qweights(rng, (SM110_NUM_EXPERTS, config.hidden_size, config.intermediate_size // 2))
+    fc1_scale = make_scale_tensor(rng, n1, config.hidden_size, non_uniform=config.non_uniform_scales)
+    fc2_scale = make_scale_tensor(
         rng, config.hidden_size, config.intermediate_size, non_uniform=config.non_uniform_scales)
     if config.non_uniform_scales:
-        fc1_alpha = np.linspace(0.55, 1.35, _SM110_NUM_EXPERTS, dtype=np.float32)
-        fc2_alpha = np.linspace(1.25, 0.65, _SM110_NUM_EXPERTS, dtype=np.float32)
-        input_scale = np.linspace(1.0e-4, 8.0e-4, _SM110_NUM_EXPERTS, dtype=np.float32)
-        down_scale = np.linspace(8.0e-4, 1.0e-4, _SM110_NUM_EXPERTS, dtype=np.float32)
+        fc1_alpha = np.linspace(0.55, 1.35, SM110_NUM_EXPERTS, dtype=np.float32)
+        fc2_alpha = np.linspace(1.25, 0.65, SM110_NUM_EXPERTS, dtype=np.float32)
+        input_scale = np.linspace(1.0e-4, 8.0e-4, SM110_NUM_EXPERTS, dtype=np.float32)
+        down_scale = np.linspace(8.0e-4, 1.0e-4, SM110_NUM_EXPERTS, dtype=np.float32)
     else:
-        fc1_alpha = np.full((_SM110_NUM_EXPERTS,), 0.85, dtype=np.float32)
-        fc2_alpha = np.full((_SM110_NUM_EXPERTS,), 0.75, dtype=np.float32)
-        input_scale = np.full((_SM110_NUM_EXPERTS,), 1.0e-4, dtype=np.float32)
-        down_scale = np.full((_SM110_NUM_EXPERTS,), 1.0e-4, dtype=np.float32)
+        fc1_alpha = np.full((SM110_NUM_EXPERTS,), 0.85, dtype=np.float32)
+        fc2_alpha = np.full((SM110_NUM_EXPERTS,), 0.75, dtype=np.float32)
+        input_scale = np.full((SM110_NUM_EXPERTS,), 1.0e-4, dtype=np.float32)
+        down_scale = np.full((SM110_NUM_EXPERTS,), 1.0e-4, dtype=np.float32)
     if config.scale_mode == "all_ones":
-        fc1_alpha = np.ones((_SM110_NUM_EXPERTS,), dtype=np.float32)
-        fc2_alpha = np.ones((_SM110_NUM_EXPERTS,), dtype=np.float32)
-        input_scale = np.ones((_SM110_NUM_EXPERTS,), dtype=np.float32)
-        down_scale = np.ones((_SM110_NUM_EXPERTS,), dtype=np.float32)
+        fc1_alpha = np.ones((SM110_NUM_EXPERTS,), dtype=np.float32)
+        fc2_alpha = np.ones((SM110_NUM_EXPERTS,), dtype=np.float32)
+        input_scale = np.ones((SM110_NUM_EXPERTS,), dtype=np.float32)
+        down_scale = np.ones((SM110_NUM_EXPERTS,), dtype=np.float32)
     elif config.scale_mode == "input_scale_only":
-        fc1_alpha = np.ones((_SM110_NUM_EXPERTS,), dtype=np.float32)
-        fc2_alpha = np.ones((_SM110_NUM_EXPERTS,), dtype=np.float32)
-        down_scale = np.ones((_SM110_NUM_EXPERTS,), dtype=np.float32)
+        fc1_alpha = np.ones((SM110_NUM_EXPERTS,), dtype=np.float32)
+        fc2_alpha = np.ones((SM110_NUM_EXPERTS,), dtype=np.float32)
+        down_scale = np.ones((SM110_NUM_EXPERTS,), dtype=np.float32)
     elif config.scale_mode == "down_scale_only":
-        fc1_alpha = np.ones((_SM110_NUM_EXPERTS,), dtype=np.float32)
-        fc2_alpha = np.ones((_SM110_NUM_EXPERTS,), dtype=np.float32)
-        input_scale = np.ones((_SM110_NUM_EXPERTS,), dtype=np.float32)
+        fc1_alpha = np.ones((SM110_NUM_EXPERTS,), dtype=np.float32)
+        fc2_alpha = np.ones((SM110_NUM_EXPERTS,), dtype=np.float32)
+        input_scale = np.ones((SM110_NUM_EXPERTS,), dtype=np.float32)
     elif config.scale_mode == "alpha_only":
-        input_scale = np.ones((_SM110_NUM_EXPERTS,), dtype=np.float32)
-        down_scale = np.ones((_SM110_NUM_EXPERTS,), dtype=np.float32)
+        input_scale = np.ones((SM110_NUM_EXPERTS,), dtype=np.float32)
+        down_scale = np.ones((SM110_NUM_EXPERTS,), dtype=np.float32)
     elif config.scale_mode not in {"config", "full_non_uniform"}:
         raise ValueError(f"unknown SM110 scale_mode: {config.scale_mode}")
 
     if config.scale_mode in {"config", "full_non_uniform"} and not config.non_uniform_scales:
         input_floor = max(float(np.max(np.abs(hidden.astype(np.float32)))) / (448.0 * 6.0), 1e-12)
         input_scale.fill(np.float32(input_floor))
-    return _Sm110Case(
+    # The unified Nvfp4MoePlugin requires an e_score_correction_bias input even
+    # in softmax-topk mode (the bias is added to the router logits before top-k).
+    # A zero bias is a no-op for the routing selection and keeps the numpy
+    # reference in compute_reference() consistent with the plugin.
+    e_score_correction_bias = np.zeros((SM110_NUM_EXPERTS,), dtype=np.float32)
+    return Sm110Case(
         config=config,
         router_logits=np.ascontiguousarray(router_logits),
         hidden_states=np.ascontiguousarray(hidden),
@@ -393,10 +413,11 @@ def _make_case(config: _Sm110CaseConfig) -> _Sm110Case:
         fc2_alpha=np.ascontiguousarray(fc2_alpha),
         input_global_scale=np.ascontiguousarray(input_scale),
         down_input_scale=np.ascontiguousarray(down_scale),
+        e_score_correction_bias=np.ascontiguousarray(e_score_correction_bias),
     )
 
 
-def _preload_libnvinfer() -> None:
+def preload_libnvinfer() -> None:
     trt_dir = os.environ.get("TRT_PACKAGE_DIR", "").strip()
     candidates: list[Path] = []
     if trt_dir:
@@ -413,7 +434,7 @@ def _preload_libnvinfer() -> None:
                 continue
 
 
-def _diagnose_dlopen(plugin_so: Path) -> str:
+def diagnose_dlopen(plugin_so: Path) -> str:
     lines: list[str] = []
     try:
         ctypes.CDLL(os.fspath(plugin_so), mode=getattr(ctypes, "RTLD_GLOBAL", 0))
@@ -428,8 +449,8 @@ def _diagnose_dlopen(plugin_so: Path) -> str:
     return "\n".join(line for line in lines if line)
 
 
-def _load_plugin(trt: Any, logger: Any, plugin_so: Path) -> None:
-    _preload_libnvinfer()
+def load_plugin(trt: Any, logger: Any, plugin_so: Path) -> None:
+    preload_libnvinfer()
     trt.init_libnvinfer_plugins(logger, "")
     registry = trt.get_plugin_registry()
     loaded = bool(registry.load_library(os.fspath(plugin_so)))
@@ -437,12 +458,12 @@ def _load_plugin(trt: Any, logger: Any, plugin_so: Path) -> None:
         try:
             ctypes.CDLL(os.fspath(plugin_so), mode=getattr(ctypes, "RTLD_GLOBAL", 0))
         except OSError as exc:
-            raise RuntimeError(f"failed to load {plugin_so}: {exc}\n{_diagnose_dlopen(plugin_so)}") from exc
-    if _get_creator(trt) is None:
+            raise RuntimeError(f"failed to load {plugin_so}: {exc}\n{diagnose_dlopen(plugin_so)}") from exc
+    if get_creator(trt) is None:
         raise RuntimeError(f"Nvfp4MoePlugin creator not registered after loading {plugin_so}")
 
 
-def _get_creator(trt: Any) -> Any | None:
+def get_creator(trt: Any) -> Any | None:
     registry = trt.get_plugin_registry()
     for getter_name in ("get_creator", "get_plugin_creator", "getPluginCreator"):
         getter = getattr(registry, getter_name, None)
@@ -458,16 +479,16 @@ def _get_creator(trt: Any) -> Any | None:
     return None
 
 
-def _plugin_fields(trt: Any, case: _Sm110Case) -> Any:
+def plugin_fields(trt: Any, case: Sm110Case) -> Any:
     cfg = case.config
     fields = {
-        "num_experts": np.asarray([_SM110_NUM_EXPERTS], dtype=np.int32),
-        "top_k": np.asarray([_SM110_TOP_K], dtype=np.int32),
+        "num_experts": np.asarray([SM110_NUM_EXPERTS], dtype=np.int32),
+        "top_k": np.asarray([SM110_TOP_K], dtype=np.int32),
         "hidden_size": np.asarray([cfg.hidden_size], dtype=np.int32),
         "moe_inter_size": np.asarray([cfg.intermediate_size], dtype=np.int32),
         "activation_type": np.asarray([cfg.activation_type], dtype=np.int32),
         "backend": np.asarray([0], dtype=np.int32),
-        "max_routed_rows": np.asarray([_SM110_TOP_K], dtype=np.int32),
+        "max_routed_rows": np.asarray([max(1, cfg.num_tokens) * SM110_TOP_K], dtype=np.int32),
         "io_dtype": np.asarray([1], dtype=np.int32),
     }
     case._plugin_field_backing = fields  # type: ignore[attr-defined]
@@ -476,12 +497,12 @@ def _plugin_fields(trt: Any, case: _Sm110Case) -> Any:
     ])
 
 
-def _build_engine(trt: Any, logger: Any, case: _Sm110Case) -> bytes:
+def build_engine(trt: Any, logger: Any, case: Sm110Case) -> bytes:
     cfg = case.config
-    creator = _get_creator(trt)
+    creator = get_creator(trt)
     if creator is None:
         raise RuntimeError("Nvfp4MoePlugin creator not found")
-    pfc = _plugin_fields(trt, case)
+    pfc = plugin_fields(trt, case)
     try:
         plugin = creator.create_plugin("sm110_nvfp4_moe", pfc, trt.TensorRTPhase.BUILD)
     except TypeError:
@@ -490,18 +511,19 @@ def _build_engine(trt: Any, logger: Any, case: _Sm110Case) -> bytes:
     builder = trt.Builder(logger)
     flags = 1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
     network = builder.create_network(flags)
-    n1 = _fc1_input_n(cfg.intermediate_size, cfg.activation_type)
+    n1 = fc1_input_n(cfg.intermediate_size, cfg.activation_type)
     inputs = [
         network.add_input("router_logits", trt.float32, tuple(case.router_logits.shape)),
         network.add_input("hidden_states", trt.float16, tuple(case.hidden_states.shape)),
-        network.add_input("fc1_qweights", trt.int8, (_SM110_NUM_EXPERTS, n1, cfg.hidden_size // 2)),
-        network.add_input("fc1_blocks_scale", trt.int8, _scale_shape(n1, cfg.hidden_size)),
-        network.add_input("fc1_alpha", trt.float32, (_SM110_NUM_EXPERTS,)),
-        network.add_input("fc2_qweights", trt.int8, (_SM110_NUM_EXPERTS, cfg.hidden_size, cfg.intermediate_size // 2)),
-        network.add_input("fc2_blocks_scale", trt.int8, _scale_shape(cfg.hidden_size, cfg.intermediate_size)),
-        network.add_input("fc2_alpha", trt.float32, (_SM110_NUM_EXPERTS,)),
-        network.add_input("input_global_scale", trt.float32, (_SM110_NUM_EXPERTS,)),
-        network.add_input("down_input_scale", trt.float32, (_SM110_NUM_EXPERTS,)),
+        network.add_input("fc1_qweights", trt.int8, (SM110_NUM_EXPERTS, n1, cfg.hidden_size // 2)),
+        network.add_input("fc1_blocks_scale", trt.int8, scale_shape(n1, cfg.hidden_size)),
+        network.add_input("fc1_alpha", trt.float32, (SM110_NUM_EXPERTS,)),
+        network.add_input("fc2_qweights", trt.int8, (SM110_NUM_EXPERTS, cfg.hidden_size, cfg.intermediate_size // 2)),
+        network.add_input("fc2_blocks_scale", trt.int8, scale_shape(cfg.hidden_size, cfg.intermediate_size)),
+        network.add_input("fc2_alpha", trt.float32, (SM110_NUM_EXPERTS,)),
+        network.add_input("input_global_scale", trt.float32, (SM110_NUM_EXPERTS,)),
+        network.add_input("down_input_scale", trt.float32, (SM110_NUM_EXPERTS,)),
+        network.add_input("e_score_correction_bias", trt.float32, (SM110_NUM_EXPERTS,)),
     ]
     layer = network.add_plugin_v3(inputs, [], plugin)
     out = layer.get_output(0)
@@ -516,7 +538,7 @@ def _build_engine(trt: Any, logger: Any, case: _Sm110Case) -> bytes:
     return bytes(serialized)
 
 
-def _trt_to_torch_dtype(trt: Any, dtype: Any) -> Any:
+def trt_to_torch_dtype(trt: Any, dtype: Any) -> Any:
     import torch
 
     if dtype == trt.float16:
@@ -530,7 +552,7 @@ def _trt_to_torch_dtype(trt: Any, dtype: Any) -> Any:
     raise ValueError(f"unsupported TensorRT dtype: {dtype}")
 
 
-def _execute_engine(torch: Any, trt: Any, serialized: bytes, inputs: dict[str, np.ndarray]) -> np.ndarray:
+def execute_engine(torch: Any, trt: Any, serialized: bytes, inputs: dict[str, np.ndarray]) -> np.ndarray:
     device = torch.device("cuda", torch.cuda.current_device())
     stream = torch.cuda.Stream(device=device)
     runtime = trt.Runtime(trt.Logger(trt.Logger.WARNING))
@@ -550,7 +572,7 @@ def _execute_engine(torch: Any, trt: Any, serialized: bytes, inputs: dict[str, n
     outputs: list[str] = []
     for idx in range(engine.num_io_tensors):
         name = engine.get_tensor_name(idx)
-        dtype = _trt_to_torch_dtype(trt, engine.get_tensor_dtype(name))
+        dtype = trt_to_torch_dtype(trt, engine.get_tensor_dtype(name))
         shape = tuple(context.get_tensor_shape(name))
         bindings[name] = torch.empty(shape, dtype=dtype, device=device)
         if engine.get_tensor_mode(name) == trt.TensorIOMode.OUTPUT:
@@ -574,7 +596,7 @@ def _execute_engine(torch: Any, trt: Any, serialized: bytes, inputs: dict[str, n
     return np.array(bindings[output_name].detach().cpu().numpy(), copy=True)
 
 
-def _summarize_output(case: _Sm110Case, trt_output: np.ndarray, reference: np.ndarray) -> dict[str, float | str]:
+def summarize_output(case: Sm110Case, trt_output: np.ndarray, reference: np.ndarray) -> dict[str, float | str]:
     got = np.asarray(trt_output, dtype=np.float32).reshape(reference.shape)
     ref = np.asarray(reference, dtype=np.float32)
     assert np.all(np.isfinite(got)), f"{case.config.name}: TRT output contains non-finite values"
@@ -596,8 +618,8 @@ def _summarize_output(case: _Sm110Case, trt_output: np.ndarray, reference: np.nd
     }
 
 
-def _assert_output_close(case: _Sm110Case, trt_output: np.ndarray, reference: np.ndarray) -> dict[str, float | str]:
-    summary = _summarize_output(case, trt_output, reference)
+def assert_output_close(case: Sm110Case, trt_output: np.ndarray, reference: np.ndarray) -> dict[str, float | str]:
+    summary = summarize_output(case, trt_output, reference)
     print(
         f"[{case.config.name}] median_cos={summary['median_cosine']:.6f} "
         f"mag_ratio={summary['mag_ratio']:.6f} max_abs={summary['max_abs']:.6g} "
@@ -613,18 +635,18 @@ def _assert_output_close(case: _Sm110Case, trt_output: np.ndarray, reference: np
     return summary
 
 
-def _run_case(config: _Sm110CaseConfig, *, check: bool = True) -> dict[str, float | str]:
-    torch, trt = _check_requirements()
+def run_case(config: Sm110CaseConfig) -> dict[str, float | str]:
+    torch, trt = check_requirements()
     logger = trt.Logger(trt.Logger.WARNING)
-    plugin_so = _resolve_plugin_so()
-    _load_plugin(trt, logger, plugin_so)
-    case = _make_case(config)
+    plugin_so = resolve_plugin_so()
+    load_plugin(trt, logger, plugin_so)
+    case = make_case(config)
     t0 = time.perf_counter()
-    reference = _compute_reference(case)
+    reference = compute_reference(case)
     print(f"[{config.name}] reference ready in {time.perf_counter() - t0:.2f}s")
-    serialized = _build_engine(trt, logger, case)
+    serialized = build_engine(trt, logger, case)
     print(f"[{config.name}] engine bytes={len(serialized)}")
-    trt_output = _execute_engine(
+    trt_output = execute_engine(
         torch,
         trt,
         serialized,
@@ -639,22 +661,99 @@ def _run_case(config: _Sm110CaseConfig, *, check: bool = True) -> dict[str, floa
             "fc2_alpha": case.fc2_alpha,
             "input_global_scale": case.input_global_scale,
             "down_input_scale": case.down_input_scale,
+            "e_score_correction_bias": case.e_score_correction_bias,
         },
     )
-    if check:
-        return _assert_output_close(case, trt_output, reference)
-    summary = _summarize_output(case, trt_output, reference)
-    print(
-        f"[{config.name}] median_cos={summary['median_cosine']:.6f} "
-        f"mag_ratio={summary['mag_ratio']:.6f} scale_mode={config.scale_mode}"
+    return assert_output_close(case, trt_output, reference)
+
+
+# --- Per-scope scale-mode accuracy tests (h=256, i=128, e=128, top_k=8).
+# Each test isolates one of the four scaling tensors in the Nvfp4MoePlugin
+# (fc1_alpha/fc2_alpha, input_global_scale, down_input_scale) so a regression
+# fails the specific scope test that points at it. Tolerance bands are
+# uniform for now (matching the pre-existing full_non_uniform test). Tighten
+# the tighter-scope ones (all_ones, *_only) once real Thor numbers are in
+# hand -- "all_ones" in particular should empirically be near cosine=1.0.
+
+
+def test_sm110_plugin_scale_all_ones_accuracy() -> None:
+    # All four scaling tensors are 1.0 -- isolates FP4 quantization rounding
+    # only. Catches plugin paths that mis-apply scales when they should be no-ops.
+    run_case(
+        Sm110CaseConfig(
+            name="sm110_scale_all_ones_h256_i128_e128_topk8",
+            hidden_size=256,
+            intermediate_size=128,
+            seed=11021,
+            non_uniform_scales=True,
+            min_cosine=0.97,
+            min_mag_ratio=0.40,
+            max_mag_ratio=2.50,
+            scale_mode="all_ones",
+        )
     )
-    return summary
 
 
-def test_sm110_plugin_non_uniform_scale_accuracy() -> None:
-    _run_case(
-        _Sm110CaseConfig(
-            name="sm110_non_uniform_scale_h256_i128_e128_topk8",
+def test_sm110_plugin_scale_input_only_accuracy() -> None:
+    # Only FC1 input_global_scale is non-uniform per expert; everything else
+    # is 1.0. Isolates the FC1 activation global-scale path.
+    run_case(
+        Sm110CaseConfig(
+            name="sm110_scale_input_only_h256_i128_e128_topk8",
+            hidden_size=256,
+            intermediate_size=128,
+            seed=11022,
+            non_uniform_scales=True,
+            min_cosine=0.97,
+            min_mag_ratio=0.40,
+            max_mag_ratio=2.50,
+            scale_mode="input_scale_only",
+        )
+    )
+
+
+def test_sm110_plugin_scale_down_only_accuracy() -> None:
+    # Only FC2 down_input_scale is non-uniform per expert; everything else
+    # is 1.0. Isolates the FC2 activation global-scale path.
+    run_case(
+        Sm110CaseConfig(
+            name="sm110_scale_down_only_h256_i128_e128_topk8",
+            hidden_size=256,
+            intermediate_size=128,
+            seed=11023,
+            non_uniform_scales=True,
+            min_cosine=0.97,
+            min_mag_ratio=0.40,
+            max_mag_ratio=2.50,
+            scale_mode="down_scale_only",
+        )
+    )
+
+
+def test_sm110_plugin_scale_alpha_only_accuracy() -> None:
+    # Only per-expert fc1_alpha/fc2_alpha (weight scales) are non-uniform;
+    # activation scales are 1.0. Isolates the per-expert weight-scale path.
+    run_case(
+        Sm110CaseConfig(
+            name="sm110_scale_alpha_only_h256_i128_e128_topk8",
+            hidden_size=256,
+            intermediate_size=128,
+            seed=11024,
+            non_uniform_scales=True,
+            min_cosine=0.97,
+            min_mag_ratio=0.40,
+            max_mag_ratio=2.50,
+            scale_mode="alpha_only",
+        )
+    )
+
+
+def test_sm110_plugin_scale_full_non_uniform_accuracy() -> None:
+    # All four scaling tensors non-uniform per expert. Exercises the same
+    # path the deployed plugin uses end-to-end on a small shape.
+    run_case(
+        Sm110CaseConfig(
+            name="sm110_scale_full_non_uniform_h256_i128_e128_topk8",
             hidden_size=256,
             intermediate_size=128,
             seed=11001,
@@ -662,45 +761,65 @@ def test_sm110_plugin_non_uniform_scale_accuracy() -> None:
             min_cosine=0.97,
             min_mag_ratio=0.40,
             max_mag_ratio=2.50,
+            scale_mode="full_non_uniform",
         )
     )
 
 
-def test_sm110_plugin_scale_sweep_debug() -> None:
-    summary_path = os.environ.get(_SCALE_SWEEP_JSON_ENV, "").strip()
-    if not summary_path:
-        pytest.skip(f"set {_SCALE_SWEEP_JSON_ENV} to write SM110 scale sweep diagnostics")
+# Prefill token count for the per-model prefill tests. Kept modest because the
+# numpy reference does (num_tokens * top_k) dequant + matmul iterations on CPU,
+# so larger values mainly slow the host reference, not the SM110 kernel.
+PREFILL_NUM_TOKENS = 8
 
-    summaries = []
-    for mode in ("all_ones", "input_scale_only", "down_scale_only", "alpha_only", "full_non_uniform"):
-        summaries.append(
-            _run_case(
-                _Sm110CaseConfig(
-                    name=f"sm110_scale_sweep_{mode}",
-                    hidden_size=256,
-                    intermediate_size=128,
-                    seed=11011,
-                    non_uniform_scales=True,
-                    min_cosine=0.0,
-                    min_mag_ratio=0.0,
-                    max_mag_ratio=float("inf"),
-                    scale_mode=mode,
-                ),
-                check=False,
-            )
+
+# --- nvidia/Qwen3-30B-A3B-NVFP4 routed MoE (H=2048, I=768, E=128, top_k=8) ---
+# Decode hits the fused fast-decode setup (useFastDecodeSetup requires H==2048).
+
+
+def test_sm110_plugin_qwen3_decode_accuracy() -> None:
+    run_case(
+        Sm110CaseConfig(
+            name="sm110_qwen3_decode_h2048_i768_e128_topk8",
+            hidden_size=2048,
+            intermediate_size=768,
+            num_tokens=1,
+            seed=11003,
+            non_uniform_scales=False,
+            min_cosine=0.94,
+            min_mag_ratio=0.25,
+            max_mag_ratio=3.00,
         )
-    path = Path(summary_path).expanduser().resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(summaries, indent=2, sort_keys=True), encoding="utf-8")
-    print(f"[scale_sweep] wrote {path}")
+    )
 
 
-def test_sm110_plugin_qwen_style_accuracy() -> None:
-    _run_case(
-        _Sm110CaseConfig(
-            name="sm110_qwen_style_h2688_i1856_e128_topk8",
+def test_sm110_plugin_qwen3_prefill_accuracy() -> None:
+    run_case(
+        Sm110CaseConfig(
+            name=f"sm110_qwen3_prefill_h2048_i768_e128_topk8_nt{PREFILL_NUM_TOKENS}",
+            hidden_size=2048,
+            intermediate_size=768,
+            num_tokens=PREFILL_NUM_TOKENS,
+            seed=11004,
+            non_uniform_scales=False,
+            min_cosine=0.94,
+            min_mag_ratio=0.25,
+            max_mag_ratio=3.00,
+        )
+    )
+
+
+# --- nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 routed MoE
+#     (H=2688, I=1856, E=128, top_k=8). Both decode and prefill go through the
+#     general gather + grouped-GEMM path because H != 2048.
+
+
+def test_sm110_plugin_nemotron_decode_accuracy() -> None:
+    run_case(
+        Sm110CaseConfig(
+            name="sm110_nemotron_decode_h2688_i1856_e128_topk8",
             hidden_size=2688,
             intermediate_size=1856,
+            num_tokens=1,
             seed=11002,
             non_uniform_scales=False,
             min_cosine=0.94,
@@ -710,13 +829,14 @@ def test_sm110_plugin_qwen_style_accuracy() -> None:
     )
 
 
-def test_sm110_plugin_qwen3_split_accuracy() -> None:
-    _run_case(
-        _Sm110CaseConfig(
-            name="sm110_qwen3_split_h2048_i768_e128_topk8",
-            hidden_size=2048,
-            intermediate_size=768,
-            seed=11003,
+def test_sm110_plugin_nemotron_prefill_accuracy() -> None:
+    run_case(
+        Sm110CaseConfig(
+            name=f"sm110_nemotron_prefill_h2688_i1856_e128_topk8_nt{PREFILL_NUM_TOKENS}",
+            hidden_size=2688,
+            intermediate_size=1856,
+            num_tokens=PREFILL_NUM_TOKENS,
+            seed=11005,
             non_uniform_scales=False,
             min_cosine=0.94,
             min_mag_ratio=0.25,
