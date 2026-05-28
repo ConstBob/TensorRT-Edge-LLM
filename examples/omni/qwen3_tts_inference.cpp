@@ -57,6 +57,7 @@ struct ParsedInput
     float repetitionPenalty{1.05f};
     std::string speakerName{""};
     int32_t maxAudioLength{4096};
+    int32_t batchSize{1}; //!< Number of requests bundled per Talker/CodePredictor call.
 };
 
 ParsedInput parseInputFile(std::filesystem::path const& inputFilePath, int32_t batchSizeOverride = -1)
@@ -80,6 +81,7 @@ ParsedInput parseInputFile(std::filesystem::path const& inputFilePath, int32_t b
     check::check(batchSize > 0, format::fmtstr("Invalid batch_size: %d", batchSize));
     check::check(batchSize <= limits::security::kReasonableMaxBatchSize,
         format::fmtstr("batch_size %d exceeds limit %d", batchSize, limits::security::kReasonableMaxBatchSize));
+    result.batchSize = batchSize;
 
     result.applyChatTemplate = inputData.value("apply_chat_template", true);
     result.addGenerationPrompt = inputData.value("add_generation_prompt", true);
@@ -163,7 +165,9 @@ enum Qwen3TTSOptionId : int
     PROFILE_OUTPUT_FILE = 909,
     DUMP_OUTPUT = 911,
     BATCH_SIZE = 912,
-    TOKENIZER_DIR = 915
+    TOKENIZER_DIR = 915,
+    STREAMING = 916,
+    CHUNK_FRAMES = 917
 };
 
 struct Qwen3TTSInferenceArgs
@@ -180,6 +184,8 @@ struct Qwen3TTSInferenceArgs
     bool dumpProfile{false};
     bool dumpOutput{false};
     int32_t batchSize{-1};
+    bool streaming{false};  //!< Enable per-request streaming (RVQ chunks → vocoded inline)
+    int32_t chunkFrames{0}; //!< Frames per streaming chunk; required when --streaming is set
 };
 
 void printUsage(char const* programName)
@@ -195,7 +201,9 @@ void printUsage(char const* programName)
               << "  --outputFile=<path>          Path to output JSON file\n"
               << "  --outputAudioDir=<path>      Directory to save generated audio (.wav) files\n\n"
               << "Performance Options:\n"
-              << "  --batchSize=<number>         Override batch size from input file\n\n"
+              << "  --batchSize=<number>         Override batch size from input file\n"
+              << "  --streaming                  Enable streaming: RVQ chunks vocoded inline per request\n"
+              << "  --chunkFrames=<N>            Required with --streaming; frames per chunk callback\n\n"
               << "Debug Options:\n"
               << "  --debug                      Enable verbose logging\n"
               << "  --dumpOutput                 Print inference output to console\n"
@@ -217,7 +225,9 @@ bool parseArgs(Qwen3TTSInferenceArgs& args, int argc, char* argv[])
         {"dumpProfile", no_argument, 0, Qwen3TTSOptionId::DUMP_PROFILE},
         {"profileOutputFile", required_argument, 0, Qwen3TTSOptionId::PROFILE_OUTPUT_FILE},
         {"dumpOutput", no_argument, 0, Qwen3TTSOptionId::DUMP_OUTPUT},
-        {"batchSize", required_argument, 0, Qwen3TTSOptionId::BATCH_SIZE}, {0, 0, 0, 0}};
+        {"batchSize", required_argument, 0, Qwen3TTSOptionId::BATCH_SIZE},
+        {"streaming", no_argument, 0, Qwen3TTSOptionId::STREAMING},
+        {"chunkFrames", required_argument, 0, Qwen3TTSOptionId::CHUNK_FRAMES}, {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", inferenceOptions, nullptr)) != -1)
@@ -251,6 +261,23 @@ bool parseArgs(Qwen3TTSInferenceArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
+        case Qwen3TTSOptionId::STREAMING: args.streaming = true; break;
+        case Qwen3TTSOptionId::CHUNK_FRAMES:
+            try
+            {
+                args.chunkFrames = std::stoi(optarg);
+                if (args.chunkFrames <= 0)
+                {
+                    LOG_ERROR("chunkFrames must be positive, got: %s", optarg);
+                    return false;
+                }
+            }
+            catch (std::exception const&)
+            {
+                LOG_ERROR("Invalid chunkFrames value: %s", optarg);
+                return false;
+            }
+            break;
         default: LOG_ERROR("Unknown option: %c", opt); return false;
         }
     }
@@ -265,6 +292,11 @@ bool parseArgs(Qwen3TTSInferenceArgs& args, int argc, char* argv[])
         if (args.talkerEngineDir.empty())
         {
             LOG_ERROR("--talkerEngineDir is required");
+            return false;
+        }
+        if (args.streaming && args.chunkFrames <= 0)
+        {
+            LOG_ERROR("--chunkFrames=<N> is required when --streaming is set");
             return false;
         }
     }
@@ -369,79 +401,249 @@ int main(int argc, char** argv)
     bool hasFailedRequest = false;
     size_t failedCount = 0;
 
-    LOG_INFO("Processing %zu request(s)...", input.requests.size());
-    for (size_t requestIdx = 0; requestIdx < input.requests.size(); ++requestIdx)
+    // Determine how many requests to bundle into each Talker call.
+    // input.batchSize comes from `--batchSize` (or `batch_size` in input JSON, default 1).
+    size_t const ttsBatchSize = std::max<size_t>(1, static_cast<size_t>(input.batchSize));
+    LOG_INFO("Processing %zu request(s) with ttsBatchSize=%zu...", input.requests.size(), ttsBatchSize);
+
+    if (args.streaming)
     {
-        rt::Qwen3OmniTTSRuntime::TalkerGenerationRequest talkerReq;
-        talkerReq.talkerTemperature = input.talkerTemperature;
-        talkerReq.talkerTopK = input.talkerTopK;
-        talkerReq.talkerTopP = input.talkerTopP;
-        talkerReq.repetitionPenalty = input.repetitionPenalty;
-        talkerReq.applyChatTemplate = input.applyChatTemplate;
-        talkerReq.addGenerationPrompt = input.addGenerationPrompt;
-        talkerReq.enableThinking = input.enableThinking;
-        talkerReq.speakerName = input.requestSpeakers[requestIdx];
-        talkerReq.maxAudioLength = input.maxAudioLength;
-        talkerReq.messages = input.requests[requestIdx];
+        check::check(
+            code2wavRunner != nullptr, "--streaming requires a usable Code2Wav engine (chunks must be vocoded inline)");
+        LOG_INFO("Streaming mode: chunkFrames=%d", args.chunkFrames);
+    }
 
-        rt::Qwen3OmniTTSRuntime::TalkerGenerationResponse talkerResp;
-        bool const requestStatus = ttsRuntime->handleAudioGeneration(talkerReq, talkerResp, stream);
+    // Per-batch streaming context for a single TTS group. Lives only during one
+    // handleAudioGeneration call; cleared between groups.
+    struct StreamingBatchCtx
+    {
+        std::vector<__half> pcmBuffer; //!< Accumulated FP16 PCM samples (chunk-by-chunk concat)
+        int32_t numFramesEmitted{0};   //!< Codec frames vocoded so far
+        int32_t numChunkCalls{0};      //!< Total callback invocations (including final flush)
+        bool finalSeen{false};
+        bool vocoderFailed{false};
+        cudaEvent_t ttfpaEvent{nullptr}; //!< Recorded on first vocoded chunk emit (time-to-first-playable-audio)
+        bool ttfpaRecorded{false};
+    };
 
-        if (!requestStatus)
+    for (size_t startIdx = 0; startIdx < input.requests.size(); startIdx += ttsBatchSize)
+    {
+        size_t const endIdx = std::min(startIdx + ttsBatchSize, input.requests.size());
+        size_t const groupSize = endIdx - startIdx;
+
+        // Allocate per-batch streaming state up front so callbacks capture stable references.
+        std::vector<StreamingBatchCtx> streamCtxs(args.streaming ? groupSize : 0);
+        cudaEvent_t e2eStart{nullptr};
+        if (args.streaming)
         {
-            LOG_WARNING("TTS generation failed for request %zu", requestIdx);
-            hasFailedRequest = true;
-            failedCount++;
+            CUDA_CHECK(cudaEventCreateWithFlags(&e2eStart, cudaEventDefault));
+            CUDA_CHECK(cudaEventRecord(e2eStart, stream));
+            for (auto& ctx : streamCtxs)
+            {
+                CUDA_CHECK(cudaEventCreateWithFlags(&ctx.ttfpaEvent, cudaEventDefault));
+            }
         }
 
-        // Run Code2Wav
-        rt::audioUtils::AudioData audioOutput;
-        bool hasAudio = false;
-        auto const& framesCodes
-            = talkerResp.batchRvqCodes.empty() ? std::vector<std::vector<int32_t>>{} : talkerResp.batchRvqCodes[0];
-        if (requestStatus && code2wavRunner && !framesCodes.empty())
+        std::vector<rt::Qwen3OmniTTSRuntime::TalkerGenerationRequest> groupReqs(groupSize);
+        for (size_t k = 0; k < groupSize; ++k)
         {
-            // Transpose [frames][layers] → [layers][frames]
-            size_t const numFrames = framesCodes.size();
-            size_t const numLayers = framesCodes[0].size();
-            std::vector<std::vector<int32_t>> transposed(numLayers, std::vector<int32_t>(numFrames));
-            for (size_t f = 0; f < numFrames; ++f)
-            {
-                for (size_t l = 0; l < numLayers; ++l)
-                {
-                    transposed[l][f] = framesCodes[f][l];
-                }
-            }
+            size_t const requestIdx = startIdx + k;
+            auto& talkerReq = groupReqs[k];
+            talkerReq.talkerTemperature = input.talkerTemperature;
+            talkerReq.talkerTopK = input.talkerTopK;
+            talkerReq.talkerTopP = input.talkerTopP;
+            talkerReq.repetitionPenalty = input.repetitionPenalty;
+            talkerReq.applyChatTemplate = input.applyChatTemplate;
+            talkerReq.addGenerationPrompt = input.addGenerationPrompt;
+            talkerReq.enableThinking = input.enableThinking;
+            talkerReq.speakerName = input.requestSpeakers[requestIdx];
+            talkerReq.maxAudioLength = input.maxAudioLength;
+            talkerReq.messages = input.requests[requestIdx];
 
-            if (code2wavRunner->generateWaveform(transposed, audioOutput, stream))
+            if (args.streaming)
             {
-                hasAudio = true;
-                if (!args.outputAudioDir.empty())
-                {
-                    std::string filename = format::fmtstr("audio_req%zu.wav", requestIdx);
-                    std::filesystem::path audioPath = std::filesystem::path(args.outputAudioDir) / filename;
-                    if (!saveAudioToWav(audioPath.string(), audioOutput))
+                talkerReq.streamingChunkFrames = args.chunkFrames;
+                // Capture k (batch slot in group) + requestIdx (global request id) by value.
+                talkerReq.onChunkReady = [&streamCtxs, &code2wavRunner, stream, k, requestIdx](
+                                             std::vector<std::vector<int32_t>> const& chunkRvqCodes, bool isFinal) {
+                    auto& ctx = streamCtxs[k];
+                    ++ctx.numChunkCalls;
+
+                    if (!chunkRvqCodes.empty())
                     {
-                        LOG_WARNING("Failed to save audio: %s", audioPath.string().c_str());
+                        // Vocode this chunk independently. Code2Wav engine resets its KV per call so
+                        // chunk boundaries lose a small amount of context; acceptable for streaming
+                        // (RVQ codes still bit-exact vs. non-streaming).
+                        size_t const numFrames = chunkRvqCodes.size();
+                        size_t const numLayers = chunkRvqCodes[0].size();
+                        std::vector<std::vector<int32_t>> transposed(numLayers, std::vector<int32_t>(numFrames));
+                        for (size_t f = 0; f < numFrames; ++f)
+                        {
+                            for (size_t l = 0; l < numLayers; ++l)
+                            {
+                                transposed[l][f] = chunkRvqCodes[f][l];
+                            }
+                        }
+                        rt::audioUtils::AudioData chunkAudio;
+                        if (!code2wavRunner->generateWaveform(transposed, chunkAudio, stream))
+                        {
+                            LOG_WARNING(
+                                "Streaming vocode failed for request %zu chunk %d", requestIdx, ctx.numChunkCalls);
+                            ctx.vocoderFailed = true;
+                        }
+                        else if (chunkAudio.waveform && !chunkAudio.waveform->isEmpty())
+                        {
+                            __half const* src = static_cast<__half const*>(chunkAudio.waveform->rawPointer());
+                            int64_t const samples = chunkAudio.waveform->getShape()[1];
+                            ctx.pcmBuffer.insert(ctx.pcmBuffer.end(), src, src + samples);
+                            if (!ctx.ttfpaRecorded && ctx.ttfpaEvent)
+                            {
+                                CUDA_CHECK(cudaEventRecord(ctx.ttfpaEvent, stream));
+                                ctx.ttfpaRecorded = true;
+                            }
+                        }
+                        ctx.numFramesEmitted += static_cast<int32_t>(numFrames);
+                    }
+                    if (isFinal)
+                    {
+                        ctx.finalSeen = true;
+                    }
+                };
+            }
+        }
+
+        rt::Qwen3OmniTTSRuntime::TalkerGenerationResponse talkerResp;
+        bool const groupStatus = ttsRuntime->handleAudioGeneration(groupReqs, talkerResp, stream);
+
+        if (!groupStatus)
+        {
+            LOG_WARNING("TTS generation failed for batch group [%zu, %zu)", startIdx, endIdx);
+            hasFailedRequest = true;
+            failedCount += groupSize;
+        }
+
+        for (size_t k = 0; k < groupSize; ++k)
+        {
+            size_t const requestIdx = startIdx + k;
+            bool const requestStatus
+                = groupStatus && k < talkerResp.batchRvqCodes.size() && !talkerResp.batchRvqCodes[k].empty();
+
+            // Build audio output: from streaming pcmBuffer if --streaming, else vocode-once-at-end.
+            rt::audioUtils::AudioData audioOutput;
+            bool hasAudio = false;
+            std::vector<std::vector<int32_t>> const& framesCodes = (k < talkerResp.batchRvqCodes.size())
+                ? talkerResp.batchRvqCodes[k]
+                : std::vector<std::vector<int32_t>>{};
+
+            if (args.streaming && requestStatus)
+            {
+                auto const& ctx = streamCtxs[k];
+                if (!ctx.finalSeen)
+                {
+                    LOG_WARNING("Streaming final flush missing for request %zu", requestIdx);
+                }
+                if (!ctx.vocoderFailed && !ctx.pcmBuffer.empty())
+                {
+                    int64_t const totalSamples = static_cast<int64_t>(ctx.pcmBuffer.size());
+                    auto waveformTensor = std::make_shared<rt::Tensor>(
+                        rt::Coords{1, totalSamples}, rt::DeviceType::kCPU, nvinfer1::DataType::kHALF, "streaming_pcm");
+                    std::memcpy(waveformTensor->rawPointer(), ctx.pcmBuffer.data(), totalSamples * sizeof(__half));
+                    audioOutput.waveform = waveformTensor;
+                    audioOutput.sampleRate = code2wavRunner->getConfig().sampleRate;
+                    audioOutput.hasWaveform = true;
+                    hasAudio = true;
+                    if (!args.outputAudioDir.empty())
+                    {
+                        std::string filename = format::fmtstr("audio_req%zu.wav", requestIdx);
+                        std::filesystem::path audioPath = std::filesystem::path(args.outputAudioDir) / filename;
+                        if (!saveAudioToWav(audioPath.string(), audioOutput))
+                        {
+                            LOG_WARNING("Failed to save audio: %s", audioPath.string().c_str());
+                        }
+                    }
+
+                    // Latency via CUDA events (same pattern as llm_inference.cpp Omni path).
+                    // TTFC (time-to-first-codec) is shared across batches in a group — recorded by
+                    // the runtime via mTtfaEnd at the joint first-sampling point of the bs=N prefill.
+                    // TTFPA (time-to-first-playable-audio) is per-batch — recorded in the callback.
+                    float ttfcMs = -1.0f;
+                    float ttfpaMs = -1.0f;
+                    auto const ttfaEnd = ttsRuntime->getTtfaEndEvent();
+                    // e2eStart was queued before generation but never explicitly synced; in the
+                    // current single-stream layout the later sync of ttfaEnd / ttfpaEvent implicitly
+                    // serializes after e2eStart, so cudaEventElapsedTime is well-defined. Sync e2eStart
+                    // explicitly anyway — defensive against future multi-stream layouts.
+                    if (e2eStart)
+                    {
+                        CUDA_CHECK(cudaEventSynchronize(e2eStart));
+                    }
+                    if (e2eStart && ttfaEnd)
+                    {
+                        CUDA_CHECK(cudaEventSynchronize(ttfaEnd));
+                        CUDA_CHECK(cudaEventElapsedTime(&ttfcMs, e2eStart, ttfaEnd));
+                    }
+                    if (e2eStart && ctx.ttfpaRecorded && ctx.ttfpaEvent)
+                    {
+                        CUDA_CHECK(cudaEventSynchronize(ctx.ttfpaEvent));
+                        CUDA_CHECK(cudaEventElapsedTime(&ttfpaMs, e2eStart, ctx.ttfpaEvent));
+                    }
+                    LOG_INFO("[stream req %zu] chunks=%d frames=%d samples=%ld TTFC=%.1fms TTFPA=%.1fms", requestIdx,
+                        ctx.numChunkCalls, ctx.numFramesEmitted, totalSamples, ttfcMs, ttfpaMs);
+
+                    // For bs=1 groups, populate mOmniLatencyMetrics so downstream profilers see it
+                    // (matches the contract llm_inference.cpp uses for Omni streaming).
+                    if (groupSize == 1)
+                    {
+                        auto& latency = ttsRuntime->getMutableOmniLatencyMetrics();
+                        if (ttfcMs >= 0.0f)
+                            latency.timeToFirstAudioCodeMs = ttfcMs;
+                        if (ttfpaMs >= 0.0f)
+                            latency.timeToFirstPlayableAudioMs = ttfpaMs;
                     }
                 }
             }
-            else
+            else if (requestStatus && code2wavRunner && !framesCodes.empty())
             {
-                LOG_WARNING("Code2Wav failed for request %zu", requestIdx);
+                size_t const numFrames = framesCodes.size();
+                size_t const numLayers = framesCodes[0].size();
+                std::vector<std::vector<int32_t>> transposed(numLayers, std::vector<int32_t>(numFrames));
+                for (size_t f = 0; f < numFrames; ++f)
+                {
+                    for (size_t l = 0; l < numLayers; ++l)
+                    {
+                        transposed[l][f] = framesCodes[f][l];
+                    }
+                }
+
+                if (code2wavRunner->generateWaveform(transposed, audioOutput, stream))
+                {
+                    hasAudio = true;
+                    if (!args.outputAudioDir.empty())
+                    {
+                        std::string filename = format::fmtstr("audio_req%zu.wav", requestIdx);
+                        std::filesystem::path audioPath = std::filesystem::path(args.outputAudioDir) / filename;
+                        if (!saveAudioToWav(audioPath.string(), audioOutput))
+                        {
+                            LOG_WARNING("Failed to save audio: %s", audioPath.string().c_str());
+                        }
+                    }
+                }
+                else
+                {
+                    LOG_WARNING("Code2Wav failed for request %zu", requestIdx);
+                }
             }
-        }
 
-        if (args.dumpOutput && requestStatus && hasAudio)
-        {
-            int64_t samples
-                = (!audioOutput.waveform || audioOutput.waveform->isEmpty()) ? 0 : audioOutput.waveform->getShape()[1];
-            LOG_INFO("[%zu] Audio: %ld samples (%.2fs)", requestIdx, samples,
-                static_cast<float>(samples) / audioOutput.sampleRate);
-        }
+            if (args.dumpOutput && requestStatus && hasAudio)
+            {
+                int64_t samples = (!audioOutput.waveform || audioOutput.waveform->isEmpty())
+                    ? 0
+                    : audioOutput.waveform->getShape()[1];
+                LOG_INFO("[%zu] Audio: %ld samples (%.2fs)", requestIdx, samples,
+                    static_cast<float>(samples) / audioOutput.sampleRate);
+            }
 
-        // Build JSON output
-        {
+            // Build per-request JSON
             nlohmann::json responseJson;
             responseJson["request_idx"] = requestIdx;
             responseJson["output_text"] = requestStatus ? "" : "FAILED";
@@ -471,13 +673,11 @@ int main(int argc, char** argv)
 
             if (requestStatus && !framesCodes.empty() && !args.outputAudioDir.empty())
             {
-                auto const& frames = framesCodes;
-                int64_t const numFrames = static_cast<int64_t>(frames.size());
-                int64_t const numCodes = frames.empty() ? 0 : static_cast<int64_t>(frames[0].size());
-                // Flatten [numFrames][numCodes] into a contiguous buffer for the Tensor wrapper
+                int64_t const numFrames = static_cast<int64_t>(framesCodes.size());
+                int64_t const numCodes = framesCodes.empty() ? 0 : static_cast<int64_t>(framesCodes[0].size());
                 std::vector<int32_t> flat;
                 flat.reserve(numFrames * numCodes);
-                for (auto const& frame : frames)
+                for (auto const& frame : framesCodes)
                 {
                     flat.insert(flat.end(), frame.begin(), frame.end());
                 }
@@ -491,6 +691,17 @@ int main(int argc, char** argv)
             }
 
             outputData["responses"].push_back(responseJson);
+        }
+
+        if (args.streaming)
+        {
+            for (auto& ctx : streamCtxs)
+            {
+                if (ctx.ttfpaEvent)
+                    cudaEventDestroy(ctx.ttfpaEvent);
+            }
+            if (e2eStart)
+                cudaEventDestroy(e2eStart);
         }
     }
 
