@@ -187,4 +187,5 @@ emits `Nvfp4MoePlugin`.
    [`kernelSrcs/nvfp4_moe_cutedsl/README.md`](../../../kernelSrcs/nvfp4_moe_cutedsl/README.md)).
 3. `python kernelSrcs/build_cutedsl.py --kernels nvfp4_moe --gpu_arch sm_110 --arch aarch64 --clean`
 4. Build the plugin with `-DENABLE_CUTE_DSL=nvfp4_moe -DCMAKE_CUDA_ARCHITECTURES=110a`.
-5. Run the SM110 plugin accuracy test with `EDGELLM_RUN_SM110_PLUGIN_ACCURACY=1`.
+5. Run the SM110 plugin accuracy test
+   (`tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py`).

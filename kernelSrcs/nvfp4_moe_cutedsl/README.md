@@ -73,8 +73,7 @@ cmake -S . -B build \
 
 No standalone reference probe is shipped. The SM110 NVFP4 MoE contract is
 validated end-to-end through
-[`tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py`](../../tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py)
-(opt-in via `EDGELLM_RUN_SM110_PLUGIN_ACCURACY=1`).
+[`tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py`](../../tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py).
 
 ## File Map
 
