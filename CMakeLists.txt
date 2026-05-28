@@ -61,17 +61,7 @@ endif()
 set_ifndef(CUDA_CTK_VERSION 12.8)
 set_ifndef(CUDA_DIR /usr/local/cuda-${CUDA_CTK_VERSION})
 
-# Default x86_64 host architecture list. We probe whether
-# CMAKE_CUDA_ARCHITECTURES was already provided on the command line (e.g.
-# `-DCMAKE_CUDA_ARCHITECTURES=110a` for an SM110/Thor cross build) so the
-# default below does not silently overwrite the user's choice. AARCH64_BUILD
-# users keep the existing branch.
-get_property(
-  _CMAKE_CUDA_ARCHITECTURES_SET
-  CACHE CMAKE_CUDA_ARCHITECTURES
-  PROPERTY VALUE
-  SET)
-if(NOT DEFINED AARCH64_BUILD AND NOT _CMAKE_CUDA_ARCHITECTURES_SET)
+if(NOT DEFINED AARCH64_BUILD)
   set(CMAKE_CUDA_ARCHITECTURES 80;86;89)
   if(CUDA_CTK_VERSION VERSION_GREATER_EQUAL 12.8)
     list(APPEND CMAKE_CUDA_ARCHITECTURES 100a 120)
