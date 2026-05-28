@@ -67,20 +67,10 @@ cmake -S . -B build \
 
 ## Probe
 
-Run the reference contract probe:
-
-```bash
-python3 kernelSrcs/nvfp4_moe_cutedsl/probe_sm110.py
-```
-
-Run it as a Thor environment check too:
-
-```bash
-python3 kernelSrcs/nvfp4_moe_cutedsl/probe_sm110.py --check-cutedsl
-```
-
-Use `--require-cutedsl` when the board is expected to have CuPy, CUDA Python,
-and CuTeDSL installed and the run should fail if that environment is missing.
+No standalone reference probe is shipped. The SM110 NVFP4 MoE contract is
+validated end-to-end through
+[`tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py`](../../tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py)
+(opt-in via `EDGELLM_RUN_SM110_PLUGIN_ACCURACY=1`).
 
 ## File Map
 
@@ -95,4 +85,3 @@ and CuTeDSL installed and the run should fail if that environment is missing.
 | `cute_utils.py` | CuTeDSL utility helpers |
 | `moe_compat.py` | Compatibility helpers for the split SM110 path |
 | `patch_cutlass_dsl_sm110a.py` | Idempotent CuTeDSL 4.5.1 SM110a patch/preflight script |
-| `probe_sm110.py` | Synthetic contract probe for SM110 tensors |

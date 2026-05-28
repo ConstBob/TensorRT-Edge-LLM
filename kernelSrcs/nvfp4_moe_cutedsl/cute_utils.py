@@ -55,7 +55,7 @@ from cutlass._mlir.dialects import llvm, nvvm
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-EDGELLM_ENABLE_PDL = os.environ.get("EDGELLM_ENABLE_PDL", "1") == "1"
+EDGELLM_ENABLE_PDL = os.environ.get("EDGELLM_ENABLE_PDL", "0") == "1"
 
 
 # WAR for CuTeDSL make_ptr implementation
