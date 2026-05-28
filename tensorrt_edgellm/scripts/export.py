@@ -1701,6 +1701,23 @@ def main() -> None:
             return {}
         return _get_weights()
 
+    def _export_visual_component(out: str) -> None:
+        if _is_alpamayo(model_type):
+            _export_alpamayo_visual(model_dir,
+                                    out,
+                                    _get_weights(),
+                                    config,
+                                    dtype,
+                                    model_config=_get_model_config())
+            return
+        _export_visual(model_dir,
+                       out,
+                       _get_weights(),
+                       config,
+                       model_type,
+                       dtype,
+                       model_config=_get_model_config())
+
     # Each stage is (enabled, component_name, exporter_callable).  Exporter
     # receives the computed output dir; the (enabled, component) columns also
     # drive both the pre-run log and the post-run summary below.
@@ -1722,24 +1739,8 @@ def main() -> None:
         (_has_llm_component(model_type, "code_predictor")
          and not args.skip_llm, "code_predictor",
          lambda out: _export_code_predictor(model_dir, out, model_type)),
-        (_has_visual(model_type) and not _is_alpamayo(model_type)
-         and not args.skip_visual, "visual",
-         lambda out: _export_visual(model_dir,
-                                    out,
-                                    _get_weights(),
-                                    config,
-                                    model_type,
-                                    dtype,
-                                    model_config=_get_model_config())),
-        (_has_visual(model_type) and _is_alpamayo(model_type)
-         and not args.skip_visual, "visual",
-         lambda out: _export_alpamayo_visual(model_dir,
-                                             out,
-                                             _get_weights(),
-                                             config,
-                                             dtype,
-                                             model_config=_get_model_config())
-         ),
+        (_has_visual(model_type)
+         and not args.skip_visual, "visual", _export_visual_component),
         (_has_audio(model_type) and not args.skip_audio, "audio",
          lambda out: _export_audio(model_dir,
                                    out,
