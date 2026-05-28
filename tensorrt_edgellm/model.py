@@ -343,7 +343,7 @@ def _load_dflash_lm_head(model: nn.Module,
     import torch
     from safetensors import safe_open
 
-    from .models.linear import FP16Linear, NVFP4Linear
+    from .models.linear import FP16Linear, is_nvfp4_linear
 
     logger = logging.getLogger(__name__)
     lm_head = getattr(model, "lm_head", None)
@@ -351,7 +351,7 @@ def _load_dflash_lm_head(model: nn.Module,
         logger.warning("DFlash draft model has no lm_head; skipping.")
         return
 
-    if isinstance(lm_head, NVFP4Linear):
+    if is_nvfp4_linear(lm_head):
         required = ("weight", "weight_scale", "weight_scale_2", "input_scale")
         missing = [name for name in required if not hasattr(lm_head, name)]
         if missing:
