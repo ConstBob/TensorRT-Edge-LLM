@@ -84,7 +84,7 @@ def test_qwen3_fc1_interleaves_64_row_up_gate_chunks(
                         fake_pack_nvfp4_moe_weight)
 
     repacking.repack_nvfp4_qwen3_moe_experts([expert], hidden_size,
-                                                     moe_inter_size)
+                                             moe_inter_size)
 
     expected_fc1 = np.stack(
         [
@@ -117,6 +117,5 @@ def test_qwen3_fc1_requires_64_row_aligned_intermediate_size(
                         fail_pack_nvfp4_moe_weight)
 
     with pytest.raises(ValueError, match="multiple of 64"):
-        repacking.repack_nvfp4_qwen3_moe_experts([expert],
-                                                         hidden_size,
-                                                         moe_inter_size)
+        repacking.repack_nvfp4_qwen3_moe_experts([expert], hidden_size,
+                                                 moe_inter_size)
