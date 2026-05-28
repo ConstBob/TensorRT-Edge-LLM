@@ -116,6 +116,24 @@ def _get_rope_theta(llm_dict: Dict[str, Any]) -> float:
 
 
 @dataclass
+class Mapping:
+    """Parallel-execution placement (tensor/pipeline/expert ranks).
+
+    Single source of truth for "which rank am I, out of how many" across
+    the loader and exporter. Pipeline / expert fields are reserved for
+    future use; only ``world_size``, ``tp_size``, and ``tp_rank`` are
+    consumed today.
+    """
+    world_size: int = 1
+    tp_size: int = 1
+    tp_rank: int = 0
+    pp_size: int = 1
+    pp_rank: int = 0
+    ep_size: int = 1
+    ep_rank: int = 0
+
+
+@dataclass
 class ActionConfig:
     """Action expert hyper-parameters for Alpamayo models.
 
@@ -359,10 +377,22 @@ class ModelConfig:
     # Runtime vocabulary reduction. ``vocab_size`` remains the original
     # tokenizer/embedding size; this field is only the exported logits size.
     reduced_vocab_size: Optional[int] = None
+    # ------------------------------------------ tensor parallel
+    # ``mapping`` is the single source of truth for parallel placement.
+    # tp_size>1 returns a per-rank ONNX graph with col/row-parallel projections.
+    mapping: Mapping = field(default_factory=Mapping)
 
     # ------------------------------------------------------------------
     # Derived properties
     # ------------------------------------------------------------------
+
+    @property
+    def tp_size(self) -> int:
+        return self.mapping.tp_size
+
+    @property
+    def tp_rank(self) -> int:
+        return self.mapping.tp_rank
 
     @property
     def is_eagle3_draft(self) -> bool:
@@ -416,6 +446,34 @@ class ModelConfig:
             "float32": torch.float32,
         }
         return _MAP.get(self.torch_dtype, torch.bfloat16)
+
+    def for_rank(self, rank: int, world: int) -> "ModelConfig":
+        """Return a per-rank copy of this config for TP.
+
+        Divides head and intermediate sizes by *world* so each rank's model
+        carries per-rank shapes.
+
+        Usage:
+            cfg = ModelConfig.from_pretrained(path).for_rank(rank, world)
+            model = CausalLM(cfg)
+            load_weights(model, path, mapping=cfg.mapping)
+        """
+        import copy
+        if world == 1:
+            return self
+        for name, v in (("num_attention_heads", self.num_attention_heads),
+                        ("num_key_value_heads", self.num_key_value_heads),
+                        ("intermediate_size", self.intermediate_size)):
+            if v % world:
+                raise ValueError(
+                    f"TP world={world}: {name}={v} is not divisible by {world}"
+                )
+        c = copy.deepcopy(self)
+        c.mapping = Mapping(world_size=world, tp_size=world, tp_rank=rank)
+        c.num_attention_heads //= world
+        c.num_key_value_heads //= world
+        c.intermediate_size //= world
+        return c
 
     # ------------------------------------------------------------------
     # Factory

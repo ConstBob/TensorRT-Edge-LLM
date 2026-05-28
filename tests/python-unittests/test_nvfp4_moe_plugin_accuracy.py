@@ -143,7 +143,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 from tensorrt_edgellm.config import NVFP4_MOE_BACKEND_THOR  # noqa: E402
 from tensorrt_edgellm.config import QUANT_NVFP4, ModelConfig, QuantConfig
-from tensorrt_edgellm.models.linear import NVFP4Linear  # noqa: E402
+from tensorrt_edgellm.models.linear import LinearBase  # noqa: E402
 from tensorrt_edgellm.models.nemotron_h.modeling_nemotron_h import \
     NemotronHMoEMLP  # noqa: E402
 from tensorrt_edgellm.models.qwen3_5_moe.modeling_qwen3_5_moe import \
@@ -324,11 +324,11 @@ def _quantize_fp32_to_nvfp4(
 
 
 def _populate_nvfp4_linear(
-    linear: NVFP4Linear,
+    linear: LinearBase,
     weight_fp32: torch.Tensor,
     input_scale_value: float = 1e-3,
 ) -> None:
-    """Fill an NVFP4Linear's buffers from FP32 weights."""
+    """Fill an NVFP4-quantized linear's buffers from FP32 weights."""
     packed, block_scale, ws2 = _quantize_fp32_to_nvfp4(
         weight_fp32, group_size=linear.group_size)
     linear.weight.data.copy_(packed)
