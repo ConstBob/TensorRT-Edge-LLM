@@ -273,22 +273,23 @@ def _export_tool_version() -> str:
     return __version__
 
 
-def _determine_model_type(config) -> str:
-    """Map ModelConfig to runtime model_type string."""
-    if config.is_eagle3_draft:
-        return "eagle3_draft"
-    if config.eagle_base:
-        return "eagle3_base"
-    if config.is_dflash_draft:
-        return "dflash_draft"
-    if config.dflash_base:
-        return "dflash_base"
-    if config.is_mtp_draft:
-        return "mtp_draft"
-    if config.mtp_base:
-        return "mtp_base"
-    if config.is_hybrid:
-        return "hybrid_mamba"
+def _determine_spec_decode_type(config) -> str:
+    """Return the speculative decoding algorithm for runtime config."""
+    if config.is_eagle3_draft or config.eagle_base:
+        return "eagle3"
+    if config.is_dflash_draft or config.dflash_base:
+        return "dflash"
+    if config.is_mtp_draft or config.mtp_base:
+        return "mtp"
+    return "none"
+
+
+def _determine_engine_role(config) -> str:
+    """Return the engine role within the speculative decoding deployment."""
+    if config.is_eagle3_draft or config.is_dflash_draft or config.is_mtp_draft:
+        return "draft"
+    if config.eagle_base or config.dflash_base or config.mtp_base:
+        return "base"
     return "llm"
 
 
@@ -308,7 +309,8 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
 
     out: Dict[str, Any] = {
         "model": config.model_type,
-        "model_type": _determine_model_type(config),
+        "spec_decode_type": _determine_spec_decode_type(config),
+        "engine_role": _determine_engine_role(config),
         "edgellm_version": _export_tool_version(),
         "vocab_size": config.vocab_size,
         "hidden_size": config.hidden_size,
@@ -423,7 +425,6 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
 
     if config.dflash_base:
         out.update({
-            "dflash_base": True,
             "dflash_config": {
                 "target_layer_ids": list(config.dflash_target_layer_ids),
                 "block_size": config.dflash_block_size,

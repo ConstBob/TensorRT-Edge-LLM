@@ -89,7 +89,7 @@ private:
     Tensor mDraftAttentionPosId;      //!< [B, BS] INT32
     Tensor mDraftContextLengths;      //!< [B] INT32
     Tensor mDraftDeltaLenCommit;      //!< [B] INT32 — pre-allocated for draft cache commit
-    Tensor mDraftDeltaLens;           //!< [B] INT32 — per-batch delta lengths for materialize plugin
+    Tensor mDraftDeltaLens;           //!< [B] INT32 — per-batch delta lengths for KV cache update plugin
 
     //! Draft/verify tokens
     Tensor mDraftTokenIds;          //!< [B, BS] INT32

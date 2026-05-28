@@ -294,7 +294,7 @@ class ModelConfig:
     """Flat model hyper-parameter config consumed by module builders."""
 
     # ------------------------------------------------------------------ arch
-    model_type: str  # e.g. "qwen3", "llama", "hybrid_mamba"
+    model_type: str  # HF architecture name, e.g. "qwen3", "llama"
     hidden_size: int
     num_hidden_layers: int
     num_attention_heads: int
@@ -705,7 +705,7 @@ def make_dflash_draft_config(draft_dir: str) -> ModelConfig:
     quant = _parse_quant(draft_dir, llm_dict)
 
     return ModelConfig(
-        model_type="dflash_draft",
+        model_type=llm_dict.get("model_type", "qwen3"),
         hidden_size=llm_dict["hidden_size"],
         num_hidden_layers=llm_dict["num_hidden_layers"],
         num_attention_heads=llm_dict["num_attention_heads"],

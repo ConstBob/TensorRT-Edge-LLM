@@ -128,9 +128,9 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
             addMambaTensor(binding_names::kConvStateTemplate, TensorIO::kInput, cfg.convStateDtype, convShape);
             addMambaTensor(binding_names::kPresentConvStateTemplate, TensorIO::kOutput, cfg.convStateDtype, convShape);
 
-            // MTP base only: per-layer intermediate state outputs the engine
-            // writes during prefill/tree-verify. The builder emits these only
-            // when `model_type == "mtp_base"`.
+            // Hybrid MTP/DFlash base only: per-layer intermediate state outputs
+            // written during prefill/verification so accepted recurrent/conv
+            // state snapshots can be committed after speculative verification.
             //
             // intermediate_recurrent_state_%d: [batch, seqLen, recurrentNumHeads, recurrentHeadDim, recurrentStateSize]
             // intermediate_conv_state_%d:      [batch, seqLen, convDim, convKernel]

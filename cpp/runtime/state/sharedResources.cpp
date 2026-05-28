@@ -28,6 +28,25 @@ namespace trt_edgellm
 namespace rt
 {
 
+bool needsBaseVerifyIntermediateStates(DeploymentConfig const& bundle)
+{
+    if (bundle.base.numLinearAttnLayers == 0)
+    {
+        return false;
+    }
+
+    switch (bundle.base.specDecodeType)
+    {
+    case SpecDecodeMode::kMTP:
+    case SpecDecodeMode::kDFlash:
+        return true;
+    case SpecDecodeMode::kEAGLE:
+    case SpecDecodeMode::kNONE:
+        return false;
+    }
+    return false;
+}
+
 void allocateZeroBuffer(SharedResources& res, int64_t bytes)
 {
     res.zeroBuffer = Tensor({bytes}, DeviceType::kGPU, nvinfer1::DataType::kUINT8, "SharedResources::zeroBuffer");
@@ -161,16 +180,11 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
 
     int32_t const maxDraftProposalSize = bundle.specConfig->maxDraftProposalSize;
 
-    // Base hybrid cache manager (index 0). EAGLE3 base is pure-attention but
-    // an MTP base can be a hybrid model (e.g. Qwen3.5 MTP, 18 mamba layers),
-    // so size the Mamba sub-manager from the base's parsed config.
-    // MTP base needs intermediate-state slots sized to the verification
-    // budget so the accepted recurrent/conv snapshot can be committed after
-    // base verification.
+    // Base hybrid cache manager (index 0). Hybrid MTP/DFlash base verification
+    // writes per-token recurrent/conv snapshots; after accept, the decoder
+    // scatters only the accepted prefix into the persistent state pools.
     {
-        int32_t const baseMaxIntermediateSeqLen = ((bundle.base.specDecodeType == SpecDecodeMode::kMTP
-                                                       || bundle.base.specDecodeType == SpecDecodeMode::kDFlash)
-                                                      && bundle.base.numLinearAttnLayers > 0)
+        int32_t const baseMaxIntermediateSeqLen = needsBaseVerifyIntermediateStates(bundle)
             ? bundle.specConfig->maxVerifySize
             : 0;
         rt::KVCacheManager::Config kvCfg{

@@ -16,8 +16,8 @@
 DFlash Draft Model for speculative decoding — cached KV path.
 
 The DFlash draft model generates an entire block of draft tokens in a SINGLE
-forward pass.  Target-hidden-derived K/V is materialized into a persistent
-draft KV cache via the DFlashTargetKVMaterialize plugin; proposal self K/V
+forward pass.  Target-hidden-derived K/V is updated into a persistent
+draft KV cache via the DFlashTargetKVCacheUpdate plugin; proposal self K/V
 is written and attention is performed by the standard AttentionPlugin with
 tree attention enabled.
 
@@ -44,7 +44,7 @@ import torch.nn.functional as F
 from ...config import ModelConfig
 from ..default.modeling_default import OnnxSpec, RMSNorm
 from ..linear import FP16Linear, make_linear
-from ..ops import attention_plugin, dflash_target_kv_materialize
+from ..ops import attention_plugin, dflash_target_kv_cache_update
 
 __all__ = ["DFlashDraftModel"]
 
@@ -95,7 +95,7 @@ class MLP(nn.Module):
 class DFlashCachedAttention(nn.Module):
     """Cached attention for DFlash draft model.
 
-    Per-layer: materializes target delta K/V into the draft KV cache,
+    Per-layer: updates the draft KV cache with target delta K/V,
     then runs AttentionPlugin for proposal self-attention over the
     full context (persistent target K/V + temporary proposal K/V).
     """
@@ -153,18 +153,16 @@ class DFlashCachedAttention(nn.Module):
         B, BS, _ = hidden_states.shape
         L = h_delta.shape[1]
 
-        # --- Target delta K/V: project and materialize into cache ---
+        # --- Target delta K/V: project and update cache ---
         k_delta = self.k_proj(h_delta)  # [B, L, Hkv*D]
         v_delta = self.v_proj(h_delta)  # [B, L, Hkv*D]
         k_delta = k_delta.reshape(B, L, self.num_kv_heads, self.head_dim)
         v_delta = v_delta.reshape(B, L, self.num_kv_heads, self.head_dim)
         k_delta = self.k_norm(k_delta)  # [B, L, Hkv, D]
 
-        materialized_kv = dflash_target_kv_materialize(k_delta, v_delta,
-                                                       past_key_value,
-                                                       rope_cos_sin,
-                                                       kvcache_start_index,
-                                                       delta_lengths)
+        updated_kv = dflash_target_kv_cache_update(
+            k_delta, v_delta, past_key_value, rope_cos_sin,
+            kvcache_start_index, delta_lengths)
 
         # --- Proposal self Q/K/V ---
         q = self.q_proj(hidden_states)  # [B, BS, Hq*D]
@@ -184,7 +182,7 @@ class DFlashCachedAttention(nn.Module):
             q,
             k_self,
             v_self,
-            materialized_kv,
+            updated_kv,
             context_lengths,
             rope_cos_sin,
             kvcache_start_index,

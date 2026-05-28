@@ -184,25 +184,21 @@ def _(query_states, key_states, value_states, cu_seqlens, max_seqlen_carrier,
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Custom op: trt_edgellm::dflash_target_kv_materialize
+# Custom op: trt_edgellm::dflash_target_kv_cache_update
 # ---------------------------------------------------------------------------
 
 
-@torch.library.custom_op("trt_edgellm::dflash_target_kv_materialize",
+@torch.library.custom_op("trt_edgellm::dflash_target_kv_cache_update",
                          mutates_args=())
-def dflash_target_kv_materialize(
-        k_delta: torch.
-    Tensor,  # [B, L, numKVHeads, headDim] FP16, k_normed, not RoPE-applied
+def dflash_target_kv_cache_update(
+        k_delta: torch.Tensor,  # [B, L, numKVHeads, headDim] FP16, k_normed, not RoPE-applied
         v_delta: torch.Tensor,  # [B, L, numKVHeads, headDim] FP16
-        past_key_value: torch.
-    Tensor,  # [B, 2, numKVHeads, maxSeqLen, headDim] FP16
+        past_key_value: torch.Tensor,  # [B, 2, numKVHeads, maxSeqLen, headDim] FP16
         rope_cos_sin: torch.Tensor,  # [ropeBatch, maxSeqLen, rotaryDim] FP32
-        delta_start_positions: torch.
-    Tensor,  # [B] INT32, old committed draft target cache length
-        delta_lengths: torch.
-    Tensor,  # [B] INT32, per-batch delta lengths for multi-batch
+        delta_start_positions: torch.Tensor,  # [B] INT32, old committed draft target cache length
+        delta_lengths: torch.Tensor,  # [B] INT32, per-batch delta lengths for multi-batch
 ) -> torch.Tensor:
-    """Materialize target-hidden-derived K/V delta into the draft combined KV cache.
+    """Update the draft combined KV cache with target-hidden-derived K/V delta.
 
     Applies RoPE to k_delta and writes k_rope + v_delta into the KV cache at
     positions [delta_start, delta_start + t) for each batch element, where
@@ -212,7 +208,7 @@ def dflash_target_kv_materialize(
     return past_key_value.clone()
 
 
-@dflash_target_kv_materialize.register_fake
+@dflash_target_kv_cache_update.register_fake
 def _(k_delta, v_delta, past_key_value, rope_cos_sin, delta_start_positions,
       delta_lengths):
     return torch.empty_like(past_key_value)

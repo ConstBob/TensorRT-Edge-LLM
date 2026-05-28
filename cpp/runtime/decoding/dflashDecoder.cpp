@@ -62,7 +62,7 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
     ELLM_CHECK(deployment.specConfig.has_value(), "DFlashDecoder: specConfig is required.");
     ELLM_CHECK(deployment.draft.has_value(), "DFlashDecoder: draft config is required.");
     ELLM_CHECK(baseCfg.specDecodeType == SpecDecodeMode::kDFlash,
-        "DFlashDecoder requires a base engine exported with model_type=dflash_base.");
+        "DFlashDecoder requires a base engine exported with spec_decode_type=dflash and engine_role=base.");
     ELLM_CHECK(baseCfg.reducedVocabSize == 0, "DFlash Phase 1 does not support reduced-vocabulary base engines.");
 
     mBlockSize = deployment.specConfig->verifySize;
@@ -242,7 +242,7 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
     // Step 3: Prepare target_hidden_delta from base hidden states.
     // On round 0: delta = prefill hidden states, per-batch lengths from effectivePrefillLengths.
     // On round > 0: delta = accepted base hidden states, per-batch from acceptLen.
-    // The materialize plugin uses per-batch delta_lengths[b] to skip padded rows.
+    // The KV cache update plugin uses per-batch delta_lengths[b] to skip padded rows.
     int64_t maxDeltaLen;
     int64_t sourceSeqLen; // stride of baseHiddenStates along dim 1
     check::check(mHostDeltaLens.reshape({activeBatchSize}), "Tensor reshape failed");
@@ -250,7 +250,7 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
 
     if (context.generationRound == 0)
     {
-        // Prompts may be padded to a batch max; materialize only each sequence's effective prefill length.
+        // Prompts may be padded to a batch max; update only each sequence's effective prefill length.
         sourceSeqLen = mRuntime.base.pipelineIO.baseHiddenStates.getShape()[1];
         maxDeltaLen = 0;
         for (int32_t b = 0; b < activeBatchSize; ++b)
@@ -273,7 +273,7 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
         }
     }
 
-    // Upload per-batch delta_lengths for the materialize plugin guard
+    // Upload per-batch delta_lengths for the KV cache update plugin guard
     check::check(mDraftDeltaLens.reshape({activeBatchSize}), "Tensor reshape failed");
     CUDA_CHECK(cudaMemcpyAsync(mDraftDeltaLens.rawPointer(), mHostDeltaLens.rawPointer(),
         activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
@@ -281,7 +281,7 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
     // Source: baseHiddenStates [B, sourceSeqLen, Hout] — stride = sourceSeqLen * Hout
     // Dest:   mDraftTargetHidden [B, maxDeltaLen, Hout] — stride = maxDeltaLen * Hout
     // Copy the first maxDeltaLen rows per batch. Rows beyond delta_lengths[b] are padding
-    // (skipped by the materialize plugin).
+    // (skipped by the KV cache update plugin).
     check::check(
         mDraftTargetHidden.reshape({activeBatchSize, maxDeltaLen, mBaseOutputHiddenDim}), "Tensor reshape failed");
     {
@@ -634,13 +634,13 @@ void DFlashDecoder::restoreSystemPromptKVCache(SystemPromptCacheKey const& key, 
 
 bool DFlashDecoder::runSystemPromptPrefill(DecodingInferenceContext& context)
 {
-    // DFlash "draft prefill" materializes target KV from base hidden states.
+    // DFlash "draft prefill" updates target KV cache from base hidden states.
     // After base prefill, baseHiddenStates contains the multi-layer hidden features
-    // for the full prompt. We run the draft engine to materialize these into the
+    // for the full prompt. We run the draft engine to update these entries in the
     // draft KV cache. The proposal logits are ignored — only the target KV matters.
     //
     // This is equivalent to the first-round draft forward (generationRound==0),
-    // but we don't do proposal/verify — just materialize and commit.
+    // but we don't do proposal/verify — just update the cache and commit.
     int32_t const activeBatchSize = context.activeBatchSize;
     int64_t const prefillLen = mRuntime.base.pipelineIO.baseHiddenStates.getShape()[1];
     int32_t const BS = mBlockSize;
@@ -694,7 +694,7 @@ bool DFlashDecoder::runSystemPromptPrefill(DecodingInferenceContext& context)
         mDraftAttentionPosId.dataPointer<int32_t>(), mDraftContextLengths.dataPointer<int32_t>(), activeBatchSize,
         context.stream);
 
-    // Run draft engine (materializes target KV, proposal logits are ignored)
+    // Run draft engine (updates target KV cache; proposal logits are ignored)
     check::check(mDraftOutputLogits.reshape({activeBatchSize, BS, mDraftVocabSize}), "Tensor reshape failed");
     int32_t const draftKVCapacity = mRuntime.deployment.draft->maxKVCacheCapacity;
     InferenceDims const draftDims{

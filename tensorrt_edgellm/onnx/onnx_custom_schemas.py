@@ -1195,14 +1195,14 @@ _fused_gemm_allreduce_plugin_schema = OpSchema(
 )
 
 # ---------------------------------------------------------------------------
-# trt_edgellm::DFlashTargetKVMaterialize
+# trt_edgellm::DFlashTargetKVCacheUpdate
 # ---------------------------------------------------------------------------
 
-_dflash_target_kv_materialize_schema = OpSchema(
-    name="DFlashTargetKVMaterialize",
+_dflash_target_kv_cache_update_schema = OpSchema(
+    name="DFlashTargetKVCacheUpdate",
     domain="trt_edgellm",
     since_version=_SCHEMA_SINCE_VERSION,
-    doc=("DFlash target KV materialize: apply RoPE to k_delta and write "
+    doc=("DFlash target KV cache update: apply RoPE to k_delta and write "
          "k_rope + v_delta into the combined draft KV cache."),
     inputs=[
         OpSchema.FormalParameter(
@@ -1232,8 +1232,7 @@ _dflash_target_kv_materialize_schema = OpSchema(
         ),
         OpSchema.FormalParameter(
             name="delta_lengths",
-            description=
-            "Per-batch delta lengths [B] INT32 for multi-batch guard",
+            description="Per-batch delta lengths [B] INT32 for multi-batch guard",
             type_str="tensor(int32)",
         ),
     ],
@@ -1271,7 +1270,7 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _nvfp4_moe_plugin_schema,
     _nvfp4_moe_plugin_geforce_schema,
     _fused_gemm_allreduce_plugin_schema,
-    _dflash_target_kv_materialize_schema,
+    _dflash_target_kv_cache_update_schema,
 )
 
 _registered_tensorrt_edgellm_schemas: bool = False

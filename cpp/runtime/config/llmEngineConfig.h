@@ -70,7 +70,7 @@ struct LLMEngineConfig
     bool useTrtNativeOps{false};  //!< Use TRT native ops instead of custom plugin
     bool isSpecDecodeBase{false}; //!< Base engine exposes speculative decoding verification bindings
     SpecDecodeMode specDecodeType{
-        SpecDecodeMode::kNONE}; //!< Speculative decoding strategy mode (parsed from model_type)
+        SpecDecodeMode::kNONE}; //!< Speculative decoding strategy mode (parsed from spec_decode_type)
     //! KV cache data type. Parsed from required top-level `kv_cache_dtype` in
     //! `config.json` (written by `llm_export.py`). Accepted values:
     //! "fp16" → kHALF, "fp8" → kFP8, "int8" → kINT8, "bf16" → kBF16.

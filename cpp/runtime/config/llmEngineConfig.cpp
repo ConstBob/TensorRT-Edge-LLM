@@ -102,6 +102,40 @@ void parseRequiredStateDtype(Json const& json, char const* key, nvinfer1::DataTy
     out = parseStateDtype(json[key].get<std::string>(), key);
 }
 
+SpecDecodeMode parseSpecDecodeMode(Json const& configJson)
+{
+    std::string const specDecodeType = configJson.value("spec_decode_type", "none");
+    if (specDecodeType == "none")
+    {
+        return SpecDecodeMode::kNONE;
+    }
+    if (specDecodeType == "mtp")
+    {
+        return SpecDecodeMode::kMTP;
+    }
+    if (specDecodeType == "eagle3")
+    {
+        return SpecDecodeMode::kEAGLE;
+    }
+    if (specDecodeType == "dflash")
+    {
+        return SpecDecodeMode::kDFlash;
+    }
+    throw std::runtime_error("parseEngineConfig: invalid spec_decode_type '" + specDecodeType
+        + "'. Allowed values: none, mtp, eagle3, dflash.");
+}
+
+std::string parseEngineRole(Json const& configJson)
+{
+    std::string const engineRole = configJson.value("engine_role", "llm");
+    if (engineRole == "llm" || engineRole == "base" || engineRole == "draft")
+    {
+        return engineRole;
+    }
+    throw std::runtime_error("parseEngineConfig: invalid engine_role '" + engineRole
+        + "'. Allowed values: llm, base, draft.");
+}
+
 void validateDFlashTargetLayerIds(
     std::vector<int32_t> const& targetLayerIds, int32_t numDecoderLayers, char const* layerCountOwner)
 {
@@ -322,19 +356,19 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
 
     LLMEngineConfig cfg;
 
-    // Parse speculative decoding type from model_type field.
-    std::string const modelType = configJson.value("model_type", "");
-    if (modelType == "mtp_base" || modelType == "mtp_draft")
+    cfg.specDecodeType = parseSpecDecodeMode(configJson);
+    std::string const engineRole = parseEngineRole(configJson);
+    ELLM_CHECK(engineRole != "draft", "parseEngineConfig: use parseDraftEngineConfig for engine_role=draft.");
+    cfg.isSpecDecodeBase = (engineRole == "base");
+    if (cfg.isSpecDecodeBase)
     {
-        cfg.specDecodeType = SpecDecodeMode::kMTP;
+        ELLM_CHECK(cfg.specDecodeType != SpecDecodeMode::kNONE,
+            "parseEngineConfig: engine_role=base requires spec_decode_type to be mtp, eagle3, or dflash.");
     }
-    else if (modelType == "eagle3_base" || modelType == "eagle3_draft")
+    else
     {
-        cfg.specDecodeType = SpecDecodeMode::kEAGLE;
-    }
-    else if (modelType == "dflash_base" || modelType == "dflash_draft")
-    {
-        cfg.specDecodeType = SpecDecodeMode::kDFlash;
+        ELLM_CHECK(cfg.specDecodeType == SpecDecodeMode::kNONE,
+            "parseEngineConfig: engine_role=llm requires spec_decode_type=none.");
     }
 
     // Shared core fields (layers, kv heads, head_dim, hidden_size, kv_cache_dtype,
@@ -363,7 +397,6 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
 
     auto const& bc = configJson["builder_config"];
     cfg.maxSupportedLoraRank = bc.value("max_lora_rank", 0);
-    cfg.isSpecDecodeBase = (cfg.specDecodeType != SpecDecodeMode::kNONE);
 
     // Recurrent / conv state dtypes are only meaningful for hybrid engines
     // (Mamba / Nemotron-H / GDN). Mirror the Python export gating exactly:
@@ -432,20 +465,11 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath)
 
     LLMEngineConfig cfg;
 
-    // Parse speculative decoding type from model_type field (draft side).
-    std::string const modelType = configJson.value("model_type", "");
-    if (modelType == "mtp_base" || modelType == "mtp_draft")
-    {
-        cfg.specDecodeType = SpecDecodeMode::kMTP;
-    }
-    else if (modelType == "eagle3_base" || modelType == "eagle3_draft")
-    {
-        cfg.specDecodeType = SpecDecodeMode::kEAGLE;
-    }
-    else if (modelType == "dflash_base" || modelType == "dflash_draft")
-    {
-        cfg.specDecodeType = SpecDecodeMode::kDFlash;
-    }
+    cfg.specDecodeType = parseSpecDecodeMode(configJson);
+    std::string const engineRole = parseEngineRole(configJson);
+    ELLM_CHECK(engineRole == "draft", "parseDraftEngineConfig: draft config must set engine_role=draft.");
+    ELLM_CHECK(cfg.specDecodeType != SpecDecodeMode::kNONE,
+        "parseDraftEngineConfig: engine_role=draft requires spec_decode_type to be mtp, eagle3, or dflash.");
 
     // Shared core fields (layers, kv heads, head_dim, hidden_size, kv_cache_dtype,
     // batch/input/kv limits, RoPE, common positivity checks).
@@ -463,8 +487,8 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath)
     cfg.outputVocabSize = cfg.vocabSize;
     parseDFlashFields(configJson, cfg);
 
-    // Draft engines do not own hybrid runtime cache state in this path.
-    cfg.isSpecDecodeBase = false; // This IS the draft engine, not the base.
+    // Draft engines do not own speculative base verification bindings.
+    cfg.isSpecDecodeBase = false;
 
     auto const& bc = configJson["builder_config"];
     // Symmetric to the base side (see parseEngineConfig): each engine's

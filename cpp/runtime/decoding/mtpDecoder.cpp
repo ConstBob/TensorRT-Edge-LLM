@@ -59,7 +59,7 @@ MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, std::filesystem::path co
     check::check(
         mRuntime.deployment.specConfig.has_value(), "SpecDecode drafting strategy requires a drafting config.");
     check::check(runtime.deployment.base.specDecodeType == SpecDecodeMode::kMTP,
-        "MTP decoding requires a base engine exported with model_type=mtp_base.");
+        "MTP decoding requires a base engine exported with spec_decode_type=mtp and engine_role=base.");
 
     mDraftExecutor = spec_decode_utils::loadDraftEngine(engineDir, mRuntime.deployment);
 

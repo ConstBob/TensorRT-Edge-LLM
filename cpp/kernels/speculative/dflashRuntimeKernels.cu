@@ -28,7 +28,7 @@ namespace kernel
 {
 
 // -----------------------------------------------------------------------
-// DFlash target KV materialize kernel
+// DFlash target KV cache update kernel
 // -----------------------------------------------------------------------
 //
 // Grid: (numTokens, numKVHeads, batchSize)  where numTokens = deltaLen
@@ -38,7 +38,7 @@ namespace kernel
 
 static constexpr int32_t kVecSize = 8; // half8
 
-__global__ void dflashKVMaterializeKernel(half const* __restrict__ kDelta, half const* __restrict__ vDelta,
+__global__ void dflashTargetKVCacheUpdateKernel(half const* __restrict__ kDelta, half const* __restrict__ vDelta,
     half* __restrict__ kvCache, float const* __restrict__ cosSinCache, int32_t const* __restrict__ deltaStartPositions,
     int32_t const* __restrict__ deltaLengths, int32_t deltaLen, int32_t numKVHeads, int32_t headDim, int32_t maxSeqLen,
     int32_t rotaryDim, int32_t cosSinBatch, int32_t cosSinSeqLen)
@@ -159,7 +159,7 @@ __global__ void dflashKVMaterializeKernel(half const* __restrict__ kDelta, half 
     }
 }
 
-void launchDFlashKVMaterialize(half const* kDelta, half const* vDelta, half* kvCache, float const* cosSinCache,
+void launchDFlashTargetKVCacheUpdate(half const* kDelta, half const* vDelta, half* kvCache, float const* cosSinCache,
     int32_t const* deltaStartPositions, int32_t const* deltaLengths, int32_t batchSize, int32_t deltaLen,
     int32_t numKVHeads, int32_t headDim, int32_t maxSeqLen, int32_t rotaryDim, int32_t cosSinBatch,
     int32_t cosSinSeqLen, cudaStream_t stream)
@@ -170,11 +170,11 @@ void launchDFlashKVMaterialize(half const* kDelta, half const* vDelta, half* kvC
     }
 
     int32_t const threadsPerToken = (headDim + kVecSize - 1) / kVecSize;
-    assert(threadsPerToken <= 1024 && "DFlash KV materialize exceeds CUDA max threads per block");
+    assert(threadsPerToken <= 1024 && "DFlash KV cache update exceeds CUDA max threads per block");
     dim3 const grid(deltaLen, numKVHeads, batchSize);
     dim3 const block(threadsPerToken);
 
-    dflashKVMaterializeKernel<<<grid, block, 0, stream>>>(kDelta, vDelta, kvCache, cosSinCache, deltaStartPositions,
+    dflashTargetKVCacheUpdateKernel<<<grid, block, 0, stream>>>(kDelta, vDelta, kvCache, cosSinCache, deltaStartPositions,
         deltaLengths, deltaLen, numKVHeads, headDim, maxSeqLen, rotaryDim, cosSinBatch, cosSinSeqLen);
     CUDA_CHECK(cudaGetLastError());
 }

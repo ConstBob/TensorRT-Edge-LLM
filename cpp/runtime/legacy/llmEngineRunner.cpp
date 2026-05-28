@@ -606,15 +606,14 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson) noexcept
             }
         }
 
-        // Determine output hidden dim based on model_type:
-        // - mtp_base: hidden_size (last layer output only)
-        // - eagle3_base (or unspecified): hidden_size * 3 (concatenates 3 layers)
+        // Determine output hidden dim based on spec_decode_type:
+        // - mtp: hidden_size (last layer output only)
+        // - eagle3 (or unspecified legacy EAGLE): hidden_size * 3 (concatenates 3 layers)
         if (mConfig.enableEagleSpecDecode)
         {
             int32_t const hiddenSize = configJson["hidden_size"].get<int32_t>();
-            std::string const modelType
-                = configJson.contains("model_type") ? configJson["model_type"].get<std::string>() : "";
-            mConfig.mtpBase = (modelType == "mtp_base");
+            std::string const specDecodeType = configJson.value("spec_decode_type", "none");
+            mConfig.mtpBase = (specDecodeType == "mtp");
             mConfig.outputHiddenDim = mConfig.mtpBase ? hiddenSize : hiddenSize * 3;
 
             // maxVerifyTreeSize is only required when eagle_base is true

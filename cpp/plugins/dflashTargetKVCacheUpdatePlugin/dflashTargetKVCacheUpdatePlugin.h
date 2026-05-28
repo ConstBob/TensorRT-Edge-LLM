@@ -26,7 +26,7 @@ namespace trt_edgellm
 namespace plugins
 {
 
-/// TensorRT plugin for DFlash target KV materialize (V3 — IPluginV3).
+/// TensorRT plugin for DFlash target KV cache update (V3 — IPluginV3).
 ///
 /// Inputs:
 ///   0: k_delta              [B, L, numKVHeads, headDim] FP16
@@ -38,18 +38,18 @@ namespace plugins
 ///
 /// Outputs:
 ///   0: present_key_value    same shape/dtype as past_key_value (aliased)
-class DFlashTargetKVMaterializePlugin : public nvinfer1::IPluginV3,
+class DFlashTargetKVCacheUpdatePlugin : public nvinfer1::IPluginV3,
                                         public nvinfer1::IPluginV3OneCore,
                                         public nvinfer1::IPluginV3OneBuildV2,
                                         public nvinfer1::IPluginV3OneRuntime
 {
 public:
-    DFlashTargetKVMaterializePlugin(std::string const& name);
-    DFlashTargetKVMaterializePlugin(std::string const& name, nvinfer1::PluginFieldCollection const* fc);
+    DFlashTargetKVCacheUpdatePlugin(std::string const& name);
+    DFlashTargetKVCacheUpdatePlugin(std::string const& name, nvinfer1::PluginFieldCollection const* fc);
 
-    DFlashTargetKVMaterializePlugin() = delete;
-    DFlashTargetKVMaterializePlugin(DFlashTargetKVMaterializePlugin const&) = delete;
-    ~DFlashTargetKVMaterializePlugin() override = default;
+    DFlashTargetKVCacheUpdatePlugin() = delete;
+    DFlashTargetKVCacheUpdatePlugin(DFlashTargetKVCacheUpdatePlugin const&) = delete;
+    ~DFlashTargetKVCacheUpdatePlugin() override = default;
 
     // IPluginV3
     nvinfer1::IPluginCapability* getCapabilityInterface(nvinfer1::PluginCapabilityType type) noexcept override;
@@ -104,11 +104,11 @@ private:
     nvinfer1::PluginFieldCollection mFCToSerialize{};
 };
 
-class DFlashTargetKVMaterializePluginCreator : public nvinfer1::IPluginCreatorV3One
+class DFlashTargetKVCacheUpdatePluginCreator : public nvinfer1::IPluginCreatorV3One
 {
 public:
-    DFlashTargetKVMaterializePluginCreator();
-    ~DFlashTargetKVMaterializePluginCreator() override = default;
+    DFlashTargetKVCacheUpdatePluginCreator();
+    ~DFlashTargetKVCacheUpdatePluginCreator() override = default;
 
     char const* getPluginName() const noexcept override;
     char const* getPluginVersion() const noexcept override;

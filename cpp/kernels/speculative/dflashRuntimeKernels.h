@@ -26,7 +26,7 @@ namespace trt_edgellm
 namespace kernel
 {
 
-/// Launch the DFlash target KV materialize kernel.
+/// Launch the DFlash target KV cache update kernel.
 ///
 /// Applies RoPE to k_delta and writes k_rope + v_delta into the combined KV cache
 /// at positions [deltaStart, deltaStart + deltaLen) for each batch element.
@@ -46,7 +46,7 @@ namespace kernel
 /// @param cosSinSeqLen cos/sin cache sequence length
 /// @param stream       CUDA stream
 /// @param deltaLengths  [B] INT32, per-batch delta lengths (skip t >= deltaLengths[b])
-void launchDFlashKVMaterialize(half const* kDelta, half const* vDelta, half* kvCache, float const* cosSinCache,
+void launchDFlashTargetKVCacheUpdate(half const* kDelta, half const* vDelta, half* kvCache, float const* cosSinCache,
     int32_t const* deltaStartPositions, int32_t const* deltaLengths, int32_t batchSize, int32_t deltaLen,
     int32_t numKVHeads, int32_t headDim, int32_t maxSeqLen, int32_t rotaryDim, int32_t cosSinBatch,
     int32_t cosSinSeqLen, cudaStream_t stream);

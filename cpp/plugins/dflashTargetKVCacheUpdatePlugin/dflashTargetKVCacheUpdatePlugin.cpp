@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "dflashTargetKVMaterializePlugin.h"
+#include "dflashTargetKVCacheUpdatePlugin.h"
 #include "common/logger.h"
 #include "kernels/speculative/dflashRuntimeKernels.h"
 
@@ -30,7 +30,7 @@ namespace plugins
 
 namespace
 {
-char const* const kPLUGIN_NAME = "DFlashTargetKVMaterialize";
+char const* const kPLUGIN_NAME = "DFlashTargetKVCacheUpdate";
 char const* const kPLUGIN_VERSION = "1";
 constexpr int32_t kNUM_INPUTS{6};
 constexpr int32_t kNUM_OUTPUTS{1};
@@ -51,12 +51,12 @@ bool checkExpectedIO(char const* where, int32_t nbInputs, int32_t nbOutputs)
 // Plugin
 // ---------------------------------------------------------------------------
 
-DFlashTargetKVMaterializePlugin::DFlashTargetKVMaterializePlugin(std::string const& name)
+DFlashTargetKVCacheUpdatePlugin::DFlashTargetKVCacheUpdatePlugin(std::string const& name)
     : mLayerName(name)
 {
 }
 
-DFlashTargetKVMaterializePlugin::DFlashTargetKVMaterializePlugin(
+DFlashTargetKVCacheUpdatePlugin::DFlashTargetKVCacheUpdatePlugin(
     std::string const& name, PluginFieldCollection const* /* fc */)
     : mLayerName(name)
 {
@@ -64,7 +64,7 @@ DFlashTargetKVMaterializePlugin::DFlashTargetKVMaterializePlugin(
 }
 
 // IPluginV3
-IPluginCapability* DFlashTargetKVMaterializePlugin::getCapabilityInterface(PluginCapabilityType type) noexcept
+IPluginCapability* DFlashTargetKVCacheUpdatePlugin::getCapabilityInterface(PluginCapabilityType type) noexcept
 {
     try
     {
@@ -83,53 +83,53 @@ IPluginCapability* DFlashTargetKVMaterializePlugin::getCapabilityInterface(Plugi
     }
     catch (std::exception const& e)
     {
-        LOG_ERROR("DFlashTargetKVMaterializePlugin: getCapabilityInterface exception: %s", e.what());
+        LOG_ERROR("DFlashTargetKVCacheUpdatePlugin: getCapabilityInterface exception: %s", e.what());
     }
     return nullptr;
 }
 
-IPluginV3* DFlashTargetKVMaterializePlugin::clone() noexcept
+IPluginV3* DFlashTargetKVCacheUpdatePlugin::clone() noexcept
 {
     try
     {
-        auto* plugin = new DFlashTargetKVMaterializePlugin(mLayerName);
+        auto* plugin = new DFlashTargetKVCacheUpdatePlugin(mLayerName);
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }
     catch (std::exception const& e)
     {
-        LOG_ERROR("DFlashTargetKVMaterializePlugin: clone exception: %s", e.what());
+        LOG_ERROR("DFlashTargetKVCacheUpdatePlugin: clone exception: %s", e.what());
     }
     return nullptr;
 }
 
 // IPluginV3OneCore
-char const* DFlashTargetKVMaterializePlugin::getPluginName() const noexcept
+char const* DFlashTargetKVCacheUpdatePlugin::getPluginName() const noexcept
 {
     return kPLUGIN_NAME;
 }
 
-char const* DFlashTargetKVMaterializePlugin::getPluginVersion() const noexcept
+char const* DFlashTargetKVCacheUpdatePlugin::getPluginVersion() const noexcept
 {
     return kPLUGIN_VERSION;
 }
 
-char const* DFlashTargetKVMaterializePlugin::getPluginNamespace() const noexcept
+char const* DFlashTargetKVCacheUpdatePlugin::getPluginNamespace() const noexcept
 {
     return mNamespace.c_str();
 }
 
 // IPluginV3OneBuild
-int32_t DFlashTargetKVMaterializePlugin::getNbOutputs() const noexcept
+int32_t DFlashTargetKVCacheUpdatePlugin::getNbOutputs() const noexcept
 {
     return 1; // present_key_value
 }
 
-int32_t DFlashTargetKVMaterializePlugin::getOutputDataTypes(
+int32_t DFlashTargetKVCacheUpdatePlugin::getOutputDataTypes(
     DataType* outputTypes, int32_t nbOutputs, DataType const* inputTypes, int32_t nbInputs) const noexcept
 {
     // Output dtype = past_key_value dtype (input 2)
-    if (!checkExpectedIO("DFlashTargetKVMaterializePlugin::getOutputDataTypes", nbInputs, nbOutputs)
+    if (!checkExpectedIO("DFlashTargetKVCacheUpdatePlugin::getOutputDataTypes", nbInputs, nbOutputs)
         || outputTypes == nullptr || inputTypes == nullptr)
     {
         return -1;
@@ -138,12 +138,12 @@ int32_t DFlashTargetKVMaterializePlugin::getOutputDataTypes(
     return 0;
 }
 
-int32_t DFlashTargetKVMaterializePlugin::getOutputShapes(DimsExprs const* inputs, int32_t nbInputs,
+int32_t DFlashTargetKVCacheUpdatePlugin::getOutputShapes(DimsExprs const* inputs, int32_t nbInputs,
     DimsExprs const* /* shapeInputs */, int32_t /* nbShapeInputs */, DimsExprs* outputs, int32_t nbOutputs,
     IExprBuilder& /* exprBuilder */) noexcept
 {
     // Output shape = past_key_value shape
-    if (!checkExpectedIO("DFlashTargetKVMaterializePlugin::getOutputShapes", nbInputs, nbOutputs) || inputs == nullptr
+    if (!checkExpectedIO("DFlashTargetKVCacheUpdatePlugin::getOutputShapes", nbInputs, nbOutputs) || inputs == nullptr
         || outputs == nullptr)
     {
         return -1;
@@ -152,7 +152,7 @@ int32_t DFlashTargetKVMaterializePlugin::getOutputShapes(DimsExprs const* inputs
     return 0;
 }
 
-bool DFlashTargetKVMaterializePlugin::supportsFormatCombination(
+bool DFlashTargetKVCacheUpdatePlugin::supportsFormatCombination(
     int32_t pos, DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
 {
     if (inOut == nullptr || nbInputs != kNUM_INPUTS || nbOutputs != kNUM_OUTPUTS || pos < 0
@@ -187,10 +187,10 @@ bool DFlashTargetKVMaterializePlugin::supportsFormatCombination(
     return false;
 }
 
-int32_t DFlashTargetKVMaterializePlugin::configurePlugin(
+int32_t DFlashTargetKVCacheUpdatePlugin::configurePlugin(
     DynamicPluginTensorDesc const* in, int32_t nbInputs, DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept
 {
-    if (!checkExpectedIO("DFlashTargetKVMaterializePlugin::configurePlugin", nbInputs, nbOutputs) || in == nullptr
+    if (!checkExpectedIO("DFlashTargetKVCacheUpdatePlugin::configurePlugin", nbInputs, nbOutputs) || in == nullptr
         || out == nullptr)
     {
         return -1;
@@ -198,41 +198,41 @@ int32_t DFlashTargetKVMaterializePlugin::configurePlugin(
     if (in[kIN_K_DELTA].desc.type != DataType::kHALF || in[kIN_V_DELTA].desc.type != DataType::kHALF
         || in[kIN_PAST_KV].desc.type != DataType::kHALF)
     {
-        LOG_ERROR("DFlashTargetKVMaterializePlugin: k_delta, v_delta, and past_key_value must be FP16");
+        LOG_ERROR("DFlashTargetKVCacheUpdatePlugin: k_delta, v_delta, and past_key_value must be FP16");
         return -1;
     }
     if (in[kIN_ROPE_COS_SIN].desc.type != DataType::kFLOAT)
     {
-        LOG_ERROR("DFlashTargetKVMaterializePlugin: rope_cos_sin must be FP32");
+        LOG_ERROR("DFlashTargetKVCacheUpdatePlugin: rope_cos_sin must be FP32");
         return -1;
     }
     if (in[kIN_DELTA_START].desc.type != DataType::kINT32 || in[kIN_DELTA_LENGTHS].desc.type != DataType::kINT32)
     {
-        LOG_ERROR("DFlashTargetKVMaterializePlugin: delta_start_positions and delta_lengths must be INT32");
+        LOG_ERROR("DFlashTargetKVCacheUpdatePlugin: delta_start_positions and delta_lengths must be INT32");
         return -1;
     }
     if (in[kIN_K_DELTA].desc.dims.nbDims != 4 || in[kIN_V_DELTA].desc.dims.nbDims != 4
         || in[kIN_PAST_KV].desc.dims.nbDims != 5 || in[kIN_ROPE_COS_SIN].desc.dims.nbDims != 3
         || in[kIN_DELTA_START].desc.dims.nbDims != 1 || in[kIN_DELTA_LENGTHS].desc.dims.nbDims != 1)
     {
-        LOG_ERROR("DFlashTargetKVMaterializePlugin: invalid input ranks");
+        LOG_ERROR("DFlashTargetKVCacheUpdatePlugin: invalid input ranks");
         return -1;
     }
     if (out[kOUT_PRESENT_KV].desc.type != in[kIN_PAST_KV].desc.type || out[kOUT_PRESENT_KV].desc.dims.nbDims != 5)
     {
-        LOG_ERROR("DFlashTargetKVMaterializePlugin: present_key_value must be 5D and match past_key_value dtype");
+        LOG_ERROR("DFlashTargetKVCacheUpdatePlugin: present_key_value must be 5D and match past_key_value dtype");
         return -1;
     }
     return 0;
 }
 
-size_t DFlashTargetKVMaterializePlugin::getWorkspaceSize(DynamicPluginTensorDesc const* /* inputs */,
+size_t DFlashTargetKVCacheUpdatePlugin::getWorkspaceSize(DynamicPluginTensorDesc const* /* inputs */,
     int32_t /* nbInputs */, DynamicPluginTensorDesc const* /* outputs */, int32_t /* nbOutputs */) const noexcept
 {
     return 0;
 }
 
-int32_t DFlashTargetKVMaterializePlugin::getAliasedInput(int32_t outputIndex) noexcept
+int32_t DFlashTargetKVCacheUpdatePlugin::getAliasedInput(int32_t outputIndex) noexcept
 {
     // present_key_value (output 0) aliases past_key_value (input 2)
     if (outputIndex == kOUT_PRESENT_KV)
@@ -243,14 +243,14 @@ int32_t DFlashTargetKVMaterializePlugin::getAliasedInput(int32_t outputIndex) no
 }
 
 // IPluginV3OneRuntime
-int32_t DFlashTargetKVMaterializePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* outputDesc,
+int32_t DFlashTargetKVCacheUpdatePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* outputDesc,
     void const* const* inputs, void* const* outputs, void* /* workspace */, cudaStream_t stream) noexcept
 {
     try
     {
         if (inputDesc == nullptr || outputDesc == nullptr || inputs == nullptr || outputs == nullptr)
         {
-            LOG_ERROR("DFlashTargetKVMaterializePlugin::enqueue received null descriptors or pointers");
+            LOG_ERROR("DFlashTargetKVCacheUpdatePlugin::enqueue received null descriptors or pointers");
             return -1;
         }
 
@@ -258,7 +258,7 @@ int32_t DFlashTargetKVMaterializePlugin::enqueue(PluginTensorDesc const* inputDe
         auto const& kDeltaDesc = inputDesc[kIN_K_DELTA];
         if (kDeltaDesc.type != DataType::kHALF || kDeltaDesc.dims.nbDims != 4)
         {
-            LOG_ERROR("DFlashTargetKVMaterializePlugin: k_delta must be 4D FP16");
+            LOG_ERROR("DFlashTargetKVCacheUpdatePlugin: k_delta must be 4D FP16");
             return -1;
         }
         int32_t const batchSize = kDeltaDesc.dims.d[0];
@@ -267,7 +267,7 @@ int32_t DFlashTargetKVMaterializePlugin::enqueue(PluginTensorDesc const* inputDe
         int32_t const headDim = kDeltaDesc.dims.d[3];
         if (batchSize <= 0 || deltaLen <= 0 || numKVHeads <= 0 || headDim <= 0)
         {
-            LOG_ERROR("DFlashTargetKVMaterializePlugin: k_delta dimensions must be positive");
+            LOG_ERROR("DFlashTargetKVCacheUpdatePlugin: k_delta dimensions must be positive");
             return -1;
         }
 
@@ -277,7 +277,7 @@ int32_t DFlashTargetKVMaterializePlugin::enqueue(PluginTensorDesc const* inputDe
             || vDeltaDesc.dims.d[1] != deltaLen || vDeltaDesc.dims.d[2] != numKVHeads
             || vDeltaDesc.dims.d[3] != headDim)
         {
-            LOG_ERROR("DFlashTargetKVMaterializePlugin: v_delta must match k_delta shape and dtype");
+            LOG_ERROR("DFlashTargetKVCacheUpdatePlugin: v_delta must match k_delta shape and dtype");
             return -1;
         }
 
@@ -287,13 +287,13 @@ int32_t DFlashTargetKVMaterializePlugin::enqueue(PluginTensorDesc const* inputDe
             || pastKVDesc.dims.d[1] != 2 || pastKVDesc.dims.d[2] != numKVHeads || pastKVDesc.dims.d[4] != headDim)
         {
             LOG_ERROR(
-                "DFlashTargetKVMaterializePlugin: past_key_value must be [B, 2, numKVHeads, maxSeqLen, headDim] FP16");
+                "DFlashTargetKVCacheUpdatePlugin: past_key_value must be [B, 2, numKVHeads, maxSeqLen, headDim] FP16");
             return -1;
         }
         int32_t const maxSeqLen = pastKVDesc.dims.d[3];
         if (maxSeqLen <= 0)
         {
-            LOG_ERROR("DFlashTargetKVMaterializePlugin: past_key_value maxSeqLen must be positive");
+            LOG_ERROR("DFlashTargetKVCacheUpdatePlugin: past_key_value maxSeqLen must be positive");
             return -1;
         }
 
@@ -301,7 +301,7 @@ int32_t DFlashTargetKVMaterializePlugin::enqueue(PluginTensorDesc const* inputDe
         auto const& ropeDesc = inputDesc[kIN_ROPE_COS_SIN];
         if (ropeDesc.type != DataType::kFLOAT || ropeDesc.dims.nbDims != 3)
         {
-            LOG_ERROR("DFlashTargetKVMaterializePlugin: rope_cos_sin must be 3D FP32");
+            LOG_ERROR("DFlashTargetKVCacheUpdatePlugin: rope_cos_sin must be 3D FP32");
             return -1;
         }
         int32_t const cosSinBatch = ropeDesc.dims.d[0];
@@ -310,7 +310,7 @@ int32_t DFlashTargetKVMaterializePlugin::enqueue(PluginTensorDesc const* inputDe
         if ((cosSinBatch != 1 && cosSinBatch != batchSize) || cosSinSeqLen < maxSeqLen || rotaryDim <= 0
             || rotaryDim > headDim || (rotaryDim % 2) != 0)
         {
-            LOG_ERROR("DFlashTargetKVMaterializePlugin: invalid rope_cos_sin shape");
+            LOG_ERROR("DFlashTargetKVCacheUpdatePlugin: invalid rope_cos_sin shape");
             return -1;
         }
 
@@ -320,7 +320,7 @@ int32_t DFlashTargetKVMaterializePlugin::enqueue(PluginTensorDesc const* inputDe
             || deltaStartDesc.dims.d[0] != batchSize || deltaLengthsDesc.type != DataType::kINT32
             || deltaLengthsDesc.dims.nbDims != 1 || deltaLengthsDesc.dims.d[0] != batchSize)
         {
-            LOG_ERROR("DFlashTargetKVMaterializePlugin: delta_start_positions and delta_lengths must be [B] INT32");
+            LOG_ERROR("DFlashTargetKVCacheUpdatePlugin: delta_start_positions and delta_lengths must be [B] INT32");
             return -1;
         }
 
@@ -330,20 +330,20 @@ int32_t DFlashTargetKVMaterializePlugin::enqueue(PluginTensorDesc const* inputDe
             || presentKVDesc.dims.d[2] != pastKVDesc.dims.d[2] || presentKVDesc.dims.d[3] != pastKVDesc.dims.d[3]
             || presentKVDesc.dims.d[4] != pastKVDesc.dims.d[4])
         {
-            LOG_ERROR("DFlashTargetKVMaterializePlugin: present_key_value must match past_key_value shape and dtype");
+            LOG_ERROR("DFlashTargetKVCacheUpdatePlugin: present_key_value must match past_key_value shape and dtype");
             return -1;
         }
         for (int32_t i = 0; i < kNUM_INPUTS; ++i)
         {
             if (inputs[i] == nullptr)
             {
-                LOG_ERROR("DFlashTargetKVMaterializePlugin: input %d is null", i);
+                LOG_ERROR("DFlashTargetKVCacheUpdatePlugin: input %d is null", i);
                 return -1;
             }
         }
         if (outputs[kOUT_PRESENT_KV] == nullptr)
         {
-            LOG_ERROR("DFlashTargetKVMaterializePlugin: present_key_value output is null");
+            LOG_ERROR("DFlashTargetKVCacheUpdatePlugin: present_key_value output is null");
             return -1;
         }
 
@@ -354,30 +354,30 @@ int32_t DFlashTargetKVMaterializePlugin::enqueue(PluginTensorDesc const* inputDe
         auto const* deltaStartPositions = static_cast<int32_t const*>(inputs[kIN_DELTA_START]);
         auto const* deltaLengths = static_cast<int32_t const*>(inputs[kIN_DELTA_LENGTHS]);
 
-        kernel::launchDFlashKVMaterialize(kDelta, vDelta, kvCache, cosSinCache, deltaStartPositions, deltaLengths,
+        kernel::launchDFlashTargetKVCacheUpdate(kDelta, vDelta, kvCache, cosSinCache, deltaStartPositions, deltaLengths,
             batchSize, deltaLen, numKVHeads, headDim, maxSeqLen, rotaryDim, cosSinBatch, cosSinSeqLen, stream);
 
         return 0;
     }
     catch (std::exception const& e)
     {
-        LOG_ERROR("DFlashTargetKVMaterializePlugin::enqueue exception: %s", e.what());
+        LOG_ERROR("DFlashTargetKVCacheUpdatePlugin::enqueue exception: %s", e.what());
         return -1;
     }
 }
 
-int32_t DFlashTargetKVMaterializePlugin::onShapeChange(PluginTensorDesc const* /* in */, int32_t /* nbInputs */,
+int32_t DFlashTargetKVCacheUpdatePlugin::onShapeChange(PluginTensorDesc const* /* in */, int32_t /* nbInputs */,
     PluginTensorDesc const* /* out */, int32_t /* nbOutputs */) noexcept
 {
     return 0;
 }
 
-IPluginV3* DFlashTargetKVMaterializePlugin::attachToContext([[maybe_unused]] IPluginResourceContext* context) noexcept
+IPluginV3* DFlashTargetKVCacheUpdatePlugin::attachToContext([[maybe_unused]] IPluginResourceContext* context) noexcept
 {
     return clone();
 }
 
-PluginFieldCollection const* DFlashTargetKVMaterializePlugin::getFieldsToSerialize() noexcept
+PluginFieldCollection const* DFlashTargetKVCacheUpdatePlugin::getFieldsToSerialize() noexcept
 {
     mDataToSerialize.clear();
     mFCToSerialize.nbFields = 0;
@@ -385,7 +385,7 @@ PluginFieldCollection const* DFlashTargetKVMaterializePlugin::getFieldsToSeriali
     return &mFCToSerialize;
 }
 
-void DFlashTargetKVMaterializePlugin::setPluginNamespace(char const* pluginNamespace) noexcept
+void DFlashTargetKVCacheUpdatePlugin::setPluginNamespace(char const* pluginNamespace) noexcept
 {
     mNamespace = pluginNamespace;
 }
@@ -394,58 +394,58 @@ void DFlashTargetKVMaterializePlugin::setPluginNamespace(char const* pluginNames
 // Plugin Creator
 // ---------------------------------------------------------------------------
 
-PluginFieldCollection DFlashTargetKVMaterializePluginCreator::mFieldCollection{};
-std::vector<PluginField> DFlashTargetKVMaterializePluginCreator::mPluginAttributes{};
+PluginFieldCollection DFlashTargetKVCacheUpdatePluginCreator::mFieldCollection{};
+std::vector<PluginField> DFlashTargetKVCacheUpdatePluginCreator::mPluginAttributes{};
 
-DFlashTargetKVMaterializePluginCreator::DFlashTargetKVMaterializePluginCreator()
+DFlashTargetKVCacheUpdatePluginCreator::DFlashTargetKVCacheUpdatePluginCreator()
 {
     mFieldCollection.nbFields = 0;
     mFieldCollection.fields = nullptr;
 }
 
-char const* DFlashTargetKVMaterializePluginCreator::getPluginName() const noexcept
+char const* DFlashTargetKVCacheUpdatePluginCreator::getPluginName() const noexcept
 {
     return kPLUGIN_NAME;
 }
 
-char const* DFlashTargetKVMaterializePluginCreator::getPluginVersion() const noexcept
+char const* DFlashTargetKVCacheUpdatePluginCreator::getPluginVersion() const noexcept
 {
     return kPLUGIN_VERSION;
 }
 
-PluginFieldCollection const* DFlashTargetKVMaterializePluginCreator::getFieldNames() noexcept
+PluginFieldCollection const* DFlashTargetKVCacheUpdatePluginCreator::getFieldNames() noexcept
 {
     return &mFieldCollection;
 }
 
-char const* DFlashTargetKVMaterializePluginCreator::getPluginNamespace() const noexcept
+char const* DFlashTargetKVCacheUpdatePluginCreator::getPluginNamespace() const noexcept
 {
     return mNamespace.c_str();
 }
 
-void DFlashTargetKVMaterializePluginCreator::setPluginNamespace(char const* pluginNamespace) noexcept
+void DFlashTargetKVCacheUpdatePluginCreator::setPluginNamespace(char const* pluginNamespace) noexcept
 {
     mNamespace = pluginNamespace;
 }
 
-IPluginV3* DFlashTargetKVMaterializePluginCreator::createPlugin(
+IPluginV3* DFlashTargetKVCacheUpdatePluginCreator::createPlugin(
     char const* name, PluginFieldCollection const* fc, [[maybe_unused]] TensorRTPhase phase) noexcept
 {
     try
     {
-        auto* plugin = new DFlashTargetKVMaterializePlugin(name, fc);
+        auto* plugin = new DFlashTargetKVCacheUpdatePlugin(name, fc);
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }
     catch (std::exception const& e)
     {
-        LOG_ERROR("DFlashTargetKVMaterializePluginCreator: createPlugin exception: %s", e.what());
+        LOG_ERROR("DFlashTargetKVCacheUpdatePluginCreator: createPlugin exception: %s", e.what());
     }
     return nullptr;
 }
 
 // Register plugin
-REGISTER_TENSORRT_PLUGIN(DFlashTargetKVMaterializePluginCreator);
+REGISTER_TENSORRT_PLUGIN(DFlashTargetKVCacheUpdatePluginCreator);
 
 } // namespace plugins
 } // namespace trt_edgellm
