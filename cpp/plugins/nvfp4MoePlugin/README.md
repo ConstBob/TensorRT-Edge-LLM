@@ -132,10 +132,12 @@ Block scales use the contiguous physical CuTeDSL NVFP4 layout
    returns an error (the plugin creator still registers, so deserialize
    paths work in build-only environments).
 
-   For SM110 Thor, generate and link the decomposed split FC1/FC2 group instead:
+   For SM110 Thor, generate and link the decomposed split FC1/FC2 group instead.
+   See [`kernelSrcs/nvfp4_moe_cutedsl/README.md`](../../../kernelSrcs/nvfp4_moe_cutedsl/README.md)
+   for the one-time CuTeDSL 4.5.1 SM110a admission patch that must be applied
+   to the installed `nvidia_cutlass_dsl` package before the AOT export, then:
 
    ```bash
-   python kernelSrcs/nvfp4_moe_cutedsl/patch_cutlass_dsl_sm110a.py --check
    python kernelSrcs/build_cutedsl.py \
      --kernels nvfp4_moe \
      --gpu_arch sm_110 \
@@ -181,7 +183,8 @@ emits `Nvfp4MoePlugin`.
 ### Thor sign-off checklist (runner-test equivalent)
 
 1. `mount-thor-sshfs` the workspace onto Thor.
-2. `python kernelSrcs/nvfp4_moe_cutedsl/patch_cutlass_dsl_sm110a.py --check`
+2. Apply the one-time CuTeDSL 4.5.1 SM110a admission patch (see
+   [`kernelSrcs/nvfp4_moe_cutedsl/README.md`](../../../kernelSrcs/nvfp4_moe_cutedsl/README.md)).
 3. `python kernelSrcs/build_cutedsl.py --kernels nvfp4_moe --gpu_arch sm_110 --arch aarch64 --clean`
 4. Build the plugin with `-DENABLE_CUTE_DSL=nvfp4_moe -DCMAKE_CUDA_ARCHITECTURES=110a`.
 5. Run the SM110 plugin accuracy test with `EDGELLM_RUN_SM110_PLUGIN_ACCURACY=1`.

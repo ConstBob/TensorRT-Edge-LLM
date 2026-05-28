@@ -65,10 +65,6 @@ _SCRIPT_DIR = Path(__file__).parent.resolve()
 _DEFAULT_OUTPUT_DIR = (_SCRIPT_DIR / "../cpp/kernels/cuteDSLArtifact").resolve()
 _CUTLASS_DSL_VERSION = "4.5.1"
 _CUPY_VERSIONS = {12: ("cupy-cuda12x", "12.3.0"), 13: ("cupy-cuda13x", "13.6.0")}
-_SM110_PATCH_SCRIPT = (
-    _SCRIPT_DIR / "nvfp4_moe_cutedsl" / "patch_cutlass_dsl_sm110a.py"
-)
-
 # Common flag sets for FMHA variants
 _LLM = ["--is_causal", "--is_persistent", "--export_only", "--bottom_right_align"]
 _LLM_FP8 = _LLM + ["--in_dtype", "Float8E4M3FN"]
@@ -1005,39 +1001,6 @@ def _cutlass_dsl_install_hint(cuda_ver):
     return f"pip install '{package}=={_CUTLASS_DSL_VERSION}'"
 
 
-def _check_sm110_cutedsl_patch():
-    errors = []
-    try:
-        spec = importlib.util.find_spec("nvidia_cutlass_dsl")
-        if spec is None or spec.submodule_search_locations is None:
-            return ["nvidia_cutlass_dsl package is not importable"]
-        pkg_dir = Path(next(iter(spec.submodule_search_locations))).resolve()
-    except Exception as exc:
-        return [f"Could not locate nvidia_cutlass_dsl package: {exc}"]
-
-    tcgen05_dir = pkg_dir / "python_packages" / "cutlass" / "cute" / "nvgpu" / "tcgen05"
-    mma_path = tcgen05_dir / "mma.py"
-    copy_path = tcgen05_dir / "copy.py"
-
-    if not mma_path.exists():
-        errors.append(f"Missing {mma_path}")
-    elif "Arch.sm_110a" not in mma_path.read_text(encoding="utf-8"):
-        errors.append(f"{mma_path} does not include Arch.sm_110a in BlockScaledMmaOp.admissible_archs")
-
-    if not copy_path.exists():
-        errors.append(f"Missing {copy_path}")
-    elif "Arch.sm_110f" not in copy_path.read_text(encoding="utf-8"):
-        errors.append(f"{copy_path} does not allow the Arch.sm_110f family in _S2TCopyBase")
-
-    if errors:
-        errors.append(
-            "Fix: run "
-            f"{sys.executable} {_SM110_PATCH_SCRIPT} "
-            "from the Python environment used for AOT export."
-        )
-    return errors
-
-
 def check_dependencies(sm=None, selected_groups=None):
     errors = []
     selected_groups = set(selected_groups or [])
@@ -1097,9 +1060,6 @@ def check_dependencies(sm=None, selected_groups=None):
         importlib.metadata.version("cuda-python")
     except importlib.metadata.PackageNotFoundError:
         errors.append("cuda-python not found.\n  Fix: pip install cuda-python")
-
-    if sm == 110 and "nvfp4_moe" in selected_groups and lib_dir is not None:
-        errors.extend(_check_sm110_cutedsl_patch())
 
     if errors:
         print("Dependency check failed:\n" + "\n".join(f"  • {e}" for e in errors))

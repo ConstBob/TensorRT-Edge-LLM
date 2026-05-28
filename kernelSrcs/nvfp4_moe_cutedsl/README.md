@@ -30,15 +30,19 @@ Set up the AOT Python environment on Thor:
 
 ```bash
 python3 -m pip install 'nvidia-cutlass-dsl[cu13]==4.5.1' cupy-cuda13x==13.6.0 cuda-python
-python3 kernelSrcs/nvfp4_moe_cutedsl/patch_cutlass_dsl_sm110a.py --check
 ```
 
-Apply the patch first if the check fails:
+**CuTeDSL 4.5.1 SM110a admission patch (manual, one-time per env).**
+The 4.5.1 wheel does not yet admit `Arch.sm_110a` in two `tcgen05` modules,
+so edit the installed package files under
+`site-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/nvgpu/tcgen05/`:
 
-```bash
-python3 kernelSrcs/nvfp4_moe_cutedsl/patch_cutlass_dsl_sm110a.py
-python3 kernelSrcs/nvfp4_moe_cutedsl/patch_cutlass_dsl_sm110a.py --check
-```
+1. `mma.py` — append `Arch.sm_110a` to
+   `BlockScaledMmaOp.admissible_archs` (currently lists `sm_100a`, `sm_103a`).
+2. `copy.py` — in `_S2TCopyBase.is_supported`, extend the `Arch.sm_100f`
+   family check to also accept `Arch.sm_110a` / `Arch.sm_110f`.
+
+Remove this section once upstream CuTeDSL ships SM110a support natively.
 
 Generate the split FC1/FC2 artifact pack:
 
@@ -84,4 +88,3 @@ validated end-to-end through
 | `custom_pipeline.py` | SM110 CuTeDSL pipeline helper |
 | `cute_utils.py` | CuTeDSL utility helpers |
 | `moe_compat.py` | Compatibility helpers for the split SM110 path |
-| `patch_cutlass_dsl_sm110a.py` | Idempotent CuTeDSL 4.5.1 SM110a patch/preflight script |
