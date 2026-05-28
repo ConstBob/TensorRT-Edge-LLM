@@ -20,23 +20,6 @@
 #ifdef CUTE_DSL_NVFP4_MOE_ENABLED
 
 #include <cuda.h>
-// CUDA runtime 12.0–12.7 does not yet declare cudaLibrary_t / cudaLibraryUnload
-// even though the AOT-emitted CuTeDSL headers from CUDA 12.8+ refer to them.
-// When the build picks up an older runtime header we set
-// TRT_EDGELLM_CUDA_LIBRARY_T_COMPAT (see cmake/CuteDsl.cmake) and provide this
-// minimal shim that forwards to the driver-API cuLibraryUnload. The guard
-// TRT_EDGELLM_CUDA_LIBRARY_T_COMPAT_DECLARED makes the shim safe to include
-// from multiple translation units.
-#if defined(TRT_EDGELLM_CUDA_LIBRARY_T_COMPAT) && !defined(TRT_EDGELLM_CUDA_LIBRARY_T_COMPAT_DECLARED)
-#define TRT_EDGELLM_CUDA_LIBRARY_T_COMPAT_DECLARED
-#include <cuda_runtime.h>
-typedef CUlibrary cudaLibrary_t;
-static inline cudaError_t cudaLibraryUnload(cudaLibrary_t lib)
-{
-    CUresult r = cuLibraryUnload(lib);
-    return static_cast<cudaError_t>(r);
-}
-#endif
 
 #include "cutedsl_all.h"
 
