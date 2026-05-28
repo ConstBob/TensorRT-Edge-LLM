@@ -194,16 +194,14 @@ The model class names were checked against the installed `transformers==5.9.0` p
 | Qwen3.5/3.6-MoE | [`Qwen3_5MoeForConditionalGeneration`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py) | `qwen3_5_moe` -> `Qwen3_5MoeCausalLM` + `Qwen3_5VLVisualModel` | INT4 GPTQ, NVFP4 |
 | Nemotron3-MoE | [`NemotronHForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/nemotron_h/modeling_nemotron_h.py) | `nemotron_h` -> `NemotronHCausalLM` | NVFP4 only |
 
-For NVFP4 MoE exports, the `--nvfp4-moe-backend` flag selects the plugin backend:
-
-- `thor` — uses `Nvfp4MoePlugin` (SM100/101/110, CuTe DSL kernels). Default when checkpoint config does not specify.
-- `geforce` — uses `NvFP4MoEPluginGeforce` (SM120/121).
+NVFP4 MoE exports always emit the unified `Nvfp4MoePlugin`, which dispatches
+the SM110 split FC1/FC2 backend on Thor and the SM120/SM121 fused decode +
+prefill backend on consumer Blackwell:
 
 ```bash
 tensorrt-edgellm-export \
     /path/to/Qwen3-MoE-NVFP4 \
-    /tmp/qwen3_moe_onnx \
-    --nvfp4-moe-backend thor
+    /tmp/qwen3_moe_onnx
 ```
 
 <details>

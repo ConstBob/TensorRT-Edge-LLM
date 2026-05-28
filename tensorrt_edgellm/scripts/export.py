@@ -473,7 +473,6 @@ def _export_llm(model_dir: str,
                 eagle_base: bool = False,
                 fp8_embedding: bool = False,
                 reduced_vocab_dir: str = "",
-                nvfp4_moe_backend: "Optional[str]" = None,
                 mtp_base: bool = False,
                 externalize_weights: "list[str] | None" = None,
                 tp_size: int = 1) -> None:
@@ -512,7 +511,6 @@ def _export_llm(model_dir: str,
                 eagle_base=eagle_base,
                 key_remap=key_remap,
                 reduced_vocab_dir=reduced_vocab_dir or None,
-                nvfp4_moe_backend=nvfp4_moe_backend,
                 mtp_base=mtp_base,
                 tp_size=world,
                 tp_rank=rank,
@@ -1643,17 +1641,6 @@ def main() -> None:
         "Directory containing vocab_map.safetensors for LLM vocabulary reduction.",
     )
     p.add_argument(
-        "--nvfp4-moe-backend",
-        "--nvfp4_moe_backend",
-        dest="nvfp4_moe_backend",
-        choices=("thor", "geforce"),
-        default=None,
-        help=(
-            "Override NVFP4 MoE plugin backend for Qwen3 MoE export. "
-            "Choices: thor (Nvfp4MoePlugin) or geforce "
-            "(NvFP4MoEPluginGeforce). Default: checkpoint config, then thor."),
-    )
-    p.add_argument(
         "--mtp",
         action="store_true",
         help=
@@ -1756,7 +1743,6 @@ def main() -> None:
                                  mtp_base=args.mtp,
                                  fp8_embedding=args.fp8_embedding,
                                  reduced_vocab_dir=args.reduced_vocab_dir,
-                                 nvfp4_moe_backend=args.nvfp4_moe_backend,
                                  externalize_weights=externalize_weights,
                                  tp_size=args.tp_size)),
         (args.mtp, "mtp_draft", lambda out: _export_mtp_draft(model_dir, out)),
@@ -1810,9 +1796,6 @@ def main() -> None:
     for enabled, component, _ in stages:
         logger.info("  %-15s: %s", component, "yes" if enabled else "no")
     logger.info("FP8 embedding : %s", "yes" if args.fp8_embedding else "no")
-    logger.info(
-        "NVFP4 MoE backend: %s",
-        args.nvfp4_moe_backend if args.nvfp4_moe_backend else "config/default")
     logger.info("MTP capable   : %s", "yes" if has_mtp_draft else "no")
     logger.info("MTP export    : %s", "yes" if args.mtp else "no")
     logger.info("Reduced vocab : %s",

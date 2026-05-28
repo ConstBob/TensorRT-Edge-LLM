@@ -77,7 +77,7 @@ def export_prefill_moe_variant(args):
     activation = args.activation
     verbose = getattr(args, "verbose", False)
     is_gated = activation in ("swiglu", "geglu")
-    # v1 NvFP4MoEPluginGeforce consumes FP16 hidden states. BF16 is intentionally
+    # v1 Nvfp4MoePlugin consumes FP16 hidden states. BF16 is intentionally
     # deferred; when it returns, add --io_dtype {bf16,fp16} here and in the
     # sibling decode export script.
     io_dtype = cutlass.Float16

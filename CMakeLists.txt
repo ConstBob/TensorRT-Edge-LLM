@@ -61,7 +61,12 @@ endif()
 set_ifndef(CUDA_CTK_VERSION 12.8)
 set_ifndef(CUDA_DIR /usr/local/cuda-${CUDA_CTK_VERSION})
 
-if(NOT DEFINED AARCH64_BUILD)
+get_property(
+  _CMAKE_CUDA_ARCHITECTURES_SET
+  CACHE CMAKE_CUDA_ARCHITECTURES
+  PROPERTY VALUE
+  SET)
+if(NOT DEFINED AARCH64_BUILD AND NOT _CMAKE_CUDA_ARCHITECTURES_SET)
   set(CMAKE_CUDA_ARCHITECTURES 80;86;89)
   if(CUDA_CTK_VERSION VERSION_GREATER_EQUAL 12.8)
     list(APPEND CMAKE_CUDA_ARCHITECTURES 100a 120)
@@ -153,6 +158,8 @@ target_link_options(commonLibraryExt INTERFACE
 
 # Build Core libraries of the project. attentionPlugin shared library and
 # edgellmCore/edgellmBuilder static library will be generated.
+option(EDGELLM_BUILD_NVFP4_MOE_SM110_ONLY
+       "Build only the SM110 NvFP4 MoE plugin slice" OFF)
 add_subdirectory(cpp)
 
 # Build C++ examples to showcase the usage
@@ -163,7 +170,8 @@ option(BUILD_PYTHON_BINDINGS "Enable building Python pybind11 bindings" OFF)
 
 # CuTe DSL unified kernel option — declare here so it is always defined before
 # any subdirectory or include references it. Choices: OFF | ALL | fmha | gdn |
-# semicolon-separated group list (e.g. -DENABLE_CUTE_DSL=fmha;gdn).
+# nvfp4_moe | nvfp4_fused_moe | semicolon-separated group list
+# (e.g. -DENABLE_CUTE_DSL=fmha;gdn).
 set(ENABLE_CUTE_DSL
     "OFF"
     CACHE

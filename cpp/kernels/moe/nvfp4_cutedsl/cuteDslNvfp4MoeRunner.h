@@ -88,7 +88,7 @@ struct CuteDslNvfp4MoeParams
     int32_t maxRoutedRows{}; //!< Upper bound on max rows per expert; sets workspace padding.
 
     // Inputs (device). All weights use native CuTeDSL layouts; see
-    // cpp/plugins/nvfp4MoePluginGeforce/README.md for the exact shapes.
+    // cpp/plugins/nvfp4MoePlugin/README.md for the exact shapes.
     void const* hiddenStates{}; //!< FP16 [B,S,H] row-major.
     int32_t const* topkIds{};   //!< int32 [T*K].
     float const* topkWeights{}; //!< fp32  [T*K] (renormalized, sums to 1 per row).

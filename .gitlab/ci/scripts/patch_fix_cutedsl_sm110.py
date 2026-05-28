@@ -12,8 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Apply SM110 compatibility patches to an installed CuTeDSL package and
-to in-tree nvfp4_moe_cutedsl kernel sources.
+"""Apply SM110 compatibility patches to an installed CuTeDSL package.
 
 CI-only workaround invoked from `.gitlab/ci/cutedsl-jobs.yml` during the
 `build_cutedsl_sm110_artifact` job. Delete this script (and its call site)
@@ -65,44 +64,6 @@ def insert_after_unique(path: Path, anchor_line: str,
     print(f"  patched {path} (inserted after {anchor_line.strip()!r})")
 
 
-def replace_all(path: Path,
-                before: str,
-                after: str,
-                *,
-                min_count: int = 1) -> None:
-    """Replace every occurrence of `before` with `after`. Require at least `min_count`."""
-    text = _read(path)
-    n = text.count(before)
-    if n < min_count:
-        sys.exit(
-            f"FAIL: {path}: expected >= {min_count} occurrence(s) of {before!r}, found {n}. "
-            "CuTeDSL likely bumped — patch needs review.")
-    path.write_text(text.replace(before, after))
-    print(f"  patched {path} (replaced {n} occurrence(s) of {before!r})")
-
-
-def delete_lines_equal(path: Path,
-                       stripped: str,
-                       *,
-                       min_count: int = 1) -> None:
-    """Delete every line whose `.strip()` equals `stripped`. Require at least `min_count`."""
-    lines = _read(path).splitlines(keepends=True)
-    kept: list[str] = []
-    deleted = 0
-    for line in lines:
-        if line.strip() == stripped:
-            deleted += 1
-        else:
-            kept.append(line)
-    if deleted < min_count:
-        sys.exit(
-            f"FAIL: {path}: expected >= {min_count} line(s) matching {stripped!r}, "
-            f"deleted {deleted}. CuTeDSL likely bumped — patch needs review.")
-    path.write_text("".join(kept))
-    print(
-        f"  patched {path} (deleted {deleted} line(s) matching {stripped!r})")
-
-
 def discover_cutedsl_pkg_root() -> Path:
     """Locate the installed nvidia_cutlass_dsl package root in the current Python env."""
     try:
@@ -119,7 +80,7 @@ def main() -> None:
         "--repo-root",
         required=True,
         type=Path,
-        help="Repo root (contains kernelSrcs/nvfp4_moe_cutedsl/).",
+        help="Repo root.",
     )
     args = ap.parse_args()
 
@@ -140,23 +101,6 @@ def main() -> None:
         after=
         "if not (arch.is_family_of(Arch.sm_100f) or arch.is_family_of(Arch.sm_110f)):",
     )
-
-    print("Patching in-tree nvfp4_moe_cutedsl kernel sources…")
-    moe_dir = repo / "kernelSrcs/nvfp4_moe_cutedsl"
-    for fname in (
-            "blockscaled_contiguous_grouped_gemm_n_major.py",
-            "blockscaled_contiguous_grouped_gemm_finalize_n_major.py",
-    ):
-        f = moe_dir / fname
-        replace_all(f,
-                    "cute.arch.ProxyKind.async_shared",
-                    '"async.shared"',
-                    min_count=1)
-        replace_all(f,
-                    "cute.arch.SharedSpace.shared_cta",
-                    '"cta"',
-                    min_count=1)
-    delete_lines_equal(moe_dir / "utils.py", "T.f32(),", min_count=1)
 
     print("Invalidating CuTeDSL .pyc cache…")
     for pyc in pkg.rglob("*.pyc"):

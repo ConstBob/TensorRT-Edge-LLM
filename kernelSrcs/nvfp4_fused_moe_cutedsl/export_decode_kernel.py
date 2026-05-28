@@ -20,8 +20,7 @@ constructs CuTe tensors from raw pointers and runtime ``Int32``
 dimensions, making the exported C entry point shape-agnostic for
 num_tokens / max_rows / state_E / weight_E / K / N / top_k.  The MMA
 N-tile (``mma_tiler_n``) remains compile-time and is selected at build
-time via the ``--mma_tiler_n`` flag (n128 or n256 variants), following
-the pattern in ``kernelSrcs/nvfp4_moe_cutedsl/export_fc1_kernel.py``.
+time via the ``--mma_tiler_n`` flag (n128 or n256 variants).
 
 The decode kernel fuses route/pack + FC1 + activation + quantize +
 FC2 + scatter in a single resident-grid launch with a barrier between
@@ -78,7 +77,7 @@ def export_decode_moe_variant(args):
     activation = args.activation
     verbose = getattr(args, "verbose", False)
     is_gated = activation in ("swiglu", "geglu")
-    # v1 NvFP4MoEPluginGeforce consumes FP16 hidden states. BF16 is intentionally
+    # v1 Nvfp4MoePlugin consumes FP16 hidden states. BF16 is intentionally
     # deferred; when it returns, add --io_dtype {bf16,fp16} here and in the
     # sibling prefill export script.
     io_dtype = cutlass.Float16

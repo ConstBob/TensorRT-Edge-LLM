@@ -1,9 +1,11 @@
 # NvFP4 Fused MoE CuTe DSL Kernels (SM120/SM121)
 
-End-to-end fused Mixture-of-Experts kernels for Blackwell GeForce
-(SM120 / SM121). Each kernel fuses route/pack + FC1 + activation +
-quantize + FC2 + scatter into a single resident-grid launch, eliminating
-the host-side FC1/FC2 handoff of the decomposed `nvfp4_moe` pipeline.
+End-to-end fused Mixture-of-Experts kernels for Blackwell consumer
+GeForce silicon (SM120 / SM121). Each kernel fuses route/pack + FC1 +
+activation + quantize + FC2 + scatter into a single resident-grid launch,
+eliminating the host-side FC1/FC2 handoff of the SM110 decomposed
+`nvfp4_moe` pipeline. Both backends share the unified
+`Nvfp4MoePlugin` (see [`cpp/plugins/nvfp4MoePlugin/`](../../cpp/plugins/nvfp4MoePlugin/)).
 
 ## Shape support
 
@@ -135,7 +137,7 @@ pip install nvidia-cutlass-dsl==4.5.1
 ## TensorRT plugin
 
 The FP16 variants of this kernel family are wrapped as a TensorRT plugin at
-[`cpp/plugins/nvfp4MoePluginGeforce/`](../../cpp/plugins/nvfp4MoePluginGeforce/).
+[`cpp/plugins/nvfp4MoePlugin/`](../../cpp/plugins/nvfp4MoePlugin/).
 See that plugin's
-[`README.md`](../../cpp/plugins/nvfp4MoePluginGeforce/README.md) for the
+[`README.md`](../../cpp/plugins/nvfp4MoePlugin/README.md) for the
 supported-shapes contract and integration instructions.

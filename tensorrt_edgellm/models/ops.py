@@ -732,15 +732,14 @@ def _(q,
 def nvfp4_moe_plugin(
     router_logits: torch.Tensor,
     hidden_states: torch.Tensor,
-    hidden_global_scale: torch.Tensor,
-    up_weights: torch.Tensor,
-    up_block_scale: torch.Tensor,
-    up_global_scale: torch.Tensor,
-    down_weights: torch.Tensor,
-    down_block_scale: torch.Tensor,
-    down_global_scale: torch.Tensor,
-    up_block_scale_decode: torch.Tensor,
-    down_block_scale_decode: torch.Tensor,
+    fc1_qweights: torch.Tensor,
+    fc1_blocks_scale: torch.Tensor,
+    fc1_alpha: torch.Tensor,
+    fc2_qweights: torch.Tensor,
+    fc2_blocks_scale: torch.Tensor,
+    fc2_alpha: torch.Tensor,
+    input_global_scale: torch.Tensor,
+    down_input_scale: torch.Tensor,
     e_score_correction_bias: torch.Tensor,
     num_experts: int,
     top_k: int,
@@ -752,42 +751,6 @@ def nvfp4_moe_plugin(
     norm_topk_prob: int,
     routed_scaling_factor: float,
     routing_mode: int,
-) -> torch.Tensor:
-    return torch.zeros_like(hidden_states)
-
-
-@nvfp4_moe_plugin.register_fake
-def _(router_logits, hidden_states, hidden_global_scale, up_weights,
-      up_block_scale, up_global_scale, down_weights, down_block_scale,
-      down_global_scale, up_block_scale_decode, down_block_scale_decode,
-      e_score_correction_bias, num_experts, top_k, hidden_size, moe_inter_size,
-      activation_type, n_group, topk_group, norm_topk_prob,
-      routed_scaling_factor, routing_mode):
-    return torch.empty_like(hidden_states)
-
-
-# ---------------------------------------------------------------------------
-# Custom op: trt_edgellm::NvFP4MoEPluginGeforce
-# ---------------------------------------------------------------------------
-
-
-@torch.library.custom_op("trt_edgellm::NvFP4MoEPluginGeforce", mutates_args=())
-def nvfp4_moe_plugin_geforce(
-    router_logits: torch.Tensor,
-    hidden_states: torch.Tensor,
-    fc1_qweights: torch.Tensor,
-    fc1_blocks_scale: torch.Tensor,
-    fc1_alpha: torch.Tensor,
-    fc2_qweights: torch.Tensor,
-    fc2_blocks_scale: torch.Tensor,
-    fc2_alpha: torch.Tensor,
-    input_global_scale: torch.Tensor,
-    down_input_scale: torch.Tensor,
-    num_experts: int,
-    top_k: int,
-    hidden_size: int,
-    moe_inter_size: int,
-    activation_type: int,
     backend: int,
     io_dtype: int,
     max_routed_rows: int,
@@ -795,11 +758,13 @@ def nvfp4_moe_plugin_geforce(
     return torch.zeros_like(hidden_states)
 
 
-@nvfp4_moe_plugin_geforce.register_fake
+@nvfp4_moe_plugin.register_fake
 def _(router_logits, hidden_states, fc1_qweights, fc1_blocks_scale, fc1_alpha,
       fc2_qweights, fc2_blocks_scale, fc2_alpha, input_global_scale,
-      down_input_scale, num_experts, top_k, hidden_size, moe_inter_size,
-      activation_type, backend, io_dtype, max_routed_rows):
+      down_input_scale, e_score_correction_bias, num_experts, top_k,
+      hidden_size, moe_inter_size, activation_type, n_group, topk_group,
+      norm_topk_prob, routed_scaling_factor, routing_mode, backend, io_dtype,
+      max_routed_rows):
     return torch.empty_like(hidden_states)
 
 

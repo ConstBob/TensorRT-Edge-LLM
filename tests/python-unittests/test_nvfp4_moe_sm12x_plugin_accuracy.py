@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Accuracy tests for the GeForce NVFP4 fused MoE CuTeDSL backends."""
+"""Accuracy tests for the NVFP4 fused MoE CuTeDSL SM12x backends."""
 
 from __future__ import annotations
 
@@ -421,7 +421,7 @@ def _check_accuracy(actual, expected, percent_threshold: float = 0.97):
         ),
     ],
 )
-def test_nvfp4_fused_moe_geforce_matches_pytorch_reference(
+def test_nvfp4_fused_moe_sm12x_matches_pytorch_reference(
         torch_cuda, cutedsl_moe_helpers, case: _MoeCase):
     del torch_cuda
     activation = "swiglu"

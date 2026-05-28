@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,184 +14,181 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""AOT export script for the N-major contiguous grouped GEMM kernel (FC1).
+"""AOT export for split NVFP4 MoE FC1 gather grouped GEMM."""
 
-Exports ``BlockScaledContiguousGroupedGemmNMajorKernel.wrapper`` with
-9 pointers + 5 int64 + stream. Weight B bytes arrive in ``[L, K, N/2]``
-(N innermost) — what the plugin's ``populate_prefill_plugin_buffers``
-emits for ``fc_up_qweights``. The kernel performs an in-flight SMEM
-nibble transpose so ``tcgen05.mma`` still sees a K-major B operand.
-
-The kernel is compiled with ``raster_along_m=False`` (Thor-opt Phase-1
-scheduling): the persistent tile scheduler walks N-first within each
-M-tile, which gives ~2x FC1 speedup at Qwen3 SwiGLU T>=2048 EP=1 and
-near-parity with the K-major path at Nemotron. This matches the
-upstream ``cutedsl-nvfp4-moe`` repo's AOT exports, which now compile
-only this scheduling variant.
-
-Variant names: ``nvfp4_moe_fc1_{relu2,swiglu}_n{128,256}_{bf16,fp16}``.
-
-Usage (from kernelSrcs/):
-    python nvfp4_moe_cutedsl/export_fc1_kernel.py \
-        --activation relu2 \
-        --mma_tiler_n 128 \
-        --output_dtype bf16 \
-        --output_dir /tmp/staging \
-        --file_name nvfp4_moe_fc1_relu2_n128_bf16 \
-        --function_prefix nvfp4_moe_fc1_relu2_n128_bf16
-
-Usage (invoked by build_cutedsl.py — PYTHONPATH set automatically).
-"""
+from __future__ import annotations
 
 import argparse
 import os
 import sys
 
-import cupy as cp
 
-
-def export_contiguous_gemm_variant(args):
-    """Export a single N-major contiguous grouped GEMM kernel variant."""
+def export_fc1(args: argparse.Namespace) -> tuple[str, str]:
     import cuda.bindings.driver as cuda
+    import cupy as cp
     import cutlass
     import cutlass.cute as cute
 
-    from blockscaled_contiguous_grouped_gemm_n_major import (
-        BlockScaledContiguousGroupedGemmNMajorKernel,
+    globals().update({"cuda": cuda, "cutlass": cutlass, "cute": cute})
+
+    from export_common import (
+        M_TILE_SIZE,
+        SF_VEC_SIZE,
+        allocate,
+        atom_scale_bytes,
+        get_max_active_clusters,
+        make_ptr,
+        resolve_activation_type,
+        verify_export,
     )
-    from common import create_dummy_pointers, get_max_active_clusters, resolve_out_dtype
+    from blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
+        BlockScaledContiguousGatherGroupedGemmKernel,
+    )
 
     cp.cuda.Device(0).use()
 
-    sf_vec_size = 16
-    mma_tiler_mn = (128, args.mma_tiler_n)
+    activation_type = resolve_activation_type(args.activation)
+    is_swiglu = args.activation == "swiglu"
+    dummy_orig_m = args.dummy_tokens
+    dummy_m = M_TILE_SIZE * args.dummy_experts
+    dummy_k = args.dummy_hidden_size
+    dummy_n = args.dummy_intermediate_size * 2 if is_swiglu else args.dummy_intermediate_size
+    dummy_intermediate = dummy_n // 2 if is_swiglu else dummy_n
     cluster_shape_mn = (1, 1)
-    activation = args.activation
-    out_dtype = resolve_out_dtype(args.output_dtype)
-    verbose = getattr(args, "verbose", False)
+    mma_tiler_mn = (M_TILE_SIZE, args.mma_tiler_n)
 
-    print(f"N-major contiguous GEMM variant: activation={activation}, "
-          f"mma_tiler_mn={mma_tiler_mn}, output_dtype={args.output_dtype}")
+    buffers: list = []
+    a = allocate((dummy_orig_m, dummy_k // 2), cp.uint8, buffers)
+    b = allocate((args.dummy_experts, dummy_n, dummy_k // 2), cp.uint8, buffers)
+    a_sf = allocate((dummy_orig_m, dummy_k // SF_VEC_SIZE), cp.uint8, buffers)
+    b_sf = allocate(atom_scale_bytes(dummy_n, dummy_k, args.dummy_experts), cp.uint8, buffers)
+    c = allocate((dummy_m, dummy_intermediate // 2), cp.uint8, buffers)
+    c_sf = allocate(atom_scale_bytes(dummy_m, dummy_intermediate), cp.uint8, buffers)
+    alpha = allocate((args.dummy_experts,), cp.float32, buffers)
+    tile_group = allocate((dummy_m // M_TILE_SIZE,), cp.int32, buffers)
+    tile_limit = allocate((dummy_m // M_TILE_SIZE,), cp.int32, buffers)
+    token_map = allocate((dummy_m,), cp.int32, buffers)
+    num_tiles = allocate((1,), cp.int32, buffers)
+    input_global_scale = allocate((args.dummy_experts,), cp.float32, buffers)
+    down_input_scale = allocate((args.dummy_experts,), cp.float32, buffers)
 
-    # Thor-opt: walk N-first within each M-tile. See module docstring.
-    gemm = BlockScaledContiguousGroupedGemmNMajorKernel(
-        sf_vec_size=sf_vec_size,
-        mma_tiler_mn=mma_tiler_mn,
-        cluster_shape_mn=cluster_shape_mn,
-        activation=activation,
-        raster_along_m=False,
+    ptrs = (
+        make_ptr(cutlass.Float4E2M1FN, a.data.ptr, assumed_align=32),
+        make_ptr(cutlass.Float4E2M1FN, b.data.ptr, assumed_align=32),
+        make_ptr(cutlass.Float8E4M3FN, a_sf.data.ptr, assumed_align=16),
+        make_ptr(cutlass.Float8E4M3FN, b_sf.data.ptr, assumed_align=16),
+        make_ptr(cutlass.Float4E2M1FN, c.data.ptr, assumed_align=32),
+        make_ptr(cutlass.Float8E4M3FN, c_sf.data.ptr, assumed_align=16),
+        make_ptr(cutlass.Float32, alpha.data.ptr, assumed_align=16),
+        make_ptr(cutlass.Float32, input_global_scale.data.ptr, assumed_align=16),
+        make_ptr(cutlass.Float32, down_input_scale.data.ptr, assumed_align=16),
+        make_ptr(cutlass.Int32, tile_group.data.ptr),
+        make_ptr(cutlass.Int32, tile_limit.data.ptr),
+        make_ptr(cutlass.Int32, token_map.data.ptr),
+        make_ptr(cutlass.Int32, num_tiles.data.ptr),
     )
 
-    max_active_clusters = get_max_active_clusters(
-        cluster_shape_mn[0] * cluster_shape_mn[1])
-
-    # ---- Create typed pointers from uint8-backed GPU buffers ----
-    is_swiglu = activation == "swiglu"
-    dummy_n = 1856
-    dummy_n_out = dummy_n // 2 if is_swiglu else dummy_n
-
-    ptrs, _bufs = create_dummy_pointers(
-        sf_vec_size=sf_vec_size,
-        dummy_m=128, dummy_n=dummy_n, dummy_k=2688, dummy_l=16,
-        is_swiglu=is_swiglu,
-        out_dtype=out_dtype)
-
+    kernel = BlockScaledContiguousGatherGroupedGemmKernel(
+        sf_vec_size=SF_VEC_SIZE,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        vectorized_f32=True,
+        topk=args.dummy_top_k,
+        raster_along_m=False,
+        b_tensor_l_sizes=(args.dummy_experts,),
+        activation_type=activation_type,
+    )
     stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
 
-    print("Compiling contiguous grouped GEMM kernel via wrapper...")
+    @cute.jit
+    def single_b_wrapper(
+        a_ptr: cute.Pointer,
+        b_ptr: cute.Pointer,
+        a_sf_ptr: cute.Pointer,
+        b_sf_ptr: cute.Pointer,
+        c_ptr: cute.Pointer,
+        c_sf_ptr: cute.Pointer,
+        alpha_ptr: cute.Pointer,
+        input_global_scale_ptr: cute.Pointer,
+        down_input_scale_ptr: cute.Pointer,
+        tile_idx_to_group_idx_ptr: cute.Pointer,
+        tile_idx_to_mn_limit_ptr: cute.Pointer,
+        token_id_mapping_ptr: cute.Pointer,
+        num_non_exiting_tiles_ptr: cute.Pointer,
+        orig_m: cutlass.Int64,
+        m: cutlass.Int64,
+        n: cutlass.Int64,
+        k: cutlass.Int64,
+        tile_size: cutlass.Constexpr,
+        scaling_vector_size: cutlass.Constexpr,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+        activation_type: cutlass.Constexpr,
+    ):
+        return kernel.wrapper(
+            a_ptr,
+            (b_ptr,),
+            a_sf_ptr,
+            (b_sf_ptr,),
+            c_ptr,
+            c_sf_ptr,
+            (alpha_ptr,),
+            input_global_scale_ptr,
+            down_input_scale_ptr,
+            tile_idx_to_group_idx_ptr,
+            tile_idx_to_mn_limit_ptr,
+            token_id_mapping_ptr,
+            num_non_exiting_tiles_ptr,
+            orig_m,
+            m,
+            n,
+            k,
+            tile_size,
+            scaling_vector_size,
+            max_active_clusters,
+            stream,
+            activation_type=activation_type,
+        )
+
     compiled = cute.compile(
-        gemm.wrapper,
-        ptrs["a_ptr"], ptrs["b_ptr"], ptrs["a_sf_ptr"], ptrs["b_sf_ptr"],
-        ptrs["c_ptr"], ptrs["alpha_ptr"],
-        ptrs["tile_group_ptr"], ptrs["tile_mn_ptr"], ptrs["num_tiles_ptr"],
-        128, dummy_n, dummy_n_out, 2688, 16,
-        tile_size=128,
-        scaling_vector_size=sf_vec_size,
-        max_active_clusters=max_active_clusters,
+        single_b_wrapper,
+        *ptrs,
+        dummy_orig_m,
+        dummy_m,
+        dummy_n,
+        dummy_k,
+        tile_size=M_TILE_SIZE,
+        scaling_vector_size=SF_VEC_SIZE,
+        max_active_clusters=get_max_active_clusters(cluster_shape_mn),
         stream=stream,
+        activation_type=activation_type,
     )
 
     os.makedirs(args.output_dir, exist_ok=True)
-
-    print(f"Exporting to {args.output_dir}/{args.file_name}.[h|o]")
-    compiled.export_to_c(
-        file_path=args.output_dir,
-        file_name=args.file_name,
-        function_prefix=args.function_prefix,
-    )
-
-    # Verify output files
-    header = os.path.join(args.output_dir, f"{args.file_name}.h")
-    obj = os.path.join(args.output_dir, f"{args.file_name}.o")
-    ok = True
-    for path, label in [(header, "Header"), (obj, "Object")]:
-        if not os.path.isfile(path):
-            print(f"ERROR: {label} not found: {path}", file=sys.stderr)
-            ok = False
-        elif os.path.getsize(path) == 0:
-            print(f"ERROR: {label} is empty: {path}", file=sys.stderr)
-            ok = False
-    if not ok:
-        sys.exit(1)
-
-    print(f"  header: {os.path.getsize(header)} bytes")
-    print(f"  object: {os.path.getsize(obj)} bytes")
-
-    if verbose:
-        print("\n--- Generated Header (first 100 lines) ---")
-        with open(header) as f:
-            for i, line in enumerate(f):
-                if i >= 100:
-                    print("  ... (truncated)")
-                    break
-                print(f"  {line.rstrip()}")
-
-    return header, obj
+    compiled.export_to_c(args.output_dir, args.file_name, args.function_prefix)
+    return verify_export(args.output_dir, args.file_name)
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Export contiguous grouped GEMM kernel (FC1) for AOT compilation"
-    )
-    parser.add_argument(
-        "--activation", type=str, default="identity",
-        choices=["identity", "relu2", "swiglu"],
-        help="Activation function (default: identity for decomposed pipeline)"
-    )
-    parser.add_argument(
-        "--mma_tiler_n", type=int, required=True,
-        choices=[128, 256],
-        help="N-tile size for MMA (128 or 256)"
-    )
-    parser.add_argument(
-        "--output_dtype", type=str, default="bf16",
-        choices=["bf16", "fp16"],
-        help="Output element type (default: bf16)"
-    )
-    parser.add_argument(
-        "--output_dir", type=str, required=True,
-        help="Directory to write .h and .o files"
-    )
-    parser.add_argument(
-        "--file_name", type=str, required=True,
-        help="Base name for output files (without extension)"
-    )
-    parser.add_argument(
-        "--function_prefix", type=str, required=True,
-        help="C function name prefix"
-    )
-    parser.add_argument(
-        "--export_only", action="store_true",
-        help="Accepted for build_cutedsl.py compatibility (no-op)"
-    )
-    parser.add_argument(
-        "--verbose", action="store_true",
-        help="Print generated header content"
-    )
-    args = parser.parse_args()
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--activation", choices=["relu2", "swiglu"], required=True)
+    parser.add_argument("--mma_tiler_n", type=int, choices=[128, 256], required=True)
+    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--file_name", required=True)
+    parser.add_argument("--function_prefix", required=True)
+    parser.add_argument("--dummy-tokens", type=int, default=128)
+    parser.add_argument("--dummy-experts", type=int, default=8)
+    parser.add_argument("--dummy-top-k", type=int, default=2)
+    parser.add_argument("--dummy-hidden-size", type=int, default=256)
+    parser.add_argument("--dummy-intermediate-size", type=int, default=128)
+    parser.add_argument("--export_only", action="store_true")
+    return parser.parse_args()
 
-    export_contiguous_gemm_variant(args)
-    print("\nContiguous grouped GEMM kernel export completed successfully.")
+
+def main() -> int:
+    header, obj = export_fc1(parse_args())
+    print(f"Exported {header}")
+    print(f"Exported {obj}")
     return 0
 
 

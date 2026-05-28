@@ -16,8 +16,9 @@
  */
 
 // NVFP4 (E2M1) dequantization: converts packed FP4 values to FP16.
-// Separated from moe_marlin/marlin/dequant.h because FP4 support is
-// specific to the NVFP4 MoE decode path (requires CUDA >= 12.8).
+// Kept next to ``moe_marlin/marlin/dequant.h`` so the Marlin kernel template
+// keeps a single ``dequant<half2, ...>`` overload set. The FP4 specialization
+// requires CUDA >= 12.8 and is gated by ``SUPPORTS_FP4``.
 
 #pragma once
 #include "common/cudaMacros.h"

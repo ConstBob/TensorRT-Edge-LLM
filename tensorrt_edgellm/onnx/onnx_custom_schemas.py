@@ -1017,66 +1017,7 @@ _nvfp4_moe_plugin_schema = OpSchema(
     name="Nvfp4MoePlugin",
     domain="trt_edgellm",
     since_version=_SCHEMA_SINCE_VERSION,
-    doc=("NVFP4 MoE plugin: FP16 hidden + NVFP4 N-major weights. "
-         "Dispatches decode or prefill"),
-    inputs=[
-        OpSchema.FormalParameter("router_logits", "T1",
-                                 "Router logits (B*S, E)"),
-        OpSchema.FormalParameter("hidden_states", "T2",
-                                 "Hidden states (B, S, H)"),
-        OpSchema.FormalParameter("hidden_global_scale", "T1",
-                                 "Activation global scales (2,) [FC1, FC2]"),
-        OpSchema.FormalParameter("up_weights", "T3", "Up weights (E, H, I/2)"),
-        OpSchema.FormalParameter(
-            "up_block_scale", "T3",
-            "Up prefill block scales (E, padUp(I,128), padUp(H/16,4))"),
-        OpSchema.FormalParameter("up_global_scale", "T1",
-                                 "Up global scales (E,)"),
-        OpSchema.FormalParameter("down_weights", "T3",
-                                 "Down weights (E, I, H/2)"),
-        OpSchema.FormalParameter(
-            "down_block_scale", "T3",
-            "Down prefill block scales (E, padUp(H,128), padUp(I/16,4))"),
-        OpSchema.FormalParameter("down_global_scale", "T1",
-                                 "Down global scales (E,)"),
-        OpSchema.FormalParameter("up_block_scale_decode", "T3",
-                                 "Up decode block scales (E, H/16, I)"),
-        OpSchema.FormalParameter("down_block_scale_decode", "T3",
-                                 "Down decode block scales (E, I/16, H)"),
-        OpSchema.FormalParameter("e_score_correction_bias", "T1",
-                                 "Per-expert load-balancing bias (E,)"),
-    ],
-    outputs=[
-        OpSchema.FormalParameter("output", "T2", "Output [B, S, H] FP16"),
-    ],
-    type_constraints=[
-        ("T1", ["tensor(float)"], "FP32"),
-        ("T2", ["tensor(float16)"], "FP16"),
-        ("T3", ["tensor(int8)"], "INT8"),
-    ],
-    attributes=[
-        OpSchema.Attribute("num_experts", OpSchema.AttrType.INT),
-        OpSchema.Attribute("top_k", OpSchema.AttrType.INT),
-        OpSchema.Attribute("hidden_size", OpSchema.AttrType.INT),
-        OpSchema.Attribute("moe_inter_size", OpSchema.AttrType.INT),
-        OpSchema.Attribute("activation_type", OpSchema.AttrType.INT),
-        OpSchema.Attribute("n_group", OpSchema.AttrType.INT),
-        OpSchema.Attribute("topk_group", OpSchema.AttrType.INT),
-        OpSchema.Attribute("norm_topk_prob", OpSchema.AttrType.INT),
-        OpSchema.Attribute("routed_scaling_factor", OpSchema.AttrType.FLOAT),
-        OpSchema.Attribute("routing_mode", OpSchema.AttrType.INT),
-    ],
-)
-
-# ---------------------------------------------------------------------------
-# trt_edgellm::NvFP4MoEPluginGeforce
-# ---------------------------------------------------------------------------
-
-_nvfp4_moe_plugin_geforce_schema = OpSchema(
-    name="NvFP4MoEPluginGeforce",
-    domain="trt_edgellm",
-    since_version=_SCHEMA_SINCE_VERSION,
-    doc=("GeForce CuTeDSL NVFP4 MoE plugin: FP16 hidden states, FP4 expert "
+    doc=("NVFP4 MoE plugin (CuTeDSL): FP16 hidden states, FP4 expert "
          "weights, and FP8 block scales in 6D MMA layout."),
     inputs=[
         OpSchema.FormalParameter("router_logits", "T_ROUTER",
@@ -1101,6 +1042,8 @@ _nvfp4_moe_plugin_geforce_schema = OpSchema(
                                  "FC1 activation scales [E] FP32"),
         OpSchema.FormalParameter("down_input_scale", "T_ROUTER",
                                  "FC2 activation scales [E] FP32"),
+        OpSchema.FormalParameter("e_score_correction_bias", "T_ROUTER",
+                                 "Router correction bias [E] FP32"),
     ],
     outputs=[
         OpSchema.FormalParameter("output", "T_HIDDEN",
@@ -1117,6 +1060,11 @@ _nvfp4_moe_plugin_geforce_schema = OpSchema(
         OpSchema.Attribute("hidden_size", OpSchema.AttrType.INT),
         OpSchema.Attribute("moe_inter_size", OpSchema.AttrType.INT),
         OpSchema.Attribute("activation_type", OpSchema.AttrType.INT),
+        OpSchema.Attribute("n_group", OpSchema.AttrType.INT),
+        OpSchema.Attribute("topk_group", OpSchema.AttrType.INT),
+        OpSchema.Attribute("norm_topk_prob", OpSchema.AttrType.INT),
+        OpSchema.Attribute("routed_scaling_factor", OpSchema.AttrType.FLOAT),
+        OpSchema.Attribute("routing_mode", OpSchema.AttrType.INT),
         OpSchema.Attribute("backend", OpSchema.AttrType.INT),
         OpSchema.Attribute("io_dtype", OpSchema.AttrType.INT),
         OpSchema.Attribute("max_routed_rows", OpSchema.AttrType.INT),
@@ -1210,7 +1158,6 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _gated_delta_net_schema,
     _int4_moe_plugin_schema,
     _nvfp4_moe_plugin_schema,
-    _nvfp4_moe_plugin_geforce_schema,
     _fused_gemm_allreduce_plugin_schema,
 )
 

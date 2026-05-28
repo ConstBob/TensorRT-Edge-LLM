@@ -31,6 +31,7 @@
 #   fmha     — enable only the FMHA group
 #   gdn      — enable only the GDN group
 #   fmha;gdn — semicolon-separated list of groups (CMake list syntax)
+#   nvfp4_moe — decomposed split FC1/FC2 NVFP4 MoE backend (SM110/Thor today)
 #
 # Usage:
 #   include(cmake/CuteDsl.cmake)
@@ -51,7 +52,7 @@ set(ENABLE_CUTE_DSL
     "OFF"
     CACHE
       STRING
-      "CuTe DSL kernels: OFF, ALL, or semicolon-separated group list (fmha;gdn)"
+      "CuTe DSL kernels: OFF, ALL, or semicolon-separated group list (fmha;gdn;nvfp4_moe)"
 )
 
 set(CUTE_DSL_ARTIFACT_TAG
