@@ -47,6 +47,8 @@ Json makeBaseConfig(
     config["hidden_size"] = 768;
     config["vocab_size"] = 32000;
     config["kv_cache_dtype"] = "fp16";
+    config["spec_decode_type"] = "none";
+    config["engine_role"] = "llm";
 
     Json bc;
     bc["max_batch_size"] = maxBatchSize;
@@ -55,13 +57,14 @@ Json makeBaseConfig(
     bc["max_lora_rank"] = 0;
     if (specDecodeMaxVerifyTreeSize > 0)
     {
-        config["model_type"] = "eagle3_base";
-        bc["eagle_base"] = true;
+        config["spec_decode_type"] = "eagle3";
+        config["engine_role"] = "base";
+        bc["spec_base"] = true;
         bc["max_verify_tree_size"] = specDecodeMaxVerifyTreeSize;
     }
     else
     {
-        bc["eagle_base"] = false;
+        bc["spec_base"] = false;
     }
     config["builder_config"] = bc;
     return config;
@@ -76,7 +79,8 @@ Json makeBaseConfig(
 Json makeDraftConfig(int32_t /*maxVerifyTreeSize*/, int32_t maxDraftTreeSize, int32_t maxBatchSize = 2)
 {
     Json config;
-    config["model_type"] = "eagle3_draft";
+    config["spec_decode_type"] = "eagle3";
+    config["engine_role"] = "draft";
     config["num_hidden_layers"] = 1;
     config["num_key_value_heads"] = 4;
     config["head_dim"] = 64;
@@ -89,6 +93,7 @@ Json makeDraftConfig(int32_t /*maxVerifyTreeSize*/, int32_t maxDraftTreeSize, in
     bc["max_batch_size"] = maxBatchSize;
     bc["max_input_len"] = 128;
     bc["max_kv_cache_capacity"] = 256;
+    bc["spec_draft"] = true;
     bc["max_draft_tree_size"] = maxDraftTreeSize;
     config["builder_config"] = bc;
     return config;
@@ -97,7 +102,8 @@ Json makeDraftConfig(int32_t /*maxVerifyTreeSize*/, int32_t maxDraftTreeSize, in
 Json makeHybridDFlashBaseConfig(int32_t maxVerifyTreeSize, int32_t maxBatchSize = 2)
 {
     Json config = makeBaseConfig(maxVerifyTreeSize, /*maxDraft=*/0, maxBatchSize);
-    config["model_type"] = "dflash_base";
+    config["spec_decode_type"] = "dflash";
+    config["engine_role"] = "base";
     config["num_attention_layers"] = 8;
     config["num_linear_attn_layers"] = 4;
     config["recurrent_state_num_heads"] = 4;
@@ -115,7 +121,8 @@ Json makeHybridDFlashBaseConfig(int32_t maxVerifyTreeSize, int32_t maxBatchSize 
 Json makeDenseDFlashBaseConfig(int32_t maxVerifyTreeSize, int32_t maxBatchSize = 2)
 {
     Json config = makeBaseConfig(maxVerifyTreeSize, /*maxDraft=*/0, maxBatchSize);
-    config["model_type"] = "dflash_base";
+    config["spec_decode_type"] = "dflash";
+    config["engine_role"] = "base";
     config["dflash_config"]
         = Json{{"block_size", 16}, {"mask_token_id", 248070}, {"target_layer_ids", Json::array({1, 8})}};
     return config;
@@ -124,7 +131,8 @@ Json makeDenseDFlashBaseConfig(int32_t maxVerifyTreeSize, int32_t maxBatchSize =
 Json makeDFlashDraftConfig(int32_t maxDraftTreeSize, int32_t maxBatchSize = 2)
 {
     Json config = makeDraftConfig(/*maxVerify=*/0, maxDraftTreeSize, maxBatchSize);
-    config["model_type"] = "dflash_draft";
+    config["spec_decode_type"] = "dflash";
+    config["engine_role"] = "draft";
     config["dflash_config"]
         = Json{{"block_size", 16}, {"mask_token_id", 248070}, {"target_layer_ids", Json::array({1, 8})}};
     return config;
