@@ -55,7 +55,7 @@ def _generate_merge_lora_commands(
 
     merge_lora_shell = _tensorrt_edgellm_module_shell(
         "tensorrt_edgellm.scripts.merge_lora", [
-            f"--model_dir={config.get_base_torch_model_dir()}",
+            f"--model_dir={config.get_torch_model_dir()}",
             f"--lora_dir={config.get_lora_adapter_dir()}",
             f"--output_dir={config.get_merged_model_dir()}"
         ])
@@ -87,6 +87,7 @@ def _llm_quant_shell(
         "llm",
         f"--model_dir={input_model_dir}",
         f"--output_dir={output_model_dir}",
+        f"--dataset={config.get_cnn_dailymail_dataset_dir()}",
     ]
     if needs_weight_quant:
         args.append(f"--quantization={config.llm_precision}")
@@ -131,7 +132,7 @@ def _generate_quantization_commands(
         if config.merge_lora:
             input_model_dir = config.get_merged_model_dir()
         else:
-            input_model_dir = config.get_base_torch_model_dir()
+            input_model_dir = config.get_torch_model_dir()
 
         if needs_weight_quant or needs_visual_quant or needs_audio_quant:
             output_model_dir = config.get_quantized_model_dir()
@@ -155,8 +156,8 @@ def _draft_quant_shell(config: TestConfig) -> str:
             "Cannot find tensorrt-edge-llm root. "
             "Set LLM_SDK_DIR to the SDK root, or run from a full tensorrt-edge-llm tree."
         )
-    base_model_dir = config.get_base_torch_model_dir()
-    draft_model_dir = config.get_draft_torch_model_dir()
+    base_model_dir = config.get_torch_model_dir()
+    draft_model_dir = config.get_draft_model_dir()
     quantized_draft_dir = config.get_quantized_draft_model_dir()
     args: List[str] = [
         "python3",
@@ -208,7 +209,11 @@ def _generate_tensorrt_edgellm_draft_export_for_vocab_commands(
     if not (config.is_eagle and config.reduced_vocab_size):
         return commands
 
-    draft_model_dir = config.get_eagle_draft_checkpoint_dir()
+    if (config.draft_llm_precision and config.draft_llm_precision != "fp16"
+            and config.draft_llm_precision != "int4_gptq"):
+        draft_model_dir = config.get_quantized_draft_model_dir()
+    else:
+        draft_model_dir = config.get_draft_model_dir()
     draft_onnx_dir = config.get_draft_onnx_dir()
 
     edgellm_root = get_tensorrt_edgellm_root()
@@ -238,7 +243,7 @@ def _generate_vocab_reduction_commands(
     if not config.reduced_vocab_size:
         return commands
 
-    torch_model_dir = config.get_base_torch_model_dir()
+    torch_model_dir = config.get_torch_model_dir()
     reduced_vocab_dir = config.get_reduced_vocab_dir()
 
     vocab_reduction_args = [
@@ -309,22 +314,13 @@ def generate_post_tensorrt_edgellm_commands(
         ]
         commands.append((insert_cmd, 120))
 
-        # Support quantized/export variant names by falling back to the base model name.
-        base_model_name = TestConfig._strip_model_quant_suffixes(
-            config.model_name)
-        model_name_candidates = [config.model_name, base_model_name]
-        lora_model_name = None
-        for candidate in dict.fromkeys(model_name_candidates):
-            if candidate in AVAILABLE_LORA_WEIGHTS:
-                lora_model_name = AVAILABLE_LORA_WEIGHTS[candidate]
-                break
-        if lora_model_name is None:
+        if config.model_name not in AVAILABLE_LORA_WEIGHTS:
             raise ValueError(
-                f"No LoRA weights available for {config.model_name} "
-                f"(also tried base model: {base_model_name}). "
+                f"No LoRA weights available for {config.model_name}. "
                 f"Please add it to AVAILABLE_LORA_WEIGHTS")
         edgellm_data_dir = os.environ.get("EDGELLM_DATA_DIR",
                                           "/scratch.edge_llm_cache")
+        lora_model_name = AVAILABLE_LORA_WEIGHTS[config.model_name]
         lora_weights_dir = _find_directory(edgellm_data_dir, lora_model_name,
                                            DEFAULT_SEARCH_DEPTH)
         if not lora_weights_dir:

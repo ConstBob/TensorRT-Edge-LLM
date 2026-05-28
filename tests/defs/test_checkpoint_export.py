@@ -29,7 +29,7 @@ from conftest import EnvironmentConfig
 from pytest_helpers import run_command, timer_context
 
 from .config import (DEFAULT_SEARCH_DEPTH, ModelType, TaskType, TestConfig,
-                     _find_directory, strip_model_quant_suffixes)
+                     _find_directory)
 from .utils.command_generation import AVAILABLE_LORA_WEIGHTS
 
 
@@ -173,15 +173,21 @@ def test_checkpoint_eagle_export(test_param: str, test_logger,
         raise FileNotFoundError(
             f"Base model checkpoint not found: {base_torch_dir}")
 
-    # Locate pre-quantized draft model checkpoint (hub name or local quant output)
-    draft_torch_dir = config.get_eagle_draft_checkpoint_dir()
+    # Locate pre-quantized draft model checkpoint
+    draft_torch_dir = config.get_draft_model_dir()
     if not os.path.exists(draft_torch_dir):
         raise FileNotFoundError(
             f"Draft model checkpoint not found: {draft_torch_dir}")
 
-    # Export params include quantized hub suffixes to locate the checkpoint, but
-    # downstream ONNX paths are keyed by the base model name.
-    config.model_name = strip_model_quant_suffixes(config.model_name)
+    # Strip quantization suffix from model_name so ONNX paths match downstream
+    # build/inference tests.  Export test params include the quantization type
+    # in the model name (e.g. "Qwen3-1.7B-NVFP4") to locate the pre-quantized
+    # checkpoint, but downstream tests use the base model name ("Qwen3-1.7B").
+    _QUANT_SUFFIXES = ("-NVFP4", "-FP8", "-FP8-KV", "-INT8-SQ", "-INT4-AWQ")
+    for suffix in _QUANT_SUFFIXES:
+        if config.model_name.endswith(suffix):
+            config.model_name = config.model_name[:-len(suffix)]
+            break
 
     # Output directories
     llm_onnx_dir = config.get_llm_onnx_dir()

@@ -307,7 +307,11 @@ def run_tensorrt_edgellm_draft_export(config: TestConfig,
     is created). Otherwise uses the original torch draft checkpoint. The
     ONNX output is copied to ``config.get_draft_onnx_dir()``.
     """
-    draft_model_dir = config.get_eagle_draft_checkpoint_dir()
+    if (config.draft_llm_precision and config.draft_llm_precision != "fp16"
+            and config.draft_llm_precision != "int4_gptq"):
+        draft_model_dir = config.get_quantized_draft_model_dir()
+    else:
+        draft_model_dir = config.get_draft_model_dir()
 
     draft_onnx_dir = config.get_draft_onnx_dir()
     os.makedirs(draft_onnx_dir, exist_ok=True)

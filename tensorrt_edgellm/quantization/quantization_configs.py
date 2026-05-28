@@ -308,7 +308,13 @@ def _merge_quant_cfg(target: Any, extra: Any) -> Any:
                 pattern = "default" if quantizer_name == "*" else quantizer_name
                 merged_value: Dict[str, Any] = {}
                 if isinstance(item.get("cfg"), dict):
-                    merged_value.update(item["cfg"])
+                    cfg_payload = item["cfg"]
+                    if "enable" in cfg_payload:
+                        raise ValueError(
+                            "Cannot losslessly convert ModelOpt list-style "
+                            "quant_cfg to dict form when cfg contains "
+                            "'enable'.")
+                    merged_value.update(cfg_payload)
                 if "enable" in item:
                     merged_value["enable"] = item["enable"]
                 target[pattern] = merged_value
