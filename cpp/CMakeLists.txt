@@ -76,17 +76,6 @@ file(GLOB_RECURSE KERNELS_CU_SRCS "kernels/*.cu")
 # Exclude MoE Marlin ops/sm80 - compiled only via include from moeMarlin.cu
 list(FILTER KERNELS_CU_SRCS EXCLUDE REGEX
      "marlin_moe_wna16/(ops|sm80_kernel_float16_u4_float16)\\.cu$")
-if(EDGELLM_BUILD_NVFP4_MOE_SM110_ONLY)
-  message(STATUS "Building SM110 NvFP4 MoE plugin slice only")
-  set(KERNELS_CPP_SRCS
-      "${CMAKE_CURRENT_SOURCE_DIR}/kernels/moe/nvfp4_cutedsl/cuteDslNvfp4MoeSm110Runner.cpp"
-  )
-  set(KERNELS_CU_SRCS
-      "${CMAKE_CURRENT_SOURCE_DIR}/kernels/moe/moeTopkSoftmaxKernels.cu"
-      "${CMAKE_CURRENT_SOURCE_DIR}/kernels/moe/fp4SupportKernels/buildLayout.cu"
-      "${CMAKE_CURRENT_SOURCE_DIR}/kernels/moe/fp4SupportKernels/fp4Quantize.cu"
-  )
-endif()
 file(GLOB_RECURSE SAMPLER_CPP_SRCS "sampler/*.cpp")
 file(GLOB_RECURSE SAMPLER_CU_SRCS "sampler/*.cu")
 file(GLOB_RECURSE MULTIMODAL_CPP_SRCS "multimodal/*.cpp")
@@ -138,11 +127,6 @@ target_link_libraries(edgellmBuilder PRIVATE ${NV_ONNX_PARSER_LIB} dl)
 
 # Generate the TensorRT plugin shared libraries
 file(GLOB_RECURSE PLUGIN_CPP_SRCS "plugins/*.cpp")
-if(EDGELLM_BUILD_NVFP4_MOE_SM110_ONLY)
-  set(PLUGIN_CPP_SRCS
-      "${CMAKE_CURRENT_SOURCE_DIR}/plugins/nvfp4MoePlugin/nvfp4MoePlugin.cpp"
-      "${CMAKE_CURRENT_SOURCE_DIR}/plugins/utils/pluginUtils.cpp")
-endif()
 add_library(NvInfer_edgellm_plugin SHARED ${PLUGIN_CPP_SRCS})
 set_target_properties(NvInfer_edgellm_plugin PROPERTIES VERSION 1.0 SOVERSION 1)
 set_target_properties(NvInfer_edgellm_plugin PROPERTIES LIBRARY_OUTPUT_DIRECTORY

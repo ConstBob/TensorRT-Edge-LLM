@@ -1,22 +1,5 @@
 # Release Notes
 
-## Unreleased
-- Unified NVFP4 MoE plugin: dropped the legacy `Nvfp4MoePlugin` Marlin / N-major
-  CuTeDSL path and merged its replacement (formerly `NvFP4MoEPluginGeforce`)
-  back under the canonical `Nvfp4MoePlugin` name. The single plugin now
-  dispatches the SM110 split FC1/FC2 backend on Thor and the SM120/SM121 fused
-  decode + prefill backend on consumer Blackwell.
-- Removed the `--nvfp4-moe-backend` CLI flag from `tensorrt-edgellm-export`
-  and the corresponding `QuantConfig.nvfp4_moe_backend` field.
-- Renamed the CuTeDSL artifact group `nvfp4_moe_geforce_sm110` to `nvfp4_moe`
-  (the user-facing `-DENABLE_CUTE_DSL=nvfp4_moe` knob and the
-  `CUTE_DSL_NVFP4_MOE_ENABLED` compile define) and the CMake option
-  `EDGELLM_BUILD_NVFP4_MOE_GEFORCE_SM110_ONLY` to
-  `EDGELLM_BUILD_NVFP4_MOE_SM110_ONLY`.
-- **ABI break**: the TensorRT plugin name changed from
-  `NvFP4MoEPluginGeforce` to `Nvfp4MoePlugin`. Engines built against the
-  previous name need to be rebuilt.
-
 ## 0.7.1
 - Added Qwen3.5 Multi-Token Prediction (MTP) support with performance improvements
 - Added Alpamayo-1 support
