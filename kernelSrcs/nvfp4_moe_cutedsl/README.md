@@ -50,9 +50,6 @@ pairs):
 | `nvfp4_moe_sm110_fc1_swiglu_n128` | SwiGLU | 128 |
 | `nvfp4_moe_sm110_fc1_swiglu_n256` | SwiGLU | 256 |
 
-FC1 emits FP4 (packed nibbles + FP8 scales) for the intermediate activation,
-so there is no `bf16` / `fp16` axis to pick from on this side.
-
 ### FC2 — Finalize with scatter-reduce (2 variants)
 
 | Variant | MMA N-tile |
@@ -107,10 +104,14 @@ the AOT export will fail until the wheel is patched. Edit the installed
 package files under
 `site-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/nvgpu/tcgen05/`:
 
-1. `mma.py` — append `Arch.sm_110a` to `BlockScaledMmaOp.admissible_archs`
-   (currently lists `Arch.sm_100a`, `Arch.sm_103a`).
+1. `mma.py` — append **both** `Arch.sm_101a` and `Arch.sm_110a` to
+   `BlockScaledMmaOp.admissible_archs` (currently lists `Arch.sm_100a`,
+   `Arch.sm_103a`). `Arch.sm_101a` is required because CuTeDSL internally
+   remaps `sm_110` to `sm_101a` for the blockscaled MMA path; both must be
+   admissible for the SM110 AOT export to succeed.
 2. `copy.py` — in `_S2TCopyBase.is_supported`, extend the `Arch.sm_100f`
-   family check to also accept `Arch.sm_110a` / `Arch.sm_110f`.
+   family check to also accept the `Arch.sm_110f` family (which covers
+   `Arch.sm_110a`).
 
 Remove this section once upstream CuTeDSL ships SM110a support natively.
 
