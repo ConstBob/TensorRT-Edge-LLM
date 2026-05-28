@@ -78,6 +78,12 @@ public:
     static constexpr int32_t kHiddenSizeAlignment = 128;
     static constexpr int32_t kCompiledNumExperts = 128;
     static constexpr int32_t kMaxTopK = 8;
+    //! Hidden size the fused decode setup kernel
+    //! (fp4BuildLayoutAndQuantizeRoutedLinearSFDecode) was specialized for.
+    //! useFastDecodeSetup() only fires when the runtime hidden size matches
+    //! this value -- any other shape falls back to the general gather + GEMM
+    //! path. Keep in sync with the kernel that backs the fused setup.
+    static constexpr int32_t kFastDecodeHiddenSize = 2048;
 
     CuteDslNvfp4MoeSm110Runner() = default;
     ~CuteDslNvfp4MoeSm110Runner() = default;

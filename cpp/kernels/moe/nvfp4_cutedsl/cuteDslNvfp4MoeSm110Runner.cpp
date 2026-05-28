@@ -125,9 +125,11 @@ bool useFastDecodeSetup(CuteDslNvfp4MoeSm110Params const& params)
 {
     // The fused fp4BuildLayoutAndQuantizeRoutedLinearSFDecode path is only correct when the
     // shape matches the kernel it was compiled for: a single-token decode step with
-    // (topK, numExperts, hiddenSize) = (kMaxTopK, kCompiledNumExperts, 2048).
+    // (topK, numExperts, hiddenSize) =
+    // (kMaxTopK, kCompiledNumExperts, kFastDecodeHiddenSize).
     return params.numTokens == 1 && params.topK == CuteDslNvfp4MoeSm110Runner::kMaxTopK
-        && params.numExperts == CuteDslNvfp4MoeSm110Runner::kCompiledNumExperts && params.hiddenSize == 2048;
+        && params.numExperts == CuteDslNvfp4MoeSm110Runner::kCompiledNumExperts
+        && params.hiddenSize == CuteDslNvfp4MoeSm110Runner::kFastDecodeHiddenSize;
 }
 } // namespace
 
