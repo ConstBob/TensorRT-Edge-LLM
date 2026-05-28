@@ -132,6 +132,13 @@ public:
     //! @brief Return a profile shape (min/opt/max) for a named binding.
     nvinfer1::Dims getProfileShape(char const* name, int32_t profileIndex, nvinfer1::OptProfileSelector selector) const;
 
+    //! @brief Attach a TRT profiler to the execution context.
+    //!
+    //! The profiler receives per-layer timing callbacks during enqueueV3.
+    //! Must be called before execute() for the profiler to receive data.
+    //! Passing nullptr detaches any previously set profiler.
+    void setProfiler(nvinfer1::IProfiler* profiler) noexcept;
+
     //! @brief Access the underlying TRT engine for generic introspection.
     nvinfer1::ICudaEngine const& getEngine() const noexcept;
 

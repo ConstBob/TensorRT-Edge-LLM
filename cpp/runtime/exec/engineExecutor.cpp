@@ -255,6 +255,11 @@ nvinfer1::Dims EngineExecutor::getProfileShape(
     return mEngine->getProfileShape(name, profileIndex, selector);
 }
 
+void EngineExecutor::setProfiler(nvinfer1::IProfiler* profiler) noexcept
+{
+    mContext->setProfiler(profiler);
+}
+
 nvinfer1::ICudaEngine const& EngineExecutor::getEngine() const noexcept
 {
     return *mEngine;
