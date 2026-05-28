@@ -33,17 +33,17 @@ namespace builder
 
 //! Configuration structure for LLM model building.
 //! Contains all parameters needed to configure the TensorRT engine building process
-//! for Large Language Models, including standard LLMs and Eagle models.
+//! for Large Language Models, including standard and speculative-decoding engines.
 struct LLMBuilderConfig
 {
     int64_t maxInputLen{1024};        //!< Maximum input sequence length for the model
-    bool eagleDraft{false};           //!< Whether this is an Eagle draft model
-    bool eagleBase{false};            //!< Whether this is an Eagle base model
+    bool specDraft{false};            //!< Whether this is a speculative-decoding draft model
+    bool specBase{false};             //!< Whether this is a speculative-decoding base model
     int64_t maxBatchSize{4};          //!< Maximum batch size for inference
     int64_t maxLoraRank{0};           //!< Maximum LoRA rank (0 = no LoRA support)
     int64_t maxKVCacheCapacity{4096}; //!< Maximum KV cache capacity (sequence length)
-    int64_t maxVerifyTreeSize{60}; //!< Maximum length of input_ids passed into Eagle base model for tree verification
-    int64_t maxDraftTreeSize{60};  //!< Maximum length of input_ids passed into Eagle draft model for draft generation
+    int64_t maxVerifyTreeSize{60}; //!< Maximum length of input_ids passed into spec base model for verification
+    int64_t maxDraftTreeSize{60};  //!< Maximum length of input_ids passed into spec draft model for draft generation
     bool useTrtNativeOps{false};   //!< Whether to use TensorRT native operations instead of custom plugin
     bool profilingDetailed{false}; //!< Enable detailed profiling verbosity for layer info extraction
 
@@ -53,18 +53,18 @@ struct LLMBuilderConfig
     {
         Json json;
         json["max_input_len"] = maxInputLen;
-        json["eagle_draft"] = eagleDraft;
-        json["eagle_base"] = eagleBase;
+        json["spec_draft"] = specDraft;
+        json["spec_base"] = specBase;
         json["max_batch_size"] = maxBatchSize;
         json["max_lora_rank"] = maxLoraRank;
         json["max_kv_cache_capacity"] = maxKVCacheCapacity;
         json["trt_native_ops"] = useTrtNativeOps;
-        // Only include Eagle-specific fields when Eagle is enabled
-        if (eagleBase)
+        // Only include speculative-decoding limits for the engine role that owns them.
+        if (specBase)
         {
             json["max_verify_tree_size"] = maxVerifyTreeSize;
         }
-        if (eagleDraft)
+        if (specDraft)
         {
             json["max_draft_tree_size"] = maxDraftTreeSize;
         }
@@ -82,13 +82,21 @@ struct LLMBuilderConfig
         {
             config.maxInputLen = json["max_input_len"];
         }
-        if (json.contains("eagle_draft"))
+        if (json.contains("spec_draft"))
         {
-            config.eagleDraft = json["eagle_draft"];
+            config.specDraft = json["spec_draft"];
         }
-        if (json.contains("eagle_base"))
+        else if (json.contains("eagle_draft"))
         {
-            config.eagleBase = json["eagle_base"];
+            config.specDraft = json["eagle_draft"];
+        }
+        if (json.contains("spec_base"))
+        {
+            config.specBase = json["spec_base"];
+        }
+        else if (json.contains("eagle_base"))
+        {
+            config.specBase = json["eagle_base"];
         }
         if (json.contains("max_batch_size"))
         {
@@ -124,17 +132,17 @@ struct LLMBuilderConfig
         std::ostringstream oss;
         oss << "LLMBuilderConfig:\n";
         oss << "  maxInputLen: " << maxInputLen << "\n";
-        oss << "  eagleDraft: " << (eagleDraft ? "true" : "false") << "\n";
-        oss << "  eagleBase: " << (eagleBase ? "true" : "false") << "\n";
+        oss << "  specDraft: " << (specDraft ? "true" : "false") << "\n";
+        oss << "  specBase: " << (specBase ? "true" : "false") << "\n";
         oss << "  maxBatchSize: " << maxBatchSize << "\n";
         oss << "  maxLoraRank: " << maxLoraRank << "\n";
         oss << "  maxKVCacheCapacity: " << maxKVCacheCapacity << "\n";
-        // Only show Eagle-specific fields when Eagle is enabled
-        if (eagleBase)
+        // Only show speculative-decoding limits for the engine role that owns them.
+        if (specBase)
         {
             oss << "  maxVerifyTreeSize: " << maxVerifyTreeSize << "\n";
         }
-        if (eagleDraft)
+        if (specDraft)
         {
             oss << "  maxDraftTreeSize: " << maxDraftTreeSize << "\n";
         }
@@ -144,7 +152,7 @@ struct LLMBuilderConfig
 
 //! Builder class for Large Language Model TensorRT engines.
 //! Handles the complete process of building TensorRT engines from ONNX models
-//! for various types of LLMs including standard models, Eagle models, and VLMs.
+//! for various types of LLMs including standard, speculative-decoding, and VLM models.
 class LLMBuilder
 {
 public:
@@ -198,7 +206,7 @@ private:
     bool setupCommonProfiles(
         nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
 
-    //! Set up optimization profiles for vanilla (non-Eagle) LLM models.
+    //! Set up optimization profiles for vanilla LLM models.
     //! Configures input IDs and last token IDs for standard transformer models.
     //! @param contextProfile Optimization profile for context processing
     //! @param generationProfile Optimization profile for generation processing
@@ -206,12 +214,12 @@ private:
     bool setupVanillaProfiles(
         nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
 
-    //! Set up optimization profiles for Eagle models.
-    //! Configures Eagle-specific inputs like hidden states and attention masks.
+    //! Set up optimization profiles for speculative tree-decoding models.
+    //! Configures hidden-state and attention-mask inputs used by spec decode.
     //! @param contextProfile Optimization profile for context processing
     //! @param generationProfile Optimization profile for generation processing
     //! @return true if setup was successful, false otherwise
-    bool setupEagleProfiles(
+    bool setupSpecDecodeProfiles(
         nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
 
     //! Set up optimization profiles for DFlash draft models.
@@ -311,7 +319,7 @@ private:
     bool copyVocabMappingFiles();
 
     //! Copy embedding table file to the engine directory.
-    //! Copies embedding.safetensors file for eagleBase and vanilla LLM models.
+    //! Copies embedding.safetensors file for spec base and vanilla LLM models.
     //! @return true if copying was successful, false otherwise
     bool copyEmbeddingFile();
 

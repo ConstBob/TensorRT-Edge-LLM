@@ -209,7 +209,7 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath);
 
 //! Parse a SpecDecode draft engine's `config.json` into an `LLMEngineConfig`.
 //!
-//! The draft config carries a reduced field set (no `builder_config.eagle_base`,
+//! The draft config carries a reduced field set (no `builder_config.spec_base`,
 //! its own `draft_vocab_size`). `max_draft_tree_size` is required and is
 //! parsed into `cfg.maxDraftTreeSize`; `cfg.maxVerifyTreeSize` stays at 0 on
 //! the draft side. `isSpecDecodeBase` is left false because this is the

@@ -259,6 +259,87 @@ def test_checkpoint_eagle_export(test_param: str, test_logger,
         pytest.fail(f"Draft ONNX model not found: {draft_onnx}")
 
 
+def test_checkpoint_dflash_export(test_param: str, test_logger,
+                                  env_config: EnvironmentConfig):
+    """Export DFlash base + draft models via tensorrt_edgellm.scripts.export."""
+
+    config = TestConfig.from_param_string(test_param, ModelType.LLM,
+                                          TaskType.EXPORT, env_config)
+
+    base_torch_dir = config.get_torch_model_dir()
+    if not os.path.exists(base_torch_dir):
+        raise FileNotFoundError(
+            f"Base model checkpoint not found: {base_torch_dir}")
+
+    draft_torch_dir = config.get_dflash_draft_model_dir()
+    if not os.path.exists(draft_torch_dir):
+        raise FileNotFoundError(
+            f"DFlash draft model checkpoint not found: {draft_torch_dir}")
+
+    llm_onnx_dir = config.get_llm_onnx_dir()
+    draft_onnx_dir = config.get_draft_onnx_dir()
+    os.makedirs(llm_onnx_dir, exist_ok=True)
+    os.makedirs(draft_onnx_dir, exist_ok=True)
+
+    tmp_base = tempfile.mkdtemp(prefix="dflash_base_export_")
+    tmp_draft = tempfile.mkdtemp(prefix="dflash_draft_export_")
+
+    try:
+        base_cmd = [
+            "python3",
+            "-m",
+            "tensorrt_edgellm.scripts.export",
+            base_torch_dir,
+            tmp_base,
+            "--dflash-base",
+            "--dflash-draft-dir",
+            draft_torch_dir,
+        ]
+        _run_checkpoint_export(
+            base_cmd, 1200, test_logger,
+            f"Exporting DFlash base {config.model_name} via the checkpoint exporter"
+        )
+
+        base_llm_out = os.path.join(tmp_base, "llm")
+        if not os.path.isdir(base_llm_out):
+            pytest.fail(f"DFlash base export did not produce llm/ in {tmp_base}")
+        shutil.copytree(base_llm_out, llm_onnx_dir, dirs_exist_ok=True)
+
+        draft_cmd = [
+            "python3",
+            "-m",
+            "tensorrt_edgellm.scripts.export",
+            base_torch_dir,
+            tmp_draft,
+            "--dflash-draft",
+            "--dflash-draft-dir",
+            draft_torch_dir,
+        ]
+        _run_checkpoint_export(
+            draft_cmd, 1200, test_logger,
+            f"Exporting DFlash draft {config.draft_model_id} via the checkpoint exporter"
+        )
+
+        draft_output = os.path.join(tmp_draft, "dflash_draft")
+        if not os.path.isdir(draft_output):
+            pytest.fail(
+                f"DFlash draft export did not produce dflash_draft/ in {tmp_draft}"
+            )
+        shutil.copytree(draft_output, draft_onnx_dir, dirs_exist_ok=True)
+
+    finally:
+        shutil.rmtree(tmp_base, ignore_errors=True)
+        shutil.rmtree(tmp_draft, ignore_errors=True)
+
+    base_onnx = os.path.join(llm_onnx_dir, "model.onnx")
+    if not os.path.exists(base_onnx):
+        pytest.fail(f"DFlash base ONNX not found: {base_onnx}")
+
+    draft_onnx = os.path.join(draft_onnx_dir, "model.onnx")
+    if not os.path.exists(draft_onnx):
+        pytest.fail(f"DFlash draft ONNX not found: {draft_onnx}")
+
+
 def test_checkpoint_mtp_export(test_param: str, test_logger,
                                env_config: EnvironmentConfig):
     """Export MTP base + draft from a single checkpoint via --mtp flag."""

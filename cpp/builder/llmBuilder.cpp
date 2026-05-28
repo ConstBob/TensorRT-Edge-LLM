@@ -211,11 +211,11 @@ bool LLMBuilder::build()
 
     // Determine engine file name
     std::string engineFileName;
-    if (mBuilderConfig.eagleDraft)
+    if (mBuilderConfig.specDraft)
     {
         engineFileName = "spec_draft.engine";
     }
-    else if (mBuilderConfig.eagleBase)
+    else if (mBuilderConfig.specBase)
     {
         engineFileName = "spec_base.engine";
     }
@@ -311,8 +311,8 @@ bool LLMBuilder::parseConfig()
             role.c_str(), specType.c_str());
         return false;
     }
-    if ((mBuilderConfig.eagleDraft && role != "draft") || (mBuilderConfig.eagleBase && role != "base")
-        || (!mBuilderConfig.eagleDraft && !mBuilderConfig.eagleBase && role != "llm"))
+    if ((mBuilderConfig.specDraft && role != "draft") || (mBuilderConfig.specBase && role != "base")
+        || (!mBuilderConfig.specDraft && !mBuilderConfig.specBase && role != "llm"))
     {
         LOG_ERROR("Build mode does not match config: engine_role='%s' (use --specBase for base, --specDraft for "
                   "draft, and neither flag for vanilla LLM).",
@@ -408,9 +408,9 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
     result &= setupCommonProfiles(*contextProfile, *generationProfile);
 
     // Setup model-specific profiles
-    if (mBuilderConfig.eagleBase || mBuilderConfig.eagleDraft)
+    if (mBuilderConfig.specBase || mBuilderConfig.specDraft)
     {
-        result &= setupEagleProfiles(*contextProfile, *generationProfile);
+        result &= setupSpecDecodeProfiles(*contextProfile, *generationProfile);
     }
     else
     {
@@ -516,28 +516,28 @@ bool LLMBuilder::setupVanillaProfiles(
     return result;
 }
 
-bool LLMBuilder::setupEagleProfiles(
+bool LLMBuilder::setupSpecDecodeProfiles(
     nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
 {
-    // TRT-native-ops + EAGLE is a partially-wired path: the Python export
+    // TRT-native-ops + speculative decoding is a partially-wired path: the Python export
     // emits a 4D bool `attention_mask` [batch, 1, seq_len, seq_len + past_len]
-    // (see `llm_model_trtnative.py` with `is_eagle_base=True`), and the
+    // (see `llm_model_trtnative.py` with `is_eagle_base=True`), and only the
     // `prepareEagleBaseTreeDecodingInputsTrtNative` kernel exists
     // (`cpp/kernels/speculative/eagleUtilKernels.{h,cu}`). However the
-    // builder's EAGLE profile setup below and the runtime dispatch in
-    // `EagleDecoder::runBaseModelVerification` both
+    // builder's speculative profile setup below and the runtime dispatch in
+    // spec-decode runtime paths
     // hardcode the plugin-path 3D packed-INT32 mask layout. Attempting to
     // build this combination produces a cryptic TRT error:
     //
     //   "Dynamic-shaped input tensor attention_mask has 4 dimensions but
     //    profile 0 has 3 dimensions"
     //
-    // Fail fast with an actionable message until the full TRT-native+EAGLE
+    // Fail fast with an actionable message until the full TRT-native + spec-decode
     // path (builder profile + registry + runtime dispatch) is completed.
-    if (mBuilderConfig.useTrtNativeOps && (mBuilderConfig.eagleBase || mBuilderConfig.eagleDraft))
+    if (mBuilderConfig.useTrtNativeOps && (mBuilderConfig.specBase || mBuilderConfig.specDraft))
     {
         LOG_ERROR(
-            "TRT-native-ops + EAGLE speculative decoding is not yet supported. "
+            "TRT-native-ops + speculative decoding is not yet supported. "
             "Re-export the engine ONNX with trt_native_ops=False (plugin attention path).");
         return false;
     }
@@ -545,7 +545,7 @@ bool LLMBuilder::setupEagleProfiles(
     bool result = true;
 
     int const maxTokens
-        = mBuilderConfig.eagleDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
+        = mBuilderConfig.specDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
 
     // Input embeddings
     result &= setOptimizationProfile(&contextProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
@@ -561,7 +561,7 @@ bool LLMBuilder::setupEagleProfiles(
     result &= setOptimizationProfile(&generationProfile, binding_names::kLastTokenIds, createDims({1, 1}),
         createDims({mBuilderConfig.maxBatchSize, maxTokens / 2}), createDims({mBuilderConfig.maxBatchSize, maxTokens}));
 
-    if (mBuilderConfig.eagleDraft)
+    if (mBuilderConfig.specDraft)
     {
         // Hidden states from draft
         result &= setOptimizationProfile(&contextProfile, binding_names::kDraftModelHiddenStates,
@@ -584,7 +584,7 @@ bool LLMBuilder::setupEagleProfiles(
     }
 
     // Attention mask and position ID
-    if (mBuilderConfig.eagleDraft || mBuilderConfig.eagleBase)
+    if (mBuilderConfig.specDraft || mBuilderConfig.specBase)
     {
         int32_t const attnMaskAlignSize = 32;
         result &= setOptimizationProfile(&contextProfile, binding_names::kAttentionMask, createDims({1, 1, 1}),
@@ -712,10 +712,10 @@ bool LLMBuilder::setupDeepstackProfiles(nvinfer1::IOptimizationProfile& contextP
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
 
-        if (mBuilderConfig.eagleBase || mBuilderConfig.eagleDraft)
+        if (mBuilderConfig.specBase || mBuilderConfig.specDraft)
         {
             int const maxTokens
-                = mBuilderConfig.eagleDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
+                = mBuilderConfig.specDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
             result &= setOptimizationProfile(&generationProfile, deepstackInputName.c_str(),
                 createDims({1, 1, mHiddenSize}), createDims({mBuilderConfig.maxBatchSize, maxTokens / 2, mHiddenSize}),
                 createDims({mBuilderConfig.maxBatchSize, maxTokens, mHiddenSize}));
@@ -1038,11 +1038,11 @@ bool LLMBuilder::copyConfig()
 {
     // Determine config file name based on model type
     std::string configFileName;
-    if (mBuilderConfig.eagleDraft)
+    if (mBuilderConfig.specDraft)
     {
         configFileName = "draft_config.json";
     }
-    else if (mBuilderConfig.eagleBase)
+    else if (mBuilderConfig.specBase)
     {
         configFileName = "base_config.json";
     }
@@ -1076,8 +1076,8 @@ bool LLMBuilder::copyConfig()
 
 bool LLMBuilder::copyTokenizerFiles()
 {
-    // Eagle3 draft model does not need tokenizer files
-    if (mBuilderConfig.eagleDraft)
+    // Speculative draft models use the base model tokenizer.
+    if (mBuilderConfig.specDraft)
     {
         return true;
     }
@@ -1160,8 +1160,8 @@ bool LLMBuilder::copyVocabMappingFiles()
 
 bool LLMBuilder::copyEmbeddingFile()
 {
-    // Eagle draft model uses shared embedding table from base model, so skip copying
-    if (mBuilderConfig.eagleDraft)
+    // Speculative draft models use the base model embedding table.
+    if (mBuilderConfig.specDraft)
     {
         return true;
     }

@@ -39,8 +39,8 @@ enum LLMBuildOptionId : int
     DEBUG = 706,
     MAX_BATCH_SIZE = 707,
     MAX_LORA_RANK = 708,
-    EAGLE_DRAFT = 709,
-    EAGLE_BASE = 710,
+    SPEC_DRAFT = 709,
+    SPEC_BASE = 710,
     MAX_VERIFY_TREE_SIZE = 711,
     MAX_DRAFT_TREE_SIZE = 712,
     PROFILING_DETAILED = 713
@@ -56,8 +56,8 @@ struct LLMBuildArgs
     bool debug{false};
     int64_t maxBatchSize{4};
     int64_t maxLoraRank{0}; // Default to 0 means no LoRA
-    bool eagleDraft{false};
-    bool eagleBase{false};
+    bool specDraft{false};
+    bool specBase{false};
     int64_t maxVerifyTreeSize{60};
     int64_t maxDraftTreeSize{60};
     bool profilingDetailed{false}; // Enable detailed profiling verbosity for layer info extraction
@@ -85,8 +85,9 @@ void printUsage(char const* programName)
     std::cerr << "  --debug                   Use debug mode, which outputs more logs." << std::endl;
     std::cerr << "  --maxLoraRank             Maximum LoRA rank for dynamic LoRA adaptation. Default = 0 (no LoRA)"
               << std::endl;
-    std::cerr << "  --specDraft               Build as speculative decoding draft model (EAGLE/MTP)" << std::endl;
-    std::cerr << "  --specBase                Build as speculative decoding base model (EAGLE/MTP)" << std::endl;
+    std::cerr << "  --specDraft               Build as speculative decoding draft model (EAGLE/MTP/DFlash)"
+              << std::endl;
+    std::cerr << "  --specBase                Build as speculative decoding base model (EAGLE/MTP/DFlash)" << std::endl;
     std::cerr << "  --maxVerifyTreeSize       Maximum input_ids tokens for base model verification. Default = 60"
               << std::endl;
     std::cerr << "  --maxDraftTreeSize        Maximum input_ids tokens for draft model generation. Default = 60"
@@ -107,10 +108,10 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
         {"debug", no_argument, 0, LLMBuildOptionId::DEBUG},
         {"maxBatchSize", required_argument, 0, LLMBuildOptionId::MAX_BATCH_SIZE},
         {"maxLoraRank", required_argument, 0, LLMBuildOptionId::MAX_LORA_RANK},
-        {"specDraft", no_argument, 0, LLMBuildOptionId::EAGLE_DRAFT},
-        {"eagleDraft", no_argument, 0, LLMBuildOptionId::EAGLE_DRAFT}, // deprecated alias
-        {"specBase", no_argument, 0, LLMBuildOptionId::EAGLE_BASE},
-        {"eagleBase", no_argument, 0, LLMBuildOptionId::EAGLE_BASE}, // deprecated alias
+        {"specDraft", no_argument, 0, LLMBuildOptionId::SPEC_DRAFT},
+        {"eagleDraft", no_argument, 0, LLMBuildOptionId::SPEC_DRAFT}, // deprecated alias
+        {"specBase", no_argument, 0, LLMBuildOptionId::SPEC_BASE},
+        {"eagleBase", no_argument, 0, LLMBuildOptionId::SPEC_BASE}, // deprecated alias
         {"maxVerifyTreeSize", required_argument, 0, LLMBuildOptionId::MAX_VERIFY_TREE_SIZE},
         {"maxDraftTreeSize", required_argument, 0, LLMBuildOptionId::MAX_DRAFT_TREE_SIZE},
         {"profilingDetailed", no_argument, 0, LLMBuildOptionId::PROFILING_DETAILED}, {0, 0, 0, 0}};
@@ -168,8 +169,8 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
                 args.maxLoraRank = std::stoi(optarg);
             }
             break;
-        case LLMBuildOptionId::EAGLE_DRAFT: args.eagleDraft = true; break;
-        case LLMBuildOptionId::EAGLE_BASE: args.eagleBase = true; break;
+        case LLMBuildOptionId::SPEC_DRAFT: args.specDraft = true; break;
+        case LLMBuildOptionId::SPEC_BASE: args.specBase = true; break;
         case LLMBuildOptionId::MAX_VERIFY_TREE_SIZE:
             if (optarg)
             {
@@ -229,8 +230,8 @@ int main(int argc, char** argv)
     config.maxKVCacheCapacity = args.maxKVCacheCapacity;
     config.maxBatchSize = args.maxBatchSize;
     config.maxLoraRank = args.maxLoraRank;
-    config.eagleDraft = args.eagleDraft;
-    config.eagleBase = args.eagleBase;
+    config.specDraft = args.specDraft;
+    config.specBase = args.specBase;
     config.maxVerifyTreeSize = args.maxVerifyTreeSize;
     config.maxDraftTreeSize = args.maxDraftTreeSize;
     config.profilingDetailed = args.profilingDetailed;
