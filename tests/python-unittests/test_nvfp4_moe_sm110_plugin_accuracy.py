@@ -65,9 +65,9 @@ class Sm110CaseConfig:
     activation_type: int = 2
     scale_mode: str = "config"
     # Number of input tokens. ``num_tokens=1`` exercises the SM110 fast-decode
-    # fused setup path (only fires for hidden_size=2048 per
-    # cuteDslNvfp4MoeSm110Runner.cpp::useFastDecodeSetup); ``num_tokens>1``
-    # exercises the general gather + grouped-GEMM path.
+    # fused setup path (cuteDslNvfp4MoeSm110Runner.cpp::useFastDecodeSetup
+    # gates on numTokens == 1 alone now); ``num_tokens>1`` exercises the
+    # general gather + grouped-GEMM path.
     num_tokens: int = 1
 
 

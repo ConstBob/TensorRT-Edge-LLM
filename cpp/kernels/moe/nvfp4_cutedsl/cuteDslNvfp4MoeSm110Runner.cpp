@@ -123,13 +123,16 @@ inline void* offsetPtr(void* base, size_t offset)
 
 bool useFastDecodeSetup(CuteDslNvfp4MoeSm110Params const& params)
 {
-    // The fused fp4BuildLayoutAndQuantizeRoutedLinearSFDecode path is only correct when the
-    // shape matches the kernel it was compiled for: a single-token decode step with
-    // (topK, numExperts, hiddenSize) =
-    // (kMaxTopK, kCompiledNumExperts, kFastDecodeHiddenSize).
-    return params.numTokens == 1 && params.topK == CuteDslNvfp4MoeSm110Runner::kMaxTopK
-        && params.numExperts == CuteDslNvfp4MoeSm110Runner::kCompiledNumExperts
-        && params.hiddenSize == CuteDslNvfp4MoeSm110Runner::kFastDecodeHiddenSize;
+    // numTokens == 1 is the only runtime distinction between the fused
+    // fp4BuildLayoutAndQuantizeRoutedLinearSFDecode setup and the general
+    // (buildLayoutGpu + fp4QuantizeRoutedLinearSF) path: the fused kernel's
+    // host launcher rejects M != 1. The remaining bounds the fused kernel
+    // needs (topK <= kMaxDecodeExperts, localNumExperts <= kMaxDecodeExperts,
+    // hiddenSize % kSfVecSize == 0) are already strictly tighter under
+    // canImplement() -- topK <= kMaxTopK = 8, numExperts == kCompiledNumExperts
+    // = 128, hiddenSize % kHiddenSizeAlignment = 128 -- so no extra gate is
+    // needed here.
+    return params.numTokens == 1;
 }
 } // namespace
 
