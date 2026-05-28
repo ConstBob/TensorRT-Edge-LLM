@@ -132,8 +132,8 @@ std::string parseEngineRole(Json const& configJson)
     {
         return engineRole;
     }
-    throw std::runtime_error("parseEngineConfig: invalid engine_role '" + engineRole
-        + "'. Allowed values: llm, base, draft.");
+    throw std::runtime_error(
+        "parseEngineConfig: invalid engine_role '" + engineRole + "'. Allowed values: llm, base, draft.");
 }
 
 void validateDFlashTargetLayerIds(

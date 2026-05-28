@@ -174,8 +174,9 @@ void launchDFlashTargetKVCacheUpdate(half const* kDelta, half const* vDelta, hal
     dim3 const grid(deltaLen, numKVHeads, batchSize);
     dim3 const block(threadsPerToken);
 
-    dflashTargetKVCacheUpdateKernel<<<grid, block, 0, stream>>>(kDelta, vDelta, kvCache, cosSinCache, deltaStartPositions,
-        deltaLengths, deltaLen, numKVHeads, headDim, maxSeqLen, rotaryDim, cosSinBatch, cosSinSeqLen);
+    dflashTargetKVCacheUpdateKernel<<<grid, block, 0, stream>>>(kDelta, vDelta, kvCache, cosSinCache,
+        deltaStartPositions, deltaLengths, deltaLen, numKVHeads, headDim, maxSeqLen, rotaryDim, cosSinBatch,
+        cosSinSeqLen);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -252,8 +253,8 @@ void launchDFlashPrepareProposalInputs(int32_t const* oldDraftCacheLengths, int3
 // Grid: (batchSize)
 // Block: (verifySize)
 
-__global__ void dflashPrepareBaseVerifyInputsKernel(int32_t const* __restrict__ baseKVCacheLengths,
-    int32_t verifySize, int32_t* __restrict__ packedAttentionMask, int32_t* __restrict__ attentionPosId,
+__global__ void dflashPrepareBaseVerifyInputsKernel(int32_t const* __restrict__ baseKVCacheLengths, int32_t verifySize,
+    int32_t* __restrict__ packedAttentionMask, int32_t* __restrict__ attentionPosId,
     int64_t* __restrict__ selectTokenIndices, int32_t* __restrict__ contextLengths)
 {
     int32_t const b = blockIdx.x;

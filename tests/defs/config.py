@@ -553,8 +553,7 @@ class TestConfig:
                 # Parse dflash-{draft_id}[-{draft_precision}[-lm{draft_lm_head}]].
                 if i + 1 >= len(remaining_parts):
                     raise ValueError(
-                        f"Missing draft model id after dflash in: {param_str}"
-                    )
+                        f"Missing draft model id after dflash in: {param_str}")
                 i += 1
                 parsed_params['draft_model_id'] = remaining_parts[i]
 
@@ -764,8 +763,8 @@ class TestConfig:
                 if self.draft_llm_precision is not None and self.draft_lm_head_precision is None:
                     self.draft_lm_head_precision = "fp16"
                 if self.eagle_draft_top_k is None:
-                    self.eagle_draft_top_k = 1 if (
-                        self.is_mtp or self.is_dflash) else 10
+                    self.eagle_draft_top_k = 1 if (self.is_mtp
+                                                   or self.is_dflash) else 10
                 if self.eagle_draft_step is None:
                     self.eagle_draft_step = 1 if self.is_dflash else (
                         3 if self.is_mtp else 6)
@@ -1295,8 +1294,7 @@ class TestConfig:
                 raise ValueError(
                     "draft_llm_precision not set for DFlash engine")
             prefix = (
-                f"llm-dflash-{self.draft_model_id}-{self.draft_llm_precision}"
-            )
+                f"llm-dflash-{self.draft_model_id}-{self.draft_llm_precision}")
         elif self.is_eagle:
             if self.draft_model_id is None:
                 raise ValueError("draft_model_id not set for EAGLE engine")

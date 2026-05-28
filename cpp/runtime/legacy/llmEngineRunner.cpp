@@ -584,9 +584,8 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson) noexcept
         mConfig.maxSupportedInputLength = builderConfig["max_input_len"].get<int32_t>();
         mConfig.maxKVCacheCapacity = builderConfig["max_kv_cache_capacity"].get<int32_t>();
         mConfig.maxSupportedLoraRank = builderConfig["max_lora_rank"].get<int32_t>();
-        mConfig.enableEagleSpecDecode = builderConfig.contains("spec_base")
-            ? builderConfig["spec_base"].get<bool>()
-            : builderConfig["eagle_base"].get<bool>();
+        mConfig.enableEagleSpecDecode = builderConfig.contains("spec_base") ? builderConfig["spec_base"].get<bool>()
+                                                                            : builderConfig["eagle_base"].get<bool>();
 
         // Collect RoPE configuration
         mConfig.ropeConfig = collectRopeConfig(configJson);

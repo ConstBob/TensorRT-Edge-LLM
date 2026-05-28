@@ -302,7 +302,8 @@ def test_checkpoint_dflash_export(test_param: str, test_logger,
 
         base_llm_out = os.path.join(tmp_base, "llm")
         if not os.path.isdir(base_llm_out):
-            pytest.fail(f"DFlash base export did not produce llm/ in {tmp_base}")
+            pytest.fail(
+                f"DFlash base export did not produce llm/ in {tmp_base}")
         shutil.copytree(base_llm_out, llm_onnx_dir, dirs_exist_ok=True)
 
         draft_cmd = [

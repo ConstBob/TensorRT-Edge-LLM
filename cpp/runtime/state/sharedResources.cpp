@@ -38,11 +38,9 @@ bool needsBaseVerifyIntermediateStates(DeploymentConfig const& bundle)
     switch (bundle.base.specDecodeType)
     {
     case SpecDecodeMode::kMTP:
-    case SpecDecodeMode::kDFlash:
-        return true;
+    case SpecDecodeMode::kDFlash: return true;
     case SpecDecodeMode::kEAGLE:
-    case SpecDecodeMode::kNONE:
-        return false;
+    case SpecDecodeMode::kNONE: return false;
     }
     return false;
 }
@@ -184,9 +182,8 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
     // writes per-token recurrent/conv snapshots; after accept, the decoder
     // scatters only the accepted prefix into the persistent state pools.
     {
-        int32_t const baseMaxIntermediateSeqLen = needsBaseVerifyIntermediateStates(bundle)
-            ? bundle.specConfig->maxVerifySize
-            : 0;
+        int32_t const baseMaxIntermediateSeqLen
+            = needsBaseVerifyIntermediateStates(bundle) ? bundle.specConfig->maxVerifySize : 0;
         rt::KVCacheManager::Config kvCfg{
             /*.numAttentionLayers=*/static_cast<int32_t>(bundle.base.kvLayerConfigs.size()),
             /*.maxBatchSize=*/bundle.base.maxSupportedBatchSize,

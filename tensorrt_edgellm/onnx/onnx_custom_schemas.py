@@ -1232,7 +1232,8 @@ _dflash_target_kv_cache_update_schema = OpSchema(
         ),
         OpSchema.FormalParameter(
             name="delta_lengths",
-            description="Per-batch delta lengths [B] INT32 for multi-batch guard",
+            description=
+            "Per-batch delta lengths [B] INT32 for multi-batch guard",
             type_str="tensor(int32)",
         ),
     ],

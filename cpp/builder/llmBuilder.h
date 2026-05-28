@@ -42,10 +42,10 @@ struct LLMBuilderConfig
     int64_t maxBatchSize{4};          //!< Maximum batch size for inference
     int64_t maxLoraRank{0};           //!< Maximum LoRA rank (0 = no LoRA support)
     int64_t maxKVCacheCapacity{4096}; //!< Maximum KV cache capacity (sequence length)
-    int64_t maxVerifyTreeSize{60}; //!< Maximum length of input_ids passed into spec base model for verification
-    int64_t maxDraftTreeSize{60};  //!< Maximum length of input_ids passed into spec draft model for draft generation
-    bool useTrtNativeOps{false};   //!< Whether to use TensorRT native operations instead of custom plugin
-    bool profilingDetailed{false}; //!< Enable detailed profiling verbosity for layer info extraction
+    int64_t maxVerifyTreeSize{60};    //!< Maximum length of input_ids passed into spec base model for verification
+    int64_t maxDraftTreeSize{60};     //!< Maximum length of input_ids passed into spec draft model for draft generation
+    bool useTrtNativeOps{false};      //!< Whether to use TensorRT native operations instead of custom plugin
+    bool profilingDetailed{false};    //!< Enable detailed profiling verbosity for layer info extraction
 
     //! Convert configuration to JSON format for serialization.
     //! @return JSON object containing all configuration parameters

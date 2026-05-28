@@ -306,16 +306,18 @@ bool LLMBuilder::parseConfig()
     }
     if ((role == "llm") != (specType == "none"))
     {
-        LOG_ERROR("Invalid config: engine_role='%s' with spec_decode_type='%s'. LLM engines require "
-                  "spec_decode_type=none; speculative base/draft engines require a non-none spec_decode_type.",
+        LOG_ERROR(
+            "Invalid config: engine_role='%s' with spec_decode_type='%s'. LLM engines require "
+            "spec_decode_type=none; speculative base/draft engines require a non-none spec_decode_type.",
             role.c_str(), specType.c_str());
         return false;
     }
     if ((mBuilderConfig.specDraft && role != "draft") || (mBuilderConfig.specBase && role != "base")
         || (!mBuilderConfig.specDraft && !mBuilderConfig.specBase && role != "llm"))
     {
-        LOG_ERROR("Build mode does not match config: engine_role='%s' (use --specBase for base, --specDraft for "
-                  "draft, and neither flag for vanilla LLM).",
+        LOG_ERROR(
+            "Build mode does not match config: engine_role='%s' (use --specBase for base, --specDraft for "
+            "draft, and neither flag for vanilla LLM).",
             role.c_str());
         return false;
     }
@@ -544,8 +546,7 @@ bool LLMBuilder::setupSpecDecodeProfiles(
 
     bool result = true;
 
-    int const maxTokens
-        = mBuilderConfig.specDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
+    int const maxTokens = mBuilderConfig.specDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
 
     // Input embeddings
     result &= setOptimizationProfile(&contextProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),

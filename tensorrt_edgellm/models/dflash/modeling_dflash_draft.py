@@ -160,9 +160,11 @@ class DFlashCachedAttention(nn.Module):
         v_delta = v_delta.reshape(B, L, self.num_kv_heads, self.head_dim)
         k_delta = self.k_norm(k_delta)  # [B, L, Hkv, D]
 
-        updated_kv = dflash_target_kv_cache_update(
-            k_delta, v_delta, past_key_value, rope_cos_sin,
-            kvcache_start_index, delta_lengths)
+        updated_kv = dflash_target_kv_cache_update(k_delta, v_delta,
+                                                   past_key_value,
+                                                   rope_cos_sin,
+                                                   kvcache_start_index,
+                                                   delta_lengths)
 
         # --- Proposal self Q/K/V ---
         q = self.q_proj(hidden_states)  # [B, BS, Hq*D]
