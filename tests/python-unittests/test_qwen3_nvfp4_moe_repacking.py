@@ -24,16 +24,35 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from tensorrt_edgellm.checkpoint import repacking  # noqa: E402
-from tensorrt_edgellm.models.linear import NVFP4Linear  # noqa: E402
+from tensorrt_edgellm.config import Mapping  # noqa: E402
+from tensorrt_edgellm.models.linear import (NVFP4LinearMethod,  # noqa: E402
+                                            ReplicatedLinear)
+
+
+def _make_nvfp4_linear(in_features: int, out_features: int,
+                       group_size: int) -> ReplicatedLinear:
+    # Replaces the legacy ``NVFP4Linear`` constructor that was removed when
+    # NVFP4 was refactored into the ``ReplicatedLinear`` + ``NVFP4LinearMethod``
+    # composition. ``is_nvfp4_linear`` (used by the repacking code under test)
+    # accepts any ``LinearBase`` whose ``quant_method`` is an
+    # ``NVFP4LinearMethod``, which this factory produces.
+    return ReplicatedLinear(
+        in_features,
+        out_features,
+        bias=False,
+        dtype=torch.float16,
+        mapping=Mapping(),
+        quant_method=NVFP4LinearMethod(group_size=group_size),
+    )
 
 
 def _make_expert(hidden_size: int,
                  moe_inter_size: int,
                  group_size: int = 16) -> SimpleNamespace:
     return SimpleNamespace(
-        gate_proj=NVFP4Linear(hidden_size, moe_inter_size, group_size),
-        up_proj=NVFP4Linear(hidden_size, moe_inter_size, group_size),
-        down_proj=NVFP4Linear(moe_inter_size, hidden_size, group_size),
+        gate_proj=_make_nvfp4_linear(hidden_size, moe_inter_size, group_size),
+        up_proj=_make_nvfp4_linear(hidden_size, moe_inter_size, group_size),
+        down_proj=_make_nvfp4_linear(moe_inter_size, hidden_size, group_size),
     )
 
 
