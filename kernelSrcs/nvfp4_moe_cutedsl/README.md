@@ -195,7 +195,81 @@ python nvfp4_moe_cutedsl/export_fc2_kernel.py \
 `256`; FC2's `--output_dtype` accepts `bf16` and `fp16` (the AOT pack only
 ships `fp16`).
 
-## 7. Important Notes
+## 7. Python Kernel-Class Usage
+
+The two AOT export scripts in Section 6 wrap the underlying CuTeDSL kernel
+classes. When iterating on a single variant (e.g. adding a new activation,
+debugging a TMEM layout), it is often easier to instantiate the class directly
+in Python instead of going through `export_fc{1,2}_kernel.py`. The snippets
+below match the `Example:` blocks in the kernel module docstrings.
+
+### 7.1. FC1 — gather grouped GEMM + activation + FP4 requant
+
+`BlockScaledContiguousGatherGroupedGemmKernel` lives in
+[`blockscaled_contiguous_gather_grouped_gemm_act_fusion.py`](blockscaled_contiguous_gather_grouped_gemm_act_fusion.py).
+`use_2cta_instrs` is inferred from `mma_tiler_mn[0]` (`True` when M=256, `False`
+when M=128):
+
+```python
+from blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
+    BlockScaledContiguousGatherGroupedGemmKernel,
+)
+
+gemm = BlockScaledContiguousGatherGroupedGemmKernel(
+    sf_vec_size=16,
+    mma_tiler_mn=(256, 128),  # use_2cta_instrs=True since M=256
+    cluster_shape_mn=(2, 1),
+    vectorized_f32=True,
+)
+gemm(
+    a=a_tensor,
+    b=b_tensor,
+    c=c_tensor,
+    sfa=sfa_tensor,
+    sfb=sfb_tensor,
+    sfc_tensor=None,
+    input_global_scale_tensor=input_global_scale_tensor,
+    down_input_scale_tensor=None,
+    tile_idx_to_expert_idx=tile_idx_to_expert_idx,
+    tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+    token_id_mapping_tensor=token_id_mapping_tensor,
+    num_non_exiting_tiles=num_non_exiting_tiles,
+    alpha=alpha,
+    max_active_clusters=max_active_clusters,
+    stream=stream,
+)
+```
+
+### 7.2. FC2 — grouped GEMM + router-scale finalize / scatter
+
+`Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel` lives in
+[`blockscaled_contiguous_grouped_gemm_finalize_fusion.py`](blockscaled_contiguous_grouped_gemm_finalize_fusion.py):
+
+```python
+from blockscaled_contiguous_grouped_gemm_finalize_fusion import (
+    Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel,
+)
+
+gemm = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel(
+    sf_vec_size=16, mma_tiler_mn=(256, 128), cluster_shape_mn=(2, 1),
+)
+gemm(
+    a_tensor, b_tensor, sfa_tensor, sfb_tensor, out_tensor,
+    max_active_clusters, stream,
+)
+```
+
+Both classes enforce the constraints listed in their docstrings — MMA tiler M
+∈ {128, 256}, MMA tiler N ∈ {64, 128, 192, 256}, cluster shape M/N positive
+powers of two with total cluster size ≤ 16 (and ≤ 4 for scale-factor
+multicasts). The SM110 AOT pack only ships `m_tile_size = 128` (1-CTA, see
+Section 8); FC1 and FC2 vary along the N tile via `mma_tiler_mn = (128, 128)`
+and `(128, 256)` (see Section 2). The docstring examples above show
+`(256, 128)` purely to illustrate the 2-CTA `use_2cta_instrs` path and are
+**not** the configuration shipped by [`build_cutedsl.py`](../build_cutedsl.py)
+for SM110.
+
+## 8. Important Notes
 
 - **Alpha scaling.** FC1 applies per-expert `alpha = input_gsf * weight_gsf`
   inside the kernel epilogue, before the fused activation. Alpha is a `[E]`
@@ -209,13 +283,13 @@ ships `fp16`).
   (`EDGELLM_ENABLE_PDL = False` in [`cute_utils.py`](cute_utils.py)).
 - **Tile size.** Only `m_tile_size = 128` (1-CTA) is supported.
 
-## 8. Validation
+## 9. Validation
 
 No standalone reference probe is shipped. The SM110 NVFP4 MoE contract is
 validated end-to-end through
 [`tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py`](../../tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py).
 
-## 9. File Map
+## 10. File Map
 
 | File | Description |
 |---|---|
