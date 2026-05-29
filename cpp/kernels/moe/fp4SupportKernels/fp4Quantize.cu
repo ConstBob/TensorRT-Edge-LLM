@@ -724,8 +724,7 @@ void fp4BuildLayoutAndQuantizeRoutedLinearSFDecode(rt::Tensor const& input, rt::
         throw std::runtime_error(
             "fp4BuildLayoutAndQuantizeRoutedLinearSFDecode: input N must be a positive multiple of 16.");
     }
-    if (layoutBuffers.tileIdxToGroupIdx.getShape()[0] < topK
-        || layoutBuffers.tileIdxToMnLimit.getShape()[0] < topK
+    if (layoutBuffers.tileIdxToGroupIdx.getShape()[0] < topK || layoutBuffers.tileIdxToMnLimit.getShape()[0] < topK
         || layoutBuffers.permutedIdxToExpandedIdx.getShape()[0] < topK * tileSize)
     {
         throw std::runtime_error("fp4BuildLayoutAndQuantizeRoutedLinearSFDecode: layout buffers are too small.");
