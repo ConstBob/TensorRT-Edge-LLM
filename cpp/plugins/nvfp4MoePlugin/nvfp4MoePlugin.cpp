@@ -182,10 +182,9 @@ REGISTER_TENSORRT_PLUGIN(Nvfp4MoePluginCreator);
 
 // Constructors / boilerplate
 
-Nvfp4MoePlugin::Nvfp4MoePlugin(std::string const& name, int32_t numExperts, int32_t topK,
-    int32_t hiddenSize, int32_t moeInterSize, int32_t activationType, int32_t nGroup, int32_t topkGroup,
-    int32_t normTopkProb, float routedScalingFactor, int32_t routingMode, int32_t backend, int32_t maxRoutedRows,
-    int32_t ioDtype)
+Nvfp4MoePlugin::Nvfp4MoePlugin(std::string const& name, int32_t numExperts, int32_t topK, int32_t hiddenSize,
+    int32_t moeInterSize, int32_t activationType, int32_t nGroup, int32_t topkGroup, int32_t normTopkProb,
+    float routedScalingFactor, int32_t routingMode, int32_t backend, int32_t maxRoutedRows, int32_t ioDtype)
     : mLayerName(name)
     , mNumExperts(numExperts)
     , mTopK(topK)
@@ -299,8 +298,7 @@ Nvfp4MoePlugin::Nvfp4MoePlugin(std::string const& name, PluginFieldCollection co
     {
         if (mNGroup <= 0 || mNumExperts % mNGroup != 0)
         {
-            throw std::invalid_argument(
-                "Nvfp4MoePlugin: n_group must be positive and evenly divide num_experts");
+            throw std::invalid_argument("Nvfp4MoePlugin: n_group must be positive and evenly divide num_experts");
         }
         if (mTopkGroup <= 0 || mTopkGroup > mNGroup)
         {
@@ -426,8 +424,9 @@ bool Nvfp4MoePlugin::supportsFormatCombination(
     // Always-on contract check (assert() would be a no-op in release builds).
     if (nbInputs != kNbPluginInputs || nbOutputs != 1)
     {
-        LOG_ERROR("Nvfp4MoePlugin: supportsFormatCombination expected %d inputs and 1 output, got %d inputs and %d "
-                  "outputs",
+        LOG_ERROR(
+            "Nvfp4MoePlugin: supportsFormatCombination expected %d inputs and 1 output, got %d inputs and %d "
+            "outputs",
             kNbPluginInputs, nbInputs, nbOutputs);
         return false;
     }
@@ -452,7 +451,7 @@ bool Nvfp4MoePlugin::supportsFormatCombination(
 #define SFC_REJ(reason)                                                                                                \
     do                                                                                                                 \
     {                                                                                                                  \
-        LOG_DEBUG("Nvfp4MoePlugin supportsFormatCombination rejected pos %d: %s", pos, reason);                 \
+        LOG_DEBUG("Nvfp4MoePlugin supportsFormatCombination rejected pos %d: %s", pos, reason);                        \
         return false;                                                                                                  \
     } while (0)
 
@@ -620,8 +619,8 @@ int32_t Nvfp4MoePlugin::configurePlugin(
     {
         if (mNGroup <= 0 || mNumExperts % mNGroup != 0)
         {
-            LOG_ERROR("Nvfp4MoePlugin: n_group (%d) must be positive and evenly divide num_experts (%d)",
-                mNGroup, mNumExperts);
+            LOG_ERROR("Nvfp4MoePlugin: n_group (%d) must be positive and evenly divide num_experts (%d)", mNGroup,
+                mNumExperts);
             return -1;
         }
         if (mTopkGroup <= 0 || mTopkGroup > mNGroup)
@@ -873,8 +872,7 @@ int32_t Nvfp4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorD
         int64_t const numTokens64 = static_cast<int64_t>(batch) * static_cast<int64_t>(seqLen);
         if (numTokens64 > std::numeric_limits<int32_t>::max())
         {
-            LOG_ERROR(
-                "Nvfp4MoePlugin: batch*seq_len (%lld) overflows int32", static_cast<long long>(numTokens64));
+            LOG_ERROR("Nvfp4MoePlugin: batch*seq_len (%lld) overflows int32", static_cast<long long>(numTokens64));
             return -1;
         }
         int32_t const numTokens = static_cast<int32_t>(numTokens64);

@@ -60,7 +60,7 @@ import torch.nn.functional as F
 from ...config import (LAYER_ATTN, LAYER_MAMBA, LAYER_MLP, LAYER_MOE,
                        MambaConfig, ModelConfig)
 from ..default.modeling_default import OnnxSpec
-from ..linear import FP16Linear, is_nvfp4_linear, make_linear
+from ..linear import FP16Linear, make_linear
 from ..ops import (attention_plugin, causal_conv1d, nvfp4_moe_plugin,
                    update_ssm_state)
 
@@ -497,8 +497,7 @@ class NemotronHMoEMLP(nn.Module):
 
     def _prepare_for_export_impl(self) -> None:
         """Pack ModelOpt NVFP4 expert tensors for ``Nvfp4MoePlugin``."""
-        from ...checkpoint.repacking import \
-            repack_nvfp4_nemotron_moe_experts
+        from ...checkpoint.repacking import repack_nvfp4_nemotron_moe_experts
 
         (fc1_qweights, fc1_blocks_scale, fc1_alpha, fc2_qweights,
          fc2_blocks_scale, fc2_alpha,

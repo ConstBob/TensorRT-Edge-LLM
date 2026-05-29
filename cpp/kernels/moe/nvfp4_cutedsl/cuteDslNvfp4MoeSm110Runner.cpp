@@ -332,8 +332,8 @@ int32_t CuteDslNvfp4MoeSm110Runner::run(CuteDslNvfp4MoeSm110Params const& params
         = static_cast<size_t>(params.numTokens) * static_cast<size_t>(params.hiddenSize) * sizeof(__half);
     CUDA_CHECK(cudaMemsetAsync(params.output, 0, outputBytes, stream));
 
-    ret = cute_dsl_nvfp4_moe_sm110_fc2_n128_fp16_wrapper(&sFC2N128Fp16, fc1FP4,
-        const_cast<void*>(params.fc2QWeights), fc1SF, const_cast<void*>(params.fc2BlocksScale), params.output,
+    ret = cute_dsl_nvfp4_moe_sm110_fc2_n128_fp16_wrapper(&sFC2N128Fp16, fc1FP4, const_cast<void*>(params.fc2QWeights),
+        fc1SF, const_cast<void*>(params.fc2BlocksScale), params.output,
         const_cast<void*>(static_cast<void const*>(params.fc2Alpha)),
         const_cast<void*>(static_cast<void const*>(params.downInputScale)), tileGroup, tileLimit, permutedToExpanded,
         numTiles, const_cast<void*>(static_cast<void const*>(params.topkWeights)), m, h, params.moeInterSize,

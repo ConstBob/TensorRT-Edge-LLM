@@ -324,8 +324,7 @@ class Qwen3SparseMoeBlock(nn.Module):
         ``kernelSrcs/nvfp4_fused_moe_cutedsl/`` and
         :func:`repack_nvfp4_qwen3_moe_experts`).
         """
-        from ...checkpoint.repacking import \
-            repack_nvfp4_qwen3_moe_experts
+        from ...checkpoint.repacking import repack_nvfp4_qwen3_moe_experts
 
         self.gate_linear = nn.Linear(self.hidden_size,
                                      self.num_experts,
@@ -334,10 +333,9 @@ class Qwen3SparseMoeBlock(nn.Module):
         self.gate_linear.weight.data = self.gate.weight.data
 
         fc1_qweights, fc1_blocks_scale, fc2_qweights, fc2_blocks_scale = (
-            repack_nvfp4_qwen3_moe_experts(self.experts,
-                                                   self.hidden_size,
-                                                   self.moe_intermediate_size,
-                                                   self.group_size))
+            repack_nvfp4_qwen3_moe_experts(self.experts, self.hidden_size,
+                                           self.moe_intermediate_size,
+                                           self.group_size))
 
         device = self.gate.weight.device
         self.register_buffer("fc1_qweights",

@@ -654,7 +654,7 @@ def _round_dense_to_bf16(dense: np.ndarray) -> np.ndarray:
 
 
 def _swizzle_nvfp4_mma_scales(scale_bytes: np.ndarray, m_dim: int,
-                                      k_sf_dim: int) -> np.ndarray:
+                              k_sf_dim: int) -> np.ndarray:
     """Swizzle linear FP8 block scales to CuTeDSL's 6D MMA layout."""
     if scale_bytes.dtype == np.int8:
         sf = scale_bytes.view(np.uint8)
@@ -686,8 +686,7 @@ def _pack_nvfp4_moe_weight(
     stores raw FP8 E4M3 block scales in the physical CuTeDSL MMA layout.
     """
     if group_size != 16:
-        raise NotImplementedError(
-            "Nvfp4MoePlugin requires group_size=16")
+        raise NotImplementedError("Nvfp4MoePlugin requires group_size=16")
 
     m_dim, k_dim = dense_w_mk.shape
     if k_dim % group_size != 0 or k_dim % 2 != 0:
@@ -740,8 +739,7 @@ def _interleave_qwen3_swiglu_fc1(
             f"{swiglu_interleave_rows} for SwiGLU FC1 layout")
 
     n_chunks = moe_inter_size // swiglu_interleave_rows
-    up_chunks = up_dense.reshape(n_chunks, swiglu_interleave_rows,
-                                 hidden_size)
+    up_chunks = up_dense.reshape(n_chunks, swiglu_interleave_rows, hidden_size)
     gate_chunks = gate_dense.reshape(n_chunks, swiglu_interleave_rows,
                                      hidden_size)
     return np.stack([up_chunks, gate_chunks],
@@ -788,8 +786,8 @@ def repack_nvfp4_qwen3_moe_experts(
             raise ValueError(f"down dense shape {down_dense.shape} != "
                              f"({hidden_size}, {moe_inter_size})")
 
-        fc1_dense = _interleave_qwen3_swiglu_fc1(
-            gate_dense, up_dense, hidden_size, moe_inter_size)
+        fc1_dense = _interleave_qwen3_swiglu_fc1(gate_dense, up_dense,
+                                                 hidden_size, moe_inter_size)
         fc1_qw, fc1_sf = _pack_nvfp4_moe_weight(fc1_dense, group_size)
         fc2_qw, fc2_sf = _pack_nvfp4_moe_weight(down_dense, group_size)
         fc1_qweights.append(fc1_qw)
@@ -893,11 +891,10 @@ def repack_nvfp4_nemotron_moe_experts(
             padded_up_sf = _sf_bytes_from_checkpoint(up.weight_scale)
             padded_down_sf = _sf_bytes_from_checkpoint(down.weight_scale)
 
-        up_sf = _swizzle_nvfp4_mma_scales(padded_up_sf,
-                                                  padded_inter_size,
-                                                  hidden_size // group_size)
-        down_sf = _swizzle_nvfp4_mma_scales(
-            padded_down_sf, hidden_size, padded_inter_size // group_size)
+        up_sf = _swizzle_nvfp4_mma_scales(padded_up_sf, padded_inter_size,
+                                          hidden_size // group_size)
+        down_sf = _swizzle_nvfp4_mma_scales(padded_down_sf, hidden_size,
+                                            padded_inter_size // group_size)
 
         fc1_qweights.append(up_weight.contiguous())
         fc1_blocks_scale.append(torch.from_numpy(up_sf))
@@ -925,4 +922,3 @@ def _sf_bytes_from_checkpoint(raw_sf: torch.Tensor) -> np.ndarray:
         return raw_sf.detach().to(torch.float8_e4m3fn).cpu().view(
             torch.uint8).numpy()
     raise TypeError(f"unsupported weight_scale dtype {raw_sf.dtype}")
-

@@ -41,14 +41,14 @@ namespace plugins
  * @note SM110 supports swiglu and relu2 with E=128, 0 < top_k <= 8.
  */
 class Nvfp4MoePlugin : public nvinfer1::IPluginV3,
-                              public nvinfer1::IPluginV3OneCore,
-                              public nvinfer1::IPluginV3OneBuild,
-                              public nvinfer1::IPluginV3OneRuntime
+                       public nvinfer1::IPluginV3OneCore,
+                       public nvinfer1::IPluginV3OneBuild,
+                       public nvinfer1::IPluginV3OneRuntime
 {
 public:
-    Nvfp4MoePlugin(std::string const& name, int32_t numExperts, int32_t topK, int32_t hiddenSize,
-        int32_t moeInterSize, int32_t activationType, int32_t nGroup, int32_t topkGroup, int32_t normTopkProb,
-        float routedScalingFactor, int32_t routingMode, int32_t backend, int32_t maxRoutedRows, int32_t ioDtype);
+    Nvfp4MoePlugin(std::string const& name, int32_t numExperts, int32_t topK, int32_t hiddenSize, int32_t moeInterSize,
+        int32_t activationType, int32_t nGroup, int32_t topkGroup, int32_t normTopkProb, float routedScalingFactor,
+        int32_t routingMode, int32_t backend, int32_t maxRoutedRows, int32_t ioDtype);
 
     Nvfp4MoePlugin(std::string const& name, nvinfer1::PluginFieldCollection const* fc);
 

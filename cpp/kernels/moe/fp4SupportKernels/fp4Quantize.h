@@ -50,8 +50,8 @@ void fp4QuantizeLinearSF(rt::Tensor const& input, rt::Tensor const& globalSF, rt
 /// \c expertGlobalSF is [E], \c outputFP4 is [T * topK, N / 2], and
 /// \c outputSF is row-major [T * topK, N / 16]. Routed row
 /// `token * topK + slot` uses `expertGlobalSF[topkIds[token, slot]]`.
-void fp4QuantizeRoutedLinearSF(rt::Tensor const& input, rt::Tensor const& topkIds,
-    rt::Tensor const& expertGlobalSF, rt::Tensor& outputFP4, rt::Tensor& outputSF, cudaStream_t stream);
+void fp4QuantizeRoutedLinearSF(rt::Tensor const& input, rt::Tensor const& topkIds, rt::Tensor const& expertGlobalSF,
+    rt::Tensor& outputFP4, rt::Tensor& outputSF, cudaStream_t stream);
 
 /// Decode-specialized setup path for SM110 NVFP4 MoE.
 ///

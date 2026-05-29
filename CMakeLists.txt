@@ -163,8 +163,8 @@ option(BUILD_PYTHON_BINDINGS "Enable building Python pybind11 bindings" OFF)
 
 # CuTe DSL unified kernel option — declare here so it is always defined before
 # any subdirectory or include references it. Choices: OFF | ALL | fmha | gdn |
-# nvfp4_moe | nvfp4_fused_moe | semicolon-separated group list
-# (e.g. -DENABLE_CUTE_DSL=fmha;gdn).
+# nvfp4_moe | nvfp4_fused_moe | semicolon-separated group list (e.g.
+# -DENABLE_CUTE_DSL=fmha;gdn).
 set(ENABLE_CUTE_DSL
     "OFF"
     CACHE

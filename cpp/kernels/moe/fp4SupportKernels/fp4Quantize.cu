@@ -438,9 +438,9 @@ __launch_bounds__(512, 4) __global__ void quantizeRoutedToFp4LinearSfKernel(int3
 template <typename ScalarT>
 __launch_bounds__(512, 4) __global__ void buildLayoutAndQuantizeRoutedToFp4LinearSfDecodeKernel(int32_t topK,
     int32_t numCols, int32_t localNumExperts, int32_t tileSize, ScalarT const* __restrict__ input,
-    int32_t const* __restrict__ topkIds, float const* __restrict__ sfScales,
-    int32_t* __restrict__ permutedIdx, int32_t* __restrict__ tileGroupIdx, int32_t* __restrict__ tileMnLimit,
-    int32_t* __restrict__ numNonExitingTiles, uint32_t* __restrict__ outputFP4, uint8_t* __restrict__ outputSF)
+    int32_t const* __restrict__ topkIds, float const* __restrict__ sfScales, int32_t* __restrict__ permutedIdx,
+    int32_t* __restrict__ tileGroupIdx, int32_t* __restrict__ tileMnLimit, int32_t* __restrict__ numNonExitingTiles,
+    uint32_t* __restrict__ outputFP4, uint8_t* __restrict__ outputSF)
 {
     using Traits = QuantTraits<ScalarT>;
     using Vec2 = typename Traits::Vec2;
@@ -644,8 +644,8 @@ void fp4QuantizeLinearSF(rt::Tensor const& input, rt::Tensor const& globalSF, rt
     }
 }
 
-void fp4QuantizeRoutedLinearSF(rt::Tensor const& input, rt::Tensor const& topkIds,
-    rt::Tensor const& expertGlobalSF, rt::Tensor& outputFP4, rt::Tensor& outputSF, cudaStream_t stream)
+void fp4QuantizeRoutedLinearSF(rt::Tensor const& input, rt::Tensor const& topkIds, rt::Tensor const& expertGlobalSF,
+    rt::Tensor& outputFP4, rt::Tensor& outputSF, cudaStream_t stream)
 {
     int64_t const M = input.getShape().at(0);
     int64_t const N = input.getShape().at(1);
@@ -678,15 +678,15 @@ void fp4QuantizeRoutedLinearSF(rt::Tensor const& input, rt::Tensor const& topkId
 
     if (input.getDataType() == nvinfer1::DataType::kBF16)
     {
-        quantizeRoutedToFp4LinearSfKernel<__nv_bfloat16><<<gridSize, blockSize, 0, stream>>>(
-            static_cast<int32_t>(M), static_cast<int32_t>(topK), static_cast<int32_t>(N),
-            static_cast<__nv_bfloat16 const*>(input.rawPointer()), topkPtr, sfPtrFwd, fp4Ptr, sfPtr);
+        quantizeRoutedToFp4LinearSfKernel<__nv_bfloat16><<<gridSize, blockSize, 0, stream>>>(static_cast<int32_t>(M),
+            static_cast<int32_t>(topK), static_cast<int32_t>(N), static_cast<__nv_bfloat16 const*>(input.rawPointer()),
+            topkPtr, sfPtrFwd, fp4Ptr, sfPtr);
     }
     else if (input.getDataType() == nvinfer1::DataType::kHALF)
     {
-        quantizeRoutedToFp4LinearSfKernel<__half><<<gridSize, blockSize, 0, stream>>>(
-            static_cast<int32_t>(M), static_cast<int32_t>(topK), static_cast<int32_t>(N),
-            static_cast<__half const*>(input.rawPointer()), topkPtr, sfPtrFwd, fp4Ptr, sfPtr);
+        quantizeRoutedToFp4LinearSfKernel<__half><<<gridSize, blockSize, 0, stream>>>(static_cast<int32_t>(M),
+            static_cast<int32_t>(topK), static_cast<int32_t>(N), static_cast<__half const*>(input.rawPointer()),
+            topkPtr, sfPtrFwd, fp4Ptr, sfPtr);
     }
     else
     {
@@ -752,17 +752,17 @@ void fp4BuildLayoutAndQuantizeRoutedLinearSFDecode(rt::Tensor const& input, rt::
 
     if (input.getDataType() == nvinfer1::DataType::kBF16)
     {
-        buildLayoutAndQuantizeRoutedToFp4LinearSfDecodeKernel<__nv_bfloat16><<<gridSize, blockSize, 0, stream>>>(
-            static_cast<int32_t>(topK), static_cast<int32_t>(N), localNumExperts, tileSize,
-            static_cast<__nv_bfloat16 const*>(input.rawPointer()), topkPtr, sfPtrFwd, permutedPtr, tileGroupPtr,
-            tileLimitPtr, numTilesPtr, fp4Ptr, sfPtr);
+        buildLayoutAndQuantizeRoutedToFp4LinearSfDecodeKernel<__nv_bfloat16>
+            <<<gridSize, blockSize, 0, stream>>>(static_cast<int32_t>(topK), static_cast<int32_t>(N), localNumExperts,
+                tileSize, static_cast<__nv_bfloat16 const*>(input.rawPointer()), topkPtr, sfPtrFwd, permutedPtr,
+                tileGroupPtr, tileLimitPtr, numTilesPtr, fp4Ptr, sfPtr);
     }
     else if (input.getDataType() == nvinfer1::DataType::kHALF)
     {
-        buildLayoutAndQuantizeRoutedToFp4LinearSfDecodeKernel<__half><<<gridSize, blockSize, 0, stream>>>(
-            static_cast<int32_t>(topK), static_cast<int32_t>(N), localNumExperts, tileSize,
-            static_cast<__half const*>(input.rawPointer()), topkPtr, sfPtrFwd, permutedPtr, tileGroupPtr,
-            tileLimitPtr, numTilesPtr, fp4Ptr, sfPtr);
+        buildLayoutAndQuantizeRoutedToFp4LinearSfDecodeKernel<__half>
+            <<<gridSize, blockSize, 0, stream>>>(static_cast<int32_t>(topK), static_cast<int32_t>(N), localNumExperts,
+                tileSize, static_cast<__half const*>(input.rawPointer()), topkPtr, sfPtrFwd, permutedPtr, tileGroupPtr,
+                tileLimitPtr, numTilesPtr, fp4Ptr, sfPtr);
     }
     else
     {
@@ -788,8 +788,7 @@ void fp4QuantizeLinearSF(rt::Tensor const& /*input*/, rt::Tensor const& /*global
 }
 
 void fp4QuantizeRoutedLinearSF(rt::Tensor const& /*input*/, rt::Tensor const& /*topkIds*/,
-    rt::Tensor const& /*expertGlobalSF*/, rt::Tensor& /*outputFP4*/, rt::Tensor& /*outputSF*/,
-    cudaStream_t /*stream*/)
+    rt::Tensor const& /*expertGlobalSF*/, rt::Tensor& /*outputFP4*/, rt::Tensor& /*outputSF*/, cudaStream_t /*stream*/)
 {
     throw std::runtime_error(
         "FP4 quantize emits FP8 E4M3 scale factors but CUDA_VERSION < 11080 (cuda_fp8.h unavailable).");
