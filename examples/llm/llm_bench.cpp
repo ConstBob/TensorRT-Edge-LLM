@@ -736,7 +736,7 @@ int main(int argc, char** argv)
         {
             if (useDraftEngine)
             {
-                executor = rt::EngineExecutor::createForSpecDecodeDraft(enginePath, deployment);
+                executor = rt::EngineExecutor::createForDraft(enginePath, deployment);
             }
             else
             {
