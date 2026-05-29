@@ -119,6 +119,9 @@ GatedDeltaNetPlugin::GatedDeltaNetPlugin(std::string const& name, PluginFieldCol
 #ifdef CUTE_DSL_GDN_ENABLED
     mSMVersion = getSMVersion();
     CuteDslGDNRunner::loadKernelModules();
+#else
+    LOG_ERROR("GatedDeltaNet plugin is not available: build with CUTE_DSL_GDN_ENABLED to enable it.");
+    throw std::runtime_error("GatedDeltaNet plugin is not available: build with CUTE_DSL_GDN_ENABLED to enable it.");
 #endif
 }
 

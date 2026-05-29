@@ -677,28 +677,29 @@ int main(int argc, char* argv[])
                 streamingWriter.open(audioPath.string(), 24000);
 
                 streamCfg.codecChunkFrames = args.codecChunkFrames;
-                streamCfg.onAudioChunkReady = [&](std::vector<std::vector<int32_t>> const& chunkCodes) {
-                    if (chunkCodes.empty() || !code2wavRunner)
-                        return;
-                    size_t const numFrames = chunkCodes.size();
-                    size_t const numLayers = chunkCodes[0].size();
-                    std::vector<std::vector<int32_t>> transposed(numLayers, std::vector<int32_t>(numFrames));
-                    for (size_t f = 0; f < numFrames; ++f)
-                        for (size_t l = 0; l < numLayers; ++l)
-                            transposed[l][f] = chunkCodes[f][l];
+                streamCfg.onAudioChunkReady
+                    = [&](std::vector<std::vector<int32_t>> const& chunkCodes, bool /*isFinal*/) {
+                          if (chunkCodes.empty() || !code2wavRunner)
+                              return;
+                          size_t const numFrames = chunkCodes.size();
+                          size_t const numLayers = chunkCodes[0].size();
+                          std::vector<std::vector<int32_t>> transposed(numLayers, std::vector<int32_t>(numFrames));
+                          for (size_t f = 0; f < numFrames; ++f)
+                              for (size_t l = 0; l < numLayers; ++l)
+                                  transposed[l][f] = chunkCodes[f][l];
 
-                    rt::audioUtils::AudioData chunkAudio;
-                    code2wavRunner->generateWaveform(transposed, chunkAudio, stream);
-                    if (chunkAudio.hasWaveform)
-                    {
-                        streamingWriter.appendChunk(chunkAudio);
-                        if (!ttfpaRecorded && ttfpaEvent)
-                        {
-                            CUDA_CHECK(cudaEventRecord(ttfpaEvent, stream));
-                            ttfpaRecorded = true;
-                        }
-                    }
-                };
+                          rt::audioUtils::AudioData chunkAudio;
+                          code2wavRunner->generateWaveform(transposed, chunkAudio, stream);
+                          if (chunkAudio.hasWaveform)
+                          {
+                              streamingWriter.appendChunk(chunkAudio);
+                              if (!ttfpaRecorded && ttfpaEvent)
+                              {
+                                  CUDA_CHECK(cudaEventRecord(ttfpaEvent, stream));
+                                  ttfpaRecorded = true;
+                              }
+                          }
+                      };
             }
 
             request.generateAudio = true;

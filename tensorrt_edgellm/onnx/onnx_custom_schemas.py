@@ -1123,6 +1123,77 @@ _nvfp4_moe_plugin_geforce_schema = OpSchema(
     ],
 )
 
+# ---------------------------------------------------------------------------
+# trt_edgellm::FusedGemmAllReducePlugin (row-parallel NVFP4 GEMM)
+# ---------------------------------------------------------------------------
+
+_fused_gemm_allreduce_plugin_schema = OpSchema(
+    name="FusedGemmAllReducePlugin",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc=("NVFP4 row-parallel GEMM fused with AllReduce.  Replaces the "
+         "dequant→MatMul→AllReduce chain in o_proj / down_proj when "
+         "tp_size>1.  Inputs are in raw FP4 form; output is FP16 and "
+         "already AllReduced across ranks."),
+    inputs=[
+        OpSchema.FormalParameter(
+            name="fp4_act",
+            description="FP4 packed activation [..., K_per_rank // 2]",
+            type_str="tensor(int8)",
+        ),
+        OpSchema.FormalParameter(
+            name="act_scale",
+            description=
+            "Combined per-block activation scale [..., K_per_rank // 16] (FP32)",
+            type_str="tensor(float)",
+        ),
+        OpSchema.FormalParameter(
+            name="weight_f4",
+            description="FP4 packed weight [N, K_per_rank // 2]",
+            type_str="tensor(int8)",
+        ),
+        OpSchema.FormalParameter(
+            name="weight_f8_scale",
+            description=
+            "FP8E4M3FN per-block weight scale [N, K_per_rank // group_size]",
+            type_str="tensor(float8e4m3fn)",
+        ),
+        OpSchema.FormalParameter(
+            name="weight_f32_scale",
+            description="FP32 global weight scale (scalar)",
+            type_str="tensor(float)",
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="output",
+            description="AllReduced FP16 output [..., N]",
+            type_str="tensor(float16)",
+        ),
+    ],
+    type_constraints=[],
+    attributes=[
+        OpSchema.Attribute(
+            name="tp_size",
+            type=OpSchema.AttrType.INT,
+            description="Tensor parallel world size",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="fuse_residual_rmsnorm",
+            type=OpSchema.AttrType.INT,
+            description="0/1: fuse the post-AllReduce residual+RMSNorm",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="rmsnorm_epsilon",
+            type=OpSchema.AttrType.FLOAT,
+            description="RMSNorm epsilon when fuse_residual_rmsnorm=1",
+            required=False,
+        ),
+    ],
+)
+
 _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _attention_plugin_schema,
     _vit_attention_plugin_schema,
@@ -1140,6 +1211,7 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _int4_moe_plugin_schema,
     _nvfp4_moe_plugin_schema,
     _nvfp4_moe_plugin_geforce_schema,
+    _fused_gemm_allreduce_plugin_schema,
 )
 
 _registered_tensorrt_edgellm_schemas: bool = False

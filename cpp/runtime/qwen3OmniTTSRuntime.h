@@ -19,9 +19,14 @@
 
 #include "common/tensor.h"
 #include "profiling/metrics.h"
-#include "runtime/legacy/llmEngineRunner.h"
+#include "runtime/config/llmEngineConfig.h"
+#include "runtime/exec/engineExecutor.h"
+#include "runtime/exec/tensorMap.h"
 #include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "runtime/preprocess/stepPreparer.h"
+#include "runtime/state/pipelineIO.h"
+#include "runtime/state/sharedResources.h"
 #include "tokenizer/tokenizer.h"
 #include <memory>
 #include <string>
@@ -126,6 +131,18 @@ public:
         bool applyChatTemplate{true};   //!< Whether to apply chat template formatting
         bool addGenerationPrompt{true}; //!< Whether to add generation prompt at the end
         bool enableThinking{false};     //!< Whether to enable thinking mode
+
+        //!< Optional streaming: emit RVQ codes via callback every N frames.
+        //!< 0 = non-streaming (default); >0 enables streaming for this request.
+        int32_t streamingChunkFrames{0};
+
+        //!< Streaming callback invoked from the Talker generation thread with:
+        //!<   chunkRvqCodes: codes generated since the last callback ([frames][numCodesPerFrame])
+        //!<   isFinal: true on the last callback for this request (post-EOS / post-maxFrames flush);
+        //!<            invoked exactly once with isFinal=true per request that has streaming enabled,
+        //!<            even if chunkRvqCodes is empty (signals end-of-stream).
+        //!< Each request gets its own callback; per-batch streams are fully independent.
+        std::function<void(std::vector<std::vector<int32_t>> const& chunkRvqCodes, bool isFinal)> onChunkReady;
     };
 
     /*!
@@ -246,14 +263,21 @@ public:
 
     /*!
      * @brief Configuration for Thinker→Talker streaming pipeline
+     *
+     * Callback contract matches the TTS streaming path (see TalkerGenerationRequest::onChunkReady):
+     *   chunkRvqCodes: codes since the last callback ([frames][numCodesPerFrame])
+     *   isFinal: true on the last callback for this request (post-EOS / post-maxAudioLength flush);
+     *            invoked exactly once with isFinal=true when streaming is enabled, even if the chunk
+     *            is empty (acts as the end-of-stream signal).
      */
-    using AudioChunkCallback = std::function<void(std::vector<std::vector<int32_t>> const& chunkRvqCodes)>;
+    using AudioChunkCallback
+        = std::function<void(std::vector<std::vector<int32_t>> const& chunkRvqCodes, bool isFinal)>;
 
     struct ThinkerTalkerStreamingConfig
     {
         int32_t talkerPrefillThreshold{4};    //!< Start Talker prefill after this many assistant tokens
-        int32_t codecChunkFrames{0};          //!< Vocode every N frames during flush (0 = disabled)
-        AudioChunkCallback onAudioChunkReady; //!< Called with chunk RVQ codes [frames][16] when ready
+        int32_t codecChunkFrames{0};          //!< Emit chunk every N frames (0 = disabled)
+        AudioChunkCallback onAudioChunkReady; //!< Per-chunk callback (see AudioChunkCallback contract)
     };
 
     /*!
@@ -332,14 +356,26 @@ private:
     bool executeTalkerPrefillStep(rt::Tensor const& inputEmbeds, rt::Tensor& outputLogits,
         rt::Tensor& outputHiddenStates, cudaStream_t stream, std::vector<int64_t> const& perBatchContextLengths = {});
 
-    //! Run CodePredictor for one frame of one batch element (batch=1 engine call internally).
-    //! Called inside the per-batch loop of the decode frame.
-    bool runCodePredictorGenerationForFrame(int32_t codecToken, rt::Tensor const& talkerHiddenState,
-        SamplingParams const& samplingParams, std::vector<int32_t>& outputCodes, cudaStream_t stream);
+    //! Run a single Talker vanilla decoding step. Wraps TensorMap binding + StepPreparer + EngineExecutor.
+    //! inputEmbeds shape must be [batch, 1, talkerHiddenSize]; outputLogits is auto-reshaped to [batch, vocab].
+    bool executeTalkerDecodingStep(
+        rt::Tensor const& inputEmbeds, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, cudaStream_t stream);
+
+    //! Run CodePredictor for one frame across all activeBatchSize batch elements in a single engine call.
+    //! Batch dim is implicit in the input tensor shapes; bs=1 is just a special case of bs=N where N=1
+    //! (same pattern as Talker / spec decode runtime).
+    //! @param activeBatchSize          Number of active batches (1..maxBatchSize).
+    //! @param codecTokensPerBatch     [activeBS] code_0 from Talker for each batch.
+    //! @param talkerLastHiddenBatched [activeBS, talkerHidden] per-batch Talker last hidden.
+    //! @param outputCodesPerBatch     [activeBS][mNumCodesPerFrame] generated codes per batch.
+    bool runCodePredictorGenerationForFrame(int32_t activeBatchSize, std::vector<int32_t> const& codecTokensPerBatch,
+        rt::Tensor const& talkerLastHiddenBatched, SamplingParams const& samplingParams,
+        std::vector<std::vector<int32_t>>& outputCodesPerBatch, cudaStream_t stream);
 
     //! Compute residual connection for one batch element.
-    bool computeResidualConnection(std::vector<int32_t> const& codes, rt::Tensor const* trailingTextHidden,
-        int32_t generationStep, rt::Tensor& outputResidual, cudaStream_t stream);
+    //! @param codecHiddensThisBatch  Per-batch view into mCodecHiddensBuffer: [1, mNumCodesPerFrame, talkerH].
+    bool computeResidualConnection(rt::Tensor const& codecHiddensThisBatch, std::vector<int32_t> const& codes,
+        rt::Tensor const* trailingTextHidden, int32_t generationStep, rt::Tensor& outputResidual, cudaStream_t stream);
 
     //! Extract last hidden state from Talker hidden states buffer for one batch element.
     bool extractTalkerLastHidden(
@@ -382,12 +418,25 @@ private:
      * @param stream  CUDA stream
      * @return True if generation succeeded
      */
+    //! Per-batch streaming handler — emits codes via callback every chunkFrames as the loop runs.
+    //! Empty chunkFrames or null onChunk disables streaming for that batch.
+    //! When set, the loop guarantees exactly one isFinal=true callback per such batch on exit.
+    struct PerBatchStreamingHandler
+    {
+        int32_t chunkFrames{0};
+        std::function<void(std::vector<std::vector<int32_t>> const& chunkRvqCodes, bool isFinal)> onChunk;
+    };
+
     //! @param prefillSeqLens Per-batch prefill sequence lengths for correct hidden-state extraction
     //!        after batched prefill with padding. Empty for single-batch callers.
+    //! @param streamingHandlers Optional per-batch streaming chunk emitters. Empty disables streaming
+    //!        globally; otherwise must be sized to activeBatchSize (per-batch entries can still be
+    //!        no-ops via chunkFrames==0 / null onChunk).
     bool runTalkerGenerationLoop(std::vector<PerBatchTalkerState>& states, int32_t activeBatchSize, int32_t maxFrames,
         SamplingParams const& talkerSamplingParams, SamplingParams const& predictorSamplingParams,
         float repetitionPenalty, std::vector<rt::Tensor const*> const& trailingTextHiddens, cudaStream_t stream,
-        std::vector<int64_t> const& prefillSeqLens = {});
+        std::vector<int64_t> const& prefillSeqLens = {},
+        std::vector<PerBatchStreamingHandler> const& streamingHandlers = {});
 
     /*!
      * @brief Run a single Talker decode frame (used by the Thinker-Talker streaming path).
@@ -509,11 +558,21 @@ private:
 
     std::unique_ptr<tokenizer::Tokenizer> mTokenizer; //!< Tokenizer for text-to-token-ID conversion
 
-    std::unique_ptr<LLMEngineRunner> mTalkerLLMRunner;     //!< Talker LLM engine runner
-    std::unique_ptr<LLMEngineRunner> mCodePredictorRunner; //!< CodePredictor engine runner
+    // Talker engine — migrated to EngineExecutor + supporting state
+    LLMEngineConfig mTalkerLLMConfig;                  //!< Talker LLM configuration (parsed from config.json)
+    std::unique_ptr<EngineExecutor> mTalkerExec;       //!< Talker engine executor
+    std::unique_ptr<SharedResources> mTalkerSharedRes; //!< Talker cache managers + RoPE pool + zero buffer
+    std::unique_ptr<PipelineIO> mTalkerPipelineIO; //!< Talker per-step pipeline buffers (selectTokenIdx, contextLen)
+    TensorMap mTalkerTensorMap;                    //!< Talker engine binding map (set once, mutated per-step)
+    std::unique_ptr<StepPreparer> mTalkerStepPreparer; //!< Talker prefill/decode metadata preparer
 
-    LLMEngineRunnerConfig mTalkerLLMConfig;     //!< Talker LLM configuration
-    LLMEngineRunnerConfig mCodePredictorConfig; //!< CodePredictor configuration
+    // CodePredictor engine — migrated to EngineExecutor + supporting state
+    LLMEngineConfig mCodePredictorConfig;                     //!< CodePredictor LLM configuration
+    std::unique_ptr<EngineExecutor> mCodePredictorExec;       //!< CodePredictor engine executor
+    std::unique_ptr<SharedResources> mCodePredictorSharedRes; //!< CodePredictor cache + RoPE + zero buffer
+    std::unique_ptr<PipelineIO> mCodePredictorPipelineIO;     //!< CodePredictor per-step pipeline buffers
+    TensorMap mCodePredictorTensorMap; //!< CodePredictor engine binding map (lm_head_weight rewired per RVQ head)
+    std::unique_ptr<StepPreparer> mCodePredictorStepPreparer; //!< CodePredictor prefill/decode metadata preparer
 
     //! Shared GPU execution context memory for Talker and CodePredictor (kUSER_MANAGED).
     rt::Tensor mSharedExecContextMemory;
@@ -565,24 +624,23 @@ private:
     rt::Tensor mSamplingWorkspace;  //!< Workspace for sampling operations
 
     // Talker LLM workspace (batched)
-    rt::Tensor mTalkerLogits;            //!< Talker output logits [maxBS, vocabSize] FP32
-    rt::Tensor mTalkerSelectedIndices;   //!< Selected token indices [maxBS, 1] INT32
-    rt::Tensor mHostSelectedTokenIds;    //!< Host selected tokens [maxBS] INT32
-    rt::Tensor mHostTalkerContextLength; //!< Host context lengths [maxBS] INT32
-    rt::Tensor mSeenCodecTokensBuf;      //!< Per-batch seen codec tokens [maxBS, maxKVCacheCapacity] INT32
+    rt::Tensor mTalkerLogits;          //!< Talker output logits [maxBS, vocabSize] FP32
+    rt::Tensor mTalkerSelectedIndices; //!< Selected token indices [maxBS, 1] INT32
+    rt::Tensor mHostSelectedTokenIds;  //!< Host selected tokens [maxBS] INT32
+    rt::Tensor mSeenCodecTokensBuf;    //!< Per-batch seen codec tokens [maxBS, maxKVCacheCapacity] INT32
 
     // CodePredictor workspace (batch=1 for per-batch CodePredictor calls)
-    rt::Tensor mCodePredictorLogits;                     //!< CodePredictor output logits [1, codebookSize] FP32
-    std::vector<rt::Tensor> mCodePredictorLogitsPerHead; //!< Per-lm_head logits for CUDA graph capture
-    bool mCodePredictorGraphsCaptured{false};
+    rt::Tensor mCodePredictorLogits; //!< CodePredictor output logits [1, codebookSize] FP32
+    std::vector<rt::Tensor>
+        mCodePredictorLogitsPerHead;            //!< Per-lm_head logits (distinct buffers → distinct graph-cache slots)
     rt::Tensor mCodePredictorSelectedIndices;   //!< Selected code indices [1, 1] INT32
     rt::Tensor mCodePredictorPrefillInput;      //!< Prefill input [1, 2, cpHidden] FP16
     rt::Tensor mCodePredictorCodecIds;          //!< Codec token IDs [1, 1] INT32
     rt::Tensor mCodePredictorCodecEmbed;        //!< Projected codec embed [1, 1, cpHidden] FP16
     rt::Tensor mRawCodecEmbed;                  //!< Raw codec embed [1, 1, talkerHidden] FP16
     rt::Tensor mSmallToMtpProjectedHidden;      //!< Projected talker hidden [1, cpHidden] FP16
-    rt::Tensor mHostSelectedCodeIds;            //!< Host selected codes [1] INT32
-    rt::Tensor mHostCodePredictorContextLength; //!< Host CodePredictor context length [1] INT32
+    rt::Tensor mHostSelectedCodeIds;            //!< Host selected codes [maxBS] INT32
+    rt::Tensor mHostCodePredictorContextLength; //!< Host CodePredictor context length [maxBS] INT32
 
     // Residual + decode buffers (batched for Talker, batch=1 for CodePredictor)
     rt::Tensor mResidualEmbedBuffer; //!< Residual embedding [maxBS, 1, talkerHidden] FP16
@@ -631,35 +689,32 @@ private:
     /*!
      * @brief Execute CodePredictor prefill step using CUDA Graph
      *
-     * Performs prefill inference for one codebook layer using pre-captured CUDA Graph.
-     * The graph already has the correct lm_head bound.
+     * Pure engine wrapper. Batch dim derived from inputsEmbeds.getShape()[0] (1..maxBatchSize).
+     * Resets CP KV cache and stages per-batch context lengths.
      *
-     * @param codecTokenEmbeds Codec token embeddings [1, 2, hiddenSize] — concat([past_hidden, embed(code_0)])
-     * @param generationStep Which lm_head/graph to use (0-14)
-     * @param outputLogits Output logits [1, seqLen, codebookSize] (engine output)
-     * @param outputHiddenStates Output hidden states for residual connection
-     * @param stream CUDA stream
-     * @return True on success, false on failure
+     * @param inputsEmbeds Codec token embeddings [batch, seqLen, cpHidden] — caller builds the batched buffer.
+     * @param lmHeadIdx Which lm_head_weight to bind (0..mNumRvqLayers-1).
+     * @param outputLogits Output logits [batch, codebookSize] (engine output).
+     * @param outputHiddenStates Output hidden states for residual / next step.
+     * @param stream CUDA stream.
      */
-    bool executeCodePredictorPrefillStep(rt::Tensor const& codecTokenEmbeds, int32_t generationStep,
-        rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, cudaStream_t stream);
+    bool executeCodePredictorPrefillStep(rt::Tensor const& inputsEmbeds, int32_t lmHeadIdx, rt::Tensor& outputLogits,
+        rt::Tensor& outputHiddenStates, cudaStream_t stream);
 
     /*!
-     * @brief Execute CodePredictor decoding step using CUDA Graph
+     * @brief Execute CodePredictor decoding step (single token per batch).
      *
-     * Performs single-step decoding for one codebook layer using pre-captured CUDA Graph.
-     * The graph already has the correct lm_head bound.
+     * Pure engine wrapper. Batch dim derived from inputsEmbeds.getShape()[0]. Caller is
+     * responsible for embedding lookup / projection before calling.
      *
-     * @param tokenId Current code token ID
-     * @param embeddingTableIndex Which embedding table to use (0-14)
-     * @param generationStep Which lm_head/graph to use (0-14)
-     * @param outputLogits Output logits [1, 1, codebookSize] (engine output)
-     * @param outputHiddenStates Output hidden states for next residual connection
-     * @param stream CUDA stream
-     * @return True on success, false on failure
+     * @param inputsEmbeds [batch, 1, cpHidden] codec embedding for current step.
+     * @param lmHeadIdx Which lm_head_weight to bind (0..mNumRvqLayers-1).
+     * @param outputLogits [batch, codebookSize] (engine output).
+     * @param outputHiddenStates Output hidden states for next step.
+     * @param stream CUDA stream.
      */
-    bool executeCodePredictorDecodingStep(int32_t tokenId, int32_t embeddingTableIndex, int32_t generationStep,
-        rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, cudaStream_t stream);
+    bool executeCodePredictorDecodingStep(rt::Tensor const& inputsEmbeds, int32_t lmHeadIdx, rt::Tensor& outputLogits,
+        rt::Tensor& outputHiddenStates, cudaStream_t stream);
 
     /*!
      * @brief Load Talker weights from safetensors files

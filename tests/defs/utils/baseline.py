@@ -35,6 +35,14 @@ ROUGE_ACCURACY_THRESHOLD = float(
     os.environ.get('BASELINE_ROUGE_ACCURACY_THRESHOLD', '0.50'))
 PERF_THRESHOLD = 0.50
 
+# Per-column overrides for PERF_THRESHOLD. minADE drift is well-bounded
+# (paper +/- 5%, quant +/- 10%) so 20% is plenty without waiting for the
+# global threshold to be tightened.
+_PERF_THRESHOLD_OVERRIDES = {
+    'accuracy_minade_3s': 0.20,
+    'accuracy_minade_6s': 0.20,
+}
+
 ACCURACY_COLUMNS = (
     'accuracy_rouge_1',
     'accuracy_rouge_2',
@@ -54,6 +62,8 @@ PERF_LOWER_IS_BETTER = {
     'spec_decode_base_model_verification_avg_time (ms)',
     'multimodal_avg_time_per_token (ms)',
     'accuracy_wer',
+    'accuracy_minade_3s',
+    'accuracy_minade_6s',
 }
 
 PERF_HIGHER_IS_BETTER = {
@@ -229,14 +239,15 @@ class BaselineData:
             curr_val = current[col]
             if not isinstance(base_val, (int, float)) or base_val <= 0:
                 continue
+            threshold = _PERF_THRESHOLD_OVERRIDES.get(col, PERF_THRESHOLD)
             change_pct = (curr_val - base_val) / base_val * 100
             label = "worse" if change_pct > 0 else "better"
             line = (f"{col} (lower=better): {curr_val:.2f} vs baseline "
                     f"{base_val:.2f} ({change_pct:+.1f}%, {label})")
             summaries.append(line)
-            if curr_val > base_val * (1 + PERF_THRESHOLD):
+            if curr_val > base_val * (1 + threshold):
                 regressions.append(
-                    f"REGRESSION {line} [threshold {PERF_THRESHOLD*100:.0f}%]")
+                    f"REGRESSION {line} [threshold {threshold*100:.0f}%]")
 
         for col in PERF_HIGHER_IS_BETTER:
             if col not in baseline or col not in current:
@@ -245,14 +256,15 @@ class BaselineData:
             curr_val = current[col]
             if not isinstance(base_val, (int, float)) or base_val <= 0:
                 continue
+            threshold = _PERF_THRESHOLD_OVERRIDES.get(col, PERF_THRESHOLD)
             change_pct = (curr_val - base_val) / base_val * 100
             label = "better" if change_pct > 0 else "worse"
             line = (f"{col} (higher=better): {curr_val:.1f} vs baseline "
                     f"{base_val:.1f} ({change_pct:+.1f}%, {label})")
             summaries.append(line)
-            if curr_val < base_val * (1 - PERF_THRESHOLD):
+            if curr_val < base_val * (1 - threshold):
                 regressions.append(
-                    f"REGRESSION {line} [threshold {PERF_THRESHOLD*100:.0f}%]")
+                    f"REGRESSION {line} [threshold {threshold*100:.0f}%]")
 
         return regressions, summaries
 
@@ -277,6 +289,10 @@ def map_accuracy_result_to_csv(result: Dict) -> Dict[str, float]:
         mapped['accuracy_overall_accuracy'] = result['accuracy']
     if 'wer' in result:
         mapped['accuracy_wer'] = result['wer']
+    if result.get('minade_6s') is not None:
+        mapped['accuracy_minade_6s'] = result['minade_6s']
+    if result.get('minade_3s') is not None:
+        mapped['accuracy_minade_3s'] = result['minade_3s']
     return mapped
 
 
@@ -302,6 +318,110 @@ def _serialise_row(columns: List[str], values: Dict) -> str:
     buf = io.StringIO()
     csv.writer(buf).writerow([values.get(c, '') for c in columns])
     return buf.getvalue()
+
+
+# Minimum relative improvement required for promote_baseline_if_better to
+# overwrite a baseline cell. Anything smaller is treated as noise.
+PROMOTE_MIN_IMPROVEMENT = 0.01
+
+
+def _is_significantly_better(col: str, curr, base) -> bool:
+    if not isinstance(curr,
+                      (int, float)) or not isinstance(base, (int, float)):
+        return False
+    if base <= 0:
+        return False
+    if col in PERF_LOWER_IS_BETTER:
+        return curr < base * (1 - PROMOTE_MIN_IMPROVEMENT)
+    if col in PERF_HIGHER_IS_BETTER or col in ACCURACY_COLUMNS:
+        return curr > base * (1 + PROMOTE_MIN_IMPROVEMENT)
+    return False
+
+
+def promote_baseline_if_better(csv_path: str,
+                               model_type_value: str,
+                               test_func: str,
+                               param_str: str,
+                               result: Dict,
+                               logger=None) -> List[str]:
+    """Replace baseline cells where the current run is >1% better.
+
+    Gated by the ``PROMOTE_BASELINE`` env var; no-op otherwise. Direction is
+    per-column via PERF_LOWER_IS_BETTER / PERF_HIGHER_IS_BETTER / ACCURACY_COLUMNS.
+    Returns the list of columns that were overwritten (for logging).
+    """
+    if not os.environ.get('PROMOTE_BASELINE'):
+        return []
+    if not os.path.isfile(csv_path) or os.path.getsize(csv_path) == 0:
+        return []
+
+    metrics: Dict[str, float] = {}
+    metrics.update(map_accuracy_result_to_csv(result))
+    metrics.update(parse_perf_from_output(result.get('output', '')))
+    if not metrics:
+        return []
+
+    case_name = _build_case_name(model_type_value, test_func, param_str)
+
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    HEADER_PREFIX = '#Case Name'
+    header_line_start = content.find(HEADER_PREFIX)
+    if header_line_start == -1:
+        return []
+    header_line_end = content.find('\n', header_line_start)
+    cols = next(
+        csv.reader(io.StringIO(content[header_line_start +
+                                       1:header_line_end])))
+    if 'Case Name' not in cols:
+        return []
+    case_idx = cols.index('Case Name')
+
+    body_start = header_line_end + 1
+    raw_rows = content[body_start:].splitlines(keepends=True)
+    promoted: List[str] = []
+    new_rows = []
+    for raw in raw_rows:
+        stripped = raw.rstrip('\n')
+        if not stripped.strip() or stripped.startswith('#'):
+            new_rows.append(raw)
+            continue
+        row = next(csv.reader(io.StringIO(stripped)))
+        # Pad short rows so col lookups don't raise.
+        while len(row) < len(cols):
+            row.append('')
+        if row[case_idx] != case_name:
+            new_rows.append(raw)
+            continue
+        for col, curr in metrics.items():
+            if col not in cols:
+                continue
+            j = cols.index(col)
+            try:
+                base = float(row[j]) if row[j] else None
+            except ValueError:
+                base = None
+            if base is None or not _is_significantly_better(col, curr, base):
+                continue
+            row[j] = f"{curr}"
+            promoted.append(f"{col}: {base} -> {curr}")
+        new_rows.append(_serialise_row(cols, dict(zip(cols, row))))
+
+    if not promoted:
+        return []
+
+    with open(csv_path, 'w', encoding='utf-8') as f:
+        f.write(content[:body_start] + ''.join(new_rows))
+
+    # Invalidate the singleton so subsequent reads see the updated CSV.
+    global _baseline_csv_path
+    _baseline_csv_path = None
+
+    if logger:
+        logger.info("Promoted baseline cells for [%s]:\n  %s", param_str,
+                    "\n  ".join(promoted))
+    return promoted
 
 
 def save_to_baseline(csv_path: str, model_type_value: str, test_func: str,
