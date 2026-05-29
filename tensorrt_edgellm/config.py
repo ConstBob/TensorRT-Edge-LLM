@@ -889,6 +889,8 @@ def _normalize_module_name(name: str) -> str:
     """
     if name.startswith("model.language_model."):
         return name[len("model.language_model."):]
+    if name.startswith("thinker.model."):
+        return name[len("thinker.model."):]
     for prefix in _VL_LLM_PREFIXES + ("model.", ):
         if name.startswith(prefix):
             return name[len(prefix):]
