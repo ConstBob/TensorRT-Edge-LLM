@@ -59,7 +59,8 @@ import torch.nn.functional as F
 
 from ...config import LAYER_GDN, GdnConfig, ModelConfig
 from ..default.modeling_default import MLP, OnnxSpec, RMSNorm
-from ..linear import FP16Linear, NVFP4Linear, make_linear
+from ..linear import (FP16Linear, NVFP4LinearMethod, ReplicatedLinear,
+                      is_nvfp4_linear, make_linear)
 from ..ops import attention_plugin, causal_conv1d, gated_delta_net
 
 __all__ = ["Qwen3_5CausalLM"]
@@ -703,7 +704,7 @@ def fuse_gdn_input_projections(model: nn.Module) -> int:
         first_proj = mixer.in_proj_qkv
         if isinstance(first_proj, FP16Linear):
             pass  # always fusible
-        elif isinstance(first_proj, NVFP4Linear):
+        elif is_nvfp4_linear(first_proj):
             if not _can_fuse_nvfp4_scales(mixer):
                 logger.warning(
                     "GDN fusion skipped for %s: NVFP4 scalar scales "
@@ -733,9 +734,15 @@ def fuse_gdn_input_projections(model: nn.Module) -> int:
         # Build a fused linear with correct type.
         fused_out_dim = sum(mixer._fused_splits)
         in_features = first_proj.in_features
-        if isinstance(first_proj, NVFP4Linear):
-            fused_linear = NVFP4Linear(in_features, fused_out_dim,
-                                       first_proj.group_size)
+        if is_nvfp4_linear(first_proj):
+            method = NVFP4LinearMethod(
+                group_size=first_proj.quant_method.group_size)
+            fused_linear = ReplicatedLinear(in_features,
+                                            fused_out_dim,
+                                            bias=False,
+                                            dtype=torch.float16,
+                                            mapping=first_proj.mapping,
+                                            quant_method=method)
         else:
             fused_linear = FP16Linear(in_features, fused_out_dim)
 

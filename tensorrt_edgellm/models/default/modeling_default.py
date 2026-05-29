@@ -44,7 +44,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ...config import ModelConfig
-from ..linear import FP16Linear, make_linear
+from ..linear import FP16Linear, TPMode, make_linear
 from ..ops import attention_plugin
 
 __all__ = [
@@ -221,17 +221,20 @@ class Attention(nn.Module):
                                   qkv_in_features,
                                   num_attention_heads * head_dim,
                                   bias=config.attention_bias,
-                                  module_name=f"{module_prefix}.q_proj")
+                                  module_name=f"{module_prefix}.q_proj",
+                                  tp_mode=TPMode.COL)
         self.k_proj = make_linear(config,
                                   qkv_in_features,
                                   num_key_value_heads * head_dim,
                                   bias=config.attention_bias,
-                                  module_name=f"{module_prefix}.k_proj")
+                                  module_name=f"{module_prefix}.k_proj",
+                                  tp_mode=TPMode.COL)
         self.v_proj = make_linear(config,
                                   qkv_in_features,
                                   num_key_value_heads * head_dim,
                                   bias=config.attention_bias,
-                                  module_name=f"{module_prefix}.v_proj")
+                                  module_name=f"{module_prefix}.v_proj",
+                                  tp_mode=TPMode.COL)
         # FP8 KV-cache scales live on the proj modules (checkpoint keys
         # ``...k_proj.k_scale`` / ``...v_proj.v_scale``); they are not part of
         # FP8Linear's per-tensor weight/input scales.
@@ -242,7 +245,8 @@ class Attention(nn.Module):
         self.o_proj = make_linear(config,
                                   num_attention_heads * head_dim,
                                   hidden_size,
-                                  module_name=f"{module_prefix}.o_proj")
+                                  module_name=f"{module_prefix}.o_proj",
+                                  tp_mode=TPMode.ROW)
 
         if config.has_qk_norm:
             self.q_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
@@ -329,17 +333,20 @@ class MLP(nn.Module):
             config,
             config.hidden_size,
             config.intermediate_size,
-            module_name=f"{module_prefix}.gate_proj" if module_prefix else "")
+            module_name=f"{module_prefix}.gate_proj" if module_prefix else "",
+            tp_mode=TPMode.COL)
         self.up_proj = make_linear(
             config,
             config.hidden_size,
             config.intermediate_size,
-            module_name=f"{module_prefix}.up_proj" if module_prefix else "")
+            module_name=f"{module_prefix}.up_proj" if module_prefix else "",
+            tp_mode=TPMode.COL)
         self.down_proj = make_linear(
             config,
             config.intermediate_size,
             config.hidden_size,
-            module_name=f"{module_prefix}.down_proj" if module_prefix else "")
+            module_name=f"{module_prefix}.down_proj" if module_prefix else "",
+            tp_mode=TPMode.ROW)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.down_proj(

@@ -84,6 +84,7 @@ _OUTPUT_DIR_MAP = {
     (lambda cfg: cfg.get_audio_onnx_dir("fp16"), "fp16 audio encoder"),
     "code2wav":
     (lambda cfg: cfg.get_code2wav_onnx_dir("fp16"), "fp16 Code2Wav"),
+    "action": (lambda cfg: cfg.get_action_onnx_dir(), "action expert"),
 }
 
 
@@ -282,6 +283,11 @@ def run_checkpoint_export(config: TestConfig,
             extra_args.append(
                 f"--reduced-vocab-dir={config.get_reduced_vocab_dir()}")
             label += f" (rvs{config.reduced_vocab_size})"
+        if (config.model_type == ModelType.VLA
+                and config.max_kv_cache_capacity is not None):
+            extra_args.append(
+                f"--max-kv-cache-capacity={config.max_kv_cache_capacity}")
+            label += f" (mxkvc{config.max_kv_cache_capacity})"
 
         _run_export_subprocess(model_dir,
                                tmp_dir,
