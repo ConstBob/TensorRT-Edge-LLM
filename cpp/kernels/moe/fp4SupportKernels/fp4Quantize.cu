@@ -565,8 +565,8 @@ __launch_bounds__(512, 4) __global__ void buildLayoutAndQuantizeRoutedToFp4Linea
 void fp4Quantize(rt::Tensor const& input, rt::Tensor const& globalSF, rt::Tensor& outputFP4, rt::Tensor& outputSF,
     cudaStream_t stream)
 {
-    int64_t const M = input.getShape().at(0);
-    int64_t const N = input.getShape().at(1);
+    int64_t const M = input.getShape()[0];
+    int64_t const N = input.getShape()[1];
     int const numColThreads = static_cast<int>(N) / kEltsPerThread;
     int const blockSize = std::min(numColThreads, 512);
     int const numPaddedRows = static_cast<int>(divUp(M, 128) * 128);
@@ -602,8 +602,8 @@ void fp4Quantize(rt::Tensor const& input, rt::Tensor const& globalSF, rt::Tensor
 void fp4QuantizeLinearSF(rt::Tensor const& input, rt::Tensor const& globalSF, rt::Tensor& outputFP4,
     rt::Tensor& outputSF, cudaStream_t stream)
 {
-    int64_t const M = input.getShape().at(0);
-    int64_t const N = input.getShape().at(1);
+    int64_t const M = input.getShape()[0];
+    int64_t const N = input.getShape()[1];
     if (N <= 0 || N % kSfVecSize != 0)
     {
         throw std::runtime_error("fp4QuantizeLinearSF: input N must be a positive multiple of 16.");
@@ -647,9 +647,9 @@ void fp4QuantizeLinearSF(rt::Tensor const& input, rt::Tensor const& globalSF, rt
 void fp4QuantizeRoutedLinearSF(rt::Tensor const& input, rt::Tensor const& topkIds, rt::Tensor const& expertGlobalSF,
     rt::Tensor& outputFP4, rt::Tensor& outputSF, cudaStream_t stream)
 {
-    int64_t const M = input.getShape().at(0);
-    int64_t const N = input.getShape().at(1);
-    int64_t const topK = topkIds.getShape().at(1);
+    int64_t const M = input.getShape()[0];
+    int64_t const N = input.getShape()[1];
+    int64_t const topK = topkIds.getShape()[1];
     if (N <= 0 || N % kSfVecSize != 0)
     {
         throw std::runtime_error("fp4QuantizeRoutedLinearSF: input N must be a positive multiple of 16.");
@@ -698,9 +698,9 @@ void fp4BuildLayoutAndQuantizeRoutedLinearSFDecode(rt::Tensor const& input, rt::
     rt::Tensor const& expertGlobalSF, MoELayoutBuffers& layoutBuffers, rt::Tensor& outputFP4, rt::Tensor& outputSF,
     int32_t localNumExperts, int32_t tileSize, cudaStream_t stream)
 {
-    int64_t const M = input.getShape().at(0);
-    int64_t const N = input.getShape().at(1);
-    int64_t const topK = topkIds.getShape().at(1);
+    int64_t const M = input.getShape()[0];
+    int64_t const N = input.getShape()[1];
+    int64_t const topK = topkIds.getShape()[1];
     if (M != 1)
     {
         throw std::runtime_error("fp4BuildLayoutAndQuantizeRoutedLinearSFDecode: input M must be 1.");
@@ -724,9 +724,9 @@ void fp4BuildLayoutAndQuantizeRoutedLinearSFDecode(rt::Tensor const& input, rt::
         throw std::runtime_error(
             "fp4BuildLayoutAndQuantizeRoutedLinearSFDecode: input N must be a positive multiple of 16.");
     }
-    if (layoutBuffers.tileIdxToGroupIdx.getShape().at(0) < topK
-        || layoutBuffers.tileIdxToMnLimit.getShape().at(0) < topK
-        || layoutBuffers.permutedIdxToExpandedIdx.getShape().at(0) < topK * tileSize)
+    if (layoutBuffers.tileIdxToGroupIdx.getShape()[0] < topK
+        || layoutBuffers.tileIdxToMnLimit.getShape()[0] < topK
+        || layoutBuffers.permutedIdxToExpandedIdx.getShape()[0] < topK * tileSize)
     {
         throw std::runtime_error("fp4BuildLayoutAndQuantizeRoutedLinearSFDecode: layout buffers are too small.");
     }
