@@ -261,10 +261,23 @@ def _build_shard_map(model_dir: str) -> Dict[str, str]:
         with open(index_path) as f:
             index = json.load(f)
         weight_map: Dict[str, str] = index["weight_map"]
-        return {
-            key: os.path.join(model_dir, shard)
-            for key, shard in weight_map.items()
+        missing_shards = {
+            shard
+            for shard in set(weight_map.values())
+            if not os.path.exists(os.path.join(model_dir, shard))
         }
+        if missing_shards and os.path.exists(single_path):
+            logger.warning(
+                "Ignoring stale %s because shard file(s) are missing and "
+                "single-file model.safetensors exists: %s",
+                index_path,
+                ", ".join(sorted(missing_shards)),
+            )
+        else:
+            return {
+                key: os.path.join(model_dir, shard)
+                for key, shard in weight_map.items()
+            }
 
     if os.path.exists(single_path):
         keys: Dict[str, str] = {}
@@ -272,6 +285,12 @@ def _build_shard_map(model_dir: str) -> Dict[str, str]:
             for key in f.keys():
                 keys[key] = single_path
         return keys
+
+    if os.path.exists(index_path):
+        return {
+            key: os.path.join(model_dir, shard)
+            for key, shard in weight_map.items()
+        }
 
     # ---- PyTorch pickle (.bin) fallback ---------------------------------
     bin_index_path = os.path.join(model_dir, "pytorch_model.bin.index.json")

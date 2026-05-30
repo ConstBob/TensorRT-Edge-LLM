@@ -71,7 +71,7 @@ NUM_K_ITERS = TILE_K // ROWS_PER_ITER   # = 16
 
 # Max T steps baked into the Phase-1 SMEM layout. AOT export uses this value.
 # At runtime, seq_len can be 1..T_MAX_AOT.
-T_MAX_AOT = 8
+T_MAX_AOT = 16
 
 # AOT placeholder shapes — only N/H/HV are dynamic shape markers.
 AOT_PLACEHOLDER_N   = 1
@@ -79,7 +79,7 @@ AOT_PLACEHOLDER_H   = 14
 AOT_PLACEHOLDER_HV  = 14
 AOT_PLACEHOLDER_K   = 128
 AOT_PLACEHOLDER_V   = 128
-AOT_PLACEHOLDER_T   = 4     # representative T for compilation
+AOT_PLACEHOLDER_T   = 8     # representative T for compilation
 
 
 # ---------------------------------------------------------------------------

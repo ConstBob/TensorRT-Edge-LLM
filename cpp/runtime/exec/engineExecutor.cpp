@@ -60,11 +60,26 @@ std::unique_ptr<EngineExecutor> EngineExecutor::createForLLM(std::filesystem::pa
     return std::unique_ptr<EngineExecutor>(new EngineExecutor(enginePath, std::move(registry)));
 }
 
-std::unique_ptr<EngineExecutor> EngineExecutor::createForSpecDecodeDraft(
+std::unique_ptr<EngineExecutor> EngineExecutor::createForDraft(
     std::filesystem::path const& enginePath, DeploymentConfig const& bundle)
 {
-    auto registry = buildRegistryForSpecDecodeDraft(bundle);
-    return std::unique_ptr<EngineExecutor>(new EngineExecutor(enginePath, std::move(registry)));
+    switch (bundle.specDecodeMode())
+    {
+    case SpecDecodeMode::kMTP:
+    case SpecDecodeMode::kEAGLE:
+    {
+        auto registry = buildRegistryForSpecDecodeDraft(bundle);
+        return std::unique_ptr<EngineExecutor>(new EngineExecutor(enginePath, std::move(registry)));
+    }
+    case SpecDecodeMode::kDFlash:
+    {
+        auto registry = buildRegistryForDFlashDraft(bundle);
+        return std::unique_ptr<EngineExecutor>(new EngineExecutor(enginePath, std::move(registry)));
+    }
+    case SpecDecodeMode::kNONE:
+    default: ELLM_CHECK(false, "createForDraft requires a speculative decoding deployment with a draft engine.");
+    }
+    return nullptr;
 }
 
 EngineExecutor::~EngineExecutor() noexcept

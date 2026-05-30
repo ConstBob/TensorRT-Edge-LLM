@@ -27,6 +27,17 @@ namespace trt_edgellm
 {
 namespace rt
 {
+namespace
+{
+void validateDFlashDraftTargetLayerIds(LLMEngineConfig const& base, LLMEngineConfig const& draft)
+{
+    for (int32_t layerId : draft.dflashTargetLayerIds)
+    {
+        ELLM_CHECK(layerId >= 0 && layerId < base.numDecoderLayers,
+            "DFlash draft target layer id " + std::to_string(layerId) + " is outside [0, base.num_hidden_layers).");
+    }
+}
+} // namespace
 
 int32_t DeploymentConfig::maxRuntimeBatchSize() const
 {
@@ -88,6 +99,11 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
         cfg.draft = parseDraftEngineConfig(*draftConfigPath);
     }
 
+    if (cfg.base.specDecodeType == SpecDecodeMode::kDFlash && cfg.draft.has_value())
+    {
+        validateDFlashDraftTargetLayerIds(cfg.base, *cfg.draft);
+    }
+
     // No cross-engine consistency check needed: each engine's builder_config
     // carries only its own sequence budget. The base emits
     // `max_verify_tree_size` (its verification budget); the draft emits
@@ -98,6 +114,11 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
     // --- Build consolidated SpecDecodeConfig and validate drafting limits ---
     if (draftingConfig.has_value())
     {
+        ELLM_CHECK(cfg.base.specDecodeType != SpecDecodeMode::kNONE,
+            "drafting configuration was provided but base config is not a speculative decoding base engine.");
+        ELLM_CHECK(cfg.draft.has_value() && cfg.draft->specDecodeType == cfg.base.specDecodeType,
+            "base and draft speculative decoding modes must match.");
+
         // Positivity: each drafting field must be >= 1. Rejecting zero/negative
         // up front lets downstream arithmetic (the topK * step multiply below)
         // proceed under a clean invariant and produces a clearer error than a
@@ -137,6 +158,23 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
             "drafting.verifySize=" + std::to_string(specConfig.verifySize)
                 + " exceeds base.maxVerifyTreeSize=" + std::to_string(specConfig.maxVerifySize)
                 + ". Verification size exceeds base engine maximum verification size.");
+
+        if (cfg.base.specDecodeType == SpecDecodeMode::kDFlash)
+        {
+            static constexpr int32_t kDFlashMaxVerifySize = 16;
+            ELLM_CHECK(specConfig.draftingTopK == 1 && specConfig.draftingStep == 1,
+                "DFlash Phase 1 supports draftingTopK=1 and draftingStep=1 only.");
+            ELLM_CHECK(specConfig.verifySize <= specConfig.maxDraftProposalSize,
+                "DFlash verifySize=" + std::to_string(specConfig.verifySize)
+                    + " exceeds draft.maxDraftTreeSize=" + std::to_string(specConfig.maxDraftProposalSize)
+                    + ". DFlash drafts one full verify block per iteration.");
+            bool const hasLinearAttnLayers = (cfg.base.numLinearAttnLayers > 0);
+            std::string const verifyLimitReason
+                = hasLinearAttnLayers ? "Qwen3.5 GDN/causal-conv intermediate-state limit" : "DFlash limit";
+            ELLM_CHECK(specConfig.verifySize <= kDFlashMaxVerifySize,
+                "DFlash verifySize=" + std::to_string(specConfig.verifySize) + " exceeds " + verifyLimitReason + " of "
+                    + std::to_string(kDFlashMaxVerifySize) + ".");
+        }
 
         cfg.specConfig = specConfig;
     }

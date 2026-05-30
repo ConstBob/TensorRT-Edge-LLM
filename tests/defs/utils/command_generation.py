@@ -32,6 +32,10 @@ AVAILABLE_LORA_WEIGHTS = {
 }
 
 
+def _uses_spec_decode(config: TestConfig) -> bool:
+    return bool(config.is_eagle or config.is_mtp or config.is_dflash)
+
+
 def _tensorrt_edgellm_module_shell(module: str, args: List[str]) -> str:
     edgellm_root = get_tensorrt_edgellm_root()
     if not edgellm_root:
@@ -343,10 +347,10 @@ def generate_post_tensorrt_edgellm_commands(
 def _generate_draft_build_commands(
         config: TestConfig,
         executable_files: Dict[str, str]) -> List[Tuple[List[str], int]]:
-    """Generate draft model build commands for EAGLE"""
+    """Generate draft model build commands for speculative decoding."""
     commands = []
 
-    if not config.is_eagle:
+    if not _uses_spec_decode(config):
         return commands
 
     draft_cmd = [executable_files['llm_build']]
@@ -380,7 +384,7 @@ def generate_build_commands(
             f"--maxBatchSize={config.max_batch_size}"
         ])
 
-        if config.is_eagle:
+        if _uses_spec_decode(config):
             cmd.append("--specBase")
             cmd.append(f"--maxVerifyTreeSize={config.max_verify_tree_size}")
 
@@ -403,7 +407,7 @@ def generate_build_commands(
             f"--maxBatchSize={config.max_batch_size}"
         ])
 
-        if config.is_eagle:
+        if _uses_spec_decode(config):
             llm_cmd.append("--specBase")
             llm_cmd.append(
                 f"--maxVerifyTreeSize={config.max_verify_tree_size}")
@@ -637,8 +641,8 @@ def generate_inference_commands(
         f"--outputFile={config.get_output_json_file()}", f"--dumpProfile"
     ])
 
-    # Add EAGLE parameters
-    if config.is_eagle:
+    # Add speculative decoding parameters.
+    if _uses_spec_decode(config):
         cmd.append("--specDecode")
         cmd.append(f"--specDraftTopK={config.eagle_draft_top_k}")
         cmd.append(f"--specDraftStep={config.eagle_draft_step}")
@@ -691,8 +695,8 @@ def generate_e2e_bench_commands(
         f"--outputFile={config.get_output_json_file()}", f"--dumpProfile"
     ])
 
-    # Add EAGLE parameters
-    if config.is_eagle:
+    # Add speculative decoding parameters.
+    if _uses_spec_decode(config):
         cmd.append("--specDecode")
         cmd.append(f"--specDraftTopK={config.eagle_draft_top_k}")
         cmd.append(f"--specDraftStep={config.eagle_draft_step}")

@@ -313,7 +313,7 @@ bool EagleDraftEngineRunner::initializeConfigFromJson(Json const& configJson) no
 
         // Define required fields for builder_config
         std::vector<std::string> const requiredBuilderConfigFields
-            = {"max_batch_size", "max_input_len", "max_kv_cache_capacity", "eagle_draft", "max_draft_tree_size"};
+            = {"max_batch_size", "max_input_len", "max_kv_cache_capacity", "max_draft_tree_size"};
 
         // Validate required fields exist in builder_config
         for (auto const& field : requiredBuilderConfigFields)
@@ -324,11 +324,18 @@ bool EagleDraftEngineRunner::initializeConfigFromJson(Json const& configJson) no
                 return false;
             }
         }
-
-        // Validate this is actually an Eagle draft model
-        if (!builderConfig["eagle_draft"].get<bool>())
+        if (!builderConfig.contains("spec_draft") && !builderConfig.contains("eagle_draft"))
         {
-            LOG_ERROR("initializeConfigFromJson(): Config indicates this is not an Eagle draft model");
+            LOG_ERROR("initializeConfigFromJson(): Missing required field 'spec_draft' in builder_config");
+            return false;
+        }
+
+        // Validate this is actually a speculative draft model.
+        bool const specDraft = builderConfig.contains("spec_draft") ? builderConfig["spec_draft"].get<bool>()
+                                                                    : builderConfig["eagle_draft"].get<bool>();
+        if (!specDraft)
+        {
+            LOG_ERROR("initializeConfigFromJson(): Config indicates this is not a speculative draft model");
             return false;
         }
 

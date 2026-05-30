@@ -721,14 +721,14 @@ int main(int argc, char** argv)
         std::filesystem::path enginePath;
         if (useDraftEngine)
         {
-            enginePath = dir / "eagle_draft.engine";
+            enginePath = dir / "spec_draft.engine";
         }
         else
         {
             enginePath = dir / "llm.engine";
             if (!std::filesystem::exists(enginePath))
             {
-                enginePath = dir / "eagle_base.engine";
+                enginePath = dir / "spec_base.engine";
             }
         }
 
@@ -736,7 +736,7 @@ int main(int argc, char** argv)
         {
             if (useDraftEngine)
             {
-                executor = rt::EngineExecutor::createForSpecDecodeDraft(enginePath, deployment);
+                executor = rt::EngineExecutor::createForDraft(enginePath, deployment);
             }
             else
             {

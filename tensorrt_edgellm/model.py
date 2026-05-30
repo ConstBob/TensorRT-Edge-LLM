@@ -23,12 +23,14 @@ the default :class:`~models.default.modeling_default.CausalLM` for a given
 ``model_type`` string.
 """
 
+import os
 from typing import Dict, Type
 
 import torch.nn as nn
 
 from .checkpoint.loader import load_weights
-from .config import ModelConfig, make_mtp_draft_config
+from .config import (ModelConfig, make_dflash_draft_config,
+                     make_mtp_draft_config)
 
 __all__ = ["AutoModel", "register_model", "dtype_summary", "param_count"]
 
@@ -65,7 +67,10 @@ class AutoModel:
                         mtp_base: bool = False,
                         mtp_draft: bool = False,
                         tp_size: int = 1,
-                        tp_rank: int = 0) -> nn.Module:
+                        tp_rank: int = 0,
+                        dflash_base: bool = False,
+                        dflash_draft: bool = False,
+                        dflash_draft_dir: "str | None" = None) -> nn.Module:
         """Construct and load a model from *model_dir*.
 
         Reads ``config.json`` via :class:`~config.ModelConfig`, looks up the
@@ -98,6 +103,10 @@ class AutoModel:
                             :meth:`ModelConfig.for_rank`, and weights
                             are sharded on assignment.  Default 1 = no TP.
             tp_rank:        This rank's index in [0, tp_size).
+            dflash_base:    When True, export as DFlash base model.
+            dflash_draft:   When True, build the DFlash draft model.
+            dflash_draft_dir:
+                            Path to the DFlash draft checkpoint directory.
 
         Returns:
             Loaded ``nn.Module`` in eval mode.
@@ -112,13 +121,32 @@ class AutoModel:
             config.eagle_base = True
         if mtp_base or config.mtp_base:
             config.mtp_base = True
+        if dflash_base:
+            config.dflash_base = True
+            # Read target_layer_ids from DFlash draft checkpoint if provided
+            if not config.dflash_target_layer_ids and dflash_draft_dir:
+                import json
+                draft_cfg_path = os.path.join(dflash_draft_dir, "config.json")
+                if os.path.isfile(draft_cfg_path):
+                    with open(draft_cfg_path) as f:
+                        draft_cfg = json.load(f)
+                    dflash_cfg = draft_cfg.get("dflash_config", {})
+                    config.dflash_target_layer_ids = dflash_cfg.get(
+                        "target_layer_ids", [1, 8, 15, 22, 29])
+                    config.dflash_block_size = dflash_cfg.get("block_size", 16)
+                    config.dflash_mask_token_id = dflash_cfg.get(
+                        "mask_token_id", 248070)
+            if not config.dflash_target_layer_ids:
+                config.dflash_target_layer_ids = [1, 8, 15, 22, 29]
         if tp_size > 1:
             config = config.for_rank(tp_rank, tp_size)
 
         variant = _resolve_model_variant(config,
                                          eagle_base=eagle_base,
                                          mtp_base=config.mtp_base,
-                                         mtp_draft=mtp_draft)
+                                         mtp_draft=mtp_draft,
+                                         dflash_base=config.dflash_base,
+                                         dflash_draft=dflash_draft)
 
         # EAGLE3 draft: auto-detect from draft_vocab_size
         if variant == "eagle3_draft":
@@ -140,11 +168,26 @@ class AutoModel:
             if key_remap is None:
                 key_remap = lambda key: _mtp_key_remap(
                     key, tie_word_embeddings=tie_word_embeddings)
+        elif variant == "dflash_draft":
+            if dflash_draft_dir is None:
+                raise ValueError(
+                    "dflash_draft requires dflash_draft_dir to be set.")
+            from .models.dflash.modeling_dflash_draft import DFlashDraftModel
+            base_model_dir = model_dir
+            base_tie_word_embeddings = config.tie_word_embeddings
+            config = make_dflash_draft_config(dflash_draft_dir)
+            model_class = DFlashDraftModel
+            model_dir = dflash_draft_dir
+            if key_remap is None:
+                key_remap = _dflash_key_remap
         else:
             if variant == "mtp_base" and config.model_type != "qwen3_5_text":
                 raise NotImplementedError(
                     "Qwen3.5 dense MTP base is only supported for qwen3_5_text checkpoints."
                 )
+            # DFlash base is supported for both Qwen3.5 hybrid (qwen3_5_text) and
+            # dense Qwen3 (default CausalLM). Dense models use the Transformer's
+            # dflash_target_layer_ids parameter to collect target-layer hidden states.
             model_class = _MODEL_REGISTRY.get(config.model_type, CausalLM)
 
         model = model_class(config)
@@ -173,6 +216,11 @@ class AutoModel:
                      key_prefix=key_prefix,
                      pre_repack_hook=pre_repack_hook,
                      mapping=config.mapping)
+        if variant == "dflash_draft":
+            _load_dflash_lm_head(model,
+                                 base_model_dir,
+                                 device,
+                                 tie_word_embeddings=base_tie_word_embeddings)
         if reduced_vocab_dir is not None and pre_repack_hook is None:
             from .vocab_reduction.onnx_export import \
                 apply_reduced_vocab_from_dir
@@ -206,8 +254,13 @@ def dtype_summary(model: nn.Module) -> Dict[str, int]:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_model_variant(config: ModelConfig, *, eagle_base: bool,
-                           mtp_base: bool, mtp_draft: bool) -> str:
+def _resolve_model_variant(config: ModelConfig,
+                           *,
+                           eagle_base: bool,
+                           mtp_base: bool,
+                           mtp_draft: bool,
+                           dflash_base: bool = False,
+                           dflash_draft: bool = False) -> str:
     """Resolve the requested model variant while keeping EAGLE3 behavior intact."""
     if eagle_base and mtp_base:
         raise ValueError("eagle_base and mtp_base cannot both be enabled.")
@@ -215,12 +268,25 @@ def _resolve_model_variant(config: ModelConfig, *, eagle_base: bool,
         raise ValueError("eagle_base and mtp_draft cannot both be enabled.")
     if mtp_base and mtp_draft:
         raise ValueError("mtp_base and mtp_draft cannot both be enabled.")
+    if dflash_base and dflash_draft:
+        raise ValueError(
+            "dflash_base and dflash_draft cannot both be enabled.")
+    if dflash_base and (eagle_base or mtp_base or mtp_draft):
+        raise ValueError(
+            "dflash_base cannot be combined with eagle/mtp variants.")
+    if dflash_draft and (eagle_base or mtp_base or mtp_draft):
+        raise ValueError(
+            "dflash_draft cannot be combined with eagle/mtp variants.")
     if config.is_eagle3_draft:
         if mtp_base or mtp_draft:
             raise ValueError(
                 "EAGLE3 draft checkpoints cannot be loaded as Qwen3.5 MTP variants."
             )
         return "eagle3_draft"
+    if dflash_draft:
+        return "dflash_draft"
+    if dflash_base:
+        return "dflash_base"
     if mtp_draft:
         return "mtp_draft"
     if mtp_base:
@@ -252,6 +318,128 @@ def _eagle3_key_remap(key: str) -> "str | None":
     key = key.replace("qkv_proj.k_proj", "k_proj")
     key = key.replace("qkv_proj.v_proj", "v_proj")
     key = key.replace("._pre_quant_scale", ".pre_quant_scale")
+    return key
+
+
+def _load_dflash_lm_head(model: nn.Module,
+                         base_model_dir: str,
+                         device: str,
+                         *,
+                         tie_word_embeddings: bool = True) -> None:
+    """Load the DFlash draft lm_head from the base model checkpoint.
+
+    Deterministic source selection (matching MTP pattern):
+      1. Explicit ``lm_head.weight`` from the base checkpoint.
+      2. Embedding fallback *only* when ``tie_word_embeddings=True``.
+      3. Otherwise fail loudly — untied models must not use embeddings.
+
+    Quantized draft checkpoints own their packed lm_head buffers.  The generic
+    checkpoint loader has already copied them before this helper runs, so only
+    FP16 draft heads are overwritten from the original base checkpoint.
+    """
+    import logging
+    import os
+
+    import torch
+    from safetensors import safe_open
+
+    from .models.linear import FP16Linear, is_nvfp4_linear
+
+    logger = logging.getLogger(__name__)
+    lm_head = getattr(model, "lm_head", None)
+    if lm_head is None:
+        logger.warning("DFlash draft model has no lm_head; skipping.")
+        return
+
+    if is_nvfp4_linear(lm_head):
+        required = ("weight", "weight_scale", "weight_scale_2", "input_scale")
+        missing = [name for name in required if not hasattr(lm_head, name)]
+        if missing:
+            raise ValueError(
+                "DFlash NVFP4 lm_head is missing quantized buffers: "
+                f"{missing}")
+        logger.info(
+            "DFlash lm_head source: quantized draft checkpoint buffers")
+        return
+
+    from .checkpoint.loader import _build_shard_map
+    shard_map = _build_shard_map(base_model_dir)
+
+    # --- Determine source key with strict priority ---
+    lm_head_candidates = [
+        "lm_head.weight",
+        "model.lm_head.weight",
+        "language_model.lm_head.weight",
+        "model.language_model.lm_head.weight",
+    ]
+    embed_candidates = [
+        "model.embed_tokens.weight",
+        "embed_tokens.weight",
+        "model.language_model.embed_tokens.weight",
+        "language_model.model.embed_tokens.weight",
+    ]
+
+    # Priority 1: explicit lm_head.weight from base checkpoint
+    source_key = None
+    source_type = None
+    for cand in lm_head_candidates:
+        if cand in shard_map:
+            source_key = cand
+            source_type = "lm_head"
+            break
+
+    # Priority 2: embedding fallback only if tie_word_embeddings
+    if source_key is None:
+        if tie_word_embeddings:
+            for cand in embed_candidates:
+                if cand in shard_map:
+                    source_key = cand
+                    source_type = "tied_embedding"
+                    break
+        else:
+            raise ValueError(
+                "DFlash lm_head: base model at %s has "
+                "tie_word_embeddings=False but no lm_head.weight found. "
+                "Cannot safely fall back to embed_tokens." % base_model_dir)
+
+    if source_key is None:
+        raise ValueError(
+            "Cannot find lm_head.weight or embed_tokens.weight in "
+            "base model at %s." % base_model_dir)
+
+    shard_path = shard_map[source_key]
+    if source_type == "tied_embedding":
+        logger.info("DFlash lm_head source: %s (tied fallback) from %s",
+                    source_key, os.path.basename(shard_path))
+    else:
+        logger.info("DFlash lm_head source: %s from %s", source_key,
+                    os.path.basename(shard_path))
+
+    with safe_open(shard_path, framework="pt", device=device) as f:
+        source_weight = f.get_tensor(source_key)
+
+    # --- Copy weight into model's lm_head ---
+    if isinstance(lm_head, FP16Linear):
+        if source_weight.shape != lm_head.weight.shape:
+            raise ValueError(
+                f"DFlash lm_head shape mismatch: source={source_weight.shape} "
+                f"vs lm_head={lm_head.weight.shape}")
+        with torch.no_grad():
+            lm_head.weight.copy_(source_weight.to(lm_head.weight.dtype))
+    else:
+        # Generic fallback
+        if source_weight.shape != lm_head.weight.shape:
+            raise ValueError(
+                f"DFlash lm_head shape mismatch: source={source_weight.shape} "
+                f"vs lm_head={lm_head.weight.shape}")
+        with torch.no_grad():
+            lm_head.weight.copy_(source_weight.to(lm_head.weight.dtype))
+
+
+def _dflash_key_remap(key: str) -> "str | None":
+    """Remap DFlash draft checkpoint keys."""
+    if "rotary_emb" in key:
+        return None
     return key
 
 

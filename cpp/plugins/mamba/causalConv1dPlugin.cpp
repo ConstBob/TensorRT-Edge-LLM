@@ -315,7 +315,7 @@ int32_t CausalConv1dPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTen
     // TODO: refactor the dispatch logic to explicitly distinguish MTP tree-verify decoding
     // from prefill when 1 < seqLen <= kMTPMaxSeqLen (e.g. pass an execution-phase flag
     // from the runtime instead of relying solely on seq_len range heuristics).
-    constexpr int32_t kMTPMaxSeqLen = 8;
+    constexpr int32_t kMTPMaxSeqLen = 16;
     bool const mtpActive = mUseMTP && (seqLen > 1) && (seqLen <= kMTPMaxSeqLen);
 
     namespace rt = trt_edgellm::rt;

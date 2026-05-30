@@ -176,6 +176,7 @@ _DEFAULT_LAYOUT: dict[str, str] = {
     "visual": "visual",
     "action": "action",
     "mtp_draft": "mtp_draft",
+    "dflash_draft": "dflash_draft",
 }
 
 # Per-model overrides on top of ``_DEFAULT_LAYOUT``.
@@ -475,6 +476,8 @@ def _export_llm(model_dir: str,
                 reduced_vocab_dir: str = "",
                 nvfp4_moe_backend: "Optional[str]" = None,
                 mtp_base: bool = False,
+                dflash_base: bool = False,
+                dflash_draft_dir: str = "",
                 externalize_weights: "list[str] | None" = None,
                 tp_size: int = 1) -> None:
     """Export LLM backbone via the standard tensorrt_edgellm pipeline.
@@ -514,6 +517,8 @@ def _export_llm(model_dir: str,
                 reduced_vocab_dir=reduced_vocab_dir or None,
                 nvfp4_moe_backend=nvfp4_moe_backend,
                 mtp_base=mtp_base,
+                dflash_base=dflash_base,
+                dflash_draft_dir=dflash_draft_dir or None,
                 tp_size=world,
                 tp_rank=rank,
             )
@@ -580,6 +585,38 @@ def _export_mtp_draft(model_dir: str, draft_out_dir: str) -> None:
         raise SystemExit(1) from exc
 
     logger.info("[MTP Draft] Done: %s", output_path)
+
+
+def _export_dflash_draft(model_dir: str, draft_out_dir: str,
+                         dflash_draft_dir: str) -> None:
+    """Export the DFlash draft model."""
+    os.makedirs(draft_out_dir, exist_ok=True)
+    output_path = os.path.join(draft_out_dir, "model.onnx")
+
+    logger.info("[DFlash Draft] Loading checkpoint from %s", dflash_draft_dir)
+    try:
+        from ..model import AutoModel
+        model = AutoModel.from_pretrained(model_dir,
+                                          device="cpu",
+                                          dflash_draft=True,
+                                          dflash_draft_dir=dflash_draft_dir)
+    except (OSError, ValueError, RuntimeError, ImportError) as exc:
+        logger.exception("[DFlash Draft] Failed to load checkpoint")
+        raise SystemExit(1) from exc
+
+    logger.info("[DFlash Draft] Exporting to %s", output_path)
+    try:
+        from ..onnx.export import export_onnx
+        export_onnx(model, output_path, model_dir=dflash_draft_dir)
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.exception("[DFlash Draft] ONNX export failed")
+        raise SystemExit(1) from exc
+
+    # FP16/FP32 RoPE fix is handled automatically by export_onnx() which
+    # reads DFlashDraftModel.match_fp32_elementwise_initializers = True
+    # and passes it to _fix_initializer_dtypes().
+
+    logger.info("[DFlash Draft] Done: %s", output_path)
 
 
 def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
@@ -1661,6 +1698,21 @@ def main() -> None:
          ),
     )
     p.add_argument(
+        "--dflash-base",
+        action="store_true",
+        help="Export as DFlash base model (adds DFlash hidden_states output).",
+    )
+    p.add_argument(
+        "--dflash-draft",
+        action="store_true",
+        help="Export DFlash draft model.",
+    )
+    p.add_argument(
+        "--dflash-draft-dir",
+        default="",
+        help="Path to the DFlash draft checkpoint directory.",
+    )
+    p.add_argument(
         "--externalize-weights",
         nargs="+",
         choices=EXTERNAL_WEIGHT_CHOICES,
@@ -1709,8 +1761,19 @@ def main() -> None:
 
     if args.eagle_base and args.mtp:
         p.error("--eagle-base and --mtp cannot be enabled together")
+    if args.dflash_base and (args.eagle_base or args.mtp):
+        p.error("--dflash-base cannot be combined with --eagle-base or --mtp")
+    if args.dflash_draft and (args.eagle_base or args.mtp):
+        p.error("--dflash-draft cannot be combined with --eagle-base or --mtp")
+    if args.dflash_draft and not args.dflash_draft_dir:
+        p.error("--dflash-draft requires --dflash-draft-dir")
     if args.mtp and args.skip_llm:
         p.error("--mtp requires LLM export; remove --skip-llm")
+    if args.dflash_base and args.skip_llm:
+        p.error("--dflash-base requires LLM export; remove --skip-llm")
+    if args.dflash_draft and args.skip_llm:
+        logger.info(
+            "--dflash-draft implies --skip-llm (draft export is independent)")
     if args.mtp and not has_mtp_draft:
         p.error("--mtp was requested, but the checkpoint does not expose "
                 "MTP weights/config")
@@ -1743,30 +1806,40 @@ def main() -> None:
             return {}
         return _get_weights()
 
+    # When --dflash-draft is set, only the dflash_draft stage runs.
+    # DFlash draft is a standalone export (like Eagle draft) — no base LLM,
+    # visual, audio, or other components needed.
+    _draft_only = args.dflash_draft
+
     # Each stage is (enabled, component_name, exporter_callable).  Exporter
     # receives the computed output dir; the (enabled, component) columns also
     # drive both the pre-run log and the post-run summary below.
     stages = [
-        (_has_llm_component(model_type, "thinker")
-         and not args.skip_llm, "thinker",
+        (_has_llm_component(model_type, "thinker") and not args.skip_llm
+         and not _draft_only, "thinker",
          lambda out: _export_llm(model_dir,
                                  out,
                                  model_type=model_type,
                                  eagle_base=args.eagle_base,
                                  mtp_base=args.mtp,
+                                 dflash_base=args.dflash_base,
+                                 dflash_draft_dir=args.dflash_draft_dir,
                                  fp8_embedding=args.fp8_embedding,
                                  reduced_vocab_dir=args.reduced_vocab_dir,
                                  nvfp4_moe_backend=args.nvfp4_moe_backend,
                                  externalize_weights=externalize_weights,
                                  tp_size=args.tp_size)),
         (args.mtp, "mtp_draft", lambda out: _export_mtp_draft(model_dir, out)),
-        (_has_llm_component(model_type, "talker") and not args.skip_llm,
-         "talker", lambda out: _export_talker(model_dir, out, model_type)),
-        (_has_llm_component(model_type, "code_predictor")
-         and not args.skip_llm, "code_predictor",
+        (args.dflash_draft, "dflash_draft", lambda out: _export_dflash_draft(
+            model_dir, out, args.dflash_draft_dir)),
+        (_has_llm_component(model_type, "talker") and not args.skip_llm
+         and not _draft_only, "talker",
+         lambda out: _export_talker(model_dir, out, model_type)),
+        (_has_llm_component(model_type, "code_predictor") and not args.skip_llm
+         and not _draft_only, "code_predictor",
          lambda out: _export_code_predictor(model_dir, out, model_type)),
         (_has_visual(model_type) and not _is_alpamayo(model_type)
-         and not args.skip_visual, "visual",
+         and not args.skip_visual and not _draft_only, "visual",
          lambda out: _export_visual(model_dir,
                                     out,
                                     _get_weights(),
@@ -1775,7 +1848,7 @@ def main() -> None:
                                     dtype,
                                     model_config=_get_model_config())),
         (_has_visual(model_type) and _is_alpamayo(model_type)
-         and not args.skip_visual, "visual",
+         and not args.skip_visual and not _draft_only, "visual",
          lambda out: _export_alpamayo_visual(model_dir,
                                              out,
                                              _get_weights(),
@@ -1783,24 +1856,26 @@ def main() -> None:
                                              dtype,
                                              model_config=_get_model_config())
          ),
-        (_has_audio(model_type) and not args.skip_audio, "audio",
-         lambda out: _export_audio(model_dir,
-                                   out,
-                                   _get_weights(),
-                                   config,
-                                   model_type,
-                                   dtype,
-                                   model_config=_get_model_config())),
-        (_has_code2wav(model_type) and not args.skip_code2wav, "code2wav",
+        (_has_audio(model_type) and not args.skip_audio and not _draft_only,
+         "audio", lambda out: _export_audio(model_dir,
+                                            out,
+                                            _get_weights(),
+                                            config,
+                                            model_type,
+                                            dtype,
+                                            model_config=_get_model_config())),
+        (_has_code2wav(model_type) and not args.skip_code2wav
+         and not _draft_only, "code2wav",
          lambda out: _export_code2wav(model_dir, out, _get_code2wav_weights(),
                                       config, model_type, dtype)),
-        (_has_action(model_type) and not args.skip_action, "action", lambda
-         out: _export_action(model_dir,
-                             out,
-                             _get_weights(),
-                             config,
-                             max_kv_cache_capacity=args.max_kv_cache_capacity,
-                             dtype=dtype))
+        (_has_action(model_type) and not args.skip_action
+         and not _draft_only, "action", lambda out: _export_action(
+             model_dir,
+             out,
+             _get_weights(),
+             config,
+             max_kv_cache_capacity=args.max_kv_cache_capacity,
+             dtype=dtype))
     ]
 
     logger.info("=" * 60)
@@ -1815,6 +1890,8 @@ def main() -> None:
         args.nvfp4_moe_backend if args.nvfp4_moe_backend else "config/default")
     logger.info("MTP capable   : %s", "yes" if has_mtp_draft else "no")
     logger.info("MTP export    : %s", "yes" if args.mtp else "no")
+    logger.info("DFlash base   : %s", "yes" if args.dflash_base else "no")
+    logger.info("DFlash draft  : %s", "yes" if args.dflash_draft else "no")
     logger.info("Reduced vocab : %s",
                 args.reduced_vocab_dir if args.reduced_vocab_dir else "no")
     logger.info(

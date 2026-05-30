@@ -1194,6 +1194,65 @@ _fused_gemm_allreduce_plugin_schema = OpSchema(
     ],
 )
 
+# ---------------------------------------------------------------------------
+# trt_edgellm::DFlashTargetKVCacheUpdate
+# ---------------------------------------------------------------------------
+
+_dflash_target_kv_cache_update_schema = OpSchema(
+    name="DFlashTargetKVCacheUpdate",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc=("DFlash target KV cache update: apply RoPE to k_delta and write "
+         "k_rope + v_delta into the combined draft KV cache."),
+    inputs=[
+        OpSchema.FormalParameter(
+            name="k_delta",
+            description="K delta [B, L, Hkv, D] after k_norm, no RoPE",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="v_delta",
+            description="V delta [B, L, Hkv, D]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="past_key_value",
+            description="Combined KV cache [B, 2, Hkv, capacity, D]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="rope_cos_sin",
+            description="RoPE cos/sin [ropeBatch, capacity, rotaryDim] FP32",
+            type_str="tensor(float)",
+        ),
+        OpSchema.FormalParameter(
+            name="delta_start_positions",
+            description="Start positions for delta write [B] INT32",
+            type_str="tensor(int32)",
+        ),
+        OpSchema.FormalParameter(
+            name="delta_lengths",
+            description=
+            "Per-batch delta lengths [B] INT32 for multi-batch guard",
+            type_str="tensor(int32)",
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="present_key_value",
+            description="Updated KV cache (aliased to past_key_value)",
+            type_str="T",
+        ),
+    ],
+    type_constraints=[
+        (
+            "T",
+            ["tensor(float16)"],
+            "KV cache data type (FP16 for now).",
+        ),
+    ],
+)
+
 _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _attention_plugin_schema,
     _vit_attention_plugin_schema,
@@ -1212,6 +1271,7 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _nvfp4_moe_plugin_schema,
     _nvfp4_moe_plugin_geforce_schema,
     _fused_gemm_allreduce_plugin_schema,
+    _dflash_target_kv_cache_update_schema,
 )
 
 _registered_tensorrt_edgellm_schemas: bool = False

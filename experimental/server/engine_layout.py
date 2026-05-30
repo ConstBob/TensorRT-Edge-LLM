@@ -41,12 +41,12 @@ VLM (LLM + Visual encoder)::
         visual.engine
         config.json
 
-EAGLE speculative decoding::
+Speculative decoding::
 
-    {eagle_engine_dir}/
-        eagle_base.engine / eagle_draft.engine
+    {spec_decode_engine_dir}/
+        spec_base.engine / spec_draft.engine
         base_config.json / draft_config.json
-        d2t.safetensors
+        d2t.safetensors                 # EAGLE only
         tokenizer.json / tokenizer_config.json
         embedding.safetensors
 """
@@ -61,15 +61,15 @@ class EngineType(enum.Enum):
 
     LLM = "llm"
     VLM = "vlm"
-    EAGLE = "eagle"
+    SPEC_DECODE = "spec_decode"
     UNKNOWN = "unknown"
 
 
 ONNX_MODEL_FILE = "model.onnx"
 LLM_ENGINE_FILE = "llm.engine"
 VISUAL_ENGINE_FILE = "visual.engine"
-EAGLE_BASE_ENGINE_FILE = "eagle_base.engine"
-EAGLE_DRAFT_ENGINE_FILE = "eagle_draft.engine"
+SPEC_BASE_ENGINE_FILE = "spec_base.engine"
+SPEC_DRAFT_ENGINE_FILE = "spec_draft.engine"
 CONFIG_FILE = "config.json"
 
 
@@ -82,8 +82,8 @@ def detect_engine_type(engine_dir: str) -> EngineType:
     """Detect the engine type from directory contents."""
     if not os.path.isdir(engine_dir):
         return EngineType.UNKNOWN
-    if os.path.isfile(os.path.join(engine_dir, EAGLE_BASE_ENGINE_FILE)):
-        return EngineType.EAGLE
+    if os.path.isfile(os.path.join(engine_dir, SPEC_BASE_ENGINE_FILE)):
+        return EngineType.SPEC_DECODE
     if os.path.isfile(os.path.join(engine_dir, LLM_ENGINE_FILE)):
         return EngineType.LLM
     if os.path.isfile(os.path.join(engine_dir, VISUAL_ENGINE_FILE)):
@@ -107,11 +107,12 @@ def validate_visual_engine_dir(engine_dir: str) -> bool:
             or os.path.isfile(os.path.join(engine_dir, VISUAL_ENGINE_FILE)))
 
 
-def validate_eagle_engine_dir(engine_dir: str) -> bool:
-    """Check that an EAGLE engine directory has both engines."""
-    return (os.path.isfile(os.path.join(engine_dir, EAGLE_BASE_ENGINE_FILE))
-            and os.path.isfile(
-                os.path.join(engine_dir, EAGLE_DRAFT_ENGINE_FILE)))
+def validate_spec_decode_engine_dir(engine_dir: str) -> bool:
+    """Check that a speculative decoding engine directory has both engines."""
+    has_base = os.path.isfile(os.path.join(engine_dir, SPEC_BASE_ENGINE_FILE))
+    has_draft = os.path.isfile(os.path.join(engine_dir,
+                                            SPEC_DRAFT_ENGINE_FILE))
+    return has_base and has_draft
 
 
 def find_visual_engine_dir(

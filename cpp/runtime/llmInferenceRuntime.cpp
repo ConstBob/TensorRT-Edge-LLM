@@ -85,14 +85,13 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     // 2. Parse engine configurations and attach user drafting (bundle factory
     //    performs cross-engine consistency and drafting-vs-capacity checks).
     // -----------------------------------------------------------------------
-    std::filesystem::path const baseEnginePath = draftingConfig.has_value()
-        ? std::filesystem::path(engineDir) / "eagle_base.engine"
-        : std::filesystem::path(engineDir) / "llm.engine";
-    std::filesystem::path const baseConfigPath = draftingConfig.has_value()
-        ? std::filesystem::path(engineDir) / "base_config.json"
-        : std::filesystem::path(engineDir) / "config.json";
+    std::filesystem::path const engineDirPath{engineDir};
+    std::filesystem::path const baseEnginePath
+        = draftingConfig.has_value() ? engineDirPath / "spec_base.engine" : engineDirPath / "llm.engine";
+    std::filesystem::path const baseConfigPath
+        = draftingConfig.has_value() ? engineDirPath / "base_config.json" : engineDirPath / "config.json";
     std::optional<std::filesystem::path> const draftConfigPath = draftingConfig.has_value()
-        ? std::optional<std::filesystem::path>{std::filesystem::path(engineDir) / "draft_config.json"}
+        ? std::optional<std::filesystem::path>{engineDirPath / "draft_config.json"}
         : std::nullopt;
 
     mDeployment = createDeploymentConfig(baseConfigPath, draftConfigPath, draftingConfig);
@@ -200,12 +199,17 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     int32_t const vanillaSamplingWorkspaceSize
         = static_cast<int32_t>(getTopKtopPSamplingWorkspaceSize(mMaxRuntimeBatchSize, mDeployment.base.outputVocabSize,
             SamplingParams(mMaxRuntimeBatchSize, mDeployment.base.outputVocabSize, 1.0f, 0, 0.9f)));
+    int32_t const draftSamplingRows = hasDraft && mDeployment.specDecodeMode() == SpecDecodeMode::kDFlash
+        ? mMaxRuntimeBatchSize * mDeployment.specConfig->verifySize
+        : mMaxRuntimeBatchSize * effectiveDraftTopK;
+    int32_t const draftSamplingTopK
+        = hasDraft && mDeployment.specDecodeMode() == SpecDecodeMode::kDFlash ? 1 : effectiveDraftTopK;
     int32_t const maxSamplingWorkspaceSize = hasDraft
         ? std::max({vanillaSamplingWorkspaceSize,
               static_cast<int32_t>(
                   getSelectAllTopKWorkspaceSize(mMaxRuntimeBatchSize, mDeployment.base.outputVocabSize, 1)),
               static_cast<int32_t>(getSelectAllTopKWorkspaceSize(
-                  mMaxRuntimeBatchSize * effectiveDraftTopK, mDeployment.draft->outputVocabSize, effectiveDraftTopK))})
+                  draftSamplingRows, mDeployment.draft->outputVocabSize, draftSamplingTopK))})
         : vanillaSamplingWorkspaceSize;
 
     try
@@ -430,10 +434,11 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     DecodingStrategy& decodingStrategy = mDecoderRegistry->select(request);
     bool const enableSpecDecode = decodingStrategy.isSpeculative();
 
-    // Speculative decoding only supports greedy; override non-default sampling params.
-    bool const hasNonDefaultSampling
-        = (request.topK > 1 || request.topP < 1.0f || std::fabs(request.temperature - 1.0f) > 1e-3f);
-    if (enableSpecDecode && hasNonDefaultSampling)
+    // Current speculative decoders only support greedy-compatible requests.
+    // DecoderRegistry falls back to vanilla for non-greedy requests; if a
+    // speculative decoder is selected here, normalize sampling params to greedy.
+    bool const hasNonGreedySampling = shouldUseNonGreedySampling(request.temperature, request.topK, request.topP);
+    if (enableSpecDecode && hasNonGreedySampling)
     {
         LOG_WARNING("Spec-decode active: overriding sampling params to greedy (ignoring temp/topK/topP).");
     }
@@ -477,7 +482,7 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
         }
     }
 
-    // Forward sampling params to context; spec-decode forces greedy.
+    // Forward sampling params to context; selected spec-decode requests run greedy.
     context.temperature = enableSpecDecode ? 1.0f : request.temperature;
     context.topP = enableSpecDecode ? 1.0f : request.topP;
     context.topK = enableSpecDecode ? 0 : request.topK;

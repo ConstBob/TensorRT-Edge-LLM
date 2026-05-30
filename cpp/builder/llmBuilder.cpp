@@ -24,6 +24,7 @@
 #include "common/trtUtils.h"
 #include "common/version.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <fstream>
 #include <string>
@@ -80,6 +81,41 @@ std::string applyMyelinCompileWorkarounds(int32_t maxBatchSize)
 
 } // namespace
 #endif
+
+namespace
+{
+
+std::string specDecodeType(Json const& config)
+{
+    return config.value("spec_decode_type", "none");
+}
+
+std::string engineRole(Json const& config)
+{
+    return config.value("engine_role", "llm");
+}
+
+bool isSpecDecodeBase(Json const& config, char const* type)
+{
+    return specDecodeType(config) == type && engineRole(config) == "base";
+}
+
+bool isSpecDecodeDraft(Json const& config, char const* type)
+{
+    return specDecodeType(config) == type && engineRole(config) == "draft";
+}
+
+bool isValidSpecDecodeType(std::string const& type)
+{
+    return type == "none" || type == "mtp" || type == "eagle3" || type == "dflash";
+}
+
+bool isValidEngineRole(std::string const& role)
+{
+    return role == "llm" || role == "base" || role == "draft";
+}
+
+} // namespace
 
 LLMBuilder::LLMBuilder(
     std::filesystem::path const& onnxDir, std::filesystem::path const& engineDir, LLMBuilderConfig const& config)
@@ -175,13 +211,13 @@ bool LLMBuilder::build()
 
     // Determine engine file name
     std::string engineFileName;
-    if (mBuilderConfig.eagleDraft)
+    if (mBuilderConfig.specDraft)
     {
-        engineFileName = "eagle_draft.engine";
+        engineFileName = "spec_draft.engine";
     }
-    else if (mBuilderConfig.eagleBase)
+    else if (mBuilderConfig.specBase)
     {
-        engineFileName = "eagle_base.engine";
+        engineFileName = "spec_base.engine";
     }
     else
     {
@@ -256,10 +292,50 @@ bool LLMBuilder::parseConfig()
     std::string modelVersion = mModelConfig.value(binding_names::kEdgellmVersion, "");
     version::checkVersion(modelVersion);
 
+    std::string const specType = specDecodeType(mModelConfig);
+    std::string const role = engineRole(mModelConfig);
+    if (!isValidSpecDecodeType(specType))
+    {
+        LOG_ERROR("Invalid spec_decode_type='%s'. Expected one of: none, mtp, eagle3, dflash.", specType.c_str());
+        return false;
+    }
+    if (!isValidEngineRole(role))
+    {
+        LOG_ERROR("Invalid engine_role='%s'. Expected one of: llm, base, draft.", role.c_str());
+        return false;
+    }
+    if ((role == "llm") != (specType == "none"))
+    {
+        LOG_ERROR(
+            "Invalid config: engine_role='%s' with spec_decode_type='%s'. LLM engines require "
+            "spec_decode_type=none; speculative base/draft engines require a non-none spec_decode_type.",
+            role.c_str(), specType.c_str());
+        return false;
+    }
+    if ((mBuilderConfig.specDraft && role != "draft") || (mBuilderConfig.specBase && role != "base")
+        || (!mBuilderConfig.specDraft && !mBuilderConfig.specBase && role != "llm"))
+    {
+        LOG_ERROR(
+            "Build mode does not match config: engine_role='%s' (use --specBase for base, --specDraft for "
+            "draft, and neither flag for vanilla LLM).",
+            role.c_str());
+        return false;
+    }
+
     mHiddenSize = mModelConfig["hidden_size"].get<int32_t>();
     // For MTP draft, base model outputs hidden_size (1x); for EAGLE3 draft, it outputs hidden_size * 3.
-    std::string const modelType = mModelConfig.value("model_type", "");
-    mTargetModelOutputHiddenDim = (modelType == "mtp_draft") ? mHiddenSize : mHiddenSize * 3;
+    if (isSpecDecodeDraft(mModelConfig, "mtp"))
+    {
+        mTargetModelOutputHiddenDim = mHiddenSize;
+    }
+    else if (isSpecDecodeDraft(mModelConfig, "dflash") && mModelConfig.contains("base_model_hidden_size"))
+    {
+        mTargetModelOutputHiddenDim = mModelConfig["base_model_hidden_size"].get<int32_t>();
+    }
+    else
+    {
+        mTargetModelOutputHiddenDim = mHiddenSize * 3;
+    }
     mNumKVHeads = mModelConfig["num_key_value_heads"].get<int32_t>();
     auto numAttentionHeads = mModelConfig["num_attention_heads"].get<int32_t>();
 
@@ -315,13 +391,28 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
 
     bool result = true;
 
+    if (isSpecDecodeDraft(mModelConfig, "dflash"))
+    {
+        result &= setupDFlashDraftProfiles(*contextProfile, *generationProfile);
+        if (!result)
+        {
+            LOG_ERROR("Failed to setup DFlash draft optimization profiles");
+            return false;
+        }
+        LOG_DEBUG("%s", printOptimizationProfile(contextProfile, "context_profile", &network).c_str());
+        LOG_DEBUG("%s", printOptimizationProfile(generationProfile, "generation_profile", &network).c_str());
+        config.addOptimizationProfile(contextProfile);
+        config.addOptimizationProfile(generationProfile);
+        return true;
+    }
+
     // Setup common profiles
     result &= setupCommonProfiles(*contextProfile, *generationProfile);
 
     // Setup model-specific profiles
-    if (mBuilderConfig.eagleBase || mBuilderConfig.eagleDraft)
+    if (mBuilderConfig.specBase || mBuilderConfig.specDraft)
     {
-        result &= setupEagleProfiles(*contextProfile, *generationProfile);
+        result &= setupSpecDecodeProfiles(*contextProfile, *generationProfile);
     }
     else
     {
@@ -329,8 +420,7 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
     }
 
     // Setup intermediate state profiles for MTP base models
-    std::string const modelType = mModelConfig.value("model_type", "");
-    if (modelType == "mtp_base")
+    if (isSpecDecodeBase(mModelConfig, "mtp") || isSpecDecodeBase(mModelConfig, "dflash"))
     {
         result &= setupIntermediateRecurrentStateProfiles(*contextProfile, *generationProfile);
         result &= setupIntermediateConvStateProfiles(*contextProfile, *generationProfile);
@@ -428,36 +518,35 @@ bool LLMBuilder::setupVanillaProfiles(
     return result;
 }
 
-bool LLMBuilder::setupEagleProfiles(
+bool LLMBuilder::setupSpecDecodeProfiles(
     nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
 {
-    // TRT-native-ops + EAGLE is a partially-wired path: the Python export
+    // TRT-native-ops + speculative decoding is a partially-wired path: the Python export
     // emits a 4D bool `attention_mask` [batch, 1, seq_len, seq_len + past_len]
-    // (see `llm_model_trtnative.py` with `is_eagle_base=True`), and the
+    // (see `llm_model_trtnative.py` with `is_eagle_base=True`), and only the
     // `prepareEagleBaseTreeDecodingInputsTrtNative` kernel exists
     // (`cpp/kernels/speculative/eagleUtilKernels.{h,cu}`). However the
-    // builder's EAGLE profile setup below and the runtime dispatch in
-    // `EagleDecoder::runBaseModelVerification` both
+    // builder's speculative profile setup below and the runtime dispatch in
+    // spec-decode runtime paths
     // hardcode the plugin-path 3D packed-INT32 mask layout. Attempting to
     // build this combination produces a cryptic TRT error:
     //
     //   "Dynamic-shaped input tensor attention_mask has 4 dimensions but
     //    profile 0 has 3 dimensions"
     //
-    // Fail fast with an actionable message until the full TRT-native+EAGLE
+    // Fail fast with an actionable message until the full TRT-native + spec-decode
     // path (builder profile + registry + runtime dispatch) is completed.
-    if (mBuilderConfig.useTrtNativeOps && (mBuilderConfig.eagleBase || mBuilderConfig.eagleDraft))
+    if (mBuilderConfig.useTrtNativeOps && (mBuilderConfig.specBase || mBuilderConfig.specDraft))
     {
         LOG_ERROR(
-            "TRT-native-ops + EAGLE speculative decoding is not yet supported. "
+            "TRT-native-ops + speculative decoding is not yet supported. "
             "Re-export the engine ONNX with trt_native_ops=False (plugin attention path).");
         return false;
     }
 
     bool result = true;
 
-    int const maxTokens
-        = mBuilderConfig.eagleDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
+    int const maxTokens = mBuilderConfig.specDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
 
     // Input embeddings
     result &= setOptimizationProfile(&contextProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
@@ -473,7 +562,7 @@ bool LLMBuilder::setupEagleProfiles(
     result &= setOptimizationProfile(&generationProfile, binding_names::kLastTokenIds, createDims({1, 1}),
         createDims({mBuilderConfig.maxBatchSize, maxTokens / 2}), createDims({mBuilderConfig.maxBatchSize, maxTokens}));
 
-    if (mBuilderConfig.eagleDraft)
+    if (mBuilderConfig.specDraft)
     {
         // Hidden states from draft
         result &= setOptimizationProfile(&contextProfile, binding_names::kDraftModelHiddenStates,
@@ -496,7 +585,7 @@ bool LLMBuilder::setupEagleProfiles(
     }
 
     // Attention mask and position ID
-    if (mBuilderConfig.eagleDraft || mBuilderConfig.eagleBase)
+    if (mBuilderConfig.specDraft || mBuilderConfig.specBase)
     {
         int32_t const attnMaskAlignSize = 32;
         result &= setOptimizationProfile(&contextProfile, binding_names::kAttentionMask, createDims({1, 1, 1}),
@@ -514,6 +603,78 @@ bool LLMBuilder::setupEagleProfiles(
             createDims({mBuilderConfig.maxBatchSize, maxTokens}));
     }
 
+    return result;
+}
+
+bool LLMBuilder::setupDFlashDraftProfiles(
+    nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
+{
+    bool result = true;
+
+    int64_t const maxDraftTokens = std::max<int64_t>(1, mBuilderConfig.maxDraftTreeSize);
+    int64_t const optDraftTokens = maxDraftTokens;
+    int64_t const maxPrefillTargetHiddenLen = std::max<int64_t>(1, mBuilderConfig.maxInputLen);
+    int64_t const optPrefillTargetHiddenLen = std::max<int64_t>(1, maxPrefillTargetHiddenLen / 2);
+    int64_t const maxDecodeTargetHiddenLen = maxDraftTokens;
+    int64_t const optDecodeTargetHiddenLen = maxDraftTokens;
+
+    int64_t const packedMaskLen = static_cast<int64_t>(divUp(maxDraftTokens, 32));
+    int64_t const optPackedMaskLen = static_cast<int64_t>(divUp(optDraftTokens, 32));
+
+    // Profile 0 handles round-0/system-prompt cache update, where target hidden spans the prompt.
+    // Profile 1 handles steady-state block proposal, where target hidden delta is bounded by block size.
+    auto setupOneProfile = [&](nvinfer1::IOptimizationProfile& profile, int64_t optTargetHiddenLen,
+                               int64_t maxTargetHiddenLen) {
+        bool ok = true;
+        // inputs_embeds: [batch, block_seq, hiddenSize]
+        ok &= setOptimizationProfile(&profile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, optDraftTokens, mHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, maxDraftTokens, mHiddenSize}));
+        // dflash_target_hidden_concat: [batch, delta_seq, baseOutputHiddenDim]
+        ok &= setOptimizationProfile(&profile, binding_names::kDFlashTargetHiddenConcat,
+            createDims({1, 1, mTargetModelOutputHiddenDim}),
+            createDims({mBuilderConfig.maxBatchSize, optTargetHiddenLen, mTargetModelOutputHiddenDim}),
+            createDims({mBuilderConfig.maxBatchSize, maxTargetHiddenLen, mTargetModelOutputHiddenDim}));
+        // rope_rotary_cos_sin: [1, kv_capacity, rotaryDim]
+        ok &= setOptimizationProfile(&profile, binding_names::kRopeCosSin, createDims({1, 1, mRotaryDim}),
+            createDims({1, mBuilderConfig.maxKVCacheCapacity, mRotaryDim}),
+            createDims({1, mBuilderConfig.maxKVCacheCapacity, mRotaryDim}));
+        // context_lengths: [batch]
+        ok &= setOptimizationProfile(&profile, binding_names::kContextLengths, createDims({1}),
+            createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+        // kvcache_start_index: [batch]
+        ok &= setOptimizationProfile(&profile, binding_names::kKVCacheStartIndex, createDims({1}),
+            createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+        // dflash_delta_lengths: [batch]
+        ok &= setOptimizationProfile(&profile, binding_names::kDFlashDeltaLengths, createDims({1}),
+            createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+        // attention_mask: [batch, block_seq, packed_mask_len]
+        ok &= setOptimizationProfile(&profile, binding_names::kAttentionMask, createDims({1, 1, 1}),
+            createDims({mBuilderConfig.maxBatchSize, optDraftTokens, optPackedMaskLen}),
+            createDims({mBuilderConfig.maxBatchSize, maxDraftTokens, packedMaskLen}));
+        // attention_pos_id: [batch, block_seq]
+        ok &= setOptimizationProfile(&profile, binding_names::kAttentionPosId, createDims({1, 1}),
+            createDims({mBuilderConfig.maxBatchSize, optDraftTokens}),
+            createDims({mBuilderConfig.maxBatchSize, maxDraftTokens}));
+        // KV cache per-layer: [batch, 2, numKVHeads, kv_capacity, headDim]
+        for (int32_t i = 0; i < mNbKVCacheInputs; ++i)
+        {
+            std::string pastName = std::string(binding_names::kPastKeyValuesTemplate) + "_" + std::to_string(i);
+            std::string presentName = std::string(binding_names::kPresentKeyValuesTemplate) + "_" + std::to_string(i);
+            ok &= setOptimizationProfile(&profile, pastName.c_str(), createDims({1, 2, mNumKVHeads, 1, mHeadSize}),
+                createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize}),
+                createDims(
+                    {mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize}));
+            ok &= setOptimizationProfile(&profile, presentName.c_str(), createDims({1, 2, mNumKVHeads, 1, mHeadSize}),
+                createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize}),
+                createDims(
+                    {mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize}));
+        }
+        return ok;
+    };
+
+    result &= setupOneProfile(contextProfile, optPrefillTargetHiddenLen, maxPrefillTargetHiddenLen);
+    result &= setupOneProfile(generationProfile, optDecodeTargetHiddenLen, maxDecodeTargetHiddenLen);
     return result;
 }
 
@@ -552,10 +713,10 @@ bool LLMBuilder::setupDeepstackProfiles(nvinfer1::IOptimizationProfile& contextP
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
 
-        if (mBuilderConfig.eagleBase || mBuilderConfig.eagleDraft)
+        if (mBuilderConfig.specBase || mBuilderConfig.specDraft)
         {
             int const maxTokens
-                = mBuilderConfig.eagleDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
+                = mBuilderConfig.specDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
             result &= setOptimizationProfile(&generationProfile, deepstackInputName.c_str(),
                 createDims({1, 1, mHiddenSize}), createDims({mBuilderConfig.maxBatchSize, maxTokens / 2, mHiddenSize}),
                 createDims({mBuilderConfig.maxBatchSize, maxTokens, mHiddenSize}));
@@ -878,11 +1039,11 @@ bool LLMBuilder::copyConfig()
 {
     // Determine config file name based on model type
     std::string configFileName;
-    if (mBuilderConfig.eagleDraft)
+    if (mBuilderConfig.specDraft)
     {
         configFileName = "draft_config.json";
     }
-    else if (mBuilderConfig.eagleBase)
+    else if (mBuilderConfig.specBase)
     {
         configFileName = "base_config.json";
     }
@@ -916,8 +1077,8 @@ bool LLMBuilder::copyConfig()
 
 bool LLMBuilder::copyTokenizerFiles()
 {
-    // Eagle3 draft model does not need tokenizer files
-    if (mBuilderConfig.eagleDraft)
+    // Speculative draft models use the base model tokenizer.
+    if (mBuilderConfig.specDraft)
     {
         return true;
     }
@@ -955,9 +1116,8 @@ bool LLMBuilder::copyTokenizerFiles()
 
 bool LLMBuilder::copyEagleFiles()
 {
-    // Copy d2t.safetensors for Eagle3 draft models only. MTP draft shares vocab with base and has no d2t mapping.
-    std::string const modelType = mModelConfig.value("model_type", "");
-    if (mBuilderConfig.eagleDraft && modelType != "mtp_draft")
+    // Copy d2t.safetensors for Eagle3 draft models only. MTP/DFlash drafts share vocab with base and have no d2t.
+    if (isSpecDecodeDraft(mModelConfig, "eagle3"))
     {
         std::string const d2tPath = (mOnnxDir / "d2t.safetensors").string();
         std::string const targetD2tPath = (mEngineDir / "d2t.safetensors").string();
@@ -1001,8 +1161,8 @@ bool LLMBuilder::copyVocabMappingFiles()
 
 bool LLMBuilder::copyEmbeddingFile()
 {
-    // Eagle draft model uses shared embedding table from base model, so skip copying
-    if (mBuilderConfig.eagleDraft)
+    // Speculative draft models use the base model embedding table.
+    if (mBuilderConfig.specDraft)
     {
         return true;
     }
