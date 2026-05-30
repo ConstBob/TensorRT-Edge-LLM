@@ -900,9 +900,8 @@ def repack_nvfp4_nemotron_moe_experts(
     if hidden_size_alignment <= 0:
         raise ValueError(
             f"hidden_size_alignment ({hidden_size_alignment}) must be >= 1")
-    padded_hidden_size = (
-        (hidden_size + hidden_size_alignment - 1) //
-        hidden_size_alignment) * hidden_size_alignment
+    padded_hidden_size = ((hidden_size + hidden_size_alignment - 1) //
+                          hidden_size_alignment) * hidden_size_alignment
     if padded_hidden_size % group_size != 0:
         raise ValueError(
             f"padded_hidden_size ({padded_hidden_size}) must be a multiple of "
@@ -952,8 +951,7 @@ def repack_nvfp4_nemotron_moe_experts(
             up_weight = padded_up_weight
 
             padded_down_weight = torch.zeros(
-                (padded_hidden_size, padded_inter_size // 2),
-                dtype=torch.int8)
+                (padded_hidden_size, padded_inter_size // 2), dtype=torch.int8)
             padded_down_weight[:hidden_size, :moe_inter_size //
                                2] = down_weight
             down_weight = padded_down_weight
@@ -988,11 +986,12 @@ def repack_nvfp4_nemotron_moe_experts(
 
     return (torch.stack(fc1_qweights,
                         dim=0), torch.stack(fc1_blocks_scale, dim=0),
-            torch.tensor(fc1_alpha, dtype=torch.float32),
-            torch.stack(fc2_qweights,
-                        dim=0), torch.stack(fc2_blocks_scale, dim=0),
-            torch.tensor(fc2_alpha, dtype=torch.float32), padded_inter_size,
-            padded_hidden_size)
+            torch.tensor(fc1_alpha,
+                         dtype=torch.float32), torch.stack(fc2_qweights,
+                                                           dim=0),
+            torch.stack(fc2_blocks_scale,
+                        dim=0), torch.tensor(fc2_alpha, dtype=torch.float32),
+            padded_inter_size, padded_hidden_size)
 
 
 def _sf_bytes_from_checkpoint(raw_sf: torch.Tensor) -> np.ndarray:
