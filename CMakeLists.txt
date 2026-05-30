@@ -162,9 +162,19 @@ option(BUILD_UNIT_TESTS "Enable building unit tests" OFF)
 option(BUILD_PYTHON_BINDINGS "Enable building Python pybind11 bindings" OFF)
 
 # CuTe DSL unified kernel option — declare here so it is always defined before
-# any subdirectory or include references it. Choices: OFF | ALL | fmha | gdn |
-# nvfp4_moe | nvfp4_fused_moe | semicolon-separated group list (e.g.
-# -DENABLE_CUTE_DSL=fmha;gdn).
+# any subdirectory or include references it.
+# cmake-format: off
+# Choices:
+#   OFF              -- no CuTe DSL kernels
+#   ALL              -- enable every kernel group below
+#   fmha             -- FMHA Blackwell attention
+#   gdn              -- gated delta net (Mamba2-style hybrid SSM)
+#   nvfp4_moe        -- SM110 (Thor) split FC1/FC2 NVFP4 MoE; consumed by the
+#                       SM110-only ``Nvfp4MoePlugin``
+#   nvfp4_fused_moe  -- SM12x (consumer Blackwell / Spark GB10) fused NVFP4
+#                       MoE; consumed by ``NvFP4MoEPluginGeforce``
+#   semicolon-separated group list (e.g. -DENABLE_CUTE_DSL=fmha;gdn)
+# cmake-format: on
 set(ENABLE_CUTE_DSL
     "OFF"
     CACHE
