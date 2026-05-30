@@ -191,6 +191,7 @@ class TestConfig:
     # Speculative decoding flags
     is_eagle: Optional[bool] = None
     is_mtp: Optional[bool] = None
+    is_dflash: Optional[bool] = None
 
     # Directory paths
     llm_models_dir: Optional[str] = None
@@ -342,6 +343,12 @@ class TestConfig:
                           TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
                           TaskType.INFERENCE
                       }, {ModelType.LLM, ModelType.VLM},
+                      is_required=False),
+        ParameterSpec("is_dflash",
+                      "dflash", {
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
+                          TaskType.INFERENCE
+                      }, {ModelType.LLM},
                       is_required=False),
         ParameterSpec("draft_model_id",
                       "", {
@@ -541,6 +548,32 @@ class TestConfig:
             elif part == "mtp":
                 parsed_params['is_mtp'] = True
                 parsed_params['is_eagle'] = True
+            elif part == "dflash":
+                parsed_params['is_dflash'] = True
+                # Parse dflash-{draft_id}[-{draft_precision}[-lm{draft_lm_head}]].
+                if i + 1 >= len(remaining_parts):
+                    raise ValueError(
+                        f"Missing draft model id after dflash in: {param_str}")
+                i += 1
+                parsed_params['draft_model_id'] = remaining_parts[i]
+
+                if (i + 1 < len(remaining_parts)
+                        and remaining_parts[i + 1] in VALID_LLM_PRECISIONS):
+                    i += 1
+                    parsed_params['draft_llm_precision'] = remaining_parts[i]
+
+                    if (i + 1 < len(remaining_parts)
+                            and remaining_parts[i + 1].startswith('lm')):
+                        i += 1
+                        draft_lm_precision = remaining_parts[i][2:]
+                        if draft_lm_precision not in VALID_LM_HEAD_PRECISIONS:
+                            raise ValueError(
+                                f"Invalid draft LM head precision: {draft_lm_precision}"
+                            )
+                        parsed_params[
+                            'draft_lm_head_precision'] = draft_lm_precision
+                else:
+                    parsed_params['draft_llm_precision'] = llm_precision
             elif part == "eagle":
                 parsed_params['is_eagle'] = True
                 # Parse eagle-{draft_id}-{draft_precision}[-lm{draft_lm_head}]
@@ -695,6 +728,8 @@ class TestConfig:
                     self.is_eagle = False
                 if self.is_mtp is None:
                     self.is_mtp = False
+                if self.is_dflash is None:
+                    self.is_dflash = False
                 if self.draft_llm_precision is not None and self.draft_lm_head_precision is None:
                     self.draft_lm_head_precision = "fp16"
                 if self.reduced_vocab_size is not None:
@@ -723,16 +758,22 @@ class TestConfig:
                     self.is_eagle = False
                 if self.is_mtp is None:
                     self.is_mtp = False
+                if self.is_dflash is None:
+                    self.is_dflash = False
                 if self.draft_llm_precision is not None and self.draft_lm_head_precision is None:
                     self.draft_lm_head_precision = "fp16"
                 if self.eagle_draft_top_k is None:
-                    self.eagle_draft_top_k = 1 if self.is_mtp else 10
+                    self.eagle_draft_top_k = 1 if (self.is_mtp
+                                                   or self.is_dflash) else 10
                 if self.eagle_draft_step is None:
-                    self.eagle_draft_step = 3 if self.is_mtp else 6
+                    self.eagle_draft_step = 1 if self.is_dflash else (
+                        3 if self.is_mtp else 6)
                 if self.max_verify_tree_size is None:
-                    self.max_verify_tree_size = 4 if self.is_mtp else 60
+                    self.max_verify_tree_size = 16 if self.is_dflash else (
+                        4 if self.is_mtp else 60)
                 if self.max_draft_tree_size is None:
-                    self.max_draft_tree_size = 4 if self.is_mtp else 60
+                    self.max_draft_tree_size = 16 if self.is_dflash else (
+                        4 if self.is_mtp else 60)
 
         warmup_env = os.environ.get('WARMUP')
         if warmup_env is not None and self.warmup is None:
@@ -807,7 +848,7 @@ class TestConfig:
             llm_engine_id += (
                 f"-mnit{self.min_image_tokens}-mxit{self.max_image_tokens}"
                 f"-mnts{self.min_time_steps}-mxts{self.max_time_steps}")
-        if self.is_eagle:
+        if self.is_eagle or self.is_mtp or self.is_dflash:
             if self.max_verify_tree_size is not None:
                 llm_engine_id += f"-mvts{self.max_verify_tree_size}"
             if self.max_draft_tree_size is not None:
@@ -988,6 +1029,49 @@ class TestConfig:
             return True
         return self.llm_precision.upper() in self.model_name.upper()
 
+    def get_dflash_draft_model_dir(self) -> str:
+        """Get DFlash draft checkpoint directory using draft_model_id."""
+        MODEL_NAME_TO_DFLASH_DRAFT_MODELS_MAP = {
+            "Qwen3.5-4B": {
+                "b16": "Qwen3.5-4B-DFlash",
+            },
+        }
+
+        if self.model_name not in MODEL_NAME_TO_DFLASH_DRAFT_MODELS_MAP:
+            raise ValueError(
+                f"Unsupported base model for DFlash: '{self.model_name}'. "
+                f"Supported models: {', '.join(MODEL_NAME_TO_DFLASH_DRAFT_MODELS_MAP.keys())}"
+            )
+
+        draft_models = MODEL_NAME_TO_DFLASH_DRAFT_MODELS_MAP[self.model_name]
+
+        if not self.draft_model_id:
+            raise ValueError(
+                f"draft_model_id not set. Available DFlash drafts for {self.model_name}: "
+                f"{', '.join(draft_models.keys())}")
+
+        if self.draft_model_id not in draft_models:
+            raise ValueError(
+                f"Unsupported DFlash draft_model_id '{self.draft_model_id}' for {self.model_name}. "
+                f"Available: {', '.join(draft_models.keys())}")
+
+        model_dir_name = draft_models[self.draft_model_id]
+        model_dir = _find_directory(self.llm_models_dir,
+                                    model_dir_name,
+                                    5,
+                                    require_files=_HF_CHECKPOINT_FILES)
+        if not model_dir:
+            model_dir = _find_directory(self.edgellm_data_dir,
+                                        model_dir_name,
+                                        5,
+                                        require_files=_HF_CHECKPOINT_FILES)
+        if not model_dir:
+            raise ValueError(
+                f"DFlash draft model directory not found: '{model_dir_name}' under "
+                f"{self.llm_models_dir} or {self.edgellm_data_dir} with search depth 5 "
+                f"(requiring config.json + *.safetensors)")
+        return model_dir
+
     def get_audio_engine_dir(self) -> str:
         suffix = f"audio-{self.audio_precision}"
         if self.min_time_steps is not None and self.max_time_steps is not None:
@@ -1090,6 +1174,8 @@ class TestConfig:
         """Get LLM ONNX model directory. For TTS this contains talker/ and code_predictor/."""
         if self.is_mtp:
             prefix = "llm-base-mtp"
+        elif self.is_dflash:
+            prefix = "llm-base-dflash"
         elif self.is_eagle:
             prefix = "llm-base"
         else:
@@ -1165,12 +1251,18 @@ class TestConfig:
             # onnx_model_id suffix so different precisions don't collide.
             return os.path.join(self.get_onnx_base_dir(),
                                 f"mtp-draft-{self.get_onnx_model_id()}")
+        if self.is_dflash:
+            return os.path.join(
+                self.get_onnx_base_dir(),
+                f"dflash-draft-{self.get_draft_onnx_model_id()}")
         return os.path.join(self.get_onnx_base_dir(),
                             f"draft-{self.get_draft_onnx_model_id()}")
 
     def get_quantized_draft_model_dir(self) -> str:
         """Get quantized draft model directory (for export)"""
         if self.draft_llm_precision == "fp16":
+            if self.is_dflash:
+                return self.get_dflash_draft_model_dir()
             return self.get_draft_model_dir()
         if self.draft_model_id is None:
             raise ValueError("draft_model_id not set")
@@ -1195,6 +1287,14 @@ class TestConfig:
             # MTP shares the base checkpoint; no separate draft_model_id.  Precision
             # info comes from get_engine_id() (already includes llm/lm_head precision).
             prefix = "llm-mtp"
+        elif self.is_dflash:
+            if self.draft_model_id is None:
+                raise ValueError("draft_model_id not set for DFlash engine")
+            if self.draft_llm_precision is None:
+                raise ValueError(
+                    "draft_llm_precision not set for DFlash engine")
+            prefix = (
+                f"llm-dflash-{self.draft_model_id}-{self.draft_llm_precision}")
         elif self.is_eagle:
             if self.draft_model_id is None:
                 raise ValueError("draft_model_id not set for EAGLE engine")
@@ -1399,7 +1499,7 @@ class TestConfig:
         """Get quantized model directory (for export)"""
         if self.llm_precision == "fp16":
             return self.get_torch_model_dir()
-        if self.is_eagle and not self.is_mtp:
+        if (self.is_eagle or self.is_dflash) and not self.is_mtp:
             prefix = "quantized-base"
         else:
             prefix = "quantized"

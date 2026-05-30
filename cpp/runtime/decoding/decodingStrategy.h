@@ -47,6 +47,7 @@ enum class DecodingStrategyKind : int32_t
     kVanilla,
     kEAGLE,
     kMTP,
+    kDFlash,
 };
 
 struct SamplingBuffers

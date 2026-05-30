@@ -41,13 +41,15 @@ Json makeMinimalConfig()
     config["hidden_size"] = 768;
     config["vocab_size"] = 32000;
     config["kv_cache_dtype"] = "fp16";
+    config["spec_decode_type"] = "none";
+    config["engine_role"] = "llm";
 
     Json bc;
     bc["max_batch_size"] = 2;
     bc["max_input_len"] = 128;
     bc["max_kv_cache_capacity"] = 256;
     bc["max_lora_rank"] = 0;
-    bc["eagle_base"] = false;
+    bc["spec_base"] = false;
     config["builder_config"] = bc;
     return config;
 }
@@ -216,8 +218,9 @@ TEST_F(LLMEngineConfigTest, MissingOptionalFieldsGetDefaults)
 TEST_F(LLMEngineConfigTest, SpecDecodeMaxProposalSizes)
 {
     Json json = makeMinimalConfig();
-    json["model_type"] = "eagle3_base";
-    json["builder_config"]["eagle_base"] = true;
+    json["spec_decode_type"] = "eagle3";
+    json["engine_role"] = "base";
+    json["builder_config"]["spec_base"] = true;
     json["builder_config"]["max_verify_tree_size"] = 16;
     // `max_draft_tree_size` is a draft-engine property and is not written
     // into base_config.json by the builder — intentionally omitted here.
@@ -336,8 +339,9 @@ TEST_F(LLMEngineConfigTest, FormatEngineConfigDoesNotCrash)
 TEST_F(LLMEngineConfigTest, SpecDecodeMissingVerifyTreeSizeThrows)
 {
     Json json = makeMinimalConfig();
-    json["model_type"] = "eagle3_base";
-    json["builder_config"]["eagle_base"] = true;
+    json["spec_decode_type"] = "eagle3";
+    json["engine_role"] = "base";
+    json["builder_config"]["spec_base"] = true;
     // Intentionally omit max_verify_tree_size (the only required specConfig field on the base).
     auto const path = writeJsonToTempFile(json);
 
@@ -634,8 +638,12 @@ namespace
 Json makeMinimalDraftConfig()
 {
     Json config = makeMinimalConfig();
+    config["spec_decode_type"] = "mtp";
+    config["engine_role"] = "draft";
     config["draft_vocab_size"] = 32000;
     config["base_model_hidden_size"] = 768;
+    config["builder_config"]["spec_base"] = false;
+    config["builder_config"]["spec_draft"] = true;
     config["builder_config"]["max_draft_tree_size"] = 4;
     return config;
 }

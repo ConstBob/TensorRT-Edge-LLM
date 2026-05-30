@@ -377,10 +377,11 @@ class LLM:
                                      max_kv_cache_capacity)
         artifacts = _artifacts_dir_for_model(onnx_dir)
 
-        eagle = self._eagle_engine_dir
-        self._engine_dir = (eagle if eagle else os.path.join(
-            artifacts, "engine", cfg_tag, "llm"))
-        if not eagle and not os.path.exists(
+        spec_decode_engine_dir = self._eagle_engine_dir
+        self._engine_dir = (spec_decode_engine_dir
+                            if spec_decode_engine_dir else os.path.join(
+                                artifacts, "engine", cfg_tag, "llm"))
+        if not spec_decode_engine_dir and not os.path.exists(
                 os.path.join(self._engine_dir, "llm.engine")):
             self._build_engine()
         else:
@@ -450,10 +451,10 @@ class LLM:
         if self._visual_engine_dir:
             logger.info("Loading visual engine from %s ...",
                         self._visual_engine_dir)
-        eagle = self._eagle_engine_dir
-        if eagle:
+        spec_decode_engine_dir = self._eagle_engine_dir
+        if spec_decode_engine_dir:
             logger.info(
-                "Eagle spec-decode enabled (top_k=%d, step=%d, tree=%d)",
+                "Speculative decoding enabled (top_k=%d, step=%d, tree=%d)",
                 self._draft_top_k,
                 self._draft_step,
                 self._verify_tree_size,

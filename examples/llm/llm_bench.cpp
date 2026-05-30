@@ -18,6 +18,7 @@
 #include "benchLogger.h"
 #include "benchRunner.h"
 #include "common/bindingNames.h"
+#include "common/checkMacros.h"
 #include "common/cudaUtils.h"
 #include "common/fileUtils.h"
 #include "common/logger.h"
@@ -25,8 +26,16 @@
 #include "common/trtUtils.h"
 #include "multimodal/multimodalRunner.h"
 #include "profiling/layerProfiler.h"
-#include "runtime/legacy/eagleDraftEngineRunner.h"
-#include "runtime/legacy/llmEngineRunner.h"
+#include "runtime/config/deploymentConfig.h"
+#include "runtime/config/inferenceDims.h"
+#include "runtime/config/inferencePhase.h"
+#include "runtime/config/llmEngineConfig.h"
+#include "runtime/exec/engineExecutor.h"
+#include "runtime/exec/tensorMap.h"
+#include "runtime/features/deepstackBinding.h"
+#include "runtime/preprocess/stepPreparer.h"
+#include "runtime/state/pipelineIO.h"
+#include "runtime/state/sharedResources.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -35,14 +44,18 @@
 #include <functional>
 #include <getopt.h>
 #include <iostream>
+#include <nlohmann/json.hpp>
 #include <sstream>
 #include <string>
 #include <vector>
 
 using namespace trt_edgellm;
-using rt::Json;
+using Json = nlohmann::json;
 
 // ==================== Type Definitions ====================
+
+constexpr int32_t kPrefillProfile{0};
+constexpr int32_t kDecodeProfile{1};
 
 enum ProfileBenchOptionId : int
 {
@@ -108,7 +121,6 @@ struct ProfileBenchArgs
     // Set via --extractLayerInfo <comma-separated list>.
     ExtractLayerInfo extractLayerInfo;
 
-    //! Convert to BenchOutputParams for CSV/log output functions
     BenchOutputParams toOutputParams() const
     {
         BenchOutputParams p;
@@ -350,7 +362,6 @@ bool parseArgs(ProfileBenchArgs& args, int argc, char* argv[])
                 break;
             case ProfileBenchOptionId::IMAGE_SIZE:
             {
-                // Parse "HxW" format (e.g., "896x448")
                 std::string sizeStr = optarg;
                 size_t xPos = sizeStr.find('x');
                 if (xPos == std::string::npos)
@@ -428,7 +439,6 @@ bool parseArgs(ProfileBenchArgs& args, int argc, char* argv[])
         }
     }
 
-    // Layer metadata is only emitted through the layer profiling CSV.
     if (args.extractLayerInfo.any())
     {
         args.noProfile = false;
@@ -451,7 +461,6 @@ bool validateArgs(ProfileBenchArgs const& args)
         return false;
     }
 
-    // Mode-specific validation
     switch (args.mode)
     {
     case BenchMode::kPREFILL:
@@ -512,6 +521,19 @@ bool validateArgs(ProfileBenchArgs const& args)
     return true;
 }
 
+// ==================== Helper: detect engine paths ====================
+
+bool isDraftEngineMode(BenchMode mode)
+{
+    return mode == BenchMode::kEAGLE_DRAFT_PROPOSAL || mode == BenchMode::kEAGLE_DRAFT_PREFILL;
+}
+
+bool isSpecDecodeMode(BenchMode mode)
+{
+    return mode == BenchMode::kEAGLE_VERIFY || mode == BenchMode::kEAGLE_DRAFT_PROPOSAL
+        || mode == BenchMode::kEAGLE_DRAFT_PREFILL;
+}
+
 // ==================== main ====================
 
 int main(int argc, char** argv)
@@ -553,7 +575,6 @@ int main(int argc, char** argv)
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
-    // Layer profiling is opt-in; E2E timing is the default benchmark path.
     if (!args.noProfile)
     {
         layerProfiler::LayerProfiler::getInstance().setEnabled(true);
@@ -564,54 +585,39 @@ int main(int argc, char** argv)
         LOG_INFO("Layer profiling disabled from startup. E2E timing only.");
     }
 
-    // Layer metadata (ONNX ops, shapes, tactics, data types) extracted from engine inspector
     std::map<std::string, LayerMetadata> layerMetadata;
 
-    // Create layer info directory if specified
     if (!args.outputDir.empty())
     {
         std::filesystem::create_directories(args.outputDir);
         LOG_INFO("Output CSV files will be saved to: %s", args.outputDir.c_str());
     }
 
-    // Variables for benchmark results
     std::vector<KernelTimes> timesPerIter;
     timesPerIter.reserve(args.iterations);
-
-    // E2E timing result (set by each mode's E2E timing section)
     float e2eTimeMsResult = 0.0f;
-
-    // Ordered collection to accumulate layer timings across iterations (preserves model layer order)
     OrderedLayerTimings layerTimings;
 
-    // ===== Phase 1: Initialize Runner =====
-    std::unique_ptr<rt::LLMEngineRunner> runner;
-    std::unique_ptr<rt::EagleDraftEngineRunner> draftRunner;
-    std::unique_ptr<rt::MultimodalRunner> visualRunner;
-    rt::Tensor contextMemory; // Shared context memory for TRT execution (kUSER_MANAGED)
+    // ===== Phase 1: Initialize Engine =====
+    std::unique_ptr<rt::EngineExecutor> executor;
+    std::unique_ptr<rt::SharedResources> resources;
+    std::unique_ptr<rt::PipelineIO> io;
+    rt::TensorMap tensorMap;
+    std::unique_ptr<rt::StepPreparer> stepPreparer;
+    std::unique_ptr<rt::DeepstackBinding> deepstack;
+    rt::DeploymentConfig deployment;
+    rt::Tensor contextMemory;
 
-    int32_t hiddenSize = 0;
-    int32_t vocabSize = 0;
-    int32_t eagleHiddenDim = 0;
-    int32_t baseHiddenSize = 0;
-    nvinfer1::DataType dtype = nvinfer1::DataType::kHALF;
-    nvinfer1::DataType logitsDtype = nvinfer1::DataType::kHALF;
-    // Standalone engine for dtype queries and layer metadata extraction. Destroyed after use.
+    // Visual mode uses MultimodalRunner (unchanged from legacy)
+    std::unique_ptr<rt::MultimodalRunner> visualRunner;
     std::unique_ptr<nvinfer1::ICudaEngine> standaloneEngine;
     int64_t imageTokens = 0;
 
     if (args.mode == BenchMode::kVISUAL)
     {
-        if (args.imageHeight <= 0 || args.imageWidth <= 0)
-        {
-            LOG_ERROR("--imageSize is required for visual mode (e.g., --imageSize 1024x512)");
-            return EXIT_FAILURE;
-        }
-
         try
         {
-            // Read maxSequenceLength from sibling LLM config (needed for MRoPE buffer allocation).
-            int32_t maxSeqLen = 4096; // fallback default
+            int32_t maxSeqLen = 4096;
             for (auto const& siblingDir : {"llm", "base"})
             {
                 auto llmConfigPath = std::filesystem::path(args.engineDir).parent_path() / siblingDir / "config.json";
@@ -643,7 +649,6 @@ int main(int argc, char** argv)
             = rt::Tensor(rt::Coords{memSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "context_memory");
         visualRunner->setContextMemory(contextMemory);
 
-        // Construct a fake request with dummy images for benchmarking.
         rt::LLMGenerationRequest dummyRequest;
         for (int32_t b = 0; b < args.batchSize; ++b)
         {
@@ -669,154 +674,190 @@ int main(int argc, char** argv)
 
         standaloneEngine = loadStandaloneEngine(std::filesystem::path(args.engineDir) / "visual.engine");
     }
-    else if (args.mode == BenchMode::kPREFILL || args.mode == BenchMode::kDECODE
-        || args.mode == BenchMode::kEAGLE_VERIFY)
+    else
     {
-        // Use llm.engine for standard VLM, eagle_base.engine for EAGLE (auto-detect by file presence)
-        std::filesystem::path enginePath = std::filesystem::path(args.engineDir) / "llm.engine";
-        if (!std::filesystem::exists(enginePath))
+        // --- Resolve engine/config paths ---
+        std::filesystem::path const dir{args.engineDir};
+        bool const hasSpecDecode = isSpecDecodeMode(args.mode);
+
+        std::filesystem::path baseConfigPath = dir / "config.json";
+        if (!std::filesystem::exists(baseConfigPath))
         {
-            enginePath = std::filesystem::path(args.engineDir) / "eagle_base.engine";
-        }
-        if (!std::filesystem::exists(enginePath))
-        {
-            LOG_ERROR("Engine not found (tried llm.engine and eagle_base.engine in %s)", args.engineDir.c_str());
-            return EXIT_FAILURE;
+            baseConfigPath = dir / "base_config.json";
         }
 
-        // Use config.json for standard VLM, base_config.json for EAGLE
-        std::filesystem::path configPath = std::filesystem::path(args.engineDir) / "config.json";
-        if (!std::filesystem::exists(configPath))
+        std::optional<std::filesystem::path> draftConfigPath;
+        std::optional<rt::SpecDecodeDraftingConfig> draftingConfig;
+        if (hasSpecDecode)
         {
-            configPath = std::filesystem::path(args.engineDir) / "base_config.json";
+            draftConfigPath = dir / "draft_config.json";
+            // Bench needs a SpecDecodeDraftingConfig to create DeploymentConfig.
+            // Use verifyTreeSize/draftTreeSize from args; draftingTopK/draftingStep are
+            // only needed for the full pipeline. Set reasonable defaults so the config
+            // factory's positivity checks pass.
+            rt::SpecDecodeDraftingConfig dc;
+            dc.draftingTopK = std::max(args.draftTreeSize, 1);
+            dc.draftingStep = std::max(args.draftStep, 1);
+            dc.verifySize = std::max(args.verifyTreeSize, 1);
+            draftingConfig = dc;
         }
-        std::unordered_map<std::string, std::string> loraMap;
 
+        // --- Parse configs and create DeploymentConfig ---
         try
         {
-            runner = std::make_unique<rt::LLMEngineRunner>(enginePath, configPath, loraMap, stream);
+            deployment = rt::createDeploymentConfig(baseConfigPath, draftConfigPath, draftingConfig);
         }
         catch (std::exception const& e)
         {
-            LOG_ERROR("Failed to create LLMEngineRunner: %s", e.what());
+            LOG_ERROR("Failed to parse engine configuration: %s", e.what());
             return EXIT_FAILURE;
         }
 
-        // Allocate shared context memory (required for kUSER_MANAGED strategy)
-        int64_t memSize = runner->getRequiredContextMemorySize();
-        contextMemory
-            = rt::Tensor(rt::Coords{memSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "context_memory");
-        runner->setContextMemory(contextMemory);
+        // --- Determine which engine this mode operates on ---
+        bool const useDraftEngine = isDraftEngineMode(args.mode);
+        rt::LLMEngineConfig const& activeCfg = useDraftEngine ? *deployment.draft : deployment.base;
 
-        auto engineConfig = runner->getEngineConfig();
-        hiddenSize = engineConfig.hiddenSize;
-        vocabSize = engineConfig.vocabSize;
-        eagleHiddenDim = engineConfig.outputHiddenDim;
-
-        standaloneEngine = loadStandaloneEngine(enginePath);
-        dtype = standaloneEngine->getTensorDataType(binding_names::kInputsEmbeds);
-        logitsDtype = standaloneEngine->getTensorDataType(binding_names::kLogits);
-    }
-    else if (args.mode == BenchMode::kEAGLE_DRAFT_PROPOSAL || args.mode == BenchMode::kEAGLE_DRAFT_PREFILL)
-    {
-        std::filesystem::path enginePath = std::filesystem::path(args.engineDir) / "eagle_draft.engine";
-        std::filesystem::path configPath = std::filesystem::path(args.engineDir) / "draft_config.json";
-        if (!std::filesystem::exists(enginePath))
+        // --- Create EngineExecutor ---
+        std::filesystem::path enginePath;
+        if (useDraftEngine)
         {
-            LOG_ERROR("Eagle draft engine not found at %s", enginePath.string().c_str());
-            return EXIT_FAILURE;
+            enginePath = dir / "spec_draft.engine";
+        }
+        else
+        {
+            enginePath = dir / "llm.engine";
+            if (!std::filesystem::exists(enginePath))
+            {
+                enginePath = dir / "spec_base.engine";
+            }
         }
 
         try
         {
-            draftRunner = std::make_unique<rt::EagleDraftEngineRunner>(enginePath, configPath, stream);
+            if (useDraftEngine)
+            {
+                executor = rt::EngineExecutor::createForDraft(enginePath, deployment);
+            }
+            else
+            {
+                std::optional<int32_t> specDecodeBaseOutputHiddenDim;
+                if (deployment.specConfig.has_value())
+                {
+                    specDecodeBaseOutputHiddenDim = deployment.specConfig->baseOutputHiddenDim;
+                }
+                executor = rt::EngineExecutor::createForLLM(enginePath, deployment.base, specDecodeBaseOutputHiddenDim);
+            }
         }
         catch (std::exception const& e)
         {
-            LOG_ERROR("Failed to create EagleDraftEngineRunner: %s", e.what());
+            LOG_ERROR("Failed to create EngineExecutor: %s", e.what());
             return EXIT_FAILURE;
         }
 
-        // Allocate shared context memory (required for kUSER_MANAGED strategy)
-        int64_t memSize = draftRunner->getRequiredContextMemorySize();
+        rt::validateAgainstEngine(activeCfg, *executor, useDraftEngine ? "draft" : "base");
+
+        if (layerProfiler::LayerProfiler::getInstance().isEnabled())
+        {
+            executor->setProfiler(&layerProfiler::LayerProfiler::getInstance());
+        }
+
+        LOG_INFO("EngineExecutor loaded from %s", enginePath.c_str());
+
+        // --- Create SharedResources, PipelineIO, TensorMap ---
+        // Use spec-decode factories when the deployment has a draft config, even if
+        // the bench mode is prefill/decode. A spec-decode base engine has extra
+        // bindings (attention_mask, attention_pos_id) that require PipelineIO to
+        // allocate packedAttentionMask and specDecodePositionIds.
+        bool const useSpecDecodeResources = deployment.draft.has_value();
+        int32_t const maxBatch = deployment.maxRuntimeBatchSize();
+        std::unordered_map<std::string, std::string> emptyLoraMap;
+
+        if (useSpecDecodeResources)
+        {
+            resources = rt::SharedResources::createForSpecDecode(deployment, maxBatch, emptyLoraMap, stream);
+            io = std::make_unique<rt::PipelineIO>(rt::PipelineIO::createForSpecDecode(deployment, maxBatch, stream));
+        }
+        else
+        {
+            resources = rt::SharedResources::createForLLM(deployment.base, emptyLoraMap, stream);
+            io = std::make_unique<rt::PipelineIO>(rt::PipelineIO::createForLLM(deployment.base, stream));
+        }
+
+        // Build TensorMap: kvCacheIndex=0 for base, 1 for draft
+        if (useDraftEngine)
+        {
+            rt::buildTensorMapForSpecDecodeDraft(tensorMap, *io, *resources, *deployment.draft);
+        }
+        else
+        {
+            rt::buildTensorMap(tensorMap, *io, *resources, deployment.base, /*kvCacheIndex=*/0);
+        }
+
+        // --- Context memory ---
+        int64_t memSize = executor->getRequiredContextMemorySize();
         contextMemory
             = rt::Tensor(rt::Coords{memSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "context_memory");
-        draftRunner->setContextMemory(contextMemory);
+        executor->setContextMemory(contextMemory);
 
-        auto engineConfig = draftRunner->getDraftEngineConfig();
-        hiddenSize = engineConfig.draftModelHiddenDim;
-        vocabSize = engineConfig.draftModelVocabSize;
-        baseHiddenSize = engineConfig.baseModelHiddenDim;
+        // --- StepPreparer (for prefill/decode metadata) ---
+        stepPreparer = std::make_unique<rt::StepPreparer>(activeCfg);
+
+        // --- DeepstackBinding (if applicable, base engine only) ---
+        if (!useDraftEngine && deployment.base.numDeepstackFeatures > 0)
+        {
+            deepstack = std::make_unique<rt::DeepstackBinding>(io->deepstackEmbeds, resources->zeroBuffer);
+        }
+
+        // --- Log engine config ---
+        LOG_INFO("Engine config:\n%s", rt::formatEngineConfig(activeCfg).c_str());
+
+        // --- Standalone engine for layer metadata extraction ---
         standaloneEngine = loadStandaloneEngine(enginePath);
-        dtype = standaloneEngine->getTensorDataType(binding_names::kInputsEmbeds);
-    }
 
-    // ===== Phase 2: Log Config =====
-    if (runner)
-    {
-        logLlmEngineConfig(runner->getEngineConfig());
-    }
-    else if (draftRunner)
-    {
-        logDraftEngineConfig(draftRunner->getDraftEngineConfig());
+        // --- Fill PipelineIO tensors with random data ---
+        nvinfer1::DataType const dtype = nvinfer1::DataType::kHALF;
+        fillRandomData(io->inputsEmbeds, -1.0f, 1.0f, dtype, args.seed);
+
+        if (!io->baseHiddenStates.isEmpty())
+        {
+            fillRandomData(io->baseHiddenStates, -1.0f, 1.0f, dtype, args.seed);
+        }
+        if (!io->draftHiddenStatesIn.isEmpty())
+        {
+            CUDA_CHECK(cudaMemsetAsync(
+                io->draftHiddenStatesIn.rawPointer(), 0, io->draftHiddenStatesIn.getMemoryCapacity(), stream));
+        }
     }
 
     logBenchConfig(args.toOutputParams(), imageTokens);
 
-    // ===== Phase 3: Prepare Tensors + Define Lambdas =====
+    // ===== Phase 2: Define step/reset/capture lambdas =====
     std::function<void()> resetState;
     std::function<bool()> step;
     std::string modeName;
 
-    // Tensors at main scope (lifetime must span all phases).
     rt::Tensor reuseKVCacheLengths;
     if (args.mode != BenchMode::kVISUAL)
     {
         reuseKVCacheLengths = rt::Tensor(
             rt::Coords{args.batchSize}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "reuse_kv_lengths");
     }
-    rt::Tensor prefillInputs;
-    rt::Tensor contextLengths;
-    rt::Tensor logits;
-    rt::Tensor decodeInputs;
-    rt::Tensor verifyInputs;
-    rt::Tensor verifyMask;
-    rt::Tensor verifyLogits;
-    rt::Tensor verifyHiddenStates;
-    rt::Tensor draftInputs;
-    rt::Tensor draftMask;
-    rt::Tensor draftBaseHiddenStates;
-    rt::Tensor draftModelHiddenStates;
-    rt::Tensor draftTreeLength;
-    rt::Tensor draftLogits;
-    rt::Tensor draftOutputHiddenStates;
-    rt::Tensor inputsEmbeds;
-    rt::Tensor baseModelHiddenStates;
-    rt::Tensor draftPrefillDraftModelHiddenStates;
-    rt::Tensor draftPrefillContextLengths;
-    rt::Tensor outputLogits;
-    rt::Tensor outputHiddenStates;
 
-    // Deepstack tensors for prefill mode
-    std::vector<rt::Tensor> deepstackEmbedTensors;
-    rt::OptionalInputTensors deepstackEmbeds;
-    std::unique_ptr<rt::Tensor> outputHiddenStatesPtr;
-    rt::OptionalOutputTensor outputHiddenStatesOpt = std::nullopt;
-
-    // Vectors for KV cache reset
     std::vector<int32_t> reuseKVLenVec;
     std::vector<int32_t> pastKVLenVec;
 
-    // E2E-specific lambdas/values (mode-specific, used in Phase 7)
     std::function<void(int32_t)> postStep = [](int32_t) {};
     std::function<bool()> captureGraph = []() { return false; };
     int32_t decodeSteps = 1;
     bool useSequentialE2E = false;
 
+    int32_t const B = args.batchSize;
+    bool const useDraftEngine = isDraftEngineMode(args.mode);
+    int32_t const kvCacheIndex = useDraftEngine ? 1 : 0;
+
     if (args.mode == BenchMode::kVISUAL)
     {
         modeName = "Visual Encoder";
-
         step = [&]() { return visualRunner->infer(stream); };
         resetState = []() {};
     }
@@ -825,68 +866,38 @@ int main(int argc, char** argv)
         modeName = "Prefill";
         LOG_INFO("Prefill mode: InputLen=%d, ReuseKVLen=%d", args.inputLen, args.reuseKVLen);
 
-        // For MRoPE (VLM), reshape RoPE cache to match batchSize before prefill.
-        // MRoPE allocates with maxSupportedBatchSize capacity (see llmEngineRunner.cpp RopeType::kMRope),
-        // then initializes as {1, maxKV, rotaryDim}. Reshape to {batchSize, ...} is safe.
-        // In real inference, multimodal preprocess handles this; in benchmark we do it manually.
-        auto engineCfg = runner->getEngineConfig();
-        if (args.batchSize > 1 && engineCfg.ropeConfig.type == rt::RopeType::kMRope)
+        // Reshape inputsEmbeds for this bench config
+        check::check(
+            io->inputsEmbeds.reshape({B, args.inputLen, deployment.base.hiddenSize}), "inputsEmbeds reshape failed");
+
+        // Set context lengths on PipelineIO (host side, for StepPreparer)
+        int32_t const contextLen = args.reuseKVLen + args.inputLen;
+        int32_t* hostCtx = io->hostContextLengths.dataPointer<int32_t>();
+        for (int32_t i = 0; i < B; ++i)
         {
-            auto& ropeCache = runner->getRopeCosSinCacheTensor();
-            check::check(ropeCache.reshape({args.batchSize, engineCfg.maxKVCacheCapacity, engineCfg.rotaryDim}),
-                "MRoPE RopeCosSinCache reshape failed");
+            hostCtx[i] = contextLen;
         }
 
-        prefillInputs = rt::Tensor(
-            rt::Coords{args.batchSize, args.inputLen, hiddenSize}, rt::DeviceType::kGPU, dtype, "prefill_input");
-        fillRandomData(prefillInputs, -1.0f, 1.0f, dtype, args.seed);
+        reuseKVLenVec.assign(B, args.reuseKVLen);
 
-        contextLengths = rt::Tensor(
-            rt::Coords{args.batchSize}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "context_lengths");
-        std::vector<int32_t> contextLengthsHost(args.batchSize, args.reuseKVLen + args.inputLen);
-        std::memcpy(
-            contextLengths.rawPointer(), contextLengthsHost.data(), contextLengthsHost.size() * sizeof(int32_t));
-
-        logits = rt::Tensor(rt::Coords{args.batchSize, vocabSize}, rt::DeviceType::kGPU, logitsDtype, "logits");
-
-        reuseKVLenVec.assign(args.batchSize, args.reuseKVLen);
-
-        // Allocate deepstack embeds if needed (zero tensors for benchmarking without multimodal input)
-        auto engineConfig = runner->getEngineConfig();
-        if (engineConfig.numDeepstackFeatures > 0)
+        if (deepstack)
         {
-            LOG_INFO("Allocating %d deepstack embed tensors (zero-filled for benchmarking)",
-                engineConfig.numDeepstackFeatures);
-            for (int32_t i = 0; i < engineConfig.numDeepstackFeatures; ++i)
-            {
-                deepstackEmbedTensors.emplace_back(rt::Coords{args.batchSize, args.inputLen, hiddenSize},
-                    rt::DeviceType::kGPU, dtype, "deepstack_embed_" + std::to_string(i));
-                // Zero-fill the tensor
-                CUDA_CHECK(cudaMemsetAsync(deepstackEmbedTensors.back().rawPointer(), 0,
-                    deepstackEmbedTensors.back().getShape().volume() * rt::utils::getTypeSize(dtype), stream));
-            }
-            for (auto const& t : deepstackEmbedTensors)
-            {
-                deepstackEmbeds.push_back(std::cref(t));
-            }
+            deepstack->useRealFeatures(tensorMap);
         }
 
-        // Allocate output hidden states if Eagle is enabled
-        if (engineConfig.enableEagleSpecDecode)
-        {
-            outputHiddenStatesPtr
-                = std::make_unique<rt::Tensor>(rt::Coords{args.batchSize, args.inputLen, engineConfig.outputHiddenDim},
-                    rt::DeviceType::kGPU, dtype, "output_hidden_states");
-            outputHiddenStatesOpt = std::ref(*outputHiddenStatesPtr);
-        }
+        bool const kvCacheAllEmpty = (args.reuseKVLen == 0);
+        auto const dims = deployment.base.prefillDims(B, args.inputLen, kvCacheAllEmpty);
 
         resetState = [&]() {
             std::memcpy(reuseKVCacheLengths.rawPointer(), reuseKVLenVec.data(), reuseKVLenVec.size() * sizeof(int32_t));
-            runner->getCacheManager().resetForNewSequences(reuseKVCacheLengths, stream);
+            resources->cacheManagers[kvCacheIndex]->resetForNewSequences(reuseKVCacheLengths, stream);
         };
-        step = [&]() {
-            return runner->executePrefillStep(
-                prefillInputs, contextLengths, deepstackEmbeds, logits, outputHiddenStatesOpt, stream);
+        step = [&, dims]() {
+            stepPreparer->prepare(
+                rt::InferencePhase::kPrefill, B, *resources->cacheManagers[kvCacheIndex], *io, stream);
+            if (!executor->prepare(kPrefillProfile, dims, tensorMap, stream))
+                return false;
+            return executor->execute(stream);
         };
     }
     else if (args.mode == BenchMode::kDECODE)
@@ -894,127 +905,141 @@ int main(int argc, char** argv)
         modeName = "Decode";
         LOG_INFO("Decode mode: PastKVLen=%d", args.pastKVLen);
 
-        int32_t osl = args.osl;
-        int32_t decodeTokens = (osl > 1) ? (osl - 1) : 1;
+        int32_t const osl = args.osl;
+        int32_t const decodeTokens = (osl > 1) ? (osl - 1) : 1;
         LOG_INFO("OSL=%d: will run %d decode steps for E2E timing", osl, decodeTokens);
         LOG_INFO(args.noCudaGraph ? "CUDA graph disabled; using non-CUDA-graph execution" : "CUDA graph enabled");
 
-        decodeInputs
-            = rt::Tensor(rt::Coords{args.batchSize, 1, hiddenSize}, rt::DeviceType::kGPU, dtype, "decode_input");
-        fillRandomData(decodeInputs, -1.0f, 1.0f, dtype, args.seed);
+        check::check(io->inputsEmbeds.reshape({B, 1, deployment.base.hiddenSize}), "inputsEmbeds reshape failed");
 
-        logits = rt::Tensor(rt::Coords{args.batchSize, vocabSize}, rt::DeviceType::kGPU, logitsDtype, "logits");
+        pastKVLenVec.assign(B, args.pastKVLen);
 
-        pastKVLenVec.assign(args.batchSize, args.pastKVLen);
+        auto const dims = deployment.base.decodeDims(B);
 
         resetState = [&]() {
             std::memcpy(reuseKVCacheLengths.rawPointer(), pastKVLenVec.data(), pastKVLenVec.size() * sizeof(int32_t));
-            runner->getCacheManager().resetForNewSequences(reuseKVCacheLengths, stream);
+            resources->cacheManagers[kvCacheIndex]->resetForNewSequences(reuseKVCacheLengths, stream);
         };
-        step = [&]() { return runner->executeVanillaDecodingStep(decodeInputs, logits, std::nullopt, stream); };
-        captureGraph = [&]() { return runner->captureVanillaDecodingCudaGraph(decodeInputs, logits, {}, stream); };
+        step = [&, dims]() {
+            stepPreparer->prepare(rt::InferencePhase::kDecode, B, *resources->cacheManagers[kvCacheIndex], *io, stream);
+            if (!executor->prepare(kDecodeProfile, dims, tensorMap, stream))
+                return false;
+            return executor->execute(stream);
+        };
+        captureGraph = [&, dims]() {
+            resetState();
+            stepPreparer->prepare(rt::InferencePhase::kDecode, B, *resources->cacheManagers[kvCacheIndex], *io, stream);
+            if (!executor->prepare(kDecodeProfile, dims, tensorMap, stream))
+                return false;
+            return executor->captureGraph(stream);
+        };
 
-        // E2E config: osl=1 uses repeated single-step timing, osl>1 uses sequential full-decode timing
         if (osl > 1)
         {
             useSequentialE2E = true;
             decodeSteps = decodeTokens;
-            postStep = [](int32_t) {};
         }
     }
     else if (args.mode == BenchMode::kEAGLE_VERIFY)
     {
         modeName = "Spec Verify";
         LOG_INFO("Spec Verify mode: VerifyTreeSize=%d, PastKVLen=%d", args.verifyTreeSize, args.pastKVLen);
-
-        pastKVLenVec.assign(args.batchSize, args.pastKVLen);
-
-        verifyInputs = rt::Tensor(
-            rt::Coords{args.batchSize, args.verifyTreeSize, hiddenSize}, rt::DeviceType::kGPU, dtype, "verify_input");
-        fillRandomData(verifyInputs, -1.0f, 1.0f, dtype, args.seed);
-
-        verifyMask = rt::Tensor(rt::Coords{args.batchSize, args.verifyTreeSize, args.verifyTreeSize},
-            rt::DeviceType::kGPU, nvinfer1::DataType::kINT8, "verify_mask");
-        fillInt8(verifyMask, 1);
-
-        int32_t selectTokenSize = args.batchSize * args.verifyTreeSize;
-        verifyLogits = rt::Tensor(
-            rt::Coords{selectTokenSize, vocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "verify_logits");
-        verifyHiddenStates = rt::Tensor(
-            rt::Coords{selectTokenSize, eagleHiddenDim}, rt::DeviceType::kGPU, dtype, "verify_hidden_states");
-
         LOG_INFO(args.noCudaGraph ? "CUDA graph disabled; using non-CUDA-graph execution" : "CUDA graph enabled");
+
+        pastKVLenVec.assign(B, args.pastKVLen);
+
+        check::check(io->inputsEmbeds.reshape({B, args.verifyTreeSize, deployment.base.hiddenSize}),
+            "inputsEmbeds reshape failed");
+
+        // selectTokenIndices: for verify, all positions are selected
+        check::check(io->selectTokenIndices.reshape({B, args.verifyTreeSize}), "selectTokenIndices reshape failed");
+        CUDA_CHECK(cudaMemsetAsync(
+            io->selectTokenIndices.rawPointer(), 0, io->selectTokenIndices.getMemoryCapacity(), stream));
+
+        // contextLengths: dummy values (past KV len + verify tree size)
+        check::check(io->contextLengths.reshape({B}), "contextLengths reshape failed");
+        {
+            std::vector<int32_t> ctxVec(B, args.pastKVLen + args.verifyTreeSize);
+            CUDA_CHECK(cudaMemcpyAsync(
+                io->contextLengths.rawPointer(), ctxVec.data(), B * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        }
+
+        if (deepstack)
+        {
+            deepstack->useZeroTarget(tensorMap);
+        }
+
+        auto const dims = deployment.base.specVerifyDims(B, args.verifyTreeSize);
 
         resetState = [&]() {
             std::memcpy(reuseKVCacheLengths.rawPointer(), pastKVLenVec.data(), pastKVLenVec.size() * sizeof(int32_t));
-            runner->getCacheManager().resetForNewSequences(reuseKVCacheLengths, stream);
+            resources->cacheManagers[kvCacheIndex]->resetForNewSequences(reuseKVCacheLengths, stream);
         };
-        step = [&]() {
-            return runner->executeEagleBaseTreeDecodingStep(
-                verifyInputs, verifyMask, verifyLogits, verifyHiddenStates, stream);
+        step = [&, dims]() {
+            if (!executor->prepare(kDecodeProfile, dims, tensorMap, stream))
+                return false;
+            return executor->execute(stream);
         };
-        captureGraph = [&]() {
-            return runner->captureEagleBaseTreeDecodingCudaGraph(
-                verifyInputs, verifyMask, verifyLogits, verifyHiddenStates, "", stream);
+        captureGraph = [&, dims]() {
+            resetState();
+            if (!executor->prepare(kDecodeProfile, dims, tensorMap, stream))
+                return false;
+            return executor->captureGraph(stream);
         };
 
-        // E2E config: osl=1 uses repeated single-step timing, osl>1 uses sequential full-decode timing
         if (args.osl > 1)
         {
             useSequentialE2E = true;
             decodeSteps = (args.osl - 1 + args.acceptRate - 1) / args.acceptRate;
-            postStep = [&](int32_t) { runner->getCacheManager().commitSequenceLength(args.acceptRate, stream); };
+            postStep = [&](int32_t) {
+                resources->cacheManagers[kvCacheIndex]->commitSequenceLength(args.acceptRate, stream);
+            };
         }
     }
     else if (args.mode == BenchMode::kEAGLE_DRAFT_PROPOSAL)
     {
         modeName = "Spec Draft";
         LOG_INFO("Spec Draft mode: DraftTreeSize=%d, PastKVLen=%d", args.draftTreeSize, args.pastKVLen);
-
-        pastKVLenVec.assign(args.batchSize, args.pastKVLen);
-
-        draftInputs = rt::Tensor(
-            rt::Coords{args.batchSize, args.draftTreeSize, hiddenSize}, rt::DeviceType::kGPU, dtype, "draft_input");
-        fillRandomData(draftInputs, -1.0f, 1.0f, dtype, args.seed);
-
-        draftMask = rt::Tensor(rt::Coords{args.batchSize, args.draftTreeSize, args.draftTreeSize}, rt::DeviceType::kGPU,
-            nvinfer1::DataType::kINT8, "draft_mask");
-        fillInt8(draftMask, 1);
-
-        draftBaseHiddenStates = rt::Tensor(rt::Coords{args.batchSize, args.draftTreeSize, baseHiddenSize},
-            rt::DeviceType::kGPU, dtype, "draft_base_hidden_zeros");
-        fillRandomData(draftBaseHiddenStates, 0.0f, 0.0f, dtype, args.seed);
-
-        draftModelHiddenStates = rt::Tensor(rt::Coords{args.batchSize, args.draftTreeSize, hiddenSize},
-            rt::DeviceType::kGPU, dtype, "draft_hidden_input");
-        fillRandomData(draftModelHiddenStates, -1.0f, 1.0f, dtype, args.seed);
-
-        draftTreeLength = rt::Tensor(
-            rt::Coords{args.batchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "draft_tree_len");
-        fillInt32(draftTreeLength, args.draftTreeSize);
-
-        int32_t numSelectedTokens = args.draftTreeSize;
-        draftLogits = rt::Tensor(rt::Coords{args.batchSize, numSelectedTokens, vocabSize}, rt::DeviceType::kGPU,
-            nvinfer1::DataType::kFLOAT, "draft_logits");
-        draftOutputHiddenStates = rt::Tensor(rt::Coords{args.batchSize, numSelectedTokens, hiddenSize},
-            rt::DeviceType::kGPU, dtype, "draft_hidden_output");
-
         LOG_INFO(args.noCudaGraph ? "CUDA graph disabled; using non-CUDA-graph execution" : "CUDA graph enabled");
+
+        pastKVLenVec.assign(B, args.pastKVLen);
+
+        int32_t const draftHiddenSize = deployment.draft->hiddenSize;
+        check::check(io->inputsEmbeds.reshape({B, args.draftTreeSize, draftHiddenSize}), "inputsEmbeds reshape failed");
+
+        // selectTokenIndices: for proposal, select draftTreeSize tokens
+        check::check(io->selectTokenIndices.reshape({B, args.draftTreeSize}), "selectTokenIndices reshape failed");
+        CUDA_CHECK(cudaMemsetAsync(
+            io->selectTokenIndices.rawPointer(), 0, io->selectTokenIndices.getMemoryCapacity(), stream));
+
+        // contextLengths: dummy values
+        check::check(io->contextLengths.reshape({B}), "contextLengths reshape failed");
+        {
+            std::vector<int32_t> ctxVec(B, args.pastKVLen + args.draftTreeSize);
+            CUDA_CHECK(cudaMemcpyAsync(
+                io->contextLengths.rawPointer(), ctxVec.data(), B * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        }
+
+        // The draft proposal uses proposalDims. draftTopK = draftTreeSize for bench
+        // (the actual topK doesn't matter for timing — it only affects selectLen).
+        auto const dims = deployment.draft->proposalDims(B, args.draftTreeSize, args.draftTreeSize);
 
         resetState = [&]() {
             std::memcpy(reuseKVCacheLengths.rawPointer(), pastKVLenVec.data(), pastKVLenVec.size() * sizeof(int32_t));
-            draftRunner->getCacheManager().resetForNewSequences(reuseKVCacheLengths, stream);
+            resources->cacheManagers[kvCacheIndex]->resetForNewSequences(reuseKVCacheLengths, stream);
         };
-        step = [&]() {
-            return draftRunner->executeEagleDraftProposalStep(draftInputs, draftBaseHiddenStates,
-                draftModelHiddenStates, draftTreeLength, draftMask, draftLogits, draftOutputHiddenStates, stream);
+        step = [&, dims]() {
+            if (!executor->prepare(kDecodeProfile, dims, tensorMap, stream))
+                return false;
+            return executor->execute(stream);
         };
-        captureGraph = [&]() {
-            return draftRunner->captureEagleDraftProposalCudaGraph(draftInputs, draftBaseHiddenStates,
-                draftModelHiddenStates, draftTreeLength, draftMask, draftLogits, draftOutputHiddenStates, stream);
+        captureGraph = [&, dims]() {
+            resetState();
+            if (!executor->prepare(kDecodeProfile, dims, tensorMap, stream))
+                return false;
+            return executor->captureGraph(stream);
         };
 
-        // E2E config: osl=1 uses repeated single-step timing, osl>1 uses sequential full-decode timing
         if (args.osl > 1)
         {
             useSequentialE2E = true;
@@ -1024,7 +1049,7 @@ int main(int argc, char** argv)
             postStep = [&, draftStepsPerIter](int32_t t) {
                 if ((t + 1) % draftStepsPerIter == 0)
                 {
-                    draftRunner->getCacheManager().commitSequenceLength(args.acceptRate, stream);
+                    resources->cacheManagers[kvCacheIndex]->commitSequenceLength(args.acceptRate, stream);
                 }
             };
         }
@@ -1034,60 +1059,49 @@ int main(int argc, char** argv)
         modeName = "Spec Draft Prefill";
         LOG_INFO("Spec Draft Prefill mode: InputLen=%d, ReuseKVLen=%d", args.inputLen, args.reuseKVLen);
 
-        reuseKVLenVec.assign(args.batchSize, args.reuseKVLen);
+        int32_t const draftHiddenSize = deployment.draft->hiddenSize;
+        check::check(io->inputsEmbeds.reshape({B, args.inputLen, draftHiddenSize}), "inputsEmbeds reshape failed");
 
-        inputsEmbeds = rt::Tensor(
-            rt::Coords{args.batchSize, args.inputLen, hiddenSize}, rt::DeviceType::kGPU, dtype, "input_embeds");
-        fillRandomData(inputsEmbeds, -1.0f, 1.0f, dtype, args.seed);
+        // Set context lengths on PipelineIO (host side, for StepPreparer)
+        int32_t const contextLen = args.reuseKVLen + args.inputLen;
+        int32_t* hostCtx = io->hostContextLengths.dataPointer<int32_t>();
+        for (int32_t i = 0; i < B; ++i)
+        {
+            hostCtx[i] = contextLen;
+        }
 
-        baseModelHiddenStates = rt::Tensor(rt::Coords{args.batchSize, args.inputLen, baseHiddenSize},
-            rt::DeviceType::kGPU, dtype, "base_hidden_states");
-        fillRandomData(baseModelHiddenStates, -1.0f, 1.0f, dtype, args.seed);
+        reuseKVLenVec.assign(B, args.reuseKVLen);
 
-        draftPrefillDraftModelHiddenStates = rt::Tensor(
-            rt::Coords{args.batchSize, args.inputLen, hiddenSize}, rt::DeviceType::kGPU, dtype, "draft_hidden_input");
-        // Set to zeros as per API documentation
-        fillRandomData(draftPrefillDraftModelHiddenStates, 0.0f, 0.0f, dtype, args.seed);
-
-        draftPrefillContextLengths = rt::Tensor(
-            rt::Coords{args.batchSize}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "context_lengths");
-        std::vector<int32_t> contextLengthsHost(args.batchSize, args.reuseKVLen + args.inputLen);
-        std::memcpy(draftPrefillContextLengths.rawPointer(), contextLengthsHost.data(),
-            contextLengthsHost.size() * sizeof(int32_t));
-
-        outputLogits = rt::Tensor(
-            rt::Coords{args.batchSize, vocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "output_logits");
-        outputHiddenStates
-            = rt::Tensor(rt::Coords{args.batchSize, hiddenSize}, rt::DeviceType::kGPU, dtype, "output_hidden");
-
-        // RoPE cos/sin cache from draft runner (values don't affect benchmark performance)
-        rt::Tensor& ropeCache = draftRunner->getRopeCosSinCacheTensor();
+        bool const kvCacheAllEmpty = (args.reuseKVLen == 0);
+        auto const dims = deployment.draft->prefillDims(B, args.inputLen, kvCacheAllEmpty);
 
         resetState = [&]() {
             std::memcpy(reuseKVCacheLengths.rawPointer(), reuseKVLenVec.data(), reuseKVLenVec.size() * sizeof(int32_t));
-            draftRunner->getCacheManager().resetForNewSequences(reuseKVCacheLengths, stream);
+            resources->cacheManagers[kvCacheIndex]->resetForNewSequences(reuseKVCacheLengths, stream);
         };
-        step = [&]() {
-            return draftRunner->executeEaglePrefillStep(inputsEmbeds, baseModelHiddenStates,
-                draftPrefillDraftModelHiddenStates, draftPrefillContextLengths, outputLogits, outputHiddenStates,
-                ropeCache, stream);
+        step = [&, dims]() {
+            stepPreparer->prepare(
+                rt::InferencePhase::kPrefill, B, *resources->cacheManagers[kvCacheIndex], *io, stream);
+            if (!executor->prepare(kPrefillProfile, dims, tensorMap, stream))
+                return false;
+            return executor->execute(stream);
         };
     }
 
-    // ===== Phase 4: Warmup =====
+    // ===== Phase 3: Warmup =====
     if (runWarmupLoop(modeName, args.warmup, resetState, step, stream) != EXIT_SUCCESS)
     {
         return EXIT_FAILURE;
     }
 
-    // ===== Phase 5: Extract Layer Metadata =====
+    // ===== Phase 4: Extract Layer Metadata =====
     if (args.extractLayerInfo.any())
     {
         layerMetadata = extractLayerMetadata(standaloneEngine.get(), args.extractLayerInfo);
-        standaloneEngine.reset(); // Free standalone engine memory
+        standaloneEngine.reset();
     }
 
-    // ===== Phase 6: Layer Profiling =====
+    // ===== Phase 5: Layer Profiling =====
     if (!args.noProfile)
     {
         if (runLayerProfilingLoop(modeName, args.iterations, !args.outputDir.empty(), resetState, step, layerMetadata,
@@ -1097,7 +1111,6 @@ int main(int argc, char** argv)
             return EXIT_FAILURE;
         }
 
-        // Write layer profiling CSV
         if (!args.outputDir.empty() && !layerTimings.empty())
         {
             auto outParams = args.toOutputParams();
@@ -1105,8 +1118,6 @@ int main(int argc, char** argv)
                 layerTimings, buildLayerCsvPath(args.outputDir, outParams), outParams, imageTokens, layerMetadata);
         }
 
-        // A TensorRT profiler attached to an execution context cannot be fully detached in this benchmark process.
-        // Keep --profile isolated to non-CUDA-graph layer profiling so E2E CUDA graph timing stays uncontaminated.
         logResultsSummary(args.toOutputParams(), timesPerIter, e2eTimeMsResult, imageTokens);
         if (!args.outputDir.empty())
         {
@@ -1116,10 +1127,7 @@ int main(int argc, char** argv)
         return EXIT_SUCCESS;
     }
 
-    // ===== Phase 7: E2E Timing =====
-    // When osl=1 (default): all modes use runRepeatedE2ETiming (single-step, multiple iterations)
-    // When osl>1: decode modes use runSequentialE2ETiming (full sequence decode, one run)
-    // Determine numTokens for E2E CSV based on mode
+    // ===== Phase 6: E2E Timing =====
     int32_t e2eNumTokens = 1;
     if (args.mode == BenchMode::kVISUAL)
     {
@@ -1138,14 +1146,12 @@ int main(int argc, char** argv)
     }
     else if (useSequentialE2E)
     {
-        // osl > 1: full sequence decode, single run
         e2eTimeMsResult = runSequentialE2ETiming(
             modeName, decodeSteps, resetState, step, postStep, !args.noCudaGraph, captureGraph, stream);
         e2eNumTokens = decodeSteps;
     }
     else
     {
-        // osl=1: single-step, multiple iterations (decode/spec-decode modes)
         e2eTimeMsResult = runRepeatedE2ETiming(
             modeName, args.iterations, resetState, step, stream, !args.noCudaGraph, captureGraph);
         e2eNumTokens = 1;
@@ -1162,7 +1168,7 @@ int main(int argc, char** argv)
         writeE2ECsv(buildE2ECsvPath(args.outputDir, outParams), outParams, e2eTimeMsResult, e2eNumTokens, imageTokens);
     }
 
-    // ===== Phase 8: Results Summary =====
+    // ===== Phase 7: Results Summary =====
     logResultsSummary(args.toOutputParams(), args.noProfile ? std::vector<KernelTimes>{} : timesPerIter,
         e2eTimeMsResult, imageTokens);
 

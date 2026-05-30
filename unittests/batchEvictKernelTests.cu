@@ -287,7 +287,6 @@ TEST(BatchEvictKernels, CompactKVCacheMultipleEvictions)
 TEST(BatchEvictKernels, CompactKVCacheSmallTestCases)
 {
     cudaStream_t stream = nullptr;
-    int32_t numLayers = 1;
     int32_t maxBatchSize = 4;
     int32_t numKVHeads = 2;
     int32_t maxSeqLen = 64;

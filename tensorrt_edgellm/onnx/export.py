@@ -458,6 +458,7 @@ def _fix_initializer_dtypes(
     cast_fp32_weights_to_fp16: bool = True,
     preserve_fp32_patterns: "tuple[str, ...]" = (),
     match_fp32_matmul_initializers: bool = False,
+    match_fp32_elementwise_initializers: bool = False,
 ) -> None:
     """Single-pass ONNX initializer fixup for TRT compatibility.
 
@@ -485,6 +486,14 @@ def _fix_initializer_dtypes(
     3. **Plugin FP32 inputs**: ONNX constant folding may collapse plugin
        FP32 input expressions into initializers.  Any such initializer is
        kept (or restored to) FP32 when the consuming plugin requires FP32.
+
+    4. **Element-wise FP32 input matching** (when
+       *match_fp32_elementwise_initializers* is True): promote FP16
+       initializers to FP32 when they feed a ``Mul`` / ``Add`` / ``Sub``
+       / ``Div`` node whose other input is FP32.  This fixes the ONNX
+       dynamo exporter folding float32 buffers (e.g. RoPE ``inv_freq``)
+       into FP16 initializers — TRT rejects mixed-type element-wise ops.
+       Used by the DFlash draft model export.
     """
     import numpy as np
 
@@ -515,7 +524,7 @@ def _fix_initializer_dtypes(
 
     init_map = {init.name: init for init in model.graph.initializer}
     elem_types: dict[str, int] = {}
-    if match_fp32_matmul_initializers:
+    if match_fp32_matmul_initializers or match_fp32_elementwise_initializers:
         for value in (list(model.graph.input) + list(model.graph.value_info) +
                       list(model.graph.output)):
             tensor_type = value.type.tensor_type
@@ -535,6 +544,20 @@ def _fix_initializer_dtypes(
                     continue
                 if elem_types.get(node.input[other_idx]) == 1:  # FLOAT
                     matmul_fp32_init_names.add(init.name)
+
+    # Pre-collect element-wise FP32 init names so the downgrade pass skips them.
+    _EW_OPS = frozenset({"Mul", "Add", "Sub", "Div"})
+    elementwise_fp32_init_names: set = set()
+    if match_fp32_elementwise_initializers:
+        for node in model.graph.node:
+            if node.op_type not in _EW_OPS or len(node.input) < 2:
+                continue
+            for init_idx, other_idx in ((0, 1), (1, 0)):
+                init = init_map.get(node.input[init_idx])
+                if init is None:
+                    continue
+                if elem_types.get(node.input[other_idx]) == 1:  # FLOAT
+                    elementwise_fp32_init_names.add(init.name)
 
     def _is_preserved_fp32(init_name: str) -> bool:
         """Does ``init_name`` match any caller-supplied preserve pattern?"""
@@ -570,6 +593,11 @@ def _fix_initializer_dtypes(
         if init.name in matmul_fp32_init_names:
             logger.info(
                 "_fix_initializer_dtypes: %s %s kept FP32 (MatMul FP32 input)",
+                init.name, list(init.dims))
+            continue
+        if init.name in elementwise_fp32_init_names:
+            logger.info(
+                "_fix_initializer_dtypes: %s %s kept FP32 (element-wise FP32 input)",
                 init.name, list(init.dims))
             continue
         dims = list(init.dims)
@@ -609,6 +637,31 @@ def _fix_initializer_dtypes(
                 logger.info(
                     "_fix_initializer_dtypes: %s %s FP16→FP32 "
                     "(MatMul FP32 input match)", init.name, list(init.dims))
+
+    if match_fp32_elementwise_initializers:
+        # Refresh elem_types after prior passes may have changed dtypes.
+        for init in model.graph.initializer:
+            elem_types[init.name] = init.data_type
+
+        _EW_OPS = frozenset({"Mul", "Add", "Sub", "Div"})
+        for node in model.graph.node:
+            if node.op_type not in _EW_OPS or len(node.input) < 2:
+                continue
+            for init_idx, other_idx in ((0, 1), (1, 0)):
+                init = init_map.get(node.input[init_idx])
+                if init is None or init.data_type != 10:  # FLOAT16
+                    continue
+                if elem_types.get(node.input[other_idx]) != 1:  # FLOAT
+                    continue
+                data = _onnx.numpy_helper.to_array(init).astype(np.float32)
+                init.CopyFrom(
+                    _onnx.numpy_helper.from_array(data, name=init.name))
+                elem_types[init.name] = init.data_type
+                n_to_fp32 += 1
+                logger.info(
+                    "_fix_initializer_dtypes: %s %s FP16→FP32 "
+                    "(%s FP32 input match)", init.name, list(init.dims),
+                    node.op_type)
 
     if n_to_fp16 == 0 and n_to_fp32 == 0 and n_deduped == 0:
         return
@@ -690,6 +743,10 @@ def _export_model(
                             match_fp32_matmul_initializers=bool(
                                 getattr(model,
                                         "match_fp32_matmul_initializers",
+                                        False)),
+                            match_fp32_elementwise_initializers=bool(
+                                getattr(model,
+                                        "match_fp32_elementwise_initializers",
                                         False)))
     _strip_attention_plugin_optional_inputs(output_path)
     external_weight_files = externalize_model_weights(

@@ -60,11 +60,26 @@ std::unique_ptr<EngineExecutor> EngineExecutor::createForLLM(std::filesystem::pa
     return std::unique_ptr<EngineExecutor>(new EngineExecutor(enginePath, std::move(registry)));
 }
 
-std::unique_ptr<EngineExecutor> EngineExecutor::createForSpecDecodeDraft(
+std::unique_ptr<EngineExecutor> EngineExecutor::createForDraft(
     std::filesystem::path const& enginePath, DeploymentConfig const& bundle)
 {
-    auto registry = buildRegistryForSpecDecodeDraft(bundle);
-    return std::unique_ptr<EngineExecutor>(new EngineExecutor(enginePath, std::move(registry)));
+    switch (bundle.specDecodeMode())
+    {
+    case SpecDecodeMode::kMTP:
+    case SpecDecodeMode::kEAGLE:
+    {
+        auto registry = buildRegistryForSpecDecodeDraft(bundle);
+        return std::unique_ptr<EngineExecutor>(new EngineExecutor(enginePath, std::move(registry)));
+    }
+    case SpecDecodeMode::kDFlash:
+    {
+        auto registry = buildRegistryForDFlashDraft(bundle);
+        return std::unique_ptr<EngineExecutor>(new EngineExecutor(enginePath, std::move(registry)));
+    }
+    case SpecDecodeMode::kNONE:
+    default: ELLM_CHECK(false, "createForDraft requires a speculative decoding deployment with a draft engine.");
+    }
+    return nullptr;
 }
 
 EngineExecutor::~EngineExecutor() noexcept
@@ -253,6 +268,11 @@ nvinfer1::Dims EngineExecutor::getProfileShape(
     char const* name, int32_t profileIndex, nvinfer1::OptProfileSelector selector) const
 {
     return mEngine->getProfileShape(name, profileIndex, selector);
+}
+
+void EngineExecutor::setProfiler(nvinfer1::IProfiler* profiler) noexcept
+{
+    mContext->setProfiler(profiler);
 }
 
 nvinfer1::ICudaEngine const& EngineExecutor::getEngine() const noexcept

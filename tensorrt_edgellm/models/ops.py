@@ -227,6 +227,43 @@ def _(query_states, key_states, value_states, cu_seqlens, max_seqlen_carrier,
 # Custom op: trt::fp8_quantize
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Custom op: trt_edgellm::dflash_target_kv_cache_update
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt_edgellm::dflash_target_kv_cache_update",
+                         mutates_args=())
+def dflash_target_kv_cache_update(
+    k_delta: torch.Tensor,
+    v_delta: torch.Tensor,
+    past_key_value: torch.Tensor,
+    rope_cos_sin: torch.Tensor,
+    delta_start_positions: torch.Tensor,
+    delta_lengths: torch.Tensor,
+) -> torch.Tensor:
+    """Update the draft combined KV cache with target-hidden-derived K/V delta.
+
+    k_delta: [B, L, numKVHeads, headDim] FP16, k_normed, not RoPE-applied.
+    v_delta: [B, L, numKVHeads, headDim] FP16.
+    past_key_value: [B, 2, numKVHeads, maxSeqLen, headDim] FP16.
+    rope_cos_sin: [ropeBatch, maxSeqLen, rotaryDim] FP32.
+    delta_start_positions: [B] INT32, old committed draft target cache length.
+    delta_lengths: [B] INT32, per-batch delta lengths.
+
+    Applies RoPE to k_delta and writes k_rope + v_delta into the KV cache at
+    positions [delta_start, delta_start + t) for each batch element, where
+    t < delta_lengths[b]. Positions beyond delta_lengths[b] are skipped.
+    Returns present_key_value (same shape as past_key_value — aliased in TRT).
+    """
+    return past_key_value.clone()
+
+
+@dflash_target_kv_cache_update.register_fake
+def _(k_delta, v_delta, past_key_value, rope_cos_sin, delta_start_positions,
+      delta_lengths):
+    return torch.empty_like(past_key_value)
+
 
 @torch.library.custom_op("trt::fp8_quantize", mutates_args=())
 def fp8_quantize(

@@ -19,6 +19,10 @@ tests:
   - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen3-1.7B-nvfp4-mxsl2048-eagle-eagle3-nvfp4-mxbs1-mxil1024]
   - tests/defs/test_llm_pipeline.py::test_inference[Qwen3-1.7B-nvfp4-mxsl2048-eagle-eagle3-nvfp4-mxbs1-mxil1024-llm_basic]
 
+  # === DFlash LLM - Qwen3.5-4B with DFlash speculative decoding ===
+  - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen3.5-4B-fp16-mxsl2048-dflash-b16-mxbs1-mxil1024-mvts16-mdts16]
+  - tests/defs/test_llm_pipeline.py::test_inference[Qwen3.5-4B-fp16-mxsl2048-dflash-b16-mxbs1-mxil1024-mvts16-mdts16-llm_basic]
+
   # === EAGLE VLM - Qwen3-VL-4B with EAGLE3 speculative decoding ===
   - tests/defs/test_vlm_pipeline.py::test_engine_build[Qwen3-VL-4B-Instruct-nvfp4-mxsl8192-eagle-eagle3-nvfp4-mxbs1-mxil8192-mnit128-mxit8192-mxpiit512]
   - tests/defs/test_vlm_pipeline.py::test_inference[Qwen3-VL-4B-Instruct-nvfp4-mxsl8192-eagle-eagle3-nvfp4-mxbs1-mxil8192-mnit128-mxit8192-mxpiit512-vlm_basic]

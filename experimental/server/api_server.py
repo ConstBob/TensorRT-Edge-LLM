@@ -458,7 +458,8 @@ def main():
         "--spec-decode-engine-dir",
         dest="spec_decode_engine_dir",
         default="",
-        help="Pre-built speculative decoding engine dir (EAGLE or MTP)",
+        help=
+        "Pre-built speculative decoding engine dir (EAGLE, MTP, or DFlash)",
     )
     parser.add_argument("--draft-top-k",
                         type=int,

@@ -58,5 +58,14 @@ TensorRegistry buildRegistryForLLM(
  */
 TensorRegistry buildRegistryForSpecDecodeDraft(DeploymentConfig const& bundle);
 
+/*!
+ * @brief Build a TensorRegistry for a DFlash draft engine.
+ *
+ * DFlash draft engines are non-autoregressive block drafters: they consume
+ * proposal embeddings, accumulated target hidden states, and per-batch delta
+ * lengths, and they expose per-layer KV-cache bindings for proposal attention.
+ */
+TensorRegistry buildRegistryForDFlashDraft(DeploymentConfig const& bundle);
+
 } // namespace rt
 } // namespace trt_edgellm

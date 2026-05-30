@@ -42,6 +42,7 @@ enum class SpecDecodeMode : int32_t
     kNONE,
     kEAGLE,
     kMTP,
+    kDFlash,
 };
 
 //! Unified configuration for base, vanilla decode, and SpecDecode draft engines.
@@ -69,7 +70,7 @@ struct LLMEngineConfig
     bool useTrtNativeOps{false};  //!< Use TRT native ops instead of custom plugin
     bool isSpecDecodeBase{false}; //!< Base engine exposes speculative decoding verification bindings
     SpecDecodeMode specDecodeType{
-        SpecDecodeMode::kNONE}; //!< Speculative decoding strategy mode (parsed from model_type)
+        SpecDecodeMode::kNONE}; //!< Speculative decoding strategy mode (parsed from spec_decode_type)
     //! KV cache data type. Parsed from required top-level `kv_cache_dtype` in
     //! `config.json` (written by `llm_export.py`). Accepted values:
     //! "fp16" → kHALF, "fp8" → kFP8, "int8" → kINT8, "bf16" → kBF16.
@@ -125,6 +126,16 @@ struct LLMEngineConfig
     //! `base.hiddenSize` for MTP. The deployment factory copies this into
     //! `DeploymentConfig::specDecode->baseOutputHiddenDim`.
     int32_t baseModelHiddenSize{0};
+
+    //! DFlash draft block size. Parsed from `dflash_config.block_size` or
+    //! top-level `block_size` on DFlash base/draft configs.
+    int32_t dflashBlockSize{0};
+
+    //! DFlash mask token ID used to seed draft input blocks.
+    int32_t dflashMaskTokenId{0};
+
+    //! Target decoder-layer IDs whose hidden states are concatenated for DFlash.
+    std::vector<int32_t> dflashTargetLayerIds{};
 
     // --- Per-layer type routing (hybrid cache) ---
 
@@ -198,7 +209,7 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath);
 
 //! Parse a SpecDecode draft engine's `config.json` into an `LLMEngineConfig`.
 //!
-//! The draft config carries a reduced field set (no `builder_config.eagle_base`,
+//! The draft config carries a reduced field set (no `builder_config.spec_base`,
 //! its own `draft_vocab_size`). `max_draft_tree_size` is required and is
 //! parsed into `cfg.maxDraftTreeSize`; `cfg.maxVerifyTreeSize` stays at 0 on
 //! the draft side. `isSpecDecodeBase` is left false because this is the

@@ -270,7 +270,7 @@ class ModelConfig:
     """Flat model hyper-parameter config consumed by module builders."""
 
     # ------------------------------------------------------------------ arch
-    model_type: str  # e.g. "qwen3", "llama", "hybrid_mamba"
+    model_type: str  # HF architecture name, e.g. "qwen3", "llama"
     hidden_size: int
     num_hidden_layers: int
     num_attention_heads: int
@@ -331,6 +331,14 @@ class ModelConfig:
     # with tree-attention inputs (attention_mask, attention_pos_id) and
     # an extra hidden_states output (concatenated from 3 selected layers).
     eagle_base: bool = False
+    # ------------------------------------------ DFlash config
+    # When True, export the standard Qwen3.5 model as the DFlash base with
+    # tree-attention verify inputs and multi-layer hidden_states output.
+    dflash_base: bool = False
+    is_dflash_draft_flag: bool = False
+    dflash_target_layer_ids: List[int] = field(default_factory=list)
+    dflash_block_size: int = 16
+    dflash_mask_token_id: int = 248070
     # ------------------------------------------ sparse MoE config (Qwen3-style)
     # num_experts=0 means dense (no MoE).
     num_experts: int = 0
@@ -379,7 +387,11 @@ class ModelConfig:
         """True for a derived MTP draft config built from a base checkpoint."""
         return bool(self.mtp_num_hidden_layers is not None
                     and self.gdn_cfg is None and not self.mtp_base
-                    and not self.is_eagle3_draft)
+                    and not self.is_eagle3_draft and not self.is_dflash_draft)
+
+    @property
+    def is_dflash_draft(self) -> bool:
+        return self.is_dflash_draft_flag
 
     @property
     def eagle3_target_hidden_size(self) -> int:
@@ -561,6 +573,7 @@ class ModelConfig:
             mtp_num_hidden_layers=mtp_num_hidden_layers,
             mtp_use_dedicated_embeddings=mtp_use_dedicated_embeddings,
             mtp_base=bool(llm_dict.get("mtp_base", False)),
+            dflash_base=bool(llm_dict.get("dflash_base", False)),
             num_deepstack_features=_parse_num_deepstack_features(
                 llm_dict, model_type, root_config=root),
             draft_vocab_size=draft_vocab_size,
@@ -649,6 +662,53 @@ def make_mtp_draft_config(base_config: ModelConfig) -> ModelConfig:
         mtp_base=False,
         quant=draft_quant,
         tie_word_embeddings=False,
+    )
+
+
+def make_dflash_draft_config(draft_dir: str) -> ModelConfig:
+    """Build a DFlash draft ModelConfig from the draft checkpoint directory.
+
+    Now quantization-aware: if the draft directory contains
+    ``hf_quant_config.json`` (e.g. from DFlash draft NVFP4 quantization),
+    the quant config is parsed so ``make_linear`` will produce the correct
+    Linear class (``NVFP4Linear`` etc.) during ONNX export.
+    """
+    _, llm_dict = load_checkpoint_config_dicts(draft_dir)
+    dflash_config = llm_dict.get("dflash_config", {}) or {}
+
+    # Parse quantization config from the draft checkpoint directory.
+    # For FP16 draft checkpoints this returns QuantConfig() (no quant).
+    quant = _parse_quant(draft_dir, llm_dict)
+
+    return ModelConfig(
+        model_type=llm_dict.get("model_type", "qwen3"),
+        hidden_size=llm_dict["hidden_size"],
+        num_hidden_layers=llm_dict["num_hidden_layers"],
+        num_attention_heads=llm_dict["num_attention_heads"],
+        num_key_value_heads=llm_dict.get("num_key_value_heads",
+                                         llm_dict["num_attention_heads"]),
+        intermediate_size=llm_dict["intermediate_size"],
+        head_dim=llm_dict.get(
+            "head_dim",
+            llm_dict["hidden_size"] // llm_dict["num_attention_heads"]),
+        rms_norm_eps=llm_dict.get("rms_norm_eps", 1e-6),
+        vocab_size=llm_dict["vocab_size"],
+        rope_theta=_get_rope_theta(llm_dict),
+        max_position_embeddings=llm_dict.get("max_position_embeddings", 4096),
+        rope_scaling=(llm_dict.get("rope_scaling")
+                      or llm_dict.get("rope_parameters") or None),
+        partial_rotary_factor=_get_partial_rotary_factor(llm_dict),
+        has_qk_norm=True,
+        torch_dtype=llm_dict.get("torch_dtype", "bfloat16"),
+        tie_word_embeddings=False,
+        layer_types=[LAYER_ATTN] * int(llm_dict["num_hidden_layers"]),
+        is_dflash_draft_flag=True,
+        dflash_target_layer_ids=list(
+            dflash_config.get("target_layer_ids", [1, 8, 15, 22, 29])),
+        dflash_block_size=int(
+            dflash_config.get("block_size", llm_dict.get("block_size", 16))),
+        dflash_mask_token_id=int(dflash_config.get("mask_token_id", 248070)),
+        quant=quant,
     )
 
 
@@ -872,23 +932,37 @@ def _detect_has_qk_norm(model_dir: str) -> bool:
     This is model-agnostic: any architecture that stores per-head Q/K norms
     as ``*.q_norm.weight`` buffers will be detected correctly.
     """
-    index_path = os.path.join(model_dir, "model.safetensors.index.json")
-    if os.path.exists(index_path):
-        with open(index_path) as f:
-            index = json.load(f)
-        return any(".q_norm.weight" in k
-                   for k in index.get("weight_map", {}).keys())
+    return any(".q_norm.weight" in k
+               for k in _checkpoint_weight_keys(model_dir))
 
-    # Single-shard: scan keys without loading tensors
+
+def _checkpoint_weight_keys(model_dir: str) -> List[str]:
+    """Return checkpoint tensor keys, ignoring stale shard indexes when needed."""
+    index_path = os.path.join(model_dir, "model.safetensors.index.json")
     single_path = os.path.join(model_dir, "model.safetensors")
+    if os.path.exists(index_path):
+        try:
+            with open(index_path) as f:
+                index = json.load(f)
+            weight_map = index.get("weight_map", {})
+            missing_shards = {
+                shard
+                for shard in set(weight_map.values())
+                if not os.path.exists(os.path.join(model_dir, shard))
+            }
+            if not missing_shards or not os.path.exists(single_path):
+                return list(weight_map.keys())
+        except (OSError, json.JSONDecodeError):
+            pass
+
     if os.path.exists(single_path):
         try:
             from safetensors import safe_open
             with safe_open(single_path, framework="pt") as f:
-                return any(".q_norm.weight" in k for k in f.keys())
+                return list(f.keys())
         except (OSError, ImportError):
             pass
-    return False
+    return []
 
 
 _VL_LLM_PREFIXES = ("language_model.", "text_model.", "llm.", "thinker.")
@@ -937,21 +1011,7 @@ def _detect_unquantized_modules(model_dir: str) -> List[str]:
     VL wrapper prefixes (``language_model.`` etc.) are stripped so that the
     returned names match the short names used by ``make_linear()``.
     """
-    all_keys: List[str] = []
-    index_path = os.path.join(model_dir, "model.safetensors.index.json")
-    if os.path.exists(index_path):
-        with open(index_path) as f:
-            index = json.load(f)
-        all_keys = list(index.get("weight_map", {}).keys())
-    else:
-        single_path = os.path.join(model_dir, "model.safetensors")
-        if os.path.exists(single_path):
-            try:
-                from safetensors import safe_open
-                with safe_open(single_path, framework="pt") as f:
-                    all_keys = list(f.keys())
-            except (OSError, ImportError):
-                pass
+    all_keys = _checkpoint_weight_keys(model_dir)
 
     # Top-level module prefix = everything before the last dot segment
     qweight_modules = {
@@ -999,21 +1059,7 @@ def _with_gdn_fused_exclusions(modules: List[str]) -> List[str]:
 
 def _detect_quantized_modules(model_dir: str) -> List[str]:
     """Return modules that have checkpoint quantization sidecars."""
-    all_keys: List[str] = []
-    index_path = os.path.join(model_dir, "model.safetensors.index.json")
-    if os.path.exists(index_path):
-        with open(index_path) as f:
-            index = json.load(f)
-        all_keys = list(index.get("weight_map", {}).keys())
-    else:
-        single_path = os.path.join(model_dir, "model.safetensors")
-        if os.path.exists(single_path):
-            try:
-                from safetensors import safe_open
-                with safe_open(single_path, framework="pt") as f:
-                    all_keys = list(f.keys())
-            except (OSError, ImportError):
-                pass
+    all_keys = _checkpoint_weight_keys(model_dir)
 
     suffixes = (".qweight", ".weight_scale", ".weight_scale_2", ".input_scale",
                 ".scales")
@@ -1071,24 +1117,7 @@ def _detect_modelopt_unquantized_linears(model_dir: str) -> List[str]:
     opposite direction: false-negative excludes when ``exclude_modules`` is
     silent on a submodule that was actually skipped during PTQ.
     """
-    all_keys: List[str] = []
-    index_path = os.path.join(model_dir, "model.safetensors.index.json")
-    if os.path.exists(index_path):
-        try:
-            with open(index_path) as f:
-                index = json.load(f)
-            all_keys = list(index.get("weight_map", {}).keys())
-        except (OSError, json.JSONDecodeError):
-            pass
-    if not all_keys:
-        single_path = os.path.join(model_dir, "model.safetensors")
-        if os.path.exists(single_path):
-            try:
-                from safetensors import safe_open
-                with safe_open(single_path, framework="pt") as f:
-                    all_keys = list(f.keys())
-            except (OSError, ImportError):
-                pass
+    all_keys = _checkpoint_weight_keys(model_dir)
 
     if not all_keys:
         return []

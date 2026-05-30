@@ -519,17 +519,21 @@ class Qwen3_5Backbone(nn.Module):
         attention_mask: "torch.Tensor | None" = None,
         attention_pos_id: "torch.Tensor | None" = None,
         collect_intermediate_states: bool = False,
-    ) -> Tuple[torch.Tensor, Tuple, Tuple, Tuple, Tuple, Tuple]:
+        dflash_target_layer_ids: "List[int] | None" = None,
+    ) -> Tuple[torch.Tensor, Tuple, Tuple, Tuple, Tuple, Tuple, object]:
         hidden_states = inputs_embeds
         present_key_values_list: List[torch.Tensor] = []
         present_conv_states_list: List[torch.Tensor] = []
         present_recurrent_states_list: List[torch.Tensor] = []
         intermediate_conv_states_list: List[torch.Tensor] = []
         intermediate_recurrent_states_list: List[torch.Tensor] = []
+        dflash_hidden_list: List[torch.Tensor] = []
+        dflash_target_set = set(dflash_target_layer_ids or [])
         attn_idx = 0
         gdn_idx = 0
 
-        for layer, lt in zip(self.layers, self.layer_types):
+        for layer_idx, (layer,
+                        lt) in enumerate(zip(self.layers, self.layer_types)):
             if lt == LAYER_GDN:
                 (hidden_states, conv_out, rec_out, intermediate_conv_out,
                  intermediate_rec_out) = layer(
@@ -559,11 +563,19 @@ class Qwen3_5Backbone(nn.Module):
                 present_key_values_list.append(present_kv)
                 attn_idx += 1
 
-        return (self.norm(hidden_states), tuple(present_key_values_list),
+            if layer_idx in dflash_target_set:
+                dflash_hidden_list.append(hidden_states)
+
+        normed_hidden = self.norm(hidden_states)
+        dflash_hidden_concat = (torch.cat(dflash_hidden_list, dim=-1)
+                                if dflash_hidden_list else None)
+
+        return (normed_hidden, tuple(present_key_values_list),
                 tuple(present_conv_states_list),
                 tuple(present_recurrent_states_list),
                 tuple(intermediate_conv_states_list),
-                tuple(intermediate_recurrent_states_list))
+                tuple(intermediate_recurrent_states_list),
+                dflash_hidden_concat)
 
 
 # ---------------------------------------------------------------------------
@@ -585,10 +597,16 @@ def _is_mtp_base_export(config: ModelConfig) -> bool:
         or getattr(config, "export_component", "") == "mtp_base")
 
 
+def _is_dflash_base_export(config: ModelConfig) -> bool:
+    """Return True when exporting the Qwen3.5 hybrid base for DFlash verify."""
+    return bool(getattr(config, "dflash_base", False))
+
+
 def _make_flat_wrapper_hybrid(model: nn.Module,
                               Na: int,
                               Ng: int,
-                              mtp_base: bool = False) -> nn.Module:
+                              mtp_base: bool = False,
+                              dflash_base: bool = False) -> nn.Module:
     """Build flat forward wrapper for Qwen3.5 hybrid (GDN + attention).
 
     Extends the transformer wrapper with ``conv_state_i`` and
@@ -603,7 +621,8 @@ def _make_flat_wrapper_hybrid(model: nn.Module,
                                   "kvcache_start_index", "last_token_ids"
                               ] + [f"conv_state_{i}" for i in range(Ng)] +
                               [f"recurrent_state_{i}" for i in range(Ng)])
-    if mtp_base:
+    spec_base = mtp_base or dflash_base
+    if spec_base:
         param_names += ["attention_pos_id", "attention_mask"]
 
     past_kv_tuple = "({},)".format(", ".join(
@@ -614,9 +633,9 @@ def _make_flat_wrapper_hybrid(model: nn.Module,
                                          for i in range(Ng))) if Ng else "()"
 
     mtp_kwargs = (", attention_pos_id=attention_pos_id"
-                  ", attention_mask=attention_mask" if mtp_base else "")
+                  ", attention_mask=attention_mask" if spec_base else "")
 
-    if mtp_base:
+    if spec_base:
         body = (
             f"    logits, hidden_states, present_key_values, "
             f"present_conv_states, present_recurrent_states, "
@@ -821,6 +840,7 @@ class Qwen3_5CausalLM(nn.Module):
         Na = config.num_attn_layers
         Ng = config.num_gdn_layers
         mtp_base = _is_mtp_base_export(config)
+        dflash_base = _is_dflash_base_export(config)
         device = next(itertools.chain(self.parameters(),
                                       self.buffers())).device
         dtype16 = torch.float16
@@ -897,8 +917,9 @@ class Qwen3_5CausalLM(nn.Module):
         past = torch.export.Dim("past_len", min=1, max=32768)
         rope_batch = torch.export.Dim("rope_batch", min=1, max=256)
         kv_batch = torch.export.Dim("kv_batch", min=1, max=256)
+        spec_base = mtp_base or dflash_base
         num_selected = torch.export.Dim("num_selected", min=1,
-                                        max=256) if mtp_base else None
+                                        max=256) if spec_base else None
 
         all_shapes: list = [{0: batch, 1: seq}]  # inputs_embeds
         for _ in range(Na):
@@ -906,7 +927,7 @@ class Qwen3_5CausalLM(nn.Module):
         all_shapes.append({0: rope_batch, 1: pos})  # rope_rotary_cos_sin
         all_shapes.append({0: batch})  # context_lengths
         all_shapes.append({0: kv_batch})  # kvcache_start_index
-        if mtp_base:
+        if spec_base:
             all_shapes.append({0: batch, 1: num_selected})  # last_token_ids
         else:
             all_shapes.append({0: batch})  # last_token_ids
@@ -915,7 +936,7 @@ class Qwen3_5CausalLM(nn.Module):
         for _ in range(Ng):
             all_shapes.append({0: batch})  # recurrent_state_i
 
-        if mtp_base:
+        if spec_base:
             attention_pos_id = torch.zeros(batch_size,
                                            seq_len,
                                            dtype=torch.int32,
@@ -944,7 +965,11 @@ class Qwen3_5CausalLM(nn.Module):
                 2: mask_kv_len
             })  # attention_mask
 
-        wrapped = _make_flat_wrapper_hybrid(self, Na, Ng, mtp_base=mtp_base)
+        wrapped = _make_flat_wrapper_hybrid(self,
+                                            Na,
+                                            Ng,
+                                            mtp_base=mtp_base,
+                                            dflash_base=dflash_base)
         wrapped.eval()
 
         return OnnxSpec(wrapped=wrapped,
@@ -967,9 +992,12 @@ class Qwen3_5CausalLM(nn.Module):
         attention_mask: "torch.Tensor | None" = None,
     ) -> Tuple:
         mtp_base = _is_mtp_base_export(self.config)
+        dflash_base = _is_dflash_base_export(self.config)
+        dflash_target_ids = (self.config.dflash_target_layer_ids
+                             if dflash_base else None)
         (hidden_states, present_key_values, present_conv_states,
          present_recurrent_states, intermediate_conv_states,
-         intermediate_recurrent_states) = self.model(
+         intermediate_recurrent_states, dflash_hidden_concat) = self.model(
              inputs_embeds,
              past_key_values,
              rope_rotary_cos_sin,
@@ -979,13 +1007,18 @@ class Qwen3_5CausalLM(nn.Module):
              recurrent_states,
              attention_mask=attention_mask,
              attention_pos_id=attention_pos_id,
-             collect_intermediate_states=mtp_base,
+             collect_intermediate_states=(mtp_base or dflash_base),
+             dflash_target_layer_ids=dflash_target_ids,
          )
         # Select hidden states for specified token positions before lm_head.
         selected_hidden_states = torch.ops.trt.gather_nd(
             hidden_states, last_token_ids)
 
         logits = self.lm_head(selected_hidden_states).to(torch.float32)
+        if dflash_base:
+            return (logits, dflash_hidden_concat, present_key_values,
+                    present_conv_states, present_recurrent_states,
+                    intermediate_conv_states, intermediate_recurrent_states)
         if mtp_base:
             return (logits, hidden_states, present_key_values,
                     present_conv_states, present_recurrent_states,

@@ -362,7 +362,7 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
     // TODO: refactor the dispatch logic to explicitly distinguish MTP tree-verify decoding
     // from prefill when 1 < seq_len <= kMTPMaxSeqLen (e.g. pass an execution-phase flag
     // from the runtime instead of relying solely on seq_len range heuristics).
-    constexpr int32_t kMTPMaxSeqLen = 8;
+    constexpr int32_t kMTPMaxSeqLen = 16;
     bool const mtpActive = mUseMTP && (seq_len > 1) && (seq_len <= kMTPMaxSeqLen);
 
     // h0 is batch-dense [n, hv, k, v]

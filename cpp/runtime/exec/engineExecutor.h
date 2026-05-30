@@ -64,9 +64,9 @@ public:
     static std::unique_ptr<EngineExecutor> createForLLM(std::filesystem::path const& enginePath,
         LLMEngineConfig const& cfg, std::optional<int32_t> specDecodeBaseOutputHiddenDim = std::nullopt);
 
-    //! Build an EngineExecutor for the SpecDecode draft engine. The factory builds the
-    //! TensorRegistry internally via `buildRegistryForSpecDecodeDraft(bundle)`.
-    static std::unique_ptr<EngineExecutor> createForSpecDecodeDraft(
+    //! Build an EngineExecutor for a speculative decoding draft engine. The
+    //! factory chooses the draft binding registry from `bundle.specDecodeMode()`.
+    static std::unique_ptr<EngineExecutor> createForDraft(
         std::filesystem::path const& enginePath, DeploymentConfig const& bundle);
 
     EngineExecutor(EngineExecutor const&) = delete;
@@ -132,6 +132,13 @@ public:
     //! @brief Return a profile shape (min/opt/max) for a named binding.
     nvinfer1::Dims getProfileShape(char const* name, int32_t profileIndex, nvinfer1::OptProfileSelector selector) const;
 
+    //! @brief Attach a TRT profiler to the execution context.
+    //!
+    //! The profiler receives per-layer timing callbacks during enqueueV3.
+    //! Must be called before execute() for the profiler to receive data.
+    //! Passing nullptr detaches any previously set profiler.
+    void setProfiler(nvinfer1::IProfiler* profiler) noexcept;
+
     //! @brief Access the underlying TRT engine for generic introspection.
     nvinfer1::ICudaEngine const& getEngine() const noexcept;
 
@@ -150,7 +157,7 @@ private:
      * Reads the engine, creates an IRuntime, deserializes the engine,
      * and creates an IExecutionContext with USER_MANAGED allocation.
      *
-     * Private — use `createForLLM` / `createForSpecDecodeDraft` factories.
+     * Private — use `createForLLM` / `createForDraft` factories.
      *
      * @param enginePath Path to the serialized TRT engine file
      * @param registry TensorRegistry describing the binding layout

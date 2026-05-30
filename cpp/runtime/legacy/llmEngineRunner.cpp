@@ -535,7 +535,7 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson) noexcept
 
         // Define required fields for builder_config
         std::vector<std::string> const requiredBuilderConfigFields
-            = {"max_batch_size", "max_input_len", "max_kv_cache_capacity", "max_lora_rank", "eagle_base"};
+            = {"max_batch_size", "max_input_len", "max_kv_cache_capacity", "max_lora_rank"};
 
         // Validate required fields exist in builder_config
         for (auto const& field : requiredBuilderConfigFields)
@@ -545,6 +545,11 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson) noexcept
                 LOG_ERROR("initializeConfigFromJson(): Missing required field '%s' in builder_config", field.c_str());
                 return false;
             }
+        }
+        if (!builderConfig.contains("spec_base") && !builderConfig.contains("eagle_base"))
+        {
+            LOG_ERROR("initializeConfigFromJson(): Missing required field 'spec_base' in builder_config");
+            return false;
         }
 
         // Extract values with proper type checking
@@ -579,7 +584,8 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson) noexcept
         mConfig.maxSupportedInputLength = builderConfig["max_input_len"].get<int32_t>();
         mConfig.maxKVCacheCapacity = builderConfig["max_kv_cache_capacity"].get<int32_t>();
         mConfig.maxSupportedLoraRank = builderConfig["max_lora_rank"].get<int32_t>();
-        mConfig.enableEagleSpecDecode = builderConfig["eagle_base"].get<bool>();
+        mConfig.enableEagleSpecDecode = builderConfig.contains("spec_base") ? builderConfig["spec_base"].get<bool>()
+                                                                            : builderConfig["eagle_base"].get<bool>();
 
         // Collect RoPE configuration
         mConfig.ropeConfig = collectRopeConfig(configJson);
@@ -606,23 +612,22 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson) noexcept
             }
         }
 
-        // Determine output hidden dim based on model_type:
-        // - mtp_base: hidden_size (last layer output only)
-        // - eagle3_base (or unspecified): hidden_size * 3 (concatenates 3 layers)
+        // Determine output hidden dim based on spec_decode_type:
+        // - mtp: hidden_size (last layer output only)
+        // - eagle3 (or unspecified legacy EAGLE): hidden_size * 3 (concatenates 3 layers)
         if (mConfig.enableEagleSpecDecode)
         {
             int32_t const hiddenSize = configJson["hidden_size"].get<int32_t>();
-            std::string const modelType
-                = configJson.contains("model_type") ? configJson["model_type"].get<std::string>() : "";
-            mConfig.mtpBase = (modelType == "mtp_base");
+            std::string const specDecodeType = configJson.value("spec_decode_type", "none");
+            mConfig.mtpBase = (specDecodeType == "mtp");
             mConfig.outputHiddenDim = mConfig.mtpBase ? hiddenSize : hiddenSize * 3;
 
-            // maxVerifyTreeSize is only required when eagle_base is true
+            // maxVerifyTreeSize is only required for speculative base engines.
             if (!builderConfig.contains("max_verify_tree_size"))
             {
                 LOG_ERROR(
                     "initializeConfigFromJson(): Missing required field 'max_verify_tree_size' in builder_config for "
-                    "Eagle base model");
+                    "speculative base model");
                 return false;
             }
             mConfig.maxVerifyTreeSize = builderConfig["max_verify_tree_size"].get<int32_t>();

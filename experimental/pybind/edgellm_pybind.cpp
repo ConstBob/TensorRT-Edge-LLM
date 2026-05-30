@@ -379,8 +379,10 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         m, "LLMBuilderConfig", "Configuration for building TensorRT LLM engines from ONNX.")
         .def(py::init<>())
         .def_readwrite("max_input_len", &builder::LLMBuilderConfig::maxInputLen)
-        .def_readwrite("eagle_draft", &builder::LLMBuilderConfig::eagleDraft)
-        .def_readwrite("eagle_base", &builder::LLMBuilderConfig::eagleBase)
+        .def_readwrite("spec_draft", &builder::LLMBuilderConfig::specDraft)
+        .def_readwrite("spec_base", &builder::LLMBuilderConfig::specBase)
+        .def_readwrite("eagle_draft", &builder::LLMBuilderConfig::specDraft) // deprecated alias
+        .def_readwrite("eagle_base", &builder::LLMBuilderConfig::specBase)   // deprecated alias
         .def_readwrite("max_batch_size", &builder::LLMBuilderConfig::maxBatchSize)
         .def_readwrite("max_lora_rank", &builder::LLMBuilderConfig::maxLoraRank)
         .def_readwrite("max_kv_cache_capacity", &builder::LLMBuilderConfig::maxKVCacheCapacity)
