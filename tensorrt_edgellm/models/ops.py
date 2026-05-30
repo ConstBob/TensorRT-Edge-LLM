@@ -21,9 +21,53 @@ Domains ``trt::`` / ``trt_edgellm::`` map to ONNX nodes consumed by the
 TensorRT plugin runtime.
 """
 
+import os
 from typing import List, Optional, Tuple
 
 import torch
+
+# ---------------------------------------------------------------------------
+# NVFP4 MoE target arch selector
+# ---------------------------------------------------------------------------
+#
+# ``Nvfp4MoePlugin`` (SM110/Thor, split FC1/FC2) and ``NvFP4MoEPluginGeforce``
+# (SM12x/Blackwell consumer, fused) share the same 11-input ONNX surface and
+# attribute set, but consume **different FC1 weight layouts** for SwiGLU MoE:
+#
+#   * SM110 expects FC1 packed as the 64-row up/gate interleave that
+#     ``_interleave_qwen3_swiglu_fc1`` produces.
+#   * SM12x expects FC1 packed as the plain ``[up_all, gate_all]`` concat
+#     that ``_concat_qwen3_swiglu_fc1`` produces.
+#
+# Repacking and modeling code call :func:`use_geforce_nvfp4_moe` to pick the
+# matching plugin op and FC1 layout at export time. Override via env var:
+#
+#   EDGELLM_NVFP4_MOE_TARGET=sm110  -> Nvfp4MoePlugin            (default)
+#   EDGELLM_NVFP4_MOE_TARGET=sm12x  -> NvFP4MoEPluginGeforce
+#
+# Accepted aliases for SM12x: ``sm120``, ``sm121``, ``geforce``.
+
+_NVFP4_MOE_TARGET_ENV = "EDGELLM_NVFP4_MOE_TARGET"
+_NVFP4_MOE_SM110_ALIASES = frozenset(("sm110", "thor", ""))
+_NVFP4_MOE_SM12X_ALIASES = frozenset(("sm12x", "sm120", "sm121", "geforce"))
+
+
+def use_geforce_nvfp4_moe() -> bool:
+    """Return True iff exporting for ``NvFP4MoEPluginGeforce`` (SM12x).
+
+    The default is SM110 (Thor) so existing export pipelines keep producing
+    the 64-row up/gate interleave layout consumed by ``Nvfp4MoePlugin``.
+    """
+    val = os.environ.get(_NVFP4_MOE_TARGET_ENV, "sm110").strip().lower()
+    if val in _NVFP4_MOE_SM12X_ALIASES:
+        return True
+    if val in _NVFP4_MOE_SM110_ALIASES:
+        return False
+    raise ValueError(
+        f"{_NVFP4_MOE_TARGET_ENV}={val!r} is not recognized. Use 'sm110' "
+        "(default; Thor/Nvfp4MoePlugin) or 'sm12x' (Blackwell consumer/"
+        "NvFP4MoEPluginGeforce). Aliases: sm120/sm121/geforce, thor.")
+
 
 # ---------------------------------------------------------------------------
 # Custom op: trt::attention_plugin  (unified: vanilla / FP8-KV / EAGLE tree)
@@ -759,6 +803,54 @@ def nvfp4_moe_plugin(
 
 
 @nvfp4_moe_plugin.register_fake
+def _(router_logits, hidden_states, fc1_qweights, fc1_blocks_scale, fc1_alpha,
+      fc2_qweights, fc2_blocks_scale, fc2_alpha, input_global_scale,
+      down_input_scale, e_score_correction_bias, num_experts, top_k,
+      hidden_size, moe_inter_size, activation_type, n_group, topk_group,
+      norm_topk_prob, routed_scaling_factor, routing_mode, backend, io_dtype,
+      max_routed_rows):
+    return torch.empty_like(hidden_states)
+
+
+# ---------------------------------------------------------------------------
+# Custom op: trt_edgellm::NvFP4MoEPluginGeforce
+#   SM12x (consumer Blackwell) fused NVFP4 MoE. Same signature as
+#   ``nvfp4_moe_plugin``; FC1 weights must be in the plain ``[up, gate]``
+#   concat layout (not the 64-row up/gate interleave) for SwiGLU activations.
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt_edgellm::NvFP4MoEPluginGeforce", mutates_args=())
+def nvfp4_moe_plugin_geforce(
+    router_logits: torch.Tensor,
+    hidden_states: torch.Tensor,
+    fc1_qweights: torch.Tensor,
+    fc1_blocks_scale: torch.Tensor,
+    fc1_alpha: torch.Tensor,
+    fc2_qweights: torch.Tensor,
+    fc2_blocks_scale: torch.Tensor,
+    fc2_alpha: torch.Tensor,
+    input_global_scale: torch.Tensor,
+    down_input_scale: torch.Tensor,
+    e_score_correction_bias: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    moe_inter_size: int,
+    activation_type: int,
+    n_group: int,
+    topk_group: int,
+    norm_topk_prob: int,
+    routed_scaling_factor: float,
+    routing_mode: int,
+    backend: int,
+    io_dtype: int,
+    max_routed_rows: int,
+) -> torch.Tensor:
+    return torch.zeros_like(hidden_states)
+
+
+@nvfp4_moe_plugin_geforce.register_fake
 def _(router_logits, hidden_states, fc1_qweights, fc1_blocks_scale, fc1_alpha,
       fc2_qweights, fc2_blocks_scale, fc2_alpha, input_global_scale,
       down_input_scale, e_score_correction_bias, num_experts, top_k,

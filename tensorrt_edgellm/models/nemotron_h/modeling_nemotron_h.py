@@ -62,7 +62,8 @@ from ...config import (LAYER_ATTN, LAYER_MAMBA, LAYER_MLP, LAYER_MOE,
 from ..default.modeling_default import OnnxSpec
 from ..linear import FP16Linear, make_linear
 from ..ops import (attention_plugin, causal_conv1d, nvfp4_moe_plugin,
-                   update_ssm_state)
+                   nvfp4_moe_plugin_geforce, update_ssm_state,
+                   use_geforce_nvfp4_moe)
 
 _NVFP4_ACTIVATION_RELU2 = 4
 _NVFP4_ROUTING_MODE_SIGMOID_GROUP_TOPK = 1
@@ -456,6 +457,13 @@ class NemotronHMoEMLP(nn.Module):
         self.io_dtype = _NVFP4_MOE_IO_DTYPE_FP16
         self.max_routed_rows = _NVFP4_MOE_MAX_ROUTED_ROWS_AUTO
         self._padded_moe_intermediate_size = self.moe_intermediate_size
+        # SM12x NvFP4MoEPluginGeforce additionally requires H % 256 == 0
+        # (kCuteDslTileK * kStaticAbStage). For checkpoints whose hidden_size
+        # does not satisfy that (e.g. Nemotron-Nano H=2688), ``_prepare_for_export_impl``
+        # picks ``hidden_size_alignment=256`` so the FC1 K and FC2 M axes get
+        # zero-padded; ``forward`` then F.pads hidden_states and slices the
+        # plugin output. SM110 keeps the original H.
+        self._padded_hidden_size = self.hidden_size
         self.gate = NemotronHTopkRouter(config)
 
         self.experts = nn.ModuleList([
@@ -496,15 +504,25 @@ class NemotronHMoEMLP(nn.Module):
         self._prepare_for_export_impl()
 
     def _prepare_for_export_impl(self) -> None:
-        """Pack ModelOpt NVFP4 expert tensors for ``Nvfp4MoePlugin``."""
+        """Pack ModelOpt NVFP4 expert tensors for the active NVFP4 MoE plugin."""
         from ...checkpoint.repacking import repack_nvfp4_nemotron_moe_experts
 
+        # SM12x NvFP4MoEPluginGeforce requires H % 256 == 0; SM110 only needs
+        # the kernel's regular alignment (the repack helper accepts H as-is
+        # when ``hidden_size_alignment=1``).
+        hidden_size_alignment = 256 if use_geforce_nvfp4_moe() else 1
+
         (fc1_qweights, fc1_blocks_scale, fc1_alpha, fc2_qweights,
-         fc2_blocks_scale, fc2_alpha,
-         padded_inter_size) = (repack_nvfp4_nemotron_moe_experts(
-             self.experts, self.hidden_size, self.moe_intermediate_size,
-             self.group_size))
+         fc2_blocks_scale, fc2_alpha, padded_inter_size,
+         padded_hidden_size) = (repack_nvfp4_nemotron_moe_experts(
+             self.experts,
+             self.hidden_size,
+             self.moe_intermediate_size,
+             self.group_size,
+             hidden_size_alignment=hidden_size_alignment,
+         ))
         self._padded_moe_intermediate_size = padded_inter_size
+        self._padded_hidden_size = padded_hidden_size
 
         device = self.gate.weight.device
         self.register_buffer("fc1_qweights",
@@ -535,13 +553,34 @@ class NemotronHMoEMLP(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch, seq_len, _ = hidden_states.shape
-        # Router logits: [batch*seq, E] FP32 (plugin expects FP32 input)
+        # Router logits: [batch*seq, E] FP32 (plugin expects FP32 input).
+        # Routing uses the unpadded hidden state because the router gate
+        # weight is shaped [E, hidden_size].
         router_logits = F.linear(hidden_states.view(-1, self.hidden_size),
                                  self.gate.weight).float()
 
-        moe_out = nvfp4_moe_plugin(
+        # SM12x NvFP4MoEPluginGeforce requires the plugin hidden_size to be a
+        # multiple of 256. When the checkpoint H does not satisfy that,
+        # ``_prepare_for_export_impl`` zero-pads FC1 K / FC2 M and sets
+        # ``self._padded_hidden_size``; we F.pad the hidden activations here
+        # and slice the plugin output back. relu2(0) = 0 keeps the padded
+        # FC1 outputs zero; the FC2 contribution to the padded H slots is
+        # therefore zero too. The shared expert path uses the original H.
+        plugin_hidden = hidden_states
+        if self._padded_hidden_size != self.hidden_size:
+            plugin_hidden = F.pad(
+                hidden_states,
+                (0, self._padded_hidden_size - self.hidden_size))
+
+        # Nemotron-H uses ReLU2 (non-gated) FC1, so the up-only weight tensor
+        # has the same row layout under both plugins; only the plugin op name
+        # differs between SM110 ``Nvfp4MoePlugin`` and SM12x
+        # ``NvFP4MoEPluginGeforce``.
+        moe_op = (nvfp4_moe_plugin_geforce
+                  if use_geforce_nvfp4_moe() else nvfp4_moe_plugin)
+        moe_out = moe_op(
             router_logits,
-            hidden_states,
+            plugin_hidden,
             self.fc1_qweights,
             self.fc1_blocks_scale,
             self.fc1_alpha,
@@ -553,7 +592,7 @@ class NemotronHMoEMLP(nn.Module):
             self._e_score_correction_bias_fp32,
             self.n_routed_experts,
             self.num_experts_per_tok,
-            self.hidden_size,
+            self._padded_hidden_size,
             self._padded_moe_intermediate_size,
             self.activation_type,
             self.gate.n_group,
@@ -565,6 +604,8 @@ class NemotronHMoEMLP(nn.Module):
             self.io_dtype,
             self.max_routed_rows,
         )
+        if self._padded_hidden_size != self.hidden_size:
+            moe_out = moe_out[..., :self.hidden_size]
 
         return moe_out + self._expert_forward(self.shared_experts,
                                               hidden_states)

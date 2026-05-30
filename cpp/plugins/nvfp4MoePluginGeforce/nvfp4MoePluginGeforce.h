@@ -30,42 +30,45 @@ namespace trt_edgellm
 namespace plugins
 {
 //! Router selection kernel chosen by the \c routing_mode plugin attribute.
-enum class Nvfp4MoeRoutingMode : int32_t
+//! Same encoding as the SM110 \c Nvfp4MoePlugin so a single ONNX schema can
+//! target either plugin variant.
+enum class NvFP4MoEGeforceRoutingMode : int32_t
 {
     kSOFTMAX_TOPK = 0,       //!< \c moeTopkSoftmax: softmax over experts + flat top-k + renormalize (default).
     kSIGMOID_GROUP_TOPK = 1, //!< \c moeSigmoidGroupTopk: sigmoid + grouped top-k + renormalize + scale (NemotronH).
 };
 
 /*!
- * @brief TensorRT plugin: NVFP4 MoE — FP16 activations with on-the-fly NVFP4
- * quant. SM110 (Thor) uses the split FC1/FC2 CuTeDSL path.
+ * @brief TensorRT plugin: NVFP4 fused MoE (CuTeDSL SM120/SM121) — FP16 activations,
+ * dynamic on-the-fly NVFP4 quant, fused route/pack + FC1 + activation + quant + FC2 + scatter.
  *
- * Weight layout: FC1 is the 64-row up/gate interleave
- * ``[up_chunk(64), gate_chunk(64), up_chunk(64), ...]`` (the layout the SM110
- * split FC1 kernel reads natively). For the SM12x fused path, see the sibling
- * \c NvFP4MoEPluginGeforce plugin which consumes the plain
- * ``[up_all, gate_all]`` concat layout.
+ * Per expert: \c y_e = down_proj( act( up_proj(x) ) ) with NVFP4 packed weights.
  *
- * @note This plugin is only supported on SM110 (Thor).
+ * Weight layout: FC1 is the plain ``[up_all, gate_all]`` concat along the M
+ * axis (no 64-row up/gate interleave). This matches what the fused SM12x
+ * CuTeDSL kernel expects natively. The SM110 \c Nvfp4MoePlugin uses the
+ * separate 64-row interleaved layout consumed by the split FC1/FC2 backend.
+ *
+ * @note This plugin is only supported on SM120 and SM121 (consumer Blackwell).
  * @note This plugin is only supported on FP16 I/O.
- * @note SM110 supports swiglu and relu2 with E=128, 0 < top_k <= 8.
+ * @note Supported activations: identity, silu, swiglu, gelu, relu2.
  */
-class Nvfp4MoePlugin : public nvinfer1::IPluginV3,
-                       public nvinfer1::IPluginV3OneCore,
-                       public nvinfer1::IPluginV3OneBuild,
-                       public nvinfer1::IPluginV3OneRuntime
+class NvFP4MoEPluginGeforce : public nvinfer1::IPluginV3,
+                              public nvinfer1::IPluginV3OneCore,
+                              public nvinfer1::IPluginV3OneBuild,
+                              public nvinfer1::IPluginV3OneRuntime
 {
 public:
-    Nvfp4MoePlugin(std::string const& name, int32_t numExperts, int32_t topK, int32_t hiddenSize, int32_t moeInterSize,
-        int32_t activationType, int32_t nGroup, int32_t topkGroup, int32_t normTopkProb, float routedScalingFactor,
-        int32_t routingMode, int32_t backend, int32_t maxRoutedRows, int32_t ioDtype);
+    NvFP4MoEPluginGeforce(std::string const& name, int32_t numExperts, int32_t topK, int32_t hiddenSize,
+        int32_t moeInterSize, int32_t activationType, int32_t nGroup, int32_t topkGroup, int32_t normTopkProb,
+        float routedScalingFactor, int32_t routingMode, int32_t backend, int32_t maxRoutedRows, int32_t ioDtype);
 
-    Nvfp4MoePlugin(std::string const& name, nvinfer1::PluginFieldCollection const* fc);
+    NvFP4MoEPluginGeforce(std::string const& name, nvinfer1::PluginFieldCollection const* fc);
 
-    Nvfp4MoePlugin() = delete;
-    Nvfp4MoePlugin(Nvfp4MoePlugin const&) = delete;
+    NvFP4MoEPluginGeforce() = delete;
+    NvFP4MoEPluginGeforce(NvFP4MoEPluginGeforce const&) = delete;
 
-    ~Nvfp4MoePlugin() noexcept override;
+    ~NvFP4MoEPluginGeforce() noexcept override;
 
     nvinfer1::IPluginCapability* getCapabilityInterface(nvinfer1::PluginCapabilityType type) noexcept override;
 
@@ -137,17 +140,29 @@ private:
     //! Encoding: 0=bf16, 1=fp16. v1 accepts 1 only.
     int32_t mIoDtype{};
 
+    //! Per-plugin device buffer holding two contiguous identity copies of
+    //! ``[0, 1, ..., mNumExperts-1]`` (total ``2 * mNumExperts`` int32). Allocated
+    //! through \c mGpuAllocator in \c attachToContext and freed in the destructor.
+    //! Threaded into the runner via \c CuteDslNvfp4MoeParams::weightExpertIds /
+    //! \c globalToLocalExpertIds so the runner does no allocation, copy, or
+    //! growth on the enqueue path. Build-phase / unattached plugin instances
+    //! retain \c nullptr and never enqueue.
+    int32_t* mIdentityExpertTable{nullptr};
+    //! Allocator captured in \c attachToContext. Non-null iff this plugin owns
+    //! \c mIdentityExpertTable and is responsible for freeing it.
+    nvinfer1::IGpuAllocator* mGpuAllocator{nullptr};
+
     std::vector<nvinfer1::PluginField> mDataToSerialize;
     nvinfer1::PluginFieldCollection mFCToSerialize;
 };
 
 //! Plugin creator — parses PluginFieldCollection into the attributes above, registers under
-//! TensorRT's default namespace, exposes name "Nvfp4MoePlugin" / version "1".
-class Nvfp4MoePluginCreator : public nvinfer1::IPluginCreatorV3One
+//! TensorRT's default namespace, exposes name "NvFP4MoEPluginGeforce" / version "1".
+class NvFP4MoEPluginGeforceCreator : public nvinfer1::IPluginCreatorV3One
 {
 public:
-    Nvfp4MoePluginCreator();
-    ~Nvfp4MoePluginCreator() override = default;
+    NvFP4MoEPluginGeforceCreator();
+    ~NvFP4MoEPluginGeforceCreator() override = default;
 
     char const* getPluginName() const noexcept override;
     char const* getPluginVersion() const noexcept override;

@@ -68,7 +68,8 @@ from ...config import QUANT_NVFP4, ModelConfig
 from ..default.modeling_default import (MLP, Attention, OnnxSpec, RMSNorm,
                                         _make_flat_wrapper)
 from ..linear import FP16Linear, make_linear
-from ..ops import int4_moe_plugin, nvfp4_moe_plugin
+from ..ops import (int4_moe_plugin, nvfp4_moe_plugin, nvfp4_moe_plugin_geforce,
+                   use_geforce_nvfp4_moe)
 
 logger = logging.getLogger(__name__)
 
@@ -315,14 +316,15 @@ class Qwen3SparseMoeBlock(nn.Module):
         self._prepare_nvfp4_moe_weights_impl()
 
     def _prepare_nvfp4_moe_weights_impl(self) -> None:
-        """Repack Qwen3 NVFP4 experts for ``Nvfp4MoePlugin`` (SM110/120/121).
+        """Repack Qwen3 NVFP4 experts for the active NVFP4 MoE plugin.
 
         Decodes ModelOpt NVFP4 to dense, rounds through BF16, and emits the
-        CuTeDSL 6D MMA scale layout the SM12x fused kernel expects. FC1
-        is 64-row interleaved ``[up_chunk, gate_chunk]`` pairs along the M
-        axis (the SwiGLU order the SM12x fused kernel hard-codes; see
-        ``kernelSrcs/nvfp4_fused_moe_cutedsl/`` and
-        :func:`repack_nvfp4_qwen3_moe_experts`).
+        CuTeDSL 6D MMA scale layout the kernel expects. FC1 SwiGLU layout
+        is selected from :func:`use_geforce_nvfp4_moe`:
+
+        * SM110 ``Nvfp4MoePlugin`` -- 64-row up/gate interleave (default).
+        * SM12x ``NvFP4MoEPluginGeforce`` -- plain ``[up_all, gate_all]``
+          concat along the M axis.
         """
         from ...checkpoint.repacking import repack_nvfp4_qwen3_moe_experts
 
@@ -332,10 +334,13 @@ class Qwen3SparseMoeBlock(nn.Module):
                                      dtype=torch.float16)
         self.gate_linear.weight.data = self.gate.weight.data
 
+        fc1_layout = "concat" if use_geforce_nvfp4_moe() else "interleave"
         fc1_qweights, fc1_blocks_scale, fc2_qweights, fc2_blocks_scale = (
-            repack_nvfp4_qwen3_moe_experts(self.experts, self.hidden_size,
+            repack_nvfp4_qwen3_moe_experts(self.experts,
+                                           self.hidden_size,
                                            self.moe_intermediate_size,
-                                           self.group_size))
+                                           self.group_size,
+                                           fc1_layout=fc1_layout))
 
         device = self.gate.weight.device
         self.register_buffer("fc1_qweights",
@@ -366,9 +371,12 @@ class Qwen3SparseMoeBlock(nn.Module):
             torch.zeros(self.num_experts, dtype=torch.float32, device=device))
 
         logger.info(
-            "Nvfp4MoePlugin (CuTeDSL fused)-packed %d Qwen3 experts: "
+            "%s (CuTeDSL)-packed %d Qwen3 experts (fc1_layout=%s): "
             "fc1_qw %s, fc2_qw %s",
+            "NvFP4MoEPluginGeforce"
+            if use_geforce_nvfp4_moe() else "Nvfp4MoePlugin",
             self.num_experts,
+            fc1_layout,
             list(self.fc1_qweights.shape),
             list(self.fc2_qweights.shape),
         )
@@ -380,7 +388,9 @@ class Qwen3SparseMoeBlock(nn.Module):
         hidden_flat = hidden_states.reshape(-1, hidden_dim)
         router_logits = self.gate_linear(hidden_flat).float()
         if self._use_nvfp4_moe:
-            return nvfp4_moe_plugin(
+            moe_op = (nvfp4_moe_plugin_geforce
+                      if use_geforce_nvfp4_moe() else nvfp4_moe_plugin)
+            return moe_op(
                 router_logits,
                 hidden_states,
                 self.fc1_qweights,
