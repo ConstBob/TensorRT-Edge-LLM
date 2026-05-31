@@ -18,3 +18,4 @@ tests:
   # === Qwen3-TTS-12Hz-0.6B-CustomVoice FP16 (Talker + CodePredictor + Code2Wav) ===
   - tests/defs/test_audio_pipeline.py::TestTTSPipeline::test_engine_build[Qwen3-TTS-12Hz-0.6B-CustomVoice-fp16-mxsl4096-mxbs1-mxil4096]
   - tests/defs/test_audio_pipeline.py::TestTTSPipeline::test_inference[Qwen3-TTS-12Hz-0.6B-CustomVoice-fp16-mxsl4096-mxbs1-mxil4096-tts_basic]
+  

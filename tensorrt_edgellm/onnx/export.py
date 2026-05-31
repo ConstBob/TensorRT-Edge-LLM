@@ -508,18 +508,17 @@ def _fix_initializer_dtypes(
     # Collect plugin initializer names that must stay FP32.
     # - Mamba2 update_ssm_state: input[1] = ssm_A
     # - gated_delta_net: input[5] = A_log
-    # - Nvfp4MoePlugin: input[11] = e_score_correction_bias
-    # - NvFP4MoEPluginGeforce: inputs[4,7,8,9] are FP32 scale vectors
+    # - Nvfp4MoePlugin / NvFP4MoEPluginGeforce: inputs[4,7,8,9] are FP32 scale
+    #   vectors; input[10] is the FP32 router correction bias. Both plugins
+    #   share the same 11-input ONNX surface.
     plugin_fp32_init_names: set = set()
     for node in model.graph.node:
         if node.op_type == "update_ssm_state" and len(node.input) > 1:
             plugin_fp32_init_names.add(node.input[1])
         if node.op_type == "gated_delta_net" and len(node.input) > 5:
             plugin_fp32_init_names.add(node.input[5])
-        if node.op_type == "Nvfp4MoePlugin" and len(node.input) > 11:
-            plugin_fp32_init_names.add(node.input[11])
-        if node.op_type == "NvFP4MoEPluginGeforce":
-            for input_idx in (4, 7, 8, 9):
+        if node.op_type in ("Nvfp4MoePlugin", "NvFP4MoEPluginGeforce"):
+            for input_idx in (4, 7, 8, 9, 10):
                 if len(node.input) > input_idx:
                     plugin_fp32_init_names.add(node.input[input_idx])
 

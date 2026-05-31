@@ -78,16 +78,16 @@ tensorrt-edgellm-export \
   --fp8-embedding
 ```
 
-For NVFP4 MoE models (e.g. Qwen3-MoE), use `--nvfp4-moe-backend` to select the plugin backend:
+NVFP4 MoE models (e.g. Qwen3-MoE, Nemotron3-MoE) always emit the unified
+`Nvfp4MoePlugin`. At runtime the plugin selects the SM110 split FC1/FC2
+backend on Thor and the SM120/SM121 fused decode + prefill backend on
+consumer Blackwell automatically:
 
 ```bash
 tensorrt-edgellm-export \
   /path/to/Qwen3-MoE-NVFP4 \
-  /tmp/qwen3_moe_onnx \
-  --nvfp4-moe-backend thor
+  /tmp/qwen3_moe_onnx
 ```
-
-Choices: `thor` (Nvfp4MoePlugin, SM100/101/110) or `geforce` (NvFP4MoEPluginGeforce, SM120/121). Defaults to checkpoint config, then `thor`.
 
 Build engines and run inference with the normal C++ tools. See [Quick Start Guide](../getting_started/quick-start-guide.md).
 

@@ -29,14 +29,29 @@ namespace trt_edgellm
 {
 namespace plugins
 {
+//! Router selection kernel chosen by the \c routing_mode plugin attribute.
+//! Same encoding as the SM110 \c Nvfp4MoePlugin so a single ONNX schema can
+//! target either plugin variant.
+enum class NvFP4MoEGeforceRoutingMode : int32_t
+{
+    kSOFTMAX_TOPK = 0,       //!< \c moeTopkSoftmax: softmax over experts + flat top-k + renormalize (default).
+    kSIGMOID_GROUP_TOPK = 1, //!< \c moeSigmoidGroupTopk: sigmoid + grouped top-k + renormalize + scale (NemotronH).
+};
 
 /*!
  * @brief TensorRT plugin: NVFP4 fused MoE (CuTeDSL SM120/SM121) — FP16 activations,
  * dynamic on-the-fly NVFP4 quant, fused route/pack + FC1 + activation + quant + FC2 + scatter.
  *
- * @note This plugin is only supported on SM120 and SM121.
- * @note This plugin is only supported on FP16.
- * @note This plugin supports identity, silu, swiglu, and gelu activations.
+ * Per expert: \c y_e = down_proj( act( up_proj(x) ) ) with NVFP4 packed weights.
+ *
+ * Weight layout: FC1 is the plain ``[up_all, gate_all]`` concat along the M
+ * axis (no 64-row up/gate interleave). This matches what the fused SM12x
+ * CuTeDSL kernel expects natively. The SM110 \c Nvfp4MoePlugin uses the
+ * separate 64-row interleaved layout consumed by the split FC1/FC2 backend.
+ *
+ * @note This plugin is only supported on SM120 and SM121 (consumer Blackwell).
+ * @note This plugin is only supported on FP16 I/O.
+ * @note Supported activations: identity, silu, swiglu, gelu, relu2.
  */
 class NvFP4MoEPluginGeforce : public nvinfer1::IPluginV3,
                               public nvinfer1::IPluginV3OneCore,
@@ -45,7 +60,8 @@ class NvFP4MoEPluginGeforce : public nvinfer1::IPluginV3,
 {
 public:
     NvFP4MoEPluginGeforce(std::string const& name, int32_t numExperts, int32_t topK, int32_t hiddenSize,
-        int32_t moeInterSize, int32_t activationType, int32_t backend, int32_t maxRoutedRows, int32_t ioDtype);
+        int32_t moeInterSize, int32_t activationType, int32_t nGroup, int32_t topkGroup, int32_t normTopkProb,
+        float routedScalingFactor, int32_t routingMode, int32_t backend, int32_t maxRoutedRows, int32_t ioDtype);
 
     NvFP4MoEPluginGeforce(std::string const& name, nvinfer1::PluginFieldCollection const* fc);
 
@@ -102,6 +118,12 @@ private:
     int32_t mMoeInterSize{};
     //! Encoding: 0=identity, 1=silu, 2=swiglu, 3=gelu, 4=relu2. All five values are accepted.
     int32_t mActivationType{};
+    //! Router encoding: 0=softmax top-k, 1=sigmoid grouped top-k.
+    int32_t mRoutingMode{};
+    int32_t mNGroup{1};
+    int32_t mTopkGroup{1};
+    int32_t mNormTopkProb{1};
+    float mRoutedScalingFactor{1.0F};
     //! Encoding: 0=auto, 1=decode, 2=prefill. v1 accepts all three values.
     int32_t mBackend{};
     //! Upper bound on num_tokens * top_k; used to size the decode workspace.

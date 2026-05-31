@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,18 +17,11 @@
 
 #pragma once
 
-#include "common/tensor.h"
-#include "kernels/moe/NvFP4MoEContiguousGemmRunner.h"
-#include "kernels/moe/NvFP4MoEFC2FinalizeRunner.h"
-#include "kernels/moe/fp4SupportKernels/nvfp4MoeTypes.h"
-#ifdef CUTE_DSL_NVFP4_MOE_ENABLED
-#include "kernels/moe/nvfp4_cutedsl/cuteDslDecodeGemvRunner.h"
-#endif
-
+#include <NvInfer.h>
 #include <NvInferRuntime.h>
+
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <string>
 #include <vector>
 
@@ -44,29 +37,18 @@ enum class Nvfp4MoeRoutingMode : int32_t
 };
 
 /*!
- * @brief TensorRT plugin: Nemotron-style MoE MLP with NVFP4 weights.
+ * @brief TensorRT plugin: NVFP4 MoE — FP16 activations with on-the-fly NVFP4
+ * quant. SM110 (Thor) uses the split FC1/FC2 CuTeDSL path.
  *
- * Per expert: \c y_e = down_proj( act( up_proj(x) ) ). No separate gate projection.
+ * Weight layout: FC1 is the 64-row up/gate interleave
+ * ``[up_chunk(64), gate_chunk(64), up_chunk(64), ...]`` (the layout the SM110
+ * split FC1 kernel reads natively). For the SM12x fused path, see the sibling
+ * \c NvFP4MoEPluginGeforce plugin which consumes the plain
+ * ``[up_all, gate_all]`` concat layout.
  *
- * Dispatch: \c enqueue() picks between two execution paths based on runtime token count
- * (\c numTokens = B × S):
- *   - \c numTokens ≤ 16 — decode path (router + W4A16 GEMV, per-token GEMV kernels).
- *   - \c numTokens > 16 — prefill path (router + GPU layout build + fp4Quantize +
- *     gather + FC1 grouped GEMM + fp4Quantize + FC2 grouped GEMM + scatter-reduce).
- *
- * Routing: both paths consume pre-activation router logits \c [num_tokens, num_experts] and
- * dispatch to one of two router kernels, selected by the \c routing_mode attribute:
- *   - \c 0 (\c kSOFTMAX_TOPK, default): \c moeTopkSoftmax (softmax + flat top-k + renormalize).
- *   - \c 1 (\c kSIGMOID_GROUP_TOPK): \c moeSigmoidGroupTopk (sigmoid + grouped top-k +
- *     renormalize + scale). Uses \c n_group / \c topk_group / \c norm_topk_prob /
- *     \c routed_scaling_factor attributes.
- * \c e_score_correction_bias \c [E] FP32 is used as an optional bias by \c moeTopkSoftmax
- * (mode 0) and as the expert load-balancing bias by \c moeSigmoidGroupTopk (mode 1); pass
- * zeros when no bias is desired.
- *
- * Hidden activations are FP16 only. Any activation NVFP4 quantization (payload + FP8 block
- * scales) needed by the prefill path is computed inside the plugin via \c fp4Quantize; the
- * caller supplies only calibrated global scales.
+ * @note This plugin is only supported on SM110 (Thor).
+ * @note This plugin is only supported on FP16 I/O.
+ * @note SM110 supports swiglu and relu2 with E=128, 0 < top_k <= 8.
  */
 class Nvfp4MoePlugin : public nvinfer1::IPluginV3,
                        public nvinfer1::IPluginV3OneCore,
@@ -74,15 +56,10 @@ class Nvfp4MoePlugin : public nvinfer1::IPluginV3,
                        public nvinfer1::IPluginV3OneRuntime
 {
 public:
-    //! Build-phase constructor — populated from ONNX attributes. \c mMaxTokens starts at 0
-    //! and is set in \c configurePlugin().
     Nvfp4MoePlugin(std::string const& name, int32_t numExperts, int32_t topK, int32_t hiddenSize, int32_t moeInterSize,
-        nvinfer1::ActivationType activationType = static_cast<nvinfer1::ActivationType>(0), int32_t nGroup = 1,
-        int32_t topkGroup = 1, int32_t normTopkProb = 1, float routedScalingFactor = 1.0f,
-        int32_t routingMode = static_cast<int32_t>(Nvfp4MoeRoutingMode::kSOFTMAX_TOPK));
+        int32_t activationType, int32_t nGroup, int32_t topkGroup, int32_t normTopkProb, float routedScalingFactor,
+        int32_t routingMode, int32_t backend, int32_t maxRoutedRows, int32_t ioDtype);
 
-    //! Runtime deserialization constructor. Reads \c max_tokens from the serialized field
-    //! collection; a missing field throws.
     Nvfp4MoePlugin(std::string const& name, nvinfer1::PluginFieldCollection const* fc);
 
     Nvfp4MoePlugin() = delete;
@@ -129,66 +106,43 @@ public:
     void setPluginNamespace(char const* pluginNamespace) noexcept;
 
 private:
-    //! Router + CuTe DSL decode GEMV kernels (N-major NVFP4 weights + FP8 block scales + FP32 global scales).
-    int32_t enqueueDecoding(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
-        void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept;
-
-    //! Top-k softmax → GPU layout → fp4Quantize → gather → FC1 GEMM → fp4Quantize → FC2 GEMM+scatter.
-    int32_t enqueuePrefill(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
-        void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept;
-
     std::string mLayerName;
-    //! Empty; ONNX uses domain ``trt`` (``trt::Nvfp4MoePlugin``).
     std::string mNamespace;
+
     int32_t mNumExperts{};
     int32_t mTopK{};
     int32_t mHiddenSize{};
     int32_t mMoeInterSize{};
-    nvinfer1::ActivationType mActivationType{};
-    //! Marlin NVFP4 block scales along \c K; only \c 16 is supported.
-    int32_t mQuantizationGroupSize{};
-    //! NemotronH sigmoid group top-k routing parameters (used when \c mRoutingMode == \c kSIGMOID_GROUP_TOPK).
+    //! Encoding: 0=identity, 1=silu, 2=swiglu, 3=gelu, 4=relu2. All five values are accepted.
+    int32_t mActivationType{};
+    //! Router encoding: 0=softmax top-k, 1=sigmoid grouped top-k.
+    int32_t mRoutingMode{};
     int32_t mNGroup{1};
     int32_t mTopkGroup{1};
-    int32_t mNormTopkProb{1}; //!< Stored as int32 for serialization; nonzero = true.
-    float mRoutedScalingFactor{1.0f};
-    //! Router selection kernel: see \c Nvfp4MoeRoutingMode.
-    int32_t mRoutingMode{static_cast<int32_t>(Nvfp4MoeRoutingMode::kSOFTMAX_TOPK)};
-
-    //! Max \c B·S captured in \c configurePlugin (union over profiles). Serialized to the
-    //! engine so the runtime ctor can size layout buffers.
-    int32_t mMaxTokens{0};
-
-    //! Runners for the prefill path. Constructed lazily in \c attachToContext once
-    //! \c mMaxTokens / shape parameters are known.
-    std::unique_ptr<trt_edgellm::kernel::nvfp4_moe::NvFP4MoEContiguousGemmRunner> mFC1Runner;
-    std::unique_ptr<trt_edgellm::kernel::nvfp4_moe::NvFP4MoEFC2FinalizeRunner> mFC2Runner;
-
-    //! Runner for the CuTe DSL decode GEMV path.
-#ifdef CUTE_DSL_NVFP4_MOE_ENABLED
-    trt_edgellm::CuteDslDecodeGemvRunner mDecodeGemvRunner{};
-#endif
-
-    //! Pre-allocated GPU layout buffers (non-owning \c rt::Tensor views over
-    //! \c IGpuAllocator -allocated memory).
-    trt_edgellm::kernel::MoELayoutBuffers mLayoutBuffers{};
-
-    //! Persistent FC1/FC2 α buffers (``[L]`` FP32 each), allocated in
-    //! \c attachToContext and populated once on the first prefill enqueue.
-    //! α depends only on constant plugin inputs (``hidden_global_scale`` and
-    //! per-expert ``fc_up_global_scale`` / ``fc_down_global_scale``), so
-    //! recomputing every call would be wasted work.
-    trt_edgellm::rt::Tensor mFC1Alpha{};
-    trt_edgellm::rt::Tensor mFC2Alpha{};
-    bool mAlphaInitialized{false};
-
-    //! Allocator captured at \c attachToContext — used to free layout buffers in dtor.
-    nvinfer1::IGpuAllocator* mGpuAllocator{nullptr};
+    int32_t mNormTopkProb{1};
+    float mRoutedScalingFactor{1.0F};
+    //! Encoding: 0=auto, 1=decode, 2=prefill. v1 accepts all three values.
+    int32_t mBackend{};
+    //! Upper bound on num_tokens * top_k; used to size the decode workspace.
+    //! Build-time semantics:
+    //!   * 0 from the user → \c configurePlugin populates it from the optimization
+    //!     profile (\c max_tokens * \c top_k) and serializes the resolved value so
+    //!     the runtime instance always carries a concrete cap.
+    //!   * non-zero from the user → must be >= profile \c max_tokens * \c top_k;
+    //!     a smaller value is rejected at \c configurePlugin time so undersized
+    //!     workspaces cannot escape into runtime.
+    //! Runtime semantics: \c onShapeChange and \c enqueue reject any launch whose
+    //! \c batch * \c seq_len * \c top_k exceeds the resolved cap.
+    int32_t mMaxRoutedRows{};
+    //! Encoding: 0=bf16, 1=fp16. v1 accepts 1 only.
+    int32_t mIoDtype{};
 
     std::vector<nvinfer1::PluginField> mDataToSerialize;
     nvinfer1::PluginFieldCollection mFCToSerialize;
 };
 
+//! Plugin creator — parses PluginFieldCollection into the attributes above, registers under
+//! TensorRT's default namespace, exposes name "Nvfp4MoePlugin" / version "1".
 class Nvfp4MoePluginCreator : public nvinfer1::IPluginCreatorV3One
 {
 public:
@@ -207,7 +161,6 @@ public:
 private:
     static nvinfer1::PluginFieldCollection mFieldCollection;
     static std::vector<nvinfer1::PluginField> mPluginAttributes;
-    //! Empty; ONNX domain ``trt`` is separate from creator namespace.
     std::string mNamespace;
 };
 

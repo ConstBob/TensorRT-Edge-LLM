@@ -21,6 +21,7 @@
 
 #include "fp4Quantize.h"
 
+#include "common/checkMacros.h"
 #include "common/cudaMacros.h"
 #include "common/cudaUtils.h"
 
@@ -48,6 +49,26 @@ namespace
 constexpr int kEltsPerThread = 8; // 4 x bfloat162 = 128 bits
 constexpr int kSfVecSize = 16;    // elements per SF block
 constexpr int kThreadsPerSf = 2;  // kSfVecSize / kEltsPerThread
+
+// Maximum number of experts the fused decode kernel
+// (buildLayoutAndQuantizeRoutedToFp4LinearSfDecodeKernel) can scatter into.
+// The kernel pre-allocates shared-memory `expertCounts`/`expertOffsets`/
+// `scatterCounters` arrays of this length, and the host-side launcher rejects
+// any call with `topK` or `localNumExperts` above this bound. Keep host and
+// kernel in lockstep -- the kernel references this same constant.
+constexpr int kMaxDecodeExperts = 128;
+
+// Lower bound on the per-expert global scale factor used as a divisor in the
+// FP4 routed quantization kernels (fmaxf(sfScales[expert], kSfScaleEpsilon)).
+// Guards against zero-valued global scales and matches the numerical guard
+// used in the corresponding host reference (see Python tests).
+constexpr float kSfScaleEpsilon = 1.0e-20f;
+
+// Resident-thread cap used to derive the per-SM block budget
+// (numBlocksPerSM = max(1, kMaxResidentThreadsPerSm / blockSize)). This is the
+// SM thread occupancy limit for the architectures we support (Hopper / Ada /
+// Blackwell / Thor). Centralising it keeps the four launcher sites in sync.
+constexpr int kMaxResidentThreadsPerSm = 2048;
 
 // -------------------------------------------------------------------------
 // Type traits for BF16 / FP16 generic quantization
@@ -295,6 +316,246 @@ __launch_bounds__(512, 4) __global__
     }
 }
 
+template <typename ScalarT>
+__launch_bounds__(512, 4) __global__
+    void quantizeToFp4LinearSfKernel(int32_t numRows, int32_t numCols, ScalarT const* __restrict__ input,
+        float const* __restrict__ sfScale, uint32_t* __restrict__ outputFP4, uint8_t* __restrict__ outputSF)
+{
+    using Traits = QuantTraits<ScalarT>;
+    using Vec2 = typename Traits::Vec2;
+    using PVec = PackedVecT<Vec2>;
+
+    int const numColThreads = numCols / kEltsPerThread;
+    int const numSfCols = numCols / kSfVecSize;
+    int const numSfColThreads = numSfCols * kThreadsPerSf;
+    float const SFScaleInv = 1.0f / *sfScale;
+
+    for (int rowIdx = blockIdx.x; rowIdx < numRows; rowIdx += gridDim.x)
+    {
+        for (int colIdx = threadIdx.x; colIdx < numSfColThreads; colIdx += blockDim.x)
+        {
+            PVec vec = *reinterpret_cast<PVec const*>(
+                input + (int64_t) rowIdx * numCols + (int64_t) colIdx * kEltsPerThread);
+
+            Vec2 localMax = __habs2(vec.elts[0]);
+#pragma unroll
+            for (int i = 1; i < 4; i++)
+            {
+                localMax = __hmax2(localMax, __habs2(vec.elts[i]));
+            }
+
+            Vec2 otherMax = __shfl_xor_sync(0xFFFFFFFF, localMax, 1);
+            localMax = __hmax2(localMax, otherMax);
+            float vecMax = Traits::toFloat(__hmax(localMax.x, localMax.y));
+
+            float SFValue = SFScaleInv * (vecMax * rcpApproxFtz(6.0f));
+            __nv_fp8_e4m3 sfFp8 = __nv_fp8_e4m3(SFValue);
+            float SFValueBack = float(sfFp8);
+            float outScale = (vecMax != 0.0f) ? rcpApproxFtz(SFValueBack * rcpApproxFtz(SFScaleInv)) : 0.0f;
+
+            float2 fp2Vals[4];
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+            {
+                fp2Vals[i] = Traits::toFloat2(vec.elts[i]);
+                fp2Vals[i].x *= outScale;
+                fp2Vals[i].y *= outScale;
+            }
+            uint32_t const packed = fp32VecToE2m1(fp2Vals);
+            outputFP4[(int64_t) rowIdx * numColThreads + colIdx] = packed;
+
+            if (colIdx % kThreadsPerSf == 0)
+            {
+                int const sfIdx = colIdx / kThreadsPerSf;
+                outputSF[(int64_t) rowIdx * numSfCols + sfIdx] = sfFp8.__x;
+            }
+        }
+    }
+}
+
+template <typename ScalarT>
+__launch_bounds__(512, 4) __global__ void quantizeRoutedToFp4LinearSfKernel(int32_t numRows, int32_t topK,
+    int32_t numCols, ScalarT const* __restrict__ input, int32_t const* __restrict__ topkIds,
+    float const* __restrict__ sfScales, uint32_t* __restrict__ outputFP4, uint8_t* __restrict__ outputSF)
+{
+    using Traits = QuantTraits<ScalarT>;
+    using Vec2 = typename Traits::Vec2;
+    using PVec = PackedVecT<Vec2>;
+
+    int const numRoutedRows = numRows * topK;
+    int const numColThreads = numCols / kEltsPerThread;
+    int const numSfCols = numCols / kSfVecSize;
+    int const numSfColThreads = numSfCols * kThreadsPerSf;
+
+    for (int routedRowIdx = blockIdx.x; routedRowIdx < numRoutedRows; routedRowIdx += gridDim.x)
+    {
+        int const tokenIdx = routedRowIdx / topK;
+        int const expert = topkIds[routedRowIdx];
+        float const sfScale = fmaxf(sfScales[expert], kSfScaleEpsilon);
+        float const sfScaleInv = 1.0f / sfScale;
+
+        for (int colIdx = threadIdx.x; colIdx < numSfColThreads; colIdx += blockDim.x)
+        {
+            PVec vec = *reinterpret_cast<PVec const*>(
+                input + (int64_t) tokenIdx * numCols + (int64_t) colIdx * kEltsPerThread);
+
+            Vec2 localMax = __habs2(vec.elts[0]);
+#pragma unroll
+            for (int i = 1; i < 4; i++)
+            {
+                localMax = __hmax2(localMax, __habs2(vec.elts[i]));
+            }
+
+            Vec2 otherMax = __shfl_xor_sync(0xFFFFFFFF, localMax, 1);
+            localMax = __hmax2(localMax, otherMax);
+            float vecMax = Traits::toFloat(__hmax(localMax.x, localMax.y));
+
+            float sfValue = sfScaleInv * (vecMax * rcpApproxFtz(6.0f));
+            __nv_fp8_e4m3 sfFp8 = __nv_fp8_e4m3(sfValue);
+            float sfValueBack = float(sfFp8);
+            float outScale = (vecMax != 0.0f) ? rcpApproxFtz(sfValueBack * sfScale) : 0.0f;
+
+            float2 fp2Vals[4];
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+            {
+                fp2Vals[i] = Traits::toFloat2(vec.elts[i]);
+                fp2Vals[i].x *= outScale;
+                fp2Vals[i].y *= outScale;
+            }
+            uint32_t const packed = fp32VecToE2m1(fp2Vals);
+            outputFP4[(int64_t) routedRowIdx * numColThreads + colIdx] = packed;
+
+            if (colIdx % kThreadsPerSf == 0)
+            {
+                int const sfIdx = colIdx / kThreadsPerSf;
+                outputSF[(int64_t) routedRowIdx * numSfCols + sfIdx] = sfFp8.__x;
+            }
+        }
+    }
+}
+
+template <typename ScalarT>
+__launch_bounds__(512, 4) __global__ void buildLayoutAndQuantizeRoutedToFp4LinearSfDecodeKernel(int32_t topK,
+    int32_t numCols, int32_t localNumExperts, int32_t tileSize, ScalarT const* __restrict__ input,
+    int32_t const* __restrict__ topkIds, float const* __restrict__ sfScales, int32_t* __restrict__ permutedIdx,
+    int32_t* __restrict__ tileGroupIdx, int32_t* __restrict__ tileMnLimit, int32_t* __restrict__ numNonExitingTiles,
+    uint32_t* __restrict__ outputFP4, uint8_t* __restrict__ outputSF)
+{
+    using Traits = QuantTraits<ScalarT>;
+    using Vec2 = typename Traits::Vec2;
+    using PVec = PackedVecT<Vec2>;
+
+    // Mirrors the file-scope `kMaxDecodeExperts` constant used by the host
+    // launcher; the static asserts on `topK`/`localNumExperts` there are what
+    // keep these shared arrays in bounds at runtime.
+    __shared__ int32_t expertCounts[kMaxDecodeExperts];
+    __shared__ int32_t expertOffsets[kMaxDecodeExperts];
+    __shared__ int32_t scatterCounters[kMaxDecodeExperts];
+
+    int const tid = threadIdx.x;
+    if (blockIdx.x == 0)
+    {
+        for (int expert = tid; expert < localNumExperts; expert += blockDim.x)
+        {
+            expertCounts[expert] = 0;
+            scatterCounters[expert] = 0;
+        }
+        __syncthreads();
+
+        if (tid < topK)
+        {
+            int const expert = topkIds[tid];
+            if (expert >= 0 && expert < localNumExperts)
+            {
+                atomicAdd_block(&expertCounts[expert], 1);
+            }
+        }
+        __syncthreads();
+
+        if (tid == 0)
+        {
+            int runningOffset = 0;
+            int runningTiles = 0;
+            for (int expert = 0; expert < localNumExperts; ++expert)
+            {
+                int const count = expertCounts[expert];
+                expertOffsets[expert] = runningOffset;
+                if (count > 0)
+                {
+                    tileGroupIdx[runningTiles] = expert;
+                    tileMnLimit[runningTiles] = runningOffset + count;
+                    runningOffset += tileSize;
+                    ++runningTiles;
+                }
+            }
+            numNonExitingTiles[0] = runningTiles;
+        }
+        __syncthreads();
+
+        if (tid < topK)
+        {
+            int const expert = topkIds[tid];
+            if (expert >= 0 && expert < localNumExperts)
+            {
+                int const pos = atomicAdd_block(&scatterCounters[expert], 1);
+                permutedIdx[expertOffsets[expert] + pos] = tid;
+            }
+        }
+        return;
+    }
+
+    int const numColThreads = numCols / kEltsPerThread;
+    int const numSfCols = numCols / kSfVecSize;
+    int const numSfColThreads = numSfCols * kThreadsPerSf;
+
+    int const quantGridSize = gridDim.x - 1;
+    for (int routedRowIdx = blockIdx.x - 1; routedRowIdx < topK; routedRowIdx += quantGridSize)
+    {
+        int const expert = topkIds[routedRowIdx];
+        float const sfScale = fmaxf(sfScales[expert], kSfScaleEpsilon);
+        float const sfScaleInv = 1.0f / sfScale;
+
+        for (int colIdx = tid; colIdx < numSfColThreads; colIdx += blockDim.x)
+        {
+            PVec vec = *reinterpret_cast<PVec const*>(input + (int64_t) colIdx * kEltsPerThread);
+
+            Vec2 localMax = __habs2(vec.elts[0]);
+#pragma unroll
+            for (int i = 1; i < 4; i++)
+            {
+                localMax = __hmax2(localMax, __habs2(vec.elts[i]));
+            }
+
+            Vec2 otherMax = __shfl_xor_sync(0xFFFFFFFF, localMax, 1);
+            localMax = __hmax2(localMax, otherMax);
+            float vecMax = Traits::toFloat(__hmax(localMax.x, localMax.y));
+
+            float sfValue = sfScaleInv * (vecMax * rcpApproxFtz(6.0f));
+            __nv_fp8_e4m3 sfFp8 = __nv_fp8_e4m3(sfValue);
+            float sfValueBack = float(sfFp8);
+            float outScale = (vecMax != 0.0f) ? rcpApproxFtz(sfValueBack * sfScale) : 0.0f;
+
+            float2 fp2Vals[4];
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+            {
+                fp2Vals[i] = Traits::toFloat2(vec.elts[i]);
+                fp2Vals[i].x *= outScale;
+                fp2Vals[i].y *= outScale;
+            }
+            uint32_t const packed = fp32VecToE2m1(fp2Vals);
+            outputFP4[(int64_t) routedRowIdx * numColThreads + colIdx] = packed;
+
+            if (colIdx % kThreadsPerSf == 0)
+            {
+                int const sfIdx = colIdx / kThreadsPerSf;
+                outputSF[(int64_t) routedRowIdx * numSfCols + sfIdx] = sfFp8.__x;
+            }
+        }
+    }
+}
+
 } // namespace
 
 // -------------------------------------------------------------------------
@@ -311,11 +572,11 @@ void fp4Quantize(rt::Tensor const& input, rt::Tensor const& globalSF, rt::Tensor
     int const numPaddedRows = static_cast<int>(divUp(M, 128) * 128);
 
     int device = 0;
-    cudaGetDevice(&device);
+    CUDA_CHECK(cudaGetDevice(&device));
     int smCount = 0;
-    cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, device);
+    CUDA_CHECK(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, device));
 
-    int const numBlocksPerSM = std::max(1, 2048 / blockSize);
+    int const numBlocksPerSM = std::max(1, kMaxResidentThreadsPerSm / blockSize);
     int const gridSize = std::min(numPaddedRows, smCount * numBlocksPerSM);
 
     auto const* sfPtrFwd = static_cast<float const*>(globalSF.rawPointer());
@@ -338,10 +599,203 @@ void fp4Quantize(rt::Tensor const& input, rt::Tensor const& globalSF, rt::Tensor
     }
 }
 
+void fp4QuantizeLinearSF(rt::Tensor const& input, rt::Tensor const& globalSF, rt::Tensor& outputFP4,
+    rt::Tensor& outputSF, cudaStream_t stream)
+{
+    int64_t const M = input.getShape()[0];
+    int64_t const N = input.getShape()[1];
+    if (N <= 0 || N % kSfVecSize != 0)
+    {
+        throw std::runtime_error("fp4QuantizeLinearSF: input N must be a positive multiple of 16.");
+    }
+    if (M <= 0)
+    {
+        return;
+    }
+
+    int const numColThreads = static_cast<int>(N) / kEltsPerThread;
+    int const blockSize = std::min(numColThreads, 512);
+
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    int smCount = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, device));
+
+    int const numBlocksPerSM = std::max(1, kMaxResidentThreadsPerSm / blockSize);
+    int const gridSize = std::min(static_cast<int>(M), smCount * numBlocksPerSM);
+
+    auto const* sfPtrFwd = static_cast<float const*>(globalSF.rawPointer());
+    auto* fp4Ptr = static_cast<uint32_t*>(outputFP4.rawPointer());
+    auto* sfPtr = static_cast<uint8_t*>(outputSF.rawPointer());
+
+    if (input.getDataType() == nvinfer1::DataType::kBF16)
+    {
+        quantizeToFp4LinearSfKernel<__nv_bfloat16><<<gridSize, blockSize, 0, stream>>>(static_cast<int32_t>(M),
+            static_cast<int32_t>(N), static_cast<__nv_bfloat16 const*>(input.rawPointer()), sfPtrFwd, fp4Ptr, sfPtr);
+    }
+    else if (input.getDataType() == nvinfer1::DataType::kHALF)
+    {
+        quantizeToFp4LinearSfKernel<__half><<<gridSize, blockSize, 0, stream>>>(static_cast<int32_t>(M),
+            static_cast<int32_t>(N), static_cast<__half const*>(input.rawPointer()), sfPtrFwd, fp4Ptr, sfPtr);
+    }
+    else
+    {
+        throw std::runtime_error("fp4QuantizeLinearSF: unsupported input data type (expected kBF16 or kHALF).");
+    }
+}
+
+void fp4QuantizeRoutedLinearSF(rt::Tensor const& input, rt::Tensor const& topkIds, rt::Tensor const& expertGlobalSF,
+    rt::Tensor& outputFP4, rt::Tensor& outputSF, cudaStream_t stream)
+{
+    int64_t const M = input.getShape()[0];
+    int64_t const N = input.getShape()[1];
+    int64_t const topK = topkIds.getShape()[1];
+    if (N <= 0 || N % kSfVecSize != 0)
+    {
+        throw std::runtime_error("fp4QuantizeRoutedLinearSF: input N must be a positive multiple of 16.");
+    }
+    if (M <= 0 || topK <= 0)
+    {
+        return;
+    }
+
+    int const numColThreads = static_cast<int>(N) / kEltsPerThread;
+    int const blockSize = std::min(numColThreads, 512);
+
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    int smCount = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, device));
+
+    int const numBlocksPerSM = std::max(1, kMaxResidentThreadsPerSm / blockSize);
+    int const numRoutedRows = static_cast<int>(M * topK);
+    int const gridSize = std::min(numRoutedRows, smCount * numBlocksPerSM);
+
+    auto const* topkPtr = static_cast<int32_t const*>(topkIds.rawPointer());
+    auto const* sfPtrFwd = static_cast<float const*>(expertGlobalSF.rawPointer());
+    auto* fp4Ptr = static_cast<uint32_t*>(outputFP4.rawPointer());
+    auto* sfPtr = static_cast<uint8_t*>(outputSF.rawPointer());
+
+    if (input.getDataType() == nvinfer1::DataType::kBF16)
+    {
+        quantizeRoutedToFp4LinearSfKernel<__nv_bfloat16><<<gridSize, blockSize, 0, stream>>>(static_cast<int32_t>(M),
+            static_cast<int32_t>(topK), static_cast<int32_t>(N), static_cast<__nv_bfloat16 const*>(input.rawPointer()),
+            topkPtr, sfPtrFwd, fp4Ptr, sfPtr);
+    }
+    else if (input.getDataType() == nvinfer1::DataType::kHALF)
+    {
+        quantizeRoutedToFp4LinearSfKernel<__half><<<gridSize, blockSize, 0, stream>>>(static_cast<int32_t>(M),
+            static_cast<int32_t>(topK), static_cast<int32_t>(N), static_cast<__half const*>(input.rawPointer()),
+            topkPtr, sfPtrFwd, fp4Ptr, sfPtr);
+    }
+    else
+    {
+        throw std::runtime_error("fp4QuantizeRoutedLinearSF: unsupported input data type (expected kBF16 or kHALF).");
+    }
+}
+
+void fp4BuildLayoutAndQuantizeRoutedLinearSFDecode(rt::Tensor const& input, rt::Tensor const& topkIds,
+    rt::Tensor const& expertGlobalSF, MoELayoutBuffers& layoutBuffers, rt::Tensor& outputFP4, rt::Tensor& outputSF,
+    int32_t localNumExperts, int32_t tileSize, cudaStream_t stream)
+{
+    int64_t const M = input.getShape()[0];
+    int64_t const N = input.getShape()[1];
+    int64_t const topK = topkIds.getShape()[1];
+    if (M != 1)
+    {
+        throw std::runtime_error("fp4BuildLayoutAndQuantizeRoutedLinearSFDecode: input M must be 1.");
+    }
+    if (topK <= 0 || topK > kMaxDecodeExperts)
+    {
+        throw std::runtime_error(
+            "fp4BuildLayoutAndQuantizeRoutedLinearSFDecode: topK must be in (0, kMaxDecodeExperts].");
+    }
+    if (localNumExperts <= 0 || localNumExperts > kMaxDecodeExperts)
+    {
+        throw std::runtime_error(
+            "fp4BuildLayoutAndQuantizeRoutedLinearSFDecode: localNumExperts must be in (0, kMaxDecodeExperts].");
+    }
+    if (tileSize <= 0)
+    {
+        throw std::runtime_error("fp4BuildLayoutAndQuantizeRoutedLinearSFDecode: tileSize must be positive.");
+    }
+    if (N <= 0 || N % kSfVecSize != 0)
+    {
+        throw std::runtime_error(
+            "fp4BuildLayoutAndQuantizeRoutedLinearSFDecode: input N must be a positive multiple of 16.");
+    }
+    if (layoutBuffers.tileIdxToGroupIdx.getShape()[0] < topK || layoutBuffers.tileIdxToMnLimit.getShape()[0] < topK
+        || layoutBuffers.permutedIdxToExpandedIdx.getShape()[0] < topK * tileSize)
+    {
+        throw std::runtime_error("fp4BuildLayoutAndQuantizeRoutedLinearSFDecode: layout buffers are too small.");
+    }
+
+    int const numColThreads = static_cast<int>(N) / kEltsPerThread;
+    int const blockSize = std::min(numColThreads, 512);
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    int smCount = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, device));
+    int const numBlocksPerSM = std::max(1, kMaxResidentThreadsPerSm / blockSize);
+    int const quantGridSize = std::min(static_cast<int>(topK), smCount * numBlocksPerSM);
+    int const gridSize = quantGridSize + 1;
+
+    auto const* topkPtr = static_cast<int32_t const*>(topkIds.rawPointer());
+    auto const* sfPtrFwd = static_cast<float const*>(expertGlobalSF.rawPointer());
+    auto* fp4Ptr = static_cast<uint32_t*>(outputFP4.rawPointer());
+    auto* sfPtr = static_cast<uint8_t*>(outputSF.rawPointer());
+    auto* tileGroupPtr = layoutBuffers.tileIdxToGroupIdx.dataPointer<int32_t>();
+    auto* tileLimitPtr = layoutBuffers.tileIdxToMnLimit.dataPointer<int32_t>();
+    auto* permutedPtr = layoutBuffers.permutedIdxToExpandedIdx.dataPointer<int32_t>();
+    auto* numTilesPtr = layoutBuffers.numNonExitingTiles.dataPointer<int32_t>();
+
+    if (input.getDataType() == nvinfer1::DataType::kBF16)
+    {
+        buildLayoutAndQuantizeRoutedToFp4LinearSfDecodeKernel<__nv_bfloat16>
+            <<<gridSize, blockSize, 0, stream>>>(static_cast<int32_t>(topK), static_cast<int32_t>(N), localNumExperts,
+                tileSize, static_cast<__nv_bfloat16 const*>(input.rawPointer()), topkPtr, sfPtrFwd, permutedPtr,
+                tileGroupPtr, tileLimitPtr, numTilesPtr, fp4Ptr, sfPtr);
+    }
+    else if (input.getDataType() == nvinfer1::DataType::kHALF)
+    {
+        buildLayoutAndQuantizeRoutedToFp4LinearSfDecodeKernel<__half>
+            <<<gridSize, blockSize, 0, stream>>>(static_cast<int32_t>(topK), static_cast<int32_t>(N), localNumExperts,
+                tileSize, static_cast<__half const*>(input.rawPointer()), topkPtr, sfPtrFwd, permutedPtr, tileGroupPtr,
+                tileLimitPtr, numTilesPtr, fp4Ptr, sfPtr);
+    }
+    else
+    {
+        throw std::runtime_error(
+            "fp4BuildLayoutAndQuantizeRoutedLinearSFDecode: unsupported input data type (expected kBF16 or kHALF).");
+    }
+}
+
 #else // !SUPPORTS_FP8
 
 void fp4Quantize(rt::Tensor const& /*input*/, rt::Tensor const& /*globalSF*/, rt::Tensor& /*outputFP4*/,
     rt::Tensor& /*outputSF*/, cudaStream_t /*stream*/)
+{
+    throw std::runtime_error(
+        "FP4 quantize emits FP8 E4M3 scale factors but CUDA_VERSION < 11080 (cuda_fp8.h unavailable).");
+}
+
+void fp4QuantizeLinearSF(rt::Tensor const& /*input*/, rt::Tensor const& /*globalSF*/, rt::Tensor& /*outputFP4*/,
+    rt::Tensor& /*outputSF*/, cudaStream_t /*stream*/)
+{
+    throw std::runtime_error(
+        "FP4 quantize emits FP8 E4M3 scale factors but CUDA_VERSION < 11080 (cuda_fp8.h unavailable).");
+}
+
+void fp4QuantizeRoutedLinearSF(rt::Tensor const& /*input*/, rt::Tensor const& /*topkIds*/,
+    rt::Tensor const& /*expertGlobalSF*/, rt::Tensor& /*outputFP4*/, rt::Tensor& /*outputSF*/, cudaStream_t /*stream*/)
+{
+    throw std::runtime_error(
+        "FP4 quantize emits FP8 E4M3 scale factors but CUDA_VERSION < 11080 (cuda_fp8.h unavailable).");
+}
+
+void fp4BuildLayoutAndQuantizeRoutedLinearSFDecode(rt::Tensor const& /*input*/, rt::Tensor const& /*topkIds*/,
+    rt::Tensor const& /*expertGlobalSF*/, MoELayoutBuffers& /*layoutBuffers*/, rt::Tensor& /*outputFP4*/,
+    rt::Tensor& /*outputSF*/, int32_t /*localNumExperts*/, int32_t /*tileSize*/, cudaStream_t /*stream*/)
 {
     throw std::runtime_error(
         "FP4 quantize emits FP8 E4M3 scale factors but CUDA_VERSION < 11080 (cuda_fp8.h unavailable).");

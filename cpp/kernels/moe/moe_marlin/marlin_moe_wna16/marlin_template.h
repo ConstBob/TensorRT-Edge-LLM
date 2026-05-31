@@ -50,9 +50,9 @@
 #include "../marlin/marlin.cuh"
 #include "../marlin/marlin_dtypes.cuh"
 #include "../marlin/marlin_mma.h"
+#include "../marlin/nvfp4_dequant.cuh"
 #include "../marlin/scalar_type.hpp"
 #include "common/cudaMacros.h"
-#include "kernels/moe/nvf4_w4an/nvfp4_dequant.cuh"
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)                                                                      \
     static_assert(std::is_same<scalar_t, half>::value || std::is_same<scalar_t, nv_bfloat16>::value,                   \

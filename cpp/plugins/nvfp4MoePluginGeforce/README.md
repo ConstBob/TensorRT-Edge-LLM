@@ -4,9 +4,22 @@ TensorRT plugin that wraps the fused NVFP4 MoE kernel in
 [`kernelSrcs/nvfp4_fused_moe_cutedsl/`](../../../kernelSrcs/nvfp4_fused_moe_cutedsl/)
 (CuTeDSL SM120 / SM121, decode + prefill backends).
 
-This plugin is an **additive** counterpart of the Marlin-based
-[`Nvfp4MoePlugin`](../nvfp4MoePlugin/nvfp4MoePlugin.cpp); it does not
-replace it. Pick one or the other at ONNX-build time.
+This plugin is the **SM12x (consumer Blackwell)** counterpart of
+[`Nvfp4MoePlugin`](../nvfp4MoePlugin/nvfp4MoePlugin.cpp), which targets
+**SM110 (Thor)** via the split FC1/FC2 backend.
+
+The two plugins share the same 11-input / 1-output ONNX surface and
+attribute set, but consume **different on-disk weight layouts**:
+
+* `NvFP4MoEPluginGeforce` expects FC1 packed as the plain
+  ``[up_all, gate_all]`` concat along the M axis (the layout the SM12x
+  fused CuTeDSL kernel reads natively).
+* `Nvfp4MoePlugin` expects FC1 packed as the 64-row up/gate interleave
+  ``[up_chunk(64), gate_chunk(64), up_chunk(64), ...]`` (the layout the
+  SM110 split FC1 kernel reads natively).
+
+The Python export side picks the plugin and the matching weight repack
+based on the target arch.
 
 ## Supported shapes
 
@@ -37,6 +50,7 @@ polymorphism but should be accuracy-checked before production use.
 |---|---|
 | `io_dtype` | FP16 |
 | `activation_type` | identity, silu, swiglu, gelu, relu2 |
+| `routing_mode` | 0=softmax top-k (Qwen3), 1=sigmoid grouped top-k (Nemotron-H) |
 | `backend` | decode + prefill (`auto` picks decode when `num_tokens*top_k <= 640` else prefill; mirrors `select_sm120_moe_backend`) |
 | `hidden_size` (H) | positive multiple of `kHiddenSizeAlignment` (= 256 = `kCuteDslTileK * kStaticAbStage`) |
 | `moe_inter_size` (I) | `I > 0`, `I % kLevelTileN == 0` (128) |
@@ -73,20 +87,22 @@ difference is purely the per-enqueue execution pattern:
 
 ## ONNX input surface
 
-10 inputs, 1 output:
+11 inputs, 1 output (identical layout to `Nvfp4MoePlugin`; only the
+plugin layer name and the FC1 packing convention differ):
 
 ```
 router_logits      fp32    [T, E]         # pre-softmax; plugin applies moeTopkSoftmax
 hidden_states      fp16    [B, S, H]      # per-token NVFP4 quant done inside the kernel
-fc1_qweights       int8    [E, N1, H/2]   # N1 = 2*I (swiglu) or I (identity)
+fc1_qweights       int8    [E, N1, H/2]   # N1 = 2*I (swiglu) or I (identity); plain [up,gate] concat
 fc1_blocks_scale   int8    [E, m_tiles_1, k_tiles_1, 32, 4, 4]
 fc1_alpha          fp32    [E]
 fc2_qweights       int8    [E, H, I/2]
 fc2_blocks_scale   int8    [E, m_tiles_2, k_tiles_2, 32, 4, 4]
 fc2_alpha          fp32    [E]
-input_global_scale fp32    [E]
-down_input_scale   fp32    [E]
--> output          fp16    [B, S, H]
+input_global_scale       fp32    [E]
+down_input_scale         fp32    [E]
+e_score_correction_bias  fp32    [E]     # router correction bias; zeros for softmax-topk
+-> output                fp16    [B, S, H]
 ```
 
 Block scales use the contiguous physical CuTeDSL NVFP4 layout
@@ -139,13 +155,14 @@ and rebuild.
 
 ## Validation
 
-There is no active Python unit-test entry for this plugin. Avoid validating
-production routing by instantiating Python-only helper modules directly; model
+There is no active Python unit-test entry for this plugin. Model
 integration should be tested at the export path that explicitly emits
-`NvFP4MoEPluginGeforce`.
+`NvFP4MoEPluginGeforce` for an SM12x target.
 
-### Thor sign-off checklist (runner-test equivalent)
+### SM12x sign-off checklist (runner-test equivalent)
 
-1. `mount-thor-sshfs` the workspace onto Thor.
-2. `python kernelSrcs/build_cutedsl.py --kernels nvfp4_fused_moe --gpu_arch sm_121`
-3. `build-edge-llm-package` with `-DENABLE_CUTE_DSL=nvfp4_fused_moe`.
+1. `python kernelSrcs/build_cutedsl.py --kernels nvfp4_fused_moe --gpu_arch sm_121`
+2. Build the plugin with `-DENABLE_CUTE_DSL=nvfp4_fused_moe`.
+3. Run the full export → engine build → inference pipeline on a sm_120 /
+   sm_121 host and verify the engine layer name binds to
+   `NvFP4MoEPluginGeforce` (e.g. via `trtexec --dumpProfile`).

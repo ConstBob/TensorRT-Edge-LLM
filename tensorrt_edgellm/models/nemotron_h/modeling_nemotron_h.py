@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -60,9 +60,16 @@ import torch.nn.functional as F
 from ...config import (LAYER_ATTN, LAYER_MAMBA, LAYER_MLP, LAYER_MOE,
                        MambaConfig, ModelConfig)
 from ..default.modeling_default import OnnxSpec
-from ..linear import FP16Linear, is_nvfp4_linear, make_linear
+from ..linear import FP16Linear, make_linear
 from ..ops import (attention_plugin, causal_conv1d, nvfp4_moe_plugin,
-                   update_ssm_state)
+                   nvfp4_moe_plugin_geforce, update_ssm_state,
+                   use_geforce_nvfp4_moe)
+
+_NVFP4_ACTIVATION_RELU2 = 4
+_NVFP4_ROUTING_MODE_SIGMOID_GROUP_TOPK = 1
+_NVFP4_MOE_BACKEND_AUTO = 0
+_NVFP4_MOE_IO_DTYPE_FP16 = 1
+_NVFP4_MOE_MAX_ROUTED_ROWS_AUTO = 0
 
 
 class RMSNorm(nn.Module):
@@ -421,15 +428,14 @@ class NemotronHTopkRouter(nn.Module):
 
 
 class NemotronHMoEMLP(nn.Module):
-    """Mixture-of-Experts MLP for NemotronH using Nvfp4MoePlugin.
+    """Mixture-of-Experts MLP for NemotronH using the configured NVFP4 MoE plugin.
 
     Named ``mixer`` inside :class:`NemotronHDecoderLayer` to match checkpoint
     key prefix ``backbone.layers.N.mixer.*``.
 
-    The routed experts are handled by the ``trt_edgellm::Nvfp4MoePlugin``
-    custom op which takes stacked NVFP4 weights + router logits and performs
-    top-k routing + W4A16 GEMV internally.  The shared expert runs as a
-    separate FP8/FP16 forward pass added to the plugin output.
+    The routed experts dispatch through ``trt_edgellm::Nvfp4MoePlugin``.
+    The shared expert runs as a separate FP8/FP16 forward pass added to the
+    plugin output.
 
     Submodule names match checkpoint keys:
         gate                     - NemotronHTopkRouter (weight + bias)
@@ -445,6 +451,19 @@ class NemotronHMoEMLP(nn.Module):
         self.num_experts_per_tok = config.num_experts_per_tok
         self.hidden_size = config.hidden_size
         self.moe_intermediate_size = config.moe_intermediate_size
+        self.group_size = config.quant.group_size
+        self.activation_type = _NVFP4_ACTIVATION_RELU2
+        self.backend = _NVFP4_MOE_BACKEND_AUTO
+        self.io_dtype = _NVFP4_MOE_IO_DTYPE_FP16
+        self.max_routed_rows = _NVFP4_MOE_MAX_ROUTED_ROWS_AUTO
+        self._padded_moe_intermediate_size = self.moe_intermediate_size
+        # SM12x NvFP4MoEPluginGeforce additionally requires H % 256 == 0
+        # (kCuteDslTileK * kStaticAbStage). For checkpoints whose hidden_size
+        # does not satisfy that (e.g. Nemotron-Nano H=2688), ``_prepare_for_export_impl``
+        # picks ``hidden_size_alignment=256`` so the FC1 K and FC2 M axes get
+        # zero-padded; ``forward`` then F.pads hidden_states and slices the
+        # plugin output. SM110 keeps the original H.
+        self._padded_hidden_size = self.hidden_size
         self.gate = NemotronHTopkRouter(config)
 
         self.experts = nn.ModuleList([
@@ -481,131 +500,112 @@ class NemotronHMoEMLP(nn.Module):
         return expert.down_proj(r * r)
 
     def prepare_for_export(self) -> None:
-        """Pack ModelOpt NVFP4 expert tensors to plugin layout.
+        """Pack ModelOpt NVFP4 expert tensors for ``Nvfp4MoePlugin``."""
+        self._prepare_for_export_impl()
 
-        ``Nvfp4MoePlugin`` expects N-major byte payloads + an atom-swizzled
-        prefill SFB + a Marlin-FP16-top-8-bit-projected decode SFB. Stacked
-        per-expert so TRT sees direct initializer→plugin edges.
+    def _prepare_for_export_impl(self) -> None:
+        """Pack ModelOpt NVFP4 expert tensors for the active NVFP4 MoE plugin."""
+        from ...checkpoint.repacking import repack_nvfp4_nemotron_moe_experts
 
-        **All buffers are raw-aligned with vLLM**: the checkpoint's FP4 weight
-        nibbles, FP8-E4M3 block scales, and scalar ``weight_scale_2`` are
-        preserved bit-exact — only the on-device layouts change. Specifically:
+        # SM12x NvFP4MoEPluginGeforce requires H % 256 == 0; SM110 only needs
+        # the kernel's regular alignment (the repack helper accepts H as-is
+        # when ``hidden_size_alignment=1``).
+        hidden_size_alignment = 256 if use_geforce_nvfp4_moe() else 1
 
-        * ``_stacked_*_weights`` — FP4 nibble transpose (K-major→N-major).
-        * ``_stacked_*_block_scale`` — checkpoint FP8 bytes atom-swizzled (128×4).
-        * ``_stacked_*_block_scale_decode`` — checkpoint FP8 bytes Marlin-
-          projected (top-8-bits of FP16 representation).
-        * ``_stacked_*_global_scale`` — per-expert raw ``weight_scale_2``.
+        (fc1_qweights, fc1_blocks_scale, fc1_alpha, fc2_qweights,
+         fc2_blocks_scale, fc2_alpha, padded_inter_size,
+         padded_hidden_size) = (repack_nvfp4_nemotron_moe_experts(
+             self.experts,
+             self.hidden_size,
+             self.moe_intermediate_size,
+             self.group_size,
+             hidden_size_alignment=hidden_size_alignment,
+         ))
+        self._padded_moe_intermediate_size = padded_inter_size
+        self._padded_hidden_size = padded_hidden_size
 
-        With this, both paths use the **same** per-expert global scale and the
-        FP4 × SFB × global_scale product recovers the checkpoint dense
-        bit-exact in prefill and approximately (Marlin-projection loss only)
-        in decode.
-
-        **Activation global scale** (``_hidden_act_input_scale``) follows the
-        plugin's forward-direction convention (``fp4Quantize.cu:212``: *callers
-        pass the forward global SF (e.g. max|x|/(448*6)); the kernel computes
-        its reciprocal internally*). The checkpoint's ``NVFP4Linear.input_scale``
-        already equals ``amax / (6 * 448)`` (see ``models/linear.py:185``), so we
-        pass the per-layer max raw — no ``/6`` adjustment. This matches both
-        :meth:`Nvfp4MoePlugin.populate_hidden_global_scales` and vLLM's
-        ``input_global_scale`` handling.
-        """
-        from ...checkpoint.repacking import (
-            repack_nvfp4_expert_down_prefill_raw,
-            repack_nvfp4_expert_up_prefill_raw)
-
-        H = self.hidden_size
-        I = self.moe_intermediate_size
-
-        up_ws, up_scs, up_scs_dec, up_gs = [], [], [], []
-        dn_ws, dn_scs, dn_scs_dec, dn_gs = [], [], [], []
-        for expert in self.experts:
-            up = expert.up_proj
-            dn = expert.down_proj
-            assert is_nvfp4_linear(up) and is_nvfp4_linear(dn), (
-                "MoE experts must be NVFP4-quantized")
-
-            up_w, up_sc, up_sc_dec, up_gl = repack_nvfp4_expert_up_prefill_raw(
-                up.weight, up.weight_scale, up.weight_scale_2, H, I)
-            if up_w.shape != (H, I // 2):
-                raise ValueError(
-                    f"up weight shape {up_w.shape} != ({H}, {I // 2})")
-            dn_w, dn_sc, dn_sc_dec, dn_gl = (
-                repack_nvfp4_expert_down_prefill_raw(dn.weight,
-                                                     dn.weight_scale,
-                                                     dn.weight_scale_2, H, I))
-            if dn_w.shape != (I, H // 2):
-                raise ValueError(
-                    f"down weight shape {dn_w.shape} != ({I}, {H // 2})")
-
-            up_ws.append(torch.as_tensor(up_w))
-            up_scs.append(torch.as_tensor(up_sc))
-            up_scs_dec.append(torch.as_tensor(up_sc_dec))
-            up_gs.append(up_gl)
-            dn_ws.append(torch.as_tensor(dn_w))
-            dn_scs.append(torch.as_tensor(dn_sc))
-            dn_scs_dec.append(torch.as_tensor(dn_sc_dec))
-            dn_gs.append(dn_gl)
-
-        self.register_buffer("_stacked_up_weights", torch.stack(up_ws))
-        self.register_buffer("_stacked_up_block_scale", torch.stack(up_scs))
-        self.register_buffer("_stacked_up_block_scale_decode",
-                             torch.stack(up_scs_dec))
-        self.register_buffer("_stacked_up_global_scale",
-                             torch.tensor(up_gs, dtype=torch.float32))
-        self.register_buffer("_stacked_down_weights", torch.stack(dn_ws))
-        self.register_buffer("_stacked_down_block_scale", torch.stack(dn_scs))
-        self.register_buffer("_stacked_down_block_scale_decode",
-                             torch.stack(dn_scs_dec))
-        self.register_buffer("_stacked_down_global_scale",
-                             torch.tensor(dn_gs, dtype=torch.float32))
+        device = self.gate.weight.device
+        self.register_buffer("fc1_qweights",
+                             fc1_qweights.to(device).contiguous())
+        self.register_buffer("fc1_blocks_scale",
+                             fc1_blocks_scale.to(device).contiguous())
+        self.register_buffer("fc2_qweights",
+                             fc2_qweights.to(device).contiguous())
+        self.register_buffer("fc2_blocks_scale",
+                             fc2_blocks_scale.to(device).contiguous())
+        self.register_buffer("fc1_alpha", fc1_alpha.to(device).contiguous())
+        self.register_buffer("fc2_alpha", fc2_alpha.to(device).contiguous())
+        self.register_buffer(
+            "input_global_scale",
+            torch.ones(self.n_routed_experts,
+                       dtype=torch.float32,
+                       device=device))
+        self.register_buffer(
+            "down_input_scale",
+            torch.ones(self.n_routed_experts,
+                       dtype=torch.float32,
+                       device=device))
         self.register_buffer(
             "_e_score_correction_bias_fp32",
-            self.gate.e_score_correction_bias.data.clone().to(torch.float32))
-        # Forward-direction convention — see method docstring.
-        fc1_scale = max(
-            float(e.up_proj.input_scale.detach().float().max().item())
-            for e in self.experts)
-        fc2_scale = max(
-            float(e.down_proj.input_scale.detach().float().max().item())
-            for e in self.experts)
-        self.register_buffer(
-            "_hidden_act_input_scale",
-            torch.tensor([fc1_scale, fc2_scale], dtype=torch.float32))
+            self.gate.e_score_correction_bias.data.clone().to(
+                torch.float32).to(device))
         self._export_ready = True
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch, seq_len, _ = hidden_states.shape
-        # Router logits: [batch*seq, E] FP32 (plugin expects FP32 input)
+        # Router logits: [batch*seq, E] FP32 (plugin expects FP32 input).
+        # Routing uses the unpadded hidden state because the router gate
+        # weight is shaped [E, hidden_size].
         router_logits = F.linear(hidden_states.view(-1, self.hidden_size),
                                  self.gate.weight).float()
 
-        moe_out = nvfp4_moe_plugin(
+        # SM12x NvFP4MoEPluginGeforce requires the plugin hidden_size to be a
+        # multiple of 256. When the checkpoint H does not satisfy that,
+        # ``_prepare_for_export_impl`` zero-pads FC1 K / FC2 M and sets
+        # ``self._padded_hidden_size``; we F.pad the hidden activations here
+        # and slice the plugin output back. relu2(0) = 0 keeps the padded
+        # FC1 outputs zero; the FC2 contribution to the padded H slots is
+        # therefore zero too. The shared expert path uses the original H.
+        plugin_hidden = hidden_states
+        if self._padded_hidden_size != self.hidden_size:
+            plugin_hidden = F.pad(
+                hidden_states,
+                (0, self._padded_hidden_size - self.hidden_size))
+
+        # Nemotron-H uses ReLU2 (non-gated) FC1, so the up-only weight tensor
+        # has the same row layout under both plugins; only the plugin op name
+        # differs between SM110 ``Nvfp4MoePlugin`` and SM12x
+        # ``NvFP4MoEPluginGeforce``.
+        moe_op = (nvfp4_moe_plugin_geforce
+                  if use_geforce_nvfp4_moe() else nvfp4_moe_plugin)
+        moe_out = moe_op(
             router_logits,
-            hidden_states,
-            self._hidden_act_input_scale,
-            self._stacked_up_weights,
-            self._stacked_up_block_scale,
-            self._stacked_up_global_scale,
-            self._stacked_down_weights,
-            self._stacked_down_block_scale,
-            self._stacked_down_global_scale,
-            self._stacked_up_block_scale_decode,
-            self._stacked_down_block_scale_decode,
+            plugin_hidden,
+            self.fc1_qweights,
+            self.fc1_blocks_scale,
+            self.fc1_alpha,
+            self.fc2_qweights,
+            self.fc2_blocks_scale,
+            self.fc2_alpha,
+            self.input_global_scale,
+            self.down_input_scale,
             self._e_score_correction_bias_fp32,
-            num_experts=self.n_routed_experts,
-            top_k=self.num_experts_per_tok,
-            hidden_size=self.hidden_size,
-            moe_inter_size=self.moe_intermediate_size,
-            activation_type=0,  # 0 = ReLU²
-            n_group=self.gate.n_group,
-            topk_group=self.gate.topk_group,
-            norm_topk_prob=int(bool(self.gate.norm_topk_prob)),
-            routed_scaling_factor=float(self.gate.routed_scaling_factor),
-            # NemotronH always drives the sigmoid + grouped top-k routing kernel (routing_mode=1).
-            routing_mode=1,
+            self.n_routed_experts,
+            self.num_experts_per_tok,
+            self._padded_hidden_size,
+            self._padded_moe_intermediate_size,
+            self.activation_type,
+            self.gate.n_group,
+            self.gate.topk_group,
+            int(bool(self.gate.norm_topk_prob)),
+            float(self.gate.routed_scaling_factor),
+            _NVFP4_ROUTING_MODE_SIGMOID_GROUP_TOPK,
+            self.backend,
+            self.io_dtype,
+            self.max_routed_rows,
         )
+        if self._padded_hidden_size != self.hidden_size:
+            moe_out = moe_out[..., :self.hidden_size]
 
         return moe_out + self._expert_forward(self.shared_experts,
                                               hidden_states)

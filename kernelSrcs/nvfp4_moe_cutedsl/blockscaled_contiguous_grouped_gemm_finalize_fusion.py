@@ -26,7 +26,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-from typing import Tuple, Type, Union
+from typing import Optional, Tuple, Type, Union
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -37,7 +37,8 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from utils import (
+from cute_utils import (
+    EDGELLM_ENABLE_PDL,
     atomic_add_func,
     blk_reduce_bf16,
     blk_reduce_fp16,
@@ -45,72 +46,133 @@ from utils import (
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
     is_power_of_2,
-    ldmatrix_m16n16_trans_b8,
-    st_shared_b16,
     vectorized_atomic_add_bf16x8,
-    vectorized_atomic_add_fp16x8,
     vectorized_atomic_add_fp32x2,
 )
 
 """
-Blackwell MoE FC2 finalize kernel: N-major weights with in-flight SMEM nibble transpose.
+High-performance persistent blockscaled contiguous grouped dense GEMM (C = alpha * (SFA * A) * (SFB * B)) example for
+the NVIDIA Blackwell architecture using CUTE DSL.
+- Matrix A is MxKx1, A can be row-major("K"), ValidM is composed of valid m in different groups
+- Matrix B is NxKxL, B can be column-major("K"), L is grouped dimension
+- Matrix C is SxNX1, C can be row-major("N"), ValidM is composed of valid m in different groups
+- Matrix SFA layout is filled internally according to A shape and BlockScaledBasicChunk, which has
+  M x ceil_div(K, sf_vec_size) x L elements respectively
+- Matrix SFB layout is filled internally according to B shape and BlockScaledBasicChunk, which has
+  N x ceil_div(K, sf_vec_size) x L elements respectively
 
-This is a fork of ``blockscaled_contiguous_grouped_gemm_finalize.py``. The goal is
-to accept FC2 weights stored in **N-major** layout on disk/device (the layout
-consumed by the Marlin-style decode GEMV), so that the same weight buffer can
-serve both the prefill finalize GEMM and the decode GEMV with a single copy.
+Matrix A/C Memory Layout Diagrams:
 
-FP4 ``tcgen05.mma`` only supports K-major B (confirmed by
-``tests/gpu/smoke_mn_major_b_fp4.py``), so the N-major layout has to be
-transposed to K-major *inside* the kernel before the MMA consumes it. The
-kernel grows from 7 to 8 warps:
+   ```
+    Group 0    Group 1   Group 2
+   -+---------+---------+---------+
+    |         |         |         |
+   K| ValidM0 | ValidM1 | ValidM2 |
+    |         |         |         |
+   -+---------+---------+---------+
+    |<-        ValidM           ->|
+   ```
+   Note: the Group(L) dimension will be flatted into M dimension, and the rest Group(L) size is 1.
+         each ValidM will be aligned to 256 or 128. The alignment is determined by the mma_tiler_mn parameter.
+         For NVFP4, 2CTA, the alignment is 256. For NVFP4, 1CTA, the alignment is 128.
 
-  warp 0-3  epilogue (scatter-reduce)  (unchanged)
-  warp 4    MMA tcgen05.mma            (unchanged - reads K-major sB)
-  warp 5    TMA loads A / SFA / SFB / B_raw
-  warp 6    scheduler                  (unchanged)
-  warp 7    transpose                  (new - repacks sB_raw -> sB nibbles)
+This GEMM kernel supports the following features:
+    - Utilizes Tensor Memory Access (TMA) for efficient memory operations
+    - Utilizes Blackwell's tcgen05.mma for matrix multiply-accumulate (MMA) operations
+    - Implements TMA multicast with cluster to reduce L2 memory traffic
+    - Support persistent tile scheduling to better overlap memory load/store with mma between tiles
+    - Support warp specialization to avoid explicit pipelining between mainloop load and mma
 
-Matrix layout:
-  - A      : MxKx1, row-major("K"), ValidM is composed of valid m across groups
-  - B      : (N, K, L) logical shape but **N-major** (N innermost) on device
-  - C (out): SxNx1, row-major("N"), output after scatter-reduce
-  - SFB    : prefill-friendly atom-swizzle copy (M=N, K=K/16)
+This GEMM works as follows:
+1. DMA warp: Load A and B matrices from global memory (GMEM) to shared memory (SMEM) using TMA operations.
+2. SCALE warp: Load scaleA and scaleB matrices from global memory (GMEM) to shared memory (SMEM) using non-TMA
+   operations.
+2. MMA warp:
+    - Load scale factor A/B from shared memory (SMEM) to tensor memory (TMEM) using tcgen05.cp instruction.
+    - Perform matrix multiply-accumulate (MMA) operations using tcgen05.mma instruction.
+3. EPILOGUE warp (with Fused Finalize for MoE):
+    - Load completed accumulator from tensor memory (TMEM) to registers (RMEM) using tcgen05.ld.
+    - Apply alpha scaling: acc_scaled = alpha * acc
+    - **Fused Finalize Logic**:
+      a) Use permuted_idx_to_expanded_idx to map from permuted row to token/topk indices
+      b) Load router_scale directly from global memory to register (no shared memory)
+      c) Apply router_scale: Final = router_scale * acc_scaled
+    - Type convert Final matrix to output type.
+    - Store C matrix from registers (RMEM) to shared memory (SMEM) to global memory (GMEM) with TMA operations.
 
-Other semantics (scatter-reduce epilogue, per-expert alpha, per-token router
-scales, determinism, StaticPersistentTileScheduler + runtime tile-info lookup)
-are identical to the K-major kernel. See
-``docs/nvfp4_prefill_n_major_weights_design.md`` for the design, §4 for the
-warp topology and §5 for the transpose primitive.
+SM100 tcgen05.mma.kind.block_scale instructions operate as follows:
+- Read matrix A from SMEM
+- Read matrix B from SMEM
+- Read scalefactor A from TMEM
+- Read scalefactor B from TMEM
+- Write accumulator to TMEM
+The accumulator in TMEM must then be loaded to registers before writing back to GMEM.
+
+.. code-block:: bash
+
+    python blackwell/blockscaled_contiguous_grouped_gemm_finalize_fusion.py         \
+      --ab_dtype Float4E2M1FN --out_dtype BFloat16         \
+      --sf_dtype Float8E4M3FN --sf_vec_size 16                                   \
+      --mma_tiler_mn 256,128 --cluster_shape_mn 2,1                             \
+      --benchmark 1024x7168x2048x64
+
+To collect performance with NCU profiler:
+
+.. code-block:: bash
+
+    ncu python blackwell/blockscaled_contiguous_grouped_gemm_finalize_fusion.py        \\     \
+      --ab_dtype Float4E2M1FN --out_dtype BFloat16           \
+      --sf_dtype Float8E4M3FN --sf_vec_size 16                                   \
+      --mma_tiler_mn 256,128 --cluster_shape_mn 2,1                             \
+      --benchmark [80,120,160]x7168x2048x64
+
+Constraints:
+* Supported input data types: mxf8, mxf4, nvf4
+  see detailed valid dtype combinations in below Sm100BlockScaledPersistentDenseGemmKernel class documentation
+* A/B tensor must have the same data type, mixed data type is not supported (e.g., mxf8 x mxf4)
+* Mma tiler M must be 128 or 256(use_2cta_instrs)
+* Mma tiler N must be 64/128/192/256
+* Cluster shape M/N must be positive and power of 2, total cluster size <= 16
+* Cluster shape M must be multiple of 2 if Mma tiler M is 256(use_2cta_instrs)
+* The contiguous dimension of A/B/C tensors must be at least 16 bytes aligned,
+  i.e, number of elements is a multiple of 16 and 32 for Float8 and Float4, respectively.
+
+CUDA Graph Support:
+* For CUDA graph support, the tile_idx_to_expert_idx, A/C matrices, and scale factor A can be padded to a larger size
+  (e.g., permuted_m = m*topK + num_local_experts*(256-1), example: 4096*8 + (256/32)*255 = 34808)
+* Use create_tensors() with permuted_m parameter to automatically pad:
+  - tile_idx_to_expert_idx: padded for invalid tiles
+  - A matrix: padded to permuted_m rows (padding rows contain dummy data)
+  - C matrix: padded to permuted_m rows (output buffer for cuda_graph)
+  - Scale factor A: padded to match A matrix dimensions
+* Kernel handling of padding (similar to masked_grouped_gemm.py):
+  - Scheduler warp checks if tile_idx >= num_non_exiting_tiles to exit
+  - Only valid tiles (tile_idx < num_non_exiting_tiles) are written to tile_info pipeline
+  - When no more valid tiles exist, outer loop exits and calls producer_tail()
+  - Consumer warps process only valid tiles from pipeline
+  - No deadlock or synchronization issues
+* Consumer warps check initial tile against num_non_exiting_tiles and set is_valid_tile=False if
+  tile_idx >= num_non_exiting_tiles
+* Only rows within (aligned_groupm[0]+aligned_groupm[1]+...) contain valid data
+* Padding rows in C matrix will not be written by the kernel
 """
 
 
-# The monkeypatch of PersistentTileSchedulerParams and StaticPersistentTileScheduler
-# that was here has been removed — nvidia-cutlass-dsl >= 4.4 ships the required
-# raster_along_m / FastDivmod support natively.
-
-
-class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
-    """Blackwell FC2 finalize kernel: blockscaled grouped GEMM with fused scatter-reduce.
-
-    Implements C = scatter_reduce(alpha * token_scale * (SFA * A) * (SFB * B)) for
-    the output projection (FC2) layer of Mixture-of-Experts blocks. The epilogue
-    fuses the permuted-to-token index mapping, router scale application, and
-    atomic scatter-reduce into the GEMM epilogue warps.
-
-    Only 1CTA mode (tile_size=128) and single B tensor are supported.
+class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
+    """This class implements batched matrix multiplication (C = A x SFA x B x SFB) with support for various data types
+    and architectural features specific to Blackwell GPUs with persistent tile scheduling and warp specialization.
 
     :param sf_vec_size: Scalefactor vector size.
     :type sf_vec_size: int
-    :param mma_tiler_mn: Shape of the Matrix Multiply-Accumulate (MMA) tile (M,N).
-        M must be 128.
+    :param mma_tiler_mn: Shape of the Matrix Multiply-Accumulate (MMA) tile (M,N)
     :type mma_tiler_mn: Tuple[int, int]
     :param cluster_shape_mn: Cluster dimensions (M,N) for parallel processing
     :type cluster_shape_mn: Tuple[int, int]
 
     :note: In current version, A and B tensor must have the same data type
+        - i.e., Float8E4M3FN for A and Float8E5M2 for B is not supported
 
-    :note: Supported combinations of A/B data types, SF data types and SF vector size:
+    :note: Supported combinations of A/B data types, SF data typs and SF vector size:
         - MXF8: A/B: Float8E5M2/Float8E4M3FN + SF: Float8E8M0FNU + sf_vec_size: 32
         - MXF4: A/B: Float4E2M1FN + SF: Float8E8M0FNU + sf_vec_size: 32
         - NVF4: A/B: Float4E2M1FN + SF: Float8E8M0FNU/Float8E4M3FN + sf_vec_size: 16
@@ -121,21 +183,26 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
     :note: Supported C data types:
         - Float32
         - Float16/BFloat16
+        - Float8E4M3FN/Float8E5M2
 
     :note: Constraints:
-        - MMA tiler M must be 128 (1CTA only)
+        - MMA tiler M must be 128 or 256 (use_2cta_instrs)
         - MMA tiler N must be 64/128/192/256
+        - Cluster shape M must be multiple of 2 if Mma tiler M is 256
         - Cluster shape M/N must be positive and power of 2, total cluster size <= 16
-        - Cluster shape M/N must be <= 4 for scale factor multicasts
+        - Also, Cluster shape M/N must be <= 4 for scale factor multicasts due to limited size of scale factors
 
     Example:
-        >>> gemm = BlockScaledContiguousGroupedGemmFinalizeNMajorKernel(
-        ...     sf_vec_size=16, mma_tiler_mn=(128, 128), cluster_shape_mn=(1, 1)
+        >>> gemm = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel(
+        ...     sf_vec_size=16, mma_tiler_mn=(256, 128), cluster_shape_mn=(2, 1)
         ... )
         >>> gemm(
         ...     a_tensor, b_tensor, sfa_tensor, sfb_tensor, out_tensor, max_active_clusters, stream
         ... )
     """
+
+    # Maximum number of B tensors supported
+    MAX_B_TENSORS = 4
 
     def __init__(
         self,
@@ -144,8 +211,9 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
         cluster_shape_mn: Tuple[int, int],
         use_blkred: bool = False,
         raster_along_m: bool = False,
+        b_tensor_l_sizes: Optional[Tuple[int, ...]] = None,
     ):
-        """Initializes the configuration for a Blackwell blockscaled grouped GEMM finalize kernel.
+        """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
 
         This configuration includes several key aspects:
 
@@ -155,24 +223,27 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
         2.  Cluster Shape:
             - cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster.
 
-        :param mma_tiler_mn: Tuple (M, N) shape of the MMA instruction. M must be 128.
+        :param mma_tiler_mn: Tuple (M, N) shape of the MMA instruction.
         :type mma_tiler_mn: Tuple[int, int]
         :param cluster_shape_mn: Tuple (ClusterM, ClusterN) shape of the cluster.
         :type cluster_shape_mn: Tuple[int, int]
         :param raster_along_m: Boolean, True to use raster along M.
         :type raster_along_m: bool
+        :param b_tensor_l_sizes: Optional tuple of L sizes for each B tensor.
+            E.g., (8, 8, 16) means 3 B tensors with L=8, 8, 16. Sum equals total L.
+            If None, single B tensor mode (backward compatible).
+        :type b_tensor_l_sizes: Optional[Tuple[int, ...]]
         """
 
         self.sf_vec_size = sf_vec_size
         self.acc_dtype = cutlass.Float32
-        # Only 1CTA mode (tile_size=128) is supported
-        self.use_2cta_instrs = False
+        self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
         self.raster_along_m = raster_along_m
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
 
-        self.cta_group = tcgen05.CtaGroup.ONE
+        self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
 
         # Block reduce configuration
         self.use_blkred = use_blkred
@@ -182,18 +253,6 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
         self.mma_warp_id = 4
         self.tma_warp_id = 5
         self.sched_warp_id = 6
-        # Transpose warps: N-major B_raw -> K-major sB nibble repack.
-        # With 4 warps × 32 lanes = 128 writer threads, each warp owns a
-        # contiguous 1/num_transpose_warps slice of the output bytes. This is
-        # free occupancy-wise (kernel is SMEM-limited to 1 block/SM already)
-        # and cuts the serial store latency proportionally.
-        self.num_transpose_warps = 4
-        self.transpose_warp_id_base = 7
-        self.transpose_warp_ids = tuple(
-            self.transpose_warp_id_base + i for i in range(self.num_transpose_warps)
-        )
-        # Back-compat alias (single-warp code reads self.transpose_warp_id).
-        self.transpose_warp_id = self.transpose_warp_id_base
         self.threads_per_warp = 32
         self.threads_per_cta = self.threads_per_warp * len(
             (
@@ -201,28 +260,18 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
                 self.mma_warp_id,
                 self.tma_warp_id,
                 self.sched_warp_id,
-                *self.transpose_warp_ids,
             )
         )
-        # Threads excluding the scheduler warp (consumers of the tile-info pipeline).
-        # Transpose warps also consume tile-info so they issue SMEM transposes per tile.
         self.threads_wo_sched = self.threads_per_warp * len(
             (
                 *self.epilog_warp_id,
                 self.mma_warp_id,
                 self.tma_warp_id,
-                *self.transpose_warp_ids,
             )
         )
         self.num_regs_uniform_warps = 64
         self.num_regs_sched_warps = 64
         self.num_regs_epilogue_warps = 216
-        # Transpose warps read/write SMEM only (no TMEM), but the ldmatrix +
-        # st.shared.b32 path keeps 2 u32 register results from ldmatrix plus
-        # 4 packed u16 outputs live per inner iteration, so bump the
-        # per-thread register budget from the TMA/sched default to avoid
-        # compiler spills (cf. FC1 N-major commit 3465358).
-        self.num_regs_transpose_warps = 128
 
         # Set barrier for cta sync, epilogue sync and tmem ptr sync
         self.cta_sync_barrier = pipeline.NamedBarrier(
@@ -241,20 +290,29 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
             barrier_id=4,
             num_threads=self.threads_per_warp,
         )
-        # Transpose-warp-group barrier. Used to fence reads of sB_raw across
-        # all transpose warps before warp 0 signals b_raw_pipeline that TMA
-        # can refill — otherwise TMA could overwrite sB_raw while later
-        # transpose warps are still reading it.
-        self.transpose_sync_barrier = pipeline.NamedBarrier(
-            barrier_id=5,
-            num_threads=self.threads_per_warp * self.num_transpose_warps,
-        )
         self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
         # TMEM offset for final accumulator
         self.tmem_final_offset = 384
 
-        # Single B tensor mode
-        self.num_b_tensors = 1
+        # Multi-B tensor configuration
+        if b_tensor_l_sizes is None:
+            self.num_b_tensors = 1
+            self.b_tensor_l_sizes = None
+            # Offsets padded for safe indexing in kernel
+            self.b_tensor_l_offsets = (0,) + (2**30,) * self.MAX_B_TENSORS
+        else:
+            assert len(b_tensor_l_sizes) <= self.MAX_B_TENSORS, (
+                f"Max {self.MAX_B_TENSORS} B tensors, got {len(b_tensor_l_sizes)}"
+            )
+            self.num_b_tensors = len(b_tensor_l_sizes)
+            self.b_tensor_l_sizes = b_tensor_l_sizes
+            offsets = [0]
+            for l_size in b_tensor_l_sizes:
+                offsets.append(offsets[-1] + l_size)
+            # Pad to MAX_B_TENSORS + 1 for safe indexing
+            while len(offsets) < self.MAX_B_TENSORS + 1:
+                offsets.append(2**30)
+            self.b_tensor_l_offsets = tuple(offsets)
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -276,7 +334,7 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
         )
         # (CTA_Tile_Shape_M, Round_Up(MMA_Tile_Shape_N, 128), MMA_Inst_Shape_K)
         self.mma_inst_shape_mn_sfb = (
-            self.mma_inst_shape_mn[0],
+            self.mma_inst_shape_mn[0] // (2 if self.use_2cta_instrs else 1),
             cute.round_up(self.mma_inst_shape_mn[1], 128),
         )
 
@@ -388,17 +446,6 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
             self.b_dtype,
             self.num_ab_stage,
         )
-        # N-major raw B buffer: TMA drops (N_TILE, K_TILE) tiles with N innermost.
-        # This is a plain unswizzled FP4 layout — the transpose warp will later
-        # repack its contents into ``b_smem_layout_staged`` (K-major, swizzled,
-        # MMA-ready). Stage count matches the K-major sB so the two pipelines
-        # stay symmetric.
-        n_tile = self.mma_tiler[1]
-        k_tile = self.mma_tiler[2]
-        self.b_raw_smem_layout_staged = cute.make_ordered_layout(
-            (n_tile, k_tile, self.num_ab_stage),
-            order=(0, 1, 2),
-        )
         self.sfa_smem_layout_staged = blockscaled_utils.make_smem_layout_sfa(
             tiled_mma,
             self.mma_tiler,
@@ -445,14 +492,15 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
     def __call__(
         self,
         a: cute.Tensor,
-        b: cute.Tensor,
+        b: Union[cute.Tensor, Tuple[cute.Tensor, ...]],
         out: cute.Tensor,
         sfa: cute.Tensor,
-        sfb: cute.Tensor,
+        sfb: Union[cute.Tensor, Tuple[cute.Tensor, ...]],
         tile_idx_to_expert_idx: cute.Tensor,
         num_non_exiting_tiles: cute.Tensor,
         tile_idx_to_mn_limit: cute.Tensor,
-        alpha: cute.Tensor,
+        alpha: Union[cute.Tensor, Tuple[cute.Tensor, ...]],
+        down_input_scale: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         permuted_idx_to_expanded_idx: cute.Tensor,
@@ -481,8 +529,10 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
         :type tile_idx_to_expert_idx: cute.Tensor
         :param num_non_exiting_tiles: Number of valid tiles (valid_m/cta_tile_m), shape (1,)
         :type num_non_exiting_tiles: cute.Tensor
-        :param alpha: Alpha tensor for each group, shape (L,)
-        :type alpha: cute.Tensor
+        :param alpha: Alpha tensor for each group
+        :type alpha: Union[cute.Tensor, Tuple[cute.Tensor, ...]]
+        :param down_input_scale: Per-expert FC2 activation global scale tensor
+        :type down_input_scale: cute.Tensor
         :param max_active_clusters: Maximum number of active clusters
         :type max_active_clusters: cutlass.Constexpr
         :param stream: CUDA stream for asynchronous execution
@@ -497,12 +547,16 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
         """
         # Setup static attributes before smem/grid/tma computation
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
-        self.b_dtype: Type[cutlass.Numeric] = b.element_type
+        # Handle tuple of B tensors
+        b_tuple = b if isinstance(b, tuple) else (b,)
+        sfb_tuple = sfb if isinstance(sfb, tuple) else (sfb,)
+        alpha_tuple = alpha if isinstance(alpha, tuple) else (alpha,)
+        self.b_dtype: Type[cutlass.Numeric] = b_tuple[0].element_type
         self.out_dtype: Type[cutlass.Numeric] = out.element_type
         self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
         self.final_scale_dtype: Type[cutlass.Numeric] = token_final_scales.element_type
         self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
-        self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
+        self.b_major_mode = utils.LayoutEnum.from_tensor(b_tuple[0]).mma_major_mode()
         self.gemm_output_layout = utils.LayoutEnum.ROW_MAJOR
 
         self.topK = token_final_scales.shape[1]
@@ -518,8 +572,27 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
         sfa = cute.make_tensor(sfa.iterator, sfa_layout)
 
         # ((Atom_N, Rest_N),(Atom_K, Rest_K),RestL)
-        sfb_layout = blockscaled_utils.tile_atom_to_shape_SF(b.shape, self.sf_vec_size)
-        sfb = cute.make_tensor(sfb.iterator, sfb_layout)
+        sfb_layout_0 = blockscaled_utils.tile_atom_to_shape_SF(b_tuple[0].shape, self.sf_vec_size)
+        sfb_tensor_0 = cute.make_tensor(sfb_tuple[0].iterator, sfb_layout_0)
+        sfb_tensors = [sfb_tensor_0]
+        if cutlass.const_expr(self.num_b_tensors >= 2):
+            sfb_layout_1 = blockscaled_utils.tile_atom_to_shape_SF(
+                b_tuple[1].shape, self.sf_vec_size
+            )
+            sfb_tensors.append(cute.make_tensor(sfb_tuple[1].iterator, sfb_layout_1))
+        if cutlass.const_expr(self.num_b_tensors >= 3):
+            sfb_layout_2 = blockscaled_utils.tile_atom_to_shape_SF(
+                b_tuple[2].shape, self.sf_vec_size
+            )
+            sfb_tensors.append(cute.make_tensor(sfb_tuple[2].iterator, sfb_layout_2))
+        if cutlass.const_expr(self.num_b_tensors >= 4):
+            sfb_layout_3 = blockscaled_utils.tile_atom_to_shape_SF(
+                b_tuple[3].shape, self.sf_vec_size
+            )
+            sfb_tensors.append(cute.make_tensor(sfb_tuple[3].iterator, sfb_layout_3))
+        sfb_tuple = tuple(sfb_tensors)
+        # Backward compat alias
+        sfb = sfb_tuple[0]
 
         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
@@ -554,18 +627,9 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
             self.cluster_layout_vmnk.shape,
         )
 
-        # Setup TMA load for B.
-        #
-        # N-major variant: the MMA-tied ``make_tiled_tma_atom_B`` helper insists
-        # on a K-major SMEM layout (matches tcgen05 requirements). We instead
-        # target our plain, unswizzled ``sB_raw`` buffer whose innermost axis is
-        # N (same as the gmem layout). The transpose warp later repacks
-        # ``sB_raw`` into the MMA-ready ``sB`` buffer.
-        #
-        # The MMA-tied ``b_smem_layout`` is still used downstream to build
-        # fragments for tcgen05.mma but is no longer the TMA destination.
+        # Setup TMA load for B
+        b_op = sm100_utils.cluster_shape_to_tma_atom_B(self.cluster_shape_mn, tiled_mma.thr_id)
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
-        b_raw_smem_layout = cute.slice_(self.b_raw_smem_layout_staged, (None, None, 0))
 
         # Setup TMA load for SFA
         sfa_op = sm100_utils.cluster_shape_to_tma_atom_A(self.cluster_shape_mn, tiled_mma.thr_id)
@@ -584,17 +648,15 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
         sfb_op = sm100_utils.cluster_shape_to_tma_atom_SFB(self.cluster_shape_mn, tiled_mma.thr_id)
         sfb_smem_layout = cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0))
 
-        # Helper to create TMA for B tensor
+        # Helper to create TMA for one B tensor
         def _make_tma_b(b_tensor, sfb_tensor):
-            # N-major B -> unswizzled N-major sB_raw. Use the low-level
-            # ``cpasync.make_tiled_tma_atom`` helper so we are not tied to an
-            # MMA-specific SMEM layout. Non-multicast only for now (cluster
-            # shape (1, 1) is enforced by ``is_valid_mma_tiler_and_cluster_shape``).
-            atom_b, tensor_b = cpasync.make_tiled_tma_atom(
-                cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE),
+            atom_b, tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
+                b_op,
                 b_tensor,
-                b_raw_smem_layout,
-                (self.mma_tiler[1], self.mma_tiler[2]),
+                b_smem_layout,
+                self.mma_tiler,
+                tiled_mma,
+                self.cluster_layout_vmnk.shape,
             )
             atom_sfb, tensor_sfb = cute.nvgpu.make_tiled_tma_atom_B(
                 sfb_op,
@@ -625,25 +687,45 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
                 tensor_sfb = cute.make_tensor(tensor_sfb.iterator, tensor_sfb_new_layout)
             return atom_b, tensor_b, atom_sfb, tensor_sfb
 
-        # Create TMA for single B tensor
-        tma_atom_b, tma_tensor_b, tma_atom_sfb, tma_tensor_sfb = _make_tma_b(b, sfb)
+        # Create TMA for all B tensors (use const_expr, not loop)
+        atom_b_0, tensor_b_0, atom_sfb_0, tensor_sfb_0 = _make_tma_b(b_tuple[0], sfb_tuple[0])
+        tma_atoms_b = [atom_b_0]
+        tma_tensors_b = [tensor_b_0]
+        tma_atoms_sfb = [atom_sfb_0]
+        tma_tensors_sfb = [tensor_sfb_0]
+        if cutlass.const_expr(self.num_b_tensors >= 2):
+            atom_b_1, tensor_b_1, atom_sfb_1, tensor_sfb_1 = _make_tma_b(b_tuple[1], sfb_tuple[1])
+            tma_atoms_b.append(atom_b_1)
+            tma_tensors_b.append(tensor_b_1)
+            tma_atoms_sfb.append(atom_sfb_1)
+            tma_tensors_sfb.append(tensor_sfb_1)
+        if cutlass.const_expr(self.num_b_tensors >= 3):
+            atom_b_2, tensor_b_2, atom_sfb_2, tensor_sfb_2 = _make_tma_b(b_tuple[2], sfb_tuple[2])
+            tma_atoms_b.append(atom_b_2)
+            tma_tensors_b.append(tensor_b_2)
+            tma_atoms_sfb.append(atom_sfb_2)
+            tma_tensors_sfb.append(tensor_sfb_2)
+        if cutlass.const_expr(self.num_b_tensors >= 4):
+            atom_b_3, tensor_b_3, atom_sfb_3, tensor_sfb_3 = _make_tma_b(b_tuple[3], sfb_tuple[3])
+            tma_atoms_b.append(atom_b_3)
+            tma_tensors_b.append(tensor_b_3)
+            tma_atoms_sfb.append(atom_sfb_3)
+            tma_tensors_sfb.append(tensor_sfb_3)
+        tma_atoms_b = tuple(tma_atoms_b)
+        tma_tensors_b = tuple(tma_tensors_b)
+        tma_atoms_sfb = tuple(tma_atoms_sfb)
+        tma_tensors_sfb = tuple(tma_tensors_sfb)
 
         a_copy_size = cute.size_in_bytes(self.a_dtype, a_smem_layout)
-        b_copy_size = cute.size_in_bytes(self.b_dtype, b_raw_smem_layout)
+        b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
         sfa_copy_size = cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
         sfb_copy_size = cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
-        # ab_pipeline (TMA -> MMA) covers only A, SFA, SFB; its tx_count
-        # excludes B which is on its own TMA -> transpose pipeline.
-        self.num_tma_load_bytes_ab = (
-            a_copy_size + sfa_copy_size + sfb_copy_size
+        self.num_tma_load_bytes = (
+            a_copy_size + b_copy_size + sfa_copy_size + sfb_copy_size
         ) * atom_thr_size
-        # b_raw_pipeline (TMA -> transpose) covers only B.
-        self.num_tma_load_bytes_b = b_copy_size * atom_thr_size
-        # Keep a combined count for any legacy callers; unused internally.
-        self.num_tma_load_bytes = self.num_tma_load_bytes_ab + self.num_tma_load_bytes_b
 
         self.tile_sched_params, grid = self._compute_grid(
-            (a.shape[0], b.shape[0], a.shape[2]),
+            (a.shape[0], b_tuple[0].shape[0], a.shape[2]),
             self.cta_tile_shape_mnk,
             self.cluster_shape_mn,
             max_active_clusters,
@@ -662,14 +744,6 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
 
         if cutlass.const_expr(self.out_dtype == cutlass.BFloat16):
             # 8-element vectorization for BF16
-            self.epi_layout = cute.make_layout(
-                shape=(self.ttr_racc_size // 8, 4, 2), stride=(8, 2, 1)
-            )
-            self.epi_loop_size = self.ttr_racc_size // 8
-            self.element_offset = 8
-
-        elif cutlass.const_expr(self.out_dtype == cutlass.Float16):
-            # 8-element vectorization for FP16 (4x f16x2 pairs, matches BF16 shape)
             self.epi_layout = cute.make_layout(
                 shape=(self.ttr_racc_size // 8, 4, 2), stride=(8, 2, 1)
             )
@@ -699,10 +773,6 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
             ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
             acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
             tile_info_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_tile_stage * 2]
-            # N-major TMA -> transpose warp (B_raw slot)
-            b_raw_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
-            # transpose warp -> MMA (B_mma slot)
-            b_mma_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
             tmem_dealloc_mbar_ptr: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
             # (MMA, MMA_M, MMA_K, STAGE)
@@ -710,16 +780,9 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
                 cute.struct.MemRange[self.a_dtype, cute.cosize(self.a_smem_layout_staged.outer)],
                 self.buffer_align_bytes,
             ]
-            # (MMA, MMA_N, MMA_K, STAGE) — K-major, MMA-ready. Filled by the
-            # transpose warp from sB_raw, consumed by the MMA warp.
+            # (MMA, MMA_N, MMA_K, STAGE)
             sB: cute.struct.Align[
                 cute.struct.MemRange[self.b_dtype, cute.cosize(self.b_smem_layout_staged.outer)],
-                self.buffer_align_bytes,
-            ]
-            # (N_TILE, K_TILE, STAGE) — N-major, unswizzled. TMA-filled,
-            # transpose-consumed.
-            sB_raw: cute.struct.Align[
-                cute.struct.MemRange[self.b_dtype, cute.cosize(self.b_raw_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
             # (granularity_m, repeat_m), (granularity_k, repeat_k), num_scale_stage)
@@ -747,24 +810,24 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
             tiled_mma_sfb,
             tma_atom_a,
             tma_tensor_a,
-            tma_atom_b,
-            tma_tensor_b,
+            tma_atoms_b,
+            tma_tensors_b,
             tma_atom_sfa,
             tma_tensor_sfa,
-            tma_atom_sfb,
-            tma_tensor_sfb,
+            tma_atoms_sfb,
+            tma_tensors_sfb,
             out,
             tile_idx_to_expert_idx,
             num_non_exiting_tiles,
             tile_idx_to_mn_limit,
-            alpha,
+            alpha_tuple,
+            down_input_scale,
             permuted_idx_to_expanded_idx,
             token_final_scales,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
-            self.b_raw_smem_layout_staged,
             self.sfa_smem_layout_staged,
             self.sfb_smem_layout_staged,
             self.c_smem_layout_staged,
@@ -780,7 +843,7 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
             smem=self.shared_storage.size_in_bytes(),
             stream=stream,
             min_blocks_per_mp=1,
-            use_pdl=False,
+            use_pdl=EDGELLM_ENABLE_PDL,
         )
         return
 
@@ -833,24 +896,24 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
         tiled_mma_sfb: cute.TiledMma,
         tma_atom_a: cute.CopyAtom,
         mA_mkl: cute.Tensor,
-        tma_atom_b: cute.CopyAtom,
-        mB_nkl: cute.Tensor,
+        tma_atoms_b: Tuple[cute.CopyAtom, ...],
+        mB_nkl_tuple: Tuple[cute.Tensor, ...],
         tma_atom_sfa: cute.CopyAtom,
         mSFA_mkl: cute.Tensor,
-        tma_atom_sfb: cute.CopyAtom,
-        mSFB_nkl: cute.Tensor,
+        tma_atoms_sfb: Tuple[cute.CopyAtom, ...],
+        mSFB_nkl_tuple: Tuple[cute.Tensor, ...],
         out: cute.Tensor,
         tile_idx_to_expert_idx: cute.Tensor,
         num_non_exiting_tiles: cute.Tensor,
         tile_idx_to_mn_limit: cute.Tensor,
-        alpha: cute.Tensor,
+        alpha_tuple: Tuple[cute.Tensor, ...],
+        down_input_scale: cute.Tensor,
         permuted_idx_to_expanded_idx: cute.Tensor,
         token_final_scales: cute.Tensor,
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
-        b_raw_smem_layout_staged: cute.Layout,
         sfa_smem_layout_staged: cute.Layout,
         sfb_smem_layout_staged: cute.Layout,
         c_smem_layout_staged: cute.Layout,
@@ -872,8 +935,17 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
         if warp_idx == self.tma_warp_id:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_sfa)
-            cpasync.prefetch_descriptor(tma_atom_b)
-            cpasync.prefetch_descriptor(tma_atom_sfb)
+            cpasync.prefetch_descriptor(tma_atoms_b[0])
+            cpasync.prefetch_descriptor(tma_atoms_sfb[0])
+            if cutlass.const_expr(self.num_b_tensors >= 2):
+                cpasync.prefetch_descriptor(tma_atoms_b[1])
+                cpasync.prefetch_descriptor(tma_atoms_sfb[1])
+            if cutlass.const_expr(self.num_b_tensors >= 3):
+                cpasync.prefetch_descriptor(tma_atoms_b[2])
+                cpasync.prefetch_descriptor(tma_atoms_sfb[2])
+            if cutlass.const_expr(self.num_b_tensors >= 4):
+                cpasync.prefetch_descriptor(tma_atoms_b[3])
+                cpasync.prefetch_descriptor(tma_atoms_sfb[3])
 
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
 
@@ -900,9 +972,7 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        # Initialize mainloop ab_pipeline (barrier) and states.
-        # In the N-major kernel the ab_pipeline covers only A, SFA, SFB; B flows
-        # through its own TMA -> transpose -> MMA pair of pipelines (see below).
+        # Initialize mainloop ab_pipeline (barrier) and states
         ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         num_tma_producer = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(
@@ -913,49 +983,8 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
             num_stages=self.num_ab_stage,
             producer_group=ab_pipeline_producer_group,
             consumer_group=ab_pipeline_consumer_group,
-            tx_count=self.num_tma_load_bytes_ab,
+            tx_count=self.num_tma_load_bytes,
             cta_layout_vmnk=cluster_layout_vmnk,
-        )
-
-        # b_raw_pipeline: TMA warp fills sB_raw (N-major); transpose warp
-        # consumes it. ``PipelineTmaAsync.consumer_release`` only arrives
-        # from ``is_signalling_thread`` (one lane per CTA), so the consumer
-        # cooperative group must have size 1 — otherwise the empty barrier's
-        # arrive_count is set to 32 and each release contributes only 1/32,
-        # meaning the barrier never flips and ``producer_tail`` deadlocks at
-        # kernel exit.
-        b_raw_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        b_raw_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        b_raw_pipeline = pipeline.PipelineTmaAsync.create(
-            barrier_storage=storage.b_raw_mbar_ptr.data_ptr(),
-            num_stages=self.num_ab_stage,
-            producer_group=b_raw_producer_group,
-            consumer_group=b_raw_consumer_group,
-            tx_count=self.num_tma_load_bytes_b,
-            cta_layout_vmnk=cluster_layout_vmnk,
-        )
-
-        # b_mma_pipeline: transpose warps produce sB (K-major, MMA-ready);
-        # MMA warp consumes. Both are plain thread-level cooperative groups
-        # so we use PipelineAsync — the MMA warp does an explicit
-        # consumer_wait / consumer_release pair (UMMA-pipeline implicit
-        # release semantics don't compose with our external transpose step).
-        # Producer side now spans all transpose warps (4 × 32 = 128 threads
-        # by default) so the barrier arrive count matches the number of
-        # threads actually calling producer_commit.
-        b_mma_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread,
-            self.threads_per_warp * self.num_transpose_warps,
-        )
-        b_mma_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread,
-            self.threads_per_warp,
-        )
-        b_mma_pipeline = pipeline.PipelineAsync.create(
-            barrier_storage=storage.b_mma_mbar_ptr.data_ptr(),
-            num_stages=self.num_ab_stage,
-            producer_group=b_mma_producer_group,
-            consumer_group=b_mma_consumer_group,
         )
 
         # Initialize acc_pipeline (barrier) and states
@@ -1006,12 +1035,8 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
         #
         # (MMA, MMA_M, MMA_K, STAGE)
         sA = storage.sA.get_tensor(a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
-        # (MMA, MMA_N, MMA_K, STAGE) — K-major, MMA-ready. Written by the
-        # transpose warp.
+        # (MMA, MMA_N, MMA_K, STAGE)
         sB = storage.sB.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)
-        # (N_TILE, K_TILE, STAGE) — N-major, TMA destination. Read by the
-        # transpose warp.
-        sB_raw = storage.sB_raw.get_tensor(b_raw_smem_layout_staged)
         # (granularity_m, repeat_m), (granularity_k, repeat_k), num_scale_stage)
         sSFA = storage.sSFA.get_tensor(sfa_smem_layout_staged)
         # (granularity_n, repeat_n), (granularity_k, repeat_k), num_scale_stage)
@@ -1031,7 +1056,7 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
         b_full_mcast_mask = None
         sfa_full_mcast_mask = None
         sfb_full_mcast_mask = None
-        if cutlass.const_expr(self.is_a_mcast or self.is_b_mcast):
+        if cutlass.const_expr(self.is_a_mcast or self.is_b_mcast or use_2cta_instrs):
             a_full_mcast_mask = cpasync.create_tma_multicast_mask(
                 cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
             )
@@ -1053,11 +1078,29 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
             mA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
         )
         # (bN, bK, loopN, loopK, loopL)
-        gB_nkl = cute.local_tile(
-            mB_nkl,
+        gB_nkl_0 = cute.local_tile(
+            mB_nkl_tuple[0],
             cute.slice_(self.mma_tiler, (0, None, None)),
             (None, None, None),
         )
+        if cutlass.const_expr(self.num_b_tensors >= 2):
+            gB_nkl_1 = cute.local_tile(
+                mB_nkl_tuple[1],
+                cute.slice_(self.mma_tiler, (0, None, None)),
+                (None, None, None),
+            )
+        if cutlass.const_expr(self.num_b_tensors >= 3):
+            gB_nkl_2 = cute.local_tile(
+                mB_nkl_tuple[2],
+                cute.slice_(self.mma_tiler, (0, None, None)),
+                (None, None, None),
+            )
+        if cutlass.const_expr(self.num_b_tensors >= 4):
+            gB_nkl_3 = cute.local_tile(
+                mB_nkl_tuple[3],
+                cute.slice_(self.mma_tiler, (0, None, None)),
+                (None, None, None),
+            )
 
         # (bM, bK, RestM, RestK, RestL)
         gSFA_mkl = cute.local_tile(
@@ -1065,11 +1108,29 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
         )
 
         # (bN, bK, RestN, RestK, RestL)
-        gSFB_nkl = cute.local_tile(
-            mSFB_nkl,
+        gSFB_nkl_0 = cute.local_tile(
+            mSFB_nkl_tuple[0],
             cute.slice_(self.mma_tiler_sfb, (0, None, None)),
             (None, None, None),
         )
+        if cutlass.const_expr(self.num_b_tensors >= 2):
+            gSFB_nkl_1 = cute.local_tile(
+                mSFB_nkl_tuple[1],
+                cute.slice_(self.mma_tiler_sfb, (0, None, None)),
+                (None, None, None),
+            )
+        if cutlass.const_expr(self.num_b_tensors >= 3):
+            gSFB_nkl_2 = cute.local_tile(
+                mSFB_nkl_tuple[2],
+                cute.slice_(self.mma_tiler_sfb, (0, None, None)),
+                (None, None, None),
+            )
+        if cutlass.const_expr(self.num_b_tensors >= 4):
+            gSFB_nkl_3 = cute.local_tile(
+                mSFB_nkl_tuple[3],
+                cute.slice_(self.mma_tiler_sfb, (0, None, None)),
+                (None, None, None),
+            )
 
         k_tile_cnt = cutlass.Int32(cute.size(gA_mkl, mode=[3]))
 
@@ -1081,11 +1142,23 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
         # (MMA, MMA_M, MMA_K, loopM, loopK, loopL)
         tCgA = thr_mma.partition_A(gA_mkl)
         # (MMA, MMA_N, MMA_K, loopN, loopK, loopL)
-        tCgB = thr_mma.partition_B(gB_nkl)
+        tCgB_0 = thr_mma.partition_B(gB_nkl_0)
+        if cutlass.const_expr(self.num_b_tensors >= 2):
+            tCgB_1 = thr_mma.partition_B(gB_nkl_1)
+        if cutlass.const_expr(self.num_b_tensors >= 3):
+            tCgB_2 = thr_mma.partition_B(gB_nkl_2)
+        if cutlass.const_expr(self.num_b_tensors >= 4):
+            tCgB_3 = thr_mma.partition_B(gB_nkl_3)
         # (MMA, MMA_M, MMA_K, RestM, RestK, RestL)
         tCgSFA = thr_mma.partition_A(gSFA_mkl)
         # (MMA, MMA_N, MMA_K, RestN, RestK, RestL)
-        tCgSFB = thr_mma_sfb.partition_B(gSFB_nkl)
+        tCgSFB_0 = thr_mma_sfb.partition_B(gSFB_nkl_0)
+        if cutlass.const_expr(self.num_b_tensors >= 2):
+            tCgSFB_1 = thr_mma_sfb.partition_B(gSFB_nkl_1)
+        if cutlass.const_expr(self.num_b_tensors >= 3):
+            tCgSFB_2 = thr_mma_sfb.partition_B(gSFB_nkl_2)
+        if cutlass.const_expr(self.num_b_tensors >= 4):
+            tCgSFB_3 = thr_mma_sfb.partition_B(gSFB_nkl_3)
 
         #
         # Partition global/shared tensor for TMA load A/B
@@ -1101,19 +1174,41 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
             cute.group_modes(sA, 0, 3),
             cute.group_modes(tCgA, 0, 3),
         )
-        # TMA load B partition_S/D — targets sB_raw (N-major, non-MMA-ready).
-        # Unlike the K-major kernel we do NOT use ``thr_mma.partition_B``
-        # because the MMA partitioning is tied to the K-major swizzled layout.
-        # Here we tile gB_nkl directly and drop it into sB_raw verbatim; the
-        # transpose warp later repacks its contents into sB.
-        b_cta_layout = cute.make_layout(1)  # non-multicast (cluster (1,1))
-        tBsB_raw, tBgB = cpasync.tma_partition(
-            tma_atom_b,
-            0,
+        # TMA load B partition_S/D
+        b_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape)
+        # ((atom_v, rest_v), STAGE)
+        # ((atom_v, rest_v), loopM, loopK, loopL)
+        tBsB_0, tBgB_0 = cpasync.tma_partition(
+            tma_atoms_b[0],
+            block_in_cluster_coord_vmnk[1],
             b_cta_layout,
-            cute.group_modes(sB_raw, 0, 2),
-            cute.group_modes(gB_nkl, 0, 2),
+            cute.group_modes(sB, 0, 3),
+            cute.group_modes(tCgB_0, 0, 3),
         )
+        if cutlass.const_expr(self.num_b_tensors >= 2):
+            _, tBgB_1 = cpasync.tma_partition(
+                tma_atoms_b[1],
+                block_in_cluster_coord_vmnk[1],
+                b_cta_layout,
+                cute.group_modes(sB, 0, 3),
+                cute.group_modes(tCgB_1, 0, 3),
+            )
+        if cutlass.const_expr(self.num_b_tensors >= 3):
+            _, tBgB_2 = cpasync.tma_partition(
+                tma_atoms_b[2],
+                block_in_cluster_coord_vmnk[1],
+                b_cta_layout,
+                cute.group_modes(sB, 0, 3),
+                cute.group_modes(tCgB_2, 0, 3),
+            )
+        if cutlass.const_expr(self.num_b_tensors >= 4):
+            _, tBgB_3 = cpasync.tma_partition(
+                tma_atoms_b[3],
+                block_in_cluster_coord_vmnk[1],
+                b_cta_layout,
+                cute.group_modes(sB, 0, 3),
+                cute.group_modes(tCgB_3, 0, 3),
+            )
 
         #  TMA load SFA partition_S/D
         sfa_cta_layout = a_cta_layout
@@ -1137,15 +1232,42 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
         )
         # ((atom_v, rest_v), STAGE)
         # ((atom_v, rest_v), RestN, RestK, RestL)
-        tBsSFB, tBgSFB = cute.nvgpu.cpasync.tma_partition(
-            tma_atom_sfb,
+        tBsSFB_0, tBgSFB_0 = cute.nvgpu.cpasync.tma_partition(
+            tma_atoms_sfb[0],
             block_in_cluster_coord_sfb_vmnk[1],
             sfb_cta_layout,
             cute.group_modes(sSFB, 0, 3),
-            cute.group_modes(tCgSFB, 0, 3),
+            cute.group_modes(tCgSFB_0, 0, 3),
         )
-        tBsSFB = cute.filter_zeros(tBsSFB)
-        tBgSFB = cute.filter_zeros(tBgSFB)
+        tBsSFB_0 = cute.filter_zeros(tBsSFB_0)
+        tBgSFB_0 = cute.filter_zeros(tBgSFB_0)
+        if cutlass.const_expr(self.num_b_tensors >= 2):
+            _, tBgSFB_1 = cute.nvgpu.cpasync.tma_partition(
+                tma_atoms_sfb[1],
+                block_in_cluster_coord_sfb_vmnk[1],
+                sfb_cta_layout,
+                cute.group_modes(sSFB, 0, 3),
+                cute.group_modes(tCgSFB_1, 0, 3),
+            )
+            tBgSFB_1 = cute.filter_zeros(tBgSFB_1)
+        if cutlass.const_expr(self.num_b_tensors >= 3):
+            _, tBgSFB_2 = cute.nvgpu.cpasync.tma_partition(
+                tma_atoms_sfb[2],
+                block_in_cluster_coord_sfb_vmnk[1],
+                sfb_cta_layout,
+                cute.group_modes(sSFB, 0, 3),
+                cute.group_modes(tCgSFB_2, 0, 3),
+            )
+            tBgSFB_2 = cute.filter_zeros(tBgSFB_2)
+        if cutlass.const_expr(self.num_b_tensors >= 4):
+            _, tBgSFB_3 = cute.nvgpu.cpasync.tma_partition(
+                tma_atoms_sfb[3],
+                block_in_cluster_coord_sfb_vmnk[1],
+                sfb_cta_layout,
+                cute.group_modes(sSFB, 0, 3),
+                cute.group_modes(tCgSFB_3, 0, 3),
+            )
+            tBgSFB_3 = cute.filter_zeros(tBgSFB_3)
 
         #
         # Partition shared/tensor memory tensor for TiledMMA_A/B/C
@@ -1234,7 +1356,10 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
                             )
                             sInfo[(4, tile_info_producer_state.index)] = mn_limit
                             # fence view async shared
-                        cute.arch.fence_proxy("async.shared", space="cta")
+                        cute.arch.fence_proxy(
+                            "async.shared",
+                            space="cta",
+                        )
 
                         self.sched_sync_barrier.arrive_and_wait()
                         tile_info_pipeline.producer_commit(tile_info_producer_state)
@@ -1261,7 +1386,10 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
                             )
                             sInfo[(4, tile_info_producer_state.index)] = mn_limit
                             # fence view async shared
-                        cute.arch.fence_proxy("async.shared", space="cta")
+                        cute.arch.fence_proxy(
+                            "async.shared",
+                            space="cta",
+                        )
 
                         self.sched_sync_barrier.arrive_and_wait()
                         tile_info_pipeline.producer_commit(tile_info_producer_state)
@@ -1280,7 +1408,10 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
                 sInfo[(2, tile_info_producer_state.index)] = -1
                 sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(0)
                 sInfo[(4, tile_info_producer_state.index)] = cutlass.Int32(0)
-            cute.arch.fence_proxy("async.shared", space="cta")
+            cute.arch.fence_proxy(
+                "async.shared",
+                space="cta",
+            )
             self.sched_sync_barrier.arrive_and_wait()
             tile_info_pipeline.producer_commit(tile_info_producer_state)
             tile_info_producer_state.advance()
@@ -1295,12 +1426,6 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
             ab_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_ab_stage
             )
-            # Separate state for the B (TMA -> transpose) pipeline. Kept in
-            # lock-step with ab_producer_state — the same k_tile counter drives
-            # both pipelines.
-            b_raw_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.num_ab_stage
-            )
 
             tile_info_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_tile_stage
@@ -1312,7 +1437,10 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
             for idx in cutlass.range(5, unroll_full=True):
                 tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
-            cute.arch.fence_proxy("async.shared", space="cta")
+            cute.arch.fence_proxy(
+                "async.shared",
+                space="cta",
+            )
             tile_info_pipeline.consumer_release(tile_info_consumer_state)
             tile_info_consumer_state.advance()
 
@@ -1338,7 +1466,6 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
 
                 # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt
                 ab_producer_state.reset_count()
-                b_raw_producer_state.reset_count()
                 peek_ab_empty_status = cutlass.Boolean(1)
                 if ab_producer_state.count < k_tile_cnt:
                     peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
@@ -1349,54 +1476,262 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
                     tAgA_k = tAgA_slice[(None, ab_producer_state.count)]
                     tAgSFA_k = tAgSFA_slice[(None, ab_producer_state.count)]
                     tAsA_pipe = tAsA[(None, ab_producer_state.index)]
-                    tBsB_raw_pipe = tBsB_raw[(None, b_raw_producer_state.index)]
+                    tBsB_pipe = tBsB_0[(None, ab_producer_state.index)]
                     tAsSFA_pipe = tAsSFA[(None, ab_producer_state.index)]
-                    tBsSFB_pipe = tBsSFB[(None, ab_producer_state.index)]
+                    tBsSFB_pipe = tBsSFB_0[(None, ab_producer_state.index)]
 
-                    tma_bar_ab = ab_pipeline.producer_get_barrier(ab_producer_state)
+                    tma_bar = ab_pipeline.producer_get_barrier(ab_producer_state)
 
-                    # Conditionally wait for AB buffer empty (A, SFA, SFB only)
+                    # Conditionally wait for AB buffer empty
                     ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
-                    # B_raw has its own pipeline; acquire independently.
-                    b_raw_pipeline.producer_acquire(b_raw_producer_state)
-                    tma_bar_b = b_raw_pipeline.producer_get_barrier(b_raw_producer_state)
 
-                    # TMA load A
+                    # TMA load A/B
                     cute.copy(
                         tma_atom_a,
                         tAgA_k,
                         tAsA_pipe,
-                        tma_bar_ptr=tma_bar_ab,
+                        tma_bar_ptr=tma_bar,
                         mcast_mask=a_full_mcast_mask,
                     )
                     cute.copy(
                         tma_atom_sfa,
                         tAgSFA_k,
                         tAsSFA_pipe,
-                        tma_bar_ptr=tma_bar_ab,
+                        tma_bar_ptr=tma_bar,
                         mcast_mask=sfa_full_mcast_mask,
                     )
-                    # TMA load SFB (still on ab_pipeline)
-                    tBgSFB_slice = tBgSFB[(None, slice_n, None, expert_idx)]
-                    cute.copy(
-                        tma_atom_sfb,
-                        tBgSFB_slice[(None, ab_producer_state.count)],
-                        tBsSFB_pipe,
-                        tma_bar_ptr=tma_bar_ab,
-                        mcast_mask=sfb_full_mcast_mask,
-                    )
-                    # TMA load B_raw (N-major, own pipeline -> transpose warp)
-                    tBgB_slice = tBgB[(None, mma_tile_coord_mnl[1], None, expert_idx)]
-                    cute.copy(
-                        tma_atom_b,
-                        tBgB_slice[(None, b_raw_producer_state.count)],
-                        tBsB_raw_pipe,
-                        tma_bar_ptr=tma_bar_b,
-                    )
+                    # Select correct B tensor based on expert_idx
+                    if cutlass.const_expr(self.num_b_tensors == 1):
+                        tBgB_slice = tBgB_0[(None, mma_tile_coord_mnl[1], None, expert_idx)]
+                        tBgSFB_slice = tBgSFB_0[(None, slice_n, None, expert_idx)]
+                        cute.copy(
+                            tma_atoms_b[0],
+                            tBgB_slice[(None, ab_producer_state.count)],
+                            tBsB_pipe,
+                            tma_bar_ptr=tma_bar,
+                            mcast_mask=b_full_mcast_mask,
+                        )
+                        cute.copy(
+                            tma_atoms_sfb[0],
+                            tBgSFB_slice[(None, ab_producer_state.count)],
+                            tBsSFB_pipe,
+                            tma_bar_ptr=tma_bar,
+                            mcast_mask=sfb_full_mcast_mask,
+                        )
+                    else:
+                        if cutlass.const_expr(self.num_b_tensors == 2):
+                            if expert_idx < self.b_tensor_l_offsets[1]:
+                                local_l_0 = expert_idx - self.b_tensor_l_offsets[0]
+                                cute.copy(
+                                    tma_atoms_b[0],
+                                    tBgB_0[
+                                        (
+                                            None,
+                                            mma_tile_coord_mnl[1],
+                                            ab_producer_state.count,
+                                            local_l_0,
+                                        )
+                                    ],
+                                    tBsB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=b_full_mcast_mask,
+                                )
+                                cute.copy(
+                                    tma_atoms_sfb[0],
+                                    tBgSFB_0[(None, slice_n, ab_producer_state.count, local_l_0)],
+                                    tBsSFB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=sfb_full_mcast_mask,
+                                )
+                            else:
+                                local_l_1 = expert_idx - self.b_tensor_l_offsets[1]
+                                cute.copy(
+                                    tma_atoms_b[1],
+                                    tBgB_1[
+                                        (
+                                            None,
+                                            mma_tile_coord_mnl[1],
+                                            ab_producer_state.count,
+                                            local_l_1,
+                                        )
+                                    ],
+                                    tBsB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=b_full_mcast_mask,
+                                )
+                                cute.copy(
+                                    tma_atoms_sfb[1],
+                                    tBgSFB_1[(None, slice_n, ab_producer_state.count, local_l_1)],
+                                    tBsSFB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=sfb_full_mcast_mask,
+                                )
+                        elif cutlass.const_expr(self.num_b_tensors == 3):
+                            if expert_idx < self.b_tensor_l_offsets[1]:
+                                local_l_0 = expert_idx - self.b_tensor_l_offsets[0]
+                                cute.copy(
+                                    tma_atoms_b[0],
+                                    tBgB_0[
+                                        (
+                                            None,
+                                            mma_tile_coord_mnl[1],
+                                            ab_producer_state.count,
+                                            local_l_0,
+                                        )
+                                    ],
+                                    tBsB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=b_full_mcast_mask,
+                                )
+                                cute.copy(
+                                    tma_atoms_sfb[0],
+                                    tBgSFB_0[(None, slice_n, ab_producer_state.count, local_l_0)],
+                                    tBsSFB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=sfb_full_mcast_mask,
+                                )
+                            elif expert_idx < self.b_tensor_l_offsets[2]:
+                                local_l_1 = expert_idx - self.b_tensor_l_offsets[1]
+                                cute.copy(
+                                    tma_atoms_b[1],
+                                    tBgB_1[
+                                        (
+                                            None,
+                                            mma_tile_coord_mnl[1],
+                                            ab_producer_state.count,
+                                            local_l_1,
+                                        )
+                                    ],
+                                    tBsB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=b_full_mcast_mask,
+                                )
+                                cute.copy(
+                                    tma_atoms_sfb[1],
+                                    tBgSFB_1[(None, slice_n, ab_producer_state.count, local_l_1)],
+                                    tBsSFB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=sfb_full_mcast_mask,
+                                )
+                            else:
+                                local_l_2 = expert_idx - self.b_tensor_l_offsets[2]
+                                cute.copy(
+                                    tma_atoms_b[2],
+                                    tBgB_2[
+                                        (
+                                            None,
+                                            mma_tile_coord_mnl[1],
+                                            ab_producer_state.count,
+                                            local_l_2,
+                                        )
+                                    ],
+                                    tBsB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=b_full_mcast_mask,
+                                )
+                                cute.copy(
+                                    tma_atoms_sfb[2],
+                                    tBgSFB_2[(None, slice_n, ab_producer_state.count, local_l_2)],
+                                    tBsSFB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=sfb_full_mcast_mask,
+                                )
+                        else:
+                            if expert_idx < self.b_tensor_l_offsets[1]:
+                                local_l_0 = expert_idx - self.b_tensor_l_offsets[0]
+                                cute.copy(
+                                    tma_atoms_b[0],
+                                    tBgB_0[
+                                        (
+                                            None,
+                                            mma_tile_coord_mnl[1],
+                                            ab_producer_state.count,
+                                            local_l_0,
+                                        )
+                                    ],
+                                    tBsB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=b_full_mcast_mask,
+                                )
+                                cute.copy(
+                                    tma_atoms_sfb[0],
+                                    tBgSFB_0[(None, slice_n, ab_producer_state.count, local_l_0)],
+                                    tBsSFB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=sfb_full_mcast_mask,
+                                )
+                            elif expert_idx < self.b_tensor_l_offsets[2]:
+                                local_l_1 = expert_idx - self.b_tensor_l_offsets[1]
+                                cute.copy(
+                                    tma_atoms_b[1],
+                                    tBgB_1[
+                                        (
+                                            None,
+                                            mma_tile_coord_mnl[1],
+                                            ab_producer_state.count,
+                                            local_l_1,
+                                        )
+                                    ],
+                                    tBsB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=b_full_mcast_mask,
+                                )
+                                cute.copy(
+                                    tma_atoms_sfb[1],
+                                    tBgSFB_1[(None, slice_n, ab_producer_state.count, local_l_1)],
+                                    tBsSFB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=sfb_full_mcast_mask,
+                                )
+                            elif expert_idx < self.b_tensor_l_offsets[3]:
+                                local_l_2 = expert_idx - self.b_tensor_l_offsets[2]
+                                cute.copy(
+                                    tma_atoms_b[2],
+                                    tBgB_2[
+                                        (
+                                            None,
+                                            mma_tile_coord_mnl[1],
+                                            ab_producer_state.count,
+                                            local_l_2,
+                                        )
+                                    ],
+                                    tBsB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=b_full_mcast_mask,
+                                )
+                                cute.copy(
+                                    tma_atoms_sfb[2],
+                                    tBgSFB_2[(None, slice_n, ab_producer_state.count, local_l_2)],
+                                    tBsSFB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=sfb_full_mcast_mask,
+                                )
+                            else:
+                                local_l_3 = expert_idx - self.b_tensor_l_offsets[3]
+                                cute.copy(
+                                    tma_atoms_b[3],
+                                    tBgB_3[
+                                        (
+                                            None,
+                                            mma_tile_coord_mnl[1],
+                                            ab_producer_state.count,
+                                            local_l_3,
+                                        )
+                                    ],
+                                    tBsB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=b_full_mcast_mask,
+                                )
+                                cute.copy(
+                                    tma_atoms_sfb[3],
+                                    tBgSFB_3[(None, slice_n, ab_producer_state.count, local_l_3)],
+                                    tBsSFB_pipe,
+                                    tma_bar_ptr=tma_bar,
+                                    mcast_mask=sfb_full_mcast_mask,
+                                )
 
                     # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt + k_tile + 1
                     ab_producer_state.advance()
-                    b_raw_producer_state.advance()
                     peek_ab_empty_status = cutlass.Boolean(1)
                     if ab_producer_state.count < k_tile_cnt:
                         peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
@@ -1408,268 +1743,16 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
                 for idx in cutlass.range(5, unroll_full=True):
                     tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
-                cute.arch.fence_proxy("async.shared", space="cta")
+                cute.arch.fence_proxy(
+                    "async.shared",
+                    space="cta",
+                )
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
             #
             # Wait A/B buffer empty
             #
             ab_pipeline.producer_tail(ab_producer_state)
-            b_raw_pipeline.producer_tail(b_raw_producer_state)
-
-        #
-        # Specialized Transpose warps
-        # -------------------------
-        # Consume one stage of sB_raw (N-major, TMA-landed), repack nibbles
-        # into the K-major ``sB`` buffer, and signal b_mma_pipeline.
-        # Four cooperating warps × 32 lanes = 128 writer threads; each warp
-        # owns a contiguous 1/num_transpose_warps slice of N. Inside a warp,
-        # a hardware ``ldmatrix.m16n16.trans.b8`` moves a 16 K × 16 N-byte
-        # slab with byte-transposed destination in a single instruction,
-        # replacing the per-lane scalar byte loop. See FC1 N-major commits
-        # 3250be5, 0ee0490, 3465358, 630b542, 1a3c63e for the staged history
-        # and ``docs/nvfp4_prefill_n_major_weights_design.md`` for the design.
-        #
-        # CuteDSL doesn't like Python `and` on tracked boolean values; use two
-        # nested compile-folded comparisons instead. `warp_idx` is runtime but
-        # the pattern matches the existing `warp_idx == self.foo_warp_id`
-        # dispatch style used by the other specialised warps.
-        warp_in_transpose_runtime = warp_idx - self.transpose_warp_id_base
-        if (warp_in_transpose_runtime >= 0) & (
-            warp_in_transpose_runtime < self.num_transpose_warps
-        ):
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_transpose_warps)
-
-            b_raw_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.num_ab_stage
-            )
-            b_mma_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.num_ab_stage
-            )
-
-            tile_info_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.num_tile_stage
-            )
-
-            sB_raw_u8 = cute.recast_tensor(sB_raw, cutlass.Uint8)
-
-            n_tile = self.mma_tiler[1]
-            k_tile = self.mma_tiler[2]
-            n_half = n_tile // 2
-            k_half = k_tile // 2
-
-            # Plain K-inner uint8 layout for sB (N rows × K_byte cols × STAGE).
-            sB_u8_plain_layout = cute.make_layout(
-                (n_tile, k_half, self.num_ab_stage),
-                stride=(k_half, 1, n_tile * k_half),
-            )
-            # Compose with the same Swizzle object the FP4 sB uses, so accesses
-            # XOR through the same bit pattern tcgen05 encodes in its matrix
-            # descriptor.
-            sB_u8_composed_layout = cute.make_composed_layout(
-                b_smem_layout_staged.inner,
-                0,
-                sB_u8_plain_layout,
-            )
-            sB_u8_ptr = cute.recast_ptr(sB.iterator, dtype=cutlass.Uint8)
-            sB_u8 = cute.make_tensor(sB_u8_ptr, sB_u8_composed_layout)
-
-            # Work distribution: warp-level ``ldmatrix.m16n16.trans.b8`` loads.
-            # Each call reads a 16 K-row × 16 N-byte tile (= 256 source bytes,
-            # covering 16 K-values and all 32 N-FP4s of a 16-byte N-stripe)
-            # with hardware transpose. The ``.b8`` source format picks 16-byte
-            # rows, which matches ``sB_raw_u8``'s K-axis stride (64 B) and lets
-            # us tile N at 16-byte granularity from N_base_byte ∈ {0, 16, 32,
-            # 48} — the 16-byte row-alignment requirement is met naturally, in
-            # contrast to ``.b4x16_p64`` (8-byte rows) which forces every-other
-            # 16-FP4 stripe to be skipped.
-            #
-            # Warp split: each warp owns 16 N-bytes = 32 N-rows of sB output.
-            # Per warp: k_tile // 16 ldmatrix calls (one per K-tile), each
-            # producing 4 output u16s per lane at 4 distinct N-FP4 rows.
-            #
-            # Per lane TV (l = 16*g + 4*qq + w, g∈0..1, qq∈0..3, w∈0..3):
-            #   Owns dst-rows (qq + 4g, qq + 4g + 8) = N-byte indices within
-            #   the 16-byte tile; dst-cols 4w..4w+3 = K-values within tile.
-            lane = tidx % self.threads_per_warp
-            ldm_g = (lane >> 4) & 1
-            ldm_qq = (lane >> 2) & 3
-            ldm_w = lane & 3
-            # Lane's N-byte offsets within the warp's 16-byte stripe (same for
-            # every tile — only K_base varies across tiles).
-            nb_lo = ldm_qq + 4 * ldm_g             # 0..7  (dst-row of R0)
-            nb_hi = ldm_qq + 4 * ldm_g + 8          # 8..15 (dst-row of R1)
-            # Absolute N-byte in sB_raw_u8 (and sB N-FP4 after *2). The tile
-            # origin is the warp's stripe start, which is 16-aligned because
-            # warp_in_transpose_runtime * 16 ∈ {0, 16, 32, 48}.
-            warp_n_base_byte = warp_in_transpose_runtime * (n_half // self.num_transpose_warps)
-            abs_nb_lo = warp_n_base_byte + nb_lo
-            abs_nb_hi = warp_n_base_byte + nb_hi
-            # Absolute N-FP4 row indices in sB (stride k_half along N):
-            n_fp4_lo_even = 2 * abs_nb_lo
-            n_fp4_lo_odd = n_fp4_lo_even + 1
-            n_fp4_hi_even = 2 * abs_nb_hi
-            n_fp4_hi_odd = n_fp4_hi_even + 1
-            # K-byte base-offset within an N-row for this lane's stripe —
-            # 2 consecutive K-bytes per call (= kb=2w..2w+1).
-            kb_lane_off = 2 * ldm_w
-            # Each lane supplies the pointer to one ldmatrix "row" = K=lane_row
-            # of the current tile. lanes 0..15 carry the 16 row addresses;
-            # lanes 16..31 duplicate (only lanes 0..15 matter for .x1).
-            ldm_row_within_tile = lane & 0xF
-
-            # Masks for the even/odd nibble-compression PTX pattern. See
-            # comment at the pack-site below.
-            MASK_LO8 = cutlass.Uint32(0x0F)
-            MASK_HI8 = cutlass.Uint32(0xF0)
-            MASK_LO16 = cutlass.Uint32(0xF00)
-            MASK_HI16 = cutlass.Uint32(0xF000)
-
-            # Get the first tile info from pipeline
-            tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
-            tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-            for idx in cutlass.range(5, unroll_full=True):
-                tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
-            is_valid_tile = tile_info[3] == 1
-            cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared,
-                space=cute.arch.SharedSpace.shared_cta,
-            )
-            tile_info_pipeline.consumer_release(tile_info_consumer_state)
-            tile_info_consumer_state.advance()
-
-            while is_valid_tile:
-                for k_iter in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                    # Wait for producer TMA to fill sB_raw[stage]
-                    b_raw_pipeline.consumer_wait(b_raw_consumer_state)
-                    # Wait for MMA to signal sB[stage] empty (ready to write)
-                    b_mma_pipeline.producer_acquire(b_mma_producer_state)
-
-                    raw_stage = b_raw_consumer_state.index
-                    mma_stage = b_mma_producer_state.index
-
-                    # One ldmatrix.m16n16.x1.trans.b8 per 16-K-value tile.
-                    # At mma_tiler (K=128) this is k_tile // 16 = 8 calls per
-                    # warp per stage. The instruction loads a 16 K × 16 N-byte
-                    # slab of ``sB_raw_u8`` with byte-transposed destination:
-                    #   dst[r'][c'] = src-u8 at (K=c', N-byte=r')
-                    #                = { FP4(N=2*r', K=c'),
-                    #                    FP4(N=2*r'+1, K=c') } packed.
-                    #
-                    # Per lane ownership (see the lane-TV summary above):
-                    #   R0 = 4 dst bytes at (dst-row=nb_lo, dst-col=4w..4w+3)
-                    #   R1 = 4 dst bytes at (dst-row=nb_hi, dst-col=4w..4w+3)
-                    # i.e. 4 K-values × 2 N-bytes × 2 N-FP4 = 16 FP4s per lane
-                    # per tile, matching the 4-u16-output contribution below.
-                    for tile_idx in cutlass.range_constexpr(k_tile // 16):
-                        k_base = tile_idx * 16
-                        # Per-lane row pointer into sB_raw_u8 — lanes 0..15
-                        # each cover one K-row of the tile; lanes 16..31
-                        # duplicate (only lanes 0..15 matter for .x1).
-                        src_row = cute.domain_offset(
-                            (warp_n_base_byte, k_base + ldm_row_within_tile, raw_stage),
-                            sB_raw_u8,
-                        )
-                        r0, r1 = ldmatrix_m16n16_trans_b8(
-                            src_row.iterator.llvm_ptr
-                        )
-
-                        # Nibble-compress each ri into (even_ri, odd_ri) u16s.
-                        # ri = [b0 b1 b2 b3] where bi is a u8 at one K value
-                        # holding (N=2*nb even: low nib, N=2*nb+1 odd: high nib).
-                        # For N-even u16 at (kb=2w..2w+1):
-                        #   out[3:0]   = b0 low nib  = ri & 0x0F
-                        #   out[7:4]   = b1 low nib  = (ri >> 4) & 0xF0
-                        #   out[11:8]  = b2 low nib  = (ri >> 8) & 0xF00
-                        #   out[15:12] = b3 low nib  = (ri >> 12) & 0xF000
-                        # For N-odd u16: same with shifted source (+4 bits).
-                        even_r0 = (
-                            (r0 & MASK_LO8)
-                            | ((r0 >> 4) & MASK_HI8)
-                            | ((r0 >> 8) & MASK_LO16)
-                            | ((r0 >> 12) & MASK_HI16)
-                        )
-                        odd_r0 = (
-                            ((r0 >> 4) & MASK_LO8)
-                            | ((r0 >> 8) & MASK_HI8)
-                            | ((r0 >> 12) & MASK_LO16)
-                            | ((r0 >> 16) & MASK_HI16)
-                        )
-                        even_r1 = (
-                            (r1 & MASK_LO8)
-                            | ((r1 >> 4) & MASK_HI8)
-                            | ((r1 >> 8) & MASK_LO16)
-                            | ((r1 >> 12) & MASK_HI16)
-                        )
-                        odd_r1 = (
-                            ((r1 >> 4) & MASK_LO8)
-                            | ((r1 >> 8) & MASK_HI8)
-                            | ((r1 >> 12) & MASK_LO16)
-                            | ((r1 >> 16) & MASK_HI16)
-                        )
-
-                        # Store 4 u16s at 4 distinct (N-FP4, kb) destinations.
-                        # kb=k_base/2 + 2w..2w+1 (two K-bytes per u16).
-                        kb_tile_off = (k_base >> 1) + kb_lane_off
-                        dst_lo_even = cute.domain_offset(
-                            (n_fp4_lo_even, kb_tile_off, mma_stage), sB_u8
-                        )
-                        dst_lo_odd = cute.domain_offset(
-                            (n_fp4_lo_odd, kb_tile_off, mma_stage), sB_u8
-                        )
-                        dst_hi_even = cute.domain_offset(
-                            (n_fp4_hi_even, kb_tile_off, mma_stage), sB_u8
-                        )
-                        dst_hi_odd = cute.domain_offset(
-                            (n_fp4_hi_odd, kb_tile_off, mma_stage), sB_u8
-                        )
-                        st_shared_b16(dst_lo_even, even_r0)
-                        st_shared_b16(dst_lo_odd, odd_r0)
-                        st_shared_b16(dst_hi_even, even_r1)
-                        st_shared_b16(dst_hi_odd, odd_r1)
-
-                    # Fence so the MMA warp's async proxy view sees the
-                    # transpose writes before it issues tcgen05.mma.
-                    cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared,
-                        space=cute.arch.SharedSpace.shared_cta,
-                    )
-
-                    # Sync across all transpose warps so warp 0 can safely
-                    # release sB_raw back to TMA (otherwise warps 1..N might
-                    # still be reading it).
-                    self.transpose_sync_barrier.arrive_and_wait()
-
-                    # Release sB_raw (TMA-refill slot) — guarded to warp 0 of
-                    # the transpose group because ``PipelineTmaAsync.consumer_release``
-                    # elects ``lane < cluster_size`` (=1) per *warp* as the
-                    # signalling thread; letting all 4 warps call it would
-                    # over-arrive the empty barrier.
-                    if warp_in_transpose_runtime == 0:
-                        b_raw_pipeline.consumer_release(b_raw_consumer_state)
-
-                    # producer_commit on b_mma uses PipelineAsync semantics:
-                    # every thread arrives once, producer_group size matches
-                    # num_transpose_warps * 32 so the barrier flips only after
-                    # all transpose threads have written their share.
-                    b_mma_pipeline.producer_commit(b_mma_producer_state)
-
-                    b_raw_consumer_state.advance()
-                    b_mma_producer_state.advance()
-
-                # Advance to next tile
-                tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                for idx in cutlass.range(5, unroll_full=True):
-                    tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
-                is_valid_tile = tile_info[3] == 1
-                cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
-                )
-                tile_info_pipeline.consumer_release(tile_info_consumer_state)
-                tile_info_consumer_state.advance()
-
-            b_mma_pipeline.producer_tail(b_mma_producer_state)
 
         #
         # Specialized MMA warp
@@ -1702,6 +1785,7 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
             tCtSFA = cute.make_tensor(sfa_tmem_ptr, tCtSFA_layout)
 
             # Make SFB tmem tensor
+            # Make SFB tmem tensor
             sfb_tmem_ptr = cute.recast_ptr(
                 acc_tmem_ptr + self.num_accumulator_tmem_cols + self.num_sfa_tmem_cols,
                 dtype=self.sf_dtype,
@@ -1731,10 +1815,6 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
             ab_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_ab_stage
             )
-            # Consume the transpose warp's output sB before each MMA atom.
-            b_mma_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.num_ab_stage
-            )
             acc_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_acc_stage
             )
@@ -1749,14 +1829,16 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
             for idx in cutlass.range(5, unroll_full=True):
                 tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
-            cute.arch.fence_proxy("async.shared", space="cta")
+            cute.arch.fence_proxy(
+                "async.shared",
+                space="cta",
+            )
             tile_info_pipeline.consumer_release(tile_info_consumer_state)
             tile_info_consumer_state.advance()
 
             while is_valid_tile:
                 # Peek (try_wait) AB buffer full for k_tile = 0
                 ab_consumer_state.reset_count()
-                b_mma_consumer_state.reset_count()
                 peek_ab_full_status = cutlass.Boolean(1)
                 if ab_consumer_state.count < k_tile_cnt and is_leader_cta:
                     peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state)
@@ -1816,12 +1898,8 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
                 #
                 for k_tile in cutlass.range(k_tile_cnt):
                     if is_leader_cta:
-                        # Conditionally wait for AB buffer full (A, SFA, SFB).
+                        # Conditionally wait for AB buffer full
                         ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
-                        # Wait for the transpose warp to finish filling sB for
-                        # this stage. The N-major -> K-major repack is on the
-                        # critical path just like the TMA arrivals.
-                        b_mma_pipeline.consumer_wait(b_mma_consumer_state)
 
                         #  Copy SFA/SFB from smem to tmem
                         s2t_stage_coord = (
@@ -1877,13 +1955,11 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
                             # Enable accumulate on tCtAcc after first kblock
                             tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
-                        # Async arrive AB buffer empty + B_mma empty.
+                        # Async arrive AB buffer empty
                         ab_pipeline.consumer_release(ab_consumer_state)
-                        b_mma_pipeline.consumer_release(b_mma_consumer_state)
 
                     # Peek (try_wait) AB buffer full for k_tile = k_tile + 1
                     ab_consumer_state.advance()
-                    b_mma_consumer_state.advance()
                     peek_ab_full_status = cutlass.Boolean(1)
                     if ab_consumer_state.count < k_tile_cnt:
                         if is_leader_cta:
@@ -1904,7 +1980,10 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
                 for idx in cutlass.range(5, unroll_full=True):
                     tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
-                cute.arch.fence_proxy("async.shared", space="cta")
+                cute.arch.fence_proxy(
+                    "async.shared",
+                    space="cta",
+                )
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
             #
@@ -1969,7 +2048,10 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
             for idx in cutlass.range(5, unroll_full=True):
                 tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
-            cute.arch.fence_proxy("async.shared", space="cta")
+            cute.arch.fence_proxy(
+                "async.shared",
+                space="cta",
+            )
             tile_info_pipeline.consumer_release(tile_info_consumer_state)
             tile_info_consumer_state.advance()
 
@@ -1982,8 +2064,35 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
                 #
                 # Get alpha for current group
                 #
+
                 expert_idx = mma_tile_coord_mnl[2]
-                alpha_val = alpha[expert_idx]
+                alpha_val = alpha_tuple[0][expert_idx - self.b_tensor_l_offsets[0]]
+                if cutlass.const_expr(self.num_b_tensors == 1):
+                    pass
+                elif cutlass.const_expr(self.num_b_tensors == 2):
+                    if expert_idx >= self.b_tensor_l_offsets[1]:
+                        alpha_val = alpha_tuple[1][expert_idx - self.b_tensor_l_offsets[1]]
+                elif cutlass.const_expr(self.num_b_tensors == 3):
+                    if (
+                        expert_idx >= self.b_tensor_l_offsets[1]
+                        and expert_idx < self.b_tensor_l_offsets[2]
+                    ):
+                        alpha_val = alpha_tuple[1][expert_idx - self.b_tensor_l_offsets[1]]
+                    elif expert_idx >= self.b_tensor_l_offsets[2]:
+                        alpha_val = alpha_tuple[2][expert_idx - self.b_tensor_l_offsets[2]]
+                else:
+                    if (
+                        expert_idx >= self.b_tensor_l_offsets[1]
+                        and expert_idx < self.b_tensor_l_offsets[2]
+                    ):
+                        alpha_val = alpha_tuple[1][expert_idx - self.b_tensor_l_offsets[1]]
+                    elif (
+                        expert_idx >= self.b_tensor_l_offsets[2]
+                        and expert_idx < self.b_tensor_l_offsets[3]
+                    ):
+                        alpha_val = alpha_tuple[2][expert_idx - self.b_tensor_l_offsets[2]]
+                    elif expert_idx >= self.b_tensor_l_offsets[3]:
+                        alpha_val = alpha_tuple[3][expert_idx - self.b_tensor_l_offsets[3]]
 
                 tile_m_start = tile_info[0] * self.cta_tile_shape_mnk[0]
                 permuted_row = tile_m_start + epi_tidx
@@ -2011,7 +2120,7 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 #
                 # Process sub-tiles with vectorized scatter-add
-                # Following TensorRT-LLM's direct G2R (global to register) approach
+                # Use direct G2R (global to register) for router scales.
                 #
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
 
@@ -2019,7 +2128,7 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
                     token_idx = expanded_idx // topK
                     topk_idx = expanded_idx % topK
                     token_scale = token_final_scales[(token_idx, topk_idx)]
-                    alpha_val = alpha_val * token_scale
+                    alpha_val = alpha_val * token_scale * down_input_scale[expert_idx]
 
                 for subtile_idx in cutlass.range(subtile_cnt):
                     real_subtile_idx = subtile_idx
@@ -2080,11 +2189,6 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
                                     vectorized_atomic_add_bf16x8(
                                         rOut_epi_packed, scatter_out_offset
                                     )
-                                elif cutlass.const_expr(self.out_dtype == cutlass.Float16):
-                                    rOut_epi_packed = rOut_epi[index, None, None]
-                                    vectorized_atomic_add_fp16x8(
-                                        rOut_epi_packed, scatter_out_offset
-                                    )
                                 elif cutlass.const_expr(self.out_dtype == cutlass.Float32):
                                     rOut_epi_packed = rOut_epi[index, None]
                                     vectorized_atomic_add_fp32x2(
@@ -2095,7 +2199,10 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
                                     atomic_add_func(rOut_epi_packed, scatter_out_offset)
 
                 if cutlass.const_expr(self.use_blkred):
-                    cute.arch.fence_proxy("async.shared", space="cta")
+                    cute.arch.fence_proxy(
+                        "async.shared",
+                        space="cta",
+                    )
                 #
                 # Async arrive accumulator buffer empty
                 #
@@ -2106,7 +2213,10 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
                     acc_consumer_state.advance()
 
                 if cutlass.const_expr(self.use_blkred):
-                    cute.arch.fence_proxy("async.shared", space="cta")
+                    cute.arch.fence_proxy(
+                        "async.shared",
+                        space="cta",
+                    )
                     if is_valid_row:
                         coord_n = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1]
                         scatter_out_offset = cute.domain_offset((token_idx, coord_n, 0), out)
@@ -2136,7 +2246,10 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
                 for idx in cutlass.range(5, unroll_full=True):
                     tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
-                cute.arch.fence_proxy("async.shared", space="cta")
+                cute.arch.fence_proxy(
+                    "async.shared",
+                    space="cta",
+                )
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
             #
@@ -2319,13 +2432,9 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
             (cta_tile[0], cta_tile[1]), stride=(cta_tile[1] + swizzled_pad, 1)
         )
 
-        # Extra cost for the N-major B_raw staging buffer (same byte count as
-        # the K-major sB, because both are (N_TILE, K_TILE) FP4 tiles).
-        b_raw_bytes_per_stage = cute.size_in_bytes(b_dtype, b_smem_layout_staged_one)
         ab_bytes_per_stage = (
             cute.size_in_bytes(a_dtype, a_smem_layout_stage_one)
             + cute.size_in_bytes(b_dtype, b_smem_layout_staged_one)
-            + b_raw_bytes_per_stage
             + cute.size_in_bytes(sf_dtype, sfa_smem_layout_staged_one)
             + cute.size_in_bytes(sf_dtype, sfb_smem_layout_staged_one)
         )
@@ -2400,7 +2509,6 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
     ) -> Union[cpasync.CopyBulkTensorTileG2SMulticastOp, cpasync.CopyBulkTensorTileG2SOp]:
         """
         Select the appropriate TMA copy atom based on the number of SMs and the multicast flag.
-        Only 1CTA mode is supported.
 
         :param atom_sm_cnt: The number of SMs
         :type atom_sm_cnt: cutlass.Int32
@@ -2412,7 +2520,11 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
 
         :raise ValueError: If the atom_sm_cnt is invalid
         """
-        if atom_sm_cnt == 1 and mcast:
+        if atom_sm_cnt == 2 and mcast:
+            return cpasync.CopyBulkTensorTileG2SMulticastOp(tcgen05.CtaGroup.TWO)
+        elif atom_sm_cnt == 2 and not mcast:
+            return cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.TWO)
+        elif atom_sm_cnt == 1 and mcast:
             return cpasync.CopyBulkTensorTileG2SMulticastOp(tcgen05.CtaGroup.ONE)
         elif atom_sm_cnt == 1 and not mcast:
             return cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
@@ -2495,9 +2607,7 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
         """
         is_valid = True
 
-        # N-major kernel: A must be K-major, B must be N-major (the in-flight
-        # SMEM transpose produces the K-major layout the MMA needs).
-        if ab_dtype is cutlass.Float4E2M1FN and not (a_major == "k" and b_major == "n"):
+        if ab_dtype is cutlass.Float4E2M1FN and not (a_major == "k" and b_major == "k"):
             is_valid = False
         if out_dtype is cutlass.Float4E2M1FN and out_major == "m":
             is_valid = False
@@ -2509,9 +2619,10 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
         cluster_shape_mn: Tuple[int, int],
     ) -> bool:
         """
-        Check if the mma tiler and cluster shape are valid.
-        Only 1CTA mode (mma_tiler_mn[0] == 128) is supported.
+        Check if the mma tiler and cluster shape are valid
 
+        :param use_2cta_instrs: Whether to use 2 CTA groups
+        :type use_2cta_instrs: bool
         :param mma_tiler_mn: The (M, N) shape of the MMA instruction tiler
         :type mma_tiler_mn: Tuple[int, int]
         :param cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster
@@ -2522,17 +2633,28 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
         """
         is_valid = True
 
-        # Only tile_size=128 (1CTA) is supported
-        if mma_tiler_mn[0] != 128:
+        # Skip invalid mma tile shape
+        if mma_tiler_mn[0] not in (128, 256):
             is_valid = False
         # Skip invalid mma tile n
         if mma_tiler_mn[1] not in (64, 128, 192, 256):
             is_valid = False
 
-        # N-major variant: only the trivial cluster shape is supported in
-        # this initial implementation. The B TMA atom is built with the
-        # low-level ``CopyBulkTensorTileG2SOp`` (no multicast).
-        if cluster_shape_mn != (1, 1):
+        # Skip illegal cluster shape
+        if (mma_tiler_mn[0] // cluster_shape_mn[0]) != 128:
+            is_valid = False
+
+        if (
+            cluster_shape_mn[0] * cluster_shape_mn[1] > 16
+            or cluster_shape_mn[0] <= 0
+            or cluster_shape_mn[1] <= 0
+            # Special cluster shape check for scale factor multicasts.
+            # Due to limited size of scale factors, we can't multicast among more than 4 CTAs.
+            or cluster_shape_mn[0] > 4
+            or cluster_shape_mn[1] > 4
+            or not is_power_of_2(cluster_shape_mn[0])
+            or not is_power_of_2(cluster_shape_mn[1])
+        ):
             is_valid = False
 
         return is_valid
@@ -2659,8 +2781,8 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
             m, n, k, l, ab_dtype, out_dtype, a_major, b_major, out_major
         ):
             can_implement = False
-        # Skip unsupported A/B layout (this kernel REQUIRES b_major == "n").
-        if not (a_major == "k" and b_major == "n"):
+        # Skip unsupported A/B layout
+        if not (a_major == "k" and b_major == "k"):
             can_implement = False
         return can_implement
 
@@ -2668,11 +2790,12 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
     def wrapper(
         self,
         a_ptr: cute.Pointer,
-        b_ptr: cute.Pointer,
+        b_ptr_tuple: Tuple[cute.Pointer, ...],
         a_sf_ptr: cute.Pointer,
-        b_sf_ptr: cute.Pointer,
+        b_sf_ptr_tuple: Tuple[cute.Pointer, ...],
         c_ptr: cute.Pointer,
-        alpha_ptr: cute.Pointer,
+        alpha_ptr_tuple: Tuple[cute.Pointer, ...],
+        down_input_scale_ptr: cute.Pointer,
         tile_idx_to_group_idx_ptr: cute.Pointer,
         tile_idx_to_mn_limit_ptr: cute.Pointer,
         permuted_idx_to_expanded_idx_ptr: cute.Pointer,
@@ -2681,7 +2804,6 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
         m: cutlass.Int64,
         n: cutlass.Int64,
         k: cutlass.Int64,
-        l: cutlass.Int64,  # noqa: E741
         num_tokens: cutlass.Int64,
         top_k: cutlass.Int64,
         tile_size: cutlass.Constexpr,
@@ -2690,9 +2812,10 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
-        """Wrapper for single-B tensor mode.
+        """Unified wrapper supporting both single-B and multi-B tensors.
 
-        L is the total number of experts (single B tensor contains all experts).
+        B tensors are always passed as tuples (length 1 for single-B).
+        L sizes are configured via b_tensor_l_sizes in __init__.
         """
         scale_k = k // scaling_vector_size
         num_tiles = m // tile_size
@@ -2708,19 +2831,68 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
             c_ptr, layout=cute.make_ordered_layout((num_tokens, n, 1), order=(1, 0, 2))
         )
 
-        alpha_tensor = cute.make_tensor(alpha_ptr, layout=cute.make_layout((l,)))
-        # N-major B layout: N is the innermost axis on device. Only ``order``
-        # differs from the K-major kernel; the logical shape tuple stays
-        # ``(n, k, l)``. Strides become ``(1, n, n*k)``.
-        b = cute.make_tensor(
-            b_ptr, layout=cute.make_ordered_layout((n, k, l), order=(0, 1, 2))
+        l_0 = self.b_tensor_l_sizes[0]
+        alpha_0 = cute.make_tensor(alpha_ptr_tuple[0], layout=cute.make_layout((l_0,)))
+        b_0 = cute.make_tensor(
+            b_ptr_tuple[0], layout=cute.make_ordered_layout((n, k, l_0), order=(1, 0, 2))
         )
-        b_sf = cute.make_tensor(
-            b_sf_ptr,
+        b_sf_0 = cute.make_tensor(
+            b_sf_ptr_tuple[0],
             layout=cute.make_ordered_layout(
-                (32, 4, n // 128, 4, scale_k // 4, l), order=(2, 1, 4, 0, 3, 5)
+                (32, 4, n // 128, 4, scale_k // 4, l_0), order=(2, 1, 4, 0, 3, 5)
             ),
         )
+        b_tuple = [b_0]
+        b_sf_tuple = [b_sf_0]
+        alpha_tuple = [alpha_0]
+
+        if cutlass.const_expr(self.num_b_tensors >= 2):
+            l_1 = self.b_tensor_l_sizes[1]
+            alpha_1 = cute.make_tensor(alpha_ptr_tuple[1], layout=cute.make_layout((l_1,)))
+            b_1 = cute.make_tensor(
+                b_ptr_tuple[1], layout=cute.make_ordered_layout((n, k, l_1), order=(1, 0, 2))
+            )
+            b_sf_1 = cute.make_tensor(
+                b_sf_ptr_tuple[1],
+                layout=cute.make_ordered_layout(
+                    (32, 4, n // 128, 4, scale_k // 4, l_1), order=(2, 1, 4, 0, 3, 5)
+                ),
+            )
+            b_tuple.append(b_1)
+            b_sf_tuple.append(b_sf_1)
+            alpha_tuple.append(alpha_1)
+
+        if cutlass.const_expr(self.num_b_tensors >= 3):
+            l_2 = self.b_tensor_l_sizes[2]
+            alpha_2 = cute.make_tensor(alpha_ptr_tuple[2], layout=cute.make_layout((l_2,)))
+            b_2 = cute.make_tensor(
+                b_ptr_tuple[2], layout=cute.make_ordered_layout((n, k, l_2), order=(1, 0, 2))
+            )
+            b_sf_2 = cute.make_tensor(
+                b_sf_ptr_tuple[2],
+                layout=cute.make_ordered_layout(
+                    (32, 4, n // 128, 4, scale_k // 4, l_2), order=(2, 1, 4, 0, 3, 5)
+                ),
+            )
+            b_tuple.append(b_2)
+            b_sf_tuple.append(b_sf_2)
+            alpha_tuple.append(alpha_2)
+
+        if cutlass.const_expr(self.num_b_tensors >= 4):
+            l_3 = self.b_tensor_l_sizes[3]
+            alpha_3 = cute.make_tensor(alpha_ptr_tuple[3], layout=cute.make_layout((l_3,)))
+            b_3 = cute.make_tensor(
+                b_ptr_tuple[3], layout=cute.make_ordered_layout((n, k, l_3), order=(1, 0, 2))
+            )
+            b_sf_3 = cute.make_tensor(
+                b_sf_ptr_tuple[3],
+                layout=cute.make_ordered_layout(
+                    (32, 4, n // 128, 4, scale_k // 4, l_3), order=(2, 1, 4, 0, 3, 5)
+                ),
+            )
+            b_tuple.append(b_3)
+            b_sf_tuple.append(b_sf_3)
+            alpha_tuple.append(alpha_3)
 
         tile_idx_to_group_idx = cute.make_tensor(
             tile_idx_to_group_idx_ptr, layout=cute.make_layout((num_tiles,))
@@ -2738,71 +2910,27 @@ class BlockScaledContiguousGroupedGemmFinalizeNMajorKernel:
             token_final_scales_ptr,
             layout=cute.make_ordered_layout((num_tokens, top_k), order=(1, 0)),
         )
+        down_input_scale = cute.make_tensor(
+            down_input_scale_ptr,
+            layout=cute.make_layout((self.b_tensor_l_offsets[self.num_b_tensors],)),
+        )
 
         return self(
             a,
-            b,
+            tuple(b_tuple),
             c,
             a_sf,
-            b_sf,
+            tuple(b_sf_tuple),
             tile_idx_to_group_idx,
             num_non_exiting_tiles,
             tile_idx_to_mn_limit,
-            alpha_tensor,
+            tuple(alpha_tuple),
+            down_input_scale,
             max_active_clusters=max_active_clusters,
             stream=stream,
             permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
             token_final_scales=token_final_scales,
             epilogue_op=epilogue_op,
-        )
-
-    @cute.jit
-    def aot_wrapper(
-        self,
-        a: cute.Tensor,
-        b: cute.Tensor,
-        a_sf: cute.Tensor,
-        b_sf: cute.Tensor,
-        c: cute.Tensor,
-        alpha: cute.Tensor,
-        tile_idx_to_group_idx: cute.Tensor,
-        tile_idx_to_mn_limit: cute.Tensor,
-        permuted_idx_to_expanded_idx: cute.Tensor,
-        num_non_exiting_tiles: cute.Tensor,
-        token_final_scales: cute.Tensor,
-        max_active_clusters: cutlass.Constexpr,
-        stream: cuda.CUstream,
-    ):
-        """AOT entry point for FC2 that accepts pre-formed CuTe tensors.
-
-        Tensor layout contract (callers must match these exactly):
-
-        * ``a``       : ``(m, K, 1)``        order ``(1, 0, 2)``  FP4
-        * ``b``       : ``(N, K, L)``         order ``(0, 1, 2)``  FP4 (N-major)
-        * ``a_sf``    : ``(32, 4, m/128, 4, K/16/4, 1)`` order ``(2,1,4,0,3,5)``
-        * ``b_sf``    : ``(32, 4, N/128, 4, K/16/4, L)`` order ``(2,1,4,0,3,5)``
-        * ``c``       : ``(num_tokens, N, 1)`` order ``(1, 0, 2)``  BF16
-        * ``alpha``   : ``(L,)``
-        * ``tile_idx_to_group_idx`` : ``(num_tiles,)``
-        * ``tile_idx_to_mn_limit``  : ``(num_tiles,)``
-        * ``permuted_idx_to_expanded_idx`` : ``(m,)``
-        * ``num_non_exiting_tiles`` : ``(1,)``
-        * ``token_final_scales``    : ``(num_tokens, top_k)`` order ``(1, 0)``
-        """
-        return self(
-            a,
-            b,
-            c,
-            a_sf,
-            b_sf,
-            tile_idx_to_group_idx,
-            num_non_exiting_tiles,
-            tile_idx_to_mn_limit,
-            alpha,
-            max_active_clusters=max_active_clusters,
-            stream=stream,
-            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
-            token_final_scales=token_final_scales,
         )
 
 

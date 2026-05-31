@@ -20,8 +20,7 @@ Kernel groups:
   fmha             — Fused Multi-Head Attention (Blackwell persistent)
   ssd              — Mamba2 SSM chunk-scan prefill
   gemm             — Talker MLP GEMM (Ampere / Blackwell / BW GeForce)
-  nvfp4_moe        — NvFP4 MoE FC1+FC2 grouped GEMM (prefill)
-  nvfp4_moe_decode — NvFP4 MoE decode GEMV (scalar K-parallel dot-product)
+  nvfp4_moe        — split FC1/FC2 NVFP4 MoE (currently SM110/Thor only)
   nvfp4_fused_moe  — End-to-end NvFP4 fused MoE (Blackwell GeForce)
 
 Usage (run from the repo root):
@@ -66,7 +65,6 @@ _SCRIPT_DIR = Path(__file__).parent.resolve()
 _DEFAULT_OUTPUT_DIR = (_SCRIPT_DIR / "../cpp/kernels/cuteDSLArtifact").resolve()
 _CUTLASS_DSL_VERSION = "4.5.1"
 _CUPY_VERSIONS = {12: ("cupy-cuda12x", "12.3.0"), 13: ("cupy-cuda13x", "13.6.0")}
-
 # Common flag sets for FMHA variants
 _LLM = ["--is_causal", "--is_persistent", "--export_only", "--bottom_right_align"]
 _LLM_FP8 = _LLM + ["--in_dtype", "Float8E4M3FN"]
@@ -79,7 +77,8 @@ class KernelVariant:
 
     Attributes:
         name:          Unique identifier — used as --file_name / --function_prefix.
-        group:         Logical group ("gdn", "fmha", "nvfp4_moe", "nvfp4_fused_moe", "ssd", or "gemm"). cmake sets CUTE_DSL_<GROUP>_ENABLED.
+        group:         Logical group ("gdn", "fmha", "nvfp4_fused_moe",
+                       "nvfp4_moe", "ssd", or "gemm"). cmake sets CUTE_DSL_<GROUP>_ENABLED.
         supported_sms: Explicit SM whitelist. With --kernels ALL, only variants whose
                        supported_sms contains the detected/requested SM are compiled.
         script:        Kernel script path relative to kernelSrcs/.
@@ -106,8 +105,7 @@ class KernelVariant:
 #   fmha             — Fused Multi-Head Attention (Blackwell persistent)
 #   ssd              — Mamba2 SSM chunk-scan prefill
 #   gemm             — Talker MLP cuBLAS replacement (Ampere/Blackwell/BW GeForce)
-#   nvfp4_moe        — NvFP4 MoE FC1+FC2 grouped GEMM (prefill)
-#   nvfp4_moe_decode — NvFP4 MoE decode GEMV (scalar K-parallel dot-product)
+#   nvfp4_moe        — split FC1/FC2 NVFP4 MoE (currently SM110/Thor only)
 #   nvfp4_fused_moe  — End-to-end NvFP4 fused MoE (Blackwell GeForce)
 # ---------------------------------------------------------------------------
 KERNEL_VARIANTS = [
@@ -302,147 +300,111 @@ KERNEL_VARIANTS = [
         script="fmha_cutedsl_blackwell/fmha.py",
         script_args=["--q_shape", "1,1024,14,128", "--k_shape", "1,1024,14,128"] + _VIT,
     ),
-    # --- NvFP4 MoE group ---
-    # FC1 contiguous grouped GEMM: 2 activations x 2 N-tiles x 2 dtypes = 8 variants
-    # (identity is not exported — no production path uses identity FC1 here.)
+    # --- NvFP4 MoE group (decomposed FC1/FC2; SM110/Thor today) ---
+    # These variants build the decomposed grouped MoE pipeline:
+    #   FC1 gather grouped GEMM + activation + FP4 requant
+    #   FC2 grouped GEMM + router-scale finalize/scatter
     KernelVariant(
-        name="nvfp4_moe_fc1_relu2_n128_bf16",
+        name="nvfp4_moe_sm110_fc1_relu2_n128",
         group="nvfp4_moe",
         supported_sms=[100, 101, 110],
         script="nvfp4_moe_cutedsl/export_fc1_kernel.py",
-        script_args=["--activation", "relu2", "--mma_tiler_n", "128",
-                     "--output_dtype", "bf16", "--export_only"],
+        script_args=[
+            "--activation",
+            "relu2",
+            "--mma_tiler_n",
+            "128",
+            "--dummy-experts",
+            "128",
+            "--dummy-top-k",
+            "8",
+            "--export_only",
+        ],
     ),
     KernelVariant(
-        name="nvfp4_moe_fc1_relu2_n128_fp16",
+        name="nvfp4_moe_sm110_fc1_relu2_n256",
         group="nvfp4_moe",
         supported_sms=[100, 101, 110],
         script="nvfp4_moe_cutedsl/export_fc1_kernel.py",
-        script_args=["--activation", "relu2", "--mma_tiler_n", "128",
-                     "--output_dtype", "fp16", "--export_only"],
+        script_args=[
+            "--activation",
+            "relu2",
+            "--mma_tiler_n",
+            "256",
+            "--dummy-experts",
+            "128",
+            "--dummy-top-k",
+            "8",
+            "--export_only",
+        ],
     ),
     KernelVariant(
-        name="nvfp4_moe_fc1_relu2_n256_bf16",
+        name="nvfp4_moe_sm110_fc1_swiglu_n128",
         group="nvfp4_moe",
         supported_sms=[100, 101, 110],
         script="nvfp4_moe_cutedsl/export_fc1_kernel.py",
-        script_args=["--activation", "relu2", "--mma_tiler_n", "256",
-                     "--output_dtype", "bf16", "--export_only"],
+        script_args=[
+            "--activation",
+            "swiglu",
+            "--mma_tiler_n",
+            "128",
+            "--dummy-experts",
+            "128",
+            "--dummy-top-k",
+            "8",
+            "--export_only",
+        ],
     ),
     KernelVariant(
-        name="nvfp4_moe_fc1_relu2_n256_fp16",
+        name="nvfp4_moe_sm110_fc1_swiglu_n256",
         group="nvfp4_moe",
         supported_sms=[100, 101, 110],
         script="nvfp4_moe_cutedsl/export_fc1_kernel.py",
-        script_args=["--activation", "relu2", "--mma_tiler_n", "256",
-                     "--output_dtype", "fp16", "--export_only"],
+        script_args=[
+            "--activation",
+            "swiglu",
+            "--mma_tiler_n",
+            "256",
+            "--dummy-experts",
+            "128",
+            "--dummy-top-k",
+            "8",
+            "--export_only",
+        ],
     ),
     KernelVariant(
-        name="nvfp4_moe_fc1_swiglu_n128_bf16",
-        group="nvfp4_moe",
-        supported_sms=[100, 101, 110],
-        script="nvfp4_moe_cutedsl/export_fc1_kernel.py",
-        script_args=["--activation", "swiglu", "--mma_tiler_n", "128",
-                     "--output_dtype", "bf16", "--export_only"],
-    ),
-    KernelVariant(
-        name="nvfp4_moe_fc1_swiglu_n128_fp16",
-        group="nvfp4_moe",
-        supported_sms=[100, 101, 110],
-        script="nvfp4_moe_cutedsl/export_fc1_kernel.py",
-        script_args=["--activation", "swiglu", "--mma_tiler_n", "128",
-                     "--output_dtype", "fp16", "--export_only"],
-    ),
-    KernelVariant(
-        name="nvfp4_moe_fc1_swiglu_n256_bf16",
-        group="nvfp4_moe",
-        supported_sms=[100, 101, 110],
-        script="nvfp4_moe_cutedsl/export_fc1_kernel.py",
-        script_args=["--activation", "swiglu", "--mma_tiler_n", "256",
-                     "--output_dtype", "bf16", "--export_only"],
-    ),
-    KernelVariant(
-        name="nvfp4_moe_fc1_swiglu_n256_fp16",
-        group="nvfp4_moe",
-        supported_sms=[100, 101, 110],
-        script="nvfp4_moe_cutedsl/export_fc1_kernel.py",
-        script_args=["--activation", "swiglu", "--mma_tiler_n", "256",
-                     "--output_dtype", "fp16", "--export_only"],
-    ),
-    # FC2 finalize (grouped GEMM + scatter-reduce): 2 N-tiles x 2 dtypes = 4 variants
-    KernelVariant(
-        name="nvfp4_moe_fc2_n128_bf16",
+        name="nvfp4_moe_sm110_fc2_n128_fp16",
         group="nvfp4_moe",
         supported_sms=[100, 101, 110],
         script="nvfp4_moe_cutedsl/export_fc2_kernel.py",
-        script_args=["--mma_tiler_n", "128",
-                     "--output_dtype", "bf16", "--export_only"],
+        script_args=[
+            "--mma_tiler_n",
+            "128",
+            "--output_dtype",
+            "fp16",
+            "--dummy-experts",
+            "128",
+            "--dummy-top-k",
+            "8",
+            "--export_only",
+        ],
     ),
     KernelVariant(
-        name="nvfp4_moe_fc2_n128_fp16",
+        name="nvfp4_moe_sm110_fc2_n256_fp16",
         group="nvfp4_moe",
         supported_sms=[100, 101, 110],
         script="nvfp4_moe_cutedsl/export_fc2_kernel.py",
-        script_args=["--mma_tiler_n", "128",
-                     "--output_dtype", "fp16", "--export_only"],
-    ),
-    KernelVariant(
-        name="nvfp4_moe_fc2_n256_bf16",
-        group="nvfp4_moe",
-        supported_sms=[100, 101, 110],
-        script="nvfp4_moe_cutedsl/export_fc2_kernel.py",
-        script_args=["--mma_tiler_n", "256",
-                     "--output_dtype", "bf16", "--export_only"],
-    ),
-    KernelVariant(
-        name="nvfp4_moe_fc2_n256_fp16",
-        group="nvfp4_moe",
-        supported_sms=[100, 101, 110],
-        script="nvfp4_moe_cutedsl/export_fc2_kernel.py",
-        script_args=["--mma_tiler_n", "256",
-                     "--output_dtype", "fp16", "--export_only"],
-    ),
-    # --- NvFP4 MoE Decode GEMV group (SM100+) ---
-    # Scalar GEMV for MoE decode: K-parallel vectorized dot-product with
-    # atom-layout FP8 block scales (shared with prefill GEMM — no weight/scale
-    # duplication). 5 kernel variants compose into pipelines:
-    #   Nemotron (relu2):  up_none → dn_relu2
-    #   Mixtral  (silu):   up_none → dn_silu
-    #   LLaMA SwiGLU:      up_swiglu → dn_none     (fused interleaved FC1)
-    KernelVariant(
-        name="gemv_up_none",
-        group="nvfp4_moe",
-        supported_sms=[100, 101, 110],
-        script="nvfp4_moe_cutedsl/export_decode_gemv_kernel.py",
-        script_args=["--activation", "none"],
-    ),
-    KernelVariant(
-        name="gemv_up_swiglu",
-        group="nvfp4_moe",
-        supported_sms=[100, 101, 110],
-        script="nvfp4_moe_cutedsl/export_decode_gemv_kernel.py",
-        script_args=["--swiglu_up"],
-    ),
-    KernelVariant(
-        name="gemv_dn_relu2",
-        group="nvfp4_moe",
-        supported_sms=[100, 101, 110],
-        script="nvfp4_moe_cutedsl/export_decode_gemv_kernel.py",
-        script_args=["--activation", "relu2", "--output_atomic"],
-    ),
-    KernelVariant(
-        name="gemv_dn_silu",
-        group="nvfp4_moe",
-        supported_sms=[100, 101, 110],
-        script="nvfp4_moe_cutedsl/export_decode_gemv_kernel.py",
-        script_args=["--activation", "silu", "--output_atomic"],
-    ),
-    KernelVariant(
-        name="gemv_dn_none",
-        group="nvfp4_moe",
-        supported_sms=[100, 101, 110],
-        script="nvfp4_moe_cutedsl/export_decode_gemv_kernel.py",
-        script_args=["--activation", "none", "--output_atomic"],
+        script_args=[
+            "--mma_tiler_n",
+            "256",
+            "--output_dtype",
+            "fp16",
+            "--dummy-experts",
+            "128",
+            "--dummy-top-k",
+            "8",
+            "--export_only",
+        ],
     ),
     # --- NvFP4 Fused MoE group (SM120/SM121 — Blackwell GeForce) ---
     # Fused route/pack + FC1 + activation + quant + FC2 + scatter kernels.
@@ -451,7 +413,7 @@ KERNEL_VARIANTS = [
     #   see CuteDslNvfp4MoeRunner::kDecodePrefillCutoverRoutedRows).
     # Prefill backend: global task-queue driven producer/consumer overlap;
     #   best for large routed working sets.
-    # NvFP4MoEPluginGeforce scope: FP16 io_dtype + {identity, silu, swiglu, gelu, relu2}
+    # Nvfp4MoePlugin scope: FP16 io_dtype + {identity, silu, swiglu, gelu, relu2}
     # x {decode, prefill} x {n128 MMA N-tile} = 10 variants. Shape axes
     # N / E / top_k / hidden_size (K) are runtime (shape-polymorphic). The
     # MMA N-tile remains a compile-time variant axis. CuteDslNvfp4MoeRunner
@@ -1032,8 +994,20 @@ def _nvcc_version():
     return None
 
 
-def check_dependencies():
+def _cutlass_dsl_install_hint(cuda_ver):
+    package = "nvidia-cutlass-dsl"
+    if cuda_ver is not None and cuda_ver.split(".")[0] == "13":
+        package = "nvidia-cutlass-dsl[cu13]"
+    return f"pip install '{package}=={_CUTLASS_DSL_VERSION}'"
+
+
+def check_dependencies(sm=None, selected_groups=None):
     errors = []
+    selected_groups = set(selected_groups or [])
+
+    # Detect CUDA first so dependency fix hints can select the right CuTeDSL extra.
+    cuda_ver = _nvcc_version()
+    cutlass_dsl_fix = _cutlass_dsl_install_hint(cuda_ver)
 
     # nvidia-cutlass-dsl
     try:
@@ -1041,7 +1015,7 @@ def check_dependencies():
         if ver != _CUTLASS_DSL_VERSION:
             errors.append(
                 f"nvidia-cutlass-dsl: found {ver}, need {_CUTLASS_DSL_VERSION}\n"
-                f"  Fix: pip install nvidia-cutlass-dsl=={_CUTLASS_DSL_VERSION}"
+                f"  Fix: {cutlass_dsl_fix}"
             )
             lib_dir = None
         else:
@@ -1055,12 +1029,11 @@ def check_dependencies():
     except importlib.metadata.PackageNotFoundError:
         errors.append(
             f"nvidia-cutlass-dsl not found.\n"
-            f"  Fix: pip install nvidia-cutlass-dsl=={_CUTLASS_DSL_VERSION}"
+            f"  Fix: {cutlass_dsl_fix}"
         )
         lib_dir, ver = None, "unknown"
 
     # cupy
-    cuda_ver = _nvcc_version()
     if cuda_ver:
         major = int(cuda_ver.split(".")[0])
         if major in _CUPY_VERSIONS:
@@ -1202,12 +1175,13 @@ def build(args):
         print("No variants selected — nothing to build.")
         return
 
+    groups_selected = sorted({v.group for v in variants})
+
     # Check dependencies before cleaning — so a failed dep check doesn't
     # silently destroy a previously good build.
     print("\nChecking dependencies...")
-    dsl_ver, lib_dir, cuda_ver = check_dependencies()
+    dsl_ver, lib_dir, cuda_ver = check_dependencies(sm=sm, selected_groups=groups_selected)
 
-    groups_selected = sorted({v.group for v in variants})
     print(f"Groups      : {groups_selected}")
     print(f"Variants    : {[v.name for v in variants]}")
 
@@ -1328,9 +1302,9 @@ def main():
         "--kernels",
         default="ALL",
         help="Which kernels to build: ALL (default), a group name "
-             "(fmha | gdn | nvfp4_moe | nvfp4_fused_moe | ssd | gemm), "
-             "or a comma-separated list of group names. "
-             "Variants whose supported_sms does not include the target SM are skipped.",
+             "(fmha | gdn | nvfp4_moe | "
+             "nvfp4_fused_moe | ssd | gemm), or a comma-separated list "
+             "of group names. Variants whose supported_sms does not include the target SM are skipped.",
     )
     p.add_argument(
         "--output_dir",
