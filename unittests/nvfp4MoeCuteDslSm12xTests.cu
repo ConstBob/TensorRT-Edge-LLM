@@ -221,8 +221,7 @@ inline float silu(float x)
 
 // GeForce SwiGLU FC1 layout: projection[:I] are the "up" rows, projection[I:2I]
 // are the "gate" rows (plain concat -- NOT the SM110 64-row interleave).
-// Matches _concat_qwen3_swiglu_fc1 in tensorrt_edgellm/checkpoint/repacking.py
-// and apply_swiglu_concat() in tests/python-unittests/test_nvfp4_moe_geforce_plugin_accuracy.py.
+// Matches _concat_qwen3_swiglu_fc1 in tensorrt_edgellm/checkpoint/repacking.py.
 std::vector<float> applySwigluConcat(float const* projection, int32_t intermediateSize)
 {
     std::vector<float> out(static_cast<size_t>(intermediateSize), 0.0f);
@@ -366,9 +365,12 @@ CaseData buildCase(MoeCase const& cfg)
 }
 
 // ---------------------------------------------------------------------------
-// CPU reference: float[T, H]. Mirrors compute_reference in
-// tests/python-unittests/test_nvfp4_moe_geforce_plugin_accuracy.py using the
-// plain [up_all, gate_all] SwiGLU layout.
+// CPU reference: float[T, H]. For each (token, top-K slot) the path is
+// FP4-quantize hidden -> FC1 (dequantized weight @ hidden) * input_global_scale
+// -> SwiGLU (plain [up_all, gate_all] concat) or ReLU2 -> FP4-quantize
+// activation -> FC2 -> router-weighted scatter-add. FP4 / FP8 SF / alpha math
+// matches the SM12x fused wrappers so the kernel and reference agree up to
+// FP4 rounding noise.
 // ---------------------------------------------------------------------------
 std::vector<float> computeReference(CaseData const& c)
 {
@@ -691,9 +693,10 @@ TEST(CuteDslNvfp4MoeSm12xTest, accuracy)
         GTEST_SKIP() << "Failed to load SM12x NVFP4 fused MoE CuTeDSL kernel modules or canImplement returned false";
     }
 
-    // Same thresholds the python geforce plugin test uses for the
-    // non_uniform_scales=False config-mode cases
-    // (test_nvfp4_moe_geforce_plugin_accuracy.py).
+    // Loose-but-meaningful bands for NVFP4 MoE: cosine >= 0.94 catches sign /
+    // routing / activation bugs; magnitude ratio in [0.25, 3.0] catches gross
+    // scale drift (per-block FP8 SF, per-expert alpha, FC1/FC2 global scales)
+    // without flagging the expected FP4-quantization noise floor.
     constexpr double kMinCosine = 0.94;
     constexpr double kMinMagRatio = 0.25;
     constexpr double kMaxMagRatio = 3.00;
