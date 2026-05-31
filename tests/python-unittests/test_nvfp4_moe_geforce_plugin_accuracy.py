@@ -21,13 +21,13 @@ capability 12.1) with TensorRT Python and a plugin built with
 (rather than the default ``build*/`` discovery), set
 ``EDGELLM_NVFP4_MOE_PLUGIN_SO=/path/to/libNvInfer_edgellm_plugin.so``.
 
-This mirrors :mod:`test_nvfp4_moe_sm110_plugin_accuracy` with three deltas:
+Notes on the GeForce/Spark MoE plugin:
 
-1. Hardware gate is SM121 only (not SM110).
-2. Plugin creator name is ``NvFP4MoEPluginGeforce`` (not ``Nvfp4MoePlugin``).
-3. FC1 SwiGLU layout is the plain ``[up_all, gate_all]`` concat (not the
-   64-row up/gate interleave); see
-   ``_concat_qwen3_swiglu_fc1`` in ``tensorrt_edgellm/checkpoint/repacking.py``.
+1. Hardware gate is SM121 only.
+2. Plugin creator name is ``NvFP4MoEPluginGeforce``.
+3. FC1 SwiGLU layout is the plain ``[up_all, gate_all]`` concat (no row
+   interleave); see ``_concat_qwen3_swiglu_fc1`` in
+   ``tensorrt_edgellm/checkpoint/repacking.py``.
 """
 
 from __future__ import annotations
