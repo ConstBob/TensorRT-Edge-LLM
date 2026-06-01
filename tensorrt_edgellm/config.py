@@ -931,23 +931,24 @@ def _strip_vl_prefix(name: str) -> str:
 
 
 def _normalize_module_name(name: str) -> str:
-    """Normalise a checkpoint / hf_quant_config module name to the namespace
-    that ``make_linear`` uses (``model.layers.N...``, ``lm_head``, etc.).
+    """Normalise a checkpoint / hf_quant_config module name to the short
+    namespace that ``make_linear`` uses (``layers.N...``, ``lm_head``, etc.).
 
-    Handles compound VL prefixes like ``model.language_model.`` (Qwen3.5-VL)
-    which must be stripped and replaced with ``model.`` to match the module
-    tree built by the modeling code.  Single VL prefixes (``language_model.``,
-    ``text_model.``, ``llm.``) and the generic ``model.`` are stripped
-    without replacement.  At most one prefix is removed per key.
+    LLM ``make_linear`` callers pass names without any ``model.`` prefix
+    (see ``modeling_default.py``: ``module_name=f"layers.{i}.mlp.gate_proj"``).
+    For multimodal checkpoints whose keys are
+    ``model.language_model.layers.N...`` the entire compound prefix must be
+    stripped so the resulting short name matches what ``module_quant_type``
+    looks up.  Single VL prefixes and bare ``model.`` follow the same rule.
 
     Used by ``_effective_excluded_modules``, ``_detect_modelopt_unquantized_linears``,
     and ``_parse_mixed_precision`` so that ``excluded``, ``layer_overrides``,
     and ``module_name`` all share the same name space.
     """
-    # Compound VL prefix: strip outer wrapper, keep inner ``model.``.
-    # Must be checked before "model." to avoid partial strip.
     if name.startswith("model.language_model."):
-        return "model." + name[len("model.language_model."):]
+        return name[len("model.language_model."):]
+    if name.startswith("thinker.model."):
+        return name[len("thinker.model."):]
     for prefix in _VL_LLM_PREFIXES + ("model.", ):
         if name.startswith(prefix):
             return name[len(prefix):]
@@ -1372,12 +1373,24 @@ def _parse_mixed_precision(quantized_layers: dict) -> "tuple[str, int, dict]":
     dominant_algo = algo_count.most_common(1)[0][0]
     dominant_type = _algo_to_quant_type(dominant_algo)
     dominant_group_size = algo_group_size.get(dominant_algo, 1)
-    # Store ALL quantized layers so unlisted modules default to FP16
+    # Expand fused projection keys (``self_attn.qkv_proj``,
+    # ``mlp.gate_up_proj``) into the split names ``make_linear`` looks up
+    # (``q_proj``/``k_proj``/``v_proj`` and ``gate_proj``/``up_proj``).
     layer_overrides: dict = {}
     for name, layer_cfg in quantized_layers.items():
         algo = layer_cfg.get("quant_algo", "").upper()
         short_name = _normalize_module_name(name)
-        layer_overrides[short_name] = _algo_to_quant_type(algo)
+        quant_type = _algo_to_quant_type(algo)
+        if short_name.endswith(".self_attn.qkv_proj"):
+            prefix = short_name[:-len("qkv_proj")]
+            for proj in ("q_proj", "k_proj", "v_proj"):
+                layer_overrides[f"{prefix}{proj}"] = quant_type
+        elif short_name.endswith(".mlp.gate_up_proj"):
+            prefix = short_name[:-len("gate_up_proj")]
+            for proj in ("gate_proj", "up_proj"):
+                layer_overrides[f"{prefix}{proj}"] = quant_type
+        else:
+            layer_overrides[short_name] = quant_type
     return dominant_type, dominant_group_size, layer_overrides
 
 
