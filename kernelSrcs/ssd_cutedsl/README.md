@@ -93,7 +93,10 @@ pip install cuda-python==12.8.* cupy-cuda12x==12.3.0 # CUDA 12.x
 # or
 pip install cuda-python cupy-cuda13x==13.6.0 # CUDA 13.x
 
-pip install nvidia-cutlass-dsl==4.5.1
+# On CUDA 13 the [cu13] extra is required (use [cu12] on CUDA 12.x); the bare
+# package ships an nvvm that fails AOT export with
+# "NVVM_ERROR_INVALID_OPTION ... -arch=compute_a is an unsupported option".
+pip install 'nvidia-cutlass-dsl[cu13]==4.5.2'  # CUDA 13.x  (use [cu12] for CUDA 12.x)
 
 cd tensorrt-edge-llm
 

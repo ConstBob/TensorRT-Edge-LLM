@@ -84,36 +84,114 @@ Run on Thor (aarch64) or on a Blackwell box for local iteration.
 
 ### 4.1. Install AOT dependencies
 
+On CUDA 13 the `[cu13]` extra is **mandatory** (use `[cu12]` on CUDA 12.x):
+
 ```bash
 python3 -m pip install \
-  'nvidia-cutlass-dsl[cu13]==4.5.1' \
+  'nvidia-cutlass-dsl[cu13]==4.5.2' \
   cupy-cuda13x==13.6.0 \
   cuda-python
 ```
 
 | Dependency | Version | Notes |
 |---|---|---|
-| `nvidia-cutlass-dsl` | `4.5.1` | Pinned; CuTeDSL surface used by all groups |
+| `nvidia-cutlass-dsl` | `4.5.2` | Pinned; CuTeDSL surface used by all groups. **Always install the CUDA-matched extra** — `[cu13]` on CUDA 13, `[cu12]` on CUDA 12. |
 | `cupy-cuda13x`       | `13.6.0` | CUDA 13.x ; use `cupy-cuda12x==12.3.0` for CUDA 12.x |
 | `cuda-python`        | matches CUDA | Required by every group's AOT export |
 
-### 4.2. CuTeDSL 4.5.1 SM110a admission patch (one-time per env)
+### 4.2. CuTeDSL 4.5.2 SM110a admission patch (one-time per env)
 
-CuTeDSL 4.5.1 does not yet admit `Arch.sm_110a` in two `tcgen05` modules, so
-the AOT export will fail until the wheel is patched. Edit the installed
-package files under
+CuTeDSL 4.5.2 does not yet admit `Arch.sm_110a` in two `tcgen05` modules, so
+the SM110 AOT export fails until the installed wheel is patched. Apply the two
+edits below by hand to the files under
 `site-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/nvgpu/tcgen05/`:
 
-1. `mma.py` — append **both** `Arch.sm_101a` and `Arch.sm_110a` to
-   `BlockScaledMmaOp.admissible_archs` (currently lists `Arch.sm_100a`,
-   `Arch.sm_103a`). `Arch.sm_101a` is required because CuTeDSL internally
-   remaps `sm_110` to `sm_101a` for the blockscaled MMA path; both must be
-   admissible for the SM110 AOT export to succeed.
-2. `copy.py` — in `_S2TCopyBase.is_supported`, extend the `Arch.sm_100f`
-   family check to also accept the `Arch.sm_110f` family (which covers
-   `Arch.sm_110a`).
+1. **`mma.py`** — append **both** `Arch.sm_101a` and `Arch.sm_110a` to
+   `BlockScaledMmaOp.admissible_archs`. It currently lists:
+
+   ```python
+   admissible_archs = [
+       Arch.sm_100a,
+       Arch.sm_103a,
+   ]
+   ```
+
+   Add the two SM110 entries:
+
+   ```python
+   admissible_archs = [
+       Arch.sm_100a,
+       Arch.sm_103a,
+       Arch.sm_101a,
+       Arch.sm_110a,
+   ]
+   ```
+
+2. **`copy.py`** — in `_S2TCopyBase.is_supported`, broaden the `Arch.sm_100f`
+   family gate to also accept the `Arch.sm_110f` family (which covers
+   `Arch.sm_110a`). Change:
+
+   ```python
+   if not arch.is_family_of(Arch.sm_100f):
+   ```
+
+   to:
+
+   ```python
+   if not (arch.is_family_of(Arch.sm_100f) or arch.is_family_of(Arch.sm_110f)):
+   ```
+
+After editing, delete the stale bytecode so the patched source is picked up:
+
+```bash
+find "$(python3 -c 'import nvidia_cutlass_dsl, pathlib; print(pathlib.Path(nvidia_cutlass_dsl.__path__[0]))')" \
+  -name '*.pyc' -delete
+```
+
+**Root cause.** CuTeDSL remaps `sm_110` to `sm_101a`, which belongs to the
+`sm_110f` family (not `sm_100f`). `BlockScaledMmaOp` and the `_S2TCopyBase`
+copy op carry hardcoded allowlists that only include the `sm_100f` family, so
+SM110 is rejected until the two edits above are applied.
 
 Remove this section once upstream CuTeDSL ships SM110a support natively.
+
+#### 4.2.1. MoE on CUDA 13 (Thor) — additional fixes (not yet fully verified)
+
+> **Status.** The steps below are required to build the **NVFP4 MoE** kernels on
+> Thor with **CUDA 13**, but they are not yet fully verified end-to-end. The
+> §4.2 admission patches alone are enough on CUDA 12.x, where `sm_110a` is
+> aliased to the 3-character chip `101a` (which MLIR accepts). On CUDA 13
+> `sm_110` is canonical, no aliasing happens, the MLIR pass instead receives
+> `sm_110a` and produces a broken `chip = "a"`, so extra workarounds are needed.
+
+In addition to the §4.2 patches, building MoE on CUDA 13 also needs:
+
+1. **Override the export arch** to dodge the MLIR `chip = "a"` bug (applies to
+   all variants):
+
+   ```bash
+   export CUTE_DSL_ARCH=sm_100a
+   ```
+
+2. **Monkey-patch `cutlass.utils.HardwareInfo`** so JIT probing does not fail
+   with `sm_100a` on an SM110 device (needed for SSD Blackwell and NVFP4 MoE).
+
+3. **Monkey-patch `cute.testing.convert`** to skip the on-device FP8 conversion
+   that JIT-runs during export (needed for the FMHA FP8 variants in
+   export-only mode).
+
+| Fix | Purpose | Affects |
+|---|---|---|
+| `mma.py` admission edit (§4.2)        | Add `sm_101a` to the blockscaled MMA allowlist | NVFP4 MoE GEMM |
+| `copy.py` family edit (§4.2)          | Accept the `sm_110f` family in the copy op | NVFP4 MoE copy |
+| `CUTE_DSL_ARCH=sm_100a`               | Dodge the MLIR `chip = "a"` bug | All variants on CUDA 13 |
+| `HardwareInfo` monkey-patch           | Bypass JIT that fails with `sm_100a` on an SM110 device | SSD Blackwell, NVFP4 MoE |
+| `cute.testing.convert` monkey-patch   | Skip the on-device FP8 conversion | FMHA FP8 (export-only) |
+
+> **Not blocked on MoE?** If you only need the non-MoE kernels, skip the MoE
+> patches entirely and build just the groups you need, e.g.
+> `python kernelSrcs/build_cutedsl.py --kernels gdn fmha ssd`. The `gdn`,
+> `fmha`, and `ssd` groups do not need the MoE-specific CUDA 13 workarounds.
 
 ### 4.3. Generate the AOT artifact pack
 

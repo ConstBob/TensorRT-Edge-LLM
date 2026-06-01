@@ -110,19 +110,15 @@ Block scales use the contiguous physical CuTeDSL NVFP4 layout
 
 ## Build
 
-1. Generate the AOT artifact (requires `nvidia-cutlass-dsl==4.5.1`,
+1. Generate the AOT artifact (requires `nvidia-cutlass-dsl[cu13]==4.5.2`,
    `cuda-python`, `cupy-cuda13x`, and a sm_120 / sm_121 GPU):
 
    ```bash
    python kernelSrcs/build_cutedsl.py --kernels nvfp4_fused_moe
    ```
 
-   `nvidia-cutlass-dsl==4.5.1` supports the `sm_121a` architecture used by
+   `nvidia-cutlass-dsl==4.5.2` supports the `sm_121a` architecture used by
    SM121.
-   No local CuTeDSL source patch is required for fused MoE artifact generation on
-   SM121. `build_cutedsl.py --kernels nvfp4_fused_moe --gpu_arch sm_121` sets
-   `CUTE_DSL_ARCH=sm_121a` for fused MoE so the generated images target SM121
-   directly.
 
    Output lands in `cpp/kernels/cuteDSLArtifact/<arch>/<tag>/` and
    includes `cutedsl_nvfp4_fused_moe_all.h`.

@@ -70,7 +70,7 @@ Artifacts land in `cpp/kernels/cuteDSLArtifact/<arch>/<tag>/`:
 
 ## CuTeDSL SM121 Support
 
-`nvidia-cutlass-dsl==4.5.1` supports the `sm_121a` architecture used by
+`nvidia-cutlass-dsl==4.5.2` supports the `sm_121a` architecture used by
 DIGITS/GB10. For SM121 fused MoE builds, `build_cutedsl.py` sets
 `CUTE_DSL_ARCH=sm_121a` for this group so the generated image targets SM121
 directly instead of relying on an SM120-compatible cubin.
@@ -119,7 +119,7 @@ integration with the TRT Edge-LLM plugin system.
 
 ## Dependencies
 
-- `nvidia-cutlass-dsl == 4.5.1`
+- `nvidia-cutlass-dsl == 4.5.2` (install the `[cu13]`/`[cu12]` extra)
 - `cuda-python` (provides `cuda.bindings.driver`)
 - `cupy-cuda13x` (GPU memory allocation during AOT compilation)
 
@@ -131,7 +131,10 @@ pip install cuda-python==12.8.* cupy-cuda12x==12.3.0 # CUDA 12.x
 # or
 pip install cuda-python cupy-cuda13x==13.6.0 # CUDA 13.x
 
-pip install nvidia-cutlass-dsl==4.5.1
+# On CUDA 13 the [cu13] extra is required (use [cu12] on CUDA 12.x); the bare
+# package ships an nvvm that fails AOT export with
+# "NVVM_ERROR_INVALID_OPTION ... -arch=compute_a is an unsupported option".
+pip install 'nvidia-cutlass-dsl[cu13]==4.5.2'  # CUDA 13.x  (use [cu12] for CUDA 12.x)
 ```
 
 ## TensorRT plugin

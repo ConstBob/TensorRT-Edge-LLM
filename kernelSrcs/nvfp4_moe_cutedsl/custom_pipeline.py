@@ -43,7 +43,7 @@
 
 # This file is copied and modified from https://github.com/NVIDIA/cutlass/tree/main/python/CuTeDSL/cutlass/pipeline
 #
-# Upstream nvidia-cutlass-dsl 4.5.1 ships PipelineTmaUmma, PipelineUmmaAsync,
+# Upstream nvidia-cutlass-dsl 4.5.2 ships PipelineTmaUmma, PipelineUmmaAsync,
 # and PipelineAsyncUmma but does NOT provide a cp.async (LDGSTS) producer +
 # UMMA consumer pipeline. Upstream's PipelineAsyncUmma uses
 # PipelineOp.AsyncThread, whose producer arrival is a plain mbarrier_arrive

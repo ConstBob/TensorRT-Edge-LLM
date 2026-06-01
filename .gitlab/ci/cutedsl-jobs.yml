@@ -173,7 +173,7 @@ build_cutedsl_gb10_artifact:
     - echo "CUDA version:$(nvcc --version | grep release)"
     - echo "Building CuTe DSL artifact for GB10"
     - python3 -m venv "$CUTE_DSL_OUTPUT_DIR/venv/cutedsl"
-    - '"$CUTE_DSL_OUTPUT_DIR/venv/cutedsl/bin/pip" install -q ''nvidia-cutlass-dsl[cu13]==4.5.1'' cupy-cuda13x==13.6.0'
+    - '"$CUTE_DSL_OUTPUT_DIR/venv/cutedsl/bin/pip" install -q ''nvidia-cutlass-dsl[cu13]==4.5.2'' cupy-cuda13x==13.6.0'
     - '"$CUTE_DSL_OUTPUT_DIR/venv/cutedsl/bin/python" kernelSrcs/build_cutedsl.py --kernels ALL --gpu_arch sm_121 --arch aarch64 --output_dir "$CUTE_DSL_OUTPUT_DIR" --clean'
     - ARTIFACT_DIR="$CUTE_DSL_OUTPUT_DIR/aarch64/$CUTE_DSL_ARTIFACT_TAG"
     - test -f "$ARTIFACT_DIR/metadata.json"
@@ -230,7 +230,7 @@ build_cutedsl_sm110_artifact:
     CUTE_DSL_ARTIFACT_TAG: "sm_110"
     CUTE_DSL_BUILD_GPU_ARCH_ARG: ""
     CUTE_DSL_PATCH_SM110: "1"
-    CUTE_DSL_PACKAGE: "nvidia-cutlass-dsl[cu13]==4.5.1"
+    CUTE_DSL_PACKAGE: "nvidia-cutlass-dsl[cu13]==4.5.2"
     CUTE_DSL_CUPY_PACKAGE: "cupy-cuda13x==13.6.0"
   artifacts:
     name: "cutedsl-sm110-${CI_COMMIT_SHORT_SHA}"
@@ -252,7 +252,7 @@ build_cutedsl_sm87_cuda12_artifact:
     CUTE_DSL_ARTIFACT_NAME: "cutedsl_aarch64_sm_87_cuda12.tar.gz"
     CUTE_DSL_ARTIFACT_TAG: "sm_87"
     CUTE_DSL_BUILD_GPU_ARCH_ARG: "--gpu_arch sm_87"
-    CUTE_DSL_PACKAGE: "nvidia-cutlass-dsl[cu12]==4.5.1"
+    CUTE_DSL_PACKAGE: "nvidia-cutlass-dsl[cu12]==4.5.2"
     CUTE_DSL_CUPY_PACKAGE: "cupy-cuda12x==12.3.0"
   artifacts:
     name: "cutedsl-sm87-cuda12-${CI_COMMIT_SHORT_SHA}"

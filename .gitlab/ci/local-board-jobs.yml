@@ -23,7 +23,7 @@ l0_local_spark_build_and_test:
     - git submodule update --init --recursive
     - echo "Generating CuteDSL kernel artifacts (venv)"
     - python3 -m venv venv/cutedsl
-    - venv/cutedsl/bin/pip install -q 'nvidia-cutlass-dsl[cu13]==4.5.1' cupy-cuda13x==13.6.0
+    - venv/cutedsl/bin/pip install -q 'nvidia-cutlass-dsl[cu13]==4.5.2' cupy-cuda13x==13.6.0
     - venv/cutedsl/bin/python kernelSrcs/build_cutedsl.py --kernels ALL
     - echo "Building project with unit tests"
     - rm -rf build && mkdir build && cd build
