@@ -152,6 +152,7 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
     auto builderConfig = jsonConfig["builder_config"];
     mConfig.minImageTokensPerImage = builderConfig["min_image_tokens"].get<int64_t>();
     mConfig.maxImageTokensPerImage = builderConfig["max_image_tokens_per_image"].get<int64_t>();
+    mUseTrtNativeVitAttn = builderConfig.value("use_trt_native_vit_attn", false);
     if (mConfig.minImageTokensPerImage <= 0 || mConfig.maxImageTokensPerImage <= 0)
     {
         LOG_ERROR(
@@ -227,10 +228,32 @@ bool QwenViTRunner::allocateBuffer(cudaStream_t stream)
     mCuSeqlensHost = rt::Tensor(
         {mConfig.maxNumImages + 1}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "QwenViTRunner::mCuSeqlensHost");
 
-    mMaxSeqLenCarrier = rt::Tensor(
-        {mConfig.maxHW}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "QwenViTRunner::mMaxSeqLenCarrier");
-    setTensorAddressStatus
-        &= mVisualContext->setTensorAddress(binding_names::kMaxSeqLenCarrier, mMaxSeqLenCarrier.rawPointer());
+    // kv_lengths is required when using TRT-native attention (TRT >= 11).
+    // TRT IAttentionV2 requires query_lengths and kv_lengths to be distinct tensors,
+    // so we allocate a separate buffer and copy the same cu_seqlens data at runtime.
+    if (mUseTrtNativeVitAttn)
+    {
+        bool const hasKvLengths
+            = mVisualEngine->getTensorIOMode(binding_names::kKvLengths) != nvinfer1::TensorIOMode::kNONE;
+        if (!hasKvLengths)
+        {
+            LOG_ERROR("Config has use_trt_native_vit_attn=true but engine is missing kv_lengths binding");
+            return false;
+        }
+        mKvLengths = rt::Tensor(
+            {mConfig.maxNumImages + 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "QwenViTRunner::mKvLengths");
+        setTensorAddressStatus &= mVisualContext->setTensorAddress(binding_names::kKvLengths, mKvLengths.rawPointer());
+    }
+
+    mHasMaxSeqLenCarrier
+        = mVisualEngine->getTensorIOMode(binding_names::kMaxSeqLenCarrier) != nvinfer1::TensorIOMode::kNONE;
+    if (mHasMaxSeqLenCarrier)
+    {
+        mMaxSeqLenCarrier = rt::Tensor(
+            {mConfig.maxHW}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "QwenViTRunner::mMaxSeqLenCarrier");
+        setTensorAddressStatus
+            &= mVisualContext->setTensorAddress(binding_names::kMaxSeqLenCarrier, mMaxSeqLenCarrier.rawPointer());
+    }
 
     // In Qwen-VL, VIT input mHW is always numImageTokens * spatial_merge_size ** 2.
     auto const maxImageTokens = mConfig.maxHW / (mConfig.mergeSize * mConfig.mergeSize);
@@ -467,7 +490,10 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
     int64_t totalImageTokens = totalSeqLength / (mConfig.mergeSize * mConfig.mergeSize);
     check::check(mVitInput.reshape({totalSeqLength, mConfig.inputDim}), "Tensor reshape failed");
     check::check(mOutputEmbedding.reshape({totalImageTokens, mConfig.outHiddenSize}), "Tensor reshape failed");
-    check::check(mMaxSeqLenCarrier.reshape({maxSeqLen}), "Tensor reshape failed");
+    if (mHasMaxSeqLenCarrier)
+    {
+        check::check(mMaxSeqLenCarrier.reshape({maxSeqLen}), "Tensor reshape failed");
+    }
     // Record performance data
     int64_t imageCount = std::accumulate(numImages.begin(), numImages.end(), int64_t(0));
     mMultimodalMetrics.recordRun(imageCount, totalImageTokens);
@@ -482,6 +508,13 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
         check::check(mCuSeqlens.reshape({cuSeqlensSize}), "Tensor reshape failed");
         CUDA_CHECK(cudaMemcpyAsync(mCuSeqlens.rawPointer(), mCuSeqlensHost.rawPointer(),
             cuSeqlensSize * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+
+        if (mUseTrtNativeVitAttn)
+        {
+            check::check(mKvLengths.reshape({cuSeqlensSize}), "Tensor reshape failed");
+            CUDA_CHECK(cudaMemcpyAsync(mKvLengths.rawPointer(), mCuSeqlensHost.rawPointer(),
+                cuSeqlensSize * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        }
 
         check::check(mRotaryPosEmb.reshape({totalSeqLength, mConfig.vitPosEmbDim}), "Tensor reshape failed");
         // Compute rotary position embeddings
@@ -875,8 +908,16 @@ bool QwenViTRunner::infer(cudaStream_t stream) noexcept
             &= mVisualContext->setInputShape(binding_names::kRotaryPosEmb, mRotaryPosEmb.getShape().getTRTDims());
         setEngineIOStatus
             &= mVisualContext->setInputShape(binding_names::kCuSeqlens, mCuSeqlens.getShape().getTRTDims());
-        setEngineIOStatus &= mVisualContext->setInputShape(
-            binding_names::kMaxSeqLenCarrier, mMaxSeqLenCarrier.getShape().getTRTDims());
+        if (mUseTrtNativeVitAttn)
+        {
+            setEngineIOStatus
+                &= mVisualContext->setInputShape(binding_names::kKvLengths, mKvLengths.getShape().getTRTDims());
+        }
+        if (mHasMaxSeqLenCarrier)
+        {
+            setEngineIOStatus &= mVisualContext->setInputShape(
+                binding_names::kMaxSeqLenCarrier, mMaxSeqLenCarrier.getShape().getTRTDims());
+        }
         if (mModelType == multimodal::ModelType::QWEN2_5_VL)
         {
             setEngineIOStatus &= mVisualContext->setInputShape(

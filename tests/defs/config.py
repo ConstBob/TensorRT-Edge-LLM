@@ -270,6 +270,9 @@ class TestConfig:
     input_len: Optional[int] = None
     past_kv_len: Optional[int] = None
 
+    # Use TRT-native VIT attention (TRT >= 11) instead of ViTAttentionPlugin
+    trt_native_vit_attn: Optional[bool] = None
+
     # Debug flag for verbose output
     debug: Optional[bool] = None
 
@@ -460,6 +463,12 @@ class TestConfig:
             "vrms", {TaskType.EXPORT},
             {ModelType.LLM, ModelType.VLM, ModelType.TTS, ModelType.ASR},
             is_required=False),
+        ParameterSpec("trt_native_vit_attn",
+                      "trt11", {
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
+                          TaskType.INFERENCE
+                      }, {ModelType.LLM, ModelType.VLM, ModelType.OMNI},
+                      is_required=False),
         # kernel_bench parameters
         ParameterSpec("bench_mode",
                       "mode", {TaskType.KERNEL_BENCH}, {ModelType.LLM},
@@ -676,6 +685,8 @@ class TestConfig:
                 parsed_params['input_len'] = int(part[2:])
             elif part.startswith('pkv') and part[3:].isdigit():
                 parsed_params['past_kv_len'] = int(part[3:])
+            elif part == 'trt11':
+                parsed_params['trt_native_vit_attn'] = True
             else:
                 parsed_params['test_case'] = part
 
@@ -828,6 +839,23 @@ class TestConfig:
         # Set defaults after validation
         set_defaults()
 
+    def check_trt_native_vit_attn(self) -> None:
+        """Skip -trt11 tests when TRT < 11.
+
+        l0_jedha and l0_jedha_trt11 share the same test list but run
+        different TRT versions. The CI job sets TRT_VERSION.
+        """
+        if not self.trt_native_vit_attn:
+            return
+        trt_ver = os.environ.get('TRT_VERSION', '')
+        try:
+            major = int(trt_ver.split(".")[0])
+        except (ValueError, IndexError):
+            major = 0
+        if major < 11:
+            import pytest
+            pytest.skip(f"-trt11 requires TRT >= 11 (TRT_VERSION={trt_ver!r})")
+
     # Unified path generation methods
     def get_onnx_model_id(self) -> str:
         """Generate unique model identifier"""
@@ -836,6 +864,8 @@ class TestConfig:
             model_id += "-fp8kv"
         if self.reduced_vocab_size:
             model_id += f"-rvs{self.reduced_vocab_size}"
+        if self.trt_native_vit_attn:
+            model_id += "-trt11"
         return model_id
 
     def get_engine_id(self) -> str:
@@ -1272,7 +1302,10 @@ class TestConfig:
 
     def get_visual_onnx_dir(self, precision: str) -> str:
         """Get visual ONNX model directory"""
-        return os.path.join(self.get_onnx_base_dir(), f"visual-{precision}")
+        name = f"visual-{precision}"
+        if self.trt_native_vit_attn:
+            name += "-trt11"
+        return os.path.join(self.get_onnx_base_dir(), name)
 
     def get_llm_engine_dir(self) -> str:
         """Get LLM engine directory"""
@@ -1322,10 +1355,13 @@ class TestConfig:
 
     def get_visual_engine_dir(self) -> str:
         """Get visual engine directory"""
-        return os.path.join(
-            self.get_engine_base_dir(),
-            f"visual-{self.visual_precision}-mnit{self.min_image_tokens}-mxit{self.max_image_tokens}-mxpiit{self.max_image_tokens_per_image}"
-        )
+        name = (f"visual-{self.visual_precision}"
+                f"-mnit{self.min_image_tokens}"
+                f"-mxit{self.max_image_tokens}"
+                f"-mxpiit{self.max_image_tokens_per_image}")
+        if self.trt_native_vit_attn:
+            name += "-trt11"
+        return os.path.join(self.get_engine_base_dir(), name)
 
     def get_multimodal_engine_dir(self) -> str:
         """OMNI multimodal engine parent dir.

@@ -800,6 +800,8 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
                     "norm_std", "patch_size", "downsample_ratio"):
             if key in config:
                 vis_cfg_out[key] = config[key]
+    if os.environ.get("USE_TRT_NATIVE_VIT_ATTN") == "1":
+        vis_cfg_out["use_trt_native_vit_attn"] = True
     cfg_out_path = os.path.join(visual_out_dir, "config.json")
     with open(cfg_out_path, "w") as f:
         json.dump(vis_cfg_out, f, indent=2)

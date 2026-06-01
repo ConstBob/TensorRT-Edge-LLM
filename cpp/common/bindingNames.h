@@ -316,6 +316,16 @@ inline constexpr char const* kRotaryPosEmb = "rotary_pos_emb";
 inline constexpr char const* kCuSeqlens = "cu_seqlens";
 
 /*!
+ * @brief KV sequence lengths for TRT-native attention (TRT >= 11).
+ *
+ * Same data as cu_seqlens but must be a separate tensor — TRT IAttentionV2
+ * requires distinct tensors for query_lengths and kv_lengths inputs.
+ *
+ * Shape: [num_images + 1] (INT32)
+ */
+inline constexpr char const* kKvLengths = "kv_lengths";
+
+/*!
  * @brief Shape-only input used to convey runtime max sequence-length for FMHA launch
  *
  * Shape: [max_seqlen] (INT32)

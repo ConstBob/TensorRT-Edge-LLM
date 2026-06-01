@@ -32,14 +32,14 @@ imported from the ``qwen3_vl`` module.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from ..linear import make_linear
-from ..ops import vit_attention_plugin
+from ..ops import get_vit_attention_fn, vit_attention_plugin, vit_trt_attention
 from ..qwen3_vl.modeling_qwen3_vl_visual import (RMSNorm, _load_weights,
                                                  apply_rotary_pos_emb_vision)
 
@@ -128,6 +128,7 @@ class Qwen2_5VLVisionAttention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
+        self._use_trt_attn = get_vit_attention_fn() is not vit_attention_plugin
         self.qkv = make_linear(
             model_config,
             hidden_size,
@@ -147,23 +148,34 @@ class Qwen2_5VLVisionAttention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen_carrier: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        kv_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
         q, k, v = self.qkv(hidden_states).reshape(
-            seq_length, 3, self.num_heads, self.head_dim).permute(1, 0, 2,
-                                                                  3).unbind(0)
+            seq_length, 3 * self.num_heads,
+            self.head_dim).split(self.num_heads, dim=1)
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
         q = q.to(torch.float16)
         k = k.to(torch.float16)
         v = v.to(torch.float16)
-        attn_output = vit_attention_plugin(q,
-                                           k,
-                                           v,
-                                           cu_seqlens,
-                                           max_seqlen_carrier,
-                                           num_heads=self.num_heads,
-                                           head_size=self.head_dim)
+        if self._use_trt_attn:
+            q = q * (self.head_dim**-0.5)
+            attn_output = vit_trt_attention(q,
+                                            k,
+                                            v,
+                                            cu_seqlens,
+                                            kv_lengths,
+                                            num_heads=self.num_heads,
+                                            head_size=self.head_dim)
+        else:
+            attn_output = vit_attention_plugin(q,
+                                               k,
+                                               v,
+                                               cu_seqlens,
+                                               max_seqlen_carrier,
+                                               num_heads=self.num_heads,
+                                               head_size=self.head_dim)
         attn_output = attn_output.reshape(seq_length, -1)
         return self.proj(attn_output)
 
@@ -200,10 +212,13 @@ class Qwen2_5VLVisionBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen_carrier: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        kv_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        hidden_states = hidden_states + self.attn(
-            self.norm1(hidden_states), cu_seqlens, max_seqlen_carrier,
-            position_embeddings)
+        hidden_states = hidden_states + self.attn(self.norm1(hidden_states),
+                                                  cu_seqlens,
+                                                  max_seqlen_carrier,
+                                                  position_embeddings,
+                                                  kv_lengths=kv_lengths)
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
         return hidden_states
 
@@ -319,6 +334,8 @@ class Qwen2_5VLVisualModel(nn.Module):
         cu_window_seqlens: torch.Tensor,
         window_index: torch.Tensor,
         reverse_window_index: torch.Tensor,
+        kv_lengths: Optional[torch.Tensor] = None,
+        kv_lengths_window: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         hidden_states = self.patch_embed(hidden_states)
 
@@ -345,13 +362,18 @@ class Qwen2_5VLVisualModel(nn.Module):
             if layer_num in self.fullatt_block_indexes:
                 cu_now = cu_seqlens
                 max_now = max_seqlen_carrier
+                kvl_now = kv_lengths
             else:
                 cu_now = cu_window_seqlens
                 max_now = torch.zeros(self.window_max_seqlen,
                                       dtype=torch.int32,
                                       device=hidden_states.device)
-            hidden_states = blk(hidden_states, cu_now, max_now,
-                                position_embeddings)
+                kvl_now = kv_lengths_window
+            hidden_states = blk(hidden_states,
+                                cu_now,
+                                max_now,
+                                position_embeddings,
+                                kv_lengths=kvl_now)
 
         hidden_states = self.merger(hidden_states)
         # Undo window ordering

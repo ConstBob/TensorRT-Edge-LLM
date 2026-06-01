@@ -223,6 +223,7 @@ def _run_export_subprocess(model_dir: str,
                            test_logger,
                            timeout: int,
                            extra_args: Optional[list] = None,
+                           extra_env: Optional[dict] = None,
                            failure_prefix: str = "checkpoint export") -> None:
     """Invoke ``python3 -m tensorrt_edgellm.scripts.export`` and fail on error.
 
@@ -237,7 +238,9 @@ def _run_export_subprocess(model_dir: str,
     if extra_args:
         export_cmd.extend(extra_args)
 
-    env_vars = _checkpoint_export_env(test_logger) or None
+    env_vars = _checkpoint_export_env(test_logger) or {}
+    if extra_env:
+        env_vars.update(extra_env)
 
     with timer_context(label, test_logger):
         result = run_command(export_cmd,
@@ -289,12 +292,18 @@ def run_checkpoint_export(config: TestConfig,
                 f"--max-kv-cache-capacity={config.max_kv_cache_capacity}")
             label += f" (mxkvc{config.max_kv_cache_capacity})"
 
+        extra_env = {}
+        if config.trt_native_vit_attn:
+            extra_env["USE_TRT_NATIVE_VIT_ATTN"] = "1"
+            label += " (TRT-native VIT attn)"
+
         _run_export_subprocess(model_dir,
                                tmp_dir,
                                label,
                                test_logger,
                                timeout,
-                               extra_args=extra_args)
+                               extra_args=extra_args,
+                               extra_env=extra_env or None)
 
         copy_tensorrt_edgellm_output(tmp_dir, config, test_logger=test_logger)
 

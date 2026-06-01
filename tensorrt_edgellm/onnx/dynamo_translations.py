@@ -557,6 +557,60 @@ def _vit_attention_plugin_translation(
 
 
 # ---------------------------------------------------------------------------
+# TRT-native ViT attention (TRT >= 11, packed NHD with Q scaling)
+# ---------------------------------------------------------------------------
+
+
+@script()
+def _vit_trt_attention_inner(
+    query_states: onnxscript.FLOAT16,
+    key_states: onnxscript.FLOAT16,
+    value_states: onnxscript.FLOAT16,
+    mask: onnxscript.FLOAT16,
+    query_lengths: onnxscript.INT32,
+    kv_lengths: onnxscript.INT32,
+) -> onnxscript.FLOAT16:
+    """Inner onnxscript function with all 6 positional inputs."""
+    return _trt.TRT_Attention(
+        query_states,
+        key_states,
+        value_states,
+        mask,
+        query_lengths,
+        kv_lengths,
+        query_form="packed_nhd",
+        kv_form="packed_nhd",
+        causal_kind="none",
+        TRT_decomposable=0,
+    )
+
+
+def _vit_trt_attention_translation(
+    query_states,
+    key_states,
+    value_states,
+    query_lengths,
+    kv_lengths,
+    num_heads,
+    head_size,
+):
+    """ViT ragged self-attention via TRT-native IAttention (packed NHD).
+
+    Q is expected to be pre-scaled by 1/sqrt(head_size) by the caller.
+    query_lengths and kv_lengths must be separate graph tensors — TRT
+    crashes when the same ONNX tensor is wired to both positions.
+    """
+    return _vit_trt_attention_inner(
+        query_states,
+        key_states,
+        value_states,
+        None,
+        query_lengths,
+        kv_lengths,
+    )
+
+
+# ---------------------------------------------------------------------------
 # TRT native attention ops (RotaryEmbedding, TensorScatter, Attention)
 # ---------------------------------------------------------------------------
 
@@ -864,6 +918,8 @@ def build_custom_translation_table() -> dict:
         _gated_delta_net_dispatch,
         torch.ops.trt.vit_attention_plugin.default:
         _vit_attention_plugin_translation,
+        torch.ops.trt.vit_trt_attention.default:
+        _vit_trt_attention_translation,
         torch.ops.trt.gather_nd.default:
         _gather_nd_translation,
         torch.ops.trt_edgellm.int4_moe_plugin.default:

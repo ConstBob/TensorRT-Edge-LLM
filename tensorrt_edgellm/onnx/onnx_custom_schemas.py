@@ -840,6 +840,89 @@ _attention_trt_native_schema = OpSchema(
     ],
 )
 
+_vit_trt_attention_schema = OpSchema(
+    name="TRT_Attention",
+    domain="trt",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc="TRT-native ViT attention (packed NHD, no causal mask, no KV cache).",
+    inputs=[
+        OpSchema.FormalParameter(
+            name="query",
+            description=
+            "Query tensor [total_S, H, D] (pre-scaled by 1/sqrt(D))",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="key",
+            description="Key tensor [total_S, H, D]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="value",
+            description="Value tensor [total_S, H, D]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="mask",
+            description="Unused — positional placeholder",
+            type_str="T",
+            param_option=OpSchema.FormalParameterOption.Optional,
+        ),
+        OpSchema.FormalParameter(
+            name="query_lengths",
+            description="Cumulative query lengths [B+1]",
+            type_str="tensor(int32)",
+            param_option=OpSchema.FormalParameterOption.Optional,
+        ),
+        OpSchema.FormalParameter(
+            name="kv_lengths",
+            description="Cumulative KV lengths [B+1]",
+            type_str="tensor(int32)",
+            param_option=OpSchema.FormalParameterOption.Optional,
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="attn_output",
+            description="Attention output [total_S, H, D]",
+            type_str="T",
+        ),
+    ],
+    type_constraints=[
+        (
+            "T",
+            ["tensor(float16)", "tensor(float)", "tensor(bfloat16)"],
+            "Input and output data type.",
+        ),
+    ],
+    attributes=[
+        OpSchema.Attribute(
+            name="query_form",
+            type=OpSchema.AttrType.STRING,
+            description="Query IO form",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="kv_form",
+            type=OpSchema.AttrType.STRING,
+            description="Key-value IO form",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="causal_kind",
+            type=OpSchema.AttrType.STRING,
+            description="Causal mask kind (none/upper_left/lower_right)",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="TRT_decomposable",
+            type=OpSchema.AttrType.INT,
+            description="Whether the attention can be decomposed",
+            required=False,
+        ),
+    ],
+)
+
 _gated_delta_net_schema = OpSchema(
     name="gated_delta_net",
     domain="trt_edgellm",
@@ -1281,6 +1364,7 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _rotary_embedding_schema,
     _tensor_scatter_schema,
     _attention_trt_native_schema,
+    _vit_trt_attention_schema,
     _gated_delta_net_schema,
     _int4_moe_plugin_schema,
     _nvfp4_moe_plugin_schema,

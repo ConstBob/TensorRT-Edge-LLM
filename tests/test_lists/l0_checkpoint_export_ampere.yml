@@ -7,6 +7,8 @@ tests:
   - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-0.6B-INT8-SQ-int8_sq]
   # Pre-quantized INT4 AWQ VLM (Qwen3-VL architecture)
   - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-VL-2B-Instruct-INT4-AWQ-int4_awq]
+  # Pre-quantized INT4 AWQ VLM with TRT-native VIT attention (TRT >= 11)
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-VL-2B-Instruct-INT4-AWQ-int4_awq-trt11]
   # Pre-quantized GPTQ VLM (InternVL3 architecture)
   - tests/defs/test_checkpoint_export.py::test_checkpoint_export[InternVL3-1B-GPTQ-Int4-int4_gptq]
   # LoRA insertion export (FP16 Qwen2.5)
