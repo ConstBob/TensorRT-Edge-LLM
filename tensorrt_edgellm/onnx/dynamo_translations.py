@@ -737,42 +737,6 @@ def _nvfp4_moe_plugin_geforce_translation(
     return output
 
 
-# ---------------------------------------------------------------------------
-# FusedGemmAllReducePlugin (row-parallel NVFP4 GEMM + AllReduce)
-# ---------------------------------------------------------------------------
-
-
-@script()
-def _fused_gemm_allreduce_translation(
-    hidden_states: onnxscript.FLOAT16,
-    global_scale: onnxscript.FLOAT,
-    weight_f4: onnxscript.INT8,
-    weight_f8_scale: onnxscript.FLOAT8E4M3FN,
-    weight_f32_scale: onnxscript.FLOAT,
-    tp_size: int,
-    fuse_residual_rmsnorm: int,
-) -> onnxscript.FLOAT16:
-    """Emit the full row-parallel NVFP4 GEMM + AllReduce ONNX subgraph."""
-    x_f4, sx_f8 = _trt.TRT_FP4DynamicQuantize(
-        hidden_states,
-        global_scale,
-        axis=-1,
-        block_size=16,
-        scale_type=17,
-        _outputs=2,
-    )
-    combined_scale = _trt.DequantizeLinear(sx_f8, global_scale)
-    return _trt_edgellm.FusedGemmAllReducePlugin(
-        x_f4,
-        combined_scale,
-        weight_f4,
-        weight_f8_scale,
-        weight_f32_scale,
-        tp_size=tp_size,
-        fuse_residual_rmsnorm=fuse_residual_rmsnorm,
-    )
-
-
 def build_custom_translation_table() -> dict:
     """Return the ``custom_translation_table`` for ``torch.onnx.export(dynamo=True)``.
 
@@ -832,6 +796,4 @@ def build_custom_translation_table() -> dict:
         _kv_cache_update_onnx_translation,
         torch.ops.trt.attention_onnx.default:
         _attention_onnx_translation,
-        torch.ops.trt_edgellm.fused_gemm_allreduce.default:
-        _fused_gemm_allreduce_translation,
     }

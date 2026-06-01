@@ -431,46 +431,6 @@ def generate_build_commands(
 
         commands.append((visual_cmd, 1200))
 
-    elif config.model_type == ModelType.VLA:
-        # llm_build, visual_build, action_build share the visual_engine_dir
-        # as the parent of visual/ and action/, matching what
-        # action_inference --multimodalEngineDir expects.
-        llm_cmd = [executable_files['llm_build']]
-        llm_cmd.extend([
-            f"--onnxDir={config.get_llm_onnx_dir()}",
-            f"--engineDir={config.get_llm_engine_dir()}",
-            f"--maxInputLen={config.max_input_len}",
-            f"--maxBatchSize={config.max_batch_size}",
-        ])
-        if config.max_kv_cache_capacity:
-            llm_cmd.append(
-                f"--maxKVCacheCapacity={config.max_kv_cache_capacity}")
-        if config.debug:
-            llm_cmd.append("--debug")
-        commands.append((llm_cmd, 1200))
-
-        visual_cmd = [executable_files['visual_build']]
-        visual_cmd.extend([
-            f"--onnxDir={config.get_visual_onnx_dir('fp16')}",
-            f"--engineDir={config.get_visual_engine_dir()}",
-            f"--minImageTokens={config.min_image_tokens}",
-            f"--maxImageTokens={config.max_image_tokens}",
-            f"--maxImageTokensPerImage={config.max_image_tokens_per_image}",
-        ])
-        if config.debug:
-            visual_cmd.append("--debug")
-        commands.append((visual_cmd, 1200))
-
-        action_cmd = [executable_files['action_build']]
-        action_cmd.extend([
-            f"--onnxDir={config.get_action_onnx_dir()}",
-            f"--engineDir={config.get_visual_engine_dir()}",
-            f"--maxBatchSize={config.max_batch_size}",
-        ])
-        if config.debug:
-            action_cmd.append("--debug")
-        commands.append((action_cmd, 1200))
-
     elif config.model_type == ModelType.TTS:
         # TTS: build talker + code_predictor LLM engines (under
         # ``llm-<llm_prec>-<lm_head_prec>/<talker|code_predictor>``).
@@ -614,22 +574,6 @@ def generate_inference_commands(
         commands.append((cmd, 6000))
         return commands
 
-    if config.model_type == ModelType.VLA:
-        cmd = [executable_files['action_inference']]
-        cmd.extend([
-            f"--engineDir={config.get_llm_engine_dir()}",
-            f"--multimodalEngineDir={config.get_visual_engine_dir()}",
-            f"--inputFile={config.get_test_case_file()}",
-            f"--outputFile={config.get_output_json_file()}",
-            "--dumpProfile",
-        ])
-        if config.warmup:
-            cmd.append(f"--warmup={config.warmup}")
-        if config.debug:
-            cmd.append("--debug")
-        commands.append((cmd, 6000))
-        return commands
-
     cmd = [executable_files['llm_inference']]
     cmd.extend([
         f"--engineDir={config.get_llm_engine_dir()}",
@@ -668,21 +612,6 @@ def generate_e2e_bench_commands(
         executable_files: Dict[str, str]) -> List[Tuple[List[str], int]]:
     """Generate e2e benchmark commands - returns list of (command, timeout) tuples"""
     commands = []
-
-    if config.model_type == ModelType.VLA:
-        cmd = [executable_files['action_inference']]
-        cmd.extend([
-            f"--engineDir={config.get_llm_engine_dir()}",
-            f"--multimodalEngineDir={config.get_visual_engine_dir()}",
-            f"--inputFile={config.get_test_case_file()}",
-            f"--outputFile={config.get_output_json_file()}",
-            "--dumpProfile",
-        ])
-        cmd.append(f"--warmup={config.warmup or 10}")
-        if config.debug:
-            cmd.append("--debug")
-        commands.append((cmd, 6000))
-        return commands
 
     cmd = [executable_files['llm_inference']]
     cmd.extend([

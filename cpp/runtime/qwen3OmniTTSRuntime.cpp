@@ -16,7 +16,6 @@
  */
 
 #include "qwen3OmniTTSRuntime.h"
-#include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
 #include "common/logger.h"
@@ -94,44 +93,6 @@ bool extractMLPWeightsFromTensors(std::vector<rt::Tensor>& tensors, rt::Tensor& 
 
     return true;
 }
-
-// Shared chunk accumulator + emitter for streaming RVQ codes.
-// Used by both runTalkerGenerationLoop (per-batch in TTS) and handleStreamingGeneration (bs=1 Omni)
-// so chunk semantics (threshold-triggered non-final emit + single final flush) live in one place.
-struct ChunkEmitter
-{
-    int32_t chunkFrames{0};
-    std::function<void(std::vector<std::vector<int32_t>> const& chunk, bool isFinal)> onChunk;
-    std::vector<std::vector<int32_t>> buffer;
-
-    bool active() const
-    {
-        return chunkFrames > 0 && static_cast<bool>(onChunk);
-    }
-
-    // Append a frame; emit non-final chunk when buffer hits the threshold.
-    void append(std::vector<int32_t> const& frame)
-    {
-        if (!active())
-            return;
-        buffer.push_back(frame);
-        if (static_cast<int32_t>(buffer.size()) >= chunkFrames)
-        {
-            onChunk(buffer, /*isFinal=*/false);
-            buffer.clear();
-        }
-    }
-
-    // Final flush — always invoked once per active emitter at end-of-stream, even if buffer empty
-    // (callers rely on this as the end-of-stream signal).
-    void flushFinal()
-    {
-        if (!active())
-            return;
-        onChunk(buffer, /*isFinal=*/true);
-        buffer.clear();
-    }
-};
 } // anonymous namespace
 
 Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
@@ -159,18 +120,18 @@ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std
     ELLM_CHECK(runnersInitialized, "Failed to initialize engine runners");
 
     // Setup shared execution context memory for Talker and CodePredictor engines.
-    // Both use kUSER_MANAGED allocation and require setContextMemory() before execution.
+    // LLMEngineRunner uses kUSER_MANAGED allocation and requires setContextMemory() before execution.
     {
-        int64_t const talkerCtxSize = mTalkerExec->getRequiredContextMemorySize();
-        int64_t const cpCtxSize = mCodePredictorExec ? mCodePredictorExec->getRequiredContextMemorySize() : 0;
+        int64_t const talkerCtxSize = mTalkerLLMRunner->getRequiredContextMemorySize();
+        int64_t const cpCtxSize = mCodePredictorRunner ? mCodePredictorRunner->getRequiredContextMemorySize() : 0;
         int64_t const sharedCtxSize = std::max(talkerCtxSize, cpCtxSize);
         LOG_INFO("Setup shared execution context memory: %zu bytes (talker: %zu, code_predictor: %zu)",
             static_cast<size_t>(sharedCtxSize), static_cast<size_t>(talkerCtxSize), static_cast<size_t>(cpCtxSize));
         mSharedExecContextMemory = rt::Tensor({sharedCtxSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8,
             "Qwen3OmniTTSRuntime::mSharedExecContextMemory");
-        bool const talkerCtxSet = mTalkerExec->setContextMemory(mSharedExecContextMemory);
+        bool const talkerCtxSet = mTalkerLLMRunner->setContextMemory(mSharedExecContextMemory);
         ELLM_CHECK(talkerCtxSet, "Failed to set context memory for Talker LLM engine");
-        ELLM_CHECK(!mCodePredictorExec || mCodePredictorExec->setContextMemory(mSharedExecContextMemory),
+        ELLM_CHECK(!mCodePredictorRunner || mCodePredictorRunner->setContextMemory(mSharedExecContextMemory),
             "Failed to set context memory for CodePredictor engine");
     }
 
@@ -267,7 +228,7 @@ Qwen3OmniTTSRuntime::~Qwen3OmniTTSRuntime()
 bool Qwen3OmniTTSRuntime::initializeEngineRunners(
     std::string const& talkerEngineDir, std::string const& codePredictorEngineDir)
 {
-    // Load Talker LLM engine via EngineExecutor (migrated from LLMEngineRunner)
+    // Load Talker LLM engine
     std::filesystem::path talkerEnginePath = std::filesystem::path(talkerEngineDir) / "llm.engine";
     std::filesystem::path talkerConfigPath = std::filesystem::path(talkerEngineDir) / "config.json";
 
@@ -275,18 +236,13 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
 
     try
     {
-        mTalkerLLMConfig = rt::parseEngineConfig(talkerConfigPath);
-        mTalkerExec = rt::EngineExecutor::createForLLM(talkerEnginePath, mTalkerLLMConfig);
         std::unordered_map<std::string, std::string> emptyLoraMap;
-        mTalkerSharedRes = rt::SharedResources::createForLLM(mTalkerLLMConfig, emptyLoraMap, mStream);
-        mTalkerPipelineIO = std::make_unique<rt::PipelineIO>(rt::PipelineIO::createForLLM(mTalkerLLMConfig, mStream));
-        mTalkerStepPreparer = std::make_unique<rt::StepPreparer>(mTalkerLLMConfig);
-        rt::buildTensorMap(
-            mTalkerTensorMap, *mTalkerPipelineIO, *mTalkerSharedRes, mTalkerLLMConfig, /*kvCacheIndex=*/0);
+        mTalkerLLMRunner = std::make_unique<LLMEngineRunner>(talkerEnginePath, talkerConfigPath, emptyLoraMap, mStream);
+        mTalkerLLMConfig = mTalkerLLMRunner->getEngineConfig();
 
         LOG_INFO("Talker LLM engine loaded: vocabSize=%d, hiddenSize=%d", mTalkerLLMConfig.vocabSize,
             mTalkerLLMConfig.hiddenSize);
-        auto talkerKVType = mTalkerLLMConfig.kvCacheDtype;
+        auto talkerKVType = mTalkerLLMRunner->getCacheManager().getKVCacheManager().getConfig().kvCacheType;
         LOG_INFO("Talker KV cache dtype: %s",
             talkerKVType == nvinfer1::DataType::kHALF ? "FP16"
                                                       : (talkerKVType == nvinfer1::DataType::kFP8 ? "FP8" : "UNKNOWN"));
@@ -297,7 +253,7 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
         return false;
     }
 
-    // Load CodePredictor engine via EngineExecutor (migrated from LLMEngineRunner)
+    // Load CodePredictor engine from separate directory
     std::filesystem::path codePredictorEnginePath = std::filesystem::path(codePredictorEngineDir) / "llm.engine";
     std::filesystem::path codePredictorConfigPath = std::filesystem::path(codePredictorEngineDir) / "config.json";
 
@@ -305,26 +261,23 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
 
     try
     {
-        mCodePredictorConfig = rt::parseEngineConfig(codePredictorConfigPath);
-        mCodePredictorExec = rt::EngineExecutor::createForLLM(codePredictorEnginePath, mCodePredictorConfig);
         std::unordered_map<std::string, std::string> emptyLoraMap;
-        mCodePredictorSharedRes = rt::SharedResources::createForLLM(mCodePredictorConfig, emptyLoraMap, mStream);
-        mCodePredictorPipelineIO
-            = std::make_unique<rt::PipelineIO>(rt::PipelineIO::createForLLM(mCodePredictorConfig, mStream));
-        mCodePredictorStepPreparer = std::make_unique<rt::StepPreparer>(mCodePredictorConfig);
-        rt::buildTensorMap(mCodePredictorTensorMap, *mCodePredictorPipelineIO, *mCodePredictorSharedRes,
-            mCodePredictorConfig, /*kvCacheIndex=*/0);
+        mCodePredictorRunner = std::make_unique<LLMEngineRunner>(
+            codePredictorEnginePath, codePredictorConfigPath, emptyLoraMap, mStream);
 
-        // CodePredictor ONNX outputs FP32 logits directly (lm_head applied in-engine via the
-        // dynamic lm_head_weight input). We rebind that input per RVQ head before each call.
+        // NOTE: CodePredictor ONNX now outputs FP32 logits directly (lm_head + cast in ONNX),
+        // so standard logits shape validation applies.
 
-        // Read CodePredictor dimensions from loaded config (vocab_size==hidden_size since
-        // engine output is last_hidden; real codebook_size is inferred from lm_head shape later)
+        mCodePredictorConfig = mCodePredictorRunner->getEngineConfig();
+
+        // Now read CodePredictor dimensions from loaded config
         mTalkerConfig.codePredictorHiddenSize = mCodePredictorConfig.hiddenSize;
+        // NOTE: config.vocab_size == hidden_size (for engine compatibility since output is last_hidden)
+        //       Real codebook_size is inferred from lm_head weight shape later
 
         LOG_INFO("CodePredictor engine loaded: vocabSize=%d, hiddenSize=%d, numLayers=%d",
             mCodePredictorConfig.vocabSize, mCodePredictorConfig.hiddenSize, mCodePredictorConfig.numDecoderLayers);
-        auto cpKVType = mCodePredictorConfig.kvCacheDtype;
+        auto cpKVType = mCodePredictorRunner->getCacheManager().getKVCacheManager().getConfig().kvCacheType;
         LOG_INFO("CodePredictor KV cache dtype: %s",
             cpKVType == nvinfer1::DataType::kHALF ? "FP16"
                                                   : (cpKVType == nvinfer1::DataType::kFP8 ? "FP8" : "UNKNOWN"));
@@ -584,36 +537,36 @@ bool Qwen3OmniTTSRuntime::allocateBuffer()
             = rt::Tensor({maxBS, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "mTalkerSelectedIndices");
         mHostSelectedTokenIds
             = rt::Tensor({maxBS}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "mHostSelectedTokenIds");
+        mHostTalkerContextLength
+            = rt::Tensor({maxBS}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "mHostTalkerContextLength");
 
-        // CodePredictor workspace — sized to maxBS so any batch in [1, maxBS] just reshapes per-call.
-        // Same pattern as Talker: framework primitives (EngineExecutor / StepPreparer) are
-        // batch-size-agnostic; the per-call reshape({activeBatchSize, ...}) makes them work.
-        mCodePredictorLogits = rt::Tensor({maxBS, mTalkerConfig.codebookSize}, rt::DeviceType::kGPU,
-            nvinfer1::DataType::kFLOAT, "mCodePredictorLogits");
+        // CodePredictor workspace — batch=1 (per-batch for-loop, each frame resets KV cache)
+        mCodePredictorLogits = rt::Tensor(
+            {1, mTalkerConfig.codebookSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "mCodePredictorLogits");
 
         mCodePredictorLogitsPerHead.resize(mNumRvqLayers);
         for (int32_t i = 0; i < mNumRvqLayers; ++i)
         {
-            mCodePredictorLogitsPerHead[i] = rt::Tensor({maxBS, mTalkerConfig.codebookSize}, rt::DeviceType::kGPU,
+            mCodePredictorLogitsPerHead[i] = rt::Tensor({1, mTalkerConfig.codebookSize}, rt::DeviceType::kGPU,
                 nvinfer1::DataType::kFLOAT, "mCodePredictorLogitsPerHead_" + std::to_string(i));
         }
 
-        mCodePredictorPrefillInput = rt::Tensor({maxBS, 2, mTalkerConfig.codePredictorHiddenSize}, rt::DeviceType::kGPU,
+        mCodePredictorPrefillInput = rt::Tensor({1, 2, mTalkerConfig.codePredictorHiddenSize}, rt::DeviceType::kGPU,
             nvinfer1::DataType::kHALF, "mCodePredictorPrefillInput");
         mCodePredictorCodecIds
-            = rt::Tensor({maxBS, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "mCodePredictorCodecIds");
-        mCodePredictorCodecEmbed = rt::Tensor({maxBS, 1, mTalkerConfig.codePredictorHiddenSize}, rt::DeviceType::kGPU,
+            = rt::Tensor({1, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "mCodePredictorCodecIds");
+        mCodePredictorCodecEmbed = rt::Tensor({1, 1, mTalkerConfig.codePredictorHiddenSize}, rt::DeviceType::kGPU,
             nvinfer1::DataType::kHALF, "mCodePredictorCodecEmbed");
-        mRawCodecEmbed = rt::Tensor({maxBS, 1, mTalkerConfig.talkerHiddenSize}, rt::DeviceType::kGPU,
-            nvinfer1::DataType::kHALF, "mRawCodecEmbed");
-        mSmallToMtpProjectedHidden = rt::Tensor({maxBS, mTalkerConfig.codePredictorHiddenSize}, rt::DeviceType::kGPU,
+        mRawCodecEmbed = rt::Tensor(
+            {1, 1, mTalkerConfig.talkerHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "mRawCodecEmbed");
+        mSmallToMtpProjectedHidden = rt::Tensor({1, mTalkerConfig.codePredictorHiddenSize}, rt::DeviceType::kGPU,
             nvinfer1::DataType::kHALF, "mSmallToMtpProjectedHidden");
         mCodePredictorSelectedIndices
-            = rt::Tensor({maxBS, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "mCodePredictorSelectedIndices");
+            = rt::Tensor({1, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "mCodePredictorSelectedIndices");
         mHostSelectedCodeIds
-            = rt::Tensor({maxBS}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "mHostSelectedCodeIds");
+            = rt::Tensor({1}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "mHostSelectedCodeIds");
         mHostCodePredictorContextLength
-            = rt::Tensor({maxBS}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "mHostCodePredictorContextLength");
+            = rt::Tensor({1}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "mHostCodePredictorContextLength");
 
         // Residual + decode buffers — batched for Talker engine execution
         mResidualEmbedBuffer = rt::Tensor({maxBS, 1, mTalkerConfig.talkerHiddenSize}, rt::DeviceType::kGPU,
@@ -643,12 +596,12 @@ bool Qwen3OmniTTSRuntime::allocateBuffer()
         // Generation loop workspace — Talker batched, CodePredictor batch=1
         mTalkerHiddenStatesBuffer = rt::Tensor({maxBS, maxSeqLen, talkerHiddenSize}, rt::DeviceType::kGPU,
             nvinfer1::DataType::kHALF, "mTalkerHiddenStatesBuffer");
-        mCodePredictorHiddenStatesBuffer = rt::Tensor({maxBS, mNumCodesPerFrame, mTalkerConfig.codePredictorHiddenSize},
+        mCodePredictorHiddenStatesBuffer = rt::Tensor({1, mNumCodesPerFrame, mTalkerConfig.codePredictorHiddenSize},
             rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "mCodePredictorHiddenStatesBuffer");
         mTalkerLastHidden = rt::Tensor(
             {maxBS, talkerHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "mTalkerLastHidden");
-        mCodecHiddensBuffer = rt::Tensor({maxBS, mNumCodesPerFrame, mTalkerConfig.talkerHiddenSize},
-            rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "mCodecHiddensBuffer");
+        mCodecHiddensBuffer = rt::Tensor({1, mNumCodesPerFrame, mTalkerConfig.talkerHiddenSize}, rt::DeviceType::kGPU,
+            nvinfer1::DataType::kHALF, "mCodecHiddensBuffer");
 
         // Trailing text hidden buffer: [maxBS * (maxSeqLen+1), H] — per-batch regions for Omni multi-batch
         mStreamingTrailingHidden = rt::Tensor({maxBS * (maxSeqLen + 1), talkerHiddenSize}, rt::DeviceType::kGPU,
@@ -849,15 +802,13 @@ bool Qwen3OmniTTSRuntime::executeTalkerPrefillStep(rt::Tensor const& inputEmbeds
     }
 
     // Reset Talker KV cache — shape must match batchSize so commitSequenceLength sees consistent activeBatchSize
-    auto& talkerCacheMgr = *mTalkerSharedRes->cacheManagers[0];
     check::check(mHostReuseKVCacheLengths.reshape({batchSize}), "Tensor reshape failed");
     std::fill_n(mHostReuseKVCacheLengths.dataPointer<int32_t>(), batchSize, 0);
-    talkerCacheMgr.resetForNewSequences(mHostReuseKVCacheLengths, stream);
+    mTalkerLLMRunner->getCacheManager().resetForNewSequences(mHostReuseKVCacheLengths, stream);
 
-    // Stage per-batch context lengths into PipelineIO's host buffer.
-    // StepPreparer consumes hostContextLengths to fill GPU contextLengths + selectTokenIndices.
-    check::check(mTalkerPipelineIO->hostContextLengths.reshape({batchSize}), "Tensor reshape failed");
-    int32_t* hostContextLength = mTalkerPipelineIO->hostContextLengths.dataPointer<int32_t>();
+    // Set per-batch context lengths (determines which token's logits the engine extracts)
+    check::check(mHostTalkerContextLength.reshape({batchSize}), "Tensor reshape failed");
+    int32_t* hostContextLength = mHostTalkerContextLength.dataPointer<int32_t>();
     if (!perBatchContextLengths.empty())
     {
         for (int64_t i = 0; i < batchSize; ++i)
@@ -872,158 +823,127 @@ bool Qwen3OmniTTSRuntime::executeTalkerPrefillStep(rt::Tensor const& inputEmbeds
             hostContextLength[i] = static_cast<int32_t>(seqLen);
         }
     }
-    // Reshape logits to match the prefill batch size (CUDA graph capture may leave it at maxBS).
+
+    // Reshape logits to match the prefill batch size (CUDA graph capture may leave it at maxBS)
     check::check(outputLogits.reshape({batchSize, outputLogits.getShape()[outputLogits.getShape().getNumDims() - 1]}),
         "Tensor reshape failed");
 
-    // Bind step-specific tensors into the Talker TensorMap. Engine I/O bindings whose
-    // address/shape change per step (inputs_embeds, logits, hidden_states) get rewired here;
-    // KV cache and rope cache were registered statically by buildTensorMap.
-    mTalkerTensorMap.set(binding_names::kInputsEmbeds, const_cast<rt::Tensor&>(inputEmbeds));
-    mTalkerTensorMap.set(binding_names::kLogits, outputLogits);
-    mTalkerTensorMap.set(binding_names::kOutputHiddenStates, outputHiddenStates);
-
-    // Prepare per-step metadata (selectTokenIndices, contextLengths, kvcache_start_index sentinel).
-    mTalkerStepPreparer->prepare(
-        rt::InferencePhase::kPrefill, static_cast<int32_t>(batchSize), talkerCacheMgr, *mTalkerPipelineIO, stream);
-
-    bool const kvAllEmpty = talkerCacheMgr.getKVCacheAllEmpty();
-    auto const prefillDims = mTalkerLLMConfig.prefillDims(batchSize, seqLen, kvAllEmpty);
-    if (!mTalkerExec->prepare(/*prefillProfile=*/0, prefillDims, mTalkerTensorMap, stream))
-    {
-        LOG_ERROR("Talker prefill prepare failed");
-        return false;
-    }
-    if (!mTalkerExec->execute(stream))
-    {
-        LOG_ERROR("Talker prefill execute failed");
-        return false;
-    }
-    talkerCacheMgr.commitSequenceLength(mTalkerPipelineIO->contextLengths, stream);
-    return true;
+    // Execute prefill
+    rt::OptionalInputTensors emptyDeepstack{};
+    return mTalkerLLMRunner->executePrefillStep(inputEmbeds, mHostTalkerContextLength, emptyDeepstack, outputLogits,
+        rt::OptionalOutputTensor{std::ref(outputHiddenStates)}, stream);
 }
 
-bool Qwen3OmniTTSRuntime::executeTalkerDecodingStep(
-    rt::Tensor const& inputEmbeds, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, cudaStream_t stream)
-{
-    NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::executeTalkerDecodingStep", nvtx_colors::PURPLE);
-
-    auto inputShape = inputEmbeds.getShape();
-    check::check(inputShape.getNumDims() == 3, "executeTalkerDecodingStep: inputEmbeds must be 3D [batch, 1, hidden]");
-    int64_t const batchSize = inputShape[0];
-    check::check(batchSize <= mMaxBatchSize, "executeTalkerDecodingStep: batchSize exceeds maxBatchSize");
-
-    auto& talkerCacheMgr = *mTalkerSharedRes->cacheManagers[0];
-
-    mTalkerTensorMap.set(binding_names::kInputsEmbeds, const_cast<rt::Tensor&>(inputEmbeds));
-    mTalkerTensorMap.set(binding_names::kLogits, outputLogits);
-    mTalkerTensorMap.set(binding_names::kOutputHiddenStates, outputHiddenStates);
-
-    mTalkerStepPreparer->prepare(
-        rt::InferencePhase::kDecode, static_cast<int32_t>(batchSize), talkerCacheMgr, *mTalkerPipelineIO, stream);
-
-    auto const decodeDims = mTalkerLLMConfig.decodeDims(batchSize);
-    if (!mTalkerExec->prepare(/*decodeProfile=*/1, decodeDims, mTalkerTensorMap, stream))
-    {
-        LOG_ERROR("Talker decode prepare failed");
-        return false;
-    }
-    if (!mTalkerExec->execute(stream))
-    {
-        LOG_ERROR("Talker decode execute failed");
-        return false;
-    }
-    // Vanilla decode advances the KV cache by exactly 1 token per call (matches kVANILLA_DECODE_INCREMENT).
-    talkerCacheMgr.commitSequenceLength(/*increment=*/1, stream);
-    return true;
-}
-
-bool Qwen3OmniTTSRuntime::executeCodePredictorPrefillStep(rt::Tensor const& inputsEmbeds, int32_t lmHeadIdx,
+bool Qwen3OmniTTSRuntime::executeCodePredictorPrefillStep(rt::Tensor const& codecTokenEmbeds, int32_t generationStep,
     rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, cudaStream_t stream)
 {
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::executeCodePredictorPrefillStep", nvtx_colors::ORANGE);
 
-    // Batch dim is implicit in input shape — same pattern as executeTalkerPrefillStep / spec decode.
-    auto inputShape = inputsEmbeds.getShape();
-    check::check(inputShape.getNumDims() == 3,
-        "executeCodePredictorPrefillStep: inputsEmbeds must be 3D [batch, seqLen, cpHidden]");
-    int64_t const batchSize = inputShape[0];
-    int64_t const seqLen = inputShape[1];
-    check::check(batchSize <= mMaxBatchSize, "executeCodePredictorPrefillStep: batchSize exceeds maxBatchSize");
-
-    auto& cpCacheMgr = *mCodePredictorSharedRes->cacheManagers[0];
-
-    // Reset CP KV cache for this batch (CP resets every frame — no cross-frame state).
-    check::check(mHostReuseKVCacheLengths.reshape({batchSize}), "Tensor reshape failed");
-    int32_t* reuseData = mHostReuseKVCacheLengths.dataPointer<int32_t>();
-    std::fill_n(reuseData, batchSize, 0);
-    cpCacheMgr.resetForNewSequences(mHostReuseKVCacheLengths, stream);
-
-    // Stage per-batch host context lengths (all = kCodePredictorPrefillSeqLen).
-    check::check(mCodePredictorPipelineIO->hostContextLengths.reshape({batchSize}), "Tensor reshape failed");
-    int32_t* hostCtxLen = mCodePredictorPipelineIO->hostContextLengths.dataPointer<int32_t>();
-    std::fill_n(hostCtxLen, batchSize, static_cast<int32_t>(seqLen));
-
-    int32_t const clampedLmHeadIdx = std::min(lmHeadIdx, mNumRvqLayers - 1);
-
-    mCodePredictorTensorMap.set(binding_names::kInputsEmbeds, const_cast<rt::Tensor&>(inputsEmbeds));
-    mCodePredictorTensorMap.set(binding_names::kLogits, outputLogits);
-    mCodePredictorTensorMap.set(binding_names::kOutputHiddenStates, outputHiddenStates);
-    mCodePredictorTensorMap.set(binding_names::kLmHeadWeight, mCodePredictorLmHeadWeights[clampedLmHeadIdx]);
-
-    mCodePredictorStepPreparer->prepare(
-        rt::InferencePhase::kPrefill, static_cast<int32_t>(batchSize), cpCacheMgr, *mCodePredictorPipelineIO, stream);
-
-    bool const kvAllEmpty = cpCacheMgr.getKVCacheAllEmpty();
-    auto const prefillDims = mCodePredictorConfig.prefillDims(batchSize, seqLen, kvAllEmpty);
-    if (!mCodePredictorExec->prepare(/*prefillProfile=*/0, prefillDims, mCodePredictorTensorMap, stream))
+    // Reset CodePredictor KV cache for new frame (always per-batch, BS=1)
+    check::check(mHostReuseKVCacheLengths.reshape({1}), "Tensor reshape failed");
+    mHostReuseKVCacheLengths.dataPointer<int32_t>()[0] = 0;
+    auto& cpCacheManager = mCodePredictorRunner->getCacheManager();
+    cpCacheManager.resetForNewSequences(mHostReuseKVCacheLengths, stream);
+    auto& cpKVManager = cpCacheManager.getKVCacheManager();
+    for (int32_t i = 0; i < cpKVManager.numLayers(); ++i)
     {
-        LOG_ERROR("CodePredictor prefill prepare failed");
+        rt::Tensor& layerKV = cpKVManager.getCombinedKVCache(i);
+        CUDA_CHECK(cudaMemsetAsync(layerKV.rawPointer(), 0, layerKV.getMemoryCapacity(), stream));
+    }
+
+    int32_t* const hostContextLength = mHostCodePredictorContextLength.dataPointer<int32_t>();
+    hostContextLength[0] = kCodePredictorPrefillSeqLen;
+
+    int32_t const lmHeadIdx = std::min(generationStep, mNumRvqLayers - 1);
+    if (!mCodePredictorRunner->setLmHeadWeight(mCodePredictorLmHeadWeights[lmHeadIdx]))
+    {
+        LOG_ERROR("Failed to bind lm_head_weight[%d]", lmHeadIdx);
         return false;
     }
-    if (!mCodePredictorExec->execute(stream))
+
+    // Execute prefill - engine outputs logits directly (with lm_head applied)
+    rt::OptionalInputTensors emptyDeepstack{};
+    if (!mCodePredictorRunner->executePrefillStep(codecTokenEmbeds, mHostCodePredictorContextLength, emptyDeepstack,
+            outputLogits, rt::OptionalOutputTensor{std::ref(outputHiddenStates)}, stream))
     {
-        LOG_ERROR("CodePredictor prefill execute failed");
+        LOG_ERROR("CodePredictor prefill step failed");
         return false;
     }
-    cpCacheMgr.commitSequenceLength(mCodePredictorPipelineIO->contextLengths, stream);
+
     return true;
 }
 
-bool Qwen3OmniTTSRuntime::executeCodePredictorDecodingStep(rt::Tensor const& inputsEmbeds, int32_t lmHeadIdx,
-    rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, cudaStream_t stream)
+bool Qwen3OmniTTSRuntime::executeCodePredictorDecodingStep(int32_t tokenId, int32_t embeddingTableIndex,
+    int32_t generationStep, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, cudaStream_t stream)
 {
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::executeCodePredictorDecodingStep", nvtx_colors::ORANGE);
 
-    auto inputShape = inputsEmbeds.getShape();
+    CUDA_CHECK(cudaMemcpyAsync(
+        mCodePredictorCodecIds.rawPointer(), &tokenId, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+
+    int32_t const embedIdx = std::min(embeddingTableIndex, mNumRvqLayers - 1);
+    // Lookup into mRawCodecEmbed (talkerHiddenSize=2048) — codec embedding tables are in Talker's space
+    check::check(mRawCodecEmbed.reshape({1, 1, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
+    kernel::embeddingLookup(
+        mCodePredictorCodecIds, mCodePredictorEmbeddingTables[embedIdx], std::nullopt, mRawCodecEmbed, stream);
+
+    // Save raw (2048-dim) embedding to mCodecHiddensBuffer for residual connection
+    // Position mapping: generationStep 1->pos 1, 2->pos 2, ..., (mNumRvqLayers-1)->pos (mNumRvqLayers-1)
+    if (generationStep >= 1 && generationStep <= mNumRvqLayers - 1)
+    {
+        int64_t const H = mTalkerConfig.talkerHiddenSize;
+        __half* dst = static_cast<__half*>(mCodecHiddensBuffer.rawPointer()) + generationStep * H;
+        CUDA_CHECK(
+            cudaMemcpyAsync(dst, mRawCodecEmbed.rawPointer(), H * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
+    }
+
+    // Project mRawCodecEmbed → mCodePredictorCodecEmbed if needed.
+    check::check(mRawCodecEmbed.reshape({1, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
+    check::check(mCodePredictorCodecEmbed.reshape({1, mTalkerConfig.codePredictorHiddenSize}), "Tensor reshape failed");
+    if (!mUseSmallToMtpProjection)
+    {
+        CUDA_CHECK(cudaMemcpyAsync(mCodePredictorCodecEmbed.rawPointer(), mRawCodecEmbed.rawPointer(),
+            mTalkerConfig.codePredictorHiddenSize * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
+    }
+    else
+    {
+        kernel::invokeLinearLayer(mRawCodecEmbed, mSmallToMtpWeight, mSmallToMtpBias, mCodePredictorCodecEmbed, stream);
+    }
+
+    int32_t const lmHeadIdx = std::min(generationStep, mNumRvqLayers - 1);
+
     check::check(
-        inputShape.getNumDims() == 3, "executeCodePredictorDecodingStep: inputsEmbeds must be 3D [batch, 1, cpHidden]");
-    int64_t const batchSize = inputShape[0];
-    check::check(batchSize <= mMaxBatchSize, "executeCodePredictorDecodingStep: batchSize exceeds maxBatchSize");
+        mCodePredictorCodecEmbed.reshape({1, 1, mTalkerConfig.codePredictorHiddenSize}), "Tensor reshape failed");
 
-    auto& cpCacheMgr = *mCodePredictorSharedRes->cacheManagers[0];
-    int32_t const clampedLmHeadIdx = std::min(lmHeadIdx, mNumRvqLayers - 1);
-
-    mCodePredictorTensorMap.set(binding_names::kInputsEmbeds, const_cast<rt::Tensor&>(inputsEmbeds));
-    mCodePredictorTensorMap.set(binding_names::kLogits, outputLogits);
-    mCodePredictorTensorMap.set(binding_names::kOutputHiddenStates, outputHiddenStates);
-    mCodePredictorTensorMap.set(binding_names::kLmHeadWeight, mCodePredictorLmHeadWeights[clampedLmHeadIdx]);
-
-    mCodePredictorStepPreparer->prepare(
-        rt::InferencePhase::kDecode, static_cast<int32_t>(batchSize), cpCacheMgr, *mCodePredictorPipelineIO, stream);
-
-    auto const decodeDims = mCodePredictorConfig.decodeDims(batchSize);
-    if (!mCodePredictorExec->prepare(/*decodeProfile=*/1, decodeDims, mCodePredictorTensorMap, stream))
+    if (mCodePredictorGraphsCaptured)
     {
-        LOG_ERROR("CodePredictor decode prepare failed");
-        return false;
+        // Graph path: lm_head_weight addresses were bound during capture and remain unchanged,
+        // so setLmHeadWeight is unnecessary. Each graph is keyed by its per-head output buffer.
+        if (!mCodePredictorRunner->executeVanillaDecodingStep(mCodePredictorCodecEmbed,
+                mCodePredictorLogitsPerHead[lmHeadIdx], rt::OptionalOutputTensor{std::ref(outputHiddenStates)}, stream))
+        {
+            LOG_ERROR("CodePredictor decoding step failed (graph path)");
+            return false;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(outputLogits.rawPointer(), mCodePredictorLogitsPerHead[lmHeadIdx].rawPointer(),
+            outputLogits.getMemoryCapacity(), cudaMemcpyDeviceToDevice, stream));
     }
-    if (!mCodePredictorExec->execute(stream))
+    else
     {
-        LOG_ERROR("CodePredictor decode execute failed");
-        return false;
+        // Non-graph path: must bind lm_head_weight before each enqueueV3
+        if (!mCodePredictorRunner->setLmHeadWeight(mCodePredictorLmHeadWeights[lmHeadIdx]))
+        {
+            LOG_ERROR("Failed to bind lm_head_weight[%d]", lmHeadIdx);
+            return false;
+        }
+        if (!mCodePredictorRunner->executeVanillaDecodingStep(
+                mCodePredictorCodecEmbed, outputLogits, rt::OptionalOutputTensor{std::ref(outputHiddenStates)}, stream))
+        {
+            LOG_ERROR("CodePredictor decoding step failed");
+            return false;
+        }
     }
-    cpCacheMgr.commitSequenceLength(/*increment=*/1, stream);
+
     return true;
 }
 
@@ -1033,83 +953,40 @@ bool Qwen3OmniTTSRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
 {
     std::string const emptyLoraWeightsName = "";
 
-    // Talker: capture for all supported batch sizes (1..maxBatchSize).
-    // EngineExecutor::captureGraph() hashes the current binding state, so each bs
-    // produces its own graph slot automatically.
+    // Talker: capture for all supported batch sizes (1..maxBatchSize)
     bool captureStatus{true};
-    auto& talkerCacheMgr = *mTalkerSharedRes->cacheManagers[0];
     for (int32_t bs = 1; bs <= mMaxBatchSize; ++bs)
     {
-        // Simulate a mid-sequence decode state for capture (matches `simulateCacheLength=128`),
-        // so the captured graph reflects realistic plugin shapes / KV-length math.
-        constexpr int32_t kSimulateCacheLength{128};
-        std::vector<int32_t> reuseLens(bs, kSimulateCacheLength);
-        rt::Tensor simulatedReuse(reuseLens.data(), rt::Coords{bs}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32);
-        talkerCacheMgr.resetForNewSequences(simulatedReuse, stream);
-
         check::check(mResidualEmbedBuffer.reshape({bs, 1, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
         check::check(
             mTalkerHiddenStatesBuffer.reshape({bs, 1, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
         check::check(mTalkerLogits.reshape({bs, mTalkerConfig.talkerVocabSize}), "Tensor reshape failed");
-
-        mTalkerTensorMap.set(binding_names::kInputsEmbeds, mResidualEmbedBuffer);
-        mTalkerTensorMap.set(binding_names::kLogits, mTalkerLogits);
-        mTalkerTensorMap.set(binding_names::kOutputHiddenStates, mTalkerHiddenStatesBuffer);
-
-        mTalkerStepPreparer->prepare(rt::InferencePhase::kDecode, bs, talkerCacheMgr, *mTalkerPipelineIO, stream);
-
-        auto const decodeDims = mTalkerLLMConfig.decodeDims(bs);
-        captureStatus &= mTalkerExec->prepare(/*decodeProfile=*/1, decodeDims, mTalkerTensorMap, stream);
-        captureStatus &= mTalkerExec->captureGraph(stream);
-    }
-    // Restore Talker KV cache to "empty" state for the first real prefill.
-    // The simulated-cache-length init above leaves both the per-batch lengths AND
-    // the engine-written stale KV contents in mid-sequence state; resetForNewSequences
-    // with zero lengths is what every real prefill expects.
-    {
-        std::vector<int32_t> zeroLens(mMaxBatchSize, 0);
-        rt::Tensor zeroReuse(
-            zeroLens.data(), rt::Coords{mMaxBatchSize}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32);
-        talkerCacheMgr.resetForNewSequences(zeroReuse, stream);
+        captureStatus &= mTalkerLLMRunner->captureVanillaDecodingCudaGraph(mResidualEmbedBuffer, mTalkerLogits,
+            emptyLoraWeightsName, stream, rt::OptionalOutputTensor{std::ref(mTalkerHiddenStatesBuffer)});
     }
 
-    // CodePredictor: capture one graph per RVQ head (mNumRvqLayers total).
-    // Each graph uses a distinct (lm_head_weight, logits) binding pair, so the
-    // EngineExecutor binding hash naturally distinguishes them.
-    auto& cpCacheMgr = *mCodePredictorSharedRes->cacheManagers[0];
+    // CodePredictor: mNumRvqLayers graphs, one per lm_head_weight.
+    // Each graph uses a distinct output logits buffer so that the decodingKey (which includes
+    // the output address) naturally produces a unique key per graph.
     check::check(
         mCodePredictorCodecEmbed.reshape({1, 1, mTalkerConfig.codePredictorHiddenSize}), "Tensor reshape failed");
     check::check(mCodePredictorHiddenStatesBuffer.reshape({1, 1, mTalkerConfig.codePredictorHiddenSize}),
         "Tensor reshape failed");
+    rt::OptionalOutputTensor cpHiddenOpt{std::ref(mCodePredictorHiddenStatesBuffer)};
 
     for (int32_t i = 0; i < mNumRvqLayers; ++i)
     {
-        // Simulate a mid-sequence CP decode state for capture (matches kSimulateCacheLength=128).
-        constexpr int32_t kSimulateCacheLength{128};
-        int32_t simLen = kSimulateCacheLength;
-        rt::Tensor simReuse(&simLen, rt::Coords{1}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32);
-        cpCacheMgr.resetForNewSequences(simReuse, stream);
-
-        mCodePredictorTensorMap.set(binding_names::kInputsEmbeds, mCodePredictorCodecEmbed);
-        mCodePredictorTensorMap.set(binding_names::kLogits, mCodePredictorLogitsPerHead[i]);
-        mCodePredictorTensorMap.set(binding_names::kOutputHiddenStates, mCodePredictorHiddenStatesBuffer);
-        mCodePredictorTensorMap.set(binding_names::kLmHeadWeight, mCodePredictorLmHeadWeights[i]);
-
-        mCodePredictorStepPreparer->prepare(
-            rt::InferencePhase::kDecode, /*batchSize=*/1, cpCacheMgr, *mCodePredictorPipelineIO, stream);
-
-        auto const decodeDims = mCodePredictorConfig.decodeDims(1);
-        captureStatus &= mCodePredictorExec->prepare(/*decodeProfile=*/1, decodeDims, mCodePredictorTensorMap, stream);
-        captureStatus &= mCodePredictorExec->captureGraph(stream);
-    }
-    // Restore CP KV cache to empty so the first real prefill starts from a clean state.
-    {
-        int32_t zero = 0;
-        rt::Tensor zeroReuse(&zero, rt::Coords{1}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32);
-        cpCacheMgr.resetForNewSequences(zeroReuse, stream);
+        if (!mCodePredictorRunner->setLmHeadWeight(mCodePredictorLmHeadWeights[i]))
+        {
+            LOG_ERROR("Failed to bind lm_head_weight[%d] for CUDA graph capture", i);
+            captureStatus = false;
+            continue;
+        }
+        captureStatus &= mCodePredictorRunner->captureVanillaDecodingCudaGraph(
+            mCodePredictorCodecEmbed, mCodePredictorLogitsPerHead[i], emptyLoraWeightsName, stream, cpHiddenOpt);
     }
 
-    // (mCodePredictorGraphsCaptured flag removed — EngineExecutor's graph cache auto-dispatches per binding hash.)
+    mCodePredictorGraphsCaptured = captureStatus;
 
     if (captureStatus)
     {
@@ -1194,17 +1071,12 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
     SamplingParams predictorSamplingParams(1, mTalkerConfig.codebookSize, talkerTemperature, talkerTopK, talkerTopP);
     SamplingParams singleSamplingParams(1, mTalkerConfig.talkerVocabSize, talkerTemperature, talkerTopK, talkerTopP);
 
-    // Build per-batch Talker prefill embeddings into mTalkerInputEmbeds, then run a single
-    // batched prefill at bs=activeBatchSize (same pattern as handleAudioGenerationFromThinker).
-    // Per-batch sequential prefill is fundamentally wrong for bs>1: it overwrites mTalkerHiddenStatesBuffer
-    // slot 0 + Talker KV cache slot 0 each iteration, losing earlier batches' state.
+    // Per-batch sequential: tokenize → prepareTalkerInput → prefill → sample first codec token
     std::vector<PerBatchTalkerState> states(activeBatchSize);
     std::vector<int64_t> perBatchSeqLens(activeBatchSize);
-    int64_t const maxInputSeqLen = mTalkerLLMConfig.maxSupportedInputLength;
-    int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
-    int64_t maxOutSeqLen = 0;
 
-    auto buildOneBatchTts = [&](int32_t b) -> bool {
+    for (int32_t b = 0; b < activeBatchSize; ++b)
+    {
         LLMGenerationRequest::Request llmReq;
         llmReq.messages = requests[b].messages;
         LLMGenerationRequest::FormattedRequest formatted;
@@ -1223,90 +1095,27 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
             return false;
         }
         perBatchSeqLens[b] = seqLen;
-        maxOutSeqLen = std::max(maxOutSeqLen, seqLen);
-        return true;
-    };
 
-    // Build batches N-1..1 first, stash each into slot (b * maxInputSeqLen).
-    for (int32_t b = activeBatchSize - 1; b >= 1; --b)
-    {
-        if (!buildOneBatchTts(b))
-            return false;
-        __half* const slot = static_cast<__half*>(mTalkerInputEmbeds.rawPointer()) + b * maxInputSeqLen * hiddenSize;
-        CUDA_CHECK(cudaMemcpyAsync(slot, mTalkerInputEmbeds.rawPointer(),
-            perBatchSeqLens[b] * hiddenSize * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
-    }
-    // Build batch 0 last — stays at slot 0.
-    if (!buildOneBatchTts(0))
-        return false;
-
-    // Re-pack from slots [b * maxInputSeqLen] → contiguous [BS, maxOutSeqLen, H]; pad with zeros.
-    __half* const inputBase = static_cast<__half*>(mTalkerInputEmbeds.rawPointer());
-    for (int32_t b = activeBatchSize - 1; b >= 0; --b)
-    {
-        __half* const src = inputBase + (b == 0 ? 0 : b * maxInputSeqLen * hiddenSize);
-        __half* const dst = inputBase + b * maxOutSeqLen * hiddenSize;
-        if (src != dst)
         {
-            CUDA_CHECK(cudaMemcpyAsync(
-                dst, src, perBatchSeqLens[b] * hiddenSize * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
+            TIME_STAGE(metrics::StageNames::kTALKER_PREFILL, stream);
+            if (!executeTalkerPrefillStep(mTalkerInputEmbeds, mTalkerLogits, mTalkerHiddenStatesBuffer, stream))
+            {
+                LOG_ERROR("Talker prefill failed for batch %d", b);
+                return false;
+            }
         }
-        if (perBatchSeqLens[b] < maxOutSeqLen)
-        {
-            CUDA_CHECK(cudaMemsetAsync(dst + perBatchSeqLens[b] * hiddenSize, 0,
-                (maxOutSeqLen - perBatchSeqLens[b]) * hiddenSize * sizeof(__half), stream));
-        }
-    }
 
-    // Single batched Talker prefill at bs=activeBatchSize.
-    check::check(mTalkerInputEmbeds.reshape({activeBatchSize, maxOutSeqLen, hiddenSize}), "Tensor reshape failed");
-    check::check(
-        mTalkerHiddenStatesBuffer.reshape({activeBatchSize, maxOutSeqLen, hiddenSize}), "Tensor reshape failed");
-    {
-        TIME_STAGE(metrics::StageNames::kTALKER_PREFILL, stream);
-        if (!executeTalkerPrefillStep(
-                mTalkerInputEmbeds, mTalkerLogits, mTalkerHiddenStatesBuffer, stream, perBatchSeqLens))
-        {
-            LOG_ERROR("Batched Talker prefill failed");
-            return false;
-        }
-    }
-
-    // Per-batch logit adjust on [BS, vocab] slices.
-    check::check(mTalkerLogits.reshape({activeBatchSize, mTalkerConfig.talkerVocabSize}), "Tensor reshape failed");
-    check::check(mTalkerSelectedIndices.reshape({activeBatchSize, 1}), "Tensor reshape failed");
-    for (int32_t b = 0; b < activeBatchSize; ++b)
-    {
-        rt::Tensor logitsSlice(static_cast<float*>(mTalkerLogits.rawPointer()) + b * mTalkerConfig.talkerVocabSize,
-            rt::Coords{1, mTalkerConfig.talkerVocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-        rt::Tensor seenBufSlice(mSeenCodecTokensBuf.dataPointer<int32_t>() + b * mTalkerLLMConfig.maxKVCacheCapacity,
-            rt::Coords{mTalkerLLMConfig.maxKVCacheCapacity}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
-        kernel::invokeTalkerLogitAdjust(seenBufSlice, logitsSlice, mTalkerConfig.talkerVocabSize - 1024,
+        kernel::invokeTalkerLogitAdjust(mSeenCodecTokensBuf, mTalkerLogits, mTalkerConfig.talkerVocabSize - 1024,
             mTalkerConfig.talkerVocabSize, mTalkerConfig.codecEosId, 0, repetitionPenalty, stream);
-    }
+        trt_edgellm::topKtopPSamplingFromLogits(
+            mTalkerLogits, mTalkerSelectedIndices, singleSamplingParams, mSamplingWorkspace, stream);
+        CUDA_CHECK(cudaMemcpyAsync(mHostSelectedTokenIds.rawPointer(), mTalkerSelectedIndices.rawPointer(),
+            sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    // Batched sampling at bs=activeBatchSize.
-    trt_edgellm::topKtopPSamplingFromLogits(
-        mTalkerLogits, mTalkerSelectedIndices, talkerSamplingParams, mSamplingWorkspace, stream);
-    check::check(mHostSelectedTokenIds.reshape({activeBatchSize}), "Tensor reshape failed");
-    CUDA_CHECK(cudaMemcpyAsync(mHostSelectedTokenIds.rawPointer(), mTalkerSelectedIndices.rawPointer(),
-        activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    int32_t* hostTokens = mHostSelectedTokenIds.dataPointer<int32_t>();
-    for (int32_t b = 0; b < activeBatchSize; ++b)
-    {
-        states[b].codecToken = hostTokens[b];
+        states[b].codecToken = mHostSelectedTokenIds.dataPointer<int32_t>()[0];
         states[b].rvqCodes.reserve(requests[b].maxAudioLength);
         LOG_INFO("Batch %d: first codec token: %d", b, states[b].codecToken);
-    }
-    (void) singleSamplingParams; // bs=1-only param kept for streaming path; unused here after batching.
-
-    // First codec token sampled — record TTFA-end so streaming CLIs can compute time-to-first-code.
-    // Same point as handleAudioGenerationFromThinker / handleStreamingGeneration; unconditional record
-    // is cheap (~µs) and lets non-profiling callers still consume the event for streaming latency.
-    if (mTtfaEnd)
-    {
-        CUDA_CHECK(cudaEventRecord(mTtfaEnd, stream));
     }
 
     int32_t const talkerKVCapacity = mTalkerLLMConfig.maxKVCacheCapacity;
@@ -1318,29 +1127,8 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
     }
 
     std::vector<rt::Tensor const*> trailingPtrs(activeBatchSize, nullptr);
-
-    // Wire optional per-request streaming callbacks. Empty vector when no request has streaming on
-    // (zero overhead for the non-streaming path).
-    std::vector<PerBatchStreamingHandler> streamingHandlers;
-    for (auto const& r : requests)
-    {
-        if (r.streamingChunkFrames > 0 && r.onChunkReady)
-        {
-            streamingHandlers.resize(activeBatchSize);
-            break;
-        }
-    }
-    if (!streamingHandlers.empty())
-    {
-        for (int32_t b = 0; b < activeBatchSize; ++b)
-        {
-            streamingHandlers[b].chunkFrames = requests[b].streamingChunkFrames;
-            streamingHandlers[b].onChunk = requests[b].onChunkReady;
-        }
-    }
-
     if (!runTalkerGenerationLoop(states, activeBatchSize, effectiveMaxFrames, talkerSamplingParams,
-            predictorSamplingParams, repetitionPenalty, trailingPtrs, stream, perBatchSeqLens, streamingHandlers))
+            predictorSamplingParams, repetitionPenalty, trailingPtrs, stream))
     {
         return false;
     }
@@ -1525,10 +1313,7 @@ bool Qwen3OmniTTSRuntime::handleAudioGenerationFromThinker(
             static_cast<int32_t>(perBatchTrailingViews[b].getShape()[0]), perBatchSeqLen[b]);
     }
 
-    // Always record (unconditional, matches handleAudioGeneration / handleStreamingGeneration):
-    // streaming callers consume the event for TTFC measurement even without profiling enabled.
-    // Cost is negligible (~µs per request).
-    if (mTtfaEnd)
+    if (getProfilingEnabled())
     {
         CUDA_CHECK(cudaEventRecord(mTtfaEnd, stream));
     }
@@ -1595,25 +1380,12 @@ bool Qwen3OmniTTSRuntime::handleAudioGenerationFromThinker(
 bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerState>& states, int32_t activeBatchSize,
     int32_t maxFrames, SamplingParams const& talkerSamplingParams, SamplingParams const& predictorSamplingParams,
     float repetitionPenalty, std::vector<rt::Tensor const*> const& trailingTextHiddens, cudaStream_t stream,
-    std::vector<int64_t> const& prefillSeqLens, std::vector<PerBatchStreamingHandler> const& streamingHandlers)
+    std::vector<int64_t> const& prefillSeqLens)
 {
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::runTalkerGenerationLoop", nvtx_colors::PURPLE);
 
     int32_t const codecEosId = mTalkerConfig.codecEosId;
     int32_t unfinished = activeBatchSize;
-
-    // Per-batch streaming chunk emitters (no-op for batches that have streaming disabled).
-    std::vector<ChunkEmitter> emitters(activeBatchSize);
-    if (!streamingHandlers.empty())
-    {
-        check::check(static_cast<int32_t>(streamingHandlers.size()) == activeBatchSize,
-            "streamingHandlers size mismatch with activeBatchSize");
-        for (int32_t b = 0; b < activeBatchSize; ++b)
-        {
-            emitters[b].chunkFrames = streamingHandlers[b].chunkFrames;
-            emitters[b].onChunk = streamingHandlers[b].onChunk;
-        }
-    }
 
     // Initialize per-batch seen token tracking. numSeenTokens starts at 0 so the repetition
     // penalty kernel reads no entries on the first decode frame, avoiding a read of the
@@ -1634,82 +1406,61 @@ bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerStat
 
         while (unfinished > 0 && globalFrame < maxFrames)
         {
-            // ---- Phase A: extract per-batch Talker last hidden into a stacked [activeBS, H] buffer ----
-            auto const& fullShape = mTalkerHiddenStatesBuffer.getShape();
-            int64_t const paddedSeqDim = fullShape[1];
-            int64_t const hDim = fullShape[2];
-            check::check(
-                mTalkerLastHidden.reshape({activeBatchSize, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
-            std::vector<int32_t> activeBatchCodes(activeBatchSize, 0);
-            std::vector<bool> activeMask(activeBatchSize, true);
-            int32_t activeBatchPresentCount = 0;
+            // Per-batch: CodePredictor + residual (batch=1 engine calls)
             for (int32_t b = 0; b < activeBatchSize; ++b)
             {
                 if (states[b].finished)
-                {
-                    activeMask[b] = false;
                     continue;
-                }
-                ++activeBatchPresentCount;
-                activeBatchCodes[b] = states[b].codecToken;
 
+                // Reset CodePredictor KV cache for this batch (batch=1)
+                int32_t* cpReuseData = mHostReuseKVCacheLengths.dataPointer<int32_t>();
+                cpReuseData[0] = 0;
+                check::check(mHostReuseKVCacheLengths.reshape({1}), "Tensor reshape failed");
+                mCodePredictorRunner->getCacheManager().resetForNewSequences(mHostReuseKVCacheLengths, stream);
+
+                // Extract this batch's last hidden from mTalkerHiddenStatesBuffer.
+                // After batched prefill: shape [BS, maxOutSeqLen, H] with padding; use the
+                // per-batch actual length for correct last-token extraction.
+                // After decode: shape [BS, 1, H], seqLen=1 for all batches.
+                auto const& fullShape = mTalkerHiddenStatesBuffer.getShape();
+                int64_t const paddedSeqDim = fullShape[1];
+                int64_t const hDim = fullShape[2];
                 int64_t const actualSeqDim
                     = (!prefillSeqLens.empty() && paddedSeqDim > 1) ? prefillSeqLens[b] : paddedSeqDim;
                 rt::Tensor batchHiddenView(
                     static_cast<__half*>(mTalkerHiddenStatesBuffer.rawPointer()) + b * paddedSeqDim * hDim,
                     rt::Coords{1, actualSeqDim, hDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-                rt::Tensor outSlice(
-                    static_cast<__half*>(mTalkerLastHidden.rawPointer()) + b * mTalkerConfig.talkerHiddenSize,
-                    rt::Coords{1, mTalkerConfig.talkerHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-                if (!extractTalkerLastHidden(batchHiddenView, outSlice, stream))
+
+                check::check(mTalkerLastHidden.reshape({1, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
+                if (!extractTalkerLastHidden(batchHiddenView, mTalkerLastHidden, stream))
                 {
                     LOG_ERROR("extractTalkerLastHidden failed for batch %d frame %d", b, globalFrame);
                     states[b].finished = true;
                     states[b].talkerError = true;
                     unfinished--;
-                    activeMask[b] = false;
-                    --activeBatchPresentCount;
-                }
-            }
-
-            // ---- Phase B: CodePredictor — single batched call for all active batches.
-            // The unified runCodePredictorGenerationForFrame handles activeBatchSize=1..maxBS
-            // uniformly (same engine call, just different batch dim). Finished batches still
-            // occupy a slot (dummy work) until a future evict pass is added.
-            std::vector<std::vector<int32_t>> framesPerBatch;
-            if (!runCodePredictorGenerationForFrame(activeBatchSize, activeBatchCodes, mTalkerLastHidden,
-                    predictorSamplingParams, framesPerBatch, stream))
-            {
-                LOG_ERROR("CodePredictor failed at frame %d", globalFrame);
-                return false;
-            }
-
-            // ---- Phase C: per-batch residual (kernel is per-batch; runtime loops over slots) ----
-            int64_t const codecHiddensRowStride = mNumCodesPerFrame * mTalkerConfig.talkerHiddenSize;
-            for (int32_t b = 0; b < activeBatchSize; ++b)
-            {
-                if (states[b].finished || !activeMask[b])
                     continue;
+                }
 
-                states[b].rvqCodes.push_back(std::move(framesPerBatch[b]));
+                std::vector<int32_t> frameCodes;
+                if (!runCodePredictorGenerationForFrame(
+                        states[b].codecToken, mTalkerLastHidden, predictorSamplingParams, frameCodes, stream))
+                {
+                    LOG_ERROR("CodePredictor failed for batch %d frame %d", b, globalFrame);
+                    states[b].finished = true;
+                    states[b].talkerError = true;
+                    unfinished--;
+                    continue;
+                }
 
-                // Streaming chunk accumulate (no-op for non-streaming batches). Final flush happens
-                // post-loop for every active emitter so isFinal=true is emitted exactly once per
-                // streaming batch regardless of which exit path was taken.
-                emitters[b].append(states[b].rvqCodes.back());
+                states[b].rvqCodes.push_back(std::move(frameCodes));
 
+                // Compute residual for this batch, writing to batch b's slot in mResidualEmbedBuffer
                 rt::Tensor residualSlice(
                     static_cast<__half*>(mResidualEmbedBuffer.rawPointer()) + b * mTalkerConfig.talkerHiddenSize,
                     rt::Coords{1, 1, mTalkerConfig.talkerHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
-                // Per-batch view into mCodecHiddensBuffer[b] for this batch's residual computation.
-                rt::Tensor codecHiddensView(
-                    static_cast<__half*>(mCodecHiddensBuffer.rawPointer()) + b * codecHiddensRowStride,
-                    rt::Coords{1, mNumCodesPerFrame, mTalkerConfig.talkerHiddenSize}, rt::DeviceType::kGPU,
-                    nvinfer1::DataType::kHALF);
-
-                if (!computeResidualConnection(codecHiddensView, states[b].rvqCodes.back(), trailingTextHiddens[b],
-                        globalFrame, residualSlice, stream))
+                if (!computeResidualConnection(
+                        states[b].rvqCodes.back(), trailingTextHiddens[b], globalFrame, residualSlice, stream))
                 {
                     LOG_ERROR("Residual connection failed for batch %d frame %d", b, globalFrame);
                     states[b].finished = true;
@@ -1725,7 +1476,8 @@ bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerStat
             check::check(mTalkerHiddenStatesBuffer.reshape({activeBatchSize, 1, mTalkerConfig.talkerHiddenSize}),
                 "Tensor reshape failed");
 
-            if (!executeTalkerDecodingStep(mResidualEmbedBuffer, mTalkerLogits, mTalkerHiddenStatesBuffer, stream))
+            if (!mTalkerLLMRunner->executeVanillaDecodingStep(mResidualEmbedBuffer, mTalkerLogits,
+                    rt::OptionalOutputTensor{std::ref(mTalkerHiddenStatesBuffer)}, stream))
             {
                 LOG_ERROR("Batched Talker decoding step failed at frame %d", globalFrame);
                 return false;
@@ -1798,13 +1550,6 @@ bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerStat
         LOG_INFO("Batch %d: %d audio frames (exit: %s)", b, states[b].talkerFrames, hitEos ? "EOS" : "maxFrames");
     }
 
-    // Final per-batch flush: every active emitter gets exactly one isFinal=true callback (with
-    // remaining buffered codes, or empty buffer as an end-of-stream signal).
-    for (auto& emitter : emitters)
-    {
-        emitter.flushFinal();
-    }
-
     return true;
 }
 
@@ -1815,32 +1560,27 @@ bool Qwen3OmniTTSRuntime::runSingleTalkerDecodeFrame(int32_t& codecToken, Sampli
 {
     int32_t const codecEosId = mTalkerConfig.codecEosId;
 
-    // Streaming TTFA path: always bs=1. Reset CP KV is now done inside runCodePredictorGenerationForFrame.
+    // Ensure batch=1 shape for CodePredictor KV cache reset (streaming path is per-batch)
+    check::check(mHostReuseKVCacheLengths.reshape({1}), "Tensor reshape failed");
+    mHostReuseKVCacheLengths.dataPointer<int32_t>()[0] = 0;
+    mCodePredictorRunner->getCacheManager().resetForNewSequences(mHostReuseKVCacheLengths, stream);
+
     if (!extractTalkerLastHidden(mTalkerHiddenStatesBuffer, mTalkerLastHidden, stream))
     {
         LOG_ERROR("extractTalkerLastHidden failed at frame %d", frameIdx);
         return false;
     }
 
-    // Wrap mTalkerLastHidden as a [1, talkerH] batched view for the unified CP call.
-    rt::Tensor talkerLastBatched(mTalkerLastHidden.rawPointer(), rt::Coords{1, mTalkerConfig.talkerHiddenSize},
-        rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    std::vector<std::vector<int32_t>> framesPerBatch;
-    if (!runCodePredictorGenerationForFrame(/*activeBatchSize=*/1, std::vector<int32_t>{codecToken}, talkerLastBatched,
-            predictorSamplingParams, framesPerBatch, stream))
+    std::vector<int32_t> frameCodes;
+    if (!runCodePredictorGenerationForFrame(codecToken, mTalkerLastHidden, predictorSamplingParams, frameCodes, stream))
     {
         LOG_ERROR("CodePredictor generation failed at frame %d", frameIdx);
         return false;
     }
 
-    rvqCodes.push_back(std::move(framesPerBatch[0]));
+    rvqCodes.push_back(std::move(frameCodes));
 
-    // Per-batch view (batch 0) into mCodecHiddensBuffer for residual.
-    rt::Tensor codecHiddensView(mCodecHiddensBuffer.rawPointer(),
-        rt::Coords{1, mNumCodesPerFrame, mTalkerConfig.talkerHiddenSize}, rt::DeviceType::kGPU,
-        nvinfer1::DataType::kHALF);
-    if (!computeResidualConnection(
-            codecHiddensView, rvqCodes.back(), trailingPtr, frameIdx, mResidualEmbedBuffer, stream))
+    if (!computeResidualConnection(rvqCodes.back(), trailingPtr, frameIdx, mResidualEmbedBuffer, stream))
     {
         LOG_ERROR("Residual connection failed at frame %d", frameIdx);
         return false;
@@ -1849,7 +1589,8 @@ bool Qwen3OmniTTSRuntime::runSingleTalkerDecodeFrame(int32_t& codecToken, Sampli
     check::check(mResidualEmbedBuffer.reshape({1, 1, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
     check::check(mTalkerHiddenStatesBuffer.reshape({1, 1, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
 
-    if (!executeTalkerDecodingStep(mResidualEmbedBuffer, mTalkerLogits, mTalkerHiddenStatesBuffer, stream))
+    if (!mTalkerLLMRunner->executeVanillaDecodingStep(
+            mResidualEmbedBuffer, mTalkerLogits, rt::OptionalOutputTensor{std::ref(mTalkerHiddenStatesBuffer)}, stream))
     {
         LOG_ERROR("Talker decoding step failed at frame %d", frameIdx);
         return false;
@@ -1874,186 +1615,141 @@ bool Qwen3OmniTTSRuntime::runSingleTalkerDecodeFrame(int32_t& codecToken, Sampli
     return true;
 }
 
-bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t activeBatchSize,
-    std::vector<int32_t> const& codecTokensPerBatch, rt::Tensor const& talkerLastHiddenBatched,
-    SamplingParams const& samplingParams, std::vector<std::vector<int32_t>>& outputCodesPerBatch, cudaStream_t stream)
+bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken, rt::Tensor const& talkerHiddenState,
+    SamplingParams const& samplingParams, std::vector<int32_t>& outputCodes, cudaStream_t stream)
 {
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::runCodePredictorGenerationForFrame", nvtx_colors::ORANGE);
 
-    int64_t const talkerH = mTalkerConfig.talkerHiddenSize;
-    int64_t const cpH = mTalkerConfig.codePredictorHiddenSize;
-    int32_t const codebookSize = mTalkerConfig.codebookSize;
+    // Original model logic:
+    // - codes: code_0 (from Talker) + code_1..code_N (from CodePredictor) = mNumCodesPerFrame codes
+    // - hidden_states: written directly to mCodecHiddensBuffer
 
-    check::check(activeBatchSize >= 1 && activeBatchSize <= mMaxBatchSize,
-        "runCodePredictorGenerationForFrame: activeBatchSize out of range");
-    check::check(static_cast<int32_t>(codecTokensPerBatch.size()) == activeBatchSize,
-        "codecTokensPerBatch.size() must equal activeBatchSize");
-    if (!mUseSmallToMtpProjection)
-    {
-        check::check(talkerH == cpH, "no-projection CP path requires talkerH == cpH");
-    }
+    outputCodes.clear();
+    outputCodes.reserve(mNumCodesPerFrame);
 
-    // Helper: returns a [activeBatchSize, cpH] tensor view containing srcTalkerSpace2D projected
-    // into CP hidden space. When mUseSmallToMtpProjection is false (talkerH == cpH), the source
-    // view IS already the cp view — returned directly. Otherwise, invokeLinearLayer writes the
-    // projected output into projectScratch (which must be sized [activeBatchSize, cpH]).
-    auto projectToCpView = [&](rt::Tensor const& srcTalkerSpace2D, rt::Tensor& projectScratch) -> rt::Tensor const* {
-        if (!mUseSmallToMtpProjection)
-        {
-            return &srcTalkerSpace2D;
-        }
-        check::check(projectScratch.reshape({activeBatchSize, cpH}), "Tensor reshape failed");
-        kernel::invokeLinearLayer(srcTalkerSpace2D, mSmallToMtpWeight, mSmallToMtpBias, projectScratch, stream);
-        return &projectScratch;
-    };
+    // code_0 comes from Talker
+    outputCodes.push_back(codecToken);
 
-    // Output containers: code_0 (from Talker) + 1..mNumRvqLayers (from CP).
-    outputCodesPerBatch.assign(activeBatchSize, std::vector<int32_t>{});
-    for (int32_t b = 0; b < activeBatchSize; ++b)
-    {
-        outputCodesPerBatch[b].reserve(mNumCodesPerFrame);
-        outputCodesPerBatch[b].push_back(codecTokensPerBatch[b]);
-    }
+    int64_t const hiddenSize = mTalkerConfig.codePredictorHiddenSize;
 
-    // ---- Step 1: Batched lookup of code_0 embeddings (Talker codec_embedding, talkerH-dim) ----
-    check::check(mCodePredictorCodecIds.reshape({activeBatchSize, 1}), "Tensor reshape failed");
-    CUDA_CHECK(cudaMemcpyAsync(mCodePredictorCodecIds.rawPointer(), codecTokensPerBatch.data(),
-        activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    check::check(mRawCodecEmbed.reshape({activeBatchSize, 1, talkerH}), "Tensor reshape failed");
-    kernel::embeddingLookup(mCodePredictorCodecIds, mTalkerEmbeddingTable, std::nullopt, mRawCodecEmbed, stream);
-
-    // ---- Step 2: Build [activeBS, 2, cpH] prefill input — slot 0 = proj(talker_h), slot 1 = proj(code_0_embed)
-    check::check(mCodePredictorPrefillInput.reshape({activeBatchSize, 2, cpH}), "Tensor reshape failed");
+    // ========== Prefill: generate code_1 ==========
+    // Input: concat([proj(talker_hidden), proj(embed(code_0))]) -> [1, 2, codePredictorHiddenSize]
+    // NOTE: code_0 embedding uses TALKER's codec_embedding (2048-dim),
+    // projected to 1024 via small_to_mtp_projection
+    // PyTorch: last_id_hidden = self.small_to_mtp_projection(self.get_input_embeddings()(input_ids))
+    int32_t code = 0;
     {
         TIME_STAGE(metrics::StageNames::kCODEPREDICTOR_PREFILL, stream);
 
-        // 2D views into the [activeBS, 1, talkerH] sources to feed projectToCpView.
-        rt::Tensor talkerInput2D(const_cast<__half*>(static_cast<__half const*>(talkerLastHiddenBatched.rawPointer())),
-            rt::Coords{activeBatchSize, talkerH}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-        rt::Tensor rawCodec2D(mRawCodecEmbed.rawPointer(), rt::Coords{activeBatchSize, talkerH}, rt::DeviceType::kGPU,
-            nvinfer1::DataType::kHALF);
+        // Step 1: Lookup code_0 from Talker's embedding table into mRawCodecEmbed (2048-dim)
+        CUDA_CHECK(cudaMemcpyAsync(
+            mCodePredictorCodecIds.rawPointer(), &codecToken, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        check::check(mRawCodecEmbed.reshape({1, 1, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
+        kernel::embeddingLookup(mCodePredictorCodecIds, mTalkerEmbeddingTable, std::nullopt, mRawCodecEmbed, stream);
 
-        rt::Tensor const* talkerCpView = projectToCpView(talkerInput2D, mSmallToMtpProjectedHidden);
-        rt::Tensor const* codecCpView = projectToCpView(rawCodec2D, mCodePredictorCodecEmbed);
-
-        // Interleave the two per-batch [bs, cpH] tensors into [bs, 2, cpH] prefill input.
-        for (int32_t b = 0; b < activeBatchSize; ++b)
+        // Step 2: Project talkerHiddenState → slot 0 of prefill input
+        // Step 3: Project mRawCodecEmbed → slot 1 of prefill input
+        // Step 4: Concat into mCodePredictorPrefillInput [1, 2, codePredictorHiddenSize]
+        check::check(mRawCodecEmbed.reshape({1, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
+        check::check(
+            mCodePredictorCodecEmbed.reshape({1, mTalkerConfig.codePredictorHiddenSize}), "Tensor reshape failed");
+        if (!mUseSmallToMtpProjection)
         {
-            __half* dst = static_cast<__half*>(mCodePredictorPrefillInput.rawPointer()) + b * 2 * cpH;
-            __half const* talkerSrc = static_cast<__half const*>(talkerCpView->rawPointer()) + b * cpH;
-            __half const* codecSrc = static_cast<__half const*>(codecCpView->rawPointer()) + b * cpH;
-            CUDA_CHECK(cudaMemcpyAsync(dst, talkerSrc, cpH * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync(dst + cpH, codecSrc, cpH * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(mCodePredictorPrefillInput.rawPointer(), talkerHiddenState.rawPointer(),
+                hiddenSize * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<__half*>(mCodePredictorPrefillInput.rawPointer()) + hiddenSize,
+                mRawCodecEmbed.rawPointer(), hiddenSize * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
+        }
+        else
+        {
+            kernel::invokeLinearLayer(
+                talkerHiddenState, mSmallToMtpWeight, mSmallToMtpBias, mSmallToMtpProjectedHidden, stream);
+            kernel::invokeLinearLayer(
+                mRawCodecEmbed, mSmallToMtpWeight, mSmallToMtpBias, mCodePredictorCodecEmbed, stream);
+            CUDA_CHECK(cudaMemcpyAsync(mCodePredictorPrefillInput.rawPointer(), mSmallToMtpProjectedHidden.rawPointer(),
+                hiddenSize * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<__half*>(mCodePredictorPrefillInput.rawPointer()) + hiddenSize,
+                mCodePredictorCodecEmbed.rawPointer(), hiddenSize * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
         }
 
-        // ---- Step 3: CP prefill engine call (produces logits for code_1) ----
-        check::check(mCodePredictorHiddenStatesBuffer.reshape({activeBatchSize, 2, cpH}), "Tensor reshape failed");
-        rt::Tensor& logitsHead0 = mCodePredictorLogitsPerHead[0];
+        check::check(mCodePredictorHiddenStatesBuffer.reshape({1, 2, mTalkerConfig.codePredictorHiddenSize}),
+            "Tensor reshape failed");
+
+        // NOTE: CodePredictor ONNX outputs FP32 logits directly (lm_head + cast in ONNX)
+        // generationStep=0 corresponds to code_1 (using lm_head_0)
         if (!executeCodePredictorPrefillStep(
-                mCodePredictorPrefillInput, /*lmHeadIdx=*/0, logitsHead0, mCodePredictorHiddenStatesBuffer, stream))
+                mCodePredictorPrefillInput, 0, mCodePredictorLogits, mCodePredictorHiddenStatesBuffer, stream))
         {
             return false;
         }
 
-        // ---- Step 4: Sample code_1 (batched) ----
-        check::check(logitsHead0.reshape({activeBatchSize, codebookSize}), "Tensor reshape failed");
-        check::check(mCodePredictorSelectedIndices.reshape({activeBatchSize, 1}), "Tensor reshape failed");
-        SamplingParams const perCallParams(
-            activeBatchSize, codebookSize, samplingParams.temperature, samplingParams.topK, samplingParams.topP);
+        // Sample code_1
         trt_edgellm::topKtopPSamplingFromLogits(
-            logitsHead0, mCodePredictorSelectedIndices, perCallParams, mSamplingWorkspace, stream);
-        check::check(mHostSelectedCodeIds.reshape({activeBatchSize}), "Tensor reshape failed");
+            mCodePredictorLogits, mCodePredictorSelectedIndices, samplingParams, mSamplingWorkspace, stream);
         CUDA_CHECK(cudaMemcpyAsync(mHostSelectedCodeIds.rawPointer(), mCodePredictorSelectedIndices.rawPointer(),
-            activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+            sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        int32_t* hostCodes = mHostSelectedCodeIds.dataPointer<int32_t>();
-        for (int32_t b = 0; b < activeBatchSize; ++b)
-        {
-            outputCodesPerBatch[b].push_back(hostCodes[b]); // code_1
-        }
+        code = mHostSelectedCodeIds.dataPointer<int32_t>()[0];
+        outputCodes.push_back(code); // code_1
     } // end kCODEPREDICTOR_PREFILL scope
 
-    // ---- Step 5: Mid-RVQ codec hiddens buffer for residual.
-    // Layout: mCodecHiddensBuffer[maxBS, mNumCodesPerFrame, talkerH].
-    // Positions 0 and mNumRvqLayers are filled by computeResidualConnection (Talker embed lookup).
-    // Positions 1..mNumRvqLayers-1 are filled here from the per-step raw codec embedding.
-    check::check(mCodecHiddensBuffer.reshape({activeBatchSize, mNumCodesPerFrame, talkerH}), "Tensor reshape failed");
+    // ========== Write embedding lookups to mCodecHiddensBuffer for residual connection ==========
+    // mCodecHiddensBuffer layout: [1, mNumCodesPerFrame, H]
+    // Position 0:  embed(code_0)  using Talker's embedding   - filled in computeResidualConnection
+    // Position 1..(mNumRvqLayers-1): codec_embedding[step-1](code_step)
+    //   — filled here (input embeddings, NOT engine hidden states)
+    // Position mNumRvqLayers: embed(code_last) using CodePredictor embed[-1] - filled in computeResidualConnection
+    //
+    // PyTorch original (modeling_qwen3_omni.py:3419):
+    //   mid_residual_hiddens = [hid[0] for hid in predictor_result.hidden_states[1:]]
+    //   hid[0] = inputs_embeds for each decode step = codec_embedding[step-1](code_step)
+    //   NOT the transformer output (last layer hidden states)
 
-    // ---- Step 6: Decode loop for codes 2 .. mNumRvqLayers (batched) ----
+    // mCodecHiddensBuffer stores raw (2048-dim) codec embeddings for the residual connection
+    check::check(
+        mCodecHiddensBuffer.reshape({1, mNumCodesPerFrame, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
+
+    // ========== Decoding loop: generate code_2 to code_(mNumRvqLayers) ==========
     {
         TIME_STAGE(metrics::StageNames::kCODEPREDICTOR_GENERATION, stream);
-        for (int32_t step = 2; step <= mNumRvqLayers; ++step)
+        for (int step = 2; step <= mNumRvqLayers; ++step)
         {
-            int32_t const embedIdx = step - 2;  // step=2 → codec_embedding[0]
-            int32_t const lmHeadIdx = step - 1; // step=2 → lm_head[1]
+            check::check(mCodePredictorHiddenStatesBuffer.reshape({1, 1, mTalkerConfig.codePredictorHiddenSize}),
+                "Tensor reshape failed");
 
-            // Lookup code_(step-1) for each batch.
-            // Codes are in outputCodesPerBatch[b].back() from last sample (= code_(step-1)).
-            std::vector<int32_t> codesForStep(activeBatchSize);
-            for (int32_t b = 0; b < activeBatchSize; ++b)
-                codesForStep[b] = outputCodesPerBatch[b].back();
-            check::check(mCodePredictorCodecIds.reshape({activeBatchSize, 1}), "Tensor reshape failed");
-            CUDA_CHECK(cudaMemcpyAsync(mCodePredictorCodecIds.rawPointer(), codesForStep.data(),
-                activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-            check::check(mRawCodecEmbed.reshape({activeBatchSize, 1, talkerH}), "Tensor reshape failed");
-            kernel::embeddingLookup(
-                mCodePredictorCodecIds, mCodePredictorEmbeddingTables[embedIdx], std::nullopt, mRawCodecEmbed, stream);
+            rt::OptionalInputTensor prevHiddenOpt{std::ref(mCodePredictorHiddenStatesBuffer)};
 
-            // Save raw embedding to mCodecHiddensBuffer[b][step-1] for residual (matches PyTorch position mapping).
-            int32_t const savePos = step - 1; // 1..mNumRvqLayers-1
-            for (int32_t b = 0; b < activeBatchSize; ++b)
-            {
-                __half* dst = static_cast<__half*>(mCodecHiddensBuffer.rawPointer())
-                    + (b * mNumCodesPerFrame + savePos) * talkerH;
-                __half const* src = static_cast<__half const*>(mRawCodecEmbed.rawPointer()) + b * talkerH;
-                CUDA_CHECK(cudaMemcpyAsync(dst, src, talkerH * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
-            }
+            // PyTorch generation_steps logic:
+            //   - generation_steps=1: embed(code_1) with codec_embedding[0], output with lm_head[1] -> code_2
+            //   - generation_steps=N: embed(code_N) with codec_embedding[N-1], output with lm_head[N] -> code_(N+1)
+            int32_t const embeddingIdx = step - 2; // step=2->embed[0], step=3->embed[1], ...
+            int32_t const lmHeadIdx = step - 1;    // step=2->lm_head[1], step=3->lm_head[2], ...
 
-            // Project raw codec embed → mCodePredictorCodecEmbed [activeBS, 1, cpH].
-            rt::Tensor rawCodec2D(mRawCodecEmbed.rawPointer(), rt::Coords{activeBatchSize, talkerH},
-                rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-            rt::Tensor const* projectedView = projectToCpView(rawCodec2D, mSmallToMtpProjectedHidden);
-
-            check::check(mCodePredictorCodecEmbed.reshape({activeBatchSize, 1, cpH}), "Tensor reshape failed");
-            for (int32_t b = 0; b < activeBatchSize; ++b)
-            {
-                __half* dst = static_cast<__half*>(mCodePredictorCodecEmbed.rawPointer()) + b * cpH;
-                __half const* src = static_cast<__half const*>(projectedView->rawPointer()) + b * cpH;
-                CUDA_CHECK(cudaMemcpyAsync(dst, src, cpH * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
-            }
-
-            // CP decode engine call.
-            rt::Tensor& logitsForHead = mCodePredictorLogitsPerHead[lmHeadIdx];
-            check::check(mCodePredictorHiddenStatesBuffer.reshape({activeBatchSize, 1, cpH}), "Tensor reshape failed");
             if (!executeCodePredictorDecodingStep(
-                    mCodePredictorCodecEmbed, lmHeadIdx, logitsForHead, mCodePredictorHiddenStatesBuffer, stream))
+                    code, embeddingIdx, lmHeadIdx, mCodePredictorLogits, mCodePredictorHiddenStatesBuffer, stream))
             {
                 return false;
             }
 
-            // Sample code_step.
-            check::check(logitsForHead.reshape({activeBatchSize, codebookSize}), "Tensor reshape failed");
-            SamplingParams const perCallParams(
-                activeBatchSize, codebookSize, samplingParams.temperature, samplingParams.topK, samplingParams.topP);
+            // Embedding is now saved inside executeCodePredictorDecodingStep before engine execution
+
             trt_edgellm::topKtopPSamplingFromLogits(
-                logitsForHead, mCodePredictorSelectedIndices, perCallParams, mSamplingWorkspace, stream);
+                mCodePredictorLogits, mCodePredictorSelectedIndices, samplingParams, mSamplingWorkspace, stream);
             CUDA_CHECK(cudaMemcpyAsync(mHostSelectedCodeIds.rawPointer(), mCodePredictorSelectedIndices.rawPointer(),
-                activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+                sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
 
-            int32_t* hostCodes = mHostSelectedCodeIds.dataPointer<int32_t>();
-            for (int32_t b = 0; b < activeBatchSize; ++b)
-                outputCodesPerBatch[b].push_back(hostCodes[b]); // code_step
+            code = mHostSelectedCodeIds.dataPointer<int32_t>()[0];
+            outputCodes.push_back(code); // code_2 to code_15
         }
-    }
+    } // end kCODEPREDICTOR_GENERATION scope
 
     return true;
 }
 
-bool Qwen3OmniTTSRuntime::computeResidualConnection(rt::Tensor const& codecHiddensThisBatch,
-    std::vector<int32_t> const& codes, rt::Tensor const* trailingTextHidden, int32_t generationStep,
-    rt::Tensor& outputResidual, cudaStream_t stream)
+bool Qwen3OmniTTSRuntime::computeResidualConnection(std::vector<int32_t> const& codes,
+    rt::Tensor const* trailingTextHidden, int32_t generationStep, rt::Tensor& outputResidual, cudaStream_t stream)
 {
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::computeResidualConnection", nvtx_colors::BLUE);
 
@@ -2062,15 +1758,13 @@ bool Qwen3OmniTTSRuntime::computeResidualConnection(rt::Tensor const& codecHidde
     //       inputs_embeds += trailing_text_hidden[:, generation_step]
     //   else:
     //       inputs_embeds += tts_pad_embed
-    //
-    // codecHiddensThisBatch: [1, mNumCodesPerFrame, talkerH] view into per-batch slot of mCodecHiddensBuffer.
-    // The kernel reads middle positions [1..mNumRvqLayers-1] (filled by CP decode loop) and
-    // fills positions 0 and mNumRvqLayers via Talker/CP embedding lookup using codes[0] / codes[last].
 
     check::check(static_cast<int32_t>(codes.size()) == mNumCodesPerFrame,
         "Expected " + std::to_string(mNumCodesPerFrame) + " codes, got " + std::to_string(codes.size()));
 
     int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
+    // reshape only when the tensor owns its memory (skip for non-owning views
+    // which are already constructed with the correct shape by the caller)
     if (!outputResidual.reshape({1, 1, hiddenSize}))
     {
         check::check(
@@ -2087,7 +1781,7 @@ bool Qwen3OmniTTSRuntime::computeResidualConnection(rt::Tensor const& codecHidde
         }
     }
 
-    kernel::invokeResidualConnection(codecHiddensThisBatch, mTalkerEmbeddingTable,
+    kernel::invokeResidualConnection(mCodecHiddensBuffer, mTalkerEmbeddingTable,
         mCodePredictorEmbeddingTables[mNumRvqLayers - 1], codes[0], codes[mNumRvqLayers], addend, outputResidual,
         stream);
 
@@ -2110,12 +1804,7 @@ bool Qwen3OmniTTSRuntime::extractTalkerLastHidden(
     int64_t const seqLen = shape[1];
     int64_t const hiddenSize = shape[2];
 
-    // Owning tensors get reshaped; non-owning views must already have the right shape.
-    if (!outputLastHidden.reshape({batchSize, hiddenSize}))
-    {
-        check::check(outputLastHidden.getShape() == rt::Coords{batchSize, hiddenSize},
-            "extractTalkerLastHidden: non-owning output has wrong shape");
-    }
+    check::check(outputLastHidden.reshape({batchSize, hiddenSize}), "Tensor reshape failed");
 
     // Extract last token for each batch: output[b] = input[b, seqLen-1, :]
     size_t const copySize = hiddenSize * sizeof(__half);
@@ -2432,14 +2121,12 @@ bool Qwen3OmniTTSRuntime::handleStreamingGeneration(LLMInferenceRuntime& thinker
         int32_t talkerFrames{0};
         int32_t codecToken{-1};
         int32_t trailingIdx{0};
+        int32_t lastChunkEnd{0};
         std::vector<std::vector<int32_t>> rvqCodes;
         std::vector<int32_t> inputIds;
     };
     StreamingState state;
     state.rvqCodes.reserve(omniBaseRequest.maxAudioLength);
-
-    // Shared chunk emitter — same accumulator used by runTalkerGenerationLoop's TTS streaming path.
-    ChunkEmitter emitter{streamingConfig.codecChunkFrames, streamingConfig.onAudioChunkReady, {}};
 
     int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
     int64_t const trailingStride = mTalkerConfig.maxSeqLen + 1;
@@ -2501,8 +2188,8 @@ bool Qwen3OmniTTSRuntime::handleStreamingGeneration(LLMInferenceRuntime& thinker
             LOG_INFO("Thinker produced %d assistant tokens, triggering Talker prefill", numAssistantTokens);
 
             // Reset KV caches
-            auto& talkerCacheManager = *mTalkerSharedRes->cacheManagers[0];
-            auto& cpCacheManager = *mCodePredictorSharedRes->cacheManagers[0];
+            auto& talkerCacheManager = mTalkerLLMRunner->getCacheManager();
+            auto& cpCacheManager = mCodePredictorRunner->getCacheManager();
             talkerCacheManager.resetForNewSequences(mHostReuseKVCacheLengths, stream);
             cpCacheManager.resetForNewSequences(mHostReuseKVCacheLengths, stream);
             {
@@ -2573,9 +2260,7 @@ bool Qwen3OmniTTSRuntime::handleStreamingGeneration(LLMInferenceRuntime& thinker
                 ++numSeenTokens;
             }
             state.talkerPrefillDone = true;
-            // Always record (matches handleAudioGeneration / handleAudioGenerationFromThinker):
-            // streaming callers consume the event for TTFC measurement even without profiling.
-            if (mTtfaEnd)
+            if (getProfilingEnabled())
             {
                 CUDA_CHECK(cudaEventRecord(mTtfaEnd, stream));
             }
@@ -2626,7 +2311,15 @@ bool Qwen3OmniTTSRuntime::handleStreamingGeneration(LLMInferenceRuntime& thinker
                     return;
                 }
                 state.talkerFrames++;
-                emitter.append(state.rvqCodes.back());
+
+                if (streamingConfig.codecChunkFrames > 0 && streamingConfig.onAudioChunkReady
+                    && (state.talkerFrames - state.lastChunkEnd) >= streamingConfig.codecChunkFrames)
+                {
+                    std::vector<std::vector<int32_t>> chunk(
+                        state.rvqCodes.begin() + state.lastChunkEnd, state.rvqCodes.begin() + state.talkerFrames);
+                    streamingConfig.onAudioChunkReady(chunk);
+                    state.lastChunkEnd = state.talkerFrames;
+                }
             }
         }
     };
@@ -2662,6 +2355,8 @@ bool Qwen3OmniTTSRuntime::handleStreamingGeneration(LLMInferenceRuntime& thinker
         rt::Tensor flushTrailingView = makeTrailingView();
         rt::Tensor const* flushTrailingPtr = (state.trailingIdx > 0) ? &flushTrailingView : nullptr;
 
+        int32_t const chunkSize = streamingConfig.codecChunkFrames;
+
         while (state.codecToken != codecEosId && state.talkerFrames < maxAudioLength)
         {
             {
@@ -2674,10 +2369,23 @@ bool Qwen3OmniTTSRuntime::handleStreamingGeneration(LLMInferenceRuntime& thinker
                 }
             }
             state.talkerFrames++;
-            emitter.append(state.rvqCodes.back());
+
+            if (chunkSize > 0 && streamingConfig.onAudioChunkReady
+                && (state.talkerFrames - state.lastChunkEnd) >= chunkSize)
+            {
+                std::vector<std::vector<int32_t>> chunk(
+                    state.rvqCodes.begin() + state.lastChunkEnd, state.rvqCodes.begin() + state.talkerFrames);
+                streamingConfig.onAudioChunkReady(chunk);
+                state.lastChunkEnd = state.talkerFrames;
+            }
         }
 
-        emitter.flushFinal();
+        if (streamingConfig.onAudioChunkReady && state.lastChunkEnd < state.talkerFrames)
+        {
+            std::vector<std::vector<int32_t>> remainder(
+                state.rvqCodes.begin() + state.lastChunkEnd, state.rvqCodes.begin() + state.talkerFrames);
+            streamingConfig.onAudioChunkReady(remainder);
+        }
     }
     else
     {

@@ -352,7 +352,7 @@ def _reduce_lm_head_in_place(lm_head: nn.Module,
                              vocab_map: torch.Tensor) -> None:
     from ..models.linear import (AWQLinear, FP8Linear, FP16Linear, GPTQLinear,
                                  INT8SQLinear, ModelOptAWQPrepackedLinear,
-                                 MXFP8Linear, is_nvfp4_linear)
+                                 MXFP8Linear, NVFP4Linear)
 
     reduced_vocab_size = int(vocab_map.numel())
     if isinstance(lm_head, FP16Linear):
@@ -366,9 +366,8 @@ def _reduce_lm_head_in_place(lm_head: nn.Module,
         lm_head.out_features = reduced_vocab_size
         return
 
-    if isinstance(
-            lm_head,
-        (FP8Linear, MXFP8Linear, INT8SQLinear)) or is_nvfp4_linear(lm_head):
+    if isinstance(lm_head,
+                  (FP8Linear, MXFP8Linear, NVFP4Linear, INT8SQLinear)):
         _reduce_row_sliced_lm_head(lm_head, vocab_map)
         return
 

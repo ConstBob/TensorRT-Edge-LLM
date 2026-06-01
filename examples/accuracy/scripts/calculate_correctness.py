@@ -41,28 +41,17 @@ def clean_text(text):
     return text
 
 
-def _strip_markdown(text):
-    """Strip markdown emphasis that gets in the way of letter matching."""
-    return text.replace("**", "").replace("__", "").replace("`", "")
-
-
 def parse_multi_choice_response(text):
     """
     Parse multiple choice answer from text that may be in various formats.
-    Handles "A. xxx", "A", "(A)", "**Answer: A**", "the answer is A", or just
-    returns the first letter if it's A-H.
-
+    Handles formats like "A. xxx", "A", "(A)", or just returns first letter if it's A-H.
+    
     Args:
         text: Input text string potentially containing a multiple choice answer.
     Returns:
         Single letter (A-H) if found, otherwise returns the original cleaned text.
     """
-    text = _strip_markdown(text.strip())
-
-    # Anchor on an explicit ``Answer: X`` / ``answer is X`` form.
-    m = re.search(r"\banswer\s*(?:is|:)?\s*\(?([A-H])\b", text, re.IGNORECASE)
-    if m:
-        return m.group(1).upper()
+    text = text.strip()
 
     # If text is already just a single letter A-H, return it
     if len(text) == 1 and text in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']:

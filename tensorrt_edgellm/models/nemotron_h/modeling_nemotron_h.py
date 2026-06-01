@@ -60,7 +60,7 @@ import torch.nn.functional as F
 from ...config import (LAYER_ATTN, LAYER_MAMBA, LAYER_MLP, LAYER_MOE,
                        MambaConfig, ModelConfig)
 from ..default.modeling_default import OnnxSpec
-from ..linear import FP16Linear, is_nvfp4_linear, make_linear
+from ..linear import FP16Linear, NVFP4Linear, make_linear
 from ..ops import (attention_plugin, causal_conv1d, nvfp4_moe_plugin,
                    update_ssm_state)
 
@@ -523,8 +523,8 @@ class NemotronHMoEMLP(nn.Module):
         for expert in self.experts:
             up = expert.up_proj
             dn = expert.down_proj
-            assert is_nvfp4_linear(up) and is_nvfp4_linear(dn), (
-                "MoE experts must be NVFP4-quantized")
+            assert isinstance(up, NVFP4Linear) and isinstance(
+                dn, NVFP4Linear), "MoE experts must be NVFP4Linear"
 
             up_w, up_sc, up_sc_dec, up_gl = repack_nvfp4_expert_up_prefill_raw(
                 up.weight, up.weight_scale, up.weight_scale_2, H, I)

@@ -75,13 +75,12 @@ def export_onnx(
     fp8_embedding: bool = False,
     reduced_vocab_dir: str = "",
     externalize_weights=None,
-    config_filename: str = "config.json",
 ) -> None:
     """Export *model* to ONNX using the dynamo exporter.
 
-    Writes ``model.onnx``, ``model.onnx.data``, the runtime config (named
-    *config_filename*), ``embedding.safetensors``, and any tokenizer files
-    present in *model_dir* to the same output directory.
+    Writes ``model.onnx``, ``model.onnx.data``, ``config.json``,
+    ``embedding.safetensors``, and any tokenizer files present in
+    *model_dir* to the same output directory.
 
     Args:
         model:       A :class:`~modules.CausalLM` with weights loaded.
@@ -97,10 +96,6 @@ def export_onnx(
                              weight files.
                              Supported kinds: ``int4_ffn``, ``int4_moe``,
                              ``lm_head``, and ``all``.
-        config_filename: Filename for the runtime config beside the ONNX.
-                         Use ``"config.json"`` for single-device exports
-                         or ``"config_tp{N}_rank{R}.json"`` for per-rank
-                         TP exports so each rank is self-describing.
     """
     out_dir = os.path.dirname(os.path.abspath(output_path))
     os.makedirs(out_dir, exist_ok=True)
@@ -120,8 +115,7 @@ def export_onnx(
                             model_dir,
                             out_dir,
                             fp8_embedding=fp8_embedding,
-                            reduced_vocab_dir=reduced_vocab_dir,
-                            config_filename=config_filename)
+                            reduced_vocab_dir=reduced_vocab_dir)
     if external_weight_files:
         patch_external_weight_manifest(out_dir, external_weight_files)
 
@@ -626,11 +620,7 @@ def _fix_initializer_dtypes(
     # Delete existing external data file before re-saving.  onnx.save_model
     # opens the file in r+b mode and appends new tensors at the end, so the
     # old data would remain as unreferenced garbage, doubling the file size.
-    # Derive the data filename from onnx_path so per-rank TP exports
-    # (model_tp{N}_rank{R}.onnx) get distinct .data files instead of
-    # all overwriting the same model.onnx.data.
-    data_file = os.path.basename(onnx_path) + ".data"
-    ext_path = os.path.join(os.path.dirname(onnx_path), data_file)
+    ext_path = os.path.join(os.path.dirname(onnx_path), "model.onnx.data")
     if os.path.isfile(ext_path):
         old_size = os.path.getsize(ext_path)
         logger.info("Removing stale external data %s (%.2f GB) before re-save",
@@ -641,7 +631,7 @@ def _fix_initializer_dtypes(
         onnx_path,
         save_as_external_data=True,
         all_tensors_to_one_file=True,
-        location=data_file,
+        location="model.onnx.data",
         convert_attribute=True,
     )
 
