@@ -41,8 +41,6 @@ import torch
 import torch.nn as nn
 from safetensors import safe_open
 
-from ..config import Mapping
-from ..models.linear import LinearBase, TPMode
 from .repacking import apply_all_repacking
 
 logger = logging.getLogger(__name__)
@@ -57,14 +55,12 @@ _FUSED_INPUT_CHANNEL_ATTRS = {"pre_quant_scale"}
 
 
 def load_weights(
-    model: nn.Module,
-    model_dir: str,
-    device: str = "cpu",
-    key_remap: "Optional[Callable[[str], Optional[str]]]" = None,
-    key_prefix: Optional[str] = None,
-    pre_repack_hook: Optional[Callable[[nn.Module], None]] = None,
-    mapping: Optional[Mapping] = None,
-) -> None:
+        model: nn.Module,
+        model_dir: str,
+        device: str = "cpu",
+        key_remap: "Optional[Callable[[str], Optional[str]]]" = None,
+        key_prefix: Optional[str] = None,
+        pre_repack_hook: Optional[Callable[[nn.Module], None]] = None) -> None:
     """Load all safetensors weights from *model_dir* into *model* in-place.
 
     Args:
@@ -84,12 +80,7 @@ def load_weights(
         pre_repack_hook:
                     Optional callback invoked after raw checkpoint tensors are
                     loaded and before quantized weights are repacked.
-        mapping:    Parallel-placement config (default = no TP). Drives
-                    :func:`_shard_for_module` to slice each NVFP4
-                    weight/scale to its per-rank shard before assignment.
-                    Must match ``ModelConfig.mapping`` used to build *model*.
     """
-    mapping = mapping or Mapping()
     shard_map = _build_shard_map(model_dir)
     # Group keys by shard path to open each shard only once
     path_to_keys: Dict[str, list] = {}
@@ -138,12 +129,9 @@ def load_weights(
                     if mapped_key is None:
                         skipped += 1
                         continue
-                if _set_tensor(model, mapped_key, tensor, mapping=mapping):
+                if _set_tensor(model, mapped_key, tensor):
                     loaded += 1
-                elif _try_split_fused_tensor(model,
-                                             mapped_key,
-                                             tensor,
-                                             mapping=mapping):
+                elif _try_split_fused_tensor(model, mapped_key, tensor):
                     loaded += 1
                 else:
                     logger.debug("Key not found in model: %s", key)
@@ -161,12 +149,9 @@ def load_weights(
                         if mapped_key is None:
                             skipped += 1
                             continue
-                    if _set_tensor(model, mapped_key, tensor, mapping=mapping):
+                    if _set_tensor(model, mapped_key, tensor):
                         loaded += 1
-                    elif _try_split_fused_tensor(model,
-                                                 mapped_key,
-                                                 tensor,
-                                                 mapping=mapping):
+                    elif _try_split_fused_tensor(model, mapped_key, tensor):
                         loaded += 1
                     else:
                         logger.debug("Key not found in model: %s", key)
@@ -316,83 +301,16 @@ def _navigate(model: nn.Module, parts: list) -> Tuple[nn.Module, str]:
     return module, parts[-1]
 
 
-def load_weight_shard(tensor: torch.Tensor,
-                      dim: int,
-                      mapping: Optional[Mapping] = None) -> torch.Tensor:
-    """Slice *tensor* along *dim* to the per-rank shard given by *mapping*.
-
-    Free function so any caller (``_shard_for_module``, future
-    ``MoEMethodBase.load_weights``) can reuse the same primitive.
-    Supports lazy partial reads when *tensor* is a safetensors slice
-    (has ``get_shape``).
-    """
-    mapping = mapping or Mapping()
-    tp_size, tp_rank = mapping.tp_size, mapping.tp_rank
-    if tp_size <= 1:
-        return tensor
-
-    # safetensors PySafeSlice path: read only the slice from disk.
-    if hasattr(tensor, "get_shape"):
-        shape = tensor.get_shape()
-        assert shape[dim] % tp_size == 0, (
-            f"TP shard: dim-{dim} {shape[dim]} not divisible by tp_size={tp_size}"
-        )
-        shard = shape[dim] // tp_size
-        sl = [slice(None)] * len(shape)
-        sl[dim] = slice(tp_rank * shard, (tp_rank + 1) * shard)
-        return tensor[tuple(sl)]
-
-    # In-memory torch.Tensor path.
-    assert tensor.shape[dim] % tp_size == 0, (
-        f"TP shard: dim-{dim} {tensor.shape[dim]} not divisible by tp_size={tp_size}"
-    )
-    shard = tensor.shape[dim] // tp_size
-    idx = [slice(None)] * tensor.dim()
-    idx[dim] = slice(tp_rank * shard, (tp_rank + 1) * shard)
-    return tensor[tuple(idx)].contiguous()
-
-
-def _shard_for_module(module: nn.Module,
-                      attr: str,
-                      tensor: torch.Tensor,
-                      mapping: Optional[Mapping] = None) -> torch.Tensor:
-    """Slice *tensor* to the per-rank shard declared by *module* for *attr*.
-
-    Dispatches on :meth:`LinearBase.tp_split_dim` so each Linear subclass
-    owns its TP rule. The loader stays uniform across quant formats.
-    Wraps the shared :func:`load_weight_shard` primitive.
-    """
-    mapping = mapping or Mapping()
-    if mapping.tp_size == 1:
-        return tensor
-
-    dim = module.tp_split_dim(attr) if isinstance(module, LinearBase) else None
-    tp_mode = getattr(module, "tp_mode", TPMode.REPLICATED)
-    if dim is None:
-        if tp_mode != TPMode.REPLICATED and tensor.dim() >= 2:
-            raise NotImplementedError(
-                f"TP sharding not declared for {type(module).__name__}.{attr} "
-                f"under tp_mode={tp_mode!r}.")
-        return tensor
-
-    return load_weight_shard(tensor, dim, mapping=mapping)
-
-
-def _set_tensor(model: nn.Module,
-                key: str,
-                tensor: torch.Tensor,
-                *,
-                mapping: Optional[Mapping] = None) -> bool:
+def _set_tensor(model: nn.Module, key: str, tensor: torch.Tensor) -> bool:
     """Assign *tensor* to the buffer or parameter at *key* inside *model*.
 
-    Bfloat16 tensors are cast to float16 on the fly. The export pipeline
+    Bfloat16 tensors are cast to float16 on the fly — the export pipeline
     assumes FP16 activations and the C++ runtime requires FP16 (or FP8)
-    weight files. Doing the cast here avoids a separate post-loading sweep.
+    weight files.  Doing the cast here avoids a separate post-loading sweep.
 
     Returns True on success, False if the key does not resolve to a known
     buffer or parameter.
     """
-    mapping = mapping or Mapping()
     parts = key.split(".")
     try:
         module, attr = _navigate(model, parts)
@@ -401,8 +319,6 @@ def _set_tensor(model: nn.Module,
 
     if tensor.dtype == torch.bfloat16:
         tensor = tensor.to(torch.float16)
-
-    tensor = _shard_for_module(module, attr, tensor, mapping)
 
     if attr in module._buffers:
         module._buffers[attr] = tensor
@@ -420,33 +336,28 @@ def _set_tensor(model: nn.Module,
     return False
 
 
-def _try_split_fused_tensor(model: nn.Module,
-                            key: str,
-                            tensor: torch.Tensor,
-                            *,
-                            mapping: Optional[Mapping] = None) -> bool:
+def _try_split_fused_tensor(model: nn.Module, key: str,
+                            tensor: torch.Tensor) -> bool:
     """Handle fused-weight checkpoint patterns not matched by _set_tensor.
 
     Supports two transformations applied in order:
-    1. ``.base_layer.`` removal. PEFT/LoRA checkpoints nest the base weight
+    1. ``.base_layer.`` removal — PEFT/LoRA checkpoints nest the base weight
        under ``module.base_layer.weight``. Strip ``.base_layer`` to recover the
        plain ``module.weight`` name before trying again.
-    2. Fused QKV split. ``self_attn.qkv_proj.weight`` (shape
+    2. Fused QKV split — ``self_attn.qkv_proj.weight`` (shape
        ``[q+k+v, hidden]``) is split into the three separate projection weights
        ``q_proj``, ``k_proj``, ``v_proj`` using the model's attention head
        configuration.
-    3. Fused gate+up split. ``mlp.gate_up_proj.weight`` (shape
+    3. Fused gate+up split — ``mlp.gate_up_proj.weight`` (shape
        ``[2*intermediate, hidden]``) is split into ``gate_proj`` and ``up_proj``
        (each half of the first dimension).
 
     Returns True if at least one split sub-tensor was set successfully.
     """
-    mapping = mapping or Mapping()
-    world = mapping.tp_size
     # --- 1. Strip PEFT base_layer prefix ------------------------------------
     if ".base_layer." in key:
         stripped = key.replace(".base_layer.", ".")
-        if _set_tensor(model, stripped, tensor, mapping=mapping):
+        if _set_tensor(model, stripped, tensor):
             return True
         # Still failed: fall through to fused-split checks with the stripped key
         key = stripped
@@ -461,30 +372,23 @@ def _try_split_fused_tensor(model: nn.Module,
         prefix = key[:qkv_idx]
         attr_suffix = key[qkv_idx + len(".self_attn.qkv_proj."):]
 
-        # When TP>1 the config carries per-rank head counts. Multiply back up
-        # so the split aligns with the full checkpoint tensor. Each split slice
-        # is then re-sharded inside _set_tensor by _shard_for_module.
-        num_q = config.num_attention_heads * config.head_dim * world
-        num_kv = config.num_key_value_heads * config.head_dim * world
+        num_q = config.num_attention_heads * config.head_dim
+        num_kv = config.num_key_value_heads * config.head_dim
 
         # Scalar, per-tensor, or per-input-channel attributes:
         # copy the same value to all three projections.
         if (tensor.dim() == 0 or (tensor.dim() == 1 and tensor.shape[0] <= 1)
                 or attr_suffix in _FUSED_INPUT_CHANNEL_ATTRS):
-            ok = _set_tensor(model,
-                             f"{prefix}.self_attn.q_proj.{attr_suffix}",
-                             tensor,
-                             mapping=mapping)
+            ok = _set_tensor(model, f"{prefix}.self_attn.q_proj.{attr_suffix}",
+                             tensor)
             ok |= _set_tensor(model,
                               f"{prefix}.self_attn.k_proj.{attr_suffix}",
-                              tensor,
-                              mapping=mapping)
+                              tensor)
             ok |= _set_tensor(model,
                               f"{prefix}.self_attn.v_proj.{attr_suffix}",
-                              tensor,
-                              mapping=mapping)
+                              tensor)
             if ok:
-                logger.debug("Broadcast qkv_proj.%s -> q/k/v for prefix %r",
+                logger.debug("Broadcast qkv_proj.%s → q/k/v for prefix %r",
                              attr_suffix, prefix)
             return ok
 
@@ -498,24 +402,15 @@ def _try_split_fused_tensor(model: nn.Module,
             expected //= 2
         if tensor.shape[0] != expected:
             logger.warning(
-                "qkv_proj.%s shape %s doesn't match expected (%d, %d, %d), "
-                "skipping split", attr_suffix, tensor.shape, *split_sizes)
+                "qkv_proj.%s shape %s doesn't match expected (%d, %d, %d) "
+                "— skipping split", attr_suffix, tensor.shape, *split_sizes)
             return False
         q, k, v = tensor.split(split_sizes, dim=0)
-        ok = _set_tensor(model,
-                         f"{prefix}.self_attn.q_proj.{attr_suffix}",
-                         q,
-                         mapping=mapping)
-        ok |= _set_tensor(model,
-                          f"{prefix}.self_attn.k_proj.{attr_suffix}",
-                          k,
-                          mapping=mapping)
-        ok |= _set_tensor(model,
-                          f"{prefix}.self_attn.v_proj.{attr_suffix}",
-                          v,
-                          mapping=mapping)
+        ok = _set_tensor(model, f"{prefix}.self_attn.q_proj.{attr_suffix}", q)
+        ok |= _set_tensor(model, f"{prefix}.self_attn.k_proj.{attr_suffix}", k)
+        ok |= _set_tensor(model, f"{prefix}.self_attn.v_proj.{attr_suffix}", v)
         if ok:
-            logger.debug("Split qkv_proj.%s -> q/k/v for prefix %r",
+            logger.debug("Split qkv_proj.%s → q/k/v for prefix %r",
                          attr_suffix, prefix)
         return ok
 
@@ -528,33 +423,23 @@ def _try_split_fused_tensor(model: nn.Module,
         # Scalar, per-tensor, or per-input-channel attributes: copy to both.
         if (tensor.dim() == 0 or (tensor.dim() == 1 and tensor.shape[0] <= 1)
                 or attr_suffix in _FUSED_INPUT_CHANNEL_ATTRS):
-            ok = _set_tensor(model,
-                             f"{prefix}.mlp.gate_proj.{attr_suffix}",
-                             tensor,
-                             mapping=mapping)
-            ok |= _set_tensor(model,
-                              f"{prefix}.mlp.up_proj.{attr_suffix}",
-                              tensor,
-                              mapping=mapping)
+            ok = _set_tensor(model, f"{prefix}.mlp.gate_proj.{attr_suffix}",
+                             tensor)
+            ok |= _set_tensor(model, f"{prefix}.mlp.up_proj.{attr_suffix}",
+                              tensor)
             if ok:
                 logger.debug(
-                    "Broadcast gate_up_proj.%s -> gate/up for prefix %r",
+                    "Broadcast gate_up_proj.%s → gate/up for prefix %r",
                     attr_suffix, prefix)
             return ok
 
         # Per-output-channel attributes: split in half on dim 0.
         half = tensor.shape[0] // 2
         gate, up = tensor[:half], tensor[half:]
-        ok = _set_tensor(model,
-                         f"{prefix}.mlp.gate_proj.{attr_suffix}",
-                         gate,
-                         mapping=mapping)
-        ok |= _set_tensor(model,
-                          f"{prefix}.mlp.up_proj.{attr_suffix}",
-                          up,
-                          mapping=mapping)
+        ok = _set_tensor(model, f"{prefix}.mlp.gate_proj.{attr_suffix}", gate)
+        ok |= _set_tensor(model, f"{prefix}.mlp.up_proj.{attr_suffix}", up)
         if ok:
-            logger.debug("Split gate_up_proj.%s -> gate/up for prefix %r",
+            logger.debug("Split gate_up_proj.%s → gate/up for prefix %r",
                          attr_suffix, prefix)
         return ok
 

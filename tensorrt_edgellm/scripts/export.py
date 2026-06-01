@@ -475,73 +475,42 @@ def _export_llm(model_dir: str,
                 reduced_vocab_dir: str = "",
                 nvfp4_moe_backend: "Optional[str]" = None,
                 mtp_base: bool = False,
-                externalize_weights: "list[str] | None" = None,
-                tp_size: int = 1) -> None:
-    """Export LLM backbone via the standard tensorrt_edgellm pipeline.
-
-    When ``tp_size > 1``, exports ``tp_size`` per-rank ONNX files named
-    ``model_tp{N}_rank{R}.onnx`` (matches ``cpp/builder/llmBuilder.cpp``).
-    Each rank reloads the checkpoint fresh and shards weights to its
-    slice on assignment.
-    """
+                externalize_weights: "list[str] | None" = None) -> None:
+    """Export LLM backbone via the standard tensorrt_edgellm pipeline."""
     os.makedirs(llm_out_dir, exist_ok=True)
+    output_path = os.path.join(llm_out_dir, "model.onnx")
 
     key_remap = (_alpamayo_llm_key_remap
                  if model_type == "alpamayo_r1" else None)
 
-    if tp_size <= 1:
-        ranks = [(0, 1)]
-        out_paths = [os.path.join(llm_out_dir, "model.onnx")]
-    else:
-        ranks = [(r, tp_size) for r in range(tp_size)]
-        out_paths = [
-            os.path.join(llm_out_dir, f"model_tp{tp_size}_rank{r}.onnx")
-            for r in range(tp_size)
-        ]
+    logger.info("[LLM] Loading checkpoint from %s", model_dir)
+    try:
+        from ..model import AutoModel
+        model = AutoModel.from_pretrained(
+            model_dir,
+            device="cpu",
+            eagle_base=eagle_base,
+            key_remap=key_remap,
+            reduced_vocab_dir=reduced_vocab_dir or None,
+            nvfp4_moe_backend=nvfp4_moe_backend,
+            mtp_base=mtp_base,
+        )
+    except (OSError, ValueError, RuntimeError, ImportError) as exc:
+        logger.exception("[LLM] Failed to load checkpoint")
+        raise SystemExit(1) from exc
 
-    for (rank, world), output_path in zip(ranks, out_paths):
-        if world > 1:
-            logger.info("[LLM] === rank %d / %d ===", rank, world)
-
-        logger.info("[LLM] Loading checkpoint from %s", model_dir)
-        try:
-            from ..model import AutoModel
-            model = AutoModel.from_pretrained(
-                model_dir,
-                device="cpu",
-                eagle_base=eagle_base,
-                key_remap=key_remap,
-                reduced_vocab_dir=reduced_vocab_dir or None,
-                nvfp4_moe_backend=nvfp4_moe_backend,
-                mtp_base=mtp_base,
-                tp_size=world,
-                tp_rank=rank,
-            )
-        except (OSError, ValueError, RuntimeError, ImportError) as exc:
-            logger.exception("[LLM] Failed to load checkpoint")
-            raise SystemExit(1) from exc
-
-        # Per-rank runtime config so each rank artifact is self-describing.
-        # Single-device exports keep the conventional "config.json".
-        config_filename = ("config.json" if world == 1 else
-                           f"config_tp{world}_rank{rank}.json")
-
-        logger.info("[LLM] Exporting to %s", output_path)
-        try:
-            from ..onnx.export import export_onnx
-            export_onnx(model,
-                        output_path,
-                        model_dir=model_dir,
-                        fp8_embedding=fp8_embedding,
-                        reduced_vocab_dir=reduced_vocab_dir,
-                        externalize_weights=externalize_weights,
-                        config_filename=config_filename)
-        except (OSError, ValueError, RuntimeError) as exc:
-            logger.exception("[LLM] ONNX export failed")
-            raise SystemExit(1) from exc
-
-        # Free this rank's model before building the next one
-        del model
+    logger.info("[LLM] Exporting to %s", output_path)
+    try:
+        from ..onnx.export import export_onnx
+        export_onnx(model,
+                    output_path,
+                    model_dir=model_dir,
+                    fp8_embedding=fp8_embedding,
+                    reduced_vocab_dir=reduced_vocab_dir,
+                    externalize_weights=externalize_weights)
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.exception("[LLM] ONNX export failed")
+        raise SystemExit(1) from exc
 
     # Patch multimodal token IDs into the LLM config so the C++ runtime
     # can identify which positions in the token stream must be replaced
@@ -1682,17 +1651,6 @@ def main() -> None:
         action="store_true",
         help="Skip action expert export (Alpamayo).",
     )
-    p.add_argument(
-        "--tp-size",
-        "--tp_size",
-        dest="tp_size",
-        type=int,
-        default=1,
-        help=(
-            "Tensor-parallel world size (default: 1 = single device). "
-            "When >1, exports per-rank LLM ONNX files named "
-            "model_tp{N}_rank{R}.onnx (matching cpp/builder/llmBuilder.cpp)."),
-    )
     args = p.parse_args()
 
     model_dir = _resolve_model_dir(args.model)
@@ -1774,8 +1732,7 @@ def main() -> None:
                                  fp8_embedding=args.fp8_embedding,
                                  reduced_vocab_dir=args.reduced_vocab_dir,
                                  nvfp4_moe_backend=args.nvfp4_moe_backend,
-                                 externalize_weights=externalize_weights,
-                                 tp_size=args.tp_size)),
+                                 externalize_weights=externalize_weights)),
         (args.mtp, "mtp_draft", lambda out: _export_mtp_draft(model_dir, out)),
         (_has_llm_component(model_type, "talker") and not args.skip_llm,
          "talker", lambda out: _export_talker(model_dir, out, model_type)),
@@ -1821,7 +1778,6 @@ def main() -> None:
     logger.info(
         "External weights: %s",
         ", ".join(externalize_weights) if externalize_weights else "no")
-    logger.info("TP size       : %d", args.tp_size)
     logger.info("=" * 60)
 
     # ``--fp8-embedding`` only applies to the LLM thinker.  Models without a

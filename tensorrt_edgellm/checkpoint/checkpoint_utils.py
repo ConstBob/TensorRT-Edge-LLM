@@ -289,18 +289,10 @@ def _determine_model_type(config) -> str:
 
 
 def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
-    """JSON object written as the runtime config beside the ONNX export.
-
-    Head and intermediate sizes describe the per-rank ONNX file this
-    config sits next to. When ``tp_size > 1`` the config is per-rank,
-    stamped with ``tp_size`` and ``tp_rank`` so each rank's artifact is
-    self-describing. For single-device exports no TP fields are emitted.
-    """
+    """JSON object written as ``config.json`` beside the ONNX export."""
     config = model.config
     mc = config.mamba_cfg
     rope_scaling = normalize_rope_scaling_for_runtime(config.rope_scaling)
-    tp_size = max(1, getattr(config, "tp_size", 1))
-    tp_rank = max(0, getattr(config, "tp_rank", 0))
 
     out: Dict[str, Any] = {
         "model": config.model_type,
@@ -319,9 +311,6 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
         "partial_rotary_factor": config.partial_rotary_factor,
         "num_deepstack_features": config.num_deepstack_features,
     }
-    if tp_size > 1:
-        out["tp_size"] = tp_size
-        out["tp_rank"] = tp_rank
 
     # longrope requires original_max_position_embeddings for scaling factor computation.
     if (isinstance(rope_scaling, dict)
@@ -531,14 +520,8 @@ def write_runtime_artifacts(model: "CausalLM",
                             model_dir: str,
                             out_dir: str,
                             fp8_embedding: bool = False,
-                            reduced_vocab_dir: str = "",
-                            config_filename: str = "config.json") -> None:
-    """Write the runtime config, ``embedding.safetensors``, tokenizer copies, chat template.
-
-    ``config_filename`` selects the filename for the runtime config. Use
-    the default ``"config.json"`` for single-device exports, or
-    ``"config_tp{N}_rank{R}.json"`` for per-rank TP exports.
-    """
+                            reduced_vocab_dir: str = "") -> None:
+    """Write ``config.json``, ``embedding.safetensors``, tokenizer copies, chat template."""
     import torch
     from safetensors.torch import save_file
 
@@ -562,10 +545,9 @@ def write_runtime_artifacts(model: "CausalLM",
             if root_cfg.get("vision_config"):
                 cfg_json["vision_config"] = root_cfg["vision_config"]
 
-    cfg_path = os.path.join(out_dir, config_filename)
-    with open(cfg_path, "w") as f:
+    with open(os.path.join(out_dir, "config.json"), "w") as f:
         json.dump(cfg_json, f, indent=2)
-    logger.info("Wrote %s to %s", config_filename, out_dir)
+    logger.info("Wrote config.json to %s", out_dir)
 
     # EAGLE3 draft models don't need embedding.safetensors — the C++ runtime
     # uses the base model's shared embedding table (the builder already skips

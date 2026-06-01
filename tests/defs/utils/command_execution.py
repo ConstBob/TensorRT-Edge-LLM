@@ -32,8 +32,7 @@ from pytest_helpers import check_file_exists, run_command, run_with_trt_env
 from ..config import ModelType, TaskType, TestConfig
 from .accuracy import check_accuracy_with_dataset
 from .baseline import (get_baseline, map_accuracy_result_to_csv,
-                       parse_perf_from_output, promote_baseline_if_better,
-                       save_to_baseline)
+                       parse_perf_from_output, save_to_baseline)
 from .command_generation import (generate_build_commands,
                                  generate_e2e_bench_commands,
                                  generate_inference_commands,
@@ -44,7 +43,6 @@ from .command_generation import (generate_build_commands,
 # .safetensors mel-spectrogram on the fly because the C++ requestFileParser
 # only accepts safetensors today.
 _RAW_AUDIO_EXTENSIONS = (".flac", ".wav", ".mp3", ".ogg", ".m4a")
-_ALPAMAYO_DATASET_PLACEHOLDER = "$ALPAMAYO_DATASET_DIR"
 
 
 def _audio_feature_extractor(model_name: str) -> str:
@@ -405,12 +403,6 @@ def _check_baseline_regression(config: TestConfig,
 
     # Baseline found → it takes priority, discard static threshold result
     result.pop('threshold_failure', None)
-
-    # Optional auto-promote: PROMOTE_BASELINE=1 overwrites baseline cells
-    # where the current run is >1% better.
-    csv_path = os.environ.get('BASELINE_CSV', 'logs/baseline.csv')
-    promote_baseline_if_better(csv_path, config.model_type.value, test_func,
-                               config.param_str, result, logger)
     return True
 
 
@@ -432,8 +424,6 @@ def execute_build_test(
             os.path.join("audio", "audio_encoder.engine"),
             os.path.join("code2wav", "code2wav.engine"),
         ],
-        executable_files['action_build']:
-        [os.path.join("action", "action.engine")],
     }
 
     for i, (cmd, timeout) in enumerate(commands):
@@ -493,14 +483,6 @@ def execute_e2e_bench_test(
         # Replace the $LORA_WEIGHTS_DIR placeholder with the resolved path.
         result = _substitute_placeholder_in_test_case(
             config, "$LORA_WEIGHTS_DIR", config.get_lora_weights_dir(), logger)
-        if not result['success']:
-            result['test_type'] = TaskType.E2E_BENCH.value
-            return result
-
-    if config.model_type == ModelType.VLA:
-        result = _substitute_placeholder_in_test_case(
-            config, _ALPAMAYO_DATASET_PLACEHOLDER,
-            config.get_alpamayo_dataset_dir(), logger)
         if not result['success']:
             result['test_type'] = TaskType.E2E_BENCH.value
             return result
@@ -575,14 +557,6 @@ def execute_inference_test(
         # Replace the $LORA_WEIGHTS_DIR placeholder with the resolved path.
         result = _substitute_placeholder_in_test_case(
             config, "$LORA_WEIGHTS_DIR", config.get_lora_weights_dir(), logger)
-        if not result['success']:
-            result['test_type'] = TaskType.INFERENCE.value
-            return result
-
-    if config.model_type == ModelType.VLA:
-        result = _substitute_placeholder_in_test_case(
-            config, _ALPAMAYO_DATASET_PLACEHOLDER,
-            config.get_alpamayo_dataset_dir(), logger)
         if not result['success']:
             result['test_type'] = TaskType.INFERENCE.value
             return result

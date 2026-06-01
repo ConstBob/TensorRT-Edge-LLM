@@ -321,15 +321,15 @@ def _cast_fp8_linear_scales(model: nn.Module) -> None:
 
 
 def _cast_nvfp4_weights(model: nn.Module) -> None:
-    """View-cast NVFP4 weight buffers from uint8 to int8 in-place.
+    """View-cast NVFP4Linear weight buffers from uint8 to int8 in-place.
 
     Packed FP4 nibbles have the same bit pattern in both types.
     Some ONNX importers mishandle UINT8 weight initializers for block DQ; int8 works.
     """
     from ..models.linear import \
-        is_nvfp4_linear  # local import to avoid circular dep
+        NVFP4Linear  # local import to avoid circular dep
     for module in model.modules():
-        if is_nvfp4_linear(module):
+        if isinstance(module, NVFP4Linear):
             w = module._buffers.get("weight")
             if w is not None and w.dtype == torch.uint8:
                 module._buffers["weight"] = w.view(torch.int8)
@@ -730,13 +730,13 @@ def repack_nvfp4_qwen3_moe_experts_geforce(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pack Qwen3 NVFP4 experts for ``NvFP4MoEPluginGeforce``.
 
-    Each expert is expected to contain ModelOpt NVFP4 gate/up/down
+    Each expert is expected to contain ModelOpt ``NVFP4Linear`` gate/up/down
     projection tensors.  Dense weights are decoded, rounded through BF16, and
     repacked for the CuTeDSL GeForce plugin.  FC1 uses SwiGLU order
     ``[up, gate]``.
     """
     from ..models.linear import \
-        is_nvfp4_linear  # local import to avoid circular dep
+        NVFP4Linear  # local import to avoid circular dep
 
     fc1_qweights = []
     fc1_blocks_scale = []
@@ -747,9 +747,9 @@ def repack_nvfp4_qwen3_moe_experts_geforce(
         gate = expert.gate_proj
         up = expert.up_proj
         down = expert.down_proj
-        if not (is_nvfp4_linear(gate) and is_nvfp4_linear(up)
-                and is_nvfp4_linear(down)):
-            raise TypeError("Qwen3 NVFP4 MoE experts must use NVFP4 quant")
+        if not (isinstance(gate, NVFP4Linear) and isinstance(up, NVFP4Linear)
+                and isinstance(down, NVFP4Linear)):
+            raise TypeError("Qwen3 NVFP4 MoE experts must use NVFP4Linear")
 
         gate_dense = decode_modelopt_nvfp4(gate.weight, gate.weight_scale,
                                            gate.weight_scale_2, group_size)
@@ -828,7 +828,7 @@ def repack_nvfp4_qwen3_moe_experts_thor(
         * ``fc_down_blocks_scale_decode``  ``[E, I/16, H]``    int8 (decode slot; INT8-only validated by the plugin)
     """
     from ..models.linear import \
-        is_nvfp4_linear  # local import to avoid circular dep
+        NVFP4Linear  # local import to avoid circular dep
 
     if group_size != 16:
         raise NotImplementedError(
@@ -873,9 +873,9 @@ def repack_nvfp4_qwen3_moe_experts_thor(
 
     for expert in experts:
         gate, up, down = expert.gate_proj, expert.up_proj, expert.down_proj
-        if not (is_nvfp4_linear(gate) and is_nvfp4_linear(up)
-                and is_nvfp4_linear(down)):
-            raise TypeError("Qwen3 NVFP4 MoE experts must be NVFP4-quantized")
+        if not (isinstance(gate, NVFP4Linear) and isinstance(up, NVFP4Linear)
+                and isinstance(down, NVFP4Linear)):
+            raise TypeError("Qwen3 NVFP4 MoE experts must use NVFP4Linear")
 
         gate_dense = decode_modelopt_nvfp4(gate.weight, gate.weight_scale,
                                            gate.weight_scale_2, group_size)
