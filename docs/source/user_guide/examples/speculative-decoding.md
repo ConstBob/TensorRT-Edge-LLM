@@ -41,8 +41,6 @@ Note that quantizing the draft model will cause a drop in acceptance rate compar
 #### Step 1: Quantize and Export (x86 Host)
 
 ```bash
-export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
-export PYTHONPATH=$EDGE_LLM_PATH:$PYTHONPATH
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Llama-3.1-8B-Instruct
 cd $WORKSPACE_DIR
@@ -94,7 +92,7 @@ scp -r $MODEL_NAME/onnx \
 ```bash
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Llama-3.1-8B-Instruct
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 # Build base model EAGLE engine
 ./build/examples/llm/llm_build \
@@ -122,7 +120,7 @@ Build time: < 5 minutes
 #### Step 4: Run Inference (Thor Device)
 
 ```bash
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 ./build/examples/llm/llm_inference \
   --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines \
@@ -142,8 +140,6 @@ EAGLE for vision-language models combines accelerated text generation with image
 #### Step 1: Quantize and Export (x86 Host)
 
 ```bash
-export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
-export PYTHONPATH=$EDGE_LLM_PATH:$PYTHONPATH
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Qwen2.5-VL-7B-Instruct
 cd $WORKSPACE_DIR
@@ -196,7 +192,7 @@ scp -r $MODEL_NAME/onnx \
 ```bash
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Qwen2.5-VL-7B-Instruct
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 # Build base model EAGLE engine
 ./build/examples/llm/llm_build \
@@ -234,7 +230,7 @@ Build time: < 5 minutes
 #### Step 4: Run Inference (Thor Device)
 
 ```bash
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 ./build/examples/llm/llm_inference \
   --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines/llm \
@@ -262,10 +258,8 @@ So far any Qwen3.5 dense model with `num_draft_layers > 0` in its config is MTP-
 MTP export produces both the base model and draft model ONNX from a single checkpoint using `tensorrt_edgellm`:
 
 ```bash
-export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Qwen3.5-4B
-export PYTHONPATH=$EDGE_LLM_PATH:$PYTHONPATH
 mkdir -p $WORKSPACE_DIR
 cd $WORKSPACE_DIR
 
@@ -295,7 +289,7 @@ scp -r $WORKSPACE_DIR/$MODEL_NAME/onnx \
 ```bash
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Qwen3.5-4B
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 # Build MTP base engine
 ./build/examples/llm/llm_build \
@@ -322,7 +316,7 @@ cd ~/TensorRT-Edge-LLM
 #### Step 4: Run Inference
 
 ```bash
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 ./build/examples/llm/llm_inference \
   --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines \

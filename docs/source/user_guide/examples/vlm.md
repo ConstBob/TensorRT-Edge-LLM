@@ -13,8 +13,6 @@ Complete workflow for vision-language models with image understanding capabiliti
 ## Step 1: Quantize and Export (x86 Host)
 
 ```bash
-export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
-export PYTHONPATH=$EDGE_LLM_PATH:$PYTHONPATH
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Qwen2.5-VL-3B-Instruct
 mkdir -p $WORKSPACE_DIR
@@ -49,7 +47,7 @@ scp -r $MODEL_NAME/onnx \
 # Set up workspace directory on device
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Qwen2.5-VL-3B-Instruct
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 # Build language model engine
 ./build/examples/llm/llm_build \
@@ -110,7 +108,7 @@ Create an input file `$WORKSPACE_DIR/input_vlm.json` (replace `/path/to/image.jp
 Run inference:
 
 ```bash
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 ./build/examples/llm/llm_inference \
   --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines/llm \

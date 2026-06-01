@@ -10,13 +10,6 @@ Complete workflow for Mixture of Experts (MoE) models using a pre-quantized GPTQ
 
 > **Prerequisites:** Complete the [Installation Guide](../getting_started/installation.md) before proceeding.
 
-**Additional dependencies:** Install `gptqmodel` (CPU-only) and `optimum` 2.1.0:
-
-```bash
-BUILD_CUDA_EXT=0 pip install -v gptqmodel==5.7.0 --no-build-isolation
-pip install optimum==2.1.0
-```
-
 ---
 
 ## Step 1: Export (x86 Host, CPU-only)
@@ -24,8 +17,6 @@ pip install optimum==2.1.0
 Export always runs on CPU; no GPU is required:
 
 ```bash
-export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
-export PYTHONPATH=$EDGE_LLM_PATH:$PYTHONPATH
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Qwen3-30B-A3B-GPTQ-Int4
 mkdir -p $WORKSPACE_DIR
@@ -54,7 +45,7 @@ scp -r $MODEL_NAME/onnx \
 ```bash
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Qwen3-30B-A3B-GPTQ-Int4
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 ./build/examples/llm/llm_build \
   --onnxDir $WORKSPACE_DIR/$MODEL_NAME/onnx \
@@ -69,7 +60,7 @@ cd ~/TensorRT-Edge-LLM
 `llm_inference` is the same as for regular LLMs:
 
 ```bash
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 ./build/examples/llm/llm_inference \
   --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines \
