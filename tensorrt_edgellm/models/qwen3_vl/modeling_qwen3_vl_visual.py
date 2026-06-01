@@ -28,14 +28,14 @@ merger. Qwen3.5-VL is the same but without deepstack_visual_indexes.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from ..linear import make_linear
-from ..ops import vit_attention_plugin
+from ..ops import get_vit_attention_fn, vit_attention_plugin, vit_trt_attention
 
 if TYPE_CHECKING:
     from ...config import ModelConfig
@@ -190,6 +190,7 @@ class Qwen3VLVisionAttention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
+        self._use_trt_attn = get_vit_attention_fn() is not vit_attention_plugin
         self.qkv = make_linear(
             model_config,
             hidden_size,
@@ -209,23 +210,34 @@ class Qwen3VLVisionAttention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen_carrier: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        kv_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
         q, k, v = self.qkv(hidden_states).reshape(
-            seq_length, 3, self.num_heads, self.head_dim).permute(1, 0, 2,
-                                                                  3).unbind(0)
+            seq_length, 3 * self.num_heads,
+            self.head_dim).split(self.num_heads, dim=1)
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
         q = q.to(torch.float16)
         k = k.to(torch.float16)
         v = v.to(torch.float16)
-        attn_output = vit_attention_plugin(q,
-                                           k,
-                                           v,
-                                           cu_seqlens,
-                                           max_seqlen_carrier,
-                                           num_heads=self.num_heads,
-                                           head_size=self.head_dim)
+        if self._use_trt_attn:
+            q = q * (self.head_dim**-0.5)
+            attn_output = vit_trt_attention(q,
+                                            k,
+                                            v,
+                                            cu_seqlens,
+                                            kv_lengths,
+                                            num_heads=self.num_heads,
+                                            head_size=self.head_dim)
+        else:
+            attn_output = vit_attention_plugin(q,
+                                               k,
+                                               v,
+                                               cu_seqlens,
+                                               max_seqlen_carrier,
+                                               num_heads=self.num_heads,
+                                               head_size=self.head_dim)
         attn_output = attn_output.reshape(seq_length, -1)
         return self.proj(attn_output)
 
@@ -262,12 +274,14 @@ class Qwen3VLVisionBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen_carrier: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        kv_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         hidden_states = hidden_states + self.attn(
             self.norm1(hidden_states),
             cu_seqlens,
             max_seqlen_carrier,
             position_embeddings,
+            kv_lengths=kv_lengths,
         )
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
         return hidden_states
@@ -467,6 +481,7 @@ class Qwen3VLVisualModel(nn.Module):
         max_seqlen_carrier: torch.Tensor,
         fast_pos_embed_idx: torch.Tensor,  # [4, T] int64
         fast_pos_embed_weight: torch.Tensor,  # [4, T] float16
+        kv_lengths: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
         hidden_states = self.patch_embed(hidden_states)
 
@@ -484,8 +499,11 @@ class Qwen3VLVisualModel(nn.Module):
 
         deepstack_features: List[torch.Tensor] = []
         for layer_num, blk in enumerate(self.blocks):
-            hidden_states = blk(hidden_states, cu_seqlens, max_seqlen_carrier,
-                                position_embeddings)
+            hidden_states = blk(hidden_states,
+                                cu_seqlens,
+                                max_seqlen_carrier,
+                                position_embeddings,
+                                kv_lengths=kv_lengths)
             if (self.deepstack_visual_indexes
                     and layer_num in self.deepstack_visual_indexes):
                 ds_idx = self.deepstack_visual_indexes.index(layer_num)
@@ -529,16 +547,33 @@ class Qwen3VLVisualModel(nn.Module):
                                   dtype=torch.float16,
                                   device=device)
 
-        args = (pixel_values, rotary_pos_emb, cu_seqlens, max_seqlen_carrier,
-                fast_idx, fast_weight)
-        input_names = [
-            "input",
-            "rotary_pos_emb",
-            "cu_seqlens",
-            "max_seqlen_carrier",
-            "fast_pos_embed_idx",
-            "fast_pos_embed_weight",
-        ]
+        use_trt_attn = get_vit_attention_fn() is not vit_attention_plugin
+        if use_trt_attn:
+            kv_lengths = torch.tensor([0, num_patches],
+                                      dtype=torch.int32,
+                                      device=device)
+            args = (pixel_values, rotary_pos_emb, cu_seqlens,
+                    max_seqlen_carrier, fast_idx, fast_weight, kv_lengths)
+            input_names = [
+                "input",
+                "rotary_pos_emb",
+                "cu_seqlens",
+                "max_seqlen_carrier",
+                "fast_pos_embed_idx",
+                "fast_pos_embed_weight",
+                "kv_lengths",
+            ]
+        else:
+            args = (pixel_values, rotary_pos_emb, cu_seqlens,
+                    max_seqlen_carrier, fast_idx, fast_weight)
+            input_names = [
+                "input",
+                "rotary_pos_emb",
+                "cu_seqlens",
+                "max_seqlen_carrier",
+                "fast_pos_embed_idx",
+                "fast_pos_embed_weight",
+            ]
         output_names = (["output"] + [
             f"deepstack_features_{i}"
             for i in range(len(self.deepstack_visual_indexes))
@@ -570,6 +605,8 @@ class Qwen3VLVisualModel(nn.Module):
                 1: T
             },
         }
+        if use_trt_attn:
+            dynamic_shapes["kv_lengths"] = {0: torch.export.Dim("kv_batch_p1")}
         return args, input_names, output_names, dynamic_shapes
 
 

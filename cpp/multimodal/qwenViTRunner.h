@@ -199,16 +199,17 @@ private:
     void imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int64_t>>& imageGridTHWs,
         std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream);
 
-    QwenViTConfig mConfig{};                       //!< Qwen-VL configuration
-    rt::Tensor mVitInput{};                        //!< Vision encoder input tensor
-    rt::Tensor mRotaryPosEmb{};                    //!< Rotary position embeddings tensor (multi-dimensional RoPE)
-    rt::Tensor mCuSeqlens{};                       //!< Cumulative sequence lengths tensor
-    rt::Tensor mCuSeqlensHost{};                   //!< Cumulative sequence lengths host tensor
-    rt::Tensor mMaxSeqLenCarrier{};                //!< Shape-only input carrying max sequence length for FMHA launch
-    rt::Tensor mImageMean{};                       //!< Image mean tensor
-    rt::Tensor mImageStd{};                        //!< Image standard deviation tensor
-    rt::Tensor mImageDevice{};                     //!< Temporary image buffer for preprocessing
-    rt::Tensor mNormalizedImageDevice{};           //!< Temporary normalized image buffer for preprocessing
+    QwenViTConfig mConfig{};             //!< Qwen-VL configuration
+    rt::Tensor mVitInput{};              //!< Vision encoder input tensor
+    rt::Tensor mRotaryPosEmb{};          //!< Rotary position embeddings tensor (multi-dimensional RoPE)
+    rt::Tensor mCuSeqlens{};             //!< Cumulative sequence lengths tensor
+    rt::Tensor mCuSeqlensHost{};         //!< Cumulative sequence lengths host tensor
+    rt::Tensor mKvLengths{};             //!< KV lengths for TRT-native attention (separate copy of cu_seqlens)
+    rt::Tensor mMaxSeqLenCarrier{};      //!< Shape-only input carrying max sequence length for FMHA launch
+    rt::Tensor mImageMean{};             //!< Image mean tensor
+    rt::Tensor mImageStd{};              //!< Image standard deviation tensor
+    rt::Tensor mImageDevice{};           //!< Temporary image buffer for preprocessing
+    rt::Tensor mNormalizedImageDevice{}; //!< Temporary normalized image buffer for preprocessing
     rt::imageUtils::ImageData mResizedImageHost{}; //!< Pre-allocated buffer for image resizing
     rt::Tensor mMropePositionIdsHost{};            //!< MRoPE position IDs host tensor
     rt::Tensor mMropePositionIdsDevice{};          //!< MRoPE position IDs device tensor
@@ -226,6 +227,9 @@ private:
 
     int32_t mLLMMaxBatchSize{0};      //!< Maximum batch size from LLM engine
     int32_t mLLMMaxSequenceLength{0}; //!< Maximum sequence length from LLM engine
+
+    bool mUseTrtNativeVitAttn{false}; //!< Use TRT IAttentionV2 (from config); requires kv_lengths binding in engine
+    bool mHasMaxSeqLenCarrier{false}; //!< Whether the visual engine has the max_seqlen_carrier binding
 
     std::vector<std::vector<int64_t>> mLastImageGridTHWs; //!< Used to determine whether RoPE can be reused.
     std::vector<int64_t> mMropeRopeDeltasPerBatch{}; //!< Used by downstream runners like Alpamayo1ActionRunner to set

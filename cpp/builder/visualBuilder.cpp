@@ -297,9 +297,33 @@ bool VisualBuilder::setupQwenViTProfile(
     int64_t maxNumImages = std::max<int64_t>(1, mBuilderConfig.maxImageTokens / mBuilderConfig.minImageTokens);
     result &= setOptimizationProfile(&profile, binding_names::kCuSeqlens, createDims({2}),
         createDims({maxNumImages + 1}), createDims({maxNumImages + 1}));
-    int32_t maxSeqLen = static_cast<int32_t>(mBuilderConfig.maxImageTokensPerImage * 4);
-    result &= setOptimizationProfile(&profile, binding_names::kMaxSeqLenCarrier, createDims({1}),
-        createDims({maxSeqLen / 2}), createDims({maxSeqLen}));
+
+    // kv_lengths is required when using TRT-native attention (TRT >= 11).
+    // Read the flag from the exporter's config.json.
+    mBuilderConfig.useTrtNativeVitAttn = mModelConfig.value("use_trt_native_vit_attn", false);
+    if (mBuilderConfig.useTrtNativeVitAttn)
+    {
+        result &= setOptimizationProfile(&profile, binding_names::kKvLengths, createDims({2}),
+            createDims({maxNumImages + 1}), createDims({maxNumImages + 1}));
+    }
+
+    // max_seqlen_carrier is only present when using the ViTAttentionPlugin path (TRT 10).
+    // The TRT-native attention path (TRT >= 11) does not emit this input.
+    bool hasMaxSeqLenCarrier = false;
+    for (int32_t i = 0; i < network.getNbInputs(); ++i)
+    {
+        if (strcmp(network.getInput(i)->getName(), binding_names::kMaxSeqLenCarrier) == 0)
+        {
+            hasMaxSeqLenCarrier = true;
+            break;
+        }
+    }
+    if (hasMaxSeqLenCarrier)
+    {
+        int32_t maxSeqLen = static_cast<int32_t>(mBuilderConfig.maxImageTokensPerImage * 4);
+        result &= setOptimizationProfile(&profile, binding_names::kMaxSeqLenCarrier, createDims({1}),
+            createDims({maxSeqLen / 2}), createDims({maxSeqLen}));
+    }
 
     // Additional inputs
     if (mModelType == multimodal::ModelType::QWEN2_5_VL)

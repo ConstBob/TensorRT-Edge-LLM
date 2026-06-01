@@ -41,6 +41,7 @@ struct VisualBuilderConfig
     int64_t maxImageTokens{1024};        //!< Maximum number of image tokens in a batch
     int64_t maxImageTokensPerImage{512}; //!< Maximum number of image tokens per image
     bool profilingDetailed{false};       //!< Enable detailed profiling verbosity for layer info extraction
+    bool useTrtNativeVitAttn{false};     //!< Use TRT IAttentionV2 instead of ViTAttentionPlugin
 
     //! Convert configuration to JSON format for serialization.
     //! @return JSON object containing all configuration parameters
@@ -50,6 +51,7 @@ struct VisualBuilderConfig
         json["min_image_tokens"] = minImageTokens;
         json["max_image_tokens"] = maxImageTokens;
         json["max_image_tokens_per_image"] = maxImageTokensPerImage;
+        json["use_trt_native_vit_attn"] = useTrtNativeVitAttn;
         return json;
     }
 
@@ -70,6 +72,10 @@ struct VisualBuilderConfig
         if (json.contains("max_image_tokens_per_image"))
         {
             config.maxImageTokensPerImage = json["max_image_tokens_per_image"];
+        }
+        if (json.contains("use_trt_native_vit_attn"))
+        {
+            config.useTrtNativeVitAttn = json["use_trt_native_vit_attn"];
         }
         return config;
     }

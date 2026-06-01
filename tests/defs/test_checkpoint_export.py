@@ -64,13 +64,18 @@ def test_checkpoint_export(test_param: str, test_logger,
             tmp_dir,
         ]
 
+        env_vars = {}
+        if config.trt_native_vit_attn:
+            env_vars["USE_TRT_NATIVE_VIT_ATTN"] = "1"
+
         with timer_context(
                 f"Exporting {config.model_name} via the checkpoint exporter",
                 test_logger):
             result = run_command(export_cmd,
                                  timeout=600,
                                  remote_config=None,
-                                 logger=test_logger)
+                                 logger=test_logger,
+                                 env_vars=env_vars or None)
             if not result['success']:
                 pytest.fail(
                     f"checkpoint export failed: {result.get('error', 'Unknown error')}"
@@ -103,8 +108,7 @@ def test_checkpoint_export(test_param: str, test_logger,
         # If the model also has a visual encoder output, move that too
         visual_output = os.path.join(tmp_dir, "visual")
         if os.path.isdir(visual_output):
-            visual_onnx_dir = os.path.join(config.get_onnx_base_dir(),
-                                           "visual-fp16")
+            visual_onnx_dir = config.get_visual_onnx_dir("fp16")
             shutil.copytree(visual_output, visual_onnx_dir, dirs_exist_ok=True)
 
         # Same for audio encoder (ASR / Qwen3-Omni / Nemotron-Omni).
@@ -222,8 +226,7 @@ def test_checkpoint_eagle_export(test_param: str, test_logger,
         # Copy visual encoder if present (VLM models)
         base_vis_out = os.path.join(tmp_base, "visual")
         if os.path.isdir(base_vis_out):
-            visual_onnx_dir = os.path.join(config.get_onnx_base_dir(),
-                                           "visual-fp16")
+            visual_onnx_dir = config.get_visual_onnx_dir("fp16")
             shutil.copytree(base_vis_out, visual_onnx_dir, dirs_exist_ok=True)
 
         # --- Export draft model ---
