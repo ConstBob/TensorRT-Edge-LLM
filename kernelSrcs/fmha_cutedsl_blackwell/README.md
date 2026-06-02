@@ -21,7 +21,8 @@ pip install cuda-python==12.8.* cupy-cuda12x==12.3.0 # CUDA 12.x
 # or
 pip install cuda-python cupy-cuda13x==13.6.0 # CUDA 13.x
 
-pip install nvidia-cutlass-dsl==4.5.1
+# Install the CUDA-matched extra: [cu13] on CUDA 13, [cu12] on CUDA 12.
+pip install 'nvidia-cutlass-dsl[cu13]==4.5.2'  # CUDA 13.x  (use [cu12] for CUDA 12.x)
 ```
 
 **2. Compile all kernel variants into a static library**
@@ -142,7 +143,7 @@ python kernelSrcs/build_cutedsl.py --kernels fmha --gpu_arch sm_100 [--clean] [-
 
 | Dependency | Version | Notes |
 |---|---|---|
-| `nvidia-cutlass-dsl` | 4.5.1 | |
+| `nvidia-cutlass-dsl` | 4.5.2 | Install the `[cu13]`/`[cu12]` extra |
 | `cupy-cuda12x` | 12.3.0 | CUDA 12.x |
 | `cupy-cuda13x` | 13.6.0 | CUDA 13.x |
 

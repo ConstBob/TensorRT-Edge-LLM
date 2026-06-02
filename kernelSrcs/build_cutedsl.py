@@ -39,9 +39,11 @@ Output (under {output_dir}/{arch}/{artifact_tag}/):
   metadata.json         — build provenance + group/variant list for CMake
 
 Prebuilt tarballs:
-  For supported targets (e.g. Thor SM110), prebuilt tarballs are committed
-  under kernelSrcs/cuteDSLPrebuilt/.  CMake auto-extracts them when the
-  artifact directory is absent — no manual build step needed.  To regenerate:
+  Prebuilt CuTe DSL artifacts are shipped in the release package. When building
+  from the source tree, no tarball is committed — CI generates per-target
+  artifacts for testing (see .gitlab/ci/cutedsl-jobs.yml). The container/build
+  flow still extracts a tarball if one is placed under
+  kernelSrcs/cuteDSLPrebuilt/; otherwise build from source for your target:
     python kernelSrcs/build_cutedsl.py --gpu_arch sm_110 --arch aarch64 --clean
 """
 
@@ -63,7 +65,7 @@ from pathlib import Path
 
 _SCRIPT_DIR = Path(__file__).parent.resolve()
 _DEFAULT_OUTPUT_DIR = (_SCRIPT_DIR / "../cpp/kernels/cuteDSLArtifact").resolve()
-_CUTLASS_DSL_VERSION = "4.5.1"
+_CUTLASS_DSL_VERSION = "4.5.2"
 _CUPY_VERSIONS = {12: ("cupy-cuda12x", "12.3.0"), 13: ("cupy-cuda13x", "13.6.0")}
 # Common flag sets for FMHA variants
 _LLM = ["--is_causal", "--is_persistent", "--export_only", "--bottom_right_align"]

@@ -255,12 +255,14 @@ cmake .. \
 | `CUDA_CTK_VERSION` | CUDA Toolkit version (such as 13.0). Important for matching target platform. | 13.0 |
 | `BUILD_UNIT_TESTS` | Build unit tests | OFF |
 | `ENABLE_COVERAGE` | Enable gcov code coverage instrumentation (see [Code Coverage](../../developer_guide/testing/code-coverage.md)) | OFF |
-| `ENABLE_CUTE_DSL` | Enable prebuilt CuTe DSL kernels: `OFF` (default), `ALL`, or a group list such as `gdn`, `fmha`, `gemm`, or `ssd` | OFF |
+| `ENABLE_CUTE_DSL` | Enable AOT-compiled CuTe DSL kernels (build with `kernelSrcs/build_cutedsl.py`): `OFF` (default), `ALL`, or a group list such as `gdn`, `fmha`, `gemm`, or `ssd` | OFF |
 | `CUTE_DSL_ARTIFACT_TAG` | Optional artifact tag under `cpp/kernels/cuteDSLArtifact/<arch>/`, for example `sm_110` or `sm_121`. Required when multiple local artifact tags exist for the same CPU architecture. | auto |
 
 **Building with CuTe DSL Kernels (Optional)**
 
-CuTe DSL binaries are prebuilt and shipped with the repository. Add `-DENABLE_CUTE_DSL=ALL` (or a group selection such as `gdn`, `fmha`, `gemm`, or `ssd`) to the CMake configure command when a model or kernel path needs them. Qwen3.5 GDN requires `-DENABLE_CUTE_DSL=gdn` or `-DENABLE_CUTE_DSL=ALL`.
+CuTe DSL kernels are AOT-compiled artifacts. For aarch64 targets, use the prebuilt CuTeDSL artifacts when available. When building from the source repository, no prebuilt tarball is committed; generate the artifact for your target with `python kernelSrcs/build_cutedsl.py` (CI also produces per-target artifacts for testing). Then add `-DENABLE_CUTE_DSL=ALL` (or a group selection such as `gdn`, `fmha`, `gemm`, or `ssd`) to the CMake configure command when a model or kernel path needs them. Qwen3.5 GDN requires `-DENABLE_CUTE_DSL=gdn` or `-DENABLE_CUTE_DSL=ALL`.
+
+When generating artifacts, install `nvidia-cutlass-dsl` with the CUDA-matched extra (`[cu13]` on CUDA 13, `[cu12]` on CUDA 12) — the bare package fails AOT export with `-arch=compute_a is an unsupported option`. For Thor (SM110), including the one-time SM110a admission patch and the CUDA 13 MoE workarounds, see the full recipe in [`kernelSrcs/nvfp4_moe_cutedsl/README.md`](../../../../kernelSrcs/nvfp4_moe_cutedsl/README.md).
 
 If you have multiple local artifact tags for the same CPU architecture, also
 pass `-DCUTE_DSL_ARTIFACT_TAG=<tag>`.

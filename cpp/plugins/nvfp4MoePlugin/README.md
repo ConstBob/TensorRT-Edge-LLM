@@ -49,7 +49,7 @@ rules, emitting a clear error when they are violated.
 
 - [`nvfp4MoePlugin.h`](nvfp4MoePlugin.h) / [`nvfp4MoePlugin.cpp`](nvfp4MoePlugin.cpp) — the `IPluginV3` implementation.
 - [`../../kernels/moe/nvfp4_cutedsl/cuteDslNvfp4MoeSm110Runner.{h,cpp}`](../../kernels/moe/nvfp4_cutedsl/) — the SM110 AOT-module owner: module load/unload, shape-check, workspace layout, and split FC1 / FC2 dispatch.
-- [`../../../kernelSrcs/nvfp4_moe_cutedsl/README.md`](../../../kernelSrcs/nvfp4_moe_cutedsl/README.md) — SM110 split FC1/FC2 kernel variants, AOT build flow, and data-layout notes (including the one-time CuTeDSL 4.5.1 SM110a admission patch).
+- [`../../../kernelSrcs/nvfp4_moe_cutedsl/README.md`](../../../kernelSrcs/nvfp4_moe_cutedsl/README.md) — SM110 split FC1/FC2 kernel variants, AOT build flow, and data-layout notes (including the one-time CuTeDSL 4.5.2 SM110a admission patch).
 
 ## ONNX input surface
 
@@ -76,9 +76,10 @@ Block scales use the contiguous physical CuTeDSL NVFP4 layout
 
 ## Build
 
-Apply the one-time CuTeDSL 4.5.1 SM110a admission patch
-(see [`kernelSrcs/nvfp4_moe_cutedsl/README.md`](../../../kernelSrcs/nvfp4_moe_cutedsl/README.md)),
-then:
+Install `nvidia-cutlass-dsl[cu13]==4.5.2` (the `[cu13]` extra is mandatory on
+CUDA 13) and apply the one-time CuTeDSL 4.5.2 SM110a admission patch
+(see [`kernelSrcs/nvfp4_moe_cutedsl/README.md`](../../../kernelSrcs/nvfp4_moe_cutedsl/README.md)
+for the full Thor + CUDA 13 build recipe), then:
 
 ```bash
 python kernelSrcs/build_cutedsl.py \
@@ -121,7 +122,7 @@ that explicitly emits `Nvfp4MoePlugin` for an SM110 target.
 ### Thor sign-off checklist (runner-test equivalent)
 
 1. `mount-thor-sshfs` the workspace onto Thor.
-2. Apply the one-time CuTeDSL 4.5.1 SM110a admission patch (see
+2. Apply the one-time CuTeDSL 4.5.2 SM110a admission patch (see
    [`kernelSrcs/nvfp4_moe_cutedsl/README.md`](../../../kernelSrcs/nvfp4_moe_cutedsl/README.md)).
 3. `python kernelSrcs/build_cutedsl.py --kernels nvfp4_moe --gpu_arch sm_110 --arch aarch64 --clean`
 4. Build the plugin with `-DENABLE_CUTE_DSL=nvfp4_moe -DCMAKE_CUDA_ARCHITECTURES=110a`.
