@@ -807,6 +807,93 @@ KERNEL_VARIANTS = [
         script_args=["--mnk", "1024,2048,2048", "--tile_shape_mnk", "128,128,64",
                      "--fused_epilogue", "bias", "--export_only"],
     ),
+    # =====================================================================
+    # GEMM_NVFP4 group — Tensor-Parallel FusedGemmAllReducePlugin backend.
+    #
+    # Warp-specialised block-scaled NVFP4 GEMM on Blackwell
+    # (SM100/101/103/110), the NVFP4 GEMM backend for the row-parallel
+    # TP layers (o_proj, down_proj).  Each variant covers a single
+    # (mma_tiler_n) choice at sf_vec_size=16 (NVF4); MNK dims are
+    # dynamic at runtime.  SM110/Thor builds require the documented
+    # CuteDSL SM110 patches (see kernelSrcs/nvfp4_moe_cutedsl/README.md
+    # and .gitlab/ci/scripts/patch_fix_cutedsl_sm110.py).
+    #
+    # The kernel body restructures load / MMA / store across separate
+    # warp roles (epilog warps 0-3 + MMA warp 4 + TMA-load warp 5) to
+    # hide TMA latency behind MMA issue.
+    #
+    # The variants are split into their own group (not reused under
+    # "gemm") so that `build_cutedsl.py --kernels gemm_nvfp4` builds
+    # them independently of the FP16 `gemm_blackwell_bias*` variants.
+    # =====================================================================
+    KernelVariant(
+        name="gemm_blackwell_nvfp4_ws_fp16_tn64",
+        group="gemm_nvfp4",
+        supported_sms=[100, 101, 103, 110],
+        script="gemm_cutedsl/gemm_blackwell_nvfp4_ws.py",
+        script_args=[
+            "--mnk", "128,256,128",
+            "--mma_tiler_n", "64",
+            "--sf_vec_size", "16",
+            "--c_dtype", "fp16",
+            "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="gemm_blackwell_nvfp4_ws_fp16_tn128",
+        group="gemm_nvfp4",
+        supported_sms=[100, 101, 103, 110],
+        script="gemm_cutedsl/gemm_blackwell_nvfp4_ws.py",
+        script_args=[
+            "--mnk", "128,512,128",
+            "--mma_tiler_n", "128",
+            "--sf_vec_size", "16",
+            "--c_dtype", "fp16",
+            "--export_only",
+        ],
+    ),
+    # tn256: larger N-tile for prefill throughput, combined with the
+    # persistent tile scheduler. N is always a multiple of 256 in the
+    # row-parallel layers.
+    KernelVariant(
+        name="gemm_blackwell_nvfp4_ws_fp16_tn256",
+        group="gemm_nvfp4",
+        supported_sms=[100, 101, 103, 110],
+        script="gemm_cutedsl/gemm_blackwell_nvfp4_ws.py",
+        script_args=[
+            "--mnk", "128,512,128",
+            "--mma_tiler_n", "256",
+            "--sf_vec_size", "16",
+            "--c_dtype", "fp16",
+            "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="gemm_blackwell_nvfp4_ws_fp8_tn64",
+        group="gemm_nvfp4",
+        supported_sms=[100, 101, 103, 110],
+        script="gemm_cutedsl/gemm_blackwell_nvfp4_ws.py",
+        script_args=[
+            "--mnk", "128,256,128",
+            "--mma_tiler_n", "64",
+            "--sf_vec_size", "16",
+            "--c_dtype", "fp8_e4m3",
+            "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="gemm_blackwell_nvfp4_ws_fp8_tn128",
+        group="gemm_nvfp4",
+        supported_sms=[100, 101, 103, 110],
+        script="gemm_cutedsl/gemm_blackwell_nvfp4_ws.py",
+        script_args=[
+            "--mnk", "128,512,128",
+            "--mma_tiler_n", "128",
+            "--sf_vec_size", "16",
+            "--c_dtype", "fp8_e4m3",
+            "--export_only",
+        ],
+    ),
 ]
 
 # All known group names (set for O(1) membership check — no manual maintenance needed).
