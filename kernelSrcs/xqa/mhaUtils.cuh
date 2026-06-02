@@ -170,6 +170,43 @@ __device__ inline void copyHeadsAsync(
         idxPart, warpNbAvailHeads, [&](uint32_t x) { return localHeadIdxMap(dstHeadOffset + x); });
 }
 
+//! Variant of copyHeadsAsync that stripes a single wide head across all x-warps.
+template <typename Head, uint32_t maxNbCopiedHeads, uint32_t nbWarps, bool swizzle, bool isFull, uint32_t dstNbHeads,
+    typename SrcHeadPtr, typename LocalHeadIdxMap = uint32_t (*)(uint32_t)>
+__device__ inline void copyHeadsAsyncMultiWarp(
+    uint32_t idxWarp, Array2D<LdGrain, dstNbHeads, exactDiv(sizeof(Head), grainBytes)>& dst, SrcHeadPtr const& src,
+    uint32_t nbAvailHeads = maxNbCopiedHeads, LocalHeadIdxMap&& localHeadIdxMap = [](uint32_t x) { return x; })
+{
+    static_assert(maxNbCopiedHeads <= dstNbHeads);
+    assert(idxWarp < nbWarps);
+    assert(!isFull || nbAvailHeads >= maxNbCopiedHeads);
+    constexpr uint32_t nbGrainsPerHead = exactDiv(sizeof(Head), grainBytes);
+    constexpr uint32_t nbTotalGrains = maxNbCopiedHeads * nbGrainsPerHead;
+    constexpr uint32_t nbThreads = warp_size * nbWarps;
+    uint32_t const tid = warp_size * idxWarp + laneId();
+#pragma unroll
+    for (uint32_t i = 0; i < divUp(nbTotalGrains, nbThreads); i++)
+    {
+        uint32_t const idxGrain = nbThreads * i + tid;
+        if (idxGrain >= nbTotalGrains)
+        {
+            break;
+        }
+        uint32_t const idxHeadLocal = idxGrain / nbGrainsPerHead;
+        uint32_t const idxGrainInsideHead = idxGrain % nbGrainsPerHead;
+        bool const isHeadInBound = isFull || (idxHeadLocal < nbAvailHeads);
+        using SrcHead = mha::decay_t<decltype(src[0])>;
+        constexpr uint32_t nbValidGrains = exactDiv(sizeof(SrcHead), grainBytes);
+        bool const isGrainInBound = (!isHeadPadded || idxGrainInsideHead < nbValidGrains);
+        SrcHead const* const pSrcHead = src + localHeadIdxMap(idxHeadLocal);
+        bool const isValidPage = (pSrcHead != nullptr);
+        LdGrain const* const pSrc = reinterpret_cast<LdGrain const*>(pSrcHead) + idxGrainInsideHead;
+        LdGrain* const pDst = &dst.template at<swizzle>(idxHeadLocal, idxGrainInsideHead);
+        assert(!hasBankConflict(pDst));
+        ldgsts::copyAsync<grainBytes>(pDst, pSrc, isValidPage && isHeadInBound && isGrainInBound ? grainBytes : 0u);
+    }
+}
+
 template <bool isAsync, uint32_t maxTotalNbGrains, uint32_t nbWarps, bool isFull = true>
 __device__ inline void copyGrains(
     uint32_t idxWarp, LdGrain* dst, LdGrain const* src, uint32_t totalNbGrains = maxTotalNbGrains)

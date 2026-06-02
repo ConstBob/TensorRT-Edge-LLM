@@ -130,8 +130,15 @@ struct XQAKernelFuncInfo
 {
     uint32_t mSharedMemBytes{0};
     CUfunction mDeviceFunction{0};
+    uint32_t mHeadDim{0};
     uint32_t mMTileSize{0};
 };
+
+uint32_t getCtaDimX(XQAKernelFuncInfo const& kernelInfo) noexcept
+{
+    // The 512-head cubins are compiled with 8 x-warps; older XQA cubins use 4 x-warps.
+    return kernelInfo.mHeadDim == 512U ? 256U : 128U;
+}
 
 class XQAKernelList
 {
@@ -189,6 +196,7 @@ public:
 
             XQAKernelFuncInfo funcInfo{};
             CUDA_DRIVER_CHECK(cuModuleGetFunction(&funcInfo.mDeviceFunction, hModule, kernelMeta.mFuncName));
+            funcInfo.mHeadDim = kernelMeta.mHeadDim;
             funcInfo.mMTileSize = kernelMeta.mMTileSize;
 
             uint32_t* deviceSmemSize{nullptr};
@@ -321,11 +329,13 @@ bool DecoderXQARunner::canImplement(int32_t numQHeads, int32_t numKVHeads, int32
     // (1) Head ratio 1-8 for head_dim {32, 64, 128}
     // (2) Head ratio 16 for head_dim 128 only (NemotronH).
     // (3) Head ratio 4, 6, 8 for head_dim 256 only (Qwen3.5-MoE).
+    // (4) Head ratio 8 for head_dim 512 on the SM100 and Thor-compatible SM101 paths.
     int32_t const headRatio = numQHeads / numKVHeads;
     bool const checkQHeadPerKV
         = ((headSize == 32 || headSize == 64 || headSize == 128) && headRatio >= 1 && headRatio <= 8)
         || (headSize == 128 && headRatio == 16)
-        || (headSize == 256 && (headRatio == 4 || headRatio == 6 || headRatio == 8));
+        || (headSize == 256 && (headRatio == 4 || headRatio == 6 || headRatio == 8))
+        || (headSize == 512 && (smVersion == 100 || smVersion == 101) && headRatio == 8);
 
     return checkHeadNumbers && checkType && checkKVType && checkSMVersion && checkQHeadPerKV;
 }
@@ -360,7 +370,7 @@ void DecoderXQARunner::dispatchXQAKernel(XQALaunchParams& params, cudaStream_t c
     // TODO: Add multiple block launch logic. The launch configuration highly depends on usecase and performance
     // context. Current measured workload doesn't get performance gain from multi-block launch.
     dim3 const dimGrid{1, mNumKVHeads, mBatchSize};
-    dim3 const dimCta{128, 1, 2};
+    dim3 const dimCta{getCtaDimX(kernelInfo), 1, 2};
     CUDA_DRIVER_CHECK(cuLaunchKernel(kernelInfo.mDeviceFunction, dimGrid.x, dimGrid.y, dimGrid.z, dimCta.x, dimCta.y,
         dimCta.z, kernelInfo.mSharedMemBytes, stream, kernelParams, nullptr));
 }
@@ -387,7 +397,7 @@ void DecoderXQARunner::dispatchSpecDecodeXQAKernel(XQALaunchParams& params, cuda
         ctaTileY == 32, format::fmtstr("ctaTileY should be 32 for spec-decode kernels, but got %d.", ctaTileY));
     int32_t const tokenBlockPerGroup = (params.qSeqLen * params.headGroupSize - 1) / ctaTileY + 1;
     dim3 const dimGrid{1, mNumKVHeads * tokenBlockPerGroup, mBatchSize};
-    dim3 const dimCta{128, 1, 2};
+    dim3 const dimCta{getCtaDimX(kernelInfo), 1, 2};
     CUDA_DRIVER_CHECK(cuLaunchKernel(kernelInfo.mDeviceFunction, dimGrid.x, dimGrid.y, dimGrid.z, dimCta.x, dimCta.y,
         dimCta.z, kernelInfo.mSharedMemBytes, stream, kernelParams, nullptr));
 }

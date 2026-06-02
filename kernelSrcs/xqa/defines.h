@@ -18,7 +18,7 @@
 #define NB_K_HEADS 2
 #endif
 
-// allowed values are multiples of 16 in range [16, 256]
+// Allowed values are multiples of 16 in range [16, 256]. SM100+ also supports selected 512-wide kernels.
 #ifndef HEAD_ELEMS
 #define HEAD_ELEMS 128
 #endif
