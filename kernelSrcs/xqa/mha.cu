@@ -55,7 +55,8 @@ constexpr bool enableMicroFastPath = false;
 // x: horizontal stacking for cta horizontal tile size
 // y: vertical stacking for cta vertical tile size
 // z: must be 2 for warp specialization.
-constexpr uint3 ctaShapeInWarps = {4, 1, 2};
+// head_dim=512 uses eight x-warps so the 512-element head still maps to 64-element warp slices.
+constexpr uint3 ctaShapeInWarps = {headElems == 512 ? 8U : 4U, 1, 2};
 
 static_assert(ctaShapeInWarps.z == 2); // for warp specialization
 constexpr uint32_t nbWarpsPerCta = ctaShapeInWarps.x * ctaShapeInWarps.y * ctaShapeInWarps.z;
@@ -87,9 +88,11 @@ __constant__ constexpr uint32_t cacheVTileSeqLen = 32;
 #if __CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 890 || __CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210
 constexpr uint32_t preferedKHeadPartBytes = 64;
 __constant__ constexpr uint32_t cacheVTileSeqLen = 32;
-#elif __CUDA_ARCH__ == 800 || __CUDA_ARCH__ == 870 || __CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1010
-constexpr uint32_t preferedKHeadPartBytes = 128;
-__constant__ constexpr uint32_t cacheVTileSeqLen = 64;
+#elif __CUDA_ARCH__ == 800 || __CUDA_ARCH__ == 870 || __CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 1000                    \
+    || __CUDA_ARCH__ == 1010 || __CUDA_ARCH__ == 1100
+// The 512-wide path uses smaller K/V tiles to keep shared memory within the per-CTA budget.
+constexpr uint32_t preferedKHeadPartBytes = headElems == 512 ? 64 : 128;
+__constant__ constexpr uint32_t cacheVTileSeqLen = headElems == 512 ? 32 : 64;
 #else
 #error "perferedKHeadPartBytes not defined"
 #endif
@@ -97,7 +100,8 @@ __constant__ constexpr uint32_t cacheVTileSeqLen = 64;
 constexpr uint32_t kHeadPartBytes = mha::min(preferedKHeadPartBytes, paddedCacheHeadBytes);
 // constexpr uint32_t cacheElemsPerKHeadPart = exactDiv(kHeadPartBytes, cacheElemSize);
 
-constexpr bool persistentQ = paddedInputHeadBytes * ctaTile.y <= (16u << 10);
+constexpr uint32_t persistentQBytesLimit = headElems == 512 ? (32u << 10) : (16u << 10);
+constexpr bool persistentQ = paddedInputHeadBytes * ctaTile.y <= persistentQBytesLimit;
 static_assert(persistentQ);
 constexpr uint32_t qHeadPartBytes = persistentQ ? paddedInputHeadBytes : kHeadPartBytes;
 constexpr uint32_t qHeadPartElems = exactDiv(qHeadPartBytes, inputElemSize);
@@ -1559,15 +1563,32 @@ CUBIN_EXPORT __global__
 
         bool const isFullTile = (nbValidHeadTokens == warpTile.y);
         static_assert(nbQBuffers == 1);
+        // A 512-wide Q head has more 16B grains than one warp can issue, so stripe the head load across x-warps.
         if (isFullTile)
         {
-            copyHeadsAsync<PaddedInputHead, warpTile.y, ctaShapeInWarps.x, qkSwizzle, true, warpTile.y>(
-                warpIdx.x, smem.q[warpIdx.y][0], src, nbValidHeadTokens, localQHeadTokenIdxMap);
+            if constexpr (paddedInputHeadBytes > warp_size * grainBytes)
+            {
+                copyHeadsAsyncMultiWarp<PaddedInputHead, warpTile.y, ctaShapeInWarps.x, qkSwizzle, true, warpTile.y>(
+                    warpIdx.x, smem.q[warpIdx.y][0], src, nbValidHeadTokens, localQHeadTokenIdxMap);
+            }
+            else
+            {
+                copyHeadsAsync<PaddedInputHead, warpTile.y, ctaShapeInWarps.x, qkSwizzle, true, warpTile.y>(
+                    warpIdx.x, smem.q[warpIdx.y][0], src, nbValidHeadTokens, localQHeadTokenIdxMap);
+            }
         }
         else
         {
-            copyHeadsAsync<PaddedInputHead, warpTile.y, ctaShapeInWarps.x, qkSwizzle, false, warpTile.y>(
-                warpIdx.x, smem.q[warpIdx.y][0], src, nbValidHeadTokens, localQHeadTokenIdxMap);
+            if constexpr (paddedInputHeadBytes > warp_size * grainBytes)
+            {
+                copyHeadsAsyncMultiWarp<PaddedInputHead, warpTile.y, ctaShapeInWarps.x, qkSwizzle, false, warpTile.y>(
+                    warpIdx.x, smem.q[warpIdx.y][0], src, nbValidHeadTokens, localQHeadTokenIdxMap);
+            }
+            else
+            {
+                copyHeadsAsync<PaddedInputHead, warpTile.y, ctaShapeInWarps.x, qkSwizzle, false, warpTile.y>(
+                    warpIdx.x, smem.q[warpIdx.y][0], src, nbValidHeadTokens, localQHeadTokenIdxMap);
+            }
         }
 
         ldgsts::barArrive(smem.qBarrier[warpIdx.y], true);
@@ -1599,8 +1620,17 @@ CUBIN_EXPORT __global__
 
         constexpr bool isFullTile = (nbValidRows == warpTile.y);
         static_assert(nbQBuffers == 1);
-        copyHeadsAsync<PaddedInputHead, warpTile.y, ctaShapeInWarps.x, qkSwizzle, isFullTile, warpTile.y>(
-            warpIdx.x, smem.q[warpIdx.y][0], src, nbValidRows, localQHeadIdxMap);
+        // Reuse the multi-warp Q load for any padded head wider than one warp's worth of 16B grains.
+        if constexpr (paddedInputHeadBytes > warp_size * grainBytes)
+        {
+            copyHeadsAsyncMultiWarp<PaddedInputHead, warpTile.y, ctaShapeInWarps.x, qkSwizzle, isFullTile, warpTile.y>(
+                warpIdx.x, smem.q[warpIdx.y][0], src, nbValidRows, localQHeadIdxMap);
+        }
+        else
+        {
+            copyHeadsAsync<PaddedInputHead, warpTile.y, ctaShapeInWarps.x, qkSwizzle, isFullTile, warpTile.y>(
+                warpIdx.x, smem.q[warpIdx.y][0], src, nbValidRows, localQHeadIdxMap);
+        }
         ldgsts::barArrive(smem.qBarrier[warpIdx.y], true);
     }
 #endif
@@ -2623,7 +2653,8 @@ constexpr uint32_t nbCtaPerSM = 1;
 CUBIN_EXPORT __device__ constexpr XQAKernelType kernelType = XQAKernelType::kAMPERE_WARP_SPECIALIZED;
 
 #ifdef NDEBUG
-CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
+// Keep launch bounds tied to ctaShapeInWarps because head_dim=512 doubles x-warps from 4 to 8.
+CUBIN_EXPORT __global__ __launch_bounds__(ctaSize, nbCtaPerSM) void kernel_mha(
 #if SPEC_DEC
     uint32_t const qSeqLen, uint32_t const nbKHeads, uint32_t const headGrpSize, SeqLenDataType const* qCuSeqLens,
 #else
@@ -2758,6 +2789,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
     }();
     // gridDim.z == batchSize && gridDim.y == nbKHeads && gridDim.x == nbSubSeqPerSeq
 #if SPEC_DEC
+    // Each token block covers rowsPerBlock query/head pairs, matching the cubin M_TILESIZE metadata.
     const uint32_t nbTokenBlocksPerGrp = divUp(qSeqLen * headGrpSize, rowsPerBlock);
     dim3 const dimGrid{nbSubSeqPerSeq, nbKHeads * nbTokenBlocksPerGrp, batchSize};
 #else

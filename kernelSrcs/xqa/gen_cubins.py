@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
 #
 # NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -14,19 +14,20 @@
 import itertools
 import multiprocessing
 import os
+import re
 import shutil
 import subprocess
 import sys
 from collections import namedtuple
-from typing import List, Tuple
+from typing import List, Tuple, Union
 
 CompileMacro = namedtuple('CompileMacro', 'macro_name short_name value')
 
 CompileMacroOption = namedtuple('CompileMacroOption',
                                 'macro_name short_name options')
 
-CompileArchMacrosAndFile = namedtuple('CompileArchMacrosAndFile',
-                                      'arch macro_list input_file_name')
+CompileArchMacrosAndFile = namedtuple(
+    'CompileArchMacrosAndFile', 'arch compile_arch macro_list input_file_name')
 
 build_func_name_prefix = 'xqa_kernel'
 arch_options = [80, 86, 90]
@@ -62,9 +63,10 @@ clean_cubin = True
 nvcc_bin = 'nvcc'
 nvcc_flags = '-std=c++17 -O3 -cubin -DGENERATE_CUBIN=1 -DNDEBUG --use_fast_math -Xptxas=-v --allow-unsupported-compiler --expt-relaxed-constexpr -t 0'
 # nvcc_flags = '-std=c++17 -G -cubin -DGENERATE_CUBIN=1 -Xptxas=-v --allow-unsupported-compiler --expt-relaxed-constexpr -t 0'
+cuda_toolkit_major_version = None
 
 cpp_file_prefix_text = R"""/*
-* SPDX-FileCopyrightText: Copyright (c) 1993-2023 NVIDIA CORPORATION &
+* SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
 * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -264,10 +266,11 @@ def build_name_info(compile_macros: List[CompileMacro]):
 def build_commands(
     func_name_prefix: str,
     arch: int,
+    compile_arch: Union[int, str],
     input_filename: str,
     compile_macros: List[CompileMacro],
 ) -> Tuple[str, str, str]:
-    arch_str = str(arch) + 'a' if arch in (90, ) else str(arch)
+    arch_str = str(compile_arch) + 'a' if compile_arch in (90, ) else str(compile_arch)
     arch_option = f"-arch=compute_{arch_str} -code=sm_{arch_str}"
     name_info = build_name_info(compile_macros)
     macro_options = [
@@ -346,6 +349,7 @@ def convert_cubin_cpp_np(cubin_file_name: str):
 def run_cubin_gen(arch_micro_file_list: CompileArchMacrosAndFile):
     nvcc_command, xxd_command, cubin_file_name = build_commands(
         build_func_name_prefix, arch_micro_file_list.arch,
+        arch_micro_file_list.compile_arch,
         arch_micro_file_list.input_file_name, arch_micro_file_list.macro_list)
     function_name = construct_name(
         build_func_name_prefix, arch_micro_file_list.arch,
@@ -368,8 +372,31 @@ def run_cubin_gen(arch_micro_file_list: CompileArchMacrosAndFile):
             os.remove(cubin_file_name)
     except subprocess.CalledProcessError as e:
         print(e.stderr)
+        raise
     print(f'generating for {function_name} done')
     return function_name, cubin_size
+
+
+def get_cuda_toolkit_major_version() -> int:
+    global cuda_toolkit_major_version
+    if cuda_toolkit_major_version is not None:
+        return cuda_toolkit_major_version
+    ctk_version = os.environ.get('CUDA_CTK_VERSION')
+    if ctk_version:
+        cuda_toolkit_major_version = int(ctk_version.split('.')[0])
+    else:
+        nvcc_output = subprocess.check_output([nvcc_bin, '--version'], text=True)
+        version_match = re.search(r'release (\d+)\.', nvcc_output)
+        cuda_toolkit_major_version = int(version_match.group(1)) if version_match else 13
+    return cuda_toolkit_major_version
+
+
+def get_compile_arch(arch: int) -> Union[int, str]:
+    # Runtime lookup and cubin names stay normalized to SM101. The actual Thor
+    # code-generation target depends on CUDA toolkit numbering.
+    if arch == 101:
+        return '110a' if get_cuda_toolkit_major_version() >= 13 else '101a'
+    return arch
 
 
 def generate_compile_arch_macro_list(compile_macro_options: list):
@@ -399,13 +426,17 @@ def generate_compile_arch_macro_list(compile_macro_options: list):
                 CompileMacro(*x) for x in zip(
                     option_macro_names, option_short_names, option_combination)
             ]
+            macro_values = {macro.macro_name: macro.value for macro in compile_macros}
+            if macro_values.get('HEAD_ELEMS') == 512 and arch not in (100, 101):
+                continue
             if arch in (90, ) and option_combination[
                     3] == 2 and option_combination[2] == 1 and not is_spec_dec:
                 input_file_name = "mha_sm90.cu"
             else:
                 input_file_name = "mha.cu"
+            compile_arch = get_compile_arch(arch)
             arch_and_macro_list.append(
-                CompileArchMacrosAndFile(arch, compile_macros,
+                CompileArchMacrosAndFile(arch, compile_arch, compile_macros,
                                          input_file_name))
     return arch_and_macro_list
 
@@ -496,19 +527,44 @@ if __name__ == "__main__":
             CompileMacroOption('M_TILESIZE', 'm', [8]),
             CompileMacroOption('SPEC_DEC', 'spec_dec', [0]),
         ],
+        [
+            # Gemma 4 global attention uses 512-wide heads with 16 Q heads and 2 KV heads.
+            CompileMacroOption('DTYPE', 'dt', ['__half']),
+            CompileMacroOption('HEAD_ELEMS', 'd', [512]),
+            CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
+            CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 2]),
+            CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV', [0]),
+            CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [8]),
+            CompileMacroOption('M_TILESIZE', 'm', [8]),
+            CompileMacroOption('SPEC_DEC', 'spec_dec', [0]),
+        ],
     ]
 
-    edgellm_config_list_spec_dec = [[
-        CompileMacroOption('DTYPE', 'dt', ['__half']),
-        CompileMacroOption('HEAD_ELEMS', 'd', [256, 128, 64]),
-        CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
-        CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 2]),
-        CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV',
-                           [0]),  # 0 denotes contiguous kv cache.
-        CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [0]),
-        CompileMacroOption('M_TILESIZE', 'm', [32]),
-        CompileMacroOption('SPEC_DEC', 'spec_dec', [1]),
-    ]]
+    edgellm_config_list_spec_dec = [
+        [
+            CompileMacroOption('DTYPE', 'dt', ['__half']),
+            CompileMacroOption('HEAD_ELEMS', 'd', [256, 128, 64]),
+            CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
+            CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 2]),
+            CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV',
+                               [0]),  # 0 denotes contiguous kv cache.
+            CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [0]),
+            CompileMacroOption('M_TILESIZE', 'm', [32]),
+            CompileMacroOption('SPEC_DEC', 'spec_dec', [1]),
+        ],
+        [
+            # MTP head_dim=512 uses the standard separate K/V cache contract.
+            CompileMacroOption('DTYPE', 'dt', ['__half']),
+            CompileMacroOption('HEAD_ELEMS', 'd', [512]),
+            CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
+            CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 2]),
+            CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV',
+                               [0]),  # 0 denotes contiguous kv cache.
+            CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [0]),
+            CompileMacroOption('M_TILESIZE', 'm', [32]),
+            CompileMacroOption('SPEC_DEC', 'spec_dec', [1]),
+        ],
+    ]
 
     edgellm_config_list.extend(edgellm_config_list_spec_dec)
     arch_macro_lists = []

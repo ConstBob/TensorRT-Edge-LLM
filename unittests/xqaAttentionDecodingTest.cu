@@ -319,6 +319,18 @@ TEST(XQAAttentionDecodingTest, accuracyKVRatio8HeadDim256)
     TestXQAAttentionDecodingAccuracy(2, 16, 2, 256, 512);
 }
 
+TEST(XQAAttentionDecodingTest, accuracyKVRatio8HeadDim512)
+{
+    int32_t smVersion = getSMVersion();
+    applyThorSMRenumberWAR(smVersion);
+    if (smVersion != 100 && smVersion != 101)
+    {
+        GTEST_SKIP() << "Skipping head_dim=512 XQA decode test: requires SM100 or Thor-compatible SM101, but got SM "
+                     << smVersion;
+    }
+    TestXQAAttentionDecodingAccuracy(1, 16, 2, 512, 256);
+}
+
 TEST(XQAAttentionDecodingTest, accuracyKVRatio6)
 {
     TestXQAAttentionDecodingAccuracy(1, 24, 4, 256, 1024);
@@ -373,6 +385,19 @@ TEST(XQAAttentionDecodingFP8Test, accuracyKVRatio8HeadDim256)
 {
     TestXQAAttentionDecodingAccuracy(1, 16, 2, 256, 1024, true);
     TestXQAAttentionDecodingAccuracy(2, 16, 2, 256, 512, true);
+}
+
+TEST(XQAAttentionDecodingFP8Test, accuracyKVRatio8HeadDim512)
+{
+    int32_t smVersion = getSMVersion();
+    applyThorSMRenumberWAR(smVersion);
+    if (smVersion != 100 && smVersion != 101)
+    {
+        GTEST_SKIP() << "Skipping head_dim=512 XQA decode FP8 test: requires SM100 or Thor-compatible SM101, but got "
+                        "SM "
+                     << smVersion;
+    }
+    TestXQAAttentionDecodingAccuracy(1, 16, 2, 512, 256, true);
 }
 
 TEST(XQAAttentionDecodingFP8Test, accuracyKVRatio6)

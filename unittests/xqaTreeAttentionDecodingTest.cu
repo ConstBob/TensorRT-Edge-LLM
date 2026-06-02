@@ -40,6 +40,8 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
     {
         GTEST_SKIP() << "Skipping FP8 KV cache tests: requires SM >= 89, but got SM " << smVersion;
     }
+    ASSERT_TRUE(trt_edgellm::DecoderXQARunner::canImplement(
+        numQHeads, numKVHeads, headSize, smVersion, DataType::kHALF, DataType::kHALF));
 
     std::vector<int32_t> kvCacheLength(batchSize, kvSequenceLength);
     std::vector<half> qInput;
@@ -61,7 +63,6 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
         uniformFloatInitialization(ki);
         uniformFloatInitialization(vi);
         uniformIntInitialization(treeMaski, 0, 1);
-
         auto ref = casualAttentionRef<half>(qi, ki, vi, qSequenceLength, kvSequenceLength, numQHeads, numKVHeads,
             headSize, std::make_optional(treeMaski));
 
@@ -321,6 +322,19 @@ TEST(XQATreeAttentionDecodingTest, accuracyKVRatio6HeadDim256)
     TestXQATreeAttentionDecodingAccuracy(1, 24, 4, 256, 256, 32);
 }
 
+TEST(XQATreeAttentionDecodingTest, accuracyKVRatio8HeadDim512)
+{
+    int32_t smVersion = getSMVersion();
+    applyThorSMRenumberWAR(smVersion);
+    if (smVersion != 100 && smVersion != 101)
+    {
+        GTEST_SKIP() << "Skipping head_dim=512 XQA tree decode test: requires SM100 or Thor-compatible SM101, but got "
+                        "SM "
+                     << smVersion;
+    }
+    TestXQATreeAttentionDecodingAccuracy(1, 32, 4, 512, 256, 20);
+}
+
 #if SUPPORTS_FP8
 TEST(XQATreeAttentionDecodingFP8Test, accuracyKVRatio4HeadDim128)
 {
@@ -367,6 +381,19 @@ TEST(XQATreeAttentionDecodingFP8Test, accuracyKVRatio6HeadDim256)
 {
     TestXQATreeAttentionDecodingAccuracy(1, 24, 4, 256, 512, 10, true);
     TestXQATreeAttentionDecodingAccuracy(1, 24, 4, 256, 256, 32, true);
+}
+
+TEST(XQATreeAttentionDecodingFP8Test, accuracyKVRatio8HeadDim512)
+{
+    int32_t smVersion = getSMVersion();
+    applyThorSMRenumberWAR(smVersion);
+    if (smVersion != 100 && smVersion != 101)
+    {
+        GTEST_SKIP() << "Skipping head_dim=512 XQA tree decode FP8 test: requires SM100 or Thor-compatible SM101, but "
+                        "got SM "
+                     << smVersion;
+    }
+    TestXQATreeAttentionDecodingAccuracy(1, 32, 4, 512, 256, 20, true);
 }
 #endif
 
