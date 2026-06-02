@@ -736,6 +736,77 @@ function(cute_dsl_setup)
     )
   endif()
 
+  # Warp-specialised NVFP4 GEMM variants (Tensor-Parallel
+  # FusedGemmAllReducePlugin backend). The umbrella CUTE_DSL_GEMM_NVFP4_ENABLED
+  # comes for free from the per-group loop (active when ``gemm_nvfp4`` is in
+  # metadata.json "groups"). Per-variant defines follow the
+  # CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_<OUT_DTYPE>_TN<N>_ENABLED pattern so the
+  # C++ runner can compile the FP16 path and the FP8 decode path independently.
+  list(FIND _variants "gemm_blackwell_nvfp4_ws_fp16_tn64"
+       _gemm_bw_nvfp4_ws_fp16_tn64_idx)
+  if(NOT ${_gemm_bw_nvfp4_ws_fp16_tn64_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP16_TN64_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_nvfp4_ws_fp16_tn64 — CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP16_TN64_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_blackwell_nvfp4_ws_fp16_tn128"
+       _gemm_bw_nvfp4_ws_fp16_tn128_idx)
+  if(NOT ${_gemm_bw_nvfp4_ws_fp16_tn128_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP16_TN128_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_nvfp4_ws_fp16_tn128 — CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP16_TN128_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_blackwell_nvfp4_ws_fp16_tn256"
+       _gemm_bw_nvfp4_ws_fp16_tn256_idx)
+  if(NOT ${_gemm_bw_nvfp4_ws_fp16_tn256_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP16_TN256_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_nvfp4_ws_fp16_tn256 — CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP16_TN256_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_blackwell_nvfp4_ws_fp8_tn64"
+       _gemm_bw_nvfp4_ws_fp8_tn64_idx)
+  if(NOT ${_gemm_bw_nvfp4_ws_fp8_tn64_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP8_TN64_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_nvfp4_ws_fp8_tn64 — CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP8_TN64_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_blackwell_nvfp4_ws_fp8_tn128"
+       _gemm_bw_nvfp4_ws_fp8_tn128_idx)
+  if(NOT ${_gemm_bw_nvfp4_ws_fp8_tn128_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP8_TN128_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_nvfp4_ws_fp8_tn128 — CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP8_TN128_ENABLED set"
+    )
+  endif()
+
   # Umbrella CUTE_DSL_GEMM_ENABLED — set if ANY gemm variant was found. Source
   # files guard the entire GEMM path with this define.
   set(_any_gemm FALSE)
