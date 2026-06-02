@@ -525,7 +525,9 @@ def _export_llm(model_dir: str,
     logger.info("[LLM] Done: %s", output_path)
 
 
-def _export_mtp_draft(model_dir: str, draft_out_dir: str) -> None:
+def _export_mtp_draft(model_dir: str,
+                      draft_out_dir: str,
+                      externalize_weights: "list[str] | None" = None) -> None:
     """Export the MTP draft model."""
     os.makedirs(draft_out_dir, exist_ok=True)
     output_path = os.path.join(draft_out_dir, "model.onnx")
@@ -543,7 +545,10 @@ def _export_mtp_draft(model_dir: str, draft_out_dir: str) -> None:
     logger.info("[MTP Draft] Exporting to %s", output_path)
     try:
         from ..onnx.export import export_onnx
-        export_onnx(model, output_path, model_dir=model_dir)
+        export_onnx(model,
+                    output_path,
+                    model_dir=model_dir,
+                    externalize_weights=externalize_weights)
     except (OSError, ValueError, RuntimeError) as exc:
         logger.exception("[MTP Draft] ONNX export failed")
         raise SystemExit(1) from exc
@@ -1733,7 +1738,8 @@ def main() -> None:
                                  reduced_vocab_dir=args.reduced_vocab_dir,
                                  nvfp4_moe_backend=args.nvfp4_moe_backend,
                                  externalize_weights=externalize_weights)),
-        (args.mtp, "mtp_draft", lambda out: _export_mtp_draft(model_dir, out)),
+        (args.mtp, "mtp_draft", lambda out: _export_mtp_draft(
+            model_dir, out, externalize_weights=externalize_weights)),
         (_has_llm_component(model_type, "talker") and not args.skip_llm,
          "talker", lambda out: _export_talker(model_dir, out, model_type)),
         (_has_llm_component(model_type, "code_predictor")

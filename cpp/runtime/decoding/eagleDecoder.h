@@ -19,6 +19,7 @@
 
 #include "common/hashUtils.h"
 #include "runtime/decoding/decodingStrategy.h"
+#include "runtime/state/externalWeightManager.h"
 
 #include <filesystem>
 #include <memory>
@@ -79,6 +80,8 @@ private:
 
     std::unique_ptr<EngineExecutor> mDraftExecutor;
     TensorMap mDraftTensorMap;
+    //! Externalized draft-engine weights, published into mDraftTensorMap.
+    ExternalWeightManager mDraftExternalWeightManager;
 
     Tensor mDraftProposalSize;
     Tensor mDraftAttentionMask;
