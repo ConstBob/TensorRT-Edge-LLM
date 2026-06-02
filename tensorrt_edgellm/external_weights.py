@@ -181,6 +181,10 @@ def _lm_head_weight_candidate_shapes(model) -> "set[tuple[int, ...]]":
     hidden_size = getattr(config, "hidden_size", None)
     vocab_sizes = [
         getattr(config, "reduced_vocab_size", None),
+        # EAGLE3 draft heads project to a reduced draft vocabulary; the ONNX
+        # MatMul weight is then (hidden, draft_vocab), which the vocab_size /
+        # reduced_vocab_size fallbacks alone do not cover.
+        getattr(config, "draft_vocab_size", None),
         getattr(config, "vocab_size", None),
     ]
     for vocab_size in vocab_sizes:
@@ -254,7 +258,12 @@ def _find_lm_head_weight_initializer(onnx_model, model) -> "str | None":
         output.name for output in onnx_model.graph.output
     ]
     seen_values: set[str] = set()
-    passthrough_ops = {"Cast", "Identity", "Reshape", "Transpose"}
+    # LogSoftmax appears between logits and the head MatMul for EAGLE3 draft
+    # models (which emit log-probs); treat it as a passthrough so the walk
+    # reaches the projection weight.
+    passthrough_ops = {
+        "Cast", "Identity", "Reshape", "Transpose", "LogSoftmax"
+    }
 
     while worklist:
         value_name = worklist.pop()

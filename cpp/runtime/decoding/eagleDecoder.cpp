@@ -76,6 +76,13 @@ EagleDecoder::EagleDecoder(DecodingRuntimeContext& runtime, std::filesystem::pat
     buildTensorMapForSpecDecodeDraft(
         mDraftTensorMap, mRuntime.base.pipelineIO, mRuntime.base.sharedResources, *mRuntime.deployment.draft);
 
+    // Publish externalized draft-engine weights into the draft tensor map,
+    // mirroring the base engine. Loaded from draft_config.json; a
+    // no-op when the draft model has no externalized weights.
+    mDraftExternalWeightManager.load(engineDir, engineDir / "draft_config.json", stream);
+    mDraftExternalWeightManager.validateAgainstEngine(*mDraftExecutor, "draft");
+    mDraftExternalWeightManager.registerTensorMapEntries(mDraftTensorMap);
+
     mDraftTokenIdsFullTable = Tensor({maxRuntimeBatchSize, draftFullTableLength}, DeviceType::kGPU,
         nvinfer1::DataType::kINT32, "SpecDecode::idsFull");
     mDraftTokenScoreFullTable = Tensor({maxRuntimeBatchSize, draftFullTableLength}, DeviceType::kGPU,
