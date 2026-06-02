@@ -1,0 +1,11 @@
+tests:
+  - tests/defs/test_common.py::test_build_project
+  - tests/defs/test_common.py::test_unit_tests
+
+  - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen2.5-0.5B-Instruct-FP8-fp8-mxsl4096-mxbs4-mxil4096]
+  - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-FP8-fp8-mxsl4096-mxbs4-mxil4096-llm_basic]
+  - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-FP8-fp8-mxsl4096-mxbs4-mxil4096-mmlu_5-bs4]
+
+  - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen3-1.7B-NVFP4-nvfp4-mxsl4096-mxbs2-mxil4096]
+  - tests/defs/test_llm_pipeline.py::test_inference[Qwen3-1.7B-NVFP4-nvfp4-mxsl4096-mxbs2-mxil4096-llm_basic]
+  - tests/defs/test_llm_pipeline.py::test_inference[Qwen3-1.7B-NVFP4-nvfp4-mxsl4096-mxbs2-mxil4096-mmlu_5-bs2]

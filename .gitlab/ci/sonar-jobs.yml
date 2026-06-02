@@ -33,6 +33,7 @@ get-binaries:
 
 build-coverage:
   stage: get-binaries
+  timeout: 10 minutes
   variables:
     CUDA_VERSION: "13.0"
     TRT_CUDA_VERSION: "13.1"
@@ -63,6 +64,7 @@ build-coverage:
 
 build-sonar:
   stage: build-sonar
+  timeout: 10 minutes
   variables:
     CUDA_VERSION: "13.0"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
