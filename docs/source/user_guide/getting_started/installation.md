@@ -103,7 +103,7 @@ pip3 install -r requirements.txt
 # and tokenizer helpers
 pip3 install ".[tools]"
 
-# Required only for experimental/server
+# Required only for the experimental high-level Python API and server
 pip3 install -r requirements-server.txt
 ```
 
@@ -115,6 +115,8 @@ The base install includes:
 
 The optional `tools` extra adds NVIDIA Model Optimizer, calibration datasets,
 audio preprocessing dependencies, LoRA merge dependencies, and tokenizer helpers.
+The server requirements file adds FastAPI, Uvicorn, and pybind11 for the
+experimental high-level Python API and OpenAI-compatible server.
 
 > **Note:** Accuracy evaluation dependencies live under `examples/accuracy/requirements.txt`.
 
@@ -205,8 +207,8 @@ dpkg -l | grep tensorrt  # Should show TensorRT 10.x+
 **3. Clone Repository (on Edge device)**
 
 ```bash
-# Clone to home directory (used in all examples)
-cd ~
+# Clone to your chosen source directory
+cd /path/to/parent-directory
 git clone https://github.com/NVIDIA/TensorRT-Edge-LLM.git
 cd TensorRT-Edge-LLM
 git submodule update --init --recursive

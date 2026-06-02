@@ -12,10 +12,17 @@ This quick start guide will get you up and running with TensorRT Edge-LLM in ~15
 
 For Jetson Thor and x86 development, use the high-level Python API or the OpenAI-compatible server. Build the project once with Python bindings enabled, then let the high-level Python API export, build, load, and run the model from a HuggingFace checkpoint.
 
+Install the server dependencies before configuring CMake with Python bindings:
+
+```bash
+cd /path/to/TensorRT-Edge-LLM
+pip install -r requirements-server.txt
+```
+
 For x86 development:
 
 ```bash
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 mkdir -p build
 cd build
@@ -30,7 +37,7 @@ cd ..
 For Jetson Thor, follow the CMake pattern used by CI and enable CuTe DSL prebuilt kernels:
 
 ```bash
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 mkdir -p build
 cd build
@@ -49,8 +56,6 @@ After either build:
 
 ```bash
 export PYTHONPATH=$PWD:$PYTHONPATH
-
-pip install pybind11 fastapi uvicorn
 ```
 
 Run a prompt with the high-level Python API:
@@ -166,7 +171,7 @@ On your Thor device:
 # Set up workspace directory
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Qwen3-0.6B
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 # Build engine
 ./build/examples/llm/llm_build \
@@ -205,12 +210,12 @@ cat > $WORKSPACE_DIR/input.json << 'EOF'
 EOF
 ```
 
-> **Tip:** You can also use example input files from `~/TensorRT-Edge-LLM/tests/test_cases/` (e.g., `llm_basic.json`) instead of creating your own.
+> **Tip:** You can also use example input files from `/path/to/TensorRT-Edge-LLM/tests/test_cases/` (e.g., `llm_basic.json`) instead of creating your own.
 
 Run inference:
 
 ```bash
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 ./build/examples/llm/llm_inference \
     --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines \

@@ -6,13 +6,6 @@ Use dynamic LoRA when you need to select adapters at runtime. Use static LoRA
 merge when the adapter is always required, such as the Phi-4-Multimodal
 `vision-lora` adapter.
 
-## Setup
-
-```bash
-export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
-export PYTHONPATH=$EDGE_LLM_PATH:$PYTHONPATH
-```
-
 ## Dynamic Runtime LoRA
 
 This workflow exports the base checkpoint, inserts LoRA inputs into the ONNX
@@ -20,6 +13,10 @@ graph, processes HuggingFace adapter weights, then builds an engine with a
 maximum adapter rank.
 
 ```bash
+# LoRA helper commands require the optional tools extra.
+cd /path/to/TensorRT-Edge-LLM
+pip3 install ".[tools]"
+
 # Step 1: Export the base model with tensorrt_edgellm
 tensorrt-edgellm-export \
   /path/to/base_model \
@@ -55,29 +52,42 @@ tensorrt-edgellm-process-lora \
 ## Static LoRA Merge
 
 Static merge permanently applies a LoRA adapter to the base HuggingFace
-checkpoint before optional quantization and ONNX export.
+checkpoint before optional quantization and ONNX export. For Phi-4-Multimodal,
+merge the required `vision-lora` adapter before quantization and export; dynamic
+runtime LoRA is for adapters selected per request.
 
 ```bash
+# Static merge and optional quantization require the optional tools extra.
+cd /path/to/TensorRT-Edge-LLM
+pip3 install ".[tools]"
+
+export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
+export MODEL_NAME=Phi-4-multimodal-instruct
+export MODEL_DIR=$WORKSPACE_DIR/$MODEL_NAME
+export HF_MODEL_DIR=$MODEL_DIR/hf
+
+# Assumes $HF_MODEL_DIR is a local HuggingFace clone with Git LFS files pulled.
+
 # Step 1: Merge LoRA into the base checkpoint
 tensorrt-edgellm-merge-lora \
-  --model_dir Phi-4-multimodal-instruct \
-  --lora_dir Phi-4-multimodal-instruct/vision-lora \
-  --output_dir merged_model
+  --model_dir $HF_MODEL_DIR \
+  --lora_dir $HF_MODEL_DIR/vision-lora \
+  --output_dir $MODEL_DIR/merged
 
 # Step 2: Optional quantization of the merged checkpoint
 tensorrt-edgellm-quantize llm \
-  --model_dir merged_model \
-  --output_dir quantized_model \
+  --model_dir $MODEL_DIR/merged \
+  --output_dir $MODEL_DIR/quantized \
   --quantization nvfp4 \
   --lm_head_quantization nvfp4
 
 # Step 3: Export the checkpoint with tensorrt_edgellm
 tensorrt-edgellm-export \
-  quantized_model \
-  onnx_output
+  $MODEL_DIR/quantized \
+  $MODEL_DIR/onnx
 ```
 
-If you do not need weight quantization, export `merged_model` directly in step 3.
+If you do not need weight quantization, export `$MODEL_DIR/merged` directly in step 3.
 
 ## Input Format
 
