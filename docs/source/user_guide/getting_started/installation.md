@@ -169,16 +169,24 @@ hf auth login
 
 ## Part 2: C++ Runtime (Edge Device)
 
-The C++ runtime builds and executes models on the target. **Jetson Thor:** follow the steps below on the device and use `EMBEDDED_TARGET=jetson-thor`. **NVIDIA DRIVE / DriveOS:** run the same flow inside the DriveOS SDK Docker image with **`EMBEDDED_TARGET=auto-thor`**, then copy **`build/`** to the DRIVE system. **x86:** optional local build using the **Alternative** `cmake` block (no toolchain).
+The C++ runtime builds TensorRT engines and runs inference on the target. Start
+from the platform row that matches the device or SDK image.
+
+| Platform | Software Release | `CUDA_CTK_VERSION` | Build Location | Precision Support |
+|:---------|:-----------------|:-------------------|:---------------|:------------------|
+| Jetson Thor | JetPack 7.0/7.1 | `13.0` | Jetson device | See [Supported Models](supported-models.md) |
+| Jetson Thor | JetPack 7.2 | `13.2` | Jetson device | See [Supported Models](supported-models.md) |
+| DRIVE Thor | DriveOS 7.2 | `13.2` | DriveOS SDK Docker image, then copy `build/` to the DRIVE system | See [Supported Models](supported-models.md) |
+| Jetson Orin | JetPack 7.2 | `13.2` | Jetson device | FP16, INT8, and INT4 |
+| Jetson Orin | JetPack 6.2+ | `12.6` | Jetson device | FP16, INT8, and INT4 |
+
+Jetson Orin does not support FP8, MXFP8, FP4, or NVFP4 runtime precision in
+this release. Use FP16, INT8, or INT4 checkpoints for Orin.
 
 ### System Requirements
 
-**Target Platform:**
-- NVIDIA Jetson Thor
-- JetPack 7.1
-- CUDA 13.x (included in JetPack)
-- TensorRT 10.x+ (included in JetPack)
-- Disk Space: ~20-50GB for ONNX files and TensorRT engines
+- CUDA and TensorRT from the target JetPack or DriveOS SDK release
+- Disk space: ~20-50GB for ONNX files and TensorRT engines
 
 ### Build Instructions
 
@@ -194,11 +202,12 @@ sudo apt install -y \
 
 **2. Verify CUDA and TensorRT Installation**
 
-After JetPack is installed, TensorRT should be installed in /usr
+After JetPack is installed, or inside the DriveOS SDK Docker image, TensorRT
+should be installed in `/usr`.
 
 ```bash
 # Check CUDA version
-nvcc --version  # Should show CUDA 13.x
+nvcc --version  # Should match the CUDA_CTK_VERSION for your platform below
 
 # Check TensorRT version
 dpkg -l | grep tensorrt  # Should show TensorRT 10.x+
@@ -216,33 +225,100 @@ git submodule update --init --recursive
 
 **4. Configure Build**
 
-On your Jetson Thor device, configure the build with the following command:
+Use the CMake command for your platform. All commands enable CuTe DSL kernels
+because Qwen3.5 and several other model paths require them.
+
+**JetPack 7.0/7.1 Thor**
 
 ```bash
-mkdir build
+mkdir -p build
 cd build
 
 cmake .. \
     -DCMAKE_BUILD_TYPE=Release \
     -DTRT_PACKAGE_DIR=/usr \
     -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake \
-    -DEMBEDDED_TARGET=jetson-thor
+    -DEMBEDDED_TARGET=jetson-thor \
+    -DCUDA_CTK_VERSION=13.0 \
+    -DENABLE_CUTE_DSL=ALL
 ```
 
-**NVIDIA DRIVE / DriveOS:** The `cmake` line is the same except **`EMBEDDED_TARGET=auto-thor`**.
+**JetPack 7.2 Thor**
+
+```bash
+mkdir -p build
+cd build
+
+cmake .. \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DTRT_PACKAGE_DIR=/usr \
+    -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake \
+    -DEMBEDDED_TARGET=jetson-thor \
+    -DCUDA_CTK_VERSION=13.2 \
+    -DENABLE_CUTE_DSL=ALL
+```
+
+**DriveOS 7.2 Thor**
+
+Run this inside the DriveOS SDK Docker image, then copy `build/` to the DRIVE
+system.
+
+```bash
+mkdir -p build
+cd build
+
+cmake .. \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DTRT_PACKAGE_DIR=/usr \
+    -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake \
+    -DEMBEDDED_TARGET=auto-thor \
+    -DCUDA_CTK_VERSION=13.2 \
+    -DENABLE_CUTE_DSL=ALL
+```
+
+**JetPack 7.2 Orin**
+
+```bash
+mkdir -p build
+cd build
+
+cmake .. \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DTRT_PACKAGE_DIR=/usr \
+    -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake \
+    -DEMBEDDED_TARGET=jetson-orin \
+    -DCUDA_CTK_VERSION=13.2 \
+    -DENABLE_CUTE_DSL=ALL
+```
+
+**JetPack 6.2+ Orin**
+
+```bash
+mkdir -p build
+cd build
+
+cmake .. \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DTRT_PACKAGE_DIR=/usr \
+    -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake \
+    -DEMBEDDED_TARGET=jetson-orin \
+    -DCUDA_CTK_VERSION=12.6 \
+    -DENABLE_CUTE_DSL=ALL
+```
 
 **Alternative: Building on x86 GPU Systems (Optional for Developers)**
 
 If you want to build and test on an x86 workstation with NVIDIA GPU (for development purposes before deploying to Edge devices), you can use this configuration instead:
 
 ```bash
-mkdir build
+mkdir -p build
 cd build
 
 cmake .. \
     -DCMAKE_BUILD_TYPE=Release \
     -DTRT_PACKAGE_DIR=/usr/local/TensorRT-10.x.x \
-    -DCUDA_CTK_VERSION=<YOUR_CUDA_VERSION>
+    -DCUDA_CTK_VERSION=<YOUR_CUDA_VERSION> \
+    -DENABLE_CUTE_DSL=ALL
 ```
 
 > **Note:** Replace `/usr/local/TensorRT-10.x.x` with your actual TensorRT installation path. Use `dpkg -l | grep tensorrt` to find it, or download from [NVIDIA TensorRT downloads](https://developer.nvidia.com/tensorrt). Replace `<YOUR_CUDA_VERSION>` with your actual CUDA version (e.g., `13.0`). Use `nvcc --version` to check your CUDA version.
@@ -253,16 +329,19 @@ cmake .. \
 |:-------|:------------|:--------|
 | `TRT_PACKAGE_DIR` | Path to TensorRT installation. Auto-detected; manual hint to disambiguate multiple versions. | N/A |
 | `CMAKE_TOOLCHAIN_FILE` | **Required for Edge devices**: Use `cmake/aarch64_linux_toolchain.cmake` for Edge device builds. **Not needed for GPU builds** | N/A |
-| `EMBEDDED_TARGET` | **Required for Edge devices**: `jetson-thor` (Jetson) or `auto-thor` (DRIVE / DriveOS). **Not needed for GPU builds** | N/A |
-| `CUDA_CTK_VERSION` | CUDA Toolkit version (such as 13.0). Important for matching target platform. | 13.0 |
+| `EMBEDDED_TARGET` | **Required for Edge devices**: `jetson-thor` (Jetson Thor), `auto-thor` (DRIVE Thor / DriveOS), or `jetson-orin` (Jetson Orin). **Not needed for GPU builds** | N/A |
+| `CUDA_CTK_VERSION` | CUDA Toolkit version. Use the platform command above to select `13.2`, `13.0`, or `12.6`. | target default |
 | `BUILD_UNIT_TESTS` | Build unit tests | OFF |
 | `ENABLE_COVERAGE` | Enable gcov code coverage instrumentation (see [Code Coverage](../../developer_guide/testing/code-coverage.md)) | OFF |
-| `ENABLE_CUTE_DSL` | Enable prebuilt CuTe DSL kernels: `OFF` (default), `ALL`, or a group list such as `gdn`, `fmha`, `gemm`, or `ssd` | OFF |
-| `CUTE_DSL_ARTIFACT_TAG` | Optional artifact tag under `cpp/kernels/cuteDSLArtifact/<arch>/`, for example `sm_110` or `sm_121`. Required when multiple local artifact tags exist for the same CPU architecture. | auto |
+| `ENABLE_CUTE_DSL` | Enable prebuilt CuTe DSL kernels: `OFF`, `ALL`, or a group list such as `gdn`, `fmha`, `gemm`, or `ssd`. Set this to `ALL` for customer builds. | OFF |
+| `CUTE_DSL_ARTIFACT_TAG` | Optional artifact tag under `cpp/kernels/cuteDSLArtifact/<arch>/`, for example `sm_87`, `sm_110`, or `sm_121`. Required when multiple local artifact tags exist for the same CPU architecture. | auto |
 
-**Building with CuTe DSL Kernels (Optional)**
+**CuTe DSL Kernel Artifacts**
 
-CuTe DSL binaries are prebuilt and shipped with the repository. Add `-DENABLE_CUTE_DSL=ALL` (or a group selection such as `gdn`, `fmha`, `gemm`, or `ssd`) to the CMake configure command when a model or kernel path needs them. Qwen3.5 GDN requires `-DENABLE_CUTE_DSL=gdn` or `-DENABLE_CUTE_DSL=ALL`.
+CuTe DSL binaries are prebuilt and shipped with the repository. The platform
+commands above pass `-DENABLE_CUTE_DSL=ALL` because Qwen3.5 and several other
+model paths require them. If you select groups manually, Qwen3.5 GDN requires
+`-DENABLE_CUTE_DSL=gdn` or `-DENABLE_CUTE_DSL=ALL`.
 
 If you have multiple local artifact tags for the same CPU architecture, also
 pass `-DCUTE_DSL_ARTIFACT_TAG=<tag>`.
@@ -312,11 +391,12 @@ tensorrt-edgellm-export --help
 
 **Issue: `nvcc: command not found`**
 
-Solution: Ensure JetPack 7.1 is properly installed with CUDA support:
+Solution: Ensure the target JetPack release or DriveOS SDK Docker image is
+installed with CUDA support:
 ```bash
 # Verify CUDA installation
 nvcc --version
-# Should show CUDA 13.x
+# Should match the CUDA_CTK_VERSION used for CMake
 ```
 
 **Issue: `TensorRT not found` during CMake**
@@ -326,7 +406,9 @@ Solution: Specify TensorRT package directory. This directory should contain `lib
 cmake .. \
     -DTRT_PACKAGE_DIR=/usr/local/TensorRT-10.x.x \
     -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake \
-    -DEMBEDDED_TARGET=jetson-thor
+    -DEMBEDDED_TARGET=<jetson-thor|auto-thor|jetson-orin> \
+    -DCUDA_CTK_VERSION=<target CUDA version> \
+    -DENABLE_CUTE_DSL=ALL
 ```
 
 **Issue: Thread issue during C++ build**

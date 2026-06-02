@@ -15,6 +15,8 @@ The model class names were checked against the installed `transformers==5.9.0` p
 ## Precision Notes
 
 - Dense precision set: FP16/BF16 checkpoints, ModelOpt FP8/MXFP8/FP4/NVFP4/INT4 AWQ/INT8 SmoothQuant checkpoints, and INT4 GPTQ checkpoints. INT8 GPTQ is not supported.
+- Jetson Orin supports FP16, INT8, and INT4 runtime precision in the supported JetPack configurations. Do not select FP8, MXFP8, FP4, or NVFP4 checkpoints for Orin.
+- For INT4 engine builds on Jetson Orin devices with less system memory, such as Jetson Orin Nano, pass `--externalize-weights int4_ffn` for dense checkpoints or `--externalize-weights int4_ffn int4_moe` for MoE checkpoints to reduce engine build memory.
 - For FP16/BF16 source checkpoints, use the [Quantization](../features/quantization.md) script to create a unified quantized checkpoint for `tensorrt_edgellm`, then export the generated checkpoint.
 - FP8 KV cache is detected automatically from checkpoint metadata by `tensorrt_edgellm`.
 - `tensorrt-edgellm-export` exports visual encoders. Use `tensorrt-edgellm-quantize --visual_quantization fp8` before export when FP8 visual weights are required.
@@ -163,9 +165,6 @@ The model class names were checked against the installed `transformers==5.9.0` p
 
 **Qwen3.6 (same architecture as Qwen3.5):**
 - [Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B)
-
-**Quantized:**
-- [Qwen/Qwen3.6-27B-FP8](https://huggingface.co/Qwen/Qwen3.6-27B-FP8)
 
 </details>
 

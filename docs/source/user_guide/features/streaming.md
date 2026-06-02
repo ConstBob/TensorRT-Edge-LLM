@@ -165,7 +165,9 @@ Use `tryPop` when you're multiplexing with other polling work, `waitPop` when yo
 
 ```bash
 # Build
-cmake .. -DTRT_PACKAGE_DIR=$TRT_PACKAGE_DIR
+cmake .. \
+    -DTRT_PACKAGE_DIR=$TRT_PACKAGE_DIR \
+    -DENABLE_CUTE_DSL=ALL
 make -j$(nproc) llm_stream
 
 # Run
