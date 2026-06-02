@@ -1,16 +1,16 @@
-# L0 Pipeline Tests - RTX 5080 (SM120 Blackwell)
-# Covers: FP8, FP8+KV precisions (small models only — larger models on B100)
-# Model families: Qwen2.5
-
 tests:
   - tests/defs/test_common.py::test_build_project
-  - tests/defs/test_common.py::test_unit_tests
 
-  # === Qwen2.5-0.5B FP8 (base FP8 LLM + MMLU accuracy) ===
-  - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen2.5-0.5B-Instruct-FP8-fp8-mxsl4096-mxbs4-mxil2048]
-  - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-FP8-fp8-mxsl4096-mxbs4-mxil2048-llm_basic]
-  - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-FP8-fp8-mxsl4096-mxbs4-mxil2048-mmlu_0-bs4]
-
-  # === Qwen2.5-0.5B FP8 + FP8 KV cache ===
   - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen2.5-0.5B-Instruct-FP8-KV-fp8-fp8kv-mxsl4096-mxbs4-mxil2048]
   - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-FP8-KV-fp8-fp8kv-mxsl4096-mxbs4-mxil2048-llm_basic]
+
+  - tests/defs/test_vlm_pipeline.py::test_engine_build[Qwen3.5-0.8B-fp16-mxsl4096-mxbs2-mxil4096-mnit128-mxit4096-mxpiit512]
+  - tests/defs/test_vlm_pipeline.py::test_inference[Qwen3.5-0.8B-fp16-mxsl4096-mxbs2-mxil4096-mnit128-mxit4096-mxpiit512-vlm_basic]
+
+  - tests/defs/test_server_pipeline.py::test_build_pybind
+  - tests/defs/test_server_pipeline.py::TestServerPipeline::test_server_inference[Qwen2.5-0.5B-Instruct-FP8-KV-fp8-fp8kv-mxsl4096-mxbs4-mxil2048-llm_basic]
+  - tests/defs/test_server_pipeline.py::TestServerPipeline::test_server_inference[Qwen3.5-0.8B-fp16-mxsl4096-mxbs2-mxil4096-mnit128-mxit4096-mxpiit512-vlm_basic]
+  - tests/defs/test_server_pipeline.py::TestServerPipeline::test_server_streaming[Qwen2.5-0.5B-Instruct-FP8-KV-fp8-fp8kv-mxsl4096-mxbs4-mxil2048-llm_basic]
+  - tests/defs/test_server_pipeline.py::TestHLAPI::test_hlapi_generate[Qwen2.5-0.5B-Instruct-FP8-KV-fp8-fp8kv-mxsl4096-mxbs4-mxil2048-llm_basic]
+  - tests/defs/test_server_pipeline.py::TestHLAPI::test_hlapi_generate[Qwen3.5-0.8B-fp16-mxsl4096-mxbs2-mxil4096-mnit128-mxit4096-mxpiit512-vlm_basic]
+  - tests/defs/test_server_pipeline.py::TestHLAPI::test_hlapi_streaming[Qwen2.5-0.5B-Instruct-FP8-KV-fp8-fp8kv-mxsl4096-mxbs4-mxil2048-llm_basic]

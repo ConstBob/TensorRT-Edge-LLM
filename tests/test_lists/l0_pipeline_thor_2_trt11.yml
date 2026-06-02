@@ -1,0 +1,12 @@
+tests:
+  - tests/defs/test_common.py::test_build_project
+  - tests/defs/test_common.py::test_unit_tests
+
+  - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen3-1.7B-nvfp4-mxsl2048-eagle-eagle3-nvfp4-mxbs1-mxil1024]
+  - tests/defs/test_llm_pipeline.py::test_inference[Qwen3-1.7B-nvfp4-mxsl2048-eagle-eagle3-nvfp4-mxbs1-mxil1024-llm_basic]
+
+  - tests/defs/test_vlm_pipeline.py::test_engine_build[Qwen3-VL-4B-Instruct-nvfp4-mxsl8192-eagle-eagle3-nvfp4-mxbs1-mxil8192-mnit128-mxit8192-mxpiit512]
+  - tests/defs/test_vlm_pipeline.py::test_inference[Qwen3-VL-4B-Instruct-nvfp4-mxsl8192-eagle-eagle3-nvfp4-mxbs1-mxil8192-mnit128-mxit8192-mxpiit512-vlm_basic]
+
+  - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen3.5-0.8B-fp16-mxsl4096-mtp-mxbs1-mxil2048]
+  - tests/defs/test_llm_pipeline.py::test_inference[Qwen3.5-0.8B-fp16-mxsl4096-mtp-mxbs1-mxil2048-llm_basic]

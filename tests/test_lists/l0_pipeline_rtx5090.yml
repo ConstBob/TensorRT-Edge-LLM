@@ -1,0 +1,8 @@
+tests:
+  - tests/defs/test_common.py::test_build_project
+
+  - tests/defs/test_llm_pipeline.py::test_engine_build[NVIDIA-Nemotron-3-Nano-4B-NVFP4-nvfp4-mxsl4096-mxbs2-mxil2048]
+  - tests/defs/test_llm_pipeline.py::test_inference[NVIDIA-Nemotron-3-Nano-4B-NVFP4-nvfp4-mxsl4096-mxbs2-mxil2048-llm_basic]
+
+  - tests/defs/test_vlm_pipeline.py::test_engine_build[Qwen3-VL-4B-Instruct-NVFP4-nvfp4-mxsl8192-mxbs2-mxil8192-mnit128-mxit8192-mxpiit512]
+  - tests/defs/test_vlm_pipeline.py::test_inference[Qwen3-VL-4B-Instruct-NVFP4-nvfp4-mxsl8192-mxbs2-mxil8192-mnit128-mxit8192-mxpiit512-vlm_basic]

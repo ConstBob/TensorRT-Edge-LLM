@@ -243,6 +243,45 @@ build_cutedsl_sm110_artifact:
       - cutedsl_aarch64_sm_110_cuda13.tar.gz
       - cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256
 
+build_cutedsl_x86_sm120_artifact:
+  extends:
+    - .cutedsl_artifact_base
+  tags:
+    - rtx5080-edgellm-nvks
+  variables:
+    CUDA_VERSION: "12.9"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    CUTE_DSL_ARTIFACT_NAME: "cutedsl_x86_64_sm_120_cuda12.tar.gz"
+    CUTE_DSL_ARTIFACT_TAG: "sm_120"
+    CUTE_DSL_OUTPUT_DIR: "$CI_PROJECT_DIR/cutedsl_artifacts"
+  image: "$IMAGE"
+  script:
+    - echo "Pipeline start time:$(date)"
+    - echo "Node name:$(hostname)"
+    - echo "Build output dir:$CUTE_DSL_OUTPUT_DIR"
+    - mkdir -p "$CUTE_DSL_OUTPUT_DIR"
+    - export DEBIAN_FRONTEND=noninteractive
+    - apt update -qq >/dev/null 2>&1
+    - apt install -y -qq python3 python3-pip python3-venv binutils >/dev/null 2>&1
+    - echo "CUDA version:$(nvcc --version | grep release)"
+    - echo "Building CuTe DSL artifact for x86_64 SM120"
+    - python3 -m venv "$CUTE_DSL_OUTPUT_DIR/venv/cutedsl"
+    - '"$CUTE_DSL_OUTPUT_DIR/venv/cutedsl/bin/pip" install -q ''nvidia-cutlass-dsl[cu12]==4.5.1'' cupy-cuda12x==12.3.0'
+    - '"$CUTE_DSL_OUTPUT_DIR/venv/cutedsl/bin/python" kernelSrcs/build_cutedsl.py --kernels ALL --gpu_arch sm_120 --arch x86_64 --output_dir "$CUTE_DSL_OUTPUT_DIR" --clean'
+    - ARTIFACT_DIR="$CUTE_DSL_OUTPUT_DIR/x86_64/$CUTE_DSL_ARTIFACT_TAG"
+    - test -f "$ARTIFACT_DIR/metadata.json"
+    - tar -C "$CUTE_DSL_OUTPUT_DIR/x86_64" -czf "$CUTE_DSL_OUTPUT_DIR/$CUTE_DSL_ARTIFACT_NAME" "$CUTE_DSL_ARTIFACT_TAG"
+    - (cd "$CUTE_DSL_OUTPUT_DIR" && sha256sum "$CUTE_DSL_ARTIFACT_NAME" | tee "$CUTE_DSL_ARTIFACT_NAME.sha256")
+    - cat "$ARTIFACT_DIR/metadata.json"
+    - cp "$CUTE_DSL_OUTPUT_DIR/$CUTE_DSL_ARTIFACT_NAME" "$CUTE_DSL_OUTPUT_DIR/$CUTE_DSL_ARTIFACT_NAME.sha256" "$CI_PROJECT_DIR/"
+    - echo "Pipeline end time:$(date)"
+  artifacts:
+    name: "cutedsl-x86-sm120-${CI_COMMIT_SHORT_SHA}"
+    expire_in: 1 day
+    paths:
+      - cutedsl_x86_64_sm_120_cuda12.tar.gz
+      - cutedsl_x86_64_sm_120_cuda12.tar.gz.sha256
+
 build_cutedsl_sm87_cuda12_artifact:
   extends:
     - .cutedsl_remote_artifact_base

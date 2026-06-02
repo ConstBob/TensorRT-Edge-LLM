@@ -1,26 +1,25 @@
 #!/bin/bash
 set -e
 echo "Setting up device environment on $HOME directory"
-tensorrt_edge_llm_folder="$HOME/tensorrt-edge-llm"
 board_password={BOARDPASSWORD}
 
 export DEBIAN_FRONTEND=noninteractive
-# clean up the home directory
-echo "removing $tensorrt_edge_llm_folder"
-if [ -d "$tensorrt_edge_llm_folder" ] ; then
-  echo $board_password | sudo -S chmod -R 777 $tensorrt_edge_llm_folder
-  echo $board_password | sudo -S rm -rf $tensorrt_edge_llm_folder
-fi
-
-if [ -d "$tensorrt_edge_llm_folder" ] ; then
-  echo "$tensorrt_edge_llm_folder is not cleaned up. Force cleaning up home directory and exit"
-  echo $board_password | sudo -S chmod -R 777 $HOME/*
-  echo $board_password | sudo -S rm -rf $HOME/*
-  df -h /home
-  exit 1
-fi
-
-mkdir -p $tensorrt_edge_llm_folder
+# Clean up stale tensorrt-edge-llm workspaces from previous CI runs.
+# Only remove directories older than 120 minutes to preserve workspaces
+# from concurrent jobs running on the same board (TRT10 + TRT11 in parallel).
+echo "Cleaning stale tensorrt-edge-llm workspaces (older than 120 minutes)"
+for dir in $HOME/tensorrt-edge-llm*; do
+  if [ -d "$dir" ]; then
+    age_check=$(find "$dir" -maxdepth 0 -mmin +120 2>/dev/null || true)
+    if [ -n "$age_check" ]; then
+      echo "  removing stale: $dir"
+      echo $board_password | sudo -S chmod -R 777 "$dir" 2>/dev/null || true
+      echo $board_password | sudo -S rm -rf "$dir"
+    else
+      echo "  keeping (recent): $dir"
+    fi
+  fi
+done
 
 echo "installing dependencies"
 echo $board_password | sudo -S apt update -qq >/dev/null 2>&1

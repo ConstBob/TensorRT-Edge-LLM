@@ -67,6 +67,18 @@ def test_build_project(env_config: EnvironmentConfig,
         test_logger.info(
             "CuTe DSL: using prebuilt tarball (CMake auto-extracts)")
 
+    # Enable CuteDSL kernels for x86 Blackwell (SM120+) targets.
+    # Prebuilt tarball is provided by CI build_cutedsl_x86_sm120_artifact job.
+    if (device_config.target == 'x86'
+            and device_config.compute_capability is not None
+            and device_config.compute_capability >= 120):
+        cmake_cmd.append('-DENABLE_CUTE_DSL=ALL')
+        cmake_cmd.append(
+            f'-DCUTE_DSL_ARTIFACT_TAG=sm_{device_config.compute_capability}')
+        test_logger.info(
+            f"CuTe DSL: x86 SM{device_config.compute_capability}, "
+            "using prebuilt tarball (CMake auto-extracts)")
+
     build_cmd = ' && '.join([
         f'mkdir -p {build_dir}', f'cd {build_dir}', ' '.join(cmake_cmd),
         'make -j16'
