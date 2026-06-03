@@ -18,6 +18,8 @@
 Kernel groups:
   gdn              — Gated Delta Net decode/prefill
   fmha             — Fused Multi-Head Attention (Blackwell persistent)
+  ffpa             — Baseline FMHA forward kernel for large head-size
+                     attention (D=512), Ampere instruction floor (sm_80+).
   ssd              — Mamba2 SSM chunk-scan prefill
   gemm             — Talker MLP GEMM (Ampere / Blackwell / BW GeForce)
   nvfp4_moe        — split FC1/FC2 NVFP4 MoE (currently SM110/Thor only)
@@ -105,6 +107,8 @@ class KernelVariant:
 # Groups:
 #   gdn              — Gated Delta Net decode/prefill
 #   fmha             — Fused Multi-Head Attention (Blackwell persistent)
+#   ffpa             — Baseline FMHA forward kernel for large head-size
+#                      attention (D=512), Ampere instruction floor (sm_80+).
 #   ssd              — Mamba2 SSM chunk-scan prefill
 #   gemm             — Talker MLP cuBLAS replacement (Ampere/Blackwell/BW GeForce)
 #   nvfp4_moe        — split FC1/FC2 NVFP4 MoE (currently SM110/Thor only)
@@ -301,6 +305,21 @@ KERNEL_VARIANTS = [
         supported_sms=[100, 101, 110],
         script="fmha_cutedsl_blackwell/fmha.py",
         script_args=["--q_shape", "1,1024,14,128", "--k_shape", "1,1024,14,128"] + _VIT,
+    ),
+    # FFPA group which handles large head size attention
+    KernelVariant(
+        name="ffpa_d512_causal",
+        group="ffpa",
+        supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+        script="ffpa_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "512",
+            "--m_block_size", "64", "--n_block_size", "16", "--num_threads", "128",
+            "--dtype", "Float16",
+            "--is_causal",
+            "--skip_rescale",
+            "--export_only",
+        ],
     ),
     # --- NvFP4 MoE group (decomposed FC1/FC2; SM110/Thor today) ---
     # These variants build the decomposed grouped MoE pipeline:

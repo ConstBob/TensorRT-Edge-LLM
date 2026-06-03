@@ -28,7 +28,8 @@
 # ENABLE_CUTE_DSL cache variable controls which kernel groups are linked:
 #   OFF      — disable entirely (default)
 #   ALL      — enable all groups found in metadata.json
-#   fmha     — enable only the FMHA group
+#   fmha     — enable only the Blackwell FMHA group
+#   ffpa     — enable only the Ampere FFPA FMHA group
 #   gdn      — enable only the GDN group
 #   fmha;gdn — semicolon-separated list of groups (CMake list syntax)
 #
@@ -41,6 +42,7 @@
 #
 # Per-group compile definitions set on each target:
 #   CUTE_DSL_FMHA_ENABLED  — set when the fmha group is active
+#   CUTE_DSL_FFPA_ENABLED  — set when the ffpa group is active
 #   CUTE_DSL_GDN_ENABLED   — set when the gdn group is active
 #   CUTE_DSL_SSD_ENABLED   — set when the ssd group is active
 #   CUTE_DSL_GEMM_ENABLED  — set when any gemm variant is active
