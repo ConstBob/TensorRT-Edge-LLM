@@ -41,15 +41,16 @@ __global__ void buildSeqIdxKernel(int32_t* d_seq_idx, int32_t const* d_context_l
 }
 
 /// Fused metadata kernel: prefix-sums chunks_per_seq into seq_chunk_cumsum, then fills
-/// chunk_indices/chunk_offsets for the full [0, batch*nchunks_per_batch) upper-bound
-/// region. Real slots get global flat IDs, trailing slack gets sentinel -1 so the SSD
-/// kernel's chunk_indices[physical_chunk+1] safety read can't false-trigger on garbage.
+/// chunk_indices/chunk_offsets for the full upper-bound region. Real slots map each
+/// sequence's [b * seq_len, b * seq_len + context_lengths[b]) interval into the flat
+/// physical 128-token chunk grid. Trailing slack gets sentinel -1 so the SSD kernel's
+/// chunk_indices[physical_chunk+1] safety read can't false-trigger on garbage.
 /// Single block -- batch is small (<= 256), inter-block sync would be wasted.
 __global__ void buildChunkMetadataKernel(int32_t* d_seq_chunk_cumsum, // [batch+1] int32
-    int32_t* d_chunk_indices,                                         // [batch * nchunks_per_batch] int32
-    int32_t* d_chunk_offsets,                                         // [batch * nchunks_per_batch] int32
+    int32_t* d_chunk_indices,                                         // [num_logical_chunks_upper] int32
+    int32_t* d_chunk_offsets,                                         // [num_logical_chunks_upper] int32
     int32_t const* d_context_lengths,                                 // [batch] int32 or nullptr
-    int32_t batch, int32_t seq_len, int32_t chunk_size, int32_t nchunks_per_batch, int32_t total_slots)
+    int32_t batch, int32_t seq_len, int32_t chunk_size, int32_t total_slots)
 {
     int32_t const tid = threadIdx.x;
     extern __shared__ int32_t smem[];
@@ -57,38 +58,36 @@ __global__ void buildChunkMetadataKernel(int32_t* d_seq_chunk_cumsum, // [batch+
     if (tid < batch)
     {
         int32_t const cl = d_context_lengths ? d_context_lengths[tid] : seq_len;
-        smem[tid] = (cl + chunk_size - 1) / chunk_size;
+        int32_t const seq_start = tid * seq_len;
+        int32_t const start_offset = seq_start - (seq_start / chunk_size) * chunk_size;
+        smem[tid] = cl > 0 ? (start_offset + cl + chunk_size - 1) / chunk_size : 0;
     }
     __syncthreads();
 
-    // Sequential scan in thread 0 -- batch is small enough that parallel scan setup costs more.
+    // Sequential scan/fill in thread 0 -- batch is small enough that parallel scan setup costs more.
     if (tid == 0)
     {
         int32_t cum = 0;
         d_seq_chunk_cumsum[0] = 0;
         for (int32_t b = 0; b < batch; ++b)
         {
+            int32_t const cl = d_context_lengths ? d_context_lengths[b] : seq_len;
+            int32_t flat = b * seq_len;
+            int32_t remaining = cl;
+            for (int32_t c = 0; c < smem[b]; ++c)
+            {
+                int32_t const offset = flat - (flat / chunk_size) * chunk_size;
+                d_chunk_indices[cum + c] = flat / chunk_size;
+                d_chunk_offsets[cum + c] = offset;
+                int32_t const room = chunk_size - offset;
+                int32_t const chunk_tokens = room < remaining ? room : remaining;
+                flat += chunk_tokens;
+                remaining -= chunk_tokens;
+            }
             cum += smem[b];
             d_seq_chunk_cumsum[b + 1] = cum;
         }
         smem[batch] = cum;
-    }
-    __syncthreads();
-
-    // Real-slot fill: each thread maps its k to (batch_idx, within-seq chunk_idx) and writes
-    // the global flat ID to the packed position seq_chunk_cumsum[bp]+cp. Slack slots are
-    // skipped here and filled with -1 in the sweep below -- we don't know their destination
-    // until cumsum is done.
-    for (int32_t k = tid; k < total_slots; k += blockDim.x)
-    {
-        int32_t const bp = k / nchunks_per_batch;
-        int32_t const cp = k - bp * nchunks_per_batch;
-        if (cp < smem[bp])
-        {
-            int32_t const dst = d_seq_chunk_cumsum[bp] + cp;
-            d_chunk_indices[dst] = bp * nchunks_per_batch + cp;
-            d_chunk_offsets[dst] = 0;
-        }
     }
     __syncthreads();
 
@@ -124,13 +123,14 @@ void buildSSDVarlenMetadata(int32_t* d_seq_idx, int32_t* d_chunk_indices, int32_
     cudaStream_t stream)
 {
     int32_t const nchunks_per_seq = (seq_len + chunk_size - 1) / chunk_size;
-    int32_t const total_slots = batch * nchunks_per_seq;
+    int32_t const chunks_per_seq_upper = nchunks_per_seq + ((seq_len % chunk_size) == 0 ? 0 : 1);
+    int32_t const total_slots = batch * chunks_per_seq_upper;
 
     // Threads >= max(batch, 256); smem fits chunks_per_seq[batch] + cum total at [batch].
     int32_t const threads = (batch <= 256) ? 256 : ((batch + 31) / 32) * 32;
     size_t const smem_bytes = static_cast<size_t>(batch + 1) * sizeof(int32_t);
     buildChunkMetadataKernel<<<1, threads, smem_bytes, stream>>>(d_seq_chunk_cumsum, d_chunk_indices, d_chunk_offsets,
-        d_context_lengths, batch, seq_len, chunk_size, nchunks_per_seq, total_slots);
+        d_context_lengths, batch, seq_len, chunk_size, total_slots);
 
     int32_t const threadsX = 128;
     dim3 const block(threadsX, 1, 1);
