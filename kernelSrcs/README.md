@@ -74,4 +74,6 @@ See the group-specific READMEs for kernel coverage and standalone testing:
 
 - `kernelSrcs/gdn_cutedsl/README.md`
 - `kernelSrcs/fmha_cutedsl_blackwell/README.md`
+- `kernelSrcs/ffpa_cutedsl/README.md` — Ampere-floor FFPA-style FMHA forward
+  (port of [xlite-dev/ffpa-attn](https://github.com/xlite-dev/ffpa-attn))
 - `kernelSrcs/gemm_cutedsl/README.md`
