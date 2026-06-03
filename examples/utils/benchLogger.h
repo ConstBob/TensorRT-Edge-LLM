@@ -21,8 +21,6 @@
 #include "common/mmapReader.h"
 #include "common/trtUtils.h"
 #include "profiling/layerProfiler.h"
-#include "runtime/legacy/eagleDraftEngineRunner.h"
-#include "runtime/legacy/llmEngineRunner.h"
 
 #include <filesystem>
 #include <map>
@@ -183,12 +181,6 @@ std::string buildLayerCsvPath(std::string const& outputDir, BenchOutputParams co
 std::string buildE2ECsvPath(std::string const& outputDir, BenchOutputParams const& params);
 
 // ==================== Log Helpers ====================
-
-//! Log LLM engine configuration
-void logLlmEngineConfig(trt_edgellm::rt::LLMEngineRunnerConfig const& cfg);
-
-//! Log draft engine configuration
-void logDraftEngineConfig(trt_edgellm::rt::EagleDraftEngineRunnerConfig const& cfg);
 
 //! Log bench configuration and mode-specific parameters
 void logBenchConfig(BenchOutputParams const& params, int64_t imageTokens = 0);
