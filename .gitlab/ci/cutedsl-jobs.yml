@@ -266,7 +266,7 @@ build_cutedsl_x86_sm120_artifact:
     - echo "CUDA version:$(nvcc --version | grep release)"
     - echo "Building CuTe DSL artifact for x86_64 SM120"
     - python3 -m venv "$CUTE_DSL_OUTPUT_DIR/venv/cutedsl"
-    - '"$CUTE_DSL_OUTPUT_DIR/venv/cutedsl/bin/pip" install -q ''nvidia-cutlass-dsl[cu12]==4.5.1'' cupy-cuda12x==12.3.0'
+    - '"$CUTE_DSL_OUTPUT_DIR/venv/cutedsl/bin/pip" install -q ''nvidia-cutlass-dsl==4.5.2'' cupy-cuda12x==12.3.0'
     - '"$CUTE_DSL_OUTPUT_DIR/venv/cutedsl/bin/python" kernelSrcs/build_cutedsl.py --kernels ALL --gpu_arch sm_120 --arch x86_64 --output_dir "$CUTE_DSL_OUTPUT_DIR" --clean'
     - ARTIFACT_DIR="$CUTE_DSL_OUTPUT_DIR/x86_64/$CUTE_DSL_ARTIFACT_TAG"
     - test -f "$ARTIFACT_DIR/metadata.json"
@@ -291,7 +291,7 @@ build_cutedsl_sm87_cuda12_artifact:
     CUTE_DSL_ARTIFACT_NAME: "cutedsl_aarch64_sm_87_cuda12.tar.gz"
     CUTE_DSL_ARTIFACT_TAG: "sm_87"
     CUTE_DSL_BUILD_GPU_ARCH_ARG: "--gpu_arch sm_87"
-    CUTE_DSL_PACKAGE: "nvidia-cutlass-dsl[cu12]==4.5.2"
+    CUTE_DSL_PACKAGE: "nvidia-cutlass-dsl==4.5.2"
     CUTE_DSL_CUPY_PACKAGE: "cupy-cuda12x==12.3.0"
   artifacts:
     name: "cutedsl-sm87-cuda12-${CI_COMMIT_SHORT_SHA}"

@@ -84,7 +84,7 @@ Run on Thor (aarch64) or on a Blackwell box for local iteration.
 
 ### 4.1. Install AOT dependencies
 
-On CUDA 13 the `[cu13]` extra is **mandatory** (use `[cu12]` on CUDA 12.x):
+On CUDA 13 the `[cu13]` extra is **mandatory**; on CUDA 12 install the base package:
 
 ```bash
 python3 -m pip install \
@@ -95,7 +95,7 @@ python3 -m pip install \
 
 | Dependency | Version | Notes |
 |---|---|---|
-| `nvidia-cutlass-dsl` | `4.5.2` | Pinned; CuTeDSL surface used by all groups. **Always install the CUDA-matched extra** — `[cu13]` on CUDA 13, `[cu12]` on CUDA 12. |
+| `nvidia-cutlass-dsl` | `4.5.2` | Pinned; CuTeDSL surface used by all groups. **On CUDA 13 install the `[cu13]` extra; on CUDA 12 install the base package.** |
 | `cupy-cuda13x`       | `13.6.0` | CUDA 13.x ; use `cupy-cuda12x==12.3.0` for CUDA 12.x |
 | `cuda-python`        | matches CUDA | Required by every group's AOT export |
 
