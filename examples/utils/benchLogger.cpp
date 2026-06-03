@@ -23,11 +23,12 @@
 #include <cmath>
 #include <fstream>
 #include <iomanip>
+#include <nlohmann/json.hpp>
 #include <numeric>
 #include <sstream>
 
 using namespace trt_edgellm;
-using rt::Json;
+using Json = nlohmann::json;
 
 // ==================== String Conversions ====================
 
@@ -564,51 +565,6 @@ std::string buildE2ECsvPath(std::string const& outputDir, BenchOutputParams cons
 }
 
 // ==================== Log Helpers ====================
-
-void logLlmEngineConfig(rt::LLMEngineRunnerConfig const& cfg)
-{
-    LOG_INFO(
-        "Base Engine Config:\n"
-        "  Layers: %d\n"
-        "  KV Heads: %d\n"
-        "  Head Dim: %d\n"
-        "  Rotary Dim: %d\n"
-        "  Hidden Size: %d\n"
-        "  Vocab Size: %d\n"
-        "  Output Vocab Size: %d\n"
-        "  Max Supported Batch Size: %d\n"
-        "  Max Supported Input Length: %d\n"
-        "  Max KV Cache Capacity: %d\n"
-        "  Max Supported LoRA Rank: %d\n"
-        "  Eagle Enable: %s\n"
-        "  Output Hidden Dim: %d\n"
-        "  Max Verify Tree Size: %d\n"
-        "  Num Deepstack Features: %d",
-        cfg.numDecoderLayers, cfg.numKVHeads, cfg.headDim, cfg.rotaryDim, cfg.hiddenSize, cfg.vocabSize,
-        cfg.outputVocabSize, cfg.maxSupportedBatchSize, cfg.maxSupportedInputLength, cfg.maxKVCacheCapacity,
-        cfg.maxSupportedLoraRank, cfg.enableEagleSpecDecode ? "true" : "false", cfg.outputHiddenDim,
-        cfg.maxVerifyTreeSize, cfg.numDeepstackFeatures);
-}
-
-void logDraftEngineConfig(rt::EagleDraftEngineRunnerConfig const& cfg)
-{
-    LOG_INFO(
-        "Draft Engine Config:\n"
-        "  Layers: %d\n"
-        "  KV Heads: %d\n"
-        "  Head Dim: %d\n"
-        "  Rotary Dim: %d\n"
-        "  Draft Hidden Size: %d\n"
-        "  Base Hidden Size: %d\n"
-        "  Draft Vocab Size: %d\n"
-        "  Max Supported Batch Size: %d\n"
-        "  Max Supported Input Length: %d\n"
-        "  Max KV Cache Capacity: %d\n"
-        "  Max Draft Tree Size: %d",
-        cfg.numDecoderLayers, cfg.numKVHeads, cfg.headDim, cfg.rotaryDim, cfg.draftModelHiddenDim,
-        cfg.baseModelHiddenDim, cfg.draftModelVocabSize, cfg.maxSupportedBatchSize, cfg.maxSupportedInputLength,
-        cfg.maxKVCacheCapacity, cfg.maxDraftTreeSize);
-}
 
 void logBenchConfig(BenchOutputParams const& params, int64_t imageTokens)
 {
