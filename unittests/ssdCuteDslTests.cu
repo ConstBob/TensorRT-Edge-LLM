@@ -30,6 +30,7 @@
 #include "common/tensor.h"
 #include "kernels/mamba/cuteDslSSDRunner.h"
 #include "kernels/mamba/selectiveStateUpdate.h"
+#include "kernels/mamba/ssdVarlenMetadata.h"
 
 using namespace trt_edgellm;
 using namespace nvinfer1;
@@ -383,6 +384,65 @@ INSTANTIATE_TEST_SUITE_P(SsdCuteDslSM80, SsdCuteDslTest,
         return name;
     });
 
+TEST(SsdCuteDslVarlenMetadata, HandlesUnalignedPaddedRows)
+{
+    int32_t constexpr batch = 3;
+    int32_t constexpr seqLen = 462;
+    int32_t constexpr chunkSize = 128;
+    int32_t constexpr chunksPerSeqUpper = 5;
+    int32_t constexpr totalSlots = batch * chunksPerSeqUpper;
+
+    std::vector<int32_t> const contextLengths{78, 175, 462};
+    std::vector<int32_t> const expectedSeqChunkCumsum{0, 1, 3, 7};
+    std::vector<int32_t> const expectedChunkIndices{0, 3, 4, 7, 8, 9, 10, -1, -1, -1, -1, -1, -1, -1, -1};
+    std::vector<int32_t> const expectedChunkOffsets{0, 78, 0, 28, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+
+    int32_t* dSeqIdx = nullptr;
+    int32_t* dChunkIndices = nullptr;
+    int32_t* dChunkOffsets = nullptr;
+    int32_t* dSeqChunkCumsum = nullptr;
+    int32_t* dContextLengths = nullptr;
+
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dSeqIdx), batch * seqLen * sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dChunkIndices), totalSlots * sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dChunkOffsets), totalSlots * sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dSeqChunkCumsum), (batch + 1) * sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dContextLengths), batch * sizeof(int32_t)));
+    CUDA_CHECK(cudaMemcpy(dContextLengths, contextLengths.data(), batch * sizeof(int32_t), cudaMemcpyHostToDevice));
+
+    mamba::buildSSDVarlenMetadata(
+        dSeqIdx, dChunkIndices, dChunkOffsets, dSeqChunkCumsum, dContextLengths, batch, seqLen, chunkSize, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<int32_t> seqChunkCumsum(batch + 1);
+    std::vector<int32_t> chunkIndices(totalSlots);
+    std::vector<int32_t> chunkOffsets(totalSlots);
+    std::vector<int32_t> seqIdx(batch * seqLen);
+    CUDA_CHECK(
+        cudaMemcpy(seqChunkCumsum.data(), dSeqChunkCumsum, (batch + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(chunkIndices.data(), dChunkIndices, totalSlots * sizeof(int32_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(chunkOffsets.data(), dChunkOffsets, totalSlots * sizeof(int32_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(seqIdx.data(), dSeqIdx, batch * seqLen * sizeof(int32_t), cudaMemcpyDeviceToHost));
+
+    EXPECT_EQ(seqChunkCumsum, expectedSeqChunkCumsum);
+    EXPECT_EQ(chunkIndices, expectedChunkIndices);
+    EXPECT_EQ(chunkOffsets, expectedChunkOffsets);
+    for (int32_t b = 0; b < batch; ++b)
+    {
+        for (int32_t t = 0; t < seqLen; ++t)
+        {
+            int32_t const expected = (t < contextLengths[b]) ? b : -1;
+            EXPECT_EQ(seqIdx[b * seqLen + t], expected) << "b=" << b << " t=" << t;
+        }
+    }
+
+    CUDA_CHECK(cudaFree(dSeqIdx));
+    CUDA_CHECK(cudaFree(dChunkIndices));
+    CUDA_CHECK(cudaFree(dChunkOffsets));
+    CUDA_CHECK(cudaFree(dSeqChunkCumsum));
+    CUDA_CHECK(cudaFree(dContextLengths));
+}
+
 #ifdef CUTE_DSL_SSD_BLACKWELL_ENABLED
 
 // =============================================================================
@@ -569,6 +629,23 @@ TEST_P(SsdCuteDslBlackwellTest, CorrectnessVsSerialReference)
 
     EXPECT_LT(relErr, 0.05f) << "Relative error " << relErr << " exceeds threshold. "
                              << "maxDiff=" << maxDiff << " refMax=" << refMax;
+
+    std::vector<half> gpuState(stateSize);
+    CUDA_CHECK(cudaMemcpy(gpuState.data(), dState, stateSize * sizeof(half), cudaMemcpyDeviceToHost));
+
+    float maxStateDiff = 0.f;
+    float refStateMax = 0.f;
+    for (size_t i = 0; i < stateSize; ++i)
+    {
+        float const a = __half2float(gpuState[i]);
+        float const b = refState[i];
+        maxStateDiff = std::max(maxStateDiff, std::abs(a - b));
+        refStateMax = std::max(refStateMax, std::abs(b));
+    }
+    float const stateRelErr = maxStateDiff / (refStateMax + 1e-8f);
+
+    EXPECT_LT(stateRelErr, 0.05f) << "Final state relative error " << stateRelErr << " exceeds threshold. "
+                                  << "maxDiff=" << maxStateDiff << " refMax=" << refStateMax;
 
     CUDA_CHECK(cudaFree(dX));
     CUDA_CHECK(cudaFree(dDt));
@@ -841,7 +918,11 @@ INSTANTIATE_TEST_SUITE_P(SsdCuteDslBlackwell, SsdCuteDslBlackwellTest,
         // Long-seq coverage at production batch shapes (bs <= 8).
         SsdCuteDslTestConfig{4, 2048, 8, 64, 128, 1}, SsdCuteDslTestConfig{4, 4096, 8, 64, 128, 1},
         SsdCuteDslTestConfig{8, 1024, 8, 64, 128, 1}, SsdCuteDslTestConfig{8, 2048, 8, 64, 128, 1},
-        SsdCuteDslTestConfig{8, 4096, 8, 64, 128, 1}),
+        SsdCuteDslTestConfig{8, 4096, 8, 64, 128, 1},
+        // Production-shaped Nemotron-H MMLU batch: h=64, g=8, mixed lengths, unaligned padded row stride,
+        // including a sub-128 valid sequence away from batch row 0.
+        SsdCuteDslTestConfig{
+            16, 462, 64, 64, 128, 8, {78, 175, 210, 248, 96, 325, 360, 400, 462, 462, 462, 462, 462, 462, 462, 462}}),
     [](testing::TestParamInfo<SsdCuteDslTestConfig> const& info) {
         auto const& c = info.param;
         std::string name = "b" + std::to_string(c.batch) + "_s" + std::to_string(c.seqLen) + "_h"

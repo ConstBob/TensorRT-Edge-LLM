@@ -1715,7 +1715,7 @@ class SSDKernel:
 
             if local_warp_idx == 0:
                 # TMA store fstate (state_dtype)
-                if cutlass.const_expr(self.has_init_states and self.has_varlen):
+                if cutlass.const_expr(self.has_varlen):
                     bSG_gP_final = bSG_gP_pre_slice[(None, 0, 0, eh_idx, seq_id)]
                 else:
                     bSG_gP_final = bSG_gP
@@ -3896,14 +3896,16 @@ class SSDKernel:
     ):
         """Compute how far into the physical chunk this logical chunk extends.
 
-        Returns chunk_size_limit (= L when the logical chunk owns the full
-        physical chunk, < L when masked).
+        Returns chunk_size_limit, the exclusive end coordinate in the
+        physical chunk's L dimension (= L when the logical chunk owns the
+        full physical chunk, < L when masked).
 
         Two masking sources combined (both gated by has_varlen):
         - flashinfer chunk-pack: next logical chunk shares this physical
           chunk -> chunk_size_limit = chunk_offsets[next].
         - padded_mode end-of-seq clamp (Edge-LLM plugin padded layout):
-          if this is seq's partial chunk, clamp to remaining valid tokens.
+          if this is seq's partial chunk, clamp to the physical-chunk
+          coordinate just past the final valid token.
           valid_lens / seq_id / first_chunk_in_seq are ignored when
           padded_mode is False.
         """
@@ -3914,14 +3916,19 @@ class SSDKernel:
                 if next_chunk == chunk:
                     chunk_size_limit = chunk_offsets[physical_chunk + 1]
             if cutlass.const_expr(self.padded_mode):
-                local_chunk = physical_chunk - first_chunk_in_seq
-                chunk_start_in_seq = local_chunk * L
+                first_chunk = chunk_indices[first_chunk_in_seq]
+                first_chunk_offset = chunk_offsets[first_chunk_in_seq]
+                chunk_start_in_seq = (
+                    (chunk - first_chunk) * L + chunk_offsets[physical_chunk]
+                    - first_chunk_offset
+                )
                 valid_in_chunk = valid_lens[seq_id] - chunk_start_in_seq
-                if valid_in_chunk < chunk_size_limit:
-                    if valid_in_chunk < 0:
-                        chunk_size_limit = cutlass.Int32(0)
-                    else:
-                        chunk_size_limit = valid_in_chunk
+                if valid_in_chunk < 0:
+                    chunk_size_limit = cutlass.Int32(0)
+                else:
+                    valid_end_in_chunk = chunk_offsets[physical_chunk] + valid_in_chunk
+                    if valid_end_in_chunk < chunk_size_limit:
+                        chunk_size_limit = valid_end_in_chunk
         return chunk_size_limit
 
     def pre_intra_tmem_load_and_partition_q(self, tIntra1, local_tidx):
@@ -4405,8 +4412,8 @@ def _compile_ssd_blackwell_aot(L, D, N, nheads, ngroups, batch, nchunks,
         dt_in: cute.Tensor,       # [B, S, EH] fp16
         A: cute.Tensor,            # [EH] fp32
         dt_bias: cute.Tensor,      # [EH] fp16
-        dA_cumsum: cute.Tensor,    # [B, EH, C, L] fp32
-        dt_proc: cute.Tensor,      # [B, EH, C, L] fp16
+        dA_cumsum: cute.Tensor,    # [B, C, EH, L] fp32
+        dt_proc: cute.Tensor,      # [B, C, EH, L] fp16
         seq_len: cutlass.Int32,
         dt_softplus: cutlass.Constexpr[bool],
     ):
@@ -4424,8 +4431,8 @@ def _compile_ssd_blackwell_aot(L, D, N, nheads, ngroups, batch, nchunks,
                     dtv = cute.log(cutlass.Float32(1.0) + cute.exp(dtv))
 
         # Write dt_proc
-        dA_cumsum[b, h, c, tidx] = cutlass.Float32(A[h]) * dtv
-        dt_proc[b, h, c, tidx] = cutlass.Float16(dtv)
+        dA_cumsum[b, c, h, tidx] = cutlass.Float32(A[h]) * dtv
+        dt_proc[b, c, h, tidx] = cutlass.Float16(dtv)
         cute.arch.barrier()
 
         # Parallel Hillis-Steele prefix scan over L=128 elements (log2(L) steps).
@@ -4433,10 +4440,10 @@ def _compile_ssd_blackwell_aot(L, D, N, nheads, ngroups, batch, nchunks,
         while stride < L:
             val = cutlass.Float32(0.0)
             if tidx >= stride:
-                val = dA_cumsum[b, h, c, tidx - stride]
+                val = dA_cumsum[b, c, h, tidx - stride]
             cute.arch.barrier()
             if tidx >= stride:
-                dA_cumsum[b, h, c, tidx] = dA_cumsum[b, h, c, tidx] + val
+                dA_cumsum[b, c, h, tidx] = dA_cumsum[b, c, h, tidx] + val
             cute.arch.barrier()
             stride = stride * 2
 
@@ -4446,12 +4453,12 @@ def _compile_ssd_blackwell_aot(L, D, N, nheads, ngroups, batch, nchunks,
 
     @cute.kernel
     def _transpose_y_kernel(
-        y_ws: cute.Tensor,     # [B, EH, D, C, L] fp16 -- L stride 1
+        y_ws: cute.Tensor,     # [B, C, EH, D, L] fp16 -- L stride 1
         output: cute.Tensor,   # [B, S, EH, D] fp16 -- D stride 1
         seq_len: cutlass.Int32,
         nchunks: cutlass.Int32,
     ):
-        """Smem-staged transpose y_ws[B,EH,D,C,L] -> output[B,S,EH,D].
+        """Smem-staged transpose y_ws[B,C,EH,D,L] -> output[B,S,EH,D].
 
         sY is [L, D_SPAD] with D stride 1. Phase 2 is a direct b128 transfer
         (smem D-contig -> gmem D-contig, no scratch). Phase 1's smem write is
@@ -4481,13 +4488,11 @@ def _compile_ssd_blackwell_aot(L, D, N, nheads, ngroups, batch, nchunks,
             16,
         )
 
-        # y_ws strides: (B_str, EH_str, DC_str, L=128 STATIC, 1 STATIC).
-        # All dynamic strides factor through L=128, so block_off is a multiple
-        # of L=128 fp16 = 256B -> 16B-aligned at runtime.
+        # y_ws is [B, C, EH, D, L]: stride[0]=B, [1]=C, [2]=EH, [3]=D, [4]=L=1.
         block_off = (b * y_ws.layout.stride[0]
-                     + eh * y_ws.layout.stride[1]
-                     + cutlass.Int32(c) * y_ws.layout.stride[3])
-        DC_str = y_ws.layout.stride[2]
+                     + cutlass.Int32(c) * y_ws.layout.stride[1]
+                     + eh * y_ws.layout.stride[2])
+        DC_str = y_ws.layout.stride[3]
 
         out_B = output.layout.stride[0]
         out_S = output.layout.stride[1]
@@ -4562,9 +4567,9 @@ def _compile_ssd_blackwell_aot(L, D, N, nheads, ngroups, batch, nchunks,
         output: cute.Tensor,         # [batch, seq_len, nheads, dim] fp16 (final output)
         state: cute.Tensor,          # [batch, nheads, dim, dstate] fp16 (matches plugin kIN_STATE_IDX type -- read init / write final in place)
         # Workspace buffers (pre-allocated by caller)
-        dA_cumsum: cute.Tensor,      # [batch, nheads, nchunks, L] fp32
-        dt_proc: cute.Tensor,        # [batch, nheads, nchunks, L] fp16
-        y_ws: cute.Tensor,           # [batch, nheads, dim, nchunks, L] fp16 (kernel's natural [B,EH,D,C,L] y layout -- transposed into output post-kernel)
+        dA_cumsum: cute.Tensor,      # [batch, nchunks, nheads, L] fp32
+        dt_proc: cute.Tensor,        # [batch, nchunks, nheads, L] fp16
+        y_ws: cute.Tensor,           # [batch, nchunks, nheads, dim, L] fp16 (kernel's natural [B,C,EH,D,L] y layout -- transposed into output post-kernel)
         # Varlen metadata (computed by caller from context_lengths)
         seq_idx: cute.Tensor,        # [batch, seq_len] int32 (b if t<cl[b] else -1)
         chunk_indices: cute.Tensor,  # [num_logical_chunks] int32
@@ -4596,13 +4601,15 @@ def _compile_ssd_blackwell_aot(L, D, N, nheads, ngroups, batch, nchunks,
             (D, L, n_c, n_eh, n_batch),
             stride=(1, n_eh * D, L * n_eh * D, D, n_c * L * n_eh * D)))
 
+        # cs/dt/y workspaces use [B, C, EH, ...] so stride[n_c]*n_c == stride[batch]
+        # (varlen flat-chunk-via-b=0 indexing, same pattern as x_perm / b_perm).
         cs_perm = cute.make_tensor(dA_cumsum.iterator, cute.make_layout(
             (L, n_c, n_eh, n_batch),
-            stride=(1, L, n_c * L, n_eh * n_c * L)))
+            stride=(1, n_eh * L, L, n_c * n_eh * L)))
 
         dt_perm = cute.make_tensor(dt_proc.iterator, cute.make_layout(
             (L, n_c, n_eh, n_batch),
-            stride=(1, L, n_c * L, n_eh * n_c * L)))
+            stride=(1, n_eh * L, L, n_c * n_eh * L)))
 
         b_perm = cute.make_tensor(B.iterator, cute.make_layout(
             (L, N, n_c, n_g, n_batch),
@@ -4612,13 +4619,11 @@ def _compile_ssd_blackwell_aot(L, D, N, nheads, ngroups, batch, nchunks,
             (L, N, n_c, n_g, n_batch),
             stride=(n_g * N, 1, L * n_g * N, N, n_c * L * n_g * N)))
 
-        # y_perm aliases y_ws workspace ([B,EH,D,C,L] row-major; L stride 1 -- required
-        # by the kernel's smem swizzle / TMA descriptor). A post-kernel transpose
-        # (one launch, vectorized) maps y_ws[b,eh,d,c,l] -> output[b, c*L+l, eh, d]
-        # to satisfy the plugin's [B,S,EH,D] contract.
+        # y_perm aliases y_ws ([B,C,EH,D,L] row-major; L stride 1 required by
+        # smem swizzle / TMA descriptor). Post-kernel transpose remaps to [B,S,EH,D].
         y_perm = cute.make_tensor(y_ws.iterator, cute.make_layout(
             (L, D, n_c, n_eh, n_batch),
-            stride=(1, n_c * L, L, D * n_c * L, n_eh * D * n_c * L)))
+            stride=(1, L, n_eh * D * L, D * L, n_c * n_eh * D * L)))
 
         # fstate aliases caller's state buffer ([B,EH,D,N] fp16 row-major) reshaped
         # to (N,D,EH,B): kernel reads init at start, overwrites with final state in
@@ -4678,10 +4683,10 @@ def _compile_ssd_blackwell_aot(L, D, N, nheads, ngroups, batch, nchunks,
     ph_dtb = ph_dtb.mark_compact_shape_dynamic(mode=0, stride_order=(0,))
     ph_out = _mark_nd(cp.zeros((batch, seq_len_ph, nheads, D), dtype=cp.float16), 3)
     ph_state = _mark_nd(cp.zeros((batch, nheads, D, N), dtype=cp.float16), 2)
-    # Workspace buffers: cumsum + dt_proc + y_ws (kernel's natural [B,EH,D,C,L] y layout).
-    ph_cumsum = _mark_nd(cp.zeros((batch, nheads, nchunks, L), dtype=cp.float32), 3)
-    ph_dtproc = _mark_nd(cp.zeros((batch, nheads, nchunks, L), dtype=cp.float16), 3)
-    ph_y = _mark_nd(cp.zeros((batch, nheads, D, nchunks, L), dtype=cp.float16), 4)
+    # Workspace buffers: cumsum + dt_proc + y_ws ([B, C, EH, ...] row-major).
+    ph_cumsum = _mark_nd(cp.zeros((batch, nchunks, nheads, L), dtype=cp.float32), 3)
+    ph_dtproc = _mark_nd(cp.zeros((batch, nchunks, nheads, L), dtype=cp.float16), 3)
+    ph_y = _mark_nd(cp.zeros((batch, nchunks, nheads, D, L), dtype=cp.float16), 4)
 
     # Varlen metadata placeholders (always-varlen AOT mode)
     # Upper-bound logical chunks at batch * nchunks (one chunk per (batch, c) cell).

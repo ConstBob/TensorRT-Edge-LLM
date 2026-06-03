@@ -35,9 +35,8 @@ namespace mamba
 {
 
 /// Build varlen metadata fully on-device (CUDA-graph-compatible -- no host sync).
-/// Caller passes `num_logical_chunks_upper = batch * nchunks_per_seq` and
-/// `num_seqs = batch` directly to the kernel; the trailing slack in
-/// chunk_indices is filled with sentinel -1 so the kernel's
+/// The logical chunk upper bound is `batch * (ceil(seq_len / chunk_size) + maybe_unaligned_chunk)`;
+/// trailing slack in chunk_indices is filled with sentinel -1 so the kernel's
 /// `chunk_indices[physical_chunk+1]` lookup is safe up to the upper bound.
 void buildSSDVarlenMetadata(int32_t* d_seq_idx, int32_t* d_chunk_indices, int32_t* d_chunk_offsets,
     int32_t* d_seq_chunk_cumsum, int32_t const* d_context_lengths, int32_t batch, int32_t seq_len, int32_t chunk_size,
