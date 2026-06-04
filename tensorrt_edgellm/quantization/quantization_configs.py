@@ -274,6 +274,51 @@ def _disable_groups(*pattern_groups) -> Dict[str, Dict[str, bool]]:
     return out
 
 
+def _merge_quant_cfg_entries(cfg: Dict[str, Any],
+                             entries: Dict[str, Dict[str, Any]]) -> None:
+    """Append or update ModelOpt quant_cfg entries across API formats."""
+    quant_cfg = cfg.setdefault("quant_cfg", {})
+    if isinstance(quant_cfg, list):
+        for name, entry in entries.items():
+            # In the legacy dict format "default" means a catch-all "*".
+            # Appending that after a selective list config would override all
+            # earlier enables, so only preserve it for dict-mode configs.
+            if name == "default":
+                continue
+            entry = dict(entry)
+            enable = entry.pop("enable", None)
+            converted = {"quantizer_name": name}
+            if entry:
+                converted["cfg"] = entry
+            if enable is not None:
+                converted["enable"] = enable
+            quant_cfg.append(converted)
+    else:
+        quant_cfg.update(entries)
+
+
+def _remove_quant_cfg_entries(cfg: Dict[str, Any], needle: str) -> None:
+    """Remove quant_cfg entries whose pattern contains *needle*."""
+    quant_cfg = cfg.setdefault("quant_cfg", {})
+    if isinstance(quant_cfg, list):
+        filtered = []
+        for entry in quant_cfg:
+            if "quantizer_name" in entry:
+                name = str(entry["quantizer_name"])
+            elif len(entry) == 1:
+                name = str(next(iter(entry)))
+            else:
+                name = str(entry)
+            if needle not in name:
+                filtered.append(entry)
+        cfg["quant_cfg"] = filtered
+    else:
+        cfg["quant_cfg"] = {
+            k: v
+            for k, v in quant_cfg.items() if needle not in k
+        }
+
+
 def build_quant_config(
     quantization: Optional[str] = None,
     lm_head_quantization: Optional[str] = None,
@@ -320,16 +365,13 @@ def build_quant_config(
             raise ValueError(
                 f"Unsupported lm_head_quantization: {lm_head_quantization}. "
                 f"Choose from: {list(_LM_HEAD_CFG_MAP)}")
-        cfg["quant_cfg"] = {
-            k: v
-            for k, v in cfg["quant_cfg"].items() if "*lm_head" not in k
-        }
-        cfg["quant_cfg"].update(
-            _LM_HEAD_CFG_MAP[lm_head_quantization]["quant_cfg"])
+        _remove_quant_cfg_entries(cfg, "lm_head")
+        _merge_quant_cfg_entries(
+            cfg, _LM_HEAD_CFG_MAP[lm_head_quantization]["quant_cfg"])
 
     if kv_cache_quantization == "fp8":
-        cfg["quant_cfg"].update(mtq.FP8_KV_CFG["quant_cfg"])
-        cfg["quant_cfg"].update(FP8_ATTN["quant_cfg"])
+        _merge_quant_cfg_entries(cfg, mtq.FP8_KV_CFG["quant_cfg"])
+        _merge_quant_cfg_entries(cfg, FP8_ATTN["quant_cfg"])
 
     # Disable every non-LLM group by default. Re-enable the ones the user
     # explicitly asked to quantize.
@@ -338,7 +380,7 @@ def build_quant_config(
         groups_to_disable.append(_VISUAL_PATTERNS)
     if audio_quantization is None:
         groups_to_disable.append(_AUDIO_PATTERNS)
-    cfg["quant_cfg"].update(_disable_groups(*groups_to_disable))
+    _merge_quant_cfg_entries(cfg, _disable_groups(*groups_to_disable))
 
     # When visual != backbone, layer an explicit override. When visual ==
     # backbone we don't need overrides — the backbone's generic wildcards
@@ -349,15 +391,15 @@ def build_quant_config(
             raise ValueError(
                 f"Unsupported visual_quantization: {visual_quantization}. "
                 f"Choose from: {list(_VISUAL_CFG_MAP)}")
-        cfg["quant_cfg"].update(
-            _VISUAL_CFG_MAP[visual_quantization]["quant_cfg"])
+        _merge_quant_cfg_entries(
+            cfg, _VISUAL_CFG_MAP[visual_quantization]["quant_cfg"])
 
     if (audio_quantization is not None and audio_quantization != quantization):
         if audio_quantization not in _AUDIO_CFG_MAP:
             raise ValueError(
                 f"Unsupported audio_quantization: {audio_quantization}. "
                 f"Choose from: {list(_AUDIO_CFG_MAP)}")
-        cfg["quant_cfg"].update(
-            _AUDIO_CFG_MAP[audio_quantization]["quant_cfg"])
+        _merge_quant_cfg_entries(
+            cfg, _AUDIO_CFG_MAP[audio_quantization]["quant_cfg"])
 
     return cfg

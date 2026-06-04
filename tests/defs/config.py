@@ -1016,6 +1016,7 @@ class TestConfig:
             "Qwen3-0.6B-INT8-SQ": "Qwen3-0.6B-INT8-SQ",
             "Qwen3-1.7B-FP8": "Qwen3-1.7B-FP8",
             "Qwen3-1.7B-NVFP4": "Qwen3-1.7B-NVFP4",
+            "Qwen3.5-4B-NVFP4": "Qwen3.5-4B-NVFP4",
             "Qwen3-VL-4B-Instruct-NVFP4": "Qwen3-VL-4B-Instruct-NVFP4",
             "Qwen3-VL-2B-Instruct-INT4-AWQ": "Qwen3-VL-2B-Instruct-INT4-AWQ",
         }
@@ -1064,6 +1065,9 @@ class TestConfig:
         MODEL_NAME_TO_DFLASH_DRAFT_MODELS_MAP = {
             "Qwen3.5-4B": {
                 "b16": "Qwen3.5-4B-DFlash",
+            },
+            "Qwen3.5-4B-NVFP4": {
+                "b16": "Qwen3.5-4B-DFlash-NVFP4",
             },
         }
 
