@@ -577,7 +577,7 @@ int32_t Nvfp4MoePlugin::configurePlugin(
 
 #ifdef CUTE_DSL_NVFP4_MOE_ENABLED
     // Defer the (sm version, dtype, activation, backend, bounded hidden size,
-    // I / E / top_k divisibility) gate to the SM110 split FC1/FC2 runner so the
+    // I / E / top_k divisibility) gate to the split FC1/FC2 runner so the
     // plugin and backend can never disagree about what the linked AOT pack
     // supports.
     int32_t const smVersion = trt_edgellm::getSMVersion();
@@ -587,9 +587,9 @@ int32_t Nvfp4MoePlugin::configurePlugin(
     {
         LOG_ERROR(
             "Nvfp4MoePlugin: shape tuple (H=%d, I=%d, E=%d, top_k=%d, sm=%d, "
-            "act=%d, io=%d, backend=%d) is not supported by the SM110 split "
+            "act=%d, io=%d, backend=%d) is not supported by the split "
             "FC1/FC2 CuteDSL runner. Requires -DENABLE_CUTE_DSL=nvfp4_moe, "
-            "sm == 110, io_dtype=FP16, activation in {swiglu, relu2}, "
+            "sm in {100, 101, 110}, io_dtype=FP16, activation in {swiglu, relu2}, "
             "H %% %d == 0, I %% 64 == 0, FC1_N %% %d == 0, E=%d, 0 < top_k <= %d.",
             mHiddenSize, mMoeInterSize, mNumExperts, mTopK, smVersion, mActivationType, mIoDtype, mBackend, 128,
             kCuteDslLevelTileN, kCuteDslSm110NumExperts, kCuteDslSm110TopK);
@@ -597,7 +597,7 @@ int32_t Nvfp4MoePlugin::configurePlugin(
     }
 #else
     LOG_ERROR(
-        "Nvfp4MoePlugin: no CuTeDSL SM110 MoE backend is linked -- rebuild "
+        "Nvfp4MoePlugin: no CuTeDSL SM100/101/110 MoE backend is linked -- rebuild "
         "with -DENABLE_CUTE_DSL=nvfp4_moe after generating the matching AOT "
         "artifact via kernelSrcs/build_cutedsl.py. For SM12x targets use the "
         "NvFP4MoEPluginGeforce plugin instead.");
@@ -709,7 +709,7 @@ size_t Nvfp4MoePlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, i
             maxTokens, maxRoutedRows, mNumExperts, mTopK, mHiddenSize, mMoeInterSize);
         if (runnerWs == 0)
         {
-            LOG_ERROR("Nvfp4MoePlugin: SM110 CuTeDSL backend returned zero workspace");
+            LOG_ERROR("Nvfp4MoePlugin: SM100/101/110 CuTeDSL backend returned zero workspace");
             return 0;
         }
         total = accumulateWorkspaceSize(
@@ -737,7 +737,7 @@ int32_t Nvfp4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorD
     (void) workspace;
     (void) stream;
     LOG_ERROR(
-        "Nvfp4MoePlugin: no CuTeDSL SM110 MoE backend is linked; rebuild "
+        "Nvfp4MoePlugin: no CuTeDSL SM100/101/110 MoE backend is linked; rebuild "
         "with -DENABLE_CUTE_DSL=nvfp4_moe");
     return -1;
 #else
@@ -745,7 +745,7 @@ int32_t Nvfp4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorD
     {
         if (!CuteDslNvfp4MoeSm110Runner::loadKernelModules())
         {
-            LOG_ERROR("Nvfp4MoePlugin: failed to load SM110 CuTe DSL AOT kernel modules");
+            LOG_ERROR("Nvfp4MoePlugin: failed to load SM100/101/110 CuTe DSL AOT kernel modules");
             return -1;
         }
 
@@ -808,7 +808,7 @@ int32_t Nvfp4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorD
             numTokens, maxRoutedRows, mNumExperts, mTopK, mHiddenSize, mMoeInterSize);
         if (runnerWs == 0)
         {
-            LOG_ERROR("Nvfp4MoePlugin: SM110 CuTeDSL backend returned zero workspace at enqueue");
+            LOG_ERROR("Nvfp4MoePlugin: SM100/101/110 CuTeDSL backend returned zero workspace at enqueue");
             return -1;
         }
         void* const runnerScratch = assignTensorFromWorkspace(
@@ -838,7 +838,7 @@ int32_t Nvfp4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorD
 
         (void) outputDesc;
 
-        // ==== Step 2: SM110 split FC1/FC2 MoE via CuTeDSL runner ====
+        // ==== Step 2: split FC1/FC2 MoE via CuTeDSL runner ====
         CuteDslNvfp4MoeSm110Params p{};
         p.numTokens = numTokens;
         p.numExperts = mNumExperts;
@@ -863,7 +863,7 @@ int32_t Nvfp4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorD
         int32_t const rc = runner.run(p, runnerScratch, stream);
         if (rc != 0)
         {
-            LOG_ERROR("Nvfp4MoePlugin: SM110 runner.run() failed with code %d", rc);
+            LOG_ERROR("Nvfp4MoePlugin: SM100/101/110 runner.run() failed with code %d", rc);
             return rc;
         }
         return 0;
@@ -925,7 +925,7 @@ IPluginV3* Nvfp4MoePlugin::attachToContext(IPluginResourceContext* context) noex
 #ifdef CUTE_DSL_NVFP4_MOE_ENABLED
     if (!CuteDslNvfp4MoeSm110Runner::loadKernelModules())
     {
-        LOG_ERROR("Nvfp4MoePlugin: attachToContext failed to load SM110 CuTe DSL AOT kernel modules");
+        LOG_ERROR("Nvfp4MoePlugin: attachToContext failed to load SM100/101/110 CuTe DSL AOT kernel modules");
         delete plugin;
         return nullptr;
     }

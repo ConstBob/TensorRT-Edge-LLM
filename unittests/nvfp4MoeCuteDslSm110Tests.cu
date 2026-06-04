@@ -41,7 +41,7 @@ namespace
 {
 
 // ---------------------------------------------------------------------------
-// SM110 NVFP4 MoE plugin constants. These mirror the runner constants in
+// NVFP4 MoE plugin constants. These mirror the runner constants in
 // cpp/kernels/moe/nvfp4_cutedsl/cuteDslNvfp4MoeSm110Runner.h so the C++
 // reference reads back exactly what the kernel consumes.
 // ---------------------------------------------------------------------------
@@ -65,6 +65,11 @@ inline float fp8BytesToFloat(uint8_t raw)
     __nv_fp8_e4m3 fp8;
     fp8.__x = raw;
     return static_cast<float>(static_cast<__half>(fp8));
+}
+
+inline bool isSupportedSm(int32_t sm)
+{
+    return sm == 100 || sm == 101 || sm == 110;
 }
 
 inline uint8_t floatToFp8Byte(float value)
@@ -605,13 +610,12 @@ Summary summarize(std::vector<float> const& got, std::vector<float> const& ref, 
 bool checkRequirementsAndLoad()
 {
     int32_t const sm = getSMVersion();
-    if (sm != 110)
+    if (!isSupportedSm(sm))
     {
         return false;
     }
     if (!CuteDslNvfp4MoeSm110Runner::canImplement(
-            /*hiddenSize=*/1024, /*moeInterSize=*/768, kNumExperts, kTopK, /*smVersion=*/110, kActSwiGLU, kIoDtypeFp16,
-            kBackendAuto))
+            /*hiddenSize=*/1024, /*moeInterSize=*/768, kNumExperts, kTopK, sm, kActSwiGLU, kIoDtypeFp16, kBackendAuto))
     {
         return false;
     }
@@ -637,16 +641,33 @@ std::vector<MoeCase> defaultCases()
 
 } // namespace
 
+TEST(CuteDslNvfp4MoeSm110Test, canImplementSupportedSms)
+{
+    for (int32_t const sm : {100, 101, 110})
+    {
+        EXPECT_TRUE(CuteDslNvfp4MoeSm110Runner::canImplement(
+            /*hiddenSize=*/1024, /*moeInterSize=*/768, kNumExperts, kTopK, sm, kActSwiGLU, kIoDtypeFp16, kBackendAuto))
+            << "sm=" << sm;
+        EXPECT_TRUE(CuteDslNvfp4MoeSm110Runner::canImplement(
+            /*hiddenSize=*/1024, /*moeInterSize=*/768, kNumExperts, kTopK, sm, kActReLU2, kIoDtypeFp16, kBackendAuto))
+            << "sm=" << sm;
+    }
+
+    EXPECT_FALSE(CuteDslNvfp4MoeSm110Runner::canImplement(
+        /*hiddenSize=*/1024, /*moeInterSize=*/768, kNumExperts, kTopK, /*smVersion=*/120, kActSwiGLU, kIoDtypeFp16,
+        kBackendAuto));
+}
+
 TEST(CuteDslNvfp4MoeSm110Test, smoke)
 {
     int32_t const sm = getSMVersion();
-    if (sm != 110)
+    if (!isSupportedSm(sm))
     {
-        GTEST_SKIP() << "SM110 NVFP4 MoE CuTeDSL runner test requires Thor SM110, got SM=" << sm;
+        GTEST_SKIP() << "SM100/101/110 NVFP4 MoE CuTeDSL runner test requires SM100, SM101, or SM110, got SM=" << sm;
     }
     if (!checkRequirementsAndLoad())
     {
-        GTEST_SKIP() << "Failed to load SM110 NVFP4 MoE CuTeDSL kernel modules or canImplement returned false";
+        GTEST_SKIP() << "Failed to load SM100/101/110 NVFP4 MoE CuTeDSL kernel modules or canImplement returned false";
     }
 
     for (auto const& cfg : defaultCases())
@@ -672,13 +693,13 @@ TEST(CuteDslNvfp4MoeSm110Test, smoke)
 TEST(CuteDslNvfp4MoeSm110Test, accuracy)
 {
     int32_t const sm = getSMVersion();
-    if (sm != 110)
+    if (!isSupportedSm(sm))
     {
-        GTEST_SKIP() << "SM110 NVFP4 MoE CuTeDSL runner test requires Thor SM110, got SM=" << sm;
+        GTEST_SKIP() << "SM100/101/110 NVFP4 MoE CuTeDSL runner test requires SM100, SM101, or SM110, got SM=" << sm;
     }
     if (!checkRequirementsAndLoad())
     {
-        GTEST_SKIP() << "Failed to load SM110 NVFP4 MoE CuTeDSL kernel modules or canImplement returned false";
+        GTEST_SKIP() << "Failed to load SM100/101/110 NVFP4 MoE CuTeDSL kernel modules or canImplement returned false";
     }
 
     // Loose-but-meaningful bands for NVFP4 MoE: cosine >= 0.94 catches sign /

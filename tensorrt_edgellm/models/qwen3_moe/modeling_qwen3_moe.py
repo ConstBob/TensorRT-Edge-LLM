@@ -322,7 +322,7 @@ class Qwen3SparseMoeBlock(nn.Module):
         CuTeDSL 6D MMA scale layout the kernel expects. FC1 SwiGLU layout
         is selected from :func:`use_geforce_nvfp4_moe`:
 
-        * SM110 ``Nvfp4MoePlugin`` -- 64-row up/gate interleave (default).
+        * SM100/101/110 ``Nvfp4MoePlugin`` -- 64-row up/gate interleave (default).
         * SM12x ``NvFP4MoEPluginGeforce`` -- plain ``[up_all, gate_all]``
           concat along the M axis.
         """

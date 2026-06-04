@@ -59,6 +59,11 @@ inline int64_t padUp64(int64_t value, int64_t alignment)
     return ((value + alignment - 1) / alignment) * alignment;
 }
 
+inline bool isSupportedSm(int32_t smVersion)
+{
+    return smVersion == 100 || smVersion == 101 || smVersion == 110;
+}
+
 inline int64_t maxPermutedRows(int64_t routedRows, int64_t numExperts)
 {
     return padUp64(routedRows + numExperts * (CuteDslNvfp4MoeSm110Runner::kRowTileAlign - 1),
@@ -140,7 +145,7 @@ bool CuteDslNvfp4MoeSm110Runner::canImplement(int32_t hiddenSize, int32_t moeInt
     int32_t topK, int32_t smVersion, int32_t activationType, int32_t ioDtype, int32_t backend)
 {
     (void) backend;
-    if (smVersion != 110 || ioDtype != kIODT_FP16)
+    if (!isSupportedSm(smVersion) || ioDtype != kIODT_FP16)
     {
         return false;
     }
@@ -190,12 +195,12 @@ bool CuteDslNvfp4MoeSm110Runner::loadKernelModules()
         nvfp4_moe_sm110_fc1_swiglu_n128_Kernel_Module_Load(&sFC1SwiGLUN128);
         nvfp4_moe_sm110_fc2_n128_fp16_Kernel_Module_Load(&sFC2N128Fp16);
         sLoaded = true;
-        LOG_DEBUG("CuTe DSL SM110 NVFP4 MoE modules loaded (FC1 relu2/swiglu n128 + FC2 n128 fp16)");
+        LOG_DEBUG("CuTe DSL SM100/101/110 NVFP4 MoE modules loaded (FC1 relu2/swiglu n128 + FC2 n128 fp16)");
         return true;
     }
     catch (...)
     {
-        LOG_ERROR("Failed to load CuTe DSL SM110 NVFP4 MoE modules");
+        LOG_ERROR("Failed to load CuTe DSL SM100/101/110 NVFP4 MoE modules");
         return false;
     }
 }

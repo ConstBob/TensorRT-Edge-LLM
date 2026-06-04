@@ -31,7 +31,7 @@
 namespace trt_edgellm
 {
 
-//! Per-launch parameters for the SM110 decomposed NVFP4 MoE path.
+//! Per-launch parameters for the SM100/SM101/SM110 decomposed NVFP4 MoE path.
 //! Device pointers are non-owning and follow the Nvfp4MoePlugin tensor ABI.
 struct CuteDslNvfp4MoeSm110Params
 {
@@ -62,7 +62,7 @@ struct CuteDslNvfp4MoeSm110Params
     int32_t activationType{};
 };
 
-//! Runner for the SM110 decomposed NVFP4 MoE backend.
+//! Runner for the SM100/SM101/SM110 decomposed NVFP4 MoE backend.
 //!
 //! Pipeline:
 //!   topK ids/weights provided by the plugin -> GPU layout build ->

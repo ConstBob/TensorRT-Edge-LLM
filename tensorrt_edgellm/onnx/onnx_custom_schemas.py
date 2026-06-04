@@ -1093,14 +1093,14 @@ _int4_moe_plugin_schema = OpSchema(
 )
 
 # ---------------------------------------------------------------------------
-# trt_edgellm::Nvfp4MoePlugin (SM110 split FC1/FC2, 64-row up/gate interleave)
+# trt_edgellm::Nvfp4MoePlugin (SM100/101/110 split FC1/FC2, 64-row up/gate interleave)
 # ---------------------------------------------------------------------------
 
 _nvfp4_moe_plugin_schema = OpSchema(
     name="Nvfp4MoePlugin",
     domain="trt_edgellm",
     since_version=_SCHEMA_SINCE_VERSION,
-    doc=("NVFP4 MoE plugin (CuTeDSL SM110/Thor split FC1/FC2): FP16 hidden "
+    doc=("NVFP4 MoE plugin (CuTeDSL SM100/101/110 split FC1/FC2): FP16 hidden "
          "states, FP4 expert weights with 64-row up/gate interleaved FC1, "
          "and FP8 block scales in 6D MMA layout."),
     inputs=[
