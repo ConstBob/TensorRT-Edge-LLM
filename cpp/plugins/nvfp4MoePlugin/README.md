@@ -1,10 +1,10 @@
 # Nvfp4MoePlugin
 
-TensorRT plugin that wraps the SM110 (Thor) decomposed split FC1/FC2
+TensorRT plugin that wraps the SM100/SM101/SM110 decomposed split FC1/FC2
 NVFP4 MoE kernel in
 [`kernelSrcs/nvfp4_moe_cutedsl/`](../../../kernelSrcs/nvfp4_moe_cutedsl/).
 
-This plugin is the **SM110 (Thor)** counterpart of
+This plugin is the **SM100/SM101/SM110** counterpart of
 [`NvFP4MoEPluginGeforce`](../nvfp4MoePluginGeforce/nvfp4MoePluginGeforce.cpp),
 which targets **SM120 / SM121 (consumer Blackwell)** via the fused
 CuTeDSL path.
@@ -15,7 +15,7 @@ attribute set, but consume **different on-disk weight layouts**:
 * `Nvfp4MoePlugin` (this plugin) expects FC1 packed as the 64-row
   up/gate interleave
   ``[up_chunk(64), gate_chunk(64), up_chunk(64), ...]`` along the M
-  axis (the layout the SM110 split FC1 kernel reads natively).
+  axis (the layout the split FC1 kernel reads natively).
 * `NvFP4MoEPluginGeforce` expects FC1 packed as the plain
   ``[up_all, gate_all]`` concat along the M axis (the layout the SM12x
   fused CuTeDSL kernel reads natively).
@@ -25,7 +25,7 @@ based on the target arch.
 
 ## Supported shapes
 
-The SM110 split FC1/FC2 pack is specialized to `E=128` and `top_k<=8`;
+The split FC1/FC2 pack is specialized to `E=128` and `top_k<=8`;
 hidden size and intermediate size stay runtime dimensions subject to the
 alignment contract below. The n128 tactic is selected; n256 artifacts
 may be generated but are not dispatched yet.
@@ -33,6 +33,7 @@ may be generated but are not dispatched yet.
 | Parameter | Supported values |
 |---|---|
 | `io_dtype` | FP16 |
+| `SM` | 100, 101, 110 |
 | `activation_type` | swiglu, relu2 |
 | `routing_mode` | 0=softmax top-k (Qwen3), 1=sigmoid grouped top-k (Nemotron-H) |
 | `backend` | decode + prefill (`auto` picks decode when `num_tokens*top_k` is small) |
@@ -48,8 +49,12 @@ rules, emitting a clear error when they are violated.
 ## Files
 
 - [`nvfp4MoePlugin.h`](nvfp4MoePlugin.h) / [`nvfp4MoePlugin.cpp`](nvfp4MoePlugin.cpp) — the `IPluginV3` implementation.
-- [`../../kernels/moe/nvfp4_cutedsl/cuteDslNvfp4MoeSm110Runner.{h,cpp}`](../../kernels/moe/nvfp4_cutedsl/) — the SM110 AOT-module owner: module load/unload, shape-check, workspace layout, and split FC1 / FC2 dispatch.
-- [`../../../kernelSrcs/nvfp4_moe_cutedsl/README.md`](../../../kernelSrcs/nvfp4_moe_cutedsl/README.md) — SM110 split FC1/FC2 kernel variants, AOT build flow, and data-layout notes (including the one-time CuTeDSL 4.5.2 SM110a admission patch).
+- [`../../kernels/moe/nvfp4_cutedsl/cuteDslNvfp4MoeSm110Runner.{h,cpp}`](../../kernels/moe/nvfp4_cutedsl/)
+  — the SM100/101/110 AOT-module owner: module load/unload,
+  shape-check, workspace layout, and split FC1 / FC2 dispatch.
+- [`../../../kernelSrcs/nvfp4_moe_cutedsl/README.md`](../../../kernelSrcs/nvfp4_moe_cutedsl/README.md)
+  — split FC1/FC2 kernel variants, AOT build flow, and data-layout notes
+  (including the one-time CuTeDSL 4.5.2 SM110a admission patch).
 
 ## ONNX input surface
 
@@ -101,7 +106,7 @@ in build-only environments).
 
 ## Retargeting other shapes
 
-The SM110 split FC1/FC2 pack is specialized to `E=128` and `top_k<=8`;
+The split FC1/FC2 pack is specialized to `E=128` and `top_k<=8`;
 hidden size and intermediate size stay runtime dimensions subject to the
 alignment contract above.
 
@@ -113,11 +118,11 @@ and rebuild.
 
 ## Validation
 
-The SM110 plugin accuracy entry is
-[`tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py`](../../../tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py).
+The split-path plugin accuracy entry is
+[the SM100/101/110 plugin accuracy test](../../../tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py).
 Avoid validating production routing by instantiating Python-only helper
 modules directly; model integration should be tested at the export path
-that explicitly emits `Nvfp4MoePlugin` for an SM110 target.
+that explicitly emits `Nvfp4MoePlugin` for an SM100/101/110 target.
 
 ### Thor sign-off checklist (runner-test equivalent)
 
@@ -126,5 +131,5 @@ that explicitly emits `Nvfp4MoePlugin` for an SM110 target.
    [`kernelSrcs/nvfp4_moe_cutedsl/README.md`](../../../kernelSrcs/nvfp4_moe_cutedsl/README.md)).
 3. `python kernelSrcs/build_cutedsl.py --kernels nvfp4_moe --gpu_arch sm_110 --arch aarch64 --clean`
 4. Build the plugin with `-DENABLE_CUTE_DSL=nvfp4_moe -DCMAKE_CUDA_ARCHITECTURES=110a`.
-5. Run the SM110 plugin accuracy test
+5. Run the split-path plugin accuracy test
    (`tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py`).

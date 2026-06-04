@@ -462,7 +462,7 @@ class NemotronHMoEMLP(nn.Module):
         # does not satisfy that (e.g. Nemotron-Nano H=2688), ``_prepare_for_export_impl``
         # picks ``hidden_size_alignment=256`` so the FC1 K and FC2 M axes get
         # zero-padded; ``forward`` then F.pads hidden_states and slices the
-        # plugin output. SM110 keeps the original H.
+        # plugin output. The SM100/101/110 path keeps the original H.
         self._padded_hidden_size = self.hidden_size
         self.gate = NemotronHTopkRouter(config)
 
@@ -507,7 +507,7 @@ class NemotronHMoEMLP(nn.Module):
         """Pack ModelOpt NVFP4 expert tensors for the active NVFP4 MoE plugin."""
         from ...checkpoint.repacking import repack_nvfp4_nemotron_moe_experts
 
-        # SM12x NvFP4MoEPluginGeforce requires H % 256 == 0; SM110 only needs
+        # SM12x NvFP4MoEPluginGeforce requires H % 256 == 0; the SM100/101/110 path only needs
         # the kernel's regular alignment (the repack helper accepts H as-is
         # when ``hidden_size_alignment=1``).
         hidden_size_alignment = 256 if use_geforce_nvfp4_moe() else 1
@@ -574,7 +574,7 @@ class NemotronHMoEMLP(nn.Module):
 
         # Nemotron-H uses ReLU2 (non-gated) FC1, so the up-only weight tensor
         # has the same row layout under both plugins; only the plugin op name
-        # differs between SM110 ``Nvfp4MoePlugin`` and SM12x
+        # differs between SM100/101/110 ``Nvfp4MoePlugin`` and SM12x
         # ``NvFP4MoEPluginGeforce``.
         moe_op = (nvfp4_moe_plugin_geforce
                   if use_geforce_nvfp4_moe() else nvfp4_moe_plugin)

@@ -725,7 +725,7 @@ def _interleave_qwen3_swiglu_fc1(
     """Build FC1 dense weight as 64-row interleaved up/gate chunks.
 
     Layout: ``[up_chunk(64), gate_chunk(64), up_chunk(64), gate_chunk(64), ...]``
-    along the M axis. Consumed natively by the SM110 ``Nvfp4MoePlugin`` split
+    along the M axis. Consumed natively by the SM100/101/110 ``Nvfp4MoePlugin`` split
     FC1 kernel.
     """
     if gate_dense.shape != up_dense.shape:
@@ -795,7 +795,7 @@ def repack_nvfp4_qwen3_moe_experts(
         moe_inter_size: per-expert intermediate size ``I``.
         group_size: NVFP4 K-axis group size (must be ``16``).
         fc1_layout: SwiGLU FC1 row layout.
-            * ``"interleave"`` (default) -- ``Nvfp4MoePlugin`` (SM110): 64-row
+            * ``"interleave"`` (default) -- ``Nvfp4MoePlugin`` (SM100/101/110): 64-row
               up/gate interleaved chunks along the M axis.
             * ``"concat"`` -- ``NvFP4MoEPluginGeforce`` (SM12x): plain
               ``[up_all, gate_all]`` concat along the M axis.
@@ -810,7 +810,7 @@ def repack_nvfp4_qwen3_moe_experts(
     else:
         raise ValueError(
             f"fc1_layout={fc1_layout!r} not recognized; use "
-            "'interleave' (SM110 Nvfp4MoePlugin) or 'concat' (SM12x "
+            "'interleave' (SM100/101/110 Nvfp4MoePlugin) or 'concat' (SM12x "
             "NvFP4MoEPluginGeforce)")
 
     fc1_qweights = []
