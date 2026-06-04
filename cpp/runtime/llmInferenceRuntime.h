@@ -31,6 +31,7 @@
 #include "runtime/features/deepstackBinding.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/preprocess/embeddingPreprocessor.h"
+#include "runtime/preprocess/gemma4EmbeddingPreprocessor.h"
 #include "runtime/preprocess/stepPreparer.h"
 #include "runtime/state/decodingInferenceContext.h"
 #include "runtime/state/pipelineIO.h"
@@ -232,8 +233,9 @@ private:
     TensorMap mBaseTensorMap;                          //!< Base engine binding map
     std::unique_ptr<DecodingRuntimeContext> mDecodingRuntimeContext;
     std::unique_ptr<DecoderRegistry> mDecoderRegistry;
-    std::unique_ptr<StepPreparer> mStepPreparer;          //!< Per-step sequence preprocessor
-    std::unique_ptr<EmbeddingPreprocessor> mEmbeddingPre; //!< Embedding-lookup preprocessor
+    std::unique_ptr<StepPreparer> mStepPreparer;             //!< Per-step sequence preprocessor
+    std::unique_ptr<EmbeddingPreprocessor> mEmbeddingPre;    //!< Embedding-lookup preprocessor
+    std::unique_ptr<Gemma4EmbeddingPreprocessor> mGemma4Ple; //!< Gemma4 PLE token-identity preprocessor
     //! Base-engine deepstack binding (nullptr when the base engine was built
     //! without deepstack features). Swaps between `io.deepstackEmbeds[i]`
     //! (prefill) and the shared `zeroDeepstackBroadcast` (all other phases).

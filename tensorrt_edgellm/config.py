@@ -288,6 +288,8 @@ class ModelConfig:
     original_max_position_embeddings: Optional[int] = None
     # Fraction of head_dim used for RoPE (e.g. 0.75 for phi3/phi4, 1.0 for most others).
     partial_rotary_factor: float = 1.0
+    # Hidden activation name used by architecture-specific auxiliary modules.
+    hidden_activation: str = "silu"
     # ------------------------------------------ model-family feature flags
     # Per-head RMSNorm after Q and K projections.
     # Auto-detected from checkpoint key names; not inferred from model_type.
@@ -361,6 +363,14 @@ class ModelConfig:
     # Runtime vocabulary reduction. ``vocab_size`` remains the original
     # tokenizer/embedding size; this field is only the exported logits size.
     reduced_vocab_size: Optional[int] = None
+    # ------------------------------------------ per-layer embeddings (Gemma4)
+    # When > 0, Gemma4 E-model PLE is enabled. The ONNX graph receives
+    # one runtime-provided ple_token_embeds_* tensor per decoder layer and
+    # combines it with the context-aware projection from inputs_embeds.
+    hidden_size_per_layer_input: int = 0
+    # Gemma4 E-model vocabulary for the runtime-side token-identity PLE table.
+    # The table is exported as ple_embedding.safetensors and gathered by C++.
+    vocab_size_per_layer_input: int = 0
     # ------------------------------------------ tensor parallel
     # ``mapping`` is the single source of truth for parallel placement.
     # tp_size>1 returns a per-rank ONNX graph with col/row-parallel projections.
@@ -392,6 +402,11 @@ class ModelConfig:
     @property
     def is_dflash_draft(self) -> bool:
         return self.is_dflash_draft_flag
+
+    @property
+    def ple_enabled(self) -> bool:
+        """True when Gemma4 per-layer embeddings are enabled."""
+        return self.hidden_size_per_layer_input > 0
 
     @property
     def eagle3_target_hidden_size(self) -> int:
@@ -559,6 +574,8 @@ class ModelConfig:
             original_max_position_embeddings=llm_dict.get(
                 "original_max_position_embeddings", None),
             partial_rotary_factor=_get_partial_rotary_factor(llm_dict),
+            hidden_activation=llm_dict.get("hidden_activation",
+                                           llm_dict.get("hidden_act", "silu")),
             has_qk_norm=has_qk_norm,
             attention_bias=bool(llm_dict.get("attention_bias", False)),
             torch_dtype=llm_dict.get("torch_dtype",
@@ -590,6 +607,10 @@ class ModelConfig:
             decoder_sparse_step=decoder_sparse_step,
             mlp_only_layers=mlp_only_layers,
             norm_topk_prob=norm_topk_prob,
+            hidden_size_per_layer_input=int(
+                llm_dict.get("hidden_size_per_layer_input", 0) or 0),
+            vocab_size_per_layer_input=int(
+                llm_dict.get("vocab_size_per_layer_input", 0) or 0),
         )
 
 

@@ -244,6 +244,12 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
         LOG_ERROR("Failed to allocate runtime tensors: %s", e.what());
         throw std::runtime_error("Failed to allocate runtime tensors: " + std::string(e.what()));
     }
+    if (mDeployment.base.pleEnabled)
+    {
+        int32_t const maxPleSeqLen = std::max(maxInputLength, std::max(1, mDeployment.base.maxVerifyTreeSize));
+        mGemma4Ple = std::make_unique<Gemma4EmbeddingPreprocessor>(std::filesystem::path(engineDir), mDeployment.base,
+            mMaxRuntimeBatchSize, maxPleSeqLen, mBaseTensorMap, stream);
+    }
     LOG_INFO("Runtime tensors successfully allocated.");
 
     // -----------------------------------------------------------------------
@@ -387,7 +393,8 @@ void LLMInferenceRuntime::buildDecodingRuntimeContext()
         *mSharedResources->cacheManagers[0], *mPipelineIO, [this](InferenceDims const& dims, cudaStream_t stream) {
             return captureBaseGraphWithLoraFanout(dims, stream);
         }};
-    PreprocessResources preprocessResources{*mStepPreparer, *mEmbeddingPre, mEmbedding, mIdsInput, mDeepstack.get()};
+    PreprocessResources preprocessResources{
+        *mStepPreparer, *mEmbeddingPre, mEmbedding, mIdsInput, mDeepstack.get(), mGemma4Ple.get()};
     SamplingBuffers sampling{mSamplingWorkspace, mSamplingIndices, mSamplingScores, mBaseVocabMappingTable,
         mHostPackedTokenIds, mHostSelectedTokenIds};
     mDecodingRuntimeContext.reset(new DecodingRuntimeContext{
@@ -1119,6 +1126,10 @@ bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context)
     // deepstack slots are populated from features or zero-filled depending on the request.
     mEmbeddingPre->embed(mIdsInput, context.visualEmbeddings, context.audioEmbeddings, *mPipelineIO, context.stream);
     mEmbeddingPre->prepareDeepstack(mIdsInput, context.deepstackFeatures, *mPipelineIO, context.stream);
+    if (mGemma4Ple)
+    {
+        mGemma4Ple->embed(mIdsInput, context.stream);
+    }
 
     // Dispatch per-step sequence prep (context lengths H2D, selectTokenIndices).
     mStepPreparer->prepare(

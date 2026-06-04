@@ -25,6 +25,7 @@
 #include "runtime/hybridCacheManager.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/preprocess/embeddingPreprocessor.h"
+#include "runtime/preprocess/gemma4EmbeddingPreprocessor.h"
 #include "runtime/preprocess/stepPreparer.h"
 #include "runtime/state/decodingInferenceContext.h"
 #include "runtime/state/pipelineIO.h"
@@ -80,6 +81,7 @@ struct PreprocessResources
     EmbeddingData& embedding;
     Tensor& idsInput;
     DeepstackBinding* deepstack;
+    Gemma4EmbeddingPreprocessor* gemma4Ple;
 };
 
 struct DecodingRuntimeContext

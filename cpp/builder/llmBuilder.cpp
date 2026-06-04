@@ -426,6 +426,9 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
         result &= setupIntermediateConvStateProfiles(*contextProfile, *generationProfile);
     }
 
+    // Setup Gemma4 PLE profiles when ple_token_embeds_* inputs are present.
+    result &= setupPleProfiles(*contextProfile, *generationProfile, network);
+
     // Setup Deepstack profiles for Qwen3VL models
     result &= setupDeepstackProfiles(*contextProfile, *generationProfile, network);
 
@@ -678,6 +681,65 @@ bool LLMBuilder::setupDFlashDraftProfiles(
     return result;
 }
 
+bool LLMBuilder::setupPleProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+    nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network)
+{
+    bool result = true;
+    bool foundPleInput = false;
+    std::string const prefix = binding_names::kPleTokenEmbedsTemplate;
+
+    for (int32_t idx = 0; idx < network.getNbInputs(); ++idx)
+    {
+        auto const* input = network.getInput(idx);
+        std::string const inputName = input->getName();
+        if (inputName.rfind(prefix, 0) != 0 || inputName.size() <= prefix.size() || inputName[prefix.size()] != '_')
+        {
+            continue;
+        }
+        foundPleInput = true;
+
+        auto const inputDims = input->getDimensions();
+        if (inputDims.nbDims != 3 || inputDims.d[2] <= 0)
+        {
+            LOG_ERROR("PLE input %s must be rank-3 [batch, seq_len, hidden] with static hidden dimension.",
+                inputName.c_str());
+            result = false;
+            continue;
+        }
+
+        int64_t const pleHiddenSize = inputDims.d[2];
+        result &= setOptimizationProfile(&contextProfile, inputName.c_str(), createDims({1, 1, pleHiddenSize}),
+            createDims(
+                {mBuilderConfig.maxBatchSize, std::max<int64_t>(1, mBuilderConfig.maxInputLen / 2), pleHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, pleHiddenSize}));
+
+        if (mBuilderConfig.specBase || mBuilderConfig.specDraft)
+        {
+            int64_t const maxTokens
+                = mBuilderConfig.specDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
+            result &= setOptimizationProfile(&generationProfile, inputName.c_str(), createDims({1, 1, pleHiddenSize}),
+                createDims({mBuilderConfig.maxBatchSize, std::max<int64_t>(1, maxTokens / 2), pleHiddenSize}),
+                createDims({mBuilderConfig.maxBatchSize, maxTokens, pleHiddenSize}));
+        }
+        else
+        {
+            result &= setOptimizationProfile(&generationProfile, inputName.c_str(), createDims({1, 1, pleHiddenSize}),
+                createDims({mBuilderConfig.maxBatchSize, 1, pleHiddenSize}),
+                createDims({mBuilderConfig.maxBatchSize, 1, pleHiddenSize}));
+        }
+    }
+
+    if (foundPleInput)
+    {
+        LOG_INFO("Configured optimization profiles for Gemma4 PLE inputs.");
+    }
+    if (!result)
+    {
+        LOG_ERROR("Failed to setup optimization profiles at setupPleProfiles().");
+    }
+    return result;
+}
+
 bool LLMBuilder::setupDeepstackProfiles(nvinfer1::IOptimizationProfile& contextProfile,
     nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network)
 {
@@ -799,7 +861,7 @@ bool LLMBuilder::setupLoraProfiles(nvinfer1::IOptimizationProfile& contextProfil
     for (int i = 0; i < network.getNbInputs(); ++i)
     {
         auto* input = network.getInput(i);
-        std::string inputName = input->getName();
+        std::string const inputName = input->getName();
 
         if (inputName.find(binding_names::kLoraAPrefix) != std::string::npos)
         {
@@ -1262,6 +1324,22 @@ bool LLMBuilder::copyEmbeddingFile()
         LOG_ERROR(
             "Failed to copy embedding.safetensors from %s to %s", embeddingPath.c_str(), targetEmbeddingPath.c_str());
         return false;
+    }
+
+    if (mModelConfig.value("ple_enabled", false))
+    {
+        std::string const plePath = (mOnnxDir / binding_names::kPleEmbeddingFileName).string();
+        std::string const targetPlePath = (mEngineDir / binding_names::kPleEmbeddingFileName).string();
+        if (file_io::copyFile(plePath, targetPlePath))
+        {
+            LOG_INFO("Copied %s to %s", binding_names::kPleEmbeddingFileName, targetPlePath.c_str());
+        }
+        else
+        {
+            LOG_ERROR("Failed to copy %s from %s to %s", binding_names::kPleEmbeddingFileName, plePath.c_str(),
+                targetPlePath.c_str());
+            return false;
+        }
     }
 
     return true;

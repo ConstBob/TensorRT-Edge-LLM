@@ -19,7 +19,9 @@
 #include "common/stringUtils.h"
 #include "embeddingKernels.h"
 #include "kernels/common/vectorizedTypes.cuh"
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <limits>
 #if SUPPORTS_FP8
 #include <cuda_fp8.h>
 #endif
@@ -455,6 +457,63 @@ void launchEmbeddingLookupMultimodalKernel(int32_t const* inputIds, TLoader cons
 
 } // namespace
 
+template <typename T>
+__global__ void gemma4PleGatherKernel(int32_t const* inputIds, T const* pleTable, T* outputBuffer,
+    int64_t layerOutputCapacity, int64_t batchSize, int64_t seqLen, int32_t vocabSize, int32_t numLayers,
+    int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId)
+{
+    int64_t const seqIdx = blockIdx.x;
+    int64_t const batchIdx = blockIdx.y;
+    int32_t const layerIdx = blockIdx.z;
+
+    if (batchIdx >= batchSize || seqIdx >= seqLen || layerIdx >= numLayers)
+    {
+        return;
+    }
+
+    int64_t const tokenOffset = batchIdx * seqLen + seqIdx;
+    int32_t const tokenId = inputIds[tokenOffset];
+    bool const zeroFill = tokenId < 0 || tokenId >= vocabSize || (imageTokenId >= 0 && tokenId == imageTokenId)
+        || (audioTokenId >= 0 && tokenId == audioTokenId);
+
+    int64_t const outputOffset = static_cast<int64_t>(layerIdx) * layerOutputCapacity + tokenOffset * pleHiddenSize;
+    int64_t const tableOffset = (static_cast<int64_t>(tokenId) * numLayers + layerIdx) * pleHiddenSize;
+
+    constexpr uint32_t kVecSize = DVec<T>::vec_size;
+    for (int32_t hiddenIdx = threadIdx.x * kVecSize; hiddenIdx < pleHiddenSize; hiddenIdx += blockDim.x * kVecSize)
+    {
+        DVec<T> valueVec;
+        if (zeroFill)
+        {
+#pragma unroll
+            for (uint32_t i = 0; i < kVecSize; ++i)
+            {
+                valueVec[i] = T{};
+            }
+        }
+        else
+        {
+            valueVec.load(pleTable + tableOffset + hiddenIdx);
+        }
+        valueVec.store(outputBuffer + outputOffset + hiddenIdx);
+    }
+}
+
+template <typename T>
+void launchGemma4PleGather(int32_t const* inputIds, T const* pleTable, T* outputBuffer, int64_t layerOutputCapacity,
+    int64_t batchSize, int64_t seqLen, int32_t vocabSize, int32_t numLayers, int32_t pleHiddenSize,
+    int32_t imageTokenId, int32_t audioTokenId, cudaStream_t stream)
+{
+    constexpr uint32_t kVecSize = DVec<T>::vec_size;
+    check::check(pleHiddenSize % kVecSize == 0,
+        format::fmtstr("pleHiddenSize must be a multiple of %d for vectorized access", kVecSize));
+
+    dim3 const grid(seqLen, batchSize, numLayers);
+    dim3 const block(256);
+    gemma4PleGatherKernel<<<grid, block, 0, stream>>>(inputIds, pleTable, outputBuffer, layerOutputCapacity, batchSize,
+        seqLen, vocabSize, numLayers, pleHiddenSize, imageTokenId, audioTokenId);
+}
+
 void embeddingLookup(rt::Tensor const& inputIds, rt::Tensor const& embeddingTable, rt::OptionalInputTensor scales,
     rt::Tensor& output, cudaStream_t stream)
 {
@@ -787,6 +846,53 @@ void embeddingLookupMultimodal(rt::Tensor const& inputIds, rt::Tensor const& emb
         launchEmbeddingLookupMultimodalKernel(inputIdsPtr, loader, multimodalIndicesPtr, imageTokenIdValue,
             imageEmbedsPtr, imageTokenLen, audioTokenIdValue, audioEmbedsPtr, audioTokenLen, outputPtr, batchSize,
             seqLen, vocabSize, hiddenSize, stream);
+    }
+}
+
+void gemma4PleGather(rt::Tensor const& inputIds, rt::Tensor const& pleTable, rt::Tensor& outputBuffer,
+    int32_t numLayers, int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId, cudaStream_t stream)
+{
+    auto const inputShape = inputIds.getShape();
+    auto const tableShape = pleTable.getShape();
+    auto const outputShape = outputBuffer.getShape();
+
+    check::check(inputShape.getNumDims() == 2, "inputIds must be 2D tensor [batchSize, seqLen]");
+    check::check(tableShape.getNumDims() == 2, "pleTable must be 2D tensor [vocabSize, numLayers * pleHiddenSize]");
+    check::check(outputShape.getNumDims() == 4,
+        "outputBuffer must be 4D tensor [numLayers, maxBatchSize, maxSeqLen, pleHiddenSize]");
+    check::check(inputIds.getDataType() == nvinfer1::DataType::kINT32, "inputIds must be INT32");
+    check::check(outputBuffer.getDataType() == pleTable.getDataType(), "outputBuffer dtype must match pleTable dtype");
+    check::check(numLayers > 0, "numLayers must be positive");
+    check::check(pleHiddenSize > 0, "pleHiddenSize must be positive");
+    check::check(outputShape[0] == numLayers, "outputBuffer first dimension must match numLayers");
+    check::check(outputShape[3] == pleHiddenSize, "outputBuffer hidden dimension must match pleHiddenSize");
+    check::check(tableShape[1] == static_cast<int64_t>(numLayers) * pleHiddenSize,
+        "pleTable second dimension must match numLayers * pleHiddenSize");
+    check::check(tableShape[0] <= std::numeric_limits<int32_t>::max(), "pleTable vocab dimension exceeds int32 range");
+    check::check(
+        pleTable.getDataType() == nvinfer1::DataType::kHALF || pleTable.getDataType() == nvinfer1::DataType::kBF16,
+        "pleTable must be FP16 or BF16");
+
+    int64_t const batchSize = inputShape[0];
+    int64_t const seqLen = inputShape[1];
+    check::check(batchSize <= outputShape[1], "inputIds batch size exceeds outputBuffer capacity");
+    check::check(seqLen <= outputShape[2], "inputIds sequence length exceeds outputBuffer capacity");
+
+    int64_t const layerOutputCapacity = outputShape[1] * outputShape[2] * pleHiddenSize;
+    int32_t const vocabSize = static_cast<int32_t>(tableShape[0]);
+    int32_t const* inputIdsPtr = inputIds.dataPointer<int32_t>();
+
+    if (pleTable.getDataType() == nvinfer1::DataType::kHALF)
+    {
+        launchGemma4PleGather(inputIdsPtr, pleTable.dataPointer<half>(), outputBuffer.dataPointer<half>(),
+            layerOutputCapacity, batchSize, seqLen, vocabSize, numLayers, pleHiddenSize, imageTokenId, audioTokenId,
+            stream);
+    }
+    else
+    {
+        launchGemma4PleGather(inputIdsPtr, pleTable.dataPointer<__nv_bfloat16>(),
+            outputBuffer.dataPointer<__nv_bfloat16>(), layerOutputCapacity, batchSize, seqLen, vocabSize, numLayers,
+            pleHiddenSize, imageTokenId, audioTokenId, stream);
     }
 }
 

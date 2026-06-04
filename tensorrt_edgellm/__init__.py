@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -37,6 +37,7 @@ from .checkpoint.loader import load_weights
 from .config import ModelConfig, QuantConfig
 from .model import AutoModel, register_model
 # Register model-type-specific implementations
+from .models.gemma4.modeling_gemma4_text import Gemma4ForCausalLM
 from .models.nemotron_h.modeling_nemotron_h import NemotronHCausalLM
 from .models.qwen3_5.modeling_qwen3_5_text import Qwen3_5CausalLM
 from .models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeCausalLM
@@ -45,6 +46,8 @@ from .models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeCausalLM
 from .models.qwen3_omni.modeling_qwen3_omni_text import Qwen3OmniLanguageModel
 from .onnx.export import export_onnx
 
+register_model("gemma4", Gemma4ForCausalLM)
+register_model("gemma4_text", Gemma4ForCausalLM)
 register_model("nemotron_h", NemotronHCausalLM)
 register_model("qwen3_5_text", Qwen3_5CausalLM)
 register_model("qwen3_5_moe_text", Qwen3_5MoeCausalLM)

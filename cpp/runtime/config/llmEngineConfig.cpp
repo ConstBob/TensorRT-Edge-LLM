@@ -383,6 +383,9 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     cfg.outputVocabSize = (cfg.reducedVocabSize > 0) ? cfg.reducedVocabSize : cfg.vocabSize;
 
     cfg.numDeepstackFeatures = configJson.value("num_deepstack_features", 0);
+    cfg.pleEnabled = configJson.value("ple_enabled", false);
+    cfg.numPleInputs = configJson.value("num_ple_inputs", 0);
+    cfg.pleHiddenSize = configJson.value("ple_hidden_size", 0);
     cfg.audioTokenId = configJson.value("audio_token_id", -1);
     cfg.imageTokenId = configJson.value("image_token_id", -1);
 
@@ -418,6 +421,23 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     // Base-specific positivity checks (beyond parseCoreFields's core set).
     requirePositive(cfg.rotaryDim, "rotary_dim");
     requirePositive(cfg.vocabSize, "vocab_size");
+    ELLM_CHECK(cfg.numPleInputs >= 0,
+        "parseEngineConfig: invalid num_ple_inputs: " + std::to_string(cfg.numPleInputs) + " (must be non-negative)");
+    ELLM_CHECK(cfg.pleHiddenSize >= 0,
+        "parseEngineConfig: invalid ple_hidden_size: " + std::to_string(cfg.pleHiddenSize) + " (must be non-negative)");
+    if (cfg.pleEnabled)
+    {
+        requirePositive(cfg.numPleInputs, "num_ple_inputs");
+        requirePositive(cfg.pleHiddenSize, "ple_hidden_size");
+        ELLM_CHECK(cfg.numPleInputs == cfg.numDecoderLayers,
+            "parseEngineConfig: Gemma4 PLE expects num_ple_inputs to match num_hidden_layers; got "
+                + std::to_string(cfg.numPleInputs) + " and " + std::to_string(cfg.numDecoderLayers));
+    }
+    else
+    {
+        ELLM_CHECK(cfg.numPleInputs == 0 && cfg.pleHiddenSize == 0,
+            "parseEngineConfig: ple_enabled is false but num_ple_inputs or ple_hidden_size is non-zero");
+    }
     ELLM_CHECK(cfg.maxSupportedLoraRank >= 0,
         "parseEngineConfig: invalid max_lora_rank: " + std::to_string(cfg.maxSupportedLoraRank)
             + " (must be non-negative)");
@@ -531,8 +551,10 @@ std::string formatEngineConfig(LLMEngineConfig const& cfg)
        << " numAttentionLayers=" << cfg.numAttentionLayers << " numKVHeads=" << cfg.numKVHeads
        << " headDim=" << cfg.headDim << " rotaryDim=" << cfg.rotaryDim << " maxBatch=" << cfg.maxSupportedBatchSize
        << " maxInputLen=" << cfg.maxSupportedInputLength << " maxKVCapacity=" << cfg.maxKVCacheCapacity
-       << " useTrtNativeOps=" << cfg.useTrtNativeOps << " isSpecDecodeBase=" << cfg.isSpecDecodeBase
-       << " specDecodeType=" << static_cast<int>(cfg.specDecodeType) << " loraRank=" << cfg.maxSupportedLoraRank;
+       << " pleEnabled=" << cfg.pleEnabled << " numPleInputs=" << cfg.numPleInputs
+       << " pleHiddenSize=" << cfg.pleHiddenSize << " useTrtNativeOps=" << cfg.useTrtNativeOps
+       << " isSpecDecodeBase=" << cfg.isSpecDecodeBase << " specDecodeType=" << static_cast<int>(cfg.specDecodeType)
+       << " loraRank=" << cfg.maxSupportedLoraRank;
 
     if (cfg.numLinearAttnLayers > 0)
     {

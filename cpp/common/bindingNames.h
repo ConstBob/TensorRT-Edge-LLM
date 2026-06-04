@@ -44,6 +44,14 @@ namespace binding_names
 inline constexpr char const* kInputsEmbeds = "inputs_embeds";
 
 /*!
+ * @brief Gemma4 per-layer token-identity embedding input template.
+ *
+ * Template: "ple_token_embeds_{layer_idx}"
+ * Shape: [batch_size, sequence_length, ple_hidden_size] (FLOAT16/BFLOAT16)
+ */
+inline constexpr char const* kPleTokenEmbedsTemplate = "ple_token_embeds";
+
+/*!
  * @brief Context lengths tensor - specifies the actual length of each sequence in the batch
  *
  * Shape: [batch_size] (INT32)
@@ -84,6 +92,14 @@ inline constexpr char const* kDFlashTargetHiddenConcat = "dflash_target_hidden_c
  * Shape: [batch_size] (INT32)
  */
 inline constexpr char const* kDFlashDeltaLengths = "dflash_delta_lengths";
+
+/*!
+ * @brief Gemma4 PLE token-identity embedding table sidecar.
+ *
+ * Contains tensor "weight" with shape [vocab_size_per_layer_input,
+ * num_ple_inputs * ple_hidden_size].
+ */
+inline constexpr char const* kPleEmbeddingFileName = "ple_embedding.safetensors";
 
 /*! @} */
 
@@ -673,6 +689,17 @@ inline std::string formatDeepstackFeaturesName(int32_t layerIdx)
 inline std::string formatDeepstackEmbedsName(int32_t embedIdx)
 {
     return std::string(kDeepstackEmbedsTemplate) + "_" + std::to_string(embedIdx);
+}
+
+/*!
+ * @brief Format Gemma4 PLE token embedding input binding name.
+ *
+ * @param layerIdx The decoder layer index
+ * @return Formatted binding name like "ple_token_embeds_0"
+ */
+inline std::string formatPleTokenEmbedsName(int32_t layerIdx)
+{
+    return std::string(kPleTokenEmbedsTemplate) + "_" + std::to_string(layerIdx);
 }
 
 /*! @} */

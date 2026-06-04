@@ -220,6 +220,10 @@ bool MTPDecoder::runDraftModelPrefill(DecodingInferenceContext& context)
         kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
             mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
     }
+    if (mRuntime.preprocess.gemma4Ple)
+    {
+        mRuntime.preprocess.gemma4Ple->embed(mRuntime.preprocess.idsInput, context.stream);
+    }
 
     int32_t* ctxLenData = mRuntime.base.pipelineIO.hostContextLengths.dataPointer<int32_t>();
     for (int32_t i = 0; i < activeBatchSize; ++i)
@@ -452,6 +456,10 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
         "Tensor reshape failed");
     kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
         mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
+    if (mRuntime.preprocess.gemma4Ple)
+    {
+        mRuntime.preprocess.gemma4Ple->embed(mRuntime.preprocess.idsInput, context.stream);
+    }
 
     int32_t const selectTokenSize = activeBatchSize * mRuntime.deployment.specConfig->verifySize;
     check::check(
@@ -581,6 +589,10 @@ bool MTPDecoder::runDraftModelAcceptToken(DecodingInferenceContext& context)
         "Tensor reshape failed");
     kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
         mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
+    if (mRuntime.preprocess.gemma4Ple)
+    {
+        mRuntime.preprocess.gemma4Ple->embed(mRuntime.preprocess.idsInput, context.stream);
+    }
 
     {
         int32_t const acceptedTokenNum = static_cast<int32_t>(inputIdsLength);
@@ -757,6 +769,11 @@ bool MTPDecoder::captureCudaGraphs(cudaStream_t stream)
             check::check(mRuntime.base.pipelineIO.inputsEmbeds.reshape(
                              {batchSize, verifySize, mRuntime.deployment.base.hiddenSize}),
                 "Tensor reshape failed");
+            check::check(mRuntime.preprocess.idsInput.reshape({batchSize, verifySize}), "Tensor reshape failed");
+            if (mRuntime.preprocess.gemma4Ple)
+            {
+                mRuntime.preprocess.gemma4Ple->reshapeOutputs(batchSize, verifySize);
+            }
 
             Tensor const& baseKVCacheLengths = mRuntime.base.cacheManager.getKVCacheLengths();
             check::check(

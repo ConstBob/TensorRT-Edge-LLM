@@ -70,6 +70,10 @@ bool VanillaDecoder::decodeStep(DecodingInferenceContext& context)
         "Tensor reshape failed");
     kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
         mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
+    if (mRuntime.preprocess.gemma4Ple)
+    {
+        mRuntime.preprocess.gemma4Ple->embed(mRuntime.preprocess.idsInput, context.stream);
+    }
 
     check::check(
         mRuntime.base.pipelineIO.outputLogits.reshape({activeBatchSize, mRuntime.deployment.base.outputVocabSize}),
@@ -145,6 +149,11 @@ bool VanillaDecoder::captureCudaGraphs(cudaStream_t stream)
             mRuntime.base.pipelineIO.outputLogits.reshape({batchSize, mRuntime.deployment.base.outputVocabSize}),
             "Tensor reshape failed");
         check::check(mRuntime.base.pipelineIO.selectTokenIndices.reshape({batchSize, 1}), "Tensor reshape failed");
+        check::check(mRuntime.preprocess.idsInput.reshape({batchSize, 1}), "Tensor reshape failed");
+        if (mRuntime.preprocess.gemma4Ple)
+        {
+            mRuntime.preprocess.gemma4Ple->reshapeOutputs(batchSize, 1);
+        }
 
         mRuntime.preprocess.stepPreparer.prepare(
             InferencePhase::kDecode, batchSize, mRuntime.base.cacheManager, mRuntime.base.pipelineIO, stream);
