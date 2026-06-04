@@ -228,6 +228,15 @@ private:
     bool setupDFlashDraftProfiles(
         nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
 
+    //! Set up optimization profiles for Gemma4 PLE tensor inputs.
+    //! Gemma4 E-model engines receive one ple_token_embeds_* tensor per layer.
+    //! @param contextProfile Optimization profile for context processing
+    //! @param generationProfile Optimization profile for generation processing
+    //! @param network TensorRT network definition for input analysis
+    //! @return true if setup was successful, false otherwise
+    bool setupPleProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+        nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network);
+
     //! Set up optimization profiles for Deepstack embeddings (Qwen3VL).
     //! Configures deepstack embedding inputs with the same profile as inputs_embeds.
     //! @param contextProfile Optimization profile for context processing

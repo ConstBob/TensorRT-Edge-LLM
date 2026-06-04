@@ -117,5 +117,18 @@ void embeddingLookupMultimodal(rt::Tensor const& inputIds, rt::Tensor const& emb
     rt::OptionalInputTensor imageEmbeds, std::optional<int32_t> audioTokenId, rt::OptionalInputTensor audioEmbeds,
     rt::Tensor& output, cudaStream_t stream);
 
+//! \brief Gather Gemma4 per-layer token-identity embeddings.
+//!
+//! \param[in] inputIds Input token IDs with shape [batchSize, seqLen]
+//! \param[in] pleTable PLE table with shape [vocabSize, numLayers * pleHiddenSize]
+//! \param[in,out] outputBuffer Backing tensor for all per-layer outputs; shape [numLayers, maxBatch, maxSeq, hidden]
+//! \param[in] numLayers Number of PLE layer outputs
+//! \param[in] pleHiddenSize Hidden size of each PLE output
+//! \param[in] imageTokenId Optional image token ID to zero-fill (-1 = unused)
+//! \param[in] audioTokenId Optional audio token ID to zero-fill (-1 = unused)
+//! \param[in] stream CUDA stream for execution
+void gemma4PleGather(rt::Tensor const& inputIds, rt::Tensor const& pleTable, rt::Tensor& outputBuffer,
+    int32_t numLayers, int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId, cudaStream_t stream);
+
 } // namespace kernel
 } // namespace trt_edgellm

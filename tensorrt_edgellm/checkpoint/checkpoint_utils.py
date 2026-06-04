@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 from typing import TYPE_CHECKING, Any, Dict, Tuple
@@ -329,6 +330,12 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
         out["tp_size"] = tp_size
         out["tp_rank"] = tp_rank
 
+    ple_enabled = config.hidden_size_per_layer_input > 0
+    out["ple_enabled"] = ple_enabled
+    out["num_ple_inputs"] = config.num_hidden_layers if ple_enabled else 0
+    out["ple_hidden_size"] = (config.hidden_size_per_layer_input
+                              if ple_enabled else 0)
+
     # longrope requires original_max_position_embeddings for scaling factor computation.
     if (isinstance(rope_scaling, dict)
             and rope_scaling.get("type") == "longrope"
@@ -557,6 +564,17 @@ def _build_alpamayo_tokenizer(config: Dict[str, Any], out_dir: str) -> None:
         logger.warning("Failed to build Alpamayo tokenizer: %s", exc)
 
 
+def _runtime_embedding_scale(model: "CausalLM") -> float:
+    """Return the scale folded into runtime token embedding sidecars."""
+    config = model.config
+    explicit_scale = getattr(config, "embedding_scale", None)
+    if explicit_scale is not None:
+        return float(explicit_scale)
+    if str(getattr(config, "model_type", "")).startswith("gemma4"):
+        return math.sqrt(float(config.hidden_size))
+    return 1.0
+
+
 def write_runtime_artifacts(model: "CausalLM",
                             model_dir: str,
                             out_dir: str,
@@ -615,7 +633,10 @@ def write_runtime_artifacts(model: "CausalLM",
             embed = getattr(getattr(model, "backbone", None), "embeddings",
                             None)
         if embed is not None:
-            weight = embed.weight.data.cpu()
+            weight = embed.weight.data.detach().cpu()
+            embedding_scale = _runtime_embedding_scale(model)
+            if embedding_scale != 1.0:
+                weight = weight * embedding_scale
             # C++ runtime requires FP16 (or FP8) embedding; cast if needed.
             if weight.dtype in (torch.float32, torch.bfloat16):
                 weight = weight.to(torch.float16)
@@ -637,6 +658,23 @@ def write_runtime_artifacts(model: "CausalLM",
         else:
             logger.warning(
                 "embed_tokens not found; skipping embedding.safetensors")
+
+        if model.config.ple_enabled:
+            ple_embed = getattr(getattr(model, "model", None),
+                                "embed_tokens_per_layer", None)
+            if ple_embed is None:
+                raise ValueError(
+                    "Gemma4 PLE is enabled but embed_tokens_per_layer is missing"
+                )
+            ple_weight = ple_embed.weight.data.detach().cpu()
+            ple_weight = ple_weight * math.sqrt(
+                model.config.hidden_size_per_layer_input)
+            if ple_weight.dtype in (torch.float32, torch.bfloat16):
+                ple_weight = ple_weight.to(torch.float16)
+            ple_path = os.path.join(out_dir, "ple_embedding.safetensors")
+            save_file({"weight": ple_weight.contiguous()}, ple_path)
+            logger.info("Wrote ple_embedding.safetensors (%s)",
+                        list(ple_weight.shape))
 
     # Alpamayo-R1: tokenizer lives in the VLM checkpoint, not in model_dir.
     # Build it first so that tokenizer files exist before the copy loop

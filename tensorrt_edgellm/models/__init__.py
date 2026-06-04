@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +17,7 @@ Shared model infrastructure (linear layers, ops) and model variants.
 
 Model variants live in sub-packages named after the model family:
   ``default/``       - standard decoder transformer + Mamba hybrid
+  ``gemma4/``        - Gemma4 text decoder with PLE runtime inputs
   ``nemotron_h/``    - Nemotron-H hybrid (Mamba2 + attention)
   ``nemotron_omni/`` - Nemotron-Omni: RADIO visual + Parakeet audio (LLM reuses nemotron_h)
   ``qwen3_vl/``      - Qwen3-VL visual encoder + LLM

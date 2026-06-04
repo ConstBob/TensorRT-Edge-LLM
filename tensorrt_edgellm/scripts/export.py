@@ -88,6 +88,11 @@ _NEMOTRON_OMNI_MODEL_TYPES = frozenset([
     "NemotronH_Nano_Omni_Reasoning_V3",
 ])
 
+_GEMMA4_MODEL_TYPES = frozenset([
+    "gemma4",
+    "gemma4_text",
+])
+
 _VLM_MODEL_TYPES = frozenset([
     "qwen3_vl",
     "qwen3_omni",
@@ -390,6 +395,24 @@ def _collect_tokens_from_tokenizer_fallback(model_dir: str) -> dict:
     return out
 
 
+def _collect_gemma4_tokenizer_fallback(model_dir: str) -> dict:
+    """Gemma4 fallback for multimodal placeholders.
+
+    Gemma4's PLE preprocessor uses image/audio token IDs to zero-fill the token
+    identity component at multimodal positions. Prefer structured config fields
+    when present, but resolve the standard placeholder tokens from tokenizer
+    assets when the source config is flat or incomplete.
+    """
+    out: dict = {}
+    image_id = _find_token_id(model_dir, "<|image_pad|>")
+    if image_id is not None:
+        out["image_token_id"] = image_id
+    audio_id = _find_token_id(model_dir, "<|audio_pad|>")
+    if audio_id is not None:
+        out["audio_token_id"] = audio_id
+    return out
+
+
 def _collect_user_token_id(model_dir: str, root: dict) -> dict:
     """Resolve ``user_token_id`` for Qwen3-ASR / Qwen3-Omni.
 
@@ -436,6 +459,17 @@ def _patch_multimodal_token_ids(model_dir: str, llm_out_dir: str,
         if "image_token_id" not in collected:
             collected.update(
                 _collect_tokens_from_tokenizer_fallback(llm_out_dir))
+
+    # Gemma4 PLE needs multimodal placeholder IDs for zero-filling PLE token
+    # identity at image/audio positions. Gemma4 is not listed in
+    # ``_VLM_MODEL_TYPES`` because that set controls visual-component export;
+    # this fallback only patches the LLM runtime config when IDs are missing.
+    if model_type in _GEMMA4_MODEL_TYPES:
+        fallback = _collect_gemma4_tokenizer_fallback(llm_out_dir)
+        fallback.update(_collect_gemma4_tokenizer_fallback(model_dir))
+        for key in ("image_token_id", "audio_token_id"):
+            if key not in collected and key in fallback:
+                collected[key] = fallback[key]
 
     # Qwen3-ASR / Qwen3-Omni metadata: ``user_token_id`` (with a BPE vocab
     # fallback) plus the ``model: "qwen3asrthinker"`` tag.
@@ -1900,8 +1934,8 @@ def main() -> None:
                              _layout_for(model_type, component)))
 
     # Summary
-    _SIDECARS = ("embedding.safetensors", "text_embedding.safetensors",
-                 "text_projection.safetensors",
+    _SIDECARS = ("embedding.safetensors", "ple_embedding.safetensors",
+                 "text_embedding.safetensors", "text_projection.safetensors",
                  "hidden_projection.safetensors",
                  "codec_embeddings.safetensors", "lm_heads.safetensors",
                  "small_to_mtp_projection.safetensors",

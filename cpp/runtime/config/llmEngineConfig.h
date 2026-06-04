@@ -91,6 +91,9 @@ struct LLMEngineConfig
 
     // --- Optional feature fields ---
     int32_t numDeepstackFeatures{0}; //!< Deepstack features (Qwen3-VL/Qwen3-Omni)
+    bool pleEnabled{false};          //!< Gemma4 PLE runtime preprocessor enabled
+    int32_t numPleInputs{0};         //!< Number of PLE tensors bound into the engine (0 = disabled)
+    int32_t pleHiddenSize{0};        //!< Hidden dimension of each PLE tensor (0 = disabled)
     int32_t maxSupportedLoraRank{0}; //!< Maximum LoRA rank (0 = no LoRA)
 
     // --- Multimodal token IDs ---
