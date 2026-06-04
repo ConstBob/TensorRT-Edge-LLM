@@ -23,7 +23,7 @@ Usage::
         --quantization nvfp4 \\
         --lm_head_quantization nvfp4
 
-    # Eagle3 draft quantization
+    # Speculative draft quantization (Eagle3 or DFlash, auto-detected)
     tensorrt-edgellm-quantize draft \\
         --base_model_dir /path/to/base \\
         --draft_model_dir /path/to/draft \\
@@ -32,6 +32,8 @@ Usage::
 """
 
 import argparse
+import json
+import os
 
 
 def _add_common_args(parser):
@@ -39,10 +41,12 @@ def _add_common_args(parser):
     parser.add_argument(
         "--quantization",
         default=None,
-        choices=["fp8", "int4_awq", "nvfp4", "mxfp8", "int8_sq"])
+        choices=["fp8", "int4_awq", "nvfp4", "mxfp8", "int8_sq"],
+        help="Backbone quantization method.")
     parser.add_argument("--lm_head_quantization",
                         default=None,
-                        choices=["fp8", "int4_awq", "nvfp4", "mxfp8"])
+                        choices=["fp8", "int4_awq", "nvfp4", "mxfp8"],
+                        help="LM-head quantization method.")
     parser.add_argument(
         "--visual_quantization",
         default=None,
@@ -81,8 +85,8 @@ def main():
     llm_parser.add_argument("--model_dir", required=True)
     _add_common_args(llm_parser)
 
-    draft_parser = sub.add_parser("draft",
-                                  help="Quantize an Eagle3 draft model")
+    draft_parser = sub.add_parser(
+        "draft", help="Quantize an Eagle3 or DFlash draft model")
     draft_parser.add_argument("--base_model_dir", required=True)
     draft_parser.add_argument("--draft_model_dir", required=True)
     _add_common_args(draft_parser)
@@ -105,20 +109,51 @@ def main():
             num_samples=args.num_samples,
         )
     elif args.command == "draft":
-        from ..quantization.models.eagle3_draft import \
-            quantize_and_export_draft
-        quantize_and_export_draft(
-            base_model_dir=args.base_model_dir,
-            draft_model_dir=args.draft_model_dir,
-            output_dir=args.output_dir,
-            quantization=args.quantization or "fp8",
-            lm_head_quantization=args.lm_head_quantization,
-            kv_cache_quantization=args.kv_cache_quantization,
-            dtype=args.dtype,
-            device=args.device,
-            dataset=args.dataset,
-            num_samples=args.num_samples,
-        )
+        if _is_dflash_draft(args.draft_model_dir):
+            _validate_dflash_quant_args(parser, args)
+            from ..quantization.models.dflash_draft import \
+                quantize_and_export_dflash_draft
+            quantize_and_export_dflash_draft(
+                base_model_dir=args.base_model_dir,
+                draft_model_dir=args.draft_model_dir,
+                output_dir=args.output_dir,
+                quantization=args.quantization or "nvfp4",
+                lm_head_quantization=args.lm_head_quantization,
+                kv_cache_quantization=args.kv_cache_quantization,
+                dtype=args.dtype,
+                device=args.device,
+                dataset=args.dataset,
+                num_samples=args.num_samples,
+            )
+        else:
+            from ..quantization.models.eagle3_draft import \
+                quantize_and_export_draft
+            quantize_and_export_draft(
+                base_model_dir=args.base_model_dir,
+                draft_model_dir=args.draft_model_dir,
+                output_dir=args.output_dir,
+                quantization=args.quantization or "fp8",
+                lm_head_quantization=args.lm_head_quantization,
+                kv_cache_quantization=args.kv_cache_quantization,
+                dtype=args.dtype,
+                device=args.device,
+                dataset=args.dataset,
+                num_samples=args.num_samples,
+            )
+
+
+def _is_dflash_draft(draft_model_dir: str) -> bool:
+    cfg_path = os.path.join(draft_model_dir, "config.json")
+    if not os.path.isfile(cfg_path):
+        return False
+    with open(cfg_path, encoding="utf-8") as f:
+        return bool(json.load(f).get("dflash_config"))
+
+
+def _validate_dflash_quant_args(parser, args) -> None:
+    if args.kv_cache_quantization is not None:
+        parser.error(
+            "DFlash draft KV-cache quantization is not validated yet.")
 
 
 if __name__ == "__main__":

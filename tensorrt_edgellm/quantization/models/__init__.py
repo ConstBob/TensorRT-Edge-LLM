@@ -21,6 +21,8 @@ provides minimal PyTorch re-implementations of those models — just
 enough to run ModelOpt quantization and export a unified checkpoint.
 """
 
+from .dflash_draft import DFlashCalibDraftModel  # noqa: F401
+from .dflash_draft import quantize_and_export_dflash_draft  # noqa: F401
 from .eagle3_draft import Eagle3DraftModel  # noqa: F401
 from .eagle3_draft import quantize_and_export_draft  # noqa: F401
 from .mtp_draft import MtpDraftModel  # noqa: F401

@@ -23,6 +23,7 @@ the default :class:`~models.default.modeling_default.CausalLM` for a given
 ``model_type`` string.
 """
 
+import logging
 import os
 from typing import Dict, Type
 
@@ -210,10 +211,15 @@ class AutoModel:
                      pre_repack_hook=pre_repack_hook,
                      mapping=config.mapping)
         if variant == "dflash_draft":
-            _load_dflash_lm_head(model,
-                                 base_model_dir,
-                                 device,
-                                 tie_word_embeddings=base_tie_word_embeddings)
+            if _checkpoint_has_dflash_lm_head(model_dir):
+                logging.getLogger(__name__).info(
+                    "DFlash lm_head source: draft checkpoint buffers")
+            else:
+                _load_dflash_lm_head(
+                    model,
+                    base_model_dir,
+                    device,
+                    tie_word_embeddings=base_tie_word_embeddings)
         if reduced_vocab_dir is not None and pre_repack_hook is None:
             from .vocab_reduction.onnx_export import \
                 apply_reduced_vocab_from_dir
@@ -326,9 +332,10 @@ def _load_dflash_lm_head(model: nn.Module,
       2. Embedding fallback *only* when ``tie_word_embeddings=True``.
       3. Otherwise fail loudly — untied models must not use embeddings.
 
-    Quantized draft checkpoints own their packed lm_head buffers.  The generic
-    checkpoint loader has already copied them before this helper runs, so only
-    FP16 draft heads are overwritten from the original base checkpoint.
+    This helper is used only for old DFlash draft checkpoints that do not carry
+    ``lm_head.*`` tensors.  Quantized checkpoints, and dense checkpoints that
+    explicitly save ``lm_head.weight``, are loaded by the generic checkpoint
+    loader and must not be overwritten from the base embedding table.
     """
     import logging
     import os
@@ -336,7 +343,7 @@ def _load_dflash_lm_head(model: nn.Module,
     import torch
     from safetensors import safe_open
 
-    from .models.linear import FP16Linear, is_nvfp4_linear
+    from .models.linear import FP16Linear
 
     logger = logging.getLogger(__name__)
     lm_head = getattr(model, "lm_head", None)
@@ -344,16 +351,10 @@ def _load_dflash_lm_head(model: nn.Module,
         logger.warning("DFlash draft model has no lm_head; skipping.")
         return
 
-    if is_nvfp4_linear(lm_head):
-        required = ("weight", "weight_scale", "weight_scale_2", "input_scale")
-        missing = [name for name in required if not hasattr(lm_head, name)]
-        if missing:
-            raise ValueError(
-                "DFlash NVFP4 lm_head is missing quantized buffers: "
-                f"{missing}")
-        logger.info(
-            "DFlash lm_head source: quantized draft checkpoint buffers")
-        return
+    if not isinstance(lm_head, FP16Linear):
+        raise ValueError(
+            "DFlash quantized lm_head requires lm_head.* tensors in the "
+            "draft checkpoint; refusing to synthesize it from base weights.")
 
     from .checkpoint.loader import _build_shard_map
     shard_map = _build_shard_map(base_model_dir)
@@ -411,22 +412,24 @@ def _load_dflash_lm_head(model: nn.Module,
     with safe_open(shard_path, framework="pt", device=device) as f:
         source_weight = f.get_tensor(source_key)
 
-    # --- Copy weight into model's lm_head ---
-    if isinstance(lm_head, FP16Linear):
-        if source_weight.shape != lm_head.weight.shape:
-            raise ValueError(
-                f"DFlash lm_head shape mismatch: source={source_weight.shape} "
-                f"vs lm_head={lm_head.weight.shape}")
-        with torch.no_grad():
-            lm_head.weight.copy_(source_weight.to(lm_head.weight.dtype))
-    else:
-        # Generic fallback
-        if source_weight.shape != lm_head.weight.shape:
-            raise ValueError(
-                f"DFlash lm_head shape mismatch: source={source_weight.shape} "
-                f"vs lm_head={lm_head.weight.shape}")
-        with torch.no_grad():
-            lm_head.weight.copy_(source_weight.to(lm_head.weight.dtype))
+    # --- Copy weight into model's dense lm_head ---
+    if source_weight.shape != lm_head.weight.shape:
+        raise ValueError(
+            f"DFlash lm_head shape mismatch: source={source_weight.shape} "
+            f"vs lm_head={lm_head.weight.shape}")
+    with torch.no_grad():
+        lm_head.weight.copy_(source_weight.to(lm_head.weight.dtype))
+
+
+def _checkpoint_has_dflash_lm_head(model_dir: str) -> bool:
+    """Return whether a DFlash draft checkpoint owns lm_head tensors."""
+    from .checkpoint.loader import _build_shard_map
+
+    for key in _build_shard_map(model_dir):
+        mapped = _dflash_key_remap(key)
+        if mapped is not None and mapped.startswith("lm_head."):
+            return True
+    return False
 
 
 def _dflash_key_remap(key: str) -> "str | None":

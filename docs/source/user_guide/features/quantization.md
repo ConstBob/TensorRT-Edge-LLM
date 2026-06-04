@@ -67,6 +67,24 @@ tensorrt-edgellm-quantize draft \
   --quantization fp8
 ```
 
+## Quantize A DFlash Draft
+
+```bash
+tensorrt-edgellm-quantize draft \
+  --base_model_dir /path/to/base_model \
+  --draft_model_dir /path/to/dflash_draft \
+  --output_dir /tmp/dflash_draft_nvfp4 \
+  --quantization nvfp4 \
+  --lm_head_quantization nvfp4
+```
+
+The `draft` command auto-detects DFlash from the draft checkpoint's
+`dflash_config`. The base model is used during calibration to produce target
+hidden states and as an LM-head fallback for draft checkpoints that do not
+store `lm_head` weights. DFlash draft quantization has been validated with
+NVFP4. The target-hidden projector stays in dense precision; export will
+reject checkpoints where that `fc` module is quantized.
+
 ## Quantize Embedding Table To FP8
 
 FP8 embedding quantization is applied at export time via `tensorrt_edgellm`, not during the quantization step. Pass `--fp8-embedding` when exporting the quantized checkpoint. See [FP8 Embedding](fp8-embedding.md) for details and usage examples. Export the runtime embedding table in FP8:
@@ -99,6 +117,7 @@ Build engines and run inference with the normal C++ tools. See [Quick Start Guid
 | LM head | `fp8`, `int4_awq`, `nvfp4`, `mxfp8` |
 | KV cache | `fp8` |
 | Visual tower | `fp8` |
+| DFlash draft | validated with `nvfp4` backbone and optional `nvfp4` LM-head quantization |
 
 ## Notes
 

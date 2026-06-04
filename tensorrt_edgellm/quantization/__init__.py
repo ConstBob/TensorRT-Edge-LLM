@@ -20,7 +20,9 @@ torch, transformers, and modelopt.
     tensorrt-edgellm-quantize --help
 """
 
+from .models import DFlashCalibDraftModel  # noqa: F401
 from .models import Eagle3DraftModel  # noqa: F401
+from .models import quantize_and_export_dflash_draft  # noqa: F401
 from .models import quantize_and_export_draft  # noqa: F401
 from .quantization_configs import build_quant_config  # noqa: F401
 from .quantize import quantize_and_export  # noqa: F401

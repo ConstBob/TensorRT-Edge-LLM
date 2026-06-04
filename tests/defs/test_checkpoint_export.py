@@ -279,6 +279,17 @@ def test_checkpoint_dflash_export(test_param: str, test_logger,
         raise FileNotFoundError(
             f"DFlash draft model checkpoint not found: {draft_torch_dir}")
 
+    # Export test params may include a quantized checkpoint suffix in the model
+    # name (for example "Qwen3.5-4B-NVFP4") to locate the pre-quantized base
+    # checkpoint.  Downstream build/inference tests use the canonical base model
+    # name plus precision ("Qwen3.5-4B-nvfp4"), so normalize the ONNX path after
+    # both checkpoint locations have been resolved.
+    _QUANT_SUFFIXES = ("-NVFP4", "-FP8", "-FP8-KV", "-INT8-SQ", "-INT4-AWQ")
+    for suffix in _QUANT_SUFFIXES:
+        if config.model_name.endswith(suffix):
+            config.model_name = config.model_name[:-len(suffix)]
+            break
+
     llm_onnx_dir = config.get_llm_onnx_dir()
     draft_onnx_dir = config.get_draft_onnx_dir()
     os.makedirs(llm_onnx_dir, exist_ok=True)

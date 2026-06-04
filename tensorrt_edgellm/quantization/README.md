@@ -24,7 +24,8 @@ heavy and brittle.
 │  quantize.py              Load → quant → save│
 │  models/                                     │
 │    eagle3_draft.py        Eagle3 draft model │
-│  cli.py                   CLI entry point    │
+│    dflash_draft.py        DFlash draft model │
+│  ../scripts/quantize.py    CLI entry point   │
 └──────────────────┬───────────────────────────┘
                    │ unified checkpoint
                    ▼
@@ -87,7 +88,7 @@ tensorrt-edgellm-quantize llm \
     --lm_head_quantization nvfp4
 ```
 
-### Eagle3 draft quantization
+### Speculative draft quantization
 
 ```bash
 tensorrt-edgellm-quantize draft \
@@ -96,6 +97,25 @@ tensorrt-edgellm-quantize draft \
     --output_dir /path/to/output \
     --quantization fp8
 ```
+
+The `draft` command auto-detects DFlash draft checkpoints from
+`config.json::dflash_config`; otherwise it uses the Eagle3 draft flow.
+
+DFlash draft quantization has been validated with NVFP4:
+
+```bash
+tensorrt-edgellm-quantize draft \
+    --base_model_dir /path/to/base_model \
+    --draft_model_dir /path/to/dflash_draft \
+    --output_dir /path/to/output \
+    --quantization nvfp4 \
+    --lm_head_quantization nvfp4
+```
+
+DFlash uses the base model only for calibration hidden states and for the
+LM-head fallback when the draft checkpoint does not carry its own LM head.
+The DFlash target-hidden projector `fc` is intentionally excluded from PTQ so
+the exporter can keep its full-FP32 accumulation path.
 
 ### Common options
 
@@ -107,7 +127,7 @@ tensorrt-edgellm-quantize draft \
 | `--visual_quantization` | None | Visual tower method (fp8) |
 | `--dtype` | fp16 | Loading dtype |
 | `--device` | cuda | CUDA device |
-| `--dataset` | cnn_dailymail | Calibration dataset |
+| `--dataset` | cnn_dailymail | Calibration dataset (`cnn_dailymail`, a HuggingFace dataset, or a local JSON/JSONL file with `text` or `article`) |
 | `--num_samples` | 512 | Number of calibration samples |
 
 ### Python API
