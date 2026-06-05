@@ -315,7 +315,7 @@ class GatedAttention(nn.Module):
         self.head_dim = head_dim
         self.enable_fp8_kv_cache = config.quant.kv_cache_quant == "fp8"
         self.sliding_window_size = -1
-        module_prefix = f"model.layers.{layer_idx}.self_attn"
+        module_prefix = f"layers.{layer_idx}.self_attn"
 
         # q_proj output is doubled: query + gate
         self.q_proj = make_linear(config,
@@ -432,10 +432,10 @@ class Qwen3_5DecoderLayer(nn.Module):
                                               config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3_5RMSNorm(config.hidden_size,
                                                        config.rms_norm_eps)
-        self.mlp = MLP(config)
+        self.mlp = MLP(config, layer_idx=layer_idx)
 
         if layer_type == LAYER_GDN:
-            module_prefix = f"model.layers.{layer_idx}.linear_attn"
+            module_prefix = f"layers.{layer_idx}.linear_attn"
             self.linear_attn = GdnMixer(config, gc, module_prefix)
         else:
             self.self_attn = GatedAttention(config, layer_idx)

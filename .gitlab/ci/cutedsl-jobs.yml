@@ -282,24 +282,24 @@ build_cutedsl_x86_sm120_artifact:
       - cutedsl_x86_64_sm_120_cuda12.tar.gz
       - cutedsl_x86_64_sm_120_cuda12.tar.gz.sha256
 
-build_cutedsl_sm87_cuda12_artifact:
+build_cutedsl_sm87_cuda13_artifact:
   extends:
     - .cutedsl_remote_artifact_base
   tags:
     - p3730-k8s
   variables:
-    CUTE_DSL_ARTIFACT_NAME: "cutedsl_aarch64_sm_87_cuda12.tar.gz"
+    CUTE_DSL_ARTIFACT_NAME: "cutedsl_aarch64_sm_87_cuda13.tar.gz"
     CUTE_DSL_ARTIFACT_TAG: "sm_87"
     CUTE_DSL_BUILD_GPU_ARCH_ARG: "--gpu_arch sm_87"
-    CUTE_DSL_PACKAGE: "nvidia-cutlass-dsl==4.5.2"
-    CUTE_DSL_CUPY_PACKAGE: "cupy-cuda12x==12.3.0"
+    CUTE_DSL_PACKAGE: "nvidia-cutlass-dsl[cu13]==4.5.2"
+    CUTE_DSL_CUPY_PACKAGE: "cupy-cuda13x==13.6.0"
   artifacts:
-    name: "cutedsl-sm87-cuda12-${CI_COMMIT_SHORT_SHA}"
+    name: "cutedsl-sm87-cuda13-${CI_COMMIT_SHORT_SHA}"
     expire_in: 1 day
     # NOTE: GitLab does not expand job-level `variables:` inside `artifacts.paths`,
     # so this literal must stay in sync with CUTE_DSL_ARTIFACT_NAME above.
     # metadata.json is intentionally not listed — it's already packaged inside the tarball
     # (extract with `tar -xzOf <tar> sm_87/metadata.json`).
     paths:
-      - cutedsl_aarch64_sm_87_cuda12.tar.gz
-      - cutedsl_aarch64_sm_87_cuda12.tar.gz.sha256
+      - cutedsl_aarch64_sm_87_cuda13.tar.gz
+      - cutedsl_aarch64_sm_87_cuda13.tar.gz.sha256

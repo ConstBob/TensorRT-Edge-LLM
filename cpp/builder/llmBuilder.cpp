@@ -1097,6 +1097,23 @@ bool LLMBuilder::setupIntermediateConvStateProfiles(
     return result;
 }
 
+namespace
+{
+// Speculative base and draft engines share one engineDir, so their external weight
+// files (e.g. external_int4_ffn_weights.safetensors) would otherwise overwrite
+// each other. Prefix only the draft files; the base keeps the original names
+// (matching the standalone non-speculative case), which is enough to avoid the
+// collision. copyConfig() and copyExternalWeightFiles() must agree on this name.
+std::string externalWeightDstName(std::string const& filename, bool specDraft)
+{
+    if (specDraft)
+    {
+        return "draft_" + filename;
+    }
+    return filename;
+}
+} // namespace
+
 bool LLMBuilder::copyConfig()
 {
     // Determine config file name based on model type
@@ -1119,6 +1136,20 @@ bool LLMBuilder::copyConfig()
     // Create a copy of mModelConfig and add builder config
     Json configWithBuilder = mModelConfig;
     configWithBuilder["builder_config"] = mBuilderConfig.toJson();
+
+    // Keep external weight file references in sync with the names written by
+    // copyExternalWeightFiles() (draft files get the "draft_" prefix) so the runtime loads the right file.
+    if (configWithBuilder.contains("external_weight_files") && configWithBuilder["external_weight_files"].is_array())
+    {
+        for (auto& fileEntry : configWithBuilder["external_weight_files"])
+        {
+            if (fileEntry.is_object() && fileEntry.contains("file") && fileEntry["file"].is_string())
+            {
+                fileEntry["file"]
+                    = externalWeightDstName(fileEntry["file"].get<std::string>(), mBuilderConfig.specDraft);
+            }
+        }
+    }
 
     // Add detected num_deepstack_features if present (Qwen3VL models)
     configWithBuilder["num_deepstack_features"] = mNumDeepstackFeatures;
@@ -1367,12 +1398,13 @@ bool LLMBuilder::copyExternalWeightFiles()
             return false;
         }
         std::string const filename = fileEntry["file"].get<std::string>();
+        std::string const dstFilename = externalWeightDstName(filename, mBuilderConfig.specDraft);
         std::filesystem::path const srcPath = mOnnxDir / filename;
-        std::filesystem::path const dstPath = mEngineDir / filename;
+        std::filesystem::path const dstPath = mEngineDir / dstFilename;
 
         if (file_io::copyFile(srcPath.string(), dstPath.string()))
         {
-            LOG_INFO("Copied external weight file: %s", filename.c_str());
+            LOG_INFO("Copied external weight file: %s -> %s", filename.c_str(), dstFilename.c_str());
         }
         else
         {

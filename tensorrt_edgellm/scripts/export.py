@@ -593,7 +593,9 @@ def _export_llm(model_dir: str,
     logger.info("[LLM] Done: %s", output_path)
 
 
-def _export_mtp_draft(model_dir: str, draft_out_dir: str) -> None:
+def _export_mtp_draft(model_dir: str,
+                      draft_out_dir: str,
+                      externalize_weights: "list[str] | None" = None) -> None:
     """Export the MTP draft model."""
     os.makedirs(draft_out_dir, exist_ok=True)
     output_path = os.path.join(draft_out_dir, "model.onnx")
@@ -611,7 +613,10 @@ def _export_mtp_draft(model_dir: str, draft_out_dir: str) -> None:
     logger.info("[MTP Draft] Exporting to %s", output_path)
     try:
         from ..onnx.export import export_onnx
-        export_onnx(model, output_path, model_dir=model_dir)
+        export_onnx(model,
+                    output_path,
+                    model_dir=model_dir,
+                    externalize_weights=externalize_weights)
     except (OSError, ValueError, RuntimeError) as exc:
         logger.exception("[MTP Draft] ONNX export failed")
         raise SystemExit(1) from exc
@@ -1834,6 +1839,23 @@ def main() -> None:
     # visual, audio, or other components needed.
     _draft_only = args.dflash_draft
 
+    def _export_visual_component(out: str) -> None:
+        if _is_alpamayo(model_type):
+            _export_alpamayo_visual(model_dir,
+                                    out,
+                                    _get_weights(),
+                                    config,
+                                    dtype,
+                                    model_config=_get_model_config())
+            return
+        _export_visual(model_dir,
+                       out,
+                       _get_weights(),
+                       config,
+                       model_type,
+                       dtype,
+                       model_config=_get_model_config())
+
     # Each stage is (enabled, component_name, exporter_callable).  Exporter
     # receives the computed output dir; the (enabled, component) columns also
     # drive both the pre-run log and the post-run summary below.
@@ -1851,7 +1873,8 @@ def main() -> None:
                                  reduced_vocab_dir=args.reduced_vocab_dir,
                                  externalize_weights=externalize_weights,
                                  tp_size=args.tp_size)),
-        (args.mtp, "mtp_draft", lambda out: _export_mtp_draft(model_dir, out)),
+        (args.mtp, "mtp_draft", lambda out: _export_mtp_draft(
+            model_dir, out, externalize_weights=externalize_weights)),
         (args.dflash_draft, "dflash_draft", lambda out: _export_dflash_draft(
             model_dir, out, args.dflash_draft_dir)),
         (_has_llm_component(model_type, "talker") and not args.skip_llm
@@ -1860,24 +1883,8 @@ def main() -> None:
         (_has_llm_component(model_type, "code_predictor") and not args.skip_llm
          and not _draft_only, "code_predictor",
          lambda out: _export_code_predictor(model_dir, out, model_type)),
-        (_has_visual(model_type) and not _is_alpamayo(model_type)
-         and not args.skip_visual and not _draft_only, "visual",
-         lambda out: _export_visual(model_dir,
-                                    out,
-                                    _get_weights(),
-                                    config,
-                                    model_type,
-                                    dtype,
-                                    model_config=_get_model_config())),
-        (_has_visual(model_type) and _is_alpamayo(model_type)
-         and not args.skip_visual and not _draft_only, "visual",
-         lambda out: _export_alpamayo_visual(model_dir,
-                                             out,
-                                             _get_weights(),
-                                             config,
-                                             dtype,
-                                             model_config=_get_model_config())
-         ),
+        (_has_visual(model_type) and not args.skip_visual
+         and not _draft_only, "visual", _export_visual_component),
         (_has_audio(model_type) and not args.skip_audio and not _draft_only,
          "audio", lambda out: _export_audio(model_dir,
                                             out,

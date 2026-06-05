@@ -12,31 +12,41 @@ This quick start guide will get you up and running with TensorRT Edge-LLM in ~15
 
 For Jetson Thor and x86 development, use the high-level Python API or the OpenAI-compatible server. Build the project once with Python bindings enabled, then let the high-level Python API export, build, load, and run the model from a HuggingFace checkpoint.
 
+Install the server dependencies before configuring CMake with Python bindings:
+
+```bash
+cd /path/to/TensorRT-Edge-LLM
+pip install -r requirements-server.txt
+```
+
 For x86 development:
 
 ```bash
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 mkdir -p build
 cd build
 cmake .. \
   -DTRT_PACKAGE_DIR=$TRT_PACKAGE_DIR \
   -DCUDA_CTK_VERSION=<YOUR_CUDA_VERSION> \
+  -DENABLE_CUTE_DSL=ALL \
   -DBUILD_PYTHON_BINDINGS=ON
 make -j$(nproc)
 cd ..
 ```
 
-For Jetson Thor, follow the CMake pattern used by CI and enable CuTe DSL prebuilt kernels:
+For Jetson Thor on JetPack 7.2, follow the CMake pattern used by CI and enable
+CuTe DSL prebuilt kernels. For JetPack 7.0/7.1, use
+`-DCUDA_CTK_VERSION=13.0` instead.
 
 ```bash
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 mkdir -p build
 cd build
 cmake .. \
   -DTRT_PACKAGE_DIR=/usr \
-  -DCUDA_CTK_VERSION=13.0 \
+  -DCUDA_CTK_VERSION=13.2 \
   -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake \
   -DEMBEDDED_TARGET=jetson-thor \
   -DENABLE_CUTE_DSL=ALL \
@@ -49,8 +59,6 @@ After either build:
 
 ```bash
 export PYTHONPATH=$PWD:$PYTHONPATH
-
-pip install pybind11 fastapi uvicorn
 ```
 
 Run a prompt with the high-level Python API:
@@ -138,10 +146,17 @@ tensorrt-edgellm-export \
 # See https://huggingface.co/Qwen/Qwen3-4B-AWQ
 tensorrt-edgellm-export \
     /path/to/Qwen/Qwen3-4B-AWQ \
-    Qwen3-4B-AWQ/onnx
+    Qwen3-4B-AWQ/onnx \
+    --externalize-weights int4_ffn
 ```
 
 For pre-quantized checkpoints (FP8, INT4 AWQ/GPTQ, NVFP4), simply point the loader at the quantized checkpoint directory. For quantization options, FP8 KV cache, FP8 embedding, LoRA, and vocabulary reduction, see [Quantization](../features/quantization.md), [FP8 KV Cache](../features/FP8KV.md), [FP8 Embedding](../features/fp8-embedding.md), [LoRA](../features/lora.md), and [Vocabulary Reduction](../features/reduce-vocab.md).
+
+For INT4 engine builds on Jetson Orin devices with less system memory, such as
+Jetson Orin Nano, externalized weights are recommended to reduce engine build
+memory. Use
+`--externalize-weights int4_ffn` for dense INT4 checkpoints and
+`--externalize-weights int4_ffn int4_moe` for INT4 MoE checkpoints.
 
 #### Transfer to Device
 
@@ -166,7 +181,7 @@ On your Thor device:
 # Set up workspace directory
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Qwen3-0.6B
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 # Build engine
 ./build/examples/llm/llm_build \
@@ -205,12 +220,12 @@ cat > $WORKSPACE_DIR/input.json << 'EOF'
 EOF
 ```
 
-> **Tip:** You can also use example input files from `~/TensorRT-Edge-LLM/tests/test_cases/` (e.g., `llm_basic.json`) instead of creating your own.
+> **Tip:** You can also use example input files from `/path/to/TensorRT-Edge-LLM/tests/test_cases/` (e.g., `llm_basic.json`) instead of creating your own.
 
 Run inference:
 
 ```bash
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 ./build/examples/llm/llm_inference \
     --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines \

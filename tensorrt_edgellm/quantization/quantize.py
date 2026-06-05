@@ -24,12 +24,14 @@ import os
 import shutil
 import time
 from contextlib import contextmanager
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Iterable, Optional
 
 import modelopt.torch.quantization as mtq
 import torch
 from modelopt.torch.export import export_hf_checkpoint
 from modelopt.torch.quantization.utils import is_quantized
+from safetensors.torch import load_file
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import (AutoModel, AutoModelForCausalLM,
@@ -314,6 +316,104 @@ def _load_model(model_dir, dtype="fp16", device="cuda"):
     return model, tokenizer, processor
 
 
+def _collect_mtp_weight_map(
+        weight_map: dict[str, str]) -> dict[str, list[str]]:
+    """Group MTP tensor names by safetensors shard from an HF weight map."""
+    mtp_weight_map: dict[str, list[str]] = {}
+    for key, filename in weight_map.items():
+        if "mtp" in key or "mtp" in filename:
+            mtp_weight_map.setdefault(filename, []).append(key)
+    return {
+        filename: sorted(keys)
+        for filename, keys in sorted(mtp_weight_map.items())
+    }
+
+
+def _extract_mtp_layer_prefixes(keys: Iterable[str]) -> list[str]:
+    """Return MTP prefixes for the unquantized export fallback."""
+    prefixes: set[str] = set()
+    for key in keys:
+        parts = key.split(".")
+        if parts:
+            prefixes.add(parts[0])
+        for idx, part in enumerate(parts[:-1]):
+            if part == "layers" and parts[idx + 1].isdigit():
+                prefixes.add(".".join(parts[:idx + 2]))
+                break
+    return sorted(prefixes)
+
+
+def _load_mtp_weights_for_unified_export(
+        model: torch.nn.Module,
+        model_dir: str) -> "tuple[list[str], dict[str, torch.Tensor]]":
+    """Load unquantized Qwen3.5 MTP tensors for unified export fallback.
+
+    This mirrors ModelOpt's ``load_mtp_weights`` + ``export_hf_checkpoint``
+    usage while keeping the checkpoint parsing deterministic and explicit:
+    tensors already present on the loaded HF model are copied into the model
+    state, and tensors absent from ``model.state_dict()`` are returned for
+    ``export_hf_checkpoint(extra_state_dict=...)``.
+    """
+    ckpt_dir = Path(model_dir)
+    index_path = ckpt_dir / "model.safetensors.index.json"
+    if not index_path.exists():
+        return [], {}
+
+    with index_path.open(encoding="utf-8") as f:
+        weight_map = json.load(f).get("weight_map", {})
+
+    mtp_weight_map = _collect_mtp_weight_map(weight_map)
+    if not mtp_weight_map:
+        return [], {}
+
+    mtp_keys = [key for keys in mtp_weight_map.values() for key in keys]
+    mtp_layer_prefixes = _extract_mtp_layer_prefixes(mtp_keys)
+    model_state_keys = set(model.state_dict())
+    extra_state_dict: dict[str, torch.Tensor] = {}
+    loaded_count = 0
+
+    for filename, keys in mtp_weight_map.items():
+        path = ckpt_dir / filename
+        if not path.exists():
+            raise FileNotFoundError(
+                f"MTP shard referenced by index not found: "
+                f"{path}")
+        print(f"Loading {len(keys)} MTP tensor(s) from {filename}...")
+        key_set = set(keys)
+        tensors = load_file(str(path), device="cpu")
+        tensors = {
+            key: tensor
+            for key, tensor in tensors.items() if key in key_set
+        }
+        in_state_dict = {
+            key: tensor
+            for key, tensor in tensors.items() if key in model_state_keys
+        }
+        if in_state_dict:
+            model.load_state_dict(in_state_dict, strict=False)
+            loaded_count += len(in_state_dict)
+        extra_state_dict.update({
+            key: tensor
+            for key, tensor in tensors.items() if key not in model_state_keys
+        })
+
+    if loaded_count or extra_state_dict:
+        print("Loaded MTP tensors for unified export: "
+              f"{loaded_count} in model state, "
+              f"{len(extra_state_dict)} via extra_state_dict.")
+    if mtp_layer_prefixes:
+        print(f"Detected unquantized MTP prefixes for quantization ignore: "
+              f"{mtp_layer_prefixes}")
+
+    return mtp_layer_prefixes, extra_state_dict
+
+
+def _mtp_num_hidden_layers(model: torch.nn.Module) -> int:
+    """Return the number of dense MTP draft layers declared by a HF config."""
+    text_config = getattr(model.config, "text_config", model.config)
+    return int(getattr(text_config, "mtp_num_hidden_layers", 0) or 0)
+
+
 def _calibrate(model, dataloader):
     """Forward-loop calibration pass."""
     for data in tqdm(dataloader, desc="Calibrating"):
@@ -454,6 +554,8 @@ def _skip_resmooth_for_hybrid(model, quantization: str = ""):
 def _calibrate_multimodal(model, batches):
     """Forward-loop calibration pass for multimodal ``BatchFeature`` dicts."""
     device = model.device
+    valid_batches = 0
+    skipped_nan_batches = 0
     for batch in tqdm(batches, desc="Calibrating (multimodal)"):
         kwargs = {}
         for k, v in batch.items():
@@ -466,7 +568,25 @@ def _calibrate_multimodal(model, batches):
             kwargs[k] = v
         kwargs.setdefault("use_cache", False)
         with torch.no_grad():
-            model(**kwargs)
+            try:
+                model(**kwargs)
+                valid_batches += 1
+            except AssertionError as exc:
+                # Some multimodal samples can produce non-finite activations
+                # during calibrator collection. ModelOpt 0.44 reports this
+                # through an internal assert on the calibrator amax value; skip
+                # those samples so calibration can complete with valid batches.
+                if "detected nan values in amax" in str(exc):
+                    skipped_nan_batches += 1
+                    continue
+                raise
+    if valid_batches == 0:
+        raise RuntimeError(
+            "All multimodal calibration batches were skipped due to NaN amax.")
+    if skipped_nan_batches > 0:
+        print(
+            f"[WAR] Skipped {skipped_nan_batches} multimodal calibration batch(es) with NaN amax."
+        )
 
 
 def _calibrate_asr_multimodal(model, batch_iter):
@@ -518,16 +638,15 @@ def quantize_and_export(
     t0 = time.time()
     model, tokenizer, processor = _load_model(model_dir, dtype, device)
 
-    # --- MTP draft: detect and quantize BEFORE base quantization ----------
-    text_config = getattr(model.config, "text_config", model.config)
-    mtp_layers = getattr(text_config, "mtp_num_hidden_layers", 0) or 0
-    quantized_mtp_draft = None
-
+    mtp_layers = _mtp_num_hidden_layers(model)
+    mtp_quantized = False
+    mtp_state_dict: dict[str, torch.Tensor] = {}
     if (mtp_layers > 0 and quantization is not None
             and not is_quantized(model)):
-        from .models.mtp_draft import quantize_mtp_from_base
-        print(f"Detected {mtp_layers} MTP layer(s) — quantizing MTP draft "
-              f"before base model.")
+        from .models.mtp_draft import (export_quantized_mtp_state_dict,
+                                       quantize_mtp_from_base)
+        print(f"Detected {mtp_layers} MTP layer(s); quantizing MTP draft "
+              "before base model.")
         quantized_mtp_draft = quantize_mtp_from_base(
             base_model=model,
             tokenizer=tokenizer,
@@ -540,6 +659,14 @@ def quantize_and_export(
             dataset=dataset,
             num_samples=num_samples,
         )
+        mtp_state_dict = export_quantized_mtp_state_dict(
+            quantized_mtp_draft, dtype)
+        print(f"Prepared {len(mtp_state_dict)} quantized MTP tensor(s) for "
+              "unified export.")
+        mtp_quantized = True
+        del quantized_mtp_draft
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # --- Quantize base model ----------------------------------------------
     if is_quantized(model):
@@ -622,10 +749,18 @@ def quantize_and_export(
     _fix_generation_config_for_strict_validate(model)
     _normalize_tied_weights_keys(model)
 
+    if mtp_layers > 0 and not mtp_quantized:
+        mtp_layer_prefixes, mtp_state_dict = (
+            _load_mtp_weights_for_unified_export(model, model_dir))
+        if mtp_layer_prefixes:
+            model._mtp_layer_prefixes = mtp_layer_prefixes
+
     os.makedirs(output_dir, exist_ok=True)
     with torch.inference_mode(), _skip_resmooth_for_hybrid(
             model, quantization or ""):
-        export_hf_checkpoint(model, export_dir=output_dir)
+        export_hf_checkpoint(model,
+                             export_dir=output_dir,
+                             extra_state_dict=mtp_state_dict)
     _remove_stale_safetensors_index(output_dir)
     tokenizer.save_pretrained(output_dir)
     if processor is not None:
@@ -633,14 +768,6 @@ def quantize_and_export(
             _copy_phi4mm_processor_files(model_dir, output_dir)
         else:
             processor.save_pretrained(output_dir)
-
-    # --- MTP draft: merge quantized weights or copy unquantized -----------
-    if mtp_layers > 0:
-        from .models.mtp_draft import copy_unquantized_mtp, save_quantized_mtp
-        if quantized_mtp_draft is not None:
-            save_quantized_mtp(quantized_mtp_draft, output_dir, dtype)
-        else:
-            copy_unquantized_mtp(model_dir, output_dir)
 
     # Copy preprocessor / processor configs so downstream tools (tensorrt_edgellm's
     # tensorrt-edgellm-export, the C++ visual builder) can find image preprocessing

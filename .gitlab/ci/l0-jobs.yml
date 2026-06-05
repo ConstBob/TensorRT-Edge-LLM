@@ -298,10 +298,11 @@ l0_jetson_orin:
     - l0_checkpoint_export_ampere
   variables:
     BOARD_USER: "tensorrt_user"
-    CUDA_VERSION: "12.9"
+    CUDA_VERSION: "13.2"
+    TRT_CUDA_VERSION: "13.2"
     L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/jetson_orin"
-    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.jp6.cuda-$CUDA_VERSION"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.aarch64.cuda-$TRT_CUDA_VERSION"
     PRIORITY: l0_pipeline_orin
     ONNX_DIR: "$L0_CACHE_DIR/checkpoint_export_ampere/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
