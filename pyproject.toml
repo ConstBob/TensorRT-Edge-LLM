@@ -41,9 +41,12 @@ tools = [
     "soundfile==0.13.1",
     "librosa==0.11.0",
     "tiktoken==0.13.0",
+    "torchvision==0.27.0",
+    "backoff",
 ]
 server = [
     "fastapi==0.136.1",
+    "pybind11==2.13.6",
     "uvicorn==0.47.0",
 ]
 dev = []

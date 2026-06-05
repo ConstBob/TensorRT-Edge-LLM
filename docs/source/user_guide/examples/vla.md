@@ -26,8 +26,6 @@ trajectory history points as `[x, y, z]`. The action output is written as
 ## Step 1: Export (x86 Host)
 
 ```bash
-export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
-export PYTHONPATH=$EDGE_LLM_PATH:$PYTHONPATH
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Alpamayo-R1-10B
 mkdir -p $WORKSPACE_DIR
@@ -60,7 +58,7 @@ scp -r $MODEL_NAME/onnx \
 ```bash
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Alpamayo-R1-10B
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 # Build language model engine
 ./build/examples/llm/llm_build \
@@ -171,7 +169,7 @@ images as an ordered list of image content items.
 Run inference:
 
 ```bash
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 ./build/examples/multimodal/action_inference \
   --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines/llm \

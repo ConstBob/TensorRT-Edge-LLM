@@ -14,18 +14,19 @@ TensorRT Edge-LLM is NVIDIA's high-performance C++ inference runtime for Large L
 
 | Platform | Software Release | Link |
 |----------|------------------|------|
-| NVIDIA Jetson Thor | JetPack 7.1 | [JetPack Website](https://developer.nvidia.com/embedded/jetpack) |
-| NVIDIA DRIVE Thor | NVIDIA DriveOS 7 | [NVIDIA DRIVE Developer](https://developer.nvidia.com/drive) |
+| NVIDIA Jetson Thor | JetPack 7.x | [JetPack Website](https://developer.nvidia.com/embedded/jetpack) |
+| NVIDIA DRIVE Thor | NVIDIA DriveOS 7.2 | [NVIDIA DRIVE Developer](https://developer.nvidia.com/drive) |
+| NVIDIA Jetson Orin | JetPack 7.2 | [JetPack Website](https://developer.nvidia.com/embedded/jetpack) |
 
-> **Note:** The platforms listed above are officially supported and tested. While TensorRT Edge-LLM may run on other NVIDIA GPU platforms (for example, discrete GPUs, other Jetson devices), these are not officially supported but may be used for experimental purposes.
+> **Note:** The platforms listed above are officially supported and tested. Jetson Orin supports FP16, INT8, and INT4 model precisions. For exact build flags by platform and JetPack release, see the [Installation Guide](user_guide/getting_started/installation.md).
 
 **Compatible Platforms:**
 
 | Platform | Software Release |
 |----------|------------------|
-| NVIDIA Jetson Orin | JetPack 6.2.x |
+| NVIDIA Jetson Orin | JetPack 6.2+ |
 
-> **Note:** TensorRT Edge-LLM will officially support Jetson Orin via later JetPack releases. While JetPack 6.2.x is compatible, the support is experimental. 
+> **Note:** JetPack 7.2 is the supported Jetson Orin path. JetPack 6.2+ remains compatible for FP16, INT8, and INT4 workflows.
 
 
 ### Supported Model Families

@@ -67,7 +67,7 @@ class Qwen3_5SparseMoeBlock(Qwen3SparseMoeBlock):
 
     def __init__(self, config: ModelConfig, layer_idx: int) -> None:
         super().__init__(config)
-        prefix = f"model.layers.{layer_idx}.mlp"
+        prefix = f"layers.{layer_idx}.mlp"
         self.shared_expert = Qwen3_5SharedExpert(config,
                                                  f"{prefix}.shared_expert")
         self.shared_expert_gate = make_linear(

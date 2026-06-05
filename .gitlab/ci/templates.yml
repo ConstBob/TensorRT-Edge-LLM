@@ -59,7 +59,9 @@
     - cd $LLM_SDK_DIR
     - pip3 install -q build
     - python3 -m build --wheel --outdir dist .
-    - pip3 install dist/*.whl
+    - export EDGE_LLM_WHEEL=$(python3 -c 'import glob; print(glob.glob("dist/*.whl")[0])')
+    - pip3 install "${EDGE_LLM_WHEEL}[tools]"
+    - python3 -c 'import torchvision; print(f"torchvision {torchvision.__version__}")'
     - echo "Installing pytest dependencies"
     - pip3 install -q -r tests/requirements.txt
     - echo "Checkpoint exporter dependencies are provided by the package wheel"

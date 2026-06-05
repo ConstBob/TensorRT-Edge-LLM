@@ -383,14 +383,9 @@ def quantize_mtp_from_base(
     return mtp_draft
 
 
-def save_quantized_mtp(mtp_draft: "MtpDraftModel", output_dir: str,
-                       dtype: str) -> None:
-    """Extract quantized MTP weights and merge into the base checkpoint.
-
-    Quantized weights are prefixed with ``mtp.`` and merged into the
-    safetensors file(s) in *output_dir*.  Shared tensors (embed_tokens,
-    rotary_emb) are excluded.
-    """
+def export_quantized_mtp_state_dict(mtp_draft: "MtpDraftModel",
+                                    dtype: str) -> Dict[str, torch.Tensor]:
+    """Return quantized MTP tensors in unified-checkpoint key format."""
     from modelopt.torch.export.quant_utils import get_quant_config
     from modelopt.torch.export.unified_export_hf import (
         QUANTIZATION_NONE, _export_quantized_weight, get_quantization_format,
@@ -412,7 +407,20 @@ def save_quantized_mtp(mtp_draft: "MtpDraftModel", output_dir: str,
     for key, tensor in sd.items():
         if key.startswith("embed_tokens") or key.startswith("rotary_emb"):
             continue
-        mtp_tensors[f"mtp.{key}"] = tensor
+        mtp_tensors[f"mtp.{key}"] = tensor.detach().cpu()
+
+    return mtp_tensors
+
+
+def save_quantized_mtp(mtp_draft: "MtpDraftModel", output_dir: str,
+                       dtype: str) -> None:
+    """Extract quantized MTP weights and merge into the base checkpoint.
+
+    Quantized weights are prefixed with ``mtp.`` and merged into the
+    safetensors file(s) in *output_dir*.  Shared tensors (embed_tokens,
+    rotary_emb) are excluded.
+    """
+    mtp_tensors = export_quantized_mtp_state_dict(mtp_draft, dtype)
 
     _merge_tensors_into_safetensors(output_dir, mtp_tensors)
     print(f"Merged {len(mtp_tensors)} quantized MTP weight(s) into "

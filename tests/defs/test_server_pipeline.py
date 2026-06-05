@@ -41,18 +41,23 @@ def test_build_pybind(env_config: EnvironmentConfig,
     """
     build_dir = env_config.build_dir
 
-    pybind_venv = 'venv/pybind'
-    install_cmd = (f'python3 -m venv {pybind_venv}'
-                   f' && {pybind_venv}/bin/pip install -q pybind11')
+    repo_root = '.' if remote_config else env_config.llm_sdk_dir
+    pybind_venv = 'venv/server'
+    install_cmd = (f'cd {shlex.quote(repo_root)}'
+                   f' && python3 -m venv {pybind_venv}'
+                   f' && {pybind_venv}/bin/pip install -q'
+                   ' -r requirements-server.txt')
     result = run_command(cmd=['bash', '-c', install_cmd],
                          remote_config=remote_config,
                          timeout=120,
                          logger=test_logger)
     if not result['success']:
-        pytest.fail(f"Failed to install pybind11: {result.get('error')}")
+        pytest.fail(
+            f"Failed to install server dependencies: {result.get('error')}")
 
+    pybind_python = f'{repo_root}/{pybind_venv}/bin/python'
     pybind11_dir_expr = (
-        f'$({pybind_venv}/bin/python'
+        f'$({shlex.quote(pybind_python)}'
         ' -c "import pybind11; print(pybind11.get_cmake_dir())")')
     build_cmd = (f'PYBIND11_DIR={pybind11_dir_expr}'
                  f' && cd {build_dir}'

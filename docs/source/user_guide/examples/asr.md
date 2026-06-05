@@ -8,28 +8,9 @@ Complete workflow for speech recognition with audio understanding capabilities.
 
 ---
 
-## Step 0: Install ASR Dependency (x86 Host)
-
-The export pipeline loads the Qwen3-ASR model via the `qwen-asr` package. Install it before exporting:
-
-> **Warning:** Installing `qwen-asr` may break package versions in your current environment (e.g. `transformers`, `torch`). **Use a dedicated virtual environment for Qwen3-ASR export only** — do not share it with other model workflows. We need this special workflow until Qwen3-ASR gets merged into HuggingFace transformers.
-
-```bash
-cd TensorRT-Edge-LLM
-python3 -m venv venv-qwen3-asr
-source venv-qwen3-asr/bin/activate
-pip3 install -r requirements.txt
-pip3 install ".[tools]"
-pip3 install qwen-asr       # install qwen3-asr and its required dependencies.
-```
-
----
-
 ## Step 1: Export (x86 Host)
 
 ```bash
-export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
-export PYTHONPATH=$EDGE_LLM_PATH:$PYTHONPATH
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Qwen3-ASR-0.6B
 mkdir -p $WORKSPACE_DIR
@@ -55,7 +36,7 @@ scp -r $MODEL_NAME/onnx \
 # Set up workspace directory on device
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Qwen3-ASR-0.6B
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 # Build language model engine
 ./build/examples/llm/llm_build \
@@ -77,14 +58,13 @@ cd ~/TensorRT-Edge-LLM
 
 Audio files must be converted to mel-spectrogram safetensors format before inference.
 
-> **Note:** This step uses the `tensorrt-edgellm-preprocess-audio` utility from the installed package. Set `EDGE_LLM_PATH` if running on a device where it was not defined in Step 1.
+> **Note:** This step uses the `tensorrt-edgellm-preprocess-audio` utility from the installed package.
 
 ```bash
-export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
-export PYTHONPATH=$EDGE_LLM_PATH:$PYTHONPATH
-export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
+cd /path/to/TensorRT-Edge-LLM
+pip3 install ".[tools]"
 
-pip3 install -e $EDGE_LLM_PATH  # required for tensorrt-edgellm-preprocess-audio
+export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 
 tensorrt-edgellm-preprocess-audio \
   --input /path/to/audio.wav \
@@ -124,7 +104,7 @@ Create an input file `$WORKSPACE_DIR/input_asr.json` (replace `/path/to/audio_in
 Run inference:
 
 ```bash
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 ./build/examples/llm/llm_inference \
   --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines/llm \
@@ -204,6 +184,8 @@ tensorrt-edgellm-export \
 **Recipe C: 1.7B NVFP4 LLM + FP8 audio**
 
 ```bash
+export MODEL_NAME=Qwen3-ASR-1.7B
+
 tensorrt-edgellm-quantize llm \
   --model_dir Qwen/Qwen3-ASR-1.7B \
   --output_dir $WORKSPACE_DIR/$MODEL_NAME-nvfp4-a.fp8 \

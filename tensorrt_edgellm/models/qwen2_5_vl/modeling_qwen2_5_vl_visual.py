@@ -491,7 +491,13 @@ def build_qwen25_vl_visual(
     """
     model = Qwen2_5VLVisualModel(config, model_config=model_config)
     model.to(dtype)
-    _load_weights(model, weights, prefix="visual")
+    # Raw HF checkpoints store visual weights under ``visual.*``, while modelopt
+    # quantization checkpoints nest them under ``model.visual.*`` (the whole
+    # model is wrapped under ``model.`` on re-save). Pick the prefix that the
+    # checkpoint actually uses so both layouts load correctly.
+    prefix = "model.visual" if any(
+        k.startswith("model.visual.") for k in weights) else "visual"
+    _load_weights(model, weights, prefix=prefix)
     model.eval()
     return model
 

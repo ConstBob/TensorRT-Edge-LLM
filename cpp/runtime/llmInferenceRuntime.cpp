@@ -147,7 +147,8 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     }
     // Externalized model weights: the SharedResources factory only allocates an
     // empty manager. Load external weights and validate against engine inputs.
-    // External weights currently apply to the base engine only (no draft-engine load call).
+    // This handles the base engine; the spec-decode draft engine loads its own
+    // external weights from draft_config.json inside the EAGLE/MTP decoder.
     mSharedResources->externalWeightManager->load(std::filesystem::path(engineDir), baseConfigPath, stream);
     mSharedResources->externalWeightManager->validateAgainstEngine(*mBaseExecutor, "base");
 

@@ -706,6 +706,9 @@ def generate_e2e_bench_commands(
         cmd.append(f"--multimodalEngineDir={config.get_visual_engine_dir()}")
     elif config.model_type == ModelType.ASR:
         cmd.append(f"--multimodalEngineDir={config.get_audio_engine_dir()}")
+    elif config.model_type == ModelType.OMNI:
+        cmd.append(
+            f"--multimodalEngineDir={config.get_multimodal_engine_dir()}")
 
     # Add batch size override if specified
     if config.batch_size is not None:

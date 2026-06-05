@@ -6,30 +6,14 @@ The experimental Python API wraps export, engine build, engine loading, generati
 
 ## Prerequisites
 
-Build the C++ runtime and pybind extension first:
+Complete the [Installation Guide](../getting_started/installation.md) with the C++ runtime, Python bindings, and server dependencies enabled before proceeding. The examples below assume `experimental.server` and `tensorrt_edgellm` are importable from the active Python environment.
+
+If the active environment was installed with base export dependencies only, install the server dependencies before building Python bindings or launching the server:
 
 ```bash
-export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
-cd $EDGE_LLM_PATH
-export PYTHONPATH=$EDGE_LLM_PATH:$PYTHONPATH
-
-mkdir -p build && cd build
-cmake .. -DTRT_PACKAGE_DIR=$TRT_PACKAGE_DIR -DBUILD_PYTHON_BINDINGS=ON
-make -j$(nproc)
-```
-
-Install server dependencies:
-
-```bash
-cd $EDGE_LLM_PATH
-pip install -r requirements.txt
+cd /path/to/TensorRT-Edge-LLM
 pip install -r requirements-server.txt
-pip install pybind11
 ```
-
-Run examples from the repository root with the same `PYTHONPATH`. The
-repository root makes `experimental.server` importable; the `experimental`
-directory makes the `tensorrt_edgellm` top-level package importable.
 
 ## Python API
 
