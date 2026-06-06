@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -230,19 +230,20 @@ struct TinyPtr
     {
         D* const p = reinterpret_cast<D*>(base);
         assert(reinterpret_cast<uintptr_t>(p) % alignof(D) == 0);
+        uint32_t castOffset = 0;
         if constexpr (mha::is_void_v<T>)
         {
             assert(offset == 0);
-            return TinyPtr<D>{p, 0};
         }
         else if constexpr (sizeof(T) < sizeof(D))
         {
-            return TinyPtr<D>{p, exactDiv(offset, exactDiv(sizeof(D), sizeof(T)))};
+            castOffset = exactDiv(offset, exactDiv(sizeof(D), sizeof(T)));
         }
         else
         {
-            return TinyPtr<D>{p, offset * exactDiv(sizeof(T), sizeof(D))};
+            castOffset = offset * exactDiv(sizeof(T), sizeof(D));
         }
+        return TinyPtr<D>{p, castOffset};
     }
 
     __device__ __host__ inline T& operator*() const

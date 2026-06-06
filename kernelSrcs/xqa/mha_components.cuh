@@ -1,3 +1,15 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ *
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+ */
+
 #pragma once
 #include "mma.cuh"
 #include "utils.cuh"
@@ -111,6 +123,7 @@ __device__ inline ThrdRegRowMaxT<warp_size * exactDiv(n, 4)> dedupFromQuad(Warp 
     return dst;
 }
 
+#if SUPPORTS_FP8
 template <uint32_t tileM, uint32_t tileN>
 __device__ inline ThrdRegRowMaxT<tileM> computeRowSumF8(
     Warp const& warp, Array2D<Array2D<uint32_t, 2, 1>, exactDiv(tileM, 16), exactDiv(tileN, 16)> const& src)
@@ -143,6 +156,7 @@ __device__ inline ThrdRegRowMaxT<tileM> computeRowSumF8(
     }
     return dedupFromQuad(warp, rowSum);
 }
+#endif
 
 template <uint32_t tileM, uint32_t tileN>
 __device__ inline ThrdRegRowMaxT<tileM> computeRowSumF32(Warp const& warp, WarpAccT<tileM, tileN> const& src)

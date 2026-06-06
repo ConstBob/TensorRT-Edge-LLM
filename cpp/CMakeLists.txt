@@ -1,5 +1,6 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
-# All rights reserved. SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION &
+# AFFILIATES. All rights reserved. SPDX-License-Identifier:
+# LicenseRef-NvidiaProprietary
 #
 # NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
 # property and proprietary rights in and to this material, related documentation
@@ -69,9 +70,13 @@ else()
   message(STATUS "FMHA Kernels: Compiling cubins for all SM architectures")
 endif()
 
+include(${CMAKE_SOURCE_DIR}/cmake/XQACubins.cmake)
+edgellm_xqa_cubins_setup()
+
 # Generate Core C++ static library for LLM-SDK
 file(GLOB_RECURSE COMMON_CPP_SRCS "common/*.cpp")
 file(GLOB_RECURSE KERNELS_CPP_SRCS "kernels/*.cpp")
+edgellm_xqa_add_generated_sources(KERNELS_CPP_SRCS)
 file(GLOB_RECURSE KERNELS_CU_SRCS "kernels/*.cu")
 # Exclude MoE Marlin ops/sm80 - compiled only via include from moeMarlin.cu
 list(FILTER KERNELS_CU_SRCS EXCLUDE REGEX
@@ -91,6 +96,7 @@ set_source_files_properties(${MOE_MARLIN_CU_SRCS} PROPERTIES COMPILE_FLAGS
 add_library(edgellmKernels STATIC ${KERNELS_CPP_SRCS} ${KERNELS_CU_SRCS}
                                   ${COMMON_CPP_SRCS})
 target_include_directories(edgellmKernels PRIVATE ${COMMON_INCLUDE_DIRS})
+edgellm_xqa_configure_target(edgellmKernels)
 # Apply FMHA SM exclusion definitions
 target_compile_definitions(edgellmKernels PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
 # Enable separable compilation for MoE Marlin kernel templates
@@ -112,6 +118,7 @@ add_library(
   ${PROFILER_CPP_SRCS}
   ${TOKENIZER_CPP_SRCS})
 target_include_directories(edgellmCore PRIVATE ${COMMON_INCLUDE_DIRS})
+edgellm_xqa_configure_target(edgellmCore)
 target_link_libraries(edgellmCore PRIVATE dl)
 # Apply FMHA SM exclusion definitions
 target_compile_definitions(edgellmCore PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})

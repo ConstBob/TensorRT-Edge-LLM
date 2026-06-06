@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -12,6 +12,7 @@
 
 #pragma once
 #include "mha_stdheaders.cuh"
+#include "common/cudaMacros.h"
 
 #define STATIC_NB_K_HEADS 0
 #if STATIC_NB_K_HEADS
@@ -31,6 +32,9 @@
 #define IS_MLA (HEAD_GRP_SIZE == 128 && HEAD_ELEMS == 576)
 
 #if IS_MLA
+#if !SUPPORTS_FP8
+#error "MLA XQA kernels require CUDA FP8 support."
+#endif
 #define INPUT_ELEM __nv_fp8_e4m3
 #define INPUT_ELEM2 __nv_fp8x2_e4m3
 #define HEAD_ELEMS_V 512
@@ -59,6 +63,24 @@
 #define SPEC_DEC 0
 #endif
 
+#ifndef XQA_2CTA_HEAD_DIM512
+#define XQA_2CTA_HEAD_DIM512 0
+#endif
+
+#ifndef TILED_QKV_STAGING_HEAD_DIM512
+#define TILED_QKV_STAGING_HEAD_DIM512 0
+#endif
+
+#if XQA_2CTA_HEAD_DIM512
+static_assert(HEAD_ELEMS == 512, "XQA_2CTA_HEAD_DIM512 is only valid for head_dim=512.");
+static_assert(BEAM_WIDTH == 1, "XQA_2CTA_HEAD_DIM512 supports beam width 1 only.");
+#endif
+
+#if TILED_QKV_STAGING_HEAD_DIM512
+static_assert(HEAD_ELEMS == 512, "TILED_QKV_STAGING_HEAD_DIM512 is only valid for head_dim=512.");
+static_assert(!XQA_2CTA_HEAD_DIM512, "TILED_QKV_STAGING_HEAD_DIM512 is a single-CTA path.");
+#endif
+
 #if SPEC_DEC
 using MaskType = uint32_t;
 
@@ -78,6 +100,10 @@ static_assert(SPEC_DEC, "SPEC_Q_SEQ_LEN should only be used when SPEC_DEC is ena
 #define CACHE_ELEM_ENUM 2
 #endif
 
+#if CACHE_ELEM_ENUM == 2 && !SUPPORTS_FP8
+#error "FP8 XQA KV cache requires CUDA FP8 support."
+#endif
+
 // don't modify
 #define USE_KV_CACHE true
 
@@ -95,6 +121,10 @@ static_assert(SPEC_DEC, "SPEC_Q_SEQ_LEN should only be used when SPEC_DEC is ena
 // don't modify
 #ifndef USE_PAGED_KV_CACHE
 #define USE_PAGED_KV_CACHE (TOKENS_PER_PAGE > 0)
+#endif
+
+#if XQA_2CTA_HEAD_DIM512
+static_assert(!USE_PAGED_KV_CACHE, "XQA_2CTA_HEAD_DIM512 supports contiguous KV cache only.");
 #endif
 
 // Paged KV Cache Format
@@ -180,7 +210,11 @@ static_assert(CACHE_ELEM_ENUM != 0);
 #define DBG_NB_CTAS_PER_SEQ 8
 
 #include <cuda_fp16.h>
-#include <cuda_fp8.h>
+#if SUPPORTS_FP8
 template <int32_t elemTypeEnum>
 using ElemType = mha::conditional_t<elemTypeEnum == 0, INPUT_ELEM,
     mha::conditional_t<elemTypeEnum == 1, int8_t, mha::conditional_t<elemTypeEnum == 2, __nv_fp8_e4m3, void>>>;
+#else
+template <int32_t elemTypeEnum>
+using ElemType = mha::conditional_t<elemTypeEnum == 0, INPUT_ELEM, mha::conditional_t<elemTypeEnum == 1, int8_t, void>>;
+#endif
