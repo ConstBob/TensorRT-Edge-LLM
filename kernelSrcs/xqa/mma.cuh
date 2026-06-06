@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -17,7 +17,15 @@
 #include <cuda_runtime.h>
 #endif
 #include <cuda_fp16.h>
-#include <cuda_fp8.h>
+#include "common/cudaMacros.h"
+
+template <typename InputElem>
+inline constexpr bool isSupportedMmaInputElem
+    = mha::is_same_v<InputElem, half> || mha::is_same_v<InputElem, __nv_bfloat16>
+#if SUPPORTS_FP8
+    || mha::is_same_v<InputElem, __nv_fp8_e4m3>
+#endif
+    ;
 
 // for both a and b, outer-dim is gemm-K and inner-dim is gemm-M or gemm-N
 // acc is used as both input and output.
@@ -25,9 +33,7 @@ template <typename InputElem>
 __device__ inline void mma(float (&acc)[2][2], uint32_t const (&a)[2][2], uint32_t const (&b)[2][1])
 {
 
-    static_assert(mha::is_same_v<InputElem, half> || mha::is_same_v<InputElem, __nv_bfloat16>
-            || mha::is_same_v<InputElem, __nv_fp8_e4m3>,
-        "not implemented");
+    static_assert(isSupportedMmaInputElem<InputElem>, "not implemented");
     if constexpr (mha::is_same_v<InputElem, half>)
     {
         asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 \n"
@@ -48,6 +54,7 @@ __device__ inline void mma(float (&acc)[2][2], uint32_t const (&a)[2][2], uint32
             : "+f"(acc[0][0]), "+f"(acc[0][1]), "+f"(acc[1][0]), "+f"(acc[1][1])
             : "r"(a[0][0]), "r"(a[0][1]), "r"(a[1][0]), "r"(a[1][1]), "r"(b[0][0]), "r"(b[1][0]));
     }
+#if SUPPORTS_FP8
     else if constexpr (mha::is_same_v<InputElem, __nv_fp8_e4m3>)
     {
         asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 \n"
@@ -58,12 +65,14 @@ __device__ inline void mma(float (&acc)[2][2], uint32_t const (&a)[2][2], uint32
             : "+f"(acc[0][0]), "+f"(acc[0][1]), "+f"(acc[1][0]), "+f"(acc[1][1])
             : "r"(a[0][0]), "r"(a[0][1]), "r"(a[1][0]), "r"(a[1][1]), "r"(b[0][0]), "r"(b[1][0]));
     }
+#endif
     else
     {
         asm volatile("trap;");
     }
 }
 
+#if SUPPORTS_FP8
 __device__ inline void mmaF8_k16(float (&acc)[2][2], uint32_t const (&a)[2], uint32_t const b)
 {
     asm("mma.sync.aligned.m16n8k16.row.col.f32.e4m3.e4m3.f32 \n"
@@ -91,3 +100,4 @@ struct mmaShape
 };
 
 inline constexpr mmaShape qmmaShape = {16, 8, 32};
+#endif

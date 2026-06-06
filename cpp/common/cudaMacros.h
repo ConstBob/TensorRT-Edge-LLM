@@ -17,7 +17,18 @@
 
 #pragma once
 
+// Avoid pulling <cuda.h> when nvcc already exposes version macros. XQA cubin generation uses a
+// lightweight stdint shim that conflicts with CUDA's transitive stdint includes.
+#if !defined(CUDA_VERSION) && !defined(__CUDACC_VER_MAJOR__)
 #include <cuda.h>
+#endif
+
+// Normalize host CUDA_VERSION and nvcc's compiler-version macros into one value for feature gates.
+#if defined(CUDA_VERSION)
+#define EDGELLM_CUDA_VERSION CUDA_VERSION
+#elif defined(__CUDACC_VER_MAJOR__) && defined(__CUDACC_VER_MINOR__)
+#define EDGELLM_CUDA_VERSION (__CUDACC_VER_MAJOR__ * 1000 + __CUDACC_VER_MINOR__ * 10)
+#endif
 
 /*!
  * @brief CUDA feature detection helpers
@@ -38,14 +49,20 @@
  * so callers do NOT need to conditionally include it themselves.
  */
 
-#if defined(CUDA_VERSION) && (CUDA_VERSION >= 11080)
+#if defined(EDGELLM_CUDA_VERSION) && (EDGELLM_CUDA_VERSION >= 11080)
 #include <cuda_fp8.h>
 #define SUPPORTS_FP8 1
 #else
 #define SUPPORTS_FP8 0
 #endif
 
-#if defined(CUDA_VERSION) && (CUDA_VERSION >= 12080)
+#if defined(EDGELLM_CUDA_VERSION) && (EDGELLM_CUDA_VERSION >= 11080)
+#define SUPPORTS_CLUSTER_LAUNCH 1
+#else
+#define SUPPORTS_CLUSTER_LAUNCH 0
+#endif
+
+#if defined(EDGELLM_CUDA_VERSION) && (EDGELLM_CUDA_VERSION >= 12080)
 #include <cuda_fp4.h>
 #define SUPPORTS_FP4 1
 #else

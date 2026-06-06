@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -113,7 +113,7 @@ public:
                          : "=l"(token)
                          : "l"(addr()), "r"(update - 1U)
                          : "memory");
-            ArrivalToken refToken;
+            [[maybe_unused]] ArrivalToken refToken;
             asm volatile("mbarrier.arrive" STR_REL_CTA ".b64 %0, [%1];\n" : "=l"(refToken) : "l"(addr()) : "memory");
             assert(token == refToken);
             return token;

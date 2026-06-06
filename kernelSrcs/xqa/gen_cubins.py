@@ -11,6 +11,7 @@
 
 # NOTE: this file is for cubin generation, should not in final code release.
 
+import argparse
 import itertools
 import multiprocessing
 import os
@@ -63,7 +64,32 @@ clean_cubin = True
 nvcc_bin = 'nvcc'
 nvcc_flags = '-std=c++17 -O3 -cubin -DGENERATE_CUBIN=1 -DNDEBUG --use_fast_math -Xptxas=-v --allow-unsupported-compiler --expt-relaxed-constexpr -t 0'
 # nvcc_flags = '-std=c++17 -G -cubin -DGENERATE_CUBIN=1 -Xptxas=-v --allow-unsupported-compiler --expt-relaxed-constexpr -t 0'
-cuda_toolkit_major_version = None
+cuda_toolkit_version = None
+cubin_dir = "../../cpp/kernels/decodeAttentionKernels/cubin/"
+xqa_source_dir = os.path.dirname(os.path.abspath(__file__))
+cpp_include_dir = os.path.abspath(os.path.join(xqa_source_dir, '..', '..',
+                                               'cpp'))
+
+
+def use_tiled_qkv_staging_head_dim512(arch: int, head_dim: int) -> bool:
+    return head_dim == 512 and arch in (86, 89)
+
+
+def get_default_m_tile_size(arch: int, head_dim: int, spec_decode: bool) -> int:
+    if spec_decode and arch in (80, 87) and head_dim == 512:
+        return 16
+    return 32 if spec_decode else 8
+
+
+def override_compile_macro(
+        compile_macros: List[CompileMacro], macro_name: str,
+        value) -> List[CompileMacro]:
+    return [
+        CompileMacro(macro.macro_name, macro.short_name,
+                     value if macro.macro_name == macro_name else macro.value)
+        for macro in compile_macros
+    ]
+
 
 cpp_file_prefix_text = R"""/*
 * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
@@ -120,6 +146,20 @@ constexpr int32_t kSM_121 = 121;
 
 static const struct XQAKernelMetaInfo
 {
+    enum XQAKernelVariant
+    {
+        //! Default single-CTA path for non-head_dim512 kernels.
+        KERNEL_VARIANT_STANDARD,
+        //! Single-CTA head_dim512 path with full shared-memory tile and protected row-max update.
+        KERNEL_VARIANT_FULL_SMEM_HEAD_DIM512,
+        //! Single-CTA head_dim512 path with full shared-memory tile and volatile row-max update.
+        KERNEL_VARIANT_FULL_SMEM_HEAD_DIM512_ROW_MAX_METHOD4,
+        //! Single-CTA head_dim512 path with tiled Q/K/V shared-memory staging.
+        KERNEL_VARIANT_TILED_QKV_STAGING_HEAD_DIM512,
+        //! 2CTA cluster head_dim512 path; requires cluster launch and distributed shared memory.
+        KERNEL_VARIANT_2CTA_HEAD_DIM512,
+    };
+
     Data_type mDataType;
     Data_type mKVDataType;
     unsigned int mHeadDim;
@@ -133,6 +173,9 @@ static const struct XQAKernelMetaInfo
     const unsigned long long* mCubin;
     unsigned int mCubinSize;
     const char* mFuncName;
+    XQAKernelVariant mKernelVariant{KERNEL_VARIANT_STANDARD};
+    bool mRequiresClusterLaunch{false};
+    bool mRequiresDistributedSharedMemory{false};
 } sXqaKernelMetaInfo[] = {
 """
 
@@ -155,6 +198,8 @@ def generate_cubin_meta_info_line(arch: int,
     m_tilesize = None
     paged_kv_cache = None
     tokens_per_page = None
+    use_tiled_qkv_staging_head_dim512 = False
+    use_2cta_head_dim512 = False
     for compile_macro in compile_macros:
         if compile_macro.macro_name == 'DTYPE':
             data_type_upper_case = map_disp_value(compile_macro.value).upper()
@@ -183,6 +228,12 @@ def generate_cubin_meta_info_line(arch: int,
             # Power of 2 tokens per page.
             assert (tokens_per_page % 2 == 0)
             paged_kv_cache = 'true' if tokens_per_page > 0 else 'false'
+        if compile_macro.macro_name == 'TILED_QKV_STAGING_HEAD_DIM512':
+            assert compile_macro.value == 1
+            use_tiled_qkv_staging_head_dim512 = True
+        if compile_macro.macro_name == 'XQA_2CTA_HEAD_DIM512':
+            assert compile_macro.value == 1
+            use_2cta_head_dim512 = True
 
     use_medusa = 'true' if is_spec_dec else 'false'
     assert data_type_str is not None
@@ -191,6 +242,19 @@ def generate_cubin_meta_info_line(arch: int,
     assert beam_width is not None
     assert num_q_heads_per_kv is not None
     unique_func_name = "kernel_mha"
+    kernel_variant = 'XQAKernelMetaInfo::KERNEL_VARIANT_STANDARD'
+    requires_cluster_launch = 'false'
+    requires_distributed_shared_memory = 'false'
+    if head_dim == 512:
+        kernel_variant = 'XQAKernelMetaInfo::KERNEL_VARIANT_FULL_SMEM_HEAD_DIM512'
+        if arch in (80, 87):
+            kernel_variant = 'XQAKernelMetaInfo::KERNEL_VARIANT_FULL_SMEM_HEAD_DIM512_ROW_MAX_METHOD4'
+        if use_tiled_qkv_staging_head_dim512:
+            kernel_variant = 'XQAKernelMetaInfo::KERNEL_VARIANT_TILED_QKV_STAGING_HEAD_DIM512'
+        if use_2cta_head_dim512:
+            kernel_variant = 'XQAKernelMetaInfo::KERNEL_VARIANT_2CTA_HEAD_DIM512'
+            requires_cluster_launch = 'true'
+            requires_distributed_shared_memory = 'true'
     fields = [
         data_type_str, kv_data_type_str,
         str(head_dim),
@@ -201,6 +265,11 @@ def generate_cubin_meta_info_line(arch: int,
         f'{function_name}_cubin', f'{function_name}_cubin_len',
         f'"{unique_func_name}"'
     ]
+    if kernel_variant != 'XQAKernelMetaInfo::KERNEL_VARIANT_STANDARD':
+        fields.extend([
+            kernel_variant, requires_cluster_launch,
+            requires_distributed_shared_memory
+        ])
     field_str = ', '.join(fields)
     line_segs = ["{ ", field_str, "}"]
     if not is_last:
@@ -237,6 +306,10 @@ def map_disp_value(value):
 
 
 def build_name_info(compile_macros: List[CompileMacro]):
+    compile_macros = [
+        compile_macro for compile_macro in compile_macros
+        if compile_macro.short_name not in ('tiled_qkv_staging', '2cta_head_dim512')
+    ]
     short_names = [
         compile_macro.short_name for compile_macro in compile_macros
     ]
@@ -292,21 +365,29 @@ def build_commands(
     function_name = construct_name(func_name_prefix, arch, name_info)
     macro_options.append(f"-DKERNEL_FUNC_NAME={function_name}")
     all_macro_option = ' '.join(macro_options)
-    cubin_file_name = construct_name(func_name_prefix, arch, name_info,
-                                     ".cubin")
+    cubin_file_name = os.path.join(
+        cubin_dir, construct_name(func_name_prefix, arch, name_info, ".cubin"))
     output_option = " ".join(["-o", cubin_file_name])
+    include_option = f"-I{cpp_include_dir}"
+    input_file_path = os.path.join(xqa_source_dir, input_filename)
     nvcc_command = " ".join([
-        nvcc_bin, nvcc_flags, arch_option, output_option, all_macro_option,
-        input_filename
+        nvcc_bin, nvcc_flags, arch_option, output_option, include_option,
+        all_macro_option, input_file_path
     ])
     xxd_command = " ".join(["xxd -i", cubin_file_name])
     return nvcc_command, xxd_command, cubin_file_name
 
 
-def save_cubin_cpp_file(xxd_output, func_name_prefix, arch, compile_macros):
+def get_cubin_cpp_file_name(func_name_prefix: str, arch: int,
+                            compile_macros: List[CompileMacro]) -> str:
     name_info = build_name_info(compile_macros)
-    cubin_cpp_file_name = construct_name(func_name_prefix, arch, name_info,
-                                         ".cubin.cpp")
+    return construct_name(func_name_prefix, arch, name_info, ".cubin.cpp")
+
+
+def save_cubin_cpp_file(xxd_output, func_name_prefix, arch, compile_macros):
+    cubin_cpp_file_name = os.path.join(
+        cubin_dir,
+        get_cubin_cpp_file_name(func_name_prefix, arch, compile_macros))
     with open(cubin_cpp_file_name, "w") as f:
         f.write(''.join(
             [cpp_file_prefix_text, xxd_output, cpp_file_suffex_text]))
@@ -325,7 +406,6 @@ def convert_cubin_cpp_xxd(xxd_command: str, cubin_file_name: str):
 
 
 def convert_cubin_cpp_np(cubin_file_name: str):
-    import numpy as np
     cubin_size = os.path.getsize(cubin_file_name)
     with open(cubin_file_name, 'rb') as f:
         cubin_bin_data = f.read()
@@ -333,8 +413,11 @@ def convert_cubin_cpp_np(cubin_file_name: str):
     if remainder != 0:
         padding = b'\x00' * (8 - remainder)
         cubin_bin_data += padding
-    array = np.frombuffer(cubin_bin_data, dtype=np.uint64)
-    array_name = cubin_file_name.replace('.', '_')
+    array = [
+        int.from_bytes(cubin_bin_data[i:i + 8], byteorder='little')
+        for i in range(0, len(cubin_bin_data), 8)
+    ]
+    array_name = os.path.basename(cubin_file_name).replace('.', '_')
     elements_per_line = 4
     cpp_array_content = ',\n'.join(
         ', '.join(
@@ -365,7 +448,7 @@ def run_cubin_gen(arch_micro_file_list: CompileArchMacrosAndFile):
                                 shell=False)
         # cubin_cpp_str, cubin_size = convert_cubin_cpp_xxd(xxd_command, cubin_file_name)
         cubin_cpp_str, cubin_size = convert_cubin_cpp_np(cubin_file_name)
-        save_cubin_cpp_file(cubin_cpp_str, cubin_dir + build_func_name_prefix,
+        save_cubin_cpp_file(cubin_cpp_str, build_func_name_prefix,
                             arch_micro_file_list.arch,
                             arch_micro_file_list.macro_list)
         if clean_cubin:
@@ -377,18 +460,31 @@ def run_cubin_gen(arch_micro_file_list: CompileArchMacrosAndFile):
     return function_name, cubin_size
 
 
-def get_cuda_toolkit_major_version() -> int:
-    global cuda_toolkit_major_version
-    if cuda_toolkit_major_version is not None:
-        return cuda_toolkit_major_version
+def get_cuda_toolkit_version() -> Tuple[int, int]:
+    global cuda_toolkit_version
+    if cuda_toolkit_version is not None:
+        return cuda_toolkit_version
     ctk_version = os.environ.get('CUDA_CTK_VERSION')
     if ctk_version:
-        cuda_toolkit_major_version = int(ctk_version.split('.')[0])
+        version_parts = ctk_version.split('.')
+        minor_version = int(version_parts[1]) if len(version_parts) > 1 else 0
+        cuda_toolkit_version = (int(version_parts[0]), minor_version)
     else:
         nvcc_output = subprocess.check_output([nvcc_bin, '--version'], text=True)
-        version_match = re.search(r'release (\d+)\.', nvcc_output)
-        cuda_toolkit_major_version = int(version_match.group(1)) if version_match else 13
-    return cuda_toolkit_major_version
+        version_match = re.search(r'release (\d+)\.(\d+)', nvcc_output)
+        cuda_toolkit_version = (
+            int(version_match.group(1)),
+            int(version_match.group(2))) if version_match else (13, 0)
+    return cuda_toolkit_version
+
+
+def get_cuda_toolkit_major_version() -> int:
+    return get_cuda_toolkit_version()[0]
+
+
+def supports_fp8() -> bool:
+    major, minor = get_cuda_toolkit_version()
+    return major > 11 or (major == 11 and minor >= 8)
 
 
 def get_compile_arch(arch: int) -> Union[int, str]:
@@ -419,6 +515,8 @@ def generate_compile_arch_macro_list(compile_macro_options: list):
             if "__half" in option_combination and "__nv_bfloat16" in option_combination:
                 continue
             assert option_macro_names[3] == "CACHE_ELEM_ENUM"
+            if option_combination[3] == 2 and not supports_fp8():
+                continue
             # fp8 kv cache is only supported on sm89 and next.
             if option_combination[3] == 2 and arch < 89:
                 continue
@@ -427,9 +525,22 @@ def generate_compile_arch_macro_list(compile_macro_options: list):
                     option_macro_names, option_short_names, option_combination)
             ]
             macro_values = {macro.macro_name: macro.value for macro in compile_macros}
-            if macro_values.get('HEAD_ELEMS') == 512 and arch not in (100, 101):
+            if macro_values.get('HEAD_ELEMS') == 512 and arch not in (80, 86, 87, 89, 100, 101, 120, 121):
                 continue
-            if arch in (90, ) and option_combination[
+            if macro_values.get('HEAD_ELEMS') == 512 and arch in (80, 87) and macro_values.get('SPEC_DEC') == 1:
+                compile_macros = override_compile_macro(
+                    compile_macros, 'M_TILESIZE',
+                    get_default_m_tile_size(arch, macro_values['HEAD_ELEMS'],
+                                            True))
+            if use_tiled_qkv_staging_head_dim512(arch, macro_values.get('HEAD_ELEMS')):
+                compile_macros.append(
+                    CompileMacro('TILED_QKV_STAGING_HEAD_DIM512', 'tiled_qkv_staging', 1))
+                input_file_name = "mha.cu"
+            elif macro_values.get('HEAD_ELEMS') == 512 and arch in (120, 121):
+                compile_macros.append(
+                    CompileMacro('XQA_2CTA_HEAD_DIM512', '2cta_head_dim512', 1))
+                input_file_name = "mha.cu"
+            elif arch in (90, ) and option_combination[
                     3] == 2 and option_combination[2] == 1 and not is_spec_dec:
                 input_file_name = "mha_sm90.cu"
             else:
@@ -479,18 +590,100 @@ def generate_header_file_contents(
     return '\n'.join([cubin_data, cubin_length, meta_struct])
 
 
+def normalize_arch(arch: str) -> int:
+    arch_num_match = re.match(r'(\d+)', arch)
+    if not arch_num_match:
+        raise ValueError(f'Unsupported CUDA architecture value: {arch}')
+    arch_num = int(arch_num_match.group(1))
+    # Thor builds use SM101 XQA runtime lookup. CUDA 13+ compiles that runtime
+    # entry with the actual SM110a code-generation target in get_compile_arch().
+    if arch_num == 110:
+        return 101
+    return arch_num
+
+
+def parse_arches(arch_args: List[str]) -> List[int]:
+    if not arch_args:
+        return []
+    parsed_arches = []
+    for arch_arg in arch_args:
+        for arch in re.split(r'[,;]', arch_arg):
+            arch = arch.strip()
+            if not arch:
+                continue
+            if arch in ('all', 'all-major', 'native'):
+                parsed_arches.extend([80, 86, 87, 89, 100, 101, 120, 121])
+            else:
+                parsed_arches.append(normalize_arch(arch))
+    return sorted(set(parsed_arches))
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='Internal CMake helper for generating XQA cubin C++ blobs.'
+    )
+    parser.add_argument(
+        '--cmake-invoked',
+        action='store_true',
+        help=argparse.SUPPRESS)
+    parser.add_argument(
+        '--output-dir',
+        default=None,
+        help='Directory where generated .cubin.cpp files and header are written.'
+    )
+    parser.add_argument(
+        '--arches',
+        nargs='+',
+        default=None,
+        help='CUDA SM architectures to generate, for example: 80 86 100 120.'
+    )
+    parser.add_argument(
+        '--nvcc',
+        default=None,
+        help='nvcc executable used to compile cubins.')
+    parser.add_argument(
+        '--list-outputs',
+        action='store_true',
+        help='Print the generated output file list and exit without compiling.'
+    )
+    parser.add_argument(
+        '--keep-cubin',
+        action='store_true',
+        help='Keep intermediate .cubin files in the output directory.')
+    args = parser.parse_args()
+    if not args.cmake_invoked:
+        parser.error(
+            'gen_cubins.py is a CMake-only helper. Configure/build the project to generate XQA cubins.'
+        )
+    if not args.output_dir:
+        parser.error('--output-dir is required when invoked by CMake.')
+    if not args.arches:
+        parser.error('--arches is required when invoked by CMake.')
+    return args
+
+
+def get_generated_output_paths(
+        output_dir: str,
+        arch_macro_lists: List[CompileArchMacrosAndFile]) -> List[str]:
+    output_paths = [
+        os.path.join(output_dir, build_func_name_prefix + '_cubin.h')
+    ]
+    output_paths.extend(
+        os.path.join(
+            output_dir,
+            get_cubin_cpp_file_name(build_func_name_prefix, arch_macro.arch,
+                                    arch_macro.macro_list))
+        for arch_macro in arch_macro_lists)
+    return output_paths
+
+
 if __name__ == "__main__":
 
-    if len(sys.argv) > 1 and sys.argv[1] == "sm12x":
-        arch_options = [120, 121]
-        cubin_dir = "../../cpp/kernels/decodeAttentionKernels/cubin_sm12x/"
-    else:
-        arch_options = [80, 86, 87, 89, 100, 101]
-        cubin_dir = "../../cpp/kernels/decodeAttentionKernels/cubin/"
-
-    if os.path.exists(cubin_dir):
-        shutil.rmtree(cubin_dir)
-    os.mkdir(cubin_dir)
+    args = parse_args()
+    arch_options = parse_arches(args.arches)
+    cubin_dir = os.path.abspath(args.output_dir)
+    nvcc_bin = args.nvcc if args.nvcc else nvcc_bin
+    clean_cubin = not args.keep_cubin
 
     edgellm_config_list = [
         [
@@ -570,6 +763,16 @@ if __name__ == "__main__":
     arch_macro_lists = []
     for cfg in edgellm_config_list:
         arch_macro_lists.extend(generate_compile_arch_macro_list(cfg))
+
+    if args.list_outputs:
+        print(';'.join(get_generated_output_paths(cubin_dir,
+                                                  arch_macro_lists)))
+        sys.exit(0)
+
+    if os.path.exists(cubin_dir):
+        shutil.rmtree(cubin_dir)
+    os.makedirs(cubin_dir)
+
     cpu_count = os.cpu_count()
     thread_count = cpu_count // 2 if cpu_count >= 2 else cpu_count
     with multiprocessing.Pool(processes=thread_count) as pool:
@@ -577,7 +780,8 @@ if __name__ == "__main__":
     header_file_contents = generate_header_file_contents(
         arch_macro_lists, name_size_list)
 
-    with open(cubin_dir + build_func_name_prefix + '_cubin.h', "w") as f:
+    with open(os.path.join(cubin_dir, build_func_name_prefix + '_cubin.h'),
+              "w") as f:
         f.write("".join(
             [cpp_file_prefix_text, header_file_contents,
              cpp_file_suffex_text]))

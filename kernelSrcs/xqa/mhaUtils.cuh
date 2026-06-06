@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -97,6 +97,25 @@ struct HeadPtr
 template <typename Head>
 struct HeadPtr<Head, 0, 0> : TinyPtr<Head>
 {
+};
+
+template <typename Head, typename SliceHead>
+struct HeadSlicePtr
+{
+    Head* pointer;
+    uint32_t offset;
+    uint32_t sliceByteOffset;
+
+    __device__ inline SliceHead& operator[](uint32_t i) const
+    {
+        return *(*this + i);
+    }
+
+    __device__ inline SliceHead* operator+(uint32_t i) const
+    {
+        uint64_t const base = reinterpret_cast<uint64_t>(pointer + offset + i);
+        return reinterpret_cast<SliceHead*>(base + sliceByteOffset);
+    }
 };
 
 // template <typename Head>
@@ -417,14 +436,17 @@ __device__ inline InputElem2 float2ToInputElem2(float2 src)
         reinterpret_cast<nv_bfloat162&>(dst) = __float22bfloat162_rn(src);
         return dst;
     }
+#if SUPPORTS_FP8
     else if constexpr (mha::is_same_v<InputElem2, __nv_fp8x2_e4m3>)
     {
         reinterpret_cast<__nv_fp8x2_e4m3&>(dst) = __nv_fp8x2_e4m3{src};
         return dst;
     }
+#endif
     else
     {
         trap();
+        return InputElem2{};
     }
 }
 
@@ -501,18 +523,16 @@ template <bool real>
 __device__ inline bool test_wait_parity(CtaBarrier* pBarrier, ParityOrNone<real> parity)
 {
     assert(real == (pBarrier != nullptr));
+    bool ret = false;
     if constexpr (real)
     {
 #if USE_CUSTOM_BARRIER
-        return pBarrier->test_wait_parity(parity);
+        ret = pBarrier->test_wait_parity(parity);
 #else
-        return pBarrier->try_wait_parity_for(parity, cuda::std::chrono::nanoseconds(0));
+        ret = pBarrier->try_wait_parity_for(parity, cuda::std::chrono::nanoseconds(0));
 #endif
     }
-    else
-    {
-        return false;
-    }
+    return ret;
 }
 
 template <bool real = true>

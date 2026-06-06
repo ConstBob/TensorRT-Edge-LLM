@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -27,12 +27,24 @@
 #include "barriers.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include <cuda_fp8.h>
+#include "common/cudaMacros.h"
 
 inline constexpr float log2e = 1.4426950408889634; // std::log2(M_E)
 inline constexpr float safeInitRowMax = -1e+30F;
 inline constexpr int32_t kBAD_PAGE_INDEX = -1;
+#if SUPPORTS_FP8
 __constant__ constexpr float kE4M3_MAX = 448.F;
+#endif
+
+template <typename T>
+inline constexpr bool isFp8E4M3 = false;
+#if SUPPORTS_FP8
+template <>
+inline constexpr bool isFp8E4M3<__nv_fp8_e4m3> = true;
+#endif
+
+template <typename T>
+inline constexpr bool isLowPrecCacheElem = mha::is_same_v<T, int8_t> || isFp8E4M3<T>;
 
 #ifdef __CUDA_ARCH__
 #if __CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 890 || __CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210
@@ -217,6 +229,7 @@ __device__ __host__ inline Vec<Dst, size> convert(Vec<Src, size> const& src)
             dst[size - 1] = Dst{src[size - 1]};
         }
     }
+#if SUPPORTS_FP8
     else if constexpr (mha::is_same_v<Src, __nv_fp8_e4m3> && mha::is_same_v<Dst, float>)
     {
         for (uint32_t i = 0; i < size - 1; i += 2)
@@ -276,6 +289,7 @@ __device__ __host__ inline Vec<Dst, size> convert(Vec<Src, size> const& src)
             dst[size - 1] = Dst{src[size - 1]};
         }
     }
+#endif
     else
     {
         for (uint32_t i = 0; i < size; i++)
@@ -801,8 +815,8 @@ __device__ inline Vec<uint32_t, 2> convertKCacheWordToF16(uint32_t i8data)
     static_assert(mha::is_same_v<InputElem, half> || mha::is_same_v<InputElem, __nv_bfloat16>, "not implemented");
     static_assert(sizeof(CacheElem) == 1);
     Vec<uint32_t, 2> ret;
-#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
-    if constexpr (mha::is_same_v<InputElem, half> && mha::is_same_v<CacheElem, __nv_fp8_e4m3>)
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 890) && SUPPORTS_FP8
+    if constexpr (mha::is_same_v<InputElem, half> && isFp8E4M3<CacheElem>)
     {
         uint16_t(&src)[2] = reinterpret_cast<uint16_t(&)[2]>(i8data);
         uint32_t(&dst)[2] = reinterpret_cast<uint32_t(&)[2]>(ret);
@@ -831,8 +845,8 @@ __device__ inline Vec<uint32_t, 2> convertVCacheWordToF16(uint32_t i8data)
     static_assert(mha::is_same_v<InputElem, half> || mha::is_same_v<InputElem, __nv_bfloat16>, "not implemented");
     static_assert(sizeof(CacheElem) == 1);
     Vec<uint32_t, 2> ret;
-#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
-    if constexpr (mha::is_same_v<InputElem, half> && mha::is_same_v<CacheElem, __nv_fp8_e4m3>)
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 890) && SUPPORTS_FP8
+    if constexpr (mha::is_same_v<InputElem, half> && isFp8E4M3<CacheElem>)
     {
         uint32_t(&dst)[2] = reinterpret_cast<uint32_t(&)[2]>(ret);
         asm("{\n"

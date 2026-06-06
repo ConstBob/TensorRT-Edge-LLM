@@ -17,7 +17,8 @@
 
 #include "decoderXQARunner.h"
 #include "common/checkMacros.h"
-#include "cubin/xqa_kernel_cubin.h"
+#include "common/cudaMacros.h"
+#include "xqa_kernel_cubin.h"
 
 #include <algorithm>
 #include <cuda.h>
@@ -31,9 +32,18 @@ using namespace nvinfer1;
 using namespace trt_edgellm;
 
 using XQADataType = xqa::kernels::Data_type;
+using XQAKernelMetaInfo = xqa::kernels::XQAKernelMetaInfo;
+using XQAKernelVariant = XQAKernelMetaInfo::XQAKernelVariant;
 
 namespace
 {
+
+constexpr uint32_t kHEAD_DIM_512{512U};
+constexpr uint32_t kSPLIT_HEAD_DIM_512_CLUSTER_SIZE{2U};
+constexpr uint32_t kSPLIT_HEAD_DIM_512_CTA_DIM_Z{2U};
+constexpr uint32_t kDEFAULT_XQA_CTA_DIM_Z{2U};
+constexpr uint32_t kDEFAULT_XQA_CTA_DIM_X{128U};
+constexpr uint32_t kHEAD_DIM_512_CTA_DIM_X{256U};
 
 //! @throws std::runtime_error if datatype is unsupported
 XQADataType trtToXqaDataType(nvinfer1::DataType type)
@@ -132,12 +142,136 @@ struct XQAKernelFuncInfo
     CUfunction mDeviceFunction{0};
     uint32_t mHeadDim{0};
     uint32_t mMTileSize{0};
+    uint32_t mSMVersion{0};
+    XQAKernelVariant mKernelVariant{XQAKernelMetaInfo::KERNEL_VARIANT_STANDARD};
+    bool mRequiresClusterLaunch{false};
+    bool mRequiresDistributedSharedMemory{false};
 };
+
+struct XQADeviceCapability
+{
+    uint32_t mMaxSharedMemPerBlockOptin{0};
+    bool mSupportsClusterLaunch{false};
+    bool mSupportsDistributedSharedMemory{false};
+};
+
+XQADeviceCapability getDeviceCapability()
+{
+    constexpr int32_t kDEVICE_ID{0};
+    CUdevice cuDevice{};
+    CUDA_DRIVER_CHECK(cuDeviceGet(&cuDevice, kDEVICE_ID));
+
+    int32_t maxSharedMemPerBlockOptin{0};
+    CUDA_DRIVER_CHECK(cuDeviceGetAttribute(
+        &maxSharedMemPerBlockOptin, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, cuDevice));
+    check::check(maxSharedMemPerBlockOptin > 0, "Failed to get max shared memory per block opt-in.");
+
+    bool supportsClusterLaunch{false};
+#if SUPPORTS_CLUSTER_LAUNCH
+    int32_t clusterLaunch{0};
+    CUDA_DRIVER_CHECK(cuDeviceGetAttribute(&clusterLaunch, CU_DEVICE_ATTRIBUTE_CLUSTER_LAUNCH, cuDevice));
+    supportsClusterLaunch = clusterLaunch != 0;
+#endif // SUPPORTS_CLUSTER_LAUNCH
+
+    return {static_cast<uint32_t>(maxSharedMemPerBlockOptin), supportsClusterLaunch, supportsClusterLaunch};
+}
+
+bool isKernelSupportedByBuild(XQAKernelMetaInfo const& kernelMeta) noexcept
+{
+#if SUPPORTS_CLUSTER_LAUNCH
+    (void) kernelMeta;
+    return true;
+#else
+    return !kernelMeta.mRequiresClusterLaunch && !kernelMeta.mRequiresDistributedSharedMemory;
+#endif // SUPPORTS_CLUSTER_LAUNCH
+}
+
+bool isKernelCompatibleWithDevice(
+    XQAKernelFuncInfo const& kernelInfo, XQADeviceCapability const& deviceCapability) noexcept
+{
+    if (kernelInfo.mSharedMemBytes > deviceCapability.mMaxSharedMemPerBlockOptin)
+    {
+        return false;
+    }
+    if (kernelInfo.mRequiresClusterLaunch && !deviceCapability.mSupportsClusterLaunch)
+    {
+        return false;
+    }
+    if (kernelInfo.mRequiresDistributedSharedMemory && !deviceCapability.mSupportsDistributedSharedMemory)
+    {
+        return false;
+    }
+    return true;
+}
+
+uint32_t getKernelVariantPriority(XQAKernelVariant variant) noexcept
+{
+    // Lower priority value is preferred when multiple compatible candidates exist for the same runtime key.
+    switch (variant)
+    {
+    case XQAKernelMetaInfo::KERNEL_VARIANT_STANDARD: return 0U;
+    case XQAKernelMetaInfo::KERNEL_VARIANT_FULL_SMEM_HEAD_DIM512: return 0U;
+    case XQAKernelMetaInfo::KERNEL_VARIANT_FULL_SMEM_HEAD_DIM512_ROW_MAX_METHOD4: return 1U;
+    case XQAKernelMetaInfo::KERNEL_VARIANT_2CTA_HEAD_DIM512: return 2U;
+    case XQAKernelMetaInfo::KERNEL_VARIANT_TILED_QKV_STAGING_HEAD_DIM512: return 3U;
+    }
+    return 3U;
+}
 
 uint32_t getCtaDimX(XQAKernelFuncInfo const& kernelInfo) noexcept
 {
-    // The 512-head cubins are compiled with 8 x-warps; older XQA cubins use 4 x-warps.
-    return kernelInfo.mHeadDim == 512U ? 256U : 128U;
+    return kernelInfo.mHeadDim == kHEAD_DIM_512 && !kernelInfo.mRequiresClusterLaunch ? kHEAD_DIM_512_CTA_DIM_X
+                                                                                      : kDEFAULT_XQA_CTA_DIM_X;
+}
+
+#if SUPPORTS_CLUSTER_LAUNCH
+void launch2CtaHeadDim512ClusterKernel(XQAKernelFuncInfo const& kernelInfo, dim3 const& dimGrid, dim3 const& dimCta,
+    cudaStream_t const& stream, void** kernelParams)
+{
+    CUlaunchAttribute launchAttr{};
+    launchAttr.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+    launchAttr.value.clusterDim.x = kSPLIT_HEAD_DIM_512_CLUSTER_SIZE;
+    launchAttr.value.clusterDim.y = 1U;
+    launchAttr.value.clusterDim.z = 1U;
+
+    CUlaunchConfig launchConfig{};
+    launchConfig.gridDimX = dimGrid.x;
+    launchConfig.gridDimY = dimGrid.y;
+    launchConfig.gridDimZ = dimGrid.z;
+    launchConfig.blockDimX = dimCta.x;
+    launchConfig.blockDimY = dimCta.y;
+    launchConfig.blockDimZ = dimCta.z;
+    launchConfig.sharedMemBytes = kernelInfo.mSharedMemBytes;
+    launchConfig.hStream = stream;
+    launchConfig.attrs = &launchAttr;
+    launchConfig.numAttrs = 1U;
+
+    CUDA_DRIVER_CHECK(cuLaunchKernelEx(&launchConfig, kernelInfo.mDeviceFunction, kernelParams, nullptr));
+}
+#endif // SUPPORTS_CLUSTER_LAUNCH
+
+bool hasHeadDim512KernelsForSM(int32_t smVersion, XQADataType kvDataType) noexcept
+{
+    bool hasDecodeKernel{false};
+    bool hasSpecDecodeKernel{false};
+    for (auto const& kernelMeta : xqa::kernels::sXqaKernelMetaInfo)
+    {
+        if (kernelMeta.mSM != static_cast<unsigned int>(smVersion)
+            || kernelMeta.mDataType != XQADataType::DATA_TYPE_FP16 || kernelMeta.mKVDataType != kvDataType
+            || kernelMeta.mHeadDim != kHEAD_DIM_512 || !isKernelSupportedByBuild(kernelMeta))
+        {
+            continue;
+        }
+        if (kernelMeta.mMultiQueryTokens)
+        {
+            hasSpecDecodeKernel = true;
+        }
+        else
+        {
+            hasDecodeKernel = true;
+        }
+    }
+    return hasDecodeKernel && hasSpecDecodeKernel;
 }
 
 class XQAKernelList
@@ -160,10 +294,11 @@ public:
     //! @throws std::runtime_error if a CUDA driver error occurs
     void loadXQAKernels()
     {
-        if (!mFunctions.empty())
+        if (mLoaded)
         {
             return;
         }
+        XQADeviceCapability const deviceCapability = getDeviceCapability();
         for (int32_t i = 0; i < mKernelMetaCount; ++i)
         {
             auto const& kernelMeta = mKernelMeta[i];
@@ -178,6 +313,10 @@ public:
                 continue;
             }
             if (kernelMeta.mMultiQueryTokens != mSpecDecode)
+            {
+                continue;
+            }
+            if (!isKernelSupportedByBuild(kernelMeta))
             {
                 continue;
             }
@@ -198,6 +337,10 @@ public:
             CUDA_DRIVER_CHECK(cuModuleGetFunction(&funcInfo.mDeviceFunction, hModule, kernelMeta.mFuncName));
             funcInfo.mHeadDim = kernelMeta.mHeadDim;
             funcInfo.mMTileSize = kernelMeta.mMTileSize;
+            funcInfo.mSMVersion = kernelMeta.mSM;
+            funcInfo.mKernelVariant = kernelMeta.mKernelVariant;
+            funcInfo.mRequiresClusterLaunch = kernelMeta.mRequiresClusterLaunch;
+            funcInfo.mRequiresDistributedSharedMemory = kernelMeta.mRequiresDistributedSharedMemory;
 
             uint32_t* deviceSmemSize{nullptr};
             size_t dataSize{0};
@@ -206,6 +349,11 @@ public:
             // Use of default stream is inevitable and justified here because it is called during kernel loading phase,
             // not runtime.
             CUDA_CHECK(cudaMemcpy(&funcInfo.mSharedMemBytes, deviceSmemSize, dataSize, cudaMemcpyDeviceToHost));
+
+            if (!isKernelCompatibleWithDevice(funcInfo, deviceCapability))
+            {
+                continue;
+            }
 
             // Set 46KB threshold here because we have to take static/driver shared memory into consideration.
             // Default value for shared memory is 48KB.
@@ -217,8 +365,14 @@ public:
             XQAKernelRuntimeHashKey hashKey{kernelMeta.mDataType, kernelMeta.mKVDataType,
                 static_cast<int32_t>(kernelMeta.mHeadDim), static_cast<int32_t>(kernelMeta.mNumQHeadsOverKV),
                 static_cast<int32_t>(kernelMeta.mBeamWidth)};
-            mFunctions.insert(std::make_pair(hashKey, funcInfo));
+            mFunctions[hashKey].push_back(funcInfo);
         }
+        mLoaded = true;
+    }
+
+    bool hasKernels() const noexcept
+    {
+        return !mFunctions.empty();
     }
 
     XQAKernelFuncInfo findKernelFunction(XQAKernelRuntimeHashKey const& key) const
@@ -230,7 +384,12 @@ public:
             return XQAKernelFuncInfo{};
         }
 
-        return findIter->second;
+        auto const& candidates = findIter->second;
+        auto const findBest = std::min_element(candidates.begin(), candidates.end(),
+            [](XQAKernelFuncInfo const& lhs, XQAKernelFuncInfo const& rhs) noexcept {
+                return getKernelVariantPriority(lhs.mKernelVariant) < getKernelVariantPriority(rhs.mKernelVariant);
+            });
+        return *findBest;
     }
 
 protected:
@@ -240,9 +399,10 @@ protected:
     bool mSpecDecode;
     XQADataType mDataType;
     XQADataType mKVDataType;
+    bool mLoaded{false};
     std::unordered_map<unsigned long long const*, CUmodule> mModules;
 
-    std::unordered_map<XQAKernelRuntimeHashKey, XQAKernelFuncInfo, XQAKernelRuntimeHasher> mFunctions;
+    std::unordered_map<XQAKernelRuntimeHashKey, std::vector<XQAKernelFuncInfo>, XQAKernelRuntimeHasher> mFunctions;
 };
 
 class XQAKernelLoader
@@ -329,13 +489,16 @@ bool DecoderXQARunner::canImplement(int32_t numQHeads, int32_t numKVHeads, int32
     // (1) Head ratio 1-8 for head_dim {32, 64, 128}
     // (2) Head ratio 16 for head_dim 128 only (NemotronH).
     // (3) Head ratio 4, 6, 8 for head_dim 256 only (Qwen3.5-MoE).
-    // (4) Head ratio 8 for head_dim 512 on the SM100 and Thor-compatible SM101 paths.
+    // (4) Head ratio 8 for head_dim 512 where matching cubins are present.
     int32_t const headRatio = numQHeads / numKVHeads;
+    XQADataType const xqaKVDataType
+        = kvDataType == DataType::kFP8 ? XQADataType::DATA_TYPE_E4M3 : XQADataType::DATA_TYPE_FP16;
+    bool const checkHeadDim512SM = hasHeadDim512KernelsForSM(smVersion, xqaKVDataType);
     bool const checkQHeadPerKV
         = ((headSize == 32 || headSize == 64 || headSize == 128) && headRatio >= 1 && headRatio <= 8)
         || (headSize == 128 && headRatio == 16)
         || (headSize == 256 && (headRatio == 4 || headRatio == 6 || headRatio == 8))
-        || (headSize == 512 && (smVersion == 100 || smVersion == 101) && headRatio == 8);
+        || (headSize == 512 && checkHeadDim512SM && headRatio == 8);
 
     return checkHeadNumbers && checkType && checkKVType && checkSMVersion && checkQHeadPerKV;
 }
@@ -345,7 +508,7 @@ bool DecoderXQARunner::loadDecodeXQAKernels(
 {
     XQAKernelList* xqaKernelList
         = getXQAKernels(trtToXqaDataType(dataType), trtToXqaDataType(kvDataType), smVersion, useSpecDecodeKernels);
-    return xqaKernelList != nullptr;
+    return xqaKernelList != nullptr && xqaKernelList->hasKernels();
 }
 
 void DecoderXQARunner::dispatchXQAKernel(XQALaunchParams& params, cudaStream_t const& stream)
@@ -369,8 +532,20 @@ void DecoderXQARunner::dispatchXQAKernel(XQALaunchParams& params, cudaStream_t c
     // The multi-block kernel launch is mainly for long sequence.
     // TODO: Add multiple block launch logic. The launch configuration highly depends on usecase and performance
     // context. Current measured workload doesn't get performance gain from multi-block launch.
-    dim3 const dimGrid{1, mNumKVHeads, mBatchSize};
-    dim3 const dimCta{getCtaDimX(kernelInfo), 1, 2};
+    bool const useClusterLaunch = kernelInfo.mRequiresClusterLaunch;
+    dim3 const dimGrid{useClusterLaunch ? kSPLIT_HEAD_DIM_512_CLUSTER_SIZE : 1U, static_cast<uint32_t>(mNumKVHeads),
+        static_cast<uint32_t>(mBatchSize)};
+    dim3 const dimCta{
+        getCtaDimX(kernelInfo), 1U, useClusterLaunch ? kSPLIT_HEAD_DIM_512_CTA_DIM_Z : kDEFAULT_XQA_CTA_DIM_Z};
+#if SUPPORTS_CLUSTER_LAUNCH
+    if (useClusterLaunch)
+    {
+        launch2CtaHeadDim512ClusterKernel(kernelInfo, dimGrid, dimCta, stream, kernelParams);
+        return;
+    }
+#else
+    check::check(!useClusterLaunch, "XQA head_dim=512 2CTA cluster kernel is unavailable.");
+#endif // SUPPORTS_CLUSTER_LAUNCH
     CUDA_DRIVER_CHECK(cuLaunchKernel(kernelInfo.mDeviceFunction, dimGrid.x, dimGrid.y, dimGrid.z, dimCta.x, dimCta.y,
         dimCta.z, kernelInfo.mSharedMemBytes, stream, kernelParams, nullptr));
 }
@@ -393,11 +568,22 @@ void DecoderXQARunner::dispatchSpecDecodeXQAKernel(XQALaunchParams& params, cuda
         &params.qScale, &params.output, &params.qInputPtr, &params.treeAttnMask, &params.attentionSinks,
         &params.kvCache, &params.batchSize, &params.kScale, &params.vScale, &params.semaphores, &params.scratch};
     int32_t const ctaTileY = static_cast<int32_t>(kernelInfo.mMTileSize);
-    check::check(
-        ctaTileY == 32, format::fmtstr("ctaTileY should be 32 for spec-decode kernels, but got %d.", ctaTileY));
+    check::check(ctaTileY > 0, format::fmtstr("Invalid spec-decode ctaTileY %d in XQA kernel metadata.", ctaTileY));
     int32_t const tokenBlockPerGroup = (params.qSeqLen * params.headGroupSize - 1) / ctaTileY + 1;
-    dim3 const dimGrid{1, mNumKVHeads * tokenBlockPerGroup, mBatchSize};
-    dim3 const dimCta{getCtaDimX(kernelInfo), 1, 2};
+    bool const useClusterLaunch = kernelInfo.mRequiresClusterLaunch;
+    dim3 const dimGrid{useClusterLaunch ? kSPLIT_HEAD_DIM_512_CLUSTER_SIZE : 1U,
+        static_cast<uint32_t>(mNumKVHeads * tokenBlockPerGroup), static_cast<uint32_t>(mBatchSize)};
+    dim3 const dimCta{
+        getCtaDimX(kernelInfo), 1U, useClusterLaunch ? kSPLIT_HEAD_DIM_512_CTA_DIM_Z : kDEFAULT_XQA_CTA_DIM_Z};
+#if SUPPORTS_CLUSTER_LAUNCH
+    if (useClusterLaunch)
+    {
+        launch2CtaHeadDim512ClusterKernel(kernelInfo, dimGrid, dimCta, stream, kernelParams);
+        return;
+    }
+#else
+    check::check(!useClusterLaunch, "XQA head_dim=512 2CTA cluster kernel is unavailable.");
+#endif // SUPPORTS_CLUSTER_LAUNCH
     CUDA_DRIVER_CHECK(cuLaunchKernel(kernelInfo.mDeviceFunction, dimGrid.x, dimGrid.y, dimGrid.z, dimCta.x, dimCta.y,
         dimCta.z, kernelInfo.mSharedMemBytes, stream, kernelParams, nullptr));
 }
