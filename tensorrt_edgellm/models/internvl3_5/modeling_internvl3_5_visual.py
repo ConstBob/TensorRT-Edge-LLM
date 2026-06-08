@@ -530,7 +530,16 @@ def _load_internvl3_5_weights(model: InternVL3_5VisualModel,
     """Load vision_tower and multi_modal_projector weights into *model*."""
     from ...checkpoint.loader import load_submodule_weights
 
+    # Raw HF checkpoints store visual weights under ``vision_tower.*``, while
+    # modelopt quantization checkpoints nest them under ``model.vision_tower.*``
+    # (the whole model is wrapped under ``model.`` on re-save).
+    ckpt_prefix = "model." if any(
+        k.startswith("model.vision_tower.") for k in weights) else ""
+
     def _remap(k: str) -> "str | None":
+        if ckpt_prefix and not k.startswith(ckpt_prefix):
+            return None
+        k = k[len(ckpt_prefix):] if ckpt_prefix else k
         if k.startswith("vision_tower.") or k.startswith(
                 "multi_modal_projector."):
             return k
