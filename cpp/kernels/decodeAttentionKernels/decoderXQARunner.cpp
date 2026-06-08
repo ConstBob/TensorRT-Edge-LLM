@@ -488,7 +488,9 @@ bool DecoderXQARunner::canImplement(int32_t numQHeads, int32_t numKVHeads, int32
     // Current kernel list supports
     // (1) Head ratio 1-8 for head_dim {32, 64, 128}
     // (2) Head ratio 16 for head_dim 128 only (NemotronH).
-    // (3) Head ratio 4, 6, 8 for head_dim 256 only (Qwen3.5-MoE).
+    // (3) Head ratio 2, 4, 6, 8 for head_dim 256
+    //     (4/6/8 for Qwen3.5-MoE / Qwen3.5-Omni Thinker+Talker;
+    //      2 for Qwen3.5-Omni Talker decode attention — 16 Q heads / 8 KV heads).
     // (4) Head ratio 8 for head_dim 512 where matching cubins are present.
     int32_t const headRatio = numQHeads / numKVHeads;
     XQADataType const xqaKVDataType
@@ -497,7 +499,7 @@ bool DecoderXQARunner::canImplement(int32_t numQHeads, int32_t numKVHeads, int32
     bool const checkQHeadPerKV
         = ((headSize == 32 || headSize == 64 || headSize == 128) && headRatio >= 1 && headRatio <= 8)
         || (headSize == 128 && headRatio == 16)
-        || (headSize == 256 && (headRatio == 4 || headRatio == 6 || headRatio == 8))
+        || (headSize == 256 && (headRatio == 2 || headRatio == 4 || headRatio == 6 || headRatio == 8))
         || (headSize == 512 && checkHeadDim512SM && headRatio == 8);
 
     return checkHeadNumbers && checkType && checkKVType && checkSMVersion && checkQHeadPerKV;
