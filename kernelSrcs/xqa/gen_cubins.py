@@ -711,12 +711,15 @@ if __name__ == "__main__":
             CompileMacroOption('SPEC_DEC', 'spec_dec', [0]),
         ],
         [
+            # nqpkv 4/6/8 cover Qwen3.5-MoE and Qwen3.5-Omni Thinker/Talker;
+            # nqpkv=2 (16 Q heads / 8 KV heads) is needed by the Qwen3.5-Omni
+            # Talker decode attention path.
             CompileMacroOption('DTYPE', 'dt', ['__half']),
             CompileMacroOption('HEAD_ELEMS', 'd', [256]),
             CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
             CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 2]),
             CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV', [0]),
-            CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [4, 6, 8]),
+            CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [2, 4, 6, 8]),
             CompileMacroOption('M_TILESIZE', 'm', [8]),
             CompileMacroOption('SPEC_DEC', 'spec_dec', [0]),
         ],
