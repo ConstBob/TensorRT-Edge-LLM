@@ -1,0 +1,116 @@
+= Decoder KV Cache
+{nbsp}
+:description: Decoder KV cache layouts, binding modes, and runtime lifecycle
+
+== Overview
+
+The decoder KV cache is the primary key/value storage for prefill and
+decode in decoder-only engines. Runtime allocates a linear buffer, slices
+it into per-layer views, and binds those views through the plugin or
+TRT-native backend.
+
+This document assumes generic KV terms from link:README.adoc[kv_cache/README.adoc].
+
+== Model Applicability
+
+[cols="1,1,1", options="header"]
+|===
+| Model Family | Binding Mode | Notes
+
+| Llama, Qwen, Phi, InternVL
+| Plugin or TRT-native
+| Standard decoder-only baseline.
+|===
+
+== Architecture
+
+[mermaid]
+----
+flowchart TB
+    subgraph Builder
+        A[LLMBuilder::setupKVCacheProfiles]
+    end
+
+    subgraph Runtime
+        B[Runtime LLM config]
+        C[HybridCacheManager / KVCacheManager]
+        D[RegistryBuilder + TensorRegistry bindings]
+    end
+
+    subgraph Engine
+        E{Backend mode}
+        F[AttentionPlugin path]
+        G[TRT-native ops path]
+    end
+
+    A --> B --> C --> D --> E
+    E -->|plugin| F
+    E -->|trt-native| G
+----
+
+== Design
+
+=== Buffer Layout
+
+Runtime allocates one combined KV tensor per attention layer through
+`KVCacheManager`: `[max_batch, 2, num_kv_heads_i, max_seq_len, head_dim_i]`.
+`HybridCacheManager` owns active cache lengths and routes absolute
+decoder-layer indices to the KV sub-manager.
+
+=== Binding Modes
+
+*Plugin mode* -- per-layer names `past_key_values_i` and
+`present_key_values_i` with shape
+`[batch, 2, num_kv_heads, max_kv_cache_capacity, head_dim]`.
+
+*TRT-native mode* -- per-layer names `k_cache_i`, `v_cache_i`,
+`present_k_cache_i`, and `present_v_cache_i` with shape
+`[batch, num_kv_heads, max_kv_cache_capacity, head_dim]`.
+
+Both modes share the same underlying `KVCacheManager` storage.
+
+=== Lifecycle
+
+1. `resetForNewSequences(...)` sets active batch and initial lengths.
+2. Prefill writes initial KV for prompt tokens.
+3. Decode updates KV per step and commits length increments.
+
+For the plugin path, `kvcache_start_index` distinguishes normal prefill
+from cache-aware execution.
+
+== Code Touchpoints
+
+[cols="1,3", options="header"]
+|===
+| Path | Responsibility
+
+| `cpp/runtime/config/llmEngineConfig.{h,cpp}`
+| Parses exported layer/cache configuration used to choose KV-cache bindings.
+
+| `cpp/runtime/kvCacheManager.{h,cpp}`
+| Owns KV tensor allocation and attention-layer cache storage.
+
+| `cpp/runtime/hybridCacheManager.{h,cpp}`
+| Owns shared cache lengths and routes attention-layer cache access.
+
+| `cpp/runtime/preprocess/stepPreparer.{h,cpp}`
+| Prepares per-step lengths and indices consumed by cache-aware execution.
+
+| `cpp/runtime/exec/registryBuilder.{h,cpp}`
+| Registers per-layer KV-cache bindings for plugin or TRT-native attention.
+
+| `cpp/runtime/exec/tensorRegistry.{h,cpp}`
+| Binds cache tensor addresses and shapes for the active execution step.
+
+| `cpp/builder/llmBuilder.{h,cpp}`
+| Emits engine bindings and profile shapes matching the cache contract.
+|===
+
+== Testing
+
+Decoder KV correctness is validated through pipeline tests exercising
+both binding modes end-to-end, builder-level validation of layer counts
+and dtype consistency, and runtime binding validation of per-layer view
+slicing. Unit coverage for cache reset/capture/restore lives in
+`unittests/hybridCacheManagerTests.cpp`; end-to-end coverage lives in
+`tests/test_lists/l0_pipeline_*.yml`.

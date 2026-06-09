@@ -1,0 +1,106 @@
+= Prefix KV Reuse
+{nbsp}
+:description: System-prompt/prefix KV reuse flow and runtime integration
+
+== Overview
+
+Prefix KV reuse avoids recomputing key/value states for repeated prompt
+prefixes, such as system prompts. On a cache hit, runtime injects saved
+KV into the active decoder cache and only runs prefill on the remaining
+suffix tokens.
+
+This document assumes generic KV terms from link:README.adoc[kv_cache/README.adoc]
+and baseline decoder KV from link:decoder.adoc[decoder.adoc].
+
+== Model Applicability
+
+[cols="1,1,1", options="header"]
+|===
+| Model Family | Applicable | Notes
+
+| Any decoder-only model
+| Yes
+| Model-agnostic; applies wherever repeated leading prompts occur.
+|===
+
+== Architecture
+
+[mermaid]
+----
+flowchart TB
+    subgraph Request[Request Path]
+        A[Incoming request + prompt]
+    end
+
+    subgraph Reuse[Prefix Reuse Layer]
+        B[Lookup cached prompt KV]
+        C[Instantiate cached KV into active batch slot]
+        D[Record reuseKVCacheLengths]
+    end
+
+    subgraph Decoder[Decoder KV Cache]
+        E[HybridCacheManager::resetForNewSequences with reuse lengths]
+        F[Prefill remaining suffix tokens]
+        G[Decode continues on seeded cache]
+    end
+
+    A --> B
+    B -->|hit| C --> D --> E
+    B -->|miss| E
+    E --> F --> G
+----
+
+== Design
+
+=== Data Model
+
+Runtime stores cached prompt entries keyed by prompt content and LoRA
+context. Each entry contains tokenized prompt content, KV tensor data,
+and effective prefill/reuse lengths.
+
+=== Runtime Flow
+
+On request setup, runtime looks up prefix KV. On a hit, cached KV is
+instantiated into the active batch slot and `reuseKVCacheLengths` is
+recorded per sequence. `HybridCacheManager::resetForNewSequences(...)`
+initializes active lengths from reused lengths. Prefill then computes
+only the remaining suffix tokens.
+
+Prefix reuse seeds the decoder KV cache; it does not replace the normal
+per-layer decoder KV flow.
+
+=== Invariants
+
+* Reuse length is always <= total prompt length and zero on a miss.
+* Cached KV tensor must match model dtype, KV head count, head dimension,
+  layer count, and LoRA context.
+* Reuse must not change generated output relative to a full-prefill run.
+
+== Code Touchpoints
+
+[cols="2,3", options="header"]
+|===
+| File Path | Responsibility
+
+| `cpp/runtime/llmInferenceRuntime.{h,cpp}`
+| Request setup, prefix lookup, reuse length propagation, and cache-seeding
+  contract.
+
+| `cpp/runtime/hybridCacheManager.{h,cpp}`
+| Shared cache lengths and capture/restore operations across KV and recurrent
+  cache managers.
+
+| `cpp/runtime/state/systemPromptKVCache.h`
+| Host-side prompt-cache entry metadata used by prefix reuse.
+
+| `cpp/kernels/kvCacheUtilKernels/`
+| Device-side cache copy and prefix-cache utility kernels.
+|===
+
+== Testing
+
+Prefix reuse is validated through pipeline tests exercising cache-hit and
+cache-miss paths. Correctness is confirmed by comparing reuse-enabled
+and reuse-disabled outputs for the same prompt. Cache capture/restore
+behavior is unit-tested in `unittests/hybridCacheManagerTests.cpp`;
+pipeline lists live under `tests/test_lists/l0_pipeline_*.yml`.

@@ -1,0 +1,162 @@
+= Positional Encoding
+{nbsp}
+:description: Positional encoding in TensorRT Edge-LLM: RoPE variants, cache construction, and runtime application
+
+== Overview
+
+Positional encoding injects sequence-position information into the model
+because self-attention is position-agnostic. Edge-LLM uses Rotary Position
+Embeddings (RoPE) for currently supported decoder families. RoPE applies
+position-dependent rotations to query and key vectors before attention,
+using precomputed cosine/sine caches.
+
+== Model Applicability
+
+[cols="2,2,3"]
+|===
+| Model Family | Encoding Type | Notes
+
+| Llama, Qwen, InternVL
+| Standard RoPE
+| Single `rope_theta`, single cache plane.
+
+| Phi-4
+| Long RoPE
+| Extended context with short/long factor arrays.
+
+| Qwen2-VL, Qwen3-VL
+| MRoPE
+| Temporal/spatial position IDs with per-request cache construction.
+
+| Config-driven RoPE-scaling families
+| Normalized RoPE parameters
+| Export selects the effective RoPE parameter set consumed by runtime.
+|===
+
+== Architecture
+
+RoPE is applied inside attention, between Q/K projections and scaled
+dot-product attention:
+
+[mermaid]
+----
+graph LR
+    Q[Query] --> ROPE_Q[Apply RoPE to Q]
+    K[Key] --> ROPE_K[Apply RoPE to K]
+    CACHE[RoPE cos/sin Cache] --> ROPE_Q
+    CACHE --> ROPE_K
+    ROPE_Q --> SDPA[Scaled Dot-Product Attention]
+    ROPE_K --> KV_WRITE[KV Cache Write]
+    KV_WRITE --> SDPA
+----
+
+== Variant Documents
+
+- link:rope.adoc[RoPE] -- rotary cache construction, non-interleaved
+  convention, Long RoPE, MRoPE, and position rebasing.
+
+== Design
+
+Position handling is exported as model metadata and materialized as runtime
+cos/sin caches or request-specific position IDs. Attention consumes the resolved
+position data rather than re-deriving family-specific rules.
+
+=== RoPE Cache Formula
+
+For a rotary pair index `i` inside `rotary_dim / 2`, Edge-LLM uses the standard
+RoPE frequency base:
+
+* `base_i = rope_theta ^ (2*i / rotary_dim)`
+* `angle(pos, i) = pos * rotaryScale / base_i`
+* `cos_sin_cache[pos, i] = cos(angle(pos, i))`
+* `cos_sin_cache[pos, i + rotary_dim/2] = sin(angle(pos, i))`
+
+The fused attention kernel reads this cache and rotates Q/K pairs before KV
+write and attention scoring.
+
+=== LongRoPE Calculation
+
+LongRoPE keeps the RoPE rotation form but replaces each dimension's base with a
+per-dimension extension factor from the checkpoint config:
+
+* `long_base_i = long_factor[i] * rope_theta ^ (2*i / rotary_dim)`
+* `short_base_i = short_factor[i] * rope_theta ^ (2*i / rotary_dim)`
+* `long_angle(pos, i) = pos / long_base_i`
+* `short_angle(pos, i) = pos / short_base_i`
+
+Runtime builds two caches:
+
+* the **long** cache uses `long_factor` for every position;
+* the **short** cache uses `short_factor` up to
+  `original_max_position_embeddings` and copies the long-cache tail beyond that
+  boundary.
+
+Both caches are multiplied by the runtime scaling factor:
+
+`scalingFactor = sqrt(1 + log(max_position_embeddings / original_max_position_embeddings) / log(original_max_position_embeddings))`
+
+when `max_position_embeddings > original_max_position_embeddings`; otherwise it
+is `1.0`.
+
+=== MRoPE Calculation
+
+MRoPE uses three position-id streams per token: temporal `T`, height `H`, and
+width `W`. Runtime receives or constructs `mropePositionIds` with shape
+`[batch, 3, max_positions]`, then selects one of the three streams for each
+rotary pair:
+
+* **Interleaved MRoPE** assigns pair indices in a THW pattern. H covers
+  `1, 4, ...` up to `sectionH`; W covers `2, 5, ...` up to `sectionW`; the
+  remaining pairs use T.
+* **Non-interleaved MRoPE** assigns contiguous pair sections: T first, then H,
+  then W.
+
+For the selected group `g in {T,H,W}`:
+
+* `base_i = rope_theta ^ (2*i / rotary_dim)`
+* `angle(pos, i) = mropePositionIds[batch, g, pos] / base_i`
+
+Text-only MRoPE sets all three position streams to the same sequential position
+IDs, so the calculation reduces to standard 1-D RoPE.
+
+=== Reference Links
+
+* RoPE paper: https://arxiv.org/abs/2104.09864[RoFormer: Enhanced Transformer
+  with Rotary Position Embedding].
+* LongRoPE paper: https://arxiv.org/abs/2402.13753[LongRoPE: Extending LLM
+  Context Window Beyond 2 Million Tokens].
+* MRoPE model context:
+  https://arxiv.org/abs/2409.12191[Qwen2-VL: Enhancing Vision-Language Model's
+  Perception of the World at Any Resolution].
+* Transformers implementation reference:
+  https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_vl/modeling_qwen2_vl.py[`apply_multimodal_rotary_pos_emb`].
+
+== Code Touchpoints
+
+[cols="1,3"]
+|===
+| Path | Responsibility
+
+| `cpp/kernels/posEncoding/initializeCosSinCache.{cu,h}`
+| CUDA kernels for standard, long, and MRoPE cache initialization.
+
+| `cpp/kernels/posEncoding/applyRopeWriteKV.{cu,h}`
+| Fused RoPE application and KV-cache write kernels.
+
+| `cpp/runtime/llmRuntimeUtils.{h,cpp}`
+| `collectRopeConfig()` and `initializeRopeCosSinCache()`.
+
+| `cpp/runtime/state/ropeCache.{h,cpp}`
+| RoPE cache allocation, initialization, and per-request MRoPE cache handling.
+
+| `tensorrt_edgellm/checkpoint/checkpoint_utils.py`
+| Normalizes and exports RoPE fields into runtime artifact config.
+
+| `tensorrt_edgellm/models/default/modeling_default.py`
+| Python-side attention wrapper that exposes `rope_rotary_cos_sin` for export.
+|===
+
+== Testing
+
+* `tests/test_lists/l0_pipeline_*.yml` covers RoPE-family behavior through
+  end-to-end generation.

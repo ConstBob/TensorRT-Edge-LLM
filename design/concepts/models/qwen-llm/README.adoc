@@ -1,0 +1,82 @@
+= Qwen Decoder Architecture
+{nbsp}
+:description: Architecture notes and implementation pointers for Qwen-family decoder checkpoints in TensorRT Edge-LLM
+
+== Overview
+
+Qwen decoder checkpoints cover dense Qwen2/Qwen2.5/Qwen3 models,
+Qwen-derived reasoning distills, Qwen3 sparse-MoE variants, and Qwen3.5
+hybrid checkpoints. Dense Qwen models use the default decoder exporter. Qwen3
+MoE registers a custom `qwen3_moe` handler for routed FFNs. Qwen3.5 registers
+specialized dense and MoE handlers because its decoder alternates between
+GatedDeltaNet linear-attention layers and gated full-attention layers.
+
+== Support Source of Truth
+
+The supported checkpoint list, precision matrix, and HF profile links live in
+link:../../../../docs/source/user_guide/getting_started/supported-models.md[Supported Models].
+Do not duplicate that table here.
+
+== Architecture Identity
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Dense config keys | `model_type: qwen2`, `model_type: qwen3`, `model_type: qwen3_5_text`
+| MoE config keys | `model_type: qwen3_moe`, `model_type: qwen3_5_moe`, `model_type: qwen3_5_moe_text`
+| Transformers modeling | https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2/modeling_qwen2.py[modeling_qwen2.py], https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3/modeling_qwen3.py[modeling_qwen3.py], https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py[modeling_qwen3_moe.py], https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5/modeling_qwen3_5.py[modeling_qwen3_5.py]
+| Edge-LLM dense handler | link:../../../../tensorrt_edgellm/models/default/modeling_default.py[default `CausalLM`]
+| Edge-LLM MoE handler | link:../../../../tensorrt_edgellm/models/qwen3_moe/modeling_qwen3_moe.py[`Qwen3MoeCausalLM`]
+| Edge-LLM Qwen3.5 handlers | link:../../../../tensorrt_edgellm/models/qwen3_5/modeling_qwen3_5_text.py[`Qwen3_5CausalLM`], link:../../../../tensorrt_edgellm/models/qwen3_5_moe/modeling_qwen3_5_moe.py[`Qwen3_5MoeCausalLM`]
+|===
+
+== Edge-LLM Integration Notes
+
+* DeepSeek-R1 distilled Qwen checkpoints are treated as Qwen decoder
+  architecture. Their reasoning behavior is checkpoint/template-specific, not a
+  separate decoder implementation.
+* Qwen3 adds attention-head Q/K normalization and thinking-mode template
+  behavior; keep those notes at the template or attention boundary instead of
+  creating a separate support list.
+* Qwen3 MoE replaces the dense FFN position with routed experts and the
+  `Int4MoePlugin`; the reusable contract is documented under
+  link:../../components/moe/[MoE / routed experts].
+* Qwen3.5 uses `layer_types` to select either `full_attention` or
+  `linear_attention` (GDN) per decoder layer. Its recurrent-state contract is
+  documented under link:../../components/state_space/linear.adoc[Linear Attention / Gated Delta Net].
+* Qwen3.5 dense MTP draft export is implemented as a dedicated draft model;
+  the base hybrid decoder remains the verification model.
+* Cosmos-style Qwen3 decoders should point back here for text-decoder details
+  and to link:../qwen-vl/[Qwen vision-language] for modality packaging.
+
+== Implementation Pointers
+
+[cols="1,3", options="header"]
+|===
+| Path | Detail
+| link:../../../../tensorrt_edgellm/model.py[model.py] | `AutoModel` fallback for dense Qwen, MTP variant selection for Qwen3.5, and explicit Qwen registrations from `__init__.py`.
+| link:../../../../tensorrt_edgellm/models/default/modeling_default.py[modeling_default.py] | Dense Qwen decoder block, attention, FFN, and LM-head graph construction.
+| link:../../../../tensorrt_edgellm/models/qwen3_moe/modeling_qwen3_moe.py[modeling_qwen3_moe.py] | Qwen3 sparse-MoE export path using routed experts.
+| link:../../../../tensorrt_edgellm/models/qwen3_5/modeling_qwen3_5_text.py[modeling_qwen3_5_text.py] | Qwen3.5 hybrid GDN/full-attention decoder path.
+| link:../../../../tensorrt_edgellm/models/qwen3_5_moe/modeling_qwen3_5_moe.py[modeling_qwen3_5_moe.py] | Qwen3.5 hybrid decoder with MoE FFNs and shared experts.
+| link:../../../../tensorrt_edgellm/models/qwen3_5/modeling_qwen3_5_mtp.py[modeling_qwen3_5_mtp.py] | Qwen3.5 dense MTP draft model.
+| link:../../../../tensorrt_edgellm/models/linear.py[linear.py] | Dense and quantized linear layers used by attention, FFN, experts, and LM heads.
+| link:../../../../tensorrt_edgellm/models/ops.py[ops.py] | Attention, quantization, MoE, GDN, and gather custom-op stubs.
+| link:../../../../tensorrt_edgellm/chat_template.py[chat_template.py] | Chat-template extraction and Qwen/Qwen3 prompt normalization.
+| link:../../../../cpp/runtime/[runtime] | Runtime engine loading and prefill/decode execution.
+|===
+
+== Related Components
+
+link:../../components/tokenizer/[Tokenizer], link:../../components/embeddings/[Embeddings],
+link:../../components/positional_encoding/[Positional encoding],
+link:../../components/attention/[Attention], link:../../components/kv_cache/[KV cache],
+link:../../components/state_space/linear.adoc[Linear Attention / Gated Delta Net],
+link:../../components/ffn/[FFN], link:../../components/moe/[MoE],
+link:../../components/normalization/[Normalization], and
+link:../../components/residual/[Residual] own the reusable contracts.
+
+== Maintenance Notes
+
+Use this page for Qwen architecture implementation notes only. Add supported
+checkpoint names and precision changes exclusively in the Supported Models page.

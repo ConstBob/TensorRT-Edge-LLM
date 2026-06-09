@@ -1,0 +1,59 @@
+= Phi-4 Multimodal Architecture
+{nbsp}
+:description: Architecture notes and implementation pointers for Phi-4 multimodal checkpoints in TensorRT Edge-LLM
+
+== Overview
+
+Phi-4 multimodal combines a Phi-family text decoder with a dedicated vision
+encoder/projector and template handling. Edge-LLM documents this separately
+because the visual path, long-RoPE text setup, and chat-template requirements
+are distinct from Qwen VLMs.
+
+== Support Source of Truth
+
+The supported checkpoint list, precision matrix, and HF profile links live in
+link:../../../../docs/source/user_guide/getting_started/supported-models.md[Supported Models].
+Do not duplicate that table here.
+
+== Architecture Identity
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Config key | `model_type: phi4_multimodal`
+| Transformers modeling | https://github.com/huggingface/transformers/blob/main/src/transformers/models/phi4_multimodal/modeling_phi4_multimodal.py[modeling_phi4_multimodal.py]
+| Edge-LLM text handler | link:../../../../tensorrt_edgellm/models/phi4mm/modeling_phi4mm_text.py[modeling_phi4mm_text.py]
+| Edge-LLM visual handler | link:../../../../tensorrt_edgellm/models/phi4mm/modeling_phi4mm_visual.py[modeling_phi4mm_visual.py]
+|===
+
+== Edge-LLM Integration Notes
+
+* The model uses a dedicated `phi4mm.json` chat-template artifact, so template
+  changes should be reviewed with export/runtime placeholder handling.
+* Visual features enter through the multimodal embedding path; decoder-side
+  attention, KV cache, FFN, and residual contracts remain shared.
+* Keep long-RoPE and multimodal-position behavior linked to the positional
+  encoding and embeddings component docs rather than duplicating upstream code.
+
+== Implementation Pointers
+
+[cols="1,3", options="header"]
+|===
+| Path | Detail
+| link:../../../../tensorrt_edgellm/models/phi4mm/modeling_phi4mm_visual.py[modeling_phi4mm_visual.py] | Phi-4 multimodal visual encoder export wrapper.
+| link:../../../../tensorrt_edgellm/models/phi4mm/modeling_phi4mm_text.py[modeling_phi4mm_text.py] | Phi-4 multimodal text wrapper.
+| link:../../../../tensorrt_edgellm/chat_templates/phi4mm.json[phi4mm.json] | Explicit chat template used during export.
+| link:../../../../cpp/multimodal/multimodalRunner.h[multimodalRunner.h] | Generic multimodal runtime dispatch.
+|===
+
+== Related Components
+
+link:../../components/vision/[Vision], link:../../components/embeddings/[Embeddings],
+link:../../components/tokenizer/[Tokenizer], link:../../components/positional_encoding/[Positional encoding],
+link:../../components/attention/[Attention], and link:../../components/kv_cache/[KV cache]
+own the reusable contracts.
+
+== Maintenance Notes
+
+Update this page only for Phi-4 multimodal architecture or implementation
+contract changes. Keep checkpoint support in the Supported Models page.

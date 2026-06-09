@@ -1,0 +1,104 @@
+= Dense Feed-Forward Network (FFN / MLP)
+{nbsp}
+:description: Dense feed-forward network component in TensorRT Edge-LLM
+
+== Overview
+
+The dense feed-forward network (FFN), also called the MLP block, is the
+per-token nonlinear transformation applied after the sequence-mixing sublayer in
+a decoder block. It projects from `hidden_size` to an intermediate dimension,
+applies an activation or gate, projects back to `hidden_size`, and feeds the
+second residual add.
+
+Mixture of Experts (MoE) layers occupy the same decoder-block position but have
+separate routing, expert packing, precision, and kernel behavior. MoE is
+therefore documented separately under link:../moe/[moe/].
+
+== Model Applicability
+
+[cols="2,2,3", options="header"]
+|===
+| Model Family | Dense FFN Type | Formula
+
+| Llama, Qwen, InternVL, Qwen3-TTS CodePredictor
+| SwiGLU-style gated MLP
+| `down_proj(silu(gate_proj(x)) * up_proj(x))`.
+
+| Phi-style dense variants
+| GeGLU-style gated MLP when configured
+| `down_proj(gelu(gate_proj(x)) * up_proj(x))`.
+
+| Nemotron-H dense MLP layers
+| ReLU-squared MLP
+| `down_proj(relu(up_proj(x)) * relu(up_proj(x)))`.
+
+| Quantized dense LLM variants
+| Same dense topology with quantized linear layers
+| `make_linear()` selects FP16/FP8/NVFP4/MXFP8/INT4/INT8 linear wrappers, but
+  the dense FFN dataflow remains the model formula above.
+|===
+
+== Architecture
+
+Within a decoder block, the dense FFN sits between pre-FFN normalization and the
+second residual add. For gated MLPs, the activation is applied to the gate
+projection, then multiplied by the up projection:
+
+[mermaid]
+----
+graph LR
+    H[Post-sequence-mixer residual] --> NORM[RMSNorm / LayerNorm]
+    NORM --> GATE[gate_proj]
+    NORM --> UP[up_proj]
+    GATE --> ACT[silu / gelu]
+    ACT --> PROD[Element-wise gated product]
+    UP --> PROD
+    PROD --> DOWN[down_proj]
+    DOWN --> RES[Residual add]
+    H --> RES
+----
+
+Nemotron-H dense MLP omits `gate_proj`: `up_proj(x)` is ReLU-activated,
+squared elementwise, and passed through `down_proj`.
+
+== Design
+
+* The dense FFN contract starts from normalized hidden states and returns a
+  tensor with the same hidden dimension as the residual path.
+* The model implementation, not the component doc, determines the exact
+  activation (`silu`, `gelu`, `relu^2`) and linear precision wrapper.
+* Quantized dense FFNs preserve the same graph-level projection/activation
+  topology; only the linear operators and weight formats differ.
+* Routed expert layers are not described here. See link:../moe/[MoE] for
+  router, top-k, INT4, NVFP4, and hardware-specific kernels.
+
+== Code Touchpoints
+
+[cols="1,2", options="header"]
+|===
+| Path | Responsibility
+
+| `tensorrt_edgellm/models/default/modeling_default.py`
+| Default SwiGLU dense MLP: `silu(gate_proj(x)) * up_proj(x)` followed by
+  `down_proj`.
+
+| `tensorrt_edgellm/models/qwen3_tts/modeling_code_predictor.py`
+| CodePredictor MLP overflow workaround that keeps the SwiGLU intermediate and
+  `down_proj` matmul in FP32 before casting back to the residual dtype.
+
+| `tensorrt_edgellm/models/nemotron_h/modeling_nemotron_h.py`
+| Nemotron-H dense MLP: `relu(up_proj(x))^2` followed by `down_proj`.
+
+| `tensorrt_edgellm/models/linear.py`
+| Dense linear wrappers for FP16 and quantized linear projections.
+
+| `cpp/plugins/`
+| TensorRT plugin implementations used by selected quantized linear paths.
+|===
+
+== Testing
+
+* Dense FFN behavior is covered through model export/build/inference tests that
+  exercise the full decoder block.
+* Plugin-specific tests should be referenced from the precision/component page
+  for that plugin rather than from this dense FFN overview.

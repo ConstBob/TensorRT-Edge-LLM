@@ -1,6 +1,9 @@
 = LLM Design Notes
 {nbsp}
-:description: Index of design notes for LLM-related components in TensorRT Edge-LLM
+:description: Index of LLM loader and model-construction design notes in TensorRT Edge-LLM
 
 == Index
-- `tensorrt_edgellm_design.adoc`: tensorrt_edgellm package — checkpoint loading, model construction, and dynamo ONNX export pipeline (including hybrid Mamba+Attention models). This is the recommended export path; the source currently lives under `tensorrt_edgellm/`.
+
+- link:tensorrt_edgellm_design.adoc[Checkpoint Exporter Design] -- ``tensorrt_edgellm`` package checkpoint loading, model construction, and dynamo ONNX export pipeline, including hybrid Mamba+Attention models.
+
+Component-level transformer architecture notes live under `design/concepts/components/`.

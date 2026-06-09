@@ -1,0 +1,106 @@
+= Vision
+{nbsp}
+:description: Vision and multimodal input component in TensorRT Edge-LLM
+
+== Overview
+
+The vision component covers image/video preprocessing, visual encoder export,
+and runtime visual embedding generation for VLM families. It feeds visual
+features into the shared embedding and decoder stack documented by the core
+component docs.
+
+Vision is a modality component, not a transformer decoder sublayer. It owns the
+path from image/video inputs to visual embeddings and model-family-specific ViT
+runtime runners.
+
+== Model Applicability
+
+[cols="2,2,3", options="header"]
+|===
+| Model Family | Vision Path | Notes
+
+| Qwen2-VL, Qwen2.5-VL, Qwen3-VL, Qwen3.5, Cosmos Reason2
+| Qwen-family ViT runner
+| Qwen3-VL exposes deepstack visual features. Qwen3.5 reuses the Qwen3-VL
+  visual architecture with deepstack disabled. Cosmos Reason2 follows the
+  Qwen3-family VLM packaging path rather than a separate vision family.
+
+| InternVL3
+| InternVL ViT runner
+| Uses InternVL-specific image token geometry and runtime runner.
+
+| Phi-4 multimodal
+| Phi-4 multimodal ViT runner
+| Requires model-family LoRA/template handling before export.
+
+|===
+
+== Architecture
+
+[mermaid]
+----
+flowchart LR
+    IMG[Image / video input] --> PRE[Image preprocessing]
+    PRE --> VIT[Vision encoder]
+    VIT --> VEMB[Visual embeddings]
+    TXT[Text tokens] --> TEMB[Text embeddings]
+    VEMB --> FUSE[Multimodal embedding stream]
+    TEMB --> FUSE
+    VIT --> DEEP[Deepstack features]:::optional
+    DEEP -.-> DEC[Decoder stack]
+    FUSE --> DEC
+    classDef optional stroke-dasharray: 5 5
+----
+
+== Design
+
+* Export creates a separate visual ONNX artifact for families with a vision
+  encoder.
+* Runtime selects a family runner based on model type and visual engine inputs.
+* Visual embeddings enter the LLM through the embedding contract documented in
+  link:../embeddings/[Embeddings].
+* Qwen3-VL deepstack features are additional per-layer visual inputs and are
+  documented in link:../embeddings/deepstack.adoc[Deepstack Embeddings].
+
+== Code Touchpoints
+
+[cols="2,3", options="header"]
+|===
+| Path | Responsibility
+
+| `tensorrt_edgellm/models/qwen2_5_vl/modeling_qwen2_5_vl_visual.py`
+| Qwen2-VL/Qwen2.5-VL visual encoder export wrapper.
+
+| `tensorrt_edgellm/models/qwen3_vl/modeling_qwen3_vl_visual.py`
+| Qwen3-VL visual encoder and deepstack feature export wrapper.
+
+| `tensorrt_edgellm/models/qwen3_5/modeling_qwen3_5_visual.py`
+| Qwen3.5 visual encoder wrapper; same Qwen3-family visual path with deepstack
+  disabled.
+
+| `tensorrt_edgellm/models/internvl3/modeling_internvl3_visual.py`
+| InternVL3 visual encoder export wrapper.
+
+| `tensorrt_edgellm/models/phi4mm/modeling_phi4mm_visual.py`
+| Phi-4 multimodal visual encoder export wrapper.
+
+| `cpp/multimodal/multimodalRunner.{h,cpp}`
+| Runtime multimodal runner dispatch.
+
+| `cpp/multimodal/qwenViTRunner.{h,cpp}`
+| Qwen-family visual runtime runner.
+
+| `cpp/multimodal/internViTRunner.{h,cpp}`
+| InternVL visual runtime runner.
+
+| `cpp/multimodal/phi4mmViTRunner.{h,cpp}`
+| Phi-4 multimodal visual runtime runner.
+|===
+
+== Testing
+
+* `tests/defs/test_vlm_pipeline.py` validates VLM build, inference, and
+  benchmark flows.
+* `tests/defs/test_model_export.py` covers VLM export entry points.
+* `tests/test_lists/l0_pipeline_*.yml` and `tests/test_lists/l1_pipeline_*.yml`
+  include Qwen-VL and InternVL pipeline coverage.

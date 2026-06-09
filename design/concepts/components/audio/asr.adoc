@@ -1,0 +1,101 @@
+= Automatic Speech Recognition (ASR)
+{nbsp}
+:description: Input-side audio encoder path for speech-to-text models
+
+== Overview
+
+ASR consumes audio-side features and turns them into embeddings that the LLM
+text decoder can consume. In the current Qwen3-ASR path, audio preprocessing
+produces mel-spectrogram chunks and masks, the audio encoder emits
+`last_hidden_state`, and the runtime inserts those audio embeddings into the
+shared `inputs_embeds` stream for the language model.
+
+This path is different from TTS: ASR has an audio encoder and produces text;
+TTS has no audio encoder and generates speech codec tokens.
+
+== Model Applicability
+
+[cols="2,2,3", options="header"]
+|===
+| Model Family | Audio Component | Notes
+
+| Qwen3-ASR
+| Whisper-style audio encoder plus LLM text decoder
+| Audio features become embeddings for `<audio>` positions in the language
+  model prompt.
+
+| Qwen3-Omni thinker/audio input
+| Same audio-encoder runner pattern
+| Shares the audio preprocessing and encoder runtime shape contracts used by
+  the ASR input-side path.
+|===
+
+== Architecture
+
+[mermaid]
+----
+flowchart LR
+    WAV[Audio file or precomputed mel] --> PRE[Audio preprocessing]
+    PRE --> CHUNK[Chunk + pad mel features]
+    CHUNK --> MASK[Mask indices + chunkwise attention mask]
+    CHUNK --> ENC[QwenAudioEncoder]
+    MASK --> ENC
+    ENC --> AEMB[last_hidden_state audio embeddings]
+    PROMPT[Tokenized prompt with audio tokens] --> LOOKUP[Embedding assembly]
+    AEMB --> LOOKUP
+    LOOKUP --> INPUTS[inputs_embeds]
+    INPUTS --> LLM[LLM text decoder]
+    LLM --> TEXT[Recognized text]
+----
+
+== Design
+
+* `audioUtils` computes chunk metadata, pads mel features, builds valid-token
+  masks after the three stride-2 CNN stages, converts masks to nonzero indices,
+  and creates the block-diagonal audio attention mask.
+* `QwenAudioEncoder.forward()` consumes `padded_feature`,
+  `padded_mask_after_cnn_indices`, and `attention_mask`. It applies three GELU
+  CNN downsampling layers, projects to the encoder hidden size, adds sinusoidal
+  position embeddings, gathers valid post-CNN tokens, runs encoder layers, then
+  projects to the LLM audio embedding dimension.
+* `Qwen3OmniAudioRunner` loads or receives mel data, prepares audio encoder
+  bindings, runs the audio engine, inserts audio placeholder tokens into the
+  text prompt, and exposes the audio embedding tensor to the LLM runtime.
+* The LLM runtime assembles a single `inputs_embeds` tensor. Audio token
+  positions are filled from the audio encoder output through the multimodal
+  embedding kernel; text positions come from the text embedding table.
+
+== Code Touchpoints
+
+[cols="2,3", options="header"]
+|===
+| Path | Responsibility
+
+| `tensorrt_edgellm/models/qwen3_asr/modeling_qwen3_asr_audio.py`
+| Qwen audio encoder architecture and `build_qwen_audio()` weight loading.
+
+| `tensorrt_edgellm/models/qwen3_asr/modeling_qwen3_asr_text.py`
+| ASR language-model wrapper.
+
+| `tensorrt_edgellm/onnx/export_encoder.py`
+| Audio encoder export and dummy input names: `padded_feature`,
+  `padded_mask_after_cnn_indices`, `attention_mask`.
+
+| `cpp/multimodal/audioRunner.{h,cpp}`
+| Audio preprocessing, audio engine execution, audio token insertion, and output
+  embedding handoff.
+
+| `cpp/multimodal/audioUtils.{h,cpp}`
+| Chunking, padding, mask/index generation, and chunkwise attention-mask helpers.
+
+| `cpp/kernels/embeddingKernels/embeddingKernels.{h,cu}`
+| Multimodal embedding assembly that inserts audio embeddings into
+  `inputs_embeds`.
+|===
+
+== Testing
+
+* `tests/python-unittests/test_preprocess_audio.py` validates the Python audio
+  preprocessing utility.
+* `tests/test_lists/l0_checkpoint_export.yml` includes a Qwen3-ASR export-only
+  case through `tests/defs/test_checkpoint_export.py`.

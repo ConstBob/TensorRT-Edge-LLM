@@ -1,0 +1,178 @@
+= Contributing Design Documents
+{nbsp}
+:description: Authoring standards for TensorRT Edge-LLM design documents
+
+== Purpose
+
+Design documents communicate the current Edge-LLM architecture and implementation
+contracts. They are not implementation diaries.
+
+`design/concepts/components/` describes reusable components: why each component is needed,
+how Edge-LLM implements it, and which code/test touchpoints own the contract.
+
+`design/concepts/models/` facilitates architecture-level communication across Edge-LLM
+engineers. An architecture README should make it easy to see:
+
+. What config/model architecture it describes.
+. What reusable components are related to that architecture.
+. Where to find implementation details for that architecture.
+
+The user-facing checkpoint list, precision matrix, and HF profile links live in
+`docs/source/user_guide/getting_started/supported-models.md`. Do not duplicate
+that support matrix in `design/concepts/models/`.
+
+Keep docs concise. Aim for **about 200 lines or fewer** per document. If a
+component needs more space, split reusable variants into separate component
+variant docs instead of growing one large file.
+
+== Document Taxonomy
+
+[cols="1,3"]
+|===
+| Path | Use
+
+| `design/README.adoc`
+| Top-level index, directory orientation, and reference architecture.
+
+| `design/concepts/components/`
+| Reusable component design docs. Component pages explain why a component is
+needed and how it is implemented in Edge-LLM.
+
+| `design/concepts/components/<component>/README.adoc`
+| Component overview. Owns the generic reusable subsystem contract, such as
+attention, tokenizer, or KV cache.
+
+| `design/concepts/components/<component>/<variant>.adoc`
+| Component variant detail. Use for a reusable permutation, family-specific
+behavior, or optimization of the owning component, such as sliding-window
+attention or prefix KV reuse.
+
+| `design/llm/`
+| LLM loader and model-construction design notes. This is top-level and not a component directory.
+
+| `design/concepts/models/`
+| Architecture index. Links to Supported Models for checkpoint-level support.
+
+| `design/concepts/models/<architecture>/README.adoc`
+| Short architecture notes, upstream modeling reference, component links, and
+implementation pointers.
+
+| `design/in_progress/`
+| Work-in-progress proposals that are not yet accepted as mainline design docs.
+|===
+
+Avoid component documents that only explain a private adaptation for one model
+family. If the mechanism is reusable, document it under the component it extends.
+If the information is only model-level wiring, keep it in the matching
+`design/concepts/models/<architecture>/README.adoc` page. Keep checkpoint-level support
+in Supported Models.
+
+== Required Structure
+
+Use these sections for component and variant docs unless there is a strong
+reason to omit one:
+
+. `Overview` -- what the component does and why it is needed.
+. `Model Applicability` -- which supported families/configurations use it.
+. `Architecture` -- where it sits in export, build, or runtime flow.
+. `Design` -- data contracts, Edge-LLM implementation approach, invariants, and
+  important failure modes.
+. `Code Touchpoints` -- validated paths to the main implementation files.
+. `Testing` -- validated test files or test-list globs.
+
+Model-architecture READMEs should use these sections:
+
+. `Overview` -- what architecture the page covers and why it needs notes.
+. `Support Source of Truth` -- link to Supported Models and state that checkpoint
+  support is not duplicated here.
+. `Architecture Identity` -- config/model-type keys, upstream Transformers
+  modeling link, and Edge-LLM handler path.
+. `Edge-LLM Integration Notes` -- short, concrete notes about what the
+  architecture changes at the Edge-LLM export/runtime boundary.
+. `Implementation Pointers` -- validated code paths for architecture-specific
+  and common implementation entry points.
+. `Related Components` -- links to reusable component docs it uses.
+. `Maintenance Notes` -- when to update the architecture page vs. Supported Models.
+
+Keep sections focused on information needed to understand or safely modify the
+component/model. Prefer links to code over copied implementation logic.
+
+== Size and Scope Guidelines
+
+* Target 80-160 lines for a component `README.adoc`.
+* Target 120-200 lines for a component variant document.
+* Target 60-140 lines for a model-architecture README.
+* Treat 200 lines as a soft limit, not a goal.
+* Split large docs by reusable mechanism, not by arbitrary implementation
+  file.
+* Do not include long code excerpts, exhaustive field dumps, or every test
+  case. Summarize and link.
+* Do not duplicate the same architecture explanation across multiple docs;
+  link to the owning component or architecture doc.
+* Do not copy HF model-card content into model docs; link to the HF profile from
+  Supported Models instead.
+
+== Style Guidelines
+
+* Write in present tense and describe the current branch behavior.
+* Start from the component contract before implementation details.
+* Prefer small Mermaid diagrams for flows that are hard to explain in text.
+* Prefer compact tables for applicability, attributes, and touchpoints.
+* Explain invariants and failure behavior explicitly.
+* Use precise names for runtime artifacts, bindings, config keys, and paths.
+* Avoid speculative roadmap content in mainline docs. Put proposals in
+  `design/in_progress/`.
+
+== Code Touchpoint Rules
+
+Every path in `Code Touchpoints` or `Implementation Pointers` must be one of:
+
+* An existing file, e.g. `cpp/runtime/llmInferenceRuntime.cpp`.
+* An existing directory, e.g. `cpp/plugins/attentionPlugin/`.
+* A validated glob, e.g. `tests/test_lists/l0_pipeline_*.yml`.
+* A clearly named generated/runtime artifact, e.g. `config.json`.
+
+When code moves, update the design doc in the same change.
+
+== Testing Section Rules
+
+The `Testing` section should answer: how do we know this contract works?
+Use real test files or validated test-list globs. Summarize coverage by
+behavior, not by listing every fixture.
+
+Good examples:
+
+* `tests/python-unittests/test_attention_plugin.py` validates plugin output
+  against a numpy reference.
+* `unittests/hybridCacheManagerTests.cpp` validates cache reset/capture/restore.
+* `tests/test_lists/l0_pipeline_*.yml` provides end-to-end engine coverage.
+
+If no direct test exists, say so briefly and describe the expected test to
+add before expanding support.
+
+== Model and Architecture References
+
+Model names are allowed when they clarify applicability for supported mainline
+behavior, but checkpoint support belongs in Supported Models. Avoid carrying
+references from private or experimental model-specific docs into generic design
+docs.
+
+Before adding a model-specific statement, verify that the current branch has
+code or tests for that behavior. If the behavior is not supported in this
+branch, omit it or move the discussion to `design/in_progress/`.
+
+== Validation Checklist
+
+Before submitting a design-doc change:
+
+* The document is near or below the 200-line soft limit.
+* Required sections are present or intentionally omitted.
+* Local `link:` targets resolve.
+* Code touchpoints point to existing files/directories, validated globs, or
+  named runtime artifacts.
+* Test references point to existing tests or validated test-list globs.
+* Architecture references match current branch code/tests.
+* Model-architecture docs link to Supported Models instead of duplicating a
+  support matrix.
+* The doc explains what the component or architecture does and how it fits into
+  the system without becoming an implementation dump.

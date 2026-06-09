@@ -1,0 +1,101 @@
+= Text-to-Speech (TTS)
+{nbsp}
+:description: Output-side talker, code-predictor, and vocoder path for speech generation
+
+== Overview
+
+TTS consumes text or thinker hidden states and generates speech codec tokens.
+It does **not** run an audio encoder. In the Qwen3-TTS path, the text backbone
+is a standard Qwen3-style LLM, while the speech path uses separate Talker and
+CodePredictor decoder engines. Generated RVQ codes can then be converted to
+waveform by Code2Wav when that engine is available.
+
+This path is different from ASR: ASR transforms audio into text; TTS transforms
+text/thinker states into audio codes.
+
+== Model Applicability
+
+[cols="2,2,3", options="header"]
+|===
+| Model Family | TTS Component | Notes
+
+| Qwen3-TTS
+| Text backbone + Talker + CodePredictor
+| Talker predicts coarse codec tokens; CodePredictor generates residual
+  codebook tokens.
+
+| Qwen3-Omni audio generation
+| Thinker-to-Talker path
+| Runtime can consume thinker layer-0 embeddings and selected hidden states
+  instead of re-tokenizing standalone TTS text only.
+|===
+
+== Architecture
+
+[mermaid]
+----
+flowchart LR
+    TXT[Text prompt / conversation] --> TOK[Tokenizer]
+    TOK --> THINK[Thinker/text LLM]
+    THINK --> PROJ[Text/hidden projection to talker space]
+    PROJ --> TALKER[Talker LLM decoder]
+    TALKER --> COARSE[Coarse codec token]
+    TALKER --> THIDDEN[Talker hidden state]
+    COARSE --> CP[CodePredictor decoder]
+    THIDDEN --> CP
+    CP --> RVQ[Residual RVQ codes]
+    RVQ --> CODES[Frame codec codes]
+    CODES --> C2W[Code2Wav vocoder]
+    C2W --> WAV[Waveform]
+----
+
+== Design
+
+* `tensorrt_edgellm/models/qwen3_tts/modeling_qwen3_tts_text.py`
+  reuses the default CausalLM wrapper for the text backbone.
+* `TalkerCausalLM` is exported through the standard LLM pipeline but returns
+  both `logits` and full `hidden_states`; the runtime needs Talker hidden states
+  for the residual CodePredictor path.
+* `CodePredictorCausalLM` is a small decoder whose `lm_head_weight` is an ONNX
+  input so runtime can select among residual-codebook heads. Codec embedding
+  lookup happens in the runtime; the engine consumes `inputs_embeds`.
+* `Qwen3OmniTTSRuntime` owns the nested generation loop: project text/thinker
+  features into Talker input space, sample Talker codec tokens, run the
+  CodePredictor per generated frame, accumulate RVQ codes, and return codes for
+  optional vocoding.
+* `Code2WavRunner` converts generated RVQ code matrices
+  `[num_quantizers, seq_len]` to waveform chunks or full waveform output.
+
+== Code Touchpoints
+
+[cols="2,3", options="header"]
+|===
+| Path | Responsibility
+
+| `tensorrt_edgellm/models/qwen3_tts/modeling_qwen3_tts_text.py`
+| Qwen3-TTS text backbone alias.
+
+| `tensorrt_edgellm/models/qwen3_tts/modeling_qwen3_tts_talker.py`
+| Talker decoder export with `logits` and `hidden_states` outputs.
+
+| `tensorrt_edgellm/models/qwen3_tts/modeling_code_predictor.py`
+| CodePredictor export with dynamic `lm_head_weight`, codec-embedding runtime
+  contract, and FP32 MLP overflow workaround.
+
+| `tensorrt_edgellm/models/qwen3_tts/modeling_qwen3_tts_audio.py`
+| Explicit note that Qwen3-TTS has no audio encoder.
+
+| `cpp/runtime/qwen3OmniTTSRuntime.{h,cpp}`
+| Talker/CodePredictor runtime, projection weights, nested generation loop, and
+  RVQ code output.
+
+| `cpp/multimodal/code2WavRunner.{h,cpp}`
+| Optional speech-code to waveform inference.
+|===
+
+== Testing
+
+* `tests/test_lists/l0_checkpoint_export.yml` includes a Qwen3-TTS export-only
+  case through `tests/defs/test_checkpoint_export.py`.
+* There is currently no dedicated TTS runtime waveform-parity unit test in this
+  branch.

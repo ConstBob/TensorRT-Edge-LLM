@@ -1,0 +1,165 @@
+= Input Embeddings Architecture
+{nbsp}
+:description: Shared design for building the `inputs_embeds` tensor in LLM builder/runtime paths
+
+== Overview
+
+All current Edge-LLM decoder engines consume one dense embedding input:
+`inputs_embeds` with shape `[batch_size, sequence_length, hidden_size]`.
+Text-only, vision, audio, and legacy multimodal requests differ in how the C++
+runtime assembles that tensor before engine enqueue; they do not use separate
+text/vision input streams.
+
+Deepstack-capable models add indexed `deepstack_embeds_<idx>` bindings beside
+`inputs_embeds`. Those tensors are per-layer visual feature injections and are
+documented in link:deepstack.adoc[deepstack.adoc].
+
+== Model Applicability
+
+[cols="1,2,3", options="header"]
+|===
+| Model Family | Embedding Assembly Path | Notes
+
+| Standard text-only LLMs
+| Text embedding lookup into `inputs_embeds`
+| `input_ids` index the text embedding table; FP8 tables use per-group scales.
+
+| Qwen2-VL, InternVL legacy vision paths
+| Text lookup plus image insertion into `inputs_embeds`
+| Image placeholders are represented by token IDs at or above `vocab_size`, so
+  `token_id - vocab_size` selects the image embedding row.
+
+| Qwen3-Omni audio/image paths
+| Multimodal lookup into `inputs_embeds`
+| Explicit image/audio token IDs and `multimodalIndices` select the visual or
+  audio embedding row for each placeholder position.
+
+| Qwen3-VL, Qwen3-Omni deepstack paths
+| `inputs_embeds` plus `deepstack_embeds_<idx>`
+| Base token/audio/image embedding assembly still produces one
+  `inputs_embeds`; deepstack tensors are additional per-layer inputs.
+|===
+
+== Architecture
+
+[mermaid]
+----
+flowchart TD
+    IDS[input_ids] --> MODE{Modal inputs present?}
+    TEXT[Text embedding table<br/>FP16 or FP8+scales] --> KERNELS[embeddingKernels]
+    MODE -->|No| LOOKUP[embeddingLookup]
+    MODE -->|Legacy image remap| LEGACY[embeddingLookupWithImageInsertion]
+    MODE -->|Explicit image/audio IDs| MM[embeddingLookupMultimodal]
+    LOOKUP --> KERNELS
+    LEGACY --> KERNELS
+    MM --> KERNELS
+    IMG[Visual embeddings] --> LEGACY
+    IMG --> MM
+    AUD[Audio embeddings] --> MM
+    IND[multimodalIndices] --> MM
+    KERNELS --> INPUTS[inputs_embeds]
+    INPUTS --> LLM[LLM engine prefill/decode]
+
+    DSF[deepstack_features_i<br/>from visual engine] --> DSK[assembleDeepstackEmbedding]
+    IDS --> DSK
+    IND --> DSK
+    DSK --> DSE[deepstack_embeds_i]
+    DSE --> LLM
+----
+
+== Design
+
+The core embedding assembly happens in
+`cpp/kernels/embeddingKernels/embeddingKernels.{h,cu}`:
+
+* `embeddingLookup()` handles pure text. Each token ID indexes
+  `[vocab_size, hidden_size]`; FP16 tables are copied directly, while FP8 tables
+  are dequantized with FP32 per-group scales into FP16 `inputs_embeds`.
+* `embeddingLookupWithImageInsertion()` handles legacy image-token remapping.
+  Text IDs index the text table. IDs outside the vocabulary select
+  `imageEmbeds[token_id - vocab_size]`.
+* `embeddingLookupMultimodal()` handles explicit image/audio token IDs. Text
+  IDs use the text table. Positions whose token ID matches `imageTokenId` or
+  `audioTokenId` use `multimodalIndices` to select the corresponding visual or
+  audio embedding row.
+* `assembleDeepstackEmbedding()` builds dense `[B,S,H]`
+  `deepstack_embeds_<idx>` tensors from raw visual `deepstack_features_<idx>`.
+  Image positions receive the selected deepstack feature row; non-image
+  positions are zero.
+
+The CUDA kernels validate tensor shapes and dtypes, vectorize hidden-dimension
+loads where possible, and zero-fill invalid or non-applicable positions instead
+of emitting partial embeddings.
+
+=== Runtime Flow
+
+1. `EmbeddingPreprocessor` receives request token IDs and reshapes the
+   `inputs_embeds` buffer to `[active_batch, input_ids_len, hidden_size]`.
+2. The runtime selects one assembly kernel:
+   * pure text -> `embeddingLookup()`;
+   * legacy vision-only remap -> `embeddingLookupWithImageInsertion()`;
+   * audio or explicit image/audio token IDs -> `embeddingLookupMultimodal()`.
+3. If the engine expects deepstack inputs, visual runner outputs are converted
+   into `deepstack_embeds_<idx>` by `assembleDeepstackEmbedding()`. Text-only
+   requests on deepstack-capable engines bind zero deepstack tensors.
+4. `TensorRegistry` binds `inputs_embeds` directly for prefill, decode, and
+   EAGLE/tree decoding. Deepstack bindings are real tensors during prefill when
+   features are present and dummy/zero tensors for decode/tree-decode paths.
+
+=== Builder and Export Contracts
+
+* Python `tensorrt_edgellm` wrappers export `inputs_embeds` as the decoder input.
+* Deepstack-capable exports append `deepstack_embeds_<idx>` input names and
+  dynamic axes with the same `[B,S,H]` profile shape as `inputs_embeds`.
+* `LLMBuilder` configures optimization profiles for `inputs_embeds` and any
+  detected deepstack inputs.
+* Runtime preprocessing and tensor registration validate that `inputs_embeds` is
+  a GPU FP16 3-D tensor with hidden dimension equal to the engine config.
+  Deepstack tensors must either be absent or match the configured count and
+  `[B,S,H]` shape.
+
+== Code Touchpoints
+
+[cols="2,3", options="header"]
+|===
+| File Path | Responsibility
+
+| `cpp/common/bindingNames.h`
+| Canonical `inputs_embeds` and `deepstack_embeds_<idx>` binding names.
+
+| `cpp/kernels/embeddingKernels/embeddingKernels.{h,cu}`
+| Core text, image, audio, multimodal, FP8-dequant, and deepstack embedding
+  assembly kernels.
+
+| `cpp/runtime/preprocess/embeddingPreprocessor.{h,cpp}`
+| Chooses the assembly kernel, generates `multimodalIndices`, assembles
+  deepstack tensors, and prepares `inputs_embeds` before enqueue.
+
+| `cpp/runtime/features/deepstackBinding.{h,cpp}`
+| Tracks expected deepstack bindings and supplies real or zero tensors by stage.
+
+| `cpp/runtime/exec/registryBuilder.{h,cpp}`
+| Registers `inputs_embeds` and `deepstack_embeds_<idx>` bindings for the engine.
+
+| `cpp/runtime/exec/tensorRegistry.{h,cpp}`
+| Resolves tensor addresses/shapes and binds embedding inputs into TensorRT
+  execution contexts.
+
+| `cpp/builder/llmBuilder.{h,cpp}`
+| Configures optimization profiles for `inputs_embeds` and detected deepstack
+  inputs.
+|===
+
+== Testing
+
+[cols="2,2", options="header"]
+|===
+| Test File | Coverage Area
+
+| `unittests/embeddingLookupTests.cpp`
+| Embedding lookup and multimodal embedding assembly kernels.
+
+| `tests/python-unittests/test_preprocess_audio.py`
+| Audio preprocessing that feeds audio embeddings into the multimodal embedding
+  path.
+|===

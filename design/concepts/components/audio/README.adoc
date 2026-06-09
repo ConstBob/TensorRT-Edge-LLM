@@ -1,0 +1,101 @@
+= Audio
+{nbsp}
+:description: Audio model export and runtime component in TensorRT Edge-LLM
+
+== Overview
+
+The audio component is an index for audio-related workflows. ASR and TTS are
+documented separately because they have different architectures, engine
+artifacts, and runtime loops:
+
+* link:asr.adoc[ASR] consumes audio features and produces embeddings for a
+  language model to decode text.
+* link:tts.adoc[TTS] consumes text/thinker hidden states and produces speech
+  codec tokens, optionally followed by code-to-waveform vocoding.
+
+Audio is not a decoder block sublayer. It is a modality component around the
+decoder stack: ASR is an input-side audio-encoder path, while TTS is an
+output-side talker/code-predictor/vocoder path.
+
+== Model Applicability
+
+[cols="2,2,3", options="header"]
+|===
+| Model Family | Audio Role | Notes
+
+| Qwen3-ASR
+| Audio encoder input path
+| See link:asr.adoc[ASR]. Converts preprocessed mel features into audio
+  embeddings consumed by the LLM path.
+
+| Qwen3-TTS
+| Talker/code-predictor output path
+| See link:tts.adoc[TTS]. Generates speech codec tokens through separate
+  decoder exports; it does not use an audio encoder.
+|===
+
+== Architecture
+
+[mermaid]
+----
+flowchart LR
+    subgraph ASR[ASR input-side path]
+        AIN[Audio or mel input] --> APRE[Audio preprocessing]
+        APRE --> AENC[Audio encoder]
+        AENC --> AEMB[Audio embeddings]
+        AEMB --> LLM[LLM text decoder]
+        LLM --> TEXT[Text output]
+    end
+
+    subgraph TTS[TTS output-side path]
+        TIN[Text prompt / thinker states] --> TALKER[Talker decoder]
+        TALKER --> CP[CodePredictor]
+        CP --> CODES[RVQ speech codes]
+        CODES --> C2W[Code2Wav vocoder]
+        C2W --> WAV[Waveform]
+    end
+----
+
+== Design
+
+* Keep ASR and TTS processing separate in design docs and implementation
+  reviews.
+* ASR owns audio preprocessing, audio encoder export, audio-token insertion, and
+  `inputs_embeds` assembly for the text decoder.
+* TTS owns talker/code-predictor decoder exports, codec-token generation, and
+  optional Code2Wav waveform generation.
+* Text tokenization still follows link:../tokenizer/[Tokenizer]; these pages
+  describe only audio-side feature preparation or speech-code output handling.
+
+== Code Touchpoints
+
+[cols="2,3", options="header"]
+|===
+| Path | Responsibility
+
+| `tensorrt_edgellm/models/qwen3_asr/modeling_qwen3_asr_audio.py`
+| Qwen3-ASR audio encoder model and builder; see link:asr.adoc[ASR].
+
+| `tensorrt_edgellm/models/qwen3_tts/`
+| Qwen3-TTS thinker/talker/code-predictor wrappers; see link:tts.adoc[TTS].
+
+| `tensorrt_edgellm/onnx/export_encoder.py`
+| Audio encoder export entry point. Qwen3-TTS is intentionally excluded from
+  audio-encoder export because it has no audio encoder.
+
+| `cpp/multimodal/audioRunner.{h,cpp}`
+| ASR/Omni audio preprocessing and encoder runtime.
+
+| `cpp/multimodal/code2WavRunner.{h,cpp}`
+| TTS/Omni speech-code to waveform runtime.
+
+| `cpp/multimodal/audioUtils.{h,cpp}`
+| Audio preprocessing helpers shared by ASR/Omni input-side paths.
+|===
+
+== Testing
+
+* `tests/python-unittests/test_preprocess_audio.py` validates audio
+  preprocessing utilities used by ASR-style inputs.
+* `tests/test_lists/l0_checkpoint_export.yml` includes Qwen3-ASR and Qwen3-TTS
+  export-only cases through `tests/defs/test_checkpoint_export.py`.

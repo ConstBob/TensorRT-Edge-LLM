@@ -1,0 +1,80 @@
+= Residual Connections
+{nbsp}
+:description: Residual connections in TensorRT Edge-LLM: standard residual paths and extension points
+
+== Overview
+
+Residual connections add a sublayer input to its output, allowing hidden
+states to flow directly through the network. Every standard decoder block
+has two residual additions:
+
+1. **Post-attention residual**: adds block input to attention output.
+2. **Post-FFN residual**: adds the post-attention result to FFN output.
+
+== Model Applicability
+
+[cols="2,2,3"]
+|===
+| Model Family | Residual Type | Notes
+
+| Llama, Qwen, Phi, InternVL
+| Standard
+| Simple element-wise add at both residual points.
+
+| Qwen3.5 hybrid
+| Standard residual adds around heterogeneous mixers
+| Residual shape/dtype behavior is still standard, while the mixer may be full
+  attention or GDN linear attention.
+|===
+
+== Architecture
+
+[mermaid]
+----
+graph TD
+    H_IN[Block Input] --> NORM1[Pre-Attn Norm]
+    NORM1 --> ATTN[Attention]
+    H_IN -->|skip| RES1((+))
+    ATTN --> RES1
+    RES1 --> NORM2[Pre-FFN Norm]
+    NORM2 --> FFN[FFN]
+    RES1 -->|skip| RES2((+))
+    FFN --> RES2
+    RES2 --> H_OUT[Block Output]
+----
+
+== Variant Documents
+
+No reusable residual variant documents are currently part of the
+mainline design tree. New residual-routing mechanisms should be added
+here only when their design is broadly reusable and not a private
+adaptation for a single model family.
+
+== Design
+
+Residual adds preserve hidden shape and dtype expectations across sublayers.
+They connect the unmodified sublayer input to attention, FFN, MoE, or
+state-space outputs before the next normalization step.
+
+== Code Touchpoints
+
+[cols="1,2"]
+|===
+| Path | Responsibility
+
+| `tensorrt_edgellm/models/default/modeling_default.py`
+| Default decoder block residual add logic around attention and FFN sublayers.
+
+| `tensorrt_edgellm/models/qwen3_5/modeling_qwen3_5_text.py`
+| Qwen3.5 hybrid residual routing around full-attention and GDN mixer layers.
+
+| `tensorrt_edgellm/models/nemotron_h/modeling_nemotron_h.py`
+| Hybrid residual routing around attention and Mamba-style state-space layers.
+|===
+
+== Testing
+
+* `tests/test_lists/l0_pipeline_*.yml` validates residual routing through full
+  model inference.
+* Add targeted graph or numerical checks when introducing non-standard residual
+  routing.

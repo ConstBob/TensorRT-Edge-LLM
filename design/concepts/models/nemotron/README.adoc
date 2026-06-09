@@ -1,0 +1,64 @@
+= Nemotron-H Hybrid Architecture
+{nbsp}
+:description: Architecture notes and implementation pointers for Nemotron-H checkpoints in TensorRT Edge-LLM
+
+== Overview
+
+Nemotron-H checkpoints use a hybrid decoder that interleaves attention with
+state-space/Mamba-style sequence mixing. Edge-LLM documents this architecture
+separately because export/runtime must carry recurrent state bindings in
+addition to the usual KV-cache path.
+
+== Support Source of Truth
+
+The supported checkpoint list, precision matrix, and HF profile links live in
+link:../../../../docs/source/user_guide/getting_started/supported-models.md[Supported Models].
+Do not duplicate that table here.
+
+== Architecture Identity
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Config key | `model_type: nemotron_h`
+| Transformers modeling | https://github.com/huggingface/transformers/blob/main/src/transformers/models/nemotron_h/modeling_nemotron_h.py[modeling_nemotron_h.py]
+| Edge-LLM handler | link:../../../../tensorrt_edgellm/models/nemotron_h/modeling_nemotron_h.py[Nemotron-H causal LM]
+| Chat template | link:../../../../tensorrt_edgellm/chat_templates/nemotron_nano_v2.json[nemotron_nano_v2.json]
+|===
+
+== Edge-LLM Integration Notes
+
+* Hybrid layers add state-space recurrent state inputs/outputs beside the
+  standard attention KV cache. Binding-mode explanations belong in the
+  state-space and attention/KV-cache component docs.
+* INT4 support is constrained by group-size and checkpoint weight dimensions;
+  the user-facing support matrix records the precision status.
+* Nemotron template handling is explicit for the 9B Nano v2 checkpoint and
+  should remain an export option rather than hidden family logic.
+* Any routed-expert or state-space variant should link to the reusable
+  link:../../components/moe/[MoE] and link:../../components/state_space/[state-space]
+  component contracts.
+
+== Implementation Pointers
+
+[cols="1,3", options="header"]
+|===
+| Path | Detail
+| link:../../../../tensorrt_edgellm/__init__.py[__init__.py] | Registers `nemotron_h` with `NemotronHCausalLM`.
+| link:../../../../tensorrt_edgellm/models/nemotron_h/modeling_nemotron_h.py[modeling_nemotron_h.py] | Nemotron-H hybrid decoder export implementation.
+| link:../../../../tensorrt_edgellm/models/ops.py[ops.py] | State-space, attention, quantization, and MoE custom-op stubs.
+| link:../../../../tensorrt_edgellm/chat_templates/nemotron_nano_v2.json[nemotron_nano_v2.json] | Explicit chat template for Nano v2 export.
+| link:../../../../cpp/runtime/[runtime] | Runtime engine loading, prefill/decode execution, KV/state cache handling.
+|===
+
+== Related Components
+
+link:../../components/state_space/[State space], link:../../components/attention/[Attention],
+link:../../components/kv_cache/[KV cache], link:../../components/ffn/[FFN],
+link:../../components/moe/[MoE], link:../../components/tokenizer/[Tokenizer],
+and link:../../components/residual/[Residual] own the reusable contracts.
+
+== Maintenance Notes
+
+Keep this page centered on Nemotron-H hybrid contracts. Update checkpoint support
+and precision availability only in the Supported Models page.

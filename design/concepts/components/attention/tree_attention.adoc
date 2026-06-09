@@ -1,0 +1,119 @@
+= Tree Attention
+{nbsp}
+:description: EAGLE3 speculative-decoding tree attention in TensorRT Edge-LLM
+
+== Overview
+
+Tree attention is the softmax attention mode used when speculative decoding
+verifies multiple draft-token candidates in one base-model pass. It is not a
+new attention formula: it still computes scaled dot-product attention over Q/K/V
+and the KV cache. The difference is the mask. Candidate tokens form a draft
+tree, so each token may attend to the prompt and its ancestors, but not to
+unrelated sibling branches.
+
+This is separate from radix-tree or prefix-reuse data structures. A prefix tree
+indexes cached prompts; tree attention defines which speculative tokens can see
+each other inside one decode step.
+
+== Runtime Applicability
+
+EAGLE3 is not a model family. It is a speculative-decoding workflow that can be
+enabled for supported base and draft engines. Tree attention applies when that
+workflow asks a base or draft model to process a draft-token tree.
+
+[cols="2,2,3", options="header"]
+|===
+| Scope | Applies when | Notes
+
+| Supported LLM or VLM base engine
+| EAGLE3 base verification is enabled
+| The base model verifies a draft-token tree using tree masks and position IDs.
+
+| Associated EAGLE3 draft engine
+| Draft generation uses tree-aware attention
+| The draft model exports explicit tree-attention mask handling.
+|===
+
+== Architecture
+
+[mermaid]
+----
+flowchart LR
+    PREFIX[Accepted prefix KV cache] --> PLUGIN[AttentionPlugin]
+    DRAFT[Draft token tree] --> MASK[Tree mask]
+    DRAFT --> POS[Tree position IDs]
+    MASK --> PLUGIN
+    POS --> PLUGIN
+    QKV[Candidate Q/K/V] --> PLUGIN
+    PLUGIN --> LOGITS[Verification logits]
+    PLUGIN --> KVOUT[Updated candidate KV]
+----
+
+== Design
+
+Normal decode is a chain: each generated token follows the previous token. Tree
+decode is a set of candidate branches. The attention mask encodes ancestry so a
+candidate attends to the accepted prefix and its branch ancestors only.
+
+Edge-LLM exposes this through `AttentionPlugin`:
+
+* `enable_tree_attention` switches the plugin to expect tree-attention inputs.
+* `attention_mask` describes visibility among candidate tokens.
+* `attention_pos_id` supplies the per-token positions used by RoPE/KV writes.
+* `kvcache_start_index` and context lengths still identify the existing prefix
+  KV region.
+
+The plugin dispatches the regular decode path for single-token decode and the
+spec-decode XQA path when the runtime sequence contains a candidate tree.
+
+== Code Touchpoints
+
+[cols="1,3", options="header"]
+|===
+| Path | Responsibility
+
+| `cpp/plugins/attentionPlugin/attentionPlugin.{h,cpp}`
+| Parses `enable_tree_attention`, tree mask/position inputs, and dispatches
+  tree decoding.
+
+| `cpp/kernels/decodeAttentionKernels/decoderXQARunner.{h,cpp}`
+| Launches XQA decode and spec-decode tree-attention kernels.
+
+| `cpp/kernels/posEncoding/applyRopeWriteKV.h`
+| Declares tree-decoding RoPE + KV-write entry points.
+
+| `cpp/kernels/speculative/eagleUtilKernels.{h,cu}`
+| Packs tree masks and prepares EAGLE base tree-decoding inputs.
+
+| `cpp/runtime/decoding/eagleDecoder.{h,cpp}`
+| Builds EAGLE draft proposals, tree masks, position IDs, and base verification
+  inputs.
+
+| `cpp/runtime/exec/registryBuilder.{h,cpp}`
+| Registers the spec-decode `attention_mask` and `attention_pos_id` bindings
+  used by base and draft engines.
+
+| `cpp/runtime/llmInferenceRuntime.{h,cpp}`
+| Orchestrates speculative decoding through the active decoding strategy.
+
+| `tensorrt_edgellm/models/default/modeling_default.py`
+| Adds tree-attention inputs for EAGLE base exports.
+
+| `tensorrt_edgellm/models/eagle3/modeling_eagle3_draft.py`
+| Draft-model attention with explicit tree-attention mask handling.
+
+| `tensorrt_edgellm/onnx/dynamo_translations.py`
+| Emits optional tree-attention mask and position-ID inputs for `AttentionPlugin`.
+|===
+
+== Testing
+
+* `tests/python-unittests/test_attention_plugin.py` validates plugin tree
+  attention against a numpy reference.
+* `tests/python-unittests/test_attention_native.py` validates TRT-native tree
+  attention against the same reference path.
+* `unittests/xqaTreeAttentionDecodingTest.cu` covers XQA tree decode kernels.
+* `unittests/eagleUtilkernelTests.cu` covers EAGLE tree-mask packing and base
+  tree-decoding input preparation.
+* `tests/test_lists/l0_pipeline_thor_2.yml` and related EAGLE pipeline lists
+  exercise end-to-end speculative decoding.

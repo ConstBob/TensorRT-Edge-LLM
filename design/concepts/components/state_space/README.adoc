@@ -1,0 +1,158 @@
+= State Space and Linear Attention
+{nbsp}
+:description: Recurrent sequence-mixing components for hybrid TensorRT Edge-LLM decoder blocks
+
+== Overview
+
+State-space and linear-attention layers are sequence-mixing components used by
+hybrid decoder models. They are not an FFN variant: they carry recurrent state
+and can replace or sit beside softmax-attention sequence mixing in selected
+layers.
+
+Two distinct families live in this component:
+
+* **Mamba-style state space**: Nemotron-H hybrid layers use Mamba selective
+  state updates, Mamba cache state, and the Mamba plugin/kernel path.
+* **Gated Delta Net (GDN) linear attention**: Qwen3.5-style hybrid
+  layers use a GDN recurrence. They may still have a causal-convolution state
+  before the GDN plugin, but the core mixer is not Mamba selective state-space
+  math and must not be documented as a Mamba variant.
+
+This component is documented separately because these layers have recurrent
+state bindings, cache/state managers, kernels, and export wrappers that differ
+from both softmax attention/KV cache and dense FFN paths.
+
+== Model Applicability
+
+[cols="2,2,3", options="header"]
+|===
+| Model Family | State-Space Path | Notes
+
+| NVIDIA Nemotron
+| Hybrid Mamba/state-space layers
+| Some layers follow attention/cache behavior, while hybrid layers use state
+  updates and Mamba cache state.
+
+| Qwen3.5-style hybrid
+| Gated Delta Net linear-attention layers
+| `linear_attention` config layers use GDN recurrent state instead of KV
+  cache. The checked-in implementation is the Qwen3.5 path; treat
+  Qwen3.5 GDN layers as linear-attention layers, not as Mamba.
+|===
+
+== Architecture
+
+=== Mamba-style state-space path
+
+[mermaid]
+----
+flowchart LR
+    H[Hidden states] --> NORM[Norm]
+    NORM --> CONV[Causal conv]
+    CONV --> SSM[Selective state update]
+    STATE_IN[State cache in] --> SSM
+    SSM --> STATE_OUT[State cache out]
+    SSM --> PROJ[Output projection]
+    PROJ --> RES[Residual add]
+    H --> RES
+----
+
+=== Gated Delta Net linear-attention path
+
+[mermaid]
+----
+flowchart LR
+    H[Hidden states] --> FUSED[In-proj fused: QKV + z + beta + alpha]
+    FUSED --> MIXED[Projected QKV]
+    FUSED --> TERMS[Gate/decay terms]
+    MIXED --> CONV[GDN causal conv]
+    CONV_STATE_IN[Conv state in] --> CONV
+    CONV --> CONV_STATE_OUT[Conv state out]
+    CONV --> ACT[Silu + split Q/K/V]
+    TERMS --> GDN[GatedDeltaNet plugin]
+    ACT --> GDN
+    GDN_STATE_IN[GDN recurrent state in] --> GDN
+    GDN --> GDN_STATE_OUT[GDN recurrent state out]
+    GDN --> GNORM[Per-head RMSNorm]
+    TERMS --> GATE[Silu output gate]
+    GNORM --> GMUL[Gated product]
+    GATE --> GMUL
+    GMUL --> OPROJ[Output projection]
+    OPROJ --> RES[Residual add]
+    H --> RES
+----
+
+== Design
+
+* State-space and linear-attention layers own recurrent state separately from
+  KV cache.
+* Mamba-style layers use causal convolution plus selective state update through
+  Mamba-specific plugins/kernels and Mamba cache state.
+* GDN layers use Q/K/V, gate, beta, alpha, `A_log`, and `dt_bias` terms lowered
+  to the `gated_delta_net` plugin. They are linear-attention layers with their
+  own recurrent state; sharing a causal-convolution step with Mamba-like code
+  does not make them Mamba layers.
+* Export wraps Mamba-style and GDN-style layers with separate plugin-friendly
+  modules.
+* Runtime owns recurrent state allocation and step-to-step propagation through
+  recurrent-state bindings.
+* Hybrid decoder blocks decide per layer whether the sequence-mixing path is
+  attention/KV-cache based or state-space based.
+
+== Variant Documents
+
+* link:linear.adoc[Linear Attention / Gated Delta Net] -- Qwen3.5-style
+  GDN layers with recurrent state, prefill/decode kernels, and plugin bindings.
+* link:../kv_cache/[KV Cache] -- softmax-attention cache path used by the
+  attention layers that can sit beside recurrent Mamba/GDN layers in hybrid
+  models.
+
+== Code Touchpoints
+
+[cols="2,3", options="header"]
+|===
+| Path | Responsibility
+
+| `tensorrt_edgellm/models/nemotron_h/modeling_nemotron_h.py`
+| Python export implementation for Nemotron-H Mamba-style hybrid layers.
+
+| `tensorrt_edgellm/models/qwen3_5/modeling_qwen3_5_text.py`
+| Python export implementation for Qwen3.5 GDN and gated full-attention layers.
+
+| `tensorrt_edgellm/models/ops.py`
+| Custom-op stubs for Mamba, causal convolution, and `gated_delta_net`.
+
+| `tensorrt_edgellm/onnx/dynamo_translations.py`
+| Lowers recurrent custom ops to ONNX plugin nodes.
+
+| `cpp/plugins/mamba/`
+| TensorRT plugins for Mamba and causal convolution.
+
+| `cpp/kernels/mamba/`
+| Mamba kernels for causal convolution and selective state update.
+
+| `cpp/runtime/mambaCacheManager.{h,cpp}`
+| Runtime state cache ownership for Mamba-style layers.
+
+| `cpp/runtime/hybridCacheManager.{h,cpp}`
+| Routes mixed attention KV cache and recurrent state cache for hybrid decoders.
+
+| `cpp/kernels/gdnKernels/`
+| Gated Delta Net kernels used by Qwen3.5 hybrid sequence-mixing paths.
+
+| `cpp/plugins/gatedDeltaNet/`
+| TensorRT plugin wrapper for Gated Delta Net linear attention.
+|===
+
+== Testing
+
+* `tests/test_lists/l0_checkpoint_export.yml` includes a Nemotron-H hybrid
+  Mamba export case.
+* `tests/defs/test_checkpoint_export.py` validates export artifact generation
+  for the hybrid model path.
+* `unittests/mambaCausalConv1dTests.cu` covers causal-convolution prefill,
+  decode, padding/context-length handling, and conv-state capture.
+* `unittests/mambaSelectiveStateUpdateTests.cu` covers Mamba selective-state
+  update kernels across basic, padded, multi-step, and Nemotron-like cases.
+* `unittests/gdnCuteDslTests.cu` covers GDN decode, prefill, padding, and
+  Qwen3.5-shaped Blackwell prefill paths.

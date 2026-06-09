@@ -1,0 +1,64 @@
+= InternVL Architecture
+{nbsp}
+:description: Architecture notes and implementation pointers for InternVL checkpoints in TensorRT Edge-LLM
+
+== Overview
+
+InternVL integrates an InternViT visual encoder/projector with a language
+backbone that still reuses the common decoder contracts. The main Edge-LLM
+specific concerns are visual preprocessing, pixel-shuffle/projector behavior,
+and the handoff from image sentinels to decoder embeddings.
+
+== Support Source of Truth
+
+The supported checkpoint list, precision matrix, and HF profile links live in
+link:../../../../docs/source/user_guide/getting_started/supported-models.md[Supported Models].
+Do not duplicate that table here.
+
+== Architecture Identity
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Config keys | `model_type: internvl_chat` and `internvl`
+| Transformers modeling | https://github.com/huggingface/transformers/blob/main/src/transformers/models/internvl/modeling_internvl.py[modeling_internvl.py]
+| Edge-LLM visual handler | link:../../../../tensorrt_edgellm/models/internvl3/modeling_internvl3_visual.py[modeling_internvl3_visual.py]
+| Edge-LLM text handler | link:../../../../tensorrt_edgellm/models/internvl3/modeling_internvl3_text.py[modeling_internvl3_text.py]
+|===
+
+== Edge-LLM Integration Notes
+
+These notes call out what is different from a plain decoder-only LLM in
+Edge-LLM:
+
+* The custom path is the InternVL visual encoder/projector export. The text
+  decoder still uses the shared attention, KV-cache, FFN, and LM-head
+  contracts after visual embeddings are inserted.
+* Runtime replaces image sentinel tokens with embeddings produced by the
+  InternVL visual runner before normal decoder prefill/decode.
+* InternVL3.5 files are present in this branch, but they are implementation
+  pointers only until a checkpoint appears in the Supported Models matrix.
+
+== Implementation Pointers
+
+[cols="1,3", options="header"]
+|===
+| Path | Detail
+| link:../../../../tensorrt_edgellm/models/internvl3/modeling_internvl3_visual.py[modeling_internvl3_visual.py] | InternVL3 visual encoder and projector export wrapper.
+| link:../../../../tensorrt_edgellm/models/internvl3/modeling_internvl3_text.py[modeling_internvl3_text.py] | InternVL3 language-model wrapper.
+| link:../../../../tensorrt_edgellm/models/internvl3_5/[internvl3_5/] | InternVL3.5 text/visual wrappers when that config is enabled.
+| link:../../../../cpp/multimodal/internViTRunner.h[internViTRunner.h] | InternVL visual runtime runner.
+| link:../../../../cpp/multimodal/multimodalRunner.h[multimodalRunner.h] | Generic multimodal runtime dispatch.
+|===
+
+== Related Components
+
+link:../../components/vision/[Vision], link:../../components/embeddings/[Embeddings],
+link:../../components/tokenizer/[Tokenizer], link:../../components/attention/[Attention],
+link:../../components/kv_cache/[KV cache], and link:../../components/ffn/[FFN]
+own the reusable contracts.
+
+== Maintenance Notes
+
+Update this page when InternVL-specific export/runtime contracts change. Keep
+checkpoint additions in the Supported Models page.

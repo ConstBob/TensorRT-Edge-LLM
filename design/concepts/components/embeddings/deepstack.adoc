@@ -1,0 +1,154 @@
+= Deepstack Embeddings Design
+{nbsp}
+:description: Design notes for deepstack visual feature inputs in builder/runtime execution flow
+
+== Overview
+
+Deepstack inputs are additional indexed tensors for per-layer visual feature
+injection. They do not replace or split `inputs_embeds`: every decoder still
+receives the normal `inputs_embeds` tensor, and deepstack-capable engines also
+receive `deepstack_embeds_0` through
+`deepstack_embeds_<num_deepstack_features - 1>`.
+
+The names are intentionally different from the raw visual-engine outputs:
+
+* `deepstack_features_<idx>` are raw visual encoder outputs with shape
+  `[num_image_tokens, hidden_size]`.
+* `deepstack_embeds_<idx>` are LLM-side dense tensors with shape
+  `[batch_size, sequence_length, hidden_size]`, assembled by the runtime so they
+  align with token positions in the prompt.
+
+== Model Applicability
+
+[cols="1,1,2", options="header"]
+|===
+| Model Family | Deepstack Usage | Notes
+
+| Qwen3-VL
+| Yes
+| Visual encoder emits indexed deepstack feature tensors when
+  `deepstack_visual_indexes` is configured.
+
+| Qwen3-Omni
+| Yes
+| Same deepstack contract for visual feature injection when configured.
+
+| Qwen3.5-VL
+| No in current path
+| The Qwen3.5 visual builder disables deepstack indexes.
+
+| Standard text-only LLMs
+| No
+| No visual encoder or deepstack bindings are present.
+|===
+
+== Architecture
+
+[mermaid]
+----
+flowchart TD
+    VCFG["vision_config.deepstack_visual_indexes"] --> VIT["Visual encoder blocks"]
+    VIT -->|selected block output| MERGER["deepstack merger"]
+    MERGER --> VF["deepstack_features_i<br/>[image_tokens,H]"]
+    VF --> RUNNER["QwenViTRunner binds visual engine outputs"]
+    RUNNER --> PRE["EmbeddingPreprocessor"]
+    IDS["input_ids"] --> ASM["assembleDeepstackEmbedding"]
+    MMI["multimodalIndices or token_id-vocab_size"] --> ASM
+    PRE --> ASM
+    ASM --> DSE["deepstack_embeds_i<br/>[B,S,H]"]
+    DSE --> LLM["LLM engine"]
+    LLM --> ADD["Decoder layer adds matching deepstack tensor"]
+----
+
+== Design
+
+=== Where Deepstack Features Come From
+
+The visual model decides whether deepstack exists from
+`vision_config.deepstack_visual_indexes`:
+
+* `tensorrt_edgellm/models/qwen3_vl/modeling_qwen3_vl_visual.py`
+  builds one `Qwen3VLPatchMerger` per configured visual block index.
+* During visual forward, after each selected visual block, the corresponding
+  merger produces a `deepstack_features_<idx>` output.
+* `cpp/multimodal/qwenViTRunner.{h,cpp}` reads the configured index count,
+  allocates `mDeepstackFeatures`, binds each visual-engine output, and exposes
+  those tensors through `getDeepstackFeatures()`.
+
+=== How Runtime Computes `deepstack_embeds_<idx>`
+
+The visual-engine features are compact image-token tensors. Before the LLM can
+consume them, runtime expands each feature tensor to the full prompt shape:
+
+1. `EmbeddingPreprocessor` retrieves the vector of raw visual
+   `deepstack_features_<idx>` tensors from the vision runner.
+2. For each feature tensor, it reshapes a preallocated output buffer to
+   `[active_batch, input_ids_len, hidden_size]`.
+3. `kernel::assembleDeepstackEmbedding()` scans `input_ids` and identifies image
+   token positions in one of two ways:
+   * legacy vision remap: `token_id >= vocab_size`, with image row index
+     `token_id - vocab_size`;
+   * explicit image token ID: `token_id == imageTokenId`, with row index from
+     `multimodalIndices`.
+4. Image positions receive the selected deepstack feature row. Text, audio,
+   padding, and other non-image positions are zero-filled.
+5. `TensorRegistry` binds the resulting `deepstack_embeds_<idx>` tensors by
+   index during prefill. Decode and EAGLE/tree-decode bind dummy zero tensors
+   because deepstack features are prompt-side visual injections.
+
+Inside the exported LLM,
+`tensorrt_edgellm/models/default/modeling_default.py` receives the
+deepstack tensors as a list and adds each tensor to the hidden states at the
+corresponding decoder layer index.
+
+=== Builder and Validation Contracts
+
+* Builder detects `deepstack_embeds_<idx>` network inputs and gives them the same
+  optimization profile as `inputs_embeds`.
+* Runtime config records `num_deepstack_features`; engine validation checks the
+  detected binding count against that value.
+* At enqueue time, the provided deepstack tensor count must be either zero or
+  exactly `num_deepstack_features`.
+* Each provided tensor must be GPU FP16 with shape `[batch, seq, hidden]`.
+* Text-only requests on a deepstack-capable engine bind zero tensors so required
+  TensorRT bindings are still satisfied.
+
+== Code Touchpoints
+
+[cols="1,3", options="header"]
+|===
+| Path | Responsibility
+
+| `tensorrt_edgellm/models/qwen3_vl/modeling_qwen3_vl_visual.py`
+| Exports Qwen3-VL visual models with optional deepstack feature outputs.
+
+| `tensorrt_edgellm/models/qwen3_vl/modeling_qwen3_vl_text.py`
+| Exports LLM decoder inputs named `deepstack_embeds_<idx>` when configured.
+
+| `cpp/kernels/embeddingKernels/embeddingKernels.{h,cu}`
+| `assembleDeepstackEmbedding()` expands compact image-token features into dense
+  `[B,S,H]` LLM inputs.
+
+| `cpp/runtime/preprocess/embeddingPreprocessor.{h,cpp}`
+| Retrieves visual deepstack features, calls the assembly kernel, and prepares
+  zero tensors when features are absent.
+
+| `cpp/runtime/features/deepstackBinding.{h,cpp}`
+| Validates deepstack count/shape expectations and selects real or dummy tensors
+  by stage.
+
+| `cpp/runtime/exec/registryBuilder.{h,cpp}`
+| Registers `deepstack_embeds_<idx>` input bindings when the engine exposes
+  them.
+
+| `cpp/builder/llmBuilder.{h,cpp}`
+| Adds optimization profiles for deepstack input bindings.
+|===
+
+== Testing
+
+* `unittests/embeddingLookupTests.cpp` covers `assembleDeepstackEmbedding()`
+  accuracy, out-of-bounds handling, explicit image-token IDs,
+  `multimodalIndices`, legacy image-token indexing, and shape-error handling.
+* There is currently no separate engine-level test for deepstack binding
+  count/shape validation.

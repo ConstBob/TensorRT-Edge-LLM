@@ -1,0 +1,130 @@
+= Sliding Window (Local) Attention
+{nbsp}
+:description: Sliding-window attention masking in TensorRT Edge-LLM
+
+== Overview
+
+Sliding-window attention restricts each token's attention span to the
+most recent `W` keys. This reduces memory bandwidth and compute for long
+contexts. In Edge-LLM, the Python attention wrapper reads an optional
+model config field named `sliding_window` and exports it to
+`AttentionPlugin` as `sliding_window_size`. The plugin applies the window on
+the context/prefill attention path by selecting CuTe DSL sliding-window FMHA
+kernels, so the engine does not need an explicit local-attention mask tensor.
+
+== Model Applicability
+
+[cols="2,2,2,2"]
+|===
+| Model Family | Attention Pattern | Window Size | Notes
+
+| Config-driven local-attention exports
+| Sliding window
+| Model-defined
+| Any exported model can use this path when its attention config exposes `sliding_window`.
+
+| Llama, Qwen, Phi
+| Global only
+| N/A
+| All layers use full causal attention unless their exported config adds `sliding_window`.
+|===
+
+== Architecture
+
+[mermaid]
+----
+graph TD
+    H[Hidden States] --> NORM[Pre-Attention Norm]
+    NORM --> Q[Q Projection]
+    NORM --> K[K Projection]
+    NORM --> V[V Projection]
+    ROPE[RoPE Cache] --> PLUGIN[AttentionPlugin]
+    Q --> PLUGIN
+    K --> PLUGIN
+    V --> PLUGIN
+    KV_IN[KV Cache In] --> PLUGIN
+    PLUGIN -->|sliding_window_size=-1 or W| ATTN_OUT[Attention Output]
+    PLUGIN --> KV_OUT[KV Cache Out]
+    ATTN_OUT --> O[O Projection]
+    O --> RES[Residual Add]
+    H --> RES
+----
+
+== Design
+
+For a query at absolute position `q_pos` with window size `W`, visible
+keys are `{ k_pos : max(0, q_pos - W + 1) <= k_pos <= q_pos }`. Keys
+outside the window are ignored. The C++ plugin converts absent or disabled
+windowing to `INT_MAX` and passes a finite window to CuTe DSL FMHA kernels
+when `sliding_window_size > 0`.
+
+NOTE: `sliding_window_size == -1` means full causal attention. Positive
+values enable a local window.
+
+NOTE: Decode XQA kernels do not consume `sliding_window_size`; XQA launch
+parameters do not include a window-size field. Do not describe XQA as a
+sliding-window implementation unless the decode runner gains an explicit
+window contract.
+
+=== Data Flow
+
+[mermaid]
+----
+sequenceDiagram
+    participant Config as Model Config
+    participant Attn as EdgeLLMAttention
+    participant Plugin as AttentionPlugin (C++)
+    participant FMHA as CuTe DSL FMHA Runner
+    participant XQA as Decode XQA Runner
+
+    Config->>Attn: config.sliding_window
+    Attn->>Plugin: q, k, v, kv_cache, rope, sliding_window_size
+    Plugin->>FMHA: prefill/context attention with window parameter
+    Note over Plugin,XQA: XQA decode has no sliding-window parameter
+    Plugin->>XQA: standard decode path
+----
+
+=== Plugin Attribute Contract
+
+[cols="2,1,3"]
+|===
+| Attribute | Type | Semantics
+
+| `sliding_window_size`
+| int32
+| `-1` for full causal attention; positive values enable a local attention window.
+|===
+
+== Code Touchpoints
+
+[cols="1,3"]
+|===
+| Path | Responsibility
+
+| `tensorrt_edgellm/config.py`
+| Parses `use_sliding_window` / `sliding_window` checkpoint fields into
+  `ModelConfig.sliding_window_size`.
+
+| `tensorrt_edgellm/models/default/modeling_default.py`
+| Passes `sliding_window_size` from model config to the attention custom op.
+
+| `tensorrt_edgellm/onnx/onnx_custom_schemas.py`
+| Declares the `AttentionPlugin` ONNX schema, including `sliding_window_size`.
+
+| `tensorrt_edgellm/onnx/dynamo_translations.py`
+| Emits the `AttentionPlugin` node with the `sliding_window_size` attribute.
+
+| `cpp/plugins/attentionPlugin/attentionPlugin.cpp`
+| Parses `sliding_window_size`, converts disabled windowing to `INT_MAX`, and
+  passes a finite window to the CuTe DSL FMHA prefill/context path.
+
+| `cpp/kernels/contextAttentionKernels/cuteDslFMHARunner.{h,cpp}`
+| Accepts `slidingWindowSize` and dispatches the sliding-window (`_sw`) CuTe
+  DSL FMHA kernel variants.
+|===
+
+== Testing
+
+There are currently no checked-in tests that explicitly validate
+`sliding_window_size > 0` for `AttentionPlugin` or the CuTe DSL FMHA
+sliding-window (`_sw`) kernel variants.
