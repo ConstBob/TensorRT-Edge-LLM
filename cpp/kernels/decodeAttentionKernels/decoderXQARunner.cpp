@@ -95,11 +95,13 @@ struct XQAKernelRuntimeHashKey
     int32_t head_size;
     int32_t num_q_heads_per_kv;
     int32_t beam_size;
+    bool sliding_window;
 
     bool operator==(XQAKernelRuntimeHashKey const& other) const noexcept
     {
         return q_data_type == other.q_data_type && kv_data_type == other.kv_data_type && head_size == other.head_size
-            && num_q_heads_per_kv == other.num_q_heads_per_kv && beam_size == other.beam_size;
+            && num_q_heads_per_kv == other.num_q_heads_per_kv && beam_size == other.beam_size
+            && sliding_window == other.sliding_window;
     }
 };
 
@@ -108,7 +110,7 @@ XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQALaunchParams const& xq
     constexpr int32_t kBEAM_SIZE{1};
     int32_t numQHeadPerKV = xqaParams.numQheads / xqaParams.numKVheads;
     return {trtToXqaDataType(xqaParams.dataType), trtToXqaDataType(xqaParams.kvDataType), xqaParams.headSize,
-        numQHeadPerKV, kBEAM_SIZE};
+        numQHeadPerKV, kBEAM_SIZE, xqaParams.slidingWinSize > 0};
 }
 
 XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParamsSpecDecode(XQALaunchParams const& xqaParams) noexcept
@@ -116,7 +118,7 @@ XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParamsSpecDecode(XQALaunchParams
     constexpr int32_t kBEAM_SIZE{1};
     constexpr int32_t kQHEAD_PER_KV = 0; // Tree attention kernel supports any ratio of Q/KV heads.
     return {trtToXqaDataType(xqaParams.dataType), trtToXqaDataType(xqaParams.kvDataType), xqaParams.headSize,
-        kQHEAD_PER_KV, kBEAM_SIZE};
+        kQHEAD_PER_KV, kBEAM_SIZE, xqaParams.slidingWinSize > 0};
 }
 
 struct XQAKernelRuntimeHasher
@@ -132,6 +134,8 @@ struct XQAKernelRuntimeHasher
         key ^= s.num_q_heads_per_kv;
         key <<= 8;
         key ^= s.beam_size;
+        key <<= 4;
+        key ^= s.sliding_window;
         return key;
     }
 };
@@ -146,6 +150,7 @@ struct XQAKernelFuncInfo
     XQAKernelVariant mKernelVariant{XQAKernelMetaInfo::KERNEL_VARIANT_STANDARD};
     bool mRequiresClusterLaunch{false};
     bool mRequiresDistributedSharedMemory{false};
+    bool mSlidingWindow{false};
 };
 
 struct XQADeviceCapability
@@ -341,6 +346,7 @@ public:
             funcInfo.mKernelVariant = kernelMeta.mKernelVariant;
             funcInfo.mRequiresClusterLaunch = kernelMeta.mRequiresClusterLaunch;
             funcInfo.mRequiresDistributedSharedMemory = kernelMeta.mRequiresDistributedSharedMemory;
+            funcInfo.mSlidingWindow = kernelMeta.mSlidingWindow;
 
             uint32_t* deviceSmemSize{nullptr};
             size_t dataSize{0};
@@ -364,7 +370,7 @@ public:
             }
             XQAKernelRuntimeHashKey hashKey{kernelMeta.mDataType, kernelMeta.mKVDataType,
                 static_cast<int32_t>(kernelMeta.mHeadDim), static_cast<int32_t>(kernelMeta.mNumQHeadsOverKV),
-                static_cast<int32_t>(kernelMeta.mBeamWidth)};
+                static_cast<int32_t>(kernelMeta.mBeamWidth), kernelMeta.mSlidingWindow};
             mFunctions[hashKey].push_back(funcInfo);
         }
         mLoaded = true;
@@ -527,9 +533,13 @@ void DecoderXQARunner::dispatchXQAKernel(XQALaunchParams& params, cudaStream_t c
     XQAKernelFuncInfo kernelInfo = xqaKernelList->findKernelFunction(hashKey);
     check::check(kernelInfo.mSharedMemBytes != 0, "No available kernel available for the GQA");
 
-    void* kernelParams[]
+    void* kernelParamsNoSliding[]
         = {&params.numKVheads, &params.qScale, &params.output, &params.qInputPtr, &params.attentionSinks,
             &params.kvCache, &params.batchSize, &params.kScale, &params.vScale, &params.semaphores, &params.scratch};
+    void* kernelParamsSliding[] = {&params.numKVheads, &params.slidingWinSize, &params.qScale, &params.output,
+        &params.qInputPtr, &params.attentionSinks, &params.kvCache, &params.batchSize, &params.kScale, &params.vScale,
+        &params.semaphores, &params.scratch};
+    void** kernelParams = kernelInfo.mSlidingWindow ? kernelParamsSliding : kernelParamsNoSliding;
 
     // The multi-block kernel launch is mainly for long sequence.
     // TODO: Add multiple block launch logic. The launch configuration highly depends on usecase and performance
@@ -566,9 +576,14 @@ void DecoderXQARunner::dispatchSpecDecodeXQAKernel(XQALaunchParams& params, cuda
     XQAKernelFuncInfo kernelInfo = xqaKernelList->findKernelFunction(hashKey);
     check::check(kernelInfo.mSharedMemBytes != 0, "No available kernel available for the Spec-DecodeGQA");
 
-    void* kernelParams[] = {&params.qSeqLen, &params.numKVheads, &params.headGroupSize, &params.qCuSeqLen,
+    void* kernelParamsNoSliding[] = {&params.qSeqLen, &params.numKVheads, &params.headGroupSize, &params.qCuSeqLen,
         &params.qScale, &params.output, &params.qInputPtr, &params.treeAttnMask, &params.attentionSinks,
         &params.kvCache, &params.batchSize, &params.kScale, &params.vScale, &params.semaphores, &params.scratch};
+    void* kernelParamsSliding[]
+        = {&params.qSeqLen, &params.numKVheads, &params.headGroupSize, &params.qCuSeqLen, &params.slidingWinSize,
+            &params.qScale, &params.output, &params.qInputPtr, &params.treeAttnMask, &params.attentionSinks,
+            &params.kvCache, &params.batchSize, &params.kScale, &params.vScale, &params.semaphores, &params.scratch};
+    void** kernelParams = kernelInfo.mSlidingWindow ? kernelParamsSliding : kernelParamsNoSliding;
     int32_t const ctaTileY = static_cast<int32_t>(kernelInfo.mMTileSize);
     check::check(ctaTileY > 0, format::fmtstr("Invalid spec-decode ctaTileY %d in XQA kernel metadata.", ctaTileY));
     int32_t const tokenBlockPerGroup = (params.qSeqLen * params.headGroupSize - 1) / ctaTileY + 1;

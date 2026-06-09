@@ -42,7 +42,7 @@ using namespace nvinfer1;
 using namespace trt_edgellm;
 
 void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
-    int32_t kvSequenceLength, int32_t qSequenceLength, bool useFp8Cache = false)
+    int32_t kvSequenceLength, int32_t qSequenceLength, bool useFp8Cache = false, int32_t slidingWindowSize = 0)
 {
     int32_t smVersion = getSMVersion();
     applyThorSMRenumberWAR(smVersion);
@@ -53,6 +53,7 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
     ASSERT_TRUE(trt_edgellm::DecoderXQARunner::canImplement(
         numQHeads, numKVHeads, headSize, smVersion, DataType::kHALF, DataType::kHALF));
 
+    // Tree attention uses one fixed KV length per shape; boundary coverage is enumerated by sliding-window test cases.
     std::vector<int32_t> kvCacheLength(batchSize, kvSequenceLength);
     std::vector<half> qInput;
     std::vector<half> kvInput;
@@ -73,7 +74,11 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
         uniformFloatInitialization(ki);
         uniformFloatInitialization(vi);
         uniformIntInitialization(treeMaski, 0, 1);
-        auto ref = casualAttentionRef<half>(qi, ki, vi, qSequenceLength, kvSequenceLength, numQHeads, numKVHeads,
+        int32_t const attentionLength
+            = slidingWindowSize > 0 ? std::min(kvSequenceLength, slidingWindowSize) : kvSequenceLength;
+        auto kiRef = sliceKVWindow(ki, numKVHeads, headSize, kvSequenceLength, slidingWindowSize);
+        auto viRef = sliceKVWindow(vi, numKVHeads, headSize, kvSequenceLength, slidingWindowSize);
+        auto ref = casualAttentionRef<half>(qi, kiRef, viRef, qSequenceLength, attentionLength, numQHeads, numKVHeads,
             headSize, std::make_optional(treeMaski));
 
         // Add data from batch to input Tensors
@@ -127,6 +132,7 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
     params.kvCache.capacity = kvSequenceLength;
     params.output = thrust::raw_pointer_cast(outDevice.data());
     params.treeAttnMask = thrust::raw_pointer_cast(packedTreeMaskDevice.data());
+    params.slidingWinSize = slidingWindowSize > 0 ? static_cast<uint32_t>(slidingWindowSize) : 0U;
     // Use default stream .
     cudaStream_t stream{nullptr};
     runner.dispatchSpecDecodeXQAKernel(params, stream);
@@ -156,7 +162,7 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
     std::cout << "XQA Tree Attention Decoding test. [FP16 KV cache] batch_size: " << batchSize
               << " num_Q_heads: " << numQHeads << " num_KV_heads: " << numKVHeads << " head_size: " << headSize
               << " kvcache seq_len: " << kvSequenceLength << " q_seq_len: " << qSequenceLength
-              << " pass_rate_1e-3: " << passRate1E_3 << std::endl;
+              << " sliding_window: " << slidingWindowSize << " pass_rate_1e-3: " << passRate1E_3 << std::endl;
     EXPECT_GT(passRate1E_3, 0.9);
     EXPECT_FALSE(NanValueDetected);
 
@@ -218,8 +224,12 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
                 vi[idx] = kvInputFp8[vBase + idx];
             }
 
-            auto refFp8 = casualAttentionRef<__nv_fp8_e4m3>(qi, ki, vi, qSequenceLength, kvSequenceLength, numQHeads,
-                numKVHeads, headSize, std::make_optional(treeMasks[b]), kScaleQuantOrig, vScaleQuantOrig);
+            int32_t const attentionLength
+                = slidingWindowSize > 0 ? std::min(kvSequenceLength, slidingWindowSize) : kvSequenceLength;
+            auto kiRef = sliceKVWindow(ki, numKVHeads, headSize, kvSequenceLength, slidingWindowSize);
+            auto viRef = sliceKVWindow(vi, numKVHeads, headSize, kvSequenceLength, slidingWindowSize);
+            auto refFp8 = casualAttentionRef<__nv_fp8_e4m3>(qi, kiRef, viRef, qSequenceLength, attentionLength,
+                numQHeads, numKVHeads, headSize, std::make_optional(treeMasks[b]), kScaleQuantOrig, vScaleQuantOrig);
             outReferenceFp8.insert(outReferenceFp8.end(), refFp8.begin(), refFp8.end());
         }
 
@@ -241,6 +251,7 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
         paramsFp8.treeAttnMask = thrust::raw_pointer_cast(packedTreeMaskDevice.data());
         paramsFp8.kScale = kScaleQuantOrig;
         paramsFp8.vScale = vScaleQuantOrig;
+        paramsFp8.slidingWinSize = slidingWindowSize > 0 ? static_cast<uint32_t>(slidingWindowSize) : 0U;
 
         // Reuse the same stream used for FP16 decoding.
         cudaStream_t stream{nullptr};
@@ -276,7 +287,7 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
         std::cout << "XQA Tree Attention Decoding test. [FP8 KV cache] batch_size: " << batchSize
                   << " num_Q_heads: " << numQHeads << " num_KV_heads: " << numKVHeads << " head_size: " << headSize
                   << " kvcache seq_len: " << kvSequenceLength << " q_seq_len: " << qSequenceLength
-                  << " pass_rate_1e-3: " << fp8PassRate1E_3 << std::endl;
+                  << " sliding_window: " << slidingWindowSize << " pass_rate_1e-3: " << fp8PassRate1E_3 << std::endl;
         EXPECT_GT(fp8PassRate1E_3, 0.8F);
         EXPECT_FALSE(NanValueDetectedFp8);
     }
@@ -338,6 +349,15 @@ TEST(XQATreeAttentionDecodingTest, accuracyKVRatio8HeadDim512)
     TestXQATreeAttentionDecodingAccuracy(1, 32, 4, 512, 128, 33);
 }
 
+TEST(XQATreeAttentionDecodingTest, slidingWindowAccuracy)
+{
+    TestXQATreeAttentionDecodingAccuracy(1, 32, 4, 128, 256, 16, false, 64);
+    TestXQATreeAttentionDecodingAccuracy(1, 14, 2, 64, 192, 32, false, 96);
+    TestXQATreeAttentionDecodingAccuracy(1, 32, 4, 128, 128, 16, false, 128);
+    TestXQATreeAttentionDecodingAccuracy(1, 24, 4, 256, 256, 16, false, 129);
+    TestXQATreeAttentionDecodingAccuracy(1, 32, 4, 128, 96, 48, false, 192);
+}
+
 #if SUPPORTS_FP8
 TEST(XQATreeAttentionDecodingFP8Test, accuracyKVRatio4HeadDim128)
 {
@@ -391,6 +411,13 @@ TEST(XQATreeAttentionDecodingFP8Test, accuracyKVRatio8HeadDim512)
     TestXQATreeAttentionDecodingAccuracy(1, 32, 4, 512, 256, 20, true);
     TestXQATreeAttentionDecodingAccuracy(1, 32, 4, 512, 128, 33, true);
 }
+
+TEST(XQATreeAttentionDecodingFP8Test, slidingWindowAccuracy)
+{
+    TestXQATreeAttentionDecodingAccuracy(1, 32, 4, 128, 256, 16, true, 64);
+    TestXQATreeAttentionDecodingAccuracy(1, 32, 4, 128, 128, 16, true, 128);
+    TestXQATreeAttentionDecodingAccuracy(1, 24, 4, 256, 256, 16, true, 129);
+}
 #endif
 
 struct XQATreeAttentionBenchShape
@@ -401,6 +428,7 @@ struct XQATreeAttentionBenchShape
     int32_t headSize{512};
     int32_t kvSequenceLength{256};
     int32_t qSequenceLength{20};
+    int32_t slidingWindowSize{0};
 };
 
 struct XQATreeAttentionBenchConfig
@@ -454,6 +482,7 @@ XQATreeAttentionBenchShape getBenchShapeFromEnv()
     shape.headSize = getBenchEnvInt("XQA_BENCH_HEAD_SIZE", shape.headSize);
     shape.kvSequenceLength = getBenchEnvInt("XQA_BENCH_KV_SEQ_LEN", shape.kvSequenceLength);
     shape.qSequenceLength = getBenchEnvInt("XQA_BENCH_Q_SEQ_LEN", shape.qSequenceLength);
+    shape.slidingWindowSize = getBenchEnvInt("XQA_BENCH_SLIDING_WINDOW_SIZE", shape.slidingWindowSize);
     return shape;
 }
 
@@ -478,6 +507,10 @@ std::string shapeToString(XQATreeAttentionBenchShape const& shape)
     std::ostringstream oss;
     oss << "B" << shape.batchSize << "_Q" << shape.qSequenceLength << "_KV" << shape.kvSequenceLength << "_H"
         << shape.headSize;
+    if (shape.slidingWindowSize > 0)
+    {
+        oss << "_SW" << shape.slidingWindowSize;
+    }
     return oss.str();
 }
 
@@ -592,16 +625,22 @@ struct XQATreeAttentionBenchBuffer
 
 double estimateXQATreeAttentionFlops(XQATreeAttentionBenchShape const& shape)
 {
-    return 4.0 * static_cast<double>(shape.batchSize) * shape.numQHeads * shape.qSequenceLength * shape.kvSequenceLength
+    int32_t const effectiveKvLength = shape.slidingWindowSize > 0
+        ? std::min(shape.kvSequenceLength, shape.slidingWindowSize)
+        : shape.kvSequenceLength;
+    return 4.0 * static_cast<double>(shape.batchSize) * shape.numQHeads * shape.qSequenceLength * effectiveKvLength
         * shape.headSize;
 }
 
 template <typename KVType>
 double estimateXQATreeAttentionBytes(XQATreeAttentionBenchShape const& shape)
 {
+    int32_t const effectiveKvLength = shape.slidingWindowSize > 0
+        ? std::min(shape.kvSequenceLength, shape.slidingWindowSize)
+        : shape.kvSequenceLength;
     size_t const qBytes = static_cast<size_t>(shape.batchSize) * shape.qSequenceLength * shape.numQHeads
         * shape.headSize * sizeof(half);
-    size_t const kvBytes = static_cast<size_t>(shape.batchSize) * 2 * shape.numKVHeads * shape.kvSequenceLength
+    size_t const kvBytes = static_cast<size_t>(shape.batchSize) * 2 * shape.numKVHeads * effectiveKvLength
         * shape.headSize * sizeof(KVType);
     size_t const outputBytes = qBytes;
     size_t const maskBytes = static_cast<size_t>(shape.batchSize) * shape.qSequenceLength
@@ -671,6 +710,7 @@ void runXQATreeAttentionBenchmark(nvinfer1::DataType kvDataType, char const* kvL
         params.treeAttnMask = thrust::raw_pointer_cast(buffer.packedMask.data());
         params.kScale = buffer.kScale;
         params.vScale = buffer.vScale;
+        params.slidingWinSize = shape.slidingWindowSize > 0 ? static_cast<uint32_t>(shape.slidingWindowSize) : 0U;
         paramsList.push_back(params);
     }
 
@@ -715,6 +755,9 @@ void runXQATreeAttentionBenchmark(nvinfer1::DataType kvDataType, char const* kvL
 
     std::sort(latenciesMs.begin(), latenciesMs.end());
     double const medianMs = latenciesMs[latenciesMs.size() / 2];
+    int32_t const effectiveKvLength = shape.slidingWindowSize > 0
+        ? std::min(shape.kvSequenceLength, shape.slidingWindowSize)
+        : shape.kvSequenceLength;
     double const flops = estimateXQATreeAttentionFlops(shape);
     double const bytes = estimateXQATreeAttentionBytes<KVType>(shape);
     bool const hasPeakTflops = config.peakTflops > 0.0F;
@@ -736,16 +779,19 @@ void runXQATreeAttentionBenchmark(nvinfer1::DataType kvDataType, char const* kvL
                     << " buffers: " << config.buffers << "\n";
     benchmarkOutput << "Buffer policy: round-robin independent Q/KV/output/mask buffers\n";
     benchmarkOutput << "Workspace: none\n";
-    benchmarkOutput << "shape,kv_dtype,q_heads,kv_heads,group,q_len,kv_len,head_dim,latency_ms,min_compute_ms,"
-                    << "min_memory_ms,achieved_tflops,achieved_gbps,compute_util_pct,bw_util_pct\n";
+    benchmarkOutput << "shape,kv_dtype,q_heads,kv_heads,group,q_len,kv_len,sliding_window,effective_kv_len,head_dim,"
+                    << "latency_ms,min_compute_ms,min_memory_ms,achieved_tflops,achieved_gbps,compute_util_pct,"
+                    << "bw_util_pct\n";
     benchmarkOutput << shapeToString(shape) << "," << kvLabel << "," << shape.numQHeads << "," << shape.numKVHeads
                     << "," << shape.numQHeads / shape.numKVHeads << "," << shape.qSequenceLength << ","
-                    << shape.kvSequenceLength << "," << shape.headSize << "," << formatBenchFloat(medianMs) << ","
-                    << minComputeStr << "," << formatBenchFloat(minMemoryMs) << "," << formatBenchFloat(achievedTflops)
-                    << "," << formatBenchFloat(achievedGbps) << "," << computeUtilStr << ","
-                    << formatBenchFloat(bandwidthUtil) << "\n";
-    benchmarkOutput << "Metric notes: FLOPs estimate = 4 * B * QHeads * QLen * KVLen * HeadDim.\n";
-    benchmarkOutput << "Memory estimate includes Q read, K/V cache read, output write, and packed tree mask read.\n";
+                    << shape.kvSequenceLength << "," << shape.slidingWindowSize << "," << effectiveKvLength << ","
+                    << shape.headSize << "," << formatBenchFloat(medianMs) << "," << minComputeStr << ","
+                    << formatBenchFloat(minMemoryMs) << "," << formatBenchFloat(achievedTflops) << ","
+                    << formatBenchFloat(achievedGbps) << "," << computeUtilStr << "," << formatBenchFloat(bandwidthUtil)
+                    << "\n";
+    benchmarkOutput << "Metric notes: FLOPs estimate = 4 * B * QHeads * QLen * effective_KVLen * HeadDim.\n";
+    benchmarkOutput
+        << "Memory estimate includes Q read, effective K/V cache read, output write, and packed tree mask read.\n";
     benchmarkOutput << "Peak assumptions: bandwidth=" << config.peakBwGbps
                     << " GB/s, compute=" << (hasPeakTflops ? formatBenchFloat(config.peakTflops) : std::string("n/a"))
                     << " TFLOP/s.\n";

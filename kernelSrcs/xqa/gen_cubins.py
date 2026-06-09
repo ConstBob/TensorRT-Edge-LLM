@@ -167,6 +167,7 @@ static const struct XQAKernelMetaInfo
     unsigned int mNumQHeadsOverKV;
     unsigned int mMTileSize;
     unsigned int mTokensPerPage;
+    bool mSlidingWindow;
     bool mPagedKVCache;
     bool mMultiQueryTokens;
     unsigned int mSM;
@@ -198,6 +199,7 @@ def generate_cubin_meta_info_line(arch: int,
     m_tilesize = None
     paged_kv_cache = None
     tokens_per_page = None
+    sliding_window = None
     use_tiled_qkv_staging_head_dim512 = False
     use_2cta_head_dim512 = False
     for compile_macro in compile_macros:
@@ -228,6 +230,9 @@ def generate_cubin_meta_info_line(arch: int,
             # Power of 2 tokens per page.
             assert (tokens_per_page % 2 == 0)
             paged_kv_cache = 'true' if tokens_per_page > 0 else 'false'
+        if compile_macro.macro_name == 'SLIDING_WINDOW':
+            assert compile_macro.value in (0, 1)
+            sliding_window = 'true' if compile_macro.value == 1 else 'false'
         if compile_macro.macro_name == 'TILED_QKV_STAGING_HEAD_DIM512':
             assert compile_macro.value == 1
             use_tiled_qkv_staging_head_dim512 = True
@@ -241,6 +246,7 @@ def generate_cubin_meta_info_line(arch: int,
     assert head_dim is not None
     assert beam_width is not None
     assert num_q_heads_per_kv is not None
+    assert sliding_window is not None
     unique_func_name = "kernel_mha"
     kernel_variant = 'XQAKernelMetaInfo::KERNEL_VARIANT_STANDARD'
     requires_cluster_launch = 'false'
@@ -261,7 +267,7 @@ def generate_cubin_meta_info_line(arch: int,
         str(beam_width),
         str(num_q_heads_per_kv),
         str(m_tilesize),
-        str(tokens_per_page), paged_kv_cache, use_medusa, f'kSM_{arch}',
+        str(tokens_per_page), sliding_window, paged_kv_cache, use_medusa, f'kSM_{arch}',
         f'{function_name}_cubin', f'{function_name}_cubin_len',
         f'"{unique_func_name}"'
     ]
@@ -333,6 +339,8 @@ def build_name_info(compile_macros: List[CompileMacro]):
     ]
     if "pagedKV_0" in name_info:
         name_info.remove("pagedKV_0")
+    if "sw_0" in name_info:
+        name_info.remove("sw_0")
     return name_info
 
 
@@ -692,6 +700,7 @@ if __name__ == "__main__":
             CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
             CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 2]),
             CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV', [0]),
+            CompileMacroOption('SLIDING_WINDOW', 'sw', [0, 1]),
             CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv',
                                [1, 2, 3, 4, 5, 6, 7, 8]),
             CompileMacroOption('M_TILESIZE', 'm', [8]),
@@ -706,6 +715,7 @@ if __name__ == "__main__":
             CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
             CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 2]),
             CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV', [0]),
+            CompileMacroOption('SLIDING_WINDOW', 'sw', [0, 1]),
             CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [16]),
             CompileMacroOption('M_TILESIZE', 'm', [8]),
             CompileMacroOption('SPEC_DEC', 'spec_dec', [0]),
@@ -719,6 +729,7 @@ if __name__ == "__main__":
             CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
             CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 2]),
             CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV', [0]),
+            CompileMacroOption('SLIDING_WINDOW', 'sw', [0, 1]),
             CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [2, 4, 6, 8]),
             CompileMacroOption('M_TILESIZE', 'm', [8]),
             CompileMacroOption('SPEC_DEC', 'spec_dec', [0]),
@@ -730,6 +741,7 @@ if __name__ == "__main__":
             CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
             CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 2]),
             CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV', [0]),
+            CompileMacroOption('SLIDING_WINDOW', 'sw', [0, 1]),
             CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [8]),
             CompileMacroOption('M_TILESIZE', 'm', [8]),
             CompileMacroOption('SPEC_DEC', 'spec_dec', [0]),
@@ -744,6 +756,7 @@ if __name__ == "__main__":
             CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 2]),
             CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV',
                                [0]),  # 0 denotes contiguous kv cache.
+            CompileMacroOption('SLIDING_WINDOW', 'sw', [0, 1]),
             CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [0]),
             CompileMacroOption('M_TILESIZE', 'm', [32]),
             CompileMacroOption('SPEC_DEC', 'spec_dec', [1]),
@@ -756,6 +769,7 @@ if __name__ == "__main__":
             CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 2]),
             CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV',
                                [0]),  # 0 denotes contiguous kv cache.
+            CompileMacroOption('SLIDING_WINDOW', 'sw', [0, 1]),
             CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [0]),
             CompileMacroOption('M_TILESIZE', 'm', [32]),
             CompileMacroOption('SPEC_DEC', 'spec_dec', [1]),

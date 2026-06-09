@@ -23,6 +23,12 @@
 #include <set>
 #include <vector>
 
+//! Returns the last sliding-window tokens from compact KV data with layout [Hkv, S, D].
+//! A non-positive slidingWindowSize keeps the full sequence.
+template <typename T>
+std::vector<T> sliceKVWindow(
+    std::vector<T> const& kv, int32_t numKVHeads, int32_t headSize, int32_t kvLength, int32_t slidingWindowSize);
+
 template <typename T>
 std::vector<half> casualAttentionRef(std::vector<half> const& q, std::vector<T> const& k, std::vector<T> const& v,
     int32_t const qlen, int32_t kvlen, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,

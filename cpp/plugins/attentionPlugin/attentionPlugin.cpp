@@ -894,6 +894,7 @@ int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, [[maybe_unus
         params.kvCache.data = kvCacheTensor.rawPointer();
         params.kvCache.sequence_lengths = contextLengthTensor.dataPointer<int32_t>();
         params.kvCache.capacity = kvCacheCapacity;
+        params.slidingWinSize = mSlidingWindowSize > 0 ? static_cast<uint32_t>(mSlidingWindowSize) : 0U;
         if (executionMode == AttentionExecutionMode::kTREE_DECODING)
         {
             // Execute tree attention decoding.
