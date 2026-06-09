@@ -1,0 +1,182 @@
+= Attention
+{nbsp}
+:description: Self-attention mechanism in TensorRT Edge-LLM: architecture, variants, and Edge-LLM implementation
+
+== Overview
+
+Self-attention lets each token attend to previous tokens in the sequence.
+Edge-LLM implements decoder attention through either `AttentionPlugin` or a
+TRT-native graph. The plugin path fuses Q/K/V handling, RoPE
+application, KV-cache read/write, and scaled dot-product attention into an
+optimized TensorRT path.
+
+In this component, **attention** means the decoder block's softmax
+self-attention sublayer. **Decode** means the generation phase after prefill,
+where each step reads prior K/V from cache and writes K/V for newly generated
+tokens. **Speculative decode** is a generation strategy layered above attention;
+it can use tree attention to verify multiple draft-token candidates in one
+base-model pass.
+
+== Model Applicability
+
+[cols="2,2,3"]
+|===
+| Model Family | Attention Type | Notes
+
+| Llama, Qwen, Phi, InternVL
+| Causal Grouped Query Attention (GQA)
+| Full causal mask with grouped-query or multi-query key/value heads.
+
+| Qwen3-VL
+| Causal Grouped Query Attention (GQA)
+| Standard text attention with additional deepstack embedding inputs.
+
+| Qwen3.5 hybrid
+| Gated full attention plus recurrent linear-attention layers
+| Softmax-attention layers use `AttentionPlugin`; linear-attention layers are
+  documented under link:../state_space/linear.adoc[Linear attention / Gated Delta Net].
+|===
+
+All supported decoder-only families use grouped-query or multi-query
+attention where `num_kv_heads <= num_attention_heads`. The reusable
+variations documented here are:
+
+- **Sliding window**: a model-wide `sliding_window` export field restricts
+  attention to a fixed recent-token window when present.
+- **Tree attention**: speculative decoding uses a tree mask and per-token
+  position IDs so each draft candidate attends only to the prompt and its
+  accepted ancestors.
+  EAGLE3 is the speculative-decoding workflow that uses this mode; it is not a
+  model family.
+- **Backend binding mode**: plugin and TRT-native paths implement the same
+  logical decoder-attention semantics, but they do not use the same engine
+  bindings. Plugin mode binds combined per-layer KV tensors
+  `past_key_values_i` / `present_key_values_i`; TRT-native mode binds split
+  `k_cache_i` / `v_cache_i` inputs and `present_k_cache_i` /
+  `present_v_cache_i` outputs. `AttentionPlugin` also has a mandatory
+  `rope_rotary_cos_sin` input; no-RoPE models satisfy that binding with an
+  identity cos/sin cache.
+
+== Architecture
+
+Within a decoder block, attention sits between pre-attention normalization
+and the first residual add:
+
+[mermaid]
+----
+graph LR
+    H[Hidden States] --> NORM[RMSNorm / LayerNorm]
+    NORM --> QKV[Q/K/V Projections]
+    QKV --> PLUGIN[AttentionPlugin]
+    KV_IN[KV Cache In] --> PLUGIN
+    ROPE[RoPE cos/sin] --> PLUGIN
+    PLUGIN --> O[Output Projection]
+    PLUGIN --> KV_OUT[KV Cache Out]
+    O --> RES[Residual Add]
+    H --> RES
+----
+
+The plugin encapsulates:
+
+1. Positional-encoding application to Q and K (RoPE/MRoPE, or an identity
+   cache for no-rope models).
+2. KV cache write for newly computed K/V.
+3. Scaled dot-product attention with causal or sliding-window masking.
+4. KV cache read during decode.
+
+== Plugin Kernel Implementations
+
+`AttentionPlugin` is the decoder-attention plugin wrapper. At runtime it
+selects specialized kernels for the active phase and platform. The exact
+coverage is owned by the `canImplement()` / kernel-loading code paths listed
+below; update this table when those checks change.
+
+[cols="1,2,3,3", options="header"]
+|===
+| Implementation | Used For | Availability / constraints | Source of truth
+
+| CuTe DSL context FMHA
+| Prefill/context attention
+| Built only when `CUTE_DSL_FMHA_ENABLED` is set (`ENABLE_CUTE_DSL=fmha` or
+  `ALL`) and a matching CuTe DSL artifact is linked. Current LLM variants
+  support SM >= 100, head dim 64 or 128, FP16 input, FP8 input, and
+  sliding-window variants.
+| `cpp/kernels/contextAttentionKernels/cuteDslFMHARunner.h`,
+  `cpp/kernels/contextAttentionKernels/cuteDslFMHARunner.cpp`,
+  `cmake/CuteDsl.cmake`
+
+| FMHA_v2 context cubins
+| Prefill/context attention fallback
+| FP16 context path. Causal decoder attention supports head dim 64, 128, or
+  256. Cubins are compiled for the target SMs selected in CMake.
+| `cpp/kernels/contextAttentionKernels/contextFMHARunner.cpp`,
+  `cpp/CMakeLists.txt`
+
+| Decode XQA (`cpp/kernels/decodeAttentionKernels/`)
+| Token-by-token decode and tree/speculative decode
+| FP16 activations with FP16 or FP8 KV-cache storage. Q heads must be divisible
+  by KV heads. Supported head dim / Q:KV ratios are checked in
+  `DecoderXQARunner::canImplement()`: head dim 32, 64, or 128 with ratios 1-8;
+  head dim 128 with ratio 16; or head dim 256 with ratios 4, 6, or 8.
+| `cpp/kernels/decodeAttentionKernels/decoderXQARunner.cpp`
+
+| Fused RoPE + KV write (`cpp/kernels/posEncoding/applyRopeWriteKV.h`)
+| Q/K positional encoding and cache update
+| Applies positional encoding and writes K/V before prefill or decode attention
+  consumes the cache.
+| `cpp/kernels/posEncoding/applyRopeWriteKV.h`
+
+| `ViTAttentionPlugin` (`cpp/plugins/vitAttentionPlugin/`)
+| Vision-transformer attention
+| Separate visual-encoder path, not decoder KV-cache attention. CuTe DSL ViT
+  FMHA currently supports SM >= 100 and head dim 64, 72, 80, or 128, with
+  FMHA_v2 fallback when unavailable.
+| `cpp/plugins/vitAttentionPlugin/`,
+  `cpp/kernels/contextAttentionKernels/cuteDslFMHARunner.h`,
+  `cpp/kernels/contextAttentionKernels/cuteDslFMHARunner.cpp`
+|===
+
+== Variant Documents
+
+- link:sliding_window.adoc[Sliding Window Attention] -- local attention
+  with the exported `sliding_window_size` plugin attribute.
+- link:tree_attention.adoc[Tree Attention] -- EAGLE3 speculative-decoding
+  attention masks, position IDs, and decode-kernel dispatch.
+- link:../state_space/linear.adoc[Linear Attention / Gated Delta Net] --
+  recurrent sequence mixing that is intentionally documented under
+  `state_space/`, not as an `AttentionPlugin` variant.
+
+== Code Touchpoints
+
+[cols="1,2"]
+|===
+| Path | Responsibility
+
+| `cpp/plugins/attentionPlugin/`
+| TensorRT AttentionPlugin implementation for prefill and decode.
+
+| `cpp/kernels/contextAttentionKernels/`
+| Context/prefill attention kernels.
+
+| `cpp/kernels/decodeAttentionKernels/`
+| Token-by-token decode kernels, including the XQA tree/spec-decode path.
+
+| `cpp/kernels/posEncoding/applyRopeWriteKV.h`
+| Fused RoPE + KV cache write kernel.
+
+| `tensorrt_edgellm/models/default/modeling_default.py`
+| Decoder attention wrapper used during ONNX export.
+
+| `tensorrt_edgellm/models/ops.py`
+| Attention custom-op stub used by the exporter model graph.
+
+| `tensorrt_edgellm/onnx/dynamo_translations.py`
+| Dynamo custom-op translation that emits `AttentionPlugin` nodes.
+|===
+
+== Testing
+
+* `tests/test_lists/l0_pipeline_*.yml` exercises attention through LLM/VLM
+  engine build and inference coverage.
+* Kernel-level regressions should compare plugin output against a reference
+  implementation for prefill and decode paths.

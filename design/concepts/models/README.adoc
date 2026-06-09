@@ -1,0 +1,56 @@
+= Model Architecture Design Index
+{nbsp}
+:description: Architecture-level model notes for TensorRT Edge-LLM
+
+== Purpose
+
+`design/concepts/models/` is an architecture index. Pages are keyed to the model
+architecture reported by checkpoint `config.json` (usually `model_type` or the
+Transformers architecture class), not to every supported marketing family.
+
+The complete user-facing checkpoint support matrix is
+link:../../../docs/source/user_guide/getting_started/supported-models.md[Supported Models].
+Do not duplicate checkpoint lists, precision matrices, or HF profile tables in
+this tree.
+
+== Architecture Notes
+
+[cols="1,2,3,3", options="header"]
+|===
+| Doc | Config / architecture key | Upstream modeling reference | Edge-LLM focus
+
+| link:llama/[Llama decoder]
+| `llama`; `LlamaForCausalLM`
+| https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py[modeling_llama.py]
+| Dense decoder-only path handled by the default `CausalLM` exporter/runtime contract.
+
+| link:qwen-llm/[Qwen decoder, Qwen3 MoE, and Qwen3.5 hybrid]
+| `qwen2`, `qwen3`, `qwen3_moe`, `qwen3_5_text`, `qwen3_5_moe`, `qwen3_5_moe_text`; Qwen-derived distill checkpoints
+| https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2/modeling_qwen2.py[Qwen2], https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3/modeling_qwen3.py[Qwen3], https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py[Qwen3 MoE]
+| Default dense decoder path plus registered Qwen3 MoE and Qwen3.5 hybrid/GDN exporters.
+
+| link:nemotron/[Nemotron-H hybrid]
+| `nemotron_h`; `NemotronHForCausalLM`
+| https://github.com/huggingface/transformers/blob/main/src/transformers/models/nemotron_h/modeling_nemotron_h.py[modeling_nemotron_h.py]
+| Hybrid attention/state-space decoder with recurrent state bindings and Nemotron template handling.
+
+| link:qwen-vl/[Qwen vision-language]
+| `qwen2_vl`, `qwen2_5_vl`, `qwen3_vl`, `qwen3_5` visual-input path; Qwen3-family VLM packaging
+| https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_vl/modeling_qwen2_vl.py[Qwen2-VL], https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py[Qwen2.5-VL], https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py[Qwen3-VL], https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5/modeling_qwen3_5.py[Qwen3.5]
+| Visual encoder export/runtime, including Qwen3.5's unified text+VLM checkpoints, and multimodal embedding handoff into the Qwen decoder.
+
+| link:internvl3/[InternVL]
+| `internvl_chat`, `internvl`
+| https://github.com/huggingface/transformers/blob/main/src/transformers/models/internvl/modeling_internvl.py[modeling_internvl.py]
+| InternVL visual encoder/projector path plus Qwen-like language backbone integration.
+
+| link:phi-4-multimodal/[Phi-4 multimodal]
+| `phi4_multimodal`
+| https://github.com/huggingface/transformers/blob/main/src/transformers/models/phi4_multimodal/modeling_phi4_multimodal.py[modeling_phi4_multimodal.py]
+| Phi-4 multimodal visual path, long-RoPE text path, and dedicated chat-template handling.
+
+| link:qwen-audio/[Qwen audio and TTS]
+| `qwen3_asr`, `qwen3_asr_audio_encoder`, `qwen3_tts`, `qwen3_tts_talker`, `qwen3_tts_talker_code_predictor`
+| https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3/modeling_qwen3.py[modeling_qwen3.py] for decoder stacks; https://huggingface.co/Qwen/Qwen3-ASR-0.6B/blob/main/config.json[Qwen3-ASR config]; https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice/blob/0c0e3051f131929182e2c023b9537f8b1c68adfe/config.json[Qwen3-TTS config]
+| ASR audio encoder export and TTS thinker/talker/code-predictor exports.
+|===

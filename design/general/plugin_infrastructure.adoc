@@ -1,0 +1,144 @@
+= TensorRT Plugin Infrastructure
+{nbsp}
+:description: How Edge-LLM custom TensorRT plugins are structured, registered, and integrated across export, build, and runtime
+
+== Overview
+
+Edge-LLM uses custom TensorRT plugins for operations that are not natively
+supported or not efficiently fusible by TensorRT. Each plugin is a
+self-contained unit with Python custom-op stubs, ONNX dynamo translations,
+a C++ implementation, and builder/runtime integration.
+
+Plugins are implementation details of their parent components. Component
+docs explain why a plugin is needed; this document explains the shared
+infrastructure and conventions.
+
+== Plugin Inventory
+
+[cols="2,2,2,2"]
+|===
+| Plugin | Component | Purpose | Scope
+
+| `AttentionPlugin`
+| link:../concepts/components/attention/[Attention]
+| Fused Q/K/V, RoPE, KV cache, and SDPA.
+| Decoder attention.
+
+| `ViTAttentionPlugin`
+| link:../concepts/components/attention/[Attention], link:../concepts/components/vision/[Vision]
+| Vision-transformer attention.
+| Vision encoders.
+
+| `DFlashTargetKVCacheUpdate`
+| link:../concepts/components/kv_cache/[KV cache], link:../concepts/components/positional_encoding/[Positional encoding]
+| Applies RoPE to DFlash target-token key deltas and updates the target KV cache.
+| DFlash speculative decoding.
+
+| `Int4GroupwiseGemmPlugin`
+| link:../concepts/components/ffn/[FFN]
+| Groupwise INT4 weight-only GEMM.
+| Quantized linear layers.
+
+| `Int4MoePlugin`
+| link:../concepts/components/moe/[MoE]
+| INT4 routed-expert MoE execution.
+| Quantized MoE decoder layers.
+
+| `Nvfp4MoePlugin`
+| link:../concepts/components/moe/[MoE]
+| NVFP4 routed-expert MoE execution for supported data-center/embedded SM targets.
+| Nemotron-H and other NVFP4 MoE paths.
+
+| `NvFP4MoEPluginGeforce`
+| link:../concepts/components/moe/[MoE]
+| NVFP4 routed-expert MoE execution using the GeForce-oriented packing and kernel path.
+| GeForce NVFP4 MoE paths.
+
+| `update_ssm_state` (`MambaPlugin`)
+| link:../concepts/components/state_space/[State space]
+| Mamba selective state-space recurrent-state update.
+| Hybrid Mamba decoder layers.
+
+| `causal_conv1d` (`CausalConv1dPlugin`)
+| link:../concepts/components/state_space/[State space]
+| Causal convolution used by Mamba-style sequence mixers.
+| Hybrid Mamba decoder layers.
+
+| `gated_delta_net` (`GatedDeltaNetPlugin`)
+| link:../concepts/components/state_space/linear.adoc[Linear attention / Gated Delta Net]
+| Gated Delta Net linear-attention recurrence.
+| Qwen3.5-style hybrid decoder layers.
+|===
+
+== Integration Pattern
+
+Every plugin follows the same three-layer pattern:
+
+[mermaid]
+----
+graph LR
+    PY[Model code + torch.ops.trt_edgellm stubs] -->|torch.onnx.export(dynamo=True)| TRANS[ONNX Script translations]
+    TRANS -->|emits trt_edgellm custom op| ONNX[ONNX Graph]
+    ONNX -->|deserialized by| CPP[C++ Plugin]
+    CPP -->|executes in| TRT[TensorRT Engine]
+----
+
+=== Python Export Layer
+
+Plugin-friendly model code calls custom-op stubs from
+`tensorrt_edgellm/models/ops.py`. The checkpoint exporter uses
+`torch.onnx.export(dynamo=True)`, so plugin lowering is implemented through
+ONNX Script translations registered in
+`tensorrt_edgellm/onnx/dynamo_translations.py`, with custom operator schemas in
+`tensorrt_edgellm/onnx/onnx_custom_schemas.py`.
+
+When adding or changing a plugin, keep the stub, translation, schema, and C++
+plugin contract synchronized. Do not use the legacy `torch.onnx` symbolic
+registration path; it is not the current Edge-LLM exporter.
+
+=== C++ Plugin Layer
+
+Plugin implementations live under `cpp/plugins/<PluginName>/`. Each
+plugin implements:
+
+- `getOutputDimensions` and `getOutputDataTypes` for shape/type inference.
+- `configurePlugin` for profile-based configuration.
+- `serialize` and `getSerializationSize` for engine serialization.
+- Constructors from `PluginFieldCollection` and serialized data.
+- `enqueue` for CUDA kernel launch.
+
+All plugins register with TensorRT through the shared Edge-LLM plugin
+library.
+
+=== Shared Utilities
+
+`cpp/plugins/utils/pluginUtils.{h,cpp}` provides common helpers for dtype
+conversion, workspace allocation, and error checking.
+
+== Code Touchpoints
+
+[cols="1,2"]
+|===
+| Path | Responsibility
+
+| `tensorrt_edgellm/models/ops.py`
+| Python custom-op stubs used by model implementations.
+
+| `tensorrt_edgellm/onnx/dynamo_translations.py`
+| ONNX Script translations from `torch.ops.trt_edgellm.*` stubs to custom ONNX operators.
+
+| `tensorrt_edgellm/onnx/onnx_custom_schemas.py`
+| Custom ONNX operator schema definitions for the `trt_edgellm` domain.
+
+| `tensorrt_edgellm/onnx/export.py`
+| Checkpoint export orchestration using `torch.onnx.export(dynamo=True)`.
+
+| `cpp/plugins/<PluginName>/`
+| C++ plugin implementation, headers, sources, and optional CUDA kernels.
+
+| `cpp/plugins/utils/`
+| Shared plugin utilities.
+
+| `cpp/CMakeLists.txt`
+| Plugin build targets and kernel source registration.
+|===

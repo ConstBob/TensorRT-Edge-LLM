@@ -1,0 +1,64 @@
+= Component Design Index
+{nbsp}
+:description: Index of reusable TensorRT Edge-LLM component design documents
+
+== Purpose
+
+`design/concepts/components/` contains reusable component design docs. Each component page
+explains why the component is needed and how it is implemented in Edge-LLM.
+Model-specific wiring lives under `design/concepts/models/` and links back here instead of
+duplicating component details.
+
+`design/llm/` remains top-level because loader/model-construction notes are not a
+single reusable transformer component.
+
+== Components
+
+[cols="1,3", options="header"]
+|===
+| Component | Scope
+
+| link:tokenizer/[tokenizer/]
+| Tokenizer artifacts, chat templates, and encode/decode boundaries.
+
+| link:embeddings/[embeddings/]
+| Token, multimodal, and deepstack embedding input contracts.
+
+| link:vision/[vision/]
+| Image/video preprocessing, visual encoder export, and VLM runtime embedding generation.
+
+| link:audio/[audio/]
+| Audio workflow index with separate link:audio/asr.adoc[ASR] and
+link:audio/tts.adoc[TTS] component pages.
+
+| link:positional_encoding/[positional_encoding/]
+| RoPE-family position caches and MRoPE when configured.
+
+| link:normalization/[normalization/]
+| Pre-attention, pre-FFN, and final norm placement.
+
+| link:attention/[attention/]
+| Causal self-attention and plugin/TRT-native binding contract.
+
+| link:kv_cache/[kv_cache/]
+| Prefill/decode cache lifecycle and prefix reuse.
+
+| link:state_space/[state_space/]
+| State-space and link:state_space/linear.adoc[linear-attention] sequence
+mixing with recurrent state cache for hybrid decoders.
+
+| link:ffn/[ffn/]
+| Dense, gated, and quantized MLP position in decoder blocks.
+
+| link:moe/[moe/]
+| Routed expert layers, INT4/NVFP4 precision paths, and hardware-specific MoE
+kernels.
+
+| link:residual/[residual/]
+| Skip-path additions around attention, FFN, MoE, and state-space sublayers.
+|===
+
+== Authoring
+
+Follow link:../../CONTRIBUTING.adoc[Contributing Design Documents]. Keep component docs
+near the 200-line soft limit and split reusable variants into focused Level 2 pages.

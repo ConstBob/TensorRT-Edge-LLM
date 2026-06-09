@@ -1,0 +1,98 @@
+= Normalization
+{nbsp}
+:description: Normalization math patterns in TensorRT Edge-LLM export and runtime
+
+== Overview
+
+Normalization layers stabilize inference by scaling hidden states to a
+consistent magnitude. Modern decoder-only LLMs generally use pre-norm:
+normalization before attention and before the FFN rather than after each
+sublayer.
+
+Normalization is a mathematical graph pattern rather than a closed list of
+model features. If a normalization formula is expressible in the exported graph
+and the TensorRT compiler can lower that graph, Edge-LLM does not need a new
+category for the norm name. This page documents the common patterns
+emitted by current model loaders and the placement contracts they rely on.
+
+- **RMS-style normalization**: scales hidden states by reciprocal root-mean-
+  square magnitude without mean subtraction, then applies learned scale.
+- **LayerNorm-style normalization**: subtracts the hidden-dimension mean, scales
+  by reciprocal standard deviation, and applies learned scale plus optional
+  bias when the model config includes it.
+
+== Current Pattern Usage
+
+[cols="2,2,3"]
+|===
+| Architecture | Pattern emitted | Placement notes
+
+| Llama, Qwen, InternVL
+| RMS-style normalization
+| Pre-attention, pre-FFN, and final norm.
+
+| Phi
+| LayerNorm-style normalization
+| Standard mean/variance normalization with bias where configured.
+|===
+
+Current decoder-only architectures use pre-norm placement: the
+normalized hidden states enter attention or FFN, while the unnormalized
+hidden states feed the residual connection.
+
+== Architecture
+
+[mermaid]
+----
+graph TD
+    H_IN[Block Input] --> NORM1[Pre-Attention Norm]
+    NORM1 --> ATTN[Attention]
+    ATTN --> RES1[Residual Add]
+    H_IN --> RES1
+    RES1 --> NORM2[Pre-FFN Norm]
+    NORM2 --> FFN[FFN]
+    FFN --> RES2[Residual Add]
+    RES1 --> RES2
+    RES2 -->|last layer| FNORM[Final Norm]
+    FNORM --> LM[LM Head]
+----
+
+== Design
+
+Normalization layers preserve the input shape and prepare hidden states for the
+next sublayer. Edge-LLM's contract is to preserve the model's normalization
+formula and placement from config/model code through ONNX export.
+
+Implementation guidance:
+
+* Treat named norms as formulas to emit, not as a fixed feature matrix.
+* Keep placement config-driven so pre-attention, pre-FFN, and final norms match
+  the source architecture.
+* Let TensorRT compile the exported reduction/elementwise graph when possible.
+* Add a custom kernel or plugin only for compiler coverage, performance, or
+  numerical-parity reasons; the plugin should not redefine which norm formulas
+  are considered valid.
+
+== Code Touchpoints
+
+[cols="1,3"]
+|===
+| Path | Responsibility
+
+| `tensorrt_edgellm/models/default/modeling_default.py`
+| Default decoder norm placement and RMSNorm usage for dense decoder blocks.
+
+| `tensorrt_edgellm/models/qwen3_5/modeling_qwen3_5_text.py`
+| Qwen3.5 RMSNorm variants, including the residual-weight convention and gated
+  per-head normalization around GDN/full-attention paths.
+
+| `tensorrt_edgellm/models/nemotron_h/modeling_nemotron_h.py`
+| Nemotron-H hybrid decoder norm placement around attention and Mamba-style
+  state-space layers.
+|===
+
+== Testing
+
+* `tests/test_lists/l0_pipeline_*.yml` validates norm placement through full
+  model export, build, and inference.
+* Add direct parity tests when introducing a custom normalization kernel.

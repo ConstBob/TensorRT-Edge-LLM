@@ -1,0 +1,177 @@
+= RoPE (Rotary Position Embeddings)
+{nbsp}
+:description: RoPE in TensorRT Edge-LLM: cache construction, non-interleaved convention, Long RoPE, MRoPE, and position rebasing
+
+== Overview
+
+Rotary Position Embeddings (RoPE) inject position information by rotating
+query and key vectors in frequency-dependent subspaces. Edge-LLM
+precomputes a cosine/sine cache at engine load time and passes it as
+`rope_rotary_cos_sin` to attention layers. The `AttentionPlugin` or the
+fused `applyRopeWriteKV` kernel applies rotation before scaled
+dot-product attention.
+
+Edge-LLM uses the **non-interleaved** convention: the first half of the
+rotary dimension contains cosine values and the second half contains
+sine values, matching the TensorRT kernel contract. Models with distinct
+RoPE config layouts are normalized during export so runtime consumes one
+effective `RopeConfig`.
+
+== Model Applicability
+
+[cols="2,2,3"]
+|===
+| Model Family | RoPE Variant | Notes
+
+| Llama, Qwen, InternVL
+| Standard RoPE
+| Single `rope_theta`, one cache plane.
+
+| Phi-4
+| Long RoPE
+| Extended context with `longFactor` and `shortFactor` arrays.
+
+| Qwen2-VL, Qwen3-VL
+| MRoPE
+| Temporal/spatial position IDs and per-request initialization.
+
+| Config-driven RoPE-scaling families
+| Normalized RoPE parameters
+| Export selects the effective parameter set for runtime cache construction.
+|===
+
+== Architecture
+
+[mermaid]
+----
+graph LR
+    QKV[Q/K/V Projections] --> Q_FLAT[Q flat]
+    QKV --> K_FLAT[K flat]
+    QKV --> V_FLAT[V flat]
+
+    subgraph "AttentionPlugin / applyRopeWriteKV"
+        CACHE[rope_rotary_cos_sin] --> ROPE_Q[Apply RoPE to Q]
+        CACHE --> ROPE_K[Apply RoPE to K]
+        Q_FLAT --> ROPE_Q
+        K_FLAT --> ROPE_K
+        ROPE_K --> KV_WRITE[Write K,V to KV Cache]
+        V_FLAT --> KV_WRITE
+        ROPE_Q --> SDPA[Scaled Dot-Product Attention]
+        KV_WRITE --> SDPA
+    end
+
+    SDPA --> O_PROJ[O Projection]
+----
+
+For standard and Long RoPE the persistent cache has shape
+`[1, max_kv_capacity, rotary_dim]`. MRoPE/text-only MRoPE paths allocate a
+batch-shaped cache when per-request positions are required.
+
+== Design
+
+=== Non-interleaved convention
+
+For rotary dimension `D` at position `p`, the cache layout is
+`cache[p, 0..D/2) = cos(...)` and `cache[p, D/2..D) = sin(...)`. The
+rotation splits the state vector into halves `x_left` and `x_right` and
+computes `roped_left = x_left*cos - x_right*sin` and
+`roped_right = x_right*cos + x_left*sin`.
+
+=== Cache construction
+
+At engine load time, `RopeCache` allocates
+`[1, max_kv_capacity, rotary_dim]` and calls
+`initializeRopeCosSinCache()`. During ONNX export, `rope_rotary_cos_sin`
+is a dummy input tensor; only shape and dtype matter because runtime
+recomputes values from config.
+
+=== Position rebasing
+
+Some runtime modes place prompt tokens at a non-zero offset within the
+KV cache. In those modes, the runtime applies a shared
+`prompt_position_offset` so the RoPE cache positions match logical token
+positions.
+
+NOTE: Position rebasing requires a shared offset across the active batch;
+runtime validation enforces this before engine enqueue.
+
+=== Configuration data contract
+
+[cols="2,1,3"]
+|===
+| Field | Type | Description
+
+| `rope_theta`
+| float
+| Primary RoPE base frequency.
+
+| `rope_scaling`
+| object/null
+| Scaling config for Long RoPE or MRoPE variants.
+
+| `partial_rotary_factor`
+| float
+| Fraction of `head_dim` used for rotation.
+
+| `max_position_embeddings`
+| int
+| Maximum sequence length represented by the RoPE cache.
+|===
+
+=== RoPE type dispatch
+
+[cols="1,3"]
+|===
+| Type | Initialization
+
+| `kDefault`
+| `initializeNormalRopeCosSin()` with standard theta.
+
+| `kDynamic`
+| Same as default; enforces `maxLength <= maxPositionEmbeddings`.
+
+| `kLongRope`
+| `initializeLongRopeCosSin()` with short/long factor arrays.
+
+| `kMRope`
+| Per-request from multi-dimensional position IDs via `initializeMRopeCosSin()`.
+|===
+
+== Code Touchpoints
+
+[cols="1,3"]
+|===
+| Path | Responsibility
+
+| `cpp/kernels/posEncoding/initializeCosSinCache.{cu,h}`
+| CUDA kernels for standard, long, and MRoPE cache computation.
+
+| `cpp/kernels/posEncoding/applyRopeWriteKV.{cu,h}`
+| Fused kernel that applies RoPE to Q/K and writes K/V to cache.
+
+| `cpp/runtime/llmRuntimeUtils.{h,cpp}`
+| `RopeConfig`, `collectRopeConfig()`, and `initializeRopeCosSinCache()`.
+
+| `cpp/runtime/state/ropeCache.{h,cpp}`
+| Cache allocation, initialization, MRoPE updates, and position rebasing support.
+
+| `cpp/plugins/attentionPlugin/attentionPlugin.cpp`
+| Consumes `rope_rotary_cos_sin` and dispatches fused RoPE + KV write.
+
+| `tensorrt_edgellm/models/default/modeling_default.py`
+| Python attention path exposing the `rope_rotary_cos_sin` input during ONNX
+  export.
+
+| `tensorrt_edgellm/models/ops.py`
+| Custom-op stubs, including the RoPE helper used by export paths.
+
+| `tensorrt_edgellm/checkpoint/checkpoint_utils.py`
+| Exports normalized RoPE config fields into runtime artifact JSON.
+|===
+
+== Testing
+
+Unit tests compare plugin RoPE output against a reference implementation,
+including position-offset scenarios. `unittests/ropeInitializeTests.cu`
+tests Long RoPE and MRoPE cache initialization; pipeline coverage lives
+under `tests/test_lists/l0_pipeline_*.yml`.

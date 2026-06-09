@@ -1,0 +1,117 @@
+= Linear Attention / Gated Delta Net
+{nbsp}
+:description: Linear-attention sequence mixing with recurrent state in TensorRT Edge-LLM
+
+== Overview
+
+Linear attention is a family of sequence-mixing formulas that avoid the
+quadratic softmax-attention matrix and instead carry recurrent state. In this
+branch, the implemented linear-attention path is Gated Delta Net (GDN) for
+Qwen3.5-style hybrid models. These layers use the `linear_attention`
+recurrence and are not Mamba selective-state-space layers.
+
+Although the name contains "attention", this path is not the decoder softmax
+`AttentionPlugin` documented under link:../attention/[attention/]. It belongs
+with state-space components because runtime must allocate, bind, and update
+recurrent state across prefill and decode.
+
+== Model Applicability
+
+[cols="2,2,3", options="header"]
+|===
+| Architecture path | Sequence-mixing pattern | Notes
+
+| Qwen3.5 hybrid layers
+| Gated Delta Net linear attention
+| Config `layer_types` values of `linear_attention` map to GDN layers. The
+  checked-in model path is Qwen3.5 and should be documented here rather than
+  grouped with Mamba.
+
+| Standard softmax attention layers
+| Not this path
+| Continue to use `AttentionPlugin` and KV cache.
+|===
+
+== Architecture
+
+[mermaid]
+----
+flowchart LR
+    H[Hidden states] --> PROJ[Input projections]
+    PROJ --> QKV[Q/K/V and gate terms]
+    STATE_IN[Recurrent state in] --> GDN[GatedDeltaNet plugin]
+    QKV --> GDN
+    LEN[context_lengths] --> GDN
+    GDN --> STATE_OUT[Recurrent state out]
+    GDN --> OUT[Mixed hidden states]
+    OUT --> OPROJ[Output projection]
+    OPROJ --> RES[Residual add]
+    H --> RES
+----
+
+== Design
+
+GDN layers occupy a sequence-mixing slot in a hybrid decoder block. They do not
+write K/V cache. Instead, export emits a `trt_edgellm.gated_delta_net` custom op
+with recurrent state inputs/outputs. Runtime treats those layers like other
+recurrent layers when sizing profiles and binding state tensors.
+
+Execution has the same high-level phases as other recurrent sequence mixers:
+
+* **Prefill** consumes prompt chunks and produces updated recurrent state.
+* **Decode** consumes a single new token and updates recurrent state in place
+  for the next step.
+* Blackwell builds may use a specialized prefill kernel, while other paths use
+  the sequential GDN prefill implementation.
+
+== Code Touchpoints
+
+[cols="1,3", options="header"]
+|===
+| Path | Responsibility
+
+| `tensorrt_edgellm/config.py`
+| Parses `linear_attention` layer types into GDN layer metadata.
+
+| `tensorrt_edgellm/models/qwen3_5/modeling_qwen3_5_text.py`
+| Qwen3.5 hybrid decoder with GDN and gated full-attention layers.
+
+| `tensorrt_edgellm/models/qwen3_5_moe/modeling_qwen3_5_moe.py`
+| Qwen3.5 MoE decoder reusing the GDN/full-attention mixer stack with MoE FFNs.
+
+| `tensorrt_edgellm/models/ops.py`
+| Defines the `trt_edgellm::gated_delta_net` custom-op stub.
+
+| `tensorrt_edgellm/onnx/dynamo_translations.py`
+| Lowers the GDN custom op to the ONNX plugin node.
+
+| `tensorrt_edgellm/onnx/onnx_custom_schemas.py`
+| Declares the `gated_delta_net` ONNX custom schema.
+
+| `cpp/runtime/config/llmEngineConfig.{h,cpp}`
+| Parses exported hybrid layer configuration for runtime.
+
+| `cpp/runtime/exec/registryBuilder.{h,cpp}`
+| Registers recurrent and convolution state bindings for GDN layers.
+
+| `cpp/runtime/mambaCacheManager.{h,cpp}`
+| Owns recurrent/convolution state tensors used by recurrent mixer layers.
+
+| `cpp/plugins/gatedDeltaNet/`
+| TensorRT plugin wrapper for GDN.
+
+| `cpp/kernels/gdnKernels/`
+| CuTe DSL GDN decode, prefill, and Blackwell prefill kernels.
+
+| `cpp/common/bindingNames.h`
+| Names recurrent-state bindings used by Mamba/GDN/linear-attention layers.
+|===
+
+== Testing
+
+* `unittests/gdnCuteDslTests.cu` validates GDN decode, prefill, padding, and
+  Qwen3.5-shaped Blackwell prefill paths.
+* `tests/test_lists/l0_checkpoint_export.yml` includes Qwen3.5 hybrid export
+  coverage.
+* `tests/test_lists/l0_pipeline_jedha.yml` includes Qwen3.5 hybrid
+  pipeline coverage.

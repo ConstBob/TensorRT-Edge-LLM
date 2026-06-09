@@ -1,0 +1,180 @@
+= Mixture of Experts (MoE)
+{nbsp}
+:description: Routed expert layers, precision paths, and hardware-specific MoE kernels in TensorRT Edge-LLM
+
+== Overview
+
+Mixture of Experts (MoE) layers are routed decoder-block sublayers. A router
+selects a small set of experts per token, expert MLPs run only for selected
+(token, expert) slots, and the outputs are weighted and reduced back into the
+hidden stream.
+
+MoE is documented separately from dense link:../ffn/[FFN] because the important
+implementation questions are routing, expert layout, quantized weight packing,
+workspace construction, hardware-specific kernels, and output aggregation rather
+than the dense FFN formula alone.
+
+== Model Applicability
+
+[cols="2,2,3", options="header"]
+|===
+| Model Family | MoE Path | Notes
+
+| Qwen3 MoE GPTQ/INT4
+| `Int4MoePlugin`
+| Router logits are FP32; hidden states are FP16; experts are Marlin-packed INT4
+  W4A16 gate/up/down projections with SwiGLU activation.
+
+| Qwen3 MoE NVFP4
+| `NvFP4MoEPluginGeforce`
+| CuTeDSL fused NVFP4 path for SM120/SM121 builds. This is not a general
+  all-platform MoE path.
+
+| Nemotron-H MoE
+| `Nvfp4MoePlugin` plus shared expert
+| Routed NVFP4 experts use sigmoid-group-top-k routing; a separate shared expert
+  path is added to the plugin output.
+|===
+
+== Architecture
+
+[mermaid]
+----
+flowchart LR
+    H[Hidden states] --> ROUTER[Router linear]
+    ROUTER --> LOGITS[FP32 router logits]
+    LOGITS --> SELECT[Top-k / grouped top-k routing]
+    H --> PACK[Token-slot packing by expert]
+    SELECT --> PACK
+    PACK --> EXPERT[Expert gate/up + activation + down]
+    EXPERT --> WEIGHT[Apply route weights]
+    WEIGHT --> REDUCE[Scatter / aggregate slots]
+    REDUCE --> OUT[MoE output]
+----
+
+== Design
+
+=== Precision and Kernel Paths
+
+[cols="1,2,3", options="header"]
+|===
+| Path | Precision / Hardware | Computation Summary
+
+| INT4 Qwen3 MoE
+| FP16 activations, FP32 router logits, INT4 expert weights with FP16 scales.
+  Uses Marlin W4A16 kernels; this is the portable INT4 MoE path, subject to the
+  Marlin kernel's CUDA architecture support.
+| `Qwen3SparseMoeBlock` extracts GPTQ expert weights, fuses `gate_proj` and
+  `up_proj`, packs weights/scales into Marlin layout, and calls
+  `int4_moe_plugin()`.
+
+| NVFP4 Qwen3 MoE GeForce
+| FP16 activations and NVFP4 expert weights. `NvFP4MoEPluginGeforce` is marked
+  in code as supported only on SM120/SM121.
+| The plugin fuses route/pack, FC1, activation, activation quantization, FC2,
+  and scatter for the CuTeDSL GeForce path.
+
+| NVFP4 Nemotron-H MoE
+| FP16 hidden-state contract with NVFP4 expert weights and activation
+  quantization inside the plugin. This path is hardware/build specific, not a
+  substitute for the portable INT4 path.
+| Decode-sized batches (`numTokens <= 16`) use router + W4A16 GEMV kernels.
+  Prefill-sized batches build a GPU layout, `fp4Quantize` activations, gather,
+  run FC1 grouped GEMM, quantize again, run FC2 grouped GEMM, and scatter-reduce.
+|===
+
+=== INT4 Qwen3 MoE Flow
+
+`cpp/plugins/int4MoePlugin/int4MoePlugin.cpp` performs the INT4 path in these
+steps:
+
+1. Accept inputs: `router_logits` `[num_tokens, num_experts]` FP32,
+   `hidden_states` `[B,S,H]` FP16, Marlin-packed gate/up weights and down
+   weights, and FP16 scales.
+2. Choose `moeBlockSize = 8` for decode (`seq_len == 1`) or `32` for prefill.
+3. Run `moeTopkSoftmax()` to compute `topkWeights` and `topkIndices`.
+4. Count selected slots per expert, compute padded offsets, build slot lists,
+   and build Marlin `sortedTokenIds` / `expertIds` indices.
+5. Run `moeAwqW4A16MarlinGemm()` for fused gate+up projection.
+6. Apply `swiGluActivation()` to produce the expert intermediate.
+7. Run `moeAwqW4A16MarlinGemm()` for the down projection with route weights.
+8. Run `launchAggregateSlotOutputsKernel()` to reduce top-k slots back to one
+   output row per token.
+
+=== NVFP4 MoE Flow
+
+There are two NVFP4 plugin families in the tree:
+
+* `NvFP4MoEPluginGeforce` is the fused CuTeDSL path used by Qwen3 NVFP4 MoE
+  exports. The plugin header states it is only supported on SM120/SM121. The
+  exporter passes FP16 I/O, NVFP4 expert weights/scales, activation type, backend
+  selection, and routed-row sizing.
+* `Nvfp4MoePlugin` is the Nemotron-H path. It selects routing by plugin
+  attribute:
+  ** `kSOFTMAX_TOPK`: `moeTopkSoftmax` softmax + flat top-k +
+     renormalization.
+  ** `kSIGMOID_GROUP_TOPK`: `moeSigmoidGroupTopk` sigmoid + grouped top-k used
+     by Nemotron-H routing parameters.
+  ** The plugin switches between decode GEMV and prefill grouped-GEMM paths
+     based on `numTokens`, and computes activation FP4 quantization internally.
+
+Nemotron-H also has a shared expert path in Python:
+`NemotronHMoEMLP.forward()` adds the `Nvfp4MoePlugin` routed-expert output to the
+separate shared expert's dense ReLU-squared MLP output.
+
+=== Design Rules
+
+* Do not describe MoE as just a dense FFN variant. The routed path owns router
+  logits, top-k selection, expert packing, and scatter/reduce behavior.
+* Do not treat NVFP4 as universally available. The checked-in NVFP4 paths are
+  hardware/build specific; the GeForce fused plugin explicitly gates on
+  SM120/SM121.
+* Do not claim L0 export or pipeline coverage for MoE unless the referenced test
+  list actually contains that case. Keep testing claims to named tests that are
+  present in the repository.
+* Keep model-family support in the user-facing
+  `docs/source/user_guide/getting_started/supported-models.md`; this component
+  doc explains how MoE executes once a supported checkpoint uses a MoE config.
+
+== Code Touchpoints
+
+[cols="2,3", options="header"]
+|===
+| Path | Responsibility
+
+| `tensorrt_edgellm/models/qwen3_moe/modeling_qwen3_moe.py`
+| Qwen3 MoE router/expert weight holders, INT4 Marlin packing, NVFP4 CuTeDSL
+  packing, and plugin calls.
+
+| `tensorrt_edgellm/models/nemotron_h/modeling_nemotron_h.py`
+| Nemotron-H MoE wrapper, NVFP4 routed experts, sigmoid-group-top-k routing
+  parameters, and shared expert addition.
+
+| `tensorrt_edgellm/checkpoint/repacking.py`
+| Expert stacking and INT4/NVFP4 layout repacking helpers.
+
+| `cpp/plugins/int4MoePlugin/`
+| TensorRT INT4 MoE plugin and enqueue orchestration.
+
+| `cpp/plugins/nvfp4MoePlugin/`
+| Nemotron-H NVFP4 MoE plugin with decode/prefill path split.
+
+| `cpp/plugins/nvfp4MoePluginGeforce/`
+| CuTeDSL fused NVFP4 MoE plugin for SM120/SM121.
+
+| `cpp/kernels/moe/`
+| Top-k routing, sigmoid grouped top-k, slot alignment, activation, Marlin,
+  NVFP4 decode, quantization, grouped GEMM, and scatter/finalize kernels.
+|===
+
+== Testing
+
+* `unittests/nvfp4MoeCuteDslSm12xTests.cu` validates the CuTeDSL SM12x
+  NVFP4 MoE path.
+* `unittests/nvfp4MoeCuteDslSm110Tests.cu` validates the CuTeDSL SM110
+  NVFP4 MoE path.
+* `unittests/nvfp4MoESupportKernelTest.cu` validates NVFP4 MoE support
+  kernels.
+* `unittests/moeTopkSoftmaxKernelTests.cpp` validates top-k softmax routing.
+* `unittests/moeSigmoidGroupTopkKernelTests.cpp` validates the sigmoid
+  grouped-top-k routing kernel used by Nemotron-H-style routing.

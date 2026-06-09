@@ -1,0 +1,160 @@
+= KV Cache
+{nbsp}
+:description: Key-value cache component in TensorRT Edge-LLM: architecture, lifecycle, and optimization strategies
+
+== Overview
+
+The KV cache stores previously computed key/value tensors from
+self-attention so decode steps can attend over the full sequence history
+without recomputing prior tokens. Runtime allocates fixed-capacity cache
+tensors when the engine runner is constructed; the cache length is tracked
+separately. Prefill writes prompt KV into that preallocated storage, and each
+decode step computes KV for the new token and logically appends it by writing
+into the next available slot rather than physically growing the allocation.
+
+KV cache design affects latency, memory footprint, maximum sequence
+length, prefix reuse, and speculative decoding.
+
+KV cache is the sequence-state path for softmax attention. Hybrid models can
+also contain recurrent state-space or linear-attention layers; those states are
+documented under link:../state_space/[state_space/] and are managed separately
+from K/V tensors.
+
+== Model Applicability
+
+KV caching is universal across decoder-only transformer models. The
+specific binding mode depends on backend and model export:
+
+[cols="2,2,3"]
+|===
+| Model Family | KV Cache Type | Notes
+
+| Llama, Qwen, Phi, InternVL
+| Baseline decoder KV
+| Standard per-layer KV cache with GQA/MQA head counts.
+
+| Instruction-tuned chat models
+| Baseline decoder KV + prefix reuse
+| System-prompt KV can be saved and reused across requests.
+
+| All decoder-only engines
+| Per-layer cache manager
+| One KV tensor per attention layer, routed through the hybrid cache manager.
+|===
+
+== Architecture
+
+The KV cache sits alongside attention. During prefill it is written;
+during decode it is both read and written.
+
+[mermaid]
+----
+graph TD
+    subgraph "Prefill"
+        P_QKV[Q/K/V Projections] --> P_WRITE[Write K,V to cache]
+        P_WRITE --> P_ATTN[Full-sequence attention]
+    end
+
+    subgraph "Decode (per step)"
+        D_QKV[Q/K/V for new token] --> D_APPEND[Append K,V to cache]
+        D_APPEND --> D_ATTN[Attend over full cache]
+    end
+
+    subgraph "Optional Reuse"
+        REUSE[Prefix Reuse<br/><i>prefix_reuse.adoc</i>]:::optional
+    end
+
+    REUSE -.->|seeds cache before prefill| P_WRITE
+    classDef optional stroke-dasharray: 5 5
+----
+
+== Design
+
+=== Core Lifecycle
+
+1. **Reset/seed** -- clear or seed the preallocated cache for the request
+   batch; optionally seed with a cached prefix.
+2. **Prefill** -- run prompt tokens through the model; attention layers
+   write K/V for the prompt.
+3. **Decode** -- for each generated token, attention reads cached K/V and
+   appends the new K/V.
+4. **Length tracking** -- `context_lengths` advances after each step.
+
+=== Core Terms
+
+[cols="1,3"]
+|===
+| Term | Definition
+
+| `past_key_values_i`
+| Plugin-mode per-layer KV cache binding on the read side.
+
+| `present_key_values_i`
+| Plugin-mode per-layer KV cache binding on the write side.
+
+| `context_lengths`
+| Per-request count of active tokens in the cache.
+
+| `kvcache_start_index`
+| Engine input that distinguishes normal prefill from cache-aware execution.
+
+| Capacity
+| Maximum sequence length the preallocated cache can hold.
+|===
+
+=== KV Variants
+
+- **link:decoder.adoc[Decoder KV]** -- baseline per-layer cache with
+  plugin or TRT-native bindings.
+- **link:prefix_reuse.adoc[Prefix Reuse]** -- seeds the cache from saved
+  system-prompt KV to amortize repeated prefixes.
+
+=== Related Sequence-State Components
+
+- link:../attention/[Attention] -- softmax-attention layers read/write KV
+  cache during prefill, decode, and tree/speculative decode paths.
+- link:../attention/tree_attention.adoc[Tree Attention] -- speculative decode
+  attention variant that still consumes the K/V cache state.
+- link:../state_space/[State Space] -- recurrent Mamba-style sequence state
+  used by hybrid layers instead of KV cache.
+- link:../state_space/linear.adoc[Linear Attention / Gated Delta Net] --
+  recurrent GDN state used by Qwen3.5-style hybrid layers instead of
+  K/V cache.
+
+== Code Touchpoints
+
+[cols="2,3", options="header"]
+|===
+| File Path | Responsibility
+
+| `cpp/runtime/kvCacheManager.{h,cpp}`
+| KV tensor allocation, cache-size accounting, reset, and capture/restore
+  operations for attention layers.
+
+| `cpp/runtime/hybridCacheManager.{h,cpp}`
+| Shared cache lengths, reset/seed operations, prompt-cache capture/restore, and
+  mixed KV/recurrent-cache routing for hybrid models.
+
+| `cpp/runtime/state/sharedResources.{h,cpp}`
+| Constructs cache managers and shared runtime resources from engine config.
+
+| `cpp/runtime/exec/registryBuilder.{h,cpp}`
+| Registers plugin combined-KV bindings or TRT-native split-KV bindings for each
+  attention layer.
+
+| `cpp/runtime/exec/tensorRegistry.{h,cpp}`
+| Resolves and binds KV-cache tensors to TensorRT execution contexts.
+
+| `cpp/plugins/attentionPlugin/`
+| Attention plugin consumes cache tensors and writes new K/V entries.
+
+| `cpp/kernels/kvCacheUtilKernels/`
+| Prefix-cache copy, block movement, and cache utility kernels.
+|===
+
+== Testing
+
+* `unittests/hybridCacheManagerTests.cpp` validates cache reset, capture, and
+  restore behavior.
+* `tests/test_lists/l0_pipeline_*.yml` covers KV cache behavior through prefill
+  and decode inference flows.
