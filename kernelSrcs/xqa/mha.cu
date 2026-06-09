@@ -2251,13 +2251,29 @@ CUBIN_EXPORT __global__
             // masking
             uint32_t const warpTileTokenBeg = ctaTile.x * seqIter + warpTile.x * warpIdx.x;
 #if SPEC_DEC
+#if SLIDING_WINDOW
+            // Full leading tiles are skipped by seqIterInit; mask residual leading tokens in the first computed tile.
+            bool const isFirstIter = (seqIter == nbSkipLeadingTiles);
+            bool const needMaskLeading = (rtIsReallySliding && isFirstIter);
+            if (needMaskLeading)
+            {
+                uint32_t const validTokenBeg
+                    = nbTotalSkipTokens < warpTileTokenBeg ? 0 : nbTotalSkipTokens - warpTileTokenBeg;
+                if (validTokenBeg > 0)
+                {
+                    applyMask(warp, acc, validTokenBeg, warpTile.x);
+                }
+            }
+#endif
             if (seqIter >= nbSeqItersWithoutMask)
             {
+                // Apply the packed speculative/tree attention mask for tiles that overlap generated query tokens.
                 uint32_t const nbValidCols = (warpTileTokenBeg < cacheSeqLen ? cacheSeqLen - warpTileTokenBeg : 0U);
                 applyMaskFromInput(
                     warp, acc, mask, idxHeadTokenInGrp, nbValidCols, qSeqLen, actualQSeqLen, headGrpSize);
             }
 #else
+            // Mask the sliding-window left edge and the padded tail of the final cache tile.
             bool const isFirstIter = (seqIter == nbSkipLeadingTiles);
             bool const needMaskLeading = (rtIsReallySliding && isFirstIter);
             bool const isLastIter = (seqIter + 1 == nbSeqIters);

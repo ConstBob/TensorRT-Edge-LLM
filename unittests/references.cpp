@@ -26,6 +26,36 @@
 #include <limits>
 
 template <typename T>
+std::vector<T> sliceKVWindow(
+    std::vector<T> const& kv, int32_t numKVHeads, int32_t headSize, int32_t kvLength, int32_t slidingWindowSize)
+{
+    int32_t const windowLength = slidingWindowSize > 0 ? std::min(kvLength, slidingWindowSize) : kvLength;
+    int32_t const windowStart = kvLength - windowLength;
+    std::vector<T> windowKV(numKVHeads * headSize * windowLength);
+    for (int32_t hkv = 0; hkv < numKVHeads; ++hkv)
+    {
+        for (int32_t skv = 0; skv < windowLength; ++skv)
+        {
+            for (int32_t d = 0; d < headSize; ++d)
+            {
+                windowKV[hkv * windowLength * headSize + skv * headSize + d]
+                    = kv[hkv * kvLength * headSize + (windowStart + skv) * headSize + d];
+            }
+        }
+    }
+    return windowKV;
+}
+
+// Explicit template instantiations for KV window slicing used in XQA unit tests.
+template std::vector<half> sliceKVWindow(
+    std::vector<half> const& kv, int32_t numKVHeads, int32_t headSize, int32_t kvLength, int32_t slidingWindowSize);
+
+#if SUPPORTS_FP8
+template std::vector<__nv_fp8_e4m3> sliceKVWindow(std::vector<__nv_fp8_e4m3> const& kv, int32_t numKVHeads,
+    int32_t headSize, int32_t kvLength, int32_t slidingWindowSize);
+#endif
+
+template <typename T>
 std::vector<half> casualAttentionRef(std::vector<half> const& q, std::vector<T> const& k, std::vector<T> const& v,
     int32_t const qlen, int32_t kvlen, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
     std::optional<std::vector<int32_t>> const& treeAttnMask, float const kScaleQuantOrig, float const vScaleQuantOrig)
