@@ -159,6 +159,26 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
                 + " exceeds base.maxVerifyTreeSize=" + std::to_string(specConfig.maxVerifySize)
                 + ". Verification size exceeds base engine maximum verification size.");
 
+        if (cfg.base.specDecodeType == SpecDecodeMode::kMTP)
+        {
+            // MTP base verification currently reuses EAGLE utility kernels for accept, KV commit,
+            // and hidden-state compaction. Those kernels support maxDepth <= 9.
+            static constexpr int32_t kMTPMaxVerifySizeForCurrentEagleUtilityKernels = 9;
+            int32_t const expectedVerifySize = specConfig.draftingStep + 1;
+            ELLM_CHECK(specConfig.draftingTopK == 1,
+                "MTP speculative decoding requires draftingTopK=1 because the MTP draft path is a linear chain.");
+            ELLM_CHECK(specConfig.verifySize == expectedVerifySize,
+                "MTP speculative decoding requires verifySize=draftingStep+1. Got verifySize="
+                    + std::to_string(specConfig.verifySize)
+                    + ", draftingStep=" + std::to_string(specConfig.draftingStep)
+                    + ", expected verifySize=" + std::to_string(expectedVerifySize) + ".");
+            ELLM_CHECK(specConfig.verifySize <= kMTPMaxVerifySizeForCurrentEagleUtilityKernels,
+                "MTP verifySize=" + std::to_string(specConfig.verifySize)
+                    + " exceeds the current MTP EAGLE utility kernel max depth of "
+                    + std::to_string(kMTPMaxVerifySizeForCurrentEagleUtilityKernels)
+                    + ". Extend eagleUtilKernels before using larger MTP verify sizes.");
+        }
+
         if (cfg.base.specDecodeType == SpecDecodeMode::kDFlash)
         {
             static constexpr int32_t kDFlashMaxVerifySize = 16;
