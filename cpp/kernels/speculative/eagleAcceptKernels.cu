@@ -250,6 +250,8 @@ __global__ void eagleAcceptKernel(int32_t const* top1Tokens, int32_t const* toke
 
         // Step 3: Parallel tree search with block-level reduction
         __shared__ int32_t nextTokenIdx;
+        // Finish prior iteration's reads of nextTokenIdx before re-initializing it.
+        __syncthreads();
         if (tid == 0)
         {
             nextTokenIdx = numTokens; // Initialize to invalid value
