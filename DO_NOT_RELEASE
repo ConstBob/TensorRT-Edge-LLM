@@ -1,0 +1,21 @@
+# GitLab-only release infrastructure.
+DO_NOT_RELEASE
+.gitlab/
+.gitlab-ci.yml
+CODEOWNERS
+sonar-project.properties
+
+# Internal notes and design documents.
+TODO.md
+TODOS.md
+todo.md
+todos.md
+AGENTS.local.md
+design/
+
+# Local/generated artifacts that must not leak into release staging.
+build/
+__pycache__/
+*.egg-info/
+*.pyc
+.pytest_cache/
