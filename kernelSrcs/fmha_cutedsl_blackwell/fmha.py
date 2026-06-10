@@ -1879,17 +1879,17 @@ class BlackwellFusedMultiHeadAttentionForward:
         """Predicated O tile store for packed-varlen sequence tails."""
         tidx, _, _ = cute.arch.thread_idx()
         lane_idx = tidx % self.threads_per_warp
-        tile_elems = self.epi_tile[0] * self.epi_tile[1]
-
-        for elem_idx in cutlass.range(
-            lane_idx, tile_elems, self.threads_per_warp, unroll=1
-        ):
-            row = elem_idx // self.epi_tile[1]
-            col = elem_idx - row * self.epi_tile[1]
-            global_row = row_start + row
-            if global_row < seqlen_q:
-                if col < self.head_dim:
-                    mO_gmem[global_row, col, head_coord] = sO[row, col, stage]
+        valid_rows = seqlen_q - row_start
+        if valid_rows > self.epi_tile[0]:
+            valid_rows = self.epi_tile[0]
+        if valid_rows > 0:
+            valid_elems = valid_rows * self.head_dim
+            for elem_idx in cutlass.range(
+                lane_idx, valid_elems, self.threads_per_warp, unroll=1
+            ):
+                row = elem_idx // self.head_dim
+                col = elem_idx - row * self.head_dim
+                mO_gmem[row_start + row, col, head_coord] = sO[row, col, stage]
 
     @cute.jit
     def softmax_step(
@@ -2032,6 +2032,11 @@ class BlackwellFusedMultiHeadAttentionForward:
         tTMEM_STORErS_x4_e_frg = cute.logical_divide(
             tTMEM_STORErS_x4_e, cute.make_layout(frg_tile)
         )
+        acc_scale_ = scale * (old_row_max - row_max_safe)
+        acc_scale = 1.0
+        if old_row_max != row_max_safe:
+            acc_scale = cute.math.exp2(acc_scale_, fastmath=True)
+        row_sum *= acc_scale
         for j in range(frg_cnt):
             for k in cutlass.range(
                 cute.size(tTMEM_LOADrS_frg, mode=[0]), vectorize=True
@@ -2044,6 +2049,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 )
 
             s_vec = tTMEM_LOADrS_frg[None, j].load()
+            row_sum = s_vec.reduce(cute.ReductionOp.ADD, row_sum, 0)
             tTMEM_STORErS_x4_e_frg[None, j].store(s_vec.to(self.q_dtype))
         # Sequence barrier arrive
         if cutlass.const_expr(stage == 0):
@@ -2056,36 +2062,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         si_handle.release()
 
         vec_i_handle = si_corr_producer.acquire_and_advance()
-        acc_scale_ = scale * (old_row_max - row_max_safe)
-        acc_scale = cute.math.exp2(acc_scale_, fastmath=True) * 0.5
-        row_sum *= acc_scale
-        local_row_sum_0 = (row_sum, row_sum)
-        local_row_sum_1 = (0.0, 0.0)
-        local_row_sum_2 = (0.0, 0.0)
-        local_row_sum_3 = (0.0, 0.0)
-
-        reduction_unroll = 4
-        frg_tile = cute.size(tTMEM_LOADrS) // reduction_unroll
-        tTMEM_LOADrS_frg = cute.logical_divide(tTMEM_LOADrS, cute.make_layout(frg_tile))
-
-        for j in cutlass.range_constexpr(0, cute.size(tTMEM_LOADrS_frg, mode=[0]), 2):
-            local_row_sum_0 = cute.arch.add_packed_f32x2(
-                local_row_sum_0, (tTMEM_LOADrS_frg[j, 0], tTMEM_LOADrS_frg[j + 1, 0])
-            )
-            local_row_sum_1 = cute.arch.add_packed_f32x2(
-                local_row_sum_1, (tTMEM_LOADrS_frg[j, 1], tTMEM_LOADrS_frg[j + 1, 1])
-            )
-            local_row_sum_2 = cute.arch.add_packed_f32x2(
-                local_row_sum_2, (tTMEM_LOADrS_frg[j, 2], tTMEM_LOADrS_frg[j + 1, 2])
-            )
-            local_row_sum_3 = cute.arch.add_packed_f32x2(
-                local_row_sum_3, (tTMEM_LOADrS_frg[j, 3], tTMEM_LOADrS_frg[j + 1, 3])
-            )
-
-        local_row_sum_0 = cute.arch.add_packed_f32x2(local_row_sum_0, local_row_sum_1)
-        local_row_sum_2 = cute.arch.add_packed_f32x2(local_row_sum_2, local_row_sum_3)
-        local_row_sum_0 = cute.arch.add_packed_f32x2(local_row_sum_0, local_row_sum_2)
-        row_sum = local_row_sum_0[0] + local_row_sum_0[1]
 
         return (
             row_max,
@@ -3019,6 +2995,7 @@ def run(
         # For the reference test, total_S = b * s_q, uniform lengths.
         _s = s_q if not isinstance(s_q, tuple) else max(s_q)
         total_S = b * _s
+        cu_seqlens_np = np.arange(b + 1, dtype=np.int32) * _s
 
         # Reshape Q, K, V from (B, S, H, D) → (total_S, H, D)
         q_vit_shape = (total_S, h_r * h_k, d)
@@ -3032,7 +3009,6 @@ def run(
         _, o_vit_tensor, o_vit_cp, *_ov = create_and_pad_tensor(
             q_vit_shape, (0, 0, 0, 0), out_dtype, is_dynamic_layout=True)
 
-        cu_seqlens_np = np.arange(b + 1, dtype=np.int32) * _s
         cu_seqlens_cp = cp.asarray(cu_seqlens_np)
         cu_seqlens = from_dlpack(cu_seqlens_cp, assumed_align=16)
 
@@ -3221,14 +3197,12 @@ def run(
             cute.testing.convert(o_vit_tensor, o_fp32_cute)
             o_result = o_fp32_cp.get()
 
-            cu_q_np = np.arange(b + 1, dtype=np.int32) * _s
-            cu_k_np = np.arange(b + 1, dtype=np.int32) * _s
             o_ref, _ = run_numpy_single_shot_reference_packed(
                 q_vit_ref,
                 k_vit_ref,
                 v_vit_ref,
-                cu_q_np,
-                cu_k_np,
+                cu_seqlens_np,
+                cu_seqlens_np,
                 scale_softmax=ref_scale_softmax,
                 scale_output=ref_scale_output,
                 is_causal=False,
