@@ -1062,12 +1062,33 @@ class TestConfig:
 
     def get_dflash_draft_model_dir(self) -> str:
         """Get DFlash draft checkpoint directory using draft_model_id."""
+        # Draft id "zlab" identifies the z-lab released DFlash drafts.
         MODEL_NAME_TO_DFLASH_DRAFT_MODELS_MAP = {
+            "Qwen3-4B-Instruct-2507": {
+                "zlab": "Qwen3-4B-DFlash-b16",
+            },
+            "Qwen3-8B": {
+                "zlab": "Qwen3-8B-DFlash-b16",
+            },
             "Qwen3.5-4B": {
                 "b16": "Qwen3.5-4B-DFlash",
             },
             "Qwen3.5-4B-NVFP4": {
                 "b16": "Qwen3.5-4B-DFlash-NVFP4",
+            },
+            "Qwen3.5-9B": {
+                "zlab": "Qwen3.5-9B-DFlash",
+            },
+            "Qwen3.5-27B": {
+                "zlab": "Qwen3.5-27B-DFlash",
+            },
+            # MoE models: NVFP4 base + FP16 DFlash draft, except
+            # Qwen3.5-35B-A3B which is currently supported as GPTQ-Int4 base.
+            "Qwen3.5-35B-A3B-GPTQ-Int4": {
+                "zlab": "Qwen3.5-35B-A3B-DFlash",
+            },
+            "Qwen3.6-35B-A3B-NVFP4": {
+                "zlab": "Qwen3.6-35B-A3B-DFlash",
             },
         }
 
