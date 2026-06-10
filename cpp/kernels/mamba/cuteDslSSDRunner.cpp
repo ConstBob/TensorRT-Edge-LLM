@@ -355,7 +355,7 @@ int CuteDslSSDRunner::runPrefill(SSDParams const& params, cudaStream_t stream)
         void* ws = params.workspace;                                                                                   \
         size_t offset = 0;                                                                                             \
                                                                                                                        \
-        /* cumsum / dt_proc / y_ws workspaces: [B, C, EH, ...] row-major. */                                          \
+        /* cumsum / dt_proc / y_ws workspaces: [1, C, EH, ...] row-major. */                                          \
         size_t cumsumBytes = static_cast<size_t>(1) * total_chunks * nheads * 128 * sizeof(float);                     \
         PREFIX##_Tensor_dA_cumsum_t cumsumTensor{};                                                                    \
         SET_4D_TENSOR(cumsumTensor, static_cast<char*>(ws) + offset, 1, total_chunks, nheads, 128);                    \
@@ -495,16 +495,18 @@ size_t CuteDslSSDRunner::getWorkspaceSize(
     size += static_cast<size_t>(batch) * sizeof(int32_t); // cl synth fallback when context_lengths is null
 
 #ifdef CUTE_DSL_SSD_BLACKWELL_ENABLED
+    int32_t const totalSeq = batch * seqLen;
+    int32_t const totalChunks = (totalSeq + 127) / 128;
     int32_t const logicalChunksPerSeqUpper = nchunks + ((seqLen % 128) == 0 ? 0 : 1);
-    // y_ws holds [B,C,EH,D,L] (L innermost: smem swizzle constraint); transposed post-kernel.
+    // y_ws holds [1,C,EH,D,L] in flattened Blackwell prefill (L innermost: smem swizzle constraint).
     size_t bwSize = 0;
-    bwSize += static_cast<size_t>(batch) * nchunks * nheads * 128 * sizeof(float);        // cumsum_delta
-    bwSize += static_cast<size_t>(batch) * nchunks * nheads * 128 * sizeof(__half);       // delta
-    bwSize += static_cast<size_t>(batch) * nchunks * nheads * dim * 128 * sizeof(__half); // y_ws
-    bwSize += static_cast<size_t>(batch) * seqLen * sizeof(int32_t);                      // seq_idx
-    bwSize += static_cast<size_t>(batch) * logicalChunksPerSeqUpper * sizeof(int32_t);    // chunk_indices
-    bwSize += static_cast<size_t>(batch) * logicalChunksPerSeqUpper * sizeof(int32_t);    // chunk_offsets
-    bwSize += static_cast<size_t>(batch + 1) * sizeof(int32_t);                           // seq_chunk_cumsum
+    bwSize += static_cast<size_t>(totalChunks) * nheads * 128 * sizeof(float);         // cumsum_delta
+    bwSize += static_cast<size_t>(totalChunks) * nheads * 128 * sizeof(__half);        // delta
+    bwSize += static_cast<size_t>(totalChunks) * nheads * dim * 128 * sizeof(__half);  // y_ws
+    bwSize += static_cast<size_t>(batch) * seqLen * sizeof(int32_t);                   // seq_idx
+    bwSize += static_cast<size_t>(batch) * logicalChunksPerSeqUpper * sizeof(int32_t); // chunk_indices
+    bwSize += static_cast<size_t>(batch) * logicalChunksPerSeqUpper * sizeof(int32_t); // chunk_offsets
+    bwSize += static_cast<size_t>(batch + 1) * sizeof(int32_t);                        // seq_chunk_cumsum
     bwSize += static_cast<size_t>(batch) * sizeof(int32_t); // valid_lens (synth fallback when context_lengths is null)
     size = std::max(size, bwSize);
 #endif
