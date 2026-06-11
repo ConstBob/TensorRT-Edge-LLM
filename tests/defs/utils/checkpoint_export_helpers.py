@@ -79,9 +79,11 @@ def get_export_model_dir(config: TestConfig) -> str:
 _OUTPUT_DIR_MAP = {
     # subdir_name: (target_dir_func, description)
     "visual":
-    (lambda cfg: cfg.get_visual_onnx_dir("fp16"), "fp16 visual encoder"),
+    (lambda cfg: cfg.get_visual_onnx_dir(cfg.visual_precision or "fp16"),
+     "visual encoder"),
     "audio":
-    (lambda cfg: cfg.get_audio_onnx_dir("fp16"), "fp16 audio encoder"),
+    (lambda cfg: cfg.get_audio_onnx_dir(cfg.audio_precision or "fp16"),
+     "audio encoder"),
     "code2wav":
     (lambda cfg: cfg.get_code2wav_onnx_dir("fp16"), "fp16 Code2Wav"),
     "action": (lambda cfg: cfg.get_action_onnx_dir(), "action expert"),
@@ -322,11 +324,7 @@ def run_tensorrt_edgellm_draft_export(config: TestConfig,
     is created). Otherwise uses the original torch draft checkpoint. The
     ONNX output is copied to ``config.get_draft_onnx_dir()``.
     """
-    if (config.draft_llm_precision and config.draft_llm_precision != "fp16"
-            and config.draft_llm_precision != "int4_gptq"):
-        draft_model_dir = config.get_quantized_draft_model_dir()
-    else:
-        draft_model_dir = config.get_draft_model_dir()
+    draft_model_dir = config.get_eagle_draft_checkpoint_dir()
 
     draft_onnx_dir = config.get_draft_onnx_dir()
     os.makedirs(draft_onnx_dir, exist_ok=True)

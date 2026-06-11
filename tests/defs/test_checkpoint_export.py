@@ -20,6 +20,7 @@ is placed in the same ONNX directory structure used by the standard export
 pipeline, so downstream engine build and inference tests can consume it.
 """
 
+import json
 import os
 import shutil
 import tempfile
@@ -29,8 +30,82 @@ from conftest import EnvironmentConfig
 from pytest_helpers import run_command, timer_context
 
 from .config import (DEFAULT_SEARCH_DEPTH, ModelType, TaskType, TestConfig,
-                     _find_directory)
-from .utils.command_generation import AVAILABLE_LORA_WEIGHTS
+                     _find_directory, strip_model_quant_suffixes)
+from .utils.command_generation import resolve_lora_model_name
+
+# --externalize-weights wiring. extw_<token> -> CLI kinds for
+# tensorrt_edgellm.scripts.export --externalize-weights.
+_EXTW_TOKEN_MAP = {
+    "ffn": ["int4_ffn"],
+    "lm": ["lm_head"],
+    "moe": ["int4_moe"],
+    "ffn_lm": ["int4_ffn", "lm_head"],
+    "all": ["all"],
+}
+
+_EXTW_FILE_BY_KIND = {
+    "int4_ffn": "external_int4_ffn_weights.safetensors",
+    "int4_moe": "external_int4_moe_weights.safetensors",
+    "lm_head": "external_lm_head_weight.safetensors",
+}
+
+
+def _extw_cli_kinds(extw_token):
+    """Resolve a test_param ``extw_<value>`` token to CLI kinds."""
+    if extw_token is None:
+        return []
+    try:
+        return list(_EXTW_TOKEN_MAP[extw_token])
+    except KeyError:
+        raise ValueError(
+            f"Unknown externalize_weights token 'extw_{extw_token}'. "
+            f"Valid: {sorted('extw_' + k for k in _EXTW_TOKEN_MAP)}")
+
+
+def _verify_externalized_outputs(out_dir, requested_cli_kinds):
+    """Assert externalization produced the expected safetensors + manifest.
+
+    ``all`` passes if at least one kind was externalized; explicit kinds must
+    each produce both a safetensors file and a config.json manifest entry.
+    """
+    if not requested_cli_kinds:
+        return
+    config_path = os.path.join(out_dir, "config.json")
+    if not os.path.isfile(config_path):
+        pytest.fail(
+            f"Externalize-weights check: missing config.json in {out_dir}")
+    with open(config_path) as f:
+        cfg = json.load(f)
+    manifest = cfg.get("external_weight_files") or []
+    manifest_files = {entry.get("file", "") for entry in manifest}
+    manifest_kinds = {entry.get("kind", "") for entry in manifest}
+
+    def _has(kind):
+        filename = _EXTW_FILE_BY_KIND[kind]
+        return (os.path.isfile(os.path.join(out_dir, filename))
+                and filename in manifest_files)
+
+    if "all" in requested_cli_kinds:
+        if any(_has(k) for k in _EXTW_FILE_BY_KIND):
+            return
+        pytest.fail(
+            f"--externalize-weights all produced no output in {out_dir}. "
+            f"Expected at least one of {sorted(_EXTW_FILE_BY_KIND)} on disk "
+            f"and in the config.json manifest. manifest={manifest!r}")
+
+    missing = []
+    for kind in requested_cli_kinds:
+        filename = _EXTW_FILE_BY_KIND[kind]
+        on_disk = os.path.isfile(os.path.join(out_dir, filename))
+        in_manifest = filename in manifest_files
+        if not (on_disk and in_manifest):
+            missing.append(
+                f"{kind}: file_on_disk={on_disk}, in_manifest={in_manifest}")
+    if missing:
+        pytest.fail(f"Externalize-weights check failed in {out_dir} "
+                    f"(requested={requested_cli_kinds}):\n" +
+                    "\n".join(f"  - {m}" for m in missing) +
+                    f"\n  manifest_kinds={sorted(manifest_kinds)}")
 
 
 def test_checkpoint_export(test_param: str, test_logger,
@@ -63,6 +138,10 @@ def test_checkpoint_export(test_param: str, test_logger,
             torch_dir,
             tmp_dir,
         ]
+
+        extw_kinds = _extw_cli_kinds(config.externalize_weights)
+        if extw_kinds:
+            export_cmd += ["--externalize-weights", *extw_kinds]
 
         env_vars = {}
         if config.trt_native_vit_attn:
@@ -108,14 +187,15 @@ def test_checkpoint_export(test_param: str, test_logger,
         # If the model also has a visual encoder output, move that too
         visual_output = os.path.join(tmp_dir, "visual")
         if os.path.isdir(visual_output):
-            visual_onnx_dir = config.get_visual_onnx_dir("fp16")
+            visual_onnx_dir = config.get_visual_onnx_dir(
+                config.visual_precision or "fp16")
             shutil.copytree(visual_output, visual_onnx_dir, dirs_exist_ok=True)
 
         # Same for audio encoder (ASR / Qwen3-Omni / Nemotron-Omni).
         audio_output = os.path.join(tmp_dir, "audio")
         if os.path.isdir(audio_output):
-            audio_onnx_dir = os.path.join(config.get_onnx_base_dir(),
-                                          "audio-fp16")
+            audio_onnx_dir = config.get_audio_onnx_dir(config.audio_precision
+                                                       or "fp16")
             shutil.copytree(audio_output, audio_onnx_dir, dirs_exist_ok=True)
 
         # Same for Qwen3-Omni Code2Wav vocoder.
@@ -126,6 +206,15 @@ def test_checkpoint_export(test_param: str, test_logger,
             shutil.copytree(code2wav_output,
                             code2wav_onnx_dir,
                             dirs_exist_ok=True)
+
+        # Alpamayo VLA action expert.
+        action_output = os.path.join(tmp_dir, "action")
+        if os.path.isdir(action_output):
+            shutil.copytree(action_output,
+                            config.get_action_onnx_dir(),
+                            dirs_exist_ok=True)
+
+        _verify_externalized_outputs(llm_onnx_dir, extw_kinds)
 
     finally:
         # Clean up temp directory
@@ -177,21 +266,15 @@ def test_checkpoint_eagle_export(test_param: str, test_logger,
         raise FileNotFoundError(
             f"Base model checkpoint not found: {base_torch_dir}")
 
-    # Locate pre-quantized draft model checkpoint
-    draft_torch_dir = config.get_draft_model_dir()
+    # Locate pre-quantized draft model checkpoint (hub name or local quant output)
+    draft_torch_dir = config.get_eagle_draft_checkpoint_dir()
     if not os.path.exists(draft_torch_dir):
         raise FileNotFoundError(
             f"Draft model checkpoint not found: {draft_torch_dir}")
 
-    # Strip quantization suffix from model_name so ONNX paths match downstream
-    # build/inference tests.  Export test params include the quantization type
-    # in the model name (e.g. "Qwen3-1.7B-NVFP4") to locate the pre-quantized
-    # checkpoint, but downstream tests use the base model name ("Qwen3-1.7B").
-    _QUANT_SUFFIXES = ("-NVFP4", "-FP8", "-FP8-KV", "-INT8-SQ", "-INT4-AWQ")
-    for suffix in _QUANT_SUFFIXES:
-        if config.model_name.endswith(suffix):
-            config.model_name = config.model_name[:-len(suffix)]
-            break
+    # Export params include quantized hub suffixes to locate the checkpoint, but
+    # downstream ONNX paths are keyed by the base model name.
+    config.model_name = strip_model_quant_suffixes(config.model_name)
 
     # Output directories
     llm_onnx_dir = config.get_llm_onnx_dir()
@@ -212,6 +295,9 @@ def test_checkpoint_eagle_export(test_param: str, test_logger,
             tmp_base,
             "--eagle-base",
         ]
+        extw_kinds = _extw_cli_kinds(config.externalize_weights)
+        if extw_kinds:
+            base_cmd += ["--externalize-weights", *extw_kinds]
         _run_checkpoint_export(
             base_cmd, 600, test_logger,
             f"Exporting EAGLE base {config.model_name} via the checkpoint exporter"
@@ -222,11 +308,13 @@ def test_checkpoint_eagle_export(test_param: str, test_logger,
         if not os.path.isdir(base_llm_out):
             pytest.fail(f"Base export did not produce llm/ in {tmp_base}")
         shutil.copytree(base_llm_out, llm_onnx_dir, dirs_exist_ok=True)
+        _verify_externalized_outputs(llm_onnx_dir, extw_kinds)
 
         # Copy visual encoder if present (VLM models)
         base_vis_out = os.path.join(tmp_base, "visual")
         if os.path.isdir(base_vis_out):
-            visual_onnx_dir = config.get_visual_onnx_dir("fp16")
+            visual_onnx_dir = config.get_visual_onnx_dir(
+                config.visual_precision or "fp16")
             shutil.copytree(base_vis_out, visual_onnx_dir, dirs_exist_ok=True)
 
         # --- Export draft model ---
@@ -237,6 +325,8 @@ def test_checkpoint_eagle_export(test_param: str, test_logger,
             draft_torch_dir,
             tmp_draft,
         ]
+        if extw_kinds:
+            draft_cmd += ["--externalize-weights", *extw_kinds]
         _run_checkpoint_export(
             draft_cmd, 600, test_logger,
             f"Exporting EAGLE draft {config.draft_model_id} via the checkpoint exporter"
@@ -247,6 +337,7 @@ def test_checkpoint_eagle_export(test_param: str, test_logger,
         if not os.path.isdir(draft_llm_out):
             pytest.fail(f"Draft export did not produce llm/ in {tmp_draft}")
         shutil.copytree(draft_llm_out, draft_onnx_dir, dirs_exist_ok=True)
+        _verify_externalized_outputs(draft_onnx_dir, extw_kinds)
 
     finally:
         shutil.rmtree(tmp_base, ignore_errors=True)
@@ -383,6 +474,10 @@ def test_checkpoint_mtp_export(test_param: str, test_logger,
             "--mtp",
         ]
 
+        extw_kinds = _extw_cli_kinds(config.externalize_weights)
+        if extw_kinds:
+            export_cmd += ["--externalize-weights", *extw_kinds]
+
         with timer_context(
                 f"Exporting MTP {config.model_name} via the checkpoint exporter",
                 test_logger):
@@ -399,11 +494,13 @@ def test_checkpoint_mtp_export(test_param: str, test_logger,
         if not os.path.isdir(llm_output):
             pytest.fail(f"MTP export did not produce llm/ in {tmp_dir}")
         shutil.copytree(llm_output, llm_onnx_dir, dirs_exist_ok=True)
+        _verify_externalized_outputs(llm_onnx_dir, extw_kinds)
 
         draft_output = os.path.join(tmp_dir, "mtp_draft")
         if not os.path.isdir(draft_output):
             pytest.fail(f"MTP export did not produce mtp_draft/ in {tmp_dir}")
         shutil.copytree(draft_output, draft_onnx_dir, dirs_exist_ok=True)
+        _verify_externalized_outputs(draft_onnx_dir, extw_kinds)
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -496,10 +593,9 @@ def test_checkpoint_lora_export(test_param: str, test_logger,
             pytest.fail("No LoRA weight inputs found in lora_model.onnx")
 
         # Step 3: Process LoRA adapter weights for runtime tests.
-        if config.model_name not in AVAILABLE_LORA_WEIGHTS:
+        lora_model_name = resolve_lora_model_name(config.model_name)
+        if lora_model_name is None:
             pytest.fail(f"No LoRA weights configured for {config.model_name}")
-
-        lora_model_name = AVAILABLE_LORA_WEIGHTS[config.model_name]
         data_dir = config.edgellm_data_dir or os.environ.get(
             "EDGELLM_DATA_DIR", "/scratch.edge_llm_cache")
         lora_weights_dir = _find_directory(data_dir, lora_model_name,

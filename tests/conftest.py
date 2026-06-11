@@ -320,6 +320,61 @@ def pytest_runtest_makereport(item, call):
 
 _test_config_cache = {}
 
+_MODEL_QUANTIZATION_TEST_NAMES = (
+    "test_llm_model_quantization",
+    "test_tts_model_quantization",
+    "test_vlm_model_quantization",
+    "test_asr_model_quantization",
+    "test_omni_model_quantization",
+)
+
+
+def _test_item_function_name(item):
+    return getattr(item, "originalname", item.name.split("[", 1)[0])
+
+
+def _preferred_model_quantization_test_name(test_param: str) -> str:
+    lower = test_param.lower()
+    if "omni" in lower:
+        return "test_omni_model_quantization"
+    if "asr" in lower:
+        return "test_asr_model_quantization"
+    if "tts" in lower:
+        return "test_tts_model_quantization"
+    vlm_hints = ("-vl-", "internvl", "multimodal", "cosmos", "vitfp8",
+                 "qwen3.5-", "qwen3.6-")
+    if any(hint in lower for hint in vlm_hints):
+        return "test_vlm_model_quantization"
+    return "test_llm_model_quantization"
+
+
+def _filter_direct_model_quantization_items(items):
+    groups = {}
+    for item in items:
+        test_name = _test_item_function_name(item)
+        if test_name not in _MODEL_QUANTIZATION_TEST_NAMES:
+            continue
+        callspec = getattr(item, "callspec", None)
+        if not callspec or "test_param" not in callspec.params:
+            continue
+        groups.setdefault(callspec.params["test_param"], []).append(item)
+
+    keep_ids = {id(item) for item in items}
+    for test_param, group in groups.items():
+        if len(group) <= 1:
+            continue
+        preferred_name = _preferred_model_quantization_test_name(test_param)
+        preferred_items = [
+            item for item in group
+            if _test_item_function_name(item) == preferred_name
+        ]
+        selected = preferred_items[0] if preferred_items else group[0]
+        for item in group:
+            if item is not selected:
+                keep_ids.discard(id(item))
+
+    items[:] = [item for item in items if id(item) in keep_ids]
+
 
 def _get_test_list_file(priority):
     """Get test configuration with caching"""
@@ -393,6 +448,7 @@ def pytest_collection_modifyitems(config, items):
     """Filter and reorder tests to strictly follow YAML declaration order"""
     # --test-param bypasses YAML filtering entirely
     if config.getoption("--test-param"):
+        _filter_direct_model_quantization_items(items)
         return
 
     priority = config.getoption("--priority", "l0")
