@@ -77,7 +77,12 @@ _NEMOTRON_OMNI_MODEL_TYPES: frozenset[str] = frozenset([
 # Maps model_type → internal family name
 _VISUAL_REGISTRY: dict[str, str] = {
     "qwen3_vl": "qwen3_vl",
-    "qwen3_omni": "qwen3_vl",
+    # Qwen3-Omni (dense and MoE) reuses Qwen3-VL's computation graph but
+    # uses HF Qwen3-Omni parameter naming (``thinker.visual.merger.ln_q``,
+    # ``mlp.0/2``, ``merger_list``).  Dispatch to a dedicated family that
+    # translates ckpt keys before delegating to build_qwen3_vl_visual.
+    "qwen3_omni": "qwen3_omni",
+    "qwen3_omni_moe": "qwen3_omni",
     "qwen3_5": "qwen3_5",
     "qwen3_5_moe": "qwen3_5",
     "qwen2_5_vl": "qwen2_5_vl",
@@ -93,6 +98,8 @@ _VISUAL_REGISTRY: dict[str, str] = {
 _VISUAL_FAMILY_MODULE: dict[str, str] = {
     "qwen3_vl":
     "tensorrt_edgellm.models.qwen3_vl.modeling_qwen3_vl_visual",
+    "qwen3_omni":
+    "tensorrt_edgellm.models.qwen3_omni.modeling_qwen3_omni_visual",
     "qwen3_5":
     "tensorrt_edgellm.models.qwen3_5.modeling_qwen3_5_visual",
     "qwen2_5_vl":
@@ -110,6 +117,7 @@ _VISUAL_FAMILY_MODULE: dict[str, str] = {
 # Maps family → build function name in that module
 _VISUAL_FAMILY_BUILD_FN: dict[str, str] = {
     "qwen3_vl": "build_qwen3_vl_visual",
+    "qwen3_omni": "build_qwen3_omni_visual",
     "qwen3_5": "build_qwen3_5_visual",
     "qwen2_5_vl": "build_qwen25_vl_visual",
     "internvl3": "build_internvl_visual",
@@ -126,6 +134,8 @@ _AUDIO_MODEL_TYPES: frozenset[str] = frozenset([
     "qwen3_asr",
     "qwen3_omni",
     "qwen3_omni_thinker",
+    "qwen3_omni_moe",
+    "qwen3_omni_moe_thinker",
     *_NEMOTRON_OMNI_MODEL_TYPES,
     # qwen3_tts intentionally excluded: Qwen3-TTS has NO audio encoder.
 ])
@@ -137,6 +147,8 @@ _AUDIO_KEY_PREFIX: dict[str, str] = {
     "qwen3_asr": "thinker.audio_tower.",
     "qwen3_omni": "thinker.audio_tower.",
     "qwen3_omni_thinker": "thinker.audio_tower.",
+    "qwen3_omni_moe": "thinker.audio_tower.",
+    "qwen3_omni_moe_thinker": "thinker.audio_tower.",
 }
 
 # ---------------------------------------------------------------------------
@@ -146,10 +158,10 @@ _AUDIO_KEY_PREFIX: dict[str, str] = {
 
 def _get_visual_config(model_type: str, config: dict) -> dict:
     """Extract visual encoder sub-config from the full model config."""
-    if model_type in ("qwen3_vl", "qwen3_omni", "qwen3_5", "qwen3_5_moe",
-                      "qwen2_5_vl"):
-        # Qwen3-Omni stores vision_config nested under thinker_config; other
-        # Qwen VL variants keep it at the root.
+    if model_type in ("qwen3_vl", "qwen3_omni", "qwen3_omni_moe", "qwen3_5",
+                      "qwen3_5_moe", "qwen2_5_vl"):
+        # Qwen3-Omni (dense + MoE) stores vision_config nested under
+        # thinker_config; other Qwen VL variants keep it at the root.
         return (config.get("vision_config")
                 or config.get("thinker_config", {}).get("vision_config")
                 or config)

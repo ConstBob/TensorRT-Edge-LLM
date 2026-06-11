@@ -1,0 +1,30 @@
+{
+    "model_path": "Qwen3-Omni",
+    "roles": {
+        "system": {
+            "prefix": "<|im_start|>system\n",
+            "suffix": "<|im_end|>\n"
+        },
+        "user": {
+            "prefix": "<|im_start|>user\n",
+            "suffix": "<|im_end|>\n"
+        },
+        "assistant": {
+            "prefix": "<|im_start|>assistant\n",
+            "suffix": "<|im_end|>\n"
+        }
+    },
+    "content_types": {
+        "audio": {
+            "format": "<|audio_pad|>"
+        },
+        "image": {
+            "format": "<|image_pad|>"
+        },
+        "video": {
+            "format": "<|video_pad|>"
+        }
+    },
+    "generation_prompt": "<|im_start|>assistant\n",
+    "default_system_prompt": ""
+}

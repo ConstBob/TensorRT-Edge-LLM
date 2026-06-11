@@ -44,6 +44,16 @@ _HARDCODED_TEMPLATE_MAP: Dict[str, str] = {
     "phi4_multimodal": "phi4mm.json",
     "qwen3_asr": "qwen3asr.json",
     "qwen3_tts": "qwen3tts.json",
+    # Qwen3-Omni family always uses ChatML; Jinja extraction is unreliable
+    # on standalone-export checkpoints (chat_template.json is not always
+    # reloaded by AutoTokenizer.from_pretrained after save_pretrained), so
+    # bypass extraction entirely and write the canonical ChatML template.
+    "qwen3_omni": "qwen3_omni.json",
+    "qwen3_omni_moe": "qwen3_omni.json",
+    "qwen3_omni_text": "qwen3_omni.json",
+    "qwen3_omni_talker": "qwen3_omni.json",
+    "qwen3_omni_moe_text": "qwen3_omni.json",
+    "qwen3_omni_moe_talker": "qwen3_omni.json",
 }
 
 
@@ -75,9 +85,23 @@ def _is_phi4mm_model(model_dir: str) -> bool:
     return root.get("model_type") in ("phi4mm", "phi4_multimodal")
 
 
+_QWEN3_OMNI_MODEL_TYPES = ("qwen3_omni", "qwen3_omni_moe")
+_QWEN3_OMNI_STANDALONE_MODEL_TYPES = ("qwen3_omni_text", "qwen3_omni_talker",
+                                      "qwen3_omni_moe_text",
+                                      "qwen3_omni_moe_talker")
+
+
 def _is_qwen3_omni_model(model_dir: str) -> bool:
     root = _load_root_config(model_dir)
-    return root.get("model_type") == "qwen3_omni"
+    return root.get("model_type") in _QWEN3_OMNI_MODEL_TYPES
+
+
+def _is_qwen3_omni_family_model(model_dir: str) -> bool:
+    root = _load_root_config(model_dir)
+    return root.get("model_type") in (
+        *_QWEN3_OMNI_MODEL_TYPES,
+        *_QWEN3_OMNI_STANDALONE_MODEL_TYPES,
+    )
 
 
 def _is_qwen3_asr_model(model_dir: str) -> bool:
@@ -492,7 +516,7 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
         # fall back to ``generation_prompt`` regardless of the
         # ``enableThinking`` flag (see tokenizer.h ChatTemplateConfig).
         # Result: Qwen3-Omni is immune to the flag at any layer of the stack.
-        if _is_qwen3_omni_model(model_dir):
+        if _is_qwen3_omni_family_model(model_dir):
             if generation_prompt_thinking is not None:
                 generation_prompt = generation_prompt_thinking
             generation_prompt_thinking = None
@@ -535,7 +559,8 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
                                                    placeholder_text)
                 if pattern:
                     content_types[ctype] = {"format": pattern}
-        elif _is_qwen3_omni_model(model_dir) or _is_qwen3_asr_model(model_dir):
+        elif _is_qwen3_omni_family_model(model_dir) or _is_qwen3_asr_model(
+                model_dir):
             content_types = {
                 "audio": {
                     "format": "<|audio_pad|>"

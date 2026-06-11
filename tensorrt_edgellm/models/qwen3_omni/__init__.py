@@ -18,6 +18,8 @@ from .modeling_qwen3_omni_audio import (Qwen3OmniAudioEncoder,
                                         build_qwen3_omni_audio)
 from .modeling_qwen3_omni_code2wav import (Code2WavModel, build_code2wav,
                                            export_code2wav_onnx)
+from .modeling_qwen3_omni_moe_talker import Qwen3OmniMoeTalkerCausalLM
+from .modeling_qwen3_omni_moe_text import Qwen3OmniMoeThinkerCausalLM
 from .modeling_qwen3_omni_text import Qwen3OmniLanguageModel
 from .modeling_qwen3_omni_visual import (Qwen3OmniVisualModel,
                                          build_qwen3_omni_visual)
@@ -28,6 +30,8 @@ __all__ = [
     "Qwen3OmniAudioEncoder",
     "build_qwen3_omni_audio",
     "Qwen3OmniLanguageModel",
+    "Qwen3OmniMoeThinkerCausalLM",
+    "Qwen3OmniMoeTalkerCausalLM",
     "Code2WavModel",
     "build_code2wav",
     "export_code2wav_onnx",

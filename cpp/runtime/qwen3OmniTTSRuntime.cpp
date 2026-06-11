@@ -418,6 +418,12 @@ bool Qwen3OmniTTSRuntime::validateAndFillConfig(std::string const& talkerEngineD
     // Speaker ID configuration
     mTalkerConfig.defaultSpeakerId = configJson.value("default_speaker_id", 2301);
 
+    // Thinker→Talker streaming uses this to route engine hidden_states from
+    // the Thinker portal into the Talker prefill. Standalone Qwen3-TTS Talker
+    // configs (no Thinker) legitimately omit the field; the streaming code
+    // path validates the value before use. Sentinel -1 means "unconfigured".
+    mTalkerConfig.acceptHiddenLayer = configJson.value("accept_hidden_layer", -1);
+
     // Load speaker ID mapping if available
     if (configJson.contains("speaker_id") && configJson["speaker_id"].is_object())
     {
@@ -2559,6 +2565,9 @@ bool Qwen3OmniTTSRuntime::handleStreamingGeneration(LLMInferenceRuntime& thinker
 
             kernel::invokeTalkerLogitAdjust(mSeenCodecTokensBuf, mTalkerLogits, mTalkerConfig.talkerVocabSize - 1024,
                 mTalkerConfig.talkerVocabSize, codecEosId, numSeenTokens, repetitionPenalty, stream);
+            // Streaming Talker runs at batch=1; size selectedIndices to match talkerSamplingParams
+            // (allocated at {maxBS, 1}, must be {1, 1} for the sampler's shape check).
+            check::check(mTalkerSelectedIndices.reshape({1, 1}), "Tensor reshape failed");
             trt_edgellm::topKtopPSamplingFromLogits(
                 mTalkerLogits, mTalkerSelectedIndices, talkerSamplingParams, mSamplingWorkspace, stream);
             CUDA_CHECK(cudaMemcpyAsync(mHostSelectedTokenIds.rawPointer(), mTalkerSelectedIndices.rawPointer(),
@@ -2633,6 +2642,13 @@ bool Qwen3OmniTTSRuntime::handleStreamingGeneration(LLMInferenceRuntime& thinker
 
     // ===== Run Thinker with the callback installed =====
     auto hiddenLayers = getThinkerHiddenLayerIndices();
+    if (hiddenLayers[1] < 0)
+    {
+        LOG_ERROR(
+            "Talker config is missing 'accept_hidden_layer'; Thinker->Talker streaming requires it to "
+            "match the layer index the Thinker engine emits on its hidden_states output.");
+        return false;
+    }
     thinkerRequest.generateAudio = true;
     thinkerRequest.acceptHiddenLayer = hiddenLayers[1];
     bool thinkerSuccess = thinkerRuntime.handleRequest(thinkerRequest, thinkerResponse, stream, true);
