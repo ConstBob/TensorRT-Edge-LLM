@@ -738,12 +738,12 @@ function(cute_dsl_setup)
     )
   endif()
 
-  # Warp-specialised NVFP4 GEMM variants (Tensor-Parallel
-  # FusedGemmAllReducePlugin backend). The umbrella CUTE_DSL_GEMM_NVFP4_ENABLED
-  # comes for free from the per-group loop (active when ``gemm_nvfp4`` is in
-  # metadata.json "groups"). Per-variant defines follow the
-  # CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_<OUT_DTYPE>_TN<N>_ENABLED pattern so the
-  # C++ runner can compile the FP16 path and the FP8 decode path independently.
+  # Warp-specialised NVFP4 GEMM variants. The umbrella
+  # CUTE_DSL_GEMM_NVFP4_ENABLED comes for free from the per-group loop (active
+  # when ``gemm_nvfp4`` is in metadata.json "groups"). Per-variant defines
+  # follow the CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_<OUT_DTYPE>_TN<N>_ENABLED
+  # pattern so callers can compile the FP16-output and FP8-output paths
+  # independently.
   list(FIND _variants "gemm_blackwell_nvfp4_ws_fp16_tn64"
        _gemm_bw_nvfp4_ws_fp16_tn64_idx)
   if(NOT ${_gemm_bw_nvfp4_ws_fp16_tn64_idx} EQUAL -1)

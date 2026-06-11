@@ -13,6 +13,12 @@ todos.md
 AGENTS.local.md
 design/
 
+# Internal release sanitizer policy and helpers.
+oss_release_manifest.json
+scripts/README.md
+scripts/check_oss_release_sanitizer.py
+scripts/strip_internal_release.py
+
 # Local/generated artifacts that must not leak into release staging.
 build/
 __pycache__/

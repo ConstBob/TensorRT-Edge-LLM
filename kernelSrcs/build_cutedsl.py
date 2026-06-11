@@ -829,15 +829,11 @@ KERNEL_VARIANTS = [
                      "--fused_epilogue", "bias", "--export_only"],
     ),
     # =====================================================================
-    # GEMM_NVFP4 group — Tensor-Parallel FusedGemmAllReducePlugin backend.
-    #
-    # Warp-specialised block-scaled NVFP4 GEMM on Blackwell
-    # (SM100/101/103/110), the NVFP4 GEMM backend for the row-parallel
-    # TP layers (o_proj, down_proj).  Each variant covers a single
-    # (mma_tiler_n) choice at sf_vec_size=16 (NVF4); MNK dims are
-    # dynamic at runtime.  SM110/Thor builds require the documented
-    # CuteDSL SM110 patches (see kernelSrcs/nvfp4_moe_cutedsl/README.md
-    # and .gitlab/ci/scripts/patch_fix_cutedsl_sm110.py).
+    # GEMM_NVFP4 group — warp-specialised block-scaled NVFP4 GEMM on
+    # Blackwell (SM100/101/103/110). Each variant covers a single
+    # (mma_tiler_n) choice at sf_vec_size=16 (NVF4); MNK dims are dynamic
+    # at runtime. SM110 builds require the documented CuteDSL SM110
+    # patches (see kernelSrcs/nvfp4_moe_cutedsl/README.md).
     #
     # The kernel body restructures load / MMA / store across separate
     # warp roles (epilog warps 0-3 + MMA warp 4 + TMA-load warp 5) to
@@ -873,9 +869,8 @@ KERNEL_VARIANTS = [
             "--export_only",
         ],
     ),
-    # tn256: larger N-tile for prefill throughput, combined with the
-    # persistent tile scheduler. N is always a multiple of 256 in the
-    # row-parallel layers.
+    # tn256: larger N-tile for high-throughput shapes, combined with the
+    # persistent tile scheduler.
     KernelVariant(
         name="gemm_blackwell_nvfp4_ws_fp16_tn256",
         group="gemm_nvfp4",
