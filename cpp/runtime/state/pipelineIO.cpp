@@ -78,6 +78,27 @@ void allocateMRope(PipelineIO& io, int32_t maxBatch, int32_t maxKVCacheCapacity,
         "PipelineIO::mropeCosSin");
 }
 
+void StreamingPrefillBuffers::populateFromPrefill(Tensor const& liveInputEmbeds, Tensor const& liveEngineHiddenStates,
+    int32_t batch, int32_t prefillLen, int32_t hiddenSize, int32_t maxBatch, int32_t maxSeq, cudaStream_t stream)
+{
+    auto const dtype = nvinfer1::DataType::kHALF;
+    if (inputEmbeds.isEmpty())
+    {
+        inputEmbeds = Tensor(
+            {maxBatch, maxSeq, hiddenSize}, DeviceType::kGPU, dtype, "PipelineIO::streamingPrefill.inputEmbeds");
+        engineHiddenStates = Tensor(
+            {maxBatch, maxSeq, hiddenSize}, DeviceType::kGPU, dtype, "PipelineIO::streamingPrefill.engineHiddenStates");
+    }
+    check::check(inputEmbeds.reshape({batch, prefillLen, hiddenSize}), "Tensor reshape failed");
+    check::check(engineHiddenStates.reshape({batch, prefillLen, hiddenSize}), "Tensor reshape failed");
+
+    size_t const bytes = static_cast<size_t>(batch) * prefillLen * hiddenSize * sizeof(__half);
+    CUDA_CHECK(cudaMemcpyAsync(
+        inputEmbeds.rawPointer(), liveInputEmbeds.rawPointer(), bytes, cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        engineHiddenStates.rawPointer(), liveEngineHiddenStates.rawPointer(), bytes, cudaMemcpyDeviceToDevice, stream));
+}
+
 void buildTensorMap(
     TensorMap& map, PipelineIO& io, SharedResources& res, LLMEngineConfig const& cfg, int32_t kvCacheIndex)
 {

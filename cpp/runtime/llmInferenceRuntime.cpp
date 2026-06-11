@@ -53,6 +53,29 @@ namespace
 constexpr int32_t kPrefillProfile{0};
 constexpr int32_t kDecodeProfile{1};
 
+//! Fires `context.onTokenGenerated` once per active slot using the most recent
+//! token in `tokenIds`. Called at the end of prefill (one token sampled per
+//! slot) and after every decode iteration so streaming consumers see every
+//! emitted token in order.
+inline void emitTokenCallbacks(rt::DecodingInferenceContext& context)
+{
+    if (!context.onTokenGenerated.has_value())
+    {
+        return;
+    }
+    auto const& callback = context.onTokenGenerated.value();
+    for (int32_t i = 0; i < context.activeBatchSize; ++i)
+    {
+        auto const& slotTokens = context.tokenIds[i];
+        if (slotTokens.empty())
+        {
+            continue;
+        }
+        bool const isFinished = context.finishedStates[i] != 0;
+        callback(rt::TokenCallbackInfo{slotTokens.back(), i, context.generationRound, isFinished});
+    }
+}
+
 } // namespace
 
 namespace rt
@@ -596,38 +619,22 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
         return false;
     }
 
-    // Populate the base-model hidden-states portal so consumers (Qwen3-Omni Talker via
-    // streaming callback or post-handleRequest sequential consumer) can fetch the buffers
-    // by layer index. See getBaseModelHiddenStates() / getBaseModelInputTokenIds() for the
-    // lifetime contract.
-    int32_t prefillSequenceLength = 0;
+    // Streaming consumers (e.g. the Qwen3-Omni Talker) run concurrently with
+    // the base model's decode loop and read the prefill-time input embeddings
+    // and engine hidden_states output. Copy both into `streamingPrefill`
+    // between prefill and the first decode step — the live PipelineIO buffers
+    // are reshaped to `{B, 1, H}` and overwritten by every decode iteration.
     if (outputThinkerEmbeddings)
     {
-        prefillSequenceLength
+        int32_t const prefillSequenceLength
             = *std::max_element(context.effectivePrefillLengths.begin(), context.effectivePrefillLengths.end());
-
-        // Layer 0: back up post-multimodal input embeddings before the decode loop reshapes
-        // mPipelineIO->inputsEmbeds to {BS,1,H} (scrambling the contiguous {BS,prefillLen,H} layout).
-        // The backup buffer lives on PipelineIO and is lazy-allocated at maxISL on first
-        // streaming request, then reshaped per request — see getBaseModelHiddenStates() lifetime contract.
-        rt::Tensor& prefillEmbedsBackup = mPipelineIO->prefillEmbedsBackup;
-        if (prefillEmbedsBackup.isEmpty())
-        {
-            prefillEmbedsBackup = rt::Tensor(
-                {mMaxRuntimeBatchSize, mDeployment.base.maxSupportedInputLength, mDeployment.base.hiddenSize},
-                rt::DeviceType::kGPU, DataType::kHALF, "PipelineIO::prefillEmbedsBackup");
-        }
-        check::check(prefillEmbedsBackup.reshape({activeBatchSize, prefillSequenceLength, mDeployment.base.hiddenSize}),
-            "Tensor reshape failed");
-        size_t const prefillBytes = static_cast<size_t>(activeBatchSize) * prefillSequenceLength
-            * mDeployment.base.hiddenSize * sizeof(__half);
-        CUDA_CHECK(cudaMemcpyAsync(prefillEmbedsBackup.rawPointer(), mPipelineIO->inputsEmbeds.rawPointer(),
-            prefillBytes, cudaMemcpyDeviceToDevice, stream));
-
+        mPipelineIO->streamingPrefill.populateFromPrefill(mPipelineIO->inputsEmbeds, mPipelineIO->outputHiddenStates,
+            activeBatchSize, prefillSequenceLength, mDeployment.base.hiddenSize, mMaxRuntimeBatchSize,
+            mDeployment.base.maxSupportedInputLength, stream);
         mLastPrefillLength = prefillSequenceLength;
         mLastInputTokenIds = context.rawBatchedInputIds;
-        mHiddenStatesRegistry[0] = &prefillEmbedsBackup;
-        // Layer N (acceptHiddenLayer) is registered after the engine-output reshape below.
+        mHiddenStatesRegistry[0] = &mPipelineIO->streamingPrefill.inputEmbeds;
+        mHiddenStatesRegistry[request.acceptHiddenLayer] = &mPipelineIO->streamingPrefill.engineHiddenStates;
     }
 
     // Lambda to check if all batches are finished
@@ -750,6 +757,8 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
         decodePerSlot(context, *mTokenizer);
         updateFinishStates();
         emitChunks(context);
+
+        emitTokenCallbacks(context);
         context.generationRound += 1;
 
         // Perform batch eviction if needed (after verification, before updating finish states)
@@ -892,17 +901,6 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
                 response.outputTrajectories[i] = std::move(trajectories[i]);
             }
         }
-    }
-
-    // Reshape engine-output hidden states to the actual prefill size and register layer N
-    // (acceptHiddenLayer) in the portal. The buffers live on PipelineIO; the registry
-    // here just records non-owning pointers consumers fetch via getBaseModelHiddenStates().
-    if (outputThinkerEmbeddings)
-    {
-        rt::Tensor& outputHiddenStates = mPipelineIO->outputHiddenStates;
-        check::check(outputHiddenStates.reshape({activeBatchSize, prefillSequenceLength, mDeployment.base.hiddenSize}),
-            "Tensor reshape failed");
-        mHiddenStatesRegistry[request.acceptHiddenLayer] = &outputHiddenStates;
     }
 
     return true;
@@ -1187,18 +1185,9 @@ bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context)
         {
             context.tokenIds[i].push_back(hostSelectedTokenIdsData[i]);
             context.currentGenerateLengths[i] += 1;
-
-            // Fire the per-token callback for the prefill-sampled token. runVanillaDecoding
-            // dispatches the callback for every decode token, so emitting here keeps the sequence
-            // complete for streaming consumers (e.g. the Qwen3-Omni Thinker-Talker pipeline).
-            if (context.onTokenGenerated.has_value())
-            {
-                bool const isFinished = context.finishedStates[i] != 0;
-                TokenCallbackInfo info{hostSelectedTokenIdsData[i], i, context.generationRound, isFinished};
-                context.onTokenGenerated.value()(info);
-            }
         }
     }
+    emitTokenCallbacks(context);
     return true;
 }
 

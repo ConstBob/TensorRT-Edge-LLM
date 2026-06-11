@@ -32,6 +32,28 @@ namespace trt_edgellm
 namespace rt
 {
 
+//! Persistent copies of the prefill-time input embeddings and engine
+//! hidden_states output, used by streaming consumers that run concurrently
+//! with the base model's decode loop.
+//!
+//! The base model's `inputsEmbeds` and `outputHiddenStates` tensors are
+//! reshaped to `{B, 1, H}` and overwritten by every decode step. This struct
+//! retains the `{B, prefillLen, H}` view as it stood at the end of prefill,
+//! so consumers reading these buffers do not race with decode writes.
+struct StreamingPrefillBuffers
+{
+    Tensor inputEmbeds;        //!< Prefill-time layer-0 input embeddings.
+    Tensor engineHiddenStates; //!< Prefill-time engine hidden_states output.
+
+    //! Allocate on first call (sized to the worst case `{maxBatch, maxSeq, hiddenSize}`),
+    //! reshape to the current request's `{batch, prefillLen, hiddenSize}`, and copy
+    //! from the live PipelineIO buffers on `stream`. Subsequent calls reuse the same
+    //! allocation. Must be invoked after prefill and before the first decode step on
+    //! the same stream so the copies precede any overwrite of `outputHiddenStates`.
+    void populateFromPrefill(Tensor const& liveInputEmbeds, Tensor const& liveEngineHiddenStates, int32_t batch,
+        int32_t prefillLen, int32_t hiddenSize, int32_t maxBatch, int32_t maxSeq, cudaStream_t stream);
+};
+
 //! All tensors flowing through the inference pipeline.
 //! POINTER STABILITY INVARIANT: After buildTensorMap() is called, this struct
 //! must not be moved, and deepstackEmbeds must not be resized. TensorMap holds
@@ -56,16 +78,16 @@ struct PipelineIO
     Tensor draftHiddenStatesIn;
     Tensor draftHiddenStatesOut;
 
-    // Streaming output (Qwen3-Omni Talker pipeline). For the vanilla
-    // LLM runtime the engine writes its layer-N hidden states into
-    // `outputHiddenStates`; the runtime exposes them through
-    // `LLMInferenceRuntime::getBaseModelHiddenStates(N)`.
-    // `prefillEmbedsBackup` snapshots layer-0 input embeddings before the decode
-    // loop reshapes `inputsEmbeds`; it is lazy-allocated on the first request that
-    // sets `outputThinkerEmbeddings`. SpecDecode configs reuse `baseHiddenStates`
-    // instead and leave these empty.
+    //! Engine hidden_states output. Used by the vanilla LLM path; SpecDecode
+    //! routes its hidden states through `baseHiddenStates` instead.
     Tensor outputHiddenStates;
-    Tensor prefillEmbedsBackup;
+
+    //! Per-request copies of `inputsEmbeds` / `outputHiddenStates` that
+    //! streaming consumers (e.g. the Qwen3-Omni Talker) read while the base
+    //! model's decode loop overwrites the live buffers. Populated by
+    //! `LLMInferenceRuntime` only when streaming output is enabled for the
+    //! request; otherwise the buffers stay empty (no allocation cost).
+    StreamingPrefillBuffers streamingPrefill;
 
     // SpecDecode engine-bound tensors (empty for vanilla LLM runtime).
     //! Packed proposal attention mask, [batch, proposalSize, divUp(proposalSize, 32)] INT32.

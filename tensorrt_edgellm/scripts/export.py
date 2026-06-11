@@ -96,6 +96,7 @@ _GEMMA4_MODEL_TYPES = frozenset([
 _VLM_MODEL_TYPES = frozenset([
     "qwen3_vl",
     "qwen3_omni",
+    "qwen3_omni_moe",
     "qwen3_5",
     "qwen3_5_moe",
     "qwen2_5_vl",
@@ -111,6 +112,8 @@ _AUDIO_MODEL_TYPES = frozenset([
     "qwen3_asr",
     "qwen3_omni",
     "qwen3_omni_thinker",
+    "qwen3_omni_moe",
+    "qwen3_omni_moe_thinker",
     *_NEMOTRON_OMNI_MODEL_TYPES,
     # qwen3_tts intentionally excluded: Qwen3-TTS has NO audio encoder.
     # Its Talker and CodePredictor are LLM decoders exported via the LLM pipeline.
@@ -125,6 +128,7 @@ _ASR_LLM_MODEL_TYPES = _AUDIO_MODEL_TYPES - _NEMOTRON_OMNI_MODEL_TYPES
 
 _CODE2WAV_MODEL_TYPES = frozenset([
     "qwen3_omni",
+    "qwen3_omni_moe",
     "qwen3_tts",
 ])
 
@@ -137,6 +141,7 @@ _ACTION_MODEL_TYPES = frozenset([
 _LLM_COMPONENTS: dict[str, frozenset[str]] = {
     "qwen3_tts": frozenset(["talker", "code_predictor"]),  # no thinker
     "qwen3_omni": frozenset(["thinker", "talker", "code_predictor"]),
+    "qwen3_omni_moe": frozenset(["thinker", "talker", "code_predictor"]),
 }
 _DEFAULT_LLM_COMPONENTS = frozenset(["thinker"])
 
@@ -525,6 +530,20 @@ def _export_llm(model_dir: str,
     key_remap = (_alpamayo_llm_key_remap
                  if model_type == "alpamayo_r1" else None)
 
+    # ModelOpt-quantized Qwen3-MoE / Qwen3-Omni-MoE checkpoints store per-expert
+    # weights under ``mlp.experts.experts.{j}.`` (Qwen3-Omni Thinker / Talker,
+    # ``_PerExpertLinears`` wraps an inner ``self.experts`` ModuleList) or
+    # ``mlp.experts.{j}.`` (bare Qwen3 MoE). The model wraps the per-expert
+    # ModuleList behind a private ``_experts`` attribute, so a one-segment
+    # insertion is required for the load to find the buffers. Without this
+    # remap the loader silently skips every expert weight, producing a Thinker
+    # engine ~3 GB (attention + norms only) instead of the expected ~17 GB.
+    if key_remap is None and model_type in ("qwen3_omni_moe_text",
+                                            "qwen3_omni_moe_talker",
+                                            "qwen3_omni_moe", "qwen3_moe"):
+        from ..models.qwen3_moe import MODELOPT_KEY_REMAP
+        key_remap = MODELOPT_KEY_REMAP
+
     if tp_size <= 1:
         ranks = [(0, 1)]
         out_paths = [os.path.join(llm_out_dir, "model.onnx")]
@@ -589,6 +608,16 @@ def _export_llm(model_dir: str,
     # (Qwen-VL / Nemotron-Omni).  Naming conventions vary across checkpoints
     # — see :func:`_patch_multimodal_token_ids` for the fallback chain.
     _patch_multimodal_token_ids(model_dir, llm_out_dir, model_type)
+
+    # Standalone Talker checkpoints route through ``_export_llm`` (not the
+    # qwen3_tts ``_export_talker``) because their model_type isn't in the
+    # ``_LLM_COMPONENTS`` Talker-dispatch map. They still need the TTS
+    # config fields (accept_hidden_layer, speaker_id, default_speaker_id,
+    # tts_*_token_id, codec_*_id) that runtime ``Qwen3OmniTTSRuntime``
+    # validates. Without these the engine config has nulls and the C++
+    # runtime falls back to wrong defaults → Talker doesn't EOS properly.
+    if model_type in ("qwen3_omni_moe_talker", "qwen3_omni_talker"):
+        _patch_tts_config(model_dir, llm_out_dir)
 
     logger.info("[LLM] Done: %s", output_path)
 
@@ -659,7 +688,15 @@ def _export_dflash_draft(model_dir: str, draft_out_dir: str,
 def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
                    config: dict, model_type: str, dtype: "torch.dtype",
                    model_config: "ModelConfig") -> None:
-    """Export visual encoder via from-scratch tensorrt_edgellm pipeline."""
+    """Export visual encoder via from-scratch tensorrt_edgellm pipeline.
+
+    For Qwen3-Omni-specific checkpoint-key translation (``thinker.visual.*``
+    to ``model.visual.*`` plus merger sub-module renames), see
+    :mod:`tensorrt_edgellm.models.qwen3_omni.modeling_qwen3_omni_visual`. That
+    family is registered in ``_VISUAL_REGISTRY`` for
+    ``qwen3_omni`` / ``qwen3_omni_moe`` model_types and runs the
+    remap inside its own ``build_qwen3_omni_visual``.
+    """
     os.makedirs(visual_out_dir, exist_ok=True)
     output_path = os.path.join(visual_out_dir, "model.onnx")
 
@@ -701,6 +738,9 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
         "internvl_chat": "internvl",
         "qwen3_5_moe": "qwen3_5",
         "qwen3_omni": "qwen3_omni_vision_encoder",
+        # MoE variant uses byte-identical visual encoder weights; reuse the
+        # same C++ runner enum the dense Qwen3-Omni visual engine registers.
+        "qwen3_omni_moe": "qwen3_omni_vision_encoder",
     }
     top_level_model_type = _VISUAL_MODEL_TYPE_MAP.get(model_type, model_type)
     vis_cfg_out: dict = {
@@ -713,8 +753,17 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
         # dense Qwen3.5, so normalize both locations to the registered tag.
         vis_cfg_out["vision_config"] = dict(vis_cfg_out["vision_config"])
         vis_cfg_out["vision_config"]["model_type"] = "qwen3_5"
-    if model_type in ("qwen2_5_vl", "qwen3_vl", "qwen3_omni", "qwen3_5",
-                      "qwen3_5_moe"):
+    if model_type == "qwen3_omni_moe":
+        # Same reason as qwen3_5_moe: nested ``vision_config.model_type``
+        # in HF Qwen3-Omni-MoE is ``qwen3_omni_moe_vision_encoder`` which
+        # the C++ visualBuilder enum doesn't recognise. Reuse the
+        # ``qwen3_omni_vision_encoder`` registration since the visual
+        # encoder is byte-identical between dense and MoE Qwen3-Omni.
+        vis_cfg_out["vision_config"] = dict(vis_cfg_out["vision_config"])
+        vis_cfg_out["vision_config"][
+            "model_type"] = "qwen3_omni_vision_encoder"
+    if model_type in ("qwen2_5_vl", "qwen3_vl", "qwen3_omni", "qwen3_omni_moe",
+                      "qwen3_5", "qwen3_5_moe"):
         # C++ QwenViTRunner reads these token IDs and rope_theta from config.json.
         # For Qwen3-VL the token IDs are at the root level, but vocab_size and
         # rope_theta live inside text_config.  Fall back to text_config for any
@@ -747,6 +796,23 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
         if _rope_scaling:
             vis_cfg_out["rope_scaling"] = normalize_rope_scaling_for_runtime(
                 _rope_scaling)
+        # HF Qwen3-Omni-MoE 30B-A3B-Instruct vision_config omits the
+        # ``num_position_embeddings`` field that QwenViTRunner reads, but
+        # ships ``image_size`` + ``patch_size`` from which it is unambiguously
+        # derivable. Inject the derived value into the on-disk config so the
+        # C++ runtime constructor (which reads from the engine config rather
+        # than re-deriving) does not throw a silent ``out_of_range`` exception
+        # during visual-runner load.
+        vc_out = vis_cfg_out.get("vision_config", {})
+        if isinstance(vc_out,
+                      dict) and "num_position_embeddings" not in vc_out:
+            _img = vc_out.get("image_size")
+            _pat = vc_out.get("patch_size")
+            if _img is not None and _pat:
+                _grid = int(_img) // int(_pat)
+                vc_out = dict(vc_out)
+                vc_out["num_position_embeddings"] = _grid * _grid
+                vis_cfg_out["vision_config"] = vc_out
     # Copy preprocessor_config.json to the visual output dir so the C++
     # runtime can find patch_size, image_mean, image_std, etc.  Applies to
     # every visual family (Qwen VL, InternVL, Phi-4mm) — the C++ visual
@@ -912,6 +978,7 @@ def _export_audio(model_dir: str,
         _AUDIO_MODEL_TYPE_MAP = {
             "qwen3_asr": "qwen3_asr_thinker",
             "qwen3_omni": "qwen3_omni_audio_encoder",
+            "qwen3_omni_moe": "qwen3_omni_audio_encoder",
         }
         audio_model_type = _AUDIO_MODEL_TYPE_MAP.get(model_type, model_type)
         audio_cfg_out = {
@@ -1171,57 +1238,66 @@ def _make_talker_sub_config(model_dir: str, sub_path) -> "ModelConfig":
 def _patch_tts_config(model_dir: str, out_dir: str) -> None:
     """Patch the exported config.json with TTS-specific fields.
 
-    Reads the root HF config and injects codec token IDs, TTS token IDs,
+    Reads the input config and injects codec token IDs, TTS token IDs,
     thinker_hidden_size, and speaker_id mapping into the already-written
     config.json in *out_dir*.
+
+    Accepts two input layouts:
+      * HF root config with nested ``talker_config`` (fields under sub-dict).
+      * Standalone Talker config from a prior quant export (fields at top
+        level, written by ``_write_standalone_talker_config``).
     """
     root_config = _load_config(model_dir)
-    talker_cfg = root_config.get("talker_config", {})
+    # ``or {}`` guards against explicit ``"talker_config": null`` in a
+    # standalone Talker config (where ``.get`` returns None, not {}).
+    talker_cfg = root_config.get("talker_config") or {}
+
+    def pick(key, *fallback_keys):
+        """Lookup *key* with fallback: talker_cfg -> root_config -> fallbacks."""
+        if key in talker_cfg:
+            return talker_cfg[key]
+        if key in root_config:
+            return root_config[key]
+        for fb in fallback_keys:
+            if fb in talker_cfg:
+                return talker_cfg[fb]
+            if fb in root_config:
+                return root_config[fb]
+        return None
 
     cfg_path = os.path.join(out_dir, "config.json")
     with open(cfg_path) as f:
         cfg = json.load(f)
 
-    # TTS token IDs (from root config)
-    for key in ("tts_pad_token_id", "tts_bos_token_id", "tts_eos_token_id"):
-        if key in root_config:
-            cfg[key] = root_config[key]
+    # TTS token IDs and Codec token IDs and runtime knobs:
+    # each lives at top level of the standalone Talker config OR under
+    # ``talker_config`` of the HF root config.
+    for key in ("tts_pad_token_id", "tts_bos_token_id", "tts_eos_token_id",
+                "codec_nothink_id", "codec_think_bos_id", "codec_think_eos_id",
+                "codec_pad_id", "codec_bos_id", "codec_eos_token_id",
+                "codec_think_id", "accept_hidden_layer", "num_code_groups"):
+        v = pick(key)
+        if v is not None:
+            cfg[key] = v
+
+    # tts_model_type (only present in root config, not talker_config).
     if "tts_model_type" in root_config:
         cfg["tts_model_type"] = root_config["tts_model_type"]
 
-    # Codec token IDs (from talker_config)
-    for key in ("codec_nothink_id", "codec_think_bos_id", "codec_think_eos_id",
-                "codec_pad_id", "codec_bos_id", "codec_eos_token_id",
-                "codec_think_id"):
-        if key in talker_cfg:
-            cfg[key] = talker_cfg[key]
+    # thinker_hidden_size (Qwen3-Omni) or text_hidden_size (Qwen3-TTS naming).
+    thinker_hs = pick("thinker_hidden_size", "text_hidden_size")
+    if thinker_hs is not None:
+        cfg["thinker_hidden_size"] = thinker_hs
 
-    # thinker_hidden_size and text_vocab_size
-    # Qwen3-Omni exposes ``thinker_hidden_size`` directly on talker_config;
-    # Qwen3-TTS uses ``text_hidden_size`` — accept either.
-    if "thinker_hidden_size" in talker_cfg:
-        cfg["thinker_hidden_size"] = talker_cfg["thinker_hidden_size"]
-    elif "text_hidden_size" in talker_cfg:
-        cfg["thinker_hidden_size"] = talker_cfg["text_hidden_size"]
-
-    # ``text_vocab_size`` is the *thinker*'s text vocabulary size (used by
-    # the talker to distinguish text tokens from codec tokens).  For
-    # Qwen3-TTS this lives at ``talker_config.text_vocab_size``; for
-    # Qwen3-Omni it lives at ``thinker_config.text_config.vocab_size``.
-    if "text_vocab_size" in talker_cfg:
-        cfg["text_vocab_size"] = talker_cfg["text_vocab_size"]
-    else:
+    # ``text_vocab_size`` is the thinker's text vocab; Qwen3-TTS exposes it
+    # on talker_config; Qwen3-Omni nests it under thinker_config.text_config.
+    tv = pick("text_vocab_size")
+    if tv is None:
         thinker_cfg = root_config.get("thinker_config", {}) or {}
         thinker_text = thinker_cfg.get("text_config", {}) or {}
         tv = thinker_text.get("vocab_size") or thinker_cfg.get("vocab_size")
-        if tv is not None:
-            cfg["text_vocab_size"] = tv
-
-    # Multi-stage talker runtime needs these; both families store them at
-    # the talker_config top level.
-    for key in ("accept_hidden_layer", "num_code_groups"):
-        if key in talker_cfg:
-            cfg[key] = talker_cfg[key]
+    if tv is not None:
+        cfg["text_vocab_size"] = tv
 
     # The Talker is a text-only decoder with no deepstack visual inputs.
     # Override the (potentially inherited) value from ModelConfig which may
@@ -1229,15 +1305,20 @@ def _patch_tts_config(model_dir: str, out_dir: str) -> None:
     # talker sub-config's model_type (``qwen3_omni_talker_text``).
     cfg["num_deepstack_features"] = 0
 
-    # Speaker ID mapping.  Qwen3-TTS stores the name→id dict under ``spk_id``,
-    # Qwen3-Omni under ``speaker_id`` (naming convention drift).  Accept
+    # Speaker ID mapping. Qwen3-TTS stores the name→id dict under ``spk_id``,
+    # Qwen3-Omni under ``speaker_id`` (naming convention drift). Accept
     # either; missing default_speaker_id causes TTS runtime to pick token 0
     # as speaker → Talker generates garbage / fails to emit codec EOS.
-    spk_map = talker_cfg.get("spk_id") or talker_cfg.get("speaker_id")
+    spk_map = pick("speaker_id", "spk_id")
     if isinstance(spk_map, dict) and spk_map:
         cfg["speaker_id"] = spk_map
         if "default_speaker_id" not in cfg:
             cfg["default_speaker_id"] = next(iter(spk_map.values()))
+    # Also propagate an explicit ``default_speaker_id`` if the input
+    # already had one (e.g. set by ``_write_standalone_talker_config``).
+    dsi = pick("default_speaker_id")
+    if dsi is not None and "default_speaker_id" not in cfg:
+        cfg["default_speaker_id"] = dsi
 
     with open(cfg_path, "w") as f:
         json.dump(cfg, f, indent=2)
@@ -1288,7 +1369,7 @@ def _export_talker(model_dir: str, llm_out_dir: str, model_type: str) -> None:
         from ..config import ModelConfig
         from ..models.qwen3_tts import TalkerCausalLM
 
-        if model_type == "qwen3_omni":
+        if model_type in ("qwen3_omni", "qwen3_omni_moe"):
             config = _make_talker_sub_config(model_dir,
                                              ["talker_config", "text_config"])
             extract_sidecars = _extract_omni_talker_sidecars
@@ -1331,6 +1412,7 @@ def _export_talker(model_dir: str, llm_out_dir: str, model_type: str) -> None:
 _CP_RUNTIME_MODEL_TYPE = {
     "qwen3_tts": "qwen3_tts_code_predictor",
     "qwen3_omni": "qwen3_omni_moe_talker_code_predictor",
+    "qwen3_omni_moe": "qwen3_omni_moe_talker_code_predictor",
 }
 
 
@@ -1656,6 +1738,14 @@ def _save_alpamayo_visual_processor(config: dict, visual_out_dir: str) -> None:
 
 
 def main() -> None:
+    # Some onnx-library code paths create the `model.onnx.data` external-data
+    # file via `open(path, 'wb')`, which applies the process umask to the
+    # file mode. Container images that ship with a restrictive umask (0o077)
+    # therefore produce 0o600 ONNX files that downstream engine-build hosts
+    # cannot read when the ONNX directory is mounted as a different user.
+    # Pin the umask to 0o022 so all exported artifacts come out world-readable.
+    os.umask(0o022)
+
     p = argparse.ArgumentParser(
         prog="tensorrt-edgellm-export",
         description=(
@@ -1695,6 +1785,16 @@ def main() -> None:
         "--skip-code2wav",
         action="store_true",
         help="Skip Code2Wav vocoder export.",
+    )
+    p.add_argument(
+        "--components",
+        default="",
+        help=
+        ("Comma-separated allow-list of components to export. Default (empty) "
+         "exports every component the checkpoint supports. Recognized values: "
+         "thinker, talker, code_predictor, visual, audio, code2wav, action. "
+         "Useful for re-running a single stage, e.g. "
+         "``--components code_predictor`` to refresh only the CodePredictor."),
     )
     p.add_argument(
         "--eagle-base",
@@ -1773,6 +1873,17 @@ def main() -> None:
             "When >1, exports per-rank LLM ONNX files named "
             "model_tp{N}_rank{R}.onnx (matching cpp/builder/llmBuilder.cpp)."),
     )
+    p.add_argument(
+        "--talker-sidecar-from",
+        "--talker_sidecar_from",
+        dest="talker_sidecar_from",
+        default="",
+        help=(
+            "HF root checkpoint from which to extract the Qwen3-Omni Talker "
+            "sidecars (hidden_projection, text_projection, codec embedding). "
+            "Used when exporting a standalone NVFP4 Talker checkpoint whose "
+            "model.safetensors omits these projection weights."),
+    )
     args = p.parse_args()
 
     model_dir = _resolve_model_dir(args.model)
@@ -1805,6 +1916,19 @@ def main() -> None:
     if args.mtp and not has_mtp_draft:
         p.error("--mtp was requested, but the checkpoint does not expose "
                 "MTP weights/config")
+
+    _VALID_COMPONENTS = {
+        "thinker", "talker", "code_predictor", "visual", "audio", "code2wav",
+        "action"
+    }
+    requested_components = {
+        c.strip()
+        for c in args.components.split(",") if c.strip()
+    }
+    unknown = requested_components - _VALID_COMPONENTS
+    if unknown:
+        p.error(f"--components contains unknown values {sorted(unknown)}; "
+                f"valid choices: {sorted(_VALID_COMPONENTS)}")
 
     # Load weights lazily — only needed when a weight-consuming exporter runs.
     _weights: dict = {}
@@ -1856,12 +1980,17 @@ def main() -> None:
                        dtype,
                        model_config=_get_model_config())
 
-    # Each stage is (enabled, component_name, exporter_callable).  Exporter
+    # `--components` is a per-component allow-list. An empty list (the default)
+    # means "no restriction": every component the checkpoint supports runs.
+    def _allow(component: str) -> bool:
+        return not requested_components or component in requested_components
+
+    # Each stage is (enabled, component_name, exporter_callable). Exporter
     # receives the computed output dir; the (enabled, component) columns also
     # drive both the pre-run log and the post-run summary below.
     stages = [
         (_has_llm_component(model_type, "thinker") and not args.skip_llm
-         and not _draft_only, "thinker",
+         and not _draft_only and _allow("thinker"), "thinker",
          lambda out: _export_llm(model_dir,
                                  out,
                                  model_type=model_type,
@@ -1878,27 +2007,28 @@ def main() -> None:
         (args.dflash_draft, "dflash_draft", lambda out: _export_dflash_draft(
             model_dir, out, args.dflash_draft_dir)),
         (_has_llm_component(model_type, "talker") and not args.skip_llm
-         and not _draft_only, "talker",
+         and not _draft_only and _allow("talker"), "talker",
          lambda out: _export_talker(model_dir, out, model_type)),
         (_has_llm_component(model_type, "code_predictor") and not args.skip_llm
-         and not _draft_only, "code_predictor",
+         and not _draft_only and _allow("code_predictor"), "code_predictor",
          lambda out: _export_code_predictor(model_dir, out, model_type)),
-        (_has_visual(model_type) and not args.skip_visual
-         and not _draft_only, "visual", _export_visual_component),
-        (_has_audio(model_type) and not args.skip_audio and not _draft_only,
-         "audio", lambda out: _export_audio(model_dir,
-                                            out,
-                                            _get_weights(),
-                                            config,
-                                            model_type,
-                                            dtype,
-                                            model_config=_get_model_config())),
+        (_has_visual(model_type) and not args.skip_visual and not _draft_only
+         and _allow("visual"), "visual", _export_visual_component),
+        (_has_audio(model_type) and not args.skip_audio and not _draft_only
+         and _allow("audio"), "audio",
+         lambda out: _export_audio(model_dir,
+                                   out,
+                                   _get_weights(),
+                                   config,
+                                   model_type,
+                                   dtype,
+                                   model_config=_get_model_config())),
         (_has_code2wav(model_type) and not args.skip_code2wav
-         and not _draft_only, "code2wav",
+         and not _draft_only and _allow("code2wav"), "code2wav",
          lambda out: _export_code2wav(model_dir, out, _get_code2wav_weights(),
                                       config, model_type, dtype)),
-        (_has_action(model_type) and not args.skip_action
-         and not _draft_only, "action", lambda out: _export_action(
+        (_has_action(model_type) and not args.skip_action and not _draft_only
+         and _allow("action"), "action", lambda out: _export_action(
              model_dir,
              out,
              _get_weights(),
@@ -1939,6 +2069,20 @@ def main() -> None:
             fn(
                 os.path.join(args.output_dir,
                              _layout_for(model_type, component)))
+
+    # Standalone NVFP4 Qwen3-Omni-MoE Talker checkpoints (model_type=
+    # ``qwen3_omni_moe_talker``) ship only the LLM backbone weights and
+    # codec_embedding; the hidden_projection / text_projection MLP weights
+    # live in the original HF root checkpoint. When ``--talker-sidecar-from``
+    # points at that HF root, extract those sidecars into the talker output
+    # so the C++ runtime can locate them next to the engine.
+    if args.talker_sidecar_from and model_type == "qwen3_omni_moe_talker":
+        talker_out = os.path.join(args.output_dir,
+                                  _layout_for(model_type, "thinker"))
+        if os.path.isdir(talker_out):
+            logger.info("[Talker-Omni] Extracting sidecars from %s into %s",
+                        args.talker_sidecar_from, talker_out)
+            _extract_omni_talker_sidecars(args.talker_sidecar_from, talker_out)
 
     # Summary
     _SIDECARS = ("embedding.safetensors", "ple_embedding.safetensors",

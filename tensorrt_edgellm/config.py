@@ -310,6 +310,23 @@ class ModelConfig:
     # hidden layers. Prefer ``vision_config.deepstack_visual_indexes`` length on
     # the root config when present; else ``num_deepstack_features`` or fallback.
     num_deepstack_features: int = 0
+    # ----------------------------------------- Qwen3-Omni emitted-tensor layer
+    # Read by the Qwen3-Omni-specific ``Transformer`` subclasses (dense and
+    # MoE) to decide which tensor to expose via ``emitted_hidden_states``
+    # (consumed by their ``CausalLM`` wrappers when
+    # ``emit_hidden_states = True``):
+    #
+    # * ``accept_hidden_layer >= 1`` (and ≤ num_hidden_layers): pre-norm
+    #   output of decoder layer ``accept_hidden_layer - 1``.  Matches HF's
+    #   ``outputs.hidden_states[k]`` convention where ``k`` denotes "after
+    #   ``k`` decoder layers" (k=0 is inputs_embeds, k=N is the last layer
+    #   pre-norm).  Used by Qwen3-Omni Thinker → Talker: Talker
+    #   consumes ``thinker.hidden_states[accept_hidden_layer]``.
+    #
+    # * Default ``-1``: post-final-norm output (= ``model.norm(last_layer)``).
+    #   Used by Qwen3-Omni Talker → CodePredictor: HF reads
+    #   ``hidden_states[0][-1]`` which resolves to the post-norm tensor.
+    accept_hidden_layer: int = -1
     # -------------------------------------------------- quantization config
     quant: QuantConfig = field(default_factory=QuantConfig)
     # ------------------------------------------ mamba / hybrid config
@@ -537,6 +554,8 @@ class ModelConfig:
             or 0)
         num_experts_per_tok = int(llm_dict.get("num_experts_per_tok", 0))
         moe_intermediate_size = int(llm_dict.get("moe_intermediate_size", 0))
+        # HF Qwen3-Omni MoE Talker uses the un-prefixed name; HF NemotronH /
+        # other MoE families use ``moe_shared_expert_intermediate_size``.
         moe_shared_expert_intermediate_size = int(
             llm_dict.get("moe_shared_expert_intermediate_size",
                          llm_dict.get("shared_expert_intermediate_size", 0))
@@ -593,6 +612,8 @@ class ModelConfig:
             dflash_base=bool(llm_dict.get("dflash_base", False)),
             num_deepstack_features=_parse_num_deepstack_features(
                 llm_dict, model_type, root_config=root),
+            accept_hidden_layer=_parse_accept_hidden_layer(llm_dict,
+                                                           root_config=root),
             draft_vocab_size=draft_vocab_size,
             target_hidden_size=target_hidden_size,
             num_experts=num_experts,
@@ -619,8 +640,23 @@ class ModelConfig:
 # ---------------------------------------------------------------------------
 
 # When HF omits ``deepstack_visual_indexes`` / ``num_deepstack_features``,
-# these model families still expect three visual deepstack injections.
-_DEEPSTACK_MODEL_TYPES = ("qwen3_vl", "qwen3_omni")
+# these model_types are known to expect three visual deepstack injections
+# at runtime (Thinker side only). Listed explicitly — substring matching
+# (``"qwen3_omni" in "qwen3_omni_moe_talker"``) would otherwise mis-classify
+# Talker / CodePredictor configs as deepstack producers and bake 3 dangling
+# input ports into their engines.
+_DEEPSTACK_MODEL_TYPES = frozenset({
+    # HF root configs that wrap a deepstack-emitting visual encoder
+    "qwen3_vl",
+    "qwen3_omni",
+    "qwen3_omni_moe",
+    # Standalone Thinker text-LLM configs (after quant export); the Thinker
+    # still consumes deepstack inputs from the separately exported visual
+    # encoder at runtime.
+    "qwen3_vl_text",
+    "qwen3_omni_text",
+    "qwen3_omni_moe_text",
+})
 
 
 def make_mtp_draft_config(base_config: ModelConfig) -> ModelConfig:
@@ -762,10 +798,42 @@ def _parse_num_deepstack_features(
                 return len(indexes)
 
     root_mt = (root_config or {}).get("model_type") or ""
-    merged = f"{model_type} {root_mt}"
-    if any(t in merged for t in _DEEPSTACK_MODEL_TYPES):
+    if model_type in _DEEPSTACK_MODEL_TYPES or root_mt in _DEEPSTACK_MODEL_TYPES:
         return 3
     return 0
+
+
+def _parse_accept_hidden_layer(
+    config: dict,
+    *,
+    root_config: Optional[Dict[str, Any]] = None,
+) -> int:
+    """Return ``accept_hidden_layer`` (Thinker decoder layer count whose output
+    is handed off to the Qwen3-Omni Talker), or -1 when not applicable.
+
+    Lookup order:
+      1. ``accept_hidden_layer`` at the LLM (text) dict top level.  This is
+         the layout written by the standalone-Thinker quant export, which
+         promotes the field out of ``talker_config`` into the Thinker root.
+      2. ``root_config["talker_config"]["accept_hidden_layer"]`` for the
+         full multimodal HF config (dense Qwen3-Omni or MoE root layout).
+      3. ``root_config["accept_hidden_layer"]`` as a defensive fallback for
+         standalone Talker checkpoints where this field already lives at
+         root.
+    """
+    raw = config.get("accept_hidden_layer")
+    if raw is not None:
+        return int(raw)
+    if root_config is not None:
+        talker_cfg = root_config.get("talker_config")
+        if isinstance(talker_cfg, dict):
+            raw = talker_cfg.get("accept_hidden_layer")
+            if raw is not None:
+                return int(raw)
+        raw = root_config.get("accept_hidden_layer")
+        if raw is not None:
+            return int(raw)
+    return -1
 
 
 def _validate_mtp_constraints(

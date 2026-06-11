@@ -161,12 +161,14 @@ public:
     };
 
     /*!
-     * @brief Get required hidden state layer indices from thinker
-     * @return Vector containing {0} for layer 0 (embed) and {14} for accept_hidden_layer
+     * @brief Hidden-state layer indices the Talker reads from the Thinker
+     *        portal. Layer 0 is the input embedding; the second index is the
+     *        decoder layer whose pre-norm hidden_states the Talker consumes,
+     *        sourced from the Talker config's ``accept_hidden_layer`` field.
      */
     std::vector<int32_t> getThinkerHiddenLayerIndices() const
     {
-        return {0, 14};
+        return {0, mTalkerConfig.acceptHiddenLayer};
     }
 
     /*!
@@ -517,6 +519,14 @@ private:
 
         // Speaker configuration (read from config)
         int32_t defaultSpeakerId{}; //!< Default speaker ID (e.g., 2301 for f245)
+
+        //! Decoder layer index whose pre-norm hidden_states the Talker
+        //! consumes from the Thinker, copied from the Talker config's
+        //! `accept_hidden_layer` field. Must match the layer the Thinker
+        //! engine was exported to emit on its `hidden_states` output.
+        //! Sentinel -1 means "unconfigured" — standalone TTS configs with
+        //! no Thinker leave this unset and never invoke the streaming path.
+        int32_t acceptHiddenLayer{-1};
     };
 
     // ========== Configuration and Initialization ==========
