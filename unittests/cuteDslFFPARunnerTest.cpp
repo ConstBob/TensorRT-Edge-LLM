@@ -109,7 +109,8 @@ struct ShapeParam
 {
     int32_t batchSize;
     int32_t seqLen;
-    int32_t numHeads;
+    int32_t numQHeads;
+    int32_t numKVHeads; // == numQHeads for MHA; < numQHeads for GQA/MQA (must divide numQHeads)
     bool useNormalInit;
     char const* name;
 };
@@ -117,12 +118,16 @@ struct ShapeParam
 void runAccuracyCase(ShapeParam const& p, cudaStream_t stream)
 {
     int32_t constexpr kHeadDim = 512;
-    rt::Coords const shape{p.batchSize, p.seqLen, p.numHeads, kHeadDim};
-    rt::Tensor q(shape, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor k(shape, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor v(shape, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor output(shape, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor outputReference(shape, rt::DeviceType::kGPU, DataType::kHALF);
+    // Q / O carry the full Q-head count; K / V carry the (possibly smaller) KV-head
+    // count.  The FP32 BSHD reference maps q_head -> kv_head as q_head * Hkv / Hq,
+    // which matches the kernel's q_head // (Hq / Hkv) when Hq % Hkv == 0.
+    rt::Coords const qShape{p.batchSize, p.seqLen, p.numQHeads, kHeadDim};
+    rt::Coords const kvShape{p.batchSize, p.seqLen, p.numKVHeads, kHeadDim};
+    rt::Tensor q(qShape, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor k(kvShape, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor v(kvShape, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor output(qShape, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor outputReference(qShape, rt::DeviceType::kGPU, DataType::kHALF);
 
     if (p.useNormalInit)
     {
@@ -147,8 +152,8 @@ void runAccuracyCase(ShapeParam const& p, cudaStream_t stream)
     params.batchSize = p.batchSize;
     params.seqlenQ = p.seqLen;
     params.seqlenK = p.seqLen;
-    params.numQHeads = p.numHeads;
-    params.numKVHeads = p.numHeads;
+    params.numQHeads = p.numQHeads;
+    params.numKVHeads = p.numKVHeads;
     params.headDim = kHeadDim;
     params.softmaxScale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
 
@@ -202,15 +207,26 @@ TEST_P(CuteDslFFPAAccuracySweep, Causal)
 }
 
 INSTANTIATE_TEST_SUITE_P(FP16Causal, CuteDslFFPAAccuracySweep,
-    ::testing::Values(ShapeParam{1, 16, 1, /*useNormalInit=*/false, "B1_S16_H1"},
-        ShapeParam{2, 24, 2, /*useNormalInit=*/false, "B2_S24_H2"},
-        ShapeParam{1, 8, 1, /*useNormalInit=*/true, "sub_Bc"}, ShapeParam{1, 16, 4, /*useNormalInit=*/true, "eq_Bc"},
-        ShapeParam{1, 64, 8, /*useNormalInit=*/true, "eq_Br"},
-        ShapeParam{1, 128, 8, /*useNormalInit=*/true, "multi_block_M"},
-        ShapeParam{1, 130, 4, /*useNormalInit=*/true, "multi_block_M_unaligned"},
-        ShapeParam{1, 1024, 8, /*useNormalInit=*/true, "llm_1k"},
-        ShapeParam{1, 2048, 8, /*useNormalInit=*/true, "llm_2k"},
-        ShapeParam{4, 256, 4, /*useNormalInit=*/true, "batch"}),
+    ::testing::Values(
+        // --- MHA (numKVHeads == numQHeads) ---
+        ShapeParam{1, 16, 1, 1, /*useNormalInit=*/false, "B1_S16_H1"},
+        ShapeParam{2, 24, 2, 2, /*useNormalInit=*/false, "B2_S24_H2"},
+        ShapeParam{1, 8, 1, 1, /*useNormalInit=*/true, "sub_Bc"},
+        ShapeParam{1, 16, 4, 4, /*useNormalInit=*/true, "eq_Bc"},
+        ShapeParam{1, 64, 8, 8, /*useNormalInit=*/true, "eq_Br"},
+        ShapeParam{1, 128, 8, 8, /*useNormalInit=*/true, "multi_block_M"},
+        ShapeParam{1, 130, 4, 4, /*useNormalInit=*/true, "multi_block_M_unaligned"},
+        ShapeParam{1, 1024, 8, 8, /*useNormalInit=*/true, "llm_1k"},
+        ShapeParam{1, 2048, 8, 8, /*useNormalInit=*/true, "llm_2k"},
+        ShapeParam{4, 256, 4, 4, /*useNormalInit=*/true, "batch"},
+        // --- GQA group size 4 (the primary target: H_q / H_kv == 4) ---
+        ShapeParam{1, 128, 8, 2, /*useNormalInit=*/true, "gqa_g4_H8_KV2"},
+        ShapeParam{1, 1024, 8, 2, /*useNormalInit=*/true, "gqa_g4_H8_KV2_1k"},
+        ShapeParam{2, 256, 8, 2, /*useNormalInit=*/true, "gqa_g4_H8_KV2_batch"},
+        // --- Other GQA / MQA group sizes for coverage ---
+        ShapeParam{1, 128, 8, 4, /*useNormalInit=*/true, "gqa_g2_H8_KV4"},
+        ShapeParam{1, 256, 4, 1, /*useNormalInit=*/true, "mqa_g4_H4_KV1"},
+        ShapeParam{1, 1024, 8, 1, /*useNormalInit=*/true, "mqa_H8_KV1_1k"}),
     [](::testing::TestParamInfo<ShapeParam> const& info) { return std::string{info.param.name}; });
 
 class CuteDslFFPACausalProperty : public CuteDslFFPABase
@@ -341,12 +357,12 @@ TEST_F(CuteDslFFPANegativePath, RejectsUnsupportedHeadDim)
     CUDA_CHECK(cudaFree(dummy));
 }
 
-// Runtime guard: numQHeads != numKVHeads (GQA/MQA) must be rejected; this kernel is
-// MHA-only in the AOT registry.  The Python kernel itself supports kv_group_size > 1
-// (see fmha.py FFPAFmhaAmpere.__init__), but the registry only exports the MHA path.
-// This test pins the runner's MHA-only stance — don't remove the guard without also
-// adding GQA variants to the AOT registry.
-TEST_F(CuteDslFFPANegativePath, RejectsKvGroupMismatch)
+// Runtime guard: GQA is supported (num_kv_heads is a runtime kernel argument), but
+// the Q heads must partition evenly across the K/V heads.  numQHeads % numKVHeads != 0
+// (here 8 % 3) has no valid group size and must be rejected before any kernel launch.
+// Note: numQHeads != numKVHeads on its own is *not* an error anymore — see the GQA
+// cases in CuteDslFFPAAccuracySweep, which exercise the divisible path end-to-end.
+TEST_F(CuteDslFFPANegativePath, RejectsIndivisibleKvHeads)
 {
     void* dummy = nullptr;
     CUDA_CHECK(cudaMalloc(&dummy, 16));
@@ -360,7 +376,7 @@ TEST_F(CuteDslFFPANegativePath, RejectsKvGroupMismatch)
     params.seqlenQ = 16;
     params.seqlenK = 16;
     params.numQHeads = 8;
-    params.numKVHeads = 2; // != numQHeads — GQA, not MHA
+    params.numKVHeads = 3; // 8 % 3 != 0 — no integer GQA group size
     params.headDim = 512;
     params.softmaxScale = 1.0F / std::sqrt(512.0F);
 

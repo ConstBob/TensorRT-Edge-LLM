@@ -114,9 +114,14 @@ int CuteDslFFPARunner::run(CuteDslFFPAParams const& params, cudaStream_t stream)
         return -1;
     }
 
-    if (params.numQHeads != params.numKVHeads)
+    // GQA: the kernel takes num_kv_heads as a runtime argument and derives the
+    // group size as numQHeads / numKVHeads internally, so a single AOT kernel
+    // serves MHA (numKVHeads == numQHeads) and any GQA group size.  The only
+    // constraint is that Q heads partition evenly across K/V heads.
+    if (params.numQHeads % params.numKVHeads != 0)
     {
-        LOG_ERROR("FFPA d512 causal CuTe DSL kernel only supports kv_group_size=1.");
+        LOG_ERROR("FFPA d512 causal CuTe DSL kernel requires numQHeads (%d) to be divisible by numKVHeads (%d).",
+            params.numQHeads, params.numKVHeads);
         return -1;
     }
 
@@ -167,7 +172,7 @@ int CuteDslFFPARunner::run(CuteDslFFPAParams const& params, cudaStream_t stream)
     oTensor.dynamic_strides[1] = qStrideSeq;
 
     return cute_dsl_ffpa_d512_causal_wrapper(
-        &sD512CausalModule, &qTensor, &kTensor, &vTensor, &oTensor, softmaxScale, stream);
+        &sD512CausalModule, &qTensor, &kTensor, &vTensor, &oTensor, softmaxScale, params.numKVHeads, stream);
 }
 
 } // namespace trt_edgellm
