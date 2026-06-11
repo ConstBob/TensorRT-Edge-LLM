@@ -496,5 +496,157 @@ void launchApplyRopeWriteKVSplitQKV(rt::Tensor const& cosSinCache, rt::Tensor co
     }
 }
 
+// =============================================================================
+// Q-only RoPE kernel for shared-KV layers (no KV cache write)
+// =============================================================================
+
+template <typename T>
+__global__ void applyRopeQOnlyKernel(T* __restrict__ q, float const* __restrict__ cosSinCache,
+    int32_t const* __restrict__ kvCacheEndLens, int32_t qSeqLen, int32_t totalNumTokens, uint32_t numQHead,
+    uint32_t headDim, uint32_t rotaryDim, int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen)
+{
+    // Grid: (ceil(totalTokens / tokensPerCTA), numQHead)
+    // Block: (headDim / vec_size, tokensPerCTA)
+    uint32_t const tIdx = threadIdx.x;
+    uint32_t const tIdy = threadIdx.y;
+    uint32_t const tokenIdx = blockIdx.x * blockDim.y + tIdy;
+
+    if (tokenIdx >= totalNumTokens)
+    {
+        return;
+    }
+
+    int32_t const batchIdx = tokenIdx / qSeqLen;
+    int32_t const posStartId = kvCacheEndLens[batchIdx] - qSeqLen;
+    int32_t const sinCosCachePos = posStartId + tokenIdx % qSeqLen;
+
+    // Load cos/sin
+    uint32_t const sinOffset = rotaryDim / 2;
+    uint32_t const cosOffset = (tIdx * DVec<float>::vec_size) % (rotaryDim / 2);
+    int32_t const cosSinCacheBatchIdx = (cosSinCacheBatchSize == 1) ? 0 : batchIdx;
+    int32_t const cosSinCacheOffset = cosSinCacheBatchIdx * cosSinCacheSeqLen * rotaryDim + sinCosCachePos * rotaryDim;
+    DVec<float> cosVec;
+    DVec<float> sinVec;
+    cosVec.load(cosSinCache + cosSinCacheOffset + cosOffset);
+    sinVec.load(cosSinCache + cosSinCacheOffset + cosOffset + sinOffset);
+
+    // Apply RoPE to Q head
+    uint32_t const qHeadIdx = blockIdx.y;
+    int32_t const qOffset = tokenIdx * numQHead * headDim + qHeadIdx * headDim;
+    T* qPtr = q + qOffset;
+    DVec<T> qRoped = vecApplyRopeNonInterleave(qPtr, cosVec, sinVec, rotaryDim);
+    qRoped.store(qPtr + DVec<T>::vec_size * tIdx);
+}
+
+void launchApplyRopeQOnly(
+    rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens, rt::Tensor& q, cudaStream_t stream)
+{
+    constexpr uint32_t kVEC_SIZE = DVec<half>::vec_size;
+    constexpr uint32_t kTHREADS_PER_CTA = 128;
+
+    uint32_t const runtimeBatchSize = static_cast<uint32_t>(q.getShape()[0]);
+    uint32_t const runtimeSeqLen = static_cast<uint32_t>(q.getShape()[1]);
+    uint32_t const numQHeads = static_cast<uint32_t>(q.getShape()[2]);
+    uint32_t const headDim = static_cast<uint32_t>(q.getShape()[3]);
+    uint32_t const totalNumTokens = runtimeBatchSize * runtimeSeqLen;
+
+    uint32_t const cosSinCacheBatchSize = static_cast<uint32_t>(cosSinCache.getShape()[0]);
+    uint32_t const cosSinCacheSeqLen = static_cast<uint32_t>(cosSinCache.getShape()[1]);
+    uint32_t const rotaryDim = static_cast<uint32_t>(cosSinCache.getShape()[2]);
+
+    half* qPtr = q.dataPointer<half>();
+    float const* cosSinCachePtr = cosSinCache.dataPointer<float>();
+    int32_t const* kvCacheEndLensPtr = kvCacheEndLens.dataPointer<int32_t>();
+
+    uint32_t const tokenPerCTA = kTHREADS_PER_CTA * kVEC_SIZE / headDim;
+    uint32_t const bDimX = headDim / kVEC_SIZE;
+    uint32_t const bDimY = tokenPerCTA;
+    uint32_t const gDimX = (totalNumTokens + tokenPerCTA - 1) / tokenPerCTA;
+    uint32_t const gDimY = numQHeads; // Q heads only — no KV threads
+
+    dim3 grid(gDimX, gDimY);
+    dim3 block(bDimX, bDimY);
+
+    applyRopeQOnlyKernel<half><<<grid, block, 0, stream>>>(qPtr, cosSinCachePtr, kvCacheEndLensPtr, runtimeSeqLen,
+        totalNumTokens, numQHeads, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen);
+}
+
+// =============================================================================
+// Q-only RoPE kernel for shared-KV layers with tree decoding (per-token position IDs)
+// =============================================================================
+
+template <typename T>
+__global__ void applyRopeQOnlyTreeDecodingKernel(T* __restrict__ q, float const* __restrict__ cosSinCache,
+    int32_t const* __restrict__ tokenPosIds, int32_t qSeqLen, int32_t totalNumTokens, uint32_t numQHead,
+    uint32_t headDim, uint32_t rotaryDim, int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen)
+{
+    // Grid: (ceil(totalTokens / tokensPerCTA), numQHead)
+    // Block: (headDim / vec_size, tokensPerCTA)
+    uint32_t const tIdx = threadIdx.x;
+    uint32_t const tIdy = threadIdx.y;
+    uint32_t const tokenIdx = blockIdx.x * blockDim.y + tIdy;
+
+    if (tokenIdx >= totalNumTokens)
+    {
+        return;
+    }
+
+    int32_t const batchIdx = tokenIdx / qSeqLen;
+    int32_t const sinCosCachePos = tokenPosIds[tokenIdx];
+
+    // Load cos/sin
+    uint32_t const sinOffset = rotaryDim / 2;
+    uint32_t const cosOffset = (tIdx * DVec<float>::vec_size) % (rotaryDim / 2);
+    int32_t const cosSinCacheBatchIdx = (cosSinCacheBatchSize == 1) ? 0 : batchIdx;
+    int32_t const cosSinCacheOffset = cosSinCacheBatchIdx * cosSinCacheSeqLen * rotaryDim + sinCosCachePos * rotaryDim;
+    DVec<float> cosVec;
+    DVec<float> sinVec;
+    cosVec.load(cosSinCache + cosSinCacheOffset + cosOffset);
+    sinVec.load(cosSinCache + cosSinCacheOffset + cosOffset + sinOffset);
+
+    // Apply RoPE to Q head
+    uint32_t const qHeadIdx = blockIdx.y;
+    int32_t const qOffset = tokenIdx * numQHead * headDim + qHeadIdx * headDim;
+    T* qPtr = q + qOffset;
+    DVec<T> qRoped = vecApplyRopeNonInterleave(qPtr, cosVec, sinVec, rotaryDim);
+    qRoped.store(qPtr + DVec<T>::vec_size * tIdx);
+}
+
+void launchApplyRopeQOnlyTreeDecoding(
+    rt::Tensor const& cosSinCache, rt::Tensor const& tokenPosIds, rt::Tensor& q, cudaStream_t stream)
+{
+    constexpr uint32_t kVEC_SIZE = DVec<half>::vec_size;
+    constexpr uint32_t kTHREADS_PER_CTA = 128;
+
+    uint32_t const runtimeBatchSize = static_cast<uint32_t>(q.getShape()[0]);
+    uint32_t const runtimeSeqLen = static_cast<uint32_t>(q.getShape()[1]);
+    uint32_t const numQHeads = static_cast<uint32_t>(q.getShape()[2]);
+    uint32_t const headDim = static_cast<uint32_t>(q.getShape()[3]);
+    uint32_t const totalNumTokens = runtimeBatchSize * runtimeSeqLen;
+
+    uint32_t const cosSinCacheBatchSize = static_cast<uint32_t>(cosSinCache.getShape()[0]);
+    uint32_t const cosSinCacheSeqLen = static_cast<uint32_t>(cosSinCache.getShape()[1]);
+    uint32_t const rotaryDim = static_cast<uint32_t>(cosSinCache.getShape()[2]);
+
+    check::check(tokenPosIds.getShape()[0] == runtimeBatchSize && tokenPosIds.getShape()[1] == runtimeSeqLen,
+        "tokenPosIds shall have shape [B, S] matching Q.");
+
+    half* qPtr = q.dataPointer<half>();
+    float const* cosSinCachePtr = cosSinCache.dataPointer<float>();
+    int32_t const* tokenPosIdsPtr = tokenPosIds.dataPointer<int32_t>();
+
+    uint32_t const tokenPerCTA = kTHREADS_PER_CTA * kVEC_SIZE / headDim;
+    uint32_t const bDimX = headDim / kVEC_SIZE;
+    uint32_t const bDimY = tokenPerCTA;
+    uint32_t const gDimX = (totalNumTokens + tokenPerCTA - 1) / tokenPerCTA;
+    uint32_t const gDimY = numQHeads; // Q heads only — no KV threads
+
+    dim3 grid(gDimX, gDimY);
+    dim3 block(bDimX, bDimY);
+
+    applyRopeQOnlyTreeDecodingKernel<half><<<grid, block, 0, stream>>>(qPtr, cosSinCachePtr, tokenPosIdsPtr,
+        runtimeSeqLen, totalNumTokens, numQHeads, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen);
+}
+
 } // namespace kernel
 } // namespace trt_edgellm

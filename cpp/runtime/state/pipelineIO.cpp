@@ -148,10 +148,17 @@ void buildTensorMap(
     {
         if (cfg.layerTypes[absIdx] == rt::HybridCacheManager::LayerType::kAttention)
         {
+            // Check if this attention layer shares KV cache from a donor layer.
+            int32_t const donorIdx
+                = (!cfg.kvSharingDonors.empty() && localAttnIdx < static_cast<int32_t>(cfg.kvSharingDonors.size()))
+                ? cfg.kvSharingDonors[localAttnIdx]
+                : -1;
+
             if (!cfg.useTrtNativeOps)
             {
-                // Plugin (combined KV): bind a reference to the owning tensor.
-                auto& combinedKV = kvMgr.getCombinedKVCache(localAttnIdx);
+                // Plugin (combined KV): bind to donor's tensor if shared, else own tensor.
+                auto& combinedKV
+                    = (donorIdx >= 0) ? kvMgr.getCombinedKVCache(donorIdx) : kvMgr.getCombinedKVCache(localAttnIdx);
                 map.set(binding_names::formatKVCacheName(localAttnIdx, /*isPast=*/true), combinedKV);
                 map.set(
                     binding_names::formatKVCacheName(localAttnIdx, /*isPast=*/false), combinedKV); // alias: in-place
@@ -161,7 +168,8 @@ void buildTensorMap(
                 // TRT-native (split K/V): views returned by value → park in the view cache.
                 auto& kViews = res.kCacheViews[kvCacheIndex];
                 auto& vViews = res.vCacheViews[kvCacheIndex];
-                auto [kT, vT] = kvMgr.getSeparateKVCache(localAttnIdx);
+                int32_t const sourceIdx = (donorIdx >= 0) ? donorIdx : localAttnIdx;
+                auto [kT, vT] = kvMgr.getSeparateKVCache(sourceIdx);
                 kViews.push_back(std::move(kT));
                 vViews.push_back(std::move(vT));
 

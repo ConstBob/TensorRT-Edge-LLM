@@ -154,6 +154,13 @@ struct LLMEngineConfig
     //! NOT absolute decoder-layer index.
     std::vector<KVLayerConfig> kvLayerConfigs{};
 
+    //! Per-attention-layer KV sharing donor index. Size equals the attention count
+    //! in `layerTypes`. Value of -1 means the layer owns its own KV cache (normal).
+    //! A value >= 0 means this layer shares the KV cache from the donor attention
+    //! layer at that LOCAL index (the donor's cache is bound to this layer's KV input).
+    //! Used for Gemma4's KV sharing where the last N layers reuse a donor's cache.
+    std::vector<int32_t> kvSharingDonors{};
+
     // ------------------------------------------------------------------
     // InferenceDims recipe methods
     //

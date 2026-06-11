@@ -671,10 +671,17 @@ int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, [[maybe_unus
     PluginTensorDesc const& vInputDesc = inputDesc[kIN_V_IDX];
     int32_t const runtimeBatchSize = static_cast<int32_t>(qInputDesc.dims.d[0]);
     int32_t const runtimeSeqLen = static_cast<int32_t>(qInputDesc.dims.d[1]);
+    int32_t const kvSeqLen = static_cast<int32_t>(kInputDesc.dims.d[1]);
+    bool const sharedKV = (kvSeqLen == 0);
+
     check::check(kInputDesc.dims.d[0] == runtimeBatchSize && vInputDesc.dims.d[0] == runtimeBatchSize,
         "Batch size must be consistent across Q/K/V inputs.");
-    check::check(kInputDesc.dims.d[1] == runtimeSeqLen && vInputDesc.dims.d[1] == runtimeSeqLen,
-        "Sequence length must be consistent across Q/K/V inputs.");
+    check::check(kInputDesc.dims.d[1] == vInputDesc.dims.d[1], "K and V sequence lengths must be consistent.");
+    if (!sharedKV)
+    {
+        check::check(
+            kvSeqLen == runtimeSeqLen, "K/V sequence length must equal Q sequence length when not in shared-KV mode.");
+    }
     check::check(qInputDesc.dims.d[2] == mNumQHeads * mHeadSize, "Q input shape shall be consistent.");
     check::check(kInputDesc.dims.d[2] == mNumKVHeads * mHeadSize, "K input shape shall be consistent.");
     check::check(vInputDesc.dims.d[2] == mNumKVHeads * mHeadSize, "V input shape shall be consistent.");
@@ -682,9 +689,9 @@ int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, [[maybe_unus
     rt::Tensor qInputTensor(const_cast<void*>(inputs[kIN_Q_IDX]),
         rt::Coords{runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, rt::DeviceType::kGPU, qInputDesc.type);
     rt::Tensor kInputTensor(const_cast<void*>(inputs[kIN_K_IDX]),
-        rt::Coords{runtimeBatchSize, runtimeSeqLen, mNumKVHeads, mHeadSize}, rt::DeviceType::kGPU, kInputDesc.type);
+        rt::Coords{runtimeBatchSize, kvSeqLen, mNumKVHeads, mHeadSize}, rt::DeviceType::kGPU, kInputDesc.type);
     rt::Tensor vInputTensor(const_cast<void*>(inputs[kIN_V_IDX]),
-        rt::Coords{runtimeBatchSize, runtimeSeqLen, mNumKVHeads, mHeadSize}, rt::DeviceType::kGPU, vInputDesc.type);
+        rt::Coords{runtimeBatchSize, kvSeqLen, mNumKVHeads, mHeadSize}, rt::DeviceType::kGPU, vInputDesc.type);
 
     PluginTensorDesc const& contextLengthInputDesc = inputDesc[kIN_CONTEXT_LENGTH_IDX];
     rt::Tensor const contextLengthTensor(const_cast<void*>(inputs[kIN_CONTEXT_LENGTH_IDX]),
@@ -769,6 +776,59 @@ int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, [[maybe_unus
             = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize + 1}, DataType::kINT32);
         kernel::calCuQCuKVSeqLensAndKVEndIdxs(contextLengthTensor, kvCacheStartIdxTensor, cuQSeqLensTensor,
             cuKVSeqLensTensor, kvCacheEndIdxsTensor, paddedCuKVSeqLensTensor, runtimeSeqLen, stream);
+
+        if (sharedKV)
+        {
+            // Shared KV mode: apply RoPE to Q only, skip KV write. The donor layer's cache is already populated.
+            kernel::launchApplyRopeQOnly(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor, stream);
+
+            // Run FMHA reading from the donor's KV cache (bound to this layer's KV cache input).
+#ifdef CUTE_DSL_FMHA_ENABLED
+            if (mUseCuteDslFMHA)
+            {
+                int32_t const slidingWindow = mSlidingWindowSize > 0 ? mSlidingWindowSize : INT_MAX;
+                CuteDslFMHARunner runner(
+                    mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen, kvCacheCapacity);
+                runner.run(qInputTensor.dataPointer<half>(),        // Q  [b, s_q, h_q, d]
+                    kvCacheTensor.dataPointer<half>(),              // KV [b, 2, h_k, cap, d] (donor's cache)
+                    attentionOutputTensor.dataPointer<half>(),      // O  [b, s_q, h_q, d]
+                    paddedCuKVSeqLensTensor.dataPointer<int32_t>(), // cu_kv_seqlens [b+1]
+                    stream, slidingWindow);
+            }
+            else
+#endif
+            {
+                auto fmhaRunner = ContextFMHARunner(mDataType, runtimeBatchSize, runtimeSeqLen, mNumQHeads, mNumKVHeads,
+                    mHeadSize, mSMVersion, AttentionInputLayout::SEPARATE_Q_K_V);
+                FusedMultiheadAttentionParamsV2 params{};
+                fmhaRunner.setupParams(params);
+                params.cu_q_seqlens = cuQSeqLensTensor.dataPointer<int32_t>();
+
+                // Chunked prefill with shared KV: read from KV cache (donor's, already populated).
+                rt::Tensor kvWorkspaceTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
+                    {runtimeBatchSize, 2, mNumKVHeads, kvCacheCapacity, mHeadSize}, DataType::kHALF);
+                size_t const halfSize
+                    = static_cast<size_t>(runtimeBatchSize) * kvCacheCapacity * mNumKVHeads * mHeadSize;
+                half* kvWorkspacePtr = kvWorkspaceTensor.dataPointer<half>();
+                rt::Tensor kWorkspaceTensor(kvWorkspacePtr,
+                    rt::Coords{runtimeBatchSize, kvCacheCapacity, mNumKVHeads, mHeadSize}, rt::DeviceType::kGPU,
+                    DataType::kHALF);
+                rt::Tensor vWorkspaceTensor(kvWorkspacePtr + halfSize,
+                    rt::Coords{runtimeBatchSize, kvCacheCapacity, mNumKVHeads, mHeadSize}, rt::DeviceType::kGPU,
+                    DataType::kHALF);
+                kernel::cvtKVLayoutBHSDToSplitKV(
+                    kvCacheTensor, kWorkspaceTensor, vWorkspaceTensor, rt::Tensor{}, stream);
+
+                params.s_kv = kvCacheCapacity;
+                params.q_ptr = qInputTensor.dataPointer<half>();
+                params.k_ptr = kWorkspaceTensor.dataPointer<half>();
+                params.v_ptr = vWorkspaceTensor.dataPointer<half>();
+                params.cu_kv_seqlens = cuKVSeqLensTensor.dataPointer<int32_t>();
+                params.o_ptr = attentionOutputTensor.dataPointer<half>();
+                fmhaRunner.dispatchFMHAKernel(params, stream);
+            }
+            return 0;
+        }
 
 #ifdef CUTE_DSL_FMHA_ENABLED
         if (mUseCuteDslFMHA)
@@ -867,18 +927,32 @@ int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, [[maybe_unus
     }
     else
     {
-        // Prepare Decoding attention runner parameter to dispatch kernel
+        // Apply RoPE and (optionally) write K/V to cache.
+        // Shared KV: RoPE Q only, skip KV write (donor's cache is already populated).
+        // Non-shared: RoPE Q+K, write K/V to cache.
         if (executionMode == AttentionExecutionMode::kTREE_DECODING)
         {
-            // Execute tree attention decoding.
-            kernel::launchApplyRopeWriteKVTreeDecoding(ropeCosSinTensor, contextLengthTensor, attentionPosIdTensor,
-                qInputTensor, kInputTensor, vInputTensor, kvCacheTensor, kScale, vScale, stream);
+            if (sharedKV)
+            {
+                kernel::launchApplyRopeQOnlyTreeDecoding(ropeCosSinTensor, attentionPosIdTensor, qInputTensor, stream);
+            }
+            else
+            {
+                kernel::launchApplyRopeWriteKVTreeDecoding(ropeCosSinTensor, contextLengthTensor, attentionPosIdTensor,
+                    qInputTensor, kInputTensor, vInputTensor, kvCacheTensor, kScale, vScale, stream);
+            }
         }
         else
         {
-            // Execute vanilla decoding.
-            kernel::launchApplyRopeWriteKV(ropeCosSinTensor, contextLengthTensor, qInputTensor, kInputTensor,
-                vInputTensor, kvCacheTensor, kScale, vScale, stream, false);
+            if (sharedKV)
+            {
+                kernel::launchApplyRopeQOnly(ropeCosSinTensor, contextLengthTensor, qInputTensor, stream);
+            }
+            else
+            {
+                kernel::launchApplyRopeWriteKV(ropeCosSinTensor, contextLengthTensor, qInputTensor, kInputTensor,
+                    vInputTensor, kvCacheTensor, kScale, vScale, stream, false);
+            }
         }
 
         auto xqaRunner = DecoderXQARunner(mDataType, selectKvCacheDataType(mEnableFp8KVCache), runtimeBatchSize,
