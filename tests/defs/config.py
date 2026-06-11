@@ -1796,8 +1796,16 @@ class TestConfig:
             "tests/test_cases/llm_lora.json",
             "asr_basic":
             "tests/test_cases/asr_basic.json",
+            "librispeech_clean_test":
+            f"{self.edgellm_data_dir}/updated_datasets/librispeech_clean_test/librispeech_clean_test.json",
+            "librispeech_clean_test_parakeet":
+            f"{self.edgellm_data_dir}/updated_datasets/librispeech_clean_test_parakeet/librispeech_clean_test_parakeet.json",
+            "OmniBench_parakeet":
+            f"{self.edgellm_data_dir}/updated_datasets/OmniBench_parakeet/omnibench_dataset.json",
             "tts_basic":
             "tests/test_cases/tts_basic.json",
+            "SeedTTS_en_meta":
+            f"{self.edgellm_data_dir}/updated_datasets/SeedTTS_en_meta/seedtts_en_meta.json",
             "vlm_basic":
             "tests/test_cases/vlm_basic.json",
             "vlm_lora":

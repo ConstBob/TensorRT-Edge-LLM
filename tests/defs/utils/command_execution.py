@@ -331,7 +331,16 @@ def check_result_failures(result: Dict[str, Any]) -> None:
 
 def _try_save_baseline(config: TestConfig, test_func: str,
                        result: Dict[str, Any], logger) -> None:
-    """Save current result to baseline CSV when BASELINE_CSV is set but has no entry."""
+    """Seed the baseline CSV with the current result.
+
+    Opt-in only: requires BASELINE_AUTOSAVE=1. Without that env var, the
+    baseline CSV is treated as read-only during regression runs — missing
+    entries are reported (see caller) but never written, so baselines are
+    not silently polluted by ad-hoc test runs.
+    """
+    if os.environ.get('BASELINE_AUTOSAVE',
+                      '').strip().lower() not in ('1', 'true'):
+        return
     csv_path = os.environ.get('BASELINE_CSV', 'logs/baseline.csv')
     if not result.get('success', False):
         return
@@ -342,7 +351,8 @@ def _try_save_baseline(config: TestConfig, test_func: str,
     if logger:
         logger.info(
             "No baseline entry for [%s]. "
-            "Saved current result to %s", config.param_str, csv_path)
+            "Saved current result to %s (BASELINE_AUTOSAVE=1)",
+            config.param_str, csv_path)
 
 
 def _check_baseline_regression(config: TestConfig,
@@ -354,13 +364,18 @@ def _check_baseline_regression(config: TestConfig,
 
     Returns True if baseline entry was found (regardless of pass/fail).
     When baseline is found, threshold_failure is cleared since baseline takes priority.
-    If no baseline exists, saves the current result for future runs.
+    If no baseline exists, the current result is NOT written back — baseline
+    CSVs are managed externally. Set BASELINE_AUTOSAVE=1 to opt in to seeding.
 
     Args:
         check_perf: only True for benchmark tests; inference skips perf comparison.
     """
     baseline = get_baseline()
     if baseline is None:
+        if logger:
+            logger.info(
+                "No baseline loaded for [%s]; skipping regression check",
+                config.param_str)
         _try_save_baseline(config, test_func, result, logger)
         return False
 
@@ -368,6 +383,10 @@ def _check_baseline_regression(config: TestConfig,
                                    test_func,
                                    model_type_value=config.model_type.value)
     if entry is None:
+        if logger:
+            logger.info(
+                "No baseline entry for [%s]; skipping regression check",
+                config.param_str)
         _try_save_baseline(config, test_func, result, logger)
         return False
 
