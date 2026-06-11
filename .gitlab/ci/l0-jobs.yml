@@ -1,6 +1,13 @@
 # ==============================================================================
 # L0 TESTS - Merge Request Triggered
-# Cache Directory: /scratch.edge_llm_cache/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}/
+# Per-pipeline cache:  /scratch.edge_llm_cache/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}/
+#                      (engines, logs, per-runner caches; pruned by l0_cache_cleanup,
+#                       which keeps only the newest NUMERIC pipeline dir per MR.)
+# Reusable ONNX cache: /scratch.edge_llm_cache/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/
+#                      Deliberately NON-numeric so it survives the pipeline-dir cleanup,
+#                      letting later pipelines of the same MR reuse exported ONNX. The
+#                      export jobs set ONNX_REUSE=1 and skip re-export unless the commit
+#                      has [Reexport] or changes tensorrt_edgellm Python (see templates.yml).
 # ==============================================================================
 
 include:
@@ -15,7 +22,8 @@ l0_checkpoint_export:
     L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/checkpoint_export"
     PRIORITY: l0_checkpoint_export
-    ONNX_DIR: "$L0_CACHE_DIR/checkpoint_export/onnx"
+    ONNX_REUSE: "1"
+    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
   tags:
     - a30-edgellm-nvks
@@ -34,7 +42,8 @@ l0_checkpoint_export_ampere:
     L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/checkpoint_export_ampere"
     PRIORITY: l0_checkpoint_export_ampere
-    ONNX_DIR: "$L0_CACHE_DIR/checkpoint_export_ampere/onnx"
+    ONNX_REUSE: "1"
+    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export_ampere/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
   tags:
     - a30-edgellm-nvks
@@ -56,7 +65,7 @@ l0_a30:
     L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/a30"
     PRIORITY: l0_pipeline_a30
-    ONNX_DIR: "$L0_CACHE_DIR/checkpoint_export_ampere/onnx"
+    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export_ampere/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
@@ -82,7 +91,7 @@ l0_a30_trt11:
     L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/a30_trt11"
     PRIORITY: l0_pipeline_a30
-    ONNX_DIR: "$L0_CACHE_DIR/checkpoint_export_ampere/onnx"
+    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export_ampere/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
@@ -107,7 +116,7 @@ l0_rtx3090:
     L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/rtx3090"
     PRIORITY: l0_pipeline_rtx3090
-    ONNX_DIR: "$L0_CACHE_DIR/checkpoint_export_ampere/onnx"
+    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export_ampere/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
@@ -137,7 +146,7 @@ l0_rtx5080:
       L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
       TEST_CACHE_DIR: "$L0_CACHE_DIR/rtx5080"
       PRIORITY: l0_pipeline_rtx5080
-      ONNX_DIR: "$L0_CACHE_DIR/checkpoint_export/onnx"
+      ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export/onnx"
       TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
       ENGINE_DIR: "$TEST_CACHE_DIR/engines"
       TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
@@ -172,7 +181,7 @@ l0_b100:
     L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/b100"
     PRIORITY: l0_pipeline_b100
-    ONNX_DIR: "$L0_CACHE_DIR/checkpoint_export/onnx"
+    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
@@ -203,7 +212,7 @@ l0_rtx5090:
     L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/rtx5090"
     PRIORITY: l0_pipeline_rtx5090
-    ONNX_DIR: "$L0_CACHE_DIR/checkpoint_export/onnx"
+    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
@@ -304,7 +313,7 @@ l0_jetson_orin:
     TEST_CACHE_DIR: "$L0_CACHE_DIR/jetson_orin"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.aarch64.cuda-$TRT_CUDA_VERSION"
     PRIORITY: l0_pipeline_orin
-    ONNX_DIR: "$L0_CACHE_DIR/checkpoint_export_ampere/onnx"
+    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export_ampere/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/jetson_orin.csv"
   tags:
@@ -332,7 +341,7 @@ l0_drive_thor_1:
     TEST_CACHE_DIR: "$L0_CACHE_DIR/drive_thor_1"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$TRT_CUDA_VERSION"
     PRIORITY: l0_pipeline_thor_1
-    ONNX_DIR: "$L0_CACHE_DIR/checkpoint_export/onnx"
+    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/drive_thor_1.csv"
     BOARD_IP: "192.168.55.1"
@@ -367,7 +376,7 @@ l0_drive_thor_1_trt11:
     TEST_CACHE_DIR: "$L0_CACHE_DIR/drive_thor_1_trt11"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$TRT_CUDA_VERSION"
     PRIORITY: l0_pipeline_thor_1_trt11
-    ONNX_DIR: "$L0_CACHE_DIR/checkpoint_export/onnx"
+    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/drive_thor_1_trt11.csv"
     BOARD_IP: "192.168.55.1"
@@ -399,7 +408,7 @@ l0_drive_thor_2:
     TEST_CACHE_DIR: "$L0_CACHE_DIR/drive_thor_2"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$TRT_CUDA_VERSION"
     PRIORITY: l0_pipeline_thor_2
-    ONNX_DIR: "$L0_CACHE_DIR/checkpoint_export/onnx"
+    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/drive_thor_2.csv"
     BOARD_IP: "192.168.55.1"
@@ -434,7 +443,7 @@ l0_drive_thor_2_trt11:
     TEST_CACHE_DIR: "$L0_CACHE_DIR/drive_thor_2_trt11"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$TRT_CUDA_VERSION"
     PRIORITY: l0_pipeline_thor_2_trt11
-    ONNX_DIR: "$L0_CACHE_DIR/checkpoint_export/onnx"
+    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/drive_thor_2_trt11.csv"
     BOARD_IP: "192.168.55.1"
@@ -466,7 +475,7 @@ l0_jedha:
     TEST_CACHE_DIR: "$L0_CACHE_DIR/jedha"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.aarch64.cuda-$TRT_CUDA_VERSION"
     PRIORITY: l0_pipeline_jedha
-    ONNX_DIR: "$L0_CACHE_DIR/checkpoint_export/onnx"
+    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/jedha.csv"
   tags:

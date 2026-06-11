@@ -47,9 +47,49 @@
 
 .checkpoint_export_template:
   script:
-    - echo "Pipeline start time:$(date)"
-    - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
-    - mkdir -p $ONNX_DIR $TEST_LOG_DIR
+    - |
+      echo "Pipeline start time:$(date)"
+      echo "Node name: ${NODE_NAME:-$(hostname)}"
+      export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
+      mkdir -p "$ONNX_DIR" "$TEST_LOG_DIR"
+    - |
+      # ── Smart ONNX reuse decision ─────────────────────────────────────────
+      # Opt-in via ONNX_REUSE=1 (set only on L0 export jobs, which point ONNX_DIR
+      # at a stable per-MR cache that survives the numeric-pipeline-dir cleanup).
+      # Callers that leave ONNX_REUSE unset (e.g. L1 export) always re-export, so
+      # their behavior is unchanged.
+      # Re-export only when: [reexport] in the commit message, OR tensorrt_edgellm
+      # Python changed since the commit that produced the cached ONNX. The model
+      # output (generated tokens) and other paths (tests/CI/C++) never trigger it.
+      NEED_EXPORT=1
+      META="$ONNX_DIR/.export_meta"
+      if [ "${ONNX_REUSE:-0}" != "1" ]; then
+        echo "ONNX reuse disabled (ONNX_REUSE!=1) — exporting."
+      elif echo "$CI_COMMIT_MESSAGE" | grep -qiE '\[reexport\]'; then
+        echo "[reexport] found in commit message — forcing re-export."
+      elif [ ! -s "$META" ] || [ -z "$(ls -A "$ONNX_DIR" 2>/dev/null | grep -v '^\.export_meta$')" ]; then
+        echo "No usable cached ONNX (missing cache or metadata) — exporting."
+      elif ! command -v git >/dev/null 2>&1; then
+        echo "git unavailable — exporting."
+      else
+        PREV_SHA="$(cat "$META")"
+        if ! git cat-file -e "${PREV_SHA}^{commit}" 2>/dev/null; then
+          echo "Cached export commit $PREV_SHA not reachable (shallow clone?) — exporting."
+        elif git diff --name-only "$PREV_SHA" "$CI_COMMIT_SHA" -- tensorrt_edgellm | grep -qE '\.py$'; then
+          echo "tensorrt_edgellm Python changed since cached export — exporting:"
+          git diff --name-only "$PREV_SHA" "$CI_COMMIT_SHA" -- tensorrt_edgellm | grep -E '\.py$' | sed 's/^/  changed: /'
+        else
+          echo "No tensorrt_edgellm Python changes since cached export ($PREV_SHA) — REUSING cached ONNX."
+          NEED_EXPORT=0
+        fi
+      fi
+    - |
+      if [ "$NEED_EXPORT" = "0" ]; then
+        echo "Reusing cached ONNX at $ONNX_DIR:"
+        ls -la "$ONNX_DIR"
+        echo "Pipeline end time:$(date)"
+        exit 0
+      fi
     - echo "Installing dependencies"
     - export DEBIAN_FRONTEND=noninteractive
     - apt update -qq >/dev/null 2>&1
@@ -66,10 +106,14 @@
     - pip3 install -q -r tests/requirements.txt
     - echo "Checkpoint exporter dependencies are provided by the package wheel"
     - export PYTHONPATH=$LLM_SDK_DIR:$PYTHONPATH
+    # Re-export from a clean cache so models dropped from the test list don't linger.
+    - if [ "${ONNX_REUSE:-0}" = "1" ]; then echo "Cleaning stale ONNX before re-export"; rm -rf "$ONNX_DIR"/*; mkdir -p "$ONNX_DIR"; fi
     - echo "Running checkpoint export tests with pytest. Time:$(date)"
     - python3 -m pytest tests --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
     - echo "Models exported to cache directory $ONNX_DIR"
     - ls -la $ONNX_DIR
+    # Record the commit that produced this ONNX so later pipelines can decide reuse.
+    - if [ "${ONNX_REUSE:-0}" = "1" ]; then echo "$CI_COMMIT_SHA" > "$ONNX_DIR/.export_meta"; echo "Recorded export commit $CI_COMMIT_SHA in $ONNX_DIR/.export_meta"; fi
     - echo "Pipeline end time:$(date)"
   interruptible: true
 
