@@ -460,6 +460,26 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     // Populate per-layer type routing from canonical fields or scalar fallback.
     populateLayerTypes(configJson, cfg);
 
+    // KV sharing donors: optional array of per-attention-layer donor indices.
+    // Each entry is -1 (owns its own KV) or >= 0 (shares donor's KV cache).
+    if (configJson.contains("kv_sharing_donors"))
+    {
+        auto const& donorsJson = configJson["kv_sharing_donors"];
+        int32_t const numAttn = static_cast<int32_t>(cfg.kvLayerConfigs.size());
+        ELLM_CHECK(static_cast<int32_t>(donorsJson.size()) == numAttn,
+            "parseEngineConfig: kv_sharing_donors length (" + std::to_string(donorsJson.size())
+                + ") must equal number of attention layers (" + std::to_string(numAttn) + ")");
+        cfg.kvSharingDonors.reserve(numAttn);
+        for (int32_t i = 0; i < numAttn; ++i)
+        {
+            int32_t donor = donorsJson[i].get<int32_t>();
+            ELLM_CHECK(donor == -1 || (donor >= 0 && donor < numAttn && donor != i),
+                "parseEngineConfig: kv_sharing_donors[" + std::to_string(i) + "] = " + std::to_string(donor)
+                    + " is invalid (must be -1 or a different layer in [0, " + std::to_string(numAttn - 1) + "])");
+            cfg.kvSharingDonors.push_back(donor);
+        }
+    }
+
     LOG_INFO("%s", formatEngineConfig(cfg).c_str());
     return cfg;
 }

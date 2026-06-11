@@ -97,5 +97,30 @@ void launchApplyRopeWriteKVSplitQKV(rt::Tensor const& cosSinCache, rt::Tensor co
     rt::Tensor const& k, rt::Tensor const& v, rt::Tensor& kvCache, float kScale, float vScale, cudaStream_t stream,
     void* fp8QOut = nullptr, float qScale = 1.0f);
 
+//! @brief Launch kernel to apply RoPE to Q only (no KV write).
+//!
+//! Used for shared-KV layers where Q still needs positional encoding but the
+//! KV cache belongs to a donor layer and must not be modified.
+//!
+//! @param[in] cosSinCache FP32 type tensor with layout of [cosSinCacheBatchSize, cosSinCacheSeqLen, rotaryDim]
+//! @param[in] kvCacheEndLens INT32 type tensor with layout of [batchSize], used to compute RoPE position.
+//! @param[in,out] q FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hq, headDim]. RoPE applied in-place.
+//! @param[in] stream CUDA stream to launch the kernel
+void launchApplyRopeQOnly(
+    rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens, rt::Tensor& q, cudaStream_t stream);
+
+//! @brief Launch kernel to apply RoPE to Q only, using per-token position IDs (tree decoding).
+//!
+//! For shared-KV layers during tree/speculative decoding, each candidate token has its own
+//! position in the tree. RoPE is applied to Q using these explicit position IDs.
+//! No KV cache write is performed (the donor layer's cache is already populated).
+//!
+//! @param[in] cosSinCache FP32 type tensor with layout of [cosSinCacheBatchSize, cosSinCacheSeqLen, rotaryDim]
+//! @param[in] tokenPosIds INT32 type tensor with layout of [batchSize, runtimeSeqLen], per-token position IDs.
+//! @param[in,out] q FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hq, headDim]. RoPE applied in-place.
+//! @param[in] stream CUDA stream to launch the kernel
+void launchApplyRopeQOnlyTreeDecoding(
+    rt::Tensor const& cosSinCache, rt::Tensor const& tokenPosIds, rt::Tensor& q, cudaStream_t stream);
+
 } // namespace kernel
 } // namespace trt_edgellm
