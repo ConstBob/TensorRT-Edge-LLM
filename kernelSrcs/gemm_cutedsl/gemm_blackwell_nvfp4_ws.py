@@ -27,9 +27,8 @@ store-back stalls:
 Layout adapted from the upstream CuTeDSL blockscaled-GEMM example
 ``examples/python/CuTeDSL/cute/blackwell/kernel/blockscaled_gemm/dense_blockscaled_gemm_persistent.py``.
 
-This is the non-grouped (plain) NVFP4 GEMM backing the Tensor-Parallel
-FusedGemmAllReducePlugin row-parallel layers (o_proj, down_proj). AOT
-build/plumbing follows main's CuTe DSL contract (see ``kernelSrcs/README.md``).
+This is a non-grouped (plain) NVFP4 GEMM variant. AOT build/plumbing
+follows main's CuTe DSL contract (see ``kernelSrcs/README.md``).
 
 Tensor layout (logical shape -> physical storage)
 -------------------------------------------------
@@ -60,9 +59,9 @@ requires a different AOT variant. Variants registered in
   gemm_blackwell_nvfp4_ws_fp16_tn{64,128,256}  — FP16 output
   gemm_blackwell_nvfp4_ws_fp8_tn{64,128}       — FP8 E4M3 output
 
-Supported SMs: 100, 101, 103, 110 (Blackwell datacenter + Thor). SM 120/121
+Supported Blackwell-family SMs: 100, 101, 103, 110. SM 120/121
 (GeForce Blackwell Ultra) lack tcgen05.blockscaled and are NOT supported.
-Thor (SM110) additionally requires the two CuteDSL patches documented in
+SM110 additionally requires the two CuteDSL patches documented in
 ``kernelSrcs/nvfp4_moe_cutedsl/README.md`` before AOT export.
 
 Usage::
@@ -774,6 +773,7 @@ class GemmBlackwellNvFp4WS:
         # to only the first m rows, instead of writing the full 128-row
         # MMA-tile output (with rows m..127 being junk).
         #
+        # {$edge-llm-internal-release begin}
         # Why this matters for the live TP=2 SHM AllReduce path: the
         # plugin gives runner.runFp8(d=...) the rank-slot pointer in
         # pinned host memory (cudaHostAlloc+noL2C). The single-row store
@@ -786,6 +786,7 @@ class GemmBlackwellNvFp4WS:
         # scratch + post-launch cudaMemcpyAsync crop, adding one graph-
         # node per call. With the (m, n) layout the scratch is no
         # longer needed and the runner can write straight to the slot.
+        # {$edge-llm-internal-release end}
         c = cute.make_tensor(
             c_ptr, layout=cute.make_ordered_layout((m, n, 1), order=(1, 0, 2))
         )
@@ -1801,8 +1802,7 @@ def run(
         return None
 
     # This entry point only drives a smoke launch and AOT export.
-    # End-to-end numerical accuracy is exercised through the
-    # FusedGemmAllReducePlugin TP path.
+    # End-to-end numerical accuracy is exercised by downstream runtime tests.
     print(f"{_tag} Numerical check + benchmark: deferred (use --export_only)")
     return None
 
@@ -1815,8 +1815,7 @@ def run(
 def _parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="CuTe DSL Blackwell NVFP4 GEMM **warp-specialised** variant "
-                    "(C = A @ B^T, FP4 in / FP16 out / FP32 acc) for the TP "
-                    "FusedGemmAllReducePlugin row-parallel layers."
+                    "(C = A @ B^T, FP4 in / FP16 out / FP32 acc)."
     )
     p.add_argument(
         "--mnk", type=parse_comma_separated_ints, default=(128, 2048, 2048),
@@ -1827,10 +1826,9 @@ def _parse_args(argv=None):
     p.add_argument("--mma_tiler_n", type=int, default=64, choices=[64, 128, 192, 256],
                    help="MMA tiler N. Default: 64.")
     p.add_argument("--c_dtype", type=str, default="fp16", choices=["fp16", "fp8_e4m3"],
-                   help="Output element type. 'fp16' → Float16 (FP16-out variant, "
-                        "used by FP16 SHM AllReduce + NCCL fallback paths). "
-                        "'fp8_e4m3' → Float8E4M3FN (FP8-out variant, used by the "
-                        "single-CTA FP8 SHM AllReduce decode path). Default: fp16.")
+                   help="Output element type. 'fp16' → Float16 (FP16-output variant). "
+                        "'fp8_e4m3' → Float8E4M3FN (FP8-output variant). "
+                        "Default: fp16.")
     p.add_argument("--export_only", action="store_true",
                    help="Compile and export .o + .h; skip test and benchmark.")
     p.add_argument("--output_dir", type=str, default="./gemm_nvfp4_aot_artifacts",

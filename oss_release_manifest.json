@@ -1,0 +1,24 @@
+{
+  "description": [
+    "OSS release staging policy for TensorRT Edge-LLM.",
+    "DO_NOT_RELEASE removes whole files, directories, and globs from the release staging tree.",
+    "{$edge-llm-internal-release begin/end} removes internal regions from otherwise public files.",
+    "Release tooling must sanitize a staging tree with scripts/strip_internal_release.py before publishing to GitHub."
+  ],
+  "release_policy": {
+    "do_not_release_manifest": "DO_NOT_RELEASE",
+    "guarded_region_markers": {
+      "begin": "{$edge-llm-internal-release begin}",
+      "end": "{$edge-llm-internal-release end}"
+    },
+    "delete_paths": [],
+    "strip_paths": [
+      "cmake/CuteDsl.cmake",
+      "kernelSrcs/build_cutedsl.py",
+      "kernelSrcs/gemm_cutedsl/gemm_blackwell_nvfp4_ws.py"
+    ],
+    "forbidden_patterns": [
+      "edge-llm-internal-release"
+    ]
+  }
+}
