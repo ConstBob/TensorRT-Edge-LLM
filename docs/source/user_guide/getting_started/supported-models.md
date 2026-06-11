@@ -6,7 +6,7 @@
 
 ## Support Policy
 
-TensorRT Edge-LLM supports the checkpoint IDs listed below. Dense LLM families include official dense checkpoints below 30B parameters. Larger dense checkpoints and non-dense variants require case-by-case validation. MoE, multimodal, audio, TTS, omni, and EAGLE support is limited to the listed rows.
+TensorRT Edge-LLM supports the checkpoint IDs listed below. Dense LLM families include official dense checkpoints below 30B parameters. Larger dense checkpoints and non-dense variants require case-by-case validation. MoE, multimodal, audio, TTS, omni, EAGLE3, and DFlash support is limited to the listed rows.
 
 The model coverage list is not comprehensive, and not every listed checkpoint has been fully verified on every supported platform and precision. If a listed model does not export, build, or run correctly, please report an issue with the checkpoint ID, precision, platform, and command line used.
 
@@ -389,3 +389,19 @@ EAGLE3 draft checkpoints are detected by `draft_vocab_size` in `config.json` and
 | [Tengyunw/qwen3_8b_eagle3](https://huggingface.co/Tengyunw/qwen3_8b_eagle3) | [Qwen/Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) | `LlamaForCausalLMEagle3`-style draft |
 | [AngelSlim/Qwen3-8B_eagle3](https://huggingface.co/AngelSlim/Qwen3-8B_eagle3) | [Qwen/Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) | `LlamaForCausalLMEagle3`-style draft |
 | [Rayzl/qwen2.5-vl-7b-eagle3-sgl](https://huggingface.co/Rayzl/qwen2.5-vl-7b-eagle3-sgl) | [Qwen/Qwen2.5-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct) | `LlamaForCausalLMEagle3`-style draft |
+
+## DFlash Draft Models
+
+DFlash draft checkpoints are detected by `dflash_config` in `config.json` and exported with `DFlashDraftModel`. DFlash base export uses `--dflash-base --dflash-draft-dir <draft_checkpoint>`, and draft export uses `--dflash-draft --dflash-draft-dir <draft_checkpoint>`. DFlash draft checkpoints can be quantized with `tensorrt-edgellm-quantize draft`; NVFP4 backbone quantization and optional NVFP4 LM-head quantization are validated.
+
+So far DFlash support in TensorRT Edge-LLM is validated for Qwen3 and Qwen3.5 only. Other DFlash draft models in the z-lab collection are not tested for TensorRT Edge-LLM accuracy, acceptance rate, or runtime compatibility. For the listed pairs, match the paired HuggingFace generation behavior when evaluating performance: enable thinking for Qwen3.5 DFlash models and disable thinking for Qwen3 DFlash models.
+
+| Draft checkpoint | Base model | Draft config class |
+|------------------|------------|--------------------|
+| [z-lab/Qwen3-4B-DFlash-b16](https://huggingface.co/z-lab/Qwen3-4B-DFlash-b16) | [Qwen/Qwen3-4B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507) | `DFlashDraftModel` |
+| [z-lab/Qwen3-8B-DFlash-b16](https://huggingface.co/z-lab/Qwen3-8B-DFlash-b16) | [Qwen/Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) | `DFlashDraftModel` |
+| [z-lab/Qwen3.5-4B-DFlash](https://huggingface.co/z-lab/Qwen3.5-4B-DFlash) | [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) | `DFlashDraftModel` |
+| [z-lab/Qwen3.5-4B-DFlash](https://huggingface.co/z-lab/Qwen3.5-4B-DFlash) (quantized checkpoint: `Qwen3.5-4B-DFlash-NVFP4`) | Qwen3.5-4B-NVFP4 | `DFlashDraftModel` |
+| [z-lab/Qwen3.5-9B-DFlash](https://huggingface.co/z-lab/Qwen3.5-9B-DFlash) | [Qwen/Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B) | `DFlashDraftModel` |
+| [z-lab/Qwen3.5-27B-DFlash](https://huggingface.co/z-lab/Qwen3.5-27B-DFlash) | [Qwen/Qwen3.5-27B](https://huggingface.co/Qwen/Qwen3.5-27B) | `DFlashDraftModel` |
+| [z-lab/Qwen3.5-35B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3.5-35B-A3B-DFlash) | [Qwen/Qwen3.5-35B-A3B-GPTQ-Int4](https://huggingface.co/Qwen/Qwen3.5-35B-A3B-GPTQ-Int4) | `DFlashDraftModel` |

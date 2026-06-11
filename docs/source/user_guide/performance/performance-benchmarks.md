@@ -10,12 +10,13 @@
 | **Prefill throughput** | Prompt tokens processed per second during prefill (tok/s) |
 | **Generation throughput** | Tokens generated per second during decoding (tok/s) |
 | **Batch size** | Number of concurrent sequences (BS=1 = single-user latency, BS=8 = multi-user throughput) |
-| **Acceptance rate** | Average tokens accepted per EAGLE verify step (higher is better) |
-| **Speedup** | EAGLE generation throughput / vanilla generation throughput (same model, precision, batch size) |
+| **Acceptance rate** | Average tokens accepted per speculative decoding verify step (higher is better) |
+| **Speedup** | Speculative decoding generation throughput / vanilla generation throughput (same model, precision, batch size) |
 | **ViT time** | Total visual encoder processing time per inference run (ms) |
 | **ViT throughput** | Image tokens processed per second by the visual encoder (tok/s) |
 | **GPU memory** | Peak GPU memory usage during inference (MB) |
 | **MTP** | Multi-token prediction speculative decoding |
+| **DFlash** | z-lab paired-draft speculative decoding with a dedicated external draft checkpoint |
 
 ### Precision Key
 
