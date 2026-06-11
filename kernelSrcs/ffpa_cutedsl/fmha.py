@@ -61,10 +61,11 @@ all KV tiles internally with FA2-style online softmax (rescale-on-shift).
 Variant axes baked at compile time:
   * ``head_dim``  — whole-D MMA partitioning; runtime mode-3 not honored.
   * ``is_causal`` — separate compiled kernel for causal vs dense masking.
-  * ``kv_group_size`` — GQA group size (``H_q / H_kv``); ``1`` = MHA.
 
 Runtime-dynamic axes (no recompile needed across these): batch size,
-seqlen_q, seqlen_k, num_head (Q heads), tensor strides.
+seqlen_q, seqlen_k, num_head (Q heads), ``num_kv_heads`` (GQA — passed as a
+kernel argument; the group size is ``num_head / num_kv_heads``, ``1`` = MHA),
+tensor strides.
 """
 
 
@@ -79,12 +80,15 @@ class FFPAFmhaAmpere:
         is_causal: bool = False,
         skip_rescale: bool = False,
         hybrid_exp2: bool = False,
-        kv_group_size: int = 1,
     ):
         """Initialize the FFPA Ampere kernel.
 
         All contiguous dimensions must be at least 16 bytes aligned, which
         means ``head_dim`` should be a multiple of 8.
+
+        GQA is a runtime axis: the kernel takes ``num_kv_heads`` as a launch
+        argument (see ``__call__``), so a single compiled kernel serves MHA
+        and any GQA group size without recompiling.
 
         :param head_dim: head dimension
         :param m_block_size: ``Br`` — query tile rows per CTA
@@ -96,9 +100,6 @@ class FFPAFmhaAmpere:
             line with the upstream xlite-dev/ffpa-attn tuning.
         :param hybrid_exp2: scaffold for FA4-style 75 % MUFU + 25 % polynomial
             exp2 in softmax.  Not validated in this variant; defer.
-        :param kv_group_size: GQA group size = ``num_head_q / num_head_kv``.
-            ``1`` = MHA (default).  Each K/V head is shared across
-            ``kv_group_size`` Q heads.
         """
         self._head_dim = head_dim
         self._m_block_size = m_block_size
@@ -109,8 +110,6 @@ class FFPAFmhaAmpere:
         self._is_causal = is_causal
         self._skip_rescale = skip_rescale
         self._hybrid_exp2 = hybrid_exp2
-        assert kv_group_size >= 1, f"kv_group_size must be >= 1, got {kv_group_size}"
-        self._kv_group_size = kv_group_size
 
         self.cta_sync_barrier = pipeline.NamedBarrier(
             barrier_id=1, num_threads=num_threads
@@ -152,6 +151,7 @@ class FFPAFmhaAmpere:
         mV: cute.Tensor,
         mO: cute.Tensor,
         softmax_scale: cutlass.Float32,
+        num_kv_heads: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         """Configure SMEM / tiled-copy / tiled-mma and launch the kernel.
@@ -159,6 +159,11 @@ class FFPAFmhaAmpere:
         All four tensors share dtype (fp16 or bf16) and BSND layout
         ``(B, S, H, D)``.  Strides match a contiguous ``B*S*H*D`` packing
         with ``D`` innermost.
+
+        ``num_kv_heads`` is the number of K/V heads (``mK``/``mV`` mode-2
+        extent).  GQA group size is ``num_head_q / num_kv_heads`` and is
+        computed at runtime inside the kernel; ``num_kv_heads == num_head_q``
+        is plain MHA.  The caller must ensure ``num_head_q % num_kv_heads == 0``.
         """
         if cutlass.const_expr(
             not (
@@ -273,6 +278,7 @@ class FFPAFmhaAmpere:
             mV,
             mO,
             softmax_scale_log2,
+            num_kv_heads,
             sQ_layout,
             sKV_layout,
             sO_layout,
@@ -294,6 +300,7 @@ class FFPAFmhaAmpere:
         mV: cute.Tensor,
         mO: cute.Tensor,
         softmax_scale_log2: cutlass.Float32,
+        num_kv_heads: cutlass.Int32,
         sQ_layout: cute.ComposedLayout,
         sKV_layout: cute.ComposedLayout,
         sO_layout: cute.ComposedLayout,
@@ -308,8 +315,12 @@ class FFPAFmhaAmpere:
         """
         tidx, _, _ = cute.arch.thread_idx()
         m_block, batch_size, num_head = cute.arch.block_idx()
-        # GQA: K/V head index = Q head index // group_size.
-        num_head_kv = num_head // self._kv_group_size
+        # GQA: group_size = H_q / H_kv (runtime); each K/V head is shared
+        # across `kv_group_size` consecutive Q heads, so the K/V head index for
+        # this CTA's Q head is `num_head // kv_group_size`.  Matches the
+        # `q_head * H_kv / H_q` convention of the FP32 BSHD reference.
+        kv_group_size = mQ.shape[2] // num_kv_heads
+        num_head_kv = num_head // kv_group_size
 
         n_block_max = cute.ceil_div(mK.shape[1], self._n_block_size)
         if self._is_causal:
@@ -1063,9 +1074,11 @@ def run(
 ):
     """Compile (+ optionally test/benchmark or export) the FFPA Ampere kernel.
 
-    AOT export uses dummy placeholder shapes; only ``head_dim``, ``is_causal``,
-    ``kv_group_size`` and the (Br, Bc, threads) tuning are baked at compile
-    time — the rest are runtime-dynamic.
+    AOT export uses dummy placeholder shapes; only ``head_dim``, ``is_causal``
+    and the (Br, Bc, threads) tuning are baked at compile time — the rest,
+    including ``num_kv_heads`` (GQA), are runtime-dynamic.  ``kv_group_size``
+    here only selects the dummy ``num_kv_heads = num_head // kv_group_size``
+    used to trace the kernel; it is not baked in.
     """
     _tag = f"[{file_name}]"
 
@@ -1131,7 +1144,6 @@ def run(
         is_causal=is_causal,
         skip_rescale=skip_rescale,
         hybrid_exp2=hybrid_exp2,
-        kv_group_size=kv_group_size,
     )
 
     current_stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
@@ -1156,6 +1168,7 @@ def run(
         v_dyn,
         o_dyn,
         softmax_scale,
+        h_kv,
         current_stream,
         **compile_options,
     )
@@ -1176,7 +1189,7 @@ def run(
     # `unittests/cuteDslFFPARunnerTest.cpp` (compares against a FP32 BSHD
     # reference); this CLI path only smoke-checks that the launch is
     # well-formed when not exporting.
-    compiled_fa2(q_dyn, k_dyn, v_dyn, o_dyn, softmax_scale, current_stream)
+    compiled_fa2(q_dyn, k_dyn, v_dyn, o_dyn, softmax_scale, h_kv, current_stream)
     cp.cuda.Device().synchronize()
 
     def generate_tensors():
@@ -1193,7 +1206,7 @@ def run(
             batch_size, seqlen_q, h_q, head_dim, dtype, fill_random=False
         )
         return testing.JitArguments(
-            q_w, k_w, v_w, o_w, softmax_scale, current_stream
+            q_w, k_w, v_w, o_w, softmax_scale, h_kv, current_stream
         )
 
     workspace_count = 1

@@ -9,9 +9,11 @@ Ampere instruction floor:
 - `ldmatrix`
 - warp shuffle reductions
 
-The current registry scope is **D=512 causal FP16 MHA**. The Python kernel
-also supports dense mode, BF16, and GQA-style `kv_group_size`, but those are
-not exported by default.
+The current registry scope is **D=512 causal FP16**. GQA is supported at
+runtime: the exported kernel takes `num_kv_heads` as a launch argument, so a
+single AOT kernel serves MHA and any GQA/MQA group size (the only constraint
+is `num_head % num_kv_heads == 0`). The Python kernel also supports dense mode
+and BF16, but those are not exported by default.
 
 Supported artifact targets:
 
@@ -57,13 +59,12 @@ in-tree FP32 BSHD reference.
 
 | Variant | D | Mask | KV group | Dtype | Tuning |
 |---------|---:|------|---------:|-------|--------|
-| `ffpa_d512_causal` | 512 | causal | 1 | FP16 | `Br=64, Bc=16, threads=128` |
+| `ffpa_d512_causal` | 512 | causal | runtime | FP16 | `Br=64, Bc=16, threads=128` |
 
 Compile-time axes:
 
 - `head_dim`
 - `is_causal`
-- `kv_group_size`
 - `Br`, `Bc`, `num_threads`
 - `skip_rescale`
 
@@ -72,6 +73,10 @@ Runtime axes:
 - batch size
 - `seqlen_q`, `seqlen_k`
 - Q-head count
+- `num_kv_heads` (GQA group size = Q-head count / `num_kv_heads`; `1` = MQA,
+  equal to Q-head count = MHA). The kernel derives the group size internally;
+  the C++ runner passes `numKVHeads` from `CuteDslFFPAParams` and rejects any
+  `numQHeads % numKVHeads != 0`.
 
 The AOT export bakes the BSND layout with `D=512` as the innermost contiguous
 dim, so the per-tensor batch and seq strides must match `S * H * D` and
@@ -173,7 +178,6 @@ Keep `script="ffpa_cutedsl/fmha.py"` and adjust `script_args`.
 
 Useful axes:
 
-- `--kv_group_size 8 --num_head 8` for MQA-style dispatch.
 - `--dtype BFloat16` to swap the exported dtype from FP16 back to BF16
   (BF16 is also the kernel script's CLI default — the registry pins
   FP16 explicitly).
