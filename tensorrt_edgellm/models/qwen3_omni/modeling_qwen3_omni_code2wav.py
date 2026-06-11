@@ -520,7 +520,9 @@ def export_code2wav_onnx(model: Code2WavModel, output_path: str,
                                        dynamic_shapes=({
                                            0: batch_dim,
                                            2: code_len_dim
-                                       }, ))
+                                       }, ),
+                                       external_data=True)
     export_program.save(output_path,
                         include_initializers=True,
-                        keep_initializers_as_inputs=False)
+                        keep_initializers_as_inputs=False,
+                        external_data=True)

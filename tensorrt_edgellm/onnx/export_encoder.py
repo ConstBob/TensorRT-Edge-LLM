@@ -216,7 +216,7 @@ def _run_dynamo_export(
             external_data=True,
             optimize=True,
         )
-    prog.save(output_path)
+    prog.save(output_path, external_data=True)
     with open(output_path, "rb") as _f:
         os.fsync(_f.fileno())
     logger.info("Export complete: %s", output_path)
