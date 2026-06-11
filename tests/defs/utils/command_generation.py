@@ -688,6 +688,24 @@ def generate_e2e_bench_commands(
         commands.append((cmd, 6000))
         return commands
 
+    if config.model_type == ModelType.TTS:
+        cmd = [executable_files['qwen3_tts_inference']]
+        cmd.extend([
+            f"--talkerEngineDir={config.get_talker_engine_dir()}",
+            f"--code2wavEngineDir={config.get_code2wav_engine_dir()}",
+            f"--tokenizerDir={config.get_tts_tokenizer_dir()}",
+            f"--inputFile={config.get_test_case_file()}",
+            f"--outputFile={config.get_output_json_file()}",
+            f"--outputAudioDir={config.get_output_audio_dir()}",
+            "--dumpProfile",
+        ])
+        if config.batch_size is not None:
+            cmd.append(f"--batchSize={config.batch_size}")
+        if config.debug:
+            cmd.append("--debug")
+        commands.append((cmd, 6000))
+        return commands
+
     cmd = [executable_files['llm_inference']]
     cmd.extend([
         f"--engineDir={config.get_llm_engine_dir()}",
