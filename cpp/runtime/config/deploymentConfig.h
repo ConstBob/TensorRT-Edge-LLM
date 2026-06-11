@@ -112,6 +112,7 @@ struct DeploymentConfig
 //!   against the engines' capacities:
 //!     - `specConfig->verifySize <= specConfig->maxVerifySize`
 //!     - `specConfig->draftingStep * specConfig->draftingTopK <= specConfig->maxDraftProposalSize`
+//!     - MTP requires `draftingTopK == 1` and `verifySize == draftingStep + 1`
 //!   Throws with named-fields message on violation.
 //!
 //! @throws std::runtime_error on any validation failure or parse failure.

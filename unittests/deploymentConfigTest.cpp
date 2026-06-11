@@ -99,6 +99,23 @@ Json makeDraftConfig(int32_t /*maxVerifyTreeSize*/, int32_t maxDraftTreeSize, in
     return config;
 }
 
+Json makeMTPBaseConfig(int32_t maxVerifyTreeSize, int32_t maxBatchSize = 2)
+{
+    Json config = makeBaseConfig(maxVerifyTreeSize, /*maxDraft=*/0, maxBatchSize);
+    config["spec_decode_type"] = "mtp";
+    config["engine_role"] = "base";
+    return config;
+}
+
+Json makeMTPDraftConfig(int32_t maxDraftTreeSize, int32_t maxBatchSize = 2)
+{
+    Json config = makeDraftConfig(/*maxVerify=*/0, maxDraftTreeSize, maxBatchSize);
+    config["spec_decode_type"] = "mtp";
+    config["engine_role"] = "draft";
+    config["base_model_hidden_size"] = config["hidden_size"];
+    return config;
+}
+
 Json makeHybridDFlashBaseConfig(int32_t maxVerifyTreeSize, int32_t maxBatchSize = 2)
 {
     Json config = makeBaseConfig(maxVerifyTreeSize, /*maxDraft=*/0, maxBatchSize);
@@ -281,6 +298,79 @@ TEST_F(DeploymentConfigTest, ConsistentBundleValidatesOk)
     ASSERT_TRUE(bundle.specConfig.has_value());
     EXPECT_EQ(bundle.base.maxVerifyTreeSize, 32);
     EXPECT_EQ(bundle.draft->maxDraftTreeSize, 24);
+}
+
+TEST_F(DeploymentConfigTest, MTPLinearChainValidatesOk)
+{
+    Json const baseJson = makeMTPBaseConfig(/*maxVerify=*/9);
+    Json const draftJson = makeMTPDraftConfig(/*maxDraft=*/9);
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto const draftPath = writeJsonToTempFile(draftJson, "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 1;
+    drafting.draftingStep = 8;
+    drafting.verifySize = 9;
+
+    DeploymentConfig bundle = createDeploymentConfig(
+        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<SpecDecodeDraftingConfig>{drafting});
+
+    EXPECT_EQ(bundle.specDecodeMode(), SpecDecodeMode::kMTP);
+    ASSERT_TRUE(bundle.specConfig.has_value());
+    EXPECT_EQ(bundle.specConfig->draftingTopK, 1);
+    EXPECT_EQ(bundle.specConfig->draftingStep, 8);
+    EXPECT_EQ(bundle.specConfig->verifySize, 9);
+}
+
+TEST_F(DeploymentConfigTest, MTPRejectsNonLinearTopK)
+{
+    Json const baseJson = makeMTPBaseConfig(/*maxVerify=*/9);
+    Json const draftJson = makeMTPDraftConfig(/*maxDraft=*/9);
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto const draftPath = writeJsonToTempFile(draftJson, "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 2;
+    drafting.draftingStep = 3;
+    drafting.verifySize = 4;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
+}
+
+TEST_F(DeploymentConfigTest, MTPRejectsVerifySizeNotDraftStepPlusOne)
+{
+    Json const baseJson = makeMTPBaseConfig(/*maxVerify=*/16);
+    Json const draftJson = makeMTPDraftConfig(/*maxDraft=*/16);
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto const draftPath = writeJsonToTempFile(draftJson, "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 1;
+    drafting.draftingStep = 4;
+    drafting.verifySize = 8;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
+}
+
+TEST_F(DeploymentConfigTest, MTPRejectsVerifySizeAboveCurrentEagleUtilityKernelLimit)
+{
+    Json const baseJson = makeMTPBaseConfig(/*maxVerify=*/16);
+    Json const draftJson = makeMTPDraftConfig(/*maxDraft=*/16);
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto const draftPath = writeJsonToTempFile(draftJson, "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 1;
+    drafting.draftingStep = 15;
+    drafting.verifySize = 16;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
 }
 
 TEST_F(DeploymentConfigTest, DFlashHybridVerifySize16ValidatesOk)
