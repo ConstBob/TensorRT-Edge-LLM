@@ -42,7 +42,7 @@ namespace rt
 //!   * `kvcache_start_index` is a static registry binding whose per-phase
 //!     shape comes from `InferenceDims::startIndexLen`.
 //!   * `deepstack_embeds_*` bindings are owned by `DeepstackBinding` (the
-//!     runtime calls `useRealFeatures` / `useZeroBroadcast` directly).
+//!     runtime calls `useRealFeatures` / `useZeroTarget` directly).
 class StepPreparer
 {
 public:

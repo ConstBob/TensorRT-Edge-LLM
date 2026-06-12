@@ -30,6 +30,7 @@
 #include <fstream>
 #include <string>
 #include <string_view>
+#include <vector>
 
 using namespace trt_edgellm;
 
@@ -131,6 +132,7 @@ bool hasInputBinding(nvinfer1::INetworkDefinition const& network, char const* in
 }
 
 } // namespace
+
 LLMBuilder::LLMBuilder(
     std::filesystem::path const& onnxDir, std::filesystem::path const& engineDir, LLMBuilderConfig const& config)
     : mOnnxDir(onnxDir)
@@ -362,6 +364,34 @@ bool LLMBuilder::parseConfig()
         mHeadSize = mHiddenSize / numAttentionHeads;
     }
 
+    mNumLinearAttnLayers = mModelConfig.value("num_linear_attn_layers", 0);
+    mRecurrentStateNumHeads = mModelConfig.value("recurrent_state_num_heads", 0);
+    mRecurrentStateHeadDim = mModelConfig.value("recurrent_state_head_dim", 0);
+    mRecurrentStateSize = mModelConfig.value("recurrent_state_size", 0);
+    mConvDim = mModelConfig.value("conv_dim", 0);
+    mConvKernel = mModelConfig.value("conv_kernel", 0);
+
+    if (mModelConfig.contains("kv_layer_configs") && mModelConfig["kv_layer_configs"].is_array())
+    {
+        mNbKVCacheInputs = 0;
+        for (auto const& layerConfig : mModelConfig["kv_layer_configs"])
+        {
+            if (layerConfig.is_object())
+            {
+                ++mNbKVCacheInputs;
+            }
+        }
+    }
+    else if (mNumLinearAttnLayers > 0)
+    {
+        // For hybrid models, only attention layers have KV caches.
+        mNbKVCacheInputs = mModelConfig.value("num_attention_layers", mModelConfig["num_hidden_layers"].get<int32_t>());
+    }
+    else
+    {
+        mNbKVCacheInputs = mModelConfig["num_hidden_layers"].get<int32_t>();
+    }
+
     mRotaryDim = getRotaryDim(mModelConfig, mHeadSize);
     mSlidingRotaryDim = mRotaryDim;
     mFullRotaryDim = mRotaryDim;
@@ -372,23 +402,6 @@ bool LLMBuilder::parseConfig()
     if (mModelConfig.contains("full_rope_config") && mModelConfig["full_rope_config"].is_object())
     {
         mFullRotaryDim = getRotaryDim(mModelConfig["full_rope_config"], mHeadSize);
-    }
-
-    mNumLinearAttnLayers = mModelConfig.value("num_linear_attn_layers", 0);
-    mRecurrentStateNumHeads = mModelConfig.value("recurrent_state_num_heads", 0);
-    mRecurrentStateHeadDim = mModelConfig.value("recurrent_state_head_dim", 0);
-    mRecurrentStateSize = mModelConfig.value("recurrent_state_size", 0);
-    mConvDim = mModelConfig.value("conv_dim", 0);
-    mConvKernel = mModelConfig.value("conv_kernel", 0);
-
-    // For hybrid models, only attention layers have KV caches
-    if (mNumLinearAttnLayers > 0)
-    {
-        mNbKVCacheInputs = mModelConfig.value("num_attention_layers", mModelConfig["num_hidden_layers"].get<int32_t>());
-    }
-    else
-    {
-        mNbKVCacheInputs = mModelConfig["num_hidden_layers"].get<int32_t>();
     }
 
     // Read trt_native_ops flag from config if present

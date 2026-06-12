@@ -572,8 +572,8 @@ def causal_conv1d(
     dilation: int,
     groups: int,
     collect_intermediate_states: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Stub: causal conv1d; with MTP enabled it returns an optional 3rd output."""
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Stub: causal conv1d; with MTP enabled it fills the 3rd output."""
     if collect_intermediate_states:
         batch_size, seq_len, _ = hidden_states.shape
         intermediate_conv_state = torch.zeros(batch_size,
@@ -584,7 +584,8 @@ def causal_conv1d(
                                               device=conv_state.device)
         return (torch.zeros_like(hidden_states), conv_state.clone(),
                 intermediate_conv_state)
-    return torch.zeros_like(hidden_states), conv_state.clone()
+    return (torch.zeros_like(hidden_states), conv_state.clone(),
+            conv_state.clone())
 
 
 @causal_conv1d.register_fake
@@ -608,7 +609,8 @@ def _(hidden_states,
                                               device=conv_state.device)
         return (torch.empty_like(hidden_states), conv_state.clone(),
                 intermediate_conv_state)
-    return torch.empty_like(hidden_states), conv_state.clone()
+    return (torch.empty_like(hidden_states), conv_state.clone(),
+            torch.empty_like(conv_state))
 
 
 # ---------------------------------------------------------------------------
@@ -817,8 +819,8 @@ def gated_delta_net(
     k_dim: int,
     v_dim: int,
     collect_intermediate_states: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Stub: GatedDeltaNet; with MTP enabled it returns an optional 3rd output."""
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Stub: GatedDeltaNet; with MTP enabled it fills the 3rd output."""
     if collect_intermediate_states:
         batch_size, seq_len, num_v_heads, _ = v.shape
         intermediate_recurrent_state = torch.zeros(batch_size,
@@ -830,7 +832,7 @@ def gated_delta_net(
                                                    device=h0_source.device)
         return (torch.zeros_like(v), h0_source.clone(),
                 intermediate_recurrent_state)
-    return torch.zeros_like(v), h0_source.clone()
+    return torch.zeros_like(v), h0_source.clone(), h0_source.clone()
 
 
 @gated_delta_net.register_fake
@@ -857,7 +859,7 @@ def _(q,
                                                    device=h0_source.device)
         return (torch.empty_like(v), h0_source.clone(),
                 intermediate_recurrent_state)
-    return torch.empty_like(v), h0_source.clone()
+    return torch.empty_like(v), h0_source.clone(), torch.empty_like(h0_source)
 
 
 # ---------------------------------------------------------------------------

@@ -320,7 +320,7 @@ def _causal_conv1d_translation(
     padding: int,
     dilation: int,
     groups: int,
-) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT16]:
+) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT16, onnxscript.FLOAT16]:
     output, conv_state_out = _trt_edgellm.causal_conv1d(
         hidden_states,
         weight,
@@ -334,7 +334,8 @@ def _causal_conv1d_translation(
         use_mtp=0,
         _outputs=2,
     )
-    return output, conv_state_out
+    intermediate_conv_state_out = _op21.Identity(conv_state_out)
+    return output, conv_state_out, intermediate_conv_state_out
 
 
 @script()
@@ -399,7 +400,7 @@ def _gated_delta_net_translation(
     context_lengths: onnxscript.INT32,
     k_dim: int,
     v_dim: int,
-) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT]:
+) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT, onnxscript.FLOAT]:
     output, h0_out = _trt_edgellm.gated_delta_net(
         q,
         k,
@@ -415,7 +416,8 @@ def _gated_delta_net_translation(
         use_mtp=0,
         _outputs=2,
     )
-    return output, h0_out
+    intermediate_h0_out = _op21.Identity(h0_out)
+    return output, h0_out, intermediate_h0_out
 
 
 @script()

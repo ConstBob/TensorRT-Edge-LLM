@@ -17,6 +17,7 @@
 
 #include "common/checkMacros.h"
 #include "initializeCosSinCache.h"
+
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <stdexcept>

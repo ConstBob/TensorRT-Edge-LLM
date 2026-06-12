@@ -265,7 +265,7 @@ class MambaMixer(nn.Module):
         gate, hidden_states_for_conv, dt = projected_states.split(
             [d_inner, self.conv_dim, self.num_heads], dim=-1)
 
-        hidden_states_for_conv, conv_state_out = causal_conv1d(
+        hidden_states_for_conv, conv_state_out, _ = causal_conv1d(
             hidden_states_for_conv,
             self.conv1d.weight,
             self.conv1d.bias,

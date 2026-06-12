@@ -218,23 +218,32 @@ class GdnMixer(nn.Module):
             a = self.in_proj_a(hidden_states)
 
         # 2. Causal conv1d (no activation baked in)
-        conv_outputs = causal_conv1d(
-            mixed_qkv,
-            self.conv1d.weight,
-            self.conv1d.bias,
-            conv_state,
-            context_lengths,
-            stride=1,
-            padding=self.conv_kernel - 1,
-            dilation=1,
-            groups=self.conv_dim,
-            collect_intermediate_states=collect_intermediate_states,
-        )
         if collect_intermediate_states:
             (mixed_qkv, conv_state_out,
-             intermediate_conv_state_out) = conv_outputs
+             intermediate_conv_state_out) = causal_conv1d(
+                 mixed_qkv,
+                 self.conv1d.weight,
+                 self.conv1d.bias,
+                 conv_state,
+                 context_lengths,
+                 stride=1,
+                 padding=self.conv_kernel - 1,
+                 dilation=1,
+                 groups=self.conv_dim,
+                 collect_intermediate_states=True,
+             )
         else:
-            mixed_qkv, conv_state_out = conv_outputs[:2]
+            mixed_qkv, conv_state_out, _ = causal_conv1d(
+                mixed_qkv,
+                self.conv1d.weight,
+                self.conv1d.bias,
+                conv_state,
+                context_lengths,
+                stride=1,
+                padding=self.conv_kernel - 1,
+                dilation=1,
+                groups=self.conv_dim,
+            )
             intermediate_conv_state_out = None
         mixed_qkv = F.silu(mixed_qkv)
 
@@ -249,25 +258,26 @@ class GdnMixer(nn.Module):
 
         # 4. GDN plugin (handles g/beta, QK L2 norm, H/HV head mapping)
         A_log_f32 = self.A_log.to(torch.float32)
-        gdn_outputs = gated_delta_net(
-            query,
-            key,
-            value,
-            a,
-            b,
-            A_log_f32,
-            self.dt_bias,
-            recurrent_state,
-            context_lengths,
-            self.k_dim,
-            self.v_dim,
-            collect_intermediate_states=collect_intermediate_states,
-        )
         if collect_intermediate_states:
             (core_attn_out, recurrent_state_out,
-             intermediate_recurrent_state_out) = gdn_outputs
+             intermediate_recurrent_state_out) = gated_delta_net(
+                 query,
+                 key,
+                 value,
+                 a,
+                 b,
+                 A_log_f32,
+                 self.dt_bias,
+                 recurrent_state,
+                 context_lengths,
+                 self.k_dim,
+                 self.v_dim,
+                 collect_intermediate_states=True,
+             )
         else:
-            core_attn_out, recurrent_state_out = gdn_outputs[:2]
+            core_attn_out, recurrent_state_out, _ = gated_delta_net(
+                query, key, value, a, b, A_log_f32, self.dt_bias,
+                recurrent_state, context_lengths, self.k_dim, self.v_dim)
             intermediate_recurrent_state_out = None
 
         # 5. Gated norm: norm FIRST, then gate

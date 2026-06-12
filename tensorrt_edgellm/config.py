@@ -86,6 +86,12 @@ LAYER_MLP = "mlp"
 LAYER_GDN = "gdn"  # GatedDeltaNet linear attention (Qwen3.5)
 LAYER_MOE = "moe"
 
+_VALID_ATTENTION_LAYER_TYPES = ("sliding_attention", "full_attention")
+
+
+def _is_gemma4_model_type(model_type: str) -> bool:
+    return str(model_type).startswith("gemma4")
+
 
 def _get_rope_theta(llm_dict: Dict[str, Any]) -> float:
     """Extract rope_theta from config dict.
@@ -183,17 +189,31 @@ def _get_dual_rope_configs(llm_dict: Dict[str, Any]) -> dict[str, dict]:
     }
 
 
-def _parse_attention_layer_types(config: dict,
-                                 num_hidden_layers: int) -> List[str]:
-    """Preserve per-layer sliding/full attention labels for RoPE routing."""
+def _parse_attention_layer_types(config: dict, num_hidden_layers: int,
+                                 model_type: str) -> List[str]:
+    """Preserve per-layer sliding/full attention labels for Gemma4 routing."""
     raw = config.get("layer_types")
-    if not isinstance(raw, list) or len(raw) != num_hidden_layers:
+    if not _is_gemma4_model_type(model_type):
         return []
-    return [
-        str(layer_type) if str(layer_type)
-        in ("sliding_attention", "full_attention") else "full_attention"
-        for layer_type in raw
-    ]
+
+    if not isinstance(raw, list):
+        raise ValueError(
+            "Gemma4 config requires layer_types with one sliding/full attention entry per layer."
+        )
+    if len(raw) != num_hidden_layers:
+        raise ValueError(
+            "Gemma4 layer_types length must match num_hidden_layers: "
+            f"{len(raw)} vs {num_hidden_layers}.")
+
+    attention_layer_types: List[str] = []
+    for layer_idx, layer_type in enumerate(raw):
+        layer_type = str(layer_type)
+        if layer_type not in _VALID_ATTENTION_LAYER_TYPES:
+            raise ValueError(
+                "Gemma4 layer_types entries must be sliding_attention or full_attention; "
+                f"got {layer_type!r} at layer {layer_idx}.")
+        attention_layer_types.append(layer_type)
+    return attention_layer_types
 
 
 def _get_attention_scaling(llm_dict: Dict[str, Any], model_type: str,
@@ -436,6 +456,15 @@ class ModelConfig:
     attention_bias: bool = False
     # Multiplicative scale applied to QK^T before softmax.
     attention_scaling: float = 0.0
+    # Gemma4 full/global attention can use a different per-head dimension
+    # from sliding attention.
+    global_head_dim: Optional[int] = None
+    # Gemma4 K=V full/global attention can use a different KV head count from
+    # sliding attention.
+    num_global_key_value_heads: Optional[int] = None
+    # Gemma4 full/global attention reuses k_proj(hidden_states) as the value
+    # projection source when enabled.
+    attention_k_eq_v: bool = False
     # Multiplicative scale applied by the HF embedding module.
     embedding_scale: float = 1.0
     # Weight dtype in the checkpoint
@@ -671,7 +700,7 @@ class ModelConfig:
         quant = _parse_quant(model_dir, llm_dict)
         layer_types = _parse_layer_types(llm_dict)
         attention_layer_types = _parse_attention_layer_types(
-            llm_dict, llm_dict["num_hidden_layers"])
+            llm_dict, llm_dict["num_hidden_layers"], model_type)
         dual_rope_configs = _get_dual_rope_configs(llm_dict)
         mamba_cfg = _parse_mamba_cfg(llm_dict,
                                      layer_types,
@@ -757,6 +786,10 @@ class ModelConfig:
             has_value_norm=has_value_norm,
             attention_bias=bool(llm_dict.get("attention_bias", False)),
             attention_scaling=attention_scaling,
+            global_head_dim=llm_dict.get("global_head_dim", None),
+            num_global_key_value_heads=llm_dict.get(
+                "num_global_key_value_heads", None),
+            attention_k_eq_v=bool(llm_dict.get("attention_k_eq_v", False)),
             embedding_scale=embedding_scale,
             torch_dtype=llm_dict.get("torch_dtype",
                                      llm_dict.get("dtype", "bfloat16")),

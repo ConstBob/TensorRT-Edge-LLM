@@ -30,9 +30,11 @@ from ..linear import make_linear
 from ..ops import attention_plugin
 
 __all__ = [
+    "Gemma4Attention",
     "Gemma4ForCausalLM",
     "Gemma4DecoderLayer",
     "Gemma4Transformer",
+    "Gemma4ValueRMSNorm",
 ]
 
 # These are dummy tensor extents used only to seed torch.export/ONNX export.
@@ -41,6 +43,98 @@ _DUMMY_BATCH_SIZE = 1
 _DUMMY_SEQ_LEN = 1
 _DUMMY_PAST_LEN = 1
 _DUMMY_ROPE_CACHE_LEN = 4096
+
+
+def _attention_type_for_layer(config: ModelConfig, layer_idx: int) -> str:
+    """Return Gemma4's per-layer attention type."""
+    if layer_idx >= len(config.attention_layer_types):
+        raise ValueError(
+            "Gemma4 attention_layer_types must have one entry per layer; "
+            f"missing layer {layer_idx}.")
+    return config.attention_layer_types[layer_idx]
+
+
+def _uses_attention_k_eq_v(config: ModelConfig, attention_type: str) -> bool:
+    """Return whether a Gemma4 attention layer reuses K as the V source."""
+    return bool(config.attention_k_eq_v and attention_type == "full_attention")
+
+
+def _head_dim_for_attention_type(config: ModelConfig,
+                                 attention_type: str) -> int:
+    """Return Gemma4's per-layer attention head dimension."""
+    if attention_type == "full_attention" and config.global_head_dim:
+        return int(config.global_head_dim)
+    return int(config.head_dim)
+
+
+def _num_kv_heads_for_attention_type(config: ModelConfig,
+                                     attention_type: str) -> int:
+    """Return Gemma4's per-layer KV head count."""
+    if (_uses_attention_k_eq_v(config, attention_type)
+            and config.num_global_key_value_heads):
+        return int(config.num_global_key_value_heads)
+    return int(config.num_key_value_heads)
+
+
+def _kv_cache_dims_for_layer(config: ModelConfig,
+                             layer_idx: int) -> tuple[int, int]:
+    """Return (num_kv_heads, head_dim) for one Gemma4 KV-cache input."""
+    attention_type = _attention_type_for_layer(config, layer_idx)
+    return (_num_kv_heads_for_attention_type(config, attention_type),
+            _head_dim_for_attention_type(config, attention_type))
+
+
+def _rotary_dim_from_rope_config(config: ModelConfig,
+                                 rope_config: dict | None,
+                                 head_dim: int | None = None) -> int:
+    """Return the RoPE table width for one Gemma4 runtime RoPE config."""
+    layer_head_dim = int(head_dim or config.head_dim)
+    if isinstance(rope_config, dict):
+        rope_scaling = rope_config.get("rope_scaling")
+        partial_rotary_factor = float(
+            rope_config.get("partial_rotary_factor",
+                            config.partial_rotary_factor))
+    else:
+        rope_scaling = config.rope_scaling
+        partial_rotary_factor = config.partial_rotary_factor
+
+    if isinstance(rope_scaling, dict):
+        rope_type = str(
+            rope_scaling.get("rope_type", rope_scaling.get("type", "default")))
+        if rope_type in {"default", "proportional"}:
+            return layer_head_dim
+    return int(layer_head_dim * partial_rotary_factor)
+
+
+def _select_rope_for_layer(
+    layer: nn.Module,
+    rope_rotary_cos_sin: torch.Tensor | None,
+    rope_rotary_cos_sin_sliding: torch.Tensor | None,
+    rope_rotary_cos_sin_full: torch.Tensor | None,
+) -> torch.Tensor:
+    """Select the Gemma4 RoPE table matching ``layer`` attention type."""
+    if (rope_rotary_cos_sin_sliding is None
+            and rope_rotary_cos_sin_full is None):
+        if rope_rotary_cos_sin is None:
+            raise ValueError(
+                "rope_rotary_cos_sin is required for single-RoPE Gemma4 export."
+            )
+        return rope_rotary_cos_sin
+
+    attention_type = getattr(layer.self_attn, "attention_type",
+                             "full_attention")
+    if attention_type == "sliding_attention":
+        if rope_rotary_cos_sin_sliding is None:
+            raise ValueError(
+                "rope_rotary_cos_sin_sliding is required for Gemma4 sliding attention layers."
+            )
+        return rope_rotary_cos_sin_sliding
+
+    if rope_rotary_cos_sin_full is None:
+        raise ValueError(
+            "rope_rotary_cos_sin_full is required for Gemma4 full attention layers."
+        )
+    return rope_rotary_cos_sin_full
 
 
 def _attention_type_for_layer(config: ModelConfig, layer_idx: int) -> str:
@@ -201,19 +295,67 @@ class Gemma4ValueRMSNorm(nn.Module):
 
 
 class Gemma4Attention(Attention):
-    """Gemma4 attention with HF-compatible value norm and QK scaling."""
+    """Gemma4 attention with HF-compatible value norm, K=V, and QK scaling."""
 
     def __init__(self,
                  config: ModelConfig,
                  layer_idx: int,
                  in_features: int = 0) -> None:
-        super().__init__(config, layer_idx, in_features)
+        nn.Module.__init__(self)
+        self.layer_idx = layer_idx
+        self.attention_type = _attention_type_for_layer(config, layer_idx)
+        self.attention_k_eq_v = _uses_attention_k_eq_v(config,
+                                                       self.attention_type)
+        self.num_heads = int(config.num_attention_heads)
+        self.num_kv_heads = _num_kv_heads_for_attention_type(
+            config, self.attention_type)
+        self.head_dim = _head_dim_for_attention_type(config,
+                                                     self.attention_type)
+        self.enable_fp8_kv_cache = config.quant.kv_cache_quant == "fp8"
+        hidden_size = int(config.hidden_size)
+        qkv_in_features = int(in_features or hidden_size)
+        module_prefix = f"layers.{layer_idx}.self_attn"
+
+        self.q_proj = make_linear(config,
+                                  qkv_in_features,
+                                  self.num_heads * self.head_dim,
+                                  bias=config.attention_bias,
+                                  module_name=f"{module_prefix}.q_proj")
+        self.k_proj = make_linear(config,
+                                  qkv_in_features,
+                                  self.num_kv_heads * self.head_dim,
+                                  bias=config.attention_bias,
+                                  module_name=f"{module_prefix}.k_proj")
+        if self.attention_k_eq_v:
+            self.v_proj = None
+        else:
+            self.v_proj = make_linear(config,
+                                      qkv_in_features,
+                                      self.num_kv_heads * self.head_dim,
+                                      bias=config.attention_bias,
+                                      module_name=f"{module_prefix}.v_proj")
+
+        if self.enable_fp8_kv_cache:
+            self.k_proj.register_buffer("k_scale", torch.ones(1))
+            if self.v_proj is not None:
+                self.v_proj.register_buffer("v_scale", torch.ones(1))
+
+        self.o_proj = make_linear(config,
+                                  self.num_heads * self.head_dim,
+                                  hidden_size,
+                                  module_name=f"{module_prefix}.o_proj")
+        if config.has_qk_norm:
+            self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        else:
+            self.q_norm = None
+            self.k_norm = None
+
         self.qk_scale = (float(config.attention_scaling)
                          if config.attention_scaling > 0.0 else self.head_dim**
                          -0.5)
         self.v_norm = (Gemma4ValueRMSNorm(self.head_dim, config.rms_norm_eps)
                        if config.has_value_norm else None)
-        self.attention_type = _attention_type_for_layer(config, layer_idx)
         self.sliding_window_size = (config.sliding_window_size
                                     if self.attention_type
                                     == "sliding_attention" else -1)
@@ -236,7 +378,10 @@ class Gemma4Attention(Attention):
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        if self.attention_k_eq_v:
+            value_states = key_states
+        else:
+            value_states = self.v_proj(hidden_states)
 
         if self.q_norm is not None:
             query_states = self.q_norm(
@@ -491,6 +636,21 @@ class Gemma4Transformer(nn.Module):
                                               device=combined.device)
         return combined * scale
 
+    def _select_rope_for_layer(
+        self,
+        layer: nn.Module,
+        rope_rotary_cos_sin: torch.Tensor | None,
+        rope_rotary_cos_sin_sliding: torch.Tensor | None,
+        rope_rotary_cos_sin_full: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Select the Gemma4 RoPE tensor for one decoder layer."""
+        return _select_rope_for_layer(
+            layer,
+            rope_rotary_cos_sin,
+            rope_rotary_cos_sin_sliding,
+            rope_rotary_cos_sin_full,
+        )
+
     def forward(
         self,
         inputs_embeds: torch.Tensor,
@@ -600,13 +760,17 @@ class Gemma4ForCausalLM(CausalLM):
         kv_dtype = (torch.float8_e4m3fn
                     if config.quant.kv_cache_quant == "fp8" else dtype16)
         past_key_values_list: List[torch.Tensor] = [
-            torch.zeros(batch_size,
-                        2,
-                        config.num_key_value_heads,
-                        past_len,
-                        config.head_dim,
-                        dtype=kv_dtype,
-                        device=device) for _ in range(Na)
+            torch.zeros(
+                batch_size,
+                2,
+                num_kv_heads,
+                past_len,
+                layer_head_dim,
+                dtype=kv_dtype,
+                device=device,
+            ) for num_kv_heads, layer_head_dim in (
+                _kv_cache_dims_for_layer(config, layer_idx)
+                for layer_idx in range(Na))
         ]
 
         args = (inputs_embeds, *ple_token_embeds_list, *past_key_values_list)
@@ -616,10 +780,14 @@ class Gemma4ForCausalLM(CausalLM):
             [f"past_key_values_{i}" for i in range(Na)])
 
         if config.use_dual_rope:
+            sliding_head_dim = _head_dim_for_attention_type(
+                config, "sliding_attention")
+            full_head_dim = _head_dim_for_attention_type(
+                config, "full_attention")
             sliding_rotary_dim = _rotary_dim_from_rope_config(
-                config, config.sliding_rope_config)
+                config, config.sliding_rope_config, sliding_head_dim)
             full_rotary_dim = _rotary_dim_from_rope_config(
-                config, config.full_rope_config)
+                config, config.full_rope_config, full_head_dim)
             rope_rotary_cos_sin_sliding = torch.zeros(batch_size,
                                                       max_pos,
                                                       sliding_rotary_dim,
@@ -636,7 +804,10 @@ class Gemma4ForCausalLM(CausalLM):
                 "rope_rotary_cos_sin_sliding", "rope_rotary_cos_sin_full"
             ]
         else:
-            rotary_dim = _rotary_dim_from_rope_config(config, None)
+            rotary_head_dim = _head_dim_for_attention_type(
+                config, "full_attention")
+            rotary_dim = _rotary_dim_from_rope_config(config, None,
+                                                      rotary_head_dim)
             rope_rotary_cos_sin = torch.zeros(batch_size,
                                               max_pos,
                                               rotary_dim,
