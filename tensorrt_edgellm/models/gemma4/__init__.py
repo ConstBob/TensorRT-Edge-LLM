@@ -14,11 +14,14 @@
 # limitations under the License.
 """Gemma4 text decoder implementation."""
 
-from .modeling_gemma4_text import (Gemma4DecoderLayer, Gemma4ForCausalLM,
-                                   Gemma4Transformer)
+from .modeling_gemma4_text import (Gemma4Attention, Gemma4DecoderLayer,
+                                   Gemma4ForCausalLM, Gemma4Transformer,
+                                   Gemma4ValueRMSNorm)
 
 __all__ = [
+    "Gemma4Attention",
     "Gemma4ForCausalLM",
     "Gemma4DecoderLayer",
     "Gemma4Transformer",
+    "Gemma4ValueRMSNorm",
 ]

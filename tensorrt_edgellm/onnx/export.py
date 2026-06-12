@@ -445,6 +445,8 @@ def _setup_fp8kv_scales_for_export(model: "CausalLM") -> None:
             continue
         k_buf = getattr(getattr(module, "k_proj", None), "k_scale", None)
         v_buf = getattr(getattr(module, "v_proj", None), "v_scale", None)
+        if v_buf is None and getattr(module, "attention_k_eq_v", False):
+            v_buf = k_buf
         module._qkv_scales_float = [
             1.0,
             float(k_buf.item()) if k_buf is not None else 1.0,

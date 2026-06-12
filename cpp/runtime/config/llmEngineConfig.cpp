@@ -408,7 +408,6 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     // --- Base-specific: vocab, rotary dim, deepstack / multimodal, hybrid ---
     cfg.vocabSize = getRequired<int32_t>(configJson, "vocab_size");
     cfg.rotaryDim = static_cast<int32_t>(getRotaryDim(configJson, cfg.headDim));
-    parseDualRopeFields(configJson, cfg);
 
     cfg.reducedVocabSize = configJson.value(binding_names::kReducedVocabSizeKey, 0);
     cfg.outputVocabSize = (cfg.reducedVocabSize > 0) ? cfg.reducedVocabSize : cfg.vocabSize;
@@ -490,6 +489,7 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
 
     // Populate per-layer type routing from canonical fields or scalar fallback.
     populateLayerTypes(configJson, cfg);
+    parseDualRopeFields(configJson, cfg);
 
     // KV sharing donors: optional array of per-attention-layer donor indices.
     // Each entry is -1 (owns its own KV) or >= 0 (shares donor's KV cache).
@@ -553,7 +553,6 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath)
     // proportional RoPE keeps a headDim-sized binding and treats the non-rotated
     // tail as identity.
     cfg.rotaryDim = static_cast<int32_t>(getRotaryDim(configJson, cfg.headDim));
-    parseDualRopeFields(configJson, cfg);
     cfg.vocabSize = configJson.value("draft_vocab_size", configJson.value("vocab_size", 0));
     cfg.outputVocabSize = cfg.vocabSize;
     parseDFlashFields(configJson, cfg);
@@ -588,6 +587,7 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath)
 
     // Populate per-layer type routing from canonical fields or scalar fallback.
     populateLayerTypes(configJson, cfg);
+    parseDualRopeFields(configJson, cfg);
 
     return cfg;
 }
@@ -596,8 +596,7 @@ std::string formatEngineConfig(LLMEngineConfig const& cfg)
 {
     std::ostringstream ss;
     ss << std::boolalpha;
-    ss << "LLMEngineConfig{"
-       << " hiddenSize=" << cfg.hiddenSize << " vocabSize=" << cfg.vocabSize
+    ss << "LLMEngineConfig{" << " hiddenSize=" << cfg.hiddenSize << " vocabSize=" << cfg.vocabSize
        << " outputVocabSize=" << cfg.outputVocabSize << " numDecoderLayers=" << cfg.numDecoderLayers
        << " numAttentionLayers=" << cfg.numAttentionLayers << " numKVHeads=" << cfg.numKVHeads
        << " headDim=" << cfg.headDim << " rotaryDim=" << cfg.rotaryDim << " maxBatch=" << cfg.maxSupportedBatchSize

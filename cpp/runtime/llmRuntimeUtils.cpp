@@ -24,16 +24,94 @@
 #include "kernels/posEncoding/initializeCosSinCache.h"
 #include "runtime/streaming.h" // For SlotStreamState (explicit compactVector instantiation)
 
+#include <algorithm>
+#include <cmath>
 #include <optional>
 #include <ostream>
 #include <sstream>
 #include <stdexcept>
+#include <vector>
 
 using namespace nvinfer1;
 namespace trt_edgellm
 {
 namespace rt
 {
+namespace
+{
+
+bool initializeNormalRopeCosSinCacheHost(
+    rt::Tensor& cosSinCache, RopeConfig const& config, cudaStream_t stream) noexcept
+{
+    int64_t const maxLength = cosSinCache.getShape()[1];
+    int64_t const rotaryDim = cosSinCache.getShape()[2];
+    if (rotaryDim <= 0 || rotaryDim % 2 != 0)
+    {
+        LOG_ERROR("Normal RoPE CosSinCache requires a positive, even rotaryDim; got %lld.",
+            static_cast<long long>(rotaryDim));
+        return false;
+    }
+
+    int64_t const halfDim = rotaryDim / 2;
+    int64_t const rotatedAngles = static_cast<int64_t>(
+        std::floor(std::clamp(config.partialRotaryFactor, 0.0F, 1.0F) * static_cast<float>(halfDim)));
+    std::vector<float> hostBuf(static_cast<size_t>(maxLength * rotaryDim));
+    for (int64_t pos = 0; pos < maxLength; ++pos)
+    {
+        for (int64_t d = 0; d < halfDim; ++d)
+        {
+            size_t const cosOffset = static_cast<size_t>(pos * rotaryDim + d);
+            if (config.type == RopeType::kProportional && d >= rotatedAngles)
+            {
+                hostBuf[cosOffset] = 1.0F;
+                hostBuf[cosOffset + static_cast<size_t>(halfDim)] = 0.0F;
+            }
+            else
+            {
+                float const ropeConstant
+                    = std::pow(config.rotaryTheta, 2.0F * static_cast<float>(d) / static_cast<float>(rotaryDim));
+                float const invFreq = static_cast<float>(pos) * config.rotaryScale / ropeConstant;
+                hostBuf[cosOffset] = std::cos(invFreq);
+                hostBuf[cosOffset + static_cast<size_t>(halfDim)] = std::sin(invFreq);
+            }
+        }
+    }
+
+    try
+    {
+        CUDA_CHECK(cudaMemcpyAsync(cosSinCache.dataPointer<float>(), hostBuf.data(), hostBuf.size() * sizeof(float),
+            cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("cudaMemcpyAsync for initializeNormalRopeCosSinCacheHost failed: %s", e.what());
+        return false;
+    }
+    return true;
+}
+
+bool canUseOptimizedNormalRopeKernel(RopeConfig const& config, int64_t rotaryDim)
+{
+    if (config.type == RopeType::kProportional)
+    {
+        return false;
+    }
+
+    // The optimized CUDA initializer is instantiated only for the rotary
+    // dimensions listed here. Each specialization processes the table in a
+    // 64-element rotary-dimension granularity; other valid RoPE dimensions use
+    // the generic host initializer below.
+    switch (rotaryDim)
+    {
+    case 64:
+    case 128: return true;
+    default: return false;
+    }
+}
+
+} // namespace
+
 std::ostream& operator<<(std::ostream& os, RopeType const& type)
 {
     switch (type)
@@ -229,6 +307,13 @@ bool initializeRopeCosSinCache(rt::Tensor& cosSinCache, RopeConfig const& config
                 "maxLength %d is greater than maxPositionEmbeddings %d indicated by model config, this could cause "
                 "inaccurate generation results",
                 ropeMaxLength, config.maxPositionEmbeddings);
+        }
+
+        if (!canUseOptimizedNormalRopeKernel(config, rotaryDim))
+        {
+            LOG_INFO("Initializing normal RoPE cos/sin cache on host for rotaryDim=%lld.",
+                static_cast<long long>(rotaryDim));
+            return initializeNormalRopeCosSinCacheHost(cosSinCache, config, stream);
         }
 
         try
