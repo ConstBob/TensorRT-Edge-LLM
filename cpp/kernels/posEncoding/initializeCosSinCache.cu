@@ -72,11 +72,69 @@ __global__ void initializeNormalRopeCosSinKernel(
     }
 }
 
-void initializeNormalRopeCosSin(float* cosSinCache, float rotaryBaseFrequency, float rotaryScale, int32_t rotaryDim,
-    int32_t rotaryEmbeddingMaxPositions, cudaStream_t stream)
+template <int32_t RotaryDim>
+__global__ void initializeNormalRopeCosSinWithIdentityTailKernel(float* cosSinCache, float rotaryBaseFrequency,
+    float rotaryScale, float partialRotaryFactor, int32_t rotaryEmbeddingMaxPositions)
 {
-    // Each CTA get assigned 128 threads.
-    dim3 block(32, 4);
+    // Use half-warp groups for valid rotary dims that are not multiples of 64
+    // and for full-width caches that materialize a partial_rotary_factor tail as
+    // identity values.
+    static_assert(RotaryDim % 32 == 0, "rotaryDim must be multiple of 32");
+
+    uint32_t const bIdx = blockIdx.x;
+    uint32_t const tIdx = threadIdx.x;
+    uint32_t const tIdy = threadIdx.y;
+
+    uint32_t const bDimY = blockDim.y;
+    uint32_t const gDimX = gridDim.x;
+
+    uint32_t const startPosIdx = bIdx * bDimY + tIdy;
+    uint32_t const posStride = gDimX * bDimY;
+
+    float const clampedPartialRotaryFactor
+        = partialRotaryFactor < 0.0F ? 0.0F : (partialRotaryFactor > 1.0F ? 1.0F : partialRotaryFactor);
+    uint32_t const rotatedAngles
+        = static_cast<uint32_t>(clampedPartialRotaryFactor * static_cast<float>(RotaryDim / 2));
+    float ropeConstants[RotaryDim / 32];
+
+#pragma unroll
+    for (uint32_t i = 0; i < RotaryDim / 32; ++i)
+    {
+        uint32_t zid = tIdx + i * 16;
+        ropeConstants[i] = pow(rotaryBaseFrequency, 2 * zid / (float) RotaryDim);
+    }
+
+    for (uint32_t posIdx = startPosIdx; posIdx < rotaryEmbeddingMaxPositions; posIdx += posStride)
+    {
+        uint32_t cosSinOffset = posIdx * RotaryDim;
+
+#pragma unroll
+        for (uint32_t i = 0; i < RotaryDim / 32; ++i)
+        {
+            uint32_t zid = tIdx + i * 16;
+            if (zid >= rotatedAngles)
+            {
+                cosSinCache[cosSinOffset + zid] = 1.0F;
+                cosSinCache[cosSinOffset + zid + RotaryDim / 2] = 0.0F;
+                continue;
+            }
+
+            float invFreq = posIdx * rotaryScale / ropeConstants[i];
+            float cosVal = cos(invFreq);
+            float sinVal = sin(invFreq);
+
+            cosSinCache[cosSinOffset + zid] = cosVal;
+            cosSinCache[cosSinOffset + zid + RotaryDim / 2] = sinVal;
+        }
+    }
+}
+
+void initializeNormalRopeCosSin(float* cosSinCache, float rotaryBaseFrequency, float rotaryScale,
+    float partialRotaryFactor, int32_t rotaryDim, int32_t rotaryEmbeddingMaxPositions, cudaStream_t stream)
+{
+    bool const useIdentityTail = partialRotaryFactor < 1.0F;
+    bool const useHalfWarpKernel = useIdentityTail || rotaryDim == 32 || rotaryDim == 96;
+    dim3 block = useHalfWarpKernel ? dim3(16, 8) : dim3(32, 4);
 
     cudaDeviceProp deviceProp;
     CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, 0));
@@ -85,8 +143,20 @@ void initializeNormalRopeCosSin(float* cosSinCache, float rotaryBaseFrequency, f
     void* kernelPtr{nullptr};
     switch (rotaryDim)
     {
-    case 64: kernelPtr = (void*) initializeNormalRopeCosSinKernel<64>; break;
-    case 128: kernelPtr = (void*) initializeNormalRopeCosSinKernel<128>; break;
+    case 32: kernelPtr = (void*) initializeNormalRopeCosSinWithIdentityTailKernel<32>; break;
+    case 64:
+        kernelPtr = useHalfWarpKernel ? (void*) initializeNormalRopeCosSinWithIdentityTailKernel<64>
+                                      : (void*) initializeNormalRopeCosSinKernel<64>;
+        break;
+    case 96: kernelPtr = (void*) initializeNormalRopeCosSinWithIdentityTailKernel<96>; break;
+    case 128:
+        kernelPtr = useHalfWarpKernel ? (void*) initializeNormalRopeCosSinWithIdentityTailKernel<128>
+                                      : (void*) initializeNormalRopeCosSinKernel<128>;
+        break;
+    case 256:
+        kernelPtr = useHalfWarpKernel ? (void*) initializeNormalRopeCosSinWithIdentityTailKernel<256>
+                                      : (void*) initializeNormalRopeCosSinKernel<256>;
+        break;
     default:
         throw std::runtime_error(
             "Un-implemented rotaryDim for initializeNormalRopeCosSin: " + std::to_string(rotaryDim));
@@ -94,12 +164,18 @@ void initializeNormalRopeCosSin(float* cosSinCache, float rotaryBaseFrequency, f
     int32_t maxBlockPerSM{};
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxBlockPerSM, kernelPtr, 128, 0));
 
-    int32_t const numBlocks = std::min(maxBlockPerSM * numSMs, rotaryEmbeddingMaxPositions / 4);
+    int32_t const positionsPerBlock = useHalfWarpKernel ? 8 : 4;
+    int32_t const numBlocks
+        = std::min(maxBlockPerSM * numSMs, (rotaryEmbeddingMaxPositions + positionsPerBlock - 1) / positionsPerBlock);
     dim3 grid(numBlocks);
 
     void* kernelArgs[] = {reinterpret_cast<void*>(&cosSinCache), reinterpret_cast<void*>(&rotaryBaseFrequency),
         reinterpret_cast<void*>(&rotaryScale), reinterpret_cast<void*>(&rotaryEmbeddingMaxPositions)};
-    CUDA_CHECK(cudaLaunchKernel(kernelPtr, grid, block, kernelArgs, 0, stream));
+    void* identityTailKernelArgs[] = {reinterpret_cast<void*>(&cosSinCache),
+        reinterpret_cast<void*>(&rotaryBaseFrequency), reinterpret_cast<void*>(&rotaryScale),
+        reinterpret_cast<void*>(&partialRotaryFactor), reinterpret_cast<void*>(&rotaryEmbeddingMaxPositions)};
+    CUDA_CHECK(
+        cudaLaunchKernel(kernelPtr, grid, block, useHalfWarpKernel ? identityTailKernelArgs : kernelArgs, 0, stream));
 }
 
 template <int32_t RotaryDim>
@@ -360,7 +436,7 @@ void initializeTextOnlyMRopeCosSin(float* cosSinCache, float rotaryBaseFrequency
     // formula reduces to standard RoPE with rotaryScale=1. Reuse initializeNormalRopeCosSin
     // to avoid constructing temporary position ID buffers. Initialize one slice and
     // replicate it across batch slots so later runtime reshape([activeBatch, ...]) is valid.
-    initializeNormalRopeCosSin(cosSinCache, rotaryBaseFrequency, 1.0f, static_cast<int32_t>(rotaryDim),
+    initializeNormalRopeCosSin(cosSinCache, rotaryBaseFrequency, 1.0f, 1.0f, static_cast<int32_t>(rotaryDim),
         static_cast<int32_t>(maxPositions), stream);
 
     if (batchSize <= 1)

@@ -65,7 +65,7 @@ void TestRopeWriteKvPrefill(int32_t const batchSize, AttnParams const& attnParam
     {
         // Initialize normal CosSinCache to real values.
         initializeNormalRopeCosSin(
-            cosSinCacheTensor.dataPointer<float>(), ropeTheta, ropeScale, rotaryDim, kvCacheCapacity, stream);
+            cosSinCacheTensor.dataPointer<float>(), ropeTheta, ropeScale, 1.0F, rotaryDim, kvCacheCapacity, stream);
     }
     else
     {
@@ -311,7 +311,7 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
     {
         // Initialize normal CosSinCache to real values.
         initializeNormalRopeCosSin(
-            cosSinCacheTensor.dataPointer<float>(), ropeTheta, ropeScale, rotaryDim, kvCacheCapacity, stream);
+            cosSinCacheTensor.dataPointer<float>(), ropeTheta, ropeScale, 1.0F, rotaryDim, kvCacheCapacity, stream);
     }
     else
     {

@@ -22,11 +22,76 @@
 #include "references.h"
 #include "testUtils.h"
 
+#include <cmath>
+
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 
 using namespace trt_edgellm;
 using namespace trt_edgellm::kernel;
+
+void computeNormalRopeReference(std::vector<float>& cosSinCache, float rotaryBaseFrequency, float rotaryScale,
+    float partialRotaryFactor, int32_t rotaryDim, int32_t rotaryEmbeddingMaxPositions)
+{
+    float const clampedPartialRotaryFactor
+        = partialRotaryFactor < 0.0F ? 0.0F : (partialRotaryFactor > 1.0F ? 1.0F : partialRotaryFactor);
+    int32_t const rotatedAngles = static_cast<int32_t>(clampedPartialRotaryFactor * static_cast<float>(rotaryDim / 2));
+
+    for (int32_t posIdx = 0; posIdx < rotaryEmbeddingMaxPositions; ++posIdx)
+    {
+        int32_t const cosSinOffset = posIdx * rotaryDim;
+        for (int32_t zid = 0; zid < rotaryDim / 2; ++zid)
+        {
+            if (zid >= rotatedAngles)
+            {
+                cosSinCache[cosSinOffset + zid] = 1.0F;
+                cosSinCache[cosSinOffset + zid + rotaryDim / 2] = 0.0F;
+                continue;
+            }
+            float const ropeConstant = std::pow(rotaryBaseFrequency, 2.0F * static_cast<float>(zid) / rotaryDim);
+            float const invFreq = posIdx * rotaryScale / ropeConstant;
+            cosSinCache[cosSinOffset + zid] = std::cos(invFreq);
+            cosSinCache[cosSinOffset + zid + rotaryDim / 2] = std::sin(invFreq);
+        }
+    }
+}
+
+void TestNormalRopeCosSin(int32_t rotaryDim, int32_t rotaryEmbeddingMaxPositions, float rotaryBaseFrequency = 10000.0F,
+    float rotaryScale = 1.0F, float partialRotaryFactor = 1.0F)
+{
+    std::vector<float> reference(rotaryEmbeddingMaxPositions * rotaryDim);
+    computeNormalRopeReference(
+        reference, rotaryBaseFrequency, rotaryScale, partialRotaryFactor, rotaryDim, rotaryEmbeddingMaxPositions);
+
+    thrust::device_vector<float> cosSinCacheDevice(rotaryEmbeddingMaxPositions * rotaryDim);
+    cudaStream_t stream{nullptr};
+
+    initializeNormalRopeCosSin(thrust::raw_pointer_cast(cosSinCacheDevice.data()), rotaryBaseFrequency, rotaryScale,
+        partialRotaryFactor, rotaryDim, rotaryEmbeddingMaxPositions, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    thrust::host_vector<float> cosSinCacheHost(cosSinCacheDevice);
+    for (int32_t i = 0; i < rotaryEmbeddingMaxPositions * rotaryDim; ++i)
+    {
+        ASSERT_TRUE(isclose(cosSinCacheHost[i], reference[i], 1e-3, 1e-3))
+            << "Normal RoPE cache mismatch at index " << i << ": got " << cosSinCacheHost[i] << ", expected "
+            << reference[i];
+    }
+
+    std::cout << "TestNormalRopeCosSin passed: rotaryDim=" << rotaryDim
+              << ", rotaryEmbeddingMaxPositions=" << rotaryEmbeddingMaxPositions
+              << ", rotaryBaseFrequency=" << rotaryBaseFrequency << ", rotaryScale=" << rotaryScale
+              << ", partialRotaryFactor=" << partialRotaryFactor << std::endl;
+}
+
+TEST(InitializeNormalRopeCosSin, Accuracy)
+{
+    TestNormalRopeCosSin(32, 256);
+    TestNormalRopeCosSin(64, 256);
+    TestNormalRopeCosSin(96, 256);
+    TestNormalRopeCosSin(128, 256);
+    TestNormalRopeCosSin(256, 256, 10000.0F, 0.5F, 0.5F);
+}
 
 void TestLongRopeCosSin(int32_t rotaryDim, int32_t kvCacheCapacity, int32_t maxPositionEmbeddings = 131072,
     int32_t originalMaxPositionEmbeddings = 4096, float rotaryBaseFrequency = 10000.0f)

@@ -114,6 +114,20 @@ inline constexpr char const* kPleEmbeddingFileName = "ple_embedding.safetensors"
  */
 inline constexpr char const* kRopeCosSin = "rope_rotary_cos_sin";
 
+/*!
+ * @brief Rotary positional encoding cos/sin cache tensor for sliding attention layers
+ *
+ * Shape: [batch_size, max_seq_len, sliding_rotary_dim] (FLOAT32)
+ */
+inline constexpr char const* kRopeCosSinSliding = "rope_rotary_cos_sin_sliding";
+
+/*!
+ * @brief Rotary positional encoding cos/sin cache tensor for full attention layers
+ *
+ * Shape: [batch_size, max_seq_len, full_rotary_dim] (FLOAT32)
+ */
+inline constexpr char const* kRopeCosSinFull = "rope_rotary_cos_sin_full";
+
 /*! @} */
 
 /*! @name KV Cache Bindings

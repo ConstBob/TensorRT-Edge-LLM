@@ -30,12 +30,13 @@ namespace kernel
  * @param cosSinCache Output cos/sin cache
  * @param rotaryBaseFrequency Base frequency for RoPE
  * @param rotaryScale Scaling factor
+ * @param partialRotaryFactor Fraction of RoPE angle slots initialized with non-identity values
  * @param rotaryDim Rotary embedding dimension
  * @param rotaryEmbeddingMaxPositions Maximum positions
  * @param stream CUDA stream
  */
-void initializeNormalRopeCosSin(float* cosSinCache, float rotaryBaseFrequency, float rotaryScale, int32_t rotaryDim,
-    int32_t rotaryEmbeddingMaxPositions, cudaStream_t stream);
+void initializeNormalRopeCosSin(float* cosSinCache, float rotaryBaseFrequency, float rotaryScale,
+    float partialRotaryFactor, int32_t rotaryDim, int32_t rotaryEmbeddingMaxPositions, cudaStream_t stream);
 
 /*!
  * @brief Initialize long RoPE cos/sin cache with interpolation

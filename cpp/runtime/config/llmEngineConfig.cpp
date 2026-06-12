@@ -21,6 +21,7 @@
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
 #include "common/logger.h"
+#include "common/ropeUtils.h"
 #include "common/trtUtils.h"
 #include "common/version.h"
 #include "runtime/exec/engineExecutor.h"
@@ -209,6 +210,35 @@ bool engineHasTensor(EngineExecutor const& executor, std::string const& tensorNa
     return false;
 }
 
+//! Helper: parse explicit sliding/full RoPE config blocks when present.
+void parseDualRopeFields(Json const& configJson, LLMEngineConfig& cfg)
+{
+    if (!configJson.contains("sliding_rope_config") || !configJson["sliding_rope_config"].is_object()
+        || !configJson.contains("full_rope_config") || !configJson["full_rope_config"].is_object())
+    {
+        return;
+    }
+
+    auto parseRopeBlock = [&](char const* key, char const* rotaryDimName, RopeConfig& ropeConfig, int32_t& rotaryDim) {
+        Json ropeJson = configJson.at(key);
+        if (!ropeJson.contains("max_position_embeddings") && configJson.contains("max_position_embeddings"))
+        {
+            ropeJson["max_position_embeddings"] = configJson["max_position_embeddings"];
+        }
+        // Do not promote original_max_position_embeddings here: it is LongRope-only,
+        // and dual RoPE cache binding does not support LongRope.
+        ropeConfig = collectRopeConfig(ropeJson);
+        rotaryDim = static_cast<int32_t>(getRotaryDim(ropeJson, cfg.headDim));
+        requirePositive(rotaryDim, rotaryDimName);
+        ELLM_CHECK(ropeConfig.type != RopeType::kMRope,
+            std::string("parseEngineConfig: dual RoPE does not support context-dependent MRoPE bindings: ") + key);
+    };
+
+    cfg.useDualRope = true;
+    parseRopeBlock("sliding_rope_config", "sliding_rotary_dim", cfg.slidingRopeConfig, cfg.slidingRotaryDim);
+    parseRopeBlock("full_rope_config", "full_rotary_dim", cfg.fullRopeConfig, cfg.fullRotaryDim);
+}
+
 //! Fields shared by base and draft engines. Parses top-level model dims and
 //! dtypes (kv_cache_dtype lives at top level — it is a property of the
 //! exported weights written by the Python export step, not a builder knob;
@@ -377,7 +407,8 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
 
     // --- Base-specific: vocab, rotary dim, deepstack / multimodal, hybrid ---
     cfg.vocabSize = getRequired<int32_t>(configJson, "vocab_size");
-    cfg.rotaryDim = static_cast<int32_t>(cfg.headDim * configJson.value("partial_rotary_factor", 1.0F));
+    cfg.rotaryDim = static_cast<int32_t>(getRotaryDim(configJson, cfg.headDim));
+    parseDualRopeFields(configJson, cfg);
 
     cfg.reducedVocabSize = configJson.value(binding_names::kReducedVocabSizeKey, 0);
     cfg.outputVocabSize = (cfg.reducedVocabSize > 0) ? cfg.reducedVocabSize : cfg.vocabSize;
@@ -517,12 +548,12 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath)
 
     // --- Draft-specific ---
     cfg.numAttentionLayers = cfg.numDecoderLayers;
-    // Apply `partial_rotary_factor` (same convention as parseEngineConfig). The
-    // draft engine inherits the base's rotary dim, which can be a fraction of
-    // headDim (e.g. Qwen3.5: headDim=256, rotaryDim=64, factor=0.25). Hard-coding
-    // `cfg.rotaryDim = cfg.headDim` mismatches the engine's `rope_rotary_cos_sin`
-    // binding shape and surfaces as a setInputShape failure on draft prefill.
-    cfg.rotaryDim = static_cast<int32_t>(cfg.headDim * configJson.value("partial_rotary_factor", 1.0F));
+    // Match the engine's `rope_rotary_cos_sin` binding shape. Most partial
+    // rotary models expose a smaller binding via `partial_rotary_factor`, while
+    // proportional RoPE keeps a headDim-sized binding and treats the non-rotated
+    // tail as identity.
+    cfg.rotaryDim = static_cast<int32_t>(getRotaryDim(configJson, cfg.headDim));
+    parseDualRopeFields(configJson, cfg);
     cfg.vocabSize = configJson.value("draft_vocab_size", configJson.value("vocab_size", 0));
     cfg.outputVocabSize = cfg.vocabSize;
     parseDFlashFields(configJson, cfg);
@@ -575,6 +606,11 @@ std::string formatEngineConfig(LLMEngineConfig const& cfg)
        << " pleHiddenSize=" << cfg.pleHiddenSize << " useTrtNativeOps=" << cfg.useTrtNativeOps
        << " isSpecDecodeBase=" << cfg.isSpecDecodeBase << " specDecodeType=" << static_cast<int>(cfg.specDecodeType)
        << " loraRank=" << cfg.maxSupportedLoraRank;
+    if (cfg.useDualRope)
+    {
+        ss << " useDualRope=true" << " slidingRotaryDim=" << cfg.slidingRotaryDim
+           << " fullRotaryDim=" << cfg.fullRotaryDim;
+    }
 
     if (cfg.numLinearAttnLayers > 0)
     {
