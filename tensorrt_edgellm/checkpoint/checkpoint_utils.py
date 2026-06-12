@@ -71,6 +71,15 @@ def normalize_rope_scaling_for_runtime(rope_scaling: Any) -> Any:
     return normalized
 
 
+def _normalize_explicit_rope_config_for_runtime(
+        rope_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize one explicit runtime RoPE config block."""
+    normalized = dict(rope_config)
+    normalized["rope_scaling"] = normalize_rope_scaling_for_runtime(
+        normalized.get("rope_scaling"))
+    return normalized
+
+
 def _torch_dtype_to_config_str(dtype: Any) -> str:
     """Map a ``torch.dtype`` to the string token the runtime parser accepts
     (see cpp/runtime/config/llmEngineConfig.cpp::parseStateDtype).
@@ -341,6 +350,12 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
             and rope_scaling.get("type") == "longrope"
             and config.original_max_position_embeddings is not None):
         out["original_max_position_embeddings"] = config.original_max_position_embeddings
+
+    if config.use_dual_rope:
+        out["sliding_rope_config"] = _normalize_explicit_rope_config_for_runtime(
+            config.sliding_rope_config or {})
+        out["full_rope_config"] = _normalize_explicit_rope_config_for_runtime(
+            config.full_rope_config or {})
 
     if config.is_hybrid and mc is not None:
         out.update({

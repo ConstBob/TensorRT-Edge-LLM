@@ -29,6 +29,23 @@ namespace rt
 // is no longer needed — every symbolic reference is a pointer-to-member of
 // `InferenceDims`, so the set of dims exists by construction of the type.
 
+void addRopeTensorSpecs(TensorRegistry& reg, LLMEngineConfig const& cfg)
+{
+    auto addRopeTensor = [&](char const* name, int32_t rotaryDim) {
+        reg.addTensor({name, TensorIO::kInput, nvinfer1::DataType::kFLOAT,
+            {sym(&InferenceDims::ropeBatch), sym(&InferenceDims::kvLen), fixed(rotaryDim)}});
+    };
+
+    if (cfg.useDualRope)
+    {
+        addRopeTensor(binding_names::kRopeCosSinSliding, cfg.slidingRotaryDim);
+        addRopeTensor(binding_names::kRopeCosSinFull, cfg.fullRotaryDim);
+        return;
+    }
+
+    addRopeTensor(binding_names::kRopeCosSin, cfg.rotaryDim);
+}
+
 TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int32_t> specDecodeBaseOutputHiddenDim)
 {
     TensorRegistry reg;
@@ -66,10 +83,10 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
     reg.addTensor({binding_names::kKVCacheStartIndex, TensorIO::kInput, nvinfer1::DataType::kINT32,
         {sym(&InferenceDims::startIndexLen)}});
 
-    // rope_rotary_cos_sin: [rope_batch, kv_len, rotaryDim] FLOAT
+    // RoPE cache inputs: single binding for single-RoPE models, explicit
+    // sliding/full bindings for mixed-attention dual-RoPE models.
     // For non-MRope, rope_batch is always 1 (TRT broadcasts); for MRope, rope_batch = activeBatchSize.
-    reg.addTensor({binding_names::kRopeCosSin, TensorIO::kInput, nvinfer1::DataType::kFLOAT,
-        {sym(&InferenceDims::ropeBatch), sym(&InferenceDims::kvLen), fixed(cfg.rotaryDim)}});
+    addRopeTensorSpecs(reg, cfg);
 
     // ---------------------------------------------------------------
     // Per-layer KV / recurrent / conv state (hybrid routing by layer_types)
@@ -244,9 +261,9 @@ TensorRegistry buildRegistryForSpecDecodeDraft(DeploymentConfig const& bundle)
     reg.addTensor({binding_names::kKVCacheStartIndex, TensorIO::kInput, nvinfer1::DataType::kINT32,
         {sym(&InferenceDims::startIndexLen)}});
 
-    // rope_rotary_cos_sin: [rope_batch, kv_len, rotaryDim] FLOAT
-    reg.addTensor({binding_names::kRopeCosSin, TensorIO::kInput, nvinfer1::DataType::kFLOAT,
-        {sym(&InferenceDims::ropeBatch), sym(&InferenceDims::kvLen), fixed(cfg.rotaryDim)}});
+    // RoPE cache inputs: single binding for single-RoPE models, explicit
+    // sliding/full bindings for mixed-attention dual-RoPE models.
+    addRopeTensorSpecs(reg, cfg);
 
     // attention_mask: [batch, attn_seq_len, packed_mask_len] INT32 — tree decoding mask
     // packed_mask_len = divUp(attn_seq_len, 32): each INT32 stores 32 mask bits.

@@ -206,6 +206,15 @@ private:
     bool setupCommonProfiles(
         nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
 
+    //! Set up RoPE optimization profiles for single-RoPE or dual-RoPE model inputs.
+    //! Configures only the RoPE cache bindings that are present in the network.
+    //! @param contextProfile Optimization profile for context processing
+    //! @param generationProfile Optimization profile for generation processing
+    //! @param network TensorRT network definition
+    //! @return true if setup was successful, false otherwise
+    bool setupRopeProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+        nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network);
+
     //! Set up optimization profiles for vanilla LLM models.
     //! Configures input IDs and last token IDs for standard transformer models.
     //! @param contextProfile Optimization profile for context processing
@@ -341,6 +350,8 @@ private:
     int64_t mNumKVHeads{0};                 //!< Number of key-value heads
     int64_t mHeadSize{0};                   //!< Size of each attention head
     int64_t mRotaryDim{0};                  //!< Dimension for rotary position embeddings
+    int64_t mSlidingRotaryDim{0};           //!< Dimension for sliding-attention rotary embeddings
+    int64_t mFullRotaryDim{0};              //!< Dimension for full-attention rotary embeddings
     int32_t mNbKVCacheInputs{0};            //!< Number of KV cache inputs (layers)
     int32_t mTargetModelOutputHiddenDim{0}; //!< Target output hidden dimension
     int32_t mNumDeepstackFeatures{0};       //!< Number of deepstack features (for Qwen3VL)

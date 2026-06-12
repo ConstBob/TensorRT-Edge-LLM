@@ -166,11 +166,12 @@ struct LLMGenerationResponse
  */
 enum class RopeType
 {
-    kDefault,  //!< Default 1-D RoPE that specified by the original paper
-    kDynamic,  //!< Dynamic RoPE type used by InternVL-3
-    kLongRope, //!< Long RoPE type used by Phi-4
-    kMRope,    //!< MRope type used by Qwen2-VL
-    kNoRope,   //!< No positional encoding (e.g., Nemotron-Nano)
+    kDefault,      //!< Default 1-D RoPE that specified by the original paper
+    kDynamic,      //!< Dynamic RoPE type used by InternVL-3
+    kProportional, //!< Proportional RoPE with identity no-position angle slots
+    kLongRope,     //!< Long RoPE type used by Phi-4
+    kMRope,        //!< MRope type used by Qwen2-VL
+    kNoRope,       //!< No positional encoding (e.g., Nemotron-Nano)
 };
 
 /*! \brief Long-Rope specific parameters */
@@ -190,6 +191,7 @@ struct RopeConfig
     RopeType type{RopeType::kDefault};        //!< Type of RoPE to use
     float rotaryScale{1.0F};                  //!< Scaling factor for rotary embeddings
     float rotaryTheta{100000.0F};             //!< Base frequency for rotary embeddings
+    float partialRotaryFactor{1.0F};          //!< Fraction of head angles rotated by proportional RoPE
     int32_t maxPositionEmbeddings{32768};     //!< Maximum position embeddings supported
     std::optional<LongRopeParams> longRope{}; //!< Long-Rope specific parameters
 };

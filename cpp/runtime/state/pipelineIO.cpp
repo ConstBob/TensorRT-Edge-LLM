@@ -99,16 +99,17 @@ void StreamingPrefillBuffers::populateFromPrefill(Tensor const& liveInputEmbeds,
         engineHiddenStates.rawPointer(), liveEngineHiddenStates.rawPointer(), bytes, cudaMemcpyDeviceToDevice, stream));
 }
 
-void buildTensorMap(
-    TensorMap& map, PipelineIO& io, SharedResources& res, LLMEngineConfig const& cfg, int32_t kvCacheIndex)
+void bindRopeTensors(TensorMap& map, PipelineIO& io, SharedResources& res, LLMEngineConfig const& cfg)
 {
-    // Core I/O
-    map.set(binding_names::kInputsEmbeds, io.inputsEmbeds);
-    map.set(binding_names::kLogits, io.outputLogits);
-    map.set(binding_names::kContextLengths, io.contextLengths);
-    map.set(binding_names::kLastTokenIds, io.selectTokenIndices);
+    if (cfg.useDualRope)
+    {
+        map.set(binding_names::kRopeCosSinSliding,
+            res.ropePool.getOrCreate(cfg.slidingRopeConfig, cfg.slidingRotaryDim, cfg.maxKVCacheCapacity, nullptr));
+        map.set(binding_names::kRopeCosSinFull,
+            res.ropePool.getOrCreate(cfg.fullRopeConfig, cfg.fullRotaryDim, cfg.maxKVCacheCapacity, nullptr));
+        return;
+    }
 
-    // RoPE
     if (cfg.ropeConfig.type == RopeType::kMRope)
     {
         map.set(binding_names::kRopeCosSin, io.mropeCosSin);
@@ -118,6 +119,18 @@ void buildTensorMap(
         map.set(binding_names::kRopeCosSin,
             res.ropePool.getOrCreate(cfg.ropeConfig, cfg.rotaryDim, cfg.maxKVCacheCapacity, nullptr));
     }
+}
+
+void buildTensorMap(
+    TensorMap& map, PipelineIO& io, SharedResources& res, LLMEngineConfig const& cfg, int32_t kvCacheIndex)
+{
+    // Core I/O
+    map.set(binding_names::kInputsEmbeds, io.inputsEmbeds);
+    map.set(binding_names::kLogits, io.outputLogits);
+    map.set(binding_names::kContextLengths, io.contextLengths);
+    map.set(binding_names::kLastTokenIds, io.selectTokenIndices);
+
+    bindRopeTensors(map, io, res, cfg);
 
     // Hybrid cache routing: walk absolute decoder-layer indices, route by
     // `cfg.layerTypes[absIdx]`, and bind per-layer tensors using LOCAL indices.

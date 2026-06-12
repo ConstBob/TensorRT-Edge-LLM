@@ -87,6 +87,11 @@ struct LLMEngineConfig
 
     // --- RoPE ---
     RopeConfig ropeConfig{};             //!< Full RoPE configuration
+    bool useDualRope{false};             //!< Use separate RoPE caches for sliding/full attention
+    RopeConfig slidingRopeConfig{};      //!< RoPE configuration for sliding attention layers
+    RopeConfig fullRopeConfig{};         //!< RoPE configuration for full attention layers
+    int32_t slidingRotaryDim{};          //!< Rotary dimension for sliding attention RoPE
+    int32_t fullRotaryDim{};             //!< Rotary dimension for full attention RoPE
     bool useContextDependentRope{false}; //!< Use context-dependent RoPE
 
     // --- Optional feature fields ---

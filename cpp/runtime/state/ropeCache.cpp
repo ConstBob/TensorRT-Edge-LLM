@@ -19,6 +19,8 @@
 
 #include "common/logger.h"
 
+#include <stdexcept>
+
 namespace trt_edgellm
 {
 namespace rt
@@ -50,6 +52,10 @@ bool RopeCache::configsMatch(RopeConfig const& a, int32_t rotaryDimA, int32_t ma
         return false;
     }
     if (a.rotaryTheta != b.rotaryTheta)
+    {
+        return false;
+    }
+    if (a.partialRotaryFactor != b.partialRotaryFactor)
     {
         return false;
     }
@@ -112,13 +118,44 @@ rt::Tensor& RopeCache::getOrCreate(RopeConfig const& config, int32_t rotaryDim, 
         = rt::Tensor({1, maxSeqLen, rotaryDim}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "RopeCache::cosSinCache");
 
     // Initialize the cache based on RoPE type.
+    bool initialized{false};
     if (config.type == RopeType::kNoRope)
     {
-        initializeNopeCosSinCache(newEntry.tensor, stream);
+        initialized = initializeNopeCosSinCache(newEntry.tensor, stream);
+    }
+    else if (config.type == RopeType::kLongRope)
+    {
+        if (!config.longRope.has_value() || config.longRope.value().originalMaxPositionEmbeddings == -1)
+        {
+            LOG_ERROR("LongRope config is missing original_max_position_embeddings.");
+        }
+        else
+        {
+            rt::Tensor shortCosSinCache = rt::Tensor({1, maxSeqLen, rotaryDim}, rt::DeviceType::kGPU,
+                nvinfer1::DataType::kFLOAT, "RopeCache::shortCosSinCache");
+            rt::Tensor longCosSinCache = rt::Tensor({1, maxSeqLen, rotaryDim}, rt::DeviceType::kGPU,
+                nvinfer1::DataType::kFLOAT, "RopeCache::longCosSinCache");
+            initialized = initializeLongRopeCosSinCache(shortCosSinCache, longCosSinCache, config, stream);
+            if (initialized)
+            {
+                if (maxSeqLen <= config.longRope.value().originalMaxPositionEmbeddings)
+                {
+                    newEntry.tensor = std::move(shortCosSinCache);
+                }
+                else
+                {
+                    newEntry.tensor = std::move(longCosSinCache);
+                }
+            }
+        }
     }
     else
     {
-        initializeRopeCosSinCache(newEntry.tensor, config, stream);
+        initialized = initializeRopeCosSinCache(newEntry.tensor, config, stream);
+    }
+    if (!initialized)
+    {
+        throw std::runtime_error("RopeCache: failed to initialize RoPE cos/sin cache");
     }
 
     mEntries.push_back(std::move(newEntry));

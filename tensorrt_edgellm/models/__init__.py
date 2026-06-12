@@ -17,7 +17,7 @@ Shared model infrastructure (linear layers, ops) and model variants.
 
 Model variants live in sub-packages named after the model family:
   ``default/``       - standard decoder transformer + Mamba hybrid
-  ``gemma4/``        - Gemma4 text decoder with PLE runtime inputs
+  ``gemma4/``        - Gemma4 text decoder with PLE runtime inputs and dual RoPE support
   ``nemotron_h/``    - Nemotron-H hybrid (Mamba2 + attention)
   ``nemotron_omni/`` - Nemotron-Omni: RADIO visual + Parakeet audio (LLM reuses nemotron_h)
   ``qwen3_vl/``      - Qwen3-VL visual encoder + LLM

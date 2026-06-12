@@ -43,21 +43,86 @@ _DUMMY_PAST_LEN = 1
 _DUMMY_ROPE_CACHE_LEN = 4096
 
 
+def _attention_type_for_layer(config: ModelConfig, layer_idx: int) -> str:
+    """Return Gemma4's per-layer attention type."""
+    if layer_idx < len(config.attention_layer_types):
+        return config.attention_layer_types[layer_idx]
+    if config.sliding_window_size >= 0:
+        return "sliding_attention"
+    return "full_attention"
+
+
+def _rotary_dim_from_rope_config(config: ModelConfig,
+                                 rope_config: dict | None) -> int:
+    """Return the RoPE table width for one Gemma4 runtime RoPE config."""
+    if isinstance(rope_config, dict):
+        rope_scaling = rope_config.get("rope_scaling")
+        partial_rotary_factor = float(
+            rope_config.get("partial_rotary_factor",
+                            config.partial_rotary_factor))
+    else:
+        rope_scaling = config.rope_scaling
+        partial_rotary_factor = config.partial_rotary_factor
+
+    if isinstance(rope_scaling, dict):
+        rope_type = str(
+            rope_scaling.get("rope_type", rope_scaling.get("type", "default")))
+        if rope_type == "proportional":
+            return int(config.head_dim)
+    return int(config.head_dim * partial_rotary_factor)
+
+
+def _select_rope_for_layer(
+    layer: nn.Module,
+    rope_rotary_cos_sin: torch.Tensor | None,
+    rope_rotary_cos_sin_sliding: torch.Tensor | None,
+    rope_rotary_cos_sin_full: torch.Tensor | None,
+) -> torch.Tensor:
+    """Select the Gemma4 RoPE table matching ``layer`` attention type."""
+    if (rope_rotary_cos_sin_sliding is None
+            and rope_rotary_cos_sin_full is None):
+        if rope_rotary_cos_sin is None:
+            raise ValueError(
+                "rope_rotary_cos_sin is required for single-RoPE Gemma4 export."
+            )
+        return rope_rotary_cos_sin
+
+    attention_type = getattr(layer.self_attn, "attention_type",
+                             "full_attention")
+    if attention_type == "sliding_attention":
+        if rope_rotary_cos_sin_sliding is None:
+            raise ValueError(
+                "rope_rotary_cos_sin_sliding is required for Gemma4 sliding attention layers."
+            )
+        return rope_rotary_cos_sin_sliding
+
+    if rope_rotary_cos_sin_full is None:
+        raise ValueError(
+            "rope_rotary_cos_sin_full is required for Gemma4 full attention layers."
+        )
+    return rope_rotary_cos_sin_full
+
+
 def _make_gemma4_flat_wrapper(model: nn.Module,
                               Na: int,
                               num_ple_inputs: int,
+                              use_dual_rope: bool = False,
                               eagle_base: bool = False,
                               emit_hidden_states: bool = False) -> nn.Module:
-    """Build a Gemma4 export wrapper with explicit PLE tensor inputs."""
+    """Build a Gemma4 export wrapper with explicit PLE/RoPE tensor inputs."""
     has_hidden_output = eagle_base or emit_hidden_states
 
     param_names: List[str] = (
         ["inputs_embeds"] +
         [f"ple_token_embeds_{i}" for i in range(num_ple_inputs)] +
-        [f"past_key_values_{i}" for i in range(Na)] + [
-            "rope_rotary_cos_sin", "context_lengths", "kvcache_start_index",
-            "last_token_ids"
-        ])
+        [f"past_key_values_{i}" for i in range(Na)])
+    if use_dual_rope:
+        param_names += [
+            "rope_rotary_cos_sin_sliding", "rope_rotary_cos_sin_full"
+        ]
+    else:
+        param_names += ["rope_rotary_cos_sin"]
+    param_names += ["context_lengths", "kvcache_start_index", "last_token_ids"]
     if eagle_base:
         param_names += ["attention_pos_id", "attention_mask"]
 
@@ -70,22 +135,29 @@ def _make_gemma4_flat_wrapper(model: nn.Module,
     eagle_kwargs = (", attention_mask=attention_mask"
                     ", attention_pos_id=attention_pos_id"
                     if eagle_base else "")
+    if use_dual_rope:
+        rope_arg = "None"
+        rope_kwargs = (
+            ", rope_rotary_cos_sin_sliding=rope_rotary_cos_sin_sliding"
+            ", rope_rotary_cos_sin_full=rope_rotary_cos_sin_full")
+    else:
+        rope_arg = "rope_rotary_cos_sin"
+        rope_kwargs = ""
 
     if has_hidden_output:
         body = (
             f"    logits, hidden_states, present_key_values = self._model(\n"
-            f"        inputs_embeds, {past_kv_tuple}, rope_rotary_cos_sin, "
+            f"        inputs_embeds, {past_kv_tuple}, {rope_arg}, "
             f"context_lengths, kvcache_start_index, last_token_ids"
-            f"{eagle_kwargs}{ple_kwarg})\n"
+            f"{eagle_kwargs}{ple_kwarg}{rope_kwargs})\n"
             f"    return (logits, hidden_states) + tuple(present_key_values)\n"
         )
     else:
-        body = (
-            f"    logits, present_key_values = self._model(\n"
-            f"        inputs_embeds, {past_kv_tuple}, rope_rotary_cos_sin, "
-            f"context_lengths, kvcache_start_index, last_token_ids"
-            f"{eagle_kwargs}{ple_kwarg})\n"
-            f"    return (logits,) + tuple(present_key_values)\n")
+        body = (f"    logits, present_key_values = self._model(\n"
+                f"        inputs_embeds, {past_kv_tuple}, {rope_arg}, "
+                f"context_lengths, kvcache_start_index, last_token_ids"
+                f"{eagle_kwargs}{ple_kwarg}{rope_kwargs})\n"
+                f"    return (logits,) + tuple(present_key_values)\n")
 
     src = "def _forward(self, {}):\n{}".format(", ".join(param_names), body)
     globs: dict = {}
@@ -112,11 +184,12 @@ def _resolve_hidden_activation(
 
 
 class Gemma4ValueRMSNorm(nn.Module):
-    """Weightless RMSNorm used by Gemma4 on value-projection heads."""
+    """Weightless per-head RMSNorm used by Gemma4 attention values."""
 
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
         super().__init__()
         self.variance_epsilon = eps
+        self.hidden_size = hidden_size
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
@@ -130,19 +203,20 @@ class Gemma4ValueRMSNorm(nn.Module):
 class Gemma4Attention(Attention):
     """Gemma4 attention with HF-compatible value norm and QK scaling."""
 
-    def __init__(self, config: ModelConfig, layer_idx: int) -> None:
-        super().__init__(config, layer_idx=layer_idx)
-        # HF Gemma4 applies q/k RMSNorm and then uses attention scaling 1.0.
-        # The EdgeLLM attention plugin applies its default 1/sqrt(head_dim)
-        # scaling internally, so pre-scale Q to preserve Gemma4 semantics.
-        self.qk_scale = 1.0
-        self.v_norm = Gemma4ValueRMSNorm(self.head_dim, config.rms_norm_eps)
-        if layer_idx < len(config.layer_types):
-            layer_type = config.layer_types[layer_idx]
-            if layer_type == "sliding_attention":
-                self.sliding_window_size = config.sliding_window_size
-            elif layer_type == "full_attention":
-                self.sliding_window_size = -1
+    def __init__(self,
+                 config: ModelConfig,
+                 layer_idx: int,
+                 in_features: int = 0) -> None:
+        super().__init__(config, layer_idx, in_features)
+        self.qk_scale = (float(config.attention_scaling)
+                         if config.attention_scaling > 0.0 else self.head_dim**
+                         -0.5)
+        self.v_norm = (Gemma4ValueRMSNorm(self.head_dim, config.rms_norm_eps)
+                       if config.has_value_norm else None)
+        self.attention_type = _attention_type_for_layer(config, layer_idx)
+        self.sliding_window_size = (config.sliding_window_size
+                                    if self.attention_type
+                                    == "sliding_attention" else -1)
 
     def _attention_plugin_query_scale(self) -> float:
         default_plugin_qk_scale = self.head_dim**-0.5
@@ -177,11 +251,12 @@ class Gemma4Attention(Attention):
                                        batch_size, seq_len,
                                        self.num_kv_heads * self.head_dim)
 
-        value_states = self.v_norm(
-            value_states.reshape(batch_size, seq_len, self.num_kv_heads,
-                                 self.head_dim)).reshape(
-                                     batch_size, seq_len,
-                                     self.num_kv_heads * self.head_dim)
+        if self.v_norm is not None:
+            value_states = self.v_norm(
+                value_states.reshape(batch_size, seq_len, self.num_kv_heads,
+                                     self.head_dim)).reshape(
+                                         batch_size, seq_len,
+                                         self.num_kv_heads * self.head_dim)
 
         query_scale = self._attention_plugin_query_scale()
         if query_scale != 1.0:
@@ -328,6 +403,9 @@ class Gemma4Transformer(nn.Module):
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
+        if config.use_dual_rope and config.eagle_base:
+            raise ValueError(
+                "Gemma4 dual RoPE is incompatible with EAGLE base mode.")
         self.hidden_size_per_layer_input = int(
             config.hidden_size_per_layer_input)
         self.vocab_size_per_layer_input = int(
@@ -417,13 +495,15 @@ class Gemma4Transformer(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         past_key_values: Tuple[torch.Tensor, ...],
-        rope_rotary_cos_sin: torch.Tensor,
+        rope_rotary_cos_sin: torch.Tensor | None,
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         attention_pos_id: torch.Tensor | None = None,
         output_hidden_states: bool = False,
         ple_token_embeds: Tuple[torch.Tensor, ...] = (),
+        rope_rotary_cos_sin_sliding: torch.Tensor | None = None,
+        rope_rotary_cos_sin_full: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, Tuple, Tuple | None]:
         hidden_states = inputs_embeds
         projected_per_layer_inputs = self._project_per_layer_inputs(
@@ -435,12 +515,18 @@ class Gemma4Transformer(nn.Module):
             if output_hidden_states:
                 all_hidden_states.append(hidden_states)
 
+            layer_rope_rotary_cos_sin = _select_rope_for_layer(
+                layer,
+                rope_rotary_cos_sin,
+                rope_rotary_cos_sin_sliding,
+                rope_rotary_cos_sin_full,
+            )
             per_layer_input = self._combine_per_layer_input(
                 projected_per_layer_inputs, ple_token_embeds, layer_index)
             hidden_states, next_key_value = layer(
                 hidden_states,
                 past_key_values[layer_index],
-                rope_rotary_cos_sin,
+                layer_rope_rotary_cos_sin,
                 context_lengths,
                 kvcache_start_index,
                 attention_mask=attention_mask,
@@ -478,14 +564,19 @@ class Gemma4ForCausalLM(CausalLM):
         return self.model.ple_enabled
 
     def onnx_export_spec(self) -> OnnxSpec:
-        """Return ONNX export inputs, adding PLE tensors for Gemma4 E models."""
-        if not self.ple_enabled:
+        """Return Gemma4-specific ONNX export parameters."""
+        if not self.ple_enabled and not self.config.use_dual_rope:
             return super().onnx_export_spec()
 
         config = self.config
+        if config.use_dual_rope and config.eagle_base:
+            raise NotImplementedError(
+                "Gemma4 dual RoPE export is not supported for EAGLE base models."
+            )
+
         Na = config.num_hidden_layers
         eagle_base = config.eagle_base
-        num_ple_inputs = Na
+        num_ple_inputs = Na if self.ple_enabled else 0
         device = next(itertools.chain(self.parameters(),
                                       self.buffers())).device
         dtype16 = torch.float16
@@ -517,12 +608,43 @@ class Gemma4ForCausalLM(CausalLM):
                         dtype=kv_dtype,
                         device=device) for _ in range(Na)
         ]
-        rotary_dim = int(config.head_dim * config.partial_rotary_factor)
-        rope_rotary_cos_sin = torch.zeros(batch_size,
-                                          max_pos,
-                                          rotary_dim,
-                                          dtype=torch.float32,
-                                          device=device)
+
+        args = (inputs_embeds, *ple_token_embeds_list, *past_key_values_list)
+        input_names = (
+            ["inputs_embeds"] +
+            [f"ple_token_embeds_{i}" for i in range(num_ple_inputs)] +
+            [f"past_key_values_{i}" for i in range(Na)])
+
+        if config.use_dual_rope:
+            sliding_rotary_dim = _rotary_dim_from_rope_config(
+                config, config.sliding_rope_config)
+            full_rotary_dim = _rotary_dim_from_rope_config(
+                config, config.full_rope_config)
+            rope_rotary_cos_sin_sliding = torch.zeros(batch_size,
+                                                      max_pos,
+                                                      sliding_rotary_dim,
+                                                      dtype=torch.float32,
+                                                      device=device)
+            rope_rotary_cos_sin_full = torch.zeros(batch_size,
+                                                   max_pos,
+                                                   full_rotary_dim,
+                                                   dtype=torch.float32,
+                                                   device=device)
+            args = args + (rope_rotary_cos_sin_sliding,
+                           rope_rotary_cos_sin_full)
+            input_names = input_names + [
+                "rope_rotary_cos_sin_sliding", "rope_rotary_cos_sin_full"
+            ]
+        else:
+            rotary_dim = _rotary_dim_from_rope_config(config, None)
+            rope_rotary_cos_sin = torch.zeros(batch_size,
+                                              max_pos,
+                                              rotary_dim,
+                                              dtype=torch.float32,
+                                              device=device)
+            args = args + (rope_rotary_cos_sin, )
+            input_names = input_names + ["rope_rotary_cos_sin"]
+
         context_lengths = torch.zeros(batch_size,
                                       dtype=torch.int32,
                                       device=device)
@@ -534,17 +656,10 @@ class Gemma4ForCausalLM(CausalLM):
                                      dtype=torch.int64,
                                      device=device)
 
-        args = (inputs_embeds, *ple_token_embeds_list, *past_key_values_list,
-                rope_rotary_cos_sin, context_lengths, kvcache_start_index,
-                last_token_ids)
-
-        input_names = (
-            ["inputs_embeds"] +
-            [f"ple_token_embeds_{i}" for i in range(num_ple_inputs)] +
-            [f"past_key_values_{i}" for i in range(Na)] + [
-                "rope_rotary_cos_sin", "context_lengths",
-                "kvcache_start_index", "last_token_ids"
-            ])
+        args = args + (context_lengths, kvcache_start_index, last_token_ids)
+        input_names = input_names + [
+            "context_lengths", "kvcache_start_index", "last_token_ids"
+        ]
         output_names = (["logits"] +
                         [f"present_key_values_{i}" for i in range(Na)])
         if self.emit_hidden_states and not eagle_base:
@@ -566,6 +681,8 @@ class Gemma4ForCausalLM(CausalLM):
         for _ in range(Na):
             all_shapes.append({0: batch, 3: past})
         all_shapes.append({0: rope_batch, 1: pos})
+        if config.use_dual_rope:
+            all_shapes.append({0: rope_batch, 1: pos})
         all_shapes.append({0: batch})
         all_shapes.append({0: kv_batch})
         if eagle_base:
@@ -596,6 +713,7 @@ class Gemma4ForCausalLM(CausalLM):
             self,
             Na,
             num_ple_inputs=num_ple_inputs,
+            use_dual_rope=config.use_dual_rope,
             eagle_base=eagle_base,
             emit_hidden_states=self.emit_hidden_states)
         wrapped.eval()
@@ -607,16 +725,18 @@ class Gemma4ForCausalLM(CausalLM):
                         dynamic_shapes=all_shapes)
 
     def forward(
-            self,
-            inputs_embeds: torch.Tensor,
-            past_key_values: Tuple[torch.Tensor, ...],
-            rope_rotary_cos_sin: torch.Tensor,
-            context_lengths: torch.Tensor,
-            kvcache_start_index: torch.Tensor,
-            last_token_ids: torch.Tensor,
-            attention_mask: torch.Tensor | None = None,
-            attention_pos_id: torch.Tensor | None = None,
-            ple_token_embeds: Tuple[torch.Tensor, ...] = (),
+        self,
+        inputs_embeds: torch.Tensor,
+        past_key_values: Tuple[torch.Tensor, ...],
+        rope_rotary_cos_sin: torch.Tensor | None,
+        context_lengths: torch.Tensor,
+        kvcache_start_index: torch.Tensor,
+        last_token_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        attention_pos_id: torch.Tensor | None = None,
+        ple_token_embeds: Tuple[torch.Tensor, ...] = (),
+        rope_rotary_cos_sin_sliding: torch.Tensor | None = None,
+        rope_rotary_cos_sin_full: torch.Tensor | None = None,
     ) -> Tuple:
         eagle_base = self.config.eagle_base
         hidden_states, present_key_values, all_hidden_states = self.model(
@@ -629,6 +749,8 @@ class Gemma4ForCausalLM(CausalLM):
             attention_pos_id=attention_pos_id,
             output_hidden_states=eagle_base,
             ple_token_embeds=ple_token_embeds,
+            rope_rotary_cos_sin_sliding=rope_rotary_cos_sin_sliding,
+            rope_rotary_cos_sin_full=rope_rotary_cos_sin_full,
         )
 
         selected_hidden_states = torch.ops.trt.gather_nd(

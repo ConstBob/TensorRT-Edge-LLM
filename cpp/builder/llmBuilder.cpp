@@ -21,6 +21,7 @@
 #include "common/cudaUtils.h"
 #include "common/fileUtils.h"
 #include "common/logger.h"
+#include "common/ropeUtils.h"
 #include "common/trtUtils.h"
 #include "common/version.h"
 
@@ -28,6 +29,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <string>
+#include <string_view>
 
 using namespace trt_edgellm;
 
@@ -115,8 +117,20 @@ bool isValidEngineRole(std::string const& role)
     return role == "llm" || role == "base" || role == "draft";
 }
 
-} // namespace
+bool hasInputBinding(nvinfer1::INetworkDefinition const& network, char const* inputName)
+{
+    std::string_view const target{inputName};
+    for (int32_t idx = 0; idx < network.getNbInputs(); ++idx)
+    {
+        if (std::string_view{network.getInput(idx)->getName()} == target)
+        {
+            return true;
+        }
+    }
+    return false;
+}
 
+} // namespace
 LLMBuilder::LLMBuilder(
     std::filesystem::path const& onnxDir, std::filesystem::path const& engineDir, LLMBuilderConfig const& config)
     : mOnnxDir(onnxDir)
@@ -348,13 +362,16 @@ bool LLMBuilder::parseConfig()
         mHeadSize = mHiddenSize / numAttentionHeads;
     }
 
-    if (mModelConfig.contains("partial_rotary_factor"))
+    mRotaryDim = getRotaryDim(mModelConfig, mHeadSize);
+    mSlidingRotaryDim = mRotaryDim;
+    mFullRotaryDim = mRotaryDim;
+    if (mModelConfig.contains("sliding_rope_config") && mModelConfig["sliding_rope_config"].is_object())
     {
-        mRotaryDim = static_cast<int64_t>(mModelConfig["partial_rotary_factor"].get<float>() * mHeadSize);
+        mSlidingRotaryDim = getRotaryDim(mModelConfig["sliding_rope_config"], mHeadSize);
     }
-    else
+    if (mModelConfig.contains("full_rope_config") && mModelConfig["full_rope_config"].is_object())
     {
-        mRotaryDim = mHeadSize;
+        mFullRotaryDim = getRotaryDim(mModelConfig["full_rope_config"], mHeadSize);
     }
 
     mNumLinearAttnLayers = mModelConfig.value("num_linear_attn_layers", 0);
@@ -408,6 +425,7 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
 
     // Setup common profiles
     result &= setupCommonProfiles(*contextProfile, *generationProfile);
+    result &= setupRopeProfiles(*contextProfile, *generationProfile, network);
 
     // Setup model-specific profiles
     if (mBuilderConfig.specBase || mBuilderConfig.specDraft)
@@ -466,16 +484,6 @@ bool LLMBuilder::setupCommonProfiles(
     result &= setOptimizationProfile(&generationProfile, binding_names::kContextLengths, createDims({1}),
         createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
 
-    // Rope rotary cos sin
-    result &= setOptimizationProfile(&contextProfile, binding_names::kRopeCosSin,
-        createDims({1, mBuilderConfig.maxKVCacheCapacity, mRotaryDim}),
-        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxKVCacheCapacity, mRotaryDim}),
-        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxKVCacheCapacity, mRotaryDim}));
-    result &= setOptimizationProfile(&generationProfile, binding_names::kRopeCosSin,
-        createDims({1, mBuilderConfig.maxKVCacheCapacity, mRotaryDim}),
-        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxKVCacheCapacity, mRotaryDim}),
-        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxKVCacheCapacity, mRotaryDim}));
-
     // For KVCacheStartIndex, we use zero shape to indicate the kvcache is empty for all sequences in the batch.
     // This can help distinguish the normal prefill and chunked prefill execution.
     result &= setOptimizationProfile(&contextProfile, binding_names::kKVCacheStartIndex, createDims({0}),
@@ -496,6 +504,38 @@ bool LLMBuilder::setupCommonProfiles(
     result &= setupConvStateProfiles(&contextProfile, &generationProfile);
     LOG_DEBUG("Conv state profiles done.");
 
+    return result;
+}
+
+bool LLMBuilder::setupRopeProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+    nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network)
+{
+    bool result = true;
+    auto setRopeProfile = [&](char const* bindingName, int64_t rotaryDim) {
+        result &= setOptimizationProfile(&contextProfile, bindingName,
+            createDims({1, mBuilderConfig.maxKVCacheCapacity, rotaryDim}),
+            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxKVCacheCapacity, rotaryDim}),
+            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxKVCacheCapacity, rotaryDim}));
+        result &= setOptimizationProfile(&generationProfile, bindingName,
+            createDims({1, mBuilderConfig.maxKVCacheCapacity, rotaryDim}),
+            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxKVCacheCapacity, rotaryDim}),
+            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxKVCacheCapacity, rotaryDim}));
+    };
+
+    // RoPE rotary cos/sin inputs: single binding for single-RoPE engines, or
+    // explicit sliding/full bindings for mixed-attention engines.
+    if (hasInputBinding(network, binding_names::kRopeCosSinSliding))
+    {
+        setRopeProfile(binding_names::kRopeCosSinSliding, mSlidingRotaryDim);
+    }
+    if (hasInputBinding(network, binding_names::kRopeCosSinFull))
+    {
+        setRopeProfile(binding_names::kRopeCosSinFull, mFullRotaryDim);
+    }
+    if (hasInputBinding(network, binding_names::kRopeCosSin))
+    {
+        setRopeProfile(binding_names::kRopeCosSin, mRotaryDim);
+    }
     return result;
 }
 

@@ -49,6 +49,7 @@ shape in the checkpoint to break the circular dependency with ``n_groups``.
 """
 
 import json
+import math
 import os
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -97,9 +98,139 @@ def _get_rope_theta(llm_dict: Dict[str, Any]) -> float:
         return float(llm_dict["rope_theta"])
     for key in ("rope_scaling", "rope_parameters"):
         nested = llm_dict.get(key)
-        if isinstance(nested, dict) and nested.get("rope_theta") is not None:
+        if not isinstance(nested, dict):
+            continue
+        if nested.get("rope_theta") is not None:
             return float(nested["rope_theta"])
+        for attention_type in ("full_attention", "sliding_attention"):
+            attention_params = nested.get(attention_type)
+            if (isinstance(attention_params, dict)
+                    and attention_params.get("rope_theta") is not None):
+                return float(attention_params["rope_theta"])
     return _DEFAULT_ROPE_THETA
+
+
+def _normalize_rope_scaling_for_config(
+        rope_params: Optional[Dict[str, Any]]) -> Optional[dict]:
+    """Normalize one RoPE parameter block for runtime config export."""
+    if not isinstance(rope_params, dict):
+        return None
+    normalized = dict(rope_params)
+    rope_type = normalized.get("rope_type", normalized.get("type"))
+    if rope_type is not None:
+        normalized.setdefault("rope_type", rope_type)
+        normalized.setdefault("type", rope_type)
+    return normalized
+
+
+def _select_rope_scaling(llm_dict: Dict[str, Any]) -> Optional[dict]:
+    """Select the single-RoPE fallback block from raw config metadata."""
+    for key in ("rope_scaling", "rope_parameters"):
+        nested = llm_dict.get(key)
+        if not isinstance(nested, dict):
+            continue
+        if isinstance(nested.get("full_attention"), dict):
+            return _normalize_rope_scaling_for_config(nested["full_attention"])
+        if isinstance(nested.get("sliding_attention"), dict):
+            return _normalize_rope_scaling_for_config(
+                nested["sliding_attention"])
+        return _normalize_rope_scaling_for_config(nested)
+    return None
+
+
+def _runtime_rope_config_from_params(llm_dict: Dict[str, Any],
+                                     rope_params: Dict[str, Any]) -> dict:
+    """Build one runtime RoPE config block from raw checkpoint metadata."""
+    out = {
+        "rope_theta":
+        float(
+            rope_params.get("rope_theta",
+                            llm_dict.get("rope_theta", _DEFAULT_ROPE_THETA))),
+        "rope_scaling":
+        _normalize_rope_scaling_for_config(rope_params),
+        "partial_rotary_factor":
+        float(
+            rope_params.get("partial_rotary_factor",
+                            llm_dict.get("partial_rotary_factor", 1.0))),
+        "max_position_embeddings":
+        int(llm_dict.get("max_position_embeddings", 4096)),
+    }
+    return out
+
+
+def _get_dual_rope_configs(llm_dict: Dict[str, Any]) -> dict[str, dict]:
+    """Return explicit sliding/full runtime RoPE configs when present."""
+    rope_parameters = llm_dict.get("rope_parameters")
+    layer_types = {
+        str(layer_type)
+        for layer_type in llm_dict.get("layer_types", [])
+    }
+    if not isinstance(rope_parameters, dict):
+        return {}
+    if not {"sliding_attention", "full_attention"} <= layer_types:
+        return {}
+
+    sliding_params = rope_parameters.get("sliding_attention")
+    full_params = rope_parameters.get("full_attention")
+    if not isinstance(sliding_params, dict) or not isinstance(
+            full_params, dict):
+        return {}
+    return {
+        "sliding_rope_config":
+        _runtime_rope_config_from_params(llm_dict, sliding_params),
+        "full_rope_config":
+        _runtime_rope_config_from_params(llm_dict, full_params),
+    }
+
+
+def _parse_attention_layer_types(config: dict,
+                                 num_hidden_layers: int) -> List[str]:
+    """Preserve per-layer sliding/full attention labels for RoPE routing."""
+    raw = config.get("layer_types")
+    if not isinstance(raw, list) or len(raw) != num_hidden_layers:
+        return []
+    return [
+        str(layer_type) if str(layer_type)
+        in ("sliding_attention", "full_attention") else "full_attention"
+        for layer_type in raw
+    ]
+
+
+def _get_attention_scaling(llm_dict: Dict[str, Any], model_type: str,
+                           head_dim: int) -> float:
+    """Return the scale applied to QK^T before softmax."""
+    for key in ("attention_scaling", "qk_scale", "scaling"):
+        if llm_dict.get(key) is not None:
+            return float(llm_dict[key])
+
+    # Gemma4 uses unscaled QK attention in HF even when the checkpoint config
+    # omits an explicit scale field.
+    if str(model_type) in {"gemma4", "gemma4_text"}:
+        return 1.0
+
+    return 1.0 / (float(head_dim)**0.5)
+
+
+def _get_embedding_scale(llm_dict: Dict[str, Any], model_type: str,
+                         hidden_size: int) -> float:
+    """Return the scale folded into runtime token embeddings."""
+    for key in ("embedding_scale", "embed_scale", "scalar_embed_scale"):
+        if llm_dict.get(key) is not None:
+            return float(llm_dict[key])
+
+    if str(model_type) in {"gemma4", "gemma4_text"}:
+        return math.sqrt(float(hidden_size))
+
+    return 1.0
+
+
+def _get_has_value_norm(llm_dict: Dict[str, Any], model_type: str) -> bool:
+    """Return whether attention values use Gemma-style RMSNorm."""
+    for key in ("has_value_norm", "has_v_norm", "value_norm"):
+        if llm_dict.get(key) is not None:
+            return bool(llm_dict[key])
+
+    return str(model_type) in {"gemma4", "gemma4_text"}
 
 
 @dataclass
@@ -290,12 +421,23 @@ class ModelConfig:
     partial_rotary_factor: float = 1.0
     # Hidden activation name used by architecture-specific auxiliary modules.
     hidden_activation: str = "silu"
+    # Optional explicit RoPE configs for mixed sliding/full attention stacks.
+    sliding_rope_config: Optional[dict] = None
+    full_rope_config: Optional[dict] = None
     # ------------------------------------------ model-family feature flags
     # Per-head RMSNorm after Q and K projections.
     # Auto-detected from checkpoint key names; not inferred from model_type.
     has_qk_norm: bool = False
+    # Per-head RMSNorm after V projection. Gemma4 stores this norm without
+    # learned weights, so it is selected from config metadata instead of
+    # checkpoint key names.
+    has_value_norm: bool = False
     # Bias on q/k/v projections.  Read from config.json "attention_bias".
     attention_bias: bool = False
+    # Multiplicative scale applied to QK^T before softmax.
+    attention_scaling: float = 0.0
+    # Multiplicative scale applied by the HF embedding module.
+    embedding_scale: float = 1.0
     # Weight dtype in the checkpoint
     torch_dtype: str = "bfloat16"
     # When True, embed_tokens and lm_head share the same weight tensor
@@ -305,6 +447,8 @@ class ModelConfig:
     # ------------------------------------------ per-layer block types
     # One entry per hidden layer: LAYER_ATTN, LAYER_MAMBA, LAYER_MLP, or LAYER_MOE.
     layer_types: List[str] = field(default_factory=list)
+    # Original attention labels for attention layers: full_attention or sliding_attention.
+    attention_layer_types: List[str] = field(default_factory=list)
     # ------------------------------------------ multimodal deepstack (VL)
     # Number of deepstack visual embedding tensors injected into the first N
     # hidden layers. Prefer ``vision_config.deepstack_visual_indexes`` length on
@@ -458,6 +602,11 @@ class ModelConfig:
         return sum(1 for t in self.layer_types if t == LAYER_MOE)
 
     @property
+    def use_dual_rope(self) -> bool:
+        return (self.sliding_rope_config is not None
+                and self.full_rope_config is not None)
+
+    @property
     def compute_dtype(self) -> "torch.dtype":  # noqa: F821
         import torch
         _MAP = {
@@ -521,11 +670,19 @@ class ModelConfig:
 
         quant = _parse_quant(model_dir, llm_dict)
         layer_types = _parse_layer_types(llm_dict)
+        attention_layer_types = _parse_attention_layer_types(
+            llm_dict, llm_dict["num_hidden_layers"])
+        dual_rope_configs = _get_dual_rope_configs(llm_dict)
         mamba_cfg = _parse_mamba_cfg(llm_dict,
                                      layer_types,
                                      model_dir=model_dir)
         gdn_cfg = _parse_gdn_cfg(llm_dict, layer_types)
         has_qk_norm = _detect_has_qk_norm(model_dir)
+        has_value_norm = _get_has_value_norm(llm_dict, model_type)
+        attention_scaling = _get_attention_scaling(llm_dict, model_type,
+                                                   head_dim)
+        embedding_scale = _get_embedding_scale(llm_dict, model_type,
+                                               hidden_size)
 
         # MTP config
         mtp_num_hidden_layers = llm_dict.get("mtp_num_hidden_layers")
@@ -588,20 +745,25 @@ class ModelConfig:
             rope_theta=_get_rope_theta(llm_dict),
             max_position_embeddings=llm_dict.get("max_position_embeddings",
                                                  4096),
-            rope_scaling=(llm_dict.get("rope_scaling")
-                          or llm_dict.get("rope_parameters") or None),
+            rope_scaling=_select_rope_scaling(llm_dict),
             original_max_position_embeddings=llm_dict.get(
                 "original_max_position_embeddings", None),
             partial_rotary_factor=_get_partial_rotary_factor(llm_dict),
             hidden_activation=llm_dict.get("hidden_activation",
                                            llm_dict.get("hidden_act", "silu")),
+            sliding_rope_config=dual_rope_configs.get("sliding_rope_config"),
+            full_rope_config=dual_rope_configs.get("full_rope_config"),
             has_qk_norm=has_qk_norm,
+            has_value_norm=has_value_norm,
             attention_bias=bool(llm_dict.get("attention_bias", False)),
+            attention_scaling=attention_scaling,
+            embedding_scale=embedding_scale,
             torch_dtype=llm_dict.get("torch_dtype",
                                      llm_dict.get("dtype", "bfloat16")),
             tie_word_embeddings=llm_dict.get("tie_word_embeddings", False),
             sliding_window_size=sliding_window_size,
             layer_types=layer_types,
+            attention_layer_types=attention_layer_types,
             quant=quant,
             mamba_cfg=mamba_cfg,
             gdn_cfg=gdn_cfg,
@@ -1008,10 +1170,15 @@ def _get_partial_rotary_factor(llm_dict: Dict[str, Any]) -> float:
         return float(prf)
     for key in ("rope_parameters", "rope_scaling"):
         nested = llm_dict.get(key)
-        if isinstance(
-                nested,
-                dict) and nested.get("partial_rotary_factor") is not None:
+        if not isinstance(nested, dict):
+            continue
+        if nested.get("partial_rotary_factor") is not None:
             return float(nested["partial_rotary_factor"])
+        for attention_type in ("full_attention", "sliding_attention"):
+            attention_params = nested.get(attention_type)
+            if (isinstance(attention_params, dict) and
+                    attention_params.get("partial_rotary_factor") is not None):
+                return float(attention_params["partial_rotary_factor"])
     return 1.0
 
 

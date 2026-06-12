@@ -230,3 +230,31 @@ TEST_F(RopeCacheTest, DifferentRopeTypesNotDeduplicated)
     EXPECT_EQ(cache.size(), 2U);
     EXPECT_NE(&t1, &t2);
 }
+
+TEST_F(RopeCacheTest, LongRopeInitializesThroughCache)
+{
+    RopeCache cache;
+
+    int32_t const rotaryDim = 96;
+    int32_t const maxSeqLen = 256;
+
+    RopeConfig config;
+    config.type = RopeType::kLongRope;
+    config.rotaryTheta = 10000.0F;
+    config.maxPositionEmbeddings = 4096;
+    LongRopeParams params;
+    params.originalMaxPositionEmbeddings = 2048;
+    params.shortFactor.assign(rotaryDim / 2, 1.0F);
+    params.longFactor.assign(rotaryDim / 2, 2.0F);
+    config.longRope = std::move(params);
+
+    rt::Tensor& t1 = cache.getOrCreate(config, rotaryDim, maxSeqLen, mStream);
+    EXPECT_EQ(cache.size(), 1U);
+    EXPECT_EQ(t1.getShape()[0], 1);
+    EXPECT_EQ(t1.getShape()[1], maxSeqLen);
+    EXPECT_EQ(t1.getShape()[2], rotaryDim);
+
+    rt::Tensor& t2 = cache.getOrCreate(config, rotaryDim, maxSeqLen, mStream);
+    EXPECT_EQ(cache.size(), 1U);
+    EXPECT_EQ(&t1, &t2);
+}
