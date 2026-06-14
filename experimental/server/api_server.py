@@ -35,6 +35,8 @@ Usage (from LLM object)::
 import argparse
 import json
 import logging
+import os
+import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -198,18 +200,29 @@ def _create_app(llm_instance):
         if has_tool_calls:
             finish_reason = "tool_calls"
 
+        # ``prompt_tokens`` is reported as 0 because the runtime response does
+        # not expose tokenised prompt ids; ``total_tokens`` is then equal to
+        # ``completion_tokens``. SDKs that validate the schema (existence of
+        # the three fields) succeed; consumers that compute cost from
+        # ``prompt_tokens`` will see 0 until the runtime is extended.
         return {
             "id":
             response_id,
             "object":
             "chat.completion",
+            "created":
+            int(time.time()),
+            "model":
+            os.path.basename(llm_instance.model_dir) or llm_instance.model_dir,
             "choices": [{
                 "index": 0,
                 "message": message_body,
                 "finish_reason": finish_reason,
             }],
             "usage": {
+                "prompt_tokens": 0,
                 "completion_tokens": completion_tokens,
+                "total_tokens": completion_tokens,
             },
         }
 

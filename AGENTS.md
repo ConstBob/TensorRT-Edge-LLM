@@ -72,7 +72,6 @@ The pipeline is: `HuggingFace Model → Python Export (quantize + ONNX) → C++ 
 | `tensorrt-edgellm-process-lora` | `tensorrt_edgellm.scripts.process_lora_weights:main` |
 | `tensorrt-edgellm-merge-lora` | `tensorrt_edgellm.scripts.merge_lora:main` |
 | `tensorrt-edgellm-reduce-vocab` | `tensorrt_edgellm.scripts.reduce_vocab:main` |
-| `tensorrt-edgellm-preprocess-audio` | `tensorrt_edgellm.scripts.preprocess_audio:main` |
 
 ## Key Files
 

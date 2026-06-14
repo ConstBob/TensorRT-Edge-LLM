@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/stl/filesystem.h>
@@ -23,13 +24,19 @@
 #include "builder/visualBuilder.h"
 #include "common/checkMacros.h"
 #include "common/logger.h"
+#include "common/tensor.h"
 #include "common/trtUtils.h"
 #include "profiling/metrics.h"
+#include "runtime/audioLoader.h"
+#include "runtime/audioUtils.h"
 #include "runtime/imageUtils.h"
 #include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "runtime/melSpectrogram.h"
 
 #include <chrono>
+#include <cstring>
+#include <cuda_runtime.h>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -177,6 +184,65 @@ imageUtils::ImageData loadImageFromBytes(py::bytes const& data)
     return imageUtils::loadImageFromMemory(reinterpret_cast<unsigned char const*>(dataStr.data()), dataStr.size());
 }
 
+//! \brief Build an AudioData from raw encoded audio bytes (wav / mp3 / flac).
+//! Decodes via vendored miniaudio (16 kHz mono FP32) and hands raw PCM off to
+//! the runner; mel extraction happens inside the audio runner per its
+//! ``audio/config.json``.
+audioUtils::AudioData loadAudioBufferFromBytes(py::bytes data)
+{
+    constexpr int32_t kTargetSampleRate = 16000;
+    std::string dataStr = data;
+    audioUtils::AudioData audio;
+    if (!audioUtils::loadAudioDataFromBytes(
+            reinterpret_cast<uint8_t const*>(dataStr.data()), dataStr.size(), kTargetSampleRate, audio))
+    {
+        throw std::runtime_error("Audio decode failed (unsupported container or corrupt bytes)");
+    }
+    return audio;
+}
+
+//! \brief Decode audio bytes + extract mel to numpy.float32 (host-resident).
+//! Diagnostic helper exposing the C++ ``MelExtractor`` output directly — the
+//! production path (``loadAudioBufferFromBytes`` -> runner) only returns PCM
+//! at the Python boundary and runs mel extraction inside the audio runner.
+//! Returns the FE's natural 2-D layout.
+py::array_t<float> extractMelToNumpy(py::bytes data, std::string const& feType)
+{
+    audio::MelExtractor extractor = audio::makeExtractorByName(feType);
+    int32_t const targetSampleRate = extractor.config().sampleRate;
+
+    char const* rawPtr = nullptr;
+    Py_ssize_t rawSize = 0;
+    if (PyBytes_AsStringAndSize(data.ptr(), const_cast<char**>(&rawPtr), &rawSize) != 0)
+    {
+        throw py::error_already_set();
+    }
+
+    audio::AudioPCM pcm;
+    if (!audio::loadAudioBytes(
+            reinterpret_cast<uint8_t const*>(rawPtr), static_cast<size_t>(rawSize), targetSampleRate, pcm))
+    {
+        throw std::runtime_error("Audio decode failed (unsupported container or corrupt bytes)");
+    }
+
+    Tensor hostMel;
+    if (!extractor.extract(pcm, hostMel))
+    {
+        throw std::runtime_error("Mel extraction failed");
+    }
+
+    Coords const& shape = hostMel.getShape();
+    std::vector<ssize_t> npShape;
+    npShape.reserve(static_cast<size_t>(shape.getNumDims()));
+    for (int32_t d = 0; d < shape.getNumDims(); ++d)
+    {
+        npShape.push_back(static_cast<ssize_t>(shape[d]));
+    }
+    py::array_t<float> out(npShape);
+    std::memcpy(out.mutable_data(), hostMel.dataPointer<float>(), static_cast<size_t>(shape.volume()) * sizeof(float));
+    return out;
+}
+
 } // anonymous namespace
 
 PYBIND11_MODULE(_edgellm_runtime, m)
@@ -223,6 +289,24 @@ PYBIND11_MODULE(_edgellm_runtime, m)
 
     m.def("load_image_from_path", &loadImageFromPath, py::arg("path"), "Load image from file path");
     m.def("load_image_from_bytes", &loadImageFromBytes, py::arg("data"), "Load image from bytes");
+
+    // ========================================================================
+    // Audio utilities
+    // ========================================================================
+    py::class_<audioUtils::AudioData>(m, "AudioData")
+        .def(py::init<>())
+        .def_readwrite("sample_rate", &audioUtils::AudioData::sampleRate);
+
+    m.def("load_audio_buffer_from_bytes", &loadAudioBufferFromBytes, py::arg("data"),
+        "Build an AudioData from raw encoded audio bytes (wav/mp3/flac). "
+        "Decodes to mono FP32 PCM @ 16 kHz via miniaudio; the audio runner "
+        "extracts mel internally per its audio/config.json.");
+
+    m.def("extract_mel_to_numpy", &extractMelToNumpy, py::arg("data"), py::arg("fe_type"),
+        "Decode audio bytes (wav/mp3/flac) and return the host float32 "
+        "mel-spectrogram directly to numpy (no f16 cast, no GPU upload). "
+        "Test / diagnostic helper for comparing the C++ pipeline against HF "
+        "feature extractors at full float32 precision.");
 
     // ========================================================================
     // Message structures
@@ -282,6 +366,7 @@ PYBIND11_MODULE(_edgellm_runtime, m)
             py::arg("messages"))
         .def_readwrite("messages", &LLMGenerationRequest::Request::messages)
         .def_readwrite("image_buffers", &LLMGenerationRequest::Request::imageBuffers)
+        .def_readwrite("audio_buffers", &LLMGenerationRequest::Request::audioBuffers)
         .def_readwrite("stop_strings", &LLMGenerationRequest::Request::stopStrings);
 
     // ========================================================================

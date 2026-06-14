@@ -22,7 +22,6 @@
 #include "common/cudaUtils.h"
 #include "common/logger.h"
 #include "common/mmapReader.h"
-#include "common/safetensorsUtils.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
@@ -145,6 +144,24 @@ bool Qwen3OmniAudioRunner::validateAndFillConfig(std::string const& engineDir)
         mConfig.mropeTheta = jsonConfig["rope_theta"].get<float>();
     }
 
+    // Pick mel feature-extractor family from the audio engine's top-level
+    // ``model_type`` (export.py writes ``qwen3_asr_thinker`` /
+    // ``qwen3_omni_audio_encoder`` here). Runner owns mel extraction;
+    // callers hand off raw PCM.
+    std::string const audioModelType = jsonConfig.value("model_type", "");
+    if (audioModelType == "qwen3_asr_thinker" || audioModelType == "qwen3_omni_audio_encoder")
+    {
+        mFeMel = rt::audio::makeWhisperExtractor();
+    }
+    else
+    {
+        LOG_ERROR(
+            "Unsupported audio model_type %s for Qwen3OmniAudioRunner (expected qwen3_asr_thinker / "
+            "qwen3_omni_audio_encoder)",
+            audioModelType.c_str());
+        return false;
+    }
+
     return true;
 }
 
@@ -166,11 +183,8 @@ bool Qwen3OmniAudioRunner::allocateBuffer([[maybe_unused]] cudaStream_t stream)
     int64_t const melBins = mConfig.melBins;
     int64_t const audioFeatureDim = mConfig.audioFeatureDim;       // Use config value, not output shape
     int64_t const maxAudioTokens = paddedMaskIndicesShapeMax.d[0]; // Max attention elements = max audio tokens
-    int64_t const maxTimeSteps = 6000;                             // Conservative estimate
 
     // Allocate tensors
-    mMelSpectrogram = rt::Tensor({1, melBins, maxTimeSteps}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-
     int64_t const maxNumChunks = paddedFeaturesShapeMax.d[0];
     int64_t const maxChunkLen = paddedFeaturesShapeMax.d[2];
     mPaddedFeature = rt::Tensor({maxNumChunks, melBins, maxChunkLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
@@ -180,8 +194,6 @@ bool Qwen3OmniAudioRunner::allocateBuffer([[maybe_unused]] cudaStream_t stream)
 
     int64_t const maxValidElements = paddedMaskIndicesShapeMax.d[0];
     mPaddedMaskIndices = rt::Tensor({maxValidElements, 2}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64);
-
-    mAfterCNNLens = rt::Tensor({maxNumChunks}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT64);
 
     mAudioEmbedding = rt::Tensor({maxAudioTokens, audioFeatureDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
@@ -311,32 +323,6 @@ void Qwen3OmniAudioRunner::textPreprocess(rt::LLMGenerationRequest const& reques
     }
 }
 
-bool Qwen3OmniAudioRunner::loadMelSpectrogramFromFile(
-    std::string const& filePath, std::string const& format, rt::Tensor& melSpectrogram, cudaStream_t stream)
-{
-    if (format != "safetensors")
-    {
-        LOG_ERROR("Only safetensors format is supported. Got: %s", format.c_str());
-        return false;
-    }
-
-    // Load mel-spectrogram from safetensors file
-    std::vector<rt::Tensor> tensors;
-    if (!safetensors::loadSafetensors(filePath, tensors, stream))
-    {
-        LOG_ERROR("Failed to load mel-spectrogram from safetensors file: %s", filePath.c_str());
-        return false;
-    }
-
-    // Use the first tensor as mel-spectrogram (should contain exactly one tensor)
-    check::check(tensors.size() == 1, "Mel-spectrogram safetensors should contain exactly one tensor");
-    check::check(tensors[0].getShape().getNumDims() == 3, "Mel-spectrogram should be 3D [1, mel_bins, time_steps]");
-    check::check(tensors[0].getDataType() == nvinfer1::DataType::kHALF, "Mel-spectrogram must be FP16 (HALF)");
-
-    melSpectrogram = std::move(tensors[0]);
-    return true;
-}
-
 bool Qwen3OmniAudioRunner::preprocessAudio(std::vector<rt::audioUtils::AudioData> const& audioBuffers,
     std::vector<int64_t>& audioTokenLengths, cudaStream_t stream)
 {
@@ -354,22 +340,24 @@ bool Qwen3OmniAudioRunner::preprocessAudio(std::vector<rt::audioUtils::AudioData
     // Process each audio clip
     for (auto const& audio : audioBuffers)
     {
-        rt::Tensor melSpec;
-
-        // Load pre-computed mel-spectrogram
-        // Audio preprocessing (Mel-spectrogram computation) must be done externally
-        // using dedicated audio processing libraries (e.g., librosa, torchaudio) in Python
-        if (audio.melSpectrogramPath.empty())
+        // PCM-only contract; runner extracts mel internally via mFeMel.
+        if (!audio.pcm)
         {
             LOG_ERROR(
-                "Pre-computed mel-spectrogram path is required. "
-                "Audio preprocessing must be done externally using Python or other pipelines.");
+                "AudioData.pcm is null; populate via load_audio_buffer_from_bytes "
+                "(server) or requestFileParser (CLI).");
             return false;
         }
-
-        if (!loadMelSpectrogramFromFile(audio.melSpectrogramPath, audio.melSpectrogramFormat, melSpec, stream))
+        rt::Tensor hostMel;
+        if (!mFeMel.extract(*audio.pcm, hostMel))
         {
-            LOG_ERROR("Failed to load mel-spectrogram from file");
+            LOG_ERROR("Mel extraction failed");
+            return false;
+        }
+        // FP32 host mel -> FP16 GPU mel ([1, mel_bins, T] for whisper layout).
+        rt::Tensor melSpec;
+        if (!audioUtils::uploadHostMelFp32ToFp16Gpu(hostMel, melSpec, stream, "Qwen3OmniAudioRunner::mel"))
+        {
             return false;
         }
 

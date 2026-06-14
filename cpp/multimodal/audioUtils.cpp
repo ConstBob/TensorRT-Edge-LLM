@@ -31,6 +31,28 @@ namespace rt
 namespace audioUtils
 {
 
+bool uploadHostMelFp32ToFp16Gpu(
+    rt::Tensor const& hostMel, rt::Tensor& devOut, cudaStream_t stream, std::string const& debugName)
+{
+    Coords const& hsh = hostMel.getShape();
+    if (hsh.getNumDims() != 2)
+    {
+        LOG_ERROR("uploadHostMelFp32ToFp16Gpu: expected 2-D host mel, got %d-D", hsh.getNumDims());
+        return false;
+    }
+    int64_t const numel = hsh.volume();
+    devOut = rt::Tensor({1, hsh[0], hsh[1]}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, debugName);
+    std::vector<__half> halfBuf(static_cast<size_t>(numel));
+    float const* srcF32 = hostMel.dataPointer<float>();
+    for (int64_t i = 0; i < numel; ++i)
+    {
+        halfBuf[i] = __float2half(srcF32[i]);
+    }
+    CUDA_CHECK(cudaMemcpyAsync(devOut.rawPointer(), halfBuf.data(), static_cast<size_t>(numel) * sizeof(__half),
+        cudaMemcpyHostToDevice, stream));
+    return true;
+}
+
 int64_t computeFeatExtractOutputLength(int64_t inputLength, int32_t nWindow)
 {
     // Floor division that always rounds toward negative infinity, matching Python's "//" operator.

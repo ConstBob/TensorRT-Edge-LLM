@@ -41,8 +41,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from audio_eval_utils import (OMNI_SYSTEM_PROMPT,
-                              save_audio_array_to_safetensors)
+from audio_eval_utils import OMNI_SYSTEM_PROMPT, save_audio_array_to_wav
 from datasets import Audio, Dataset, load_dataset
 from edgellm_dataset import DatasetConfig, EdgeLLMDataset
 
@@ -58,7 +57,7 @@ class OmniBenchDataset(EdgeLLMDataset):
     def __init__(self, dataset: Dataset, config: DatasetConfig, **kwargs):
         super().__init__(dataset=dataset, config=config, **kwargs)
         self.images_dir = os.path.join(self.output_dir, "images")
-        self.audio_dir = os.path.join(self.output_dir, "audio_safetensors")
+        self.audio_dir = os.path.join(self.output_dir, "audio_wavs")
         os.makedirs(self.images_dir, exist_ok=True)
         os.makedirs(self.audio_dir, exist_ok=True)
 
@@ -110,38 +109,44 @@ class OmniBenchDataset(EdgeLLMDataset):
         return image_paths
 
     def save_audio(self, data: Dict[str, Any]) -> Optional[str]:
-        """Save OmniBench audio as safetensors mel-spectrogram.
+        """Save OmniBench audio to disk for the C++ ``llm_inference`` CLI.
 
-        Handles both decoded (dict with 'array') and raw (dict with 'bytes')
-        audio formats from HuggingFace datasets.
+        HF gives ``bytes`` (raw container) or ``array`` (decoded waveform).
+        For ``bytes`` we drop them verbatim — miniaudio in the C++ runtime
+        handles container decode + resample + downmix. For ``array`` we
+        write a 16-bit WAV at the dataset-reported sample rate.
         """
-        import io
-
-        import librosa
+        from pathlib import Path
 
         audio_data = data.get("audio")
         if audio_data is None:
             return None
 
         idx = data.get("index", id(data))
-        sf_path = os.path.join(self.audio_dir, f"audio_{idx}.safetensors")
-        if os.path.exists(sf_path):
-            return sf_path
+        os.makedirs(self.audio_dir, exist_ok=True)
 
         if isinstance(audio_data, dict) and "bytes" in audio_data:
-            arr, sr = librosa.load(io.BytesIO(audio_data["bytes"]), sr=None)
-        elif isinstance(audio_data, dict) and "array" in audio_data:
+            ext = Path(audio_data.get("path", "")).suffix.lower()
+            if ext not in (".wav", ".mp3", ".flac"):
+                ext = ".wav"
+            out_path = os.path.join(self.audio_dir, f"audio_{idx}{ext}")
+            if not os.path.exists(out_path):
+                with open(out_path, "wb") as f:
+                    f.write(audio_data["bytes"])
+            return out_path
+
+        wav_path = os.path.join(self.audio_dir, f"audio_{idx}.wav")
+        if os.path.exists(wav_path):
+            return wav_path
+        if isinstance(audio_data, dict) and "array" in audio_data:
             arr = np.array(audio_data["array"], dtype=np.float32)
             sr = audio_data["sampling_rate"]
         else:
             arr = np.array(audio_data, dtype=np.float32)
             sr = 16000
-
         if arr.ndim > 1:
             arr = arr.mean(axis=0)
-        if sr != 16000:
-            arr = librosa.resample(arr, orig_sr=sr, target_sr=16000)
-        return save_audio_array_to_safetensors(arr, sf_path)
+        return save_audio_array_to_wav(arr, wav_path, sample_rate=sr)
 
     def extract_answer(self, data: Dict[str, Any]) -> Optional[str]:
         """Extract the correct answer letter (A/B/C/D) from OmniBench data."""

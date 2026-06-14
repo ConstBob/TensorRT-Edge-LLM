@@ -536,12 +536,17 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
             # content list instead of expanding it.  Emit one real placeholder
             # per item; NemotronOmniViTRunner / NemotronOmniAudioRunner repeat
             # each to the encoder's output length at textPreprocess time.
+            # Audio is wrapped with ``<so_start>`` / ``<so_end>`` to match HF
+            # ``processing.py``'s layout (the same one vLLM inherits via HF
+            # processor); the runner expands ``<so_embedding>`` × N between
+            # the markers so the tokenized prompt the model sees is
+            # ``<so_start><so_embedding>×N<so_end>``.
             content_types = {
                 "image": {
                     "format": "<img><image></img>"
                 },
                 "audio": {
-                    "format": "<so_embedding>"
+                    "format": "<so_start><so_embedding><so_end>"
                 },
             }
         elif is_vlm:

@@ -17,10 +17,10 @@
 
 #pragma once
 
-#include "common/cudaUtils.h"
 #include "common/tensor.h"
+#include "runtime/audioLoader.h"
+#include <filesystem>
 #include <memory>
-#include <string>
 #include <vector>
 
 namespace trt_edgellm
@@ -30,14 +30,18 @@ namespace rt
 namespace audioUtils
 {
 
-//! Audio data container
-//! For input: provide melSpectrogramPath for pre-computed Mel-spectrogram
-//! For output: contains generated audio waveform data, sampleRate, and numChannels
+//! Audio input container. Holds raw mono FP32 PCM (host) decoded from
+//! ``.wav`` / ``.mp3`` / ``.flac`` by ``audioLoader``. The audio runner
+//! reads ``pcm``, extracts mel internally per its ``audio/config.json``,
+//! and consumes the resulting GPU mel.
+//!
+//! TTS-side output fields (``waveform`` / ``codebookCodes``) are
+//! documented inline.
 struct AudioData
 {
-    // For audio input: pre-computed Mel-spectrogram
-    std::string melSpectrogramPath;   //!< Path to pre-computed Mel-spectrogram file (.npy or .raw)
-    std::string melSpectrogramFormat; //!< Format of the mel-spectrogram file: "npy" or "raw"
+    //! \brief Raw audio waveform: mono FP32, host. Sample rate matches the
+    //! runner's MelExtractor expectation (16 kHz for whisper / parakeet).
+    std::shared_ptr<rt::audio::AudioPCM> pcm;
 
     // For audio output: generated waveform
     std::shared_ptr<Tensor> waveform; //!< Waveform samples [1, numSamples], FP16, range [-1, 1], CPU
@@ -48,6 +52,16 @@ struct AudioData
     std::vector<std::vector<int32_t>> codebookCodes; //!< RVQ codebook codes [numCodebooks][seqLen]
     bool hasWaveform{false};                         //!< True if waveform contains valid data
 };
+
+//! Decode raw audio bytes (wav / mp3 / flac via miniaudio) into an
+//! ``AudioData`` container ready for the audio runner. Wraps
+//! ``audio::loadAudioBytes`` + ``AudioData`` field plumbing so callers don't
+//! repeat the staging boilerplate. Mirrors ``imageUtils::loadImageFromMemory``.
+bool loadAudioDataFromBytes(uint8_t const* bytes, size_t size, int32_t targetSampleRate, AudioData& out);
+
+//! Load a local audio file (wav / mp3 / flac via miniaudio) into an
+//! ``AudioData`` container. Mirrors ``imageUtils::loadImageFromFile``.
+bool loadAudioDataFromFile(std::filesystem::path const& path, int32_t targetSampleRate, AudioData& out);
 
 } // namespace audioUtils
 } // namespace rt

@@ -68,6 +68,7 @@ class EngineType(enum.Enum):
 ONNX_MODEL_FILE = "model.onnx"
 LLM_ENGINE_FILE = "llm.engine"
 VISUAL_ENGINE_FILE = "visual.engine"
+AUDIO_ENGINE_FILE = "audio_encoder.engine"
 SPEC_BASE_ENGINE_FILE = "spec_base.engine"
 SPEC_DRAFT_ENGINE_FILE = "spec_draft.engine"
 CONFIG_FILE = "config.json"
@@ -97,14 +98,16 @@ def validate_llm_engine_dir(engine_dir: str) -> bool:
 
 
 def validate_visual_engine_dir(engine_dir: str) -> bool:
-    """Check that a visual engine directory has the required files.
+    """Check that a multimodal engine directory has at least one encoder.
 
-    Matches the C++ runtime convention: checks ``visual/visual.engine``
-    first, then ``visual.engine`` at root as a fallback.
+    Matches the C++ ``MultimodalRunner::create`` layout: a ``visual/`` or
+    ``audio/`` subdirectory holding the respective ``.engine``; legacy
+    ``visual.engine`` at root is also accepted.
     """
-    return (os.path.isfile(
-        os.path.join(engine_dir, "visual", VISUAL_ENGINE_FILE))
-            or os.path.isfile(os.path.join(engine_dir, VISUAL_ENGINE_FILE)))
+    return (
+        os.path.isfile(os.path.join(engine_dir, "visual", VISUAL_ENGINE_FILE))
+        or os.path.isfile(os.path.join(engine_dir, "audio", AUDIO_ENGINE_FILE))
+        or os.path.isfile(os.path.join(engine_dir, VISUAL_ENGINE_FILE)))
 
 
 def validate_spec_decode_engine_dir(engine_dir: str) -> bool:

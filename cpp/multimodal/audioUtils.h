@@ -19,6 +19,7 @@
 
 #include "common/tensor.h"
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace trt_edgellm
@@ -36,6 +37,12 @@ struct ChunkInfo
     std::vector<int64_t> chunkOffsets;
     int64_t maxChunkLength;
 };
+
+//! Cast a host FP32 mel ``[H, W]`` to FP16 and upload to a fresh GPU tensor
+//! shaped ``[1, H, W]``. Shared by audio runners so the same FP16-cast +
+//! cudaMemcpyAsync staging path isn't duplicated.
+bool uploadHostMelFp32ToFp16Gpu(
+    rt::Tensor const& hostMel, rt::Tensor& devOut, cudaStream_t stream, std::string const& debugName);
 
 //! Compute CNN output length (three 2x downsampling layers)
 int64_t computeFeatExtractOutputLength(int64_t inputLength, int32_t nWindow);
