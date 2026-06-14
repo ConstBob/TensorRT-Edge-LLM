@@ -21,6 +21,7 @@
 #include "common/inputLimits.h"
 #include "common/logger.h"
 #include "common/stringUtils.h"
+#include "runtime/audioLoader.h"
 #include "runtime/audioUtils.h"
 #include "runtime/imageUtils.h"
 
@@ -221,21 +222,33 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                         else if (msgContent.type == "audio")
                         {
                             msgContent.content = contentItemJson["audio"].get<std::string>();
-                            rt::audioUtils::AudioData audio;
                             std::string const audioPath = msgContent.content;
                             size_t const dotPos = audioPath.find_last_of('.');
                             std::string const extension = (dotPos != std::string::npos) ? audioPath.substr(dotPos) : "";
-                            if (extension == ".safetensors")
+                            bool const isRawAudio
+                                = (extension == ".wav" || extension == ".mp3" || extension == ".flac");
+
+                            if (isRawAudio)
                             {
-                                audio.melSpectrogramPath = audioPath;
-                                audio.melSpectrogramFormat = "safetensors";
+                                // Raw audio path: miniaudio decode → PCM. The runtime audio
+                                // runner extracts mel internally per its audio/config.json,
+                                // mirroring how the visual runner owns image preprocessing.
+                                constexpr int32_t kTargetSampleRate = 16000;
+                                rt::audioUtils::AudioData audio;
+                                if (!rt::audioUtils::loadAudioDataFromFile(audioPath, kTargetSampleRate, audio))
+                                {
+                                    throw std::runtime_error(format::fmtstr(
+                                        "Failed to decode audio file: %s (unsupported container or corrupt bytes)",
+                                        audioPath.c_str()));
+                                }
+                                size_t const numSamples = audio.pcm->samples.size();
                                 audioBuffers.push_back(std::move(audio));
-                                LOG_INFO("Loaded mel-spectrogram from: %s (safetensors format)", audioPath.c_str());
+                                LOG_INFO("Decoded audio (PCM): %s (%ld samples @ %d Hz)", audioPath.c_str(),
+                                    static_cast<long>(numSamples), kTargetSampleRate);
                             }
                             else
                             {
-                                LOG_WARNING(
-                                    "Unsupported audio format: %s (only .safetensors mel-spectrograms supported)",
+                                LOG_WARNING("Unsupported audio format: %s (CLI accepts raw .wav / .mp3 / .flac files)",
                                     audioPath.c_str());
                             }
                         }

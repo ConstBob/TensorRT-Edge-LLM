@@ -40,6 +40,7 @@ import os
 import shutil
 from typing import Dict, Iterator
 
+import numpy as np
 import torch
 from safetensors.torch import load_file, save_file
 from transformers import AutoTokenizer
@@ -114,14 +115,46 @@ def asr_calibration_dataloader(
     """
     import soundfile as sf
     from datasets import Audio, load_dataset
+    from transformers import WhisperFeatureExtractor
 
-    # Reuse the shared mel extractor instead of redoing the Whisper
-    # feature-extractor wiring here; the runtime preprocess (Step 4 of
-    # the ASR example) uses the same helper, so calibration and runtime
-    # match by construction. ``num_mel_bins`` is the Whisper default
-    # already (128) so we pass nothing.
-    from tensorrt_edgellm.scripts.preprocess_audio import \
-        extract_mel_spectrogram
+    def extract_mel_spectrogram(audio: np.ndarray, sample_rate: int,
+                                feature_extractor_type: str):
+        """Offline-only helper: build mel via HF WhisperFeatureExtractor for
+        quantization calibration data.
+
+        The runtime audio path itself does NOT use Python — it's pure C++
+        via miniaudio + the in-tree mel extractor in
+        ``cpp/runtime/melSpectrogram``. This calibration path stays in
+        Python because (a) calibration runs once at quantize-time on CPU
+        and (b) the calibrator wants a numpy tensor it can feed into the
+        model's forward. Parameters match Qwen3-Omni / Qwen3-ASR
+        ``preprocessor_config.json`` (``feature_size=128``,
+        ``hop_length=160``, ``n_fft=400``); HF's default ``feature_size``
+        is 80, which would produce a mel shape the audio encoder cannot
+        consume.
+        """
+        if feature_extractor_type != "whisper":
+            raise ValueError(
+                "qwen3_asr_loader: only whisper FE supported here")
+        fe = WhisperFeatureExtractor(
+            feature_size=128,
+            sampling_rate=sample_rate,
+            hop_length=160,
+            n_fft=400,
+            return_attention_mask=True,
+            padding_value=0.0,
+        )
+        out = fe(
+            audio,
+            sampling_rate=sample_rate,
+            return_tensors="np",
+            return_attention_mask=True,
+            padding=False,
+            truncation=False,
+        )
+        mel = out["input_features"][0]
+        valid_len = int(out["attention_mask"][0].sum())
+        return mel, valid_len
 
     # ``decode=False`` avoids torchcodec; we decode bytes with soundfile.
     stream = load_dataset(dataset_name,

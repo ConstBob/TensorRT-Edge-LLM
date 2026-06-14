@@ -19,7 +19,7 @@
 
 #include "multimodalRunner.h"
 #include "runtime/audioUtils.h"
-#include <cuda_fp16.h>
+#include "runtime/melSpectrogram.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -103,8 +103,8 @@ public:
         rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream) override;
 
 private:
-    //! \brief Preprocess audio buffers and run encoder inference
-    //! \param[in] audioBuffers Input audio data with mel-spectrogram paths or waveforms
+    //! \brief Preprocess audio buffers (PCM → mel internally) and run encoder.
+    //! \param[in] audioBuffers Input audio data carrying raw PCM (``AudioData::pcm``)
     //! \param[out] audioTokenLengths Output token lengths for each audio clip
     //! \param[in] stream CUDA stream for execution
     //! \return True if preprocessing and inference succeeded, false otherwise
@@ -119,15 +119,6 @@ private:
     void textPreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchInputIds,
         std::vector<int64_t> const& audioTokenLengths, tokenizer::Tokenizer const* tokenizer);
 
-    //! \brief Load pre-computed mel-spectrogram from file
-    //! \param[in] filePath Path to .npy or .raw file
-    //! \param[in] format File format: "npy" or "raw"
-    //! \param[out] melSpectrogram Output tensor [1, mel_bins, time_steps]
-    //! \param[in] stream CUDA stream for execution
-    //! \return True on success, false otherwise
-    bool loadMelSpectrogramFromFile(
-        std::string const& filePath, std::string const& format, rt::Tensor& melSpectrogram, cudaStream_t stream);
-
     //! \brief Initialize MRope cos/sin cache with sequential position IDs (T=H=W=[0,1,2,...])
     //! \details Used for audio+text only models (e.g. Qwen3-ASR) where all 3 MRope dimensions
     //!          use identical sequential positions. Skipped when mConfig.mropeTheta == 0.
@@ -138,15 +129,14 @@ private:
     bool initializeSequentialMRopeCache(
         int64_t activeBatchSize, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream);
 
-    AudioConfig mConfig{};                                      //!< Audio encoder configuration
-    std::unique_ptr<nvinfer1::ICudaEngine> mAudioEngine;        //!< Audio encoder TensorRT engine
+    AudioConfig mConfig{};                               //!< Audio encoder configuration
+    rt::audio::MelExtractor mFeMel;                      //!< FE for PCM→mel; family bound by validateAndFillConfig
+    std::unique_ptr<nvinfer1::ICudaEngine> mAudioEngine; //!< Audio encoder TensorRT engine
     std::unique_ptr<nvinfer1::IExecutionContext> mAudioContext; //!< Audio encoder execution context
-    rt::Tensor mMelSpectrogram{};                               //!< [batch, mel_bins, time] Mel-spectrogram input
     rt::Tensor mPaddedFeature{};      //!< [num_chunks, mel_bins, max_chunk_len] Padded audio chunks
     rt::Tensor mPaddedMaskAfterCNN{}; //!< [num_chunks, max_len_after_cnn] Mask for valid tokens
     rt::Tensor mPaddedMaskIndices{};  //!< [num_valid_elements, 2] Nonzero indices from mask
     rt::Tensor mAudioAttentionMask{}; //!< [num_attention_elems, num_attention_elems] Block-diagonal attention mask
-    rt::Tensor mAfterCNNLens{};       //!< [batch_size] Length of each audio after CNN (CPU tensor)
     rt::Tensor mAudioEmbedding{};     //!< [num_audio_tokens, hidden_dim] Audio encoder output
 };
 

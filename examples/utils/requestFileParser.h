@@ -53,7 +53,7 @@ namespace exampleUtils
  *           {"role": "...", "content": "..."},
  *           {"role": "...", "content": [{"type":"text", "text":"..."},
  *                                       {"type":"image", "image":"/path/to/img"},
- *                                       {"type":"audio", "audio":"/path/to/audio.safetensors"}]}
+ *                                       {"type":"audio", "audio":"/path/to/audio.wav"}]}
  *         ]
  *       }
  *     ]

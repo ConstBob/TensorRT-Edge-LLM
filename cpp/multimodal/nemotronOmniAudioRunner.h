@@ -19,6 +19,7 @@
 
 #include "multimodalRunner.h"
 #include "runtime/audioUtils.h"
+#include "runtime/melSpectrogram.h"
 #include <cuda_fp16.h>
 #include <memory>
 #include <string>
@@ -32,13 +33,10 @@ namespace rt
 //! \brief Configuration for Nemotron-Omni Parakeet audio encoder
 struct NemotronOmniAudioConfig
 {
-    int32_t melBins{0};           //!< Number of mel-frequency bins
-    int32_t audioFeatureDim{0};   //!< Audio feature dimension (LLM hidden size)
-    int32_t subsamplingFactor{0}; //!< Parakeet subsampling factor
-    int32_t samplingRate{0};      //!< Audio sampling rate
-
+    int32_t melBins{0};             //!< Number of mel-frequency bins
+    int32_t audioFeatureDim{0};     //!< Audio feature dimension (LLM hidden size)
+    int32_t subsamplingFactor{0};   //!< Parakeet subsampling factor
     int32_t soundContextTokenId{0}; //!< <so_embedding> token ID
-    int32_t vocabSize{0};           //!< Vocabulary size (audio token ID offset)
 };
 
 //! \brief Runner for Nemotron-Omni Parakeet audio encoder.
@@ -92,15 +90,6 @@ public:
     rt::Tensor& getOutputEmbedding() override;
 
 private:
-    //! \brief Load pre-computed mel-spectrogram from file
-    //! \param[in] filePath Path to .npy or .raw file
-    //! \param[in] format File format: "npy" or "raw"
-    //! \param[out] melSpectrogram Output tensor [1, seq_len, mel_bins]
-    //! \param[in] stream CUDA stream for execution
-    //! \return True on success, false otherwise
-    bool loadMelSpectrogramFromFile(
-        std::string const& filePath, std::string const& format, rt::Tensor& melSpectrogram, cudaStream_t stream);
-
     //! \brief Encode all audio clips in the request batch into mAudioEmbedding.
     //!
     //! Iterates ``request.requests`` (and each request's audioBuffers) in
@@ -129,6 +118,7 @@ private:
         std::vector<int64_t> const& audioTokenLengths, tokenizer::Tokenizer const* tokenizer);
 
     NemotronOmniAudioConfig mConfig{}; //!< Nemotron-Omni Parakeet audio configuration
+    rt::audio::MelExtractor mFeMel;    //!< FE for PCM→mel; family bound by validateAndFillConfig
     rt::Tensor mInputFeatures{};       //!< [1, paddedSeqLen, mel_bins] encoder input (rebound per clip)
     rt::Tensor mAudioEmbedding{};      //!< [totalEncodedRows, hidden_dim] flat output for all clips in batch
     int64_t mMaxSeqLen{0};             //!< Max raw mel-spectrogram time steps from engine profile

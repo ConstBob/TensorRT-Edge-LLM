@@ -1,0 +1,155 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "audioLoader.h"
+
+#include "common/logger.h"
+
+// miniaudio: single-header library. The implementation lives in this TU only.
+// Disable subsystems we don't need (playback / capture / device I/O / null
+// backend) to keep object size small. We only use the decoder API.
+#define MA_NO_DEVICE_IO
+#define MA_NO_THREADING
+#define MA_NO_GENERATION
+#define MA_NO_RESOURCE_MANAGER
+#define MA_NO_NODE_GRAPH
+#define MA_NO_ENGINE
+#define MINIAUDIO_IMPLEMENTATION
+#include "miniaudio.h"
+
+namespace trt_edgellm
+{
+namespace rt
+{
+namespace audio
+{
+
+namespace
+{
+
+//! RAII guard so any early-return from a decode helper cleans up the decoder.
+class DecoderGuard
+{
+public:
+    explicit DecoderGuard(ma_decoder& d) noexcept
+        : mDecoder(d)
+    {
+    }
+    ~DecoderGuard()
+    {
+        ma_decoder_uninit(&mDecoder);
+    }
+    DecoderGuard(DecoderGuard const&) = delete;
+    DecoderGuard& operator=(DecoderGuard const&) = delete;
+
+private:
+    ma_decoder& mDecoder;
+};
+
+//! Drain an initialised decoder into ``out``.
+//!
+//! WAV / MP3 / FLAC headers advertise total frame count, so query it once
+//! and do a single allocation + read. Matches the HF / whisper.cpp /
+//! dr_wav pattern.
+bool drainDecoder(ma_decoder& decoder, AudioPCM& out)
+{
+    ma_uint64 totalFrames = 0;
+    if (ma_decoder_get_length_in_pcm_frames(&decoder, &totalFrames) != MA_SUCCESS || totalFrames == 0)
+    {
+        LOG_ERROR("ma_decoder_get_length_in_pcm_frames returned 0 or failed");
+        return false;
+    }
+    out.samples.resize(static_cast<size_t>(totalFrames));
+
+    ma_uint64 framesRead = 0;
+    ma_result const status = ma_decoder_read_pcm_frames(&decoder, out.samples.data(), totalFrames, &framesRead);
+    out.samples.resize(static_cast<size_t>(framesRead));
+    if (status != MA_SUCCESS && status != MA_AT_END)
+    {
+        LOG_ERROR("ma_decoder_read_pcm_frames failed: %d", static_cast<int>(status));
+        return false;
+    }
+    return true;
+}
+
+//! Build a decoder config that asks miniaudio to deliver mono float32 at
+//! ``targetSampleRate``. miniaudio handles the channel mixdown and resample
+//! internally on every read.
+ma_decoder_config makeConfig(int32_t targetSampleRate)
+{
+    return ma_decoder_config_init(ma_format_f32, 1 /* mono */, static_cast<ma_uint32>(targetSampleRate));
+}
+
+} // namespace
+
+bool loadAudioBytes(uint8_t const* bytes, size_t size, int32_t targetSampleRate, AudioPCM& out)
+{
+    if (bytes == nullptr || size == 0)
+    {
+        LOG_ERROR("loadAudioBytes: empty input");
+        return false;
+    }
+
+    ma_decoder_config const config = makeConfig(targetSampleRate);
+    ma_decoder decoder;
+    ma_result const initStatus = ma_decoder_init_memory(bytes, size, &config, &decoder);
+    if (initStatus != MA_SUCCESS)
+    {
+        LOG_ERROR("ma_decoder_init_memory failed: %d", static_cast<int>(initStatus));
+        return false;
+    }
+    DecoderGuard const guard(decoder);
+
+    if (!drainDecoder(decoder, out))
+    {
+        return false;
+    }
+    out.sampleRate = targetSampleRate;
+    out.numChannels = 1;
+    return true;
+}
+
+bool loadAudioFile(std::filesystem::path const& path, int32_t targetSampleRate, AudioPCM& out)
+{
+    if (path.empty())
+    {
+        LOG_ERROR("loadAudioFile: empty path");
+        return false;
+    }
+
+    ma_decoder_config const config = makeConfig(targetSampleRate);
+    ma_decoder decoder;
+    ma_result const initStatus = ma_decoder_init_file(path.string().c_str(), &config, &decoder);
+    if (initStatus != MA_SUCCESS)
+    {
+        LOG_ERROR("ma_decoder_init_file('%s') failed: %d", path.string().c_str(), static_cast<int>(initStatus));
+        return false;
+    }
+    DecoderGuard const guard(decoder);
+
+    if (!drainDecoder(decoder, out))
+    {
+        return false;
+    }
+    out.sampleRate = targetSampleRate;
+    out.numChannels = 1;
+    return true;
+}
+
+} // namespace audio
+} // namespace rt
+} // namespace trt_edgellm

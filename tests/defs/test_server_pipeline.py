@@ -182,6 +182,68 @@ print('SERVER_INFERENCE_PASSED')
                 f"Server inference did not produce expected output. Output:\n{output}"
             )
 
+    def test_server_inference_with_audio(
+            self, test_param: str, executable_files: Dict[str, str],
+            remote_config: Optional[RemoteConfig], test_logger: logging.Logger,
+            env_config: EnvironmentConfig) -> None:
+        """Audio pybind path: in-memory PCM -> AudioData -> Request.audio_buffers -> runtime."""
+        is_asr = "-asr" in test_param
+        is_omni = "-omni" in test_param
+        if not (is_asr or is_omni):
+            pytest.skip(
+                "audio test requires test_param with '-asr' or '-omni'")
+        config = TestConfig.from_param_string(test_param, ModelType.LLM,
+                                              TaskType.INFERENCE, env_config)
+        engine_dir = config.get_llm_engine_dir()
+        audio_engine_dir = (getattr(config, "get_audio_engine_dir",
+                                    lambda: "")()
+                            or os.environ.get("AUDIO_ENCODER_ENGINE_DIR", ""))
+        if not audio_engine_dir:
+            pytest.skip("AUDIO_ENCODER_ENGINE_DIR not set")
+        test_wav = (getattr(config, "get_audio_test_wav", lambda: "")()
+                    or os.environ.get("AUDIO_TEST_WAV", ""))
+        if not test_wav:
+            pytest.skip("AUDIO_TEST_WAV not set")
+
+        pybind_build_dir = os.path.join(env_config.build_dir, "pybind")
+        script = f"""\
+import sys, os, importlib.util
+sys.path.insert(0, {pybind_build_dir!r})
+so_files = [f for f in os.listdir({pybind_build_dir!r}) if '_edgellm_runtime' in f and f.endswith('.so')]
+spec = importlib.util.spec_from_file_location('_edgellm_runtime', os.path.join({pybind_build_dir!r}, so_files[0]))
+rt = importlib.util.module_from_spec(spec); spec.loader.exec_module(rt)
+with open({test_wav!r}, 'rb') as _f: _audio_bytes = _f.read()
+runtime = rt.LLMRuntime({engine_dir!r}, {audio_engine_dir!r}, {{}})
+runtime.capture_decoding_cuda_graph()
+request = rt.LLMGenerationRequest()
+msg = rt.Message(); msg.role = 'user'; msg.contents = [rt.MessageContent('audio', '')]
+req = rt.Request(messages=[msg]); req.image_buffers = []
+req.audio_buffers = [rt.load_audio_buffer_from_bytes(_audio_bytes)]
+request.requests = [req]; request.temperature = 1.0; request.top_p = 1.0; request.top_k = 50
+request.max_generate_length = 128; request.apply_chat_template = True; request.add_generation_prompt = True
+response = runtime.handle_request(request)
+ids = response.output_ids[0] if response.output_ids else []
+assert len(ids) > 0
+print('SERVER_INFERENCE_WITH_AUDIO_PASSED')
+"""
+        script_escaped = shlex.quote(script)
+        cmd = ['bash', '-c', f'python3 -c {script_escaped}']
+        env_vars = {
+            "LD_LIBRARY_PATH":
+            f"$LD_LIBRARY_PATH:{env_config.trt_package_dir}/lib"
+        } if env_config.trt_package_dir else None
+        with timer_context(f"Server audio inference for {config.model_name}",
+                           test_logger):
+            result = run_command(cmd=cmd,
+                                 remote_config=remote_config,
+                                 timeout=600,
+                                 logger=test_logger,
+                                 env_vars=env_vars)
+        if not result[
+                'success'] or 'SERVER_INFERENCE_WITH_AUDIO_PASSED' not in result.get(
+                    'output', ''):
+            pytest.fail(f"audio inference failed:\n{result.get('output', '')}")
+
     def test_server_streaming(self, test_param: str,
                               executable_files: Dict[str, str],
                               remote_config: Optional[RemoteConfig],
@@ -612,6 +674,64 @@ print('HLAPI_GENERATE_PASSED')
             pytest.fail(
                 f"HLAPI generate did not produce expected output. Output:\n{output}"
             )
+
+    def test_hlapi_generate_with_audio(self, test_param: str,
+                                       executable_files: Dict[str, str],
+                                       remote_config: Optional[RemoteConfig],
+                                       test_logger: logging.Logger,
+                                       env_config: EnvironmentConfig) -> None:
+        """HLAPI audio path: OpenAI input_audio.data base64 wav -> transcription."""
+        is_asr = "-asr" in test_param
+        is_omni = "-omni" in test_param
+        if not (is_asr or is_omni):
+            pytest.skip(
+                "audio HLAPI test requires '-asr' or '-omni' test_param")
+        config = TestConfig.from_param_string(test_param, ModelType.LLM,
+                                              TaskType.INFERENCE, env_config)
+        engine_dir = config.get_llm_engine_dir()
+        audio_engine_dir = (getattr(config, "get_audio_engine_dir",
+                                    lambda: "")()
+                            or os.environ.get("AUDIO_ENCODER_ENGINE_DIR", ""))
+        if not audio_engine_dir:
+            pytest.skip("AUDIO_ENCODER_ENGINE_DIR not set")
+        test_wav = (getattr(config, "get_audio_test_wav", lambda: "")()
+                    or os.environ.get("AUDIO_TEST_WAV", ""))
+        if not test_wav:
+            pytest.skip("AUDIO_TEST_WAV not set")
+
+        setup = self._build_hlapi_env_setup(env_config.trt_package_dir or "")
+        script = f"""\
+{setup}
+import base64
+with open({test_wav!r}, 'rb') as f:
+    wav_b64 = base64.b64encode(f.read()).decode()
+from experimental.server import LLM, SamplingParams
+llm = LLM(engine_dir={engine_dir!r}, visual_engine_dir={audio_engine_dir!r})
+messages = [{{'role': 'user', 'content': [
+    {{'type': 'input_audio', 'input_audio': {{'data': wav_b64, 'format': 'wav'}}}}
+]}}]
+outputs = llm.generate([messages], SamplingParams(temperature=1.0, max_tokens=128))
+assert len(outputs[0].token_ids) > 0
+print('HLAPI_GENERATE_WITH_AUDIO_PASSED')
+"""
+        script_escaped = shlex.quote(script)
+        cmd = ['bash', '-c', f'python3 -c {script_escaped}']
+        env_vars = {
+            "LD_LIBRARY_PATH":
+            f"$LD_LIBRARY_PATH:{env_config.trt_package_dir}/lib"
+        } if env_config.trt_package_dir else None
+        with timer_context(f"HLAPI audio generate for {config.model_name}",
+                           test_logger):
+            result = run_command(cmd=cmd,
+                                 remote_config=remote_config,
+                                 timeout=600,
+                                 logger=test_logger,
+                                 env_vars=env_vars)
+        if not result[
+                'success'] or 'HLAPI_GENERATE_WITH_AUDIO_PASSED' not in result.get(
+                    'output', ''):
+            pytest.fail(
+                f"HLAPI audio generate failed:\n{result.get('output', '')}")
 
     def test_hlapi_streaming(self, test_param: str,
                              executable_files: Dict[str, str],
