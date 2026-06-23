@@ -36,6 +36,7 @@ DEFAULT_SEARCH_DEPTH = 3
 # These are exported directly from the HF checkpoint without a quantization step.
 PRE_QUANTIZED_MODELS: frozenset = frozenset({
     "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+    "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
     "Qwen3-30B-A3B-NVFP4",
 })
 
@@ -250,6 +251,8 @@ LLM_MODELS_DIR_MAP = {
     # Pre-quantized NVFP4 model: exported directly without quantization step
     "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4":
     "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+    "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4":
+    "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
     "NVIDIA-Nemotron-3-Nano-4B-BF16": "NVIDIA-Nemotron-3-Nano-4B-BF16",
     "NVIDIA-Nemotron-3-Nano-4B-FP8": "NVIDIA-Nemotron-3-Nano-4B-FP8",
     # Nemotron-Nano 9B v2 family (BF16 base + FP8/NVFP4 pre-quantized
@@ -348,7 +351,7 @@ class TestConfig:
     lm_head_precision: Optional[str] = None
     visual_precision: Optional[str] = None
     audio_precision: Optional[str] = None
-    # extw_<value> token: ffn / lm / moe / ffn_lm / all
+    # extw_<value> token: ffn / lm / moe / nvfp4_moe / ffn_lm / all
     externalize_weights: Optional[str] = None
 
     # EAGLE draft model settings

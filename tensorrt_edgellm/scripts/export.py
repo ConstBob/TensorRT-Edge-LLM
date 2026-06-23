@@ -1848,7 +1848,7 @@ def main() -> None:
         metavar="WEIGHT_TYPE",
         help=("Expose selected model weights as ONNX inputs and write them "
               "to safetensors external weight files. Values: int4_ffn, "
-              "int4_moe, lm_head, all."),
+              "int4_moe, nvfp4_moe, lm_head, all."),
     )
     p.add_argument(
         "--max-kv-cache-capacity",

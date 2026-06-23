@@ -39,6 +39,7 @@ _EXTW_TOKEN_MAP = {
     "ffn": ["int4_ffn"],
     "lm": ["lm_head"],
     "moe": ["int4_moe"],
+    "nvfp4_moe": ["nvfp4_moe"],
     "ffn_lm": ["int4_ffn", "lm_head"],
     "all": ["all"],
 }
@@ -46,6 +47,7 @@ _EXTW_TOKEN_MAP = {
 _EXTW_FILE_BY_KIND = {
     "int4_ffn": "external_int4_ffn_weights.safetensors",
     "int4_moe": "external_int4_moe_weights.safetensors",
+    "nvfp4_moe": "external_nvfp4_moe_weights.safetensors",
     "lm_head": "external_lm_head_weight.safetensors",
 }
 

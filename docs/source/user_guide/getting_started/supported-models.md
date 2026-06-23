@@ -192,6 +192,7 @@ The model class names were checked against the installed `transformers==5.9.0` p
 | Qwen3-MoE | [`Qwen3MoeForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py) | `qwen3_moe` -> `Qwen3MoeCausalLM` | INT4, NVFP4 |
 | Qwen3.5/3.6-MoE | [`Qwen3_5MoeForConditionalGeneration`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py) | `qwen3_5_moe` -> `Qwen3_5MoeCausalLM` + `Qwen3_5VLVisualModel` | INT4 GPTQ, NVFP4 |
 | Nemotron3-MoE | [`NemotronHForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/nemotron_h/modeling_nemotron_h.py) | `nemotron_h` -> `NemotronHCausalLM` | NVFP4 only |
+| Nemotron3 Super 120B-A12B | [`NemotronHForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/nemotron_h/modeling_nemotron_h.py) | `nemotron_h` -> `NemotronHCausalLM` with latent MoE routed path | NVFP4 only |
 
 NVFP4 MoE exports always emit the unified `Nvfp4MoePlugin`, which dispatches
 the SM110 split FC1/FC2 backend on Thor and the SM120/SM121 fused decode +
@@ -222,6 +223,11 @@ tensorrt-edgellm-export \
 <summary><b>Nemotron3-MoE</b> checkpoints</summary>
 
 - [nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4)
+- [nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4)
+
+Nemotron3 Super uses latent MoE: routing is computed from the model hidden
+states, while the routed expert payload is projected to `moe_latent_size` before
+the NVFP4 MoE plugin path. The shared expert path remains separate.
 
 </details>
 
