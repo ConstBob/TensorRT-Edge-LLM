@@ -450,6 +450,9 @@ class NemotronHMoEMLP(nn.Module):
         self.n_routed_experts = config.n_routed_experts
         self.num_experts_per_tok = config.num_experts_per_tok
         self.hidden_size = config.hidden_size
+        self.routed_hidden_size = (config.moe_latent_size
+                                   if config.moe_latent_size is not None else
+                                   config.hidden_size)
         self.moe_intermediate_size = config.moe_intermediate_size
         self.group_size = config.quant.group_size
         self.activation_type = _NVFP4_ACTIVATION_RELU2
@@ -463,32 +466,51 @@ class NemotronHMoEMLP(nn.Module):
         # picks ``hidden_size_alignment=256`` so the FC1 K and FC2 M axes get
         # zero-padded; ``forward`` then F.pads hidden_states and slices the
         # plugin output. The SM100/101/110 path keeps the original H.
-        self._padded_hidden_size = self.hidden_size
+        self._padded_hidden_size = self.routed_hidden_size
         self.gate = NemotronHTopkRouter(config)
 
         self.experts = nn.ModuleList([
-            self._make_expert(config, config.moe_intermediate_size,
-                              f"{module_prefix}.experts.{j}")
+            self._make_expert(config,
+                              config.moe_intermediate_size,
+                              f"{module_prefix}.experts.{j}",
+                              input_size=self.routed_hidden_size)
             for j in range(config.n_routed_experts)
         ])
 
         self.shared_experts = self._make_expert(
-            config, config.moe_shared_expert_intermediate_size,
-            f"{module_prefix}.shared_experts")
+            config,
+            config.moe_shared_expert_intermediate_size,
+            f"{module_prefix}.shared_experts",
+            input_size=config.hidden_size)
+
+        if config.moe_latent_size is not None:
+            self.fc1_latent_proj = make_linear(
+                config,
+                config.hidden_size,
+                self.routed_hidden_size,
+                module_name=f"{module_prefix}.fc1_latent_proj")
+            self.fc2_latent_proj = make_linear(
+                config,
+                self.routed_hidden_size,
+                config.hidden_size,
+                module_name=f"{module_prefix}.fc2_latent_proj")
+        else:
+            self.fc1_latent_proj = nn.Identity()
+            self.fc2_latent_proj = nn.Identity()
 
         self._export_ready = False
 
     @staticmethod
-    def _make_expert(config: ModelConfig, inter_size: int,
-                     prefix: str) -> nn.Module:
+    def _make_expert(config: ModelConfig, inter_size: int, prefix: str,
+                     input_size: int) -> nn.Module:
         expert = nn.Module()
         expert.up_proj = make_linear(config,
-                                     config.hidden_size,
+                                     input_size,
                                      inter_size,
                                      module_name=f"{prefix}.up_proj")
         expert.down_proj = make_linear(config,
                                        inter_size,
-                                       config.hidden_size,
+                                       input_size,
                                        module_name=f"{prefix}.down_proj")
         return expert
 
@@ -516,7 +538,7 @@ class NemotronHMoEMLP(nn.Module):
          fc2_blocks_scale, fc2_alpha, padded_inter_size,
          padded_hidden_size) = (repack_nvfp4_nemotron_moe_experts(
              self.experts,
-             self.hidden_size,
+             self.routed_hidden_size,
              self.moe_intermediate_size,
              self.group_size,
              hidden_size_alignment=hidden_size_alignment,
@@ -553,11 +575,12 @@ class NemotronHMoEMLP(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch, seq_len, _ = hidden_states.shape
-        # Router logits: [batch*seq, E] FP32 (plugin expects FP32 input).
-        # Routing uses the unpadded hidden state because the router gate
-        # weight is shaped [E, hidden_size].
+        # Router logits are computed from the original hidden states. When
+        # moe_latent_size is set, only the routed expert payload is projected
+        # down into latent space.
         router_logits = F.linear(hidden_states.view(-1, self.hidden_size),
                                  self.gate.weight).float()
+        routed_hidden_states = self.fc1_latent_proj(hidden_states)
 
         # SM12x NvFP4MoEPluginGeforce requires the plugin hidden_size to be a
         # multiple of 256. When the checkpoint H does not satisfy that,
@@ -566,11 +589,11 @@ class NemotronHMoEMLP(nn.Module):
         # and slice the plugin output back. relu2(0) = 0 keeps the padded
         # FC1 outputs zero; the FC2 contribution to the padded H slots is
         # therefore zero too. The shared expert path uses the original H.
-        plugin_hidden = hidden_states
-        if self._padded_hidden_size != self.hidden_size:
+        plugin_hidden = routed_hidden_states
+        if self._padded_hidden_size != self.routed_hidden_size:
             plugin_hidden = F.pad(
-                hidden_states,
-                (0, self._padded_hidden_size - self.hidden_size))
+                routed_hidden_states,
+                (0, self._padded_hidden_size - self.routed_hidden_size))
 
         # Nemotron-H uses ReLU2 (non-gated) FC1, so the up-only weight tensor
         # has the same row layout under both plugins; only the plugin op name
@@ -604,9 +627,10 @@ class NemotronHMoEMLP(nn.Module):
             self.io_dtype,
             self.max_routed_rows,
         )
-        if self._padded_hidden_size != self.hidden_size:
-            moe_out = moe_out[..., :self.hidden_size]
+        if self._padded_hidden_size != self.routed_hidden_size:
+            moe_out = moe_out[..., :self.routed_hidden_size]
 
+        moe_out = self.fc2_latent_proj(moe_out)
         return moe_out + self._expert_forward(self.shared_experts,
                                               hidden_states)
 

@@ -231,6 +231,15 @@ def _get_attention_scaling(llm_dict: Dict[str, Any], model_type: str,
     return 1.0 / (float(head_dim)**0.5)
 
 
+def _get_rms_norm_eps(llm_dict: Dict[str, Any], model_type: str) -> float:
+    if str(model_type).lower().startswith("nemotron_h"):
+        return llm_dict.get(
+            "rms_norm_eps",
+            llm_dict.get("norm_eps", llm_dict.get("layer_norm_epsilon", 1e-6)))
+
+    return llm_dict.get("rms_norm_eps", 1e-6)
+
+
 def _get_embedding_scale(llm_dict: Dict[str, Any], model_type: str,
                          hidden_size: int) -> float:
     """Return the scale folded into runtime token embeddings."""
@@ -539,6 +548,8 @@ class ModelConfig:
     # Expert MLP intermediate size (may differ from dense intermediate_size).
     moe_intermediate_size: int = 0
     moe_shared_expert_intermediate_size: int = 0
+    # Optional latent dimension used by Nemotron-H routed experts.
+    moe_latent_size: Optional[int] = None
     routed_scaling_factor: float = 1.0
     n_group: int = 1
     topk_group: int = 1
@@ -753,6 +764,9 @@ class ModelConfig:
         decoder_sparse_step = int(llm_dict.get("decoder_sparse_step", 1))
         mlp_only_layers = list(llm_dict.get("mlp_only_layers") or [])
         norm_topk_prob = bool(llm_dict.get("norm_topk_prob", True))
+        moe_latent_size = llm_dict.get("moe_latent_size", None)
+        if moe_latent_size is not None:
+            moe_latent_size = int(moe_latent_size)
 
         intermediate_size = int(
             llm_dict.get("intermediate_size")
@@ -769,7 +783,7 @@ class ModelConfig:
                                              num_attn_heads),
             intermediate_size=intermediate_size,
             head_dim=head_dim,
-            rms_norm_eps=llm_dict.get("rms_norm_eps", 1e-6),
+            rms_norm_eps=_get_rms_norm_eps(llm_dict, model_type),
             vocab_size=llm_dict["vocab_size"],
             rope_theta=_get_rope_theta(llm_dict),
             max_position_embeddings=llm_dict.get("max_position_embeddings",
@@ -817,6 +831,7 @@ class ModelConfig:
             moe_intermediate_size=moe_intermediate_size,
             moe_shared_expert_intermediate_size=
             moe_shared_expert_intermediate_size,
+            moe_latent_size=moe_latent_size,
             routed_scaling_factor=routed_scaling_factor,
             n_group=n_group,
             topk_group=topk_group,

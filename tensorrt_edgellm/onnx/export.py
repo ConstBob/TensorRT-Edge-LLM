@@ -96,7 +96,7 @@ def export_onnx(
                              ONNX inputs and save to safetensors external
                              weight files.
                              Supported kinds: ``int4_ffn``, ``int4_moe``,
-                             ``lm_head``, and ``all``.
+                             ``nvfp4_moe``, ``lm_head``, and ``all``.
         config_filename: Filename for the runtime config beside the ONNX.
                          Use ``"config.json"`` for single-device exports
                          or ``"config_tp{N}_rank{R}.json"`` for per-rank

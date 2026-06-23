@@ -23,11 +23,13 @@ logger = logging.getLogger(__name__)
 
 EXTERNAL_WEIGHT_INT4_FFN = "int4_ffn"
 EXTERNAL_WEIGHT_INT4_MOE = "int4_moe"
+EXTERNAL_WEIGHT_NVFP4_MOE = "nvfp4_moe"
 EXTERNAL_WEIGHT_LM_HEAD = "lm_head"
 EXTERNAL_WEIGHT_ALL = "all"
 EXTERNAL_WEIGHT_KINDS = (
     EXTERNAL_WEIGHT_INT4_FFN,
     EXTERNAL_WEIGHT_INT4_MOE,
+    EXTERNAL_WEIGHT_NVFP4_MOE,
     EXTERNAL_WEIGHT_LM_HEAD,
 )
 EXTERNAL_WEIGHT_CHOICES = (*EXTERNAL_WEIGHT_KINDS, EXTERNAL_WEIGHT_ALL)
@@ -162,6 +164,23 @@ def _find_int4_moe_weight_initializers(onnx_model) -> "list[str]":
         if len(node.input) < 5:
             continue
         for tensor_name in (node.input[2], node.input[4]):
+            if tensor_name in initializers and tensor_name not in external_name_set:
+                external_names.append(tensor_name)
+                external_name_set.add(tensor_name)
+    return external_names
+
+
+def _find_nvfp4_moe_weight_initializers(onnx_model) -> "list[str]":
+    """Return NVFP4 MoE plugin initializer inputs."""
+    initializers = {init.name for init in onnx_model.graph.initializer}
+    plugin_op_types = {"Nvfp4MoePlugin", "NvFP4MoEPluginGeforce"}
+
+    external_names: list[str] = []
+    external_name_set: set[str] = set()
+    for node in onnx_model.graph.node:
+        if node.domain != "trt_edgellm" or node.op_type not in plugin_op_types:
+            continue
+        for tensor_name in node.input:
             if tensor_name in initializers and tensor_name not in external_name_set:
                 external_names.append(tensor_name)
                 external_name_set.add(tensor_name)
@@ -437,6 +456,18 @@ def externalize_model_weights(
             add_external_weight_file("Int4MoePlugin qweight",
                                      "external_int4_moe_weights.safetensors",
                                      names, "int4_moe_weights")
+            continue
+
+        if kind == EXTERNAL_WEIGHT_NVFP4_MOE:
+            names = _find_nvfp4_moe_weight_initializers(onnx_model)
+            if not names:
+                logger.warning(
+                    "External nvfp4_moe weights requested, but no "
+                    "NVFP4 MoE plugin initializer inputs were found")
+                continue
+            add_external_weight_file("NVFP4 MoE plugin",
+                                     "external_nvfp4_moe_weights.safetensors",
+                                     names, "nvfp4_moe_weights")
             continue
 
         if kind == EXTERNAL_WEIGHT_LM_HEAD:
