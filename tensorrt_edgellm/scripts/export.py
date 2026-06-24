@@ -41,6 +41,7 @@ VLMs (LLM + visual encoder):
     internvl_chat                 (InternVL3)
     internvl                      (InternVL3.5)
     phi4mm, phi4_multimodal       (Phi-4 Multimodal)
+    gemma4                        (Gemma4 multimodal checkpoints)
     NemotronH_Nano_VL_V2, NemotronH_Nano_Omni_Reasoning_V3
                                  (Nemotron-Omni)
 
@@ -104,6 +105,7 @@ _VLM_MODEL_TYPES = frozenset([
     "internvl_chat",
     "phi4mm",
     "phi4_multimodal",
+    "gemma4",
     "alpamayo_r1",
     *_NEMOTRON_OMNI_MODEL_TYPES,
 ])
@@ -466,9 +468,7 @@ def _patch_multimodal_token_ids(model_dir: str, llm_out_dir: str,
                 _collect_tokens_from_tokenizer_fallback(llm_out_dir))
 
     # Gemma4 PLE needs multimodal placeholder IDs for zero-filling PLE token
-    # identity at image/audio positions. Gemma4 is not listed in
-    # ``_VLM_MODEL_TYPES`` because that set controls visual-component export;
-    # this fallback only patches the LLM runtime config when IDs are missing.
+    # identity at image/audio positions.
     if model_type in _GEMMA4_MODEL_TYPES:
         fallback = _collect_gemma4_tokenizer_fallback(llm_out_dir)
         fallback.update(_collect_gemma4_tokenizer_fallback(model_dir))
@@ -741,6 +741,7 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
         # MoE variant uses byte-identical visual encoder weights; reuse the
         # same C++ runner enum the dense Qwen3-Omni visual engine registers.
         "qwen3_omni_moe": "qwen3_omni_vision_encoder",
+        "gemma4": "gemma4_vision",
     }
     top_level_model_type = _VISUAL_MODEL_TYPE_MAP.get(model_type, model_type)
     vis_cfg_out: dict = {
@@ -796,6 +797,24 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
         if _rope_scaling:
             vis_cfg_out["rope_scaling"] = normalize_rope_scaling_for_runtime(
                 _rope_scaling)
+    if model_type == "gemma4":
+        vis_cfg_out["vision_config"] = dict(vis_cfg_out["vision_config"])
+        vis_cfg_out["vision_config"]["model_type"] = "gemma4_vision"
+        text_cfg = config.get("text_config") or {}
+        if text_cfg:
+            vis_cfg_out["text_config"] = text_cfg
+        for key in ("image_token_id", "audio_token_id"):
+            if key in config:
+                vis_cfg_out[key] = config[key]
+        if "image_token_id" not in vis_cfg_out:
+            image_token_id = _find_token_id(model_dir, "<|image_pad|>")
+            if image_token_id is not None:
+                vis_cfg_out["image_token_id"] = image_token_id
+        if "audio_token_id" not in vis_cfg_out:
+            audio_token_id = _find_token_id(model_dir, "<|audio_pad|>")
+            if audio_token_id is not None:
+                vis_cfg_out["audio_token_id"] = audio_token_id
+    if model_type == "qwen3_omni_moe":
         # HF Qwen3-Omni-MoE 30B-A3B-Instruct vision_config omits the
         # ``num_position_embeddings`` field that QwenViTRunner reads, but
         # ships ``image_size`` + ``patch_size`` from which it is unambiguously

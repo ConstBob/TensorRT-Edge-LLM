@@ -17,6 +17,7 @@
 from .modeling_gemma4_text import (Gemma4Attention, Gemma4DecoderLayer,
                                    Gemma4ForCausalLM, Gemma4Transformer,
                                    Gemma4ValueRMSNorm)
+from .modeling_gemma4_visual import Gemma4VisualModel, build_gemma4_visual
 
 __all__ = [
     "Gemma4Attention",
@@ -24,4 +25,6 @@ __all__ = [
     "Gemma4DecoderLayer",
     "Gemma4Transformer",
     "Gemma4ValueRMSNorm",
+    "Gemma4VisualModel",
+    "build_gemma4_visual",
 ]
