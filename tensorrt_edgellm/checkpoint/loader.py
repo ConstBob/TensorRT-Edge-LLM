@@ -332,6 +332,8 @@ def _navigate(model: nn.Module, parts: list) -> Tuple[nn.Module, str]:
             module = module[int(part)]
         else:
             module = getattr(module, part)
+        if module is None:
+            raise AttributeError(f"None encountered at '{part}' in path")
     return module, parts[-1]
 
 

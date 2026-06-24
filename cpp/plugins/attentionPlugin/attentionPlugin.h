@@ -21,7 +21,10 @@
 #include <cstddef>
 #include <cstdlib>
 #include <string>
+#include <utility>
 #include <vector>
+
+#include "common/tensor.h"
 
 namespace trt_edgellm
 {
@@ -90,6 +93,16 @@ public:
 
     void setPluginNamespace(char const* pluginNamespace) noexcept;
 
+private:
+    //! Split a BHSD-layout KV cache [B, 2, Hkv, cap, D] into separate K [B, cap, Hkv, D] and V [B, cap, Hkv, D].
+    static std::pair<rt::Tensor, rt::Tensor> deinterleaveKVCache(rt::Tensor const& kvCacheTensor,
+        std::byte*& workspacePtr, int32_t batchSize, int32_t numKVHeads, int32_t kvCacheCapacity, int32_t headSize,
+        cudaStream_t stream);
+
+    //! Launch the CuTe DSL FFPA d512 causal attention kernel.
+    static void dispatchFFPAKernel(half const* q, half const* k, half const* v, half* o, int32_t batchSize,
+        int32_t seqlenQ, int32_t seqlenK, int32_t numQHeads, int32_t numKVHeads, int32_t headDim, cudaStream_t stream);
+
 protected:
     std::string mLayerName; //!< Plugin layer name
     std::string mNamespace; //!< Plugin namespace
@@ -123,6 +136,16 @@ protected:
 #else
     bool mUseCuteDslFMHA{false};
 #endif
+
+    //! Whether FMHA context kernels are available for this configuration.
+    //! When false (e.g. headSize=512), the prefill path uses XQA instead.
+    bool mCanImplementFMHA{true};
+
+    //! Whether FFPA d512 kernel is available for headSize=512 prefill+decode.
+    bool mCanImplementFFPA{false};
+
+    //! Whether XQA decode kernels are available.
+    bool mCanImplementXQA{false};
 
     std::vector<nvinfer1::PluginField> mDataToSerialize;
     nvinfer1::PluginFieldCollection mFCToSerialize{};

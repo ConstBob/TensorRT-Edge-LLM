@@ -123,6 +123,15 @@ public:
      */
     std::string getRankToken(Rank rank) const;
 
+    /*!
+     * @brief Enable or disable byte-level fallback for unknown tokens
+     * @param enable Whether to enable byte fallback
+     */
+    void setByteFallback(bool enable) noexcept
+    {
+        mByteFallback = enable;
+    }
+
 private:
     /**
      * @brief Byte Pair Encoding implementation
@@ -139,6 +148,7 @@ private:
     TokenToRanks mSpecialTokensEncoder;
     RanksToToken mSpecialTokensDecoder;
     size_t mVocabSize;
+    bool mByteFallback{false}; //!< Whether to fall back to byte-level tokens (<0xNN>) for unknown tokens
 };
 
 } // namespace tokenizer

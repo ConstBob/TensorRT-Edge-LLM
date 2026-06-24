@@ -401,7 +401,56 @@ bool LLMBuilder::parseConfig()
     }
     if (mModelConfig.contains("full_rope_config") && mModelConfig["full_rope_config"].is_object())
     {
-        mFullRotaryDim = getRotaryDim(mModelConfig["full_rope_config"], mHeadSize);
+        int64_t const fullHeadDim = mModelConfig.value("global_head_dim", static_cast<int64_t>(mHeadSize));
+        mFullRotaryDim = getRotaryDim(mModelConfig["full_rope_config"], fullHeadDim);
+    }
+
+    mNumLinearAttnLayers = mModelConfig.value("num_linear_attn_layers", 0);
+    mRecurrentStateNumHeads = mModelConfig.value("recurrent_state_num_heads", 0);
+    mRecurrentStateHeadDim = mModelConfig.value("recurrent_state_head_dim", 0);
+    mRecurrentStateSize = mModelConfig.value("recurrent_state_size", 0);
+    mConvDim = mModelConfig.value("conv_dim", 0);
+    mConvKernel = mModelConfig.value("conv_kernel", 0);
+
+    // For hybrid models, only attention layers have KV caches
+    if (mNumLinearAttnLayers > 0)
+    {
+        mNbKVCacheInputs = mModelConfig.value("num_attention_layers", mModelConfig["num_hidden_layers"].get<int32_t>());
+    }
+    else
+    {
+        mNbKVCacheInputs = mModelConfig["num_hidden_layers"].get<int32_t>();
+    }
+
+    // Build per-layer head size vector for heterogeneous models (e.g. Gemma4).
+    // Prefer kv_layer_configs (authoritative per-layer dims) when available;
+    // fall back to global_head_dim + layer_types for older exports.
+    int64_t globalHeadSize = mModelConfig.value("global_head_dim", static_cast<int64_t>(0));
+    if (mModelConfig.contains("kv_layer_configs") && !mModelConfig["kv_layer_configs"].is_null())
+    {
+        auto const& kvLayerConfigs = mModelConfig["kv_layer_configs"];
+        check::check(static_cast<int>(kvLayerConfigs.size()) >= mNbKVCacheInputs,
+            "kv_layer_configs has fewer entries than expected KV cache layers");
+        for (int i = 0; i < mNbKVCacheInputs; ++i)
+        {
+            auto const& lc = kvLayerConfigs[i];
+            int64_t layerHeadDim
+                = (lc.is_null() || !lc.contains("head_dim")) ? mHeadSize : lc["head_dim"].get<int64_t>();
+            mPerLayerHeadSize.push_back(layerHeadDim);
+        }
+        LOG_INFO("Heterogeneous head sizes from kv_layer_configs: %d layers", mNbKVCacheInputs);
+    }
+    else if (globalHeadSize > 0 && globalHeadSize != mHeadSize && mModelConfig.contains("layer_types"))
+    {
+        auto const& layerTypes = mModelConfig["layer_types"];
+        for (int i = 0; i < mNbKVCacheInputs; ++i)
+        {
+            std::string lt = (i < static_cast<int>(layerTypes.size())) ? layerTypes[i].get<std::string>() : "";
+            mPerLayerHeadSize.push_back((lt == "full_attention") ? globalHeadSize : mHeadSize);
+        }
+        LOG_INFO("Heterogeneous head sizes: %d layers with head_dim=%ld, %ld layers with global_head_dim=%ld",
+            mNbKVCacheInputs, mHeadSize, std::count(mPerLayerHeadSize.begin(), mPerLayerHeadSize.end(), globalHeadSize),
+            globalHeadSize);
     }
 
     // Read trt_native_ops flag from config if present
@@ -549,6 +598,7 @@ bool LLMBuilder::setupRopeProfiles(nvinfer1::IOptimizationProfile& contextProfil
     {
         setRopeProfile(binding_names::kRopeCosSin, mRotaryDim);
     }
+
     return result;
 }
 
@@ -1009,14 +1059,15 @@ bool LLMBuilder::setupKVCacheProfiles(
     {
         // Plugin path: combined KV cache with "2" dimension
         // KV cache shape is [B, 2, num_kv_heads, 0 to max_kv_cache_capacity, head_dim]
-        nvinfer1::Dims minKVCacheShape = createDims({1, 2, mNumKVHeads, 0, mHeadSize});
-        nvinfer1::Dims optKVCacheShape
-            = createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize});
-        nvinfer1::Dims maxKVCacheShape
-            = createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize});
-
         for (int i = 0; i < mNbKVCacheInputs; ++i)
         {
+            int64_t layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
+            nvinfer1::Dims minKVCacheShape = createDims({1, 2, mNumKVHeads, 0, layerHeadSize});
+            nvinfer1::Dims optKVCacheShape = createDims(
+                {mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
+            nvinfer1::Dims maxKVCacheShape = createDims(
+                {mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
+
             result &= setOptimizationProfile(&contextProfile, binding_names::formatKVCacheName(i, true).c_str(),
                 minKVCacheShape, optKVCacheShape, maxKVCacheShape);
             result &= setOptimizationProfile(&generationProfile, binding_names::formatKVCacheName(i, true).c_str(),
@@ -1206,6 +1257,32 @@ bool LLMBuilder::copyConfig()
 
     // Add detected num_deepstack_features if present (Qwen3VL models)
     configWithBuilder["num_deepstack_features"] = mNumDeepstackFeatures;
+
+    // Emit per-layer KV cache configs for heterogeneous models (e.g. Gemma4).
+    // The runtime uses `kv_layer_configs` + normalized `layer_types` ("attention"/"mamba")
+    // to allocate per-layer KV cache tensors with the correct head dimensions.
+    if (!mPerLayerHeadSize.empty())
+    {
+        Json kvLayerConfigs = Json::array();
+        Json normalizedLayerTypes = Json::array();
+
+        for (int i = 0; i < mNbKVCacheInputs; ++i)
+        {
+            normalizedLayerTypes.push_back("attention");
+            // NOTE: num_kv_heads is uniform for all current models (E2B/E4B both use 2 for all
+            // layer types). If a future model has different KV head counts per layer type,
+            // add a mPerLayerNumKVHeads vector analogous to mPerLayerHeadSize.
+            kvLayerConfigs.push_back(Json{{"num_kv_heads", mNumKVHeads}, {"head_dim", mPerLayerHeadSize[i]}});
+        }
+        // Hybrid models also have recurrent (mamba) layers that need routing entries.
+        for (int i = 0; i < mNumLinearAttnLayers; ++i)
+        {
+            normalizedLayerTypes.push_back("mamba");
+            kvLayerConfigs.push_back(nullptr);
+        }
+        configWithBuilder["layer_types"] = normalizedLayerTypes;
+        configWithBuilder["kv_layer_configs"] = kvLayerConfigs;
+    }
 
     // Write updated config
     std::ofstream targetConfigFile(targetConfigPath);

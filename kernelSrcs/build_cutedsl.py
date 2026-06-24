@@ -321,6 +321,39 @@ KERNEL_VARIANTS = [
             "--export_only",
         ],
     ),
+    # FFPA GQA variants for Gemma4 (D=512, kv_group_size > 1)
+    KernelVariant(
+        name="ffpa_d512_causal_gqa4",
+        group="ffpa",
+        supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+        script="ffpa_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "512",
+            "--m_block_size", "64", "--n_block_size", "16", "--num_threads", "128",
+            "--dtype", "Float16",
+            "--is_causal",
+            "--skip_rescale",
+            "--kv_group_size", "4",
+            "--num_head", "4",
+            "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="ffpa_d512_causal_gqa8",
+        group="ffpa",
+        supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+        script="ffpa_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "512",
+            "--m_block_size", "64", "--n_block_size", "16", "--num_threads", "128",
+            "--dtype", "Float16",
+            "--is_causal",
+            "--skip_rescale",
+            "--kv_group_size", "8",
+            "--num_head", "8",
+            "--export_only",
+        ],
+    ),
     # --- NvFP4 MoE group (decomposed FC1/FC2; SM110/Thor today) ---
     # These variants build the decomposed grouped MoE pipeline:
     #   FC1 gather grouped GEMM + activation + FP4 requant

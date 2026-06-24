@@ -219,7 +219,8 @@ void parseDualRopeFields(Json const& configJson, LLMEngineConfig& cfg)
         return;
     }
 
-    auto parseRopeBlock = [&](char const* key, char const* rotaryDimName, RopeConfig& ropeConfig, int32_t& rotaryDim) {
+    auto parseRopeBlock = [&](char const* key, char const* rotaryDimName, RopeConfig& ropeConfig, int32_t& rotaryDim,
+                              int32_t headDim) {
         Json ropeJson = configJson.at(key);
         if (!ropeJson.contains("max_position_embeddings") && configJson.contains("max_position_embeddings"))
         {
@@ -228,15 +229,17 @@ void parseDualRopeFields(Json const& configJson, LLMEngineConfig& cfg)
         // Do not promote original_max_position_embeddings here: it is LongRope-only,
         // and dual RoPE cache binding does not support LongRope.
         ropeConfig = collectRopeConfig(ropeJson);
-        rotaryDim = static_cast<int32_t>(getRotaryDim(ropeJson, cfg.headDim));
+        rotaryDim = static_cast<int32_t>(getRotaryDim(ropeJson, headDim));
         requirePositive(rotaryDim, rotaryDimName);
         ELLM_CHECK(ropeConfig.type != RopeType::kMRope,
             std::string("parseEngineConfig: dual RoPE does not support context-dependent MRoPE bindings: ") + key);
     };
 
     cfg.useDualRope = true;
-    parseRopeBlock("sliding_rope_config", "sliding_rotary_dim", cfg.slidingRopeConfig, cfg.slidingRotaryDim);
-    parseRopeBlock("full_rope_config", "full_rotary_dim", cfg.fullRopeConfig, cfg.fullRotaryDim);
+    int32_t const fullHeadDim = configJson.value("global_head_dim", cfg.headDim);
+    parseRopeBlock(
+        "sliding_rope_config", "sliding_rotary_dim", cfg.slidingRopeConfig, cfg.slidingRotaryDim, cfg.headDim);
+    parseRopeBlock("full_rope_config", "full_rotary_dim", cfg.fullRopeConfig, cfg.fullRotaryDim, fullHeadDim);
 }
 
 //! Fields shared by base and draft engines. Parses top-level model dims and

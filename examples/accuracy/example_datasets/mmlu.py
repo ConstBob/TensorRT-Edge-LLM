@@ -65,7 +65,7 @@ class MMLUDataset(EdgeLLMDataset):
             answer_letter = chr(ord('A') + data["answer"])
             example += f" {answer_letter}\n\n"
         else:
-            example += ""
+            example += " "
 
         return example
 
@@ -106,6 +106,12 @@ class MMLUDataset(EdgeLLMDataset):
         # Add the current question
         user_prompt += self._format_single_example(data, include_answer=False)
         return user_prompt
+
+    def format_system_prompt(self, data: Dict[str, Any]) -> str:
+        """Short system prompt to constrain output to single letter."""
+        if self.apply_chat_template:
+            return "Reply with only the letter."
+        return ""
 
     def extract_answer(self, data: Dict[str, Any]) -> Optional[str]:
         """Extract the correct answer from MMLU data."""
@@ -154,7 +160,7 @@ def convert_mmlu_dataset(config: DatasetConfig,
                                         dev_dataset=dev_dataset,
                                         num_shot=num_shot,
                                         output_dir=output_dir,
-                                        apply_chat_template=False)
+                                        apply_chat_template=True)
 
     print(f"Processing MMLU dataset with config: {config}")
     edge_llm_mmlu_dataset.process_and_save_dataset("mmlu_dataset.json")

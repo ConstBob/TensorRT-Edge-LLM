@@ -353,6 +353,7 @@ private:
     int64_t mSlidingRotaryDim{0};           //!< Dimension for sliding-attention rotary embeddings
     int64_t mFullRotaryDim{0};              //!< Dimension for full-attention rotary embeddings
     int32_t mNbKVCacheInputs{0};            //!< Number of KV cache inputs (layers)
+    std::vector<int64_t> mPerLayerHeadSize; //!< Per-layer head size (for heterogeneous models like Gemma4)
     int32_t mTargetModelOutputHiddenDim{0}; //!< Target output hidden dimension
     int32_t mNumDeepstackFeatures{0};       //!< Number of deepstack features (for Qwen3VL)
     // TODO: Use better mechanism to organize model configuration.

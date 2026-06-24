@@ -339,6 +339,51 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
         out["tp_size"] = tp_size
         out["tp_rank"] = tp_rank
 
+    # Heterogeneous head dimensions (e.g. Gemma4: sliding=256, global=512)
+    if config.global_head_dim and config.global_head_dim != config.head_dim:
+        out["global_head_dim"] = config.global_head_dim
+        out["layer_types"] = config.layer_types
+        # Emit kv_layer_configs so C++ runtime sizes per-layer KV cache correctly.
+        # The C++ parser expects "attention"/"mamba" strings in layer_types when
+        # kv_layer_configs is present, so emit a normalised copy.
+        norm_lt: list = []
+        kv_cfgs: list = []
+        for lt in config.layer_types:
+            norm_lt.append("attention")  # all layers are attention in Gemma4
+            if lt == "full_attention":
+                kv_cfgs.append({
+                    "num_kv_heads":
+                    config.num_global_key_value_heads
+                    or config.num_key_value_heads,
+                    "head_dim":
+                    config.global_head_dim
+                })
+            else:
+                kv_cfgs.append({
+                    "num_kv_heads": config.num_key_value_heads,
+                    "head_dim": config.head_dim
+                })
+        out["layer_types"] = norm_lt
+        out["kv_layer_configs"] = kv_cfgs
+        # Per-layer-type RoPE: extract global attention RoPE parameters from
+        # rope_scaling.full_attention (Gemma4: theta=1000000, prf=0.25).
+        full_attn_rope = (rope_scaling or {}).get("full_attention", {})
+        if full_attn_rope.get("rope_theta"):
+            out["global_rope_theta"] = float(full_attn_rope["rope_theta"])
+
+    # KV-sharing donors: shared layers read from donor layer's KV cache.
+    num_kv_shared = getattr(config, "num_kv_shared_layers", 0)
+    if num_kv_shared > 0:
+        from ..models.gemma4.modeling_gemma4_text import \
+            _compute_kv_donor_indices
+        donor_map = _compute_kv_donor_indices(config)
+        # Build donors array of length num_hidden_layers (all are attention).
+        # -1 = no sharing, otherwise = donor layer index.
+        donors = [-1] * config.num_hidden_layers
+        for shared_idx, donor_idx in donor_map.items():
+            donors[shared_idx] = donor_idx
+        out["kv_sharing_donors"] = donors
+
     ple_enabled = config.hidden_size_per_layer_input > 0
     out["ple_enabled"] = ple_enabled
     out["num_ple_inputs"] = config.num_hidden_layers if ple_enabled else 0

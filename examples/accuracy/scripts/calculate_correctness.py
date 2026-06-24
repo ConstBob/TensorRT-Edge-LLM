@@ -19,6 +19,51 @@ import re
 from collections import defaultdict
 
 
+def _apply_byte_fallback(text):
+    """
+    Apply SentencePiece ByteFallback decoding: convert <0xNN> sequences to actual bytes.
+
+    SentencePiece byte_fallback tokenizers use <0xNN> notation for individual byte tokens.
+    The ByteFallback decoder step converts these back to raw bytes. If the C++ tokenizer
+    does not implement this step, the literal text "<0xE2><0x96><0x81>" appears in output
+    instead of the UTF-8 character (U+2581).
+    """
+
+    def hex_to_byte(match):
+        return bytes([int(match.group(1), 16)])
+
+    # Only apply when consecutive <0xNN> tokens exist (SentencePiece ByteFallback
+    # always emits multi-byte runs for non-ASCII). Single isolated <0xNN> in normal
+    # text (e.g., hex discussions) is left unchanged to avoid false positives.
+    byte_pattern = re.compile(r"<0x([0-9A-Fa-f]{2})>")
+    if not re.search(r"<0x[0-9A-Fa-f]{2}><0x[0-9A-Fa-f]{2}>", text):
+        return text
+
+    # Process the string: convert <0xNN> runs to bytes, keep other text as-is
+    parts = []
+    last_end = 0
+    byte_buffer = bytearray()
+
+    for match in byte_pattern.finditer(text):
+        start = match.start()
+        if start > last_end:
+            # Flush byte buffer before non-hex text
+            if byte_buffer:
+                parts.append(byte_buffer.decode("utf-8", errors="replace"))
+                byte_buffer = bytearray()
+            parts.append(text[last_end:start])
+        byte_buffer.append(int(match.group(1), 16))
+        last_end = match.end()
+
+    # Flush remaining
+    if byte_buffer:
+        parts.append(byte_buffer.decode("utf-8", errors="replace"))
+    if last_end < len(text):
+        parts.append(text[last_end:])
+
+    return "".join(parts)
+
+
 def clean_text(text):
     """
     Clean and normalize text by stripping whitespace and removing punctuation from ends.
@@ -28,15 +73,35 @@ def clean_text(text):
         Cleaned text string.
     """
 
+    # Apply SentencePiece ByteFallback decoding (<0xNN> -> bytes) only when
+    # the text also contains the SentencePiece word-boundary marker '▁',
+    # confirming a SentencePiece tokenizer produced this output.
+    if "\u2581" in text:
+        text = _apply_byte_fallback(text)
+        text = text.replace("\u2581", " ")
+
     # Drop reasoning blocks emitted by reasoning models (Qwen3-thinking,
     # Nemotron-Reasoning, DeepSeek-R1, etc.) so an MCQ answer like
     # ``<think>...</think>\nC`` still scores against the clean reference.
     # The opening tag is optional because some chat templates inject it into
     # the prompt prefix, so the model output contains only ``</think>``.
-    text = re.sub(r"(?:<think>)?.*?</think>", "", text, flags=re.DOTALL)
-    # Drop chat / tokenizer special tokens (e.g. <|endoftext|>, <|im_end|>) so MCQ output
-    # like "C<|im_end|>" still scores against "C"
-    text = re.sub(r"<\|.*?\|>", "", text)
+    if "</think>" in text:
+        text = re.sub(r"(?:<think>)?.*?</think>", "", text, flags=re.DOTALL)
+    # Gemma4 thinking format: ``<|channel>thought\n...\n<|channel>response\n...``
+    # Keep only the response portion after the last ``<|channel>response`` marker.
+    if "<|channel>response" in text:
+        text = text[text.rfind("<|channel>response") +
+                    len("<|channel>response"):]
+    elif "<|channel>thought" in text:
+        # Thinking output without response section — no extractable answer via clean_text.
+        # Fall through to MCQ parser which will try heuristic extraction.
+        pass
+    # Drop chat / tokenizer special tokens (e.g. <|endoftext|>, <|im_end|>, <turn|>,
+    # <end_of_turn>) so MCQ output like "C<|im_end|>" or "C<turn|>" still scores.
+    # Replace with space (not empty) so "C<turn|>The..." → "C The..." preserves boundary.
+    text = re.sub(r"<\|.*?\|>", " ", text)
+    text = re.sub(r"<[a-z_]+\|>", " ", text)
+    text = re.sub(r"<end_of_turn>", " ", text)
     text = text.strip().strip("().,")
     return text
 
@@ -72,6 +137,18 @@ def parse_multi_choice_response(text):
     match = re.match(r'^[\(]?([A-H])[\.\):\s]', text)
     if match:
         return match.group(1)
+
+    # Handle short responses that start with a valid letter (e.g. "A\n" or "B.")
+    if len(text) <= 3 and text and text[0] in 'ABCDEFGH':
+        return text[0]
+
+    # For long thinking outputs: search the last 500 chars for "answer is X" pattern
+    if len(text) > 100:
+        tail = text[-500:]
+        m = re.search(r"\b(?:answer|correct)\s*(?:is|:)?\s*\(?([A-H])\b", tail,
+                      re.IGNORECASE)
+        if m:
+            return m.group(1).upper()
 
     # If no match found, return the original text
     return text

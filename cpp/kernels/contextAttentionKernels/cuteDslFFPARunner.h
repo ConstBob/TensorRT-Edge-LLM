@@ -60,6 +60,7 @@ struct CuteDslFFPAParams
 };
 
 //! Runner for the generated BF16 FFPA d=512 causal kernel.
+//! Supports MHA and GQA dynamically via numKVHeads runtime argument.
 class CuteDslFFPARunner
 {
 public:

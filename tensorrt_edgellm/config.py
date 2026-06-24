@@ -448,6 +448,10 @@ class ModelConfig:
     original_max_position_embeddings: Optional[int] = None
     # Fraction of head_dim used for RoPE (e.g. 0.75 for phi3/phi4, 1.0 for most others).
     partial_rotary_factor: float = 1.0
+    # Gemma4: head_dim for global (full_attention) layers (0 = same as head_dim)
+    global_head_dim: int = 0
+    # Gemma4 E4B: num_key_value_heads for global (full_attention) layers (0 = same as num_key_value_heads)
+    num_global_key_value_heads: int = 0
     # Hidden activation name used by architecture-specific auxiliary modules.
     hidden_activation: str = "silu"
     # Optional explicit RoPE configs for mixed sliding/full attention stacks.
@@ -476,6 +480,8 @@ class ModelConfig:
     attention_k_eq_v: bool = False
     # Multiplicative scale applied by the HF embedding module.
     embedding_scale: float = 1.0
+    # Final logit softcapping: tanh(logits/cap)*cap.  None = disabled.
+    final_logit_softcapping: Optional[float] = None
     # Weight dtype in the checkpoint
     torch_dtype: str = "bfloat16"
     # When True, embed_tokens and lm_head share the same weight tensor
@@ -572,6 +578,14 @@ class ModelConfig:
     # Gemma4 E-model vocabulary for the runtime-side token-identity PLE table.
     # The table is exported as ple_embedding.safetensors and gathered by C++.
     vocab_size_per_layer_input: int = 0
+    # Gemma4: number of KV-shared layers (counted from the last layer backward).
+    # Layers [num_hidden_layers - num_kv_shared_layers, num_hidden_layers) are
+    # "KV-shared" — in HF they reuse KV states from the last non-shared layer
+    # of the same attention type. Our export gives them independent K/V, but
+    # they may have a 2× wider MLP (use_double_wide_mlp).
+    num_kv_shared_layers: int = 0
+    # When True, KV-shared layers use 2× intermediate_size for their MLP.
+    use_double_wide_mlp: bool = False
     # ------------------------------------------ tensor parallel
     # ``mapping`` is the single source of truth for parallel placement.
     # tp_size>1 returns a per-rank ONNX graph with col/row-parallel projections.
@@ -623,7 +637,13 @@ class ModelConfig:
 
     @property
     def num_attn_layers(self) -> int:
-        return sum(1 for t in self.layer_types if t == LAYER_ATTN)
+        """Total attention layers (includes Gemma4 sliding/full variants).
+
+        Note: layers may have heterogeneous head dims — use per-layer configs
+        (kv_layer_configs) for allocation, not this count alone.
+        """
+        return sum(1 for t in self.layer_types
+                   if t in (LAYER_ATTN, "sliding_attention", "full_attention"))
 
     @property
     def num_mamba_layers(self) -> int:
@@ -707,6 +727,9 @@ class ModelConfig:
         hidden_size = llm_dict["hidden_size"]
         num_attn_heads = llm_dict["num_attention_heads"]
         head_dim = llm_dict.get("head_dim", hidden_size // num_attn_heads)
+        global_head_dim = int(llm_dict.get("global_head_dim", 0) or 0)
+        num_global_kv_heads = int(
+            llm_dict.get("num_global_key_value_heads", 0) or 0)
 
         quant = _parse_quant(model_dir, llm_dict)
         layer_types = _parse_layer_types(llm_dict)
@@ -739,8 +762,12 @@ class ModelConfig:
         # EAGLE3 draft model fields
         draft_vocab_size = llm_dict.get("draft_vocab_size", None)
         target_hidden_size = llm_dict.get("target_hidden_size", None)
-        # Sliding window: only active when use_sliding_window=True.
+        # Sliding window: active when use_sliding_window=True, OR when
+        # layer_types contains "sliding_attention" (Gemma4 convention).
         use_sw = llm_dict.get("use_sliding_window", False)
+        layer_types_raw = llm_dict.get("layer_types", [])
+        if not use_sw and "sliding_attention" in layer_types_raw:
+            use_sw = True
         sw_raw = llm_dict.get("sliding_window") if use_sw else None
         sliding_window_size = int(sw_raw) if sw_raw is not None else -1
 
@@ -790,6 +817,8 @@ class ModelConfig:
                                              num_attn_heads),
             intermediate_size=intermediate_size,
             head_dim=head_dim,
+            global_head_dim=global_head_dim,
+            num_global_key_value_heads=num_global_kv_heads,
             rms_norm_eps=_get_rms_norm_eps(llm_dict, model_type),
             vocab_size=llm_dict["vocab_size"],
             rope_theta=_get_rope_theta(llm_dict),
@@ -807,11 +836,10 @@ class ModelConfig:
             has_value_norm=has_value_norm,
             attention_bias=bool(llm_dict.get("attention_bias", False)),
             attention_scaling=attention_scaling,
-            global_head_dim=llm_dict.get("global_head_dim", None),
-            num_global_key_value_heads=llm_dict.get(
-                "num_global_key_value_heads", None),
             attention_k_eq_v=bool(llm_dict.get("attention_k_eq_v", False)),
             embedding_scale=embedding_scale,
+            final_logit_softcapping=llm_dict.get("final_logit_softcapping",
+                                                 None),
             torch_dtype=llm_dict.get("torch_dtype",
                                      llm_dict.get("dtype", "bfloat16")),
             tie_word_embeddings=llm_dict.get("tie_word_embeddings", False),
@@ -849,6 +877,10 @@ class ModelConfig:
                 llm_dict.get("hidden_size_per_layer_input", 0) or 0),
             vocab_size_per_layer_input=int(
                 llm_dict.get("vocab_size_per_layer_input", 0) or 0),
+            num_kv_shared_layers=int(
+                llm_dict.get("num_kv_shared_layers", 0) or 0),
+            use_double_wide_mlp=bool(llm_dict.get("use_double_wide_mlp",
+                                                  False)),
         )
 
 
@@ -1099,6 +1131,9 @@ def _parse_layer_types(config: dict) -> List[str]:
                 result.append(LAYER_MOE)
             elif "mlp" in bt_lower:
                 result.append(LAYER_MLP)
+            elif bt_lower in ("sliding_attention", "full_attention"):
+                # Gemma4: preserve raw string for per-layer head_dim dispatch
+                result.append(bt_lower)
             else:
                 result.append(LAYER_ATTN)
         return result

@@ -19,6 +19,7 @@
 #include "common/inputLimits.h"
 #include "tokenizerUtils.h"
 #include <cassert>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
 
@@ -259,6 +260,25 @@ void TokenEncoder::bytePairEncode(std::string const& piece, std::vector<Rank>& o
         if (tokenIt != mEncoder.end())
         {
             output.emplace_back(tokenIt->second);
+        }
+        else if (mByteFallback)
+        {
+            // Encode each byte as <0xNN> token
+            for (unsigned char byte : token)
+            {
+                char buf[8];
+                snprintf(buf, sizeof(buf), "<0x%02X>", byte);
+                auto byteIt = mEncoder.find(buf);
+                if (byteIt != mEncoder.end())
+                {
+                    output.emplace_back(byteIt->second);
+                }
+                else
+                {
+                    LOG_ERROR("Byte fallback token not found: '%s'", buf);
+                    return;
+                }
+            }
         }
         else
         {

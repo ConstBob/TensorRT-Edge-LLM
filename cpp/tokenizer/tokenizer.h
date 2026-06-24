@@ -376,6 +376,16 @@ protected:
     // Chat template
     ChatTemplateConfig mChatTemplate; //!< Chat template configuration
 
+    // Normalizer: list of (pattern, replacement) pairs applied before pre-tokenization.
+    std::vector<std::pair<std::string, std::string>> mNormalizerReplacements;
+
+    // Decoder replacements: list of (pattern, replacement) pairs applied after decoding (reverse of normalizer).
+    std::vector<std::pair<std::string, std::string>> mDecoderReplacements;
+
+    // ByteFallback: whether to convert <0xNN> pieces back to raw bytes during decode.
+    // Set when tokenizer.json decoder contains a "ByteFallback" step (SentencePiece-style).
+    bool mByteFallbackDecode{false};
+
     // State
     bool mInitialized; //!< Whether tokenizer is initialized
 };
