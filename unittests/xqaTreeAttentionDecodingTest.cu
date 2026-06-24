@@ -296,6 +296,155 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
 #endif
 }
 
+// Test with capacity > kvSequenceLength (simulates runtime with large allocated KV cache, partially filled).
+// This is the runtime scenario for Gemma4: capacity=256, only 16 tokens filled.
+void TestXQATreeAttentionDecodingWithPaddedCapacity(int32_t batchSize, int32_t numQHeads, int32_t numKVHeads,
+    int32_t headSize, int32_t kvSequenceLength, int32_t qSequenceLength, int32_t capacity)
+{
+    ASSERT_GE(capacity, kvSequenceLength);
+    int32_t smVersion = getSMVersion();
+    applyThorSMRenumberWAR(smVersion);
+    ASSERT_TRUE(trt_edgellm::DecoderXQARunner::canImplement(
+        numQHeads, numKVHeads, headSize, smVersion, DataType::kHALF, DataType::kHALF));
+
+    std::vector<int32_t> kvCacheLength(batchSize, kvSequenceLength);
+    std::vector<half> qInput;
+    std::vector<half> kvInput;
+    std::vector<half> outReference;
+    std::vector<int32_t> packedTreeMaskInput;
+
+    for (int32_t i = 0; i < batchSize; i++)
+    {
+        std::vector<half> qi(numQHeads * headSize * qSequenceLength);
+        // KV allocated at full capacity, but only first kvSequenceLength positions have data
+        std::vector<half> ki(numKVHeads * headSize * capacity, __float2half(0.0F));
+        std::vector<half> vi(numKVHeads * headSize * capacity, __float2half(0.0F));
+        std::vector<int32_t> treeMaski(qSequenceLength * qSequenceLength);
+
+        uniformFloatInitialization(qi);
+        // Fill only the first kvSequenceLength positions per KV head
+        std::vector<half> kiData(numKVHeads * headSize * kvSequenceLength);
+        std::vector<half> viData(numKVHeads * headSize * kvSequenceLength);
+        uniformFloatInitialization(kiData);
+        uniformFloatInitialization(viData);
+        // Copy data into padded buffer: KV layout is [numKVHeads, capacity, headSize]
+        for (int32_t h = 0; h < numKVHeads; ++h)
+        {
+            for (int32_t s = 0; s < kvSequenceLength; ++s)
+            {
+                for (int32_t d = 0; d < headSize; ++d)
+                {
+                    ki[h * capacity * headSize + s * headSize + d]
+                        = kiData[h * kvSequenceLength * headSize + s * headSize + d];
+                    vi[h * capacity * headSize + s * headSize + d]
+                        = viData[h * kvSequenceLength * headSize + s * headSize + d];
+                }
+            }
+        }
+
+        uniformIntInitialization(treeMaski, 0, 1);
+        auto ref = casualAttentionRef<half>(
+            qi, kiData, viData, qSequenceLength, kvSequenceLength, numQHeads, numKVHeads, headSize, treeMaski);
+
+        qInput.insert(qInput.end(), qi.begin(), qi.end());
+        // KV layout: [B, 2, H_kv, capacity, D] — K then V per batch
+        kvInput.insert(kvInput.end(), ki.begin(), ki.end());
+        kvInput.insert(kvInput.end(), vi.begin(), vi.end());
+        outReference.insert(outReference.end(), ref.begin(), ref.end());
+
+        int32_t const numBitsPerPackedMask = 32;
+        int32_t const numPackedMasksPerToken = divUp(qSequenceLength, numBitsPerPackedMask);
+        std::vector<int32_t> packedMaski(numPackedMasksPerToken * qSequenceLength, 0);
+        for (int32_t ti = 0; ti < qSequenceLength; ti++)
+        {
+            for (int32_t j = 0; j < numPackedMasksPerToken; j++)
+            {
+                int32_t mask = 0;
+                for (int32_t k = 0; k < numBitsPerPackedMask; k++)
+                {
+                    int32_t const bitIndex = j * numBitsPerPackedMask + k;
+                    int32_t maskFlag = 0;
+                    if (bitIndex < qSequenceLength)
+                    {
+                        maskFlag = treeMaski[ti * qSequenceLength + bitIndex];
+                    }
+                    mask |= maskFlag << k;
+                }
+                packedMaski[ti * numPackedMasksPerToken + j] = mask;
+            }
+        }
+        packedTreeMaskInput.insert(packedTreeMaskInput.end(), packedMaski.begin(), packedMaski.end());
+    }
+
+    thrust::device_vector<half> qInputDevice(qInput);
+    thrust::device_vector<half> kvInputDevice(kvInput);
+    thrust::device_vector<half> outDevice(outReference.size(), 1.0F);
+    thrust::device_vector<int32_t> kvCacheLengthDevice(kvCacheLength);
+    thrust::device_vector<int32_t> packedTreeMaskDevice(packedTreeMaskInput);
+
+    trt_edgellm::DecoderXQARunner runner(
+        DataType::kHALF, DataType::kHALF, batchSize, numQHeads, numKVHeads, headSize, smVersion);
+    auto params = runner.initXQAParams();
+    params.qSeqLen = qSequenceLength;
+    params.qInputPtr = thrust::raw_pointer_cast(qInputDevice.data());
+    params.kvCache.data = thrust::raw_pointer_cast(kvInputDevice.data());
+    params.kvCache.sequence_lengths = thrust::raw_pointer_cast(kvCacheLengthDevice.data());
+    params.kvCache.capacity = capacity; // capacity > kvSequenceLength
+    params.output = thrust::raw_pointer_cast(outDevice.data());
+    params.treeAttnMask = thrust::raw_pointer_cast(packedTreeMaskDevice.data());
+
+    cudaStream_t stream{nullptr};
+    runner.dispatchSpecDecodeXQAKernel(params, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaGetLastError());
+
+    thrust::host_vector<half> outHost(outDevice.size());
+    thrust::copy(outDevice.begin(), outDevice.end(), outHost.begin());
+
+    bool NanValueDetected = false;
+    int32_t numErrorWithin1E_3 = 0;
+    for (int32_t i = 0; i < batchSize * qSequenceLength * numQHeads * headSize; ++i)
+    {
+        EXPECT_TRUE(isclose(outHost[i], outReference[i], 1e-2, 1e-2));
+        if (isclose(outHost[i], outReference[i], 1e-3, 1e-3))
+        {
+            numErrorWithin1E_3++;
+        }
+        if (isnan(__half2float(outHost[i])))
+        {
+            NanValueDetected = true;
+        }
+    }
+    float passRate1E_3 = static_cast<float>(numErrorWithin1E_3) / (batchSize * qSequenceLength * numQHeads * headSize);
+
+    std::cout << "XQA Tree Attention Decoding test. [Padded capacity] batch_size: " << batchSize
+              << " num_Q_heads: " << numQHeads << " num_KV_heads: " << numKVHeads << " head_size: " << headSize
+              << " kvcache seq_len: " << kvSequenceLength << " q_seq_len: " << qSequenceLength
+              << " capacity: " << capacity << " pass_rate_1e-3: " << passRate1E_3 << std::endl;
+    EXPECT_GT(passRate1E_3, 0.9);
+    EXPECT_FALSE(NanValueDetected);
+}
+
+TEST(XQATreeAttentionDecodingTest, accuracyBaseLen0Gemma4)
+{
+    // Gemma4 prefill scenario: baseLen=0 (kvSeqLen==qSeqLen), GQA 8:1, headDim=512
+    TestXQATreeAttentionDecodingAccuracy(1, 8, 1, 512, 16, 16);
+    TestXQATreeAttentionDecodingAccuracy(1, 8, 1, 512, 32, 32);
+    TestXQATreeAttentionDecodingAccuracy(1, 8, 1, 512, 64, 64);
+    // Also test with baseLen > 0 for the same config (decode after prefill)
+    TestXQATreeAttentionDecodingAccuracy(1, 8, 1, 512, 32, 16);
+}
+
+TEST(XQATreeAttentionDecodingTest, accuracyPaddedCapacityGemma4)
+{
+    // Gemma4 runtime: capacity=256, only 16 tokens filled (baseLen=0)
+    TestXQATreeAttentionDecodingWithPaddedCapacity(1, 8, 1, 512, 16, 16, 256);
+    // capacity=256, 32 tokens filled
+    TestXQATreeAttentionDecodingWithPaddedCapacity(1, 8, 1, 512, 32, 32, 256);
+    // capacity=128, 16 tokens filled
+    TestXQATreeAttentionDecodingWithPaddedCapacity(1, 8, 1, 512, 16, 16, 128);
+}
+
 TEST(XQATreeAttentionDecodingTest, accuracyKVRatio4HeadDim128)
 {
     /// KVSequence 256, QSequence 48
@@ -347,6 +496,9 @@ TEST(XQATreeAttentionDecodingTest, accuracyKVRatio8HeadDim512)
 {
     TestXQATreeAttentionDecodingAccuracy(1, 32, 4, 512, 256, 20);
     TestXQATreeAttentionDecodingAccuracy(1, 32, 4, 512, 128, 33);
+    // Gemma4-like: GQA 8:1, headDim=512, baseLen=0 (kvSeqLen==qSeqLen, initial prefill)
+    TestXQATreeAttentionDecodingAccuracy(1, 8, 1, 512, 16, 16);
+    TestXQATreeAttentionDecodingAccuracy(1, 8, 1, 512, 32, 32);
 }
 
 TEST(XQATreeAttentionDecodingTest, slidingWindowAccuracy)

@@ -138,8 +138,15 @@ std::string decodeHFTokenToNormal(std::string const& hfToken)
     {
         auto const utf8 = unicodeCptToUtf8(cpt);
         auto it = map.find(utf8);
-        assert(it != map.end());
-        decoded += it->second;
+        if (it == map.end())
+        {
+            // Codepoint not in HF byte-to-unicode map; keep the raw UTF-8 bytes.
+            decoded += utf8;
+        }
+        else
+        {
+            decoded += it->second;
+        }
     }
 
     return decoded;

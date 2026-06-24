@@ -64,7 +64,7 @@ bool CuteDslFFPARunner::loadKernelModule()
     {
         ffpa_d512_causal_Kernel_Module_Load(&sD512CausalModule);
         sLoaded = true;
-        LOG_DEBUG("CuTe DSL FFPA d512 causal kernel module loaded");
+        LOG_DEBUG("CuTe DSL FFPA d512 causal kernel module(s) loaded");
         return true;
     }
     catch (...)
@@ -125,6 +125,7 @@ int CuteDslFFPARunner::run(CuteDslFFPAParams const& params, cudaStream_t stream)
         return -1;
     }
 
+    // Strides for Q/O (indexed by numQHeads) and K/V (indexed by numKVHeads).
     int64_t const qStrideBatch
         = static_cast<int64_t>(params.seqlenQ) * static_cast<int64_t>(params.numQHeads) * params.headDim;
     int64_t const qStrideSeq = static_cast<int64_t>(params.numQHeads) * params.headDim;
@@ -134,9 +135,6 @@ int CuteDslFFPARunner::run(CuteDslFFPAParams const& params, cudaStream_t stream)
     float const softmaxScale
         = params.softmaxScale > 0.0F ? params.softmaxScale : 1.0F / std::sqrt(static_cast<float>(params.headDim));
 
-    // The AOT export marks B / S / H dynamic and bakes D=512 statically into
-    // the kernel; the generated Tensor_m{Q,K,V,O}_t structs therefore expose
-    // dynamic_shapes[3] for (B, S, H) and dynamic_strides[2] for (stride_B, stride_S).
     // The H-stride is statically D and the D-stride is statically 1, so neither
     // is passed across the ABI.
     ffpa_d512_causal_Tensor_mQ_t qTensor{};

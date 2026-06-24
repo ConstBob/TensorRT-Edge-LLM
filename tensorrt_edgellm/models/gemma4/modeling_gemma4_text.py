@@ -147,8 +147,11 @@ def _attention_type_for_layer(config: ModelConfig, layer_idx: int) -> str:
 
 
 def _rotary_dim_from_rope_config(config: ModelConfig,
-                                 rope_config: dict | None) -> int:
+                                 rope_config: dict | None,
+                                 head_dim: int | None = None) -> int:
     """Return the RoPE table width for one Gemma4 runtime RoPE config."""
+    effective_head_dim = head_dim if head_dim is not None else int(
+        config.head_dim)
     if isinstance(rope_config, dict):
         rope_scaling = rope_config.get("rope_scaling")
         partial_rotary_factor = float(
@@ -162,8 +165,8 @@ def _rotary_dim_from_rope_config(config: ModelConfig,
         rope_type = str(
             rope_scaling.get("rope_type", rope_scaling.get("type", "default")))
         if rope_type == "proportional":
-            return int(config.head_dim)
-    return int(config.head_dim * partial_rotary_factor)
+            return effective_head_dim
+    return int(effective_head_dim * partial_rotary_factor)
 
 
 def _select_rope_for_layer(
@@ -277,6 +280,38 @@ def _resolve_hidden_activation(
     )
 
 
+def _compute_kv_donor_indices(config: ModelConfig) -> dict:
+    """Compute the KV donor layer index for each KV-shared layer.
+
+    Returns a dict mapping shared layer_idx -> donor layer_idx.
+    Donor is the last non-shared layer of the same type (sliding/full).
+    """
+    num_kv_shared = getattr(config, "num_kv_shared_layers", 0)
+    if num_kv_shared <= 0:
+        return {}
+    n = config.num_hidden_layers
+    first_shared = n - num_kv_shared
+    layer_types = (list(config.attention_layer_types)
+                   if config.attention_layer_types else [])
+
+    # Find last non-shared layer of each type
+    prev_layers = layer_types[:first_shared]
+    donors: dict = {}
+    for lt in set(prev_layers):
+        donors[lt] = first_shared - 1 - prev_layers[::-1].index(lt)
+
+    result: dict = {}
+    for i in range(first_shared, n):
+        if i < len(layer_types):
+            lt = layer_types[i]
+            if lt not in donors:
+                raise ValueError(
+                    f"KV-shared layer {i} has type '{lt}' with no "
+                    f"non-shared donor layer of the same type.")
+            result[i] = donors[lt]
+    return result
+
+
 class Gemma4ValueRMSNorm(nn.Module):
     """Weightless per-head RMSNorm used by Gemma4 attention values."""
 
@@ -295,7 +330,14 @@ class Gemma4ValueRMSNorm(nn.Module):
 
 
 class Gemma4Attention(Attention):
-    """Gemma4 attention with HF-compatible value norm, K=V, and QK scaling."""
+    """Gemma4 attention with HF-compatible value norm, K=V, and QK scaling.
+
+    KV-shared layers (index >= num_hidden_layers - num_kv_shared_layers) do not
+    compute their own K/V.  They reuse the KV cache of the donor layer (the last
+    preceding layer of the same attention type before the shared range).
+
+    Full-attention layers use global_head_dim (512) instead of head_dim (256).
+    """
 
     def __init__(self,
                  config: ModelConfig,
@@ -351,11 +393,30 @@ class Gemma4Attention(Attention):
             self.q_norm = None
             self.k_norm = None
 
+        # KV-sharing: layers in the shared range reuse a donor's KV cache.
+        num_kv_shared = getattr(config, "num_kv_shared_layers", 0)
+        first_shared = (config.num_hidden_layers - num_kv_shared
+                        if num_kv_shared > 0 else config.num_hidden_layers)
+        self.is_kv_shared = layer_idx >= first_shared
+
+        # KV-shared layers don't use k_proj/v_proj/k_norm — remove them
+        # so their weights are not loaded from the checkpoint.
+        if self.is_kv_shared:
+            del self.k_proj
+            if self.v_proj is not None:
+                del self.v_proj
+            if hasattr(self, "k_norm") and self.k_norm is not None:
+                del self.k_norm
+
         self.qk_scale = (float(config.attention_scaling)
                          if config.attention_scaling > 0.0 else self.head_dim**
                          -0.5)
-        self.v_norm = (Gemma4ValueRMSNorm(self.head_dim, config.rms_norm_eps)
-                       if config.has_value_norm else None)
+        if not self.is_kv_shared:
+            self.v_norm = (Gemma4ValueRMSNorm(self.head_dim,
+                                              config.rms_norm_eps)
+                           if config.has_value_norm else None)
+        else:
+            self.v_norm = None
         self.sliding_window_size = (config.sliding_window_size
                                     if self.attention_type
                                     == "sliding_attention" else -1)
@@ -377,11 +438,20 @@ class Gemma4Attention(Attention):
         batch_size, seq_len, _ = hidden_states.shape
 
         query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        if self.attention_k_eq_v:
-            value_states = key_states
+
+        if self.is_kv_shared:
+            # Shared-KV mode: pass zero-length K/V to the attention plugin.
+            # The plugin detects kvSeqLen==0 and skips KV cache writes,
+            # reading from the donor layer's cache (bound as past_key_value).
+            kv_dim = self.num_kv_heads * self.head_dim
+            key_states = hidden_states.new_zeros(batch_size, 0, kv_dim)
+            value_states = hidden_states.new_zeros(batch_size, 0, kv_dim)
         else:
-            value_states = self.v_proj(hidden_states)
+            key_states = self.k_proj(hidden_states)
+            if self.attention_k_eq_v:
+                value_states = key_states
+            else:
+                value_states = self.v_proj(hidden_states)
 
         if self.q_norm is not None:
             query_states = self.q_norm(
@@ -389,19 +459,21 @@ class Gemma4Attention(Attention):
                                      self.head_dim)).reshape(
                                          batch_size, seq_len,
                                          self.num_heads * self.head_dim)
-        if self.k_norm is not None:
-            key_states = self.k_norm(
-                key_states.reshape(batch_size, seq_len, self.num_kv_heads,
-                                   self.head_dim)).reshape(
-                                       batch_size, seq_len,
-                                       self.num_kv_heads * self.head_dim)
+        if not self.is_kv_shared:
+            if self.k_norm is not None:
+                key_states = self.k_norm(
+                    key_states.reshape(batch_size, seq_len, self.num_kv_heads,
+                                       self.head_dim)).reshape(
+                                           batch_size, seq_len,
+                                           self.num_kv_heads * self.head_dim)
 
-        if self.v_norm is not None:
-            value_states = self.v_norm(
-                value_states.reshape(batch_size, seq_len, self.num_kv_heads,
-                                     self.head_dim)).reshape(
-                                         batch_size, seq_len,
-                                         self.num_kv_heads * self.head_dim)
+            if self.v_norm is not None:
+                value_states = self.v_norm(
+                    value_states.reshape(batch_size, seq_len,
+                                         self.num_kv_heads,
+                                         self.head_dim)).reshape(
+                                             batch_size, seq_len,
+                                             self.num_kv_heads * self.head_dim)
 
         query_scale = self._attention_plugin_query_scale()
         if query_scale != 1.0:
@@ -445,9 +517,12 @@ class Gemma4MLP(MLP):
         self.act_fn = _resolve_hidden_activation(config.hidden_activation)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(
-            self.act_fn(self.gate_proj(hidden_states)) *
-            self.up_proj(hidden_states))
+        # Upcast gate*up product to fp32 to prevent fp16 overflow in large models.
+        gate = self.act_fn(self.gate_proj(hidden_states))
+        up = self.up_proj(hidden_states)
+        intermediate = (gate.to(torch.float32) * up.to(torch.float32)).to(
+            hidden_states.dtype)
+        return self.down_proj(intermediate)
 
 
 class Gemma4DecoderLayer(DecoderLayer):
@@ -460,6 +535,16 @@ class Gemma4DecoderLayer(DecoderLayer):
         self.hidden_size_per_layer_input = int(
             config.hidden_size_per_layer_input)
         self.act_fn = _resolve_hidden_activation(config.hidden_activation)
+
+        # Gemma4 uses 4 distinct RMSNorm layers per decoder block:
+        #   input_layernorm            -> pre-attention (inherited from super)
+        #   post_attention_layernorm   -> post-attention, before residual add (inherited)
+        #   pre_feedforward_layernorm  -> pre-MLP
+        #   post_feedforward_layernorm -> post-MLP, before residual add
+        self.pre_feedforward_layernorm = RMSNorm(config.hidden_size,
+                                                 config.rms_norm_eps)
+        self.post_feedforward_layernorm = RMSNorm(config.hidden_size,
+                                                  config.rms_norm_eps)
 
         if self.hidden_size_per_layer_input > 0:
             self.per_layer_input_gate = nn.Linear(
@@ -521,8 +606,9 @@ class Gemma4DecoderLayer(DecoderLayer):
         per_layer_input: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
-        attn_output, present_key_value = self.self_attn(
-            self.input_layernorm(hidden_states),
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, present_key_value = self.self_attn(
+            hidden_states,
             past_key_value,
             rope_rotary_cos_sin,
             context_lengths,
@@ -530,11 +616,15 @@ class Gemma4DecoderLayer(DecoderLayer):
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
         )
-        hidden_states = residual + attn_output
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = residual + hidden_states
 
         residual = hidden_states
-        hidden_states = residual + self.mlp(
-            self.post_attention_layernorm(hidden_states))
+        hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.post_feedforward_layernorm(hidden_states)
+        hidden_states = residual + hidden_states
+
         hidden_states = self._apply_per_layer_input(hidden_states,
                                                     per_layer_input)
         if self.hidden_size_per_layer_input > 0:
@@ -927,6 +1017,12 @@ class Gemma4ForCausalLM(CausalLM):
         selected_hidden_states = torch.ops.trt.gather_nd(
             hidden_states, last_token_ids)
         logits = self.lm_head(selected_hidden_states).to(torch.float32)
+
+        final_logit_softcapping = getattr(self.config,
+                                          "final_logit_softcapping", None)
+        if final_logit_softcapping is not None:
+            logits = torch.tanh(
+                logits / final_logit_softcapping) * final_logit_softcapping
 
         if eagle_base and all_hidden_states is not None:
             n_layers = len(all_hidden_states) - 1
