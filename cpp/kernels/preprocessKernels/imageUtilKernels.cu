@@ -18,6 +18,7 @@
 #include "common/checkMacros.h"
 #include "imageUtilKernels.h"
 #include "kernels/common/vectorizedTypes.cuh"
+#include <cmath>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -464,6 +465,98 @@ void initRotaryPosEmbQwenViT(rt::Tensor& rotaryPosEmb, std::vector<int64_t> cons
 
     initRotaryPosEmbQwenKernel<<<gridSize, blockSize, 0, stream>>>(
         rotaryPosEmb.dataPointer<float>(), T, H, W, mergeSize, startIdx, vitPosEmbDim, rotaryBaseFrequency, scale);
+}
+
+__global__ void initRotaryPosEmbGemma4Kernel(float* rotaryPosEmb, int64_t const* pixelPositionIds,
+    int64_t const totalSeqLength, int64_t const headDim, float const rotaryBaseFrequency)
+{
+    int64_t const tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t const totalElements = totalSeqLength * headDim;
+    if (tid >= totalElements)
+        return;
+
+    int64_t const tokenIdx = tid / headDim;
+    int64_t const dimIdx = tid % headDim;
+    int64_t const axisDim = headDim / 2;
+    int64_t const axis = dimIdx / axisDim;
+    int64_t const dimInAxis = dimIdx % axisDim;
+    int64_t const freqIdx = dimInAxis % (axisDim / 2);
+    int64_t const posId = pixelPositionIds[tokenIdx * 2 + axis];
+
+    float const exponent = 2.0F * static_cast<float>(freqIdx) / static_cast<float>(axisDim);
+    rotaryPosEmb[tid] = static_cast<float>(posId) / powf(rotaryBaseFrequency, exponent);
+}
+
+void initRotaryPosEmbGemma4ViT(
+    rt::Tensor& rotaryPosEmb, rt::Tensor const& pixelPositionIds, float rotaryBaseFrequency, cudaStream_t stream)
+{
+    check::check(rotaryPosEmb.getDeviceType() == rt::DeviceType::kGPU
+            && pixelPositionIds.getDeviceType() == rt::DeviceType::kGPU,
+        "Device type shall be GPU for Gemma4 rotary position tensors.");
+    check::check(rotaryPosEmb.getDataType() == DataType::kFLOAT && pixelPositionIds.getDataType() == DataType::kINT64,
+        "Data type check failed for Gemma4 rotary position tensors.");
+    check::check(rotaryPosEmb.getShape().getNumDims() == 2,
+        "Gemma4 rotary position embeddings shape shall be [totalSeqLength, headDim].");
+    check::check(pixelPositionIds.getShape().getNumDims() == 2 && pixelPositionIds.getShape()[1] == 2,
+        "Gemma4 pixel position ids shape shall be [totalSeqLength, 2].");
+    check::check(rotaryPosEmb.getShape()[0] == pixelPositionIds.getShape()[0],
+        "Gemma4 rotary position embeddings and pixel position ids must have the same sequence length.");
+
+    int64_t const totalSeqLength = rotaryPosEmb.getShape()[0];
+    int64_t const headDim = rotaryPosEmb.getShape()[1];
+    check::check(headDim % 4 == 0, "Gemma4 RoPE headDim must be divisible by 4.");
+
+    uint32_t const blockSize = 256;
+    uint32_t const gridSize = static_cast<uint32_t>((totalSeqLength * headDim + blockSize - 1) / blockSize);
+    initRotaryPosEmbGemma4Kernel<<<gridSize, blockSize, 0, stream>>>(rotaryPosEmb.dataPointer<float>(),
+        pixelPositionIds.dataPointer<int64_t>(), totalSeqLength, headDim, rotaryBaseFrequency);
+}
+
+__global__ void initPoolingWeightsGemma4Kernel(half* poolingWeights, int64_t const totalPatches,
+    int64_t const patchStart, int64_t const softStart, int64_t const patchHeight, int64_t const patchWidth,
+    int64_t const poolingKernelSize)
+{
+    int64_t const tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t const curPatches = patchHeight * patchWidth;
+    if (tid >= curPatches)
+        return;
+
+    int64_t const y = tid / patchWidth;
+    int64_t const x = tid % patchWidth;
+    int64_t const softWidth = patchWidth / poolingKernelSize;
+    int64_t const row = softStart + (y / poolingKernelSize) * softWidth + (x / poolingKernelSize);
+    int64_t const col = patchStart + tid;
+    float const weight = 1.0F / static_cast<float>(poolingKernelSize * poolingKernelSize);
+    poolingWeights[row * totalPatches + col] = __float2half(weight);
+}
+
+void initPoolingWeightsGemma4ViT(rt::Tensor& poolingWeights, int64_t patchStart, int64_t softStart, int64_t patchHeight,
+    int64_t patchWidth, int64_t poolingKernelSize, cudaStream_t stream)
+{
+    check::check(poolingWeights.getDeviceType() == rt::DeviceType::kGPU,
+        "Device type shall be GPU for Gemma4 pooling weights tensor.");
+    check::check(
+        poolingWeights.getDataType() == DataType::kHALF, "Data type shall be half for Gemma4 pooling weights tensor.");
+    check::check(poolingWeights.getShape().getNumDims() == 2,
+        "Gemma4 pooling weights shape shall be [totalSoftTokens, totalPatches].");
+    check::check(poolingKernelSize > 0, "Gemma4 pooling kernel size must be positive.");
+    check::check(patchHeight > 0 && patchWidth > 0, "Gemma4 patch grid size must be positive.");
+    check::check(patchHeight % poolingKernelSize == 0 && patchWidth % poolingKernelSize == 0,
+        "Gemma4 patch grid size must be divisible by pooling kernel size.");
+
+    int64_t const totalSoftTokens = poolingWeights.getShape()[0];
+    int64_t const totalPatches = poolingWeights.getShape()[1];
+    int64_t const curPatches = patchHeight * patchWidth;
+    int64_t const curSoftTokens = (patchHeight / poolingKernelSize) * (patchWidth / poolingKernelSize);
+    check::check(patchStart >= 0 && patchStart + curPatches <= totalPatches,
+        "Gemma4 pooling patch range exceeds pooling weights shape.");
+    check::check(softStart >= 0 && softStart + curSoftTokens <= totalSoftTokens,
+        "Gemma4 pooling soft-token range exceeds pooling weights shape.");
+
+    uint32_t const blockSize = 256;
+    uint32_t const gridSize = static_cast<uint32_t>((curPatches + blockSize - 1) / blockSize);
+    initPoolingWeightsGemma4Kernel<<<gridSize, blockSize, 0, stream>>>(poolingWeights.dataPointer<half>(), totalPatches,
+        patchStart, softStart, patchHeight, patchWidth, poolingKernelSize);
 }
 
 __global__ void initFastPosEmbedQwenViTKernel(int64_t* fastPosEmbedIdx, half* fastPosEmbedWeight,

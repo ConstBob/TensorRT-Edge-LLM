@@ -749,8 +749,15 @@ class ModelConfig:
         num_experts = int(
             llm_dict.get("num_experts", llm_dict.get("num_local_experts", 0))
             or 0)
-        num_experts_per_tok = int(llm_dict.get("num_experts_per_tok", 0))
-        moe_intermediate_size = int(llm_dict.get("moe_intermediate_size", 0))
+        if num_experts > 0:
+            num_experts_per_tok = int(
+                llm_dict.get("num_experts_per_tok",
+                             llm_dict.get("top_k_experts", 0)) or 0)
+            moe_intermediate_size = int(
+                llm_dict.get("moe_intermediate_size", 0) or 0)
+        else:
+            num_experts_per_tok = 0
+            moe_intermediate_size = 0
         # HF Qwen3-Omni MoE Talker uses the un-prefixed name; HF NemotronH /
         # other MoE families use ``moe_shared_expert_intermediate_size``.
         moe_shared_expert_intermediate_size = int(

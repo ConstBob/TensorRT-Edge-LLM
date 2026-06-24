@@ -69,6 +69,31 @@ void transposeToPatchQwenViT(rt::Tensor const& originalImage, rt::Tensor& inputP
 void initRotaryPosEmbQwenViT(rt::Tensor& rotaryPosEmb, std::vector<int64_t> const& gridTHW, int64_t const mergeSize,
     int64_t const startIdx, float const rotaryBaseFrequency, float const scale, cudaStream_t stream);
 
+//! The kernel will initialize Gemma4 vision 2-D rotary angle embeddings from pixel position ids
+//! Inputs:
+//!     pixelPositionIds [GPU, Int64]: Pixel position ids [totalSeqLength, 2] (x, y)
+//!     rotaryBaseFrequency: Rotary base frequency
+//!     stream: CUDA stream for execution
+//! Outputs:
+//!     rotaryPosEmb [GPU, Float]: Rotary angle embeddings tensor [totalSeqLength, headDim]
+//! \throws std::runtime_error if tensors have invalid shape, data type or location
+void initRotaryPosEmbGemma4ViT(
+    rt::Tensor& rotaryPosEmb, rt::Tensor const& pixelPositionIds, float rotaryBaseFrequency, cudaStream_t stream);
+
+//! The kernel will initialize Gemma4 vision dense pooling weights on GPU
+//! Inputs:
+//!     patchStart: First patch column for the current image in the packed patch tensor
+//!     softStart: First soft-token row for the current image in the pooled output
+//!     patchHeight: Patch-grid height for the current image
+//!     patchWidth: Patch-grid width for the current image
+//!     poolingKernelSize: Spatial pooling kernel size
+//!     stream: CUDA stream for execution
+//! Outputs:
+//!     poolingWeights [GPU, Half]: Dense pooling weight tensor [totalSoftTokens, totalPatches]
+//! \throws std::runtime_error if tensors have invalid shape, data type or location
+void initPoolingWeightsGemma4ViT(rt::Tensor& poolingWeights, int64_t patchStart, int64_t softStart, int64_t patchHeight,
+    int64_t patchWidth, int64_t poolingKernelSize, cudaStream_t stream);
+
 //! The kernel will transpose image data to patch format for InternVL VIT
 //! Inputs:
 //!     originalImage [GPU, Half]: Current image [1, height, width, channels]

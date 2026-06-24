@@ -332,11 +332,18 @@ inline constexpr char const* kVisualInput = "input";
 inline constexpr char const* kVisualOutput = "output";
 
 /*!
- * @brief Rotary positional embeddings for visual inputs (Qwen-VL specific)
+ * @brief Rotary positional embeddings for visual inputs
  *
  * Shape: [sequence_length, embed_dim] (FLOAT32)
  */
 inline constexpr char const* kRotaryPosEmb = "rotary_pos_emb";
+
+/*!
+ * @brief Gemma4 pixel position ids for visual patch embeddings and 2-D RoPE
+ *
+ * Shape: [sequence_length, 2] (INT64)
+ */
+inline constexpr char const* kPixelPositionIds = "pixel_position_ids";
 
 /*!
  * @brief Cumulative sequence lengths for ragged ViT attention
@@ -361,6 +368,13 @@ inline constexpr char const* kKvLengths = "kv_lengths";
  * Shape: [max_seqlen] (INT32)
  */
 inline constexpr char const* kMaxSeqLenCarrier = "max_seqlen_carrier";
+
+/*!
+ * @brief Gemma4 position-aware pooling weights
+ *
+ * Shape: [num_image_tokens, sequence_length] (FLOAT16)
+ */
+inline constexpr char const* kPoolingWeights = "pooling_weights";
 
 /*!
  * @brief Cumulative window sequence lengths for Qwen2.5-VL window attention

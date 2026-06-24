@@ -1,0 +1,563 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "gemma4ViTRunner.h"
+#include "common/bindingNames.h"
+#include "common/checkMacros.h"
+#include "common/mathUtils.h"
+#include "kernels/preprocessKernels/imageUtilKernels.h"
+#include "profiling/metrics.h"
+#include "profiling/timer.h"
+#include <algorithm>
+#include <cmath>
+#include <fstream>
+#include <nlohmann/json.hpp>
+#include <numeric>
+#include <stdexcept>
+
+using Json = nlohmann::json;
+
+namespace trt_edgellm
+{
+namespace rt
+{
+
+Gemma4ViTRunner::Gemma4ViTRunner(std::string const& engineDir, cudaStream_t stream)
+    : MultimodalRunner(engineDir, stream)
+{
+    if (!validateAndFillConfig(engineDir))
+    {
+        LOG_ERROR("Failed to validate and fill config");
+        throw std::runtime_error("Gemma4ViTRunner::Gemma4ViTRunner(): Failed to validate and fill config");
+    }
+    if (!allocateBuffer(stream))
+    {
+        LOG_ERROR("Failed to allocate buffer");
+        throw std::runtime_error("Gemma4ViTRunner::Gemma4ViTRunner(): Failed to allocate buffer");
+    }
+}
+
+bool Gemma4ViTRunner::validateAndFillConfig(std::string const& engineDir)
+{
+    Json jsonConfig;
+
+    std::string configPath = engineDir + "/config.json";
+    std::ifstream configFileStream(configPath);
+    if (!configFileStream.is_open())
+    {
+        LOG_ERROR("Failed to open config file: %s", configPath.c_str());
+        return false;
+    }
+
+    try
+    {
+        jsonConfig = Json::parse(configFileStream);
+        configFileStream.close();
+    }
+    catch (Json::parse_error const& e)
+    {
+        LOG_ERROR("Failed to parse config file with error: %s", e.what());
+        return false;
+    }
+
+    std::string modelTypeStr = jsonConfig["model_type"].get<std::string>();
+    mModelType = multimodal::stringToModelType(modelTypeStr);
+    if (mModelType != multimodal::ModelType::GEMMA4_VISION)
+    {
+        LOG_ERROR("Invalid model type: %s", modelTypeStr.c_str());
+        return false;
+    }
+
+    if (!jsonConfig.contains("image_token_id"))
+    {
+        LOG_ERROR("Gemma4 visual config is missing image_token_id");
+        return false;
+    }
+    mConfig.imageTokenId = jsonConfig["image_token_id"].get<int32_t>();
+
+    auto const& visionConfig = jsonConfig["vision_config"];
+    mConfig.patchSize = visionConfig.value("patch_size", 16);
+    mConfig.poolingKernelSize = visionConfig.value("pooling_kernel_size", 3);
+    auto const& ropeParams = visionConfig.contains("rope_parameters") ? visionConfig["rope_parameters"] : visionConfig;
+    mConfig.ropeTheta = ropeParams.value("rope_theta", 100.0F);
+    if (mConfig.patchSize <= 0 || mConfig.poolingKernelSize <= 0)
+    {
+        LOG_ERROR("Gemma4 patch_size and pooling_kernel_size must be positive");
+        return false;
+    }
+
+    auto const& builderConfig = jsonConfig["builder_config"];
+    mConfig.minImageTokensPerImage = builderConfig["min_image_tokens"].get<int64_t>();
+    mConfig.maxImageTokens = builderConfig["max_image_tokens"].get<int64_t>();
+    mConfig.maxImageTokensPerImage = builderConfig["max_image_tokens_per_image"].get<int64_t>();
+    mUseTrtNativeVitAttn = builderConfig.value("use_trt_native_vit_attn", false);
+    if (mConfig.minImageTokensPerImage <= 0 || mConfig.maxImageTokens <= 0 || mConfig.maxImageTokensPerImage <= 0)
+    {
+        LOG_ERROR("Gemma4 visual builder_config image-token limits must be positive");
+        return false;
+    }
+    mConfig.maxNumImages = std::max<int64_t>(1, mConfig.maxImageTokens / mConfig.minImageTokensPerImage);
+
+    Json preprocessorConfig;
+    std::string preprocessorConfigPath = engineDir + "/preprocessor_config.json";
+    std::ifstream preprocessorConfigFileStream(preprocessorConfigPath);
+    if (!preprocessorConfigFileStream.is_open())
+    {
+        LOG_ERROR("Failed to open preprocessor config file: %s", preprocessorConfigPath.c_str());
+        return false;
+    }
+    try
+    {
+        preprocessorConfig = Json::parse(preprocessorConfigFileStream);
+        preprocessorConfigFileStream.close();
+    }
+    catch (Json::parse_error const& e)
+    {
+        LOG_ERROR("Failed to parse preprocessor config file with error: %s", e.what());
+        return false;
+    }
+
+    auto const& imageProcessorConfig
+        = (preprocessorConfig.contains("image_processor") && preprocessorConfig["image_processor"].is_object())
+        ? preprocessorConfig["image_processor"]
+        : preprocessorConfig;
+    mConfig.patchSize = imageProcessorConfig.value("patch_size", mConfig.patchSize);
+    mConfig.poolingKernelSize = imageProcessorConfig.value("pooling_kernel_size", mConfig.poolingKernelSize);
+    mConfig.imageMean = imageProcessorConfig.value("image_mean", std::vector<float>{0.0F, 0.0F, 0.0F});
+    mConfig.imageStd = imageProcessorConfig.value("image_std", std::vector<float>{1.0F, 1.0F, 1.0F});
+    mConfig.maxPatchesPerImage = mConfig.maxImageTokensPerImage * mConfig.poolingKernelSize * mConfig.poolingKernelSize;
+
+    nvinfer1::Dims const inputShapeMax
+        = mVisualEngine->getProfileShape(binding_names::kVisualInput, 0, nvinfer1::OptProfileSelector::kMAX);
+    nvinfer1::Dims const inputShapeMin
+        = mVisualEngine->getProfileShape(binding_names::kVisualInput, 0, nvinfer1::OptProfileSelector::kMIN);
+    mConfig.maxPatches = inputShapeMax.d[0];
+    mConfig.minPatches = inputShapeMin.d[0];
+    mConfig.inputDim = mVisualContext->getTensorShape(binding_names::kVisualInput).d[1];
+    mConfig.rotaryPosEmbDim = mVisualContext->getTensorShape(binding_names::kRotaryPosEmb).d[1];
+    mConfig.outHiddenSize = mVisualEngine->getTensorShape(binding_names::kVisualOutput).d[1];
+    if (mConfig.rotaryPosEmbDim <= 0)
+    {
+        LOG_ERROR("Gemma4 visual engine is missing rotary_pos_emb head dimension");
+        return false;
+    }
+
+    return true;
+}
+
+bool Gemma4ViTRunner::allocateBuffer(cudaStream_t stream)
+{
+    bool setTensorAddressStatus{true};
+
+    mVitInput = rt::Tensor({mConfig.maxPatches, mConfig.inputDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF,
+        "Gemma4ViTRunner::mVitInput");
+    setTensorAddressStatus &= mVisualContext->setTensorAddress(binding_names::kVisualInput, mVitInput.rawPointer());
+
+    mPixelPositionIds = rt::Tensor({mConfig.maxPatches, 2}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64,
+        "Gemma4ViTRunner::mPixelPositionIds");
+    mPixelPositionIdsHost = rt::Tensor({mConfig.maxPatches, 2}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT64,
+        "Gemma4ViTRunner::mPixelPositionIdsHost");
+    setTensorAddressStatus
+        &= mVisualContext->setTensorAddress(binding_names::kPixelPositionIds, mPixelPositionIds.rawPointer());
+
+    mRotaryPosEmb = rt::Tensor({mConfig.maxPatches, mConfig.rotaryPosEmbDim}, rt::DeviceType::kGPU,
+        nvinfer1::DataType::kFLOAT, "Gemma4ViTRunner::mRotaryPosEmb");
+    setTensorAddressStatus
+        &= mVisualContext->setTensorAddress(binding_names::kRotaryPosEmb, mRotaryPosEmb.rawPointer());
+
+    mPoolingWeights = rt::Tensor({mConfig.maxImageTokens, mConfig.maxPatches}, rt::DeviceType::kGPU,
+        nvinfer1::DataType::kHALF, "Gemma4ViTRunner::mPoolingWeights");
+    setTensorAddressStatus
+        &= mVisualContext->setTensorAddress(binding_names::kPoolingWeights, mPoolingWeights.rawPointer());
+
+    mCuSeqlens = rt::Tensor(
+        {mConfig.maxNumImages + 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "Gemma4ViTRunner::mCuSeqlens");
+    mCuSeqlensHost = rt::Tensor({mConfig.maxNumImages + 1}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32,
+        "Gemma4ViTRunner::mCuSeqlensHost");
+    setTensorAddressStatus &= mVisualContext->setTensorAddress(binding_names::kCuSeqlens, mCuSeqlens.rawPointer());
+
+    if (mUseTrtNativeVitAttn)
+    {
+        bool const hasKvLengths
+            = mVisualEngine->getTensorIOMode(binding_names::kKvLengths) != nvinfer1::TensorIOMode::kNONE;
+        if (!hasKvLengths)
+        {
+            LOG_ERROR("Config has use_trt_native_vit_attn=true but engine is missing kv_lengths binding");
+            return false;
+        }
+        mKvLengths = rt::Tensor({mConfig.maxNumImages + 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32,
+            "Gemma4ViTRunner::mKvLengths");
+        setTensorAddressStatus &= mVisualContext->setTensorAddress(binding_names::kKvLengths, mKvLengths.rawPointer());
+    }
+
+    mHasMaxSeqLenCarrier
+        = mVisualEngine->getTensorIOMode(binding_names::kMaxSeqLenCarrier) != nvinfer1::TensorIOMode::kNONE;
+    if (mHasMaxSeqLenCarrier)
+    {
+        mMaxSeqLenCarrier = rt::Tensor({mConfig.maxPatchesPerImage}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32,
+            "Gemma4ViTRunner::mMaxSeqLenCarrier");
+        setTensorAddressStatus
+            &= mVisualContext->setTensorAddress(binding_names::kMaxSeqLenCarrier, mMaxSeqLenCarrier.rawPointer());
+    }
+
+    mOutputEmbedding = rt::Tensor({mConfig.maxImageTokens, mConfig.outHiddenSize}, rt::DeviceType::kGPU,
+        nvinfer1::DataType::kHALF, "Gemma4ViTRunner::mOutputEmbedding");
+    setTensorAddressStatus
+        &= mVisualContext->setTensorAddress(binding_names::kVisualOutput, mOutputEmbedding.rawPointer());
+
+    if (!setTensorAddressStatus)
+    {
+        LOG_ERROR("Failed to set tensor address to the engine");
+        return false;
+    }
+
+    auto nbBytes = mConfig.imageMean.size() * sizeof(float);
+    auto channels = math::cast<int64_t>(mConfig.imageMean.size());
+    mImageMean
+        = rt::Tensor({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "Gemma4ViTRunner::mImageMean");
+    mImageStd = rt::Tensor({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "Gemma4ViTRunner::mImageStd");
+    CUDA_CHECK(
+        cudaMemcpyAsync(mImageMean.rawPointer(), mConfig.imageMean.data(), nbBytes, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(mImageStd.rawPointer(), mConfig.imageStd.data(), nbBytes, cudaMemcpyHostToDevice, stream));
+
+    int64_t const maxImagePixels = mConfig.maxPatchesPerImage * mConfig.patchSize * mConfig.patchSize * channels;
+    rt::Tensor resizeBuffer({1, maxImagePixels, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8,
+        "Gemma4ViTRunner::resizeBuffer");
+    mResizedImageHost = rt::imageUtils::ImageData(std::move(resizeBuffer));
+    mImageDevice = rt::Tensor(
+        {maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "Gemma4ViTRunner::mImageDevice");
+    mNormalizedImageDevice = rt::Tensor(
+        {maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "Gemma4ViTRunner::mNormalizedImageDevice");
+
+    return true;
+}
+
+std::tuple<int64_t, int64_t> Gemma4ViTRunner::getResizedImageSize(int64_t height, int64_t width) const
+{
+    ELLM_CHECK(height > 0 && width > 0, "Gemma4 image height/width must be positive");
+    int64_t const maxPatches = mConfig.maxImageTokensPerImage * mConfig.poolingKernelSize * mConfig.poolingKernelSize;
+    double const totalPx = static_cast<double>(height) * static_cast<double>(width);
+    double const targetPx = static_cast<double>(maxPatches) * mConfig.patchSize * mConfig.patchSize;
+    double const factor = std::sqrt(targetPx / totalPx);
+    double const idealHeight = factor * static_cast<double>(height);
+    double const idealWidth = factor * static_cast<double>(width);
+    int64_t const sideMult = mConfig.poolingKernelSize * mConfig.patchSize;
+    auto floorBySideMult = [sideMult](double value) {
+        return static_cast<int64_t>(std::floor(value / static_cast<double>(sideMult))) * sideMult;
+    };
+    auto roundBySideMult = [sideMult](double value) {
+        return static_cast<int64_t>(std::round(value / static_cast<double>(sideMult))) * sideMult;
+    };
+
+    int64_t targetHeight = floorBySideMult(idealHeight);
+    int64_t targetWidth = floorBySideMult(idealWidth);
+    ELLM_CHECK(targetHeight != 0 || targetWidth != 0, "Gemma4 target image size rounded to 0x0");
+
+    int64_t const maxSideLength = (maxPatches / (mConfig.poolingKernelSize * mConfig.poolingKernelSize)) * sideMult;
+    if (targetHeight == 0)
+    {
+        targetHeight = sideMult;
+        int64_t const maxWidth = std::min(maxSideLength, floorBySideMult(targetPx / targetHeight));
+        targetWidth = std::clamp(roundBySideMult(idealWidth), sideMult, maxWidth);
+    }
+    else if (targetWidth == 0)
+    {
+        targetWidth = sideMult;
+        int64_t const maxHeight = std::min(maxSideLength, floorBySideMult(targetPx / targetWidth));
+        targetHeight = std::clamp(roundBySideMult(idealHeight), sideMult, maxHeight);
+    }
+
+    ELLM_CHECK(
+        static_cast<double>(targetHeight) * targetWidth <= targetPx, "Gemma4 target image size exceeds patch budget");
+    return {targetHeight, targetWidth};
+}
+
+void Gemma4ViTRunner::formatPatch(rt::imageUtils::ImageData const& image, std::vector<ImageGrid>& imageGrids,
+    std::vector<int64_t>& imageTokenLengths, int32_t* cuSeqlensData, int64_t& cuSeqlensSize, int64_t& maxSeqLen,
+    cudaStream_t stream)
+{
+    int64_t const height = image.height;
+    int64_t const width = image.width;
+    int64_t const channels = image.channels;
+    unsigned char* imageData = image.data();
+    int64_t const sideMult = mConfig.patchSize * mConfig.poolingKernelSize;
+
+    ELLM_CHECK(channels == static_cast<int64_t>(mConfig.imageMean.size()),
+        "Gemma4 image channels mismatch, got " + std::to_string(channels));
+    ELLM_CHECK(height % sideMult == 0 && width % sideMult == 0,
+        "Gemma4 image height/width must be divisible by patch_size * pooling_kernel_size");
+
+    int64_t const patchHeight = height / mConfig.patchSize;
+    int64_t const patchWidth = width / mConfig.patchSize;
+    int64_t const curSeqLength = patchHeight * patchWidth;
+    int64_t const curSoftLength = curSeqLength / (mConfig.poolingKernelSize * mConfig.poolingKernelSize);
+    int64_t const prevCuSeqlen = cuSeqlensData[cuSeqlensSize - 1];
+    ELLM_CHECK(prevCuSeqlen + curSeqLength <= mConfig.maxPatches && cuSeqlensSize < (mConfig.maxNumImages + 1),
+        "Gemma4 visual input exceeds VIT engine profile");
+    imageTokenLengths.emplace_back(curSoftLength);
+    imageGrids.push_back(ImageGrid{patchHeight, patchWidth});
+    maxSeqLen = std::max(maxSeqLen, curSeqLength);
+
+    check::check(mImageDevice.reshape({1, height, width, channels}), "Tensor reshape failed");
+    check::check(mNormalizedImageDevice.reshape({1, height, width, channels}), "Tensor reshape failed");
+    CUDA_CHECK(cudaMemcpyAsync(
+        mImageDevice.rawPointer(), imageData, height * width * channels, cudaMemcpyHostToDevice, stream));
+
+    kernel::normalizeImage(mImageDevice, mImageMean, mImageStd, mNormalizedImageDevice, stream);
+    kernel::transposeToPatchQwenViT(
+        mNormalizedImageDevice, mVitInput, prevCuSeqlen * mConfig.inputDim, 1, mConfig.patchSize, 1, stream);
+
+    int64_t* positionIds = mPixelPositionIdsHost.dataPointer<int64_t>();
+    for (int64_t y = 0; y < patchHeight; ++y)
+    {
+        for (int64_t x = 0; x < patchWidth; ++x)
+        {
+            int64_t const idx = prevCuSeqlen + y * patchWidth + x;
+            positionIds[2 * idx] = x;
+            positionIds[2 * idx + 1] = y;
+        }
+    }
+
+    cuSeqlensData[cuSeqlensSize++] = static_cast<int32_t>(prevCuSeqlen + curSeqLength);
+}
+
+void Gemma4ViTRunner::generatePoolingWeights(
+    std::vector<ImageGrid> const& imageGrids, int64_t totalPatches, int64_t totalSoftTokens, cudaStream_t stream)
+{
+    size_t const numPoolingWeightBytes = static_cast<size_t>(totalSoftTokens) * totalPatches * sizeof(half);
+    CUDA_CHECK(cudaMemsetAsync(mPoolingWeights.rawPointer(), 0, numPoolingWeightBytes, stream));
+
+    int64_t patchStart = 0;
+    int64_t softStart = 0;
+    int64_t const k = mConfig.poolingKernelSize;
+    for (auto const& grid : imageGrids)
+    {
+        kernel::initPoolingWeightsGemma4ViT(
+            mPoolingWeights, patchStart, softStart, grid.patchHeight, grid.patchWidth, k, stream);
+        patchStart += grid.patchHeight * grid.patchWidth;
+        softStart += (grid.patchHeight / k) * (grid.patchWidth / k);
+    }
+}
+
+void Gemma4ViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<ImageGrid>& imageGrids,
+    std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream)
+{
+    int32_t* cuSeqlensData = mCuSeqlensHost.dataPointer<int32_t>();
+    cuSeqlensData[0] = 0;
+    int64_t cuSeqlensSize = 1;
+    int64_t maxSeqLen = 0;
+
+    for (auto const& req : request.requests)
+    {
+        int64_t numImage = 0;
+        for (auto const& image : req.imageBuffers)
+        {
+            if (doResize)
+            {
+                auto [resizedHeight, resizedWidth] = getResizedImageSize(image.height, image.width);
+                rt::imageUtils::resizeImage(
+                    image, mResizedImageHost, resizedWidth, resizedHeight, rt::imageUtils::InterpolationMode::kBICUBIC);
+                formatPatch(
+                    mResizedImageHost, imageGrids, imageTokenLengths, cuSeqlensData, cuSeqlensSize, maxSeqLen, stream);
+            }
+            else
+            {
+                formatPatch(image, imageGrids, imageTokenLengths, cuSeqlensData, cuSeqlensSize, maxSeqLen, stream);
+            }
+            ++numImage;
+        }
+        numImages.emplace_back(numImage);
+    }
+
+    int64_t const totalPatches = cuSeqlensData[cuSeqlensSize - 1];
+    if (totalPatches == 0)
+    {
+        check::check(mVitInput.reshape({totalPatches, mConfig.inputDim}), "Tensor reshape failed");
+        return;
+    }
+
+    int64_t const totalSoftTokens = std::accumulate(imageTokenLengths.begin(), imageTokenLengths.end(), int64_t(0));
+    ELLM_CHECK(totalPatches >= mConfig.minPatches && totalPatches <= mConfig.maxPatches,
+        "Gemma4 total patch count exceeds VIT engine profile");
+    ELLM_CHECK(totalSoftTokens <= mConfig.maxImageTokens, "Gemma4 total soft token count exceeds VIT engine profile");
+
+    check::check(mVitInput.reshape({totalPatches, mConfig.inputDim}), "Tensor reshape failed");
+    check::check(mPixelPositionIds.reshape({totalPatches, 2}), "Tensor reshape failed");
+    check::check(mPixelPositionIdsHost.reshape({totalPatches, 2}), "Tensor reshape failed");
+    check::check(mRotaryPosEmb.reshape({totalPatches, mConfig.rotaryPosEmbDim}), "Tensor reshape failed");
+    check::check(mCuSeqlens.reshape({cuSeqlensSize}), "Tensor reshape failed");
+    check::check(mOutputEmbedding.reshape({totalSoftTokens, mConfig.outHiddenSize}), "Tensor reshape failed");
+    check::check(mPoolingWeights.reshape({totalSoftTokens, totalPatches}), "Tensor reshape failed");
+    if (mHasMaxSeqLenCarrier)
+    {
+        check::check(mMaxSeqLenCarrier.reshape({maxSeqLen}), "Tensor reshape failed");
+    }
+    if (mUseTrtNativeVitAttn)
+    {
+        check::check(mKvLengths.reshape({cuSeqlensSize}), "Tensor reshape failed");
+    }
+
+    generatePoolingWeights(imageGrids, totalPatches, totalSoftTokens, stream);
+    CUDA_CHECK(cudaMemcpyAsync(mPixelPositionIds.rawPointer(), mPixelPositionIdsHost.rawPointer(),
+        totalPatches * 2 * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
+    kernel::initRotaryPosEmbGemma4ViT(mRotaryPosEmb, mPixelPositionIds, mConfig.ropeTheta, stream);
+    CUDA_CHECK(cudaMemcpyAsync(mCuSeqlens.rawPointer(), mCuSeqlensHost.rawPointer(), cuSeqlensSize * sizeof(int32_t),
+        cudaMemcpyHostToDevice, stream));
+    if (mUseTrtNativeVitAttn)
+    {
+        CUDA_CHECK(cudaMemcpyAsync(mKvLengths.rawPointer(), mCuSeqlensHost.rawPointer(),
+            cuSeqlensSize * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    }
+
+    int64_t imageCount = std::accumulate(numImages.begin(), numImages.end(), int64_t(0));
+    mMultimodalMetrics.recordRun(imageCount, totalSoftTokens);
+}
+
+void Gemma4ViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
+    std::vector<std::vector<int32_t>>& batchInputIds, std::vector<int64_t> const& numImages,
+    std::vector<int64_t> const& imageTokenLengths, trt_edgellm::tokenizer::Tokenizer const* tokenizer)
+{
+    if (numImages.size() != request.requests.size())
+    {
+        std::string errorMsg = "Gemma4ViTRunner::textPreprocess() numImages.size() != request.requests.size(), "
+            + std::to_string(numImages.size()) + " != " + std::to_string(request.requests.size());
+        LOG_ERROR("%s", errorMsg.c_str());
+        throw std::runtime_error(errorMsg);
+    }
+
+    int64_t imageIndex = 0;
+    for (size_t i = 0; i < request.requests.size(); ++i)
+    {
+        std::vector<int32_t> ids;
+        if (i < batchInputIds.size() && !batchInputIds[i].empty())
+        {
+            ids = batchInputIds[i];
+        }
+        else
+        {
+            ids = tokenizer->encode(request.formattedRequests[i].formattedCompleteRequest);
+            check::check(!ids.empty(), "Gemma4ViTRunner::textPreprocess() Failed to encode text");
+        }
+
+        std::vector<int32_t> newIds;
+        for (auto tokenId : ids)
+        {
+            if (tokenId == mConfig.imageTokenId)
+            {
+                int64_t const numImageTokens = imageTokenLengths.at(imageIndex);
+                for (int64_t k = 0; k < numImageTokens; ++k)
+                {
+                    newIds.push_back(tokenId);
+                }
+                ++imageIndex;
+            }
+            else
+            {
+                newIds.push_back(tokenId);
+            }
+        }
+
+        if (i < batchInputIds.size())
+        {
+            batchInputIds[i] = std::move(newIds);
+        }
+        else
+        {
+            batchInputIds.emplace_back(std::move(newIds));
+        }
+    }
+    check::check(imageIndex == static_cast<int64_t>(imageTokenLengths.size()),
+        "Gemma4ViTRunner::textPreprocess() placeholder count does not match image count");
+}
+
+bool Gemma4ViTRunner::preprocess(rt::LLMGenerationRequest const& request,
+    std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
+    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly) noexcept
+{
+    std::vector<ImageGrid> imageGrids;
+    std::vector<int64_t> imageTokenLengths;
+    std::vector<int64_t> numImages;
+
+    try
+    {
+        imagePreprocess(request, imageGrids, imageTokenLengths, numImages, !imageOnly, stream);
+        if (!imageOnly)
+        {
+            textPreprocess(request, batchedInputIds, numImages, imageTokenLengths, tokenizer);
+        }
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("Failed: %s", e.what());
+        return false;
+    }
+
+    return true;
+}
+
+bool Gemma4ViTRunner::infer(cudaStream_t stream) noexcept
+{
+    if (mVitInput.getShape()[0] == 0)
+    {
+        return true;
+    }
+
+    {
+        TIME_STAGE(metrics::StageNames::kVISION_ENCODER, stream);
+
+        bool setEngineIOStatus{true};
+        setEngineIOStatus
+            &= mVisualContext->setInputShape(binding_names::kVisualInput, mVitInput.getShape().getTRTDims());
+        setEngineIOStatus &= mVisualContext->setInputShape(
+            binding_names::kPixelPositionIds, mPixelPositionIds.getShape().getTRTDims());
+        setEngineIOStatus
+            &= mVisualContext->setInputShape(binding_names::kRotaryPosEmb, mRotaryPosEmb.getShape().getTRTDims());
+        setEngineIOStatus
+            &= mVisualContext->setInputShape(binding_names::kCuSeqlens, mCuSeqlens.getShape().getTRTDims());
+        setEngineIOStatus
+            &= mVisualContext->setInputShape(binding_names::kPoolingWeights, mPoolingWeights.getShape().getTRTDims());
+        if (mUseTrtNativeVitAttn)
+        {
+            setEngineIOStatus
+                &= mVisualContext->setInputShape(binding_names::kKvLengths, mKvLengths.getShape().getTRTDims());
+        }
+        if (mHasMaxSeqLenCarrier)
+        {
+            setEngineIOStatus &= mVisualContext->setInputShape(
+                binding_names::kMaxSeqLenCarrier, mMaxSeqLenCarrier.getShape().getTRTDims());
+        }
+
+        if (!setEngineIOStatus)
+        {
+            LOG_ERROR("Failed to bind Gemma4 visual engine input tensors.");
+            return false;
+        }
+
+        bool enqueueStatus = mVisualContext->enqueueV3(stream);
+        if (!enqueueStatus)
+        {
+            LOG_ERROR("Failed to enqueue Gemma4 visual engine.");
+            return false;
+        }
+    }
+
+    return true;
+}
+
+} // namespace rt
+} // namespace trt_edgellm

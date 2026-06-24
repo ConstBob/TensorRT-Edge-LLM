@@ -19,6 +19,7 @@
 #include "common/checkMacros.h"
 #include "common/mmapReader.h"
 #include "multimodal/audioRunner.h"
+#include "multimodal/gemma4ViTRunner.h"
 #include "multimodal/internViTRunner.h"
 #include "multimodal/nemotronOmniAudioRunner.h"
 #include "multimodal/nemotronOmniViTRunner.h"
@@ -141,6 +142,10 @@ std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& mu
     else if (modelType == multimodal::ModelType::PHI4MM)
     {
         multimodalRunner = std::make_unique<Phi4MMViTRunner>(multimodalEngineDir, stream);
+    }
+    else if (modelType == multimodal::ModelType::GEMMA4_VISION)
+    {
+        multimodalRunner = std::make_unique<Gemma4ViTRunner>(multimodalEngineDir, stream);
     }
     else if (modelType == multimodal::ModelType::NEMOTRON_OMNI_VISION_ENCODER)
     {

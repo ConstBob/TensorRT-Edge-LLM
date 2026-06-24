@@ -26,6 +26,7 @@ Visual encoders — I/O spec via ``model.get_onnx_export_args(config, device)``:
     - InternVL3        (model_type ``internvl_chat``)
     - InternVL3 HF     (model_type ``internvl``)
     - Phi-4 Multimodal (model_type ``phi4mm``, ``phi4_multimodal``)
+    - Gemma4            (model_type ``gemma4``)
     - Nemotron-Omni    (model_type ``NemotronH_Nano_VL_V2`` or
       ``NemotronH_Nano_Omni_Reasoning_V3``)
 
@@ -90,6 +91,7 @@ _VISUAL_REGISTRY: dict[str, str] = {
     "internvl": "internvl3_5",
     "phi4mm": "phi4mm",
     "phi4_multimodal": "phi4mm",
+    "gemma4": "gemma4",
     "NemotronH_Nano_VL_V2": "nemotron_omni",
     "NemotronH_Nano_Omni_Reasoning_V3": "nemotron_omni",
 }
@@ -110,6 +112,8 @@ _VISUAL_FAMILY_MODULE: dict[str, str] = {
     "tensorrt_edgellm.models.internvl3_5.modeling_internvl3_5_visual",
     "phi4mm":
     "tensorrt_edgellm.models.phi4mm.modeling_phi4mm_visual",
+    "gemma4":
+    "tensorrt_edgellm.models.gemma4.modeling_gemma4_visual",
     "nemotron_omni":
     "tensorrt_edgellm.models.nemotron_omni.modeling_nemotron_omni_visual",
 }
@@ -123,6 +127,7 @@ _VISUAL_FAMILY_BUILD_FN: dict[str, str] = {
     "internvl3": "build_internvl_visual",
     "internvl3_5": "build_internvl3_5_visual",
     "phi4mm": "build_phi4mm_visual",
+    "gemma4": "build_gemma4_visual",
     "nemotron_omni": "build_nemotron_omni_visual",
 }
 
@@ -165,9 +170,10 @@ def _get_visual_config(model_type: str, config: dict) -> dict:
         return (config.get("vision_config")
                 or config.get("thinker_config", {}).get("vision_config")
                 or config)
-    if (model_type in ("internvl", "internvl_chat")
+    if (model_type in ("internvl", "internvl_chat", "gemma4")
             or model_type in _NEMOTRON_OMNI_MODEL_TYPES):
-        # InternVL / Nemotron-Omni need the full config (vision + text + downsample_ratio)
+        # InternVL / Gemma4 / Nemotron-Omni need the full config
+        # (vision + text + projection/runtime fields).
         return config
     if model_type in ("phi4mm", "phi4_multimodal"):
         # Phi-4mm visual config is hardcoded (not in config.json).

@@ -235,6 +235,8 @@ bool VisualBuilder::setupVisualOptimizationProfile(
         result = setupNemotronOmniViTProfile(*visualProfile);
         break;
 
+    case multimodal::ModelType::GEMMA4_VISION: result = setupGemma4ViTProfile(*visualProfile, network); break;
+
     default: LOG_ERROR("Unsupported model type for visual encoder: %d", static_cast<int>(mModelType)); return false;
     }
 
@@ -402,6 +404,94 @@ bool VisualBuilder::setupNemotronOmniViTProfile(nvinfer1::IOptimizationProfile& 
     if (!result)
     {
         LOG_ERROR("Failed to setup Nemotron-Omni ViT optimization profile");
+    }
+    return result;
+}
+
+bool VisualBuilder::setupGemma4ViTProfile(
+    nvinfer1::IOptimizationProfile& profile, nvinfer1::INetworkDefinition const& network)
+{
+    bool result = true;
+
+    auto const& visionConfig = mModelConfig[kVisionConfigKey];
+    int64_t const poolingKernelSize = visionConfig.value("pooling_kernel_size", 3);
+    int64_t const patchesPerSoftToken = poolingKernelSize * poolingKernelSize;
+    int64_t const minSoftTokens = mBuilderConfig.minImageTokens;
+    int64_t const maxSoftTokens = mBuilderConfig.maxImageTokens;
+    int64_t const optSoftTokens = std::max<int64_t>(minSoftTokens, (minSoftTokens + maxSoftTokens) / 2);
+    int64_t const minPatches = minSoftTokens * patchesPerSoftToken;
+    int64_t const optPatches = optSoftTokens * patchesPerSoftToken;
+    int64_t const maxPatches = maxSoftTokens * patchesPerSoftToken;
+
+    int64_t inputDim = 0;
+    int64_t ropeEmbedSize = 0;
+    bool hasMaxSeqLenCarrier = false;
+    bool hasKvLengths = false;
+    for (int32_t i = 0; i < network.getNbInputs(); ++i)
+    {
+        auto* input = network.getInput(i);
+        if (strcmp(input->getName(), binding_names::kVisualInput) == 0)
+        {
+            inputDim = input->getDimensions().d[1];
+        }
+        else if (strcmp(input->getName(), binding_names::kRotaryPosEmb) == 0)
+        {
+            ropeEmbedSize = input->getDimensions().d[1];
+        }
+        else if (strcmp(input->getName(), binding_names::kMaxSeqLenCarrier) == 0)
+        {
+            hasMaxSeqLenCarrier = true;
+        }
+        else if (strcmp(input->getName(), binding_names::kKvLengths) == 0)
+        {
+            hasKvLengths = true;
+        }
+    }
+    if (inputDim == 0)
+    {
+        LOG_ERROR("Cannot infer inputDim. Do you have proper ONNX input: %s?", binding_names::kVisualInput);
+        return false;
+    }
+    if (ropeEmbedSize == 0)
+    {
+        LOG_ERROR("Cannot infer ropeEmbedSize. Do you have proper ONNX input: %s?", binding_names::kRotaryPosEmb);
+        return false;
+    }
+
+    result &= setOptimizationProfile(&profile, binding_names::kVisualInput, createDims({minPatches, inputDim}),
+        createDims({optPatches, inputDim}), createDims({maxPatches, inputDim}));
+    result &= setOptimizationProfile(&profile, binding_names::kPixelPositionIds, createDims({minPatches, 2}),
+        createDims({optPatches, 2}), createDims({maxPatches, 2}));
+    result &= setOptimizationProfile(&profile, binding_names::kRotaryPosEmb, createDims({minPatches, ropeEmbedSize}),
+        createDims({optPatches, ropeEmbedSize}), createDims({maxPatches, ropeEmbedSize}));
+    result &= setOptimizationProfile(&profile, binding_names::kPoolingWeights, createDims({minSoftTokens, minPatches}),
+        createDims({optSoftTokens, optPatches}), createDims({maxSoftTokens, maxPatches}));
+
+    int64_t const maxNumImages = std::max<int64_t>(1, maxSoftTokens / mBuilderConfig.minImageTokens);
+    result &= setOptimizationProfile(&profile, binding_names::kCuSeqlens, createDims({2}),
+        createDims({maxNumImages + 1}), createDims({maxNumImages + 1}));
+
+    mBuilderConfig.useTrtNativeVitAttn = mModelConfig.value("use_trt_native_vit_attn", false);
+    if (mBuilderConfig.useTrtNativeVitAttn)
+    {
+        if (!hasKvLengths)
+        {
+            LOG_ERROR("Gemma4 config requests TRT-native ViT attention but ONNX is missing kv_lengths");
+            return false;
+        }
+        result &= setOptimizationProfile(&profile, binding_names::kKvLengths, createDims({2}),
+            createDims({maxNumImages + 1}), createDims({maxNumImages + 1}));
+    }
+    if (hasMaxSeqLenCarrier)
+    {
+        int64_t const maxSeqLen = mBuilderConfig.maxImageTokensPerImage * patchesPerSoftToken;
+        result &= setOptimizationProfile(&profile, binding_names::kMaxSeqLenCarrier, createDims({1}),
+            createDims({std::max<int64_t>(1, maxSeqLen / 2)}), createDims({maxSeqLen}));
+    }
+
+    if (!result)
+    {
+        LOG_ERROR("Failed to setup Gemma4 ViT optimization profile");
     }
     return result;
 }

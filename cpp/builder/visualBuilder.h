@@ -157,6 +157,13 @@ private:
     //! @return true if setup was successful, false otherwise
     bool setupNemotronOmniViTProfile(nvinfer1::IOptimizationProfile& profile);
 
+    //! Set up optimization profile for Gemma4 ViT model.
+    //! Configures ragged patch, position-id, and position-aware pooling inputs.
+    //! @param profile Optimization profile to configure
+    //! @param network TensorRT network definition for input analysis
+    //! @return true if setup was successful, false otherwise
+    bool setupGemma4ViTProfile(nvinfer1::IOptimizationProfile& profile, nvinfer1::INetworkDefinition const& network);
+
     //! Copy and save the model configuration with builder config.
     //! Creates a config.json file in the engine directory with both original model config
     //! and builder configuration parameters.
