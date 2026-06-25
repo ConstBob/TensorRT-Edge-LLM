@@ -128,6 +128,109 @@ __forceinline__ size_t alignSharedMem(size_t size)
     return ((size + 15) / 16) * 16; // Align to 16 bytes
 }
 
+static constexpr int32_t kSequentialArgmaxBlockSize = 256;
+
+__global__ void sequentialAcceptArgmaxKernel(
+    float const* __restrict__ logits, int32_t* __restrict__ argmaxResults, int32_t totalPositions, int32_t vocabSize)
+{
+    int32_t const posIdx = blockIdx.x;
+    if (posIdx >= totalPositions)
+    {
+        return;
+    }
+
+    float const* posLogits = logits + static_cast<int64_t>(posIdx) * vocabSize;
+
+    float localMax = -FLT_MAX;
+    int32_t localIdx = 0;
+
+    for (int32_t vocabIdx = threadIdx.x; vocabIdx < vocabSize; vocabIdx += blockDim.x)
+    {
+        float const value = posLogits[vocabIdx];
+        if (value > localMax || (value == localMax && vocabIdx < localIdx))
+        {
+            localMax = value;
+            localIdx = vocabIdx;
+        }
+    }
+
+    for (int32_t offset = 16; offset > 0; offset >>= 1)
+    {
+        float const otherMax = __shfl_down_sync(0xFFFFFFFF, localMax, offset);
+        int32_t const otherIdx = __shfl_down_sync(0xFFFFFFFF, localIdx, offset);
+        if (otherMax > localMax || (otherMax == localMax && otherIdx < localIdx))
+        {
+            localMax = otherMax;
+            localIdx = otherIdx;
+        }
+    }
+
+    __shared__ float sharedMaxValues[32];
+    __shared__ int32_t sharedMaxIndices[32];
+
+    int32_t const warpId = threadIdx.x / 32;
+    int32_t const laneId = threadIdx.x % 32;
+    int32_t const numWarps = (blockDim.x + 31) / 32;
+
+    if (laneId == 0)
+    {
+        sharedMaxValues[warpId] = localMax;
+        sharedMaxIndices[warpId] = localIdx;
+    }
+    __syncthreads();
+
+    if (warpId == 0)
+    {
+        float warpMax = (laneId < numWarps) ? sharedMaxValues[laneId] : -FLT_MAX;
+        int32_t warpIdx = (laneId < numWarps) ? sharedMaxIndices[laneId] : 0;
+
+        for (int32_t offset = 16; offset > 0; offset >>= 1)
+        {
+            float const otherMax = __shfl_down_sync(0xFFFFFFFF, warpMax, offset);
+            int32_t const otherIdx = __shfl_down_sync(0xFFFFFFFF, warpIdx, offset);
+            if (otherMax > warpMax || (otherMax == warpMax && otherIdx < warpIdx))
+            {
+                warpMax = otherMax;
+                warpIdx = otherIdx;
+            }
+        }
+
+        if (laneId == 0)
+        {
+            argmaxResults[posIdx] = warpIdx;
+        }
+    }
+}
+
+__global__ void sequentialAcceptWalkKernel(int32_t const* __restrict__ argmaxResults,
+    int32_t const* __restrict__ draftTokenIds, int32_t* __restrict__ acceptedTokenIds,
+    int32_t* __restrict__ acceptLength, int32_t verifyLen)
+{
+    int32_t const batchIdx = blockIdx.x;
+
+    int32_t const* batchArgmax = argmaxResults + batchIdx * verifyLen;
+    int32_t const* batchDraft = draftTokenIds + batchIdx * verifyLen;
+    int32_t* batchAccepted = acceptedTokenIds + batchIdx * verifyLen;
+
+    batchAccepted[0] = batchArgmax[0];
+    int32_t accepted = 1;
+
+    for (int32_t tokenIdx = 1; tokenIdx < verifyLen; ++tokenIdx)
+    {
+        if (batchArgmax[tokenIdx - 1] == batchDraft[tokenIdx])
+        {
+            batchAccepted[accepted] = batchArgmax[tokenIdx];
+            ++accepted;
+        }
+        else
+        {
+            break;
+        }
+    }
+
+    acceptLength[batchIdx] = accepted;
+}
+
 // Stage 1: Compute top-1 tokens for all positions using sampling strategy
 // Optionally map from reduced vocab to full vocab if mapping table is provided
 template <int32_t BLOCK_SIZE>
@@ -328,6 +431,23 @@ void launchEagleAcceptKernel(float const* logits, int32_t const* tokenIds, int8_
 }
 
 } // namespace
+
+void sequentialAccept(rt::Tensor const& logits, rt::Tensor const& draftTokenIds, rt::Tensor& acceptedTokenIds,
+    rt::Tensor& acceptLength, rt::Tensor& argmaxScratch, int32_t batchSize, int32_t verifyLen, int32_t vocabSize,
+    cudaStream_t stream)
+{
+    int32_t const totalPositions = batchSize * verifyLen;
+    int32_t* argmaxResults = static_cast<int32_t*>(argmaxScratch.rawPointer());
+
+    sequentialAcceptArgmaxKernel<<<totalPositions, kSequentialArgmaxBlockSize, 0, stream>>>(
+        static_cast<float const*>(logits.rawPointer()), argmaxResults, totalPositions, vocabSize);
+    CUDA_CHECK(cudaGetLastError());
+
+    sequentialAcceptWalkKernel<<<batchSize, 1, 0, stream>>>(argmaxResults,
+        static_cast<int32_t const*>(draftTokenIds.rawPointer()), static_cast<int32_t*>(acceptedTokenIds.rawPointer()),
+        static_cast<int32_t*>(acceptLength.rawPointer()), verifyLen);
+    CUDA_CHECK(cudaGetLastError());
+}
 
 void eagleAccept(rt::Tensor const& logits, rt::Tensor const& tokenIds, rt::Tensor const& attentionMask,
     rt::Tensor& acceptedTokenIds, rt::Tensor& acceptedLogitsIndices, rt::Tensor& acceptLength,

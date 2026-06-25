@@ -151,6 +151,20 @@ void validateGemma4MTPConfig(LLMEngineConfig const& base, LLMEngineConfig& draft
             "Gemma4 MTP kv_sharing_map is missing assistant layer " + std::to_string(assistantLayerIdx) + ".");
     }
 }
+
+int32_t resolveDFlashBlockSize(
+    LLMEngineConfig const& base, LLMEngineConfig const& draft, SpecDecodeDraftingConfig const& draftingConfig)
+{
+    if (draftingConfig.dflashBlockSize > 0)
+    {
+        return draftingConfig.dflashBlockSize;
+    }
+    if (draft.dflashBlockSize > 0)
+    {
+        return draft.dflashBlockSize;
+    }
+    return base.dflashBlockSize;
+}
 } // namespace
 
 int32_t DeploymentConfig::maxRuntimeBatchSize() const
@@ -238,9 +252,8 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
             "base and draft speculative decoding modes must match.");
 
         // Positivity: each drafting field must be >= 1. Rejecting zero/negative
-        // up front lets downstream arithmetic (the topK * step multiply below)
-        // proceed under a clean invariant and produces a clearer error than a
-        // far-away shape-mismatch at bind time.
+        // up front gives downstream shape arithmetic a clean invariant and
+        // produces a clearer error than a far-away bind-time mismatch.
         auto const requirePositiveField = [](int32_t value, char const* name) {
             ELLM_CHECK(
                 value > 0, std::string("drafting.") + name + "=" + std::to_string(value) + " must be positive (>= 1).");
@@ -248,6 +261,9 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
         requirePositiveField(draftingConfig->draftingTopK, "draftingTopK");
         requirePositiveField(draftingConfig->draftingStep, "draftingStep");
         requirePositiveField(draftingConfig->verifySize, "verifySize");
+        ELLM_CHECK(draftingConfig->dflashBlockSize >= 0,
+            "drafting.dflashBlockSize=" + std::to_string(draftingConfig->dflashBlockSize)
+                + " must be non-negative; use 0 to infer from DFlash engine config.");
 
         SpecDecodeConfig specConfig;
         // baseOutputHiddenDim comes from the draft config's `base_model_hidden_size`
@@ -260,60 +276,104 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
         specConfig.draftingTopK = draftingConfig->draftingTopK;
         specConfig.draftingStep = draftingConfig->draftingStep;
         specConfig.verifySize = draftingConfig->verifySize;
+        specConfig.dflashBlockSize = draftingConfig->dflashBlockSize;
 
-        // In practice both `draftingStep` and `draftingTopK` are <= ~64 (bounded
-        // downstream by `maxDraftProposalSize`, which is tens, not millions), so
-        // int32 multiplication is overflow-safe; keeping it in int32 avoids
-        // widening noise.
-        int32_t const requiredDraftInputSize = specConfig.draftingStep * specConfig.draftingTopK;
+        if (cfg.base.specDecodeType == SpecDecodeMode::kDFlash)
+        {
+            static constexpr int32_t kDFlashDDTreeMaxVerifySize = 128;
+            static constexpr int32_t kDFlashDDTreeMaxCandidateTopK = 8;
+            static constexpr int32_t kDFlashHybridMaxBlockSize = 16;
 
-        ELLM_CHECK(requiredDraftInputSize <= specConfig.maxDraftProposalSize,
-            "drafting.draftingStep=" + std::to_string(specConfig.draftingStep) + " * drafting.draftingTopK="
-                + std::to_string(specConfig.draftingTopK) + " = " + std::to_string(requiredDraftInputSize)
-                + " exceeds draft.maxDraftTreeSize=" + std::to_string(specConfig.maxDraftProposalSize)
-                + ". Drafting configuration exceeds engine proposal size capability.");
+            specConfig.dflashBlockSize = resolveDFlashBlockSize(cfg.base, *cfg.draft, *draftingConfig);
+            ELLM_CHECK(specConfig.dflashBlockSize > 0,
+                "DFlash requires resolved dflashBlockSize > 0. Set dflashBlockSize or export a draft "
+                "dflash_config.block_size.");
+
+            ELLM_CHECK(specConfig.draftingStep == 1,
+                "DFlash supports draftingStep=1 only because one DFlash draft forward emits the full block. Use "
+                "dflashBlockSize to control the DFlash draft horizon.");
+            ELLM_CHECK(specConfig.dflashBlockSize <= specConfig.maxDraftProposalSize,
+                "DFlash dflashBlockSize=" + std::to_string(specConfig.dflashBlockSize)
+                    + " exceeds draft.maxDraftTreeSize=" + std::to_string(specConfig.maxDraftProposalSize)
+                    + ". DFlash drafts one full block per iteration.");
+
+            bool const useBranchingTree = specConfig.draftingTopK > 1;
+            if (!useBranchingTree)
+            {
+                specConfig.verifySize = specConfig.dflashBlockSize;
+            }
+            else
+            {
+                ELLM_CHECK(specConfig.dflashBlockSize >= 2,
+                    "DFlash branching DDTree requires dflashBlockSize >= 2 because node 0 is the root and the "
+                    "remaining draft positions provide child candidates.");
+                ELLM_CHECK(specConfig.draftingTopK < specConfig.verifySize,
+                    "DFlash DDTree candidateTopK=" + std::to_string(specConfig.draftingTopK)
+                        + " must be less than verifySize=" + std::to_string(specConfig.verifySize)
+                        + " because the root consumes one verification node.");
+                ELLM_CHECK(specConfig.draftingTopK <= kDFlashDDTreeMaxCandidateTopK,
+                    "DFlash DDTree candidateTopK=" + std::to_string(specConfig.draftingTopK)
+                        + " exceeds the current DDTree candidateTopK limit of "
+                        + std::to_string(kDFlashDDTreeMaxCandidateTopK) + ".");
+                ELLM_CHECK(specConfig.draftingTopK <= cfg.draft->outputVocabSize,
+                    "DFlash draftingTopK=" + std::to_string(specConfig.draftingTopK)
+                        + " exceeds draft output vocabulary size=" + std::to_string(cfg.draft->outputVocabSize) + ".");
+                ELLM_CHECK(specConfig.verifySize <= kDFlashDDTreeMaxVerifySize,
+                    "DFlash DDTree verifySize=" + std::to_string(specConfig.verifySize)
+                        + " exceeds node budget limit of " + std::to_string(kDFlashDDTreeMaxVerifySize) + ".");
+            }
+            bool const hasLinearAttnLayers = (cfg.base.numLinearAttnLayers > 0);
+            if (hasLinearAttnLayers)
+            {
+                ELLM_CHECK(specConfig.dflashBlockSize <= kDFlashHybridMaxBlockSize,
+                    "DFlash dflashBlockSize=" + std::to_string(specConfig.dflashBlockSize)
+                        + " exceeds hybrid intermediate-state depth limit of "
+                        + std::to_string(kDFlashHybridMaxBlockSize) + ".");
+            }
+        }
+        else
+        {
+            // In practice both `draftingStep` and `draftingTopK` are <= ~64 (bounded
+            // downstream by `maxDraftProposalSize`, which is tens, not millions), so
+            // int32 multiplication is overflow-safe; keeping it in int32 avoids
+            // widening noise.
+            int32_t const requiredDraftInputSize = specConfig.draftingStep * specConfig.draftingTopK;
+
+            ELLM_CHECK(requiredDraftInputSize <= specConfig.maxDraftProposalSize,
+                "drafting.draftingStep=" + std::to_string(specConfig.draftingStep) + " * drafting.draftingTopK="
+                    + std::to_string(specConfig.draftingTopK) + " = " + std::to_string(requiredDraftInputSize)
+                    + " exceeds draft.maxDraftTreeSize=" + std::to_string(specConfig.maxDraftProposalSize)
+                    + ". Drafting configuration exceeds engine proposal size capability.");
+            ELLM_CHECK(
+                specConfig.dflashBlockSize == 0, "dflashBlockSize can only be set when spec_decode_type=dflash.");
+
+            if (cfg.base.specDecodeType == SpecDecodeMode::kMTP)
+            {
+                // MTP base verification currently reuses EAGLE utility kernels for accept, KV commit,
+                // and hidden-state compaction. Those kernels support maxDepth <= 9.
+                static constexpr int32_t kMTPMaxVerifySizeForCurrentEagleUtilityKernels = 9;
+                int32_t const expectedVerifySize = specConfig.draftingStep + 1;
+                ELLM_CHECK(specConfig.draftingTopK == 1,
+                    "MTP speculative decoding requires draftingTopK=1 because the MTP draft path is a linear chain.");
+                ELLM_CHECK(specConfig.verifySize == expectedVerifySize,
+                    "MTP speculative decoding requires verifySize=draftingStep+1. Got verifySize="
+                        + std::to_string(specConfig.verifySize)
+                        + ", draftingStep=" + std::to_string(specConfig.draftingStep)
+                        + ", expected verifySize=" + std::to_string(expectedVerifySize) + ".");
+                ELLM_CHECK(specConfig.verifySize <= kMTPMaxVerifySizeForCurrentEagleUtilityKernels,
+                    "MTP verifySize=" + std::to_string(specConfig.verifySize)
+                        + " exceeds the current MTP EAGLE utility kernel max depth of "
+                        + std::to_string(kMTPMaxVerifySizeForCurrentEagleUtilityKernels)
+                        + ". Extend eagleUtilKernels before using larger MTP verify sizes.");
+            }
+        }
+
         ELLM_CHECK(specConfig.verifySize <= specConfig.maxVerifySize,
             "drafting.verifySize=" + std::to_string(specConfig.verifySize)
                 + " exceeds base.maxVerifyTreeSize=" + std::to_string(specConfig.maxVerifySize)
                 + ". Verification size exceeds base engine maximum verification size.");
 
-        if (cfg.base.specDecodeType == SpecDecodeMode::kMTP)
-        {
-            // MTP base verification currently reuses EAGLE utility kernels for accept, KV commit,
-            // and hidden-state compaction. Those kernels support maxDepth <= 9.
-            static constexpr int32_t kMTPMaxVerifySizeForCurrentEagleUtilityKernels = 9;
-            int32_t const expectedVerifySize = specConfig.draftingStep + 1;
-            ELLM_CHECK(specConfig.draftingTopK == 1,
-                "MTP speculative decoding requires draftingTopK=1 because the MTP draft path is a linear chain.");
-            ELLM_CHECK(specConfig.verifySize == expectedVerifySize,
-                "MTP speculative decoding requires verifySize=draftingStep+1. Got verifySize="
-                    + std::to_string(specConfig.verifySize)
-                    + ", draftingStep=" + std::to_string(specConfig.draftingStep)
-                    + ", expected verifySize=" + std::to_string(expectedVerifySize) + ".");
-            ELLM_CHECK(specConfig.verifySize <= kMTPMaxVerifySizeForCurrentEagleUtilityKernels,
-                "MTP verifySize=" + std::to_string(specConfig.verifySize)
-                    + " exceeds the current MTP EAGLE utility kernel max depth of "
-                    + std::to_string(kMTPMaxVerifySizeForCurrentEagleUtilityKernels)
-                    + ". Extend eagleUtilKernels before using larger MTP verify sizes.");
-        }
-
-        if (cfg.base.specDecodeType == SpecDecodeMode::kDFlash)
-        {
-            static constexpr int32_t kDFlashMaxVerifySize = 16;
-            ELLM_CHECK(specConfig.draftingTopK == 1 && specConfig.draftingStep == 1,
-                "DFlash Phase 1 supports draftingTopK=1 and draftingStep=1 only.");
-            ELLM_CHECK(specConfig.verifySize <= specConfig.maxDraftProposalSize,
-                "DFlash verifySize=" + std::to_string(specConfig.verifySize)
-                    + " exceeds draft.maxDraftTreeSize=" + std::to_string(specConfig.maxDraftProposalSize)
-                    + ". DFlash drafts one full verify block per iteration.");
-            bool const hasLinearAttnLayers = (cfg.base.numLinearAttnLayers > 0);
-            std::string const verifyLimitReason
-                = hasLinearAttnLayers ? "Qwen3.5 GDN/causal-conv intermediate-state limit" : "DFlash limit";
-            ELLM_CHECK(specConfig.verifySize <= kDFlashMaxVerifySize,
-                "DFlash verifySize=" + std::to_string(specConfig.verifySize) + " exceeds " + verifyLimitReason + " of "
-                    + std::to_string(kDFlashMaxVerifySize) + ".");
-        }
-        else if (cfg.base.specDecodeType == SpecDecodeMode::kGemma4MTP)
+        if (cfg.base.specDecodeType == SpecDecodeMode::kGemma4MTP)
         {
             ELLM_CHECK(specConfig.draftingTopK == 1,
                 "Gemma4 MTP currently supports greedy chain drafting only; draftingTopK must be 1.");
