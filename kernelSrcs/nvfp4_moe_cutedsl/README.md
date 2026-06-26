@@ -64,9 +64,12 @@ picks `n128` unconditionally (see `selectMmaTilerN` in
 
 ## 3. Tensor Contract
 
-The AOT pack is specialized for the current Thor Qwen3 / Nemotron contract:
-`num_experts = 128` and `top_k = 8`. Hidden size and intermediate size remain
-runtime dimensions.
+The AOT pack specializes `top_k = 8` (compile-time). `num_experts` (E), hidden
+size, and intermediate size are runtime dimensions: the FC1/FC2 wrappers take E
+as a runtime `l` argument, so one cubin serves any expert count. The
+`--dummy-experts` value used during AOT export only sizes the trace buffers and
+is not baked into the cubin. The SM110 runner restricts E to the
+product-supported set `{128, 256}` (`CuteDslNvfp4MoeSm110Runner::canImplement`).
 
 - FC1 weights: `[E, N1, H / 2]` (N1 = `2 * I` for SwiGLU, `I` for ReLU²)
 - FC1 scales:  `[E, ceil(N1 / 128), ceil((H / 16) / 4), 32, 4, 4]`

@@ -98,11 +98,9 @@ constexpr int32_t kNvfp4SfVecSize{16};
 //! Keep shape inference compilable when the AOT runner is not linked.
 #ifdef CUTE_DSL_NVFP4_MOE_ENABLED
 constexpr int32_t kCuteDslLevelTileN{CuteDslNvfp4MoeSm110Runner::kLevelTileN};
-constexpr int32_t kCuteDslSm110NumExperts{CuteDslNvfp4MoeSm110Runner::kCompiledNumExperts};
 constexpr int32_t kCuteDslSm110TopK{CuteDslNvfp4MoeSm110Runner::kMaxTopK};
 #else
 constexpr int32_t kCuteDslLevelTileN{128};
-constexpr int32_t kCuteDslSm110NumExperts{0};
 constexpr int32_t kCuteDslSm110TopK{0};
 #endif
 
@@ -590,9 +588,9 @@ int32_t Nvfp4MoePlugin::configurePlugin(
             "act=%d, io=%d, backend=%d) is not supported by the split "
             "FC1/FC2 CuteDSL runner. Requires -DENABLE_CUTE_DSL=nvfp4_moe, "
             "sm in {100, 101, 110}, io_dtype=FP16, activation in {swiglu, relu2}, "
-            "H %% %d == 0, I %% 64 == 0, FC1_N %% %d == 0, E=%d, 0 < top_k <= %d.",
+            "H %% %d == 0, I %% 64 == 0, FC1_N %% %d == 0, E in {128, 256}, 0 < top_k <= %d.",
             mHiddenSize, mMoeInterSize, mNumExperts, mTopK, smVersion, mActivationType, mIoDtype, mBackend, 128,
-            kCuteDslLevelTileN, kCuteDslSm110NumExperts, kCuteDslSm110TopK);
+            kCuteDslLevelTileN, kCuteDslSm110TopK);
         return -1;
     }
 #else
