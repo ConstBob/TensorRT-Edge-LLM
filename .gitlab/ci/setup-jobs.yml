@@ -4,7 +4,7 @@
 
 # Pre-commit code quality checks
 pre_commit_checks:
-  stage: setup
+  stage: precheck
   variables:
     CUDA_VERSION: "12.9"
   tags:
