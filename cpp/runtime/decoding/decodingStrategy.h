@@ -104,10 +104,6 @@ public:
     virtual char const* name() const noexcept = 0;
     virtual bool isSpeculative() const noexcept = 0;
 
-    //! Check whether this strategy can handle the given request.
-    //! @return nullptr if supported; a human-readable reason string if not.
-    virtual char const* unsupportedReason(LLMGenerationRequest const&) const noexcept = 0;
-
     virtual bool decodeStep(DecodingInferenceContext& context) = 0;
     virtual bool captureCudaGraphs(cudaStream_t stream) = 0;
 
