@@ -6,8 +6,8 @@
 
 The decoder KV cache is the primary key/value storage for prefill and
 decode in decoder-only engines. Runtime allocates a linear buffer, slices
-it into per-layer views, and binds those views through the plugin or
-TRT-native backend.
+it into per-layer views, and binds those views through the `AttentionPlugin`
+backend.
 
 This document assumes generic KV terms from link:README.adoc[kv_cache/README.adoc].
 
@@ -18,7 +18,7 @@ This document assumes generic KV terms from link:README.adoc[kv_cache/README.ado
 | Model Family | Binding Mode | Notes
 
 | Llama, Qwen, Phi, InternVL
-| Plugin or TRT-native
+| Plugin (combined KV)
 | Standard decoder-only baseline.
 |===
 
@@ -38,14 +38,10 @@ flowchart TB
     end
 
     subgraph Engine
-        E{Backend mode}
         F[AttentionPlugin path]
-        G[TRT-native ops path]
     end
 
-    A --> B --> C --> D --> E
-    E -->|plugin| F
-    E -->|trt-native| G
+    A --> B --> C --> D --> F
 ----
 
 == Design
@@ -57,17 +53,19 @@ Runtime allocates one combined KV tensor per attention layer through
 `HybridCacheManager` owns active cache lengths and routes absolute
 decoder-layer indices to the KV sub-manager.
 
-=== Binding Modes
+=== KV Cache Bindings
 
-*Plugin mode* -- per-layer names `past_key_values_i` and
-`present_key_values_i` with shape
-`[batch, 2, num_kv_heads, max_kv_cache_capacity, head_dim]`.
+Decoder attention binds combined per-layer KV tensors `past_key_values_i`
+and `present_key_values_i` with shape
+`[batch, 2, num_kv_heads, max_kv_cache_capacity, head_dim]`, backed by
+`KVCacheManager` storage.
 
-*TRT-native mode* -- per-layer names `k_cache_i`, `v_cache_i`,
-`present_k_cache_i`, and `present_v_cache_i` with shape
-`[batch, num_kv_heads, max_kv_cache_capacity, head_dim]`.
-
-Both modes share the same underlying `KVCacheManager` storage.
+NOTE: The split per-layer layout (`k_cache_i` / `v_cache_i` /
+`present_k_cache_i` / `present_v_cache_i`, shape
+`[batch, num_kv_heads, max_kv_cache_capacity, head_dim]`) is no longer used by
+decoder-only LLM engines. It survives only in the Alpamayo action expert,
+whose exported graph consumes separate K/V caches; see
+`cpp/action/alpamayo1ActionRunner.cpp`.
 
 === Lifecycle
 
@@ -75,8 +73,8 @@ Both modes share the same underlying `KVCacheManager` storage.
 2. Prefill writes initial KV for prompt tokens.
 3. Decode updates KV per step and commits length increments.
 
-For the plugin path, `kvcache_start_index` distinguishes normal prefill
-from cache-aware execution.
+`kvcache_start_index` distinguishes normal prefill from cache-aware
+execution.
 
 == Code Touchpoints
 
@@ -97,7 +95,7 @@ from cache-aware execution.
 | Prepares per-step lengths and indices consumed by cache-aware execution.
 
 | `cpp/runtime/exec/registryBuilder.{h,cpp}`
-| Registers per-layer KV-cache bindings for plugin or TRT-native attention.
+| Registers per-layer KV-cache bindings for decoder attention.
 
 | `cpp/runtime/exec/tensorRegistry.{h,cpp}`
 | Binds cache tensor addresses and shapes for the active execution step.
@@ -109,7 +107,7 @@ from cache-aware execution.
 == Testing
 
 Decoder KV correctness is validated through pipeline tests exercising
-both binding modes end-to-end, builder-level validation of layer counts
+the decoder KV bindings end-to-end, builder-level validation of layer counts
 and dtype consistency, and runtime binding validation of per-layer view
 slicing. Unit coverage for cache reset/capture/restore lives in
 `unittests/hybridCacheManagerTests.cpp`; end-to-end coverage lives in

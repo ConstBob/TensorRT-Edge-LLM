@@ -68,7 +68,6 @@ LLMEngineConfig makeBasicLLMConfig()
     cfg.numKVHeads = 8;
     cfg.headDim = 128;
     cfg.rotaryDim = 128;
-    cfg.useTrtNativeOps = false;
     cfg.maxSupportedBatchSize = 4;
     cfg.maxSupportedInputLength = 2048;
     cfg.maxKVCacheCapacity = 4096;
@@ -132,61 +131,6 @@ TEST(RegistryBuilderTest, StandardLLMHasCorrectSpecAttributes)
     ASSERT_NE(logIt, specs.end());
     EXPECT_EQ(logIt->io, TensorIO::kOutput);
     EXPECT_EQ(logIt->dtype, nvinfer1::DataType::kFLOAT);
-}
-
-// =====================================================================
-// buildRegistryForLLM — TRT native ops mode
-// =====================================================================
-
-TEST(RegistryBuilderTest, NativeOpsModeSeparateKVCache)
-{
-    LLMEngineConfig cfg = makeBasicLLMConfig();
-    cfg.useTrtNativeOps = true;
-    cfg.numAttentionLayers = 4;
-    cfg.numDecoderLayers = 4;
-
-    populateHybridFieldsFromScalars(cfg);
-    auto reg = buildRegistryForLLM(cfg);
-    auto names = reg.allTensorNames();
-
-    // Should have separate K and V caches (4 names each for past/present)
-    EXPECT_TRUE(hasName(names, "k_cache_0"));
-    EXPECT_TRUE(hasName(names, "k_cache_3"));
-    EXPECT_TRUE(hasName(names, "present_k_cache_0"));
-    EXPECT_TRUE(hasName(names, "present_k_cache_3"));
-    EXPECT_TRUE(hasName(names, "v_cache_0"));
-    EXPECT_TRUE(hasName(names, "v_cache_3"));
-    EXPECT_TRUE(hasName(names, "present_v_cache_0"));
-    EXPECT_TRUE(hasName(names, "present_v_cache_3"));
-
-    // Should NOT have combined KV cache
-    EXPECT_FALSE(hasName(names, "past_key_values_0"));
-    EXPECT_FALSE(hasName(names, "present_key_values_0"));
-
-    // 5 core + 4*4 (k,present_k,v,present_v) = 5 + 16 = 21
-    // (kvcache_start_index registered with symbolic start_index_len dim)
-    EXPECT_EQ(names.size(), 22u);
-}
-
-TEST(RegistryBuilderTest, NativeOpsKVCacheShapeIs4D)
-{
-    LLMEngineConfig cfg = makeBasicLLMConfig();
-    cfg.useTrtNativeOps = true;
-    cfg.numAttentionLayers = 2;
-    cfg.numDecoderLayers = 2;
-
-    populateHybridFieldsFromScalars(cfg);
-    auto reg = buildRegistryForLLM(cfg);
-    auto specs = reg.allExpandedSpecs();
-
-    // k_cache_0 should be 4D [batch, numKVHeads, kv_len, headDim]
-    auto it = std::find_if(specs.begin(), specs.end(), [](TensorSpec const& s) { return s.name == "k_cache_0"; });
-    ASSERT_NE(it, specs.end());
-    EXPECT_EQ(it->shape.size(), 4u);
-    EXPECT_TRUE(it->shape[0].isSymbolic()); // batch
-    EXPECT_EQ(it->shape[1].value, 8);       // numKVHeads
-    EXPECT_TRUE(it->shape[2].isSymbolic()); // kv_len
-    EXPECT_EQ(it->shape[3].value, 128);     // headDim
 }
 
 // =====================================================================
@@ -617,7 +561,6 @@ TEST(RegistryBuilderTest, HybridModelKVCacheCountMatchesAttentionLayers)
     LLMEngineConfig cfg = makeBasicLLMConfig();
     cfg.numAttentionLayers = 10;
     cfg.numDecoderLayers = 20;
-    cfg.useTrtNativeOps = false;
 
     populateHybridFieldsFromScalars(cfg);
     auto reg = buildRegistryForLLM(cfg);
@@ -643,7 +586,6 @@ TEST(RegistryBuilderTest, HeterogeneousKVLayerEmitsPerLayerSpecs)
     cfg.numAttentionLayers = 2;
     cfg.numDecoderLayers = 2;
     cfg.numLinearAttnLayers = 0;
-    cfg.useTrtNativeOps = false; // plugin KV -> past_key_values_{i}
 
     // Set layerTypes and kvLayerConfigs explicitly — do NOT call
     // populateHybridFieldsFromScalars: that would broadcast uniform KV config
@@ -723,7 +665,6 @@ TEST_P(RegistryBuilderKVDtypeTest, KVCacheBindingDtypeMatchesConfigPluginPath)
     cfg.kvCacheDtype = kvDtype;
     cfg.numAttentionLayers = 4;
     cfg.numDecoderLayers = 4;
-    cfg.useTrtNativeOps = false; // plugin KV cache path emits past_key_values_* / present_key_values_*
 
     populateHybridFieldsFromScalars(cfg);
     auto reg = buildRegistryForLLM(cfg);
@@ -746,35 +687,6 @@ TEST_P(RegistryBuilderKVDtypeTest, KVCacheBindingDtypeMatchesConfigPluginPath)
     }
     EXPECT_EQ(pastCount, 4);
     EXPECT_EQ(presentCount, 4);
-}
-
-TEST_P(RegistryBuilderKVDtypeTest, KVCacheBindingDtypeMatchesConfigNativePath)
-{
-    nvinfer1::DataType const kvDtype = GetParam();
-
-    LLMEngineConfig cfg = makeBasicLLMConfig();
-    cfg.kvCacheDtype = kvDtype;
-    cfg.numAttentionLayers = 2;
-    cfg.numDecoderLayers = 2;
-    cfg.useTrtNativeOps = true; // native path emits k_cache_* / v_cache_* / present_* variants
-
-    populateHybridFieldsFromScalars(cfg);
-    auto reg = buildRegistryForLLM(cfg);
-    auto specs = reg.allExpandedSpecs();
-
-    int kvBindingCount = 0;
-    for (auto const& spec : specs)
-    {
-        bool const isKVCache = spec.name.rfind("k_cache_", 0) == 0 || spec.name.rfind("v_cache_", 0) == 0
-            || spec.name.rfind("present_k_cache_", 0) == 0 || spec.name.rfind("present_v_cache_", 0) == 0;
-        if (isKVCache)
-        {
-            EXPECT_EQ(spec.dtype, kvDtype) << "KV binding " << spec.name << " has wrong dtype";
-            ++kvBindingCount;
-        }
-    }
-    // 2 layers * 4 (k, v, present_k, present_v) = 8
-    EXPECT_EQ(kvBindingCount, 8);
 }
 
 TEST_P(RegistryBuilderKVDtypeTest, DraftEngineKVCacheBindingDtypeMatchesConfig)

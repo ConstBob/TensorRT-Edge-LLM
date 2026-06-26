@@ -473,7 +473,6 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readwrite("max_kv_cache_capacity", &builder::LLMBuilderConfig::maxKVCacheCapacity)
         .def_readwrite("max_verify_tree_size", &builder::LLMBuilderConfig::maxVerifyTreeSize)
         .def_readwrite("max_draft_tree_size", &builder::LLMBuilderConfig::maxDraftTreeSize)
-        .def_readwrite("use_trt_native_ops", &builder::LLMBuilderConfig::useTrtNativeOps)
         .def("__repr__", &builder::LLMBuilderConfig::toString);
 
     py::class_<builder::LLMBuilder>(m, "LLMBuilder", "Build a TensorRT engine from an ONNX directory.")

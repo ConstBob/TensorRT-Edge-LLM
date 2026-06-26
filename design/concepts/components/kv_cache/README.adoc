@@ -105,7 +105,7 @@ graph TD
 === KV Variants
 
 - **link:decoder.adoc[Decoder KV]** -- baseline per-layer cache with
-  plugin or TRT-native bindings.
+  plugin combined-KV bindings.
 - **link:prefix_reuse.adoc[Prefix Reuse]** -- seeds the cache from saved
   system-prompt KV to amortize repeated prefixes.
 
@@ -139,8 +139,7 @@ graph TD
 | Constructs cache managers and shared runtime resources from engine config.
 
 | `cpp/runtime/exec/registryBuilder.{h,cpp}`
-| Registers plugin combined-KV bindings or TRT-native split-KV bindings for each
-  attention layer.
+| Registers plugin combined-KV bindings for each attention layer.
 
 | `cpp/runtime/exec/tensorRegistry.{h,cpp}`
 | Resolves and binds KV-cache tensors to TensorRT execution contexts.
