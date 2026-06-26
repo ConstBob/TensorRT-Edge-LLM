@@ -118,6 +118,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         is_causal: bool = False,
         use_sliding_window: bool = False,
         actual_head_dim: Optional[int] = None,
+        enable_skip_correction: bool = True,
     ):
         """Initializes the configuration for a Blackwell Fused Multi-Head Attention (FMHA) kernel.
 
@@ -182,6 +183,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.mask_type = mask_type
         self.is_causal = is_causal
         self.use_sliding_window = use_sliding_window
+        self.enable_skip_correction = enable_skip_correction
 
         self.softmax0_warp_ids = (0, 1, 2, 3)
         self.softmax1_warp_ids = (4, 5, 6, 7)
@@ -262,6 +264,19 @@ class BlackwellFusedMultiHeadAttentionForward:
         FP8_E4M3_PRESCALE_LOG2 = 8.0  # log2(256) — tuned for FP8 E4M3 range [0, 448]
         self.softmax_prescale_log2 = FP8_E4M3_PRESCALE_LOG2 if self.q_dtype.width == 8 else 0.0
         self.softmax_prescale_ln = self.softmax_prescale_log2 * 0.6931471805599453
+
+        # skip-correction: skip the per-tile O/row_sum rescale when the row-max grew
+        # by <= rescale_threshold (in log2 units). Keeping the old max makes the
+        # rescale an identity (acc_scale = exp2(0) = 1). P can then reach up to
+        # 2^threshold, which must fit the dtype P is cast to before the PV matmul
+        # (self.q_dtype, see the s_vec.to(self.q_dtype) store below): fp16 (16-bit,
+        # max ~2^16) uses 15.0; FP8 E4M3 (max 448 ~= 2^8.8) uses 8.0. On by default;
+        # benchmarks show a +2-3.8% prefill win at D128 (grows with seq length) and
+        # ~neutral at D64. 0.0 disables skip-correction.
+        if self.enable_skip_correction:
+            self.rescale_threshold = 15.0 if self.q_dtype.width == 16 else 8.0
+        else:
+            self.rescale_threshold = 0.0
 
     @cute.jit
     def __call__(
@@ -2002,6 +2017,13 @@ class BlackwellFusedMultiHeadAttentionForward:
         row_max_safe = row_max
         if row_max == -cutlass.Float32.inf:
             row_max_safe = 0.0
+        # skip-correction: if the row-max grew by <= rescale_threshold (log2 units),
+        # keep the previous max as the normalization point so the O/row_sum rescale
+        # becomes identity and the correction step is skipped. P is then normalized
+        # to old_row_max and can reach up to 2^threshold (fits fp16 at 15 / fp8 at 8).
+        if cutlass.const_expr(self.rescale_threshold > 0.0):
+            if (row_max_safe - old_row_max) * scale_softmax_log2 <= self.rescale_threshold:
+                row_max_safe = old_row_max
         tTMEM_STORE_VECrS = cute.make_rmem_tensor(
             tTMEM_STORE_VECcS.shape, self.qk_acc_dtype
         )
@@ -2063,8 +2085,15 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         vec_i_handle = si_corr_producer.acquire_and_advance()
 
+        # With skip-correction enabled, carry the (possibly lagging) normalization
+        # point row_max_safe so the next tile's correction baseline matches what O is
+        # actually normalized to. With it disabled, carry the true row_max (unchanged).
+        carried_row_max = (
+            row_max_safe if cutlass.const_expr(self.rescale_threshold > 0.0) else row_max
+        )
+
         return (
-            row_max,
+            carried_row_max,
             row_sum,
             vec_i_handle,
             mma_si_consumer,
@@ -2633,6 +2662,7 @@ def run(
     file_name: str = "fmha",
     function_prefix: str = "fmha",
     vit_mode: bool = False,
+    enable_skip_correction: bool = True,
     **kwargs,
 ):
     """Execute Fused Multi-Head Attention (FMHA) on Blackwell architecture and validate results.
@@ -2945,6 +2975,7 @@ def run(
         is_causal=(is_causal and not vit_mode),
         use_sliding_window=(use_sliding_window and not vit_mode),
         actual_head_dim=actual_head_dim,
+        enable_skip_correction=enable_skip_correction,
     )
 
     # Initialize Stream
@@ -3811,6 +3842,14 @@ if __name__ == "__main__":
         "bidirectional (no causal mask). Produces a different ABI.",
     )
 
+    parser.add_argument(
+        "--enable_skip_correction",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable skip correction (default: on). "
+        "Use --no-enable_skip_correction to disable.",
+    )
+
     args = parser.parse_args()
 
     if cp.cuda.runtime.getDeviceCount() == 0:
@@ -3862,6 +3901,7 @@ if __name__ == "__main__":
         file_name=args.file_name,
         function_prefix=args.function_prefix,
         vit_mode=args.vit_mode,
+        enable_skip_correction=args.enable_skip_correction,
     )
 
     if latency is not None:
