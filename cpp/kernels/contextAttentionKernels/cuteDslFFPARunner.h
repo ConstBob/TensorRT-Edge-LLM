@@ -29,7 +29,7 @@
 // matching cudaLibrary* function symbol is supplied at link time by
 // cpp/kernels/gdnKernels/cutedsl_cuda_runtime_library_shim.c (weak definition,
 // linked through trt_edgellm_cutedsl_cudart_shim).
-#if CUDA_VERSION < 12080
+#if CUDA_VERSION >= 12000 && CUDA_VERSION < 12080
 typedef CUlibrary cudaLibrary_t;
 extern "C" cudaError_t cudaLibraryUnload(cudaLibrary_t library);
 #endif
