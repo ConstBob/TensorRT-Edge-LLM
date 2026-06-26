@@ -110,8 +110,6 @@ spec-decode XQA path when the runtime sequence contains a candidate tree.
 
 * `tests/python-unittests/test_attention_plugin.py` validates plugin tree
   attention against a numpy reference.
-* `tests/python-unittests/test_attention_native.py` validates TRT-native tree
-  attention against the same reference path.
 * `unittests/xqaTreeAttentionDecodingTest.cu` covers XQA tree decode kernels.
 * `unittests/eagleUtilkernelTests.cu` covers EAGLE tree-mask packing and base
   tree-decoding input preparation.

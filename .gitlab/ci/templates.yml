@@ -297,7 +297,7 @@
     - pip3 install -q pycuda
     - export LD_LIBRARY_PATH=$TRT_PACKAGE_DIR/lib:$LD_LIBRARY_PATH
     - echo "Running unit tests with pytest. Time:$(date)"
-    - python3 -m pytest tests/defs/test_common.py tests/python-unittests/test_attention_native.py tests/python-unittests/test_attention_plugin.py --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
+    - python3 -m pytest tests/defs/test_common.py tests/python-unittests/test_attention_plugin.py --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
     - echo "Command execution logs and pytest reports saved to $TEST_LOG_DIR"
     - ls -la $TEST_LOG_DIR
     - echo "Pipeline end time:$(date)"

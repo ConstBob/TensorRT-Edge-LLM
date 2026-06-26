@@ -67,7 +67,6 @@ struct LLMEngineConfig
     int32_t reducedVocabSize{0};       //!< 0 = no vocab reduction
 
     // --- Feature flags ---
-    bool useTrtNativeOps{false};  //!< Use TRT native ops instead of custom plugin
     bool isSpecDecodeBase{false}; //!< Base engine exposes speculative decoding verification bindings
     SpecDecodeMode specDecodeType{
         SpecDecodeMode::kNONE}; //!< Speculative decoding strategy mode (parsed from spec_decode_type)
@@ -182,9 +181,8 @@ struct LLMEngineConfig
     //! Prefill dims (vanilla LLM, SpecDecode base, and SpecDecode draft).
     //! seqLen is the prompt length being processed this step.
     //! kvCacheAllEmpty signals whether this is the initial prefill of an empty
-    //! KV cache — for plugin-path engines, this drives the `kvcache_start_index`
-    //! shape to `[0]` (engine's "initial prefill" sentinel) instead of `[batch]`.
-    //! TRT-native-ops engines always use `[batch]` regardless.
+    //! KV cache — this drives the `kvcache_start_index` shape to `[0]` (engine's
+    //! "initial prefill" sentinel) instead of `[batch]`.
     InferenceDims prefillDims(int64_t batch, int64_t seqLen, bool kvCacheAllEmpty) const;
 
     //! Vanilla single-token decode dims.
