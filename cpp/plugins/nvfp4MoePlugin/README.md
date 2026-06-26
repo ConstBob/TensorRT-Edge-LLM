@@ -39,7 +39,7 @@ may be generated but are not dispatched yet.
 | `backend` | decode + prefill (`auto` picks decode when `num_tokens*top_k` is small) |
 | `hidden_size` (H) | `H > 0 && H % 128 == 0` |
 | `moe_inter_size` (I) | `I > 0 && I % 64 == 0`, `FC1_N % 128 == 0` |
-| `num_experts` (E) | `E == 128` |
+| `num_experts` (E) | `E in {128, 256}` (FC1/FC2 cubins are runtime-polymorphic in E) |
 | `top_k` | `0 < top_k <= 8` |
 
 The plugin's `configurePlugin` enforces the divisibility and alignment
