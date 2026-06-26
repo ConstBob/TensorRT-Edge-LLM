@@ -568,13 +568,13 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
                 model_dir):
             content_types = {
                 "audio": {
-                    "format": "<|audio_pad|>"
+                    "format": "<|audio_start|><|audio_pad|><|audio_end|>"
                 },
                 "image": {
-                    "format": "<|image_pad|>"
+                    "format": "<|vision_start|><|image_pad|><|vision_end|>"
                 },
                 "video": {
-                    "format": "<|video_pad|>"
+                    "format": "<|vision_start|><|video_pad|><|vision_end|>"
                 },
             }
 

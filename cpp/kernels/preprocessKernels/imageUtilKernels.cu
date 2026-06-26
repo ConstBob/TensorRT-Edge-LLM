@@ -623,6 +623,7 @@ void initFastPosEmbedQwenViT(rt::Tensor& fastPosEmbedIdx, rt::Tensor& fastPosEmb
     check::check(totalSeqLength == fastPosEmbedWeight.getShape()[1], "Total sequence length mismatch.");
 
     check::check(gridTHW.size() == 3, "gridTHW must have exactly 3 elements [T, H, W]");
+    int64_t const T = gridTHW[0];
     int64_t const H = gridTHW[1];
     int64_t const W = gridTHW[2];
     int64_t const llmGridH = H / mergeSize;
@@ -633,9 +634,15 @@ void initFastPosEmbedQwenViT(rt::Tensor& fastPosEmbedIdx, rt::Tensor& fastPosEmb
     uint32_t const blockSize = 256;
     uint32_t const gridSize = (H * W + blockSize - 1) / blockSize;
 
-    initFastPosEmbedQwenViTKernel<<<gridSize, blockSize, 0, stream>>>(fastPosEmbedIdx.dataPointer<int64_t>(),
-        fastPosEmbedWeight.dataPointer<half>(), llmGridH, llmGridW, mergeSize, numGridPerSide, lineSpaceH, lineSpaceW,
-        startIdx, totalSeqLength);
+    // The fast position embedding is spatial (H*W); for a video grid it repeats per temporal frame (HF
+    // `pos_embed.repeat(t, 1)`). Qwen3-VL splits frames into T=1 sub-span grids (this loop runs once);
+    // Qwen3-Omni passes a single (T, H, W) grid, so write the same spatial pattern at each frame's patch offset.
+    for (int64_t t = 0; t < T; ++t)
+    {
+        initFastPosEmbedQwenViTKernel<<<gridSize, blockSize, 0, stream>>>(fastPosEmbedIdx.dataPointer<int64_t>(),
+            fastPosEmbedWeight.dataPointer<half>(), llmGridH, llmGridW, mergeSize, numGridPerSide, lineSpaceH,
+            lineSpaceW, startIdx + t * H * W, totalSeqLength);
+    }
 }
 
 } // namespace kernel

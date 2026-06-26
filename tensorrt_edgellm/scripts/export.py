@@ -832,6 +832,16 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
                 vc_out = dict(vc_out)
                 vc_out["num_position_embeddings"] = _grid * _grid
                 vis_cfg_out["vision_config"] = vc_out
+        if model_type == "qwen3_omni":
+            # Qwen3-Omni video temporal MRoPE scale. HF keeps it at thinker_config
+            # level (not vision_config), so copy it into vision_config where the C++
+            # Qwen3OmniViTRunner reads it.
+            _pips = _thinker_cfg.get("position_id_per_seconds",
+                                     config.get("position_id_per_seconds"))
+            if _pips is not None:
+                vis_cfg_out["vision_config"] = dict(
+                    vis_cfg_out["vision_config"])
+                vis_cfg_out["vision_config"]["position_id_per_seconds"] = _pips
     # Copy preprocessor_config.json to the visual output dir so the C++
     # runtime can find patch_size, image_mean, image_std, etc.  Applies to
     # every visual family (Qwen VL, InternVL, Phi-4mm) — the C++ visual

@@ -882,7 +882,7 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
                 "Alpamayo1ActionRunner requires a Qwen3-VL vision runner but a different vision runner is loaded.");
             return false;
         }
-        // MultimodalRunner::create() uses QwenViTRunner only for Qwen3-VL.
+        // The Qwen3-VL runner is a Qwen3VLViTRunner (derives from QwenViTRunner); upcast to read the base rope deltas.
         auto* qwenVision = static_cast<rt::QwenViTRunner*>(mVisionRunner.get());
         std::vector<int64_t> const& ropeDeltas = qwenVision->getMropeRopeDeltasPerBatch();
         rt::HybridCacheManager& kvcache = *mSharedResources->cacheManagers[0];

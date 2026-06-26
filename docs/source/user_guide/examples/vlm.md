@@ -68,6 +68,18 @@ cd /path/to/TensorRT-Edge-LLM
 
 Build time: < 5 minutes
 
+> **Visual token budget (important for video).** Two build-time limits, fixed in the visual engine:
+> - `--maxImageTokens` — the budget for **one whole request** (all images and video frames combined).
+> - `--maxImageTokensPerImage` — the cap for a **single** image or video (applied during smart-resize).
+>
+> A **video counts as one token block per frame**, so it costs about `numFrames × tokensPerFrame` —
+> far more than a single image. Set `--maxImageTokens` for your largest expected video (frames ×
+> per-frame tokens) plus any images sent alongside it.
+>
+> If a request exceeds the budget, `llm_inference` stops with
+> `... exceeds the limitation, maxHW = <N> of VIT engine`. Rebuild the visual engine with a larger
+> `--maxImageTokens` (or `--maxImageTokensPerImage` if one image/video is itself too large).
+
 ## Step 4: Run Inference (Thor Device)
 
 Create an input file `$WORKSPACE_DIR/input_vlm.json` (replace `/path/to/image.jpg` with an actual image file path):
