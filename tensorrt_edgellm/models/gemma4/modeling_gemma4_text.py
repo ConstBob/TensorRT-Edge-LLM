@@ -26,7 +26,7 @@ from transformers.activations import ACT2FN
 from ...config import ModelConfig
 from ..default.modeling_default import (MLP, Attention, CausalLM, DecoderLayer,
                                         OnnxSpec, RMSNorm)
-from ..linear import make_linear
+from ..linear import TPMode, make_linear
 from ..ops import attention_plugin
 
 __all__ = [
@@ -82,6 +82,19 @@ def _kv_cache_dims_for_layer(config: ModelConfig,
     attention_type = _attention_type_for_layer(config, layer_idx)
     return (_num_kv_heads_for_attention_type(config, attention_type),
             _head_dim_for_attention_type(config, attention_type))
+
+
+def _mlp_intermediate_size_for_layer(config: ModelConfig,
+                                     layer_idx: int) -> int:
+    """Return Gemma4's per-layer MLP width."""
+    intermediate_size = int(config.intermediate_size)
+    if not config.use_double_wide_mlp:
+        return intermediate_size
+    first_shared_layer = int(config.num_hidden_layers -
+                             config.num_kv_shared_layers)
+    if layer_idx >= first_shared_layer:
+        return intermediate_size * 2
+    return intermediate_size
 
 
 def _rotary_dim_from_rope_config(config: ModelConfig,
@@ -513,7 +526,30 @@ class Gemma4MLP(MLP):
     """Gemma4 MLP using the checkpoint-configured activation."""
 
     def __init__(self, config: ModelConfig, layer_idx: int) -> None:
-        super().__init__(config, layer_idx=layer_idx)
+        nn.Module.__init__(self)
+        intermediate_size = _mlp_intermediate_size_for_layer(config, layer_idx)
+        module_prefix = f"layers.{layer_idx}.mlp"
+        self.gate_proj = make_linear(
+            config,
+            config.hidden_size,
+            intermediate_size,
+            module_name=f"{module_prefix}.gate_proj",
+            tp_mode=TPMode.COL,
+        )
+        self.up_proj = make_linear(
+            config,
+            config.hidden_size,
+            intermediate_size,
+            module_name=f"{module_prefix}.up_proj",
+            tp_mode=TPMode.COL,
+        )
+        self.down_proj = make_linear(
+            config,
+            intermediate_size,
+            config.hidden_size,
+            module_name=f"{module_prefix}.down_proj",
+            tp_mode=TPMode.ROW,
+        )
         self.act_fn = _resolve_hidden_activation(config.hidden_activation)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -547,15 +583,21 @@ class Gemma4DecoderLayer(DecoderLayer):
                                                   config.rms_norm_eps)
 
         if self.hidden_size_per_layer_input > 0:
-            self.per_layer_input_gate = nn.Linear(
+            self.per_layer_input_gate = make_linear(
+                config,
                 config.hidden_size,
                 self.hidden_size_per_layer_input,
                 bias=False,
+                module_name=f"layers.{layer_idx}.per_layer_input_gate",
+                tp_mode=TPMode.REPLICATED,
             )
-            self.per_layer_projection = nn.Linear(
+            self.per_layer_projection = make_linear(
+                config,
                 self.hidden_size_per_layer_input,
                 config.hidden_size,
                 bias=False,
+                module_name=f"layers.{layer_idx}.per_layer_projection",
+                tp_mode=TPMode.REPLICATED,
             )
             self.post_per_layer_input_norm = RMSNorm(config.hidden_size,
                                                      config.rms_norm_eps)
@@ -665,10 +707,13 @@ class Gemma4Transformer(nn.Module):
                 self.vocab_size_per_layer_input,
                 config.num_hidden_layers * self.hidden_size_per_layer_input,
             )
-            self.per_layer_model_projection = nn.Linear(
+            self.per_layer_model_projection = make_linear(
+                config,
                 config.hidden_size,
                 config.num_hidden_layers * self.hidden_size_per_layer_input,
                 bias=False,
+                module_name="per_layer_model_projection",
+                tp_mode=TPMode.REPLICATED,
             )
             self.per_layer_projection_norm = RMSNorm(
                 self.hidden_size_per_layer_input,
