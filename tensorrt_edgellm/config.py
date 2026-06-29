@@ -907,6 +907,13 @@ _DEEPSTACK_MODEL_TYPES = frozenset({
     "qwen3_omni_moe_text",
 })
 
+_QWEN3_5_MTP_CONFIG_MODEL_TYPES = frozenset({
+    "qwen3_5",
+    "qwen3_5_text",
+    "qwen3_5_moe",
+    "qwen3_5_moe_text",
+})
+
 
 def make_mtp_draft_config(base_config: ModelConfig) -> ModelConfig:
     """Derive the currently supported MTP draft config from a base config."""
@@ -1094,17 +1101,15 @@ def _validate_mtp_constraints(
     """Validate the currently supported MTP config subset."""
     if mtp_num_hidden_layers is None and not mtp_use_dedicated_embeddings:
         return
-    if model_type not in ("qwen3_5_text", "qwen3_5_moe_text"):
+    if model_type not in _QWEN3_5_MTP_CONFIG_MODEL_TYPES:
         raise NotImplementedError(
             "MTP config parsing is only supported for Qwen3.5 checkpoints.")
     if mtp_num_hidden_layers != 1:
         raise NotImplementedError(
-            "Only mtp_num_hidden_layers == 1 is supported for Qwen3.5 dense MTP."
-        )
+            "Only mtp_num_hidden_layers == 1 is supported for Qwen3.5 MTP.")
     if mtp_use_dedicated_embeddings:
         raise NotImplementedError(
-            "Dedicated MTP embeddings are not supported for Qwen3.5 dense MTP."
-        )
+            "Dedicated MTP embeddings are not supported for Qwen3.5 MTP.")
 
 
 def _parse_layer_types(config: dict) -> List[str]:
@@ -1355,8 +1360,9 @@ def _detect_unquantized_modules(model_dir: str) -> List[str]:
     """Return module names whose weights are plain float (not int4 quantized).
 
     Some layers (often ``lm_head``) use ``*.weight`` instead of ``*.qweight``.
-    VL wrapper prefixes (``language_model.`` etc.) are stripped so that the
-    returned names match the short names used by ``make_linear()``.
+    Checkpoint wrapper prefixes (``model.``, ``language_model.``, etc.) are
+    stripped so that the returned names match the short names used by
+    ``make_linear()``.
     """
     all_keys = _checkpoint_weight_keys(model_dir)
 
@@ -1370,13 +1376,13 @@ def _detect_unquantized_modules(model_dir: str) -> List[str]:
         for k in all_keys if k.endswith(".weight")
     }
     excluded: List[str] = [
-        _strip_vl_prefix(m) for m in (weight_modules - qweight_modules)
+        _normalize_module_name(m) for m in (weight_modules - qweight_modules)
     ]
     # lm_head may have neither .weight nor .qweight when tie_word_embeddings=True
     # (the checkpoint omits lm_head.weight entirely).  Treat it as FP16 so that
     # tie_weights() can clone embed_tokens.weight into it after loading.
     all_linear_stripped = {
-        _strip_vl_prefix(m)
+        _normalize_module_name(m)
         for m in qweight_modules | weight_modules
     }
     if "lm_head" not in all_linear_stripped:
