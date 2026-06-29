@@ -36,6 +36,22 @@ from .config import (ModelConfig, make_dflash_draft_config,
 __all__ = ["AutoModel", "register_model", "dtype_summary", "param_count"]
 
 _MODEL_REGISTRY: Dict[str, Type[nn.Module]] = {}
+_QWEN3_5_MTP_BASE_MODEL_TYPES = frozenset({
+    "qwen3_5_text",
+    "qwen3_5_moe",
+    "qwen3_5_moe_text",
+})
+_QWEN3_5_MTP_DRAFT_MODEL_TYPES = frozenset({
+    "qwen3_5_text",
+})
+
+
+def _is_qwen3_5_mtp_base_supported(model_type: str) -> bool:
+    return model_type in _QWEN3_5_MTP_BASE_MODEL_TYPES
+
+
+def _is_qwen3_5_mtp_draft_supported(model_type: str) -> bool:
+    return model_type in _QWEN3_5_MTP_DRAFT_MODEL_TYPES
 
 
 def register_model(model_type: str, model_class: Type[nn.Module]) -> None:
@@ -92,7 +108,7 @@ class AutoModel:
             reduced_vocab_dir:
                             Optional directory containing ``vocab_map.safetensors``.
             mtp_base:       When True, export the standard Qwen3.5 text model as
-                            the dense MTP base variant.
+                            the MTP base variant.
             mtp_draft:      When True, build the dedicated Qwen3.5 dense MTP
                             draft model from the base checkpoint config.
             tp_size:        Tensor-parallel world size.  When >1 the config
@@ -151,10 +167,10 @@ class AutoModel:
                 key_remap = _eagle3_key_remap
         elif variant == "mtp_draft":
             # TODO: support other model types
-            if config.model_type != "qwen3_5_text":
+            if not _is_qwen3_5_mtp_draft_supported(config.model_type):
                 raise NotImplementedError(
-                    "MTP draft is only supported for qwen3_5_text checkpoints."
-                )
+                    "MTP draft is only supported for qwen3_5_text checkpoints; "
+                    f"got {config.model_type!r}.")
             from .models.qwen3_5 import Qwen3_5MtpDraftModel
             tie_word_embeddings = config.tie_word_embeddings
             config = make_mtp_draft_config(config)
@@ -175,10 +191,12 @@ class AutoModel:
             if key_remap is None:
                 key_remap = _dflash_key_remap
         else:
-            if variant == "mtp_base" and config.model_type != "qwen3_5_text":
+            if (variant == "mtp_base"
+                    and not _is_qwen3_5_mtp_base_supported(config.model_type)):
                 raise NotImplementedError(
-                    "Qwen3.5 dense MTP base is only supported for qwen3_5_text checkpoints."
-                )
+                    "Qwen3.5 MTP base is only supported for qwen3_5_text "
+                    "qwen3_5_moe, or qwen3_5_moe_text checkpoints; "
+                    f"got {config.model_type!r}.")
             # DFlash base is supported for both Qwen3.5 hybrid (qwen3_5_text) and
             # dense Qwen3 (default CausalLM). Dense models use the Transformer's
             # dflash_target_layer_ids parameter to collect target-layer hidden states.
