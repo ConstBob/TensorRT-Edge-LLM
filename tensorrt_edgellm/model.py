@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,6 +23,7 @@ the default :class:`~models.default.modeling_default.CausalLM` for a given
 ``model_type`` string.
 """
 
+import dataclasses
 import logging
 import os
 from typing import Dict, Type
@@ -30,8 +31,10 @@ from typing import Dict, Type
 import torch.nn as nn
 
 from .checkpoint.loader import load_weights
-from .config import (ModelConfig, make_dflash_draft_config,
-                     make_mtp_draft_config)
+from .config import (QUANT_FP16, QUANT_INT4_AWQ, QUANT_INT4_AWQ_MODELOPT,
+                     QUANT_INT4_GPTQ, QUANT_MXFP8, QUANT_NVFP4, ModelConfig,
+                     make_dflash_draft_config, make_mtp_draft_config,
+                     module_quant_type)
 
 __all__ = ["AutoModel", "register_model", "dtype_summary", "param_count"]
 
@@ -52,6 +55,15 @@ def _is_qwen3_5_mtp_base_supported(model_type: str) -> bool:
 
 def _is_qwen3_5_mtp_draft_supported(model_type: str) -> bool:
     return model_type in _QWEN3_5_MTP_DRAFT_MODEL_TYPES
+
+
+_GROUP_SIZE_LM_HEAD_QUANTS = frozenset({
+    QUANT_INT4_AWQ,
+    QUANT_INT4_AWQ_MODELOPT,
+    QUANT_INT4_GPTQ,
+    QUANT_MXFP8,
+    QUANT_NVFP4,
+})
 
 
 def register_model(model_type: str, model_class: Type[nn.Module]) -> None:
@@ -183,9 +195,14 @@ class AutoModel:
                 raise ValueError(
                     "dflash_draft requires dflash_draft_dir to be set.")
             from .models.dflash.modeling_dflash_draft import DFlashDraftModel
+            base_config = config
             base_model_dir = model_dir
-            base_tie_word_embeddings = config.tie_word_embeddings
+            base_tie_word_embeddings = base_config.tie_word_embeddings
+            draft_has_lm_head = _checkpoint_has_dflash_lm_head(
+                dflash_draft_dir)
             config = make_dflash_draft_config(dflash_draft_dir)
+            if not draft_has_lm_head:
+                config = _inherit_dflash_lm_head_quant(config, base_config)
             model_class = DFlashDraftModel
             model_dir = dflash_draft_dir
             if key_remap is None:
@@ -206,6 +223,7 @@ class AutoModel:
         model.to(device)
 
         pre_repack_hook = None
+        apply_reduced_vocab_after_load = False
         if reduced_vocab_dir is not None:
             from .vocab_reduction.onnx_export import (
                 apply_reduced_vocab, load_reduced_vocab_map,
@@ -220,6 +238,22 @@ class AutoModel:
                     loaded_model._reduced_vocab_dir = reduced_vocab_dir
 
                 pre_repack_hook = _apply_pre_repack_reduced_vocab
+            else:
+                apply_reduced_vocab_after_load = True
+
+        if variant == "dflash_draft" and not draft_has_lm_head:
+            next_pre_repack_hook = pre_repack_hook
+
+            def _load_pre_repack_dflash_lm_head(loaded_model: nn.Module):
+                _load_dflash_lm_head(
+                    loaded_model,
+                    base_model_dir,
+                    device,
+                    tie_word_embeddings=base_tie_word_embeddings)
+                if next_pre_repack_hook is not None:
+                    next_pre_repack_hook(loaded_model)
+
+            pre_repack_hook = _load_pre_repack_dflash_lm_head
 
         load_weights(model,
                      model_dir,
@@ -229,16 +263,10 @@ class AutoModel:
                      pre_repack_hook=pre_repack_hook,
                      mapping=config.mapping)
         if variant == "dflash_draft":
-            if _checkpoint_has_dflash_lm_head(model_dir):
+            if draft_has_lm_head:
                 logging.getLogger(__name__).info(
                     "DFlash lm_head source: draft checkpoint buffers")
-            else:
-                _load_dflash_lm_head(
-                    model,
-                    base_model_dir,
-                    device,
-                    tie_word_embeddings=base_tie_word_embeddings)
-        if reduced_vocab_dir is not None and pre_repack_hook is None:
+        if apply_reduced_vocab_after_load:
             from .vocab_reduction.onnx_export import \
                 apply_reduced_vocab_from_dir
             apply_reduced_vocab_from_dir(model, reduced_vocab_dir)
@@ -264,6 +292,43 @@ def dtype_summary(model: nn.Module) -> Dict[str, int]:
         name = str(p.dtype).replace("torch.", "")
         out[name] = out.get(name, 0) + p.numel()
     return dict(sorted(out.items(), key=lambda x: -x[1]))
+
+
+def _inherit_dflash_lm_head_quant(draft_config: ModelConfig,
+                                  base_config: ModelConfig) -> ModelConfig:
+    """Make an old DFlash draft build a loadable shared lm_head.
+
+    Older DFlash drafts may omit ``lm_head.*`` and reuse the base output head.
+    When that head is quantized, mirror its layout only for the draft ``lm_head``
+    so the fallback loader can copy the base sidecar tensors.
+    """
+    lm_head_quant = module_quant_type("lm_head", base_config)
+    if lm_head_quant == QUANT_FP16:
+        return draft_config
+
+    draft_quant = draft_config.quant
+    base_quant = base_config.quant
+    use_base_group_size = lm_head_quant in _GROUP_SIZE_LM_HEAD_QUANTS
+    if (use_base_group_size and draft_quant.quant_type != QUANT_FP16
+            and draft_quant.group_size != base_quant.group_size):
+        raise ValueError(
+            "DFlash draft cannot share %s base lm_head with a different "
+            "draft quantization group size." % lm_head_quant)
+
+    layer_overrides = dict(draft_quant.layer_overrides)
+    layer_overrides["lm_head"] = lm_head_quant
+    excluded = [name for name in draft_quant.excluded if name != "lm_head"]
+    quant_updates = {
+        "excluded": excluded,
+        "layer_overrides": layer_overrides,
+    }
+    if use_base_group_size:
+        quant_updates["group_size"] = base_quant.group_size
+    if lm_head_quant == QUANT_INT4_GPTQ:
+        quant_updates[
+            "gptq_zero_point_offset"] = base_quant.gptq_zero_point_offset
+    quant = dataclasses.replace(draft_quant, **quant_updates)
+    return dataclasses.replace(draft_config, quant=quant)
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +424,6 @@ def _load_dflash_lm_head(model: nn.Module,
     import os
 
     import torch
-    from safetensors import safe_open
 
     from .models.linear import FP16Linear
 
@@ -369,13 +433,13 @@ def _load_dflash_lm_head(model: nn.Module,
         logger.warning("DFlash draft model has no lm_head; skipping.")
         return
 
-    if not isinstance(lm_head, FP16Linear):
-        raise ValueError(
-            "DFlash quantized lm_head requires lm_head.* tensors in the "
-            "draft checkpoint; refusing to synthesize it from base weights.")
-
     from .checkpoint.loader import _build_shard_map
     shard_map = _build_shard_map(base_model_dir)
+
+    if not isinstance(lm_head, FP16Linear):
+        _load_dflash_quantized_lm_head(model, lm_head, shard_map,
+                                       base_model_dir, device)
+        return
 
     # --- Determine source key with strict priority ---
     lm_head_candidates = [
@@ -427,8 +491,8 @@ def _load_dflash_lm_head(model: nn.Module,
         logger.info("DFlash lm_head source: %s from %s", source_key,
                     os.path.basename(shard_path))
 
-    with safe_open(shard_path, framework="pt", device=device) as f:
-        source_weight = f.get_tensor(source_key)
+    source_weight = _read_dflash_checkpoint_tensor(shard_path, source_key,
+                                                   device)
 
     # --- Copy weight into model's dense lm_head ---
     if source_weight.shape != lm_head.weight.shape:
@@ -437,6 +501,90 @@ def _load_dflash_lm_head(model: nn.Module,
             f"vs lm_head={lm_head.weight.shape}")
     with torch.no_grad():
         lm_head.weight.copy_(source_weight.to(lm_head.weight.dtype))
+
+
+def _load_dflash_quantized_lm_head(model: nn.Module, lm_head: nn.Module,
+                                   shard_map: Dict[str, str],
+                                   base_model_dir: str, device: str) -> None:
+    """Load quantized lm_head sidecar tensors shared from the base checkpoint."""
+    import logging
+    import os
+
+    from .checkpoint.loader import _set_tensor
+
+    logger = logging.getLogger(__name__)
+    source_prefixes = (
+        "lm_head",
+        "model.lm_head",
+        "language_model.lm_head",
+        "model.language_model.lm_head",
+    )
+    target_state = lm_head.state_dict()
+    missing = []
+    source_by_target = {}
+    optional_tensors = {"g_idx", "int4_act_perm", "pre_quant_scale"}
+
+    for target_name in target_state:
+        source_key = next((f"{prefix}.{target_name}"
+                           for prefix in source_prefixes
+                           if f"{prefix}.{target_name}" in shard_map), None)
+        if source_key is None:
+            if target_name not in optional_tensors:
+                missing.append(target_name)
+            continue
+        source_by_target[target_name] = source_key
+
+    if missing:
+        raise ValueError(
+            "DFlash quantized lm_head fallback requires base checkpoint tensors "
+            "for %s; missing %s in %s." % (", ".join(
+                target_state.keys()), ", ".join(missing), base_model_dir))
+
+    loaded_tensors = []
+    for target_name, source_key in source_by_target.items():
+        target_tensor = target_state[target_name]
+
+        source_tensor = _read_dflash_checkpoint_tensor(shard_map[source_key],
+                                                       source_key, device)
+        source_tensor = _normalize_dflash_lm_head_tensor_shape(
+            target_name, source_tensor, target_tensor)
+        loaded_tensors.append((target_name, source_key, source_tensor))
+
+    loaded = []
+    for target_name, source_key, source_tensor in loaded_tensors:
+        if not _set_tensor(model,
+                           f"lm_head.{target_name}",
+                           source_tensor,
+                           mapping=model.config.mapping):
+            raise ValueError(
+                f"Failed to assign DFlash lm_head tensor {target_name!r}.")
+        loaded.append(source_key)
+
+    logger.info(
+        "DFlash lm_head source: quantized base checkpoint buffers from %s",
+        ", ".join(sorted({os.path.basename(shard_map[key])
+                          for key in loaded})))
+
+
+def _read_dflash_checkpoint_tensor(shard_path: str, key: str, device: str):
+    import torch
+    from safetensors import safe_open
+
+    if shard_path.endswith(".bin"):
+        state = torch.load(shard_path, map_location=device, weights_only=True)
+        return state[key]
+    with safe_open(shard_path, framework="pt", device=device) as f:
+        return f.get_tensor(key)
+
+
+def _normalize_dflash_lm_head_tensor_shape(target_name: str, source, target):
+    if source.shape == target.shape:
+        return source
+    if source.numel() == 1 and target.numel() == 1:
+        return source.reshape(target.shape)
+    raise ValueError(
+        "DFlash quantized lm_head shape mismatch for %s: source=%s vs "
+        "lm_head=%s" % (target_name, source.shape, target.shape))
 
 
 def _checkpoint_has_dflash_lm_head(model_dir: str) -> bool:
