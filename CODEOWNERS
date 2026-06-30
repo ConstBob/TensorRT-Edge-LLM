@@ -8,7 +8,7 @@
 # == C++/CUDA runtime & kernel components ==
 /cpp/builder/ @luxiaoz @fans @amberl @zhijial
 /cpp/common/ @fans @zhijial
-/cpp/kernels/ @fans @ruochengj @xiangg
+/cpp/kernels/ @fans @ruochengj @xiangg @samcheng @zhazhang
 /cpp/multimodal/ @amberl @ruochengj @jiahaoz
 /cpp/plugins/ @fans @ruochengj @zhijial
 /cpp/profiling/ @luxiaoz @amberl @ruochengj @zhijial
@@ -37,7 +37,7 @@
 /3rdParty/ @fans @amberl @luxiaoz
 
 # == Kernel source we bring from other projects ==
-/kernelSrcs/ @fans @ruochengj @xiangg
+/kernelSrcs/ @fans @ruochengj @xiangg @samcheng @zhazhang
 
 # == Experimental ==
 /experimental/ @luxiaoz @amberl
