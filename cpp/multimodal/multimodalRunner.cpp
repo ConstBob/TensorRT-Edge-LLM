@@ -24,6 +24,9 @@
 #include "multimodal/nemotronOmniAudioRunner.h"
 #include "multimodal/nemotronOmniViTRunner.h"
 #include "multimodal/phi4mmViTRunner.h"
+#include "multimodal/qwen25vlViTRunner.h"
+#include "multimodal/qwen3omniViTRunner.h"
+#include "multimodal/qwen3vlViTRunner.h"
 #include "multimodal/qwenViTRunner.h"
 #include "profiling/layerProfiler.h"
 #include "profiling/metrics.h"
@@ -95,6 +98,19 @@ bool MultimodalRunner::setContextMemory(rt::Tensor& sharedContextMemory)
     return true;
 }
 
+namespace
+{
+//! \brief Construct a QwenViTRunner-family runner, then run its two-phase initialize().
+template <typename RunnerT>
+std::unique_ptr<RunnerT> makeInitializedQwenViTRunner(
+    std::string const& engineDir, int32_t llmMaxBatchSize, int64_t llmMaxPositionEmbeddings, cudaStream_t stream)
+{
+    auto runner = std::make_unique<RunnerT>(engineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
+    runner->initialize(stream);
+    return runner;
+}
+} // namespace
+
 std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& multimodalEngineDir,
     int32_t llmMaxBatchSize, int64_t llmMaxPositionEmbeddings, cudaStream_t stream)
 {
@@ -119,11 +135,21 @@ std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& mu
     std::string modelTypeStr = jsonConfig["model_type"].get<std::string>();
     multimodal::ModelType modelType = multimodal::stringToModelType(modelTypeStr);
 
-    if (modelType == multimodal::ModelType::QWEN2_VL || modelType == multimodal::ModelType::QWEN2_5_VL
-        || modelType == multimodal::ModelType::QWEN3_VL || modelType == multimodal::ModelType::QWEN3_5)
+    // Qwen vision family: base QwenViTRunner == Qwen2-VL; each later model is a subclass that extends it.
+    if (modelType == multimodal::ModelType::QWEN2_VL)
     {
-        multimodalRunner
-            = std::make_unique<QwenViTRunner>(multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
+        multimodalRunner = makeInitializedQwenViTRunner<QwenViTRunner>(
+            multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
+    }
+    else if (modelType == multimodal::ModelType::QWEN2_5_VL)
+    {
+        multimodalRunner = makeInitializedQwenViTRunner<Qwen25VLViTRunner>(
+            multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
+    }
+    else if (modelType == multimodal::ModelType::QWEN3_VL || modelType == multimodal::ModelType::QWEN3_5)
+    {
+        multimodalRunner = makeInitializedQwenViTRunner<Qwen3VLViTRunner>(
+            multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
     }
     else if (modelType == multimodal::ModelType::QWEN3_OMNI_AUDIO_ENCODER)
     {
@@ -131,9 +157,8 @@ std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& mu
     }
     else if (modelType == multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER)
     {
-        // Qwen3-Omni Vision Encoder: Visual engine should exist
-        multimodalRunner
-            = std::make_unique<QwenViTRunner>(multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
+        multimodalRunner = makeInitializedQwenViTRunner<Qwen3OmniViTRunner>(
+            multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
     }
     else if (modelType == multimodal::ModelType::INTERNVL)
     {

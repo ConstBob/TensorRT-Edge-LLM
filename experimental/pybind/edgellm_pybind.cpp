@@ -243,6 +243,30 @@ py::array_t<float> extractMelToNumpy(py::bytes data, std::string const& feType)
     return out;
 }
 
+//! Build an ImageData (video frame stack) from a (T, H, W, 3) uint8 numpy array. forcecast makes a contiguous
+//! uint8 copy if needed, so the buffer is always row-major and directly copyable into the device-bound tensor.
+imageUtils::ImageData loadVideoFromArray(
+    py::array_t<uint8_t, py::array::c_style | py::array::forcecast> const& array, double fps)
+{
+    py::buffer_info info = array.request();
+    check::check(info.ndim == 4, "video array must be 4D (T, H, W, 3)");
+    check::check(info.shape[3] == 3, "video array must have 3 channels (last dim == 3)");
+    check::check(fps > 0.0, "fps must be positive");
+    int64_t const T = info.shape[0];
+    int64_t const H = info.shape[1];
+    int64_t const W = info.shape[2];
+    int64_t const C = info.shape[3];
+    check::check(T > 0, "video array must have at least one frame (T > 0)");
+
+    rt::Tensor stacked(
+        {T, H, W, C}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8, "pybind::loadVideoFromArray::stacked");
+    std::memcpy(stacked.dataPointer<unsigned char>(), info.ptr, static_cast<size_t>(T * H * W * C));
+
+    imageUtils::ImageData video(std::move(stacked));
+    video.fps = fps;
+    return video;
+}
+
 } // anonymous namespace
 
 PYBIND11_MODULE(_edgellm_runtime, m)
@@ -285,10 +309,16 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def(py::init<>())
         .def_readonly("width", &imageUtils::ImageData::width)
         .def_readonly("height", &imageUtils::ImageData::height)
-        .def_readonly("channels", &imageUtils::ImageData::channels);
+        .def_readonly("channels", &imageUtils::ImageData::channels)
+        .def_readonly("frames", &imageUtils::ImageData::frames)
+        .def_readwrite("fps", &imageUtils::ImageData::fps);
 
     m.def("load_image_from_path", &loadImageFromPath, py::arg("path"), "Load image from file path");
     m.def("load_image_from_bytes", &loadImageFromBytes, py::arg("data"), "Load image from bytes");
+    m.def("load_video_from_paths", &imageUtils::loadVideoFromFrames, py::arg("frame_paths"), py::arg("fps") = 1.0,
+        "Load a video by stacking identically-sized image files into one (T, H, W, 3) ImageData");
+    m.def("load_video_from_array", &loadVideoFromArray, py::arg("array"), py::arg("fps") = 1.0,
+        "Build a video ImageData from a (T, H, W, 3) uint8 numpy array");
 
     // ========================================================================
     // Audio utilities
@@ -473,7 +503,6 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readwrite("max_kv_cache_capacity", &builder::LLMBuilderConfig::maxKVCacheCapacity)
         .def_readwrite("max_verify_tree_size", &builder::LLMBuilderConfig::maxVerifyTreeSize)
         .def_readwrite("max_draft_tree_size", &builder::LLMBuilderConfig::maxDraftTreeSize)
-        .def_readwrite("use_trt_native_ops", &builder::LLMBuilderConfig::useTrtNativeOps)
         .def("__repr__", &builder::LLMBuilderConfig::toString);
 
     py::class_<builder::LLMBuilder>(m, "LLMBuilder", "Build a TensorRT engine from an ONNX directory.")

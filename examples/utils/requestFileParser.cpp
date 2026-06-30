@@ -219,6 +219,25 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                                 imageBuffers.push_back(std::move(image));
                             }
                         }
+                        else if (msgContent.type == "video")
+                        {
+                            // Schema: {"type": "video", "frames": [path1, path2, ...], "fps": 1.0}
+                            // fps is optional (default 1.0); frames are assumed pre-sampled in temporal order.
+                            check::check(contentItemJson.contains("frames") && contentItemJson["frames"].is_array(),
+                                "Video content must have a 'frames' array of frame file paths");
+                            std::vector<std::string> framePaths;
+                            for (auto const& f : contentItemJson["frames"])
+                            {
+                                framePaths.push_back(f.get<std::string>());
+                            }
+                            double const fps = contentItemJson.value("fps", 1.0);
+                            msgContent.content = "video[" + std::to_string(framePaths.size()) + " frames]";
+                            auto video = rt::imageUtils::loadVideoFromFrames(framePaths, fps);
+                            if (video.buffer != nullptr)
+                            {
+                                imageBuffers.push_back(std::move(video));
+                            }
+                        }
                         else if (msgContent.type == "audio")
                         {
                             msgContent.content = contentItemJson["audio"].get<std::string>();
@@ -254,8 +273,9 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                         }
                         else
                         {
-                            throw std::runtime_error(format::fmtstr(
-                                "Content type must be 'text', 'image', 'audio', but got: %s", msgContent.type.c_str()));
+                            throw std::runtime_error(
+                                format::fmtstr("Content type must be 'text', 'image', 'video', 'audio', but got: %s",
+                                    msgContent.type.c_str()));
                         }
                         chatMsg.contents.push_back(msgContent);
                     }
