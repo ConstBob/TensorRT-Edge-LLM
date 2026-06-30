@@ -1549,10 +1549,15 @@ class BlackwellFusedMultiHeadAttentionForward:
                         seqlen_q,
                     )
                 if not continue_cond:
+                    is_last_sequence = False
                     curr_block_coord_o = curr_block_coord
                     mO_qdl_ = mO_qdl
                     mO_gmem_ = mO_gmem
                     if cutlass.const_expr(cum_seqlen_q is not None):
+                        # True when this sequence ends exactly at the end of the packed
+                        # O buffer -> its tail tile's overhang is past o.shape[0], so a
+                        # full-tile TMA store is masked out of bounds by the descriptor.
+                        is_last_sequence = cuseqlen_q + seqlen_q == mO_qdl.shape[0]
                         logical_offset_mO = (
                             cuseqlen_q,
                             0,
@@ -1587,7 +1592,23 @@ class BlackwellFusedMultiHeadAttentionForward:
                     o0_handle = corr_epi_consumer.wait_and_advance()
                     # 2. copy O0 to gmem
                     o0_row = o0_coord * self.epi_tile[0]
+                    # Full tile (all epi_tile[0] rows valid) -> always TMA.
                     o0_use_tma = o0_row + self.epi_tile[0] <= seqlen_q
+                    # Promote a PARTIAL tile to TMA only for the last sequence. The
+                    # TMA store descriptor (make_tiled_tma_atom over `o`) carries the
+                    # output tensor's global bounds and masks any access past them in
+                    # hardware. For the last sequence seqlen_q == o.shape[0], so the
+                    # tile's overhang rows (>= seqlen_q) fall outside the descriptor
+                    # and are dropped -> safe to use the cheap full-tile TMA.
+                    # For a non-last sequence the overhang rows are still inside `o`
+                    # (they are the next sequence's rows in the packed buffer), so TMA
+                    # would overwrite them -> not promoted; handled by store_o_tail below.
+                    if (
+                        not o0_use_tma
+                        and is_last_sequence
+                        and o0_row < seqlen_q
+                    ):
+                        o0_use_tma = True
                     if o0_use_tma:
                         cute.copy(tma_atom_o, tOsO[None, 0], tOgO[None, o0_coord])
                         cute.arch.cp_async_bulk_commit_group()
@@ -1601,13 +1622,28 @@ class BlackwellFusedMultiHeadAttentionForward:
                     # 2. copy O1 to gmem
                     o1_row = o1_coord * self.epi_tile[0]
                     o1_use_tma = o1_row + self.epi_tile[0] <= seqlen_q
+                    # Same partial-tile promotion as O0: last-sequence overhang is
+                    # masked out of bounds by the TMA descriptor, so it's safe to TMA.
+                    if (
+                        not o1_use_tma
+                        and is_last_sequence
+                        and o1_row < seqlen_q
+                    ):
+                        o1_use_tma = True
                     if o1_use_tma:
                         cute.copy(tma_atom_o, tOsO[None, 1], tOgO[None, o1_coord])
                         cute.arch.cp_async_bulk_commit_group()
-                    else:
+                    elif o1_row < seqlen_q:
+                        # Partial tile: some rows valid -> predicated tail store.
                         self.store_o_tail(
                             sO, mO_gmem_, o1_row, seqlen_q, curr_block_coord_o[2], 1
                         )
+                    # else: o1_row >= seqlen_q -> O1 tile is entirely OOB padding (e.g. ViT
+                    # seqlen_q <= mma_tiler[0]); nothing to store. The corr->epi token was
+                    # already consumed via wait_and_advance() above and o1_handle is
+                    # released below, so the pipeline handshake is unchanged. This elides a
+                    # no-op store_o_tail loop (epi_tile[0]*epi_tile[1] elements, every row
+                    # failing global_row < seqlen_q) from the epilogue completion tail.
 
                     # Ensure O0 buffer is ready to be released
                     if o0_use_tma:
@@ -1883,13 +1919,51 @@ class BlackwellFusedMultiHeadAttentionForward:
         if valid_rows > self.epi_tile[0]:
             valid_rows = self.epi_tile[0]
         if valid_rows > 0:
-            valid_elems = valid_rows * self.head_dim
-            for elem_idx in cutlass.range(
-                lane_idx, valid_elems, self.threads_per_warp, unroll=1
-            ):
-                row = elem_idx // self.head_dim
-                col = elem_idx - row * self.head_dim
-                mO_gmem[row_start + row, col, head_coord] = sO[row, col, stage]
+            copy_bits = 128
+            elems_per_copy = copy_bits // self.o_dtype.width
+            copy_atom_stg = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                self.o_dtype,
+                num_bits_per_copy=copy_bits,
+            )
+            thr_layout = cute.make_ordered_layout(
+                (4, self.threads_per_warp // 4),
+                order=(1, 0),
+            )
+            val_layout = cute.make_layout((1, elems_per_copy))
+            tiled_copy = cute.make_tiled_copy_tv(copy_atom_stg, thr_layout, val_layout)
+            thr_copy = tiled_copy.get_slice(lane_idx)
+
+            sO_stage = sO[None, None, stage]
+            mO_head = mO_gmem[None, None, head_coord]
+            mO_tail = cute.domain_offset((row_start, 0), mO_head)
+            gO_tail = cute.local_tile(mO_tail, self.epi_tile, (0, 0))
+
+            thrS = thr_copy.partition_S(sO_stage)  # SMEM source partition
+            thrC = thr_copy.partition_D(gO_tail)   # GMEM dest partition
+            cO = cute.make_identity_tensor(self.epi_tile)
+            tOcO = thr_copy.partition_S(cO)
+
+            # cute.copy expects pred shape (1, rest_m, rest_k).
+            # Gate on BOTH coords: rows may be partial at a varlen tail, and
+            # columns may be partial because epi_tile[1] is the MMA-padded head dim
+            # (e.g. 72 -> 80) while the gmem head stride is the real head_dim.
+            num_rest_m = cute.size(thrC.shape[1])
+            num_rest_k = cute.size(thrC.shape[2])
+            frgPred = cute.make_rmem_tensor(
+                cute.make_layout((1, num_rest_m, num_rest_k)),
+                cutlass.Boolean,
+            )
+            bound = (valid_rows, self.head_dim)
+            for rest_m in cutlass.range_constexpr(num_rest_m):
+                for rest_k in cutlass.range_constexpr(num_rest_k):
+                    frgPred[0, rest_m, rest_k] = cute.elem_less(
+                        tOcO[0, rest_m, rest_k], bound
+                    )
+
+            # SMEM -> GMEM, predicated per 128-bit atom. cute.copy iterates over all remaining
+            # modes (rest_m, rest_k) internally, so one call covers the tile.
+            cute.copy(copy_atom_stg, thrS, thrC, pred=frgPred)
 
     @cute.jit
     def softmax_step(
