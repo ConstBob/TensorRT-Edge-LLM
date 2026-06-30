@@ -371,12 +371,6 @@ Qwen3.5 and Qwen3.6 checkpoints are unified text+VLM models. The same checkpoint
 | Model Series | Transformers Class | `tensorrt_edgellm` Handling | Supported Precisions |
 |--------------|--------------------|-----------------------|----------------------|
 | [Nemotron-Omni](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4/blob/main/modeling.py) | Checkpoint architecture `NemotronH_Nano_Omni_Reasoning_V3`; LLM is Nemotron-H compatible with [`NemotronHForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/nemotron_h/modeling_nemotron_h.py) | `NemotronHCausalLM` + `NemotronOmniVisualModel` + `NemotronOmniAudioModel` | NVFP4 only |
-| Qwen3-Omni (dense 4B) | Checkpoint architecture `Qwen3OmniForConditionalGeneration` (`model_type=qwen3_omni`); available in `transformers` 5.x (load in a dedicated venv — see the [Omni example](../examples/omni.md)) | `Qwen3OmniLanguageModel` (dense Thinker + Talker) + `Qwen3OmniVisualModel` + `Qwen3OmniAudioEncoder` + `Code2WavModel` | FP16, INT4 GPTQ (external gptqmodel) |
-| Qwen3-Omni-MoE (30B-A3B) | Checkpoint architecture `Qwen3OmniMoeForConditionalGeneration` (`model_type=qwen3_omni_moe`); available in `transformers` 5.x (load in a dedicated venv — see the [Omni example](../examples/omni.md)) | `Qwen3OmniMoeThinkerCausalLM` + `Qwen3OmniMoeTalkerCausalLM` + `Qwen3OmniVisualModel` + `Qwen3OmniAudioEncoder` + `Code2WavModel` | NVFP4 (Thinker + Talker text-MoE; visual / audio / Code2Wav / Talker projections stay FP16) |
-
-The full Qwen3-Omni quantize → export → build → inference workflow (six
-engines: Thinker, Talker, CodePredictor, audio encoder, visual encoder,
-Code2Wav) is documented in the [Omni example](../examples/omni.md).
 
 <details>
 <summary><b>Nemotron-Omni</b> checkpoints</summary>
@@ -385,38 +379,9 @@ Code2Wav) is documented in the [Omni example](../examples/omni.md).
 
 </details>
 
-<details>
-<summary><b>Qwen3-Omni (dense 4B)</b> checkpoints</summary>
-
-**Original:**
-- [Qwen/Qwen3-Omni-4B-Instruct-multilingual](https://huggingface.co/Qwen/Qwen3-Omni-4B-Instruct-multilingual)
-
-INT4 GPTQ checkpoints are produced **outside** trt-edge-llm with
-[gptqmodel](https://github.com/modelcloud/gptqmodel) 4.0.0+ (only the Thinker
-and Talker LLM transformer layers are quantized; visual / audio / Code2Wav /
-Talker projection sidecars stay BF16). trt-edge-llm's exporter auto-detects the
-embedded `quantization_config` and selects the INT4 plugin path. Dense 4B NVFP4
-is not currently exposed.
-
-</details>
-
-<details>
-<summary><b>Qwen3-Omni-MoE (30B-A3B)</b> checkpoints</summary>
-
-**Original:**
-- [Qwen/Qwen3-Omni-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct)
-
-NVFP4 checkpoints are produced in-tree by `tensorrt-edgellm-quantize qwen3-omni`,
-which jointly calibrates the Thinker and Talker text-MoE backbones in a single
-ModelOpt pass and writes standalone Thinker (`model_type=qwen3_omni_moe_text`)
-and Talker (`model_type=qwen3_omni_moe_talker`) checkpoints. See the
-[Omni example](../examples/omni.md) for the calibration command.
-
-</details>
-
 ---
 
-Qwen3-ASR and Qwen3-TTS use checkpoint architecture names that are not present in the installed `transformers==5.3.0` package, so TensorRT Edge-LLM handles their speech/audio/talker/Code2Wav components with local model implementations. Qwen3-TTS support is limited to the CustomVoice checkpoints listed above. The Qwen3-Omni dense and MoE architectures (`Qwen3OmniForConditionalGeneration` / `Qwen3OmniMoeForConditionalGeneration`) are available in `transformers` 5.x — load them in a dedicated virtual environment, as described in the [Omni example](../examples/omni.md).
+Qwen3-ASR and Qwen3-TTS use checkpoint architecture names that are not present in the installed `transformers==5.3.0` package, so TensorRT Edge-LLM handles their speech/audio/talker/Code2Wav components with local model implementations. Qwen3-TTS support is limited to the CustomVoice checkpoints listed above.
 
 ## EAGLE3 Draft Models
 

@@ -38,7 +38,7 @@ link:audio/tts.adoc[TTS] component pages.
 | Pre-attention, pre-FFN, and final norm placement.
 
 | link:attention/[attention/]
-| Causal self-attention and KV-cache binding contract.
+| Causal self-attention and plugin/TRT-native binding contract.
 
 | link:kv_cache/[kv_cache/]
 | Prefill/decode cache lifecycle and prefix reuse.

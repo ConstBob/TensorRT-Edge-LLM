@@ -248,7 +248,7 @@ void parseDualRopeFields(Json const& configJson, LLMEngineConfig& cfg)
 //! the C++ builder never emits it inside builder_config). Also parses the
 //! common builder_config batch/input/kv limits and RoPE configuration.
 //! Engine-type-specific fields (reduced vocab, hybrid state, SpecDecode
-//! capacities, LoRA) are filled in by the calling parser
+//! capacities, LoRA, trt_native_ops) are filled in by the calling parser
 //! around this helper.
 void parseCoreFields(Json const& configJson, LLMEngineConfig& cfg)
 {
@@ -445,6 +445,12 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
         parseRequiredStateDtype(configJson, "conv_state_dtype", cfg.convStateDtype);
     }
 
+    // TRT native ops flag.
+    if (bc.contains("trt_native_ops"))
+    {
+        cfg.useTrtNativeOps = bc["trt_native_ops"].get<bool>();
+    }
+
     // Base-specific positivity checks (beyond parseCoreFields's core set).
     requirePositive(cfg.rotaryDim, "rotary_dim");
     requirePositive(cfg.vocabSize, "vocab_size");
@@ -599,8 +605,9 @@ std::string formatEngineConfig(LLMEngineConfig const& cfg)
        << " headDim=" << cfg.headDim << " rotaryDim=" << cfg.rotaryDim << " maxBatch=" << cfg.maxSupportedBatchSize
        << " maxInputLen=" << cfg.maxSupportedInputLength << " maxKVCapacity=" << cfg.maxKVCacheCapacity
        << " pleEnabled=" << cfg.pleEnabled << " numPleInputs=" << cfg.numPleInputs
-       << " pleHiddenSize=" << cfg.pleHiddenSize << " isSpecDecodeBase=" << cfg.isSpecDecodeBase
-       << " specDecodeType=" << static_cast<int>(cfg.specDecodeType) << " loraRank=" << cfg.maxSupportedLoraRank;
+       << " pleHiddenSize=" << cfg.pleHiddenSize << " useTrtNativeOps=" << cfg.useTrtNativeOps
+       << " isSpecDecodeBase=" << cfg.isSpecDecodeBase << " specDecodeType=" << static_cast<int>(cfg.specDecodeType)
+       << " loraRank=" << cfg.maxSupportedLoraRank;
     if (cfg.useDualRope)
     {
         ss << " useDualRope=true" << " slidingRotaryDim=" << cfg.slidingRotaryDim
@@ -653,8 +660,8 @@ InferenceDims LLMEngineConfig::prefillDims(int64_t batch, int64_t seqLen, bool k
     // and read uninitialized buffer bits, producing garbage outputs.
     //
     // startIndexLen=0 is the plugin-path sentinel for "initial prefill of an
-    // empty KV cache"; chunked prefill uses [batch].
-    int64_t const startIndexLen = kvCacheAllEmpty ? 0 : batch;
+    // empty KV cache"; chunked prefill and TRT-native-ops engines use [batch].
+    int64_t const startIndexLen = (!useTrtNativeOps && kvCacheAllEmpty) ? 0 : batch;
     return InferenceDims{
         /*.batch=*/batch,
         /*.seqLen=*/seqLen,
@@ -785,10 +792,15 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
     }
 
     // KV cache binding: validated on layer 0; all layers share the same dtype.
-    // Plugin-path engines use a combined `past_key_values_%d` binding.
+    // TRT-native-ops engines split KV into separate `k_cache_%d` / `v_cache_%d`
+    // bindings; plugin-path engines use a combined `past_key_values_%d`. Query
+    // whichever the engine actually exposes — asking for the wrong name returns
+    // a spurious FLOAT32 (TRT's default for an unknown binding).
     if (config.numAttentionLayers > 0)
     {
-        std::string const kvBindingName = binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/true);
+        std::string const kvBindingName = config.useTrtNativeOps
+            ? binding_names::formatKCacheName(/*layerIdx=*/0, /*isPast=*/true)
+            : binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/true);
         ELLM_CHECK(engineHasTensor(executor, kvBindingName),
             std::string("Missing KV cache binding (") + engineLabel + "): expected '" + kvBindingName + "'.");
         auto const engineDtype = executor.getBindingDataType(kvBindingName.c_str());

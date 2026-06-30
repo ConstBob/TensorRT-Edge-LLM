@@ -465,8 +465,9 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     DecodingStrategy& decodingStrategy = mDecoderRegistry->select(request);
     bool const enableSpecDecode = decodingStrategy.isSpeculative();
 
-    // Current speculative decoders only support greedy-compatible sampling.
-    // Warn here; active spec-decode requests are normalized when context sampling params are populated below.
+    // Current speculative decoders only support greedy-compatible requests.
+    // DecoderRegistry falls back to vanilla for non-greedy requests; if a
+    // speculative decoder is selected here, normalize sampling params to greedy.
     bool const hasNonGreedySampling = shouldUseNonGreedySampling(request.temperature, request.topK, request.topP);
     if (enableSpecDecode && hasNonGreedySampling)
     {
@@ -882,7 +883,7 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
                 "Alpamayo1ActionRunner requires a Qwen3-VL vision runner but a different vision runner is loaded.");
             return false;
         }
-        // The Qwen3-VL runner is a Qwen3VLViTRunner (derives from QwenViTRunner); upcast to read the base rope deltas.
+        // MultimodalRunner::create() uses QwenViTRunner only for Qwen3-VL.
         auto* qwenVision = static_cast<rt::QwenViTRunner*>(mVisionRunner.get());
         std::vector<int64_t> const& ropeDeltas = qwenVision->getMropeRopeDeltasPerBatch();
         rt::HybridCacheManager& kvcache = *mSharedResources->cacheManagers[0];
@@ -1149,8 +1150,8 @@ bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context)
     mSharedResources->cacheManagers[0]->commitSequenceLength(mPipelineIO->contextLengths, context.stream);
 
     // Sampling from the prefill stage logits follows the same policy as vanilla decoding.
-    // Speculative decoders reach this code with greedy-compatible context params because
-    // handleRequest normalizes active spec-decode requests before decoding.
+    // Speculative decoders reach this code only for greedy-compatible requests; non-greedy
+    // requests are routed to the vanilla decode path by handleRequest.
     check::check(mSamplingIndices.reshape({activeBatchSize, 1}), "Tensor reshape failed");
     if (shouldUseNonGreedySampling(context.temperature, context.topK, context.topP))
     {

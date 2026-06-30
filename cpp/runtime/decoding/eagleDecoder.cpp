@@ -128,6 +128,11 @@ EagleDecoder::EagleDecoder(DecodingRuntimeContext& runtime, std::filesystem::pat
     }
 }
 
+char const* EagleDecoder::unsupportedReason(LLMGenerationRequest const& request) const noexcept
+{
+    return spec_decode_utils::isGreedyCompatible(request);
+}
+
 int64_t EagleDecoder::getRequiredContextMemorySize() const noexcept
 {
     return mDraftExecutor ? mDraftExecutor->getRequiredContextMemorySize() : 0;

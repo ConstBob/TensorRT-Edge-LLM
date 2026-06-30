@@ -32,10 +32,12 @@ box ModelOpt would skip the experts entirely. This driver:
    ``model_type="qwen3_omni_moe_text"``, consumable by
    :class:`llm_loader.Qwen3MoeNvfp4CutedslCausalLM`.
 
-This Thinker-only path is an internal helper (no CLI subcommand); the
-Thinker NVFP4 checkpoint is normally produced by
-``tensorrt-edgellm-quantize qwen3-omni`` as part of the joint
-Thinker+Talker pass.
+Usage::
+
+    python -m experimental.quantization.cli qwen3-omni-thinker \\
+        --model_dir Qwen/Qwen3-Omni-30B-A3B-Instruct \\
+        --output_dir ./out_thinker_nvfp4 \\
+        --num_samples 512
 """
 
 import json

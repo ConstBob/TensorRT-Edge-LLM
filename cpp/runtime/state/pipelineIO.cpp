@@ -138,6 +138,23 @@ void buildTensorMap(
     auto& kvMgr = cacheMgr.getKVCacheManager();
     auto& mambaMgr = cacheMgr.getMambaCacheManager();
 
+    // The split K/V view cache only needs to exist in TRT-native mode.
+    // `KVCacheManager::getSeparateKVCache` returns views by value, so we park
+    // them in stable-address storage (res.kCacheViews / res.vCacheViews).
+    if (cfg.useTrtNativeOps)
+    {
+        if (static_cast<int32_t>(res.kCacheViews.size()) <= kvCacheIndex)
+        {
+            res.kCacheViews.resize(kvCacheIndex + 1);
+            res.vCacheViews.resize(kvCacheIndex + 1);
+        }
+        int32_t const numAttn = static_cast<int32_t>(cfg.kvLayerConfigs.size());
+        res.kCacheViews[kvCacheIndex].clear();
+        res.vCacheViews[kvCacheIndex].clear();
+        res.kCacheViews[kvCacheIndex].reserve(numAttn);
+        res.vCacheViews[kvCacheIndex].reserve(numAttn);
+    }
+
     int32_t localAttnIdx = 0;
     int32_t localMambaIdx = 0;
     for (int32_t absIdx = 0; absIdx < static_cast<int32_t>(cfg.layerTypes.size()); ++absIdx)
@@ -150,11 +167,30 @@ void buildTensorMap(
                 ? cfg.kvSharingDonors[localAttnIdx]
                 : -1;
 
-            // Plugin (combined KV): bind to donor's tensor if shared, else own tensor.
-            auto& combinedKV
-                = (donorIdx >= 0) ? kvMgr.getCombinedKVCache(donorIdx) : kvMgr.getCombinedKVCache(localAttnIdx);
-            map.set(binding_names::formatKVCacheName(localAttnIdx, /*isPast=*/true), combinedKV);
-            map.set(binding_names::formatKVCacheName(localAttnIdx, /*isPast=*/false), combinedKV); // alias: in-place
+            if (!cfg.useTrtNativeOps)
+            {
+                // Plugin (combined KV): bind to donor's tensor if shared, else own tensor.
+                auto& combinedKV
+                    = (donorIdx >= 0) ? kvMgr.getCombinedKVCache(donorIdx) : kvMgr.getCombinedKVCache(localAttnIdx);
+                map.set(binding_names::formatKVCacheName(localAttnIdx, /*isPast=*/true), combinedKV);
+                map.set(
+                    binding_names::formatKVCacheName(localAttnIdx, /*isPast=*/false), combinedKV); // alias: in-place
+            }
+            else
+            {
+                // TRT-native (split K/V): views returned by value → park in the view cache.
+                auto& kViews = res.kCacheViews[kvCacheIndex];
+                auto& vViews = res.vCacheViews[kvCacheIndex];
+                int32_t const sourceIdx = (donorIdx >= 0) ? donorIdx : localAttnIdx;
+                auto [kT, vT] = kvMgr.getSeparateKVCache(sourceIdx);
+                kViews.push_back(std::move(kT));
+                vViews.push_back(std::move(vT));
+
+                map.set(binding_names::formatKCacheName(localAttnIdx, /*isPast=*/true), kViews.back());
+                map.set(binding_names::formatKCacheName(localAttnIdx, /*isPast=*/false), kViews.back()); // alias
+                map.set(binding_names::formatVCacheName(localAttnIdx, /*isPast=*/true), vViews.back());
+                map.set(binding_names::formatVCacheName(localAttnIdx, /*isPast=*/false), vViews.back()); // alias
+            }
             ++localAttnIdx;
         }
         else if (cfg.layerTypes[absIdx] == rt::HybridCacheManager::LayerType::kMamba)

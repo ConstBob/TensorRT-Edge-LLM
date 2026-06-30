@@ -60,9 +60,10 @@ struct InferenceDims
     int64_t ropeBatch;     //!< RoPE broadcast dim (1 for non-MRope; batch for MRope)
     int64_t packedMaskLen; //!< divUp(attnMaskSeqLen, 32) for SpecDecode masks; else 1
     //! Shape length for `kvcache_start_index`. Zero is the engine's sentinel
-    //! for "initial prefill of an empty KV cache"; `batch` means "use these
-    //! per-batch start offsets" for chunked prefill, decode, verify, and
-    //! accept. Zero is a legitimate, engine-meaningful value for this dim.
+    //! for "initial prefill of an empty KV cache" (plugin-path engines only);
+    //! `batch` means "use these per-batch start offsets" for chunked prefill,
+    //! decode, verify, and accept. TRT-native-ops engines always use
+    //! `batch`. Zero is a legitimate, engine-meaningful value for this dim.
     int64_t startIndexLen;
 };
 

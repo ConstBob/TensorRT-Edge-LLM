@@ -932,7 +932,7 @@ def build_custom_translation_table() -> dict:
         _nvfp4_moe_plugin_geforce_translation,
         torch.ops.trt_edgellm.dflash_target_kv_cache_update.default:
         _dflash_target_kv_cache_update_translation,
-        # TRT native attention ops (used by Alpamayo)
+        # TRT native attention ops (used by EdgeLLMAttentionTRTNative / Alpamayo)
         torch.ops.trt.rope_onnx.default:
         _rope_onnx_translation,
         torch.ops.trt.kv_cache_update_onnx.default:

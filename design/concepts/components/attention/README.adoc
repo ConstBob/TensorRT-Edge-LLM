@@ -5,9 +5,10 @@
 == Overview
 
 Self-attention lets each token attend to previous tokens in the sequence.
-Edge-LLM implements decoder attention through `AttentionPlugin`, which fuses
-Q/K/V handling, RoPE application, KV-cache read/write, and scaled dot-product
-attention into an optimized TensorRT path.
+Edge-LLM implements decoder attention through either `AttentionPlugin` or a
+TRT-native graph. The plugin path fuses Q/K/V handling, RoPE
+application, KV-cache read/write, and scaled dot-product attention into an
+optimized TensorRT path.
 
 In this component, **attention** means the decoder block's softmax
 self-attention sublayer. **Decode** means the generation phase after prefill,
@@ -47,10 +48,14 @@ variations documented here are:
   accepted ancestors.
   EAGLE3 is the speculative-decoding workflow that uses this mode; it is not a
   model family.
-- **KV cache bindings**: decoder attention binds combined per-layer KV tensors
-  `past_key_values_i` / `present_key_values_i`. `AttentionPlugin` also has a
-  mandatory `rope_rotary_cos_sin` input; no-RoPE models satisfy that binding
-  with an identity cos/sin cache.
+- **Backend binding mode**: plugin and TRT-native paths implement the same
+  logical decoder-attention semantics, but they do not use the same engine
+  bindings. Plugin mode binds combined per-layer KV tensors
+  `past_key_values_i` / `present_key_values_i`; TRT-native mode binds split
+  `k_cache_i` / `v_cache_i` inputs and `present_k_cache_i` /
+  `present_v_cache_i` outputs. `AttentionPlugin` also has a mandatory
+  `rope_rotary_cos_sin` input; no-RoPE models satisfy that binding with an
+  identity cos/sin cache.
 
 == Architecture
 

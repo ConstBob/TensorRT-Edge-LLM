@@ -531,13 +531,13 @@ def _export_llm(model_dir: str,
                  if model_type == "alpamayo_r1" else None)
 
     # ModelOpt-quantized Qwen3-MoE / Qwen3-Omni-MoE checkpoints store per-expert
-    # weights under ``mlp.experts.{j}.`` (modelopt's fused-expert export, for
-    # both bare Qwen3-MoE and Qwen3-Omni Thinker / Talker). The model wraps the
-    # per-expert ModuleList behind a private ``_experts`` attribute, so a
-    # one-segment insertion is required for the load to find the buffers.
-    # Without this remap the loader silently skips every expert weight,
-    # producing a Thinker engine ~3 GB (attention + norms only) instead of the
-    # expected ~17 GB.
+    # weights under ``mlp.experts.experts.{j}.`` (Qwen3-Omni Thinker / Talker,
+    # ``_PerExpertLinears`` wraps an inner ``self.experts`` ModuleList) or
+    # ``mlp.experts.{j}.`` (bare Qwen3 MoE). The model wraps the per-expert
+    # ModuleList behind a private ``_experts`` attribute, so a one-segment
+    # insertion is required for the load to find the buffers. Without this
+    # remap the loader silently skips every expert weight, producing a Thinker
+    # engine ~3 GB (attention + norms only) instead of the expected ~17 GB.
     if key_remap is None and model_type in ("qwen3_omni_moe_text",
                                             "qwen3_omni_moe_talker",
                                             "qwen3_omni_moe", "qwen3_moe"):
@@ -832,16 +832,6 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
                 vc_out = dict(vc_out)
                 vc_out["num_position_embeddings"] = _grid * _grid
                 vis_cfg_out["vision_config"] = vc_out
-        if model_type == "qwen3_omni":
-            # Qwen3-Omni video temporal MRoPE scale. HF keeps it at thinker_config
-            # level (not vision_config), so copy it into vision_config where the C++
-            # Qwen3OmniViTRunner reads it.
-            _pips = _thinker_cfg.get("position_id_per_seconds",
-                                     config.get("position_id_per_seconds"))
-            if _pips is not None:
-                vis_cfg_out["vision_config"] = dict(
-                    vis_cfg_out["vision_config"])
-                vis_cfg_out["vision_config"]["position_id_per_seconds"] = _pips
     # Copy preprocessor_config.json to the visual output dir so the C++
     # runtime can find patch_size, image_mean, image_std, etc.  Applies to
     # every visual family (Qwen VL, InternVL, Phi-4mm) — the C++ visual

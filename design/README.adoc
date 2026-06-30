@@ -44,7 +44,7 @@ directory.
 | link:concepts/components/audio/[audio/] | Audio workflow index with separate ASR and TTS component pages.
 | link:concepts/components/positional_encoding/[positional_encoding/] | RoPE-family position caches and MRoPE when configured.
 | link:concepts/components/normalization/[normalization/] | Pre-attention, pre-FFN, and final norm placement.
-| link:concepts/components/attention/[attention/] | Causal self-attention and KV-cache binding contract.
+| link:concepts/components/attention/[attention/] | Causal self-attention and plugin/TRT-native binding contract.
 | link:concepts/components/kv_cache/[kv_cache/] | Prefill/decode cache lifecycle and prefix reuse.
 | link:concepts/components/state_space/[state_space/] | State-space and linear-attention sequence mixing with recurrent state cache for hybrid decoders.
 | link:concepts/components/ffn/[ffn/] | Dense, gated, and quantized MLP position in decoder blocks.

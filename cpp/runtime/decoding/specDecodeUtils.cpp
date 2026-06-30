@@ -20,6 +20,7 @@
 #include "common/cudaUtils.h"
 #include "common/logger.h"
 #include "runtime/config/llmEngineConfig.h"
+#include "sampler/sampling.h"
 
 #include <filesystem>
 #include <stdexcept>
@@ -31,6 +32,15 @@ namespace rt
 {
 namespace spec_decode_utils
 {
+char const* isGreedyCompatible(LLMGenerationRequest const& request) noexcept
+{
+    if (shouldUseNonGreedySampling(request.temperature, request.topK, request.topP))
+    {
+        return "speculative decoding currently supports greedy-compatible sampling only";
+    }
+    return nullptr;
+}
+
 std::unique_ptr<EngineExecutor> loadDraftEngine(std::filesystem::path const& engineDir, DeploymentConfig& deployment)
 {
     std::filesystem::path const draftEnginePath = engineDir / "spec_draft.engine";

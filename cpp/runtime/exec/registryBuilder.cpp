@@ -77,7 +77,7 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
     // uses shape [0] as a sentinel for "initial prefill of an empty KV cache";
     // chunked prefill, decode, and verification use [batch] start offsets.
     // InferenceDims::startIndexLen carries this per-phase: prefillDims sets it to 0
-    // when kvCacheAllEmpty, else batch; all other recipes
+    // when (!useTrtNativeOps && kvCacheAllEmpty), else batch; all other recipes
     // set it to batch. Shape 0 is engine-valid here — TRT reads 0 bytes from
     // the bound address and the engine branches to the initial-prefill path.
     reg.addTensor({binding_names::kKVCacheStartIndex, TensorIO::kInput, nvinfer1::DataType::kINT32,
@@ -107,11 +107,24 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
             auto addKVCacheTensor = [&](char const* tmpl, TensorIO io, std::vector<ShapeDim> const& shape) {
                 reg.addTensor({std::string(tmpl) + "_" + std::to_string(localAttnIdx), io, cfg.kvCacheDtype, shape});
             };
-            // Plugin: combined KV, 5D [batch, 2, numKVHeads, kv_len, headDim]
-            std::vector<ShapeDim> const shape{sym(&InferenceDims::batch), fixed(2), fixed(lc.numKVHeads),
-                sym(&InferenceDims::kvLen), fixed(lc.headDim)};
-            addKVCacheTensor(binding_names::kPastKeyValuesTemplate, TensorIO::kInput, shape);
-            addKVCacheTensor(binding_names::kPresentKeyValuesTemplate, TensorIO::kOutput, shape);
+            if (cfg.useTrtNativeOps)
+            {
+                // TRT native: separate K / V, 4D [batch, numKVHeads, kv_len, headDim]
+                std::vector<ShapeDim> const shape{
+                    sym(&InferenceDims::batch), fixed(lc.numKVHeads), sym(&InferenceDims::kvLen), fixed(lc.headDim)};
+                addKVCacheTensor(binding_names::kKCacheTemplate, TensorIO::kInput, shape);
+                addKVCacheTensor(binding_names::kPresentKCacheTemplate, TensorIO::kOutput, shape);
+                addKVCacheTensor(binding_names::kVCacheTemplate, TensorIO::kInput, shape);
+                addKVCacheTensor(binding_names::kPresentVCacheTemplate, TensorIO::kOutput, shape);
+            }
+            else
+            {
+                // Plugin: combined KV, 5D [batch, 2, numKVHeads, kv_len, headDim]
+                std::vector<ShapeDim> const shape{sym(&InferenceDims::batch), fixed(2), fixed(lc.numKVHeads),
+                    sym(&InferenceDims::kvLen), fixed(lc.headDim)};
+                addKVCacheTensor(binding_names::kPastKeyValuesTemplate, TensorIO::kInput, shape);
+                addKVCacheTensor(binding_names::kPresentKeyValuesTemplate, TensorIO::kOutput, shape);
+            }
             ++localAttnIdx;
         }
         else // kMamba

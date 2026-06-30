@@ -453,6 +453,12 @@ bool LLMBuilder::parseConfig()
             globalHeadSize);
     }
 
+    // Read trt_native_ops flag from config if present
+    if (mModelConfig.contains("trt_native_ops"))
+    {
+        mBuilderConfig.useTrtNativeOps = mModelConfig["trt_native_ops"].get<bool>();
+    }
+
     return true;
 }
 
@@ -621,6 +627,29 @@ bool LLMBuilder::setupVanillaProfiles(
 bool LLMBuilder::setupSpecDecodeProfiles(
     nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
 {
+    // TRT-native-ops + speculative decoding is a partially-wired path: the Python export
+    // emits a 4D bool `attention_mask` [batch, 1, seq_len, seq_len + past_len]
+    // (see `llm_model_trtnative.py` with `is_eagle_base=True`), and only the
+    // `prepareEagleBaseTreeDecodingInputsTrtNative` kernel exists
+    // (`cpp/kernels/speculative/eagleUtilKernels.{h,cu}`). However the
+    // builder's speculative profile setup below and the runtime dispatch in
+    // spec-decode runtime paths
+    // hardcode the plugin-path 3D packed-INT32 mask layout. Attempting to
+    // build this combination produces a cryptic TRT error:
+    //
+    //   "Dynamic-shaped input tensor attention_mask has 4 dimensions but
+    //    profile 0 has 3 dimensions"
+    //
+    // Fail fast with an actionable message until the full TRT-native + spec-decode
+    // path (builder profile + registry + runtime dispatch) is completed.
+    if (mBuilderConfig.useTrtNativeOps && (mBuilderConfig.specBase || mBuilderConfig.specDraft))
+    {
+        LOG_ERROR(
+            "TRT-native-ops + speculative decoding is not yet supported. "
+            "Re-export the engine ONNX with trt_native_ops=False (plugin attention path).");
+        return false;
+    }
+
     bool result = true;
 
     int const maxTokens = mBuilderConfig.specDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
@@ -1001,21 +1030,49 @@ bool LLMBuilder::setupKVCacheProfiles(
     nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
 {
     bool result = true;
-    // Plugin path: combined KV cache with "2" dimension
-    // KV cache shape is [B, 2, num_kv_heads, 0 to max_kv_cache_capacity, head_dim]
-    for (int i = 0; i < mNbKVCacheInputs; ++i)
+    if (mBuilderConfig.useTrtNativeOps)
     {
-        int64_t layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
-        nvinfer1::Dims minKVCacheShape = createDims({1, 2, mNumKVHeads, 0, layerHeadSize});
-        nvinfer1::Dims optKVCacheShape = createDims(
-            {mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
-        nvinfer1::Dims maxKVCacheShape = createDims(
-            {mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
+        // TRT attention: separate K and V caches without the "2" dimension
+        // Shape: [batch, num_kv_heads, seq_len, head_dim]
+        nvinfer1::Dims minKVCacheShape = createDims({1, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize});
+        nvinfer1::Dims optKVCacheShape
+            = createDims({mBuilderConfig.maxBatchSize, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize});
+        nvinfer1::Dims maxKVCacheShape
+            = createDims({mBuilderConfig.maxBatchSize, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize});
 
-        result &= setOptimizationProfile(&contextProfile, binding_names::formatKVCacheName(i, true).c_str(),
-            minKVCacheShape, optKVCacheShape, maxKVCacheShape);
-        result &= setOptimizationProfile(&generationProfile, binding_names::formatKVCacheName(i, true).c_str(),
-            minKVCacheShape, optKVCacheShape, maxKVCacheShape);
+        for (int i = 0; i < mNbKVCacheInputs; ++i)
+        {
+            // K cache bindings
+            result &= setOptimizationProfile(&contextProfile, binding_names::formatKCacheName(i, true).c_str(),
+                minKVCacheShape, optKVCacheShape, maxKVCacheShape);
+            result &= setOptimizationProfile(&generationProfile, binding_names::formatKCacheName(i, true).c_str(),
+                minKVCacheShape, optKVCacheShape, maxKVCacheShape);
+
+            // V cache bindings
+            result &= setOptimizationProfile(&contextProfile, binding_names::formatVCacheName(i, true).c_str(),
+                minKVCacheShape, optKVCacheShape, maxKVCacheShape);
+            result &= setOptimizationProfile(&generationProfile, binding_names::formatVCacheName(i, true).c_str(),
+                minKVCacheShape, optKVCacheShape, maxKVCacheShape);
+        }
+    }
+    else
+    {
+        // Plugin path: combined KV cache with "2" dimension
+        // KV cache shape is [B, 2, num_kv_heads, 0 to max_kv_cache_capacity, head_dim]
+        for (int i = 0; i < mNbKVCacheInputs; ++i)
+        {
+            int64_t layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
+            nvinfer1::Dims minKVCacheShape = createDims({1, 2, mNumKVHeads, 0, layerHeadSize});
+            nvinfer1::Dims optKVCacheShape = createDims(
+                {mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
+            nvinfer1::Dims maxKVCacheShape = createDims(
+                {mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
+
+            result &= setOptimizationProfile(&contextProfile, binding_names::formatKVCacheName(i, true).c_str(),
+                minKVCacheShape, optKVCacheShape, maxKVCacheShape);
+            result &= setOptimizationProfile(&generationProfile, binding_names::formatKVCacheName(i, true).c_str(),
+                minKVCacheShape, optKVCacheShape, maxKVCacheShape);
+        }
     }
 
     return result;

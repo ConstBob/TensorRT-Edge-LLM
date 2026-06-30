@@ -46,7 +46,7 @@ This mirrors the dense Qwen3-Omni quantization convention used by
 
 Usage::
 
-    tensorrt-edgellm-quantize qwen3-omni \\
+    python -m experimental.quantization.cli qwen3-omni \\
         --model_dir Qwen/Qwen3-Omni-30B-A3B-Instruct \\
         --output_dir ./out_qwen3_omni_nvfp4 \\
         --kv_cache_quantization fp8 \\
@@ -65,6 +65,7 @@ from modelopt.torch.quantization.utils import is_quantized
 from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer
 
+from ._moe_experts_patch import patch_fused_moe_experts
 from .quantization_configs import build_quant_config
 # Reuse Thinker-side helpers from the dedicated thinker driver.
 from .qwen3_omni_thinker import _extract_and_save_thinker_text
@@ -149,16 +150,8 @@ def _build_full_model_quant_cfg(lm_head_quantization: Optional[str],
         # "*shared_expert.up_proj.*",
         # "*shared_expert.down_proj.*",
     ]
-    # modelopt's ``quant_cfg`` is an ordered list of rule dicts; append a
-    # disable rule per glob at the end so it overrides the earlier
-    # ``*weight_quantizer`` / ``*input_quantizer`` enables. A ``dict``
-    # ``quant_cfg`` (``{pattern: cfg}``) is handled too.
-    qc = cfg["quant_cfg"]
     for g in disable_globs:
-        if isinstance(qc, list):
-            qc.append({"quantizer_name": g, "enable": False})
-        else:
-            qc[g] = {"enable": False}
+        cfg["quant_cfg"][g] = {"enable": False}
     return cfg
 
 
@@ -640,12 +633,11 @@ def quantize_qwen3_omni(
             getattr(model.config.talker_config, "accept_hidden_layer"))
     print(f"[calib] accept_hidden_layer={talker_accept_hidden_layer}")
 
-    # 2. Fused-Parameter MoE experts need no pre-quantization patching.
-    #    On transformers >= 5.0 the Thinker/Talker experts are stored fused
-    #    (``gate_up_proj`` / ``down_proj`` 3-D ``nn.Parameter``); ModelOpt 0.44
-    #    quantizes and exports them natively via its on-the-fly fused-expert
-    #    plugins, emitting standard per-expert NVFP4 keys
-    #    (``experts.{j}.{gate,up,down}_proj.{weight,weight_scale,...}``).
+    # 2. Patch BOTH Thinker and Talker fused-Parameter MoE blocks so ModelOpt
+    #    sees per-expert ``nn.Linear`` modules it can attach quantizers to.
+    n_patched = patch_fused_moe_experts(model)
+    print(f"[patch] replaced {n_patched} fused MoE blocks across "
+          f"thinker + talker")
 
     # 3. Joint multimodal calibration in a single ``mtq.quantize`` call on
     #    the full model.  The forward loop runs Thinker → projection →

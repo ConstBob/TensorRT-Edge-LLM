@@ -63,7 +63,15 @@ DecodingStrategy& DecoderRegistry::select(LLMGenerationRequest const& request) c
         return *mDefaultDecoder;
     }
 
-    return *mSpeculativeDecoder;
+    char const* reason = mSpeculativeDecoder->unsupportedReason(request);
+    if (!reason)
+    {
+        return *mSpeculativeDecoder;
+    }
+
+    LOG_WARNING("Speculative decoding strategy %s cannot handle this request: %s; falling back to vanilla decoding.",
+        mSpeculativeDecoder->name(), reason);
+    return *mDefaultDecoder;
 }
 
 DecodingStrategy& DecoderRegistry::cachePrimingStrategy() const noexcept

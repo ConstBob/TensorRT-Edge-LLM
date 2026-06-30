@@ -101,6 +101,11 @@ public:
     //! @return Reference to the per-layer tensor [maxBatch, 2, numKVHeads, maxSeqLen, headDim].
     rt::Tensor& getCombinedKVCache(int32_t absLayerIdx);
 
+    //! Get the separate K and V caches for a given absolute layer index (must be an attention layer).
+    //! @param absLayerIdx Absolute decoder-layer index.
+    //! @return Pair of non-owned view tensors (K, V).
+    std::pair<rt::Tensor, rt::Tensor> getSeparateKVCache(int32_t absLayerIdx);
+
     //! Get the recurrent state for a given absolute layer index (must be a Mamba layer).
     //! @param absLayerIdx Absolute decoder-layer index.
     //! @return Reference to the per-layer recurrent state tensor.

@@ -175,6 +175,11 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
         mBlockSize, mMaskTokenId, maxBatch, mDraftHiddenSize, mBaseOutputHiddenDim, mDraftVocabSize);
 }
 
+char const* DFlashDecoder::unsupportedReason(LLMGenerationRequest const& request) const noexcept
+{
+    return spec_decode_utils::isGreedyCompatible(request);
+}
+
 bool DFlashDecoder::decodeStep(DecodingInferenceContext& context)
 {
     NVTX_SCOPED_RANGE(nvtx_dflash_decode, "DFlashDecoder::decodeStep", nvtx_colors::GREEN);

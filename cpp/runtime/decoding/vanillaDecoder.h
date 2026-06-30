@@ -44,6 +44,11 @@ public:
         return false;
     }
 
+    char const* unsupportedReason(LLMGenerationRequest const&) const noexcept override
+    {
+        return nullptr;
+    }
+
     bool decodeStep(DecodingInferenceContext& context) override;
     bool captureCudaGraphs(cudaStream_t stream) override;
 

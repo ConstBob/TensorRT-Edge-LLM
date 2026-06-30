@@ -145,9 +145,9 @@ private:
     int32_t const* getActualKVLengths(cudaStream_t stream, int32_t activeBatchSize);
 
     //! \brief Deinterleave combined [maxBatchSize, 2, H, S, D] (KV Cache layout from attention plugin) for one layer
-    //! into owned buffers and return refs to them. The Alpamayo action expert's exported graph consumes separate K/V
-    //! caches of shape [2, maxBatchSize, H, S, D] (the TRT native attention op layout), so this runner repacks the
-    //! plugin-path combined buffer into that layout.
+    //! into owned buffers and return refs to them. Used instead of HybridCacheManager::getSeparateKVCache,
+    //! which separates a KV cache of shape [2, maxBatchSize, H, S, D] (KV Cache layout from TRT native attention op)
+    //! because of the different memory layout.
     //! \param stream CUDA stream for execution
     //! \param kvcache KV cache containing the VLM outputs; used to read active batch size and KV cache lengths
     //! \param decoderLayerIdx Index of the decoder layer

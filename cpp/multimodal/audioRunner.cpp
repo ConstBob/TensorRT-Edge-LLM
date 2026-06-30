@@ -123,7 +123,16 @@ bool Qwen3OmniAudioRunner::validateAndFillConfig(std::string const& engineDir)
     {
         mConfig.audioTokenId = jsonConfig["audio_token_id"].get<int32_t>();
     }
-    LOG_DEBUG("Audio token IDs: audio_pad=%d", mConfig.audioTokenId);
+    if (jsonConfig.contains("audio_start_token_id"))
+    {
+        mConfig.audioBosTokenId = jsonConfig["audio_start_token_id"].get<int32_t>();
+    }
+    if (jsonConfig.contains("audio_end_token_id"))
+    {
+        mConfig.audioEosTokenId = jsonConfig["audio_end_token_id"].get<int32_t>();
+    }
+    LOG_DEBUG("Audio token IDs: audio_pad=%d, audio_start=%d, audio_end=%d", mConfig.audioTokenId,
+        mConfig.audioBosTokenId, mConfig.audioEosTokenId);
 
     // Parse rope_theta for MRope initialization (from text_config or top-level)
     if (jsonConfig.contains("text_config") && jsonConfig["text_config"].contains("rope_theta"))
@@ -270,13 +279,18 @@ void Qwen3OmniAudioRunner::textPreprocess(rt::LLMGenerationRequest const& reques
             {
                 if (ids[j] == mConfig.audioTokenId)
                 {
-                    // Expand the <|audio_pad|> placeholder to N×<|audio_pad|> in place. The <|audio_start|>/
-                    // <|audio_end|> markers come from the (unified) chat template, so we do NOT re-add them here.
+                    // Replace <|audio_pad|> placeholder with: <|audio_start|> + N×<|audio_pad|> + <|audio_end|>
+                    // TRT chat template only has <|audio_pad|> without start/end markers
                     int64_t numAudioTokens = audioTokenLengths[i];
+
+                    newIds.push_back(mConfig.audioBosTokenId);
+
                     for (int64_t k = 0; k < numAudioTokens; ++k)
                     {
                         newIds.push_back(mConfig.audioTokenId);
                     }
+
+                    newIds.push_back(mConfig.audioEosTokenId);
                 }
                 else
                 {

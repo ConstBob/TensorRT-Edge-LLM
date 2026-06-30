@@ -44,6 +44,7 @@ struct LLMBuilderConfig
     int64_t maxKVCacheCapacity{4096}; //!< Maximum KV cache capacity (sequence length)
     int64_t maxVerifyTreeSize{60};    //!< Maximum length of input_ids passed into spec base model for verification
     int64_t maxDraftTreeSize{60};     //!< Maximum length of input_ids passed into spec draft model for draft generation
+    bool useTrtNativeOps{false};      //!< Whether to use TensorRT native operations instead of custom plugin
     bool profilingDetailed{false};    //!< Enable detailed profiling verbosity for layer info extraction
 
     //! Convert configuration to JSON format for serialization.
@@ -57,6 +58,7 @@ struct LLMBuilderConfig
         json["max_batch_size"] = maxBatchSize;
         json["max_lora_rank"] = maxLoraRank;
         json["max_kv_cache_capacity"] = maxKVCacheCapacity;
+        json["trt_native_ops"] = useTrtNativeOps;
         // Only include speculative-decoding limits for the engine role that owns them.
         if (specBase)
         {
@@ -115,6 +117,10 @@ struct LLMBuilderConfig
         if (json.contains("max_draft_tree_size"))
         {
             config.maxDraftTreeSize = json["max_draft_tree_size"];
+        }
+        if (json.contains("trt_native_ops"))
+        {
+            config.useTrtNativeOps = json["trt_native_ops"];
         }
         return config;
     }

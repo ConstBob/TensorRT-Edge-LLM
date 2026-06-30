@@ -119,6 +119,11 @@ MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, std::filesystem::path co
         cudaMemsetAsync(mDraftVocabMappingTable.rawPointer(), 0, mDraftVocabMappingTable.getMemoryCapacity(), stream));
 }
 
+char const* MTPDecoder::unsupportedReason(LLMGenerationRequest const& request) const noexcept
+{
+    return spec_decode_utils::isGreedyCompatible(request);
+}
+
 int64_t MTPDecoder::getRequiredContextMemorySize() const noexcept
 {
     return mDraftExecutor ? mDraftExecutor->getRequiredContextMemorySize() : 0;

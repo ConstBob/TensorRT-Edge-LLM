@@ -34,6 +34,10 @@ namespace rt
 namespace spec_decode_utils
 {
 
+//! @brief Check whether a generation request is compatible with greedy-only spec-decode sampling.
+//! @return nullptr if compatible; a human-readable reason string if not.
+char const* isGreedyCompatible(LLMGenerationRequest const& request) noexcept;
+
 //! @brief Load the draft engine from disk and return an EngineExecutor.
 std::unique_ptr<EngineExecutor> loadDraftEngine(std::filesystem::path const& engineDir, DeploymentConfig& deployment);
 

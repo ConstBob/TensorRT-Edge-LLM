@@ -177,6 +177,16 @@ rt::Tensor& HybridCacheManager::getCombinedKVCache(int32_t absLayerIdx)
     return mKVCache.getCombinedKVCache(localIdx);
 }
 
+std::pair<rt::Tensor, rt::Tensor> HybridCacheManager::getSeparateKVCache(int32_t absLayerIdx)
+{
+    check::check(absLayerIdx >= 0 && absLayerIdx < static_cast<int32_t>(mAbsToKVIndex.size()),
+        "getSeparateKVCache: absLayerIdx " + std::to_string(absLayerIdx) + " out of range.");
+    int32_t const localIdx = mAbsToKVIndex[absLayerIdx];
+    check::check(
+        localIdx >= 0, "getSeparateKVCache: layer " + std::to_string(absLayerIdx) + " is not an attention layer.");
+    return mKVCache.getSeparateKVCache(localIdx);
+}
+
 rt::Tensor& HybridCacheManager::getRecurrentState(int32_t absLayerIdx)
 {
     check::check(absLayerIdx >= 0 && absLayerIdx < static_cast<int32_t>(mAbsToMambaIndex.size()),

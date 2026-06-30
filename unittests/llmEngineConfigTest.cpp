@@ -121,6 +121,7 @@ TEST_F(LLMEngineConfigTest, ParseMinimalConfig)
     EXPECT_EQ(cfg.maxKVCacheCapacity, 256);
     EXPECT_EQ(cfg.maxSupportedLoraRank, 0);
     EXPECT_FALSE(cfg.isSpecDecodeBase);
+    EXPECT_FALSE(cfg.useTrtNativeOps);
     EXPECT_EQ(cfg.maxVerifyTreeSize, 0);
     EXPECT_EQ(cfg.maxDraftTreeSize, 0);
     EXPECT_EQ(cfg.kvCacheDtype, nvinfer1::DataType::kHALF);
@@ -231,6 +232,16 @@ TEST_F(LLMEngineConfigTest, SpecDecodeMaxProposalSizes)
     EXPECT_EQ(cfg.maxDraftTreeSize, 0); // Base side leaves this at the default.
     // baseOutputHiddenDim = hiddenSize * 3 = 768 * 3 = 2304; computed at DeploymentConfig level
     EXPECT_EQ(cfg.hiddenSize * 3, 2304);
+}
+
+TEST_F(LLMEngineConfigTest, TrtNativeOps)
+{
+    Json json = makeMinimalConfig();
+    json["builder_config"]["trt_native_ops"] = true;
+    auto const path = writeJsonToTempFile(json);
+
+    LLMEngineConfig cfg = parseEngineConfig(path);
+    EXPECT_TRUE(cfg.useTrtNativeOps);
 }
 
 TEST_F(LLMEngineConfigTest, KVCacheDtypeFP8)
@@ -516,6 +527,19 @@ TEST(LLMEngineConfigRecipesTest, PrefillDimsChunked)
     auto const cfg = makeRecipeConfig(/*maxKV=*/4096, /*mrope=*/false);
     auto const d = cfg.prefillDims(/*batch=*/2, /*seqLen=*/128, /*kvCacheAllEmpty=*/false);
     EXPECT_EQ(d.startIndexLen, 2);
+}
+
+TEST(LLMEngineConfigRecipesTest, PrefillDimsTrtNativeAlwaysBatch)
+{
+    // TRT-native ops engines don't use the shape-[0] sentinel — startIndexLen
+    // is always batch regardless of cache-empty state.
+    LLMEngineConfig cfg;
+    cfg.maxKVCacheCapacity = 4096;
+    cfg.useTrtNativeOps = true;
+    auto const dEmpty = cfg.prefillDims(/*batch=*/2, /*seqLen=*/128, /*kvCacheAllEmpty=*/true);
+    auto const dCached = cfg.prefillDims(/*batch=*/2, /*seqLen=*/128, /*kvCacheAllEmpty=*/false);
+    EXPECT_EQ(dEmpty.startIndexLen, 2);
+    EXPECT_EQ(dCached.startIndexLen, 2);
 }
 
 TEST(LLMEngineConfigRecipesTest, DecodeDims)
