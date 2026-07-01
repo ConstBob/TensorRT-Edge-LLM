@@ -43,6 +43,8 @@ namespace trt_edgellm
 namespace rt
 {
 
+struct LogitBias;
+
 enum class DecodingStrategyKind : int32_t
 {
     kVanilla,
@@ -92,6 +94,7 @@ struct DecodingRuntimeContext
     BaseEngineResources base;
     PreprocessResources preprocess;
     tokenizer::Tokenizer& tokenizer;
+    LogitBias& logitBias;
     SamplingBuffers sampling;
 };
 

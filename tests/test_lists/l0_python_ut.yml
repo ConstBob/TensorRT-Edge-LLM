@@ -20,3 +20,15 @@ tests:
   - tests/python-unittests/test_tool_calling.py::test_validates_tool_request
   - tests/python-unittests/test_tool_calling.py::test_parses_tool_calls
   - tests/python-unittests/test_tool_calling.py::test_builds_tool_response_shapes
+
+  # Experimental Server Logit Bias Validation Tests
+  - tests/python-unittests/test_experimental_server_logit_bias.py::test_normalize_logit_bias_accepts_integer_like_keys_and_boundaries
+  - tests/python-unittests/test_experimental_server_logit_bias.py::test_normalize_logit_bias_rejects_too_many_entries
+  - tests/python-unittests/test_experimental_server_logit_bias.py::test_normalize_logit_bias_rejects_non_integer_token_ids
+  - tests/python-unittests/test_experimental_server_logit_bias.py::test_normalize_logit_bias_rejects_token_ids_outside_nonnegative_int32
+  - tests/python-unittests/test_experimental_server_logit_bias.py::test_normalize_logit_bias_rejects_invalid_bias_values
+  - tests/python-unittests/test_experimental_server_logit_bias.py::test_validate_logit_bias_spec_decode_accepts_compatible_states
+  - tests/python-unittests/test_experimental_server_logit_bias.py::test_validate_logit_bias_spec_decode_rejects_active_spec_decode
+  - tests/python-unittests/test_experimental_server_logit_bias.py::test_hlapi_generate_rejects_logit_bias_with_active_spec_decode
+  - tests/python-unittests/test_experimental_server_logit_bias.py::test_api_rejects_logit_bias_with_active_spec_decode
+  - tests/python-unittests/test_experimental_server_logit_bias.py::test_api_rejects_overflowing_logit_bias

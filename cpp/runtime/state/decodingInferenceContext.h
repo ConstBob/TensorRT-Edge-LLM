@@ -82,6 +82,11 @@ struct DecodingInferenceContext
     // Per-slot stop strings; empty list disables stop-string termination for that slot.
     std::vector<std::vector<std::string>> stopStringsPerSlot;
 
+    std::vector<std::unordered_map<int32_t, float>>
+        logitBiasPerSlot;          //!< Per-active-slot sparse logit bias maps in output-vocab space
+    bool hasLogitBias{false};      //!< True when any active slot has logit bias entries
+    bool logitBiasGpuDirty{false}; //!< True when CPU-side bias state must be uploaded to GPU
+
     bool outputThinkerEmbeddings{false}; //!< Whether to capture hidden states for the Talker pipeline
 
     //! Optional per-token callback invoked after each accepted token update.

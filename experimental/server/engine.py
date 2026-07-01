@@ -38,6 +38,7 @@ import hashlib
 import importlib.util
 import json
 import logging
+import math
 import os
 import sys
 import threading
@@ -53,6 +54,14 @@ from .tool_chat_template import (ToolChatTemplateFormatter,
 logger = logging.getLogger("edgellm.server")
 
 _PLUGIN_LIB_NAME = "libNvInfer_edgellm_plugin.so"
+_MAX_LOGIT_BIAS_TOKENS = 1024
+_MAX_LOGIT_BIAS_TOKEN_ID = (1 << 31) - 1
+_MIN_LOGIT_BIAS = -100.0
+_MAX_LOGIT_BIAS = 100.0
+
+_LOGIT_BIAS_SPEC_DECODE_ERROR = (
+    "logit_bias is not supported while speculative decoding is enabled; "
+    "set disable_spec_decode=true or use a vanilla engine")
 
 _VLM_MODEL_TYPES = frozenset([
     "qwen3_vl",
@@ -81,6 +90,7 @@ class SamplingParams:
     enable_thinking: bool = False
     disable_spec_decode: bool = False
     stop: List[str] = field(default_factory=list)
+    logit_bias: Dict[int, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -211,10 +221,13 @@ def _import_runtime():
     except ImportError:
         pass
     project_root = Path(__file__).resolve().parent.parent.parent
-    search_dirs = [
+    search_dirs = []
+    if os.environ.get("BUILD_DIR"):
+        search_dirs.append(Path(os.environ["BUILD_DIR"]) / "pybind")
+    search_dirs.extend([
         project_root / "experimental" / "pybind" / "build",
         project_root / "build" / "pybind",
-    ]
+    ])
     search_dirs.extend(project_root.glob("build/lib.*"))
     for cand_dir in search_dirs:
         if not cand_dir.is_dir():
@@ -242,6 +255,65 @@ def _ensure_export_package() -> None:
         project_root = str(Path(__file__).resolve().parent.parent.parent)
         if project_root not in sys.path:
             sys.path.insert(0, project_root)
+
+
+def _normalize_logit_bias(
+        logit_bias: Optional[Dict[Any, Any]]) -> Dict[int, float]:
+    """Validate and normalize an OpenAI-compatible logit_bias map."""
+    if logit_bias is None:
+        return {}
+    if not isinstance(logit_bias, dict):
+        raise ValueError(
+            "'logit_bias' must be an object mapping token IDs to bias values")
+    if len(logit_bias) > _MAX_LOGIT_BIAS_TOKENS:
+        raise ValueError(f"'logit_bias' has {len(logit_bias)} entries; max is "
+                         f"{_MAX_LOGIT_BIAS_TOKENS}")
+
+    normalized: Dict[int, float] = {}
+    for token, bias in logit_bias.items():
+        if isinstance(token, bool):
+            raise ValueError(
+                f"'logit_bias' token ID {token!r} is not an integer")
+        if isinstance(token, int):
+            token_id = token
+        elif isinstance(token, str):
+            try:
+                token_id = int(token)
+            except ValueError as exc:
+                raise ValueError(
+                    f"'logit_bias' token ID {token!r} is not an integer"
+                ) from exc
+        else:
+            raise ValueError(
+                f"'logit_bias' token ID {token!r} is not an integer")
+        if token_id < 0 or token_id > _MAX_LOGIT_BIAS_TOKEN_ID:
+            raise ValueError(
+                f"'logit_bias' token ID must be in "
+                f"[0, {_MAX_LOGIT_BIAS_TOKEN_ID}], got {token_id}")
+        if isinstance(bias, bool) or not isinstance(bias, (int, float)):
+            raise ValueError(
+                f"'logit_bias' value for token ID {token_id} must be a number")
+        try:
+            bias_value = float(bias)
+        except OverflowError as exc:
+            raise ValueError(
+                f"'logit_bias' value for token ID {token_id} must be in "
+                f"[{_MIN_LOGIT_BIAS}, {_MAX_LOGIT_BIAS}], got {bias}") from exc
+        if (not math.isfinite(bias_value) or bias_value < _MIN_LOGIT_BIAS
+                or bias_value > _MAX_LOGIT_BIAS):
+            raise ValueError(
+                f"'logit_bias' value for token ID {token_id} must be in "
+                f"[{_MIN_LOGIT_BIAS}, {_MAX_LOGIT_BIAS}], got {bias_value}")
+        normalized[token_id] = bias_value
+    return normalized
+
+
+def _validate_logit_bias_spec_decode(logit_bias: Dict[int, float], *,
+                                     disable_spec_decode: bool,
+                                     has_draft_model: bool) -> None:
+    """Reject logit bias unless speculative decoding is absent or explicitly disabled."""
+    if logit_bias and has_draft_model and not disable_spec_decode:
+        raise ValueError(_LOGIT_BIAS_SPEC_DECODE_ERROR)
 
 
 # ---------------------------------------------------------------------------
@@ -678,6 +750,13 @@ class LLM:
         tool_config: Optional[ToolConfig] = None,
         stream_channel: Optional[Any] = None,
     ):
+        normalized_logit_bias = _normalize_logit_bias(params.logit_bias)
+        _validate_logit_bias_spec_decode(
+            normalized_logit_bias,
+            disable_spec_decode=params.disable_spec_decode,
+            has_draft_model=self.has_draft_model,
+        )
+
         tool_config = tool_config or validate_tool_request(
             messages, tools, tool_choice)
         cpp_messages, image_buffers, apply_template, add_prompt = (
@@ -696,6 +775,7 @@ class LLM:
         req.image_buffers = image_buffers
         req.audio_buffers = audio_buffers
         req.stop_strings = params.stop
+        req.logit_bias = normalized_logit_bias
         request.requests = [req]
         if stream_channel is not None:
             request.stream_channels = [stream_channel]

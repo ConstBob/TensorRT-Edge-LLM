@@ -26,6 +26,7 @@
 #include "runtime/config/deploymentConfig.h"
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/decoding/decoderRegistry.h"
+#include "runtime/decoding/logitBias.h"
 #include "runtime/exec/engineExecutor.h"
 #include "runtime/exec/tensorMap.h"
 #include "runtime/features/deepstackBinding.h"
@@ -231,6 +232,7 @@ private:
     std::unique_ptr<SharedResources> mSharedResources; //!< KV caches / RoPE / LoRA / context memory
     std::unique_ptr<PipelineIO> mPipelineIO;           //!< Per-pipeline I/O tensors
     TensorMap mBaseTensorMap;                          //!< Base engine binding map
+    LogitBias mLogitBias; //!< Runtime-owned resources that outlive decoding objects borrowing them
     std::unique_ptr<DecodingRuntimeContext> mDecodingRuntimeContext;
     std::unique_ptr<DecoderRegistry> mDecoderRegistry;
     std::unique_ptr<StepPreparer> mStepPreparer;             //!< Per-step sequence preprocessor
@@ -260,7 +262,7 @@ private:
     rt::Tensor mSamplingWorkspace;
     rt::Tensor mSamplingIndices;
     rt::Tensor mSamplingScores;
-    rt::Tensor mBaseVocabMappingTable; // Vocab mapping table for base model reduced vocab (empty if not used)
+    rt::Tensor mBaseVocabMappingTable; //!< Vocab mapping table for base model reduced vocab (empty if unused)
 
     // [3] Batch eviction support tensors.
     rt::Tensor mDeviceBatchMapping;

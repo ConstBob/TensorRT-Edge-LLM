@@ -453,6 +453,8 @@ template void compactVector<std::vector<int32_t>>(std::vector<int32_t> const&, s
 template void compactVector<std::string>(std::vector<int32_t> const&, std::vector<std::string>&);
 template void compactVector<std::vector<std::string>>(
     std::vector<int32_t> const&, std::vector<std::vector<std::string>>&);
+template void compactVector<std::unordered_map<int32_t, float>>(
+    std::vector<int32_t> const&, std::vector<std::unordered_map<int32_t, float>>&);
 template void compactVector<SlotStreamState>(std::vector<int32_t> const&, std::vector<SlotStreamState>&);
 
 // Build batch mapping from finished states

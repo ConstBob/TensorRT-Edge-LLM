@@ -40,7 +40,8 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from .engine import SamplingParams, finish_reason_name
+from .engine import (SamplingParams, _normalize_logit_bias,
+                     _validate_logit_bias_spec_decode, finish_reason_name)
 from .tool_calling import (ToolConfig, parse_assistant_output,
                            validate_tool_request)
 
@@ -114,6 +115,15 @@ def _create_app(llm_instance):
         disable_spec_decode = body.get("disable_spec_decode", False)
         tools = body.get("tools")
         tool_choice = body.get("tool_choice")
+        try:
+            logit_bias = _normalize_logit_bias(body.get("logit_bias"))
+            _validate_logit_bias_spec_decode(
+                logit_bias,
+                disable_spec_decode=disable_spec_decode,
+                has_draft_model=llm_instance.has_draft_model,
+            )
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
 
         # OpenAI-compatible "stop": null | str | list[str]. Reject other types with 400.
         stop_raw = body.get("stop")
@@ -149,6 +159,7 @@ def _create_app(llm_instance):
             enable_thinking=enable_thinking,
             disable_spec_decode=disable_spec_decode,
             stop=stop,
+            logit_bias=logit_bias,
         )
 
         if stream:

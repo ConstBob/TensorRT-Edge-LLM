@@ -36,6 +36,10 @@ void DecodingInferenceContext::initialize(int32_t batchSize, int32_t maxGenLengt
     slotStreams.resize(batchSize);
     stopStringsPerSlot.clear();
     stopStringsPerSlot.resize(batchSize);
+    logitBiasPerSlot.clear();
+    logitBiasPerSlot.resize(batchSize);
+    hasLogitBias = false;
+    logitBiasGpuDirty = false;
 
     batchIndexMapping.resize(batchSize);
     for (int32_t i = 0; i < batchSize; ++i)

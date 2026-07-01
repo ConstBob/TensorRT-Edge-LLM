@@ -29,6 +29,7 @@
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -103,6 +104,9 @@ struct LLMGenerationRequest
 
         //! Stop strings; generation halts on the earliest match and trims it from output.
         std::vector<std::string> stopStrings;
+
+        //! Sparse per-token logit bias map keyed by full tokenizer token ID.
+        std::unordered_map<int32_t, float> logitBias;
 
         mutable FormattedRequest formatted; //!< Formatted request (populated by tokenizer or user-provided)
     };

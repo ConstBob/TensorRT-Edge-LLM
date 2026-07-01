@@ -25,7 +25,9 @@
 #include "runtime/audioUtils.h"
 #include "runtime/imageUtils.h"
 
+#include <cmath>
 #include <fstream>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 
@@ -35,6 +37,47 @@ namespace exampleUtils
 {
 
 using Json = nlohmann::json;
+
+namespace
+{
+
+std::unordered_map<int32_t, float> parseLogitBias(Json const& logitBiasJson, std::string const& fieldName)
+{
+    check::check(logitBiasJson.is_object(), fieldName + " must be an object mapping token IDs to bias values");
+    check::check(logitBiasJson.size() <= limits::security::kMaxLogitBiasTokens,
+        format::fmtstr("%s has %zu entries, max is %zu (matching vLLM)", fieldName.c_str(), logitBiasJson.size(),
+            limits::security::kMaxLogitBiasTokens));
+
+    std::unordered_map<int32_t, float> logitBias;
+    logitBias.reserve(logitBiasJson.size());
+    for (auto const& [tokenIdStr, biasJson] : logitBiasJson.items())
+    {
+        size_t parsedChars = 0;
+        long long tokenIdLong = 0;
+        try
+        {
+            tokenIdLong = std::stoll(tokenIdStr, &parsedChars);
+        }
+        catch (std::exception const&)
+        {
+            throw std::runtime_error(fieldName + " token ID '" + tokenIdStr + "' is not an integer");
+        }
+        check::check(parsedChars == tokenIdStr.size(), fieldName + " token ID '" + tokenIdStr + "' is not an integer");
+        check::check(
+            tokenIdLong >= std::numeric_limits<int32_t>::min() && tokenIdLong <= std::numeric_limits<int32_t>::max(),
+            fieldName + " token ID '" + tokenIdStr + "' is outside int32 range");
+        check::check(biasJson.is_number(), fieldName + " value for token ID '" + tokenIdStr + "' must be numeric");
+        float const bias = biasJson.get<float>();
+        check::check(
+            std::isfinite(bias) && bias >= limits::security::kMinLogitBias && bias <= limits::security::kMaxLogitBias,
+            format::fmtstr("%s value for token ID '%s' must be finite and in [%.1f, %.1f]", fieldName.c_str(),
+                tokenIdStr.c_str(), limits::security::kMinLogitBias, limits::security::kMaxLogitBias));
+        logitBias[static_cast<int32_t>(tokenIdLong)] = bias;
+    }
+    return logitBias;
+}
+
+} // namespace
 
 std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGenerationRequest>> parseRequestFile(
     std::filesystem::path const& inputFilePath, int32_t batchSizeOverride, int64_t maxGenerateLengthOverride)
@@ -73,6 +116,11 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
     bool applyChatTemplate = inputData.value("apply_chat_template", true);
     bool addGenerationPrompt = inputData.value("add_generation_prompt", true);
     bool enableThinking = inputData.value("enable_thinking", false);
+    std::unordered_map<int32_t, float> defaultLogitBias;
+    if (inputData.contains("logit_bias") && !inputData["logit_bias"].is_null())
+    {
+        defaultLogitBias = parseLogitBias(inputData["logit_bias"], "logit_bias");
+    }
 
     std::unordered_map<std::string, std::string> loraWeightsMap;
     if (inputData.contains("available_lora_weights") && inputData["available_lora_weights"].is_object())
@@ -292,6 +340,12 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
             request.messages = std::move(chatMessages);
             request.imageBuffers = std::move(imageBuffers);
             request.audioBuffers = std::move(audioBuffers);
+            request.logitBias = defaultLogitBias;
+            if (requestItem.contains("logit_bias") && !requestItem["logit_bias"].is_null())
+            {
+                request.logitBias
+                    = parseLogitBias(requestItem["logit_bias"], format::fmtstr("requests[%zu].logit_bias", requestIdx));
+            }
 
             // Optional per-request stop strings ("stop": string | string[]).
             if (requestItem.contains("stop") && !requestItem["stop"].is_null())
