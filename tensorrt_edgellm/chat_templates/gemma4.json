@@ -1,0 +1,29 @@
+{
+  "roles": {
+    "system": {
+      "prefix": "<bos><|turn>system\n",
+      "suffix": "<turn|>\n"
+    },
+    "user": {
+      "prefix": "<bos><|turn>user\n",
+      "suffix": "<turn|>\n"
+    },
+    "assistant": {
+      "prefix": "<|turn>model\n",
+      "suffix": "<turn|>\n"
+    }
+  },
+  "content_types": {
+    "image": {
+      "format": "<|image|>"
+    },
+    "video": {
+      "format": "<|video|>"
+    },
+    "audio": {
+      "format": "<|audio|>"
+    }
+  },
+  "generation_prompt": "<|turn>model\n",
+  "default_system_prompt": ""
+}

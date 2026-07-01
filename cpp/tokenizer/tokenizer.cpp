@@ -297,6 +297,60 @@ bool Tokenizer::parseTokenizerConfig(
     {
         mTokenEncoder->setByteFallback(true);
     }
+
+    // Load explicit BPE merges only for SentencePiece-style tokenizers (byte_fallback=true).
+    // These tokenizers (e.g. Gemma) define merge order independently of vocab rank.
+    // Tiktoken-style tokenizers (e.g. Qwen) have merges in tokenizer.json but use vocab rank
+    // for merge ordering — loading merge priorities would break their tokenization.
+    if (byteFallback && jsonData["model"].contains("merges") && jsonData["model"]["merges"].is_array())
+    {
+        auto const& mergesArray = jsonData["model"]["merges"];
+        if (!mergesArray.empty())
+        {
+            std::unordered_map<std::string, Rank> mergePriorities;
+            mergePriorities.reserve(mergesArray.size());
+
+            for (size_t i = 0; i < mergesArray.size(); ++i)
+            {
+                std::string left, right;
+                if (mergesArray[i].is_string())
+                {
+                    // Format: "tokenA tokenB" — split on first space
+                    std::string const& mergeStr = mergesArray[i].get_ref<std::string const&>();
+                    auto spacePos = mergeStr.find(' ');
+                    if (spacePos == std::string::npos)
+                    {
+                        LOG_WARNING("Invalid merge entry at index %zu: '%s'", i, mergeStr.c_str());
+                        continue;
+                    }
+                    left = mergeStr.substr(0, spacePos);
+                    right = mergeStr.substr(spacePos + 1);
+                }
+                else if (mergesArray[i].is_array() && mergesArray[i].size() == 2 && mergesArray[i][0].is_string()
+                    && mergesArray[i][1].is_string())
+                {
+                    // Format: ["tokenA", "tokenB"]
+                    left = mergesArray[i][0].get<std::string>();
+                    right = mergesArray[i][1].get<std::string>();
+                }
+                else
+                {
+                    LOG_WARNING("Unrecognized merge entry format at index %zu", i);
+                    continue;
+                }
+                // Use null-byte separator to avoid ambiguity when different (left, right) pairs
+                // produce the same concatenation (e.g. "▁th"+"e" vs "▁t"+"he" both → "▁the").
+                std::string key = left;
+                key += '\0';
+                key += right;
+                mergePriorities[std::move(key)] = static_cast<Rank>(i);
+            }
+
+            LOG_INFO("Loaded %zu BPE merge priorities", mergePriorities.size());
+            mTokenEncoder->setMergePriorities(std::move(mergePriorities));
+        }
+    }
+
     return true;
 }
 
@@ -958,6 +1012,7 @@ bool Tokenizer::loadChatTemplate(std::filesystem::path const& chatTemplateFile)
         mChatTemplate.generationPrompt = jsonData.value("generation_prompt", mChatTemplate.generationPrompt);
         mChatTemplate.generationPromptThinking = jsonData.value("generation_prompt_thinking", "");
         mChatTemplate.defaultSystemPrompt = jsonData.value("default_system_prompt", mChatTemplate.defaultSystemPrompt);
+        mChatTemplate.trimContent = jsonData.value("trim_content", false);
     }
     catch (std::exception const& e)
     {
@@ -1064,7 +1119,20 @@ bool Tokenizer::applyChatTemplate(rt::LLMGenerationRequest::Request const& reque
         {
             if (contentItem.type == "text")
             {
-                formattedMessage += contentItem.content;
+                if (mChatTemplate.trimContent)
+                {
+                    auto const& s = contentItem.content;
+                    auto start = s.find_first_not_of(" \t\n\r");
+                    auto end = s.find_last_not_of(" \t\n\r");
+                    if (start != std::string::npos)
+                    {
+                        formattedMessage += s.substr(start, end - start + 1);
+                    }
+                }
+                else
+                {
+                    formattedMessage += contentItem.content;
+                }
             }
             else if (contentItem.type == "trajectory")
             {
