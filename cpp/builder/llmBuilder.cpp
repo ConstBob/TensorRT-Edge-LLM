@@ -38,7 +38,7 @@ namespace trt_edgellm
 {
 namespace builder
 {
-#if NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 13
+#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 13)
 namespace
 {
 
@@ -66,7 +66,7 @@ std::string applyMyelinCompileWorkarounds(int32_t maxBatchSize)
 #if NV_TENSORRT_MAJOR == 10 && (NV_TENSORRT_MINOR == 13 || NV_TENSORRT_MINOR == 14)
     appendLunowudFlag(lunowudFlags, "-peep:match_dual_gemm=off");
 #endif
-#if NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 15
+#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 15)
     appendLunowudFlag(lunowudFlags, "-mlir:autotune:num_threads=1");
     appendLunowudFlag(lunowudFlags, "-mlir:collective:fp4=off");
     appendLunowudFlag(lunowudFlags, "-cask_fusion:async_policy=1");
@@ -143,7 +143,7 @@ LLMBuilder::LLMBuilder(
 
 bool LLMBuilder::build()
 {
-#if NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 13
+#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 13)
     std::string const lunowudFlags = applyMyelinCompileWorkarounds(mBuilderConfig.maxBatchSize);
     if (!lunowudFlags.empty())
     {
