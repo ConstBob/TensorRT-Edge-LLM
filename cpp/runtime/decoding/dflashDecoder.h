@@ -119,6 +119,11 @@ private:
     int32_t mDraftHiddenSize{0};
     int32_t mBaseOutputHiddenDim{0};
     int32_t mDraftVocabSize{0};
+
+    //! Draft vocab map [reducedVocabSize] INT32 (GPU). Active when draft
+    //! lm_head uses a reduced vocabulary. Sized to zero otherwise.
+    Tensor mDraftVocabMappingTable;
+    bool mHasDraftVocabMap{false};
 };
 
 } // namespace rt

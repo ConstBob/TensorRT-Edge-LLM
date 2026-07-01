@@ -653,9 +653,11 @@ def _export_mtp_draft(model_dir: str,
     logger.info("[MTP Draft] Done: %s", output_path)
 
 
-def _export_dflash_draft(model_dir: str, draft_out_dir: str,
-                         dflash_draft_dir: str) -> None:
-    """Export the DFlash draft model."""
+def _export_dflash_draft(model_dir: str,
+                         draft_out_dir: str,
+                         dflash_draft_dir: str,
+                         draft_reduced_vocab_dir: str = "") -> None:
+    """Export the DFlash draft model, optionally with reduced vocabulary."""
     os.makedirs(draft_out_dir, exist_ok=True)
     output_path = os.path.join(draft_out_dir, "model.onnx")
 
@@ -670,6 +672,23 @@ def _export_dflash_draft(model_dir: str, draft_out_dir: str,
         logger.exception("[DFlash Draft] Failed to load checkpoint")
         raise SystemExit(1) from exc
 
+    # --- Optional: reduce draft lm_head vocabulary ---
+    full_size = model.config.vocab_size
+    reduced_size = None
+    if draft_reduced_vocab_dir:
+        logger.info("[DFlash Draft] Applying vocab reduction from %s",
+                    draft_reduced_vocab_dir)
+        try:
+            from ..vocab_reduction.onnx_export import \
+                apply_reduced_vocab_from_dir
+            apply_reduced_vocab_from_dir(model, draft_reduced_vocab_dir)
+            reduced_size = model.config.reduced_vocab_size
+            logger.info("[DFlash Draft] lm_head reduced: %d → %d", full_size,
+                        reduced_size)
+        except (OSError, ValueError, RuntimeError, ImportError) as exc:
+            logger.exception("[DFlash Draft] Vocab reduction failed")
+            raise SystemExit(1) from exc
+
     logger.info("[DFlash Draft] Exporting to %s", output_path)
     try:
         from ..onnx.export import export_onnx
@@ -681,6 +700,31 @@ def _export_dflash_draft(model_dir: str, draft_out_dir: str,
     # FP16/FP32 RoPE fix is handled automatically by export_onnx() which
     # reads DFlashDraftModel.match_fp32_elementwise_initializers = True
     # and passes it to _fix_initializer_dtypes().
+
+    # --- Save draft vocab map sidecar for C++ runtime ---
+    if draft_reduced_vocab_dir:
+        from safetensors.torch import save_file as _save_safetensors
+
+        from ..vocab_reduction.constants import (DRAFT_VOCAB_INFO_NAME,
+                                                 DRAFT_VOCAB_MAP_NAME)
+        vocab_map = model._reduced_vocab_map_for_runtime
+
+        map_path = os.path.join(draft_out_dir, DRAFT_VOCAB_MAP_NAME)
+        _save_safetensors({"vocab_map": vocab_map.cpu().to(torch.int32)},
+                          map_path)
+        logger.info("[DFlash Draft] Wrote draft vocab map: %s (%d tokens)",
+                    map_path, vocab_map.numel())
+
+        with open(os.path.join(draft_out_dir, DRAFT_VOCAB_INFO_NAME),
+                  "w") as fh:
+            json.dump(
+                {
+                    "vocab_size": full_size,
+                    "reduced_vocab_size": reduced_size,
+                    "source": draft_reduced_vocab_dir
+                },
+                fh,
+                indent=2)
 
     logger.info("[DFlash Draft] Done: %s", output_path)
 
@@ -1848,6 +1892,16 @@ def main() -> None:
         "Directory containing vocab_map.safetensors for LLM vocabulary reduction.",
     )
     p.add_argument(
+        "--draft-reduced-vocab-dir",
+        dest="draft_reduced_vocab_dir",
+        default="",
+        metavar="DIR",
+        help=
+        ("Directory containing vocab_map.safetensors for the DFlash draft model "
+         "(from tensorrt_edgellm/scripts/reduce_vocab.py). "
+         "Reduces the DFlash draft lm_head output dimension."),
+    )
+    p.add_argument(
         "--mtp",
         action="store_true",
         help=
@@ -2034,7 +2088,10 @@ def main() -> None:
         (args.mtp, "mtp_draft", lambda out: _export_mtp_draft(
             model_dir, out, externalize_weights=externalize_weights)),
         (args.dflash_draft, "dflash_draft", lambda out: _export_dflash_draft(
-            model_dir, out, args.dflash_draft_dir)),
+            model_dir,
+            out,
+            args.dflash_draft_dir,
+            draft_reduced_vocab_dir=args.draft_reduced_vocab_dir)),
         (_has_llm_component(model_type, "talker") and not args.skip_llm
          and not _draft_only and _allow("talker"), "talker",
          lambda out: _export_talker(model_dir, out, model_type)),

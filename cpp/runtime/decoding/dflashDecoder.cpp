@@ -21,6 +21,7 @@
 #include "common/cudaUtils.h"
 #include "common/logger.h"
 #include "common/mathUtils.h"
+#include "common/safetensorsUtils.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
 #include "kernels/speculative/dflashAcceptKernels.h"
 #include "kernels/speculative/dflashRuntimeKernels.h"
@@ -173,6 +174,30 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
         "DFlashDecoder initialized (cached KV path): blockSize=%d, maskTokenId=%d, maxBatch=%d, "
         "draftHiddenSize=%d, baseOutputHiddenDim=%d, draftVocabSize=%d",
         mBlockSize, mMaskTokenId, maxBatch, mDraftHiddenSize, mBaseOutputHiddenDim, mDraftVocabSize);
+
+    // Load draft vocab map when the draft engine config declares vocab reduction.
+    // Gating on the config (not file existence) makes draft vocab reduction an
+    // explicit feature toggle: a missing file is a hard error, and a stray file
+    // in a non-reduced engine directory is ignored.
+    if (deployment.draft->reducedVocabSize > 0)
+    {
+        auto const draftVocabMapPath = engineDir / binding_names::kDraftVocabMapFileName;
+        ELLM_CHECK(std::filesystem::exists(draftVocabMapPath),
+            "Draft engine declares reduced_vocab_size > 0 but " + std::string(binding_names::kDraftVocabMapFileName)
+                + " is missing from engine directory");
+        std::vector<Tensor> vocabMapTensors;
+        ELLM_CHECK(safetensors::loadSafetensors(draftVocabMapPath, vocabMapTensors, stream),
+            "Failed to load " + std::string(binding_names::kDraftVocabMapFileName) + " from engine directory");
+        check::check(vocabMapTensors.size() == 1,
+            std::string(binding_names::kDraftVocabMapFileName) + " should contain exactly one tensor");
+        check::check(vocabMapTensors[0].getShape().getNumDims() == 1, "draft vocab_map tensor should be 1D");
+        check::check(vocabMapTensors[0].getShape()[0] == mDraftVocabSize,
+            "draft vocab_map tensor length should match draft model reduced vocab size");
+        mDraftVocabMappingTable = std::move(vocabMapTensors[0]);
+        mHasDraftVocabMap = true;
+        LOG_INFO("DFlashDecoder: draft vocab map loaded (%d reduced -> full vocab tokens)",
+            static_cast<int32_t>(mDraftVocabMappingTable.getShape()[0]));
+    }
 }
 
 bool DFlashDecoder::decodeStep(DecodingInferenceContext& context)
@@ -359,6 +384,15 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
     check::check(mDraftTokenIds.reshape({activeBatchSize * BS, 1}), "Tensor reshape failed");
     selectAllTopK(mDraftOutputLogits, std::nullopt, mDraftTokenIds, 1, mRuntime.sampling.workspace, context.stream);
     check::check(mDraftTokenIds.reshape({activeBatchSize, BS}), "Tensor reshape failed");
+
+    // Step 7b: Remap reduced-vocab IDs to full-vocab IDs so the base model
+    // can embed them correctly and the accept kernel compares on equal footing.
+    if (mHasDraftVocabMap)
+    {
+        check::check(mDraftTokenIds.reshape({activeBatchSize * BS}), "Tensor reshape failed");
+        mapReducedVocabToFullVocab(mDraftTokenIds, mDraftVocabMappingTable, context.stream);
+        check::check(mDraftTokenIds.reshape({activeBatchSize, BS}), "Tensor reshape failed");
+    }
 
     // Step 8: Build verify input on GPU: [last_accepted_token, draft_1, ..., draft_{BS-1}]
     check::check(mVerifyTokenIds.reshape({activeBatchSize, BS}), "Tensor reshape failed");

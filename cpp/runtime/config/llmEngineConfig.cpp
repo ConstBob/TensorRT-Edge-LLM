@@ -551,7 +551,8 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath)
     // tail as identity.
     cfg.rotaryDim = static_cast<int32_t>(getRotaryDim(configJson, cfg.headDim));
     cfg.vocabSize = configJson.value("draft_vocab_size", configJson.value("vocab_size", 0));
-    cfg.outputVocabSize = cfg.vocabSize;
+    cfg.reducedVocabSize = configJson.value(binding_names::kReducedVocabSizeKey, 0);
+    cfg.outputVocabSize = (cfg.reducedVocabSize > 0) ? cfg.reducedVocabSize : cfg.vocabSize;
     parseDFlashFields(configJson, cfg);
 
     // Draft engines do not own speculative base verification bindings.

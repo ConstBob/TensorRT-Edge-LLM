@@ -1304,22 +1304,32 @@ bool LLMBuilder::copyEagleFiles()
 
 bool LLMBuilder::copyVocabMappingFiles()
 {
-    // Copy vocab_map.safetensors if reduced vocabulary is used
+    // Copy the vocab map sidecar if reduced vocabulary is used. Base engines
+    // consume vocab_map.safetensors; DFlash draft engines consume
+    // draft_vocab_map.safetensors. Pick the right filename based on the build
+    // role so the runtime finds the sidecar in mEngineDir.
     if (mModelConfig.contains(binding_names::kReducedVocabSizeKey)
         && mModelConfig[binding_names::kReducedVocabSizeKey].get<int32_t>() > 0)
     {
-        std::string const vocabMapPath = (mOnnxDir / binding_names::kVocabMapFileName).string();
-        std::string const targetVocabMapPath = (mEngineDir / binding_names::kVocabMapFileName).string();
+        char const* const vocabMapFileName
+            = mBuilderConfig.specDraft ? binding_names::kDraftVocabMapFileName : binding_names::kVocabMapFileName;
+        std::string const vocabMapPath = (mOnnxDir / vocabMapFileName).string();
+        std::string const targetVocabMapPath = (mEngineDir / vocabMapFileName).string();
 
-        if (file_io::copyFile(vocabMapPath, targetVocabMapPath))
+        if (!file_io::copyFile(vocabMapPath, targetVocabMapPath))
         {
-            LOG_INFO("Copied %s to %s", binding_names::kVocabMapFileName, targetVocabMapPath.c_str());
+            // The enclosing guard already proved reduced_vocab_size > 0, so the
+            // sidecar is required. Runtime will refuse to load (DFlashDecoder
+            // hard-errors when reducedVocabSize > 0 and the file is missing;
+            // base-model runtime falls back to no remap but produces wrong IDs).
+            // Fail the build instead of letting a broken engine ship.
+            LOG_ERROR(
+                "%s not found in %s but reduced_vocab_size > 0; the sidecar is "
+                "required for the runtime to remap reduced->full vocabulary IDs.",
+                vocabMapFileName, mOnnxDir.string().c_str());
+            return false;
         }
-        else
-        {
-            LOG_WARNING("%s not found in %s. This is expected if reduced vocabulary is not used.",
-                binding_names::kVocabMapFileName, mOnnxDir.string().c_str());
-        }
+        LOG_INFO("Copied %s to %s", vocabMapFileName, targetVocabMapPath.c_str());
     }
 
     return true;
