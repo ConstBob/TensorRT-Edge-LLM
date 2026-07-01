@@ -564,7 +564,7 @@ def _vit_attention_plugin_translation(
 
 
 @script()
-def _vit_trt_attention_inner(
+def _trt_ragged_attention_inner(
     query_states: onnxscript.FLOAT16,
     key_states: onnxscript.FLOAT16,
     value_states: onnxscript.FLOAT16,
@@ -587,7 +587,7 @@ def _vit_trt_attention_inner(
     )
 
 
-def _vit_trt_attention_translation(
+def _trt_ragged_attention_translation(
     query_states,
     key_states,
     value_states,
@@ -595,18 +595,19 @@ def _vit_trt_attention_translation(
     kv_lengths,
     num_heads,
     head_size,
+    mask=None,
 ):
-    """ViT ragged self-attention via TRT-native IAttention (packed NHD).
+    """Ragged self-attention via TRT-native IAttention (packed NHD).
 
     Q is expected to be pre-scaled by 1/sqrt(head_size) by the caller.
     query_lengths and kv_lengths must be separate graph tensors — TRT
     crashes when the same ONNX tensor is wired to both positions.
     """
-    return _vit_trt_attention_inner(
+    return _trt_ragged_attention_inner(
         query_states,
         key_states,
         value_states,
-        None,
+        mask,
         query_lengths,
         kv_lengths,
     )
@@ -920,8 +921,8 @@ def build_custom_translation_table() -> dict:
         _gated_delta_net_dispatch,
         torch.ops.trt.vit_attention_plugin.default:
         _vit_attention_plugin_translation,
-        torch.ops.trt.vit_trt_attention.default:
-        _vit_trt_attention_translation,
+        torch.ops.trt.trt_ragged_attention.default:
+        _trt_ragged_attention_translation,
         torch.ops.trt.gather_nd.default:
         _gather_nd_translation,
         torch.ops.trt_edgellm.int4_moe_plugin.default:

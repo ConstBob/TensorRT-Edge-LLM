@@ -50,6 +50,18 @@ bool Qwen25VLViTRunner::allocateExtraBuffers(int64_t maxImageTokens)
     mCuWindowSeqlensHost = rt::Tensor(
         {maxImageTokens}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "Qwen25VLViTRunner::mCuWindowSeqlensHost");
 
+    if (mUseTrtNativeVitAttn)
+    {
+        mHasKvLengthsWindow = isEngineInput(*mVisualEngine, binding_names::kKvLengthsWindow);
+        if (mHasKvLengthsWindow)
+        {
+            mKvLengthsWindow = rt::Tensor({maxImageTokens}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32,
+                "Qwen25VLViTRunner::mKvLengthsWindow");
+            setTensorAddressStatus
+                &= mVisualContext->setTensorAddress(binding_names::kKvLengthsWindow, mKvLengthsWindow.rawPointer());
+        }
+    }
+
     mWindowIndexHost = rt::Tensor(
         {maxImageTokens}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT64, "Qwen25VLViTRunner::mWindowIndexHost");
     mWindowIndexDevice = rt::Tensor(
@@ -75,6 +87,14 @@ void Qwen25VLViTRunner::buildExtraInputs(
     check::check(mReverseWindowIndexHost.reshape({totalImageTokens}), "Tensor reshape failed");
     check::check(mReverseWindowIndexDevice.reshape({totalImageTokens}), "Tensor reshape failed");
     getWindowIndex(spans, totalSeqLength, stream);
+
+    if (mUseTrtNativeVitAttn && mHasKvLengthsWindow)
+    {
+        int64_t const cuWindowSeqlensSize = mCuWindowSeqlens.getShape()[0];
+        check::check(mKvLengthsWindow.reshape({cuWindowSeqlensSize}), "Tensor reshape failed");
+        CUDA_CHECK(cudaMemcpyAsync(mKvLengthsWindow.rawPointer(), mCuWindowSeqlensHost.rawPointer(),
+            cuWindowSeqlensSize * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    }
 }
 
 bool Qwen25VLViTRunner::bindExtraInputShapes()
@@ -82,6 +102,11 @@ bool Qwen25VLViTRunner::bindExtraInputShapes()
     bool setEngineIOStatus{true};
     setEngineIOStatus
         &= mVisualContext->setInputShape(binding_names::kCuWindowSeqlens, mCuWindowSeqlens.getShape().getTRTDims());
+    if (mUseTrtNativeVitAttn && mHasKvLengthsWindow)
+    {
+        setEngineIOStatus
+            &= mVisualContext->setInputShape(binding_names::kKvLengthsWindow, mKvLengthsWindow.getShape().getTRTDims());
+    }
     setEngineIOStatus
         &= mVisualContext->setInputShape(binding_names::kWindowIndex, mWindowIndexDevice.getShape().getTRTDims());
     setEngineIOStatus &= mVisualContext->setInputShape(

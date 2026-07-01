@@ -39,8 +39,9 @@ namespace builder
 struct AudioBuilderConfig
 {
     // Audio encoder profile config (used when building audio_encoder)
-    int64_t minTimeSteps{100};  //!< Minimum audio time steps
-    int64_t maxTimeSteps{6000}; //!< Maximum audio time steps
+    int64_t minTimeSteps{100};         //!< Minimum audio time steps
+    int64_t maxTimeSteps{6000};        //!< Maximum audio time steps
+    bool useTrtNativeAudioAttn{false}; //!< Use TRT IAttention
 
     // Code2Wav profile config (used when building code2wav)
     int64_t minCodeLen{1};    //!< Minimum code sequence length in frames

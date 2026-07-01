@@ -36,6 +36,7 @@ Json AudioBuilderConfig::toJson() const noexcept
     // Audio encoder config
     json["min_time_steps"] = minTimeSteps;
     json["max_time_steps"] = maxTimeSteps;
+    json["use_trt_native_audio_attn"] = useTrtNativeAudioAttn;
     // Code2Wav config
     json["min_code_len"] = minCodeLen;
     json["opt_code_len"] = optCodeLen;
@@ -54,6 +55,10 @@ AudioBuilderConfig AudioBuilderConfig::fromJson(Json const& json)
     if (json.contains("max_time_steps"))
     {
         config.maxTimeSteps = json["max_time_steps"];
+    }
+    if (json.contains("use_trt_native_audio_attn"))
+    {
+        config.useTrtNativeAudioAttn = json["use_trt_native_audio_attn"];
     }
     // Code2Wav config
     if (json.contains("min_code_len"))
@@ -75,7 +80,8 @@ std::string AudioBuilderConfig::toString() const
 {
     std::ostringstream oss;
     oss << "AudioBuilderConfig:"
-        << " AudioEncoder[min=" << minTimeSteps << ",max=" << maxTimeSteps << "]"
+        << " AudioEncoder[min=" << minTimeSteps << ",max=" << maxTimeSteps
+        << ",use_trt_native_audio_attn=" << useTrtNativeAudioAttn << "]"
         << "\n  Code2Wav[min=" << minCodeLen << ",opt=" << optCodeLen << ",max=" << maxCodeLen << "]";
     return oss.str();
 }
@@ -283,11 +289,20 @@ bool AudioBuilder::parseConfig()
     case AudioBuildType::CODE2WAV: return parseCode2WavConfig();
     case AudioBuildType::AUDIO_ENCODER:
     {
+        bool parseOk = false;
         if (mModelType == multimodal::ModelType::NEMOTRON_OMNI_AUDIO_ENCODER)
         {
-            return parseNemotronOmniAudioConfig();
+            parseOk = parseNemotronOmniAudioConfig();
         }
-        return parseAudioEncoderConfig();
+        else
+        {
+            parseOk = parseAudioEncoderConfig();
+        }
+        if (parseOk && mModelConfig.value("use_trt_native_audio_attn", false))
+        {
+            logTrtNativeAttentionPath("AudioAttention");
+        }
+        return parseOk;
     }
     default: LOG_ERROR("Unknown build type"); return false;
     }
@@ -449,6 +464,15 @@ bool AudioBuilder::setupQwen3OmniAudioEncoderProfile(nvinfer1::IOptimizationProf
     result &= setOptimizationProfile(&profile, "attention_mask", createDims({minElems, minElems}),
         createDims({optElems, optElems}), createDims({maxElems, maxElems}));
 
+    mBuilderConfig.useTrtNativeAudioAttn = mModelConfig.value("use_trt_native_audio_attn", false);
+    if (mBuilderConfig.useTrtNativeAudioAttn)
+    {
+        int64_t const maxBatchSize = std::max<int64_t>(1, mModelConfig.value("max_batch_size", 16));
+        result &= setOptimizationProfile(
+            &profile, "cu_seqlens", createDims({2}), createDims({2}), createDims({maxBatchSize + 1}));
+        result &= setOptimizationProfile(
+            &profile, "kv_lengths", createDims({2}), createDims({2}), createDims({maxBatchSize + 1}));
+    }
     if (!result)
     {
         LOG_ERROR("Failed to setup Qwen3-Omni audio encoder profile");

@@ -22,6 +22,7 @@
 #include "common/cudaUtils.h"
 #include "common/logger.h"
 #include "common/mmapReader.h"
+#include "common/trtUtils.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
@@ -30,6 +31,7 @@
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
+#include <vector>
 
 using Json = nlohmann::json;
 
@@ -37,6 +39,30 @@ namespace trt_edgellm
 {
 namespace rt
 {
+namespace
+{
+bool prepareSeqlensInput(rt::Tensor& seqlensTensor, nvinfer1::IExecutionContext& context, char const* bindingName,
+    rt::Tensor const& seqlensHost, int64_t seqlensSize, int64_t seqlensSizeInBytes, cudaStream_t stream,
+    char const* tensorLabel)
+{
+    if (!seqlensTensor.reshape({seqlensSize}))
+    {
+        LOG_ERROR("Failed to reshape %s", tensorLabel);
+        return false;
+    }
+
+    if (!context.setInputShape(bindingName, seqlensTensor.getShape().getTRTDims()))
+    {
+        LOG_ERROR("Failed to set %s input shape", tensorLabel);
+        return false;
+    }
+
+    CUDA_CHECK(cudaMemcpyAsync(
+        seqlensTensor.rawPointer(), seqlensHost.rawPointer(), seqlensSizeInBytes, cudaMemcpyHostToDevice, stream));
+
+    return true;
+}
+} // namespace
 
 Qwen3OmniAudioRunner::Qwen3OmniAudioRunner(std::string const& engineDir, cudaStream_t stream)
     : MultimodalRunner()
@@ -187,6 +213,45 @@ bool Qwen3OmniAudioRunner::allocateBuffer([[maybe_unused]] cudaStream_t stream)
     mPaddedMaskIndices = rt::Tensor({maxValidElements, 2}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64);
 
     mAudioEmbedding = rt::Tensor({maxAudioTokens, audioFeatureDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+    int64_t maxSeqlensHostCapacity = 0;
+    mHasCuSeqlens = isEngineInput(*mAudioEngine, binding_names::kCuSeqlens);
+    if (mHasCuSeqlens)
+    {
+        nvinfer1::Dims const cuSeqlensShapeMax
+            = mAudioEngine->getProfileShape(binding_names::kCuSeqlens, 0, nvinfer1::OptProfileSelector::kMAX);
+        int64_t const maxCuSeqlens = cuSeqlensShapeMax.d[0];
+        maxSeqlensHostCapacity = std::max(maxSeqlensHostCapacity, maxCuSeqlens);
+        mCuSeqlens = rt::Tensor(
+            {maxCuSeqlens}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "Qwen3OmniAudioRunner::mCuSeqlens");
+        if (!mAudioContext->setTensorAddress(binding_names::kCuSeqlens, mCuSeqlens.rawPointer()))
+        {
+            LOG_ERROR("Failed to set cu_seqlens input address");
+            return false;
+        }
+    }
+
+    mHasKvLengths = isEngineInput(*mAudioEngine, binding_names::kKvLengths);
+    if (mHasKvLengths)
+    {
+        nvinfer1::Dims const kvLengthsShapeMax
+            = mAudioEngine->getProfileShape(binding_names::kKvLengths, 0, nvinfer1::OptProfileSelector::kMAX);
+        int64_t const maxKvLengths = kvLengthsShapeMax.d[0];
+        maxSeqlensHostCapacity = std::max(maxSeqlensHostCapacity, maxKvLengths);
+        mKvLengths = rt::Tensor(
+            {maxKvLengths}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "Qwen3OmniAudioRunner::mKvLengths");
+        if (!mAudioContext->setTensorAddress(binding_names::kKvLengths, mKvLengths.rawPointer()))
+        {
+            LOG_ERROR("Failed to set kv_lengths input address");
+            return false;
+        }
+    }
+
+    if (maxSeqlensHostCapacity > 0)
+    {
+        mCuSeqlensHost = rt::Tensor({maxSeqlensHostCapacity}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32,
+            "Qwen3OmniAudioRunner::mCuSeqlensHost");
+    }
 
     return true;
 }
@@ -383,6 +448,47 @@ bool Qwen3OmniAudioRunner::preprocessAudio(std::vector<rt::audioUtils::AudioData
         // Calculate total audio tokens
         int64_t const totalAudioTokens = mPaddedMaskIndices.getShape()[0];
 
+        if (mHasCuSeqlens || mHasKvLengths)
+        {
+            // NOTE: Currently, audio encoder always runs at batch size of 1.
+            // Thus, we always set the seqlens size to 2 and set values to {0, totalAudioTokens}.
+            int64_t const seqlensSize = 2;
+            int64_t const seqlensSizeInBytes = seqlensSize * static_cast<int64_t>(sizeof(int32_t));
+            if (mCuSeqlensHost.getMemoryCapacity() < seqlensSizeInBytes)
+            {
+                LOG_ERROR("cu_seqlens host capacity too small: need=%ld bytes, capacity=%ld bytes", seqlensSizeInBytes,
+                    mCuSeqlensHost.getMemoryCapacity());
+                return false;
+            }
+
+            if (!mCuSeqlensHost.reshape({seqlensSize}))
+            {
+                LOG_ERROR("Failed to reshape host cu_seqlens buffer");
+                return false;
+            }
+            int32_t* seqlensData = mCuSeqlensHost.dataPointer<int32_t>();
+            seqlensData[0] = 0;
+            seqlensData[1] = static_cast<int32_t>(totalAudioTokens);
+
+            if (mHasCuSeqlens)
+            {
+                if (!prepareSeqlensInput(mCuSeqlens, *mAudioContext, binding_names::kCuSeqlens, mCuSeqlensHost,
+                        seqlensSize, seqlensSizeInBytes, stream, "cu_seqlens"))
+                {
+                    return false;
+                }
+            }
+
+            if (mHasKvLengths)
+            {
+                if (!prepareSeqlensInput(mKvLengths, *mAudioContext, binding_names::kKvLengths, mCuSeqlensHost,
+                        seqlensSize, seqlensSizeInBytes, stream, "kv_lengths"))
+                {
+                    return false;
+                }
+            }
+        }
+
         // Reshape output buffer
         if (!mAudioEmbedding.reshape({totalAudioTokens, mConfig.audioFeatureDim}))
         {
@@ -457,7 +563,6 @@ bool Qwen3OmniAudioRunner::preprocessAudio(std::vector<rt::audioUtils::AudioData
         }
 
         LOG_DEBUG("Audio encoder inference completed");
-
         audioTokenLengths.push_back(totalAudioTokens);
         mMultimodalMetrics.recordRun(0, 0, 1, totalAudioTokens);
     }

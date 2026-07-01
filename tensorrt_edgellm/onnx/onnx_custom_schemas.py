@@ -840,11 +840,12 @@ _attention_trt_native_schema = OpSchema(
     ],
 )
 
-_vit_trt_attention_schema = OpSchema(
+_trt_ragged_attention_schema = OpSchema(
     name="TRT_Attention",
     domain="trt",
     since_version=_SCHEMA_SINCE_VERSION,
-    doc="TRT-native ViT attention (packed NHD, no causal mask, no KV cache).",
+    doc=
+    "TRT-native ragged attention (packed NHD, no causal mask, no KV cache).",
     inputs=[
         OpSchema.FormalParameter(
             name="query",
@@ -864,22 +865,16 @@ _vit_trt_attention_schema = OpSchema(
         ),
         OpSchema.FormalParameter(
             name="mask",
-            description="Unused — positional placeholder",
+            description="Optional attention mask",
             type_str="T",
             param_option=OpSchema.FormalParameterOption.Optional,
         ),
-        OpSchema.FormalParameter(
-            name="query_lengths",
-            description="Cumulative query lengths [B+1]",
-            type_str="tensor(int32)",
-            param_option=OpSchema.FormalParameterOption.Optional,
-        ),
-        OpSchema.FormalParameter(
-            name="kv_lengths",
-            description="Cumulative KV lengths [B+1]",
-            type_str="tensor(int32)",
-            param_option=OpSchema.FormalParameterOption.Optional,
-        ),
+        OpSchema.FormalParameter(name="query_lengths",
+                                 description="Cumulative query lengths [B+1]",
+                                 type_str="tensor(int32)"),
+        OpSchema.FormalParameter(name="kv_lengths",
+                                 description="Cumulative KV lengths [B+1]",
+                                 type_str="tensor(int32)"),
     ],
     outputs=[
         OpSchema.FormalParameter(
@@ -1364,7 +1359,7 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _rotary_embedding_schema,
     _tensor_scatter_schema,
     _attention_trt_native_schema,
-    _vit_trt_attention_schema,
+    _trt_ragged_attention_schema,
     _gated_delta_net_schema,
     _int4_moe_plugin_schema,
     _nvfp4_moe_plugin_schema,

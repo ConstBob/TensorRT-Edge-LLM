@@ -442,8 +442,8 @@ class TestConfig:
     input_len: Optional[int] = None
     past_kv_len: Optional[int] = None
 
-    # Use TRT-native VIT attention (TRT >= 11) instead of ViTAttentionPlugin
-    trt_native_vit_attn: Optional[bool] = None
+    # Use TRT-native ragged attention (TRT >= 11) instead of plugin
+    trt_native_attn: Optional[bool] = None
 
     # Debug flag for verbose output
     debug: Optional[bool] = None
@@ -642,7 +642,7 @@ class TestConfig:
             "vrms", {TaskType.EXPORT},
             {ModelType.LLM, ModelType.VLM, ModelType.TTS, ModelType.ASR},
             is_required=False),
-        ParameterSpec("trt_native_vit_attn",
+        ParameterSpec("trt_native_attn",
                       "trt11", {
                           TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
                           TaskType.INFERENCE
@@ -871,7 +871,7 @@ class TestConfig:
             elif part.startswith('pkv') and part[3:].isdigit():
                 parsed_params['past_kv_len'] = int(part[3:])
             elif part == 'trt11':
-                parsed_params['trt_native_vit_attn'] = True
+                parsed_params['trt_native_attn'] = True
             else:
                 parsed_params['test_case'] = part
 
@@ -1068,13 +1068,13 @@ class TestConfig:
         # Set defaults after validation
         set_defaults()
 
-    def check_trt_native_vit_attn(self) -> None:
+    def check_trt_native_attn(self) -> None:
         """Skip -trt11 tests when TRT < 11.
 
         l0_jedha and l0_jedha_trt11 share the same test list but run
         different TRT versions. The CI job sets TRT_VERSION.
         """
-        if not self.trt_native_vit_attn:
+        if not self.trt_native_attn:
             return
         trt_ver = os.environ.get('TRT_VERSION', '')
         try:
@@ -1104,7 +1104,7 @@ class TestConfig:
             model_id += "-FP8-KV"
         if self.reduced_vocab_size:
             model_id += f"-rvs{self.reduced_vocab_size}"
-        if self.trt_native_vit_attn:
+        if self.trt_native_attn:
             model_id += "-trt11"
         return model_id
 
@@ -1687,7 +1687,7 @@ class TestConfig:
     def get_visual_onnx_dir(self, precision: str) -> str:
         """Get visual ONNX model directory"""
         name = f"visual-{precision}"
-        if self.trt_native_vit_attn:
+        if self.trt_native_attn:
             name += "-trt11"
         return os.path.join(self.get_onnx_base_dir(), name)
 
@@ -1743,7 +1743,7 @@ class TestConfig:
                 f"-mnit{self.min_image_tokens}"
                 f"-mxit{self.max_image_tokens}"
                 f"-mxpiit{self.max_image_tokens_per_image}")
-        if self.trt_native_vit_attn:
+        if self.trt_native_attn:
             name += "-trt11"
         return os.path.join(self.get_engine_base_dir(), name)
 

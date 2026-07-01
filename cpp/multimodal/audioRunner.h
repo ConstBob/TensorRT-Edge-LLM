@@ -135,7 +135,12 @@ private:
     rt::Tensor mPaddedMaskAfterCNN{}; //!< [num_chunks, max_len_after_cnn] Mask for valid tokens
     rt::Tensor mPaddedMaskIndices{};  //!< [num_valid_elements, 2] Nonzero indices from mask
     rt::Tensor mAudioAttentionMask{}; //!< [num_attention_elems, num_attention_elems] Block-diagonal attention mask
+    rt::Tensor mCuSeqlens{};          //!< [num_windows + 1] Cumulative sequence lengths (optional TRT input)
+    rt::Tensor mCuSeqlensHost{};      //!< Host staging for mCuSeqlens
+    rt::Tensor mKvLengths{};          //!< [num_windows + 1] Separate copy of cu_seqlens (TRT-native attention)
     rt::Tensor mAudioEmbedding{};     //!< [num_audio_tokens, hidden_dim] Audio encoder output
+    bool mHasCuSeqlens{false};        //!< True when engine exposes cu_seqlens input
+    bool mHasKvLengths{false};        //!< True when engine exposes kv_lengths input
 };
 
 } // namespace rt

@@ -363,6 +363,16 @@ inline constexpr char const* kCuSeqlens = "cu_seqlens";
 inline constexpr char const* kKvLengths = "kv_lengths";
 
 /*!
+ * @brief Window KV sequence lengths for Qwen2.5-VL TRT-native attention.
+ *
+ * Same data as cu_window_seqlens but must be a separate tensor for
+ * TRT_Attention query_lengths/kv_lengths inputs in window-attention blocks.
+ *
+ * Shape: [num_windows + 1] (INT32)
+ */
+inline constexpr char const* kKvLengthsWindow = "kv_lengths_window";
+
+/*!
  * @brief Shape-only input used to convey runtime max sequence-length for FMHA launch
  *
  * Shape: [max_seqlen] (INT32)

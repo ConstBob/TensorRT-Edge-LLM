@@ -934,7 +934,7 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
                     "norm_std", "patch_size", "downsample_ratio"):
             if key in config:
                 vis_cfg_out[key] = config[key]
-    if os.environ.get("USE_TRT_NATIVE_VIT_ATTN") == "1":
+    if os.environ.get("USE_TRT_NATIVE_ATTN") == "1":
         vis_cfg_out["use_trt_native_vit_attn"] = True
     cfg_out_path = os.path.join(visual_out_dir, "config.json")
     with open(cfg_out_path, "w") as f:
@@ -1034,6 +1034,8 @@ def _export_audio(model_dir: str,
         rope_theta = text_cfg.get("rope_theta")
         if rope_theta is not None:
             audio_cfg_out["text_config"] = {"rope_theta": rope_theta}
+    if os.environ.get("USE_TRT_NATIVE_ATTN") == "1":
+        audio_cfg_out["use_trt_native_audio_attn"] = True
     cfg_out_path = os.path.join(audio_out_dir, "config.json")
     with open(cfg_out_path, "w") as f:
         json.dump(audio_cfg_out, f, indent=2)
