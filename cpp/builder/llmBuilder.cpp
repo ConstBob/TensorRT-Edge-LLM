@@ -437,6 +437,9 @@ bool LLMBuilder::parseConfig()
             int64_t layerHeadDim
                 = (lc.is_null() || !lc.contains("head_dim")) ? mHeadSize : lc["head_dim"].get<int64_t>();
             mPerLayerHeadSize.push_back(layerHeadDim);
+            int64_t layerNumKVHeads
+                = (lc.is_null() || !lc.contains("num_kv_heads")) ? mNumKVHeads : lc["num_kv_heads"].get<int64_t>();
+            mPerLayerNumKVHeads.push_back(layerNumKVHeads);
         }
         LOG_INFO("Heterogeneous head sizes from kv_layer_configs: %d layers", mNbKVCacheInputs);
     }
@@ -765,16 +768,22 @@ bool LLMBuilder::setupDFlashDraftProfiles(
         // KV cache per-layer: [batch, 2, numKVHeads, kv_capacity, headDim]
         for (int32_t i = 0; i < mNbKVCacheInputs; ++i)
         {
+            int64_t layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
+            int64_t layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
             std::string pastName = std::string(binding_names::kPastKeyValuesTemplate) + "_" + std::to_string(i);
             std::string presentName = std::string(binding_names::kPresentKeyValuesTemplate) + "_" + std::to_string(i);
-            ok &= setOptimizationProfile(&profile, pastName.c_str(), createDims({1, 2, mNumKVHeads, 1, mHeadSize}),
-                createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize}),
-                createDims(
-                    {mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize}));
-            ok &= setOptimizationProfile(&profile, presentName.c_str(), createDims({1, 2, mNumKVHeads, 1, mHeadSize}),
-                createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize}),
-                createDims(
-                    {mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize}));
+            ok &= setOptimizationProfile(&profile, pastName.c_str(),
+                createDims({1, 2, layerNumKVHeads, 1, layerHeadSize}),
+                createDims({mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity,
+                    layerHeadSize}),
+                createDims({mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity,
+                    layerHeadSize}));
+            ok &= setOptimizationProfile(&profile, presentName.c_str(),
+                createDims({1, 2, layerNumKVHeads, 1, layerHeadSize}),
+                createDims({mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity,
+                    layerHeadSize}),
+                createDims({mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity,
+                    layerHeadSize}));
         }
         return ok;
     };
@@ -1032,16 +1041,18 @@ bool LLMBuilder::setupKVCacheProfiles(
     bool result = true;
     if (mBuilderConfig.useTrtNativeOps)
     {
-        // TRT attention: separate K and V caches without the "2" dimension
-        // Shape: [batch, num_kv_heads, seq_len, head_dim]
-        nvinfer1::Dims minKVCacheShape = createDims({1, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize});
-        nvinfer1::Dims optKVCacheShape
-            = createDims({mBuilderConfig.maxBatchSize, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize});
-        nvinfer1::Dims maxKVCacheShape
-            = createDims({mBuilderConfig.maxBatchSize, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize});
-
         for (int i = 0; i < mNbKVCacheInputs; ++i)
         {
+            int64_t layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
+            int64_t layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
+            // TRT attention: separate K and V caches without the "2" dimension
+            // Shape: [batch, num_kv_heads, seq_len, head_dim]
+            nvinfer1::Dims minKVCacheShape
+                = createDims({1, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
+            nvinfer1::Dims optKVCacheShape = createDims(
+                {mBuilderConfig.maxBatchSize, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
+            nvinfer1::Dims maxKVCacheShape = createDims(
+                {mBuilderConfig.maxBatchSize, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
             // K cache bindings
             result &= setOptimizationProfile(&contextProfile, binding_names::formatKCacheName(i, true).c_str(),
                 minKVCacheShape, optKVCacheShape, maxKVCacheShape);
@@ -1269,10 +1280,8 @@ bool LLMBuilder::copyConfig()
         for (int i = 0; i < mNbKVCacheInputs; ++i)
         {
             normalizedLayerTypes.push_back("attention");
-            // NOTE: num_kv_heads is uniform for all current models (E2B/E4B both use 2 for all
-            // layer types). If a future model has different KV head counts per layer type,
-            // add a mPerLayerNumKVHeads vector analogous to mPerLayerHeadSize.
-            kvLayerConfigs.push_back(Json{{"num_kv_heads", mNumKVHeads}, {"head_dim", mPerLayerHeadSize[i]}});
+            int64_t layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
+            kvLayerConfigs.push_back(Json{{"num_kv_heads", layerNumKVHeads}, {"head_dim", mPerLayerHeadSize[i]}});
         }
         // Hybrid models also have recurrent (mamba) layers that need routing entries.
         for (int i = 0; i < mNumLinearAttnLayers; ++i)

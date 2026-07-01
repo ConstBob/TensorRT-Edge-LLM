@@ -94,14 +94,23 @@ public:
     void setPluginNamespace(char const* pluginNamespace) noexcept;
 
 private:
-    //! Split a BHSD-layout KV cache [B, 2, Hkv, cap, D] into separate K [B, cap, Hkv, D] and V [B, cap, Hkv, D].
+    //! Split a BHSD-layout KV cache [B, 2, Hkv, cap, D] into separate K and V tensors.
+    //! When seqLen == 0 (default), copies the full capacity → output is [B, cap, Hkv, D].
+    //! When seqLen > 0, copies only the first seqLen tokens → output is [B, seqLen, Hkv, D].
+    //! The compact form allows downstream kernels to derive batch stride from the output's S dimension.
     static std::pair<rt::Tensor, rt::Tensor> deinterleaveKVCache(rt::Tensor const& kvCacheTensor,
         std::byte*& workspacePtr, int32_t batchSize, int32_t numKVHeads, int32_t kvCacheCapacity, int32_t headSize,
-        cudaStream_t stream);
+        int32_t seqLen, cudaStream_t stream);
 
     //! Launch the CuTe DSL FFPA d512 causal attention kernel.
     static void dispatchFFPAKernel(half const* q, half const* k, half const* v, half* o, int32_t batchSize,
         int32_t seqlenQ, int32_t seqlenK, int32_t numQHeads, int32_t numKVHeads, int32_t headDim, cudaStream_t stream);
+
+    //! Zero the attention output buffer before FFPA prefill.
+    //! FFPA is a dense causal kernel with no cu_seqlens support, so it processes padding positions as real data.
+    //! Zeroing the output ensures padding positions don't carry NaN/garbage into downstream layers.
+    static void zeroPrefillOutputForPaddingForFFPA(rt::Tensor& attentionOutput, int32_t batchSize, int32_t seqLen,
+        int32_t numQHeads, int32_t headSize, cudaStream_t stream);
 
 protected:
     std::string mLayerName; //!< Plugin layer name

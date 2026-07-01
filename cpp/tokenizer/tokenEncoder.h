@@ -132,6 +132,21 @@ public:
         mByteFallback = enable;
     }
 
+    /*!
+     * @brief Set explicit BPE merge priorities from tokenizer.json merges list.
+     *
+     * When set, the BPE algorithm uses these priorities instead of vocabulary rank
+     * to determine merge order. This is required for SentencePiece-style tokenizers
+     * (e.g. Gemma) where merge order != vocabulary rank order.
+     *
+     * @param mergePriorities Map from null-byte-separated pair key ("a\\0b") to merge priority (0 = highest)
+     */
+    void setMergePriorities(std::unordered_map<std::string, Rank> mergePriorities) noexcept
+    {
+        mMergePriorities = std::move(mergePriorities);
+        mUseMergePriorities = true;
+    }
+
 private:
     /**
      * @brief Byte Pair Encoding implementation
@@ -148,7 +163,9 @@ private:
     TokenToRanks mSpecialTokensEncoder;
     RanksToToken mSpecialTokensDecoder;
     size_t mVocabSize;
-    bool mByteFallback{false}; //!< Whether to fall back to byte-level tokens (<0xNN>) for unknown tokens
+    bool mByteFallback{false};       //!< Whether to fall back to byte-level tokens (<0xNN>) for unknown tokens
+    bool mUseMergePriorities{false}; //!< Whether to use explicit merge priorities instead of vocab rank
+    std::unordered_map<std::string, Rank> mMergePriorities; //!< Merge pair -> priority (lower = merge first)
 };
 
 } // namespace tokenizer

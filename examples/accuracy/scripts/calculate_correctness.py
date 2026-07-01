@@ -93,9 +93,13 @@ def clean_text(text):
         text = text[text.rfind("<|channel>response") +
                     len("<|channel>response"):]
     elif "<|channel>thought" in text:
-        # Thinking output without response section — no extractable answer via clean_text.
-        # Fall through to MCQ parser which will try heuristic extraction.
-        pass
+        # Gemma4 alternate format: ``<|channel>thought\n...<channel|>ANSWER<turn|>``
+        # The closing ``<channel|>`` ends the thought block; answer follows immediately.
+        if "<channel|>" in text:
+            text = text[text.rfind("<channel|>") + len("<channel|>"):]
+        else:
+            # Truncated thinking (hit max-length) — try last 500 chars for heuristic
+            text = text[-500:]
     # Drop chat / tokenizer special tokens (e.g. <|endoftext|>, <|im_end|>, <turn|>,
     # <end_of_turn>) so MCQ output like "C<|im_end|>" or "C<turn|>" still scores.
     # Replace with space (not empty) so "C<turn|>The..." → "C The..." preserves boundary.
