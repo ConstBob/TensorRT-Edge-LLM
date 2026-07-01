@@ -118,6 +118,24 @@ void topKtopPSamplingFromLogits(rt::Tensor const& logits, rt::Tensor& selectedIn
     rt::Tensor& workspace, cudaStream_t stream, uint64_t philoxSeed = 42, uint64_t philoxOffset = 0);
 
 /*!
+ * \brief Apply sparse per-batch logit biases in place before sampling.
+ *
+ * Biases are represented in CSR-style flattened buffers. For each batch row
+ * `b`, entries in `[offsets[b], offsets[b + 1])` are added to
+ * `logits[b, tokenIds[i]]`. Invalid token IDs are ignored defensively; callers
+ * should still validate token IDs before invoking this helper.
+ *
+ * \param[in,out] logits Logits tensor [GPU, Float] with shape [batch-size, vocab-size]
+ * \param[in] tokenIds Flattened biased token IDs [GPU, Int32] with shape [num-biased-tokens]
+ * \param[in] biasValues Flattened bias values [GPU, Float] with shape [num-biased-tokens]
+ * \param[in] offsets Per-batch CSR offsets [GPU, Int32] with shape [batch-size + 1]
+ * \param[in] stream CUDA stream to execute the kernel
+ * \throws std::runtime_error If tensor validation or CUDA launch fails
+ */
+void applyLogitBias(rt::Tensor& logits, rt::Tensor const& tokenIds, rt::Tensor const& biasValues,
+    rt::Tensor const& offsets, cudaStream_t stream);
+
+/*!
  * \brief Select all top-K elements from input tensor.
  *
  * Returns topK indices and raw values from input with no transformations applied.

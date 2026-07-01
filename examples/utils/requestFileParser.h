@@ -39,6 +39,7 @@ namespace exampleUtils
  *     "temperature": float,                   // optional, default 1.0
  *     "top_p": float,                         // optional, default 0.8
  *     "top_k": int,                           // optional, default 50
+ *     "logit_bias": {token_id: bias},         // optional default for all requests
  *     "max_generate_length": int,             // optional, default 256
  *     "apply_chat_template": bool,            // optional, default true
  *     "add_generation_prompt": bool,          // optional, default true
@@ -47,6 +48,7 @@ namespace exampleUtils
  *     "requests": [
  *       {
  *         "lora_name": str,                   // optional
+ *         "logit_bias": {token_id: bias},     // optional, overrides top-level default
  *         "save_system_prompt_kv_cache": bool,
  *         "disable_spec_decode": bool,
  *         "messages": [

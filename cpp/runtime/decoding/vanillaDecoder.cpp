@@ -23,6 +23,7 @@
 #include "profiling/metrics.h"
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
+#include "runtime/decoding/logitBias.h"
 #include "sampler/sampling.h"
 
 #include <optional>
@@ -35,7 +36,8 @@ namespace rt
 namespace
 {
 constexpr int32_t kDecodeProfile{1};
-}
+
+} // namespace
 
 VanillaDecoder::VanillaDecoder(DecodingRuntimeContext& runtime)
     : mRuntime(runtime)
@@ -102,6 +104,8 @@ bool VanillaDecoder::decodeStep(DecodingInferenceContext& context)
         LOG_ERROR("Failed to execute vanilla decoding step for base model.");
         return false;
     }
+
+    applyLogitBias(mRuntime.logitBias, mRuntime.base.pipelineIO.outputLogits, context, context.stream);
 
     check::check(mRuntime.sampling.indices.reshape({activeBatchSize, 1}), "Tensor reshape failed");
     if (shouldUseNonGreedySampling(context.temperature, context.topK, context.topP))

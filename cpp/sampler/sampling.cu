@@ -653,6 +653,61 @@ __global__ void softmaxKernel(
     }
 }
 
+__global__ void applyLogitBiasKernel(
+    float* logits, int32_t const* tokenIds, float const* biasValues, int32_t const* offsets, int32_t vocabSize)
+{
+    int32_t const batchId = static_cast<int32_t>(blockIdx.x);
+    int32_t const begin = offsets[batchId];
+    int32_t const end = offsets[batchId + 1];
+    float* rowLogits = logits + static_cast<int64_t>(batchId) * vocabSize;
+
+    for (int32_t entryIdx = begin + static_cast<int32_t>(threadIdx.x); entryIdx < end;
+        entryIdx += static_cast<int32_t>(blockDim.x))
+    {
+        int32_t const tokenId = tokenIds[entryIdx];
+        if (tokenId >= 0 && tokenId < vocabSize)
+        {
+            rowLogits[tokenId] += biasValues[entryIdx];
+        }
+    }
+}
+
+void applyLogitBias(rt::Tensor& logits, rt::Tensor const& tokenIds, rt::Tensor const& biasValues,
+    rt::Tensor const& offsets, cudaStream_t stream)
+{
+    check::check(logits.getDeviceType() == rt::DeviceType::kGPU && tokenIds.getDeviceType() == rt::DeviceType::kGPU
+            && biasValues.getDeviceType() == rt::DeviceType::kGPU && offsets.getDeviceType() == rt::DeviceType::kGPU,
+        "All tensors must be on GPU");
+    check::check(logits.getDataType() == nvinfer1::DataType::kFLOAT
+            && tokenIds.getDataType() == nvinfer1::DataType::kINT32
+            && biasValues.getDataType() == nvinfer1::DataType::kFLOAT
+            && offsets.getDataType() == nvinfer1::DataType::kINT32,
+        "Invalid tensor data types");
+
+    auto const logitsShape = logits.getShape();
+    auto const tokenIdsShape = tokenIds.getShape();
+    auto const biasValuesShape = biasValues.getShape();
+    auto const offsetsShape = offsets.getShape();
+
+    check::check(logitsShape.getNumDims() == 2 && tokenIdsShape.getNumDims() == 1 && biasValuesShape.getNumDims() == 1
+            && offsetsShape.getNumDims() == 1,
+        "Invalid tensor dimensions");
+    check::check(tokenIdsShape[0] == biasValuesShape[0], "Logit bias token/value shape mismatch");
+    check::check(offsetsShape[0] == logitsShape[0] + 1, "Logit bias offsets shape mismatch");
+
+    int32_t const batchSize = static_cast<int32_t>(logitsShape[0]);
+    int32_t const vocabSize = static_cast<int32_t>(logitsShape[1]);
+    int64_t const numBiasedTokens = tokenIdsShape[0];
+    if (batchSize == 0 || vocabSize == 0 || numBiasedTokens == 0)
+    {
+        return;
+    }
+
+    constexpr int32_t kBLOCK_SIZE = 256;
+    applyLogitBiasKernel<<<batchSize, kBLOCK_SIZE, 0, stream>>>(logits.dataPointer<float>(),
+        tokenIds.dataPointer<int32_t>(), biasValues.dataPointer<float>(), offsets.dataPointer<int32_t>(), vocabSize);
+}
+
 // Initialize ID values and offsets for top-p sampling
 __global__ void topPInitialize(
     int32_t* topPIdValBuf, int32_t* topPOffsetBuf, int32_t* beginTopPOffsetBuf, int32_t batchSize, int32_t vocabSize)

@@ -19,6 +19,7 @@
 #include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
+#include "common/inputLimits.h"
 #include "common/logger.h"
 #include "common/mathUtils.h"
 #include "common/safetensorsUtils.h"
@@ -247,6 +248,7 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
             {maxSamplingSize}, rt::DeviceType::kGPU, DataType::kINT32, "LLMInferenceRuntime::mSamplingIndices");
         mSamplingScores = rt::Tensor(
             {maxSamplingSize}, rt::DeviceType::kGPU, DataType::kFLOAT, "LLMInferenceRuntime::mSamplingScores");
+        allocateLogitBias(mLogitBias, mMaxRuntimeBatchSize);
 
         // Batch mapping tensor for batch eviction.
         mDeviceBatchMapping = rt::Tensor(
@@ -294,7 +296,10 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
         check::check(vocabMapTensors[0].getShape().getNumDims() == 1, "vocab_map tensor should be 1D");
         check::check(vocabMapTensors[0].getShape()[0] == mDeployment.base.reducedVocabSize,
             "vocab_map tensor length should match base model reduced vocab size");
+        check::check(vocabMapTensors[0].getDataType() == DataType::kINT32, "vocab_map tensor should be INT32");
         mBaseVocabMappingTable = std::move(vocabMapTensors[0]);
+        setLogitBiasVocabMap(
+            mLogitBias, mBaseVocabMappingTable, mDeployment.base.vocabSize, mDeployment.base.reducedVocabSize, stream);
         LOG_INFO("Base model vocabulary mapping table successfully loaded.");
     }
 
@@ -422,7 +427,7 @@ void LLMInferenceRuntime::buildDecodingRuntimeContext()
     SamplingBuffers sampling{mSamplingWorkspace, mSamplingIndices, mSamplingScores, mBaseVocabMappingTable,
         mHostPackedTokenIds, mHostSelectedTokenIds};
     mDecodingRuntimeContext.reset(new DecodingRuntimeContext{
-        mDeployment, mMaxRuntimeBatchSize, baseResources, preprocessResources, *mTokenizer, sampling});
+        mDeployment, mMaxRuntimeBatchSize, baseResources, preprocessResources, *mTokenizer, mLogitBias, sampling});
 }
 
 void LLMInferenceRuntime::setActionNoiseSeed(int32_t seed) noexcept
@@ -518,6 +523,8 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     context.topK = enableSpecDecode ? 0 : request.topK;
     context.outputThinkerEmbeddings = outputThinkerEmbeddings;
     context.onTokenGenerated = request.onTokenGenerated;
+
+    prepareLogitBias(mLogitBias, request, context);
 
     // Forward per-slot stop strings and cache the longest length to avoid
     // recomputing it on every emitChunks iteration.
@@ -934,6 +941,37 @@ bool LLMInferenceRuntime::validateRequestConfig(LLMGenerationRequest const& requ
             LOG_ERROR("Request %d in batch is empty: no messages provided", i);
             return false;
         }
+        auto const& logitBias = request.requests[i].logitBias;
+        if (logitBias.size() > limits::security::kMaxLogitBiasTokens)
+        {
+            LOG_ERROR("Request %d has too many logit_bias entries: %zu (max: %zu)", i, logitBias.size(),
+                limits::security::kMaxLogitBiasTokens);
+            return false;
+        }
+        for (auto const& [tokenId, bias] : logitBias)
+        {
+            if (tokenId < 0 || tokenId >= mDeployment.base.vocabSize)
+            {
+                LOG_ERROR("Request %d logit_bias token ID %d is outside the full vocabulary range [0, %d)", i, tokenId,
+                    mDeployment.base.vocabSize);
+                return false;
+            }
+            if (!std::isfinite(bias) || bias < limits::security::kMinLogitBias
+                || bias > limits::security::kMaxLogitBias)
+            {
+                LOG_ERROR("Request %d logit_bias for token ID %d must be finite and in [%.1f, %.1f], got %.6f", i,
+                    tokenId, limits::security::kMinLogitBias, limits::security::kMaxLogitBias, bias);
+                return false;
+            }
+        }
+    }
+    bool const speculativeDecoderAvailable = mDecoderRegistry && mDecoderRegistry->hasSpeculativeDecoder();
+    if (shouldRejectLogitBiasWithSpecDecode(request, speculativeDecoderAvailable))
+    {
+        LOG_ERROR(
+            "logit_bias is not supported while speculative decoding is enabled; set disable_spec_decode=true or use "
+            "a vanilla engine.");
+        return false;
     }
     if (hasAudio && !mAudioRunner)
     {
@@ -1147,6 +1185,8 @@ bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context)
         "Failed to prepare base model for prefill step.");
     check::check(mBaseExecutor->execute(context.stream), "Failed to execute base model for prefill step.");
     mSharedResources->cacheManagers[0]->commitSequenceLength(mPipelineIO->contextLengths, context.stream);
+
+    applyLogitBias(mLogitBias, mPipelineIO->outputLogits, context, context.stream);
 
     // Sampling from the prefill stage logits follows the same policy as vanilla decoding.
     // Speculative decoders reach this code with greedy-compatible context params because
@@ -1666,6 +1706,10 @@ bool LLMInferenceRuntime::performBatchEvict(DecodingInferenceContext& context, D
     rt::compactVector(batchMapping, context.batchIndexMapping);
     rt::compactVector(batchMapping, context.slotStreams);
     rt::compactVector(batchMapping, context.stopStringsPerSlot);
+    rt::compactVector(batchMapping, context.logitBiasPerSlot);
+    context.hasLogitBias = std::any_of(context.logitBiasPerSlot.begin(), context.logitBiasPerSlot.end(),
+        [](auto const& slotLogitBias) { return !slotLogitBias.empty(); });
+    context.logitBiasGpuDirty = context.hasLogitBias;
 
     // Update active batch size
     context.activeBatchSize = newActiveBatch;

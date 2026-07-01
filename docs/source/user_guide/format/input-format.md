@@ -10,6 +10,7 @@ This guide describes the input JSON format for the LLM inference tool. The forma
     "temperature": 1.0,
     "top_p": 0.8,
     "top_k": 50,
+    "logit_bias": {"123": -100.0},
     "max_generate_length": 256,
     "apply_chat_template": true,
     "enable_thinking": false,
@@ -25,6 +26,7 @@ This guide describes the input JSON format for the LLM inference tool. The forma
             "lora_name": "optional_lora_name",
             "save_system_prompt_kv_cache": false,
             "disable_spec_decode": false,
+            "logit_bias": {"456": 5.0},
             "stop": ["optional_stop_string"]
         }
     ]
@@ -42,6 +44,7 @@ This guide describes the input JSON format for the LLM inference tool. The forma
 - **`temperature`** (default: 1.0): Sampling temperature (0.0 = deterministic)
 - **`top_p`** (default: 0.8): Nucleus sampling threshold
 - **`top_k`** (default: 50): Top-k sampling parameter
+- **`logit_bias`** (optional): Sparse map from token ID to bias value. The top-level map is the default for all requests.
 - **`max_generate_length`** (default: 256): Maximum tokens to generate
 - **`apply_chat_template`** (default: true): Apply chat template formatting
 - **`add_generation_prompt`** (default: true): Add generation prompt token sequence
@@ -53,6 +56,7 @@ This guide describes the input JSON format for the LLM inference tool. The forma
 - **`lora_name`** (optional): LoRA adapter name from `available_lora_weights`
 - **`save_system_prompt_kv_cache`** (optional): Cache system prompt KV for reuse
 - **`disable_spec_decode`** (optional, default: false): Disable EAGLE speculative decoding for this request even if draft engine is loaded
+- **`logit_bias`** (optional): Request-specific sparse logit-bias map. When set, it overrides the top-level `logit_bias` default for this request.
 - **`stop`** (optional): String or array of strings that halt generation when produced in the output. The stop string itself is excluded from the returned text. Each request in a batch may declare its own list independently. Defaults to no stop strings.
 
 ### Message Fields
@@ -194,6 +198,33 @@ When using EAGLE speculative decoding, you can disable it for specific requests:
 
 **Note:** If any request in a batch has `disable_spec_decode: true`, speculative decoding will be disabled for the entire batch. Requests within one batch cannot use different decoding strategies simultaneously for now.
 
+### Logit Bias
+
+`logit_bias` accepts a sparse map of tokenizer token IDs to additive logit bias values. Positive values make a token more likely, and negative values make it less likely. Bias values must be finite and in `[-100.0, 100.0]`; each map may contain up to 1024 token IDs.
+
+Top-level `logit_bias` applies to every request by default. A request-level `logit_bias` overrides the top-level default for that request.
+
+```json
+{
+    "logit_bias": {"123": -100.0},
+    "requests": [
+        {
+            "messages": [
+                {"role": "user", "content": "Avoid token 123 by default."}
+            ]
+        },
+        {
+            "messages": [
+                {"role": "user", "content": "Prefer token 456 for this request."}
+            ],
+            "logit_bias": {"456": 5.0}
+        }
+    ]
+}
+```
+
+**Speculative decoding limitation:** Requests with a non-empty `logit_bias` map are rejected while speculative decoding is active. Set `disable_spec_decode: true` to explicitly use vanilla decoding for that batch before sending logit bias. Future support for using `logit_bias` with speculative decoding is tracked in [GitLab issue #479](https://gitlab-master.nvidia.com/TensorRT/tensorrt-edge-llm/tensorrt-edge-llm/-/issues/479).
+
 ### Stop Strings
 
 Generation halts as soon as any of the specified substrings appears in the decoded output; the stop string itself is excluded from the returned text. Accepts a single string or an array. Each request carries its own independent list — requests in the same batch may stop on different strings or none at all.
@@ -217,5 +248,6 @@ When a stop string triggers termination, the request's finish reason is `stop-wo
 
 - System prompt: Uses provided system message, or model default from chat template
 - LoRA: All requests in same batch must use same adapter
+- Logit bias: Supported through vanilla decoding; active speculative decoding must be explicitly disabled first.
 - Paths: Use absolute or relative paths for images/videos
 - Format: Follows OpenAI chat completion API structure

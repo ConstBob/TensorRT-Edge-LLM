@@ -397,7 +397,8 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readwrite("messages", &LLMGenerationRequest::Request::messages)
         .def_readwrite("image_buffers", &LLMGenerationRequest::Request::imageBuffers)
         .def_readwrite("audio_buffers", &LLMGenerationRequest::Request::audioBuffers)
-        .def_readwrite("stop_strings", &LLMGenerationRequest::Request::stopStrings);
+        .def_readwrite("stop_strings", &LLMGenerationRequest::Request::stopStrings)
+        .def_readwrite("logit_bias", &LLMGenerationRequest::Request::logitBias);
 
     // ========================================================================
     // Streaming
@@ -535,7 +536,8 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         "create_generation_request",
         [](std::vector<std::vector<Message>> const& batchMessages, float temperature, float topP, int64_t topK,
             int64_t maxGenerateLength, bool applyChatTemplate, bool addGenerationPrompt, bool enableThinking,
-            std::string const& loraWeightsName, bool saveSystemPromptKvCache, bool disableSpecDecode) {
+            std::string const& loraWeightsName, bool saveSystemPromptKvCache, bool disableSpecDecode,
+            std::unordered_map<int32_t, float> const& logitBias) {
             LLMGenerationRequest request;
             request.temperature = temperature;
             request.topP = topP;
@@ -552,6 +554,7 @@ PYBIND11_MODULE(_edgellm_runtime, m)
             {
                 LLMGenerationRequest::Request req;
                 req.messages = messages;
+                req.logitBias = logitBias;
                 request.requests.push_back(std::move(req));
             }
             return request;
@@ -560,5 +563,6 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         py::arg("max_generate_length") = 256, py::arg("apply_chat_template") = true,
         py::arg("add_generation_prompt") = true, py::arg("enable_thinking") = false, py::arg("lora_weights_name") = "",
         py::arg("save_system_prompt_kv_cache") = false, py::arg("disable_spec_decode") = false,
+        py::arg("logit_bias") = std::unordered_map<int32_t, float>{},
         "Create a generation request from a batch of message lists.");
 }

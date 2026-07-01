@@ -733,6 +733,150 @@ print('HLAPI_GENERATE_WITH_AUDIO_PASSED')
             pytest.fail(
                 f"HLAPI audio generate failed:\n{result.get('output', '')}")
 
+    def test_hlapi_generate_with_logit_bias(
+            self, test_param: str, executable_files: Dict[str, str],
+            remote_config: Optional[RemoteConfig], test_logger: logging.Logger,
+            env_config: EnvironmentConfig) -> None:
+        """Validate non-streaming HLAPI logit_bias behavior.
+
+        Runs generation in a subprocess against a real engine. The +100 case
+        selects a non-special tokenizer ID and verifies that deterministic
+        generation returns it for both the prefill-sampled token and a vanilla
+        decode token. The -100 case first records the baseline greedy token,
+        then verifies biasing that token suppresses it. When a draft model is
+        present, speculative decoding is explicitly disabled because combining
+        it with logit bias is rejected.
+        """
+        config = TestConfig.from_param_string(test_param, ModelType.LLM,
+                                              TaskType.INFERENCE, env_config)
+
+        engine_dir = config.get_llm_engine_dir()
+        test_logger.info("HLAPI logit_bias: engine=%s", engine_dir)
+
+        prompt = "Complete this sentence with one short word: NVIDIA makes"
+        setup = self._build_hlapi_env_setup(env_config.trt_package_dir or "")
+
+        script = f"""\
+{setup}
+import json
+import os
+from experimental.server import LLM, SamplingParams
+
+engine_dir = {engine_dir!r}
+
+def pick_positive_bias_target_id(engine_dir):
+    tokenizer_path = os.path.join(engine_dir, 'tokenizer.json')
+    with open(tokenizer_path, encoding='utf-8') as f:
+        tokenizer = json.load(f)
+
+    special_ids = set()
+    for token in tokenizer.get('added_tokens', []):
+        token_id = token.get('id')
+        if token.get('special') and isinstance(token_id, int):
+            special_ids.add(token_id)
+    for token_id, token in tokenizer.get('added_tokens_decoder', {{}}).items():
+        if token.get('special'):
+            try:
+                special_ids.add(int(token_id))
+            except ValueError:
+                pass
+
+    vocab = tokenizer.get('model', {{}}).get('vocab', {{}})
+    preferred_pieces = (
+        ' NVIDIA', 'NVIDIA', ' hello', 'Hello', ' the', 'The',
+        ' answer', 'Answer', ' cat', 'cat', '!', '.',
+        'ĠNVIDIA', 'Ġhello', 'Ġthe', 'Ġanswer', 'Ġcat',
+        '▁NVIDIA', '▁hello', '▁the', '▁answer', '▁cat',
+    )
+    for piece in preferred_pieces:
+        token_id = vocab.get(piece)
+        if isinstance(token_id, int) and token_id not in special_ids:
+            return token_id
+
+    vocab_items = (
+        (piece, token_id) for piece, token_id in vocab.items()
+        if isinstance(token_id, int)
+    )
+    for piece, token_id in sorted(vocab_items, key=lambda item: item[1]):
+        if (
+            token_id not in special_ids
+            and piece
+            and not piece.startswith(('<', '[', '{{'))
+        ):
+            return token_id
+
+    raise RuntimeError('Could not find a non-special token ID for logit_bias')
+
+def generate_ids(llm, *, max_tokens=1, logit_bias=None):
+    outputs = llm.generate(
+        [{prompt!r}],
+        SamplingParams(
+            temperature=0.0,
+            top_p=1.0,
+            top_k=1,
+            max_tokens=max_tokens,
+            disable_spec_decode=llm.has_draft_model,
+            logit_bias=logit_bias or {{}},
+        ),
+    )
+    ids = outputs[0].token_ids
+    assert ids, 'Expected at least one generated token id'
+    return ids
+
+llm = LLM(engine_dir=engine_dir)
+
+target_token_id = pick_positive_bias_target_id(engine_dir)
+forced_token_count = 2
+positive_token_ids = generate_ids(
+    llm,
+    max_tokens=forced_token_count,
+    logit_bias={{target_token_id: 100.0}},
+)
+print(f'HLAPI_POSITIVE_TARGET_ID={{target_token_id}}')
+print(f'HLAPI_POSITIVE_TOKEN_IDS={{positive_token_ids}}')
+assert len(positive_token_ids) == forced_token_count, (
+    f'Expected {{forced_token_count}} generated tokens, got {{positive_token_ids}}'
+)
+assert all(token_id == target_token_id for token_id in positive_token_ids), (
+    f'Expected +100 logit_bias to force {{target_token_id}} for prefill and decode, '
+    f'got {{positive_token_ids}}'
+)
+
+baseline_token_id = generate_ids(llm)[0]
+negative_token_id = generate_ids(
+    llm, logit_bias={{baseline_token_id: -100.0}}
+)[0]
+print(f'HLAPI_NEGATIVE_BANNED_ID={{baseline_token_id}}')
+print(f'HLAPI_NEGATIVE_TOKEN_ID={{negative_token_id}}')
+assert negative_token_id != baseline_token_id, (
+    f'Expected -100 logit_bias to suppress {{baseline_token_id}}, got {{negative_token_id}}'
+)
+print('HLAPI_GENERATE_WITH_LOGIT_BIAS_PASSED')
+"""
+        script_escaped = shlex.quote(script)
+        cmd = ['bash', '-c', f'python3 -c {script_escaped}']
+        env_vars = None
+        if env_config.trt_package_dir:
+            env_vars = {
+                "LD_LIBRARY_PATH":
+                f"$LD_LIBRARY_PATH:{env_config.trt_package_dir}/lib"
+            }
+
+        with timer_context(f"HLAPI logit_bias for {config.model_name}",
+                           test_logger):
+            result = run_command(cmd=cmd,
+                                 remote_config=remote_config,
+                                 timeout=600,
+                                 logger=test_logger,
+                                 env_vars=env_vars)
+        if not result['success']:
+            pytest.fail(
+                f"HLAPI logit_bias failed: {result.get('error', 'Unknown')}")
+        if 'HLAPI_GENERATE_WITH_LOGIT_BIAS_PASSED' not in result.get(
+                'output', ''):
+            pytest.fail(
+                f"HLAPI logit_bias output:\n{result.get('output', '')}")
+
     def test_hlapi_streaming(self, test_param: str,
                              executable_files: Dict[str, str],
                              remote_config: Optional[RemoteConfig],
