@@ -271,7 +271,7 @@ size_t CausalConv1dPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* /* in
 
 int32_t CausalConv1dPlugin::getAliasedInput(int32_t outputIndex) noexcept
 {
-    // WAR (FIXME nvbug 6330354): this is not the correct plugin API usage. The
+    // WAR: this is not the correct plugin API usage. The
     // plugin updates the conv state in place, so the correct return is the
     // conv-state input index. We return -1 to drop the alias because declaring it
     // makes Myelin keep a redundant per-layer state copy (the perf regression).

@@ -1072,7 +1072,7 @@ def _parse_accept_hidden_layer(
          the layout written by the standalone-Thinker quant export, which
          promotes the field out of ``talker_config`` into the Thinker root.
       2. ``root_config["talker_config"]["accept_hidden_layer"]`` for the
-         full multimodal HF config (dense Qwen3-Omni or MoE root layout).
+         full multimodal HF config.
       3. ``root_config["accept_hidden_layer"]`` as a defensive fallback for
          standalone Talker checkpoints where this field already lives at
          root.

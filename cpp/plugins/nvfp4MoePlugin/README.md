@@ -119,7 +119,8 @@ and rebuild.
 ## Validation
 
 The split-path plugin accuracy entry is
-[the SM100/101/110 plugin accuracy test](../../../tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py).
+[the SM110 CuTeDSL MoE unit test](../../../unittests/nvfp4MoeCuteDslSm110Tests.cu)
+(`CuteDslNvfp4MoeSm110Test.accuracy`).
 Avoid validating production routing by instantiating Python-only helper
 modules directly; model integration should be tested at the export path
 that explicitly emits `Nvfp4MoePlugin` for an SM100/101/110 target.
@@ -131,5 +132,5 @@ that explicitly emits `Nvfp4MoePlugin` for an SM100/101/110 target.
    [`kernelSrcs/nvfp4_moe_cutedsl/README.md`](../../../kernelSrcs/nvfp4_moe_cutedsl/README.md)).
 3. `python kernelSrcs/build_cutedsl.py --kernels nvfp4_moe --gpu_arch sm_110 --arch aarch64 --clean`
 4. Build the plugin with `-DENABLE_CUTE_DSL=nvfp4_moe -DCMAKE_CUDA_ARCHITECTURES=110a`.
-5. Run the split-path plugin accuracy test
-   (`tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py`).
+5. Run the split-path plugin accuracy test:
+   `./build/unitTest --gtest_filter="CuteDslNvfp4MoeSm110Test.accuracy"`.

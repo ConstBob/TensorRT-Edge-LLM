@@ -735,7 +735,7 @@ size_t AttentionPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, 
 
 int32_t AttentionPlugin::getAliasedInput(int32_t outputIndex) noexcept
 {
-    // WAR (FIXME nvbug 6330354): this is not the correct plugin API usage. The
+    // WAR:this is not the correct plugin API usage. The
     // plugin updates the KV cache in place, so the correct return is
     // kIN_KV_CACHE_IDX (output kOUT_KV_CACHE_IDX aliases that input). We return -1
     // to drop the alias because declaring it makes Myelin keep a redundant

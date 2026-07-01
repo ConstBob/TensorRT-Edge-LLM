@@ -607,7 +607,7 @@ def quantize_qwen3_omni(
     in a single pass.  Both submodels' amax statistics come from the SAME
     realistic multimodal distribution, matching what
     ``tensorrt_edgellm.quantization.llm_quantization.quantize_llm`` does
-    for the dense Qwen3-Omni-4B model.
+    for the dense model.
 
     Notes:
       * ``num_samples`` / ``max_length`` / ``dataset`` are kept in the
