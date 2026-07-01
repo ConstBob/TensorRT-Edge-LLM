@@ -19,6 +19,7 @@
 #include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "common/mathUtils.h"
+#include "common/trtUtils.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
 #include "kernels/preprocessKernels/imageUtilKernels.h"
 #include "profiling/timer.h"
@@ -214,8 +215,7 @@ bool QwenViTRunner::allocateBuffer(cudaStream_t stream)
     // so we allocate a separate buffer and copy the same cu_seqlens data at runtime.
     if (mUseTrtNativeVitAttn)
     {
-        bool const hasKvLengths
-            = mVisualEngine->getTensorIOMode(binding_names::kKvLengths) != nvinfer1::TensorIOMode::kNONE;
+        bool const hasKvLengths = isEngineInput(*mVisualEngine, binding_names::kKvLengths);
         if (!hasKvLengths)
         {
             LOG_ERROR("Config has use_trt_native_vit_attn=true but engine is missing kv_lengths binding");
@@ -226,8 +226,7 @@ bool QwenViTRunner::allocateBuffer(cudaStream_t stream)
         setTensorAddressStatus &= mVisualContext->setTensorAddress(binding_names::kKvLengths, mKvLengths.rawPointer());
     }
 
-    mHasMaxSeqLenCarrier
-        = mVisualEngine->getTensorIOMode(binding_names::kMaxSeqLenCarrier) != nvinfer1::TensorIOMode::kNONE;
+    mHasMaxSeqLenCarrier = isEngineInput(*mVisualEngine, binding_names::kMaxSeqLenCarrier);
     if (mHasMaxSeqLenCarrier)
     {
         mMaxSeqLenCarrier = rt::Tensor(

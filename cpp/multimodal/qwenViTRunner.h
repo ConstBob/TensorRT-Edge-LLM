@@ -256,6 +256,7 @@ protected:
     rt::Tensor mCuSeqlens{};             //!< Cumulative sequence lengths tensor
     rt::Tensor mCuSeqlensHost{};         //!< Cumulative sequence lengths host tensor
     rt::Tensor mKvLengths{};             //!< KV lengths for TRT-native attention (separate copy of cu_seqlens)
+    rt::Tensor mKvLengthsWindow{};       //!< KV lengths for Qwen2.5-VL window attention (TRT-native)
     rt::Tensor mMaxSeqLenCarrier{};      //!< Shape-only input carrying max sequence length for FMHA launch
     rt::Tensor mImageMean{};             //!< Image mean tensor
     rt::Tensor mImageStd{};              //!< Image standard deviation tensor
@@ -271,6 +272,7 @@ protected:
     int32_t mLLMMaxSequenceLength{0}; //!< Maximum sequence length from LLM engine
 
     bool mUseTrtNativeVitAttn{false}; //!< Use TRT IAttentionV2 (from config); requires kv_lengths binding in engine
+    bool mHasKvLengthsWindow{false};  //!< Whether the visual engine has kv_lengths_window binding
     bool mHasMaxSeqLenCarrier{false}; //!< Whether the visual engine has the max_seqlen_carrier binding
 
     std::vector<VisionSpan> mLastSpans; //!< Last round's spans; ViT-input tensors are reused when vit geometry matches.

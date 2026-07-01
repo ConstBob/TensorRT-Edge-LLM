@@ -295,9 +295,9 @@ def run_checkpoint_export(config: TestConfig,
             label += f" (mxkvc{config.max_kv_cache_capacity})"
 
         extra_env = {}
-        if config.trt_native_vit_attn:
-            extra_env["USE_TRT_NATIVE_VIT_ATTN"] = "1"
-            label += " (TRT-native VIT attn)"
+        if config.trt_native_attn:
+            extra_env["USE_TRT_NATIVE_ATTN"] = "1"
+            label += " (TRT-native attn)"
 
         _run_export_subprocess(model_dir,
                                tmp_dir,

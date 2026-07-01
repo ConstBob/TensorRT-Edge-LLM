@@ -143,6 +143,9 @@ LLMBuilder::LLMBuilder(
 
 bool LLMBuilder::build()
 {
+    std::string trtVersion = std::to_string(NV_TENSORRT_MAJOR) + "." + std::to_string(NV_TENSORRT_MINOR) + "."
+        + std::to_string(NV_TENSORRT_PATCH);
+    LOG_INFO("Using TRT_VERSION=%s", trtVersion.c_str());
 #if NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 13
     std::string const lunowudFlags = applyMyelinCompileWorkarounds(mBuilderConfig.maxBatchSize);
     if (!lunowudFlags.empty())

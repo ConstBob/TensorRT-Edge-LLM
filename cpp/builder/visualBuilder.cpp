@@ -211,6 +211,11 @@ bool VisualBuilder::parseConfig()
     default: break;
     }
 
+    if (mModelConfig.value("use_trt_native_vit_attn", false))
+    {
+        logTrtNativeAttentionPath("ViTAttention");
+    }
+
     return true;
 }
 
@@ -333,6 +338,23 @@ bool VisualBuilder::setupQwenViTProfile(
         // Use maxImageTokens as a safe upper bound for cumulative window sequence lengths.
         result &= setOptimizationProfile(&profile, binding_names::kCuWindowSeqlens, createDims({2}),
             createDims({mBuilderConfig.maxImageTokens}), createDims({mBuilderConfig.maxImageTokens}));
+        if (mBuilderConfig.useTrtNativeVitAttn)
+        {
+            bool hasKvLengthsWindow = false;
+            for (int32_t i = 0; i < network.getNbInputs(); ++i)
+            {
+                if (strcmp(network.getInput(i)->getName(), binding_names::kKvLengthsWindow) == 0)
+                {
+                    hasKvLengthsWindow = true;
+                    break;
+                }
+            }
+            if (hasKvLengthsWindow)
+            {
+                result &= setOptimizationProfile(&profile, binding_names::kKvLengthsWindow, createDims({2}),
+                    createDims({mBuilderConfig.maxImageTokens}), createDims({mBuilderConfig.maxImageTokens}));
+            }
+        }
         result &= setOptimizationProfile(&profile, binding_names::kWindowIndex, createDims({minHW / 4}),
             createDims({optHW / 4}), createDims({maxHW / 4}));
         result &= setOptimizationProfile(&profile, binding_names::kReverseWindowIndex, createDims({minHW / 4}),

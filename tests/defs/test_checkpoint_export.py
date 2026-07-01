@@ -146,8 +146,8 @@ def test_checkpoint_export(test_param: str, test_logger,
             export_cmd += ["--externalize-weights", *extw_kinds]
 
         env_vars = {}
-        if config.trt_native_vit_attn:
-            env_vars["USE_TRT_NATIVE_VIT_ATTN"] = "1"
+        if config.trt_native_attn:
+            env_vars["USE_TRT_NATIVE_ATTN"] = "1"
 
         with timer_context(
                 f"Exporting {config.model_name} via the checkpoint exporter",

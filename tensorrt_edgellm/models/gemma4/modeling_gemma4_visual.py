@@ -25,7 +25,8 @@ import torch.nn.functional as F
 from transformers.activations import ACT2FN
 
 from ..linear import make_linear
-from ..ops import get_vit_attention_fn, vit_attention_plugin, vit_trt_attention
+from ..ops import (is_trt_native_attention_enabled, trt_ragged_attention,
+                   vit_attention_plugin)
 
 if TYPE_CHECKING:
     from ...config import ModelConfig
@@ -201,7 +202,7 @@ class Gemma4VisionAttention(nn.Module):
                              "num_key_value_heads == num_attention_heads")
         self.head_dim = int(
             config.get("head_dim", self.hidden_size // self.num_heads))
-        self._use_trt_attn = get_vit_attention_fn() is not vit_attention_plugin
+        self._use_trt_attn = is_trt_native_attention_enabled()
         prefix = f"vision_tower.encoder.layers.{layer_idx}.self_attn"
         self.q_proj = Gemma4ClippableLinear(config,
                                             self.hidden_size,
@@ -254,13 +255,13 @@ class Gemma4VisionAttention(nn.Module):
         v = self.v_norm(v)
 
         if self._use_trt_attn:
-            attn_output = vit_trt_attention(q.to(torch.float16),
-                                            k.to(torch.float16),
-                                            v.to(torch.float16),
-                                            cu_seqlens,
-                                            kv_lengths,
-                                            num_heads=self.num_heads,
-                                            head_size=self.head_dim)
+            attn_output = trt_ragged_attention(q.to(torch.float16),
+                                               k.to(torch.float16),
+                                               v.to(torch.float16),
+                                               cu_seqlens,
+                                               kv_lengths,
+                                               num_heads=self.num_heads,
+                                               head_size=self.head_dim)
         else:
             # Gemma4 vision attention uses qk scale 1.0. ViTAttentionPlugin
             # applies 1/sqrt(head_dim), so fold sqrt(head_dim) into Q.
@@ -486,7 +487,7 @@ class Gemma4VisualModel(nn.Module):
         self.vision_tower = Gemma4VisionTower(vision_config, model_config)
         self.embed_vision = Gemma4MultimodalEmbedder(vision_config,
                                                      text_config, model_config)
-        self._use_trt_attn = get_vit_attention_fn() is not vit_attention_plugin
+        self._use_trt_attn = is_trt_native_attention_enabled()
 
     def forward(
         self,

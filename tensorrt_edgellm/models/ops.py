@@ -229,54 +229,53 @@ def _(query_states, key_states, value_states, cu_seqlens, max_seqlen_carrier,
 
 
 # ---------------------------------------------------------------------------
-# Custom op: trt::vit_trt_attention  (TRT-native ViT ragged self-attention)
+# Custom op: trt::trt_ragged_attention  (TRT-native ViT ragged self-attention)
 # ---------------------------------------------------------------------------
 
 
-@torch.library.custom_op("trt::vit_trt_attention", mutates_args=())
-def vit_trt_attention(
-    query_states: torch.Tensor,  # [T, num_heads, head_size]
-    key_states: torch.Tensor,  # [T, num_heads, head_size]
-    value_states: torch.Tensor,  # [T, num_heads, head_size]
-    query_lengths: torch.Tensor,  # [batch+1] int32
-    kv_lengths: torch.Tensor,  # [batch+1] int32
-    num_heads: int,
-    head_size: int,
+@torch.library.custom_op("trt::trt_ragged_attention", mutates_args=())
+def trt_ragged_attention(
+        query_states: torch.Tensor,  # [T, num_heads, head_size]
+        key_states: torch.Tensor,  # [T, num_heads, head_size]
+        value_states: torch.Tensor,  # [T, num_heads, head_size]
+        query_lengths: torch.Tensor,  # [batch+1] int32
+        kv_lengths: torch.Tensor,  # [batch+1] int32
+        num_heads: int,
+        head_size: int,
+        mask: Optional[torch.Tensor] = None,  # optional attention mask
 ) -> torch.Tensor:
-    """TRT-native ViT ragged self-attention proxy op (TRT >= 11).
+    """TRT-native ragged self-attention proxy op (TRT >= 11).
 
     Emits trt::TRT_Attention ONNX node instead of the edgellm plugin.
     Q is expected to be pre-scaled by 1/sqrt(head_dim) by the caller.
     query_lengths and kv_lengths must be separate tensors (not the same
     object) — TRT requires distinct inputs for these positions.
+    ``mask`` is optional; pass ``None`` for unmasked attention.
     """
     return torch.empty_like(query_states)
 
 
-@vit_trt_attention.register_fake
-def _(query_states, key_states, value_states, query_lengths, kv_lengths,
-      num_heads, head_size):
+@trt_ragged_attention.register_fake
+def _(query_states,
+      key_states,
+      value_states,
+      query_lengths,
+      kv_lengths,
+      num_heads,
+      head_size,
+      mask=None):
     return torch.empty_like(query_states)
 
 
-# ---------------------------------------------------------------------------
-# Factory: choose between plugin and TRT-native ViT attention
-# ---------------------------------------------------------------------------
-
-
-def get_vit_attention_fn():
-    """Return ``vit_trt_attention`` or ``vit_attention_plugin``.
-
-    Only uses TRT-native attention when explicitly requested via
-    ``USE_TRT_NATIVE_VIT_ATTN=1``.  The env var is set by the test
-    harness for ``-trt11`` configs; without it the plugin path is used
-    so that ONNX artifacts remain compatible with TRT 10.
-    """
-    if os.environ.get("USE_TRT_NATIVE_VIT_ATTN") == "1":
-        logger.debug("Using TRT-native VIT attention (TRT_Attention)")
-        return vit_trt_attention
-    logger.debug("Using VIT attention plugin (ViTAttentionPlugin)")
-    return vit_attention_plugin
+def is_trt_native_attention_enabled():
+    """Check if TRT-native attention is enabled."""
+    is_enabled = os.environ.get("USE_TRT_NATIVE_ATTN") == "1"
+    if is_enabled:
+        msg = "Using TRT-native attention (TRT_Attention)"
+    else:
+        msg = "Using attention plugin or non-fused attention"
+    logger.info(msg)
+    return is_enabled
 
 
 # ---------------------------------------------------------------------------
