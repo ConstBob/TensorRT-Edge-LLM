@@ -234,7 +234,7 @@ size_t DFlashTargetKVCacheUpdatePlugin::getWorkspaceSize(DynamicPluginTensorDesc
 
 int32_t DFlashTargetKVCacheUpdatePlugin::getAliasedInput(int32_t outputIndex) noexcept
 {
-    // WAR (FIXME nvbug 6330354): this is not the correct plugin API usage. The
+    // WAR: this is not the correct plugin API usage. The
     // plugin updates the KV cache in place, so the correct return is the KV-cache
     // input index. We return -1 to drop the alias because declaring it makes
     // Myelin keep a redundant per-layer KV copy (the perf regression). In-place

@@ -1,13 +1,12 @@
 # SM110 NVFP4 MoE CuTeDSL Kernels
 
 This directory contains the Thor SM110 split FC1 / FC2 CuTeDSL backend used by
-the unified [`Nvfp4MoePlugin`](../../cpp/plugins/nvfp4MoePlugin/). It keeps the
-plugin tensor ABI and exports the `nvfp4_moe` artifact group from
-[`kernelSrcs/build_cutedsl.py`](../build_cutedsl.py); today the only variants
-in that group target SM110/Thor. The SM120 / SM121 fused decode + prefill
-kernels live in
+[`Nvfp4MoePlugin`](../../cpp/plugins/nvfp4MoePlugin/). It exports the
+`nvfp4_moe` artifact group from [`kernelSrcs/build_cutedsl.py`](../build_cutedsl.py);
+today the only variants in that group target SM110/Thor. The SM120 / SM121 fused decode + prefill kernels live in
 [`kernelSrcs/nvfp4_fused_moe_cutedsl/`](../nvfp4_fused_moe_cutedsl/) and feed
-the same plugin via the `nvfp4_fused_moe` group.
+[`NvFP4MoEPluginGeforce`](../../cpp/plugins/nvfp4MoePluginGeforce/) via the
+`nvfp4_fused_moe` group.
 
 Pipeline produced by the AOT pack:
 
@@ -19,11 +18,6 @@ Pipeline produced by the AOT pack:
    `alpha = input_gsf * weight_gsf` in the kernel epilogue, multiplies by the
    per-token router weight, and scatter-reduces the result back to the original
    token layout, emitting `[T, H]` FP16.
-
-The legacy `nvfp4_moe` prefill / decode N-major sources that lived in this
-directory on `main` were removed when [MR
-!902](https://gitlab-master.nvidia.com/TensorRT/tensorrt-edge-llm/tensorrt-edge-llm/-/merge_requests/902)
-dropped the legacy `Nvfp4MoePlugin` Marlin path.
 
 ## 1. Supported Hardware
 
@@ -368,7 +362,8 @@ for SM110.
 
 No standalone reference probe is shipped. The SM110 NVFP4 MoE contract is
 validated end-to-end through
-[`tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py`](../../tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py).
+[`unittests/nvfp4MoeCuteDslSm110Tests.cu`](../../unittests/nvfp4MoeCuteDslSm110Tests.cu)
+(`CuteDslNvfp4MoeSm110Test.accuracy`).
 
 ## 10. File Map
 

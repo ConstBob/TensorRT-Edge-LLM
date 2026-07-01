@@ -127,7 +127,7 @@ class Qwen3OmniDenseTransformer(Transformer):
 
 
 class Qwen3OmniLanguageModel(CausalLM):
-    """Qwen3-Omni dense Thinker (and Talker) CausalLM.
+    """Qwen3-Omni Thinker/Talker CausalLM.
 
     Replaces the parent's ``self.model`` with
     :class:`Qwen3OmniDenseTransformer` and routes ``emit_hidden_states`` to

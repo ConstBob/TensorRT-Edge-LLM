@@ -1,18 +1,16 @@
 # Omni (Audio + Vision + Speech I/O)
 
-End-to-end workflow for **Qwen3-Omni** — a unified multimodal model that
-ingests text + audio + image and emits text + speech. Covers quantization,
-ONNX export, engine build, and inference for both the dense 4B model and
-the 30B-A3B MoE model.
+End-to-end workflow for **Qwen3-Omni** — a unified multimodal
+model that ingests text + audio + image and emits text + speech. Covers
+quantization, ONNX export, engine build, and inference.
 
 ## Supported models
 
 | Model | Backbone | HF checkpoint | Recipes |
 |-------|----------|---------------|---------|
-| Qwen3-Omni-4B-Instruct (multilingual) | Dense | [`Qwen/Qwen3-Omni-4B-Instruct-multilingual`](https://huggingface.co/Qwen/Qwen3-Omni-4B-Instruct-multilingual) | FP16, INT4 GPTQ (external gptqmodel) |
 | Qwen3-Omni-30B-A3B-Instruct | MoE (128 experts) | [`Qwen/Qwen3-Omni-30B-A3B-Instruct`](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct) | NVFP4 Thinker + Talker |
 
-Both share the same six-engine layout:
+Omni uses a six-engine layout:
 
 > **Thinker** (text decoder, generates assistant tokens) +
 > **Talker** (text decoder, generates codec tokens) +
@@ -25,79 +23,20 @@ Both share the same six-engine layout:
 
 ---
 
-## Part 0: Install Omni Dependency
+## Part 1: Quantize (NVFP4 Thinker + Talker)
 
-The export pipeline loads the Qwen3-Omni model via HuggingFace
-`transformers`. The architecture is not in any released `transformers` tag
-yet, so install the in-tree development version:
-
-> **Warning:** Installing the dev `transformers` may break package versions
-> in your current environment (e.g. `torch`). **Use a dedicated virtual
-> environment for Qwen3-Omni only** — do not share it with other model
-> workflows.
-
-```bash
-cd TensorRT-Edge-LLM
-python3 -m venv venv-qwen3-omni
-source venv-qwen3-omni/bin/activate
-pip3 install .
-pip3 install git+https://github.com/huggingface/transformers.git
-```
-
-Pick a model and set common environment variables (used throughout the
-remaining parts):
+First set the shell variables used throughout the remaining parts:
 
 ```bash
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 mkdir -p $WORKSPACE_DIR
 
-# Dense 4B (FP16):
-export OMNI_MODEL=Qwen3-Omni-4B-Instruct-multilingual
-
-# MoE 30B-A3B (NVFP4):
-# export OMNI_MODEL=Qwen3-Omni-30B-A3B-Instruct
+export OMNI_MODEL=Qwen3-Omni-30B-A3B-Instruct
 
 export HF_ROOT=Qwen/$OMNI_MODEL                           # or a local snapshot dir
 export ONNX=$WORKSPACE_DIR/$OMNI_MODEL/onnx
 export ENG=$WORKSPACE_DIR/$OMNI_MODEL/engines
 ```
-
----
-
-## Part 1: Quantize
-
-Pick the recipe matching your model + target precision. All quantized
-checkpoints below stay HF-formatted; trt-edge-llm's exporter auto-detects
-the embedded `quantization_config` and runs the correct repacker in Part 2.
-
-### Option 1: Dense 4B — FP16 (no quantization)
-
-Use the unmodified HF checkpoint as-is. **Skip directly to
-[Part 2: Export ONNX](#part-2-export-onnx)** and set
-`export QUANT_ROOT=$HF_ROOT`.
-
-### Option 2: Dense 4B — INT4 GPTQ (external gptqmodel)
-
-GPTQ INT4 quantization for Qwen3-Omni-4B is done **outside trt-edge-llm**
-with [gptqmodel](https://github.com/modelcloud/gptqmodel) (a Qwen3-Omni
-support patch ships in gptqmodel 4.0.0+ as `BaseQwen3_OmniGPTQ`). Only
-the Thinker and Talker LLM transformer layers are quantized to INT4
-(`bits=4, group_size=128, sym=true, desc_act=true`); visual, audio,
-code2wav, and the Talker projection sidecars stay in BF16.
-
-Once you have a GPTQ-quantized HF checkpoint with the standard
-`quantization_config` block in its `config.json`, point `QUANT_ROOT` at
-it:
-
-```bash
-export QUANT_ROOT=/path/to/Qwen3-Omni-4B-Instruct-multilingual-GPTQ-Int4
-```
-
-trt-edge-llm's exporter inspects `quantization_config.quant_method`
-during Part 2 and dispatches to the INT4 plugin repacker automatically —
-no extra flag.
-
-### Option 3: MoE 30B-A3B — NVFP4 Thinker + Talker
 
 Thinker and Talker text-MoE backbones are jointly post-training quantized
 to NVFP4 in a single ModelOpt pass. Calibration uses a multimodal dataset
@@ -138,28 +77,12 @@ the run to a subset (useful when iterating on a single component).
 | Flag | Description |
 |------|-------------|
 | `--components LIST` | Comma-separated allow-list (`thinker,talker,code_predictor,visual,audio,code2wav,action`). Default: export every component the checkpoint supports. |
-| `--talker-sidecar-from PATH` | Path to a full HF root checkpoint. When set, the Talker stage extracts `hidden_projection.safetensors` and `text_projection.safetensors` from that root after exporting the LLM. Required when the input is a standalone NVFP4 Talker checkpoint (those ship only the LLM backbone + codec embedding). |
+| `--talker-sidecar-from PATH` | Path to a full HF root checkpoint. When set, the Talker stage extracts `hidden_projection.safetensors` and `text_projection.safetensors` from that root after exporting the LLM. Required because the standalone NVFP4 Talker checkpoint ships only the LLM backbone + codec embedding. |
 | `--fp8-embedding` | Write `embedding.safetensors` in FP8 E4M3 (Thinker only). |
 | `--reduced-vocab-dir DIR` | Use `vocab_map.safetensors` to shrink the LM head vocabulary. |
 | `--skip-llm`, `--skip-visual`, `--skip-audio`, `--skip-code2wav` | Negative filters: skip these components entirely (applied on top of `--components`). |
 
-### Option A: Dense 4B — single-pass export (FP16 or INT4 GPTQ)
-
-Both FP16 and INT4 GPTQ dense checkpoints ship every component in a single
-HF root, so one export command produces all six ONNX subgraphs. Set
-`QUANT_ROOT` to either `$HF_ROOT` (FP16) or the gptqmodel output dir
-(INT4):
-
-```bash
-mkdir -p $ONNX
-tensorrt-edgellm-export $QUANT_ROOT $ONNX
-```
-
-The exporter inspects `$QUANT_ROOT/config.json` and dispatches to the
-GPTQ INT4 repacker automatically when
-`quantization_config.quant_method == "gptq"` is present.
-
-### Option B: MoE 30B-A3B (NVFP4, three exports)
+### Export commands (three exports)
 
 The NVFP4 quantizer writes Thinker and Talker as standalone checkpoints
 (separate `config.json` per submodel). Visual / audio / code2wav /
@@ -171,7 +94,7 @@ mkdir -p $ONNX
 # Thinker: NVFP4 standalone Thinker checkpoint -> ONNX
 tensorrt-edgellm-export $QUANT_ROOT/thinker $ONNX/thinker
 
-# Talker: NVFP4 standalone Talker checkpoint -> ONNX + projection sidecars
+# Talker: NVFP4 standalone Talker checkpoint -> ONNX + projection weights
 tensorrt-edgellm-export \
     --talker-sidecar-from $HF_ROOT \
     $QUANT_ROOT/talker $ONNX/talker
@@ -183,25 +106,6 @@ tensorrt-edgellm-export \
 ```
 
 ### Expected layout
-
-Dense 4B (single export root):
-
-```
-$ONNX/
-├── llm/thinker/                          # Thinker dense ONNX
-│   ├── model.onnx + model.onnx.data
-│   ├── config.json                       # model: qwen3_omni
-│   ├── embedding.safetensors
-│   ├── processed_chat_template.json
-│   └── tokenizer files
-├── llm/talker/                           # Talker dense ONNX + sidecars
-├── llm/code_predictor/                   # codec head
-├── audio/audio_encoder/                  # audio encoder
-├── audio/code2wav/                       # codec → PCM
-└── vision/                               # visual ViT
-```
-
-MoE 30B-A3B (three export roots):
 
 ```
 $ONNX/
@@ -230,21 +134,7 @@ $ONNX/
 
 Six engines total; `llm_build` covers Thinker / Talker / CodePredictor,
 `audio_build` covers the audio encoder and Code2Wav, `visual_build` covers
-the visual encoder. The commands below use shell variables to abstract
-the layout difference between dense and MoE.
-
-### Option A: Dense 4B layout
-
-```bash
-export THINKER_ONNX=$ONNX/llm/thinker
-export TALKER_ONNX=$ONNX/llm/talker
-export CP_ONNX=$ONNX/llm/code_predictor
-export AUDIO_ONNX=$ONNX/audio/audio_encoder
-export CODE2WAV_ONNX=$ONNX/audio/code2wav
-export VISUAL_ONNX=$ONNX/vision
-```
-
-### Option B: MoE 30B-A3B layout
+the visual encoder.
 
 ```bash
 export THINKER_ONNX=$ONNX/thinker/llm
@@ -255,7 +145,7 @@ export CODE2WAV_ONNX=$ONNX/multimodal/code2wav
 export VISUAL_ONNX=$ONNX/multimodal/visual
 ```
 
-### Build commands (shared)
+### Build commands
 
 ```bash
 # 1. Thinker
@@ -328,8 +218,7 @@ Supported formats: `.wav`, `.mp3`, `.flac`, `.ogg`, `.m4a`.
 
 `llm_inference` drives all four scenarios. Audio output is opt-in via
 `--enableAudioOutput`; without that flag only the Thinker generates text.
-The same commands work for both the dense 4B and the MoE 30B-A3B engines
-— the runtime detects model_type from the engine config.
+The runtime detects model_type from the engine config.
 
 ### Scenario A: Text input → text output
 
@@ -414,26 +303,15 @@ Thinker text is fully complete, significantly reducing time-to-first-audio.
 
 ## Notes
 
-- **Calibration quality (MoE only):** the default `--talker_num_{audio,image,text}`
+- **Calibration quality:** the default `--talker_num_{audio,image,text}`
   values were tuned for English TTS. Reducing `--talker_num_text` below 100
   or removing modalities (audio/image) can regress both OmniBench and TTS
   WER.
-- **MoE Talker is the critical path:** Talker MoE is heavier per step than
-  Thinker MoE on the same model (Talker 128 experts × routed top-6 + shared
-  expert, vs Thinker 128 experts × top-8). In streaming mode the Talker
-  drives the audio-out latency.
-- **Dense 4B Talker MLP:** the dense Talker uses an MLP (not MoE) for the
-  `text_projection`. Building C++ with `-DENABLE_CUTE_DSL=gemm` is required
-  to avoid the MLP silently returning zeros on Ampere/Blackwell.
-- **4B GPTQ Int4 quantization happens externally** via gptqmodel; only the
-  Thinker and Talker LLM transformer layers are quantized to INT4. Visual,
-  audio, code2wav, code-predictor, and the Talker projection sidecars stay
-  in BF16/FP16. trt-edge-llm's exporter reads the embedded
-  `quantization_config` and selects the INT4 plugin path automatically;
-  no CLI flag is required.
-- **Dense 4B NVFP4 not currently exposed:** the original dense Qwen3-Omni
-  NVFP4 multimodal calibration pipeline from
-  [MR !691](https://gitlab-master.nvidia.com/TensorRT/tensorrt-edge-llm/tensorrt-edge-llm/-/merge_requests/691)
-  was removed during the May 2026 checkpoint-loader refactor and has not
-  been ported to the new CLI. Use FP16 or external INT4 GPTQ on dense 4B
-  until a follow-up MR restores the dense NVFP4 entry point.
+- **Talker is the critical path:** the Talker MoE is heavier per step than
+  the Thinker MoE on the same model (Talker 128 experts × routed top-6 +
+  shared expert, vs Thinker 128 experts × top-8). In streaming mode the
+  Talker drives the audio-out latency.
+- **Talker `text_projection` MLP:** the Talker consumes the Thinker hidden
+  state through a `text_projection` MLP sidecar. Build C++ with
+  `-DENABLE_CUTE_DSL=gemm` — without it this MLP silently returns zeros on
+  Ampere/Blackwell, producing garbled or empty Talker audio.
