@@ -456,6 +456,18 @@ inline constexpr char const* kReducedVocabSizeKey = "reduced_vocab_size";
  */
 inline constexpr char const* kVocabMapFileName = "vocab_map.safetensors";
 
+/*!
+ * @brief Draft model vocabulary mapping file name
+ *
+ * SafeTensors file containing mapping from reduced draft vocabulary to full vocabulary.
+ *
+ * @note Currently consumed only by DFlashDecoder (gated on the draft engine config's
+ *       reduced_vocab_size > 0) and produced only by the DFlash draft export path. If a
+ *       future decoder adopts draft vocab reduction, it must (a) gate the load on the same
+ *       config field and (b) be added as a consumer of this constant.
+ */
+inline constexpr char const* kDraftVocabMapFileName = "draft_vocab_map.safetensors";
+
 /*! @} */
 
 /*! @name Audio Encoder Bindings (Qwen3-Omni)

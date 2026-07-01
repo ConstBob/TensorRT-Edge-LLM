@@ -345,6 +345,8 @@ For best acceptance rate and throughput, use the thinking-mode setting that matc
 
 DFlash supports FP16 and quantized base models. Quantize a base checkpoint with `tensorrt-edgellm-quantize llm` before export, or start from a supported pre-quantized checkpoint. DFlash draft quantization is supported through `tensorrt-edgellm-quantize draft`; the command auto-detects DFlash from the draft checkpoint's `dflash_config`. NVFP4 draft quantization is validated, including optional NVFP4 LM-head quantization.
 
+For large-vocabulary base models (e.g. Qwen3 family at 151936), the DFlash draft LM-head argmax can be reduced via vocabulary reduction on the draft only. Any reduced size can be passed to `tensorrt-edgellm-reduce-vocab --reduced_vocab_size` — there is no hardcoded set of supported sizes. Of the sweep we ran on Qwen3-8B DFlash, **64K** gave the best measured throughput (19.3 vs 18.5 tok/sec, ~4% speedup) with no acceptance loss; 32K regressed because acceptance dropped enough to undo the drafter-latency win. Measure on your own model and workload before committing to a setting. See [DFlash Speculative Decoding Support](../features/reduce-vocab.md#dflash-speculative-decoding-support) for the export workflow and the full results table.
+
 The following example quantizes the paired [z-lab/Qwen3.5-4B-DFlash](https://huggingface.co/z-lab/Qwen3.5-4B-DFlash) draft for [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B). Download the draft checkpoint first and pass its local directory as `--draft_model_dir`:
 
 ```bash
