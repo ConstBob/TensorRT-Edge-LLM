@@ -547,7 +547,8 @@ class ModelConfig:
     dflash_block_size: int = 16
     dflash_mask_token_id: int = 248070
     # ------------------------------------------ sparse MoE config (Qwen3-style)
-    # num_experts=0 means dense (no MoE).
+    # num_experts=0 means dense (no MoE) for Qwen/Mixtral-style keys; Nemotron-H instead reports
+    # its expert count via n_routed_experts, so n_routed_experts > 0 also indicates MoE.
     num_experts: int = 0
     n_routed_experts: int = 0
     num_experts_per_tok: int = 0
@@ -776,7 +777,11 @@ class ModelConfig:
         num_experts = int(
             llm_dict.get("num_experts", llm_dict.get("num_local_experts", 0))
             or 0)
-        if num_experts > 0:
+        # Nemotron-H declares routed experts as ``n_routed_experts`` rather
+        # than ``num_experts`` / ``num_local_experts``; treat either as MoE so
+        # the sizes below are parsed instead of defaulting to 0.
+        n_routed_experts = int(llm_dict.get("n_routed_experts", 0) or 0)
+        if num_experts > 0 or n_routed_experts > 0:
             num_experts_per_tok = int(
                 llm_dict.get("num_experts_per_tok",
                              llm_dict.get("top_k_experts", 0)) or 0)
@@ -861,7 +866,7 @@ class ModelConfig:
             draft_vocab_size=draft_vocab_size,
             target_hidden_size=target_hidden_size,
             num_experts=num_experts,
-            n_routed_experts=llm_dict.get("n_routed_experts", 0),
+            n_routed_experts=n_routed_experts,
             num_experts_per_tok=num_experts_per_tok,
             moe_intermediate_size=moe_intermediate_size,
             moe_shared_expert_intermediate_size=

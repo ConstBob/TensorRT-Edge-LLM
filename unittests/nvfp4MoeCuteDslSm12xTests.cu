@@ -518,7 +518,8 @@ RunResult runCase(CaseData const& c)
     CUDA_CHECK(cudaMemset(output.rawPointer(), 0, static_cast<size_t>(T) * H * sizeof(__half)));
 
     int32_t const maxRoutedRows = T * kTopK;
-    size_t const workspaceBytes = CuteDslNvfp4MoeRunner::getWorkspaceSize(T, maxRoutedRows, kNumExperts, kTopK, H, I);
+    size_t const workspaceBytes
+        = CuteDslNvfp4MoeRunner::getWorkspaceSize(T, maxRoutedRows, kNumExperts, kTopK, H, I, c.config.backend);
     EXPECT_GT(workspaceBytes, 0u);
     void* workspace = nullptr;
     CUDA_CHECK(cudaMalloc(&workspace, workspaceBytes));

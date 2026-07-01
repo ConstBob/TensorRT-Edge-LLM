@@ -383,7 +383,7 @@ inline void* offsetPtr(void* base, size_t byteOffset)
 } // namespace
 
 size_t CuteDslNvfp4MoeRunner::getWorkspaceSize(int32_t maxNumTokens, int32_t maxRoutedRows, int32_t numExperts,
-    int32_t topK, int32_t hiddenSize, int32_t moeInterSize)
+    int32_t topK, int32_t hiddenSize, int32_t moeInterSize, CuteDslMoeBackend backend)
 {
     (void) topK;
     if (maxNumTokens <= 0 || maxRoutedRows <= 0 || numExperts <= 0 || hiddenSize <= 0 || moeInterSize <= 0)
@@ -391,18 +391,19 @@ size_t CuteDslNvfp4MoeRunner::getWorkspaceSize(int32_t maxNumTokens, int32_t max
         return 0;
     }
 
-    // Decode max_rows upper bound = every token picks the same expert, i.e. maxRoutedRows.
-    // The kernel pads this to 128 internally; callers can pass a tighter estimate.
-    int32_t const maxRowsDecode = maxRoutedRows;
-
-    auto const decodeL = buildDecodeLayout(numExperts, numExperts, maxRowsDecode, hiddenSize);
-    // Use 2*moeInterSize as the worst-case N1 (gated activations like swiglu have N1=2*I).
-    // This ensures the task-queue workspace is large enough regardless of activation type.
+    // Size the decode sub-layout with the same cap runDecode() uses (see decodeCapRoutedRows), and
+    // only when decode can actually run. 2*moeInterSize covers the worst-case prefill N1 (gated
+    // activations have N1=2*I) so the task queue fits any activation.
+    size_t decodeTotal = 0;
+    if (backend != CuteDslMoeBackend::kPrefill)
+    {
+        int32_t const maxRowsDecode = decodeCapRoutedRows(backend, maxRoutedRows);
+        decodeTotal = buildDecodeLayout(numExperts, numExperts, maxRowsDecode, hiddenSize).total;
+    }
     auto const prefillL = buildPrefillLayout(numExperts, maxRoutedRows, hiddenSize, 2 * moeInterSize);
 
-    // Return max of both layouts so kAuto can dispatch either backend without re-querying.
-    // Plus device-alignment tail pad so the caller can align the base pointer with std::align.
-    return std::max(decodeL.total, prefillL.total) + kDeviceAlignment;
+    // Max of both layouts so kAuto can dispatch either backend; + device-alignment tail pad.
+    return std::max(decodeTotal, prefillL.total) + kDeviceAlignment;
 }
 
 // Backend resolution
@@ -418,6 +419,19 @@ CuteDslMoeBackend CuteDslNvfp4MoeRunner::resolveBackend(CuteDslMoeBackend backen
     int64_t const routedRows = static_cast<int64_t>(std::max(numTokens, 1)) * static_cast<int64_t>(std::max(topK, 1));
     return routedRows <= static_cast<int64_t>(kDecodePrefillCutoverRoutedRows) ? CuteDslMoeBackend::kDecode
                                                                                : CuteDslMoeBackend::kPrefill;
+}
+
+int32_t CuteDslNvfp4MoeRunner::decodeCapRoutedRows(CuteDslMoeBackend backend, int32_t maxRoutedRows)
+{
+    // Only valid for backends that can dispatch decode; kPrefill never does.
+    ELLM_CHECK(
+        backend != CuteDslMoeBackend::kPrefill, "decodeCapRoutedRows must not be queried for the prefill backend");
+    // Explicit kDecode bypasses resolveBackend()'s cutover and may see up to the full profile-wide
+    // maxRoutedRows; kAuto only routes num_tokens*top_k <= the cutover to decode.
+    int32_t const cap = (backend == CuteDslMoeBackend::kDecode)
+        ? maxRoutedRows
+        : std::min(maxRoutedRows, kDecodePrefillCutoverRoutedRows);
+    return std::max(1, cap);
 }
 
 // Decode backend launch
@@ -501,7 +515,14 @@ int32_t CuteDslNvfp4MoeRunner::runDecode(CuteDslNvfp4MoeParams const& params, vo
 {
     int32_t const stateE = params.numExperts;
     int32_t const weightE = params.numExperts; // single-device.
-    int32_t const maxRows = std::max(1, params.maxRoutedRows);
+    // Size the per-expert workspace from the actual routed rows (num_tokens * top_k), capped by the
+    // same decodeCapRoutedRows() getWorkspaceSize() reserved for -- not the profile-wide
+    // max_routed_rows, which would overflow the kernel's int32 addressing (num_experts *
+    // max_routed_rows * K/2) and over-allocate. Mirrors runPrefill().
+    int32_t const decodeCap = decodeCapRoutedRows(params.backend, params.maxRoutedRows);
+    int64_t const routedRows64
+        = static_cast<int64_t>(std::max(1, params.numTokens)) * static_cast<int64_t>(std::max(1, params.topK));
+    int32_t const maxRows = std::max<int32_t>(1, static_cast<int32_t>(std::min<int64_t>(routedRows64, decodeCap)));
     auto const L = buildDecodeLayout(stateE, weightE, maxRows, params.hiddenSize);
 
     std::byte* ws = static_cast<std::byte*>(workspace);
