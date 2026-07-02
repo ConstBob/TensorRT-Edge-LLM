@@ -832,6 +832,8 @@ int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, [[maybe_unus
         attentionPosIdTensor = rt::Tensor(const_cast<void*>(inputs[kIN_OPTIONAL_ATTN_POS_ID_IDX]),
             rt::Coords{attentionPosIdInputDesc.dims}, rt::DeviceType::kGPU, attentionPosIdInputDesc.type);
     }
+    bool const useExplicitPositionIds = mEnableTreeAttention && !attentionPosIdTensor.isEmpty()
+        && attentionPosIdTensor.getShape().getNumDims() == 2 && attentionPosIdTensor.getShape()[1] == runtimeSeqLen;
 
     float const kScale = mQkvScales[1];
     float const vScale = mQkvScales[2];
@@ -886,7 +888,14 @@ int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, [[maybe_unus
         // --- Shared KV prefill: Q gets RoPE, K/V read from donor layer's cache ---
         if (sharedKV)
         {
-            kernel::launchApplyRopeQOnly(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor, stream);
+            if (useExplicitPositionIds)
+            {
+                kernel::launchApplyRopeQOnlyTreeDecoding(ropeCosSinTensor, attentionPosIdTensor, qInputTensor, stream);
+            }
+            else
+            {
+                kernel::launchApplyRopeQOnly(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor, stream);
+            }
 
             // Shared-KV + FFPA (headSize=512, no FMHA cubins available).
             if (!mCanImplementFMHA)
@@ -1120,7 +1129,15 @@ int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, [[maybe_unus
         {
             if (sharedKV)
             {
-                kernel::launchApplyRopeQOnly(ropeCosSinTensor, contextLengthTensor, qInputTensor, stream);
+                if (useExplicitPositionIds)
+                {
+                    kernel::launchApplyRopeQOnlyTreeDecoding(
+                        ropeCosSinTensor, attentionPosIdTensor, qInputTensor, stream);
+                }
+                else
+                {
+                    kernel::launchApplyRopeQOnly(ropeCosSinTensor, contextLengthTensor, qInputTensor, stream);
+                }
             }
             else
             {

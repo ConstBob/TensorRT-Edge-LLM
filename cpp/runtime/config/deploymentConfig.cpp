@@ -20,6 +20,7 @@
 #include "common/checkMacros.h"
 
 #include "common/logger.h"
+#include "common/trtUtils.h"
 
 #include <algorithm>
 
@@ -29,12 +30,125 @@ namespace rt
 {
 namespace
 {
+bool isAttentionLayer(LLMEngineConfig const& cfg, int32_t absLayerIdx)
+{
+    return absLayerIdx >= 0 && absLayerIdx < static_cast<int32_t>(cfg.layerTypes.size())
+        && cfg.layerTypes[absLayerIdx] == HybridCacheManager::LayerType::kAttention;
+}
+
+int32_t attentionLocalToAbsolute(LLMEngineConfig const& cfg, int32_t localLayerIdx)
+{
+    int32_t localIdx = 0;
+    for (int32_t absIdx = 0; absIdx < static_cast<int32_t>(cfg.layerTypes.size()); ++absIdx)
+    {
+        if (cfg.layerTypes[absIdx] != HybridCacheManager::LayerType::kAttention)
+        {
+            continue;
+        }
+        if (localIdx == localLayerIdx)
+        {
+            return absIdx;
+        }
+        ++localIdx;
+    }
+    return -1;
+}
+
+int32_t attentionAbsoluteToLocal(LLMEngineConfig const& cfg, int32_t absLayerIdx)
+{
+    int32_t localIdx = 0;
+    for (int32_t i = 0; i < static_cast<int32_t>(cfg.layerTypes.size()); ++i)
+    {
+        if (cfg.layerTypes[i] != HybridCacheManager::LayerType::kAttention)
+        {
+            continue;
+        }
+        if (i == absLayerIdx)
+        {
+            return localIdx;
+        }
+        ++localIdx;
+    }
+    return -1;
+}
+
 void validateDFlashDraftTargetLayerIds(LLMEngineConfig const& base, LLMEngineConfig const& draft)
 {
     for (int32_t layerId : draft.dflashTargetLayerIds)
     {
         ELLM_CHECK(layerId >= 0 && layerId < base.numDecoderLayers,
             "DFlash draft target layer id " + std::to_string(layerId) + " is outside [0, base.num_hidden_layers).");
+    }
+}
+
+void validateGemma4MTPConfig(LLMEngineConfig const& base, LLMEngineConfig& draft)
+{
+    ELLM_CHECK(
+        base.specDecodeType == SpecDecodeMode::kGemma4MTP, "Gemma4 MTP validation requires a gemma4_mtp base config.");
+    ELLM_CHECK(base.isSpecDecodeBase, "Gemma4 MTP base config must be exported with engine_role=base.");
+    ELLM_CHECK(draft.specDecodeType == SpecDecodeMode::kGemma4MTP,
+        "Gemma4 MTP draft config must set spec_decode_type=gemma4_mtp.");
+    ELLM_CHECK(draft.modelType == "gemma4_assistant", "Gemma4 MTP draft config must set model=gemma4_assistant.");
+    ELLM_CHECK(draft.baseModelHiddenSize == base.hiddenSize,
+        "Gemma4 MTP draft base_model_hidden_size (" + std::to_string(draft.baseModelHiddenSize)
+            + ") must match base hidden_size (" + std::to_string(base.hiddenSize) + ").");
+    ELLM_CHECK(
+        draft.vocabSize == base.vocabSize, "Gemma4 MTP draft vocab_size/draft_vocab_size must match base vocab_size.");
+    ELLM_CHECK(draft.sharesTargetKV && !draft.hasOwnKVCache,
+        "Gemma4 MTP assistant must share target KV and must not own a draft KV cache.");
+    ELLM_CHECK(draft.returnsFeedbackHidden, "Gemma4 MTP assistant must return backbone-space hidden_states feedback.");
+    ELLM_CHECK(draft.constantDraftPositions, "Gemma4 MTP assistant must set constant_draft_positions=true.");
+    ELLM_CHECK(base.kvCacheDtype == draft.kvCacheDtype,
+        std::string("Gemma4 MTP base/draft KV dtype mismatch: base=") + getDataTypeString(base.kvCacheDtype)
+            + ", draft=" + getDataTypeString(draft.kvCacheDtype) + ".");
+    ELLM_CHECK(static_cast<int32_t>(draft.gemma4MTPKVSharingMap.size()) == draft.numAttentionLayers,
+        "Gemma4 MTP kv_sharing_map size (" + std::to_string(draft.gemma4MTPKVSharingMap.size())
+            + ") must equal draft attention layer count (" + std::to_string(draft.numAttentionLayers) + ").");
+    ELLM_CHECK(static_cast<int32_t>(draft.kvLayerConfigs.size()) == draft.numAttentionLayers,
+        "Gemma4 MTP draft KV layer config size (" + std::to_string(draft.kvLayerConfigs.size())
+            + ") must equal draft attention layer count (" + std::to_string(draft.numAttentionLayers) + ").");
+
+    std::vector<bool> seenAssistantLayers(draft.numAttentionLayers, false);
+    for (auto& entry : draft.gemma4MTPKVSharingMap)
+    {
+        ELLM_CHECK(entry.assistantLayerIdx >= 0 && entry.assistantLayerIdx < draft.numAttentionLayers,
+            "Gemma4 MTP kv_sharing_map assistant layer " + std::to_string(entry.assistantLayerIdx)
+                + " is outside draft attention-layer range.");
+        ELLM_CHECK(!seenAssistantLayers[entry.assistantLayerIdx],
+            "Gemma4 MTP kv_sharing_map has duplicate assistant layer " + std::to_string(entry.assistantLayerIdx) + ".");
+        seenAssistantLayers[entry.assistantLayerIdx] = true;
+
+        ELLM_CHECK(entry.targetAttentionLayerIdx >= 0
+                && entry.targetAttentionLayerIdx < static_cast<int32_t>(base.kvLayerConfigs.size()),
+            "Gemma4 MTP kv_sharing_map target attention layer " + std::to_string(entry.targetAttentionLayerIdx)
+                + " is outside base attention-layer range.");
+
+        entry.targetAbsoluteLayerIdx = attentionLocalToAbsolute(base, entry.targetAttentionLayerIdx);
+
+        ELLM_CHECK(isAttentionLayer(base, entry.targetAbsoluteLayerIdx),
+            "Gemma4 MTP kv_sharing_map target absolute layer " + std::to_string(entry.targetAbsoluteLayerIdx)
+                + " is not a valid target attention layer.");
+
+        int32_t const expectedLocal = attentionAbsoluteToLocal(base, entry.targetAbsoluteLayerIdx);
+        ELLM_CHECK(entry.targetAttentionLayerIdx == expectedLocal,
+            "Gemma4 MTP kv_sharing_map target local layer " + std::to_string(entry.targetAttentionLayerIdx)
+                + " does not match target absolute layer " + std::to_string(entry.targetAbsoluteLayerIdx) + ".");
+
+        auto const& assistantKV = draft.kvLayerConfigs[entry.assistantLayerIdx];
+        auto const& targetKV = base.kvLayerConfigs[entry.targetAttentionLayerIdx];
+        ELLM_CHECK(assistantKV.numKVHeads == targetKV.numKVHeads,
+            "Gemma4 MTP shared KV num heads mismatch for assistant layer " + std::to_string(entry.assistantLayerIdx)
+                + " -> target layer " + std::to_string(entry.targetAttentionLayerIdx) + ": assistant="
+                + std::to_string(assistantKV.numKVHeads) + ", target=" + std::to_string(targetKV.numKVHeads) + ".");
+        ELLM_CHECK(assistantKV.headDim == targetKV.headDim,
+            "Gemma4 MTP shared KV head dim mismatch for assistant layer " + std::to_string(entry.assistantLayerIdx)
+                + " -> target layer " + std::to_string(entry.targetAttentionLayerIdx) + ": assistant="
+                + std::to_string(assistantKV.headDim) + ", target=" + std::to_string(targetKV.headDim) + ".");
+    }
+    for (int32_t assistantLayerIdx = 0; assistantLayerIdx < draft.numAttentionLayers; ++assistantLayerIdx)
+    {
+        ELLM_CHECK(seenAssistantLayers[assistantLayerIdx],
+            "Gemma4 MTP kv_sharing_map is missing assistant layer " + std::to_string(assistantLayerIdx) + ".");
     }
 }
 } // namespace
@@ -102,6 +216,10 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
     if (cfg.base.specDecodeType == SpecDecodeMode::kDFlash && cfg.draft.has_value())
     {
         validateDFlashDraftTargetLayerIds(cfg.base, *cfg.draft);
+    }
+    if (cfg.base.specDecodeType == SpecDecodeMode::kGemma4MTP && cfg.draft.has_value())
+    {
+        validateGemma4MTPConfig(cfg.base, *cfg.draft);
     }
 
     // No cross-engine consistency check needed: each engine's builder_config
@@ -194,6 +312,13 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
             ELLM_CHECK(specConfig.verifySize <= kDFlashMaxVerifySize,
                 "DFlash verifySize=" + std::to_string(specConfig.verifySize) + " exceeds " + verifyLimitReason + " of "
                     + std::to_string(kDFlashMaxVerifySize) + ".");
+        }
+        else if (cfg.base.specDecodeType == SpecDecodeMode::kGemma4MTP)
+        {
+            ELLM_CHECK(specConfig.draftingTopK == 1,
+                "Gemma4 MTP currently supports greedy chain drafting only; draftingTopK must be 1.");
+            ELLM_CHECK(specConfig.verifySize == specConfig.draftingStep + 1,
+                "Gemma4 MTP verifySize must equal draftingStep + 1 to include the root token and all draft tokens.");
         }
 
         cfg.specConfig = specConfig;

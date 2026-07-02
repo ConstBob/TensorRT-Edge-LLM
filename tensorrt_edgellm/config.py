@@ -530,6 +530,23 @@ class ModelConfig:
     # with tree-attention inputs (attention_mask, attention_pos_id) and
     # an extra hidden_states output.
     mtp_base: bool = False
+    # ------------------------------------------ Gemma4 MTP config
+    root_model_type: str = ""
+    raw_layer_types: List[str] = field(default_factory=list)
+    rope_parameters: Optional[dict] = None
+    backbone_hidden_size: int = 0
+    gemma4_mtp_base: bool = False
+    gemma4_mtp_draft: bool = False
+    assistant_hidden_size: int = 0
+    shares_target_kv: bool = False
+    has_own_kv_cache: bool = True
+    constant_draft_positions: bool = False
+    returns_feedback_hidden: bool = False
+    use_ordered_embeddings: bool = False
+    num_centroids: int = 0
+    centroid_intermediate_top_k: int = 0
+    sparse_logits_enabled: bool = False
+    kv_sharing_map: List[dict] = field(default_factory=list)
     # ------------------------------------------ EAGLE3 draft config
     draft_vocab_size: Optional[int] = None
     target_hidden_size: Optional[int] = None
@@ -614,6 +631,11 @@ class ModelConfig:
         return bool(self.mtp_num_hidden_layers is not None
                     and self.gdn_cfg is None and not self.mtp_base
                     and not self.is_eagle3_draft and not self.is_dflash_draft)
+
+    @property
+    def is_gemma4_mtp_draft(self) -> bool:
+        """True for a paired Gemma4 assistant draft checkpoint."""
+        return self.gemma4_mtp_draft
 
     @property
     def is_dflash_draft(self) -> bool:
@@ -724,7 +746,10 @@ class ModelConfig:
         """
         root, llm_dict = load_checkpoint_config_dicts(model_dir)
 
+        root_model_type = root.get("model_type", "")
         model_type = llm_dict.get("model_type", "llama")
+        if root_model_type == "gemma4_assistant":
+            model_type = root_model_type
         hidden_size = llm_dict["hidden_size"]
         num_attn_heads = llm_dict["num_attention_heads"]
         head_dim = llm_dict.get("head_dim", hidden_size // num_attn_heads)
@@ -733,6 +758,7 @@ class ModelConfig:
             llm_dict.get("num_global_key_value_heads", 0) or 0)
 
         quant = _parse_quant(model_dir, llm_dict)
+        raw_layer_types = _parse_raw_layer_types(llm_dict)
         layer_types = _parse_layer_types(llm_dict)
         attention_layer_types = _parse_attention_layer_types(
             llm_dict, llm_dict["num_hidden_layers"], model_type)
@@ -763,12 +789,11 @@ class ModelConfig:
         # EAGLE3 draft model fields
         draft_vocab_size = llm_dict.get("draft_vocab_size", None)
         target_hidden_size = llm_dict.get("target_hidden_size", None)
-        # Sliding window: active when use_sliding_window=True, OR when
+        # Sliding window: active when use_sliding_window=True, or when
         # layer_types contains "sliding_attention" (Gemma4 convention).
-        use_sw = llm_dict.get("use_sliding_window", False)
-        layer_types_raw = llm_dict.get("layer_types", [])
-        if not use_sw and "sliding_attention" in layer_types_raw:
-            use_sw = True
+        use_sw = llm_dict.get("use_sliding_window", False) or any(
+            layer_type == "sliding_attention"
+            for layer_type in raw_layer_types)
         sw_raw = llm_dict.get("sliding_window") if use_sw else None
         sliding_window_size = int(sw_raw) if sw_raw is not None else -1
 
@@ -858,6 +883,22 @@ class ModelConfig:
             mtp_num_hidden_layers=mtp_num_hidden_layers,
             mtp_use_dedicated_embeddings=mtp_use_dedicated_embeddings,
             mtp_base=bool(llm_dict.get("mtp_base", False)),
+            root_model_type=root_model_type,
+            raw_layer_types=raw_layer_types,
+            rope_parameters=llm_dict.get("rope_parameters", None),
+            backbone_hidden_size=int(
+                llm_dict.get("backbone_hidden_size", 0) or 0),
+            assistant_hidden_size=(hidden_size if root_model_type
+                                   == "gemma4_assistant" else 0),
+            shares_target_kv=(root_model_type == "gemma4_assistant"),
+            has_own_kv_cache=(root_model_type != "gemma4_assistant"),
+            constant_draft_positions=(root_model_type == "gemma4_assistant"),
+            returns_feedback_hidden=(root_model_type == "gemma4_assistant"),
+            use_ordered_embeddings=bool(
+                llm_dict.get("use_ordered_embeddings", False)),
+            num_centroids=int(llm_dict.get("num_centroids", 0) or 0),
+            centroid_intermediate_top_k=int(
+                llm_dict.get("centroid_intermediate_top_k", 0) or 0),
             dflash_base=bool(llm_dict.get("dflash_base", False)),
             num_deepstack_features=_parse_num_deepstack_features(
                 llm_dict, model_type, root_config=root),
@@ -1115,6 +1156,14 @@ def _validate_mtp_constraints(
     if mtp_use_dedicated_embeddings:
         raise NotImplementedError(
             "Dedicated MTP embeddings are not supported for Qwen3.5 MTP.")
+
+
+def _parse_raw_layer_types(config: dict) -> List[str]:
+    """Return checkpoint layer type strings without canonicalization."""
+    raw = config.get("layers_block_type") or config.get("layer_types")
+    if raw is None:
+        return []
+    return [str(layer_type) for layer_type in raw]
 
 
 def _parse_layer_types(config: dict) -> List[str]:

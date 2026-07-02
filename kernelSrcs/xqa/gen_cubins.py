@@ -736,7 +736,8 @@ if __name__ == "__main__":
         ],
         [
             # Gemma 4 global attention uses 512-wide heads.
-            # nqpkv=4: E4B (8 Q heads / 2 KV heads)
+            # nqpkv=2: E4B assistant (4 Q heads / 2 KV heads)
+            # nqpkv=4: E4B base (8 Q heads / 2 KV heads)
             # nqpkv=8: E2B (8 Q heads / 1 KV head)
             CompileMacroOption('DTYPE', 'dt', ['__half']),
             CompileMacroOption('HEAD_ELEMS', 'd', [512]),
@@ -744,7 +745,7 @@ if __name__ == "__main__":
             CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 2]),
             CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV', [0]),
             CompileMacroOption('SLIDING_WINDOW', 'sw', [0, 1]),
-            CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [4, 8]),
+            CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [2, 4, 8]),
             CompileMacroOption('M_TILESIZE', 'm', [8]),
             CompileMacroOption('SPEC_DEC', 'spec_dec', [0]),
         ],

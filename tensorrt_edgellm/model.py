@@ -85,20 +85,24 @@ class AutoModel:
     """HuggingFace-style factory that dispatches on ``model_type``."""
 
     @classmethod
-    def from_pretrained(cls,
-                        model_dir: str,
-                        device: str = "cpu",
-                        key_remap=None,
-                        key_prefix: "str | None" = None,
-                        eagle_base: bool = False,
-                        reduced_vocab_dir: "str | None" = None,
-                        mtp_base: bool = False,
-                        mtp_draft: bool = False,
-                        tp_size: int = 1,
-                        tp_rank: int = 0,
-                        dflash_base: bool = False,
-                        dflash_draft: bool = False,
-                        dflash_draft_dir: "str | None" = None) -> nn.Module:
+    def from_pretrained(
+            cls,
+            model_dir: str,
+            device: str = "cpu",
+            key_remap=None,
+            key_prefix: "str | None" = None,
+            eagle_base: bool = False,
+            reduced_vocab_dir: "str | None" = None,
+            mtp_base: bool = False,
+            mtp_draft: bool = False,
+            tp_size: int = 1,
+            tp_rank: int = 0,
+            dflash_base: bool = False,
+            dflash_draft: bool = False,
+            dflash_draft_dir: "str | None" = None,
+            gemma4_mtp_base: bool = False,
+            gemma4_mtp_draft: bool = False,
+            gemma4_kv_sharing_map: "list[dict] | None" = None) -> nn.Module:
         """Construct and load a model from *model_dir*.
 
         Reads ``config.json`` via :class:`~config.ModelConfig`, looks up the
@@ -132,6 +136,14 @@ class AutoModel:
             dflash_draft:   When True, build the DFlash draft model.
             dflash_draft_dir:
                             Path to the DFlash draft checkpoint directory.
+            gemma4_mtp_base:
+                            Export a Gemma4 target checkpoint as the base
+                            engine for paired Gemma4 MTP.
+            gemma4_mtp_draft:
+                            Export/load a paired Gemma4 assistant checkpoint.
+            gemma4_kv_sharing_map:
+                            Validated assistant-layer to target-layer map for
+                            Gemma4 MTP draft runtime config.
 
         Returns:
             Loaded ``nn.Module`` in eval mode.
@@ -143,6 +155,8 @@ class AutoModel:
             config.eagle_base = True
         if mtp_base or config.mtp_base:
             config.mtp_base = True
+        if gemma4_mtp_base:
+            config.gemma4_mtp_base = True
         if dflash_base:
             config.dflash_base = True
             # Read target_layer_ids from DFlash draft checkpoint if provided
@@ -168,7 +182,9 @@ class AutoModel:
                                          mtp_base=config.mtp_base,
                                          mtp_draft=mtp_draft,
                                          dflash_base=config.dflash_base,
-                                         dflash_draft=dflash_draft)
+                                         dflash_draft=dflash_draft,
+                                         gemma4_mtp_base=gemma4_mtp_base,
+                                         gemma4_mtp_draft=gemma4_mtp_draft)
 
         # EAGLE3 draft: auto-detect from draft_vocab_size
         if variant == "eagle3_draft":
@@ -188,8 +204,11 @@ class AutoModel:
             config = make_mtp_draft_config(config)
             model_class = Qwen3_5MtpDraftModel
             if key_remap is None:
-                key_remap = lambda key: _mtp_key_remap(
-                    key, tie_word_embeddings=tie_word_embeddings)
+
+                def key_remap(key):
+                    return _mtp_key_remap(
+                        key, tie_word_embeddings=tie_word_embeddings)
+
         elif variant == "dflash_draft":
             if dflash_draft_dir is None:
                 raise ValueError(
@@ -207,6 +226,19 @@ class AutoModel:
             model_dir = dflash_draft_dir
             if key_remap is None:
                 key_remap = _dflash_key_remap
+        elif variant == "gemma4_mtp_draft":
+            if config.root_model_type != "gemma4_assistant":
+                raise ValueError(
+                    "Gemma4 MTP draft requires a gemma4_assistant checkpoint.")
+            from .models.gemma4 import Gemma4AssistantForCausalLM
+            config.gemma4_mtp_draft = True
+            config.shares_target_kv = True
+            config.has_own_kv_cache = False
+            config.constant_draft_positions = True
+            config.returns_feedback_hidden = True
+            config.assistant_hidden_size = config.hidden_size
+            config.kv_sharing_map = list(gemma4_kv_sharing_map or [])
+            model_class = Gemma4AssistantForCausalLM
         else:
             if (variant == "mtp_base"
                     and not _is_qwen3_5_mtp_base_supported(config.model_type)):
@@ -214,10 +246,19 @@ class AutoModel:
                     "Qwen3.5 MTP base is only supported for qwen3_5_text "
                     "qwen3_5_moe, or qwen3_5_moe_text checkpoints; "
                     f"got {config.model_type!r}.")
-            # DFlash base is supported for both Qwen3.5 hybrid (qwen3_5_text) and
-            # dense Qwen3 (default CausalLM). Dense models use the Transformer's
-            # dflash_target_layer_ids parameter to collect target-layer hidden states.
-            model_class = _MODEL_REGISTRY.get(config.model_type, CausalLM)
+            if variant == "gemma4_mtp_base":
+                if config.model_type not in ("gemma4", "gemma4_text"):
+                    raise ValueError(
+                        "Gemma4 MTP base requires a gemma4/gemma4_text target checkpoint."
+                    )
+                from .models.gemma4 import Gemma4ForCausalLM
+                config.gemma4_mtp_base = True
+                model_class = Gemma4ForCausalLM
+            else:
+                # DFlash base is supported for both Qwen3.5 hybrid (qwen3_5_text) and
+                # dense Qwen3 (default CausalLM). Dense models use the Transformer's
+                # dflash_target_layer_ids parameter to collect target-layer hidden states.
+                model_class = _MODEL_REGISTRY.get(config.model_type, CausalLM)
 
         model = model_class(config)
         model.to(device)
@@ -342,7 +383,9 @@ def _resolve_model_variant(config: ModelConfig,
                            mtp_base: bool,
                            mtp_draft: bool,
                            dflash_base: bool = False,
-                           dflash_draft: bool = False) -> str:
+                           dflash_draft: bool = False,
+                           gemma4_mtp_base: bool = False,
+                           gemma4_mtp_draft: bool = False) -> str:
     """Resolve the requested model variant while keeping EAGLE3 behavior intact."""
     if eagle_base and mtp_base:
         raise ValueError("eagle_base and mtp_base cannot both be enabled.")
@@ -359,12 +402,27 @@ def _resolve_model_variant(config: ModelConfig,
     if dflash_draft and (eagle_base or mtp_base or mtp_draft):
         raise ValueError(
             "dflash_draft cannot be combined with eagle/mtp variants.")
+    if gemma4_mtp_base and (eagle_base or mtp_base or mtp_draft or dflash_base
+                            or dflash_draft):
+        raise ValueError(
+            "gemma4_mtp_base cannot be combined with other speculative variants."
+        )
+    if gemma4_mtp_draft and (eagle_base or mtp_base or mtp_draft or dflash_base
+                             or dflash_draft):
+        raise ValueError(
+            "gemma4_mtp_draft cannot be combined with other speculative variants."
+        )
+    if gemma4_mtp_base and gemma4_mtp_draft:
+        raise ValueError(
+            "gemma4_mtp_base and gemma4_mtp_draft cannot both be enabled.")
     if config.is_eagle3_draft:
         if mtp_base or mtp_draft:
             raise ValueError(
                 "EAGLE3 draft checkpoints cannot be loaded as Qwen3.5 MTP variants."
             )
         return "eagle3_draft"
+    if gemma4_mtp_draft:
+        return "gemma4_mtp_draft"
     if dflash_draft:
         return "dflash_draft"
     if dflash_base:
@@ -373,6 +431,8 @@ def _resolve_model_variant(config: ModelConfig,
         return "mtp_draft"
     if mtp_base:
         return "mtp_base"
+    if gemma4_mtp_base:
+        return "gemma4_mtp_base"
     if eagle_base:
         return "eagle_base"
     return "llm"

@@ -693,24 +693,42 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     int32_t const startOfChannelId = static_cast<int32_t>(mTokenizer->getTokenId("<|channel>"));
     int32_t const startOfThinkId = static_cast<int32_t>(mTokenizer->getTokenId("<think>"));
 
-    auto updateThinkingDone = [&]() {
-        if (!request.enableThinking)
+    auto updateThinkingDoneForToken = [&](int32_t batchIdx, int32_t tokenId) {
+        if (!request.enableThinking || thinkingDone[batchIdx])
+        {
             return;
+        }
+        if (tokenId == endOfChannelId || tokenId == endOfThinkId)
+        {
+            thinkingDone[batchIdx] = true;
+        }
+        else if (context.currentGenerateLengths[batchIdx] == 1 && tokenId != startOfChannelId
+            && tokenId != startOfThinkId)
+        {
+            thinkingDone[batchIdx] = true;
+            LOG_DEBUG("Batch %d: first token %d is not thinking-start, marking thinkingDone", batchIdx, tokenId);
+        }
+    };
+
+    auto updateThinkingDone = [&]() {
         for (int32_t i = 0; i < context.activeBatchSize; ++i)
         {
-            if (thinkingDone[i] || context.tokenIds[i].empty())
+            if (context.tokenIds[i].empty())
+            {
                 continue;
-            auto lastTok = context.tokenIds[i].back();
-            if (lastTok == endOfChannelId || lastTok == endOfThinkId)
-            {
-                thinkingDone[i] = true;
             }
-            else if (context.currentGenerateLengths[i] == 1 && lastTok != startOfChannelId && lastTok != startOfThinkId)
-            {
-                thinkingDone[i] = true;
-                LOG_DEBUG("Batch %d: first token %d is not thinking-start, marking thinkingDone", i, lastTok);
-            }
+            updateThinkingDoneForToken(i, context.tokenIds[i].back());
         }
+    };
+
+    context.shouldStopAfterAcceptedToken = [&](int32_t batchIdx, int32_t tokenId) {
+        updateThinkingDoneForToken(batchIdx, tokenId);
+        bool isEos = mTokenizer->isEosToken(tokenId);
+        if (isEos && request.enableThinking && tokenId != mTokenizer->getEosId() && !thinkingDone[batchIdx])
+        {
+            isEos = false;
+        }
+        return isEos || context.currentGenerateLengths[batchIdx] >= context.maxGenerateLength;
     };
 
     // Lambda to update finish states based on EOS and max_length. Latches

@@ -381,5 +381,57 @@ TensorRegistry buildRegistryForDFlashDraft(DeploymentConfig const& bundle)
     return reg;
 }
 
+TensorRegistry buildRegistryForGemma4MTPDraft(DeploymentConfig const& bundle)
+{
+    check::check(bundle.draft.has_value(), "buildRegistryForGemma4MTPDraft: bundle.draft must be set");
+    check::check(bundle.specConfig.has_value(), "buildRegistryForGemma4MTPDraft: bundle.specConfig must be set");
+    check::check(bundle.specDecodeMode() == SpecDecodeMode::kGemma4MTP,
+        "buildRegistryForGemma4MTPDraft requires spec_decode_type=gemma4_mtp");
+
+    TensorRegistry reg;
+    LLMEngineConfig const& draftCfg = *bundle.draft;
+    int32_t const baseOutputHiddenDim = bundle.specConfig->baseOutputHiddenDim;
+    int32_t const draftVocabSize = draftCfg.outputVocabSize;
+
+    // inputs_embeds: [B, 1, Hb] target/base embedding table output.
+    reg.addTensor({binding_names::kInputsEmbeds, TensorIO::kInput, nvinfer1::DataType::kHALF,
+        {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(baseOutputHiddenDim)}});
+
+    // hidden_states_input: [B, 1, Hb] target hidden seed or assistant feedback hidden.
+    reg.addTensor({binding_names::kBaseModelHiddenStates, TensorIO::kInput, nvinfer1::DataType::kHALF,
+        {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(baseOutputHiddenDim)}});
+
+    // context_lengths: [B] target KV lengths.
+    reg.addTensor(
+        {binding_names::kContextLengths, TensorIO::kInput, nvinfer1::DataType::kINT32, {sym(&InferenceDims::batch)}});
+
+    addRopeTensorSpecs(reg, draftCfg);
+
+    // logits: [B, vocab] full-logits correctness path.
+    reg.addTensor({binding_names::kLogits, TensorIO::kOutput, nvinfer1::DataType::kFLOAT,
+        {sym(&InferenceDims::batch), fixed(draftVocabSize)}});
+
+    // hidden_states: [B, 1, Hb] assistant feedback hidden in target backbone space.
+    reg.addTensor({binding_names::kOutputHiddenStates, TensorIO::kOutput, nvinfer1::DataType::kHALF,
+        {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(baseOutputHiddenDim)}});
+
+    for (auto const& entry : draftCfg.gemma4MTPKVSharingMap)
+    {
+        check::check(entry.assistantLayerIdx >= 0 && entry.assistantLayerIdx < draftCfg.numAttentionLayers,
+            "buildRegistryForGemma4MTPDraft: invalid assistant layer index");
+        check::check(entry.targetAttentionLayerIdx >= 0
+                && entry.targetAttentionLayerIdx < static_cast<int32_t>(bundle.base.kvLayerConfigs.size()),
+            "buildRegistryForGemma4MTPDraft: invalid target attention layer index");
+
+        auto const& targetKV = bundle.base.kvLayerConfigs[entry.targetAttentionLayerIdx];
+        std::vector<ShapeDim> const shape{sym(&InferenceDims::batch), fixed(2), fixed(targetKV.numKVHeads),
+            sym(&InferenceDims::kvLen), fixed(targetKV.headDim)};
+        reg.addTensor({binding_names::formatKVCacheName(entry.assistantLayerIdx, /*isPast=*/true), TensorIO::kInput,
+            bundle.base.kvCacheDtype, shape});
+    }
+
+    return reg;
+}
+
 } // namespace rt
 } // namespace trt_edgellm
