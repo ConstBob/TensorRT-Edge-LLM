@@ -28,6 +28,7 @@ import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+import trt_dev_toolkit
 from trt_dev_toolkit.code_manager import (ArtifactSource, ArtifactTarget,
                                           BuildComponent, BuildMode,
                                           CodeManager, DeploymentMode)
@@ -59,6 +60,7 @@ _JOBS = 16
 _PYTHON = "python3"
 _DEFAULT_ONNX_ROOT = PurePosixPath("/home/edge_llm_cache/trt-ci/onnx")
 _MODEL_RELATIVE = PurePosixPath("Qwen2.5-0.5B-Instruct/llm-fp16-fp16")
+_TOOLKIT_SRC = str(Path(trt_dev_toolkit.__file__).resolve().parents[1])
 
 
 class FlowError(RuntimeError):
@@ -427,12 +429,17 @@ class ControllerFlow:
             "--run-id",
             self.config.run_id,
         ]
+        pythonpath = os.pathsep.join(item for item in (
+            os.environ.get("TRT_CI_TOOLKIT_PYTHONPATH", _TOOLKIT_SRC),
+            os.environ.get("PYTHONPATH", ""),
+        ) if item)
         result = self.services.commands.run(
             self.services.build_remote.target,
             CommandSpec(
                 name="Build, deploy, and test Edge-LLM",
                 argv=argv,
                 env={
+                    "PYTHONPATH": pythonpath,
                     "TRT_CI_BRANCH": self.config.branch,
                     "TRT_CI_ONNX_DIR": str(self.config.onnx_root),
                     "TRT_CI_JOBS": str(self.config.jobs),

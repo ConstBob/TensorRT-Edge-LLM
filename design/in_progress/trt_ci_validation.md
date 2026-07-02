@@ -49,7 +49,7 @@ exact `RunResult` returned by `plan_and_execute()` is passed directly to
 controller
   -> stage current Edge-LLM checkout
   -> RemoteConnectionManager upload to x86 build host
-  -> hidden build-host worker
+  -> hidden build-host worker with forwarded TRT Dev Toolkit PYTHONPATH
        -> detect package or built-source TRT PRE_BUILT layout
        -> CodeManager plan_and_execute(TRT PRE_BUILT, Edge-LLM BUILD)
        -> CodeManager deploy_runtime(actual RunResult, x86 run host)

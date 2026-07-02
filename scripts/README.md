@@ -89,4 +89,6 @@ Each run owns `/tmp/edgellm-trt-ci/run-<id>` on both remote hosts. Failed runs
 retain their workspaces. Successful runs clean them, while controller logs and
 streamed worker output remain under `artifacts/trt-ci/run-<id>`. Set
 `TRT_CI_JOBS`, `TRT_CI_ARTIFACTS_DIR`, or `TRT_CI_ONNX_DIR` only when a
-CI default needs an override.
+CI default needs an override. The controller forwards its discovered toolkit
+source path to the build worker; use `TRT_CI_TOOLKIT_PYTHONPATH` only when the
+build host exposes that checkout at a different shared path.

@@ -17,6 +17,7 @@
 import argparse
 import ast
 import dataclasses
+import os
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -327,7 +328,16 @@ def test_trt_probe_rejects_empty_output(config):
         ci.BuildWorker(config, services, FakeLogger())._probe_trt()
 
 
-def test_controller_stages_source_and_invokes_hidden_worker(config):
+@pytest.mark.parametrize("toolkit_override", [None, "/ci/toolkit/src"])
+def test_controller_stages_source_and_invokes_hidden_worker(
+        config, monkeypatch, toolkit_override):
+    inherited_pythonpath = os.pathsep.join(
+        ("/existing/python", "/team/python"))
+    monkeypatch.setenv("PYTHONPATH", inherited_pythonpath)
+    if toolkit_override is None:
+        monkeypatch.delenv("TRT_CI_TOOLKIT_PYTHONPATH", raising=False)
+    else:
+        monkeypatch.setenv("TRT_CI_TOOLKIT_PYTHONPATH", toolkit_override)
     events = []
     commands = FakeCommands(events)
     remote = _remote(ci.Endpoint("build-alias", "builder", 2201), config,
@@ -382,11 +392,15 @@ def test_controller_stages_source_and_invokes_hidden_worker(config):
         "--run-id",
         config.run_id,
     ]
+    toolkit = toolkit_override or ci._TOOLKIT_SRC
     assert worker.env == {
+        "PYTHONPATH": os.pathsep.join((toolkit, inherited_pythonpath)),
         "TRT_CI_BRANCH": config.branch,
         "TRT_CI_ONNX_DIR": str(config.onnx_root),
         "TRT_CI_JOBS": str(config.jobs),
     }
+    if toolkit_override is None:
+        assert (Path(toolkit) / "trt_dev_toolkit" / "__init__.py").is_file()
     assert worker.timeout_s == config.worker_timeout_s + 120
     assert remote.filesystem.remove_calls[-1][1]["timeout_s"] == 1800
 
