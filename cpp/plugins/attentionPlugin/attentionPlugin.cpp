@@ -236,17 +236,21 @@ REGISTER_TENSORRT_PLUGIN(AttentionPluginCreator);
 // deinterleaveKVCache call (WAR for current kernel limitation).
 std::pair<rt::Tensor, rt::Tensor> AttentionPlugin::deinterleaveKVCache(rt::Tensor const& kvCacheTensor,
     std::byte*& workspacePtr, int32_t batchSize, int32_t numKVHeads, int32_t kvCacheCapacity, int32_t headSize,
-    cudaStream_t stream)
+    int32_t seqLen, cudaStream_t stream)
 {
-    size_t const halfSize = static_cast<size_t>(batchSize) * kvCacheCapacity * numKVHeads * headSize;
-    rt::Tensor kvWorkspaceTensor = assignTensorFromWorkspace(
-        workspacePtr, {batchSize, 2, numKVHeads, kvCacheCapacity, headSize}, DataType::kHALF);
+    // seqLen == 0 means copy full capacity; otherwise copy only first seqLen tokens (compact).
+    int32_t const outSeqDim = (seqLen > 0) ? seqLen : kvCacheCapacity;
+    size_t const halfSize = static_cast<size_t>(batchSize) * outSeqDim * numKVHeads * headSize;
+    rt::Tensor kvWorkspaceTensor
+        = assignTensorFromWorkspace(workspacePtr, {batchSize, 2, numKVHeads, outSeqDim, headSize}, DataType::kHALF);
     half* ptr = kvWorkspaceTensor.dataPointer<half>();
     rt::Tensor kTensor(
-        ptr, rt::Coords{batchSize, kvCacheCapacity, numKVHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor vTensor(ptr + halfSize, rt::Coords{batchSize, kvCacheCapacity, numKVHeads, headSize},
-        rt::DeviceType::kGPU, DataType::kHALF);
-    kernel::cvtKVLayoutBHSDToSplitKV(kvCacheTensor, kTensor, vTensor, rt::Tensor{}, stream);
+        ptr, rt::Coords{batchSize, outSeqDim, numKVHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor vTensor(
+        ptr + halfSize, rt::Coords{batchSize, outSeqDim, numKVHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
+
+    // seqLen > 0: compact copy of first seqLen tokens; seqLen == 0: full copy (also handles FP8 dequant).
+    kernel::cvtKVLayoutBHSDToSplitKV(kvCacheTensor, kTensor, vTensor, rt::Tensor{}, seqLen, stream);
     return std::make_pair(std::move(kTensor), std::move(vTensor));
 }
 
@@ -269,6 +273,13 @@ void AttentionPlugin::dispatchFFPAKernel(half const* q, half const* k, half cons
     CuteDslFFPARunner::run(ffpaParams, stream);
 }
 #endif
+
+void AttentionPlugin::zeroPrefillOutputForPaddingForFFPA(rt::Tensor& attentionOutput, int32_t batchSize, int32_t seqLen,
+    int32_t numQHeads, int32_t headSize, cudaStream_t stream)
+{
+    size_t const outputBytes = static_cast<size_t>(batchSize) * seqLen * numQHeads * headSize * sizeof(half);
+    CUDA_CHECK(cudaMemsetAsync(attentionOutput.rawPointer(), 0, outputBytes, stream));
+}
 
 AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
     int32_t enableTreeAttention, int32_t enableFp8KVCache, int32_t slidingWindowSize,
@@ -735,10 +746,13 @@ size_t AttentionPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, 
 
 int32_t AttentionPlugin::getAliasedInput(int32_t outputIndex) noexcept
 {
-    if (outputIndex == kOUT_KV_CACHE_IDX)
-    {
-        return kIN_KV_CACHE_IDX;
-    }
+    // WAR:this is not the correct plugin API usage. The
+    // plugin updates the KV cache in place, so the correct return is
+    // kIN_KV_CACHE_IDX (output kOUT_KV_CACHE_IDX aliases that input). We return -1
+    // to drop the alias because declaring it makes Myelin keep a redundant
+    // per-layer KV copy (the perf regression). In-place read-write still works
+    // because the runtime binds past and present KV to the same address. TODO:
+    // restore the alias declaration once the Myelin issue is fixed.
     return -1;
 }
 
@@ -899,15 +913,26 @@ int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, [[maybe_unus
                     "(B=%d, S=%d, Hq=%d, Hkv=%d, D=%d, cap=%d)",
                     runtimeBatchSize, runtimeSeqLen, mNumQHeads, mNumKVHeads, mHeadSize, kvCacheCapacity);
 
-                // Extract K/V from donor's cache and run FFPA with native GQA.
-                // seqlenK = kvCacheCapacity to match the batch stride of deinterleaved K/V
-                // (shape [B, kvCacheCapacity, Hkv, D]). Causal masking ensures only the
-                // first runtimeSeqLen positions are attended to.
+                // Zero attention output at padding positions before FFPA writes.
+                // FFPA has no cu_seqlens — it processes all positions uniformly.
+                // BS=1 has no padding, so skip the memset.
+                if (runtimeBatchSize > 1)
+                {
+                    zeroPrefillOutputForPaddingForFFPA(
+                        attentionOutputTensor, runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize, stream);
+                }
+
+                // Extract K/V from donor's cache (compact: only first runtimeSeqLen tokens)
+                // and run FFPA with native GQA.  seqlenK = runtimeSeqLen so that FFPA's
+                // bottom-right causal mask offset (seqlenK - seqlenQ) is 0, correctly
+                // bounding attention to valid positions.  The compact deinterleave produces
+                // [B, runtimeSeqLen, Hkv, D] so physical stride matches seqlenK — no batch
+                // stride override needed.
                 auto [kSplit, vSplit] = deinterleaveKVCache(kvCacheTensor, alignedWorkspacePtr, runtimeBatchSize,
-                    mNumKVHeads, kvCacheCapacity, mHeadSize, stream);
+                    mNumKVHeads, kvCacheCapacity, mHeadSize, runtimeSeqLen, stream);
                 dispatchFFPAKernel(qInputTensor.dataPointer<half>(), kSplit.dataPointer<half>(),
                     vSplit.dataPointer<half>(), attentionOutputTensor.dataPointer<half>(), runtimeBatchSize,
-                    runtimeSeqLen, kvCacheCapacity, mNumQHeads, mNumKVHeads, mHeadSize, stream);
+                    runtimeSeqLen, runtimeSeqLen, mNumQHeads, mNumKVHeads, mHeadSize, stream);
 #else
                 LOG_ERROR("AttentionPlugin: headSize=512 shared-KV prefill requires FFPA (CUTE_DSL_FFPA_ENABLED).");
                 return -1;
@@ -939,10 +964,15 @@ int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, [[maybe_unus
                 fmhaRunner.setupParams(params);
                 params.cu_q_seqlens = cuQSeqLensTensor.dataPointer<int32_t>();
 
+                // Normal prefill: compact deinterleave (seqLen tokens) so FMHA_v2's
+                // s_kv-derived batch stride matches the physical layout.
+                // Chunked prefill: full deinterleave, s_kv = kvCacheCapacity.
+                bool const compact = (executionMode == AttentionExecutionMode::kNORMAL_PREFILL);
+                int32_t const seqLen = compact ? runtimeSeqLen : 0;
                 auto [kSplit, vSplit] = deinterleaveKVCache(kvCacheTensor, alignedWorkspacePtr, runtimeBatchSize,
-                    mNumKVHeads, kvCacheCapacity, mHeadSize, stream);
+                    mNumKVHeads, kvCacheCapacity, mHeadSize, seqLen, stream);
 
-                params.s_kv = kvCacheCapacity;
+                params.s_kv = compact ? runtimeSeqLen : kvCacheCapacity;
                 params.q_ptr = qInputTensor.dataPointer<half>();
                 params.k_ptr = kSplit.dataPointer<half>();
                 params.v_ptr = vSplit.dataPointer<half>();
@@ -1043,7 +1073,7 @@ int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, [[maybe_unus
                         vInputTensor, kvCacheTensor, kScale, vScale, stream, false);
 
                     auto [kSplit, vSplit] = deinterleaveKVCache(kvCacheTensor, alignedWorkspacePtr, runtimeBatchSize,
-                        mNumKVHeads, kvCacheCapacity, mHeadSize, stream);
+                        mNumKVHeads, kvCacheCapacity, mHeadSize, 0, stream);
 
                     params.s_kv = kvCacheCapacity;
                     params.q_ptr = qInputTensor.dataPointer<half>();

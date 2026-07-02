@@ -104,6 +104,11 @@ struct LLMEngineConfig
     int32_t imageTokenId{-1}; //!< Special token ID for image (-1 = unused)
     int32_t audioTokenId{-1}; //!< Special token ID for audio (-1 = unused)
 
+    //! Additional EOS token IDs parsed from config.json `eos_token_id` array.
+    //! Models like Gemma4 have multiple EOS tokens (e.g. [1, 106] for <eos> and <turn|>).
+    //! Empty if `eos_token_id` is absent or scalar.
+    std::vector<int32_t> eosTokenIds{};
+
     // --- Hybrid model (Mamba/GDN) state dimensions ---
     int32_t numLinearAttnLayers{0};    //!< Number of linear attention / recurrent layers
     int32_t recurrentStateNumHeads{0}; //!< Recurrent state heads (hv for GDN, mamba_num_heads for Mamba)

@@ -352,11 +352,13 @@ function(cute_dsl_setup)
     set(_cute_dsl_cuda_ver "")
   endif()
 
-  if(NOT _cute_dsl_cuda_ver STREQUAL "" AND _cute_dsl_cuda_ver VERSION_LESS
-                                            12.0)
+  # CUDA 11.4 is allowed only for special CuTe DSL package deliveries.
+  if(NOT _cute_dsl_cuda_ver STREQUAL ""
+     AND NOT _cute_dsl_cuda_ver VERSION_EQUAL 11.4
+     AND _cute_dsl_cuda_ver VERSION_LESS 12.6)
     message(
       FATAL_ERROR
-        "CuTe DSL requires CUDA Toolkit 12.0+ (detected ${_cute_dsl_cuda_ver}). "
+        "CuTe DSL requires CUDA Toolkit 12.6+ (detected ${_cute_dsl_cuda_ver}). "
         "Use -DENABLE_CUTE_DSL=OFF or set -DCUDA_CTK_VERSION to a supported toolkit."
     )
   endif()
@@ -369,8 +371,9 @@ function(cute_dsl_setup)
       "${CMAKE_SOURCE_DIR}/cpp/kernels/gdnKernels/cutedsl_cuda_runtime_library_shim.c"
   )
   if(NOT TARGET trt_edgellm_cutedsl_cudart_shim)
-    if(NOT _cute_dsl_cuda_ver STREQUAL "" AND _cute_dsl_cuda_ver
-                                              VERSION_GREATER_EQUAL 12.8)
+    if(_cute_dsl_cuda_ver STREQUAL ""
+       OR _cute_dsl_cuda_ver VERSION_LESS 12.0
+       OR _cute_dsl_cuda_ver VERSION_GREATER_EQUAL 12.8)
       add_library(trt_edgellm_cutedsl_cudart_shim INTERFACE)
     else()
       if(NOT EXISTS "${_cutedsl_cudart_shim_src}")
@@ -880,10 +883,11 @@ function(cute_dsl_setup)
     if(CUDA_DRIVER_LIB AND NOT CUDA_DRIVER_LIB MATCHES "-NOTFOUND$")
       target_link_libraries(${_tgt} PRIVATE "${CUDA_DRIVER_LIB}")
     endif()
-    # CUDA < 12.8: wrap _cudaLaunchKernelEx (cudaKernel_t → CUfunction, e.g.
-    # JetPack 6).
-    if(NOT _cute_dsl_cuda_ver STREQUAL "" AND _cute_dsl_cuda_ver VERSION_LESS
-                                              12.8)
+    # CUDA 12.0–12.6: wrap _cudaLaunchKernelEx (cudaKernel_t → CUfunction, e.g.
+    # JetPack 6). CUDA 11.x artifacts use CUmodule ABI instead.
+    if(NOT _cute_dsl_cuda_ver STREQUAL ""
+       AND _cute_dsl_cuda_ver VERSION_GREATER_EQUAL 12.0
+       AND _cute_dsl_cuda_ver VERSION_LESS 12.8)
       target_link_options(${_tgt} PRIVATE "-Wl,--wrap=_cudaLaunchKernelEx")
     endif()
   endforeach()

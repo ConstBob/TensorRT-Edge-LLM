@@ -22,13 +22,15 @@
 #include <cuda.h>
 #if defined(TRT_EDGELLM_CUDA_LIBRARY_T_COMPAT)
 #include <cuda_runtime.h>
+#if CUDA_VERSION >= 12000 && CUDA_VERSION < 12080
 typedef CUlibrary cudaLibrary_t;
 static inline cudaError_t cudaLibraryUnload(cudaLibrary_t lib)
 {
     CUresult r = cuLibraryUnload(lib);
     return static_cast<cudaError_t>(r);
 }
-#endif
+#endif // CUDA_VERSION >= 12000 && CUDA_VERSION < 12080
+#endif // TRT_EDGELLM_CUDA_LIBRARY_T_COMPAT
 
 #include "cutedsl_all.h"
 
@@ -205,8 +207,12 @@ public:
     //! and (b) every buffer enumerated in allocate_sm120_decode_workspace +
     //! allocate_sm120_prefill_workspace in moe_dispatch.py. Returns the max of the two
     //! backends so backend == kAuto can pick either at runtime without re-querying.
+    //! \p backend sizes the decode sub-layout appropriately: under kAuto the decode backend is
+    //! only ever selected for num_tokens*top_k <= kDecodePrefillCutoverRoutedRows, so the decode
+    //! workspace is capped at the cutover instead of the (potentially huge) profile-wide
+    //! maxRoutedRows. See decodeCapRoutedRows().
     static size_t getWorkspaceSize(int32_t maxNumTokens, int32_t maxRoutedRows, int32_t numExperts, int32_t topK,
-        int32_t hiddenSize, int32_t moeInterSize);
+        int32_t hiddenSize, int32_t moeInterSize, CuteDslMoeBackend backend);
 
     //! Dispatch one fused MoE launch. Returns 0 on success, non-zero on dispatch failure
     //! (unsupported dim, missing module, kernel returned non-zero).
@@ -218,6 +224,13 @@ private:
     //! moe_dispatch.py: decode when num_tokens*top_k <= kDecodePrefillCutoverRoutedRows,
     //! else prefill. Explicit kDecode / kPrefill are propagated as-is.
     static CuteDslMoeBackend resolveBackend(CuteDslMoeBackend backend, int32_t numTokens, int32_t topK);
+
+    //! Upper bound on the routed rows the decode backend can ever process, used to size BOTH
+    //! the decode workspace allocation (getWorkspaceSize) and the per-launch decode layout
+    //! (runDecode) so they stay consistent. kPrefill never dispatches decode (minimal); kAuto is
+    //! bounded by kDecodePrefillCutoverRoutedRows; explicit kDecode bypasses the cutover and is
+    //! bounded only by the profile-wide maxRoutedRows.
+    static int32_t decodeCapRoutedRows(CuteDslMoeBackend backend, int32_t maxRoutedRows);
 
     //! Pick the compile-time MMA N-tile variant. Currently returns n128 only;
     //! N must already be a multiple of kLevelTileN (enforced by canImplement).

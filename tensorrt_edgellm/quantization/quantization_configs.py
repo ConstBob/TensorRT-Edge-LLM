@@ -129,8 +129,9 @@ FP8_ATTN = {
 # Different families pick different names — Qwen-VL uses ``visual.*``, InternVL
 # 3.5 uses ``vision_tower.*`` + ``multi_modal_projector.*``, InternVL3 (custom)
 # uses ``vision_model.*`` + ``mlp1.*``, Phi-4-multimodal nests the visual
-# encoder under ``model.embed_tokens_extend.image_embed.*``.  This single
-# tuple is the source of truth; everything below derives from it.
+# encoder under ``model.embed_tokens_extend.image_embed.*``, and Gemma4 uses
+# ``embed_vision.*``.  This single tuple is the source of truth; everything
+# below derives from it.
 _VISUAL_PREFIXES = (
     "visual",
     "vision_tower",
@@ -138,6 +139,7 @@ _VISUAL_PREFIXES = (
     "multi_modal_projector",
     "mlp1",
     "image_embed",
+    "embed_vision",
 )
 
 
@@ -191,10 +193,12 @@ FP8_VISUAL = {
 _VISUAL_PATTERNS = tuple(f"*{p}.*" for p in _VISUAL_PREFIXES)
 
 # Audio submodule prefixes. Mirror of ``_VISUAL_PREFIXES`` for the audio
-# tower (Qwen3-ASR / Qwen3-Omni audio encoder, Phi-4mm audio_embed).
+# tower (Qwen3-ASR / Qwen3-Omni audio encoder, Phi-4mm audio_embed, Gemma4
+# embed_audio).
 _AUDIO_PREFIXES = (
     "audio_tower",
     "audio_embed",
+    "embed_audio",
 )
 _AUDIO_PATTERNS = tuple(f"*{p}.*" for p in _AUDIO_PREFIXES)
 

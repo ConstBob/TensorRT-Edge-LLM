@@ -1,5 +1,15 @@
 # Release Notes
 
+## 0.9.0
+- Added Gemma 4 E2B/E4B text inference support
+- Added DFlash support
+- Added Qwen3-Omni-30B-A3B NVFP4 support
+- Fixed decode performance regression in 0.8.0
+- Added Nemotron3 NVFP4 support for Jetson Thor
+- Added C++ audio decoding/mel preprocessing and server audio input for supported audio models
+- Expanded NVFP4 MoE backend coverage for SM100/101/110
+- Added XQA sliding-window support and head-dim 512 kernels across supported SM targets
+
 ## 0.8.0
 - Externalized INT4 FFN, INT4 MoE, and LM-head weights to reduce engine build memory usage
 - Upgraded plugins to TensorRT Plugin V3 for TensorRT 11 readiness

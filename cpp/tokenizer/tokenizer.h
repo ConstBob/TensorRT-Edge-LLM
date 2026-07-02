@@ -67,6 +67,7 @@ struct ChatTemplateConfig
     std::string generationPrompt;         //!< Standard generation prompt (thinking disabled)
     std::string generationPromptThinking; //!< Generation prompt with thinking enabled (optional, model-specific)
     std::string defaultSystemPrompt;      //!< Default system prompt
+    bool trimContent{false};              //!< Whether to trim whitespace from message content (matches Jinja | trim)
 };
 
 /*!
@@ -207,6 +208,43 @@ public:
     Rank getEosId() const noexcept
     {
         return mEosId;
+    }
+
+    /*!
+     * @brief Check if a token is an end-of-sequence token
+     * @param tokenId Token ID to check
+     * @return true if the token is any EOS token (primary or additional)
+     */
+    bool isEosToken(Rank tokenId) const noexcept
+    {
+        if (tokenId == mEosId)
+        {
+            return true;
+        }
+        for (Rank id : mAdditionalEosIds)
+        {
+            if (tokenId == id)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /*!
+     * @brief Set additional end-of-sequence token IDs
+     * @param ids Vector of additional EOS token IDs (from config.json eos_token_id array)
+     */
+    void setAdditionalEosIds(std::vector<Rank> const& ids)
+    {
+        mAdditionalEosIds.clear();
+        for (Rank id : ids)
+        {
+            if (id != mEosId && id >= 0)
+            {
+                mAdditionalEosIds.push_back(id);
+            }
+        }
     }
 
     /*!
@@ -366,12 +404,13 @@ protected:
     std::unordered_map<Rank, std::string> mSpecialTokensDecoder; //!< Special tokens decoder mapping
 
     // Configuration
-    int mNumVocab;      //!< Total vocabulary size
-    Rank mBosId;        //!< Beginning-of-sequence token ID
-    Rank mEosId;        //!< End-of-sequence token ID
-    Rank mPadId;        //!< Padding token ID
-    Rank mUnkId;        //!< Unknown token ID
-    Rank mImgContextId; //!< Image context token ID
+    int mNumVocab;                       //!< Total vocabulary size
+    Rank mBosId;                         //!< Beginning-of-sequence token ID
+    Rank mEosId;                         //!< End-of-sequence token ID
+    Rank mPadId;                         //!< Padding token ID
+    Rank mUnkId;                         //!< Unknown token ID
+    std::vector<Rank> mAdditionalEosIds; //!< Additional EOS token IDs (from config.json)
+    Rank mImgContextId;                  //!< Image context token ID
 
     // Chat template
     ChatTemplateConfig mChatTemplate; //!< Chat template configuration

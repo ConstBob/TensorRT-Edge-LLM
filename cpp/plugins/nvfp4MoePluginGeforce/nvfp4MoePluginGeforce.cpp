@@ -712,7 +712,7 @@ size_t NvFP4MoEPluginGeforce::getWorkspaceSize(DynamicPluginTensorDesc const* in
         total = accumulateWorkspaceSize(total, rt::Coords{maxTokens, mTopK}, DataType::kFLOAT);
         total = accumulateWorkspaceSize(total, rt::Coords{maxTokens, mTopK}, DataType::kINT32);
         size_t const runnerWs = CuteDslNvfp4MoeRunner::getWorkspaceSize(
-            maxTokens, maxRoutedRows, mNumExperts, mTopK, mHiddenSize, mMoeInterSize);
+            maxTokens, maxRoutedRows, mNumExperts, mTopK, mHiddenSize, mMoeInterSize, toRunnerBackend(mBackend));
         if (runnerWs == 0)
         {
             LOG_ERROR("NvFP4MoEPluginGeforce: SM12x CuTeDSL backend returned zero workspace");
@@ -817,7 +817,7 @@ int32_t NvFP4MoEPluginGeforce::enqueue(PluginTensorDesc const* inputDesc, Plugin
         int32_t* const topkIdsPtr
             = static_cast<int32_t*>(assignTensorFromWorkspace(ws, {numTokens, mTopK}, DataType::kINT32).rawPointer());
         size_t const runnerWs = CuteDslNvfp4MoeRunner::getWorkspaceSize(
-            numTokens, maxRoutedRows, mNumExperts, mTopK, mHiddenSize, mMoeInterSize);
+            numTokens, maxRoutedRows, mNumExperts, mTopK, mHiddenSize, mMoeInterSize, toRunnerBackend(mBackend));
         if (runnerWs == 0)
         {
             LOG_ERROR("NvFP4MoEPluginGeforce: SM12x CuTeDSL backend returned zero workspace at enqueue");

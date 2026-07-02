@@ -85,7 +85,7 @@ TEST_P(SplitKVCpuReferenceTest, MatchesCpuReference)
     rt::Tensor kTensor({B, S, H, D}, rt::DeviceType::kGPU, DataType::kHALF);
     rt::Tensor vTensor({B, S, H, D}, rt::DeviceType::kGPU, DataType::kHALF);
     rt::Tensor emptyScale{};
-    kernel::cvtKVLayoutBHSDToSplitKV(srcTensor, kTensor, vTensor, emptyScale, stream);
+    kernel::cvtKVLayoutBHSDToSplitKV(srcTensor, kTensor, vTensor, emptyScale, S, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Pull results back to host.
@@ -154,7 +154,7 @@ TEST(SplitKVFP8Test, DequantizesWithScale)
 
     rt::Tensor kTensor({B, S, H, D}, rt::DeviceType::kGPU, DataType::kHALF);
     rt::Tensor vTensor({B, S, H, D}, rt::DeviceType::kGPU, DataType::kHALF);
-    kernel::cvtKVLayoutBHSDToSplitKV(srcTensor, kTensor, vTensor, scaleTensor, stream);
+    kernel::cvtKVLayoutBHSDToSplitKV(srcTensor, kTensor, vTensor, scaleTensor, S, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     size_t const dstVol = (size_t) B * S * H * D;

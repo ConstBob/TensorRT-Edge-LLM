@@ -35,7 +35,7 @@ checkpoints. It does not export ONNX or build TensorRT engines.
 | Model loading and calibration | `tensorrt_edgellm/quantization/quantize.py` | Add model loading fallbacks, calibration data handling, or pre-save checkpoint fixups. |
 | EAGLE draft quantization | `tensorrt_edgellm/quantization/models/eagle3_draft.py` | Update draft-model calibration and checkpoint writing. |
 | DFlash draft quantization | `tensorrt_edgellm/quantization/models/dflash_draft.py` | Update DFlash draft calibration, target-hidden projector exclusions, and checkpoint writing. |
-| CLI surface | `tensorrt_edgellm/quantization/cli.py` | Expose a new supported option after the implementation and tests exist. |
+| CLI surface | `tensorrt_edgellm/scripts/quantize.py` | Expose a new supported option after the implementation and tests exist. |
 
 Supported methods are documented in
 [Quantization](../../user_guide/features/quantization.md). GPTQ checkpoints are

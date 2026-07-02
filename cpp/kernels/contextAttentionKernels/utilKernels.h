@@ -70,8 +70,8 @@ void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor con
 //!             Layout: [kScaleQuantOrig, vScaleQuantOrig]. Pass an empty tensor for FP16 src.
 //! \param[in]  stream          CUDA stream to launch the kernel on.
 //! \throws std::runtime_error if tensor shapes or data types are invalid.
-void cvtKVLayoutBHSDToSplitKV(
-    rt::Tensor const& src, rt::Tensor& kDst, rt::Tensor& vDst, rt::Tensor const& kvScaleQuantOrig, cudaStream_t stream);
+void cvtKVLayoutBHSDToSplitKV(rt::Tensor const& src, rt::Tensor& kDst, rt::Tensor& vDst,
+    rt::Tensor const& kvScaleQuantOrig, int32_t seqLen, cudaStream_t stream);
 
 } // namespace kernel
 } // namespace trt_edgellm

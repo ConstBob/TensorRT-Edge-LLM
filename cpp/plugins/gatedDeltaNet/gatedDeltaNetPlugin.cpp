@@ -331,10 +331,13 @@ size_t GatedDeltaNetPlugin::getWorkspaceSize([[maybe_unused]] DynamicPluginTenso
 
 int32_t GatedDeltaNetPlugin::getAliasedInput(int32_t outputIndex) noexcept
 {
-    if (outputIndex == kOUT_H0_SOURCE_IDX)
-    {
-        return kIN_H0_SOURCE_IDX;
-    }
+    // WAR: this is not the correct plugin API usage. The
+    // plugin updates the recurrent state in place, so the correct return is the
+    // recurrent-state input index. We return -1 to drop the alias because
+    // declaring it makes Myelin keep a redundant per-layer state copy (the perf
+    // regression). In-place read-write still works because the runtime binds the
+    // past and present state to the same buffer. TODO: restore the alias
+    // declaration once the Myelin issue is fixed.
     return -1;
 }
 

@@ -120,6 +120,15 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
 
     mDeployment = createDeploymentConfig(baseConfigPath, draftConfigPath, draftingConfig);
 
+    // Precompute whether any attention layer uses FFPA (headDim=512).
+    // FFPA has no cu_seqlens support and requires zero-padded embeddings for ragged batches.
+    mHasFFPALayer = std::any_of(mDeployment.base.kvLayerConfigs.begin(), mDeployment.base.kvLayerConfigs.end(),
+        [](KVLayerConfig const& kv) { return kv.headDim == 512; });
+    if (mDeployment.base.kvLayerConfigs.empty())
+    {
+        mHasFFPALayer = (mDeployment.base.headDim == 512);
+    }
+
     ELLM_CHECK(mDeployment.base.numDeepstackFeatures <= 0 || !multimodalEngineDir.empty(),
         "--multimodalEngineDir is required for VLM engine.");
 
@@ -310,6 +319,15 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     LOG_INFO("Start loading tokenizer from model directory: %s", engineDir.c_str());
     ELLM_CHECK(mTokenizer->loadFromHF(engineDir), "Failed to load tokenizer from model directory: " + engineDir);
     LOG_INFO("Tokenizer successfully loaded from model directory: %s", engineDir.c_str());
+
+    // Set additional EOS token IDs from parsed config (e.g. Gemma4 has eos_token_id: [1, 106])
+    if (!mDeployment.base.eosTokenIds.empty())
+    {
+        std::vector<tokenizer::Rank> additionalEos(
+            mDeployment.base.eosTokenIds.begin(), mDeployment.base.eosTokenIds.end());
+        mTokenizer->setAdditionalEosIds(additionalEos);
+        LOG_INFO("Loaded %zu EOS token IDs from config", additionalEos.size());
+    }
 
     // -----------------------------------------------------------------------
     // 13. Decoding strategies.
@@ -667,6 +685,34 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
         trajFutureStartId = static_cast<int32_t>(mTokenizer->getTokenId("<|traj_future_start|>"));
     }
 
+    // Per-slot tracking: once thinking is complete (end marker emitted or model
+    // never entered thinking), secondary EOS tokens terminate generation normally.
+    std::vector<int8_t> thinkingDone(context.activeBatchSize, 0);
+    int32_t const endOfChannelId = static_cast<int32_t>(mTokenizer->getTokenId("<channel|>"));
+    int32_t const endOfThinkId = static_cast<int32_t>(mTokenizer->getTokenId("</think>"));
+    int32_t const startOfChannelId = static_cast<int32_t>(mTokenizer->getTokenId("<|channel>"));
+    int32_t const startOfThinkId = static_cast<int32_t>(mTokenizer->getTokenId("<think>"));
+
+    auto updateThinkingDone = [&]() {
+        if (!request.enableThinking)
+            return;
+        for (int32_t i = 0; i < context.activeBatchSize; ++i)
+        {
+            if (thinkingDone[i] || context.tokenIds[i].empty())
+                continue;
+            auto lastTok = context.tokenIds[i].back();
+            if (lastTok == endOfChannelId || lastTok == endOfThinkId)
+            {
+                thinkingDone[i] = true;
+            }
+            else if (context.currentGenerateLengths[i] == 1 && lastTok != startOfChannelId && lastTok != startOfThinkId)
+            {
+                thinkingDone[i] = true;
+                LOG_DEBUG("Batch %d: first token %d is not thinking-start, marking thinkingDone", i, lastTok);
+            }
+        }
+    };
+
     // Lambda to update finish states based on EOS and max_length. Latches
     // terminalReason atomically with the state flip — the !finishedStates guard
     // keeps first-writer-wins semantics relative to applyCancellationToFinishStates.
@@ -693,13 +739,23 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
             }
             else
             {
-                // Check EOS
-                if (!context.tokenIds[i].empty() && context.tokenIds[i].back() == mTokenizer->getEosId())
+                // Check EOS (supports multiple EOS tokens, e.g. Gemma4 [1, 106]).
+                // In thinking mode, suppress secondary EOS until thinking is complete.
+                if (!context.tokenIds[i].empty())
                 {
-                    context.finishedStates[i] = 1;
-                    s.terminalReason = FinishReason::kEndId;
-                    LOG_DEBUG("Batch %d finished, reason: EOS", i);
-                    continue;
+                    auto lastToken = context.tokenIds[i].back();
+                    bool isEos = mTokenizer->isEosToken(lastToken);
+                    if (isEos && request.enableThinking && lastToken != mTokenizer->getEosId() && !thinkingDone[i])
+                    {
+                        isEos = false;
+                    }
+                    if (isEos)
+                    {
+                        context.finishedStates[i] = 1;
+                        s.terminalReason = FinishReason::kEndId;
+                        LOG_DEBUG("Batch %d finished, reason: EOS", i);
+                        continue;
+                    }
                 }
             }
             // Check max length
@@ -733,6 +789,9 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     //   cancel → decode (emitDelta + stop match) → finalize (EOS/length/stop) → emit
     applyCancellationToFinishStates(context);
     decodePerSlot(context, *mTokenizer);
+
+    updateThinkingDone();
+
     updateFinishStates();
     emitChunks(context);
 
@@ -761,6 +820,11 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
 
         // Per-iter pipeline: decode → finalize finish state → emit chunks.
         decodePerSlot(context, *mTokenizer);
+
+        // Update thinking-done state: check if the last generated token is an
+        // end-of-thinking marker (<channel|> for Gemma4, </think> for Qwen3/Nemotron).
+        updateThinkingDone();
+
         updateFinishStates();
         emitChunks(context);
 
@@ -1167,6 +1231,14 @@ bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context)
         mGemma4Ple->embed(mIdsInput, context.stream);
     }
 
+    // Zero padding positions in embeddings/PLE to prevent fp16 overflow in FFPA layers.
+    // FFPA (headDim=512) has no cu_seqlens and processes all positions uniformly.
+    // Non-FFPA models (Llama/Qwen) handle padding via cu_seqlens, so skip the memsets.
+    if (activeBatchSize > 1 && mHasFFPALayer)
+    {
+        zeroPaddingForFFPA(hostCtxLenData, activeBatchSize, inputIdsLength, context.stream);
+    }
+
     // Dispatch per-step sequence prep (context lengths H2D, selectTokenIndices).
     mStepPreparer->prepare(
         InferencePhase::kPrefill, activeBatchSize, *mSharedResources->cacheManagers[0], *mPipelineIO, context.stream);
@@ -1181,6 +1253,7 @@ bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context)
     // (0 for the "initial prefill" sentinel, else batch).
     bool const baseKVAllEmpty = mSharedResources->cacheManagers[0]->getKVCacheAllEmpty();
     auto const prefillDims = mDeployment.base.prefillDims(activeBatchSize, inputIdsLength, baseKVAllEmpty);
+
     check::check(mBaseExecutor->prepare(kPrefillProfile, prefillDims, mBaseTensorMap, context.stream),
         "Failed to prepare base model for prefill step.");
     check::check(mBaseExecutor->execute(context.stream), "Failed to execute base model for prefill step.");
@@ -1715,6 +1788,51 @@ bool LLMInferenceRuntime::performBatchEvict(DecodingInferenceContext& context, D
     context.activeBatchSize = newActiveBatch;
 
     return true;
+}
+
+void LLMInferenceRuntime::zeroPaddingForFFPA(
+    int32_t const* contextLengths, int32_t batchSize, int32_t inputIdsLength, cudaStream_t stream)
+{
+    int32_t const hiddenSize = mDeployment.base.hiddenSize;
+    for (int32_t b = 0; b < batchSize; ++b)
+    {
+        int32_t const validLen = contextLengths[b];
+        if (validLen < inputIdsLength)
+        {
+            int32_t const padLen = inputIdsLength - validLen;
+            size_t const padOffset = (static_cast<size_t>(b) * inputIdsLength + validLen) * hiddenSize * sizeof(half);
+            size_t const padBytes = static_cast<size_t>(padLen) * hiddenSize * sizeof(half);
+            CUDA_CHECK(cudaMemsetAsync(
+                static_cast<char*>(mPipelineIO->inputsEmbeds.rawPointer()) + padOffset, 0, padBytes, stream));
+        }
+    }
+
+    // Zero PLE at padding positions.
+    if (mGemma4Ple)
+    {
+        int32_t const pleHiddenSize = mDeployment.base.pleHiddenSize;
+        int32_t const numPleInputs = mDeployment.base.numPleInputs;
+        for (int32_t b = 0; b < batchSize; ++b)
+        {
+            int32_t const validLen = contextLengths[b];
+            if (validLen < inputIdsLength)
+            {
+                int32_t const padLen = inputIdsLength - validLen;
+                for (int32_t pleIdx = 0; pleIdx < numPleInputs; ++pleIdx)
+                {
+                    rt::Tensor* pleTensor = mBaseTensorMap.get(binding_names::formatPleTokenEmbedsName(pleIdx));
+                    if (pleTensor)
+                    {
+                        size_t const padOffset
+                            = (static_cast<size_t>(b) * inputIdsLength + validLen) * pleHiddenSize * sizeof(half);
+                        size_t const padBytes = static_cast<size_t>(padLen) * pleHiddenSize * sizeof(half);
+                        CUDA_CHECK(cudaMemsetAsync(
+                            static_cast<char*>(pleTensor->rawPointer()) + padOffset, 0, padBytes, stream));
+                    }
+                }
+            }
+        }
+    }
 }
 
 } // namespace rt

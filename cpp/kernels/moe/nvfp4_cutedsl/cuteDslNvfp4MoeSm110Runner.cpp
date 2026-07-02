@@ -128,15 +128,11 @@ inline void* offsetPtr(void* base, size_t offset)
 
 bool useFastDecodeSetup(CuteDslNvfp4MoeSm110Params const& params)
 {
-    // numTokens == 1 is the only runtime distinction between the fused
-    // fp4BuildLayoutAndQuantizeRoutedLinearSFDecode setup and the general
-    // (buildLayoutGpu + fp4QuantizeRoutedLinearSF) path: the fused kernel's
-    // host launcher rejects M != 1. The remaining bounds the fused kernel
-    // needs (topK <= kMaxDecodeExperts, localNumExperts <= kMaxDecodeExperts,
-    // hiddenSize % kSfVecSize == 0) are already strictly tighter under
-    // canImplement() -- topK <= kMaxTopK = 8, numExperts == kCompiledNumExperts
-    // = 128, hiddenSize % kHiddenSizeAlignment = 128 -- so no extra gate is
-    // needed here.
+    // numTokens == 1 selects the fused fp4BuildLayoutAndQuantizeRoutedLinearSFDecode
+    // setup over the general (buildLayoutGpu + fp4QuantizeRoutedLinearSF) path: the
+    // fused kernel's host launcher rejects M != 1. Its remaining bounds are already
+    // guaranteed by canImplement() (topK <= kMaxTopK = 8) and the supported expert
+    // set {128, 256}, which fp4Quantize.cu's kMaxDecodeExperts (256) covers.
     return params.numTokens == 1;
 }
 } // namespace
@@ -153,11 +149,9 @@ bool CuteDslNvfp4MoeSm110Runner::canImplement(int32_t hiddenSize, int32_t moeInt
     {
         return false;
     }
-    // TODO: today the AOT kernel is only compiled for E == kCompiledNumExperts
-    // (128). Investigate whether we can dispatch with a runtime expert count by
-    // re-emitting the FC1/FC2 kernels with E as a dynamic dim, so we can drop
-    // this hard reject.
-    if (numExperts != kCompiledNumExperts || topK <= 0 || topK > kMaxTopK)
+    // The FC1/FC2 cubins are runtime-polymorphic in L (num_experts); the runner
+    // restricts E to the product-supported set {128, 256} (see kSupportedNumExperts).
+    if (!isSupportedNumExperts(numExperts) || topK <= 0 || topK > kMaxTopK)
     {
         return false;
     }
@@ -302,6 +296,8 @@ int32_t CuteDslNvfp4MoeSm110Runner::run(CuteDslNvfp4MoeSm110Params const& params
     int64_t const m = L.permutedM;
     int64_t const n1 = L.fc1InputN;
     int64_t const h = params.hiddenSize;
+    // Runtime expert count (L); the AOT cubins are polymorphic in this dim.
+    int64_t const e = params.numExperts;
 
     if (params.activationType == kACT_RELU2)
     {
@@ -310,7 +306,7 @@ int32_t CuteDslNvfp4MoeSm110Runner::run(CuteDslNvfp4MoeSm110Params const& params
             const_cast<void*>(static_cast<void const*>(params.fc1Alpha)),
             const_cast<void*>(static_cast<void const*>(params.inputGlobalScale)),
             const_cast<void*>(static_cast<void const*>(params.downInputScale)), tileGroup, tileLimit,
-            permutedToExpanded, numTiles, origM, m, n1, h, stream);
+            permutedToExpanded, numTiles, origM, m, n1, h, e, stream);
     }
     else if (params.activationType == kACT_SWIGLU)
     {
@@ -319,7 +315,7 @@ int32_t CuteDslNvfp4MoeSm110Runner::run(CuteDslNvfp4MoeSm110Params const& params
             const_cast<void*>(static_cast<void const*>(params.fc1Alpha)),
             const_cast<void*>(static_cast<void const*>(params.inputGlobalScale)),
             const_cast<void*>(static_cast<void const*>(params.downInputScale)), tileGroup, tileLimit,
-            permutedToExpanded, numTiles, origM, m, n1, h, stream);
+            permutedToExpanded, numTiles, origM, m, n1, h, e, stream);
     }
     else
     {
@@ -341,7 +337,7 @@ int32_t CuteDslNvfp4MoeSm110Runner::run(CuteDslNvfp4MoeSm110Params const& params
         fc1SF, const_cast<void*>(params.fc2BlocksScale), params.output,
         const_cast<void*>(static_cast<void const*>(params.fc2Alpha)),
         const_cast<void*>(static_cast<void const*>(params.downInputScale)), tileGroup, tileLimit, permutedToExpanded,
-        numTiles, const_cast<void*>(static_cast<void const*>(params.topkWeights)), m, h, params.moeInterSize,
+        numTiles, const_cast<void*>(static_cast<void const*>(params.topkWeights)), m, h, params.moeInterSize, e,
         params.numTokens, params.topK, stream);
     if (ret != 0)
     {

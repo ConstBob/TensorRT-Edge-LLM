@@ -29,6 +29,11 @@ Usage::
         --draft_model_dir /path/to/draft \\
         --output_dir /path/to/output \\
         --quantization fp8
+
+    # Qwen3-Omni-MoE joint Thinker+Talker NVFP4 quantization
+    tensorrt-edgellm-quantize qwen3-omni \\
+        --model_dir Qwen/Qwen3-Omni-30B-A3B-Instruct \\
+        --output_dir /path/to/output
 """
 
 import argparse
@@ -91,6 +96,39 @@ def main():
     draft_parser.add_argument("--draft_model_dir", required=True)
     _add_common_args(draft_parser)
 
+    # Qwen3-Omni-MoE needs a dedicated path: NVFP4 is calibrated jointly in a
+    # single mtq.quantize() whose forward loop chains Thinker(multimodal) ->
+    # hidden/text projection -> Talker. The standard `llm` path can't express
+    # this dependency. NVFP4 is implied (the only validated recipe).
+    omni_parser = sub.add_parser(
+        "qwen3-omni",
+        help="Qwen3-Omni-MoE joint Thinker+Talker NVFP4 quantization")
+    omni_parser.add_argument("--model_dir", required=True)
+    omni_parser.add_argument("--output_dir", required=True)
+    omni_parser.add_argument("--lm_head_quantization",
+                             default=None,
+                             choices=["fp8", "nvfp4"])
+    omni_parser.add_argument("--kv_cache_quantization",
+                             default=None,
+                             choices=["fp8"])
+    omni_parser.add_argument("--dtype", default="fp16", choices=["fp16"])
+    omni_parser.add_argument("--device", default="cuda")
+    omni_parser.add_argument("--dataset", default="cnn_dailymail")
+    omni_parser.add_argument("--num_samples", type=int, default=64)
+    omni_parser.add_argument("--max_length", type=int, default=64)
+    omni_parser.add_argument("--talker_num_audio", type=int, default=150)
+    omni_parser.add_argument("--talker_num_image", type=int, default=150)
+    omni_parser.add_argument("--talker_num_text", type=int, default=200)
+    omni_parser.add_argument(
+        "--talker_accept_hidden_layer",
+        type=int,
+        default=None,
+        help="Override talker_config.accept_hidden_layer.")
+    omni_parser.add_argument(
+        "--keep_full_export",
+        action="store_true",
+        help="Keep the intermediate full-model export directory.")
+
     args = parser.parse_args()
 
     if args.command == "llm":
@@ -140,6 +178,24 @@ def main():
                 dataset=args.dataset,
                 num_samples=args.num_samples,
             )
+    elif args.command == "qwen3-omni":
+        from ..quantization.qwen3_omni import quantize_qwen3_omni
+        quantize_qwen3_omni(
+            model_dir=args.model_dir,
+            output_dir=args.output_dir,
+            lm_head_quantization=args.lm_head_quantization,
+            kv_cache_quantization=args.kv_cache_quantization,
+            dtype=args.dtype,
+            device=args.device,
+            dataset=args.dataset,
+            num_samples=args.num_samples,
+            max_length=args.max_length,
+            talker_num_audio=args.talker_num_audio,
+            talker_num_image=args.talker_num_image,
+            talker_num_text=args.talker_num_text,
+            talker_accept_hidden_layer=args.talker_accept_hidden_layer,
+            keep_full_export=args.keep_full_export,
+        )
 
 
 def _is_dflash_draft(draft_model_dir: str) -> bool:
