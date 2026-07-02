@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 import argparse
-import collections
 import dataclasses
 import datetime
 import hashlib
@@ -37,6 +36,7 @@ import typing
 import uuid
 
 SOURCE_ROOT = pathlib.Path(__file__).resolve().parent.parent
+_MAX_SSH_PORT = 65535
 _SSH_USER_PATTERN = r"[A-Za-z_][A-Za-z0-9_.-]*"
 _SSH_HOST_PATTERN = r"(?:[A-Za-z0-9][A-Za-z0-9_.-]*|\[[0-9A-Fa-f:.%]+\])"
 _SSH_JUMP_RE = re.compile(r"(?:{}@)?{}(?::([1-9][0-9]{{0,4}}))?".format(
@@ -89,12 +89,12 @@ class SshTarget:
             )
         if re.fullmatch(_SSH_USER_PATTERN, self.user) is None:
             raise ValueError("SSH user contains unsupported syntax")
-        if not 1 <= self.port <= 65535:
+        if not 1 <= self.port <= _MAX_SSH_PORT:
             raise ValueError("SSH port must be in the range 1..65535")
         if self.jump_host is not None:
             jump = _SSH_JUMP_RE.fullmatch(self.jump_host)
             if jump is None or (jump.group(1) is not None
-                                and int(jump.group(1)) > 65535):
+                                and int(jump.group(1)) > _MAX_SSH_PORT):
                 raise ValueError(
                     "SSH jump host must use [user@]host[:port] syntax")
         if self.host_key_policy not in ("yes", "accept-new", "no"):
@@ -190,16 +190,15 @@ class CommandRunner:
         except ProcessLookupError:
             pass
         process.wait()
-    def run(self, phase: str, argv: typing.Sequence[str], timeout_s: float,
-            check: bool = True) -> subprocess.CompletedProcess:
+    def run(self, phase: str, argv: typing.Sequence[str],
+            timeout_s: float) -> None:
         """Run an argv command with streamed output and a deadline.
         Args:
             phase: Stable phase name used for its log file.
             argv: Command and argument sequence.
             timeout_s: Wall-clock timeout in seconds.
-            check: Whether a nonzero exit status raises an error.
         Returns:
-            Completed-process metadata with a bounded output tail.
+            None.
         Raises:
             FlowError: If execution, output streaming, or status checking fails.
             OSError: If the process cannot be started.
@@ -207,7 +206,6 @@ class CommandRunner:
         log_path = self.artifacts_dir / "{}.log".format(
             re.sub(r"[^A-Za-z0-9_.-]", "-", phase))
         command = [str(value) for value in argv]
-        tail = collections.deque(maxlen=200)  # type: typing.Deque[str]
         reader_errors = []  # type: typing.List[BaseException]
         with log_path.open("w", encoding="utf-8", errors="replace") as log:
             rendered = shlex.join(command)
@@ -218,13 +216,11 @@ class CommandRunner:
                 command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                 encoding="utf-8", errors="replace", bufsize=1, start_new_session=True)
             def copy_output() -> None:
-                """Stream output and retain only a bounded tail."""
+                """Stream output to the console and phase log."""
                 try:
                     assert process.stdout is not None
                     for line in process.stdout:
-                        tail.append(line)
-                        sys.stdout.write(line)
-                        sys.stdout.flush()
+                        print(line, end="", flush=True)
                         log.write(line)
                         log.flush()
                 except (OSError, UnicodeError, ValueError) as error:
@@ -252,11 +248,9 @@ class CommandRunner:
                 raise FlowError("{} output reader failed: {}; see {}".format(
                     phase, reader_errors[0], log_path))
             log.write("\n[exit_code] {}\n".format(return_code))
-        completed = subprocess.CompletedProcess(command, return_code, "".join(tail), "")
-        if check and return_code != 0:
+        if return_code != 0:
             raise FlowError("{} failed with exit code {}; see {}".format(
                 phase, return_code, log_path), return_code)
-        return completed
 # yapf: enable
 
 
@@ -324,20 +318,16 @@ class TrtCiConfig:
             raise ValueError("--gtest-filter cannot contain NUL or a newline")
     @property
     def run_workspace(self) -> pathlib.PurePosixPath:
-        """Return the sole remote run-specific child.
+        """Return the validated run-specific child used on both remote hosts.
         Returns:
             Identical absolute workspace path used on both remote hosts.
-        Raises:
-            ValueError: If derivation ever escapes the validated workspace base.
         """
-        child = self.workspace / "run-{}".format(self.run_id)
-        if child.parent != self.workspace:
-            raise ValueError("unsafe derived run workspace")
-        return child
+        return self.workspace / "run-{}".format(self.run_id)
 
 # yapf: enable
 
 
+@dataclasses.dataclass(frozen=True)
 class TrtCiFlow:
     """Cross-build, transfer, run, and collect the compatibility check.
     Attributes:
@@ -345,15 +335,8 @@ class TrtCiFlow:
         runner: Injectable argv command runner.
     """
 
-    def __init__(self, config: TrtCiConfig, runner: CommandRunner) -> None:
-        """Initialize the flow.
-        Args:
-            config: Validated immutable run configuration.
-            runner: Command runner or recording test double.
-        """
-        self.config = config
-        self.runner = runner
-        self._temp_dir = None  # type: typing.Optional[pathlib.Path]
+    config: TrtCiConfig
+    runner: CommandRunner
 
     @staticmethod
     def _q(value: object) -> str:
@@ -429,11 +412,11 @@ class TrtCiFlow:
     # yapf: enable
 
     # yapf: disable
-    def _remote(self, phase: str, target: SshTarget, script: str, timeout_s: float,
-                check: bool = True) -> subprocess.CompletedProcess:
-        """Run generated Bash over SSH."""
+    def _remote(self, phase: str, target: SshTarget, script: str,
+                timeout_s: float) -> None:
+        """Run script on target for phase and propagate runner errors."""
         argv = target.ssh_argv(script, self.config.connection_timeout_s)
-        return self.runner.run(phase, argv, timeout_s, check)
+        self.runner.run(phase, argv, timeout_s)
     def _probe(self) -> None:
         """Probe both remote endpoints."""
         cfg = self.config
@@ -459,13 +442,12 @@ class TrtCiFlow:
         argv.extend(["-e", cfg.build_target.rsync_transport(cfg.connection_timeout_s),
                      str(cfg.source_root) + "/", cfg.build_target.remote_spec(run / "source") + "/"])
         self.runner.run("sync-source", argv, cfg.transfer_timeout_s)
-    def _transfer(self, remote_archive: pathlib.PurePosixPath) -> str:
-        """Verify and transfer the board archive."""
-        if self._temp_dir is None:
-            raise FlowError("transfer called without an active temporary directory")
+    def _transfer(self, remote_archive: pathlib.PurePosixPath,
+                  temp_dir: pathlib.Path) -> str:
+        """Transfer remote_archive through temp_dir and return its verified digest."""
         cfg, run = self.config, self.config.run_workspace
-        archive = self._temp_dir / "edgellm-d7l.tar.gz"
-        digest_file = self._temp_dir / "edgellm-d7l.tar.gz.sha256"
+        archive = temp_dir / "edgellm-d7l.tar.gz"
+        digest_file = temp_dir / "edgellm-d7l.tar.gz.sha256"
         self.runner.run("download-bundle", cfg.build_target.scp_argv(
             cfg.build_target.remote_spec(remote_archive), str(archive), cfg.connection_timeout_s),
             cfg.transfer_timeout_s)
@@ -506,9 +488,8 @@ class TrtCiFlow:
             FlowError: If a required build, transfer, deploy, or test phase fails.
             OSError: If a local artifact operation fails.
         """
-        primary = None  # type: typing.Optional[Exception]
         with tempfile.TemporaryDirectory(prefix="edgellm-trt-ci-") as temp:
-            self._temp_dir = pathlib.Path(temp)
+            temp_dir = pathlib.Path(temp)
             try:
                 self._probe()
                 self._sync()
@@ -516,7 +497,8 @@ class TrtCiFlow:
                              self.config.build_timeout_s)
                 self._remote("bundle", self.config.build_target, self.render_bundle_script(),
                              self.config.transfer_timeout_s)
-                digest = self._transfer(self.config.run_workspace / "edgellm-d7l.tar.gz")
+                digest = self._transfer(
+                    self.config.run_workspace / "edgellm-d7l.tar.gz", temp_dir)
                 run, q = self.config.run_workspace, self._q
                 extract = "\n".join([
                     "set -euo pipefail", "run={}".format(q(run)), "archive=\"$run/edgellm-d7l.tar.gz\"",
@@ -525,8 +507,6 @@ class TrtCiFlow:
                 self._remote("deploy", self.config.test_target, extract, self.config.transfer_timeout_s)
                 self._remote("test", self.config.test_target, self.render_test_script(),
                              self.config.test_timeout_s)
-            except Exception as error:
-                primary = error
             finally:
                 try:
                     self._collect()
@@ -534,9 +514,6 @@ class TrtCiFlow:
                     print(
                         "warning: result collection failed: {}".format(error),
                         file=sys.stderr)
-                self._temp_dir = None
-        if primary is not None:
-            raise primary
         if not self.config.keep_workspace:
             cfg, run = self.config, self.config.run_workspace
             for name, target in (("cleanup-build", cfg.build_target), ("cleanup-test", cfg.test_target)):

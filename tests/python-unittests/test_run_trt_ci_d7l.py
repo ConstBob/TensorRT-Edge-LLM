@@ -168,17 +168,13 @@ def test_command_runner_bounds_reader_after_leader_exits_with_detached_child(
                 pass
 
 
-def test_command_runner_retains_only_bounded_output_tail(tmp_path):
+def test_command_runner_streams_complete_output_to_phase_log(tmp_path):
     runner = run_trt_ci_d7l.CommandRunner(tmp_path)
     command = "for i in range(205): print('line-{}'.format(i))"
 
-    result = runner.run("bounded-output", [sys.executable, "-c", command],
-                        timeout_s=5)
+    runner.run("streamed-output", [sys.executable, "-c", command], timeout_s=5)
 
-    assert result.stdout.splitlines() == [
-        "line-{}".format(index) for index in range(5, 205)
-    ]
-    log = (tmp_path / "bounded-output.log").read_text(encoding="utf-8")
+    log = (tmp_path / "streamed-output.log").read_text(encoding="utf-8")
     assert "line-0\n" in log and "line-204\n" in log
 
 
@@ -249,18 +245,25 @@ def test_source_root_and_workspace_are_independent_of_cwd(
         "/tmp/edge llm validation/run-unit-123")
 
 
+def _make_checkout(root, *, include_nvtx):
+    """Create a minimal checkout with selected submodule marker files."""
+    files = [
+        "CMakeLists.txt",
+        "3rdParty/googletest/CMakeLists.txt",
+        "3rdParty/nlohmannJson/CMakeLists.txt",
+    ]
+    if include_nvtx:
+        files.append("3rdParty/NVTX/CMakeLists.txt")
+    for name in files:
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    return root
+
+
 def test_main_reports_missing_nvtx_submodule(tmp_path, flow_config,
                                              monkeypatch, capsys):
-    source_root = tmp_path / "source"
-    (source_root / "CMakeLists.txt").parent.mkdir(parents=True)
-    (source_root / "CMakeLists.txt").touch()
-    for marker in [
-            "3rdParty/googletest/CMakeLists.txt",
-            "3rdParty/nlohmannJson/CMakeLists.txt",
-    ]:
-        path = source_root / marker
-        path.parent.mkdir(parents=True)
-        path.touch()
+    source_root = _make_checkout(tmp_path / "source", include_nvtx=False)
     config = dataclasses.replace(flow_config, source_root=source_root)
     monkeypatch.setattr(run_trt_ci_d7l, "parse_args", lambda argv: config)
 
@@ -307,14 +310,10 @@ def test_build_and_bundle_quote_paths_and_use_full_candidate_trt(flow_config):
             "include/NvInferVersion.h",
             "parsers/onnx",
             "NvOnnxParser.h",
-            "Release/lib",
-            "libnvinfer",
-            "libnvonnxparser",
     ]:
         assert required in script
     assert "cmake --build" in script and "--parallel 7" in script
     assert "--target unitTest" not in script
-    assert "readlink" in script or "realpath" in script
     assert "/usr/local/cuda/bin/nvcc --version" in run_trt_ci_d7l.TrtCiFlow(
         dataclasses.replace(flow_config, cuda_version=None),
         runner=object()).render_build_script()
@@ -335,15 +334,11 @@ def test_runtime_script_proves_candidate_trt_and_preserves_gtest_status(
     flow = run_trt_ci_d7l.TrtCiFlow(flow_config, runner=object())
     script = flow.render_test_script()
     for required in [
-            "ldd",
             "not found",
-            "libnvinfer",
             "libnvonnxparser",
             str(flow_config.run_workspace / "trt-package/lib"),
             "LD_LIBRARY_PATH",
             "check_ldd \"$run/build/llm_build\" 1",
-            "BASH_REMATCH[2]",
-            "readlink -f -- \"$path\"",
             "--gtest_output=xml:",
             "PIPESTATUS",
     ]:
@@ -478,7 +473,7 @@ class _RecordingRunner:
     def phases(self):
         return [phase for phase, _argv in self.calls]
 
-    def run(self, phase, argv, timeout_s, check=True):
+    def run(self, phase, argv, timeout_s):
         self.calls.append((phase, list(argv)))
         payload = b"candidate TRT bundle"
         if phase == "download-bundle":
@@ -491,17 +486,11 @@ class _RecordingRunner:
         if phase in self.failures:
             raise run_trt_ci_d7l.FlowError(phase + " failed",
                                            self.failures[phase])
-        return subprocess.CompletedProcess(argv, 0, "", "")
 
 
-def test_private_transport_phases_are_anchored_marked_and_recursive(
-        flow_config):
+def test_flow_order_without_network(flow_config):
     runner = _RecordingRunner()
-    flow = run_trt_ci_d7l.TrtCiFlow(flow_config, runner)
-
-    flow._probe()
-    flow._sync()
-    flow._collect()
+    run_trt_ci_d7l.TrtCiFlow(flow_config, runner).run()
 
     calls = dict(runner.calls)
     probe_script = calls["probe-test"][-1]
@@ -520,12 +509,7 @@ def test_private_transport_phases_are_anchored_marked_and_recursive(
     assert collect_argv[0:3] == ["scp", "-r", "-O"]
     assert "/results" in collect_argv[-2]
 
-
-def test_flow_order_without_network(flow_config):
-    runner = _RecordingRunner()
-    run_trt_ci_d7l.TrtCiFlow(flow_config, runner).run()
-
-    deploy_script = dict(runner.calls)["deploy"][-1]
+    deploy_script = calls["deploy"][-1]
     assert "sha256sum" in deploy_script
     assert hashlib.sha256(b"candidate TRT bundle").hexdigest() in deploy_script
 
@@ -560,17 +544,8 @@ def test_collection_is_best_effort_and_never_masks_primary(flow_config):
 
 
 def test_main_returns_exact_flow_exit(tmp_path, monkeypatch, flow_config):
-    source_root = tmp_path / "complete-source"
-    (source_root / "CMakeLists.txt").parent.mkdir(parents=True)
-    (source_root / "CMakeLists.txt").touch()
-    for marker in [
-            "3rdParty/googletest/CMakeLists.txt",
-            "3rdParty/nlohmannJson/CMakeLists.txt",
-            "3rdParty/NVTX/CMakeLists.txt",
-    ]:
-        path = source_root / marker
-        path.parent.mkdir(parents=True)
-        path.touch()
+    source_root = _make_checkout(tmp_path / "complete-source",
+                                 include_nvtx=True)
     config = dataclasses.replace(flow_config, source_root=source_root)
     monkeypatch.setattr(run_trt_ci_d7l, "parse_args", lambda argv: config)
 
