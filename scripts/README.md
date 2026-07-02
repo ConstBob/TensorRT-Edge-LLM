@@ -43,14 +43,9 @@ python3 scripts/run_trt_ci.py \
   trt-ci@run.example.nvidia.com
 ```
 
-The TRT location on the build host may be either:
-
-- a package/install root with `include/` and `lib/`; or
-- a built TRT source root with `include/`, `parsers/onnx/`,
-  `build/include/`, and `build/Release/lib/`.
-
-Both are CodeManager `PRE_BUILT` inputs; the script does not rebuild or
-repackage TRT. SSH endpoints use `[user@]host[:port]` or an OpenSSH host alias.
+The TRT location is a CodeManager-compatible artifact directory usable as
+Edge-LLM `TRT_PACKAGE_DIR`. It is passed directly as `PRE_BUILT`; this script
+neither rebuilds TRT nor inspects or normalizes the directory. SSH endpoints use `[user@]host[:port]` or an OpenSSH host alias.
 Aliases may provide identity and `ProxyJump` settings. Run-host SSH
 configuration must be available on the build host.
 
@@ -67,9 +62,8 @@ The script delegates infrastructure work to TRT Dev Toolkit:
    controller.
 4. The CodeManager-owned `ContainerManager` resolves the normalized Edge-LLM
    build profile, launches that CUDA container on the run host, sources
-   CodeManager's deployed `setup_environment.sh`, checks candidate TRT
-   linkage, and runs a focused TRT-facing `unitTest` subset, `llm_build`, and
-   `llm_inference`.
+   CodeManager's deployed `setup_environment.sh`, and runs a focused
+   TRT-facing `unitTest` subset, `llm_build`, and `llm_inference`.
 
 The build and run hosts must expose that model's exported ONNX tree at the
 same absolute path,

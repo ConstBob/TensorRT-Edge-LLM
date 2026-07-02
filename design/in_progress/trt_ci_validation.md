@@ -25,11 +25,11 @@ The four positional inputs are architecture, TRT location, build-host SSH
 information, and run-host SSH information. The first draft accepts `x86` or
 `x86_64` and rejects D7L clearly.
 
-The TRT location can be a package root (`include` plus `lib`) or a built TRT
-source root (`include`, parser headers, `build/include`, and
-`build/Release/lib`). SSH endpoints use `[user@]host[:port]`; OpenSSH aliases
-can supply identity and ProxyJump settings. The run-host alias is resolved on
-the build host.
+The TRT location is a CodeManager-compatible artifact directory usable as
+Edge-LLM `TRT_PACKAGE_DIR` and passed as an opaque `PRE_BUILT` input. This entry
+point does not inspect or normalize the directory. SSH endpoints use `[user@]host[:port]`; OpenSSH aliases can supply
+identity and ProxyJump settings. The run-host alias is resolved on the build
+host.
 
 ## Toolkit ownership
 
@@ -50,7 +50,6 @@ controller
   -> stage current Edge-LLM checkout
   -> RemoteConnectionManager upload to x86 build host
   -> hidden build-host worker with forwarded TRT Dev Toolkit PYTHONPATH
-       -> detect package or built-source TRT PRE_BUILT layout
        -> CodeManager plan_and_execute(TRT PRE_BUILT, Edge-LLM BUILD)
        -> CodeManager deploy_runtime(actual RunResult, x86 run host)
        -> resolve the normalized Edge-LLM CUDA profile
@@ -85,7 +84,7 @@ Fake public toolkit services cover:
 
 - x86 parsing and D7L rejection;
 - SSH aliases, users, ports, and jump-host-preserving resolution;
-- package and built-source PRE_BUILT target construction;
+- opaque TRT PRE_BUILT and Edge-LLM source target construction;
 - controller source upload and hidden-worker invocation;
 - identity-preserving `plan_and_execute` to `deploy_runtime`;
 - normalized Edge-LLM profile resolution and run-host container lifecycle;

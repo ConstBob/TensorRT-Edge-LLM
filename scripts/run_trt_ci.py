@@ -35,14 +35,11 @@ from trt_dev_toolkit.code_manager import (ArtifactSource, ArtifactTarget,
 from trt_dev_toolkit.code_manager.models import BuildConfig, PlatformConfig
 from trt_dev_toolkit.command_manager.command_manager import CommandManager
 from trt_dev_toolkit.command_manager.data_structures import (CommandSpec,
-                                                             OutputMode,
-                                                             ShellType)
+                                                             OutputMode)
 from trt_dev_toolkit.command_manager.targets import LocalTarget
 from trt_dev_toolkit.constants import Arch, TargetType, parse_arch
 from trt_dev_toolkit.container_manager import (ContainerKind, ContainerManager,
-                                               ContainerPattern,
-                                               ContainerRequirements,
-                                               MountSpec)
+                                               ContainerPattern, MountSpec)
 from trt_dev_toolkit.log_manager import configure_logging, get_logger
 from trt_dev_toolkit.remote_connection_manager.config.config import (
     RemoteConfig, RemotePaths)
@@ -103,7 +100,7 @@ class Config:
             )
         if not _safe_path(self.trt_location):
             raise ValueError(
-                "trt_location must be an absolute, non-root package or TRT source path"
+                "trt_location must be an absolute, non-root PRE_BUILT directory path"
             )
         if not _safe_path(self.onnx_root):
             raise ValueError(
@@ -155,7 +152,6 @@ class ControllerServices:
 
 @dataclasses.dataclass
 class WorkerServices:
-    commands: Any
     run_remote: Any
     run_config: RemoteConfig
     code: Any
@@ -263,25 +259,8 @@ def remote_config(endpoint: Endpoint, *, local_path: Path | PurePosixPath,
     )
 
 
-def build_targets(config: Config, trt_layout: str) -> list[ArtifactTarget]:
+def build_targets(config: Config) -> list[ArtifactTarget]:
     platform = PlatformConfig(arch=Arch.X86_64)
-    cmake_args = ["-DENABLE_CUTE_DSL=OFF"]
-    extra_mounts: list[str] = []
-    if trt_layout == "package":
-        trt_build = BuildConfig(build_dir=str(config.trt_location))
-    elif trt_layout == "source":
-        build = config.trt_location / "build"
-        trt_build = BuildConfig(build_dir=str(build),
-                                repo_path=str(config.trt_location))
-        cmake_args[:0] = [
-            f"-DTensorRT_INCLUDE_DIR={config.trt_location}/include;{build}/include",
-            f"-DTensorRT_OnnxParser_INCLUDE_DIR={config.trt_location}/parsers/onnx",
-            f"-DTensorRT_LIBRARY={build}/Release/lib/libnvinfer.so",
-            f"-DTensorRT_OnnxParser_LIBRARY={build}/Release/lib/libnvonnxparser.so",
-        ]
-        extra_mounts = [str(config.trt_location)]
-    else:
-        raise ValueError(f"unsupported TRT layout: {trt_layout}")
     return [
         ArtifactTarget(
             component=BuildComponent.TRT,
@@ -289,7 +268,7 @@ def build_targets(config: Config, trt_layout: str) -> list[ArtifactTarget]:
             branch=config.branch,
             source=ArtifactSource.PRE_BUILT,
             platform=platform,
-            build=trt_build,
+            build=BuildConfig(build_dir=str(config.trt_location)),
         ),
         ArtifactTarget(
             component=BuildComponent.EDGELLM,
@@ -302,8 +281,7 @@ def build_targets(config: Config, trt_layout: str) -> list[ArtifactTarget]:
                 build_dir=str(config.edgellm_root),
                 log_file=str(config.run_root / "artifacts/build-edgellm.log"),
                 parallel_jobs=config.jobs,
-                cmake_args=cmake_args,
-                extra_mounts=extra_mounts,
+                cmake_args=["-DENABLE_CUTE_DSL=OFF"],
             ),
         ),
     ]
@@ -360,7 +338,7 @@ class ControllerFlow:
     def run(self) -> int:
         status = 1
         try:
-            self._prepare()
+            self._reset_workspace()
             self._stage_source()
             status = self._run_worker()
         except FlowError as error:
@@ -373,44 +351,14 @@ class ControllerFlow:
                      self.logger, "build-host")
         return status
 
-    def _prepare(self) -> None:
-        local = self.services.commands.run(
-            LocalTarget(),
-            CommandSpec(
-                name="Check controller prerequisites",
-                command="command -v rsync >/dev/null",
-                shell_type=ShellType.POSIX,
-                timeout_s=_CONNECTION_TIMEOUT_S,
-                output_mode=OutputMode.CAPTURE,
-                operation_name="controller-prerequisites",
-            ))
-        if not local.success:
-            raise FlowError("controller requires rsync", _status(local))
+    def _reset_workspace(self) -> None:
         remote = self.services.build_remote
-        if not remote.test_connection():
-            raise FlowError("cannot connect to build host")
         if not remote.filesystem.remove_dir(str(self.config.run_root),
                                             timeout_s=_CONNECTION_TIMEOUT_S):
             raise FlowError("cannot reset build-host workspace")
         if not remote.filesystem.ensure_dir(str(self.config.edgellm_root),
                                             timeout_s=_CONNECTION_TIMEOUT_S):
             raise FlowError("cannot create build-host source workspace")
-        result = self.services.commands.run(
-            remote.target,
-            CommandSpec(
-                name="Check build-host prerequisites",
-                command=
-                ('test "$(uname -m)" = x86_64 && '
-                 f"command -v timeout git docker bash ssh rsync {_PYTHON} >/dev/null"
-                 ),
-                shell_type=ShellType.BASH,
-                timeout_s=_CONNECTION_TIMEOUT_S,
-                output_mode=OutputMode.CAPTURE,
-                operation_name="build-host-prerequisites",
-            ))
-        if not result.success:
-            raise FlowError("build-host prerequisite probe failed",
-                            _status(result))
 
     def _stage_source(self) -> None:
         stage = self.config.local_root / "source-stage"
@@ -493,10 +441,8 @@ class BuildWorker:
 
     def run(self) -> int:
         try:
-            self._probe_run_host()
-            trt_layout = self._probe_trt()
             run_result = self.services.code.plan_and_execute(
-                build_targets(self.config, trt_layout))
+                build_targets(self.config))
             if not run_result.success:
                 self.logger.error("CodeManager build failed: %s",
                                   "; ".join(run_result.error_messages))
@@ -517,70 +463,6 @@ class BuildWorker:
             _cleanup(self.services.run_remote, self.config.run_root,
                      self.logger, "run-host")
         return status
-
-    def _probe_run_host(self) -> None:
-        if not self.services.run_remote.test_connection():
-            raise FlowError("cannot connect from build host to run host")
-        model = shlex.quote(str(self.config.model_dir))
-        result = self.services.commands.run(
-            self.services.run_remote.target,
-            CommandSpec(
-                name="Check run-host prerequisites",
-                command=(
-                    'test "$(uname -m)" = x86_64 && '
-                    f"test -d {model} && "
-                    "command -v bash docker git nvidia-smi rsync >/dev/null"),
-                shell_type=ShellType.BASH,
-                timeout_s=_CONNECTION_TIMEOUT_S,
-                output_mode=OutputMode.CAPTURE,
-                operation_name="run-host-prerequisites",
-            ))
-        if not result.success:
-            raise FlowError("run-host prerequisite/model probe failed",
-                            _status(result))
-
-    def _probe_trt(self) -> str:
-        location = shlex.quote(str(self.config.trt_location))
-        command = f"""set -e
-root={location}
-if test -f "$root/include/NvInfer.h" &&
-   test -f "$root/include/NvInferVersion.h" &&
-   test -f "$root/include/NvOnnxParser.h" &&
-   test -e "$root/lib/libnvinfer.so" &&
-   test -e "$root/lib/libnvonnxparser.so"; then
-  printf 'package\n'
-elif test -f "$root/include/NvInfer.h" &&
-     test -f "$root/parsers/onnx/NvOnnxParser.h" &&
-     test -f "$root/build/include/NvInferVersion.h" &&
-     test -e "$root/build/Release/lib/libnvinfer.so" &&
-     test -e "$root/build/Release/lib/libnvonnxparser.so"; then
-  printf 'source\n'
-else
-  exit 1
-fi
-"""
-        result = self.services.commands.run(
-            LocalTarget(),
-            CommandSpec(
-                name="Detect TensorRT PRE_BUILT layout",
-                command=command,
-                shell_type=ShellType.BASH,
-                timeout_s=_CONNECTION_TIMEOUT_S,
-                output_mode=OutputMode.CAPTURE,
-                operation_name="detect-trt-prebuilt",
-            ))
-        if not result.success:
-            raise FlowError(
-                "trt_location is neither a package root nor a built TRT source root",
-                _status(result),
-            )
-        lines = (result.stdout or result.combined_output
-                 or "").strip().splitlines()
-        layout = lines[-1] if lines else ""
-        if layout not in {"package", "source"}:
-            raise FlowError(f"unexpected TensorRT layout result: {layout!r}")
-        self.logger.info("TensorRT PRE_BUILT layout: %s", layout)
-        return layout
 
     def _run_tests(self, run_result: Any) -> int:
         assert self.deployment is not None
@@ -605,23 +487,6 @@ fi
                 workdir=str(edge),
                 exec_target=self.deployment.remote_target,
             )
-            validation = containers.validate(
-                handle,
-                ContainerRequirements(
-                    required_mounts=mounts,
-                    required_paths=[
-                        self.deployment.env_script_path,
-                        str(self.config.model_dir),
-                    ],
-                    required_tools=[
-                        "bash", "ldd", "readlink", "awk", "tee", "grep"
-                    ],
-                ),
-                exec_target=self.deployment.remote_target,
-            )
-            if not validation.ok:
-                raise FlowError("Edge-LLM test container is invalid: " +
-                                "; ".join(validation.errors))
             status = 0 if containers.exec_progress(
                 handle,
                 command=self._test_command(),
@@ -649,7 +514,7 @@ fi
     def _test_command(self) -> str:
         assert self.deployment is not None
         workspace = PurePosixPath(self.deployment.remote_workspace)
-        edge, candidate = workspace / "edgellm", workspace / "trt"
+        edge = workspace / "edgellm"
         results = workspace / "results"
         unit = edge / "unitTest"
         builder = edge / "examples/llm/llm_build"
@@ -664,21 +529,6 @@ source {q(self.deployment.env_script_path)}
 export EDGELLM_PLUGIN_PATH={q(str(plugin))}
 rm -rf {q(str(results))}
 mkdir -p {q(str(results))}
-check_trt() {{
-  binary="$1"; shift
-  test -x "$binary"
-  linked="$(ldd "$binary")"; printf '%s\\n' "$linked"
-  ! grep -q 'not found' <<<"$linked"
-  for library in "$@"; do
-    resolved="$(awk -v name="$library" 'index($1, name ".so") == 1 {{print $3; exit}}' <<<"$linked")"
-    test -n "$resolved"
-    case "$(readlink -f "$resolved")" in {q(str(candidate))}/*) ;; *) exit 1 ;; esac
-  done
-}}
-check_trt {q(str(unit))} libnvinfer
-check_trt {q(str(plugin))} libnvinfer
-check_trt {q(str(builder))} libnvinfer libnvonnxparser
-check_trt {q(str(inference))} libnvinfer
 status=0
 run_step() {{
   log="$1"; shift
@@ -716,7 +566,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "trt_location",
         type=PurePosixPath,
-        help="absolute TRT package or built source root on the build host")
+        help="absolute TRT PRE_BUILT directory on the build host")
     parser.add_argument("build_host",
                         help="[user@]host[:port] or OpenSSH alias")
     parser.add_argument("run_host", help="[user@]host[:port] or OpenSSH alias")
@@ -776,8 +626,7 @@ def _worker_main(config: Config) -> int:
         remote_connection_manager=run_remote,
         enable_high_core_auto=False,
     )
-    return BuildWorker(config,
-                       WorkerServices(commands, run_remote, run_cfg, code),
+    return BuildWorker(config, WorkerServices(run_remote, run_cfg, code),
                        logger).run()
 
 

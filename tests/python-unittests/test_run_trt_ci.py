@@ -38,7 +38,7 @@ from trt_dev_toolkit.constants import Arch, TargetType
 from trt_dev_toolkit.container_manager import (ContainerBackendType,
                                                ContainerDescriptor,
                                                ContainerHandle, ContainerKind,
-                                               MountSpec, ValidationResult)
+                                               MountSpec)
 
 from scripts import run_trt_ci as ci
 
@@ -95,13 +95,8 @@ class FakeRemote:
         self.events = events
         self.target = RemoteSshTarget(config)
         self.filesystem = FakeFilesystem(name, events)
-        self.connected = True
         self.upload_ok = True
         self.uploads = []
-
-    def test_connection(self):
-        self.events.append(f"{self.name}:probe")
-        return self.connected
 
     def copy_local_directory_to_remote(self, *, local_path, remote_path,
                                        timeout_s):
@@ -127,13 +122,10 @@ class FakeContainers:
         )
         self.resolve_calls = []
         self.launch_calls = []
-        self.validate_calls = []
         self.exec_calls = []
         self.remove_calls = []
         self.resolve_error = None
         self.launch_error = None
-        self.validation = ValidationResult(ok=True)
-        self.validation_error = None
         self.exec_error = None
         self.exec_ok = True
         self.remove_error = None
@@ -152,13 +144,6 @@ class FakeContainers:
         if self.launch_error:
             raise self.launch_error
         return self.handle
-
-    def validate(self, handle, requirements, *, exec_target=None):
-        self.validate_calls.append((handle, requirements, exec_target))
-        self.events.append("container:validate")
-        if self.validation_error:
-            raise self.validation_error
-        return self.validation
 
     def exec_progress(self, handle, **kwargs):
         self.exec_calls.append((handle, kwargs))
@@ -271,17 +256,13 @@ def _remote(endpoint, config, name, events):
     return FakeRemote(name, remote, events)
 
 
-def _worker_harness(config, trt_layout="package"):
+def _worker_harness(config):
     events = []
     run_remote = _remote(ci.Endpoint("run-alias", "runner", 2202), config,
                          "run", events)
-    commands = FakeCommands(
-        events,
-        {"detect-trt-prebuilt": _result(stdout=f"{trt_layout}\n")},
-    )
     code = FakeCode(run_remote.target, config.runtime_root, events)
-    services = ci.WorkerServices(commands, run_remote, run_remote.config, code)
-    return services, commands, run_remote, code, events
+    services = ci.WorkerServices(run_remote, run_remote.config, code)
+    return services, run_remote, code, events
 
 
 def _spec(commands, operation):
@@ -350,28 +331,8 @@ def test_ssh_resolution_preserves_alias_and_derives_user_and_port():
     assert resolved.ssh.batch_mode
 
 
-@pytest.mark.parametrize("layout", ["package", "source"])
-def test_trt_probe_and_targets_support_package_or_built_source(config, layout):
-    services, commands, _remote, _code, _events = _worker_harness(
-        config, layout)
-
-    assert ci.BuildWorker(config, services,
-                          FakeLogger())._probe_trt() == layout
-
-    target, probe = _spec(commands, "detect-trt-prebuilt")
-    assert isinstance(target, LocalTarget)
-    assert probe.output_mode is OutputMode.CAPTURE
-    for path in (
-            '"$root/include/NvInfer.h"',
-            '"$root/include/NvInferVersion.h"',
-            '"$root/include/NvOnnxParser.h"',
-            '"$root/lib/libnvinfer.so"',
-            '"$root/build/include/NvInferVersion.h"',
-            '"$root/build/Release/lib/libnvinfer.so"',
-    ):
-        assert path in probe.command
-
-    trt, edge = ci.build_targets(config, layout)
+def test_build_targets_use_prebuilt_trt_and_edgellm_source(config):
+    trt, edge = ci.build_targets(config)
 
     assert [trt.component,
             edge.component] == [BuildComponent.TRT, BuildComponent.EDGELLM]
@@ -380,43 +341,21 @@ def test_trt_probe_and_targets_support_package_or_built_source(config, layout):
     assert trt.mode is edge.mode is BuildMode.RELEASE
     assert trt.platform.arch is edge.platform.arch is Arch.X86_64
     assert trt.branch == edge.branch == config.branch
-    expected_build = (config.trt_location if layout == "package" else
-                      config.trt_location / "build")
-    expected_repo = None if layout == "package" else str(config.trt_location)
-    assert trt.build.build_dir == str(expected_build)
-    assert trt.build.repo_path == expected_repo
+    assert trt.build.build_dir == str(config.trt_location)
+    assert trt.build.repo_path is None
     assert edge.build.repo_path == edge.build.build_dir == str(
         config.edgellm_root)
     assert edge.build.parallel_jobs == config.jobs
-    if layout == "package":
-        assert edge.build.cmake_args == ["-DENABLE_CUTE_DSL=OFF"]
-        assert edge.build.extra_mounts == []
-    else:
-        build = config.trt_location / "build"
-        assert edge.build.cmake_args == [
-            f"-DTensorRT_INCLUDE_DIR={config.trt_location}/include;{build}/include",
-            f"-DTensorRT_OnnxParser_INCLUDE_DIR={config.trt_location}/parsers/onnx",
-            f"-DTensorRT_LIBRARY={build}/Release/lib/libnvinfer.so",
-            f"-DTensorRT_OnnxParser_LIBRARY={build}/Release/lib/libnvonnxparser.so",
-            "-DENABLE_CUTE_DSL=OFF",
-        ]
-        assert edge.build.extra_mounts == [str(config.trt_location)]
+    assert edge.build.cmake_args == ["-DENABLE_CUTE_DSL=OFF"]
+    assert edge.build.extra_mounts == []
     assert edge.build.trt_package_dir is None
-
-
-def test_trt_probe_rejects_empty_output(config):
-    services, commands, _remote, _code, _events = _worker_harness(config)
-    commands.outcomes["detect-trt-prebuilt"] = _result(stdout="")
-
-    with pytest.raises(ci.FlowError, match="unexpected TensorRT layout"):
-        ci.BuildWorker(config, services, FakeLogger())._probe_trt()
 
 
 def test_test_container_pattern_requires_edgellm_plan(config):
     with pytest.raises(ci.FlowError, match="missing its execution plan"):
         ci._test_container_pattern(RunResult(success=True))
 
-    trt = ci.build_targets(config, "package")[0]
+    trt = ci.build_targets(config)[0]
     result = RunResult(
         success=True,
         plan=Plan("trt-only", [PlanStep("trt", trt, BuildComponent.TRT)]),
@@ -448,20 +387,13 @@ def test_controller_stages_source_and_invokes_hidden_worker(
     assert flow.run() == 0
 
     _assert_subsequence(events, [
-        "build:probe",
         "build:remove",
         "build:ensure",
-        "command:build-host-prerequisites",
         "command:stage-source",
         "build:upload",
         "command:build-worker",
         "build:remove",
     ])
-    probe_target, probe = _spec(commands, "build-host-prerequisites")
-    assert probe_target is remote.target
-    assert probe.output_mode is OutputMode.CAPTURE
-    assert "x86_64" in probe.command and "command -v timeout git docker" in probe.command
-
     stage_target, stage = _spec(commands, "stage-source")
     assert isinstance(stage_target, LocalTarget)
     assert stage.argv[:4] == ["rsync", "-a", "--delete", "--delete-excluded"]
@@ -499,25 +431,25 @@ def test_controller_stages_source_and_invokes_hidden_worker(
     if toolkit_override is None:
         assert (Path(toolkit) / "trt_dev_toolkit" / "__init__.py").is_file()
     assert worker.timeout_s == config.worker_timeout_s + 120
+    assert [spec.operation_name for _target, spec in commands.calls] == [
+        "stage-source",
+        "build-worker",
+    ]
     assert remote.filesystem.remove_calls[-1][1]["timeout_s"] == 1800
 
 
 def test_worker_deploys_then_tests_in_edgellm_container_and_cleans(config):
-    services, commands, run_remote, code, events = _worker_harness(config)
+    services, run_remote, code, events = _worker_harness(config)
     original = code.build_result
     worker = ci.BuildWorker(config, services, FakeLogger())
 
     assert worker.run() == 0
 
     _assert_subsequence(events, [
-        "run:probe",
-        "command:run-host-prerequisites",
-        "command:detect-trt-prebuilt",
         "code:build",
         "code:deploy",
         "container:resolve",
         "container:launch",
-        "container:validate",
         "container:exec",
         "container:remove",
         "run:remove",
@@ -529,13 +461,6 @@ def test_worker_deploys_then_tests_in_edgellm_container_and_cleans(config):
     assert services.run_config is run_remote.config
     assert mode is DeploymentMode.RSYNC
     assert not run_remote.uploads
-
-    probe_target, probe = _spec(commands, "run-host-prerequisites")
-    assert probe_target is run_remote.target
-    assert probe.output_mode is OutputMode.CAPTURE
-    assert "x86_64" in probe.command
-    assert "command -v bash docker git nvidia-smi rsync" in probe.command
-    assert f"test -d {config.model_dir}" in probe.command
 
     containers = code.container_manager
     pattern = containers.resolve_calls[0]
@@ -556,19 +481,6 @@ def test_worker_deploys_then_tests_in_edgellm_container_and_cleans(config):
                   read_only=True),
     ]
 
-    validated_handle, requirements, validated_target = containers.validate_calls[
-        0]
-    assert validated_handle is containers.handle
-    assert validated_target is run_remote.target
-    assert requirements.required_mounts == launch["mounts"]
-    assert requirements.required_paths == [
-        str(config.runtime_root / "setup_environment.sh"),
-        str(config.model_dir),
-    ]
-    assert requirements.required_tools == [
-        "bash", "ldd", "readlink", "awk", "tee", "grep"
-    ]
-
     handle, execution = containers.exec_calls[0]
     assert handle is containers.handle
     assert execution["exec_target"] is run_remote.target
@@ -581,7 +493,6 @@ def test_worker_deploys_then_tests_in_edgellm_container_and_cleans(config):
     plugin = config.runtime_root / "edgellm/libNvInfer_edgellm_plugin.so"
     assert setup in command
     assert f"export EDGELLM_PLUGIN_PATH={plugin}" in command
-    assert f"check_trt {plugin} libnvinfer" in command
     expected_filter = (
         "SanityCheck.*:DeploymentConfigTest.*:EngineExecutorTest.*:"
         "LLMEngineConfigTest.*:LLMEngineConfigRecipesTest.*:"
@@ -592,8 +503,7 @@ def test_worker_deploys_then_tests_in_edgellm_container_and_cleans(config):
     assert ci._TRT_UNIT_FILTER in command
     assert "--gtest_fail_if_no_test_selected" in command
     assert command.index(setup) < command.index("unitTest")
-    for text in ("not found", "readlink -f", "libnvinfer", "libnvonnxparser",
-                 "unitTest", "llm_build", "llm_inference", "PIPESTATUS[0]",
+    for text in ("unitTest", "llm_build", "llm_inference", "PIPESTATUS[0]",
                  "run_step", 'exit "$status"'):
         assert text in command
     results = config.runtime_root / "results"
@@ -618,10 +528,6 @@ def test_worker_deploys_then_tests_in_edgellm_container_and_cleans(config):
             "exec_target": run_remote.target
         },
     )]
-    assert [spec.operation_name for _target, spec in commands.calls] == [
-        "run-host-prerequisites",
-        "detect-trt-prebuilt",
-    ]
     assert len(run_remote.filesystem.remove_calls) == 1
     assert run_remote.filesystem.remove_calls[0][1]["timeout_s"] == 1800
 
@@ -644,21 +550,15 @@ def test_generated_test_command_aggregates_step_status(config, tmp_path,
                                                        steps):
     workspace = tmp_path / "runtime"
     edge = workspace / "edgellm"
-    candidate = workspace / "trt"
     model_root = tmp_path / "onnx"
     model = model_root / ci._MODEL_RELATIVE
     marker = tmp_path / "steps.log"
-    fake_bin = tmp_path / "bin"
 
     def executable(path, body):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("#!/usr/bin/env bash\n" + body)
         path.chmod(0o755)
 
-    for library in ("libnvinfer.so.10", "libnvonnxparser.so.10"):
-        path = candidate / library
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("fake")
     model.mkdir(parents=True)
     (edge / "tests/test_cases").mkdir(parents=True)
     (edge / "tests/test_cases/llm_basic.json").write_text("{}")
@@ -689,12 +589,6 @@ done
 if test "$WRITE_OUTPUT" = 1; then printf '{}\n' > "$output"; fi
 exit "$INFERENCE_RC"
 """)
-    executable(
-        fake_bin / "ldd",
-        """printf 'libnvinfer.so.10 => %s\nlibnvonnxparser.so.10 => %s\n' \
-  "$FAKE_TRT/libnvinfer.so.10" "$FAKE_TRT/libnvonnxparser.so.10"
-""")
-
     test_config = dataclasses.replace(config,
                                       onnx_root=PurePosixPath(str(model_root)))
     worker = ci.BuildWorker(test_config, None, FakeLogger())
@@ -705,10 +599,8 @@ exit "$INFERENCE_RC"
     env = os.environ.copy()
     env.update({
         "BUILD_RC": str(build_rc),
-        "FAKE_TRT": str(candidate),
         "FLOW_MARKER": str(marker),
         "INFERENCE_RC": str(inference_rc),
-        "PATH": f"{fake_bin}:{env['PATH']}",
         "UNIT_RC": str(unit_rc),
         "WRITE_OUTPUT": "1" if write_output else "0",
     })
@@ -728,11 +620,8 @@ exit "$INFERENCE_RC"
 @pytest.mark.parametrize(
     ("failure", "expected"),
     [
-        ("controller", 13),
-        ("connect", 1),
         ("reset", 1),
         ("ensure", 1),
-        ("prerequisite", 17),
         ("stage", 19),
         ("upload", 1),
         ("worker", 37),
@@ -745,16 +634,10 @@ def test_controller_preserves_workspace_and_failure_status(
     commands = FakeCommands(events)
     remote = _remote(ci.Endpoint("build-alias", "builder", 2201), config,
                      "build", events)
-    if failure == "controller":
-        commands.outcomes["controller-prerequisites"] = _result(False, 13)
-    elif failure == "connect":
-        remote.connected = False
-    elif failure == "reset":
+    if failure == "reset":
         remote.filesystem.remove_ok = False
     elif failure == "ensure":
         remote.filesystem.ensure_ok = False
-    elif failure == "prerequisite":
-        commands.outcomes["build-host-prerequisites"] = _result(False, 17)
     elif failure == "stage":
         commands.outcomes["stage-source"] = _result(False, 19)
     elif failure == "upload":
@@ -777,15 +660,10 @@ def test_controller_preserves_workspace_and_failure_status(
 @pytest.mark.parametrize(
     ("failure", "expected", "cleanup"),
     [
-        ("connect", 1, False),
-        ("prerequisite", 23, False),
-        ("trt", 29, False),
         ("build", 1, False),
         ("deploy", 1, False),
         ("container-resolve", 1, False),
         ("container-launch", 1, False),
-        ("container-invalid", 1, False),
-        ("container-validation-error", 1, False),
         ("test", 1, False),
         ("test-error", 1, False),
         ("remove", 1, False),
@@ -795,14 +673,8 @@ def test_controller_preserves_workspace_and_failure_status(
 )
 def test_worker_preserves_status_and_cleans_only_success(
         config, failure, expected, cleanup):
-    services, commands, run_remote, code, _events = _worker_harness(config)
-    if failure == "connect":
-        run_remote.connected = False
-    elif failure == "prerequisite":
-        commands.outcomes["run-host-prerequisites"] = _result(False, 23)
-    elif failure == "trt":
-        commands.outcomes["detect-trt-prebuilt"] = _result(False, 29)
-    elif failure == "build":
+    services, run_remote, code, _events = _worker_harness(config)
+    if failure == "build":
         code.build_result = RunResult(success=False,
                                       error_messages=["build failed"])
     elif failure == "deploy":
@@ -811,12 +683,6 @@ def test_worker_preserves_status_and_cleans_only_success(
         code.container_manager.resolve_error = RuntimeError("resolve failed")
     elif failure == "container-launch":
         code.container_manager.launch_error = RuntimeError("launch failed")
-    elif failure == "container-invalid":
-        code.container_manager.validation = ValidationResult(
-            ok=False, errors=["missing runtime"])
-    elif failure == "container-validation-error":
-        code.container_manager.validation_error = RuntimeError(
-            "validation failed")
     elif failure == "test":
         code.container_manager.exec_ok = False
     elif failure == "test-error":
@@ -831,14 +697,12 @@ def test_worker_preserves_status_and_cleans_only_success(
     assert status == expected
     assert len(run_remote.filesystem.remove_calls) == (1 if cleanup else 0)
     if failure in {
-            "container-resolve", "container-launch", "container-invalid",
-            "container-validation-error", "test", "test-error", "remove",
-            "remove-error", "success"
+            "container-resolve", "container-launch", "test", "test-error",
+            "remove", "remove-error", "success"
     }:
         assert code.deploy_calls[0][0] is code.build_result
     assert len(code.container_manager.remove_calls) == (1 if failure in {
-        "container-invalid", "container-validation-error", "test",
-        "test-error", "remove", "remove-error", "success"
+        "test", "test-error", "remove", "remove-error", "success"
     } else 0)
 
 
@@ -867,7 +731,7 @@ def test_structure_forbids_manual_runtime_resource_and_result_copies():
     assert [field.name for field in dataclasses.fields(ci.ControllerServices)
             ] == ["commands", "build_remote"]
     assert [field.name for field in dataclasses.fields(ci.WorkerServices)
-            ] == ["commands", "run_remote", "run_config", "code"]
+            ] == ["run_remote", "run_config", "code"]
     for forbidden in ("deploy_runtime", "copy_remote_", "_retrieve",
                       "_stage_resources", "_collect", "_test_spec"):
         assert forbidden not in controller
