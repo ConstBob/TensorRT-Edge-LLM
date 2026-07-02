@@ -39,7 +39,10 @@ from trt_dev_toolkit.command_manager.data_structures import (CommandSpec,
                                                              ShellType)
 from trt_dev_toolkit.command_manager.targets import LocalTarget
 from trt_dev_toolkit.constants import Arch, TargetType, parse_arch
-from trt_dev_toolkit.container_manager import ContainerManager
+from trt_dev_toolkit.container_manager import (ContainerKind, ContainerManager,
+                                               ContainerPattern,
+                                               ContainerRequirements,
+                                               MountSpec)
 from trt_dev_toolkit.log_manager import configure_logging, get_logger
 from trt_dev_toolkit.remote_connection_manager.config.config import (
     RemoteConfig, RemotePaths)
@@ -60,6 +63,10 @@ _JOBS = 16
 _PYTHON = "python3"
 _DEFAULT_ONNX_ROOT = PurePosixPath("/home/edge_llm_cache/trt-ci/onnx")
 _MODEL_RELATIVE = PurePosixPath("Qwen2.5-0.5B-Instruct/llm-fp16-fp16")
+_TRT_UNIT_FILTER = (
+    "SanityCheck.*:DeploymentConfigTest.*:EngineExecutorTest.*:"
+    "LLMEngineConfigTest.*:LLMEngineConfigRecipesTest.*:RegistryBuilderTest.*:"
+    "AllKVDtypes/RegistryBuilderKVDtypeTest.*")
 _TOOLKIT_SRC = str(Path(trt_dev_toolkit.__file__).resolve().parents[1])
 
 
@@ -302,6 +309,28 @@ def build_targets(config: Config, trt_layout: str) -> list[ArtifactTarget]:
     ]
 
 
+def _test_container_pattern(run_result: Any) -> ContainerPattern:
+    if run_result.plan is None:
+        raise FlowError("CodeManager result is missing its execution plan")
+    target = next((step.target for step in run_result.plan.steps
+                   if step.component is BuildComponent.EDGELLM), None)
+    if target is None:
+        raise FlowError("CodeManager result has no Edge-LLM build step")
+    platform = target.platform
+    branch = {
+        "master": "main",
+        "trt1015": "rel-10.15",
+    }.get(target.branch.lower(), target.branch)
+    return ContainerPattern(
+        kind=ContainerKind.TRT,
+        arch=platform.arch,
+        branch=branch,
+        cuda_version=platform.cuda_version,
+        ubuntu_version=platform.ubuntu_version,
+        trt_type=platform.trt_type,
+    )
+
+
 def _status(result: Any) -> int:
     if result.success:
         return 0
@@ -372,7 +401,7 @@ class ControllerFlow:
                 name="Check build-host prerequisites",
                 command=
                 ('test "$(uname -m)" = x86_64 && '
-                 f"command -v timeout git docker bash cmake make ssh rsync {_PYTHON} >/dev/null"
+                 f"command -v timeout git docker bash ssh rsync {_PYTHON} >/dev/null"
                  ),
                 shell_type=ShellType.BASH,
                 timeout_s=_CONNECTION_TIMEOUT_S,
@@ -477,9 +506,7 @@ class BuildWorker:
                 self.services.run_config,
                 preferred_mode=DeploymentMode.RSYNC,
             )
-            status = _status(
-                self.services.commands.run(self.deployment.remote_target,
-                                           self._test_spec()))
+            status = self._run_tests(run_result)
         except FlowError as error:
             self.logger.error("%s", error)
             return error.exit_code
@@ -499,11 +526,10 @@ class BuildWorker:
             self.services.run_remote.target,
             CommandSpec(
                 name="Check run-host prerequisites",
-                command=
-                ('test "$(uname -m)" = x86_64 && '
-                 f"test -d {model} && "
-                 "command -v bash ldd readlink awk tee grep nvidia-smi >/dev/null"
-                 ),
+                command=(
+                    'test "$(uname -m)" = x86_64 && '
+                    f"test -d {model} && "
+                    "command -v bash docker git nvidia-smi rsync >/dev/null"),
                 shell_type=ShellType.BASH,
                 timeout_s=_CONNECTION_TIMEOUT_S,
                 output_mode=OutputMode.CAPTURE,
@@ -556,20 +582,87 @@ fi
         self.logger.info("TensorRT PRE_BUILT layout: %s", layout)
         return layout
 
-    def _test_spec(self) -> CommandSpec:
+    def _run_tests(self, run_result: Any) -> int:
+        assert self.deployment is not None
+        containers = self.services.code.container_manager
+        workspace = PurePosixPath(self.deployment.remote_workspace)
+        edge = workspace / "edgellm"
+        mounts = [
+            MountSpec(str(workspace), str(workspace)),
+            MountSpec(str(self.config.onnx_root),
+                      str(self.config.onnx_root),
+                      read_only=True),
+        ]
+        handle = None
+        status = 1
+        try:
+            descriptor = containers.resolve(
+                _test_container_pattern(run_result))
+            handle = containers.launch(
+                descriptor=descriptor,
+                name=f"trt-ci-edgellm-{self.config.run_id}",
+                mounts=mounts,
+                workdir=str(edge),
+                exec_target=self.deployment.remote_target,
+            )
+            validation = containers.validate(
+                handle,
+                ContainerRequirements(
+                    required_mounts=mounts,
+                    required_paths=[
+                        self.deployment.env_script_path,
+                        str(self.config.model_dir),
+                    ],
+                    required_tools=[
+                        "bash", "ldd", "readlink", "awk", "tee", "grep"
+                    ],
+                ),
+                exec_target=self.deployment.remote_target,
+            )
+            if not validation.ok:
+                raise FlowError("Edge-LLM test container is invalid: " +
+                                "; ".join(validation.errors))
+            status = 0 if containers.exec_progress(
+                handle,
+                command=self._test_command(),
+                cwd=str(edge),
+                timeout_s=_TEST_TIMEOUT_S,
+                tee_file=str(self.config.run_root / "artifacts/tests.log"),
+                exec_target=self.deployment.remote_target,
+            ) else 1
+        finally:
+            if handle is not None:
+                try:
+                    if not containers.remove(
+                            handle,
+                            force=True,
+                            exec_target=self.deployment.remote_target):
+                        self.logger.warning(
+                            "Could not remove Edge-LLM test container")
+                        status = 1
+                except Exception as error:
+                    self.logger.warning(
+                        "Could not remove Edge-LLM test container: %s", error)
+                    status = 1
+        return status
+
+    def _test_command(self) -> str:
         assert self.deployment is not None
         workspace = PurePosixPath(self.deployment.remote_workspace)
         edge, candidate = workspace / "edgellm", workspace / "trt"
-        results = self.config.run_root / "results"
+        results = workspace / "results"
         unit = edge / "unitTest"
         builder = edge / "examples/llm/llm_build"
         inference = edge / "examples/llm/llm_inference"
+        plugin = edge / "libNvInfer_edgellm_plugin.so"
         engine = results / "qwen2.5-fp16-engine"
         test_case = edge / "tests/test_cases/llm_basic.json"
         output = results / "llm-basic-output.json"
         q = shlex.quote
         command = f"""set -euo pipefail
 source {q(self.deployment.env_script_path)}
+export EDGELLM_PLUGIN_PATH={q(str(plugin))}
+rm -rf {q(str(results))}
 mkdir -p {q(str(results))}
 check_trt() {{
   binary="$1"; shift
@@ -583,37 +676,36 @@ check_trt() {{
   done
 }}
 check_trt {q(str(unit))} libnvinfer
+check_trt {q(str(plugin))} libnvinfer
 check_trt {q(str(builder))} libnvinfer libnvonnxparser
 check_trt {q(str(inference))} libnvinfer
-set +e
-{q(str(unit))} --gtest_output=xml:{q(str(results / 'unit-tests.xml'))} \\
-  2>&1 | tee {q(str(results / 'unit-tests.log'))}
-status=${{PIPESTATUS[0]}}
-set -e
-test "$status" -eq 0 || exit "$status"
-{q(str(builder))} \\
+status=0
+run_step() {{
+  log="$1"; shift
+  set +e
+  "$@" 2>&1 | tee "$log"
+  step_status=${{PIPESTATUS[0]}}
+  set -e
+  if test "$step_status" -ne 0; then status=1; fi
+  return 0
+}}
+run_step {q(str(results / 'unit-tests.log'))} {q(str(unit))} \\
+  --gtest_filter={q(_TRT_UNIT_FILTER)} --gtest_fail_if_no_test_selected \\
+  --gtest_output=xml:{q(str(results / 'unit-tests.xml'))}
+run_step {q(str(results / 'llm-build.log'))} {q(str(builder))} \\
   --onnxDir={q(str(self.config.model_dir))} \\
   --engineDir={q(str(engine))} \\
-  --maxInputLen=2048 --maxKVCacheCapacity=4096 --maxBatchSize=1 \\
-  2>&1 | tee {q(str(results / 'llm-build.log'))}
-{q(str(inference))} \\
-  --engineDir={q(str(engine))} \\
-  --inputFile={q(str(test_case))} \\
-  --outputFile={q(str(output))} --dumpProfile \\
-  2>&1 | tee {q(str(results / 'llm-inference.log'))}
-test -s {q(str(output))}
+  --maxInputLen=2048 --maxKVCacheCapacity=4096 --maxBatchSize=1
+if test "$step_status" -eq 0; then
+  run_step {q(str(results / 'llm-inference.log'))} {q(str(inference))} \\
+    --engineDir={q(str(engine))} \\
+    --inputFile={q(str(test_case))} \\
+    --outputFile={q(str(output))} --dumpProfile
+fi
+test -s {q(str(output))} || status=1
+exit "$status"
 """
-        return CommandSpec(
-            name="Run Edge-LLM unit and fixed Qwen E2E tests",
-            command=command,
-            shell_type=ShellType.BASH,
-            cwd=str(edge),
-            timeout_s=_TEST_TIMEOUT_S,
-            output_mode=OutputMode.PROGRESS,
-            artifact_log_file=str(self.config.run_root /
-                                  "artifacts/tests.log"),
-            operation_name="run-compatibility-subset",
-        )
+        return command
 
 
 def _parser() -> argparse.ArgumentParser:

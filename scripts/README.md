@@ -65,11 +65,14 @@ The script delegates infrastructure work to TRT Dev Toolkit:
    `CodeManager.deploy_runtime()`, which deploys TRT and Edge-LLM directly to
    the run host. Runtime artifacts and resources are not relayed through the
    controller.
-4. `CommandManager` checks candidate TRT linkage, runs `unitTest`, builds a
-   Qwen2.5-0.5B-Instruct FP16 engine, and runs `llm_inference` with
-   `tests/test_cases/llm_basic.json`.
+4. The CodeManager-owned `ContainerManager` resolves the normalized Edge-LLM
+   build profile, launches that CUDA container on the run host, sources
+   CodeManager's deployed `setup_environment.sh`, checks candidate TRT
+   linkage, and runs a focused TRT-facing `unitTest` subset, `llm_build`, and
+   `llm_inference`.
 
-The run host must expose that model's exported ONNX tree at
+The build and run hosts must expose that model's exported ONNX tree at the
+same absolute path,
 `/home/edge_llm_cache/trt-ci/onnx/Qwen2.5-0.5B-Instruct/llm-fp16-fp16`.
 Set `TRT_CI_ONNX_DIR` on the controller to override the ONNX root while
 keeping the public command unchanged. D7L cross-compilation is intentionally
@@ -82,8 +85,8 @@ Prerequisites:
 - key/agent/OpenSSH-config authentication from the controller to the build host
   and from the build host to the run host;
 - TRT container tooling and rsync on the controller/build host; and
-- an x86 NVIDIA GPU environment plus Bash, CUDA, `ldd`, `awk`, and
-  `readlink` on the run host.
+- the shared TRT/git-trt checkout, Docker with the NVIDIA runtime, rsync, and
+  an x86 NVIDIA GPU on the run host. A bare-host CUDA runtime is not required.
 
 Each run owns `/tmp/edgellm-trt-ci/run-<id>` on both remote hosts. Failed runs
 retain their workspaces. Successful runs clean them, while controller logs and

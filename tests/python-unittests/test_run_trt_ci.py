@@ -18,7 +18,9 @@ import argparse
 import ast
 import dataclasses
 import os
+import subprocess
 from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 
 import pytest
 
@@ -27,13 +29,16 @@ pytest.importorskip("trt_dev_toolkit", reason="TRT-internal CI dependency")
 from trt_dev_toolkit.code_manager import (ArtifactSource, BuildComponent,
                                           BuildMode, DeploymentMode,
                                           DeploymentResult, EnvironmentExports,
-                                          RunResult)
+                                          Plan, PlanStep, RunResult)
 from trt_dev_toolkit.command_manager.data_structures import (CommandResult,
-                                                             OutputMode,
-                                                             ShellType)
+                                                             OutputMode)
 from trt_dev_toolkit.command_manager.targets import (LocalTarget,
                                                      RemoteSshTarget)
 from trt_dev_toolkit.constants import Arch, TargetType
+from trt_dev_toolkit.container_manager import (ContainerBackendType,
+                                               ContainerDescriptor,
+                                               ContainerHandle, ContainerKind,
+                                               MountSpec, ValidationResult)
 
 from scripts import run_trt_ci as ci
 
@@ -105,6 +110,71 @@ class FakeRemote:
         return self.upload_ok
 
 
+class FakeContainers:
+
+    def __init__(self, events):
+        self.events = events
+        self.descriptor = ContainerDescriptor(
+            backend=ContainerBackendType.GIT_TRT_RUNC,
+            image_or_profile="main-native-x86_64-ubuntu24.04-cuda13.2",
+            kind=ContainerKind.TRT,
+        )
+        self.handle = ContainerHandle(
+            name="trt-ci-edgellm-unit-451",
+            backend=ContainerBackendType.GIT_TRT_RUNC,
+            image=self.descriptor.image_or_profile,
+            kind=ContainerKind.TRT,
+        )
+        self.resolve_calls = []
+        self.launch_calls = []
+        self.validate_calls = []
+        self.exec_calls = []
+        self.remove_calls = []
+        self.resolve_error = None
+        self.launch_error = None
+        self.validation = ValidationResult(ok=True)
+        self.validation_error = None
+        self.exec_error = None
+        self.exec_ok = True
+        self.remove_error = None
+        self.remove_ok = True
+
+    def resolve(self, pattern):
+        self.resolve_calls.append(pattern)
+        self.events.append("container:resolve")
+        if self.resolve_error:
+            raise self.resolve_error
+        return self.descriptor
+
+    def launch(self, **kwargs):
+        self.launch_calls.append(kwargs)
+        self.events.append("container:launch")
+        if self.launch_error:
+            raise self.launch_error
+        return self.handle
+
+    def validate(self, handle, requirements, *, exec_target=None):
+        self.validate_calls.append((handle, requirements, exec_target))
+        self.events.append("container:validate")
+        if self.validation_error:
+            raise self.validation_error
+        return self.validation
+
+    def exec_progress(self, handle, **kwargs):
+        self.exec_calls.append((handle, kwargs))
+        self.events.append("container:exec")
+        if self.exec_error:
+            raise self.exec_error
+        return self.exec_ok
+
+    def remove(self, handle, **kwargs):
+        self.remove_calls.append((handle, kwargs))
+        self.events.append("container:remove")
+        if self.remove_error:
+            raise self.remove_error
+        return self.remove_ok
+
+
 class FakeCode:
 
     def __init__(self, target, workspace, events):
@@ -112,12 +182,26 @@ class FakeCode:
         self.workspace = workspace
         self.events = events
         self.build_result = RunResult(success=True)
+        self.container_manager = FakeContainers(events)
         self.build_calls = []
         self.deploy_calls = []
         self.deploy_error = None
 
     def plan_and_execute(self, targets):
-        self.build_calls.append(list(targets))
+        targets = list(targets)
+        self.build_calls.append(targets)
+        edge = next(target for target in targets
+                    if target.component is BuildComponent.EDGELLM)
+        edge = dataclasses.replace(
+            edge,
+            platform=dataclasses.replace(edge.platform,
+                                         cuda_version="13.2",
+                                         ubuntu_version="24.04"),
+        )
+        self.build_result.plan = Plan(
+            run_id="fake-run",
+            steps=[PlanStep("edgellm-build", edge, BuildComponent.EDGELLM)],
+        )
         self.events.append("code:build")
         return self.build_result
 
@@ -328,6 +412,19 @@ def test_trt_probe_rejects_empty_output(config):
         ci.BuildWorker(config, services, FakeLogger())._probe_trt()
 
 
+def test_test_container_pattern_requires_edgellm_plan(config):
+    with pytest.raises(ci.FlowError, match="missing its execution plan"):
+        ci._test_container_pattern(RunResult(success=True))
+
+    trt = ci.build_targets(config, "package")[0]
+    result = RunResult(
+        success=True,
+        plan=Plan("trt-only", [PlanStep("trt", trt, BuildComponent.TRT)]),
+    )
+    with pytest.raises(ci.FlowError, match="no Edge-LLM build step"):
+        ci._test_container_pattern(result)
+
+
 @pytest.mark.parametrize("toolkit_override", [None, "/ci/toolkit/src"])
 def test_controller_stages_source_and_invokes_hidden_worker(
         config, monkeypatch, toolkit_override):
@@ -405,7 +502,7 @@ def test_controller_stages_source_and_invokes_hidden_worker(
     assert remote.filesystem.remove_calls[-1][1]["timeout_s"] == 1800
 
 
-def test_worker_deploys_exact_build_result_then_tests_and_cleans(config):
+def test_worker_deploys_then_tests_in_edgellm_container_and_cleans(config):
     services, commands, run_remote, code, events = _worker_harness(config)
     original = code.build_result
     worker = ci.BuildWorker(config, services, FakeLogger())
@@ -418,7 +515,11 @@ def test_worker_deploys_exact_build_result_then_tests_and_cleans(config):
         "command:detect-trt-prebuilt",
         "code:build",
         "code:deploy",
-        "command:run-compatibility-subset",
+        "container:resolve",
+        "container:launch",
+        "container:validate",
+        "container:exec",
+        "container:remove",
         "run:remove",
     ])
     assert len(code.build_calls) == len(code.deploy_calls) == 1
@@ -432,18 +533,70 @@ def test_worker_deploys_exact_build_result_then_tests_and_cleans(config):
     probe_target, probe = _spec(commands, "run-host-prerequisites")
     assert probe_target is run_remote.target
     assert probe.output_mode is OutputMode.CAPTURE
-    assert "x86_64" in probe.command and "command -v bash ldd" in probe.command
+    assert "x86_64" in probe.command
+    assert "command -v bash docker git nvidia-smi rsync" in probe.command
     assert f"test -d {config.model_dir}" in probe.command
 
-    test_target, test = _spec(commands, "run-compatibility-subset")
-    assert test_target is run_remote.target
-    assert test.shell_type is ShellType.BASH
-    assert test.output_mode is OutputMode.PROGRESS
-    assert test.cwd == str(config.runtime_root / "edgellm")
+    containers = code.container_manager
+    pattern = containers.resolve_calls[0]
+    assert (pattern.kind, pattern.arch, pattern.branch) == (
+        ContainerKind.TRT,
+        Arch.X86_64,
+        config.branch,
+    )
+    assert (pattern.cuda_version, pattern.ubuntu_version) == ("13.2", "24.04")
+    launch = containers.launch_calls[0]
+    assert launch["descriptor"] is containers.descriptor
+    assert launch["name"] == f"trt-ci-edgellm-{config.run_id}"
+    assert launch["workdir"] == str(config.runtime_root / "edgellm")
+    assert launch["exec_target"] is run_remote.target
+    assert launch["mounts"] == [
+        MountSpec(str(config.runtime_root), str(config.runtime_root)),
+        MountSpec(str(config.onnx_root), str(config.onnx_root),
+                  read_only=True),
+    ]
+
+    validated_handle, requirements, validated_target = containers.validate_calls[
+        0]
+    assert validated_handle is containers.handle
+    assert validated_target is run_remote.target
+    assert requirements.required_mounts == launch["mounts"]
+    assert requirements.required_paths == [
+        str(config.runtime_root / "setup_environment.sh"),
+        str(config.model_dir),
+    ]
+    assert requirements.required_tools == [
+        "bash", "ldd", "readlink", "awk", "tee", "grep"
+    ]
+
+    handle, execution = containers.exec_calls[0]
+    assert handle is containers.handle
+    assert execution["exec_target"] is run_remote.target
+    assert execution["cwd"] == str(config.runtime_root / "edgellm")
+    assert execution["timeout_s"] == 3600
+    assert execution["tee_file"] == str(config.run_root /
+                                        "artifacts/tests.log")
+    command = execution["command"]
+    setup = f"source {config.runtime_root / 'setup_environment.sh'}"
+    plugin = config.runtime_root / "edgellm/libNvInfer_edgellm_plugin.so"
+    assert setup in command
+    assert f"export EDGELLM_PLUGIN_PATH={plugin}" in command
+    assert f"check_trt {plugin} libnvinfer" in command
+    expected_filter = (
+        "SanityCheck.*:DeploymentConfigTest.*:EngineExecutorTest.*:"
+        "LLMEngineConfigTest.*:LLMEngineConfigRecipesTest.*:"
+        "RegistryBuilderTest.*:AllKVDtypes/RegistryBuilderKVDtypeTest.*")
+    assert ci._TRT_UNIT_FILTER == expected_filter
+    assert "InitializeMRopeCosSin" not in ci._TRT_UNIT_FILTER
+    assert "Benchmark" not in ci._TRT_UNIT_FILTER
+    assert ci._TRT_UNIT_FILTER in command
+    assert "--gtest_fail_if_no_test_selected" in command
+    assert command.index(setup) < command.index("unitTest")
     for text in ("not found", "readlink -f", "libnvinfer", "libnvonnxparser",
-                 "unitTest", "llm_build", "llm_inference", "PIPESTATUS[0]"):
-        assert text in test.command
-    results = config.run_root / "results"
+                 "unitTest", "llm_build", "llm_inference", "PIPESTATUS[0]",
+                 "run_step", 'exit "$status"'):
+        assert text in command
+    results = config.runtime_root / "results"
     edge = config.runtime_root / "edgellm"
     for argument in (
             f"--onnxDir={config.model_dir}",
@@ -456,12 +609,120 @@ def test_worker_deploys_exact_build_result_then_tests_and_cleans(config):
             "--dumpProfile",
             f"test -s {results / 'llm-basic-output.json'}",
     ):
-        assert argument in test.command
-    assert "--help" not in test.command
-    assert test.artifact_log_file == str(config.run_root /
-                                         "artifacts/tests.log")
+        assert argument in command
+    assert "--help" not in command
+    assert containers.remove_calls == [(
+        containers.handle,
+        {
+            "force": True,
+            "exec_target": run_remote.target
+        },
+    )]
+    assert [spec.operation_name for _target, spec in commands.calls] == [
+        "run-host-prerequisites",
+        "detect-trt-prebuilt",
+    ]
     assert len(run_remote.filesystem.remove_calls) == 1
     assert run_remote.filesystem.remove_calls[0][1]["timeout_s"] == 1800
+
+
+@pytest.mark.parametrize(
+    ("unit_rc", "build_rc", "inference_rc", "write_output", "expected",
+     "steps"),
+    [
+        (7, 0, 0, True, 1, ["unit", "build", "inference"]),
+        (0, 9, 0, True, 1, ["unit", "build"]),
+        (0, 0, 11, True, 1, ["unit", "build", "inference"]),
+        (0, 0, 0, False, 1, ["unit", "build", "inference"]),
+        (0, 0, 0, True, 0, ["unit", "build", "inference"]),
+    ],
+)
+def test_generated_test_command_aggregates_step_status(config, tmp_path,
+                                                       unit_rc, build_rc,
+                                                       inference_rc,
+                                                       write_output, expected,
+                                                       steps):
+    workspace = tmp_path / "runtime"
+    edge = workspace / "edgellm"
+    candidate = workspace / "trt"
+    model_root = tmp_path / "onnx"
+    model = model_root / ci._MODEL_RELATIVE
+    marker = tmp_path / "steps.log"
+    fake_bin = tmp_path / "bin"
+
+    def executable(path, body):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/usr/bin/env bash\n" + body)
+        path.chmod(0o755)
+
+    for library in ("libnvinfer.so.10", "libnvonnxparser.so.10"):
+        path = candidate / library
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("fake")
+    model.mkdir(parents=True)
+    (edge / "tests/test_cases").mkdir(parents=True)
+    (edge / "tests/test_cases/llm_basic.json").write_text("{}")
+    setup = workspace / "setup_environment.sh"
+    setup.write_text(":\n")
+    executable(edge / "unitTest", """printf 'unit\n' >> "$FLOW_MARKER"
+exit "$UNIT_RC"
+""")
+    executable(edge / "libNvInfer_edgellm_plugin.so", "exit 0\n")
+    executable(
+        edge / "examples/llm/llm_build", """printf 'build\n' >> "$FLOW_MARKER"
+for argument in "$@"; do
+  case "$argument" in
+    --engineDir=*) mkdir -p "$(printf '%s' "$argument" | cut -d= -f2-)" ;;
+  esac
+done
+exit "$BUILD_RC"
+""")
+    executable(
+        edge / "examples/llm/llm_inference",
+        """printf 'inference\n' >> "$FLOW_MARKER"
+output=
+for argument in "$@"; do
+  case "$argument" in
+    --outputFile=*) output="$(printf '%s' "$argument" | cut -d= -f2-)" ;;
+  esac
+done
+if test "$WRITE_OUTPUT" = 1; then printf '{}\n' > "$output"; fi
+exit "$INFERENCE_RC"
+""")
+    executable(
+        fake_bin / "ldd",
+        """printf 'libnvinfer.so.10 => %s\nlibnvonnxparser.so.10 => %s\n' \
+  "$FAKE_TRT/libnvinfer.so.10" "$FAKE_TRT/libnvonnxparser.so.10"
+""")
+
+    test_config = dataclasses.replace(config,
+                                      onnx_root=PurePosixPath(str(model_root)))
+    worker = ci.BuildWorker(test_config, None, FakeLogger())
+    worker.deployment = SimpleNamespace(
+        remote_workspace=str(workspace),
+        env_script_path=str(setup),
+    )
+    env = os.environ.copy()
+    env.update({
+        "BUILD_RC": str(build_rc),
+        "FAKE_TRT": str(candidate),
+        "FLOW_MARKER": str(marker),
+        "INFERENCE_RC": str(inference_rc),
+        "PATH": f"{fake_bin}:{env['PATH']}",
+        "UNIT_RC": str(unit_rc),
+        "WRITE_OUTPUT": "1" if write_output else "0",
+    })
+
+    result = subprocess.run(
+        ["bash", "-c", worker._test_command()],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False)
+
+    assert result.returncode == expected, result.stdout + result.stderr
+    assert marker.read_text().splitlines() == steps
 
 
 @pytest.mark.parametrize(
@@ -521,8 +782,14 @@ def test_controller_preserves_workspace_and_failure_status(
         ("trt", 29, False),
         ("build", 1, False),
         ("deploy", 1, False),
-        ("test", 41, False),
-        ("test-timeout", 124, False),
+        ("container-resolve", 1, False),
+        ("container-launch", 1, False),
+        ("container-invalid", 1, False),
+        ("container-validation-error", 1, False),
+        ("test", 1, False),
+        ("test-error", 1, False),
+        ("remove", 1, False),
+        ("remove-error", 1, False),
         ("success", 0, True),
     ],
 )
@@ -540,18 +807,39 @@ def test_worker_preserves_status_and_cleans_only_success(
                                       error_messages=["build failed"])
     elif failure == "deploy":
         code.deploy_error = RuntimeError("deploy failed")
+    elif failure == "container-resolve":
+        code.container_manager.resolve_error = RuntimeError("resolve failed")
+    elif failure == "container-launch":
+        code.container_manager.launch_error = RuntimeError("launch failed")
+    elif failure == "container-invalid":
+        code.container_manager.validation = ValidationResult(
+            ok=False, errors=["missing runtime"])
+    elif failure == "container-validation-error":
+        code.container_manager.validation_error = RuntimeError(
+            "validation failed")
     elif failure == "test":
-        commands.outcomes["run-compatibility-subset"] = _result(False, 41)
-    elif failure == "test-timeout":
-        commands.outcomes["run-compatibility-subset"] = _result(
-            False, None, True)
+        code.container_manager.exec_ok = False
+    elif failure == "test-error":
+        code.container_manager.exec_error = TimeoutError("test timed out")
+    elif failure == "remove":
+        code.container_manager.remove_ok = False
+    elif failure == "remove-error":
+        code.container_manager.remove_error = RuntimeError("remove failed")
 
     status = ci.BuildWorker(config, services, FakeLogger()).run()
 
     assert status == expected
     assert len(run_remote.filesystem.remove_calls) == (1 if cleanup else 0)
-    if failure in {"test", "test-timeout", "success"}:
+    if failure in {
+            "container-resolve", "container-launch", "container-invalid",
+            "container-validation-error", "test", "test-error", "remove",
+            "remove-error", "success"
+    }:
         assert code.deploy_calls[0][0] is code.build_result
+    assert len(code.container_manager.remove_calls) == (1 if failure in {
+        "container-invalid", "container-validation-error", "test",
+        "test-error", "remove", "remove-error", "success"
+    } else 0)
 
 
 def test_worker_main_returns_one_when_ssh_resolution_fails(

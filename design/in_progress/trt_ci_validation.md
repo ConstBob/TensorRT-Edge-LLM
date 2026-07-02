@@ -35,7 +35,7 @@ the build host.
 
 - `CommandManager`: every local, build-host, and run-host command.
 - `RemoteConnectionManager`: source upload and both SSH connections.
-- `ContainerManager`: Edge-LLM build container lifecycle.
+- `ContainerManager`: Edge-LLM build and run-host test container lifecycles.
 - `CodeManager`: TRT PRE_BUILT binding, Edge-LLM source build, artifact
   planning, and direct runtime deployment.
 
@@ -53,9 +53,13 @@ controller
        -> detect package or built-source TRT PRE_BUILT layout
        -> CodeManager plan_and_execute(TRT PRE_BUILT, Edge-LLM BUILD)
        -> CodeManager deploy_runtime(actual RunResult, x86 run host)
-       -> unitTest
-       -> Qwen2.5-0.5B FP16 llm_build
-       -> llm_inference with llm_basic.json
+       -> resolve the normalized Edge-LLM CUDA profile
+       -> launch the profile on the run host
+            -> source CodeManager setup_environment.sh
+            -> focused TRT-facing unitTest subset
+            -> Qwen2.5-0.5B FP16 llm_build
+            -> llm_inference with llm_basic.json
+       -> remove the test container
 ```
 
 Edge-LLM is built in-source at
@@ -64,15 +68,16 @@ runtime root. This preserves source-relative test resources without separate
 resource copies.
 
 The fixed E2E expects the exported ONNX tree under
-`/home/edge_llm_cache/trt-ci/onnx`; `TRT_CI_ONNX_DIR` is an optional
-controller-side override. The public CLI remains four positional arguments.
+`/home/edge_llm_cache/trt-ci/onnx` at the same absolute path on both hosts;
+`TRT_CI_ONNX_DIR` is an optional controller-side override. The public CLI
+remains four positional arguments.
 
 ## Failure and cleanup
 
-Remote command and test exit statuses are preserved; CodeManager failures
-return nonzero. Failed workspaces remain for debugging. Successful remote
-workspaces are removed best-effort. Controller logs and streamed worker output
-remain under `artifacts/trt-ci/run-<id>`.
+CodeManager and containerized-test failures return nonzero. The test container
+is always removed, while failed workspaces remain for debugging. Successful
+remote workspaces are removed best-effort. Controller logs and streamed worker
+output remain under `artifacts/trt-ci/run-<id>`.
 
 ## Focused tests
 
@@ -83,6 +88,7 @@ Fake public toolkit services cover:
 - package and built-source PRE_BUILT target construction;
 - controller source upload and hidden-worker invocation;
 - identity-preserving `plan_and_execute` to `deploy_runtime`;
-- unit, engine-build, and inference command construction;
+- normalized Edge-LLM profile resolution and run-host container lifecycle;
+- setup-environment, unit, engine-build, and inference command construction;
 - run-host status and cleanup behavior; and
 - structural absence of runtime/resource/result copy logic.
