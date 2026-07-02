@@ -15,8 +15,8 @@
 """
 Qwen3-Omni-30B-A3B Thinker MoE backbone.
 
-Mirrors :class:`Qwen3OmniLanguageModel` (dense Qwen3-Omni Thinker) but on
-top of the MoE :class:`Qwen3MoeCausalLM`.  The TTS pipeline feeds the
+Mirrors :class:`Qwen3OmniLanguageModel` behavior on top of the MoE
+:class:`Qwen3MoeCausalLM`.  The TTS pipeline feeds the
 Thinker's full-sequence last-layer pre-norm hidden states into the
 Talker's input projection, so the export enables the extra
 ``hidden_states`` ONNX output via ``emit_hidden_states``.

@@ -508,6 +508,18 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
         }
     }
 
+    // --- EOS token IDs (optional array) ---
+    if (configJson.contains("eos_token_id") && configJson["eos_token_id"].is_array())
+    {
+        for (auto const& id : configJson["eos_token_id"])
+        {
+            if (id.is_number_integer())
+            {
+                cfg.eosTokenIds.push_back(id.get<int32_t>());
+            }
+        }
+    }
+
     LOG_INFO("%s", formatEngineConfig(cfg).c_str());
     return cfg;
 }
@@ -628,6 +640,17 @@ std::string formatEngineConfig(LLMEngineConfig const& cfg)
     {
         ss << " dflashBlockSize=" << cfg.dflashBlockSize << " dflashMaskTokenId=" << cfg.dflashMaskTokenId
            << " dflashTargetLayerIds=" << cfg.dflashTargetLayerIds.size();
+    }
+    if (!cfg.eosTokenIds.empty())
+    {
+        ss << " eosTokenIds=[";
+        for (size_t i = 0; i < cfg.eosTokenIds.size(); ++i)
+        {
+            if (i > 0)
+                ss << ",";
+            ss << cfg.eosTokenIds[i];
+        }
+        ss << "]";
     }
     ss << " }";
     return ss.str();

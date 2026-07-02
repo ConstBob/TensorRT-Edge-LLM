@@ -19,7 +19,7 @@ The model class names were checked against the installed `transformers==5.9.0` p
 - For INT4 engine builds on Jetson Orin devices with less system memory, such as Jetson Orin Nano, pass `--externalize-weights int4_ffn` for dense checkpoints or `--externalize-weights int4_ffn int4_moe` for MoE checkpoints to reduce engine build memory.
 - For FP16/BF16 source checkpoints, use the [Quantization](../features/quantization.md) script to create a unified quantized checkpoint for `tensorrt_edgellm`, then export the generated checkpoint.
 - FP8 KV cache is detected automatically from checkpoint metadata by `tensorrt_edgellm`.
-- `tensorrt-edgellm-export` exports visual encoders. Use `tensorrt-edgellm-quantize --visual_quantization fp8` before export when FP8 visual weights are required.
+- `tensorrt-edgellm-export` exports visual encoders. Use `tensorrt-edgellm-quantize llm --visual_quantization fp8` before export when FP8 visual weights are required.
 - MXFP8 and FP4/NVFP4 require Blackwell-class hardware for runtime execution.
 
 ## Support Matrix
@@ -32,6 +32,7 @@ The model class names were checked against the installed `transformers==5.9.0` p
 | Qwen2/Qwen2.5 dense | [`Qwen2ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2/modeling_qwen2.py) | `qwen2` -> default `CausalLM` | Dense precision set |
 | Qwen3 dense | [`Qwen3ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3/modeling_qwen3.py) | `qwen3` -> default `CausalLM` | Dense precision set |
 | Qwen3.5/3.6 text | [`Qwen3_5ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5/modeling_qwen3_5.py) | `qwen3_5_text` -> `Qwen3_5CausalLM` | Dense precision set |
+| Gemma4 E2B/E4B text | [`Gemma4ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma4/modeling_gemma4.py) | `gemma4` / `gemma4_text` -> text decoder with PLE and dual-RoPE support | BF16/FP16 source checkpoints; no image/audio/video/MTP |
 | Nemotron Nano dense | [`NemotronHForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/nemotron_h/modeling_nemotron_h.py) | `nemotron_h` -> `NemotronHCausalLM` | BF16, FP8, NVFP4 |
 
 <details>
@@ -194,15 +195,8 @@ The model class names were checked against the installed `transformers==5.9.0` p
 | Nemotron3-MoE | [`NemotronHForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/nemotron_h/modeling_nemotron_h.py) | `nemotron_h` -> `NemotronHCausalLM` | NVFP4 only |
 | Nemotron3 Super 120B-A12B | [`NemotronHForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/nemotron_h/modeling_nemotron_h.py) | `nemotron_h` -> `NemotronHCausalLM` with latent MoE routed path | NVFP4 only |
 
-NVFP4 MoE exports always emit the unified `Nvfp4MoePlugin`, which dispatches
-the SM110 split FC1/FC2 backend on Thor and the SM120/SM121 fused decode +
-prefill backend on consumer Blackwell:
-
-```bash
-tensorrt-edgellm-export \
-    /path/to/Qwen3-MoE-NVFP4 \
-    /tmp/qwen3_moe_onnx
-```
+NVFP4 MoE export picks the plugin and FC1 weight layout from
+`EDGELLM_NVFP4_MOE_TARGET`; see [MoE Example](../examples/moe.md).
 
 <details>
 <summary><b>Qwen3-MoE</b> checkpoints</summary>
@@ -216,6 +210,7 @@ tensorrt-edgellm-export \
 <summary><b>Qwen3.5/3.6-MoE</b> checkpoints</summary>
 
 - [Qwen/Qwen3.5-35B-A3B-GPTQ-Int4](https://huggingface.co/Qwen/Qwen3.5-35B-A3B-GPTQ-Int4)
+- [nvidia/Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4)
 
 </details>
 
@@ -338,7 +333,7 @@ Qwen3.5 and Qwen3.6 checkpoints are unified text+VLM models. The same checkpoint
 
 | Model Series | Transformers Class | `tensorrt_edgellm` Handling | Supported Precisions |
 |--------------|--------------------|-----------------------|----------------------|
-| Qwen3-ASR | Checkpoint architecture `Qwen3ASRForConditionalGeneration`; text backbone compatible with [`Qwen3ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3/modeling_qwen3.py) | `Qwen3ASRLanguageModel` + `QwenAudioEncoder` | FP16 |
+| Qwen3-ASR | Checkpoint architecture `Qwen3ASRForConditionalGeneration`; text backbone compatible with [`Qwen3ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3/modeling_qwen3.py) | `Qwen3ASRLanguageModel` + `QwenAudioEncoder` | FP16; FP8 LLM (optional FP8 audio); NVFP4 LLM (optional FP8 audio; see [ASR example](../examples/asr.md)) |
 
 <details>
 <summary><b>Qwen3-ASR</b> checkpoints</summary>
@@ -370,6 +365,7 @@ Qwen3.5 and Qwen3.6 checkpoints are unified text+VLM models. The same checkpoint
 
 | Model Series | Transformers Class | `tensorrt_edgellm` Handling | Supported Precisions |
 |--------------|--------------------|-----------------------|----------------------|
+| Qwen3-Omni | [`Qwen3OmniMoeForConditionalGeneration`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_omni_moe/modeling_qwen3_omni_moe.py) | `Qwen3OmniMoeThinkerCausalLM` + `Qwen3OmniMoeTalkerCausalLM` + visual/audio/Code2Wav | NVFP4 only |
 | [Nemotron-Omni](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4/blob/main/modeling.py) | Checkpoint architecture `NemotronH_Nano_Omni_Reasoning_V3`; LLM is Nemotron-H compatible with [`NemotronHForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/nemotron_h/modeling_nemotron_h.py) | `NemotronHCausalLM` + `NemotronOmniVisualModel` + `NemotronOmniAudioModel` | NVFP4 only |
 
 <details>
@@ -381,7 +377,7 @@ Qwen3.5 and Qwen3.6 checkpoints are unified text+VLM models. The same checkpoint
 
 ---
 
-Qwen3-ASR and Qwen3-TTS use checkpoint architecture names that are not present in the installed `transformers==5.3.0` package, so TensorRT Edge-LLM handles their speech/audio/talker/Code2Wav components with local model implementations. Qwen3-TTS support is limited to the CustomVoice checkpoints listed above.
+Qwen3-ASR and Qwen3-TTS use checkpoint architecture names that are not present in the installed `transformers==5.9.0` package, so TensorRT Edge-LLM handles their speech/audio/talker/Code2Wav components with local model implementations. Qwen3-TTS support is limited to the CustomVoice checkpoints listed above.
 
 ## EAGLE3 Draft Models
 

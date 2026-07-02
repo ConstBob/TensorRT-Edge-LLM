@@ -2804,6 +2804,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         m: cutlass.Int64,
         n: cutlass.Int64,
         k: cutlass.Int64,
+        l: cutlass.Int64,
         num_tokens: cutlass.Int64,
         top_k: cutlass.Int64,
         tile_size: cutlass.Constexpr,
@@ -2812,13 +2813,18 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
-        """Unified wrapper supporting both single-B and multi-B tensors.
+        """Grouped-GEMM wrapper for the NVFP4 MoE FC2 path.
 
-        B tensors are always passed as tuples (length 1 for single-B).
-        L sizes are configured via b_tensor_l_sizes in __init__.
+        B tensors are passed as a tuple (length 1; MoE uses a single expert
+        weight tensor). The L extent (number of experts) is the runtime ``l``
+        argument, so one compiled kernel serves any expert count -- ``l_0`` and
+        ``total_l`` are always ``l``.
         """
         scale_k = k // scaling_vector_size
         num_tiles = m // tile_size
+
+        total_l = l
+        l_0 = l
 
         a = cute.make_tensor(a_ptr, layout=cute.make_ordered_layout((m, k, 1), order=(1, 0, 2)))
         a_sf = cute.make_tensor(
@@ -2831,7 +2837,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             c_ptr, layout=cute.make_ordered_layout((num_tokens, n, 1), order=(1, 0, 2))
         )
 
-        l_0 = self.b_tensor_l_sizes[0]
+        # B / alpha tensors for the single expert weight tensor (l_0 == l).
         alpha_0 = cute.make_tensor(alpha_ptr_tuple[0], layout=cute.make_layout((l_0,)))
         b_0 = cute.make_tensor(
             b_ptr_tuple[0], layout=cute.make_ordered_layout((n, k, l_0), order=(1, 0, 2))
@@ -2912,7 +2918,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         )
         down_input_scale = cute.make_tensor(
             down_input_scale_ptr,
-            layout=cute.make_layout((self.b_tensor_l_offsets[self.num_b_tensors],)),
+            layout=cute.make_layout((total_l,)),
         )
 
         return self(

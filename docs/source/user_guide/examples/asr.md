@@ -122,7 +122,7 @@ Qwen3-ASR-0.6B; 1.7B is noted where it diverges.
 | NVFP4 | FP16 | ✅ | ✅ |
 | NVFP4 | FP8 | ❌ Empty output (combined quant noise exceeds the first-token EOS-vs-correct logit margin on 0.6B) | ✅ (1.7B tolerates the combined noise) |
 
-> **Mixed-precision rules** (`tensorrt_edgellm/quantization/cli.py`):
+> **Mixed-precision rules** (`tensorrt_edgellm/scripts/quantize.py`):
 > - `--quantization` quantizes the LLM backbone only.
 > - `--audio_quantization fp8` opts the audio tower in. **Omit it to
 >   keep the audio tower at FP16** regardless of `--quantization` --

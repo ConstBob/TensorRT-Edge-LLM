@@ -669,6 +669,22 @@ def write_runtime_artifacts(model: "CausalLM",
                 root_cfg = json.load(_f)
             if root_cfg.get("vision_config"):
                 cfg_json["vision_config"] = root_cfg["vision_config"]
+            # Propagate eos_token_id so the C++ runtime can stop on any EOS
+            # token (e.g. Gemma4 uses [1, 106]).  Check config.json first,
+            # then fall back to generation_config.json (some models only set
+            # eos_token_id there).
+            eos = root_cfg.get("eos_token_id")
+            if eos is None:
+                gen_cfg_path = os.path.join(model_dir,
+                                            "generation_config.json")
+                if os.path.exists(gen_cfg_path):
+                    with open(gen_cfg_path) as _gf:
+                        gen_cfg = json.load(_gf)
+                    eos = gen_cfg.get("eos_token_id")
+            if isinstance(eos, list):
+                cfg_json["eos_token_id"] = [int(x) for x in eos]
+            elif isinstance(eos, int):
+                cfg_json["eos_token_id"] = [eos]
 
     cfg_path = os.path.join(out_dir, config_filename)
     with open(cfg_path, "w") as f:

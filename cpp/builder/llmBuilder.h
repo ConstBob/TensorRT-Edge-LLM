@@ -340,16 +340,17 @@ private:
     bool copyExternalWeightFiles();
 
     // Model dimensions extracted from config.json
-    int64_t mHiddenSize{0};                 //!< Hidden size of the model
-    int64_t mNumKVHeads{0};                 //!< Number of key-value heads
-    int64_t mHeadSize{0};                   //!< Size of each attention head
-    int64_t mRotaryDim{0};                  //!< Dimension for rotary position embeddings
-    int64_t mSlidingRotaryDim{0};           //!< Dimension for sliding-attention rotary embeddings
-    int64_t mFullRotaryDim{0};              //!< Dimension for full-attention rotary embeddings
-    int32_t mNbKVCacheInputs{0};            //!< Number of KV cache inputs (layers)
-    std::vector<int64_t> mPerLayerHeadSize; //!< Per-layer head size (for heterogeneous models like Gemma4)
-    int32_t mTargetModelOutputHiddenDim{0}; //!< Target output hidden dimension
-    int32_t mNumDeepstackFeatures{0};       //!< Number of deepstack features (for Qwen3VL)
+    int64_t mHiddenSize{0};                   //!< Hidden size of the model
+    int64_t mNumKVHeads{0};                   //!< Number of key-value heads
+    int64_t mHeadSize{0};                     //!< Size of each attention head
+    int64_t mRotaryDim{0};                    //!< Dimension for rotary position embeddings
+    int64_t mSlidingRotaryDim{0};             //!< Dimension for sliding-attention rotary embeddings
+    int64_t mFullRotaryDim{0};                //!< Dimension for full-attention rotary embeddings
+    int32_t mNbKVCacheInputs{0};              //!< Number of KV cache inputs (layers)
+    std::vector<int64_t> mPerLayerHeadSize;   //!< Per-layer head size (for heterogeneous models like Gemma4)
+    std::vector<int64_t> mPerLayerNumKVHeads; //!< Per-layer KV head count (for heterogeneous models like Gemma4)
+    int32_t mTargetModelOutputHiddenDim{0};   //!< Target output hidden dimension
+    int32_t mNumDeepstackFeatures{0};         //!< Number of deepstack features (for Qwen3VL)
     // TODO: Use better mechanism to organize model configuration.
     int32_t mNumLinearAttnLayers{0};    //!< Number of recurrent layers (Mamba/GDN/linear-attention)
     int32_t mRecurrentStateNumHeads{0}; //!< Number of recurrent state heads

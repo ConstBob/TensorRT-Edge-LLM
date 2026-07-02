@@ -88,11 +88,11 @@ bool checkVersion(std::string const& modelVersion) noexcept
             return false;
         }
 
-        // Reject versions < 0.5.0
-        if (major == 0 && minor <= 4)
+        // Reject versions < 0.8.0
+        if (major == 0 && minor < 8)
         {
             LOG_ERROR(
-                "ONNX model version %s is no longer supported. Minimum supported version is 0.5.0 "
+                "ONNX model version %s is no longer supported. Minimum supported version is 0.8.0 "
                 "Please re-export your model with the latest tensorrt-edgellm.",
                 modelVersion.c_str());
             return false;

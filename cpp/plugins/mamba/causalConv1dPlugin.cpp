@@ -271,10 +271,13 @@ size_t CausalConv1dPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* /* in
 
 int32_t CausalConv1dPlugin::getAliasedInput(int32_t outputIndex) noexcept
 {
-    if (outputIndex == kOUT_CONV_STATE_IDX)
-    {
-        return kIN_CONV_STATE_IDX;
-    }
+    // WAR: this is not the correct plugin API usage. The
+    // plugin updates the conv state in place, so the correct return is the
+    // conv-state input index. We return -1 to drop the alias because declaring it
+    // makes Myelin keep a redundant per-layer state copy (the perf regression).
+    // In-place read-write still works because the runtime binds the past and
+    // present conv state to the same buffer. TODO: restore the alias declaration
+    // once the Myelin issue is fixed.
     return -1;
 }
 

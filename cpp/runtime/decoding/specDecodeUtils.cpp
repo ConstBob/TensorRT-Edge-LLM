@@ -74,6 +74,10 @@ void appendAcceptedTokens(DecodingInferenceContext& context, Tensor& hostAcceptL
             int32_t const token = hostAcceptedTokenIdsData[batchIdx * maxAcceptDepth + i];
             context.tokenIds[batchIdx].push_back(token);
             context.currentGenerateLengths[batchIdx]++;
+            // Only break on the primary EOS token. Secondary EOS tokens (e.g.
+            // <turn|> for Gemma4) may appear mid-thinking and should not truncate
+            // speculative acceptance. updateFinishStates handles secondary EOS
+            // termination with access to per-slot thinkingDone state.
             if (token == tokenizer.getEosId())
             {
                 break;

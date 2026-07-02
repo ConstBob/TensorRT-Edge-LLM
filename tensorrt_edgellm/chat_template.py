@@ -54,6 +54,10 @@ _HARDCODED_TEMPLATE_MAP: Dict[str, str] = {
     "qwen3_omni_talker": "qwen3_omni.json",
     "qwen3_omni_moe_text": "qwen3_omni.json",
     "qwen3_omni_moe_talker": "qwen3_omni.json",
+    # Gemma4 uses <bos><|turn>system/user/model tokens; Jinja extraction
+    # fails when tokenizer.json is absent from standalone checkpoints.
+    "gemma4_text": "gemma4.json",
+    "gemma4": "gemma4.json",
 }
 
 

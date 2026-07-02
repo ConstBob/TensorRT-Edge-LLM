@@ -96,19 +96,6 @@ tensorrt-edgellm-export \
   --fp8-embedding
 ```
 
-NVFP4 MoE models (e.g. Qwen3-MoE, Nemotron3-MoE) always emit the unified
-`Nvfp4MoePlugin`. At runtime the plugin selects the SM110 split FC1/FC2
-backend on Thor and the SM120/SM121 fused decode + prefill backend on
-consumer Blackwell automatically:
-
-```bash
-tensorrt-edgellm-export \
-  /path/to/Qwen3-MoE-NVFP4 \
-  /tmp/qwen3_moe_onnx
-```
-
-Build engines and run inference with the normal C++ tools. See [Quick Start Guide](../getting_started/quick-start-guide.md).
-
 ## Supported Methods
 
 | Component | Methods |

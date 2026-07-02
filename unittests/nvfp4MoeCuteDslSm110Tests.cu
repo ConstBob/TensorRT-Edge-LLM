@@ -208,7 +208,9 @@ std::vector<float> dequantWeight(
 {
     int32_t const sfCols = cols / kSfVecSize;
     size_t const packedPerExpert = static_cast<size_t>(rows) * (cols / 2);
-    size_t const sfPerExpert = static_cast<size_t>(scaleShape(rows, cols).volume()) / kNumExperts;
+    // Per-expert SF byte count (expert-count independent): the volume for a
+    // single expert in the 6D layout.
+    size_t const sfPerExpert = static_cast<size_t>(scaleShape(rows, cols, /*experts=*/1).volume());
     uint8_t const* packed = qWeights + static_cast<size_t>(expert) * packedPerExpert;
     uint8_t const* sfBase = scale6d + static_cast<size_t>(expert) * sfPerExpert;
 
@@ -275,6 +277,7 @@ struct MoeCase
     int32_t hiddenSize;
     int32_t intermediateSize;
     int32_t activationType;
+    int32_t numExperts;
     uint64_t seed;
 };
 
@@ -301,6 +304,7 @@ CaseData buildCase(MoeCase const& cfg)
     CaseData c{};
     c.config = cfg;
     c.n1 = fc1InputN(cfg.intermediateSize, cfg.activationType);
+    int32_t const E = cfg.numExperts;
 
     std::mt19937 rng(cfg.seed);
 
@@ -319,7 +323,7 @@ CaseData buildCase(MoeCase const& cfg)
         // input_global_scale uses the python floor formula:
         // max(|hidden| / (448 * 6), 1e-12). Per-expert uniform (non_uniform=False).
         float const inputFloor = std::max(maxAbs / (448.0f * 6.0f), 1e-12f);
-        c.inputGlobalScale.assign(kNumExperts, inputFloor);
+        c.inputGlobalScale.assign(E, inputFloor);
     }
 
     // Routing: each token gets kTopK distinct experts (random permutation),
@@ -327,8 +331,8 @@ CaseData buildCase(MoeCase const& cfg)
     c.topkIds.resize(static_cast<size_t>(cfg.numTokens) * kTopK);
     c.topkWeights.resize(static_cast<size_t>(cfg.numTokens) * kTopK);
     {
-        std::vector<int32_t> pool(kNumExperts);
-        for (int32_t i = 0; i < kNumExperts; ++i)
+        std::vector<int32_t> pool(E);
+        for (int32_t i = 0; i < E; ++i)
         {
             pool[i] = i;
         }
@@ -352,17 +356,17 @@ CaseData buildCase(MoeCase const& cfg)
     }
 
     // Packed FP4 weights (random bytes covering all nibble combinations).
-    c.fc1QWeights = makeQWeights(rng, static_cast<size_t>(kNumExperts) * c.n1 * (cfg.hiddenSize / 2));
-    c.fc2QWeights = makeQWeights(rng, static_cast<size_t>(kNumExperts) * cfg.hiddenSize * (cfg.intermediateSize / 2));
+    c.fc1QWeights = makeQWeights(rng, static_cast<size_t>(E) * c.n1 * (cfg.hiddenSize / 2));
+    c.fc2QWeights = makeQWeights(rng, static_cast<size_t>(E) * cfg.hiddenSize * (cfg.intermediateSize / 2));
 
     // Uniform per-block FP8 SF tensor (single representative byte).
-    c.fc1Scale = makeScaleTensorUniform(c.n1, cfg.hiddenSize);
-    c.fc2Scale = makeScaleTensorUniform(cfg.hiddenSize, cfg.intermediateSize);
+    c.fc1Scale = makeScaleTensorUniform(c.n1, cfg.hiddenSize, E);
+    c.fc2Scale = makeScaleTensorUniform(cfg.hiddenSize, cfg.intermediateSize, E);
 
     // Per-expert weight alphas and FC2 activation scale (non_uniform=False).
-    c.fc1Alpha.assign(kNumExperts, 0.85f);
-    c.fc2Alpha.assign(kNumExperts, 0.75f);
-    c.downInputScale.assign(kNumExperts, 1.0e-4f);
+    c.fc1Alpha.assign(E, 0.85f);
+    c.fc2Alpha.assign(E, 0.75f);
+    c.downInputScale.assign(E, 1.0e-4f);
     return c;
 }
 
@@ -470,6 +474,7 @@ RunResult runCase(CaseData const& c)
     int32_t const H = c.config.hiddenSize;
     int32_t const I = c.config.intermediateSize;
     int32_t const n1 = c.n1;
+    int32_t const E = c.config.numExperts;
     int32_t const sfShapeOuterH = (n1 + kRowTile - 1) / kRowTile;
     int32_t const sfShapeOuterI = (H + kRowTile - 1) / kRowTile;
     (void) sfShapeOuterH;
@@ -479,11 +484,11 @@ RunResult runCase(CaseData const& c)
     rt::Tensor hidden({T, H}, DeviceType::kGPU, nvinfer1::DataType::kHALF);
     rt::Tensor topkIds({T, kTopK}, DeviceType::kGPU, nvinfer1::DataType::kINT32);
     rt::Tensor topkWeights({T, kTopK}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    rt::Tensor fc1Q({kNumExperts, n1, H / 2}, DeviceType::kGPU, nvinfer1::DataType::kINT8);
-    rt::Tensor fc2Q({kNumExperts, H, I / 2}, DeviceType::kGPU, nvinfer1::DataType::kINT8);
+    rt::Tensor fc1Q({E, n1, H / 2}, DeviceType::kGPU, nvinfer1::DataType::kINT8);
+    rt::Tensor fc2Q({E, H, I / 2}, DeviceType::kGPU, nvinfer1::DataType::kINT8);
 
-    auto const fc1ScaleShape = scaleShape(n1, H);
-    auto const fc2ScaleShape = scaleShape(H, I);
+    auto const fc1ScaleShape = scaleShape(n1, H, E);
+    auto const fc2ScaleShape = scaleShape(H, I, E);
     rt::Tensor fc1Scale({fc1ScaleShape.experts, fc1ScaleShape.mOuter, fc1ScaleShape.kOuter, fc1ScaleShape.inner0,
                             fc1ScaleShape.inner1, fc1ScaleShape.inner2},
         DeviceType::kGPU, nvinfer1::DataType::kINT8);
@@ -491,10 +496,10 @@ RunResult runCase(CaseData const& c)
                             fc2ScaleShape.inner1, fc2ScaleShape.inner2},
         DeviceType::kGPU, nvinfer1::DataType::kINT8);
 
-    rt::Tensor fc1Alpha({kNumExperts}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    rt::Tensor fc2Alpha({kNumExperts}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    rt::Tensor inputScale({kNumExperts}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    rt::Tensor downScale({kNumExperts}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor fc1Alpha({E}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor fc2Alpha({E}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor inputScale({E}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor downScale({E}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
     rt::Tensor output({T, H}, DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
     CUDA_CHECK(cudaMemcpy(
@@ -518,7 +523,7 @@ RunResult runCase(CaseData const& c)
     CUDA_CHECK(cudaMemset(output.rawPointer(), 0, static_cast<size_t>(T) * H * sizeof(__half)));
 
     // Allocate runner workspace.
-    size_t const workspaceBytes = CuteDslNvfp4MoeSm110Runner::getWorkspaceSize(T, T * kTopK, kNumExperts, kTopK, H, I);
+    size_t const workspaceBytes = CuteDslNvfp4MoeSm110Runner::getWorkspaceSize(T, T * kTopK, E, kTopK, H, I);
     EXPECT_GT(workspaceBytes, 0u);
     void* workspace = nullptr;
     CUDA_CHECK(cudaMalloc(&workspace, workspaceBytes));
@@ -526,7 +531,7 @@ RunResult runCase(CaseData const& c)
 
     CuteDslNvfp4MoeSm110Params params{};
     params.numTokens = T;
-    params.numExperts = kNumExperts;
+    params.numExperts = E;
     params.topK = kTopK;
     params.hiddenSize = H;
     params.moeInterSize = I;
@@ -625,17 +630,29 @@ bool checkRequirementsAndLoad()
 std::vector<MoeCase> defaultCases()
 {
     return {
-        {/*name=*/"decode_h1024_i768_t1_swiglu", /*numTokens=*/1, /*hiddenSize=*/1024,
-            /*intermediateSize=*/768, /*activationType=*/kActSwiGLU, /*seed=*/0xC0FFEEu},
-        {/*name=*/"prefill_h1024_i768_t8_swiglu", /*numTokens=*/8, /*hiddenSize=*/1024,
-            /*intermediateSize=*/768, /*activationType=*/kActSwiGLU, /*seed=*/0xDEADBEEFu},
+        {/*name=*/"decode_h1024_i768_t1_swiglu_e128", /*numTokens=*/1, /*hiddenSize=*/1024,
+            /*intermediateSize=*/768, /*activationType=*/kActSwiGLU, /*numExperts=*/128, /*seed=*/0xC0FFEEu},
+        {/*name=*/"prefill_h1024_i768_t8_swiglu_e128", /*numTokens=*/8, /*hiddenSize=*/1024,
+            /*intermediateSize=*/768, /*activationType=*/kActSwiGLU, /*numExperts=*/128, /*seed=*/0xDEADBEEFu},
         // ReLU2 path: fc1InputN = I (no doubling), reference uses square(max(x,0)).
         // Runner constraint moeInterSize % 64 == 0 and fc1InputN % kLevelTileN(128)
         // == 0 -> I=768 ok (768%128=0).
-        {/*name=*/"decode_h1024_i768_t1_relu2", /*numTokens=*/1, /*hiddenSize=*/1024,
-            /*intermediateSize=*/768, /*activationType=*/kActReLU2, /*seed=*/0xFEEDFACEu},
-        {/*name=*/"prefill_h1024_i768_t8_relu2", /*numTokens=*/8, /*hiddenSize=*/1024,
-            /*intermediateSize=*/768, /*activationType=*/kActReLU2, /*seed=*/0xBADCAFEu},
+        {/*name=*/"decode_h1024_i768_t1_relu2_e128", /*numTokens=*/1, /*hiddenSize=*/1024,
+            /*intermediateSize=*/768, /*activationType=*/kActReLU2, /*numExperts=*/128, /*seed=*/0xFEEDFACEu},
+        {/*name=*/"prefill_h1024_i768_t8_relu2_e128", /*numTokens=*/8, /*hiddenSize=*/1024,
+            /*intermediateSize=*/768, /*activationType=*/kActReLU2, /*numExperts=*/128, /*seed=*/0xBADCAFEu},
+        // E=256 coverage: the FC1/FC2 cubins are runtime-polymorphic in L, so the
+        // same kernels must handle 256 experts. Decode exercises the fused
+        // fp4BuildLayoutAndQuantizeRoutedLinearSFDecode path (kMaxDecodeExperts=256);
+        // prefill exercises the general buildLayoutGpu path.
+        {/*name=*/"decode_h1024_i768_t1_swiglu_e256", /*numTokens=*/1, /*hiddenSize=*/1024,
+            /*intermediateSize=*/768, /*activationType=*/kActSwiGLU, /*numExperts=*/256, /*seed=*/0x5EED256u},
+        {/*name=*/"decode_h1024_i768_t1_relu2_e256", /*numTokens=*/1, /*hiddenSize=*/1024,
+            /*intermediateSize=*/768, /*activationType=*/kActReLU2, /*numExperts=*/256, /*seed=*/0xDEC0DE2u},
+        {/*name=*/"prefill_h1024_i768_t8_swiglu_e256", /*numTokens=*/8, /*hiddenSize=*/1024,
+            /*intermediateSize=*/768, /*activationType=*/kActSwiGLU, /*numExperts=*/256, /*seed=*/0xA11CE256u},
+        {/*name=*/"prefill_h1024_i768_t8_relu2_e256", /*numTokens=*/8, /*hiddenSize=*/1024,
+            /*intermediateSize=*/768, /*activationType=*/kActReLU2, /*numExperts=*/256, /*seed=*/0xB0B256u},
     };
 }
 
@@ -645,12 +662,24 @@ TEST(CuteDslNvfp4MoeSm110Test, canImplementSupportedSms)
 {
     for (int32_t const sm : {100, 101, 110})
     {
-        EXPECT_TRUE(CuteDslNvfp4MoeSm110Runner::canImplement(
-            /*hiddenSize=*/1024, /*moeInterSize=*/768, kNumExperts, kTopK, sm, kActSwiGLU, kIoDtypeFp16, kBackendAuto))
-            << "sm=" << sm;
-        EXPECT_TRUE(CuteDslNvfp4MoeSm110Runner::canImplement(
-            /*hiddenSize=*/1024, /*moeInterSize=*/768, kNumExperts, kTopK, sm, kActReLU2, kIoDtypeFp16, kBackendAuto))
-            << "sm=" << sm;
+        // Both supported expert counts {128, 256} must pass on every supported SM.
+        for (int32_t const e : {128, 256})
+        {
+            EXPECT_TRUE(CuteDslNvfp4MoeSm110Runner::canImplement(
+                /*hiddenSize=*/1024, /*moeInterSize=*/768, e, kTopK, sm, kActSwiGLU, kIoDtypeFp16, kBackendAuto))
+                << "sm=" << sm << " e=" << e;
+            EXPECT_TRUE(CuteDslNvfp4MoeSm110Runner::canImplement(
+                /*hiddenSize=*/1024, /*moeInterSize=*/768, e, kTopK, sm, kActReLU2, kIoDtypeFp16, kBackendAuto))
+                << "sm=" << sm << " e=" << e;
+        }
+        // Expert counts outside the supported set are rejected (the cubin is
+        // runtime-polymorphic, but the product contract is exactly {128, 256}).
+        for (int32_t const e : {64, 192, 512})
+        {
+            EXPECT_FALSE(CuteDslNvfp4MoeSm110Runner::canImplement(
+                /*hiddenSize=*/1024, /*moeInterSize=*/768, e, kTopK, sm, kActSwiGLU, kIoDtypeFp16, kBackendAuto))
+                << "sm=" << sm << " e=" << e;
+        }
     }
 
     EXPECT_FALSE(CuteDslNvfp4MoeSm110Runner::canImplement(

@@ -531,13 +531,13 @@ def _export_llm(model_dir: str,
                  if model_type == "alpamayo_r1" else None)
 
     # ModelOpt-quantized Qwen3-MoE / Qwen3-Omni-MoE checkpoints store per-expert
-    # weights under ``mlp.experts.experts.{j}.`` (Qwen3-Omni Thinker / Talker,
-    # ``_PerExpertLinears`` wraps an inner ``self.experts`` ModuleList) or
-    # ``mlp.experts.{j}.`` (bare Qwen3 MoE). The model wraps the per-expert
-    # ModuleList behind a private ``_experts`` attribute, so a one-segment
-    # insertion is required for the load to find the buffers. Without this
-    # remap the loader silently skips every expert weight, producing a Thinker
-    # engine ~3 GB (attention + norms only) instead of the expected ~17 GB.
+    # weights under ``mlp.experts.{j}.`` (modelopt's fused-expert export, for
+    # both bare Qwen3-MoE and Qwen3-Omni Thinker / Talker). The model wraps the
+    # per-expert ModuleList behind a private ``_experts`` attribute, so a
+    # one-segment insertion is required for the load to find the buffers.
+    # Without this remap the loader silently skips every expert weight,
+    # producing a Thinker engine ~3 GB (attention + norms only) instead of the
+    # expected ~17 GB.
     if key_remap is None and model_type in ("qwen3_omni_moe_text",
                                             "qwen3_omni_moe_talker",
                                             "qwen3_omni_moe", "qwen3_moe"):

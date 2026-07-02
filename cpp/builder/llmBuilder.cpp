@@ -38,7 +38,7 @@ namespace trt_edgellm
 {
 namespace builder
 {
-#if NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 13
+#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 13)
 namespace
 {
 
@@ -66,7 +66,7 @@ std::string applyMyelinCompileWorkarounds(int32_t maxBatchSize)
 #if NV_TENSORRT_MAJOR == 10 && (NV_TENSORRT_MINOR == 13 || NV_TENSORRT_MINOR == 14)
     appendLunowudFlag(lunowudFlags, "-peep:match_dual_gemm=off");
 #endif
-#if NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 15
+#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 15)
     appendLunowudFlag(lunowudFlags, "-mlir:autotune:num_threads=1");
     appendLunowudFlag(lunowudFlags, "-mlir:collective:fp4=off");
     appendLunowudFlag(lunowudFlags, "-cask_fusion:async_policy=1");
@@ -146,7 +146,7 @@ bool LLMBuilder::build()
     std::string trtVersion = std::to_string(NV_TENSORRT_MAJOR) + "." + std::to_string(NV_TENSORRT_MINOR) + "."
         + std::to_string(NV_TENSORRT_PATCH);
     LOG_INFO("Using TRT_VERSION=%s", trtVersion.c_str());
-#if NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 13
+#if NV_TENSORRT_MAJOR >= 11 || NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 13
     std::string const lunowudFlags = applyMyelinCompileWorkarounds(mBuilderConfig.maxBatchSize);
     if (!lunowudFlags.empty())
     {
@@ -440,6 +440,9 @@ bool LLMBuilder::parseConfig()
             int64_t layerHeadDim
                 = (lc.is_null() || !lc.contains("head_dim")) ? mHeadSize : lc["head_dim"].get<int64_t>();
             mPerLayerHeadSize.push_back(layerHeadDim);
+            int64_t layerNumKVHeads
+                = (lc.is_null() || !lc.contains("num_kv_heads")) ? mNumKVHeads : lc["num_kv_heads"].get<int64_t>();
+            mPerLayerNumKVHeads.push_back(layerNumKVHeads);
         }
         LOG_INFO("Heterogeneous head sizes from kv_layer_configs: %d layers", mNbKVCacheInputs);
     }
@@ -739,16 +742,22 @@ bool LLMBuilder::setupDFlashDraftProfiles(
         // KV cache per-layer: [batch, 2, numKVHeads, kv_capacity, headDim]
         for (int32_t i = 0; i < mNbKVCacheInputs; ++i)
         {
+            int64_t layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
+            int64_t layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
             std::string pastName = std::string(binding_names::kPastKeyValuesTemplate) + "_" + std::to_string(i);
             std::string presentName = std::string(binding_names::kPresentKeyValuesTemplate) + "_" + std::to_string(i);
-            ok &= setOptimizationProfile(&profile, pastName.c_str(), createDims({1, 2, mNumKVHeads, 1, mHeadSize}),
-                createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize}),
-                createDims(
-                    {mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize}));
-            ok &= setOptimizationProfile(&profile, presentName.c_str(), createDims({1, 2, mNumKVHeads, 1, mHeadSize}),
-                createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize}),
-                createDims(
-                    {mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize}));
+            ok &= setOptimizationProfile(&profile, pastName.c_str(),
+                createDims({1, 2, layerNumKVHeads, 1, layerHeadSize}),
+                createDims({mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity,
+                    layerHeadSize}),
+                createDims({mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity,
+                    layerHeadSize}));
+            ok &= setOptimizationProfile(&profile, presentName.c_str(),
+                createDims({1, 2, layerNumKVHeads, 1, layerHeadSize}),
+                createDims({mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity,
+                    layerHeadSize}),
+                createDims({mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity,
+                    layerHeadSize}));
         }
         return ok;
     };
@@ -1215,10 +1224,8 @@ bool LLMBuilder::copyConfig()
         for (int i = 0; i < mNbKVCacheInputs; ++i)
         {
             normalizedLayerTypes.push_back("attention");
-            // NOTE: num_kv_heads is uniform for all current models (E2B/E4B both use 2 for all
-            // layer types). If a future model has different KV head counts per layer type,
-            // add a mPerLayerNumKVHeads vector analogous to mPerLayerHeadSize.
-            kvLayerConfigs.push_back(Json{{"num_kv_heads", mNumKVHeads}, {"head_dim", mPerLayerHeadSize[i]}});
+            int64_t layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
+            kvLayerConfigs.push_back(Json{{"num_kv_heads", layerNumKVHeads}, {"head_dim", mPerLayerHeadSize[i]}});
         }
         // Hybrid models also have recurrent (mamba) layers that need routing entries.
         for (int i = 0; i < mNumLinearAttnLayers; ++i)

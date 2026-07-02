@@ -183,6 +183,8 @@ void TokenEncoder::bytePairEncode(std::string const& piece, std::vector<Rank>& o
     }
 
     // Initialize parts vector with (start_position, rank) pairs
+    // "rank" here is used as merge priority — either vocab rank (tiktoken-style)
+    // or explicit merge priority from the merges list (SentencePiece-style).
     std::vector<std::pair<int, Rank>> parts;
     parts.reserve(piece.size() + 1);
 
@@ -190,40 +192,99 @@ void TokenEncoder::bytePairEncode(std::string const& piece, std::vector<Rank>& o
     auto const MAX_RANK = std::numeric_limits<Rank>::max();
     std::pair<int, Rank> minRank{MAX_INT, MAX_RANK};
 
-    // Initialize with bigram ranks
-    for (size_t i = 0; i < piece.size() - 1; ++i)
-    {
-        Rank rank = MAX_RANK;
-        std::string bigram(piece.begin() + i, piece.begin() + i + 2);
-
-        auto bigramIt = mEncoder.find(bigram);
-        if (bigramIt != mEncoder.end())
+    // Helper: get the merge priority for a pair of adjacent substrings.
+    // When mUseMergePriorities is true, look up using null-byte separated key (left + '\0' + right)
+    // to avoid ambiguity when different (left, right) splits produce the same concatenation.
+    // Otherwise fall back to vocabulary rank lookup on the concatenated string (tiktoken-style).
+    auto getPairPriority = [&](std::string const& left, std::string const& right) -> Rank {
+        if (mUseMergePriorities)
         {
-            rank = bigramIt->second;
+            std::string key = left;
+            key += '\0';
+            key += right;
+            auto mergeIt = mMergePriorities.find(key);
+            return (mergeIt != mMergePriorities.end()) ? mergeIt->second : MAX_RANK;
         }
+        else
+        {
+            std::string merged = left + right;
+            auto vocabIt = mEncoder.find(merged);
+            return (vocabIt != mEncoder.end()) ? vocabIt->second : MAX_RANK;
+        }
+    };
+
+    // Build character boundary positions.
+    // For tiktoken-style (byte-level BPE), each byte is a unit.
+    // For SentencePiece-style (merge priorities), each UTF-8 character is a unit.
+    std::vector<int> charPositions;
+    if (mUseMergePriorities)
+    {
+        // Split at UTF-8 character boundaries
+        for (size_t pos = 0; pos < piece.size();)
+        {
+            charPositions.push_back(static_cast<int>(pos));
+            unsigned char c = static_cast<unsigned char>(piece[pos]);
+            if (c < 0x80)
+                pos += 1;
+            else if ((c & 0xE0) == 0xC0)
+                pos += 2;
+            else if ((c & 0xF0) == 0xE0)
+                pos += 3;
+            else
+                pos += 4;
+        }
+        charPositions.push_back(static_cast<int>(piece.size()));
+    }
+    else
+    {
+        // Byte-level: each byte is a unit
+        for (size_t i = 0; i <= piece.size(); ++i)
+        {
+            charPositions.push_back(static_cast<int>(i));
+        }
+    }
+
+    // Initialize with bigram priorities (pairs of adjacent characters/bytes)
+    size_t numChars = charPositions.size() - 1; // number of initial units
+    if (numChars <= 1)
+    {
+        // Single character or empty piece: no merges possible, push raw token lookup.
+        auto it = mEncoder.find(piece);
+        if (it != mEncoder.end())
+        {
+            output.push_back(it->second);
+        }
+        return;
+    }
+    for (size_t i = 0; i < numChars - 1; ++i)
+    {
+        std::string left(piece.begin() + charPositions[i], piece.begin() + charPositions[i + 1]);
+        std::string right(piece.begin() + charPositions[i + 1], piece.begin() + charPositions[i + 2]);
+        Rank rank = getPairPriority(left, right);
 
         if (rank < minRank.second)
         {
             minRank = std::make_pair(static_cast<int>(i), rank);
         }
 
-        parts.emplace_back(static_cast<int>(i), rank);
+        parts.emplace_back(charPositions[i], rank);
     }
 
     // Add sentinel values
-    parts.emplace_back(static_cast<int>(piece.size() - 1), MAX_RANK);
-    parts.emplace_back(static_cast<int>(piece.size()), MAX_RANK);
+    parts.emplace_back(charPositions[numChars - 1], MAX_RANK);
+    parts.emplace_back(charPositions[numChars], MAX_RANK);
 
-    // Helper function to get merged rank
+    // Helper function to get merged rank for position i (merging parts[i]..parts[i+2] into one,
+    // then checking the priority of the new pair: (merged, parts[i+2]..parts[i+3]))
     auto getMergedRank = [&](size_t i) -> Rank {
         if (i + 3 >= parts.size())
         {
             return MAX_RANK;
         }
 
-        std::string merged(piece.begin() + parts[i].first, piece.begin() + parts[i + 3].first);
-        auto mergedIt = mEncoder.find(merged);
-        return (mergedIt != mEncoder.end()) ? mergedIt->second : MAX_RANK;
+        std::string left(piece.begin() + parts[i].first, piece.begin() + parts[i + 2].first);
+        std::string right(piece.begin() + parts[i + 2].first, piece.begin() + parts[i + 3].first);
+        return getPairPriority(left, right);
     };
 
     // Main BPE loop

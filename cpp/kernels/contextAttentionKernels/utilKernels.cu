@@ -104,16 +104,17 @@ void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor con
 }
 
 // ===== kernel: produce separate K [B, S, H, D] and V [B, S, H, D] =====
-//! Splits the interleaved [B, 2, H, S, D] KV cache into two independent tensors.
-//! Splits the [B, 2, H, S, D] KV cache into separate K [B, S, H, D] and V [B, S, H, D] tensors.
+// Unified deinterleave kernel: copies tokens [0, dstS) from source [B, 2, H, srcS, D] to
+// separate K [B, dstS, H, D] and V [B, dstS, H, D].  When dstS == srcS this is a full copy;
+// when dstS < srcS it is a compact copy of only the first dstS tokens.
 template <typename T>
-__global__ void cvtKVLayoutBHSDToSplitKVKernel(T const* __restrict__ src, // [B, 2, H, S, D]
-    half* __restrict__ kDst,                                              // [B, S, H, D]
-    half* __restrict__ vDst,                                              // [B, S, H, D]
-    float const* __restrict__ kScaleQuantOrig, float const* __restrict__ vScaleQuantOrig, int32_t B, int32_t S,
-    int32_t H, int32_t D)
+__global__ void cvtKVLayoutBHSDToSplitKVKernel(T const* __restrict__ src, // [B, 2, H, srcS, D]
+    half* __restrict__ kDst,                                              // [B, dstS, H, D]
+    half* __restrict__ vDst,                                              // [B, dstS, H, D]
+    float const* __restrict__ kScaleQuantOrig, float const* __restrict__ vScaleQuantOrig, int32_t B, int32_t srcS,
+    int32_t dstS, int32_t H, int32_t D)
 {
-    uint32_t const token = blockIdx.y * blockDim.y + threadIdx.y; // 0 .. S-1
+    uint32_t const token = blockIdx.y * blockDim.y + threadIdx.y; // 0 .. dstS-1
     uint32_t const d = blockIdx.x * blockDim.x + threadIdx.x;     // 0 .. D-1
 
     uint32_t const numHpBlocks = (2 * H + blockDim.z - 1) / blockDim.z;
@@ -121,16 +122,16 @@ __global__ void cvtKVLayoutBHSDToSplitKVKernel(T const* __restrict__ src, // [B,
     uint32_t const hpTile = blockIdx.z % numHpBlocks;
     uint32_t const headPair = hpTile * blockDim.z + threadIdx.z; // 0 .. 2*H-1
 
-    if (batch >= B || headPair >= 2 * H || d >= D || token >= S)
+    if (batch >= B || headPair >= 2 * H || d >= D || token >= dstS)
         return;
 
     uint32_t const kv = headPair / H; // 0 = K, 1 = V
     uint32_t const h = headPair % H;
 
-    // src layout: [B, 2, H, S, D]
-    size_t const srcIdx = (((((size_t) batch * 2 + kv) * H + h) * S + token) * D + d);
-    // dst layout: [B, S, H, D]
-    size_t const dstIdx = ((((size_t) batch * S + token) * H + h) * D + d);
+    // src layout: [B, 2, H, srcS, D]
+    size_t const srcIdx = (((((size_t) batch * 2 + kv) * H + h) * srcS + token) * D + d);
+    // dst layout: [B, dstS, H, D]
+    size_t const dstIdx = ((((size_t) batch * dstS + token) * H + h) * D + d);
 
     half* dst = (kv == 0) ? kDst : vDst;
 
@@ -147,25 +148,28 @@ __global__ void cvtKVLayoutBHSDToSplitKVKernel(T const* __restrict__ src, // [B,
     }
 }
 
-void cvtKVLayoutBHSDToSplitKV(
-    rt::Tensor const& src, rt::Tensor& kDst, rt::Tensor& vDst, rt::Tensor const& kvScaleQuantOrig, cudaStream_t stream)
+void cvtKVLayoutBHSDToSplitKV(rt::Tensor const& src, rt::Tensor& kDst, rt::Tensor& vDst,
+    rt::Tensor const& kvScaleQuantOrig, int32_t seqLen, cudaStream_t stream)
 {
     rt::Coords const srcShape = src.getShape();
     int32_t const B = static_cast<int32_t>(srcShape[0]);
     int32_t const H = static_cast<int32_t>(srcShape[2]);
-    int32_t const S = static_cast<int32_t>(srcShape[3]);
+    int32_t const srcS = static_cast<int32_t>(srcShape[3]);
     int32_t const D = static_cast<int32_t>(srcShape[4]);
+    // seqLen == 0 means full copy; otherwise compact copy of first seqLen tokens.
+    int32_t const dstS = (seqLen > 0) ? seqLen : srcS;
 
     check::check(srcShape[1] == 2, "Source tensor must have shape [B, 2, H, S, D].");
+    check::check(dstS <= srcS, "seqLen must be <= source capacity.");
     check::check(kDst.getDataType() == nvinfer1::DataType::kHALF, "kDst must be FP16.");
     check::check(vDst.getDataType() == nvinfer1::DataType::kHALF, "vDst must be FP16.");
 
     rt::Coords const kShape = kDst.getShape();
     rt::Coords const vShape = vDst.getShape();
-    check::check(
-        kShape[0] == B && kShape[1] == S && kShape[2] == H && kShape[3] == D, "kDst must have shape [B, S, H, D].");
-    check::check(
-        vShape[0] == B && vShape[1] == S && vShape[2] == H && vShape[3] == D, "vDst must have shape [B, S, H, D].");
+    check::check(kShape[0] == B && kShape[1] == dstS && kShape[2] == H && kShape[3] == D,
+        "kDst must have shape [B, dstS, H, D].");
+    check::check(vShape[0] == B && vShape[1] == dstS && vShape[2] == H && vShape[3] == D,
+        "vDst must have shape [B, dstS, H, D].");
 
     // Block config with safe thread count (≤ 1024)
     uint32_t const tx = (D >= 256) ? 256 : (D >= 128 ? 128 : 64);
@@ -173,16 +177,16 @@ void cvtKVLayoutBHSDToSplitKV(
     uint32_t const tz = 1; // process one head-pair per thread in z
     dim3 block(tx, ty, tz);
 
-    // Grid config
-    uint32_t const hpTilesPerBatch = (2 * H + tz - 1) / tz; // z-blocks needed per batch for head-pairs
-    dim3 grid((D + tx - 1) / tx,                            // x : feature dim
-        (S + ty - 1) / ty,                                  // y : token dim
-        hpTilesPerBatch * B);                               // z : (batch, headPair)
+    // Grid covers only dstS tokens (compact when dstS < srcS).
+    uint32_t const hpTilesPerBatch = (2 * H + tz - 1) / tz;
+    dim3 grid((D + tx - 1) / tx, // x : feature dim
+        (dstS + ty - 1) / ty,    // y : token dim
+        hpTilesPerBatch * B);    // z : (batch, headPair)
 
     if (src.getDataType() == nvinfer1::DataType::kHALF)
     {
-        cvtKVLayoutBHSDToSplitKVKernel<half><<<grid, block, 0, stream>>>(
-            src.dataPointer<half>(), kDst.dataPointer<half>(), vDst.dataPointer<half>(), nullptr, nullptr, B, S, H, D);
+        cvtKVLayoutBHSDToSplitKVKernel<half><<<grid, block, 0, stream>>>(src.dataPointer<half>(),
+            kDst.dataPointer<half>(), vDst.dataPointer<half>(), nullptr, nullptr, B, srcS, dstS, H, D);
     }
 #if SUPPORTS_FP8
     else if (src.getDataType() == nvinfer1::DataType::kFP8)
@@ -195,7 +199,8 @@ void cvtKVLayoutBHSDToSplitKV(
         float const* const kScaleQuantOrigPtr = scales + 0;
         float const* const vScaleQuantOrigPtr = scales + 1;
         cvtKVLayoutBHSDToSplitKVKernel<__nv_fp8_e4m3><<<grid, block, 0, stream>>>(src.dataPointer<__nv_fp8_e4m3>(),
-            kDst.dataPointer<half>(), vDst.dataPointer<half>(), kScaleQuantOrigPtr, vScaleQuantOrigPtr, B, S, H, D);
+            kDst.dataPointer<half>(), vDst.dataPointer<half>(), kScaleQuantOrigPtr, vScaleQuantOrigPtr, B, srcS, dstS,
+            H, D);
     }
 #endif
     else

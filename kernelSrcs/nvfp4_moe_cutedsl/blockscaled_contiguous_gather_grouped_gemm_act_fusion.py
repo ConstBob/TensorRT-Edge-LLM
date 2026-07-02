@@ -3741,6 +3741,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         m: cutlass.Int64,
         n: cutlass.Int64,
         k: cutlass.Int64,
+        l: cutlass.Int64,
         tile_size: cutlass.Constexpr,
         scaling_vector_size: cutlass.Constexpr,
         max_active_clusters: cutlass.Constexpr,
@@ -3748,18 +3749,21 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         epilogue_op: cutlass.Constexpr = lambda x: x,
         activation_type: cutlass.Constexpr = ActivationType.Swiglu,
     ):
-        """Unified wrapper supporting both single-B and multi-B tensors.
+        """Grouped-GEMM wrapper for the NVFP4 MoE FC1 path.
 
-        B tensors are always passed as tuples (length 1 for single-B).
-        L sizes are configured via b_tensor_l_sizes in __init__.
-        ``activation_type`` is an ``ActivationType`` value and must match the
-        one passed to ``__init__``; only ``Swiglu`` and ``Relu2`` are supported.
+        B tensors are passed as a tuple (length 1; MoE uses a single expert
+        weight tensor). The L extent (number of experts) is the runtime ``l``
+        argument, so one compiled kernel serves any expert count -- ``l_0`` and
+        ``total_l`` are always ``l``. ``activation_type`` is an ``ActivationType``
+        value and must match the one passed to ``__init__``; only ``Swiglu`` and
+        ``Relu2`` are supported.
         """
         is_gated = is_gated_activation(activation_type)
         scale_k = k // scaling_vector_size
         interm_size = n // 2 if is_gated else n
         num_tiles = m // tile_size
-        total_l = self.b_tensor_l_offsets[self.num_b_tensors]
+        total_l = l
+        l_0 = l
 
         a = cute.make_tensor(
             a_ptr, layout=cute.make_ordered_layout((orig_m, k, 1), order=(1, 0, 2))
@@ -3778,8 +3782,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             ),
         )
 
-        # Create B and alpha tensors using const_expr conditions
-        l_0 = self.b_tensor_l_sizes[0]
+        # B / alpha tensors for the single expert weight tensor (l_0 == l).
         alpha_0 = cute.make_tensor(alpha_ptr_tuple[0], layout=cute.make_layout((l_0,)))
         b_0 = cute.make_tensor(
             b_ptr_tuple[0], layout=cute.make_ordered_layout((n, k, l_0), order=(1, 0, 2))

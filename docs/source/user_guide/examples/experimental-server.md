@@ -213,6 +213,7 @@ responses include `delta.tool_calls` chunks.
 from experimental.server import LLM, SamplingParams
 
 llm = LLM(
+    engine_dir="/path/to/base/engine",
     eagle_engine_dir="/path/to/eagle/engines",
     draft_top_k=10,
     draft_step=6,
