@@ -1,241 +1,223 @@
 # TRT CI D7L Validation (Issue 451)
 
-## Problem and scope
+## Goal and scope
 
-TensorRT CI needs a small downstream check that proves a candidate TensorRT
-source/build remains compatible with TensorRT Edge-LLM. The check runs from an
-Edge-LLM checkout, cross-builds the default Edge-LLM target set with C++
-unit tests enabled on a Linux build host, deploys the resulting runtime bundle
-to a D7L target, and runs the unit tests there.
+TensorRT CI needs one downstream check that proves a candidate TensorRT source
+and build remain compatible with TensorRT Edge-LLM. A controller stages the
+current Edge-LLM checkout on an SSH build host, cross-builds it for D7L, deploys
+the candidate runtime to an independent D7L SSH target, and runs the C++ unit
+tests there.
 
 Success means:
 
-- the caller supplies the remote TensorRT source root and build directory;
-- both build-host and D7L SSH endpoints are explicit and use non-interactive
-  key/agent authentication;
-- Edge-LLM configures for `auto-thor` with the AArch64 Linux toolchain and
-  builds the default source targets, including `unitTest`, against the
-  supplied TensorRT headers/libraries;
-- the D7L run uses the candidate TensorRT libraries and returns the unit-test
-  exit status to CI;
-- local phase logs are retained, while D7L logs and GTest XML are collected
-  best-effort without masking the primary result; and
-- commands are deterministic, quoted, fail-fast, and small enough to maintain.
+- TensorRT is consumed only as a CodeManager `PRE_BUILT` artifact;
+- Edge-LLM is built from source through CodeManager in a toolkit-managed TRT
+  build container;
+- all command execution uses CommandManager;
+- all SSH transfer and remote filesystem work uses RemoteConnectionManager;
+- runtime deployment uses `CodeManager.deploy_runtime()`; and
+- the D7L unit-test exit code is returned to CI, with logs and GTest XML
+  retained when available.
 
-Out of scope: QNX or safety builds, remote tuning, model export, engine build,
-model inference/accuracy, container lifecycle, password handling, board mount
-repair, and persistent host provisioning.
+QNX/safety, model export, engine building, inference, accuracy testing, remote
+tuning, and host provisioning are out of scope.
 
-## Tooling decision
+## Toolkit decision
 
-The script is Python 3.8-compatible and standard-library-only. It mirrors TRT
-Dev Toolkit practices (argv-based subprocesses, explicit SSH targets,
-non-interactive probes, phase logs, and bounded timeouts) but does not import
-the toolkit. Direct reuse would couple this compatibility check to the TRT
-revision under test, require Python 3.12 plus NumPy/ONNX/PyYAML, and still would
-not model the build-host-to-test-host handoff or an explicit target identity
-file. This keeps failures attributable to TensorRT/Edge-LLM rather than the
-orchestration environment.
+This is an internal TRT CI entry point and requires TRT Dev Toolkit with Python
+3.12 or newer. It deliberately contains no custom SSH/SCP/rsync runner and does
+not call `subprocess`, `os.system`, Docker, or git-trt directly.
 
-## Structure and responsibilities
+CodeManager's current remote source-build path validates container mount paths
+on the controller and does not synchronize a remote Edge-LLM build back. To
+avoid requiring identical controller/build-host filesystems, the same script
+has a small internal worker mode. The controller stages the script with the
+source and invokes the worker through CommandManager. The worker runs
+CodeManager locally on the build host, where the TensorRT checkout, container
+mounts, source, and build output are all visible.
 
-All production code stays in one focused script:
+The controller then relays the two runtime trees through
+RemoteConnectionManager and asks a local CodeManager instance to deploy them
+to D7L. This keeps the two SSH endpoints independent and avoids requiring the
+build host to hold credentials for the board.
 
-- `SshTarget` (immutable dataclass)
-  - stores host, user, port, optional identity file/jump host, and host-key
-    policy;
-  - renders SSH, SCP, and rsync transport arguments without secrets.
-- `CommandRunner`
-  - runs argv lists, streams combined output to console and a phase log,
-    enforces a real timeout, and raises a contextual error on failure.
-- `TrtCiConfig` (immutable dataclass)
-  - validates local paths separately from remote POSIX paths and derives one
-    run-specific child below a safe workspace base, identically on both hosts.
-- `TrtCiFlow`
-  - probes endpoints;
-  - rsyncs the current Edge-LLM checkout to the build host;
-  - prepares a TensorRT package view from `<trt-root>/include` and shared
-    libraries found below `<trt-build-dir>`;
-  - cross-configures/builds the default Edge-LLM target breadth with unit
-    tests enabled while intentionally leaving CuTe DSL disabled;
-  - bundles `unitTest`, a parser-linked provenance executable, Edge-LLM shared
-    objects, candidate TensorRT runtime libraries, and source-relative
-    unit-test resources;
-  - transfers the archive through a local temporary file, verifies its digest,
-    deploys it at the same absolute workspace on D7L, runs `ldd` and GTest, and
-    collects results best-effort in `finally` without masking the primary
-    phase error or its exit code.
-- `parse_args()` / `main()`
-  - define the stable CI interface and map expected failures to a nonzero exit.
+## Structure
 
-No reusable library module is introduced because there is only one caller and
-the SSH/build stages share one small configuration object.
+Production code remains in `scripts/run_trt_ci_d7l.py`:
 
-## Control flow
+- `CiConfig` validates the CI interface and derives one safe `run-<id>` path.
+- `ControllerServices` and `WorkerServices` expose only the toolkit facades
+  each phase needs and are injectable in unit tests.
+- `ControllerFlow` stages source, runs the build worker, retrieves runtime
+  artifacts, deploys through CodeManager, runs GTest, and collects results.
+- `BuildWorker` prepares the TensorRT package view and invokes CodeManager with
+  the two build targets.
+- small pure helpers construct remote configs, CodeManager targets, deployment
+  results, and quoted shell fragments once; controller and worker do not
+  duplicate those contracts.
+
+No reusable library is introduced for this single CI caller.
+
+## Flow
 
 ```mermaid
 flowchart TD
-    A[Parse and validate inputs] --> B[Probe build and D7L SSH]
-    B --> C[Rsync Edge-LLM source to build host]
-    C --> D[Create TRT include/lib package view]
-    D --> E[CMake D7L configure and full build]
-    E --> F[Bundle binary, shared libraries, and resources]
-    F --> G[Download archive and calculate SHA-256]
-    G --> H[Upload archive to D7L]
-    H --> I[Verify digest and extract at identical workspace]
-    I --> J[ldd dependency preflight]
-    J --> K[Run unitTest and write GTest XML]
-    K --> L[Fetch D7L results]
-    D -. failure .-> M[Fail CI with phase log]
-    E -. failure .-> M
-    I -. failure .-> M
-    J -. failure .-> M
-    K -. failure .-> M
-    M --> L
+    A[Parse CI inputs] --> B[Create CommandManager and build/test RCM]
+    B --> C[Probe both SSH endpoints]
+    C --> D[CommandManager creates clean local source stage]
+    D --> E[Build RCM uploads source]
+    E --> F[CommandManager invokes same script in build-worker mode]
+    F --> G[Worker CommandManager assembles TRT package view]
+    G --> H[Worker CodeManager: TRT PRE_BUILT]
+    H --> I[Worker CodeManager: EdgeLLM BUILD in TRT container]
+    I --> J[Build RCM downloads TRT and EdgeLLM runtime trees]
+    J --> K[Controller CodeManager deploy_runtime to D7L]
+    K --> L[Test RCM stages source-relative test resources]
+    L --> M[CommandManager runs ldd provenance checks and GTest]
+    M --> N[Test RCM collects XML/logs]
 ```
 
-## Remote build contract
+On success, remote run directories are removed unless `--keep-workspace` is
+set. Failures preserve them for diagnosis. Result collection is best-effort
+and never masks the primary build, deployment, or test status.
 
-The build command uses:
+## Build contract
+
+The supplied TensorRT paths are paths on the build host. Because CodeManager's
+`PRE_BUILT` input must be one package root, the worker creates:
 
 ```text
-cmake -S <workspace>/source -B <workspace>/build
-  -DCMAKE_BUILD_TYPE=Release
-  -DBUILD_UNIT_TESTS=ON
-  -DEMBEDDED_TARGET=auto-thor
-  -DCMAKE_TOOLCHAIN_FILE=<workspace>/source/cmake/aarch64_linux_toolchain.cmake
-  -DTRT_PACKAGE_DIR=<workspace>/trt-package
-  -DCUDA_CTK_VERSION=<override-or-/usr/local/cuda/bin/nvcc-version>
-  -DENABLE_CUTE_DSL=OFF
-cmake --build <workspace>/build --parallel <jobs>
+<run>/trt-package/
+  include/  <- <trt-root>/include, parser headers, generated NvInferVersion.h
+  lib/      <- <trt-build-dir>/Release/lib, preserving SONAME symlinks
 ```
 
-The package view archive-preserves `<trt-root>/include/.`, overlays the
-required generated `<trt-build-dir>/include/NvInferVersion.h`, and then
-archive-preserves `<trt-root>/parsers/onnx/.` under `include/`. It next
-archive-preserves the complete
-TensorRT library directory selected from `<trt-build-dir>/Release/lib` (with a
-bounded fallback search). Selection prefers that exact Release path; fallback
-candidates are sorted and exactly one complete directory is required. Relative
-SONAME symlinks are preserved, while absolute, out-of-tree, or broken required
-symlinks are rejected. This avoids misclassifying a newly introduced TensorRT
-DSO dependency as an Edge-LLM regression. Configuration fails before
-compilation if `NvInfer.h`, generated `NvInferVersion.h`,
-`NvOnnxParser.h`, `libnvinfer`, or `libnvonnxparser` is absent.
+The CommandManager package-preparation command fails before CodeManager if the
+required headers, `libnvinfer`, or `libnvonnxparser` are missing.
 
-The same absolute run-specific workspace is used on D7L because `unitTest`
-embeds `PROJECT_ROOT_DIR` at compilation time. The deployment includes
-`unittests/resources` (and `tests/chat_templates` when present), so
-source-relative tests do not accidentally depend on the build host. Runtime
-sets `LD_LIBRARY_PATH=<run>/trt-package/lib:<run>/build:${LD_LIBRARY_PATH:-}`
-and rejects an `ldd` result where any `libnvinfer*` or `libnvonnxparser*`
-resolves outside the deployed package; a board-installed TRT can never satisfy
-the check silently.
+CodeManager receives exactly two targets on `Arch.D7L`:
+
+1. TRT `PRE_BUILT`, `BuildMode.RELEASE`, whose `build_dir` is the package view
+   and whose `repo_path` is the supplied TRT root.
+2. Edge-LLM `BUILD`, `BuildMode.RELEASE`, whose repository and build paths are
+   `<run>/source` and `<run>/build` and whose CMake additions are:
+
+   ```text
+   -DEMBEDDED_TARGET=auto-thor
+   -DCMAKE_TOOLCHAIN_FILE=<run>/source/cmake/aarch64_linux_toolchain.cmake
+   -DENABLE_CUTE_DSL=OFF
+   ```
+
+The Edge-LLM target intentionally leaves `trt_package_dir` unset. CodeManager
+orders TRT first and injects the same-architecture TRT result. Its Edge-LLM
+generator adds `TRT_PACKAGE_DIR`, CUDA, Release mode, and `BUILD_UNIT_TESTS=ON`,
+then builds the default target set. The worker sets
+`keep_containers_running=False`.
+
+## Deployment and test contract
+
+The controller downloads `<run>/trt-package` and `<run>/build` through the
+build-host RCM. It creates a deployment-only CodeManager plan containing TRT
+and Edge-LLM `PRE_BUILT` targets, reifies the steps as a successful `RunResult`
+over those local paths without executing the plan, and calls:
+
+```text
+CodeManager.deploy_runtime(..., preferred_mode=DeploymentMode.RSYNC)
+```
+
+Toolkit fallbacks remain enabled. Deployment produces `<run>/trt`,
+`<run>/edgellm`, and `setup_environment.sh` on D7L.
+
+`unitTest` embeds its build-host source root. Therefore test RCM also stages
+`unittests/resources` and, when present, `tests/chat_templates` at the same
+absolute `<run>/source` path on D7L. CommandManager sources the generated
+environment script, rejects unresolved dependencies, verifies that TensorRT
+DSOs resolve below `<run>/trt`, and runs:
+
+```text
+<run>/edgellm/unitTest
+  --gtest_filter=<filter>
+  --gtest_output=xml:<run>/results/unit-tests.xml
+```
+
+The test command runs with a bounded toolkit timeout and its exact nonzero exit
+code is returned when available (124 for a reported timeout, otherwise 1 when
+the transport supplies no exit code).
 
 ## CLI contract
 
-Required:
+Required controller arguments:
 
-- `--trt-root`, `--trt-build-dir`
+- `--trt-root`, `--trt-build-dir` (build-host paths)
 - `--build-host`, `--build-user`
 - `--test-host`, `--test-user`
 
-Optional, with conservative defaults:
+Optional arguments cover TRT branch, CUDA version, build/test ports, one jump
+host per endpoint, strict known-host checking, workspace/run ID, artifact
+directory, job count, GTest filter, phase timeouts, and workspace retention.
 
-- build/test SSH ports, a shared identity file, and per-endpoint jump hosts;
-- `--workspace` (safe base only), `--run-id`, `--artifacts-dir`,
-  `--cuda-version`, and `--jobs` (CUDA is detected from build-host
-  `/usr/local/cuda/bin/nvcc --version` when no override is supplied);
-- `--gtest-filter` (default `*`, matching the existing `test_unit_tests`
-  behavior);
-- connection/build/test/transfer timeouts and `--keep-workspace`.
+Toolkit SSH uses the caller's OpenSSH agent/config/default keys. The toolkit
+does not expose an arbitrary identity-file option, so the script does not
+reimplement one. Both the controller-to-build and controller-to-D7L credentials
+must be pre-provisioned in TRT CI. Passwords and raw shell fragments are not
+accepted.
 
-The script intentionally does not accept passwords or raw shell fragments.
-Remote TRT paths are validated over build-host SSH, never with local
-`Path.exists()`. The workspace must be absolute and non-root; a restricted
-`run-<id>` child is generated, validated, and is the only remotely deleted
-path.
+The internal `--build-worker` interface is hidden and invoked only through the
+controller's CommandManager with Python 3.12 and
+`<trt-root>/scripts/devToolkit/src` on `PYTHONPATH`. Remote paths are quoted,
+the workspace must be absolute and non-root, and cleanup is restricted to the
+derived `run-<id>` child.
 
-## Files
+## Files and tests
 
 ```text
-design/in_progress/trt_ci_d7l_validation.md   # this design and test plan
-scripts/run_trt_ci_d7l.py                     # CI entry point
-scripts/README.md                              # invocation and prerequisites
-tests/python-unittests/test_run_trt_ci_d7l.py # behavior-focused unit tests
+design/in_progress/trt_ci_d7l_validation.md   # architecture and test plan
+scripts/run_trt_ci_d7l.py                     # controller + small build worker
+scripts/README.md                              # internal CI usage
+tests/python-unittests/test_run_trt_ci_d7l.py # behavior tests with toolkit fakes
 ```
 
-The production entry point remains smaller than the D7Q safety reference while
-retaining explicit transport, timeout, provenance, and cleanup behavior. The
-larger behavior-focused test file exercises generated Bash and failure paths
-without duplicating production helpers. Helpers are extracted only where they
-remove repeated transport, quoting, or execution logic.
+The focused test suite does not require SSH, Docker, or D7L. It verifies:
 
-## Test design
+1. remote configs map Linux/D7L targets, key auth, ports, jump hosts, and host
+   key policy correctly;
+2. target construction is exactly TRT `PRE_BUILT` followed by Edge-LLM source
+   `BUILD`, with one shared D7L platform contract and no manual TRT binding;
+3. the worker uses CommandManager for package preparation and CodeManager for
+   the full build;
+4. the controller's observable order is probe, stage, worker, retrieve,
+   CodeManager deploy, resource stage, test, collect;
+5. deployment artifacts are reconstructed from local RCM downloads without
+   mutating or pretending to execute a second source build;
+6. the test command sources the toolkit environment, checks candidate TRT
+   provenance, applies the filter, and writes XML;
+7. build/deployment failures stop later phases, test exits are preserved, and
+   collection failures do not mask the primary result; and
+8. production code contains no direct process or SSH implementation.
 
-Local tests do not require SSH hardware. They validate observable command and
-configuration behavior with a recording runner:
-
-1. SSH/SCP/rsync argv include user, port, identity, jump host, BatchMode, and
-   selected host-key policy without embedding a password.
-2. Build script contains the D7L toolchain, `auto-thor`, candidate TRT package
-   view, detected/overridden CUDA version, unit-test flag, CuTe DSL opt-out, and
-   the default full-source build rather than only `unitTest`.
-3. Build inputs and all remote paths are shell-quoted, including spaces and
-   metacharacters.
-4. Build/package scripts require generated `NvInferVersion.h`, check all TRT
-   artifacts, and stage unit-test resources plus the complete selected TRT
-   runtime-library directory and safe symlinks.
-5. D7L script verifies SHA-256, rejects missing `ldd` dependencies, preserves
-   pipeline status, applies the GTest filter, and writes XML/log artifacts.
-6. Flow ordering is probe -> sync -> build -> bundle -> transfer -> deploy ->
-   test -> collect; collection failure never masks a primary error or exit code,
-   including when deploy never created remote results.
-7. CLI validation distinguishes local source/key/artifact paths from remote TRT
-   paths and rejects unsafe workspace bases/run IDs, invalid ports/timeouts/jobs,
-   and an unavailable submodule checkout with actionable messages.
-8. `CommandRunner` terminates the full subprocess group on timeout; separate
-   regressions prove that same-group children are stopped and that a detached child
-   retaining stdout cannot block the controller beyond bounded cleanup.
-9. Source-root resolution uses `Path(__file__).resolve()`, remains independent
-   of caller CWD, and remote paths use `PurePosixPath`.
-
-Validation commands:
+Validation:
 
 ```text
-python -m pytest tests/python-unittests/test_run_trt_ci_d7l.py -q
-python -m py_compile scripts/run_trt_ci_d7l.py
+PYTHONPATH=<trt-root>/scripts/devToolkit/src:$PWD \
+  python3.12 -m pytest tests/python-unittests/test_run_trt_ci_d7l.py -q
+PYTHONPATH=<trt-root>/scripts/devToolkit/src \
+  python3.12 -m py_compile scripts/run_trt_ci_d7l.py
 pre-commit run --files scripts/run_trt_ci_d7l.py \
-  tests/python-unittests/test_run_trt_ci_d7l.py \
-  scripts/README.md design/in_progress/trt_ci_d7l_validation.md
+  tests/python-unittests/test_run_trt_ci_d7l.py scripts/README.md \
+  design/in_progress/trt_ci_d7l_validation.md
 ```
 
-The real two-host run is hardware-dependent and remains a CI/manual validation
-step; this change does not claim to execute it locally.
+The real two-host run remains an internal hardware/CI validation step.
 
-## Performance and maintenance notes
+## Residual constraints
 
-- The default Edge-LLM build catches compile-time TRT API drift across the
-  builder, plugin, examples, and unit tests. Model data and unrelated TRT build
-  outputs are not copied; only the selected runtime `lib` directory is staged.
-- Rsync excludes VCS metadata, worktrees, local builds, caches, logs, and
-  generated artifacts.
-- Transfers are archive-based between the two independent SSH endpoints, so no
-  build-host trust of the board or shared filesystem is assumed.
-- Every expensive phase has a configurable timeout and a distinct log.
-- Only the validated run-specific child is cleaned before use. Successful
-  runs remove that child unless `--keep-workspace`; failed runs preserve it for
-  debugging.
-
-## Assumptions and residual risks
-
-- The controller has `ssh`, `scp`, and `rsync`; the build host has CMake, the
-  AArch64 compiler, a compatible CUDA toolkit, `find`, and `tar`; D7L has CUDA
-  and `ldd`.
-- The supplied TRT source/build paths exist on the build host, not necessarily
-  on the controller or D7L.
-- Edge-LLM submodules are initialized before source sync.
-- Key/agent-based SSH is pre-provisioned. A jump endpoint, when supplied, is in
-  OpenSSH `user@host[:port]` form.
-- A malformed TRT build tree with multiple complete `Release/lib` candidates
-  is rejected rather than silently selecting an arbitrary one.
+- TRT Dev Toolkit and its Python dependencies must be available on the
+  controller and build host.
+- The build host needs the TRT container tooling and the normal D7L cross-build
+  prerequisites; D7L needs `ldd` and a compatible CUDA runtime.
+- The supplied TRT build uses the normal `Release/lib` layout.
+- RemoteConnectionManager has no exclude list, so CommandManager creates a
+  compact local source stage before upload.
+- CodeManager's build timeout is not configurable. The controller bounds the
+  worker with the remote `timeout` utility; a timed-out build may still require
+  host-side cleanup if the SSH transport cannot terminate descendants.

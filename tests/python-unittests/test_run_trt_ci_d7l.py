@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,545 +12,583 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Behavior tests for the TRT-internal D7L CI controller."""
 
+import argparse
+import ast
 import dataclasses
-import hashlib
-import importlib.util
-import os
-import pathlib
 import shlex
-import subprocess
-import sys
-import time
+from pathlib import Path, PurePosixPath
 
 import pytest
 
-from scripts import run_trt_ci_d7l
+pytest.importorskip("trt_dev_toolkit", reason="TRT-internal CI dependency")
+
+from trt_dev_toolkit.code_manager import (ArtifactSource, BuildComponent,
+                                          BuildMode, DeploymentMode,
+                                          DeploymentResult, EnvironmentExports,
+                                          Plan, PlanStep, RunResult)
+from trt_dev_toolkit.command_manager.command_manager import CommandManager
+from trt_dev_toolkit.command_manager.data_structures import (CommandResult,
+                                                             OutputMode,
+                                                             ShellType)
+from trt_dev_toolkit.command_manager.targets import (LocalTarget,
+                                                     RemoteSshTarget)
+from trt_dev_toolkit.constants import Arch, TargetType
+
+from scripts import run_trt_ci_d7l as ci
 
 
-def _assert_option(argv, option, value):
-    index = argv.index(option)
-    assert argv[index + 1] == value
+def _result(success=True, exit_code=0, timed_out=False):
+    return CommandResult(success=success,
+                         exit_code=exit_code,
+                         timed_out=timed_out)
 
 
-def test_ssh_endpoint_renders_noninteractive_ssh_scp_and_rsync(tmp_path):
-    identity = tmp_path / "identity key"
-    identity.touch()
-    target = run_trt_ci_d7l.SshTarget(
-        "build.example",
-        "ci-user",
-        port=2201,
-        identity_file=identity,
-        jump_host="jump-user@jump.example:2222",
-        host_key_policy="no",
-    )
+class FakeCommands:
 
-    ssh_argv = target.ssh_argv("printf ok", 9)
-    assert ssh_argv[0:2] == ["ssh", "-T"]
-    for option in [
-            "BatchMode=yes",
-            "StrictHostKeyChecking=no",
-            "UserKnownHostsFile=/dev/null",
-    ]:
-        assert option in ssh_argv
-    _assert_option(ssh_argv, "-p", "2201")
-    _assert_option(ssh_argv, "-i", str(identity))
-    _assert_option(ssh_argv, "-J", "jump-user@jump.example:2222")
-    assert ssh_argv[-4:] == [
-        "ci-user@build.example",
-        "bash",
-        "-lc",
-        shlex.quote("printf ok"),
-    ]
+    def __init__(self, events=None, outcomes=None):
+        self.events = events if events is not None else []
+        self.outcomes = dict(outcomes or {})
+        self.calls = []
 
-    remote_path = pathlib.PurePosixPath("/tmp/run with spaces/$unsafe;name")
-    remote_spec = "ci-user@build.example:" + shlex.quote(str(remote_path))
-    assert target.remote_spec(remote_path) == remote_spec
-    scp_argv = target.scp_argv("local archive", remote_spec, 9)
-    assert scp_argv[0:2] == ["scp", "-O"]
-    _assert_option(scp_argv, "-P", "2201")
-    assert scp_argv[-2:] == ["local archive", remote_spec]
-
-    rsync_argv = shlex.split(target.rsync_transport(9))
-    assert rsync_argv[0] == "ssh"
-    _assert_option(rsync_argv, "-p", "2201")
-    _assert_option(rsync_argv, "-i", str(identity))
-    assert not any("password" in token.lower()
-                   for token in ssh_argv + scp_argv + rsync_argv)
-    with pytest.raises(ValueError, match="control"):
-        target.remote_spec(pathlib.PurePosixPath("/tmp/bad\npath"))
+    def run(self, target, spec):
+        self.calls.append((target, spec))
+        self.events.append(f"command:{spec.operation_name}")
+        return self.outcomes.get(spec.operation_name, _result())
 
 
-@pytest.mark.parametrize(("field", "value"), [
-    ("host", "-oProxyCommand=touch-pwned"),
-    ("user", "-Fattacker-config"),
-    ("jump_host", "-oProxyCommand=touch-pwned"),
-    ("host", "build.example\n-oProxyCommand=pwned"),
-    ("jump_host", "jump.example\n-oProxyCommand=pwned"),
-])
-def test_ssh_target_rejects_option_and_control_injection(field, value):
-    endpoint = {"host": "build.example", "user": "ci-user", field: value}
-    with pytest.raises(ValueError, match="SSH"):
-        run_trt_ci_d7l.SshTarget(**endpoint)
+class FakeFilesystem:
+
+    def __init__(self, name, events):
+        self.name = name
+        self.events = events
+        self.remove_calls = []
+        self.ensure_calls = []
+        self.remove_ok = True
+        self.ensure_ok = True
+
+    def remove_dir(self, path, **kwargs):
+        self.remove_calls.append((path, kwargs))
+        self.events.append(f"{self.name}:remove")
+        return self.remove_ok
+
+    def ensure_dir(self, path, **kwargs):
+        self.ensure_calls.append((path, kwargs))
+        self.events.append(f"{self.name}:ensure")
+        return self.ensure_ok
 
 
-def _process_is_running(pid):
-    stat_path = pathlib.Path("/proc") / str(pid) / "stat"
-    if not stat_path.exists():
-        return False
-    return stat_path.read_text(encoding="utf-8").split()[2] != "Z"
+class FakeRemote:
+
+    def __init__(self, name, config, events):
+        self.name = name
+        self.config = config
+        self.events = events
+        self.target = RemoteSshTarget(config)
+        self.filesystem = FakeFilesystem(name, events)
+        self.connected = True
+        self.upload_fail_names = set()
+        self.download_fail_names = set()
+        self.uploads = []
+        self.downloads = []
+
+    def test_connection(self):
+        self.events.append(f"{self.name}:probe")
+        return self.connected
+
+    def copy_local_directory_to_remote(self, *, local_path, remote_path,
+                                       timeout_s):
+        name = PurePosixPath(remote_path).name
+        self.uploads.append((local_path, remote_path, timeout_s))
+        self.events.append(f"{self.name}:upload:{name}")
+        return name not in self.upload_fail_names
+
+    def copy_remote_directory_to_local(self, *, remote_path, local_path,
+                                       timeout_s):
+        name = PurePosixPath(remote_path).name
+        self.downloads.append((remote_path, local_path, timeout_s))
+        self.events.append(f"{self.name}:download:{name}")
+        if name in self.download_fail_names:
+            return False
+        Path(local_path).mkdir(parents=True, exist_ok=True)
+        return True
 
 
-def test_command_runner_times_out_silent_process_group(tmp_path):
-    child_script = (
-        "import signal,time; "
-        "signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(60)")
-    pid_file = tmp_path / "child.pid"
-    parent_script = (
-        "import pathlib,subprocess,sys,time; "
-        "child=subprocess.Popen([sys.executable,'-c',sys.argv[1]]); "
-        "pathlib.Path(sys.argv[2]).write_text(str(child.pid)); time.sleep(60)")
-    runner = run_trt_ci_d7l.CommandRunner(tmp_path)
+class FakeCode:
 
-    start = time.monotonic()
-    with pytest.raises(run_trt_ci_d7l.FlowError, match="timed out"):
-        runner.run(
-            "silent-timeout",
-            [sys.executable, "-c", parent_script, child_script,
-             str(pid_file)],
-            timeout_s=0.5,
+    def __init__(self, events=None, remote_target=None):
+        self.events = events if events is not None else []
+        self.remote_target = remote_target
+        self.plan_calls = []
+        self.build_calls = []
+        self.deploy_calls = []
+        self.build_result = RunResult(success=True)
+        self.deploy_error = None
+
+    def plan_artifact_generation(self, targets):
+        self.plan_calls.append(list(targets))
+        self.events.append("code:plan")
+        return Plan(
+            run_id="unit-plan",
+            steps=[
+                PlanStep(
+                    step_id=f"s{index:03d}",
+                    target=target,
+                    component=BuildComponent(target.component),
+                ) for index, target in enumerate(targets)
+            ],
         )
-    assert time.monotonic() - start < 3.0
 
-    child_pid = int(pid_file.read_text(encoding="utf-8"))
-    deadline = time.monotonic() + 2.0
-    while _process_is_running(child_pid) and time.monotonic() < deadline:
-        time.sleep(0.02)
-    assert not _process_is_running(child_pid)
+    def plan_and_execute(self, targets):
+        self.build_calls.append(list(targets))
+        self.events.append("code:build")
+        return self.build_result
 
-
-def test_command_runner_bounds_reader_after_leader_exits_with_detached_child(
-        tmp_path):
-    pid_file = tmp_path / "detached-pipe-child.pid"
-    child_script = ("import os,pathlib,signal,sys,time\n"
-                    "signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
-                    "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
-                    "time.sleep(60)\n")
-    leader_script = (
-        "import pathlib,subprocess,sys,time\n"
-        "subprocess.Popen([sys.executable,'-c',sys.argv[1],sys.argv[2]],"
-        "start_new_session=True)\n"
-        "marker=pathlib.Path(sys.argv[2])\n"
-        "deadline=time.monotonic()+2\n"
-        "while not marker.exists():\n"
-        "    if time.monotonic() >= deadline: raise SystemExit(2)\n"
-        "    time.sleep(0.01)\n")
-    runner = run_trt_ci_d7l.CommandRunner(tmp_path)
-
-    start = time.monotonic()
-    try:
-        with pytest.raises(run_trt_ci_d7l.FlowError) as error:
-            runner.run(
-                "detached-child",
-                [
-                    sys.executable, "-c", leader_script, child_script,
-                    str(pid_file)
-                ],
-                timeout_s=0.5,
-            )
-        assert error.value.exit_code == 124
-        assert time.monotonic() - start < 3.0
-    finally:
-        if pid_file.exists():
-            try:
-                os.kill(int(pid_file.read_text(encoding="utf-8")), 9)
-            except ProcessLookupError:
-                pass
-
-
-def test_command_runner_streams_complete_output_to_phase_log(tmp_path):
-    runner = run_trt_ci_d7l.CommandRunner(tmp_path)
-    command = "for i in range(205): print('line-{}'.format(i))"
-
-    runner.run("streamed-output", [sys.executable, "-c", command], timeout_s=5)
-
-    log = (tmp_path / "streamed-output.log").read_text(encoding="utf-8")
-    assert "line-0\n" in log and "line-204\n" in log
-
-
-def test_command_runner_preserves_exact_exit_code(tmp_path):
-    runner = run_trt_ci_d7l.CommandRunner(tmp_path)
-    with pytest.raises(run_trt_ci_d7l.FlowError) as error:
-        runner.run(
-            "known-exit",
-            [sys.executable, "-c", "raise SystemExit(23)"],
-            timeout_s=5,
+    def deploy_runtime(self,
+                       run_result,
+                       remote_config,
+                       *,
+                       preferred_mode=None):
+        self.deploy_calls.append((run_result, remote_config, preferred_mode))
+        self.events.append("code:deploy")
+        if self.deploy_error is not None:
+            raise self.deploy_error
+        workspace = remote_config.paths.remote_path
+        return DeploymentResult(
+            remote_target=self.remote_target,
+            remote_workspace=workspace,
+            env_script_path=f"{workspace}/setup_environment.sh",
+            environment_exports=EnvironmentExports(),
+            deployment_mode=DeploymentMode.RSYNC,
         )
-    assert error.value.exit_code == 23
+
+
+@dataclasses.dataclass
+class Harness:
+    events: list
+    commands: FakeCommands
+    build_remote: FakeRemote
+    test_remote: FakeRemote
+    code: FakeCode
+
+    @property
+    def services(self):
+        return ci.ControllerServices(self.commands, self.build_remote,
+                                     self.test_remote, self.code)
 
 
 @pytest.fixture
-def flow_config(tmp_path):
-    repo_root = pathlib.Path(run_trt_ci_d7l.__file__).resolve().parents[1]
-    return run_trt_ci_d7l.TrtCiConfig(
-        source_root=repo_root,
-        trt_root=pathlib.PurePosixPath("/candidate TRT/source;$root"),
-        trt_build_dir=pathlib.PurePosixPath("/candidate TRT/build $output"),
-        build_target=run_trt_ci_d7l.SshTarget("build.example", "builder"),
-        test_target=run_trt_ci_d7l.SshTarget("d7l.example", "tester"),
-        workspace=pathlib.PurePosixPath("/tmp/edge llm validation"),
-        run_id="unit-123",
-        artifacts_dir=tmp_path / "artifacts",
+def config(tmp_path):
+    source = tmp_path / "Edge LLM source"
+    (source / "unittests/resources").mkdir(parents=True)
+    (source / "tests/chat_templates").mkdir(parents=True)
+    value = ci.CiConfig(
+        trt_root=PurePosixPath("/candidate TRT/source"),
+        trt_build_dir=PurePosixPath("/candidate TRT/build"),
+        trt_branch="main",
+        build_endpoint=ci.Endpoint("builder.example", "builder", 2201,
+                                   "jump-user@jump.example:2222"),
+        test_endpoint=ci.Endpoint("d7l.example", "tester", 2202),
+        workspace=PurePosixPath("/remote Edge workspace"),
+        run_id="unit-451",
+        artifacts_dir=source / "ci artifacts",
         cuda_version="13.2",
         jobs=7,
-        gtest_filter="LoggerTest.$case;*",
+        gtest_filter="Suite.$case;*",
         connection_timeout_s=9,
-        build_timeout_s=120,
         transfer_timeout_s=30,
+        build_timeout_s=0.5,
         test_timeout_s=60,
-        keep_workspace=True,
+        strict_host_keys=False,
+        known_hosts_file="/tmp/known hosts",
+        source_root=source,
+    )
+    value.validate()
+    return value
+
+
+def _harness(config):
+    events = []
+    commands = FakeCommands(events)
+    build_cfg = ci.remote_config(
+        config,
+        config.build_endpoint,
+        TargetType.LINUX,
+        Arch.X86_64,
+        config.local_root / "build-transfer",
+    )
+    test_cfg = ci.remote_config(
+        config,
+        config.test_endpoint,
+        TargetType.THOR_LINUX,
+        Arch.D7L,
+        config.local_root / "deploy-stage",
+    )
+    build_remote = FakeRemote("build", build_cfg, events)
+    test_remote = FakeRemote("test", test_cfg, events)
+    code = FakeCode(events, test_remote.target)
+    return Harness(events, commands, build_remote, test_remote, code)
+
+
+def _worker_args(tmp_path):
+    return argparse.Namespace(
+        run_root=PurePosixPath(str(tmp_path / "worker run")),
+        trt_root=PurePosixPath("/candidate TRT/source"),
+        trt_build_dir=PurePosixPath("/candidate TRT/build"),
+        trt_branch="main",
+        cuda_version="13.2",
+        jobs=7,
+        package_timeout=30,
     )
 
 
-def test_source_root_and_workspace_are_independent_of_cwd(
-        flow_config, tmp_path, monkeypatch):
-    script_path = pathlib.Path(run_trt_ci_d7l.__file__).resolve()
-    expected_root = script_path.parents[1]
-    monkeypatch.chdir(tmp_path)
-    spec = importlib.util.spec_from_file_location("_trt_ci_cwd_test",
-                                                  script_path)
-    loaded = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, spec.name, loaded)
-    assert spec.loader is not None
-    spec.loader.exec_module(loaded)
-    parsed = loaded.parse_args([
-        "--trt-root",
-        "/remote/trt",
-        "--trt-build-dir",
-        "/remote/build",
-        "--build-host",
-        "build",
-        "--build-user",
-        "ci",
-        "--test-host",
-        "test",
-        "--test-user",
-        "ci",
-        "--artifacts-dir",
-        str(tmp_path / "results"),
-    ])
-
-    assert parsed.source_root == expected_root
-    assert flow_config.run_workspace == pathlib.PurePosixPath(
-        "/tmp/edge llm validation/run-unit-123")
+def _assert_subsequence(values, expected):
+    iterator = iter(values)
+    for item in expected:
+        assert any(value == item for value in iterator), (item, values)
 
 
-def _make_checkout(root, *, include_nvtx):
-    """Create a minimal checkout with selected submodule marker files."""
-    files = [
-        "CMakeLists.txt",
-        "3rdParty/googletest/CMakeLists.txt",
-        "3rdParty/nlohmannJson/CMakeLists.txt",
+def test_remote_configs_map_linux_and_d7l_endpoints(config):
+    build = ci.remote_config(config, config.build_endpoint, TargetType.LINUX,
+                             Arch.X86_64, config.local_root / "build")
+    test = ci.remote_config(config, config.test_endpoint,
+                            TargetType.THOR_LINUX, Arch.D7L,
+                            config.local_root / "test")
+
+    assert (build.target.target_type, build.target.arch) == (TargetType.LINUX,
+                                                             Arch.X86_64)
+    assert (test.target.target_type,
+            test.target.arch) == (TargetType.THOR_LINUX, Arch.D7L)
+    assert build.target.password == test.target.password == ""
+    assert (build.target.port, test.target.port) == (2201, 2202)
+    assert build.jump_host.host == "jump.example"
+    assert (build.jump_host.username, build.jump_host.port) == ("jump-user",
+                                                                2222)
+    assert build.ssh.batch_mode and not build.ssh.strict_host_key_checking
+    assert build.ssh.known_hosts_file == "/tmp/known hosts"
+    assert build.jump_host.ssh is build.ssh
+    assert build.jump_host.ssh.connect_timeout_s == 9
+    assert build.jump_host.ssh.batch_mode
+    assert not build.jump_host.ssh.strict_host_key_checking
+    assert build.jump_host.ssh.known_hosts_file == "/tmp/known hosts"
+    assert build.paths.remote_path == str(config.run_root)
+
+    for unsafe in (PurePosixPath("//"), PurePosixPath("/tmp/../escape")):
+        with pytest.raises(ValueError, match="canonical absolute"):
+            dataclasses.replace(config, workspace=unsafe).validate()
+
+
+def test_build_targets_use_prebuilt_trt_and_source_edgellm(config):
+    targets = ci.build_targets(config.run_root, config.trt_root,
+                               config.trt_branch, config.cuda_version,
+                               config.jobs)
+    trt, edge = targets
+
+    assert [target.component for target in targets
+            ] == [BuildComponent.TRT, BuildComponent.EDGELLM]
+    assert [target.source for target in targets
+            ] == [ArtifactSource.PRE_BUILT, ArtifactSource.BUILD]
+    assert all(target.mode is BuildMode.RELEASE for target in targets)
+    assert all(target.platform.arch is Arch.D7L for target in targets)
+    assert trt.build.build_dir == str(config.remote("trt-package"))
+    assert trt.build.repo_path == str(config.trt_root)
+    assert edge.build.repo_path == str(config.remote("source"))
+    assert edge.build.build_dir == str(config.remote("build"))
+    assert edge.build.parallel_jobs == 7
+    assert edge.build.trt_package_dir is None
+    assert edge.build.cmake_args == [
+        "-DEMBEDDED_TARGET=auto-thor",
+        f"-DCMAKE_TOOLCHAIN_FILE={config.remote('source')}/cmake/aarch64_linux_toolchain.cmake",
+        "-DENABLE_CUTE_DSL=OFF",
     ]
-    if include_nvtx:
-        files.append("3rdParty/NVTX/CMakeLists.txt")
-    for name in files:
-        path = root / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.touch()
-    return root
 
 
-def test_main_reports_missing_nvtx_submodule(tmp_path, flow_config,
-                                             monkeypatch, capsys):
-    source_root = _make_checkout(tmp_path / "source", include_nvtx=False)
-    config = dataclasses.replace(flow_config, source_root=source_root)
-    monkeypatch.setattr(run_trt_ci_d7l, "parse_args", lambda argv: config)
+def test_worker_prepares_package_then_uses_code_manager(tmp_path):
+    args = _worker_args(tmp_path)
+    commands, code = FakeCommands(), FakeCode()
+    assert ci.BuildWorker(args, ci.WorkerServices(commands, code)).run() == 0
 
-    assert run_trt_ci_d7l.main([]) == 1
-    assert "3rdParty/NVTX/CMakeLists.txt" in capsys.readouterr().err
+    target, spec = commands.calls[0]
+    assert isinstance(target, LocalTarget)
+    assert spec.operation_name == "prepare-trt-package"
+    assert spec.shell_type is ShellType.BASH
+    for text in ("NvInferVersion.h", "parsers/onnx", "Release/lib",
+                 "libnvinfer.so", "libnvonnxparser.so", "cp -a", "readlink -f",
+                 'case "$resolved"', '"$package"/lib/*', "-type l"):
+        assert text in spec.command
+    assert len(code.build_calls) == 1
 
+    failed_commands = FakeCommands(
+        outcomes={"prepare-trt-package": _result(False, 23)})
+    unused_code = FakeCode()
+    assert ci.BuildWorker(args, ci.WorkerServices(failed_commands,
+                                                  unused_code)).run() == 23
+    assert not unused_code.build_calls
 
-@pytest.mark.parametrize("workspace", [
-    pathlib.PurePosixPath("/"),
-    pathlib.PurePosixPath("//"),
-    pathlib.PurePosixPath("relative/workspace"),
-    pathlib.PurePosixPath("/tmp/../escape"),
-])
-def test_config_rejects_unsafe_workspace(flow_config, workspace):
-    with pytest.raises(ValueError, match="workspace"):
-        dataclasses.replace(flow_config, workspace=workspace)
-
-
-@pytest.mark.parametrize("run_id",
-                         ["../escape", "nested/id", ".", "bad;command"])
-def test_config_rejects_unsafe_run_id(flow_config, run_id):
-    with pytest.raises(ValueError, match="run"):
-        dataclasses.replace(flow_config, run_id=run_id)
-
-
-def test_build_and_bundle_quote_paths_and_use_full_candidate_trt(flow_config):
-    flow = run_trt_ci_d7l.TrtCiFlow(flow_config, runner=object())
-    script = flow.render_build_script()
-    workspace = flow_config.run_workspace
-
-    for path in [
-            flow_config.trt_root,
-            flow_config.trt_build_dir,
-            workspace / "source",
-    ]:
-        assert shlex.quote(str(path)) in script
-    for required in [
-            "-DBUILD_UNIT_TESTS=ON",
-            "-DEMBEDDED_TARGET=auto-thor",
-            "cmake/aarch64_linux_toolchain.cmake",
-            "-DTRT_PACKAGE_DIR=\"$pkg\"",
-            "-DCUDA_CTK_VERSION=\"$cuda_version\"",
-            "-DENABLE_CUTE_DSL=OFF",
-            "include/NvInferVersion.h",
-            "parsers/onnx",
-            "NvOnnxParser.h",
-    ]:
-        assert required in script
-    assert "cmake --build" in script and "--parallel 7" in script
-    assert "--target unitTest" not in script
-    assert "/usr/local/cuda/bin/nvcc --version" in run_trt_ci_d7l.TrtCiFlow(
-        dataclasses.replace(flow_config, cuda_version=None),
-        runner=object()).render_build_script()
-
-    bundle = flow.render_bundle_script()
-    for required in [
-            "trt-package/lib",
-            "llm_build",
-            "unittests/resources",
-            "tests/chat_templates",
-            "-name '*.so*'",
-    ]:
-        assert required in bundle
+    failed_code = FakeCode()
+    failed_code.build_result = RunResult(success=False,
+                                         error_messages=["build failed"])
+    assert ci.BuildWorker(args, ci.WorkerServices(FakeCommands(),
+                                                  failed_code)).run() == 1
 
 
-def test_runtime_script_proves_candidate_trt_and_preserves_gtest_status(
-        flow_config):
-    flow = run_trt_ci_d7l.TrtCiFlow(flow_config, runner=object())
-    script = flow.render_test_script()
-    for required in [
+def test_deployment_result_describes_local_prebuilt_artifacts(tmp_path):
+    trt, edge = tmp_path / "runtime/trt", tmp_path / "runtime/edgellm"
+    trt.mkdir(parents=True)
+    edge.mkdir(parents=True)
+    code = FakeCode()
+
+    result = ci.deployment_result(code, trt, edge, "main", "13.2")
+
+    assert result.success and len(code.plan_calls) == 1
+    assert not code.build_calls
+    assert [step.component for step in result.plan.steps
+            ] == [BuildComponent.TRT, BuildComponent.EDGELLM]
+    assert all(step.target.source is ArtifactSource.PRE_BUILT
+               for step in result.plan.steps)
+    assert [
+        result.step_artifacts[step.step_id].output_dir
+        for step in result.plan.steps
+    ] == [str(trt.resolve()), str(edge.resolve())]
+
+
+def test_controller_uses_toolkit_services_in_order(config):
+    harness = _harness(config)
+    assert ci.ControllerFlow(config, harness.services).run() == 0
+
+    _assert_subsequence(harness.events, [
+        "build:probe",
+        "build:remove",
+        "test:probe",
+        "test:remove",
+        "build:ensure",
+        "command:build-host-prerequisites",
+        "command:d7l-prerequisites",
+        "command:stage-source",
+        "build:upload:source",
+        "command:build-worker",
+        "build:download:trt-package",
+        "build:download:build",
+        "code:plan",
+        "code:deploy",
+        "test:upload:resources",
+        "test:upload:chat_templates",
+        "command:d7l-unit-tests",
+        "build:download:artifacts",
+        "test:download:results",
+        "build:remove",
+        "test:remove",
+    ])
+    worker = next(spec for _target, spec in harness.commands.calls
+                  if spec.operation_name == "build-worker")
+    assert worker.argv[0] == "timeout" and "--build-worker" in worker.argv
+    assert "0.5s" in worker.argv
+    assert worker.env == {
+        "PYTHONPATH": f"{config.trt_root}/scripts/devToolkit/src"
+    }
+    assert worker.timeout_s > config.build_timeout_s
+    assert harness.code.deploy_calls[0][2] is DeploymentMode.RSYNC
+
+    probes = {
+        spec.operation_name: spec
+        for _target, spec in harness.commands.calls if spec.operation_name in
+        {"build-host-prerequisites", "d7l-prerequisites"}
+    }
+    assert all(spec.output_mode is OutputMode.CAPTURE
+               for spec in probes.values())
+    for text in ("command -v timeout", config.build_python):
+        assert text in probes["build-host-prerequisites"].command
+    for text in ("aarch64", "/etc/nvidia/version-ubuntu-rootfs.txt",
+                 "/proc/device-tree/compatible", "grep -qi 'nvidia,tegra264'",
+                 "command -v bash ldd readlink awk tee grep tr"):
+        assert text in probes["d7l-prerequisites"].command
+    stage = next(spec for _target, spec in harness.commands.calls
+                 if spec.operation_name == "stage-source")
+    assert "--exclude=/ci artifacts" in stage.argv
+
+    tree = ast.parse(Path(ci.__file__).read_text(encoding="utf-8"))
+    imports = {
+        alias.name.split(".")[0]
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        for alias in node.names
+    }
+    assert "subprocess" not in imports
+    assert not any(
+        isinstance(node, ast.ClassDef) and "Runner" in node.name
+        for node in ast.walk(tree))
+
+
+def test_test_spec_proves_candidate_trt_and_stages_resources(config):
+    harness = _harness(config)
+    assert ci.ControllerFlow(config, harness.services).run() == 0
+    target, spec = next(call for call in harness.commands.calls
+                        if call[1].operation_name == "d7l-unit-tests")
+
+    assert target is harness.test_remote.target
+    assert spec.shell_type is ShellType.BASH
+    assert spec.output_mode is OutputMode.PROGRESS
+    assert spec.cwd == str(config.remote("edgellm"))
+    for text in (
+            f"source {shlex.quote(str(config.run_root / 'setup_environment.sh'))}",
             "not found",
+            "readlink -f",
+            f"{shlex.quote(str(config.run_root / 'trt'))}/*",
+            "libnvinfer",
             "libnvonnxparser",
-            str(flow_config.run_workspace / "trt-package/lib"),
-            "LD_LIBRARY_PATH",
-            "check_ldd \"$run/build/llm_build\" 1",
+            "--gtest_filter='Suite.$case;*'",
             "--gtest_output=xml:",
-            "PIPESTATUS",
-    ]:
-        assert required in script
-    assert "--gtest_filter=" + shlex.quote(flow_config.gtest_filter) in script
+            "PIPESTATUS[0]",
+    ):
+        assert text in spec.command
+    assert [
+        remote for _local, remote, _timeout in harness.test_remote.uploads
+    ] == [
+        str(config.remote("source/unittests/resources")),
+        str(config.remote("source/tests/chat_templates")),
+    ]
 
 
-def _complete_trt_lib_dir(path, marker=None):
-    path.mkdir(parents=True)
-    for name in ["libnvinfer.so.10", "libnvonnxparser.so.10"]:
-        (path / name).write_text(name, encoding="utf-8")
-    if marker:
-        (path / marker).touch()
-
-
-def _run_rendered_library_stage(flow, trt_build, package):
-    lines = flow.render_build_script().splitlines()
-    start = lines.index('exact="$trt_build/Release/lib"; lib_dir=')
-    end = next(index for index, line in enumerate(lines[start:], start)
-               if line.startswith('test -f "$pkg/include/NvInfer.h"'))
-    script = "\n".join([
-        "set -euo pipefail",
-        "trt_build={}".format(shlex.quote(str(trt_build))),
-        "pkg={}".format(shlex.quote(str(package))),
-        'mkdir -p "$pkg/lib"',
-    ] + lines[start:end])
-    return subprocess.run(["bash", "-c", script],
-                          text=True,
-                          capture_output=True,
-                          check=False)
-
-
-def test_rendered_library_selection_prefers_exact_and_rejects_ambiguity(
-        tmp_path, flow_config):
-    flow = run_trt_ci_d7l.TrtCiFlow(flow_config, runner=object())
-    trt_build = tmp_path / "TRT build"
-    exact = trt_build / "Release/lib"
-    _complete_trt_lib_dir(exact, "selected-exact")
-    _complete_trt_lib_dir(trt_build / "a/Release/lib", "fallback-a")
-    _complete_trt_lib_dir(trt_build / "b/Release/lib", "fallback-b")
-
-    package = tmp_path / "package exact"
-    result = _run_rendered_library_stage(flow, trt_build, package)
-    assert result.returncode == 0, result.stderr
-    assert (package / "lib/selected-exact").is_file()
-    assert not (package / "lib/fallback-a").exists()
-
-    ambiguous = tmp_path / "ambiguous build"
-    _complete_trt_lib_dir(ambiguous / "a/Release/lib")
-    _complete_trt_lib_dir(ambiguous / "b/Release/lib")
-    result = _run_rendered_library_stage(flow, ambiguous,
-                                         tmp_path / "package ambiguous")
-    assert result.returncode == 2
-    assert "Expected one complete Release/lib, found 2" in result.stderr
-
-
-def test_rendered_library_stage_rejects_unsafe_symlink(tmp_path, flow_config):
-    flow = run_trt_ci_d7l.TrtCiFlow(flow_config, runner=object())
-    trt_build = tmp_path / "unsafe build"
-    exact = trt_build / "Release/lib"
-    _complete_trt_lib_dir(exact)
-    (exact / "libunsafe.so").symlink_to("/tmp/outside-candidate-trt.so")
-
-    result = _run_rendered_library_stage(flow, trt_build,
-                                         tmp_path / "unsafe package")
-
-    assert result.returncode == 2
-    assert "Absolute TRT symlink" in result.stderr
-
-
-def test_rendered_ldd_accepts_candidate_path_with_spaces(
-        tmp_path, flow_config):
+def test_test_spec_runs_locally_with_candidate_paths_containing_spaces(
+        config, tmp_path):
     config = dataclasses.replace(
-        flow_config,
-        workspace=pathlib.PurePosixPath(str(tmp_path / "remote workspace")),
-        run_id="ldd-spaces",
+        config,
+        workspace=PurePosixPath(str(tmp_path / "D7L workspace with spaces")),
+        artifacts_dir=tmp_path / "controller artifacts",
     )
-    flow = run_trt_ci_d7l.TrtCiFlow(config, runner=object())
-    run = pathlib.Path(str(config.run_workspace))
-    package = run / "trt-package/lib"
-    build = run / "build"
-    package.mkdir(parents=True)
-    build.mkdir(parents=True)
-    for library in ["libnvinfer.so.10", "libnvonnxparser.so.10"]:
-        (package / library).touch()
-    for binary in ["unitTest", "llm_build"]:
-        path = build / binary
-        path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    config.validate()
+    workspace = Path(str(config.run_root))
+    edge = workspace / "edgellm"
+    candidate = workspace / "trt"
+    tools = tmp_path / "fake tools with spaces"
+    (edge / "examples/llm").mkdir(parents=True)
+    candidate.mkdir(parents=True)
+    tools.mkdir()
+    for library in ("libnvinfer.so.10", "libnvonnxparser.so.10"):
+        (candidate / library).touch()
+
+    def executable(path, script):
+        path.write_text(script, encoding="utf-8")
         path.chmod(0o755)
 
-    stub_dir = tmp_path / "stubs"
-    stub_dir.mkdir()
-    ldd = stub_dir / "ldd"
-    ldd.write_text(
-        "#!/bin/bash\n"
-        "printf 'libnvinfer.so.10 => %s (0xabc)\\n' "
-        "\"$FAKE_PACKAGE/libnvinfer.so.10\"\n"
-        "case $1 in *llm_build) "
-        "printf 'libnvonnxparser.so.10 => %s (0xdef)\\n' "
-        "\"$FAKE_PACKAGE/libnvonnxparser.so.10\";; esac\n",
+    executable(
+        edge / "unitTest",
+        """#!/bin/bash
+for arg in "$@"; do
+  case "$arg" in
+    --gtest_output=xml:*)
+      output="${arg#--gtest_output=xml:}"
+      mkdir -p "$(dirname "$output")"
+      printf '<testsuites/>\n' >"$output"
+      ;;
+  esac
+done
+printf 'unit tests passed\n'
+""",
+    )
+    executable(edge / "examples/llm/llm_build", "#!/bin/bash\nexit 0\n")
+    executable(
+        tools / "ldd",
+        """#!/bin/bash
+printf 'libnvinfer.so.10 => %s (0xabc)\n' "$FAKE_TRT/libnvinfer.so.10"
+case "$1" in
+  *llm_build)
+    printf 'libnvonnxparser.so.10 => %s (0xdef)\n' "$FAKE_TRT/libnvonnxparser.so.10"
+    ;;
+esac
+""",
+    )
+    setup = workspace / "setup_environment.sh"
+    setup.write_text(
+        f"export PATH={shlex.quote(str(tools))}:$PATH\n"
+        f"export FAKE_TRT={shlex.quote(str(candidate))}\n",
         encoding="utf-8",
     )
-    ldd.chmod(0o755)
-    environment = dict(os.environ)
-    environment.update({
-        "FAKE_PACKAGE":
-        str(package),
-        "PATH":
-        str(stub_dir) + os.pathsep + environment["PATH"],
-    })
-
-    result = subprocess.run(
-        ["bash", "-c", flow.render_test_script()],
-        env=environment,
-        text=True,
-        capture_output=True,
-        check=False,
+    config.local_root.mkdir(parents=True)
+    harness = _harness(config)
+    flow = ci.ControllerFlow(config, harness.services)
+    flow.deployment = DeploymentResult(
+        remote_target=harness.test_remote.target,
+        remote_workspace=str(workspace),
+        env_script_path=str(setup),
+        environment_exports=EnvironmentExports(),
+        deployment_mode=DeploymentMode.RSYNC,
     )
 
-    assert result.returncode == 0, result.stderr
-    assert str(package) in (run /
-                            "results/ldd.log").read_text(encoding="utf-8")
+    result = CommandManager().run(LocalTarget(), flow._test_spec())
+
+    assert result.success and result.exit_code == 0
+    assert (workspace / "results/unit-tests.xml").read_text(
+        encoding="utf-8") == "<testsuites/>\n"
+    assert "unit tests passed" in (workspace /
+                                   "results/unit-tests.log").read_text(
+                                       encoding="utf-8")
 
 
-class _RecordingRunner:
+@pytest.mark.parametrize(
+    ("failure", "expected_status"),
+    [
+        ("probe", 1),
+        ("source-stage", 19),
+        ("source-upload", 1),
+        ("worker", 37),
+        ("retrieve", 1),
+        ("deploy", 1),
+        ("resource", 1),
+    ],
+)
+def test_primary_failures_stop_before_testing(config, failure,
+                                              expected_status):
+    harness = _harness(config)
+    if failure == "probe":
+        harness.build_remote.connected = False
+    elif failure == "source-stage":
+        harness.commands.outcomes["stage-source"] = _result(False, 19)
+    elif failure == "source-upload":
+        harness.build_remote.upload_fail_names.add("source")
+    elif failure == "worker":
+        harness.commands.outcomes["build-worker"] = _result(False, 37)
+    elif failure == "retrieve":
+        harness.build_remote.download_fail_names.add("trt-package")
+    elif failure == "deploy":
+        harness.code.deploy_error = RuntimeError("deploy failed")
+    elif failure == "resource":
+        harness.test_remote.upload_fail_names.add("resources")
 
-    def __init__(self, failures=None):
-        self.calls = []
-        self.failures = failures or {}
-
-    @property
-    def phases(self):
-        return [phase for phase, _argv in self.calls]
-
-    def run(self, phase, argv, timeout_s):
-        self.calls.append((phase, list(argv)))
-        payload = b"candidate TRT bundle"
-        if phase == "download-bundle":
-            pathlib.Path(argv[-1]).write_bytes(payload)
-        elif phase == "download-digest":
-            pathlib.Path(argv[-1]).write_text(
-                hashlib.sha256(payload).hexdigest() + "  bundle\n",
-                encoding="utf-8",
-            )
-        if phase in self.failures:
-            raise run_trt_ci_d7l.FlowError(phase + " failed",
-                                           self.failures[phase])
-
-
-def test_flow_order_without_network(flow_config):
-    runner = _RecordingRunner()
-    run_trt_ci_d7l.TrtCiFlow(flow_config, runner).run()
-
-    calls = dict(runner.calls)
-    probe_script = calls["probe-test"][-1]
-    assert "aarch64" in probe_script
-    assert "/etc/nvidia/version-ubuntu-rootfs.txt" in probe_script
-
-    sync_argv = calls["sync-source"]
-    excludes = [
-        sync_argv[index + 1] for index, token in enumerate(sync_argv)
-        if token == "--exclude"
-    ]
-    assert ["/.git", "/.worktrees/", "/build/", "/build-*/"] == excludes[:4]
-    assert all(pattern.startswith("/") for pattern in excludes)
-
-    collect_argv = calls["collect-results"]
-    assert collect_argv[0:3] == ["scp", "-r", "-O"]
-    assert "/results" in collect_argv[-2]
-
-    deploy_script = calls["deploy"][-1]
-    assert "sha256sum" in deploy_script
-    assert hashlib.sha256(b"candidate TRT bundle").hexdigest() in deploy_script
-
-    assert runner.phases == [
-        "probe-build",
-        "probe-test",
-        "prepare-build",
-        "sync-source",
-        "build",
-        "bundle",
-        "download-bundle",
-        "download-digest",
-        "prepare-deploy",
-        "upload-bundle",
-        "deploy",
-        "test",
-        "collect-results",
-    ]
+    assert ci.ControllerFlow(config, harness.services).run() == expected_status
+    assert "command:d7l-unit-tests" not in harness.events
+    assert len(harness.build_remote.filesystem.remove_calls) <= 1
+    assert len(harness.test_remote.filesystem.remove_calls) <= 1
 
 
-def test_collection_is_best_effort_and_never_masks_primary(flow_config):
-    best_effort = _RecordingRunner({"collect-results": 91})
-    run_trt_ci_d7l.TrtCiFlow(flow_config, best_effort).run()
+@pytest.mark.parametrize(
+    ("test_result", "collection_fails", "keep_workspace", "expected",
+     "cleanup"),
+    [
+        (_result(False, 41), False, False, 41, False),
+        (_result(False, None, True), False, False, 124, False),
+        (_result(False, None), True, False, 1, False),
+        (_result(), True, False, 0, True),
+        (_result(), False, True, 0, False),
+    ],
+)
+def test_test_status_collection_and_cleanup_precedence(config, test_result,
+                                                       collection_fails,
+                                                       keep_workspace,
+                                                       expected, cleanup):
+    config = dataclasses.replace(config, keep_workspace=keep_workspace)
+    harness = _harness(config)
+    harness.commands.outcomes["d7l-unit-tests"] = test_result
+    if collection_fails:
+        harness.test_remote.download_fail_names.add("results")
 
-    runner = _RecordingRunner({"build": 37, "collect-results": 91})
-
-    with pytest.raises(run_trt_ci_d7l.FlowError) as error:
-        run_trt_ci_d7l.TrtCiFlow(flow_config, runner).run()
-
-    assert error.value.exit_code == 37
-    assert runner.phases[-2:] == ["build", "collect-results"]
-
-
-def test_main_returns_exact_flow_exit(tmp_path, monkeypatch, flow_config):
-    source_root = _make_checkout(tmp_path / "complete-source",
-                                 include_nvtx=True)
-    config = dataclasses.replace(flow_config, source_root=source_root)
-    monkeypatch.setattr(run_trt_ci_d7l, "parse_args", lambda argv: config)
-
-    def fail(_flow):
-        raise run_trt_ci_d7l.FlowError("expected", exit_code=41)
-
-    monkeypatch.setattr(run_trt_ci_d7l.TrtCiFlow, "run", fail)
-    assert run_trt_ci_d7l.main([]) == 41
+    assert ci.ControllerFlow(config, harness.services).run() == expected
+    assert any(
+        PurePosixPath(remote).name == "results"
+        for remote, _local, _timeout in harness.test_remote.downloads)
+    expected_removals = 2 if cleanup else 1
+    assert len(
+        harness.build_remote.filesystem.remove_calls) == expected_removals
+    assert len(
+        harness.test_remote.filesystem.remove_calls) == expected_removals

@@ -32,51 +32,53 @@ python3 scripts/check_oss_release_sanitizer.py
 
 ## TensorRT CI D7L compatibility check
 
-`run_trt_ci_d7l.py` is the downstream compatibility entry point for TensorRT
-CI. It synchronizes this checkout to a Linux build host, creates a package view
-from candidate TensorRT source and build trees, cross-builds the full default
-Edge-LLM target set plus `unitTest`, and runs the tests on D7L. The GTest exit
-code is returned unchanged.
+`run_trt_ci_d7l.py` is the internal TensorRT CI downstream check for Edge-LLM.
+It uses TRT Dev Toolkit for every command, container build, remote transfer,
+and deployment:
+
+1. RemoteConnectionManager stages this checkout on the Linux build host.
+2. A build-host worker gives CodeManager a TRT `PRE_BUILT` package and an
+   Edge-LLM source `BUILD` target for D7L.
+3. RemoteConnectionManager relays both runtime trees to the controller.
+4. `CodeManager.deploy_runtime()` deploys them to D7L, where CommandManager
+   checks candidate TRT linkage and runs `unitTest`.
 
 ```bash
-python3 scripts/run_trt_ci_d7l.py \
+python3.12 scripts/run_trt_ci_d7l.py \
   --trt-root /remote/trt/source \
   --trt-build-dir /remote/trt/build \
+  --trt-branch main \
   --build-host build.example.nvidia.com --build-user trt-ci \
   --test-host d7l.example.nvidia.com --test-user root \
-  --identity-file "$HOME/.ssh/trt-ci" \
   --artifacts-dir "$PWD/artifacts/trt-ci-d7l"
 ```
 
-The TRT paths are paths on the **build host**, not on the controller. By
-default the script reads the CUDA toolkit version from
-`/usr/local/cuda/bin/nvcc --version` there; use `--cuda-version` only when CI
-must override it. Separate `--build-port`/`--test-port` and
-`--build-jump-host`/`--test-jump-host` options support independent endpoints.
-Host keys are verified strictly by default; `--host-key-policy accept-new` is a
-reasonable bootstrap policy for ephemeral CI hosts.
+The TRT paths are absolute paths on the **build host**. The worker assembles the
+CodeManager `PRE_BUILT` package from `<trt-root>/include`, parser headers,
+`<trt-build-dir>/include/NvInferVersion.h`, and
+`<trt-build-dir>/Release/lib`. CodeManager then cross-builds the full default
+Edge-LLM target set with C++ unit tests enabled, `auto-thor`, and CuTe DSL
+disabled. Use `--cuda-version` only when the toolkit default does not match the
+candidate environment.
 
 Prerequisites:
 
-- Python 3.8 or newer plus controller-side `ssh`, `scp`, and `rsync`;
-- initialized Edge-LLM submodules (`git submodule update --init`);
-- key- or agent-based non-interactive SSH access (passwords are unsupported);
-- Bash, CMake, AArch64 Linux compilers, CUDA, `find`, `grep`, `readlink`,
-  `sha256sum`, `sort`, `tar`, and `rsync` on the build host;
-- an AArch64 D7L rootfs with `/etc/nvidia/version-ubuntu-rootfs.txt`, CUDA,
-  Bash, `awk`, `ldd`, `readlink`, `sha256sum`, `tar`, and `tee`;
-- candidate headers under `<trt-root>/include` and `<trt-root>/parsers/onnx`,
-  generated `NvInferVersion.h` under `<trt-build-dir>/include`, and a complete
-  candidate `Release/lib` directory.
+- Python 3.12 and TRT Dev Toolkit on the controller and build host;
+- initialized Edge-LLM submodules;
+- key/agent/OpenSSH-config authentication from the controller to both hosts;
+- TRT container tooling, GNU `timeout`, rsync, and the normal D7L cross-build
+  toolchain on the build host; and
+- Bash, CUDA, `awk`, `ldd`, `readlink`, and `tee` on D7L.
 
-Each run uses only `<workspace>/run-<run-id>` on both hosts. Successful runs
-remove that child unless `--keep-workspace` is set; failed runs preserve it for
-debugging. Phase logs, D7L `ldd` output, GTest output, and GTest XML are retained
-under `<artifacts-dir>/run-<run-id>`.
+The toolkit does not expose a target identity-file override, so keys must be
+available through the CI user's normal SSH agent/config. Separate ports and
+`--build-jump-host`/`--test-jump-host` values support independent endpoints.
+Host keys are strict by default; use `--known-hosts-file` for a CI-owned file or
+`--host-key-policy no` only in an isolated ephemeral environment.
 
-Result collection is best effort and runs even after an earlier failure. A
-collection error is reported as a warning and never replaces either a passing
-status or the primary build/test exit code. Use `--keep-workspace` when remote
-results must survive a controller-side transfer failure. Run
-`python3 scripts/run_trt_ci_d7l.py --help` for filters, concurrency, timeout,
-workspace, and SSH options.
+Each run owns only `<workspace>/run-<run-id>` on each remote host. A successful
+run removes those directories unless `--keep-workspace` is set; failures retain
+them. Controller logs, build-host logs, D7L GTest output, and XML are collected
+under `<artifacts-dir>/run-<run-id>`. Collection and cleanup warnings never
+replace the primary build or test status. Run
+`python3.12 scripts/run_trt_ci_d7l.py --help` for all CI options.
