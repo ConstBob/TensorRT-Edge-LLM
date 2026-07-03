@@ -101,6 +101,12 @@ int CuteDslFFPARunner::run(CuteDslFFPAParams const& params, cudaStream_t stream)
         return -1;
     }
 
+    if (params.cuSeqLenQ == nullptr || params.cuSeqLenK == nullptr)
+    {
+        LOG_ERROR("FFPA CuTe DSL kernel requires cuSeqLenQ/cuSeqLenK (batchSize + 1) int32 device tensors.");
+        return -1;
+    }
+
     if (params.batchSize <= 0 || params.seqlenQ <= 0 || params.seqlenK <= 0 || params.numQHeads <= 0
         || params.numKVHeads <= 0 || params.headDim <= 0)
     {
@@ -169,8 +175,17 @@ int CuteDslFFPARunner::run(CuteDslFFPAParams const& params, cudaStream_t stream)
     oTensor.dynamic_strides[0] = qStrideBatch;
     oTensor.dynamic_strides[1] = qStrideSeq;
 
-    return cute_dsl_ffpa_d512_causal_wrapper(
-        &sD512CausalModule, &qTensor, &kTensor, &vTensor, &oTensor, softmaxScale, params.numKVHeads, stream);
+    // (batchSize + 1) int32 cumulative sequence lengths; stride is statically 1.
+    ffpa_d512_causal_Tensor_mCuSeqLenQ_t cuSeqLenQTensor{};
+    cuSeqLenQTensor.data = const_cast<int32_t*>(params.cuSeqLenQ);
+    cuSeqLenQTensor.dynamic_shapes[0] = params.batchSize + 1;
+
+    ffpa_d512_causal_Tensor_mCuSeqLenK_t cuSeqLenKTensor{};
+    cuSeqLenKTensor.data = const_cast<int32_t*>(params.cuSeqLenK);
+    cuSeqLenKTensor.dynamic_shapes[0] = params.batchSize + 1;
+
+    return cute_dsl_ffpa_d512_causal_wrapper(&sD512CausalModule, &qTensor, &kTensor, &vTensor, &oTensor,
+        &cuSeqLenQTensor, &cuSeqLenKTensor, softmaxScale, params.numKVHeads, stream);
 }
 
 } // namespace trt_edgellm

@@ -255,31 +255,13 @@ std::pair<rt::Tensor, rt::Tensor> AttentionPlugin::deinterleaveKVCache(rt::Tenso
 }
 
 #ifdef CUTE_DSL_FFPA_ENABLED
-void AttentionPlugin::dispatchFFPAKernel(half const* q, half const* k, half const* v, half* o, int32_t batchSize,
-    int32_t seqlenQ, int32_t seqlenK, int32_t numQHeads, int32_t numKVHeads, int32_t headDim, cudaStream_t stream)
+void AttentionPlugin::dispatchFFPAKernel(CuteDslFFPAParams const& params, cudaStream_t stream)
 {
-    CuteDslFFPAParams ffpaParams{};
-    ffpaParams.q = q;
-    ffpaParams.k = k;
-    ffpaParams.v = v;
-    ffpaParams.o = o;
-    ffpaParams.batchSize = batchSize;
-    ffpaParams.seqlenQ = seqlenQ;
-    ffpaParams.seqlenK = seqlenK;
-    ffpaParams.numQHeads = numQHeads;
-    ffpaParams.numKVHeads = numKVHeads;
-    ffpaParams.headDim = headDim;
-    ffpaParams.softmaxScale = 1.0F / std::sqrt(static_cast<float>(headDim));
+    CuteDslFFPAParams ffpaParams = params;
+    ffpaParams.softmaxScale = 1.0F / std::sqrt(static_cast<float>(params.headDim));
     CuteDslFFPARunner::run(ffpaParams, stream);
 }
 #endif
-
-void AttentionPlugin::zeroPrefillOutputForPaddingForFFPA(rt::Tensor& attentionOutput, int32_t batchSize, int32_t seqLen,
-    int32_t numQHeads, int32_t headSize, cudaStream_t stream)
-{
-    size_t const outputBytes = static_cast<size_t>(batchSize) * seqLen * numQHeads * headSize * sizeof(half);
-    CUDA_CHECK(cudaMemsetAsync(attentionOutput.rawPointer(), 0, outputBytes, stream));
-}
 
 AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
     int32_t enableTreeAttention, int32_t enableFp8KVCache, int32_t slidingWindowSize,
@@ -902,16 +884,6 @@ int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, [[maybe_unus
             // Shared-KV + FFPA (headSize=512, no FMHA cubins available).
             if (!mCanImplementFMHA)
             {
-                // FFPA is a dense causal kernel — no cu_seqlens, so chunked prefill is unsupported.
-                if (executionMode == AttentionExecutionMode::kCHUNKED_PREFILL)
-                {
-                    LOG_ERROR(
-                        "AttentionPlugin: headSize=512 shared-KV chunked prefill is not supported with FFPA. "
-                        "FFPA is a dense causal kernel and cannot attend to KV context longer than Q chunk length. "
-                        "Use normal prefill (full sequence) or enable FMHA for chunked prefill.");
-                    return -1;
-                }
-
 #ifdef CUTE_DSL_FFPA_ENABLED
                 if (!mCanImplementFFPA)
                 {
@@ -924,26 +896,44 @@ int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, [[maybe_unus
                     "(B=%d, S=%d, Hq=%d, Hkv=%d, D=%d, cap=%d)",
                     runtimeBatchSize, runtimeSeqLen, mNumQHeads, mNumKVHeads, mHeadSize, kvCacheCapacity);
 
-                // Zero attention output at padding positions before FFPA writes.
-                // FFPA has no cu_seqlens — it processes all positions uniformly.
-                // BS=1 has no padding, so skip the memset.
-                if (runtimeBatchSize > 1)
+                // Per-batch cu_seqlens bound the logical lengths inside the kernel
+                // (bug 6384817): ragged padding keys/rows are masked and the boundary
+                // tile is zero-filled, so no output zeroing WAR is needed.
+                CuteDslFFPAParams ffpaParams{};
+                ffpaParams.q = qInputTensor.dataPointer<half>();
+                ffpaParams.o = attentionOutputTensor.dataPointer<half>();
+                ffpaParams.cuSeqLenQ = cuQSeqLensTensor.dataPointer<int32_t>();
+                ffpaParams.cuSeqLenK = cuKVSeqLensTensor.dataPointer<int32_t>();
+                ffpaParams.batchSize = runtimeBatchSize;
+                ffpaParams.seqlenQ = runtimeSeqLen;
+                ffpaParams.numQHeads = mNumQHeads;
+                ffpaParams.numKVHeads = mNumKVHeads;
+                ffpaParams.headDim = mHeadSize;
+                if (executionMode == AttentionExecutionMode::kCHUNKED_PREFILL)
                 {
-                    zeroPrefillOutputForPaddingForFFPA(
-                        attentionOutputTensor, runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize, stream);
+                    // Chunked prefill: the Q chunk attends the donor cache prefix as
+                    // well, so deinterleave the full capacity and let the per-batch
+                    // cuKVSeqLens (prefix + chunk) drive the bottom-right causal
+                    // offset inside the kernel.
+                    auto [kSplit, vSplit] = deinterleaveKVCache(kvCacheTensor, alignedWorkspacePtr, runtimeBatchSize,
+                        mNumKVHeads, kvCacheCapacity, mHeadSize, 0, stream);
+                    ffpaParams.k = kSplit.dataPointer<half>();
+                    ffpaParams.v = vSplit.dataPointer<half>();
+                    ffpaParams.seqlenK = kvCacheCapacity;
+                    dispatchFFPAKernel(ffpaParams, stream);
                 }
-
-                // Extract K/V from donor's cache (compact: only first runtimeSeqLen tokens)
-                // and run FFPA with native GQA.  seqlenK = runtimeSeqLen so that FFPA's
-                // bottom-right causal mask offset (seqlenK - seqlenQ) is 0, correctly
-                // bounding attention to valid positions.  The compact deinterleave produces
-                // [B, runtimeSeqLen, Hkv, D] so physical stride matches seqlenK — no batch
-                // stride override needed.
-                auto [kSplit, vSplit] = deinterleaveKVCache(kvCacheTensor, alignedWorkspacePtr, runtimeBatchSize,
-                    mNumKVHeads, kvCacheCapacity, mHeadSize, runtimeSeqLen, stream);
-                dispatchFFPAKernel(qInputTensor.dataPointer<half>(), kSplit.dataPointer<half>(),
-                    vSplit.dataPointer<half>(), attentionOutputTensor.dataPointer<half>(), runtimeBatchSize,
-                    runtimeSeqLen, runtimeSeqLen, mNumQHeads, mNumKVHeads, mHeadSize, stream);
+                else
+                {
+                    // Normal prefill: compact deinterleave (first runtimeSeqLen tokens)
+                    // keeps the physical stride at runtimeSeqLen; the logical per-batch
+                    // lengths (cuKVSeqLens == cuQSeqLens, offset 0) mask ragged padding.
+                    auto [kSplit, vSplit] = deinterleaveKVCache(kvCacheTensor, alignedWorkspacePtr, runtimeBatchSize,
+                        mNumKVHeads, kvCacheCapacity, mHeadSize, runtimeSeqLen, stream);
+                    ffpaParams.k = kSplit.dataPointer<half>();
+                    ffpaParams.v = vSplit.dataPointer<half>();
+                    ffpaParams.seqlenK = runtimeSeqLen;
+                    dispatchFFPAKernel(ffpaParams, stream);
+                }
 #else
                 LOG_ERROR("AttentionPlugin: headSize=512 shared-KV prefill requires FFPA (CUTE_DSL_FFPA_ENABLED).");
                 return -1;
@@ -1016,9 +1006,39 @@ int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, [[maybe_unus
                 "(B=%d, S=%d, Hq=%d, Hkv=%d, D=%d)",
                 runtimeBatchSize, runtimeSeqLen, mNumQHeads, mNumKVHeads, mHeadSize);
 
-            dispatchFFPAKernel(qInputTensor.dataPointer<half>(), kInputTensor.dataPointer<half>(),
-                vInputTensor.dataPointer<half>(), attentionOutputTensor.dataPointer<half>(), runtimeBatchSize,
-                runtimeSeqLen, runtimeSeqLen, mNumQHeads, mNumKVHeads, mHeadSize, stream);
+            CuteDslFFPAParams ffpaParams{};
+            ffpaParams.q = qInputTensor.dataPointer<half>();
+            ffpaParams.o = attentionOutputTensor.dataPointer<half>();
+            ffpaParams.cuSeqLenQ = cuQSeqLensTensor.dataPointer<int32_t>();
+            ffpaParams.batchSize = runtimeBatchSize;
+            ffpaParams.seqlenQ = runtimeSeqLen;
+            ffpaParams.numQHeads = mNumQHeads;
+            ffpaParams.numKVHeads = mNumKVHeads;
+            ffpaParams.headDim = mHeadSize;
+            if (executionMode == AttentionExecutionMode::kCHUNKED_PREFILL)
+            {
+                // Chunked prefill: the Q chunk must also attend the KV-cache prefix, so
+                // read K/V back from the just-updated cache.  Per-batch cuKVSeqLens
+                // (prefix + chunk) drive the bottom-right causal offset inside the kernel.
+                auto [kSplit, vSplit] = deinterleaveKVCache(kvCacheTensor, alignedWorkspacePtr, runtimeBatchSize,
+                    mNumKVHeads, kvCacheCapacity, mHeadSize, 0, stream);
+                ffpaParams.k = kSplit.dataPointer<half>();
+                ffpaParams.v = vSplit.dataPointer<half>();
+                ffpaParams.cuSeqLenK = cuKVSeqLensTensor.dataPointer<int32_t>();
+                ffpaParams.seqlenK = kvCacheCapacity;
+                dispatchFFPAKernel(ffpaParams, stream);
+            }
+            else
+            {
+                // Normal prefill: K/V inputs are the current (right-padded) sequences, so
+                // per-batch Q and KV logical lengths coincide (offset 0) — pass cuQSeqLens
+                // for both and ragged padding rows/keys are masked (bug 6384817).
+                ffpaParams.k = kInputTensor.dataPointer<half>();
+                ffpaParams.v = vInputTensor.dataPointer<half>();
+                ffpaParams.cuSeqLenK = cuQSeqLensTensor.dataPointer<int32_t>();
+                ffpaParams.seqlenK = runtimeSeqLen;
+                dispatchFFPAKernel(ffpaParams, stream);
+            }
 #else
             LOG_ERROR("AttentionPlugin: headSize=512 own-KV prefill requires FFPA (CUTE_DSL_FFPA_ENABLED).");
             return -1;
