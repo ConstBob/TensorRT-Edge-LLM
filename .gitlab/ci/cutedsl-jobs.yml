@@ -40,11 +40,8 @@
     BOARD_IP: "192.168.55.1"
     BOARD_USER: "tensorrt_user"
     CUTE_DSL_PATCH_SM110: "0"
-    # Build output lives on the runner-mounted Edge-LLM scratch so it persists across job
-    # failures for SSH-in debugging. Cleanup happens only on success in after_script.
-    # Nested under L0/ because /scratch.edge_llm_cache root only allows writes within
-    # known subdirs (L0, L1, trt_softwares, baselines). Inheriting the L0 namespace also
-    # inherits cleanup_l0_mr_cache (.gitlab/ci/l0-jobs.yml:295) for free on MR close.
+    # Temporary build output lives under L0 and is cleaned on success. Durable
+    # copies are published by publish_cutedsl_artifacts after the pipeline passes.
     CUTE_DSL_OUTPUT_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}/cutedsl_artifacts/${CI_JOB_NAME}"
   script:
     - echo "Pipeline start time:$(date)"
@@ -104,30 +101,7 @@
     - cat "$ARTIFACT_DIR/metadata.json"
     # Copy the tar + sha256 into $CI_PROJECT_DIR so GitLab's `artifacts.paths` (project-relative) can upload them.
     - cp "$CUTE_DSL_OUTPUT_DIR/$CUTE_DSL_ARTIFACT_NAME" "$CUTE_DSL_OUTPUT_DIR/$CUTE_DSL_ARTIFACT_NAME.sha256" "$CI_PROJECT_DIR/"
-    # Publish tarball + sha256 to shared Edge-LLM scratch for downstream consumption.
-    # MR pipelines write under L0/MR_*/... so cleanup_l0_mr_cache reaps it on MR close
-    # (see .gitlab/ci/l0-jobs.yml:295). main/release pipelines write to a stable
-    # cutedsl_artifacts/<branch>/<short_sha>/ namespace plus a 'latest' symlink so
-    # downstream consumers can pin a SHA or follow latest.
-    - |
-      # MR-scoped publish path so all jobs from one MR's pipeline land in the
-      # same MR_<IID>/<pipeline>/ tree. Cleanup_l0_mr_cache reaps it on MR close.
-      if [ -n "$CI_MERGE_REQUEST_IID" ]; then
-        SCRATCH_PUBLISH_DIR="$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}/cutedsl_artifacts/${CUTE_DSL_ARTIFACT_TAG}"
-      else
-        SCRATCH_PUBLISH_DIR="$EDGE_LLM_CACHE_DIR/L0/cutedsl_artifacts/${CI_COMMIT_REF_SLUG}/${CI_COMMIT_SHORT_SHA}/${CUTE_DSL_ARTIFACT_TAG}"
-      fi
-      mkdir -p "$SCRATCH_PUBLISH_DIR"
-      cp "$CUTE_DSL_OUTPUT_DIR/$CUTE_DSL_ARTIFACT_NAME" "$CUTE_DSL_OUTPUT_DIR/$CUTE_DSL_ARTIFACT_NAME.sha256" "$SCRATCH_PUBLISH_DIR/"
-      echo "Published to scratch: $SCRATCH_PUBLISH_DIR/"
-      ls -la "$SCRATCH_PUBLISH_DIR"
-      if [ -z "$CI_MERGE_REQUEST_IID" ]; then
-        LATEST_LINK="$EDGE_LLM_CACHE_DIR/L0/cutedsl_artifacts/${CI_COMMIT_REF_SLUG}/latest"
-        mkdir -p "$(dirname "$LATEST_LINK")"
-        ln -sfn "${CI_COMMIT_SHORT_SHA}" "${LATEST_LINK}.tmp"
-        mv -Tf "${LATEST_LINK}.tmp" "$LATEST_LINK"
-        echo "Updated latest symlink: $LATEST_LINK -> ${CI_COMMIT_SHORT_SHA}"
-      fi
+    - echo "Durable scratch publish is handled by publish_cutedsl_artifacts after the pipeline passes."
     - echo "Pipeline end time:$(date)"
   after_script:
     # Always tear down the on-board temp dirs (keyed by CI_JOB_ID, no cross-job interest).
@@ -157,9 +131,8 @@ build_cutedsl_gb10_artifact:
     CUTE_DSL_ARTIFACT_NAME: "cutedsl_aarch64_sm_121_cuda13.tar.gz"
     CUTE_DSL_ARTIFACT_TAG: "sm_121"
     # Build into the runner-local project dir. The `local-spark` runner does not have
-    # /scratch.edge_llm_cache mounted (verified empirically — mkdir on /scratch.edge_llm_cache/L0
-    # fails with EPERM), so we cannot use the scratch-as-build-dir pattern here. Scratch
-    # publish below is best-effort and silently skipped on this runner.
+    # a reliable writable /scratch.edge_llm_cache mount, so scratch publishing is
+    # handled by publish_cutedsl_artifacts on a scratch-writable runner.
     CUTE_DSL_OUTPUT_DIR: "$CI_PROJECT_DIR/cutedsl_artifacts"
   script:
     - echo "Pipeline start time:$(date)"
@@ -180,32 +153,7 @@ build_cutedsl_gb10_artifact:
     - cat "$ARTIFACT_DIR/metadata.json"
     # Copy the tar + sha256 into $CI_PROJECT_DIR so GitLab's `artifacts.paths` (project-relative) can upload them.
     - cp "$CUTE_DSL_OUTPUT_DIR/$CUTE_DSL_ARTIFACT_NAME" "$CUTE_DSL_OUTPUT_DIR/$CUTE_DSL_ARTIFACT_NAME.sha256" "$CI_PROJECT_DIR/"
-    # Best-effort publish to shared Edge-LLM scratch for downstream consumption.
-    # MR-scoped path (single tree per MR pipeline). On runners where the
-    # CIFS-backed /scratch.edge_llm_cache mount is not writable for the SMB
-    # user (e.g. cross-runner ACL collision when another job already created
-    # the parent dirs), the publish silently skips with a WARN and the GitLab
-    # artifact upload above still serves the tarball.
-    - |
-      if [ -n "$CI_MERGE_REQUEST_IID" ]; then
-        SCRATCH_PUBLISH_DIR="$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}/cutedsl_artifacts/${CUTE_DSL_ARTIFACT_TAG}"
-      else
-        SCRATCH_PUBLISH_DIR="$EDGE_LLM_CACHE_DIR/L0/cutedsl_artifacts/${CI_COMMIT_REF_SLUG}/${CI_COMMIT_SHORT_SHA}/${CUTE_DSL_ARTIFACT_TAG}"
-      fi
-      if mkdir -p "$SCRATCH_PUBLISH_DIR" 2>/dev/null && \
-         cp "$CUTE_DSL_OUTPUT_DIR/$CUTE_DSL_ARTIFACT_NAME" "$CUTE_DSL_OUTPUT_DIR/$CUTE_DSL_ARTIFACT_NAME.sha256" "$SCRATCH_PUBLISH_DIR/" 2>/dev/null; then
-        echo "Published to scratch: $SCRATCH_PUBLISH_DIR/"
-        ls -la "$SCRATCH_PUBLISH_DIR"
-        if [ -z "$CI_MERGE_REQUEST_IID" ]; then
-          LATEST_LINK="$EDGE_LLM_CACHE_DIR/L0/cutedsl_artifacts/${CI_COMMIT_REF_SLUG}/latest"
-          mkdir -p "$(dirname "$LATEST_LINK")" 2>/dev/null && \
-            ln -sfn "${CI_COMMIT_SHORT_SHA}" "${LATEST_LINK}.tmp" && \
-            mv -Tf "${LATEST_LINK}.tmp" "$LATEST_LINK" && \
-            echo "Updated latest symlink: $LATEST_LINK -> ${CI_COMMIT_SHORT_SHA}"
-        fi
-      else
-        echo "WARN: $EDGE_LLM_CACHE_DIR publish failed on this runner ($(hostname)); skipping scratch publish. GitLab artifact upload still serves the tarball."
-      fi
+    - echo "Durable scratch publish is handled by publish_cutedsl_artifacts after the pipeline passes."
     - echo "Pipeline end time:$(date)"
   artifacts:
     name: "cutedsl-gb10-${CI_COMMIT_SHORT_SHA}"
@@ -301,3 +249,72 @@ build_cutedsl_sm87_cuda13_artifact:
     paths:
       - cutedsl_aarch64_sm_87_cuda13.tar.gz
       - cutedsl_aarch64_sm_87_cuda13.tar.gz.sha256
+
+publish_cutedsl_artifacts:
+  stage: publish
+  extends:
+    - .cutedsl_artifact_rules
+  tags:
+    - a30-edgellm-nvks
+  image: "ubuntu:24.04"
+  dependencies:
+    - build_cutedsl_gb10_artifact
+    - build_cutedsl_sm110_artifact
+    - build_cutedsl_x86_sm120_artifact
+    - build_cutedsl_sm87_cuda13_artifact
+  script:
+    - echo "Pipeline start time:$(date)"
+    - 'echo "Node name:${NODE_NAME:-$(hostname)}"'
+    - |
+      set -eu
+      set -- cutedsl_*.tar.gz
+      test -f "$1"
+      test "$#" -eq 4
+
+      artifact_root="${EDGE_LLM_CACHE_DIR}/cutedsl_artifacts"
+      if [ -n "${CI_MERGE_REQUEST_IID:-}" ]; then
+        publish_root="$artifact_root/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
+        latest_root=""
+      else
+        branch_root="$artifact_root/${CI_COMMIT_REF_SLUG}"
+        publish_root="$branch_root/${CI_COMMIT_SHORT_SHA}"
+        latest_root="$branch_root/latest"
+      fi
+
+      publish_tmp="${publish_root}.tmp.${CI_PIPELINE_ID}"
+      rm -rf "$publish_tmp"
+      mkdir -p "$publish_tmp"
+
+      for tarball in "$@"; do
+        checksum="$tarball.sha256"
+        tag="$(printf '%s\n' "$tarball" | sed -E 's/^cutedsl_.*_(sm_[0-9]+)_cuda[0-9]+\.tar\.gz$/\1/')"
+        test "$tag" != "$tarball"
+        test -f "$checksum"
+        dest="$publish_tmp/$tag"
+        mkdir -p "$dest"
+        cp "$tarball" "$checksum" "$dest/"
+        (cd "$dest" && sha256sum -c "$(basename "$checksum")")
+      done
+
+      printf '%s\n' "$CI_COMMIT_SHA" > "$publish_tmp/commit_sha"
+      printf '%s\n' "$CI_PIPELINE_ID" > "$publish_tmp/pipeline_id"
+      rm -rf "$publish_root"
+      mv "$publish_tmp" "$publish_root"
+
+      if [ -n "${latest_root:-}" ]; then
+        latest_tmp="${latest_root}.tmp.${CI_PIPELINE_ID}"
+        rm -rf "$latest_tmp"
+        mkdir -p "$latest_tmp"
+        cp -a "$publish_root/." "$latest_tmp/"
+        rm -rf "$latest_root"
+        mv "$latest_tmp" "$latest_root"
+      fi
+
+      echo "Published $# CuTeDSL package(s) under $publish_root"
+      find "$publish_root" -maxdepth 2 -type f -print | sort
+      if [ -n "${latest_root:-}" ]; then
+        echo "Updated latest directory: $latest_root"
+        find "$latest_root" -maxdepth 2 -type f -print | sort
+      fi
+    - echo "Pipeline end time:$(date)"
+  interruptible: true

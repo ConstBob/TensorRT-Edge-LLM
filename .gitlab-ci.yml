@@ -48,3 +48,4 @@ stages:
 - get-binaries
 - build-sonar
 - sonarqube-vulnerability-report
+- publish

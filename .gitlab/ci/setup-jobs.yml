@@ -43,7 +43,7 @@ l0_cache_cleanup:
       for MR_CACHE_DIR in "$EDGE_LLM_CACHE_DIR/L0"/MR_*; do
         [ -d "$MR_CACHE_DIR" ] || continue
         # Only consider numeric (pipeline ID) directories; skip any non-numeric dirs.
-        LATEST_PIPELINE=$(find "$MR_CACHE_DIR" -mindepth 1 -maxdepth 1 -type d -printf "%f\n" | grep -E '^[0-9]+$' | sort -n | tail -1)
+        LATEST_PIPELINE=$(find "$MR_CACHE_DIR" -mindepth 1 -maxdepth 1 -type d -printf "%f\n" | awk '/^[0-9]+$/ { print }' | sort -n | tail -1)
         [ -n "$LATEST_PIPELINE" ] || continue
         echo "Keeping latest pipeline cache $MR_CACHE_DIR/$LATEST_PIPELINE"
         find "$MR_CACHE_DIR" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended -regex '.*/[0-9]+' ! -name "$LATEST_PIPELINE" -exec rm -rf {} \; -print || true
@@ -58,6 +58,7 @@ l0_cache_cleanup:
     - echo "Pipeline end time:$(date)"
   extends: .l0_rules
   interruptible: true
+  allow_failure: true
 
 # Cache cleanup for L1 directory
 l1_cache_cleanup:
