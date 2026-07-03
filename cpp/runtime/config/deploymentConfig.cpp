@@ -282,6 +282,7 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
         {
             static constexpr int32_t kDFlashDDTreeMaxVerifySize = 128;
             static constexpr int32_t kDFlashDDTreeMaxCandidateTopK = 8;
+            static constexpr int32_t kDFlashDDTreeMaxAcceptedPathLength = 16;
             static constexpr int32_t kDFlashHybridMaxBlockSize = 16;
 
             specConfig.dflashBlockSize = resolveDFlashBlockSize(cfg.base, *cfg.draft, *draftingConfig);
@@ -321,6 +322,11 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
                 ELLM_CHECK(specConfig.verifySize <= kDFlashDDTreeMaxVerifySize,
                     "DFlash DDTree verifySize=" + std::to_string(specConfig.verifySize)
                         + " exceeds node budget limit of " + std::to_string(kDFlashDDTreeMaxVerifySize) + ".");
+                int32_t const maxAcceptedPathLength = std::min(specConfig.dflashBlockSize, specConfig.verifySize);
+                ELLM_CHECK(maxAcceptedPathLength <= kDFlashDDTreeMaxAcceptedPathLength,
+                    "DFlash DDTree max accepted path length=" + std::to_string(maxAcceptedPathLength)
+                        + " exceeds indexed commit path limit of " + std::to_string(kDFlashDDTreeMaxAcceptedPathLength)
+                        + ".");
             }
             bool const hasLinearAttnLayers = (cfg.base.numLinearAttnLayers > 0);
             if (hasLinearAttnLayers)

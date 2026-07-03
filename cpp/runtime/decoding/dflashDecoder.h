@@ -67,19 +67,19 @@ public:
 
 private:
     bool runDraftForward(DecodingInferenceContext& context);
+    bool prepareDFlashVerifyInputs(DecodingInferenceContext& context);
     bool captureDraftCudaGraphs(cudaStream_t stream);
     bool buildTreeVerifyInputs(DecodingInferenceContext& context);
     bool runBaseVerification(DecodingInferenceContext& context);
-    bool executeLinearBaseVerification(
-        DecodingInferenceContext& context, Tensor const& verifyTokenIds, int32_t verifySize);
-    bool executePreparedBaseVerification(DecodingInferenceContext& context, int32_t verifySize);
+    bool executeBaseVerification(DecodingInferenceContext& context, int32_t verifySize);
     void reshapeBaseVerificationForCapture(int32_t batchSize, int32_t verifySize, bool includeTreeMetadata);
     void prepareLinearBaseVerificationMetadata(int32_t batchSize, int32_t verifySize, cudaStream_t stream);
+    void copyVerifyTokenIdsToBaseInput(int32_t batchSize, int32_t verifySize, cudaStream_t stream);
     void runBaseVerificationEmbeddingLookup(
         int32_t batchSize, int32_t verifySize, cudaStream_t stream, bool reshapeGemmaPleOutputs);
     bool capturePreparedBaseVerification(int32_t batchSize, int32_t verifySize, cudaStream_t stream);
     void reshapeBaseVerificationInputsOutputs(int32_t batchSize, int32_t verifySize);
-    void prepareCommonBaseVerificationInputs(int32_t batchSize, int32_t verifySize, cudaStream_t stream);
+    void prepareCommonBaseVerificationInputs(int32_t batchSize, int32_t verifySize);
     void commitAcceptedTreePath(DecodingInferenceContext& context, int32_t verifySize, int32_t maxAcceptLength);
     bool checkCudaLastError(char const* stage) const;
 

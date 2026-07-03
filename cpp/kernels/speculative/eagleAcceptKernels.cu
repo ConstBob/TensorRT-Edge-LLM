@@ -18,6 +18,7 @@
 #include "common/checkMacros.h"
 #include "common/stringUtils.h"
 #include "eagleAcceptKernels.h"
+#include "speculativeKernelsUtils.h"
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
@@ -30,13 +31,6 @@ namespace trt_edgellm
 {
 namespace kernel
 {
-
-// Shared alignment function for workspace buffers
-inline size_t alignWorkspaceSize(size_t size)
-{
-    size_t const alignment = 256; // 256-byte alignment for optimal GPU memory access
-    return (size + alignment - 1) & ~(alignment - 1);
-}
 
 // Internal workspace structure for memory management (similar to SamplingWorkspace)
 struct EagleAcceptWorkspace
@@ -61,7 +55,8 @@ struct EagleAcceptWorkspace
     void setupWorkspace(void* workspace, size_t workspaceSize, int32_t batchSize, int32_t numTokens)
     {
         // Check that workspace is aligned to 256 bytes for optimal GPU memory access
-        ELLM_CHECK(reinterpret_cast<uintptr_t>(workspace) % 256 == 0, "Workspace must be aligned to 256 bytes");
+        ELLM_CHECK(reinterpret_cast<uintptr_t>(workspace) % kSpeculativeWorkspaceAlignment == 0,
+            "Workspace must be aligned to 256 bytes");
 
         ptr = workspace;
         size = workspaceSize;
@@ -70,7 +65,7 @@ struct EagleAcceptWorkspace
         size_t offset = 0;
 
         // Top-1 tokens buffer
-        size_t top1TokensSize = alignWorkspaceSize(batchSize * numTokens * sizeof(int32_t));
+        size_t top1TokensSize = alignSpeculativeWorkspaceSize(batchSize * numTokens * sizeof(int32_t));
         top1Tokens = reinterpret_cast<int32_t*>(static_cast<char*>(ptr) + offset);
         offset += top1TokensSize;
 
@@ -85,7 +80,7 @@ struct EagleAcceptWorkspace
 size_t getEagleAcceptWorkspaceSize(int32_t batchSize, int32_t numTokens)
 {
     // Top-1 tokens buffer
-    return alignWorkspaceSize(batchSize * numTokens * sizeof(int32_t));
+    return alignSpeculativeWorkspaceSize(batchSize * numTokens * sizeof(int32_t));
 }
 
 namespace
