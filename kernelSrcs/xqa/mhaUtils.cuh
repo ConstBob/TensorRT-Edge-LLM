@@ -15,16 +15,95 @@
 #include "mha.h"
 #include "utils.cuh"
 
+__device__ inline uint32_t getTokensPerPage(uint32_t tokensPerPageLog2)
+{
+    return 1U << tokensPerPageLog2;
+}
+
+__device__ inline uint32_t getPageIndexForToken(uint32_t tokenOffset, uint32_t tokensPerPageLog2)
+{
+    return divByPow2(tokenOffset, tokensPerPageLog2);
+}
+
+__device__ inline uint32_t getTokenOffsetInPage(uint32_t tokenOffset, uint32_t tokensPerPageLog2)
+{
+    return modByPow2(tokenOffset, tokensPerPageLog2);
+}
+
+struct PagedKVCacheLayout
+{
+    // Page pool offsets are in GMemCacheHead units. Physical shape: [numPages][tokensPerPage][Hkv].
+    struct StridedLayout4D
+    {
+        uint32_t mStride0;
+        uint32_t mStride1;
+        uint32_t mStride2;
+        uint32_t mStride3;
+
+        __device__ uint32_t operator()(uint32_t idx0, uint32_t idx1, uint32_t idx2, uint32_t idx3) const
+        {
+            return mStride0 * idx0 + mStride1 * idx1 + mStride2 * idx2 + mStride3 * idx3;
+        }
+    };
+
+    __device__ static StridedLayout4D makePageListLayout(uint32_t maxNbPagesPerSeq)
+    {
+#if defined(PAGED_KV_CACHE_LAYOUT) && PAGED_KV_CACHE_LAYOUT == 1
+        // Coordinates: (request, beam, K/V, page). Separate K/V pools use one page table per request.
+        return StridedLayout4D{maxNbPagesPerSeq, 0U, 0U, 1U};
+#else
+        // Coordinates: (request, beam, K/V, page). Physical shape: [B][beam][2][maxPages].
+        return StridedLayout4D{
+            beamWidth * 2U * maxNbPagesPerSeq, 2U * maxNbPagesPerSeq, maxNbPagesPerSeq, 1U};
+#endif
+    }
+
+    __device__ static bool isBadPage(KVCachePageIndex pageIdx)
+    {
+        constexpr uint32_t kBAD_PAGE_FLAG{1U << 31};
+        return (static_cast<uint32_t>(pageIdx) & kBAD_PAGE_FLAG) != 0U;
+    }
+
+    __device__ static uint32_t getHeadOffset(
+        uint32_t seqOffset, uint32_t nbKHeads, uint32_t idxHeadGrp, uint32_t tokensPerPageLog2)
+    {
+        return getTokenOffsetInPage(seqOffset, tokensPerPageLog2) * nbKHeads + idxHeadGrp;
+    }
+
+    __device__ static uint32_t getPoolOffset(KVCachePageIndex pageIdx, uint32_t nbKHeads, uint32_t headOffset,
+        uint32_t tokenOffset, uint32_t tokensPerPageLog2)
+    {
+        uint32_t const tokensPerPage = getTokensPerPage(tokensPerPageLog2);
+        uint32_t const pageStride = nbKHeads * tokensPerPage;
+        return static_cast<uint32_t>(pageIdx) * pageStride + headOffset
+            + getTokenOffsetInPage(tokenOffset, tokensPerPageLog2) * nbKHeads;
+    }
+
+    __device__ static uint32_t getPageListOffset(bool isK, uint32_t idxReq, uint32_t idxBeam, uint32_t idxPage,
+        uint32_t maxNbPagesPerSeq)
+    {
+        auto const pageListLayout = makePageListLayout(maxNbPagesPerSeq);
+        return static_cast<uint32_t>(pageListLayout(idxReq, idxBeam, isK ? 0U : 1U, idxPage));
+    }
+};
+
+// Paged head offsets encode tokenInPage * nbKHeads + idxHeadGrp.
+__device__ inline bool isPageAlignedHeadOffset(uint32_t headOffset, uint32_t nbKHeads)
+{
+    return headOffset < nbKHeads;
+}
+
 // for beam search
-template <typename Head, uint32_t tokensPerPage, uint32_t nbPages>
+template <typename Head, uint32_t nbPages>
 struct IndexedHeadPtrImpl
 {
-    static_assert(tokensPerPage != 0 && nbPages != 0);
+    static_assert(nbPages != 0);
     uint32_t const* indices; // values are in range [0, beamWidth)
     Head* pool;
     Vec<KVCachePageIndex, nbPages> const* pageIndices;
     uint32_t nbKHeads;
     uint32_t offset; // applied onto pool + pointers
+    uint32_t tokensPerPageLog2;
 
     __device__ inline Head& operator[](uint32_t i) const
     {
@@ -34,14 +113,17 @@ struct IndexedHeadPtrImpl
     __device__ inline Head* operator+(uint32_t i) const
     {
         assert(indices[i] < beamWidth);
-        assert(nbPages == 1 || offset % tokensPerPage == 0);
-        auto const pageIdx = pageIndices[indices[i]][nbPages == 1 ? 0U : i / tokensPerPage];
-        return pool + (tokensPerPage * nbKHeads * pageIdx + offset + i % tokensPerPage);
+        assert(nbPages == 1 || isPageAlignedHeadOffset(offset, nbKHeads));
+        auto const pageIdx
+            = pageIndices[indices[i]][nbPages == 1 ? 0U : getPageIndexForToken(i, tokensPerPageLog2)];
+        return PagedKVCacheLayout::isBadPage(pageIdx)
+            ? nullptr
+            : pool + PagedKVCacheLayout::getPoolOffset(pageIdx, nbKHeads, offset, i, tokensPerPageLog2);
     }
 };
 
 template <typename Head>
-struct IndexedHeadPtrImpl<Head, 0, 0>
+struct IndexedHeadPtrImpl<Head, 0>
 {
     uint32_t const* indices; // values are in range [0, beamWidth)
     Head* pointer;
@@ -60,18 +142,19 @@ struct IndexedHeadPtrImpl<Head, 0, 0>
     }
 };
 
-template <typename Head, uint32_t tokensPerPage, uint32_t nbPages = 0>
-using IndexedHeadPtr = IndexedHeadPtrImpl<Head, tokensPerPage, nbPages>;
+template <typename Head, uint32_t nbPages = 0>
+using IndexedHeadPtr = IndexedHeadPtrImpl<Head, nbPages>;
 
 // for beamWidth = 1
-template <typename Head, uint32_t tokensPerPage, uint32_t nbPages>
+template <typename Head, uint32_t nbPages>
 struct HeadPtr
 {
-    static_assert(tokensPerPage != 0 && nbPages != 0);
+    static_assert(nbPages != 0);
     Head* pool;
     Vec<KVCachePageIndex, nbPages> pageIndices;
     uint32_t nbKHeads;
     uint32_t offset; // offset inside the first page.
+    uint32_t tokensPerPageLog2;
 
     __device__ inline Head& operator[](uint32_t i) const
     {
@@ -80,24 +163,75 @@ struct HeadPtr
 
     __device__ inline Head* operator+(uint32_t i) const
     {
-#if PAGED_KV_CACHE_LAYOUT == 1 && USE_PAGED_KV_CACHE
-        auto const pageIdx = pageIndices[nbPages == 1 ? 0U : i / tokensPerPage];
-        return (pageIdx & (1U << 31))
+        assert(nbPages == 1 || isPageAlignedHeadOffset(offset, nbKHeads));
+        auto const pageIdx = pageIndices[nbPages == 1 ? 0U : getPageIndexForToken(i, tokensPerPageLog2)];
+        return PagedKVCacheLayout::isBadPage(pageIdx)
             ? nullptr
-            : pool + (tokensPerPage * nbKHeads * pageIdx + offset + (i % tokensPerPage) * nbKHeads);
-#else
-        assert(nbPages == 1 || offset % tokensPerPage == 0);
-        auto const pageIdx = pageIndices[nbPages == 1 ? 0U : i / tokensPerPage];
-        return (pageIdx & (1U << 31)) ? nullptr
-                                      : pool + (tokensPerPage * nbKHeads * pageIdx + offset + i % tokensPerPage);
-#endif
+            : pool + PagedKVCacheLayout::getPoolOffset(pageIdx, nbKHeads, offset, i, tokensPerPageLog2);
     }
 };
 
 template <typename Head>
-struct HeadPtr<Head, 0, 0> : TinyPtr<Head>
+struct HeadPtr<Head, 0> : TinyPtr<Head>
 {
 };
+
+// Returns the offset within a page for the paged KV cache pool.
+__device__ inline uint32_t getPagedHeadOffset(
+    uint32_t seqOffset, uint32_t nbKHeads, uint32_t idxHeadGrp, uint32_t tokensPerPageLog2)
+{
+    return PagedKVCacheLayout::getHeadOffset(seqOffset, nbKHeads, idxHeadGrp, tokensPerPageLog2);
+}
+
+// Like HeadPtr, but returns a slice inside each full cache head for 2CTA head_dim=512 kernels.
+template <typename Head, typename SliceHead, uint32_t nbPages>
+struct PagedHeadSlicePtr
+{
+    static_assert(nbPages != 0);
+    Head* pool;
+    Vec<KVCachePageIndex, nbPages> pageIndices;
+    uint32_t nbKHeads;
+    uint32_t offset; // offset inside the first page.
+    uint32_t sliceByteOffset;
+    uint32_t tokensPerPageLog2;
+
+    __device__ inline SliceHead& operator[](uint32_t i) const
+    {
+        return *(*this + i);
+    }
+
+    __device__ inline SliceHead* operator+(uint32_t i) const
+    {
+        assert(nbPages == 1 || isPageAlignedHeadOffset(offset, nbKHeads));
+        auto const pageIdx = pageIndices[nbPages == 1 ? 0U : getPageIndexForToken(i, tokensPerPageLog2)];
+        Head* const pHead = PagedKVCacheLayout::isBadPage(pageIdx)
+            ? nullptr
+            : pool + PagedKVCacheLayout::getPoolOffset(pageIdx, nbKHeads, offset, i, tokensPerPageLog2);
+        if (pHead == nullptr)
+        {
+            return nullptr;
+        }
+        uint64_t const base = reinterpret_cast<uint64_t>(pHead);
+        return reinterpret_cast<SliceHead*>(base + sliceByteOffset);
+    }
+};
+
+// Keeps paged KV callers independent of whether the kernel reads a full head or one split slice.
+template <typename Head, typename SliceHead, uint32_t nbPages>
+__device__ inline auto makePagedHeadPtr(
+    Head* pool, Vec<KVCachePageIndex, nbPages> pageIndices, uint32_t nbKHeads, uint32_t offset,
+    uint32_t sliceByteOffset, uint32_t tokensPerPageLog2)
+{
+    if constexpr (twoCtaHeadDim512)
+    {
+        return PagedHeadSlicePtr<Head, SliceHead, nbPages>{
+            pool, pageIndices, nbKHeads, offset, sliceByteOffset, tokensPerPageLog2};
+    }
+    else
+    {
+        return HeadPtr<Head, nbPages>{pool, pageIndices, nbKHeads, offset, tokensPerPageLog2};
+    }
+}
 
 template <typename Head, typename SliceHead>
 struct HeadSlicePtr
@@ -357,13 +491,9 @@ __device__ inline Vec<KVCachePageIndex, nbLoadedPages> getPage(KVCacheList<true>
     for (uint32_t i = 0; i < nbLoadedPages; i++)
     {
         uint32_t const idxPage = idxPageBeg + i;
-#if PAGED_KV_CACHE_LAYOUT == 1 && USE_PAGED_KV_CACHE
-        ret[i] = (idxPage < nbPages ? cacheList.kvCachePageList[maxNbPagesPerSeq * idxReq + idxPage] : kBAD_PAGE_INDEX);
-#else
-        ret[i] = (idxPage < nbPages ? cacheList.kvCachePageList[beamWidth * 2 * maxNbPagesPerSeq * idxReq
-                      + 2 * maxNbPagesPerSeq * idxBeam + maxNbPagesPerSeq * (isK ? 0U : 1U) + idxPage]
-                                    : kBAD_PAGE_INDEX);
-#endif
+        uint32_t const pageListOffset
+            = PagedKVCacheLayout::getPageListOffset(isK, idxReq, idxBeam, idxPage, maxNbPagesPerSeq);
+        ret[i] = idxPage < nbPages ? cacheList.kvCachePageList[pageListOffset] : kBAD_PAGE_INDEX;
     }
     return ret;
 }
@@ -384,9 +514,10 @@ __device__ inline void loadPagesForBeamSearchAsync(uint32_t idxWarp,
     {
         constexpr uint32_t nbBytes = sizeof(KVCachePageIndex);
         uint32_t const idxPage = idxPageBeg + idxLoadedPage;
+        uint32_t const pageListOffset
+            = PagedKVCacheLayout::getPageListOffset(isK, idxReq, idxBeam, idxPage, maxNbPagesPerSeq);
         ldgsts::copyAsync<nbBytes>(&dst[idxBeam][idxLoadedPage],
-            &cacheList.kvCachePageList[beamWidth * 2 * maxNbPagesPerSeq * idxReq + 2 * maxNbPagesPerSeq * idxBeam
-                + (isK ? 0U : maxNbPagesPerSeq) + idxPage],
+            &cacheList.kvCachePageList[pageListOffset],
             idxPage < nbPages ? nbBytes : 0U);
     }
 }

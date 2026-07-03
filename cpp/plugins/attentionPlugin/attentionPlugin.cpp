@@ -308,12 +308,13 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
 
     // XQA decode kernels are needed for decode path when available.
     bool const useSpecDecode = true;
-    mCanImplementXQA = DecoderXQARunner::canImplement(
-        mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType, selectKvCacheDataType(mEnableFp8KVCache));
+    bool const usePagedKVCache = false;
+    mCanImplementXQA = DecoderXQARunner::canImplement(mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType,
+        selectKvCacheDataType(mEnableFp8KVCache), usePagedKVCache);
     if (mCanImplementXQA)
     {
         DecoderXQARunner::loadDecodeXQAKernels(
-            mSMVersion, mDataType, selectKvCacheDataType(mEnableFp8KVCache), useSpecDecode);
+            mSMVersion, mDataType, selectKvCacheDataType(mEnableFp8KVCache), useSpecDecode, usePagedKVCache);
     }
 
     // Kernel selection priority for prefill and decode:
@@ -412,12 +413,13 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
     mCanImplementFMHA = loadFMHAKernels(mUseCuteDslFMHA, mHeadSize, mSMVersion, mDataType);
 
     // XQA decode kernels.
-    mCanImplementXQA = DecoderXQARunner::canImplement(
-        mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType, selectKvCacheDataType(mEnableFp8KVCache));
+    bool const usePagedKVCache = false;
+    mCanImplementXQA = DecoderXQARunner::canImplement(mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType,
+        selectKvCacheDataType(mEnableFp8KVCache), usePagedKVCache);
     if (mCanImplementXQA)
     {
-        DecoderXQARunner::loadDecodeXQAKernels(
-            mSMVersion, mDataType, selectKvCacheDataType(mEnableFp8KVCache), /*useSpecDecodeKernels=*/true);
+        DecoderXQARunner::loadDecodeXQAKernels(mSMVersion, mDataType, selectKvCacheDataType(mEnableFp8KVCache),
+            /*useSpecDecodeKernels=*/true, usePagedKVCache);
     }
 
     if (!mCanImplementFMHA)

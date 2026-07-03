@@ -117,8 +117,9 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
     thrust::device_vector<half> outDevice(outReference.size(), 0.0F);
     thrust::device_vector<int32_t> kvCacheLengthDevice(kvCacheLengths);
 
+    constexpr bool kUsePagedKVCache = false;
     EXPECT_TRUE(trt_edgellm::DecoderXQARunner::canImplement(
-        numQHeads, numKVHeads, headSize, smVersion, DataType::kHALF, DataType::kHALF));
+        numQHeads, numKVHeads, headSize, smVersion, DataType::kHALF, DataType::kHALF, kUsePagedKVCache));
     trt_edgellm::DecoderXQARunner runner(
         DataType::kHALF, DataType::kHALF, batchSize, numQHeads, numKVHeads, headSize, smVersion);
     auto params = runner.initXQAParams();
@@ -248,7 +249,7 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
         thrust::device_vector<__nv_fp8_e4m3> kvInputFp8Device(kvInputFp8);
         thrust::device_vector<half> outFp8Device(batchSize * numQHeads * headSize, __float2half(0.0F));
         EXPECT_TRUE(trt_edgellm::DecoderXQARunner::canImplement(
-            numQHeads, numKVHeads, headSize, smVersion, DataType::kHALF, DataType::kFP8));
+            numQHeads, numKVHeads, headSize, smVersion, DataType::kHALF, DataType::kFP8, kUsePagedKVCache));
         trt_edgellm::DecoderXQARunner runnerFp8(
             DataType::kHALF, DataType::kFP8, batchSize, numQHeads, numKVHeads, headSize, smVersion);
         auto paramsFp8 = runnerFp8.initXQAParams();
