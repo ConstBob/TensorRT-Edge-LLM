@@ -120,15 +120,6 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
 
     mDeployment = createDeploymentConfig(baseConfigPath, draftConfigPath, draftingConfig);
 
-    // Precompute whether any attention layer uses FFPA (headDim=512).
-    // FFPA has no cu_seqlens support and requires zero-padded embeddings for ragged batches.
-    mHasFFPALayer = std::any_of(mDeployment.base.kvLayerConfigs.begin(), mDeployment.base.kvLayerConfigs.end(),
-        [](KVLayerConfig const& kv) { return kv.headDim == 512; });
-    if (mDeployment.base.kvLayerConfigs.empty())
-    {
-        mHasFFPALayer = (mDeployment.base.headDim == 512);
-    }
-
     ELLM_CHECK(mDeployment.base.numDeepstackFeatures <= 0 || !multimodalEngineDir.empty(),
         "--multimodalEngineDir is required for VLM engine.");
 
@@ -1249,14 +1240,6 @@ bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context)
         mGemma4Ple->embed(mIdsInput, context.stream);
     }
 
-    // Zero padding positions in embeddings/PLE to prevent fp16 overflow in FFPA layers.
-    // FFPA (headDim=512) has no cu_seqlens and processes all positions uniformly.
-    // Non-FFPA models (Llama/Qwen) handle padding via cu_seqlens, so skip the memsets.
-    if (activeBatchSize > 1 && mHasFFPALayer)
-    {
-        zeroPaddingForFFPA(hostCtxLenData, activeBatchSize, inputIdsLength, context.stream);
-    }
-
     // Dispatch per-step sequence prep (context lengths H2D, selectTokenIndices).
     mStepPreparer->prepare(
         InferencePhase::kPrefill, activeBatchSize, *mSharedResources->cacheManagers[0], *mPipelineIO, context.stream);
@@ -1807,51 +1790,5 @@ bool LLMInferenceRuntime::performBatchEvict(DecodingInferenceContext& context, D
 
     return true;
 }
-
-void LLMInferenceRuntime::zeroPaddingForFFPA(
-    int32_t const* contextLengths, int32_t batchSize, int32_t inputIdsLength, cudaStream_t stream)
-{
-    int32_t const hiddenSize = mDeployment.base.hiddenSize;
-    for (int32_t b = 0; b < batchSize; ++b)
-    {
-        int32_t const validLen = contextLengths[b];
-        if (validLen < inputIdsLength)
-        {
-            int32_t const padLen = inputIdsLength - validLen;
-            size_t const padOffset = (static_cast<size_t>(b) * inputIdsLength + validLen) * hiddenSize * sizeof(half);
-            size_t const padBytes = static_cast<size_t>(padLen) * hiddenSize * sizeof(half);
-            CUDA_CHECK(cudaMemsetAsync(
-                static_cast<char*>(mPipelineIO->inputsEmbeds.rawPointer()) + padOffset, 0, padBytes, stream));
-        }
-    }
-
-    // Zero PLE at padding positions.
-    if (mGemma4Ple)
-    {
-        int32_t const pleHiddenSize = mDeployment.base.pleHiddenSize;
-        int32_t const numPleInputs = mDeployment.base.numPleInputs;
-        for (int32_t b = 0; b < batchSize; ++b)
-        {
-            int32_t const validLen = contextLengths[b];
-            if (validLen < inputIdsLength)
-            {
-                int32_t const padLen = inputIdsLength - validLen;
-                for (int32_t pleIdx = 0; pleIdx < numPleInputs; ++pleIdx)
-                {
-                    rt::Tensor* pleTensor = mBaseTensorMap.get(binding_names::formatPleTokenEmbedsName(pleIdx));
-                    if (pleTensor)
-                    {
-                        size_t const padOffset
-                            = (static_cast<size_t>(b) * inputIdsLength + validLen) * pleHiddenSize * sizeof(half);
-                        size_t const padBytes = static_cast<size_t>(padLen) * pleHiddenSize * sizeof(half);
-                        CUDA_CHECK(cudaMemsetAsync(
-                            static_cast<char*>(pleTensor->rawPointer()) + padOffset, 0, padBytes, stream));
-                    }
-                }
-            }
-        }
-    }
-}
-
 } // namespace rt
 } // namespace trt_edgellm
