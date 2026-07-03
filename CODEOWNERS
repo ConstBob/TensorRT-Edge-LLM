@@ -6,46 +6,46 @@
 ############################################################
 
 # == C++/CUDA runtime & kernel components ==
-/cpp/builder/ @luxiaoz @fans @amberl @zhijial
-/cpp/common/ @fans @zhijial
-/cpp/kernels/ @fans @ruochengj @xiangg @samcheng @zhazhang
+/cpp/builder/ @luxiaoz @amberl @zhijial
+/cpp/common/ @zhijial @luxiaoz
+/cpp/kernels/ @ruochengj @xiangg @samcheng @zhazhang
 /cpp/multimodal/ @amberl @ruochengj @jiahaoz
-/cpp/plugins/ @fans @ruochengj @zhijial
+/cpp/plugins/ @ruochengj @zhijial @samcheng @poweiw @willg
 /cpp/profiling/ @luxiaoz @amberl @ruochengj @zhijial
-/cpp/runtime/ @fans @amberl @zhijial
-/cpp/sampler/ @luxiaoz @fans @amberl @xiangg
-/cpp/tokenizer/ @amberl @kchemudupati @luxiaoz
+/cpp/runtime/ @amberl @zhijial @xiangg
+/cpp/sampler/ @luxiaoz @amberl @xiangg
+/cpp/tokenizer/ @amberl @luxiaoz @zhijial
 
 # == Build system ==
-**/CMakeLists.txt @fans @luxiaoz @mahu
-/cmake/ @fans @mahu
+**/CMakeLists.txt @luxiaoz @mahu @zhijial
+/cmake/ @mahu @luxiaoz @zhijial
 
 # == Automation tests ==
 /tests/ @luxiaoz @mahu @amberl @xinrzhang
 /.gitlab/ @luxiaoz @mahu @amberl @xinrzhang
 
 # == Examples ==
-/examples/ @luxiaoz @fans @amberl @zhijial @jiahaoz
+/examples/ @luxiaoz @amberl @zhijial @jiahaoz
 
 # == Unit tests ==
-/unittests/ @luxiaoz @fans @amberl @zhijial @xiangg
+/unittests/ @luxiaoz @amberl @zhijial @xiangg
 
 # == Scripts ==
-/scripts/ @luxiaoz @amberl
+/scripts/ @luxiaoz @amberl @zhijial
 
 # == Third-party dependencies ==
-/3rdParty/ @fans @amberl @luxiaoz
+/3rdParty/ @amberl @luxiaoz @zhijial
 
 # == Kernel source we bring from other projects ==
-/kernelSrcs/ @fans @ruochengj @xiangg @samcheng @zhazhang
+/kernelSrcs/ @ruochengj @xiangg @samcheng @zhazhang
 
 # == Experimental ==
-/experimental/ @luxiaoz @amberl
+/experimental/ @luxiaoz @amberl @yuanyao
 
 # == Python frontend ==
-/tensorrt_edgellm/ @luxiaoz @ruochengj @amberl @yuanyao
+/tensorrt_edgellm/ @luxiaoz @ruochengj @amberl @yuanyao @zhijial
 
 # == Documentation ==
-/docs/ @luxiaoz @ffriedmann @kchemudupati @amberl @mchi @xinrzhang
-/.github/ @luxiaoz @ffriedmann @kchemudupati @amberl @mahu @xinrzhang
-/design/ @fans @luxiaoz @zhijial
+/docs/ @luxiaoz @amberl @xinrzhang @mahu
+/.github/ @luxiaoz @amberl @mahu @xinrzhang
+/design/ @fans @luxiaoz @zhijial @amberl
