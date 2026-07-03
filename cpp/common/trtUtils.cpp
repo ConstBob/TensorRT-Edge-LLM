@@ -112,10 +112,10 @@ bool isEngineInput(nvinfer1::ICudaEngine const& engine, std::string const& tenso
 {
     for (int32_t i = 0; i < engine.getNbIOTensors(); ++i)
     {
-        std::string const bindingName = engine.getIOTensorName(i);
-        if (bindingName == tensorName)
+        char const* const bindingName = engine.getIOTensorName(i);
+        if (std::string_view{bindingName} == tensorName)
         {
-            return engine.getTensorIOMode(bindingName.c_str()) == nvinfer1::TensorIOMode::kINPUT;
+            return engine.getTensorIOMode(bindingName) == nvinfer1::TensorIOMode::kINPUT;
         }
     }
     return false;
@@ -126,13 +126,13 @@ std::string printEngineInfo(nvinfer1::ICudaEngine const* engine, int32_t profile
     std::stringstream ss;
     for (int32_t i = 0; i < engine->getNbIOTensors(); ++i)
     {
-        std::string const bindingName = engine->getIOTensorName(i);
+        char const* const bindingName = engine->getIOTensorName(i);
         nvinfer1::Dims const maxDims
-            = engine->getProfileShape(bindingName.c_str(), profileIndex, nvinfer1::OptProfileSelector::kMAX);
+            = engine->getProfileShape(bindingName, profileIndex, nvinfer1::OptProfileSelector::kMAX);
         nvinfer1::Dims const minDims
-            = engine->getProfileShape(bindingName.c_str(), profileIndex, nvinfer1::OptProfileSelector::kMIN);
+            = engine->getProfileShape(bindingName, profileIndex, nvinfer1::OptProfileSelector::kMIN);
         nvinfer1::Dims const optDims
-            = engine->getProfileShape(bindingName.c_str(), profileIndex, nvinfer1::OptProfileSelector::kOPT);
+            = engine->getProfileShape(bindingName, profileIndex, nvinfer1::OptProfileSelector::kOPT);
         ss << "  " << bindingName << ": MIN=" << dimsToString(minDims) << ", OPT=" << dimsToString(optDims)
            << ", MAX=" << dimsToString(maxDims) << "\n";
     }

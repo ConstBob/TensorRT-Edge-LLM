@@ -254,8 +254,8 @@ bool LLMBuilder::build()
     mNumDeepstackFeatures = 0;
     for (int32_t idx = 0; idx < network->getNbInputs(); idx++)
     {
-        std::string const inputName = network->getInput(idx)->getName();
-        if (inputName.find(binding_names::kDeepstackEmbedsTemplate) != std::string::npos)
+        std::string_view const inputName = network->getInput(idx)->getName();
+        if (inputName.find(binding_names::kDeepstackEmbedsTemplate) != std::string_view::npos)
         {
             mNumDeepstackFeatures++;
         }
@@ -772,13 +772,15 @@ bool LLMBuilder::setupPleProfiles(nvinfer1::IOptimizationProfile& contextProfile
 {
     bool result = true;
     bool foundPleInput = false;
-    std::string const prefix = binding_names::kPleTokenEmbedsTemplate;
+    std::string_view const prefix = binding_names::kPleTokenEmbedsTemplate;
 
     for (int32_t idx = 0; idx < network.getNbInputs(); ++idx)
     {
         auto const* input = network.getInput(idx);
-        std::string const inputName = input->getName();
-        if (inputName.rfind(prefix, 0) != 0 || inputName.size() <= prefix.size() || inputName[prefix.size()] != '_')
+        char const* const inputName = input->getName();
+        std::string_view const inputNameView = inputName;
+        if (inputNameView.rfind(prefix, 0) != 0 || inputNameView.size() <= prefix.size()
+            || inputNameView[prefix.size()] != '_')
         {
             continue;
         }
@@ -787,14 +789,13 @@ bool LLMBuilder::setupPleProfiles(nvinfer1::IOptimizationProfile& contextProfile
         auto const inputDims = input->getDimensions();
         if (inputDims.nbDims != 3 || inputDims.d[2] <= 0)
         {
-            LOG_ERROR("PLE input %s must be rank-3 [batch, seq_len, hidden] with static hidden dimension.",
-                inputName.c_str());
+            LOG_ERROR("PLE input %s must be rank-3 [batch, seq_len, hidden] with static hidden dimension.", inputName);
             result = false;
             continue;
         }
 
         int64_t const pleHiddenSize = inputDims.d[2];
-        result &= setOptimizationProfile(&contextProfile, inputName.c_str(), createDims({1, 1, pleHiddenSize}),
+        result &= setOptimizationProfile(&contextProfile, inputName, createDims({1, 1, pleHiddenSize}),
             createDims(
                 {mBuilderConfig.maxBatchSize, std::max<int64_t>(1, mBuilderConfig.maxInputLen / 2), pleHiddenSize}),
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, pleHiddenSize}));
@@ -803,13 +804,13 @@ bool LLMBuilder::setupPleProfiles(nvinfer1::IOptimizationProfile& contextProfile
         {
             int64_t const maxTokens
                 = mBuilderConfig.specDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
-            result &= setOptimizationProfile(&generationProfile, inputName.c_str(), createDims({1, 1, pleHiddenSize}),
+            result &= setOptimizationProfile(&generationProfile, inputName, createDims({1, 1, pleHiddenSize}),
                 createDims({mBuilderConfig.maxBatchSize, std::max<int64_t>(1, maxTokens / 2), pleHiddenSize}),
                 createDims({mBuilderConfig.maxBatchSize, maxTokens, pleHiddenSize}));
         }
         else
         {
-            result &= setOptimizationProfile(&generationProfile, inputName.c_str(), createDims({1, 1, pleHiddenSize}),
+            result &= setOptimizationProfile(&generationProfile, inputName, createDims({1, 1, pleHiddenSize}),
                 createDims({mBuilderConfig.maxBatchSize, 1, pleHiddenSize}),
                 createDims({mBuilderConfig.maxBatchSize, 1, pleHiddenSize}));
         }
@@ -835,10 +836,10 @@ bool LLMBuilder::setupDeepstackProfiles(nvinfer1::IOptimizationProfile& contextP
     std::vector<std::string> deepstackInputs;
     for (int32_t idx = 0; idx < network.getNbInputs(); idx++)
     {
-        std::string const inputName = network.getInput(idx)->getName();
-        if (inputName.find(binding_names::kDeepstackEmbedsTemplate) != std::string::npos)
+        std::string_view const inputName = network.getInput(idx)->getName();
+        if (inputName.find(binding_names::kDeepstackEmbedsTemplate) != std::string_view::npos)
         {
-            deepstackInputs.push_back(inputName);
+            deepstackInputs.emplace_back(inputName);
         }
     }
 
@@ -894,7 +895,7 @@ bool LLMBuilder::setupLmHeadWeightProfiles(nvinfer1::IOptimizationProfile& conte
     bool hasLmHeadWeight = false;
     for (int32_t idx = 0; idx < network.getNbInputs(); idx++)
     {
-        std::string const inputName = network.getInput(idx)->getName();
+        std::string_view const inputName = network.getInput(idx)->getName();
         if (inputName == binding_names::kLmHeadWeight)
         {
             hasLmHeadWeight = true;
@@ -947,9 +948,10 @@ bool LLMBuilder::setupLoraProfiles(nvinfer1::IOptimizationProfile& contextProfil
     for (int i = 0; i < network.getNbInputs(); ++i)
     {
         auto* input = network.getInput(i);
-        std::string const inputName = input->getName();
+        char const* const inputName = input->getName();
+        std::string_view const inputNameView = inputName;
 
-        if (inputName.find(binding_names::kLoraAPrefix) != std::string::npos)
+        if (inputNameView.find(binding_names::kLoraAPrefix) != std::string_view::npos)
         {
             if (!findLoraWeights)
             {
@@ -960,17 +962,15 @@ bool LLMBuilder::setupLoraProfiles(nvinfer1::IOptimizationProfile& contextProfil
             if (dims.nbDims == 2)
             {
                 int64_t gemm_k = dims.d[0];
-                result
-                    &= setOptimizationProfile(&contextProfile, inputName.c_str(), createDims({gemm_k, 0}), // min shape
-                        createDims({gemm_k, mBuilderConfig.maxLoraRank / 2}),                              // opt shape
-                        createDims({gemm_k, mBuilderConfig.maxLoraRank}));                                 // max shape
-                result &= setOptimizationProfile(&generationProfile, inputName.c_str(),
-                    createDims({gemm_k, 0}),                              // min shape
-                    createDims({gemm_k, mBuilderConfig.maxLoraRank / 2}), // opt shape
-                    createDims({gemm_k, mBuilderConfig.maxLoraRank}));    // max shape
+                result &= setOptimizationProfile(&contextProfile, inputName, createDims({gemm_k, 0}),    // min shape
+                    createDims({gemm_k, mBuilderConfig.maxLoraRank / 2}),                                // opt shape
+                    createDims({gemm_k, mBuilderConfig.maxLoraRank}));                                   // max shape
+                result &= setOptimizationProfile(&generationProfile, inputName, createDims({gemm_k, 0}), // min shape
+                    createDims({gemm_k, mBuilderConfig.maxLoraRank / 2}),                                // opt shape
+                    createDims({gemm_k, mBuilderConfig.maxLoraRank}));                                   // max shape
             }
         }
-        else if (inputName.find(binding_names::kLoraBPrefix) != std::string::npos)
+        else if (inputNameView.find(binding_names::kLoraBPrefix) != std::string_view::npos)
         {
             if (!findLoraWeights)
             {
@@ -981,14 +981,12 @@ bool LLMBuilder::setupLoraProfiles(nvinfer1::IOptimizationProfile& contextProfil
             if (dims.nbDims == 2)
             {
                 int64_t gemm_n = dims.d[1];
-                result
-                    &= setOptimizationProfile(&contextProfile, inputName.c_str(), createDims({0, gemm_n}), // min shape
-                        createDims({mBuilderConfig.maxLoraRank / 2, gemm_n}),                              // opt shape
-                        createDims({mBuilderConfig.maxLoraRank, gemm_n}));                                 // max shape
-                result &= setOptimizationProfile(&generationProfile, inputName.c_str(),
-                    createDims({0, gemm_n}),                              // min shape
-                    createDims({mBuilderConfig.maxLoraRank / 2, gemm_n}), // opt shape
-                    createDims({mBuilderConfig.maxLoraRank, gemm_n}));    // max shape
+                result &= setOptimizationProfile(&contextProfile, inputName, createDims({0, gemm_n}),    // min shape
+                    createDims({mBuilderConfig.maxLoraRank / 2, gemm_n}),                                // opt shape
+                    createDims({mBuilderConfig.maxLoraRank, gemm_n}));                                   // max shape
+                result &= setOptimizationProfile(&generationProfile, inputName, createDims({0, gemm_n}), // min shape
+                    createDims({mBuilderConfig.maxLoraRank / 2, gemm_n}),                                // opt shape
+                    createDims({mBuilderConfig.maxLoraRank, gemm_n}));                                   // max shape
             }
         }
     }
