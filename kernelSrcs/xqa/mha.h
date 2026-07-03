@@ -50,8 +50,7 @@ constexpr bool useKVCache = USE_KV_CACHE;
 
 using SeqLenDataType = uint32_t;
 
-constexpr bool usePagedKVCache = USE_PAGED_KV_CACHE;
-constexpr uint32_t tokensPerPage = TOKENS_PER_PAGE;
+constexpr bool usePagedKVCache = (TOKENS_PER_PAGE != 0);
 
 using IOHead = Vec<InputElem, validElemsPerHead>;
 using InputHead = IOHead;
@@ -80,7 +79,8 @@ constexpr bool useInputKV = USE_INPUT_KV;
 
 using GMemKVCacheHead = mha::conditional_t<useInputKV, GMemCacheHead, GMemCacheHead const>;
 
-using KVCachePageIndex = int32_t; // shape: KVCacheHead[nbKHeads][tokensPerPage]. Page index in the global pool of pages
+// Page index in the global pool of pages; page size is selected by TOKENS_PER_PAGE.
+using KVCachePageIndex = int32_t;
 
 constexpr bool allowSlidingWindow = SLIDING_WINDOW;
 
@@ -109,7 +109,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t const nbKHeads,
     InputHead const* q,
 #endif
     float const* attentionSinks, // [headGrpSize]
-#if USE_PAGED_KV_CACHE
+#if TOKENS_PER_PAGE != 0
 #if PAGED_KV_CACHE_LAYOUT == 1
     GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
 #else
@@ -149,7 +149,7 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
     InputHead const* q,
 #endif
     float const* attentionSinks, // [headGrpSize]
-#if USE_PAGED_KV_CACHE
+#if TOKENS_PER_PAGE != 0
 #if PAGED_KV_CACHE_LAYOUT == 1
     GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
 #else
@@ -175,7 +175,7 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 void launchMLA(cudaDeviceProp const& prop,
     uint32_t inputSeqLen, // uniform for all requests and causal mask is assumed
     float qScale, OutputHead* output, InputHead const* q,
-#if USE_PAGED_KV_CACHE
+#if TOKENS_PER_PAGE != 0
     GMemCacheHead* pool, // global pool of pages
     KVCachePageIndex const*
         kvCachePageList, // device pointer. shape: KVCachePage[batchSize][beamWidth][2][maxNbPagesPerSeq]

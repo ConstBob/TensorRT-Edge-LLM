@@ -29,9 +29,11 @@ struct XQALaunchParams
     //! \brief KV cache structure
     struct KVCache
     {
-        void* data = nullptr;                      //!< Pointer to KV cache data
+        void* data = nullptr;                      //!< Pointer to KV cache data or paged KV cache pool
         int32_t const* sequence_lengths = nullptr; //!< Sequence lengths for each request
         uint32_t capacity = 0;                     //!< Cache capacity
+        int32_t const* pageList = nullptr;         //!< Page table for paged KV cache
+        uint32_t tokensPerPage = 0;                //!< Tokens per page, or 0 for contiguous KV cache
     };
     //! \endcond
 
@@ -114,19 +116,21 @@ public:
     //! \param[in] smVersion CUDA SM version
     //! \param[in] dataType Data type for computation
     //! \param[in] kvDataType KV cache data type
+    //! \param[in] usePagedKVCache Whether to check paged KV cache kernels
     //! \return True if implementation is supported, false otherwise
     static bool canImplement(int32_t numQHeads, int32_t numKVHeads, int32_t headSize, int32_t smVersion,
-        nvinfer1::DataType dataType, nvinfer1::DataType kvDataType) noexcept;
+        nvinfer1::DataType dataType, nvinfer1::DataType kvDataType, bool usePagedKVCache) noexcept;
 
     //! \brief Load decoder XQA kernels for given configuration
     //! \param[in] smVersion CUDA SM version
     //! \param[in] dataType Data type for computation (Q dtype)
     //! \param[in] kvDataType KV cache data type
     //! \param[in] useSpecDecodeKernels Whether to load spec-decode kernels
+    //! \param[in] usePagedKVCache Whether to load paged KV cache kernels
     //! \return True if kernels loaded successfully, false otherwise
     //! \throws std::runtime_error if a CUDA driver error occurs
-    static bool loadDecodeXQAKernels(
-        int32_t smVersion, nvinfer1::DataType dataType, nvinfer1::DataType kvDataType, bool useSpecDecodeKernels);
+    static bool loadDecodeXQAKernels(int32_t smVersion, nvinfer1::DataType dataType, nvinfer1::DataType kvDataType,
+        bool useSpecDecodeKernels, bool usePagedKVCache);
 
 private:
     nvinfer1::DataType mDataType;   //!< Data type for computation
