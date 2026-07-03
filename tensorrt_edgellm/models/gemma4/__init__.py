@@ -12,8 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Gemma4 text decoder implementation."""
+"""Gemma4 text and paired MTP assistant decoder implementations."""
 
+from .modeling_gemma4_assistant import (Gemma4AssistantDecoderLayer,
+                                        Gemma4AssistantForCausalLM)
 from .modeling_gemma4_text import (Gemma4Attention, Gemma4DecoderLayer,
                                    Gemma4ForCausalLM, Gemma4Transformer,
                                    Gemma4ValueRMSNorm)
@@ -22,7 +24,9 @@ from .modeling_gemma4_visual import Gemma4VisualModel, build_gemma4_visual
 __all__ = [
     "Gemma4Attention",
     "Gemma4ForCausalLM",
+    "Gemma4AssistantForCausalLM",
     "Gemma4DecoderLayer",
+    "Gemma4AssistantDecoderLayer",
     "Gemma4Transformer",
     "Gemma4ValueRMSNorm",
     "Gemma4VisualModel",

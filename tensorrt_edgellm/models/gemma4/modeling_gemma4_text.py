@@ -159,6 +159,35 @@ def _attention_type_for_layer(config: ModelConfig, layer_idx: int) -> str:
     return "full_attention"
 
 
+def _compute_kv_donor_indices(config: ModelConfig) -> dict[int, int]:
+    """Return shared-layer -> donor-layer KV indices for Gemma4."""
+    num_shared = int(getattr(config, "num_kv_shared_layers", 0) or 0)
+    if num_shared <= 0:
+        return {}
+
+    num_layers = int(config.num_hidden_layers)
+    if num_shared > num_layers:
+        raise ValueError(
+            "Gemma4 num_kv_shared_layers cannot exceed num_hidden_layers: "
+            f"{num_shared} > {num_layers}.")
+
+    first_shared = num_layers - num_shared
+    donors_by_type: dict[str, int] = {}
+    for layer_idx in range(first_shared):
+        donors_by_type[_attention_type_for_layer(config,
+                                                 layer_idx)] = layer_idx
+
+    donor_map: dict[int, int] = {}
+    for layer_idx in range(first_shared, num_layers):
+        attention_type = _attention_type_for_layer(config, layer_idx)
+        if attention_type not in donors_by_type:
+            raise ValueError(
+                "Gemma4 shared KV layer has no compatible donor before the "
+                f"shared range: layer={layer_idx}, type={attention_type}.")
+        donor_map[layer_idx] = donors_by_type[attention_type]
+    return donor_map
+
+
 def _rotary_dim_from_rope_config(config: ModelConfig,
                                  rope_config: dict | None,
                                  head_dim: int | None = None) -> int:
@@ -291,38 +320,6 @@ def _resolve_hidden_activation(
     raise ValueError(
         f"Unsupported hidden_activation for Gemma4 PLE gate: {activation_name!r}"
     )
-
-
-def _compute_kv_donor_indices(config: ModelConfig) -> dict:
-    """Compute the KV donor layer index for each KV-shared layer.
-
-    Returns a dict mapping shared layer_idx -> donor layer_idx.
-    Donor is the last non-shared layer of the same type (sliding/full).
-    """
-    num_kv_shared = getattr(config, "num_kv_shared_layers", 0)
-    if num_kv_shared <= 0:
-        return {}
-    n = config.num_hidden_layers
-    first_shared = n - num_kv_shared
-    layer_types = (list(config.attention_layer_types)
-                   if config.attention_layer_types else [])
-
-    # Find last non-shared layer of each type
-    prev_layers = layer_types[:first_shared]
-    donors: dict = {}
-    for lt in set(prev_layers):
-        donors[lt] = first_shared - 1 - prev_layers[::-1].index(lt)
-
-    result: dict = {}
-    for i in range(first_shared, n):
-        if i < len(layer_types):
-            lt = layer_types[i]
-            if lt not in donors:
-                raise ValueError(
-                    f"KV-shared layer {i} has type '{lt}' with no "
-                    f"non-shared donor layer of the same type.")
-            result[i] = donors[lt]
-    return result
 
 
 class Gemma4ValueRMSNorm(nn.Module):
@@ -860,7 +857,8 @@ class Gemma4ForCausalLM(CausalLM):
 
     def onnx_export_spec(self) -> OnnxSpec:
         """Return Gemma4-specific ONNX export parameters."""
-        if not self.ple_enabled and not self.config.use_dual_rope:
+        if (not self.ple_enabled and not self.config.use_dual_rope
+                and not self.config.gemma4_mtp_base):
             return super().onnx_export_spec()
 
         config = self.config
@@ -871,6 +869,7 @@ class Gemma4ForCausalLM(CausalLM):
 
         Na = config.num_hidden_layers
         eagle_base = config.eagle_base
+        tree_attention_base = eagle_base or config.gemma4_mtp_base
         num_ple_inputs = Na if self.ple_enabled else 0
         device = next(itertools.chain(self.parameters(),
                                       self.buffers())).device
@@ -979,8 +978,8 @@ class Gemma4ForCausalLM(CausalLM):
         rope_batch = torch.export.Dim("rope_batch", min=1, max=256)
         kv_batch = torch.export.Dim("kv_batch", min=1, max=256)
 
-        num_selected = torch.export.Dim("num_selected", min=1,
-                                        max=256) if eagle_base else None
+        num_selected = torch.export.Dim(
+            "num_selected", min=1, max=256) if tree_attention_base else None
         all_shapes: list = [{0: batch, 1: seq}]
         for _ in range(num_ple_inputs):
             all_shapes.append({0: batch, 1: seq})
@@ -991,11 +990,11 @@ class Gemma4ForCausalLM(CausalLM):
             all_shapes.append({0: rope_batch, 1: pos})
         all_shapes.append({0: batch})
         all_shapes.append({0: kv_batch})
-        if eagle_base:
+        if tree_attention_base:
             all_shapes.append({0: batch, 1: num_selected})
         else:
             all_shapes.append({0: batch})
-        if eagle_base:
+        if tree_attention_base:
             attention_pos_id = torch.zeros(batch_size,
                                            seq_len,
                                            dtype=torch.int32,
@@ -1020,8 +1019,9 @@ class Gemma4ForCausalLM(CausalLM):
             Na,
             num_ple_inputs=num_ple_inputs,
             use_dual_rope=config.use_dual_rope,
-            eagle_base=eagle_base,
-            emit_hidden_states=self.emit_hidden_states)
+            eagle_base=tree_attention_base,
+            emit_hidden_states=(self.emit_hidden_states
+                                or config.gemma4_mtp_base))
         wrapped.eval()
 
         return OnnxSpec(wrapped=wrapped,
@@ -1045,6 +1045,7 @@ class Gemma4ForCausalLM(CausalLM):
         rope_rotary_cos_sin_full: torch.Tensor | None = None,
     ) -> Tuple:
         eagle_base = self.config.eagle_base
+        gemma4_mtp_base = self.config.gemma4_mtp_base
         hidden_states, present_key_values, all_hidden_states = self.model(
             inputs_embeds,
             past_key_values,
@@ -1083,5 +1084,8 @@ class Gemma4ForCausalLM(CausalLM):
         if self.emit_hidden_states:
             return logits, self.model.last_pre_norm_hidden_states, \
                 present_key_values
+
+        if gemma4_mtp_base:
+            return logits, hidden_states, present_key_values
 
         return logits, present_key_values

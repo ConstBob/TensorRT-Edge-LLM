@@ -21,6 +21,7 @@
 #include "runtime/streaming.h"
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -91,6 +92,9 @@ struct DecodingInferenceContext
 
     //! Optional per-token callback invoked after each accepted token update.
     std::optional<TokenCallback> onTokenGenerated;
+
+    //! Optional callback used by speculative decoders to stop appending accepted tokens.
+    std::function<bool(int32_t, int32_t)> shouldStopAfterAcceptedToken;
 
     /*!
      * @brief Initialize request-local vectors and scalar fields.

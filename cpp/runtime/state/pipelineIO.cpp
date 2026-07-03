@@ -255,6 +255,33 @@ void buildTensorMapForSpecDecodeDraft(TensorMap& map, PipelineIO& io, SharedReso
     map.set(binding_names::kAttentionPosId, io.specDecodePositionIds);
 }
 
+void buildTensorMapForGemma4MTPDraft(
+    TensorMap& map, PipelineIO& io, SharedResources& res, DeploymentConfig const& bundle)
+{
+    check::check(bundle.draft.has_value(), "buildTensorMapForGemma4MTPDraft requires bundle.draft");
+    check::check(bundle.specConfig.has_value(), "buildTensorMapForGemma4MTPDraft requires bundle.specConfig");
+    check::check(bundle.specDecodeMode() == SpecDecodeMode::kGemma4MTP,
+        "buildTensorMapForGemma4MTPDraft requires spec_decode_type=gemma4_mtp");
+    check::check(!res.cacheManagers.empty(), "buildTensorMapForGemma4MTPDraft requires base cache manager");
+
+    LLMEngineConfig const& draftCfg = *bundle.draft;
+
+    map.set(binding_names::kInputsEmbeds, io.inputsEmbeds);
+    map.set(binding_names::kLogits, io.outputLogits);
+    map.set(binding_names::kBaseModelHiddenStates, io.draftHiddenStatesIn);
+    map.set(binding_names::kOutputHiddenStates, io.draftHiddenStatesOut);
+
+    bindRopeTensors(map, io, res, draftCfg);
+
+    auto& baseCacheManager = *res.cacheManagers[0];
+    map.set(binding_names::kContextLengths, baseCacheManager.getKVCacheLengths());
+    for (auto const& entry : draftCfg.gemma4MTPKVSharingMap)
+    {
+        rt::Tensor& targetKV = baseCacheManager.getCombinedKVCache(entry.targetAbsoluteLayerIdx);
+        map.set(binding_names::formatKVCacheName(entry.assistantLayerIdx, /*isPast=*/true), targetKV);
+    }
+}
+
 PipelineIO PipelineIO::createForLLM(LLMEngineConfig const& cfg, cudaStream_t stream)
 {
     PipelineIO io;
@@ -300,6 +327,8 @@ PipelineIO PipelineIO::createForSpecDecode(
     int32_t const maxDraftProposalSize = bundle.specConfig->maxDraftProposalSize;
     int32_t const draftHiddenSize = bundle.specConfig->draftHiddenSize;
     int32_t const baseOutputHiddenDim = bundle.specConfig->baseOutputHiddenDim;
+    int32_t const draftRuntimeHiddenSize
+        = bundle.specDecodeMode() == SpecDecodeMode::kGemma4MTP ? baseOutputHiddenDim : draftHiddenSize;
     int32_t const draftVocabSize = bundle.draft->vocabSize;
 
     // Use max of base and draft dimensions for shared tensors
@@ -317,8 +346,8 @@ PipelineIO PipelineIO::createForSpecDecode(
         {maxLogitsSize, maxVocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "PipelineIO::outputLogits");
 
     // Allocate hidden states for SpecDecode.
-    allocateSpecDecodeHiddenStates(
-        io, maxRuntimeBatchSize, maxInputLength, baseOutputHiddenDim, draftHiddenSize, nvinfer1::DataType::kHALF);
+    allocateSpecDecodeHiddenStates(io, maxRuntimeBatchSize, maxInputLength, baseOutputHiddenDim, draftRuntimeHiddenSize,
+        nvinfer1::DataType::kHALF);
 
     if (bundle.base.numDeepstackFeatures > 0)
     {

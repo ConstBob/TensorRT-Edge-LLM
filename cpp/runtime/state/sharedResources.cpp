@@ -39,6 +39,7 @@ bool needsBaseVerifyIntermediateStates(DeploymentConfig const& bundle)
     {
     case SpecDecodeMode::kMTP:
     case SpecDecodeMode::kDFlash: return true;
+    case SpecDecodeMode::kGemma4MTP:
     case SpecDecodeMode::kEAGLE:
     case SpecDecodeMode::kNONE: return false;
     }
@@ -191,7 +192,14 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
         resources->cacheManagers.push_back(std::make_unique<HybridCacheManager>(hybridCfg, stream));
     }
 
-    // Draft hybrid cache manager (index 1). Same pattern: pure-attention.
+    // Draft hybrid cache manager (index 1). Gemma4 MTP assistant reads the
+    // base/target KV cache directly and must not allocate a draft-owned cache.
+    if (bundle.specDecodeMode() == SpecDecodeMode::kGemma4MTP)
+    {
+        check::check(bundle.draft->sharesTargetKV && !bundle.draft->hasOwnKVCache,
+            "Gemma4 MTP assistant must share target KV and must not own a draft KV cache.");
+    }
+    else
     {
         rt::KVCacheManager::Config kvCfg{
             /*.numAttentionLayers=*/static_cast<int32_t>(bundle.draft->kvLayerConfigs.size()),

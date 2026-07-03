@@ -233,6 +233,15 @@ def _resolve_model_dir(model: str) -> str:
     return snapshot_download(model)
 
 
+def _resolve_mtp_draft_dir(mtp_draft_dir: str) -> str:
+    """Resolve a user-provided paired MTP draft checkpoint path or HF repo ID."""
+    if os.path.isdir(mtp_draft_dir):
+        return os.path.abspath(mtp_draft_dir)
+    if os.path.isabs(mtp_draft_dir) or mtp_draft_dir.startswith("."):
+        return os.path.abspath(mtp_draft_dir)
+    return _resolve_model_dir(mtp_draft_dir)
+
+
 def _load_config(model_dir: str) -> dict:
     cfg_path = os.path.join(model_dir, "config.json")
     if not os.path.exists(cfg_path):
@@ -255,6 +264,211 @@ def _has_mtp(config: dict) -> bool:
     """Return True when the checkpoint exposes the MTP branch."""
     text_cfg = _get_llm_text_config(config)
     return bool(text_cfg.get("mtp_num_hidden_layers") is not None)
+
+
+def _normalize_gemma4_layer_type(layer_type: str) -> str:
+    if layer_type in ("sliding_attention", "full_attention"):
+        return layer_type
+    raise ValueError(
+        f"Unsupported Gemma4 assistant layer type {layer_type!r}; "
+        "expected sliding_attention or full_attention.")
+
+
+def _assert_tokenizers_match(target_dir: str, assistant_dir: str) -> None:
+
+    def _token_id_map(tokenizer_path: str) -> dict:
+        with open(tokenizer_path) as f:
+            tokenizer = json.load(f)
+        token_ids = {}
+        vocab = tokenizer.get("model", {}).get("vocab", {})
+        if isinstance(vocab, dict):
+            token_ids.update({
+                str(token): int(idx)
+                for token, idx in vocab.items()
+            })
+        for entry in tokenizer.get("added_tokens", []):
+            content = entry.get("content")
+            idx = entry.get("id")
+            if content is not None and idx is not None:
+                token_ids[str(content)] = int(idx)
+        return token_ids
+
+    target_tok = os.path.join(target_dir, "tokenizer.json")
+    assistant_tok = os.path.join(assistant_dir, "tokenizer.json")
+    if not os.path.exists(target_tok) or not os.path.exists(assistant_tok):
+        raise ValueError(
+            "Gemma4 MTP pairing requires tokenizer.json in both target and assistant checkpoints."
+        )
+    if _token_id_map(target_tok) != _token_id_map(assistant_tok):
+        raise ValueError(
+            "Gemma4 MTP target and assistant tokenizer token-id maps differ; "
+            "paired export requires identical token IDs.")
+
+
+def _build_gemma4_kv_sharing_map(target_config: dict,
+                                 assistant_config: dict) -> list[dict]:
+    target_text = _get_llm_text_config(target_config)
+    assistant_text = _get_llm_text_config(assistant_config)
+    target_types = [
+        _normalize_gemma4_layer_type(str(layer_type))
+        for layer_type in target_text.get("layer_types", [])
+    ]
+    assistant_types = [
+        _normalize_gemma4_layer_type(str(layer_type))
+        for layer_type in assistant_text.get("layer_types", [])
+    ]
+    num_shared_target_layers_value = target_text.get("num_kv_shared_layers")
+    num_shared_target_layers = (len(target_types)
+                                if num_shared_target_layers_value is None else
+                                int(num_shared_target_layers_value))
+    num_shared_target_layers = min(num_shared_target_layers, len(target_types))
+    target_share_start = len(target_types) - num_shared_target_layers
+    target_donor_types = target_types[:target_share_start]
+
+    kv_sharing_map = []
+    # Gemma4 assistant layers read target KV from the nearest compatible donor
+    # before the shared-KV suffix. Layers with the same attention type may
+    # intentionally share the same target donor.
+    for assistant_layer, assistant_type in enumerate(assistant_types):
+        matched_target = None
+        for target_layer in range(len(target_donor_types) - 1, -1, -1):
+            if target_types[target_layer] == assistant_type:
+                matched_target = target_layer
+                break
+        if matched_target is None:
+            raise ValueError(
+                "Gemma4 MTP assistant layer %d (%s) cannot be mapped to a "
+                "compatible donor layer before the target shared-KV suffix of %d layers."
+                % (assistant_layer, assistant_type, num_shared_target_layers))
+        kv_sharing_map.append({
+            "assistant_layer": assistant_layer,
+            "target_attention_layer": matched_target,
+            "target_layer": matched_target,
+            "target_layer_type": assistant_type,
+        })
+    return kv_sharing_map
+
+
+def _gemma4_head_dim_for_layer(text_config: dict, layer_type: str) -> int:
+    if layer_type == "full_attention" and text_config.get("global_head_dim"):
+        return int(text_config["global_head_dim"])
+    return int(text_config.get("head_dim", 0))
+
+
+def _validate_gemma4_kv_sharing_contract(target_config: dict,
+                                         assistant_config: dict,
+                                         kv_sharing_map: list[dict]) -> None:
+    target_text = _get_llm_text_config(target_config)
+    assistant_text = _get_llm_text_config(assistant_config)
+    target_types = [
+        _normalize_gemma4_layer_type(str(layer_type))
+        for layer_type in target_text.get("layer_types", [])
+    ]
+    assistant_types = [
+        _normalize_gemma4_layer_type(str(layer_type))
+        for layer_type in assistant_text.get("layer_types", [])
+    ]
+    if len(assistant_types) != int(assistant_text.get("num_hidden_layers", 0)):
+        raise ValueError(
+            "Gemma4 MTP assistant layer_types length must match num_hidden_layers."
+        )
+    if len(target_types) != int(target_text.get("num_hidden_layers", 0)):
+        raise ValueError(
+            "Gemma4 MTP target layer_types length must match num_hidden_layers."
+        )
+    if len(kv_sharing_map) != len(assistant_types):
+        raise ValueError(
+            "Gemma4 MTP kv_sharing_map length must match assistant layer count."
+        )
+
+    target_kv_heads = int(target_text.get("num_key_value_heads", 0))
+    assistant_kv_heads = int(assistant_text.get("num_key_value_heads", 0))
+    if target_kv_heads != assistant_kv_heads:
+        raise ValueError(
+            "Gemma4 MTP KV head mismatch: target num_key_value_heads=%d, assistant num_key_value_heads=%d"
+            % (target_kv_heads, assistant_kv_heads))
+
+    seen_layers = set()
+    for entry in kv_sharing_map:
+        assistant_layer = int(entry["assistant_layer"])
+        target_layer = int(entry["target_attention_layer"])
+        if assistant_layer in seen_layers:
+            raise ValueError(
+                "Gemma4 MTP kv_sharing_map has duplicate assistant layer %d." %
+                assistant_layer)
+        seen_layers.add(assistant_layer)
+        if assistant_layer < 0 or assistant_layer >= len(assistant_types):
+            raise ValueError(
+                "Gemma4 MTP assistant layer %d is outside the assistant layer range."
+                % assistant_layer)
+        if target_layer < 0 or target_layer >= len(target_types):
+            raise ValueError(
+                "Gemma4 MTP target donor layer %d is outside the target layer range."
+                % target_layer)
+
+        assistant_type = assistant_types[assistant_layer]
+        target_type = target_types[target_layer]
+        if assistant_type != target_type:
+            raise ValueError(
+                "Gemma4 MTP layer type mismatch: assistant layer %d is %s, target donor layer %d is %s."
+                % (assistant_layer, assistant_type, target_layer, target_type))
+
+        assistant_head_dim = _gemma4_head_dim_for_layer(
+            assistant_text, assistant_type)
+        target_head_dim = _gemma4_head_dim_for_layer(target_text, target_type)
+        if assistant_head_dim != target_head_dim:
+            raise ValueError(
+                "Gemma4 MTP KV head_dim mismatch: assistant layer %d head_dim=%d, target donor layer %d head_dim=%d."
+                % (assistant_layer, assistant_head_dim, target_layer,
+                   target_head_dim))
+
+    expected_layers = set(range(len(assistant_types)))
+    if seen_layers != expected_layers:
+        missing = sorted(expected_layers - seen_layers)
+        raise ValueError(
+            "Gemma4 MTP kv_sharing_map is missing assistant layers: %s." %
+            missing)
+
+
+def _validate_gemma4_mtp_pair(target_dir: str,
+                              assistant_dir: str) -> list[dict]:
+    target_config = _load_config(target_dir)
+    assistant_config = _load_config(assistant_dir)
+    target_text = _get_llm_text_config(target_config)
+    assistant_text = _get_llm_text_config(assistant_config)
+
+    if target_text.get("model_type") not in ("gemma4", "gemma4_text"):
+        raise ValueError(
+            "Gemma4 MTP target must have model_type gemma4/gemma4_text in text_config."
+        )
+    if assistant_config.get("model_type") != "gemma4_assistant":
+        raise ValueError(
+            "Gemma4 MTP assistant must have root model_type gemma4_assistant.")
+    if int(target_text.get("hidden_size", 0)) != int(
+            assistant_config.get("backbone_hidden_size", 0)):
+        raise ValueError(
+            "Gemma4 MTP hidden mismatch: target hidden_size=%s, assistant backbone_hidden_size=%s"
+            % (target_text.get("hidden_size"),
+               assistant_config.get("backbone_hidden_size")))
+    if int(target_text.get("vocab_size",
+                           0)) != int(assistant_text.get("vocab_size", 0)):
+        raise ValueError(
+            "Gemma4 MTP vocab mismatch: target vocab_size=%s, assistant vocab_size=%s"
+            %
+            (target_text.get("vocab_size"), assistant_text.get("vocab_size")))
+    if int(assistant_text.get("num_kv_shared_layers", 0)) != int(
+            assistant_text.get("num_hidden_layers", 0)):
+        raise ValueError(
+            "Gemma4 MTP assistant requires num_kv_shared_layers == num_hidden_layers."
+        )
+    if not target_text.get("hidden_size_per_layer_input", 0):
+        raise ValueError("Gemma4 MTP target must have PLE enabled.")
+    _assert_tokenizers_match(target_dir, assistant_dir)
+    kv_sharing_map = _build_gemma4_kv_sharing_map(target_config,
+                                                  assistant_config)
+    _validate_gemma4_kv_sharing_contract(target_config, assistant_config,
+                                         kv_sharing_map)
+    return kv_sharing_map
 
 
 def _find_token_id(model_dir: str, token_str: str) -> "Optional[int]":
@@ -516,6 +730,7 @@ def _export_llm(model_dir: str,
                 mtp_base: bool = False,
                 dflash_base: bool = False,
                 dflash_draft_dir: str = "",
+                gemma4_mtp_base: bool = False,
                 externalize_weights: "list[str] | None" = None,
                 tp_size: int = 1) -> None:
     """Export LLM backbone via the standard tensorrt_edgellm pipeline.
@@ -570,6 +785,7 @@ def _export_llm(model_dir: str,
                 mtp_base=mtp_base,
                 dflash_base=dflash_base,
                 dflash_draft_dir=dflash_draft_dir or None,
+                gemma4_mtp_base=gemma4_mtp_base,
                 tp_size=world,
                 tp_rank=rank,
             )
@@ -651,6 +867,41 @@ def _export_mtp_draft(model_dir: str,
         raise SystemExit(1) from exc
 
     logger.info("[MTP Draft] Done: %s", output_path)
+
+
+def _export_gemma4_mtp_draft(target_dir: str, draft_out_dir: str,
+                             assistant_dir: str,
+                             kv_sharing_map: list[dict]) -> None:
+    """Export the paired Gemma4 assistant draft model."""
+    os.makedirs(draft_out_dir, exist_ok=True)
+    output_path = os.path.join(draft_out_dir, "model.onnx")
+    logger.info("[Gemma4 MTP Draft] Target checkpoint: %s", target_dir)
+    logger.info("[Gemma4 MTP Draft] Loading assistant checkpoint from %s",
+                assistant_dir)
+    try:
+        from ..checkpoint.checkpoint_utils import write_runtime_artifacts
+        from ..model import AutoModel
+        model = AutoModel.from_pretrained(
+            assistant_dir,
+            device="cpu",
+            gemma4_mtp_draft=True,
+            gemma4_kv_sharing_map=kv_sharing_map,
+        )
+        write_runtime_artifacts(model, assistant_dir, draft_out_dir)
+    except (OSError, ValueError, RuntimeError, ImportError) as exc:
+        logger.exception("[Gemma4 MTP Draft] Failed to load assistant")
+        raise SystemExit(1) from exc
+
+    logger.info("[Gemma4 MTP Draft] Exporting assistant ONNX to %s",
+                output_path)
+    try:
+        from ..onnx.export import export_onnx
+        export_onnx(model, output_path, model_dir=assistant_dir)
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.exception("[Gemma4 MTP Draft] ONNX export failed")
+        raise SystemExit(1) from exc
+
+    logger.info("[Gemma4 MTP Draft] Done: %s", output_path)
 
 
 def _export_dflash_draft(model_dir: str,
@@ -1656,7 +1907,7 @@ def _extract_code_predictor_weights(model_dir: str, out_dir: str,
 # ---------------------------------------------------------------------------
 
 
-def _build_action_config(root_cfg: dict, weights: dict) -> "ActionConfig":
+def _build_action_config(root_cfg: dict, weights: dict):
     """Build an ActionConfig from the Alpamayo root config and weight dict."""
     from ..config import ActionConfig
 
@@ -1907,8 +2158,29 @@ def main() -> None:
         "--mtp",
         action="store_true",
         help=
-        ("Export MTP components from a single checkpoint (llm/ as mtp_base + mtp_draft/)."
+        ("Export MTP components. Qwen-style checkpoints use checkpoint-internal "
+         "MTP weights; paired MTP models such as Gemma4 require --mtp-draft-dir."
          ),
+    )
+    p.add_argument(
+        "--mtp-draft-dir",
+        "--mtp_draft_dir",
+        dest="mtp_draft_dir",
+        default="",
+        help=(
+            "Path to a paired MTP draft checkpoint. Required for Gemma4 MTP; "
+            "not used by Qwen-style checkpoint-internal MTP."),
+    )
+    p.add_argument(
+        "--mtpDraftModelDir",
+        dest="mtp_draft_dir",
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument(
+        "--gemma4-mtp-assistant-dir",
+        default="",
+        help=argparse.SUPPRESS,
     )
     p.add_argument(
         "--dflash-base",
@@ -1976,6 +2248,11 @@ def main() -> None:
     model_type: str = config.get("model_type", "unknown")
     dtype = _dtype_from_str(args.dtype)
     has_mtp_draft = _has_mtp(config)
+    is_gemma4_target = model_type in _GEMMA4_MODEL_TYPES
+    mtp_draft_dir_arg = args.mtp_draft_dir or args.gemma4_mtp_assistant_dir
+    gemma4_mtp_requested = args.mtp and is_gemma4_target
+    gemma4_mtp_assistant_dir = ""
+    gemma4_kv_sharing_map: list[dict] = []
     externalize_weights = resolve_externalize_weights(args.externalize_weights)
 
     if (model_type == "qwen3_tts"
@@ -1985,6 +2262,12 @@ def main() -> None:
 
     if args.eagle_base and args.mtp:
         p.error("--eagle-base and --mtp cannot be enabled together")
+    if args.mtp_draft_dir and args.gemma4_mtp_assistant_dir:
+        p.error("Use only one MTP draft checkpoint directory option")
+    if mtp_draft_dir_arg and args.eagle_base:
+        p.error("--mtp-draft-dir cannot be combined with --eagle-base")
+    if mtp_draft_dir_arg and (args.dflash_base or args.dflash_draft):
+        p.error("--mtp-draft-dir cannot be combined with DFlash export")
     if args.dflash_base and (args.eagle_base or args.mtp):
         p.error("--dflash-base cannot be combined with --eagle-base or --mtp")
     if args.dflash_draft and (args.eagle_base or args.mtp):
@@ -1993,14 +2276,33 @@ def main() -> None:
         p.error("--dflash-draft requires --dflash-draft-dir")
     if args.mtp and args.skip_llm:
         p.error("--mtp requires LLM export; remove --skip-llm")
+    if mtp_draft_dir_arg and args.skip_llm:
+        p.error("--mtp-draft-dir requires LLM export; remove --skip-llm")
     if args.dflash_base and args.skip_llm:
         p.error("--dflash-base requires LLM export; remove --skip-llm")
     if args.dflash_draft and args.skip_llm:
         logger.info(
             "--dflash-draft implies --skip-llm (draft export is independent)")
-    if args.mtp and not has_mtp_draft:
+    if mtp_draft_dir_arg and not args.mtp:
+        p.error("--mtp-draft-dir requires --mtp")
+    if args.mtp and is_gemma4_target and not mtp_draft_dir_arg:
+        p.error("Gemma4 --mtp requires --mtp-draft-dir <assistant checkpoint>")
+    if args.mtp and not is_gemma4_target and mtp_draft_dir_arg:
+        p.error("--mtp-draft-dir is currently only supported for Gemma4 MTP")
+    if args.mtp and not is_gemma4_target and not has_mtp_draft:
         p.error("--mtp was requested, but the checkpoint does not expose "
                 "MTP weights/config")
+    if gemma4_mtp_requested:
+        try:
+            gemma4_mtp_assistant_dir = _resolve_mtp_draft_dir(
+                mtp_draft_dir_arg)
+            if not os.path.isdir(gemma4_mtp_assistant_dir):
+                p.error("Gemma4 MTP draft directory not found: %s" %
+                        gemma4_mtp_assistant_dir)
+            gemma4_kv_sharing_map = _validate_gemma4_mtp_pair(
+                model_dir, gemma4_mtp_assistant_dir)
+        except ValueError as exc:
+            p.error(str(exc))
 
     _VALID_COMPONENTS = {
         "thinker", "talker", "code_predictor", "visual", "audio", "code2wav",
@@ -2075,20 +2377,25 @@ def main() -> None:
     # drive both the pre-run log and the post-run summary below.
     stages = [
         (_has_llm_component(model_type, "thinker") and not args.skip_llm
-         and not _draft_only and _allow("thinker"), "thinker",
-         lambda out: _export_llm(model_dir,
-                                 out,
-                                 model_type=model_type,
-                                 eagle_base=args.eagle_base,
-                                 mtp_base=args.mtp,
-                                 dflash_base=args.dflash_base,
-                                 dflash_draft_dir=args.dflash_draft_dir,
-                                 fp8_embedding=args.fp8_embedding,
-                                 reduced_vocab_dir=args.reduced_vocab_dir,
-                                 externalize_weights=externalize_weights,
-                                 tp_size=args.tp_size)),
-        (args.mtp, "mtp_draft", lambda out: _export_mtp_draft(
-            model_dir, out, externalize_weights=externalize_weights)),
+         and not _draft_only and _allow("thinker"), "thinker", lambda out:
+         _export_llm(model_dir,
+                     out,
+                     model_type=model_type,
+                     eagle_base=args.eagle_base,
+                     mtp_base=args.mtp and not gemma4_mtp_requested,
+                     dflash_base=args.dflash_base,
+                     dflash_draft_dir=args.dflash_draft_dir,
+                     gemma4_mtp_base=gemma4_mtp_requested,
+                     fp8_embedding=args.fp8_embedding,
+                     reduced_vocab_dir=args.reduced_vocab_dir,
+                     externalize_weights=externalize_weights,
+                     tp_size=args.tp_size)),
+        (args.mtp and not gemma4_mtp_requested
+         and _allow("mtp_draft"), "mtp_draft", lambda out: _export_mtp_draft(
+             model_dir, out, externalize_weights=externalize_weights)),
+        (gemma4_mtp_requested and _allow("mtp_draft"),
+         "mtp_draft", lambda out: _export_gemma4_mtp_draft(
+             model_dir, out, gemma4_mtp_assistant_dir, gemma4_kv_sharing_map)),
         (args.dflash_draft, "dflash_draft", lambda out: _export_dflash_draft(
             model_dir,
             out,
@@ -2133,7 +2440,10 @@ def main() -> None:
         logger.info("  %-15s: %s", component, "yes" if enabled else "no")
     logger.info("FP8 embedding : %s", "yes" if args.fp8_embedding else "no")
     logger.info("MTP capable   : %s", "yes" if has_mtp_draft else "no")
-    logger.info("MTP export    : %s", "yes" if args.mtp else "no")
+    logger.info("MTP export    : %s",
+                "yes" if args.mtp or gemma4_mtp_requested else "no")
+    logger.info("Gemma4 MTP    : %s",
+                gemma4_mtp_assistant_dir if gemma4_mtp_assistant_dir else "no")
     logger.info("DFlash base   : %s", "yes" if args.dflash_base else "no")
     logger.info("DFlash draft  : %s", "yes" if args.dflash_draft else "no")
     logger.info("Reduced vocab : %s",

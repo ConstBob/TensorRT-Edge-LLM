@@ -148,5 +148,13 @@ void buildTensorMap(
 //! @param cfg Draft engine configuration.
 void buildTensorMapForSpecDecodeDraft(TensorMap& map, PipelineIO& io, SharedResources& res, LLMEngineConfig const& cfg);
 
+//! Populate a TensorMap for a Gemma4 MTP assistant draft engine.
+//!
+//! Unlike EAGLE/MTP draft engines, Gemma4 assistant engines do not own a draft
+//! KV cache. Their `past_key_values_*` bindings are zero-copy aliases to the
+//! base target KV cache selected by `draftCfg.gemma4MTPKVSharingMap`.
+void buildTensorMapForGemma4MTPDraft(
+    TensorMap& map, PipelineIO& io, SharedResources& res, DeploymentConfig const& bundle);
+
 } // namespace rt
 } // namespace trt_edgellm

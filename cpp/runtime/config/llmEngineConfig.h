@@ -43,6 +43,15 @@ enum class SpecDecodeMode : int32_t
     kEAGLE,
     kMTP,
     kDFlash,
+    kGemma4MTP,
+};
+
+//! Gemma4 MTP assistant-layer to target-layer shared-KV mapping.
+struct Gemma4MTPKVSharingEntry
+{
+    int32_t assistantLayerIdx{-1};       //!< Assistant local attention-layer index.
+    int32_t targetAttentionLayerIdx{-1}; //!< Target local attention-layer index.
+    int32_t targetAbsoluteLayerIdx{-1};  //!< Target absolute decoder-layer index, derived during validation.
 };
 
 //! Unified configuration for base, vanilla decode, and SpecDecode draft engines.
@@ -148,6 +157,15 @@ struct LLMEngineConfig
 
     //! Target decoder-layer IDs whose hidden states are concatenated for DFlash.
     std::vector<int32_t> dflashTargetLayerIds{};
+
+    // --- Gemma4 MTP shared-target-KV metadata ---
+    std::string modelType;              //!< Top-level model type string, if exported.
+    bool sharesTargetKV{false};         //!< Draft assistant reads target KV cache.
+    bool hasOwnKVCache{true};           //!< Draft assistant owns/writes its own KV cache.
+    bool constantDraftPositions{false}; //!< Assistant draft position IDs stay constant through a chain.
+    bool returnsFeedbackHidden{false};  //!< Assistant emits backbone-space feedback hidden states.
+    int32_t assistantHiddenSize{0};     //!< Assistant internal hidden dim, when distinct from hiddenSize.
+    std::vector<Gemma4MTPKVSharingEntry> gemma4MTPKVSharingMap{}; //!< Assistant -> target KV sharing map.
 
     // --- Per-layer type routing (hybrid cache) ---
 

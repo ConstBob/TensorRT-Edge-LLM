@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -110,7 +111,7 @@ bool isSpecDecodeDraft(Json const& config, char const* type)
 
 bool isValidSpecDecodeType(std::string const& type)
 {
-    return type == "none" || type == "mtp" || type == "eagle3" || type == "dflash";
+    return type == "none" || type == "mtp" || type == "eagle3" || type == "dflash" || type == "gemma4_mtp";
 }
 
 bool isValidEngineRole(std::string const& role)
@@ -129,6 +130,27 @@ bool hasInputBinding(nvinfer1::INetworkDefinition const& network, char const* in
         }
     }
     return false;
+}
+
+std::optional<int64_t> getStaticInputDim(
+    nvinfer1::INetworkDefinition const& network, char const* inputName, int32_t axis)
+{
+    std::string_view const target{inputName};
+    for (int32_t idx = 0; idx < network.getNbInputs(); ++idx)
+    {
+        auto const* input = network.getInput(idx);
+        if (std::string_view{input->getName()} != target)
+        {
+            continue;
+        }
+        nvinfer1::Dims const dims = input->getDimensions();
+        if (axis >= dims.nbDims || dims.d[axis] <= 0)
+        {
+            return std::nullopt;
+        }
+        return dims.d[axis];
+    }
+    return std::nullopt;
 }
 
 } // namespace
@@ -315,7 +337,8 @@ bool LLMBuilder::parseConfig()
     std::string const role = engineRole(mModelConfig);
     if (!isValidSpecDecodeType(specType))
     {
-        LOG_ERROR("Invalid spec_decode_type='%s'. Expected one of: none, mtp, eagle3, dflash.", specType.c_str());
+        LOG_ERROR(
+            "Invalid spec_decode_type='%s'. Expected one of: none, mtp, eagle3, dflash, gemma4_mtp.", specType.c_str());
         return false;
     }
     if (!isValidEngineRole(role))
@@ -347,7 +370,8 @@ bool LLMBuilder::parseConfig()
     {
         mTargetModelOutputHiddenDim = mHiddenSize;
     }
-    else if (isSpecDecodeDraft(mModelConfig, "dflash") && mModelConfig.contains("base_model_hidden_size"))
+    else if ((isSpecDecodeDraft(mModelConfig, "dflash") || isSpecDecodeDraft(mModelConfig, "gemma4_mtp"))
+        && mModelConfig.contains("base_model_hidden_size"))
     {
         mTargetModelOutputHiddenDim = mModelConfig["base_model_hidden_size"].get<int32_t>();
     }
@@ -476,6 +500,21 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
         if (!result)
         {
             LOG_ERROR("Failed to setup DFlash draft optimization profiles");
+            return false;
+        }
+        LOG_DEBUG("%s", printOptimizationProfile(contextProfile, "context_profile", &network).c_str());
+        LOG_DEBUG("%s", printOptimizationProfile(generationProfile, "generation_profile", &network).c_str());
+        config.addOptimizationProfile(contextProfile);
+        config.addOptimizationProfile(generationProfile);
+        return true;
+    }
+
+    if (isSpecDecodeDraft(mModelConfig, "gemma4_mtp"))
+    {
+        result &= setupGemma4MTPDraftProfiles(*contextProfile, *generationProfile, network);
+        if (!result)
+        {
+            LOG_ERROR("Failed to setup Gemma4 MTP draft optimization profiles");
             return false;
         }
         LOG_DEBUG("%s", printOptimizationProfile(contextProfile, "context_profile", &network).c_str());
@@ -764,6 +803,63 @@ bool LLMBuilder::setupDFlashDraftProfiles(
 
     result &= setupOneProfile(contextProfile, optPrefillTargetHiddenLen, maxPrefillTargetHiddenLen);
     result &= setupOneProfile(generationProfile, optDecodeTargetHiddenLen, maxDecodeTargetHiddenLen);
+    return result;
+}
+
+bool LLMBuilder::setupGemma4MTPDraftProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+    nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network)
+{
+    bool result = true;
+    int64_t const baseHiddenSize = mTargetModelOutputHiddenDim;
+
+    auto setupRopeProfile = [&](nvinfer1::IOptimizationProfile& profile, char const* bindingName, int64_t rotaryDim) {
+        return setOptimizationProfile(&profile, bindingName,
+            createDims({1, mBuilderConfig.maxKVCacheCapacity, rotaryDim}),
+            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxKVCacheCapacity, rotaryDim}),
+            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxKVCacheCapacity, rotaryDim}));
+    };
+
+    auto setupOneProfile = [&](nvinfer1::IOptimizationProfile& profile) {
+        bool ok = true;
+        ok &= setOptimizationProfile(&profile, binding_names::kInputsEmbeds, createDims({1, 1, baseHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, 1, baseHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, 1, baseHiddenSize}));
+        ok &= setOptimizationProfile(&profile, binding_names::kBaseModelHiddenStates,
+            createDims({1, 1, baseHiddenSize}), createDims({mBuilderConfig.maxBatchSize, 1, baseHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, 1, baseHiddenSize}));
+        ok &= setOptimizationProfile(&profile, binding_names::kContextLengths, createDims({1}),
+            createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+
+        if (auto const rotaryDim = getStaticInputDim(network, binding_names::kRopeCosSinSliding, 2))
+        {
+            ok &= setupRopeProfile(profile, binding_names::kRopeCosSinSliding, *rotaryDim);
+        }
+        if (auto const rotaryDim = getStaticInputDim(network, binding_names::kRopeCosSinFull, 2))
+        {
+            ok &= setupRopeProfile(profile, binding_names::kRopeCosSinFull, *rotaryDim);
+        }
+        if (auto const rotaryDim = getStaticInputDim(network, binding_names::kRopeCosSin, 2))
+        {
+            ok &= setupRopeProfile(profile, binding_names::kRopeCosSin, *rotaryDim);
+        }
+
+        for (int i = 0; i < mNbKVCacheInputs; ++i)
+        {
+            int64_t const layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
+            int64_t const layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
+            nvinfer1::Dims const minKVCacheShape = createDims({1, 2, layerNumKVHeads, 1, layerHeadSize});
+            nvinfer1::Dims const optKVCacheShape = createDims(
+                {mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
+            nvinfer1::Dims const maxKVCacheShape = optKVCacheShape;
+            ok &= setOptimizationProfile(&profile, binding_names::formatKVCacheName(i, true).c_str(), minKVCacheShape,
+                optKVCacheShape, maxKVCacheShape);
+        }
+
+        return ok;
+    };
+
+    result &= setupOneProfile(contextProfile);
+    result &= setupOneProfile(generationProfile);
     return result;
 }
 

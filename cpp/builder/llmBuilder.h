@@ -231,6 +231,12 @@ private:
     bool setupDFlashDraftProfiles(
         nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
 
+    //! Set up optimization profiles for Gemma4 assistant draft models.
+    //! Gemma4 assistants read base embeddings, target hidden states, target KV,
+    //! and dual RoPE caches, but do not own KV cache or tree-mask inputs.
+    bool setupGemma4MTPDraftProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+        nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network);
+
     //! Set up optimization profiles for Gemma4 PLE tensor inputs.
     //! Gemma4 E-model engines receive one ple_token_embeds_* tensor per layer.
     //! @param contextProfile Optimization profile for context processing

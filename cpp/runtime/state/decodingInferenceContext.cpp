@@ -40,6 +40,7 @@ void DecodingInferenceContext::initialize(int32_t batchSize, int32_t maxGenLengt
     logitBiasPerSlot.resize(batchSize);
     hasLogitBias = false;
     logitBiasGpuDirty = false;
+    shouldStopAfterAcceptedToken = {};
 
     batchIndexMapping.resize(batchSize);
     for (int32_t i = 0; i < batchSize; ++i)
