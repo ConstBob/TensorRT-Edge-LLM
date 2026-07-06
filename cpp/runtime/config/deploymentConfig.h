@@ -37,9 +37,15 @@ namespace rt
  */
 struct SpecDecodeDraftingConfig
 {
-    int32_t draftingTopK{0}; //!< Tokens to select from one predecessor during draft expansion
+    //! Tokens to select from one predecessor during draft expansion. For
+    //! DFlash, this is candidateTopK: 1 is a linear tree and >1 enables branching DDTree.
+    int32_t draftingTopK{0};
     int32_t draftingStep{0}; //!< Number of drafting steps with draft model
     int32_t verifySize{0};   //!< Number of proposal tokens for base model verification
+
+    //! Optional DFlash draft-forward horizon. 0 means infer from the DFlash
+    //! base/draft engine config.
+    int32_t dflashBlockSize{0};
 };
 
 /*!
@@ -71,9 +77,15 @@ struct SpecDecodeConfig
     int32_t maxDraftProposalSize{}; //!< Max seq_len the draft engine accepts for proposal generation
 
     // --- User-supplied drafting parameters ---
-    int32_t draftingTopK{}; //!< Tokens to select from one predecessor during draft expansion
+    //! Tokens to select from one predecessor during draft expansion. For
+    //! DFlash, this is candidateTopK: 1 is a linear tree and >1 enables branching DDTree.
+    int32_t draftingTopK{};
     int32_t draftingStep{}; //!< Number of drafting steps with draft model
     int32_t verifySize{};   //!< Number of proposal tokens for base model verification
+
+    //! DFlash draft-forward horizon. This is independent from draftingStep:
+    //! DFlash runs one draft forward per iteration and that forward emits a full block.
+    int32_t dflashBlockSize{};
 };
 
 //! Complete deployment configuration: the base engine's config, optional draft
@@ -111,8 +123,10 @@ struct DeploymentConfig
 //!   capacities with the user-supplied drafting parameters, and validates them
 //!   against the engines' capacities:
 //!     - `specConfig->verifySize <= specConfig->maxVerifySize`
-//!     - `specConfig->draftingStep * specConfig->draftingTopK <= specConfig->maxDraftProposalSize`
+//!     - non-DFlash: `specConfig->draftingStep * specConfig->draftingTopK <= specConfig->maxDraftProposalSize`
 //!     - MTP requires `draftingTopK == 1` and `verifySize == draftingStep + 1`
+//!     - DFlash: `draftingStep == 1`, `dflashBlockSize <= maxDraftProposalSize`, and
+//!       `draftingTopK` is candidateTopK: 1 uses the linear-tree fast path while >1 uses branching DDTree.
 //!   Throws with named-fields message on violation.
 //!
 //! @throws std::runtime_error on any validation failure or parse failure.

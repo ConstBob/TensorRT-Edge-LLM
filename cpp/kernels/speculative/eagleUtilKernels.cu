@@ -795,8 +795,8 @@ void eagleBaseCommitKVCache(rt::Tensor const& acceptedIndices, rt::Tensor const&
     check::check(
         static_cast<int32_t>(acceptIndicesShape[1]) == maxDepth, "acceptedIndices second dim must match maxDepth.");
 
-    constexpr int32_t MAX_PATH{8};
-    check::check(maxDepth <= (MAX_PATH + 1), "maxDepth > 9 is not supported by the kernel.");
+    constexpr int32_t MAX_PATH{16};
+    check::check(maxDepth <= MAX_PATH, "maxDepth > 16 is not supported by the kernel.");
 
     // Each CTA has 128 threads, each thread copies vecSize elements (DVec<half> = 8 elements;
     // DVec<__nv_fp8_e4m3> is also 8 elements wide, so the block-dim math is dtype-agnostic).
@@ -898,8 +898,8 @@ void eagleBaseAssembleHiddenState(
     check::check(acceptLengthsShape[0] == batchSize, "acceptLengths should have same batch size as acceptedIndices.");
     check::check(hiddenStateShape[0] == batchSize, "hiddenState batch size should match acceptedIndices.");
 
-    constexpr int32_t MAX_PATH{8};
-    check::check(maxDepth <= (MAX_PATH + 1), "maxDepth > 9 is not supported by the kernel.");
+    constexpr int32_t MAX_PATH{16};
+    check::check(maxDepth <= MAX_PATH, "maxDepth > 16 is not supported by the kernel.");
 
     constexpr uint32_t vecSize = DVec<half>::vec_size;
     constexpr uint32_t threadsPerBlock = 128;

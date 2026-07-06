@@ -70,7 +70,8 @@ enum LLMInferenceOptionId : int
     TALKER_ENGINE_DIR = 917,
     CODE2WAV_ENGINE_DIR = 918,
     OUTPUT_AUDIO_DIR = 919,
-    ENABLE_THINKER_TALKER_STREAMING = 920
+    ENABLE_THINKER_TALKER_STREAMING = 920,
+    DFLASH_BLOCK_SIZE = 921
 };
 
 // Struct to hold speculative decoding arguments (used by both EAGLE and MTP)
@@ -89,6 +90,9 @@ struct SpecDecodeArgs
 
     // Number of proposal tokens to select for base model verification.
     int32_t verifySize{60};
+
+    // DFlash-only draft horizon. 0 means infer from the engine config.
+    int32_t dflashBlockSize{0};
 };
 
 struct LLMInferenceArgs
@@ -139,7 +143,7 @@ void printUsage(char const* programName)
                  "[--dumpProfile] [--profileOutputFile=<path to profile output file>] [--warmup=<number>] [--debug] "
                  "[--dumpOutput] [--batchSize=<number>] [--maxGenerateLength=<number>] [--specDecode] "
                  "[--specDraftTopK=<number>] [--specDraftStep=<number>] "
-                 "[--specVerifySize=<number>]"
+                 "[--specVerifySize=<number>] [--dflashBlockSize=<number>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --help                    Display this help message" << std::endl;
@@ -156,12 +160,16 @@ void printUsage(char const* programName)
     std::cerr << "  --maxGenerateLength       Override max generate length from input file" << std::endl;
     std::cerr << "                            NOTE: For sampling parameters (temperature, top_p, top_k)," << std::endl;
     std::cerr << "                            please specify them in the input JSON file instead of CLI" << std::endl;
-    std::cerr << "  --specDecode              Enable speculative decoding (EAGLE or MTP)" << std::endl;
+    std::cerr << "  --specDecode              Enable speculative decoding (EAGLE, MTP, or DFlash)" << std::endl;
     std::cerr << "  --specDraftTopK           Number of tokens selected per drafting step (default: 10)" << std::endl;
-    std::cerr << "                            Controls candidate count per draft expansion step" << std::endl;
+    std::cerr << "                            For DFlash: candidateTopK; 1 is linear, >1 enables branching DDTree"
+              << std::endl;
     std::cerr << "  --specDraftStep           Number of drafting steps to perform (default: 6)" << std::endl;
-    std::cerr << "                            Each step extends the current draft proposal" << std::endl;
+    std::cerr << "                            DFlash requires this to be 1; use dflashBlockSize for proposal horizon"
+              << std::endl;
     std::cerr << "  --specVerifySize          Number of proposal tokens for base verification (default: 60)"
+              << std::endl;
+    std::cerr << "  --dflashBlockSize         DFlash proposal block size; 0 means infer from engine config"
               << std::endl;
     std::cerr << "\nQwen3-Omni Audio Output Options:" << std::endl;
     std::cerr << "  --enableAudioOutput       Enable audio output from Thinker hidden states" << std::endl;
@@ -191,6 +199,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"specVerifySize", required_argument, 0, LLMInferenceOptionId::SPEC_VERIFY_SIZE},
         {"specVerifyTreeSize", required_argument, 0, LLMInferenceOptionId::SPEC_VERIFY_SIZE},
         {"eagleVerifyTreeSize", required_argument, 0, LLMInferenceOptionId::SPEC_VERIFY_SIZE}, // deprecated alias
+        {"dflashBlockSize", required_argument, 0, LLMInferenceOptionId::DFLASH_BLOCK_SIZE},
         {"batchSize", required_argument, 0, LLMInferenceOptionId::BATCH_SIZE},
         {"maxGenerateLength", required_argument, 0, LLMInferenceOptionId::MAX_GENERATE_LENGTH},
         {"enableAudioOutput", no_argument, 0, LLMInferenceOptionId::ENABLE_AUDIO_OUTPUT},
@@ -276,6 +285,22 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
             catch (std::exception const& e)
             {
                 LOG_ERROR("Invalid specVerifySize value: %s", optarg);
+                return false;
+            }
+            break;
+        case LLMInferenceOptionId::DFLASH_BLOCK_SIZE:
+            try
+            {
+                args.specDecodeArgs.dflashBlockSize = std::stoi(optarg);
+                if (args.specDecodeArgs.dflashBlockSize < 0)
+                {
+                    LOG_ERROR("Invalid dflashBlockSize value: %s (must be non-negative)", optarg);
+                    return false;
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Invalid dflashBlockSize value: %s", optarg);
                 return false;
             }
             break;
@@ -370,6 +395,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         LOG_INFO("Spec draft topK: %d", args.specDecodeArgs.draftTopK);
         LOG_INFO("Spec draft step: %d", args.specDecodeArgs.draftStep);
         LOG_INFO("Spec verify size: %d", args.specDecodeArgs.verifySize);
+        LOG_INFO("DFlash block size: %d", args.specDecodeArgs.dflashBlockSize);
     }
 
     if (args.enableAudioOutput)
@@ -513,8 +539,11 @@ int main(int argc, char* argv[])
 
     if (args.specDecodeArgs.enabled)
     {
-        rt::SpecDecodeDraftingConfig draftingConfig{
-            args.specDecodeArgs.draftTopK, args.specDecodeArgs.draftStep, args.specDecodeArgs.verifySize};
+        rt::SpecDecodeDraftingConfig draftingConfig;
+        draftingConfig.draftingTopK = args.specDecodeArgs.draftTopK;
+        draftingConfig.draftingStep = args.specDecodeArgs.draftStep;
+        draftingConfig.verifySize = args.specDecodeArgs.verifySize;
+        draftingConfig.dflashBlockSize = args.specDecodeArgs.dflashBlockSize;
         try
         {
             runtime = std::make_unique<rt::LLMInferenceRuntime>(

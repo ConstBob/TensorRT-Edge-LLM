@@ -23,8 +23,8 @@
 #include "common/mathUtils.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
 #include "kernels/speculative/batchEvictKernels.h"
-#include "kernels/speculative/dflashAcceptKernels.h"
 #include "kernels/speculative/dflashRuntimeKernels.h"
+#include "kernels/speculative/eagleAcceptKernels.h"
 #include "kernels/speculative/gemma4MTPRuntimeKernels.h"
 #include "profiling/metrics.h"
 #include "profiling/nvtx_wrapper.h"
@@ -540,9 +540,8 @@ bool Gemma4MTPDecoder::acceptAndCommit(DecodingInferenceContext& context)
     check::check(mAcceptLength.reshape({activeBatchSize}), "Tensor reshape failed");
     check::check(mArgmaxScratch.reshape({activeBatchSize * verifySize}), "Tensor reshape failed");
 
-    kernel::dflashSequentialAccept(mRuntime.base.pipelineIO.outputLogits, mVerifyTokenIds, mAcceptedTokenIds,
-        mAcceptLength, mArgmaxScratch, activeBatchSize, verifySize, mRuntime.deployment.base.outputVocabSize,
-        context.stream);
+    kernel::sequentialAccept(mRuntime.base.pipelineIO.outputLogits, mVerifyTokenIds, mAcceptedTokenIds, mAcceptLength,
+        mArgmaxScratch, activeBatchSize, verifySize, mRuntime.deployment.base.outputVocabSize, context.stream);
 
     check::check(mHostAcceptLengths.reshape({activeBatchSize}), "Tensor reshape failed");
     int32_t* hostAcceptLengths = mHostAcceptLengths.dataPointer<int32_t>();
