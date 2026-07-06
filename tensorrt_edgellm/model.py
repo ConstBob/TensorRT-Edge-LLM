@@ -85,24 +85,24 @@ class AutoModel:
     """HuggingFace-style factory that dispatches on ``model_type``."""
 
     @classmethod
-    def from_pretrained(
-            cls,
-            model_dir: str,
-            device: str = "cpu",
-            key_remap=None,
-            key_prefix: "str | None" = None,
-            eagle_base: bool = False,
-            reduced_vocab_dir: "str | None" = None,
-            mtp_base: bool = False,
-            mtp_draft: bool = False,
-            tp_size: int = 1,
-            tp_rank: int = 0,
-            dflash_base: bool = False,
-            dflash_draft: bool = False,
-            dflash_draft_dir: "str | None" = None,
-            gemma4_mtp_base: bool = False,
-            gemma4_mtp_draft: bool = False,
-            gemma4_kv_sharing_map: "list[dict] | None" = None) -> nn.Module:
+    def from_pretrained(cls,
+                        model_dir: str,
+                        device: str = "cpu",
+                        key_remap=None,
+                        key_prefix: "str | None" = None,
+                        eagle_base: bool = False,
+                        reduced_vocab_dir: "str | None" = None,
+                        mtp_base: bool = False,
+                        mtp_draft: bool = False,
+                        tp_size: int = 1,
+                        tp_rank: int = 0,
+                        dflash_base: bool = False,
+                        dflash_draft: bool = False,
+                        dflash_draft_dir: "str | None" = None,
+                        gemma4_mtp_base: bool = False,
+                        gemma4_mtp_draft: bool = False,
+                        gemma4_kv_sharing_map: "list[dict] | None" = None,
+                        num_decoder_layers: "int | None" = None) -> nn.Module:
         """Construct and load a model from *model_dir*.
 
         Reads ``config.json`` via :class:`~config.ModelConfig`, looks up the
@@ -144,6 +144,13 @@ class AutoModel:
             gemma4_kv_sharing_map:
                             Validated assistant-layer to target-layer map for
                             Gemma4 MTP draft runtime config.
+            num_decoder_layers:
+                            When set, truncate the model to only the first N
+                            decoder layers (few-layer numeric validation).
+                            Only supported for the plain default ``CausalLM``
+                            path (e.g. Qwen3); rejected for eagle/mtp/dflash and
+                            registered non-default variants. The checkpoint's
+                            extra-layer weights are simply skipped by the loader.
 
         Returns:
             Loaded ``nn.Module`` in eval mode.
@@ -259,6 +266,40 @@ class AutoModel:
                 # dense Qwen3 (default CausalLM). Dense models use the Transformer's
                 # dflash_target_layer_ids parameter to collect target-layer hidden states.
                 model_class = _MODEL_REGISTRY.get(config.model_type, CausalLM)
+
+        # 4-layer numeric validation: truncate to the first N decoder
+        # layers.  The whole pipeline is config-driven (the Transformer builds
+        # layers from ``config.num_hidden_layers`` / ``config.layer_types``,
+        # ``onnx_export_spec`` derives the KV / recurrent / conv I/O counts from
+        # them, the runtime config.json is written from ``model.config``, and the
+        # loader silently skips checkpoint keys for the dropped layers), so a
+        # single config override is sufficient and the modeling code needs no
+        # change.  This covers the plain default ``CausalLM`` path (e.g. Qwen3)
+        # AND registered hybrid base models (Qwen3.5 linear+full / Gated DeltaNet,
+        # Nemotron-H Mamba), which also build per-layer from ``layer_types``.  The
+        # eagle/mtp/dflash/gemma4-mtp speculative-decoding variants have a
+        # different per-layer structure and remain out of scope.
+        if num_decoder_layers is not None:
+            if (eagle_base or config.eagle_base or mtp_base or config.mtp_base
+                    or dflash_base or config.dflash_base or mtp_draft
+                    or dflash_draft or gemma4_mtp_base
+                    or config.gemma4_mtp_base or gemma4_mtp_draft
+                    or config.gemma4_mtp_draft):
+                raise NotImplementedError(
+                    "num_decoder_layers cannot be combined with the "
+                    "eagle/mtp/dflash/gemma4-mtp speculative-decoding variants."
+                )
+            if not 1 <= num_decoder_layers <= config.num_hidden_layers:
+                raise ValueError(
+                    f"num_decoder_layers={num_decoder_layers} out of range "
+                    f"[1, {config.num_hidden_layers}].")
+            config.num_hidden_layers = num_decoder_layers
+            # Keep per-layer lists consistent with the truncated layer count.
+            if config.layer_types:
+                config.layer_types = config.layer_types[:num_decoder_layers]
+            logging.getLogger(__name__).info(
+                "num_decoder_layers: truncated to first %d decoder layers",
+                num_decoder_layers)
 
         model = model_class(config)
         model.to(device)
