@@ -141,6 +141,7 @@ _AUDIO_MODEL_TYPES: frozenset[str] = frozenset([
     "qwen3_omni_thinker",
     "qwen3_omni_moe",
     "qwen3_omni_moe_thinker",
+    "gemma4",
     *_NEMOTRON_OMNI_MODEL_TYPES,
     # qwen3_tts intentionally excluded: Qwen3-TTS has NO audio encoder.
 ])
@@ -154,6 +155,7 @@ _AUDIO_KEY_PREFIX: dict[str, str] = {
     "qwen3_omni_thinker": "thinker.audio_tower.",
     "qwen3_omni_moe": "thinker.audio_tower.",
     "qwen3_omni_moe_thinker": "thinker.audio_tower.",
+    "gemma4": "model.audio_tower.",
 }
 
 # ---------------------------------------------------------------------------
@@ -366,6 +368,19 @@ def export_audio_onnx(
             build_nemotron_omni_audio
         logger.info("Building Nemotron-Omni audio encoder ...")
         build_fn = build_nemotron_omni_audio
+    elif model_type == "gemma4":
+        from ..models.gemma4.modeling_gemma4_audio import build_gemma4_audio
+        if model_config is None:
+            from ..config import ModelConfig
+            model_config = ModelConfig.from_pretrained(model_dir)
+        key_prefix = _AUDIO_KEY_PREFIX.get(model_type)
+        logger.info("Building Gemma4 audio encoder (prefix=%r) ...",
+                    key_prefix)
+        build_fn = build_gemma4_audio
+        extra_kwargs = {
+            "prefix": key_prefix,
+            "model_config": model_config,
+        }
     else:
         from ..models.qwen3_asr.modeling_qwen3_asr_audio import \
             build_qwen_audio

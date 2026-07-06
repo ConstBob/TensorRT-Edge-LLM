@@ -561,13 +561,41 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
             for ctype, cplaceholder in [
                 ("image", "<placeholder_image_path>"),
                 ("video", "<placeholder_video_path>"),
+                ("audio", "<placeholder_audio_path>"),
             ]:
-                pattern = _extract_content_pattern(tokenizer, system_prompt,
-                                                   ctype, cplaceholder,
-                                                   text_only_formatted,
-                                                   placeholder_text)
+                try:
+                    pattern = _extract_content_pattern(tokenizer,
+                                                       system_prompt, ctype,
+                                                       cplaceholder,
+                                                       text_only_formatted,
+                                                       placeholder_text)
+                except Exception:
+                    # Some tokenizer templates raise TemplateError for
+                    # unsupported content types (e.g. audio on VLM-only
+                    # models).  Skip gracefully.
+                    pattern = None
                 if pattern:
                     content_types[ctype] = {"format": pattern}
+            # Fallback: if _extract_content_pattern failed for image/audio
+            # (e.g. tokenizer chat template doesn't handle multimodal content
+            # items), detect known special tokens and construct the format
+            # string from begin/placeholder/end token triplets.
+            if "image" not in content_types:
+                boi = getattr(tokenizer, "boi_token", None)
+                eoi = getattr(tokenizer, "eoi_token", None)
+                img = getattr(tokenizer, "image_token", None)
+                if boi and eoi and img:
+                    content_types["image"] = {"format": f"{boi}{img}{eoi}"}
+                elif img:
+                    content_types["image"] = {"format": img}
+            if "audio" not in content_types:
+                boa = getattr(tokenizer, "boa_token", None)
+                eoa = getattr(tokenizer, "eoa_token", None)
+                aud = getattr(tokenizer, "audio_token", None)
+                if boa and eoa and aud:
+                    content_types["audio"] = {"format": f"{boa}{aud}{eoa}"}
+                elif aud:
+                    content_types["audio"] = {"format": aud}
         elif _is_qwen3_omni_family_model(model_dir) or _is_qwen3_asr_model(
                 model_dir):
             content_types = {

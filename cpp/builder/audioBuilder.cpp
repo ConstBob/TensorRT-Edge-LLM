@@ -327,14 +327,18 @@ bool AudioBuilder::parseAudioEncoderConfig()
         return false;
     }
 
-    // n_window: same name in HF config
-    if (!audioConfig.contains("n_window"))
+    // n_window: required for Qwen3-Omni audio encoder (chunked feature format).
+    // Gemma4 and Nemotron-Omni use [1, seq_len, mel_bins] input and don't need n_window.
+    if (audioConfig.contains("n_window"))
     {
-        LOG_ERROR("audio_config.n_window not found in config.json");
+        // Feature tensor uses n_window * 2 (implementation detail of Qwen3-Omni audio encoder)
+        mNWindowDim = audioConfig["n_window"].get<int32_t>() * 2;
+    }
+    else if (mModelType == multimodal::ModelType::QWEN3_OMNI_AUDIO_ENCODER)
+    {
+        LOG_ERROR("audio_config.n_window not found in config.json (required for Qwen3-Omni)");
         return false;
     }
-    // Feature tensor uses n_window * 2 (implementation detail of Qwen3-Omni audio encoder)
-    mNWindowDim = audioConfig["n_window"].get<int32_t>() * 2;
 
     LOG_INFO("AudioEncoder config: mel_bins=%d, n_window_dim=%d", mMelBins, mNWindowDim);
     return true;
@@ -419,6 +423,7 @@ bool AudioBuilder::setupAudioEncoderProfile(
     case multimodal::ModelType::NEMOTRON_OMNI_AUDIO_ENCODER:
         result = setupNemotronOmniAudioEncoderProfile(*profile);
         break;
+    case multimodal::ModelType::GEMMA4_AUDIO_ENCODER: result = setupGemma4AudioEncoderProfile(*profile); break;
     default: LOG_ERROR("Unsupported model type for audio encoder: %d", static_cast<int>(mModelType)); return false;
     }
 
@@ -591,6 +596,46 @@ bool AudioBuilder::setupNemotronOmniAudioEncoderProfile(nvinfer1::IOptimizationP
     if (!result)
     {
         LOG_ERROR("Failed to setup Nemotron-Omni audio encoder profile");
+    }
+    return result;
+}
+
+bool AudioBuilder::setupGemma4AudioEncoderProfile(nvinfer1::IOptimizationProfile& profile)
+{
+    bool result = true;
+
+    // Gemma4 audio encoder runs at batch=1 (same as Nemotron-Omni): chunked
+    // local attention and depthwise convolution are local operators, so
+    // cross-clip batching with padding may corrupt outputs.
+    //
+    // Inputs:
+    //   input_features: [1, seq_len, mel_bins]
+    //   valid:          [1, seq_len/4]          (bool mask after 2× stride-2 subsampling)
+    //
+    // seq_len is mel-spectrogram frames (~16 kHz / 160 hop_length); the
+    // 2× stride-2 subsampling requires divisibility by 4.
+
+    constexpr int64_t kSubFactor = 4;
+    auto alignUp = [](int64_t x, int64_t a) { return (x + a - 1) / a * a; };
+    int64_t const minSeqLen = alignUp(mBuilderConfig.minTimeSteps, kSubFactor);
+    int64_t const maxSeqLen = alignUp(mBuilderConfig.maxTimeSteps, kSubFactor);
+    int64_t const optSeqLen = alignUp((minSeqLen + maxSeqLen) / 2, kSubFactor);
+    constexpr int64_t kBatch = 1;
+
+    result &= setOptimizationProfile(&profile, "input_features", createDims({kBatch, minSeqLen, mMelBins}),
+        createDims({kBatch, optSeqLen, mMelBins}), createDims({kBatch, maxSeqLen, mMelBins}));
+
+    // Valid mask after subsampling: [1, seq_len/4]
+    int64_t const minValidLen = minSeqLen / kSubFactor;
+    int64_t const maxValidLen = maxSeqLen / kSubFactor;
+    int64_t const optValidLen = optSeqLen / kSubFactor;
+
+    result &= setOptimizationProfile(&profile, "valid", createDims({kBatch, minValidLen}),
+        createDims({kBatch, optValidLen}), createDims({kBatch, maxValidLen}));
+
+    if (!result)
+    {
+        LOG_ERROR("Failed to setup Gemma4 audio encoder profile");
     }
     return result;
 }

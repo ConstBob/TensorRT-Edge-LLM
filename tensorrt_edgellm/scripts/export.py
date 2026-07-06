@@ -111,6 +111,7 @@ _VLM_MODEL_TYPES = frozenset([
 ])
 
 _AUDIO_MODEL_TYPES = frozenset([
+    "gemma4",
     "qwen3_asr",
     "qwen3_omni",
     "qwen3_omni_thinker",
@@ -1294,6 +1295,30 @@ def _export_audio(model_dir: str,
             raise ValueError(
                 "sound_config.model_type not found in config.json")
         audio_cfg_out["model_type"] = sound_model_type
+    elif model_type == "gemma4":
+        # Gemma4 audio encoder config lives at ``config["audio_config"]``.
+        # The C++ audioBuilder requires ``num_mel_bins`` inside audio_config;
+        # HF config may omit it (defaults to 128 in Python model code).
+        audio_cfg = dict(config.get("audio_config", {}))
+        if "num_mel_bins" not in audio_cfg:
+            audio_cfg["num_mel_bins"] = 128
+        audio_cfg_out = {
+            "model_type": "gemma4_audio",
+            "audio_config": audio_cfg,
+            "builder_config": {
+                "max_code_len": 2000,
+                "max_time_steps": 6000,
+                "min_code_len": 1,
+                "min_time_steps": 100,
+                "opt_code_len": 300,
+            },
+        }
+        # Propagate audio_token_id from top-level config.
+        audio_token_id = config.get("audio_token_id")
+        if audio_token_id is None:
+            audio_token_id = _find_token_id(model_dir, "<|audio_pad|>")
+        if audio_token_id is not None:
+            audio_cfg_out["audio_token_id"] = audio_token_id
     else:
         # Qwen3-family: read the nested ``audio_config`` and map top-level
         # model_type to the encoder-specific enum the C++ builder expects

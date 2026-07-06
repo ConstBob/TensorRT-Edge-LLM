@@ -877,6 +877,41 @@ def _dflash_target_kv_cache_update_translation(
     return present_kv
 
 
+# ---------------------------------------------------------------------------
+# Gemma4 Audio Attention Plugin
+# ---------------------------------------------------------------------------
+
+
+@script()
+def _gemma4_audio_attention_plugin_translation(
+    q_raw: onnxscript.FLOAT16,
+    k_raw: onnxscript.FLOAT16,
+    v: onnxscript.FLOAT16,
+    gamma: onnxscript.FLOAT,
+    rel_key: onnxscript.FLOAT16,
+    valid: onnxscript.BOOL,
+    seq_len_carrier: onnxscript.INT32,
+    chunk_size: int,
+    left_horizon: int,
+    context_size: int,
+    logit_cap: float,
+) -> onnxscript.FLOAT16:
+    """Gemma4 audio chunked local attention plugin."""
+    return _trt_edgellm.Gemma4AudioAttentionPlugin(
+        q_raw,
+        k_raw,
+        v,
+        gamma,
+        rel_key,
+        valid,
+        seq_len_carrier,
+        chunk_size=chunk_size,
+        left_horizon=left_horizon,
+        context_size=context_size,
+        logit_cap=logit_cap,
+    )
+
+
 def build_custom_translation_table() -> dict:
     """Return the ``custom_translation_table`` for ``torch.onnx.export(dynamo=True)``.
 
@@ -942,4 +977,6 @@ def build_custom_translation_table() -> dict:
         _attention_onnx_translation,
         torch.ops.trt_edgellm.fused_gemm_allreduce.default:
         _fused_gemm_allreduce_translation,
+        torch.ops.trt_edgellm.gemma4_audio_attention_plugin.default:
+        _gemma4_audio_attention_plugin_translation,
     }

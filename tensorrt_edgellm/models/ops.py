@@ -1220,3 +1220,130 @@ def _(hidden_states, global_scale, weight_f4, weight_f8_scale,
     return torch.empty(*out_shape,
                        dtype=torch.float16,
                        device=hidden_states.device)
+
+
+# ---------------------------------------------------------------------------
+# Custom op: trt_edgellm::gemma4_audio_attention_plugin
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt_edgellm::gemma4_audio_attention_plugin",
+                         mutates_args=())
+def gemma4_audio_attention_plugin(
+    q_raw: torch.Tensor,  # [B, S, H, D]
+    k_raw: torch.Tensor,  # [B, S, H, D]
+    v: torch.Tensor,  # [B, S, H, D]
+    gamma: torch.Tensor,  # [D] float32
+    rel_key: torch.Tensor,  # [P, H, D]
+    valid: torch.Tensor,  # [B, S] bool
+    seq_len_carrier: torch.Tensor,  # [1] int32 (shape carrier)
+    chunk_size: int,
+    left_horizon: int,
+    context_size: int,
+    logit_cap: float,
+) -> torch.Tensor:
+    """Gemma 4 audio chunked local attention (post-QKV, pre-output-proj).
+
+    In eager mode, implements the full attention body using PyTorch ops.
+    During dynamo/ONNX tracing the register_fake shape propagation is used.
+    """
+    import math
+
+    import torch.nn.functional as F
+
+    B, S, H, D = q_raw.shape
+    P = rel_key.shape[0]  # num relative positions
+    num_chunks = (S + chunk_size - 1) // chunk_size
+
+    # Q/K scaling (matches kernel and HF reference)
+    ln2 = math.log(2.0)
+    q_scalar = (D**-0.5) / ln2
+    k_scale = math.log1p(math.exp(1.0)) / ln2
+    softplus_gamma = F.softplus(gamma)  # [D]
+
+    q = q_raw.float() * q_scalar * softplus_gamma.unsqueeze(0).unsqueeze(0)
+    k = k_raw.float() * k_scale
+    v_f = v.float()
+
+    # Pad sequence to multiple of chunk_size
+    pad_len = num_chunks * chunk_size - S
+    if pad_len > 0:
+        q = F.pad(q, (0, 0, 0, 0, 0, pad_len))
+        k = F.pad(k, (0, 0, 0, 0, 0, pad_len))
+        v_f = F.pad(v_f, (0, 0, 0, 0, 0, pad_len))
+
+    # Block Q: [B, num_chunks, chunk_size, H, D]
+    q_blocks = q.reshape(B, num_chunks, chunk_size, H, D)
+
+    # Extract context windows for K, V (left-pad by one chunk, concat pairs)
+    k_padded = F.pad(k, (0, 0, 0, 0, chunk_size, 0))  # left-pad seq dim
+    v_padded = F.pad(v_f, (0, 0, 0, 0, chunk_size, 0))
+    k_padded = k_padded.reshape(B, num_chunks + 1, chunk_size, H, D)
+    v_padded = v_padded.reshape(B, num_chunks + 1, chunk_size, H, D)
+    # Concat adjacent pairs: [B, num_chunks, 2*chunk_size=context_size, H, D]
+    k_ctx = torch.cat([k_padded[:, :-1], k_padded[:, 1:]], dim=2)
+    v_ctx = torch.cat([v_padded[:, :-1], v_padded[:, 1:]], dim=2)
+
+    # Content scores: Q @ K^T
+    # queries: [B, H, nB, chunk, D], keys: [B, H, nB, D, ctx]
+    queries = q_blocks.permute(0, 3, 1, 2, 4)
+    k_c = k_ctx.permute(0, 3, 1, 4, 2)
+    matrix_ac = queries @ k_c  # [B, H, nB, chunk, ctx]
+
+    # Relative position bias via _rel_shift
+    # rel_key: [P, H, D] -> [H, D, P]
+    rel_k_t = rel_key.float().permute(1, 2, 0)
+    # queries_flat: [B, H, nB*chunk, D]
+    queries_flat = queries.reshape(B, H, -1, D)
+    matrix_bd = queries_flat @ rel_k_t  # [B, H, nB*chunk, P]
+    matrix_bd = matrix_bd.reshape(B, H, num_chunks, chunk_size, P)
+    # Rel shift: pad right, reshape, slice
+    matrix_bd = F.pad(matrix_bd, (0, context_size + 1 - P))
+    matrix_bd = matrix_bd.reshape(B, H, num_chunks,
+                                  chunk_size * (context_size + 1))
+    matrix_bd = matrix_bd[..., :chunk_size * context_size]
+    matrix_bd = matrix_bd.reshape(B, H, num_chunks, chunk_size, context_size)
+
+    # Combine scores
+    scores = matrix_ac + matrix_bd
+
+    # Softcap: cap * tanh(scores / cap)
+    scores = logit_cap * torch.tanh(scores / logit_cap)
+
+    # Build attention mask from valid tensor
+    # valid: [B, S] -> pad to num_chunks*chunk_size, then build blocked mask
+    if pad_len > 0:
+        valid_padded = F.pad(valid.float(), (0, pad_len))
+    else:
+        valid_padded = valid.float()
+    # Context validity: left-pad by chunk_size (matching K/V context extraction)
+    valid_ctx_flat = F.pad(valid_padded, (chunk_size, 0))
+    valid_ctx = valid_ctx_flat.reshape(B, num_chunks + 1, chunk_size)
+    valid_ctx = torch.cat([valid_ctx[:, :-1], valid_ctx[:, 1:]],
+                          dim=2)  # [B, nB, ctx]
+    # Query validity
+    valid_q = valid_padded.reshape(B, num_chunks, chunk_size)  # [B, nB, chunk]
+    # Mask: both query and key must be valid
+    # [B, 1, nB, chunk, 1] * [B, 1, nB, 1, ctx]
+    mask = valid_q.unsqueeze(1).unsqueeze(-1) * valid_ctx.unsqueeze(
+        1).unsqueeze(3)
+
+    # Apply mask
+    scores = scores.masked_fill(mask == 0, -1e4)
+
+    # Softmax and weighted sum
+    attn_weights = torch.softmax(scores, dim=-1)
+    v_c = v_ctx.permute(0, 3, 1, 2, 4)  # [B, H, nB, ctx, D]
+    out = attn_weights @ v_c  # [B, H, nB, chunk, D]
+
+    # Reshape: [B, H, nB, chunk, D] -> [B, nB*chunk, H, D] -> [B, S, H, D]
+    out = out.permute(0, 2, 3, 1, 4).reshape(B, num_chunks * chunk_size, H, D)
+    out = out[:, :S, :, :]
+
+    return out.to(q_raw.dtype)
+
+
+@gemma4_audio_attention_plugin.register_fake
+def _(q_raw, k_raw, v, gamma, rel_key, valid, seq_len_carrier, chunk_size,
+      left_horizon, context_size, logit_cap):
+    return torch.empty_like(q_raw)

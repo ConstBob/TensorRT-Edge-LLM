@@ -1346,6 +1346,97 @@ _dflash_target_kv_cache_update_schema = OpSchema(
     ],
 )
 
+# ---------------------------------------------------------------------------
+# Gemma4 Audio Attention Plugin
+# ---------------------------------------------------------------------------
+
+_gemma4_audio_attention_plugin_schema = OpSchema(
+    name="Gemma4AudioAttentionPlugin",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc=
+    ("Fused Gemma 4 audio chunked local attention (post-QKV, pre-output-proj). "
+     "Per-dim Q scaling, fixed K scaling, content + rel-pos scores, "
+     "tanh soft-cap, local mask, softmax, value mix."),
+    inputs=[
+        OpSchema.FormalParameter(
+            name="q_raw",
+            description="Raw query projections [B, S, H, D]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="k_raw",
+            description="Raw key projections [B, S, H, D]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="v",
+            description="Value projections [B, S, H, D]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="gamma",
+            description="Per-dim learned query scale [D] (float32)",
+            type_str="tensor(float)",
+        ),
+        OpSchema.FormalParameter(
+            name="rel_key",
+            description="Projected relative-position embeddings [P, H, D]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="valid",
+            description="Audio validity mask [B, S] (bool)",
+            type_str="tensor(bool)",
+        ),
+        OpSchema.FormalParameter(
+            name="seq_len_carrier",
+            description="Shape carrier [1] (int32)",
+            type_str="tensor(int32)",
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="attn_output",
+            description="Attention output [B, S, H, D]",
+            type_str="T",
+        ),
+    ],
+    type_constraints=[
+        (
+            "T",
+            ["tensor(float16)", "tensor(bfloat16)", "tensor(float)"],
+            "Q/K/V/relKey/output data type.",
+        ),
+    ],
+    attributes=[
+        OpSchema.Attribute(
+            name="chunk_size",
+            type=OpSchema.AttrType.INT,
+            description="Query block size (default 12)",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="left_horizon",
+            type=OpSchema.AttrType.INT,
+            description="Effective left context (default 12)",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="context_size",
+            type=OpSchema.AttrType.INT,
+            description="Gathered K/V context size (default 24)",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="logit_cap",
+            type=OpSchema.AttrType.FLOAT,
+            description="Tanh soft-cap on logits (default 50.0)",
+            required=True,
+        ),
+    ],
+)
+
 _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _attention_plugin_schema,
     _vit_attention_plugin_schema,
@@ -1366,6 +1457,7 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _nvfp4_moe_plugin_geforce_schema,
     _fused_gemm_allreduce_plugin_schema,
     _dflash_target_kv_cache_update_schema,
+    _gemma4_audio_attention_plugin_schema,
 )
 
 _registered_tensorrt_edgellm_schemas: bool = False

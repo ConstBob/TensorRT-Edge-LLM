@@ -235,14 +235,14 @@ bool Gemma4ViTRunner::allocateBuffer(cudaStream_t stream)
     CUDA_CHECK(
         cudaMemcpyAsync(mImageStd.rawPointer(), mConfig.imageStd.data(), nbBytes, cudaMemcpyHostToDevice, stream));
 
-    int64_t const maxImagePixels = mConfig.maxPatchesPerImage * mConfig.patchSize * mConfig.patchSize * channels;
-    rt::Tensor resizeBuffer({1, maxImagePixels, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8,
+    int64_t const maxImagePixels = mConfig.maxPatchesPerImage * mConfig.patchSize * mConfig.patchSize;
+    rt::Tensor resizeBuffer({1, maxImagePixels, 1, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8,
         "Gemma4ViTRunner::resizeBuffer");
     mResizedImageHost = rt::imageUtils::ImageData(std::move(resizeBuffer));
     mImageDevice = rt::Tensor(
-        {maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "Gemma4ViTRunner::mImageDevice");
-    mNormalizedImageDevice = rt::Tensor(
-        {maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "Gemma4ViTRunner::mNormalizedImageDevice");
+        {maxImagePixels * channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "Gemma4ViTRunner::mImageDevice");
+    mNormalizedImageDevice = rt::Tensor({maxImagePixels * channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF,
+        "Gemma4ViTRunner::mNormalizedImageDevice");
 
     return true;
 }
@@ -319,8 +319,8 @@ void Gemma4ViTRunner::formatPatch(rt::imageUtils::ImageData const& image, std::v
         mImageDevice.rawPointer(), imageData, height * width * channels, cudaMemcpyHostToDevice, stream));
 
     kernel::normalizeImage(mImageDevice, mImageMean, mImageStd, mNormalizedImageDevice, stream);
-    kernel::transposeToPatchQwenViT(
-        mNormalizedImageDevice, mVitInput, prevCuSeqlen * mConfig.inputDim, 1, mConfig.patchSize, 1, stream);
+    kernel::transposeToPatchGemma4ViT(
+        mNormalizedImageDevice, mVitInput, prevCuSeqlen * mConfig.inputDim, mConfig.patchSize, stream);
 
     int64_t* positionIds = mPixelPositionIdsHost.dataPointer<int64_t>();
     for (int64_t y = 0; y < patchHeight; ++y)
@@ -420,6 +420,8 @@ void Gemma4ViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
         cudaMemcpyHostToDevice, stream));
     if (mUseTrtNativeVitAttn)
     {
+        // TRT native attention expects kv_lengths in cumulative format (same as cu_seqlens),
+        // e.g. [0, 256, 512] for two 256-patch images. The naming is historical.
         CUDA_CHECK(cudaMemcpyAsync(mKvLengths.rawPointer(), mCuSeqlensHost.rawPointer(),
             cuSeqlensSize * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     }
@@ -455,6 +457,14 @@ void Gemma4ViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
         }
 
         std::vector<int32_t> newIds;
+        // Compute expanded size: non-image tokens + sum of image token lengths.
+        size_t expandedSize = 0;
+        int64_t imgIdx = imageIndex;
+        for (auto tokenId : ids)
+        {
+            expandedSize += (tokenId == mConfig.imageTokenId) ? imageTokenLengths.at(imgIdx++) : 1;
+        }
+        newIds.reserve(expandedSize);
         for (auto tokenId : ids)
         {
             if (tokenId == mConfig.imageTokenId)
