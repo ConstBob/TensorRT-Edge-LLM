@@ -29,8 +29,9 @@ import pytest
 from conftest import EnvironmentConfig
 from pytest_helpers import run_command, timer_context
 
-from .config import (DEFAULT_SEARCH_DEPTH, ModelType, TaskType, TestConfig,
-                     _find_directory, strip_model_quant_suffixes)
+from .config import (DEFAULT_SEARCH_DEPTH, GEMMA4_MTP_ASSISTANT_MODELS_MAP,
+                     ModelType, TaskType, TestConfig, _find_directory,
+                     strip_model_quant_suffixes)
 from .utils.command_generation import resolve_lora_model_name
 
 # --externalize-weights wiring. extw_<token> -> CLI kinds for
@@ -475,6 +476,12 @@ def test_checkpoint_mtp_export(test_param: str, test_logger,
             tmp_dir,
             "--mtp",
         ]
+        base_model_name = strip_model_quant_suffixes(config.model_name)
+        if base_model_name in GEMMA4_MTP_ASSISTANT_MODELS_MAP:
+            export_cmd += [
+                "--mtp-draft-dir",
+                config.get_gemma4_mtp_assistant_model_dir(),
+            ]
 
         extw_kinds = _extw_cli_kinds(config.externalize_weights)
         if extw_kinds:
