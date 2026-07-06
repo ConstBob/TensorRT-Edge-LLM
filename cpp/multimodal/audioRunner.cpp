@@ -24,6 +24,9 @@
 #include "common/mmapReader.h"
 #include "common/trtUtils.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
+#ifdef CUTE_DSL_GEMM_ENABLED
+#include "kernels/talkerMLPKernels/cuteDslGemmRunner.h"
+#endif
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
 #include <algorithm>
@@ -103,6 +106,26 @@ Qwen3OmniAudioRunner::Qwen3OmniAudioRunner(std::string const& engineDir, cudaStr
 
     bool const bufferAllocated = allocateBuffer(stream);
     ELLM_CHECK(bufferAllocated, "Failed to allocate buffers");
+
+    // Best-effort init of the online GPU fbank. Failure is non-fatal: the
+    // runner falls back to the CPU MelExtractor (mFeMel, already bound by
+    // validateAndFillConfig above) for PCM→mel. initFbankResources issues H2D
+    // copies via CUDA_CHECK, which throws on failure (e.g. device OOM), so
+    // catch here to keep construction non-fatal.
+    try
+    {
+        mFbankReady = initFbankResources(stream);
+        if (!mFbankReady)
+        {
+            // initFbankResources already logged the specific reason; add the consequence.
+            LOG_WARNING("Online GPU fbank unavailable; using CPU MelExtractor for PCM→mel.");
+        }
+    }
+    catch (std::exception const& e)
+    {
+        mFbankReady = false;
+        LOG_WARNING("Online GPU fbank init failed (%s); using CPU MelExtractor for PCM→mel.", e.what());
+    }
 
     LOG_INFO("Qwen3OmniAudioRunner initialized successfully");
 }
@@ -374,6 +397,211 @@ void Qwen3OmniAudioRunner::textPreprocess(rt::LLMGenerationRequest const& reques
     }
 }
 
+namespace
+{
+
+// The GPU fbank kernel suite hard-codes the Whisper choices (N=400 FFT, periodic
+// Hann, reflect-pad, log10 + max-floor, whisper-clamp post-norm, [nMel,T] layout,
+// drop-last-frame, no pre-emphasis). Validate the bound MelExtractor's config is
+// Whisper-spec before enabling online fbank; any mismatch (e.g. a Parakeet
+// extractor) cleanly falls back to the CPU path instead of silently producing a
+// wrong spectrogram. The config is the single source of truth — these are the
+// only places the "expected Whisper spec" literals live.
+bool whisperFbankConfigOk(audio::MelExtractorConfig const& cfg, std::string& reason)
+{
+    auto fail = [&reason](char const* msg) {
+        reason = msg;
+        return false;
+    };
+    // Shape: the kernel FFT is N=400-specific and the encoder takes [1, 128, T].
+    if (!(cfg.nFFT == 400 && cfg.winLength == cfg.nFFT && cfg.nMel == 128))
+        return fail("needs nFFT==400, winLength==nFFT, nMel==128.");
+    // Windowing / framing.
+    if (!(cfg.windowType == audio::WindowType::kHannPeriodic && cfg.framePadding == audio::FramePadding::kCenterReflect
+            && cfg.preemphCoeff == 0.0f))
+        return fail("needs periodic Hann window, centre-reflect framing, no pre-emphasis.");
+    // Log + post-normalize.
+    if (!(cfg.logType == audio::LogType::kLog10 && cfg.logFloorMode == audio::LogFloorMode::kMax
+            && cfg.postNormalize == audio::PostNormalize::kWhisperClamp))
+        return fail("needs log10 + max-floor + Whisper-clamp post-normalize.");
+    // Layout + dynamic T.
+    if (!(cfg.layout == audio::MelLayout::kMelTime && cfg.dropLastStftFrame
+            && cfg.timePadding == audio::TimePadding::kNone))
+        return fail("needs [nMel, T] layout, drop-last-frame, no static time padding.");
+    return true;
+}
+
+} // anonymous namespace
+
+bool Qwen3OmniAudioRunner::initFbankResources(cudaStream_t stream)
+{
+    // The bound CPU MelExtractor's config is the single source of truth for every
+    // STFT/mel param AND the mel filter weights. The GPU kernels hard-code the
+    // Whisper choices, so validate the config is Whisper-spec before enabling —
+    // otherwise fall back to CPU.
+    audio::MelExtractorConfig const& cfg = mFeMel.config();
+    std::string reason;
+    if (!whisperFbankConfigOk(cfg, reason))
+    {
+        LOG_WARNING("Online GPU fbank disabled (extractor not Whisper-spec): %s", reason.c_str());
+        return false;
+    }
+    int32_t const nFft = cfg.nFFT;
+    int32_t const nMel = cfg.nMel;
+    int32_t const nFreq = nFft / 2 + 1;
+
+    // Single source of truth for the mel filter: reuse the exact Slaney weights
+    // the CPU MelExtractor (mFeMel) was built with, so the GPU fbank and the CPU
+    // fallback can never drift apart. No external mel_filter.bin to ship or keep
+    // in sync. buildMelFilterBank already emits the [nMel, nBins] (nMel-major,
+    // freq-contiguous) layout the GEMM A-matrix wants, so this is a pure FP16
+    // cast + K-pad — no transpose.
+    std::vector<float> const& melFilterHost = mFeMel.melFilterBank(); // [nMel, nBins] row-major F32
+    if (melFilterHost.size() != static_cast<size_t>(nMel) * nFreq)
+    {
+        LOG_WARNING("Online fbank disabled: mel filter size %zu != %d x %d.", melFilterHost.size(), nMel, nFreq);
+        return false;
+    }
+
+    // Single source of truth for the window: reuse the exact periodic-Hann taps
+    // the CPU MelExtractor built (buildWindow), so the GPU fbank and the CPU
+    // fallback can never drift. The config gate guarantees winLength == nFft.
+    std::vector<float> const& windowHost = mFeMel.window();
+    if (windowHost.size() != static_cast<size_t>(nFft))
+    {
+        LOG_WARNING("Online GPU fbank disabled: window size %zu != nFft=%d.", windowHost.size(), nFft);
+        return false;
+    }
+
+#ifdef CUTE_DSL_GEMM_ENABLED
+    // Idempotent + thread-safe; returns false (with its own LOG_ERROR) when no
+    // GEMM variant is compiled for the current SM, so online fbank fails early
+    // here rather than dispatching to an unloaded module at the first GEMM call.
+    if (!CuteDslGemmRunner::loadKernelModule())
+    {
+        LOG_ERROR("CuteDslGemmRunner::loadKernelModule failed — online fbank GEMM unavailable on this device.");
+        return false;
+    }
+#else
+    LOG_WARNING(
+        "Online GPU fbank disabled: built without CuTe DSL GEMM (rebuild with -DENABLE_CUTE_DSL=gemm). "
+        "Using CPU MelExtractor.");
+    return false;
+#endif
+
+    // Upper bounds from the engine kMAX profile, mirroring allocateBuffer: the
+    // encoder consumes at most maxNumChunks × maxChunkLen mel frames, and
+    // T_out == floor(N / hopLength) for the Whisper-gated geometry
+    // (2 * padLength == nFft), so the largest PCM the GPU path accepts is the
+    // largest N with T_out <= maxFrames. Longer clips exceed the encoder
+    // profile on any path; tryOnlineGpuFbank routes them to the CPU fallback.
+    nvinfer1::Dims const paddedFeaturesShapeMax
+        = mAudioEngine->getProfileShape(binding_names::kAudioPaddedFeatures, 0, nvinfer1::OptProfileSelector::kMAX);
+    int64_t const maxFrames = paddedFeaturesShapeMax.d[0] * paddedFeaturesShapeMax.d[2];
+    if (maxFrames <= 0)
+    {
+        LOG_WARNING("Online GPU fbank disabled: engine kMAX profile gives non-positive max mel frames (%ld).",
+            static_cast<long>(maxFrames));
+        return false;
+    }
+    int64_t const maxPcmSamples = (maxFrames + 1) * cfg.hopLength - 1;
+    int64_t const maxFramesFull = maxFrames + 1; // fbankWhisper frames T_full = T_out + 1
+    int64_t const nPadMax = audioUtils::fbankNPad(static_cast<int32_t>(maxFrames));
+
+    // Allocate every device buffer the online fbank path uses, sized at the
+    // bounds above.
+    mFbankResources.melFilterFp16Kmajor
+        = rt::Tensor({nMel, audioUtils::kFbankKPad}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    mFbankResources.hannWindow = rt::Tensor({nFft}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    mFbankResources.fftTwiddle = rt::Tensor({nFft, 2}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    mFbankResources.framedF32 = rt::Tensor({maxFramesFull, nFft}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    mFbankResources.magFp16
+        = rt::Tensor({nPadMax, audioUtils::kFbankKPad}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    mFbankResources.melPowerFp16 = rt::Tensor({nMel, nPadMax}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    mFbankResources.maxLogScalar = rt::Tensor({1}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    mPcmF32Device = rt::Tensor({maxPcmSamples}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    mMelSpecDevice = rt::Tensor({1, nMel, maxFrames}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+    // Fill the persistent weight / table tensors (H2D). Mel filter: cast +
+    // K-pad the Slaney weights into the [nMel, K_pad] F16 K-major GEMM
+    // A-matrix layout.
+    if (!audioUtils::fillMelFilterFp16Kmajor(
+            melFilterHost.data(), nMel, nFreq, audioUtils::kFbankKPad, mFbankResources.melFilterFp16Kmajor, stream))
+    {
+        return false;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(mFbankResources.hannWindow.rawPointer(), windowHost.data(),
+        windowHost.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+    std::vector<float> twiddleHost;
+    audioUtils::makeFftTwiddleHost(nFft, twiddleHost);
+    CUDA_CHECK(cudaMemcpyAsync(mFbankResources.fftTwiddle.rawPointer(), twiddleHost.data(),
+        twiddleHost.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+
+    // Publish the scalar params derived from cfg — the single source of truth
+    // for fbankWhisper / computeNumMelFrames (no duplicated constants downstream).
+    mFbankResources.nFft = nFft;
+    mFbankResources.hopLength = cfg.hopLength;
+    mFbankResources.padLength = nFft / 2;
+    mFbankResources.nMel = nMel;
+    mFbankResources.nFreq = nFreq;
+    mFbankResources.maxFrames = static_cast<int32_t>(maxFrames);
+    mFbankResources.melFloor = cfg.logFloor;
+
+    LOG_INFO(
+        "Online GPU fbank ready (mel filter %d×%d Slaney reused from CPU MelExtractor → [%d, %d] F16 K-major; "
+        "buffers pre-allocated for up to %ld mel frames).",
+        nMel, nFreq, nMel, audioUtils::kFbankKPad, static_cast<long>(maxFrames));
+    return true;
+}
+
+bool Qwen3OmniAudioRunner::tryOnlineGpuFbank(rt::audio::AudioPCM const& pcm, rt::Tensor& melSpec, cudaStream_t stream)
+{
+    // Gate: online fbank ready (config validated Whisper-spec, params published
+    // into mFbankResources), the engine mel width agrees, and the sample rate
+    // matches what the kernels assume. The CPU MelExtractor rejects a rate
+    // mismatch, so the GPU path must too, or it would silently produce a
+    // wrong-but-plausible spectrogram.
+    if (!mFbankReady || mConfig.melBins != mFbankResources.nMel || pcm.sampleRate != mFeMel.config().sampleRate)
+    {
+        return false;
+    }
+
+    // Frame count from the host PCM length, before any upload. Clips too short
+    // for the GPU fbank framing (numFrames <= 0; the CPU MelExtractor clamps to
+    // >= 1 frame) and clips beyond the engine kMAX profile the fbank buffers
+    // were pre-allocated for (numFrames > maxFrames) fall back to the CPU path
+    // without touching the GPU.
+    int32_t const numFrames = audioUtils::computeNumMelFrames(static_cast<int64_t>(pcm.samples.size()),
+        mFbankResources.nFft, mFbankResources.hopLength, mFbankResources.padLength);
+    if (numFrames <= 0 || numFrames > mFbankResources.maxFrames)
+    {
+        return false;
+    }
+
+    // Upload host FP32 PCM [-1, 1] into the pre-allocated [N] GPU staging tensor
+    // (metadata-only reshape; the maxFrames gate above bounds N). pcm.samples is
+    // owned by the request and outlives preprocessAudio, covering the async
+    // fbank launches and the cudaStreamSynchronize at the end of that function.
+    if (!audioUtils::uploadHostPcmF32ToGpu(pcm.samples, mPcmF32Device, stream))
+    {
+        return false;
+    }
+
+    // Non-owning view of the pre-allocated backing store at this clip's width.
+    // A move-assignment into melSpec (the CPU fallback path) cannot free the
+    // backing store, and every consumer of melSpec runs within this
+    // preprocessAudio call — inside mMelSpecDevice's lifetime.
+    melSpec = rt::Tensor(mMelSpecDevice.rawPointer(),
+        {1, static_cast<int64_t>(mFbankResources.nMel), static_cast<int64_t>(numFrames)}, rt::DeviceType::kGPU,
+        nvinfer1::DataType::kHALF);
+    if (!audioUtils::fbankWhisper(mPcmF32Device, mFbankResources, melSpec, stream))
+    {
+        LOG_WARNING("Online GPU fbank failed; falling back to CPU MelExtractor for this clip.");
+        return false;
+    }
+    return true;
+}
+
 bool Qwen3OmniAudioRunner::preprocessAudio(std::vector<rt::audioUtils::AudioData> const& audioBuffers,
     std::vector<int64_t>& audioTokenLengths, cudaStream_t stream)
 {
@@ -399,17 +627,29 @@ bool Qwen3OmniAudioRunner::preprocessAudio(std::vector<rt::audioUtils::AudioData
                 "(server) or requestFileParser (CLI).");
             return false;
         }
-        rt::Tensor hostMel;
-        if (!mFeMel.extract(*audio.pcm, hostMel))
-        {
-            LOG_ERROR("Mel extraction failed");
-            return false;
-        }
-        // FP32 host mel -> FP16 GPU mel ([1, mel_bins, T] for whisper layout).
         rt::Tensor melSpec;
-        if (!audioUtils::uploadHostMelFp32ToFp16Gpu(hostMel, melSpec, stream, "Qwen3OmniAudioRunner::mel"))
+
+        // Default path: online GPU fbank — PCM→log-mel entirely on device. On
+        // any gate miss or kernel failure it returns false and we fall through
+        // to the CPU MelExtractor below; both produce the identical
+        // [1, nMel, T] FP16 contract, so the encoder is oblivious.
+        bool const gpuFbankDone = tryOnlineGpuFbank(*audio.pcm, melSpec, stream);
+
+        // Fallback path (also the default when online fbank is unavailable):
+        // CPU MelExtractor → FP16 GPU upload (the legacy CPU mel path).
+        if (!gpuFbankDone)
         {
-            return false;
+            rt::Tensor hostMel;
+            if (!mFeMel.extract(*audio.pcm, hostMel))
+            {
+                LOG_ERROR("Mel extraction failed");
+                return false;
+            }
+            // FP32 host mel -> FP16 GPU mel ([1, mel_bins, T] for whisper layout).
+            if (!audioUtils::uploadHostMelFp32ToFp16Gpu(hostMel, melSpec, stream, "Qwen3OmniAudioRunner::mel"))
+            {
+                return false;
+            }
         }
 
         int64_t const timeSteps = melSpec.getShape()[2];
