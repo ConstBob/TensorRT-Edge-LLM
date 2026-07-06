@@ -1315,17 +1315,56 @@ bool LLMBuilder::copyConfig()
         Json kvLayerConfigs = Json::array();
         Json normalizedLayerTypes = Json::array();
 
-        for (int i = 0; i < mNbKVCacheInputs; ++i)
+        // Preserve the per-position ordering from the input `layer_types` when it is
+        // present and complete: attention and mamba layers can interleave (e.g. Qwen3.5
+        // GDN hybrids place attention every Nth layer), and emitting "all attention then
+        // all mamba" would misplace every layer in the runtime routing table. Attention
+        // entries consume the per-layer head sizes in order; mamba entries carry no KV.
+        bool const haveInputLayerTypes = mModelConfig.contains("layer_types") && mModelConfig["layer_types"].is_array()
+            && mModelConfig["layer_types"].size() == static_cast<size_t>(mNbKVCacheInputs + mNumLinearAttnLayers);
+        if (haveInputLayerTypes)
         {
-            normalizedLayerTypes.push_back("attention");
-            int64_t layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
-            kvLayerConfigs.push_back(Json{{"num_kv_heads", layerNumKVHeads}, {"head_dim", mPerLayerHeadSize[i]}});
+            int attnIdx = 0;
+            for (auto const& layerType : mModelConfig["layer_types"])
+            {
+                // Input layer_types are normalized to "attention" / "mamba" by the export.
+                if (layerType.is_string() && layerType.get<std::string>() == "mamba")
+                {
+                    normalizedLayerTypes.push_back("mamba");
+                    kvLayerConfigs.push_back(nullptr);
+                }
+                else
+                {
+                    // The total-size guard above does not constrain the attention/mamba split,
+                    // so a layer_types inconsistent with the ONNX (more attention entries than
+                    // KV cache inputs) would index past mPerLayerHeadSize. Fail clearly instead.
+                    check::check(attnIdx < static_cast<int>(mPerLayerHeadSize.size()),
+                        "copyConfig: layer_types has more attention layers than the " + std::to_string(mNbKVCacheInputs)
+                            + " KV cache input(s); config.json layer_types is inconsistent with the engine.");
+                    normalizedLayerTypes.push_back("attention");
+                    int64_t const layerNumKVHeads
+                        = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[attnIdx] : mNumKVHeads;
+                    kvLayerConfigs.push_back(
+                        Json{{"num_kv_heads", layerNumKVHeads}, {"head_dim", mPerLayerHeadSize[attnIdx]}});
+                    ++attnIdx;
+                }
+            }
         }
-        // Hybrid models also have recurrent (mamba) layers that need routing entries.
-        for (int i = 0; i < mNumLinearAttnLayers; ++i)
+        else
         {
-            normalizedLayerTypes.push_back("mamba");
-            kvLayerConfigs.push_back(nullptr);
+            // Legacy fallback (no per-position info): attention layers first, then mamba.
+            // Correct for pure-attention and all-attention heterogeneous models (e.g. Gemma4).
+            for (int i = 0; i < mNbKVCacheInputs; ++i)
+            {
+                normalizedLayerTypes.push_back("attention");
+                int64_t layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
+                kvLayerConfigs.push_back(Json{{"num_kv_heads", layerNumKVHeads}, {"head_dim", mPerLayerHeadSize[i]}});
+            }
+            for (int i = 0; i < mNumLinearAttnLayers; ++i)
+            {
+                normalizedLayerTypes.push_back("mamba");
+                kvLayerConfigs.push_back(nullptr);
+            }
         }
         configWithBuilder["layer_types"] = normalizedLayerTypes;
         configWithBuilder["kv_layer_configs"] = kvLayerConfigs;

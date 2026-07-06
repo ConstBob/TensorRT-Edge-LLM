@@ -81,6 +81,7 @@ for large language models and vision-language models on edge devices.
    :caption: Testing
 
    developer_guide/testing/code-coverage.md
+   developer_guide/testing/few-layer-validation.md
 
 .. toctree::
    :maxdepth: 2

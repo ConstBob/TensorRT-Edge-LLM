@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -31,6 +32,8 @@ namespace trt_edgellm
 {
 namespace rt
 {
+
+class LayerDebugger; // Few-layer-validation debug: per-layer logits/KV dump (runtime/debug/layerDebugger.h)
 
 /*!
  * @brief Batch result data for a single sequence.
@@ -96,6 +99,12 @@ struct DecodingInferenceContext
     //! Optional callback used by speculative decoders to stop appending accepted tokens.
     std::function<bool(int32_t, int32_t)> shouldStopAfterAcceptedToken;
 
+    //! Few-layer-validation debug: per-request layer dumper (null unless the
+    //! EDGELLM_DUMP_LOGITS_KVCACHE_* env vars are set). Owned here via RAII so it shares the
+    //! context's lifetime exactly; see the out-of-line destructor. Also carries optional
+    //! teacher-forcing tokens (EDGELLM_FORCE_TOKENS_FILE) applied via LayerDebugger::applyForcedTokens.
+    std::unique_ptr<LayerDebugger> layerDebugger;
+
     /*!
      * @brief Initialize request-local vectors and scalar fields.
      * @param batchSize Active batch size
@@ -107,6 +116,19 @@ struct DecodingInferenceContext
      */
     void initialize(int32_t batchSize, int32_t maxGenLength, rt::OptionalInputTensor const& visual,
         rt::OptionalInputTensors const& deepstackFeatures, std::string const& loraName, cudaStream_t cudaStream);
+
+    //! ctor / move ops / dtor are out-of-line (defined in the .cpp) because @ref
+    //! layerDebugger is a ``unique_ptr`` to the incomplete type ``LayerDebugger``:
+    //! a defaulted special member in the header would instantiate the member's
+    //! destructor against the incomplete type in every translation unit (e.g.
+    //! unit tests that only forward-declare LayerDebugger). Move ops are declared
+    //! because the user-declared destructor otherwise suppresses the implicit
+    //! move, and the context is returned by value in places. The struct stays
+    //! non-copyable via the unique_ptr member.
+    DecodingInferenceContext();
+    DecodingInferenceContext(DecodingInferenceContext&&) noexcept;
+    DecodingInferenceContext& operator=(DecodingInferenceContext&&) noexcept;
+    ~DecodingInferenceContext();
 };
 
 } // namespace rt

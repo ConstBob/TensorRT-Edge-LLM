@@ -732,7 +732,8 @@ def _export_llm(model_dir: str,
                 dflash_draft_dir: str = "",
                 gemma4_mtp_base: bool = False,
                 externalize_weights: "list[str] | None" = None,
-                tp_size: int = 1) -> None:
+                tp_size: int = 1,
+                num_decoder_layers: "int | None" = None) -> None:
     """Export LLM backbone via the standard tensorrt_edgellm pipeline.
 
     When ``tp_size > 1``, exports ``tp_size`` per-rank ONNX files named
@@ -788,6 +789,7 @@ def _export_llm(model_dir: str,
                 gemma4_mtp_base=gemma4_mtp_base,
                 tp_size=world,
                 tp_rank=rank,
+                num_decoder_layers=num_decoder_layers,
             )
         except (OSError, ValueError, RuntimeError, ImportError) as exc:
             logger.exception("[LLM] Failed to load checkpoint")
@@ -2241,6 +2243,20 @@ def main() -> None:
             "Used when exporting a standalone NVFP4 Talker checkpoint whose "
             "model.safetensors omits these projection weights."),
     )
+    p.add_argument(
+        "--num-decoder-layer",
+        "--num_decoder_layer",
+        dest="num_decoder_layer",
+        type=int,
+        default=None,
+        help=(
+            "Accuracy-debugging only: export only the first N decoder layers "
+            "of the LLM backbone. The runtime config.json and the ONNX KV "
+            "in/out count follow N automatically. Supported for the plain "
+            "default model path (e.g. Qwen3) and hybrid base models (e.g. "
+            "Qwen3.5, Nemotron-H); not for eagle/mtp/dflash "
+            "speculative-decoding variants."),
+    )
     args = p.parse_args()
 
     model_dir = _resolve_model_dir(args.model)
@@ -2303,6 +2319,12 @@ def main() -> None:
                 model_dir, gemma4_mtp_assistant_dir)
         except ValueError as exc:
             p.error(str(exc))
+    if args.num_decoder_layer is not None:
+        if args.num_decoder_layer < 1:
+            p.error("--num-decoder-layer must be >= 1")
+        if args.eagle_base or args.mtp or args.dflash_base or args.dflash_draft:
+            p.error("--num-decoder-layer cannot be combined with "
+                    "--eagle-base / --mtp / --dflash-base / --dflash-draft")
 
     _VALID_COMPONENTS = {
         "thinker", "talker", "code_predictor", "visual", "audio", "code2wav",
@@ -2389,7 +2411,8 @@ def main() -> None:
                      fp8_embedding=args.fp8_embedding,
                      reduced_vocab_dir=args.reduced_vocab_dir,
                      externalize_weights=externalize_weights,
-                     tp_size=args.tp_size)),
+                     tp_size=args.tp_size,
+                     num_decoder_layers=args.num_decoder_layer)),
         (args.mtp and not gemma4_mtp_requested
          and _allow("mtp_draft"), "mtp_draft", lambda out: _export_mtp_draft(
              model_dir, out, externalize_weights=externalize_weights)),
@@ -2452,6 +2475,9 @@ def main() -> None:
         "External weights: %s",
         ", ".join(externalize_weights) if externalize_weights else "no")
     logger.info("TP size       : %d", args.tp_size)
+    if args.num_decoder_layer is not None:
+        logger.info("Decoder layers: first %d only (accuracy debug)",
+                    args.num_decoder_layer)
     logger.info("=" * 60)
 
     # ``--fp8-embedding`` only applies to the LLM thinker.  Models without a

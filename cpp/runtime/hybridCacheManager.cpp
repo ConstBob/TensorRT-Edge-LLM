@@ -167,6 +167,13 @@ HybridCacheManager& HybridCacheManager::operator=(HybridCacheManager&& other) no
 // Routing by absolute layer index
 // ------------------------------------------------------------------
 
+HybridCacheManager::LayerType HybridCacheManager::getLayerType(int32_t absLayerIdx) const
+{
+    check::check(absLayerIdx >= 0 && absLayerIdx < static_cast<int32_t>(mConfig.layerTypes.size()),
+        "getLayerType: absLayerIdx " + std::to_string(absLayerIdx) + " out of range.");
+    return mConfig.layerTypes[absLayerIdx];
+}
+
 rt::Tensor& HybridCacheManager::getCombinedKVCache(int32_t absLayerIdx)
 {
     check::check(absLayerIdx >= 0 && absLayerIdx < static_cast<int32_t>(mAbsToKVIndex.size()),

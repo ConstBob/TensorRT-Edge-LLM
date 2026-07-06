@@ -320,13 +320,58 @@ def _(k_delta, v_delta, past_key_value, rope_cos_sin, delta_start_positions,
     return torch.empty_like(past_key_value)
 
 
+# ---------------------------------------------------------------------------
+# FP8 fake-quant eager helpers (numeric-validation golden)
+#
+# As with the NVFP4 helpers above, the eager bodies of the FP8 ops were zero
+# stubs (export-only). The golden runs the model eagerly, so they must compute
+# the real per-tensor FP8 (E4M3) quantize / dequantize. ``fp8_quantize`` keeps
+# the fp16 output dtype of register_fake (it holds the fp8-grid value of x/scale
+# in fp16), so ``fp8_dequantize`` -- which multiplies by the scale -- works
+# uniformly whether fed the quantized activation or the raw fp8 weight buffer.
+# ---------------------------------------------------------------------------
+
+# E4M3 finite max (float8_e4m3fn has no inf; overflow casts to NaN, so saturate first).
+_FP8_E4M3_MAX = 448.0
+
+
+def _fp8_quantize_eager(hidden_states: torch.Tensor,
+                        scale: torch.Tensor) -> torch.Tensor:
+    """Per-tensor FP8 E4M3 quantize: round (x / scale) onto the FP8 grid.
+
+    Returns fp16 holding the fp8-grid value (still divided by ``scale``); the
+    paired ``fp8_dequantize`` multiplies the scale back. Saturates to the E4M3
+    max so an out-of-range value clamps (like the kernel) instead of becoming NaN.
+    """
+    s = scale.to(torch.float32)
+    q = (hidden_states.to(torch.float32) / s).clamp(-_FP8_E4M3_MAX,
+                                                    _FP8_E4M3_MAX)
+    return q.to(torch.float8_e4m3fn).to(torch.float16)
+
+
+def _fp8_dequantize_eager(weight: torch.Tensor,
+                          weight_scale: torch.Tensor) -> torch.Tensor:
+    """Per-tensor FP8 dequantize: value * scale -> fp16.
+
+    ``weight`` is either the fp8 weight buffer or the fp16 output of
+    ``_fp8_quantize_eager`` (already on the fp8 grid); ``.to(float16)`` is the
+    real fp8 value in both cases.
+    """
+    return (weight.to(torch.float32) * weight_scale.to(torch.float32)).to(
+        torch.float16)
+
+
 @torch.library.custom_op("trt::fp8_quantize", mutates_args=())
 def fp8_quantize(
         hidden_states: torch.Tensor,  # float16 input
         scale: torch.Tensor,  # float16 per-tensor scale (scalar)
 ) -> torch.Tensor:
-    """Stub: quantize float16 -> FP8; ONNX export -> QuantizeLinear."""
-    return torch.zeros_like(hidden_states)
+    """Quantize float16 -> FP8 (per-tensor E4M3); ONNX export -> QuantizeLinear.
+
+    Eager body computes the real fake-quant for the numeric-validation golden; export uses
+    register_fake and emits the ONNX node, so the real body does not affect it.
+    """
+    return _fp8_quantize_eager(hidden_states, scale)
 
 
 @fp8_quantize.register_fake
@@ -344,13 +389,107 @@ def fp8_dequantize(
         weight: torch.Tensor,  # fp8_e4m3fn [out, in]
         weight_scale: torch.Tensor,  # float16 per-tensor scale (scalar)
 ) -> torch.Tensor:
-    """Stub: dequantize FP8 -> float16; ONNX export -> DequantizeLinear."""
-    return torch.zeros_like(weight, dtype=torch.float16)
+    """Dequantize FP8 -> float16 (value * scale); ONNX export -> DequantizeLinear.
+
+    Eager body computes the real dequant for the numeric-validation golden; export uses
+    register_fake and emits the ONNX node, so the real body does not affect it.
+    """
+    return _fp8_dequantize_eager(weight, weight_scale)
 
 
 @fp8_dequantize.register_fake
 def _(weight, weight_scale):
     return torch.empty_like(weight, dtype=torch.float16)
+
+
+# ---------------------------------------------------------------------------
+# NVFP4 fake-quant eager helpers (numeric-validation golden)
+#
+# The custom ops below normally only emit ONNX nodes; their eager bodies were
+# zero stubs. For the PyTorch golden we run the model eagerly, so the bodies
+# must compute the real NVFP4 fake-quant. These helpers mirror EdgeLLM's own
+# offline decoder ``checkpoint/repacking.decode_modelopt_nvfp4`` exactly (same
+# E2M1 levels, same nibble order: low nibble = even index, same
+# value*block_scale*scale_2 formula) so the golden matches the engine's NVFP4
+# definition rather than a third-party convention.
+# ---------------------------------------------------------------------------
+
+# E2M1 positive levels (index 0..7) and the midpoints used to round to them.
+# Kept in sync with tensorrt_edgellm/checkpoint/repacking.py.
+_FP4_E2M1_LEVELS = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+_FP4_E2M1_BOUNDS = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]
+
+
+def _nvfp4_dequantize_eager(weight: torch.Tensor, weight_scale: torch.Tensor,
+                            weight_scale_2: torch.Tensor,
+                            group_size: int) -> torch.Tensor:
+    """Dequantize packed NVFP4 weight to float16 (torch, on-device).
+
+    Torch port of ``repacking.decode_modelopt_nvfp4``: ``weight`` is
+    ``[out, in//2]`` int8/uint8 with two E2M1 nibbles per byte (low nibble = even
+    index); ``weight_scale`` is ``[out, in//group_size]`` FP8 E4M3 (or an int8
+    view / float cast of it); ``weight_scale_2`` is a fp32 per-tensor scalar.
+    """
+    device = weight.device
+    w = weight.view(torch.uint8) if weight.dtype == torch.int8 else weight
+    w = w.to(torch.int64)  # 0..255, so the right-shift below is logical
+    out_f, half = w.shape
+    nibbles = torch.empty(out_f, half * 2, dtype=torch.int64, device=device)
+    nibbles[:, 0::2] = w & 0x0F
+    nibbles[:, 1::2] = (w >> 4) & 0x0F
+    sign = (nibbles & 0x08) != 0
+    magnitude = nibbles & 0x07
+    levels = torch.tensor(_FP4_E2M1_LEVELS, dtype=torch.float32, device=device)
+    values = torch.where(sign, -levels[magnitude], levels[magnitude])
+
+    if weight_scale.dtype == torch.int8:
+        ws = weight_scale.view(torch.float8_e4m3fn).to(torch.float32)
+    else:
+        ws = weight_scale.to(torch.float32)
+    ws2 = weight_scale_2.to(torch.float32).reshape(1)
+    num_groups = ws.shape[-1]
+    in_f = num_groups * group_size
+    dense = values.reshape(out_f, num_groups, group_size) * ws.reshape(
+        out_f, num_groups, 1) * ws2
+    return dense.reshape(out_f, in_f).to(torch.float16)
+
+
+def _nvfp4_act_qdq_eager(hidden_states: torch.Tensor,
+                         global_scale: torch.Tensor,
+                         block_size: int = 16) -> torch.Tensor:
+    """Dynamic per-block NVFP4 fake-quant of activations (torch, fp16 out).
+
+    Mirrors ``TRT_FP4DynamicQuantize`` + 2x DQ: along the last dim, every
+    ``block_size`` elements share a scale derived dynamically from the block
+    amax; values are rounded to the E2M1 grid and dequantized back.
+    ``global_scale`` is the per-tensor scale-2 (the calibrated ``input_scale``).
+    """
+    orig_dtype = hidden_states.dtype
+    device = hidden_states.device
+    x = hidden_states.to(torch.float32)
+    *lead, last = x.shape
+    nb = last // block_size
+    xb = x.reshape(*lead, nb, block_size)
+
+    s2 = global_scale.to(torch.float32).reshape(1)
+    per_block_scale = xb.abs().amax(dim=-1, keepdim=True) / 6.0  # [..., nb, 1]
+    # Quantize the block scale through FP8 E4M3 (as the kernel does), guard zeros.
+    # Saturate to the E4M3 max (448) before the cast: float8_e4m3fn has no inf, so an
+    # overflowing value would become NaN instead of clamping like the hardware kernel.
+    q_block_scale = (per_block_scale / s2).clamp(max=448.0).to(
+        torch.float8_e4m3fn).to(torch.float32)
+    q_block_scale = torch.where(per_block_scale == 0,
+                                torch.ones_like(q_block_scale), q_block_scale)
+    block_scale = (q_block_scale * s2).clamp_min(
+        1e-20)  # effective dequant scale
+
+    # Round magnitude to the nearest E2M1 level (midpoints in _FP4_E2M1_BOUNDS).
+    bounds = torch.tensor(_FP4_E2M1_BOUNDS, dtype=torch.float32, device=device)
+    levels = torch.tensor(_FP4_E2M1_LEVELS, dtype=torch.float32, device=device)
+    scaled = xb / block_scale
+    idx = torch.searchsorted(bounds, scaled.abs().contiguous())
+    deq = torch.sign(scaled) * levels[idx] * block_scale
+    return deq.reshape(*lead, last).to(orig_dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -374,8 +513,12 @@ def nvfp4_act_qdq(
             -> dq_scale
         trt::DequantizeLinear(x_f4, dq_scale, axis=-1, block_size=16)
             -> x_dq  [float16]
+
+    The eager body computes the real fake-quant (used by the numeric-
+    validation golden); ``torch.export`` uses ``register_fake`` for tracing and
+    emits the three ONNX nodes above, so the real body does not affect export.
     """
-    return torch.zeros_like(hidden_states)
+    return _nvfp4_act_qdq_eager(hidden_states, global_scale)
 
 
 @nvfp4_act_qdq.register_fake
@@ -395,13 +538,14 @@ def nvfp4_dequantize(
     weight_scale_2: torch.Tensor,  # float32 scalar
     group_size: int,
 ) -> torch.Tensor:
-    """Stub: dequantize NVFP4 packed weight to float16."""
-    out_features, packed_in = weight.shape
-    in_features = packed_in * 2
-    return torch.zeros(out_features,
-                       in_features,
-                       dtype=torch.float16,
-                       device=weight.device)
+    """Dequantize NVFP4 packed weight to float16.
+
+    Eager body computes the real dequant (used by the numeric-validation
+    golden); ``torch.export`` uses ``register_fake`` for tracing and emits the
+    two ``trt::DequantizeLinear`` nodes, so the real body does not affect export.
+    """
+    return _nvfp4_dequantize_eager(weight, weight_scale, weight_scale_2,
+                                   group_size)
 
 
 @nvfp4_dequantize.register_fake
@@ -414,6 +558,56 @@ def _(weight, weight_scale, weight_scale_2, group_size):
 
 
 # ---------------------------------------------------------------------------
+# MXFP8 fake-quant eager helpers (numeric-validation golden)
+#
+# MXFP8 (OCP microscaling): FP8 E4M3 elements with a per-block (block_size=32)
+# power-of-two shared scale stored as E8M0 (uint8, value V -> 2^(V-127)).
+# Activation is dynamically quantized at runtime; weights carry a precomputed
+# E8M0 scale. As with NVFP4/FP8, the eager bodies were zero stubs (export-only).
+# ---------------------------------------------------------------------------
+
+# E8M0 exponent bias and FP8 E4M3 element emax / finite-max (OCP MX spec).
+_E8M0_BIAS = 127
+_FP8_E4M3_EMAX = 8  # largest binary exponent of an E4M3 normal (448 = 1.75 * 2^8)
+
+
+def _mxfp8_weight_dq_eager(weight: torch.Tensor, weight_scale: torch.Tensor,
+                           block_size: int) -> torch.Tensor:
+    """Dequantize an MXFP8 weight (FP8 E4M3 + per-block E8M0 scale) to fp16."""
+    out_f, in_f = weight.shape
+    nb = in_f // block_size
+    w = weight.to(torch.float32).reshape(out_f, nb, block_size)
+    scale = torch.exp2(weight_scale.to(torch.float32) - _E8M0_BIAS).reshape(
+        out_f, nb, 1)
+    return (w * scale).reshape(out_f, in_f).to(torch.float16)
+
+
+def _mxfp8_act_qdq_eager(hidden_states: torch.Tensor,
+                         block_size: int = 32) -> torch.Tensor:
+    """Dynamic per-block MXFP8 fake-quant of activations (fp16 out).
+
+    Mirrors ``TRT_MXFP8DynamicQuantize`` + ``DequantizeLinear``: per block of
+    ``block_size`` along the last dim, pick an E8M0 (power-of-two) shared scale so
+    the block amax lands at the top of E4M3's range, quantize to FP8, dequantize.
+    """
+    orig_dtype = hidden_states.dtype
+    x = hidden_states.to(torch.float32)
+    *lead, last = x.shape
+    nb = last // block_size
+    xb = x.reshape(*lead, nb, block_size)
+    amax = xb.abs().amax(dim=-1, keepdim=True)  # [..., nb, 1]
+    safe = torch.where(amax > 0, amax, torch.ones_like(amax))
+    # E8M0 shared exponent: floor(log2(amax)) - emax(E4M3), clamped to E8M0 range.
+    shared_exp = (torch.floor(torch.log2(safe)) - _FP8_E4M3_EMAX).clamp(
+        -_E8M0_BIAS, _E8M0_BIAS)
+    scale = torch.where(amax > 0, torch.exp2(shared_exp),
+                        torch.ones_like(amax))
+    q = (xb / scale).clamp(-448.0,
+                           448.0).to(torch.float8_e4m3fn).to(torch.float32)
+    return (q * scale).reshape(*lead, last).to(orig_dtype)
+
+
+# ---------------------------------------------------------------------------
 # Custom op: trt::mxfp8_act_qdq  (activation DynQ + DQ -> float16)
 # ---------------------------------------------------------------------------
 
@@ -422,9 +616,10 @@ def _(weight, weight_scale, weight_scale_2, group_size):
 def mxfp8_act_qdq(
         hidden_states: torch.Tensor,  # float16 activation
 ) -> torch.Tensor:
-    """Stub: MXFP8 activation DynQ + DQ. Returns float16.
+    """MXFP8 activation DynQ + DQ -> float16.
 
-    In the ONNX graph this emits two nodes::
+    Eager body computes the real fake-quant for the numeric-validation golden; export uses
+    register_fake and emits the two ONNX nodes below, so the body is export-safe::
 
         TRT_MXFP8DynamicQuantize(x, axis=-1, block_size=32, output_dtype=17)
             -> (x_f8, sx_e8m0)
@@ -432,7 +627,7 @@ def mxfp8_act_qdq(
             axis=-1, block_size=32, output_dtype=10)
             -> x_dq  [float16]
     """
-    return torch.zeros_like(hidden_states)
+    return _mxfp8_act_qdq_eager(hidden_states)
 
 
 @mxfp8_act_qdq.register_fake
@@ -451,17 +646,15 @@ def mxfp8_weight_dq(
     weight_scale: torch.Tensor,  # uint8 (E8M0) [out, in // block_size]
     block_size: int,
 ) -> torch.Tensor:
-    """Stub: dequantize MXFP8 weight (FP8E4M3 + E8M0 scale) to float16.
+    """Dequantize MXFP8 weight (FP8E4M3 + per-block E8M0 scale) to float16.
 
-    Emits::
+    Eager body computes the real dequant for the numeric-validation golden; export uses
+    register_fake and emits the ONNX node, so the body is export-safe::
 
         TRT_MXFP8DequantizeLinear(weight, weight_scale,
             axis=-1, block_size=block_size, output_dtype=10) -> w_dq [float16]
     """
-    return torch.zeros(weight.shape[0],
-                       weight.shape[1],
-                       dtype=torch.float16,
-                       device=weight.device)
+    return _mxfp8_weight_dq_eager(weight, weight_scale, block_size)
 
 
 @mxfp8_weight_dq.register_fake
@@ -504,6 +697,33 @@ def _(hidden_states, qweight, scales, gemm_n, gemm_k, group_size):
 
 
 # ---------------------------------------------------------------------------
+# INT8 SmoothQuant fake-quant eager helpers (numeric-validation golden)
+#
+# W8A8: symmetric per-tensor INT8 activation, symmetric per-channel INT8 weight.
+# As with the other recipes, the eager bodies were zero stubs (export-only).
+# ---------------------------------------------------------------------------
+
+# Symmetric INT8 uses [-127, 127] (not -128), matching ONNX QuantizeLinear sym.
+_INT8_SYM_MAX = 127.0
+
+
+def _int8_sq_act_qdq_eager(hidden_states: torch.Tensor,
+                           scale: torch.Tensor) -> torch.Tensor:
+    """Symmetric per-tensor INT8 quantize+dequantize of the (smoothed) activation."""
+    s = scale.to(torch.float32)
+    q = torch.round(hidden_states.to(torch.float32) / s).clamp(
+        -_INT8_SYM_MAX, _INT8_SYM_MAX)
+    return (q * s).to(torch.float16)
+
+
+def _int8_sq_weight_dq_eager(weight: torch.Tensor,
+                             scale: torch.Tensor) -> torch.Tensor:
+    """Per-channel (axis=0) INT8 weight dequantize: value * scale[out] -> fp16."""
+    return (weight.to(torch.float32) *
+            scale.to(torch.float32).reshape(-1, 1)).to(torch.float16)
+
+
+# ---------------------------------------------------------------------------
 # Custom op: trt::int8_sq_act_qdq  (INT8 SmoothQuant activation QDQ)
 # ---------------------------------------------------------------------------
 
@@ -513,15 +733,16 @@ def int8_sq_act_qdq(
         hidden_states: torch.Tensor,  # float16 smoothed activation [*, in]
         scale: torch.Tensor,  # float32 per-tensor input scale []
 ) -> torch.Tensor:
-    """Stub: symmetric per-tensor INT8 QuantizeLinear + DequantizeLinear.
+    """Symmetric per-tensor INT8 QuantizeLinear + DequantizeLinear.
 
-    In the ONNX graph emits::
+    Eager body computes the real fake-quant for the numeric-validation golden; export uses
+    register_fake and emits the ONNX nodes below, so the body is export-safe::
 
         QuantizeLinear(x, scale, output_dtype=INT8) -> q
         DequantizeLinear(q, scale)                  -> dq  [float32]
         Cast(dq, to=FLOAT16)                        -> output
     """
-    return torch.zeros_like(hidden_states)
+    return _int8_sq_act_qdq_eager(hidden_states, scale)
 
 
 @int8_sq_act_qdq.register_fake
@@ -539,14 +760,15 @@ def int8_sq_weight_dq(
         weight: torch.Tensor,  # int8 [out, in]
         scale: torch.Tensor,  # float32 [out] per-channel scale
 ) -> torch.Tensor:
-    """Stub: per-channel INT8 DequantizeLinear (axis=0), output float16.
+    """Per-channel INT8 DequantizeLinear (axis=0), output float16.
 
-    In the ONNX graph emits::
+    Eager body computes the real dequant for the numeric-validation golden; export uses
+    register_fake and emits the ONNX node, so the body is export-safe::
 
         DequantizeLinear(weight, scale, axis=0) -> dq  [float32]
         Cast(dq, to=FLOAT16)                    -> output
     """
-    return torch.zeros_like(weight, dtype=torch.float16)
+    return _int8_sq_weight_dq_eager(weight, scale)
 
 
 @int8_sq_weight_dq.register_fake

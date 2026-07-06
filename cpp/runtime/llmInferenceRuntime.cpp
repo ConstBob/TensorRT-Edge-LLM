@@ -30,6 +30,7 @@
 #include "multimodal/qwenViTRunner.h"
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
+#include "runtime/debug/layerDebugger.h"
 #include "runtime/decoding/decoderRegistry.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "sampler/sampling.h"
@@ -501,6 +502,12 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     DecodingInferenceContext context;
     context.initialize(
         activeBatchSize, maxGenerateLength, std::nullopt, rt::OptionalInputTensors{}, loraWeightsName, stream);
+
+    // Few-layer-validation debug: per-layer logits/KV dump + optional teacher-forcing (both no-ops
+    // unless the env vars are set). Owned by the context via RAII so it shares the request's lifetime
+    // exactly; prefill and the vanilla decode loop dump rounds through context.layerDebugger.
+    context.layerDebugger = LayerDebugger::fromEnv();
+
     bool const supportsMultimodalInput
         = (mAudioRunner != nullptr) || (mVisionRunner != nullptr) || (mActionRunner != nullptr);
 
@@ -722,6 +729,20 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
         return isEos || context.currentGenerateLengths[batchIdx] >= context.maxGenerateLength;
     };
 
+    // Few-layer-validation: when EDGELLM_IGNORE_EOS is set, suppress EOS-based
+    // termination so the run produces exactly maxGenerateLength tokens, matching
+    // the PyTorch golden, which forces a fixed number of decode rounds ignoring
+    // EOS. Off by default; only for the numeric-validation run. (Greedy sampling
+    // itself is requested separately via the input JSON's top_k=1.)
+    bool const ignoreEos = []() {
+        char const* v = std::getenv("EDGELLM_IGNORE_EOS");
+        return v != nullptr && std::string(v) != "0" && std::string(v) != "false";
+    }();
+    if (ignoreEos)
+    {
+        LOG_INFO("EDGELLM_IGNORE_EOS set: ignoring EOS; running to maxGenerateLength.");
+    }
+
     // Lambda to update finish states based on EOS and max_length. Latches
     // terminalReason atomically with the state flip — the !finishedStates guard
     // keeps first-writer-wins semantics relative to applyCancellationToFinishStates.
@@ -750,7 +771,8 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
             {
                 // Check EOS (supports multiple EOS tokens, e.g. Gemma4 [1, 106]).
                 // In thinking mode, suppress secondary EOS until thinking is complete.
-                if (!context.tokenIds[i].empty())
+                // EDGELLM_IGNORE_EOS bypasses EOS entirely to force a fixed-length run.
+                if (!ignoreEos && !context.tokenIds[i].empty())
                 {
                     auto lastToken = context.tokenIds[i].back();
                     bool isEos = mTokenizer->isEosToken(lastToken);
@@ -847,6 +869,12 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
             LOG_ERROR("Failed to perform batch eviction.");
             return false;
         }
+    }
+
+    // Few-layer-validation debug: write the accumulated per-layer logits/KV dump for this request.
+    if (context.layerDebugger)
+    {
+        context.layerDebugger->flush(stream);
     }
 
     if (context.activeBatchSize != 0)
@@ -1291,6 +1319,25 @@ bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context)
     CUDA_CHECK(cudaMemcpyAsync(hostSelectedTokenIdsData, mSamplingIndices.rawPointer(),
         activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost, context.stream));
     CUDA_CHECK(cudaStreamSynchronize(context.stream));
+
+    // Few-layer-validation debug: dump round 0 (prefill). At this point the KV cache is committed and
+    // tokenIds[i].size() == the prefill length == the committed cache length.
+    if (context.layerDebugger != nullptr)
+    {
+        std::vector<int32_t> validLengths(activeBatchSize);
+        for (int32_t i = 0; i < activeBatchSize; ++i)
+        {
+            validLengths[i] = static_cast<int32_t>(context.tokenIds[i].size());
+        }
+        context.layerDebugger->dumpRound(*mSharedResources->cacheManagers[0], mPipelineIO->outputLogits, validLengths,
+            hostSelectedTokenIdsData, activeBatchSize, context.stream);
+
+        // Teacher-forcing — feed the golden's tokens instead of our own sampled ones (no-op unless
+        // EDGELLM_FORCE_TOKENS_FILE is set). Applied after the dump so the dump still records what we
+        // *would* have sampled; the pushed token below is the forced one.
+        context.layerDebugger->applyForcedTokens(
+            context.currentGenerateLengths, hostSelectedTokenIdsData, activeBatchSize);
+    }
 
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {

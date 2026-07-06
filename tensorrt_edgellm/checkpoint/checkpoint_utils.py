@@ -454,12 +454,20 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
     # Only attention and linear-attention layers carry KV/recurrent state and
     # must appear in the per-layer routing table. MLP layers are skipped.
     if config.is_hybrid and config.layer_types:
-        from ..config import LAYER_ATTN, LAYER_GDN, LAYER_MAMBA
+        from ..config import (_VALID_ATTENTION_LAYER_TYPES, LAYER_ATTN,
+                              LAYER_GDN, LAYER_MAMBA)
 
+        # ``config.layer_types`` normalizes recurrent layers to LAYER_GDN /
+        # LAYER_MAMBA, but attention layers keep their raw HF type (e.g.
+        # Qwen3.5 uses ``"full_attention"``), so match the attention family
+        # explicitly. Matching only LAYER_ATTN silently drops those layers,
+        # collapsing the per-layer routing table and shifting every attention
+        # layer's position (see num_attn_layers, which counts the same set).
+        attention_types = (LAYER_ATTN, ) + _VALID_ATTENTION_LAYER_TYPES
         normalized_layer_types: list = []
         kv_layer_configs: list = []
         for lt in config.layer_types:
-            if lt == LAYER_ATTN:
+            if lt in attention_types:
                 normalized_layer_types.append("attention")
                 kv_layer_configs.append({
                     "num_kv_heads": config.num_key_value_heads,

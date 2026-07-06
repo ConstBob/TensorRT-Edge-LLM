@@ -23,11 +23,13 @@
 #include "profiling/metrics.h"
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
+#include "runtime/debug/layerDebugger.h"
 #include "runtime/decoding/logitBias.h"
 #include "sampler/sampling.h"
 
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace trt_edgellm
 {
@@ -132,6 +134,24 @@ bool VanillaDecoder::decodeStep(DecodingInferenceContext& context)
     CUDA_CHECK(cudaMemcpyAsync(hostSelectedTokenIdsData, mRuntime.sampling.indices.rawPointer(),
         activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost, context.stream));
     CUDA_CHECK(cudaStreamSynchronize(context.stream));
+
+    // Few-layer-validation debug: dump this decode round. The KV cache is committed (line above) so
+    // tokenIds[i].size() == the committed cache length for this round.
+    if (context.layerDebugger != nullptr)
+    {
+        std::vector<int32_t> validLengths(activeBatchSize);
+        for (int32_t i = 0; i < activeBatchSize; ++i)
+        {
+            validLengths[i] = static_cast<int32_t>(context.tokenIds[i].size());
+        }
+        context.layerDebugger->dumpRound(mRuntime.base.cacheManager, mRuntime.base.pipelineIO.outputLogits,
+            validLengths, hostSelectedTokenIdsData, activeBatchSize, context.stream);
+
+        // Teacher-forcing — feed the golden's tokens instead of our own (no-op unless
+        // EDGELLM_FORCE_TOKENS_FILE is set). After the dump, so the dump keeps our own sampled token.
+        context.layerDebugger->applyForcedTokens(
+            context.currentGenerateLengths, hostSelectedTokenIdsData, activeBatchSize);
+    }
 
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
