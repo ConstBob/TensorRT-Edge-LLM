@@ -50,6 +50,14 @@ struct CuteDslFFPAParams
     void const* k{nullptr};
     void const* v{nullptr};
     void* o{nullptr};
+    //! Device pointers to (batchSize + 1) int32 cumulative sequence lengths
+    //! carrying the logical per-batch valid lengths (seqlenQ/seqlenK stay the
+    //! physical padded extents).  Per batch b the valid lengths are
+    //! cuSeqLenQ[b+1] - cuSeqLenQ[b] and cuSeqLenK[b+1] - cuSeqLenK[b]; the
+    //! causal mask is bottom-right aligned with offset seqlenK_b - seqlenQ_b
+    //! (0 for plain prefill, KV prefix length for chunked prefill).
+    int32_t const* cuSeqLenQ{nullptr};
+    int32_t const* cuSeqLenK{nullptr};
     int32_t batchSize{0};
     int32_t seqlenQ{0};
     int32_t seqlenK{0};

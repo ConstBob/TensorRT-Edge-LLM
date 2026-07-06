@@ -77,6 +77,17 @@ Runtime axes:
   equal to Q-head count = MHA). The kernel derives the group size internally;
   the C++ runner passes `numKVHeads` from `CuteDslFFPAParams` and rejects any
   `numQHeads % numKVHeads != 0`.
+- `mCuSeqLenQ` / `mCuSeqLenK` — `(B+1,)` Int32 cumulative sequence lengths
+  carrying the *logical* per-batch valid lengths (nvbug 6384817).  Per batch
+  `b`, `seqlen_q_b = cu_q[b+1] - cu_q[b]` and `seqlen_k_b = cu_k[b+1] -
+  cu_k[b]`; the causal mask is bottom-right aligned with offset
+  `seqlen_k_b - seqlen_q_b` (0 for right-padded prefill, the KV prefix length
+  for chunked prefill).  Padding K/V positions beyond `seqlen_k_b` are never
+  attended, padding Q rows are residual-masked, and whole-padding Q tiles
+  write exact zeros.  Pass uniform cumulative lengths (`[0, S, 2S, ...]`) to
+  recover the previous dense behaviour.  Varlen behaviour is covered by
+  `unittests/cuteDslFFPARunnerTest.cpp` (ragged poisoned-padding and
+  chunked-prefill cases against the FP32 reference).
 
 The AOT export bakes the BSND layout with `D=512` as the innermost contiguous
 dim, so the per-tensor batch and seq strides must match `S * H * D` and

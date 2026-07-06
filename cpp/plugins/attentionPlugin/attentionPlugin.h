@@ -26,6 +26,10 @@
 
 #include "common/tensor.h"
 
+#ifdef CUTE_DSL_FFPA_ENABLED
+#include "kernels/contextAttentionKernels/cuteDslFFPARunner.h"
+#endif
+
 namespace trt_edgellm
 {
 namespace plugins
@@ -102,15 +106,15 @@ private:
         std::byte*& workspacePtr, int32_t batchSize, int32_t numKVHeads, int32_t kvCacheCapacity, int32_t headSize,
         int32_t seqLen, cudaStream_t stream);
 
-    //! Launch the CuTe DSL FFPA d512 causal attention kernel.
-    static void dispatchFFPAKernel(half const* q, half const* k, half const* v, half* o, int32_t batchSize,
-        int32_t seqlenQ, int32_t seqlenK, int32_t numQHeads, int32_t numKVHeads, int32_t headDim, cudaStream_t stream);
-
-    //! Zero the attention output buffer before FFPA prefill.
-    //! FFPA is a dense causal kernel with no cu_seqlens support, so it processes padding positions as real data.
-    //! Zeroing the output ensures padding positions don't carry NaN/garbage into downstream layers.
-    static void zeroPrefillOutputForPaddingForFFPA(rt::Tensor& attentionOutput, int32_t batchSize, int32_t seqLen,
-        int32_t numQHeads, int32_t headSize, cudaStream_t stream);
+#ifdef CUTE_DSL_FFPA_ENABLED
+    //! Launch the CuTe DSL FFPA d512 causal attention kernel.  The caller
+    //! fills the tensor pointers, the (batchSize + 1) int32 cuSeqLenQ /
+    //! cuSeqLenK device tensors (cumulative logical per-batch Q / KV lengths;
+    //! bug 6384817: padding positions and chunked-prefill prefixes are masked
+    //! per batch inside the kernel) and the dimensions; softmaxScale is
+    //! derived from headDim here.
+    static void dispatchFFPAKernel(CuteDslFFPAParams const& params, cudaStream_t stream);
+#endif
 
 protected:
     std::string mLayerName; //!< Plugin layer name
