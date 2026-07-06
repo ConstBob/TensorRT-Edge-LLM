@@ -19,6 +19,7 @@
 
 #include "cutedsl_all.h"
 
+#include <NvInferRuntime.h>
 #include <climits>
 #include <cstdint>
 #include <cuda_fp16.h>
@@ -85,6 +86,38 @@ public:
         float vScale = 1.0f);
 
     /**
+     * @brief LLM FMHA over a paged KV cache.
+     *
+     * Dispatches a dedicated CuTe DSL AOT variant that reads K/V directly from
+     * a paged pool using kvCachePageList. The logical descriptor shape is
+     * [numPages, H_kv, tokensPerPage, D], while the physical pool is fixed to
+     * NHD [numPages, tokensPerPage, H_kv, D]. This path maps one logical K/V
+     * TMA tile to one physical page. The current CuTe DSL variants use a K/V
+     * tile width of 128 tokens, so tokensPerPage must be 128 to avoid
+     * multi-page tile stitching or a gather workspace.
+     *
+     * @param qPtr Query [B, S_q, H_q, D]
+     * @param pagedKVPoolPtr Paged KV pool [numPages, tokensPerPage, H_kv, D]
+     * @param kvCachePageList Page table [B, 2, maxPagesPerSeq], K pages then V pages
+     * @param oPtr Output [B, S_q, H_q, D] (always FP16)
+     * @param cuKVSeqLens Cumulative KV sequence lengths [B+1]
+     * @param numPages Number of pages in the paged KV pool
+     * @param maxPagesPerSeq Max logical pages per sequence
+     * @param tokensPerPage Number of tokens per page
+     * @param kvDataType Paged KV cache dtype (FP16 or FP8)
+     * @param stream CUDA stream
+     * @param slidingWindowSize Sliding window size (INT_MAX = disabled)
+     * @param fp8Input Whether Q/KV are FP8 E4M3
+     * @param qScale Q dequant scale, ignored when fp8Input=false
+     * @param kScale K dequant scale, ignored when fp8Input=false
+     * @param vScale V dequant scale, ignored when fp8Input=false
+     */
+    void runPaged(void const* qPtr, void const* pagedKVPoolPtr, int32_t const* kvCachePageList, void* oPtr,
+        int32_t const* cuKVSeqLens, int32_t numPages, int32_t maxPagesPerSeq, int32_t tokensPerPage,
+        nvinfer1::DataType kvDataType, cudaStream_t stream, int32_t slidingWindowSize = INT_MAX, bool fp8Input = false,
+        float qScale = 1.0f, float kScale = 1.0f, float vScale = 1.0f);
+
+    /**
      * @brief ViT FMHA: packed varlen separate Q/K/V, bidirectional.
      *
      * @param qPtr  Query  [total_S, H, D]
@@ -119,6 +152,18 @@ private:
     static fmha_d128_fp8_Kernel_Module_t sLLM_d128_fp8;
     static fmha_d64_sw_fp8_Kernel_Module_t sLLM_d64_sw_fp8;
     static fmha_d128_sw_fp8_Kernel_Module_t sLLM_d128_sw_fp8;
+
+    // LLM paged KV cache kernel modules (FP16)
+    static fmha_d64_paged_Kernel_Module_t sLLM_d64_paged;
+    static fmha_d128_paged_Kernel_Module_t sLLM_d128_paged;
+    static fmha_d64_sw_paged_Kernel_Module_t sLLM_d64_sw_paged;
+    static fmha_d128_sw_paged_Kernel_Module_t sLLM_d128_sw_paged;
+
+    // LLM paged KV cache kernel modules (FP8 input, FP16 output)
+    static fmha_d64_paged_fp8_Kernel_Module_t sLLM_d64_paged_fp8;
+    static fmha_d128_paged_fp8_Kernel_Module_t sLLM_d128_paged_fp8;
+    static fmha_d64_sw_paged_fp8_Kernel_Module_t sLLM_d64_sw_paged_fp8;
+    static fmha_d128_sw_paged_fp8_Kernel_Module_t sLLM_d128_sw_paged_fp8;
 
     static bool sLLMLoaded;
     static std::mutex sLLMMutex;

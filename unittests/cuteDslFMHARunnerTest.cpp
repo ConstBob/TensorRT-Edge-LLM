@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -197,6 +197,112 @@ void runLlmAccuracyCase(int32_t batchSize, int32_t seqLen, int32_t numQHeads, in
             + " headDim=" + std::to_string(headDim));
 }
 
+size_t contiguousKVIdx(int32_t b, int32_t kv, int32_t h, int32_t s, int32_t d, int32_t H, int32_t S, int32_t D)
+{
+    return (((((size_t) b * 2 + kv) * H + h) * S + s) * D + d);
+}
+
+size_t pagedKVIdx(int32_t page, int32_t h, int32_t tokenInPage, int32_t d, int32_t H, int32_t tokensPerPage, int32_t D)
+{
+    return static_cast<size_t>(((static_cast<int64_t>(page) * tokensPerPage + tokenInPage) * H + h) * D + d);
+}
+
+rt::Coords pagedKVPoolShape(int32_t numPages, int32_t numKVHeads, int32_t tokensPerPage, int32_t headDim)
+{
+    return rt::Coords{numPages, tokensPerPage, numKVHeads, headDim};
+}
+
+void runLlmPagedMatchesContiguousCase(
+    int32_t batchSize, int32_t seqLen, int32_t numQHeads, int32_t numKVHeads, int32_t headDim, int32_t tokensPerPage)
+{
+    ASSERT_EQ(seqLen % tokensPerPage, 0);
+    int32_t const maxPagesPerSeq = seqLen / tokensPerPage;
+    int32_t const numPages = batchSize * 2 * maxPagesPerSeq;
+
+    size_t const qSize = static_cast<size_t>(batchSize) * seqLen * numQHeads * headDim;
+    size_t const kvSize = static_cast<size_t>(batchSize) * 2 * numKVHeads * seqLen * headDim;
+    size_t const pagedKVSize = static_cast<size_t>(numPages) * numKVHeads * tokensPerPage * headDim;
+
+    std::vector<half> qInput(qSize);
+    std::vector<half> kvContiguous(kvSize);
+    std::vector<half> kvPaged(pagedKVSize);
+    std::vector<int32_t> pageList(static_cast<size_t>(batchSize) * 2 * maxPagesPerSeq);
+
+    uniformFloatInitialization(qInput, -1.0f, 1.0f);
+    uniformFloatInitialization(kvContiguous, -1.0f, 1.0f);
+
+    for (int32_t b = 0; b < batchSize; ++b)
+    {
+        int32_t const batchPageBase = b * 2 * maxPagesPerSeq;
+        for (int32_t logicalPage = 0; logicalPage < maxPagesPerSeq; ++logicalPage)
+        {
+            int32_t const permutedPage = (logicalPage * 3 + 1) % maxPagesPerSeq;
+            pageList[(b * 2 * maxPagesPerSeq) + logicalPage] = batchPageBase + permutedPage;
+            pageList[(b * 2 * maxPagesPerSeq) + maxPagesPerSeq + logicalPage]
+                = batchPageBase + maxPagesPerSeq + permutedPage;
+        }
+    }
+
+    for (int32_t b = 0; b < batchSize; ++b)
+    {
+        for (int32_t kv = 0; kv < 2; ++kv)
+        {
+            for (int32_t s = 0; s < seqLen; ++s)
+            {
+                int32_t const logicalPage = s / tokensPerPage;
+                int32_t const tokenInPage = s % tokensPerPage;
+                int32_t const page = pageList[(b * 2 + kv) * maxPagesPerSeq + logicalPage];
+                for (int32_t h = 0; h < numKVHeads; ++h)
+                {
+                    for (int32_t d = 0; d < headDim; ++d)
+                    {
+                        kvPaged[pagedKVIdx(page, h, tokenInPage, d, numKVHeads, tokensPerPage, headDim)]
+                            = kvContiguous[contiguousKVIdx(b, kv, h, s, d, numKVHeads, seqLen, headDim)];
+                    }
+                }
+            }
+        }
+    }
+
+    rt::Tensor qContiguous({batchSize, seqLen, numQHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor qPaged({batchSize, seqLen, numQHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor kvContiguousTensor({batchSize, 2, numKVHeads, seqLen, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor kvPagedTensor(
+        pagedKVPoolShape(numPages, numKVHeads, tokensPerPage, headDim), rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor pageListTensor({batchSize, 2, maxPagesPerSeq}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor outputContiguous({batchSize, seqLen, numQHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor outputPaged({batchSize, seqLen, numQHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor cuKVSeqLens({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
+
+    std::vector<int32_t> cuKVSeqLensHost(static_cast<size_t>(batchSize + 1));
+    for (int32_t idx = 0; idx <= batchSize; ++idx)
+    {
+        cuKVSeqLensHost[static_cast<size_t>(idx)] = idx * seqLen;
+    }
+
+    copyHostToDevice(qContiguous, qInput);
+    copyHostToDevice(qPaged, qInput);
+    copyHostToDevice(kvContiguousTensor, kvContiguous);
+    copyHostToDevice(kvPagedTensor, kvPaged);
+    copyHostToDevice(pageListTensor, pageList);
+    copyHostToDevice(cuKVSeqLens, cuKVSeqLensHost);
+
+    cudaStream_t stream = nullptr;
+    CuteDslFMHARunner runner(numQHeads, numKVHeads, headDim, batchSize, seqLen, seqLen);
+    runner.run(qContiguous.dataPointer<half>(), kvContiguousTensor.dataPointer<half>(),
+        outputContiguous.dataPointer<half>(), cuKVSeqLens.dataPointer<int32_t>(), stream, INT_MAX);
+    runner.runPaged(qPaged.dataPointer<half>(), kvPagedTensor.dataPointer<half>(),
+        pageListTensor.dataPointer<int32_t>(), outputPaged.dataPointer<half>(), cuKVSeqLens.dataPointer<int32_t>(),
+        numPages, maxPagesPerSeq, tokensPerPage, DataType::kHALF, stream, INT_MAX);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaGetLastError());
+
+    expectHalfOutputsClose(outputPaged, outputContiguous,
+        "Paged LLM CuTe DSL FMHA batch=" + std::to_string(batchSize) + " seqLen=" + std::to_string(seqLen)
+            + " numQHeads=" + std::to_string(numQHeads) + " numKVHeads=" + std::to_string(numKVHeads)
+            + " headDim=" + std::to_string(headDim) + " tokensPerPage=" + std::to_string(tokensPerPage));
+}
+
 } // namespace
 
 TEST(CuteDslFMHARunnerTest, vitAccuracy)
@@ -279,6 +385,47 @@ TEST(CuteDslFMHARunnerTest, llmAccuracy)
                                           << " numKVHeads=" << testCase.numKVHeads << " headDim=" << testCase.headDim);
         runLlmAccuracyCase(
             testCase.batchSize, testCase.seqLen, testCase.numQHeads, testCase.numKVHeads, testCase.headDim);
+    }
+}
+
+TEST(CuteDslFMHARunnerTest, llmPagedKVMatchesContiguous)
+{
+    int32_t const rawSmVersion = getSMVersion();
+    if (!isSupportedCuteDslTestSm(rawSmVersion))
+    {
+        GTEST_SKIP() << "CuTe DSL FMHA unit tests only run on SM100/101/110. Current SM=" << rawSmVersion;
+    }
+
+    if (!CuteDslFMHARunner::loadLLMKernelModule())
+    {
+        FAIL() << "Failed to load CuTe DSL LLM FMHA kernel module";
+    }
+
+    struct LlmPagedCase
+    {
+        int32_t batchSize;
+        int32_t seqLen;
+        int32_t numQHeads;
+        int32_t numKVHeads;
+        int32_t headDim;
+        int32_t tokensPerPage;
+    };
+
+    std::vector<LlmPagedCase> const cases{
+        {1, 256, 8, 8, 64, 128},
+        {2, 128, 16, 4, 64, 128},
+        {1, 128, 8, 8, 128, 128},
+        {1, 256, 12, 4, 128, 128},
+    };
+
+    for (auto const& testCase : cases)
+    {
+        SCOPED_TRACE(::testing::Message()
+            << "batchSize=" << testCase.batchSize << " seqLen=" << testCase.seqLen
+            << " numQHeads=" << testCase.numQHeads << " numKVHeads=" << testCase.numKVHeads
+            << " headDim=" << testCase.headDim << " tokensPerPage=" << testCase.tokensPerPage);
+        runLlmPagedMatchesContiguousCase(testCase.batchSize, testCase.seqLen, testCase.numQHeads, testCase.numKVHeads,
+            testCase.headDim, testCase.tokensPerPage);
     }
 }
 
