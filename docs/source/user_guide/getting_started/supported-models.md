@@ -32,7 +32,7 @@ The model class names were checked against the installed `transformers==5.9.0` p
 | Qwen2/Qwen2.5 dense | [`Qwen2ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2/modeling_qwen2.py) | `qwen2` -> default `CausalLM` | Dense precision set |
 | Qwen3 dense | [`Qwen3ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3/modeling_qwen3.py) | `qwen3` -> default `CausalLM` | Dense precision set |
 | Qwen3.5/3.6 text | [`Qwen3_5ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5/modeling_qwen3_5.py) | `qwen3_5_text` -> `Qwen3_5CausalLM` | Dense precision set |
-| Gemma4 E2B/E4B text | [`Gemma4ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma4/modeling_gemma4.py) | `gemma4` / `gemma4_text` -> text decoder with PLE and dual-RoPE support | BF16/FP16 source checkpoints; no image/audio/video/MTP |
+| Gemma4 E2B/E4B text | [`Gemma4ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma4/modeling_gemma4.py) | `gemma4` / `gemma4_text` -> text decoder with PLE, dual-RoPE, and paired-assistant MTP support | BF16/FP16 source checkpoints; text-only; MTP requires a matched Gemma4 assistant checkpoint; no image/audio/video |
 | Nemotron Nano dense | [`NemotronHForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/nemotron_h/modeling_nemotron_h.py) | `nemotron_h` -> `NemotronHCausalLM` | BF16, FP8, NVFP4 |
 
 <details>

@@ -211,40 +211,80 @@ class ParameterSpec:
 
 
 LLM_MODELS_DIR_MAP = {
-    "Qwen2.5-0.5B-Instruct": "Qwen2.5-0.5B-Instruct",
-    "Qwen2.5-1.5B-Instruct": "Qwen2.5-1.5B-Instruct",
-    "Qwen2.5-3B-Instruct": "Qwen2.5-3B-Instruct",
-    "Qwen2.5-7B-Instruct": "Qwen2.5-7B-Instruct",
-    "Qwen2.5-VL-3B-Instruct": "Qwen2.5-VL-3B-Instruct",
-    "Qwen2.5-VL-7B-Instruct": "Qwen2.5-VL-7B-Instruct",
-    "Qwen2-VL-2B-Instruct": "Qwen2-VL-2B-Instruct",
-    "InternVL3-1B": "InternVL3-1B-hf",
-    "InternVL3-2B": "InternVL3-2B-hf",
-    "Llama-3.1-8B-Instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
-    "Llama-3.2-1B": "llama-3.2-models/Llama-3.2-1B",
-    "Llama-3.2-3B": "llama-3.2-models/Llama-3.2-3B",
-    "Qwen3-0.6B": "Qwen3/Qwen3-0.6B",
-    "Qwen3-1.7B": "Qwen3/Qwen3-1.7B",
-    "Qwen3-8B": "Qwen3/Qwen3-8B",
-    "Qwen3-4B-Instruct-2507": "Qwen3/Qwen3-4B-Instruct-2507",
-    "Qwen3-VL-2B-Instruct": "Qwen3/Qwen3-VL-2B-Instruct",
-    "Qwen3-VL-4B-Instruct": "Qwen3/Qwen3-VL-4B-Instruct",
-    "Qwen3-VL-8B-Instruct": "Qwen3/Qwen3-VL-8B-Instruct",
-    "Qwen3.5-0.8B": "Qwen3.5-0.8B",
-    "Qwen3.5-2B": "Qwen3.5-2B",
-    "Qwen3.5-4B": "Qwen3.5-4B",
-    "Qwen3.5-9B": "Qwen3.5-9B",
-    "Qwen3.5-27B": "Qwen3.5-27B",
-    "Qwen3.6-27B": "Qwen3.6-27B",
-    "Phi-4-multimodal-instruct": "Phi-4-multimodal-instruct",
-    "Alpamayo-R1-10B": "Alpamayo-R1-10B",
+    "Qwen2.5-0.5B-Instruct":
+    "Qwen2.5-0.5B-Instruct",
+    "Qwen2.5-1.5B-Instruct":
+    "Qwen2.5-1.5B-Instruct",
+    "Qwen2.5-3B-Instruct":
+    "Qwen2.5-3B-Instruct",
+    "Qwen2.5-7B-Instruct":
+    "Qwen2.5-7B-Instruct",
+    "Qwen2.5-VL-3B-Instruct":
+    "Qwen2.5-VL-3B-Instruct",
+    "Qwen2.5-VL-7B-Instruct":
+    "Qwen2.5-VL-7B-Instruct",
+    "Qwen2-VL-2B-Instruct":
+    "Qwen2-VL-2B-Instruct",
+    "InternVL3-1B":
+    "InternVL3-1B-hf",
+    "InternVL3-2B":
+    "InternVL3-2B-hf",
+    "Llama-3.1-8B-Instruct":
+    "llama-3.1-model/Llama-3.1-8B-Instruct",
+    "Llama-3.2-1B":
+    "llama-3.2-models/Llama-3.2-1B",
+    "Llama-3.2-3B":
+    "llama-3.2-models/Llama-3.2-3B",
+    "Qwen3-0.6B":
+    "Qwen3/Qwen3-0.6B",
+    "Qwen3-1.7B":
+    "Qwen3/Qwen3-1.7B",
+    "Qwen3-8B":
+    "Qwen3/Qwen3-8B",
+    "Qwen3-4B-Instruct-2507":
+    "Qwen3/Qwen3-4B-Instruct-2507",
+    "Qwen3-VL-2B-Instruct":
+    "Qwen3/Qwen3-VL-2B-Instruct",
+    "Qwen3-VL-4B-Instruct":
+    "Qwen3/Qwen3-VL-4B-Instruct",
+    "Qwen3-VL-8B-Instruct":
+    "Qwen3/Qwen3-VL-8B-Instruct",
+    "Qwen3.5-0.8B":
+    "Qwen3.5-0.8B",
+    "Qwen3.5-2B":
+    "Qwen3.5-2B",
+    "Qwen3.5-4B":
+    "Qwen3.5-4B",
+    "Qwen3.5-9B":
+    "Qwen3.5-9B",
+    "Qwen3.5-27B":
+    "Qwen3.5-27B",
+    "Qwen3.6-27B":
+    "Qwen3.6-27B",
+    # Gemma4 E-models. CI runners may see the public base checkpoint under
+    # /scratch.trt_llm_data/llm-models/gemma, while paired MTP assistant
+    # checkpoints are usually staged under /scratch.edge_llm_cache/source_models.
+    "gemma-4-E2B-it": [
+        "gemma/gemma-4-E2B-it",
+        "source_models/gemma-4-E2B-it",
+        "gemma-4-E2B-it",
+    ],
+    "Phi-4-multimodal-instruct":
+    "Phi-4-multimodal-instruct",
+    "Alpamayo-R1-10B":
+    "Alpamayo-R1-10B",
     # Pre-quantized models in llm_models_dir
-    "Llama-3.2-1B-FP8": "llama-3.2-models/Llama-3.2-1B-FP8",
-    "Phi-4-FP8": "Phi-4-FP8",
-    "Phi-4-multimodal-instruct-FP8": "Phi-4-multimodal-instruct-FP8",
+    "Llama-3.2-1B-FP8":
+    "llama-3.2-models/Llama-3.2-1B-FP8",
+    "Phi-4-FP8":
+    "Phi-4-FP8",
+    "Phi-4-multimodal-instruct-FP8":
+    "Phi-4-multimodal-instruct-FP8",
     # ASR and TTS models
-    "Qwen3-ASR-0.6B": "Qwen3/Qwen3-ASR-0.6B",
-    "Qwen3-TTS-12Hz-0.6B-CustomVoice": "Qwen3/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+    "Qwen3-ASR-0.6B":
+    "Qwen3/Qwen3-ASR-0.6B",
+    "Qwen3-TTS-12Hz-0.6B-CustomVoice":
+    "Qwen3/Qwen3-TTS-12Hz-0.6B-CustomVoice",
     # Nemotron-H 30B (BF16 base + pre-quantized NVFP4)
     "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16":
     "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
@@ -253,20 +293,29 @@ LLM_MODELS_DIR_MAP = {
     "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
     "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4":
     "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
-    "NVIDIA-Nemotron-3-Nano-4B-BF16": "NVIDIA-Nemotron-3-Nano-4B-BF16",
-    "NVIDIA-Nemotron-3-Nano-4B-FP8": "NVIDIA-Nemotron-3-Nano-4B-FP8",
+    "NVIDIA-Nemotron-3-Nano-4B-BF16":
+    "NVIDIA-Nemotron-3-Nano-4B-BF16",
+    "NVIDIA-Nemotron-3-Nano-4B-FP8":
+    "NVIDIA-Nemotron-3-Nano-4B-FP8",
     # Nemotron-Nano 9B v2 family (BF16 base + FP8/NVFP4 pre-quantized
     # variants all live under llm_models_dir/, not edge_llm_cache/).
-    "NVIDIA-Nemotron-Nano-9B-v2": "NVIDIA-Nemotron-Nano-9B-v2",
-    "NVIDIA-Nemotron-Nano-9B-v2-FP8": "NVIDIA-Nemotron-Nano-9B-v2-FP8",
-    "NVIDIA-Nemotron-Nano-9B-v2-NVFP4": "NVIDIA-Nemotron-Nano-9B-v2-NVFP4",
+    "NVIDIA-Nemotron-Nano-9B-v2":
+    "NVIDIA-Nemotron-Nano-9B-v2",
+    "NVIDIA-Nemotron-Nano-9B-v2-FP8":
+    "NVIDIA-Nemotron-Nano-9B-v2-FP8",
+    "NVIDIA-Nemotron-Nano-9B-v2-NVFP4":
+    "NVIDIA-Nemotron-Nano-9B-v2-NVFP4",
     # Cosmos VLM
-    "Cosmos-Reason2-8B": "Cosmos-Reason2-8B",
+    "Cosmos-Reason2-8B":
+    "Cosmos-Reason2-8B",
     # Qwen3.5 35B-A3B (BF16 base; GPTQ-Int4 variant lives in GPTQ map)
-    "Qwen3.5-35B-A3B": "Qwen3.5-35B-A3B",
+    "Qwen3.5-35B-A3B":
+    "Qwen3.5-35B-A3B",
     # ASR / TTS larger variants (1.7B family)
-    "Qwen3-ASR-1.7B": "Qwen3/Qwen3-ASR-1.7B",
-    "Qwen3-TTS-12Hz-1.7B-CustomVoice": "Qwen3/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    "Qwen3-ASR-1.7B":
+    "Qwen3/Qwen3-ASR-1.7B",
+    "Qwen3-TTS-12Hz-1.7B-CustomVoice":
+    "Qwen3/Qwen3-TTS-12Hz-1.7B-CustomVoice",
 }
 
 GPTQ_MODELS_DIR_MAP = {
@@ -332,6 +381,17 @@ MODEL_NAME_TO_DRAFT_MODELS_MAP = {
     "Qwen3-VL-8B-Instruct": {
         "v0": "qwen3-vl-8b-eagle3-v0",
     },
+}
+
+# Paired Gemma4 MTP uses a separate assistant checkpoint. The test parameter
+# remains ``...-mtp`` so runtime naming is shared with Qwen-style MTP; only
+# export needs this model-family-specific assistant lookup.
+GEMMA4_MTP_ASSISTANT_MODELS_MAP = {
+    "gemma-4-E2B-it": [
+        "source_models/gemma-4-E2B-it-assistant",
+        "gemma-4-E2B-it-assistant",
+        "gemma/gemma-4-E2B-it-assistant",
+    ],
 }
 
 
@@ -1508,6 +1568,22 @@ class TestConfig:
         candidates = list(dict.fromkeys(candidates))
         return self._resolve_draft_model_dir(candidates,
                                              self._draft_hub_search_roots())
+
+    def get_gemma4_mtp_assistant_model_dir(self) -> str:
+        """Resolve the paired Gemma4 assistant checkpoint for MTP export."""
+        base_model_name = self._strip_model_quant_suffixes(self.model_name)
+        if base_model_name not in GEMMA4_MTP_ASSISTANT_MODELS_MAP:
+            raise ValueError(
+                f"Unsupported Gemma4 MTP model: '{self.model_name}'. "
+                f"Supported models: {', '.join(GEMMA4_MTP_ASSISTANT_MODELS_MAP.keys())}"
+            )
+
+        entry = GEMMA4_MTP_ASSISTANT_MODELS_MAP[base_model_name]
+        candidates = [entry] if isinstance(entry, str) else list(entry)
+        return self._resolve_draft_model_dir(
+            candidates,
+            self._draft_torch_search_roots(),
+        )
 
     def get_onnx_base_dir(self) -> str:
         """Get ONNX model base directory.

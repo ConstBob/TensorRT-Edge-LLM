@@ -243,13 +243,16 @@ cd /path/to/TensorRT-Edge-LLM
 
 ## MTP (Multi-Token Prediction)
 
-MTP is a speculative decoding method built into certain model architectures. Unlike EAGLE which uses a separately trained draft model, MTP uses lightweight prediction heads that are part of the base model checkpoint. The runtime reuses the same EAGLE speculative decoding pipeline with `topK=1` (linear draft chain).
+MTP is a speculative decoding method that proposes a linear chain of draft tokens and verifies them with the base model. The runtime reuses the same speculative decoding pipeline as EAGLE with `topK=1`.
 
-So far any Qwen3.5 dense model with `num_draft_layers > 0` in its config is MTP-capable.
+TensorRT Edge-LLM supports two MTP checkpoint layouts:
+
+- **Single-checkpoint MTP:** Qwen3.5 dense checkpoints with `num_draft_layers > 0` carry the MTP draft weights inside the base checkpoint. Export with `--mtp`.
+- **Paired-assistant MTP:** Gemma4 uses a base checkpoint plus a matched assistant checkpoint. Export with `--mtp --mtp-draft-dir <assistant_checkpoint>`. Do not mix assistant checkpoints across Gemma4 model sizes or families.
 
 ---
 
-### Example
+### Single-Checkpoint MTP Example
 
 **Example model:** [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B)
 
@@ -273,6 +276,24 @@ tensorrt-edgellm-export \
 This produces:
 - `$WORKSPACE_DIR/$MODEL_NAME/onnx/llm/` — MTP base model (hybrid attention + GDN layers, with tree-attention and intermediate state outputs)
 - `$WORKSPACE_DIR/$MODEL_NAME/onnx/mtp_draft/` — MTP draft head (single attention layer with Add-based hidden state fusion)
+
+For Gemma4 paired-assistant MTP, download or stage both the base checkpoint and the matched assistant checkpoint, then pass the assistant with `--mtp-draft-dir`:
+
+```bash
+export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
+export MODEL_NAME=gemma-4-E2B-it
+export ASSISTANT_MODEL_NAME=gemma-4-E2B-it-assistant
+mkdir -p $WORKSPACE_DIR
+cd $WORKSPACE_DIR
+
+tensorrt-edgellm-export \
+  $WORKSPACE_DIR/$MODEL_NAME \
+  $WORKSPACE_DIR/$MODEL_NAME/onnx \
+  --mtp \
+  --mtp-draft-dir $WORKSPACE_DIR/$ASSISTANT_MODEL_NAME
+```
+
+This produces the same `llm/` and `mtp_draft/` layout used by the build and inference steps below.
 
 
 #### Step 2: Transfer to Device
