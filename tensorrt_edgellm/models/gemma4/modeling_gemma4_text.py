@@ -322,6 +322,41 @@ def _resolve_hidden_activation(
     )
 
 
+def _compute_kv_donor_indices(config: ModelConfig) -> dict:
+    """Compute the KV donor layer index for each KV-shared layer.
+
+    Returns a dict mapping shared layer_idx -> donor layer_idx.
+    Donor is the last non-shared layer of the same type (sliding/full).
+    """
+    num_kv_shared = getattr(config, "num_kv_shared_layers", 0)
+    if num_kv_shared <= 0:
+        return {}
+    n = config.num_hidden_layers
+    first_shared = n - num_kv_shared
+    layer_types = (list(config.attention_layer_types)
+                   if config.attention_layer_types else [])
+
+    # Find last non-shared layer of each type
+    prev_layers = layer_types[:first_shared]
+    donors: dict = {}
+    for lt in set(prev_layers):
+        donors[lt] = first_shared - 1 - prev_layers[::-1].index(lt)
+
+    result: dict = {}
+    for i in range(first_shared, n):
+        if i >= len(layer_types):
+            raise ValueError(
+                f"Layer index {i} exceeds attention_layer_types length "
+                f"({len(layer_types)}). Check num_hidden_layers vs "
+                f"attention_layer_types in config.")
+        lt = layer_types[i]
+        if lt not in donors:
+            raise ValueError(f"KV-shared layer {i} has type '{lt}' with no "
+                             f"non-shared donor layer of the same type.")
+        result[i] = donors[lt]
+    return result
+
+
 class Gemma4ValueRMSNorm(nn.Module):
     """Weightless per-head RMSNorm used by Gemma4 attention values."""
 

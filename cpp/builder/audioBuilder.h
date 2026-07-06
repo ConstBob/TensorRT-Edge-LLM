@@ -147,6 +147,12 @@ private:
     //! @return true if setup was successful, false otherwise
     bool setupNemotronOmniAudioEncoderProfile(nvinfer1::IOptimizationProfile& profile);
 
+    //! Set up Gemma4 audio encoder profile.
+    //! Configures input: input_features [1, seq_len, mel_bins] with subsamplingFactor=4.
+    //! @param profile Optimization profile to configure
+    //! @return true if setup was successful, false otherwise
+    bool setupGemma4AudioEncoderProfile(nvinfer1::IOptimizationProfile& profile);
+
     //! Set up optimization profile for Code2Wav vocoder.
     //! Creates optimization profile with appropriate dynamic shapes for code inputs.
     //! @param builder TensorRT builder object

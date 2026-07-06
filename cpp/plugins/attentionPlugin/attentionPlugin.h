@@ -107,13 +107,10 @@ private:
         int32_t seqLen, cudaStream_t stream);
 
 #ifdef CUTE_DSL_FFPA_ENABLED
-    //! Launch the CuTe DSL FFPA d512 causal attention kernel.  The caller
-    //! fills the tensor pointers, the (batchSize + 1) int32 cuSeqLenQ /
-    //! cuSeqLenK device tensors (cumulative logical per-batch Q / KV lengths;
-    //! bug 6384817: padding positions and chunked-prefill prefixes are masked
-    //! per batch inside the kernel) and the dimensions; softmaxScale is
-    //! derived from headDim here.
-    static void dispatchFFPAKernel(CuteDslFFPAParams const& params, cudaStream_t stream);
+    //! Launch the CuTe DSL FFPA d512 causal attention kernel.
+    //! Caller fills the CuteDslFFPAParams struct (tensor pointers, cuSeqLens,
+    //! dimensions); softmaxScale is derived from headDim here.
+    void dispatchFFPAKernel(CuteDslFFPAParams const& params, cudaStream_t stream);
 #endif
 
 protected:

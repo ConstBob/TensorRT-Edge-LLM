@@ -134,6 +134,81 @@ __global__ void transposeToPatchQwenKernel(half const* originalImage, half* inpu
     inputPatches[dstIdx] = originalImage[srcIdx];
 }
 
+__global__ void transposeToPatchGemma4Kernel(half const* originalImage, half* inputPatches, int64_t const H,
+    int64_t const W, int64_t const C, int64_t const patchSize, int64_t const inputOffset)
+{
+    // Gemma4 patchification: channel-last within each patch
+    // Original image format: [1, H, W, C]
+    // Output format: [numPatches, patchSize * patchSize * C]
+    //   where element order within each patch is [patchH, patchW, C] (channels fastest)
+    // This matches HuggingFace Gemma4 convert_image_to_patches():
+    //   image.reshape(C, pH, ps, pW, ps).permute(1,3,2,4,0).reshape(pH*pW, ps*ps*C)
+
+    auto const tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    auto const gridH = H / patchSize;
+    auto const gridW = W / patchSize;
+    auto const numPatches = gridH * gridW;
+    auto const inputDim = patchSize * patchSize * C;
+    auto const totalElements = numPatches * inputDim;
+
+    if (tid >= totalElements)
+        return;
+
+    // Calculate which patch and element within patch
+    auto const patchIdx = tid / inputDim;
+    auto const elemIdx = tid % inputDim;
+
+    // Patch grid coordinates
+    auto const hIdx = patchIdx / gridW;
+    auto const wIdx = patchIdx % gridW;
+
+    // Element coordinates within patch: [patchH, patchW, C] ordering
+    auto const patchH = elemIdx / (patchSize * C);
+    auto const patchW = (elemIdx % (patchSize * C)) / C;
+    auto const cIdx = elemIdx % C;
+
+    // Source coordinates in [H, W, C] image
+    auto const srcH = hIdx * patchSize + patchH;
+    auto const srcW = wIdx * patchSize + patchW;
+    auto const srcIdx = srcH * W * C + srcW * C + cIdx;
+    auto const dstIdx = inputOffset + tid;
+
+    inputPatches[dstIdx] = originalImage[srcIdx];
+}
+
+void transposeToPatchGemma4ViT(rt::Tensor const& originalImage, rt::Tensor& inputPatches, int64_t const inputOffset,
+    int64_t const patchSize, cudaStream_t stream)
+{
+    check::check(
+        originalImage.getDeviceType() == rt::DeviceType::kGPU && inputPatches.getDeviceType() == rt::DeviceType::kGPU,
+        "Device type shall all be GPU for these tensors.");
+    check::check(originalImage.getDataType() == DataType::kHALF && inputPatches.getDataType() == DataType::kHALF,
+        "Data type check failed for the input tensors.");
+    check::check(originalImage.getShape().getNumDims() == 4 && inputPatches.getShape().getNumDims() == 2,
+        "Input and output tensor shapes shall be [1, H, W, C] and [totalSeqLength, inputDim] respectively.");
+
+    int64_t const H = originalImage.getShape()[1];
+    int64_t const W = originalImage.getShape()[2];
+    int64_t const C = originalImage.getShape()[3];
+    int64_t const inputDim = inputPatches.getShape()[1];
+
+    check::check(inputDim == patchSize * patchSize * C,
+        "inputDim must equal patchSize * patchSize * C: inputDim=" + std::to_string(inputDim)
+            + ", patchSize*patchSize*C=" + std::to_string(patchSize * patchSize * C));
+    check::check(H % patchSize == 0 && W % patchSize == 0, "H and W must be multiples of patchSize");
+
+    int64_t const gridH = H / patchSize;
+    int64_t const gridW = W / patchSize;
+    int64_t const totalElements = gridH * gridW * inputDim;
+
+    uint32_t const blockSize = 256;
+    uint32_t const gridSize = (totalElements + blockSize - 1) / blockSize;
+
+    transposeToPatchGemma4Kernel<<<gridSize, blockSize, 0, stream>>>(
+        originalImage.dataPointer<half>(), inputPatches.dataPointer<half>(), H, W, C, patchSize, inputOffset);
+}
+
 void transposeToPatchQwenViT(rt::Tensor const& originalImage, rt::Tensor& inputPatches, int64_t const inputOffset,
     int64_t const temporalPatchSize, int64_t const patchSize, int64_t const mergeSize, cudaStream_t stream)
 {

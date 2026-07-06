@@ -294,6 +294,7 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                             std::string const extension = (dotPos != std::string::npos) ? audioPath.substr(dotPos) : "";
                             bool const isRawAudio
                                 = (extension == ".wav" || extension == ".mp3" || extension == ".flac");
+                            bool const isMelSpectrogram = (extension == ".safetensors");
 
                             if (isRawAudio)
                             {
@@ -313,9 +314,19 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                                 LOG_INFO("Decoded audio (PCM): %s (%ld samples @ %d Hz)", audioPath.c_str(),
                                     static_cast<long>(numSamples), kTargetSampleRate);
                             }
+                            else if (isMelSpectrogram)
+                            {
+                                // Pre-computed mel-spectrogram (Gemma4 audio encoder input).
+                                rt::audioUtils::AudioData audio;
+                                audio.melSpectrogramPath = audioPath;
+                                audio.melSpectrogramFormat = "safetensors";
+                                audioBuffers.push_back(std::move(audio));
+                                LOG_INFO("Mel-spectrogram input: %s", audioPath.c_str());
+                            }
                             else
                             {
-                                LOG_WARNING("Unsupported audio format: %s (CLI accepts raw .wav / .mp3 / .flac files)",
+                                LOG_WARNING(
+                                    "Unsupported audio format: %s (CLI accepts .wav / .mp3 / .flac / .safetensors)",
                                     audioPath.c_str());
                             }
                         }
