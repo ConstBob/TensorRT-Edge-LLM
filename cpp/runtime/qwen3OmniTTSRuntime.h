@@ -650,6 +650,10 @@ private:
     rt::Tensor mRawCodecEmbed;                  //!< Raw codec embed [1, 1, talkerHidden] FP16
     rt::Tensor mSmallToMtpProjectedHidden;      //!< Projected talker hidden [1, cpHidden] FP16
     rt::Tensor mHostSelectedCodeIds;            //!< Host selected codes [maxBS] INT32
+    rt::Tensor mHostGenCodeBuf;                 //!< Host pinned buffer for deferred CP gen-loop sample reads
+                                                //!< [mNumRvqLayers - 1, maxBS] INT32 — accumulates code_2..code_15
+                                                //!< for up to maxBS active batches so we can do one
+                                                //!< cudaStreamSynchronize per frame instead of one per step
     rt::Tensor mHostCodePredictorContextLength; //!< Host CodePredictor context length [maxBS] INT32
 
     // Residual + decode buffers (batched for Talker, batch=1 for CodePredictor)
