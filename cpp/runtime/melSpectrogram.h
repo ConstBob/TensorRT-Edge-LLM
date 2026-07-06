@@ -22,6 +22,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace trt_edgellm
 {
@@ -225,6 +226,17 @@ public:
     {
         return mConfig;
     }
+
+    //! Internally built mel filter bank: row-major ``[nMel x (nFFT/2 + 1)]``
+    //! weights, valid for the extractor's lifetime. Empty for a
+    //! default-constructed extractor or when a precomputed ``melFilter`` was
+    //! supplied in the config.
+    std::vector<float> const& melFilterBank() const noexcept;
+
+    //! Analysis window used by ``extract()``: ``winLength`` float taps, valid
+    //! for the extractor's lifetime. Empty for a default-constructed (empty)
+    //! extractor.
+    std::vector<float> const& window() const noexcept;
 
 private:
     struct Impl;

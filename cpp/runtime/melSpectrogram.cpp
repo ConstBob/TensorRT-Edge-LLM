@@ -349,6 +349,18 @@ MelExtractor::~MelExtractor() = default;
 MelExtractor::MelExtractor(MelExtractor&&) noexcept = default;
 MelExtractor& MelExtractor::operator=(MelExtractor&&) noexcept = default;
 
+std::vector<float> const& MelExtractor::melFilterBank() const noexcept
+{
+    static std::vector<float> const kEmpty;
+    return mImpl ? mImpl->melFilterStorage : kEmpty;
+}
+
+std::vector<float> const& MelExtractor::window() const noexcept
+{
+    static std::vector<float> const kEmpty;
+    return mImpl ? mImpl->windowFn : kEmpty;
+}
+
 bool MelExtractor::extract(AudioPCM const& pcm, Tensor& out)
 {
     if (pcm.sampleRate != mConfig.sampleRate)
