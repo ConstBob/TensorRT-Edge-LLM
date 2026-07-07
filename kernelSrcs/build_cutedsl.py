@@ -70,7 +70,7 @@ from pathlib import Path
 
 _SCRIPT_DIR = Path(__file__).parent.resolve()
 _DEFAULT_OUTPUT_DIR = (_SCRIPT_DIR / "../cpp/kernels/cuteDSLArtifact").resolve()
-_CUTLASS_DSL_VERSION = "4.5.2"
+_CUTLASS_DSL_VERSION = "4.6.0"
 _CUPY_VERSIONS = {12: ("cupy-cuda12x", "12.3.0"), 13: ("cupy-cuda13x", "13.6.0")}
 # Common flag sets for FMHA variants
 _LLM = ["--is_causal", "--is_persistent", "--export_only", "--bottom_right_align"]
@@ -1284,6 +1284,22 @@ def _cutlass_dsl_install_hint(cuda_ver):
     return f"pip install '{package}=={_CUTLASS_DSL_VERSION}'"
 
 
+def _cutlass_dsl_lib_dir(pkg_dir, cuda_ver):
+    candidates = []
+    if cuda_ver:
+        candidates.append(pkg_dir / f"cu{cuda_ver.split('.')[0]}" / "lib")
+    candidates.append(pkg_dir / "lib")
+
+    for candidate in candidates:
+        if (candidate / "libcuda_dialect_runtime_static.a").exists():
+            return candidate
+    raise FileNotFoundError(
+        f"libcuda_dialect_runtime_static.a not found in any of: "
+        f"{[str(c) for c in candidates]}. "
+        f"Ensure nvidia-cutlass-dsl=={_CUTLASS_DSL_VERSION} is installed correctly."
+    )
+
+
 def check_dependencies(sm=None, selected_groups=None):
     errors = []
     selected_groups = set(selected_groups or [])
@@ -1308,7 +1324,11 @@ def check_dependencies(sm=None, selected_groups=None):
                 if spec.submodule_search_locations
                 else Path(spec.origin).parent
             )
-            lib_dir = pkg_dir / "lib"
+            try:
+                lib_dir = _cutlass_dsl_lib_dir(pkg_dir, cuda_ver)
+            except FileNotFoundError as e:
+                errors.append(str(e))
+                lib_dir = None
     except importlib.metadata.PackageNotFoundError:
         errors.append(
             f"nvidia-cutlass-dsl not found.\n"

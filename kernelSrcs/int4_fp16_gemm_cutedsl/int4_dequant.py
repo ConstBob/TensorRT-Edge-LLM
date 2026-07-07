@@ -74,7 +74,7 @@ def _dequant_int4_word(q, scale, *, loc=None, ip=None):
     )
 
     vec_t = ir.VectorType.get([2], Float16.mlir_type, loc=loc)
-    sv = vector.splat(vec_t, Float16(scale).ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
+    sv = vector.broadcast(vec_t, Float16(scale).ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
     lo_s = arith.mulf(llvm.bitcast(vec_t, lo, loc=loc, ip=ip), sv, loc=loc, ip=ip)
     hi_s = arith.mulf(llvm.bitcast(vec_t, hi, loc=loc, ip=ip), sv, loc=loc, ip=ip)
     return (
