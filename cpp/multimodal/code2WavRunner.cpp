@@ -22,8 +22,8 @@
 #include "common/cudaUtils.h"
 #include "common/logger.h"
 #include "common/mathUtils.h"
-#include "common/mmapReader.h"
 #include "common/safetensorsUtils.h"
+#include "common/trtUtils.h"
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
 
@@ -56,10 +56,7 @@ Code2WavRunner::Code2WavRunner(std::string const& engineDir, cudaStream_t stream
 
     try
     {
-        auto mmapReader = std::make_unique<file_io::MmapReader>(code2wavEnginePath);
-        mCode2WavEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
-            mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
-        ELLM_CHECK(mCode2WavEngine, "Failed to deserialize Code2Wav engine");
+        mCode2WavEngine = deserializeCudaEngineFromFile(*mRuntime, code2wavEnginePath);
 
         mCode2WavContext = std::unique_ptr<nvinfer1::IExecutionContext>(mCode2WavEngine->createExecutionContext());
         ELLM_CHECK(mCode2WavContext, "Failed to create Code2Wav execution context");

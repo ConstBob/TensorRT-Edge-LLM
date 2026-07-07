@@ -20,7 +20,6 @@
 #include "common/checkMacros.h"
 #include "common/hashUtils.h"
 #include "common/logger.h"
-#include "common/mmapReader.h"
 #include "common/trtUtils.h"
 #include "runtime/exec/registryBuilder.h"
 #include <stdexcept>
@@ -38,12 +37,7 @@ EngineExecutor::EngineExecutor(std::filesystem::path const& enginePath, TensorRe
     mRuntime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
     ELLM_CHECK(mRuntime != nullptr, "failed to create TRT IRuntime");
 
-    auto mmapReader = std::make_unique<file_io::MmapReader>(enginePath);
-    ELLM_CHECK(mmapReader->getData() != nullptr, "failed to mmap engine file: " + enginePath.string());
-
-    mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
-        mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
-    ELLM_CHECK(mEngine != nullptr, "failed to deserialize engine: " + enginePath.string());
+    mEngine = deserializeCudaEngineFromFile(*mRuntime, enginePath);
 
     // Use USER_MANAGED allocation so context memory can be shared across runners.
     mContext = std::unique_ptr<nvinfer1::IExecutionContext>(
