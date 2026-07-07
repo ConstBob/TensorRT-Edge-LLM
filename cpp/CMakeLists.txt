@@ -154,6 +154,8 @@ add_cross_build_link_options(NvInfer_edgellm_plugin)
 # ENABLE_CUTE_DSL to enable one of:
 #   fmha             -- FMHA Blackwell attention
 #   gdn              -- gated delta net (Mamba2-style hybrid SSM)
+#   f16_moe          -- target-specific FP16 grouped MoE for Ampere,
+#                       Blackwell DC, and Blackwell GeForce
 #   nvfp4_moe        -- SM110 (Thor) split FC1/FC2 NVFP4 MoE; consumed by the
 #                       SM110-only ``Nvfp4MoePlugin``
 #   nvfp4_fused_moe  -- SM12x (consumer Blackwell / Spark GB10) fused NVFP4

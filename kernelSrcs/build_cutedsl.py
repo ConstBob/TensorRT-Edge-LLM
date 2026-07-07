@@ -25,6 +25,7 @@ Kernel groups:
   int4_fp16_gemm   — W4A16 INT4-weight FP16 GEMM (Ampere; full 75-config sweep) +
                      the decode GEMV (small-M, shares the GEMM's weight layout;
                      one exported function per M in 1..8) — built together
+  f16_moe          — FP16 grouped FC1/FC2 MoE (Ampere / Blackwell / SM12x)
   nvfp4_moe        — split FC1/FC2 NVFP4 MoE (currently SM110/Thor only)
   nvfp4_fused_moe  — End-to-end NvFP4 fused MoE (Blackwell GeForce)
 
@@ -86,8 +87,9 @@ class KernelVariant:
 
     Attributes:
         name:          Unique identifier — used as --file_name / --function_prefix.
-        group:         Logical group ("gdn", "fmha", "nvfp4_fused_moe",
-                       "nvfp4_moe", "ssd", or "gemm"). cmake sets CUTE_DSL_<GROUP>_ENABLED.
+        group:         Logical group ("gdn", "fmha", "f16_moe",
+                       "nvfp4_fused_moe", "nvfp4_moe", "ssd", or "gemm").
+                       cmake sets CUTE_DSL_<GROUP>_ENABLED for integrated groups.
         supported_sms: Explicit SM whitelist. With --kernels ALL, only variants whose
                        supported_sms contains the detected/requested SM are compiled.
         script:        Kernel script path relative to kernelSrcs/.
@@ -105,9 +107,10 @@ class KernelVariant:
 # ---------------------------------------------------------------------------
 # Kernel registry — add new groups/variants here.
 #
-# Each KernelVariant has a supported_sms whitelist.  Only variants matching
-# the target SM are compiled.  All kernel scripts compile device-native
-# (no --gpu_arch forwarded), which works uniformly on Linux and QNX.
+# Each KernelVariant has a supported_sms whitelist. Only variants matching
+# the target SM are compiled. All kernel scripts compile device-native
+# (no --gpu_arch forwarded), which works uniformly on Linux and QNX. The
+# f16_moe exporters additionally require the target to match the current GPU.
 #
 # Groups:
 #   gdn              — Gated Delta Net decode/prefill
@@ -116,6 +119,7 @@ class KernelVariant:
 #                      attention (D=512), Ampere instruction floor (sm_80+).
 #   ssd              — Mamba2 SSM chunk-scan prefill
 #   gemm             — Talker MLP cuBLAS replacement (Ampere/Blackwell/BW GeForce)
+#   f16_moe          — FP16 grouped FC1/FC2 MoE (Ampere/Blackwell/SM12x)
 #   nvfp4_moe        — split FC1/FC2 NVFP4 MoE (currently SM110/Thor only)
 #   nvfp4_fused_moe  — End-to-end NvFP4 fused MoE (Blackwell GeForce)
 # ---------------------------------------------------------------------------
@@ -525,6 +529,28 @@ KERNEL_VARIANTS = [
             "8",
             "--export_only",
         ],
+    ),
+    # --- F16 MoE group (one FP16 ABI, architecture-specific grouped GEMM) ---
+    KernelVariant(
+        name="f16_moe_ampere_grouped_fp16",
+        group="f16_moe",
+        supported_sms=[80, 86, 87, 89],
+        script="f16_moe_cutedsl/export_grouped_gemm.py",
+        script_args=["--family", "ampere"],
+    ),
+    KernelVariant(
+        name="f16_moe_blackwell_grouped_fp16",
+        group="f16_moe",
+        supported_sms=[100, 101, 103, 110],
+        script="f16_moe_cutedsl/export_grouped_gemm.py",
+        script_args=["--family", "blackwell"],
+    ),
+    KernelVariant(
+        name="f16_moe_blackwell_geforce_grouped_fp16",
+        group="f16_moe",
+        supported_sms=[120, 121],
+        script="f16_moe_cutedsl/export_grouped_gemm.py",
+        script_args=["--family", "blackwell_geforce"],
     ),
     # --- NvFP4 Fused MoE group (SM120/SM121 — Blackwell GeForce) ---
     # Fused route/pack + FC1 + activation + quant + FC2 + scatter kernels.
@@ -1369,7 +1395,7 @@ def _compile_one(variant, staging_dir, verbose, sm):
     cmd += variant.script_args
 
     env = os.environ.copy()
-    if sm == 121 and variant.group == "nvfp4_fused_moe":
+    if sm == 121 and variant.group in ("f16_moe", "nvfp4_fused_moe"):
         # Build a real SM121 image for DIGITS/GB10. SM120 cubins link, but
         # fail at runtime on SM121 with cudaErrorNoKernelImageForDevice.
         env.setdefault("CUTE_DSL_ARCH", "sm_121a")
@@ -1459,6 +1485,17 @@ def build(args):
         return
 
     groups_selected = sorted({v.group for v in variants})
+
+    # The grouped-MoE AOT output embeds device-native code and host objects.
+    # Refuse an override that would create a valid-looking but unusable pack.
+    if "f16_moe" in groups_selected:
+        native_sm = detect_gpu_sm()
+        native_arch = detect_arch()
+        if sm != native_sm or arch != native_arch:
+            raise RuntimeError(
+                "f16_moe requires native artifact generation: selected "
+                f"{arch}/sm_{sm}, but the build host is {native_arch}/sm_{native_sm}."
+            )
 
     # Check dependencies before cleaning — so a failed dep check doesn't
     # silently destroy a previously good build.
@@ -1585,7 +1622,7 @@ def main():
         "--kernels",
         default="ALL",
         help="Which kernels to build: ALL (default), a group name "
-             "(fmha | gdn | nvfp4_moe | "
+             "(fmha | gdn | f16_moe | nvfp4_moe | "
              "nvfp4_fused_moe | ssd | gemm | int4_fp16_gemm), or a comma-separated list "
              "of group names. Variants whose supported_sms does not include the target SM are skipped.",
     )

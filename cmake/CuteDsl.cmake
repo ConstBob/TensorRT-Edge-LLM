@@ -31,6 +31,7 @@
 #   fmha     — enable only the Blackwell FMHA group
 #   ffpa     — enable only the Ampere FFPA FMHA group
 #   gdn      — enable only the GDN group
+#   f16_moe  — enable the target-specific homogeneous-FP16 MoE group
 #   fmha;gdn — semicolon-separated list of groups (CMake list syntax)
 #
 # Usage:
@@ -44,6 +45,7 @@
 #   CUTE_DSL_FMHA_ENABLED  — set when the fmha group is active
 #   CUTE_DSL_FFPA_ENABLED  — set when the ffpa group is active
 #   CUTE_DSL_GDN_ENABLED   — set when the gdn group is active
+#   CUTE_DSL_F16_MOE_ENABLED — set when the f16_moe group is active
 #   CUTE_DSL_SSD_ENABLED   — set when the ssd group is active
 #   CUTE_DSL_GEMM_ENABLED  — set when any gemm variant is active
 # ---------------------------------------------------------------------------
@@ -420,6 +422,19 @@ function(cute_dsl_setup)
     endforeach()
   endif()
 
+  # The FP16 MoE runner links one exact-SM artifact. Parse the artifact SM for
+  # its compile-time exact-SM guard.
+  if("f16_moe" IN_LIST _active_groups)
+    if(NOT _meta_gpu_arch_err AND _meta_gpu_arch MATCHES "^sm_([0-9]+)$")
+      set(_meta_sm "${CMAKE_MATCH_1}")
+    else()
+      message(
+        FATAL_ERROR
+          "CuTe DSL f16_moe metadata gpu_arch must have form sm_<NN>, got '${_meta_gpu_arch}' in ${_metadata}."
+      )
+    endif()
+  endif()
+
   # Apply compile definitions and include path to all targets.
   foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
     target_include_directories(${_tgt} SYSTEM PRIVATE "${_inc_dir}")
@@ -483,6 +498,52 @@ function(cute_dsl_setup)
     message(
       STATUS
         "CuTe DSL: Blackwell SSD prefill variant(s) found — CUTE_DSL_SSD_BLACKWELL_ENABLED set"
+    )
+  endif()
+
+  # Per-family definitions for the FP16 MoE grouped-GEMM modules. Each
+  # target-specific artifact pack contains exactly one of these variants.
+  if("f16_moe" IN_LIST _active_groups)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_F16_MOE_ARTIFACT_SM=${_meta_sm}")
+    endforeach()
+  endif()
+
+  list(FIND _variants "f16_moe_ampere_grouped_fp16" _f16_moe_ampere_idx)
+  if(NOT ${_f16_moe_ampere_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(${_tgt}
+                                 PRIVATE "CUTE_DSL_F16_MOE_AMPERE_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: f16_moe Ampere grouped GEMM found — CUTE_DSL_F16_MOE_AMPERE_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "f16_moe_blackwell_grouped_fp16" _f16_moe_blackwell_idx)
+  if(NOT ${_f16_moe_blackwell_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(${_tgt}
+                                 PRIVATE "CUTE_DSL_F16_MOE_BLACKWELL_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: f16_moe Blackwell grouped GEMM found — CUTE_DSL_F16_MOE_BLACKWELL_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "f16_moe_blackwell_geforce_grouped_fp16"
+       _f16_moe_blackwell_geforce_idx)
+  if(NOT ${_f16_moe_blackwell_geforce_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_F16_MOE_BLACKWELL_GEFORCE_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: f16_moe Blackwell GeForce grouped GEMM found — CUTE_DSL_F16_MOE_BLACKWELL_GEFORCE_ENABLED set"
     )
   endif()
 
