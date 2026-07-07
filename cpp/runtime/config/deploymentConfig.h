@@ -44,8 +44,9 @@ enum class DSparkSchedulerMode : int32_t
  */
 struct SpecDecodeDraftingConfig
 {
-    //! Tokens to select from one predecessor during draft expansion. For
-    //! DFlash, this is candidateTopK: 1 is a linear tree and >1 enables branching DDTree.
+    //! Tokens to select from one predecessor during draft expansion:
+    //! draftingTopK = 1 selects chain mode, draftingTopK > 1 selects tree
+    //! drafting with this candidate fanout.
     int32_t draftingTopK{0};
     int32_t draftingStep{0}; //!< Number of drafting steps with draft model
     int32_t verifySize{0};   //!< Number of tokens in the base verification input
@@ -90,8 +91,9 @@ struct SpecDecodeConfig
     int32_t maxDraftProposalSize{}; //!< Max seq_len the draft engine accepts for proposal generation
 
     // --- User-supplied drafting parameters ---
-    //! Tokens to select from one predecessor during draft expansion. For
-    //! DFlash, this is candidateTopK: 1 is a linear tree and >1 enables branching DDTree.
+    //! Tokens to select from one predecessor during draft expansion:
+    //! draftingTopK = 1 selects chain mode, draftingTopK > 1 selects tree
+    //! drafting with this candidate fanout.
     int32_t draftingTopK{};
     int32_t draftingStep{}; //!< Number of drafting steps with draft model
     int32_t verifySize{};   //!< Number of tokens in the base verification input
@@ -150,7 +152,11 @@ struct DeploymentConfig
 //!   against the engines' capacities:
 //!     - `specConfig->verifySize <= specConfig->maxVerifySize`
 //!     - non-DFlash: `specConfig->draftingStep * specConfig->draftingTopK <= specConfig->maxDraftProposalSize`
-//!     - MTP requires `draftingTopK == 1` and `verifySize == draftingStep + 1`
+//!     - MTP: `draftingStep + 1 <= 9` (EAGLE utility kernel depth limit);
+//!       `draftingTopK == 1` selects the linear chain and requires `verifySize == draftingStep + 1`,
+//!       while `draftingTopK > 1` selects tree drafting and requires
+//!       `draftingTopK < verifySize`, `draftingTopK <= 8`, and `verifySize <= 128`
+//!       (tree-build kernel limits; unfillable verify nodes become padding)
 //!     - DFlash: `draftingStep == 1`, `dflashBlockSize <= maxDraftProposalSize`, and
 //!       `draftingTopK` is candidateTopK: 1 uses the linear-tree fast path while >1 uses branching DDTree.
 //!       Linear DFlash normalizes `verifySize` to `dflashBlockSize` for compatibility with the historical API.

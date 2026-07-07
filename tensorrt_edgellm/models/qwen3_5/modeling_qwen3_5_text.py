@@ -648,9 +648,14 @@ def _is_dflash_base_export(config: ModelConfig) -> bool:
     return bool(getattr(config, "dflash_base", False))
 
 
-def _is_dflash_tree_base_export(config: ModelConfig) -> bool:
-    """Return True when exporting DDTree metadata for Qwen3.5 hybrid state."""
-    return bool(getattr(config, "dflash_tree_base", False))
+def _is_spec_tree_base_export(config: ModelConfig) -> bool:
+    """Return True when exporting DDTree metadata for Qwen3.5 hybrid state.
+
+    Both the DFlash DDTree base and the MTP tree base consume the same
+    ``tree_parent_ids`` / ``tree_depths`` verify inputs.
+    """
+    return bool(getattr(config, "dflash_tree_base", False)) or bool(
+        getattr(config, "mtp_tree_base", False))
 
 
 def _make_flat_wrapper_hybrid(model: nn.Module,
@@ -905,7 +910,7 @@ class Qwen3_5CausalLM(nn.Module):
             "Qwen3.5 requires gdn_cfg when any layer is GDN")
         mtp_base = _is_mtp_base_export(config)
         dflash_base = _is_dflash_base_export(config)
-        dflash_tree_base = _is_dflash_tree_base_export(config)
+        spec_tree_base = _is_spec_tree_base_export(config)
         device = next(itertools.chain(self.parameters(),
                                       self.buffers())).device
         dtype16 = torch.float16
@@ -1049,7 +1054,7 @@ class Qwen3_5CausalLM(nn.Module):
             })  # attention_mask
             all_shapes.append({0: torch.export.Dim.AUTO
                                })  # spec_verify_phase_marker
-            if dflash_tree_base:
+            if spec_tree_base:
                 tree_parent_ids = torch.zeros(batch_size,
                                               seq_len,
                                               dtype=torch.int32,
@@ -1068,7 +1073,7 @@ class Qwen3_5CausalLM(nn.Module):
                                             Ng,
                                             mtp_base=mtp_base,
                                             dflash_base=dflash_base,
-                                            dflash_tree_base=dflash_tree_base)
+                                            dflash_tree_base=spec_tree_base)
         wrapped.eval()
 
         return OnnxSpec(wrapped=wrapped,

@@ -404,7 +404,9 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
             // downstream by `maxDraftProposalSize`, which is tens, not millions), so
             // int32 multiplication is overflow-safe; keeping it in int32 avoids
             // widening noise.
-            int32_t const requiredDraftInputSize = specConfig.draftingStep * specConfig.draftingTopK;
+            bool const mtpTree = cfg.base.specDecodeType == SpecDecodeMode::kMTP && specConfig.draftingTopK > 1;
+            int32_t const requiredDraftInputSize
+                = mtpTree ? specConfig.draftingStep : specConfig.draftingStep * specConfig.draftingTopK;
 
             ELLM_CHECK(requiredDraftInputSize <= specConfig.maxDraftProposalSize,
                 "drafting.draftingStep=" + std::to_string(specConfig.draftingStep) + " * drafting.draftingTopK="
@@ -417,21 +419,66 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
             if (cfg.base.specDecodeType == SpecDecodeMode::kMTP)
             {
                 // MTP base verification currently reuses EAGLE utility kernels for accept, KV commit,
-                // and hidden-state compaction. Those kernels support maxDepth <= 9.
-                static constexpr int32_t kMTPMaxVerifySizeForCurrentEagleUtilityKernels = 9;
-                int32_t const expectedVerifySize = specConfig.draftingStep + 1;
-                ELLM_CHECK(specConfig.draftingTopK == 1,
-                    "MTP speculative decoding requires draftingTopK=1 because the MTP draft path is a linear chain.");
-                ELLM_CHECK(specConfig.verifySize == expectedVerifySize,
-                    "MTP speculative decoding requires verifySize=draftingStep+1. Got verifySize="
-                        + std::to_string(specConfig.verifySize)
-                        + ", draftingStep=" + std::to_string(specConfig.draftingStep)
-                        + ", expected verifySize=" + std::to_string(expectedVerifySize) + ".");
-                ELLM_CHECK(specConfig.verifySize <= kMTPMaxVerifySizeForCurrentEagleUtilityKernels,
-                    "MTP verifySize=" + std::to_string(specConfig.verifySize)
+                // and hidden-state compaction. Those kernels support maxDepth <= 9. Each round
+                // accepts at most draftingStep matched proposals plus one bonus token, for both
+                // the linear chain and tree drafting, so the same depth bound applies to either mode.
+                static constexpr int32_t kMTPMaxAcceptDepthForCurrentEagleUtilityKernels = 9;
+                int32_t const maxAcceptDepth = specConfig.draftingStep + 1;
+                ELLM_CHECK(maxAcceptDepth <= kMTPMaxAcceptDepthForCurrentEagleUtilityKernels,
+                    "MTP max accept depth (draftingStep+1)=" + std::to_string(maxAcceptDepth)
                         + " exceeds the current MTP EAGLE utility kernel max depth of "
-                        + std::to_string(kMTPMaxVerifySizeForCurrentEagleUtilityKernels)
-                        + ". Extend eagleUtilKernels before using larger MTP verify sizes.");
+                        + std::to_string(kMTPMaxAcceptDepthForCurrentEagleUtilityKernels)
+                        + ". Extend eagleUtilKernels before using larger MTP draft steps.");
+
+                bool const useTree = specConfig.draftingTopK > 1;
+                if (!useTree)
+                {
+                    // Linear chain: the verification input covers the root plus the draftingStep
+                    // proposed tokens, so verifySize is fully determined by draftingStep (and
+                    // happens to equal the max accept depth).
+                    ELLM_CHECK(specConfig.verifySize == maxAcceptDepth,
+                        "MTP linear-chain speculative decoding (draftingTopK=1) requires "
+                        "verifySize=draftingStep+1. Got verifySize="
+                            + std::to_string(specConfig.verifySize)
+                            + ", draftingStep=" + std::to_string(specConfig.draftingStep)
+                            + ", expected verifySize=" + std::to_string(maxAcceptDepth) + ".");
+                }
+                else
+                {
+                    // Tree drafting: the chain drafter keeps one full logits row per depth and
+                    // ddtreeBuild grows a prefix-closed, score-prioritized tree of verifySize
+                    // nodes with candidateFanout=draftingTopK. The limits below come from the
+                    // tree-build kernel (ddtreeKernels.h).
+                    static constexpr int32_t kMTPTreeMaxVerifySize = 128;
+                    static constexpr int32_t kMTPTreeMaxCandidateFanout = 8;
+                    ELLM_CHECK(specConfig.draftingTopK < specConfig.verifySize,
+                        "MTP tree draftingTopK=" + std::to_string(specConfig.draftingTopK)
+                            + " must be less than verifySize=" + std::to_string(specConfig.verifySize)
+                            + " because the root consumes one verification node.");
+                    ELLM_CHECK(specConfig.draftingTopK <= kMTPTreeMaxCandidateFanout,
+                        "MTP tree draftingTopK=" + std::to_string(specConfig.draftingTopK)
+                            + " exceeds the tree-build kernel candidate fanout limit of "
+                            + std::to_string(kMTPTreeMaxCandidateFanout) + ".");
+                    ELLM_CHECK(specConfig.draftingTopK <= cfg.draft->outputVocabSize,
+                        "MTP tree draftingTopK=" + std::to_string(specConfig.draftingTopK)
+                            + " exceeds draft output vocabulary size=" + std::to_string(cfg.draft->outputVocabSize)
+                            + ".");
+                    ELLM_CHECK(specConfig.verifySize <= kMTPTreeMaxVerifySize,
+                        "MTP tree verifySize=" + std::to_string(specConfig.verifySize)
+                            + " exceeds the tree-build kernel node budget of " + std::to_string(kMTPTreeMaxVerifySize)
+                            + ".");
+                }
+                // Hybrid base models materialize one GDN/causal-conv state checkpoint per
+                // verify token; the intermediate-state kernels support at most 16 per pass.
+                static constexpr int32_t kMTPHybridMaxProposalDepth = 16;
+                bool const hasLinearAttnLayers = (cfg.base.numLinearAttnLayers > 0);
+                if (hasLinearAttnLayers)
+                {
+                    ELLM_CHECK(maxAcceptDepth <= kMTPHybridMaxProposalDepth,
+                        "MTP max accept depth (draftingStep+1)=" + std::to_string(maxAcceptDepth)
+                            + " exceeds Qwen3.5 GDN/causal-conv intermediate-state depth limit of "
+                            + std::to_string(kMTPHybridMaxProposalDepth) + ".");
+                }
             }
         }
 

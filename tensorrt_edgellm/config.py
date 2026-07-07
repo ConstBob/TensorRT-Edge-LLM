@@ -593,6 +593,9 @@ class ModelConfig:
     centroid_intermediate_top_k: int = 0
     sparse_logits_enabled: bool = False
     kv_sharing_map: List[dict] = field(default_factory=list)
+    # When True, MTP base export also exposes DDTree parent/depth metadata
+    # for Qwen3.5 hybrid causal-conv/GDN tree-state execution (MTP tree drafting).
+    mtp_tree_base: bool = False
     # ------------------------------------------ EAGLE3 draft config
     draft_vocab_size: Optional[int] = None
     target_hidden_size: Optional[int] = None
@@ -1031,6 +1034,7 @@ class ModelConfig:
             num_centroids=int(llm_dict.get("num_centroids", 0) or 0),
             centroid_intermediate_top_k=int(
                 llm_dict.get("centroid_intermediate_top_k", 0) or 0),
+            mtp_tree_base=bool(llm_dict.get("mtp_tree_base", False)),
             dflash_base=bool(llm_dict.get("dflash_base", False)),
             dflash_tree_base=bool(llm_dict.get("dflash_tree_base", False)),
             dspark_base=bool(llm_dict.get("dspark_base", False)),
