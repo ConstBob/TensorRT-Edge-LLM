@@ -18,7 +18,7 @@
 #include "nemotronOmniAudioRunner.h"
 #include "audioUtils.h"
 #include "common/checkMacros.h"
-#include "common/mmapReader.h"
+#include "common/trtUtils.h"
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
 #include <fstream>
@@ -39,9 +39,7 @@ NemotronOmniAudioRunner::NemotronOmniAudioRunner(std::string const& engineDir, c
     mRuntime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
 
     std::string const enginePath = engineDir + "/audio_encoder.engine";
-    auto mmapReader = std::make_unique<file_io::MmapReader>(enginePath);
-    mAudioEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
-        mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
+    mAudioEngine = deserializeCudaEngineFromFile(*mRuntime, enginePath);
 
     mAudioContext = std::unique_ptr<nvinfer1::IExecutionContext>(
         mAudioEngine->createExecutionContext(nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED));

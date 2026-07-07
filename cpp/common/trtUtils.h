@@ -22,6 +22,7 @@
 #include <NvInfer.h>
 #include <NvInferVersion.h>
 #include <dlfcn.h>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -173,6 +174,10 @@ bool isEngineInput(nvinfer1::ICudaEngine const& engine, std::string const& tenso
 
 //! Print the engine information for a specific profile index.
 std::string printEngineInfo(nvinfer1::ICudaEngine const* engine, int32_t profileIndex) noexcept;
+
+//! Deserialize a TensorRT engine plan from disk without mapping the full plan into process memory.
+std::unique_ptr<nvinfer1::ICudaEngine> deserializeCudaEngineFromFile(
+    nvinfer1::IRuntime& runtime, std::filesystem::path const& enginePath);
 
 //! Short, human-readable name for a TensorRT data type (e.g. "FLOAT16").
 //! Used in logs and error messages; not intended for serialization.

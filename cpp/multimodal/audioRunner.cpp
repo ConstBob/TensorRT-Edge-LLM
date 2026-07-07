@@ -21,7 +21,6 @@
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
 #include "common/logger.h"
-#include "common/mmapReader.h"
 #include "common/trtUtils.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
 #ifdef CUTE_DSL_GEMM_ENABLED
@@ -82,10 +81,7 @@ Qwen3OmniAudioRunner::Qwen3OmniAudioRunner(std::string const& engineDir, cudaStr
         LOG_INFO("Loading audio encoder from %s", audioEnginePath.c_str());
         try
         {
-            auto mmapReader = std::make_unique<file_io::MmapReader>(audioEnginePath);
-            mAudioEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
-                mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
-            ELLM_CHECK(mAudioEngine, "Failed to deserialize audio encoder engine");
+            mAudioEngine = deserializeCudaEngineFromFile(*mRuntime, audioEnginePath);
 
             mAudioContext = std::unique_ptr<nvinfer1::IExecutionContext>(mAudioEngine->createExecutionContext());
             ELLM_CHECK(mAudioContext, "Failed to create audio encoder context");

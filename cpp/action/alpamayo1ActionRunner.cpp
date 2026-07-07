@@ -20,7 +20,6 @@
 #include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "common/logger.h"
-#include "common/mmapReader.h"
 #include "common/trtUtils.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
 #include "profiling/metrics.h"
@@ -147,12 +146,7 @@ Alpamayo1ActionRunner::Alpamayo1ActionRunner(
     mRuntime = std::unique_ptr<IRuntime>(createInferRuntime(gLogger));
     ELLM_CHECK(mRuntime, "Failed to create TensorRT runtime");
 
-    auto mmapReader = std::make_unique<file_io::MmapReader>(actionEnginePath);
-    ELLM_CHECK(mmapReader->getData() != nullptr, "Failed to read engine file: " + actionEnginePath);
-
-    mEngine
-        = std::unique_ptr<ICudaEngine>(mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
-    ELLM_CHECK(mEngine, "Failed to deserialize engine from: " + actionEnginePath);
+    mEngine = deserializeCudaEngineFromFile(*mRuntime, actionEnginePath);
 
     mContext = std::unique_ptr<IExecutionContext>(
         mEngine->createExecutionContext(ExecutionContextAllocationStrategy::kUSER_MANAGED));

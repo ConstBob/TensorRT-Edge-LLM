@@ -17,7 +17,7 @@
 
 #include "multimodalRunner.h"
 #include "common/checkMacros.h"
-#include "common/mmapReader.h"
+#include "common/trtUtils.h"
 #include "multimodal/audioRunner.h"
 #include "multimodal/gemma4AudioRunner.h"
 #include "multimodal/gemma4ViTRunner.h"
@@ -52,9 +52,7 @@ MultimodalRunner::MultimodalRunner(std::string const& engineDir, cudaStream_t st
     std::string enginePath = engineDir + "/visual.engine";
 
     // Load engine
-    auto mmapReader = std::make_unique<file_io::MmapReader>(enginePath);
-    mVisualEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
-        mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
+    mVisualEngine = deserializeCudaEngineFromFile(*mRuntime, enginePath);
 
     // Create context with user-managed memory (no device memory allocated here).
     // The context object is needed by subclasses for tensor binding during initialization.
