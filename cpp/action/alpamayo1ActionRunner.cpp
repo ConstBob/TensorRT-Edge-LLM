@@ -21,6 +21,7 @@
 #include "common/checkMacros.h"
 #include "common/logger.h"
 #include "common/mmapReader.h"
+#include "common/trtUtils.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
 #include "profiling/metrics.h"
 #include "profiling/nvtx_wrapper.h"
@@ -159,6 +160,8 @@ Alpamayo1ActionRunner::Alpamayo1ActionRunner(
 
     bool const profileSet = mContext->setOptimizationProfileAsync(0, stream);
     ELLM_CHECK(profileSet, "Failed to set optimization profile");
+
+    setNonBlockingAuxStreams(mContext.get(), mEngine.get(), mAuxStreams);
 
     bool const configParsed = parseModelConfig(engineDir + "/config.json");
     ELLM_CHECK(configParsed, "Failed to parse model config");

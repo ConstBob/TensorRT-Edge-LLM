@@ -18,6 +18,7 @@
 #pragma once
 
 #include "common/tensor.h"
+#include "common/trtUtils.h"
 #include "runtime/config/deploymentConfig.h"
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/exec/tensorMap.h"
@@ -165,6 +166,7 @@ private:
      */
     EngineExecutor(std::filesystem::path const& enginePath, TensorRegistry registry);
 
+    AuxStreamSet mAuxStreams{};
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;
     std::unique_ptr<nvinfer1::ICudaEngine> mEngine;
     std::unique_ptr<nvinfer1::IExecutionContext> mContext;

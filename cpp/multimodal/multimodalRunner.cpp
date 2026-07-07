@@ -63,6 +63,8 @@ MultimodalRunner::MultimodalRunner(std::string const& engineDir, cudaStream_t st
     bool const profileSet = mVisualContext->setOptimizationProfileAsync(0, stream);
     ELLM_CHECK(profileSet, "Failed to set optimization profile for visual engine");
 
+    setNonBlockingAuxStreams(mVisualContext.get(), mVisualEngine.get(), mAuxStreams);
+
     if (trt_edgellm::layerProfiler::LayerProfiler::getInstance().isEnabled())
     {
         mVisualContext->setProfiler(&trt_edgellm::layerProfiler::LayerProfiler::getInstance());

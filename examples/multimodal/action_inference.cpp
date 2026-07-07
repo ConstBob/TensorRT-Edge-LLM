@@ -584,7 +584,7 @@ int main(int argc, char* argv[])
     // Create runtime
     std::unique_ptr<rt::LLMInferenceRuntime> llmInferenceRuntime{nullptr};
     cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
     try
     {

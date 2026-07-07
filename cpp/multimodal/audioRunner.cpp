@@ -92,6 +92,8 @@ Qwen3OmniAudioRunner::Qwen3OmniAudioRunner(std::string const& engineDir, cudaStr
 
             bool const profileSet = mAudioContext->setOptimizationProfileAsync(0, stream);
             ELLM_CHECK(profileSet, "Failed to set optimization profile for audio encoder");
+
+            setNonBlockingAuxStreams(mAudioContext.get(), mAudioEngine.get(), mAuxStreams);
         }
         catch (std::exception const& e)
         {

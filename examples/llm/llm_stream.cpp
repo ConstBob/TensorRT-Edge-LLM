@@ -526,7 +526,7 @@ int main(int argc, char** argv)
     std::cout << "Loaded " << singleRequests.size() << " request(s) from " << args.inputFile << "\n";
 
     cudaStream_t stream{};
-    CUDA_CHECK(cudaStreamCreate(&stream));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
     std::unique_ptr<rt::LLMInferenceRuntime> runtime;
     try

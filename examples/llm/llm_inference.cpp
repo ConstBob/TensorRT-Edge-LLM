@@ -535,7 +535,7 @@ int main(int argc, char* argv[])
     // Create unified runtime (handles both vanilla and speculative decoding modes)
     std::unique_ptr<rt::LLMInferenceRuntime> runtime{nullptr};
     cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
     if (args.specDecodeArgs.enabled)
     {

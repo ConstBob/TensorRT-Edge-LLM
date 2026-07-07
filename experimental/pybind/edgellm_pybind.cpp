@@ -56,7 +56,7 @@ class CudaStreamWrapper
 public:
     CudaStreamWrapper()
     {
-        CUDA_CHECK(cudaStreamCreate(&mStream));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&mStream, cudaStreamNonBlocking));
     }
 
     ~CudaStreamWrapper()
