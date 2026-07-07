@@ -551,7 +551,8 @@ bool DecoderXQARunner::canImplement(int32_t numQHeads, int32_t numKVHeads, int32
 {
     bool const checkHeadNumbers = numQHeads % numKVHeads == 0;
     bool const checkType = dataType == DataType::kHALF;
-    bool const checkKVType = kvDataType == DataType::kHALF || kvDataType == DataType::kFP8;
+    // FP8 XQA cubins exist only for FP8-capable devices (sm89+).
+    bool const checkKVType = kvDataType == DataType::kHALF || (kvDataType == DataType::kFP8 && smVersion >= 89);
     std::vector<int32_t> allowedSMVersions{80, 86, 87, 89, 100, 101, 120, 121};
     bool const checkSMVersion
         = std::find(allowedSMVersions.begin(), allowedSMVersions.end(), smVersion) != allowedSMVersions.end();
