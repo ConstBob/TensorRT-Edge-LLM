@@ -23,3 +23,5 @@ nvidia-modelopt==0.44.0
 onnx==1.19.0
 onnxscript==0.7.0
 onnx-graphsurgeon==0.6.1
+fastapi==0.136.1
+httpx>=0.27.0

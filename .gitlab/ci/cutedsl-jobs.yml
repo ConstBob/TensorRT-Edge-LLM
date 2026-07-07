@@ -189,17 +189,18 @@ build_cutedsl_sm110_artifact:
       - cutedsl_aarch64_sm_110_cuda13.tar.gz
       - cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256
 
-build_cutedsl_x86_sm120_artifact:
+# One x86_64 artifact job per unit-test SKU SM, each built natively on a runner
+# with that GPU (a30=sm_80, rtx3090=sm_86, b100=sm_100, rtx5080=sm_120): the
+# CuTe DSL resolves the compile arch from the local GPU, so cross-compiling on
+# a different SM produces wrong-arch (or failing) kernels.
+.build_cutedsl_x86_base:
   extends:
     - .cutedsl_artifact_base
-  tags:
-    - rtx5080-edgellm-nvks
   variables:
     CUDA_VERSION: "12.9"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    CUTE_DSL_ARTIFACT_NAME: "cutedsl_x86_64_sm_120_cuda12.tar.gz"
-    CUTE_DSL_ARTIFACT_TAG: "sm_120"
     CUTE_DSL_OUTPUT_DIR: "$CI_PROJECT_DIR/cutedsl_artifacts"
+    CUTE_DSL_KERNELS: "ALL"
   image: "$IMAGE"
   script:
     - echo "Pipeline start time:$(date)"
@@ -210,10 +211,10 @@ build_cutedsl_x86_sm120_artifact:
     - apt update -qq >/dev/null 2>&1
     - apt install -y -qq python3 python3-pip python3-venv binutils >/dev/null 2>&1
     - echo "CUDA version:$(nvcc --version | grep release)"
-    - echo "Building CuTe DSL artifact for x86_64 SM120"
+    - echo "Building CuTe DSL artifact for x86_64 $CUTE_DSL_ARTIFACT_TAG"
     - python3 -m venv "$CUTE_DSL_OUTPUT_DIR/venv/cutedsl"
     - '"$CUTE_DSL_OUTPUT_DIR/venv/cutedsl/bin/pip" install -q ''nvidia-cutlass-dsl==4.5.2'' cupy-cuda12x==12.3.0'
-    - '"$CUTE_DSL_OUTPUT_DIR/venv/cutedsl/bin/python" kernelSrcs/build_cutedsl.py --kernels ALL --gpu_arch sm_120 --arch x86_64 --output_dir "$CUTE_DSL_OUTPUT_DIR" --clean'
+    - '"$CUTE_DSL_OUTPUT_DIR/venv/cutedsl/bin/python" kernelSrcs/build_cutedsl.py --kernels $CUTE_DSL_KERNELS --gpu_arch $CUTE_DSL_ARTIFACT_TAG --arch x86_64 --output_dir "$CUTE_DSL_OUTPUT_DIR" --clean'
     - ARTIFACT_DIR="$CUTE_DSL_OUTPUT_DIR/x86_64/$CUTE_DSL_ARTIFACT_TAG"
     - test -f "$ARTIFACT_DIR/metadata.json"
     - tar -C "$CUTE_DSL_OUTPUT_DIR/x86_64" -czf "$CUTE_DSL_OUTPUT_DIR/$CUTE_DSL_ARTIFACT_NAME" "$CUTE_DSL_ARTIFACT_TAG"
@@ -222,11 +223,47 @@ build_cutedsl_x86_sm120_artifact:
     - cp "$CUTE_DSL_OUTPUT_DIR/$CUTE_DSL_ARTIFACT_NAME" "$CUTE_DSL_OUTPUT_DIR/$CUTE_DSL_ARTIFACT_NAME.sha256" "$CI_PROJECT_DIR/"
     - echo "Pipeline end time:$(date)"
   artifacts:
-    name: "cutedsl-x86-sm120-${CI_COMMIT_SHORT_SHA}"
+    name: "cutedsl-x86-${CI_JOB_NAME_SLUG}-${CI_COMMIT_SHORT_SHA}"
     expire_in: 1 day
+    # NOTE: GitLab does not expand job-level `variables:` inside `artifacts.paths`,
+    # so a glob keeps this in sync with CUTE_DSL_ARTIFACT_NAME for every SM variant.
     paths:
-      - cutedsl_x86_64_sm_120_cuda12.tar.gz
-      - cutedsl_x86_64_sm_120_cuda12.tar.gz.sha256
+      - cutedsl_x86_64_sm_*_cuda12.tar.gz
+      - cutedsl_x86_64_sm_*_cuda12.tar.gz.sha256
+
+build_cutedsl_x86_sm120_artifact:
+  extends:
+    - .build_cutedsl_x86_base
+  tags:
+    - rtx5080-edgellm-nvks
+  variables:
+    CUTE_DSL_ARTIFACT_NAME: "cutedsl_x86_64_sm_120_cuda12.tar.gz"
+    CUTE_DSL_ARTIFACT_TAG: "sm_120"
+
+build_cutedsl_x86_sm100_artifact:
+  extends:
+    - .build_cutedsl_x86_base
+  tags:
+    - b100-edgellm-nvks
+  variables:
+    CUTE_DSL_ARTIFACT_NAME: "cutedsl_x86_64_sm_100_cuda12.tar.gz"
+    CUTE_DSL_ARTIFACT_TAG: "sm_100"
+    # The nvfp4_moe FC1 variants fail to compile on sm_100 (the sibling FC2 and
+    # gemm_nvfp4 tcgen05 kernels compile fine there), so skip the group here
+    # until the FC1 kernel is fixed; the unit tests do not cover the MoE plugin.
+    CUTE_DSL_KERNELS: "fmha,ffpa,gdn,ssd,gemm,gemm_nvfp4"
+
+# No sm_86 job: rtx3090 reuses the sm_80 artifact (cubins are forward
+# compatible within a major compute capability and the sm_80/sm_86 variant
+# sets are identical).
+build_cutedsl_x86_sm80_artifact:
+  extends:
+    - .build_cutedsl_x86_base
+  tags:
+    - a30-edgellm-nvks
+  variables:
+    CUTE_DSL_ARTIFACT_NAME: "cutedsl_x86_64_sm_80_cuda12.tar.gz"
+    CUTE_DSL_ARTIFACT_TAG: "sm_80"
 
 build_cutedsl_sm87_cuda13_artifact:
   extends:
