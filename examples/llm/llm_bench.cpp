@@ -573,7 +573,7 @@ int main(int argc, char** argv)
     auto pluginHandles = loadEdgellmPluginLib();
 
     cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
     if (!args.noProfile)
     {

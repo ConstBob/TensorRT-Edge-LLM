@@ -19,6 +19,7 @@
 
 #include "action/actionModelTypes.h"
 #include "common/tensor.h"
+#include "common/trtUtils.h"
 #include "runtime/hybridCacheManager.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizer/tokenizer.h"
@@ -164,6 +165,7 @@ private:
     int32_t mNoiseSeed{5};  //!< Random seed for diffusion noise trajectory initialization
     ActionConfig mConfig{}; //!< Model configuration parsed from config.json
 
+    AuxStreamSet mAuxStreams{};
     std::unique_ptr<nvinfer1::IRuntime> mRuntime{nullptr};
     std::unique_ptr<nvinfer1::ICudaEngine> mEngine{nullptr};
     std::unique_ptr<nvinfer1::IExecutionContext> mContext{nullptr};

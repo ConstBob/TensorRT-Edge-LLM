@@ -48,6 +48,8 @@ NemotronOmniAudioRunner::NemotronOmniAudioRunner(std::string const& engineDir, c
     bool const profileSet = mAudioContext->setOptimizationProfileAsync(0, stream);
     ELLM_CHECK(profileSet, "Failed to set optimization profile for audio engine");
 
+    setNonBlockingAuxStreams(mAudioContext.get(), mAudioEngine.get(), mAuxStreams);
+
     bool const configValid = validateAndFillConfig(engineDir);
     ELLM_CHECK(configValid, "NemotronOmniAudioRunner: Failed to validate config");
     bool const bufferAllocated = allocateBuffer(stream);

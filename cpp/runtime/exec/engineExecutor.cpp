@@ -50,6 +50,8 @@ EngineExecutor::EngineExecutor(std::filesystem::path const& enginePath, TensorRe
         mEngine->createExecutionContext(nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED));
     ELLM_CHECK(mContext != nullptr, "failed to create execution context");
 
+    setNonBlockingAuxStreams(mContext.get(), mEngine.get(), mAuxStreams);
+
     LOG_INFO("engine loaded successfully (%d I/O tensors)", mEngine->getNbIOTensors());
 }
 

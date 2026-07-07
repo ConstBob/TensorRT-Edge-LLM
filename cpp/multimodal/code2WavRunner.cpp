@@ -66,6 +66,9 @@ Code2WavRunner::Code2WavRunner(std::string const& engineDir, cudaStream_t stream
 
         bool const profileSet = mCode2WavContext->setOptimizationProfileAsync(0, stream);
         ELLM_CHECK(profileSet, "Failed to set optimization profile");
+
+        setNonBlockingAuxStreams(mCode2WavContext.get(), mCode2WavEngine.get(), mAuxStreams);
+
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
     catch (std::exception const& e)

@@ -64,6 +64,29 @@ std::optional<std::pair<cudaGraph_t, cudaGraphExec_t>> captureTRTCudaGraph(
     return std::make_pair(graph, graphExec);
 }
 
+void setNonBlockingAuxStreams(
+    nvinfer1::IExecutionContext* context, nvinfer1::ICudaEngine const* engine, AuxStreamSet& out)
+{
+    int32_t const nbAuxStreams = engine->getNbAuxStreams();
+    if (nbAuxStreams <= 0)
+    {
+        return;
+    }
+
+    // `out` may already hold streams for another context, so record the offset to
+    // hand setAuxStreams only the streams created here.
+    size_t const start = out.size();
+    for (int32_t i = 0; i < nbAuxStreams; ++i)
+    {
+        cudaStream_t stream = nullptr;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        out.add(stream);
+    }
+
+    context->setAuxStreams(out.data() + start, nbAuxStreams);
+    LOG_INFO("configured %d non-blocking auxiliary stream(s) for execution context", nbAuxStreams);
+}
+
 std::string dimsToString(nvinfer1::Dims const& dims) noexcept
 {
     std::ostringstream oss;

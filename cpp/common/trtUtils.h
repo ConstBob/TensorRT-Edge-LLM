@@ -25,6 +25,8 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <utility>
+#include <vector>
 namespace trt_edgellm
 {
 
@@ -90,6 +92,72 @@ inline std::unique_ptr<void, DlDeleter> loadEdgellmPluginLib(void) noexcept
 //! @return Pair of graph and graph exec on success, std::nullopt on failure
 std::optional<std::pair<cudaGraph_t, cudaGraphExec_t>> captureTRTCudaGraph(
     nvinfer1::IExecutionContext* context, cudaStream_t stream);
+
+//! RAII owner for the non-blocking auxiliary streams passed to
+//! IExecutionContext::setAuxStreams(). Declare it before the context member so the
+//! context is destroyed first (the streams must outlive it).
+class AuxStreamSet
+{
+public:
+    AuxStreamSet() = default;
+    ~AuxStreamSet() noexcept
+    {
+        destroy();
+    }
+    AuxStreamSet(AuxStreamSet const&) = delete;
+    AuxStreamSet& operator=(AuxStreamSet const&) = delete;
+    AuxStreamSet(AuxStreamSet&& other) noexcept
+        : mStreams(std::move(other.mStreams))
+    {
+        other.mStreams.clear();
+    }
+    AuxStreamSet& operator=(AuxStreamSet&& other) noexcept
+    {
+        if (this != &other)
+        {
+            destroy();
+            mStreams = std::move(other.mStreams);
+            other.mStreams.clear();
+        }
+        return *this;
+    }
+
+    void add(cudaStream_t stream)
+    {
+        mStreams.push_back(stream);
+    }
+
+    //! Number of streams currently held.
+    size_t size() const noexcept
+    {
+        return mStreams.size();
+    }
+
+    //! Pointer to the contiguous stream storage, for passing to setAuxStreams().
+    //! Only valid until the next add(); read it after all add() calls.
+    cudaStream_t* data() noexcept
+    {
+        return mStreams.data();
+    }
+
+private:
+    void destroy() noexcept
+    {
+        for (cudaStream_t stream : mStreams)
+        {
+            cudaStreamDestroy(stream);
+        }
+        mStreams.clear();
+    }
+
+    std::vector<cudaStream_t> mStreams;
+};
+
+//! Create non-blocking auxiliary streams for the context, register them via
+//! IExecutionContext::setAuxStreams(), and append them to @p out (which owns them).
+//! No-op when the engine reports zero aux streams.
+void setNonBlockingAuxStreams(
+    nvinfer1::IExecutionContext* context, nvinfer1::ICudaEngine const* engine, AuxStreamSet& out);
 
 //! Convert TensorRT dimensions to a string representation.
 std::string dimsToString(nvinfer1::Dims const& dims) noexcept;
