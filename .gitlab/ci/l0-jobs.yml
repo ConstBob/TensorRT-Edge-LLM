@@ -230,10 +230,18 @@ l0_rtx5090:
   interruptible: true
 
 # Unit tests for low-level components (attention kernels, etc.)
+# Each SKU in the matrix needs a cuteDSL artifact matching its own SM
+# (a30=sm_80, rtx3090=sm_86, b100=sm_100, rtx5080/rtx5090=sm_120), so all four
+# tarballs are staged and test_build_project selects the tag from the detected
+# compute capability.
 l0_unit_tests_x86:
   stage: l0_test
   needs:
     - job: build_cutedsl_x86_sm120_artifact
+      artifacts: true
+    - job: build_cutedsl_x86_sm100_artifact
+      artifacts: true
+    - job: build_cutedsl_x86_sm80_artifact
       artifacts: true
   variables:
     CUDA_VERSION: "13.2"
@@ -248,7 +256,7 @@ l0_unit_tests_x86:
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
   before_script:
     - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_x86_64_sm_120_cuda12.tar.gz cutedsl_x86_64_sm_120_cuda12.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
+    - mv -f cutedsl_x86_64_sm_*_cuda12.tar.gz cutedsl_x86_64_sm_*_cuda12.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   parallel:
     matrix:
       - RUNNER_TAG: a30-edgellm-nvks
@@ -270,6 +278,10 @@ l0_unit_tests_x86_trt11:
   needs:
     - job: build_cutedsl_x86_sm120_artifact
       artifacts: true
+    - job: build_cutedsl_x86_sm100_artifact
+      artifacts: true
+    - job: build_cutedsl_x86_sm80_artifact
+      artifacts: true
   variables:
     CUDA_VERSION: "13.2"
     TRT_VERSION: "$TRT11_VERSION"
@@ -283,7 +295,7 @@ l0_unit_tests_x86_trt11:
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
   before_script:
     - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_x86_64_sm_120_cuda12.tar.gz cutedsl_x86_64_sm_120_cuda12.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
+    - mv -f cutedsl_x86_64_sm_*_cuda12.tar.gz cutedsl_x86_64_sm_*_cuda12.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   parallel:
     matrix:
       - RUNNER_TAG: a30-edgellm-nvks
@@ -296,6 +308,65 @@ l0_unit_tests_x86_trt11:
   image: "$IMAGE"
   extends:
     - .x86_unit_test_template
+    - .l0_rules
+    - .l0_environment
+  interruptible: true
+
+# Plugin unit tests on Jetson/Drive Thor (SM110). pytest runs on the board
+# itself (TensorRT Python API + torch CUDA need the GPU); allow_failure until
+# the board python environment is proven out in CI.
+l0_unit_tests_thor:
+  stage: l0_test
+  allow_failure: true
+  needs:
+    - job: build_cutedsl_sm110_artifact
+      artifacts: true
+  variables:
+    BOARD_USER: "tensorrt_user"
+    CUDA_VERSION: "13.0"
+    TRT_VERSION: "10.16.0.72"
+    TRT_CUDA_VERSION: "13.2"
+    TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/unit_tests_thor"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$TRT_CUDA_VERSION"
+    PRIORITY: l0_python_ut
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    BOARD_IP: "192.168.55.1"
+  before_script:
+    - mkdir -p kernelSrcs/cuteDSLPrebuilt
+    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
+  tags:
+    - thor_drive-nvks
+  image: "ubuntu:24.04"
+  extends:
+    - .device_unit_test_template
+    - .l0_rules
+    - .l0_environment
+  interruptible: true
+
+# Plugin unit tests on Jetson Orin (SM87), same board-side pytest flow.
+l0_unit_tests_orin:
+  stage: l0_test
+  allow_failure: true
+  needs:
+    - job: build_cutedsl_sm87_cuda13_artifact
+      artifacts: true
+  variables:
+    BOARD_USER: "tensorrt_user"
+    CUDA_VERSION: "13.2"
+    # TRT_VERSION comes from the global default, same as l0_jetson_orin.
+    TRT_CUDA_VERSION: "13.2"
+    TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/unit_tests_orin"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.aarch64.cuda-$TRT_CUDA_VERSION"
+    PRIORITY: l0_python_ut
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+  before_script:
+    - mkdir -p kernelSrcs/cuteDSLPrebuilt
+    - mv -f cutedsl_aarch64_sm_87_cuda13.tar.gz cutedsl_aarch64_sm_87_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
+  tags:
+    - p3730-k8s
+  image: "ubuntu:24.04"
+  extends:
+    - .device_unit_test_template
     - .l0_rules
     - .l0_environment
   interruptible: true

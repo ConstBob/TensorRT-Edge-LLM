@@ -289,15 +289,14 @@
     # clone googletest and nlohmannJson from internal mirror to avoid git submodule network issues
     - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
     - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
-    - echo "Installing unit test dependencies"
-    - pip3 install -q pytest pytest-html pyyaml numpy
+    - echo "Installing test dependencies"
+    - pip3 install -q -r tests/requirements.txt torch
     - echo "Installing TensorRT Python package from cache"
     - pip3 install -q $TRT_PACKAGE_DIR/python/tensorrt-$TRT_VERSION*-cp312*.whl
-    - echo "Installing python cuda dependencies"
-    - pip3 install -q pycuda
     - export LD_LIBRARY_PATH=$TRT_PACKAGE_DIR/lib:$LD_LIBRARY_PATH
     - echo "Running unit tests with pytest. Time:$(date)"
-    - python3 -m pytest tests/defs/test_common.py tests/python-unittests/test_attention_plugin.py --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
+    # Test selection is driven by the tests/test_lists/$PRIORITY.yml list.
+    - python3 -m pytest tests/ --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
     - echo "Command execution logs and pytest reports saved to $TEST_LOG_DIR"
     - ls -la $TEST_LOG_DIR
     - echo "Pipeline end time:$(date)"
@@ -349,6 +348,45 @@
     - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "rm -rf $REMOTE_WORKSPACE"
     - ls -la $TEST_LOG_DIR
     - deactivate
+    - echo "Pipeline end time:$(date)"
+
+# Plugin python unit tests on an aarch64 board. Unlike .device_test_template
+# (pytest on the host driving the board over ssh), the unit tests call the
+# TensorRT Python API and torch CUDA directly, so pytest itself runs on the
+# board (see .gitlab/ci/scripts/device_unit_tests.sh).
+.device_unit_test_template:
+  script:
+    - echo "Pipeline start time:$(date)"
+    - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
+    - export BOARD_IP=${BOARD_IP:-192.168.55.1}
+    - echo "Board IP:$BOARD_IP"
+    - mkdir -p $TEST_LOG_DIR
+    - rm -rf $TEST_LOG_DIR/*
+    - chmod -R 777 $TEST_LOG_DIR
+    - echo "Installing dependencies"
+    - export DEBIAN_FRONTEND=noninteractive
+    - apt update -qq >/dev/null 2>&1
+    - apt install -y -qq git openssh-client sshpass rsync >/dev/null 2>&1
+    - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
+    # clone googletest and nlohmannJson from internal mirror to avoid git submodule network issues
+    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
+    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
+    - export REMOTE_WORKSPACE=${REMOTE_WORKSPACE:-/home/$BOARD_USER/tensorrt-edge-llm-ut-${CI_JOB_ID:-manual}}
+    - |
+      case "$REMOTE_WORKSPACE" in
+        /home/$BOARD_USER/tensorrt-edge-llm*) ;;
+        *) echo "Unsafe REMOTE_WORKSPACE=$REMOTE_WORKSPACE"; exit 1 ;;
+      esac
+    - echo "Creating isolated remote workspace $REMOTE_WORKSPACE and syncing repo from host to board"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "rm -rf '$REMOTE_WORKSPACE' && mkdir -p '$REMOTE_WORKSPACE'"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -a -e "ssh -o StrictHostKeyChecking=no" $LLM_SDK_DIR/ $BOARD_USER@$BOARD_IP:$REMOTE_WORKSPACE/
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "chmod -R 755 $REMOTE_WORKSPACE"
+    - echo "Running plugin unit tests on the board. Time:$(date)"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "REMOTE_WORKSPACE='$REMOTE_WORKSPACE' TRT_PACKAGE_DIR='$TRT_PACKAGE_DIR' PRIORITY='$PRIORITY' bash -s" < .gitlab/ci/scripts/device_unit_tests.sh
+    - echo "Fetching pytest reports from the board"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -a -e "ssh -o StrictHostKeyChecking=no" $BOARD_USER@$BOARD_IP:$REMOTE_WORKSPACE/logs/ $TEST_LOG_DIR/
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "rm -rf '$REMOTE_WORKSPACE'"
+    - ls -la $TEST_LOG_DIR
     - echo "Pipeline end time:$(date)"
 
 .cross_build_template:

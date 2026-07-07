@@ -145,7 +145,8 @@ AttentionExecutionMode deduceModeTreeAttention(
     return AttentionExecutionMode::kINVALID;
 }
 
-bool loadFMHAKernels(bool& useCuteDslFMHA, int32_t headSize, int32_t smVersion, nvinfer1::DataType dataType)
+bool loadFMHAKernels(
+    bool& useCuteDslFMHA, int32_t headSize, int32_t smVersion, nvinfer1::DataType dataType, bool useSlidingWindow)
 {
     bool canImplementFMHA = false;
 #ifdef CUTE_DSL_FMHA_ENABLED
@@ -165,8 +166,9 @@ bool loadFMHAKernels(bool& useCuteDslFMHA, int32_t headSize, int32_t smVersion, 
     if (!useCuteDslFMHA)
 #endif
     {
-        canImplementFMHA = ContextFMHARunner::canImplement(
-            headSize, smVersion, dataType, AttentionInputLayout::SEPARATE_Q_K_V, ContextAttentionMaskType::CAUSAL);
+        canImplementFMHA = ContextFMHARunner::canImplement(headSize, smVersion, dataType,
+            AttentionInputLayout::SEPARATE_Q_K_V,
+            useSlidingWindow ? ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL : ContextAttentionMaskType::CAUSAL);
         if (canImplementFMHA)
         {
             if (!ContextFMHARunner::loadContextFMHAKernels(smVersion, dataType))
@@ -281,7 +283,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     LOG_DEBUG("AttentionPlugin FMHA path: %s, sliding_window: %s", mUseCuteDslFMHA ? "CuTe DSL FMHA" : "FMHA_v2",
         mSlidingWindowSize > 0 ? std::to_string(mSlidingWindowSize).c_str() : "disabled");
 
-    mCanImplementFMHA = loadFMHAKernels(mUseCuteDslFMHA, mHeadSize, mSMVersion, mDataType);
+    mCanImplementFMHA = loadFMHAKernels(mUseCuteDslFMHA, mHeadSize, mSMVersion, mDataType, mSlidingWindowSize > 0);
 
     // XQA decode kernels are needed for decode path when available.
     bool const useSpecDecode = true;
@@ -294,6 +296,12 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
             mSMVersion, mDataType, selectKvCacheDataType(mEnableFp8KVCache), useSpecDecode, usePagedKVCache);
     }
 
+    // Kernel selection priority for prefill and decode:
+    //   1. FMHA (prefill) + XQA (decode) — standard path for most head sizes.
+    //   2. FFPA (prefill) + XQA (decode) — fallback for headSize=512 where FMHA has no cubins.
+    //   3. FFPA (prefill) only           — headSize=512 without XQA decode support.
+    //   4. XQA (decode) only             — prefill unsupported for this head size.
+    //   5. None                          — fatal, cannot serve this configuration.
     if (!mCanImplementFMHA)
     {
 #ifdef CUTE_DSL_FFPA_ENABLED
@@ -316,8 +324,16 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
 
     if (!mCanImplementFMHA)
     {
-        LOG_INFO("AttentionPlugin: FMHA unsupported for headSize=%d, using %s for prefill + %s for decode.", mHeadSize,
-            mCanImplementFFPA ? "FFPA" : "XQA", mCanImplementXQA ? "XQA" : "FFPA");
+        if (mCanImplementFFPA)
+        {
+            LOG_INFO("AttentionPlugin: FMHA unsupported for headSize=%d, using FFPA for prefill%s.", mHeadSize,
+                mCanImplementXQA ? " + XQA for decode" : "");
+        }
+        else
+        {
+            LOG_WARNING(
+                "AttentionPlugin: no prefill kernel for headSize=%d; only decode (XQA) is supported.", mHeadSize);
+        }
     }
 }
 
@@ -358,7 +374,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
 
     LOG_DEBUG("AttentionPlugin FMHA path: %s", mUseCuteDslFMHA ? "CuTe DSL FMHA" : "FMHA_v2");
 
-    mCanImplementFMHA = loadFMHAKernels(mUseCuteDslFMHA, mHeadSize, mSMVersion, mDataType);
+    mCanImplementFMHA = loadFMHAKernels(mUseCuteDslFMHA, mHeadSize, mSMVersion, mDataType, mSlidingWindowSize > 0);
 
     // XQA decode kernels.
     bool const usePagedKVCache = false;
@@ -831,6 +847,10 @@ int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, [[maybe_unus
         return 1;
     }
 
+    // ==================== Prefill path ====================
+    // Dispatch order: sharedKV first (early return), then own-KV.
+    // Within each: FMHA (standard), FFPA (headSize=512 fallback), or reject
+    // the prefill when neither kernel serves the head size.
     if (executionMode == AttentionExecutionMode::kNORMAL_PREFILL
         || executionMode == AttentionExecutionMode::kCHUNKED_PREFILL)
     {
@@ -859,12 +879,15 @@ int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, [[maybe_unus
                 kernel::launchApplyRopeQOnly(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor, stream);
             }
 
+            // Shared-KV without FMHA cubins: FFPA for headSize=512, reject any
+            // other head size.
             if (!mCanImplementFMHA)
             {
 #ifdef CUTE_DSL_FFPA_ENABLED
                 if (!mCanImplementFFPA)
                 {
-                    LOG_ERROR("AttentionPlugin: FFPA required for headSize=512 prefill but module failed to load.");
+                    LOG_ERROR("AttentionPlugin: no prefill kernel for headSize=%d (FMHA unsupported%s).", mHeadSize,
+                        mHeadSize == 512 ? ", FFPA module failed to load" : "; FFPA serves headSize=512 only");
                     return -1;
                 }
 
@@ -912,7 +935,10 @@ int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, [[maybe_unus
                     dispatchFFPAKernel(ffpaParams, stream);
                 }
 #else
-                LOG_ERROR("AttentionPlugin: headSize=512 shared-KV prefill requires FFPA (CUTE_DSL_FFPA_ENABLED).");
+                LOG_ERROR(
+                    "AttentionPlugin: no prefill kernel for headSize=%d shared-KV prefill (FMHA unsupported, "
+                    "built without CUTE_DSL_FFPA_ENABLED).",
+                    mHeadSize);
                 return -1;
 #endif
                 return 0;
@@ -922,7 +948,10 @@ int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, [[maybe_unus
 #ifdef CUTE_DSL_FMHA_ENABLED
             if (mUseCuteDslFMHA)
             {
-                int32_t const slidingWindow = mSlidingWindowSize > 0 ? mSlidingWindowSize : INT_MAX;
+                // CuTe DSL FMHA reads interleaved KV cache natively.
+                // windowSizeLeft excludes the query itself; sliding_window_size counts it
+                // (last W keys, the XQA/HF convention), so pass W - 1.
+                int32_t const slidingWindow = mSlidingWindowSize > 0 ? mSlidingWindowSize - 1 : INT_MAX;
                 CuteDslFMHARunner runner(
                     mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen, kvCacheCapacity);
                 runner.run(qInputTensor.dataPointer<half>(),        // Q  [b, s_q, h_q, d]
@@ -935,9 +964,15 @@ int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, [[maybe_unus
 #endif
             {
                 auto fmhaRunner = ContextFMHARunner(mDataType, runtimeBatchSize, runtimeSeqLen, mNumQHeads, mNumKVHeads,
-                    mHeadSize, mSMVersion, AttentionInputLayout::SEPARATE_Q_K_V);
+                    mHeadSize, mSMVersion, AttentionInputLayout::SEPARATE_Q_K_V,
+                    mSlidingWindowSize > 0 ? ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL
+                                           : ContextAttentionMaskType::CAUSAL);
                 FusedMultiheadAttentionParamsV2 params{};
                 fmhaRunner.setupParams(params);
+                if (mSlidingWindowSize > 0)
+                {
+                    params.sliding_window_size = mSlidingWindowSize;
+                }
                 params.cu_q_seqlens = cuQSeqLensTensor.dataPointer<int32_t>();
 
                 // Normal prefill: compact deinterleave (seqLen tokens) so FMHA_v2's
@@ -959,6 +994,10 @@ int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, [[maybe_unus
             return 0;
         }
 
+        // --- Own KV prefill: RoPE Q+K, write K/V to cache, then run attention kernel ---
+
+        // Own-KV without FMHA cubins: FFPA for headSize=512, reject any other
+        // head size.
         if (!mCanImplementFMHA)
         {
             // headSize=512 prefill: apply RoPE, write K/V to cache, then use FFPA.
@@ -966,6 +1005,13 @@ int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, [[maybe_unus
                 vInputTensor, kvCacheTensor, kScale, vScale, stream, true);
 
 #ifdef CUTE_DSL_FFPA_ENABLED
+            if (!mCanImplementFFPA)
+            {
+                LOG_ERROR("AttentionPlugin: no prefill kernel for headSize=%d (FMHA unsupported%s).", mHeadSize,
+                    mHeadSize == 512 ? ", FFPA module failed to load" : "; FFPA serves headSize=512 only");
+                return -1;
+            }
+
             // Use FFPA d512 causal kernel with native GQA support (no K/V expansion needed).
             LOG_DEBUG(
                 "AttentionPlugin: headSize=512 own-KV prefill via FFPA native GQA "
@@ -1006,7 +1052,10 @@ int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, [[maybe_unus
                 dispatchFFPAKernel(ffpaParams, stream);
             }
 #else
-            LOG_ERROR("AttentionPlugin: headSize=512 own-KV prefill requires FFPA (CUTE_DSL_FFPA_ENABLED).");
+            LOG_ERROR(
+                "AttentionPlugin: no prefill kernel for headSize=%d own-KV prefill (FMHA unsupported, built "
+                "without CUTE_DSL_FFPA_ENABLED).",
+                mHeadSize);
             return -1;
 #endif
         }
@@ -1016,7 +1065,9 @@ int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, [[maybe_unus
             if (mUseCuteDslFMHA)
             {
                 float const qScale = mQkvScales[0];
-                int32_t const slidingWindow = mSlidingWindowSize > 0 ? mSlidingWindowSize : INT_MAX;
+                // windowSizeLeft excludes the query itself; sliding_window_size counts it
+                // (last W keys, the XQA/HF convention), so pass W - 1.
+                int32_t const slidingWindow = mSlidingWindowSize > 0 ? mSlidingWindowSize - 1 : INT_MAX;
 
                 CuteDslFMHARunner runner(
                     mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen, kvCacheCapacity);
@@ -1055,11 +1106,15 @@ int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, [[maybe_unus
 #endif
             {
                 auto fmhaRunner = ContextFMHARunner(mDataType, runtimeBatchSize, runtimeSeqLen, mNumQHeads, mNumKVHeads,
-                    mHeadSize, mSMVersion, AttentionInputLayout::SEPARATE_Q_K_V);
-
-                // Prepare FMHA_v2 params to launch FMHA kernel
+                    mHeadSize, mSMVersion, AttentionInputLayout::SEPARATE_Q_K_V,
+                    mSlidingWindowSize > 0 ? ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL
+                                           : ContextAttentionMaskType::CAUSAL);
                 FusedMultiheadAttentionParamsV2 params{};
                 fmhaRunner.setupParams(params);
+                if (mSlidingWindowSize > 0)
+                {
+                    params.sliding_window_size = mSlidingWindowSize;
+                }
                 params.cu_q_seqlens = cuQSeqLensTensor.dataPointer<int32_t>();
 
                 if (executionMode == AttentionExecutionMode::kCHUNKED_PREFILL)
