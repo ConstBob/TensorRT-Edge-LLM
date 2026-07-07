@@ -22,6 +22,9 @@ Kernel groups:
                      attention (D=512), Ampere instruction floor (sm_80+).
   ssd              — Mamba2 SSM chunk-scan prefill
   gemm             — Talker MLP GEMM (Ampere / Blackwell / BW GeForce)
+  int4_fp16_gemm   — W4A16 INT4-weight FP16 GEMM (Ampere; full 75-config sweep) +
+                     the decode GEMV (small-M, shares the GEMM's weight layout;
+                     one exported function per M in 1..8) — built together
   nvfp4_moe        — split FC1/FC2 NVFP4 MoE (currently SM110/Thor only)
   nvfp4_fused_moe  — End-to-end NvFP4 fused MoE (Blackwell GeForce)
 
@@ -1008,6 +1011,87 @@ KERNEL_VARIANTS = [
     ),
 ]
 
+
+# ---------------------------------------------------------------------------
+# int4_fp16_gemm group — W4A16 INT4-weight FP16 GEMM.  Ampere instruction floor
+# (cp.async + mma.sync 16x8x16 + ldmatrix), forward-compatible to SM80 and newer
+# (Ampere / Ada / Hopper / Blackwell).
+#
+# These are GENERATED rather than hand-listed: an AOT artifact has no runtime
+# autotune, so the full config universe is baked — 5 CTA tiles x {2,3,4}
+# pipeline stages x {1,2,4,8,16} split-K factors = 75 exported functions, one
+# each, and the consumer selects per shape.  swizzle (grouped-M raster) stays a
+# *runtime* Int32 kernel arg, so it is NOT a baked dimension.  split_k>1 uses an
+# in-kernel reduction; a baked split_k=N is correct only when N divides
+# ceil(K/64) (split_k=1 always works).
+# ---------------------------------------------------------------------------
+_INT4_FP16_GEMM_TILES = [
+    (16, 128, 64),
+    (16, 256, 64),
+    (32, 128, 64),
+    (64, 128, 64),
+    (128, 128, 64),
+]
+_INT4_FP16_GEMM_STAGES = (2, 3, 4)
+_INT4_FP16_GEMM_SPLIT_K = (1, 2, 4, 8, 16)
+# Quant group size, baked per variant (it sizes the in-kernel scale smem, so it
+# is compile-time, not a runtime arg). The kernel supports {16, 32, 64, 128, ...}
+# (any multiple of 16 mutually divisible with bK=64); only G=128 is baked today.
+# Single knob: set to 32 to build G=32 instead, or make it a list + add a
+# `_g{gs}` suffix to the variant name below to ship both group sizes at once.
+_INT4_FP16_GEMM_GROUP_SIZE = 128
+
+for _tile in _INT4_FP16_GEMM_TILES:
+    _tile_tag = f"{_tile[0]}x{_tile[1]}x{_tile[2]}"
+    for _stages in _INT4_FP16_GEMM_STAGES:
+        for _sk in _INT4_FP16_GEMM_SPLIT_K:
+            KERNEL_VARIANTS.append(
+                KernelVariant(
+                    name=f"int4_fp16_gemm_{_tile_tag}_s{_stages}_sk{_sk}",
+                    group="int4_fp16_gemm",
+                    supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+                    script="int4_fp16_gemm_cutedsl/int4_fp16_gemm_ampere.py",
+                    script_args=[
+                        "--mnk", "256,512,1024",
+                        "--cta_tiler_mnk", ",".join(str(d) for d in _tile),
+                        "--atom_layout_mnk", "1,4,1",
+                        "--num_stages", str(_stages),
+                        "--split_k", str(_sk),
+                        "--group_size", str(_INT4_FP16_GEMM_GROUP_SIZE),
+                        "--export_only",
+                    ],
+                )
+            )
+
+# int4_fp16_gemm group also includes the W4A16 decode GEMV — a CUDA-core kernel
+# for the decode regime (small M) that consumes the SAME offline fragment weight
+# buffer as the GEMM.  Prefill (GEMM) and decode (GEMV) are always needed together
+# (one weight copy serves both), so the GEMV is baked under the same group /
+# CUTE_DSL_INT4_FP16_GEMM_ENABLED define rather than a separate selectable group.
+# M is the baked dimension — one exported function per M in [1, 8] (8 total); N/K
+# stay dynamic.  Single W=8 config; the kernel bakes SKU-independent per-M tuning
+# (UNROLL2/MINB from _gemv_defaults) — no device-SM detection, so the AOT config
+# is identical on every arch.  group_size 128 only for now (the kernel also
+# supports 32).
+# ---------------------------------------------------------------------------
+_INT4_FP16_GEMV_MAX_M = 8
+_INT4_FP16_GEMV_GROUP_SIZE = 128
+
+for _m in range(1, _INT4_FP16_GEMV_MAX_M + 1):
+    KERNEL_VARIANTS.append(
+        KernelVariant(
+            name=f"int4_fp16_gemv_m{_m}",
+            group="int4_fp16_gemm",
+            supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+            script="int4_fp16_gemm_cutedsl/int4_fp16_gemv_ampere.py",
+            script_args=[
+                "--mnk", f"{_m},512,1024",
+                "--group_size", str(_INT4_FP16_GEMV_GROUP_SIZE),
+                "--export_only",
+            ],
+        )
+    )
+
 # All known group names (set for O(1) membership check — no manual maintenance needed).
 _ALL_GROUPS: set[str] = {v.group for v in KERNEL_VARIANTS}
 
@@ -1502,7 +1586,7 @@ def main():
         default="ALL",
         help="Which kernels to build: ALL (default), a group name "
              "(fmha | gdn | nvfp4_moe | "
-             "nvfp4_fused_moe | ssd | gemm), or a comma-separated list "
+             "nvfp4_fused_moe | ssd | gemm | int4_fp16_gemm), or a comma-separated list "
              "of group names. Variants whose supported_sms does not include the target SM are skipped.",
     )
     p.add_argument(
