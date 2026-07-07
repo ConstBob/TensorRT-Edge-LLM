@@ -86,7 +86,7 @@ class EdgeLLMDataset:
             **kwargs: Additional parameters to override config values
         """
         self.dataset = dataset
-        self.output_dir = str(output_dir)
+        self.output_dir = os.path.abspath(os.fspath(output_dir))
         self.apply_chat_template = apply_chat_template
 
         # Override config with kwargs if provided
@@ -126,7 +126,7 @@ class EdgeLLMDataset:
             data: Single dataset entry containing image data
             
         Returns:
-            List of relative paths to saved images
+            List of paths to saved images
         """
         raise NotImplementedError("save_image is not implemented")
 
