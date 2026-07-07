@@ -1,23 +1,90 @@
 # ==============================================================================
-# L1 TESTS - Manual Trigger (L1_MAIN=true)
+# L1 TESTS - Manual Trigger (L1=true)
 # Cache Directory: /scratch.edge_llm_cache/L1/
 # Run weekly or manually from GitLab UI:
-#   Pipelines → Run pipeline → Add variable L1_MAIN=true
+#   Pipelines -> Run pipeline -> Add variable L1=true
 # ==============================================================================
 
 include:
   - local: '.gitlab/ci/templates.yml'
 
-# L1 checkpoint export for Ampere
-l1_checkpoint_export_ampere:
+# ==============================================================================
+# DATASET PREP — runs once per L1 pipeline on a30; output cached for all
+# downstream pipeline jobs via $EDGELLM_DATA_DIR.
+# ==============================================================================
+
+l1_dataset_prep:
   stage: l1_test
   variables:
-    CUDA_VERSION: "13.0"
+    CUDA_VERSION: "13.2"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
-    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_checkpoint_export_ampere"
-    PRIORITY: l1_checkpoint_export_ampere
-    ONNX_DIR: "$TEST_CACHE_DIR/onnx"
+    EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
+    TEST_LOG_DIR: "$L1_CACHE_DIR/dataset_prep/logs"
+  tags:
+    - a30-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+  script:
+    - set -o pipefail
+    # $EDGELLM_DATA_DIR is a per-pipeline writable cache under
+    # $L1_CACHE_DIR (keyed by $CI_PIPELINE_ID); the GitLab environment
+    # `l1_cache/pipeline_$CI_PIPELINE_ID` (see .l1_environment template)
+    # auto-stops after 6 days and triggers `cleanup_l1_pipeline_cache`
+    # to remove the cache directory. We never write to the QA-hub mount.
+    - export DATA="$EDGELLM_DATA_DIR/updated_datasets"
+    - mkdir -p "$DATA" "$TEST_LOG_DIR"
+    - cd $LLM_SDK_DIR
+    - pip install -r tests/requirements.txt
+    - pip install -r examples/accuracy/requirements.txt
+    - cd examples/accuracy/scripts
+    # Text / multiple choice (LLM accuracy)
+    - python prepare_dataset.py --dataset MMLU --output_dir "$DATA/MMLU_five_shot" --num_shot 5 2>&1 | tee "$TEST_LOG_DIR/mmlu_5.log"
+    - python prepare_dataset.py --dataset MMLU --output_dir "$DATA/MMLU_zero_shot" --num_shot 0 2>&1 | tee "$TEST_LOG_DIR/mmlu_0.log"
+    - python prepare_dataset.py --dataset MMLU_Pro --output_dir "$DATA/MMLU_Pro" --num_shot 5 2>&1 | tee "$TEST_LOG_DIR/mmlu_pro.log"
+    - python prepare_dataset.py --dataset MTBench --output_dir "$DATA/updated_MTBench" 2>&1 | tee "$TEST_LOG_DIR/mtbench.log"
+    - cp "$DATA/updated_MTBench/mtbench_dataset.json" "$DATA/updated_MTBench/mtbench_eagle3.json"
+    # Reasoning / coding / math (fills budget headroom — already supported by prepare_dataset)
+    - python prepare_dataset.py --dataset GSM8K --output_dir "$DATA/GSM8K" 2>&1 | tee "$TEST_LOG_DIR/gsm8k.log"
+    - python prepare_dataset.py --dataset HumanEval --output_dir "$DATA/HumanEval" 2>&1 | tee "$TEST_LOG_DIR/humaneval.log"
+    - python prepare_dataset.py --dataset AIME --output_dir "$DATA/AIME" 2>&1 | tee "$TEST_LOG_DIR/aime.log"
+    - python prepare_dataset.py --dataset MATH500 --output_dir "$DATA/MATH500" 2>&1 | tee "$TEST_LOG_DIR/math500.log"
+    - python prepare_dataset.py --dataset MMStar --output_dir "$DATA/MMStar" 2>&1 | tee "$TEST_LOG_DIR/mmstar.log"
+    # VLM
+    - python prepare_dataset.py --dataset MMMU --output_dir "$DATA/mmmu" 2>&1 | tee "$TEST_LOG_DIR/mmmu.log"
+    - python prepare_dataset.py --dataset MMMU_VLMEvalkit --output_dir "$DATA/MMMU_VLMEvalKit" 2>&1 | tee "$TEST_LOG_DIR/mmmu_vlmevalkit.log"
+    - cp "$EDGE_LLM_CACHE_DIR/updated_datasets/MMMU_VLMEvalKit/mmmu_dataset.tsv" "$DATA/MMMU_VLMEvalKit/mmmu_dataset.tsv"
+    - python prepare_dataset.py --dataset MMMU_Pro --output_dir "$DATA/MMMU_Pro_vision" --subset vision 2>&1 | tee "$TEST_LOG_DIR/mmmu_pro_vision.log"
+    - python prepare_dataset.py --dataset MMMU_Pro --output_dir "$DATA/MMMU_Pro_4" --subset "standard (4 options)" 2>&1 | tee "$TEST_LOG_DIR/mmmu_pro_4.log"
+    - python prepare_dataset.py --dataset COCO --output_dir "$DATA/coco" 2>&1 | tee "$TEST_LOG_DIR/coco.log"
+    # Audio / Omni
+    - python prepare_dataset.py --dataset LibriSpeech --output_dir "$DATA/librispeech_clean_test" 2>&1 | tee "$TEST_LOG_DIR/librispeech.log"
+    - python prepare_dataset.py --dataset OmniBench --output_dir "$DATA/OmniBench" 2>&1 | tee "$TEST_LOG_DIR/omnibench.log"
+    # TTS multilingual (auto-downloads from HF)
+    - python prepare_dataset.py --dataset MiniMaxMultilingual --output_dir "$DATA/MiniMaxMultilingual" --language en 2>&1 | tee "$TEST_LOG_DIR/minimax_en.log"
+    - ls -la "$DATA"
+    - du -sh "$DATA"/*
+
+# ==============================================================================
+# EXPORT JOBS
+# ==============================================================================
+
+l1_ampere_export:
+  stage: l1_test
+  variables:
+    CUDA_VERSION: "13.2"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    # QA-hub pre-quantized HF checkpoints (GPTQ / NVFP4 suffix-named models)
+    # let `is_prequantized()` short-circuit and skip the local quant step.
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$QUANT_CHECKPOINT_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_ampere_export"
+    PRIORITY: l1_export_ampere
+    ONNX_DIR: "$L1_CACHE_DIR/l1_ampere_exports/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
   tags:
     - a30-edgellm-nvks
@@ -25,54 +92,1076 @@ l1_checkpoint_export_ampere:
   extends:
     - .checkpoint_export_template
     - .l1_rules
+    - .l1_environment
   interruptible: false
 
-# L1 Building and testing with A30 Linux
-l1_a30:
+l1_ampere_export_special:
   stage: l1_test
-  needs:
-    - l1_checkpoint_export_ampere
   variables:
-    CUDA_VERSION: "13.0"
-    TRT_CUDA_VERSION: "13.1"
+    CUDA_VERSION: "13.2"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
-    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_a30"
-    PRIORITY: l1_pipeline_a30
-    ONNX_DIR: "$L1_CACHE_DIR/l1_checkpoint_export_ampere/onnx"
+    # QA-hub pre-quantized HF checkpoints (GPTQ / NVFP4 suffix-named models)
+    # let `is_prequantized()` short-circuit and skip the local quant step.
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$QUANT_CHECKPOINT_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_ampere_export_special"
+    PRIORITY: l1_export_ampere_special
+    ONNX_DIR: "$L1_CACHE_DIR/l1_ampere_exports/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
-    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
-    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
-    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/a30.csv"
   tags:
     - a30-edgellm-nvks
   image: "$IMAGE"
   extends:
-    - .x86_test_template
+    - .checkpoint_export_template
     - .l1_rules
+    - .l1_environment
   interruptible: false
 
-l1_a30_trt11:
+l1_blackwell_export_small:
   stage: l1_test
-  needs:
-    - l1_checkpoint_export_ampere
   variables:
     CUDA_VERSION: "13.2"
-    TRT_VERSION: "$TRT11_VERSION"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    # QA-hub pre-quantized HF checkpoints (GPTQ / NVFP4 suffix-named models)
+    # let `is_prequantized()` short-circuit and skip the local quant step.
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$QUANT_CHECKPOINT_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_blackwell_export_small"
+    PRIORITY: l1_export_blackwell_small
+    ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+  tags:
+    - a30-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .checkpoint_export_template
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+
+l1_blackwell_export_large:
+  stage: l1_test
+  variables:
+    CUDA_VERSION: "13.2"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    # QA-hub pre-quantized HF checkpoints (GPTQ / NVFP4 suffix-named models)
+    # let `is_prequantized()` short-circuit and skip the local quant step.
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$QUANT_CHECKPOINT_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_blackwell_export_large"
+    PRIORITY: l1_export_blackwell_large
+    ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+  tags:
+    - a30-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .checkpoint_export_template
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+
+l1_blackwell_export_moe:
+  stage: l1_test
+  variables:
+    CUDA_VERSION: "13.2"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    # QA-hub pre-quantized HF checkpoints (GPTQ / NVFP4 suffix-named models)
+    # let `is_prequantized()` short-circuit and skip the local quant step.
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$QUANT_CHECKPOINT_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_blackwell_export_moe"
+    PRIORITY: l1_export_blackwell_moe
+    ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+  tags:
+    - a30-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .checkpoint_export_template
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+
+l1_blackwell_export_eagle:
+  stage: l1_test
+  variables:
+    CUDA_VERSION: "13.2"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    # QA-hub pre-quantized HF checkpoints (GPTQ / NVFP4 suffix-named models)
+    # let `is_prequantized()` short-circuit and skip the local quant step.
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$QUANT_CHECKPOINT_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_blackwell_export_eagle"
+    PRIORITY: l1_eagle_export_blackwell
+    ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+  tags:
+    - a30-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .checkpoint_export_template
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+
+l1_audio_export:
+  stage: l1_test
+  needs:
+    - l1_ampere_export
+  variables:
+    CUDA_VERSION: "13.2"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    # QA-hub pre-quantized HF checkpoints (GPTQ / NVFP4 suffix-named models)
+    # let `is_prequantized()` short-circuit and skip the local quant step.
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$QUANT_CHECKPOINT_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_audio_export"
+    PRIORITY: l1_export_audio
+    ONNX_DIR: "$L1_CACHE_DIR/l1_ampere_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+  tags:
+    - a30-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .checkpoint_export_template
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+
+# ==============================================================================
+# PIPELINE JOBS
+# ==============================================================================
+
+l1_a30_llm:
+  stage: l1_test
+  needs:
+    - l1_ampere_export
+    - l1_ampere_export_special
+    - l1_dataset_prep
+  variables:
+    CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
-    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_a30_trt11"
-    PRIORITY: l1_pipeline_a30
-    ONNX_DIR: "$L1_CACHE_DIR/l1_checkpoint_export_ampere/onnx"
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_a30_llm"
+    PRIORITY: l1_pipeline_a30_llm
+    ONNX_DIR: "$L1_CACHE_DIR/l1_ampere_exports/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
-    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/a30_trt11.csv"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_a30.csv"
   tags:
     - a30-edgellm-nvks
   image: "$IMAGE"
   extends:
     - .x86_test_template
     - .l1_rules
+    - .l1_environment
   interruptible: false
+
+l1_a30_vlm:
+  stage: l1_test
+  needs:
+    - l1_ampere_export
+    - l1_dataset_prep
+  variables:
+    CUDA_VERSION: "13.2"
+    TRT_CUDA_VERSION: "13.2"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_a30_vlm"
+    PRIORITY: l1_pipeline_a30_vlm
+    ONNX_DIR: "$L1_CACHE_DIR/l1_ampere_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_a30.csv"
+  tags:
+    - a30-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .x86_test_template
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+
+l1_a30_eagle:
+  stage: l1_test
+  needs:
+    - l1_ampere_export
+    - l1_ampere_export_special
+    - l1_dataset_prep
+  variables:
+    CUDA_VERSION: "13.2"
+    TRT_CUDA_VERSION: "13.2"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_a30_eagle"
+    PRIORITY: l1_pipeline_a30_eagle
+    ONNX_DIR: "$L1_CACHE_DIR/l1_ampere_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_a30.csv"
+  tags:
+    - a30-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .x86_test_template
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+
+l1_rtx3090_trt11_llm:
+  stage: l1_test
+  needs:
+    - l1_ampere_export
+    - l1_dataset_prep
+  variables:
+    CUDA_VERSION: "13.2"
+    TRT_CUDA_VERSION: "13.2"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
+    TRT_VERSION: "$TRT11_VERSION"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_rtx3090_trt11_llm"
+    PRIORITY: l1_pipeline_rtx3090_llm
+    ONNX_DIR: "$L1_CACHE_DIR/l1_ampere_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_rtx3090_trt11.csv"
+  tags:
+    - rtx3090-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .x86_test_template
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+
+l1_rtx3090_trt11_vlm:
+  stage: l1_test
+  needs:
+    - l1_ampere_export
+    - l1_dataset_prep
+  variables:
+    CUDA_VERSION: "13.2"
+    TRT_CUDA_VERSION: "13.2"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
+    TRT_VERSION: "$TRT11_VERSION"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_rtx3090_trt11_vlm"
+    PRIORITY: l1_pipeline_rtx3090_vlm
+    ONNX_DIR: "$L1_CACHE_DIR/l1_ampere_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_rtx3090_trt11.csv"
+  tags:
+    - rtx3090-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .x86_test_template
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+
+l1_rtx5080_llm:
+  stage: l1_test
+  needs:
+    - l1_blackwell_export_small
+    - l1_blackwell_export_large
+    - l1_dataset_prep
+    - job: build_cutedsl_x86_sm120_artifact
+      artifacts: true
+  variables:
+    CUDA_VERSION: "12.9"
+    TRT_CUDA_VERSION: "12.9"
+    TRT_VERSION: "10.13.3.9"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_rtx5080_llm"
+    PRIORITY: l1_pipeline_rtx5080_llm
+    ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_rtx5080.csv"
+  before_script:
+    - mkdir -p kernelSrcs/cuteDSLPrebuilt
+    - mv -f cutedsl_x86_64_sm_120_cuda12.tar.gz cutedsl_x86_64_sm_120_cuda12.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
+  tags:
+    - rtx5080-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .x86_test_template
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+
+l1_rtx5080_vlm:
+  stage: l1_test
+  needs:
+    - l1_blackwell_export_small
+    - l1_blackwell_export_large
+    - l1_dataset_prep
+    - job: build_cutedsl_x86_sm120_artifact
+      artifacts: true
+  variables:
+    CUDA_VERSION: "12.9"
+    TRT_CUDA_VERSION: "12.9"
+    TRT_VERSION: "10.13.3.9"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_rtx5080_vlm"
+    PRIORITY: l1_pipeline_rtx5080_vlm
+    ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_rtx5080.csv"
+  before_script:
+    - mkdir -p kernelSrcs/cuteDSLPrebuilt
+    - mv -f cutedsl_x86_64_sm_120_cuda12.tar.gz cutedsl_x86_64_sm_120_cuda12.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
+  tags:
+    - rtx5080-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .x86_test_template
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+
+l1_rtx5090_llm:
+  stage: l1_test
+  needs:
+    - l1_blackwell_export_small
+    - l1_blackwell_export_moe
+    - l1_dataset_prep
+    - job: build_cutedsl_x86_sm120_artifact
+      artifacts: true
+  variables:
+    CUDA_VERSION: "13.2"
+    TRT_CUDA_VERSION: "13.2"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_rtx5090_llm"
+    PRIORITY: l1_pipeline_rtx5090_llm
+    ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_rtx5090.csv"
+  before_script:
+    - mkdir -p kernelSrcs/cuteDSLPrebuilt
+    - mv -f cutedsl_x86_64_sm_120_cuda12.tar.gz cutedsl_x86_64_sm_120_cuda12.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
+  tags:
+    - rtx5090-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .x86_test_template
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+
+l1_rtx5090_vlm:
+  stage: l1_test
+  needs:
+    - l1_blackwell_export_large
+    - l1_blackwell_export_moe
+    - l1_dataset_prep
+    - job: build_cutedsl_x86_sm120_artifact
+      artifacts: true
+  variables:
+    CUDA_VERSION: "13.2"
+    TRT_CUDA_VERSION: "13.2"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_rtx5090_vlm"
+    PRIORITY: l1_pipeline_rtx5090_vlm
+    ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_rtx5090.csv"
+  before_script:
+    - mkdir -p kernelSrcs/cuteDSLPrebuilt
+    - mv -f cutedsl_x86_64_sm_120_cuda12.tar.gz cutedsl_x86_64_sm_120_cuda12.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
+  tags:
+    - rtx5090-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .x86_test_template
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+
+l1_rtx5090_eagle:
+  stage: l1_test
+  needs:
+    - l1_blackwell_export_small
+    - l1_blackwell_export_large
+    - l1_blackwell_export_eagle
+    - l1_dataset_prep
+    - job: build_cutedsl_x86_sm120_artifact
+      artifacts: true
+  variables:
+    CUDA_VERSION: "13.2"
+    TRT_CUDA_VERSION: "13.2"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_rtx5090_eagle"
+    PRIORITY: l1_pipeline_rtx5090_eagle
+    ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_rtx5090.csv"
+  before_script:
+    - mkdir -p kernelSrcs/cuteDSLPrebuilt
+    - mv -f cutedsl_x86_64_sm_120_cuda12.tar.gz cutedsl_x86_64_sm_120_cuda12.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
+  tags:
+    - rtx5090-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .x86_test_template
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+
+# VLMEvalKit checkout used by b100 jobs. Cloned into the L1 cache so it
+# survives across pipelines; commit is pinned for reproducibility.
+#
+# OPENAI_API_KEY must be defined as a masked + protected GitLab CI variable
+# on the project (do NOT commit the secret here). Without it, the LLM
+# judge call fails and VLMEvalKit silently scores open-ended MMMU near 0%.
+.l1_vlmevalkit_setup:
+  variables:
+    VLMEVALKIT_JUDGE_MODEL: "gpt-4-0125"
+    LOCAL_LLM: "openai/openai/gpt-5.1"
+    OPENAI_API_BASE: "https://inference-api.nvidia.com/v1/chat/completions"
+  before_script:
+    - mkdir -p kernelSrcs/cuteDSLPrebuilt
+    - mv -f cutedsl_x86_64_sm_120_cuda12.tar.gz cutedsl_x86_64_sm_120_cuda12.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
+    - |
+      if [ ! -d "$VLMEVALKIT_DIR/.git" ]; then
+        echo "Cloning VLMEvalKit into $VLMEVALKIT_DIR"
+        mkdir -p "$(dirname "$VLMEVALKIT_DIR")"
+        git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/VLMEvalKit-mirror.git "$VLMEVALKIT_DIR" \
+          || git clone https://github.com/open-compass/VLMEvalKit.git "$VLMEVALKIT_DIR"
+      fi
+    - cd "$VLMEVALKIT_DIR" && git fetch --all -q && git checkout "$VLMEVALKIT_COMMIT" && cd -
+    - pip3 install -q -r "$VLMEVALKIT_DIR/requirements.txt"
+
+l1_b100_qwen:
+  stage: l1_test
+  needs:
+    - l1_blackwell_export_large
+    - l1_dataset_prep
+    - job: build_cutedsl_x86_sm120_artifact
+      artifacts: true
+  variables:
+    CUDA_VERSION: "13.2"
+    TRT_CUDA_VERSION: "13.2"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_b100_qwen"
+    PRIORITY: l1_pipeline_b100_qwen
+    ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_b100.csv"
+    VLMEVALKIT_DIR: "$EDGE_LLM_CACHE_DIR/vlmevalkit"
+    VLMEVALKIT_COMMIT: "a3656d4"
+    VLMEVALKIT_DATA_DIR: "$EDGELLM_DATA_DIR"
+    VLMEVALKIT_WORK_DIR: "$TEST_CACHE_DIR/vlmevalkit_workdir"
+  tags:
+    - b100-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .x86_test_template
+    - .l1_rules
+    - .l1_environment
+    - .l1_vlmevalkit_setup
+  interruptible: false
+
+l1_b100_misc:
+  stage: l1_test
+  needs:
+    - l1_blackwell_export_large
+    - l1_blackwell_export_moe
+    - l1_dataset_prep
+    - job: build_cutedsl_x86_sm120_artifact
+      artifacts: true
+  variables:
+    CUDA_VERSION: "13.2"
+    TRT_CUDA_VERSION: "13.2"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_b100_misc"
+    PRIORITY: l1_pipeline_b100_misc
+    ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_b100.csv"
+    VLMEVALKIT_DIR: "$EDGE_LLM_CACHE_DIR/vlmevalkit"
+    VLMEVALKIT_COMMIT: "a3656d4"
+    VLMEVALKIT_DATA_DIR: "$EDGELLM_DATA_DIR"
+    VLMEVALKIT_WORK_DIR: "$TEST_CACHE_DIR/vlmevalkit_workdir"
+  tags:
+    - b100-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .x86_test_template
+    - .l1_rules
+    - .l1_environment
+    - .l1_vlmevalkit_setup
+  interruptible: false
+
+l1_spark:
+  stage: l1_test
+  needs:
+    - l1_blackwell_export_large
+    - l1_blackwell_export_moe
+    - l1_dataset_prep
+    - job: build_cutedsl_gb10_artifact
+      artifacts: true
+  variables:
+    CUDA_VERSION: "13.0"
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
+    TEST_CACHE_DIR: "$CI_PROJECT_DIR/l1_spark_cache"
+    PRIORITY: l1_pipeline_spark
+    ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
+    TRT_PACKAGE_DIR: "/usr"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_spark.csv"
+  tags:
+    - local-spark
+  before_script:
+    - mkdir -p kernelSrcs/cuteDSLPrebuilt
+    - mv -f cutedsl_aarch64_sm_121_cuda13.tar.gz cutedsl_aarch64_sm_121_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
+  script:
+    - echo "Pipeline start time:$(date)"
+    - echo "Node name:$(hostname)"
+    - export PATH=/usr/local/cuda/bin:$PATH
+    - export LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH
+    - echo "CUDA version:$(nvcc --version | grep release)"
+    - echo "TRT version:$(dpkg -l | grep tensorrt-libs | awk '{print $3}')"
+    - mkdir -p "$TEST_LOG_DIR" "$ENGINE_DIR"
+    - rm -rf "$TEST_LOG_DIR"/* "$ENGINE_DIR"/*
+    - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
+    - rm -rf 3rdParty/googletest 3rdParty/nlohmannJson venv/l1-spark
+    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
+    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
+    - python3 -m venv --system-site-packages venv/l1-spark
+    - source venv/l1-spark/bin/activate
+    - pip3 install -q -r tests/requirements.txt
+    - pip3 install -q -r examples/accuracy/requirements.txt
+    - if [ -n "$BASELINE_CSV" ]; then mkdir -p "$(dirname "$BASELINE_CSV")"; fi
+    - python3 -m pytest tests/ --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
+    - ls -la "$TEST_LOG_DIR"
+    - deactivate
+    - echo "Pipeline end time:$(date)"
+  extends:
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+
+l1_drive_thor_1_llm:
+  stage: l1_test
+  needs:
+    - l1_blackwell_export_small
+    - l1_blackwell_export_moe
+    - l1_dataset_prep
+    - job: build_cutedsl_sm110_artifact
+      artifacts: true
+  variables:
+    TRT_CUDA_VERSION: "12.8"
+    BOARD_USER: "tensorrt_user"
+    CUDA_VERSION: "12.8"
+    TRT_VERSION: "10.13.3.9"
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_drive_thor_1_llm"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$TRT_CUDA_VERSION"
+    PRIORITY: l1_pipeline_thor_1_llm
+    ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_drive_thor_1.csv"
+  before_script:
+    - mkdir -p kernelSrcs/cuteDSLPrebuilt
+    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
+  tags:
+    - thor_drive-nvks
+  image: "ubuntu:24.04"
+  extends:
+    - .device_test_template
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+
+l1_drive_thor_1_vlm:
+  stage: l1_test
+  needs:
+    - l1_blackwell_export_large
+    - l1_blackwell_export_moe
+    - l1_dataset_prep
+    - job: build_cutedsl_sm110_artifact
+      artifacts: true
+  variables:
+    TRT_CUDA_VERSION: "12.8"
+    BOARD_USER: "tensorrt_user"
+    CUDA_VERSION: "12.8"
+    TRT_VERSION: "10.13.3.9"
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_drive_thor_1_vlm"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$TRT_CUDA_VERSION"
+    PRIORITY: l1_pipeline_thor_1_vlm
+    ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_drive_thor_1.csv"
+  before_script:
+    - mkdir -p kernelSrcs/cuteDSLPrebuilt
+    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
+  tags:
+    - thor_drive-nvks
+  image: "ubuntu:24.04"
+  extends:
+    - .device_test_template
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+
+l1_drive_thor_1_eagle:
+  stage: l1_test
+  needs:
+    - l1_blackwell_export_small
+    - l1_blackwell_export_eagle
+    - l1_dataset_prep
+    - job: build_cutedsl_sm110_artifact
+      artifacts: true
+  variables:
+    TRT_CUDA_VERSION: "12.8"
+    BOARD_USER: "tensorrt_user"
+    CUDA_VERSION: "12.8"
+    TRT_VERSION: "10.13.3.9"
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_drive_thor_1_eagle"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$TRT_CUDA_VERSION"
+    PRIORITY: l1_pipeline_thor_1_eagle
+    ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_drive_thor_1.csv"
+  before_script:
+    - mkdir -p kernelSrcs/cuteDSLPrebuilt
+    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
+  tags:
+    - thor_drive-nvks
+  image: "ubuntu:24.04"
+  extends:
+    - .device_test_template
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+
+l1_drive_thor_2_llm:
+  stage: l1_test
+  needs:
+    - l1_blackwell_export_small
+    - l1_blackwell_export_moe
+    - l1_dataset_prep
+    - job: build_cutedsl_sm110_artifact
+      artifacts: true
+  variables:
+    BOARD_USER: "tensorrt_user"
+    CUDA_VERSION: "13.0"
+    TRT_VERSION: "10.16.0.72"
+    TRT_CUDA_VERSION: "13.2"
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_drive_thor_2_llm"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$TRT_CUDA_VERSION"
+    PRIORITY: l1_pipeline_thor_2_llm
+    ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_drive_thor_2.csv"
+  before_script:
+    - mkdir -p kernelSrcs/cuteDSLPrebuilt
+    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
+  tags:
+    - thor_ts4_724-nvks
+  image: "ubuntu:24.04"
+  extends:
+    - .device_test_template
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+
+l1_drive_thor_2_vlm:
+  stage: l1_test
+  needs:
+    - l1_blackwell_export_large
+    - l1_blackwell_export_moe
+    - l1_dataset_prep
+    - job: build_cutedsl_sm110_artifact
+      artifacts: true
+  variables:
+    BOARD_USER: "tensorrt_user"
+    CUDA_VERSION: "13.0"
+    TRT_VERSION: "10.16.0.72"
+    TRT_CUDA_VERSION: "13.2"
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_drive_thor_2_vlm"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$TRT_CUDA_VERSION"
+    PRIORITY: l1_pipeline_thor_2_vlm
+    ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_drive_thor_2.csv"
+  before_script:
+    - mkdir -p kernelSrcs/cuteDSLPrebuilt
+    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
+  tags:
+    - thor_ts4_724-nvks
+  image: "ubuntu:24.04"
+  extends:
+    - .device_test_template
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+
+l1_drive_thor_2_eagle:
+  stage: l1_test
+  needs:
+    - l1_blackwell_export_small
+    - l1_blackwell_export_large
+    - l1_blackwell_export_eagle
+    - l1_dataset_prep
+    - job: build_cutedsl_sm110_artifact
+      artifacts: true
+  variables:
+    BOARD_USER: "tensorrt_user"
+    CUDA_VERSION: "13.0"
+    TRT_VERSION: "10.16.0.72"
+    TRT_CUDA_VERSION: "13.2"
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_drive_thor_2_eagle"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$TRT_CUDA_VERSION"
+    PRIORITY: l1_pipeline_thor_2_eagle
+    ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_drive_thor_2.csv"
+  before_script:
+    - mkdir -p kernelSrcs/cuteDSLPrebuilt
+    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
+  tags:
+    - thor_ts4_724-nvks
+  image: "ubuntu:24.04"
+  extends:
+    - .device_test_template
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+
+l1_drive_thor_2_extras:
+  stage: l1_test
+  needs:
+    - l1_ampere_export
+    - l1_dataset_prep
+    - job: build_cutedsl_sm110_artifact
+      artifacts: true
+  variables:
+    BOARD_USER: "tensorrt_user"
+    CUDA_VERSION: "13.0"
+    TRT_VERSION: "10.16.0.72"
+    TRT_CUDA_VERSION: "13.2"
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_drive_thor_2_extras"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$TRT_CUDA_VERSION"
+    PRIORITY: l1_pipeline_thor_2_extras
+    ONNX_DIR: "$L1_CACHE_DIR/l1_ampere_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_drive_thor_2.csv"
+  before_script:
+    - mkdir -p kernelSrcs/cuteDSLPrebuilt
+    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
+  tags:
+    - thor_ts4_724-nvks
+  image: "ubuntu:24.04"
+  extends:
+    - .device_test_template
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+
+l1_drive_thor_2_extras_blackwell:
+  stage: l1_test
+  needs:
+    - l1_blackwell_export_small
+    - l1_blackwell_export_large
+    - l1_dataset_prep
+    - job: build_cutedsl_sm110_artifact
+      artifacts: true
+  variables:
+    BOARD_USER: "tensorrt_user"
+    CUDA_VERSION: "13.0"
+    TRT_VERSION: "10.16.0.72"
+    TRT_CUDA_VERSION: "13.2"
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_drive_thor_2_extras_blackwell"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$TRT_CUDA_VERSION"
+    PRIORITY: l1_pipeline_thor_2_extras_blackwell
+    ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_drive_thor_2.csv"
+  before_script:
+    - mkdir -p kernelSrcs/cuteDSLPrebuilt
+    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
+  tags:
+    - thor_ts4_724-nvks
+  image: "ubuntu:24.04"
+  extends:
+    - .device_test_template
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+
+l1_jedha_vlm:
+  stage: l1_test
+  needs:
+    - l1_blackwell_export_large
+    - l1_blackwell_export_moe
+    - l1_dataset_prep
+    - job: build_cutedsl_sm110_artifact
+      artifacts: true
+  variables:
+    BOARD_USER: "tensorrt_user"
+    CUDA_VERSION: "12.8"
+    TRT_VERSION: "10.16.0.72"
+    TRT_CUDA_VERSION: "13.2"
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_jedha_vlm"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.aarch64.cuda-$TRT_CUDA_VERSION"
+    PRIORITY: l1_pipeline_jedha_vlm
+    ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_jedha.csv"
+  before_script:
+    - mkdir -p kernelSrcs/cuteDSLPrebuilt
+    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
+  tags:
+    - jedha-edgellm-nvks
+  image: "ubuntu:24.04"
+  extends:
+    - .device_test_template
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+
+l1_jedha_llm_eagle:
+  stage: l1_test
+  needs:
+    - l1_blackwell_export_small
+    - l1_blackwell_export_large
+    - l1_blackwell_export_moe
+    - l1_blackwell_export_eagle
+    - l1_dataset_prep
+    - job: build_cutedsl_sm110_artifact
+      artifacts: true
+  variables:
+    BOARD_USER: "tensorrt_user"
+    CUDA_VERSION: "12.8"
+    TRT_VERSION: "10.16.0.72"
+    TRT_CUDA_VERSION: "13.2"
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_jedha_llm_eagle"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.aarch64.cuda-$TRT_CUDA_VERSION"
+    PRIORITY: l1_pipeline_jedha_llm_eagle
+    ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_jedha.csv"
+  before_script:
+    - mkdir -p kernelSrcs/cuteDSLPrebuilt
+    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
+  tags:
+    - jedha-edgellm-nvks
+  image: "ubuntu:24.04"
+  extends:
+    - .device_test_template
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+
+l1_jetson_orin_llm:
+  stage: l1_test
+  needs:
+    - l1_ampere_export
+    - l1_dataset_prep
+  variables:
+    TRT_CUDA_VERSION: "13.2"
+    BOARD_USER: "tensorrt_user"
+    CUDA_VERSION: "13.2"
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_jetson_orin_llm"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.aarch64.cuda-$TRT_CUDA_VERSION"
+    PRIORITY: l1_pipeline_orin_llm
+    ONNX_DIR: "$L1_CACHE_DIR/l1_ampere_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_jetson_orin.csv"
+  tags:
+    - p3730-k8s
+  image: "ubuntu:24.04"
+  extends:
+    - .device_test_template
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+
+l1_jetson_orin_vlm:
+  stage: l1_test
+  needs:
+    - l1_ampere_export
+    - l1_dataset_prep
+  variables:
+    TRT_CUDA_VERSION: "13.2"
+    BOARD_USER: "tensorrt_user"
+    CUDA_VERSION: "13.2"
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_jetson_orin_vlm"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.aarch64.cuda-$TRT_CUDA_VERSION"
+    PRIORITY: l1_pipeline_orin_vlm
+    ONNX_DIR: "$L1_CACHE_DIR/l1_ampere_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_jetson_orin.csv"
+  tags:
+    - p3730-k8s
+  image: "ubuntu:24.04"
+  extends:
+    - .device_test_template
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+
+l1_jetson_orin_eagle:
+  stage: l1_test
+  needs:
+    - l1_ampere_export
+    - l1_ampere_export_special
+    - l1_dataset_prep
+  variables:
+    TRT_CUDA_VERSION: "13.2"
+    BOARD_USER: "tensorrt_user"
+    CUDA_VERSION: "13.2"
+    L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
+    LLM_MODELS_DIR: "$TORCH_DIR"
+    EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_jetson_orin_eagle"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.aarch64.cuda-$TRT_CUDA_VERSION"
+    PRIORITY: l1_pipeline_orin_eagle
+    ONNX_DIR: "$L1_CACHE_DIR/l1_ampere_exports/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_jetson_orin.csv"
+  tags:
+    - p3730-k8s
+  image: "ubuntu:24.04"
+  extends:
+    - .device_test_template
+    - .l1_rules
+    - .l1_environment
+  interruptible: false
+
+# ==============================================================================
+# CLEANUP — Triggered when L1 pipeline environment is stopped
+# (auto-stop after 6 days per .l1_environment, or manually from GitLab UI).
+# Mirrors the L0 cleanup pattern in cleanup_l0_mr_cache.
+# ==============================================================================
+
+cleanup_l1_pipeline_cache:
+  stage: .post
+  dependencies: []
+  variables:
+    GIT_STRATEGY: none
+  tags:
+    - a30-edgellm-nvks
+  script:
+    - echo "Cleaning up L1 cache for pipeline ${CI_PIPELINE_ID}"
+    # Safety check: CI_PIPELINE_ID must be set
+    - |
+      if [ -z "$CI_PIPELINE_ID" ]; then
+        echo "ERROR: CI_PIPELINE_ID is not set!"
+        exit 1
+      fi
+    - PIPELINE_CACHE_DIR="${EDGE_LLM_CACHE_DIR}/L1/${CI_PIPELINE_ID}"
+    - |
+      if [ -d "$PIPELINE_CACHE_DIR" ]; then
+        echo "Found L1 pipeline cache: $PIPELINE_CACHE_DIR"
+        echo "Disk usage before cleanup:"
+        du -sh "$PIPELINE_CACHE_DIR" || true
+        echo "Removing $PIPELINE_CACHE_DIR..."
+        rm -rf "$PIPELINE_CACHE_DIR"
+        echo "✅ Cleanup completed for pipeline ${CI_PIPELINE_ID}"
+      else
+        echo "ℹ️  No cache directory at $PIPELINE_CACHE_DIR (already cleaned or never created)"
+      fi
+  environment:
+    name: l1_cache/pipeline_$CI_PIPELINE_ID
+    action: stop
+  when: manual
+  allow_failure: true

@@ -20,6 +20,12 @@
     on_stop: cleanup_l0_mr_cache
     auto_stop_in: 30 days
 
+.l1_environment:
+  environment:
+    name: l1_cache/pipeline_$CI_PIPELINE_ID
+    on_stop: cleanup_l1_pipeline_cache
+    auto_stop_in: 6 days
+
 .l1_rules:
   rules:
     - if: $L1 == "true"
