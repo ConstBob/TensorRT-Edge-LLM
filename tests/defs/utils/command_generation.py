@@ -20,6 +20,8 @@ import os
 import shlex
 from typing import Dict, List, Optional, Tuple
 
+from conftest import EnvironmentConfig
+
 from ..config import (DEFAULT_SEARCH_DEPTH, PRE_QUANTIZED_MODELS, ModelType,
                       TestConfig, _find_directory, strip_model_quant_suffixes)
 from .checkpoint_export_helpers import get_tensorrt_edgellm_root
@@ -776,4 +778,59 @@ def generate_kernel_bench_commands(
         cmd.append("--debug")
 
     commands.append((cmd, 600))
+    return commands
+
+
+def generate_vlmevalkit_commands(
+        config: TestConfig,
+        env_config: EnvironmentConfig) -> List[Tuple[List[str], int]]:
+    """Generate VLMEvalKit post-processing commands for MMMU evaluation."""
+    if not env_config.vlmevalkit_dir:
+        raise ValueError("VLMEVALKIT_DIR is required for VLMEvalKit commands. "
+                         "Set the VLMEVALKIT_DIR environment variable.")
+
+    llm_sdk_dir = env_config.llm_sdk_dir
+    vlmevalkit_work_dir = (env_config.vlmevalkit_work_dir or os.path.join(
+        env_config.test_log_dir, "vlmevalkit_workdir"))
+    prepare_script = os.path.join(llm_sdk_dir, "examples", "accuracy",
+                                  "scripts", "prepare_mmmu_vlmevalkit.py")
+    vlmevalkit_run_py = os.path.join(env_config.vlmevalkit_dir, "run.py")
+
+    # VLMEvalKit --reuse looks for xlsx in
+    # {work_dir}/{model_name}/<previous_eval_id>/.
+    reuse_seed_dir = os.path.join(vlmevalkit_work_dir, config.model_name,
+                                  "T00000000_G00000000")
+    output_xlsx = os.path.join(reuse_seed_dir,
+                               f"{config.model_name}_MMMU_DEV_VAL.xlsx")
+
+    commands = [(["bash", "-c",
+                  f"mkdir -p {shlex.quote(reuse_seed_dir)}"], 30)]
+
+    commands.append(([
+        "python3",
+        prepare_script,
+        f"--tsv_file={config.get_vlmevalkit_tsv_file()}",
+        f"--json_file={config.get_output_json_file()}",
+        f"--output_file={output_xlsx}",
+    ], 300))
+
+    # The default exact-matching judge avoids depending on an external service.
+    # CI can opt into an OpenAI-compatible judge by setting VLMEVALKIT_JUDGE_MODEL.
+    judge_model = os.environ.get("VLMEVALKIT_JUDGE_MODEL", "exact_matching")
+    commands.append(([
+        "python3",
+        vlmevalkit_run_py,
+        "--data",
+        "MMMU_DEV_VAL",
+        "--model",
+        config.model_name,
+        "--work-dir",
+        vlmevalkit_work_dir,
+        "--mode",
+        "eval",
+        "--reuse",
+        "--judge",
+        judge_model,
+    ], 600))
+
     return commands

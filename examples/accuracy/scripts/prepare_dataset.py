@@ -39,9 +39,11 @@ from typing import Tuple
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from example_datasets.aime import convert_aime_dataset
+from example_datasets.coco import convert_coco_dataset
 from example_datasets.edgellm_dataset import DatasetConfig
 from example_datasets.gsm8k import convert_gsm8k_dataset
 from example_datasets.humaneval import convert_humaneval_dataset
+from example_datasets.librispeech import convert_librispeech_dataset
 from example_datasets.math500 import convert_math500_dataset
 from example_datasets.mmlu import convert_mmlu_dataset
 from example_datasets.mmlu_pro import convert_mmlu_pro_dataset
@@ -56,8 +58,10 @@ from example_datasets.tts_eval import (convert_minimax_multilingual_dataset,
 # Default dataset mappings (HuggingFace repo ID or local path)
 DEFAULT_DATASETS = {
     "AIME": "Maxwell-Jia/AIME_2024",
+    "COCO": "lmms-lab/COCO-Caption2017",
     "GSM8K": "openai/gsm8k",
     "HumanEval": "openai/openai_humaneval",
+    "LibriSpeech": "openslr/librispeech_asr",
     "MATH500": "HuggingFaceH4/MATH-500",
     "MMLU": "cais/mmlu",
     "MMLU_Pro": "TIGER-Lab/MMLU-Pro",
@@ -82,8 +86,10 @@ LOCAL_ONLY_DATASETS = {
 # Default max_generate_length for each dataset
 DEFAULT_MAX_GENERATE_LENGTHS = {
     "AIME": 512,
+    "COCO": 64,
     "GSM8K": 512,
     "HumanEval": 512,
+    "LibriSpeech": 256,
     "MATH500": 512,
     "MMLU": 1,
     "MMLU_Pro": 1,
@@ -160,10 +166,11 @@ def main():
                         type=str,
                         required=True,
                         choices=[
-                            "AIME", "GSM8K", "HumanEval", "MATH500", "MMLU",
-                            "MMLU_Pro", "MMMU", "MMMU_VLMEvalkit", "MMMU_Pro",
-                            "MMStar", "MTBench", "SeedTTSEval",
-                            "MiniMaxMultilingual", "OmniBench"
+                            "AIME", "COCO", "GSM8K", "HumanEval",
+                            "LibriSpeech", "MATH500", "MMLU", "MMLU_Pro",
+                            "MMMU", "MMMU_VLMEvalkit", "MMMU_Pro", "MMStar",
+                            "MTBench", "SeedTTSEval", "MiniMaxMultilingual",
+                            "OmniBench"
                         ],
                         help="Dataset type to convert")
 
@@ -355,6 +362,18 @@ def main():
                                       dataset_name_or_dir=dataset_path,
                                       output_dir=args.output_dir,
                                       max_samples=args.max_samples)
+
+        elif args.dataset == "COCO":
+            convert_coco_dataset(config=config,
+                                 dataset_name_or_dir=dataset_path,
+                                 output_dir=args.output_dir,
+                                 max_samples=args.max_samples)
+
+        elif args.dataset == "LibriSpeech":
+            convert_librispeech_dataset(config=config,
+                                        dataset_name_or_dir=dataset_path,
+                                        output_dir=args.output_dir,
+                                        max_samples=args.max_samples)
     except Exception as e:
         print(f"Error converting dataset: {e}", file=sys.stderr)
         sys.exit(1)

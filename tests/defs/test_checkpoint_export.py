@@ -53,6 +53,23 @@ _EXTW_FILE_BY_KIND = {
 }
 
 
+def _infer_checkpoint_model_type(test_param: str) -> ModelType:
+    param = test_param.lower()
+    if "alpamayo" in param:
+        return ModelType.VLA
+    if "omni" in param:
+        return ModelType.OMNI
+    if "-tts-" in param or "qwen3-tts" in param:
+        return ModelType.TTS
+    if "-asr-" in param or "qwen3-asr" in param:
+        return ModelType.ASR
+    if ("-vl-" in param or param.startswith("internvl")
+            or "multimodal" in param or "cosmos" in param
+            or "vitfp8" in param):
+        return ModelType.VLM
+    return ModelType.LLM
+
+
 def _extw_cli_kinds(extw_token):
     """Resolve a test_param ``extw_<value>`` token to CLI kinds."""
     if extw_token is None:
@@ -115,8 +132,9 @@ def test_checkpoint_export(test_param: str, test_logger,
                            env_config: EnvironmentConfig):
     """Export a pre-quantized model via tensorrt_edgellm.scripts.export."""
 
-    config = TestConfig.from_param_string(test_param, ModelType.LLM,
-                                          TaskType.EXPORT, env_config)
+    config = TestConfig.from_param_string(
+        test_param, _infer_checkpoint_model_type(test_param), TaskType.EXPORT,
+        env_config)
 
     # Locate source model checkpoint
     torch_dir = config.get_torch_model_dir()
@@ -260,8 +278,9 @@ def test_checkpoint_eagle_export(test_param: str, test_logger,
       2. Draft model -> draft ONNX
     """
 
-    config = TestConfig.from_param_string(test_param, ModelType.LLM,
-                                          TaskType.EXPORT, env_config)
+    config = TestConfig.from_param_string(
+        test_param, _infer_checkpoint_model_type(test_param), TaskType.EXPORT,
+        env_config)
 
     # Locate pre-quantized base model checkpoint
     base_torch_dir = config.get_torch_model_dir()
@@ -360,8 +379,9 @@ def test_checkpoint_dflash_export(test_param: str, test_logger,
                                   env_config: EnvironmentConfig):
     """Export DFlash base + draft models via tensorrt_edgellm.scripts.export."""
 
-    config = TestConfig.from_param_string(test_param, ModelType.LLM,
-                                          TaskType.EXPORT, env_config)
+    config = TestConfig.from_param_string(
+        test_param, _infer_checkpoint_model_type(test_param), TaskType.EXPORT,
+        env_config)
 
     base_torch_dir = config.get_torch_model_dir()
     if not os.path.exists(base_torch_dir):
@@ -453,8 +473,9 @@ def test_checkpoint_mtp_export(test_param: str, test_logger,
                                env_config: EnvironmentConfig):
     """Export MTP base + draft from a single checkpoint via --mtp flag."""
 
-    config = TestConfig.from_param_string(test_param, ModelType.LLM,
-                                          TaskType.EXPORT, env_config)
+    config = TestConfig.from_param_string(
+        test_param, _infer_checkpoint_model_type(test_param), TaskType.EXPORT,
+        env_config)
 
     torch_dir = config.get_torch_model_dir()
     if not os.path.exists(torch_dir):
@@ -531,8 +552,9 @@ def test_checkpoint_lora_export(test_param: str, test_logger,
     lora_model.onnx has additional LoRA nodes.
     """
 
-    config = TestConfig.from_param_string(test_param, ModelType.LLM,
-                                          TaskType.EXPORT, env_config)
+    config = TestConfig.from_param_string(
+        test_param, _infer_checkpoint_model_type(test_param), TaskType.EXPORT,
+        env_config)
 
     torch_dir = config.get_torch_model_dir()
     if not os.path.exists(torch_dir):
