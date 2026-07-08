@@ -2,92 +2,119 @@
 
 ## Status
 
-Implementation-ready, x86 first draft.
+Implemented and validated on x86 and a D7L board through a password-authenticated
+jump host.
 
 ## Goal
 
-Provide a small internal TRT CI entry point that builds Edge-LLM against a
-supplied PRE_BUILT TRT, deploys both artifacts to a separate run host, and runs
-one fixed engine-build-plus-inference E2E case. D7L is deferred until the native
-x86 flow is proven.
+Build Edge-LLM against a supplied PRE_BUILT TRT, hand both artifacts to the run
+target, and run Python E2E engine-build and inference cases for an explicit,
+easy-to-extend model-family list.
 
 ## Public interface
 
 ```bash
-python3 scripts/run_trt_ci.py \
+python3 scripts/run_trt_dependency_ci.py \
   x86 \
   /absolute/trt/prebuilt/on-build-host \
-  ci-user@build-host[:port] \
-  ci-user@run-host[:port]
+  /path/to/build-host.json \
+  /path/to/run-host.json
 ```
 
-The four positional inputs are architecture, TRT location, build-host SSH
-information, and run-host SSH information. The first draft accepts `x86` or
-`x86_64` and rejects D7L clearly.
+The four positional inputs are architecture, TRT location, build-host JSON, and
+run-host JSON. `x86`, `x86_64`, and `d7l` are accepted. A host argument may be
+an inline JSON object or a JSON file. `{"host":"localhost"}` selects a
+`LocalTarget`. Remote objects require `host`, `port`, `user`, and `password`;
+an optional nested `jump_host` object uses the same fields. The script builds
+devtoolkit `RemoteConfig` objects directly and never queries the target registry
+or resolves OpenSSH aliases.
 
-The TRT location is a CodeManager-compatible artifact directory usable as
-Edge-LLM `TRT_PACKAGE_DIR` and passed as an opaque `PRE_BUILT` input. This entry
-point does not inspect or normalize the directory. SSH endpoints use `[user@]host[:port]`; OpenSSH aliases can supply
-identity and ProxyJump settings. The run-host alias is resolved on the build
-host.
+The Edge-LLM source-build target sets CodeManager's `no_nvidia_runtime` flag.
+Consequently, the controller may be a CPU-only local build host while the run
+host supplies the GPU. Passwords should be passed in protected JSON files in CI;
+an empty password selects SSH key authentication.
 
-## Toolkit ownership
+TRT is passed unchanged as a CodeManager `PRE_BUILT` build dependency usable
+as Edge-LLM `TRT_PACKAGE_DIR`. D7L deployment omits build-only static archives
+from the runtime copy; CodeManager still owns the remote deployment.
 
-- `CommandManager`: every local, build-host, and run-host command.
-- `RemoteConnectionManager`: source upload and both SSH connections.
-- `ContainerManager`: Edge-LLM build and run-host test container lifecycles.
-- `CodeManager`: TRT PRE_BUILT binding, Edge-LLM source build, artifact
-  planning, and direct runtime deployment.
+## Process and toolkit ownership
 
-There is no controller-side runtime relay or synthetic deployment result. The
-exact `RunResult` returned by `plan_and_execute()` is passed directly to
-`deploy_runtime(..., preferred_mode=RSYNC)`.
+There is no hidden worker or self-invocation. One controller process owns:
+
+- non-local SSH target handling and CodeManager deployment transport with
+  `RemoteConnectionManager`;
+- TRT binding and Edge-LLM build with `CodeManager.plan_and_execute()` and
+  `ContainerManager`;
+- remote handoff with
+  `CodeManager.deploy_runtime()`: direct rsync on x86 and toolkit-selected
+  NFS/direct-copy fallback on D7L; local handoff uses
+  `CodeManager.write_environment_setup_script()`; and
+- x86 test-container execution on the run target with `ContainerManager`; and
+- direct deployed-runtime execution on D7L, where the board is the run target.
+
+The exact successful `RunResult` is used for either handoff.
+
+## Remote-build path contract
+
+A remote build requires the controller and build host to see the current
+Edge-LLM checkout and TRT directory at the same absolute paths. CodeManager's
+public `deploy_runtime()` API deploys completed artifacts to a run target; it
+does not stage a source checkout to a build host. The current Edge-LLM remote
+build generator also does not sync output back, so these paths must be shared.
 
 ## Flow
 
 ```text
-controller
-  -> stage current Edge-LLM checkout
-  -> RemoteConnectionManager upload to x86 build host
-  -> hidden build-host worker with forwarded TRT Dev Toolkit PYTHONPATH
-       -> CodeManager plan_and_execute(TRT PRE_BUILT, Edge-LLM BUILD)
-       -> CodeManager deploy_runtime(actual RunResult, x86 run host)
-       -> resolve the normalized Edge-LLM CUDA profile
-       -> launch the profile on the run host
-            -> source CodeManager setup_environment.sh
-            -> focused TRT-facing unitTest subset
-            -> Qwen2.5-0.5B FP16 llm_build
-            -> llm_inference with llm_basic.json
-       -> remove the test container
+parse four positional arguments
+  -> parse build/run JSON into local or direct SSH targets
+  -> CodeManager plan_and_execute(TRT PRE_BUILT, Edge-LLM BUILD)
+  -> remote run: CodeManager deploy_runtime(actual RunResult,
+     x86 RSYNC or D7L AUTO)
+     local run: CodeManager write_environment_setup_script(actual RunResult)
+  -> x86: launch the normalized Edge-LLM CUDA profile on the run target
+     D7L: execute directly in the deployed board runtime
+  -> source setup_environment.sh and configure Python E2E paths
+  -> pytest test_engine_build for each configured LLM family
+  -> pytest test_inference with llm_basic for each configured LLM family
+  -> collect remote JUnit, logs, and inference outputs locally
+  -> remove the x86 test container and the script-owned remote workspace
 ```
 
-Edge-LLM is built in-source at
-`<workspace>/run-<id>/runtime/edgellm` and deployed to the identical absolute
-runtime root. This preserves source-relative test resources without separate
-resource copies.
+Edge-LLM is built in the current checkout through CodeManager. Remote x86
+runs deploy below `/tmp/edgellm-trt-ci/run-<id>/runtime`; D7L uses
+`/dev/shm/edgellm-trt-ci/run-<id>/runtime` to leave room for generated engines.
+Local runs use the build result in place. The run target must expose the ONNX tree at
+`/home/edge_llm_cache/trt-ci/onnx` or the caller-supplied
+`TRT_CI_ONNX_DIR` override. `_ONNX_MODELS` maps each test family to its
+HuggingFace repository and Edge-LLM checkpoint-cache path; adding one entry
+schedules engine build and `llm_basic` inference. By default the flow reuses
+existing ONNX. On x86, `--download_onnx` downloads each checkpoint on the run
+host and invokes Edge-LLM checkpoint export in the test container before those
+E2E cases. The active controller Python prefix supplies the
+E2E dependencies and must be visible at the same absolute path on the run host;
+the toolkit-managed container mounts it automatically. Branch, job-count, and local artifact-root
+overrides are optional; the script configures git-trt for noninteractive CI
+without requiring caller environment variables.
 
-The fixed E2E expects the exported ONNX tree under
-`/home/edge_llm_cache/trt-ci/onnx` at the same absolute path on both hosts;
-`TRT_CI_ONNX_DIR` is an optional controller-side override. The public CLI
-remains four positional arguments.
+One CodeManager instance intentionally receives both `exec_target=build_host`
+and `remote_connection_manager=run_host`: the first selects where source is
+built, while the second is the deployment transport for that exact successful
+`RunResult`. For x86 remote tests, `ContainerManager.launch()` and
+`exec_progress()` both receive the run host as `exec_target`, so the container
+is launched and executed remotely rather than launched on the controller.
 
 ## Failure and cleanup
 
-CodeManager and containerized-test failures return nonzero. The test container
-is always removed, while failed workspaces remain for debugging. Successful
-remote workspaces are removed best-effort. Controller logs and streamed worker
-output remain under `artifacts/trt-ci/run-<id>`.
+Every completed flow reports a final `TRT CI validation PASSED` or
+`TRT CI validation FAILED` line with its run ID and artifact path. Failures
+return nonzero. The test container is always removed, and script-owned remote
+workspaces are removed best-effort after either outcome. Controller logs and builds remain under
+`artifacts/trt-ci/run-<id>` or `TRT_CI_ARTIFACTS_DIR`.
 
 ## Focused tests
 
-Fake public toolkit services cover:
-
-- x86 parsing and D7L rejection;
-- SSH aliases, users, ports, and jump-host-preserving resolution;
-- opaque TRT PRE_BUILT and Edge-LLM source target construction;
-- controller source upload and hidden-worker invocation;
-- identity-preserving `plan_and_execute` to `deploy_runtime`;
-- normalized Edge-LLM profile resolution and run-host container lifecycle;
-- setup-environment, unit, engine-build, and inference command construction;
-- run-host status and cleanup behavior; and
-- structural absence of runtime/resource/result copy logic.
+Public-toolkit fakes cover the four arguments, x86/D7L validation, inline/file
+JSON, localhost/direct SSH/jump-host targets, CodeManager targets, one-process
+ordering, remote deployment versus local handoff, test execution, failure
+status, cleanup, registry absence, and hidden worker/self-invocation absence.

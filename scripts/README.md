@@ -32,60 +32,134 @@ python3 scripts/check_oss_release_sanitizer.py
 
 ## TensorRT CI Edge-LLM validation
 
-`run_trt_ci.py` is the x86 first draft of the internal TRT downstream check.
-It takes exactly four positional inputs:
+`run_trt_dependency_ci.py` is the internal x86/D7L TRT downstream check. It takes
+architecture, TRT location, build-host JSON, and run-host JSON:
 
 ```bash
-python3 scripts/run_trt_ci.py \
+python3 scripts/run_trt_dependency_ci.py \
   x86 \
   /absolute/trt/prebuilt/on-build-host \
-  trt-ci@build.example.nvidia.com \
-  trt-ci@run.example.nvidia.com
+  /path/to/build-host.json \
+  /path/to/run-host.json
 ```
 
-The TRT location is a CodeManager-compatible artifact directory usable as
-Edge-LLM `TRT_PACKAGE_DIR`. It is passed directly as `PRE_BUILT`; this script
-neither rebuilds TRT nor inspects or normalizes the directory. SSH endpoints use `[user@]host[:port]` or an OpenSSH host alias.
-Aliases may provide identity and `ProxyJump` settings. Run-host SSH
-configuration must be available on the build host.
+Each host argument may be an inline JSON object or a JSON file.
 
-The script delegates infrastructure work to TRT Dev Toolkit:
+Local host:
 
-1. The controller uses `CommandManager` and `RemoteConnectionManager` to
-   stage this Edge-LLM checkout on the x86 build host.
-2. A build-host worker gives `CodeManager` the TRT `PRE_BUILT` target and an
-   Edge-LLM source `BUILD` target. `ContainerManager` owns the build
-   container.
-3. The exact `RunResult` from `CodeManager.plan_and_execute()` is passed to
-   `CodeManager.deploy_runtime()`, which deploys TRT and Edge-LLM directly to
-   the run host. Runtime artifacts and resources are not relayed through the
-   controller.
-4. The CodeManager-owned `ContainerManager` resolves the normalized Edge-LLM
-   build profile, launches that CUDA container on the run host, sources
-   CodeManager's deployed `setup_environment.sh`, and runs a focused
-   TRT-facing `unitTest` subset, `llm_build`, and `llm_inference`.
+```json
+{
+  "host": "localhost"
+}
+```
 
-The build and run hosts must expose that model's exported ONNX tree at the
-same absolute path,
-`/home/edge_llm_cache/trt-ci/onnx/Qwen2.5-0.5B-Instruct/llm-fp16-fp16`.
-Set `TRT_CI_ONNX_DIR` on the controller to override the ONNX root while
-keeping the public command unchanged. D7L cross-compilation is intentionally
-deferred until this native x86 flow has run successfully in TRT CI.
+Direct SSH target; use an empty password for SSH-key authentication:
 
-Prerequisites:
+```json
+{
+  "host": "compute-host.example.com",
+  "port": 22,
+  "user": "ci-user",
+  "password": ""
+}
+```
 
-- Python 3 and TRT Dev Toolkit on the controller and build host;
-- initialized Edge-LLM submodules on the controller;
-- key/agent/OpenSSH-config authentication from the controller to the build host
-  and from the build host to the run host;
-- TRT container tooling and rsync on the controller/build host; and
-- the shared TRT/git-trt checkout, Docker with the NVIDIA runtime, rsync, and
-  an x86 NVIDIA GPU on the run host. A bare-host CUDA runtime is not required.
+SSH target reached through a jump host:
 
-Each run owns `/tmp/edgellm-trt-ci/run-<id>` on both remote hosts. Failed runs
-retain their workspaces. Successful runs clean them, while controller logs and
-streamed worker output remain under `artifacts/trt-ci/run-<id>`. Set
-`TRT_CI_JOBS`, `TRT_CI_ARTIFACTS_DIR`, or `TRT_CI_ONNX_DIR` only when a
-CI default needs an override. The controller forwards its discovered toolkit
-source path to the build worker; use `TRT_CI_TOOLKIT_PYTHONPATH` only when the
-build host exposes that checkout at a different shared path.
+```json
+{
+  "host": "192.168.1.3",
+  "port": 22,
+  "user": "board-user",
+  "password": "board-password",
+  "jump_host": {
+    "host": "jump-host.example.com",
+    "port": 22,
+    "user": "ci-user",
+    "password": ""
+  }
+}
+```
+
+`jump_host` is optional. The script constructs devtoolkit `RemoteConfig`
+objects directly and never depends on the target registry or OpenSSH aliases.
+Passwords should be supplied through protected JSON files in CI rather than
+inline command arguments.
+
+The accepted architectures are `x86`, `x86_64`, and `d7l`. The TRT directory
+is passed unchanged to CodeManager as a `PRE_BUILT` artifact usable as
+`TRT_PACKAGE_DIR`. Either host can use `{"host":"localhost"}`. For a remote
+build, the checkout and TRT package must be visible at the same absolute paths
+on the controller and build host.
+
+One controller process owns the flow; there is no hidden worker or script
+self-invocation:
+
+1. `CodeManager.plan_and_execute()` binds TRT and builds the current Edge-LLM
+   checkout on the build target through `ContainerManager`. The checkout and
+   TRT package must be visible at the same absolute paths on a remote build
+   host.
+2. The build target's container explicitly
+   disables the NVIDIA runtime, so a local build host does not need a GPU.
+3. `RemoteConnectionManager` supplies direct JSON-configured SSH targets and
+   CodeManager's deployment transport. A remote run uses
+   `CodeManager.deploy_runtime()`; x86 requests direct rsync, while D7L lets
+   the toolkit try NFS before its direct-copy fallbacks. D7L first derives a
+   runtime `RunResult` that omits build-only TRT static archives. A local run
+   uses `CodeManager.write_environment_setup_script()` without a copy.
+4. On x86, the CodeManager-owned `ContainerManager` launches and executes the
+   test container on the run target via its `exec_target`. On D7L, the same
+   Python E2E cases run directly on the deployed board runtime.
+5. Remote JUnit, logs, and inference outputs are copied back to the local
+   artifact directory. Engines remain in the remote run workspace and all
+   script-owned remote workspaces are then removed best-effort.
+
+The model-family map is deliberately local and easy to extend in
+`scripts/run_trt_dependency_ci.py`:
+
+```python
+_ONNX_MODELS = {
+    "Qwen2.5-0.5B-Instruct":
+    ("Qwen/Qwen2.5-0.5B-Instruct", "Qwen2.5-0.5B-Instruct"),
+    "Llama-3.2-1B":
+    ("meta-llama/Llama-3.2-1B-Instruct",
+     "llama-3.2-models/Llama-3.2-1B"),
+}
+```
+
+Each entry supplies the test name, HuggingFace repository, and Edge-LLM source
+checkpoint layout. It schedules ONNX export, engine build, and `llm_basic`
+inference. Pass `--download_onnx` on x86 to download checkpoints on the run host
+and export fresh ONNX in the Edge-LLM test container. The run-host account must
+already have HuggingFace access; Llama requires accepting Meta's license and
+running `hf auth login`. Without the flag, existing ONNX packages are reused.
+C++ unit tests are not built or run by this flow. The controller's active Python environment supplies pytest and the E2E
+dependencies; its prefix must be visible at the same absolute path on the run
+host and is mounted into the x86 test container automatically. D7L runs use
+the board's `python3`, which must provide the Edge-LLM E2E dependencies,
+including `examples/accuracy/requirements.txt` for ROUGE validation.
+
+**Remote-build path requirement:** the controller and build host must see the
+Edge-LLM checkout and supplied TRT directory at identical absolute paths. The
+current CodeManager Edge-LLM remote-build flow does not stage source or sync
+its output back, while deployment reads the controller-visible `RunResult`
+paths.
+
+The run target must expose the ONNX packages required by every configured model
+under `/home/edge_llm_cache/trt-ci/onnx`; `TRT_CI_ONNX_DIR` overrides that
+root. This is the only path override normally
+needed for a local build. `TRT_CI_ARTIFACTS_DIR` is needed only when a remote
+build requires a caller-supplied shared path. `TRT_CI_JOBS` and
+`TRT_CI_BRANCH` are optional tuning overrides; the script makes git-trt
+noninteractive itself. Python 3 and TRT Dev Toolkit are required on the controller.
+Remote targets also require controller-side SSH authentication; the toolkit
+falls back to tar-over-SSH when a board does not provide rsync. Only the run target needs NVIDIA runtime
+support; the build target may be CPU-only. A D7L board is executed directly and
+does not require Docker or git-trt.
+
+The last console line reports `TRT CI validation PASSED` or
+`TRT CI validation FAILED`, together with the run ID and local artifact path.
+Build artifacts and logs remain under `artifacts/trt-ci/run-<id>` or
+`TRT_CI_ARTIFACTS_DIR`. An x86 remote run uses `/tmp/edgellm-trt-ci/run-<id>`; D7L uses
+`/dev/shm/edgellm-trt-ci/run-<id>` so engines do not exhaust the board root
+filesystem. Remote run workspaces are removed best-effort after either outcome.
