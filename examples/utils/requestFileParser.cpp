@@ -24,6 +24,7 @@
 #include "runtime/audioLoader.h"
 #include "runtime/audioUtils.h"
 #include "runtime/imageUtils.h"
+#include "sampler/sampling.h" // kMaxLogprobsK
 
 #include <cmath>
 #include <fstream>
@@ -80,7 +81,8 @@ std::unordered_map<int32_t, float> parseLogitBias(Json const& logitBiasJson, std
 } // namespace
 
 std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGenerationRequest>> parseRequestFile(
-    std::filesystem::path const& inputFilePath, int32_t batchSizeOverride, int64_t maxGenerateLengthOverride)
+    std::filesystem::path const& inputFilePath, int32_t batchSizeOverride, int64_t maxGenerateLengthOverride,
+    int32_t numLogprobsOverride)
 {
     std::vector<rt::LLMGenerationRequest> batchedRequests;
 
@@ -121,6 +123,13 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
     {
         defaultLogitBias = parseLogitBias(inputData["logit_bias"], "logit_bias");
     }
+    // Top-level num_logprobs is the default for every request; a request may raise it.
+    // A CLI override (>= 0) takes precedence over both file levels, mirroring
+    // batchSizeOverride / maxGenerateLengthOverride.
+    int32_t const defaultNumLogprobs
+        = (numLogprobsOverride >= 0) ? numLogprobsOverride : inputData.value("num_logprobs", 0);
+    check::check(defaultNumLogprobs >= 0 && defaultNumLogprobs <= kMaxLogprobsK,
+        format::fmtstr("Invalid num_logprobs value: %d (must be in [0, %d])", defaultNumLogprobs, kMaxLogprobsK));
 
     std::unordered_map<std::string, std::string> loraWeightsMap;
     if (inputData.contains("available_lora_weights") && inputData["available_lora_weights"].is_object())
@@ -154,6 +163,7 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
         batchRequest.applyChatTemplate = applyChatTemplate;
         batchRequest.addGenerationPrompt = addGenerationPrompt;
         batchRequest.enableThinking = enableThinking;
+        batchRequest.numLogprobs = defaultNumLogprobs;
 
         std::string batchLoraWeightsName;
         bool firstInBatch = true;
@@ -174,6 +184,16 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
             {
                 batchRequest.disableSpecDecode = true;
             }
+            // num_logprobs: request value overrides the top-level default (unless a CLI
+            // override is active); applied batch-uniformly (like disable_spec_decode) —
+            // the batch uses the max.
+            int32_t const requestNumLogprobs = (numLogprobsOverride >= 0)
+                ? numLogprobsOverride
+                : requestItem.value("num_logprobs", defaultNumLogprobs);
+            check::check(requestNumLogprobs >= 0 && requestNumLogprobs <= kMaxLogprobsK,
+                format::fmtstr(
+                    "Invalid num_logprobs value: %d (must be in [0, %d])", requestNumLogprobs, kMaxLogprobsK));
+            batchRequest.numLogprobs = std::max(batchRequest.numLogprobs, requestNumLogprobs);
 
             std::string requestLoraName;
             if (requestItem.contains("lora_name") && !requestItem["lora_name"].is_null())

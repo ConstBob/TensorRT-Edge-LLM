@@ -110,6 +110,12 @@ struct DeploymentConfig
     //! Speculative decode only — throws `std::runtime_error` if `specConfig` is not set.
     int32_t effectiveMaxDraftProposalSize() const;
 
+    //! Maximum tokens a single decode round can accept per slot: 1 (vanilla, no specConfig),
+    //! draftingStep + 1 (chain/tree verify: EAGLE / MTP / Gemma4 MTP), or
+    //! min(dflashBlockSize, verifySize) (DFlash block verify). New speculative modes must add a case to the switch in
+    //! the implementation.
+    int32_t maxAcceptedTokensPerRound() const;
+
     //! Return the concrete speculative decoding mode declared by the engine bundle.
     SpecDecodeMode specDecodeMode() const noexcept;
 };

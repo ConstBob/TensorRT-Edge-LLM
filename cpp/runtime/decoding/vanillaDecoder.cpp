@@ -24,6 +24,7 @@
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
 #include "runtime/debug/layerDebugger.h"
+#include "runtime/decoding/decoderUtils.h"
 #include "runtime/decoding/logitBias.h"
 #include "sampler/sampling.h"
 
@@ -129,6 +130,14 @@ bool VanillaDecoder::decodeStep(DecodingInferenceContext& context)
         mapReducedVocabToFullVocab(mRuntime.sampling.indices, mRuntime.sampling.baseVocabMappingTable, context.stream);
     }
 
+    // Enqueue logprobs extraction + D2H before the round's single synchronization so the
+    // copies ride the same sync as the sampled-token D2H below.
+    if (context.numLogprobs > 0)
+    {
+        decoder_utils::enqueueLogprobsD2H(
+            mRuntime.base.pipelineIO.outputLogits, activeBatchSize, mRuntime, context.numLogprobs, context.stream);
+    }
+
     check::check(mRuntime.sampling.hostSelectedTokenIds.reshape({activeBatchSize}), "Tensor reshape failed");
     int32_t* hostSelectedTokenIdsData = mRuntime.sampling.hostSelectedTokenIds.dataPointer<int32_t>();
     CUDA_CHECK(cudaMemcpyAsync(hostSelectedTokenIdsData, mRuntime.sampling.indices.rawPointer(),
@@ -157,6 +166,11 @@ bool VanillaDecoder::decodeStep(DecodingInferenceContext& context)
     {
         context.tokenIds[i].push_back(hostSelectedTokenIdsData[i]);
         context.currentGenerateLengths[i] += 1;
+    }
+
+    if (context.numLogprobs > 0)
+    {
+        decoder_utils::collectLogprobsFromHost(mRuntime, context, activeBatchSize, context.numLogprobs);
     }
 
     return true;

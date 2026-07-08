@@ -422,6 +422,19 @@ RequestResult runOneRequest(rt::LLMInferenceRuntime& runtime, cudaStream_t strea
             std::fwrite(c.text.data(), 1, c.text.size(), stdout);
             std::fflush(stdout);
         }
+
+        // When logprobs were requested (num_logprobs > 0), print each new token's
+        // top-K to stderr — kept off stdout so it does not interleave with the live
+        // text stream. Each entry is (token_id, log-prob).
+        for (auto const& stepEntries : c.logprobs)
+        {
+            std::fprintf(stderr, "[logprobs]");
+            for (auto const& e : stepEntries)
+            {
+                std::fprintf(stderr, " (%d, %.4f)", e.tokenId, e.logprob);
+            }
+            std::fprintf(stderr, "\n");
+        }
         if (c.finished)
         {
             result.finishReason = c.reason;

@@ -78,6 +78,17 @@ struct TokenCallbackInfo
  *  Invoked inside the decode loop after cudaStreamSynchronize. */
 using TokenCallback = std::function<void(TokenCallbackInfo const&)>;
 
+/*! \brief One top-K log-probability entry for a single generated token.
+ *  `piece` is the raw token bytes (Tokenizer::idToPiece), possibly not valid
+ *  UTF-8 on its own (byte-level BPE); filled at assembly time, not on the
+ *  decoder hot path which only writes tokenId/logprob. */
+struct LogprobEntry
+{
+    int32_t tokenId;   //!< Token ID
+    float logprob;     //!< Natural-log probability (<= 0)
+    std::string piece; //!< Raw token bytes; empty until filled at assembly time
+};
+
 /*! \brief LLM Generation Request structure
  */
 struct LLMGenerationRequest
@@ -132,6 +143,10 @@ struct LLMGenerationRequest
     // Always disable speculative decoding for this request even if Eagle Draft engine is loaded.
     bool disableSpecDecode{false};
 
+    //! Number of top log-probabilities to return per generated token (0 = disabled, max = kMaxLogprobsK).
+    //! Logprobs are computed as log(softmax(logits)) and returned in LLMGenerationResponse::logprobs.
+    int32_t numLogprobs{0};
+
     //! Per-slot streaming channels. Size 0 disables streaming globally.
     //! When non-empty the size must equal `requests.size()` and individual entries may be null
     //! to opt out on a per-slot basis. Channels must not already be finished or concurrently
@@ -157,6 +172,9 @@ struct LLMGenerationResponse
 {
     std::vector<std::vector<int32_t>> outputIds; //!< Generated token IDs for each request in the batch
     std::vector<std::string> outputTexts;        //!< Generated text strings for each request in the batch
+    //! Top log-probabilities per generated token: logprobs[batch][step] = [LogprobEntry, ...].
+    //! Sorted by descending probability. Populated only when LLMGenerationRequest::numLogprobs > 0.
+    std::vector<std::vector<std::vector<LogprobEntry>>> logprobs;
     //!< Future trajectory waypoints (e.g. accel, kappa) per batch item; populated when action engine is used
     std::vector<std::vector<FutureTrajectoryPoint>> outputTrajectories;
 

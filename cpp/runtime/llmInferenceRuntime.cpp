@@ -32,6 +32,7 @@
 #include "profiling/timer.h"
 #include "runtime/debug/layerDebugger.h"
 #include "runtime/decoding/decoderRegistry.h"
+#include "runtime/decoding/decoderUtils.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "sampler/sampling.h"
 #include <algorithm>
@@ -230,13 +231,17 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
         : mMaxRuntimeBatchSize * effectiveDraftTopK;
     int32_t const draftSamplingTopK
         = hasDraft && mDeployment.specDecodeMode() == SpecDecodeMode::kDFlash ? 1 : effectiveDraftTopK;
+    mLogprobsMaxBatchDim = mMaxRuntimeBatchSize * mDeployment.maxAcceptedTokensPerRound();
+    int32_t const logprobsWorkspaceSize = static_cast<int32_t>(
+        getExtractTopKLogprobsWorkspaceSize(mLogprobsMaxBatchDim, mDeployment.base.outputVocabSize, kMaxLogprobsK));
     int32_t const maxSamplingWorkspaceSize = hasDraft
         ? std::max({vanillaSamplingWorkspaceSize,
               static_cast<int32_t>(
                   getSelectAllTopKWorkspaceSize(mMaxRuntimeBatchSize, mDeployment.base.outputVocabSize, 1)),
               static_cast<int32_t>(getSelectAllTopKWorkspaceSize(
-                  draftSamplingRows, mDeployment.draft->outputVocabSize, draftSamplingTopK))})
-        : vanillaSamplingWorkspaceSize;
+                  draftSamplingRows, mDeployment.draft->outputVocabSize, draftSamplingTopK)),
+              logprobsWorkspaceSize})
+        : std::max(vanillaSamplingWorkspaceSize, logprobsWorkspaceSize);
 
     try
     {
@@ -265,6 +270,8 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
         // Pre-allocate multimodal indices tensor (used for audio/vision embedding lookup).
         mMultimodalIndices = rt::Tensor({mMaxRuntimeBatchSize, maxInputLength}, rt::DeviceType::kGPU, DataType::kINT32,
             "LLMInferenceRuntime::mMultimodalIndices");
+
+        allocateLogprobsTensors();
     }
     catch (std::exception const& e)
     {
@@ -426,6 +433,24 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
         static_cast<size_t>(audioContextMemorySize), static_cast<size_t>(actionContextMemorySize));
 }
 
+void LLMInferenceRuntime::allocateLogprobsTensors()
+{
+    int32_t const logprobsRows = mMaxRuntimeBatchSize * mDeployment.maxAcceptedTokensPerRound();
+    mDeviceLogprobsValues = rt::Tensor({logprobsRows, kMaxLogprobsK}, rt::DeviceType::kGPU, DataType::kFLOAT,
+        "LLMInferenceRuntime::mDeviceLogprobsValues");
+    mDeviceLogprobsIndices = rt::Tensor({logprobsRows, kMaxLogprobsK}, rt::DeviceType::kGPU, DataType::kINT32,
+        "LLMInferenceRuntime::mDeviceLogprobsIndices");
+    mHostLogprobsValues = rt::Tensor({logprobsRows, kMaxLogprobsK}, rt::DeviceType::kCPU, DataType::kFLOAT,
+        "LLMInferenceRuntime::mHostLogprobsValues");
+    mHostLogprobsIndices = rt::Tensor({logprobsRows, kMaxLogprobsK}, rt::DeviceType::kCPU, DataType::kINT32,
+        "LLMInferenceRuntime::mHostLogprobsIndices");
+    if (mDeployment.specConfig.has_value())
+    {
+        mGatheredLogits = rt::Tensor({logprobsRows, mDeployment.base.outputVocabSize}, rt::DeviceType::kGPU,
+            DataType::kFLOAT, "LLMInferenceRuntime::mGatheredLogits");
+    }
+}
+
 void LLMInferenceRuntime::buildDecodingRuntimeContext()
 {
     BaseEngineResources baseResources{*mBaseExecutor, mBaseTensorMap, *mSharedResources,
@@ -436,8 +461,10 @@ void LLMInferenceRuntime::buildDecodingRuntimeContext()
         *mStepPreparer, *mEmbeddingPre, mEmbedding, mIdsInput, mDeepstack.get(), mGemma4Ple.get()};
     SamplingBuffers sampling{mSamplingWorkspace, mSamplingIndices, mSamplingScores, mBaseVocabMappingTable,
         mHostPackedTokenIds, mHostSelectedTokenIds};
-    mDecodingRuntimeContext.reset(new DecodingRuntimeContext{
-        mDeployment, mMaxRuntimeBatchSize, baseResources, preprocessResources, *mTokenizer, mLogitBias, sampling});
+    LogprobsBuffers logprobs{
+        mDeviceLogprobsValues, mDeviceLogprobsIndices, mHostLogprobsValues, mHostLogprobsIndices, mGatheredLogits};
+    mDecodingRuntimeContext.reset(new DecodingRuntimeContext{mDeployment, mMaxRuntimeBatchSize, baseResources,
+        preprocessResources, *mTokenizer, mLogitBias, sampling, logprobs});
 }
 
 void LLMInferenceRuntime::setActionNoiseSeed(int32_t seed) noexcept
@@ -541,6 +568,22 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     context.onTokenGenerated = request.onTokenGenerated;
 
     prepareLogitBias(mLogitBias, request, context);
+
+    if (request.numLogprobs > static_cast<int32_t>(kMaxLogprobsK))
+    {
+        LOG_WARNING("numLogprobs %d exceeds maximum %d; clamping.", request.numLogprobs, kMaxLogprobsK);
+    }
+    context.numLogprobs = std::min(request.numLogprobs, static_cast<int32_t>(kMaxLogprobsK));
+    if (context.numLogprobs > 0)
+    {
+        // Spec-decode verify may accept more than 1 token in one step, overshooting maxGenerateLength.
+        int32_t const overshoot = mDeployment.maxAcceptedTokensPerRound() - 1;
+        for (auto& slot : context.stepLogprobs)
+        {
+            slot.data.resize(static_cast<size_t>(context.maxGenerateLength + overshoot) * context.numLogprobs);
+            slot.numSteps = 0;
+        }
+    }
 
     // Forward per-slot stop strings and cache the longest length to avoid
     // recomputing it on every emitChunks iteration.
@@ -824,7 +867,7 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     updateThinkingDone();
 
     updateFinishStates();
-    emitChunks(context);
+    emitChunks(context, *mTokenizer);
 
     // If everything finished during prefill, evict once so activeBatchSize reaches 0
     if (checkAllFinished() && context.activeBatchSize > 0)
@@ -857,7 +900,7 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
         updateThinkingDone();
 
         updateFinishStates();
-        emitChunks(context);
+        emitChunks(context, *mTokenizer);
 
         emitTokenCallbacks(context);
         context.generationRound += 1;
@@ -911,10 +954,11 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
         mGenerationMetrics.recordRun(totalGeneratedTokens);
     }
 
-    // Save output ids and decoded texts to response.
+    // Save output ids, decoded texts, and logprobs to response.
     // Maintain original batch order using original batch indices.
     response.outputIds.resize(context.completedBatches.size());
     response.outputTexts.resize(context.completedBatches.size());
+    response.logprobs.resize(context.completedBatches.size());
     response.outputTrajectories.resize(context.completedBatches.size());
     response.finishReasons.resize(context.completedBatches.size(), FinishReason::kNotFinished);
 
@@ -944,6 +988,7 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
             batchResult.tokenIds.begin() + (totalLength - genLength), batchResult.tokenIds.end());
         response.outputTexts[originalIdx] = mTokenizer->decode(response.outputIds[originalIdx], true);
         response.finishReasons[originalIdx] = batchResult.terminalReason;
+        response.logprobs[originalIdx] = batchResult.logprobs;
 
         // Trim this slot's own stop strings from its output text by delegating
         // to applyStopStringMatch with isFinal=true — single source of truth
@@ -1314,6 +1359,14 @@ bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context)
         mapReducedVocabToFullVocab(mSamplingIndices, mBaseVocabMappingTable, context.stream);
     }
 
+    // Enqueue logprobs extraction + D2H before the round's single synchronization so the
+    // copies ride the same sync as the sampled-token D2H below.
+    if (context.numLogprobs > 0)
+    {
+        decoder_utils::enqueueLogprobsD2H(mDecodingRuntimeContext->base.pipelineIO.outputLogits, activeBatchSize,
+            *mDecodingRuntimeContext, context.numLogprobs, context.stream);
+    }
+
     check::check(mHostSelectedTokenIds.reshape({activeBatchSize}), "Tensor reshape failed");
     int32_t* hostSelectedTokenIdsData = mHostSelectedTokenIds.dataPointer<int32_t>();
     CUDA_CHECK(cudaMemcpyAsync(hostSelectedTokenIdsData, mSamplingIndices.rawPointer(),
@@ -1347,6 +1400,12 @@ bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context)
             context.currentGenerateLengths[i] += 1;
         }
     }
+
+    if (context.numLogprobs > 0)
+    {
+        decoder_utils::collectLogprobsFromHost(*mDecodingRuntimeContext, context, activeBatchSize, context.numLogprobs);
+    }
+
     emitTokenCallbacks(context);
     return true;
 }
@@ -1813,6 +1872,21 @@ bool LLMInferenceRuntime::performBatchEvict(DecodingInferenceContext& context, D
             result.rawBatchedInputIds = std::move(context.rawBatchedInputIds[i]);
             result.effectivePrefillLength = context.effectivePrefillLengths[i];
             result.terminalReason = context.slotStreams[i].terminalReason;
+            // Convert flat LogprobsSlot → nested vector for BatchResult (once per completed request).
+            // Enrich each (token_id, logprob) with the raw token piece so consumers can render the
+            // token string / bytes without needing a tokenizer (see LogprobEntry).
+            rt::LogprobsSlot const& slot = context.stepLogprobs[i];
+            result.logprobs.resize(slot.numSteps);
+            for (int32_t step = 0; step < slot.numSteps; ++step)
+            {
+                auto const* begin = slot.data.data() + step * context.numLogprobs;
+                auto& stepEntries = result.logprobs[step];
+                stepEntries.reserve(context.numLogprobs);
+                for (int32_t k = 0; k < context.numLogprobs; ++k)
+                {
+                    stepEntries.push_back({begin[k].first, begin[k].second, mTokenizer->idToPiece(begin[k].first)});
+                }
+            }
 
             context.completedBatches[originalIdx] = std::move(result);
         }
@@ -1831,6 +1905,7 @@ bool LLMInferenceRuntime::performBatchEvict(DecodingInferenceContext& context, D
     context.hasLogitBias = std::any_of(context.logitBiasPerSlot.begin(), context.logitBiasPerSlot.end(),
         [](auto const& slotLogitBias) { return !slotLogitBias.empty(); });
     context.logitBiasGpuDirty = context.hasLogitBias;
+    rt::compactVector(batchMapping, context.stepLogprobs);
 
     // Update active batch size
     context.activeBatchSize = newActiveBatch;

@@ -353,6 +353,225 @@ print('SERVER_STREAMING_PASSED')
                 f"Server streaming did not produce expected output. Output:\n{output}"
             )
 
+    def test_server_inference_with_logprobs(
+            self, test_param: str, executable_files: Dict[str, str],
+            remote_config: Optional[RemoteConfig], test_logger: logging.Logger,
+            env_config: EnvironmentConfig) -> None:
+        """Test non-streaming inference returns per-token logprobs via pybind."""
+        config = TestConfig.from_param_string(test_param, ModelType.LLM,
+                                              TaskType.INFERENCE, env_config)
+        engine_dir = config.get_llm_engine_dir()
+        test_logger.info("Server inference with logprobs: engine=%s",
+                         engine_dir)
+
+        pybind_build_dir = os.path.join(env_config.build_dir, "pybind")
+        prompt = "Count from 1 to 5."
+        max_tokens = 32
+        num_logprobs = 3
+
+        script = f"""\
+import sys, os
+sys.path.insert(0, os.getcwd())
+sys.path.insert(0, {pybind_build_dir!r})
+import importlib.util
+so_files = [f for f in os.listdir({pybind_build_dir!r}) if '_edgellm_runtime' in f and f.endswith('.so')]
+if not so_files:
+    raise RuntimeError('_edgellm_runtime.so not found in ' + {pybind_build_dir!r})
+spec = importlib.util.spec_from_file_location('_edgellm_runtime', os.path.join({pybind_build_dir!r}, so_files[0]))
+rt = importlib.util.module_from_spec(spec)
+sys.modules['_edgellm_runtime'] = rt  # so api_server/engine reuse this exact module
+spec.loader.exec_module(rt)
+
+engine_dir = {engine_dir!r}
+runtime = rt.LLMRuntime(engine_dir, '', {{}})
+runtime.capture_decoding_cuda_graph()
+
+request = rt.LLMGenerationRequest()
+msg = rt.Message()
+msg.role = 'user'
+msg.contents = [rt.MessageContent('text', {prompt!r})]
+req = rt.Request(messages=[msg])
+req.image_buffers = []
+request.requests = [req]
+request.temperature = 0.0
+request.top_p = 1.0
+request.top_k = 1
+request.max_generate_length = {max_tokens}
+request.apply_chat_template = True
+request.add_generation_prompt = True
+request.num_logprobs = {num_logprobs}
+
+response = runtime.handle_request(request)
+ids = response.output_ids[0] if response.output_ids else []
+lps = response.logprobs[0] if response.logprobs else []
+print(f'OUTPUT_IDS_LEN={{len(ids)}}')
+print(f'LOGPROBS_STEPS={{len(lps)}}')
+assert len(ids) > 0, 'Empty output ids'
+assert len(lps) == len(ids), f'logprobs steps {{len(lps)}} != token count {{len(ids)}}'
+for step in lps:
+    assert len(step) == {num_logprobs}, f'Expected {num_logprobs} entries per step, got {{len(step)}}'
+    for e in step:
+        assert isinstance(e.token_id, int) and e.token_id >= 0, f'Bad token_id {{e.token_id}}'
+        assert e.logprob <= 0.0, f'logprob should be <= 0, got {{e.logprob}}'
+        assert isinstance(e.piece, bytes), f'piece should be bytes, got {{type(e.piece)}}'
+
+# Also exercise the OpenAI-compatible formatting layer on the same raw response.
+from experimental.server import api_server
+obj = api_server._format_logprobs(response)
+assert obj is not None and 'content' in obj, f'missing content: {{obj}}'
+oc = obj['content']
+assert len(oc) == len(ids), f'content {{len(oc)}} != token count {{len(ids)}}'
+for c in oc:
+    assert set(c) >= {{'token', 'token_id', 'bytes', 'logprob', 'top_logprobs'}}, f'missing keys: {{sorted(c)}}'
+    assert isinstance(c['token'], str) and isinstance(c['token_id'], int) and isinstance(c['bytes'], list)
+    assert c['logprob'] is None or c['logprob'] <= 0.0, f'bad chosen logprob {{c["logprob"]}}'
+    top = c['top_logprobs']
+    assert len(top) == {num_logprobs}, f'expected {num_logprobs} top_logprobs, got {{len(top)}}'
+    for t in top:
+        assert set(t) >= {{'token', 'token_id', 'bytes', 'logprob'}}, f'missing top keys: {{sorted(t)}}'
+        assert isinstance(t['token'], str) and isinstance(t['bytes'], list) and t['logprob'] <= 0.0
+print('SERVER_INFERENCE_LOGPROBS_PASSED')
+"""
+        script_escaped = shlex.quote(script)
+        cmd = ['bash', '-c', f'python3 -c {script_escaped}']
+
+        env_vars = None
+        if env_config.trt_package_dir:
+            trt_lib = f"{env_config.trt_package_dir}/lib"
+            env_vars = {"LD_LIBRARY_PATH": f"$LD_LIBRARY_PATH:{trt_lib}"}
+
+        with timer_context(
+                f"Server inference with logprobs for {config.model_name}",
+                test_logger,
+        ):
+            result = run_command(cmd=cmd,
+                                 remote_config=remote_config,
+                                 timeout=600,
+                                 logger=test_logger,
+                                 env_vars=env_vars)
+
+        if not result['success']:
+            pytest.fail(
+                f"Server inference with logprobs failed: {result.get('error', 'Unknown')}"
+            )
+
+        if 'SERVER_INFERENCE_LOGPROBS_PASSED' not in result.get('output', ''):
+            pytest.fail(
+                f"Server inference logprobs output:\n{result.get('output', '')}"
+            )
+
+    def test_server_streaming_with_logprobs(
+            self, test_param: str, executable_files: Dict[str, str],
+            remote_config: Optional[RemoteConfig], test_logger: logging.Logger,
+            env_config: EnvironmentConfig) -> None:
+        """Test streaming inference delivers per-token logprobs on each chunk via pybind."""
+        config = TestConfig.from_param_string(test_param, ModelType.LLM,
+                                              TaskType.INFERENCE, env_config)
+        engine_dir = config.get_llm_engine_dir()
+        test_logger.info("Server streaming with logprobs: engine=%s",
+                         engine_dir)
+
+        pybind_build_dir = os.path.join(env_config.build_dir, "pybind")
+        prompt = "Count from 1 to 5."
+        max_tokens = 32
+        num_logprobs = 3
+
+        script = f"""\
+import sys, os, threading
+sys.path.insert(0, {pybind_build_dir!r})
+import importlib.util
+so_files = [f for f in os.listdir({pybind_build_dir!r}) if '_edgellm_runtime' in f and f.endswith('.so')]
+if not so_files:
+    raise RuntimeError('_edgellm_runtime.so not found in ' + {pybind_build_dir!r})
+spec = importlib.util.spec_from_file_location('_edgellm_runtime', os.path.join({pybind_build_dir!r}, so_files[0]))
+rt = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(rt)
+
+engine_dir = {engine_dir!r}
+runtime = rt.LLMRuntime(engine_dir, '', {{}})
+runtime.capture_decoding_cuda_graph()
+
+channel = rt.StreamChannel.create()
+channel.set_skip_special_tokens(True)
+
+request = rt.LLMGenerationRequest()
+msg = rt.Message()
+msg.role = 'user'
+msg.contents = [rt.MessageContent('text', {prompt!r})]
+req = rt.Request(messages=[msg])
+req.image_buffers = []
+request.requests = [req]
+request.stream_channels = [channel]
+request.temperature = 0.0
+request.top_p = 1.0
+request.top_k = 1
+request.max_generate_length = {max_tokens}
+request.apply_chat_template = True
+request.add_generation_prompt = True
+request.num_logprobs = {num_logprobs}
+
+def run_inference():
+    runtime.handle_request(request)
+
+worker = threading.Thread(target=run_inference, daemon=True)
+worker.start()
+
+chunks = []
+while True:
+    chunk = channel.wait_pop(timeout_ms=500)
+    if chunk is None:
+        if channel.is_finished() or channel.is_cancelled():
+            break
+        continue
+    chunks.append(chunk)
+    if chunk.finished:
+        break
+
+worker.join(timeout=10)
+
+total_tokens = sum(len(c.token_ids) for c in chunks)
+total_lp_steps = sum(len(c.logprobs) for c in chunks)
+print(f'STREAM_TOTAL_TOKENS={{total_tokens}}')
+print(f'STREAM_TOTAL_LP_STEPS={{total_lp_steps}}')
+assert total_tokens > 0, 'No tokens received'
+assert total_lp_steps == total_tokens, f'logprob steps {{total_lp_steps}} != token count {{total_tokens}}'
+for chunk in chunks:
+    for step in chunk.logprobs:
+        assert len(step) == {num_logprobs}, f'Expected {num_logprobs} entries per step, got {{len(step)}}'
+        for e in step:
+            assert isinstance(e.token_id, int) and e.token_id >= 0, f'Bad token_id {{e.token_id}}'
+            assert e.logprob <= 0.0, f'logprob should be <= 0, got {{e.logprob}}'
+            assert isinstance(e.piece, bytes), f'piece should be bytes, got {{type(e.piece)}}'
+print('SERVER_STREAMING_LOGPROBS_PASSED')
+"""
+        script_escaped = shlex.quote(script)
+        cmd = ['bash', '-c', f'python3 -c {script_escaped}']
+
+        env_vars = None
+        if env_config.trt_package_dir:
+            trt_lib = f"{env_config.trt_package_dir}/lib"
+            env_vars = {"LD_LIBRARY_PATH": f"$LD_LIBRARY_PATH:{trt_lib}"}
+
+        with timer_context(
+                f"Server streaming with logprobs for {config.model_name}",
+                test_logger,
+        ):
+            result = run_command(cmd=cmd,
+                                 remote_config=remote_config,
+                                 timeout=600,
+                                 logger=test_logger,
+                                 env_vars=env_vars)
+
+        if not result['success']:
+            pytest.fail(
+                f"Server streaming with logprobs failed: {result.get('error', 'Unknown')}"
+            )
+
+        if 'SERVER_STREAMING_LOGPROBS_PASSED' not in result.get('output', ''):
+            pytest.fail(
+                f"Server streaming logprobs output:\n{result.get('output', '')}"
+            )
+
     def test_server_inference_with_stop(self, test_param: str,
                                         executable_files: Dict[str, str],
                                         remote_config: Optional[RemoteConfig],
@@ -675,6 +894,74 @@ print('HLAPI_GENERATE_PASSED')
                 f"HLAPI generate did not produce expected output. Output:\n{output}"
             )
 
+    def test_hlapi_generate_with_logprobs(
+            self, test_param: str, executable_files: Dict[str, str],
+            remote_config: Optional[RemoteConfig], test_logger: logging.Logger,
+            env_config: EnvironmentConfig) -> None:
+        """Test LLM.generate() returns per-token logprobs when num_logprobs > 0."""
+        config = TestConfig.from_param_string(test_param, ModelType.LLM,
+                                              TaskType.INFERENCE, env_config)
+        engine_dir = config.get_llm_engine_dir()
+        test_logger.info("HLAPI generate with logprobs: engine=%s", engine_dir)
+
+        prompt = "Count from 1 to 5."
+        max_tokens = 32
+        num_logprobs = 3
+        setup = self._build_hlapi_env_setup(env_config.trt_package_dir or "")
+
+        script = f"""\
+{setup}
+from experimental.server import LLM, SamplingParams
+
+llm = LLM(engine_dir={engine_dir!r})
+outputs = llm.generate(
+    [[{{"role": "user", "content": {prompt!r}}}]],
+    SamplingParams(temperature=0.0, top_p=1.0, top_k=1, max_tokens={max_tokens},
+                   num_logprobs={num_logprobs}),
+)
+out = outputs[0]
+ids = out.token_ids
+lps = out.logprobs
+print(f'HLAPI_IDS_LEN={{len(ids)}}')
+print(f'HLAPI_LOGPROBS_STEPS={{len(lps)}}')
+assert len(ids) > 0, 'Empty output token ids'
+assert len(lps) == len(ids), f'logprobs steps {{len(lps)}} != token count {{len(ids)}}'
+for step in lps:
+    assert len(step) == {num_logprobs}, f'Expected {num_logprobs} entries per step, got {{len(step)}}'
+    for e in step:
+        assert isinstance(e.token_id, int) and e.token_id >= 0, f'Bad token_id {{e.token_id}}'
+        assert e.logprob <= 0.0, f'logprob should be <= 0, got {{e.logprob}}'
+        assert isinstance(e.token, str), f'token should be str, got {{type(e.token)}}'
+        assert isinstance(e.bytes, list), f'bytes should be list, got {{type(e.bytes)}}'
+print('HLAPI_GENERATE_LOGPROBS_PASSED')
+"""
+        script_escaped = shlex.quote(script)
+        cmd = ['bash', '-c', f'python3 -c {script_escaped}']
+
+        env_vars = None
+        if env_config.trt_package_dir:
+            trt_lib = f"{env_config.trt_package_dir}/lib"
+            env_vars = {"LD_LIBRARY_PATH": f"$LD_LIBRARY_PATH:{trt_lib}"}
+
+        with timer_context(
+                f"HLAPI generate with logprobs for {config.model_name}",
+                test_logger,
+        ):
+            result = run_command(cmd=cmd,
+                                 remote_config=remote_config,
+                                 timeout=600,
+                                 logger=test_logger,
+                                 env_vars=env_vars)
+
+        if not result['success']:
+            pytest.fail(
+                f"HLAPI generate with logprobs failed: {result.get('error', 'Unknown')}"
+            )
+
+        if 'HLAPI_GENERATE_LOGPROBS_PASSED' not in result.get('output', ''):
+            pytest.fail(
+                f"HLAPI generate logprobs output:\n{result.get('output', '')}")
+
     def test_hlapi_generate_with_audio(self, test_param: str,
                                        executable_files: Dict[str, str],
                                        remote_config: Optional[RemoteConfig],
@@ -938,6 +1225,103 @@ print('HLAPI_STREAMING_PASSED')
         if 'HLAPI_STREAMING_PASSED' not in output:
             pytest.fail(
                 f"HLAPI streaming did not produce expected output. Output:\n{output}"
+            )
+
+    def test_hlapi_streaming_with_logprobs(
+            self, test_param: str, executable_files: Dict[str, str],
+            remote_config: Optional[RemoteConfig], test_logger: logging.Logger,
+            env_config: EnvironmentConfig) -> None:
+        """Test LLM.generate_stream() delivers per-token logprobs matching token count."""
+        config = TestConfig.from_param_string(test_param, ModelType.LLM,
+                                              TaskType.INFERENCE, env_config)
+        engine_dir = config.get_llm_engine_dir()
+        test_logger.info("HLAPI streaming with logprobs: engine=%s",
+                         engine_dir)
+
+        prompt = "Count from 1 to 5."
+        max_tokens = 32
+        num_logprobs = 3
+        setup = self._build_hlapi_env_setup(env_config.trt_package_dir or "")
+
+        script = f"""\
+{setup}
+from experimental.server import LLM, SamplingParams
+
+llm = LLM(engine_dir={engine_dir!r})
+chunks = list(llm.generate_stream(
+    [{{"role": "user", "content": {prompt!r}}}],
+    SamplingParams(temperature=0.0, top_p=1.0, top_k=1, max_tokens={max_tokens},
+                   num_logprobs={num_logprobs}),
+))
+total_tokens = sum(len(c.token_ids) for c in chunks)
+total_lp_steps = sum(len(c.logprobs) for c in chunks)
+print(f'HLAPI_STREAM_TOTAL_TOKENS={{total_tokens}}')
+print(f'HLAPI_STREAM_TOTAL_LP_STEPS={{total_lp_steps}}')
+assert total_tokens > 0, 'No tokens received'
+assert total_lp_steps == total_tokens, f'logprob steps {{total_lp_steps}} != token count {{total_tokens}}'
+for chunk in chunks:
+    for step in chunk.logprobs:
+        assert len(step) == {num_logprobs}, f'Expected {num_logprobs} entries per step, got {{len(step)}}'
+        for e in step:
+            assert isinstance(e.token_id, int) and e.token_id >= 0, f'Bad token_id {{e.token_id}}'
+            assert e.logprob <= 0.0, f'logprob should be <= 0, got {{e.logprob}}'
+            assert isinstance(e.token, str), f'token should be str, got {{type(e.token)}}'
+            assert isinstance(e.bytes, list), f'bytes should be list, got {{type(e.bytes)}}'
+
+# Also exercise the SSE formatting layer on the same engine: streaming
+# choices[0].logprobs must be the OpenAI object shape {{"content": [...]}} with
+# nested top_logprobs, mirroring the non-streaming _format_logprobs.
+import json as _json
+from experimental.server import api_server
+from experimental.server.tool_calling import validate_tool_request
+_msgs = [{{"role": "user", "content": {prompt!r}}}]
+_tc = validate_tool_request(_msgs, None, None)
+lp_objs = []
+for sse in api_server._generate_stream_sse(
+        llm, _msgs,
+        SamplingParams(temperature=0.0, top_p=1.0, top_k=1, max_tokens={max_tokens},
+                       num_logprobs={num_logprobs}),
+        'chatcmpl-test', False, tool_config=_tc):
+    if not sse.startswith('data: ') or sse.strip() == 'data: [DONE]':
+        continue
+    _choice = _json.loads(sse[len('data: '):].strip())['choices'][0]
+    assert 'logprobs' not in _choice.get('delta', {{}}), 'logprobs must not live inside delta'
+    if _choice.get('logprobs') is not None:
+        lp_objs.append(_choice['logprobs'])
+assert lp_objs, 'no logprobs found in any SSE chunk'
+for lp in lp_objs:
+    assert isinstance(lp, dict) and 'content' in lp, f'SSE logprobs not OpenAI-shaped: {{lp}}'
+    for c in lp['content']:
+        assert set(c) >= {{'token', 'token_id', 'bytes', 'logprob', 'top_logprobs'}}, f'missing keys: {{sorted(c)}}'
+        assert len(c['top_logprobs']) == {num_logprobs}, f'expected {num_logprobs} top_logprobs, got {{len(c["top_logprobs"])}}'
+print('HLAPI_STREAMING_LOGPROBS_PASSED')
+"""
+        script_escaped = shlex.quote(script)
+        cmd = ['bash', '-c', f'python3 -c {script_escaped}']
+
+        env_vars = None
+        if env_config.trt_package_dir:
+            trt_lib = f"{env_config.trt_package_dir}/lib"
+            env_vars = {"LD_LIBRARY_PATH": f"$LD_LIBRARY_PATH:{trt_lib}"}
+
+        with timer_context(
+                f"HLAPI streaming with logprobs for {config.model_name}",
+                test_logger,
+        ):
+            result = run_command(cmd=cmd,
+                                 remote_config=remote_config,
+                                 timeout=600,
+                                 logger=test_logger,
+                                 env_vars=env_vars)
+
+        if not result['success']:
+            pytest.fail(
+                f"HLAPI streaming with logprobs failed: {result.get('error', 'Unknown')}"
+            )
+
+        if 'HLAPI_STREAMING_LOGPROBS_PASSED' not in result.get('output', ''):
+            pytest.fail(
+                f"HLAPI streaming logprobs output:\n{result.get('output', '')}"
             )
 
     def test_hlapi_generate_with_stop(self, test_param: str,

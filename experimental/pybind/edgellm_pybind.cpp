@@ -381,6 +381,14 @@ PYBIND11_MODULE(_edgellm_runtime, m)
     // ========================================================================
     // Request / Response
     // ========================================================================
+    // One top-K logprob entry. `piece` is exposed as bytes (raw token bytes may
+    // not be valid UTF-8 for byte-level BPE tokens); decode on the Python side
+    // with errors="replace" for a display string.
+    py::class_<LogprobEntry>(m, "LogprobEntry")
+        .def_readonly("token_id", &LogprobEntry::tokenId)
+        .def_readonly("logprob", &LogprobEntry::logprob)
+        .def_property_readonly("piece", [](LogprobEntry const& e) { return py::bytes(e.piece); });
+
     py::class_<LLMGenerationRequest::FormattedRequest>(m, "FormattedRequest")
         .def(py::init<>())
         .def_readwrite("formatted_system_prompt", &LLMGenerationRequest::FormattedRequest::formattedSystemPrompt)
@@ -416,7 +424,8 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readonly("token_ids", &StreamChunk::tokenIds)
         .def_readonly("text", &StreamChunk::text)
         .def_readonly("finished", &StreamChunk::finished)
-        .def_readonly("reason", &StreamChunk::reason);
+        .def_readonly("reason", &StreamChunk::reason)
+        .def_readonly("logprobs", &StreamChunk::logprobs);
 
     py::class_<StreamChannel, std::shared_ptr<StreamChannel>>(m, "StreamChannel")
         .def_static("create", &StreamChannel::create)
@@ -451,12 +460,14 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readwrite("add_generation_prompt", &LLMGenerationRequest::addGenerationPrompt)
         .def_readwrite("enable_thinking", &LLMGenerationRequest::enableThinking)
         .def_readwrite("disable_spec_decode", &LLMGenerationRequest::disableSpecDecode)
-        .def_readwrite("stream_channels", &LLMGenerationRequest::streamChannels);
+        .def_readwrite("stream_channels", &LLMGenerationRequest::streamChannels)
+        .def_readwrite("num_logprobs", &LLMGenerationRequest::numLogprobs);
 
     py::class_<LLMGenerationResponse>(m, "LLMGenerationResponse")
         .def(py::init<>())
         .def_readwrite("output_ids", &LLMGenerationResponse::outputIds)
         .def_readwrite("output_texts", &LLMGenerationResponse::outputTexts)
+        .def_readwrite("logprobs", &LLMGenerationResponse::logprobs)
         .def_readonly("finish_reasons", &LLMGenerationResponse::finishReasons);
 
     // ========================================================================
@@ -537,7 +548,7 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         [](std::vector<std::vector<Message>> const& batchMessages, float temperature, float topP, int64_t topK,
             int64_t maxGenerateLength, bool applyChatTemplate, bool addGenerationPrompt, bool enableThinking,
             std::string const& loraWeightsName, bool saveSystemPromptKvCache, bool disableSpecDecode,
-            std::unordered_map<int32_t, float> const& logitBias) {
+            std::unordered_map<int32_t, float> const& logitBias, int32_t numLogprobs) {
             LLMGenerationRequest request;
             request.temperature = temperature;
             request.topP = topP;
@@ -549,6 +560,7 @@ PYBIND11_MODULE(_edgellm_runtime, m)
             request.loraWeightsName = loraWeightsName;
             request.saveSystemPromptKVCache = saveSystemPromptKvCache;
             request.disableSpecDecode = disableSpecDecode;
+            request.numLogprobs = numLogprobs;
 
             for (auto const& messages : batchMessages)
             {
@@ -563,6 +575,6 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         py::arg("max_generate_length") = 256, py::arg("apply_chat_template") = true,
         py::arg("add_generation_prompt") = true, py::arg("enable_thinking") = false, py::arg("lora_weights_name") = "",
         py::arg("save_system_prompt_kv_cache") = false, py::arg("disable_spec_decode") = false,
-        py::arg("logit_bias") = std::unordered_map<int32_t, float>{},
+        py::arg("logit_bias") = std::unordered_map<int32_t, float>{}, py::arg("num_logprobs") = 0,
         "Create a generation request from a batch of message lists.");
 }

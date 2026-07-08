@@ -207,6 +207,20 @@ SpecDecodeMode DeploymentConfig::specDecodeMode() const noexcept
     return base.specDecodeType;
 }
 
+int32_t DeploymentConfig::maxAcceptedTokensPerRound() const
+{
+    switch (specDecodeMode())
+    {
+    case SpecDecodeMode::kNONE: return 1;
+    case SpecDecodeMode::kEAGLE:
+    case SpecDecodeMode::kMTP:
+    case SpecDecodeMode::kGemma4MTP: return specConfig->draftingStep + 1;
+    case SpecDecodeMode::kDFlash: return std::min(specConfig->verifySize, specConfig->dflashBlockSize);
+    }
+    ELLM_CHECK(false, "maxAcceptedTokensPerRound: unhandled SpecDecodeMode");
+    return 1;
+}
+
 DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigPath,
     std::optional<std::filesystem::path> const& draftConfigPath,
     std::optional<SpecDecodeDraftingConfig> const& draftingConfig)
