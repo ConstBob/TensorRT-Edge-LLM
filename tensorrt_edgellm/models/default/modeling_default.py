@@ -235,10 +235,11 @@ class Attention(nn.Module):
                                   bias=config.attention_bias,
                                   module_name=f"{module_prefix}.v_proj",
                                   tp_mode=TPMode.COL)
-        # FP8 KV-cache scales live on the proj modules (checkpoint keys
-        # ``...k_proj.k_scale`` / ``...v_proj.v_scale``); they are not part of
-        # FP8Linear's per-tensor weight/input scales.
+        # FP8 attention scales live on the projection modules (checkpoint keys
+        # ``...{q,k,v}_proj.{q,k,v}_scale``); they are not part of FP8Linear's
+        # per-tensor weight/input scales.
         if self.enable_fp8_kv_cache:
+            self.q_proj.register_buffer("q_scale", torch.ones(1))
             self.k_proj.register_buffer("k_scale", torch.ones(1))
             self.v_proj.register_buffer("v_scale", torch.ones(1))
 

@@ -436,19 +436,20 @@ def _setup_fp8kv_scales_for_export(model: "CausalLM") -> None:
     compile-time constants during export.
 
     Stored attribute: ``module._qkv_scales_float = [q, k, v]``
-      - q_scale : 1.0 (not stored in any current checkpoint)
+      - q_scale : ``q_proj.q_scale`` buffer value if present, else 1.0
       - k_scale : ``k_proj.k_scale`` buffer value if present, else 1.0
       - v_scale : ``v_proj.v_scale`` buffer value if present, else 1.0
     """
     for module in model.modules():
         if not getattr(module, "enable_fp8_kv_cache", False):
             continue
+        q_buf = getattr(getattr(module, "q_proj", None), "q_scale", None)
         k_buf = getattr(getattr(module, "k_proj", None), "k_scale", None)
         v_buf = getattr(getattr(module, "v_proj", None), "v_scale", None)
         if v_buf is None and getattr(module, "attention_k_eq_v", False):
             v_buf = k_buf
         module._qkv_scales_float = [
-            1.0,
+            float(q_buf.item()) if q_buf is not None else 1.0,
             float(k_buf.item()) if k_buf is not None else 1.0,
             float(v_buf.item()) if v_buf is not None else 1.0,
         ]

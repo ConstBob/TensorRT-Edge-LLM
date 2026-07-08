@@ -345,6 +345,7 @@ class GatedAttention(nn.Module):
                                   module_name=f"{module_prefix}.v_proj")
 
         if self.enable_fp8_kv_cache:
+            self.q_proj.register_buffer("q_scale", torch.ones(1))
             self.k_proj.register_buffer("k_scale", torch.ones(1))
             self.v_proj.register_buffer("v_scale", torch.ones(1))
 

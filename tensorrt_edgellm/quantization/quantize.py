@@ -425,6 +425,47 @@ def _calibrate(model, dataloader):
             model(data)
 
 
+def _collect_attention_q_scales_for_export(
+        model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Preserve calibrated FP8 Q-BMM scales in the exported checkpoint.
+
+    ModelOpt retains the calibrated Q-BMM amax on the quantizer, but checkpoint
+    export does not emit it as ``q_proj.q_scale``. Edge-LLM needs that scale to
+    quantize prefill Q to E4M3 without saturation.
+    """
+    q_scales: dict[str, torch.Tensor] = {}
+    for module_name, module in model.named_modules():
+        quantizer = getattr(module, "q_bmm_quantizer", None)
+        if quantizer is None or not getattr(quantizer, "is_enabled", False):
+            continue
+        if getattr(module, "q_proj", None) is None:
+            continue
+
+        amax = getattr(quantizer, "_amax", None)
+        if amax is None:
+            raise RuntimeError(
+                f"Enabled Q-BMM quantizer {module_name}.q_bmm_quantizer "
+                "has no calibrated amax")
+        if amax.numel() != 1:
+            raise RuntimeError(
+                f"Q-BMM quantizer {module_name}.q_bmm_quantizer must use "
+                f"a per-tensor scale, got shape {tuple(amax.shape)}")
+
+        maxbound = float(quantizer.maxbound)
+        if maxbound <= 0.0:
+            raise RuntimeError(
+                f"Invalid Q-BMM maxbound for {module_name}: {maxbound}")
+        scale = amax.detach().float().reshape(1).cpu() / maxbound
+        if not torch.isfinite(scale).all() or scale.item() <= 0.0:
+            raise RuntimeError(
+                f"Invalid calibrated Q-BMM scale for {module_name}: "
+                f"amax={amax.item()}, maxbound={maxbound}")
+        prefix = f"{module_name}." if module_name else ""
+        q_scales[f"{prefix}q_proj.q_scale"] = scale
+
+    return q_scales
+
+
 def _normalize_tied_weights_keys(model) -> None:
     """WAR for transformers >= 5.x ``_tied_weights_keys`` format change.
 
@@ -755,12 +796,19 @@ def quantize_and_export(
         if mtp_layer_prefixes:
             model._mtp_layer_prefixes = mtp_layer_prefixes
 
+    attention_q_scales = _collect_attention_q_scales_for_export(model)
+    extra_state_dict = dict(mtp_state_dict)
+    extra_state_dict.update(attention_q_scales)
+
     os.makedirs(output_dir, exist_ok=True)
     with torch.inference_mode(), _skip_resmooth_for_hybrid(
             model, quantization or ""):
         export_hf_checkpoint(model,
                              export_dir=output_dir,
-                             extra_state_dict=mtp_state_dict)
+                             extra_state_dict=extra_state_dict)
+    if attention_q_scales:
+        print("Exported calibrated Q-BMM scales for "
+              f"{len(attention_q_scales)} attention layer(s).")
     _remove_stale_safetensors_index(output_dir)
     tokenizer.save_pretrained(output_dir)
     if processor is not None:
