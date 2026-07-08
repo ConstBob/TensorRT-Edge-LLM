@@ -427,7 +427,7 @@ def main():
     )
     parser.add_argument(
         "--activation", type=str, default="swiglu",
-        choices=["identity", "silu", "swiglu", "gelu", "relu2"],
+        choices=["identity", "silu", "swiglu", "gelu", "geglu", "relu2"],
         help="Activation function (default: swiglu)"
     )
     parser.add_argument(

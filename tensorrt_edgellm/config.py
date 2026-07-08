@@ -604,10 +604,26 @@ class ModelConfig:
     num_kv_shared_layers: int = 0
     # When True, KV-shared layers use 2× intermediate_size for their MLP.
     use_double_wide_mlp: bool = False
+    # Gemma4 26B-A4B MoE: when True, each decoder layer has a routed MoE
+    # block in addition to the dense MLP (parallel experts + router).
+    enable_moe_block: bool = False
     # ------------------------------------------ tensor parallel
     # ``mapping`` is the single source of truth for parallel placement.
     # tp_size>1 returns a per-rank ONNX graph with col/row-parallel projections.
     mapping: Mapping = field(default_factory=Mapping)
+
+    def __post_init__(self):
+        # For standalone models, num_kv_shared_layers < num_hidden_layers is
+        # required so that at least one non-shared donor layer exists.
+        # Gemma4 assistant models (shares_target_kv=True) share KV from the
+        # *target* model, so num_kv_shared_layers == num_hidden_layers is valid
+        # — the donor-index logic is skipped at runtime for those.
+        if (self.num_kv_shared_layers > 0
+                and self.num_kv_shared_layers >= self.num_hidden_layers
+                and not self.shares_target_kv):
+            raise ValueError(
+                f"num_kv_shared_layers ({self.num_kv_shared_layers}) must be "
+                f"less than num_hidden_layers ({self.num_hidden_layers})")
 
     # ------------------------------------------------------------------
     # Derived properties
@@ -927,6 +943,7 @@ class ModelConfig:
                 llm_dict.get("num_kv_shared_layers", 0) or 0),
             use_double_wide_mlp=bool(llm_dict.get("use_double_wide_mlp",
                                                   False)),
+            enable_moe_block=bool(llm_dict.get("enable_moe_block", False)),
         )
 
 

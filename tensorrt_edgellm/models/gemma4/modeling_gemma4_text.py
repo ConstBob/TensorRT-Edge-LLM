@@ -17,25 +17,39 @@
 from __future__ import annotations
 
 import itertools
+import re
 from typing import Callable, List, Tuple
 
 import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
 
-from ...config import ModelConfig
+from ...config import QUANT_NVFP4, ModelConfig
 from ..default.modeling_default import (MLP, Attention, CausalLM, DecoderLayer,
                                         OnnxSpec, RMSNorm)
 from ..linear import TPMode, make_linear
-from ..ops import attention_plugin
+from ..ops import (attention_plugin, nvfp4_moe_plugin,
+                   nvfp4_moe_plugin_geforce, use_geforce_nvfp4_moe)
 
 __all__ = [
     "Gemma4Attention",
     "Gemma4ForCausalLM",
     "Gemma4DecoderLayer",
+    "Gemma4NvFP4MoEBlock",
+    "Gemma4NvFP4MoEExperts",
     "Gemma4Transformer",
     "Gemma4ValueRMSNorm",
+    "GEMMA4_NVFP4_KEY_REMAP",
 ]
+
+# Plugin constants for ``Nvfp4MoePlugin`` (same as Qwen3 MoE).
+_NVFP4_ROUTING_MODE_SOFTMAX_TOPK_POST_SCALE = 2
+_NVFP4_ACTIVATION_GEGLU = 5
+_NVFP4_MOE_BACKEND_AUTO = 0
+_NVFP4_MOE_IO_DTYPE_FP16 = 1
+_NVFP4_MOE_MAX_ROUTED_ROWS_AUTO = 0
+_NVFP4_MOE_N_GROUP_FLAT = 1
+_NVFP4_MOE_TOPK_GROUP_FLAT = 1
 
 # These are dummy tensor extents used only to seed torch.export/ONNX export.
 # Runtime limits are controlled by dynamic_shapes and the builder profiles.
@@ -414,7 +428,13 @@ class Gemma4Attention(Attention):
                                   bias=config.attention_bias,
                                   module_name=f"{module_prefix}.k_proj")
         if self.attention_k_eq_v:
-            self.v_proj = None
+            # K=V: forward uses key_states as value_states, but we still
+            # instantiate v_proj so checkpoint loading can assign its weight.
+            self.v_proj = make_linear(config,
+                                      qkv_in_features,
+                                      self.num_kv_heads * self.head_dim,
+                                      bias=config.attention_bias,
+                                      module_name=f"{module_prefix}.v_proj")
         else:
             self.v_proj = make_linear(config,
                                       qkv_in_features,
@@ -587,11 +607,200 @@ class Gemma4MLP(MLP):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Upcast gate*up product to fp32 to prevent fp16 overflow in large models.
+        # This ensures HF reference equivalence during export; TRT handles precision
+        # internally in the built engine (the Cast ops are preserved in ONNX).
         gate = self.act_fn(self.gate_proj(hidden_states))
         up = self.up_proj(hidden_states)
         intermediate = (gate.to(torch.float32) * up.to(torch.float32)).to(
             hidden_states.dtype)
         return self.down_proj(intermediate)
+
+
+class Gemma4Router(nn.Module):
+    """Gemma4 MoE router weights for checkpoint loading.
+
+    Holds norm, scale, proj, and per_expert_scale parameters that get repacked
+    by Gemma4NvFP4MoEBlock._prepare_moe_weights(). The TRT plugin handles
+    softmax + topk internally.
+    """
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.num_experts = config.num_experts
+        self.scalar_root_size = self.hidden_size**-0.5
+        self.eps = config.rms_norm_eps
+
+        # Weightless RMSNorm (no learnable scale parameter)
+        self.norm = Gemma4ValueRMSNorm(self.hidden_size, eps=self.eps)
+        self.proj = make_linear(config,
+                                self.hidden_size,
+                                self.num_experts,
+                                bias=False,
+                                module_name="router.proj")
+        self.scale = nn.Parameter(torch.ones(self.hidden_size))
+        self.per_expert_scale = nn.Parameter(torch.ones(self.num_experts))
+
+
+class Gemma4NvFP4MoEExperts(nn.Module):
+    """Per-expert NVFP4 linear modules for Gemma4 MoE checkpoint loading.
+
+    Mirrors :class:`Qwen3MoEExperts`: each expert has gate_proj, up_proj,
+    down_proj created via ``make_linear()`` which returns ``NVFP4Linear``
+    when ``config.quant.quant_type == QUANT_NVFP4``.
+    """
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        hidden = config.hidden_size
+        inter = config.moe_intermediate_size
+        experts = []
+        for _ in range(config.num_experts):
+            expert = nn.Module()
+            expert.gate_proj = make_linear(config, hidden, inter)
+            expert.up_proj = make_linear(config, hidden, inter)
+            expert.down_proj = make_linear(config, inter, hidden)
+            experts.append(expert)
+        self._experts = nn.ModuleList(experts)
+
+    def __getitem__(self, idx: int) -> nn.Module:
+        return self._experts[idx]
+
+    def __len__(self) -> int:
+        return len(self._experts)
+
+    def __iter__(self):
+        return iter(self._experts)
+
+
+class Gemma4NvFP4MoEBlock(nn.Module):
+    """NVFP4 MoE block for Gemma4 26B-A4B using ``Nvfp4MoePlugin``.
+
+    Wraps the router + NVFP4 per-expert weights for checkpoint loading,
+    then repacks into plugin-compatible layout via ``_prepare_moe_weights()``.
+
+    Forward path: Router RMSNorm + scale + proj produces raw logits; the
+    plugin handles softmax + topk + expert GEMMs internally.
+    """
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+        self.moe_intermediate_size = config.moe_intermediate_size
+        self.hidden_size = config.hidden_size
+        self.group_size = config.quant.group_size
+        self.activation_type = _NVFP4_ACTIVATION_GEGLU
+        self.backend = _NVFP4_MOE_BACKEND_AUTO
+        self.io_dtype = _NVFP4_MOE_IO_DTYPE_FP16
+        self.max_routed_rows = _NVFP4_MOE_MAX_ROUTED_ROWS_AUTO
+
+        self.router = Gemma4Router(config)
+        self.experts = Gemma4NvFP4MoEExperts(config)
+
+    def _prepare_moe_weights(self) -> None:
+        """Repack NVFP4 experts for Nvfp4MoePlugin.
+
+        Called by :func:`~checkpoint.repacking._stack_moe_experts`.
+        """
+        from ...checkpoint.repacking import repack_nvfp4_qwen3_moe_experts
+
+        # Promote router projection to make_linear for standard MatMul trace.
+        self.gate_linear = make_linear(self.config,
+                                       self.hidden_size,
+                                       self.num_experts,
+                                       bias=False,
+                                       module_name="moe_block.gate_linear")
+        self.gate_linear.weight.data = self.router.proj.weight.data
+
+        fc1_layout = "concat" if use_geforce_nvfp4_moe() else "interleave"
+        fc1_qweights, fc1_blocks_scale, fc2_qweights, fc2_blocks_scale = (
+            repack_nvfp4_qwen3_moe_experts(self.experts,
+                                           self.hidden_size,
+                                           self.moe_intermediate_size,
+                                           self.group_size,
+                                           fc1_layout=fc1_layout))
+
+        device = self.router.proj.weight.device
+        self.register_buffer("fc1_qweights",
+                             fc1_qweights.to(device).contiguous())
+        self.register_buffer("fc1_blocks_scale",
+                             fc1_blocks_scale.to(device).contiguous())
+        self.register_buffer("fc2_qweights",
+                             fc2_qweights.to(device).contiguous())
+        self.register_buffer("fc2_blocks_scale",
+                             fc2_blocks_scale.to(device).contiguous())
+
+        # w4a16: weights are NVFP4, activations stay FP16.
+        # repack_nvfp4_qwen3_moe_experts decodes weights to dense (folding
+        # weight_scale_2 in) then re-quantizes → alpha must be 1.0.
+        # No activation quantization → input scales are also 1.0.
+        self.register_buffer(
+            "fc1_alpha",
+            torch.ones(self.num_experts, dtype=torch.float32, device=device))
+        self.register_buffer(
+            "fc2_alpha",
+            torch.ones(self.num_experts, dtype=torch.float32, device=device))
+        self.register_buffer(
+            "input_global_scale",
+            torch.ones(self.num_experts, dtype=torch.float32, device=device))
+        self.register_buffer(
+            "down_input_scale",
+            torch.ones(self.num_experts, dtype=torch.float32, device=device))
+
+        # per_expert_scale → raw scale applied post-renorm by plugin
+        # (routing_mode=2 triggers multiplicative post-topk application).
+        self.register_buffer(
+            "e_score_correction_bias",
+            self.router.per_expert_scale.data.float().to(device))
+
+        # Discard per-expert modules after repacking.
+        self.experts = nn.ModuleList()
+
+    def forward(self, expert_input: torch.Tensor,
+                residual: torch.Tensor) -> torch.Tensor:
+        """Route via plugin: router_logits → Nvfp4MoePlugin.
+
+        Args:
+            expert_input: [num_tokens, H] — pre-normed expert input (2D).
+            residual: [B, S, H] — pre-MLP residual used for routing.
+        """
+        hidden_flat = residual.reshape(-1, self.hidden_size)
+        # Router: RMSNorm + scale + proj → raw logits (softmax done by plugin)
+        normed = self.router.norm(hidden_flat)
+        scaled = normed * (self.router.scale *
+                           self.router.scalar_root_size).to(normed.dtype)
+        router_logits = self.gate_linear(scaled).float()
+
+        moe_op = (nvfp4_moe_plugin_geforce
+                  if use_geforce_nvfp4_moe() else nvfp4_moe_plugin)
+        return moe_op(
+            router_logits,
+            expert_input.unsqueeze(0),  # Plugin expects 3D [B, T, H]
+            self.fc1_qweights,
+            self.fc1_blocks_scale,
+            self.fc1_alpha,
+            self.fc2_qweights,
+            self.fc2_blocks_scale,
+            self.fc2_alpha,
+            self.input_global_scale,
+            self.down_input_scale,
+            self.e_score_correction_bias,
+            self.num_experts,
+            self.top_k,
+            self.hidden_size,
+            self.moe_intermediate_size,
+            self.activation_type,
+            _NVFP4_MOE_N_GROUP_FLAT,
+            _NVFP4_MOE_TOPK_GROUP_FLAT,
+            1,
+            1.0,
+            _NVFP4_ROUTING_MODE_SOFTMAX_TOPK_POST_SCALE,
+            self.backend,
+            self.io_dtype,
+            self.max_routed_rows,
+        )
 
 
 class Gemma4DecoderLayer(DecoderLayer):
@@ -615,6 +824,25 @@ class Gemma4DecoderLayer(DecoderLayer):
         self.post_feedforward_layernorm = RMSNorm(config.hidden_size,
                                                   config.rms_norm_eps)
 
+        # MoE block: parallel routed experts alongside dense MLP (Gemma4 26B).
+        # Only NVFP4 quantization is supported for MoE.
+        self.enable_moe_block = config.enable_moe_block
+        if self.enable_moe_block:
+            if config.quant.quant_type != QUANT_NVFP4:
+                raise ValueError(
+                    "Gemma4 MoE requires NVFP4 quantization "
+                    f"(got quant_type={config.quant.quant_type!r})")
+            self.moe_block = Gemma4NvFP4MoEBlock(config)
+            self.post_feedforward_layernorm_1 = RMSNorm(
+                config.hidden_size, config.rms_norm_eps)
+            self.post_feedforward_layernorm_2 = RMSNorm(
+                config.hidden_size, config.rms_norm_eps)
+            self.pre_feedforward_layernorm_2 = RMSNorm(config.hidden_size,
+                                                       config.rms_norm_eps)
+
+        # HF applies layer_scalar unconditionally (it's 1.0 for non-PLE models).
+        self.register_buffer("layer_scalar", torch.ones(1))
+
         if self.hidden_size_per_layer_input > 0:
             self.per_layer_input_gate = make_linear(
                 config,
@@ -634,7 +862,6 @@ class Gemma4DecoderLayer(DecoderLayer):
             )
             self.post_per_layer_input_norm = RMSNorm(config.hidden_size,
                                                      config.rms_norm_eps)
-            self.register_buffer("layer_scalar", torch.ones(1))
 
     def _apply_per_layer_input(
             self, hidden_states: torch.Tensor,
@@ -697,13 +924,29 @@ class Gemma4DecoderLayer(DecoderLayer):
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
+
+        if self.enable_moe_block:
+            # MoE branch: norm MLP output, route residual through experts,
+            # combine both normalized outputs.
+            hidden_states_1 = self.post_feedforward_layernorm_1(hidden_states)
+
+            # NVFP4 path: plugin handles routing + expert compute.
+            # pre_feedforward_layernorm_2 normalizes expert input.
+            hidden_states_flat = residual.reshape(-1, residual.shape[-1])
+            expert_input = self.pre_feedforward_layernorm_2(hidden_states_flat)
+            hidden_states_2 = self.moe_block(expert_input, residual)
+            hidden_states_2 = hidden_states_2.reshape(residual.shape)
+            hidden_states_2 = self.post_feedforward_layernorm_2(
+                hidden_states_2)
+
+            hidden_states = hidden_states_1 + hidden_states_2
+
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
         hidden_states = self._apply_per_layer_input(hidden_states,
                                                     per_layer_input)
-        if self.hidden_size_per_layer_input > 0:
-            hidden_states = hidden_states * self.layer_scalar
+        hidden_states = hidden_states * self.layer_scalar
 
         return hidden_states, present_key_value
 
@@ -1125,3 +1368,35 @@ class Gemma4ForCausalLM(CausalLM):
             return logits, hidden_states, present_key_values
 
         return logits, present_key_values
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint key remap for NVFP4 Gemma4 MoE
+# ---------------------------------------------------------------------------
+# Checkpoint: layers.{i}.router.* → model tree: layers.{i}.moe_block.router.*
+_ROUTER_RE = re.compile(r"(layers\.\d+\.)router\.")
+# Checkpoint: layers.{i}.experts.{j}.* → model tree: layers.{i}.moe_block.experts._experts.{j}.*
+_EXPERTS_RE = re.compile(r"(layers\.\d+\.)experts\.(\d+)\.")
+
+
+def GEMMA4_NVFP4_KEY_REMAP(key: str) -> "str | None":
+    """Remap Gemma4 NVFP4 checkpoint keys to the internal module tree.
+
+    Checkpoint layout (nvidia/Gemma-4-26B-A4B-NVFP4):
+        model.layers.{i}.router.proj.weight
+        model.layers.{i}.router.scale
+        model.layers.{i}.router.per_expert_scale
+        model.layers.{i}.experts.{j}.gate_proj.weight
+        model.layers.{i}.experts.{j}.gate_proj.weight_scale
+        ...
+
+    Model tree (with Gemma4NvFP4MoEBlock):
+        model.layers.{i}.moe_block.router.proj.weight
+        model.layers.{i}.moe_block.router.scale
+        model.layers.{i}.moe_block.router.per_expert_scale
+        model.layers.{i}.moe_block.experts._experts.{j}.gate_proj.weight
+        ...
+    """
+    key = _ROUTER_RE.sub(r"\1moe_block.router.", key)
+    key = _EXPERTS_RE.sub(r"\1moe_block.experts._experts.\2.", key)
+    return key

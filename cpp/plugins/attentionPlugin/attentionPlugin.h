@@ -26,10 +26,6 @@
 
 #include "common/tensor.h"
 
-#ifdef CUTE_DSL_FFPA_ENABLED
-#include "kernels/contextAttentionKernels/cuteDslFFPARunner.h"
-#endif
-
 namespace trt_edgellm
 {
 namespace plugins
@@ -106,12 +102,9 @@ private:
         std::byte*& workspacePtr, int32_t batchSize, int32_t numKVHeads, int32_t kvCacheCapacity, int32_t headSize,
         int32_t seqLen, cudaStream_t stream);
 
-#ifdef CUTE_DSL_FFPA_ENABLED
-    //! Launch the CuTe DSL FFPA d512 causal attention kernel.
-    //! Caller fills the CuteDslFFPAParams struct (tensor pointers, cuSeqLens,
-    //! dimensions); softmaxScale is derived from headDim here.
-    void dispatchFFPAKernel(CuteDslFFPAParams const& params, cudaStream_t stream);
-#endif
+    //! Launch the CuTe DSL FFPA d512 causal attention kernel with per-batch varlen masking.
+    void dispatchFFPAKernel(half const* q, half const* k, half const* v, half* o, int32_t const* cuSeqLenQ,
+        int32_t const* cuSeqLenK, int32_t batchSize, int32_t seqlenQ, int32_t seqlenK, cudaStream_t stream);
 
 protected:
     std::string mLayerName; //!< Plugin layer name

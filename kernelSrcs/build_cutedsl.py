@@ -497,6 +497,23 @@ KERNEL_VARIANTS = [
         ],
     ),
     KernelVariant(
+        name="nvfp4_moe_sm110_fc1_geglu_n128",
+        group="nvfp4_moe",
+        supported_sms=[100, 101, 110],
+        script="nvfp4_moe_cutedsl/export_fc1_kernel.py",
+        script_args=[
+            "--activation",
+            "geglu",
+            "--mma_tiler_n",
+            "128",
+            "--dummy-experts",
+            "128",
+            "--dummy-top-k",
+            "8",
+            "--export_only",
+        ],
+    ),
+    KernelVariant(
         name="nvfp4_moe_sm110_fc2_n128_fp16",
         group="nvfp4_moe",
         supported_sms=[100, 101, 110],
@@ -559,8 +576,8 @@ KERNEL_VARIANTS = [
     #   see CuteDslNvfp4MoeRunner::kDecodePrefillCutoverRoutedRows).
     # Prefill backend: global task-queue driven producer/consumer overlap;
     #   best for large routed working sets.
-    # Nvfp4MoePlugin scope: FP16 io_dtype + {identity, silu, swiglu, gelu, relu2}
-    # x {decode, prefill} x {n128 MMA N-tile} = 10 variants. Shape axes
+    # Nvfp4MoePlugin scope: FP16 io_dtype + {identity, silu, swiglu, gelu, relu2, geglu}
+    # x {decode, prefill} x {n128 MMA N-tile} = 12 variants. Shape axes
     # N / E / top_k / hidden_size (K) are runtime (shape-polymorphic). The
     # MMA N-tile remains a compile-time variant axis. CuteDslNvfp4MoeRunner
     # currently dispatches n128 and accepts the bounded K set {1024, 2048}.
@@ -600,6 +617,13 @@ KERNEL_VARIANTS = [
         script="nvfp4_fused_moe_cutedsl/export_decode_kernel.py",
         script_args=["--activation", "relu2", "--mma_tiler_n", "128", "--export_only"],
     ),
+    KernelVariant(
+        name="nvfp4_fused_moe_decode_geglu_n128",
+        group="nvfp4_fused_moe",
+        supported_sms=[120, 121],
+        script="nvfp4_fused_moe_cutedsl/export_decode_kernel.py",
+        script_args=["--activation", "geglu", "--mma_tiler_n", "128", "--export_only"],
+    ),
 
     # Prefill backend, N-tile 128
     KernelVariant(
@@ -636,6 +660,13 @@ KERNEL_VARIANTS = [
         supported_sms=[120, 121],
         script="nvfp4_fused_moe_cutedsl/export_prefill_kernel.py",
         script_args=["--activation", "relu2", "--mma_tiler_n", "128", "--export_only"],
+    ),
+    KernelVariant(
+        name="nvfp4_fused_moe_prefill_geglu_n128",
+        group="nvfp4_fused_moe",
+        supported_sms=[120, 121],
+        script="nvfp4_fused_moe_cutedsl/export_prefill_kernel.py",
+        script_args=["--activation", "geglu", "--mma_tiler_n", "128", "--export_only"],
     ),
     # Prefill backend, N-tile 256 — DISABLED (same bug as decode n256).
 

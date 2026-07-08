@@ -715,6 +715,34 @@ def _patch_multimodal_token_ids(model_dir: str, llm_out_dir: str,
 # ---------------------------------------------------------------------------
 
 
+def _is_nvfp4_checkpoint(model_dir: str) -> bool:
+    """Return True if *model_dir* contains an NVFP4-quantized checkpoint.
+
+    Checks ``hf_quant_config.json`` and ``config.json`` for FP4/NVFP4
+    quantization indicators.
+    """
+    for fname in ("hf_quant_config.json", "config.json"):
+        path = os.path.join(model_dir, fname)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path) as f:
+                cfg = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        # hf_quant_config.json nests under "quantization"
+        quant_section = cfg.get("quantization", {})
+        # config.json embeds under "quantization_config"
+        qcfg = cfg.get("quantization_config", {})
+        # Check all known algo key names across both sections
+        for section in (cfg, quant_section, qcfg):
+            for key in ("algorithm", "quant_algo", "quant_method"):
+                algo = section.get(key, "")
+                if isinstance(algo, str) and "FP4" in algo.upper():
+                    return True
+    return False
+
+
 def _alpamayo_llm_key_remap(key: str) -> "Optional[str]":
     """Remap ``vlm.lm_head.*`` → ``lm_head.*`` (not covered by prefix detection)."""
     if key.startswith("vlm.lm_head."):
@@ -760,6 +788,26 @@ def _export_llm(model_dir: str,
                                             "qwen3_omni_moe", "qwen3_moe"):
         from ..models.qwen3_moe import MODELOPT_KEY_REMAP
         key_remap = MODELOPT_KEY_REMAP
+
+    # Gemma4 NVFP4 MoE: checkpoint stores router/experts at layer level but
+    # model tree nests them under moe_block with _experts indirection.
+    # Only activate when the checkpoint is NVFP4-quantized (otherwise the
+    # FP16 dense path uses router/experts directly on the layer).
+    if key_remap is None and model_type in _GEMMA4_MODEL_TYPES:
+        if _is_nvfp4_checkpoint(model_dir):
+            config_path = os.path.join(model_dir, "config.json")
+            with open(config_path) as f:
+                _cfg = json.load(f)
+            _llm = _cfg.get("text_config", _cfg)
+            if not _llm.get("enable_moe_block", False):
+                raise ValueError(
+                    "NVFP4 key remap requires enable_moe_block=True in "
+                    "config.json. The checkpoint appears NVFP4-quantized "
+                    "but the model config has no MoE block — remapped "
+                    "router/expert keys would be silently dropped.")
+            from ..models.gemma4.modeling_gemma4_text import \
+                GEMMA4_NVFP4_KEY_REMAP
+            key_remap = GEMMA4_NVFP4_KEY_REMAP
 
     if tp_size <= 1:
         ranks = [(0, 1)]
@@ -1140,6 +1188,19 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
                 vis_cfg_out["vision_config"] = dict(
                     vis_cfg_out["vision_config"])
                 vis_cfg_out["vision_config"]["position_id_per_seconds"] = _pips
+
+    if model_type == "gemma4":
+        vis_cfg_out["vision_config"] = dict(vis_cfg_out["vision_config"])
+        vis_cfg_out["vision_config"]["model_type"] = "gemma4_vision"
+        text_cfg = config.get("text_config") or {}
+        if text_cfg:
+            vis_cfg_out["text_config"] = text_cfg
+        if "image_token_id" in config:
+            vis_cfg_out["image_token_id"] = config["image_token_id"]
+        else:
+            image_token_id = _find_token_id(model_dir, "<|image_pad|>")
+            if image_token_id is not None:
+                vis_cfg_out["image_token_id"] = image_token_id
     # Copy preprocessor_config.json to the visual output dir so the C++
     # runtime can find patch_size, image_mean, image_std, etc.  Applies to
     # every visual family (Qwen VL, InternVL, Phi-4mm) — the C++ visual
