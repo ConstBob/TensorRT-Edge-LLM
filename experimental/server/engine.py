@@ -89,8 +89,35 @@ class SamplingParams:
     max_tokens: int = 2048
     enable_thinking: bool = False
     disable_spec_decode: bool = False
+    num_logprobs: int = 0
     stop: List[str] = field(default_factory=list)
     logit_bias: Dict[int, float] = field(default_factory=dict)
+
+
+@dataclass
+class LogprobEntry:
+    """One top-K log-probability entry for a single generated token.
+
+    ``token`` is the piece decoded as UTF-8 with ``errors="replace"`` (a
+    byte-level BPE token may be only part of a multi-byte character, so it can
+    contain U+FFFD); ``bytes`` carries the raw token bytes losslessly.
+    """
+
+    token_id: int
+    logprob: float
+    token: str
+    bytes: List[int]
+
+
+def _convert_logprobs(raw) -> List[List[LogprobEntry]]:
+    """Convert the C++/pybind logprobs (list of list of native LogprobEntry with
+    a raw-bytes ``piece``) into engine LogprobEntry dataclasses."""
+    return [[
+        LogprobEntry(token_id=e.token_id,
+                     logprob=e.logprob,
+                     token=e.piece.decode("utf-8", "replace"),
+                     bytes=list(e.piece)) for e in step
+    ] for step in raw]
 
 
 @dataclass
@@ -100,6 +127,7 @@ class CompletionOutput:
     text: str = ""
     token_ids: List[int] = field(default_factory=list)
     finish_reason: Optional[str] = None
+    logprobs: List[List[LogprobEntry]] = field(default_factory=list)
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     reasoning: Optional[str] = None
 
@@ -112,6 +140,7 @@ class StreamDelta:
     token_ids: List[int] = field(default_factory=list)
     finished: bool = False
     finish_reason: Optional[str] = None
+    logprobs: List[List[LogprobEntry]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -787,6 +816,7 @@ class LLM:
         request.add_generation_prompt = add_prompt
         request.enable_thinking = params.enable_thinking
         request.disable_spec_decode = params.disable_spec_decode
+        request.num_logprobs = params.num_logprobs
         return request
 
     def _parse_generation_output(
@@ -865,8 +895,11 @@ class LLM:
             ids = response.output_ids[0] if response.output_ids else []
             reason = finish_reason_name(self._rt, response.finish_reasons[0]) \
                 if response.finish_reasons else "stop"
-            outputs.append(
-                self._parse_generation_output(text, ids, reason, tool_config))
+            lps = _convert_logprobs(response.logprobs[0]) if (
+                params.num_logprobs > 0 and response.logprobs) else []
+            out = self._parse_generation_output(text, ids, reason, tool_config)
+            out.logprobs = lps
+            outputs.append(out)
 
         return outputs
 
@@ -947,6 +980,7 @@ class LLM:
                     token_ids=list(chunk.token_ids),
                     finished=chunk.finished,
                     finish_reason=reason,
+                    logprobs=_convert_logprobs(chunk.logprobs),
                 )
                 if chunk.finished:
                     break

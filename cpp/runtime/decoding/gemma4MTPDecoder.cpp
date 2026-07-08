@@ -29,7 +29,7 @@
 #include "profiling/metrics.h"
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
-#include "runtime/decoding/specDecodeUtils.h"
+#include "runtime/decoding/decoderUtils.h"
 #include "runtime/state/pipelineIO.h"
 #include "sampler/sampling.h"
 
@@ -62,7 +62,7 @@ Gemma4MTPDecoder::Gemma4MTPDecoder(DecodingRuntimeContext& runtime, std::filesys
     check::check(runtime.deployment.draft->sharesTargetKV && !runtime.deployment.draft->hasOwnKVCache,
         "Gemma4 MTP assistant must share target KV and must not own draft KV cache.");
 
-    mDraftExecutor = spec_decode_utils::loadDraftEngine(engineDir, mRuntime.deployment);
+    mDraftExecutor = decoder_utils::loadDraftEngine(engineDir, mRuntime.deployment);
     buildTensorMapForGemma4MTPDraft(
         mDraftTensorMap, mRuntime.base.pipelineIO, mRuntime.base.sharedResources, mRuntime.deployment);
 
@@ -543,6 +543,18 @@ bool Gemma4MTPDecoder::acceptAndCommit(DecodingInferenceContext& context)
     kernel::sequentialAccept(mRuntime.base.pipelineIO.outputLogits, mVerifyTokenIds, mAcceptedTokenIds, mAcceptLength,
         mArgmaxScratch, activeBatchSize, verifySize, mRuntime.deployment.base.outputVocabSize, context.stream);
 
+    // Enqueue logprobs device work + D2H so the copies ride the accept-length sync below.
+    // Gemma4 MTP verification is a sequential chain: verify row j is accepted position j, so
+    // extraction runs directly on the [B * verifySize, vocab] logits without a gather.
+    if (context.numLogprobs > 0)
+    {
+        check::check(mRuntime.base.pipelineIO.outputLogits.reshape(
+                         {activeBatchSize * verifySize, mRuntime.deployment.base.outputVocabSize}),
+            "Tensor reshape failed");
+        decoder_utils::enqueueLogprobsD2H(mRuntime.base.pipelineIO.outputLogits, activeBatchSize * verifySize, mRuntime,
+            context.numLogprobs, context.stream);
+    }
+
     check::check(mHostAcceptLengths.reshape({activeBatchSize}), "Tensor reshape failed");
     int32_t* hostAcceptLengths = mHostAcceptLengths.dataPointer<int32_t>();
     CUDA_CHECK(cudaMemcpyAsync(hostAcceptLengths, mAcceptLength.rawPointer(),
@@ -568,8 +580,14 @@ bool Gemma4MTPDecoder::acceptAndCommit(DecodingInferenceContext& context)
 
     mRuntime.base.cacheManager.commitSequenceLength(mAcceptLength, context.stream);
 
-    spec_decode_utils::appendAcceptedTokens(context, mHostAcceptLengths, mHostAcceptedTokenIds, mAcceptLength,
+    decoder_utils::appendAcceptedTokens(context, mHostAcceptLengths, mHostAcceptedTokenIds, mAcceptLength,
         mAcceptedTokenIds, verifySize, mRuntime.tokenizer, context.stream);
+
+    if (context.numLogprobs > 0)
+    {
+        decoder_utils::collectSpecLogprobsFromHost(mRuntime, context, activeBatchSize, verifySize,
+            mHostAcceptLengths.dataPointer<int32_t>(), context.numLogprobs);
+    }
 
     return true;
 }

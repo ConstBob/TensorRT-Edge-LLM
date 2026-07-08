@@ -35,6 +35,19 @@ namespace rt
 
 class LayerDebugger; // Few-layer-validation debug: per-layer logits/KV dump (runtime/debug/layerDebugger.h)
 
+/**
+ * @brief Pre-allocated flat accumulator for per-step log-probabilities of one batch slot.
+ *
+ * Stores up to `maxGenerateLength * topK` pairs in a single allocation made at request start,
+ * eliminating per-step heap allocations inside the decode loop.
+ * `data[step * topK .. (step+1) * topK - 1]` holds the top-K (token_id, log_prob) pairs for step `step`.
+ */
+struct LogprobsSlot
+{
+    std::vector<std::pair<int32_t, float>> data; //!< Flat [maxGenerateLength * topK] storage, pre-allocated once
+    int32_t numSteps{0};                         //!< Number of steps written so far
+};
+
 /*!
  * @brief Batch result data for a single sequence.
  *
@@ -48,6 +61,9 @@ struct BatchResult
     int32_t generateLength{0};               //!< Number of tokens generated
     int32_t actualIterations{0};             //!< Number of iterations executed
     int32_t effectivePrefillLength{0};       //!< Effective prefill length after system prompt cache reuse
+    //! Per-step top log-probabilities: logprobs[step] = [LogprobEntry, ...], sorted descending.
+    //! Populated only when numLogprobs > 0 in the original request.
+    std::vector<std::vector<LogprobEntry>> logprobs;
     FinishReason terminalReason{
         FinishReason::kNotFinished}; //!< Why this batch terminated (EOS, length, stop string, cancel, error)
 };
@@ -82,6 +98,12 @@ struct DecodingInferenceContext
     float temperature{1.0f}; //!< Temperature for sampling
     float topP{1.0f};        //!< Top-P sampling parameter
     int64_t topK{0};         //!< Top-K sampling parameter
+    int32_t numLogprobs{0};  //!< Number of top log-probs to collect per generated token
+    //! Per-batch flat logprobs accumulator.  slot.data is pre-allocated
+    //! [(maxGenerateLength + draftingStep) * numLogprobs] in spec-decode mode (vanilla: maxGenerateLength)
+    //! to accommodate the up-to-(draftingStep+1) tokens accepted per verify step.
+    //! slot.data[step*numLogprobs .. (step+1)*numLogprobs-1] holds step's top-K (token_id, log_prob) pairs.
+    std::vector<rt::LogprobsSlot> stepLogprobs;
 
     // Per-slot stop strings; empty list disables stop-string termination for that slot.
     std::vector<std::vector<std::string>> stopStringsPerSlot;

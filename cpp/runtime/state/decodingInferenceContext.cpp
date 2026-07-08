@@ -62,6 +62,10 @@ void DecodingInferenceContext::initialize(int32_t batchSize, int32_t maxGenLengt
 
     completedBatches.clear();
 
+    // Initialize per-batch logprobs accumulator (populated only when numLogprobs > 0)
+    stepLogprobs.clear();
+    stepLogprobs.resize(batchSize);
+
     visualEmbeddings = visual;
     deepstackFeatures = deepstack;
     generationRound = 0;

@@ -31,8 +31,8 @@
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
 #include "runtime/config/llmEngineConfig.h"
+#include "runtime/decoding/decoderUtils.h"
 #include "runtime/decoding/dflashDecodeUtils.h"
-#include "runtime/decoding/specDecodeUtils.h"
 #include "sampler/sampling.h"
 
 #include <algorithm>
@@ -586,8 +586,30 @@ bool DFlashDecoder::runBaseVerification(DecodingInferenceContext& context)
         mRuntime.base.cacheManager.getMambaCacheManager().scatterMtpStates(mAcceptLength, context.stream);
     }
 
-    spec_decode_utils::appendAcceptedTokens(context, mHostAcceptLengths, mHostAcceptedTokenIds, mAcceptLength,
+    // Enqueue logprobs device work + D2H before appendAcceptedTokens so everything rides
+    // that call's single round synchronization. Verify rows are tree nodes (DDTree) or linear
+    // block positions; either way the accepted rows can be non-contiguous in outputLogits, so
+    // gather them via the accepted verify indices first (same as EAGLE/MTP).
+    if (context.numLogprobs > 0)
+    {
+        int32_t const vocabSize = mRuntime.deployment.base.outputVocabSize;
+        int32_t const gatheredRows = activeBatchSize * maxAcceptLength;
+        check::check(mRuntime.logprobs.gatheredLogits.reshape({gatheredRows, vocabSize}), "Tensor reshape failed");
+        gatherSpecVerifyAcceptedLogitRows(mRuntime.base.pipelineIO.outputLogits, mAcceptedTokenIndices,
+            mRuntime.logprobs.gatheredLogits, activeBatchSize, verifySize, maxAcceptLength, vocabSize, context.stream);
+        decoder_utils::enqueueLogprobsD2H(
+            mRuntime.logprobs.gatheredLogits, gatheredRows, mRuntime, context.numLogprobs, context.stream);
+    }
+
+    // Step 8: Append accepted tokens to context (includes the round's D2H sync)
+    decoder_utils::appendAcceptedTokens(context, mHostAcceptLengths, mHostAcceptedTokenIds, mAcceptLength,
         mAcceptedTokenIds, maxAcceptLength, mRuntime.tokenizer, context.stream);
+
+    if (context.numLogprobs > 0)
+    {
+        decoder_utils::collectSpecLogprobsFromHost(mRuntime, context, activeBatchSize, maxAcceptLength,
+            mHostAcceptLengths.dataPointer<int32_t>(), context.numLogprobs);
+    }
 
     return true;
 }
