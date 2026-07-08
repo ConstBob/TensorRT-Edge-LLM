@@ -176,6 +176,96 @@ struct HeadPtr<Head, 0> : TinyPtr<Head>
 {
 };
 
+// nbPages == 1: the whole tile lives in a single page (page-aligned CTA tiles never let a
+// warp tile cross a page boundary), so both the bad-page check and the page-base
+// computation are loop-invariant across the tile. The general template recomputes
+// getPoolOffset per access and threads its result through a per-access bad-page nullptr
+// select. That select is what blocks affine-address codegen: every LDGSTS in the copy
+// loop must rebuild a full 64-bit address (IMAD.WIDE) plus a null ISETP and a CS2R
+// zero-materialization per grain, while the contiguous TinyPtr path folds the offsets
+// into the LDGSTS immediate field (measured as +57% dynamic instructions / +38% kernel
+// time on B200 decode). This specialization keeps the address UNCONDITIONAL and affine —
+// an unmapped page aliases the pool origin, which is never dereferenced because the
+// tile-wide validity mask zeroes the cp.async source size instead (cp.async with source
+// size 0 performs no global access and zero-fills the destination, preserving the
+// zero-fill semantics of the nullptr path).
+template <typename Head>
+struct HeadPtr<Head, 1>
+{
+    // Copy loops may skip the per-head nullptr check and use validMask() instead.
+    static constexpr bool kNeverNull = true;
+
+    Head* pool;
+    Vec<KVCachePageIndex, 1> pageIndices;
+    uint32_t nbKHeads;
+    uint32_t offset; // offset inside the page.
+    uint32_t tokensPerPageLog2;
+    Head* base;          // pool + page * pageStride + offset; aliases pool origin for a bad page.
+    uint32_t mValidMask; // ~0U if the page is mapped, 0U otherwise.
+
+    __device__ inline HeadPtr(Head* pool_, Vec<KVCachePageIndex, 1> pageIndices_, uint32_t nbKHeads_,
+        uint32_t offset_, uint32_t tokensPerPageLog2_)
+        : pool{pool_}
+        , pageIndices{pageIndices_}
+        , nbKHeads{nbKHeads_}
+        , offset{offset_}
+        , tokensPerPageLog2{tokensPerPageLog2_}
+        , base{PagedKVCacheLayout::isBadPage(pageIndices_[0])
+                  ? pool_
+                  : pool_
+                      + PagedKVCacheLayout::getPoolOffset(
+                          pageIndices_[0], nbKHeads_, offset_, 0U, tokensPerPageLog2_)}
+        , mValidMask{PagedKVCacheLayout::isBadPage(pageIndices_[0]) ? 0U : ~0U}
+    {
+    }
+
+    __device__ inline uint32_t validMask() const
+    {
+        return mValidMask;
+    }
+
+    __device__ inline Head& operator[](uint32_t i) const
+    {
+        return *(*this + i);
+    }
+
+    __device__ inline Head* operator+(uint32_t i) const
+    {
+        // getTokenOffsetInPage(i) == i within a single-page tile (i < tokensPerPage since the
+        // tile starts at `offset` inside this page and never wraps), so the address is linear.
+        // NEVER null — consumers must gate the actual access on validMask().
+        assert(i < getTokensPerPage(tokensPerPageLog2));
+        return base + static_cast<size_t>(i) * nbKHeads;
+    }
+};
+
+// Detection for pointer types that never return nullptr and expose a tile-wide validity
+// mask instead (see HeadPtr<Head, 1>). Header-free SFINAE (cubins avoid <type_traits>).
+template <typename T, typename = void>
+struct SrcHeadPtrNeverNull
+{
+    static constexpr bool value = false;
+};
+
+template <typename T>
+struct SrcHeadPtrNeverNull<T, decltype(void(T::kNeverNull))>
+{
+    static constexpr bool value = T::kNeverNull;
+};
+
+template <typename SrcHeadPtr>
+__device__ inline uint32_t srcTileValidMask(SrcHeadPtr const& src)
+{
+    if constexpr (SrcHeadPtrNeverNull<SrcHeadPtr>::value)
+    {
+        return src.validMask();
+    }
+    else
+    {
+        return ~0U;
+    }
+}
+
 // Returns the offset within a page for the paged KV cache pool.
 __device__ inline uint32_t getPagedHeadOffset(
     uint32_t seqOffset, uint32_t nbKHeads, uint32_t idxHeadGrp, uint32_t tokensPerPageLog2)
@@ -287,6 +377,9 @@ __device__ inline void copyPartialHeadsAsync(
     uint32_t const segIdx = warpLane / thrdsPerSeg;
     uint32_t const segLane = warpLane % thrdsPerSeg;
     constexpr uint32_t partsPerWarpInst = exactDiv(grainBytes * warp_size, partBytes);
+    // Tile-wide validity (loop-invariant): pointer types that never return nullptr expose the
+    // page validity as a mask, so the per-grain copy size below needs no per-head null check.
+    uint32_t const tileValidMask = srcTileValidMask(src);
 #pragma unroll
     for (uint32_t i = 0; i < thrdLdBytes / grainBytes; i++)
     {
@@ -299,11 +392,13 @@ __device__ inline void copyPartialHeadsAsync(
         uint32_t const idxGrainInsideHead = grainsPerPart * idxPart + segLane;
         bool const isGrainInBound = (!isHeadPadded || idxGrainInsideHead < nbValidGrains);
         SrcHead const* const pSrcHead = src + localHeadIdxMap(idxHeadLocal);
-        bool const isValidPage = (pSrcHead != nullptr);
+        bool const isValidPage
+            = SrcHeadPtrNeverNull<mha::decay_t<SrcHeadPtr>>::value || (pSrcHead != nullptr);
         LdGrain const* const pSrc = reinterpret_cast<LdGrain const*>(pSrcHead) + idxGrainInsideHead;
         LdGrain* const pDst = &dst.template at<swizzle>(dstHeadOffset + idxHeadLocal, segLane);
         assert(!hasBankConflict(pDst));
-        ldgsts::copyAsync<grainBytes>(pDst, pSrc, isValidPage && isHeadInBound && isGrainInBound ? grainBytes : 0u);
+        ldgsts::copyAsync<grainBytes>(
+            pDst, pSrc, tileValidMask & (isValidPage && isHeadInBound && isGrainInBound ? grainBytes : 0u));
     }
 }
 
@@ -337,6 +432,11 @@ __device__ inline void copyHeadsAsyncMultiWarp(
     constexpr uint32_t nbTotalGrains = maxNbCopiedHeads * nbGrainsPerHead;
     constexpr uint32_t nbThreads = warp_size * nbWarps;
     uint32_t const tid = warp_size * idxWarp + laneId();
+    // Tile-wide validity (loop-invariant): pointer types that never return nullptr expose the
+    // page validity as a mask instead (see HeadPtr<Head, 1>). Today only non-paged Q sources
+    // reach this function, but the guard keeps it correct for any SrcHeadPtr (same contract as
+    // copyPartialHeadsAsync); for non-paged sources it folds to the plain null check.
+    uint32_t const tileValidMask = srcTileValidMask(src);
 #pragma unroll
     for (uint32_t i = 0; i < divUp(nbTotalGrains, nbThreads); i++)
     {
@@ -352,11 +452,13 @@ __device__ inline void copyHeadsAsyncMultiWarp(
         constexpr uint32_t nbValidGrains = exactDiv(sizeof(SrcHead), grainBytes);
         bool const isGrainInBound = (!isHeadPadded || idxGrainInsideHead < nbValidGrains);
         SrcHead const* const pSrcHead = src + localHeadIdxMap(idxHeadLocal);
-        bool const isValidPage = (pSrcHead != nullptr);
+        bool const isValidPage
+            = SrcHeadPtrNeverNull<mha::decay_t<SrcHeadPtr>>::value || (pSrcHead != nullptr);
         LdGrain const* const pSrc = reinterpret_cast<LdGrain const*>(pSrcHead) + idxGrainInsideHead;
         LdGrain* const pDst = &dst.template at<swizzle>(idxHeadLocal, idxGrainInsideHead);
         assert(!hasBankConflict(pDst));
-        ldgsts::copyAsync<grainBytes>(pDst, pSrc, isValidPage && isHeadInBound && isGrainInBound ? grainBytes : 0u);
+        ldgsts::copyAsync<grainBytes>(
+            pDst, pSrc, tileValidMask & (isValidPage && isHeadInBound && isGrainInBound ? grainBytes : 0u));
     }
 }
 
