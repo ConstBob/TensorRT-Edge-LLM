@@ -1217,11 +1217,11 @@ _nvfp4_moe_plugin_geforce_schema = OpSchema(
 )
 
 # ---------------------------------------------------------------------------
-# trt_edgellm::FusedGemmAllReducePlugin (row-parallel NVFP4 GEMM)
+# trt_edgellm::FusedNvfp4GemmAllReducePlugin (row-parallel NVFP4 GEMM)
 # ---------------------------------------------------------------------------
 
-_fused_gemm_allreduce_plugin_schema = OpSchema(
-    name="FusedGemmAllReducePlugin",
+_fused_nvfp4_gemm_allreduce_plugin_schema = OpSchema(
+    name="FusedNvfp4GemmAllReducePlugin",
     domain="trt_edgellm",
     since_version=_SCHEMA_SINCE_VERSION,
     doc=("NVFP4 row-parallel GEMM fused with AllReduce.  Replaces the "
@@ -1271,18 +1271,6 @@ _fused_gemm_allreduce_plugin_schema = OpSchema(
             type=OpSchema.AttrType.INT,
             description="Tensor parallel world size",
             required=True,
-        ),
-        OpSchema.Attribute(
-            name="fuse_residual_rmsnorm",
-            type=OpSchema.AttrType.INT,
-            description="0/1: fuse the post-AllReduce residual+RMSNorm",
-            required=False,
-        ),
-        OpSchema.Attribute(
-            name="rmsnorm_epsilon",
-            type=OpSchema.AttrType.FLOAT,
-            description="RMSNorm epsilon when fuse_residual_rmsnorm=1",
-            required=False,
         ),
     ],
 )
@@ -1455,7 +1443,7 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _int4_moe_plugin_schema,
     _nvfp4_moe_plugin_schema,
     _nvfp4_moe_plugin_geforce_schema,
-    _fused_gemm_allreduce_plugin_schema,
+    _fused_nvfp4_gemm_allreduce_plugin_schema,
     _dflash_target_kv_cache_update_schema,
     _gemma4_audio_attention_plugin_schema,
 )
