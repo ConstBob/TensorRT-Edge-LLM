@@ -1912,5 +1912,6 @@ bool LLMInferenceRuntime::performBatchEvict(DecodingInferenceContext& context, D
 
     return true;
 }
+
 } // namespace rt
 } // namespace trt_edgellm
