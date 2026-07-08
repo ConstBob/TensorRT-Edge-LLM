@@ -11,14 +11,32 @@
       "begin": "{$edge-llm-internal-release begin}",
       "end": "{$edge-llm-internal-release end}"
     },
-    "delete_paths": [],
+    "delete_paths": [
+      "cpp/kernels/multiDeviceKernels/shmAllReduce.cu",
+      "cpp/kernels/multiDeviceKernels/shmAllReduce.h",
+      "unittests/shmAllReduceTests.cu"
+    ],
     "strip_paths": [
       "cmake/CuteDsl.cmake",
       "kernelSrcs/build_cutedsl.py",
-      "kernelSrcs/gemm_cutedsl/gemm_blackwell_nvfp4_ws.py"
+      "kernelSrcs/gemm_cutedsl/gemm_blackwell_nvfp4_ws.py",
+      "cpp/kernels/multiDeviceKernels/cuteDslGemmNvFp4Runner.h",
+      "cpp/plugins/allReducePlugin/allReducePlugin.cpp",
+      "cpp/plugins/allReducePlugin/allReducePlugin.h",
+      "cpp/plugins/fusedNvfp4GemmAllReducePlugin/fusedNvfp4GemmAllReducePlugin.cpp",
+      "cpp/plugins/fusedNvfp4GemmAllReducePlugin/fusedNvfp4GemmAllReducePlugin.h"
     ],
     "forbidden_patterns": [
-      "edge-llm-internal-release"
+      "edge-llm-internal-release",
+      "shmAllReduce",
+      "ShmAllReduce",
+      "EDGELLM_SHM",
+      "SuperThor",
+      "enableShmAllReduce",
+      "shmMaxElements",
+      "shmAllReduceElementThreshold",
+      "shmFp8SmallPathElementThreshold",
+      "shmSessionName"
     ]
   }
 }

@@ -238,6 +238,7 @@ function(cute_dsl_setup)
   endif()
 
   set(_static_lib "${_artifact_dir}/libcutedsl_${_arch}.a")
+  set(_runtime_lib "${_artifact_dir}/libcute_dsl_runtime.so")
   set(_inc_dir "${_artifact_dir}/include")
   set(_metadata "${_artifact_dir}/metadata.json")
 
@@ -826,12 +827,64 @@ function(cute_dsl_setup)
     )
   endif()
 
-  # Warp-specialised NVFP4 GEMM variants. The umbrella
-  # CUTE_DSL_GEMM_NVFP4_ENABLED comes for free from the per-group loop (active
-  # when ``gemm_nvfp4`` is in metadata.json "groups"). Per-variant defines
-  # follow the CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_<OUT_DTYPE>_TN<N>_ENABLED
-  # pattern so callers can compile the FP16-output and FP8-output paths
-  # independently.
+  # NVFP4 GEMM variants. The umbrella CUTE_DSL_GEMM_NVFP4_ENABLED comes from the
+  # active gemm_nvfp4 group; these per-variant defines let callers compile only
+  # the AOT entry points present in the selected artifact.
+  list(FIND _variants "gemm_blackwell_nvfp4_fp16_tn64"
+       _gemm_bw_nvfp4_fp16_tn64_idx)
+  if(NOT ${_gemm_bw_nvfp4_fp16_tn64_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BLACKWELL_NVFP4_FP16_TN64_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_nvfp4_fp16_tn64 — CUTE_DSL_GEMM_BLACKWELL_NVFP4_FP16_TN64_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_blackwell_nvfp4_fp16_tn128"
+       _gemm_bw_nvfp4_fp16_tn128_idx)
+  if(NOT ${_gemm_bw_nvfp4_fp16_tn128_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BLACKWELL_NVFP4_FP16_TN128_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_nvfp4_fp16_tn128 — CUTE_DSL_GEMM_BLACKWELL_NVFP4_FP16_TN128_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_blackwell_nvfp4_fp8_tn64"
+       _gemm_bw_nvfp4_fp8_tn64_idx)
+  if(NOT ${_gemm_bw_nvfp4_fp8_tn64_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BLACKWELL_NVFP4_FP8_TN64_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_nvfp4_fp8_tn64 — CUTE_DSL_GEMM_BLACKWELL_NVFP4_FP8_TN64_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_blackwell_nvfp4_fp8_tn128"
+       _gemm_bw_nvfp4_fp8_tn128_idx)
+  if(NOT ${_gemm_bw_nvfp4_fp8_tn128_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BLACKWELL_NVFP4_FP8_TN128_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_nvfp4_fp8_tn128 — CUTE_DSL_GEMM_BLACKWELL_NVFP4_FP8_TN128_ENABLED set"
+    )
+  endif()
+
+  # Warp-specialised NVFP4 GEMM variants. Per-variant defines follow the
+  # CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_<OUT_DTYPE>_TN<N>_ENABLED pattern so
+  # callers can compile the FP16-output and FP8-output paths independently.
   list(FIND _variants "gemm_blackwell_nvfp4_ws_fp16_tn64"
        _gemm_bw_nvfp4_ws_fp16_tn64_idx)
   if(NOT ${_gemm_bw_nvfp4_ws_fp16_tn64_idx} EQUAL -1)
@@ -913,6 +966,15 @@ function(cute_dsl_setup)
     _gemm_blackwell_idx
     _gemm_blackwell_bias_silu_idx
     _gemm_blackwell_bias_idx
+    _gemm_bw_nvfp4_fp16_tn64_idx
+    _gemm_bw_nvfp4_fp16_tn128_idx
+    _gemm_bw_nvfp4_fp8_tn64_idx
+    _gemm_bw_nvfp4_fp8_tn128_idx
+    _gemm_bw_nvfp4_ws_fp16_tn64_idx
+    _gemm_bw_nvfp4_ws_fp16_tn128_idx
+    _gemm_bw_nvfp4_ws_fp16_tn256_idx
+    _gemm_bw_nvfp4_ws_fp8_tn64_idx
+    _gemm_bw_nvfp4_ws_fp8_tn128_idx
     _gemm_bw_geforce_idx
     _gemm_bw_geforce_small_idx
     _gemm_bw_geforce_bias_silu_idx
@@ -933,12 +995,17 @@ function(cute_dsl_setup)
   # For STATIC libraries, use PUBLIC so executables that link edgellmCore /
   # edgellmKernels also inherit the CuTe DSL archive. Otherwise unresolved AOT
   # wrapper symbols only show up at the final executable link step.
+  set(_link_libs "${_static_lib}")
+  if(EXISTS "${_runtime_lib}")
+    list(APPEND _link_libs "${_runtime_lib}")
+    message(STATUS "CuTe DSL: runtime library found: ${_runtime_lib}")
+  endif()
   foreach(_tgt ${ARG_LINK_TARGETS})
     get_target_property(_tgt_type ${_tgt} TYPE)
     if(_tgt_type STREQUAL "STATIC_LIBRARY")
-      target_link_libraries(${_tgt} PUBLIC "${_static_lib}")
+      target_link_libraries(${_tgt} PUBLIC ${_link_libs})
     else()
-      target_link_libraries(${_tgt} PRIVATE "${_static_lib}"
+      target_link_libraries(${_tgt} PRIVATE ${_link_libs}
                                             trt_edgellm_cutedsl_cudart_shim)
     endif()
     if(CUDA_DRIVER_LIB AND NOT CUDA_DRIVER_LIB MATCHES "-NOTFOUND$")
