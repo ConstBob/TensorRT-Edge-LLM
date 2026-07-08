@@ -18,10 +18,12 @@
 #ifdef CUTE_DSL_FMHA_ENABLED
 
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 #include <climits>
 #include <cmath>
 #include <optional>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -303,6 +305,108 @@ void runLlmPagedMatchesContiguousCase(
             + " headDim=" + std::to_string(headDim) + " tokensPerPage=" + std::to_string(tokensPerPage));
 }
 
+void runLlmFp8LongSequenceAccuracyCase()
+{
+    // Nemotron layer-0 scales and SD GQA geometry. A 2048-token sequence exercises
+    // multiple online-softmax tiles where FP8 skip-correction must remain representable.
+    constexpr int32_t batchSize = 1;
+    constexpr int32_t seqLen = 2048;
+    constexpr int32_t numQHeads = 32;
+    constexpr int32_t numKVHeads = 2;
+    constexpr int32_t headDim = 128;
+    constexpr float qScale = 0.01429094560444355f;
+    constexpr float kScale = 1.0f;
+    constexpr float vScale = 1.0f;
+
+    size_t const qSize = static_cast<size_t>(batchSize) * seqLen * numQHeads * headDim;
+    size_t const kvSize = static_cast<size_t>(batchSize) * seqLen * numKVHeads * headDim;
+    size_t const kvCacheSize = 2 * kvSize;
+
+    std::vector<__nv_fp8_e4m3> qFp8Host(qSize);
+    std::vector<__nv_fp8_e4m3> kvCacheFp8Host(kvCacheSize);
+    std::vector<half> qReferenceHost(qSize);
+    std::vector<half> kReferenceHost(kvSize);
+    std::vector<half> vReferenceHost(kvSize);
+
+    // Dequantize the generated E4M3 values for the reference path so both
+    // implementations receive identical quantized inputs.
+    std::mt19937 generator{20260703};
+    std::uniform_real_distribution<float> distribution{-6.0f, 6.0f};
+    for (size_t index = 0; index < qSize; ++index)
+    {
+        __nv_fp8_e4m3 const quantized{distribution(generator) / qScale};
+        qFp8Host[index] = quantized;
+        qReferenceHost[index] = __float2half(static_cast<float>(quantized) * qScale);
+    }
+    for (int32_t token = 0; token < seqLen; ++token)
+    {
+        for (int32_t kvHead = 0; kvHead < numKVHeads; ++kvHead)
+        {
+            for (int32_t dim = 0; dim < headDim; ++dim)
+            {
+                __nv_fp8_e4m3 const quantizedK{distribution(generator) / kScale};
+                __nv_fp8_e4m3 const quantizedV{distribution(generator) / vScale};
+                size_t const referenceIndex = static_cast<size_t>((token * numKVHeads + kvHead) * headDim + dim);
+                size_t const kCacheIndex = static_cast<size_t>((kvHead * seqLen + token) * headDim + dim);
+                size_t const vCacheIndex
+                    = static_cast<size_t>(((numKVHeads + kvHead) * seqLen + token) * headDim + dim);
+                kvCacheFp8Host[kCacheIndex] = quantizedK;
+                kvCacheFp8Host[vCacheIndex] = quantizedV;
+                kReferenceHost[referenceIndex] = __float2half(static_cast<float>(quantizedK) * kScale);
+                vReferenceHost[referenceIndex] = __float2half(static_cast<float>(quantizedV) * vScale);
+            }
+        }
+    }
+
+    rt::Tensor qFp8({batchSize, seqLen, numQHeads, headDim}, rt::DeviceType::kGPU, DataType::kFP8);
+    rt::Tensor kvCacheFp8({batchSize, 2, numKVHeads, seqLen, headDim}, rt::DeviceType::kGPU, DataType::kFP8);
+    rt::Tensor qReference({batchSize, seqLen, numQHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor kReference({batchSize, seqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor vReference({batchSize, seqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor outputCuteDsl({batchSize, seqLen, numQHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor outputReference({batchSize, seqLen, numQHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor cuKVSeqLens({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
+
+    copyHostToDevice(qFp8, qFp8Host);
+    copyHostToDevice(kvCacheFp8, kvCacheFp8Host);
+    copyHostToDevice(qReference, qReferenceHost);
+    copyHostToDevice(kReference, kReferenceHost);
+    copyHostToDevice(vReference, vReferenceHost);
+    copyHostToDevice(cuKVSeqLens, std::vector<int32_t>{0, seqLen});
+
+    cudaStream_t stream = nullptr;
+    CuteDslFMHARunner runner(numQHeads, numKVHeads, headDim, batchSize, seqLen, seqLen);
+    runner.run(qFp8.rawPointer(), kvCacheFp8.rawPointer(), outputCuteDsl.rawPointer(),
+        cuKVSeqLens.dataPointer<int32_t>(), stream, INT_MAX, true, qScale, kScale, vScale);
+    rt::launchFmhaReferenceBshd(qReference, kReference, vReference, outputReference, true, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaGetLastError());
+
+    auto const actual = copyDeviceToHost<half>(outputCuteDsl);
+    auto const expected = copyDeviceToHost<half>(outputReference);
+    double sumAbsError = 0.0;
+    double sumSquaredActual = 0.0;
+    double sumSquaredExpected = 0.0;
+    double dot = 0.0;
+    bool nanDetected = false;
+    for (size_t index = 0; index < qSize; ++index)
+    {
+        float const actualValue = __half2float(actual[index]);
+        float const expectedValue = __half2float(expected[index]);
+        sumAbsError += std::fabs(actualValue - expectedValue);
+        sumSquaredActual += static_cast<double>(actualValue) * actualValue;
+        sumSquaredExpected += static_cast<double>(expectedValue) * expectedValue;
+        dot += static_cast<double>(actualValue) * expectedValue;
+        nanDetected = nanDetected || std::isnan(actualValue);
+    }
+
+    double const meanAbsError = sumAbsError / qSize;
+    double const cosineSimilarity = dot / std::sqrt(std::max(sumSquaredActual * sumSquaredExpected, 1.0e-30));
+    EXPECT_FALSE(nanDetected);
+    EXPECT_LT(meanAbsError, 0.05);
+    EXPECT_GT(cosineSimilarity, 0.99);
+}
+
 } // namespace
 
 TEST(CuteDslFMHARunnerTest, vitAccuracy)
@@ -427,6 +531,22 @@ TEST(CuteDslFMHARunnerTest, llmPagedKVMatchesContiguous)
         runLlmPagedMatchesContiguousCase(testCase.batchSize, testCase.seqLen, testCase.numQHeads, testCase.numKVHeads,
             testCase.headDim, testCase.tokensPerPage);
     }
+}
+
+TEST(CuteDslFMHARunnerTest, llmFp8LongSequenceAccuracy)
+{
+    int32_t const rawSmVersion = getSMVersion();
+    if (!isSupportedCuteDslTestSm(rawSmVersion))
+    {
+        GTEST_SKIP() << "CuTe DSL FMHA unit tests only run on SM100/101/110. Current SM=" << rawSmVersion;
+    }
+
+    if (!CuteDslFMHARunner::loadLLMKernelModule())
+    {
+        FAIL() << "Failed to load CuTe DSL LLM FMHA kernel module";
+    }
+
+    runLlmFp8LongSequenceAccuracyCase();
 }
 
 #endif

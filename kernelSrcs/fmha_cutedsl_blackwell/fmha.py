@@ -267,14 +267,16 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         # skip-correction: skip the per-tile O/row_sum rescale when the row-max grew
         # by <= rescale_threshold (in log2 units). Keeping the old max makes the
-        # rescale an identity (acc_scale = exp2(0) = 1). P can then reach up to
-        # 2^threshold, which must fit the dtype P is cast to before the PV matmul
-        # (self.q_dtype, see the s_vec.to(self.q_dtype) store below): fp16 (16-bit,
-        # max ~2^16) uses 15.0; FP8 E4M3 (max 448 ~= 2^8.8) uses 8.0. On by default;
-        # benchmarks show a +2-3.8% prefill win at D128 (grows with seq length) and
-        # ~neutral at D64. 0.0 disables skip-correction.
+        # rescale an identity (acc_scale = exp2(0) = 1). P can then reach
+        # 2^(threshold + softmax_prescale_log2), which must fit the dtype P is
+        # cast to before the PV matmul (self.q_dtype). FP16 has no prescale and
+        # uses 15.0. FP8 E4M3 has max 448 and already uses an 8-bit prescale, so
+        # only log2(448) - 8 bits of additional headroom remain.
         if self.enable_skip_correction:
-            self.rescale_threshold = 15.0 if self.q_dtype.width == 16 else 8.0
+            fp8_rescale_threshold = math.log2(448.0) - self.softmax_prescale_log2
+            self.rescale_threshold = (
+                15.0 if self.q_dtype.width == 16 else fp8_rescale_threshold
+            )
         else:
             self.rescale_threshold = 0.0
 
@@ -2346,7 +2348,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         # skip-correction: if the row-max grew by <= rescale_threshold (log2 units),
         # keep the previous max as the normalization point so the O/row_sum rescale
         # becomes identity and the correction step is skipped. P is then normalized
-        # to old_row_max and can reach up to 2^threshold (fits fp16 at 15 / fp8 at 8).
+        # to old_row_max and remains representable after the dtype-specific prescale.
         if cutlass.const_expr(self.rescale_threshold > 0.0):
             if (row_max_safe - old_row_max) * scale_softmax_log2 <= self.rescale_threshold:
                 row_max_safe = old_row_max
