@@ -22,8 +22,14 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cuda.h>
 #include <gtest/gtest.h>
+#include <iostream>
+#include <memory>
+#include <optional>
 #include <random>
+#include <stdexcept>
 #include <vector>
 
 #include "common/cudaUtils.h"
@@ -52,6 +58,122 @@ float thresholdedSoftplus(float x)
     constexpr float threshold = 20.f;
     return (x <= threshold) ? softplus(x) : x;
 }
+
+size_t roundUpTo(size_t value, size_t alignment)
+{
+    return ((value + alignment - 1) / alignment) * alignment;
+}
+
+class GuardedDeviceBuffer
+{
+public:
+    explicit GuardedDeviceBuffer(size_t logicalBytes)
+    {
+        try
+        {
+            CUDA_DRIVER_CHECK(cuInit(0));
+
+            int device{};
+            CUDA_CHECK(cudaGetDevice(&device));
+            CUdevice cuDevice{};
+            CUDA_DRIVER_CHECK(cuDeviceGet(&cuDevice, device));
+
+            int vmmSupported{};
+            CUDA_DRIVER_CHECK(
+                cuDeviceGetAttribute(&vmmSupported, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, cuDevice));
+            if (vmmSupported == 0)
+            {
+                throw std::runtime_error("CUDA VMM is not supported on this device");
+            }
+
+            CUmemAllocationProp prop{};
+            prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+            prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            prop.location.id = device;
+            prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_NONE;
+
+            size_t granularity{};
+            CUDA_DRIVER_CHECK(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+            mMappedBytes = roundUpTo(logicalBytes, granularity);
+            mReservedBytes = mMappedBytes + granularity;
+
+            CUDA_DRIVER_CHECK(cuMemAddressReserve(&mBase, mReservedBytes, granularity, 0, 0));
+            mHasAddress = true;
+            CUDA_DRIVER_CHECK(cuMemCreate(&mHandle, mMappedBytes, &prop, 0));
+            mHasHandle = true;
+            CUDA_DRIVER_CHECK(cuMemMap(mBase, mMappedBytes, 0, mHandle, 0));
+            mIsMapped = true;
+
+            CUmemAccessDesc access{};
+            access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            access.location.id = device;
+            access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            CUDA_DRIVER_CHECK(cuMemSetAccess(mBase, mMappedBytes, &access, 1));
+
+            mData = mBase + (mMappedBytes - logicalBytes);
+        }
+        catch (...)
+        {
+            cleanup();
+            throw;
+        }
+    }
+
+    GuardedDeviceBuffer(GuardedDeviceBuffer const&) = delete;
+    GuardedDeviceBuffer& operator=(GuardedDeviceBuffer const&) = delete;
+
+    ~GuardedDeviceBuffer()
+    {
+        cleanup();
+    }
+
+    void* data() const
+    {
+        return reinterpret_cast<void*>(mData);
+    }
+
+private:
+    void cleanup() noexcept
+    {
+        if (mIsMapped)
+        {
+            (void) cuMemUnmap(mBase, mMappedBytes);
+            mIsMapped = false;
+        }
+        if (mHasHandle)
+        {
+            (void) cuMemRelease(mHandle);
+            mHasHandle = false;
+        }
+        if (mHasAddress)
+        {
+            (void) cuMemAddressFree(mBase, mReservedBytes);
+            mHasAddress = false;
+        }
+        mBase = 0;
+        mData = 0;
+        mMappedBytes = 0;
+        mReservedBytes = 0;
+    }
+
+    size_t mMappedBytes{};
+    size_t mReservedBytes{};
+    CUdeviceptr mBase{};
+    CUdeviceptr mData{};
+    CUmemGenericAllocationHandle mHandle{};
+    bool mHasAddress{};
+    bool mHasHandle{};
+    bool mIsMapped{};
+};
+
+enum class GuardedSsdInput
+{
+    kX,
+    kDt,
+    kB,
+    kC,
+    kAll,
+};
 
 /// CPU reference for SSD prefill (sequential scan, matches selectiveStateUpdatePrefill).
 void ssdPrefillReference(int32_t batch, int32_t seqLen, int32_t nheads, int32_t dim, int32_t dstate, int32_t ngroups,
@@ -218,9 +340,9 @@ TEST_P(SsdCuteDslTest, CorrectnessVsSerialReference)
 
     // SM80 wrapper now takes fp16 D / dt_bias / state (matches plugin contract).
     std::vector<half> dHostFp16(nheads), dtBiasHostFp16(nheads), stateHostFp16(stateSize);
-    for (size_t i = 0; i < nheads; ++i)
+    for (size_t i = 0; i < dHostFp16.size(); ++i)
         dHostFp16[i] = __float2half(dHost[i]);
-    for (size_t i = 0; i < nheads; ++i)
+    for (size_t i = 0; i < dtBiasHostFp16.size(); ++i)
         dtBiasHostFp16[i] = __float2half(dtBiasHost[i]);
     for (size_t i = 0; i < stateSize; ++i)
         stateHostFp16[i] = __float2half(stateHost[i]);
@@ -445,6 +567,24 @@ TEST(SsdCuteDslVarlenMetadata, HandlesUnalignedPaddedRows)
 
 #ifdef CUTE_DSL_SSD_BLACKWELL_ENABLED
 
+char const* guardedSsdInputName(GuardedSsdInput guardedInput)
+{
+    switch (guardedInput)
+    {
+    case GuardedSsdInput::kX: return "X";
+    case GuardedSsdInput::kDt: return "Dt";
+    case GuardedSsdInput::kB: return "B";
+    case GuardedSsdInput::kC: return "C";
+    case GuardedSsdInput::kAll: return "All";
+    }
+    return "Unknown";
+}
+
+rt::Tensor makeGpuTensor(int64_t elements, DataType dataType, std::string const& name)
+{
+    return rt::Tensor(rt::Coords{elements}, rt::DeviceType::kGPU, dataType, name);
+}
+
 // =============================================================================
 // Blackwell test fixture (SM100+, dim=64, dstate=128)
 // =============================================================================
@@ -536,9 +676,9 @@ TEST_P(SsdCuteDslBlackwellTest, CorrectnessVsSerialReference)
         dtBiasHost, true, refState, refOut, contextLengthsPtr);
 
     std::vector<half> dHostFp16(nheads), dtBiasHostFp16(nheads), stateHostFp16(stateSize);
-    for (size_t i = 0; i < nheads; ++i)
+    for (size_t i = 0; i < dHostFp16.size(); ++i)
         dHostFp16[i] = __float2half(dHost[i]);
-    for (size_t i = 0; i < nheads; ++i)
+    for (size_t i = 0; i < dtBiasHostFp16.size(); ++i)
         dtBiasHostFp16[i] = __float2half(dtBiasHost[i]);
     for (size_t i = 0; i < stateSize; ++i)
         stateHostFp16[i] = __float2half(stateHost[i]);
@@ -666,6 +806,260 @@ TEST_P(SsdCuteDslBlackwellTest, CorrectnessVsSerialReference)
     }
 }
 
+int runSsdTmaBoundsCase(GuardedSsdInput guardedInput)
+{
+    try
+    {
+        int device{};
+        CUDA_CHECK(cudaGetDevice(&device));
+        cudaDeviceProp prop{};
+        CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+        if (prop.major < 10)
+        {
+            std::cerr << "Blackwell tests require SM100+ GPU (got SM" << prop.major << prop.minor << ")\n";
+            return 1;
+        }
+
+        CUDA_DRIVER_CHECK(cuInit(0));
+        CUdevice cuDevice{};
+        CUDA_DRIVER_CHECK(cuDeviceGet(&cuDevice, device));
+        int vmmSupported{};
+        CUDA_DRIVER_CHECK(
+            cuDeviceGetAttribute(&vmmSupported, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, cuDevice));
+        if (vmmSupported == 0)
+        {
+            std::cerr << "CUDA VMM is required for the guard-page allocation\n";
+            return 1;
+        }
+
+        if (!CuteDslSSDRunner::loadKernelModules())
+        {
+            std::cerr << "Failed to load SSD CuTe DSL kernel modules\n";
+            return 1;
+        }
+
+        int32_t constexpr batch = 1;
+        int32_t constexpr seqLen = 129;
+        int32_t constexpr nheads = 8;
+        int32_t constexpr dim = 64;
+        int32_t constexpr dstate = 128;
+        int32_t constexpr ngroups = 1;
+        if (!CuteDslSSDRunner::canImplement(dim, dstate, 100))
+        {
+            std::cerr << "CuteDslSSDRunner cannot implement dim=" << dim << " dstate=" << dstate << " for SM100\n";
+            return 1;
+        }
+
+        size_t constexpr xSize = static_cast<size_t>(batch) * seqLen * nheads * dim;
+        size_t constexpr dtSize = static_cast<size_t>(batch) * seqLen * nheads;
+        size_t constexpr bSize = static_cast<size_t>(batch) * seqLen * ngroups * dstate;
+        size_t constexpr stateSize = static_cast<size_t>(batch) * nheads * dim * dstate;
+
+        std::mt19937 rng(2026);
+        std::normal_distribution<float> normal(0.f, 0.5f);
+        std::uniform_real_distribution<float> uniform(0.1f, 0.6f);
+
+        std::vector<half> xHost(xSize), dtHost(dtSize), bHost(bSize), cHost(bSize);
+        std::vector<float> aHost(nheads);
+        std::vector<half> dHost(nheads), dtBiasHost(nheads), stateHost(stateSize, __float2half(0.f));
+        for (auto& v : xHost)
+            v = __float2half(normal(rng));
+        for (auto& v : dtHost)
+            v = __float2half(uniform(rng));
+        for (auto& v : bHost)
+            v = __float2half(normal(rng));
+        for (auto& v : cHost)
+            v = __float2half(normal(rng));
+        for (auto& v : aHost)
+            v = -(uniform(rng) + 0.5f);
+        for (auto& v : dHost)
+            v = __float2half(normal(rng) * 0.1f);
+        for (auto& v : dtBiasHost)
+            v = __float2half(normal(rng) * 0.1f);
+
+        bool const guardX = guardedInput == GuardedSsdInput::kX || guardedInput == GuardedSsdInput::kAll;
+        bool const guardDt = guardedInput == GuardedSsdInput::kDt || guardedInput == GuardedSsdInput::kAll;
+        bool const guardB = guardedInput == GuardedSsdInput::kB || guardedInput == GuardedSsdInput::kAll;
+        bool const guardC = guardedInput == GuardedSsdInput::kC || guardedInput == GuardedSsdInput::kAll;
+
+        std::unique_ptr<GuardedDeviceBuffer> xGuard;
+        std::unique_ptr<GuardedDeviceBuffer> dtGuard;
+        std::unique_ptr<GuardedDeviceBuffer> bGuard;
+        std::unique_ptr<GuardedDeviceBuffer> cGuard;
+        std::optional<rt::Tensor> xTensor;
+        std::optional<rt::Tensor> dtTensor;
+        std::optional<rt::Tensor> bTensor;
+        std::optional<rt::Tensor> cTensor;
+        void *dX{}, *dDt{}, *dA{}, *dB{}, *dC{}, *dD{}, *dDtBias{}, *dState{}, *dOutput{};
+        if (guardX)
+        {
+            xGuard = std::make_unique<GuardedDeviceBuffer>(xSize * sizeof(half));
+            dX = xGuard->data();
+        }
+        else
+        {
+            xTensor.emplace(makeGpuTensor(static_cast<int64_t>(xSize), DataType::kHALF, "x"));
+            dX = xTensor->rawPointer();
+        }
+        if (guardDt)
+        {
+            dtGuard = std::make_unique<GuardedDeviceBuffer>(dtSize * sizeof(half));
+            dDt = dtGuard->data();
+        }
+        else
+        {
+            dtTensor.emplace(makeGpuTensor(static_cast<int64_t>(dtSize), DataType::kHALF, "dt"));
+            dDt = dtTensor->rawPointer();
+        }
+        if (guardB)
+        {
+            bGuard = std::make_unique<GuardedDeviceBuffer>(bSize * sizeof(half));
+            dB = bGuard->data();
+        }
+        else
+        {
+            bTensor.emplace(makeGpuTensor(static_cast<int64_t>(bSize), DataType::kHALF, "B"));
+            dB = bTensor->rawPointer();
+        }
+        if (guardC)
+        {
+            cGuard = std::make_unique<GuardedDeviceBuffer>(bSize * sizeof(half));
+            dC = cGuard->data();
+        }
+        else
+        {
+            cTensor.emplace(makeGpuTensor(static_cast<int64_t>(bSize), DataType::kHALF, "C"));
+            dC = cTensor->rawPointer();
+        }
+        rt::Tensor aTensor = makeGpuTensor(nheads, DataType::kFLOAT, "A");
+        rt::Tensor dTensor = makeGpuTensor(nheads, DataType::kHALF, "D");
+        rt::Tensor dtBiasTensor = makeGpuTensor(nheads, DataType::kHALF, "dtBias");
+        rt::Tensor stateTensor = makeGpuTensor(static_cast<int64_t>(stateSize), DataType::kHALF, "state");
+        rt::Tensor outputTensor = makeGpuTensor(static_cast<int64_t>(xSize), DataType::kHALF, "output");
+        dA = aTensor.rawPointer();
+        dD = dTensor.rawPointer();
+        dDtBias = dtBiasTensor.rawPointer();
+        dState = stateTensor.rawPointer();
+        dOutput = outputTensor.rawPointer();
+
+        CUDA_CHECK(cudaMemcpy(dX, xHost.data(), xSize * sizeof(half), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dDt, dtHost.data(), dtSize * sizeof(half), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dA, aHost.data(), nheads * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dB, bHost.data(), bSize * sizeof(half), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dC, cHost.data(), bSize * sizeof(half), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dD, dHost.data(), nheads * sizeof(half), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dDtBias, dtBiasHost.data(), nheads * sizeof(half), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dState, stateHost.data(), stateSize * sizeof(half), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemset(dOutput, 0, xSize * sizeof(half)));
+
+        size_t const wsSize = CuteDslSSDRunner::getWorkspaceSize(batch, seqLen, nheads, dim, dstate, ngroups);
+        std::optional<rt::Tensor> workspaceTensor;
+        void* dWorkspace{};
+        if (wsSize > 0)
+        {
+            workspaceTensor.emplace(makeGpuTensor(static_cast<int64_t>(wsSize), DataType::kUINT8, "workspace"));
+            dWorkspace = workspaceTensor->rawPointer();
+            CUDA_CHECK(cudaMemset(dWorkspace, 0, wsSize));
+        }
+
+        SSDParams params{};
+        params.x = dX;
+        params.dt = dDt;
+        params.A = dA;
+        params.B = dB;
+        params.C = dC;
+        params.D = dD;
+        params.dt_bias = dDtBias;
+        params.z = nullptr;
+        params.state = dState;
+        params.output = dOutput;
+        params.workspace = dWorkspace;
+        params.batch = batch;
+        params.seq_len = seqLen;
+        params.nheads = nheads;
+        params.dim = dim;
+        params.dstate = dstate;
+        params.ngroups = ngroups;
+        params.smVersion = 100;
+        params.dt_softplus = true;
+        params.has_D = true;
+        params.has_z = false;
+        params.has_init_states = false;
+
+        CuteDslSSDRunner runner;
+        int const runStatus = runner.run(params, nullptr);
+        cudaError_t const syncStatus = cudaDeviceSynchronize();
+
+        if (runStatus != 0)
+        {
+            std::cerr << "CuteDslSSDRunner::run (Blackwell) failed while guarding " << guardedSsdInputName(guardedInput)
+                      << "\n";
+            return 1;
+        }
+        if (syncStatus != cudaSuccess)
+        {
+            std::cerr << "Final partial TMA tile read past a logical tensor bound while guarding "
+                      << guardedSsdInputName(guardedInput) << ": " << cudaGetErrorString(syncStatus) << "\n";
+            return 1;
+        }
+        return 0;
+    }
+    catch (std::exception const& e)
+    {
+        std::cerr << "SSD TMA bounds case failed while guarding " << guardedSsdInputName(guardedInput) << ": "
+                  << e.what() << "\n";
+        return 1;
+    }
+}
+
+class SsdCuteDslBlackwellTmaBounds : public ::testing::TestWithParam<GuardedSsdInput>
+{
+};
+
+TEST_P(SsdCuteDslBlackwellTmaBounds, FinalPartialChunkDoesNotReadPastTensor)
+{
+    GuardedSsdInput const guardedInput = GetParam();
+    int device{};
+    CUDA_CHECK(cudaGetDevice(&device));
+    cudaDeviceProp prop{};
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+    if (prop.major < 10)
+    {
+        GTEST_SKIP() << "Blackwell tests require SM100+ GPU (got SM" << prop.major << prop.minor << ")";
+    }
+
+    CUDA_DRIVER_CHECK(cuInit(0));
+    CUdevice cuDevice{};
+    CUDA_DRIVER_CHECK(cuDeviceGet(&cuDevice, device));
+    int vmmSupported{};
+    CUDA_DRIVER_CHECK(
+        cuDeviceGetAttribute(&vmmSupported, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, cuDevice));
+    if (vmmSupported == 0)
+    {
+        GTEST_SKIP() << "CUDA VMM is required for the guard-page allocation";
+    }
+
+    int32_t constexpr dim = 64;
+    int32_t constexpr dstate = 128;
+    if (!CuteDslSSDRunner::canImplement(dim, dstate, 100))
+    {
+        GTEST_SKIP() << "CuteDslSSDRunner cannot implement dim=" << dim << " dstate=" << dstate << " for SM100";
+    }
+
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT(
+        {
+            int const exitCode = runSsdTmaBoundsCase(guardedInput);
+            std::_Exit(exitCode);
+        },
+        ::testing::ExitedWithCode(0), "");
+}
+
+INSTANTIATE_TEST_SUITE_P(GuardedInput, SsdCuteDslBlackwellTmaBounds,
+    ::testing::Values(
+        GuardedSsdInput::kX, GuardedSsdInput::kDt, GuardedSsdInput::kB, GuardedSsdInput::kC, GuardedSsdInput::kAll),
+    [](testing::TestParamInfo<GuardedSsdInput> const& info) { return guardedSsdInputName(info.param); });
+
 // =============================================================================
 // Chunked prefill simulation -- exercises has_init_states correctness end-to-end.
 // Splits a single seq of length 2*chunkLen into two consecutive runner calls; the
@@ -723,9 +1117,9 @@ TEST(SsdCuteDslBlackwellChunkedPrefill, StateCarriesAcrossCalls)
 
     // Blackwell wrapper takes fp16 D / dt_bias / state (matches plugin contract).
     std::vector<half> dHostFp16(nheads), dtBiasHostFp16(nheads);
-    for (size_t i = 0; i < nheads; ++i)
+    for (size_t i = 0; i < dHostFp16.size(); ++i)
         dHostFp16[i] = __float2half(dHost[i]);
-    for (size_t i = 0; i < nheads; ++i)
+    for (size_t i = 0; i < dtBiasHostFp16.size(); ++i)
         dtBiasHostFp16[i] = __float2half(dtBiasHost[i]);
 
     auto runOnce
