@@ -92,10 +92,19 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
         ELLM_CHECK(mCandidateTopK <= kernel::kDDTreeMaxCandidateTopK,
             "DFlashDecoder DDTree draftingTopK exceeds the current candidateTopK limit.");
     }
-    mMaskTokenId = baseCfg.dflashMaskTokenId > 0 ? baseCfg.dflashMaskTokenId : deployment.draft->dflashMaskTokenId;
+    // Draft's mask_token_id is authoritative: the draft was trained expecting that
+    // specific mask id. Base config may carry an uninitialized exporter default
+    // (e.g. 248070 > vocab_size on Qwen3-8B) which, if fed to the draft engine,
+    // produces out-of-vocab embeddings and degenerate proposals. Prefer the draft's
+    // value and only fall back to base when the draft doesn't specify one.
+    mMaskTokenId
+        = deployment.draft->dflashMaskTokenId > 0 ? deployment.draft->dflashMaskTokenId : baseCfg.dflashMaskTokenId;
     mDraftHiddenSize = deployment.specConfig->draftHiddenSize;
     mBaseOutputHiddenDim = deployment.specConfig->baseOutputHiddenDim;
     mDraftVocabSize = deployment.draft->outputVocabSize;
+    ELLM_CHECK(mMaskTokenId >= 0 && mMaskTokenId < mDraftVocabSize,
+        "DFlashDecoder: mask_token_id (" + std::to_string(mMaskTokenId) + ") out of draft vocab range [0,"
+            + std::to_string(mDraftVocabSize) + ").");
 
     int32_t const maxBatch = deployment.maxRuntimeBatchSize();
     int32_t const maxSeqForDraft = baseCfg.maxKVCacheCapacity;
