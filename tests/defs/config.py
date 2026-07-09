@@ -432,6 +432,7 @@ class TestConfig:
     is_eagle: Optional[bool] = None
     is_mtp: Optional[bool] = None
     is_dflash: Optional[bool] = None
+    is_dflash_tree: Optional[bool] = None
 
     # Directory paths
     llm_models_dir: Optional[str] = None
@@ -590,6 +591,12 @@ class TestConfig:
                       is_required=False),
         ParameterSpec("is_dflash",
                       "dflash", {
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
+                          TaskType.INFERENCE
+                      }, {ModelType.LLM},
+                      is_required=False),
+        ParameterSpec("is_dflash_tree",
+                      "ddtree", {
                           TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
                           TaskType.INFERENCE
                       }, {ModelType.LLM},
@@ -837,6 +844,8 @@ class TestConfig:
                             'draft_lm_head_precision'] = draft_lm_precision
                 else:
                     parsed_params['draft_llm_precision'] = llm_precision
+            elif part == "ddtree":
+                parsed_params['is_dflash_tree'] = True
             elif part == "eagle":
                 parsed_params['is_eagle'] = True
                 # Parse eagle-{draft_id}-{draft_precision}[-lm{draft_lm_head}]
@@ -1038,6 +1047,8 @@ class TestConfig:
                     self.is_mtp = False
                 if self.is_dflash is None:
                     self.is_dflash = False
+                if self.is_dflash_tree is None:
+                    self.is_dflash_tree = False
                 if self.draft_llm_precision is not None and self.draft_lm_head_precision is None:
                     self.draft_lm_head_precision = "fp16"
                 if self.reduced_vocab_size is not None:
@@ -1068,6 +1079,8 @@ class TestConfig:
                     self.is_mtp = False
                 if self.is_dflash is None:
                     self.is_dflash = False
+                if self.is_dflash_tree is None:
+                    self.is_dflash_tree = False
                 if self.draft_llm_precision is not None and self.draft_lm_head_precision is None:
                     self.draft_lm_head_precision = "fp16"
                 if self.eagle_draft_top_k is None:
@@ -1139,6 +1152,14 @@ class TestConfig:
 
         # Set defaults after validation
         set_defaults()
+
+        if self.is_dflash_tree and not self.is_dflash:
+            raise ValueError("ddtree can only be used with DFlash tests")
+        if (self.is_dflash_tree
+                and self.task_type in (TaskType.E2E_BENCH, TaskType.INFERENCE)
+                and self.eagle_draft_top_k <= 1):
+            raise ValueError("DFlash DDTree runtime tests require edtk > 1; "
+                             "use linear DFlash without ddtree for edtk=1")
 
     def check_trt_native_attn(self) -> None:
         """Skip -trt11 tests when TRT < 11.
@@ -1628,7 +1649,8 @@ class TestConfig:
         if self.is_mtp:
             prefix = "llm-base-mtp"
         elif self.is_dflash:
-            prefix = "llm-base-dflash"
+            mode = "ddtree" if self.is_dflash_tree else "linear"
+            prefix = f"llm-base-dflash-{mode}"
         elif self.is_eagle:
             prefix = "llm-base"
         else:
@@ -1798,8 +1820,10 @@ class TestConfig:
             if self.draft_llm_precision is None:
                 raise ValueError(
                     "draft_llm_precision not set for DFlash engine")
+            mode = "ddtree" if self.is_dflash_tree else "linear"
             prefix = (
-                f"llm-dflash-{self.draft_model_id}-{self.draft_llm_precision}")
+                f"llm-dflash-{mode}-{self.draft_model_id}-{self.draft_llm_precision}"
+            )
         elif self.is_eagle:
             if self.draft_model_id is None:
                 raise ValueError("draft_model_id not set for EAGLE engine")

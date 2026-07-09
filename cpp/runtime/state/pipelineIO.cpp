@@ -31,7 +31,6 @@ namespace trt_edgellm
 {
 namespace rt
 {
-
 void allocateBasicIO(
     PipelineIO& io, int32_t maxBatch, int32_t maxSeq, int32_t hiddenSize, int32_t vocabSize, nvinfer1::DataType dtype)
 {
@@ -165,7 +164,7 @@ void buildTensorMap(
             map.set(binding_names::formatRecurrentStateName(localMambaIdx, /*isPast=*/false), rec);
             map.set(binding_names::formatConvStateName(localMambaIdx, /*isPast=*/true), conv);
             map.set(binding_names::formatConvStateName(localMambaIdx, /*isPast=*/false), conv);
-            // MTP base only: bind the per-layer intermediate state outputs.
+            // Spec-decode hybrid base: bind the per-layer intermediate state outputs.
             // `hasIntermediateRecurrentStates()` is true iff the MambaCacheManager
             // was built with `maxIntermediateSeqLen > 0` (set by createForSpecDecode
             // for hybrid MTP bases). EAGLE3 base lacks recurrent layers entirely,
@@ -226,6 +225,18 @@ void buildTensorMap(
     {
         map.set(binding_names::kAttentionMask, io.packedAttentionMask);
         map.set(binding_names::kAttentionPosId, io.specDecodePositionIds);
+    }
+    if (!io.specVerifyPhaseMarker.isEmpty())
+    {
+        map.set(binding_names::kSpecVerifyPhaseMarker, io.specVerifyPhaseMarker);
+    }
+    if (!io.specTreeParentIds.isEmpty())
+    {
+        map.set(binding_names::kTreeParentIds, io.specTreeParentIds);
+    }
+    if (!io.specTreeDepths.isEmpty())
+    {
+        map.set(binding_names::kTreeDepths, io.specTreeDepths);
     }
 
     // LoRA bindings are NOT set here because adapter tensor names may differ
@@ -333,12 +344,14 @@ PipelineIO PipelineIO::createForSpecDecode(
 
     // Use max of base and draft dimensions for shared tensors
     int32_t const maxInputLength = std::max(bundle.base.maxSupportedInputLength, bundle.draft->maxSupportedInputLength);
-    int32_t const effectiveMaxDraftProposalSize = std::max(maxDraftProposalSize, bundle.specConfig->verifySize);
+    int32_t const effectiveMaxDraftProposalSize
+        = std::max({maxDraftProposalSize, bundle.specConfig->verifySize, bundle.specConfig->dflashBlockSize});
     int32_t const maxLogitsSize = maxRuntimeBatchSize * effectiveMaxDraftProposalSize;
     int32_t const maxVocabSize = std::max(bundle.base.outputVocabSize, draftVocabSize);
+    int32_t const maxTensorSeqLen = std::max(maxInputLength, effectiveMaxDraftProposalSize);
 
     allocateBasicIO(
-        io, maxRuntimeBatchSize, maxInputLength, bundle.base.hiddenSize, maxVocabSize, nvinfer1::DataType::kHALF);
+        io, maxRuntimeBatchSize, maxTensorSeqLen, bundle.base.hiddenSize, maxVocabSize, nvinfer1::DataType::kHALF);
 
     // Override outputLogits to support proposal-sized outputs: [maxLogitsSize, maxVocabSize].
     // dtype is kFLOAT (matching allocateBasicIO); only the shape changes for SpecDecode.
@@ -346,8 +359,8 @@ PipelineIO PipelineIO::createForSpecDecode(
         {maxLogitsSize, maxVocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "PipelineIO::outputLogits");
 
     // Allocate hidden states for SpecDecode.
-    allocateSpecDecodeHiddenStates(io, maxRuntimeBatchSize, maxInputLength, baseOutputHiddenDim, draftRuntimeHiddenSize,
-        nvinfer1::DataType::kHALF);
+    allocateSpecDecodeHiddenStates(io, maxRuntimeBatchSize, maxTensorSeqLen, baseOutputHiddenDim,
+        draftRuntimeHiddenSize, nvinfer1::DataType::kHALF);
 
     if (bundle.base.numDeepstackFeatures > 0)
     {
@@ -384,6 +397,25 @@ PipelineIO PipelineIO::createForSpecDecode(
         nvinfer1::DataType::kINT64, "PipelineIO::selectTokenIndices");
     CUDA_CHECK(
         cudaMemsetAsync(io.selectTokenIndices.rawPointer(), 0, io.selectTokenIndices.getMemoryCapacity(), stream));
+
+    io.specVerifyPhaseMarker
+        = Tensor({1}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "PipelineIO::specVerifyPhaseMarker");
+    CUDA_CHECK(cudaMemsetAsync(
+        io.specVerifyPhaseMarker.rawPointer(), 0, io.specVerifyPhaseMarker.getMemoryCapacity(), stream));
+
+    bool const useDFlashTree
+        = bundle.specDecodeMode() == SpecDecodeMode::kDFlash && bundle.specConfig->draftingTopK > 1;
+    if (useDFlashTree)
+    {
+        io.specTreeParentIds = Tensor({maxRuntimeBatchSize, effectiveMaxDraftProposalSize}, DeviceType::kGPU,
+            nvinfer1::DataType::kINT32, "PipelineIO::specTreeParentIds");
+        CUDA_CHECK(
+            cudaMemsetAsync(io.specTreeParentIds.rawPointer(), 0, io.specTreeParentIds.getMemoryCapacity(), stream));
+
+        io.specTreeDepths = Tensor({maxRuntimeBatchSize, effectiveMaxDraftProposalSize}, DeviceType::kGPU,
+            nvinfer1::DataType::kINT32, "PipelineIO::specTreeDepths");
+        CUDA_CHECK(cudaMemsetAsync(io.specTreeDepths.rawPointer(), 0, io.specTreeDepths.getMemoryCapacity(), stream));
+    }
 
     return io;
 }

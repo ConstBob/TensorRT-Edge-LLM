@@ -183,9 +183,9 @@
       # at a stable per-MR cache that survives the numeric-pipeline-dir cleanup).
       # Callers that leave ONNX_REUSE unset (e.g. L1 export) always re-export, so
       # their behavior is unchanged.
-      # Re-export only when: [reexport] in the commit message, OR tensorrt_edgellm
-      # Python changed since the commit that produced the cached ONNX. The model
-      # output (generated tokens) and other paths (tests/CI/C++) never trigger it.
+      # Re-export only when: [reexport] in the commit message, OR exporter/cache
+      # contract inputs changed since the commit that produced the cached ONNX.
+      # Runtime-only tests/CI/C++ changes never trigger it.
       NEED_EXPORT=1
       META="$ONNX_DIR/.export_meta"
       if [ "${ONNX_REUSE:-0}" != "1" ]; then
@@ -198,13 +198,14 @@
         echo "git unavailable — exporting."
       else
         PREV_SHA="$(cat "$META")"
+        EXPORT_CACHE_INPUTS="tensorrt_edgellm tests/defs/config.py tests/defs/test_checkpoint_export.py tests/defs/utils/checkpoint_export_helpers.py tests/test_lists/${PRIORITY}.yml .gitlab/ci/templates.yml"
         if ! git cat-file -e "${PREV_SHA}^{commit}" 2>/dev/null; then
           echo "Cached export commit $PREV_SHA not reachable (shallow clone?) — exporting."
-        elif git diff --name-only "$PREV_SHA" "$CI_COMMIT_SHA" -- tensorrt_edgellm | grep -qE '\.py$'; then
-          echo "tensorrt_edgellm Python changed since cached export — exporting:"
-          git diff --name-only "$PREV_SHA" "$CI_COMMIT_SHA" -- tensorrt_edgellm | grep -E '\.py$' | sed 's/^/  changed: /'
+        elif git diff --name-only "$PREV_SHA" "$CI_COMMIT_SHA" -- $EXPORT_CACHE_INPUTS | grep -qE '\.(py|ya?ml)$'; then
+          echo "Checkpoint export cache inputs changed since cached export — exporting:"
+          git diff --name-only "$PREV_SHA" "$CI_COMMIT_SHA" -- $EXPORT_CACHE_INPUTS | grep -E '\.(py|ya?ml)$' | sed 's/^/  changed: /'
         else
-          echo "No tensorrt_edgellm Python changes since cached export ($PREV_SHA) — REUSING cached ONNX."
+          echo "No checkpoint export cache input changes since cached export ($PREV_SHA) — REUSING cached ONNX."
           NEED_EXPORT=0
         fi
       fi

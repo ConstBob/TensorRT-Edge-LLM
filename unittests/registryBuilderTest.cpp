@@ -360,10 +360,11 @@ TEST(RegistryBuilderTest, AllFeaturesEnabled)
     auto reg = buildRegistryForLLM(cfg);
     auto names = reg.allTensorNames();
 
-    // 6 core (incl. kvcache_start_index) + 4 KV (2 layers) + 2 deepstack + 3 SpecDecode
+    // 6 core (incl. kvcache_start_index) + 4 KV (2 layers) + 2 deepstack + 4 SpecDecode
     //   + 4 recurrent + 4 conv + 4 intermediate (2 layers × {recurrent, conv})
-    // = 27. The extra 4 intermediate-state outputs come from the MTP-base path.
-    EXPECT_EQ(names.size(), 27u);
+    // = 28. The extra 4 intermediate-state outputs and phase marker come from the MTP-base path.
+    EXPECT_EQ(names.size(), 28u);
+    EXPECT_TRUE(hasName(names, trt_edgellm::binding_names::kSpecVerifyPhaseMarker));
     EXPECT_TRUE(hasName(names, "intermediate_recurrent_state_0"));
     EXPECT_TRUE(hasName(names, "intermediate_recurrent_state_1"));
     EXPECT_TRUE(hasName(names, "intermediate_conv_state_0"));
@@ -395,6 +396,15 @@ TEST(RegistryBuilderTest, MtpBaseAddsIntermediateStateOutputs)
     EXPECT_TRUE(hasName(names, "intermediate_recurrent_state_1"));
     EXPECT_TRUE(hasName(names, "intermediate_conv_state_0"));
     EXPECT_TRUE(hasName(names, "intermediate_conv_state_1"));
+    EXPECT_TRUE(hasName(names, trt_edgellm::binding_names::kSpecVerifyPhaseMarker));
+
+    auto markerIt = std::find_if(specs.begin(), specs.end(),
+        [](TensorSpec const& s) { return s.name == trt_edgellm::binding_names::kSpecVerifyPhaseMarker; });
+    ASSERT_NE(markerIt, specs.end());
+    EXPECT_EQ(markerIt->io, TensorIO::kInput);
+    ASSERT_EQ(markerIt->shape.size(), 1u);
+    EXPECT_TRUE(markerIt->shape[0].isSymbolic());
+    EXPECT_EQ(markerIt->shape[0].symbol, &InferenceDims::specVerifyPhaseLen);
 
     // Shape: [batch, seqLen, recurrentNumHeads, recurrentHeadDim, recurrentStateSize]
     auto irecIt = std::find_if(

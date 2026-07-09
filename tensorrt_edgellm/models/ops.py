@@ -792,24 +792,50 @@ def causal_conv1d(
     padding: int,
     dilation: int,
     groups: int,
-    collect_intermediate_states: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Stub: causal conv1d; with MTP enabled it fills the 3rd output."""
-    if collect_intermediate_states:
-        batch_size, seq_len, _ = hidden_states.shape
-        intermediate_conv_state = torch.zeros(batch_size,
-                                              seq_len,
-                                              conv_state.shape[1],
-                                              conv_state.shape[2],
-                                              dtype=conv_state.dtype,
-                                              device=conv_state.device)
-        return (torch.zeros_like(hidden_states), conv_state.clone(),
-                intermediate_conv_state)
+    """Stub: causal conv1d."""
     return (torch.zeros_like(hidden_states), conv_state.clone(),
             conv_state.clone())
 
 
 @causal_conv1d.register_fake
+def _(hidden_states, weight, bias, conv_state, context_lengths, stride,
+      padding, dilation, groups):
+    return (torch.empty_like(hidden_states), conv_state.clone(),
+            torch.empty_like(conv_state))
+
+
+@torch.library.custom_op("trt_edgellm::causal_conv1d_with_intermediate",
+                         mutates_args=())
+def causal_conv1d_with_intermediate(
+    hidden_states: torch.Tensor,  # [batch, seq_len, conv_dim]
+    weight: torch.Tensor,  # [conv_dim, 1, kernel_size]
+    bias: torch.Tensor,  # [conv_dim]
+    conv_state: torch.Tensor,  # [batch, conv_dim, conv_kernel]
+    context_lengths: torch.Tensor,  # [batch] int32
+    stride: int,
+    padding: int,
+    dilation: int,
+    groups: int,
+    spec_verify_phase_marker: torch.Tensor,
+    tree_parent_ids: Optional[
+        torch.Tensor] = None,  # [batch, verify_seq] int32
+    tree_depths: Optional[torch.Tensor] = None,  # [batch, verify_seq] int32
+    use_ddtree_state: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Stub: causal conv1d with per-token intermediate state output."""
+    batch_size, seq_len, _ = hidden_states.shape
+    intermediate_conv_state = torch.zeros(batch_size,
+                                          seq_len,
+                                          conv_state.shape[1],
+                                          conv_state.shape[2],
+                                          dtype=conv_state.dtype,
+                                          device=conv_state.device)
+    return torch.zeros_like(
+        hidden_states), conv_state.clone(), intermediate_conv_state
+
+
+@causal_conv1d_with_intermediate.register_fake
 def _(hidden_states,
       weight,
       bias,
@@ -819,19 +845,19 @@ def _(hidden_states,
       padding,
       dilation,
       groups,
-      collect_intermediate_states=False):
-    if collect_intermediate_states:
-        batch_size, seq_len, _ = hidden_states.shape
-        intermediate_conv_state = torch.empty(batch_size,
-                                              seq_len,
-                                              conv_state.shape[1],
-                                              conv_state.shape[2],
-                                              dtype=conv_state.dtype,
-                                              device=conv_state.device)
-        return (torch.empty_like(hidden_states), conv_state.clone(),
-                intermediate_conv_state)
-    return (torch.empty_like(hidden_states), conv_state.clone(),
-            torch.empty_like(conv_state))
+      spec_verify_phase_marker,
+      tree_parent_ids=None,
+      tree_depths=None,
+      use_ddtree_state=False):
+    batch_size, seq_len, _ = hidden_states.shape
+    intermediate_conv_state = torch.empty(batch_size,
+                                          seq_len,
+                                          conv_state.shape[1],
+                                          conv_state.shape[2],
+                                          dtype=conv_state.dtype,
+                                          device=conv_state.device)
+    return torch.empty_like(
+        hidden_states), conv_state.clone(), intermediate_conv_state
 
 
 # ---------------------------------------------------------------------------
@@ -1039,24 +1065,49 @@ def gated_delta_net(
     context_lengths: torch.Tensor,  # [batch] int32
     k_dim: int,
     v_dim: int,
-    collect_intermediate_states: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Stub: GatedDeltaNet; with MTP enabled it fills the 3rd output."""
-    if collect_intermediate_states:
-        batch_size, seq_len, num_v_heads, _ = v.shape
-        intermediate_recurrent_state = torch.zeros(batch_size,
-                                                   seq_len,
-                                                   num_v_heads,
-                                                   k_dim,
-                                                   v_dim,
-                                                   dtype=h0_source.dtype,
-                                                   device=h0_source.device)
-        return (torch.zeros_like(v), h0_source.clone(),
-                intermediate_recurrent_state)
+    """Stub: GatedDeltaNet."""
     return torch.zeros_like(v), h0_source.clone(), h0_source.clone()
 
 
 @gated_delta_net.register_fake
+def _(q, k, v, a, b, A_log, dt_bias, h0_source, context_lengths, k_dim, v_dim):
+    return torch.empty_like(v), h0_source.clone(), torch.empty_like(h0_source)
+
+
+@torch.library.custom_op("trt_edgellm::gated_delta_net_with_intermediate",
+                         mutates_args=())
+def gated_delta_net_with_intermediate(
+    q: torch.Tensor,  # [batch, seq, num_k_heads, k_dim]
+    k: torch.Tensor,  # [batch, seq, num_k_heads, k_dim]
+    v: torch.Tensor,  # [batch, seq, num_v_heads, v_dim]
+    a: torch.Tensor,  # [batch, seq, num_v_heads]
+    b: torch.Tensor,  # [batch, seq, num_v_heads]
+    A_log: torch.Tensor,  # [num_v_heads] float32
+    dt_bias: torch.Tensor,  # [num_v_heads] float16
+    h0_source: torch.Tensor,  # [batch, num_v_heads, k_dim, v_dim] float32
+    context_lengths: torch.Tensor,  # [batch] int32
+    k_dim: int,
+    v_dim: int,
+    spec_verify_phase_marker: torch.Tensor,
+    tree_parent_ids: Optional[
+        torch.Tensor] = None,  # [batch, verify_seq] int32
+    tree_depths: Optional[torch.Tensor] = None,  # [batch, verify_seq] int32
+    use_ddtree_state: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Stub: GatedDeltaNet with per-token recurrent state output."""
+    batch_size, seq_len, num_v_heads, _ = v.shape
+    intermediate_recurrent_state = torch.zeros(batch_size,
+                                               seq_len,
+                                               num_v_heads,
+                                               k_dim,
+                                               v_dim,
+                                               dtype=h0_source.dtype,
+                                               device=h0_source.device)
+    return torch.zeros_like(v), h0_source.clone(), intermediate_recurrent_state
+
+
+@gated_delta_net_with_intermediate.register_fake
 def _(q,
       k,
       v,
@@ -1068,19 +1119,19 @@ def _(q,
       context_lengths,
       k_dim,
       v_dim,
-      collect_intermediate_states=False):
-    if collect_intermediate_states:
-        batch_size, seq_len, num_v_heads, _ = v.shape
-        intermediate_recurrent_state = torch.empty(batch_size,
-                                                   seq_len,
-                                                   num_v_heads,
-                                                   k_dim,
-                                                   v_dim,
-                                                   dtype=h0_source.dtype,
-                                                   device=h0_source.device)
-        return (torch.empty_like(v), h0_source.clone(),
-                intermediate_recurrent_state)
-    return torch.empty_like(v), h0_source.clone(), torch.empty_like(h0_source)
+      spec_verify_phase_marker,
+      tree_parent_ids=None,
+      tree_depths=None,
+      use_ddtree_state=False):
+    batch_size, seq_len, num_v_heads, _ = v.shape
+    intermediate_recurrent_state = torch.empty(batch_size,
+                                               seq_len,
+                                               num_v_heads,
+                                               k_dim,
+                                               v_dim,
+                                               dtype=h0_source.dtype,
+                                               device=h0_source.device)
+    return torch.empty_like(v), h0_source.clone(), intermediate_recurrent_state
 
 
 # ---------------------------------------------------------------------------

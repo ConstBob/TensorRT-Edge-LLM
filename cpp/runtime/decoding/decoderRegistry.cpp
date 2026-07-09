@@ -78,7 +78,13 @@ DecodingStrategy& DecoderRegistry::cachePrimingStrategy() const noexcept
 
 bool DecoderRegistry::captureCudaGraphs(cudaStream_t stream) const
 {
-    bool const defaultCaptureStatus = mDefaultDecoder ? mDefaultDecoder->captureCudaGraphs(stream) : true;
+    bool const skipDefaultCapture = mSpeculativeDecoder && mSpeculativeDecoder->kind() == DecodingStrategyKind::kDFlash;
+    if (skipDefaultCapture)
+    {
+        LOG_INFO("Skipping vanilla CUDA graph capture for DFlash speculative runtime.");
+    }
+    bool const defaultCaptureStatus
+        = (!skipDefaultCapture && mDefaultDecoder) ? mDefaultDecoder->captureCudaGraphs(stream) : true;
     bool const speculativeCaptureStatus = mSpeculativeDecoder ? mSpeculativeDecoder->captureCudaGraphs(stream) : true;
     bool const captureStatus = defaultCaptureStatus && speculativeCaptureStatus;
     if (captureStatus)

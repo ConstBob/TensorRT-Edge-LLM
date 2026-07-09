@@ -314,6 +314,15 @@ private:
     bool setupIntermediateConvStateProfiles(
         nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
 
+    //! Set up hybrid linear-attention profiles needed only by speculative verification engines.
+    //! Configures the shape-only phase marker and optional DDTree parent/depth metadata inputs.
+    //! @param contextProfile Optimization profile for context processing
+    //! @param generationProfile Optimization profile for generation processing
+    //! @param network TensorRT network definition for optional input analysis
+    //! @return true if setup was successful, false otherwise
+    bool setupLinearAttentionSpecVerifyProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+        nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network);
+
     //! Copy and save the model configuration with builder config.
     //! Creates a config.json file in the engine directory with both original model config
     //! and builder configuration parameters.

@@ -98,6 +98,16 @@ struct PipelineIO
     //! Written by proposal/verify input preparation kernels; consumed by the base and draft
     //! engines via the `kAttentionPosId` binding.
     Tensor specDecodePositionIds;
+    //! Shape-only marker for hybrid MTP/DFlash base engines. The runtime binds
+    //! this tensor at shape [0] for normal prefill/decode and [1] for spec
+    //! verify; plugins branch on the shape, not the payload.
+    Tensor specVerifyPhaseMarker;
+    //! DDTree parent node ids, [batch, proposalSize] INT32. Runtime-owned
+    //! metadata for tree attention and hybrid state plugin bindings.
+    Tensor specTreeParentIds;
+    //! DDTree depth per node, [batch, proposalSize] INT32. Runtime-owned
+    //! metadata for tree attention and hybrid state plugin bindings.
+    Tensor specTreeDepths;
 
     //! Build PipelineIO for the vanilla single-engine LLM runtime
     //! (basic I/O tensors, deepstack embeds, MRope cos/sin cache).

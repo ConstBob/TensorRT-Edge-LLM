@@ -17,17 +17,59 @@
 
 #include "runtime/exec/engineExecutor.h"
 
+#include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "common/hashUtils.h"
 #include "common/logger.h"
 #include "common/trtUtils.h"
 #include "runtime/exec/registryBuilder.h"
 #include <stdexcept>
+#include <string_view>
 
 namespace trt_edgellm
 {
 namespace rt
 {
+namespace
+{
+bool engineHasIOTensor(nvinfer1::ICudaEngine const& engine, char const* tensorName)
+{
+    if (tensorName == nullptr)
+    {
+        return false;
+    }
+
+    int32_t const numIO = engine.getNbIOTensors();
+    for (int32_t i = 0; i < numIO; ++i)
+    {
+        char const* const name = engine.getIOTensorName(i);
+        if (name != nullptr && std::string_view{name} == tensorName)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool engineHasInputTensor(nvinfer1::ICudaEngine const& engine, char const* tensorName)
+{
+    if (tensorName == nullptr)
+    {
+        return false;
+    }
+
+    int32_t const numIO = engine.getNbIOTensors();
+    for (int32_t i = 0; i < numIO; ++i)
+    {
+        char const* const name = engine.getIOTensorName(i);
+        if (name != nullptr && std::string_view{name} == tensorName)
+        {
+            return engine.getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT;
+        }
+    }
+    return false;
+}
+} // namespace
 
 EngineExecutor::EngineExecutor(std::filesystem::path const& enginePath, TensorRegistry registry)
     : mRegistry(std::move(registry))
@@ -45,6 +87,16 @@ EngineExecutor::EngineExecutor(std::filesystem::path const& enginePath, TensorRe
     ELLM_CHECK(mContext != nullptr, "failed to create execution context");
 
     setNonBlockingAuxStreams(mContext.get(), mEngine.get(), mAuxStreams);
+
+    auto registerOptionalTreeMetadata = [&](char const* name) {
+        if (engineHasInputTensor(*mEngine, name) && !mRegistry.contains(name))
+        {
+            mRegistry.addTensor({name, TensorIO::kInput, nvinfer1::DataType::kINT32,
+                {sym(&InferenceDims::batch), sym(&InferenceDims::attnMaskSeqLen)}});
+        }
+    };
+    registerOptionalTreeMetadata(binding_names::kTreeParentIds);
+    registerOptionalTreeMetadata(binding_names::kTreeDepths);
 
     LOG_INFO("engine loaded successfully (%d I/O tensors)", mEngine->getNbIOTensors());
 }
@@ -258,6 +310,11 @@ int32_t EngineExecutor::getNumIOTensors() const
 char const* EngineExecutor::getIOTensorName(int32_t index) const
 {
     return mEngine->getIOTensorName(index);
+}
+
+bool EngineExecutor::hasIOTensor(char const* name) const
+{
+    return engineHasIOTensor(*mEngine, name);
 }
 
 nvinfer1::DataType EngineExecutor::getBindingDataType(char const* name) const

@@ -358,7 +358,7 @@ cd /path/to/TensorRT-Edge-LLM
 
 ## DFlash
 
-DFlash is a speculative decoding method that uses a dedicated external draft model. The draft model is separately trained, is not built into the base model checkpoint, and must be paired with the specific base model it was trained for. DFlash draft models are published by z-lab in the [DFlash HuggingFace collection](https://huggingface.co/collections/z-lab/dflash). Unlike EAGLE3, DFlash draft architecture is model-family-specific: the draft consumes concatenated target hidden states from selected base-model layers, updates target K/V in its draft KV cache, and proposes a linear block of draft tokens.
+DFlash is a speculative decoding method that uses a dedicated external draft model. The draft model is separately trained, is not built into the base model checkpoint, and must be paired with the specific base model it was trained for. DFlash draft models are published by z-lab in the [DFlash HuggingFace collection](https://huggingface.co/collections/z-lab/dflash). Unlike EAGLE3, DFlash draft architecture is model-family-specific: the draft consumes concatenated target hidden states from selected base-model layers, updates target K/V in its draft KV cache, and proposes either a linear block of draft tokens (`--specDraftTopK 1`) or a branching DDTree proposal (`--specDraftTopK > 1`).
 
 So far DFlash support in TensorRT Edge-LLM is validated for Qwen3 and Qwen3.5 only. See [DFlash Draft Models](../getting_started/supported-models.md#dflash-draft-models) for the supported base/draft pairs. Other DFlash draft models in the z-lab collection are not tested for TensorRT Edge-LLM accuracy, acceptance rate, or runtime compatibility.
 
@@ -400,11 +400,20 @@ cd $WORKSPACE_DIR
 git clone https://huggingface.co/z-lab/Qwen3.5-4B-DFlash
 cd Qwen3.5-4B-DFlash && git lfs pull && cd ..
 
-# Export DFlash base model
+# Export DFlash base model for linear DFlash (`--specDraftTopK 1`)
 tensorrt-edgellm-export \
   Qwen/Qwen3.5-4B \
   $MODEL_NAME/onnx/base_export \
   --dflash-base \
+  --dflash-draft-dir Qwen3.5-4B-DFlash
+
+# For Qwen3.5 hybrid DDTree (`--specDraftTopK > 1`), export the base with
+# tree metadata inputs instead. Do not use this tree-base engine with
+# `--specDraftTopK 1`.
+tensorrt-edgellm-export \
+  Qwen/Qwen3.5-4B \
+  $MODEL_NAME/onnx/tree_base_export \
+  --dflash-tree-base \
   --dflash-draft-dir Qwen3.5-4B-DFlash
 
 # Export DFlash draft model
@@ -415,13 +424,15 @@ tensorrt-edgellm-export \
   --dflash-draft-dir Qwen3.5-4B-DFlash
 
 # Put outputs in the layout used by the build steps below
-mkdir -p $MODEL_NAME/onnx/base $MODEL_NAME/onnx/draft
+mkdir -p $MODEL_NAME/onnx/base $MODEL_NAME/onnx/tree_base $MODEL_NAME/onnx/draft
 cp -a $MODEL_NAME/onnx/base_export/llm/. $MODEL_NAME/onnx/base/
+cp -a $MODEL_NAME/onnx/tree_base_export/llm/. $MODEL_NAME/onnx/tree_base/
 cp -a $MODEL_NAME/onnx/draft_export/dflash_draft/. $MODEL_NAME/onnx/draft/
 ```
 
 This produces:
-- `$WORKSPACE_DIR/$MODEL_NAME/onnx/base/` - DFlash base model with target hidden-state outputs
+- `$WORKSPACE_DIR/$MODEL_NAME/onnx/base/` - DFlash base model with target hidden-state outputs for linear DFlash
+- `$WORKSPACE_DIR/$MODEL_NAME/onnx/tree_base_export/llm/` - Qwen3.5 hybrid DDTree base model with `tree_parent_ids` and `tree_depths` inputs
 - `$WORKSPACE_DIR/$MODEL_NAME/onnx/draft/` - DFlash draft model
 
 #### Step 2: Transfer to Device
@@ -439,7 +450,9 @@ export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Qwen3.5-4B
 cd /path/to/TensorRT-Edge-LLM
 
-# Build DFlash base engine
+# Build DFlash base engine.
+# Use $MODEL_NAME/onnx/base for `--specDraftTopK 1`.
+# Use $MODEL_NAME/onnx/tree_base for Qwen3.5 hybrid DDTree with `--specDraftTopK > 1`.
 ./build/examples/llm/llm_build \
   --onnxDir $WORKSPACE_DIR/$MODEL_NAME/onnx/base \
   --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines \
@@ -477,10 +490,25 @@ cd /path/to/TensorRT-Edge-LLM
   --specVerifySize 16
 ```
 
+For Qwen3.5 hybrid DDTree, build the base engine from the `--dflash-tree-base` export and run with a candidate top-K greater than 1:
+
+```bash
+./build/examples/llm/llm_inference \
+  --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines \
+  --inputFile $WORKSPACE_DIR/input.json \
+  --outputFile $WORKSPACE_DIR/output_ddtree.json \
+  --specDecode \
+  --specDraftTopK 8 \
+  --specDraftStep 1 \
+  --specVerifySize 64
+```
+
 **Key differences from EAGLE3:**
-- `--dflash-base` exports the base model with DFlash target hidden-state outputs; pass `--dflash-draft-dir` so export can read the draft's target-layer and block-size configuration
+- `--dflash-base` exports the base model with DFlash target hidden-state outputs for linear DFlash; pass `--dflash-draft-dir` so export can read the draft's target-layer and block-size configuration
+- `--dflash-tree-base` exports a Qwen3.5 hybrid DDTree base model with additional `tree_parent_ids` and `tree_depths` inputs; use it only with `--specDraftTopK > 1`
 - `--dflash-draft` exports the dedicated draft model into `dflash_draft/`
 - `--specDraftTopK 1`: DFlash proposes a linear block, so topK=1
+- `--specDraftTopK > 1`: DFlash runs branching DDTree verification; Qwen3.5 hybrid DDTree requires a base engine exported with `--dflash-tree-base`
 - `--specDraftStep 1`: One DFlash draft forward proposes the whole block
 - `--specVerifySize 16`: Base verification checks the DFlash proposal block
 - Thinking-mode settings are model-family-specific and should match the paired HuggingFace behavior: Qwen3.5 DFlash uses thinking mode enabled, while Qwen3 DFlash uses thinking mode disabled

@@ -128,6 +128,13 @@ def _verify_externalized_outputs(out_dir, requested_cli_kinds):
                     f"\n  manifest_kinds={sorted(manifest_kinds)}")
 
 
+def _onnx_graph_input_names(onnx_path):
+    import onnx
+
+    model = onnx.load(onnx_path, load_external_data=False)
+    return {value_info.name for value_info in model.graph.input}
+
+
 def test_checkpoint_export(test_param: str, test_logger,
                            env_config: EnvironmentConfig):
     """Export a pre-quantized model via tensorrt_edgellm.scripts.export."""
@@ -411,6 +418,8 @@ def test_checkpoint_dflash_export(test_param: str, test_logger,
 
     tmp_base = tempfile.mkdtemp(prefix="dflash_base_export_")
     tmp_draft = tempfile.mkdtemp(prefix="dflash_draft_export_")
+    use_tree_base = config.is_dflash_tree
+    base_export_flag = "--dflash-tree-base" if use_tree_base else "--dflash-base"
 
     try:
         base_cmd = [
@@ -419,7 +428,7 @@ def test_checkpoint_dflash_export(test_param: str, test_logger,
             "tensorrt_edgellm.scripts.export",
             base_torch_dir,
             tmp_base,
-            "--dflash-base",
+            base_export_flag,
             "--dflash-draft-dir",
             draft_torch_dir,
         ]
@@ -463,6 +472,14 @@ def test_checkpoint_dflash_export(test_param: str, test_logger,
     base_onnx = os.path.join(llm_onnx_dir, "model.onnx")
     if not os.path.exists(base_onnx):
         pytest.fail(f"DFlash base ONNX not found: {base_onnx}")
+    if use_tree_base:
+        input_names = _onnx_graph_input_names(base_onnx)
+        expected_tree_inputs = {"tree_parent_ids", "tree_depths"}
+        missing = expected_tree_inputs - input_names
+        if missing:
+            pytest.fail(
+                f"DFlash tree-base ONNX missing inputs {sorted(missing)}: {base_onnx}"
+            )
 
     draft_onnx = os.path.join(draft_onnx_dir, "model.onnx")
     if not os.path.exists(draft_onnx):

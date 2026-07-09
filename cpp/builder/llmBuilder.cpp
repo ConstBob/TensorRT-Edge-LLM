@@ -538,11 +538,12 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
         result &= setupVanillaProfiles(*contextProfile, *generationProfile);
     }
 
-    // Setup intermediate state profiles for MTP base models
+    // Setup hybrid state profiles for MTP/DFlash base models.
     if (isSpecDecodeBase(mModelConfig, "mtp") || isSpecDecodeBase(mModelConfig, "dflash"))
     {
         result &= setupIntermediateRecurrentStateProfiles(*contextProfile, *generationProfile);
         result &= setupIntermediateConvStateProfiles(*contextProfile, *generationProfile);
+        result &= setupLinearAttentionSpecVerifyProfiles(*contextProfile, *generationProfile, network);
     }
 
     // Setup Gemma4 PLE profiles when ple_token_embeds_* inputs are present.
@@ -1246,7 +1247,51 @@ bool LLMBuilder::setupIntermediateConvStateProfiles(
         result &= setOptimizationProfile(&generationProfile, name.c_str(), minShape, optGenShape, maxGenShape);
     }
 
-    LOG_DEBUG("Set up intermediate conv state profiles for %d recurrent layers (MTP)", mNumLinearAttnLayers);
+    LOG_DEBUG("Set up intermediate conv state profiles for %d recurrent layers (MTP/DFlash)", mNumLinearAttnLayers);
+    return result;
+}
+
+bool LLMBuilder::setupLinearAttentionSpecVerifyProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+    nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network)
+{
+    if (mNumLinearAttnLayers == 0)
+    {
+        return true;
+    }
+
+    if (!hasInputBinding(network, binding_names::kSpecVerifyPhaseMarker))
+    {
+        LOG_ERROR("Hybrid MTP/DFlash base engine is missing input '%s'. Re-export the ONNX model.",
+            binding_names::kSpecVerifyPhaseMarker);
+        return false;
+    }
+
+    bool result = true;
+    result &= setOptimizationProfile(
+        &contextProfile, binding_names::kSpecVerifyPhaseMarker, createDims({0}), createDims({0}), createDims({0}));
+    result &= setOptimizationProfile(
+        &generationProfile, binding_names::kSpecVerifyPhaseMarker, createDims({0}), createDims({1}), createDims({1}));
+
+    auto setOptionalTreeProfile = [&](char const* inputName) {
+        if (!hasInputBinding(network, inputName))
+        {
+            return true;
+        }
+
+        int64_t const maxTreeTokens = std::max<int64_t>(1, mBuilderConfig.maxVerifyTreeSize);
+        bool ok = true;
+        ok &= setOptimizationProfile(&contextProfile, inputName, createDims({1, 1}),
+            createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, maxTreeTokens}));
+        ok &= setOptimizationProfile(&generationProfile, inputName, createDims({1, 1}),
+            createDims({mBuilderConfig.maxBatchSize, std::max<int64_t>(1, maxTreeTokens / 2)}),
+            createDims({mBuilderConfig.maxBatchSize, maxTreeTokens}));
+        return ok;
+    };
+
+    result &= setOptionalTreeProfile(binding_names::kTreeParentIds);
+    result &= setOptionalTreeProfile(binding_names::kTreeDepths);
+
+    LOG_DEBUG("Set up hybrid linear-attention spec-verify profiles for %d recurrent layers", mNumLinearAttnLayers);
     return result;
 }
 
