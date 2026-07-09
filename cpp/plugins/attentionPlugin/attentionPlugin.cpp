@@ -762,8 +762,31 @@ int32_t AttentionPlugin::getAliasedInput(int32_t outputIndex) noexcept
 // IPluginV3OneRuntime — execution
 // ---------------------------------------------------------------------------
 
-int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, [[maybe_unused]] PluginTensorDesc const* outputDesc,
+int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* outputDesc,
     void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
+{
+    // enqueue is noexcept: an exception escaping a kernel dispatch (e.g. a
+    // missing-cubin check) would terminate the process. Turn it into a failed
+    // enqueue instead.
+    try
+    {
+        return enqueueImpl(inputDesc, outputDesc, inputs, outputs, workspace, stream);
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("AttentionPlugin: enqueue failed: %s", e.what());
+        return -1;
+    }
+    catch (...)
+    {
+        LOG_ERROR("AttentionPlugin: enqueue failed with a non-standard exception.");
+        return -1;
+    }
+}
+
+int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
+    [[maybe_unused]] PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs,
+    void* workspace, cudaStream_t stream)
 {
     // Construct non-owned tensor objects from I/O data pointers and shapes.
     // Q input in the graph will be in shape [B, S, Hq x D], for convenience,
@@ -872,6 +895,24 @@ int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, [[maybe_unus
     if (executionMode == AttentionExecutionMode::kNORMAL_PREFILL
         || executionMode == AttentionExecutionMode::kCHUNKED_PREFILL)
     {
+        // No prefill backend can read an FP8 donor cache.
+        if (mEnableFp8KVCache && sharedKV)
+        {
+            LOG_ERROR("AttentionPlugin: shared-KV prefill cannot read an FP8 donor cache.");
+            return -1;
+        }
+        // Chunked prefill reads the cache back; only the CuTe DSL FMHA reads FP8.
+        // Normal prefill reads the FP16 K/V inputs and needs no FP8 kernel.
+        if (mEnableFp8KVCache && executionMode == AttentionExecutionMode::kCHUNKED_PREFILL
+            && !(mUseCuteDslFMHA && mCanImplementFMHA))
+        {
+            LOG_ERROR(
+                "AttentionPlugin: FP8 KV cache chunked prefill requires the CuTe DSL FMHA path "
+                "(SM 100/101/110); the FP16-only prefill kernels cannot read the FP8 cache on SM %d.",
+                mSMVersion);
+            return -1;
+        }
+
         rt::Tensor cuQSeqLensTensor
             = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize + 1}, DataType::kINT32);
 

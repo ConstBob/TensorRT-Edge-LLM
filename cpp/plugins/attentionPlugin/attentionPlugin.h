@@ -102,6 +102,11 @@ private:
         std::byte*& workspacePtr, int32_t batchSize, int32_t numKVHeads, int32_t kvCacheCapacity, int32_t headSize,
         int32_t seqLen, cudaStream_t stream);
 
+    //! enqueue() body. enqueue() wraps it in a try/catch so a thrown error
+    //! fails the call instead of terminating the process (enqueue is noexcept).
+    int32_t enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
+        void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream);
+
     //! Launch the CuTe DSL FFPA d512 causal attention kernel with per-batch varlen masking.
     void dispatchFFPAKernel(half const* q, half const* k, half const* v, half* o, int32_t const* cuSeqLenQ,
         int32_t const* cuSeqLenK, int32_t batchSize, int32_t seqlenQ, int32_t seqlenK, cudaStream_t stream);
