@@ -333,7 +333,7 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
             {
                 ELLM_CHECK(specConfig.dflashBlockSize <= kDFlashHybridMaxBlockSize,
                     "DFlash dflashBlockSize=" + std::to_string(specConfig.dflashBlockSize)
-                        + " exceeds hybrid intermediate-state depth limit of "
+                        + " exceeds Qwen3.5 GDN/causal-conv intermediate-state depth limit of "
                         + std::to_string(kDFlashHybridMaxBlockSize) + ".");
             }
         }

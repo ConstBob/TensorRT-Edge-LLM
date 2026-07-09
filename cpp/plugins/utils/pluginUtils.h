@@ -150,6 +150,9 @@ inline void deserializeValue(std::byte const** buffer, size_t* buffer_size, T* v
     return Serializer<T>::deserialize(buffer, buffer_size, value);
 }
 
+//! @brief Align a byte size to the device workspace alignment.
+size_t alignTensorSize(size_t size);
+
 //! @brief Accumulate workspace size for a given shape and data type. Device alignment will be applied automatically.
 //! @param currentSize Current workspace size
 //! @param shape Tensor shape

@@ -345,6 +345,7 @@ def _causal_conv1d_with_intermediate_translation(
     bias: onnxscript.FLOAT16,
     conv_state: onnxscript.FLOAT16,
     context_lengths: onnxscript.INT32,
+    spec_verify_phase_marker: onnxscript.INT32,
     stride: int,
     padding: int,
     dilation: int,
@@ -356,11 +357,46 @@ def _causal_conv1d_with_intermediate_translation(
         bias,
         conv_state,
         context_lengths,
+        spec_verify_phase_marker,
         stride=stride,
         padding=padding,
         dilation=dilation,
         groups=groups,
         use_mtp=1,
+        _outputs=3,
+    )
+    return output, conv_state_out, intermediate_conv_state_out
+
+
+@script()
+def _causal_conv1d_with_intermediate_tree_translation(
+    hidden_states: onnxscript.FLOAT16,
+    weight: onnxscript.FLOAT16,
+    bias: onnxscript.FLOAT16,
+    conv_state: onnxscript.FLOAT16,
+    context_lengths: onnxscript.INT32,
+    spec_verify_phase_marker: onnxscript.INT32,
+    tree_parent_ids: onnxscript.INT32,
+    tree_depths: onnxscript.INT32,
+    stride: int,
+    padding: int,
+    dilation: int,
+    groups: int,
+) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT16, onnxscript.FLOAT16]:
+    output, conv_state_out, intermediate_conv_state_out = _trt_edgellm.causal_conv1d(
+        hidden_states,
+        weight,
+        bias,
+        conv_state,
+        context_lengths,
+        spec_verify_phase_marker,
+        tree_parent_ids,
+        tree_depths,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        groups=groups,
+        use_ddtree=1,
         _outputs=3,
     )
     return output, conv_state_out, intermediate_conv_state_out
@@ -376,15 +412,39 @@ def _causal_conv1d_dispatch(
     padding,
     dilation,
     groups,
-    collect_intermediate_states=False,
 ):
-    if collect_intermediate_states:
-        return _causal_conv1d_with_intermediate_translation(
-            hidden_states, weight, bias, conv_state, context_lengths, stride,
-            padding, dilation, groups)
     return _causal_conv1d_translation(hidden_states, weight, bias, conv_state,
                                       context_lengths, stride, padding,
                                       dilation, groups)
+
+
+def _causal_conv1d_intermediate_dispatch(
+    hidden_states,
+    weight,
+    bias,
+    conv_state,
+    context_lengths,
+    stride,
+    padding,
+    dilation,
+    groups,
+    spec_verify_phase_marker,
+    tree_parent_ids=None,
+    tree_depths=None,
+    use_ddtree_state=False,
+):
+    if use_ddtree_state:
+        if tree_parent_ids is None or tree_depths is None:
+            raise ValueError(
+                "causal_conv1d DDTree state path requires tree_parent_ids and tree_depths"
+            )
+        return _causal_conv1d_with_intermediate_tree_translation(
+            hidden_states, weight, bias, conv_state, context_lengths,
+            spec_verify_phase_marker, tree_parent_ids, tree_depths, stride,
+            padding, dilation, groups)
+    return _causal_conv1d_with_intermediate_translation(
+        hidden_states, weight, bias, conv_state, context_lengths,
+        spec_verify_phase_marker, stride, padding, dilation, groups)
 
 
 @script()
@@ -431,6 +491,7 @@ def _gated_delta_net_with_intermediate_translation(
     dt_bias: onnxscript.FLOAT16,
     h0_source: onnxscript.FLOAT,
     context_lengths: onnxscript.INT32,
+    spec_verify_phase_marker: onnxscript.INT32,
     k_dim: int,
     v_dim: int,
 ) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT, onnxscript.FLOAT]:
@@ -444,9 +505,48 @@ def _gated_delta_net_with_intermediate_translation(
         dt_bias,
         h0_source,
         context_lengths,
+        spec_verify_phase_marker,
         k_dim=k_dim,
         v_dim=v_dim,
         use_mtp=1,
+        _outputs=3,
+    )
+    return output, h0_out, intermediate_h0_out
+
+
+@script()
+def _gated_delta_net_with_intermediate_tree_translation(
+    q: onnxscript.FLOAT16,
+    k: onnxscript.FLOAT16,
+    v: onnxscript.FLOAT16,
+    a: onnxscript.FLOAT16,
+    b: onnxscript.FLOAT16,
+    A_log: onnxscript.FLOAT,
+    dt_bias: onnxscript.FLOAT16,
+    h0_source: onnxscript.FLOAT,
+    context_lengths: onnxscript.INT32,
+    spec_verify_phase_marker: onnxscript.INT32,
+    tree_parent_ids: onnxscript.INT32,
+    tree_depths: onnxscript.INT32,
+    k_dim: int,
+    v_dim: int,
+) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT, onnxscript.FLOAT]:
+    output, h0_out, intermediate_h0_out = _trt_edgellm.gated_delta_net(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        h0_source,
+        context_lengths,
+        spec_verify_phase_marker,
+        tree_parent_ids,
+        tree_depths,
+        k_dim=k_dim,
+        v_dim=v_dim,
+        use_ddtree=1,
         _outputs=3,
     )
     return output, h0_out, intermediate_h0_out
@@ -464,15 +564,41 @@ def _gated_delta_net_dispatch(
     context_lengths,
     k_dim,
     v_dim,
-    collect_intermediate_states=False,
 ):
-    if collect_intermediate_states:
-        return _gated_delta_net_with_intermediate_translation(
-            q, k, v, a, b, A_log, dt_bias, h0_source, context_lengths, k_dim,
-            v_dim)
     return _gated_delta_net_translation(q, k, v, a, b, A_log, dt_bias,
                                         h0_source, context_lengths, k_dim,
                                         v_dim)
+
+
+def _gated_delta_net_intermediate_dispatch(
+    q,
+    k,
+    v,
+    a,
+    b,
+    A_log,
+    dt_bias,
+    h0_source,
+    context_lengths,
+    k_dim,
+    v_dim,
+    spec_verify_phase_marker,
+    tree_parent_ids=None,
+    tree_depths=None,
+    use_ddtree_state=False,
+):
+    if use_ddtree_state:
+        if tree_parent_ids is None or tree_depths is None:
+            raise ValueError(
+                "gated_delta_net DDTree state path requires tree_parent_ids and tree_depths"
+            )
+        return _gated_delta_net_with_intermediate_tree_translation(
+            q, k, v, a, b, A_log, dt_bias, h0_source, context_lengths,
+            spec_verify_phase_marker, tree_parent_ids, tree_depths, k_dim,
+            v_dim)
+    return _gated_delta_net_with_intermediate_translation(
+        q, k, v, a, b, A_log, dt_bias, h0_source, context_lengths,
+        spec_verify_phase_marker, k_dim, v_dim)
 
 
 @script()
@@ -950,10 +1076,14 @@ def build_custom_translation_table() -> dict:
         _int8_sq_weight_dq_translation,
         torch.ops.trt_edgellm.causal_conv1d.default:
         _causal_conv1d_dispatch,
+        torch.ops.trt_edgellm.causal_conv1d_with_intermediate.default:
+        _causal_conv1d_intermediate_dispatch,
         torch.ops.trt_edgellm.update_ssm_state.default:
         _update_ssm_state_translation,
         torch.ops.trt_edgellm.gated_delta_net.default:
         _gated_delta_net_dispatch,
+        torch.ops.trt_edgellm.gated_delta_net_with_intermediate.default:
+        _gated_delta_net_intermediate_dispatch,
         torch.ops.trt.vit_attention_plugin.default:
         _vit_attention_plugin_translation,
         torch.ops.trt.trt_ragged_attention.default:

@@ -193,7 +193,7 @@ struct LLMEngineConfig
     //
     // Every `InferenceDims` the runtime hands to `EngineExecutor::prepare` should be
     // produced by one of these methods. Each returns a fully-specified
-    // struct with all six fields set — no implicit defaults.
+    // struct with all fields set — no implicit defaults.
     //
     // The second parameter (where present) is named for the caller-side
     // concept, not a destination field, because each input fans out to

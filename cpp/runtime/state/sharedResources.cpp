@@ -46,6 +46,28 @@ bool needsBaseVerifyIntermediateStates(DeploymentConfig const& bundle)
     return false;
 }
 
+namespace
+{
+bool isDFlashDDTreeShape(DeploymentConfig const& bundle)
+{
+    return bundle.specConfig.has_value() && bundle.base.specDecodeType == SpecDecodeMode::kDFlash
+        && bundle.specConfig->draftingTopK > 1;
+}
+
+int32_t baseVerifyIntermediateSeqLen(DeploymentConfig const& bundle)
+{
+    if (!needsBaseVerifyIntermediateStates(bundle))
+    {
+        return 0;
+    }
+    if (bundle.base.specDecodeType != SpecDecodeMode::kDFlash)
+    {
+        return bundle.specConfig->maxVerifySize;
+    }
+    return isDFlashDDTreeShape(bundle) ? bundle.specConfig->verifySize : bundle.specConfig->dflashBlockSize;
+}
+} // namespace
+
 void allocateZeroBuffer(SharedResources& res, int64_t bytes)
 {
     res.zeroBuffer = Tensor({bytes}, DeviceType::kGPU, nvinfer1::DataType::kUINT8, "SharedResources::zeroBuffer");
@@ -158,12 +180,11 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
 
     int32_t const maxDraftProposalSize = bundle.specConfig->maxDraftProposalSize;
 
-    // Base hybrid cache manager (index 0). Hybrid MTP/DFlash base verification
+    // Base hybrid cache manager (index 0). Hybrid spec-decode base verification
     // writes per-token recurrent/conv snapshots; after accept, the decoder
     // scatters only the accepted prefix into the persistent state pools.
     {
-        int32_t const baseMaxIntermediateSeqLen
-            = needsBaseVerifyIntermediateStates(bundle) ? bundle.specConfig->maxVerifySize : 0;
+        int32_t const baseMaxIntermediateSeqLen = baseVerifyIntermediateSeqLen(bundle);
         rt::KVCacheManager::Config kvCfg{
             /*.numAttentionLayers=*/static_cast<int32_t>(bundle.base.kvLayerConfigs.size()),
             /*.maxBatchSize=*/bundle.base.maxSupportedBatchSize,

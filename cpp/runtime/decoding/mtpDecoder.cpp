@@ -491,6 +491,10 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
     // MTP: inline prepareBaseVerificationState
     mRuntime.base.cacheManager.getMambaCacheManager().reshapeIntermediateStates(
         context.activeBatchSize, mRuntime.deployment.specConfig->verifySize);
+    if (!mRuntime.base.pipelineIO.specVerifyPhaseMarker.isEmpty())
+    {
+        check::check(mRuntime.base.pipelineIO.specVerifyPhaseMarker.reshape({1}), "Tensor reshape failed");
+    }
 
     auto const verifyDims
         = mRuntime.deployment.base.specVerifyDims(activeBatchSize, mRuntime.deployment.specConfig->verifySize);
@@ -539,7 +543,7 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
     mRuntime.base.cacheManager.commitSequenceLength(mAcceptLength, context.stream);
 
     // MTP: inline commitAcceptedBaseState
-    mRuntime.base.cacheManager.getMambaCacheManager().scatterMtpStates(mAcceptLength, context.stream);
+    mRuntime.base.cacheManager.getMambaCacheManager().scatterAcceptedLinearStates(mAcceptLength, context.stream);
 
     check::check(
         mRuntime.base.pipelineIO.baseHiddenStates.reshape({activeBatchSize, maxAcceptDepth, baseOutputHiddenDim}),
@@ -793,6 +797,10 @@ bool MTPDecoder::captureCudaGraphs(cudaStream_t stream)
 
             // MTP: inline prepareBaseVerificationCapture
             mRuntime.base.cacheManager.getMambaCacheManager().reshapeIntermediateStates(batchSize, verifySize);
+            if (!mRuntime.base.pipelineIO.specVerifyPhaseMarker.isEmpty())
+            {
+                check::check(mRuntime.base.pipelineIO.specVerifyPhaseMarker.reshape({1}), "Tensor reshape failed");
+            }
 
             auto const verifyDims = mRuntime.deployment.base.specVerifyDims(batchSize, verifySize);
             baseVerificationCaptureStatus &= mRuntime.base.captureGraph(verifyDims, stream);

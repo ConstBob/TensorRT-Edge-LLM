@@ -127,6 +127,9 @@ public:
     //! @brief Return the name of the i-th I/O tensor.
     char const* getIOTensorName(int32_t index) const;
 
+    //! @brief Return whether the engine exposes a named I/O tensor.
+    bool hasIOTensor(char const* name) const;
+
     //! @brief Return the data type of a named binding.
     nvinfer1::DataType getBindingDataType(char const* name) const;
 

@@ -193,6 +193,13 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
         // attention_pos_id: [batch, attn_seq_len] INT32
         reg.addTensor({binding_names::kAttentionPosId, TensorIO::kInput, nvinfer1::DataType::kINT32,
             {sym(&InferenceDims::batch), sym(&InferenceDims::attnMaskSeqLen)}});
+
+        if ((cfg.specDecodeType == SpecDecodeMode::kMTP || cfg.specDecodeType == SpecDecodeMode::kDFlash)
+            && cfg.numLinearAttnLayers > 0)
+        {
+            reg.addTensor({binding_names::kSpecVerifyPhaseMarker, TensorIO::kInput, nvinfer1::DataType::kINT32,
+                {sym(&InferenceDims::specVerifyPhaseLen)}});
+        }
     }
 
     // ---------------------------------------------------------------

@@ -394,7 +394,7 @@ EAGLE3 draft checkpoints are detected by `draft_vocab_size` in `config.json` and
 
 ## DFlash Draft Models
 
-DFlash draft checkpoints are detected by `dflash_config` in `config.json` and exported with `DFlashDraftModel`. DFlash base export uses `--dflash-base --dflash-draft-dir <draft_checkpoint>`, and draft export uses `--dflash-draft --dflash-draft-dir <draft_checkpoint>`. DFlash draft checkpoints can be quantized with `tensorrt-edgellm-quantize draft`; NVFP4 backbone quantization and optional NVFP4 LM-head quantization are validated.
+DFlash draft checkpoints are detected by `dflash_config` in `config.json` and exported with `DFlashDraftModel`. Linear DFlash base export uses `--dflash-base --dflash-draft-dir <draft_checkpoint>`, Qwen3.5 hybrid DDTree base export uses `--dflash-tree-base --dflash-draft-dir <draft_checkpoint>`, and draft export uses `--dflash-draft --dflash-draft-dir <draft_checkpoint>`. Use the tree-base engine only with DFlash DDTree runtime settings such as `--specDraftTopK 8`, not with linear `--specDraftTopK 1`. DFlash draft checkpoints can be quantized with `tensorrt-edgellm-quantize draft`; NVFP4 backbone quantization and optional NVFP4 LM-head quantization are validated.
 
 So far DFlash support in TensorRT Edge-LLM is validated for Qwen3 and Qwen3.5 only. Other DFlash draft models in the z-lab collection are not tested for TensorRT Edge-LLM accuracy, acceptance rate, or runtime compatibility. For the listed pairs, match the paired HuggingFace generation behavior when evaluating performance: enable thinking for Qwen3.5 DFlash models and disable thinking for Qwen3 DFlash models.
 

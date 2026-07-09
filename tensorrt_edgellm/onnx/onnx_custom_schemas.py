@@ -577,6 +577,12 @@ _causal_conv1d_schema = OpSchema(
         OpSchema.FormalParameter(name="context_lengths",
                                  description="Context lengths per batch",
                                  type_str="T_CL"),
+        OpSchema.FormalParameter(
+            name="spec_decode_metadata",
+            description=
+            "Optional speculative metadata: spec_verify_phase_marker, tree_parent_ids, tree_depths",
+            type_str="T_CL",
+            param_option=OpSchema.FormalParameterOption.Variadic),
     ],
     outputs=[
         OpSchema.FormalParameter(name="output",
@@ -615,7 +621,14 @@ _causal_conv1d_schema = OpSchema(
         OpSchema.Attribute(
             name="use_mtp",
             type=OpSchema.AttrType.INT,
-            description="Whether to emit per-token intermediate states",
+            description=
+            "Enable linear spec-verify intermediate state output; retained as use_mtp for compatibility with existing MTP ONNX/plugin schema",
+            required=False),
+        OpSchema.Attribute(
+            name="use_ddtree",
+            type=OpSchema.AttrType.INT,
+            description=
+            "Whether tree_parent_ids/tree_depths drive tree-state execution; also enables intermediate state output",
             required=False),
     ],
 )
@@ -953,6 +966,12 @@ _gated_delta_net_schema = OpSchema(
             name="context_lengths",
             description="Valid token count per batch row [n]",
             type_str="T_CL"),
+        OpSchema.FormalParameter(
+            name="spec_decode_metadata",
+            description=
+            "Optional speculative metadata: spec_verify_phase_marker, tree_parent_ids, tree_depths",
+            type_str="T_CL",
+            param_option=OpSchema.FormalParameterOption.Variadic),
     ],
     outputs=[
         OpSchema.FormalParameter(name="o",
@@ -985,7 +1004,14 @@ _gated_delta_net_schema = OpSchema(
         OpSchema.Attribute(
             name="use_mtp",
             type=OpSchema.AttrType.INT,
-            description="Whether to emit per-token intermediate states",
+            description=
+            "Enable linear spec-verify intermediate state output; retained as use_mtp for compatibility with existing MTP ONNX/plugin schema",
+            required=False),
+        OpSchema.Attribute(
+            name="use_ddtree",
+            type=OpSchema.AttrType.INT,
+            description=
+            "Whether tree_parent_ids/tree_depths drive tree-state execution; also enables intermediate state output",
             required=False),
     ],
 )

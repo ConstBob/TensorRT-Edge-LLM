@@ -559,6 +559,9 @@ class ModelConfig:
     # When True, export the standard Qwen3.5 model as the DFlash base with
     # tree-attention verify inputs and multi-layer hidden_states output.
     dflash_base: bool = False
+    # When True, DFlash base export also exposes DDTree parent/depth metadata
+    # for Qwen3.5 hybrid causal-conv/GDN tree-state execution.
+    dflash_tree_base: bool = False
     is_dflash_draft_flag: bool = False
     dflash_target_layer_ids: List[int] = field(default_factory=list)
     dflash_block_size: int = 16
@@ -900,6 +903,7 @@ class ModelConfig:
             centroid_intermediate_top_k=int(
                 llm_dict.get("centroid_intermediate_top_k", 0) or 0),
             dflash_base=bool(llm_dict.get("dflash_base", False)),
+            dflash_tree_base=bool(llm_dict.get("dflash_tree_base", False)),
             num_deepstack_features=_parse_num_deepstack_features(
                 llm_dict, model_type, root_config=root),
             accept_hidden_layer=_parse_accept_hidden_layer(llm_dict,

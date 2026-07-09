@@ -36,6 +36,7 @@
 #include "sampler/sampling.h"
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <filesystem>
 #include <functional>
 #include <optional>
@@ -82,6 +83,51 @@ inline void emitTokenCallbacks(rt::DecodingInferenceContext& context)
 
 namespace rt
 {
+namespace
+{
+bool needsDFlashDDTreeHybridBindings(DeploymentConfig const& deployment)
+{
+    return deployment.specConfig.has_value() && deployment.specDecodeMode() == SpecDecodeMode::kDFlash
+        && deployment.specConfig->draftingTopK > 1 && deployment.base.numLinearAttnLayers > 0;
+}
+
+void validateDFlashTreeMetadataBindings(DeploymentConfig const& deployment, EngineExecutor const& baseExecutor)
+{
+    if (!deployment.specConfig.has_value() || deployment.specDecodeMode() != SpecDecodeMode::kDFlash)
+    {
+        return;
+    }
+
+    bool const hasTreeParentIds = baseExecutor.hasIOTensor(binding_names::kTreeParentIds);
+    bool const hasTreeDepths = baseExecutor.hasIOTensor(binding_names::kTreeDepths);
+    bool const hasTreeMetadata = hasTreeParentIds || hasTreeDepths;
+    bool const usesDDTree = deployment.specConfig->draftingTopK > 1;
+    if (hasTreeMetadata)
+    {
+        ELLM_CHECK(hasTreeParentIds && hasTreeDepths,
+            std::string("DFlash tree-base engine must expose both INT32 tree metadata bindings '")
+                + binding_names::kTreeParentIds + "' and '" + binding_names::kTreeDepths + "'.");
+        ELLM_CHECK(baseExecutor.getBindingDataType(binding_names::kTreeParentIds) == DataType::kINT32
+                && baseExecutor.getBindingDataType(binding_names::kTreeDepths) == DataType::kINT32,
+            std::string("DFlash tree-base engine tree metadata bindings must be INT32: '")
+                + binding_names::kTreeParentIds + "' and '" + binding_names::kTreeDepths + "'.");
+        ELLM_CHECK(usesDDTree,
+            std::string("DFlash base engine was exported with --dflash-tree-base, but runtime is configured for "
+                        "linear DFlash because specDraftTopK=1. Use --specDraftTopK > 1 for DDTree, or re-export "
+                        "the base model with --dflash-base for linear DFlash."));
+    }
+
+    if (!needsDFlashDDTreeHybridBindings(deployment))
+    {
+        return;
+    }
+
+    ELLM_CHECK(hasTreeParentIds && hasTreeDepths,
+        std::string("DFlash DDTree hybrid base engine requires INT32 tree metadata bindings '")
+            + binding_names::kTreeParentIds + "' and '" + binding_names::kTreeDepths
+            + "'. Re-export the base model with --dflash-tree-base, then rebuild spec_base.engine.");
+}
+} // namespace
 
 LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
     std::unordered_map<std::string, std::string> const& loraWeightsMap, SpecDecodeDraftingConfig const& draftingConfig,
@@ -145,6 +191,7 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     // 4. Validate engine binding dtypes against the parsed configs.
     // -----------------------------------------------------------------------
     validateAgainstEngine(mDeployment.base, *mBaseExecutor, "base");
+    validateDFlashTreeMetadataBindings(mDeployment, *mBaseExecutor);
 
     // -----------------------------------------------------------------------
     // 5. Set runtime batch size.
@@ -1386,7 +1433,22 @@ bool LLMInferenceRuntime::captureBaseGraphWithLoraFanout(InferenceDims const& di
 
 bool LLMInferenceRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
 {
-    return mDecoderRegistry ? mDecoderRegistry->captureCudaGraphs(stream) : true;
+    try
+    {
+        return mDecoderRegistry ? mDecoderRegistry->captureCudaGraphs(stream) : true;
+    }
+    catch (std::exception const& e)
+    {
+        LOG_WARNING("CUDA graph capture failed with exception: %s", e.what());
+        static_cast<void>(cudaGetLastError());
+        return false;
+    }
+    catch (...)
+    {
+        LOG_WARNING("CUDA graph capture failed with an unknown exception.");
+        static_cast<void>(cudaGetLastError());
+        return false;
+    }
 }
 
 void LLMInferenceRuntime::restoreRecurrentStates(

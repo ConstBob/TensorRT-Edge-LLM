@@ -248,19 +248,6 @@ bool isGemma4MTPDraftConfig(LLMEngineConfig const& config)
     return config.specDecodeType == SpecDecodeMode::kGemma4MTP && !config.isSpecDecodeBase;
 }
 
-bool engineHasTensor(EngineExecutor const& executor, std::string const& tensorName)
-{
-    int32_t const numIOTensors = executor.getNumIOTensors();
-    for (int32_t i = 0; i < numIOTensors; ++i)
-    {
-        if (tensorName == executor.getIOTensorName(i))
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
 //! Helper: parse explicit sliding/full RoPE config blocks when present.
 void parseDualRopeFields(Json const& configJson, LLMEngineConfig& cfg)
 {
@@ -826,6 +813,7 @@ InferenceDims LLMEngineConfig::prefillDims(int64_t batch, int64_t seqLen, bool k
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
         /*.packedMaskLen=*/1,
         /*.startIndexLen=*/startIndexLen,
+        /*.specVerifyPhaseLen=*/0,
     };
 }
 
@@ -840,6 +828,7 @@ InferenceDims LLMEngineConfig::decodeDims(int64_t batch) const
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
         /*.packedMaskLen=*/1,
         /*.startIndexLen=*/batch,
+        /*.specVerifyPhaseLen=*/0,
     };
 }
 
@@ -857,6 +846,7 @@ InferenceDims LLMEngineConfig::specVerifyDims(int64_t batch, int64_t verifySize)
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
         /*.packedMaskLen=*/static_cast<int64_t>(divUp(verifySize, 32)),
         /*.startIndexLen=*/batch,
+        /*.specVerifyPhaseLen=*/1,
     };
 }
 
@@ -876,6 +866,7 @@ InferenceDims LLMEngineConfig::proposalDims(int64_t batch, int64_t proposalSize,
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
         /*.packedMaskLen=*/static_cast<int64_t>(divUp(proposalSize, 32)),
         /*.startIndexLen=*/batch,
+        /*.specVerifyPhaseLen=*/0,
     };
 }
 
@@ -894,6 +885,7 @@ InferenceDims LLMEngineConfig::acceptDims(int64_t batch, int64_t acceptLen) cons
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
         /*.packedMaskLen=*/static_cast<int64_t>(divUp(acceptLen, 32)),
         /*.startIndexLen=*/batch,
+        /*.specVerifyPhaseLen=*/0,
     };
 }
 
@@ -919,7 +911,7 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
         };
         for (auto const* name : kRequiredBindings)
         {
-            ELLM_CHECK(engineHasTensor(executor, std::string(name)),
+            ELLM_CHECK(executor.hasIOTensor(name),
                 std::string("DFlash cached draft engine (") + engineLabel + ") is missing required binding '" + name
                     + "'. This engine may be from the old explicit DFlash path. Re-export and rebuild.");
         }
@@ -929,10 +921,10 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
         {
             std::string const kvPastName = binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/true);
             std::string const kvPresentName = binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/false);
-            ELLM_CHECK(engineHasTensor(executor, kvPastName),
+            ELLM_CHECK(executor.hasIOTensor(kvPastName.c_str()),
                 std::string("DFlash cached draft engine (") + engineLabel + ") missing KV cache binding '" + kvPastName
                     + "'. Old explicit DFlash engines are not compatible. Re-export and rebuild.");
-            ELLM_CHECK(engineHasTensor(executor, kvPresentName),
+            ELLM_CHECK(executor.hasIOTensor(kvPresentName.c_str()),
                 std::string("DFlash cached draft engine (") + engineLabel + ") missing KV cache binding '"
                     + kvPresentName + "'.");
 
@@ -959,30 +951,30 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
         };
         for (auto const* name : kRequiredBindings)
         {
-            ELLM_CHECK(engineHasTensor(executor, std::string(name)),
+            ELLM_CHECK(executor.hasIOTensor(name),
                 std::string("Gemma4 MTP draft engine (") + engineLabel + ") is missing required binding '" + name
                     + "'. Re-export and rebuild the assistant engine.");
         }
         if (config.useDualRope)
         {
-            ELLM_CHECK(engineHasTensor(executor, binding_names::kRopeCosSinSliding),
+            ELLM_CHECK(executor.hasIOTensor(binding_names::kRopeCosSinSliding),
                 std::string("Gemma4 MTP draft engine (") + engineLabel + ") is missing required dual-RoPE binding '"
                     + binding_names::kRopeCosSinSliding + "'. Re-export and rebuild the assistant engine.");
-            ELLM_CHECK(engineHasTensor(executor, binding_names::kRopeCosSinFull),
+            ELLM_CHECK(executor.hasIOTensor(binding_names::kRopeCosSinFull),
                 std::string("Gemma4 MTP draft engine (") + engineLabel + ") is missing required dual-RoPE binding '"
                     + binding_names::kRopeCosSinFull + "'. Re-export and rebuild the assistant engine.");
         }
         else
         {
-            ELLM_CHECK(engineHasTensor(executor, binding_names::kRopeCosSin),
+            ELLM_CHECK(executor.hasIOTensor(binding_names::kRopeCosSin),
                 std::string("Gemma4 MTP draft engine (") + engineLabel + ") is missing required binding '"
                     + binding_names::kRopeCosSin + "'. Re-export and rebuild the assistant engine.");
         }
 
-        ELLM_CHECK(!engineHasTensor(executor, binding_names::kDraftModelHiddenStates),
+        ELLM_CHECK(!executor.hasIOTensor(binding_names::kDraftModelHiddenStates),
             std::string("Gemma4 MTP draft engine (") + engineLabel + ") must not expose binding '"
                 + binding_names::kDraftModelHiddenStates + "'.");
-        ELLM_CHECK(!engineHasTensor(executor, binding_names::kKVCacheStartIndex),
+        ELLM_CHECK(!executor.hasIOTensor(binding_names::kKVCacheStartIndex),
             std::string("Gemma4 MTP draft engine (") + engineLabel
                 + ") must not expose draft-owned kvcache_start_index.");
         ELLM_CHECK(!engineHasTensorWithPrefix(executor, binding_names::kPresentKeyValuesTemplate),
@@ -991,7 +983,7 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
         for (int32_t assistantLayerIdx = 0; assistantLayerIdx < config.numAttentionLayers; ++assistantLayerIdx)
         {
             std::string const kvPastName = binding_names::formatKVCacheName(assistantLayerIdx, /*isPast=*/true);
-            ELLM_CHECK(engineHasTensor(executor, kvPastName),
+            ELLM_CHECK(executor.hasIOTensor(kvPastName.c_str()),
                 std::string("Gemma4 MTP draft engine (") + engineLabel + ") missing shared target KV input '"
                     + kvPastName + "'.");
             auto const engineDtype = executor.getBindingDataType(kvPastName.c_str());
@@ -1030,7 +1022,7 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
     if (config.numAttentionLayers > 0)
     {
         std::string const kvBindingName = binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/true);
-        ELLM_CHECK(engineHasTensor(executor, kvBindingName),
+        ELLM_CHECK(executor.hasIOTensor(kvBindingName.c_str()),
             std::string("Missing KV cache binding (") + engineLabel + "): expected '" + kvBindingName + "'.");
         auto const engineDtype = executor.getBindingDataType(kvBindingName.c_str());
         ELLM_CHECK(engineDtype == config.kvCacheDtype,
@@ -1043,7 +1035,7 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
     if (config.numLinearAttnLayers > 0)
     {
         std::string const recBindingName = binding_names::formatRecurrentStateName(/*layerIdx=*/0, /*isPast=*/true);
-        ELLM_CHECK(engineHasTensor(executor, recBindingName),
+        ELLM_CHECK(executor.hasIOTensor(recBindingName.c_str()),
             std::string("Missing recurrent-state binding (") + engineLabel + "): expected '" + recBindingName + "'.");
         auto const recEngineDtype = executor.getBindingDataType(recBindingName.c_str());
         ELLM_CHECK(recEngineDtype == config.recurrentStateDtype,
@@ -1053,13 +1045,26 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
                 + "'. Re-export the engine with matching recurrent_state_dtype.");
 
         std::string const convBindingName = binding_names::formatConvStateName(/*layerIdx=*/0, /*isPast=*/true);
-        ELLM_CHECK(engineHasTensor(executor, convBindingName),
+        ELLM_CHECK(executor.hasIOTensor(convBindingName.c_str()),
             std::string("Missing conv-state binding (") + engineLabel + "): expected '" + convBindingName + "'.");
         auto const convEngineDtype = executor.getBindingDataType(convBindingName.c_str());
         ELLM_CHECK(convEngineDtype == config.convStateDtype,
             std::string("Conv state dtype mismatch (") + engineLabel + "): config says "
                 + getDataTypeString(config.convStateDtype) + ", engine reports " + getDataTypeString(convEngineDtype)
                 + " for binding '" + convBindingName + "'. Re-export the engine with matching conv_state_dtype.");
+
+        if (config.isSpecDecodeBase && config.numLinearAttnLayers > 0
+            && (config.specDecodeType == SpecDecodeMode::kMTP || config.specDecodeType == SpecDecodeMode::kDFlash))
+        {
+            ELLM_CHECK(executor.hasIOTensor(binding_names::kSpecVerifyPhaseMarker),
+                std::string("Missing spec-verify phase marker binding (") + engineLabel + "): expected '"
+                    + binding_names::kSpecVerifyPhaseMarker + "'. Re-export the hybrid MTP/DFlash base engine.");
+            auto const markerEngineDtype = executor.getBindingDataType(binding_names::kSpecVerifyPhaseMarker);
+            ELLM_CHECK(markerEngineDtype == nvinfer1::DataType::kINT32,
+                std::string("Spec-verify phase marker dtype mismatch (") + engineLabel + "): engine reports "
+                    + getDataTypeString(markerEngineDtype) + " for binding '" + binding_names::kSpecVerifyPhaseMarker
+                    + "'. Re-export the hybrid MTP/DFlash base engine.");
+        }
     }
 }
 
@@ -1079,6 +1084,7 @@ InferenceDims LLMEngineConfig::resetDims() const
         /*.ropeBatch=*/1,
         /*.packedMaskLen=*/1,
         /*.startIndexLen=*/1,
+        /*.specVerifyPhaseLen=*/0,
     };
 }
 

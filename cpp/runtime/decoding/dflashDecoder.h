@@ -109,8 +109,6 @@ private:
 
     Tensor mTreeTokenIds;         //!< [B, verifySize] INT32, DDTree node tokens
     Tensor mTreeNodeScores;       //!< [B, verifySize] FP32, DDTree prefix scores
-    Tensor mTreeParentIds;        //!< [B, verifySize] INT32, DDTree parent ids for runtime tree construction
-    Tensor mTreeDepths;           //!< [B, verifySize] INT32, DDTree node depths for runtime tree construction
     Tensor mValidCounts;          //!< [B] INT32, DDTree valid node counts
     Tensor mVerifyTokenIds;       //!< [B, verifyTokenCount] INT32
     Tensor mVerifyTreeMask;       //!< [B, verifyTokenCount, verifyTokenCount] INT8

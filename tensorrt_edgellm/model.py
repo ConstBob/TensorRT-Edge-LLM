@@ -97,6 +97,7 @@ class AutoModel:
                         tp_size: int = 1,
                         tp_rank: int = 0,
                         dflash_base: bool = False,
+                        dflash_tree_base: bool = False,
                         dflash_draft: bool = False,
                         dflash_draft_dir: "str | None" = None,
                         gemma4_mtp_base: bool = False,
@@ -133,6 +134,9 @@ class AutoModel:
                             are sharded on assignment.  Default 1 = no TP.
             tp_rank:        This rank's index in [0, tp_size).
             dflash_base:    When True, export as DFlash base model.
+            dflash_tree_base:
+                            When True, add DDTree parent/depth metadata inputs
+                            for Qwen3.5 hybrid state execution.
             dflash_draft:   When True, build the DFlash draft model.
             dflash_draft_dir:
                             Path to the DFlash draft checkpoint directory.
@@ -166,6 +170,12 @@ class AutoModel:
             config.gemma4_mtp_base = True
         if dflash_base:
             config.dflash_base = True
+        if dflash_tree_base:
+            config.dflash_base = True
+            config.dflash_tree_base = True
+        elif config.dflash_tree_base:
+            config.dflash_base = True
+        if config.dflash_base:
             # Read target_layer_ids from DFlash draft checkpoint if provided
             if not config.dflash_target_layer_ids and dflash_draft_dir:
                 import json

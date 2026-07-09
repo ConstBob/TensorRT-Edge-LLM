@@ -498,6 +498,7 @@ TEST(LLMEngineConfigRecipesTest, PrefillDims)
     EXPECT_EQ(d.ropeBatch, 1);      // non-MRope
     EXPECT_EQ(d.packedMaskLen, 1);  // pinned to 1 alongside attnMaskSeqLen
     EXPECT_EQ(d.startIndexLen, 0);  // plugin-path empty-cache sentinel
+    EXPECT_EQ(d.specVerifyPhaseLen, 0);
 }
 
 TEST(LLMEngineConfigRecipesTest, PrefillDimsMRope)
@@ -508,6 +509,7 @@ TEST(LLMEngineConfigRecipesTest, PrefillDimsMRope)
     EXPECT_EQ(d.attnMaskSeqLen, 1); // dummy attention shape during prefill
     EXPECT_EQ(d.packedMaskLen, 1);  // pinned to 1 alongside attnMaskSeqLen
     EXPECT_EQ(d.startIndexLen, 0);  // plugin-path empty-cache sentinel
+    EXPECT_EQ(d.specVerifyPhaseLen, 0);
 }
 
 TEST(LLMEngineConfigRecipesTest, PrefillDimsChunked)
@@ -516,6 +518,7 @@ TEST(LLMEngineConfigRecipesTest, PrefillDimsChunked)
     auto const cfg = makeRecipeConfig(/*maxKV=*/4096, /*mrope=*/false);
     auto const d = cfg.prefillDims(/*batch=*/2, /*seqLen=*/128, /*kvCacheAllEmpty=*/false);
     EXPECT_EQ(d.startIndexLen, 2);
+    EXPECT_EQ(d.specVerifyPhaseLen, 0);
 }
 
 TEST(LLMEngineConfigRecipesTest, DecodeDims)
@@ -530,6 +533,7 @@ TEST(LLMEngineConfigRecipesTest, DecodeDims)
     EXPECT_EQ(d.ropeBatch, 1);
     EXPECT_EQ(d.packedMaskLen, 1); // explicit 1 in decode
     EXPECT_EQ(d.startIndexLen, 4); // batch
+    EXPECT_EQ(d.specVerifyPhaseLen, 0);
 }
 
 TEST(LLMEngineConfigRecipesTest, DecodeDimsMRope)
@@ -551,6 +555,20 @@ TEST(LLMEngineConfigRecipesTest, SpecVerifyDimsIsOnlyRecipeWithSelectLenNeq1)
     EXPECT_EQ(d.ropeBatch, 1);
     EXPECT_EQ(d.packedMaskLen, 1); // divUp(8, 32) = 1
     EXPECT_EQ(d.startIndexLen, 1); // batch (cache non-empty during verify)
+    EXPECT_EQ(d.specVerifyPhaseLen, 1);
+}
+
+TEST(LLMEngineConfigRecipesTest, ShortPrefillDoesNotSetSpecVerifyPhaseMarker)
+{
+    auto const cfg = makeRecipeConfig(/*maxKV=*/8192, /*mrope=*/false);
+    for (int32_t seqLen = 2; seqLen <= 16; ++seqLen)
+    {
+        auto const d = cfg.prefillDims(/*batch=*/2, seqLen, /*kvCacheAllEmpty=*/true);
+        EXPECT_EQ(d.seqLen, seqLen);
+        EXPECT_EQ(d.specVerifyPhaseLen, 0);
+    }
+    auto const verifyDims = cfg.specVerifyDims(/*batch=*/2, /*verifySize=*/16);
+    EXPECT_EQ(verifyDims.specVerifyPhaseLen, 1);
 }
 
 TEST(LLMEngineConfigRecipesTest, ProposalDims)
@@ -562,6 +580,7 @@ TEST(LLMEngineConfigRecipesTest, ProposalDims)
     EXPECT_EQ(d.attnMaskSeqLen, 16); // paddedTreeSize — tree attention shape
     EXPECT_EQ(d.packedMaskLen, 1);   // divUp(16, 32) = 1
     EXPECT_EQ(d.startIndexLen, 2);   // batch
+    EXPECT_EQ(d.specVerifyPhaseLen, 0);
 }
 
 TEST(LLMEngineConfigRecipesTest, AcceptDims)
@@ -574,6 +593,7 @@ TEST(LLMEngineConfigRecipesTest, AcceptDims)
     EXPECT_EQ(d.attnMaskSeqLen, 33); // acceptLen — tree attention shape
     EXPECT_EQ(d.packedMaskLen, 2);   // divUp(33, 32) = 2 — exercises the boundary
     EXPECT_EQ(d.startIndexLen, 3);   // batch
+    EXPECT_EQ(d.specVerifyPhaseLen, 0);
 }
 
 TEST(LLMEngineConfigRecipesTest, ResetDimsRopeBatchOneEvenForMRope)
@@ -595,6 +615,7 @@ TEST(LLMEngineConfigRecipesTest, ResetDimsRopeBatchOneEvenForMRope)
         EXPECT_EQ(d.ropeBatch, 1); // Always 1, regardless of MRope
         EXPECT_EQ(d.packedMaskLen, 1);
         EXPECT_EQ(d.startIndexLen, 1); // placeholder bind; matches batch=1
+        EXPECT_EQ(d.specVerifyPhaseLen, 0);
     }
 }
 

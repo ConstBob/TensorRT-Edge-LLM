@@ -311,6 +311,31 @@ inline constexpr char const* kAttentionMask = "attention_mask";
  */
 inline constexpr char const* kAttentionPosId = "attention_pos_id";
 
+/*!
+ * @brief Shape-only marker for speculative verification in hybrid MTP/DFlash base engines
+ *
+ * Shape: [0] for normal prefill/decode/reset, [1] for MTP/DFlash verification (INT32).
+ * The INT32 payload is ignored. Hybrid GDN/conv plugins only need to distinguish
+ * speculative verify seq_len > 1 from ordinary prefill seq_len > 1.
+ */
+inline constexpr char const* kSpecVerifyPhaseMarker = "spec_verify_phase_marker";
+
+/*!
+ * @brief DDTree parent node ids for hybrid DFlash base verification
+ *
+ * Shape: [batch_size, verify_tree_size] (INT32). Each entry points to the
+ * flattened parent node whose hybrid state is used to evaluate the current node.
+ */
+inline constexpr char const* kTreeParentIds = "tree_parent_ids";
+
+/*!
+ * @brief DDTree node depths for hybrid DFlash base verification
+ *
+ * Shape: [batch_size, verify_tree_size] (INT32). Depth is used for positional
+ * metadata and for tree-state kernels that need node order information.
+ */
+inline constexpr char const* kTreeDepths = "tree_depths";
+
 /*! @} */
 
 /*! @name Visual Encoder Bindings (Qwen-VL, InternVL)

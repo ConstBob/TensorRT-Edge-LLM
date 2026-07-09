@@ -730,6 +730,7 @@ def _export_llm(model_dir: str,
                 reduced_vocab_dir: str = "",
                 mtp_base: bool = False,
                 dflash_base: bool = False,
+                dflash_tree_base: bool = False,
                 dflash_draft_dir: str = "",
                 gemma4_mtp_base: bool = False,
                 externalize_weights: "list[str] | None" = None,
@@ -786,6 +787,7 @@ def _export_llm(model_dir: str,
                 reduced_vocab_dir=reduced_vocab_dir or None,
                 mtp_base=mtp_base,
                 dflash_base=dflash_base,
+                dflash_tree_base=dflash_tree_base,
                 dflash_draft_dir=dflash_draft_dir or None,
                 gemma4_mtp_base=gemma4_mtp_base,
                 tp_size=world,
@@ -2215,6 +2217,11 @@ def main() -> None:
         help="Export as DFlash base model (adds DFlash hidden_states output).",
     )
     p.add_argument(
+        "--dflash-tree-base",
+        action="store_true",
+        help="Export DFlash base with DDTree hybrid state metadata inputs.",
+    )
+    p.add_argument(
         "--dflash-draft",
         action="store_true",
         help="Export DFlash draft model.",
@@ -2309,6 +2316,8 @@ def main() -> None:
         p.error("--mtp-draft-dir cannot be combined with --eagle-base")
     if mtp_draft_dir_arg and (args.dflash_base or args.dflash_draft):
         p.error("--mtp-draft-dir cannot be combined with DFlash export")
+    if args.dflash_tree_base:
+        args.dflash_base = True
     if args.dflash_base and (args.eagle_base or args.mtp):
         p.error("--dflash-base cannot be combined with --eagle-base or --mtp")
     if args.dflash_draft and (args.eagle_base or args.mtp):
@@ -2431,6 +2440,7 @@ def main() -> None:
                      eagle_base=args.eagle_base,
                      mtp_base=args.mtp and not gemma4_mtp_requested,
                      dflash_base=args.dflash_base,
+                     dflash_tree_base=args.dflash_tree_base,
                      dflash_draft_dir=args.dflash_draft_dir,
                      gemma4_mtp_base=gemma4_mtp_requested,
                      fp8_embedding=args.fp8_embedding,
