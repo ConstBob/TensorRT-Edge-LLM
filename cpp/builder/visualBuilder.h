@@ -164,6 +164,10 @@ private:
     //! @return true if setup was successful, false otherwise
     bool setupGemma4ViTProfile(nvinfer1::IOptimizationProfile& profile, nvinfer1::INetworkDefinition const& network);
 
+    //! Set up the two dynamic packed-patch inputs for encoder-free Gemma4 Unified vision.
+    bool setupGemma4UnifiedVisionProfile(
+        nvinfer1::IOptimizationProfile& profile, nvinfer1::INetworkDefinition const& network);
+
     //! Copy and save the model configuration with builder config.
     //! Creates a config.json file in the engine directory with both original model config
     //! and builder configuration parameters.

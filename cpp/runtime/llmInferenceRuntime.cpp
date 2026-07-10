@@ -1181,6 +1181,11 @@ bool LLMInferenceRuntime::validateRequestConfig(LLMGenerationRequest const& requ
         LOG_ERROR("Request contains trajectory history input, but this runtime does not have an action runner.");
         return false;
     }
+    if (mDeployment.base.useVisionBidirectionalAttention && request.saveSystemPromptKVCache)
+    {
+        LOG_ERROR("System-prompt KV-cache reuse is not supported with Gemma4 vision bidirectional attention.");
+        return false;
+    }
 
     return true;
 }
@@ -1351,6 +1356,26 @@ bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context)
     CUDA_CHECK(cudaMemcpyAsync(mIdsInput.rawPointer(), hostPackedTokenIdsData,
         activeBatchSize * inputIdsLength * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
 
+    bool const baseKVAllEmpty = mSharedResources->cacheManagers[0]->getKVCacheAllEmpty();
+    if (mDeployment.base.useVisionBidirectionalAttention)
+    {
+        // Vision-block attention supports only non-chunked prefill. Decode
+        // ignores this binding and uses causal decode attention over the
+        // canonical KV cache.
+        if (!baseKVAllEmpty)
+        {
+            LOG_ERROR(
+                "Gemma4 vision bidirectional attention does not yet support prefix-cache reuse or chunked prefill.");
+            return false;
+        }
+        check::check(mPipelineIO->visionBlockIds.reshape({activeBatchSize, inputIdsLength}), "Tensor reshape failed");
+        rt::Tensor hostVisionBlockIds = generateVisionBlockIds(mHostPackedTokenIds, mDeployment.base.imageTokenId);
+        // hostVisionBlockIds owns short-lived pinned storage. Keep this copy
+        // synchronous so the source remains alive until H2D completion.
+        CUDA_CHECK(cudaMemcpy(mPipelineIO->visionBlockIds.rawPointer(), hostVisionBlockIds.rawPointer(),
+            activeBatchSize * inputIdsLength * sizeof(int32_t), cudaMemcpyHostToDevice));
+    }
+
     // Embedding lookup (text / vision / audio-multimodal) into mPipelineIO->inputsEmbeds;
     // deepstack slots are populated from features or zero-filled depending on the request.
     mEmbeddingPre->embed(mIdsInput, context.visualEmbeddings, context.audioEmbeddings, *mPipelineIO, context.stream);
@@ -1372,7 +1397,6 @@ bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context)
     // Execute base prefill through the EngineExecutor. Empty-cache is
     // runtime-dynamic; prefillDims uses it to set InferenceDims::startIndexLen
     // (0 for the "initial prefill" sentinel, else batch).
-    bool const baseKVAllEmpty = mSharedResources->cacheManagers[0]->getKVCacheAllEmpty();
     auto const prefillDims = mDeployment.base.prefillDims(activeBatchSize, inputIdsLength, baseKVAllEmpty);
 
     check::check(mBaseExecutor->prepare(kPrefillProfile, prefillDims, mBaseTensorMap, context.stream),
@@ -1696,6 +1720,12 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(DecodingInferenceContext& con
 
 bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(DecodingInferenceContext& context, int32_t genAndSaveBatchIdx)
 {
+    if (mDeployment.base.useVisionBidirectionalAttention)
+    {
+        LOG_ERROR("System-prompt KV-cache reuse is not supported with Gemma4 vision bidirectional attention.");
+        return false;
+    }
+
     std::string const& loraWeightsName = context.loraWeightsName;
     std::string const prompt = context.systemPrompts[genAndSaveBatchIdx];
     auto const promptKey = keySystemPromptWithLoraWeights(prompt, loraWeightsName);
@@ -1804,6 +1834,12 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(DecodingInferenceContext
 bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     std::string const& prompt, std::string const& loraWeightsName, cudaStream_t stream)
 {
+    if (mDeployment.base.useVisionBidirectionalAttention)
+    {
+        LOG_ERROR("System-prompt KV-cache reuse is not supported with Gemma4 vision bidirectional attention.");
+        return false;
+    }
+
     if (prompt.empty())
     {
         LOG_DEBUG("The systemPrompt is empty. Skip saving system prompt KVCache.");

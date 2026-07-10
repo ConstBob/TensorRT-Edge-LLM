@@ -41,12 +41,12 @@ VLMs (LLM + visual encoder):
     internvl_chat                 (InternVL3)
     internvl                      (InternVL3.5)
     phi4mm, phi4_multimodal       (Phi-4 Multimodal)
-    gemma4                        (Gemma4 multimodal checkpoints)
+    gemma4, gemma4_unified        (Gemma4 multimodal checkpoints)
     NemotronH_Nano_VL_V2, NemotronH_Nano_Omni_Reasoning_V3
                                  (Nemotron-Omni)
 
 Audio models (LLM + audio encoder):
-    qwen3_asr, qwen3_omni, qwen3_omni_thinker
+    qwen3_asr, qwen3_omni, qwen3_omni_thinker, gemma4_unified
     NemotronH_Nano_VL_V2, NemotronH_Nano_Omni_Reasoning_V3
                                  (Nemotron-Omni)
 
@@ -92,6 +92,8 @@ _NEMOTRON_OMNI_MODEL_TYPES = frozenset([
 _GEMMA4_MODEL_TYPES = frozenset([
     "gemma4",
     "gemma4_text",
+    "gemma4_unified",
+    "gemma4_unified_text",
 ])
 
 _VLM_MODEL_TYPES = frozenset([
@@ -106,6 +108,7 @@ _VLM_MODEL_TYPES = frozenset([
     "phi4mm",
     "phi4_multimodal",
     "gemma4",
+    "gemma4_unified",
     "alpamayo_r1",
     *_NEMOTRON_OMNI_MODEL_TYPES,
 ])
@@ -117,6 +120,7 @@ _AUDIO_MODEL_TYPES = frozenset([
     "qwen3_omni_thinker",
     "qwen3_omni_moe",
     "qwen3_omni_moe_thinker",
+    "gemma4_unified",
     *_NEMOTRON_OMNI_MODEL_TYPES,
     # qwen3_tts intentionally excluded: Qwen3-TTS has NO audio encoder.
     # Its Talker and CodePredictor are LLM decoders exported via the LLM pipeline.
@@ -127,7 +131,8 @@ _AUDIO_MODEL_TYPES = frozenset([
 # Excludes Nemotron-Omni, which has its own field names
 # (``img_context_token_id`` / ``sound_context_token_id``) at the source-config
 # root and is handled by ``_collect_tokens_from_nemotron_root``.
-_ASR_LLM_MODEL_TYPES = _AUDIO_MODEL_TYPES - _NEMOTRON_OMNI_MODEL_TYPES
+_ASR_LLM_MODEL_TYPES = (_AUDIO_MODEL_TYPES - _NEMOTRON_OMNI_MODEL_TYPES -
+                        {"gemma4_unified"})
 
 _CODE2WAV_MODEL_TYPES = frozenset([
     "qwen3_omni",
@@ -617,21 +622,32 @@ def _collect_tokens_from_tokenizer_fallback(model_dir: str) -> dict:
     return out
 
 
-def _collect_gemma4_tokenizer_fallback(model_dir: str) -> dict:
+def _collect_gemma4_tokenizer_fallback(model_dir: str,
+                                       model_type: str = "") -> dict:
     """Gemma4 fallback for multimodal placeholders.
 
     Gemma4's PLE preprocessor uses image/audio token IDs to zero-fill the token
     identity component at multimodal positions. Prefer structured config fields
     when present, but resolve the standard placeholder tokens from tokenizer
-    assets when the source config is flat or incomplete.
+    assets when the source config is flat or incomplete.  Gemma4 Unified
+    checkpoints name the placeholders ``<|image|>`` / ``<|audio|>``.
     """
+    unified = str(model_type).startswith("gemma4_unified")
+    image_tokens = ("<|image|>",
+                    "<|image_pad|>") if unified else ("<|image_pad|>", )
+    audio_tokens = ("<|audio|>",
+                    "<|audio_pad|>") if unified else ("<|audio_pad|>", )
     out: dict = {}
-    image_id = _find_token_id(model_dir, "<|image_pad|>")
-    if image_id is not None:
-        out["image_token_id"] = image_id
-    audio_id = _find_token_id(model_dir, "<|audio_pad|>")
-    if audio_id is not None:
-        out["audio_token_id"] = audio_id
+    for token in image_tokens:
+        image_id = _find_token_id(model_dir, token)
+        if image_id is not None:
+            out["image_token_id"] = image_id
+            break
+    for token in audio_tokens:
+        audio_id = _find_token_id(model_dir, token)
+        if audio_id is not None:
+            out["audio_token_id"] = audio_id
+            break
     return out
 
 
@@ -685,8 +701,9 @@ def _patch_multimodal_token_ids(model_dir: str, llm_out_dir: str,
     # Gemma4 PLE needs multimodal placeholder IDs for zero-filling PLE token
     # identity at image/audio positions.
     if model_type in _GEMMA4_MODEL_TYPES:
-        fallback = _collect_gemma4_tokenizer_fallback(llm_out_dir)
-        fallback.update(_collect_gemma4_tokenizer_fallback(model_dir))
+        fallback = _collect_gemma4_tokenizer_fallback(llm_out_dir, model_type)
+        fallback.update(
+            _collect_gemma4_tokenizer_fallback(model_dir, model_type))
         for key in ("image_token_id", "audio_token_id"):
             if key not in collected and key in fallback:
                 collected[key] = fallback[key]
@@ -1090,6 +1107,7 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
         # same C++ runner enum the dense Qwen3-Omni visual engine registers.
         "qwen3_omni_moe": "qwen3_omni_vision_encoder",
         "gemma4": "gemma4_vision",
+        "gemma4_unified": "gemma4_unified_vision",
     }
     top_level_model_type = _VISUAL_MODEL_TYPE_MAP.get(model_type, model_type)
     vis_cfg_out: dict = {
@@ -1145,23 +1163,51 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
         if _rope_scaling:
             vis_cfg_out["rope_scaling"] = normalize_rope_scaling_for_runtime(
                 _rope_scaling)
-    if model_type == "gemma4":
+    if model_type in ("gemma4", "gemma4_unified"):
         vis_cfg_out["vision_config"] = dict(vis_cfg_out["vision_config"])
-        vis_cfg_out["vision_config"]["model_type"] = "gemma4_vision"
+        visual_model_type = ("gemma4_unified_vision" if model_type
+                             == "gemma4_unified" else "gemma4_vision")
+        vis_cfg_out["model_type"] = visual_model_type
+        vis_cfg_out["vision_config"]["model_type"] = visual_model_type
         text_cfg = config.get("text_config") or {}
         if text_cfg:
             vis_cfg_out["text_config"] = text_cfg
-        for key in ("image_token_id", "audio_token_id"):
+        for key in ("image_token_id", "audio_token_id", "boi_token_id",
+                    "eoi_token_id", "boa_token_id", "eoa_token_index"):
             if key in config:
                 vis_cfg_out[key] = config[key]
         if "image_token_id" not in vis_cfg_out:
-            image_token_id = _find_token_id(model_dir, "<|image_pad|>")
+            image_token = ("<|image|>" if model_type == "gemma4_unified" else
+                           "<|image_pad|>")
+            image_token_id = _find_token_id(model_dir, image_token)
             if image_token_id is not None:
                 vis_cfg_out["image_token_id"] = image_token_id
         if "audio_token_id" not in vis_cfg_out:
-            audio_token_id = _find_token_id(model_dir, "<|audio_pad|>")
+            audio_token = ("<|audio|>" if model_type == "gemma4_unified" else
+                           "<|audio_pad|>")
+            audio_token_id = _find_token_id(model_dir, audio_token)
             if audio_token_id is not None:
                 vis_cfg_out["audio_token_id"] = audio_token_id
+        if model_type == "gemma4_unified":
+            # Unified images have a fixed upper bound on the number of soft
+            # tokens produced for each image.  Persist that bound in the
+            # exporter sidecar so both visualBuilder's optimization profile
+            # and the runtime runner agree before the engine config is
+            # generated.
+            max_soft_tokens = vis_cfg_out["vision_config"].get(
+                "num_soft_tokens")
+            processor_path = os.path.join(model_dir, "processor_config.json")
+            if os.path.exists(processor_path):
+                with open(processor_path) as f:
+                    processor_config = json.load(f)
+                image_processor = processor_config.get("image_processor") or {}
+                max_soft_tokens = image_processor.get("max_soft_tokens",
+                                                      max_soft_tokens)
+            if max_soft_tokens is not None:
+                max_soft_tokens = int(max_soft_tokens)
+                vis_cfg_out["builder_config"] = {
+                    "max_image_tokens_per_image": max_soft_tokens,
+                }
     if model_type == "qwen3_omni_moe":
         # HF Qwen3-Omni-MoE 30B-A3B-Instruct vision_config omits the
         # ``num_position_embeddings`` field that QwenViTRunner reads, but
@@ -1208,6 +1254,7 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
     # every visual family (Qwen VL, InternVL, Phi-4mm) — the C++ visual
     # runners all read from this file.
     import shutil
+    proc_src = os.path.join(model_dir, "processor_config.json")
     pp_src = os.path.join(model_dir, "preprocessor_config.json")
     if os.path.exists(pp_src):
         shutil.copy2(pp_src, visual_out_dir)
@@ -1217,7 +1264,6 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
         # Newer quantized checkpoints store image processor config inside
         # processor_config.json under the "image_processor" key.  Extract
         # it and write a standalone preprocessor_config.json.
-        proc_src = os.path.join(model_dir, "processor_config.json")
         if os.path.exists(proc_src):
             with open(proc_src) as _pf:
                 proc_cfg = json.load(_pf)
@@ -1348,7 +1394,37 @@ def _export_audio(model_dir: str,
     logger.info("[Audio] Done: %s", output_path)
 
     # Write config.json for the C++ runtime
-    if model_type in _NEMOTRON_OMNI_MODEL_TYPES:
+    if model_type == "gemma4_unified":
+        audio_cfg = dict(config.get("audio_config") or {})
+        audio_cfg["model_type"] = "gemma4_unified_audio"
+        audio_cfg_out = {
+            "model_type": "gemma4_unified_audio",
+            "audio_config": audio_cfg,
+        }
+        text_cfg = config.get("text_config") or {}
+        if text_cfg:
+            audio_cfg_out["text_config"] = text_cfg
+        for key in ("audio_token_id", "image_token_id", "boi_token_id",
+                    "eoi_token_id", "boa_token_id", "eoa_token_index"):
+            if key in config:
+                audio_cfg_out[key] = config[key]
+
+        # The source checkpoint keeps raw-waveform framing metadata in the
+        # nested feature_extractor section of processor_config.json.  Copy it
+        # into the runtime sidecar so the C++ Unified runner does not have to
+        # parse an unrelated Hugging Face processor file.
+        processor_path = os.path.join(model_dir, "processor_config.json")
+        if os.path.exists(processor_path):
+            with open(processor_path) as f:
+                processor_config = json.load(f)
+            feature_extractor = processor_config.get("feature_extractor") or {}
+            if feature_extractor:
+                audio_cfg_out["feature_extractor"] = feature_extractor
+                for key in ("audio_samples_per_token", "sampling_rate",
+                            "feature_size", "padding_value"):
+                    if key in feature_extractor and key not in audio_cfg:
+                        audio_cfg[key] = feature_extractor[key]
+    elif model_type in _NEMOTRON_OMNI_MODEL_TYPES:
         # Nemotron-Omni carries ``sound_config`` at the root with its own
         # encoder model_type; keep the full root config alongside so the
         # builder sees everything it needs.

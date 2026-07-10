@@ -95,6 +95,7 @@ def attention_plugin(
     enable_tree_attention: bool,
     enable_fp8_kv_cache: bool,
     attention_scale: float,
+    enable_vision_block_attention: bool,
     attention_mask: Optional[torch.Tensor] = None,
     attention_pos_id: Optional[torch.Tensor] = None,
     qkv_scales: Optional[List[float]] = None,
@@ -115,16 +116,23 @@ def attention_plugin(
     | EAGLE + FP8 KV        | True               | True  (qkv_scales set)     |
     +-----------------------+--------------------+----------------------------+
 
-    ``enable_tree_attention``, ``enable_fp8_kv_cache``, and
-    ``attention_scale`` are required (no default) so that ``torch.export``
-    always includes them in the FX graph — default-matching kwargs get
-    stripped, breaking ONNX translation.
+    ``enable_tree_attention``, ``enable_fp8_kv_cache``,
+    ``enable_vision_block_attention``, and ``attention_scale`` are
+    required (no default) so that ``torch.export`` always includes them
+    in the FX graph — default-matching kwargs get stripped, breaking
+    ONNX translation.
 
     Callers must always pass ``qkv_scales=[1.0, 1.0, 1.0]`` explicitly so
     the FX graph contains a valid FLOATS value for the ONNX translation.
 
     When ``enable_tree_attention=True``, ``attention_mask`` and
     ``attention_pos_id`` must be provided (non-None).
+
+    When ``enable_vision_block_attention=True``, the ``attention_mask`` input
+    carries a ``[batch, seq_len]`` INT32 vision-block-ID tensor instead of a
+    tree mask.  ``-1`` means causal text/audio; equal non-negative IDs identify
+    one contiguous image run whose tokens may attend bidirectionally to
+    each other.  This mode is mutually exclusive with tree attention.
 
     The TRT AttentionPlugin kernel returns a 4-D tensor
     ``[batch, seq_len, num_q_heads, head_size]``.
@@ -164,6 +172,7 @@ def _(query_states,
       enable_tree_attention,
       enable_fp8_kv_cache,
       attention_scale,
+      enable_vision_block_attention,
       attention_mask=None,
       attention_pos_id=None,
       qkv_scales=None):

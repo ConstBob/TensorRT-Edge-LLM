@@ -128,6 +128,10 @@ void buildTensorMap(
     map.set(binding_names::kLogits, io.outputLogits);
     map.set(binding_names::kContextLengths, io.contextLengths);
     map.set(binding_names::kLastTokenIds, io.selectTokenIndices);
+    if (cfg.useVisionBidirectionalAttention)
+    {
+        map.set(binding_names::kVisionBlockIds, io.visionBlockIds);
+    }
 
     bindRopeTensors(map, io, res, cfg);
 
@@ -299,6 +303,12 @@ PipelineIO PipelineIO::createForLLM(LLMEngineConfig const& cfg, cudaStream_t str
 
     allocateBasicIO(io, cfg.maxSupportedBatchSize, cfg.maxSupportedInputLength, cfg.hiddenSize, cfg.outputVocabSize,
         nvinfer1::DataType::kHALF);
+
+    if (cfg.useVisionBidirectionalAttention)
+    {
+        io.visionBlockIds = Tensor({cfg.maxSupportedBatchSize, cfg.maxSupportedInputLength}, DeviceType::kGPU,
+            nvinfer1::DataType::kINT32, "PipelineIO::visionBlockIds");
+    }
 
     if (cfg.numDeepstackFeatures > 0)
     {

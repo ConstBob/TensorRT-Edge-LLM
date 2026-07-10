@@ -102,6 +102,18 @@ public:
      */
     void dispatchFMHAKernel(FusedMultiheadAttentionParamsV2& params, cudaStream_t const& stream);
 
+    /*!
+     * @brief Check whether the exact kernel this instance would dispatch exists in the cubin table
+     *
+     * Performs the same kernel lookup as dispatchFMHAKernel() (including the
+     * sequence-length driven tiled/non-tiled selection) without launching.
+     * Used for per-instance routing decisions, e.g. the vision-block prefill
+     * seam probing for CUSTOM_MASK kernels.
+     *
+     * @return True if the kernel is available
+     */
+    bool isKernelAvailable() const noexcept;
+
     // Static methods to check kernel availability and load cubins into device.
     /*!
      * @brief Check if FMHA can be implemented for given head size/layout/mask combination

@@ -201,6 +201,10 @@ void transposeToPatchGemma4ViT(rt::Tensor const& originalImage, rt::Tensor& inpu
     int64_t const gridH = H / patchSize;
     int64_t const gridW = W / patchSize;
     int64_t const totalElements = gridH * gridW * inputDim;
+    check::check(inputOffset >= 0 && inputOffset + totalElements <= inputPatches.getShape().volume(),
+        "inputOffset + totalElements must fit inside inputPatches: inputOffset=" + std::to_string(inputOffset)
+            + ", totalElements=" + std::to_string(totalElements)
+            + ", capacity=" + std::to_string(inputPatches.getShape().volume()));
 
     uint32_t const blockSize = 256;
     uint32_t const gridSize = (totalElements + blockSize - 1) / blockSize;

@@ -304,6 +304,9 @@ inline constexpr char const* kDraftModelHiddenStates = "hidden_states_from_draft
  */
 inline constexpr char const* kAttentionMask = "attention_mask";
 
+/*! Gemma4 Unified prefill block IDs: [batch_size, sequence_length] INT32. */
+inline constexpr char const* kVisionBlockIds = "vision_block_ids";
+
 /*!
  * @brief Attention position IDs for Eagle models
  *
@@ -498,6 +501,13 @@ inline constexpr char const* kDraftVocabMapFileName = "draft_vocab_map.safetenso
 /*! @name Audio Encoder Bindings (Qwen3-Omni)
  * @{
  */
+
+/*!
+ * @brief Raw framed PCM input used by encoder-free audio embedders
+ *
+ * Shape: [1, num_frames, frame_size] (FLOAT16)
+ */
+inline constexpr char const* kAudioInputFeatures = "input_features";
 
 /*!
  * @brief Audio padded features tensor - chunked and padded Mel-spectrogram

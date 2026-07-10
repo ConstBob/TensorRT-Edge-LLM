@@ -313,7 +313,8 @@ void launch2CtaHeadDim512ClusterKernel(XQAKernelFuncInfo const& kernelInfo, dim3
 }
 #endif // SUPPORTS_CLUSTER_LAUNCH
 
-bool hasHeadDim512KernelsForSM(int32_t smVersion, XQADataType kvDataType, bool usePagedKVCache) noexcept
+bool hasHeadDim512KernelsForSM(
+    int32_t smVersion, XQADataType kvDataType, int32_t headRatio, bool usePagedKVCache) noexcept
 {
     bool hasDecodeKernel{false};
     bool hasSpecDecodeKernel{false};
@@ -328,9 +329,10 @@ bool hasHeadDim512KernelsForSM(int32_t smVersion, XQADataType kvDataType, bool u
         }
         if (kernelMeta.mMultiQueryTokens)
         {
+            // Spec-decode tree attention kernels support any Q/KV head ratio.
             hasSpecDecodeKernel = true;
         }
-        else
+        else if (kernelMeta.mNumQHeadsOverKV == static_cast<unsigned int>(headRatio))
         {
             hasDecodeKernel = true;
         }
@@ -563,19 +565,23 @@ bool DecoderXQARunner::canImplement(int32_t numQHeads, int32_t numKVHeads, int32
     // (3) Head ratio 2, 4, 6, 8 for head_dim 256
     //     (4/6/8 for Qwen3.5-MoE / Qwen3.5-Omni Thinker+Talker;
     //      2 for Qwen3.5-Omni Talker decode attention — 16 Q heads / 8 KV heads).
-    // (4) Head ratio 2, 4, 8 for head_dim 512 where matching cubins are present.
+    // (4) Head ratio 2, 4, 8, 16 for head_dim 512 where matching cubins are present.
     //     (2 for Gemma4 E4B assistant: 4 Q heads / 2 KV heads;
     //      4 for Gemma4 E4B: 8 Q heads / 2 KV heads;
-    //      8 for Gemma4 E2B: 8 Q heads / 1 KV head).
+    //      8 for Gemma4 E2B: 8 Q heads / 1 KV head;
+    //      16 for Gemma4 Unified 12B global attention: 16 Q heads / 1 KV head,
+    //      generated for SM100/SM120-family only).
     int32_t const headRatio = numQHeads / numKVHeads;
     XQADataType const xqaKVDataType
         = kvDataType == DataType::kFP8 ? XQADataType::DATA_TYPE_E4M3 : XQADataType::DATA_TYPE_FP16;
-    bool const checkHeadDim512SM = hasHeadDim512KernelsForSM(smVersion, xqaKVDataType, usePagedKVCache);
+    bool const checkHeadDim512SM
+        = headSize == 512 && hasHeadDim512KernelsForSM(smVersion, xqaKVDataType, headRatio, usePagedKVCache);
     bool const checkQHeadPerKV
         = ((headSize == 32 || headSize == 64 || headSize == 128) && headRatio >= 1 && headRatio <= 8)
         || (headSize == 128 && headRatio == 16)
         || (headSize == 256 && (headRatio == 2 || headRatio == 4 || headRatio == 6 || headRatio == 8))
-        || (headSize == 512 && checkHeadDim512SM && (headRatio == 2 || headRatio == 4 || headRatio == 8));
+        || (headSize == 512 && checkHeadDim512SM
+            && (headRatio == 2 || headRatio == 4 || headRatio == 8 || headRatio == 16));
 
     return checkHeadNumbers && checkType && checkKVType && checkSMVersion && checkQHeadPerKV;
 }

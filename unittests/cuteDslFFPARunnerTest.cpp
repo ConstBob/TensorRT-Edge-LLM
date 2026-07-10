@@ -287,7 +287,9 @@ INSTANTIATE_TEST_SUITE_P(FP16Causal, CuteDslFFPAAccuracySweep,
         ShapeParam{1, 128, 8, 1, /*useNormalInit=*/true, "gemma_mqa_identity", 1.0F},
         ShapeParam{1, 128, 8, 1, /*useNormalInit=*/true, "gemma_mqa_custom", 0.37F},
         ShapeParam{1, 256, 4, 1, /*useNormalInit=*/true, "mqa_g4_H4_KV1"},
-        ShapeParam{1, 1024, 8, 1, /*useNormalInit=*/true, "mqa_H8_KV1_1k"}),
+        ShapeParam{1, 1024, 8, 1, /*useNormalInit=*/true, "mqa_H8_KV1_1k"},
+        // Gemma4 Unified 12B global-attention layers use Hq=16, Hkv=1.
+        ShapeParam{1, 128, 16, 1, /*useNormalInit=*/true, "gemma4_mqa_g16_H16_KV1"}),
     [](::testing::TestParamInfo<ShapeParam> const& info) { return std::string{info.param.name}; });
 
 class CuteDslFFPACausalProperty : public CuteDslFFPABase, public ::testing::WithParamInterface<float>
@@ -702,9 +704,327 @@ TEST_F(CuteDslFFPAVarlen, ChunkedPrefill)
 INSTANTIATE_TEST_SUITE_P(AttentionScale, CuteDslFFPACausalProperty, ::testing::Values(1.0F, 0.37F),
     [](::testing::TestParamInfo<float> const& info) { return info.param == 1.0F ? "Identity" : "Custom"; });
 
+//! Expand [B, S] vision-block IDs (-1 = text, >= 0 = block id per contiguous
+//! image run) into per-row [blockBegin, blockEnd] interval tensors with the
+//! -1/-1 sentinel for text and padding rows — the same expansion the
+//! AttentionPlugin performs on the vision_block_ids input.
+std::pair<std::vector<int32_t>, std::vector<int32_t>> buildBlockRanges(
+    std::vector<int32_t> const& blockIds, int32_t batchSize, int32_t seqLen, std::vector<int32_t> const& lens)
+{
+    std::vector<int32_t> begin(blockIds.size(), -1);
+    std::vector<int32_t> end(blockIds.size(), -1);
+    for (int32_t b = 0; b < batchSize; ++b)
+    {
+        int32_t const len = lens[static_cast<size_t>(b)];
+        int32_t s = 0;
+        while (s < len)
+        {
+            int32_t const id = blockIds[static_cast<size_t>(b) * seqLen + s];
+            int32_t e = s;
+            while (e + 1 < len && blockIds[static_cast<size_t>(b) * seqLen + e + 1] == id)
+            {
+                ++e;
+            }
+            if (id >= 0)
+            {
+                for (int32_t i = s; i <= e; ++i)
+                {
+                    begin[static_cast<size_t>(b) * seqLen + i] = s;
+                    end[static_cast<size_t>(b) * seqLen + i] = e;
+                }
+            }
+            s = e + 1;
+        }
+    }
+    return {begin, end};
+}
+
+class CuteDslFFPAVisionBlock : public CuteDslFFPABase
+{
+protected:
+    static int32_t constexpr kHeadDim = 512;
+
+    void SetUp() override
+    {
+        CuteDslFFPABase::SetUp();
+        if (IsSkipped())
+        {
+            return;
+        }
+        if (!CuteDslFFPARunner::canImplementVisionBlock(kHeadDim, mSmVersion))
+        {
+            GTEST_SKIP() << "ffpa_d512_causal_visionblock AOT variant is not compiled into this build";
+        }
+    }
+
+    //! Independent FP32 host reference for causal + vision-block overlay:
+    //! allow(q, k) = (k <= q) OR (blockBegin[q] >= 0 AND blockBegin[q] <= k <=
+    //! blockEnd[q]), restricted to the per-batch valid prefix.  Padding rows
+    //! are left untouched (the kernel only guarantees boundedness there).
+    static std::vector<__half> computeReference(std::vector<__half> const& q, std::vector<__half> const& k,
+        std::vector<__half> const& v, std::vector<int32_t> const& blockBegin, std::vector<int32_t> const& blockEnd,
+        std::vector<int32_t> const& lens, int32_t batchSize, int32_t seqLen, int32_t numQHeads, int32_t numKVHeads)
+    {
+        std::vector<__half> out(q.size(), __float2half(0.0F));
+        float const scale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
+        int32_t const groupSize = numQHeads / numKVHeads;
+        auto qIdx = [&](int32_t b, int32_t s, int32_t h, int32_t d) {
+            return ((static_cast<size_t>(b) * seqLen + s) * numQHeads + h) * kHeadDim + d;
+        };
+        auto kvIdx = [&](int32_t b, int32_t s, int32_t h, int32_t d) {
+            return ((static_cast<size_t>(b) * seqLen + s) * numKVHeads + h) * kHeadDim + d;
+        };
+        for (int32_t b = 0; b < batchSize; ++b)
+        {
+            int32_t const len = lens[static_cast<size_t>(b)];
+            for (int32_t query = 0; query < len; ++query)
+            {
+                int32_t const bBegin = blockBegin[static_cast<size_t>(b) * seqLen + query];
+                int32_t const bEnd = blockEnd[static_cast<size_t>(b) * seqLen + query];
+                for (int32_t qHead = 0; qHead < numQHeads; ++qHead)
+                {
+                    int32_t const kvHead = qHead / groupSize;
+                    std::vector<float> logits(static_cast<size_t>(len), -INFINITY);
+                    float maxLogit = -INFINITY;
+                    for (int32_t key = 0; key < len; ++key)
+                    {
+                        bool const causal = key <= query;
+                        bool const inBlock = bBegin >= 0 && key >= bBegin && key <= bEnd;
+                        if (!causal && !inBlock)
+                        {
+                            continue;
+                        }
+                        float dot = 0.0F;
+                        for (int32_t d = 0; d < kHeadDim; ++d)
+                        {
+                            dot += __half2float(q[qIdx(b, query, qHead, d)])
+                                * __half2float(k[kvIdx(b, key, kvHead, d)]);
+                        }
+                        logits[static_cast<size_t>(key)] = dot * scale;
+                        maxLogit = std::max(maxLogit, logits[static_cast<size_t>(key)]);
+                    }
+                    float denominator = 0.0F;
+                    for (float& logit : logits)
+                    {
+                        logit = std::isfinite(logit) ? std::exp(logit - maxLogit) : 0.0F;
+                        denominator += logit;
+                    }
+                    for (int32_t d = 0; d < kHeadDim; ++d)
+                    {
+                        float value = 0.0F;
+                        for (int32_t key = 0; key < len; ++key)
+                        {
+                            value += logits[static_cast<size_t>(key)] * __half2float(v[kvIdx(b, key, kvHead, d)]);
+                        }
+                        out[qIdx(b, query, qHead, d)] = __float2half(value / denominator);
+                    }
+                }
+            }
+        }
+        return out;
+    }
+
+    //! Run the overlay kernel for the given vision-block IDs and compare the
+    //! valid rows against the FP32 host reference; padding rows must stay
+    //! bounded and NaN/Inf-free.
+    void runAndCheck(std::vector<int32_t> const& blockIds, std::vector<int32_t> const& lens, int32_t seqLen,
+        int32_t numQHeads, int32_t numKVHeads, bool poisonPadding, std::string const& label)
+    {
+        int32_t const batchSize = static_cast<int32_t>(lens.size());
+        rt::Coords const qShape{batchSize, seqLen, numQHeads, kHeadDim};
+        rt::Coords const kvShape{batchSize, seqLen, numKVHeads, kHeadDim};
+        rt::Tensor q(qShape, rt::DeviceType::kGPU, DataType::kHALF);
+        rt::Tensor k(kvShape, rt::DeviceType::kGPU, DataType::kHALF);
+        rt::Tensor v(kvShape, rt::DeviceType::kGPU, DataType::kHALF);
+        rt::Tensor output(qShape, rt::DeviceType::kGPU, DataType::kHALF);
+        initializeNormalFp16(q, 811);
+        initializeNormalFp16(k, 823);
+        initializeNormalFp16(v, 827);
+        if (poisonPadding)
+        {
+            poisonPaddingRows(q, lens, 71);
+            poisonPaddingRows(k, lens, 73);
+            poisonPaddingRows(v, lens, 79);
+        }
+
+        auto const [blockBegin, blockEnd] = buildBlockRanges(blockIds, batchSize, seqLen, lens);
+        rt::Tensor blockBeginTensor(rt::Coords{batchSize, seqLen}, rt::DeviceType::kGPU, DataType::kINT32);
+        rt::Tensor blockEndTensor(rt::Coords{batchSize, seqLen}, rt::DeviceType::kGPU, DataType::kINT32);
+        copyHostToDevice(blockBeginTensor, blockBegin);
+        copyHostToDevice(blockEndTensor, blockEnd);
+        rt::Tensor cuSeqLens = makeCuSeqLens(lens);
+
+        CuteDslFFPAParams params;
+        params.q = q.rawPointer();
+        params.k = k.rawPointer();
+        params.v = v.rawPointer();
+        params.o = output.rawPointer();
+        params.cuSeqLenQ = cuSeqLens.dataPointer<int32_t>();
+        params.cuSeqLenK = cuSeqLens.dataPointer<int32_t>();
+        params.blockBegin = blockBeginTensor.dataPointer<int32_t>();
+        params.blockEnd = blockEndTensor.dataPointer<int32_t>();
+        params.batchSize = batchSize;
+        params.seqlenQ = seqLen;
+        params.seqlenK = seqLen;
+        params.numQHeads = numQHeads;
+        params.numKVHeads = numKVHeads;
+        params.headDim = kHeadDim;
+        params.softmaxScale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
+
+        ASSERT_EQ(CuteDslFFPARunner::run(params, mStream), 0) << label;
+        CUDA_CHECK(cudaStreamSynchronize(mStream));
+        CUDA_CHECK(cudaGetLastError());
+
+        auto const qHost = copyDeviceToHost<__half>(q);
+        auto const kHost = copyDeviceToHost<__half>(k);
+        auto const vHost = copyDeviceToHost<__half>(v);
+        auto const oHost = copyDeviceToHost<__half>(output);
+        auto const reference = computeReference(
+            qHost, kHost, vHost, blockBegin, blockEnd, lens, batchSize, seqLen, numQHeads, numKVHeads);
+
+        int64_t const rowElems = static_cast<int64_t>(numQHeads) * kHeadDim;
+        for (int32_t b = 0; b < batchSize; ++b)
+        {
+            for (int64_t s = 0; s < lens[static_cast<size_t>(b)]; ++s)
+            {
+                for (int64_t e = 0; e < rowElems; ++e)
+                {
+                    int64_t const idx = (static_cast<int64_t>(b) * seqLen + s) * rowElems + e;
+                    float const actual = __half2float(oHost[static_cast<size_t>(idx)]);
+                    float const expected = __half2float(reference[static_cast<size_t>(idx)]);
+                    ASSERT_FALSE(std::isnan(actual)) << label << " NaN at b=" << b << " s=" << s << " e=" << e;
+                    ASSERT_TRUE(
+                        isclose(oHost[static_cast<size_t>(idx)], reference[static_cast<size_t>(idx)], 1e-2F, 1e-2F))
+                        << label << " mismatch at b=" << b << " s=" << s << " e=" << e << " expected=" << expected
+                        << " actual=" << actual;
+                }
+            }
+            for (int64_t s = lens[static_cast<size_t>(b)]; s < seqLen; ++s)
+            {
+                for (int64_t e = 0; e < rowElems; ++e)
+                {
+                    int64_t const idx = (static_cast<int64_t>(b) * seqLen + s) * rowElems + e;
+                    float const actual = __half2float(oHost[static_cast<size_t>(idx)]);
+                    ASSERT_FALSE(std::isnan(actual)) << label << " padding NaN at b=" << b << " s=" << s;
+                    ASSERT_FALSE(std::isinf(actual)) << label << " padding Inf at b=" << b << " s=" << s;
+                    ASSERT_LT(std::abs(actual), 1.0F)
+                        << label << " padding row not bounded at b=" << b << " s=" << s << " value=" << actual;
+                }
+            }
+        }
+    }
+};
+
+// One block in the middle of the sequence, crossing both the Br=64 Q-tile
+// boundary and several Bc=16 KV tiles.  Rows 70..149 must attend keys up to
+// 149 (beyond their causal diagonal); text rows before/after stay causal.
+TEST_F(CuteDslFFPAVisionBlock, BlockMidSequence)
+{
+    int32_t constexpr kSeqLen = 192;
+    std::vector<int32_t> blockIds(kSeqLen, -1);
+    for (int32_t s = 70; s < 150; ++s)
+    {
+        blockIds[static_cast<size_t>(s)] = 0;
+    }
+    runAndCheck(blockIds, {kSeqLen}, kSeqLen, 4, 1, /*poisonPadding=*/false, "block_mid_sequence");
+}
+
+// A block that runs to the last token: blockEnd == seqlen - 1 exercises the
+// KV-bound clamp and the topmost (physically partial) KV tile.
+TEST_F(CuteDslFFPAVisionBlock, BlockAtSequenceEnd)
+{
+    int32_t constexpr kSeqLen = 160;
+    std::vector<int32_t> blockIds(kSeqLen, -1);
+    for (int32_t s = 100; s < kSeqLen; ++s)
+    {
+        blockIds[static_cast<size_t>(s)] = 0;
+    }
+    runAndCheck(blockIds, {kSeqLen}, kSeqLen, 4, 1, /*poisonPadding=*/false, "block_at_sequence_end");
+}
+
+// Two disjoint blocks with the Gemma4 Unified 12B global-layer head shape
+// (Hq=16, Hkv=1).  Rows of block 0 must not attend block 1 and vice versa.
+TEST_F(CuteDslFFPAVisionBlock, TwoBlocksGemma4HeadShape)
+{
+    int32_t constexpr kSeqLen = 128;
+    std::vector<int32_t> blockIds(kSeqLen, -1);
+    for (int32_t s = 8; s < 40; ++s)
+    {
+        blockIds[static_cast<size_t>(s)] = 0;
+    }
+    for (int32_t s = 80; s < 112; ++s)
+    {
+        blockIds[static_cast<size_t>(s)] = 1;
+    }
+    runAndCheck(blockIds, {kSeqLen}, kSeqLen, 16, 1, /*poisonPadding=*/false, "two_blocks_gemma4");
+}
+
+// Ragged BS=2 right-padded batch with poisoned padding and different block
+// layouts per batch — the overlay must stay per-batch correct under varlen
+// masking (reusing the bug 6384817 test structure).
+TEST_F(CuteDslFFPAVisionBlock, RaggedBatchWithBlocks)
+{
+    int32_t constexpr kSeqLen = 192;
+    std::vector<int32_t> const lens{192, 130};
+    std::vector<int32_t> blockIds(static_cast<size_t>(2) * kSeqLen, -1);
+    for (int32_t s = 70; s < 150; ++s)
+    {
+        blockIds[static_cast<size_t>(s)] = 0; // batch 0
+    }
+    for (int32_t s = 20; s < 60; ++s)
+    {
+        blockIds[static_cast<size_t>(kSeqLen) + s] = 0; // batch 1
+    }
+    for (int32_t s = 100; s < 130; ++s)
+    {
+        blockIds[static_cast<size_t>(kSeqLen) + s] = 1; // batch 1, ends at len-1
+    }
+    runAndCheck(blockIds, lens, kSeqLen, 4, 1, /*poisonPadding=*/true, "ragged_batch_with_blocks");
+}
+
+// Text-only inputs through the overlay kernel (all -1/-1 sentinel intervals)
+// must reproduce the plain causal FP32 reference exactly like the plain
+// kernel does — the overlay must be a strict superset feature.
+TEST_F(CuteDslFFPAVisionBlock, SentinelDegeneratesToCausal)
+{
+    int32_t constexpr kSeqLen = 130; // Br/Bc-unaligned on purpose
+    std::vector<int32_t> const blockIds(kSeqLen, -1);
+    runAndCheck(blockIds, {kSeqLen}, kSeqLen, 4, 2, /*poisonPadding=*/false, "sentinel_degenerates_to_causal");
+}
+
 class CuteDslFFPANegativePath : public CuteDslFFPABase
 {
 };
+
+// Runtime guard: blockBegin/blockEnd must be both set or both null.
+TEST_F(CuteDslFFPANegativePath, RejectsMixedNullBlockRangePointers)
+{
+    void* dummy = nullptr;
+    CUDA_CHECK(cudaMalloc(&dummy, 16));
+
+    CuteDslFFPAParams params;
+    params.q = dummy;
+    params.k = dummy;
+    params.v = dummy;
+    params.o = dummy;
+    params.cuSeqLenQ = static_cast<int32_t const*>(dummy);
+    params.cuSeqLenK = static_cast<int32_t const*>(dummy);
+    params.blockBegin = static_cast<int32_t const*>(dummy);
+    params.blockEnd = nullptr; // intentionally mixed
+    params.batchSize = 1;
+    params.seqlenQ = 16;
+    params.seqlenK = 16;
+    params.numQHeads = 1;
+    params.numKVHeads = 1;
+    params.headDim = 512;
+    params.softmaxScale = 1.0F / std::sqrt(512.0F);
+
+    EXPECT_NE(CuteDslFFPARunner::run(params, mStream), 0);
+    CUDA_CHECK(cudaStreamSynchronize(mStream));
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cudaFree(dummy));
+}
 
 // Runtime guard: params.headDim != 512 must be rejected with a non-zero return code,
 // even though canImplement() filters this at the API entry.

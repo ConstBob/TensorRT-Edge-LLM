@@ -769,6 +769,23 @@ if __name__ == "__main__":
             CompileMacroOption('M_TILESIZE', 'm', [8]),
             CompileMacroOption('SPEC_DEC', 'spec_dec', [0]),
         ],
+        [
+            # Gemma4 Unified 12B global attention: 16 Q heads / 1 KV head
+            # (GQA ratio 16) with 512-wide heads. The decode kernel tiles Q
+            # rows as roundUp(headGrpSize * beamWidth, 16), so ratio 16 fully
+            # occupies the same 16-row M tile that the nqpkv 4/8 kernels pad;
+            # shared-memory and register footprints are unchanged. Generated
+            # for the same SM set as the other d512 kernels.
+            CompileMacroOption('DTYPE', 'dt', ['__half']),
+            CompileMacroOption('HEAD_ELEMS', 'd', [512]),
+            CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
+            CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 2]),
+            CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV', [0]),
+            CompileMacroOption('SLIDING_WINDOW', 'sw', [0]),
+            CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [16]),
+            CompileMacroOption('M_TILESIZE', 'm', [8]),
+            CompileMacroOption('SPEC_DEC', 'spec_dec', [0]),
+        ],
     ]
 
     edgellm_config_list_spec_dec = [
