@@ -371,8 +371,8 @@ def export_audio_onnx(
     elif model_type == "gemma4":
         from ..models.gemma4.modeling_gemma4_audio import build_gemma4_audio
         if model_config is None:
-            from ..config import ModelConfig
-            model_config = ModelConfig.from_pretrained(model_dir)
+            from ..model import load_model_config
+            model_config = load_model_config(model_dir)
         key_prefix = _AUDIO_KEY_PREFIX.get(model_type)
         logger.info("Building Gemma4 audio encoder (prefix=%r) ...",
                     key_prefix)

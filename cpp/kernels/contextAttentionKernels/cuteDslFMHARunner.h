@@ -75,15 +75,17 @@ public:
      * @param oPtr Output [B, S_q, H_q, D] (always FP16)
      * @param cuKVSeqLens Cumulative KV sequence lengths [B+1]
      * @param stream CUDA stream
+     * @param attentionScale Model-defined multiplier applied to QK^T before softmax. For FP8 input, the effective
+     *        softmax scale is attentionScale * qScale * kScale.
      * @param slidingWindowSize Sliding window size (INT_MAX = disabled)
      * @param fp8Input Whether Q/KV are FP8 E4M3
      * @param qScale Q dequant scale (quant→orig), ignored when fp8Input=false
      * @param kScale K dequant scale (quant→orig), ignored when fp8Input=false
-     * @param vScale V dequant scale (quant→orig), ignored when fp8Input=false
+     * @param vScale V dequant scale (quant→orig), applied to the attention output and ignored when fp8Input=false
      */
     void run(void const* qPtr, void const* kvPtr, void* oPtr, int32_t const* cuKVSeqLens, cudaStream_t stream,
-        int32_t slidingWindowSize = INT_MAX, bool fp8Input = false, float qScale = 1.0f, float kScale = 1.0f,
-        float vScale = 1.0f);
+        float attentionScale, int32_t slidingWindowSize = INT_MAX, bool fp8Input = false, float qScale = 1.0F,
+        float kScale = 1.0F, float vScale = 1.0F);
 
     /**
      * @brief LLM FMHA over a paged KV cache.
@@ -114,8 +116,8 @@ public:
      */
     void runPaged(void const* qPtr, void const* pagedKVPoolPtr, int32_t const* kvCachePageList, void* oPtr,
         int32_t const* cuKVSeqLens, int32_t numPages, int32_t maxPagesPerSeq, int32_t tokensPerPage,
-        nvinfer1::DataType kvDataType, cudaStream_t stream, int32_t slidingWindowSize = INT_MAX, bool fp8Input = false,
-        float qScale = 1.0f, float kScale = 1.0f, float vScale = 1.0f);
+        nvinfer1::DataType kvDataType, cudaStream_t stream, float attentionScale, int32_t slidingWindowSize = INT_MAX,
+        bool fp8Input = false, float qScale = 1.0f, float kScale = 1.0f, float vScale = 1.0f);
 
     /**
      * @brief ViT FMHA: packed varlen separate Q/K/V, bidirectional.
@@ -129,9 +131,10 @@ public:
      * @param maxSeqLen Longest individual sequence length
      * @param batchSize Number of sequences
      * @param stream CUDA stream
+     * @param attentionScale Absolute multiplier applied to QK^T before softmax
      */
     void run(void const* qPtr, void const* kPtr, void const* vPtr, void* oPtr, int32_t const* cuSeqLens,
-        int32_t totalSeqLen, int32_t maxSeqLen, int32_t batchSize, cudaStream_t stream);
+        int32_t totalSeqLen, int32_t maxSeqLen, int32_t batchSize, cudaStream_t stream, float attentionScale);
 
 private:
     int32_t mBatchSize{};

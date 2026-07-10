@@ -17,11 +17,35 @@
 
 #pragma once
 
+#include "common/checkMacros.h"
 #include "fmhaParams_v2.h"
 
 #include <NvInferRuntime.h>
+#include <cmath>
+#include <cstdint>
+#include <optional>
 namespace trt_edgellm
 {
+
+//! Validate an absolute QK^T multiplier.
+inline void validateAttentionScale(float attentionScale)
+{
+    ELLM_CHECK(std::isfinite(attentionScale) && attentionScale > 0.0F,
+        "Attention scale must be finite and greater than zero.");
+}
+
+//! Resolve an optional absolute QK^T multiplier, preserving the legacy default.
+inline float resolveAttentionScale(std::optional<float> attentionScale, int32_t headSize)
+{
+    if (!attentionScale.has_value())
+    {
+        ELLM_CHECK(headSize > 0, "Attention head size must be greater than zero when attention scale is absent.");
+        attentionScale = 1.0F / std::sqrt(static_cast<float>(headSize));
+    }
+
+    validateAttentionScale(*attentionScale);
+    return *attentionScale;
+}
 
 /*!
  * @brief Runner for context-phase fused multi-head attention (FMHA)
@@ -65,9 +89,10 @@ public:
      * Configures FMHA parameters. Device pointers must be set by caller.
      *
      * @param params FMHA parameter structure
-     * @throws std::runtime_error if input layout or alpha type is unsupported
+     * @param attentionScale Absolute multiplier applied to QK^T before softmax
+     * @throws std::runtime_error if the scale, input layout, or alpha type is unsupported
      */
-    void setupParams(FusedMultiheadAttentionParamsV2& params);
+    void setupParams(FusedMultiheadAttentionParamsV2& params, float attentionScale);
 
     /*!
      * @brief Dispatch FMHA kernel execution

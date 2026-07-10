@@ -607,9 +607,9 @@ void DecoderXQARunner::dispatchXQAKernel(XQALaunchParams& params, cudaStream_t c
     void* const kvCacheArg = getKernelKVCacheArg(kernelKVCacheArg);
 
     void* kernelParamsNoSliding[]
-        = {&params.numKVheads, &params.qScale, &params.output, &params.qInputPtr, &params.attentionSinks, kvCacheArg,
-            &params.batchSize, &params.kScale, &params.vScale, &params.semaphores, &params.scratch};
-    void* kernelParamsSliding[] = {&params.numKVheads, &params.slidingWinSize, &params.qScale, &params.output,
+        = {&params.numKVheads, &params.attentionScale, &params.output, &params.qInputPtr, &params.attentionSinks,
+            kvCacheArg, &params.batchSize, &params.kScale, &params.vScale, &params.semaphores, &params.scratch};
+    void* kernelParamsSliding[] = {&params.numKVheads, &params.slidingWinSize, &params.attentionScale, &params.output,
         &params.qInputPtr, &params.attentionSinks, kvCacheArg, &params.batchSize, &params.kScale, &params.vScale,
         &params.semaphores, &params.scratch};
     void** kernelParams = kernelInfo.mSlidingWindow ? kernelParamsSliding : kernelParamsNoSliding;
@@ -655,12 +655,12 @@ void DecoderXQARunner::dispatchSpecDecodeXQAKernel(XQALaunchParams& params, cuda
     void* const kvCacheArg = getKernelKVCacheArg(kernelKVCacheArg);
 
     void* kernelParamsNoSliding[] = {&params.qSeqLen, &params.numKVheads, &params.headGroupSize, &params.qCuSeqLen,
-        &params.qScale, &params.output, &params.qInputPtr, &params.treeAttnMask, &params.attentionSinks, kvCacheArg,
-        &params.batchSize, &params.kScale, &params.vScale, &params.semaphores, &params.scratch};
+        &params.attentionScale, &params.output, &params.qInputPtr, &params.treeAttnMask, &params.attentionSinks,
+        kvCacheArg, &params.batchSize, &params.kScale, &params.vScale, &params.semaphores, &params.scratch};
     void* kernelParamsSliding[]
         = {&params.qSeqLen, &params.numKVheads, &params.headGroupSize, &params.qCuSeqLen, &params.slidingWinSize,
-            &params.qScale, &params.output, &params.qInputPtr, &params.treeAttnMask, &params.attentionSinks, kvCacheArg,
-            &params.batchSize, &params.kScale, &params.vScale, &params.semaphores, &params.scratch};
+            &params.attentionScale, &params.output, &params.qInputPtr, &params.treeAttnMask, &params.attentionSinks,
+            kvCacheArg, &params.batchSize, &params.kScale, &params.vScale, &params.semaphores, &params.scratch};
     void** kernelParams = kernelInfo.mSlidingWindow ? kernelParamsSliding : kernelParamsNoSliding;
     int32_t const ctaTileY = static_cast<int32_t>(kernelInfo.mMTileSize);
     check::check(ctaTileY > 0, format::fmtstr("Invalid spec-decode ctaTileY %d in XQA kernel metadata.", ctaTileY));

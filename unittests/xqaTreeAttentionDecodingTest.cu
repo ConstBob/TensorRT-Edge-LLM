@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <type_traits>
@@ -57,8 +58,9 @@ void initializeCudaContextForXQATest()
 
 void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
     int32_t kvSequenceLength, int32_t qSequenceLength, bool useFp8Cache = false, int32_t slidingWindowSize = 0,
-    int32_t tokensPerPage = 0)
+    int32_t tokensPerPage = 0, std::optional<float> attentionScale = std::nullopt)
 {
+    float const resolvedAttentionScale = attentionScale.value_or(1.0F / std::sqrt(static_cast<float>(headSize)));
     initializeCudaContextForXQATest();
 
     int32_t smVersion = getSMVersion();
@@ -123,16 +125,16 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
         std::vector<half> vi(numKVHeads * headSize * kvSequenceLength);
         std::vector<int32_t> treeMaski(qSequenceLength * qSequenceLength);
 
-        uniformFloatInitialization(qi);
-        uniformFloatInitialization(ki);
-        uniformFloatInitialization(vi);
+        uniformFloatInitialization(qi, -1.0F, 1.0F);
+        uniformFloatInitialization(ki, -1.0F, 1.0F);
+        uniformFloatInitialization(vi, -1.0F, 1.0F);
         uniformIntInitialization(treeMaski, 0, 1);
         int32_t const attentionLength
             = slidingWindowSize > 0 ? std::min(kvSequenceLength, slidingWindowSize) : kvSequenceLength;
         auto kiRef = sliceKVWindow(ki, numKVHeads, headSize, kvSequenceLength, slidingWindowSize);
         auto viRef = sliceKVWindow(vi, numKVHeads, headSize, kvSequenceLength, slidingWindowSize);
         auto ref = casualAttentionRef<half>(qi, kiRef, viRef, qSequenceLength, attentionLength, numQHeads, numKVHeads,
-            headSize, std::make_optional(treeMaski));
+            headSize, resolvedAttentionScale, std::make_optional(treeMaski));
 
         // Add data from batch to input Tensors
         qInput.insert(qInput.end(), qi.begin(), qi.end());
@@ -215,6 +217,7 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
     }
     params.output = thrust::raw_pointer_cast(outDevice.data());
     params.treeAttnMask = thrust::raw_pointer_cast(packedTreeMaskDevice.data());
+    params.attentionScale = resolvedAttentionScale;
     params.slidingWinSize = slidingWindowSize > 0 ? static_cast<uint32_t>(slidingWindowSize) : 0U;
     // Use default stream .
     cudaStream_t stream{nullptr};
@@ -246,7 +249,8 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
               << " num_Q_heads: " << numQHeads << " num_KV_heads: " << numKVHeads << " head_size: " << headSize
               << " kvcache seq_len: " << kvSequenceLength << " q_seq_len: " << qSequenceLength
               << " sliding_window: " << slidingWindowSize << " paged_kv: " << usePagedKVCache
-              << " tokens_per_page: " << tokensPerPage << " pass_rate_1e-3: " << passRate1E_3 << std::endl;
+              << " tokens_per_page: " << tokensPerPage << " attention_scale: " << resolvedAttentionScale
+              << " pass_rate_1e-3: " << passRate1E_3 << std::endl;
     EXPECT_GT(passRate1E_3, 0.9);
     EXPECT_FALSE(NanValueDetected);
 
@@ -396,7 +400,8 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
             auto kiRef = sliceKVWindow(ki, numKVHeads, headSize, kvSequenceLength, slidingWindowSize);
             auto viRef = sliceKVWindow(vi, numKVHeads, headSize, kvSequenceLength, slidingWindowSize);
             auto refFp8 = casualAttentionRef<__nv_fp8_e4m3>(qi, kiRef, viRef, qSequenceLength, attentionLength,
-                numQHeads, numKVHeads, headSize, std::make_optional(treeMasks[b]), kScaleQuantOrig, vScaleQuantOrig);
+                numQHeads, numKVHeads, headSize, resolvedAttentionScale, std::make_optional(treeMasks[b]),
+                kScaleQuantOrig, vScaleQuantOrig);
             outReferenceFp8.insert(outReferenceFp8.end(), refFp8.begin(), refFp8.end());
         }
 
@@ -421,6 +426,7 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
         }
         paramsFp8.output = thrust::raw_pointer_cast(outFp8Device.data());
         paramsFp8.treeAttnMask = thrust::raw_pointer_cast(packedTreeMaskDevice.data());
+        paramsFp8.attentionScale = resolvedAttentionScale;
         paramsFp8.kScale = kScaleQuantOrig;
         paramsFp8.vScale = vScaleQuantOrig;
         paramsFp8.slidingWinSize = slidingWindowSize > 0 ? static_cast<uint32_t>(slidingWindowSize) : 0U;
@@ -457,7 +463,8 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
                   << " num_Q_heads: " << numQHeads << " num_KV_heads: " << numKVHeads << " head_size: " << headSize
                   << " kvcache seq_len: " << kvSequenceLength << " q_seq_len: " << qSequenceLength
                   << " sliding_window: " << slidingWindowSize << " paged_kv: " << usePagedKVCache
-                  << " tokens_per_page: " << tokensPerPage << " pass_rate_1e-3: " << fp8PassRate1E_3 << std::endl;
+                  << " tokens_per_page: " << tokensPerPage << " attention_scale: " << resolvedAttentionScale
+                  << " pass_rate_1e-3: " << fp8PassRate1E_3 << std::endl;
         EXPECT_GT(fp8PassRate1E_3, 0.8F);
         EXPECT_FALSE(NanValueDetectedFp8);
     }
@@ -472,6 +479,7 @@ void TestXQATreeAttentionDecodingWithPaddedCapacity(int32_t batchSize, int32_t n
     int32_t headSize, int32_t kvSequenceLength, int32_t qSequenceLength, int32_t capacity)
 {
     ASSERT_GE(capacity, kvSequenceLength);
+    float const attentionScale = 1.0F / std::sqrt(static_cast<float>(headSize));
     int32_t smVersion = getSMVersion();
     applyThorSMRenumberWAR(smVersion);
     constexpr bool kUsePagedKVCache = false;
@@ -514,8 +522,8 @@ void TestXQATreeAttentionDecodingWithPaddedCapacity(int32_t batchSize, int32_t n
         }
 
         uniformIntInitialization(treeMaski, 0, 1);
-        auto ref = casualAttentionRef<half>(
-            qi, kiData, viData, qSequenceLength, kvSequenceLength, numQHeads, numKVHeads, headSize, treeMaski);
+        auto ref = casualAttentionRef<half>(qi, kiData, viData, qSequenceLength, kvSequenceLength, numQHeads,
+            numKVHeads, headSize, attentionScale, treeMaski);
 
         qInput.insert(qInput.end(), qi.begin(), qi.end());
         // KV layout: [B, 2, H_kv, capacity, D] — K then V per batch
@@ -563,6 +571,7 @@ void TestXQATreeAttentionDecodingWithPaddedCapacity(int32_t batchSize, int32_t n
     params.kvCache.capacity = capacity; // capacity > kvSequenceLength
     params.output = thrust::raw_pointer_cast(outDevice.data());
     params.treeAttnMask = thrust::raw_pointer_cast(packedTreeMaskDevice.data());
+    params.attentionScale = attentionScale;
 
     cudaStream_t stream{nullptr};
     runner.dispatchSpecDecodeXQAKernel(params, stream);
@@ -685,6 +694,17 @@ TEST(XQATreeAttentionDecodingTest, pagedKVAccuracyNon512HeadDims)
     TestXQATreeAttentionDecodingAccuracy(1, 24, 4, 256, 256, 16, false, 0, 128);
 }
 
+TEST(XQATreeAttentionDecodingTest, configurableAttentionScale)
+{
+    TestXQATreeAttentionDecodingAccuracy(1, 8, 2, 128, 128, 16, false, 0, 0, 1.0F);
+    TestXQATreeAttentionDecodingAccuracy(1, 8, 2, 128, 128, 16, false, 0, 0, 0.37F);
+}
+
+TEST(XQATreeAttentionDecodingTest, pagedKVCustomAttentionScale)
+{
+    TestXQATreeAttentionDecodingAccuracy(1, 32, 4, 128, 256, 16, false, 0, 128, 0.37F);
+}
+
 TEST(XQATreeAttentionDecodingTest, slidingWindowAccuracy)
 {
     TestXQATreeAttentionDecodingAccuracy(1, 32, 4, 128, 256, 16, false, 64);
@@ -759,6 +779,11 @@ TEST(XQATreeAttentionDecodingFP8Test, pagedKVAccuracyNon512HeadDims)
     TestXQATreeAttentionDecodingAccuracy(1, 14, 2, 64, 256, 32, true, 0, 128);
     TestXQATreeAttentionDecodingAccuracy(1, 32, 4, 128, 256, 16, true, 0, 128);
     TestXQATreeAttentionDecodingAccuracy(1, 24, 4, 256, 256, 16, true, 0, 128);
+}
+
+TEST(XQATreeAttentionDecodingFP8Test, pagedKVCustomAttentionScale)
+{
+    TestXQATreeAttentionDecodingAccuracy(1, 32, 4, 128, 256, 16, true, 0, 128, 0.37F);
 }
 
 TEST(XQATreeAttentionDecodingFP8Test, slidingWindowAccuracy)
@@ -1151,6 +1176,7 @@ void runXQATreeAttentionBenchmark(nvinfer1::DataType kvDataType, char const* kvL
         }
         params.output = thrust::raw_pointer_cast(buffer.output.data());
         params.treeAttnMask = thrust::raw_pointer_cast(buffer.packedMask.data());
+        params.attentionScale = 1.0F / std::sqrt(static_cast<float>(shape.headSize));
         params.kScale = buffer.kScale;
         params.vScale = buffer.vScale;
         params.slidingWinSize = shape.slidingWindowSize > 0 ? static_cast<uint32_t>(shape.slidingWindowSize) : 0U;
@@ -1284,6 +1310,7 @@ void TestXQAPaddingConsistency(int32_t batchSize, int32_t numQHeads, int32_t num
 
     int32_t smVersion = getSMVersion();
     applyThorSMRenumberWAR(smVersion);
+    float const attentionScale = 1.0F / std::sqrt(static_cast<float>(headSize));
 
     // Generate random Q, K, V data for actual sequence length
     // Layout: Q is [seqLen, numQHeads, headSize], K/V is [seqLen, numKVHeads, headSize]
@@ -1308,7 +1335,7 @@ void TestXQAPaddingConsistency(int32_t batchSize, int32_t numQHeads, int32_t num
 
     std::cout << "\n--- Computing CPU Reference ---" << std::endl;
     auto outReference = casualAttentionRef<half>(qActual, kInput, vInput, actualQSeqLen, kvSequenceLength, numQHeads,
-        numKVHeads, headSize, std::make_optional(treeMaskForRef));
+        numKVHeads, headSize, attentionScale, std::make_optional(treeMaskForRef));
     std::cout << "Reference output size: " << outReference.size() << std::endl;
 
     // === Run 1: No padding (actualQSeqLen) ===
@@ -1368,6 +1395,7 @@ void TestXQAPaddingConsistency(int32_t batchSize, int32_t numQHeads, int32_t num
     paramsNoPad.kvCache.capacity = kvSequenceLength;
     paramsNoPad.output = thrust::raw_pointer_cast(outNoPaddingDevice.data());
     paramsNoPad.treeAttnMask = thrust::raw_pointer_cast(packedMaskNoPaddingDevice.data());
+    paramsNoPad.attentionScale = attentionScale;
 
     cudaStream_t stream{nullptr};
     runnerNoPad.dispatchSpecDecodeXQAKernel(paramsNoPad, stream);
@@ -1452,6 +1480,7 @@ void TestXQAPaddingConsistency(int32_t batchSize, int32_t numQHeads, int32_t num
     paramsPad.kvCache.capacity = kvSequenceLength;
     paramsPad.output = thrust::raw_pointer_cast(outPaddedDevice.data());
     paramsPad.treeAttnMask = thrust::raw_pointer_cast(packedMaskPaddingDevice.data());
+    paramsPad.attentionScale = attentionScale;
 
     runnerPad.dispatchSpecDecodeXQAKernel(paramsPad, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));

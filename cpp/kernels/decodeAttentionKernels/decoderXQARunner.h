@@ -60,9 +60,9 @@ struct XQALaunchParams
     int32_t batchSize = 0;  //!< Batch size
 
     //! Parameters for spec-decode tree attention
-    int32_t qSeqLen = 0;       //!< Query sequence length
-    float qScale = 1.0F;       //!< Query scaling factor
-    int32_t headGroupSize = 0; //!< Head group size
+    int32_t qSeqLen = 0;         //!< Query sequence length
+    float attentionScale = 1.0F; //!< Absolute QK^T multiplier
+    int32_t headGroupSize = 0;   //!< Head group size
 
     nvinfer1::DataType dataType;   //!< I/O data type of the kernel
     nvinfer1::DataType kvDataType; //!< KV cache data type

@@ -21,6 +21,7 @@
 
 #include "common/checkMacros.h"
 #include "common/logger.h"
+#include "contextFMHARunner.h"
 
 #include <climits>
 #include <cmath>
@@ -193,7 +194,7 @@ CuteDslFMHARunner::CuteDslFMHARunner(
 // Macro shared by run() and runFp8() — sets up Q/KV/O/cumSeqlenK tensor structs
 // and calls the CuTe DSL wrapper. Relies on local variables: batchSize, seqLenQ,
 // numQHeads, numKVHeads, headDim, capacity, qPtr, kvPtr, oPtr, cuKVSeqLens,
-// scaleQ, scaleK, scaleV, invScaleO, ret.
+// attentionScale, scaleQ, scaleK, scaleV, invScaleO, ret.
 // clang-format off
 #define CALL_LLM_FMHA(PREFIX, MODULE, WSL)                                                                             \
     do                                                                                                                 \
@@ -235,7 +236,7 @@ CuteDslFMHARunner::CuteDslFMHARunner(
         cumSeqlenK.dynamic_shapes[0] = batchSize + 1;                                                                   \
                                                                                                                        \
         ret = cute_dsl_##PREFIX##_wrapper(                                                                              \
-            &(MODULE), &qTensor, &kvTensor, &oTensor, &cumSeqlenK, (WSL),                                              \
+            &(MODULE), &qTensor, &kvTensor, &oTensor, &cumSeqlenK, (WSL), attentionScale,                               \
             scaleQ, scaleK, scaleV, invScaleO, stream);                                                                 \
     } while (0)
 // clang-format on
@@ -245,7 +246,8 @@ CuteDslFMHARunner::CuteDslFMHARunner(
 // =====================================================================
 
 void CuteDslFMHARunner::run(void const* qPtr, void const* kvPtr, void* oPtr, int32_t const* cuKVSeqLens,
-    cudaStream_t stream, int32_t slidingWindowSize, bool fp8Input, float qScale, float kScale, float vScale)
+    cudaStream_t stream, float attentionScale, int32_t slidingWindowSize, bool fp8Input, float qScale, float kScale,
+    float vScale)
 {
     if (!sLLMLoaded)
     {
@@ -253,6 +255,7 @@ void CuteDslFMHARunner::run(void const* qPtr, void const* kvPtr, void* oPtr, int
         return;
     }
 
+    validateAttentionScale(attentionScale);
     float const scaleQ = qScale;
     float const scaleK = kScale;
     float const scaleV = vScale;
@@ -317,8 +320,8 @@ void CuteDslFMHARunner::run(void const* qPtr, void const* kvPtr, void* oPtr, int
 
 void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, int32_t const* kvCachePageList,
     void* oPtr, int32_t const* cuKVSeqLens, int32_t numPages, int32_t maxPagesPerSeq, int32_t tokensPerPage,
-    nvinfer1::DataType kvDataType, cudaStream_t stream, int32_t slidingWindowSize, bool fp8Input, float qScale,
-    float kScale, float vScale)
+    nvinfer1::DataType kvDataType, cudaStream_t stream, float attentionScale, int32_t slidingWindowSize, bool fp8Input,
+    float qScale, float kScale, float vScale)
 {
     if (!sLLMLoaded)
     {
@@ -409,7 +412,7 @@ void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, i
         cumSeqlenK.dynamic_shapes[0] = batchSize + 1;                                                                  \
                                                                                                                        \
         ret = cute_dsl_##PREFIX##_wrapper(&(MODULE), &qTensor, &kvPoolTensor, &pageListTensor, &oTensor, &cumSeqlenK,  \
-            (WSL), scaleQ, scaleK, scaleV, invScaleO, stream);                                                         \
+            (WSL), attentionScale, scaleQ, scaleK, scaleV, invScaleO, stream);                                                         \
     } while (0)
     // clang-format on
 
@@ -461,7 +464,7 @@ void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, i
 // =====================================================================
 
 void CuteDslFMHARunner::run(void const* qPtr, void const* kPtr, void const* vPtr, void* oPtr, int32_t const* cuSeqLens,
-    int32_t totalSeqLen, int32_t maxSeqLen, int32_t batchSize, cudaStream_t stream)
+    int32_t totalSeqLen, int32_t maxSeqLen, int32_t batchSize, cudaStream_t stream, float attentionScale)
 {
     if (!sViTLoaded)
     {
@@ -469,9 +472,9 @@ void CuteDslFMHARunner::run(void const* qPtr, void const* kPtr, void const* vPtr
         return;
     }
 
-    float const softmaxScale = 1.0f / std::sqrt(static_cast<float>(mHeadDim));
-    float const scaleSoftmaxLog2 = softmaxScale * static_cast<float>(M_LOG2E);
-    float const scaleOutput = 1.0f;
+    validateAttentionScale(attentionScale);
+    float const scaleSoftmaxLog2 = attentionScale * static_cast<float>(M_LOG2E);
+    float const scaleOutput = 1.0F;
 
     int32_t const numHeads = mNumHeadsQ;
     int32_t const headDim = mHeadDim;
@@ -518,7 +521,7 @@ void CuteDslFMHARunner::run(void const* qPtr, void const* kPtr, void const* vPtr
                                                                                                                        \
         ret = cute_dsl_##PREFIX##_wrapper(                                                                              \
             &(MODULE), &qTensor, &kTensor, &vTensor, &oTensor, &cuSeqlensTensor, maxSeqLen,                            \
-            scaleSoftmaxLog2, softmaxScale, scaleOutput, stream);                                                       \
+            scaleSoftmaxLog2, attentionScale, scaleOutput, stream);                                                       \
     } while (0)
     // clang-format on
 

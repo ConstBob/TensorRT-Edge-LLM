@@ -105,7 +105,7 @@ class Gemma4SharedKVAttention(nn.Module):
             if layer_type == "full_attention":
                 self.sliding_window_size = -1
 
-        self.qk_scale = 1.0
+        self.attention_scale = config.attention_scaling
 
     @staticmethod
     def _head_dim_for_layer(config: ModelConfig, layer_idx: int) -> int:
@@ -130,13 +130,6 @@ class Gemma4SharedKVAttention(nn.Module):
                                  self.head_dim)).reshape(
                                      batch_size, seq_len,
                                      self.num_heads * self.head_dim)
-
-        # Gemma4 uses q/k RMSNorm with attention scaling 1.0. AttentionPlugin's
-        # decode kernels apply their default 1/sqrt(head_dim), so pre-scale Q
-        # to preserve the model's effective scaling.
-        plugin_scale = self.head_dim**-0.5
-        query_states = query_states * query_states.new_tensor(
-            self.qk_scale / plugin_scale)
 
         dummy_kv = torch.zeros(batch_size,
                                0,
@@ -166,6 +159,7 @@ class Gemma4SharedKVAttention(nn.Module):
             sliding_window_size=self.sliding_window_size,
             enable_tree_attention=True,
             enable_fp8_kv_cache=self.enable_fp8_kv_cache,
+            attention_scale=self.attention_scale,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
             qkv_scales=[1.0, 1.0, 1.0],

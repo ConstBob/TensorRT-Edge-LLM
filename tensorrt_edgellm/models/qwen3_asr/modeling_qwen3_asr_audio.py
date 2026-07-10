@@ -59,9 +59,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ...config import ModelConfig
+from ... import config as config_module
+from .. import ops
 from ..linear import make_linear
-from ..ops import is_trt_native_attention_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -129,14 +129,15 @@ class QwenAudioAttention(nn.Module):
     """
 
     def __init__(self,
-                 model_config: ModelConfig,
+                 model_config: config_module.ModelConfig,
+                 attention_scale: float,
                  d_model: int = _D_MODEL,
                  num_heads: int = _NUM_HEADS,
                  name_prefix: str = "") -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
-        self.scaling = self.head_dim**-0.5
+        self.attention_scale = attention_scale
         self.q_proj = make_linear(
             model_config,
             d_model,
@@ -161,7 +162,7 @@ class QwenAudioAttention(nn.Module):
             d_model,
             bias=True,
             module_name=f"{name_prefix}.out_proj" if name_prefix else "")
-        self._use_trt_attn = is_trt_native_attention_enabled()
+        self._use_trt_attn = ops.is_trt_native_attention_enabled()
 
     def forward(self,
                 hidden_states: torch.Tensor,
@@ -189,8 +190,7 @@ class QwenAudioAttention(nn.Module):
             k = k.to(torch.float16)
             v = v.to(torch.float16)
 
-            q = (q * self.scaling)
-            out = trt_ragged_attention(
+            out = ops.trt_ragged_attention(
                 q,
                 k,
                 v,
@@ -198,6 +198,7 @@ class QwenAudioAttention(nn.Module):
                 kv_lengths,
                 num_heads=self.num_heads,
                 head_size=self.head_dim,
+                attention_scale=self.attention_scale,
                 mask=attention_mask,
             )
             # attn_output: [T, num_heads, head_dim] → [T, num_heads * head_dim]
@@ -210,7 +211,9 @@ class QwenAudioAttention(nn.Module):
             # q/k/v: [num_heads, T, head_dim]
             # Explicit softmax attention (avoids SDPA op which TRT ONNX parser rejects).
             # scores: [num_heads, T, T]
-            scores = torch.matmul(q, k.transpose(-2, -1)) * self.scaling
+            scores = torch.matmul(q, k.transpose(-2, -1))
+            if self.attention_scale != 1.0:
+                scores = scores * self.attention_scale
             # attention_mask: [T, T] → [1, T, T] (broadcast over heads)
             scores = scores + attention_mask.unsqueeze(0)
             attn_weights = torch.softmax(scores.float(), dim=-1).to(q.dtype)
@@ -237,7 +240,8 @@ class QwenAudioEncoderLayer(nn.Module):
     """
 
     def __init__(self,
-                 model_config: ModelConfig,
+                 model_config: config_module.ModelConfig,
+                 attention_scale: float,
                  d_model: int = _D_MODEL,
                  num_heads: int = _NUM_HEADS,
                  ffn_dim: int = _FFN_DIM,
@@ -246,6 +250,7 @@ class QwenAudioEncoderLayer(nn.Module):
         self.self_attn_layer_norm = nn.LayerNorm(d_model)
         self.self_attn = QwenAudioAttention(
             model_config,
+            attention_scale,
             d_model,
             num_heads,
             name_prefix=f"{name_prefix}.self_attn" if name_prefix else "")
@@ -318,7 +323,8 @@ class QwenAudioEncoder(nn.Module):
                  output_dim: int = _OUTPUT_DIM,
                  downsample_hidden: int = _DOWNSAMPLE_HIDDEN,
                  *,
-                 model_config: ModelConfig,
+                 attention_scale: float,
+                 model_config: config_module.ModelConfig,
                  name_prefix: str = "audio_tower") -> None:
         super().__init__()
         self.config: Dict[str, Any] = {
@@ -361,13 +367,14 @@ class QwenAudioEncoder(nn.Module):
         self.layers = nn.ModuleList([
             QwenAudioEncoderLayer(
                 model_config,
+                attention_scale,
                 d_model,
                 num_heads,
                 ffn_dim,
                 name_prefix=f"{name_prefix}.layers.{i}" if name_prefix else "")
             for i in range(num_layers)
         ])
-        self._use_trt_attn = is_trt_native_attention_enabled()
+        self._use_trt_attn = ops.is_trt_native_attention_enabled()
         self.ln_post = nn.LayerNorm(d_model)
         self.proj1 = make_linear(
             model_config,
@@ -557,7 +564,7 @@ def build_qwen_audio(
     dtype: torch.dtype = torch.float16,
     prefix: Optional[str] = None,
     *,
-    model_config: ModelConfig,
+    model_config: config_module.ModelConfig,
     name_prefix: str = "audio_tower",
 ) -> QwenAudioEncoder:
     """Build and return a :class:`QwenAudioEncoder` with loaded weights.
@@ -587,16 +594,23 @@ def build_qwen_audio(
     def _get(key: str, default: Any) -> Any:
         return audio_cfg.get(key, config.get(key, default))
 
+    d_model = _get("d_model", _D_MODEL)
+    num_heads = _get("encoder_attention_heads", _NUM_HEADS)
+    head_dim = d_model // num_heads
+    attention_scale = config_module._get_attention_scaling(
+        audio_cfg, head_dim, 1.0 / (float(head_dim)**0.5))
+
     model = QwenAudioEncoder(
         num_mel_bins=_get("num_mel_bins", _NUM_MEL_BINS),
-        d_model=_get("d_model", _D_MODEL),
+        d_model=d_model,
         num_layers=_get("encoder_layers", _NUM_LAYERS),
-        num_heads=_get("encoder_attention_heads", _NUM_HEADS),
+        num_heads=num_heads,
         ffn_dim=_get("encoder_ffn_dim", _FFN_DIM),
         max_source_positions=_get("max_source_positions",
                                   _MAX_SOURCE_POSITIONS),
         output_dim=_get("output_dim", _OUTPUT_DIM),
         downsample_hidden=_get("downsample_hidden_size", _DOWNSAMPLE_HIDDEN),
+        attention_scale=attention_scale,
         model_config=model_config,
         name_prefix=name_prefix,
     )

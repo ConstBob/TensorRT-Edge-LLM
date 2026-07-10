@@ -474,9 +474,7 @@ class Gemma4Attention(Attention):
             if hasattr(self, "k_norm") and self.k_norm is not None:
                 del self.k_norm
 
-        self.qk_scale = (float(config.attention_scaling)
-                         if config.attention_scaling > 0.0 else self.head_dim**
-                         -0.5)
+        self.attention_scale = config.attention_scaling
         if not self.is_kv_shared:
             self.v_norm = (Gemma4ValueRMSNorm(self.head_dim,
                                               config.rms_norm_eps)
@@ -486,10 +484,6 @@ class Gemma4Attention(Attention):
         self.sliding_window_size = (config.sliding_window_size
                                     if self.attention_type
                                     == "sliding_attention" else -1)
-
-    def _attention_plugin_query_scale(self) -> float:
-        default_plugin_qk_scale = self.head_dim**-0.5
-        return self.qk_scale / default_plugin_qk_scale
 
     def forward(
         self,
@@ -541,10 +535,6 @@ class Gemma4Attention(Attention):
                                              batch_size, seq_len,
                                              self.num_kv_heads * self.head_dim)
 
-        query_scale = self._attention_plugin_query_scale()
-        if query_scale != 1.0:
-            query_states = query_states * query_states.new_tensor(query_scale)
-
         enable_tree = attention_mask is not None and attention_pos_id is not None
         kwargs: dict = {
             "num_q_heads": self.num_heads,
@@ -553,6 +543,7 @@ class Gemma4Attention(Attention):
             "sliding_window_size": self.sliding_window_size,
             "enable_tree_attention": enable_tree,
             "enable_fp8_kv_cache": self.enable_fp8_kv_cache,
+            "attention_scale": self.attention_scale,
         }
         if enable_tree:
             kwargs["attention_mask"] = attention_mask

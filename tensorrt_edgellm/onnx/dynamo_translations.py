@@ -62,6 +62,7 @@ def _attention_plugin_translation(
     sliding_window_size: int,
     enable_tree_attention: int,
     enable_fp8_kv_cache: int,
+    attention_scale: float,
     attention_mask: onnxscript.INT32,
     attention_pos_id: onnxscript.INT32,
     qkv_scales: Sequence[float],
@@ -91,6 +92,7 @@ def _attention_plugin_translation(
         enable_fp8_kv_cache=enable_fp8_kv_cache,
         sliding_window_size=sliding_window_size,
         qkv_scales=qkv_scales,
+        attention_scale=attention_scale,
         _outputs=2,
     )
     return attn_4d, present_kv
@@ -671,6 +673,7 @@ def _vit_attention_plugin_translation(
     max_seqlen_carrier: onnxscript.INT32,
     num_heads: int,
     head_size: int,
+    attention_scale: float,
 ) -> onnxscript.FLOAT16:
     """ViT ragged self-attention without KV cache."""
     return _trt_edgellm.ViTAttentionPlugin(
@@ -681,6 +684,7 @@ def _vit_attention_plugin_translation(
         max_seqlen_carrier,
         num_heads=num_heads,
         head_size=head_size,
+        attention_scale=attention_scale,
     )
 
 
@@ -721,14 +725,17 @@ def _trt_ragged_attention_translation(
     kv_lengths,
     num_heads,
     head_size,
+    attention_scale,
     mask=None,
 ):
     """Ragged self-attention via TRT-native IAttention (packed NHD).
 
-    Q is expected to be pre-scaled by 1/sqrt(head_size) by the caller.
+    Non-identity attention scaling is folded into Q before TRT attention.
     query_lengths and kv_lengths must be separate graph tensors — TRT
     crashes when the same ONNX tensor is wired to both positions.
     """
+    if attention_scale != 1.0:
+        query_states = _op21.Mul(query_states, attention_scale)
     return _trt_ragged_attention_inner(
         query_states,
         key_states,

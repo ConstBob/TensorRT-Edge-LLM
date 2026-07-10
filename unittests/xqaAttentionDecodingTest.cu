@@ -29,13 +29,17 @@
 #include "testUtils.h"
 
 #include <algorithm>
+#include <cmath>
+#include <optional>
 
 using namespace nvinfer1;
 using namespace trt_edgellm;
 
 void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
-    int32_t kvCacheCapacity, bool useFp8Cache = false, int32_t slidingWindowSize = 0)
+    int32_t kvCacheCapacity, bool useFp8Cache = false, int32_t slidingWindowSize = 0,
+    std::optional<float> attentionScale = std::nullopt)
 {
+    float const resolvedAttentionScale = attentionScale.value_or(1.0F / std::sqrt(static_cast<float>(headSize)));
     int32_t smVersion = getSMVersion();
     applyThorSMRenumberWAR(smVersion);
     if (useFp8Cache && smVersion < 89)
@@ -80,15 +84,15 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
         std::vector<half> qi(numQHeads * headSize * qSequenceLength);
         std::vector<half> ki(numKVHeads * headSize * kvLength);
         std::vector<half> vi(numKVHeads * headSize * kvLength);
-        uniformFloatInitialization(qi);
-        uniformFloatInitialization(ki);
-        uniformFloatInitialization(vi);
+        uniformFloatInitialization(qi, -1.0F, 1.0F);
+        uniformFloatInitialization(ki, -1.0F, 1.0F);
+        uniformFloatInitialization(vi, -1.0F, 1.0F);
 
         int32_t const attentionLength = slidingWindowSize > 0 ? std::min(kvLength, slidingWindowSize) : kvLength;
         auto kiRef = sliceKVWindow(ki, numKVHeads, headSize, kvLength, slidingWindowSize);
         auto viRef = sliceKVWindow(vi, numKVHeads, headSize, kvLength, slidingWindowSize);
-        auto ref = casualAttentionRef<half>(
-            qi, kiRef, viRef, qSequenceLength, attentionLength, numQHeads, numKVHeads, headSize);
+        auto ref = casualAttentionRef<half>(qi, kiRef, viRef, qSequenceLength, attentionLength, numQHeads, numKVHeads,
+            headSize, resolvedAttentionScale);
 
         // Add data from batch to input Tensors
         qInput.insert(qInput.end(), qi.begin(), qi.end());
@@ -128,6 +132,7 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
     params.kvCache.sequence_lengths = thrust::raw_pointer_cast(kvCacheLengthDevice.data());
     params.kvCache.capacity = kvCacheCapacity;
     params.output = thrust::raw_pointer_cast(outDevice.data());
+    params.attentionScale = resolvedAttentionScale;
     params.slidingWinSize = slidingWindowSize > 0 ? static_cast<uint32_t>(slidingWindowSize) : 0U;
 
     // Use default stream .
@@ -159,7 +164,7 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
     std::cout << "XQA Attention Decoding test. [FP16 KV cache] batch_size: " << batchSize
               << " num_Q_heads: " << numQHeads << " num_KV_heads: " << numKVHeads << " head_size: " << headSize
               << " sliding_window: " << slidingWindowSize << " kvcache lengths: " << kvCacheLengths
-              << " pass_rate_1e-3: " << passRate1E_3 << std::endl;
+              << " attention_scale: " << resolvedAttentionScale << " pass_rate_1e-3: " << passRate1E_3 << std::endl;
     EXPECT_GT(passRate1E_3, 0.9);
     EXPECT_FALSE(NanValueDetected);
 
@@ -242,7 +247,7 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
             auto kiRef = sliceKVWindow(ki, numKVHeads, headSize, kvLength, slidingWindowSize);
             auto viRef = sliceKVWindow(vi, numKVHeads, headSize, kvLength, slidingWindowSize);
             auto ref = casualAttentionRef<__nv_fp8_e4m3>(qi, kiRef, viRef, qSequenceLength, attentionLength, numQHeads,
-                numKVHeads, headSize, std::nullopt, kScaleQuantOrig, vScaleQuantOrig);
+                numKVHeads, headSize, resolvedAttentionScale, std::nullopt, kScaleQuantOrig, vScaleQuantOrig);
             outReferenceFp8.insert(outReferenceFp8.end(), ref.begin(), ref.end());
         }
 
@@ -258,6 +263,7 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
         paramsFp8.kvCache.sequence_lengths = thrust::raw_pointer_cast(kvCacheLengthDevice.data());
         paramsFp8.kvCache.capacity = kvCacheCapacity;
         paramsFp8.output = thrust::raw_pointer_cast(outFp8Device.data());
+        paramsFp8.attentionScale = resolvedAttentionScale;
         paramsFp8.kScale = kScaleQuantOrig;
         paramsFp8.vScale = vScaleQuantOrig;
         paramsFp8.slidingWinSize = slidingWindowSize > 0 ? static_cast<uint32_t>(slidingWindowSize) : 0U;
@@ -297,7 +303,7 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
         std::cout << "XQA Attention Decoding test. [FP8 KV cache] batch_size: " << batchSize
                   << " num_Q_heads: " << numQHeads << " num_KV_heads: " << numKVHeads << " head_size: " << headSize
                   << " sliding_window: " << slidingWindowSize << " kvcache lengths: " << kvCacheLengths
-                  << " pass_rate_1e-3: " << passRate1E_3 << std::endl;
+                  << " attention_scale: " << resolvedAttentionScale << " pass_rate_1e-3: " << passRate1E_3 << std::endl;
         EXPECT_GT(matchRate, 0.9);
         EXPECT_FALSE(NanValueDetectedFp8);
     }
@@ -376,6 +382,16 @@ TEST(XQAAttentionDecodingTest, slidingWindowAccuracy)
     TestXQAAttentionDecodingAccuracy(2, 32, 4, 128, 96, false, 256);
 }
 
+TEST(XQAAttentionDecodingTest, configurableAttentionScale)
+{
+    TestXQAAttentionDecodingAccuracy(1, 8, 2, 128, 256, false, 0, 1.0F);
+    TestXQAAttentionDecodingAccuracy(1, 8, 2, 128, 256, false, 0, 0.37F);
+    TestXQAAttentionDecodingAccuracy(1, 8, 1, 256, 1024, false, 512, 1.0F);
+    TestXQAAttentionDecodingAccuracy(1, 8, 1, 256, 1024, false, 512, 0.37F);
+    TestXQAAttentionDecodingAccuracy(1, 8, 1, 512, 256, false, 0, 1.0F);
+    TestXQAAttentionDecodingAccuracy(1, 8, 1, 512, 256, false, 0, 0.37F);
+}
+
 #if SUPPORTS_FP8
 TEST(XQAAttentionDecodingFP8Test, accuracyKVRatio3)
 {
@@ -442,5 +458,10 @@ TEST(XQAAttentionDecodingFP8Test, slidingWindowAccuracy)
 {
     TestXQAAttentionDecodingAccuracy(3, 32, 4, 128, 512, true, 127);
     TestXQAAttentionDecodingAccuracy(2, 16, 2, 256, 384, true, 96);
+}
+
+TEST(XQAAttentionDecodingFP8Test, configurableAttentionScale)
+{
+    TestXQAAttentionDecodingAccuracy(1, 8, 2, 128, 256, true, 0, 0.37F);
 }
 #endif

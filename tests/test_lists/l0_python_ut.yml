@@ -73,6 +73,10 @@ tests:
   - tests/python-unittests/test_vit_attention_plugin.py::test_head_sweep
   - tests/python-unittests/test_vit_attention_plugin.py::test_batch_invariance
 
+  # Configurable Attention Scaling Tests
+  - tests/python-unittests/test_shared_kv.py::TestSharedKVAttention::test_shared_kv_attention_correctness
+  - tests/python-unittests/test_shared_kv.py::TestSharedKVAttention::test_shared_kv_decode_correctness
+
   # Experimental Server Tool Calling Tests
   - tests/python-unittests/test_tool_chat_template.py::test_formats_tool_template
   - tests/python-unittests/test_tool_calling.py::test_validates_tool_request

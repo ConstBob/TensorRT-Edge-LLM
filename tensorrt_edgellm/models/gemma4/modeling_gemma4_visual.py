@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import math
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
@@ -24,6 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
 
+from ... import config as config_module
 from ..linear import make_linear
 from ..ops import (is_trt_native_attention_enabled, trt_ragged_attention,
                    vit_attention_plugin)
@@ -202,6 +202,8 @@ class Gemma4VisionAttention(nn.Module):
                              "num_key_value_heads == num_attention_heads")
         self.head_dim = int(
             config.get("head_dim", self.hidden_size // self.num_heads))
+        self.attention_scale = config_module._get_attention_scaling(
+            config, self.head_dim, 1.0)
         self._use_trt_attn = is_trt_native_attention_enabled()
         prefix = f"vision_tower.encoder.layers.{layer_idx}.self_attn"
         self.q_proj = Gemma4ClippableLinear(config,
@@ -255,24 +257,25 @@ class Gemma4VisionAttention(nn.Module):
         v = self.v_norm(v)
 
         if self._use_trt_attn:
-            attn_output = trt_ragged_attention(q.to(torch.float16),
-                                               k.to(torch.float16),
-                                               v.to(torch.float16),
-                                               cu_seqlens,
-                                               kv_lengths,
-                                               num_heads=self.num_heads,
-                                               head_size=self.head_dim)
+            attn_output = trt_ragged_attention(
+                q.to(torch.float16),
+                k.to(torch.float16),
+                v.to(torch.float16),
+                cu_seqlens,
+                kv_lengths,
+                num_heads=self.num_heads,
+                head_size=self.head_dim,
+                attention_scale=self.attention_scale)
         else:
-            # Gemma4 vision attention uses qk scale 1.0. ViTAttentionPlugin
-            # applies 1/sqrt(head_dim), so fold sqrt(head_dim) into Q.
-            q = q * q.new_tensor(math.sqrt(self.head_dim))
-            attn_output = vit_attention_plugin(q.to(torch.float16),
-                                               k.to(torch.float16),
-                                               v.to(torch.float16),
-                                               cu_seqlens,
-                                               max_seqlen_carrier,
-                                               num_heads=self.num_heads,
-                                               head_size=self.head_dim)
+            attn_output = vit_attention_plugin(
+                q.to(torch.float16),
+                k.to(torch.float16),
+                v.to(torch.float16),
+                cu_seqlens,
+                max_seqlen_carrier,
+                num_heads=self.num_heads,
+                head_size=self.head_dim,
+                attention_scale=self.attention_scale)
         attn_output = attn_output.reshape(seq_len,
                                           self.num_heads * self.head_dim)
         return self.o_proj(attn_output)

@@ -38,6 +38,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ... import config as config_module
 from ..linear import make_linear
 from ..ops import (is_trt_native_attention_enabled, trt_ragged_attention,
                    vit_attention_plugin)
@@ -124,11 +125,13 @@ class Qwen2_5VLVisionAttention(nn.Module):
     def __init__(self,
                  hidden_size: int,
                  num_heads: int,
+                 attention_scale: float,
                  model_config: "ModelConfig",
                  name_prefix: str = "") -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
+        self.attention_scale = attention_scale
         self.qkv = make_linear(
             model_config,
             hidden_size,
@@ -161,22 +164,25 @@ class Qwen2_5VLVisionAttention(nn.Module):
         k = k.to(torch.float16)
         v = v.to(torch.float16)
         if self._use_trt_attn:
-            q = q * (self.head_dim**-0.5)
-            attn_output = trt_ragged_attention(q,
-                                               k,
-                                               v,
-                                               cu_seqlens,
-                                               kv_lengths,
-                                               num_heads=self.num_heads,
-                                               head_size=self.head_dim)
+            attn_output = trt_ragged_attention(
+                q,
+                k,
+                v,
+                cu_seqlens,
+                kv_lengths,
+                num_heads=self.num_heads,
+                head_size=self.head_dim,
+                attention_scale=self.attention_scale)
         else:
-            attn_output = vit_attention_plugin(q,
-                                               k,
-                                               v,
-                                               cu_seqlens,
-                                               max_seqlen_carrier,
-                                               num_heads=self.num_heads,
-                                               head_size=self.head_dim)
+            attn_output = vit_attention_plugin(
+                q,
+                k,
+                v,
+                cu_seqlens,
+                max_seqlen_carrier,
+                num_heads=self.num_heads,
+                head_size=self.head_dim,
+                attention_scale=self.attention_scale)
         attn_output = attn_output.reshape(seq_length, -1)
         return self.proj(attn_output)
 
@@ -191,6 +197,7 @@ class Qwen2_5VLVisionBlock(nn.Module):
                  hidden_size: int,
                  intermediate_size: int,
                  num_heads: int,
+                 attention_scale: float,
                  model_config: "ModelConfig",
                  name_prefix: str = "") -> None:
         super().__init__()
@@ -199,6 +206,7 @@ class Qwen2_5VLVisionBlock(nn.Module):
         self.attn = Qwen2_5VLVisionAttention(
             hidden_size,
             num_heads,
+            attention_scale,
             model_config,
             name_prefix=f"{name_prefix}.attn" if name_prefix else "")
         self.mlp = Qwen2_5VLMLP(
@@ -301,10 +309,13 @@ class Qwen2_5VLVisualModel(nn.Module):
                                                self.hidden_size,
                                                self.patch_size,
                                                self.temporal_patch_size)
+        attention_scale = config_module._get_attention_scaling(
+            config, self.head_dim, 1.0 / (float(self.head_dim)**0.5))
         self.blocks = nn.ModuleList([
             Qwen2_5VLVisionBlock(self.hidden_size,
                                  intermediate_size,
                                  self.num_heads,
+                                 attention_scale,
                                  model_config,
                                  name_prefix=f"visual.blocks.{i}")
             for i in range(depth)

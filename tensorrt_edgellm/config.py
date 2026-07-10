@@ -52,7 +52,7 @@ import json
 import math
 import os
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 if TYPE_CHECKING:
     import torch
@@ -216,19 +216,41 @@ def _parse_attention_layer_types(config: dict, num_hidden_layers: int,
     return attention_layer_types
 
 
-def _get_attention_scaling(llm_dict: Dict[str, Any], model_type: str,
-                           head_dim: int) -> float:
-    """Return the scale applied to QK^T before softmax."""
+def _get_attention_scaling(llm_dict: Dict[str, Any], head_dim: int,
+                           default_val: float) -> float:
+    """Resolve the absolute multiplier applied to QK^T before softmax.
+
+    Args:
+        llm_dict: Checkpoint configuration containing an optional supported
+            attention-scale alias.
+        head_dim: Per-head query/key dimension.
+        default_val: Required model-family fallback.
+
+    Returns:
+        The finite, positive attention scale supplied by the checkpoint, or
+        the caller-selected fallback.
+
+    Raises:
+        ValueError: If an explicit checkpoint scale is not finite and
+            positive, or if ``head_dim`` is not positive.
+    """
+    if head_dim <= 0:
+        raise ValueError(f"head_dim must be positive; got {head_dim}")
+
     for key in ("attention_scaling", "qk_scale", "scaling"):
         if llm_dict.get(key) is not None:
-            return float(llm_dict[key])
+            attention_scale = float(llm_dict[key])
+            if not math.isfinite(attention_scale) or attention_scale <= 0.0:
+                raise ValueError(
+                    f"{key} must be finite and positive; got {llm_dict[key]!r}"
+                )
+            return attention_scale
 
-    # Gemma4 uses unscaled QK attention in HF even when the checkpoint config
-    # omits an explicit scale field.
-    if str(model_type) in {"gemma4", "gemma4_text"}:
-        return 1.0
-
-    return 1.0 / (float(head_dim)**0.5)
+    attention_scale = float(default_val)
+    if not math.isfinite(attention_scale) or attention_scale <= 0.0:
+        raise ValueError(
+            f"default_val must be finite and positive; got {default_val!r}")
+    return attention_scale
 
 
 def _get_rms_norm_eps(llm_dict: Dict[str, Any], model_type: str) -> float:
@@ -295,6 +317,7 @@ class ActionConfig:
     num_attention_heads: int = 0
     num_key_value_heads: int = 0
     head_dim: int = 128
+    attention_scaling: Optional[float] = None
     hidden_size: int = 0
     intermediate_size: int = 0
     rms_norm_eps: float = 1e-6
@@ -305,6 +328,18 @@ class ActionConfig:
     in_proj_num_enc_layers: int = 2
     in_proj_max_freq: float = 100.0
     in_proj_num_fourier_feats: int = 20
+
+    def __post_init__(self) -> None:
+        """Resolve and validate attention scaling for direct construction.
+
+        Raises:
+            ValueError: If the head dimension or explicit scale is invalid.
+        """
+        scale_config = ({} if self.attention_scaling is None else {
+            "attention_scaling": self.attention_scaling
+        })
+        self.attention_scaling = _get_attention_scaling(
+            scale_config, self.head_dim, 1.0 / (float(self.head_dim)**0.5))
 
 
 @dataclass
@@ -441,6 +476,7 @@ class ModelConfig:
     vocab_size: int
     rope_theta: float
     max_position_embeddings: int
+    default_attention_scale: float
     # RoPE scaling config (e.g. {"type": "dynamic", "factor": 2.0} for Qwen2).
     # None means no scaling (standard RoPE).
     rope_scaling: Optional[dict] = None
@@ -467,8 +503,8 @@ class ModelConfig:
     has_value_norm: bool = False
     # Bias on q/k/v projections.  Read from config.json "attention_bias".
     attention_bias: bool = False
-    # Multiplicative scale applied to QK^T before softmax.
-    attention_scaling: float = 0.0
+    # Explicit multiplicative scale applied to QK^T before softmax.
+    attention_scaling: Optional[float] = None
     # Gemma4 full/global attention can use a different per-head dimension
     # from sliding attention.
     global_head_dim: Optional[int] = None
@@ -632,6 +668,16 @@ class ModelConfig:
     # Derived properties
     # ------------------------------------------------------------------
 
+    def __post_init__(self) -> None:
+        """Resolve and validate the model family's attention scale."""
+        self.default_attention_scale = _get_attention_scaling(
+            {}, self.head_dim, self.default_attention_scale)
+        scale_config = ({} if self.attention_scaling is None else {
+            "attention_scaling": self.attention_scaling
+        })
+        self.attention_scaling = _get_attention_scaling(
+            scale_config, self.head_dim, self.default_attention_scale)
+
     @property
     def tp_size(self) -> int:
         return self.mapping.tp_size
@@ -725,7 +771,9 @@ class ModelConfig:
         carries per-rank shapes.
 
         Usage:
-            cfg = ModelConfig.from_pretrained(path).for_rank(rank, world)
+            cfg = ModelConfig.from_pretrained(
+                path, lambda head_dim: 1.0 / (float(head_dim)**0.5)
+            ).for_rank(rank, world)
             model = CausalLM(cfg)
             load_weights(model, path, mapping=cfg.mapping)
         """
@@ -751,7 +799,9 @@ class ModelConfig:
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_pretrained(cls, model_dir: str) -> "ModelConfig":
+    def from_pretrained(
+            cls, model_dir: str,
+            default_attention_scale: Callable[[int], float]) -> "ModelConfig":
         """Load a ModelConfig from a checkpoint directory.
 
         Loads architecture hyper-parameters via ``AutoConfig`` (see
@@ -760,8 +810,10 @@ class ModelConfig:
         block to determine
         the quantisation scheme.
 
-        ``has_qk_norm`` is auto-detected by scanning the safetensors key index
-        for ``.q_norm.weight`` entries - no model-type assumptions are made.
+        ``default_attention_scale`` is a required model-family callable
+        accepting ``head_dim``. ``has_qk_norm`` is auto-detected by scanning
+        the safetensors key index for ``.q_norm.weight`` entries; no
+        model-type assumptions are made here.
         """
         root, llm_dict = load_checkpoint_config_dicts(model_dir)
 
@@ -788,8 +840,10 @@ class ModelConfig:
         gdn_cfg = _parse_gdn_cfg(llm_dict, layer_types)
         has_qk_norm = _detect_has_qk_norm(model_dir)
         has_value_norm = _get_has_value_norm(llm_dict, model_type)
-        attention_scaling = _get_attention_scaling(llm_dict, model_type,
-                                                   head_dim)
+        default_attention_scale_value = float(
+            default_attention_scale(head_dim))
+        attention_scaling = _get_attention_scaling(
+            llm_dict, head_dim, default_attention_scale_value)
         embedding_scale = _get_embedding_scale(llm_dict, model_type,
                                                hidden_size)
 
@@ -873,6 +927,7 @@ class ModelConfig:
             rope_theta=_get_rope_theta(llm_dict),
             max_position_embeddings=llm_dict.get("max_position_embeddings",
                                                  4096),
+            default_attention_scale=default_attention_scale_value,
             rope_scaling=_select_rope_scaling(llm_dict),
             original_max_position_embeddings=llm_dict.get(
                 "original_max_position_embeddings", None),
@@ -1045,7 +1100,9 @@ def make_mtp_draft_config(base_config: ModelConfig) -> ModelConfig:
     )
 
 
-def make_dflash_draft_config(draft_dir: str) -> ModelConfig:
+def make_dflash_draft_config(
+        draft_dir: str,
+        default_attention_scale: Callable[[int], float]) -> ModelConfig:
     """Build a DFlash draft ModelConfig from the draft checkpoint directory.
 
     Now quantization-aware: if the draft directory contains
@@ -1060,17 +1117,21 @@ def make_dflash_draft_config(draft_dir: str) -> ModelConfig:
     # For FP16 draft checkpoints this returns QuantConfig() (no quant).
     quant = _parse_quant(draft_dir, llm_dict)
 
+    model_type = llm_dict.get("model_type", "qwen3")
+    head_dim = llm_dict.get(
+        "head_dim", llm_dict["hidden_size"] // llm_dict["num_attention_heads"])
+
+    default_attention_scale_value = float(default_attention_scale(head_dim))
+
     return ModelConfig(
-        model_type=llm_dict.get("model_type", "qwen3"),
+        model_type=model_type,
         hidden_size=llm_dict["hidden_size"],
         num_hidden_layers=llm_dict["num_hidden_layers"],
         num_attention_heads=llm_dict["num_attention_heads"],
         num_key_value_heads=llm_dict.get("num_key_value_heads",
                                          llm_dict["num_attention_heads"]),
         intermediate_size=llm_dict["intermediate_size"],
-        head_dim=llm_dict.get(
-            "head_dim",
-            llm_dict["hidden_size"] // llm_dict["num_attention_heads"]),
+        head_dim=head_dim,
         rms_norm_eps=llm_dict.get("rms_norm_eps", 1e-6),
         vocab_size=llm_dict["vocab_size"],
         rope_theta=_get_rope_theta(llm_dict),
@@ -1079,6 +1140,9 @@ def make_dflash_draft_config(draft_dir: str) -> ModelConfig:
                       or llm_dict.get("rope_parameters") or None),
         partial_rotary_factor=_get_partial_rotary_factor(llm_dict),
         has_qk_norm=True,
+        attention_scaling=_get_attention_scaling(
+            llm_dict, head_dim, default_attention_scale_value),
+        default_attention_scale=default_attention_scale_value,
         torch_dtype=llm_dict.get("torch_dtype", "bfloat16"),
         tie_word_embeddings=False,
         layer_types=[LAYER_ATTN] * int(llm_dict["num_hidden_layers"]),
