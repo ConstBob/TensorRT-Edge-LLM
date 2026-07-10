@@ -100,9 +100,10 @@ int32_t getRequiredIntField(PluginFieldCollection const* fields, char const* nam
 void validateAttributes(int32_t numExperts, int32_t topK, int32_t hiddenSize, int32_t moeInterSize,
     int32_t activationType, int32_t normTopkProb, int32_t maxRoutedRows)
 {
-    if (numExperts <= 0)
+    // Match CuteDslF16MoeRunner::kSupportedNumExperts.
+    if (numExperts != 128 && numExperts != 256)
     {
-        throw std::invalid_argument("Fp16MoePlugin: num_experts must be > 0");
+        throw std::invalid_argument("Fp16MoePlugin: num_experts must be one of {128, 256}");
     }
     if (topK <= 0 || topK > kMAX_TOP_K)
     {
