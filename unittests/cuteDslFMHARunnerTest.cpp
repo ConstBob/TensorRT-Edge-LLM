@@ -78,7 +78,8 @@ void expectHalfOutputsClose(rt::Tensor const& actualTensor, rt::Tensor const& ex
     EXPECT_FALSE(nanDetected) << label;
 }
 
-void runViTAccuracyCase(std::vector<int32_t> const& cuSeqLens, int32_t numHeads, int32_t headDim, int32_t maxSeqLen)
+void runViTAccuracyCase(
+    std::vector<int32_t> const& cuSeqLens, int32_t numHeads, int32_t headDim, int32_t maxSeqLen, float attentionScale)
 {
     int32_t const batchSize = static_cast<int32_t>(cuSeqLens.size()) - 1;
     int32_t const totalSeqLen = cuSeqLens.back();
@@ -108,14 +109,14 @@ void runViTAccuracyCase(std::vector<int32_t> const& cuSeqLens, int32_t numHeads,
     cudaStream_t stream = nullptr;
 
     rt::launchFmhaReferenceCompact(
-        qTensor, kTensor, vTensor, outputReference, cuSeqLensTensor, maxSeqLen, false, stream);
+        qTensor, kTensor, vTensor, outputReference, cuSeqLensTensor, maxSeqLen, false, attentionScale, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
 
     CuteDslFMHARunner runner(numHeads, numHeads, headDim);
     runner.run(qTensor.dataPointer<half>(), kTensor.dataPointer<half>(), vTensor.dataPointer<half>(),
         outputCuteDsl.dataPointer<half>(), cuSeqLensTensor.dataPointer<int32_t>(), totalSeqLen, maxSeqLen, batchSize,
-        stream);
+        stream, attentionScale);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
 
@@ -123,7 +124,8 @@ void runViTAccuracyCase(std::vector<int32_t> const& cuSeqLens, int32_t numHeads,
         "ViT CuTe DSL FMHA headDim=" + std::to_string(headDim) + " numHeads=" + std::to_string(numHeads));
 }
 
-void runLlmAccuracyCase(int32_t batchSize, int32_t seqLen, int32_t numQHeads, int32_t numKVHeads, int32_t headDim)
+void runLlmAccuracyCase(
+    int32_t batchSize, int32_t seqLen, int32_t numQHeads, int32_t numKVHeads, int32_t headDim, float attentionScale)
 {
     size_t const qSize = static_cast<size_t>(batchSize) * seqLen * numQHeads * headDim;
     size_t const kvSize = static_cast<size_t>(batchSize) * seqLen * numKVHeads * headDim;
@@ -187,9 +189,9 @@ void runLlmAccuracyCase(int32_t batchSize, int32_t seqLen, int32_t numQHeads, in
 
     CuteDslFMHARunner runner(numQHeads, numKVHeads, headDim, batchSize, seqLen, seqLen);
     runner.run(qCute.dataPointer<half>(), kvCacheCute.dataPointer<half>(), outputCuteDsl.dataPointer<half>(),
-        cuKVSeqLens.dataPointer<int32_t>(), stream, INT_MAX);
+        cuKVSeqLens.dataPointer<int32_t>(), stream, attentionScale, INT_MAX);
 
-    rt::launchFmhaReferenceBshd(qReference, kReference, vReference, outputReference, true, stream);
+    rt::launchFmhaReferenceBshd(qReference, kReference, vReference, outputReference, true, attentionScale, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
 
@@ -290,12 +292,13 @@ void runLlmPagedMatchesContiguousCase(
     copyHostToDevice(cuKVSeqLens, cuKVSeqLensHost);
 
     cudaStream_t stream = nullptr;
+    float const attentionScale = 1.0F / std::sqrt(static_cast<float>(headDim));
     CuteDslFMHARunner runner(numQHeads, numKVHeads, headDim, batchSize, seqLen, seqLen);
     runner.run(qContiguous.dataPointer<half>(), kvContiguousTensor.dataPointer<half>(),
-        outputContiguous.dataPointer<half>(), cuKVSeqLens.dataPointer<int32_t>(), stream, INT_MAX);
+        outputContiguous.dataPointer<half>(), cuKVSeqLens.dataPointer<int32_t>(), stream, attentionScale, INT_MAX);
     runner.runPaged(qPaged.dataPointer<half>(), kvPagedTensor.dataPointer<half>(),
         pageListTensor.dataPointer<int32_t>(), outputPaged.dataPointer<half>(), cuKVSeqLens.dataPointer<int32_t>(),
-        numPages, maxPagesPerSeq, tokensPerPage, DataType::kHALF, stream, INT_MAX);
+        numPages, maxPagesPerSeq, tokensPerPage, DataType::kHALF, stream, attentionScale, INT_MAX);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
 
@@ -375,10 +378,11 @@ void runLlmFp8LongSequenceAccuracyCase()
     copyHostToDevice(cuKVSeqLens, std::vector<int32_t>{0, seqLen});
 
     cudaStream_t stream = nullptr;
+    float const attentionScale = 1.0F / std::sqrt(static_cast<float>(headDim));
     CuteDslFMHARunner runner(numQHeads, numKVHeads, headDim, batchSize, seqLen, seqLen);
     runner.run(qFp8.rawPointer(), kvCacheFp8.rawPointer(), outputCuteDsl.rawPointer(),
-        cuKVSeqLens.dataPointer<int32_t>(), stream, INT_MAX, true, qScale, kScale, vScale);
-    rt::launchFmhaReferenceBshd(qReference, kReference, vReference, outputReference, true, stream);
+        cuKVSeqLens.dataPointer<int32_t>(), stream, attentionScale, INT_MAX, true, qScale, kScale, vScale);
+    rt::launchFmhaReferenceBshd(qReference, kReference, vReference, outputReference, true, attentionScale, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
 
@@ -428,6 +432,7 @@ TEST(CuteDslFMHARunnerTest, vitAccuracy)
         int32_t numHeads;
         int32_t headDim;
         int32_t maxSeqLen;
+        std::optional<float> attentionScale;
     };
 
     std::vector<ViTCase> const cases{
@@ -435,6 +440,8 @@ TEST(CuteDslFMHARunnerTest, vitAccuracy)
         {{0, 16, 64}, 14, 72, 128},
         {{0, 24, 80, 144}, 14, 80, 160},
         {{0, 100, 200, 300}, 14, 128, 512},
+        {{0, 16, 48}, 8, 64, 48, 1.0F},
+        {{0, 24, 64}, 8, 80, 64, 0.37F},
     };
 
     for (auto const& testCase : cases)
@@ -449,7 +456,9 @@ TEST(CuteDslFMHARunnerTest, vitAccuracy)
         cuSeqLensStr += "]";
         SCOPED_TRACE(::testing::Message() << "numHeads=" << testCase.numHeads << " headDim=" << testCase.headDim
                                           << " maxSeqLen=" << testCase.maxSeqLen << " cuSeqLens=" << cuSeqLensStr);
-        runViTAccuracyCase(testCase.cuSeqLens, testCase.numHeads, testCase.headDim, testCase.maxSeqLen);
+        float const attentionScale
+            = testCase.attentionScale.value_or(1.0F / std::sqrt(static_cast<float>(testCase.headDim)));
+        runViTAccuracyCase(testCase.cuSeqLens, testCase.numHeads, testCase.headDim, testCase.maxSeqLen, attentionScale);
     }
 }
 
@@ -473,6 +482,7 @@ TEST(CuteDslFMHARunnerTest, llmAccuracy)
         int32_t numQHeads;
         int32_t numKVHeads;
         int32_t headDim;
+        std::optional<float> attentionScale;
     };
 
     std::vector<LlmCase> const cases{
@@ -480,6 +490,8 @@ TEST(CuteDslFMHARunnerTest, llmAccuracy)
         {2, 48, 16, 4, 64},
         {1, 24, 8, 8, 128},
         {1, 32, 12, 4, 128},
+        {1, 16, 8, 8, 64, 1.0F},
+        {1, 16, 8, 2, 128, 0.37F},
     };
 
     for (auto const& testCase : cases)
@@ -487,8 +499,10 @@ TEST(CuteDslFMHARunnerTest, llmAccuracy)
         SCOPED_TRACE(::testing::Message() << "batchSize=" << testCase.batchSize << " seqLen=" << testCase.seqLen
                                           << " numQHeads=" << testCase.numQHeads
                                           << " numKVHeads=" << testCase.numKVHeads << " headDim=" << testCase.headDim);
-        runLlmAccuracyCase(
-            testCase.batchSize, testCase.seqLen, testCase.numQHeads, testCase.numKVHeads, testCase.headDim);
+        float const attentionScale
+            = testCase.attentionScale.value_or(1.0F / std::sqrt(static_cast<float>(testCase.headDim)));
+        runLlmAccuracyCase(testCase.batchSize, testCase.seqLen, testCase.numQHeads, testCase.numKVHeads,
+            testCase.headDim, attentionScale);
     }
 }
 

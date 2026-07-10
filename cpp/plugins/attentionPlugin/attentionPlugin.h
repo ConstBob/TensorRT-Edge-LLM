@@ -20,6 +20,7 @@
 #include <NvInferRuntime.h>
 #include <cstddef>
 #include <cstdlib>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -50,9 +51,10 @@ public:
     //! \param[in] enableFp8KVCache Whether to enable FP8 KV cache
     //! \param[in] slidingWindowSize Sliding window size (-1 = no sliding window)
     //! \param[in] qkvScales Optional [q, k, v] FP8 dequant scales (required when enableFp8KVCache)
+    //! \param[in] attentionScale Optional absolute QK^T multiplier; defaults to 1/sqrt(headSize)
     AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
         int32_t supportsSpecDecode, int32_t enableFp8KVCache, int32_t slidingWindowSize = -1,
-        std::vector<float> const& qkvScales = {});
+        std::vector<float> const& qkvScales = {}, std::optional<float> attentionScale = std::nullopt);
     AttentionPlugin(std::string const& name, nvinfer1::PluginFieldCollection const* fc);
 
     AttentionPlugin() = delete;
@@ -121,6 +123,7 @@ protected:
     int32_t mNumKVHeads{};
     //! Number of elements per head (head dimension)
     int32_t mHeadSize{};
+    float mAttentionScale{}; //!< Absolute QK^T multiplier.
     //! Whether to enable tree attention for EAGLE speculative decoding
     int32_t mEnableTreeAttention{};
 

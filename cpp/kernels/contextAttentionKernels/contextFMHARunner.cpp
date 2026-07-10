@@ -368,18 +368,18 @@ ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t 
     }
 }
 
-void ContextFMHARunner::setupParams(FusedMultiheadAttentionParamsV2& params)
+void ContextFMHARunner::setupParams(FusedMultiheadAttentionParamsV2& params, float attentionScale)
 {
-    float const invSqrtScale = (1.f / sqrtf(mHeadSize));
+    validateAttentionScale(attentionScale);
+    float const scaleBmm1 = attentionScale;
+    float const scaleSoftmax = 1.0F; // Used by the INT8 path; keep neutral for FP16.
+    float const scaleBmm2 = 1.0F;
 
-    float const scale_bmm1 = invSqrtScale;
-    float const scale_softmax = 1.f; // Seems to be only required for int8
-    float const scale_bmm2 = 1.f;
-
-    FMHADataType scale_type = mLaunchParams.force_fp32_acc ? fmha_v2::DATA_TYPE_FP32 : trtToFMHADataType(mDataType);
-    set_alpha(params.scale_bmm1, scale_bmm1, scale_type);
-    set_alpha(params.scale_softmax, scale_softmax, scale_type);
-    set_alpha(params.scale_bmm2, scale_bmm2, scale_type);
+    FMHADataType const scaleType
+        = mLaunchParams.force_fp32_acc ? fmha_v2::DATA_TYPE_FP32 : trtToFMHADataType(mDataType);
+    set_alpha(params.scale_bmm1, scaleBmm1, scaleType);
+    set_alpha(params.scale_softmax, scaleSoftmax, scaleType);
+    set_alpha(params.scale_bmm2, scaleBmm2, scaleType);
 
     params.b = mBatchSize;
     params.h = mNumHeads;

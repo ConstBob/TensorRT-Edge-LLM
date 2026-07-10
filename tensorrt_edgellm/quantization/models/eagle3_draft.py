@@ -23,7 +23,6 @@ forward with KV-cache and GatherND belongs in the ONNX export layer.
 """
 
 import json
-import math
 import os
 from pathlib import Path
 from typing import Optional
@@ -38,6 +37,7 @@ from transformers import (AutoConfig, AutoModelForCausalLM,
                           AutoModelForImageTextToText, AutoTokenizer)
 
 from ..quantization_configs import build_quant_config
+from .attention_scale import resolve_attention_scale
 from .layers import (RMSNorm, RotaryEmbedding, SwiGLUMLP, apply_rotary_pos_emb,
                      repeat_kv)
 
@@ -45,12 +45,20 @@ from .layers import (RMSNorm, RotaryEmbedding, SwiGLUMLP, apply_rotary_pos_emb,
 class Eagle3DraftAttention(nn.Module):
     """Eagle3 draft attention (input dim = 2 * hidden_size)."""
 
-    def __init__(self, hidden_size, num_heads, num_kv_heads, head_dim, bias):
+    def __init__(self,
+                 hidden_size,
+                 num_heads,
+                 num_kv_heads,
+                 head_dim,
+                 bias,
+                 attention_scale=None):
         super().__init__()
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.kv_groups = num_heads // num_kv_heads
+        self.attention_scale = (resolve_attention_scale({}, "", head_dim) if
+                                attention_scale is None else attention_scale)
 
         in_dim = hidden_size * 2
         self.q_proj = nn.Linear(in_dim, num_heads * head_dim, bias=bias)
@@ -70,7 +78,7 @@ class Eagle3DraftAttention(nn.Module):
         k = repeat_kv(k, self.kv_groups)
         v = repeat_kv(v, self.kv_groups)
 
-        w = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(self.head_dim)
+        w = torch.matmul(q, k.transpose(2, 3)) * self.attention_scale
         if L > 1:
             mask = torch.triu(
                 torch.ones(1, 1, L, L, device=x.device, dtype=torch.bool), 1)
@@ -83,14 +91,22 @@ class Eagle3DraftAttention(nn.Module):
 class Eagle3DraftDecoderLayer(nn.Module):
     """Eagle3 draft decoder layer."""
 
-    def __init__(self, hidden_size, intermediate_size, num_heads, num_kv_heads,
-                 head_dim, rms_norm_eps, bias):
+    def __init__(self,
+                 hidden_size,
+                 intermediate_size,
+                 num_heads,
+                 num_kv_heads,
+                 head_dim,
+                 rms_norm_eps,
+                 bias,
+                 attention_scale=None):
         super().__init__()
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.self_attn = Eagle3DraftAttention(hidden_size, num_heads,
-                                              num_kv_heads, head_dim, bias)
+                                              num_kv_heads, head_dim, bias,
+                                              attention_scale)
         self.mlp = SwiGLUMLP(hidden_size, intermediate_size)
 
     def forward(self, hidden_states, cos, sin, inputs_embeds):
@@ -119,6 +135,8 @@ class Eagle3DraftModel(nn.Module):
                            hs // config.num_attention_heads)
         bias = getattr(config, "attention_bias", False)
         target_hidden = getattr(config, "target_hidden_size", hs)
+        attention_scale = resolve_attention_scale(
+            config, getattr(config, "model_type", ""), head_dim)
 
         self.fc = nn.Linear(target_hidden * 3,
                             hs,
@@ -131,7 +149,7 @@ class Eagle3DraftModel(nn.Module):
             Eagle3DraftDecoderLayer(hs, config.intermediate_size,
                                     config.num_attention_heads,
                                     config.num_key_value_heads, head_dim,
-                                    config.rms_norm_eps, bias)
+                                    config.rms_norm_eps, bias, attention_scale)
             for _ in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(hs, eps=config.rms_norm_eps)

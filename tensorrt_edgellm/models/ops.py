@@ -94,6 +94,7 @@ def attention_plugin(
     sliding_window_size: int,
     enable_tree_attention: bool,
     enable_fp8_kv_cache: bool,
+    attention_scale: float,
     attention_mask: Optional[torch.Tensor] = None,
     attention_pos_id: Optional[torch.Tensor] = None,
     qkv_scales: Optional[List[float]] = None,
@@ -114,9 +115,10 @@ def attention_plugin(
     | EAGLE + FP8 KV        | True               | True  (qkv_scales set)     |
     +-----------------------+--------------------+----------------------------+
 
-    ``enable_tree_attention`` and ``enable_fp8_kv_cache`` are required (no
-    default) so that ``torch.export`` always includes them in the FX graph
-    — default-matching kwargs get stripped, breaking ONNX translation.
+    ``enable_tree_attention``, ``enable_fp8_kv_cache``, and
+    ``attention_scale`` are required (no default) so that ``torch.export``
+    always includes them in the FX graph — default-matching kwargs get
+    stripped, breaking ONNX translation.
 
     Callers must always pass ``qkv_scales=[1.0, 1.0, 1.0]`` explicitly so
     the FX graph contains a valid FLOATS value for the ONNX translation.
@@ -161,6 +163,7 @@ def _(query_states,
       sliding_window_size,
       enable_tree_attention,
       enable_fp8_kv_cache,
+      attention_scale,
       attention_mask=None,
       attention_pos_id=None,
       qkv_scales=None):
@@ -195,6 +198,7 @@ def vit_attention_plugin(
     max_seqlen_carrier: torch.Tensor,  # [] or [1] int32 (scalar)
     num_heads: int,
     head_size: int,
+    attention_scale: float,
 ) -> torch.Tensor:
     """ViT ragged self-attention.
 
@@ -217,14 +221,15 @@ def vit_attention_plugin(
         q = query_states[start:end].permute(1, 0, 2).unsqueeze(0)
         k = key_states[start:end].permute(1, 0, 2).unsqueeze(0)
         v = value_states[start:end].permute(1, 0, 2).unsqueeze(0)
-        attn = F.scaled_dot_product_attention(q, k, v)  # [1, H, S, D]
+        attn = F.scaled_dot_product_attention(
+            q, k, v, scale=attention_scale)  # [1, H, S, D]
         out[start:end] = attn.squeeze(0).permute(1, 0, 2)
     return out
 
 
 @vit_attention_plugin.register_fake
 def _(query_states, key_states, value_states, cu_seqlens, max_seqlen_carrier,
-      num_heads, head_size):
+      num_heads, head_size, attention_scale):
     return torch.empty_like(query_states)
 
 
@@ -242,12 +247,14 @@ def trt_ragged_attention(
         kv_lengths: torch.Tensor,  # [batch+1] int32
         num_heads: int,
         head_size: int,
+        attention_scale: float,
         mask: Optional[torch.Tensor] = None,  # optional attention mask
 ) -> torch.Tensor:
     """TRT-native ragged self-attention proxy op (TRT >= 11).
 
     Emits trt::TRT_Attention ONNX node instead of the edgellm plugin.
-    Q is expected to be pre-scaled by 1/sqrt(head_dim) by the caller.
+    ``attention_scale`` is the absolute multiplier applied to QK^T. The ONNX
+    translation folds non-identity values into Q before emitting TRT attention.
     query_lengths and kv_lengths must be separate tensors (not the same
     object) — TRT requires distinct inputs for these positions.
     ``mask`` is optional; pass ``None`` for unmasked attention.
@@ -263,6 +270,7 @@ def _(query_states,
       kv_lengths,
       num_heads,
       head_size,
+      attention_scale,
       mask=None):
     return torch.empty_like(query_states)
 

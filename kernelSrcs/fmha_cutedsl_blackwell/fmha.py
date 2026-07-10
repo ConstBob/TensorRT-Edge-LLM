@@ -165,7 +165,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         # MMA/SMEM/CTA tilers below use mma_tiler[2] (padded, e.g. 80).
         # TMA ZFILL bridges the gap on loads; OOB drop on stores.
         self.head_dim = actual_head_dim if actual_head_dim is not None else mma_tiler[2]
-        self.inv_sqrt_head_dim = 1.0 / math.sqrt(self.head_dim)
         self.log2_e = math.log2(math.e)
         self.cta_tiler = (
             2 * mma_tiler[0],  # 2 Q tile per CTA
@@ -288,6 +287,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         o_tensor: cute.Tensor,  # (B, S_q, H_q, D) — same layout as Q
         cum_seqlen_k: cute.Tensor,  # (B+1,) Int32 — cumulative KV sequence lengths
         window_size_left: Int32,
+        attention_scale: Float32,
         scale_q: Float32,
         scale_k: Float32,
         scale_v: Float32,
@@ -308,9 +308,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         6. Kernel launch with appropriate parameters
 
         The softmax scale is computed as:
-            scale_softmax = scale_q * scale_k * (1 / sqrt(head_dim))
-        For FP16 (no quantization), pass scale_q = scale_k = scale_v = inv_scale_o = 1.0.
-        For FP8, pass the dequant scales so the kernel folds them into softmax/output scaling.
+            scale_softmax = attention_scale * scale_q * scale_k
+        For FP16, pass unit dequant scales. For FP8, pass Q/K dequant scales
+        separately so only quantization factors are folded into attention_scale.
 
         :param q_tensor: The query tensor (B, S_q, H_q, D) with dynamic B, S_q, H_q
         :type q_tensor: cute.Tensor
@@ -320,6 +320,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         :type o_tensor: cute.Tensor
         :param window_size_left: Left-side sliding window size for attention masking.
         :type window_size_left: Int32
+        :param attention_scale: Absolute multiplier applied to QK^T before softmax.
+        :type attention_scale: Float32
         :param scale_q: Dequantization scale for Q (quant→orig). 1.0 for FP16.
         :type scale_q: Float32
         :param scale_k: Dequantization scale for K (quant→orig). 1.0 for FP16.
@@ -333,7 +335,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         :raises TypeError: If tensor data types don't match or aren't supported
         :raises RuntimeError: If tensor layouts aren't in supported formats
         """
-        scale_softmax = scale_q * scale_k * self.inv_sqrt_head_dim
+        scale_softmax = scale_q * scale_k
+        if attention_scale != 1.0:
+            scale_softmax *= attention_scale
         scale_softmax_log2 = scale_softmax * self.log2_e
         scale_output = scale_v * inv_scale_o
         b = q_tensor.layout.shape[0]
@@ -833,6 +837,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         o_tensor: cute.Tensor,  # (B, S_q, H_q, D) — same layout as Q
         cum_seqlen_k: cute.Tensor,  # (B+1,) Int32 — cumulative KV sequence lengths
         window_size_left: Int32,
+        attention_scale: Float32,
         scale_q: Float32,
         scale_k: Float32,
         scale_v: Float32,
@@ -846,8 +851,12 @@ class BlackwellFusedMultiHeadAttentionForward:
         tokens_per_page must match the K tile width (128 for these variants).
         The logical pool shape is (P,H,T,D); dynamic strides select the physical
         pool layout, either (P,H,T,D) or (P,T,H,D).
+
+        attention_scale is the absolute model-defined QK^T multiplier.
         """
-        scale_softmax = scale_q * scale_k * self.inv_sqrt_head_dim
+        scale_softmax = scale_q * scale_k
+        if attention_scale != 1.0:
+            scale_softmax *= attention_scale
         scale_softmax_log2 = scale_softmax * self.log2_e
         scale_output = scale_v * inv_scale_o
         b = q_tensor.layout.shape[0]
@@ -3319,6 +3328,8 @@ def run(
     # The LLM __call__ computes these internally from the raw per-tensor scales.
     if scale_softmax == 0.0:  # default to 1/sqrt(d)
         scale_softmax = 1.0 / math.sqrt(d)
+    if not math.isfinite(scale_softmax) or scale_softmax <= 0.0:
+        raise ValueError("scale_softmax must be finite and greater than zero")
     log2_e = math.log2(math.exp(1.0))
 
     ref_scale_softmax = scale_q * scale_k * scale_softmax
@@ -3435,7 +3446,7 @@ def run(
             compiled_fmha = cute.compile(
                 fmha.__call_paged__,
                 q_dyn, kv_pool_dyn, page_list_tensor, o_dyn, cu_kv_seqlens,
-                _wsl, scale_q, scale_k, scale_v, inv_scale_o,
+                _wsl, scale_softmax, scale_q, scale_k, scale_v, inv_scale_o,
                 current_stream,
             )
         else:
@@ -3443,7 +3454,7 @@ def run(
             compiled_fmha = cute.compile(
                 fmha,
                 q_dyn, kv_dyn, o_dyn, cu_kv_seqlens, _wsl,
-                scale_q, scale_k, scale_v, inv_scale_o,
+                scale_softmax, scale_q, scale_k, scale_v, inv_scale_o,
                 current_stream,
             )
 
@@ -3674,6 +3685,7 @@ def run(
                 window_size_left_val=(window_size_left
                                      if window_size_left is not None
                                      else -1),
+                attention_scale=scale_softmax,
                 tolerance=llm_prefill_tolerance,
             )
             print(f"{_tag} LLM multi-round prefill test passed.")
@@ -3717,6 +3729,7 @@ def run(
             o_ws,
             cu_kv_seqlens,
             _wsl,
+            scale_softmax,
             scale_q,
             scale_k,
             scale_v,
@@ -3761,6 +3774,7 @@ def run_llm_multi_round_prefill_test(
     bottom_right_align: bool = True,
     use_sliding_window: bool = False,
     window_size_left_val: int = -1,
+    attention_scale: Optional[float] = None,
     tolerance: float = 0.1,
 ):
     """LLM FMHA multi-round prefill accuracy test aligned with plugin unit test.
@@ -3786,6 +3800,7 @@ def run_llm_multi_round_prefill_test(
     :param bottom_right_align: bottom-right causal mask alignment.
     :param use_sliding_window: Enable sliding window masking.
     :param window_size_left_val: Left window size (-1 = disabled).
+    :param attention_scale: Absolute QK^T multiplier; None selects the default 1/sqrt(d) value.
     :param tolerance: Max absolute error tolerance.
     """
     _tag = "[llm_prefill_test]"
@@ -3812,14 +3827,15 @@ def run_llm_multi_round_prefill_test(
     cp.random.seed(42)
     np.random.seed(42)
 
-    # FP16 test: all per-tensor scales are 1.0.
-    # The kernel computes softmax_scale = scale_q * scale_k / sqrt(d) internally.
+    # FP16 test: all per-tensor dequant scales are 1.0.
     _scale_q = 1.0
     _scale_k = 1.0
     _scale_v = 1.0
     _inv_scale_o = 1.0
-    # Reference softmax scale for numpy validation
-    ref_scale_softmax = 1.0 / math.sqrt(d)
+    _attention_scale = 1.0 / math.sqrt(d) if attention_scale is None else attention_scale
+    if not math.isfinite(_attention_scale) or _attention_scale <= 0.0:
+        raise ValueError("attention_scale must be finite and greater than zero")
+    ref_scale_softmax = _attention_scale
 
     mask_type = fmha_utils.MaskEnum.WINDOW_MASK
     if bottom_right_align:
@@ -3908,7 +3924,7 @@ def run_llm_multi_round_prefill_test(
             start_time = time.time()
             compiled_fmha = cute.compile(
                 fmha_op, q_t, kv_t, o_t, cu_kv, _wsl,
-                _scale_q, _scale_k, _scale_v, _inv_scale_o,
+                _attention_scale, _scale_q, _scale_k, _scale_v, _inv_scale_o,
                 current_stream,
             )
             print(f"{_tag} Compilation time: "
@@ -3917,7 +3933,7 @@ def run_llm_multi_round_prefill_test(
         # ---- run kernel ----
         compiled_fmha(
             q_t, kv_t, o_t, cu_kv, _wsl,
-            _scale_q, _scale_k, _scale_v, _inv_scale_o,
+            _attention_scale, _scale_q, _scale_k, _scale_v, _inv_scale_o,
             current_stream,
         )
 

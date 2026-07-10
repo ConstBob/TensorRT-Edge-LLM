@@ -26,19 +26,32 @@ the default :class:`~models.default.modeling_default.CausalLM` for a given
 import dataclasses
 import logging
 import os
-from typing import Dict, Type
+from typing import Callable, Dict, Type
 
 import torch.nn as nn
 
+from .checkpoint.checkpoint_utils import load_checkpoint_config_dicts
 from .checkpoint.loader import load_weights
 from .config import (QUANT_FP16, QUANT_INT4_AWQ, QUANT_INT4_AWQ_MODELOPT,
                      QUANT_INT4_GPTQ, QUANT_MXFP8, QUANT_NVFP4, ModelConfig,
                      make_dflash_draft_config, make_mtp_draft_config,
                      module_quant_type)
 
-__all__ = ["AutoModel", "register_model", "dtype_summary", "param_count"]
+__all__ = [
+    "AutoModel", "load_model_config", "register_attention_scale_default",
+    "register_model", "standard_attention_scale", "dtype_summary",
+    "param_count"
+]
 
+AttentionScaleDefault = Callable[[int], float]
 _MODEL_REGISTRY: Dict[str, Type[nn.Module]] = {}
+_ATTENTION_SCALE_DEFAULT_REGISTRY: Dict[str, AttentionScaleDefault] = {}
+
+
+def standard_attention_scale(head_dim: int) -> float:
+    return 1.0 / (float(head_dim)**0.5)
+
+
 _QWEN3_5_MTP_BASE_MODEL_TYPES = frozenset({
     "qwen3_5_text",
     "qwen3_5_moe",
@@ -66,7 +79,8 @@ _GROUP_SIZE_LM_HEAD_QUANTS = frozenset({
 })
 
 
-def register_model(model_type: str, model_class: Type[nn.Module]) -> None:
+def register_model(model_type: str, model_class: Type[nn.Module],
+                   default_attention_scale: AttentionScaleDefault) -> None:
     """Register *model_class* as the handler for *model_type*.
 
     When :meth:`AutoModel.from_pretrained` encounters a checkpoint whose
@@ -77,8 +91,31 @@ def register_model(model_type: str, model_class: Type[nn.Module]) -> None:
         model_type:  Value of ``model_type`` in the checkpoint ``config.json``.
         model_class: ``nn.Module`` subclass; must accept a single
                      :class:`~config.ModelConfig` as its constructor argument.
+        default_attention_scale: Function returning this family's default for
+                     a given attention head dimension.
     """
     _MODEL_REGISTRY[model_type] = model_class
+    _ATTENTION_SCALE_DEFAULT_REGISTRY[model_type] = default_attention_scale
+
+
+def register_attention_scale_default(
+        model_type: str,
+        default_attention_scale: AttentionScaleDefault) -> None:
+    """Register a default for a model type with special factory dispatch."""
+    _ATTENTION_SCALE_DEFAULT_REGISTRY[model_type] = default_attention_scale
+
+
+def load_model_config(model_dir: str) -> ModelConfig:
+    """Load ModelConfig using the default declared by its model family."""
+    root, llm_dict = load_checkpoint_config_dicts(model_dir)
+    default_attention_scale = standard_attention_scale
+    for config in (root, llm_dict):
+        model_type = config.get("model_type")
+        if model_type in _ATTENTION_SCALE_DEFAULT_REGISTRY:
+            default_attention_scale = _ATTENTION_SCALE_DEFAULT_REGISTRY[
+                model_type]
+            break
+    return ModelConfig.from_pretrained(model_dir, default_attention_scale)
 
 
 class AutoModel:
@@ -161,7 +198,7 @@ class AutoModel:
         """
         from .models.default.modeling_default import CausalLM
 
-        config = ModelConfig.from_pretrained(model_dir)
+        config = load_model_config(model_dir)
         if eagle_base:
             config.eagle_base = True
         if mtp_base or config.mtp_base:
@@ -236,7 +273,8 @@ class AutoModel:
             base_tie_word_embeddings = base_config.tie_word_embeddings
             draft_has_lm_head = _checkpoint_has_dflash_lm_head(
                 dflash_draft_dir)
-            config = make_dflash_draft_config(dflash_draft_dir)
+            config = make_dflash_draft_config(dflash_draft_dir,
+                                              standard_attention_scale)
             if not draft_has_lm_head:
                 config = _inherit_dflash_lm_head_quant(config, base_config)
             model_class = DFlashDraftModel

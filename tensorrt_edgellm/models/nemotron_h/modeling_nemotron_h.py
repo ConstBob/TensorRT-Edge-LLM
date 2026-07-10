@@ -669,6 +669,7 @@ class NemotronHAttentionMixer(nn.Module):
         self.num_heads = num_attention_heads
         self.num_kv_heads = num_key_value_heads
         self.head_dim = head_dim
+        self.attention_scale = config.attention_scaling
         self.enable_fp8_kv_cache = config.quant.kv_cache_quant == "fp8"
         self.sliding_window_size = -1
 
@@ -718,6 +719,7 @@ class NemotronHAttentionMixer(nn.Module):
             "sliding_window_size": self.sliding_window_size,
             "enable_tree_attention": False,
             "enable_fp8_kv_cache": self.enable_fp8_kv_cache,
+            "attention_scale": self.attention_scale,
         }
         # Always pass qkv_scales so torch.export includes a valid FLOATS
         # value in the FX graph for the unified ONNX translation.

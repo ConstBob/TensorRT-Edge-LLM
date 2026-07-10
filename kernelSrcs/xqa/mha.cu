@@ -1532,7 +1532,7 @@ CUBIN_EXPORT __global__
 #if SLIDING_WINDOW
         uint32_t slidingWinSize,
 #endif
-        float qScale,
+        float attentionScale,
         OutputHead* __restrict__ const output, // [nbReq][beamWidth][nbQHeads]
 #if LOW_PREC_OUTPUT
         float const* rcpOutScale,
@@ -1829,9 +1829,11 @@ CUBIN_EXPORT __global__
     };
     if (warpIdx.z == 0)
     {
-        float const kScale = (isKVCacheQuantized ? kCacheScale : 1.f);
-        float const qkScale = qScale * kScale
-            * rsqrtf(validElemsPerHead); // qkScale is applied onto Q*K.T before softmax.
+        float qkScale = attentionScale;
+        if constexpr (isKVCacheQuantized)
+        {
+            qkScale *= kCacheScale;
+        }
         CircIdx<nbKBuffers> idxCurrSMemKBuf{nbKBuffers - 1};
         auto const getSMemKTile = [&](uint32_t idx) -> SharedMem::KSmemBuffer& { return smem.k[warpIdx.x][idx]; };
 #if BEAM_WIDTH > 1
@@ -2218,8 +2220,11 @@ CUBIN_EXPORT __global__
                 pickAccRowsForBeamSearch(
                     warp, acc, tmp, isConvergedTile(seqIter), idxBeam, [](float& d, float s) { d = s; });
             }
-            // apply qkScale
-            rescaleAcc(warp, acc, qkScale);
+            // Apply the combined semantic and K-dequant scale only when it changes the accumulator.
+            if (qkScale != 1.0F)
+            {
+                rescaleAcc(warp, acc, qkScale);
+            }
 #if XQA_2CTA_HEAD_DIM512
             xBar.consumed.wait_parity(getAndFlip(xBarConsumedParityNext));
             auto& splitScoreBar = smem.splitScoreBarriers[warpIdx.y][warpIdx.x];
@@ -3003,7 +3008,7 @@ CUBIN_EXPORT __global__ __launch_bounds__(ctaSize, nbCtaPerSM) void kernel_mha(
 #if SLIDING_WINDOW
     uint32_t slidingWinSize,
 #endif
-    float qScale,
+    float attentionScale,
     OutputHead* __restrict__ const output, // [nbReq][beamWidth][nbQHeads]
 #if LOW_PREC_OUTPUT
     float const* rcpOutScale,
@@ -3031,7 +3036,7 @@ CUBIN_EXPORT __global__ __launch_bounds__(ctaSize, nbCtaPerSM) void kernel_mha(
 #if SLIDING_WINDOW
         slidingWinSize,
 #endif
-        qScale, output,
+        attentionScale, output,
 #if LOW_PREC_OUTPUT
         rcpOutScale,
 #endif
@@ -3054,7 +3059,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if SLIDING_WINDOW
     uint32_t slidingWinSize,
 #endif
-    float qScale, OutputHead* output,
+    float attentionScale, OutputHead* output,
 #if LOW_PREC_OUTPUT
     float const* rcpOutScale,
 #endif
@@ -3153,7 +3158,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if SLIDING_WINDOW
         slidingWinSize,
 #endif
-        qScale, output,
+        attentionScale, output,
 #if LOW_PREC_OUTPUT
         rcpOutScale,
 #endif
@@ -3181,7 +3186,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if SLIDING_WINDOW
         slidingWinSize,
 #endif
-        qScale, output,
+        attentionScale, output,
 #if LOW_PREC_OUTPUT
         rcpOutScale,
 #endif

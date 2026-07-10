@@ -1627,7 +1627,7 @@ def _make_talker_sub_config(model_dir: str, sub_path) -> "ModelConfig":
     """
     import tempfile
 
-    from ..config import ModelConfig
+    from ..model import load_model_config
 
     cfg = _load_config(model_dir)
     for key in sub_path:
@@ -1648,7 +1648,7 @@ def _make_talker_sub_config(model_dir: str, sub_path) -> "ModelConfig":
         tmp_cfg_path = os.path.join(tmp_dir, "config.json")
         with open(tmp_cfg_path, "w") as f:
             json.dump(cfg, f)
-        return ModelConfig.from_pretrained(tmp_dir)
+        return load_model_config(tmp_dir)
 
 
 def _patch_tts_config(model_dir: str, out_dir: str) -> None:
@@ -1782,7 +1782,7 @@ def _export_talker(model_dir: str, llm_out_dir: str, model_type: str) -> None:
                 model_dir, model_type)
     try:
         from ..checkpoint.loader import load_weights
-        from ..config import ModelConfig
+        from ..model import load_model_config
         from ..models.qwen3_tts import TalkerCausalLM
 
         if model_type in ("qwen3_omni", "qwen3_omni_moe"):
@@ -1790,7 +1790,7 @@ def _export_talker(model_dir: str, llm_out_dir: str, model_type: str) -> None:
                                              ["talker_config", "text_config"])
             extract_sidecars = _extract_omni_talker_sidecars
         else:  # qwen3_tts and any other future dense-talker variants
-            config = ModelConfig.from_pretrained(model_dir)
+            config = load_model_config(model_dir)
             extract_sidecars = _extract_tts_weights
 
         model = TalkerCausalLM(config)
@@ -1882,8 +1882,8 @@ def _export_code_predictor(model_dir: str, cp_out_dir: str,
         with open(tmp_cfg_path, "w") as f:
             json.dump(cp_cfg, f)
 
-        from ..config import ModelConfig
-        config = ModelConfig.from_pretrained(tmp_dir)
+        from ..model import load_model_config
+        config = load_model_config(tmp_dir)
 
     # Override model_type for runtime identification
     config.model_type = _CP_RUNTIME_MODEL_TYPE.get(model_type,
@@ -1999,9 +1999,10 @@ def _extract_code_predictor_weights(model_dir: str, out_dir: str,
 
 def _build_action_config(root_cfg: dict, weights: dict):
     """Build an ActionConfig from the Alpamayo root config and weight dict."""
-    from ..config import ActionConfig
+    from .. import config as config_module
 
     expert_cfg = root_cfg.get("expert_cfg", {})
+    head_dim = expert_cfg.get("head_dim", 128)
 
     # Infer num_hidden_layers by counting expert.layers.N keys.
     layer_indices = set()
@@ -2016,7 +2017,7 @@ def _build_action_config(root_cfg: dict, weights: dict):
     num_kv_heads = expert_cfg.get("num_attention_heads", 0)
     for k, v in weights.items():
         if k.endswith("expert.layers.0.self_attn.k_proj.weight"):
-            num_kv_heads = v.shape[0] // expert_cfg.get("head_dim", 128)
+            num_kv_heads = v.shape[0] // head_dim
             break
 
     traj_token_start_idx = root_cfg.get("traj_token_start_idx", 0)
@@ -2026,14 +2027,16 @@ def _build_action_config(root_cfg: dict, weights: dict):
 
     in_proj_cfg = root_cfg.get("action_in_proj_cfg", {})
 
-    return ActionConfig(
+    return config_module.ActionConfig(
         rope_theta=5_000_000.0,
         mrope_section=[24, 20, 20],
         mrope_interleaved=True,
         num_hidden_layers=num_hidden_layers,
         num_attention_heads=expert_cfg.get("num_attention_heads", 0),
         num_key_value_heads=num_kv_heads,
-        head_dim=expert_cfg.get("head_dim", 128),
+        head_dim=head_dim,
+        attention_scaling=config_module._get_attention_scaling(
+            expert_cfg, head_dim, 1.0 / (float(head_dim)**0.5)),
         hidden_size=expert_cfg.get("hidden_size", 0),
         intermediate_size=expert_cfg.get("intermediate_size", 0),
         rms_norm_eps=1e-6,
@@ -2453,8 +2456,8 @@ def main() -> None:
 
     def _get_model_config() -> "ModelConfig":
         if _model_config[0] is None:
-            from ..config import ModelConfig
-            _model_config[0] = ModelConfig.from_pretrained(model_dir)
+            from ..model import load_model_config
+            _model_config[0] = load_model_config(model_dir)
         return _model_config[0]
 
     def _get_code2wav_weights() -> dict:

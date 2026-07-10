@@ -336,6 +336,7 @@ class GatedAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
+        self.attention_scale = config.attention_scaling
         self.enable_fp8_kv_cache = config.quant.kv_cache_quant == "fp8"
         self.sliding_window_size = -1
         module_prefix = f"layers.{layer_idx}.self_attn"
@@ -412,6 +413,7 @@ class GatedAttention(nn.Module):
             "sliding_window_size": self.sliding_window_size,
             "enable_tree_attention": enable_tree,
             "enable_fp8_kv_cache": self.enable_fp8_kv_cache,
+            "attention_scale": self.attention_scale,
         }
         if enable_tree:
             kwargs["attention_mask"] = attention_mask

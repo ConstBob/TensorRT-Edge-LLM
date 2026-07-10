@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -86,7 +86,7 @@ constexpr bool allowSlidingWindow = SLIDING_WINDOW;
 
 struct BeamSearchParams
 {
-    uint32_t const* __restrict__ indices;    // shape: [batchSize][beamWidth][capacity]
+    uint32_t const* __restrict__ indices; // shape: [batchSize][beamWidth][capacity]
     uint32_t capacity;
     uint32_t const* __restrict__ ctxLenList; // shape: [batchSize][beamWidth]. Should be [batchSize] but we have to
                                              // match trt-llm API.
@@ -96,7 +96,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t const nbKHeads,
 #if SLIDING_WINDOW
     uint32_t slidingWinSize,
 #endif
-    float qScale, OutputHead* output,
+    float attentionScale, OutputHead* output,
 #if LOW_PREC_OUTPUT
     float const* rcpOutScale,
 #endif
@@ -136,7 +136,7 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if SLIDING_WINDOW
     uint32_t slidingWinSize,
 #endif
-    float qScale, OutputHead* output,
+    float attentionScale, OutputHead* output,
 #if LOW_PREC_OUTPUT
     float const* rcpOutScale,
 #endif
@@ -174,7 +174,7 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 
 void launchMLA(cudaDeviceProp const& prop,
     uint32_t inputSeqLen, // uniform for all requests and causal mask is assumed
-    float qScale, OutputHead* output, InputHead const* q,
+    float attentionScale, OutputHead* output, InputHead const* q,
 #if TOKENS_PER_PAGE != 0
     GMemCacheHead* pool, // global pool of pages
     KVCachePageIndex const*

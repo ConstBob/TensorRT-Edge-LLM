@@ -273,18 +273,19 @@ void AttentionPlugin::dispatchFFPAKernel(half const* q, half const* k, half cons
     ffpaParams.numQHeads = mNumQHeads;
     ffpaParams.numKVHeads = mNumKVHeads;
     ffpaParams.headDim = mHeadSize;
-    ffpaParams.softmaxScale = 1.0F / std::sqrt(static_cast<float>(mHeadSize));
+    ffpaParams.softmaxScale = mAttentionScale;
     CuteDslFFPARunner::run(ffpaParams, stream);
 }
 #endif
 
 AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
     int32_t enableTreeAttention, int32_t enableFp8KVCache, int32_t slidingWindowSize,
-    std::vector<float> const& qkvScales)
+    std::vector<float> const& qkvScales, std::optional<float> attentionScale)
     : mLayerName(name)
     , mNumQHeads(numQHeads)
     , mNumKVHeads(numKVHeads)
     , mHeadSize(headSize)
+    , mAttentionScale(resolveAttentionScale(attentionScale, headSize))
     , mEnableTreeAttention(enableTreeAttention)
     , mEnableFp8KVCache(enableFp8KVCache)
     , mQkvScales(enableFp8KVCache ? qkvScales : std::vector<float>{1.f, 1.f, 1.f})
@@ -357,13 +358,14 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
 
 AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection const* fc)
     : mLayerName(name)
+    , mNumQHeads(parsePluginScalarField<int32_t>("num_q_heads", fc).value_or(0))
+    , mNumKVHeads(parsePluginScalarField<int32_t>("num_kv_heads", fc).value_or(0))
+    , mHeadSize(parsePluginScalarField<int32_t>("head_size", fc).value_or(0))
+    , mAttentionScale(resolveAttentionScale(parsePluginScalarField<float>("attention_scale", fc), mHeadSize))
+    , mEnableTreeAttention(parsePluginScalarField<int32_t>("enable_tree_attention", fc).value_or(0))
+    , mEnableFp8KVCache(parsePluginScalarField<int32_t>("enable_fp8_kv_cache", fc).value_or(0))
+    , mSlidingWindowSize(parsePluginScalarField<int32_t>("sliding_window_size", fc).value_or(-1))
 {
-    mNumQHeads = parsePluginScalarField<int32_t>("num_q_heads", fc).value_or(0);
-    mNumKVHeads = parsePluginScalarField<int32_t>("num_kv_heads", fc).value_or(0);
-    mHeadSize = parsePluginScalarField<int32_t>("head_size", fc).value_or(0);
-    mEnableTreeAttention = parsePluginScalarField<int32_t>("enable_tree_attention", fc).value_or(0);
-    mEnableFp8KVCache = parsePluginScalarField<int32_t>("enable_fp8_kv_cache", fc).value_or(0);
-    mSlidingWindowSize = parsePluginScalarField<int32_t>("sliding_window_size", fc).value_or(-1);
 
     // Parse qkv_scales float array
     for (int32_t i = 0; i < fc->nbFields; ++i)
@@ -449,7 +451,7 @@ IPluginV3* AttentionPlugin::clone() noexcept
     try
     {
         auto* p = new AttentionPlugin(mLayerName, mNumQHeads, mNumKVHeads, mHeadSize, mEnableTreeAttention,
-            mEnableFp8KVCache, mSlidingWindowSize, mQkvScales);
+            mEnableFp8KVCache, mSlidingWindowSize, mQkvScales, mAttentionScale);
         p->setPluginNamespace(mNamespace.c_str());
         return p;
     }
@@ -1007,7 +1009,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                     kvCacheTensor.dataPointer<half>(),              // KV [b, 2, h_k, cap, d] (donor's cache)
                     attentionOutputTensor.dataPointer<half>(),      // O  [b, s_q, h_q, d]
                     paddedCuKVSeqLensTensor.dataPointer<int32_t>(), // cu_kv_seqlens [b+1]
-                    stream, slidingWindow);
+                    stream, mAttentionScale, slidingWindow);
             }
             else
 #endif
@@ -1017,7 +1019,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                     mSlidingWindowSize > 0 ? ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL
                                            : ContextAttentionMaskType::CAUSAL);
                 FusedMultiheadAttentionParamsV2 params{};
-                fmhaRunner.setupParams(params);
+                fmhaRunner.setupParams(params, mAttentionScale);
                 if (mSlidingWindowSize > 0)
                 {
                     params.sliding_window_size = mSlidingWindowSize;
@@ -1125,7 +1127,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                         kvCacheTensor.rawPointer(),                     // KV [b, 2, h_k, cap, d] FP8
                         attentionOutputTensor.dataPointer<half>(),      // O  [b, s_q, h_q, d] FP16
                         paddedCuKVSeqLensTensor.dataPointer<int32_t>(), // cu_kv_seqlens [b+1]
-                        stream, slidingWindow, /*fp8Input=*/true, qScale, kScale, vScale);
+                        stream, mAttentionScale, slidingWindow, /*fp8Input=*/true, qScale, kScale, vScale);
                 }
                 else
                 {
@@ -1137,7 +1139,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                         kvCacheTensor.dataPointer<half>(),              // KV [b, 2, h_k, cap, d]
                         attentionOutputTensor.dataPointer<half>(),      // O  [b, s_q, h_q, d]
                         paddedCuKVSeqLensTensor.dataPointer<int32_t>(), // cu_kv_seqlens [b+1]
-                        stream, slidingWindow);
+                        stream, mAttentionScale, slidingWindow);
                 }
             }
             else
@@ -1148,7 +1150,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                     mSlidingWindowSize > 0 ? ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL
                                            : ContextAttentionMaskType::CAUSAL);
                 FusedMultiheadAttentionParamsV2 params{};
-                fmhaRunner.setupParams(params);
+                fmhaRunner.setupParams(params, mAttentionScale);
                 if (mSlidingWindowSize > 0)
                 {
                     params.sliding_window_size = mSlidingWindowSize;
@@ -1231,6 +1233,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
         auto xqaRunner = DecoderXQARunner(mDataType, selectKvCacheDataType(mEnableFp8KVCache), runtimeBatchSize,
             mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion);
         XQALaunchParams params = xqaRunner.initXQAParams();
+        params.attentionScale = mAttentionScale;
         if (mEnableFp8KVCache)
         {
             params.kScale = kScale;
@@ -1275,6 +1278,7 @@ PluginFieldCollection const* AttentionPlugin::getFieldsToSerialize() noexcept
     mDataToSerialize.emplace_back("num_q_heads", &mNumQHeads, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("num_kv_heads", &mNumKVHeads, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("head_size", &mHeadSize, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back("attention_scale", &mAttentionScale, PluginFieldType::kFLOAT32, 1);
     mDataToSerialize.emplace_back("enable_tree_attention", &mEnableTreeAttention, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("enable_fp8_kv_cache", &mEnableFp8KVCache, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("sliding_window_size", &mSlidingWindowSize, PluginFieldType::kINT32, 1);
@@ -1298,6 +1302,7 @@ AttentionPluginCreator::AttentionPluginCreator()
     mPluginAttributes.emplace_back(PluginField("num_q_heads", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("num_kv_heads", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("head_size", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("attention_scale", nullptr, PluginFieldType::kFLOAT32, 0));
     // Make enable_fp8_kv_cache optional with default value 0 (disable by default)
     mPluginAttributes.emplace_back(PluginField("enable_tree_attention", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("enable_fp8_kv_cache", nullptr, PluginFieldType::kINT32, 0));

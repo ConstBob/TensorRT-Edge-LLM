@@ -171,6 +171,12 @@ _attention_plugin_schema = OpSchema(
             "Defaults to [1.0, 1.0, 1.0] when the checkpoint has no explicit scales.",
             required=False,
         ),
+        OpSchema.Attribute(
+            name="attention_scale",
+            type=OpSchema.AttrType.FLOAT,
+            description="Absolute multiplier applied to QK^T before softmax.",
+            required=False,
+        ),
     ],
 )
 
@@ -233,6 +239,12 @@ _vit_attention_plugin_schema = OpSchema(
             type=OpSchema.AttrType.INT,
             description="Size of each attention head",
             required=True,
+        ),
+        OpSchema.Attribute(
+            name="attention_scale",
+            type=OpSchema.AttrType.FLOAT,
+            description="Absolute multiplier applied to QK^T before softmax.",
+            required=False,
         ),
     ],
 )
@@ -847,7 +859,7 @@ _attention_trt_native_schema = OpSchema(
         OpSchema.Attribute(
             name="scale",
             type=OpSchema.AttrType.FLOAT,
-            description="Attention scale factor (1.0 when Q is pre-scaled)",
+            description="Absolute multiplier applied to QK^T before softmax.",
             required=False,
         ),
     ],
@@ -862,8 +874,7 @@ _trt_ragged_attention_schema = OpSchema(
     inputs=[
         OpSchema.FormalParameter(
             name="query",
-            description=
-            "Query tensor [total_S, H, D] (pre-scaled by 1/sqrt(D))",
+            description="Query tensor [total_S, H, D]",
             type_str="T",
         ),
         OpSchema.FormalParameter(

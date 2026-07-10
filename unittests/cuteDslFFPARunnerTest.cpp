@@ -163,6 +163,7 @@ struct ShapeParam
     int32_t numKVHeads; // == numQHeads for MHA; < numQHeads for GQA/MQA (must divide numQHeads)
     bool useNormalInit;
     char const* name;
+    float attentionScale{1.0F / std::sqrt(512.0F)};
 };
 
 void runAccuracyCase(ShapeParam const& p, cudaStream_t stream)
@@ -192,7 +193,7 @@ void runAccuracyCase(ShapeParam const& p, cudaStream_t stream)
         initializeFp16(v, 47);
     }
 
-    rt::launchFmhaReferenceBshd(q, k, v, outputReference, true, stream);
+    rt::launchFmhaReferenceBshd(q, k, v, outputReference, true, p.attentionScale, stream);
 
     // Uniform (dense) cumulative lengths: varlen masking degenerates to the
     // padded extents, preserving the original dense-kernel semantics.
@@ -211,7 +212,7 @@ void runAccuracyCase(ShapeParam const& p, cudaStream_t stream)
     params.numQHeads = p.numQHeads;
     params.numKVHeads = p.numKVHeads;
     params.headDim = kHeadDim;
-    params.softmaxScale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
+    params.softmaxScale = p.attentionScale;
 
     ASSERT_EQ(CuteDslFFPARunner::run(params, stream), 0) << p.name;
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -267,6 +268,8 @@ INSTANTIATE_TEST_SUITE_P(FP16Causal, CuteDslFFPAAccuracySweep,
         // --- MHA (numKVHeads == numQHeads) ---
         ShapeParam{1, 16, 1, 1, /*useNormalInit=*/false, "B1_S16_H1"},
         ShapeParam{2, 24, 2, 2, /*useNormalInit=*/false, "B2_S24_H2"},
+        ShapeParam{1, 16, 1, 1, /*useNormalInit=*/false, "identity_scale", 1.0F},
+        ShapeParam{1, 16, 1, 1, /*useNormalInit=*/false, "custom_scale", 0.37F},
         ShapeParam{1, 8, 1, 1, /*useNormalInit=*/true, "sub_Bc"},
         ShapeParam{1, 16, 4, 4, /*useNormalInit=*/true, "eq_Bc"},
         ShapeParam{1, 64, 8, 8, /*useNormalInit=*/true, "eq_Br"},
@@ -281,19 +284,21 @@ INSTANTIATE_TEST_SUITE_P(FP16Causal, CuteDslFFPAAccuracySweep,
         ShapeParam{2, 256, 8, 2, /*useNormalInit=*/true, "gqa_g4_H8_KV2_batch"},
         // --- Other GQA / MQA group sizes for coverage ---
         ShapeParam{1, 128, 8, 4, /*useNormalInit=*/true, "gqa_g2_H8_KV4"},
+        ShapeParam{1, 128, 8, 1, /*useNormalInit=*/true, "gemma_mqa_identity", 1.0F},
+        ShapeParam{1, 128, 8, 1, /*useNormalInit=*/true, "gemma_mqa_custom", 0.37F},
         ShapeParam{1, 256, 4, 1, /*useNormalInit=*/true, "mqa_g4_H4_KV1"},
         ShapeParam{1, 1024, 8, 1, /*useNormalInit=*/true, "mqa_H8_KV1_1k"}),
     [](::testing::TestParamInfo<ShapeParam> const& info) { return std::string{info.param.name}; });
 
-class CuteDslFFPACausalProperty : public CuteDslFFPABase
+class CuteDslFFPACausalProperty : public CuteDslFFPABase, public ::testing::WithParamInterface<float>
 {
 protected:
     // Run the causal kernel for a B=1, H=numHeads prefix [0..seqLen) drawn from
     // the leading rows of a single full-length input buffer. The runner re-derives
     // strides from seqlenK, so reusing the full-S input pointer with a shorter
     // seqlenQ/seqlenK correctly addresses the contiguous leading-row prefix.
-    rt::Tensor runPrefix(
-        rt::Tensor const& fullQ, rt::Tensor const& fullK, rt::Tensor const& fullV, int32_t seqLen, int32_t numHeads)
+    rt::Tensor runPrefix(rt::Tensor const& fullQ, rt::Tensor const& fullK, rt::Tensor const& fullV, int32_t seqLen,
+        int32_t numHeads, float attentionScale)
     {
         int32_t constexpr kHeadDim = 512;
         rt::Coords const outShape{1, seqLen, numHeads, kHeadDim};
@@ -313,7 +318,7 @@ protected:
         params.numQHeads = numHeads;
         params.numKVHeads = numHeads;
         params.headDim = kHeadDim;
-        params.softmaxScale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
+        params.softmaxScale = attentionScale;
 
         EXPECT_EQ(CuteDslFFPARunner::run(params, mStream), 0) << "prefix S=" << seqLen;
         CUDA_CHECK(cudaStreamSynchronize(mStream));
@@ -327,7 +332,7 @@ protected:
 // leading-row inputs must yield identical outputs for the rows they share.
 // Picking 16/64/128 crosses the Br=64 tile boundary so we exercise both
 // single-block and multi-block Q traversal.
-TEST_F(CuteDslFFPACausalProperty, PrefixEquivalence)
+TEST_P(CuteDslFFPACausalProperty, PrefixEquivalence)
 {
     int32_t constexpr kHeadDim = 512;
     int32_t constexpr kNumHeads = 2;
@@ -342,9 +347,10 @@ TEST_F(CuteDslFFPACausalProperty, PrefixEquivalence)
     initializeNormalFp16(fullK, 211);
     initializeNormalFp16(fullV, 307);
 
-    rt::Tensor out128 = runPrefix(fullQ, fullK, fullV, 128, kNumHeads);
-    rt::Tensor out64 = runPrefix(fullQ, fullK, fullV, 64, kNumHeads);
-    rt::Tensor out16 = runPrefix(fullQ, fullK, fullV, 16, kNumHeads);
+    float const attentionScale = GetParam();
+    rt::Tensor out128 = runPrefix(fullQ, fullK, fullV, 128, kNumHeads, attentionScale);
+    rt::Tensor out64 = runPrefix(fullQ, fullK, fullV, 64, kNumHeads, attentionScale);
+    rt::Tensor out16 = runPrefix(fullQ, fullK, fullV, 16, kNumHeads, attentionScale);
 
     auto const host128 = copyDeviceToHost<__half>(out128);
     auto const host64 = copyDeviceToHost<__half>(out64);
@@ -467,7 +473,7 @@ TEST_F(CuteDslFFPAVarlen, RaggedBatchPoisonedPadding)
         rt::Tensor vRef = sliceBatchPrefix(vHost, kvShape, b, lens[static_cast<size_t>(b)]);
         rt::Tensor oRef(
             rt::Coords{1, lens[static_cast<size_t>(b)], kNumQHeads, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-        rt::launchFmhaReferenceBshd(qRef, kRef, vRef, oRef, true, mStream);
+        rt::launchFmhaReferenceBshd(qRef, kRef, vRef, oRef, true, params.softmaxScale, mStream);
         CUDA_CHECK(cudaStreamSynchronize(mStream));
         auto const oRefHost = copyDeviceToHost<__half>(oRef);
 
@@ -565,7 +571,7 @@ TEST_F(CuteDslFFPAVarlen, NaNPoisonedPaddingDoesNotLeak)
         rt::Tensor vRef = sliceBatchPrefix(vHost, kvShape, b, lens[static_cast<size_t>(b)]);
         rt::Tensor oRef(
             rt::Coords{1, lens[static_cast<size_t>(b)], kNumQHeads, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-        rt::launchFmhaReferenceBshd(qRef, kRef, vRef, oRef, true, mStream);
+        rt::launchFmhaReferenceBshd(qRef, kRef, vRef, oRef, true, params.softmaxScale, mStream);
         CUDA_CHECK(cudaStreamSynchronize(mStream));
         auto const oRefHost = copyDeviceToHost<__half>(oRef);
 
@@ -672,7 +678,7 @@ TEST_F(CuteDslFFPAVarlen, ChunkedPrefill)
         rt::Tensor kRef = sliceBatchPrefix(kHost, kvShape, b, kvLen);
         rt::Tensor vRef = sliceBatchPrefix(vHost, kvShape, b, kvLen);
         rt::Tensor oRef(rt::Coords{1, kvLen, kNumQHeads, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-        rt::launchFmhaReferenceBshd(qRef, kRef, vRef, oRef, true, mStream);
+        rt::launchFmhaReferenceBshd(qRef, kRef, vRef, oRef, true, params.softmaxScale, mStream);
         CUDA_CHECK(cudaStreamSynchronize(mStream));
         auto const oRefHost = copyDeviceToHost<__half>(oRef);
 
@@ -693,6 +699,8 @@ TEST_F(CuteDslFFPAVarlen, ChunkedPrefill)
         }
     }
 }
+INSTANTIATE_TEST_SUITE_P(AttentionScale, CuteDslFFPACausalProperty, ::testing::Values(1.0F, 0.37F),
+    [](::testing::TestParamInfo<float> const& info) { return info.param == 1.0F ? "Identity" : "Custom"; });
 
 class CuteDslFFPANegativePath : public CuteDslFFPABase
 {

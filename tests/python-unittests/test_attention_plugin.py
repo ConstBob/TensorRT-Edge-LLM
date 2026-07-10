@@ -302,10 +302,12 @@ class AttentionPluginRunner:
     def __init__(self,
                  p: AttentionParams,
                  enable_tree_attention=False,
-                 allow_empty_kv=False):
+                 allow_empty_kv=False,
+                 attention_scale: Optional[float] = None):
         self.p = p
         self.tree = enable_tree_attention
         self.allow_empty_kv = allow_empty_kv
+        self.attention_scale = attention_scale
         self.kv_dtype = trt.fp8 if p.enable_fp8_kv_cache else trt.float16
         self.runner = PluginRunner()
         self._build()
@@ -358,6 +360,8 @@ class AttentionPluginRunner:
         ]
         if p.enable_fp8_kv_cache:
             fields.append(pf_float32("qkv_scales", p.qkv_scales))
+        if self.attention_scale is not None:
+            fields.append(pf_float32("attention_scale", self.attention_scale))
 
         self.runner.build(
             input_specs=input_specs,
@@ -468,15 +472,10 @@ def _run_rounds(p: AttentionParams,
                 rtol: float,
                 seed: int = 42,
                 cos_threshold: float = 0.99999,
-                q_prescale: float = 1.0):
-    """Generic multi-round decode/prefill driver comparing plugin vs reference.
-
-    ``q_prescale`` multiplies the plugin-side Q only (the export-time Q
-    pre-scaling convention for a non-default softmax scale); the reference
-    keeps the unscaled Q and applies ``p.qk_scale`` directly.
-    """
+                attention_scale: Optional[float] = None):
+    """Generic multi-round decode/prefill driver comparing plugin vs reference."""
     gen = torch.Generator().manual_seed(seed)
-    runner = AttentionPluginRunner(p)
+    runner = AttentionPluginRunner(p, attention_scale=attention_scale)
     cos, sin, combined = _make_rope(p, gen)
     ref_k, ref_v, plugin_kv = _empty_caches(p)
 
@@ -486,8 +485,6 @@ def _run_rounds(p: AttentionParams,
                           generator=gen,
                           dtype=torch.float32).to(DEV)
         q, k, v = _split_qkv(qkv, p)
-        if q_prescale != 1.0:
-            q = (q.float() * q_prescale).to(torch.float16)
         position_ids = torch.arange(pos,
                                     pos + p.seq_len,
                                     dtype=torch.int32,
@@ -681,21 +678,12 @@ def test_fp8_kv_cache_prefill(scales):
 
 
 # --------------------------------------------------------------------------- #
-# Q pre-scaling convention for a non-standard softmax scale: the plugin has no
-# softmax-scale parameter (every backend hardcodes 1/sqrt(headDim)). Models
-# whose desired scale differs (e.g. Gemma4 attention_scaling) pre-scale Q at
-# export time by desired_scale / (1/sqrt(d)). The plugin consumes the
-# pre-scaled Q; the reference attends the UNSCALED Q with desired_scale
-# directly, proving the convention is equivalent through the real prefill
-# (FMHA) and decode (XQA) kernels. RoPE is a rotation, so it commutes with the
-# scalar pre-scale.
+# Configurable softmax scale through the real prefill and decode kernels.
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("is_prefill", [True, False],
                          ids=["prefill", "decode"])
-def test_prescaled_query_softmax_scale(is_prefill):
-    head_size = BASE["head_size"]
-    default_scale = head_size**-0.5
-    desired_scale = 0.5 * default_scale  # any value != 1/sqrt(d)
+def test_configurable_softmax_scale(is_prefill):
+    desired_scale = 0.37
     p = AttentionParams(batch_size=2,
                         seq_len=8 if is_prefill else 1,
                         is_prefill=is_prefill,
@@ -705,7 +693,7 @@ def test_prescaled_query_softmax_scale(is_prefill):
                 num_rounds=2 if is_prefill else 4,
                 atol=1e-2,
                 rtol=1e-2,
-                q_prescale=desired_scale / default_scale)
+                attention_scale=desired_scale)
 
 
 # --------------------------------------------------------------------------- #
