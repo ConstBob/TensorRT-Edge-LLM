@@ -207,6 +207,12 @@ class MambaMixer(nn.Module):
         norm.weight              - [intermediate_size] (gated RMSNorm)
     """
 
+    # Bound for dt before softplus. FP8 in_proj carries a per-tensor weight
+    # scale, so an outlier channel can drive dt past the fp16 range; softplus(dt)
+    # then overflows the SSM recurrence. softplus is ~identity in this range, so
+    # clamping keeps well-behaved dt exact while capping the pathological ones.
+    _DT_CLAMP = 50.0
+
     def __init__(self, config: ModelConfig, mc: MambaConfig,
                  module_prefix: str) -> None:
         super().__init__()
@@ -264,6 +270,7 @@ class MambaMixer(nn.Module):
         # Split: [gate, BC conv path, dt]
         gate, hidden_states_for_conv, dt = projected_states.split(
             [d_inner, self.conv_dim, self.num_heads], dim=-1)
+        dt = dt.clamp(-self._DT_CLAMP, self._DT_CLAMP)
 
         hidden_states_for_conv, conv_state_out, _ = causal_conv1d(
             hidden_states_for_conv,
