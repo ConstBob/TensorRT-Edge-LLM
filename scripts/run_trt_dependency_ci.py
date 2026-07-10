@@ -31,7 +31,8 @@ from typing import Any
 from trt_dev_toolkit.code_manager import (ArtifactSource, ArtifactTarget,
                                           BuildComponent, BuildMode,
                                           CodeManager, DeploymentMode)
-from trt_dev_toolkit.code_manager.models import BuildConfig, PlatformConfig
+from trt_dev_toolkit.code_manager.models import (ArtifactResult, BuildConfig,
+                                                 PlanStep, PlatformConfig)
 from trt_dev_toolkit.command_manager.command_manager import CommandManager
 from trt_dev_toolkit.command_manager.data_structures import (CommandSpec,
                                                              OutputMode,
@@ -204,6 +205,7 @@ class Config:
     jobs: int
     source_root: Path = _SOURCE_ROOT
     download_onnx: bool = False
+    build_locally: bool = False
 
     def validate(self) -> None:
         if self.architecture not in {Arch.X86_64, Arch.D7L}:
@@ -325,15 +327,16 @@ def build_targets(config: Config) -> list[ArtifactTarget]:
     ] if config.architecture is Arch.D7L else [
         "-DCUDA_TARGET_DIR=/usr/local/cuda/targets/x86_64-linux"
     ])
+    trt = ArtifactTarget(
+        component=BuildComponent.TRT,
+        mode=BuildMode.RELEASE,
+        branch=config.branch,
+        source=ArtifactSource.PRE_BUILT,
+        platform=platform,
+        build=BuildConfig(build_dir=str(config.trt_location)),
+    )
     return [
-        ArtifactTarget(
-            component=BuildComponent.TRT,
-            mode=BuildMode.RELEASE,
-            branch=config.branch,
-            source=ArtifactSource.PRE_BUILT,
-            platform=platform,
-            build=BuildConfig(build_dir=str(config.trt_location)),
-        ),
+        trt,
         ArtifactTarget(
             component=BuildComponent.EDGELLM,
             mode=BuildMode.RELEASE,
@@ -346,6 +349,7 @@ def build_targets(config: Config) -> list[ArtifactTarget]:
                 log_file=str(config.local_root / "build-edgellm.log"),
                 parallel_jobs=config.jobs,
                 no_nvidia_runtime=True,
+                trt_package_dir=str(config.trt_location),
                 cmake_args=[
                     "--fresh", "-DBUILD_UNIT_TESTS=OFF",
                     "-DENABLE_CUTE_DSL=OFF", *platform_cmake_args
@@ -390,11 +394,89 @@ def _cleanup(remote: Any, path: PurePosixPath, logger: Any) -> None:
         logger.warning("Could not clean run-host workspace: %s", error)
 
 
-def _build(config: Config, code: Any) -> Any:
-    run_result = code.plan_and_execute(build_targets(config))
+# TODO(devtoolkit): replace this with a public CodeManager host-native
+# source-build mode and a public API that renders the component build command.
+def _native_build_command(target: ArtifactTarget) -> str:
+    build = target.build
+    if not build.repo_path or not build.build_dir or not build.trt_package_dir:
+        raise FlowError("Native EdgeLLM build target is incomplete")
+    arch = parse_arch(target.platform.arch)
+    cuda_version = target.platform.cuda_version or arch.default_cuda_version
+    configure = [
+        "cmake",
+        build.repo_path,
+        f"-DTRT_PACKAGE_DIR={build.trt_package_dir}",
+        f"-DCUDA_CTK_VERSION={cuda_version}",
+        "-DBUILD_UNIT_TESTS=ON",
+        f"-DCMAKE_BUILD_TYPE={BuildMode(target.mode).capitalized}",
+        *build.cmake_args,
+    ]
+    make = [
+        "make", f"-j{build.parallel_jobs or 1}", *build.targets,
+        *build.make_args
+    ]
+    return "\n".join([
+        "set -euo pipefail", f"mkdir -p {shlex.quote(build.build_dir)}",
+        f"cd {shlex.quote(build.build_dir)}",
+        shlex.join(configure),
+        shlex.join(make)
+    ])
+
+
+def _build_locally(commands: Any, target: Any, edge: ArtifactTarget,
+                   run_result: Any) -> Any:
+    edge = dataclasses.replace(
+        edge,
+        platform=dataclasses.replace(
+            edge.platform,
+            cuda_version=edge.platform.arch.default_cuda_version,
+            ubuntu_version="24.04",
+        ),
+    )
+    result = commands.run(
+        target,
+        CommandSpec(
+            name="Build EdgeLLM on host",
+            command=_native_build_command(edge),
+            shell_type=ShellType.BASH,
+            cwd=edge.build.repo_path,
+            timeout_s=_TEST_TIMEOUT_S,
+            output_mode=OutputMode.PROGRESS,
+            artifact_log_file=edge.build.log_file,
+            operation_name="native-edgellm-build",
+        ))
+    if not result.success:
+        raise FlowError("Native EdgeLLM build failed", _status(result))
+    if run_result.plan is None:
+        raise FlowError("CodeManager result is missing its execution plan")
+    step_id = "native-edgellm"
+    artifacts = dict(run_result.step_artifacts)
+    artifacts[step_id] = ArtifactResult(
+        success=True,
+        component=BuildComponent.EDGELLM.value,
+        output_dir=edge.build.build_dir,
+        log_file=edge.build.log_file,
+    )
+    plan = dataclasses.replace(
+        run_result.plan,
+        steps=[
+            *run_result.plan.steps,
+            PlanStep(step_id, edge, BuildComponent.EDGELLM),
+        ],
+    )
+    return dataclasses.replace(run_result, step_artifacts=artifacts, plan=plan)
+
+
+def _build(config: Config, code: Any, build_target: Any) -> Any:
+    targets = build_targets(config)
+    run_result = code.plan_and_execute(
+        targets[:1] if config.build_locally else targets)
     if not run_result.success:
         raise FlowError("CodeManager build failed: " +
                         "; ".join(run_result.error_messages))
+    if config.build_locally:
+        return _build_locally(code.command_manager, build_target, targets[1],
+                              run_result)
     return run_result
 
 
@@ -628,6 +710,11 @@ def _parser() -> argparse.ArgumentParser:
         "run_host",
         help="inline JSON object or JSON file path for the run host")
     parser.add_argument(
+        "--build-locally",
+        action="store_true",
+        help="build EdgeLLM through CommandManager on the build host",
+    )
+    parser.add_argument(
         "--download_onnx",
         action="store_true",
         help="download checkpoints and export configured ONNX models (x86 only)"
@@ -656,6 +743,7 @@ def _config(args: argparse.Namespace) -> Config:
             os.environ.get("TRT_CI_ONNX_DIR", str(_DEFAULT_ONNX_ROOT))),
         jobs=jobs,
         download_onnx=args.download_onnx,
+        build_locally=args.build_locally,
     )
     config.validate()
     return config
@@ -713,7 +801,7 @@ def main(argv: list[str] | None = None) -> int:
         enable_high_core_auto=False,
     )
     try:
-        run_result = _build(config, code)
+        run_result = _build(config, code, build_host.target)
         runtime = _deploy(config, code, run_host, run_result)
         _download_onnx(config, commands, runtime.target)
         status = _run_tests(config, code, run_host, run_result, runtime,

@@ -29,10 +29,17 @@ an optional nested `jump_host` object uses the same fields. The script builds
 devtoolkit `RemoteConfig` objects directly and never queries the target registry
 or resolves OpenSSH aliases.
 
-The Edge-LLM source-build target sets CodeManager's `no_nvidia_runtime` flag.
-Consequently, the controller may be a CPU-only local build host while the run
-host supplies the GPU. Passwords should be passed in protected JSON files in CI;
-an empty password selects SSH key authentication.
+The default Edge-LLM source-build target sets CodeManager's
+`no_nvidia_runtime` flag. Consequently, the controller may be a CPU-only
+local build host while the run host supplies the GPU. Passwords should be
+passed in protected JSON files in CI; an empty password selects SSH key
+authentication.
+
+`--build-locally` uses CommandManager to execute the same Edge-LLM CMake/make
+configuration on the selected build host without a build container. The script
+adds the native result to the CodeManager run result so deployment remains
+toolkit-owned. It requires the host compiler, CMake, CUDA, and any target
+cross-toolchain to be preinstalled; x86 test execution is unchanged.
 
 TRT is passed unchanged as a CodeManager `PRE_BUILT` build dependency usable
 as Edge-LLM `TRT_PACKAGE_DIR`. D7L deployment omits build-only static archives

@@ -164,8 +164,16 @@ class FakeCode:
         self.build_calls.append(targets)
         self.events.append("code:build")
         if self.build_result.success:
-            edge = next(t for t in targets
-                        if t.component is BuildComponent.EDGELLM)
+            edge = next(
+                (t for t in targets if t.component is BuildComponent.EDGELLM),
+                None)
+            if edge is None:
+                trt = next(t for t in targets
+                           if t.component is BuildComponent.TRT)
+                self.build_result.plan = Plan(
+                    run_id="fake-run",
+                    steps=[PlanStep("trt", trt, BuildComponent.TRT)])
+                return self.build_result
             edge = dataclasses.replace(edge,
                                        platform=dataclasses.replace(
                                            edge.platform,
@@ -238,7 +246,8 @@ def _main_harness(monkeypatch,
                   build_remote,
                   run_remote,
                   architecture=Arch.X86_64,
-                  download_onnx=False):
+                  download_onnx=False,
+                  build_locally=False):
     monkeypatch.setenv("TRT_CI_ARTIFACTS_DIR", str(tmp_path / "artifacts"))
     monkeypatch.setenv("TRT_CI_BRANCH", "rel-ci-test")
     monkeypatch.setenv("TRT_CI_ONNX_DIR", "/models/onnx")
@@ -256,7 +265,8 @@ def _main_harness(monkeypatch,
                        "rel-ci-test",
                        PurePosixPath("/models/onnx"),
                        7,
-                       download_onnx=download_onnx)
+                       download_onnx=download_onnx,
+                       build_locally=build_locally)
     events = []
     commands = FakeCommands(events)
     build_rcm = (_remote(build_connection, config, "build", events)
@@ -309,6 +319,8 @@ def _main_harness(monkeypatch,
     ]
     if download_onnx:
         argv.append("--download_onnx")
+    if build_locally:
+        argv.append("--build-locally")
     return SimpleNamespace(argv=argv,
                            config=config,
                            events=events,
@@ -446,6 +458,33 @@ def test_direct_json_target_preserves_jump_host(monkeypatch):
     assert (config.paths.local_path,
             config.paths.remote_path) == ("/tmp/local", "/tmp/remote")
     assert commands.calls == []
+
+
+def test_native_build_uses_command_manager_and_preserves_deployment(
+        monkeypatch, tmp_path):
+    harness = _main_harness(monkeypatch,
+                            tmp_path,
+                            build_remote=True,
+                            run_remote=True,
+                            build_locally=True)
+
+    assert ci.main(harness.argv) == 0
+
+    assert [target.component
+            for target in harness.code.build_calls[0]] == [BuildComponent.TRT]
+    target, spec = next((target, spec)
+                        for target, spec in harness.commands.calls
+                        if spec.operation_name == "native-edgellm-build")
+    assert target is harness.build_host.target
+    assert spec.shell_type.value == "bash"
+    assert "cmake" in spec.command
+    assert "make -j7" in spec.command
+    assert "TRT_PACKAGE_DIR=/candidate TRT/package" in spec.command
+    deployed = harness.code.deploy_calls[0][0]
+    assert any(step.component is BuildComponent.EDGELLM
+               for step in deployed.plan.steps)
+    native_index = harness.events.index("command:native-edgellm-build")
+    assert "container:resolve" not in harness.events[:native_index]
 
 
 @pytest.mark.parametrize(

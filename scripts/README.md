@@ -43,6 +43,8 @@ python3 scripts/run_trt_dependency_ci.py \
   /path/to/run-host.json
 ```
 
+Append `--build-locally` to build Edge-LLM natively on the selected build host.
+
 Each host argument may be an inline JSON object or a JSON file.
 
 Local host:
@@ -92,15 +94,25 @@ is passed unchanged to CodeManager as a `PRE_BUILT` artifact usable as
 build, the checkout and TRT package must be visible at the same absolute paths
 on the controller and build host.
 
+Pass `--build-locally` to run Edge-LLM's CMake and make steps through
+devtoolkit `CommandManager` on the selected build host instead of launching a
+build container. CodeManager still records the TRT `PRE_BUILT` artifact and
+deploys the resulting native Edge-LLM artifact. The native build host must
+already provide the required compiler, CMake, CUDA toolkit, and cross-toolchain
+when applicable. This option changes only the build; x86 test execution remains
+containerized.
+
 One controller process owns the flow; there is no hidden worker or script
 self-invocation:
 
-1. `CodeManager.plan_and_execute()` binds TRT and builds the current Edge-LLM
-   checkout on the build target through `ContainerManager`. The checkout and
-   TRT package must be visible at the same absolute paths on a remote build
-   host.
-2. The build target's container explicitly
-   disables the NVIDIA runtime, so a local build host does not need a GPU.
+1. `CodeManager.plan_and_execute()` binds TRT. By default it builds the
+   current Edge-LLM checkout through `ContainerManager`; `--build-locally`
+   runs the CMake/make build through `CommandManager` on the build target.
+   The checkout and TRT package must be visible at the same absolute paths on a
+   remote build host.
+2. The default build container explicitly disables the NVIDIA runtime, so a
+   containerized local build host does not need a GPU. A native build instead
+   uses its preinstalled host toolchain.
 3. `RemoteConnectionManager` supplies direct JSON-configured SSH targets and
    CodeManager's deployment transport. A remote run uses
    `CodeManager.deploy_runtime()`; x86 requests direct rsync, while D7L lets
