@@ -107,7 +107,6 @@ class F16MoeGroupedGemmBlackwell:
                 "Blackwell grouped GEMM requires SMEM tensor-map updates")
 
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
-        self.num_experts = 128
         self.use_2cta_instrs = use_2cta_instrs
         self.cluster_shape_mn = cluster_shape_mn
         # K dimension is deferred in _setup_attributes
@@ -294,13 +293,15 @@ class F16MoeGroupedGemmBlackwell:
         :type initial_b: cute.Tensor
         :param initial_d: Initial tensor D, used for data type and majorness information.
         :type initial_d: cute.Tensor
-        :param group_count: Runtime ABI value. Version one requires 128 groups.
+        :param group_count: Runtime ABI value: the actual expert count. The
+            cubin is runtime-polymorphic in this dimension; callers bound it
+            by export_common.MAX_NUM_EXPERTS (descriptor trace sizing).
         :type group_count: cutlass.Int32
-        :param problem_shapes: Device tensor ``[128, 4]`` containing (M, N, K, L).
+        :param problem_shapes: Device tensor ``[MAX_NUM_EXPERTS, 4]`` containing (M, N, K, L).
         :type problem_shapes: cute.Tensor
-        :param strides: Device tensor ``[128, 3, 2]`` containing A/B/D strides.
+        :param strides: Device tensor ``[MAX_NUM_EXPERTS, 3, 2]`` containing A/B/D strides.
         :type strides: cute.Tensor
-        :param addresses: Device tensor ``[128, 3]`` containing A/B/D addresses.
+        :param addresses: Device tensor ``[MAX_NUM_EXPERTS, 3]`` containing A/B/D addresses.
         :type addresses: cute.Tensor
         :param tensormap_scratch: Device tensor ``[max_active_clusters, 3, 128]``
             of UInt8 values used for per-CTA tensor-map descriptors.
@@ -752,7 +753,7 @@ class F16MoeGroupedGemmBlackwell:
             grid_dim,
             self.cluster_tile_shape_mnk,
             utils.create_initial_search_state(),
-            self.num_experts,
+            group_count,
             problem_sizes_mnkl,
         )
         initial_work_tile_info = tile_sched.initial_work_tile_info()

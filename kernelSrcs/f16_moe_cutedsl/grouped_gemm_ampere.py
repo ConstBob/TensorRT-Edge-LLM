@@ -52,11 +52,7 @@ class F16MoeGroupedGemmAmpere(GemmAmpereFP16):
     Ampere-family target, including devices with a 100-KiB block limit.
     """
 
-    def __init__(self, num_experts: int = 128):
-        if num_experts != 128:
-            raise ValueError(
-                f"F16MoeGroupedGemmAmpere requires 128 experts, got {num_experts}"
-            )
+    def __init__(self):
         super().__init__(
             ab_dtype=cutlass.Float16,
             c_dtype=cutlass.Float16,
@@ -65,7 +61,6 @@ class F16MoeGroupedGemmAmpere(GemmAmpereFP16):
             num_stages=3,
             atom_layout_mnk=(1, 4, 1),
         )
-        self.num_experts = num_experts
 
     @cute.jit
     def __call__(
@@ -231,7 +226,7 @@ class F16MoeGroupedGemmAmpere(GemmAmpereFP16):
             cute.arch.grid_dim(),
             self.cta_tiler,
             utils.create_initial_search_state(),
-            self.num_experts,
+            group_count,
             problem_shapes,
         )
         work_tile = tile_sched.initial_work_tile_info()

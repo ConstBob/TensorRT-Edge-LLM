@@ -92,24 +92,24 @@ def export_grouped_gemm(args: argparse.Namespace) -> tuple[str, str]:
             )
             problem_shapes = cute.make_tensor(
                 problem_shapes_ptr,
-                layout=cute.make_layout((export_common.NUM_EXPERTS, 4),
+                layout=cute.make_layout((export_common.MAX_NUM_EXPERTS, 4),
                                         stride=(4, 1)),
             )
             strides = cute.make_tensor(
                 strides_ptr,
-                layout=cute.make_layout((export_common.NUM_EXPERTS, 3, 2),
+                layout=cute.make_layout((export_common.MAX_NUM_EXPERTS, 3, 2),
                                         stride=(6, 2, 1)),
             )
             addresses = cute.make_tensor(
                 addresses_ptr,
-                layout=cute.make_layout((export_common.NUM_EXPERTS, 3),
+                layout=cute.make_layout((export_common.MAX_NUM_EXPERTS, 3),
                                         stride=(3, 1)),
             )
             scratch = cute.make_tensor(
                 cute.recast_ptr(scratch_ptr, dtype=cutlass.Uint8),
                 layout=cute.make_layout(
                     (
-                        export_common.NUM_EXPERTS,
+                        export_common.MAX_NUM_EXPERTS,
                         export_common.TENSORMAPS_PER_BLOCK,
                         export_common.BYTES_PER_TENSORMAP,
                     ),
@@ -150,15 +150,15 @@ def export_grouped_gemm(args: argparse.Namespace) -> tuple[str, str]:
         "d":
         cupy.zeros((128, 128), dtype=cupy.float16),
         "problem_shapes":
-        cupy.zeros((export_common.NUM_EXPERTS, 4), dtype=cupy.int32),
+        cupy.zeros((export_common.MAX_NUM_EXPERTS, 4), dtype=cupy.int32),
         "strides":
-        cupy.zeros((export_common.NUM_EXPERTS, 3, 2), dtype=cupy.int32),
+        cupy.zeros((export_common.MAX_NUM_EXPERTS, 3, 2), dtype=cupy.int32),
         "addresses":
-        cupy.zeros((export_common.NUM_EXPERTS, 3), dtype=cupy.int64),
+        cupy.zeros((export_common.MAX_NUM_EXPERTS, 3), dtype=cupy.int64),
         "scratch":
         cupy.zeros(
             (
-                export_common.NUM_EXPERTS,
+                export_common.MAX_NUM_EXPERTS,
                 export_common.TENSORMAPS_PER_BLOCK,
                 export_common.BYTES_PER_TENSORMAP,
             ),
@@ -209,7 +209,7 @@ def export_grouped_gemm(args: argparse.Namespace) -> tuple[str, str]:
         128,
         128,
         128,
-        export_common.NUM_EXPERTS,
+        export_common.MAX_NUM_EXPERTS,
         max_active_clusters,
         stream,
     )

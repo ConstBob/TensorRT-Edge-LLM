@@ -242,7 +242,7 @@ bool CuteDslF16MoeRunner::canImplement(int32_t hiddenSize, int32_t moeInterSize,
 #if defined(CUTE_DSL_F16_MOE_BLACKWELL_GEFORCE_ENABLED)
     architectureAvailable = architectureAvailable || isBlackwellGeforceSm(smVersion);
 #endif
-    return architectureAvailable && smVersion == kARTIFACT_SM && numExperts == kCompiledNumExperts && topK > 0
+    return architectureAvailable && smVersion == kARTIFACT_SM && isSupportedNumExperts(numExperts) && topK > 0
         && topK <= kMaxTopK && hiddenSize > 0 && hiddenSize % kHiddenSizeAlignment == 0 && moeInterSize > 0
         && moeInterSize % kInterSizeAlignment == 0 && fc1N <= std::numeric_limits<int32_t>::max()
         && fc1N % kFc1NAlignment == 0 && (activationType == kACT_SWIGLU || activationType == kACT_RELU2);

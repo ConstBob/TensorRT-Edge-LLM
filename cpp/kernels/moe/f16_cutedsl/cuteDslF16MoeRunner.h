@@ -71,10 +71,26 @@ class CuteDslF16MoeRunner
 {
 public:
     static constexpr int32_t kFc1NAlignment{128};
-    static constexpr int32_t kCompiledNumExperts{128};
+    //! Expert count is a runtime kernel argument (group_count); the runner
+    //! restricts it to this set, capped by export_common.MAX_NUM_EXPERTS.
+    static constexpr int32_t kMaxNumExperts{256};
+    static constexpr int32_t kSupportedNumExperts[] = {128, 256};
     static constexpr int32_t kMaxTopK{8};
     static constexpr int32_t kHiddenSizeAlignment{128};
     static constexpr int32_t kInterSizeAlignment{64};
+
+    //! True iff numExperts is one of the product-supported expert counts.
+    static constexpr bool isSupportedNumExperts(int32_t numExperts)
+    {
+        for (int32_t supported : kSupportedNumExperts)
+        {
+            if (numExperts == supported)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
 
     CuteDslF16MoeRunner() = delete;
 

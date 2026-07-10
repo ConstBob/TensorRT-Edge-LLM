@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import pathlib
 
-NUM_EXPERTS = 128
+# Max expert count: sizes the AOT trace buffers and caps the persistent grid.
+# Not baked into the cubin -- the runtime group_count argument carries E.
+MAX_NUM_EXPERTS = 256
 DESCRIPTOR_ALIGNMENT = 16
 TENSORMAP_ALIGNMENT = 128
 BYTES_PER_TENSORMAP = 128
@@ -35,12 +37,12 @@ def get_max_active_clusters(family: str) -> int:
         # Ampere does not support CTA clusters; querying cluster occupancy
         # returns CUDA_ERROR_INVALID_CLUSTER_SIZE. The grouped scheduler uses
         # an ordinary one-CTA-per-SM persistent grid on this family.
-        return min(NUM_EXPERTS,
+        return min(MAX_NUM_EXPERTS,
                    hardware_info.get_device_multiprocessor_count())
     if family not in ("blackwell", "blackwell_geforce"):
         raise ValueError(f"Unsupported f16_moe family: {family}")
     return min(
-        NUM_EXPERTS,
+        MAX_NUM_EXPERTS,
         hardware_info.get_max_active_clusters(1),
     )
 
