@@ -83,7 +83,7 @@ constexpr int32_t kACT_RELU2{4};
 #endif
 constexpr int32_t kARTIFACT_SM{CUTE_DSL_F16_MOE_ARTIFACT_SM};
 constexpr size_t kDEVICE_ALIGNMENT{256};
-constexpr int32_t kMAX_PERSISTENT_BLOCKS{128};
+constexpr int32_t kMAX_PERSISTENT_BLOCKS{256};
 constexpr int32_t kTENSORMAPS_PER_BLOCK{3};
 constexpr int32_t kBYTES_PER_TENSORMAP{128};
 constexpr size_t kPROBLEM_SHAPE_VALUES_PER_EXPERT{4};

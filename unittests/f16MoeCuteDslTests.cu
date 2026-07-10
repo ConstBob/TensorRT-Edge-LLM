@@ -329,8 +329,8 @@ void validateRoutingCase(int32_t numTokens, int32_t topK, int32_t numExperts)
     constexpr int32_t kSTRIDE_VALUES_PER_EXPERT{6};
     constexpr int32_t kADDRESS_VALUES_PER_EXPERT{3};
     int32_t const routedRows = numTokens * topK;
-    SCOPED_TRACE(::testing::Message() << "numTokens=" << numTokens << ", topK=" << topK
-                                      << ", numExperts=" << numExperts);
+    SCOPED_TRACE(
+        ::testing::Message() << "numTokens=" << numTokens << ", topK=" << topK << ", numExperts=" << numExperts);
 
     std::vector<int32_t> topkIdsHost(routedRows);
     std::vector<int32_t> expectedCounts(numExperts, 0);

@@ -59,21 +59,7 @@ constexpr char const* kPLUGIN_NAME{"Fp16MoePlugin"};
 constexpr char const* kPLUGIN_VERSION{"1"};
 constexpr int32_t kACT_SWIGLU{2};
 constexpr int32_t kACT_RELU2{4};
-//! Keep in sync with CuteDslF16MoeRunner::kSupportedNumExperts.
-constexpr int32_t kSUPPORTED_NUM_EXPERTS[] = {128, 256};
 constexpr int32_t kMAX_TOP_K{8};
-
-constexpr bool isSupportedNumExperts(int32_t numExperts)
-{
-    for (int32_t supported : kSUPPORTED_NUM_EXPERTS)
-    {
-        if (numExperts == supported)
-        {
-            return true;
-        }
-    }
-    return false;
-}
 constexpr int32_t kROW_ALIGNMENT{128};
 constexpr int32_t kINTER_ALIGNMENT{64};
 
@@ -114,9 +100,9 @@ int32_t getRequiredIntField(PluginFieldCollection const* fields, char const* nam
 void validateAttributes(int32_t numExperts, int32_t topK, int32_t hiddenSize, int32_t moeInterSize,
     int32_t activationType, int32_t normTopkProb, int32_t maxRoutedRows)
 {
-    if (!isSupportedNumExperts(numExperts))
+    if (numExperts <= 0)
     {
-        throw std::invalid_argument("Fp16MoePlugin: num_experts must be one of {128, 256}");
+        throw std::invalid_argument("Fp16MoePlugin: num_experts must be > 0");
     }
     if (topK <= 0 || topK > kMAX_TOP_K)
     {
@@ -345,7 +331,8 @@ int32_t Fp16MoePlugin::configurePlugin(DynamicPluginTensorDesc const* inputs, in
         }
         if (!validateTokenShape(inputs[kIN_ROUTER_LOGITS].min, inputs[kIN_HIDDEN_STATES].min, mNumExperts, "minimum")
             || !validateTokenShape(inputs[kIN_ROUTER_LOGITS].opt, inputs[kIN_HIDDEN_STATES].opt, mNumExperts, "optimum")
-            || !validateTokenShape(inputs[kIN_ROUTER_LOGITS].max, inputs[kIN_HIDDEN_STATES].max, mNumExperts, "maximum"))
+            || !validateTokenShape(
+                inputs[kIN_ROUTER_LOGITS].max, inputs[kIN_HIDDEN_STATES].max, mNumExperts, "maximum"))
         {
             return -1;
         }
