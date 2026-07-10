@@ -480,8 +480,7 @@ def _fix_initializer_dtypes(
 
        Initializers whose name contains any substring in
        ``preserve_fp32_patterns`` are kept FP32.  This is how a model opts
-       out of the downgrade for weights that must stay FP32 (e.g.
-       CodePredictor's ``down_proj``, see ``_DownProjFP32``). Some
+       out of the downgrade for weights that must stay FP32.  Some
        ``torch.export`` initializers are anonymous, so selected models can
        additionally request MatMul initializer dtype matching when the other
        input is known to be FP32.

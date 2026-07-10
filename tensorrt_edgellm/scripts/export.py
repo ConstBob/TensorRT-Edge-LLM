@@ -1857,13 +1857,25 @@ def _export_code_predictor(model_dir: str, cp_out_dir: str,
     os.makedirs(cp_out_dir, exist_ok=True)
     output_path = os.path.join(cp_out_dir, "model.onnx")
 
-    # Build CodePredictor config from the checkpoint's code_predictor sub-config
+    # ``code_predictor_config`` lives at either root.talker_config.* (full Omni
+    # HF root) or root.* (Talker-only submodule export). Support both.
     root_config = _load_config(model_dir)
     talker_cfg = root_config.get("talker_config", {})
     cp_cfg = talker_cfg.get("code_predictor_config", {})
+    talker_is_root = False
     if not cp_cfg.get("hidden_size"):
-        logger.error("code_predictor_config not found in talker_config")
+        cp_cfg = root_config.get("code_predictor_config", {})
+        talker_cfg = root_config
+        talker_is_root = bool(cp_cfg.get("hidden_size"))
+    if not cp_cfg.get("hidden_size"):
+        logger.error(
+            "code_predictor_config not found in %s/config.json (checked both "
+            "talker_config.code_predictor_config and top-level "
+            "code_predictor_config)", model_dir)
         sys.exit(1)
+    # Match either the full-Omni-root prefix or the Talker-only prefix.
+    load_key_prefix = ("code_predictor."
+                       if talker_is_root else "talker.code_predictor.")
 
     # Write a temporary config.json for the CodePredictor so ModelConfig can
     # parse it.  The CP sub-config is a valid standalone Qwen3 config.
@@ -1877,33 +1889,57 @@ def _export_code_predictor(model_dir: str, cp_out_dir: str,
                 dst = os.path.join(tmp_dir, fname)
                 if not os.path.exists(dst):
                     os.symlink(src, dst)
+        # Rewrite ``hf_quant_config.json`` into the CP-relative namespace:
+        # strip the CP subtree prefix from exclude entries and drop everything
+        # outside CP so ``make_linear`` in the standalone graph resolves.
+        hf_quant_src = os.path.join(model_dir, "hf_quant_config.json")
+        cp_only_excludes: list = []
+        if os.path.exists(hf_quant_src):
+            with open(hf_quant_src) as f:
+                hf_q = json.load(f)
+            q = hf_q.get("quantization", {})
+            # Strip either the full-Omni CP prefix or the Talker-only CP
+            # prefix; drop entries outside the CP subtree (Talker body,
+            # Thinker, code2wav — none exist inside the standalone CP graph).
+            cp_prefix = load_key_prefix
+            for ex in q.get("exclude_modules", []):
+                if ex.startswith(cp_prefix):
+                    cp_only_excludes.append(ex[len(cp_prefix):])
+            q["exclude_modules"] = cp_only_excludes
+            hf_q["quantization"] = q
+            with open(os.path.join(tmp_dir, "hf_quant_config.json"), "w") as f:
+                json.dump(hf_q, f, indent=2)
         # Write the CP config
         tmp_cfg_path = os.path.join(tmp_dir, "config.json")
         with open(tmp_cfg_path, "w") as f:
             json.dump(cp_cfg, f)
 
+        from ..config import _normalize_module_name
         from ..model import load_model_config
         config = load_model_config(tmp_dir)
+
+    # ``_parse_quant`` auto-detects unquantized weights from the whole
+    # checkpoint. Post-normalization those thinker/encoder module names
+    # collide with CP paths and force every CP Linear to FP16. Overwrite
+    # ``excluded`` with only the CP-scoped entries.
+    if config.quant is not None:
+        config.quant.excluded = [
+            _normalize_module_name(ex) for ex in cp_only_excludes
+        ]
 
     # Override model_type for runtime identification
     config.model_type = _CP_RUNTIME_MODEL_TYPE.get(model_type,
                                                    "qwen3_tts_code_predictor")
 
-    # Create CodePredictorCausalLM and load weights
-    from ..models.qwen3_tts import (CodePredictorCausalLM,
-                                    apply_code_predictor_mlp_war)
-
+    # CP's MLP path is the same for FP16 and FP8: FP32 silu*up + FP32
+    # down_proj matmul.  down_proj is always FP16Linear (excluded from FP8
+    # quant by ``FP8_CP``), so the FP32 matmul is safe in either mode.
+    from ..models.qwen3_tts import CodePredictorCausalLM
     model = CodePredictorCausalLM(config)
     model.to("cpu")
 
     from ..checkpoint.loader import load_weights
-    load_weights(model,
-                 model_dir,
-                 device="cpu",
-                 key_prefix="talker.code_predictor.")
-
-    # Apply MLP FP16 overflow WAR
-    apply_code_predictor_mlp_war(model)
+    load_weights(model, model_dir, device="cpu", key_prefix=load_key_prefix)
 
     logger.info("[CodePredictor] Exporting ONNX to %s", output_path)
     try:
@@ -1913,9 +1949,16 @@ def _export_code_predictor(model_dir: str, cp_out_dir: str,
         logger.exception("[CodePredictor] ONNX export failed")
         raise SystemExit(1) from exc
 
+    # ``torch.onnx.export`` drops ``axis=0`` from per-channel DequantizeLinear
+    # nodes → TRT engine build fails with ``K == scaleSize``. Restore it.
+    _patch_cp_dq_axis(output_path)
+
     # Extract CodePredictor-specific weight files
     logger.info("[CodePredictor] Extracting weight files ...")
-    _extract_code_predictor_weights(model_dir, cp_out_dir, talker_cfg)
+    _extract_code_predictor_weights(model_dir,
+                                    cp_out_dir,
+                                    talker_cfg,
+                                    key_prefix=load_key_prefix)
 
     # Patch config.json with use_embeddings_input and num_code_groups
     cfg_path = os.path.join(cp_out_dir, "config.json")
@@ -1935,19 +1978,79 @@ def _export_code_predictor(model_dir: str, cp_out_dir: str,
     logger.info("[CodePredictor] Done: %s", output_path)
 
 
+def _patch_cp_dq_axis(onnx_path: str) -> None:
+    """Restore ``axis=0`` on per-channel DequantizeLinear nodes.
+
+    ``torch.onnx.export`` (dynamo, opset 24) silently drops the ``axis``
+    attribute that ModelOpt configures via ``axis=0`` on the weight
+    quantizer. The result is that every per-channel DQ node defaults to
+    axis=1 at import time, and TRT then fails engine build with
+    ``K == scaleSize`` because it interprets the scale vector along the
+    wrong dim.
+
+    Set ``axis=0`` on every DQ node whose scale initializer is 1-D and
+    matches the FIRST dim of the weight initializer (ModelOpt's ``axis=0``
+    convention for ``[out_features, in_features]`` layout). Per-tensor
+    (scalar) DQ nodes are left alone.
+    """
+    import onnx
+    from onnx import helper
+
+    m = onnx.load(onnx_path, load_external_data=False)
+    inits = {i.name: i for i in m.graph.initializer}
+    patched = 0
+    for n in m.graph.node:
+        if n.op_type != "DequantizeLinear" or len(n.input) < 2:
+            continue
+        weight, scale = n.input[0], n.input[1]
+        if weight not in inits or scale not in inits:
+            continue
+        s_dims = list(inits[scale].dims)
+        if len(s_dims) == 0 or (len(s_dims) == 1 and s_dims[0] == 1):
+            continue  # per-tensor
+        if len(s_dims) != 1:
+            continue
+        w_dims = list(inits[weight].dims)
+        if not w_dims or s_dims[0] != w_dims[0]:
+            continue
+        existing = [a for a in n.attribute if a.name == "axis"]
+        if existing:
+            if existing[0].i != 0:
+                existing[0].i = 0
+                patched += 1
+            continue
+        n.attribute.append(helper.make_attribute("axis", 0))
+        patched += 1
+    if patched:
+        onnx.save(m,
+                  onnx_path,
+                  save_as_external_data=True,
+                  all_tensors_to_one_file=True,
+                  location=os.path.basename(onnx_path) + ".data",
+                  size_threshold=1024)
+        logger.info(
+            "[CodePredictor] Patched axis=0 on %d DequantizeLinear nodes",
+            patched)
+
+
 def _extract_code_predictor_weights(model_dir: str, out_dir: str,
-                                    talker_cfg: dict) -> None:
-    """Extract codec_embeddings, lm_heads, and small_to_mtp_projection."""
+                                    talker_cfg: dict, key_prefix: str) -> None:
+    """Extract codec_embeddings, lm_heads, and small_to_mtp_projection.
+
+    ``key_prefix`` is either ``talker.code_predictor.`` (full-Omni HF root
+    layout) or ``code_predictor.`` (Talker-only submodule layout produced by
+    ``qwen3_omni._export_submodel`` for MoE CP-only exports).
+    """
     from safetensors.torch import save_file
 
     weights = _load_all_weights(model_dir)
 
-    # codec_embeddings: talker.code_predictor.model.codec_embedding.{i}.weight
+    # codec_embeddings: <prefix>model.codec_embedding.{i}.weight
     num_code_groups = talker_cfg.get("num_code_groups", 16)
     num_embeddings = num_code_groups - 1  # 15 for TTS (16-1=15)
     embedding_dict = {}
     for i in range(num_embeddings):
-        key = f"talker.code_predictor.model.codec_embedding.{i}.weight"
+        key = f"{key_prefix}model.codec_embedding.{i}.weight"
         if key not in weights:
             logger.error("Key %r not found in checkpoint", key)
             sys.exit(1)
@@ -1959,10 +2062,10 @@ def _extract_code_predictor_weights(model_dir: str, out_dir: str,
         "(%d embeddings, shape %s)", num_embeddings,
         list(embedding_dict["embedding_0"].shape))
 
-    # lm_heads: talker.code_predictor.lm_head.{i}.weight
+    # lm_heads: <prefix>lm_head.{i}.weight
     lm_head_dict = {}
     for i in range(num_embeddings):
-        key = f"talker.code_predictor.lm_head.{i}.weight"
+        key = f"{key_prefix}lm_head.{i}.weight"
         if key not in weights:
             logger.error("Key %r not found in checkpoint", key)
             sys.exit(1)
@@ -1974,9 +2077,9 @@ def _extract_code_predictor_weights(model_dir: str, out_dir: str,
         "(%d heads, shape %s)", num_embeddings,
         list(lm_head_dict["lm_head_0.weight"].shape))
 
-    # small_to_mtp_projection: talker.code_predictor.small_to_mtp_projection
-    proj_w_key = "talker.code_predictor.small_to_mtp_projection.weight"
-    proj_b_key = "talker.code_predictor.small_to_mtp_projection.bias"
+    # small_to_mtp_projection: <prefix>small_to_mtp_projection.{weight,bias}
+    proj_w_key = f"{key_prefix}small_to_mtp_projection.weight"
+    proj_b_key = f"{key_prefix}small_to_mtp_projection.bias"
     proj_dict = {}
     if proj_w_key in weights:
         proj_dict["weight"] = weights[proj_w_key].cpu()

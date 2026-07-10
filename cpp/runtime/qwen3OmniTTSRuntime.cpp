@@ -1203,7 +1203,11 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
 
     SamplingParams talkerSamplingParams(
         activeBatchSize, mTalkerConfig.talkerVocabSize, talkerTemperature, talkerTopK, talkerTopP);
-    SamplingParams predictorSamplingParams(1, mTalkerConfig.codebookSize, talkerTemperature, talkerTopK, talkerTopP);
+    // CP sampling params come from HF's hardcoded ``code_predictor.generate``
+    // defaults; see ``kCPSamplingTemperature`` / ``kCPSamplingTopK`` /
+    // ``kCPSamplingTopP`` in qwen3OmniTTSRuntime.h for the source-code links.
+    SamplingParams predictorSamplingParams(
+        1, mTalkerConfig.codebookSize, kCPSamplingTemperature, kCPSamplingTopK, kCPSamplingTopP);
     SamplingParams singleSamplingParams(1, mTalkerConfig.talkerVocabSize, talkerTemperature, talkerTopK, talkerTopP);
 
     // Build per-batch Talker prefill embeddings into mTalkerInputEmbeds, then run a single
@@ -1396,7 +1400,8 @@ bool Qwen3OmniTTSRuntime::handleAudioGenerationFromThinker(
 
     SamplingParams talkerSamplingParams(
         activeBatchSize, mTalkerConfig.talkerVocabSize, talkerTemperature, talkerTopK, talkerTopP);
-    SamplingParams predictorSamplingParams(1, mTalkerConfig.codebookSize, talkerTemperature, talkerTopK, talkerTopP);
+    SamplingParams predictorSamplingParams(
+        1, mTalkerConfig.codebookSize, kCPSamplingTemperature, kCPSamplingTopK, kCPSamplingTopP);
 
     int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
     int64_t const trailingStride = mTalkerConfig.maxSeqLen + 1;
@@ -2461,7 +2466,8 @@ bool Qwen3OmniTTSRuntime::handleStreamingGeneration(LLMInferenceRuntime& thinker
     float const repetitionPenalty = omniBaseRequest.repetitionPenalty;
 
     SamplingParams talkerSamplingParams(1, mTalkerConfig.talkerVocabSize, talkerTemperature, talkerTopK, talkerTopP);
-    SamplingParams predictorSamplingParams(1, mTalkerConfig.codebookSize, talkerTemperature, talkerTopK, talkerTopP);
+    SamplingParams predictorSamplingParams(
+        1, mTalkerConfig.codebookSize, kCPSamplingTemperature, kCPSamplingTopK, kCPSamplingTopP);
 
     int32_t const codecEosId = mTalkerConfig.codecEosId;
     int32_t numSeenTokens = 0;
