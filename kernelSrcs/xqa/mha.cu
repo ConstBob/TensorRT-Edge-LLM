@@ -2231,7 +2231,9 @@ CUBIN_EXPORT __global__
             auto& peerSplitScoreBar = mapa(splitScoreBar, splitRank ^ 1U);
             auto& scoreTile = smem.x[warpIdx.y][warpIdx.x];
             static_assert(sizeof(SharedMem::KSmemBuffer) >= sizeof(SharedMem::XSmemBuffer));
-            auto& scoreHighTile = smem.k[warpIdx.x][0];
+            // Must borrow the free K buffer: the current one may still be receiving the next tile's
+            // async K prefetch (only waitGroup<1> has completed), which the score write would race.
+            auto& scoreHighTile = getSMemKTile(idxCurrSMemKBuf.next());
             storeWarpAccTileFp32(acc, scoreTile, scoreHighTile);
             splitScoreArriveAndWait(splitScoreBar, peerSplitScoreBar, splitScoreBarParityNext);
             acc = acc + loadWarpAccTileFp32(mapa(scoreTile, splitRank ^ 1U), mapa(scoreHighTile, splitRank ^ 1U));

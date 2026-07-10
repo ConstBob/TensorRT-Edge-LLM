@@ -127,6 +127,9 @@ private:
     //! @return true if parsing was successful, false otherwise
     bool parseNemotronOmniAudioConfig();
 
+    //! Parse encoder-free Gemma4 Unified framed-PCM audio configuration.
+    bool parseGemma4UnifiedAudioConfig();
+
     //! Set up optimization profile for audio encoder.
     //! Creates optimization profile with appropriate dynamic shapes for audio inputs.
     //! @param builder TensorRT builder object (must not be null)
@@ -152,6 +155,9 @@ private:
     //! @param profile Optimization profile to configure
     //! @return true if setup was successful, false otherwise
     bool setupGemma4AudioEncoderProfile(nvinfer1::IOptimizationProfile& profile);
+
+    //! Set up Gemma4 Unified input_features [1, num_raw_pcm_frames, 640].
+    bool setupGemma4UnifiedAudioEncoderProfile(nvinfer1::IOptimizationProfile& profile);
 
     //! Set up optimization profile for Code2Wav vocoder.
     //! Creates optimization profile with appropriate dynamic shapes for code inputs.
@@ -180,8 +186,9 @@ private:
 
     // Model-specific configuration extracted from config.json (initialized to 0, must be read)
     // Audio encoder config (from audio_config)
-    int32_t mMelBins{0};    //!< Number of Mel-frequency bins
-    int32_t mNWindowDim{0}; //!< Window dimension for feature tensor (n_window * 2)
+    int32_t mMelBins{0};         //!< Number of Mel-frequency bins
+    int32_t mNWindowDim{0};      //!< Window dimension for feature tensor (n_window * 2)
+    int32_t mAudioFeatureDim{0}; //!< Raw PCM samples per frame for Gemma4 Unified
 
     // Code2Wav config (from code2wav_config)
     int32_t mNumQuantizers{0}; //!< Number of RVQ quantizers

@@ -68,6 +68,8 @@ struct PipelineIO
     Tensor hostContextLengths; //!< CPU (pinned, [maxBatch] INT32)
     Tensor
         hostSelectTokenIndices; //!< CPU (pinned, [maxBatch, 1] INT64) — pairs with selectTokenIndices for H2D staging
+    //! Gemma4 Unified block IDs, [batch, seq_len] INT32; empty for other models.
+    Tensor visionBlockIds;
 
     // Multimodal (resize deepstackEmbeds BEFORE buildTensorMap, never after)
     std::vector<Tensor> deepstackEmbeds;

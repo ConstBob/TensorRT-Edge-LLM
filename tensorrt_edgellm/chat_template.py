@@ -633,6 +633,36 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
                         # where no explicit system message is provided (e.g. the sweep test).
                         user_prefix = system_prefix + system_suffix + user_prefix
 
+        bos_token = getattr(tokenizer, "bos_token", None) or getattr(
+            getattr(tokenizer, "tokenizer", None), "bos_token", None)
+        bos_token = str(bos_token) if bos_token else ""
+        prompt_prefix = ""
+        if bos_token and (system_prefix.startswith(bos_token)
+                          or user_prefix.startswith(bos_token)):
+            prompt_prefix = bos_token
+            if system_prefix.startswith(bos_token):
+                system_prefix = system_prefix[len(bos_token):]
+            if user_prefix.startswith(bos_token):
+                user_prefix = user_prefix[len(bos_token):]
+            if assistant_prefix.startswith(bos_token):
+                assistant_prefix = assistant_prefix[len(bos_token):]
+
+        # Detect whether the template trims message content (e.g. Gemma
+        # applies ``| trim`` to every text item).  Render a user message with
+        # whitespace-padded content: if the padding is stripped from the
+        # output, the C++ renderer must trim too, or prompts whose messages
+        # carry leading/trailing whitespace tokenize differently from HF.
+        trim_content = False
+        try:
+            padded_prompt = UserMessage()
+            padded_prompt.content = "  " + padded_prompt.content + "  "
+            padded_formatted = _format_messages(tokenizer, [padded_prompt])
+            if (padded_prompt.content not in padded_formatted
+                    and padded_prompt.content.strip() in padded_formatted):
+                trim_content = True
+        except Exception:
+            pass
+
         data: Dict[str, Any] = {
             "model_path": model_dir,
             "roles": {
@@ -653,6 +683,10 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
             "generation_prompt": generation_prompt,
             "default_system_prompt": default_system_prompt,
         }
+        if prompt_prefix:
+            data["prompt_prefix"] = prompt_prefix
+        if trim_content:
+            data["trim_content"] = True
         if generation_prompt_thinking is not None:
             data["generation_prompt_thinking"] = generation_prompt_thinking
 

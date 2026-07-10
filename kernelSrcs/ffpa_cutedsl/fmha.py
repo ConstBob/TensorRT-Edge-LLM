@@ -24,7 +24,7 @@ import os
 import sys
 import time
 from types import SimpleNamespace
-from typing import Callable, Tuple, Type
+from typing import Callable, Optional, Tuple, Type
 
 _parsed_args = None
 _saved_argv = None
@@ -77,6 +77,20 @@ cu_k[b]`` and the causal mask is bottom-right aligned with offset
 prefix length for chunked prefill).  Padding K/V positions are never
 attended by valid rows, and padding Q rows are residual-masked in the masked
 steps — fixing the Gemma4 BS>1 NaN corruption (nvbug 6384817) at the source.
+
+Vision-block overlay (Gemma4 Unified): two optional ``(B, S_q)`` Int32
+tensors ``mBlockBegin`` / ``mBlockEnd`` carry, per query row, an extra
+allowed KV interval ``[blockBegin[q], blockEnd[q]]`` (sentinel ``-1`` /
+``-1`` for text rows — the empty interval).  Every image-placeholder run
+gets one contiguous block that contains the row's own diagonal position
+(``blockBegin[q] <= q + offset_b <= blockEnd[q]``), so
+``allow(q, k) = causal(q, k) OR blockBegin[q] <= k <= blockEnd[q]``.  KV
+tiles between the causal diagonal and the Q tile's largest ``blockEnd``
+are additionally visited through the masked path (blocks are short —
+O(hundreds of tokens) past the diagonal — so the extra work is bounded).
+Passing ``None`` for both tensors compiles the overlay away entirely: the
+generated kernel and its AOT C ABI are identical to the plain causal
+variant.
 """
 
 
@@ -163,6 +177,8 @@ class FFPAFmhaAmpere:
         mO: cute.Tensor,
         mCuSeqLenQ: cute.Tensor,
         mCuSeqLenK: cute.Tensor,
+        mBlockBegin: Optional[cute.Tensor],
+        mBlockEnd: Optional[cute.Tensor],
         softmax_scale: cutlass.Float32,
         num_kv_heads: cutlass.Int32,
         stream: cuda.CUstream,
@@ -178,6 +194,11 @@ class FFPAFmhaAmpere:
         module docstring).  For uniform dense batches pass
         ``[0, S, 2S, ...]`` — the masking then degenerates to the padded
         extents.
+
+        ``mBlockBegin`` / ``mBlockEnd`` are optional ``(B, S_q)`` Int32
+        vision-block interval tensors (see module docstring).  Pass ``None``
+        for both to compile the plain causal kernel (unchanged codegen and
+        AOT ABI); pass both to compile the vision-block overlay variant.
 
         ``num_kv_heads`` is the number of K/V heads (``mK``/``mV`` mode-2
         extent).  GQA group size is ``num_head_q / num_kv_heads`` and is
@@ -197,6 +218,14 @@ class FFPAFmhaAmpere:
             )
         ):
             raise TypeError("Only Float16 or BFloat16 is supported")
+        if cutlass.const_expr((mBlockBegin is None) != (mBlockEnd is None)):
+            raise TypeError(
+                "mBlockBegin and mBlockEnd must both be provided or both be None"
+            )
+        if cutlass.const_expr(mBlockBegin is not None and not self._is_causal):
+            raise TypeError(
+                "The vision-block overlay is only defined for the causal variant"
+            )
         self._dtype: Type[cutlass.Numeric] = mQ.element_type
         # ///////////////////////////////////////////////////////////////////////////////
         # Shared memory layout: Q/K/V
@@ -298,6 +327,8 @@ class FFPAFmhaAmpere:
             mO,
             mCuSeqLenQ,
             mCuSeqLenK,
+            mBlockBegin,
+            mBlockEnd,
             softmax_scale_log2,
             num_kv_heads,
             sQ_layout,
@@ -322,6 +353,8 @@ class FFPAFmhaAmpere:
         mO: cute.Tensor,
         mCuSeqLenQ: cute.Tensor,
         mCuSeqLenK: cute.Tensor,
+        mBlockBegin: Optional[cute.Tensor],
+        mBlockEnd: Optional[cute.Tensor],
         softmax_scale_log2: cutlass.Float32,
         num_kv_heads: cutlass.Int32,
         sQ_layout: cute.ComposedLayout,
@@ -378,6 +411,31 @@ class FFPAFmhaAmpere:
         n_block_max = (
             0 if m_block * self._m_block_size >= seqlen_q_b else n_block_max
         )
+        # Vision-block overlay: extend the per-CTA KV upper bound so tiles
+        # covering [.., blockEnd[q]] beyond the causal diagonal are visited.
+        # The bound is the max blockEnd over this Q tile's valid rows; the
+        # extension tiles (extra_mask_steps of them) always take the masked
+        # path since most of their entries lie past the causal limit.  With
+        # no blocks in the tile (blockEnd == -1 everywhere, or a whole-padding
+        # Q tile whose row scan is empty) the extension is exactly zero and
+        # the traversal matches the plain causal kernel.
+        n_block_max_causal = n_block_max
+        extra_mask_steps = 0
+        if cutlass.const_expr(mBlockEnd is not None):
+            block_end_tile_max = cutlass.Int32(-1)
+            row_lo = m_block * self._m_block_size
+            row_hi = cutlass.min(row_lo + self._m_block_size, seqlen_q_b)
+            row_hi = cutlass.max(row_hi, row_lo)
+            for row in cutlass.range(row_lo, row_hi, 1, unroll=1):
+                block_end_tile_max = cutlass.max(
+                    block_end_tile_max, mBlockEnd[batch_size, row]
+                )
+            n_block_ext = cutlass.min(
+                cute.ceil_div(block_end_tile_max + 1, self._n_block_size),
+                cute.ceil_div(seqlen_k_b, self._n_block_size),
+            )
+            n_block_max = cutlass.max(n_block_max, n_block_ext)
+            extra_mask_steps = n_block_max - n_block_max_causal
         n_block = n_block_max - 1
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -587,6 +645,8 @@ class FFPAFmhaAmpere:
             seqlen_q_b=seqlen_q_b,
             seqlen_k_b=seqlen_k_b,
             offset_b=offset_b,
+            mBlockBegin=mBlockBegin,
+            mBlockEnd=mBlockEnd,
         )
         mma_params = SimpleNamespace(
             thr_mma=thr_mma,
@@ -662,8 +722,29 @@ class FFPAFmhaAmpere:
                         in_mask_steps=True,
                     )
 
+        # Vision-block extension tiles: KV tiles between the causal diagonal
+        # and the Q tile's largest blockEnd.  Every one of them needs the
+        # masked path (rows without a block are fully masked there; block
+        # rows are allowed only inside their [blockBegin, blockEnd]
+        # interval).  extra_mask_steps is the compile-time constant 0 when
+        # the overlay is disabled, so this loop vanishes and the traversal
+        # is bit-identical to the plain causal kernel.
+        for n_tile in range(mask_steps, mask_steps + extra_mask_steps, 1):
+            n_block = n_block_max - n_tile - 1
+            basic_params.n_block = n_block
+            if n_block >= 0:
+                self.compute_one_n_block(
+                    basic_params,
+                    mma_params,
+                    gmem_copy_params,
+                    smem_copy_params,
+                    softmax_params,
+                    is_first_n_block=False,
+                    in_mask_steps=True,
+                )
+
         # Remaining K-tiles in reverse order — no k-residue handling needed.
-        for n_tile in range(mask_steps, n_block_max, 1):
+        for n_tile in range(mask_steps + extra_mask_steps, n_block_max, 1):
             n_block = n_block_max - n_tile - 1
             basic_params.n_block = n_block
             self.compute_one_n_block(
@@ -947,9 +1028,39 @@ class FFPAFmhaAmpere:
                 col_idx_limit = (
                     0 if row_idx + 1 > basic_params.seqlen_q_b else col_idx_limit
                 )
-                for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
-                    if cute.elem_less(col_idx_limit, tScS_mn[0, c][3] + 1):
-                        acc_S_mn[r, c] = -cutlass.Float32.inf
+                if cutlass.const_expr(basic_params.mBlockBegin is not None):
+                    # Vision-block overlay: this row's extra allowed KV
+                    # interval.  The 0/-1 default keeps the interval empty
+                    # for padding rows (also guarding the (B, S_q) gather
+                    # against out-of-bounds row indices in residual tiles);
+                    # text rows store the -1/-1 sentinel which is empty for
+                    # the same reason (no key satisfies col <= -1).
+                    block_begin_r = cutlass.Int32(0)
+                    block_end_r = cutlass.Int32(-1)
+                    if row_idx < basic_params.seqlen_q_b:
+                        block_begin_r = basic_params.mBlockBegin[
+                            basic_params.batch_size, row_idx
+                        ]
+                        block_end_r = cutlass.min(
+                            basic_params.mBlockEnd[
+                                basic_params.batch_size, row_idx
+                            ],
+                            basic_params.seqlen_k_b - 1,
+                        )
+                    for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
+                        col_idx = tScS_mn[0, c][3]
+                        # Masked iff past the causal/varlen limit AND outside
+                        # the block interval (two writes for keys outside the
+                        # interval on both compares are harmless).
+                        if cute.elem_less(col_idx_limit, col_idx + 1):
+                            if cute.elem_less(col_idx, block_begin_r):
+                                acc_S_mn[r, c] = -cutlass.Float32.inf
+                            if cute.elem_less(block_end_r, col_idx):
+                                acc_S_mn[r, c] = -cutlass.Float32.inf
+                else:
+                    for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
+                        if cute.elem_less(col_idx_limit, tScS_mn[0, c][3] + 1):
+                            acc_S_mn[r, c] = -cutlass.Float32.inf
 
             acc_S_row = acc_S_mn[r, None].load()
             row_max_cur_row = acc_S_row.reduce(
@@ -1126,6 +1237,22 @@ def _create_bsnd_tensor(
     return t, arr
 
 
+def _create_block_range_tensor(batch_size: int, seqlen: int, fill: int = -1):
+    """(B, S) Int32 vision-block interval tensor (``mBlockBegin`` / ``mBlockEnd``).
+
+    The -1 fill is the text-row sentinel: the ``[begin, end]`` interval is
+    empty, so the kernel degenerates to plain causal masking.  B and S are
+    runtime-dynamic; the row stride is derived from S (compact packing).
+    """
+    arr = cp.full((batch_size, seqlen), fill, dtype=cp.int32)
+    t = from_dlpack(arr, assumed_align=16)
+    so = (0, 1)
+    t = t.mark_compact_shape_dynamic(mode=0, stride_order=so).mark_compact_shape_dynamic(
+        mode=1, stride_order=so
+    )
+    return t, arr
+
+
 def _create_cu_seqlens_tensor(batch_size: int, seqlen: int):
     """(B+1,) Int32 cumulative sequence lengths for uniform per-batch ``seqlen``.
 
@@ -1160,6 +1287,7 @@ def run(
     num_threads: int = 128,
     is_causal: bool = False,
     kv_group_size: int = 1,
+    vision_block: bool = False,
     skip_rescale: bool = True,
     hybrid_exp2: bool = False,
     warmup_iterations: int = 3,
@@ -1174,11 +1302,14 @@ def run(
 ):
     """Compile (+ optionally test/benchmark or export) the FFPA Ampere kernel.
 
-    AOT export uses dummy placeholder shapes; only ``head_dim``, ``is_causal``
-    and the (Br, Bc, threads) tuning are baked at compile time — the rest,
-    including ``num_kv_heads`` (GQA), are runtime-dynamic.  ``kv_group_size``
-    here only selects the dummy ``num_kv_heads = num_head // kv_group_size``
-    used to trace the kernel; it is not baked in.
+    AOT export uses dummy placeholder shapes; only ``head_dim``, ``is_causal``,
+    ``vision_block`` and the (Br, Bc, threads) tuning are baked at compile
+    time — the rest, including ``num_kv_heads`` (GQA), are runtime-dynamic.
+    ``kv_group_size`` here only selects the dummy
+    ``num_kv_heads = num_head // kv_group_size`` used to trace the kernel; it
+    is not baked in.  ``vision_block=True`` compiles the Gemma4 vision-block
+    overlay variant, which adds the two ``(B, S_q)`` Int32 ``mBlockBegin`` /
+    ``mBlockEnd`` tensors to the kernel ABI (see module docstring).
     """
     _tag = f"[{file_name}]"
 
@@ -1237,6 +1368,11 @@ def run(
     )
     cu_q_dyn, cu_q_arr = _create_cu_seqlens_tensor(batch_size, seqlen_q)
     cu_k_dyn, cu_k_arr = _create_cu_seqlens_tensor(batch_size, seqlen_k)
+    block_begin_dyn = None
+    block_end_dyn = None
+    if vision_block:
+        block_begin_dyn, _ = _create_block_range_tensor(batch_size, seqlen_q)
+        block_end_dyn, _ = _create_block_range_tensor(batch_size, seqlen_q)
 
     fa2_fwd = FFPAFmhaAmpere(
         head_dim=head_dim,
@@ -1271,6 +1407,8 @@ def run(
         o_dyn,
         cu_q_dyn,
         cu_k_dyn,
+        block_begin_dyn,
+        block_end_dyn,
         softmax_scale,
         h_kv,
         current_stream,
@@ -1294,8 +1432,8 @@ def run(
     # reference); this CLI path only smoke-checks that the launch is
     # well-formed when not exporting.
     compiled_fa2(
-        q_dyn, k_dyn, v_dyn, o_dyn, cu_q_dyn, cu_k_dyn, softmax_scale, h_kv,
-        current_stream,
+        q_dyn, k_dyn, v_dyn, o_dyn, cu_q_dyn, cu_k_dyn, block_begin_dyn,
+        block_end_dyn, softmax_scale, h_kv, current_stream,
     )
     cp.cuda.Device().synchronize()
 
@@ -1314,8 +1452,14 @@ def run(
         )
         cu_q_w, _ = _create_cu_seqlens_tensor(batch_size, seqlen_q)
         cu_k_w, _ = _create_cu_seqlens_tensor(batch_size, seqlen_k)
+        block_begin_w = None
+        block_end_w = None
+        if vision_block:
+            block_begin_w, _ = _create_block_range_tensor(batch_size, seqlen_q)
+            block_end_w, _ = _create_block_range_tensor(batch_size, seqlen_q)
         return testing.JitArguments(
-            q_w, k_w, v_w, o_w, cu_q_w, cu_k_w, softmax_scale, h_kv, current_stream
+            q_w, k_w, v_w, o_w, cu_q_w, cu_k_w, block_begin_w, block_end_w,
+            softmax_scale, h_kv, current_stream
         )
 
     workspace_count = 1
@@ -1377,6 +1521,10 @@ def _parse_args(argv=None):
     p.add_argument("--num_threads", type=int, default=128)
     p.add_argument("--is_causal", action="store_true",
                    help="Compile-time enable causal mask.")
+    p.add_argument("--vision_block", action="store_true",
+                   help="Compile-time enable the Gemma4 vision-block overlay "
+                        "(adds (B, S_q) Int32 mBlockBegin/mBlockEnd tensors to "
+                        "the ABI; requires --is_causal).")
     p.add_argument("--skip_rescale", action="store_true",
                    help="Tier-1: clamp rescale factor to 1.0 when within 2^-8 of unity.")
     p.add_argument("--hybrid_exp2", action="store_true",
@@ -1412,6 +1560,7 @@ def main():
         num_threads=args.num_threads,
         is_causal=args.is_causal,
         kv_group_size=args.kv_group_size,
+        vision_block=args.vision_block,
         skip_rescale=args.skip_rescale,
         hybrid_exp2=args.hybrid_exp2,
         warmup_iterations=args.warmup_iterations,

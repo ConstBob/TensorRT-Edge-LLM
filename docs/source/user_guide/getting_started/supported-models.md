@@ -367,11 +367,19 @@ Qwen3.5 and Qwen3.6 checkpoints are unified text+VLM models. The same checkpoint
 |--------------|--------------------|-----------------------|----------------------|
 | Qwen3-Omni | [`Qwen3OmniMoeForConditionalGeneration`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_omni_moe/modeling_qwen3_omni_moe.py) | `Qwen3OmniMoeThinkerCausalLM` + `Qwen3OmniMoeTalkerCausalLM` + visual/audio/Code2Wav | NVFP4 only |
 | [Nemotron-Omni](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4/blob/main/modeling.py) | Checkpoint architecture `NemotronH_Nano_Omni_Reasoning_V3`; LLM is Nemotron-H compatible with [`NemotronHForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/nemotron_h/modeling_nemotron_h.py) | `NemotronHCausalLM` + `NemotronOmniVisualModel` + `NemotronOmniAudioModel` | NVFP4 only |
+| Gemma4 Unified 12B | Checkpoint architecture `Gemma4UnifiedForConditionalGeneration`; text backbone compatible with [`Gemma4ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma4/modeling_gemma4.py) | `gemma4_unified` -> Gemma4 text decoder (dual-RoPE, per-layer heterogeneous KV, decoder-side vision-block bidirectional attention) + `Gemma4UnifiedVisualModel` + `Gemma4UnifiedAudioModel` (encoder-free patch/PCM embedders) | FP16 LLM backbone; FP32 multimodal embedders; image and audio input (no video) |
 
 <details>
 <summary><b>Nemotron-Omni</b> checkpoints</summary>
 
 - [nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4)
+
+</details>
+
+<details>
+<summary><b>Gemma4 Unified</b> checkpoints</summary>
+
+- [google/gemma-4-12b-it](https://huggingface.co/google/gemma-4-12b-it)
 
 </details>
 

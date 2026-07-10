@@ -227,15 +227,18 @@ def _fix_nvfp4_weight_dtype(onnx_path: str) -> None:
 def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
     """Strip trailing empty optional inputs from AttentionPlugin ONNX nodes.
 
-    When ``enable_tree_attention=False``, ``torch.export`` still emits two
-    empty-string inputs (``attention_mask``, ``attention_pos_id``) in the
-    ONNX node.  The TRT AttentionPlugin C++ requires exactly
-    ``kNUM_REQUIRED_INPUTS=7`` inputs for non-tree-attention mode and raises
-    ``(input) != nullptr`` when it encounters the extra null entries via
+    ``torch.export`` emits the two optional inputs (``attention_mask``,
+    ``attention_pos_id``) on every node, as empty strings when unused.  The
+    TRT AttentionPlugin C++ requires exactly ``kNUM_REQUIRED_INPUTS=7``
+    inputs for vanilla mode and raises ``(input) != nullptr`` when it
+    encounters the extra null entries via
     ``INetworkDefinition::addPluginV2``.
 
-    This pass removes trailing empty inputs from every ``AttentionPlugin``
-    node whose ``enable_tree_attention`` attribute equals 0.
+    This pass trims each ``AttentionPlugin`` node to its expected input
+    count: 7 for vanilla nodes, 8 for vision-block-attention nodes (the
+    real ``attention_mask`` input carrying block IDs is kept, the empty
+    ``attention_pos_id`` placeholder is dropped), and 9 for tree-attention
+    nodes (both optional inputs are real and kept).
     """
     _REQUIRED = 7
     model = onnx.load(onnx_path, load_external_data=False)
@@ -247,14 +250,21 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
             (a.i for a in node.attribute if a.name == "enable_tree_attention"),
             0,
         )
-        if tree_attn:
-            continue  # tree-attention nodes use the extra optional inputs
-        extra = [i for i in list(node.input)[_REQUIRED:] if i == ""]
-        if not extra:
+        vision_block_attn = next(
+            (a.i for a in node.attribute
+             if a.name == "enable_vision_block_attention"),
+            0,
+        )
+        optional_count = 2 if tree_attn else (1 if vision_block_attn else 0)
+        keep = _REQUIRED + optional_count
+        trailing = list(node.input)[keep:]
+        if not trailing or any(i != "" for i in trailing):
             continue
-        # Trim to exactly _REQUIRED inputs (drop trailing empty strings)
-        del node.input[_REQUIRED:]
-        changed += len(extra)
+        # Keep the real vision-block-ID input while dropping its unused
+        # attention_pos_id placeholder.  Vanilla nodes retain only required
+        # inputs; tree nodes retain both optional inputs.
+        del node.input[keep:]
+        changed += len(trailing)
 
     if not changed:
         return

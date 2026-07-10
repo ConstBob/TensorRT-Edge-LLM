@@ -655,6 +655,16 @@ bool LLMBuilder::setupVanillaProfiles(
         createDims({mBuilderConfig.maxBatchSize, 1, mHiddenSize}),
         createDims({mBuilderConfig.maxBatchSize, 1, mHiddenSize}));
 
+    if (mModelConfig.value("use_vision_bidirectional_attention", false))
+    {
+        result &= setOptimizationProfile(&contextProfile, binding_names::kVisionBlockIds, createDims({1, 1}),
+            createDims({mBuilderConfig.maxBatchSize, std::max<int64_t>(1, mBuilderConfig.maxInputLen / 2)}),
+            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen}));
+        // Decode ignores block IDs, but the static engine binding remains present.
+        result &= setOptimizationProfile(&generationProfile, binding_names::kVisionBlockIds, createDims({1, 1}),
+            createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, 1}));
+    }
+
     // Last token IDs
     result &= setOptimizationProfile(&contextProfile, binding_names::kLastTokenIds, createDims({1, 1}),
         createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, 1}));

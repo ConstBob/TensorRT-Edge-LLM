@@ -37,7 +37,7 @@ using namespace trt_edgellm;
 
 void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
     int32_t kvCacheCapacity, bool useFp8Cache = false, int32_t slidingWindowSize = 0,
-    std::optional<float> attentionScale = std::nullopt)
+    std::optional<float> attentionScale = std::nullopt, int32_t fixedContextLen = 0)
 {
     float const resolvedAttentionScale = attentionScale.value_or(1.0F / std::sqrt(static_cast<float>(headSize)));
     int32_t smVersion = getSMVersion();
@@ -51,6 +51,12 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
 
     std::vector<int32_t> kvCacheLengths(batchSize);
     uniformIntInitialization(kvCacheLengths, kvCacheCapacity / 4, kvCacheCapacity);
+    if (fixedContextLen > 0)
+    {
+        // Deterministic context length to reproduce reported failure shapes.
+        ASSERT_LE(fixedContextLen, kvCacheCapacity);
+        std::fill(kvCacheLengths.begin(), kvCacheLengths.end(), fixedContextLen);
+    }
     if (slidingWindowSize > 0)
     {
         // Cover KV lengths greater than, equal to, and smaller than the sliding window.
@@ -154,7 +160,7 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
         {
             numErrorWithin1E_3++;
         }
-        if (isnan(__half2float(outHost[i])))
+        if (isnan(__half2float(outHost[i])) || isinf(__half2float(outHost[i])))
         {
             NanValueDetected = true;
         }
@@ -293,7 +299,7 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
             {
                 numClose++;
             }
-            if (isnan(__half2float(outFp8Host[i])))
+            if (isnan(__half2float(outFp8Host[i])) || isinf(__half2float(outFp8Host[i])))
             {
                 NanValueDetectedFp8 = true;
             }
@@ -364,6 +370,15 @@ TEST(XQAAttentionDecodingTest, accuracyKVRatio8HeadDim512)
 {
     TestXQAAttentionDecodingAccuracy(1, 16, 2, 512, 256);
     TestXQAAttentionDecodingAccuracy(2, 16, 2, 512, 128);
+    TestXQAAttentionDecodingAccuracy(1, 16, 2, 512, 512, false, 0, std::nullopt, 274);
+    TestXQAAttentionDecodingAccuracy(1, 8, 1, 512, 1024, false, 0, 1000);
+}
+
+TEST(XQAAttentionDecodingTest, accuracyKVRatio16HeadDim512)
+{
+    TestXQAAttentionDecodingAccuracy(2, 16, 1, 512, 128);
+    TestXQAAttentionDecodingAccuracy(1, 16, 1, 512, 512, false, 0, std::nullopt, 274);
+    TestXQAAttentionDecodingAccuracy(1, 16, 1, 512, 4096, false, 0, std::nullopt, 3200);
 }
 
 TEST(XQAAttentionDecodingTest, accuracyKVRatio6)
@@ -445,6 +460,12 @@ TEST(XQAAttentionDecodingFP8Test, accuracyKVRatio8HeadDim512)
 {
     TestXQAAttentionDecodingAccuracy(1, 16, 2, 512, 256, true);
     TestXQAAttentionDecodingAccuracy(2, 16, 2, 512, 128, true);
+}
+
+TEST(XQAAttentionDecodingFP8Test, accuracyKVRatio16HeadDim512)
+{
+    TestXQAAttentionDecodingAccuracy(2, 16, 1, 512, 128, true);
+    TestXQAAttentionDecodingAccuracy(1, 16, 1, 512, 512, true, 0, std::nullopt, 274);
 }
 
 TEST(XQAAttentionDecodingFP8Test, accuracyKVRatio6)

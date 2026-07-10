@@ -27,12 +27,14 @@ Visual encoders — I/O spec via ``model.get_onnx_export_args(config, device)``:
     - InternVL3 HF     (model_type ``internvl``)
     - Phi-4 Multimodal (model_type ``phi4mm``, ``phi4_multimodal``)
     - Gemma4            (model_type ``gemma4``)
+    - Gemma4 Unified    (model_type ``gemma4_unified``)
     - Nemotron-Omni    (model_type ``NemotronH_Nano_VL_V2`` or
       ``NemotronH_Nano_Omni_Reasoning_V3``)
 
 Audio encoders — I/O spec defined internally or via ``model.get_onnx_export_args``:
     - Qwen3-ASR    (model_type ``qwen3_asr``)
     - Qwen3-Omni   (model_type ``qwen3_omni``, ``qwen3_omni_thinker``)
+    - Gemma4 Unified (model_type ``gemma4_unified``)
     - Nemotron-Omni (model_type ``NemotronH_Nano_VL_V2`` or
       ``NemotronH_Nano_Omni_Reasoning_V3``)
 
@@ -92,6 +94,7 @@ _VISUAL_REGISTRY: dict[str, str] = {
     "phi4mm": "phi4mm",
     "phi4_multimodal": "phi4mm",
     "gemma4": "gemma4",
+    "gemma4_unified": "gemma4_unified",
     "NemotronH_Nano_VL_V2": "nemotron_omni",
     "NemotronH_Nano_Omni_Reasoning_V3": "nemotron_omni",
 }
@@ -114,6 +117,8 @@ _VISUAL_FAMILY_MODULE: dict[str, str] = {
     "tensorrt_edgellm.models.phi4mm.modeling_phi4mm_visual",
     "gemma4":
     "tensorrt_edgellm.models.gemma4.modeling_gemma4_visual",
+    "gemma4_unified":
+    "tensorrt_edgellm.models.gemma4.modeling_gemma4_unified_visual",
     "nemotron_omni":
     "tensorrt_edgellm.models.nemotron_omni.modeling_nemotron_omni_visual",
 }
@@ -128,6 +133,7 @@ _VISUAL_FAMILY_BUILD_FN: dict[str, str] = {
     "internvl3_5": "build_internvl3_5_visual",
     "phi4mm": "build_phi4mm_visual",
     "gemma4": "build_gemma4_visual",
+    "gemma4_unified": "build_gemma4_unified_visual",
     "nemotron_omni": "build_nemotron_omni_visual",
 }
 
@@ -142,6 +148,7 @@ _AUDIO_MODEL_TYPES: frozenset[str] = frozenset([
     "qwen3_omni_moe",
     "qwen3_omni_moe_thinker",
     "gemma4",
+    "gemma4_unified",
     *_NEMOTRON_OMNI_MODEL_TYPES,
     # qwen3_tts intentionally excluded: Qwen3-TTS has NO audio encoder.
 ])
@@ -172,7 +179,7 @@ def _get_visual_config(model_type: str, config: dict) -> dict:
         return (config.get("vision_config")
                 or config.get("thinker_config", {}).get("vision_config")
                 or config)
-    if (model_type in ("internvl", "internvl_chat", "gemma4")
+    if (model_type in ("internvl", "internvl_chat", "gemma4", "gemma4_unified")
             or model_type in _NEMOTRON_OMNI_MODEL_TYPES):
         # InternVL / Gemma4 / Nemotron-Omni need the full config
         # (vision + text + projection/runtime fields).
@@ -360,6 +367,26 @@ def export_audio_onnx(
         raise ValueError(f"Unsupported audio model_type {model_type!r}. "
                          f"Supported: {sorted(_AUDIO_MODEL_TYPES)}")
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+    # Gemma4 Unified is encoder-free: it builds its own module and export
+    # arguments, so it bypasses the build_fn registry below entirely.
+    if model_type == "gemma4_unified":
+        from ..models.gemma4.modeling_gemma4_unified_audio import \
+            build_gemma4_unified_audio
+        if model_config is None:
+            from ..config import ModelConfig
+            model_config = ModelConfig.from_pretrained(model_dir)
+        logger.info("Building Gemma4 Unified encoder-free audio model ...")
+        audio_model = build_gemma4_unified_audio(config,
+                                                 weights,
+                                                 model_config=model_config,
+                                                 dtype=dtype)
+        audio_model = audio_model.to(device).eval()
+        args, input_names, output_names, dynamic_shapes = (
+            audio_model.get_onnx_export_args(config, device))
+        _run_dynamo_export(audio_model, args, output_path, input_names,
+                           output_names, dynamic_shapes)
+        return
 
     build_fn = None
     extra_kwargs = {}

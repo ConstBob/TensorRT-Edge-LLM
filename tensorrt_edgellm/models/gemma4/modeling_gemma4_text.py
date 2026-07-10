@@ -59,15 +59,6 @@ _DUMMY_PAST_LEN = 1
 _DUMMY_ROPE_CACHE_LEN = 4096
 
 
-def _attention_type_for_layer(config: ModelConfig, layer_idx: int) -> str:
-    """Return Gemma4's per-layer attention type."""
-    if layer_idx >= len(config.attention_layer_types):
-        raise ValueError(
-            "Gemma4 attention_layer_types must have one entry per layer; "
-            f"missing layer {layer_idx}.")
-    return config.attention_layer_types[layer_idx]
-
-
 def _uses_attention_k_eq_v(config: ModelConfig, attention_type: str) -> bool:
     """Return whether a Gemma4 attention layer reuses K as the V source."""
     return bool(config.attention_k_eq_v and attention_type == "full_attention")
@@ -261,6 +252,7 @@ def _make_gemma4_flat_wrapper(model: nn.Module,
                               num_ple_inputs: int,
                               use_dual_rope: bool = False,
                               eagle_base: bool = False,
+                              vision_block_attention: bool = False,
                               emit_hidden_states: bool = False) -> nn.Module:
     """Build a Gemma4 export wrapper with explicit PLE/RoPE tensor inputs."""
     has_hidden_output = eagle_base or emit_hidden_states
@@ -276,6 +268,8 @@ def _make_gemma4_flat_wrapper(model: nn.Module,
     else:
         param_names += ["rope_rotary_cos_sin"]
     param_names += ["context_lengths", "kvcache_start_index", "last_token_ids"]
+    if vision_block_attention:
+        param_names += ["vision_block_ids"]
     if eagle_base:
         param_names += ["attention_pos_id", "attention_mask"]
 
@@ -288,6 +282,8 @@ def _make_gemma4_flat_wrapper(model: nn.Module,
     eagle_kwargs = (", attention_mask=attention_mask"
                     ", attention_pos_id=attention_pos_id"
                     if eagle_base else "")
+    vision_kwargs = (", vision_block_ids=vision_block_ids"
+                     if vision_block_attention else "")
     if use_dual_rope:
         rope_arg = "None"
         rope_kwargs = (
@@ -302,14 +298,14 @@ def _make_gemma4_flat_wrapper(model: nn.Module,
             f"    logits, hidden_states, present_key_values = self._model(\n"
             f"        inputs_embeds, {past_kv_tuple}, {rope_arg}, "
             f"context_lengths, kvcache_start_index, last_token_ids"
-            f"{eagle_kwargs}{ple_kwarg}{rope_kwargs})\n"
+            f"{eagle_kwargs}{vision_kwargs}{ple_kwarg}{rope_kwargs})\n"
             f"    return (logits, hidden_states) + tuple(present_key_values)\n"
         )
     else:
         body = (f"    logits, present_key_values = self._model(\n"
                 f"        inputs_embeds, {past_kv_tuple}, {rope_arg}, "
                 f"context_lengths, kvcache_start_index, last_token_ids"
-                f"{eagle_kwargs}{ple_kwarg}{rope_kwargs})\n"
+                f"{eagle_kwargs}{vision_kwargs}{ple_kwarg}{rope_kwargs})\n"
                 f"    return (logits,) + tuple(present_key_values)\n")
 
     src = "def _forward(self, {}):\n{}".format(", ".join(param_names), body)
@@ -494,6 +490,7 @@ class Gemma4Attention(Attention):
         kvcache_start_index: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         attention_pos_id: torch.Tensor | None = None,
+        vision_block_ids: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -536,6 +533,11 @@ class Gemma4Attention(Attention):
                                              self.num_kv_heads * self.head_dim)
 
         enable_tree = attention_mask is not None and attention_pos_id is not None
+        enable_vision_block = vision_block_ids is not None
+        if enable_tree and enable_vision_block:
+            raise ValueError(
+                "Gemma4 vision block attention and tree attention are mutually exclusive."
+            )
         kwargs: dict = {
             "num_q_heads": self.num_heads,
             "num_kv_heads": self.num_kv_heads,
@@ -544,10 +546,15 @@ class Gemma4Attention(Attention):
             "enable_tree_attention": enable_tree,
             "enable_fp8_kv_cache": self.enable_fp8_kv_cache,
             "attention_scale": self.attention_scale,
+            "enable_vision_block_attention": enable_vision_block,
         }
         if enable_tree:
             kwargs["attention_mask"] = attention_mask
             kwargs["attention_pos_id"] = attention_pos_id
+        elif enable_vision_block:
+            # AttentionPlugin input slot 7 is shared with the tree mask.  The
+            # static plugin attribute selects its [B,S] block-ID semantics.
+            kwargs["attention_mask"] = vision_block_ids
         kwargs["qkv_scales"] = getattr(self, "_qkv_scales_float",
                                        [1.0, 1.0, 1.0])
 
@@ -896,6 +903,7 @@ class Gemma4DecoderLayer(DecoderLayer):
         kvcache_start_index: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         attention_pos_id: torch.Tensor | None = None,
+        vision_block_ids: torch.Tensor | None = None,
         per_layer_input: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
@@ -908,6 +916,7 @@ class Gemma4DecoderLayer(DecoderLayer):
             kvcache_start_index,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
+            vision_block_ids=vision_block_ids,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
@@ -937,7 +946,8 @@ class Gemma4DecoderLayer(DecoderLayer):
 
         hidden_states = self._apply_per_layer_input(hidden_states,
                                                     per_layer_input)
-        hidden_states = hidden_states * self.layer_scalar
+        hidden_states = hidden_states * self.layer_scalar.to(
+            dtype=hidden_states.dtype)
 
         return hidden_states, present_key_value
 
@@ -1062,6 +1072,7 @@ class Gemma4Transformer(nn.Module):
         kvcache_start_index: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         attention_pos_id: torch.Tensor | None = None,
+        vision_block_ids: torch.Tensor | None = None,
         output_hidden_states: bool = False,
         ple_token_embeds: Tuple[torch.Tensor, ...] = (),
         rope_rotary_cos_sin_sliding: torch.Tensor | None = None,
@@ -1093,6 +1104,7 @@ class Gemma4Transformer(nn.Module):
                 kvcache_start_index,
                 attention_mask=attention_mask,
                 attention_pos_id=attention_pos_id,
+                vision_block_ids=vision_block_ids,
                 per_layer_input=per_layer_input,
             )
             present_key_values_list.append(next_key_value)
@@ -1127,7 +1139,10 @@ class Gemma4ForCausalLM(CausalLM):
 
     def onnx_export_spec(self) -> OnnxSpec:
         """Return Gemma4-specific ONNX export parameters."""
+        vision_block_attention = bool(
+            self.config.use_vision_bidirectional_attention)
         if (not self.ple_enabled and not self.config.use_dual_rope
+                and not vision_block_attention
                 and not self.config.gemma4_mtp_base):
             return super().onnx_export_spec()
 
@@ -1135,6 +1150,10 @@ class Gemma4ForCausalLM(CausalLM):
         if config.use_dual_rope and config.eagle_base:
             raise NotImplementedError(
                 "Gemma4 dual RoPE export is not supported for EAGLE base models."
+            )
+        if vision_block_attention and config.eagle_base:
+            raise NotImplementedError(
+                "Gemma4 vision block attention is not supported with EAGLE base models."
             )
 
         Na = config.num_hidden_layers
@@ -1235,6 +1254,13 @@ class Gemma4ForCausalLM(CausalLM):
         input_names = input_names + [
             "context_lengths", "kvcache_start_index", "last_token_ids"
         ]
+        if vision_block_attention:
+            vision_block_ids = torch.full((batch_size, seq_len),
+                                          -1,
+                                          dtype=torch.int32,
+                                          device=device)
+            args = args + (vision_block_ids, )
+            input_names = input_names + ["vision_block_ids"]
         output_names = (["logits"] +
                         [f"present_key_values_{i}" for i in range(Na)])
         if self.emit_hidden_states and not eagle_base:
@@ -1264,6 +1290,8 @@ class Gemma4ForCausalLM(CausalLM):
             all_shapes.append({0: batch, 1: num_selected})
         else:
             all_shapes.append({0: batch})
+        if vision_block_attention:
+            all_shapes.append({0: batch, 1: seq})
         if tree_attention_base:
             attention_pos_id = torch.zeros(batch_size,
                                            seq_len,
@@ -1290,6 +1318,7 @@ class Gemma4ForCausalLM(CausalLM):
             num_ple_inputs=num_ple_inputs,
             use_dual_rope=config.use_dual_rope,
             eagle_base=tree_attention_base,
+            vision_block_attention=vision_block_attention,
             emit_hidden_states=(self.emit_hidden_states
                                 or config.gemma4_mtp_base))
         wrapped.eval()
@@ -1310,6 +1339,7 @@ class Gemma4ForCausalLM(CausalLM):
         last_token_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         attention_pos_id: torch.Tensor | None = None,
+        vision_block_ids: torch.Tensor | None = None,
         ple_token_embeds: Tuple[torch.Tensor, ...] = (),
         rope_rotary_cos_sin_sliding: torch.Tensor | None = None,
         rope_rotary_cos_sin_full: torch.Tensor | None = None,
@@ -1324,6 +1354,7 @@ class Gemma4ForCausalLM(CausalLM):
             kvcache_start_index,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
+            vision_block_ids=vision_block_ids,
             output_hidden_states=eagle_base,
             ple_token_embeds=ple_token_embeds,
             rope_rotary_cos_sin_sliding=rope_rotary_cos_sin_sliding,

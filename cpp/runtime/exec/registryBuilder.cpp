@@ -83,6 +83,12 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
     reg.addTensor({binding_names::kKVCacheStartIndex, TensorIO::kInput, nvinfer1::DataType::kINT32,
         {sym(&InferenceDims::startIndexLen)}});
 
+    if (cfg.useVisionBidirectionalAttention)
+    {
+        reg.addTensor({binding_names::kVisionBlockIds, TensorIO::kInput, nvinfer1::DataType::kINT32,
+            {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen)}});
+    }
+
     // RoPE cache inputs: single binding for single-RoPE models, explicit
     // sliding/full bindings for mixed-attention dual-RoPE models.
     // For non-MRope, rope_batch is always 1 (TRT broadcasts); for MRope, rope_batch = activeBatchSize.

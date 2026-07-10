@@ -20,6 +20,8 @@
 #include "common/trtUtils.h"
 #include "multimodal/audioRunner.h"
 #include "multimodal/gemma4AudioRunner.h"
+#include "multimodal/gemma4UnifiedAudioRunner.h"
+#include "multimodal/gemma4UnifiedVisionRunner.h"
 #include "multimodal/gemma4ViTRunner.h"
 #include "multimodal/internViTRunner.h"
 #include "multimodal/nemotronOmniAudioRunner.h"
@@ -172,6 +174,14 @@ std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& mu
     else if (modelType == multimodal::ModelType::GEMMA4_VISION)
     {
         multimodalRunner = std::make_unique<Gemma4ViTRunner>(multimodalEngineDir, stream);
+    }
+    else if (modelType == multimodal::ModelType::GEMMA4_UNIFIED_VISION)
+    {
+        multimodalRunner = std::make_unique<Gemma4UnifiedVisionRunner>(multimodalEngineDir, stream);
+    }
+    else if (modelType == multimodal::ModelType::GEMMA4_UNIFIED_AUDIO)
+    {
+        multimodalRunner = std::make_unique<Gemma4UnifiedAudioRunner>(multimodalEngineDir, stream);
     }
     else if (modelType == multimodal::ModelType::NEMOTRON_OMNI_VISION_ENCODER)
     {

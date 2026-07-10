@@ -514,6 +514,9 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     cfg.pleHiddenSize = configJson.value("ple_hidden_size", 0);
     cfg.audioTokenId = configJson.value("audio_token_id", -1);
     cfg.imageTokenId = configJson.value("image_token_id", -1);
+    cfg.useVisionBidirectionalAttention = configJson.value("use_vision_bidirectional_attention", false);
+    ELLM_CHECK(!cfg.useVisionBidirectionalAttention || cfg.imageTokenId >= 0,
+        "use_vision_bidirectional_attention requires image_token_id in the LLM config.");
 
     cfg.numLinearAttnLayers = configJson.value("num_linear_attn_layers", 0);
     cfg.numAttentionLayers = configJson.value("num_attention_layers", cfg.numDecoderLayers);

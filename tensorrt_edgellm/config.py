@@ -269,7 +269,7 @@ def _get_embedding_scale(llm_dict: Dict[str, Any], model_type: str,
         if llm_dict.get(key) is not None:
             return float(llm_dict[key])
 
-    if str(model_type) in {"gemma4", "gemma4_text"}:
+    if _is_gemma4_model_type(model_type):
         return math.sqrt(float(hidden_size))
 
     return 1.0
@@ -281,7 +281,7 @@ def _get_has_value_norm(llm_dict: Dict[str, Any], model_type: str) -> bool:
         if llm_dict.get(key) is not None:
             return bool(llm_dict[key])
 
-    return str(model_type) in {"gemma4", "gemma4_text"}
+    return _is_gemma4_model_type(model_type)
 
 
 @dataclass
@@ -524,6 +524,10 @@ class ModelConfig:
     tie_word_embeddings: bool = False
     # Sliding window attention size; -1 means no sliding window.
     sliding_window_size: int = -1
+    # Gemma4 Unified 12B+: image placeholder runs use block-causal
+    # attention during prefill (bidirectional inside each contiguous vision
+    # run, causal everywhere else).  Audio placeholders remain causal.
+    use_vision_bidirectional_attention: bool = False
     # ------------------------------------------ per-layer block types
     # One entry per hidden layer: LAYER_ATTN, LAYER_MAMBA, LAYER_MLP, or LAYER_MOE.
     layer_types: List[str] = field(default_factory=list)
@@ -869,6 +873,9 @@ class ModelConfig:
             for layer_type in raw_layer_types)
         sw_raw = llm_dict.get("sliding_window") if use_sw else None
         sliding_window_size = int(sw_raw) if sw_raw is not None else -1
+        use_vision_bidirectional_attention = bool(
+            model_type in ("gemma4_unified", "gemma4_unified_text")
+            and llm_dict.get("use_bidirectional_attention") == "vision")
 
         # Sparse MoE fields.  HF uses "num_local_experts" as the internal key
         # and maps "num_experts" → "num_local_experts" via attribute_map.
@@ -948,6 +955,8 @@ class ModelConfig:
                                      llm_dict.get("dtype", "bfloat16")),
             tie_word_embeddings=llm_dict.get("tie_word_embeddings", False),
             sliding_window_size=sliding_window_size,
+            use_vision_bidirectional_attention=
+            use_vision_bidirectional_attention,
             layer_types=layer_types,
             attention_layer_types=attention_layer_types,
             quant=quant,

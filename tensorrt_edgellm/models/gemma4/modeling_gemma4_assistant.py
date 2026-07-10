@@ -160,6 +160,7 @@ class Gemma4SharedKVAttention(nn.Module):
             enable_tree_attention=True,
             enable_fp8_kv_cache=self.enable_fp8_kv_cache,
             attention_scale=self.attention_scale,
+            enable_vision_block_attention=False,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
             qkv_scales=[1.0, 1.0, 1.0],

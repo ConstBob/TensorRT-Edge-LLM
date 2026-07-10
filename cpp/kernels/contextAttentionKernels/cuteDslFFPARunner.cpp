@@ -27,6 +27,9 @@ namespace trt_edgellm
 {
 
 ffpa_d512_causal_Kernel_Module_t CuteDslFFPARunner::sD512CausalModule{};
+#ifdef CUTE_DSL_FFPA_VISIONBLOCK_ENABLED
+ffpa_d512_causal_visionblock_Kernel_Module_t CuteDslFFPARunner::sD512CausalVisionBlockModule{};
+#endif
 bool CuteDslFFPARunner::sLoaded{false};
 std::mutex CuteDslFFPARunner::sMutex;
 
@@ -52,6 +55,17 @@ bool CuteDslFFPARunner::canImplement(int32_t headDim, int32_t smVersion)
     }
 }
 
+bool CuteDslFFPARunner::canImplementVisionBlock(int32_t headDim, int32_t smVersion)
+{
+#ifdef CUTE_DSL_FFPA_VISIONBLOCK_ENABLED
+    return canImplement(headDim, smVersion);
+#else
+    (void) headDim;
+    (void) smVersion;
+    return false;
+#endif
+}
+
 bool CuteDslFFPARunner::loadKernelModule()
 {
     std::lock_guard<std::mutex> lock{sMutex};
@@ -63,6 +77,9 @@ bool CuteDslFFPARunner::loadKernelModule()
     try
     {
         ffpa_d512_causal_Kernel_Module_Load(&sD512CausalModule);
+#ifdef CUTE_DSL_FFPA_VISIONBLOCK_ENABLED
+        ffpa_d512_causal_visionblock_Kernel_Module_Load(&sD512CausalVisionBlockModule);
+#endif
         sLoaded = true;
         LOG_DEBUG("CuTe DSL FFPA d512 causal kernel module(s) loaded");
         return true;
@@ -84,6 +101,10 @@ void CuteDslFFPARunner::unloadKernelModule()
 
     ffpa_d512_causal_Kernel_Module_Unload(&sD512CausalModule);
     sD512CausalModule = {};
+#ifdef CUTE_DSL_FFPA_VISIONBLOCK_ENABLED
+    ffpa_d512_causal_visionblock_Kernel_Module_Unload(&sD512CausalVisionBlockModule);
+    sD512CausalVisionBlockModule = {};
+#endif
     sLoaded = false;
 }
 
@@ -106,6 +127,22 @@ int CuteDslFFPARunner::run(CuteDslFFPAParams const& params, cudaStream_t stream)
         LOG_ERROR("FFPA CuTe DSL kernel requires cuSeqLenQ/cuSeqLenK (batchSize + 1) int32 device tensors.");
         return -1;
     }
+
+    bool const useVisionBlock = params.blockBegin != nullptr || params.blockEnd != nullptr;
+    if (useVisionBlock && (params.blockBegin == nullptr || params.blockEnd == nullptr))
+    {
+        LOG_ERROR("FFPA CuTe DSL kernel requires blockBegin and blockEnd to be both set or both null.");
+        return -1;
+    }
+#ifndef CUTE_DSL_FFPA_VISIONBLOCK_ENABLED
+    if (useVisionBlock)
+    {
+        LOG_ERROR(
+            "FFPA vision-block overlay requested but the ffpa_d512_causal_visionblock AOT variant is not compiled "
+            "into this build.");
+        return -1;
+    }
+#endif
 
     if (params.batchSize <= 0 || params.seqlenQ <= 0 || params.seqlenK <= 0 || params.numQHeads <= 0
         || params.numKVHeads <= 0 || params.headDim <= 0)
@@ -140,6 +177,70 @@ int CuteDslFFPARunner::run(CuteDslFFPAParams const& params, cudaStream_t stream)
     int64_t const kStrideSeq = static_cast<int64_t>(params.numKVHeads) * params.headDim;
     float const softmaxScale
         = params.softmaxScale > 0.0F ? params.softmaxScale : 1.0F / std::sqrt(static_cast<float>(params.headDim));
+
+#ifdef CUTE_DSL_FFPA_VISIONBLOCK_ENABLED
+    if (useVisionBlock)
+    {
+        // Vision-block overlay variant: identical tensor marshalling plus the
+        // two [batchSize, seqlenQ] int32 block-interval tensors (compact row
+        // stride seqlenQ; element stride statically 1).
+        ffpa_d512_causal_visionblock_Tensor_mQ_t qTensor{};
+        qTensor.data = const_cast<void*>(params.q);
+        qTensor.dynamic_shapes[0] = params.batchSize;
+        qTensor.dynamic_shapes[1] = params.seqlenQ;
+        qTensor.dynamic_shapes[2] = params.numQHeads;
+        qTensor.dynamic_strides[0] = qStrideBatch;
+        qTensor.dynamic_strides[1] = qStrideSeq;
+
+        ffpa_d512_causal_visionblock_Tensor_mK_t kTensor{};
+        kTensor.data = const_cast<void*>(params.k);
+        kTensor.dynamic_shapes[0] = params.batchSize;
+        kTensor.dynamic_shapes[1] = params.seqlenK;
+        kTensor.dynamic_shapes[2] = params.numKVHeads;
+        kTensor.dynamic_strides[0] = kStrideBatch;
+        kTensor.dynamic_strides[1] = kStrideSeq;
+
+        ffpa_d512_causal_visionblock_Tensor_mV_t vTensor{};
+        vTensor.data = const_cast<void*>(params.v);
+        vTensor.dynamic_shapes[0] = params.batchSize;
+        vTensor.dynamic_shapes[1] = params.seqlenK;
+        vTensor.dynamic_shapes[2] = params.numKVHeads;
+        vTensor.dynamic_strides[0] = kStrideBatch;
+        vTensor.dynamic_strides[1] = kStrideSeq;
+
+        ffpa_d512_causal_visionblock_Tensor_mO_t oTensor{};
+        oTensor.data = params.o;
+        oTensor.dynamic_shapes[0] = params.batchSize;
+        oTensor.dynamic_shapes[1] = params.seqlenQ;
+        oTensor.dynamic_shapes[2] = params.numQHeads;
+        oTensor.dynamic_strides[0] = qStrideBatch;
+        oTensor.dynamic_strides[1] = qStrideSeq;
+
+        ffpa_d512_causal_visionblock_Tensor_mCuSeqLenQ_t cuSeqLenQTensor{};
+        cuSeqLenQTensor.data = const_cast<int32_t*>(params.cuSeqLenQ);
+        cuSeqLenQTensor.dynamic_shapes[0] = params.batchSize + 1;
+
+        ffpa_d512_causal_visionblock_Tensor_mCuSeqLenK_t cuSeqLenKTensor{};
+        cuSeqLenKTensor.data = const_cast<int32_t*>(params.cuSeqLenK);
+        cuSeqLenKTensor.dynamic_shapes[0] = params.batchSize + 1;
+
+        ffpa_d512_causal_visionblock_Tensor_mBlockBegin_t blockBeginTensor{};
+        blockBeginTensor.data = const_cast<int32_t*>(params.blockBegin);
+        blockBeginTensor.dynamic_shapes[0] = params.batchSize;
+        blockBeginTensor.dynamic_shapes[1] = params.seqlenQ;
+        blockBeginTensor.dynamic_strides[0] = params.seqlenQ;
+
+        ffpa_d512_causal_visionblock_Tensor_mBlockEnd_t blockEndTensor{};
+        blockEndTensor.data = const_cast<int32_t*>(params.blockEnd);
+        blockEndTensor.dynamic_shapes[0] = params.batchSize;
+        blockEndTensor.dynamic_shapes[1] = params.seqlenQ;
+        blockEndTensor.dynamic_strides[0] = params.seqlenQ;
+
+        return cute_dsl_ffpa_d512_causal_visionblock_wrapper(&sD512CausalVisionBlockModule, &qTensor, &kTensor,
+            &vTensor, &oTensor, &cuSeqLenQTensor, &cuSeqLenKTensor, &blockBeginTensor, &blockEndTensor, softmaxScale,
+            params.numKVHeads, stream);
+    }
+#endif
 
     // The H-stride is statically D and the D-stride is statically 1, so neither
     // is passed across the ABI.

@@ -469,6 +469,19 @@ function(cute_dsl_setup)
     )
   endif()
 
+  # FFPA vision-block overlay variant.
+  list(FIND _variants "ffpa_d512_causal_visionblock" _ffpa_visionblock_idx)
+  if(NOT ${_ffpa_visionblock_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(${_tgt}
+                                 PRIVATE "CUTE_DSL_FFPA_VISIONBLOCK_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: ffpa_d512_causal_visionblock variant found — CUTE_DSL_FFPA_VISIONBLOCK_ENABLED set"
+    )
+  endif()
+
   # Check for Blackwell GDN variant specifically and set a clean define.
   list(FIND _variants "gdn_prefill_blackwell" _bw_idx)
   if(NOT ${_bw_idx} EQUAL -1)

@@ -157,6 +157,14 @@ _attention_plugin_schema = OpSchema(
             required=False,
         ),
         OpSchema.Attribute(
+            name="enable_vision_block_attention",
+            type=OpSchema.AttrType.INT,
+            description=(
+                "Use attention_mask as Gemma4 vision block IDs during "
+                "prefill (0(false), 1(true)). Optional."),
+            required=False,
+        ),
+        OpSchema.Attribute(
             name="sliding_window_size",
             type=OpSchema.AttrType.INT,
             description=

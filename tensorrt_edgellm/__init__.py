@@ -59,6 +59,9 @@ def _identity_attention_scale(head_dim: int) -> float:
 
 register_model("gemma4", Gemma4ForCausalLM, _identity_attention_scale)
 register_model("gemma4_text", Gemma4ForCausalLM, _identity_attention_scale)
+register_model("gemma4_unified", Gemma4ForCausalLM, _identity_attention_scale)
+register_model("gemma4_unified_text", Gemma4ForCausalLM,
+               _identity_attention_scale)
 register_attention_scale_default("gemma4_assistant", _identity_attention_scale)
 register_model("nemotron_h", NemotronHCausalLM, standard_attention_scale)
 register_model("qwen3_5_text", Qwen3_5CausalLM, standard_attention_scale)

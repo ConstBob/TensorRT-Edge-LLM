@@ -446,6 +446,28 @@ KERNEL_VARIANTS = [
             "--export_only",
         ],
     ),
+    # FFPA vision-block overlay variant (Gemma4 Unified prefill, global d512
+    # layers): the causal kernel plus two (B, S) Int32 mBlockBegin/mBlockEnd
+    # tensors carrying a per-query-row extra allowed KV interval so image
+    # blocks attend bidirectionally.  Traced with the Gemma4-12B
+    # global-layer GQA shape (Hq=16, Hkv=1) — GQA remains runtime-dynamic.
+    KernelVariant(
+        name="ffpa_d512_causal_visionblock",
+        group="ffpa",
+        supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+        script="ffpa_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "512",
+            "--m_block_size", "64", "--n_block_size", "16", "--num_threads", "128",
+            "--dtype", "Float16",
+            "--is_causal",
+            "--vision_block",
+            "--skip_rescale",
+            "--kv_group_size", "16",
+            "--num_head", "16",
+            "--export_only",
+        ],
+    ),
     # --- NvFP4 MoE group (decomposed FC1/FC2; SM110/Thor today) ---
     # These variants build the decomposed grouped MoE pipeline:
     #   FC1 gather grouped GEMM + activation + FP4 requant

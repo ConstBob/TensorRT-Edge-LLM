@@ -290,7 +290,11 @@ bool AudioBuilder::parseConfig()
     case AudioBuildType::AUDIO_ENCODER:
     {
         bool parseOk = false;
-        if (mModelType == multimodal::ModelType::NEMOTRON_OMNI_AUDIO_ENCODER)
+        if (mModelType == multimodal::ModelType::GEMMA4_UNIFIED_AUDIO)
+        {
+            parseOk = parseGemma4UnifiedAudioConfig();
+        }
+        else if (mModelType == multimodal::ModelType::NEMOTRON_OMNI_AUDIO_ENCODER)
         {
             parseOk = parseNemotronOmniAudioConfig();
         }
@@ -306,6 +310,33 @@ bool AudioBuilder::parseConfig()
     }
     default: LOG_ERROR("Unknown build type"); return false;
     }
+}
+
+bool AudioBuilder::parseGemma4UnifiedAudioConfig()
+{
+    if (!mModelConfig.contains("audio_config"))
+    {
+        LOG_ERROR("audio_config not found in config.json for Gemma4 Unified audio");
+        return false;
+    }
+    auto const& audioConfig = mModelConfig["audio_config"];
+    mAudioFeatureDim = audioConfig.value("audio_samples_per_token", audioConfig.value("audio_embed_dim", int32_t{0}));
+    if (mAudioFeatureDim != 640)
+    {
+        LOG_ERROR(
+            "Gemma4 Unified audio requires audio_samples_per_token/audio_embed_dim=640, got %d", mAudioFeatureDim);
+        return false;
+    }
+    if (mBuilderConfig.maxTimeSteps < 1)
+    {
+        LOG_ERROR("Gemma4 Unified maxTimeSteps must be at least one raw PCM frame");
+        return false;
+    }
+    LOG_INFO(
+        "Gemma4 Unified AudioEncoder config: frame_size=%d samples; maxTimeSteps=%ld means raw 640-sample "
+        "PCM frames (minimum profile length is always 1)",
+        mAudioFeatureDim, mBuilderConfig.maxTimeSteps);
+    return true;
 }
 
 bool AudioBuilder::parseAudioEncoderConfig()
@@ -420,6 +451,7 @@ bool AudioBuilder::setupAudioEncoderProfile(
     switch (mModelType)
     {
     case multimodal::ModelType::QWEN3_OMNI_AUDIO_ENCODER: result = setupQwen3OmniAudioEncoderProfile(*profile); break;
+    case multimodal::ModelType::GEMMA4_UNIFIED_AUDIO: result = setupGemma4UnifiedAudioEncoderProfile(*profile); break;
     case multimodal::ModelType::NEMOTRON_OMNI_AUDIO_ENCODER:
         result = setupNemotronOmniAudioEncoderProfile(*profile);
         break;
@@ -435,6 +467,23 @@ bool AudioBuilder::setupAudioEncoderProfile(
     LOG_DEBUG("%s", printOptimizationProfile(profile, "audio_encoder_profile", &network).c_str());
     config.addOptimizationProfile(profile);
     return true;
+}
+
+bool AudioBuilder::setupGemma4UnifiedAudioEncoderProfile(nvinfer1::IOptimizationProfile& profile)
+{
+    constexpr int64_t kBatch = 1;
+    constexpr int64_t kMinFrames = 1;
+    int64_t const maxFrames = mBuilderConfig.maxTimeSteps;
+    int64_t const optFrames = kMinFrames + (maxFrames - kMinFrames) / 2;
+
+    bool const result = setOptimizationProfile(&profile, binding_names::kAudioInputFeatures,
+        createDims({kBatch, kMinFrames, mAudioFeatureDim}), createDims({kBatch, optFrames, mAudioFeatureDim}),
+        createDims({kBatch, maxFrames, mAudioFeatureDim}));
+    if (!result)
+    {
+        LOG_ERROR("Failed to setup Gemma4 Unified audio encoder profile");
+    }
+    return result;
 }
 
 bool AudioBuilder::setupQwen3OmniAudioEncoderProfile(nvinfer1::IOptimizationProfile& profile)

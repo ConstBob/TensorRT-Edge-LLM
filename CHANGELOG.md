@@ -2,6 +2,7 @@
 
 ## 0.9.0
 - Added Gemma 4 E2B/E4B text inference support
+- Added Gemma4 Unified 12B image and audio multimodal inference support
 - Added DFlash support
 - Added Qwen3-Omni-30B-A3B NVFP4 support
 - Fixed decode performance regression in 0.8.0
