@@ -72,6 +72,16 @@ def _add_common_args(parser):
               "pairs streamed through audio_tower + text decoder). When "
               "unset the audio tower stays at fp16."),
     )
+    parser.add_argument(
+        "--cp_quantization",
+        default=None,
+        choices=["fp8"],
+        help=("Quantize the Qwen3-Omni Talker CodePredictor "
+              "(talker.code_predictor.*).  Only fp8 is exposed today; "
+              "down_proj is kept unquantized to preserve the FP32 MLP "
+              "WAR (see modeling_code_predictor.py).  When unset CP "
+              "stays at fp16."),
+    )
     parser.add_argument("--kv_cache_quantization",
                         default=None,
                         choices=["fp8"])
@@ -140,6 +150,7 @@ def main():
             lm_head_quantization=args.lm_head_quantization,
             visual_quantization=args.visual_quantization,
             audio_quantization=args.audio_quantization,
+            cp_quantization=args.cp_quantization,
             kv_cache_quantization=args.kv_cache_quantization,
             dtype=args.dtype,
             device=args.device,

@@ -35,13 +35,15 @@ from safetensors.torch import load_file
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import (AutoModel, AutoModelForCausalLM,
-                          AutoModelForImageTextToText, AutoProcessor,
+                          AutoModelForImageTextToText,
+                          AutoModelForTextToWaveform, AutoProcessor,
                           AutoTokenizer)
 
 from .quantization_configs import build_quant_config
 from .qwen3_asr_loader import (asr_calibration_dataloader, is_qwen3_asr_model,
                                load_qwen3_asr_joint_for_calibration,
                                postprocess_qwen3_asr_checkpoint)
+from .qwen3_cp_loader import has_code_predictor, qwen3_cp_calibration_loop
 
 
 def _load_dataset(*args, **kwargs):
@@ -287,9 +289,15 @@ def _load_model(model_dir, dtype="fp16", device="cuda"):
         # for *recognition* failures — not for ImportError or other runtime
         # errors, which would otherwise be silently masked by a misleading
         # "Unrecognized configuration class" exception.
+        # Most-specific factory first: TextToWaveform > ImageTextToText >
+        # CausalLM > AutoModel (fallback for custom architectures).
+        factories = [
+            f
+            for f in (AutoModelForTextToWaveform, AutoModelForImageTextToText,
+                      AutoModelForCausalLM, AutoModel) if f is not None
+        ]
         last_err: Optional[Exception] = None
-        for factory in (AutoModelForImageTextToText, AutoModelForCausalLM,
-                        AutoModel):
+        for factory in factories:
             try:
                 model = factory.from_pretrained(
                     model_dir,
@@ -572,8 +580,12 @@ def _skip_resmooth_for_hybrid(model, quantization: str = ""):
     # NVFP4 on hybrid models: resmoothing is safe and required for GDN
     # input projection fusion — do NOT skip.
     is_nvfp4 = quantization.lower() in ("nvfp4", "fp4")
+    # Multimodal wrappers have no top-level ``forward``; resmooth's dummy
+    # ``model(fake_input)`` crashes on them. Resmooth is a no-op without
+    # AWQ pre_quant_scales, so skipping is safe here.
     should_skip = ((_is_hybrid_model(model) and not is_nvfp4)
-                   or model_type in ("phi4mm", "phi4_multimodal"))
+                   or model_type in ("phi4mm", "phi4_multimodal", "qwen3_omni",
+                                     "qwen3_omni_moe", "qwen3_omni_next"))
     if not should_skip:
         yield
         return
@@ -660,6 +672,7 @@ def quantize_and_export(
     quantization: Optional[str] = None,
     lm_head_quantization: Optional[str] = None,
     visual_quantization: Optional[str] = None,
+    cp_quantization: Optional[str] = None,
     kv_cache_quantization: Optional[str] = None,
     audio_quantization: Optional[str] = None,
     dtype: str = "fp16",
@@ -713,14 +726,68 @@ def quantize_and_export(
     if is_quantized(model):
         print("Model already quantized — skipping.")
     else:
+        # Fail fast when the user asks for CP quantization on a model that
+        # has no CodePredictor — otherwise the cp_quantization argument
+        # silently no-ops (build_quant_config still adds *code_predictor*
+        # wildcards but they match nothing).
+        if cp_quantization is not None and not has_code_predictor(model):
+            raise ValueError(
+                f"--cp_quantization={cp_quantization} requires a model with "
+                "talker.code_predictor (Qwen3-Omni / Qwen3-TTS); the loaded "
+                "checkpoint has none.")
+        # MoE Thinker backbone quantization runs through the dedicated
+        # ``tensorrt-edgellm-quantize thinker`` command (qwen3_omni_thinker.py);
+        # the ``llm`` command can't dummy-walk the MoE wrapper. Joint mode
+        # here would silently produce a Thinker-unquantized checkpoint.
+        if (cp_quantization is not None and quantization is not None
+                and getattr(model, "thinker", None) is not None
+                and "Moe" in type(model).__name__):
+            raise ValueError(
+                "Joint --quantization + --cp_quantization on the Qwen3-Omni-MoE "
+                "wrapper is not supported here. Use `--cp_quantization fp8` "
+                "alone via `tensorrt-edgellm-quantize llm`, and run "
+                "`tensorrt-edgellm-quantize thinker --quantization fp8` "
+                "separately for the MoE Thinker backbone.")
         quant_cfg = build_quant_config(
             quantization,
             lm_head_quantization,
             kv_cache_quantization,
             visual_quantization=visual_quantization,
             audio_quantization=audio_quantization,
+            cp_quantization=cp_quantization,
         )
-        if is_qwen3_asr_model(model_dir):
+        if cp_quantization is not None and has_code_predictor(model):
+            # CP is only reached via the Thinker->Talker->CP generation path,
+            # so a dedicated loop drives that chain (bs=1: Talker uses 3D
+            # RoPE, no batch-mixing). When backbone is co-quantized, prepend
+            # a standard text pass; backbone forward doesn't fire CP
+            # quantizers so CP amax matches standalone mode.
+            cp_loader = _text_calib_dataloader(tokenizer,
+                                               dataset,
+                                               batch_size=1,
+                                               num_samples=num_samples)
+            cp_n = min(num_samples, 64)
+            if quantization is not None:
+                bb_loader = _text_calib_dataloader(tokenizer,
+                                                   dataset,
+                                                   batch_size=16,
+                                                   num_samples=num_samples)
+
+                def _joint_cp_loop(m):
+                    _calibrate(m, bb_loader)
+                    qwen3_cp_calibration_loop(m,
+                                              cp_loader,
+                                              num_cp_samples=cp_n)
+
+                mtq.quantize(model, quant_cfg, forward_loop=_joint_cp_loop)
+            else:
+                mtq.quantize(
+                    model,
+                    quant_cfg,
+                    forward_loop=lambda m: qwen3_cp_calibration_loop(
+                        m, cp_loader, num_cp_samples=cp_n),
+                )
+        elif is_qwen3_asr_model(model_dir):
             # ASR multimodal calibration: stream real (audio, transcript)
             # pairs through the joint audio_tower + text decoder so the
             # text quantizers see audio-embedding-spliced inputs (the
@@ -801,14 +868,25 @@ def quantize_and_export(
     extra_state_dict.update(attention_q_scales)
 
     os.makedirs(output_dir, exist_ok=True)
-    with torch.inference_mode(), _skip_resmooth_for_hybrid(
-            model, quantization or ""):
-        export_hf_checkpoint(model,
-                             export_dir=output_dir,
-                             extra_state_dict=extra_state_dict)
-    if attention_q_scales:
-        print("Exported calibrated Q-BMM scales for "
-              f"{len(attention_q_scales)} attention layer(s).")
+    # MoE wrapper has no top-level ``forward`` → ``export_hf_checkpoint``'s
+    # dummy walk crashes. Route CP-only quantization on such wrappers through
+    # ``qwen3_omni._export_submodel(model, "talker", ...)``.
+    cp_only_moe_wrapper = (cp_quantization is not None and quantization is None
+                           and has_code_predictor(model)
+                           and getattr(model, "thinker", None) is not None
+                           and "Moe" in type(model).__name__)
+    if cp_only_moe_wrapper:
+        from .qwen3_omni import _export_submodel
+        _export_submodel(model, "talker", output_dir)
+    else:
+        with torch.inference_mode(), _skip_resmooth_for_hybrid(
+                model, quantization or ""):
+            export_hf_checkpoint(model,
+                                 export_dir=output_dir,
+                                 extra_state_dict=extra_state_dict)
+        if attention_q_scales:
+            print("Exported calibrated Q-BMM scales for "
+                  f"{len(attention_q_scales)} attention layer(s).")
     _remove_stale_safetensors_index(output_dir)
     tokenizer.save_pretrained(output_dir)
     if processor is not None:
