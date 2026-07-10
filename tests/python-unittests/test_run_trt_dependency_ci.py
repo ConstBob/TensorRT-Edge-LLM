@@ -247,7 +247,7 @@ def _main_harness(monkeypatch,
                   run_remote,
                   architecture=Arch.X86_64,
                   download_onnx=False,
-                  build_locally=False):
+                  no_trt_containers=False):
     monkeypatch.setenv("TRT_CI_ARTIFACTS_DIR", str(tmp_path / "artifacts"))
     monkeypatch.setenv("TRT_CI_BRANCH", "rel-ci-test")
     monkeypatch.setenv("TRT_CI_ONNX_DIR", "/models/onnx")
@@ -266,7 +266,7 @@ def _main_harness(monkeypatch,
                        PurePosixPath("/models/onnx"),
                        7,
                        download_onnx=download_onnx,
-                       build_locally=build_locally)
+                       no_trt_containers=no_trt_containers)
     events = []
     commands = FakeCommands(events)
     build_rcm = (_remote(build_connection, config, "build", events)
@@ -319,8 +319,8 @@ def _main_harness(monkeypatch,
     ]
     if download_onnx:
         argv.append("--download_onnx")
-    if build_locally:
-        argv.append("--build-locally")
+    if no_trt_containers:
+        argv.append("--no-trt-containers")
     return SimpleNamespace(argv=argv,
                            config=config,
                            events=events,
@@ -460,13 +460,13 @@ def test_direct_json_target_preserves_jump_host(monkeypatch):
     assert commands.calls == []
 
 
-def test_native_build_uses_command_manager_and_preserves_deployment(
+def test_no_trt_containers_uses_host_commands_and_preserves_deployment(
         monkeypatch, tmp_path):
     harness = _main_harness(monkeypatch,
                             tmp_path,
                             build_remote=True,
                             run_remote=True,
-                            build_locally=True)
+                            no_trt_containers=True)
 
     assert ci.main(harness.argv) == 0
 
@@ -483,8 +483,17 @@ def test_native_build_uses_command_manager_and_preserves_deployment(
     deployed = harness.code.deploy_calls[0][0]
     assert any(step.component is BuildComponent.EDGELLM
                for step in deployed.plan.steps)
-    native_index = harness.events.index("command:native-edgellm-build")
-    assert "container:resolve" not in harness.events[:native_index]
+    test_target, test_spec = next(
+        (target, spec) for target, spec in harness.commands.calls
+        if spec.operation_name == "edgellm-python-e2e")
+    assert test_target is harness.run_host.target
+    assert "python3 -m pytest" in test_spec.command
+    assert str(ci._PYTHON) not in test_spec.command
+    assert f"source {harness.config.runtime_root / 'setup_environment.sh'}" in test_spec.command
+    assert harness.code.container_manager.resolve_calls == []
+    assert harness.code.container_manager.launch_calls == []
+    assert harness.code.container_manager.exec_calls == []
+    assert harness.code.container_manager.remove_calls == []
 
 
 @pytest.mark.parametrize(
@@ -765,7 +774,7 @@ exit 98
     monkeypatch.setattr(ci, "_PYTHON_ROOT", bin_dir)
     trace_file = tmp_path / "trace"
     runtime = ci.Runtime(LocalTarget(), PurePosixPath(str(workspace)),
-                         PurePosixPath(str(edge)),
+                         PurePosixPath(str(edge)), config.trt_location,
                          PurePosixPath(str(edge / "setup_environment.sh")))
     env = os.environ | {
         "PATH": f"{bin_dir}:{os.environ['PATH']}",

@@ -190,6 +190,7 @@ class Runtime:
     target: Any
     workspace: PurePosixPath
     edge: PurePosixPath
+    trt: PurePosixPath
     env_script: PurePosixPath
 
 
@@ -205,7 +206,7 @@ class Config:
     jobs: int
     source_root: Path = _SOURCE_ROOT
     download_onnx: bool = False
-    build_locally: bool = False
+    no_trt_containers: bool = False
 
     def validate(self) -> None:
         if self.architecture not in {Arch.X86_64, Arch.D7L}:
@@ -394,8 +395,9 @@ def _cleanup(remote: Any, path: PurePosixPath, logger: Any) -> None:
         logger.warning("Could not clean run-host workspace: %s", error)
 
 
-# TODO(devtoolkit): replace this with a public CodeManager host-native
-# source-build mode and a public API that renders the component build command.
+# TODO(devtoolkit): add a CodeManager no_container option that builds source
+# artifacts through CommandManager, exposes each component build command, runs
+# E2E commands on the host, and emits the same runtime setup environment.
 def _native_build_command(target: ArtifactTarget) -> str:
     build = target.build
     if not build.repo_path or not build.build_dir or not build.trt_package_dir:
@@ -423,7 +425,7 @@ def _native_build_command(target: ArtifactTarget) -> str:
     ])
 
 
-def _build_locally(commands: Any, target: Any, edge: ArtifactTarget,
+def _build_on_host(commands: Any, target: Any, edge: ArtifactTarget,
                    run_result: Any) -> Any:
     edge = dataclasses.replace(
         edge,
@@ -470,12 +472,12 @@ def _build_locally(commands: Any, target: Any, edge: ArtifactTarget,
 def _build(config: Config, code: Any, build_target: Any) -> Any:
     targets = build_targets(config)
     run_result = code.plan_and_execute(
-        targets[:1] if config.build_locally else targets)
+        targets[:1] if config.no_trt_containers else targets)
     if not run_result.success:
         raise FlowError("CodeManager build failed: " +
                         "; ".join(run_result.error_messages))
-    if config.build_locally:
-        return _build_locally(code.command_manager, build_target, targets[1],
+    if config.no_trt_containers:
+        return _build_on_host(code.command_manager, build_target, targets[1],
                               run_result)
     return run_result
 
@@ -526,13 +528,15 @@ def _deploy(config: Config, code: Any, run_host: Host,
             target=deployment.remote_target,
             workspace=workspace,
             edge=workspace / "edgellm",
+            trt=workspace / "trt",
             env_script=PurePosixPath(deployment.env_script_path),
         )
 
     edge = PurePosixPath(str(config.edgellm_root))
     setup = code.write_environment_setup_script(
         run_result, preferred_component=BuildComponent.EDGELLM)
-    return Runtime(run_host.target, edge, edge, PurePosixPath(setup))
+    return Runtime(run_host.target, edge, edge, config.trt_location,
+                   PurePosixPath(setup))
 
 
 def _download_onnx(config: Config, commands: Any, target: Any) -> None:
@@ -562,7 +566,7 @@ def _download_onnx(config: Config, commands: Any, target: Any) -> None:
 
 def _run_tests(config: Config, code: Any, run_host: Host, run_result: Any,
                runtime: Runtime, logger: Any) -> int:
-    if config.architecture is Arch.D7L:
+    if config.no_trt_containers or config.architecture is Arch.D7L:
         result = code.command_manager.run(
             runtime.target,
             CommandSpec(
@@ -657,9 +661,10 @@ def _test_command(config: Config, runtime: Runtime) -> str:
                            for model in _E2E_MODEL_FAMILIES)
     inference_cases = " ".join(f"--test-param={q(model + '-llm_basic')}"
                                for model in _E2E_MODEL_FAMILIES)
-    python = "python3" if config.architecture is Arch.D7L else str(_PYTHON)
-    python_path = ("" if config.architecture is Arch.D7L else
-                   f"export PATH={q(str(_PYTHON.parent))}:$PATH\n")
+    use_host_python = (config.no_trt_containers
+                       or config.architecture is Arch.D7L)
+    python = "python3" if use_host_python else str(_PYTHON)
+    python_path = "" if use_host_python else f"export PATH={q(str(_PYTHON.parent))}:$PATH\n"
     export_step = ""
     if config.download_onnx:
         export_tests = runtime.edge / "tests/defs/test_checkpoint_export.py"
@@ -682,7 +687,7 @@ export ONNX_DIR={q(str(config.onnx_root))}
 export ENGINE_DIR={q(str(runtime.workspace / 'engines'))}
 export BUILD_DIR={q(str(runtime.edge))}
 export TEST_LOG_DIR={q(str(results / 'logs'))}
-export TRT_PACKAGE_DIR={q(str(runtime.workspace / 'trt'))}
+export TRT_PACKAGE_DIR={q(str(runtime.trt))}
 rm -rf {q(str(results))}
 mkdir -p {q(str(results))}
 {export_step}{q(python)} -m pytest -q {q(str(tests))}::TestLLMPipeline::test_engine_build \
@@ -710,9 +715,9 @@ def _parser() -> argparse.ArgumentParser:
         "run_host",
         help="inline JSON object or JSON file path for the run host")
     parser.add_argument(
-        "--build-locally",
+        "--no-trt-containers",
         action="store_true",
-        help="build EdgeLLM through CommandManager on the build host",
+        help="run the EdgeLLM build and E2E tests without TRT containers",
     )
     parser.add_argument(
         "--download_onnx",
@@ -743,7 +748,7 @@ def _config(args: argparse.Namespace) -> Config:
             os.environ.get("TRT_CI_ONNX_DIR", str(_DEFAULT_ONNX_ROOT))),
         jobs=jobs,
         download_onnx=args.download_onnx,
-        build_locally=args.build_locally,
+        no_trt_containers=args.no_trt_containers,
     )
     config.validate()
     return config

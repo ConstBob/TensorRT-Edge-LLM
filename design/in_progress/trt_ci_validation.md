@@ -35,11 +35,13 @@ local build host while the run host supplies the GPU. Passwords should be
 passed in protected JSON files in CI; an empty password selects SSH key
 authentication.
 
-`--build-locally` uses CommandManager to execute the same Edge-LLM CMake/make
-configuration on the selected build host without a build container. The script
-adds the native result to the CodeManager run result so deployment remains
-toolkit-owned. It requires the host compiler, CMake, CUDA, and any target
-cross-toolchain to be preinstalled; x86 test execution is unchanged.
+`--no-trt-containers` uses CommandManager to build Edge-LLM on the selected
+build host and run the Python E2E tests directly on the selected run host. The
+script adds the native result to the CodeManager run result so deployment
+remains toolkit-owned, then sources CodeManager's generated runtime setup
+script before testing so Edge-LLM and TRT library paths match normal deployment.
+The build host needs compiler, CMake, CUDA, and any target cross-toolchain; the
+run host needs Python and pytest.
 
 TRT is passed unchanged as a CodeManager `PRE_BUILT` build dependency usable
 as Edge-LLM `TRT_PACKAGE_DIR`. D7L deployment omits build-only static archives

@@ -43,7 +43,7 @@ python3 scripts/run_trt_dependency_ci.py \
   /path/to/run-host.json
 ```
 
-Append `--build-locally` to build Edge-LLM natively on the selected build host.
+Append `--no-trt-containers` to build Edge-LLM and run its Python E2E tests natively on their selected hosts.
 
 Each host argument may be an inline JSON object or a JSON file.
 
@@ -94,34 +94,35 @@ is passed unchanged to CodeManager as a `PRE_BUILT` artifact usable as
 build, the checkout and TRT package must be visible at the same absolute paths
 on the controller and build host.
 
-Pass `--build-locally` to run Edge-LLM's CMake and make steps through
-devtoolkit `CommandManager` on the selected build host instead of launching a
-build container. CodeManager still records the TRT `PRE_BUILT` artifact and
-deploys the resulting native Edge-LLM artifact. The native build host must
-already provide the required compiler, CMake, CUDA toolkit, and cross-toolchain
-when applicable. This option changes only the build; x86 test execution remains
-containerized.
+Pass `--no-trt-containers` to run Edge-LLM's CMake/make build on the
+build host and its Python E2E tests on the run host through devtoolkit
+`CommandManager`, without launching TRT containers. CodeManager still records
+the TRT `PRE_BUILT` artifact, deploys the resulting native Edge-LLM artifact,
+and writes the sourced runtime environment script, including `LD_LIBRARY_PATH`
+for Edge-LLM and TRT. Both hosts must already provide their required native
+toolchain; the run host must also provide Python and pytest.
 
 One controller process owns the flow; there is no hidden worker or script
 self-invocation:
 
 1. `CodeManager.plan_and_execute()` binds TRT. By default it builds the
-   current Edge-LLM checkout through `ContainerManager`; `--build-locally`
-   runs the CMake/make build through `CommandManager` on the build target.
-   The checkout and TRT package must be visible at the same absolute paths on a
+   current Edge-LLM checkout through `ContainerManager`; `--no-trt-containers`
+   runs the CMake/make build through `CommandManager` on the build target. The
+   checkout and TRT package must be visible at the same absolute paths on a
    remote build host.
-2. The default build container explicitly disables the NVIDIA runtime, so a
-   containerized local build host does not need a GPU. A native build instead
-   uses its preinstalled host toolchain.
+2. The default build container explicitly disables the NVIDIA runtime. With
+   `--no-trt-containers`, the native build host supplies its toolchain instead.
+   CodeManager's generated setup script configures the deployed Edge-LLM/TRT
+   library paths before the direct E2E command runs.
 3. `RemoteConnectionManager` supplies direct JSON-configured SSH targets and
    CodeManager's deployment transport. A remote run uses
    `CodeManager.deploy_runtime()`; x86 requests direct rsync, while D7L lets
    the toolkit try NFS before its direct-copy fallbacks. D7L first derives a
    runtime `RunResult` that omits build-only TRT static archives. A local run
    uses `CodeManager.write_environment_setup_script()` without a copy.
-4. On x86, the CodeManager-owned `ContainerManager` launches and executes the
-   test container on the run target via its `exec_target`. On D7L, the same
-   Python E2E cases run directly on the deployed board runtime.
+4. By default, x86 uses a CodeManager-owned runtime container; D7L runs the
+   Python E2E cases directly on the deployed board runtime. `--no-trt-containers`
+   makes x86 use that same direct `CommandManager` execution path.
 5. Remote JUnit, logs, and inference outputs are copied back to the local
    artifact directory. Engines remain in the remote run workspace and all
    script-owned remote workspaces are then removed best-effort.
