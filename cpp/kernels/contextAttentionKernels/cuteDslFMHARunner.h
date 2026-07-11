@@ -147,26 +147,34 @@ private:
     // LLM kernel modules (FP16)
     static fmha_d64_Kernel_Module_t sLLM_d64;
     static fmha_d128_Kernel_Module_t sLLM_d128;
+    static fmha_d256_Kernel_Module_t sLLM_d256;
     static fmha_d64_sw_Kernel_Module_t sLLM_d64_sw;
     static fmha_d128_sw_Kernel_Module_t sLLM_d128_sw;
+    static fmha_d256_sw_Kernel_Module_t sLLM_d256_sw;
 
     // LLM kernel modules (FP8 input, FP16 output)
     static fmha_d64_fp8_Kernel_Module_t sLLM_d64_fp8;
     static fmha_d128_fp8_Kernel_Module_t sLLM_d128_fp8;
+    static fmha_d256_fp8_Kernel_Module_t sLLM_d256_fp8;
     static fmha_d64_sw_fp8_Kernel_Module_t sLLM_d64_sw_fp8;
     static fmha_d128_sw_fp8_Kernel_Module_t sLLM_d128_sw_fp8;
+    static fmha_d256_sw_fp8_Kernel_Module_t sLLM_d256_sw_fp8;
 
     // LLM paged KV cache kernel modules (FP16)
     static fmha_d64_paged_Kernel_Module_t sLLM_d64_paged;
     static fmha_d128_paged_Kernel_Module_t sLLM_d128_paged;
+    static fmha_d256_paged_Kernel_Module_t sLLM_d256_paged;
     static fmha_d64_sw_paged_Kernel_Module_t sLLM_d64_sw_paged;
     static fmha_d128_sw_paged_Kernel_Module_t sLLM_d128_sw_paged;
+    static fmha_d256_sw_paged_Kernel_Module_t sLLM_d256_sw_paged;
 
     // LLM paged KV cache kernel modules (FP8 input, FP16 output)
     static fmha_d64_paged_fp8_Kernel_Module_t sLLM_d64_paged_fp8;
     static fmha_d128_paged_fp8_Kernel_Module_t sLLM_d128_paged_fp8;
+    static fmha_d256_paged_fp8_Kernel_Module_t sLLM_d256_paged_fp8;
     static fmha_d64_sw_paged_fp8_Kernel_Module_t sLLM_d64_sw_paged_fp8;
     static fmha_d128_sw_paged_fp8_Kernel_Module_t sLLM_d128_sw_paged_fp8;
+    static fmha_d256_sw_paged_fp8_Kernel_Module_t sLLM_d256_sw_paged_fp8;
 
     static bool sLLMLoaded;
     static std::mutex sLLMMutex;

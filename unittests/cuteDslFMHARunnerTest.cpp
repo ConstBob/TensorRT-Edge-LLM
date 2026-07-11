@@ -216,8 +216,10 @@ rt::Coords pagedKVPoolShape(int32_t numPages, int32_t numKVHeads, int32_t tokens
     return rt::Coords{numPages, tokensPerPage, numKVHeads, headDim};
 }
 
-void runLlmPagedMatchesContiguousCase(
-    int32_t batchSize, int32_t seqLen, int32_t numQHeads, int32_t numKVHeads, int32_t headDim, int32_t tokensPerPage)
+template <typename T>
+void runLlmPagedMatchesContiguousCase(int32_t batchSize, int32_t seqLen, int32_t numQHeads, int32_t numKVHeads,
+    int32_t headDim, int32_t tokensPerPage, DataType dataType, int32_t slidingWindowSize = INT_MAX,
+    bool fp8Input = false, float qScale = 1.0F, float kScale = 1.0F, float vScale = 1.0F)
 {
     ASSERT_EQ(seqLen % tokensPerPage, 0);
     int32_t const maxPagesPerSeq = seqLen / tokensPerPage;
@@ -227,9 +229,9 @@ void runLlmPagedMatchesContiguousCase(
     size_t const kvSize = static_cast<size_t>(batchSize) * 2 * numKVHeads * seqLen * headDim;
     size_t const pagedKVSize = static_cast<size_t>(numPages) * numKVHeads * tokensPerPage * headDim;
 
-    std::vector<half> qInput(qSize);
-    std::vector<half> kvContiguous(kvSize);
-    std::vector<half> kvPaged(pagedKVSize);
+    std::vector<T> qInput(qSize);
+    std::vector<T> kvContiguous(kvSize);
+    std::vector<T> kvPaged(pagedKVSize);
     std::vector<int32_t> pageList(static_cast<size_t>(batchSize) * 2 * maxPagesPerSeq);
 
     uniformFloatInitialization(qInput, -1.0f, 1.0f);
@@ -268,11 +270,11 @@ void runLlmPagedMatchesContiguousCase(
         }
     }
 
-    rt::Tensor qContiguous({batchSize, seqLen, numQHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor qPaged({batchSize, seqLen, numQHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor kvContiguousTensor({batchSize, 2, numKVHeads, seqLen, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor qContiguous({batchSize, seqLen, numQHeads, headDim}, rt::DeviceType::kGPU, dataType);
+    rt::Tensor qPaged({batchSize, seqLen, numQHeads, headDim}, rt::DeviceType::kGPU, dataType);
+    rt::Tensor kvContiguousTensor({batchSize, 2, numKVHeads, seqLen, headDim}, rt::DeviceType::kGPU, dataType);
     rt::Tensor kvPagedTensor(
-        pagedKVPoolShape(numPages, numKVHeads, tokensPerPage, headDim), rt::DeviceType::kGPU, DataType::kHALF);
+        pagedKVPoolShape(numPages, numKVHeads, tokensPerPage, headDim), rt::DeviceType::kGPU, dataType);
     rt::Tensor pageListTensor({batchSize, 2, maxPagesPerSeq}, rt::DeviceType::kGPU, DataType::kINT32);
     rt::Tensor outputContiguous({batchSize, seqLen, numQHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
     rt::Tensor outputPaged({batchSize, seqLen, numQHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
@@ -294,29 +296,28 @@ void runLlmPagedMatchesContiguousCase(
     cudaStream_t stream = nullptr;
     float const attentionScale = 1.0F / std::sqrt(static_cast<float>(headDim));
     CuteDslFMHARunner runner(numQHeads, numKVHeads, headDim, batchSize, seqLen, seqLen);
-    runner.run(qContiguous.dataPointer<half>(), kvContiguousTensor.dataPointer<half>(),
-        outputContiguous.dataPointer<half>(), cuKVSeqLens.dataPointer<int32_t>(), stream, attentionScale, INT_MAX);
-    runner.runPaged(qPaged.dataPointer<half>(), kvPagedTensor.dataPointer<half>(),
-        pageListTensor.dataPointer<int32_t>(), outputPaged.dataPointer<half>(), cuKVSeqLens.dataPointer<int32_t>(),
-        numPages, maxPagesPerSeq, tokensPerPage, DataType::kHALF, stream, attentionScale, INT_MAX);
+    runner.run(qContiguous.rawPointer(), kvContiguousTensor.rawPointer(), outputContiguous.dataPointer<half>(),
+        cuKVSeqLens.dataPointer<int32_t>(), stream, attentionScale, slidingWindowSize, fp8Input, qScale, kScale,
+        vScale);
+    runner.runPaged(qPaged.rawPointer(), kvPagedTensor.rawPointer(), pageListTensor.dataPointer<int32_t>(),
+        outputPaged.dataPointer<half>(), cuKVSeqLens.dataPointer<int32_t>(), numPages, maxPagesPerSeq, tokensPerPage,
+        dataType, stream, attentionScale, slidingWindowSize, fp8Input, qScale, kScale, vScale);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
 
     expectHalfOutputsClose(outputPaged, outputContiguous,
         "Paged LLM CuTe DSL FMHA batch=" + std::to_string(batchSize) + " seqLen=" + std::to_string(seqLen)
             + " numQHeads=" + std::to_string(numQHeads) + " numKVHeads=" + std::to_string(numKVHeads)
-            + " headDim=" + std::to_string(headDim) + " tokensPerPage=" + std::to_string(tokensPerPage));
+            + " headDim=" + std::to_string(headDim) + " tokensPerPage=" + std::to_string(tokensPerPage)
+            + " fp8Input=" + std::to_string(fp8Input) + " slidingWindowSize=" + std::to_string(slidingWindowSize));
 }
 
-void runLlmFp8LongSequenceAccuracyCase()
+void runLlmFp8LongSequenceAccuracyCase(int32_t numQHeads, int32_t numKVHeads, int32_t headDim)
 {
-    // Nemotron layer-0 scales and SD GQA geometry. A 2048-token sequence exercises
+    // Nemotron layer-0 scales. A 2048-token sequence exercises
     // multiple online-softmax tiles where FP8 skip-correction must remain representable.
     constexpr int32_t batchSize = 1;
     constexpr int32_t seqLen = 2048;
-    constexpr int32_t numQHeads = 32;
-    constexpr int32_t numKVHeads = 2;
-    constexpr int32_t headDim = 128;
     constexpr float qScale = 0.01429094560444355f;
     constexpr float kScale = 1.0f;
     constexpr float vScale = 1.0f;
@@ -413,6 +414,14 @@ void runLlmFp8LongSequenceAccuracyCase()
 
 } // namespace
 
+TEST(CuteDslFMHARunnerTest, canImplement)
+{
+    EXPECT_TRUE(CuteDslFMHARunner::canImplement(64, 100));
+    EXPECT_TRUE(CuteDslFMHARunner::canImplement(128, 110));
+    EXPECT_TRUE(CuteDslFMHARunner::canImplement(256, 110));
+    EXPECT_FALSE(CuteDslFMHARunner::canImplement(256, 90));
+}
+
 TEST(CuteDslFMHARunnerTest, vitAccuracy)
 {
     int32_t const rawSmVersion = getSMVersion();
@@ -492,6 +501,8 @@ TEST(CuteDslFMHARunnerTest, llmAccuracy)
         {1, 32, 12, 4, 128},
         {1, 16, 8, 8, 64, 1.0F},
         {1, 16, 8, 2, 128, 0.37F},
+        {1, 32, 16, 2, 256},
+        {1, 256, 16, 2, 256},
     };
 
     for (auto const& testCase : cases)
@@ -527,6 +538,7 @@ TEST(CuteDslFMHARunnerTest, llmPagedKVMatchesContiguous)
         int32_t numKVHeads;
         int32_t headDim;
         int32_t tokensPerPage;
+        int32_t slidingWindowSize{INT_MAX};
     };
 
     std::vector<LlmPagedCase> const cases{
@@ -534,6 +546,8 @@ TEST(CuteDslFMHARunnerTest, llmPagedKVMatchesContiguous)
         {2, 128, 16, 4, 64, 128},
         {1, 128, 8, 8, 128, 128},
         {1, 256, 12, 4, 128, 128},
+        {1, 256, 16, 2, 256, 128},
+        {1, 256, 16, 2, 256, 128, 192},
     };
 
     for (auto const& testCase : cases)
@@ -542,9 +556,33 @@ TEST(CuteDslFMHARunnerTest, llmPagedKVMatchesContiguous)
             << "batchSize=" << testCase.batchSize << " seqLen=" << testCase.seqLen
             << " numQHeads=" << testCase.numQHeads << " numKVHeads=" << testCase.numKVHeads
             << " headDim=" << testCase.headDim << " tokensPerPage=" << testCase.tokensPerPage);
-        runLlmPagedMatchesContiguousCase(testCase.batchSize, testCase.seqLen, testCase.numQHeads, testCase.numKVHeads,
-            testCase.headDim, testCase.tokensPerPage);
+        runLlmPagedMatchesContiguousCase<half>(testCase.batchSize, testCase.seqLen, testCase.numQHeads,
+            testCase.numKVHeads, testCase.headDim, testCase.tokensPerPage, DataType::kHALF, testCase.slidingWindowSize);
     }
+}
+
+TEST(CuteDslFMHARunnerTest, llmPagedKVFp8MatchesContiguous)
+{
+    int32_t const rawSmVersion = getSMVersion();
+    if (!isSupportedCuteDslTestSm(rawSmVersion))
+    {
+        GTEST_SKIP() << "CuTe DSL FMHA unit tests only run on SM100/101/110. Current SM=" << rawSmVersion;
+    }
+
+    if (!CuteDslFMHARunner::loadLLMKernelModule())
+    {
+        FAIL() << "Failed to load CuTe DSL LLM FMHA kernel module";
+    }
+
+    constexpr float qScale = 0.01429094560444355F;
+    constexpr float kScale = 0.021F;
+    constexpr float vScale = 0.017F;
+    runLlmPagedMatchesContiguousCase<__nv_fp8_e4m3>(
+        1, 256, 12, 4, 128, 128, DataType::kFP8, INT_MAX, true, qScale, kScale, vScale);
+    runLlmPagedMatchesContiguousCase<__nv_fp8_e4m3>(
+        1, 256, 16, 2, 256, 128, DataType::kFP8, INT_MAX, true, qScale, kScale, vScale);
+    runLlmPagedMatchesContiguousCase<__nv_fp8_e4m3>(
+        1, 256, 16, 2, 256, 128, DataType::kFP8, 192, true, qScale, kScale, vScale);
 }
 
 TEST(CuteDslFMHARunnerTest, llmFp8LongSequenceAccuracy)
@@ -560,7 +598,8 @@ TEST(CuteDslFMHARunnerTest, llmFp8LongSequenceAccuracy)
         FAIL() << "Failed to load CuTe DSL LLM FMHA kernel module";
     }
 
-    runLlmFp8LongSequenceAccuracyCase();
+    runLlmFp8LongSequenceAccuracyCase(32, 2, 128);
+    runLlmFp8LongSequenceAccuracyCase(16, 2, 256);
 }
 
 #endif

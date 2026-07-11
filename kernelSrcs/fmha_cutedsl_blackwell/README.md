@@ -43,7 +43,7 @@ This produces the following artifacts under
 `sm_121`).
 
 ```
-libcutedsl_{arch}.a          — all 8 kernel .o files + libcuda_dialect_runtime_static.a merged in
+libcutedsl_{arch}.a          — all FMHA kernel .o files + libcuda_dialect_runtime_static.a merged in
 metadata.json                — build provenance (CUDA ver, DSL ver, date, groups)
 include/
     cutedsl_all.h            — umbrella header
@@ -109,18 +109,23 @@ Local modifications are captured in `fmha.patch`.
 
 ## 1. Kernel Variants
 
-The build produces eight AOT-compiled kernel objects (`.o` + `.h` pairs):
+`fmha.py` contains two independently compiled kernel classes. The generic class
+handles D32-D128, while `BlackwellFusedMultiHeadAttentionForwardD256` uses a
+D256-specific TMEM and pipeline layout. The host selects the class before
+`cute.compile`, so the generated hot kernels contain no head-dimension branch.
 
-| Variant | Head Dim | SWA | Mode | Causal |
-|---|---|---|---|---|
-| `fmha_d64` | 64 | No | LLM | Yes |
-| `fmha_d128` | 128 | No | LLM | Yes |
-| `fmha_d64_sw` | 64 | Yes | LLM | Yes |
-| `fmha_d128_sw` | 128 | Yes | LLM | Yes |
-| `vit_fmha_d64` | 64 | No | ViT | No |
-| `vit_fmha_d72` | 72 | No | ViT | No |
-| `vit_fmha_d80` | 80 | No | ViT | No |
-| `vit_fmha_d128` | 128 | No | ViT | No |
+| Input / KV dtype | KV layout | Head dims | Variants per head dim |
+|---|---|---|---|
+| FP16 | Contiguous | 64, 128, 256 | regular, sliding window |
+| FP8 E4M3 | Contiguous | 64, 128, 256 | regular, sliding window |
+| FP16 | Paged | 64, 128, 256 | regular, sliding window |
+| FP8 E4M3 | Paged | 64, 128, 256 | regular, sliding window |
+| FP16 | Packed ViT | 64, 72, 80, 128 | bidirectional |
+
+The eight D256 AOT names are `fmha_d256`, `fmha_d256_sw`,
+`fmha_d256_fp8`, `fmha_d256_sw_fp8`, `fmha_d256_paged`,
+`fmha_d256_sw_paged`, `fmha_d256_paged_fp8`, and
+`fmha_d256_sw_paged_fp8`. D256 ViT is not supported.
 
 **LLM variants** use a fused KV cache layout `[B, 2, H_kv, S_k, D]` with causal
 masking and bottom-right alignment (`WINDOW_MASK_INFERENCE`).
