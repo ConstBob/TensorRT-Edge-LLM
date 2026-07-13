@@ -22,11 +22,15 @@ toolchain rather than adding a second C++ GEMM backend.
 
 All arrays remain in GPU memory:
 
-- `problem_shapes`: INT32 `[128,4]`, containing `(M,N,K,L)` with `L=1`.
-- `strides`: INT32 `[128,3,2]`, containing row/contiguous strides for A/B/D.
-- `addresses`: INT64 `[128,3]`, containing A/B/D device addresses.
-- `scratch`: UINT8 `[128,3,128]`; TMA variants use one A/B/D descriptor set
+- `problem_shapes`: INT32 `[E,4]`, containing `(M,N,K,L)` with `L=1`.
+- `strides`: INT32 `[E,3,2]`, containing row/contiguous strides for A/B/D.
+- `addresses`: INT64 `[E,3]`, containing A/B/D device addresses.
+- `scratch`: UINT8 `[E,3,128]`; TMA variants use one A/B/D descriptor set
   per persistent CTA and Ampere keeps the argument for ABI parity.
+
+`E` is the runtime expert count (`group_count`); the AOT trace sizes its dummy
+buffers with `MAX_NUM_EXPERTS` (256), which bounds `group_count` but is not
+baked into the cubin.
 
 After the seven device pointers, the exported wrapper accepts these runtime
 values in order:
@@ -34,7 +38,10 @@ values in order:
 - `max_m`, `max_n`, and `max_k`: global bounds used to construct the A, B, and
   D tensor views. They do not replace the exact per-expert `(M,N,K)` values in
   `problem_shapes`.
-- `group_count`: the number of descriptor groups; plugin version 1 passes 128.
+- `group_count`: the number of descriptor groups (runtime expert count). The
+  cubin is runtime-polymorphic in this dimension; the C++ runner restricts it
+  to the product-supported set `{128, 256}`
+  (`CuteDslF16MoeRunner::kSupportedNumExperts`).
 - `max_active_clusters`: the cached persistent launch count for the device.
 - CUDA stream.
 
@@ -73,7 +80,7 @@ multiple SMs share one kernel implementation family.
 
 ## Fixed plugin contract
 
-- FP16 only, exactly 128 experts, top-K 1 through 8.
+- FP16 only, expert count in `{128, 256}`, top-K 1 through 8.
 - `H % 128 == 0`, `I % 64 == 0`, and `FC1_N % 128 == 0`.
 - FC1 weights: row-major `[E,FC1_N,H]`.
 - FC2 weights: row-major `[E,H,I]`.

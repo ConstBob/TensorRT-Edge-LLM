@@ -40,6 +40,7 @@ namespace
 {
 
 constexpr int32_t kNUM_EXPERTS{128};
+constexpr int32_t kNUM_EXPERTS_LARGE{256};
 constexpr int32_t kTOP_K{8};
 constexpr int32_t kHIDDEN_SIZE{128};
 constexpr int32_t kINTER_SIZE{128};
@@ -65,6 +66,7 @@ struct MoeCase
     uint32_t seed;
     int32_t interSize{kINTER_SIZE};
     bool identityFc2{};
+    int32_t numExperts{kNUM_EXPERTS};
 };
 
 struct CaseData
@@ -105,12 +107,13 @@ CaseData makeCase(MoeCase config)
 {
     int32_t const fc1Rows = config.activationType == kACT_SWIGLU ? 2 * config.interSize : config.interSize;
     CaseData data{std::move(config), fc1Rows};
+    int32_t const numExperts = data.config.numExperts;
     size_t const numRoutes = static_cast<size_t>(data.config.numTokens) * kTOP_K;
     data.hiddenStates.resize(static_cast<size_t>(data.config.numTokens) * kHIDDEN_SIZE);
     data.topkIds.resize(numRoutes);
     data.topkWeights.resize(numRoutes);
-    data.fc1Weights.resize(static_cast<size_t>(kNUM_EXPERTS) * fc1Rows * kHIDDEN_SIZE);
-    data.fc2Weights.resize(static_cast<size_t>(kNUM_EXPERTS) * kHIDDEN_SIZE * data.config.interSize);
+    data.fc1Weights.resize(static_cast<size_t>(numExperts) * fc1Rows * kHIDDEN_SIZE);
+    data.fc2Weights.resize(static_cast<size_t>(numExperts) * kHIDDEN_SIZE * data.config.interSize);
 
     std::mt19937 generator{data.config.seed};
     std::uniform_real_distribution<float> inputDistribution{kINPUT_MIN, kINPUT_MAX};
@@ -125,14 +128,14 @@ CaseData makeCase(MoeCase config)
         for (int32_t slot = 0; slot < kTOP_K; ++slot)
         {
             size_t const route = static_cast<size_t>(token) * kTOP_K + slot;
-            data.topkIds[route] = (slot * 17 + token * 13) % kNUM_EXPERTS;
+            data.topkIds[route] = (slot * 17 + token * 13) % numExperts;
             data.topkWeights[route] = static_cast<float>(slot + 1) / kROUTER_DENOMINATOR;
         }
     }
 
     if (data.config.activationType == kACT_SWIGLU)
     {
-        for (int32_t expert = 0; expert < kNUM_EXPERTS; ++expert)
+        for (int32_t expert = 0; expert < numExperts; ++expert)
         {
             for (int32_t intermediate = 0; intermediate < data.config.interSize; ++intermediate)
             {
@@ -159,7 +162,7 @@ CaseData makeCase(MoeCase config)
     if (data.config.identityFc2)
     {
         std::fill(data.fc2Weights.begin(), data.fc2Weights.end(), __float2half_rn(0.0F));
-        for (int32_t expert = 0; expert < kNUM_EXPERTS; ++expert)
+        for (int32_t expert = 0; expert < numExperts; ++expert)
         {
             for (int32_t index = 0; index < kHIDDEN_SIZE; ++index)
             {
@@ -247,12 +250,13 @@ RunResult runCase(CaseData const& data)
 {
     using rt::DeviceType;
     int32_t const numTokens = data.config.numTokens;
+    int32_t const numExperts = data.config.numExperts;
     rt::Tensor hiddenStates({numTokens, kHIDDEN_SIZE}, DeviceType::kGPU, nvinfer1::DataType::kHALF);
     rt::Tensor topkIds({numTokens, kTOP_K}, DeviceType::kGPU, nvinfer1::DataType::kINT32);
     rt::Tensor topkWeights({numTokens, kTOP_K}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    rt::Tensor fc1Weights({kNUM_EXPERTS, data.fc1Rows, kHIDDEN_SIZE}, DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor fc1Weights({numExperts, data.fc1Rows, kHIDDEN_SIZE}, DeviceType::kGPU, nvinfer1::DataType::kHALF);
     rt::Tensor fc2Weights(
-        {kNUM_EXPERTS, kHIDDEN_SIZE, data.config.interSize}, DeviceType::kGPU, nvinfer1::DataType::kHALF);
+        {numExperts, kHIDDEN_SIZE, data.config.interSize}, DeviceType::kGPU, nvinfer1::DataType::kHALF);
     rt::Tensor output({numTokens, kHIDDEN_SIZE}, DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
     CUDA_CHECK(cudaMemcpy(hiddenStates.rawPointer(), data.hiddenStates.data(),
@@ -267,13 +271,13 @@ RunResult runCase(CaseData const& data)
         cudaMemcpyHostToDevice));
 
     size_t const workspaceBytes = CuteDslF16MoeRunner::getWorkspaceSize(
-        numTokens * kTOP_K, kNUM_EXPERTS, kHIDDEN_SIZE, data.config.interSize, data.config.activationType);
+        numTokens * kTOP_K, numExperts, kHIDDEN_SIZE, data.config.interSize, data.config.activationType);
     EXPECT_GT(workspaceBytes, 0U);
     rt::Tensor workspace({static_cast<int64_t>(workspaceBytes)}, DeviceType::kGPU, nvinfer1::DataType::kINT8);
 
     CuteDslF16MoeParams params{};
     params.numTokens = numTokens;
-    params.numExperts = kNUM_EXPERTS;
+    params.numExperts = numExperts;
     params.topK = kTOP_K;
     params.hiddenSize = kHIDDEN_SIZE;
     params.moeInterSize = data.config.interSize;
@@ -309,10 +313,13 @@ std::vector<MoeCase> testCases()
         {"prefill_swiglu_identity_fc2", 8, kACT_SWIGLU, 0xF162008U, kINTER_SIZE, true},
         {"prefill_relu2_identity_fc2", 8, kACT_RELU2, 0xF164208U, kINTER_SIZE, true},
         {"prefill_swiglu_i64", 8, kACT_SWIGLU, 0xF166408U, 64},
+        {"decode_swiglu_e256", 1, kACT_SWIGLU, 0xF168001U, kINTER_SIZE, false, kNUM_EXPERTS_LARGE},
+        {"prefill_swiglu_e256", 8, kACT_SWIGLU, 0xF168008U, kINTER_SIZE, false, kNUM_EXPERTS_LARGE},
+        {"prefill_relu2_e256", 8, kACT_RELU2, 0xF168108U, kINTER_SIZE, false, kNUM_EXPERTS_LARGE},
     };
 }
 
-void validateRoutingCase(int32_t numTokens, int32_t topK)
+void validateRoutingCase(int32_t numTokens, int32_t topK, int32_t numExperts)
 {
     using rt::DeviceType;
     constexpr int32_t kTEST_HIDDEN_SIZE{8};
@@ -322,44 +329,45 @@ void validateRoutingCase(int32_t numTokens, int32_t topK)
     constexpr int32_t kSTRIDE_VALUES_PER_EXPERT{6};
     constexpr int32_t kADDRESS_VALUES_PER_EXPERT{3};
     int32_t const routedRows = numTokens * topK;
-    SCOPED_TRACE(::testing::Message() << "numTokens=" << numTokens << ", topK=" << topK);
+    SCOPED_TRACE(
+        ::testing::Message() << "numTokens=" << numTokens << ", topK=" << topK << ", numExperts=" << numExperts);
 
     std::vector<int32_t> topkIdsHost(routedRows);
-    std::vector<int32_t> expectedCounts(kNUM_EXPERTS, 0);
+    std::vector<int32_t> expectedCounts(numExperts, 0);
     for (int32_t token = 0; token < numTokens; ++token)
     {
         for (int32_t slot = 0; slot < topK; ++slot)
         {
             int32_t const expandedRow = token * topK + slot;
-            int32_t const expert = (token * 13 + slot * 17) % kNUM_EXPERTS;
+            int32_t const expert = (token * 13 + slot * 17) % numExperts;
             topkIdsHost[expandedRow] = expert;
             ++expectedCounts[expert];
         }
     }
-    std::vector<int32_t> expectedOffsets(kNUM_EXPERTS + 1, 0);
-    for (int32_t expert = 0; expert < kNUM_EXPERTS; ++expert)
+    std::vector<int32_t> expectedOffsets(numExperts + 1, 0);
+    for (int32_t expert = 0; expert < numExperts; ++expert)
     {
         expectedOffsets[expert + 1] = expectedOffsets[expert] + expectedCounts[expert];
     }
 
     rt::Tensor topkIds({numTokens, topK}, DeviceType::kGPU, nvinfer1::DataType::kINT32);
-    rt::Tensor expertCounts({kNUM_EXPERTS}, DeviceType::kGPU, nvinfer1::DataType::kINT32);
-    rt::Tensor expertOffsets({kNUM_EXPERTS + 1}, DeviceType::kGPU, nvinfer1::DataType::kINT32);
-    rt::Tensor expertWriteOffsets({kNUM_EXPERTS}, DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor expertCounts({numExperts}, DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor expertOffsets({numExperts + 1}, DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor expertWriteOffsets({numExperts}, DeviceType::kGPU, nvinfer1::DataType::kINT32);
     rt::Tensor sortedToExpanded({routedRows}, DeviceType::kGPU, nvinfer1::DataType::kINT32);
     rt::Tensor expandedToSorted({routedRows}, DeviceType::kGPU, nvinfer1::DataType::kINT32);
-    rt::Tensor fc1ProblemShapes({kNUM_EXPERTS, kSHAPE_VALUES_PER_EXPERT}, DeviceType::kGPU, nvinfer1::DataType::kINT32);
-    rt::Tensor fc1Strides({kNUM_EXPERTS, kSTRIDE_VALUES_PER_EXPERT}, DeviceType::kGPU, nvinfer1::DataType::kINT32);
-    rt::Tensor fc1Addresses({kNUM_EXPERTS, kADDRESS_VALUES_PER_EXPERT}, DeviceType::kGPU, nvinfer1::DataType::kINT64);
-    rt::Tensor fc2ProblemShapes({kNUM_EXPERTS, kSHAPE_VALUES_PER_EXPERT}, DeviceType::kGPU, nvinfer1::DataType::kINT32);
-    rt::Tensor fc2Strides({kNUM_EXPERTS, kSTRIDE_VALUES_PER_EXPERT}, DeviceType::kGPU, nvinfer1::DataType::kINT32);
-    rt::Tensor fc2Addresses({kNUM_EXPERTS, kADDRESS_VALUES_PER_EXPERT}, DeviceType::kGPU, nvinfer1::DataType::kINT64);
+    rt::Tensor fc1ProblemShapes({numExperts, kSHAPE_VALUES_PER_EXPERT}, DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor fc1Strides({numExperts, kSTRIDE_VALUES_PER_EXPERT}, DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor fc1Addresses({numExperts, kADDRESS_VALUES_PER_EXPERT}, DeviceType::kGPU, nvinfer1::DataType::kINT64);
+    rt::Tensor fc2ProblemShapes({numExperts, kSHAPE_VALUES_PER_EXPERT}, DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor fc2Strides({numExperts, kSTRIDE_VALUES_PER_EXPERT}, DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor fc2Addresses({numExperts, kADDRESS_VALUES_PER_EXPERT}, DeviceType::kGPU, nvinfer1::DataType::kINT64);
     rt::Tensor gatheredInput({routedRows, kTEST_HIDDEN_SIZE}, DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    rt::Tensor fc1Weights({kNUM_EXPERTS, kTEST_FC1_N, kTEST_HIDDEN_SIZE}, DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor fc1Weights({numExperts, kTEST_FC1_N, kTEST_HIDDEN_SIZE}, DeviceType::kGPU, nvinfer1::DataType::kHALF);
     rt::Tensor rawFc1({routedRows, kTEST_FC1_N}, DeviceType::kGPU, nvinfer1::DataType::kHALF);
     rt::Tensor activatedFc1({routedRows, kTEST_INTER_SIZE}, DeviceType::kGPU, nvinfer1::DataType::kHALF);
     rt::Tensor fc2Weights(
-        {kNUM_EXPERTS, kTEST_HIDDEN_SIZE, kTEST_INTER_SIZE}, DeviceType::kGPU, nvinfer1::DataType::kHALF);
+        {numExperts, kTEST_HIDDEN_SIZE, kTEST_INTER_SIZE}, DeviceType::kGPU, nvinfer1::DataType::kHALF);
     rt::Tensor routedFc2({routedRows, kTEST_HIDDEN_SIZE}, DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
     CUDA_CHECK(cudaMemcpy(
@@ -380,16 +388,16 @@ void validateRoutingCase(int32_t numTokens, int32_t topK)
         routedFc2.rawPointer(), kTEST_HIDDEN_SIZE, kTEST_INTER_SIZE};
     cudaStream_t stream{};
     CUDA_CHECK(kernel::buildF16MoeRoutingAndGemmMetadata(
-        routingBuffers, fc1Setup, fc2Setup, topkIds.dataPointer<int32_t>(), numTokens, topK, kNUM_EXPERTS, stream));
+        routingBuffers, fc1Setup, fc2Setup, topkIds.dataPointer<int32_t>(), numTokens, topK, numExperts, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    std::vector<int32_t> countsHost(kNUM_EXPERTS);
-    std::vector<int32_t> offsetsHost(kNUM_EXPERTS + 1);
-    std::vector<int32_t> writeOffsetsHost(kNUM_EXPERTS);
+    std::vector<int32_t> countsHost(numExperts);
+    std::vector<int32_t> offsetsHost(numExperts + 1);
+    std::vector<int32_t> writeOffsetsHost(numExperts);
     std::vector<int32_t> sortedToExpandedHost(routedRows);
     std::vector<int32_t> expandedToSortedHost(routedRows);
-    std::vector<int32_t> fc1ShapesHost(static_cast<size_t>(kNUM_EXPERTS) * kSHAPE_VALUES_PER_EXPERT);
-    std::vector<int32_t> fc2ShapesHost(static_cast<size_t>(kNUM_EXPERTS) * kSHAPE_VALUES_PER_EXPERT);
+    std::vector<int32_t> fc1ShapesHost(static_cast<size_t>(numExperts) * kSHAPE_VALUES_PER_EXPERT);
+    std::vector<int32_t> fc2ShapesHost(static_cast<size_t>(numExperts) * kSHAPE_VALUES_PER_EXPERT);
     CUDA_CHECK(cudaMemcpy(
         countsHost.data(), expertCounts.rawPointer(), countsHost.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(
@@ -407,7 +415,7 @@ void validateRoutingCase(int32_t numTokens, int32_t topK)
 
     EXPECT_EQ(countsHost, expectedCounts);
     EXPECT_EQ(offsetsHost, expectedOffsets);
-    for (int32_t expert = 0; expert < kNUM_EXPERTS; ++expert)
+    for (int32_t expert = 0; expert < numExperts; ++expert)
     {
         EXPECT_EQ(writeOffsetsHost[expert], expectedOffsets[expert + 1]);
         size_t const shapeBase = static_cast<size_t>(expert) * kSHAPE_VALUES_PER_EXPERT;
@@ -591,12 +599,15 @@ TEST(F16MoeCuteDslTest, fusedRoutingAndFallbackBoundary)
 {
     constexpr int32_t kTEST_TOKENS{17};
     constexpr int32_t kMAX_FUSED_TOKENS{256};
-    for (int32_t topK = 1; topK <= kTOP_K; ++topK)
+    for (int32_t const numExperts : {kNUM_EXPERTS, kNUM_EXPERTS_LARGE})
     {
-        validateRoutingCase(kTEST_TOKENS, topK);
+        for (int32_t topK = 1; topK <= kTOP_K; ++topK)
+        {
+            validateRoutingCase(kTEST_TOKENS, topK, numExperts);
+        }
+        validateRoutingCase(kMAX_FUSED_TOKENS, kTOP_K, numExperts);
+        validateRoutingCase(kMAX_FUSED_TOKENS + 1, kTOP_K, numExperts);
     }
-    validateRoutingCase(kMAX_FUSED_TOKENS, kTOP_K);
-    validateRoutingCase(kMAX_FUSED_TOKENS + 1, kTOP_K);
 }
 
 TEST(F16MoeCuteDslTest, accuracy)
@@ -613,6 +624,10 @@ TEST(F16MoeCuteDslTest, accuracy)
     EXPECT_TRUE(CuteDslF16MoeRunner::canImplement(kHIDDEN_SIZE, kINTER_SIZE, kNUM_EXPERTS, 1, smVersion, kACT_SWIGLU));
     EXPECT_TRUE(
         CuteDslF16MoeRunner::canImplement(kHIDDEN_SIZE, kINTER_SIZE, kNUM_EXPERTS, kTOP_K, smVersion, kACT_RELU2));
+    EXPECT_TRUE(CuteDslF16MoeRunner::canImplement(
+        kHIDDEN_SIZE, kINTER_SIZE, kNUM_EXPERTS_LARGE, kTOP_K, smVersion, kACT_SWIGLU));
+    EXPECT_FALSE(CuteDslF16MoeRunner::canImplement(kHIDDEN_SIZE, kINTER_SIZE, 64, kTOP_K, smVersion, kACT_SWIGLU));
+    EXPECT_FALSE(CuteDslF16MoeRunner::canImplement(kHIDDEN_SIZE, kINTER_SIZE, 192, kTOP_K, smVersion, kACT_SWIGLU));
     EXPECT_FALSE(CuteDslF16MoeRunner::canImplement(kHIDDEN_SIZE, kINTER_SIZE, kNUM_EXPERTS, kTOP_K, 90, kACT_SWIGLU));
     int32_t const mismatchedArtifactSm = smVersion == 110 ? 100 : 110;
     EXPECT_FALSE(CuteDslF16MoeRunner::canImplement(
@@ -625,7 +640,7 @@ TEST(F16MoeCuteDslTest, accuracy)
     {
         SCOPED_TRACE(::testing::Message() << "case=" << config.name);
         ASSERT_TRUE(CuteDslF16MoeRunner::canImplement(
-            kHIDDEN_SIZE, config.interSize, kNUM_EXPERTS, kTOP_K, smVersion, config.activationType));
+            kHIDDEN_SIZE, config.interSize, config.numExperts, kTOP_K, smVersion, config.activationType));
         CaseData const data = makeCase(config);
         std::vector<float> const reference = computeReference(data);
         RunResult const result = runCase(data);

@@ -59,7 +59,6 @@ constexpr char const* kPLUGIN_NAME{"Fp16MoePlugin"};
 constexpr char const* kPLUGIN_VERSION{"1"};
 constexpr int32_t kACT_SWIGLU{2};
 constexpr int32_t kACT_RELU2{4};
-constexpr int32_t kNUM_EXPERTS{128};
 constexpr int32_t kMAX_TOP_K{8};
 constexpr int32_t kROW_ALIGNMENT{128};
 constexpr int32_t kINTER_ALIGNMENT{64};
@@ -101,9 +100,10 @@ int32_t getRequiredIntField(PluginFieldCollection const* fields, char const* nam
 void validateAttributes(int32_t numExperts, int32_t topK, int32_t hiddenSize, int32_t moeInterSize,
     int32_t activationType, int32_t normTopkProb, int32_t maxRoutedRows)
 {
-    if (numExperts != kNUM_EXPERTS)
+    // Match CuteDslF16MoeRunner::kSupportedNumExperts.
+    if (numExperts != 128 && numExperts != 256)
     {
-        throw std::invalid_argument("Fp16MoePlugin: num_experts must be 128");
+        throw std::invalid_argument("Fp16MoePlugin: num_experts must be one of {128, 256}");
     }
     if (topK <= 0 || topK > kMAX_TOP_K)
     {
@@ -135,9 +135,9 @@ void validateAttributes(int32_t numExperts, int32_t topK, int32_t hiddenSize, in
     }
 }
 
-bool validateTokenShape(Dims const& router, Dims const& hidden, char const* profilePoint)
+bool validateTokenShape(Dims const& router, Dims const& hidden, int32_t numExperts, char const* profilePoint)
 {
-    if (router.nbDims != 2 || hidden.nbDims != 3 || router.d[0] <= 0 || router.d[1] != kNUM_EXPERTS || hidden.d[0] <= 0
+    if (router.nbDims != 2 || hidden.nbDims != 3 || router.d[0] <= 0 || router.d[1] != numExperts || hidden.d[0] <= 0
         || hidden.d[1] <= 0 || hidden.d[2] <= 0)
     {
         LOG_ERROR("Fp16MoePlugin: invalid %s profile dimensions", profilePoint);
@@ -330,9 +330,10 @@ int32_t Fp16MoePlugin::configurePlugin(DynamicPluginTensorDesc const* inputs, in
             LOG_ERROR("Fp16MoePlugin: configurePlugin expected four inputs and one output");
             return -1;
         }
-        if (!validateTokenShape(inputs[kIN_ROUTER_LOGITS].min, inputs[kIN_HIDDEN_STATES].min, "minimum")
-            || !validateTokenShape(inputs[kIN_ROUTER_LOGITS].opt, inputs[kIN_HIDDEN_STATES].opt, "optimum")
-            || !validateTokenShape(inputs[kIN_ROUTER_LOGITS].max, inputs[kIN_HIDDEN_STATES].max, "maximum"))
+        if (!validateTokenShape(inputs[kIN_ROUTER_LOGITS].min, inputs[kIN_HIDDEN_STATES].min, mNumExperts, "minimum")
+            || !validateTokenShape(inputs[kIN_ROUTER_LOGITS].opt, inputs[kIN_HIDDEN_STATES].opt, mNumExperts, "optimum")
+            || !validateTokenShape(
+                inputs[kIN_ROUTER_LOGITS].max, inputs[kIN_HIDDEN_STATES].max, mNumExperts, "maximum"))
         {
             return -1;
         }
@@ -359,7 +360,7 @@ int32_t Fp16MoePlugin::configurePlugin(DynamicPluginTensorDesc const* inputs, in
             LOG_ERROR(
                 "Fp16MoePlugin: unsupported configuration H=%d I=%d E=%d top_k=%d activation=%d SM=%d. "
                 "The v1 backend requires a matching f16_moe artifact for Ampere SM80/86/87/89, "
-                "Blackwell SM100/101/103/110, or Blackwell GeForce SM120/121; E=128; top_k in [1,8]; "
+                "Blackwell SM100/101/103/110, or Blackwell GeForce SM120/121; E in {128, 256}; top_k in [1,8]; "
                 "H%%128=0; I%%64=0; FC1_N%%128=0; and activation 2 (SwiGLU) or 4 (ReLU2).",
                 mHiddenSize, mMoeInterSize, mNumExperts, mTopK, mActivationType, smVersion);
             return -1;

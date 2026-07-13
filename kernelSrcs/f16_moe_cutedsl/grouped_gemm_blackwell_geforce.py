@@ -72,7 +72,6 @@ class F16MoeGroupedGemmBlackwellGeforce(GemmBlackwellGeforceFP16):
             acc_dtype=cutlass.Float32,
             tile_shape_mnk=tile_shape_mnk,
         )
-        self.num_experts = 128
 
         # Keep the dense kernel's validated (2, 2, 1) MMA topology. Its tiled
         # copies and epilogue rely on that warp arrangement even when the CTA
@@ -341,7 +340,7 @@ class F16MoeGroupedGemmBlackwellGeforce(GemmBlackwellGeforceFP16):
             grid_dim,
             self.tile_shape_mnk,
             utils.create_initial_search_state(),
-            self.num_experts,
+            group_count,
             problem_shapes,
         )
         initial_work_tile = tile_sched.initial_work_tile_info()
