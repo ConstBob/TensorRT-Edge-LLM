@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "RUNTIME_TOKENIZER_FILENAMES",
     "normalize_rope_scaling_for_runtime",
+    "rotary_dim_for_runtime",
     "load_checkpoint_config_dicts",
     "load_config_dict",
     "build_runtime_llm_config_dict",
@@ -69,6 +70,21 @@ def normalize_rope_scaling_for_runtime(rope_scaling: Any) -> Any:
     if "type" not in normalized and "rope_type" in normalized:
         normalized["type"] = normalized["rope_type"]
     return normalized
+
+
+def rotary_dim_for_runtime(rope_config: Dict[str, Any], head_dim: int,
+                           fallback_partial_rotary_factor: float) -> int:
+    """Return the RoPE binding width expected by the C++ builder/runtime."""
+    rope_scaling = rope_config.get("rope_scaling")
+    if isinstance(rope_scaling, dict):
+        rope_type = str(
+            rope_scaling.get("type") or rope_scaling.get("rope_type") or "")
+        if rope_type in ("default", "proportional"):
+            return int(head_dim)
+    partial_rotary_factor = float(
+        rope_config.get("partial_rotary_factor",
+                        fallback_partial_rotary_factor))
+    return int(float(head_dim) * partial_rotary_factor)
 
 
 def _normalize_explicit_rope_config_for_runtime(
@@ -362,24 +378,31 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
         out["tp_rank"] = tp_rank
 
     # Heterogeneous head dimensions (e.g. Gemma4: sliding=256, global=512)
-    if (config.global_head_dim and config.global_head_dim != config.head_dim
-            and not config.gemma4_mtp_draft):
+    if config.global_head_dim and config.global_head_dim != config.head_dim:
         out["global_head_dim"] = config.global_head_dim
+        use_global_kv_heads = bool(config.attention_k_eq_v
+                                   and config.num_global_key_value_heads)
+        # C++ sizes KV tensors from kv_layer_configs below. Keep the top-level
+        # field only for Python/config round-trip metadata.
+        if (config.num_global_key_value_heads and use_global_kv_heads
+                and config.num_global_key_value_heads
+                != config.num_key_value_heads):
+            out["num_global_key_value_heads"] = config.num_global_key_value_heads
         out["layer_types"] = config.layer_types
         # Emit kv_layer_configs so C++ runtime sizes per-layer KV cache correctly.
         # The C++ parser expects "attention"/"mamba" strings in layer_types when
         # kv_layer_configs is present, so emit a normalised copy.
         norm_lt: list = []
         kv_cfgs: list = []
+        full_attention_kv_heads = (config.num_global_key_value_heads
+                                   if use_global_kv_heads else
+                                   config.num_key_value_heads)
         for lt in config.layer_types:
             norm_lt.append("attention")  # all layers are attention in Gemma4
             if lt == "full_attention":
                 kv_cfgs.append({
-                    "num_kv_heads":
-                    config.num_global_key_value_heads
-                    or config.num_key_value_heads,
-                    "head_dim":
-                    config.global_head_dim
+                    "num_kv_heads": full_attention_kv_heads,
+                    "head_dim": config.global_head_dim
                 })
             else:
                 kv_cfgs.append({
@@ -425,14 +448,13 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
         out["full_rope_config"] = _normalize_explicit_rope_config_for_runtime(
             config.full_rope_config or {})
         if config.gemma4_mtp_draft:
-            sliding_prf = float((config.sliding_rope_config
-                                 or {}).get("partial_rotary_factor", 1.0))
-            full_prf = float((config.full_rope_config
-                              or {}).get("partial_rotary_factor",
-                                         config.partial_rotary_factor))
-            out["sliding_rotary_dim"] = int(config.head_dim * sliding_prf)
-            out["full_rotary_dim"] = int(
-                (config.global_head_dim or config.head_dim) * full_prf)
+            out["sliding_rotary_dim"] = rotary_dim_for_runtime(
+                out["sliding_rope_config"], config.head_dim, 1.0)
+            out["full_rotary_dim"] = rotary_dim_for_runtime(
+                out["full_rope_config"],
+                config.global_head_dim or config.head_dim,
+                config.partial_rotary_factor,
+            )
 
     if config.is_hybrid and mc is not None:
         out.update({

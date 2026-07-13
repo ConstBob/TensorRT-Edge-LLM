@@ -361,6 +361,13 @@ def _gemma4_head_dim_for_layer(text_config: dict, layer_type: str) -> int:
     return int(text_config.get("head_dim", 0))
 
 
+def _gemma4_num_kv_heads_for_layer(text_config: dict, layer_type: str) -> int:
+    if (layer_type == "full_attention" and text_config.get("attention_k_eq_v")
+            and text_config.get("num_global_key_value_heads")):
+        return int(text_config["num_global_key_value_heads"])
+    return int(text_config.get("num_key_value_heads", 0))
+
+
 def _validate_gemma4_kv_sharing_contract(target_config: dict,
                                          assistant_config: dict,
                                          kv_sharing_map: list[dict]) -> None:
@@ -386,13 +393,6 @@ def _validate_gemma4_kv_sharing_contract(target_config: dict,
         raise ValueError(
             "Gemma4 MTP kv_sharing_map length must match assistant layer count."
         )
-
-    target_kv_heads = int(target_text.get("num_key_value_heads", 0))
-    assistant_kv_heads = int(assistant_text.get("num_key_value_heads", 0))
-    if target_kv_heads != assistant_kv_heads:
-        raise ValueError(
-            "Gemma4 MTP KV head mismatch: target num_key_value_heads=%d, assistant num_key_value_heads=%d"
-            % (target_kv_heads, assistant_kv_heads))
 
     seen_layers = set()
     for entry in kv_sharing_map:
@@ -427,6 +427,16 @@ def _validate_gemma4_kv_sharing_contract(target_config: dict,
                 "Gemma4 MTP KV head_dim mismatch: assistant layer %d head_dim=%d, target donor layer %d head_dim=%d."
                 % (assistant_layer, assistant_head_dim, target_layer,
                    target_head_dim))
+
+        assistant_kv_heads = _gemma4_num_kv_heads_for_layer(
+            assistant_text, assistant_type)
+        target_kv_heads = _gemma4_num_kv_heads_for_layer(
+            target_text, target_type)
+        if assistant_kv_heads != target_kv_heads:
+            raise ValueError(
+                "Gemma4 MTP KV head mismatch: assistant layer %d num_kv_heads=%d, target donor layer %d num_kv_heads=%d."
+                % (assistant_layer, assistant_kv_heads, target_layer,
+                   target_kv_heads))
 
     expected_layers = set(range(len(assistant_types)))
     if seen_layers != expected_layers:
@@ -467,8 +477,6 @@ def _validate_gemma4_mtp_pair(target_dir: str,
         raise ValueError(
             "Gemma4 MTP assistant requires num_kv_shared_layers == num_hidden_layers."
         )
-    if not target_text.get("hidden_size_per_layer_input", 0):
-        raise ValueError("Gemma4 MTP target must have PLE enabled.")
     _assert_tokenizers_match(target_dir, assistant_dir)
     kv_sharing_map = _build_gemma4_kv_sharing_map(target_config,
                                                   assistant_config)
@@ -950,12 +958,15 @@ def _export_gemma4_mtp_draft(target_dir: str, draft_out_dir: str,
                 assistant_dir)
     try:
         from ..checkpoint.checkpoint_utils import write_runtime_artifacts
-        from ..model import AutoModel
+        from ..model import AutoModel, load_model_config
+        target_model_config = load_model_config(target_dir)
         model = AutoModel.from_pretrained(
             assistant_dir,
             device="cpu",
             gemma4_mtp_draft=True,
             gemma4_kv_sharing_map=kv_sharing_map,
+            gemma4_target_kv_cache_quant=target_model_config.quant.
+            kv_cache_quant,
         )
         write_runtime_artifacts(model, assistant_dir, draft_out_dir)
     except (OSError, ValueError, RuntimeError, ImportError) as exc:
@@ -2390,8 +2401,8 @@ def main() -> None:
         help=
         ("Comma-separated allow-list of components to export. Default (empty) "
          "exports every component the checkpoint supports. Recognized values: "
-         "thinker, talker, code_predictor, visual, audio, code2wav, action. "
-         "Useful for re-running a single stage, e.g. "
+         "thinker, mtp_draft, talker, code_predictor, visual, audio, "
+         "code2wav, action. Useful for re-running a single stage, e.g. "
          "``--components code_predictor`` to refresh only the CodePredictor."),
     )
     p.add_argument(
@@ -2604,8 +2615,8 @@ def main() -> None:
                     "--eagle-base / --mtp / --dflash-base / --dflash-draft")
 
     _VALID_COMPONENTS = {
-        "thinker", "talker", "code_predictor", "visual", "audio", "code2wav",
-        "action"
+        "thinker", "mtp_draft", "talker", "code_predictor", "visual", "audio",
+        "code2wav", "action"
     }
     requested_components = {
         c.strip()

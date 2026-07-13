@@ -400,6 +400,11 @@ GEMMA4_MTP_ASSISTANT_MODELS_MAP = {
         "gemma-4-E2B-it-assistant",
         "gemma/gemma-4-E2B-it-assistant",
     ],
+    "nvidia-Gemma-4-26B-A4B": [
+        "gemma-4-26B-A4B-it-assistant",
+        "google/gemma-4-26B-A4B-it-assistant",
+        "gemma/gemma-4-26B-A4B-it-assistant",
+    ],
 }
 
 

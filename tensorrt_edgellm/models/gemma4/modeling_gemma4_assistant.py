@@ -27,7 +27,7 @@ from ...config import ModelConfig
 from ..default.modeling_default import OnnxSpec, RMSNorm
 from ..linear import TPMode, make_linear
 from ..ops import attention_plugin
-from .modeling_gemma4_text import Gemma4MLP
+from .modeling_gemma4_text import Gemma4MLP, _rotary_dim_from_rope_config
 
 __all__ = ["Gemma4AssistantForCausalLM", "Gemma4AssistantDecoderLayer"]
 
@@ -78,7 +78,6 @@ class Gemma4SharedKVAttention(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_key_value_heads
         self.head_dim = self._head_dim_for_layer(config, layer_idx)
         self.sliding_window_size = config.sliding_window_size
         module_prefix = f"layers.{layer_idx}.self_attn"
@@ -96,25 +95,39 @@ class Gemma4SharedKVAttention(nn.Module):
                                   tp_mode=TPMode.ROW)
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.enable_fp8_kv_cache = config.quant.kv_cache_quant == "fp8"
-        self.attention_type = "sliding_attention"
+        layer_type = self._layer_type_for_layer(config, layer_idx)
+        self.attention_type = layer_type
+        if layer_type == "full_attention":
+            self.sliding_window_size = -1
 
-        raw_layer_types = config.raw_layer_types or config.layer_types
-        if layer_idx < len(raw_layer_types):
-            layer_type = raw_layer_types[layer_idx]
-            self.attention_type = layer_type
-            if layer_type == "full_attention":
-                self.sliding_window_size = -1
-
+        self.num_kv_heads = self._num_kv_heads_for_layer(config, layer_idx)
         self.attention_scale = config.attention_scaling
 
     @staticmethod
-    def _head_dim_for_layer(config: ModelConfig, layer_idx: int) -> int:
+    def _layer_type_for_layer(config: ModelConfig, layer_idx: int) -> str:
         raw_layer_types = config.raw_layer_types or config.layer_types
-        if layer_idx < len(raw_layer_types):
-            layer_type = raw_layer_types[layer_idx]
-            if (layer_type == "full_attention" and config.global_head_dim):
-                return config.global_head_dim
+        if layer_idx >= len(raw_layer_types):
+            raise ValueError(
+                "Gemma4 assistant layer_types must have one entry per layer; "
+                f"missing layer {layer_idx}.")
+        return raw_layer_types[layer_idx]
+
+    @staticmethod
+    def _head_dim_for_layer(config: ModelConfig, layer_idx: int) -> int:
+        layer_type = Gemma4SharedKVAttention._layer_type_for_layer(
+            config, layer_idx)
+        if layer_type == "full_attention" and config.global_head_dim:
+            return config.global_head_dim
         return config.head_dim
+
+    @staticmethod
+    def _num_kv_heads_for_layer(config: ModelConfig, layer_idx: int) -> int:
+        layer_type = Gemma4SharedKVAttention._layer_type_for_layer(
+            config, layer_idx)
+        if (layer_type == "full_attention" and config.attention_k_eq_v
+                and config.num_global_key_value_heads):
+            return config.num_global_key_value_heads
+        return config.num_key_value_heads
 
     def forward(
         self,
@@ -142,8 +155,9 @@ class Gemma4SharedKVAttention(nn.Module):
                                     dtype=torch.int32,
                                     device=query_states.device)
         # Match HF Gemma4 SinglePosition MTP: all assistant draft steps use
-        # the same frontier position while reading the target shared KV states.
-        attention_pos_id = context_lengths.reshape(batch_size, 1).expand(
+        # the last seen token position while reading the target shared KV states.
+        frontier_pos_id = torch.clamp(context_lengths - 1, min=0)
+        attention_pos_id = frontier_pos_id.reshape(batch_size, 1).expand(
             batch_size, seq_len)
         attn_output, _ = attention_plugin(
             query_states,
@@ -349,13 +363,11 @@ class Gemma4AssistantForCausalLM(nn.Module):
         context_lengths = torch.zeros(batch_size,
                                       dtype=torch.int32,
                                       device=device)
-        sliding_rotary_dim = int(config.head_dim * float(
-            (config.sliding_rope_config or {}).get("partial_rotary_factor",
-                                                   1.0)))
-        full_rotary_dim = int(
-            (config.global_head_dim or config.head_dim) * float(
-                (config.full_rope_config or {}).get(
-                    "partial_rotary_factor", config.partial_rotary_factor)))
+        sliding_rotary_dim = _rotary_dim_from_rope_config(
+            config, config.sliding_rope_config, config.head_dim)
+        full_rotary_dim = _rotary_dim_from_rope_config(
+            config, config.full_rope_config, config.global_head_dim
+            or config.head_dim)
         rope_rotary_cos_sin_sliding = torch.zeros(batch_size,
                                                   max_pos,
                                                   sliding_rotary_dim,
@@ -371,7 +383,8 @@ class Gemma4AssistantForCausalLM(nn.Module):
         past_key_values_list: List[torch.Tensor] = [
             torch.zeros(batch_size,
                         2,
-                        config.num_key_value_heads,
+                        Gemma4SharedKVAttention._num_kv_heads_for_layer(
+                            config, layer_idx),
                         past_len,
                         Gemma4SharedKVAttention._head_dim_for_layer(
                             config, layer_idx),
