@@ -83,7 +83,11 @@ struct CuteDslFFPAParams
 class CuteDslFFPARunner
 {
 public:
-    static bool canImplement(int32_t headDim, int32_t smVersion);
+    //! Returns true if the given configuration is supported. Checks head dimension,
+    //! SM version, and GQA group size (numQHeads / numKVHeads). Group size 1 (MHA) is
+    //! always supported; group sizes 4 and 8 require CUTE_DSL_FFPA_GQA4_ENABLED /
+    //! CUTE_DSL_FFPA_GQA8_ENABLED respectively.
+    static bool canImplement(int32_t headDim, int32_t smVersion, int32_t numQHeads = 1, int32_t numKVHeads = 1);
 
     //! Whether the vision-block overlay variant was compiled into this build
     //! (requires the ffpa_d512_causal_visionblock AOT artifact).
@@ -99,6 +103,12 @@ private:
     static ffpa_d512_causal_Kernel_Module_t sD512CausalModule;
 #ifdef CUTE_DSL_FFPA_VISIONBLOCK_ENABLED
     static ffpa_d512_causal_visionblock_Kernel_Module_t sD512CausalVisionBlockModule;
+#endif
+#if defined(CUTE_DSL_FFPA_GQA4_ENABLED)
+    static ffpa_d512_causal_gqa4_Kernel_Module_t sD512CausalGqa4Module;
+#endif
+#if defined(CUTE_DSL_FFPA_GQA8_ENABLED)
+    static ffpa_d512_causal_gqa8_Kernel_Module_t sD512CausalGqa8Module;
 #endif
     static bool sLoaded;
     static std::mutex sMutex;

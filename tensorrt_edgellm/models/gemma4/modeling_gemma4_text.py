@@ -367,6 +367,31 @@ def _compute_kv_donor_indices(config: ModelConfig) -> dict:
     return result
 
 
+class Gemma4RMSNorm(RMSNorm):
+    """RMSNorm with f32 weight storage for Gemma4.
+
+    Gemma4 31B has norm weights up to 1248 which overflow fp16 when multiplied
+    with normalized values. Weight is stored as f32 and multiplication is done
+    in f32 before casting back to input dtype. This also ensures both operands
+    have matching type in the ONNX graph (required by TRT --stronglyTyped).
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        nn.Module.__init__(self)
+        self.variance_epsilon = eps
+        self.weight = nn.Parameter(torch.ones(hidden_size,
+                                              dtype=torch.float32))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance +
+                                                    self.variance_epsilon)
+        hidden_states = hidden_states * self.weight
+        return hidden_states.to(input_dtype)
+
+
 class Gemma4ValueRMSNorm(nn.Module):
     """Weightless per-head RMSNorm used by Gemma4 attention values."""
 
@@ -449,8 +474,8 @@ class Gemma4Attention(Attention):
                                   hidden_size,
                                   module_name=f"{module_prefix}.o_proj")
         if config.has_qk_norm:
-            self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-            self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.q_norm = Gemma4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.k_norm = Gemma4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         else:
             self.q_norm = None
             self.k_norm = None
@@ -604,14 +629,15 @@ class Gemma4MLP(MLP):
         self.act_fn = _resolve_hidden_activation(config.hidden_activation)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Upcast gate*up product to fp32 to prevent fp16 overflow in large models.
-        # This ensures HF reference equivalence during export; TRT handles precision
-        # internally in the built engine (the Cast ops are preserved in ONNX).
-        gate = self.act_fn(self.gate_proj(hidden_states))
-        up = self.up_proj(hidden_states)
-        intermediate = (gate.to(torch.float32) * up.to(torch.float32)).to(
-            hidden_states.dtype)
-        return self.down_proj(intermediate)
+        # Compute gate*up in f32 to prevent fp16 overflow.
+        # Clamp intermediate to +/-2048 before casting to fp16 for down_proj.
+        # Without this clamp, the fp16 down_proj MatMul can produce Inf
+        # (dot product of 21504 elements at +/-65504 overflows fp16 output range),
+        # which then causes NaN in the subsequent RMSNorm (Inf*0=NaN).
+        gate = self.act_fn(self.gate_proj(hidden_states).to(torch.float32))
+        up = self.up_proj(hidden_states).to(torch.float32)
+        intermediate = (gate * up).clamp(-2048.0, 2048.0)
+        return self.down_proj(intermediate.to(hidden_states.dtype))
 
 
 class Gemma4Router(nn.Module):
@@ -817,10 +843,14 @@ class Gemma4DecoderLayer(DecoderLayer):
         #   post_attention_layernorm   -> post-attention, before residual add (inherited)
         #   pre_feedforward_layernorm  -> pre-MLP
         #   post_feedforward_layernorm -> post-MLP, before residual add
-        self.pre_feedforward_layernorm = RMSNorm(config.hidden_size,
-                                                 config.rms_norm_eps)
-        self.post_feedforward_layernorm = RMSNorm(config.hidden_size,
-                                                  config.rms_norm_eps)
+        self.pre_feedforward_layernorm = Gemma4RMSNorm(config.hidden_size,
+                                                       config.rms_norm_eps)
+        self.post_feedforward_layernorm = Gemma4RMSNorm(
+            config.hidden_size, config.rms_norm_eps)
+
+        # layer_scalar is applied unconditionally in HF Gemma4 - it scales the
+        # residual stream per-layer (early layers have very small values ~0.06-0.09).
+        self.register_buffer("layer_scalar", torch.ones(1))
 
         # MoE block: parallel routed experts alongside dense MLP (Gemma4 26B).
         # Only NVFP4 quantization is supported for MoE.
@@ -858,8 +888,8 @@ class Gemma4DecoderLayer(DecoderLayer):
                 module_name=f"layers.{layer_idx}.per_layer_projection",
                 tp_mode=TPMode.REPLICATED,
             )
-            self.post_per_layer_input_norm = RMSNorm(config.hidden_size,
-                                                     config.rms_norm_eps)
+            self.post_per_layer_input_norm = Gemma4RMSNorm(
+                config.hidden_size, config.rms_norm_eps)
 
     def _apply_per_layer_input(
             self, hidden_states: torch.Tensor,
@@ -971,7 +1001,7 @@ class Gemma4Transformer(nn.Module):
             Gemma4DecoderLayer(config, layer_idx=i)
             for i in range(config.num_hidden_layers)
         ])
-        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.norm = Gemma4RMSNorm(config.hidden_size, config.rms_norm_eps)
 
         if self.ple_enabled:
             if self.vocab_size_per_layer_input <= 0:
@@ -992,7 +1022,7 @@ class Gemma4Transformer(nn.Module):
                 module_name="per_layer_model_projection",
                 tp_mode=TPMode.REPLICATED,
             )
-            self.per_layer_projection_norm = RMSNorm(
+            self.per_layer_projection_norm = Gemma4RMSNorm(
                 self.hidden_size_per_layer_input,
                 config.rms_norm_eps,
             )
@@ -1121,6 +1151,11 @@ class Gemma4Transformer(nn.Module):
 
 class Gemma4ForCausalLM(CausalLM):
     """Gemma4 CausalLM wrapper for the checkpoint exporter."""
+
+    # RMSNorm weights are f32 initializers that feed element-wise Mul with
+    # f32 normalized hidden states.  Without this flag, _fix_initializer_dtypes
+    # downgrades them to f16, creating a type mismatch with --stronglyTyped.
+    match_fp32_elementwise_initializers = True
 
     def __init__(self, config: ModelConfig) -> None:
         nn.Module.__init__(self)
