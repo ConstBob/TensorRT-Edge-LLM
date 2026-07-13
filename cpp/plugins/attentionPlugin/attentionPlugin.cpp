@@ -391,7 +391,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     if (!mCanImplementFMHA)
     {
 #ifdef CUTE_DSL_FFPA_ENABLED
-        if (mHeadSize == 512 && CuteDslFFPARunner::canImplement(mHeadSize, mSMVersion))
+        if (mHeadSize == 512 && CuteDslFFPARunner::canImplement(mHeadSize, mSMVersion, mNumQHeads, mNumKVHeads))
         {
             if (CuteDslFFPARunner::loadKernelModule())
             {
@@ -495,7 +495,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
     if (!mCanImplementFMHA)
     {
 #ifdef CUTE_DSL_FFPA_ENABLED
-        if (mHeadSize == 512 && CuteDslFFPARunner::canImplement(mHeadSize, mSMVersion))
+        if (mHeadSize == 512 && CuteDslFFPARunner::canImplement(mHeadSize, mSMVersion, mNumQHeads, mNumKVHeads))
         {
             if (CuteDslFFPARunner::loadKernelModule())
             {

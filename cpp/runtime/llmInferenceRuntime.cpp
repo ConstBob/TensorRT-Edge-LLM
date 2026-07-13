@@ -810,7 +810,20 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     };
 
     context.shouldStopAfterAcceptedToken = [&](int32_t batchIdx, int32_t tokenId) {
-        updateThinkingDoneForToken(batchIdx, tokenId);
+        // Per-token thinking-done check (inline version of updateThinkingDone for a single batch entry).
+        if (request.enableThinking && !thinkingDone[batchIdx])
+        {
+            if (tokenId == endOfChannelId || tokenId == endOfThinkId)
+            {
+                thinkingDone[batchIdx] = true;
+            }
+            else if (context.currentGenerateLengths[batchIdx] == 1 && tokenId != startOfChannelId
+                && tokenId != startOfThinkId)
+            {
+                thinkingDone[batchIdx] = true;
+                LOG_DEBUG("Batch %d: first token %d is not thinking-start, marking thinkingDone", batchIdx, tokenId);
+            }
+        }
         bool isEos = mTokenizer->isEosToken(tokenId);
         if (isEos && request.enableThinking && tokenId != mTokenizer->getEosId() && !thinkingDone[batchIdx])
         {

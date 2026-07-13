@@ -43,7 +43,7 @@ namespace
 
 bool isFfpaSupportedSm(int32_t smVersion)
 {
-    return CuteDslFFPARunner::canImplement(512, smVersion);
+    return CuteDslFFPARunner::canImplement(512, smVersion, 1, 1);
 }
 
 void initializeFp16(rt::Tensor& tensor, int32_t seed)
@@ -260,7 +260,13 @@ class CuteDslFFPAAccuracySweep : public CuteDslFFPABase, public ::testing::WithP
 
 TEST_P(CuteDslFFPAAccuracySweep, Causal)
 {
-    runAccuracyCase(GetParam(), mStream);
+    auto const& p = GetParam();
+    int32_t constexpr kHeadDim = 512;
+    if (!CuteDslFFPARunner::canImplement(kHeadDim, mSmVersion, p.numQHeads, p.numKVHeads))
+    {
+        GTEST_SKIP() << p.name << ": GQA group size " << (p.numQHeads / p.numKVHeads) << " not supported on this build";
+    }
+    runAccuracyCase(p, mStream);
 }
 
 INSTANTIATE_TEST_SUITE_P(FP16Causal, CuteDslFFPAAccuracySweep,
@@ -1146,6 +1152,7 @@ TEST_F(CuteDslFFPANegativePath, RejectsNullCuSeqLens)
 
 TEST(CuteDslFFPARunnerStaticTest, CanImplementSupportedHeadDimAndSMs)
 {
+    // MHA (default numQHeads=1, numKVHeads=1)
     EXPECT_TRUE(CuteDslFFPARunner::canImplement(512, 80));
     EXPECT_TRUE(CuteDslFFPARunner::canImplement(512, 86));
     EXPECT_TRUE(CuteDslFFPARunner::canImplement(512, 87));
@@ -1158,6 +1165,73 @@ TEST(CuteDslFFPARunnerStaticTest, CanImplementSupportedHeadDimAndSMs)
     EXPECT_FALSE(CuteDslFFPARunner::canImplement(128, 100));
     EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, 75));
     EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, 90));
+}
+
+TEST(CuteDslFFPARunnerStaticTest, CanImplementGQAGroupSizes)
+{
+    int32_t constexpr kSM = 100;
+
+    // MHA always supported
+    EXPECT_TRUE(CuteDslFFPARunner::canImplement(512, kSM, 8, 8));
+    EXPECT_TRUE(CuteDslFFPARunner::canImplement(512, kSM, 1, 1));
+
+    // GQA4: Hq=8, Hkv=2 (Gemma4 E4B)
+#if defined(CUTE_DSL_FFPA_GQA4_ENABLED)
+    EXPECT_TRUE(CuteDslFFPARunner::canImplement(512, kSM, 8, 2));
+    EXPECT_TRUE(CuteDslFFPARunner::canImplement(512, kSM, 4, 1));
+#else
+    EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, kSM, 8, 2));
+    EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, kSM, 4, 1));
+#endif
+
+    // GQA8: Hq=8, Hkv=1 (Gemma4 E2B)
+#if defined(CUTE_DSL_FFPA_GQA8_ENABLED)
+    EXPECT_TRUE(CuteDslFFPARunner::canImplement(512, kSM, 8, 1));
+    EXPECT_TRUE(CuteDslFFPARunner::canImplement(512, kSM, 16, 2));
+#else
+    EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, kSM, 8, 1));
+    EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, kSM, 16, 2));
+#endif
+
+    // Unsupported group sizes (2, 3, 16) — never compiled
+    EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, kSM, 8, 4));  // group=2
+    EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, kSM, 12, 4)); // group=3
+    EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, kSM, 16, 1)); // group=16
+
+    // Invalid: indivisible
+    EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, kSM, 8, 3));
+    EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, kSM, 7, 2));
+
+    // Invalid: zero/negative KV heads
+    EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, kSM, 8, 0));
+}
+
+// Runtime guard: unsupported GQA group size (e.g. group=2) must be rejected by run().
+TEST_F(CuteDslFFPANegativePath, RejectsUnsupportedGQAGroupSize)
+{
+    void* dummy = nullptr;
+    CUDA_CHECK(cudaMalloc(&dummy, 16));
+
+    CuteDslFFPAParams params;
+    params.q = dummy;
+    params.k = dummy;
+    params.v = dummy;
+    params.o = dummy;
+    params.cuSeqLenQ = static_cast<int32_t const*>(dummy);
+    params.cuSeqLenK = static_cast<int32_t const*>(dummy);
+    params.batchSize = 1;
+    params.seqlenQ = 16;
+    params.seqlenK = 16;
+    params.numQHeads = 8;
+    params.numKVHeads = 4; // group size 2 — no compiled variant
+    params.headDim = 512;
+    params.softmaxScale = 1.0F / std::sqrt(512.0F);
+
+    EXPECT_NE(CuteDslFFPARunner::run(params, mStream), 0);
+    CUDA_CHECK(cudaStreamSynchronize(mStream));
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cudaFree(dummy));
 }
 
 } // namespace
