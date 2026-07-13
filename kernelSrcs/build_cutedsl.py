@@ -901,6 +901,22 @@ KERNEL_VARIANTS = [
             "--export_only",
         ],
     ),
+    # FP16-in / FP32-out twin of gemm_blackwell_small_fp16: same tile, cluster,
+    # and MNK; differs only by --c_dtype float32, which makes the C epilogue
+    # write FP32. A and B stay FP16 tensor-core operands.
+    KernelVariant(
+        name="gemm_blackwell_small_fp16in_fp32out",
+        group="gemm",
+        supported_sms=[100, 101, 103, 110],
+        script="gemm_cutedsl/gemm_blackwell.py",
+        script_args=[
+            "--mnk", "256,2048,2048",
+            "--mma_tiler_mn", "64,128",
+            "--cluster_shape_mn", "1,2",
+            "--c_dtype", "float32",
+            "--export_only",
+        ],
+    ),
     KernelVariant(
         name="gemm_blackwell_small_bias_silu_fp16",
         group="gemm",
