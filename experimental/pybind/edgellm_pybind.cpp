@@ -169,8 +169,8 @@ public:
 
 private:
     CudaStreamWrapper mStream;
-    std::unique_ptr<LLMInferenceRuntime> mRuntime;
     std::unique_ptr<void, DlDeleter> mPluginHandle;
+    std::unique_ptr<LLMInferenceRuntime> mRuntime;
 };
 
 imageUtils::ImageData loadImageFromPath(std::string const& path)
