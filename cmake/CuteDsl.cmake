@@ -774,6 +774,22 @@ function(cute_dsl_setup)
     )
   endif()
 
+  # Blackwell DC small-tile FP16-in/FP32-out variant (tile=64x128, FP32 C
+  # epilogue) for the parakeet mel GEMM (mel power spans ~17 orders of magnitude
+  # and must not flush to zero in FP16 before the natural-log stats).
+  list(FIND _variants "gemm_blackwell_small_fp16in_fp32out"
+       _gemm_blackwell_small_fp16in_fp32out_idx)
+  if(NOT ${_gemm_blackwell_small_fp16in_fp32out_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BLACKWELL_SMALL_FP16IN_FP32OUT_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_small_fp16in_fp32out — CUTE_DSL_GEMM_BLACKWELL_SMALL_FP16IN_FP32OUT_ENABLED set"
+    )
+  endif()
+
   # Blackwell DC 2-CTA variants (tile=256x256 cluster=(2,1) use_2cta=True) for
   # low-SM-count GPUs (Thor) at M >= 256.
   list(FIND _variants "gemm_blackwell_2cta_fp16" _gemm_blackwell_2cta_idx)

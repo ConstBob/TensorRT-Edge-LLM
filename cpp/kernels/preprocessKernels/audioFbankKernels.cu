@@ -527,6 +527,281 @@ constexpr float kMaxMinus = 8.0f;
 constexpr float kShift = 4.0f;
 constexpr float kScale = 4.0f;
 
+// ============================================================================
+// Parakeet fbank kernels
+// ============================================================================
+// These kernels reuse the fft_cmul / fft_cadd / fft_csub / dft16 register-FFT
+// helpers defined above (shared with the Whisper suite). The path is fixed to
+// FP16-in / FP32-out: mag is always FP16 and melPower is always FP32, so the
+// FP16 store / FP32 load is inlined (no dtype-polymorphic accessors).
+
+// Frames per STFT block (1 warp each). W=2 is tuned for Thor sm_110: the
+// smallest block gives the best SM load balance.
+constexpr int kPkStftWarps = 2;
+
+// Fused FP32 PCM → preemphasis → virtual center zero-pad → frame → symmetric
+// Hann. framed[t, n] = y * window[n] where y is the preemphasized sample at
+// idx = t*hop + n - centerPad (0 outside [0, N); y[0] = pcm[0]). The window is
+// the bare symmetric Hann embedded in nFft (no 1/32768 — input is FP32 [-1, 1]).
+// block(128) × grid(T_out) on grid.x (long-clip safe); kPcmM=4 so
+// blockDim.x*kPcmM = 512 ≥ nFft. See audioFbankKernels.h::pcmPreemphFramesAndWindow.
+__global__ void pcmPreemphFramedKernel(float const* __restrict__ pcm, float const* __restrict__ window, int64_t N,
+    int centerPad, int hop, float preemph, int nFft, int T_out, float* __restrict__ framedOut)
+{
+    constexpr int kPcmM = 4;
+    int const tid = threadIdx.x;
+    int const t = blockIdx.x;
+    if (t >= T_out)
+    {
+        return;
+    }
+    int64_t const pBase = static_cast<int64_t>(t) * hop - centerPad;
+    int64_t const tRowOff = static_cast<int64_t>(t) * nFft;
+#pragma unroll
+    for (int mm = 0; mm < kPcmM; ++mm)
+    {
+        int const n = tid + mm * blockDim.x;
+        if (n < nFft)
+        {
+            int64_t const idx = pBase + n;
+            float y = 0.0f;
+            if (idx >= 0 && idx < N)
+            {
+                float const xi = pcm[idx];
+                y = (idx == 0) ? xi : (xi - preemph * pcm[idx - 1]);
+            }
+            framedOut[tRowOff + n] = y * window[n];
+        }
+    }
+}
+
+// Self-written R2C N=512 FFT + |·|², FP16 store. Real-input packing
+// z[m] = x[2m] + i·x[2m+1] (m ∈ [0,256)), one half-length 256-pt complex FFT
+// (256 = 16×16, two register dft16 stages), then recombine to the 257 real bins.
+// One frame per warp; kPkStftWarps frames per block; __syncwarp ordering (each
+// frame is warp-local). Writes the [N_pad, K_pad] FP16 GEMM B-buffer; the
+// FP32→FP16 cast is fused into the store. rowStride = K_pad. kPaddedStride=kN2+1 padded
+// intermediate stride clears the stage-1→stage-2 shared-bank conflict.
+__global__ void stftR2C512FusedMagsqKernel(float const* __restrict__ framed, float2 const* __restrict__ twiddle,
+    __half* __restrict__ magOut, int T_out, int rowStride)
+{
+    constexpr int kNFft = 512;
+    constexpr int kNFreq = kNFft / 2 + 1;  // 257
+    constexpr int kNHalf = kNFft / 2;      // 256 (half length)
+    constexpr int kN1 = 16, kN2 = 16;      // 256 = 16 × 16
+    constexpr int kPaddedStride = kN2 + 1; // padded intermediate stride (17)
+    __shared__ float2 Zb[kPkStftWarps][kN1 * kPaddedStride];
+    int const warpId = threadIdx.x >> 5;
+    int const lane = threadIdx.x & 31;
+    int const frame = blockIdx.x * kPkStftWarps + warpId;
+    if (frame >= T_out)
+    {
+        return; // whole warp inactive together (frame depends only on warpId)
+    }
+    float2* Z = Zb[warpId];
+
+    // Stage 0: pack z[m] = x[2m] + i·x[2m+1] into natural layout Z[m] (coalesced).
+    float2 const* in2 = reinterpret_cast<float2 const*>(framed + static_cast<size_t>(frame) * kNFft);
+#pragma unroll
+    for (int m = lane; m < kNHalf; m += 32)
+    {
+        Z[m] = in2[m];
+    }
+    __syncwarp();
+
+    // Stage 1: 16 lanes, column DFT_16 + outer twiddle W_512^(2·k1·m2) → padded
+    // intermediate Z[k1·kPaddedStride + m2].
+    if (lane < kN2)
+    {
+        int const m2 = lane;
+        float2 col[kN1];
+#pragma unroll
+        for (int m1 = 0; m1 < kN1; ++m1)
+        {
+            col[m1] = Z[m1 * kN2 + m2];
+        }
+        dft16(col);
+        // In-place stride change (read kN2=16, write kPaddedStride=17): one lane's write index
+        // aliases another lane's not-yet-read input, so all active lanes must finish
+        // reading Z into registers before any write. Blackwell independent thread
+        // scheduling does not guarantee warp lockstep, so an explicit 16-lane barrier
+        // is required (cf. the Whisper stftR2CFusedMagsqKernel stage-3 barrier).
+        __syncwarp(0xFFFFu);
+#pragma unroll
+        for (int k1 = 0; k1 < kN1; ++k1)
+        {
+            // 2·k1·m2 maxes at 2·15·15 = 450 < 512 — direct L1-cached table index.
+            Z[k1 * kPaddedStride + m2] = fft_cmul(col[k1], twiddle[2 * k1 * m2]);
+        }
+    }
+    __syncwarp();
+
+    // Stage 2: 16 lanes, row DFT_16 → natural-bin order Z[k1 + k2·kN1].
+    if (lane < kN1)
+    {
+        int const k1 = lane;
+        float2 row[kN2];
+#pragma unroll
+        for (int m2 = 0; m2 < kN2; ++m2)
+        {
+            row[m2] = Z[k1 * kPaddedStride + m2];
+        }
+        dft16(row);
+        // In-place stride change (read kPaddedStride=17, write kN1=16): same cross-lane aliasing
+        // as stage 1; barrier the read phase before the write phase on ITS hardware.
+        __syncwarp(0xFFFFu);
+#pragma unroll
+        for (int k2 = 0; k2 < kN2; ++k2)
+        {
+            Z[k1 + k2 * kN1] = row[k2];
+        }
+    }
+    __syncwarp();
+
+    // Stage 3: recombine to the 512-pt real spectrum, store power for 257 bins.
+    __half* out = magOut + static_cast<size_t>(frame) * rowStride;
+    for (int k = lane; k < kNFreq; k += 32)
+    {
+        float2 Xk;
+        if (k == kNHalf) // k == 256: real Nyquist
+        {
+            float2 const z0 = Z[0];
+            Xk = make_float2(z0.x - z0.y, 0.0f);
+        }
+        else
+        {
+            float2 const Zk = Z[k];
+            float2 const cZ = Z[(kNHalf - k) & (kNHalf - 1)]; // Z[(256-k) mod 256]
+            float2 const E = make_float2(0.5f * (Zk.x + cZ.x), 0.5f * (Zk.y - cZ.y));
+            float2 const D = make_float2(0.5f * (Zk.x - cZ.x), 0.5f * (Zk.y + cZ.y));
+            float2 const O = make_float2(D.y, -D.x);   // -i·D
+            float2 const WO = fft_cmul(twiddle[k], O); // W_512^k · O
+            Xk = make_float2(E.x + WO.x, E.y + WO.y);
+        }
+        // Clamp the power to the largest finite FP16 before the store: a near-full-
+        // scale / clipped frame can push |X|^2 past kFp16MaxNormal -> inf -> ln(inf)
+        // downstream -> NaN. Real speech stays far below, so the clamp only guards
+        // pathological input.
+        constexpr float kFp16MaxNormal = 65504.0f; // largest finite FP16 (half) normal
+        float const power = Xk.x * Xk.x + Xk.y * Xk.y;
+        out[k] = __float2half_rn(fminf(power, kFp16MaxNormal));
+    }
+}
+
+// Per-feature ln(power+guard) mean + unbiased (N-1) variance. One block per mel
+// bin, single pass over melPower [nMel, N_pad] (N_pad stride; active [0, T_out)).
+// Two independent FMA accumulators (Σx, Σx²), warp-shuffle reduction.
+// See audioFbankKernels.h::melStatsLnPerFeature.
+template <int BLOCK_X>
+__global__ void melStatsLnKernel(float const* __restrict__ melPower, int T_out, int rowStride, float logGuard,
+    float normEps, float* __restrict__ meanOut, float* __restrict__ invDenomOut)
+{
+    constexpr int kWarps = BLOCK_X / 32;
+    __shared__ float wSum[kWarps];
+    __shared__ float wSqr[kWarps];
+    int const m = blockIdx.x;
+    int const tid = threadIdx.x;
+    int const lane = tid & 31;
+    int const warp = tid >> 5;
+    float const* row = melPower + static_cast<size_t>(m) * rowStride;
+
+    float s = 0.0f, s2 = 0.0f;
+    for (int t = tid; t < T_out; t += BLOCK_X)
+    {
+        float const x = logf(row[t] + logGuard);
+        s += x;
+        s2 += x * x;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+    {
+        s += __shfl_down_sync(0xffffffffu, s, off);
+        s2 += __shfl_down_sync(0xffffffffu, s2, off);
+    }
+    if (lane == 0)
+    {
+        wSum[warp] = s;
+        wSqr[warp] = s2;
+    }
+    __syncthreads();
+    if (warp == 0)
+    {
+        s = (lane < kWarps) ? wSum[lane] : 0.0f;
+        s2 = (lane < kWarps) ? wSqr[lane] : 0.0f;
+#pragma unroll
+        for (int off = kWarps >> 1; off > 0; off >>= 1)
+        {
+            s += __shfl_down_sync(0xffffffffu, s, off);
+            s2 += __shfl_down_sync(0xffffffffu, s2, off);
+        }
+        if (lane == 0)
+        {
+            float const mean = s / static_cast<float>(T_out);
+            float const denomN = (T_out > 1) ? static_cast<float>(T_out - 1) : 1.0f;
+            // Clamp >= 0: the (sum_x2 - sum_x*mean) expansion can round slightly
+            // negative for a near-constant bin (silence / dead frequency band), which
+            // would make sqrtf(var) NaN and poison every frame of this mel bin.
+            float const var = fmaxf((s2 - s * mean) / denomN, 0.0f); // unbiased (N-1)
+            meanOut[m] = mean;
+            invDenomOut[m] = 1.0f / (sqrtf(var) + normEps);
+        }
+    }
+}
+
+// z-score normalize + F16 cast, written time-first to out[T_out, nMel].
+// out[t, m] = (ln(power[m,t]+guard) - mean[m]) · invDenom[m]. threadIdx.x indexes
+// a mel PAIR and emits one __half2 store, folding the m-major→time-first
+// transpose into the thread→(m,t) mapping (coalesced 128-B warp store). Each
+// thread covers 4 consecutive t (one float4/row when T_out%4==0). Requires
+// blockDim.x == nMel/2. See audioFbankKernels.h::melNormalizeZScoreTimeFirst.
+__global__ void melNormalizeZScoreTimeFirstKernel(float const* __restrict__ melPower, int nMel, int T_out,
+    int rowStride, float logGuard, float const* __restrict__ mean, float const* __restrict__ invDenom,
+    __half* __restrict__ out)
+{
+    int const nPair = nMel >> 1;
+    int const mh = threadIdx.x;
+    int const m0 = 2 * mh;
+    float const mu0 = mean[m0], mu1 = mean[m0 + 1];
+    float const id0 = invDenom[m0], id1 = invDenom[m0 + 1];
+    float const* __restrict__ r0 = melPower + static_cast<size_t>(m0) * rowStride;
+    float const* __restrict__ r1 = melPower + static_cast<size_t>(m0 + 1) * rowStride;
+    __half2* out2 = reinterpret_cast<__half2*>(out);
+
+    int const t0 = (blockIdx.x * blockDim.y + threadIdx.y) * 4;
+    if (t0 >= T_out)
+    {
+        return;
+    }
+    if ((T_out & 3) == 0)
+    {
+        float4 const a = *reinterpret_cast<float4 const*>(r0 + t0); // one float4/row
+        float4 const b = *reinterpret_cast<float4 const*>(r1 + t0);
+        float const av[4] = {a.x, a.y, a.z, a.w};
+        float const bv[4] = {b.x, b.y, b.z, b.w};
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+        {
+            float const v0 = (logf(av[e] + logGuard) - mu0) * id0;
+            float const v1 = (logf(bv[e] + logGuard) - mu1) * id1;
+            out2[static_cast<size_t>(t0 + e) * nPair + mh] = __halves2half2(__float2half_rn(v0), __float2half_rn(v1));
+        }
+    }
+    else
+    {
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+        {
+            int const t = t0 + e;
+            if (t < T_out)
+            {
+                float const v0 = (logf(r0[t] + logGuard) - mu0) * id0;
+                float const v1 = (logf(r1[t] + logGuard) - mu1) * id1;
+                out2[static_cast<size_t>(t) * nPair + mh] = __halves2half2(__float2half_rn(v0), __float2half_rn(v1));
+            }
+        }
+    }
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -697,6 +972,172 @@ void logMelNormalizeAndCastF16(rt::Tensor const& melPowerFp16, int32_t const T_o
     logMelNormalizeFp16Kernel<kNormBlock, kNormElems><<<grid, block, 0, stream>>>(melPowerFp16.dataPointer<half>(),
         melOutF16.dataPointer<half>(), T_out, N_pad, maxLogScalar.dataPointer<float>(), melFloor, kMaxMinus, kInvScale,
         kShiftScaled);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ============================================================================
+// Parakeet wrappers
+// ============================================================================
+
+void pcmPreemphFramesAndWindow(rt::Tensor const& pcmF32, rt::Tensor const& windowF32, rt::Tensor& framedF32,
+    int32_t const nFft, int32_t const hopLength, int32_t const centerPad, float const preemph, int32_t const T_out,
+    cudaStream_t stream)
+{
+    check::check(pcmF32.getDeviceType() == rt::DeviceType::kGPU && windowF32.getDeviceType() == rt::DeviceType::kGPU
+            && framedF32.getDeviceType() == rt::DeviceType::kGPU,
+        "pcmPreemphFramesAndWindow: all tensors must be GPU.");
+    // Input is mono FP32 PCM in [-1, 1] (decoded host-side; AudioPCM::samples) —
+    // already float, no int16 reinterpret, no 1/32768 baked into the window.
+    check::check(pcmF32.getDataType() == DataType::kFLOAT && windowF32.getDataType() == DataType::kFLOAT
+            && framedF32.getDataType() == DataType::kFLOAT,
+        "pcmPreemphFramesAndWindow: pcmF32, windowF32 and framedF32 must be Float.");
+    check::check(
+        pcmF32.getShape().getNumDims() == 1, "pcmPreemphFramesAndWindow: pcmF32 must be [N] (mono FP32 samples).");
+    check::check(windowF32.getShape().getNumDims() == 1 && windowF32.getShape()[0] == nFft,
+        "pcmPreemphFramesAndWindow: windowF32 shape must be [nFft].");
+    check::check(framedF32.getShape().getNumDims() == 2 && framedF32.getShape()[1] == nFft,
+        "pcmPreemphFramesAndWindow: framedF32 shape must be [T_out, nFft].");
+    // block.x * kPcmM (=4) must cover nFft, else frame cols [512, nFft) are never
+    // written (stale DRAM → wrong spectrum).
+    check::check(nFft <= 512, "pcmPreemphFramesAndWindow: nFft must be <= blockDim.x*kPcmM (512).");
+    check::check(T_out > 0 && T_out <= framedF32.getShape()[0],
+        "pcmPreemphFramesAndWindow: T_out must be in (0, framedF32.shape[0]].");
+
+    int64_t const N = pcmF32.getShape()[0];
+    // One block per frame on grid.x (long-form clips stay under the 65535 grid.y
+    // limit); kPcmM = 4 elements per thread.
+    dim3 const block(128, 1);
+    dim3 const grid(static_cast<uint32_t>(T_out), 1);
+    pcmPreemphFramedKernel<<<grid, block, 0, stream>>>(pcmF32.dataPointer<float>(), windowF32.dataPointer<float>(), N,
+        centerPad, hopLength, preemph, nFft, T_out, framedF32.dataPointer<float>());
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void stftR2C512FusedMagsq(rt::Tensor const& framedF32, rt::Tensor const& fftTwiddle, rt::Tensor& magFp16,
+    int32_t const T_out, int32_t const K_pad, cudaStream_t stream)
+{
+    constexpr int kNFft = 512;
+
+    check::check(framedF32.getDeviceType() == rt::DeviceType::kGPU && fftTwiddle.getDeviceType() == rt::DeviceType::kGPU
+            && magFp16.getDeviceType() == rt::DeviceType::kGPU,
+        "stftR2C512FusedMagsq: all tensors must be GPU.");
+    check::check(framedF32.getDataType() == DataType::kFLOAT && fftTwiddle.getDataType() == DataType::kFLOAT,
+        "stftR2C512FusedMagsq: framedF32 and fftTwiddle must be Float.");
+    check::check(magFp16.getDataType() == DataType::kHALF, "stftR2C512FusedMagsq: magFp16 must be Half.");
+    check::check(framedF32.getShape().getNumDims() == 2 && framedF32.getShape()[1] == kNFft,
+        "stftR2C512FusedMagsq: framedF32 shape must be [T_full, 512].");
+    check::check(
+        fftTwiddle.getShape().getNumDims() == 2 && fftTwiddle.getShape()[0] == kNFft && fftTwiddle.getShape()[1] == 2,
+        "stftR2C512FusedMagsq: fftTwiddle shape must be [512, 2] (interleaved complex).");
+    check::check(magFp16.getShape().getNumDims() == 2 && magFp16.getShape()[1] == K_pad,
+        "stftR2C512FusedMagsq: magFp16 shape must be [N_pad, K_pad].");
+    check::check(T_out > 0 && T_out <= magFp16.getShape()[0], "stftR2C512FusedMagsq: T_out must be in (0, N_pad].");
+    check::check(T_out <= framedF32.getShape()[0], "stftR2C512FusedMagsq: T_out must not exceed framedF32 T_full.");
+
+    // kPkStftWarps frames per block, one warp each. Static smem inside the kernel.
+    uint32_t const nBlocks = (static_cast<uint32_t>(T_out) + kPkStftWarps - 1) / kPkStftWarps;
+    dim3 const grid(nBlocks, 1, 1);
+    dim3 const block(kPkStftWarps * 32, 1, 1);
+    stftR2C512FusedMagsqKernel<<<grid, block, 0, stream>>>(framedF32.dataPointer<float>(),
+        reinterpret_cast<float2 const*>(fftTwiddle.dataPointer<float>()), magFp16.dataPointer<half>(), T_out, K_pad);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void melLinearGemmFp16inFp32out(
+    rt::Tensor const& melFilterFp16Kmajor, rt::Tensor const& magFp16, rt::Tensor& melPowerF32, cudaStream_t stream)
+{
+#ifdef CUTE_DSL_GEMM_ENABLED
+    check::check(melFilterFp16Kmajor.getDeviceType() == rt::DeviceType::kGPU
+            && magFp16.getDeviceType() == rt::DeviceType::kGPU && melPowerF32.getDeviceType() == rt::DeviceType::kGPU,
+        "melLinearGemmFp16inFp32out: all tensors must be GPU.");
+    check::check(melFilterFp16Kmajor.getDataType() == DataType::kHALF && magFp16.getDataType() == DataType::kHALF,
+        "melLinearGemmFp16inFp32out: melFilter and mag must be Half (tensor-core operands).");
+    check::check(melPowerF32.getDataType() == DataType::kFLOAT,
+        "melLinearGemmFp16inFp32out: melPowerF32 must be Float (FP32 GEMM output).");
+    check::check(melFilterFp16Kmajor.getShape().getNumDims() == 2 && magFp16.getShape().getNumDims() == 2
+            && melPowerF32.getShape().getNumDims() == 2,
+        "melLinearGemmFp16inFp32out: all tensors must be 2-D.");
+
+    int32_t const M = static_cast<int32_t>(melFilterFp16Kmajor.getShape()[0]); // nMel
+    int32_t const K = static_cast<int32_t>(melFilterFp16Kmajor.getShape()[1]); // K_pad
+    int32_t const N = static_cast<int32_t>(magFp16.getShape()[0]);             // N_pad
+    check::check(magFp16.getShape()[1] == K,
+        "melLinearGemmFp16inFp32out: magFp16.shape[1] must equal melFilter.shape[1] (K_pad).");
+    check::check(melPowerF32.getShape()[0] == M && melPowerF32.getShape()[1] == N,
+        "melLinearGemmFp16inFp32out: melPowerF32 shape must equal [nMel, N_pad].");
+
+    // Same FP16 tensor-core MMA as the Whisper path (melLinearGemmFp16TC) with an
+    // FP32 C store; see CuteDslGemmRunner::runFp16inFp32out for the FP32-out rationale.
+    bool const ok = CuteDslGemmRunner::runFp16inFp32out(
+        melFilterFp16Kmajor.rawPointer(), magFp16.rawPointer(), melPowerF32.rawPointer(), M, N, K, stream);
+    check::check(ok, "melLinearGemmFp16inFp32out: CuteDslGemmRunner::runFp16inFp32out dispatch failed.");
+#else
+    // GEMM variant not compiled (ENABLE_CUTE_DSL=OFF); signature kept so audioUtils.cpp links.
+    check::check(
+        false, "melLinearGemmFp16inFp32out: CuTe DSL GEMM not compiled. Rebuild with -DENABLE_CUTE_DSL=gemm (or ALL).");
+#endif
+}
+
+void melStatsLnPerFeature(rt::Tensor const& melPowerF32, int32_t const T_out, float const logGuard, float const normEps,
+    rt::Tensor& mean, rt::Tensor& invDenom, cudaStream_t stream)
+{
+    check::check(melPowerF32.getDeviceType() == rt::DeviceType::kGPU && mean.getDeviceType() == rt::DeviceType::kGPU
+            && invDenom.getDeviceType() == rt::DeviceType::kGPU,
+        "melStatsLnPerFeature: all tensors must be GPU.");
+    check::check(melPowerF32.getDataType() == DataType::kFLOAT && mean.getDataType() == DataType::kFLOAT
+            && invDenom.getDataType() == DataType::kFLOAT,
+        "melStatsLnPerFeature: melPowerF32, mean and invDenom must be Float.");
+    check::check(
+        melPowerF32.getShape().getNumDims() == 2, "melStatsLnPerFeature: melPowerF32 must be 2-D [nMel, N_pad].");
+
+    int32_t const nMel = static_cast<int32_t>(melPowerF32.getShape()[0]);
+    int32_t const N_pad = static_cast<int32_t>(melPowerF32.getShape()[1]);
+    check::check(nMel > 0 && nMel <= 65535, "melStatsLnPerFeature: nMel must be in (0, 65535].");
+    check::check(T_out > 0 && T_out <= N_pad, "melStatsLnPerFeature: T_out must be in (0, N_pad].");
+    check::check(mean.getShape().getNumDims() == 1 && mean.getShape()[0] == nMel
+            && invDenom.getShape().getNumDims() == 1 && invDenom.getShape()[0] == nMel,
+        "melStatsLnPerFeature: mean and invDenom must be [nMel].");
+
+    // 256-thread block, one block per mel bin.
+    constexpr int kStatBlock = 256;
+    melStatsLnKernel<kStatBlock>
+        <<<static_cast<uint32_t>(nMel), kStatBlock, 0, stream>>>(melPowerF32.dataPointer<float>(), T_out, N_pad,
+            logGuard, normEps, mean.dataPointer<float>(), invDenom.dataPointer<float>());
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void melNormalizeZScoreTimeFirst(rt::Tensor const& melPowerF32, int32_t const T_out, float const logGuard,
+    rt::Tensor const& mean, rt::Tensor const& invDenom, rt::Tensor& melOutF16, cudaStream_t stream)
+{
+    check::check(melPowerF32.getDeviceType() == rt::DeviceType::kGPU && mean.getDeviceType() == rt::DeviceType::kGPU
+            && invDenom.getDeviceType() == rt::DeviceType::kGPU && melOutF16.getDeviceType() == rt::DeviceType::kGPU,
+        "melNormalizeZScoreTimeFirst: all tensors must be GPU.");
+    check::check(melPowerF32.getDataType() == DataType::kFLOAT && mean.getDataType() == DataType::kFLOAT
+            && invDenom.getDataType() == DataType::kFLOAT,
+        "melNormalizeZScoreTimeFirst: melPowerF32, mean and invDenom must be Float.");
+    check::check(melOutF16.getDataType() == DataType::kHALF, "melNormalizeZScoreTimeFirst: melOutF16 must be Half.");
+    check::check(melPowerF32.getShape().getNumDims() == 2,
+        "melNormalizeZScoreTimeFirst: melPowerF32 must be 2-D [nMel, N_pad].");
+
+    int32_t const nMel = static_cast<int32_t>(melPowerF32.getShape()[0]);
+    int32_t const N_pad = static_cast<int32_t>(melPowerF32.getShape()[1]);
+    check::check(nMel > 0 && (nMel & 1) == 0, "melNormalizeZScoreTimeFirst: nMel must be even.");
+    check::check(T_out > 0 && T_out <= N_pad, "melNormalizeZScoreTimeFirst: T_out must be in (0, N_pad].");
+    // Time-first output [1, T_out, nMel] (the parakeet layout; Whisper is [1, nMel, T_out]).
+    check::check(melOutF16.getShape().getNumDims() == 3 && melOutF16.getShape()[0] == 1
+            && melOutF16.getShape()[1] == T_out && melOutF16.getShape()[2] == nMel,
+        "melNormalizeZScoreTimeFirst: melOutF16 shape must be [1, T_out, nMel].");
+    check::check(mean.getShape()[0] == nMel && invDenom.getShape()[0] == nMel,
+        "melNormalizeZScoreTimeFirst: mean and invDenom must be [nMel].");
+
+    // threadIdx.x = mel pair (nMel/2), threadIdx.y = 4 time rows; each thread does
+    // 4 consecutive t → (64, 4) = 256 threads for nMel = 128.
+    constexpr int kNormTRows = 4;
+    constexpr int kNormTileT = kNormTRows * 4;
+    dim3 const block(static_cast<uint32_t>(nMel / 2), kNormTRows);
+    dim3 const grid((static_cast<uint32_t>(T_out) + kNormTileT - 1) / kNormTileT, 1, 1);
+    melNormalizeZScoreTimeFirstKernel<<<grid, block, 0, stream>>>(melPowerF32.dataPointer<float>(), nMel, T_out, N_pad,
+        logGuard, mean.dataPointer<float>(), invDenom.dataPointer<float>(), melOutF16.dataPointer<half>());
     CUDA_CHECK(cudaGetLastError());
 }
 

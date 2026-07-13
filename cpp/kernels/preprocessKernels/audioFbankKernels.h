@@ -164,5 +164,131 @@ void log10MaxReduce(rt::Tensor const& melPowerFp16, int32_t const T_out, rt::Ten
 void logMelNormalizeAndCastF16(rt::Tensor const& melPowerFp16, int32_t const T_out, rt::Tensor const& maxLogScalar,
     rt::Tensor& melOutF16, float const melFloor, cudaStream_t stream);
 
+//! \brief Parakeet (Nemotron-Omni) fbank GPU kernel suite.
+//!
+//! Same rt::Tensor free-function ABI as the Whisper suite above; composed by
+//! audioUtils::fbankParakeet.
+//! The algorithm differs from Whisper: preemphasis 0.97; n_fft 512 (radix-2, not
+//! 400 mixed-radix); zero center pad (not reflect); symmetric Hann (win 400)
+//! zero-padded to 512; natural log (not log10); per-feature z-score normalize
+//! (not global-max); and a time-first [1, T_out, nMel] output.
+//!
+//! Mel pipeline shape contract (parakeet K_pad = round_up(nFreq=257, 16) = 272):
+//!     N_pad = round_up(T_out, 128)      — GEMM N-axis (no residue handling)
+//!     K_pad = 272                       — GEMM K-axis (cluster-tile aligned)
+//!     mag        [N_pad, K_pad]  Half  — GEMM B-matrix; first T_out rows × nFreq
+//!                                        cols written, padding stays zero
+//!     melFilter  [nMel,  K_pad]  Half  — GEMM A-matrix; K-padded by caller
+//!     melPower   [nMel,  N_pad]  Float — GEMM C-matrix; FP32 (not FP16) so the
+//!                                        ~17-orders-of-magnitude mel power does
+//!                                        not flush to zero before the natural-log
+//!                                        stats (the ln + per-feature z-score
+//!                                        amplifies that underflow).
+
+//! Fused PCM → preemphasis → virtual center zero-pad → frame → symmetric Hann.
+//! For framed[t, n] (n in [0, nFft)):
+//!     idx   = t*hop + n - centerPad             (index into the FP32 signal)
+//!     y     = 0                                       if idx < 0 or idx >= N
+//!           = pcm[0]                                  if idx == 0
+//!           = pcm[idx] - preemph * pcm[idx-1]         otherwise
+//!     framed[t, n] = y * windowF32[n]
+//! The input is mono FP32 PCM in [-1, 1] (decoded host-side; AudioPCM::samples),
+//! so the preemphasis recurrence runs directly on the FP32 samples and windowF32
+//! carries no 1/32768 S16→F32 scale factor. Because preemphasis is linear and
+//! FP32 == S16/32768, this is numerically equivalent to running on S16 input with
+//! the scale folded into the window.
+//! The center zero-pad is virtual: out-of-range idx contribute 0, no padded
+//! buffer is materialized.
+//! Inputs:
+//!     pcmF32   [GPU, Float]: [N]      — mono FP32 PCM in [-1, 1].
+//!     windowF32 [GPU, Float]: [nFft]  — symmetric Hann (win_length) zero-padded
+//!                                       and centered at offset (nFft-win)/2.
+//!     nFft / hopLength / centerPad / preemph — STFT parameters (512/160/256/0.97).
+//!     T_out                            — output frames = floor(N / hopLength).
+//! Outputs:
+//!     framedF32 [GPU, Float]: [T_out, nFft] row-major.
+//! \throws std::runtime_error on invalid tensor shape / dtype / location.
+void pcmPreemphFramesAndWindow(rt::Tensor const& pcmF32, rt::Tensor const& windowF32, rt::Tensor& framedF32,
+    int32_t const nFft, int32_t const hopLength, int32_t const centerPad, float const preemph, int32_t const T_out,
+    cudaStream_t stream);
+
+//! Self-written R2C N=512 FFT (radix-2), fp32, with power |·|² + FP16 cast fused
+//! into the store. Real-input packing: z[m] = x[2m] + i·x[2m+1] (m in [0,256)),
+//! one half-length 256-pt complex FFT (two register dft16 stages, 256 = 16×16),
+//! then recombine to the 257 non-redundant bins of the 512-pt real spectrum.
+//! One frame per warp; kPkStftWarps frames per block; __syncwarp ordering.
+//!
+//! Writes directly into the T-major [N_pad, K_pad] FP16 GEMM B-buffer (no
+//! separate magsq/pack kernel). Caller MUST pre-zero magFp16 so padding rows
+//! [T_out, N_pad) and cols [nFreq, K_pad) stay zero — the AOT GEMM has no
+//! residue handling.
+//! Inputs:
+//!     framedF32  [GPU, Float]: [T_out, 512]
+//!     fftTwiddle [GPU, Float]: [512, 2]  — outer-stage W_512^k table, float2
+//!         interleaved (real, imag); precomputed in fp64 then cast to fp32.
+//!     T_out / K_pad                       — first T_out frames × nFreq=257 bins
+//!                                           written; K_pad (=272) is the row stride.
+//! Outputs:
+//!     magFp16 [GPU, Half]: [N_pad, K_pad] — caller-pre-zeroed.
+//! \throws std::runtime_error on invalid tensor shape / dtype / location.
+void stftR2C512FusedMagsq(rt::Tensor const& framedF32, rt::Tensor const& fftTwiddle, rt::Tensor& magFp16,
+    int32_t const T_out, int32_t const K_pad, cudaStream_t stream);
+
+//! Mel-filter projection via the AOT CuTe DSL Blackwell GEMM, FP16 in / FP32 out.
+//! Logical: melPower = melFilter @ mag^T, GEMM ABI
+//!     C[M=nMel, N=N_pad] = A[M=nMel, K=K_pad] @ B[N=N_pad, K=K_pad]^T
+//! A/B are FP16 (tensor-core operands), accumulation is FP32, and the C output is
+//! written in FP32 — the parakeet-specific deviation from the Whisper FP16-out
+//! path (melLinearGemmFp16TC). Dispatched to the FP16-in/FP32-out Blackwell
+//! variant; the caller must have loaded the kernel module (initFbankResources).
+//! Inputs:
+//!     melFilterFp16Kmajor [GPU, Half]:  [nMel, K_pad]  row-major, K contiguous
+//!     magFp16             [GPU, Half]:  [N_pad, K_pad] row-major, K contiguous
+//! Outputs:
+//!     melPowerF32         [GPU, Float]: [nMel, N_pad]  row-major
+//! \throws std::runtime_error on invalid tensor shape / dtype / location, or if
+//!     the GEMM runner reports dispatch failure / the FP32-out variant is absent.
+void melLinearGemmFp16inFp32out(
+    rt::Tensor const& melFilterFp16Kmajor, rt::Tensor const& magFp16, rt::Tensor& melPowerF32, cudaStream_t stream);
+
+//! Per-feature (per mel bin) statistics for z-score normalization. One block per
+//! mel bin. Single pass over x = ln(power + logGuard): two independent FMA chains
+//! accumulate Σx and Σx² (full ILP, no serial recurrence), reduced via warp
+//! shuffles. Writes mean[nMel] and invDenom[nMel] where
+//!     mean = Σx / T_out ;  var = (Σx² - Σx·mean) / (T_out - 1) ;  (unbiased N-1)
+//!     invDenom = 1 / (sqrt(var) + normEps)
+//! Reads melPower in the padded [nMel, N_pad] layout via N_pad stride; only the
+//! active [0, nMel) × [0, T_out) window contributes.
+//! Inputs:
+//!     melPowerF32 [GPU, Float]: [nMel, N_pad]
+//!     T_out                     — active T-window width
+//!     logGuard / normEps        — ln floor (2^-24) and std epsilon (1e-5)
+//! Outputs:
+//!     mean     [GPU, Float]: [nMel]
+//!     invDenom [GPU, Float]: [nMel]
+//! \throws std::runtime_error on invalid tensor shape / dtype / location.
+void melStatsLnPerFeature(rt::Tensor const& melPowerF32, int32_t const T_out, float const logGuard, float const normEps,
+    rt::Tensor& mean, rt::Tensor& invDenom, cudaStream_t stream);
+
+//! Per-feature z-score normalize + cast to F16, written time-first to
+//! out[1, T_out, nMel]:
+//!     out[t, m] = (ln(power[m, t] + logGuard) - mean[m]) * invDenom[m]
+//! melPower is m-major [nMel, N_pad] but the output is time-first, so the kernel
+//! folds the transpose into the thread→(m,t) mapping: threadIdx.x indexes a mel
+//! PAIR and emits one __half2 store, giving a coalesced 128-byte warp write.
+//! Output shape/dtype matches the CPU MelExtractor → uploadHostMelFp32ToFp16Gpu
+//! contract for parakeet ([1, T_out, nMel] Half, time-first), so downstream
+//! requires no change. Requires nMel even.
+//! Inputs:
+//!     melPowerF32 [GPU, Float]: [nMel, N_pad]
+//!     T_out                     — active T-window width
+//!     logGuard                  — ln floor (2^-24)
+//!     mean / invDenom [GPU, Float]: [nMel]  — output of melStatsLnPerFeature
+//! Outputs:
+//!     melOutF16 [GPU, Half]: [1, T_out, nMel]
+//! \throws std::runtime_error on invalid tensor shape / dtype / location.
+void melNormalizeZScoreTimeFirst(rt::Tensor const& melPowerF32, int32_t const T_out, float const logGuard,
+    rt::Tensor const& mean, rt::Tensor const& invDenom, rt::Tensor& melOutF16, cudaStream_t stream);
+
 } // namespace kernel
 } // namespace trt_edgellm

@@ -77,6 +77,12 @@ bool fillMelFilterFp16Kmajor(
 //! fp64, stored as fp32.
 void makeFftTwiddleHost(int32_t nFft, std::vector<float>& twoChan);
 
+//! Embed a symmetric window of ``window.size()`` taps centred in an ``nFft``-wide
+//! buffer (offset ``(nFft - winLength)/2``, zeros elsewhere) into ``out`` as
+//! ``[nFft]`` float. For winLength < nFft (e.g. a 400-tap Hann in a 512-point
+//! FFT); the caller ensures ``window.size() <= nFft``.
+void makeCentredWindowHost(std::vector<float> const& window, int32_t nFft, std::vector<float>& out);
+
 //! Compute CNN output length (three 2x downsampling layers)
 int64_t computeFeatExtractOutputLength(int64_t inputLength, int32_t nWindow);
 
@@ -206,6 +212,93 @@ inline int32_t fbankNPad(int32_t T_out)
 //! @param stream              CUDA stream.
 //! @return true on success, false on validation / dispatch failure.
 bool fbankWhisper(rt::Tensor const& pcmF32, FbankResources& resources, rt::Tensor& melOutF16, cudaStream_t stream);
+
+//! K-axis padding for the parakeet AOT CuTe DSL GEMM: round_up(nFreq, 16) (the
+//! Blackwell tcgen05 GEMM has no K-residue handling). Derived from nFreq — which
+//! is itself filled from MelExtractorConfig — so K_pad cannot drift from the
+//! FFT/mel geometry (nFreq=257 → 272; cf. Whisper's nFreq=201 → 208). Mirrors
+//! fbankNPad above.
+inline int32_t fbankKPadParakeet(int32_t nFreq)
+{
+    return ((nFreq + 15) / 16) * 16;
+}
+
+//! Output mel frames for parakeet: ``T_out = floor(numPcmSamples / hopLength)``.
+//! Unlike Whisper (computeNumMelFrames, which applies the HF ``stft[..., :-1]``
+//! drop-last trim), parakeet uses a plain floor — the HF ParakeetFeatureExtractor
+//! features length for center=True padding.
+int32_t computeNumMelFramesParakeet(int64_t numPcmSamples, int32_t hopLength);
+
+//! Per-feature z-score epsilon for the parakeet log-mel normalise (HF
+//! ParakeetFeatureExtractor norm_eps == 1e-5). Matches the CPU MelExtractor's
+//! per-feature epsilon (runtime/melSpectrogram.cpp).
+constexpr float kParakeetZScoreEps = 1e-5f;
+
+//! Persistent parakeet fbank resources, built once by
+//! NemotronOmniAudioRunner::initFbankResources and reused across clips. Every
+//! device tensor is allocated exactly once — the weight/table tensors at their
+//! natural shapes, the workspace below at the engine kMAX bound; per-clip steady
+//! state performs no device allocation — only a capacity-checked reshape of the
+//! workspace.
+//!
+//! The scalar STFT/mel params are populated from the bound CPU MelExtractor's
+//! MelExtractorConfig (single source of truth), except normEps, which is not a
+//! MelExtractorConfig field and comes from kParakeetZScoreEps above.
+//! initFbankResources validates the config is parakeet-spec before filling these.
+struct FbankResourcesParakeet
+{
+    // Persistent weight / table tensors, filled once at init.
+    rt::Tensor melFilterFp16Kmajor; //!< [nMel, round_up(nFreq,16)] Half — Slaney weights, K-padded
+    rt::Tensor windowF32;           //!< [nFft] Float — symmetric Hann (win_length) centered in nFft
+    rt::Tensor fftTwiddle;          //!< [nFft, 2] Float — outer-stage W_512^k table
+
+    // Device workspace, pre-allocated at the maxFrames bound and reshaped (never
+    // re-allocated) per clip. magFp16's K-pad columns are zeroed once at init.
+    rt::Tensor framedF32;   //!< [T_out, nFft]  Float
+    rt::Tensor magFp16;     //!< [N_pad, K_pad] Half  — GEMM B-matrix
+    rt::Tensor melPowerF32; //!< [nMel, N_pad]  Float — GEMM C-matrix (FP32, not FP16)
+    rt::Tensor mean;        //!< [nMel]         Float — per-feature ln mean
+    rt::Tensor invDenom;    //!< [nMel]         Float — per-feature 1/(std + eps)
+
+    int32_t nFft{0};      //!< STFT size (== MelExtractorConfig::nFFT; kernels require 512)
+    int32_t hopLength{0}; //!< STFT hop (== MelExtractorConfig::hopLength == 160)
+    int32_t centerPad{0}; //!< center zero-pad each side (== nFft / 2 == 256)
+    int32_t nMel{0};      //!< mel bins (== MelExtractorConfig::nMel == 128)
+    int32_t nFreq{0};     //!< FFT bins == nFft / 2 + 1 == 257 (active K-window before K-pad)
+    int32_t maxFrames{0}; //!< workspace capacity in mel frames (engine input_features kMAX bound)
+    float preemph{0.0f};  //!< preemphasis coefficient (== 0.97)
+    float logGuard{0.0f}; //!< natural-log input floor (== 2^-24)
+    float normEps{0.0f};  //!< per-feature std epsilon (== kParakeetZScoreEps)
+};
+
+//! Parakeet-style online fbank: mono FP32 PCM → log-mel F16 spectrogram,
+//! time-first [1, T_out, nMel]. Composes the five GPU kernel launches declared
+//! in kernels/preprocessKernels/audioFbankKernels.h:
+//!     pcmPreemphFramesAndWindow → stftR2C512FusedMagsq →
+//!     melLinearGemmFp16inFp32out (AOT CuTe DSL, FP32 out) → melStatsLnPerFeature
+//!     → melNormalizeZScoreTimeFirst.
+//!
+//! Output shape/dtype matches the CPU MelExtractor → uploadHostMelFp32ToFp16Gpu
+//! parakeet contract ([1, T_out, nMel] Half, time-first), so the GPU fbank and the
+//! CPU fallback are shape/dtype-compatible. (Numerically the GPU per-feature std
+//! uses an unbiased N-1 divisor, matching HF ParakeetFeatureExtractor, while the CPU
+//! MelExtractor uses a biased N divisor — a sub-threshold sqrt(N/(N-1)) scale that
+//! differs only on very short clips; see melSpectrogram.cpp.)
+//!
+//! Caller must have already loaded the CuTe DSL gemm module (idempotent +
+//! thread-safe; initFbankResources does this).
+//!
+//! @param pcmF32     Input [N] Float GPU tensor — mono FP32 PCM in [-1, 1].
+//! @param resources  Persistent parakeet fbank resources; non-const — the
+//!                   init-time pre-allocated workspace is reshaped to the active
+//!                   clip size (no per-clip device allocation).
+//! @param melOutF16  [1, T_out, nMel] Half GPU output — an owned tensor or a
+//!                   non-owning view over a pre-allocated backing store
+//!                   (NemotronOmniAudioRunner passes a view).
+//! @param stream     CUDA stream.
+//! @return true on success, false on validation / dispatch / capacity failure.
+bool fbankParakeet(
+    rt::Tensor const& pcmF32, FbankResourcesParakeet& resources, rt::Tensor& melOutF16, cudaStream_t stream);
 
 } // namespace audioUtils
 } // namespace rt
