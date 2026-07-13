@@ -140,6 +140,7 @@ class AutoModel:
                         gemma4_mtp_base: bool = False,
                         gemma4_mtp_draft: bool = False,
                         gemma4_kv_sharing_map: "list[dict] | None" = None,
+                        gemma4_target_kv_cache_quant: "str | None" = None,
                         num_decoder_layers: "int | None" = None) -> nn.Module:
         """Construct and load a model from *model_dir*.
 
@@ -185,6 +186,9 @@ class AutoModel:
             gemma4_kv_sharing_map:
                             Validated assistant-layer to target-layer map for
                             Gemma4 MTP draft runtime config.
+            gemma4_target_kv_cache_quant:
+                            Target/base KV-cache quantization mode inherited by
+                            Gemma4 MTP draft inputs that alias target KV cache.
             num_decoder_layers:
                             When set, truncate the model to only the first N
                             decoder layers (few-layer numeric validation).
@@ -293,6 +297,8 @@ class AutoModel:
             config.returns_feedback_hidden = True
             config.assistant_hidden_size = config.hidden_size
             config.kv_sharing_map = list(gemma4_kv_sharing_map or [])
+            if gemma4_target_kv_cache_quant is not None:
+                config.quant.kv_cache_quant = gemma4_target_kv_cache_quant
             model_class = Gemma4AssistantForCausalLM
         else:
             if (variant == "mtp_base"

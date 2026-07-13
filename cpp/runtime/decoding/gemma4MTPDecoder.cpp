@@ -189,8 +189,12 @@ bool Gemma4MTPDecoder::captureCudaGraphs(cudaStream_t stream)
             check::check(mRuntime.base.pipelineIO.contextLengths.reshape({batchSize}), "Tensor reshape failed");
             check::check(mRuntime.base.pipelineIO.specDecodePositionIds.reshape({batchSize, verifySize}),
                 "Tensor reshape failed");
-            check::check(mRuntime.preprocess.gemma4Ple, "Gemma4 MTP base verification requires Gemma4 PLE.");
-            mRuntime.preprocess.gemma4Ple->reshapeOutputs(batchSize, verifySize);
+            if (mRuntime.deployment.base.pleEnabled)
+            {
+                check::check(mRuntime.preprocess.gemma4Ple,
+                    "Gemma4 MTP base config has PLE enabled but the Gemma4 PLE preprocessor is missing.");
+                mRuntime.preprocess.gemma4Ple->reshapeOutputs(batchSize, verifySize);
+            }
 
             Tensor const& baseKVCacheLengths = mRuntime.base.cacheManager.getKVCacheLengths();
             kernel::launchDFlashPrepareBaseVerifyInputs(baseKVCacheLengths.dataPointer<int32_t>(), verifySize,
@@ -483,8 +487,12 @@ bool Gemma4MTPDecoder::runBaseVerification(DecodingInferenceContext& context)
         "Tensor reshape failed");
     kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
         mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
-    check::check(mRuntime.preprocess.gemma4Ple, "Gemma4 MTP base verification requires Gemma4 PLE.");
-    mRuntime.preprocess.gemma4Ple->embed(mRuntime.preprocess.idsInput, context.stream);
+    if (mRuntime.deployment.base.pleEnabled)
+    {
+        check::check(mRuntime.preprocess.gemma4Ple,
+            "Gemma4 MTP base config has PLE enabled but the Gemma4 PLE preprocessor is missing.");
+        mRuntime.preprocess.gemma4Ple->embed(mRuntime.preprocess.idsInput, context.stream);
+    }
 
     int32_t const selectTokenSize = activeBatchSize * verifySize;
     check::check(

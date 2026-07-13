@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
 
+from ...checkpoint import checkpoint_utils
 from ...config import QUANT_NVFP4, ModelConfig
 from ..default.modeling_default import (MLP, Attention, CausalLM, DecoderLayer,
                                         OnnxSpec, RMSNorm)
@@ -111,68 +112,6 @@ def _mlp_intermediate_size_for_layer(config: ModelConfig,
     return intermediate_size
 
 
-def _rotary_dim_from_rope_config(config: ModelConfig,
-                                 rope_config: dict | None,
-                                 head_dim: int | None = None) -> int:
-    """Return the RoPE table width for one Gemma4 runtime RoPE config."""
-    layer_head_dim = int(head_dim or config.head_dim)
-    if isinstance(rope_config, dict):
-        rope_scaling = rope_config.get("rope_scaling")
-        partial_rotary_factor = float(
-            rope_config.get("partial_rotary_factor",
-                            config.partial_rotary_factor))
-    else:
-        rope_scaling = config.rope_scaling
-        partial_rotary_factor = config.partial_rotary_factor
-
-    if isinstance(rope_scaling, dict):
-        rope_type = str(
-            rope_scaling.get("rope_type", rope_scaling.get("type", "default")))
-        if rope_type in {"default", "proportional"}:
-            return layer_head_dim
-    return int(layer_head_dim * partial_rotary_factor)
-
-
-def _select_rope_for_layer(
-    layer: nn.Module,
-    rope_rotary_cos_sin: torch.Tensor | None,
-    rope_rotary_cos_sin_sliding: torch.Tensor | None,
-    rope_rotary_cos_sin_full: torch.Tensor | None,
-) -> torch.Tensor:
-    """Select the Gemma4 RoPE table matching ``layer`` attention type."""
-    if (rope_rotary_cos_sin_sliding is None
-            and rope_rotary_cos_sin_full is None):
-        if rope_rotary_cos_sin is None:
-            raise ValueError(
-                "rope_rotary_cos_sin is required for single-RoPE Gemma4 export."
-            )
-        return rope_rotary_cos_sin
-
-    attention_type = getattr(layer.self_attn, "attention_type",
-                             "full_attention")
-    if attention_type == "sliding_attention":
-        if rope_rotary_cos_sin_sliding is None:
-            raise ValueError(
-                "rope_rotary_cos_sin_sliding is required for Gemma4 sliding attention layers."
-            )
-        return rope_rotary_cos_sin_sliding
-
-    if rope_rotary_cos_sin_full is None:
-        raise ValueError(
-            "rope_rotary_cos_sin_full is required for Gemma4 full attention layers."
-        )
-    return rope_rotary_cos_sin_full
-
-
-def _attention_type_for_layer(config: ModelConfig, layer_idx: int) -> str:
-    """Return Gemma4's per-layer attention type."""
-    if layer_idx < len(config.attention_layer_types):
-        return config.attention_layer_types[layer_idx]
-    if config.sliding_window_size >= 0:
-        return "sliding_attention"
-    return "full_attention"
-
-
 def _compute_kv_donor_indices(config: ModelConfig) -> dict[int, int]:
     """Return shared-layer -> donor-layer KV indices for Gemma4."""
     num_shared = int(getattr(config, "num_kv_shared_layers", 0) or 0)
@@ -208,21 +147,13 @@ def _rotary_dim_from_rope_config(config: ModelConfig,
     """Return the RoPE table width for one Gemma4 runtime RoPE config."""
     effective_head_dim = head_dim if head_dim is not None else int(
         config.head_dim)
-    if isinstance(rope_config, dict):
-        rope_scaling = rope_config.get("rope_scaling")
-        partial_rotary_factor = float(
-            rope_config.get("partial_rotary_factor",
-                            config.partial_rotary_factor))
-    else:
-        rope_scaling = config.rope_scaling
-        partial_rotary_factor = config.partial_rotary_factor
-
-    if isinstance(rope_scaling, dict):
-        rope_type = str(
-            rope_scaling.get("rope_type", rope_scaling.get("type", "default")))
-        if rope_type == "proportional":
-            return effective_head_dim
-    return int(effective_head_dim * partial_rotary_factor)
+    if rope_config is None:
+        rope_config = {
+            "rope_scaling": config.rope_scaling,
+            "partial_rotary_factor": config.partial_rotary_factor,
+        }
+    return checkpoint_utils.rotary_dim_for_runtime(
+        rope_config, effective_head_dim, config.partial_rotary_factor)
 
 
 def _select_rope_for_layer(
@@ -615,7 +546,7 @@ class Gemma4Router(nn.Module):
     softmax + topk internally.
     """
 
-    def __init__(self, config: ModelConfig) -> None:
+    def __init__(self, config: ModelConfig, layer_idx: int) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_experts = config.num_experts
@@ -628,7 +559,7 @@ class Gemma4Router(nn.Module):
                                 self.hidden_size,
                                 self.num_experts,
                                 bias=False,
-                                module_name="router.proj")
+                                module_name=f"layers.{layer_idx}.router.proj")
         self.scale = nn.Parameter(torch.ones(self.hidden_size))
         self.per_expert_scale = nn.Parameter(torch.ones(self.num_experts))
 
@@ -674,7 +605,7 @@ class Gemma4NvFP4MoEBlock(nn.Module):
     plugin handles softmax + topk + expert GEMMs internally.
     """
 
-    def __init__(self, config: ModelConfig) -> None:
+    def __init__(self, config: ModelConfig, layer_idx: int) -> None:
         super().__init__()
         self.config = config
         self.num_experts = config.num_experts
@@ -687,7 +618,7 @@ class Gemma4NvFP4MoEBlock(nn.Module):
         self.io_dtype = _NVFP4_MOE_IO_DTYPE_FP16
         self.max_routed_rows = _NVFP4_MOE_MAX_ROUTED_ROWS_AUTO
 
-        self.router = Gemma4Router(config)
+        self.router = Gemma4Router(config, layer_idx)
         self.experts = Gemma4NvFP4MoEExperts(config)
 
     def _prepare_moe_weights(self) -> None:
@@ -696,14 +627,6 @@ class Gemma4NvFP4MoEBlock(nn.Module):
         Called by :func:`~checkpoint.repacking._stack_moe_experts`.
         """
         from ...checkpoint.repacking import repack_nvfp4_qwen3_moe_experts
-
-        # Promote router projection to make_linear for standard MatMul trace.
-        self.gate_linear = make_linear(self.config,
-                                       self.hidden_size,
-                                       self.num_experts,
-                                       bias=False,
-                                       module_name="moe_block.gate_linear")
-        self.gate_linear.weight.data = self.router.proj.weight.data
 
         fc1_layout = "concat" if use_geforce_nvfp4_moe() else "interleave"
         fc1_qweights, fc1_blocks_scale, fc2_qweights, fc2_blocks_scale = (
@@ -762,7 +685,7 @@ class Gemma4NvFP4MoEBlock(nn.Module):
         normed = self.router.norm(hidden_flat)
         scaled = normed * (self.router.scale *
                            self.router.scalar_root_size).to(normed.dtype)
-        router_logits = self.gate_linear(scaled).float()
+        router_logits = self.router.proj(scaled).float()
 
         moe_op = (nvfp4_moe_plugin_geforce
                   if use_geforce_nvfp4_moe() else nvfp4_moe_plugin)
@@ -823,7 +746,7 @@ class Gemma4DecoderLayer(DecoderLayer):
                 raise ValueError(
                     "Gemma4 MoE requires NVFP4 quantization "
                     f"(got quant_type={config.quant.quant_type!r})")
-            self.moe_block = Gemma4NvFP4MoEBlock(config)
+            self.moe_block = Gemma4NvFP4MoEBlock(config, layer_idx)
             self.post_feedforward_layernorm_1 = RMSNorm(
                 config.hidden_size, config.rms_norm_eps)
             self.post_feedforward_layernorm_2 = RMSNorm(

@@ -837,11 +837,17 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
     rt::Tensor attentionOutputTensor(outputs[kOUT_ATTENTION_IDX], rt::Coords{attentionOutputDesc.dims},
         rt::DeviceType::kGPU, attentionOutputDesc.type);
 
-    // Construct the KVCache tensor from the input KV cache descriptor.
-    // This allows KV cache from 0 to maxSeqLen and helps adjust the profile at runtime.
+    // Construct the KV cache tensor from the past-KV input descriptor. Shared-KV
+    // draft layers are read-only views of the target/base cache, so they must
+    // read the input binding rather than the plugin's present-KV output. The
+    // present-KV output is not consumed in shared-KV mode and must remain
+    // unwritten by every shared-KV path below.
     PluginTensorDesc const& kvCacheInputDesc = inputDesc[kIN_KV_CACHE_IDX];
-    rt::Tensor kvCacheTensor(
+    rt::Tensor pastKVCacheTensor(const_cast<void*>(inputs[kIN_KV_CACHE_IDX]), rt::Coords{kvCacheInputDesc.dims},
+        rt::DeviceType::kGPU, kvCacheInputDesc.type);
+    rt::Tensor presentKVCacheTensor(
         outputs[kOUT_KV_CACHE_IDX], rt::Coords{kvCacheInputDesc.dims}, rt::DeviceType::kGPU, kvCacheInputDesc.type);
+    rt::Tensor& kvCacheTensor = sharedKV ? pastKVCacheTensor : presentKVCacheTensor;
 
     // Extract KV cache capacity from the runtime tensor shape.
     int32_t const kvCacheCapacity = static_cast<int32_t>(kvCacheInputDesc.dims.d[3]);
