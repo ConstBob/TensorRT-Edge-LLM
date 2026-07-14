@@ -74,6 +74,7 @@ for large language models and vision-language models on edge devices.
    :caption: Customization
 
    developer_guide/customization/customization-guide.md
+   developer_guide/customization/calibration-datasets.md
    developer_guide/customization/tensorrt-plugins.md
 
 .. toctree::

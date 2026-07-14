@@ -96,6 +96,14 @@ def _llm_quant_shell(
             "Cannot find tensorrt-edge-llm root. "
             "Set LLM_SDK_DIR to the SDK root, or run from a full tensorrt-edge-llm tree."
         )
+    # The CLI selects calibration datasets by registered name. CI runs
+    # offline, so point the built-in datasets at their cached copies via the
+    # per-dataset EDGELLM_QUANT_DATASET_<NAME> override (the CLI stays
+    # name-only). LibriSpeech is streamed from the Hub as before.
+    env: List[str] = [
+        "EDGELLM_QUANT_DATASET_CNN_DAILYMAIL="
+        f"{config.get_cnn_dailymail_dataset_dir()}",
+    ]
     args: List[str] = [
         "python3",
         "-m",
@@ -103,6 +111,7 @@ def _llm_quant_shell(
         "llm",
         f"--model_dir={input_model_dir}",
         f"--output_dir={output_model_dir}",
+        "--text_dataset=cnn_dailymail",
     ]
     if needs_weight_quant:
         args.append(f"--quantization={config.llm_precision}")
@@ -112,10 +121,15 @@ def _llm_quant_shell(
         args.append("--kv_cache_quantization=fp8")
     if needs_visual_quant:
         args.append("--visual_quantization=fp8")
+        args.append("--image_dataset=mmmu")
+        env.append(
+            f"EDGELLM_QUANT_DATASET_MMMU={config.get_mmmu_dataset_dir()}")
     if needs_audio_quant:
         args.append("--audio_quantization=fp8")
+        args.append("--audio_dataset=librispeech")
+    env_prefix = " ".join(shlex.quote(x) for x in env)
     inner = " ".join(shlex.quote(x) for x in args)
-    return f"cd {shlex.quote(edgellm_root)} && {inner}"
+    return f"cd {shlex.quote(edgellm_root)} && {env_prefix} {inner}"
 
 
 def _generate_quantization_commands(
@@ -177,6 +191,11 @@ def _draft_quant_shell(config: TestConfig) -> str:
     else:
         draft_model_dir = config.get_draft_torch_model_dir()
     quantized_draft_dir = config.get_quantized_draft_model_dir()
+    # Name-only dataset selection; cached cnn_dailymail via the offline override.
+    env: List[str] = [
+        "EDGELLM_QUANT_DATASET_CNN_DAILYMAIL="
+        f"{config.get_cnn_dailymail_dataset_dir()}",
+    ]
     args: List[str] = [
         "python3",
         "-m",
@@ -186,13 +205,14 @@ def _draft_quant_shell(config: TestConfig) -> str:
         f"--draft_model_dir={draft_model_dir}",
         f"--output_dir={quantized_draft_dir}",
         f"--quantization={config.draft_llm_precision}",
-        f"--dataset={config.get_cnn_dailymail_dataset_dir()}",
+        "--text_dataset=cnn_dailymail",
     ]
     if (config.draft_lm_head_precision
             and config.draft_lm_head_precision != "fp16"):
         args.append(f"--lm_head_quantization={config.draft_lm_head_precision}")
+    env_prefix = " ".join(shlex.quote(x) for x in env)
     inner = " ".join(shlex.quote(x) for x in args)
-    return f"cd {shlex.quote(edgellm_root)} && {inner}"
+    return f"cd {shlex.quote(edgellm_root)} && {env_prefix} {inner}"
 
 
 def _generate_draft_quantization_commands(

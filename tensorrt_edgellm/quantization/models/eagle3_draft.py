@@ -25,17 +25,17 @@ forward with KV-cache and GatherND belongs in the ONNX export layer.
 import json
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import modelopt.torch.quantization as mtq
 import torch
 from safetensors.torch import load_file, safe_open
 from torch import nn
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import (AutoConfig, AutoModelForCausalLM,
                           AutoModelForImageTextToText, AutoTokenizer)
 
+from ..datasets import TextDataset, dataset_name, resolve_dataset
 from ..quantization_configs import build_quant_config
 from .attention_scale import resolve_attention_scale
 from .layers import (RMSNorm, RotaryEmbedding, SwiGLUMLP, apply_rotary_pos_emb,
@@ -203,7 +203,8 @@ def quantize_and_export_draft(
     kv_cache_quantization: Optional[str] = None,
     dtype: str = "fp16",
     device: str = "cuda",
-    dataset: str = "cnn_dailymail",
+    *,
+    text_dataset: Union[str, TextDataset, None] = None,
     num_samples: int = 512,
 ) -> str:
     """Load base + draft models, quantize the draft, and export."""
@@ -228,9 +229,11 @@ def quantize_and_export_draft(
         base, tokenizer = _load_for_draft_calib(base_model_dir, dtype, device)
         quant_cfg = build_quant_config(quantization, lm_head_quantization,
                                        kv_cache_quantization)
+        text_ds = resolve_dataset(text_dataset, "text")
+        print(f"Draft text calibration: {dataset_name(text_ds)}")
         loader = _draft_text_loader(
             tokenizer,
-            dataset,
+            text_ds,
             batch_size=16 if "int4" in quantization else 1,
             num_samples=num_samples)
 
@@ -348,17 +351,9 @@ def _load_for_draft_calib(model_dir, dtype, device):
     return model, tok
 
 
-def _draft_text_loader(tokenizer, dataset_name, batch_size, num_samples):
-    from datasets import load_dataset
-    if "cnn_dailymail" in dataset_name:
-        ds = load_dataset(dataset_name, name="3.0.0", split="train")
-        texts = ds["article"][:num_samples]
-    else:
-        ds = load_dataset(dataset_name, split="train")
-        texts = ds["text"][:num_samples]
-    enc = tokenizer(texts,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=512)
-    return DataLoader(enc["input_ids"], batch_size=batch_size, shuffle=False)
+def _draft_text_loader(tokenizer, text_dataset, batch_size, num_samples):
+    from ..quantize import _text_calib_dataloader
+    return _text_calib_dataloader(tokenizer,
+                                  text_dataset,
+                                  batch_size=batch_size,
+                                  num_samples=num_samples)

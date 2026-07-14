@@ -30,8 +30,10 @@ tensorrt-edgellm-export \
   $MODEL_NAME/onnx
 ```
 
-To also quantize the visual tower to FP8, add `--visual_quantization fp8` and
-use a multimodal calibration dataset such as `--dataset lmms-lab/MMMU`.
+To also quantize the visual tower to FP8, add `--visual_quantization fp8`.
+This calibrates on the default `mmmu` image dataset; pick another with
+`--image_dataset <name>` (see
+[Calibration Dataset Customization](../../developer_guide/customization/calibration-datasets.md)).
 
 ## Step 2: Transfer to Device
 
