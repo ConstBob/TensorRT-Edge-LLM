@@ -22,8 +22,8 @@ from typing import Dict, List, Optional, Tuple
 
 from conftest import EnvironmentConfig
 
-from ..config import (DEFAULT_SEARCH_DEPTH, PRE_QUANTIZED_MODELS, ModelType,
-                      TestConfig, _find_directory, strip_model_quant_suffixes)
+from ..config import (PRE_QUANTIZED_MODELS, ModelType, TestConfig,
+                      strip_model_quant_suffixes)
 from .checkpoint_export_helpers import get_tensorrt_edgellm_root
 
 # Available LoRA weights mapping
@@ -172,7 +172,10 @@ def _draft_quant_shell(config: TestConfig) -> str:
             "Set LLM_SDK_DIR to the SDK root, or run from a full tensorrt-edge-llm tree."
         )
     base_model_dir = config.get_base_torch_model_dir()
-    draft_model_dir = config.get_draft_torch_model_dir()
+    if config.is_dflash:
+        draft_model_dir = config.get_dflash_draft_model_dir()
+    else:
+        draft_model_dir = config.get_draft_torch_model_dir()
     quantized_draft_dir = config.get_quantized_draft_model_dir()
     args: List[str] = [
         "python3",
@@ -194,19 +197,19 @@ def _draft_quant_shell(config: TestConfig) -> str:
 
 def _generate_draft_quantization_commands(
         config: TestConfig) -> List[Tuple[List[str], int]]:
-    """Generate draft model quantization commands for EAGLE.
+    """Generate draft model quantization commands for EAGLE / DFlash.
 
     Uses ``tensorrt-edgellm-quantize``. Output is a unified ModelOpt
     ``export_hf_checkpoint`` tree consumable by ``tensorrt_edgellm.scripts.export``.
     """
     commands = []
-    if not config.is_eagle:
-        return commands
     if config.is_mtp:
+        return commands
+    if not (config.is_eagle or config.is_dflash):
         return commands
 
     if config.draft_llm_precision is None:
-        raise ValueError("draft_llm_precision not set for EAGLE mode")
+        raise ValueError("draft_llm_precision not set for draft mode")
 
     # Only quantize if draft model is not fp16
     if (config.draft_llm_precision != "fp16"
@@ -331,15 +334,13 @@ def generate_post_tensorrt_edgellm_commands(
                 f"No LoRA weights available for {config.model_name} (also tried "
                 f"base {strip_model_quant_suffixes(config.model_name)}). "
                 f"Please add it to AVAILABLE_LORA_WEIGHTS")
-        edgellm_data_dir = os.environ.get("EDGELLM_DATA_DIR",
-                                          "/scratch.edge_llm_cache")
-        lora_weights_dir = _find_directory(edgellm_data_dir, lora_model_name,
-                                           DEFAULT_SEARCH_DEPTH)
+        lora_weights_dir = config.find_lora_adapter_weights_dir(
+            lora_model_name)
         if not lora_weights_dir:
             raise ValueError(
                 f"LoRA weights directory '{lora_model_name}' not found under "
-                f"'{edgellm_data_dir}' within search depth "
-                f"{DEFAULT_SEARCH_DEPTH}.")
+                f"edgellm_data_dir={config.edgellm_data_dir}, "
+                f"llm_models_dir={config.llm_models_dir}.")
         process_cmd = [
             "python3",
             "-m",
