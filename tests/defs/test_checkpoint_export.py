@@ -29,8 +29,8 @@ import pytest
 from conftest import EnvironmentConfig
 from pytest_helpers import run_command, timer_context
 
-from .config import (DEFAULT_SEARCH_DEPTH, GEMMA4_MTP_ASSISTANT_MODELS_MAP,
-                     ModelType, TaskType, TestConfig, _find_directory,
+from .config import (GEMMA4_MTP_ASSISTANT_MODELS_MAP, ModelType, TaskType,
+                     TestConfig, infer_checkpoint_export_model_type,
                      strip_model_quant_suffixes)
 from .utils.command_generation import resolve_lora_model_name
 
@@ -51,23 +51,6 @@ _EXTW_FILE_BY_KIND = {
     "nvfp4_moe": "external_nvfp4_moe_weights.safetensors",
     "lm_head": "external_lm_head_weight.safetensors",
 }
-
-
-def _infer_checkpoint_model_type(test_param: str) -> ModelType:
-    param = test_param.lower()
-    if "alpamayo" in param:
-        return ModelType.VLA
-    if "omni" in param:
-        return ModelType.OMNI
-    if "-tts-" in param or "qwen3-tts" in param:
-        return ModelType.TTS
-    if "-asr-" in param or "qwen3-asr" in param:
-        return ModelType.ASR
-    if ("-vl-" in param or param.startswith("internvl")
-            or "multimodal" in param or "cosmos" in param
-            or "vitfp8" in param):
-        return ModelType.VLM
-    return ModelType.LLM
 
 
 def _extw_cli_kinds(extw_token):
@@ -140,8 +123,8 @@ def test_checkpoint_export(test_param: str, test_logger,
     """Export a pre-quantized model via tensorrt_edgellm.scripts.export."""
 
     config = TestConfig.from_param_string(
-        test_param, _infer_checkpoint_model_type(test_param), TaskType.EXPORT,
-        env_config)
+        test_param, infer_checkpoint_export_model_type(test_param),
+        TaskType.EXPORT, env_config)
 
     # Locate source model checkpoint
     torch_dir = config.get_torch_model_dir()
@@ -174,6 +157,7 @@ def test_checkpoint_export(test_param: str, test_logger,
         env_vars = {}
         if config.trt_native_attn:
             env_vars["USE_TRT_NATIVE_ATTN"] = "1"
+        env_vars.update(config.get_export_env_vars())
 
         with timer_context(
                 f"Exporting {config.model_name} via the checkpoint exporter",
@@ -219,14 +203,14 @@ def test_checkpoint_export(test_param: str, test_logger,
                 config.visual_precision or "fp16")
             shutil.copytree(visual_output, visual_onnx_dir, dirs_exist_ok=True)
 
-        # Same for audio encoder (ASR / Qwen3-Omni / Nemotron-Omni).
+        # Same for audio encoder (ASR / Omni).
         audio_output = os.path.join(tmp_dir, "audio")
         if os.path.isdir(audio_output):
             audio_onnx_dir = config.get_audio_onnx_dir(config.audio_precision
                                                        or "fp16")
             shutil.copytree(audio_output, audio_onnx_dir, dirs_exist_ok=True)
 
-        # Same for Qwen3-Omni Code2Wav vocoder.
+        # Same for Code2Wav vocoder.
         code2wav_output = os.path.join(tmp_dir, "code2wav")
         if os.path.isdir(code2wav_output):
             code2wav_onnx_dir = os.path.join(config.get_onnx_base_dir(),
@@ -261,13 +245,14 @@ def test_checkpoint_export(test_param: str, test_logger,
         )
 
 
-def _run_checkpoint_export(cmd, timeout, test_logger, label):
+def _run_checkpoint_export(cmd, timeout, test_logger, label, env_vars=None):
     """Run an checkpoint export command and fail on error."""
     with timer_context(label, test_logger):
         result = run_command(cmd,
                              timeout=timeout,
                              remote_config=None,
-                             logger=test_logger)
+                             logger=test_logger,
+                             env_vars=env_vars)
         if not result['success']:
             pytest.fail(
                 f"{label} failed: {result.get('error', 'Unknown error')}")
@@ -286,8 +271,9 @@ def test_checkpoint_eagle_export(test_param: str, test_logger,
     """
 
     config = TestConfig.from_param_string(
-        test_param, _infer_checkpoint_model_type(test_param), TaskType.EXPORT,
-        env_config)
+        test_param, infer_checkpoint_export_model_type(test_param),
+        TaskType.EXPORT, env_config)
+    export_env_vars = config.get_export_env_vars() or None
 
     # Locate pre-quantized base model checkpoint
     base_torch_dir = config.get_torch_model_dir()
@@ -328,9 +314,11 @@ def test_checkpoint_eagle_export(test_param: str, test_logger,
         if extw_kinds:
             base_cmd += ["--externalize-weights", *extw_kinds]
         _run_checkpoint_export(
-            base_cmd, 600, test_logger,
-            f"Exporting EAGLE base {config.model_name} via the checkpoint exporter"
-        )
+            base_cmd,
+            600,
+            test_logger,
+            f"Exporting EAGLE base {config.model_name} via the checkpoint exporter",
+            env_vars=export_env_vars)
 
         # Copy base LLM ONNX
         base_llm_out = os.path.join(tmp_base, "llm")
@@ -357,9 +345,11 @@ def test_checkpoint_eagle_export(test_param: str, test_logger,
         if extw_kinds:
             draft_cmd += ["--externalize-weights", *extw_kinds]
         _run_checkpoint_export(
-            draft_cmd, 600, test_logger,
-            f"Exporting EAGLE draft {config.draft_model_id} via the checkpoint exporter"
-        )
+            draft_cmd,
+            600,
+            test_logger,
+            f"Exporting EAGLE draft {config.draft_model_id} via the checkpoint exporter",
+            env_vars=export_env_vars)
 
         # Copy draft ONNX
         draft_llm_out = os.path.join(tmp_draft, "llm")
@@ -387,8 +377,9 @@ def test_checkpoint_dflash_export(test_param: str, test_logger,
     """Export DFlash base + draft models via tensorrt_edgellm.scripts.export."""
 
     config = TestConfig.from_param_string(
-        test_param, _infer_checkpoint_model_type(test_param), TaskType.EXPORT,
-        env_config)
+        test_param, infer_checkpoint_export_model_type(test_param),
+        TaskType.EXPORT, env_config)
+    export_env_vars = config.get_export_env_vars() or None
 
     base_torch_dir = config.get_torch_model_dir()
     if not os.path.exists(base_torch_dir):
@@ -433,9 +424,11 @@ def test_checkpoint_dflash_export(test_param: str, test_logger,
             draft_torch_dir,
         ]
         _run_checkpoint_export(
-            base_cmd, 1200, test_logger,
-            f"Exporting DFlash base {config.model_name} via the checkpoint exporter"
-        )
+            base_cmd,
+            1200,
+            test_logger,
+            f"Exporting DFlash base {config.model_name} via the checkpoint exporter",
+            env_vars=export_env_vars)
 
         base_llm_out = os.path.join(tmp_base, "llm")
         if not os.path.isdir(base_llm_out):
@@ -454,9 +447,11 @@ def test_checkpoint_dflash_export(test_param: str, test_logger,
             draft_torch_dir,
         ]
         _run_checkpoint_export(
-            draft_cmd, 1200, test_logger,
-            f"Exporting DFlash draft {config.draft_model_id} via the checkpoint exporter"
-        )
+            draft_cmd,
+            1200,
+            test_logger,
+            f"Exporting DFlash draft {config.draft_model_id} via the checkpoint exporter",
+            env_vars=export_env_vars)
 
         draft_output = os.path.join(tmp_draft, "dflash_draft")
         if not os.path.isdir(draft_output):
@@ -491,8 +486,9 @@ def test_checkpoint_mtp_export(test_param: str, test_logger,
     """Export MTP base + draft from a single checkpoint via --mtp flag."""
 
     config = TestConfig.from_param_string(
-        test_param, _infer_checkpoint_model_type(test_param), TaskType.EXPORT,
-        env_config)
+        test_param, infer_checkpoint_export_model_type(test_param),
+        TaskType.EXPORT, env_config)
+    export_env_vars = config.get_export_env_vars() or None
 
     torch_dir = config.get_torch_model_dir()
     if not os.path.exists(torch_dir):
@@ -531,7 +527,8 @@ def test_checkpoint_mtp_export(test_param: str, test_logger,
             result = run_command(export_cmd,
                                  timeout=600,
                                  remote_config=None,
-                                 logger=test_logger)
+                                 logger=test_logger,
+                                 env_vars=export_env_vars)
             if not result['success']:
                 pytest.fail(
                     f"MTP export failed: {result.get('error', 'Unknown error')}"
@@ -570,8 +567,9 @@ def test_checkpoint_lora_export(test_param: str, test_logger,
     """
 
     config = TestConfig.from_param_string(
-        test_param, _infer_checkpoint_model_type(test_param), TaskType.EXPORT,
-        env_config)
+        test_param, infer_checkpoint_export_model_type(test_param),
+        TaskType.EXPORT, env_config)
+    export_env_vars = config.get_export_env_vars() or None
 
     torch_dir = config.get_torch_model_dir()
     if not os.path.exists(torch_dir):
@@ -593,9 +591,11 @@ def test_checkpoint_lora_export(test_param: str, test_logger,
         ]
 
         _run_checkpoint_export(
-            export_cmd, 600, test_logger,
-            f"Exporting {config.model_name} for LoRA via the checkpoint exporter"
-        )
+            export_cmd,
+            600,
+            test_logger,
+            f"Exporting {config.model_name} for LoRA via the checkpoint exporter",
+            env_vars=export_env_vars)
 
         llm_output = os.path.join(tmp_dir, "llm")
         if not os.path.isdir(llm_output):
@@ -644,14 +644,13 @@ def test_checkpoint_lora_export(test_param: str, test_logger,
         lora_model_name = resolve_lora_model_name(config.model_name)
         if lora_model_name is None:
             pytest.fail(f"No LoRA weights configured for {config.model_name}")
-        data_dir = config.edgellm_data_dir or os.environ.get(
-            "EDGELLM_DATA_DIR", "/scratch.edge_llm_cache")
-        lora_weights_dir = _find_directory(data_dir, lora_model_name,
-                                           DEFAULT_SEARCH_DEPTH)
+        lora_weights_dir = config.find_lora_adapter_weights_dir(
+            lora_model_name)
         if not lora_weights_dir:
             pytest.fail(
                 f"LoRA weights directory '{lora_model_name}' not found under "
-                f"{data_dir}")
+                f"edgellm_data_dir={config.edgellm_data_dir}, "
+                f"llm_models_dir={config.llm_models_dir}")
 
         process_cmd = [
             "python3",
@@ -687,6 +686,7 @@ def test_llm_loader_tp_export(test_param: str, test_logger,
 
     config = TestConfig.from_param_string(test_param, ModelType.LLM,
                                           TaskType.EXPORT, env_config)
+    export_env_vars = config.get_export_env_vars() or None
 
     torch_dir = config.get_torch_model_dir()
     if not os.path.exists(torch_dir):
@@ -706,8 +706,11 @@ def test_llm_loader_tp_export(test_param: str, test_logger,
             "--tp-size",
             "2",
         ]
-        _run_checkpoint_export(export_cmd, 600, test_logger,
-                               f"TP=2 export for {config.model_name}")
+        _run_checkpoint_export(export_cmd,
+                               600,
+                               test_logger,
+                               f"TP=2 export for {config.model_name}",
+                               env_vars=export_env_vars)
 
         llm_output = os.path.join(tmp_dir, "llm")
         if not os.path.isdir(llm_output):
