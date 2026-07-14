@@ -159,8 +159,7 @@ class OmniBenchDataset(EdgeLLMDataset):
 def convert_omnibench_dataset(
         config: DatasetConfig,
         dataset_name_or_dir: str = "m-a-p/OmniBench",
-        output_dir: Union[str, os.PathLike] = "omnibench_dataset",
-        max_samples: Optional[int] = None):
+        output_dir: Union[str, os.PathLike] = "omnibench_dataset"):
     """
     Convert OmniBench dataset to TensorRT Edge-LLM format.
 
@@ -168,17 +167,12 @@ def convert_omnibench_dataset(
         config: DatasetConfig object with processing parameters
         dataset_name_or_dir: HuggingFace dataset name or local directory path
         output_dir: Output directory for converted dataset
-        max_samples: Limit number of samples
     """
     print(f"Converting OmniBench from {dataset_name_or_dir} to {output_dir}")
 
     dataset = load_dataset(dataset_name_or_dir, split="train")
     dataset = dataset.cast_column("audio", Audio(decode=False))
     print(f"Loaded OmniBench with {len(dataset)} examples")
-
-    if max_samples:
-        dataset = dataset.select(range(min(max_samples, len(dataset))))
-        print(f"Using first {len(dataset)} samples")
 
     edge_llm_dataset = OmniBenchDataset(dataset=dataset,
                                         config=config,
