@@ -9,7 +9,7 @@
 /cpp/builder/ @luxiaoz @amberl @zhijial
 /cpp/common/ @zhijial @luxiaoz
 /cpp/kernels/ @ruochengj @xiangg @samcheng @zhazhang
-/cpp/multimodal/ @amberl @ruochengj @jiahaoz
+/cpp/multimodal/ @amberl @ruochengj @jiahaoz @dingkunw
 /cpp/plugins/ @ruochengj @zhijial @samcheng @poweiw @willg
 /cpp/profiling/ @luxiaoz @amberl @ruochengj @zhijial
 /cpp/runtime/ @amberl @zhijial @xiangg
@@ -21,11 +21,11 @@
 /cmake/ @mahu @luxiaoz @zhijial
 
 # == Automation tests ==
-/tests/ @luxiaoz @mahu @amberl @xinrzhang
+/tests/ @luxiaoz @mahu @amberl @xinrzhang @dingkunw
 /.gitlab/ @luxiaoz @mahu @amberl @xinrzhang
 
 # == Examples ==
-/examples/ @luxiaoz @amberl @zhijial @jiahaoz
+/examples/ @luxiaoz @amberl @zhijial @jiahaoz @dingkunw
 
 # == Unit tests ==
 /unittests/ @luxiaoz @amberl @zhijial @xiangg
@@ -40,7 +40,7 @@
 /kernelSrcs/ @ruochengj @xiangg @samcheng @zhazhang
 
 # == Experimental ==
-/experimental/ @luxiaoz @amberl @yuanyao
+/experimental/ @luxiaoz @amberl @yuanyao @dingkunw
 
 # == Python frontend ==
 /tensorrt_edgellm/ @luxiaoz @ruochengj @amberl @yuanyao @zhijial
