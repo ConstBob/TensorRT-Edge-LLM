@@ -93,6 +93,12 @@ def _is_gemma4_model_type(model_type: str) -> bool:
     return str(model_type).startswith("gemma4")
 
 
+def _check_num_attention_heads(num_attn_heads: int) -> None:
+    if num_attn_heads <= 0:
+        raise ValueError("num_attention_heads must be a positive integer, "
+                         f"got {num_attn_heads!r}")
+
+
 def _get_rope_theta(llm_dict: Dict[str, Any]) -> float:
     """Extract rope_theta from config dict.
 
@@ -827,6 +833,7 @@ class ModelConfig:
             model_type = root_model_type
         hidden_size = llm_dict["hidden_size"]
         num_attn_heads = llm_dict["num_attention_heads"]
+        _check_num_attention_heads(num_attn_heads)
         head_dim = llm_dict.get("head_dim", hidden_size // num_attn_heads)
         global_head_dim = int(llm_dict.get("global_head_dim", 0) or 0)
         num_global_kv_heads = int(
@@ -1127,6 +1134,7 @@ def make_dflash_draft_config(
     quant = _parse_quant(draft_dir, llm_dict)
 
     model_type = llm_dict.get("model_type", "qwen3")
+    _check_num_attention_heads(llm_dict["num_attention_heads"])
     head_dim = llm_dict.get(
         "head_dim", llm_dict["hidden_size"] // llm_dict["num_attention_heads"])
 
