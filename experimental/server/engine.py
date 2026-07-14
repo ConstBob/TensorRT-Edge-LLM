@@ -431,10 +431,32 @@ class LLM:
     def _init_from_engine(self, engine_dir: str,
                           visual_engine_dir: str) -> None:
         """Load from pre-built engine directories (no export, no build)."""
-        from .engine_layout import (find_visual_engine_dir,
+        from .engine_layout import (EngineType, detect_engine_type,
+                                    find_visual_engine_dir,
                                     validate_llm_engine_dir,
+                                    validate_spec_decode_engine_dir,
                                     validate_visual_engine_dir)
 
+        engine_type = detect_engine_type(engine_dir)
+        if engine_type == EngineType.SPEC_DECODE:
+            if not validate_spec_decode_engine_dir(engine_dir):
+                raise ValueError(
+                    f"spec_base.engine/spec_draft.engine not found in: {engine_dir}"
+                )
+            if visual_engine_dir:
+                logger.warning(
+                    "visual_engine_dir=%r is ignored for spec-decode engines",
+                    visual_engine_dir)
+            # Spec-decode dir (spec_base.engine + spec_draft.engine): route through
+            # the spec-decode path by promoting engine_dir to eagle_engine_dir.
+            self._engine_dir = engine_dir
+            self._model_dir = engine_dir
+            self._eagle_engine_dir = engine_dir
+            self._visual_engine_dir = ""
+            self._is_vlm = False
+            logger.info("Using pre-built spec-decode engine: %s",
+                        self._engine_dir)
+            return
         if not validate_llm_engine_dir(engine_dir):
             raise ValueError(f"llm.engine not found in: {engine_dir}")
         self._engine_dir = engine_dir
