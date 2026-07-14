@@ -2722,14 +2722,14 @@ def main() -> None:
         (_has_visual(model_type) and not args.skip_visual and not _draft_only
          and _allow("visual"), "visual", _export_visual_component),
         (_has_audio(model_type) and not args.skip_audio and not _draft_only
-         and _allow("audio"), "audio",
-         lambda out: _export_audio(model_dir,
-                                   out,
-                                   _get_weights(),
-                                   config,
-                                   model_type,
-                                   dtype,
-                                   model_config=_get_model_config())),
+         and config.get("audio_config") is not None and _allow("audio"),
+         "audio", lambda out: _export_audio(model_dir,
+                                            out,
+                                            _get_weights(),
+                                            config,
+                                            model_type,
+                                            dtype,
+                                            model_config=_get_model_config())),
         (_has_code2wav(model_type) and not args.skip_code2wav
          and not _draft_only and _allow("code2wav"), "code2wav",
          lambda out: _export_code2wav(model_dir, out, _get_code2wav_weights(),
@@ -2776,6 +2776,12 @@ def main() -> None:
         logger.warning(
             "--fp8-embedding is not supported for Talker / CodePredictor; "
             "using FP16 embeddings.")
+
+    if (_has_audio(model_type) and not args.skip_audio
+            and config.get("audio_config") is None):
+        logger.warning(
+            "Model type '%s' supports audio, but this checkpoint has no "
+            "audio_config — skipping audio encoder export.", model_type)
 
     for enabled, component, fn in stages:
         if enabled:
