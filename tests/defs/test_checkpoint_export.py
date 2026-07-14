@@ -547,7 +547,12 @@ def test_checkpoint_mtp_export(test_param: str, test_logger,
         if not os.path.isdir(draft_output):
             pytest.fail(f"MTP export did not produce mtp_draft/ in {tmp_dir}")
         shutil.copytree(draft_output, draft_onnx_dir, dirs_exist_ok=True)
-        _verify_externalized_outputs(draft_onnx_dir, extw_kinds)
+        # The paired Gemma4 assistant draft is a small fp16 dense model (tied
+        # embeddings, no int4/moe/lm_head weights), so --externalize-weights is
+        # a no-op for it. Only quantized derived drafts carry externalizable
+        # weights, so only verify the draft externalization in that case.
+        if base_model_name not in GEMMA4_MTP_ASSISTANT_MODELS_MAP:
+            _verify_externalized_outputs(draft_onnx_dir, extw_kinds)
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
