@@ -36,6 +36,8 @@ class DatasetConfig:
     top_p: float
     top_k: int
     max_generate_length: int
+    max_samples: Optional[int] = None
+    apply_chat_template: Optional[bool] = None
 
     def __post_init__(self):
         """Validate configuration parameters."""
@@ -49,6 +51,8 @@ class DatasetConfig:
             raise ValueError("top_k must be positive")
         if self.max_generate_length <= 0:
             raise ValueError("max_generate_length must be positive")
+        if self.max_samples is not None and self.max_samples <= 0:
+            raise ValueError("max_samples must be positive when provided")
 
 
 class EdgeLLMDataset:
@@ -93,6 +97,13 @@ class EdgeLLMDataset:
         config_dict = config.__dict__.copy()
         config_dict.update(kwargs)
         self.config = DatasetConfig(**config_dict)
+        if self.config.max_samples is not None:
+            sample_count = min(self.config.max_samples, len(self.dataset))
+            self.dataset = self.dataset.select(range(sample_count))
+            print(f"Using first {sample_count} samples")
+        self.apply_chat_template = (self.config.apply_chat_template
+                                    if apply_chat_template is None else
+                                    apply_chat_template)
 
         # Set attributes for backward compatibility
         self.batch_size = self.config.batch_size
@@ -100,6 +111,7 @@ class EdgeLLMDataset:
         self.top_p = self.config.top_p
         self.top_k = self.config.top_k
         self.max_generate_length = self.config.max_generate_length
+        self.max_samples = self.config.max_samples
 
         self.formatted_data: List[Dict[str, Any]] = []
 

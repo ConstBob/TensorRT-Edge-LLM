@@ -147,6 +147,9 @@ def build_dataset_config(args, dataset_type: str) -> DatasetConfig:
         dataset_type)
     max_generate_length = (args.max_generate_length
                            or DEFAULT_MAX_GENERATE_LENGTHS[dataset_type])
+    apply_chat_template = None
+    if dataset_type not in {"SeedTTSEval", "MiniMaxMultilingual"}:
+        apply_chat_template = not args.disable_chat_template
     return DatasetConfig(
         batch_size=args.batch_size,
         temperature=(default_temperature
@@ -154,6 +157,8 @@ def build_dataset_config(args, dataset_type: str) -> DatasetConfig:
         top_p=(default_top_p if args.top_p is None else args.top_p),
         top_k=(default_top_k if args.top_k is None else args.top_k),
         max_generate_length=max_generate_length,
+        max_samples=args.max_samples,
+        apply_chat_template=apply_chat_template,
     )
 
 
@@ -256,6 +261,14 @@ def main():
                         required=False,
                         help="Limit number of samples for quick testing")
 
+    parser.add_argument(
+        "--disable_chat_template",
+        action="store_true",
+        required=False,
+        help=("Disable chat template formatting for Q/A datasets. This is "
+              "useful for granularity analysis against the default "
+              "chat-template mode."))
+
     args = parser.parse_args()
 
     try:
@@ -335,11 +348,15 @@ def main():
                 raise ValueError(
                     "SeedTTSEval requires --dataset_name_or_dir pointing to "
                     "a .lst file (e.g. zh/meta.lst, en/meta.lst)")
-            convert_seed_tts_eval_dataset(config=config,
-                                          dataset_name_or_dir=dataset_path,
-                                          output_dir=args.output_dir,
-                                          language=args.language,
-                                          max_samples=args.max_samples)
+            # SeedTTSEval does not extend EdgeLLMDataset, so it never reads
+            # config.max_samples; forward --max_samples explicitly.
+            convert_seed_tts_eval_dataset(
+                config=config,
+                dataset_name_or_dir=dataset_path,
+                output_dir=args.output_dir,
+                language=args.language,
+                max_samples=args.max_samples,
+            )
 
         elif args.dataset == "MiniMaxMultilingual":
             # Auto-download from HuggingFace when no local path is given.
@@ -350,6 +367,8 @@ def main():
                     repo_type="dataset")
                 print(f"Auto-downloaded MiniMaxMultilingual to: "
                       f"{dataset_path}")
+            # MiniMaxMultilingual also does not extend EdgeLLMDataset; forward
+            # --max_samples explicitly.
             convert_minimax_multilingual_dataset(
                 config=config,
                 dataset_name_or_dir=dataset_path,
@@ -360,20 +379,17 @@ def main():
         elif args.dataset == "OmniBench":
             convert_omnibench_dataset(config=config,
                                       dataset_name_or_dir=dataset_path,
-                                      output_dir=args.output_dir,
-                                      max_samples=args.max_samples)
+                                      output_dir=args.output_dir)
 
         elif args.dataset == "COCO":
             convert_coco_dataset(config=config,
                                  dataset_name_or_dir=dataset_path,
-                                 output_dir=args.output_dir,
-                                 max_samples=args.max_samples)
+                                 output_dir=args.output_dir)
 
         elif args.dataset == "LibriSpeech":
             convert_librispeech_dataset(config=config,
                                         dataset_name_or_dir=dataset_path,
-                                        output_dir=args.output_dir,
-                                        max_samples=args.max_samples)
+                                        output_dir=args.output_dir)
     except Exception as e:
         print(f"Error converting dataset: {e}", file=sys.stderr)
         sys.exit(1)
