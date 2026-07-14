@@ -825,15 +825,13 @@ def _export_llm(model_dir: str,
             with open(config_path) as f:
                 _cfg = json.load(f)
             _llm = _cfg.get("text_config", _cfg)
-            if not _llm.get("enable_moe_block", False):
-                raise ValueError(
-                    "NVFP4 key remap requires enable_moe_block=True in "
-                    "config.json. The checkpoint appears NVFP4-quantized "
-                    "but the model config has no MoE block — remapped "
-                    "router/expert keys would be silently dropped.")
-            from ..models.gemma4.modeling_gemma4_text import \
-                GEMMA4_NVFP4_KEY_REMAP
-            key_remap = GEMMA4_NVFP4_KEY_REMAP
+            # Only MoE checkpoints (e.g. 26B-A4B) nest router/experts under
+            # moe_block and need the remap; dense NVFP4 checkpoints (E2B/E4B/
+            # 31B) have enable_moe_block=False and export directly.
+            if _llm.get("enable_moe_block", False):
+                from ..models.gemma4.modeling_gemma4_text import \
+                    GEMMA4_NVFP4_KEY_REMAP
+                key_remap = GEMMA4_NVFP4_KEY_REMAP
 
     if tp_size <= 1:
         ranks = [(0, 1)]
