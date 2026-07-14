@@ -40,7 +40,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import modelopt.torch.quantization as mtq
 import torch
@@ -49,6 +49,7 @@ from torch import nn
 from tqdm import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+from ..datasets import TextDataset, dataset_name, resolve_dataset
 from ..quantization_configs import build_quant_config
 from .attention_scale import resolve_attention_scale
 from .layers import (RMSNorm, RotaryEmbedding, SwiGLUMLP, apply_rotary_pos_emb,
@@ -392,7 +393,8 @@ def quantize_and_export_dflash_draft(
     kv_cache_quantization: Optional[str] = None,
     dtype: str = "fp16",
     device: str = "cuda",
-    dataset: str = "cnn_dailymail",
+    *,
+    text_dataset: Union[str, TextDataset, None] = None,
     num_samples: int = 512,
 ) -> str:
     """Load base + DFlash draft models, quantize draft, and export."""
@@ -426,9 +428,11 @@ def quantize_and_export_dflash_draft(
                                        kv_cache_quantization)
         _disable_dflash_fc_quantization(quant_cfg)
         from ..quantize import _text_calib_dataloader
+        text_ds = resolve_dataset(text_dataset, "text")
+        print(f"DFlash text calibration: {dataset_name(text_ds)}")
         loader = _text_calib_dataloader(
             tokenizer,
-            dataset,
+            text_ds,
             batch_size=16 if "int4" in quantization else 1,
             num_samples=num_samples)
 

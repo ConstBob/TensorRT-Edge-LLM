@@ -37,7 +37,7 @@ and SwiGLU MLP.
 import json
 import os
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 
 import modelopt.torch.quantization as mtq
 import torch
@@ -46,6 +46,7 @@ from torch import nn
 from tqdm import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+from ..datasets import TextDataset, dataset_name, resolve_dataset
 from ..quantization_configs import build_quant_config
 from .attention_scale import resolve_attention_scale
 from .layers import RotaryEmbedding, SwiGLUMLP, apply_rotary_pos_emb, repeat_kv
@@ -356,7 +357,8 @@ def quantize_mtp_from_base(
     kv_cache_quantization: Optional[str] = None,
     dtype: str = "fp16",
     device: str = "cuda",
-    dataset: str = "cnn_dailymail",
+    *,
+    text_dataset: Union[str, TextDataset, None] = None,
     num_samples: int = 512,
 ) -> "MtpDraftModel":
     """Load and quantize the MTP draft using the unquantized base model.
@@ -382,9 +384,11 @@ def quantize_mtp_from_base(
     quant_cfg = build_quant_config(quantization, lm_head_quantization,
                                    kv_cache_quantization)
     from ..quantize import _text_calib_dataloader
+    text_ds = resolve_dataset(text_dataset, "text")
+    print(f"MTP text calibration: {dataset_name(text_ds)}")
     loader = _text_calib_dataloader(
         tokenizer,
-        dataset,
+        text_ds,
         num_samples=num_samples,
         batch_size=16 if "int4" in quantization else 1)
 

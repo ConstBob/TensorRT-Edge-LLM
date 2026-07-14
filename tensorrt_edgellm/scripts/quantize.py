@@ -40,6 +40,10 @@ import argparse
 import json
 import os
 
+from ..quantization.datasets import (DEFAULT_AUDIO_DATASET,
+                                     DEFAULT_IMAGE_DATASET,
+                                     DEFAULT_TEXT_DATASET, available_datasets)
+
 
 def _add_common_args(parser):
     parser.add_argument("--output_dir", required=True)
@@ -87,7 +91,28 @@ def _add_common_args(parser):
                         choices=["fp8"])
     parser.add_argument("--dtype", default="fp16", choices=["fp16"])
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--dataset", default="cnn_dailymail")
+    parser.add_argument(
+        "--text_dataset",
+        default=DEFAULT_TEXT_DATASET,
+        help=("Registered text calibration dataset name (LLM, LM-head, "
+              "KV-cache, CodePredictor, MTP, EAGLE3, DFlash). "
+              f"Default: {DEFAULT_TEXT_DATASET}. Available: "
+              f"{', '.join(available_datasets('text'))}. Unknown names fail "
+              "with a pointer to the customization guide."))
+    parser.add_argument(
+        "--image_dataset",
+        default=DEFAULT_IMAGE_DATASET,
+        help=("Registered image calibration dataset name (used with "
+              "--visual_quantization). "
+              f"Default: {DEFAULT_IMAGE_DATASET}. Available: "
+              f"{', '.join(available_datasets('image'))}."))
+    parser.add_argument(
+        "--audio_dataset",
+        default=DEFAULT_AUDIO_DATASET,
+        help=("Registered audio calibration dataset name (Qwen3-ASR / audio "
+              "tower). "
+              f"Default: {DEFAULT_AUDIO_DATASET}. Available: "
+              f"{', '.join(available_datasets('audio'))}."))
     parser.add_argument("--num_samples", type=int, default=512)
 
 
@@ -154,7 +179,9 @@ def main():
             kv_cache_quantization=args.kv_cache_quantization,
             dtype=args.dtype,
             device=args.device,
-            dataset=args.dataset,
+            text_dataset=args.text_dataset,
+            image_dataset=args.image_dataset,
+            audio_dataset=args.audio_dataset,
             num_samples=args.num_samples,
         )
     elif args.command == "draft":
@@ -171,7 +198,7 @@ def main():
                 kv_cache_quantization=args.kv_cache_quantization,
                 dtype=args.dtype,
                 device=args.device,
-                dataset=args.dataset,
+                text_dataset=args.text_dataset,
                 num_samples=args.num_samples,
             )
         else:
@@ -186,7 +213,7 @@ def main():
                 kv_cache_quantization=args.kv_cache_quantization,
                 dtype=args.dtype,
                 device=args.device,
-                dataset=args.dataset,
+                text_dataset=args.text_dataset,
                 num_samples=args.num_samples,
             )
     elif args.command == "qwen3-omni":

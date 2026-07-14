@@ -86,7 +86,8 @@ CP FP8 from `$QUANT_ROOT/cp_fp8` side by side.
 tensorrt-edgellm-quantize llm \
     --model_dir  $HF_ROOT \
     --output_dir $QUANT_ROOT/cp_fp8 \
-    --cp_quantization fp8
+    --cp_quantization fp8 \
+    --text_dataset cnn_dailymail
 ```
 
 Then export the `code_predictor` component from the CP-quantized checkpoint;
