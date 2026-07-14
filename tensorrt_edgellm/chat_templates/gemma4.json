@@ -11,6 +11,10 @@
     "assistant": {
       "prefix": "<|turn>model\n",
       "suffix": "<turn|>\n"
+    },
+    "model": {
+      "prefix": "<|turn>model\n",
+      "suffix": "<turn|>\n"
     }
   },
   "content_types": {

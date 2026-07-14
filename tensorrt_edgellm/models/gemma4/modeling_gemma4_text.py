@@ -60,6 +60,15 @@ _DUMMY_PAST_LEN = 1
 _DUMMY_ROPE_CACHE_LEN = 4096
 
 
+def _attention_type_for_layer(config: ModelConfig, layer_idx: int) -> str:
+    """Return Gemma4's per-layer attention type."""
+    if layer_idx >= len(config.attention_layer_types):
+        raise ValueError(
+            "Gemma4 attention_layer_types must have one entry per layer; "
+            f"missing layer {layer_idx}.")
+    return config.attention_layer_types[layer_idx]
+
+
 def _uses_attention_k_eq_v(config: ModelConfig, attention_type: str) -> bool:
     """Return whether a Gemma4 attention layer reuses K as the V source."""
     return bool(config.attention_k_eq_v and attention_type == "full_attention")
