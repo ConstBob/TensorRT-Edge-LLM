@@ -19,6 +19,7 @@
 #include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "kernels/preprocessKernels/imageUtilKernels.h"
+#include "multimodal/imageUtils.h"
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
 #include <algorithm>
@@ -247,39 +248,6 @@ bool Gemma4UnifiedVisionRunner::allocateBuffer([[maybe_unused]] cudaStream_t str
     return true;
 }
 
-std::tuple<int64_t, int64_t> Gemma4UnifiedVisionRunner::getResizedImageSize(int64_t height, int64_t width) const
-{
-    ELLM_CHECK(height > 0 && width > 0, "Gemma4 Unified image dimensions must be positive");
-    double const targetPixels
-        = static_cast<double>(mConfig.maxPatchesPerImage) * mConfig.modelPatchSize * mConfig.modelPatchSize;
-    double const scale = std::sqrt(targetPixels / (static_cast<double>(height) * width));
-    double const idealHeight = scale * height;
-    double const idealWidth = scale * width;
-    int64_t const sideMultiple = mConfig.modelPatchSize;
-    auto floorToMultiple = [sideMultiple](double value) {
-        return static_cast<int64_t>(std::floor(value / sideMultiple)) * sideMultiple;
-    };
-    int64_t const maxSide = std::min(mConfig.maxPatchesPerImage, mConfig.positionEmbeddingSize) * sideMultiple;
-    int64_t targetHeight = std::min(floorToMultiple(idealHeight), maxSide);
-    int64_t targetWidth = std::min(floorToMultiple(idealWidth), maxSide);
-    ELLM_CHECK(targetHeight != 0 || targetWidth != 0, "Gemma4 Unified resized image rounded to 0x0");
-    if (targetHeight == 0)
-    {
-        targetHeight = sideMultiple;
-        targetWidth
-            = std::min(static_cast<int64_t>(std::floor(static_cast<double>(width) / height)) * sideMultiple, maxSide);
-    }
-    else if (targetWidth == 0)
-    {
-        targetWidth = sideMultiple;
-        targetHeight
-            = std::min(static_cast<int64_t>(std::floor(static_cast<double>(height) / width)) * sideMultiple, maxSide);
-    }
-    ELLM_CHECK(static_cast<double>(targetHeight) * targetWidth <= targetPixels,
-        "Gemma4 Unified resized image exceeds per-image patch budget");
-    return {targetHeight, targetWidth};
-}
-
 void Gemma4UnifiedVisionRunner::formatImage(rt::imageUtils::ImageData const& image, int64_t& patchOffset,
     std::vector<int64_t>& imageTokenLengths, cudaStream_t stream)
 {
@@ -319,7 +287,7 @@ void Gemma4UnifiedVisionRunner::formatImage(rt::imageUtils::ImageData const& ima
 }
 
 void Gemma4UnifiedVisionRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
-    std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& imagesPerRequest, bool doResize, cudaStream_t stream)
+    std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& imagesPerRequest, cudaStream_t stream)
 {
     check::check(mVisualInput.reshape({mConfig.maxPatches, mConfig.inputDim}), "Tensor reshape failed");
     check::check(mPixelPositionIdsHost.reshape({mConfig.maxPatches, 2}), "Tensor reshape failed");
@@ -329,18 +297,20 @@ void Gemma4UnifiedVisionRunner::imagePreprocess(rt::LLMGenerationRequest const& 
         imagesPerRequest.push_back(static_cast<int64_t>(req.imageBuffers.size()));
         for (auto const& image : req.imageBuffers)
         {
-            if (doResize)
+            if (image.doResize)
             {
-                auto const [resizedHeight, resizedWidth] = getResizedImageSize(image.height, image.width);
+                auto const [resizedHeight, resizedWidth] = rt::imageUtils::gemma4UnifiedResizeTarget(image.height,
+                    image.width, mConfig.maxPatchesPerImage, mConfig.modelPatchSize, mConfig.positionEmbeddingSize);
                 // The resize reuses this pinned host allocation. Wait for any
                 // in-flight asynchronous H2D copy before overwriting it.
                 CUDA_CHECK(cudaStreamSynchronize(stream));
-                rt::imageUtils::resizeImage(
+                auto const& src = rt::imageUtils::resizeImage(
                     image, mResizedImageHost, resizedWidth, resizedHeight, rt::imageUtils::InterpolationMode::kBICUBIC);
-                formatImage(mResizedImageHost, totalPatches, imageTokenLengths, stream);
+                formatImage(src, totalPatches, imageTokenLengths, stream);
             }
             else
             {
+                LOG_DEBUG("Skipping resize for pre-resized image %ldx%ld", image.height, image.width);
                 formatImage(image, totalPatches, imageTokenLengths, stream);
             }
         }
@@ -421,7 +391,7 @@ bool Gemma4UnifiedVisionRunner::preprocess(rt::LLMGenerationRequest const& reque
     {
         std::vector<int64_t> imageTokenLengths;
         std::vector<int64_t> imagesPerRequest;
-        imagePreprocess(request, imageTokenLengths, imagesPerRequest, !imageOnly, stream);
+        imagePreprocess(request, imageTokenLengths, imagesPerRequest, stream);
         if (!imageOnly)
         {
             textPreprocess(request, batchedInputIds, imageTokenLengths, imagesPerRequest, tokenizer);

@@ -118,11 +118,10 @@ private:
     //! \param[in] request LLM generation request containing images
     //! \param[out] imageTokenLengths Token lengths for each image
     //! \param[out] numImages Number of images per request
-    //! \param[in] doResize Whether to resize images
     //! \param[in] stream CUDA stream for execution
     //! \throws std::runtime_error if image size is unexpected, or number of blocks is excessive
     void imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths,
-        std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream);
+        std::vector<int64_t>& numImages, cudaStream_t stream);
 
     InternViTConfig mConfig;                         //!< InternViT configuration
     rt::Tensor mVitInput{};                          //!< Vision encoder input tensor

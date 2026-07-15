@@ -311,7 +311,8 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readonly("height", &imageUtils::ImageData::height)
         .def_readonly("channels", &imageUtils::ImageData::channels)
         .def_readonly("frames", &imageUtils::ImageData::frames)
-        .def_readwrite("fps", &imageUtils::ImageData::fps);
+        .def_readwrite("fps", &imageUtils::ImageData::fps)
+        .def_readwrite("do_resize", &imageUtils::ImageData::doResize);
 
     m.def("load_image_from_path", &loadImageFromPath, py::arg("path"), "Load image from file path");
     m.def("load_image_from_bytes", &loadImageFromBytes, py::arg("data"), "Load image from bytes");

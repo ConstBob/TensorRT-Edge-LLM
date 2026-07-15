@@ -22,6 +22,7 @@
 #include "common/trtUtils.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
 #include "kernels/preprocessKernels/imageUtilKernels.h"
+#include "multimodal/imageUtils.h"
 #include "profiling/timer.h"
 #include <algorithm>
 #include <cmath>
@@ -384,53 +385,12 @@ void QwenViTRunner::buildCuSeqlens(
 std::tuple<int64_t, int64_t> QwenViTRunner::getResizedImageSize(
     int64_t const /*numFrames*/, int64_t const height, int64_t const width, int64_t const maxRatio)
 {
-    // According to https://github.com/QwenLM/Qwen2-VL/blob/main/qwen-vl-utils/src/qwen_vl_utils/vision_process.py
-    int64_t const factor = mConfig.patchSize * mConfig.mergeSize;
-    int64_t const minPixels = mConfig.minImageTokensPerImage * factor * factor;
-    int64_t const maxPixels = mConfig.maxImageTokensPerImage * factor * factor;
-
-    // Banker's rounding (round-half-to-even) to match Python's round() used by the HF reference.
-    auto roundByFactor = [](int64_t value, int64_t factor) -> int64_t {
-        int64_t q = value / factor;
-        int64_t r = value - q * factor;
-        int64_t twoR = 2 * r;
-        if (twoR > factor || (twoR == factor && (q & 1)))
-            ++q;
-        return q * factor;
-    };
-    auto floorByFactor = [](int64_t value, int64_t factor) -> int64_t {
-        return std::floor(static_cast<double>(value) / factor) * factor;
-    };
-    auto ceilByFactor = [](int64_t value, int64_t factor) -> int64_t {
-        return std::ceil(static_cast<double>(value) / factor) * factor;
-    };
-
-    ELLM_CHECK(std::max(height, width) / std::min(height, width) <= maxRatio,
-        "absolute aspect ratio must be smaller than " + std::to_string(maxRatio) + ", got "
-            + std::to_string(std::max(height, width) / std::min(height, width)));
-
-    int64_t hBar = std::max(factor, roundByFactor(height, factor));
-    int64_t wBar = std::max(factor, roundByFactor(width, factor));
-
-    if (hBar * wBar > maxPixels)
-    {
-        double beta = std::sqrt(static_cast<double>(height * width) / maxPixels);
-        // Clamp to >= factor: a heavily-downscaled image must not yield a sub-factor (or zero) dimension.
-        hBar = std::max(factor, floorByFactor(static_cast<int64_t>(height / beta), factor));
-        wBar = std::max(factor, floorByFactor(static_cast<int64_t>(width / beta), factor));
-    }
-    else if (hBar * wBar < minPixels)
-    {
-        double beta = std::sqrt(static_cast<double>(minPixels) / (height * width));
-        hBar = ceilByFactor(static_cast<int64_t>(height * beta), factor);
-        wBar = ceilByFactor(static_cast<int64_t>(width * beta), factor);
-    }
-
-    return {hBar, wBar};
+    return rt::imageUtils::qwenSmartResize(height, width, mConfig.patchSize, mConfig.mergeSize,
+        mConfig.minImageTokensPerImage, mConfig.maxImageTokensPerImage, maxRatio);
 }
 
 void QwenViTRunner::imagePreprocess(
-    rt::LLMGenerationRequest const& request, std::vector<VisionSpan>& spans, bool doResize, cudaStream_t stream)
+    rt::LLMGenerationRequest const& request, std::vector<VisionSpan>& spans, cudaStream_t stream)
 {
     // Marshal each buffer's frames into the ViT scratch and append its spans. totalSeqLength doubles as the running
     // patch offset threaded across buffers, so after the loop it is the total ViT patch count.
@@ -440,15 +400,17 @@ void QwenViTRunner::imagePreprocess(
     {
         for (auto const& image : req.imageBuffers)
         {
-            if (doResize)
+            if (image.doResize)
             {
                 auto [resizedHeight, resizedWidth] = getResizedImageSize(image.frames, image.height, image.width);
-                rt::imageUtils::resizeImage(
+                auto const& src = rt::imageUtils::resizeImage(
                     image, mResizedImageHost, resizedWidth, resizedHeight, rt::imageUtils::InterpolationMode::kBICUBIC);
-                formatPatch(mResizedImageHost, spans, totalSeqLength, stream);
+                formatPatch(src, spans, totalSeqLength, stream);
             }
             else
             {
+                LOG_DEBUG("Skipping resize for pre-resized image/video %ldx%ld (frames=%ld)", image.height, image.width,
+                    image.frames);
                 formatPatch(image, spans, totalSeqLength, stream);
             }
             ++imageCount;
@@ -689,7 +651,7 @@ bool QwenViTRunner::preprocess(rt::LLMGenerationRequest const& request,
 
     try
     {
-        imagePreprocess(request, spans, !imageOnly, stream);
+        imagePreprocess(request, spans, stream);
         if (!imageOnly)
         {
             if (!mropeCosSinOut.has_value())

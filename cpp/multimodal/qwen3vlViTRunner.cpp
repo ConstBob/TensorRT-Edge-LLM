@@ -19,6 +19,7 @@
 #include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "kernels/preprocessKernels/imageUtilKernels.h"
+#include "multimodal/imageUtils.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -96,50 +97,8 @@ bool Qwen3VLViTRunner::bindExtraInputShapes()
 std::tuple<int64_t, int64_t> Qwen3VLViTRunner::getResizedImageSize(
     int64_t numFrames, int64_t height, int64_t width, int64_t maxRatio)
 {
-    // Mirrors HF Qwen3-VL smart_resize: 3D temporal-aware budget (t_bar = ceil(N/TPS)*TPS) — the base 2D body plus
-    // numFrames counted into the budget.
-    int64_t const factor = mConfig.patchSize * mConfig.mergeSize;
-    int64_t const minPixels = mConfig.minImageTokensPerImage * factor * factor;
-    int64_t const maxPixels = mConfig.maxImageTokensPerImage * factor * factor;
-
-    // Banker's rounding (round-half-to-even) to match Python's round() used by the HF reference.
-    auto roundByFactor = [](int64_t value, int64_t f) -> int64_t {
-        int64_t q = value / f;
-        int64_t r = value - q * f;
-        int64_t twoR = 2 * r;
-        if (twoR > f || (twoR == f && (q & 1)))
-            ++q;
-        return q * f;
-    };
-    auto floorByFactor
-        = [](int64_t value, int64_t f) -> int64_t { return std::floor(static_cast<double>(value) / f) * f; };
-    auto ceilByFactor
-        = [](int64_t value, int64_t f) -> int64_t { return std::ceil(static_cast<double>(value) / f) * f; };
-
-    ELLM_CHECK(std::max(height, width) / std::min(height, width) <= maxRatio,
-        "absolute aspect ratio must be smaller than " + std::to_string(maxRatio) + ", got "
-            + std::to_string(std::max(height, width) / std::min(height, width)));
-
-    int64_t hBar = std::max(factor, roundByFactor(height, factor));
-    int64_t wBar = std::max(factor, roundByFactor(width, factor));
-
-    int64_t tBar = (numFrames > 1) ? ceilByFactor(numFrames, mConfig.temporalPatchSize) : 1;
-
-    int64_t const budget = tBar * hBar * wBar;
-    if (budget > maxPixels)
-    {
-        double beta = std::sqrt(static_cast<double>(numFrames * height * width) / maxPixels);
-        hBar = std::max(factor, floorByFactor(static_cast<int64_t>(height / beta), factor));
-        wBar = std::max(factor, floorByFactor(static_cast<int64_t>(width / beta), factor));
-    }
-    else if (budget < minPixels)
-    {
-        double beta = std::sqrt(static_cast<double>(minPixels) / (numFrames * height * width));
-        hBar = ceilByFactor(static_cast<int64_t>(height * beta), factor);
-        wBar = ceilByFactor(static_cast<int64_t>(width * beta), factor);
-    }
-
-    return {hBar, wBar};
+    return rt::imageUtils::qwenSmartResize3D(numFrames, height, width, mConfig.patchSize, mConfig.mergeSize,
+        mConfig.minImageTokensPerImage, mConfig.maxImageTokensPerImage, mConfig.temporalPatchSize, maxRatio);
 }
 
 std::tuple<int64_t, int64_t> Qwen3VLViTRunner::computeVisionSpans(

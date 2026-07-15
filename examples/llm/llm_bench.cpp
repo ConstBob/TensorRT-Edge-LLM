@@ -657,6 +657,7 @@ int main(int argc, char** argv)
                 rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8, "fake");
             std::memset(fakeImage.rawPointer(), 128, static_cast<size_t>(args.imageHeight) * args.imageWidth * 3);
             req.imageBuffers.emplace_back(std::move(fakeImage));
+            req.imageBuffers.back().doResize = false;
             dummyRequest.requests.push_back(std::move(req));
         }
 

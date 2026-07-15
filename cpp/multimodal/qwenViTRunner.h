@@ -241,14 +241,12 @@ protected:
     //! \brief Preprocess all images in the request (populates spans + ViT-side tensors)
     //! \param[in] request LLM generation request containing images
     //! \param[out] spans Vision spans (flattened, global order)
-    //! \param[in] doResize Whether to resize images
     //! \param[in] stream CUDA stream for execution
     //! \throws std::runtime_error if aspect ratio is invalid
     //! \throws std::runtime_error if image dimensions are incompatible with patch size, or sequence length is out of
     //! range
     //! \throws std::runtime_error if a CUDA error occurs
-    void imagePreprocess(
-        rt::LLMGenerationRequest const& request, std::vector<VisionSpan>& spans, bool doResize, cudaStream_t stream);
+    void imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<VisionSpan>& spans, cudaStream_t stream);
 
     QwenViTConfig mConfig{};             //!< Qwen-VL configuration
     rt::Tensor mVitInput{};              //!< Vision encoder input tensor
