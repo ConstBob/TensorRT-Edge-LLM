@@ -205,6 +205,16 @@ def test_checkpoint_export(test_param: str, test_logger,
 
         # Same for audio encoder (ASR / Omni).
         audio_output = os.path.join(tmp_dir, "audio")
+        if config.model_type == ModelType.ASR:
+            missing_audio = [
+                path for path in (
+                    os.path.join(audio_output, "model.onnx"),
+                    os.path.join(audio_output, "config.json"),
+                ) if not os.path.isfile(path)
+            ]
+            if missing_audio:
+                pytest.fail("ASR checkpoint export missing audio outputs:\n" +
+                            "\n".join(f"  - {p}" for p in missing_audio))
         if os.path.isdir(audio_output):
             audio_onnx_dir = config.get_audio_onnx_dir(config.audio_precision
                                                        or "fp16")
