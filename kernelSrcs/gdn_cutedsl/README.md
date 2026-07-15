@@ -32,8 +32,8 @@ pip install cuda-python==12.8.* cupy-cuda12x==12.3.0 # CUDA 12.x
 pip install cuda-python cupy-cuda13x==13.6.0 # CUDA 13.x
 
 # CUDA 13: install the [cu13] extra. CUDA 12: install the base package.
-pip install 'nvidia-cutlass-dsl[cu13]==4.6.0'  # CUDA 13.x
-# CUDA 12.x: pip install 'nvidia-cutlass-dsl==4.6.0'
+pip install 'nvidia-cutlass-dsl[cu13]==4.6.1'  # CUDA 13.x
+# CUDA 12.x: pip install 'nvidia-cutlass-dsl==4.6.1'
 
 cd tensorrt-edge-llm
 

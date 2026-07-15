@@ -15,7 +15,7 @@ operands/output and FP32 accumulation. The same module is invoked for FC1 and
 FC2. Activation and route reduction are intentionally separate CUDA kernels.
 The Blackwell datacenter implementation is adapted from the CUTLASS 4.4.2
 CuTeDSL grouped-GEMM example and retains its BSD-3-Clause notice; the repository
-exports all three variants with its existing `nvidia-cutlass-dsl==4.5.2`
+exports all three variants with its existing `nvidia-cutlass-dsl==4.6.1`
 toolchain rather than adding a second C++ GEMM backend.
 
 ## Device descriptor ABI
@@ -50,12 +50,12 @@ persistent scheduler can skip empty experts without host synchronization.
 
 ## Export
 
-`build_cutedsl.py` checks for `nvidia-cutlass-dsl==4.5.2`, the matching CuPy
+`build_cutedsl.py` checks for `nvidia-cutlass-dsl==4.6.1`, the matching CuPy
 package, `cuda-python`, and `ar`. For example, the CUDA 13 environment uses:
 
 ```bash
 python3 -m pip install cuda-python cupy-cuda13x==13.6.0 \
-  'nvidia-cutlass-dsl[cu13]==4.5.2'
+  'nvidia-cutlass-dsl[cu13]==4.6.1'
 ```
 
 Generate each pack on a host whose CPU architecture and GPU SM exactly match
