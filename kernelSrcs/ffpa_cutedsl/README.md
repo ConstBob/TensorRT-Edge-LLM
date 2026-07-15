@@ -27,7 +27,7 @@ Supported artifact targets:
 ```bash
 python3 -m venv build_kernel_venv
 source build_kernel_venv/bin/activate
-pip install nvidia-cutlass-dsl==4.5.1 cupy-cuda12x==12.3.0 cuda-python
+pip install nvidia-cutlass-dsl==4.6.1 cupy-cuda12x==12.3.0 cuda-python
 
 cd tensorrt-edge-llm
 python kernelSrcs/build_cutedsl.py --kernels ffpa --gpu_arch sm_86 --clean -j 4

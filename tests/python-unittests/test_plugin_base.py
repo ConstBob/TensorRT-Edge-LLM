@@ -162,12 +162,27 @@ class InputSpec:
     shape: Tuple[int, ...]  # may contain -1 for dynamic dims
 
 
+# TensorRT registers the logger of the FIRST builder/runtime globally and
+# ignores the ones passed later. A per-runner logger is garbage-collected
+# when its test ends while TensorRT still dereferences it, crashing a later
+# engine build. Share one process-lifetime logger instead (first caller's
+# severity wins).
+_LOGGER = None
+
+
+def _get_logger(verbose: bool):
+    global _LOGGER
+    if _LOGGER is None:
+        _LOGGER = trt.Logger(
+            trt.Logger.VERBOSE if verbose else trt.Logger.WARNING)
+    return _LOGGER
+
+
 class PluginRunner:
     """Builds and executes a single-plugin TensorRT engine with torch buffers."""
 
     def __init__(self, verbose: bool = False):
-        sev = trt.Logger.VERBOSE if verbose else trt.Logger.WARNING
-        self.logger = trt.Logger(sev)
+        self.logger = _get_logger(verbose)
         if not _plugins_loaded:
             load_edgellm_plugins(self.logger)
         self.engine = None

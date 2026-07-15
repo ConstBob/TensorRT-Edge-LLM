@@ -80,7 +80,7 @@ Block scales use the contiguous physical CuTeDSL NVFP4 layout
 
 ## Build
 
-Install `nvidia-cutlass-dsl[cu13]==4.6.0` (the `[cu13]` extra is mandatory on
+Install `nvidia-cutlass-dsl[cu13]==4.6.1` (the `[cu13]` extra is mandatory on
 CUDA 13), then:
 
 ```bash

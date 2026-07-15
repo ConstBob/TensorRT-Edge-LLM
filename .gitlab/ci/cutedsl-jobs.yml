@@ -137,7 +137,7 @@ build_cutedsl_gb10_artifact:
     - echo "CUDA version:$(nvcc --version | grep release)"
     - echo "Building CuTe DSL artifact for GB10"
     - python3 -m venv "$CUTE_DSL_OUTPUT_DIR/venv/cutedsl"
-    - '"$CUTE_DSL_OUTPUT_DIR/venv/cutedsl/bin/pip" install -q ''nvidia-cutlass-dsl[cu13]==4.6.0'' cupy-cuda13x==13.6.0'
+    - '"$CUTE_DSL_OUTPUT_DIR/venv/cutedsl/bin/pip" install -q ''nvidia-cutlass-dsl[cu13]==4.6.1'' cupy-cuda13x==13.6.0'
     - '"$CUTE_DSL_OUTPUT_DIR/venv/cutedsl/bin/python" kernelSrcs/build_cutedsl.py --kernels ALL --gpu_arch sm_121 --arch aarch64 --output_dir "$CUTE_DSL_OUTPUT_DIR" --clean'
     - ARTIFACT_DIR="$CUTE_DSL_OUTPUT_DIR/aarch64/$CUTE_DSL_ARTIFACT_TAG"
     - test -f "$ARTIFACT_DIR/metadata.json"
@@ -168,7 +168,7 @@ build_cutedsl_sm110_artifact:
     CUTE_DSL_ARTIFACT_NAME: "cutedsl_aarch64_sm_110_cuda13.tar.gz"
     CUTE_DSL_ARTIFACT_TAG: "sm_110"
     CUTE_DSL_BUILD_GPU_ARCH_ARG: ""
-    CUTE_DSL_PACKAGE: "nvidia-cutlass-dsl[cu13]==4.6.0"
+    CUTE_DSL_PACKAGE: "nvidia-cutlass-dsl[cu13]==4.6.1"
     CUTE_DSL_CUPY_PACKAGE: "cupy-cuda13x==13.6.0"
   artifacts:
     name: "cutedsl-sm110-${CI_COMMIT_SHORT_SHA}"
@@ -205,7 +205,7 @@ build_cutedsl_sm110_artifact:
     - echo "CUDA version:$(nvcc --version | grep release)"
     - echo "Building CuTe DSL artifact for x86_64 $CUTE_DSL_ARTIFACT_TAG"
     - python3 -m venv "$CUTE_DSL_OUTPUT_DIR/venv/cutedsl"
-    - '"$CUTE_DSL_OUTPUT_DIR/venv/cutedsl/bin/pip" install -q ''nvidia-cutlass-dsl==4.6.0'' cupy-cuda12x==12.3.0'
+    - '"$CUTE_DSL_OUTPUT_DIR/venv/cutedsl/bin/pip" install -q ''nvidia-cutlass-dsl==4.6.1'' cupy-cuda12x==12.3.0'
     - '"$CUTE_DSL_OUTPUT_DIR/venv/cutedsl/bin/python" kernelSrcs/build_cutedsl.py --kernels $CUTE_DSL_KERNELS --gpu_arch $CUTE_DSL_ARTIFACT_TAG --arch x86_64 --output_dir "$CUTE_DSL_OUTPUT_DIR" --clean'
     - ARTIFACT_DIR="$CUTE_DSL_OUTPUT_DIR/x86_64/$CUTE_DSL_ARTIFACT_TAG"
     - test -f "$ARTIFACT_DIR/metadata.json"
@@ -266,7 +266,7 @@ build_cutedsl_sm87_cuda13_artifact:
     CUTE_DSL_ARTIFACT_NAME: "cutedsl_aarch64_sm_87_cuda13.tar.gz"
     CUTE_DSL_ARTIFACT_TAG: "sm_87"
     CUTE_DSL_BUILD_GPU_ARCH_ARG: "--gpu_arch sm_87"
-    CUTE_DSL_PACKAGE: "nvidia-cutlass-dsl[cu13]==4.6.0"
+    CUTE_DSL_PACKAGE: "nvidia-cutlass-dsl[cu13]==4.6.1"
     CUTE_DSL_CUPY_PACKAGE: "cupy-cuda13x==13.6.0"
   artifacts:
     name: "cutedsl-sm87-cuda13-${CI_COMMIT_SHORT_SHA}"

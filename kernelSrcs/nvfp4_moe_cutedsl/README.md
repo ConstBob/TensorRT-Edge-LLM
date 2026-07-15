@@ -85,14 +85,14 @@ On CUDA 13 the `[cu13]` extra is **mandatory**; on CUDA 12 install the base pack
 
 ```bash
 python3 -m pip install \
-  'nvidia-cutlass-dsl[cu13]==4.6.0' \
+  'nvidia-cutlass-dsl[cu13]==4.6.1' \
   cupy-cuda13x==13.6.0 \
   cuda-python
 ```
 
 | Dependency | Version | Notes |
 |---|---|---|
-| `nvidia-cutlass-dsl` | `4.6.0` | Pinned; CuTeDSL surface used by all groups. **On CUDA 13 install the `[cu13]` extra; on CUDA 12 install the base package.** |
+| `nvidia-cutlass-dsl` | `4.6.1` | Pinned; CuTeDSL surface used by all groups. **On CUDA 13 install the `[cu13]` extra; on CUDA 12 install the base package.** |
 | `cupy-cuda13x`       | `13.6.0` | CUDA 13.x ; use `cupy-cuda12x==12.3.0` for CUDA 12.x |
 | `cuda-python`        | matches CUDA | Required by every group's AOT export |
 
