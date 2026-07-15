@@ -102,12 +102,11 @@ private:
     //! \param[in] request LLM generation request containing images
     //! \param[out] imageTokenLengths Token lengths for each image
     //! \param[out] numImages Number of images per prompt
-    //! \param[in] doResize Whether to resize images
     //! \param[in] stream CUDA stream for execution
     //! \throws std::runtime_error if an image reshape fails, or the number of blocks is inconsistent
     void imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths,
         std::vector<int64_t>& numImages, std::vector<std::vector<std::vector<int64_t>>>& imagesBlockGridHW,
-        bool doResize, cudaStream_t stream);
+        cudaStream_t stream);
 
     //! \brief Preprocess text portion of the request
     //! \param[in] request LLM generation request

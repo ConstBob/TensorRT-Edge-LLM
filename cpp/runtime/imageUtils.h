@@ -45,7 +45,8 @@ public:
     int64_t height{0};                  //!< Image height
     int64_t channels{0};                //!< Number of channels (e.g., 3 for RGB)
     int64_t frames{1};                  //!< Number of frames (T). 1 for static images, >1 for video.
-    double fps{1.0}; //!< Video sample fps (used to compute MRoPE timestamps); ignored when frames == 1.
+    double fps{1.0};     //!< Video sample fps (used to compute MRoPE timestamps); ignored when frames == 1.
+    bool doResize{true}; //!< When false, the vision runner skips its internal resize.
 
     /*!
      * @brief Default constructor (creates uninitialized ImageData)
@@ -106,17 +107,20 @@ enum class InterpolationMode
 };
 
 /*!
- * @brief Resize each frame of an image/video stack into a pre-allocated buffer
+ * @brief Resize each frame of an image/video stack into a pre-allocated buffer, unless `image` is already at
+ *        the target dimensions.
  * @param image Source image (4D `[T, H, W, C]`)
- * @param resizedImage Output buffer (reshaped to target dimensions)
+ * @param resizedImage Output buffer (reshaped to target dimensions); untouched when the resize is skipped
  * @param newWidth Target width
  * @param newHeight Target height
  * @param mode Interpolation filter
+ * @return Reference to `image` when its dimensions already match (resize skipped), otherwise reference to the
+ *         freshly resized `resizedImage`. Always consume the returned reference, not `resizedImage`.
  * @throws std::runtime_error if image buffer cannot be reshaped
  *
  * TODO(perf): per-frame CPU stbir is slow for video; consider GPU resize.
  */
-void resizeImage(
+[[nodiscard]] ImageData const& resizeImage(
     ImageData const& image, ImageData& resizedImage, int64_t newWidth, int64_t newHeight, InterpolationMode mode);
 
 } // namespace imageUtils

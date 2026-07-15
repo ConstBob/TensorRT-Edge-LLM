@@ -214,7 +214,7 @@ void InternViTRunner::formatPatch(imageUtils::ImageData const& image, std::vecto
 }
 
 void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths,
-    std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream)
+    std::vector<int64_t>& numImages, cudaStream_t stream)
 {
     int64_t totalNumBlocks = 0;
 
@@ -224,17 +224,18 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
         for (auto const& image : req.imageBuffers)
         {
             int64_t const blocksBeforePatch = totalNumBlocks;
-            if (doResize)
+            if (image.doResize)
             {
                 auto [resizedHeight, resizedWidth] = imageUtils::computeBestBlockGridForResize(image.height,
                     image.width, mConfig.minImageTokensPerImage, mConfig.maxImageTokensPerImage,
                     mConfig.blockImageSizeH, mConfig.blockImageSizeW);
-                rt::imageUtils::resizeImage(
+                auto const& src = rt::imageUtils::resizeImage(
                     image, mResizedImageHost, resizedWidth, resizedHeight, rt::imageUtils::InterpolationMode::kBICUBIC);
-                formatPatch(mResizedImageHost, imageTokenLengths, numImage, totalNumBlocks, false, stream);
+                formatPatch(src, imageTokenLengths, numImage, totalNumBlocks, false, stream);
             }
             else
             {
+                LOG_DEBUG("Skipping resize for pre-resized image %ldx%ld", image.height, image.width);
                 formatPatch(image, imageTokenLengths, numImage, totalNumBlocks, false, stream);
             }
             // Add a thumbnail tile when (a) the image has more than 1 main block (matches
@@ -245,9 +246,9 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
             int64_t const mainImageBlocks = totalNumBlocks - blocksBeforePatch;
             if (mainImageBlocks > 1 || mConfig.minNumBlocks > 1)
             {
-                rt::imageUtils::resizeImage(image, mThumbnailImageHost, mConfig.blockImageSizeW,
+                auto const& thumbnail = rt::imageUtils::resizeImage(image, mThumbnailImageHost, mConfig.blockImageSizeW,
                     mConfig.blockImageSizeH, rt::imageUtils::InterpolationMode::kBICUBIC);
-                formatPatch(mThumbnailImageHost, imageTokenLengths, numImage, totalNumBlocks, true, stream);
+                formatPatch(thumbnail, imageTokenLengths, numImage, totalNumBlocks, true, stream);
             }
         }
         numImages.emplace_back(numImage);
@@ -339,7 +340,7 @@ bool InternViTRunner::preprocess(rt::LLMGenerationRequest const& request,
 
     try
     {
-        imagePreprocess(request, imageTokenLengths, numImages, !imageOnly, stream);
+        imagePreprocess(request, imageTokenLengths, numImages, stream);
         if (!imageOnly)
         {
             textPreprocess(request, batchedInputIds, numImages, imageTokenLengths, tokenizer);

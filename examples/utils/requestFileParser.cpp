@@ -284,6 +284,7 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                             auto image = rt::imageUtils::loadImageFromFile(msgContent.content);
                             if (image.buffer != nullptr)
                             {
+                                image.doResize = contentItemJson.value("do_resize", true);
                                 imageBuffers.push_back(std::move(image));
                             }
                         }
@@ -303,6 +304,7 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                             auto video = rt::imageUtils::loadVideoFromFrames(framePaths, fps);
                             if (video.buffer != nullptr)
                             {
+                                video.doResize = contentItemJson.value("do_resize", true);
                                 imageBuffers.push_back(std::move(video));
                             }
                         }

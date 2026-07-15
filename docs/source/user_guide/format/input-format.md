@@ -69,7 +69,7 @@ This guide describes the input JSON format for the LLM inference tool. The forma
 
 **Content Array Format:**
 - Text: `{"type": "text", "text": "..."}`
-- Image: `{"type": "image", "image": "/path/to/image.jpg"}`
+- Image: `{"type": "image", "image": "/path/to/image.jpg"}`. Optional `"do_resize"` (default `true`): set to `false` when the image is already resized to the model's target size — the vision runner then consumes it as-is instead of resizing internally (see [Pre-resized image input](#pre-resized-image-input-do_resize-false)).
 - Audio: `{"type": "audio", "audio": "/path/to/clip.wav"}` (raw `.wav` / `.mp3` / `.flac` decoded in C++ via vendored miniaudio + in-tree mel extractor. Feature-extractor family — `whisper` / `parakeet` — is auto-derived from the engine's `audio/config.json`, mirroring HF / vLLM where FE is pinned by the model. The HTTP server in `experimental.server` accepts the same audio formats via `input_audio` / `audio_url` and routes through the same C++ mel path.)
 - Video: `{"type": "video", "video": "/path/to/video.mp4"}` *(Note: Video support is a placeholder for future releases and is not available for now)*
 
@@ -126,6 +126,26 @@ This guide describes the input JSON format for the LLM inference tool. The forma
     ]
 }
 ```
+
+### Pre-resized Image Input (`do_resize: false`)
+
+By default the vision runner resizes every input image to the model's target size. If your pipeline already produces frames at the target size (e.g. a camera/robotics pipeline that resizes once upstream), set `"do_resize": false` on the content item to skip the runtime's internal resize:
+
+```json
+{"type": "image", "image": "/path/to/pre_resized.png", "do_resize": false}
+```
+
+The same field is available on the video content item, on the Python `ImageData` binding (`image.do_resize = False`), and on the C++ struct (`rt::imageUtils::ImageData::doResize`).
+
+**Contract for pre-resized inputs:**
+
+- Supply raw **uint8 RGB** pixels. Do **not** rescale or normalize the pixel values yourself — mean/std normalization always runs inside the runtime.
+- Dimensions must exactly match the model's resize target. The per-model target formulas are exposed as stateless C++ functions in `cpp/multimodal/imageUtils.h`. For example, for the Qwen family:
+
+  ```cpp
+  auto [targetHeight, targetWidth] = rt::imageUtils::qwenSmartResize(
+      origHeight, origWidth, patchSize, mergeSize, minImageTokensPerImage, maxImageTokensPerImage);
+  ```
 
 ### LoRA Adapters
 

@@ -16,11 +16,13 @@
  */
 
 #include "multimodal/imageUtils.h"
+#include "common/checkMacros.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -31,6 +33,32 @@ namespace rt
 {
 namespace imageUtils
 {
+
+namespace
+{
+
+//! Banker's rounding (round-half-to-even) to match Python's round() used by the HF reference.
+int64_t roundByFactor(int64_t value, int64_t factor)
+{
+    int64_t q = value / factor;
+    int64_t r = value - q * factor;
+    int64_t twoR = 2 * r;
+    if (twoR > factor || (twoR == factor && (q & 1)))
+        ++q;
+    return q * factor;
+}
+
+int64_t floorByFactor(int64_t value, int64_t factor)
+{
+    return std::floor(static_cast<double>(value) / factor) * factor;
+}
+
+int64_t ceilByFactor(int64_t value, int64_t factor)
+{
+    return std::ceil(static_cast<double>(value) / factor) * factor;
+}
+
+} // namespace
 
 std::vector<std::pair<int64_t, int64_t>> getAllSupportedAspectRatios(int64_t minImageTiles, int64_t maxImageTiles)
 {
@@ -104,6 +132,150 @@ std::tuple<int64_t, int64_t> computeBestBlockGridForResize(int64_t height, int64
     // return (height, width)
     return {bestRatio.second * blockImageSizeH, bestRatio.first * blockImageSizeW};
 }
+
+std::tuple<int64_t, int64_t> qwenSmartResize(int64_t height, int64_t width, int64_t patchSize, int64_t mergeSize,
+    int64_t minImageTokensPerImage, int64_t maxImageTokensPerImage, int64_t maxRatio)
+{
+    // According to https://github.com/QwenLM/Qwen2-VL/blob/main/qwen-vl-utils/src/qwen_vl_utils/vision_process.py
+    int64_t const factor = patchSize * mergeSize;
+    int64_t const minPixels = minImageTokensPerImage * factor * factor;
+    int64_t const maxPixels = maxImageTokensPerImage * factor * factor;
+
+    ELLM_CHECK(std::max(height, width) / std::min(height, width) <= maxRatio,
+        "absolute aspect ratio must be smaller than " + std::to_string(maxRatio) + ", got "
+            + std::to_string(std::max(height, width) / std::min(height, width)));
+
+    int64_t hBar = std::max(factor, roundByFactor(height, factor));
+    int64_t wBar = std::max(factor, roundByFactor(width, factor));
+
+    if (hBar * wBar > maxPixels)
+    {
+        double beta = std::sqrt(static_cast<double>(height * width) / maxPixels);
+        // Clamp to >= factor: a heavily-downscaled image must not yield a sub-factor (or zero) dimension.
+        hBar = std::max(factor, floorByFactor(static_cast<int64_t>(height / beta), factor));
+        wBar = std::max(factor, floorByFactor(static_cast<int64_t>(width / beta), factor));
+    }
+    else if (hBar * wBar < minPixels)
+    {
+        double beta = std::sqrt(static_cast<double>(minPixels) / (height * width));
+        hBar = ceilByFactor(static_cast<int64_t>(height * beta), factor);
+        wBar = ceilByFactor(static_cast<int64_t>(width * beta), factor);
+    }
+
+    return {hBar, wBar};
+}
+
+std::tuple<int64_t, int64_t> qwenSmartResize3D(int64_t numFrames, int64_t height, int64_t width, int64_t patchSize,
+    int64_t mergeSize, int64_t minImageTokensPerImage, int64_t maxImageTokensPerImage, int64_t temporalPatchSize,
+    int64_t maxRatio)
+{
+    // Mirrors HF Qwen3-VL smart_resize: 3D temporal-aware budget (t_bar = ceil(N/TPS)*TPS) — the base 2D body plus
+    // numFrames counted into the budget. NOTE (HF parity): beta is derived from the raw numFrames*height*width (not
+    // tBar), and the minPixels branch intentionally has no >= factor clamp, matching the reference implementation.
+    int64_t const factor = patchSize * mergeSize;
+    int64_t const minPixels = minImageTokensPerImage * factor * factor;
+    int64_t const maxPixels = maxImageTokensPerImage * factor * factor;
+
+    ELLM_CHECK(std::max(height, width) / std::min(height, width) <= maxRatio,
+        "absolute aspect ratio must be smaller than " + std::to_string(maxRatio) + ", got "
+            + std::to_string(std::max(height, width) / std::min(height, width)));
+
+    int64_t hBar = std::max(factor, roundByFactor(height, factor));
+    int64_t wBar = std::max(factor, roundByFactor(width, factor));
+
+    int64_t tBar = (numFrames > 1) ? ceilByFactor(numFrames, temporalPatchSize) : 1;
+
+    int64_t const budget = tBar * hBar * wBar;
+    if (budget > maxPixels)
+    {
+        double beta = std::sqrt(static_cast<double>(numFrames * height * width) / maxPixels);
+        hBar = std::max(factor, floorByFactor(static_cast<int64_t>(height / beta), factor));
+        wBar = std::max(factor, floorByFactor(static_cast<int64_t>(width / beta), factor));
+    }
+    else if (budget < minPixels)
+    {
+        double beta = std::sqrt(static_cast<double>(minPixels) / (numFrames * height * width));
+        hBar = ceilByFactor(static_cast<int64_t>(height * beta), factor);
+        wBar = ceilByFactor(static_cast<int64_t>(width * beta), factor);
+    }
+
+    return {hBar, wBar};
+}
+
+std::tuple<int64_t, int64_t> gemma4ResizeTarget(
+    int64_t height, int64_t width, int64_t maxImageTokensPerImage, int64_t poolingKernelSize, int64_t patchSize)
+{
+    ELLM_CHECK(height > 0 && width > 0, "Gemma4 image height/width must be positive");
+    int64_t const maxPatches = maxImageTokensPerImage * poolingKernelSize * poolingKernelSize;
+    double const totalPx = static_cast<double>(height) * static_cast<double>(width);
+    double const targetPx = static_cast<double>(maxPatches) * patchSize * patchSize;
+    double const factor = std::sqrt(targetPx / totalPx);
+    double const idealHeight = factor * static_cast<double>(height);
+    double const idealWidth = factor * static_cast<double>(width);
+    int64_t const sideMult = poolingKernelSize * patchSize;
+    auto floorBySideMult = [sideMult](double value) {
+        return static_cast<int64_t>(std::floor(value / static_cast<double>(sideMult))) * sideMult;
+    };
+    auto roundBySideMult = [sideMult](double value) {
+        return static_cast<int64_t>(std::round(value / static_cast<double>(sideMult))) * sideMult;
+    };
+
+    int64_t targetHeight = floorBySideMult(idealHeight);
+    int64_t targetWidth = floorBySideMult(idealWidth);
+    ELLM_CHECK(targetHeight != 0 || targetWidth != 0, "Gemma4 target image size rounded to 0x0");
+
+    int64_t const maxSideLength = (maxPatches / (poolingKernelSize * poolingKernelSize)) * sideMult;
+    if (targetHeight == 0)
+    {
+        targetHeight = sideMult;
+        int64_t const maxWidth = std::min(maxSideLength, floorBySideMult(targetPx / targetHeight));
+        targetWidth = std::clamp(roundBySideMult(idealWidth), sideMult, maxWidth);
+    }
+    else if (targetWidth == 0)
+    {
+        targetWidth = sideMult;
+        int64_t const maxHeight = std::min(maxSideLength, floorBySideMult(targetPx / targetWidth));
+        targetHeight = std::clamp(roundBySideMult(idealHeight), sideMult, maxHeight);
+    }
+
+    ELLM_CHECK(
+        static_cast<double>(targetHeight) * targetWidth <= targetPx, "Gemma4 target image size exceeds patch budget");
+    return {targetHeight, targetWidth};
+}
+
+std::tuple<int64_t, int64_t> gemma4UnifiedResizeTarget(
+    int64_t height, int64_t width, int64_t maxPatchesPerImage, int64_t modelPatchSize, int64_t positionEmbeddingSize)
+{
+    ELLM_CHECK(height > 0 && width > 0, "Gemma4 Unified image dimensions must be positive");
+    double const targetPixels = static_cast<double>(maxPatchesPerImage) * modelPatchSize * modelPatchSize;
+    double const scale = std::sqrt(targetPixels / (static_cast<double>(height) * width));
+    double const idealHeight = scale * height;
+    double const idealWidth = scale * width;
+    int64_t const sideMultiple = modelPatchSize;
+    auto floorToMultiple = [sideMultiple](double value) {
+        return static_cast<int64_t>(std::floor(value / sideMultiple)) * sideMultiple;
+    };
+    int64_t const maxSide = std::min(maxPatchesPerImage, positionEmbeddingSize) * sideMultiple;
+    int64_t targetHeight = std::min(floorToMultiple(idealHeight), maxSide);
+    int64_t targetWidth = std::min(floorToMultiple(idealWidth), maxSide);
+    ELLM_CHECK(targetHeight != 0 || targetWidth != 0, "Gemma4 Unified resized image rounded to 0x0");
+    if (targetHeight == 0)
+    {
+        targetHeight = sideMultiple;
+        targetWidth
+            = std::min(static_cast<int64_t>(std::floor(static_cast<double>(width) / height)) * sideMultiple, maxSide);
+    }
+    else if (targetWidth == 0)
+    {
+        targetWidth = sideMultiple;
+        targetHeight
+            = std::min(static_cast<int64_t>(std::floor(static_cast<double>(height) / width)) * sideMultiple, maxSide);
+    }
+    ELLM_CHECK(static_cast<double>(targetHeight) * targetWidth <= targetPixels,
+        "Gemma4 Unified resized image exceeds per-image patch budget");
+    return {targetHeight, targetWidth};
+}
+
 } // namespace imageUtils
 } // namespace rt
 } // namespace trt_edgellm

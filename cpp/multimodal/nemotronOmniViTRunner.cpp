@@ -274,21 +274,29 @@ void NemotronOmniViTRunner::imagePreprocess(rt::LLMGenerationRequest const& requ
         {
             int64_t const blocksBeforePatch = mTotalNumBlocks;
 
-            // Resize image to the aspect-ratio-matched tile grid within the per-image tile budget
-            auto [resizedHeight, resizedWidth]
-                = imageUtils::computeBestBlockGridForResize(image.height, image.width, mConfig.minImageTokensPerImage,
-                    mConfig.maxImageTokensPerImage, mConfig.blockImageSizeH, mConfig.blockImageSizeW);
-            rt::imageUtils::resizeImage(
-                image, mResizedImageHost, resizedWidth, resizedHeight, rt::imageUtils::InterpolationMode::kBICUBIC);
-            formatPatch(mResizedImageHost, imageTokenLengths, numImage, mTotalNumBlocks, false, stream);
+            if (image.doResize)
+            {
+                // Resize image to the aspect-ratio-matched tile grid within the per-image tile budget
+                auto [resizedHeight, resizedWidth] = imageUtils::computeBestBlockGridForResize(image.height,
+                    image.width, mConfig.minImageTokensPerImage, mConfig.maxImageTokensPerImage,
+                    mConfig.blockImageSizeH, mConfig.blockImageSizeW);
+                auto const& src = rt::imageUtils::resizeImage(
+                    image, mResizedImageHost, resizedWidth, resizedHeight, rt::imageUtils::InterpolationMode::kBICUBIC);
+                formatPatch(src, imageTokenLengths, numImage, mTotalNumBlocks, false, stream);
+            }
+            else
+            {
+                LOG_DEBUG("Skipping resize for pre-resized image %ldx%ld", image.height, image.width);
+                formatPatch(image, imageTokenLengths, numImage, mTotalNumBlocks, false, stream);
+            }
 
             // Only add thumbnail when the image has more than 1 block (matches HuggingFace behavior)
             int64_t const mainImageBlocks = mTotalNumBlocks - blocksBeforePatch;
             if (mainImageBlocks > 1)
             {
-                rt::imageUtils::resizeImage(image, mThumbnailImageHost, mConfig.blockImageSizeW,
+                auto const& thumbnail = rt::imageUtils::resizeImage(image, mThumbnailImageHost, mConfig.blockImageSizeW,
                     mConfig.blockImageSizeH, rt::imageUtils::InterpolationMode::kBICUBIC);
-                formatPatch(mThumbnailImageHost, imageTokenLengths, numImage, mTotalNumBlocks, true, stream);
+                formatPatch(thumbnail, imageTokenLengths, numImage, mTotalNumBlocks, true, stream);
             }
         }
         numImages.emplace_back(numImage);

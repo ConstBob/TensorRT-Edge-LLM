@@ -145,9 +145,15 @@ ImageData loadVideoFromFrames(std::vector<std::string> const& framePaths, double
     return video;
 }
 
-void resizeImage(
+ImageData const& resizeImage(
     ImageData const& image, ImageData& resizedImage, int64_t newWidth, int64_t newHeight, InterpolationMode mode)
 {
+    // Already at the target size — skip the resample and the scratch-buffer copy.
+    if (image.width == newWidth && image.height == newHeight)
+    {
+        return image;
+    }
+
     // Reshape pre-allocated buffer to target [T, H, W, C] (always 4D).
     bool const success = resizedImage.buffer->reshape({image.frames, newHeight, newWidth, image.channels});
     ELLM_CHECK(success, "Failed to reshape resized image buffer");
@@ -177,6 +183,7 @@ void resizeImage(
                 kOUTPUT_STRIDE_BYTES, STBIR_RGB);
         }
     }
+    return resizedImage;
 }
 
 } // namespace imageUtils

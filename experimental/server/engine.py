@@ -1130,7 +1130,9 @@ def _load_image_buffers(rt_module, messages: List[Dict[str, Any]]):
             if item.get("type") == "image":
                 path = item.get("image", "")
                 if path and os.path.isfile(path):
-                    images.append(rt_module.load_image_from_path(path))
+                    image = rt_module.load_image_from_path(path)
+                    image.do_resize = bool(item.get("do_resize", True))
+                    images.append(image)
     return images
 
 

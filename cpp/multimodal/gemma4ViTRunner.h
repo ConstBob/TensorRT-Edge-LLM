@@ -74,14 +74,12 @@ private:
         int64_t patchWidth{0};
     };
 
-    std::tuple<int64_t, int64_t> getResizedImageSize(int64_t height, int64_t width) const;
-
     void formatPatch(rt::imageUtils::ImageData const& image, std::vector<ImageGrid>& imageGrids,
         std::vector<int64_t>& imageTokenLengths, int32_t* cuSeqlensData, int64_t& cuSeqlensSize, int64_t& maxSeqLen,
         cudaStream_t stream);
 
     void imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<ImageGrid>& imageGrids,
-        std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream);
+        std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages, cudaStream_t stream);
 
     void textPreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchInputIds,
         std::vector<int64_t> const& numImages, std::vector<int64_t> const& imageTokenLengths,
