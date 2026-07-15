@@ -78,6 +78,41 @@ void expectHalfOutputsClose(rt::Tensor const& actualTensor, rt::Tensor const& ex
     EXPECT_FALSE(nanDetected) << label;
 }
 
+// Skip-softmax is approximate by design: skipped KV tiles perturb the output by
+// up to the calibrated accuracy gate (0.1 max-abs, the same gate the baked-in
+// lambda was calibrated against), so the dense comparator's 1e-2 tolerance
+// does not apply.
+void expectSkipSoftmaxOutputsClose(
+    rt::Tensor const& actualTensor, rt::Tensor const& expectedTensor, std::string const& label)
+{
+    ASSERT_EQ(actualTensor.getShape().volume(), expectedTensor.getShape().volume()) << label;
+
+    auto const actual = copyDeviceToHost<half>(actualTensor);
+    auto const expected = copyDeviceToHost<half>(expectedTensor);
+    auto const& shape = actualTensor.getShape();
+
+    bool nanDetected = false;
+    double sumAbsError = 0.0;
+    int64_t const totalElements = static_cast<int64_t>(actual.size());
+
+    for (int64_t idx = 0; idx < totalElements; ++idx)
+    {
+        float const actualValue = __half2float(actual[static_cast<size_t>(idx)]);
+        float const expectedValue = __half2float(expected[static_cast<size_t>(idx)]);
+
+        ASSERT_LT(std::fabs(actualValue - expectedValue), 0.1f)
+            << label << " mismatch at index=" << formatTensorIndex(shape, idx) << " flat_index=" << idx
+            << " expected=" << expectedValue << " actual=" << actualValue;
+
+        sumAbsError += std::fabs(actualValue - expectedValue);
+        nanDetected = nanDetected || std::isnan(actualValue);
+    }
+
+    double const meanAbsError = sumAbsError / static_cast<double>(totalElements);
+    EXPECT_LT(meanAbsError, 0.01) << label;
+    EXPECT_FALSE(nanDetected) << label;
+}
+
 void runViTAccuracyCase(
     std::vector<int32_t> const& cuSeqLens, int32_t numHeads, int32_t headDim, int32_t maxSeqLen, float attentionScale)
 {
@@ -124,8 +159,8 @@ void runViTAccuracyCase(
         "ViT CuTe DSL FMHA headDim=" + std::to_string(headDim) + " numHeads=" + std::to_string(numHeads));
 }
 
-void runLlmAccuracyCase(
-    int32_t batchSize, int32_t seqLen, int32_t numQHeads, int32_t numKVHeads, int32_t headDim, float attentionScale)
+void runLlmAccuracyCase(int32_t batchSize, int32_t seqLen, int32_t numQHeads, int32_t numKVHeads, int32_t headDim,
+    float attentionScale, bool enableSkipSoftmax = false)
 {
     size_t const qSize = static_cast<size_t>(batchSize) * seqLen * numQHeads * headDim;
     size_t const kvSize = static_cast<size_t>(batchSize) * seqLen * numKVHeads * headDim;
@@ -189,16 +224,24 @@ void runLlmAccuracyCase(
 
     CuteDslFMHARunner runner(numQHeads, numKVHeads, headDim, batchSize, seqLen, seqLen);
     runner.run(qCute.dataPointer<half>(), kvCacheCute.dataPointer<half>(), outputCuteDsl.dataPointer<half>(),
-        cuKVSeqLens.dataPointer<int32_t>(), stream, attentionScale, INT_MAX);
+        cuKVSeqLens.dataPointer<int32_t>(), stream, attentionScale, INT_MAX, false, 1.0F, 1.0F, 1.0F,
+        enableSkipSoftmax);
 
     rt::launchFmhaReferenceBshd(qReference, kReference, vReference, outputReference, true, attentionScale, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
 
-    expectHalfOutputsClose(outputCuteDsl, outputReference,
-        "LLM CuTe DSL FMHA batch=" + std::to_string(batchSize) + " seqLen=" + std::to_string(seqLen)
-            + " numQHeads=" + std::to_string(numQHeads) + " numKVHeads=" + std::to_string(numKVHeads)
-            + " headDim=" + std::to_string(headDim));
+    std::string const label = std::string(enableSkipSoftmax ? "Skip-softmax " : "") + "LLM CuTe DSL FMHA batch="
+        + std::to_string(batchSize) + " seqLen=" + std::to_string(seqLen) + " numQHeads=" + std::to_string(numQHeads)
+        + " numKVHeads=" + std::to_string(numKVHeads) + " headDim=" + std::to_string(headDim);
+    if (enableSkipSoftmax)
+    {
+        expectSkipSoftmaxOutputsClose(outputCuteDsl, outputReference, label);
+    }
+    else
+    {
+        expectHalfOutputsClose(outputCuteDsl, outputReference, label);
+    }
 }
 
 size_t contiguousKVIdx(int32_t b, int32_t kv, int32_t h, int32_t s, int32_t d, int32_t H, int32_t S, int32_t D)
@@ -514,6 +557,47 @@ TEST(CuteDslFMHARunnerTest, llmAccuracy)
             = testCase.attentionScale.value_or(1.0F / std::sqrt(static_cast<float>(testCase.headDim)));
         runLlmAccuracyCase(testCase.batchSize, testCase.seqLen, testCase.numQHeads, testCase.numKVHeads,
             testCase.headDim, attentionScale);
+    }
+}
+
+TEST(CuteDslFMHARunnerTest, llmSkipSoftmaxAccuracy)
+{
+    int32_t const rawSmVersion = getSMVersion();
+    if (!isSupportedCuteDslTestSm(rawSmVersion))
+    {
+        GTEST_SKIP() << "CuTe DSL FMHA unit tests only run on SM100/101/110. Current SM=" << rawSmVersion;
+    }
+
+    if (!CuteDslFMHARunner::loadLLMKernelModule())
+    {
+        GTEST_SKIP() << "Failed to load CuTe DSL LLM FMHA kernel module";
+    }
+
+    struct LlmCase
+    {
+        int32_t batchSize;
+        int32_t seqLen;
+        int32_t numQHeads;
+        int32_t numKVHeads;
+        int32_t headDim;
+    };
+
+    // seqLen must span several 128-token KV tiles: single-tile rows can never
+    // skip (first-tile rule), so a short sequence would not exercise the skip
+    // predicate / vote / P*V-skip path at all.
+    std::vector<LlmCase> const cases{
+        {2, 1024, 14, 2, 64},
+        {1, 1024, 16, 8, 128},
+    };
+
+    for (auto const& testCase : cases)
+    {
+        SCOPED_TRACE(::testing::Message() << "batchSize=" << testCase.batchSize << " seqLen=" << testCase.seqLen
+                                          << " numQHeads=" << testCase.numQHeads
+                                          << " numKVHeads=" << testCase.numKVHeads << " headDim=" << testCase.headDim);
+        float const attentionScale = 1.0F / std::sqrt(static_cast<float>(testCase.headDim));
+        runLlmAccuracyCase(testCase.batchSize, testCase.seqLen, testCase.numQHeads, testCase.numKVHeads,
+            testCase.headDim, attentionScale, /*enableSkipSoftmax=*/true);
     }
 }
 

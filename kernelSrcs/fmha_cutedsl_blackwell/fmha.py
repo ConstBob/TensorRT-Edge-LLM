@@ -59,7 +59,7 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import numpy as np
 from cutlass.cute.runtime import from_dlpack
-from cutlass.cute.typing import Float32, Int32, Int64
+from cutlass.cute.typing import Float32, Int8, Int32, Int64
 
 if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -134,6 +134,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         use_sliding_window: bool = False,
         actual_head_dim: Optional[int] = None,
         enable_skip_correction: bool = True,
+        skip_softmax_threshold: Optional[float] = None,
     ):
         """Initializes the configuration for a Blackwell Fused Multi-Head Attention (FMHA) kernel.
 
@@ -198,7 +199,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.is_causal = is_causal
         self.use_sliding_window = use_sliding_window
         self.enable_skip_correction = enable_skip_correction
-
+        # BLASST skip-softmax: None -> disabled (bit-identical dense base kernel).
+        # A float value is the raw lambda; log2 is taken at kernel-build time and
+        # threaded into softmax_step / the MMA-warp P*V skip behind const_expr gates.
+        self.skip_softmax_threshold = skip_softmax_threshold
         self.softmax0_warp_ids = (0, 1, 2, 3)
         self.softmax1_warp_ids = (4, 5, 6, 7)
         self.correction_warp_ids = (8, 9, 10, 11)
@@ -240,6 +244,12 @@ class BlackwellFusedMultiHeadAttentionForward:
         # vec buffer for row_max & row_sum
         self.tmem_vec0_offset = 0
         self.tmem_vec1_offset = 128
+
+        # skip-softmax (BLASST) flag slots: in the vec buffer region, offset past
+        # the 2-float row_max/row_sum data so they collide with neither vec nor P
+        # (P0@32, P1@160). stage0 flag @8, stage1 @136.
+        self.tmem_skip_softmax0_offset = 8
+        self.tmem_skip_softmax1_offset = 136
 
         self.num_regs_softmax = 192
         self.num_regs_correction = 96
@@ -294,6 +304,13 @@ class BlackwellFusedMultiHeadAttentionForward:
         else:
             self.rescale_threshold = 0.0
 
+        # skip-softmax (BLASST): log2 of the lambda threshold, or None to
+        # compile-time eliminate the entire skip path (bit-identical dense base).
+        if self.skip_softmax_threshold is not None:
+            self.skip_softmax_threshold_log2 = math.log2(self.skip_softmax_threshold)
+        else:
+            self.skip_softmax_threshold_log2 = None
+
     @cute.jit
     def __call__(
         self,
@@ -308,6 +325,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         scale_v: Float32,
         inv_scale_o: Float32,
         stream: cuda.CUstream,
+        skip_softmax_count: Optional[cute.Tensor] = None,   # Int32[1]; verify builds only
+        total_softmax_count: Optional[cute.Tensor] = None,  # (perf builds pass None ->
+                                                            #  const_expr removes atomics)
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
@@ -579,6 +599,10 @@ class BlackwellFusedMultiHeadAttentionForward:
             tmem_dealloc_mbar_ptr: cute.struct.MemRange[Int64, 1]
             # Tmem holding buffer
             tmem_holding_buf: Int32
+            # skip-softmax (BLASST): per-warp skip votes exchanged across the 4
+            # warps of each softmax warpgroup (Int8 per warp).
+            s0_warp_wants_skip_softmax_exchange: cute.struct.MemRange[Int8, 4]
+            s1_warp_wants_skip_softmax_exchange: cute.struct.MemRange[Int8, 4]
             # Smem tensors
             sO: cute.struct.Align[
                 cute.struct.MemRange[self.o_dtype, cute.cosize(o_smem_layout_staged)],
@@ -632,6 +656,8 @@ class BlackwellFusedMultiHeadAttentionForward:
             v_smem_layout_staged,
             o_smem_layout_staged,
             self.tile_sched_params,
+            skip_softmax_count,
+            total_softmax_count,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -837,6 +863,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             q_smem_layout_staged, k_smem_layout_staged,
             p_tmem_layout_staged, v_smem_layout_staged,
             o_smem_layout_staged, self.tile_sched_params,
+            None, None,
         ).launch(
             grid=grid, block=[self.threads_per_cta, 1, 1],
             cluster=self.cluster_shape_mnk, stream=stream,
@@ -1045,6 +1072,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             q_smem_layout_staged, k_smem_layout_staged,
             p_tmem_layout_staged, v_smem_layout_staged,
             o_smem_layout_staged, self.tile_sched_params,
+            None, None,
         ).launch(
             grid=grid, block=[self.threads_per_cta, 1, 1],
             cluster=self.cluster_shape_mnk, stream=stream,
@@ -1081,6 +1109,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         v_smem_layout_staged: cute.ComposedLayout,
         o_smem_layout_staged: cute.ComposedLayout,
         tile_sched_params: fmha_utils.FmhaStaticTileSchedulerParams,
+        skip_softmax_count: Optional[cute.Tensor],
+        total_softmax_count: Optional[cute.Tensor],
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1154,6 +1184,23 @@ class BlackwellFusedMultiHeadAttentionForward:
         # Alloc
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
+
+        # skip-softmax (BLASST): per-warp skip-vote exchange buffers in SMEM.
+        # With threshold=None the whole skip path is compile-time eliminated,
+        # keeping the disabled path bit-identical to base.
+        s0_warp_wants_skip_softmax_exchange = None
+        s1_warp_wants_skip_softmax_exchange = None
+        if cutlass.const_expr(self.skip_softmax_threshold is not None):
+            s0_warp_wants_skip_softmax_exchange = (
+                storage.s0_warp_wants_skip_softmax_exchange.get_tensor(
+                    cute.make_layout((4,))
+                )
+            )
+            s1_warp_wants_skip_softmax_exchange = (
+                storage.s1_warp_wants_skip_softmax_exchange.get_tensor(
+                    cute.make_layout((4,))
+                )
+            )
 
         load_q_producer, load_q_consumer = pipeline.PipelineTmaUmma.create(
             num_stages=self.q_stage,
@@ -1640,18 +1687,38 @@ class BlackwellFusedMultiHeadAttentionForward:
                     # this acquire returns the ownership of all of S0 to the mma warp
                     # including the P0 part (inplaced in S0)
                     s0_handle = mma_s0_producer.acquire_and_advance()
-                    # 4. gemm
+                    # 4. gemm (block 0 is never skipped — running max starts at
+                    #    -inf so no valid row can vote skip; this always
+                    #    initializes O0.)
                     num_kphases = cute.size(tOrP0, mode=[2])
-                    for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
-                        kphase_coord = (None, None, kphase_idx)
-                        pv_tiled_mma.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
-                        cute.gemm(
-                            pv_tiled_mma,
-                            tOtO0,
-                            tOrP0[kphase_coord],
-                            tOrVi[kphase_coord],
-                            tOtO0,
-                        )
+                    skip_pv = False
+                    if cutlass.const_expr(self.skip_softmax_threshold is not None):
+                        if not skip_pv:
+                            for kphase_idx in cutlass.range(
+                                num_kphases, unroll_full=True
+                            ):
+                                kphase_coord = (None, None, kphase_idx)
+                                pv_tiled_mma.set(
+                                    tcgen05.Field.ACCUMULATE, kphase_idx != 0
+                                )
+                                cute.gemm(
+                                    pv_tiled_mma,
+                                    tOtO0,
+                                    tOrP0[kphase_coord],
+                                    tOrVi[kphase_coord],
+                                    tOtO0,
+                                )
+                    else:
+                        for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
+                            kphase_coord = (None, None, kphase_idx)
+                            pv_tiled_mma.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
+                            cute.gemm(
+                                pv_tiled_mma,
+                                tOtO0,
+                                tOrP0[kphase_coord],
+                                tOrVi[kphase_coord],
+                                tOtO0,
+                            )
                     # 5. release accumulated O0_partial
                     o0_handle.commit()
                     # End of GEMM_PV00 (P0 * V0 -> O0_partial)
@@ -1701,19 +1768,46 @@ class BlackwellFusedMultiHeadAttentionForward:
                         s1_handle = mma_s1_producer.acquire_and_advance()
                         # 3. gemm
                         inner_num_kphases = cute.size(tOrP0, mode=[2])
-                        for kphase_idx in cutlass.range(
-                            inner_num_kphases, unroll_full=True
-                        ):
-                            kphase_coord = (None, None, kphase_idx)
-                            pv_tiled_mma.set(tcgen05.Field.ACCUMULATE, pv_whether_acc)
-                            cute.gemm(
-                                pv_tiled_mma,
-                                tOtO1,
-                                tOrP1[kphase_coord],
-                                tOrVi[kphase_coord],
-                                tOtO1,
+                        skip_pv = False
+                        if cutlass.const_expr(self.skip_softmax_threshold is not None):
+                            skip_pv = self.get_skip_softmax_flag(
+                                s1_warp_wants_skip_softmax_exchange
                             )
+                            if not skip_pv:
+                                for kphase_idx in cutlass.range(
+                                    inner_num_kphases, unroll_full=True
+                                ):
+                                    kphase_coord = (None, None, kphase_idx)
+                                    pv_tiled_mma.set(
+                                        tcgen05.Field.ACCUMULATE,
+                                        pv_whether_acc or kphase_idx != 0,
+                                    )
+                                    cute.gemm(
+                                        pv_tiled_mma,
+                                        tOtO1,
+                                        tOrP1[kphase_coord],
+                                        tOrVi[kphase_coord],
+                                        tOtO1,
+                                    )
+                            # O1 is accumulated from here on (block 0 never skips,
+                            # so O1 is always initialized before any skip).
                             pv_whether_acc = True
+                        else:
+                            for kphase_idx in cutlass.range(
+                                inner_num_kphases, unroll_full=True
+                            ):
+                                kphase_coord = (None, None, kphase_idx)
+                                pv_tiled_mma.set(
+                                    tcgen05.Field.ACCUMULATE, pv_whether_acc
+                                )
+                                cute.gemm(
+                                    pv_tiled_mma,
+                                    tOtO1,
+                                    tOrP1[kphase_coord],
+                                    tOrVi[kphase_coord],
+                                    tOtO1,
+                                )
+                                pv_whether_acc = True
                         # 4. release accumulated O1_partial
                         o1_handle.commit()
                         # 5. release V(i-1)
@@ -1750,18 +1844,37 @@ class BlackwellFusedMultiHeadAttentionForward:
                         s0_handle = mma_s0_producer.acquire_and_advance()
                         # 4. gemm
                         inner_num_kphases = cute.size(tOrP0, mode=[2])
-                        for kphase_idx in cutlass.range(
-                            inner_num_kphases, unroll_full=True
-                        ):
-                            kphase_coord = (None, None, kphase_idx)
-                            pv_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                            cute.gemm(
-                                pv_tiled_mma,
-                                tOtO0,
-                                tOrP0[kphase_coord],
-                                tOrVi[kphase_coord],
-                                tOtO0,
+                        skip_pv = False
+                        if cutlass.const_expr(self.skip_softmax_threshold is not None):
+                            skip_pv = self.get_skip_softmax_flag(
+                                s0_warp_wants_skip_softmax_exchange
                             )
+                            if not skip_pv:
+                                for kphase_idx in cutlass.range(
+                                    inner_num_kphases, unroll_full=True
+                                ):
+                                    kphase_coord = (None, None, kphase_idx)
+                                    pv_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                                    cute.gemm(
+                                        pv_tiled_mma,
+                                        tOtO0,
+                                        tOrP0[kphase_coord],
+                                        tOrVi[kphase_coord],
+                                        tOtO0,
+                                    )
+                        else:
+                            for kphase_idx in cutlass.range(
+                                inner_num_kphases, unroll_full=True
+                            ):
+                                kphase_coord = (None, None, kphase_idx)
+                                pv_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                                cute.gemm(
+                                    pv_tiled_mma,
+                                    tOtO0,
+                                    tOrP0[kphase_coord],
+                                    tOrVi[kphase_coord],
+                                    tOtO0,
+                                )
                         # 5. release accumulated O0_partial
                         o0_handle.commit()
                         # End of GEMM_PV0i (P0 * Vi -> O0_partial)
@@ -1778,17 +1891,40 @@ class BlackwellFusedMultiHeadAttentionForward:
                     s1_handle = mma_s1_producer.acquire_and_advance()
                     # 3. gemm
                     num_kphases = cute.size(tOrP1, mode=[2])
-                    for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
-                        kphase_coord = (None, None, kphase_idx)
-                        pv_tiled_mma.set(tcgen05.Field.ACCUMULATE, pv_whether_acc)
-                        cute.gemm(
-                            pv_tiled_mma,
-                            tOtO1,
-                            tOrP1[kphase_coord],
-                            tOrVi[kphase_coord],
-                            tOtO1,
+                    skip_pv = False
+                    if cutlass.const_expr(self.skip_softmax_threshold is not None):
+                        skip_pv = self.get_skip_softmax_flag(
+                            s1_warp_wants_skip_softmax_exchange
                         )
+                        if not skip_pv:
+                            for kphase_idx in cutlass.range(
+                                num_kphases, unroll_full=True
+                            ):
+                                kphase_coord = (None, None, kphase_idx)
+                                pv_tiled_mma.set(
+                                    tcgen05.Field.ACCUMULATE,
+                                    pv_whether_acc or kphase_idx != 0,
+                                )
+                                cute.gemm(
+                                    pv_tiled_mma,
+                                    tOtO1,
+                                    tOrP1[kphase_coord],
+                                    tOrVi[kphase_coord],
+                                    tOtO1,
+                                )
                         pv_whether_acc = True
+                    else:
+                        for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
+                            kphase_coord = (None, None, kphase_idx)
+                            pv_tiled_mma.set(tcgen05.Field.ACCUMULATE, pv_whether_acc)
+                            cute.gemm(
+                                pv_tiled_mma,
+                                tOtO1,
+                                tOrP1[kphase_coord],
+                                tOrVi[kphase_coord],
+                                tOtO1,
+                            )
+                            pv_whether_acc = True
                     # 4. commit accumulated O1
                     o1_handle.commit()
                     # 5. release Vi_end
@@ -1979,6 +2115,10 @@ class BlackwellFusedMultiHeadAttentionForward:
                 s0_s1_sequence_consumer=s0_s1_sequence_consumer,
                 s0_s1_sequence_producer=s0_s1_sequence_producer,
                 tile_sched_params=tile_sched_params,
+                skip_softmax_threshold_log2=self.skip_softmax_threshold_log2,
+                warp_wants_skip_softmax_exchange=s0_warp_wants_skip_softmax_exchange,
+                skip_softmax_count=skip_softmax_count,
+                total_softmax_count=total_softmax_count,
             )
             cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr)
 
@@ -2009,6 +2149,10 @@ class BlackwellFusedMultiHeadAttentionForward:
                 s0_s1_sequence_consumer=s0_s1_sequence_consumer,
                 s0_s1_sequence_producer=s0_s1_sequence_producer,
                 tile_sched_params=tile_sched_params,
+                skip_softmax_threshold_log2=self.skip_softmax_threshold_log2,
+                warp_wants_skip_softmax_exchange=s1_warp_wants_skip_softmax_exchange,
+                skip_softmax_count=skip_softmax_count,
+                total_softmax_count=total_softmax_count,
             )
             cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr)
 
@@ -2259,6 +2403,71 @@ class BlackwellFusedMultiHeadAttentionForward:
             cute.copy(copy_atom_stg, thrS, thrC, pred=frgPred)
 
     @cute.jit
+    def get_skip_softmax_flag(self, warp_wants_skip_softmax_exchange):
+        """MMA-warp side of skip-softmax: read the 4 per-warp vote bytes the softmax
+        warpgroup published to the SMEM exchange buffer as one Int32 (the
+        softmax->MMA pipeline release/acquire orders the stores) and skip this
+        tile's P*V only when all 4 warps agreed — P is then exactly zeros."""
+        votes_i32 = cute.make_tensor(
+            cute.recast_ptr(
+                warp_wants_skip_softmax_exchange.iterator, dtype=cutlass.Int32
+            ),
+            cute.make_layout((1,)),
+        )
+        votes = cute.arch.make_warp_uniform(votes_i32[0])
+        return cute.arch.popc(votes) == 4
+
+    @cute.jit
+    def calculate_skip_softmax_flag(
+        self,
+        row_max,
+        tile_row_max,
+        scale_softmax_log2,
+        skip_softmax_threshold_log2,
+        thread_idx,
+        row_is_oob,
+        warp_wants_skip_softmax_exchange,
+        skip_softmax_count,
+        total_softmax_count,
+    ):
+        """Softmax-warpgroup side of skip-softmax (BLASST). Skip the current KV
+        block when its local row-max is below the running global row-max by more
+        than ln(lambda):  (tile_row_max - row_max) * scale_log2 < threshold_log2.
+        Per-thread predicate reduced to a PER-WARP vote (32 rows); each warp
+        publishes its vote byte to the SMEM exchange buffer. A skipped warp leaves
+        row_max unchanged so O/l need no rescale.
+        :return: (warp_wants_skip, row_max)
+        """
+        thread_wants_skip = (
+            (tile_row_max - row_max) * scale_softmax_log2
+        ) < skip_softmax_threshold_log2
+        # Rows past the end of the query sequence never contribute; treat them as
+        # wanting to skip so they don't veto a warp-level skip. row_is_oob is
+        # KV-tile-invariant (depends only on the query row + seqlen_q) so it is
+        # computed ONCE per work-tile in softmax() and threaded in, removing an
+        # add+compare+OR from every enabled KV tile on the bound softmax warp.
+        thread_wants_skip = thread_wants_skip or row_is_oob
+        warp_wants_skip = cute.arch.vote_all_sync(thread_wants_skip)
+
+        with cute.arch.elect_one():
+            warp_wants_skip_softmax_exchange[cute.arch.warp_idx() % 4] = warp_wants_skip
+
+        if not warp_wants_skip:
+            row_max = cute.arch.fmax(row_max, tile_row_max)
+
+        if cutlass.const_expr(skip_softmax_count is not None):
+            # Exclude fully-OOB row-blocks (phantom stage visits past seqlen_q):
+            # they always vote skip by construction and would inflate the ratio
+            # (e.g. S=128 reads 0.50 instead of the true 0.00).
+            warp_all_oob = cute.arch.vote_all_sync(row_is_oob)
+            if not warp_all_oob:
+                if thread_idx % 32 == 0:
+                    if warp_wants_skip:
+                        cute.arch.atomic_add(skip_softmax_count.iterator.llvm_ptr, Int32(1))
+                    cute.arch.atomic_add(total_softmax_count.iterator.llvm_ptr, Int32(1))
+        return warp_wants_skip, row_max
+
+    @cute.jit
     def softmax_step(
         self,
         stage: int,
@@ -2311,10 +2520,18 @@ class BlackwellFusedMultiHeadAttentionForward:
         :return: Updated state values (row_max, row_sum, and pipeline related arguments)
         :rtype: tuple
         """
-        cS, row_max, row_sum, vec_i_handle = iter_args
-        seqlen_k, seqlen_q, scale_softmax_log2, window_size_left, window_size_right = (
-            value_args
-        )
+        cS, row_max, row_max_true, row_sum, vec_i_handle = iter_args
+        (
+            seqlen_k,
+            seqlen_q,
+            scale_softmax_log2,
+            window_size_left,
+            window_size_right,
+            skip_softmax_threshold_log2,
+            thread_idx,
+            logical_offset,
+            row_is_oob,
+        ) = value_args
         (
             mma_si_consumer,
             si_corr_producer,
@@ -2334,7 +2551,12 @@ class BlackwellFusedMultiHeadAttentionForward:
             tTMEM_LOADtS,
             tTMEM_STORE_VECtS,
             tTMEM_STOREtS_x4,
+            tTMEM_STORE_SKIP_SOFTMAX,
+            warp_wants_skip_softmax_exchange,
+            skip_softmax_count,
+            total_softmax_count,
         ) = tensor_args
+        enable_skip_softmax = skip_softmax_threshold_log2 is not None
 
         tilePlikeFP32 = self.qk_mma_tiler[1] // Float32.width * self.o_dtype.width
         tScS = qk_thr_mma.partition_C(cS)
@@ -2365,7 +2587,51 @@ class BlackwellFusedMultiHeadAttentionForward:
             )
 
         old_row_max = row_max
-        row_max = tTMEM_LOADrS.load().reduce(cute.ReductionOp.MAX, row_max, 0)
+        # Python False when skip disabled; a runtime Boolean on the enabled path.
+        skip_softmax = False
+        if cutlass.const_expr(not enable_skip_softmax):
+            row_max = tTMEM_LOADrS.load().reduce(cute.ReductionOp.MAX, row_max, 0)
+            row_max_true = row_max
+        else:
+            # Local (block) max, then block-level skip decision.
+            tile_row_max = tTMEM_LOADrS.load().reduce(
+                cute.ReductionOp.MAX, -cutlass.Float32.inf, 0
+            )
+            # The predicate must see the TRUE running max. With skip-correction on
+            # (rescale_threshold > 0) the carried row_max is the lagged
+            # normalization point (trails true max by up to rescale_threshold
+            # log2-units) which would make lambda in (0,1) never fire — so track a
+            # separate row_max_true for the predicate.
+            if cutlass.const_expr(self.rescale_threshold > 0.0):
+                skip_softmax, row_max_true = self.calculate_skip_softmax_flag(
+                    row_max_true,
+                    tile_row_max,
+                    scale_softmax_log2,
+                    skip_softmax_threshold_log2,
+                    thread_idx,
+                    row_is_oob,
+                    warp_wants_skip_softmax_exchange,
+                    skip_softmax_count,
+                    total_softmax_count,
+                )
+                # Normalization chain: same update on the carried (possibly
+                # lagged) row_max, which the rescale below may rewind.
+                if not skip_softmax:
+                    row_max = cute.arch.fmax(row_max, tile_row_max)
+            else:
+                # Skip-correction off: carried row_max IS the true max.
+                skip_softmax, row_max = self.calculate_skip_softmax_flag(
+                    row_max,
+                    tile_row_max,
+                    scale_softmax_log2,
+                    skip_softmax_threshold_log2,
+                    thread_idx,
+                    row_is_oob,
+                    warp_wants_skip_softmax_exchange,
+                    skip_softmax_count,
+                    total_softmax_count,
+                )
+                row_max_true = row_max
         row_max_safe = row_max
         if row_max == -cutlass.Float32.inf:
             row_max_safe = 0.0
@@ -2410,21 +2676,46 @@ class BlackwellFusedMultiHeadAttentionForward:
         acc_scale = 1.0
         if old_row_max != row_max_safe:
             acc_scale = cute.math.exp2(acc_scale_, fastmath=True)
-        row_sum *= acc_scale
-        for j in range(frg_cnt):
-            for k in cutlass.range(
-                cute.size(tTMEM_LOADrS_frg, mode=[0]), vectorize=True
-            ):
-                tTMEM_LOADrS_frg[k, j] = (
-                    tTMEM_LOADrS_frg[k, j] * scale + minus_row_max_scale
-                )
-                tTMEM_LOADrS_frg[k, j] = cute.math.exp2(
-                    tTMEM_LOADrS_frg[k, j], fastmath=True
-                )
 
-            s_vec = tTMEM_LOADrS_frg[None, j].load()
-            row_sum = s_vec.reduce(cute.ReductionOp.ADD, row_sum, 0)
-            tTMEM_STORErS_x4_e_frg[None, j].store(s_vec.to(self.q_dtype))
+        # Compute P unless this warp's 32 rows are skipped. Skip-specific code is
+        # const_expr-guarded so the disabled path is byte-identical to base.
+        if cutlass.const_expr(enable_skip_softmax):
+            if skip_softmax:
+                # Skipped warp: row_max unchanged => O/l rescale identity. No exp,
+                # no row_sum update; zero-fill P rows so the whole-tile P*V skip
+                # elides a GEMM of exact zeros.
+                tTMEM_STORErS_x4.fill(0.0)
+            else:
+                row_sum *= acc_scale
+                for j in range(frg_cnt):
+                    for k in cutlass.range(
+                        cute.size(tTMEM_LOADrS_frg, mode=[0]), vectorize=True
+                    ):
+                        tTMEM_LOADrS_frg[k, j] = (
+                            tTMEM_LOADrS_frg[k, j] * scale + minus_row_max_scale
+                        )
+                        tTMEM_LOADrS_frg[k, j] = cute.math.exp2(
+                            tTMEM_LOADrS_frg[k, j], fastmath=True
+                        )
+                    s_vec = tTMEM_LOADrS_frg[None, j].load()
+                    row_sum = s_vec.reduce(cute.ReductionOp.ADD, row_sum, 0)
+                    tTMEM_STORErS_x4_e_frg[None, j].store(s_vec.to(self.q_dtype))
+        else:
+            row_sum *= acc_scale
+            for j in range(frg_cnt):
+                for k in cutlass.range(
+                    cute.size(tTMEM_LOADrS_frg, mode=[0]), vectorize=True
+                ):
+                    tTMEM_LOADrS_frg[k, j] = (
+                        tTMEM_LOADrS_frg[k, j] * scale + minus_row_max_scale
+                    )
+                    tTMEM_LOADrS_frg[k, j] = cute.math.exp2(
+                        tTMEM_LOADrS_frg[k, j], fastmath=True
+                    )
+
+                s_vec = tTMEM_LOADrS_frg[None, j].load()
+                row_sum = s_vec.reduce(cute.ReductionOp.ADD, row_sum, 0)
+                tTMEM_STORErS_x4_e_frg[None, j].store(s_vec.to(self.q_dtype))
         # Sequence barrier arrive
         if cutlass.const_expr(stage == 0):
             sequence_producer_handle.commit()
@@ -2446,6 +2737,7 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         return (
             carried_row_max,
+            row_max_true,
             row_sum,
             vec_i_handle,
             mma_si_consumer,
@@ -2474,6 +2766,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         s0_s1_sequence_consumer: pipeline.PipelineConsumer,
         s0_s1_sequence_producer: pipeline.PipelineProducer,
         tile_sched_params: fmha_utils.FmhaStaticTileSchedulerParams,
+        skip_softmax_threshold_log2: Optional[Float32] = None,
+        warp_wants_skip_softmax_exchange: Optional[cute.Tensor] = None,
+        skip_softmax_count: Optional[cute.Tensor] = None,
+        total_softmax_count: Optional[cute.Tensor] = None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -2567,6 +2863,20 @@ class BlackwellFusedMultiHeadAttentionForward:
         thr_tmem_store_vec = tiled_tmem_store_vec.get_slice(thread_idx)
         tTMEM_STORE_VECtS = thr_tmem_store_vec.partition_D(tStS_vec)
         tTMEM_STORE_VECcS = thr_tmem_store_vec.partition_S(tScS_vec)
+        # skip-softmax flag slot (BLASST): a 2-elem view into the vec buffer
+        # region, offset past row_max/row_sum.
+        enable_skip_softmax = skip_softmax_threshold_log2 is not None
+        tTMEM_STORE_SKIP_SOFTMAX = None
+        if cutlass.const_expr(enable_skip_softmax):
+            tmem_skip_softmax_offset = (
+                self.tmem_skip_softmax0_offset
+                if stage == 0
+                else self.tmem_skip_softmax1_offset
+            )
+            tStS_skip_softmax = cute.make_tensor(
+                tStS.iterator + tmem_skip_softmax_offset, tStS_vec_layout
+            )
+            tTMEM_STORE_SKIP_SOFTMAX = thr_tmem_store_vec.partition_D(tStS_skip_softmax)
         tmem_store_atom = cute.make_copy_atom(
             tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)),
             self.qk_acc_dtype,
@@ -2602,13 +2912,32 @@ class BlackwellFusedMultiHeadAttentionForward:
                     cuseqlen_k = cum_seqlen_k[batch_coord]
                     seqlen_k_ = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
                 row_max = -Float32.inf
+                # True running max for the skip-softmax predicate; never rewound
+                # by skip-correction (unlike row_max, the normalization point).
+                row_max_true = -Float32.inf
                 row_sum = 0.0
+                logical_offset = (
+                    curr_block_coord[0] * self.cta_tiler[0]
+                    + stage * self.qk_mma_tiler[0],
+                    0,
+                )
+                # KV-tile-invariant OOB-row predicate: hoisted out of the
+                # per-KV-tile skip flag calc (was recomputed every tile). Only
+                # meaningful on the enabled path; guarded so the disabled path
+                # stays byte-identical to base.
+                row_is_oob = False
+                if cutlass.const_expr(skip_softmax_threshold_log2 is not None):
+                    row_is_oob = (logical_offset[0] + thread_idx) >= seqlen_q_
                 value_args = (
                     seqlen_k_,
                     seqlen_q_,
                     scale_softmax_log2,
                     window_size_left,
                     window_size_right,
+                    skip_softmax_threshold_log2,
+                    thread_idx,
+                    logical_offset,
+                    row_is_oob,
                 )
                 atom_args = (
                     qk_thr_mma,
@@ -2623,13 +2952,12 @@ class BlackwellFusedMultiHeadAttentionForward:
                     tTMEM_LOADtS,
                     tTMEM_STORE_VECtS,
                     tTMEM_STOREtS_x4,
+                    tTMEM_STORE_SKIP_SOFTMAX,
+                    warp_wants_skip_softmax_exchange,
+                    skip_softmax_count,
+                    total_softmax_count,
                 )
 
-                logical_offset = (
-                    curr_block_coord[0] * self.cta_tiler[0]
-                    + stage * self.qk_mma_tiler[0],
-                    0,
-                )
                 cS = cute.domain_offset(logical_offset, cS_base)
                 vec_i_handle = si_corr_producer.acquire_and_advance()
 
@@ -2655,7 +2983,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                     start_count, start_count + leading_mask_count, 1, unroll=1
                 ):
                     cS_iter = cute.domain_offset((0, i * self.qk_mma_tiler[1]), cS)
-                    iter_args = (cS_iter, row_max, row_sum, vec_i_handle)
+                    iter_args = (cS_iter, row_max, row_max_true, row_sum, vec_i_handle)
                     pipeline_args = (
                         mma_si_consumer,
                         si_corr_producer,
@@ -2664,6 +2992,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                     )
                     (
                         row_max,
+                        row_max_true,
                         row_sum,
                         vec_i_handle,
                         mma_si_consumer,
@@ -2695,7 +3024,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                     unroll=1,
                 ):
                     cS_iter = cute.domain_offset((0, i * self.qk_mma_tiler[1]), cS)
-                    iter_args = (cS_iter, row_max, row_sum, vec_i_handle)
+                    iter_args = (cS_iter, row_max, row_max_true, row_sum, vec_i_handle)
                     pipeline_args = (
                         mma_si_consumer,
                         si_corr_producer,
@@ -2704,6 +3033,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                     )
                     (
                         row_max,
+                        row_max_true,
                         row_sum,
                         vec_i_handle,
                         mma_si_consumer,
@@ -2739,7 +3069,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                     unroll=1,
                 ):
                     cS_iter = cute.domain_offset((0, i * self.qk_mma_tiler[1]), cS)
-                    iter_args = (cS_iter, row_max, row_sum, vec_i_handle)
+                    iter_args = (cS_iter, row_max, row_max_true, row_sum, vec_i_handle)
                     pipeline_args = (
                         mma_si_consumer,
                         si_corr_producer,
@@ -2748,6 +3078,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                     )
                     (
                         row_max,
+                        row_max_true,
                         row_sum,
                         vec_i_handle,
                         mma_si_consumer,
@@ -6065,6 +6396,9 @@ def run(
     vit_mode: bool = False,
     enable_skip_correction: bool = True,
     paged_kv: bool = False,
+    skip_softmax_threshold: Optional[float] = None,
+    load_qkv: Optional[str] = None,
+    prefill_test_rounds: int = 3,
     **kwargs,
 ):
     """Execute Fused Multi-Head Attention (FMHA) on Blackwell architecture and validate results.
@@ -6315,6 +6649,29 @@ def run(
     else:
         lse_cp = None
 
+    # Replay captured real activations instead of the synthetic randint
+    # data: npz with q (B,Hq,S,D),
+    # k/v (B,Hkv,S,D), fp16. Random data never triggers threshold-driven
+    # skip-softmax (tile max ~ running max everywhere), so perf/sparsity
+    # measurements require real Q/K distributions.
+    if load_qkv is not None:
+        assert in_dtype == cutlass.Float16, "--load_qkv supports fp16 only"
+        _cap = np.load(load_qkv)
+        _q = _cap["q"].astype(np.float32)[:, :, :s_q]  # (B, Hq, S, D)
+        _k = _cap["k"].astype(np.float32)[:, :, :s_k]  # (B, Hkv, S, D)
+        _v = _cap["v"].astype(np.float32)[:, :, :s_k]
+        assert _q.shape == (b, h_r * h_k, s_q, d), \
+            f"--load_qkv q shape {_q.shape} != expected {(b, h_r * h_k, s_q, d)}"
+        assert _k.shape == (b, h_k, s_k, d), \
+            f"--load_qkv k shape {_k.shape} != expected {(b, h_k, s_k, d)}"
+        _q_bshd = np.ascontiguousarray(np.transpose(_q, (0, 2, 1, 3)))
+        q_cp[:] = cp.asarray(_q_bshd.astype(np.float16))
+        kvcache_cp[:, 0] = cp.asarray(_k.astype(np.float16))
+        kvcache_cp[:, 1] = cp.asarray(_v.astype(np.float16))
+        q_ref = _q_bshd
+        kvcache_ref = np.stack([_k, _v], axis=1)
+        print(f"[fmha] loaded real Q/K/V from {load_qkv}")
+
     # SM100 tcgen05.mma atom K = 256 bits / element_bits.  For fp16: 16 elems.
     # The MMA tiler K must be a multiple of this atom.  Non-aligned dims like
     # 72 are padded up (→ 80); TMA ZFILL/OOB-drop bridge the gap at zero cost.
@@ -6375,22 +6732,50 @@ def run(
         raise NotImplementedError("paged_kv mode currently supports AOT export only")
     if d == 256 and vit_mode:
         raise ValueError("head dimension 256 is not supported in ViT mode")
-    fmha_cls = (
-        BlackwellFusedMultiHeadAttentionForwardD256
-        if d == 256
-        else BlackwellFusedMultiHeadAttentionForward
-    )
-    fmha = fmha_cls(
-        qk_acc_dtype,
-        pv_acc_dtype,
-        mma_tiler,
-        is_persistent,
-        mask_type,
-        is_causal=(is_causal and not vit_mode),
-        use_sliding_window=(use_sliding_window and not vit_mode),
-        actual_head_dim=actual_head_dim,
-        enable_skip_correction=enable_skip_correction,
-    )
+    # skip-softmax (BLASST) is a single switch: setting the threshold activates
+    # the whole gated feature (skip predicate + vote + P*V skip) and forces
+    # skip-correction OFF (mutually exclusive with the skip predicate:
+    # correction carries a lagged row max). threshold=None
+    # compiles all of it out -- bit-identical to the dense kernel.
+    # Note: skip-softmax is only implemented for d64/d128; D256 falls through
+    # to its own class path below.
+    if skip_softmax_threshold is not None:
+        fmha = BlackwellFusedMultiHeadAttentionForward(
+            qk_acc_dtype,
+            pv_acc_dtype,
+            mma_tiler,
+            is_persistent,
+            mask_type,
+            is_causal=(is_causal and not vit_mode),
+            use_sliding_window=(use_sliding_window and not vit_mode),
+            actual_head_dim=actual_head_dim,
+            enable_skip_correction=False,
+            skip_softmax_threshold=skip_softmax_threshold,
+        )
+    elif d == 256:
+        fmha = BlackwellFusedMultiHeadAttentionForwardD256(
+            qk_acc_dtype,
+            pv_acc_dtype,
+            mma_tiler,
+            is_persistent,
+            mask_type,
+            is_causal=(is_causal and not vit_mode),
+            use_sliding_window=(use_sliding_window and not vit_mode),
+            actual_head_dim=actual_head_dim,
+            enable_skip_correction=enable_skip_correction,
+        )
+    else:
+        fmha = BlackwellFusedMultiHeadAttentionForward(
+            qk_acc_dtype,
+            pv_acc_dtype,
+            mma_tiler,
+            is_persistent,
+            mask_type,
+            is_causal=(is_causal and not vit_mode),
+            use_sliding_window=(use_sliding_window and not vit_mode),
+            actual_head_dim=actual_head_dim,
+            enable_skip_correction=enable_skip_correction,
+        )
 
     # Initialize Stream
     current_stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
@@ -6734,7 +7119,10 @@ def run(
             0.13 if (out_dtype.is_float and out_dtype.width <= 8) else tolerance
         )
         if not isinstance(s_q, tuple) and not isinstance(s_k, tuple):
-            _num_rounds = 3
+            # rounds=1 => single-shot prefill (past_kv=0), the SAME scenario the
+            # perf benchmark measures — use it to accuracy-check the perf lambda.
+            # rounds>=2 grows the KV cache (lambda should shrink per a/L).
+            _num_rounds = prefill_test_rounds
             _prefill_seq = min(s_q, s_k)
             _cap = _prefill_seq * _num_rounds
             print(f"{_tag} Running LLM multi-round prefill test "
@@ -6758,6 +7146,8 @@ def run(
                                      else -1),
                 attention_scale=scale_softmax,
                 tolerance=llm_prefill_tolerance,
+                skip_softmax_threshold=skip_softmax_threshold,
+                qkv_npz=load_qkv,
             )
             print(f"{_tag} LLM multi-round prefill test passed.")
 
@@ -6847,6 +7237,8 @@ def run_llm_multi_round_prefill_test(
     window_size_left_val: int = -1,
     attention_scale: Optional[float] = None,
     tolerance: float = 0.1,
+    skip_softmax_threshold: Optional[float] = None,
+    qkv_npz: Optional[str] = None,
 ):
     """LLM FMHA multi-round prefill accuracy test aligned with plugin unit test.
 
@@ -6912,14 +7304,58 @@ def run_llm_multi_round_prefill_test(
     if bottom_right_align:
         mask_type = fmha_utils.MaskEnum.WINDOW_MASK_INFERENCE
 
-    fmha_op = BlackwellFusedMultiHeadAttentionForward(
-        Float32, Float32, (*mma_tiler_mn, padded_d),
-        is_persistent, mask_type, use_sliding_window=use_sliding_window,
-        is_causal=is_causal,
-        actual_head_dim=actual_head_dim,
-    )
+    # Real-activation replay for the accuracy test: randint data produces ~no
+    # threshold skips, silently reducing the test to the dense path.
+    real_q = real_k = real_v = None
+    if qkv_npz is not None:
+        _capd = np.load(qkv_npz)
+        real_q = _capd["q"].astype(np.float32)  # (B, Hq, S, D)
+        real_k = _capd["k"].astype(np.float32)  # (B, Hkv, S, D)
+        real_v = _capd["v"].astype(np.float32)
+        assert real_q.shape[0] == b and real_q.shape[1] == h_q \
+            and real_k.shape[1] == h_k and real_q.shape[3] == d, \
+            f"qkv_npz shape mismatch: q{real_q.shape} vs (b={b},h_q={h_q},d={d})"
+        assert real_q.shape[2] >= num_rounds * seq_len, \
+            f"qkv_npz too short: {real_q.shape[2]} < {num_rounds * seq_len}"
+
+    # skip-softmax single switch (see run()): threshold activates the gated
+    # feature and forces skip-correction semantics; None = dense bit-identical.
+    if skip_softmax_threshold is not None and skip_softmax_threshold > 0:
+        # NOTE: the dense tolerance is NOT relaxed for skip. Calibrate lambda
+        # per lambda=a/L against it — with a growing KV cache (rounds>=2) the
+        # effective L is rounds*seq_len, so use the cache-scenario lambda
+        # (e.g. 0.002 passes all rounds at 0.1 on both models' real data;
+        # single-shot ceilings are higher: q05b 0.03/0.01/0.003,
+        # q17b 0.01/0.002/0.001 for S=512/2048/4096).
+        print(f"[multi-round] skip-softmax ENABLED for accuracy test: "
+              f"lambda={skip_softmax_threshold} (tolerance {tolerance})")
+        fmha_op = BlackwellFusedMultiHeadAttentionForward(
+            Float32, Float32, (*mma_tiler_mn, padded_d),
+            is_persistent, mask_type, use_sliding_window=use_sliding_window,
+            is_causal=is_causal,
+            actual_head_dim=actual_head_dim,
+            enable_skip_correction=False,
+            skip_softmax_threshold=skip_softmax_threshold,
+        )
+    else:
+        fmha_op = BlackwellFusedMultiHeadAttentionForward(
+            Float32, Float32, (*mma_tiler_mn, padded_d),
+            is_persistent, mask_type, use_sliding_window=use_sliding_window,
+            is_causal=is_causal,
+            actual_head_dim=actual_head_dim,
+        )
     current_stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
     _wsl = Int32(window_size_left_val) if use_sliding_window else Int32(0)
+
+    # skip counters: verify-only instrumentation (perf builds pass None and the
+    # kernel compiles the atomics out).
+    _skip_cnt_cp = _total_cnt_cp = None
+    _skip_cnt_t = _total_cnt_t = None
+    if skip_softmax_threshold is not None and skip_softmax_threshold > 0:
+        _skip_cnt_cp = cp.zeros(1, dtype=cp.int32)
+        _total_cnt_cp = cp.zeros(1, dtype=cp.int32)
+        _skip_cnt_t = from_dlpack(_skip_cnt_cp, assumed_align=16)
+        _total_cnt_t = from_dlpack(_total_cnt_cp, assumed_align=16)
 
     # ---- helpers ----
     def _to_cute(arr, element_type):
@@ -6962,12 +7398,24 @@ def run_llm_multi_round_prefill_test(
               f"(pos={current_pos}, s_k={effective_kv_len}, cap={cap}) ---")
 
         # ---- generate new Q and K/V for this round ----
-        q_np = np.random.randint(-2, 2,
-                                  (b, seq_len, h_q, d)).astype(np.float32)
-        new_k_np = np.random.randint(-2, 2,
-                                      (b, h_k, seq_len, d)).astype(np.float32)
-        new_v_np = np.random.randint(-2, 2,
-                                      (b, h_k, seq_len, d)).astype(np.float32)
+        if real_q is not None:
+            lo, hi = current_pos, current_pos + seq_len
+            # Round-trip through fp16 so the numpy reference sees exactly the
+            # values the kernel receives.
+            q_np = np.ascontiguousarray(
+                np.transpose(real_q[:, :, lo:hi], (0, 2, 1, 3))
+            ).astype(np.float16).astype(np.float32)
+            new_k_np = np.ascontiguousarray(
+                real_k[:, :, lo:hi]).astype(np.float16).astype(np.float32)
+            new_v_np = np.ascontiguousarray(
+                real_v[:, :, lo:hi]).astype(np.float16).astype(np.float32)
+        else:
+            q_np = np.random.randint(-2, 2,
+                                      (b, seq_len, h_q, d)).astype(np.float32)
+            new_k_np = np.random.randint(-2, 2,
+                                          (b, h_k, seq_len, d)).astype(np.float32)
+            new_v_np = np.random.randint(-2, 2,
+                                          (b, h_k, seq_len, d)).astype(np.float32)
 
         # write new K/V into cache at [current_pos : current_pos + seq_len]
         kv_np[:, 0, :, current_pos:current_pos + seq_len, :] = new_k_np
@@ -6997,6 +7445,7 @@ def run_llm_multi_round_prefill_test(
                 fmha_op, q_t, kv_t, o_t, cu_kv, _wsl,
                 _attention_scale, _scale_q, _scale_k, _scale_v, _inv_scale_o,
                 current_stream,
+                _skip_cnt_t, _total_cnt_t,
             )
             print(f"{_tag} Compilation time: "
                   f"{time.time() - start_time:.4f}s")
@@ -7006,6 +7455,7 @@ def run_llm_multi_round_prefill_test(
             q_t, kv_t, o_t, cu_kv, _wsl,
             _attention_scale, _scale_q, _scale_k, _scale_v, _inv_scale_o,
             current_stream,
+            _skip_cnt_t, _total_cnt_t,
         )
 
         # ---- read output ----
@@ -7061,6 +7511,10 @@ def run_llm_multi_round_prefill_test(
         current_pos += seq_len
 
     if all_pass:
+        if _skip_cnt_cp is not None:
+            _s, _tot = int(_skip_cnt_cp.get()[0]), int(_total_cnt_cp.get()[0])
+            _r = (_s / _tot) if _tot else 0.0
+            print(f"{_tag} skip-softmax ratio: {_s}/{_tot} = {_r:.4f}")
         print(f"\n{_tag} All {num_rounds} rounds passed.")
     else:
         raise AssertionError(f"{_tag} Some rounds failed accuracy check!")
@@ -7311,6 +7765,35 @@ if __name__ == "__main__":
         "Requires tokens_per_page == K tile width (128).",
     )
 
+    parser.add_argument(
+        "--load_qkv",
+        type=str,
+        default=None,
+        help="Replay captured real Q/K/V activations from an npz "
+        "(keys q: (B,Hq,S,D), k/v: (B,Hkv,S,D), fp16) instead of synthetic "
+        "randint data. Required for meaningful skip-softmax sparsity/perf "
+        "measurements.",
+    )
+
+    parser.add_argument(
+        "--prefill_test_rounds",
+        type=int,
+        default=3,
+        help="Rounds for the LLM multi-round prefill accuracy test. 1 = "
+        "single-shot (past_kv=0, matches the perf benchmark scenario); "
+        ">=2 grows the KV cache across rounds (calibrate lambda per a/L).",
+    )
+
+    parser.add_argument(
+        "--skip_softmax_threshold",
+        type=float,
+        default=None,
+        help="Enable skip-softmax (BLASST). lambda in (0,1); the kernel skips "
+        "a KV block when exp(scale*(block_max - running_max)) < lambda, and "
+        "the gated feature package (per-warp vote, P*V skip) activates "
+        "with it. None/unset = dense, bit-identical.",
+    )
+
     args = parser.parse_args()
 
     if cp.cuda.runtime.getDeviceCount() == 0:
@@ -7364,6 +7847,9 @@ if __name__ == "__main__":
         vit_mode=args.vit_mode,
         enable_skip_correction=args.enable_skip_correction,
         paged_kv=args.paged_kv,
+        skip_softmax_threshold=args.skip_softmax_threshold,
+        load_qkv=args.load_qkv,
+        prefill_test_rounds=args.prefill_test_rounds,
     )
 
     if latency is not None:

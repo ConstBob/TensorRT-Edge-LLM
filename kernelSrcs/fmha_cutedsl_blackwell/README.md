@@ -325,12 +325,128 @@ and integration into TensorRT Edge-LLM:
   separate Q/K/V and bidirectional (non-causal) attention for vision
   transformer workloads.
 
-## 5. File Map
+
+## 5. Skip-Softmax (BLASST) Threshold Calibration
+
+The kernel implements BLASST skip-softmax ([arXiv:2512.12087](https://arxiv.org/abs/2512.12087)):
+with `skip_softmax_threshold` (lambda) set at construction, a KV tile whose local
+row max falls below the running max by more than `ln(lambda)` is skipped whole
+(exp / row-sum / P*V elided). `None` (default) compiles the feature out — the
+kernel is bit-identical to the dense build. Restricted to plain causal attention
+(constructor assert; no sliding window, no ViT/bidirectional) and used by the
+prefill/context path only.
+
+`calibrate_skip_softmax.py` covers the full lambda lifecycle with two
+subcommands and staged, verbose output:
+
+```
+calibrate (default) ── ModelOpt official calibration ──▶ a, b, deploy lambda
+      │                                                        │
+      │                                    bake lambda into build_cutedsl.py,
+      │                                    rebuild artifact + relink (manual)
+      ▼                                                        ▼
+evaluate ── RULER accuracy of the deployed engine ──▶ PASS/FAIL + recommendation
+```
+
+### `calibrate` — lambda via ModelOpt (official)
+
+A fixed lambda yields wildly different sparsity across context lengths, so the
+threshold follows `lambda = scale_factor / L` with a model-specific scale
+factor. The subcommand wraps the official calibration in
+`modelopt.torch.sparsity.attention_sparsity` (the same machinery behind
+TensorRT-LLM's `threshold_scale_factor`): ModelOpt auto-generates a RULER
+calibration set (default 24 samples across power-of-2 length bins), runs one
+forward pass evaluating 20 built-in threshold trials at once, and fits
+`scale_factor = a * exp(b * sparsity)` with scipy. Requires `torch`,
+`transformers`, `nvidia-modelopt`, `scipy`, `wonderwords`; the model loads
+with `attn_implementation="eager"`.
+
+```bash
+python kernelSrcs/fmha_cutedsl_blackwell/calibrate_skip_softmax.py calibrate \
+    --model-dir /path/to/Qwen3-1.7B --max-seqlen 4096 \
+    --target-sparsity 0.3 0.5 --max-context 4096 \
+    --cache-dir /path/with/room/modelopt-cache   # RULER gen cache; ModelOpt
+                                                 # defaults to ~/.cache (quota!)
+# [calibrate 1/3] load model ... [calibrate 2/3] ModelOpt calibration
+#   (library output is dim and '│'-indented, this tool's lines are plain)
+# [calibrate 3/3] fitted parameters and deployment thresholds
+# ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+# ┃ a = 115.037   b = 4.6992   R^2 = 0.733   (278 points)         ┃
+# ┃ observed sparsity range: [10.3%, 74.7%]  (beyond = extrapolated)
+# ┃ target  30%  max_ctx 4096    lambda = 0.115008  (log2 -3.12)  ┃
+# ┃ target  50%  max_ctx 4096    lambda = 0.294372  (log2 -1.76)  ┃
+# ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+```
+
+ModelOpt's sparsity is a simulated, all-layers-pooled metric — the deployed
+kernel's per-layer skip ratio at the same lambda can differ substantially.
+Treat the calibrated lambda as the ecosystem-consistent starting point and let
+`evaluate` arbitrate which target actually deploys.
+
+### Deploying a candidate lambda
+
+`lambda` is baked at AOT-compile time (there is no runtime knob): add
+`--skip_softmax_threshold <lambda>` to the `fmha_d64`/`fmha_d128` variant args
+in `kernelSrcs/build_cutedsl.py`, rebuild the artifact
+(`build_cutedsl.py --kernels fmha`), and relink with `ENABLE_CUTE_DSL=fmha`.
+
+### `evaluate` — RULER accuracy verdict for the deployed engine
+
+The paper's accuracy instrument is RULER (its ~50%-sparsity safe-zone
+conclusions come from it; retrieval-style tasks degrade first). The subcommand
+samples real RULER items (HF `simonjegou/ruler`, tokenizer-filtered to the
+engine's max input length), runs the deployed engine greedily, scores by
+exact-answer matching per task, and — given a baseline — prints a PASS/FAIL
+verdict plus a deployment recommendation (exit code follows, so it can gate
+CI). Pair with `llm_bench --mode prefill` for TTFT.
+
+```bash
+# 1) dense baseline: save its scores
+python kernelSrcs/fmha_cutedsl_blackwell/calibrate_skip_softmax.py evaluate \
+    --model-dir /path/to/Qwen3-1.7B \
+    --engine-dir engines/qwen3-1.7b --llm-inference build/examples/llm/llm_inference \
+    --max-context 4096 --save-results ruler_dense.json
+
+# 2) each skip build: compare, get the verdict
+python kernelSrcs/fmha_cutedsl_blackwell/calibrate_skip_softmax.py evaluate \
+    --model-dir /path/to/Qwen3-1.7B \
+    --engine-dir engines/qwen3-1.7b --llm-inference build/examples/llm/llm_inference \
+    --max-context 4096 --baseline ruler_dense.json --label "lambda=0.115"
+# ...per-task score table with baseline/delta columns...
+# ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓ 
+# ┃ VERDICT: PASS [lambda=0.115]                          ┃
+# ┃ overall  0.7685 -> 0.7653   drop +0.0032  (gate 0.03) ┃
+# ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+# 
+# ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+# ┃ VERDICT: FAIL [lambda=0.294]                          ┃
+# ┃ overall  0.7685 -> 0.7147   drop +0.0537  (gate 0.03) ┃
+# ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+# RECOMMENDATION: this build [lambda=0.115] is validated for deployment. ...
+```
+
+### Reference result (Qwen3-1.7B NVFP4, max_context 4096, B200)
+
+Calibrated `a = 115.0, b = 4.70` (R² 0.73). RULER 200 samples x 10 tasks,
+gate 0.03; TTFT from `llm_bench --mode prefill --inputLen 4096`:
+
+| build | RULER overall | verdict | TTFT S=4096 |
+|---|---|---|---|
+| dense | 0.7685 | baseline | 12.18 ms |
+| lambda=0.115 (target 30%) | 0.7653 (-0.003) | **PASS** | 11.70 ms (1.04x) |
+| lambda=0.294 (target 50%) | 0.7147 (-0.054, qa/multiquery collapse) | **FAIL** | 11.68 ms (1.04x) |
+
+Kernel time is threshold-insensitive at these shapes, so deploy the SMALLEST
+lambda that passes the gate — a larger lambda buys no speed and only spends
+accuracy margin.
+
+## 6. File Map
 
 | File | Description |
 |---|---|
 | `kernelSrcs/fmha_cutedsl_blackwell/fmha.py` | CuTe DSL kernel source (LLM + ViT variants) |
 | `kernelSrcs/fmha_cutedsl_blackwell/fmha_helpers.py` | Helper utilities from CUTLASS |
+| `kernelSrcs/fmha_cutedsl_blackwell/calibrate_skip_softmax.py` | Skip-softmax threshold scale-factor calibration tool |
 | `kernelSrcs/fmha_cutedsl_blackwell/fmha.patch` | Diff against upstream CUTLASS example |
 | `kernelSrcs/fmha_cutedsl_blackwell/fp8_prescale.patch` | FP8 pre-scaling patch (future) |
 | `kernelSrcs/build_cutedsl.py` | Unified pre-build script: compiles all CuTe DSL variants (FMHA + GDN) |
