@@ -672,7 +672,11 @@ int main(int argc, char** argv)
         LOG_INFO("Image Size: %dx%d -> %ld image tokens (batch=%d)", args.imageHeight, args.imageWidth, imageTokens,
             args.batchSize);
 
-        standaloneEngine = loadStandaloneEngine(std::filesystem::path(args.engineDir) / "visual.engine");
+        // Only needed by the --extractLayerInfo path (used at Phase 4 below).
+        if (args.extractLayerInfo.any())
+        {
+            standaloneEngine = loadStandaloneEngine(std::filesystem::path(args.engineDir) / "visual.engine");
+        }
     }
     else
     {
@@ -818,7 +822,15 @@ int main(int argc, char** argv)
         LOG_INFO("Engine config:\n%s", rt::formatEngineConfig(activeCfg).c_str());
 
         // --- Standalone engine for layer metadata extraction ---
-        standaloneEngine = loadStandaloneEngine(enginePath);
+        // Only needed by the --extractLayerInfo path (used at Phase 4 below).
+        // Skip the load otherwise: a second engine deserialization holds an
+        // additional copy of the engine weights for the process lifetime and
+        // can double peak GPU memory (~15 GB for Qwen3-8B), OOM'ing on
+        // Jetson UMA and other memory-constrained targets.
+        if (args.extractLayerInfo.any())
+        {
+            standaloneEngine = loadStandaloneEngine(enginePath);
+        }
 
         // --- Fill PipelineIO tensors with random data ---
         nvinfer1::DataType const dtype = nvinfer1::DataType::kHALF;
