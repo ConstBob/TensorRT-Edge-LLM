@@ -217,6 +217,26 @@ private:
     bool setupVanillaProfiles(
         nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
 
+    //! Effective opt-shape token count for a generation-time optimization profile.
+    //!
+    //! Set opt = max for spec-decode base engines. Empirical measurements on Qwen3-8B
+    //! (Jetson Thor) show that anchoring the TRT autotuner target at max picks better
+    //! kernels for the actual runtime workload than the historical max/2 fallback,
+    //! regardless of spec_decode_type or how max relates to the runtime verifyTreeSize:
+    //!
+    //!   - DFlash `max=64` at runtime ts=64: opt=max is ~9 ms faster than opt=max/2
+    //!   - DFlash `max=128` at runtime ts=64: opt=max is ~0.7 ms faster
+    //!   - Eagle3 `max=150` at runtime ts=32/64: opt=max is ~1.5 ms faster
+    //!   - Eagle3 `max=150` at runtime ts=72 (close to max/2): tied within noise
+    //!
+    //! opt=max is never worse than max/2 in any tested configuration. See
+    //! `dflash-edgellm-vs-zlab/docs/2026-07-13-opt-shape-experiment-findings.md`
+    //! for the full dataset.
+    //!
+    //! @param maxToken The `max` shape count for this profile
+    //!                 (e.g., `maxVerifyTreeSize` for verify, `maxDraftTreeSize` for draft).
+    int64_t effectiveOptTokens(int64_t maxToken) const;
+
     //! Set up optimization profiles for speculative tree-decoding models.
     //! Configures hidden-state and attention-mask inputs used by spec decode.
     //! @param contextProfile Optimization profile for context processing
