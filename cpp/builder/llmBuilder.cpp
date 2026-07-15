@@ -674,26 +674,32 @@ bool LLMBuilder::setupVanillaProfiles(
     return result;
 }
 
+int64_t LLMBuilder::effectiveOptTokens(int64_t maxToken) const
+{
+    return std::max<int64_t>(1, maxToken);
+}
+
 bool LLMBuilder::setupSpecDecodeProfiles(
     nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
 {
     bool result = true;
 
     int const maxTokens = mBuilderConfig.specDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
+    int const optTokens = static_cast<int>(effectiveOptTokens(maxTokens));
 
     // Input embeddings
     result &= setOptimizationProfile(&contextProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
         createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
         createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
     result &= setOptimizationProfile(&generationProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
-        createDims({mBuilderConfig.maxBatchSize, maxTokens / 2, mHiddenSize}),
+        createDims({mBuilderConfig.maxBatchSize, optTokens, mHiddenSize}),
         createDims({mBuilderConfig.maxBatchSize, maxTokens, mHiddenSize}));
 
     // Last token IDs - 2D shape [batch_size, num_selected_tokens]
     result &= setOptimizationProfile(&contextProfile, binding_names::kLastTokenIds, createDims({1, 1}),
         createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, 1}));
     result &= setOptimizationProfile(&generationProfile, binding_names::kLastTokenIds, createDims({1, 1}),
-        createDims({mBuilderConfig.maxBatchSize, maxTokens / 2}), createDims({mBuilderConfig.maxBatchSize, maxTokens}));
+        createDims({mBuilderConfig.maxBatchSize, optTokens}), createDims({mBuilderConfig.maxBatchSize, maxTokens}));
 
     if (mBuilderConfig.specDraft)
     {
@@ -703,7 +709,7 @@ bool LLMBuilder::setupSpecDecodeProfiles(
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
         result &= setOptimizationProfile(&generationProfile, binding_names::kDraftModelHiddenStates,
-            createDims({1, 1, mHiddenSize}), createDims({mBuilderConfig.maxBatchSize, maxTokens / 2, mHiddenSize}),
+            createDims({1, 1, mHiddenSize}), createDims({mBuilderConfig.maxBatchSize, optTokens, mHiddenSize}),
             createDims({mBuilderConfig.maxBatchSize, maxTokens, mHiddenSize}));
 
         // Hidden states input
@@ -713,7 +719,7 @@ bool LLMBuilder::setupSpecDecodeProfiles(
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mTargetModelOutputHiddenDim}));
         result &= setOptimizationProfile(&generationProfile, binding_names::kBaseModelHiddenStates,
             createDims({1, 1, mTargetModelOutputHiddenDim}),
-            createDims({mBuilderConfig.maxBatchSize, maxTokens / 2, mTargetModelOutputHiddenDim}),
+            createDims({mBuilderConfig.maxBatchSize, optTokens, mTargetModelOutputHiddenDim}),
             createDims({mBuilderConfig.maxBatchSize, maxTokens, mTargetModelOutputHiddenDim}));
     }
 
@@ -724,16 +730,15 @@ bool LLMBuilder::setupSpecDecodeProfiles(
         result &= setOptimizationProfile(&contextProfile, binding_names::kAttentionMask, createDims({1, 1, 1}),
             createDims({mBuilderConfig.maxBatchSize, 1, 1}), createDims({mBuilderConfig.maxBatchSize, 1, 1}));
         result &= setOptimizationProfile(&generationProfile, binding_names::kAttentionMask, createDims({1, 1, 1}),
-            createDims({mBuilderConfig.maxBatchSize, maxTokens / 2,
-                static_cast<int64_t>(divUp(maxTokens / 2, attnMaskAlignSize) * attnMaskAlignSize)}),
+            createDims({mBuilderConfig.maxBatchSize, optTokens,
+                static_cast<int64_t>(divUp(optTokens, attnMaskAlignSize) * attnMaskAlignSize)}),
             createDims({mBuilderConfig.maxBatchSize, maxTokens,
                 static_cast<int64_t>(divUp(maxTokens, attnMaskAlignSize) * attnMaskAlignSize)}));
 
         result &= setOptimizationProfile(&contextProfile, binding_names::kAttentionPosId, createDims({1, 1}),
             createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, 1}));
         result &= setOptimizationProfile(&generationProfile, binding_names::kAttentionPosId, createDims({1, 1}),
-            createDims({mBuilderConfig.maxBatchSize, maxTokens / 2}),
-            createDims({mBuilderConfig.maxBatchSize, maxTokens}));
+            createDims({mBuilderConfig.maxBatchSize, optTokens}), createDims({mBuilderConfig.maxBatchSize, maxTokens}));
     }
 
     return result;
@@ -911,8 +916,9 @@ bool LLMBuilder::setupPleProfiles(nvinfer1::IOptimizationProfile& contextProfile
         {
             int64_t const maxTokens
                 = mBuilderConfig.specDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
+            int64_t const optTokens = effectiveOptTokens(maxTokens);
             result &= setOptimizationProfile(&generationProfile, inputName, createDims({1, 1, pleHiddenSize}),
-                createDims({mBuilderConfig.maxBatchSize, std::max<int64_t>(1, maxTokens / 2), pleHiddenSize}),
+                createDims({mBuilderConfig.maxBatchSize, optTokens, pleHiddenSize}),
                 createDims({mBuilderConfig.maxBatchSize, maxTokens, pleHiddenSize}));
         }
         else
@@ -973,8 +979,9 @@ bool LLMBuilder::setupDeepstackProfiles(nvinfer1::IOptimizationProfile& contextP
         {
             int const maxTokens
                 = mBuilderConfig.specDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
+            int const optTokens = static_cast<int>(effectiveOptTokens(maxTokens));
             result &= setOptimizationProfile(&generationProfile, deepstackInputName.c_str(),
-                createDims({1, 1, mHiddenSize}), createDims({mBuilderConfig.maxBatchSize, maxTokens / 2, mHiddenSize}),
+                createDims({1, 1, mHiddenSize}), createDims({mBuilderConfig.maxBatchSize, optTokens, mHiddenSize}),
                 createDims({mBuilderConfig.maxBatchSize, maxTokens, mHiddenSize}));
         }
         else
@@ -1213,8 +1220,9 @@ bool LLMBuilder::setupIntermediateRecurrentStateProfiles(
         mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
     nvinfer1::Dims maxCtxShape = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen,
         mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
-    nvinfer1::Dims optGenShape = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxVerifyTreeSize / 2,
-        mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
+    nvinfer1::Dims optGenShape
+        = createDims({mBuilderConfig.maxBatchSize, effectiveOptTokens(mBuilderConfig.maxVerifyTreeSize),
+            mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
     nvinfer1::Dims maxGenShape = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxVerifyTreeSize,
         mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
 
@@ -1245,8 +1253,8 @@ bool LLMBuilder::setupIntermediateConvStateProfiles(
         = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mConvDim, mConvKernel});
     nvinfer1::Dims maxCtxShape
         = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mConvDim, mConvKernel});
-    nvinfer1::Dims optGenShape
-        = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxVerifyTreeSize / 2, mConvDim, mConvKernel});
+    nvinfer1::Dims optGenShape = createDims(
+        {mBuilderConfig.maxBatchSize, effectiveOptTokens(mBuilderConfig.maxVerifyTreeSize), mConvDim, mConvKernel});
     nvinfer1::Dims maxGenShape
         = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxVerifyTreeSize, mConvDim, mConvKernel});
 
