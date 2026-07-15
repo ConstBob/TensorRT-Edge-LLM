@@ -40,6 +40,9 @@ fmha_d256_Kernel_Module_t CuteDslFMHARunner::sLLM_d256 = {};
 fmha_d64_sw_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_sw = {};
 fmha_d128_sw_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_sw = {};
 fmha_d256_sw_Kernel_Module_t CuteDslFMHARunner::sLLM_d256_sw = {};
+// LLM skip-softmax (BLASST, FP16 causal)
+fmha_d64_skipsoftmax_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_skipsoftmax = {};
+fmha_d128_skipsoftmax_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_skipsoftmax = {};
 // LLM (FP8 input, FP16 output)
 fmha_d64_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_fp8 = {};
 fmha_d128_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_fp8 = {};
@@ -91,6 +94,8 @@ bool CuteDslFMHARunner::loadLLMKernelModule()
         fmha_d64_sw_Kernel_Module_Load(&sLLM_d64_sw);
         fmha_d128_sw_Kernel_Module_Load(&sLLM_d128_sw);
         fmha_d256_sw_Kernel_Module_Load(&sLLM_d256_sw);
+        fmha_d64_skipsoftmax_Kernel_Module_Load(&sLLM_d64_skipsoftmax);
+        fmha_d128_skipsoftmax_Kernel_Module_Load(&sLLM_d128_skipsoftmax);
         fmha_d64_fp8_Kernel_Module_Load(&sLLM_d64_fp8);
         fmha_d128_fp8_Kernel_Module_Load(&sLLM_d128_fp8);
         fmha_d256_fp8_Kernel_Module_Load(&sLLM_d256_fp8);
@@ -131,6 +136,8 @@ void CuteDslFMHARunner::unloadLLMKernelModule()
         fmha_d64_sw_Kernel_Module_Unload(&sLLM_d64_sw);
         fmha_d128_sw_Kernel_Module_Unload(&sLLM_d128_sw);
         fmha_d256_sw_Kernel_Module_Unload(&sLLM_d256_sw);
+        fmha_d64_skipsoftmax_Kernel_Module_Unload(&sLLM_d64_skipsoftmax);
+        fmha_d128_skipsoftmax_Kernel_Module_Unload(&sLLM_d128_skipsoftmax);
         fmha_d64_fp8_Kernel_Module_Unload(&sLLM_d64_fp8);
         fmha_d128_fp8_Kernel_Module_Unload(&sLLM_d128_fp8);
         fmha_d256_fp8_Kernel_Module_Unload(&sLLM_d256_fp8);
@@ -272,7 +279,7 @@ CuteDslFMHARunner::CuteDslFMHARunner(
 
 void CuteDslFMHARunner::run(void const* qPtr, void const* kvPtr, void* oPtr, int32_t const* cuKVSeqLens,
     cudaStream_t stream, float attentionScale, int32_t slidingWindowSize, bool fp8Input, float qScale, float kScale,
-    float vScale)
+    float vScale, bool enableSkipSoftmax)
 {
     if (!sLLMLoaded)
     {
@@ -313,7 +320,29 @@ void CuteDslFMHARunner::run(void const* qPtr, void const* kvPtr, void* oPtr, int
         }                                                                                                              \
     }
 
-    if (fp8Input)
+    if (enableSkipSoftmax)
+    {
+        if (fp8Input || useSlidingWindow)
+        {
+            LOG_ERROR("CuTe DSL LLM FMHA: skip-softmax variant is FP16 causal only (fp8Input=%s, sw=%s)",
+                fp8Input ? "true" : "false", useSlidingWindow ? "true" : "false");
+            return;
+        }
+        if (headDim == 64)
+        {
+            CALL_LLM_FMHA(fmha_d64_skipsoftmax, sLLM_d64_skipsoftmax, windowSizeLeft);
+        }
+        else if (headDim == 128)
+        {
+            CALL_LLM_FMHA(fmha_d128_skipsoftmax, sLLM_d128_skipsoftmax, windowSizeLeft);
+        }
+        else
+        {
+            LOG_ERROR("CuTe DSL LLM FMHA: unsupported head_dim=%d", headDim);
+            return;
+        }
+    }
+    else if (fp8Input)
     {
         DISPATCH_HEADD(64, fmha_d64_fp8, sLLM_d64_fp8, fmha_d64_sw_fp8, sLLM_d64_sw_fp8)
         else DISPATCH_HEADD(128, fmha_d128_fp8, sLLM_d128_fp8, fmha_d128_sw_fp8, sLLM_d128_sw_fp8) else DISPATCH_HEADD(

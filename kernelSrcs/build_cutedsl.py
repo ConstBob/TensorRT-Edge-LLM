@@ -262,6 +262,26 @@ KERNEL_VARIANTS = [
         script="fmha_cutedsl_blackwell/fmha.py",
         script_args=["--q_shape", "1,1024,14,128", "--k_shape", "1,1024,1,128"] + _LLM,
     ),
+    # Skip-softmax (BLASST) variants: causal-only, lambda baked at export.
+    # Lambdas are the 4096-context-safe values from the MR calibration table
+    # (kernelSrcs/fmha_cutedsl_blackwell/README.md), so any test seqlen up to
+    # 4096 passes the 0.1 max-abs accuracy gate.
+    KernelVariant(
+        name="fmha_d64_skipsoftmax",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,14,64", "--k_shape", "1,1024,1,64"]
+                    + _LLM + ["--skip_softmax_threshold", "0.003"],
+    ),
+    KernelVariant(
+        name="fmha_d128_skipsoftmax",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,14,128", "--k_shape", "1,1024,1,128"]
+                    + _LLM + ["--skip_softmax_threshold", "0.001"],
+    ),
     KernelVariant(
         name="fmha_d256",
         group="fmha",

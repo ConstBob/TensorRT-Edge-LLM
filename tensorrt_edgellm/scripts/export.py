@@ -162,6 +162,19 @@ def _has_audio(model_type: str) -> bool:
     return model_type in _AUDIO_MODEL_TYPES
 
 
+def _checkpoint_audio_config(config: dict) -> "dict | None":
+    """Locate the audio-encoder config wherever the checkpoint stores it.
+
+    Gemma4 / Gemma4-Unified keep ``audio_config`` at the root; Qwen3-ASR /
+    Qwen3-Omni nest it under ``thinker_config``; Nemotron-Omni names it
+    ``sound_config``. Returns ``None`` when the checkpoint genuinely has no
+    audio encoder (e.g. Gemma4 dense with ``"audio_config": null``).
+    """
+    return (config.get("audio_config")
+            or (config.get("thinker_config") or {}).get("audio_config")
+            or config.get("sound_config"))
+
+
 def _has_action(model_type: str) -> bool:
     return model_type in _ACTION_MODEL_TYPES
 
@@ -2722,7 +2735,7 @@ def main() -> None:
         (_has_visual(model_type) and not args.skip_visual and not _draft_only
          and _allow("visual"), "visual", _export_visual_component),
         (_has_audio(model_type) and not args.skip_audio and not _draft_only
-         and config.get("audio_config") is not None and _allow("audio"),
+         and _checkpoint_audio_config(config) is not None and _allow("audio"),
          "audio", lambda out: _export_audio(model_dir,
                                             out,
                                             _get_weights(),
@@ -2778,7 +2791,7 @@ def main() -> None:
             "using FP16 embeddings.")
 
     if (_has_audio(model_type) and not args.skip_audio
-            and config.get("audio_config") is None):
+            and _checkpoint_audio_config(config) is None):
         logger.warning(
             "Model type '%s' supports audio, but this checkpoint has no "
             "audio_config — skipping audio encoder export.", model_type)

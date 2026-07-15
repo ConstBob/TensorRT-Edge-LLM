@@ -82,10 +82,14 @@ public:
      * @param qScale Q dequant scale (quant→orig), ignored when fp8Input=false
      * @param kScale K dequant scale (quant→orig), ignored when fp8Input=false
      * @param vScale V dequant scale (quant→orig), applied to the attention output and ignored when fp8Input=false
+     * @param enableSkipSoftmax Dispatch the skip-softmax (BLASST) kernel variant, which skips the P*V GEMM of
+     *        KV tiles whose contribution is negligible (threshold baked at export). Approximate — outputs may
+     *        deviate from dense by up to the calibrated accuracy gate. FP16 causal only: incompatible with
+     *        fp8Input and slidingWindowSize.
      */
     void run(void const* qPtr, void const* kvPtr, void* oPtr, int32_t const* cuKVSeqLens, cudaStream_t stream,
         float attentionScale, int32_t slidingWindowSize = INT_MAX, bool fp8Input = false, float qScale = 1.0F,
-        float kScale = 1.0F, float vScale = 1.0F);
+        float kScale = 1.0F, float vScale = 1.0F, bool enableSkipSoftmax = false);
 
     /**
      * @brief LLM FMHA over a paged KV cache.
@@ -151,6 +155,10 @@ private:
     static fmha_d64_sw_Kernel_Module_t sLLM_d64_sw;
     static fmha_d128_sw_Kernel_Module_t sLLM_d128_sw;
     static fmha_d256_sw_Kernel_Module_t sLLM_d256_sw;
+
+    // LLM skip-softmax (BLASST) kernel modules (FP16, causal, no sliding window)
+    static fmha_d64_skipsoftmax_Kernel_Module_t sLLM_d64_skipsoftmax;
+    static fmha_d128_skipsoftmax_Kernel_Module_t sLLM_d128_skipsoftmax;
 
     // LLM kernel modules (FP8 input, FP16 output)
     static fmha_d64_fp8_Kernel_Module_t sLLM_d64_fp8;
