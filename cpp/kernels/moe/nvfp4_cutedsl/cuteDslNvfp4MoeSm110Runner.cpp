@@ -20,6 +20,7 @@
 #include "cuteDslNvfp4MoeSm110Runner.h"
 
 #include "common/checkMacros.h"
+#include "common/cudaUtils.h"
 #include "common/logger.h"
 #include "common/tensor.h"
 #include "kernels/moe/NvFP4MoEUtils.h"
@@ -310,7 +311,7 @@ int32_t CuteDslNvfp4MoeSm110Runner::run(CuteDslNvfp4MoeSm110Params const& params
             const_cast<void*>(static_cast<void const*>(params.fc1Alpha)),
             const_cast<void*>(static_cast<void const*>(params.inputGlobalScale)),
             const_cast<void*>(static_cast<void const*>(params.downInputScale)), tileGroup, tileLimit,
-            permutedToExpanded, numTiles, origM, m, n1, h, e, stream);
+            permutedToExpanded, numTiles, origM, m, n1, h, e, getDeviceMultiProcessorCount(), stream);
     }
     else if (params.activationType == kACT_SWIGLU)
     {
@@ -319,7 +320,7 @@ int32_t CuteDslNvfp4MoeSm110Runner::run(CuteDslNvfp4MoeSm110Params const& params
             const_cast<void*>(static_cast<void const*>(params.fc1Alpha)),
             const_cast<void*>(static_cast<void const*>(params.inputGlobalScale)),
             const_cast<void*>(static_cast<void const*>(params.downInputScale)), tileGroup, tileLimit,
-            permutedToExpanded, numTiles, origM, m, n1, h, e, stream);
+            permutedToExpanded, numTiles, origM, m, n1, h, e, getDeviceMultiProcessorCount(), stream);
     }
     else if (params.activationType == kACT_GEGLU)
     {
@@ -328,7 +329,7 @@ int32_t CuteDslNvfp4MoeSm110Runner::run(CuteDslNvfp4MoeSm110Params const& params
             const_cast<void*>(static_cast<void const*>(params.fc1Alpha)),
             const_cast<void*>(static_cast<void const*>(params.inputGlobalScale)),
             const_cast<void*>(static_cast<void const*>(params.downInputScale)), tileGroup, tileLimit,
-            permutedToExpanded, numTiles, origM, m, n1, h, e, stream);
+            permutedToExpanded, numTiles, origM, m, n1, h, e, getDeviceMultiProcessorCount(), stream);
     }
     else
     {
@@ -351,7 +352,7 @@ int32_t CuteDslNvfp4MoeSm110Runner::run(CuteDslNvfp4MoeSm110Params const& params
         const_cast<void*>(static_cast<void const*>(params.fc2Alpha)),
         const_cast<void*>(static_cast<void const*>(params.downInputScale)), tileGroup, tileLimit, permutedToExpanded,
         numTiles, const_cast<void*>(static_cast<void const*>(params.topkWeights)), m, h, params.moeInterSize, e,
-        params.numTokens, params.topK, stream);
+        params.numTokens, params.topK, getDeviceMultiProcessorCount(), stream);
     if (ret != 0)
     {
         LOG_ERROR("CuteDslNvfp4MoeSm110Runner: FC2 kernel returned error code %d", ret);

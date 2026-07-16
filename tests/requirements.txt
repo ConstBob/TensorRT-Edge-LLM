@@ -20,6 +20,7 @@ nvidia-modelopt==0.44.0
 # pre-exported by the checkpoint_export job. This template installs only
 # tests/requirements.txt (not the top-level requirements.txt nor `pip install
 # -e .`), so these must be pinned here too (kept in sync with requirements.txt).
+transformers==5.9.0
 onnx==1.19.0
 onnxscript==0.7.0
 onnx-graphsurgeon==0.6.1

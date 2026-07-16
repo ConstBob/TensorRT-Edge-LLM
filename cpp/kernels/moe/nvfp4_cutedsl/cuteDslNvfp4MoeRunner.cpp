@@ -20,6 +20,7 @@
 #include "cuteDslNvfp4MoeRunner.h"
 
 #include "common/checkMacros.h"
+#include "common/cudaUtils.h"
 #include "common/logger.h"
 
 #include <algorithm>
@@ -480,7 +481,8 @@ int32_t CuteDslNvfp4MoeRunner::decodeCapRoutedRows(CuteDslMoeBackend backend, in
             const_cast<void*>(static_cast<void const*>(params.fc2Alpha)),                                              \
             const_cast<void*>(static_cast<void const*>(params.downInputScale)),                                        \
             params.output, tokenMapPtr, tokenWeightsPtr,                                                               \
-            numTokens, maxRows, stateE, weightE, rowsPadded, K, N, numTopk, stream);                                   \
+            numTokens, maxRows, stateE, weightE, rowsPadded, K, N, numTopk,                                               \
+            trt_edgellm::getDeviceMultiProcessorCount(), stream);                                                                  \
     } while (0)
 // clang-format on
 
@@ -662,7 +664,7 @@ int32_t CuteDslNvfp4MoeRunner::runDecode(CuteDslNvfp4MoeParams const& params, vo
             const_cast<void*>(static_cast<void const*>(params.downInputScale)),                                        \
             params.output, tokenMapPtr, tokenWeightsPtr,                                                               \
             numTokens, maxRows, rowsPadded, maxTasks, physicalTiles,                                                   \
-            K, N, weightE, numTopk, stream);                                                                           \
+            K, N, weightE, numTopk, trt_edgellm::getDeviceMultiProcessorCount(), stream);                                          \
     } while (0)
 // clang-format on
 

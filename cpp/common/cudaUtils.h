@@ -18,6 +18,7 @@
 #pragma once
 
 #include "common/checkMacros.h"
+#include <cstdint>
 #include <cuda_runtime.h>
 
 namespace trt_edgellm
@@ -59,6 +60,35 @@ inline int getSMVersion()
     CUDA_CHECK(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device));
     CUDA_CHECK(cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device));
     return sm_major * 10 + sm_minor;
+}
+
+/*!
+ * @brief Multiprocessor (SM) count of the current device, cached once.
+ *
+ * Used as the runtime max_active_clusters / sm_count argument of persistent
+ * CuTe DSL kernels so AOT artifacts size their persistent grid for the GPU
+ * they actually launch on, instead of a value baked at export time on the
+ * build machine. For cluster shape (1,1) the max active cluster count of the
+ * full-shared-memory persistent kernels equals the SM count.
+ *
+ * @return Multiprocessor count (>= 1)
+ * @throws std::runtime_error If the current device or its SM count cannot be queried
+ */
+inline int32_t getDeviceMultiProcessorCount()
+{
+    // Edge-LLM runs on one target GPU per process. Query its hardware constant
+    // once, then reuse it on every kernel launch.
+    static int32_t const smCount = []() {
+        int device{-1};
+        CUDA_CHECK(cudaGetDevice(&device));
+        ELLM_CHECK(device >= 0, "Invalid CUDA device");
+
+        int count = 0;
+        CUDA_CHECK(cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device));
+        ELLM_CHECK(count > 0, "Invalid CUDA SM count");
+        return count;
+    }();
+    return smCount;
 }
 
 /*!

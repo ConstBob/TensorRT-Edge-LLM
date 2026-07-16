@@ -20,6 +20,7 @@
 #include "cuteDslGDNRunner.h"
 #include "gdnKernelUtils.cuh"
 
+#include "common/cudaUtils.h"
 #include "common/logger.h"
 
 #include <cmath>
@@ -460,7 +461,8 @@ int CuteDslGDNRunner::runPrefillBlackwell(GDNParams const& params, cudaStream_t 
 
     // Step 2: Run the Blackwell prefill kernel.
     cute_dsl_gdn_prefill_blackwell_wrapper(&sBlackwellPrefillModule, &qTensor, &kTensor, &vTensor, &aTensor, &bTensor,
-        &A_logTensor, &dt_biasTensor, &h0InTensor, &h0OutTensor, &oTensor, &cuSeqLensTensor, stream);
+        &A_logTensor, &dt_biasTensor, &h0InTensor, &h0OutTensor, &oTensor, &cuSeqLensTensor,
+        getDeviceMultiProcessorCount(), stream);
 
     // Step 3: Transpose V-major output state back to K-major into scratch.
     launchGdnStateTranspose(params.h0_source, params.h0_scratch, numStateBlocks, k, stream);

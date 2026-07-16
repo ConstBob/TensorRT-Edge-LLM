@@ -324,6 +324,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         scale_k: Float32,
         scale_v: Float32,
         inv_scale_o: Float32,
+        sm_count: Int32,
         stream: cuda.CUstream,
         skip_softmax_count: Optional[cute.Tensor] = None,   # Int32[1]; verify builds only
         total_softmax_count: Optional[cute.Tensor] = None,  # (perf builds pass None ->
@@ -451,6 +452,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             cute.shape((s_q, d, ((h_r, h_k), b))),
             self.cta_tiler,
             self.is_persistent,
+            sm_count,
         )
 
         self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
@@ -678,6 +680,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         scale_softmax_log2: Float32,
         scale_softmax: Float32,
         scale_output: Float32,
+        sm_count: Int32,
         stream: cuda.CUstream,
     ):
         """ViT FMHA: packed varlen, separate Q/K/V, bidirectional (no causal mask).
@@ -741,6 +744,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             cute.shape((s_q, d, ((h_r, h_k), b))),
             self.cta_tiler,
             self.is_persistent,
+            sm_count,
         )
 
         self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
@@ -884,6 +888,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         scale_k: Float32,
         scale_v: Float32,
         inv_scale_o: Float32,
+        sm_count: Int32,
         stream: cuda.CUstream,
     ):
         """LLM FMHA over paged KV cache.
@@ -957,6 +962,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             cute.shape((s_q, d, ((h_r, h_k), b))),
             self.cta_tiler,
             self.is_persistent,
+            sm_count,
         )
 
         self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
@@ -3504,6 +3510,7 @@ class BlackwellFusedMultiHeadAttentionForwardD256:
         scale_k: Float32,
         scale_v: Float32,
         inv_scale_o: Float32,
+        sm_count: Int32,
         stream: cuda.CUstream,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
@@ -3628,6 +3635,7 @@ class BlackwellFusedMultiHeadAttentionForwardD256:
             cute.shape((s_q, d, ((h_r, h_k), b))),
             self.cta_tiler,
             self.is_persistent,
+            sm_count,
         )
 
         self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
@@ -3854,6 +3862,7 @@ class BlackwellFusedMultiHeadAttentionForwardD256:
         scale_softmax_log2: Float32,
         scale_softmax: Float32,
         scale_output: Float32,
+        sm_count: Int32,
         stream: cuda.CUstream,
     ):
         """ViT FMHA: packed varlen, separate Q/K/V, bidirectional (no causal mask).
@@ -3917,6 +3926,7 @@ class BlackwellFusedMultiHeadAttentionForwardD256:
             cute.shape((s_q, d, ((h_r, h_k), b))),
             self.cta_tiler,
             self.is_persistent,
+            sm_count,
         )
 
         self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
@@ -4066,6 +4076,7 @@ class BlackwellFusedMultiHeadAttentionForwardD256:
         scale_k: Float32,
         scale_v: Float32,
         inv_scale_o: Float32,
+        sm_count: Int32,
         stream: cuda.CUstream,
     ):
         """LLM FMHA over paged KV cache.
@@ -4139,6 +4150,7 @@ class BlackwellFusedMultiHeadAttentionForwardD256:
             cute.shape((s_q, d, ((h_r, h_k), b))),
             self.cta_tiler,
             self.is_persistent,
+            sm_count,
         )
 
         self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
@@ -6779,6 +6791,11 @@ def run(
 
     # Initialize Stream
     current_stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
+    # Runtime persistent-grid size (sm_count kernel argument): AOT callers pass
+    # the deployment GPU's multiprocessor count at launch; here we seed the
+    # trace/run with the local device's count (pure driver attribute — no
+    # helper-kernel probe, so it is safe under cross/foreign-arch compiles).
+    _sm_count = Int32(utils.HardwareInfo().get_device_multiprocessor_count())
 
     # Compute folded scales for numpy reference and ViT path.
     # The LLM __call__ computes these internally from the raw per-tensor scales.
@@ -6866,7 +6883,7 @@ def run(
             fmha.__call_vit__,
             q_dyn, k_dyn, v_dyn, o_dyn, cu_dyn, _max_seqlen,
             ref_scale_softmax_log2, ref_scale_softmax, ref_scale_output,
-            current_stream,
+            _sm_count, current_stream,
         )
     else:
         # LLM: batched Q [B,S,H,D] + combined KV cache [B,2,H,Cap,D]
@@ -6903,7 +6920,7 @@ def run(
                 fmha.__call_paged__,
                 q_dyn, kv_pool_dyn, page_list_tensor, o_dyn, cu_kv_seqlens,
                 _wsl, scale_softmax, scale_q, scale_k, scale_v, inv_scale_o,
-                current_stream,
+                _sm_count, current_stream,
             )
         else:
             kv_dyn = mark_kv_cache_dynamic(kvcache_tensor)
@@ -6911,7 +6928,7 @@ def run(
                 fmha,
                 q_dyn, kv_dyn, o_dyn, cu_kv_seqlens, _wsl,
                 scale_softmax, scale_q, scale_k, scale_v, inv_scale_o,
-                current_stream,
+                _sm_count, current_stream,
             )
 
     compilation_time = time.time() - start_time
@@ -7052,7 +7069,7 @@ def run(
                 q_vit_tensor, k_vit_tensor, v_vit_tensor, o_vit_tensor,
                 cu_seqlens, _max_seqlen,
                 ref_scale_softmax_log2, ref_scale_softmax, ref_scale_output,
-                current_stream,
+                _sm_count, current_stream,
             )
 
             o_fp32_cp = cp.empty(o_vit_cp.shape, dtype=cp.float32)
@@ -7097,7 +7114,7 @@ def run(
                 mark_shd_dynamic(v_ws), mark_shd_dynamic(o_ws),
                 cu_dyn, _max_seqlen,
                 ref_scale_softmax_log2, ref_scale_softmax, ref_scale_output,
-                current_stream,
+                _sm_count, current_stream,
             )
 
         exec_time = testing.benchmark(
@@ -7195,7 +7212,7 @@ def run(
             scale_k,
             scale_v,
             inv_scale_o,
-            current_stream,
+            _sm_count, current_stream,
         )
         return args
 
@@ -7345,6 +7362,11 @@ def run_llm_multi_round_prefill_test(
             actual_head_dim=actual_head_dim,
         )
     current_stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
+    # Runtime persistent-grid size (sm_count kernel argument): AOT callers pass
+    # the deployment GPU's multiprocessor count at launch; here we seed the
+    # trace/run with the local device's count (pure driver attribute — no
+    # helper-kernel probe, so it is safe under cross/foreign-arch compiles).
+    _sm_count = Int32(utils.HardwareInfo().get_device_multiprocessor_count())
     _wsl = Int32(window_size_left_val) if use_sliding_window else Int32(0)
 
     # skip counters: verify-only instrumentation (perf builds pass None and the
@@ -7444,7 +7466,7 @@ def run_llm_multi_round_prefill_test(
             compiled_fmha = cute.compile(
                 fmha_op, q_t, kv_t, o_t, cu_kv, _wsl,
                 _attention_scale, _scale_q, _scale_k, _scale_v, _inv_scale_o,
-                current_stream,
+                _sm_count, current_stream,
                 _skip_cnt_t, _total_cnt_t,
             )
             print(f"{_tag} Compilation time: "
@@ -7454,7 +7476,7 @@ def run_llm_multi_round_prefill_test(
         compiled_fmha(
             q_t, kv_t, o_t, cu_kv, _wsl,
             _attention_scale, _scale_q, _scale_k, _scale_v, _inv_scale_o,
-            current_stream,
+            _sm_count, current_stream,
             _skip_cnt_t, _total_cnt_t,
         )
 
