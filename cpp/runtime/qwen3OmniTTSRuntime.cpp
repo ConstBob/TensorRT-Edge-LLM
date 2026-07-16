@@ -24,6 +24,9 @@
 #include "common/stringUtils.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
 #include "kernels/talkerMLPKernels/talkerMLPKernels.h"
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #ifdef CUTE_DSL_GEMM_ENABLED
 #include "kernels/talkerMLPKernels/cuteDslGemmRunner.h"
 #endif
@@ -418,11 +421,30 @@ bool Qwen3OmniTTSRuntime::validateAndFillConfig(std::string const& talkerEngineD
     // Speaker ID configuration
     mTalkerConfig.defaultSpeakerId = configJson.value("default_speaker_id", 2301);
 
-    // Thinker→Talker streaming uses this to route engine hidden_states from
-    // the Thinker portal into the Talker prefill. Standalone Qwen3-TTS Talker
-    // configs (no Thinker) legitimately omit the field; the streaming code
-    // path validates the value before use. Sentinel -1 means "unconfigured".
-    mTalkerConfig.acceptHiddenLayer = configJson.value("accept_hidden_layer", -1);
+    // Decoder layer index whose pre-norm hidden_states the Talker consumes from
+    // the Thinker. Must match the layer the Thinker engine was exported to
+    // emit on its ``hidden_states`` output (Qwen3-Omni dense default 14,
+    // Qwen3-Next Omni reads it from talker_config.accept_hidden_layer). Sentinel
+    // -1 (the struct default) means "unconfigured"; only the standalone-TTS
+    // path that never invokes the streaming hidden-states portal is allowed
+    // to leave it that way.
+    mTalkerConfig.acceptHiddenLayer = configJson.value("accept_hidden_layer", mTalkerConfig.acceptHiddenLayer);
+
+    // Chat-template / placeholder token IDs. Read from config.json so the
+    // talker pipeline stays variant-agnostic — every engine carries its own
+    // tokenizer's IDs at export time. Defaults are the Qwen3-Omni values
+    // baked into the TalkerConfig struct so legacy engines keep working.
+    mTalkerConfig.imStartTokenId = configJson.value("im_start_token_id", mTalkerConfig.imStartTokenId);
+    mTalkerConfig.assistantRoleId = configJson.value("assistant_role_id", mTalkerConfig.assistantRoleId);
+    mTalkerConfig.userRoleId = configJson.value("user_role_id", mTalkerConfig.userRoleId);
+    mTalkerConfig.systemRoleId = configJson.value("system_role_id", mTalkerConfig.systemRoleId);
+    mTalkerConfig.audioTokenId = configJson.value("audio_token_id", mTalkerConfig.audioTokenId);
+    mTalkerConfig.imageTokenId = configJson.value("image_token_id", mTalkerConfig.imageTokenId);
+    mTalkerConfig.videoTokenId = configJson.value("video_token_id", mTalkerConfig.videoTokenId);
+    mTalkerConfig.thinkOpenTokenId = configJson.value("think_open_token_id", mTalkerConfig.thinkOpenTokenId);
+    mTalkerConfig.thinkCloseTokenId = configJson.value("think_close_token_id", mTalkerConfig.thinkCloseTokenId);
+    mTalkerConfig.maxThinkerToTalkerMmTokens
+        = configJson.value("max_thinker_to_talker_mm_tokens", mTalkerConfig.maxThinkerToTalkerMmTokens);
 
     // Load speaker ID mapping if available
     if (configJson.contains("speaker_id") && configJson["speaker_id"].is_object())
@@ -432,6 +454,28 @@ bool Qwen3OmniTTSRuntime::validateAndFillConfig(std::string const& talkerEngineD
             mSpeakerIdMap[speaker_name] = speaker_id.get<int32_t>();
         }
         LOG_INFO("Loaded %zu speaker IDs from config", mSpeakerIdMap.size());
+
+        // Qwen3-Next Omni: load speaker_system_prompt_id (speaker_name → token list) and index by
+        // speaker_id so the prefill builder can look up rows for a given numeric speakerId.
+        if (configJson.contains("speaker_system_prompt_id") && configJson["speaker_system_prompt_id"].is_object())
+        {
+            for (auto const& [speaker_name, ids] : configJson["speaker_system_prompt_id"].items())
+            {
+                auto it = mSpeakerIdMap.find(speaker_name);
+                if (it == mSpeakerIdMap.end())
+                {
+                    continue;
+                }
+                std::vector<int32_t> tokens;
+                tokens.reserve(ids.size());
+                for (auto const& tid : ids)
+                {
+                    tokens.push_back(tid.get<int32_t>());
+                }
+                mSpeakerSystemPromptIds[it->second] = std::move(tokens);
+            }
+            LOG_INFO("Loaded %zu speaker_system_prompt_id entries", mSpeakerSystemPromptIds.size());
+        }
 
         // Log available speakers
         if (!mSpeakerIdMap.empty())
@@ -679,6 +723,18 @@ bool Qwen3OmniTTSRuntime::allocateBuffer()
         mStreamingMlpWork
             = rt::Tensor({1, thinkerHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "mStreamingMlpWork");
 
+        // OmniNext persistent buffers; values filled by initializeTTSEmbeddings.
+        mQwen3OmniNextZeroResidualAddend = rt::Tensor(
+            {talkerHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "mQwen3OmniNextZeroResidualAddend");
+        mNegInfConst = rt::Tensor({1}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "mNegInfConst");
+        int32_t const numCodeGroups = mTalkerConfig.numCodeGroups;
+        mCodecEmbPtrTable = rt::Tensor({numCodeGroups, static_cast<int64_t>(sizeof(__half const*))},
+            rt::DeviceType::kGPU, nvinfer1::DataType::kINT8, "mCodecEmbPtrTable");
+        mCodecEmbVocabSizes
+            = rt::Tensor({numCodeGroups}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "mCodecEmbVocabSizes");
+        mCodecRowCodes
+            = rt::Tensor({numCodeGroups}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64, "mCodecRowCodes");
+
         LOG_INFO("Talker buffers allocated (maxBS=%d, maxSeqLen=%ld, talkerH=%ld, cpH=%d)", mMaxBatchSize, maxSeqLen,
             talkerHiddenSize, mTalkerConfig.codePredictorHiddenSize);
         return true;
@@ -694,43 +750,144 @@ bool Qwen3OmniTTSRuntime::loadTalkerWeights(std::string const& weightsDir, cudaS
 {
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::loadTalkerWeights", nvtx_colors::YELLOW);
 
-    // Load text_projection weights
     std::filesystem::path const textProjPath = std::filesystem::path(weightsDir) / "text_projection.safetensors";
-    std::vector<rt::Tensor> textTensors;
-    if (!safetensors::loadSafetensors(textProjPath, textTensors, stream))
+    std::filesystem::path const hiddenProjPath = std::filesystem::path(weightsDir) / "hidden_projection.safetensors";
+
+    // Detect Qwen3-Next Omni Talker: text_projection.safetensors absent + hidden_projection.safetensors
+    // contains exactly 2 tensors (weight, bias for a single Linear) rather than the 4-tensor 2-layer
+    // MLP layout used by Qwen3-Omni / Qwen3-TTS. In that mode text tokens are looked up directly in
+    // Talker's own embed_tokens (already at talker hidden dim) — no text projection MLP — and
+    // multimodal tokens go through a single Linear.
+    mTalkerVariant = TalkerVariant::Omni;
+    if (!std::filesystem::exists(textProjPath) && std::filesystem::exists(hiddenProjPath))
     {
-        LOG_ERROR("Failed to load text_projection from: %s", textProjPath.string().c_str());
-        return false;
-    }
-    if (!extractMLPWeightsFromTensors(
-            textTensors, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias, "text_projection"))
-    {
-        return false;
+        std::vector<rt::Tensor> probeTensors;
+        if (safetensors::loadSafetensors(hiddenProjPath, probeTensors, stream) && probeTensors.size() == 2)
+        {
+            mTalkerVariant = TalkerVariant::OmniNext;
+        }
     }
 
-    // Load hidden_projection weights (same architecture as text_projection, different weights)
-    std::filesystem::path const hiddenProjPath = std::filesystem::path(weightsDir) / "hidden_projection.safetensors";
-    if (std::filesystem::exists(hiddenProjPath))
+    // HF talker_supppressed_tokens range = [vocab_size - K, vocab_size). K is
+    // 1024 for Qwen3-Omni and 3072 for Qwen3-Omni-Next; see
+    // ``modeling_qwen3_omni{,_next}.py::generate``. Without this the Talker
+    // can sample reserved tokens that have no codec_embedding entry, producing
+    // garbage codec ids that fold into mispronunciations / inserted syllables.
+    int32_t const kSuppressTailSize = isOmniNext() ? 3072 : 1024;
+    mTalkerConfig.talkerSuppressStart = std::max(0, mTalkerConfig.talkerVocabSize - kSuppressTailSize);
+
+    if (isOmniNext())
     {
-        mIsOmni = true;
+        // Qwen3-Next Omni: single Linear hidden_projection, no text_projection.
         std::vector<rt::Tensor> hiddenTensors;
         if (!safetensors::loadSafetensors(hiddenProjPath, hiddenTensors, stream))
         {
             LOG_ERROR("Failed to load hidden_projection from: %s", hiddenProjPath.string().c_str());
             return false;
         }
-        if (!extractMLPWeightsFromTensors(
-                hiddenTensors, mHiddenFC1Weight, mHiddenFC1Bias, mHiddenFC2Weight, mHiddenFC2Bias, "hidden_projection"))
+        // Locate weight + bias by shape (weight is 2D, bias is 1D) — the safetensors loader does not
+        // preserve original key names, so match by rank instead.
+        for (auto& t : hiddenTensors)
         {
+            int32_t const ndims = t.getShape().getNumDims();
+            if (ndims == 2)
+            {
+                mHiddenProjLinearWeight = std::move(t);
+            }
+            else if (ndims == 1)
+            {
+                mHiddenProjLinearBias = std::move(t);
+            }
+        }
+        check::check(mHiddenProjLinearWeight.rawPointer() != nullptr && mHiddenProjLinearBias.rawPointer() != nullptr,
+            "hidden_projection.safetensors must contain a 2D weight and a 1D bias");
+        mIsOmni = false; // text embedding comes from talkerEngineDir/text_embedding.safetensors
+        // Qwen3-Next Omni uses a different chat-template token set (vocab 248320).
+        // Engines exported with up-to-date ``_export_omni_next_talker`` carry the
+        // IDs in talker config.json already (the ``configJson.value(...)`` reads
+        // above pick them up); this block patches legacy engines whose
+        // config.json predates the export-side update so they keep working.
+        if (mTalkerConfig.imStartTokenId == talker_constants::kImStartTokenId)
+        {
+            mTalkerConfig.imStartTokenId = talker_constants::kImStartTokenIdNext;
+            mTalkerConfig.assistantRoleId = talker_constants::kAssistantRoleIdNext;
+            mTalkerConfig.userRoleId = talker_constants::kUserRoleIdNext;
+            mTalkerConfig.systemRoleId = talker_constants::kSystemRoleIdNext;
+            mTalkerConfig.audioTokenId = talker_constants::kAudioTokenIdNext;
+            mTalkerConfig.imageTokenId = talker_constants::kImageTokenIdNext;
+            mTalkerConfig.videoTokenId = talker_constants::kVideoTokenIdNext;
+        }
+        LOG_INFO(
+            "Qwen3-Next Omni Talker detected: single-Linear hidden_projection loaded from %s "
+            "(weight [%lld, %lld], bias [%lld])",
+            hiddenProjPath.string().c_str(), mHiddenProjLinearWeight.getShape()[0],
+            mHiddenProjLinearWeight.getShape()[1], mHiddenProjLinearBias.getShape()[0]);
+
+        // Load Talker codec_embedding (distinct from text embed_tokens — see header comment).
+        std::filesystem::path const codecEmbedPath = std::filesystem::path(weightsDir) / "codec_embedding.safetensors";
+        std::vector<rt::Tensor> codecEmbedTensors;
+        if (!safetensors::loadSafetensors(codecEmbedPath, codecEmbedTensors, stream) || codecEmbedTensors.empty())
+        {
+            LOG_ERROR(
+                "Qwen3-Next Omni Talker requires codec_embedding.safetensors at %s", codecEmbedPath.string().c_str());
             return false;
         }
-        LOG_INFO("hidden_projection weights loaded from: %s", hiddenProjPath.string().c_str());
+        mTalkerCodecEmbedTable = std::move(codecEmbedTensors[0]);
+        LOG_INFO("Qwen3-Next Omni Talker codec_embedding loaded: [%lld, %lld]", mTalkerCodecEmbedTable.getShape()[0],
+            mTalkerCodecEmbedTable.getShape()[1]);
+
+        // Load speaker_codec_embeddings (int64 templates per speaker).
+        std::filesystem::path const spkPath
+            = std::filesystem::path(weightsDir) / "speaker_codec_embeddings.safetensors";
+        std::vector<rt::Tensor> spkTensors;
+        if (!safetensors::loadSafetensors(spkPath, spkTensors, stream) || spkTensors.empty())
+        {
+            LOG_ERROR(
+                "Qwen3-Next Omni Talker requires speaker_codec_embeddings.safetensors at %s", spkPath.string().c_str());
+            return false;
+        }
+        mSpeakerCodecEmbeddings = std::move(spkTensors[0]);
+        auto const& spkShape = mSpeakerCodecEmbeddings.getShape();
+        LOG_INFO("Qwen3-Next Omni Talker speaker_codec_embeddings loaded: [%lld, %lld, %lld]", spkShape[0], spkShape[1],
+            spkShape[2]);
     }
     else
     {
-        mIsOmni = false;
-        LOG_INFO("hidden_projection.safetensors not found at %s (multimodal token projection unavailable)",
-            hiddenProjPath.string().c_str());
+        // Qwen3-Omni / Qwen3-TTS: 2-layer MLP text_projection + optional 2-layer MLP hidden_projection.
+        std::vector<rt::Tensor> textTensors;
+        if (!safetensors::loadSafetensors(textProjPath, textTensors, stream))
+        {
+            LOG_ERROR("Failed to load text_projection from: %s", textProjPath.string().c_str());
+            return false;
+        }
+        if (!extractMLPWeightsFromTensors(
+                textTensors, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias, "text_projection"))
+        {
+            return false;
+        }
+
+        if (std::filesystem::exists(hiddenProjPath))
+        {
+            mIsOmni = true;
+            std::vector<rt::Tensor> hiddenTensors;
+            if (!safetensors::loadSafetensors(hiddenProjPath, hiddenTensors, stream))
+            {
+                LOG_ERROR("Failed to load hidden_projection from: %s", hiddenProjPath.string().c_str());
+                return false;
+            }
+            if (!extractMLPWeightsFromTensors(hiddenTensors, mHiddenFC1Weight, mHiddenFC1Bias, mHiddenFC2Weight,
+                    mHiddenFC2Bias, "hidden_projection"))
+            {
+                return false;
+            }
+            LOG_INFO("hidden_projection weights loaded from: %s", hiddenProjPath.string().c_str());
+        }
+        else
+        {
+            mIsOmni = false;
+            LOG_INFO("hidden_projection.safetensors not found at %s (multimodal token projection unavailable)",
+                hiddenProjPath.string().c_str());
+        }
     }
 
     // Note: mTextEmbeddingTable is loaded separately in the constructor with mIsOmni-aware path selection
@@ -788,8 +945,18 @@ void Qwen3OmniTTSRuntime::initializeTTSEmbeddings(cudaStream_t stream)
     kernel::embeddingLookup(ttsIds, mTextEmbeddingTable, std::nullopt, ttsRaw, stream);
     // Reshape from [1, 3, hidden] to [3, hidden] for MLP (expects 2D input)
     check::check(ttsRaw.reshape({kNumTtsTokens, thinkerHiddenSize}), "Tensor reshape failed");
-    kernel::invokeTalkerMLP(
-        ttsRaw, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias, ttsProjected, workspace, stream);
+    if (isOmniNext())
+    {
+        // Qwen3-Next Omni: Talker's own embed_tokens already produces talker-hidden vectors —
+        // no projection needed. mTextEmbeddingTable.shape[1] equals talkerHiddenSize here.
+        CUDA_CHECK(cudaMemcpyAsync(ttsProjected.rawPointer(), ttsRaw.rawPointer(),
+            static_cast<size_t>(kNumTtsTokens) * thinkerHiddenSize * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
+    }
+    else
+    {
+        kernel::invokeTalkerMLP(
+            ttsRaw, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias, ttsProjected, workspace, stream);
+    }
 
     int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
     mTtsPadEmbed = rt::Tensor({hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
@@ -805,6 +972,18 @@ void Qwen3OmniTTSRuntime::initializeTTSEmbeddings(cudaStream_t stream)
         mTtsBosEmbed.rawPointer(), projectedPtr + 1 * hiddenSize, embedSize, cudaMemcpyDeviceToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(
         mTtsEosEmbed.rawPointer(), projectedPtr + 2 * hiddenSize, embedSize, cudaMemcpyDeviceToDevice, stream));
+
+    // OmniNext decode addend is zero (text is fed via re-prefill, not per step).
+    CUDA_CHECK(cudaMemsetAsync(mQwen3OmniNextZeroResidualAddend.rawPointer(), 0, embedSize, stream));
+
+    float const ninf = -std::numeric_limits<float>::infinity();
+    CUDA_CHECK(cudaMemcpyAsync(mNegInfConst.rawPointer(), &ninf, sizeof(float), cudaMemcpyHostToDevice, stream));
+
+    if (isOmniNext() && mTalkerCodecEmbedTable.rawPointer() != nullptr && !mCodePredictorEmbeddingTables.empty())
+    {
+        check::check(buildCodecEmbedPointerTable(stream), "buildCodecEmbedPointerTable failed");
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 
     LOG_INFO("TTS embeddings initialized");
 }
@@ -823,11 +1002,20 @@ bool Qwen3OmniTTSRuntime::projectToTalkerInput(
     LOG_INFO("projectToTalkerInput: seqLen=%ld, N=%ld (stripped prefix=%d suffix=%d), outputSeqLen=%ld, speakerId=%d",
         seqLen, N, kAssistantPrefixLen, kAssistantTrailingSuffix, outputSeqLen, speakerId);
 
-    // Project all tokens via text_projection MLP
+    // Project all tokens via text_projection MLP (Qwen3-Omni) or copy directly (Qwen3-Next Omni
+    // — Talker's own embed_tokens is already at talker hidden dim).
     check::check(mProjectedBuffer.reshape({seqLen, hiddenSize}), "Tensor reshape failed");
-    check::check(mMLPWorkspace.reshape({seqLen, thinkerHiddenSize}), "Tensor reshape failed");
-    kernel::invokeTalkerMLP(thinkerEmbed, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias, mProjectedBuffer,
-        mMLPWorkspace, stream);
+    if (isOmniNext())
+    {
+        CUDA_CHECK(cudaMemcpyAsync(mProjectedBuffer.rawPointer(), thinkerEmbed.rawPointer(),
+            static_cast<size_t>(seqLen) * hiddenSize * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
+    }
+    else
+    {
+        check::check(mMLPWorkspace.reshape({seqLen, thinkerHiddenSize}), "Tensor reshape failed");
+        kernel::invokeTalkerMLP(thinkerEmbed, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias,
+            mProjectedBuffer, mMLPWorkspace, stream);
+    }
 
     // Fused kernel: build complete non-streaming prefill buffer
     check::check(output.reshape({outputSeqLen, hiddenSize}), "Tensor reshape failed");
@@ -865,6 +1053,9 @@ bool Qwen3OmniTTSRuntime::executeTalkerPrefillStep(rt::Tensor const& inputEmbeds
     check::check(mHostReuseKVCacheLengths.reshape({batchSize}), "Tensor reshape failed");
     std::fill_n(mHostReuseKVCacheLengths.dataPointer<int32_t>(), batchSize, 0);
     talkerCacheMgr.resetForNewSequences(mHostReuseKVCacheLengths, stream);
+
+    // Zero Mamba SSM buffers — engine inputs, not covered by resetForNewSequences.
+    talkerCacheMgr.getMambaCacheManager().clearStates(stream);
 
     // Stage per-batch context lengths into PipelineIO's host buffer.
     // StepPreparer consumes hostContextLengths to fill GPU contextLengths + selectTokenIndices.
@@ -1297,13 +1488,26 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
             rt::Coords{1, mTalkerConfig.talkerVocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
         rt::Tensor seenBufSlice(mSeenCodecTokensBuf.dataPointer<int32_t>() + b * mTalkerLLMConfig.maxKVCacheCapacity,
             rt::Coords{mTalkerLLMConfig.maxKVCacheCapacity}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
-        kernel::invokeTalkerLogitAdjust(seenBufSlice, logitsSlice, mTalkerConfig.talkerVocabSize - 1024,
+        kernel::invokeTalkerLogitAdjust(seenBufSlice, logitsSlice, mTalkerConfig.talkerSuppressStart,
             mTalkerConfig.talkerVocabSize, mTalkerConfig.codecEosId, 0, repetitionPenalty, stream);
+
+        // Qwen3-Next Omni: if this batch has more text chunks to feed, suppress EOS so the model
+        // generates the full ``framesPerCall`` frames for this call (mirrors PT's
+        // min_new_tokens=chunk_m+1 enforcement via MinLengthLogitsProcessor).
+        if (b < static_cast<int32_t>(mQwen3OmniNextChunkStates.size()) && mQwen3OmniNextChunkStates[b].active)
+        {
+            suppressTalkerEosLogit(b, mTalkerConfig.talkerVocabSize, stream);
+        }
     }
 
-    // Batched sampling at bs=activeBatchSize.
-    trt_edgellm::topKtopPSamplingFromLogits(
-        mTalkerLogits, mTalkerSelectedIndices, talkerSamplingParams, mSamplingWorkspace, stream);
+    // Batched sampling at bs=activeBatchSize. PhiloxOffset=0 for the FIRST frame after prefill so
+    // it aligns with the runTalkerGenerationLoop chain that uses ``globalFrame+1`` for subsequent
+    // frames (frame 0 sampled here, frame 1 uses offset 1, etc.). Without an explicit offset the
+    // sampler default also produces 0 here, so the chain happens to align, but we pass it
+    // explicitly to make the intent clear and avoid silent breakage if defaults change.
+    trt_edgellm::topKtopPSamplingFromLogits(mTalkerLogits, mTalkerSelectedIndices, talkerSamplingParams,
+        mSamplingWorkspace, stream,
+        /*philoxSeed=*/42, /*philoxOffset=*/0);
     check::check(mHostSelectedTokenIds.reshape({activeBatchSize}), "Tensor reshape failed");
     CUDA_CHECK(cudaMemcpyAsync(mHostSelectedTokenIds.rawPointer(), mTalkerSelectedIndices.rawPointer(),
         activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
@@ -1445,8 +1649,13 @@ bool Qwen3OmniTTSRuntime::handleAudioGenerationFromThinker(
 
         int32_t trailingCount = 0;
         int64_t outSeqLen = 0;
-        if (!buildTalkerPrefillFromSegments(textTokenIds, req.thinkerPrefillEmbeds, req.thinkerHiddenStates,
-                req.prefillLength, mTextEmbeddingTable, speakerId, batchTrailingBuf, trailingCount, outSeqLen, stream))
+        bool const buildOk = isOmniNext()
+            ? buildQwen3OmniNextTalkerPrefill(textTokenIds, req.thinkerHiddenStates, req.prefillLength, speakerId,
+                  batchTrailingBuf, trailingCount, outSeqLen, stream)
+            : buildTalkerPrefillFromSegments(textTokenIds, req.thinkerPrefillEmbeds, req.thinkerHiddenStates,
+                  req.prefillLength, mTextEmbeddingTable, speakerId, batchTrailingBuf, trailingCount, outSeqLen,
+                  stream);
+        if (!buildOk)
         {
             return false;
         }
@@ -1524,7 +1733,7 @@ bool Qwen3OmniTTSRuntime::handleAudioGenerationFromThinker(
         rt::Tensor logitsSlice(static_cast<float*>(mTalkerLogits.rawPointer()) + b * mTalkerConfig.talkerVocabSize,
             rt::Coords{1, mTalkerConfig.talkerVocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
 
-        kernel::invokeTalkerLogitAdjust(mSeenCodecTokensBuf, logitsSlice, mTalkerConfig.talkerVocabSize - 1024,
+        kernel::invokeTalkerLogitAdjust(mSeenCodecTokensBuf, logitsSlice, mTalkerConfig.talkerSuppressStart,
             mTalkerConfig.talkerVocabSize, mTalkerConfig.codecEosId, 0, repetitionPenalty, stream);
     }
 
@@ -1612,7 +1821,7 @@ bool Qwen3OmniTTSRuntime::handleAudioGenerationFromThinker(
 bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerState>& states, int32_t activeBatchSize,
     int32_t maxFrames, SamplingParams const& talkerSamplingParams, SamplingParams const& predictorSamplingParams,
     float repetitionPenalty, std::vector<rt::Tensor const*> const& trailingTextHiddens, cudaStream_t stream,
-    std::vector<int64_t> const& prefillSeqLens, std::vector<PerBatchStreamingHandler> const& streamingHandlers)
+    std::vector<int64_t>& prefillSeqLens, std::vector<PerBatchStreamingHandler> const& streamingHandlers)
 {
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::runTalkerGenerationLoop", nvtx_colors::PURPLE);
 
@@ -1632,14 +1841,8 @@ bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerStat
         }
     }
 
-    // Initialize per-batch seen token tracking. numSeenTokens starts at 0 so the repetition
-    // penalty kernel reads no entries on the first decode frame, avoiding a read of the
-    // unseeded GPU buffer. The in-loop code below records tokens into both the host set and
-    // GPU buffer starting from the first iteration.
-    // NOTE: the host set / GPU buffer are still off-by-one (host set tracks the token entering
-    // each iteration while the GPU buffer receives the newly sampled token). That functional
-    // drift is pre-existing and tracked as a follow-up together with the standalone-TTS
-    // Chinese-prompt prefill-EOS anomaly surfaced during MR 770 review.
+    // Zero-init per-batch seen tokens so the repetition penalty reads no entries on the first
+    // frame. Host set / GPU buffer are still off-by-one — see MR 770 follow-ups.
     for (int32_t b = 0; b < activeBatchSize; ++b)
     {
         states[b].numSeenTokens = 0;
@@ -1686,6 +1889,7 @@ bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerStat
                     unfinished--;
                     activeMask[b] = false;
                     --activeBatchPresentCount;
+                    continue;
                 }
             }
 
@@ -1695,7 +1899,7 @@ bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerStat
             // occupy a slot (dummy work) until a future evict pass is added.
             std::vector<std::vector<int32_t>> framesPerBatch;
             if (!runCodePredictorGenerationForFrame(activeBatchSize, activeBatchCodes, mTalkerLastHidden,
-                    predictorSamplingParams, framesPerBatch, stream))
+                    predictorSamplingParams, framesPerBatch, stream, globalFrame))
             {
                 LOG_ERROR("CodePredictor failed at frame %d", globalFrame);
                 return false;
@@ -1764,8 +1968,24 @@ bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerStat
                     mSeenCodecTokensBuf.dataPointer<int32_t>() + b * mTalkerLLMConfig.maxKVCacheCapacity,
                     rt::Coords{mTalkerLLMConfig.maxKVCacheCapacity}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
 
-                kernel::invokeTalkerLogitAdjust(seenBufSlice, logitsSlice, mTalkerConfig.talkerVocabSize - 1024,
+                kernel::invokeTalkerLogitAdjust(seenBufSlice, logitsSlice, mTalkerConfig.talkerSuppressStart,
                     mTalkerConfig.talkerVocabSize, codecEosId, states[b].numSeenTokens, repetitionPenalty, stream);
+
+                // Suppress EOS through the chunk-boundary iter so re-prefill always runs before
+                // the loop's finished check. Last-chunk (cs.active==false) is exempted.
+                if (b < static_cast<int32_t>(mQwen3OmniNextChunkStates.size()))
+                {
+                    auto const& cs = mQwen3OmniNextChunkStates[b];
+                    if (cs.active)
+                    {
+                        int32_t const framesThisCall
+                            = static_cast<int32_t>(states[b].rvqCodes.size()) - cs.firstFrameOfCallIdx;
+                        if (framesThisCall <= cs.framesPerCall)
+                        {
+                            suppressTalkerEosLogit(b, mTalkerConfig.talkerVocabSize, stream);
+                        }
+                    }
+                }
             }
 
             // Batched sampling
@@ -1806,6 +2026,23 @@ bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerStat
                 }
             }
             globalFrame++;
+
+            if (!driveOmniNextChunkReprefills(
+                    states, activeBatchSize, globalFrame, talkerSamplingParams, repetitionPenalty, unfinished, stream))
+            {
+                return false;
+            }
+            // driveOmniNextChunkReprefills may have grown mQwen3OmniNextChunkStates[b].cumulativeSeqLen;
+            // mirror that into prefillSeqLens so the next iteration extracts the correct last row.
+            for (int32_t b = 0; b < activeBatchSize; ++b)
+            {
+                if (b < static_cast<int32_t>(mQwen3OmniNextChunkStates.size())
+                    && b < static_cast<int32_t>(prefillSeqLens.size())
+                    && mQwen3OmniNextChunkStates[b].cumulativeSeqLen != 0)
+                {
+                    prefillSeqLens[b] = mQwen3OmniNextChunkStates[b].cumulativeSeqLen;
+                }
+            }
         }
     }
 
@@ -1844,7 +2081,7 @@ bool Qwen3OmniTTSRuntime::runSingleTalkerDecodeFrame(int32_t& codecToken, Sampli
         rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
     std::vector<std::vector<int32_t>> framesPerBatch;
     if (!runCodePredictorGenerationForFrame(/*activeBatchSize=*/1, std::vector<int32_t>{codecToken}, talkerLastBatched,
-            predictorSamplingParams, framesPerBatch, stream))
+            predictorSamplingParams, framesPerBatch, stream, frameIdx))
     {
         LOG_ERROR("CodePredictor generation failed at frame %d", frameIdx);
         return false;
@@ -1872,7 +2109,7 @@ bool Qwen3OmniTTSRuntime::runSingleTalkerDecodeFrame(int32_t& codecToken, Sampli
         return false;
     }
 
-    kernel::invokeTalkerLogitAdjust(mSeenCodecTokensBuf, mTalkerLogits, mTalkerConfig.talkerVocabSize - 1024,
+    kernel::invokeTalkerLogitAdjust(mSeenCodecTokensBuf, mTalkerLogits, mTalkerConfig.talkerSuppressStart,
         mTalkerConfig.talkerVocabSize, codecEosId, numSeenTokens, repetitionPenalty, stream);
     trt_edgellm::topKtopPSamplingFromLogits(mTalkerLogits, mTalkerSelectedIndices, talkerSamplingParams,
         mSamplingWorkspace, stream, 42, static_cast<uint64_t>(frameIdx + 1));
@@ -1893,9 +2130,13 @@ bool Qwen3OmniTTSRuntime::runSingleTalkerDecodeFrame(int32_t& codecToken, Sampli
 
 bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t activeBatchSize,
     std::vector<int32_t> const& codecTokensPerBatch, rt::Tensor const& talkerLastHiddenBatched,
-    SamplingParams const& samplingParams, std::vector<std::vector<int32_t>>& outputCodesPerBatch, cudaStream_t stream)
+    SamplingParams const& samplingParams, std::vector<std::vector<int32_t>>& outputCodesPerBatch, cudaStream_t stream,
+    int32_t globalFrame)
 {
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::runCodePredictorGenerationForFrame", nvtx_colors::ORANGE);
+    // Every CP sampling call within a frame needs a UNIQUE Philox offset — a constant offset
+    // repeats the RNG state and degenerates sampling. cpBase is frame-unique; add step per call.
+    uint64_t const cpOffsetBase = static_cast<uint64_t>(globalFrame) * (mNumRvqLayers + 4) + 1000;
 
     int64_t const talkerH = mTalkerConfig.talkerHiddenSize;
     int64_t const cpH = mTalkerConfig.codePredictorHiddenSize;
@@ -1933,11 +2174,14 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t activeBatch
     }
 
     // ---- Step 1: Batched lookup of code_0 embeddings (Talker codec_embedding, talkerH-dim) ----
+    // For Qwen3-Next Omni Talker we MUST use mTalkerCodecEmbedTable (codec vocab 5120). The legacy
+    // Qwen3-Omni Talker uses mTalkerEmbeddingTable because there embed_tokens IS the codec table.
+    rt::Tensor const& codeZeroEmbedTable = isOmniNext() ? mTalkerCodecEmbedTable : mTalkerEmbeddingTable;
     check::check(mCodePredictorCodecIds.reshape({activeBatchSize, 1}), "Tensor reshape failed");
     CUDA_CHECK(cudaMemcpyAsync(mCodePredictorCodecIds.rawPointer(), codecTokensPerBatch.data(),
         activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     check::check(mRawCodecEmbed.reshape({activeBatchSize, 1, talkerH}), "Tensor reshape failed");
-    kernel::embeddingLookup(mCodePredictorCodecIds, mTalkerEmbeddingTable, std::nullopt, mRawCodecEmbed, stream);
+    kernel::embeddingLookup(mCodePredictorCodecIds, codeZeroEmbedTable, std::nullopt, mRawCodecEmbed, stream);
 
     // ---- Step 2: Build [activeBS, 2, cpH] prefill input — slot 0 = proj(talker_h), slot 1 = proj(code_0_embed)
     check::check(mCodePredictorPrefillInput.reshape({activeBatchSize, 2, cpH}), "Tensor reshape failed");
@@ -1977,8 +2221,9 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t activeBatch
         check::check(mCodePredictorSelectedIndices.reshape({activeBatchSize, 1}), "Tensor reshape failed");
         SamplingParams const perCallParams(
             activeBatchSize, codebookSize, samplingParams.temperature, samplingParams.topK, samplingParams.topP);
-        trt_edgellm::topKtopPSamplingFromLogits(
-            logitsHead0, mCodePredictorSelectedIndices, perCallParams, mSamplingWorkspace, stream);
+        trt_edgellm::topKtopPSamplingFromLogits(logitsHead0, mCodePredictorSelectedIndices, perCallParams,
+            mSamplingWorkspace, stream,
+            /*philoxSeed=*/42, /*philoxOffset=*/cpOffsetBase + 1);
         check::check(mHostSelectedCodeIds.reshape({activeBatchSize}), "Tensor reshape failed");
         CUDA_CHECK(cudaMemcpyAsync(mHostSelectedCodeIds.rawPointer(), mCodePredictorSelectedIndices.rawPointer(),
             activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
@@ -2071,8 +2316,9 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t activeBatch
             check::check(logitsForHead.reshape({activeBatchSize, codebookSize}), "Tensor reshape failed");
             SamplingParams const perCallParams(
                 activeBatchSize, codebookSize, samplingParams.temperature, samplingParams.topK, samplingParams.topP);
-            trt_edgellm::topKtopPSamplingFromLogits(
-                logitsForHead, mCodePredictorSelectedIndices, perCallParams, mSamplingWorkspace, stream);
+            trt_edgellm::topKtopPSamplingFromLogits(logitsForHead, mCodePredictorSelectedIndices, perCallParams,
+                mSamplingWorkspace, stream,
+                /*philoxSeed=*/42, /*philoxOffset=*/cpOffsetBase + static_cast<uint64_t>(step));
 
             // Async D2H to row (step - 2) × maxBS of pinned host buffer;
             // deliberately NO cudaStreamSynchronize here — the value will be
@@ -2106,15 +2352,8 @@ bool Qwen3OmniTTSRuntime::computeResidualConnection(rt::Tensor const& codecHidde
 {
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::computeResidualConnection", nvtx_colors::BLUE);
 
-    // PyTorch (modeling_qwen3_omni.py:3429-3434):
-    //   if generation_step < trailing_text_hidden.shape[1]:
-    //       inputs_embeds += trailing_text_hidden[:, generation_step]
-    //   else:
-    //       inputs_embeds += tts_pad_embed
-    //
-    // codecHiddensThisBatch: [1, mNumCodesPerFrame, talkerH] view into per-batch slot of mCodecHiddensBuffer.
-    // The kernel reads middle positions [1..mNumRvqLayers-1] (filled by CP decode loop) and
-    // fills positions 0 and mNumRvqLayers via Talker/CP embedding lookup using codes[0] / codes[last].
+    // codecHiddensThisBatch: [1, mNumCodesPerFrame, talkerH] per-batch slot of mCodecHiddensBuffer.
+    // Kernel reads middle rows filled by CP; positions 0/last are looked up from codes[0]/codes[last].
 
     check::check(static_cast<int32_t>(codes.size()) == mNumCodesPerFrame,
         "Expected " + std::to_string(mNumCodesPerFrame) + " codes, got " + std::to_string(codes.size()));
@@ -2126,8 +2365,11 @@ bool Qwen3OmniTTSRuntime::computeResidualConnection(rt::Tensor const& codecHidde
             outputResidual.getShape() == rt::Coords{1, 1, hiddenSize}, "Non-owning residual tensor has wrong shape");
     }
 
-    __half const* addend = mTtsPadEmbed.dataPointer<__half>();
-    if (trailingTextHidden != nullptr)
+    // Residual addend: Qwen3-Omni/TTS injects per-frame trailing text (falls back to pad);
+    // OmniNext supplies text via chunked re-prefill, so its per-frame addend is zero.
+    __half const* addend = isOmniNext() ? static_cast<__half const*>(mQwen3OmniNextZeroResidualAddend.rawPointer())
+                                        : mTtsPadEmbed.dataPointer<__half>();
+    if (!isOmniNext() && trailingTextHidden != nullptr)
     {
         int64_t const trailingLen = trailingTextHidden->getShape()[0];
         if (generationStep < trailingLen)
@@ -2136,7 +2378,10 @@ bool Qwen3OmniTTSRuntime::computeResidualConnection(rt::Tensor const& codecHidde
         }
     }
 
-    kernel::invokeResidualConnection(codecHiddensThisBatch, mTalkerEmbeddingTable,
+    // Position-0 codec token lookup: OmniNext keeps text and codec embeds in separate tables;
+    // Qwen3-Omni/TTS store only the codec table in mTalkerEmbeddingTable.
+    rt::Tensor const& position0Table = isOmniNext() ? mTalkerCodecEmbedTable : mTalkerEmbeddingTable;
+    kernel::invokeResidualConnection(codecHiddensThisBatch, position0Table,
         mCodePredictorEmbeddingTables[mNumRvqLayers - 1], codes[0], codes[mNumRvqLayers], addend, outputResidual,
         stream);
 
@@ -2166,11 +2411,12 @@ bool Qwen3OmniTTSRuntime::extractTalkerLastHidden(
             "extractTalkerLastHidden: non-owning output has wrong shape");
     }
 
-    // Extract last token for each batch: output[b] = input[b, seqLen-1, :]
+    // Talker engine emits the last-position hidden at row 0 regardless of seqLen — reading
+    // seqLen-1 yields zeros and starves the CodePredictor.
     size_t const copySize = hiddenSize * sizeof(__half);
     for (int64_t b = 0; b < batchSize; ++b)
     {
-        size_t const srcOffset = (b * seqLen + seqLen - 1) * hiddenSize * sizeof(__half);
+        size_t const srcOffset = b * seqLen * hiddenSize * sizeof(__half); // row 0 per batch
         size_t const dstOffset = b * hiddenSize * sizeof(__half);
         CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(outputLastHidden.rawPointer()) + dstOffset,
             static_cast<char const*>(talkerHiddenStates.rawPointer()) + srcOffset, copySize, cudaMemcpyDeviceToDevice,
@@ -2238,17 +2484,26 @@ bool Qwen3OmniTTSRuntime::buildTalkerPrefillFromSegments(std::vector<int32_t> co
         kernel::embeddingLookup(mGpuTokenIdsBuffer, thinkerEmbedTable, std::nullopt, embedView, stream);
     }
 
-    // Step 2: Project ALL tokens through text_projection MLP
+    // Step 2: Project ALL tokens through text_projection (Qwen3-Omni: 2-layer MLP) or
+    // copy them directly (Qwen3-Next Omni: Talker's own embed_tokens is already at talker hidden dim).
     check::check(mProjectedBuffer.reshape({seqLen, hiddenSize}), "Tensor reshape failed");
-    check::check(mMLPWorkspace.reshape({seqLen, thinkerHiddenSize}), "Tensor reshape failed");
-    kernel::invokeTalkerMLP(mThinkerEmbedBuffer, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias,
-        mProjectedBuffer, mMLPWorkspace, stream);
+    if (isOmniNext())
+    {
+        CUDA_CHECK(cudaMemcpyAsync(mProjectedBuffer.rawPointer(), mThinkerEmbedBuffer.rawPointer(),
+            static_cast<size_t>(seqLen) * hiddenSize * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
+    }
+    else
+    {
+        check::check(mMLPWorkspace.reshape({seqLen, thinkerHiddenSize}), "Tensor reshape failed");
+        kernel::invokeTalkerMLP(mThinkerEmbedBuffer, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias,
+            mProjectedBuffer, mMLPWorkspace, stream);
+    }
 
     // Step 3: Parse segments by <|im_start|> positions
     std::vector<SegmentInfo> segments;
     for (int64_t i = 0; i < seqLen; ++i)
     {
-        if (textTokenIds[i] == kImStartTokenId)
+        if (textTokenIds[i] == mTalkerConfig.imStartTokenId)
         {
             int32_t const roleId = (i + 1 < seqLen) ? textTokenIds[i + 1] : -1;
             segments.push_back({i, seqLen, roleId});
@@ -2263,11 +2518,11 @@ bool Qwen3OmniTTSRuntime::buildTalkerPrefillFromSegments(std::vector<int32_t> co
     int64_t assistantSegIdx = -1;
     for (size_t s = 0; s < segments.size(); ++s)
     {
-        if (segments[s].roleId == kSystemRoleId)
+        if (segments[s].roleId == mTalkerConfig.systemRoleId)
             continue;
-        else if (segments[s].roleId == kUserRoleId)
+        else if (segments[s].roleId == mTalkerConfig.userRoleId)
             userSegmentIndices.push_back(s);
-        else if (segments[s].roleId == kAssistantRoleId)
+        else if (segments[s].roleId == mTalkerConfig.assistantRoleId)
             assistantSegIdx = static_cast<int64_t>(s);
     }
 
@@ -2278,7 +2533,8 @@ bool Qwen3OmniTTSRuntime::buildTalkerPrefillFromSegments(std::vector<int32_t> co
     }
 
     // Step 4: Project multimodal tokens via hidden_projection using gather/scatter kernels
-    bool const hasHiddenProjection = (mHiddenFC1Weight.getShape().volume() > 0);
+    bool const hasHiddenProjection
+        = isOmniNext() ? (mHiddenProjLinearWeight.getShape().volume() > 0) : (mHiddenFC1Weight.getShape().volume() > 0);
     if (hasHiddenProjection && prefillHiddenPtr != nullptr)
     {
         std::vector<int32_t> mmPositions;
@@ -2288,7 +2544,8 @@ bool Qwen3OmniTTSRuntime::buildTalkerPrefillFromSegments(std::vector<int32_t> co
             for (int64_t i = seg.startPos; i < seg.endPos && i < prefillLen; ++i)
             {
                 int32_t const tid = textTokenIds[i];
-                if (tid == kAudioTokenId || tid == kImageTokenId || tid == kVideoTokenId)
+                if (tid == mTalkerConfig.audioTokenId || tid == mTalkerConfig.imageTokenId
+                    || tid == mTalkerConfig.videoTokenId)
                     mmPositions.push_back(static_cast<int32_t>(i));
             }
         }
@@ -2314,8 +2571,17 @@ bool Qwen3OmniTTSRuntime::buildTalkerPrefillFromSegments(std::vector<int32_t> co
                 nvinfer1::DataType::kHALF);
             kernel::invokeGather(hiddenSource, mGatherIndicesBuffer, mThinkerEmbedBuffer, stream);
 
-            kernel::invokeTalkerMLP(mThinkerEmbedBuffer, mHiddenFC1Weight, mHiddenFC1Bias, mHiddenFC2Weight,
-                mHiddenFC2Bias, mTalkerInputEmbeds, mMLPWorkspace, stream);
+            if (isOmniNext())
+            {
+                // Qwen3-Next Omni: single Linear (weight [talkerHidden, thinkerHidden] + bias [talkerHidden]).
+                kernel::invokeLinearLayer(
+                    mThinkerEmbedBuffer, mHiddenProjLinearWeight, mHiddenProjLinearBias, mTalkerInputEmbeds, stream);
+            }
+            else
+            {
+                kernel::invokeTalkerMLP(mThinkerEmbedBuffer, mHiddenFC1Weight, mHiddenFC1Bias, mHiddenFC2Weight,
+                    mHiddenFC2Bias, mTalkerInputEmbeds, mMLPWorkspace, stream);
+            }
 
             // Scatter projected multimodal embeddings back into mProjectedBuffer
             kernel::invokeScatter(mTalkerInputEmbeds, mGatherIndicesBuffer, mProjectedBuffer, stream);
@@ -2330,7 +2596,8 @@ bool Qwen3OmniTTSRuntime::buildTalkerPrefillFromSegments(std::vector<int32_t> co
             for (int64_t i = seg.startPos; i < seg.endPos; ++i)
             {
                 int32_t const tid = textTokenIds[i];
-                if (tid == kAudioTokenId || tid == kImageTokenId || tid == kVideoTokenId)
+                if (tid == mTalkerConfig.audioTokenId || tid == mTalkerConfig.imageTokenId
+                    || tid == mTalkerConfig.videoTokenId)
                 {
                     __half* rowPtr = static_cast<__half*>(mProjectedBuffer.rawPointer()) + i * hiddenSize;
                     CUDA_CHECK(cudaMemsetAsync(rowPtr, 0, hiddenSize * sizeof(__half), stream));
@@ -2405,6 +2672,681 @@ bool Qwen3OmniTTSRuntime::buildTalkerPrefillFromSegments(std::vector<int32_t> co
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// OmniNext Talker prefill: row-assembly primitives shared by build + reprefill.
+// See buildQwen3OmniNextTalkerPrefill for the row sequence.
+// ---------------------------------------------------------------------------
+
+bool Qwen3OmniTTSRuntime::copyEmbedRow(
+    rt::Tensor const& table, int32_t tokenId, __half* dstBase, int64_t dstRow, cudaStream_t stream)
+{
+    int64_t const vocab = table.getShape()[0];
+    int64_t const hiddenSize = table.getShape()[1];
+    if (tokenId < 0 || tokenId >= vocab)
+    {
+        LOG_ERROR("Embed lookup OOB: tokenId=%d vocab=%ld", tokenId, vocab);
+        return false;
+    }
+    __half const* src = static_cast<__half const*>(table.rawPointer()) + static_cast<int64_t>(tokenId) * hiddenSize;
+    CUDA_CHECK(cudaMemcpyAsync(dstBase + dstRow * hiddenSize, src, static_cast<size_t>(hiddenSize) * sizeof(__half),
+        cudaMemcpyDeviceToDevice, stream));
+    return true;
+}
+
+void Qwen3OmniTTSRuntime::copyRawRow(rt::Tensor const& src, __half* dstBase, int64_t dstRow, cudaStream_t stream)
+{
+    int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
+    CUDA_CHECK(cudaMemcpyAsync(dstBase + dstRow * hiddenSize, src.rawPointer(),
+        static_cast<size_t>(hiddenSize) * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
+}
+
+bool Qwen3OmniTTSRuntime::buildCodecEmbedPointerTable(cudaStream_t stream)
+{
+    int32_t const numCodeGroups = mTalkerConfig.numCodeGroups;
+    if (static_cast<int32_t>(mCodePredictorEmbeddingTables.size()) < numCodeGroups - 1)
+    {
+        LOG_ERROR("CodePredictor codec embed tables (%zu) < numCodeGroups-1 (%d)", mCodePredictorEmbeddingTables.size(),
+            numCodeGroups - 1);
+        return false;
+    }
+    std::vector<__half const*> hostEmbPtrs(numCodeGroups);
+    std::vector<int32_t> hostVocabSizes(numCodeGroups);
+    hostEmbPtrs[0] = static_cast<__half const*>(mTalkerCodecEmbedTable.rawPointer());
+    hostVocabSizes[0] = static_cast<int32_t>(mTalkerCodecEmbedTable.getShape()[0]);
+    for (int32_t g = 1; g < numCodeGroups; ++g)
+    {
+        rt::Tensor const& t = mCodePredictorEmbeddingTables[g - 1];
+        hostEmbPtrs[g] = static_cast<__half const*>(t.rawPointer());
+        hostVocabSizes[g] = static_cast<int32_t>(t.getShape()[0]);
+    }
+    CUDA_CHECK(cudaMemcpyAsync(mCodecEmbPtrTable.rawPointer(), hostEmbPtrs.data(),
+        numCodeGroups * sizeof(__half const*), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(mCodecEmbVocabSizes.rawPointer(), hostVocabSizes.data(), numCodeGroups * sizeof(int32_t),
+        cudaMemcpyHostToDevice, stream));
+    return true;
+}
+
+void Qwen3OmniTTSRuntime::sumSpeakerCodecRow(
+    int64_t const* hostCodes, __half* dstBase, int64_t dstRow, cudaStream_t stream)
+{
+    int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
+    int32_t const numCodeGroups = mTalkerConfig.numCodeGroups;
+    CUDA_CHECK(cudaMemcpyAsync(
+        mCodecRowCodes.rawPointer(), hostCodes, numCodeGroups * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
+    rt::Tensor rowOut(
+        dstBase + dstRow * hiddenSize, rt::Coords{hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    kernel::invokeSpeakerCodecSum(mCodecRowCodes, mCodecEmbPtrTable, mCodecEmbVocabSizes, rowOut, stream);
+}
+
+void Qwen3OmniTTSRuntime::projectHiddenRow(
+    rt::Tensor const& prefillHidden, int64_t srcRow, __half* dstBase, int64_t dstRow, cudaStream_t stream)
+{
+    int64_t const thinkerHiddenSize = mTalkerConfig.thinkerHiddenSize;
+    int64_t const talkerHiddenSize = mTalkerConfig.talkerHiddenSize;
+    __half const* hSrc = static_cast<__half const*>(prefillHidden.rawPointer()) + srcRow * thinkerHiddenSize;
+    rt::Tensor hSlice(
+        const_cast<__half*>(hSrc), rt::Coords{1, thinkerHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor outSlice(dstBase + dstRow * talkerHiddenSize, rt::Coords{1, talkerHiddenSize}, rt::DeviceType::kGPU,
+        nvinfer1::DataType::kHALF);
+    kernel::invokeLinearLayer(hSlice, mHiddenProjLinearWeight, mHiddenProjLinearBias, outSlice, stream);
+}
+
+// ---------------------------------------------------------------------------
+// OmniNext Talker prefill (system + user + assistant), mirrors HF
+// _get_talker_{system,user,assistant}_parts. Row sequence:
+//   sys:  [im_start, system, nl] + speaker_system_prompt +
+//         codec_bos + speaker_codec_sum[..] + codec_eos + [im_end, nl]
+//   usr:  role tokens via text embed, content tokens via hidden_projection(prefillHidden)
+//   asst: [im_start, assistant, nl] + [codec_nothink, codec_think_bos, codec_think_eos]
+//         + tts_bos + codec_bos + first text chunk (up to kTextInChunkN rows).
+// Remaining text chunks + tts_eos go into mQwen3OmniNextChunkStates[0] for reprefill.
+// ---------------------------------------------------------------------------
+
+bool Qwen3OmniTTSRuntime::buildQwen3OmniNextTalkerPrefill(std::vector<int32_t> const& textTokenIds,
+    rt::Tensor const* prefillHiddenPtr, int32_t prefillLen, int32_t speakerId, rt::Tensor& trailingTextHidden,
+    int32_t& trailingCount, int64_t& outSeqLen, cudaStream_t stream)
+{
+    NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::buildQwen3OmniNextTalkerPrefill", nvtx_colors::PALE_GREEN);
+
+    int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
+    int32_t const numCodeGroups = mTalkerConfig.numCodeGroups;
+    int32_t const codecBosId = mTalkerConfig.codecBosId;
+    int32_t const codecEosId = mTalkerConfig.codecEosId;
+    int32_t const codecNothinkId = mTalkerConfig.codecNothinkId;
+    int32_t const codecThinkBosId = mTalkerConfig.codecThinkBosId;
+    int32_t const codecThinkEosId = mTalkerConfig.codecThinkEosId;
+
+    if (mTalkerCodecEmbedTable.rawPointer() == nullptr || mSpeakerCodecEmbeddings.rawPointer() == nullptr)
+    {
+        LOG_ERROR("OmniNext prefill requires codec_embedding and speaker_codec_embeddings sidecars");
+        return false;
+    }
+    auto const& spkShape = mSpeakerCodecEmbeddings.getShape();
+    int32_t const maxSpeakerNum = static_cast<int32_t>(spkShape[0]);
+    int32_t const numGroupsSpk = static_cast<int32_t>(spkShape[1]);
+    int32_t const speakerEmbedLen = static_cast<int32_t>(spkShape[2]);
+    if (speakerId < 0 || speakerId >= maxSpeakerNum)
+    {
+        LOG_ERROR("speakerId %d out of range [0, %d)", speakerId, maxSpeakerNum);
+        return false;
+    }
+    if (numGroupsSpk != numCodeGroups)
+    {
+        LOG_ERROR("speaker_codec_embeddings groups (%d) != numCodeGroups (%d)", numGroupsSpk, numCodeGroups);
+        return false;
+    }
+
+    // Pull the speaker's codec-code matrix to host once and trim its -1 padding
+    // (HF: speaker_code[..., :valid_len]).
+    int64_t const speakerRowBytes = static_cast<int64_t>(numCodeGroups) * speakerEmbedLen * sizeof(int64_t);
+    std::vector<int64_t> speakerRow(static_cast<size_t>(numCodeGroups) * speakerEmbedLen);
+    CUDA_CHECK(cudaMemcpyAsync(speakerRow.data(),
+        static_cast<int64_t const*>(mSpeakerCodecEmbeddings.rawPointer())
+            + static_cast<int64_t>(speakerId) * numCodeGroups * speakerEmbedLen,
+        speakerRowBytes, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    int32_t validSpeakerLen = 0;
+    for (int32_t p = speakerEmbedLen - 1; p >= 0; --p)
+    {
+        bool any = false;
+        for (int32_t g = 0; g < numCodeGroups; ++g)
+        {
+            if (speakerRow[static_cast<size_t>(g) * speakerEmbedLen + p] != -1)
+            {
+                any = true;
+                break;
+            }
+        }
+        if (any)
+        {
+            validSpeakerLen = p + 1;
+            break;
+        }
+    }
+    if (validSpeakerLen == 0)
+    {
+        validSpeakerLen = speakerEmbedLen;
+    }
+
+    // Row plan (mirrors HF _get_talker_system_parts / _user_parts / _assistant_parts).
+    constexpr int32_t kSysRolePrefix = 3;  // [im_start, system, nl]
+    constexpr int32_t kSysSuffix = 2;      // [im_end, nl]
+    constexpr int32_t kAsstRolePrefix = 3; // [im_start, assistant, nl]
+    constexpr int32_t kCodecSpecial = 3;   // [codec_nothink, codec_think_bos, codec_think_eos]
+
+    // HF inserts a per-speaker text prompt between [im_start,system,nl] and codec_bos.
+    std::vector<int32_t> const* speakerSysPromptPtr = nullptr;
+    if (auto it = mSpeakerSystemPromptIds.find(speakerId); it != mSpeakerSystemPromptIds.end())
+    {
+        speakerSysPromptPtr = &it->second;
+    }
+    int32_t const sysPromptLen = speakerSysPromptPtr ? static_cast<int32_t>(speakerSysPromptPtr->size()) : 0;
+    int32_t const systemRows = kSysRolePrefix + sysPromptLen + 1 /*codec_bos*/ + validSpeakerLen + 1 /*codec_eos*/
+        + kSysSuffix;
+
+    // Split the ChatML token stream into (start, end, roleId) segments so we can
+    // replay user segments and locate the assistant text.
+    struct ChatSegment
+    {
+        int32_t start;
+        int32_t end;
+        int32_t roleId;
+    };
+    std::vector<ChatSegment> segments;
+    for (size_t i = 0; i < textTokenIds.size(); ++i)
+    {
+        if (textTokenIds[i] == mTalkerConfig.imStartTokenId && i + 1 < textTokenIds.size())
+        {
+            segments.push_back(
+                {static_cast<int32_t>(i), static_cast<int32_t>(textTokenIds.size()), textTokenIds[i + 1]});
+        }
+    }
+    for (size_t s = 0; s + 1 < segments.size(); ++s)
+    {
+        segments[s].end = segments[s + 1].start;
+    }
+    int32_t assistantSegIdx = -1;
+    for (size_t s = 0; s < segments.size(); ++s)
+    {
+        if (segments[s].roleId == mTalkerConfig.assistantRoleId)
+        {
+            assistantSegIdx = static_cast<int32_t>(s);
+        }
+    }
+    if (assistantSegIdx < 0)
+    {
+        LOG_ERROR("buildQwen3OmniNextTalkerPrefill: assistant role marker not found in textTokenIds");
+        return false;
+    }
+    // The chat template appends <|im_start|>assistant\n<think>\n</think>\n via
+    // add_generation_prompt, so prefillLen already sits at the first generated content token.
+    auto const& asstSeg = segments[assistantSegIdx];
+    int32_t assistantTextStart = prefillLen;
+    int32_t assistantTextEnd = asstSeg.end;
+    for (int32_t i = assistantTextStart; i < asstSeg.end; ++i)
+    {
+        if (textTokenIds[i] == kImEndTokenIdNext)
+        {
+            assistantTextEnd = i;
+            break;
+        }
+    }
+    int32_t const assistantTextLen = std::max(0, assistantTextEnd - assistantTextStart);
+    int32_t const totalTextLen = assistantTextLen + 1; // +1 for appended tts_eos
+    int32_t const firstChunkLen = std::min(totalTextLen, kTextInChunkN);
+
+    int32_t const assistantRows = kAsstRolePrefix + kCodecSpecial + 1 /*tts_bos*/ + 1 /*codec_bos*/ + firstChunkLen;
+
+    // User part: role tokens use Talker text embed; content tokens go through the
+    // single-Linear hidden_projection. mmPos is subsampled per segment via
+    // torch.linspace(0,N-1,M).long() to at most maxThinkerToTalkerMmTokens.
+    auto isUserRoleToken = [&](int32_t t) {
+        return t == mTalkerConfig.imStartTokenId || t == kImEndTokenIdNext || t == mTalkerConfig.userRoleId
+            || t == kNlTokenIdNext;
+    };
+    std::vector<std::pair<int32_t /*tokenId*/, int32_t /*absPos*/>> userPositions;
+    for (size_t s = 0; s < segments.size(); ++s)
+    {
+        if (static_cast<int32_t>(s) == assistantSegIdx)
+        {
+            break;
+        }
+        if (segments[s].roleId == mTalkerConfig.systemRoleId)
+        {
+            continue; // system role is handled by the speaker_part above
+        }
+        std::vector<int32_t> rolePos;
+        std::vector<int32_t> mmPos;
+        for (int32_t i = segments[s].start; i < segments[s].end; ++i)
+        {
+            (isUserRoleToken(textTokenIds[i]) ? rolePos : mmPos).push_back(i);
+        }
+        if (mTalkerConfig.maxThinkerToTalkerMmTokens > 0
+            && static_cast<int32_t>(mmPos.size()) > mTalkerConfig.maxThinkerToTalkerMmTokens)
+        {
+            int32_t const N = static_cast<int32_t>(mmPos.size());
+            int32_t const M = mTalkerConfig.maxThinkerToTalkerMmTokens;
+            std::vector<int32_t> kept;
+            kept.reserve(M);
+            if (M == 1)
+            {
+                // torch.linspace(0, N-1, 1) yields tensor([0.]).long() = [0].
+                kept.push_back(mmPos.front());
+            }
+            else
+            {
+                for (int32_t i = 0; i < M; ++i)
+                {
+                    // double avoids FP drift vs torch.linspace's ladder.
+                    double const idxF
+                        = static_cast<double>(i) * static_cast<double>(N - 1) / static_cast<double>(M - 1);
+                    kept.push_back(mmPos[static_cast<int32_t>(idxF)]);
+                }
+            }
+            mmPos.swap(kept);
+        }
+        std::vector<int32_t> merged;
+        merged.reserve(rolePos.size() + mmPos.size());
+        merged.insert(merged.end(), rolePos.begin(), rolePos.end());
+        merged.insert(merged.end(), mmPos.begin(), mmPos.end());
+        std::sort(merged.begin(), merged.end());
+        for (int32_t pos : merged)
+        {
+            userPositions.emplace_back(textTokenIds[pos], pos);
+        }
+    }
+    int32_t const userPartRows = static_cast<int32_t>(userPositions.size());
+
+    int64_t const totalSeqLen = static_cast<int64_t>(systemRows) + userPartRows + assistantRows;
+    if (totalSeqLen > mTalkerLLMConfig.maxSupportedInputLength)
+    {
+        LOG_ERROR("buildQwen3OmniNextTalkerPrefill: assembled length %ld > maxInputLen %d", totalSeqLen,
+            mTalkerLLMConfig.maxSupportedInputLength);
+        return false;
+    }
+    outSeqLen = totalSeqLen;
+    check::check(mTalkerInputEmbeds.reshape({1, totalSeqLen, hiddenSize}), "Tensor reshape failed");
+    __half* const dstBase = static_cast<__half*>(mTalkerInputEmbeds.rawPointer());
+
+    // System part.
+    int64_t row = 0;
+    if (!copyEmbedRow(mTextEmbeddingTable, mTalkerConfig.imStartTokenId, dstBase, row++, stream))
+        return false;
+    if (!copyEmbedRow(mTextEmbeddingTable, mTalkerConfig.systemRoleId, dstBase, row++, stream))
+        return false;
+    if (!copyEmbedRow(mTextEmbeddingTable, kNlTokenIdNext, dstBase, row++, stream))
+        return false;
+    if (speakerSysPromptPtr)
+    {
+        for (int32_t tid : *speakerSysPromptPtr)
+        {
+            if (!copyEmbedRow(mTextEmbeddingTable, tid, dstBase, row++, stream))
+                return false;
+        }
+    }
+    if (!copyEmbedRow(mTalkerCodecEmbedTable, codecBosId, dstBase, row++, stream))
+        return false;
+    for (int32_t p = 0; p < validSpeakerLen; ++p)
+    {
+        int64_t hostCodesAtPos[64]; // numCodeGroups <= 64
+        for (int32_t g = 0; g < numCodeGroups; ++g)
+        {
+            hostCodesAtPos[g] = speakerRow[static_cast<size_t>(g) * speakerEmbedLen + p];
+        }
+        sumSpeakerCodecRow(hostCodesAtPos, dstBase, row++, stream);
+    }
+    if (!copyEmbedRow(mTalkerCodecEmbedTable, codecEosId, dstBase, row++, stream))
+        return false;
+    if (!copyEmbedRow(mTextEmbeddingTable, kImEndTokenIdNext, dstBase, row++, stream))
+        return false;
+    if (!copyEmbedRow(mTextEmbeddingTable, kNlTokenIdNext, dstBase, row++, stream))
+        return false;
+    ELLM_CHECK(row == systemRows, "system row count mismatch");
+
+    // User part: role → text embed, content → hidden_projection(thinker_hidden[absPos]).
+    auto isRoleToken = [&](int32_t t) {
+        return t == mTalkerConfig.imStartTokenId || t == kImEndTokenIdNext || t == mTalkerConfig.userRoleId
+            || t == kNlTokenIdNext;
+    };
+    for (auto const& [tid, absPos] : userPositions)
+    {
+        if (isRoleToken(tid))
+        {
+            if (!copyEmbedRow(mTextEmbeddingTable, tid, dstBase, row++, stream))
+                return false;
+        }
+        else
+        {
+            if (prefillHiddenPtr == nullptr || absPos >= prefillLen)
+            {
+                LOG_ERROR(
+                    "OmniNext user content pos %d out of range (prefillLen=%d) or hidden ptr null", absPos, prefillLen);
+                return false;
+            }
+            projectHiddenRow(*prefillHiddenPtr, absPos, dstBase, row++, stream);
+        }
+    }
+    ELLM_CHECK(row == systemRows + userPartRows, "user row count mismatch");
+
+    // Assistant part.
+    if (!copyEmbedRow(mTextEmbeddingTable, mTalkerConfig.imStartTokenId, dstBase, row++, stream))
+        return false;
+    if (!copyEmbedRow(mTextEmbeddingTable, mTalkerConfig.assistantRoleId, dstBase, row++, stream))
+        return false;
+    if (!copyEmbedRow(mTextEmbeddingTable, kNlTokenIdNext, dstBase, row++, stream))
+        return false;
+    if (!copyEmbedRow(mTalkerCodecEmbedTable, codecNothinkId, dstBase, row++, stream))
+        return false;
+    if (!copyEmbedRow(mTalkerCodecEmbedTable, codecThinkBosId, dstBase, row++, stream))
+        return false;
+    if (!copyEmbedRow(mTalkerCodecEmbedTable, codecThinkEosId, dstBase, row++, stream))
+        return false;
+    copyRawRow(mTtsBosEmbed, dstBase, row++, stream);
+    if (!copyEmbedRow(mTalkerCodecEmbedTable, codecBosId, dstBase, row++, stream))
+        return false;
+
+    // First text chunk: up to kTextInChunkN rows; tts_eos occupies the last slot when the
+    // chunk covers the end of the text.
+    int32_t const chunkTextRows = std::min(firstChunkLen, assistantTextLen);
+    for (int32_t i = 0; i < chunkTextRows; ++i)
+    {
+        if (!copyEmbedRow(mTextEmbeddingTable, textTokenIds[assistantTextStart + i], dstBase, row++, stream))
+            return false;
+    }
+    if (firstChunkLen > assistantTextLen)
+    {
+        copyRawRow(mTtsEosEmbed, dstBase, row++, stream);
+    }
+    ELLM_CHECK(row == totalSeqLen,
+        "row count mismatch (got " + std::to_string(row) + ", expected " + std::to_string(totalSeqLen) + ")");
+
+    // Trailing rows (unused by the OmniNext decode step but kept for interface parity).
+    int32_t const remainingTextStart = chunkTextRows;
+    int32_t const remainingTextLen = assistantTextLen - remainingTextStart;
+    int32_t const remainingHasEos = (firstChunkLen <= assistantTextLen) ? 1 : 0;
+    int32_t const remainingTotal = remainingTextLen + remainingHasEos;
+    int32_t const trailingCapacity = static_cast<int32_t>(trailingTextHidden.getShape()[0]);
+    trailingCount = std::min(remainingTotal, trailingCapacity - 1);
+    __half* const trailDst = static_cast<__half*>(trailingTextHidden.rawPointer());
+    for (int32_t i = 0; i < trailingCount; ++i)
+    {
+        if (i < remainingTextLen)
+        {
+            if (!copyEmbedRow(mTextEmbeddingTable, textTokenIds[assistantTextStart + remainingTextStart + i], trailDst,
+                    i, stream))
+                return false;
+        }
+        else
+        {
+            copyRawRow(mTtsEosEmbed, trailDst, i, stream);
+        }
+    }
+
+    // Arm chunked streaming: remaining text tokens (chunks 1..) feed the re-prefill loop.
+    if (static_cast<int32_t>(mQwen3OmniNextChunkStates.size()) <= 0)
+    {
+        mQwen3OmniNextChunkStates.resize(std::max(1, mMaxBatchSize));
+    }
+    {
+        auto& cs = mQwen3OmniNextChunkStates[0];
+        cs.remainingTextTokens.clear();
+        cs.remainingTextTokens.reserve(static_cast<size_t>(std::max(0, remainingTextLen)));
+        for (int32_t i = 0; i < remainingTextLen; ++i)
+        {
+            cs.remainingTextTokens.push_back(textTokenIds[assistantTextStart + remainingTextStart + i]);
+        }
+        cs.hasTrailingTtsEos = (remainingHasEos != 0);
+        cs.active = !cs.remainingTextTokens.empty() || cs.hasTrailingTtsEos;
+        cs.chunkTokensPerCall = kTextInChunkN;
+        cs.framesPerCall = 5;
+        cs.cumulativeSeqLen = outSeqLen;
+        cs.cursorToken = 0;
+        cs.framesSinceLastPrefill = 0;
+        cs.firstFrameOfCallIdx = 0;
+        if (cs.active)
+        {
+            LOG_INFO("OmniNext chunk stream armed: remainingText=%zu hasTtsEos=%d cumSeq=%ld",
+                cs.remainingTextTokens.size(), static_cast<int>(cs.hasTrailingTtsEos), cs.cumulativeSeqLen);
+        }
+    }
+
+    LOG_INFO("buildQwen3OmniNextTalkerPrefill: outSeqLen=%ld (sys=%d[+%d], usr=%d, asst=%d), trailing=%d", outSeqLen,
+        systemRows, sysPromptLen, userPartRows, assistantRows, trailingCount);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// OmniNext chunked re-prefill. HF generate_talker reissues prefill with
+// [cumulative | codec_input_embeds(prev frames) | next text chunk] every
+// framesPerCall frames until the assistant text is exhausted.
+// ---------------------------------------------------------------------------
+
+int32_t Qwen3OmniTTSRuntime::maybeReprefillOmniNextChunkForBatch(int32_t batchIdx,
+    std::vector<std::vector<int32_t>> const& rvqCodes, int32_t& codecTokenInOut,
+    SamplingParams const& talkerSamplingParams, float repetitionPenalty, int32_t& numSeenTokens,
+    std::unordered_set<int32_t>& seenTokenSet, cudaStream_t stream)
+{
+    if (batchIdx < 0 || batchIdx >= static_cast<int32_t>(mQwen3OmniNextChunkStates.size()))
+    {
+        return 0;
+    }
+    auto& cs = mQwen3OmniNextChunkStates[batchIdx];
+    if (!cs.active)
+    {
+        return 0;
+    }
+    int32_t const framesThisCall = static_cast<int32_t>(rvqCodes.size()) - cs.firstFrameOfCallIdx;
+    if (framesThisCall < cs.framesPerCall)
+    {
+        return 0;
+    }
+    int32_t newCodecToken = 0;
+    if (!reprefillQwen3OmniNextChunk(batchIdx, rvqCodes, newCodecToken, talkerSamplingParams, repetitionPenalty,
+            numSeenTokens, seenTokenSet, stream))
+    {
+        return -1;
+    }
+    codecTokenInOut = newCodecToken;
+    return 1;
+}
+
+bool Qwen3OmniTTSRuntime::driveOmniNextChunkReprefills(std::vector<PerBatchTalkerState>& states,
+    int32_t activeBatchSize, int32_t globalFrame, SamplingParams const& talkerSamplingParams, float repetitionPenalty,
+    int32_t& unfinished, cudaStream_t stream)
+{
+    int32_t const codecEosId = mTalkerConfig.codecEosId;
+    for (int32_t b = 0; b < activeBatchSize; ++b)
+    {
+        if (states[b].finished)
+        {
+            continue;
+        }
+        int32_t newCodecToken = states[b].codecToken;
+        int32_t const outcome = maybeReprefillOmniNextChunkForBatch(b, states[b].rvqCodes, newCodecToken,
+            talkerSamplingParams, repetitionPenalty, states[b].numSeenTokens, states[b].seenTokenSet, stream);
+        if (outcome == -1)
+        {
+            LOG_ERROR("reprefillQwen3OmniNextChunk failed at frame %d batch %d", globalFrame, b);
+            states[b].finished = true;
+            states[b].talkerError = true;
+            unfinished--;
+            continue;
+        }
+        if (outcome == 1)
+        {
+            // Freshly-sampled first frame of the new call replaces the stale unconstrained sample.
+            states[b].codecToken = newCodecToken;
+            if (newCodecToken == codecEosId)
+            {
+                states[b].finished = true;
+                unfinished--;
+            }
+        }
+    }
+    return true;
+}
+
+void Qwen3OmniTTSRuntime::appendOmniNextChunkStreamToken(int32_t batchIdx, int32_t tokenId)
+{
+    if (batchIdx < 0 || batchIdx >= static_cast<int32_t>(mQwen3OmniNextChunkStates.size()))
+    {
+        return;
+    }
+    auto& cs = mQwen3OmniNextChunkStates[batchIdx];
+    cs.remainingTextTokens.push_back(tokenId);
+    cs.active = true;
+}
+
+void Qwen3OmniTTSRuntime::finalizeOmniNextChunkStream(int32_t batchIdx)
+{
+    if (batchIdx < 0 || batchIdx >= static_cast<int32_t>(mQwen3OmniNextChunkStates.size()))
+    {
+        return;
+    }
+    auto& cs = mQwen3OmniNextChunkStates[batchIdx];
+    cs.hasTrailingTtsEos = true;
+    cs.active = true;
+}
+
+void Qwen3OmniTTSRuntime::suppressTalkerEosLogit(int32_t batchIdx, int32_t batchVocabSize, cudaStream_t stream)
+{
+    // D2D copy from the persistent -INF constant — async-safe (unlike a stack source).
+    float* const dst = static_cast<float*>(mTalkerLogits.rawPointer()) + static_cast<int64_t>(batchIdx) * batchVocabSize
+        + mTalkerConfig.codecEosId;
+    CUDA_CHECK(cudaMemcpyAsync(dst, mNegInfConst.rawPointer(), sizeof(float), cudaMemcpyDeviceToDevice, stream));
+}
+
+bool Qwen3OmniTTSRuntime::reprefillQwen3OmniNextChunk(int32_t batchIdx,
+    std::vector<std::vector<int32_t>> const& rvqCodes, int32_t& outFirstCodecTok,
+    SamplingParams const& talkerSamplingParams, float repetitionPenalty, int32_t& numSeenTokens,
+    std::unordered_set<int32_t>& seenTokenSet, cudaStream_t stream)
+{
+    NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::reprefillQwen3OmniNextChunk", nvtx_colors::PALE_GREEN);
+
+    if (batchIdx < 0 || batchIdx >= static_cast<int32_t>(mQwen3OmniNextChunkStates.size()))
+    {
+        LOG_ERROR("reprefillQwen3OmniNextChunk: batchIdx %d out of range (size=%zu)", batchIdx,
+            mQwen3OmniNextChunkStates.size());
+        return false;
+    }
+    auto& cs = mQwen3OmniNextChunkStates[batchIdx];
+    if (!cs.active)
+    {
+        return true;
+    }
+
+    int32_t const numCodeGroups = mTalkerConfig.numCodeGroups;
+    int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
+    int32_t const framesAvail = static_cast<int32_t>(rvqCodes.size()) - cs.firstFrameOfCallIdx;
+    if (framesAvail < cs.codecEmbedFrames)
+    {
+        LOG_ERROR("reprefillQwen3OmniNextChunk: only %d frames since last prefill, need at least %d", framesAvail,
+            cs.codecEmbedFrames);
+        return false;
+    }
+
+    // (1) Codec-embed rows for the FIRST codecEmbedFrames frames of this call. PT drops the
+    // last "lookahead" frame from the codec_input handoff — feeding all framesPerCall breaks
+    // cumulative seqLen alignment with PT (108 vs 107) and degrades long-utterance audio.
+    __half* const dstBase = static_cast<__half*>(mTalkerInputEmbeds.rawPointer());
+    int64_t writeRow = cs.cumulativeSeqLen;
+    for (int32_t f = 0; f < cs.codecEmbedFrames; ++f)
+    {
+        auto const& frameCodes = rvqCodes[cs.firstFrameOfCallIdx + f];
+        if (static_cast<int32_t>(frameCodes.size()) != numCodeGroups)
+        {
+            LOG_ERROR("reprefillQwen3OmniNextChunk: rvqCodes[%d] size %zu != numCodeGroups %d",
+                cs.firstFrameOfCallIdx + f, frameCodes.size(), numCodeGroups);
+            return false;
+        }
+        int64_t hostCodes[64]; // numCodeGroups <= 64
+        for (int32_t g = 0; g < numCodeGroups; ++g)
+        {
+            hostCodes[g] = static_cast<int64_t>(frameCodes[g]);
+        }
+        sumSpeakerCodecRow(hostCodes, dstBase, writeRow++, stream);
+    }
+
+    // (2) Next text chunk (up to chunkTokensPerCall rows) + optional trailing tts_eos.
+    int32_t const textRemain = static_cast<int32_t>(cs.remainingTextTokens.size()) - cs.cursorToken;
+    int32_t const textRows = std::min(cs.chunkTokensPerCall, textRemain);
+    for (int32_t i = 0; i < textRows; ++i)
+    {
+        if (!copyEmbedRow(mTextEmbeddingTable, cs.remainingTextTokens[cs.cursorToken + i], dstBase, writeRow++, stream))
+        {
+            return false;
+        }
+    }
+    cs.cursorToken += textRows;
+
+    bool appendedEos = false;
+    bool const textExhausted = cs.cursorToken >= static_cast<int32_t>(cs.remainingTextTokens.size());
+    if (textExhausted && cs.hasTrailingTtsEos && textRows < cs.chunkTokensPerCall)
+    {
+        copyRawRow(mTtsEosEmbed, dstBase, writeRow++, stream);
+        cs.hasTrailingTtsEos = false;
+        appendedEos = true;
+    }
+    cs.cumulativeSeqLen = writeRow;
+
+    bool const exhaustedAfter = textExhausted && !cs.hasTrailingTtsEos;
+    int64_t const maxInputLen = mTalkerLLMConfig.maxSupportedInputLength;
+    if (cs.cumulativeSeqLen > maxInputLen)
+    {
+        LOG_ERROR("reprefillQwen3OmniNextChunk: cumulative seq %ld exceeds maxInputLen %ld", cs.cumulativeSeqLen,
+            maxInputLen);
+        return false;
+    }
+
+    LOG_INFO("OmniNext re-prefill: cumSeq=%ld (added %d codec + %d text%s); more chunks=%s", cs.cumulativeSeqLen,
+        cs.codecEmbedFrames, textRows, appendedEos ? " + tts_eos" : "", exhaustedAfter ? "no" : "yes");
+
+    // (3) Re-prefill — executeTalkerPrefillStep resets KV cache implicitly.
+    check::check(mTalkerInputEmbeds.reshape({1, cs.cumulativeSeqLen, hiddenSize}), "Tensor reshape failed");
+    check::check(mTalkerHiddenStatesBuffer.reshape({1, cs.cumulativeSeqLen, hiddenSize}), "Tensor reshape failed");
+    {
+        TIME_STAGE(metrics::StageNames::kTALKER_PREFILL, stream);
+        if (!executeTalkerPrefillStep(mTalkerInputEmbeds, mTalkerLogits, mTalkerHiddenStatesBuffer, stream))
+        {
+            LOG_ERROR("OmniNext chunked re-prefill failed at cumSeq=%ld", cs.cumulativeSeqLen);
+            return false;
+        }
+    }
+
+    // (4) Sample first codec token of the new call. Suppress EOS while more chunks are still due
+    // (PT enforces min_new_tokens=chunk_m+1 on every non-last call). Vary the philox offset per
+    // call so every talker sample sees a distinct RNG state.
+    kernel::invokeTalkerLogitAdjust(mSeenCodecTokensBuf, mTalkerLogits, mTalkerConfig.talkerSuppressStart,
+        mTalkerConfig.talkerVocabSize, mTalkerConfig.codecEosId, numSeenTokens, repetitionPenalty, stream);
+    if (!exhaustedAfter)
+    {
+        suppressTalkerEosLogit(batchIdx, mTalkerConfig.talkerVocabSize, stream);
+    }
+    uint64_t const reprefillOffset = static_cast<uint64_t>(mQwen3OmniNextChunkStates[batchIdx].firstFrameOfCallIdx) + 1;
+    trt_edgellm::topKtopPSamplingFromLogits(mTalkerLogits, mTalkerSelectedIndices, talkerSamplingParams,
+        mSamplingWorkspace, stream, /*philoxSeed=*/42, /*philoxOffset=*/reprefillOffset);
+    CUDA_CHECK(cudaMemcpyAsync(mHostSelectedTokenIds.rawPointer(), mTalkerSelectedIndices.rawPointer(), sizeof(int32_t),
+        cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    outFirstCodecTok = mHostSelectedTokenIds.dataPointer<int32_t>()[0];
+
+    if (seenTokenSet.insert(outFirstCodecTok).second)
+    {
+        CUDA_CHECK(cudaMemcpyAsync(mSeenCodecTokensBuf.dataPointer<int32_t>() + numSeenTokens,
+            mTalkerSelectedIndices.rawPointer(), sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
+        ++numSeenTokens;
+    }
+
+    cs.framesSinceLastPrefill = 0;
+    cs.firstFrameOfCallIdx = static_cast<int32_t>(rvqCodes.size());
+    if (exhaustedAfter)
+    {
+        cs.active = false;
+    }
+    return true;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //        Incremental Trailing Hidden Helpers (for streaming)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2424,9 +3366,18 @@ void Qwen3OmniTTSRuntime::appendTrailingToken(int32_t tokenId, rt::Tensor const&
         rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
     kernel::embeddingLookup(mStreamingTokenId, thinkerEmbedTable, std::nullopt, embedView, stream);
 
-    // text_projection: mStreamingTokenEmbed [1, thinkerH] → mStreamingProjOut [1, talkerH]
-    kernel::invokeTalkerMLP(mStreamingTokenEmbed, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias,
-        mStreamingProjOut, mStreamingMlpWork, stream);
+    // text_projection: mStreamingTokenEmbed [1, thinkerH] → mStreamingProjOut [1, talkerH].
+    // Qwen3-Next Omni Talker has its own embed_tokens at talker hidden dim, so just copy.
+    if (isOmniNext())
+    {
+        CUDA_CHECK(cudaMemcpyAsync(mStreamingProjOut.rawPointer(), mStreamingTokenEmbed.rawPointer(),
+            talkerHiddenSize * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
+    }
+    else
+    {
+        kernel::invokeTalkerMLP(mStreamingTokenEmbed, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias,
+            mStreamingProjOut, mStreamingMlpWork, stream);
+    }
 
     // Write to trailingTextHidden[trailingIdx]
     __half* dst = static_cast<__half*>(trailingTextHidden.rawPointer()) + trailingIdx * talkerHiddenSize;
@@ -2579,14 +3530,21 @@ bool Qwen3OmniTTSRuntime::handleStreamingGeneration(LLMInferenceRuntime& thinker
             }
             textTokenIds.insert(textTokenIds.end(), state.assistantTokens.begin(), state.assistantTokens.end());
 
-            // Use buildTalkerPrefillFromSegments for segment parsing, MLP projection, and prefill assembly
+            // Use buildTalkerPrefillFromSegments for segment parsing, MLP projection, and prefill assembly.
+            // For Qwen3-Next Omni (isOmniNext()), dispatch to buildQwen3OmniNextTalkerPrefill — mirrors the
+            // sequential batched dispatch at the buildOneBatch lambda. The OmniNext builder uses Talker's
+            // own embed_tokens internally and does NOT consume prefillEmbedPtr or thinkerEmbedTable.
             auto prefillEmbedPtr = thinkerRuntime.getBaseModelHiddenStates(0);
             auto prefillHiddenPtr = thinkerRuntime.getBaseModelHiddenStates(thinkerRequest.acceptHiddenLayer);
             int32_t const prefillLen = thinkerRuntime.getBaseModelPrefillLength();
 
             int64_t outSeqLen = 0;
-            if (!buildTalkerPrefillFromSegments(textTokenIds, prefillEmbedPtr, prefillHiddenPtr, prefillLen,
-                    thinkerEmbedTable, speakerId, mStreamingTrailingHidden, state.trailingIdx, outSeqLen, stream))
+            bool const buildOk = isOmniNext()
+                ? buildQwen3OmniNextTalkerPrefill(textTokenIds, prefillHiddenPtr, prefillLen, speakerId,
+                      mStreamingTrailingHidden, state.trailingIdx, outSeqLen, stream)
+                : buildTalkerPrefillFromSegments(textTokenIds, prefillEmbedPtr, prefillHiddenPtr, prefillLen,
+                      thinkerEmbedTable, speakerId, mStreamingTrailingHidden, state.trailingIdx, outSeqLen, stream);
+            if (!buildOk)
             {
                 state.talkerError = true;
                 return;
@@ -2607,10 +3565,12 @@ bool Qwen3OmniTTSRuntime::handleStreamingGeneration(LLMInferenceRuntime& thinker
                 }
             }
 
-            kernel::invokeTalkerLogitAdjust(mSeenCodecTokensBuf, mTalkerLogits, mTalkerConfig.talkerVocabSize - 1024,
+            kernel::invokeTalkerLogitAdjust(mSeenCodecTokensBuf, mTalkerLogits, mTalkerConfig.talkerSuppressStart,
                 mTalkerConfig.talkerVocabSize, codecEosId, numSeenTokens, repetitionPenalty, stream);
             // Streaming Talker runs at batch=1; size selectedIndices to match talkerSamplingParams
-            // (allocated at {maxBS, 1}, must be {1, 1} for the sampler's shape check).
+            // (allocated at {maxBS, 1}, must be {1, 1} for the sampler's shape check). Mirrors
+            // MR !842's fix(runtime): reshape mTalkerSelectedIndices to {1,1} before streaming
+            // Talker sampling.
             check::check(mTalkerSelectedIndices.reshape({1, 1}), "Tensor reshape failed");
             trt_edgellm::topKtopPSamplingFromLogits(
                 mTalkerLogits, mTalkerSelectedIndices, talkerSamplingParams, mSamplingWorkspace, stream);
@@ -2649,12 +3609,31 @@ bool Qwen3OmniTTSRuntime::handleStreamingGeneration(LLMInferenceRuntime& thinker
                     return;
                 }
                 state.talkerFrames++;
+                if (isOmniNext())
+                {
+                    int32_t const outcome = maybeReprefillOmniNextChunkForBatch(0, state.rvqCodes, state.codecToken,
+                        talkerSamplingParams, repetitionPenalty, numSeenTokens, seenTokenSet, stream);
+                    if (outcome == -1)
+                    {
+                        state.talkerError = true;
+                        return;
+                    }
+                }
             }
         }
         else if (state.talkerPrefillDone && numAssistantTokens > prefillThreshold)
         {
-            // Incremental: append new trailing token + run Talker decode step
-            if (state.trailingIdx >= maxTrailingLen - 1)
+            if (isOmniNext())
+            {
+                // OmniNext streaming: feed new Thinker tokens into the chunk stream — the model
+                // is trained for chunk-based re-prefills, not per-decode-step text injection.
+                appendOmniNextChunkStreamToken(0, info.tokenId);
+                if (state.thinkerFinished)
+                {
+                    finalizeOmniNextChunkStream(0);
+                }
+            }
+            else if (state.trailingIdx >= maxTrailingLen - 1)
             {
                 LOG_WARNING("Trailing buffer full (%d/%d), skipping token append", state.trailingIdx, maxTrailingLen);
             }
@@ -2669,7 +3648,7 @@ bool Qwen3OmniTTSRuntime::handleStreamingGeneration(LLMInferenceRuntime& thinker
             {
                 TIME_STAGE(metrics::StageNames::kTALKER_GENERATION, stream);
                 rt::Tensor trailingView = makeTrailingView();
-                rt::Tensor const* trailingPtr = (state.trailingIdx > 0) ? &trailingView : nullptr;
+                rt::Tensor const* trailingPtr = (!isOmniNext() && state.trailingIdx > 0) ? &trailingView : nullptr;
 
                 if (!runSingleTalkerDecodeFrame(state.codecToken, talkerSamplingParams, predictorSamplingParams,
                         trailingPtr, state.talkerFrames, seenTokenSet, numSeenTokens, repetitionPenalty, state.rvqCodes,
@@ -2680,6 +3659,20 @@ bool Qwen3OmniTTSRuntime::handleStreamingGeneration(LLMInferenceRuntime& thinker
                 }
                 state.talkerFrames++;
                 emitter.append(state.rvqCodes.back());
+                if (isOmniNext())
+                {
+                    int32_t const outcome = maybeReprefillOmniNextChunkForBatch(0, state.rvqCodes, state.codecToken,
+                        talkerSamplingParams, repetitionPenalty, numSeenTokens, seenTokenSet, stream);
+                    if (outcome == -1)
+                    {
+                        state.talkerError = true;
+                        return;
+                    }
+                    if (state.codecToken == codecEosId)
+                    {
+                        return;
+                    }
+                }
             }
         }
     };
@@ -2706,7 +3699,12 @@ bool Qwen3OmniTTSRuntime::handleStreamingGeneration(LLMInferenceRuntime& thinker
     // ===== After Thinker finishes: finalize trailing and flush remaining Talker frames =====
     if (state.talkerPrefillDone && !state.talkerError)
     {
-        if (state.trailingIdx < maxTrailingLen)
+        if (isOmniNext())
+        {
+            // OmniNext consumes tts_eos through the chunk stream, not the trailing buffer.
+            finalizeOmniNextChunkStream(0);
+        }
+        else if (state.trailingIdx < maxTrailingLen)
         {
             finalizeTrailing(mStreamingTrailingHidden, state.trailingIdx, stream);
             state.trailingIdx++;
@@ -2720,7 +3718,7 @@ bool Qwen3OmniTTSRuntime::handleStreamingGeneration(LLMInferenceRuntime& thinker
             state.talkerFrames, state.codecToken, state.trailingIdx);
 
         rt::Tensor flushTrailingView = makeTrailingView();
-        rt::Tensor const* flushTrailingPtr = (state.trailingIdx > 0) ? &flushTrailingView : nullptr;
+        rt::Tensor const* flushTrailingPtr = (!isOmniNext() && state.trailingIdx > 0) ? &flushTrailingView : nullptr;
 
         while (state.codecToken != codecEosId && state.talkerFrames < maxAudioLength)
         {
@@ -2735,6 +3733,15 @@ bool Qwen3OmniTTSRuntime::handleStreamingGeneration(LLMInferenceRuntime& thinker
             }
             state.talkerFrames++;
             emitter.append(state.rvqCodes.back());
+            if (isOmniNext())
+            {
+                int32_t const outcome = maybeReprefillOmniNextChunkForBatch(0, state.rvqCodes, state.codecToken,
+                    talkerSamplingParams, repetitionPenalty, numSeenTokens, seenTokenSet, stream);
+                if (outcome == -1)
+                {
+                    break;
+                }
+            }
         }
 
         emitter.flushFinal();

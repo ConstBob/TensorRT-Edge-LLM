@@ -160,5 +160,11 @@ void invokeResidualConnection(rt::Tensor const& codecHiddens, rt::Tensor const& 
 void invokeTalkerLogitAdjust(rt::Tensor const& seenTokens, rt::Tensor& logits, int32_t suppressStart,
     int32_t suppressEnd, int32_t codecEosId, int32_t numSeenTokens, float repetitionPenalty, cudaStream_t stream);
 
+//! Per-position sum across codec groups: out[d] = sum_g embPtrTable[g][codes[g]][d];
+//! codes[g] < 0 skips group g. embPtrTable is INT8-typed to carry `__half const*[numCodeGroups]`
+//! (rt::Tensor has no pointer-array dtype). numCodeGroups = codes.shape[0]; hiddenSize = output.volume().
+void invokeSpeakerCodecSum(rt::Tensor const& codes, rt::Tensor const& embPtrTable, rt::Tensor const& embVocabSizes,
+    rt::Tensor& output, cudaStream_t stream);
+
 } // namespace kernel
 } // namespace trt_edgellm

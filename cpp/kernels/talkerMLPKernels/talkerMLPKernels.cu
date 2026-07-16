@@ -707,5 +707,52 @@ void invokeTalkerLogitAdjust(rt::Tensor const& seenTokens, rt::Tensor& logits, i
     CUDA_CHECK(cudaPeekAtLastError());
 }
 
+//! \brief Per-position sum across codec groups (Qwen3.5-Omni speaker codec embedding fold).
+//!
+//! Mirrors HF ``_get_codec_input_embeddings``: concatenate per-group embeddings then sum across
+//! the group axis. Implemented here as a single-row reduction so the caller only invokes one
+//! kernel per row of the speaker codec template.
+namespace
+{
+__global__ void speakerCodecSumKernel(int64_t const* __restrict__ codes, __half const* const* __restrict__ embTables,
+    int32_t const* __restrict__ embVocabSizes, int32_t numCodeGroups, int32_t hiddenSize, __half* __restrict__ output)
+{
+    int32_t const tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= hiddenSize)
+    {
+        return;
+    }
+    float acc = 0.0f;
+    for (int32_t g = 0; g < numCodeGroups; ++g)
+    {
+        int64_t const code = codes[g];
+        if (code < 0 || code >= embVocabSizes[g])
+        {
+            continue; // HF: -1 entries are no-ops; OOB defensively skipped
+        }
+        acc += __half2float(embTables[g][code * hiddenSize + tid]);
+    }
+    output[tid] = __float2half(acc);
+}
+} // namespace
+
+void invokeSpeakerCodecSum(rt::Tensor const& codes, rt::Tensor const& embPtrTable, rt::Tensor const& embVocabSizes,
+    rt::Tensor& output, cudaStream_t stream)
+{
+    check::check(codes.getDataType() == nvinfer1::DataType::kINT64, "codes must be INT64");
+    check::check(embVocabSizes.getDataType() == nvinfer1::DataType::kINT32, "embVocabSizes must be INT32");
+    check::check(output.getDataType() == nvinfer1::DataType::kHALF, "output must be FP16");
+
+    int32_t const numCodeGroups = static_cast<int32_t>(codes.getShape()[0]);
+    int32_t const hiddenSize = static_cast<int32_t>(output.getShape().volume());
+
+    constexpr int32_t kBlockSize = 256;
+    int32_t const blocks = (hiddenSize + kBlockSize - 1) / kBlockSize;
+    speakerCodecSumKernel<<<blocks, kBlockSize, 0, stream>>>(codes.dataPointer<int64_t>(),
+        static_cast<__half const* const*>(embPtrTable.rawPointer()), embVocabSizes.dataPointer<int32_t>(),
+        numCodeGroups, hiddenSize, static_cast<__half*>(output.rawPointer()));
+    CUDA_CHECK(cudaPeekAtLastError());
+}
+
 } // namespace kernel
 } // namespace trt_edgellm
