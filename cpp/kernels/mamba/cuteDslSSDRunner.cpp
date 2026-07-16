@@ -19,6 +19,7 @@
 
 #include "cuteDslSSDRunner.h"
 
+#include "common/cudaUtils.h"
 #include "common/logger.h"
 #include "ssdVarlenMetadata.h"
 
@@ -433,7 +434,7 @@ int CuteDslSSDRunner::runPrefill(SSDParams const& params, cudaStream_t stream)
             &cumsumTensor, &dtProcTensor, &yTensor,                                                                    \
             &seqIdxTensor, &chunkIndicesTensor, &chunkOffsetsTensor, &seqChunkCumsumTensor,                            \
             &validLensTensor,                                                                                          \
-            total_seq, total_chunks, numLogicalChunks, numSeqs, stream);                                               \
+            total_seq, total_chunks, numLogicalChunks, numSeqs, getDeviceMultiProcessorCount(), stream);              \
     } while (0)
 // clang-format on
 

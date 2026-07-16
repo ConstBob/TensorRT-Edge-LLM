@@ -20,6 +20,7 @@
 #include "cuteDslFMHARunner.h"
 
 #include "common/checkMacros.h"
+#include "common/cudaUtils.h"
 #include "common/logger.h"
 #include "contextFMHARunner.h"
 
@@ -269,7 +270,7 @@ CuteDslFMHARunner::CuteDslFMHARunner(
                                                                                                                        \
         ret = cute_dsl_##PREFIX##_wrapper(                                                                              \
             &(MODULE), &qTensor, &kvTensor, &oTensor, &cumSeqlenK, (WSL), attentionScale,                               \
-            scaleQ, scaleK, scaleV, invScaleO, stream);                                                                 \
+            scaleQ, scaleK, scaleV, invScaleO, getDeviceMultiProcessorCount(), stream);                                 \
     } while (0)
 // clang-format on
 
@@ -468,7 +469,7 @@ void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, i
         cumSeqlenK.dynamic_shapes[0] = batchSize + 1;                                                                  \
                                                                                                                        \
         ret = cute_dsl_##PREFIX##_wrapper(&(MODULE), &qTensor, &kvPoolTensor, &pageListTensor, &oTensor, &cumSeqlenK,  \
-            (WSL), attentionScale, scaleQ, scaleK, scaleV, invScaleO, stream);                                                         \
+            (WSL), attentionScale, scaleQ, scaleK, scaleV, invScaleO, getDeviceMultiProcessorCount(), stream);                         \
     } while (0)
     // clang-format on
 
@@ -580,7 +581,7 @@ void CuteDslFMHARunner::run(void const* qPtr, void const* kPtr, void const* vPtr
                                                                                                                        \
         ret = cute_dsl_##PREFIX##_wrapper(                                                                              \
             &(MODULE), &qTensor, &kTensor, &vTensor, &oTensor, &cuSeqlensTensor, maxSeqLen,                            \
-            scaleSoftmaxLog2, attentionScale, scaleOutput, stream);                                                       \
+            scaleSoftmaxLog2, attentionScale, scaleOutput, getDeviceMultiProcessorCount(), stream);                       \
     } while (0)
     // clang-format on
 

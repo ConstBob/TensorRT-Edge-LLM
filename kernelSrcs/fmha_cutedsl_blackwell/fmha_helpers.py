@@ -143,6 +143,7 @@ class FmhaStaticTileScheduler:
     @staticmethod
     def get_grid_shape(
         params: FmhaStaticTileSchedulerParams,
+        sm_count: Optional[Int32] = None,
         *,
         loc=None,
         ip=None,
@@ -161,10 +162,15 @@ class FmhaStaticTileScheduler:
         :rtype: cute.Shape
         """
         if params.is_persistent:
-            hardware_info = HardwareInfo()
-            sm_count = hardware_info.get_device_multiprocessor_count()
+            # sm_count is a runtime value supplied by the caller (AOT wrappers
+            # thread it from a kernel argument so the persistent grid is sized
+            # for the GPU the kernel actually launches on). The HardwareInfo
+            # probe of the local device remains as a JIT-mode fallback only.
+            if sm_count is None:
+                hardware_info = HardwareInfo()
+                sm_count = hardware_info.get_device_multiprocessor_count()
             return (
-                min(sm_count,
+                cutlass.min(sm_count,
                     cute.size(params.problem_shape_mbh, loc=loc, ip=ip)),
                 1,
                 1,
@@ -309,6 +315,7 @@ def compute_grid(
     o_shape: cute.Shape,
     cta_tiler: Tuple[int, int, int],
     is_persistent: bool,
+    sm_count: Optional[Int32] = None,
 ) -> Tuple[FmhaStaticTileSchedulerParams, Tuple[int, int, int]]:
     """
     Compute grid parameters for FMHA operation.
@@ -342,7 +349,7 @@ def compute_grid(
             cute.size(o_shape[2][1]),
         ),
     )
-    grid = FmhaStaticTileScheduler.get_grid_shape(tile_sched_params)
+    grid = FmhaStaticTileScheduler.get_grid_shape(tile_sched_params, sm_count)
 
     return tile_sched_params, grid
 
