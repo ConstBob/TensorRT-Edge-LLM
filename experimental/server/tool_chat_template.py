@@ -127,15 +127,20 @@ class ToolChatTemplateFormatter:
             return self._template_owner
 
         try:
-            from transformers import AutoProcessor, AutoTokenizer
+            from transformers import (AutoProcessor, AutoTokenizer,
+                                      PreTrainedTokenizerFast)
         except ImportError as exc:
             raise ToolChatTemplateError(
                 "transformers is required for tool-aware chat templates."
             ) from exc
 
+        # PreTrainedTokenizerFast fallback ignores config.json (an EdgeLLM engine
+        # config in engine-dir mode) that AutoProcessor/AutoTokenizer reject.
+        loaders = (AutoProcessor, AutoTokenizer, PreTrainedTokenizerFast)
+
         errors = []
         for template_dir in self._template_dirs:
-            for loader in (AutoProcessor, AutoTokenizer):
+            for loader in loaders:
                 try:
                     owner = loader.from_pretrained(template_dir,
                                                    trust_remote_code=True)

@@ -607,6 +607,24 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
         }
     }
 
+    // Guard: reject inputs longer than the engine's built max input length with a clear,
+    // distinguishable error instead of failing opaquely downstream (TRT profile/shape error).
+    // The Python server maps the EDGELLM_INPUT_TOO_LONG marker to HTTP 413.
+    for (size_t i = 0; i < context.rawBatchedInputIds.size(); ++i)
+    {
+        int32_t const inputLen = static_cast<int32_t>(context.rawBatchedInputIds[i].size());
+        if (inputLen > mDeployment.base.maxSupportedInputLength)
+        {
+            LOG_ERROR(
+                "Input length (%d) exceeds engine max input length (%d). "
+                "Rebuild the engine with a larger --maxInputLen.",
+                inputLen, mDeployment.base.maxSupportedInputLength);
+            throw std::runtime_error("EDGELLM_INPUT_TOO_LONG: input length " + std::to_string(inputLen)
+                + " exceeds engine max_input_len " + std::to_string(mDeployment.base.maxSupportedInputLength)
+                + " (rebuild engine with a larger --maxInputLen)");
+        }
+    }
+
     // Forward sampling params to context; selected spec-decode requests run greedy.
     context.temperature = enableSpecDecode ? 1.0f : request.temperature;
     context.topP = enableSpecDecode ? 1.0f : request.topP;

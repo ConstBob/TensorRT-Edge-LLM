@@ -22,8 +22,11 @@ Endpoints:
 
 Usage (standalone)::
 
-    python -m experimental.server \\
-        --model Qwen/Qwen3-1.7B --port 8000
+    # --model takes a HuggingFace id or a local path; a local path is
+    # auto-detected as a prebuilt engine dir, a prebuilt ONNX dir, or a
+    # checkpoint (exports ONNX + builds an engine).
+    python -m experimental.server --model Qwen/Qwen3-1.7B --port 8000
+    python -m experimental.server --model /path/to/engine --port 8000
 
 Usage (from LLM object)::
 
@@ -221,6 +224,13 @@ def _create_app(llm_instance):
                 content={"error": f"Invalid messages: {exc}"},
             )
         except Exception as exc:
+            # Input longer than the engine's built max_input_len: the C++ runtime
+            # raises with an EDGELLM_INPUT_TOO_LONG marker. Surface it as 413 with a
+            # clear message instead of an opaque 500 (rebuild engine with larger
+            # --maxInputLen to accept longer prompts / larger tool lists).
+            if "EDGELLM_INPUT_TOO_LONG" in str(exc):
+                return JSONResponse(status_code=413,
+                                    content={"error": str(exc)})
             logger.exception("Inference failed")
             return JSONResponse(status_code=500, content={"error": str(exc)})
 
@@ -328,6 +338,15 @@ class _ThinkingStateMachine:
             self._buf = ""
 
 
+def _sse_error(message: str) -> str:
+    """Terminal SSE event carrying an error message, emitted before ``[DONE]``.
+
+    Lets a streaming client see an actionable failure (e.g. the
+    ``EDGELLM_INPUT_TOO_LONG`` marker) instead of a silent ``finish_reason=error``.
+    """
+    return "data: " + json.dumps({"error": {"message": message}}) + "\n\n"
+
+
 def _generate_stream_sse(llm_instance,
                          messages,
                          params,
@@ -345,6 +364,7 @@ def _generate_stream_sse(llm_instance,
 
     sm = _ThinkingStateMachine(enable_thinking)
     finish_reason: Optional[str] = None
+    error_message: Optional[str] = None
     stream_tools = tool_config.tools if tool_config else None
     stream_tool_choice = tool_config.tool_choice if tool_config else None
 
@@ -390,13 +410,16 @@ def _generate_stream_sse(llm_instance,
                 yield _sse_chunk(response_id, {}, logprobs=lp_obj)
             if delta.finished:
                 finish_reason = delta.finish_reason or "stop"
-    except Exception:
+    except Exception as exc:
         logger.exception("Streaming inference failed")
         finish_reason = "error"
+        error_message = str(exc)
 
     for field, text in sm.flush():
         yield _sse_chunk(response_id, {field: text})
 
+    if error_message and "EDGELLM_INPUT_TOO_LONG" in error_message:
+        yield _sse_error(error_message)
     yield _sse_chunk(response_id, {}, finish_reason=finish_reason or "stop")
     yield "data: [DONE]\n\n"
 
@@ -405,6 +428,7 @@ def _generate_tool_stream_sse(llm_instance, messages, params, response_id,
                               tool_config: ToolConfig):
     text_parts: List[str] = []
     finish_reason: Optional[str] = None
+    error_message: Optional[str] = None
     try:
         for delta in llm_instance.generate_stream(
                 messages,
@@ -415,9 +439,10 @@ def _generate_tool_stream_sse(llm_instance, messages, params, response_id,
                 text_parts.append(delta.text)
             if delta.finished:
                 finish_reason = delta.finish_reason or "stop"
-    except Exception:
+    except Exception as exc:
         logger.exception("Streaming inference failed")
         finish_reason = "error"
+        error_message = str(exc)
 
     output_text = "".join(text_parts).replace(IM_END_TOKEN, "")
     parsed = parse_assistant_output(output_text, tool_config,
@@ -455,6 +480,8 @@ def _generate_tool_stream_sse(llm_instance, messages, params, response_id,
             tool_index += 1
 
     finish = "tool_calls" if tool_index else finish_reason or "stop"
+    if error_message and "EDGELLM_INPUT_TOO_LONG" in error_message:
+        yield _sse_error(error_message)
     yield _sse_chunk(response_id, {}, finish_reason=finish)
     yield "data: [DONE]\n\n"
 
@@ -572,10 +599,29 @@ def main():
     )
     parser = argparse.ArgumentParser(
         description="TensorRT Edge-LLM OpenAI-compatible server")
+    # Single model source. A local path is auto-detected as a prebuilt engine
+    # dir, a prebuilt ONNX dir, or a checkpoint, then routed to the matching one
+    # of the LLM class's three init modes.
     parser.add_argument(
         "--model",
         required=True,
-        help="HuggingFace model ID or local checkpoint path",
+        help="HuggingFace model ID or local path. A local path is auto-detected "
+        "as a prebuilt engine dir, a prebuilt ONNX dir, or a checkpoint (exports "
+        "ONNX + builds an engine).",
+    )
+    parser.add_argument(
+        "--visual-engine-dir",
+        dest="visual_engine_dir",
+        default="",
+        help="Pre-built visual.engine directory for a VLM "
+        "(use when --model is a prebuilt engine dir)",
+    )
+    parser.add_argument(
+        "--visual-onnx-dir",
+        dest="visual_onnx_dir",
+        default="",
+        help="Pre-built visual ONNX directory for a VLM "
+        "(use when --model is a prebuilt ONNX dir)",
     )
     parser.add_argument("--host", default="0.0.0.0", help="Bind address")
     parser.add_argument("--port", type=int, default=8000, help="Bind port")
@@ -617,9 +663,26 @@ def main():
     args = parser.parse_args()
 
     from .engine import LLM
+    from .engine_layout import classify_model_source
+
+    # Auto-classify the --model path (prebuilt engine / prebuilt ONNX /
+    # checkpoint) and route it to the matching one of LLM's three init modes.
+    # Build params are ignored for the prebuilt-engine mode.
+    model_arg = args.model
+    onnx_dir = ""
+    engine_dir = ""
+    mode = classify_model_source(model_arg)
+    if mode == "engine_dir":
+        engine_dir, model_arg = model_arg, ""
+    elif mode == "onnx_dir":
+        onnx_dir, model_arg = model_arg, ""
 
     llm = LLM(
-        model=args.model,
+        model=model_arg,
+        onnx_dir=onnx_dir,
+        visual_onnx_dir=args.visual_onnx_dir,
+        engine_dir=engine_dir,
+        visual_engine_dir=args.visual_engine_dir,
         max_input_len=args.max_input_len,
         max_batch_size=args.max_batch_size,
         max_kv_cache_capacity=args.max_kv_cache_capacity,

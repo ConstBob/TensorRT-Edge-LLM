@@ -118,6 +118,23 @@ def validate_spec_decode_engine_dir(engine_dir: str) -> bool:
     return has_base and has_draft
 
 
+def classify_model_source(path: str) -> str:
+    """Classify a path into an LLM init mode: ``engine_dir`` | ``onnx_dir`` | ``model``.
+
+    A prebuilt engine dir (has an ``*.engine``) maps to ``engine_dir``, a prebuilt
+    ONNX dir (has ``model.onnx``) to ``onnx_dir``, and a HuggingFace id or
+    checkpoint dir to ``model``. Lets a single path route to LLM's three init
+    modes without the caller having to know the directory layout.
+    """
+    if os.path.isdir(path):
+        if validate_llm_engine_dir(path) or validate_spec_decode_engine_dir(
+                path):
+            return "engine_dir"
+        if validate_onnx_dir(path):
+            return "onnx_dir"
+    return "model"
+
+
 def find_visual_engine_dir(
     llm_engine_dir: str,
     model_name: str = "",
