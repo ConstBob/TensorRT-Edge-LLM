@@ -47,6 +47,7 @@ from .qwen3_asr_loader import (asr_calibration_dataloader, is_qwen3_asr_model,
                                load_qwen3_asr_joint_for_calibration,
                                postprocess_qwen3_asr_checkpoint)
 from .qwen3_cp_loader import has_code_predictor, qwen3_cp_calibration_loop
+from .qwen3_omni import is_omni_model_dir, quantize_and_export_omni
 
 
 def _text_calib_dataloader(tokenizer,
@@ -648,6 +649,22 @@ def quantize_and_export(
     never fails the run; an unknown name for the modality in use fails out
     with a pointer to the customization guide.
     """
+    # Qwen3-Omni / Qwen3-Next Omni: the Thinker+Talker pair requires a multimodal
+    # calibration loop that pushes audio + image + text through the Thinker and
+    # then projects the chosen hidden layer through the Talker bridge, so the
+    # Talker layers see realistic activations.  Delegate to the standalone
+    # orchestrator instead of the generic flow below.
+    if is_omni_model_dir(model_dir):
+        return quantize_and_export_omni(
+            model_dir=model_dir,
+            output_dir=output_dir,
+            quantization=quantization,
+            lm_head_quantization=lm_head_quantization,
+            kv_cache_quantization=kv_cache_quantization,
+            dtype=dtype,
+            device=device,
+        )
+
     t0 = time.time()
     model, tokenizer, processor = _load_model(model_dir, dtype, device)
 

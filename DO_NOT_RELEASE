@@ -12,6 +12,7 @@ todo.md
 todos.md
 AGENTS.local.md
 design/
+docs/source/user_guide/examples/omni_internal.md
 
 # Internal release sanitizer policy and helpers.
 oss_release_manifest.json
