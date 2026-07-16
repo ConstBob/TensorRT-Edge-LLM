@@ -86,6 +86,7 @@ _VISUAL_REGISTRY: dict[str, str] = {
     # translates ckpt keys before delegating to build_qwen3_vl_visual.
     "qwen3_omni": "qwen3_omni",
     "qwen3_omni_moe": "qwen3_omni",
+    "qwen3_omni_next": "qwen3_omni_next",
     "qwen3_5": "qwen3_5",
     "qwen3_5_moe": "qwen3_5",
     "qwen2_5_vl": "qwen2_5_vl",
@@ -105,6 +106,8 @@ _VISUAL_FAMILY_MODULE: dict[str, str] = {
     "tensorrt_edgellm.models.qwen3_vl.modeling_qwen3_vl_visual",
     "qwen3_omni":
     "tensorrt_edgellm.models.qwen3_omni.modeling_qwen3_omni_visual",
+    "qwen3_omni_next":
+    "tensorrt_edgellm.models.qwen3_omni_next.modeling_qwen3_omni_next_visual",
     "qwen3_5":
     "tensorrt_edgellm.models.qwen3_5.modeling_qwen3_5_visual",
     "qwen2_5_vl":
@@ -127,6 +130,7 @@ _VISUAL_FAMILY_MODULE: dict[str, str] = {
 _VISUAL_FAMILY_BUILD_FN: dict[str, str] = {
     "qwen3_vl": "build_qwen3_vl_visual",
     "qwen3_omni": "build_qwen3_omni_visual",
+    "qwen3_omni_next": "build_qwen3_omni_next_visual",
     "qwen3_5": "build_qwen3_5_visual",
     "qwen2_5_vl": "build_qwen25_vl_visual",
     "internvl3": "build_internvl_visual",
@@ -148,6 +152,8 @@ _AUDIO_MODEL_TYPES: frozenset[str] = frozenset([
     "qwen3_omni_moe",
     "qwen3_omni_moe_thinker",
     "gemma4",
+    "qwen3_omni_next",
+    "qwen3_omni_next_thinker",
     "gemma4_unified",
     *_NEMOTRON_OMNI_MODEL_TYPES,
     # qwen3_tts intentionally excluded: Qwen3-TTS has NO audio encoder.
@@ -163,6 +169,8 @@ _AUDIO_KEY_PREFIX: dict[str, str] = {
     "qwen3_omni_moe": "thinker.audio_tower.",
     "qwen3_omni_moe_thinker": "thinker.audio_tower.",
     "gemma4": "model.audio_tower.",
+    "qwen3_omni_next": "thinker.audio_tower.",
+    "qwen3_omni_next_thinker": "thinker.audio_tower.",
 }
 
 # ---------------------------------------------------------------------------
@@ -172,9 +180,10 @@ _AUDIO_KEY_PREFIX: dict[str, str] = {
 
 def _get_visual_config(model_type: str, config: dict) -> dict:
     """Extract visual encoder sub-config from the full model config."""
-    if model_type in ("qwen3_vl", "qwen3_omni", "qwen3_omni_moe", "qwen3_5",
-                      "qwen3_5_moe", "qwen2_5_vl"):
-        # Qwen3-Omni (dense + MoE) stores vision_config nested under
+    if model_type in ("qwen3_vl", "qwen3_omni", "qwen3_omni_moe",
+                      "qwen3_omni_next", "qwen3_5", "qwen3_5_moe",
+                      "qwen2_5_vl"):
+        # Qwen3-Omni (dense + MoE) / Qwen3-Next Omni store vision_config nested under
         # thinker_config; other Qwen VL variants keep it at the root.
         return (config.get("vision_config")
                 or config.get("thinker_config", {}).get("vision_config")
@@ -374,8 +383,8 @@ def export_audio_onnx(
         from ..models.gemma4.modeling_gemma4_unified_audio import \
             build_gemma4_unified_audio
         if model_config is None:
-            from ..config import ModelConfig
-            model_config = ModelConfig.from_pretrained(model_dir)
+            from ..model import load_model_config
+            model_config = load_model_config(model_dir)
         logger.info("Building Gemma4 Unified encoder-free audio model ...")
         audio_model = build_gemma4_unified_audio(config,
                                                  weights,
@@ -404,6 +413,23 @@ def export_audio_onnx(
         logger.info("Building Gemma4 audio encoder (prefix=%r) ...",
                     key_prefix)
         build_fn = build_gemma4_audio
+        extra_kwargs = {
+            "prefix": key_prefix,
+            "model_config": model_config,
+        }
+    elif model_type in ("qwen3_omni_next", "qwen3_omni_next_thinker"):
+        # Qwen3-Next audio encoder adds a 4th stride-2 Conv2d (16x downsample
+        # instead of Qwen3-ASR/Qwen3-Omni's 8x); the builder + subclass
+        # ``get_onnx_export_args`` override handle the shape difference.
+        from ..models.qwen3_omni_next.modeling_qwen3_omni_next_audio import \
+            build_qwen3_omni_next_audio
+        config = config.get("thinker_config",
+                            {}).get("audio_config",
+                                    config.get("audio_config", config))
+        key_prefix = _AUDIO_KEY_PREFIX.get(model_type)
+        logger.info("Building %s audio encoder (prefix=%r) ...", model_type,
+                    key_prefix)
+        build_fn = build_qwen3_omni_next_audio
         extra_kwargs = {
             "prefix": key_prefix,
             "model_config": model_config,

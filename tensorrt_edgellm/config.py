@@ -1050,6 +1050,7 @@ _QWEN3_5_MTP_CONFIG_MODEL_TYPES = frozenset({
     "qwen3_5_text",
     "qwen3_5_moe",
     "qwen3_5_moe_text",
+    "qwen3_omni_next_text",
 })
 
 
@@ -1202,6 +1203,9 @@ def _parse_num_deepstack_features(
                 return len(indexes)
 
     root_mt = (root_config or {}).get("model_type") or ""
+    # Strict equality, not substring — ``"qwen3_omni" in "qwen3_omni_next"``
+    # is True and would otherwise report 3 deepstack features for Qwen3-Next Omni
+    # (whose ``deepstack_visual_indexes`` is empty -> 0 features).
     if model_type in _DEEPSTACK_MODEL_TYPES or root_mt in _DEEPSTACK_MODEL_TYPES:
         return 3
     return 0
@@ -1506,6 +1510,12 @@ def _normalize_module_name(name: str) -> str:
         return name[len("model.language_model."):]
     if name.startswith("thinker.model."):
         return name[len("thinker.model."):]
+    # Talker sub-LLM keys share the thinker short-name space after
+    # ``_make_sub_model_dir(key_prefix='talker.')`` staging.
+    if name.startswith("talker.model."):
+        return name[len("talker.model."):]
+    if name.startswith("talker."):
+        return name[len("talker."):]
     for prefix in _VL_LLM_PREFIXES + ("model.", ):
         if name.startswith(prefix):
             return name[len(prefix):]

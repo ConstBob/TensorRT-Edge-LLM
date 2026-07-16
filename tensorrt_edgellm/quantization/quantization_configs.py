@@ -240,6 +240,13 @@ FP8_AUDIO = {
     )
 }
 
+_TTS_PATTERNS = (
+    "*code_predictor.*",
+    "*code2wav.*",
+    "*codec_head*",
+    "*hidden_projection*",
+)
+
 # Qwen3-Omni Talker CodePredictor — 5-layer Qwen3 decoder under
 # ``talker.code_predictor.*`` emitting residual codec tokens.
 _CP_PREFIXES = ("code_predictor", )

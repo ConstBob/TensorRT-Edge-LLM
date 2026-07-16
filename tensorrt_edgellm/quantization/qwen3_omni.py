@@ -60,14 +60,22 @@ from typing import Optional, Tuple
 
 import modelopt.torch.quantization as mtq
 import torch
+from datasets import (Audio, concatenate_datasets, get_dataset_config_names,
+                      load_dataset)
 from modelopt.torch.export import export_hf_checkpoint
 from modelopt.torch.quantization.utils import is_quantized
+from torch.utils.data import Dataset
 from tqdm import tqdm
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
 from .quantization_configs import build_quant_config
 # Reuse Thinker-side helpers from the dedicated thinker driver.
 from .qwen3_omni_thinker import _extract_and_save_thinker_text
+
+try:
+    import librosa
+except ImportError:
+    librosa = None
 
 # ---------------------------------------------------------------------------
 # Quant config — Thinker + Talker text path
@@ -167,7 +175,7 @@ def _build_full_model_quant_cfg(lm_head_quantization: Optional[str],
 # ---------------------------------------------------------------------------
 
 
-class _OmniMultimodalCalibDataset:
+class _OmniMultimodalCalibDataset(Dataset):
     """Mixed-modality calibration dataset for Qwen3-Omni Talker.
 
     Pre-encodes each sample with the HF processor so calibration just
@@ -269,18 +277,28 @@ class _OmniMultimodalCalibDataset:
         return self._process_text(sample["raw"])
 
 
-def _build_multimodal_calib_dataset(processor, num_audio: int, num_image: int,
-                                    num_text: int):
+def _build_multimodal_calib_dataset(
+    processor,
+    num_audio: int,
+    num_image: int,
+    num_text: int,
+    audio_dataset_dir: str = "openslr/librispeech_asr",
+    visual_dataset_dir: str = "lmms-lab/MMMU",
+    text_dataset: str = "cnn_dailymail",
+) -> "_OmniMultimodalCalibDataset":
     """Build the multimodal calibration dataset (audio + image + text).
 
-    Setting any ``num_*`` to 0 skips that modality.
+    Setting any ``num_*`` to 0 skips that modality. Dataset paths are optional
+    overrides for the auto-dispatch path (``quantize_and_export_omni``); the
+    ``quantize_qwen3_omni`` CLI leaves them at their defaults for the original
+    LibriSpeech / MMMU / cnn_dailymail recipe.
     """
-    from datasets import load_dataset
     audio_data = []
     if num_audio > 0:
-        from datasets import Audio
-        print(f"[Omni calib] Loading audio (LibriSpeech), n={num_audio}")
-        audio_stream = load_dataset("openslr/librispeech_asr",
+        print(
+            f"[Omni calib] Loading audio from {audio_dataset_dir}, n={num_audio}"
+        )
+        audio_stream = load_dataset(audio_dataset_dir,
                                     "clean",
                                     split="test",
                                     streaming=True)
@@ -289,16 +307,33 @@ def _build_multimodal_calib_dataset(processor, num_audio: int, num_image: int,
 
     image_data = []
     if num_image > 0:
-        print(f"[Omni calib] Loading images (MMMU), n={num_image}")
-        image_dataset = load_dataset("lmms-lab/MMMU", split="dev")
+        print(
+            f"[Omni calib] Loading images from {visual_dataset_dir}, n={num_image}"
+        )
+        if "lmms-lab/MMMU" in visual_dataset_dir:
+            image_dataset = load_dataset(visual_dataset_dir, split="dev")
+        elif "MMMU" in visual_dataset_dir:
+            configs = get_dataset_config_names(visual_dataset_dir)
+            image_dataset = concatenate_datasets([
+                load_dataset(visual_dataset_dir, c, split="dev")
+                for c in configs
+            ])
+        else:
+            image_dataset = load_dataset(visual_dataset_dir, split="dev")
         image_data = list(
             image_dataset.select(range(min(num_image, len(image_dataset)))))
 
     text_data = []
     if num_text > 0:
-        print(f"[Omni calib] Loading text (cnn_dailymail), n={num_text}")
-        text_ds = load_dataset("cnn_dailymail", name="3.0.0", split="train")
-        text_data = text_ds["article"][:num_text]
+        print(f"[Omni calib] Loading text from {text_dataset}, n={num_text}")
+        if "cnn_dailymail" in text_dataset:
+            text_ds = load_dataset(text_dataset, name="3.0.0", split="train")
+            text_data = text_ds["article"][:num_text]
+        elif os.path.isdir(text_dataset):
+            text_ds = load_dataset(text_dataset, split="train")
+            text_data = text_ds["text"][:num_text]
+        else:
+            text_data = ["Describe the weather today."] * num_text
 
     return _OmniMultimodalCalibDataset(processor, audio_data, image_data,
                                        text_data)
@@ -345,10 +380,10 @@ def _calib_full_multimodal(model, calib_dataset,
                   desc="Calibrating Omni (multimodal: thinker+talker)"):
         try:
             data = calib_dataset[i]
-        except Exception as e:
+        except Exception as error:
             skipped += 1
             if skipped <= 3:
-                print(f"[Omni calib] Skipping sample {i}: {e}")
+                print(f"[Omni calib] Skipping sample {i}: {error}")
             continue
         data = {
             k:
@@ -840,3 +875,352 @@ def _export_submodel(model, which: str, full_dir: str) -> None:
         if _tied_keys_was_patched:
             sub._tied_weights_keys = saved_tied_keys
     print(f"[export-{which}] {full_dir}")
+
+
+# ===========================================================================
+#         Auto-dispatch path used by ``tensorrt-edgellm-quantize llm``
+#     for any Qwen3-Omni / Qwen3-Next Omni checkpoint. Separate from the
+#     ``qwen3-omni`` CLI subcommand above (which targets the joint MoE
+#     NVFP4 Thinker+Talker recipe with a per-submodule extraction step).
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# transformers 4.57.0.dev0 workarounds for Qwen3-Next Omni
+# ---------------------------------------------------------------------------
+
+
+def _patch_qwen3_omni_next_transformers() -> None:
+    """Patch transformers in-place so the Qwen3-Next Omni HF checkpoint loads.
+
+    Three latent bugs in transformers 4.57.0.dev0's ``qwen3_omni_next``
+    module surface only on the Qwen3-Next Omni checkpoint:
+
+    1. ``Qwen3OmniNextCode2WavConfig`` never sets ``rope_scaling`` but the
+       shared ``Qwen3OmniNextRotaryEmbedding.__init__`` reads it unguarded,
+       so Code2Wav init raises ``AttributeError``.
+    2. ``Qwen3OmniNextTalkerDecoderLayer`` wires ``self_attn`` to the
+       non-gated ``Qwen3OmniNextThinkerTextAttention`` but the checkpoint
+       stores a gated ``q_proj`` (2× output).  Swap to the gated
+       ``Qwen3OmniNextAttention`` whose forward splits q into query+gate.
+    3. ``Qwen3OmniNextTalkerCodePredictorAttention.q_proj`` is non-gated
+       in source but gated in checkpoint.  CodePredictor is excluded from
+       quantization and never forward-called during calibration, so
+       resizing q_proj to the 2× shape is enough for ``load_state_dict``.
+
+    The patches are guarded with sentinel attributes so multiple calls
+    are safe.
+    """
+    import torch.nn as _nn
+    from transformers.models.qwen3_omni_next import \
+        modeling_qwen3_omni_next as _mod
+    from transformers.models.qwen3_omni_next.configuration_qwen3_omni_next import \
+        Qwen3OmniNextCode2WavConfig
+
+    if not hasattr(Qwen3OmniNextCode2WavConfig, "rope_scaling"):
+        Qwen3OmniNextCode2WavConfig.rope_scaling = {}
+
+    if not getattr(_mod.Qwen3OmniNextTalkerDecoderLayer,
+                   "_edgellm_gated_patched", False):
+        _orig_tdl_init = _mod.Qwen3OmniNextTalkerDecoderLayer.__init__
+
+        def _tdl_init_gated(self, config, layer_idx):
+            _orig_tdl_init(self, config, layer_idx)
+            self.self_attn = _mod.Qwen3OmniNextAttention(config, layer_idx)
+
+        _mod.Qwen3OmniNextTalkerDecoderLayer.__init__ = _tdl_init_gated
+        _mod.Qwen3OmniNextTalkerDecoderLayer._edgellm_gated_patched = True
+
+    if not getattr(_mod.Qwen3OmniNextTalkerCodePredictorAttention,
+                   "_edgellm_gated_q_patched", False):
+        _orig_cp_init = \
+            _mod.Qwen3OmniNextTalkerCodePredictorAttention.__init__
+
+        def _cp_init_gated(self, config, layer_idx):
+            _orig_cp_init(self, config, layer_idx)
+            self.q_proj = _nn.Linear(
+                config.hidden_size,
+                config.num_attention_heads * self.head_dim * 2,
+                bias=config.attention_bias,
+            )
+
+        _mod.Qwen3OmniNextTalkerCodePredictorAttention.__init__ = \
+            _cp_init_gated
+        _mod.Qwen3OmniNextTalkerCodePredictorAttention._edgellm_gated_q_patched = True
+
+
+# ---------------------------------------------------------------------------
+# Model detection + loader
+# ---------------------------------------------------------------------------
+
+OMNI_MODEL_TYPES = frozenset(["qwen3_omni", "qwen3_omni_next"])
+
+
+def is_omni_model_dir(model_dir: str) -> bool:
+    """Return True iff ``config.json`` declares a Qwen3-Omni variant."""
+    cfg_path = os.path.join(model_dir, "config.json")
+    if not os.path.isfile(cfg_path):
+        return False
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return cfg.get("model_type") in OMNI_MODEL_TYPES
+
+
+def _read_model_type(model_dir: str) -> str:
+    with open(os.path.join(model_dir, "config.json")) as f:
+        return json.load(f).get("model_type", "")
+
+
+def _load_omni_model(model_dir: str, dtype: str, device: str):
+    """Instantiate the right ``ForConditionalGeneration`` class + processor."""
+    torch_dtype = torch.float16 if dtype == "fp16" else torch.bfloat16
+    model_type = _read_model_type(model_dir)
+
+    tokenizer = AutoTokenizer.from_pretrained(model_dir,
+                                              trust_remote_code=True)
+    try:
+        processor = AutoProcessor.from_pretrained(model_dir,
+                                                  trust_remote_code=True)
+    except Exception as error:
+        print(f"Warning: AutoProcessor failed ({error}); "
+              "multimodal calibration will fall back to text-only.")
+        processor = None
+
+    if model_type == "qwen3_omni_next":
+        _patch_qwen3_omni_next_transformers()
+        from transformers import Qwen3OmniNextForConditionalGeneration
+        model = Qwen3OmniNextForConditionalGeneration.from_pretrained(
+            model_dir, torch_dtype=torch_dtype,
+            trust_remote_code=True).to(device)
+    else:
+        from transformers import Qwen3OmniForConditionalGeneration
+        model = Qwen3OmniForConditionalGeneration.from_pretrained(
+            model_dir, torch_dtype=torch_dtype,
+            trust_remote_code=True).to(device)
+
+    # Qwen3-Omni / Qwen3-Next Omni ForConditionalGeneration classes are
+    # generation-only — they don't define forward(). ModelOpt's
+    # ``export_hf_checkpoint`` calls ``model(fake_input)`` though, so add
+    # a forward that delegates to the Thinker (which covers every layer
+    # we actually quantize).
+    type(model).forward = lambda self, *args, **kwargs: self.thinker(
+        *args, **kwargs)
+
+    if getattr(model.config, "architectures", None) is None:
+        model.config.architectures = [type(model).__name__]
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    return model, tokenizer, processor
+
+
+# ---------------------------------------------------------------------------
+# Calibration loop — works for both Qwen3-Omni and Qwen3-Next Omni. Respects
+# the ``has_talker`` toggle and Qwen3-Next Omni's standalone text-embedding
+# path (``get_input_text_embeddings()`` vs. ``text_projection``).
+# ---------------------------------------------------------------------------
+
+
+def _omni_calib_loop(model,
+                     calib_dataset: "_OmniMultimodalCalibDataset",
+                     accept_hidden_layer: int = 14) -> None:
+    """Forward each sample through Thinker (and Talker when present).
+
+    For each sample the Thinker is run with ``output_hidden_states=True``.
+    The hidden states at ``accept_hidden_layer`` are projected into the
+    Talker space (Qwen3-Omni uses ``text_projection``; Qwen3-Next Omni uses
+    a standalone ``get_input_text_embeddings()``) so the Talker's first
+    decoder layer sees realistic ``inputs_embeds``.
+    """
+    device = next(model.parameters()).device
+    has_talker = bool(getattr(model, "has_talker", False))
+
+    skipped = 0
+    for i in tqdm(range(len(calib_dataset)),
+                  desc="Calibrating Omni (multimodal)"):
+        try:
+            data = calib_dataset[i]
+        except Exception as error:  # noqa: BLE001
+            skipped += 1
+            if skipped <= 3:
+                print(f"Skipping sample {i}: {error}")
+            continue
+        data = {
+            k:
+            v.unsqueeze(0).to(
+                device,
+                dtype=model.thinker.dtype if v.is_floating_point() else None)
+            for k, v in data.items()
+        }
+
+        thinker_out = model.thinker(**data, output_hidden_states=True)
+        if not has_talker:
+            continue
+
+        all_hidden = thinker_out.hidden_states
+        if all_hidden is None or len(all_hidden) <= accept_hidden_layer:
+            continue
+        thinker_hidden = all_hidden[accept_hidden_layer]
+        thinker_embed = all_hidden[0]
+
+        input_ids = data.get("input_ids")
+        audio_tok = getattr(model.config.thinker_config, "audio_token_id", -1)
+        image_tok = getattr(model.config.thinker_config, "image_token_id", -1)
+        mm_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        if audio_tok >= 0:
+            mm_mask |= (input_ids == audio_tok)
+        if image_tok >= 0:
+            mm_mask |= (input_ids == image_tok)
+
+        seq_len = thinker_hidden.shape[1]
+        talker_dim = model.talker.config.text_config.hidden_size
+        inputs_embeds = torch.empty(1,
+                                    seq_len,
+                                    talker_dim,
+                                    dtype=model.talker.dtype,
+                                    device=device)
+
+        if mm_mask.any():
+            inputs_embeds[mm_mask] = model.talker.hidden_projection(
+                thinker_hidden[mm_mask])
+        text_mask = ~mm_mask
+        if text_mask.any():
+            # Qwen3-Omni: ``talker.text_projection(thinker_embed)``.
+            # Qwen3-Next Omni: standalone ``get_input_text_embeddings()``
+            # (text_projection does not exist on the Qwen3.5 talker).
+            if hasattr(model.talker, "text_projection"):
+                inputs_embeds[text_mask] = model.talker.text_projection(
+                    thinker_embed[text_mask])
+            else:
+                inputs_embeds[
+                    text_mask] = model.talker.get_input_text_embeddings()(
+                        input_ids[text_mask]).to(inputs_embeds.dtype)
+
+        tc = model.talker.config.text_config
+        talker_ids = torch.randint(0,
+                                   tc.vocab_size, (1, seq_len),
+                                   device=device)
+        attn_mask = torch.ones(1, seq_len, dtype=torch.long, device=device)
+
+        model.talker(inputs_embeds=inputs_embeds,
+                     attention_mask=attn_mask,
+                     talker_input_ids=talker_ids)
+
+    if skipped:
+        print(
+            f"Omni calibration: skipped {skipped}/{len(calib_dataset)} samples"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Post-calibration ``_amax`` backfill
+# ---------------------------------------------------------------------------
+
+
+def _backfill_missing_amax(model) -> int:
+    """Set ``_amax`` for any quantizer that calibration did not populate.
+
+    Required because ``modelopt`` exports NVFP4's per-tensor ``weight_scale_2``
+    from ``weight_quantizer._amax``; if a Linear's forward never updated its
+    quantizer (observed for Talker layers post the gated-attention swap),
+    ``export_hf_checkpoint`` aborts with::
+
+        AssertionError: Weight quantizer does not have attribute amax
+
+    For weight quantizers we use ``weight.abs().max()`` (the static fallback
+    a ``MaxCalibrator`` would have produced).  For input quantizers without
+    observed activations we use the same value: it makes the per-tensor
+    scale conservative but quantization still works at runtime.
+    """
+    n_filled = 0
+    for module in model.modules():
+        wq = getattr(module, "weight_quantizer", None)
+        iq = getattr(module, "input_quantizer", None)
+        weight = getattr(module, "weight", None)
+        # We're looking specifically for quantized linears, which are the
+        # only modules that have all three (weight + weight_quantizer +
+        # input_quantizer).  Skip everything else.
+        if wq is None or iq is None or weight is None:
+            continue
+        for q in (wq, iq):
+            if getattr(q, "_disabled", False):
+                continue
+            if not hasattr(q, "_amax"):
+                fallback = weight.detach().abs().max().to(weight.dtype)
+                q.register_buffer("_amax", fallback.clone())
+                n_filled += 1
+    return n_filled
+
+
+# ---------------------------------------------------------------------------
+# Top-level entry point (called from ``tensorrt-edgellm-quantize llm``)
+# ---------------------------------------------------------------------------
+
+
+def quantize_and_export_omni(
+    model_dir: str,
+    output_dir: str,
+    quantization: Optional[str] = None,
+    lm_head_quantization: Optional[str] = None,
+    kv_cache_quantization: Optional[str] = None,
+    dtype: str = "fp16",
+    device: str = "cuda",
+    audio_dataset: str = "openslr/librispeech_asr",
+    visual_dataset: str = "lmms-lab/MMMU",
+    text_dataset: str = "cnn_dailymail",
+) -> str:
+    """Load a Qwen3-Omni / Qwen3-Next Omni model, quantize it, and export."""
+    t0 = time.time()
+    model, tokenizer, processor = _load_omni_model(model_dir, dtype, device)
+
+    if is_quantized(model):
+        print("Model already quantized — skipping.")
+    else:
+        if processor is None:
+            raise RuntimeError(
+                "Omni multimodal calibration requires a processor; "
+                "AutoProcessor.from_pretrained failed.")
+        accept_layer = getattr(getattr(model.config, "talker_config", None),
+                               "accept_hidden_layer", 14)
+        calib_dataset = _build_multimodal_calib_dataset(
+            processor,
+            num_audio=150,
+            num_image=150,
+            num_text=200,
+            audio_dataset_dir=audio_dataset,
+            visual_dataset_dir=visual_dataset,
+            text_dataset=text_dataset,
+        )
+        has_talker = bool(getattr(model, "has_talker", False))
+        print(f"Omni multimodal calibration: {len(calib_dataset)} samples "
+              f"(accept_hidden_layer={accept_layer}, "
+              f"talker={'yes' if has_talker else 'no'})")
+
+        quant_cfg = build_quant_config(quantization, lm_head_quantization,
+                                       kv_cache_quantization)
+        mtq.quantize(
+            model,
+            quant_cfg,
+            forward_loop=lambda m: _omni_calib_loop(m, calib_dataset,
+                                                    accept_layer),
+        )
+        mtq.print_quant_summary(model)
+
+    print(f"Quantization: {time.time() - t0:.1f}s")
+
+    n_filled = _backfill_missing_amax(model)
+    if n_filled:
+        print(f"Backfilled {n_filled} missing _amax buffers from weights "
+              "(Talker layers calibration did not populate)")
+
+    os.makedirs(output_dir, exist_ok=True)
+    with torch.inference_mode():
+        export_hf_checkpoint(model, export_dir=output_dir)
+    tokenizer.save_pretrained(output_dir)
+    if processor is not None:
+        processor.save_pretrained(output_dir)
+
+    print(f"Saved to {output_dir} (total {time.time() - t0:.1f}s)")
+    return output_dir

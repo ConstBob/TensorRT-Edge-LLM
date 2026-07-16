@@ -531,7 +531,9 @@ class Qwen3_5Backbone(nn.Module):
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
         gc = config.gdn_cfg
-        assert gc is not None, "Qwen3.5 requires gdn_cfg"
+        assert gc is not None or LAYER_GDN not in config.layer_types, (
+            "Qwen3.5 requires gdn_cfg when any layer is a GDN "
+            "(linear_attention) layer")
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([
             Qwen3_5DecoderLayer(config, gc, layer_idx=i, layer_type=lt)
@@ -890,9 +892,10 @@ class Qwen3_5CausalLM(nn.Module):
         """Return all model-specific parameters needed for ONNX export."""
         config = self.config
         gc = config.gdn_cfg
-        assert gc is not None
         Na = config.num_attn_layers
         Ng = config.num_gdn_layers
+        assert gc is not None or Ng == 0, (
+            "Qwen3.5 requires gdn_cfg when any layer is GDN")
         mtp_base = _is_mtp_base_export(config)
         dflash_base = _is_dflash_base_export(config)
         dflash_tree_base = _is_dflash_tree_base_export(config)
