@@ -30,13 +30,15 @@ namespace trt_edgellm
 namespace rt
 {
 
-//! \brief Configuration for Qwen3-Omni audio encoder
+//! \brief Configuration for Qwen3-Omni / Qwen3-Next Omni audio encoder
 struct AudioConfig
 {
     int32_t melBins{128};          //!< Number of mel-frequency bins
     int32_t audioFeatureDim{2560}; //!< Audio feature dimension (output embedding size)
     int32_t nWindow{100};          //!< Window size for audio chunking
     int32_t nWindowInfer{100};     //!< Inference window size
+
+    int32_t numConvDownsampleStages{3}; //! Number of stride-2 Conv2D downsampling
 
     // Audio special tokens (from tokenizer_config.json)
     int32_t audioTokenId{151675}; //!< <|audio_pad|> token ID

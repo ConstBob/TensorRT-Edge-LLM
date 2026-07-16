@@ -165,6 +165,24 @@ bool Qwen3OmniAudioRunner::validateAndFillConfig(std::string const& engineDir)
         LOG_WARNING("audio_config not found in config.json, using default values");
     }
 
+    // Convolutional downsample-stack depth — derived from the top-level model_type.
+    // Qwen3-Omni / Qwen3-ASR use 3 stride-2 Conv2D stages; Qwen3-Next Omni adds a 4th stage
+    // (``conv2d4`` in HF ``Qwen3OmniNextAudioEncoder``). Defaulting to 3 keeps existing
+    // exports unchanged.
+    {
+        std::string const topLevelModelType = jsonConfig.value("model_type", "");
+        if (topLevelModelType == "qwen3_omni_next_audio_encoder")
+        {
+            mConfig.numConvDownsampleStages = 4;
+        }
+        else
+        {
+            mConfig.numConvDownsampleStages = 3;
+        }
+        LOG_INFO("Audio encoder: model_type='%s', conv downsample stages=%d", topLevelModelType.c_str(),
+            mConfig.numConvDownsampleStages);
+    }
+
     // Parse audio special token IDs from top-level config (may differ between Qwen3-Omni and Qwen3-ASR)
     if (jsonConfig.contains("audio_token_id"))
     {
@@ -187,7 +205,8 @@ bool Qwen3OmniAudioRunner::validateAndFillConfig(std::string const& engineDir)
     // ``qwen3_omni_audio_encoder`` here). Runner owns mel extraction;
     // callers hand off raw PCM.
     std::string const audioModelType = jsonConfig.value("model_type", "");
-    if (audioModelType == "qwen3_asr_thinker" || audioModelType == "qwen3_omni_audio_encoder")
+    if (audioModelType == "qwen3_asr_thinker" || audioModelType == "qwen3_omni_audio_encoder"
+        || audioModelType == "qwen3_omni_next_audio_encoder")
     {
         mFeMel = rt::audio::makeWhisperExtractor();
     }
@@ -195,7 +214,7 @@ bool Qwen3OmniAudioRunner::validateAndFillConfig(std::string const& engineDir)
     {
         LOG_ERROR(
             "Unsupported audio model_type %s for Qwen3OmniAudioRunner (expected qwen3_asr_thinker / "
-            "qwen3_omni_audio_encoder)",
+            "qwen3_omni_audio_encoder / qwen3_omni_next_audio_encoder)",
             audioModelType.c_str());
         return false;
     }
@@ -653,10 +672,11 @@ bool Qwen3OmniAudioRunner::preprocessAudio(std::vector<rt::audioUtils::AudioData
         int64_t const timeSteps = melSpec.getShape()[2];
         LOG_DEBUG("Mel-spectrogram shape: [%ld, %ld, %ld]", melSpec.getShape()[0], melSpec.getShape()[1], timeSteps);
 
-        // Preprocess for audio encoder
+        // Preprocess for audio encoder. ``numConvDownsampleStages`` selects the post-CNN
+        // length recurrence (3 stages for Qwen3-Omni, 4 for Qwen3-Next Omni).
         std::vector<int64_t> afterCNNLens;
-        if (!audioUtils::preprocessAudioForEncoder(
-                melSpec, mConfig.nWindow, mPaddedFeature, mPaddedMaskAfterCNN, afterCNNLens, stream))
+        if (!audioUtils::preprocessAudioForEncoder(melSpec, mConfig.nWindow, mPaddedFeature, mPaddedMaskAfterCNN,
+                afterCNNLens, stream, mConfig.numConvDownsampleStages))
         {
             LOG_ERROR("Failed to preprocess audio for encoder");
             return false;
