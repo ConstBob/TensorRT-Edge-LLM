@@ -885,6 +885,7 @@ class FusedMask:
             index_q,
             index_k,
         ),
+        assume_fragment_single_row: cutlass.Constexpr = False,
     ):
         """
         Apply the appropriate mask to the attention scores.
@@ -906,6 +907,10 @@ class FusedMask:
         :type window_size_left: Optional[int]
         :param window_size_right: Right-side sliding window size for attention masking.
         :type window_size_right: Optional[int]
+        :param assume_fragment_single_row: UNCHECKED caller promise that this
+            thread's whole fragment lies in a single S-matrix row, i.e. index_q
+            is identical for every element.
+        :type assume_fragment_single_row: cutlass.Constexpr
         """
 
         tidx, tidy, tidx = cute.arch.thread_idx()
@@ -913,30 +918,65 @@ class FusedMask:
         offset = (seqlen_k - seqlen_q if cutlass.const_expr(
             mask_type is MaskEnum.WINDOW_MASK_INFERENCE
             or mask_type is MaskEnum.WINDOW_MASK_BWD_INFERENCE) else 0)
-        for i in cutlass.range_constexpr(cute.size(acc_qk)):
-            index_q, index_k = index_transform(*index_qk[i])
-            if cutlass.const_expr(window_size_left is not None
-                                  or window_size_right is not None):
-                if cutlass.const_expr(window_size_left is None):
-                    if index_q + offset + window_size_right < index_k:
-                        acc_qk[i] = -Float32.inf
-                    if index_k >= seqlen_k or index_q >= seqlen_q:  # residual mask
-                        acc_qk[i] = -Float32.inf
-                elif cutlass.const_expr(window_size_right is None):
-                    if index_q + offset - window_size_left > index_k:
-                        acc_qk[i] = -Float32.inf
-                    if index_k >= seqlen_k or index_q >= seqlen_q:  # residual mask
-                        acc_qk[i] = -Float32.inf
-                else:
-                    max_K_index = min(index_q + offset + window_size_right,
-                                      seqlen_k)
-                    min_K_index = max(0, index_q + offset - window_size_left)
-                    if index_k > max_K_index or index_k < min_K_index:
-                        acc_qk[i] = -Float32.inf
-                    if index_k >= seqlen_k or index_q >= seqlen_q:  # residual mask
-                        acc_qk[i] = -Float32.inf
-
-            if cutlass.const_expr(mask_type == MaskEnum.RESIDUAL_MASK
-                                  or mask_type == MaskEnum.RESIDUAL_MASK_BWD):
-                if index_k >= seqlen_k or index_q >= seqlen_q:
+        if cutlass.const_expr(assume_fragment_single_row
+                              and window_size_left is None
+                              and window_size_right is not None):
+            # Hoisted scalar causal fast path. index_q is constant across the
+            # fragment (caller-promised, see the parameter doc), which lets
+            # the generic path's per-element work collapse three times:
+            # (1) hoist q: the row coordinate is read once (index_qk[0]) and
+            #     the causal right boundary k_bound is computed once per row;
+            # (2) absorb the residual checks into k_bound: clamping to
+            #     seqlen_k - 1 makes an OOB column (index_k >= seqlen_k)
+            #     automatically fail index_k <= k_bound, and an OOB row
+            #     (index_q >= seqlen_q) sets k_bound = -1 so every element
+            #     masks -- both residual compares vanish from the loop;
+            # (3) the loop body reduces to one compare per element, replacing
+            #     the generic path's two-coordinate read + add + 3 compares.
+            # Alignment follows mask_type: WINDOW_MASK_INFERENCE =
+            # bottom-right (offset = seqlen_k - seqlen_q); WINDOW_MASK =
+            # top-left (offset 0). Bit-identical to the generic path.
+            index_q0, _k0 = index_transform(*index_qk[0])  # hoist q
+            k_bound = index_q0 + offset + window_size_right
+            # Clamp absorbs the OOB-column residual check. Fires whenever the
+            # causal boundary reaches past the key sequence -- routine for
+            # rows near the end once window_size_right > 0; with wsr == 0 it
+            # only fires for OOB rows (top-left: s_q > s_k).
+            if k_bound > seqlen_k - 1:
+                k_bound = seqlen_k - 1
+            # OOB-row sentinel: valid index_k is always >= 0, so k_bound = -1
+            # guarantees index_k > k_bound and every element masks.
+            if index_q0 >= seqlen_q:
+                k_bound = Int32(-1)
+            for i in cutlass.range_constexpr(cute.size(acc_qk)):
+                _q, index_k = index_transform(*index_qk[i])
+                if index_k > k_bound: # one compare per element
                     acc_qk[i] = -Float32.inf
+        else:
+            for i in cutlass.range_constexpr(cute.size(acc_qk)):
+                index_q, index_k = index_transform(*index_qk[i])
+                if cutlass.const_expr(window_size_left is not None
+                                      or window_size_right is not None):
+                    if cutlass.const_expr(window_size_left is None):
+                        if index_q + offset + window_size_right < index_k:
+                            acc_qk[i] = -Float32.inf
+                        if index_k >= seqlen_k or index_q >= seqlen_q:  # residual mask
+                            acc_qk[i] = -Float32.inf
+                    elif cutlass.const_expr(window_size_right is None):
+                        if index_q + offset - window_size_left > index_k:
+                            acc_qk[i] = -Float32.inf
+                        if index_k >= seqlen_k or index_q >= seqlen_q:  # residual mask
+                            acc_qk[i] = -Float32.inf
+                    else:
+                        max_K_index = min(index_q + offset + window_size_right,
+                                          seqlen_k)
+                        min_K_index = max(0, index_q + offset - window_size_left)
+                        if index_k > max_K_index or index_k < min_K_index:
+                            acc_qk[i] = -Float32.inf
+                        if index_k >= seqlen_k or index_q >= seqlen_q:  # residual mask
+                            acc_qk[i] = -Float32.inf
+
+                if cutlass.const_expr(mask_type == MaskEnum.RESIDUAL_MASK
+                                      or mask_type == MaskEnum.RESIDUAL_MASK_BWD):
+                    if index_k >= seqlen_k or index_q >= seqlen_q:
+                        acc_qk[i] = -Float32.inf

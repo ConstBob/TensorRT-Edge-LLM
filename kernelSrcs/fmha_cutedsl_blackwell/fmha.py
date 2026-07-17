@@ -199,6 +199,11 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.is_causal = is_causal
         self.use_sliding_window = use_sliding_window
         self.enable_skip_correction = enable_skip_correction
+        # apply_mask(assume_fragment_single_row=...) promise for every masked
+        # S load in this kernel: they all use Ld32x32b(Repetition(32)) tmem
+        # atoms, which place one S-matrix row per thread. Re-audit this flag
+        # if any softmax S-load atom changes.
+        self.is_fragment_single_row = True
         # BLASST skip-softmax: None -> disabled (bit-identical dense base kernel).
         # A float value is the raw lambda; log2 is taken at kernel-build time and
         # threaded into softmax_step / the MMA-warp P*V skip behind const_expr gates.
@@ -2590,6 +2595,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 seqlen_k,
                 window_size_left,
                 window_size_right,
+                assume_fragment_single_row=self.is_fragment_single_row,
             )
 
         old_row_max = row_max
@@ -2846,6 +2852,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
         tmem_p_offset = self.tmem_p0_offset if stage == 0 else self.tmem_p1_offset
         tStS_P = cute.make_tensor(tStS.iterator + tmem_p_offset, tStS_P_layout)
+        # Ld32x32b maps lane <-> datapath: each thread's S fragment is one
+        # matrix row. self.is_fragment_single_row (the apply_mask promise in
+        # softmax_step) relies on this -- revisit that flag if the atom or
+        # the partition changes.
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
             self.qk_acc_dtype,
@@ -3407,6 +3417,11 @@ class BlackwellFusedMultiHeadAttentionForwardD256:
         self.is_causal = is_causal
         self.use_sliding_window = use_sliding_window
         self.enable_skip_correction = enable_skip_correction
+        # apply_mask(assume_fragment_single_row=...) promise for every masked
+        # S load in this kernel: they all use Ld32x32b(Repetition(32)) tmem
+        # atoms, which place one S-matrix row per thread. Re-audit this flag
+        # if any softmax S-load atom changes.
+        self.is_fragment_single_row = True
 
         self.softmax_warp_ids = (0, 1, 2, 3)
         self.correction_warp_ids = (4, 5, 6, 7)
@@ -5313,6 +5328,7 @@ class BlackwellFusedMultiHeadAttentionForwardD256:
             seqlen_k,
             window_size_left,
             window_size_right,
+            assume_fragment_single_row=self.is_fragment_single_row,
         )
 
         old_row_max = row_max
@@ -5746,6 +5762,7 @@ class BlackwellFusedMultiHeadAttentionForwardD256:
                 seqlen_k,
                 window_size_left,
                 window_size_right,
+                assume_fragment_single_row=self.is_fragment_single_row,
             )
 
         old_row_max = row_max
@@ -5928,6 +5945,10 @@ class BlackwellFusedMultiHeadAttentionForwardD256:
         )
         tmem_p_offset = self.tmem_p0_offset if stage == 0 else self.tmem_p1_offset
         tStS_P = cute.make_tensor(tStS.iterator + tmem_p_offset, tStS_P_layout)
+        # Ld32x32b maps lane <-> datapath: each thread's S fragment is one
+        # matrix row. self.is_fragment_single_row (the apply_mask promise in
+        # softmax_step) relies on this -- revisit that flag if the atom or
+        # the partition changes.
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
             self.qk_acc_dtype,
