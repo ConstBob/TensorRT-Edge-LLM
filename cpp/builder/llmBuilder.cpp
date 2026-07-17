@@ -1297,11 +1297,12 @@ bool LLMBuilder::setupLinearAttentionSpecVerifyProfiles(nvinfer1::IOptimizationP
         }
 
         int64_t const maxTreeTokens = std::max<int64_t>(1, mBuilderConfig.maxVerifyTreeSize);
+        int64_t const optTreeTokens = effectiveOptTokens(maxTreeTokens);
         bool ok = true;
         ok &= setOptimizationProfile(&contextProfile, inputName, createDims({1, 1}),
             createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, maxTreeTokens}));
         ok &= setOptimizationProfile(&generationProfile, inputName, createDims({1, 1}),
-            createDims({mBuilderConfig.maxBatchSize, std::max<int64_t>(1, maxTreeTokens / 2)}),
+            createDims({mBuilderConfig.maxBatchSize, optTreeTokens}),
             createDims({mBuilderConfig.maxBatchSize, maxTreeTokens}));
         return ok;
     };
