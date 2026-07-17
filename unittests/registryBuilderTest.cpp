@@ -554,12 +554,12 @@ TEST(RegistryBuilderTest, DraftEngineKVCacheUsesPluginPath)
     auto reg = buildRegistryForSpecDecodeDraft(bundle);
     auto specs = reg.allExpandedSpecs();
 
-    // KV cache should be 5D (plugin path)
+    // KV cache should be 5D paged-pool shape [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim]
     auto kvIt
         = std::find_if(specs.begin(), specs.end(), [](TensorSpec const& s) { return s.name == "past_key_values_0"; });
     ASSERT_NE(kvIt, specs.end());
     EXPECT_EQ(kvIt->shape.size(), 5u);
-    EXPECT_EQ(kvIt->shape[1].value, 2); // combined K+V dimension
+    EXPECT_EQ(kvIt->shape[0].value, 2); // combined K+V dimension (leading, pool contract)
 }
 
 // =====================================================================
@@ -607,12 +607,12 @@ TEST(RegistryBuilderTest, HeterogeneousKVLayerEmitsPerLayerSpecs)
     auto reg = buildRegistryForLLM(cfg);
     auto specs = reg.allExpandedSpecs();
 
-    // past_key_values_0: plugin combined KV shape [batch, 2, numKVHeads, kv_len, headDim]
+    // past_key_values_0: plugin paged-pool shape [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim]
     auto layer0
         = std::find_if(specs.begin(), specs.end(), [](TensorSpec const& s) { return s.name == "past_key_values_0"; });
     ASSERT_NE(layer0, specs.end());
     ASSERT_EQ(layer0->shape.size(), 5u);
-    EXPECT_EQ(layer0->shape[2].value, 8);  // numKVHeads for layer 0
+    EXPECT_EQ(layer0->shape[3].value, 8);  // numKVHeads for layer 0
     EXPECT_EQ(layer0->shape[4].value, 64); // headDim for layer 0
 
     // past_key_values_1: different KV config
@@ -620,11 +620,11 @@ TEST(RegistryBuilderTest, HeterogeneousKVLayerEmitsPerLayerSpecs)
         = std::find_if(specs.begin(), specs.end(), [](TensorSpec const& s) { return s.name == "past_key_values_1"; });
     ASSERT_NE(layer1, specs.end());
     ASSERT_EQ(layer1->shape.size(), 5u);
-    EXPECT_EQ(layer1->shape[2].value, 4);   // numKVHeads for layer 1
+    EXPECT_EQ(layer1->shape[3].value, 4);   // numKVHeads for layer 1
     EXPECT_EQ(layer1->shape[4].value, 128); // headDim for layer 1
 
     // Sanity: the two specs must differ on the fixed dims.
-    EXPECT_NE(layer0->shape[2].value, layer1->shape[2].value);
+    EXPECT_NE(layer0->shape[3].value, layer1->shape[3].value);
     EXPECT_NE(layer0->shape[4].value, layer1->shape[4].value);
 }
 

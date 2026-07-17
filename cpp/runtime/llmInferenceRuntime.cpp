@@ -24,6 +24,7 @@
 #include "common/mathUtils.h"
 #include "common/safetensorsUtils.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
+#include "kernels/posEncoding/applyRopeWriteKV.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
 #include "kernels/speculative/batchEvictKernels.h"
 #include "multimodal/multimodalRunner.h"
@@ -418,8 +419,9 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
         {
             std::string actionDir = multimodalEngineDir + "/action";
             LOG_INFO("Attempting to load Action runner from %s", actionDir.c_str());
-            mActionRunner = std::make_unique<Alpamayo1ActionRunner>(
-                actionDir, stream, mSharedResources->cacheManagers[0]->getKVCacheManager().getConfig());
+            mActionRunner = std::make_unique<Alpamayo1ActionRunner>(actionDir, stream,
+                mSharedResources->cacheManagers[0]->getKVCacheManager().getConfig(),
+                mSharedResources->kvPageTables[0]->isIdentity());
             LOG_INFO("Alpamayo 1 action expert loaded.");
         }
         catch (std::exception const& e)
@@ -1697,18 +1699,13 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(DecodingInferenceContext& con
                 restoreRecurrentStates(i, precachedKVCacheBase, context.stream);
             }
 
-            // Per-layer saved KV tensor shape is [2, numKVHeads, sequenceLength, headDim]; shape[2] == seqLen.
-            check::check(!kvCacheLayersBase.empty(), "System prompt KV cache must have at least one layer.");
-            auto reuseLength = math::cast<size_t>(kvCacheLayersBase[0].getShape()[2]);
-            check::check(reuseLength > 0 && reuseLength < batchedInputIds[i].size(),
-                "The reuse length shall be larger than 0 and not exceed the input length.");
-            // Reuse N-1 tokens from the cached prefix so the Nth token is treated as real input in prefill;
-            // this keeps the draft prefill boundary aligned with the true next-token position.
-            auto const effectiveReuseLength = reuseLength - 1;
-            reuseKVCacheLengthsData[i] = math::cast<int32_t>(effectiveReuseLength);
-
-            context.tokenIds[i].assign(batchedInputIds[i].begin() + effectiveReuseLength, batchedInputIds[i].end());
-            context.effectivePrefillLengths[i] = math::cast<int32_t>(batchedInputIds[i].size() - effectiveReuseLength);
+            // Cached token length comes from the tokenized prompt that was actually captured, not from
+            // any KV-tensor's physical shape (see computeSystemPromptReuse) — this also covers
+            // pure-recurrent models, whose kvCacheLayersBase is empty.
+            auto reuse = computeSystemPromptReuse(precachedKVCacheBase, batchedInputIds[i]);
+            reuseKVCacheLengthsData[i] = reuse.reuseKVCacheLength;
+            context.tokenIds[i] = std::move(reuse.tokenIds);
+            context.effectivePrefillLengths[i] = reuse.effectivePrefillLength;
 
             bool const matchIds = std::equal(precachedKVCacheBase.tokenizedPrompt.begin(),
                 precachedKVCacheBase.tokenizedPrompt.end(), batchedInputIds[i].begin());

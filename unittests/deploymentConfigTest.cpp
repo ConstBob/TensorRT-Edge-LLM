@@ -155,6 +155,50 @@ Json makeDFlashDraftConfig(int32_t maxDraftTreeSize, int32_t maxBatchSize = 2)
     return config;
 }
 
+//! Gemma4-MTP base config: gemma4_mtp spec type, engine_role=base.
+Json makeGemma4MTPBaseConfig(int32_t maxBatchSize = 2, int32_t maxKVCacheCapacity = 256)
+{
+    Json config = makeBaseConfig(/*maxVerify=*/0, /*maxDraft=*/0, maxBatchSize);
+    config["spec_decode_type"] = "gemma4_mtp";
+    config["engine_role"] = "base";
+    config["model"] = "gemma4_text";
+    config["builder_config"]["spec_base"] = true;
+    config["builder_config"]["max_verify_tree_size"] = 4;
+    config["builder_config"]["max_kv_cache_capacity"] = maxKVCacheCapacity;
+    return config;
+}
+
+//! Gemma4-MTP assistant (draft) config: shares the target KV, no own cache.
+Json makeGemma4MTPDraftConfig(int32_t maxBatchSize = 2, int32_t maxKVCacheCapacity = 256)
+{
+    Json config;
+    config["spec_decode_type"] = "gemma4_mtp";
+    config["engine_role"] = "draft";
+    config["model"] = "gemma4_assistant";
+    config["num_hidden_layers"] = 1;
+    config["num_key_value_heads"] = 4;
+    config["head_dim"] = 64;
+    config["hidden_size"] = 768;
+    config["vocab_size"] = 32000;
+    config["base_model_hidden_size"] = 768;
+    config["kv_cache_dtype"] = "fp16";
+    config["shares_target_kv"] = true;
+    config["has_own_kv_cache"] = false;
+    config["constant_draft_positions"] = true;
+    config["returns_feedback_hidden"] = true;
+    config["kv_sharing_map"] = Json::array({Json{{"assistant_layer", 0}, {"target_attention_layer", 0}}});
+
+    Json bc;
+    bc["max_batch_size"] = maxBatchSize;
+    bc["max_input_len"] = 128;
+    bc["max_kv_cache_capacity"] = maxKVCacheCapacity;
+    bc["max_lora_rank"] = 0;
+    bc["spec_base"] = false;
+    bc["max_draft_tree_size"] = 4;
+    config["builder_config"] = bc;
+    return config;
+}
+
 //! Write a JSON object to a unique temp file and return its path.
 std::filesystem::path writeJsonToTempFile(Json const& json, std::string const& suffix)
 {
@@ -749,4 +793,57 @@ TEST_F(DeploymentConfigTest, EffectiveMaxDraftProposalSizeNoDraftingThrows)
 
     DeploymentConfig bundle = createDeploymentConfig(basePath, std::nullopt, std::nullopt);
     EXPECT_THROW(bundle.effectiveMaxDraftProposalSize(), std::runtime_error);
+}
+
+// The assistant's shared-KV pool/page-table profiles are fixed from its own build limits while the
+// runtime binds the TARGET's pool, so identical geometry is a hard contract: equal limits validate.
+TEST_F(DeploymentConfigTest, Gemma4MTPMatchingPoolGeometryValidatesOk)
+{
+    auto const basePath = writeJsonToTempFile(makeGemma4MTPBaseConfig(/*maxBatch=*/4, /*maxCap=*/256), "base");
+    auto const draftPath = writeJsonToTempFile(makeGemma4MTPDraftConfig(/*maxBatch=*/4, /*maxCap=*/256), "draft");
+
+    EXPECT_NO_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath}, std::nullopt));
+}
+
+// Differing max batch sizes imply different fixed pool page counts -> must be rejected with the
+// geometry error, not a late TensorRT profile failure.
+TEST_F(DeploymentConfigTest, Gemma4MTPMismatchedMaxBatchThrows)
+{
+    auto const basePath = writeJsonToTempFile(makeGemma4MTPBaseConfig(/*maxBatch=*/4, /*maxCap=*/256), "base");
+    auto const draftPath = writeJsonToTempFile(makeGemma4MTPDraftConfig(/*maxBatch=*/2, /*maxCap=*/256), "draft");
+
+    EXPECT_THROW(
+        {
+            try
+            {
+                createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath}, std::nullopt);
+            }
+            catch (std::exception const& e)
+            {
+                EXPECT_NE(std::string(e.what()).find("pool geometry mismatch"), std::string::npos) << e.what();
+                throw;
+            }
+        },
+        std::exception);
+}
+
+// Differing KV capacities change both the pool page count and the page-table width -> rejected.
+TEST_F(DeploymentConfigTest, Gemma4MTPMismatchedKVCapacityThrows)
+{
+    auto const basePath = writeJsonToTempFile(makeGemma4MTPBaseConfig(/*maxBatch=*/2, /*maxCap=*/512), "base");
+    auto const draftPath = writeJsonToTempFile(makeGemma4MTPDraftConfig(/*maxBatch=*/2, /*maxCap=*/256), "draft");
+
+    EXPECT_THROW(
+        {
+            try
+            {
+                createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath}, std::nullopt);
+            }
+            catch (std::exception const& e)
+            {
+                EXPECT_NE(std::string(e.what()).find("pool geometry mismatch"), std::string::npos) << e.what();
+                throw;
+            }
+        },
+        std::exception);
 }

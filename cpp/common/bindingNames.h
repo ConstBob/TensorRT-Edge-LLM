@@ -142,10 +142,19 @@ inline constexpr char const* kRopeCosSinFull = "rope_rotary_cos_sin_full";
 inline constexpr char const* kKVCacheStartIndex = "kvcache_start_index";
 
 /*!
+ * @brief KV page-table tensor - per-request page indices into the paged two-pool KV cache
+ *
+ * K page ids in row 0, derived V page ids (K + numPages) in row 1.
+ *
+ * Shape: [batch_size, 2, max_pages_per_seq] (INT32)
+ */
+inline constexpr char const* kKVPageTable = "kv_page_table";
+
+/*!
  * @brief Past key-value cache tensor template - use with layer index formatting
  *
  * Template: "past_key_values_{layer_idx}"
- * Shape: [batch_size, 2, num_kv_heads, seq_len, head_dim] (FLOAT16)
+ * Shape: [2, num_pages, kTOKENS_PER_PAGE, num_kv_heads, head_dim] paged pool (FLOAT16/FP8)
  */
 inline constexpr char const* kPastKeyValuesTemplate = "past_key_values";
 
@@ -153,7 +162,7 @@ inline constexpr char const* kPastKeyValuesTemplate = "past_key_values";
  * @brief Present key-value cache tensor template - use with layer index formatting
  *
  * Template: "present_key_values_{layer_idx}"
- * Shape: [batch_size, 2, num_kv_heads, seq_len, head_dim] (FLOAT16)
+ * Shape: [2, num_pages, kTOKENS_PER_PAGE, num_kv_heads, head_dim] paged pool, aliases past (FLOAT16/FP8)
  */
 inline constexpr char const* kPresentKeyValuesTemplate = "present_key_values";
 

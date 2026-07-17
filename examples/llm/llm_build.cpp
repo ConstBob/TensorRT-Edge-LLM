@@ -43,7 +43,7 @@ enum LLMBuildOptionId : int
     SPEC_BASE = 710,
     MAX_VERIFY_TREE_SIZE = 711,
     MAX_DRAFT_TREE_SIZE = 712,
-    PROFILING_DETAILED = 713
+    PROFILING_DETAILED = 713,
 };
 
 struct LLMBuildArgs
@@ -94,8 +94,8 @@ void printUsage(char const* programName)
               << std::endl;
     std::cerr << "  --profilingDetailed       Enable detailed profiling verbosity to include ONNX op names "
                  "in layer info. Use for DLSim analysis."
-              << std::endl
               << std::endl;
+    std::cerr << std::endl;
 }
 
 bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])

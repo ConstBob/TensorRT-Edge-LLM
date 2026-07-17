@@ -22,6 +22,7 @@
 #include "common/mathUtils.h"
 #include "common/safetensorsUtils.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
+#include "kernels/posEncoding/applyRopeWriteKV.h"
 #include "kernels/speculative/batchEvictKernels.h"
 #include "kernels/speculative/eagleAcceptKernels.h"
 #include "kernels/speculative/eagleUtilKernels.h"
@@ -532,6 +533,9 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
                      {activeBatchSize, mRuntime.deployment.specConfig->verifySize, baseOutputHiddenDim}),
         "Tensor reshape failed");
 
+    // MTP intentionally still uses the identity-only default (no page table passed) here -- unlike
+    // eagleDecoder.cpp, MTP reuse is deferred so this call is not wired to the real
+    // base page table yet. Revisit together with EAGLE if/when MTP gains non-identity reuse support.
     for (auto const& group : kvHeadDimGroups)
     {
         kernel::eagleBaseCommitKVCache(mAcceptedTokenIndices, mAcceptLength, kvCacheLengths, group.deviceLayerInfos,
@@ -845,7 +849,11 @@ void MTPDecoder::restoreSystemPromptKVCache(SystemPromptCacheKey const& key, int
 
 bool MTPDecoder::runSystemPromptPrefill(DecodingInferenceContext& context)
 {
-    return runDraftModelPrefill(context);
+    if (!runDraftModelPrefill(context))
+    {
+        return false;
+    }
+    return true;
 }
 
 void MTPDecoder::saveSystemPromptKVCache(SystemPromptCacheKey const& key, std::string const& prompt,

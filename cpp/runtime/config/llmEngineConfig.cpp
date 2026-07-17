@@ -21,6 +21,7 @@
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
 #include "common/logger.h"
+#include "common/pagedKvTypes.h"
 #include "common/ropeUtils.h"
 #include "common/trtUtils.h"
 #include "common/version.h"
@@ -1009,10 +1010,13 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
                     auto const shape = executor.getProfileShape(kvPastName.c_str(), profileIdx, selector);
                     ELLM_CHECK(shape.nbDims == 5,
                         std::string("Gemma4 MTP shared KV binding '") + kvPastName + "' must be rank-5.");
-                    ELLM_CHECK(shape.d[1] == 2 && shape.d[2] == kvConfig.numKVHeads && shape.d[4] == kvConfig.headDim,
+                    // Paged pool binding [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim];
+                    // numPages (dim 1) is engine-specific.
+                    ELLM_CHECK(shape.d[0] == 2 && shape.d[2] == kTOKENS_PER_PAGE && shape.d[3] == kvConfig.numKVHeads
+                            && shape.d[4] == kvConfig.headDim,
                         std::string("Gemma4 MTP shared KV profile shape mismatch for binding '") + kvPastName
-                            + "': expected static dims [*,2," + std::to_string(kvConfig.numKVHeads) + ",*,"
-                            + std::to_string(kvConfig.headDim) + "].");
+                            + "': expected static dims [2,*," + std::to_string(kTOKENS_PER_PAGE) + ","
+                            + std::to_string(kvConfig.numKVHeads) + "," + std::to_string(kvConfig.headDim) + "].");
                 }
             }
         }

@@ -88,6 +88,12 @@ _attention_plugin_schema = OpSchema(
             type_str="tensor(int32)",
         ),
         OpSchema.FormalParameter(
+            name="kv_page_table",
+            description=
+            "Per-request page table of shape [batch, 2, max_pages_per_seq]",
+            type_str="tensor(int32)",
+        ),
+        OpSchema.FormalParameter(
             name="attention_mask",
             description="Attention mask tensor (optional)",
             type_str="tensor(int32)",
@@ -1343,7 +1349,8 @@ _dflash_target_kv_cache_update_schema = OpSchema(
         ),
         OpSchema.FormalParameter(
             name="past_key_value",
-            description="Combined KV cache [B, 2, Hkv, capacity, D]",
+            description=
+            "Combined KV cache, paged pool [2, num_pages, KV_PAGE_SIZE, Hkv, D]",
             type_str="T",
         ),
         OpSchema.FormalParameter(
