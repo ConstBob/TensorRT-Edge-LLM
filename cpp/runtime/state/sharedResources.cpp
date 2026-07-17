@@ -74,6 +74,17 @@ void allocateZeroBuffer(SharedResources& res, int64_t bytes)
     CUDA_CHECK(cudaMemset(res.zeroBuffer.rawPointer(), 0, res.zeroBuffer.getMemoryCapacity()));
 }
 
+//! Build a static-identity page table sized from `kv` (reuse-off: fully static — see
+//! `SharedResources::kvPageTables`).
+std::unique_ptr<KVPageTable> makeIdentityPageTable(KVCacheManager const& kv, cudaStream_t stream)
+{
+    auto table
+        = std::make_unique<KVPageTable>(kv.getConfig().maxBatchSize, pagesPerSlot(kv.maxCapPadded()), kv.numPages());
+    table->setIdentity();
+    table->upload(stream);
+    return table;
+}
+
 std::unique_ptr<SharedResources> SharedResources::createForLLM(
     LLMEngineConfig const& cfg, std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream)
 {
@@ -88,6 +99,7 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
         /*.maxSequenceLength=*/cfg.maxKVCacheCapacity,
         /*.layerConfigs=*/cfg.kvLayerConfigs,
         /*.kvCacheType=*/cfg.kvCacheDtype,
+        /*.numPages=*/rt::computeKvPoolFloorPages(cfg.maxSupportedBatchSize, cfg.maxKVCacheCapacity),
     };
     rt::MambaCacheManager::Config mambaCfg{
         /*.numRecurrentLayers=*/cfg.numLinearAttnLayers,
@@ -108,6 +120,8 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
         /*.maxBatchSize=*/cfg.maxSupportedBatchSize,
     };
     resources->cacheManagers.push_back(std::make_unique<HybridCacheManager>(hybridCfg, stream));
+    resources->kvPageTables.push_back(
+        makeIdentityPageTable(resources->cacheManagers.back()->getKVCacheManager(), stream));
 
     // RoPE cache
     // For MRope, the cache is stored in PipelineIO (initialized below).
@@ -191,6 +205,8 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.maxSequenceLength=*/bundle.base.maxKVCacheCapacity,
             /*.layerConfigs=*/bundle.base.kvLayerConfigs,
             /*.kvCacheType=*/bundle.base.kvCacheDtype,
+            /*.numPages=*/
+            rt::computeKvPoolFloorPages(bundle.base.maxSupportedBatchSize, bundle.base.maxKVCacheCapacity),
         };
         rt::MambaCacheManager::Config mambaCfg{
             /*.numRecurrentLayers=*/bundle.base.numLinearAttnLayers,
@@ -211,6 +227,8 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.maxBatchSize=*/bundle.base.maxSupportedBatchSize,
         };
         resources->cacheManagers.push_back(std::make_unique<HybridCacheManager>(hybridCfg, stream));
+        resources->kvPageTables.push_back(
+            makeIdentityPageTable(resources->cacheManagers.back()->getKVCacheManager(), stream));
     }
 
     // Draft hybrid cache manager (index 1). Gemma4 MTP assistant reads the
@@ -228,6 +246,8 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.maxSequenceLength=*/bundle.draft->maxKVCacheCapacity,
             /*.layerConfigs=*/bundle.draft->kvLayerConfigs,
             /*.kvCacheType=*/bundle.draft->kvCacheDtype,
+            /*.numPages=*/
+            rt::computeKvPoolFloorPages(bundle.draft->maxSupportedBatchSize, bundle.draft->maxKVCacheCapacity),
         };
         rt::MambaCacheManager::Config mambaCfg{
             /*.numRecurrentLayers=*/0,
@@ -248,6 +268,8 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.maxBatchSize=*/bundle.draft->maxSupportedBatchSize,
         };
         resources->cacheManagers.push_back(std::make_unique<HybridCacheManager>(hybridCfg, stream));
+        resources->kvPageTables.push_back(
+            makeIdentityPageTable(resources->cacheManagers.back()->getKVCacheManager(), stream));
     }
 
     // RoPE cache (shared — base and draft use same RoPE config)

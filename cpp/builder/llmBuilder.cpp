@@ -21,6 +21,7 @@
 #include "common/cudaUtils.h"
 #include "common/fileUtils.h"
 #include "common/logger.h"
+#include "common/pagedKvTypes.h"
 #include "common/ropeUtils.h"
 #include "common/trtUtils.h"
 #include "common/version.h"
@@ -210,6 +211,32 @@ bool LLMBuilder::build()
     if (!parser)
     {
         return false;
+    }
+
+    // DFlash draft's DFlashTargetKVCacheUpdate plugin needs pages_per_slot (capPadded /
+    // kTOKENS_PER_PAGE) to split its now-pool-shaped past_key_value binding's numPages back into
+    // (maxBatch, cap). That fact is builder-only (mBuilderConfig.maxKVCacheCapacity), unavailable at
+    // ONNX-export time, and this plugin's concrete class is intentionally not linked into the
+    // builder (plugins are opaque .so modules, loaded via EDGELLM_PLUGIN_PATH — see
+    // common/trtUtils.h). Resolve the plugin's exported configuration hook via dlsym on the already
+    // -loaded handle instead of adding a new link dependency.
+    if (isSpecDecodeDraft(mModelConfig, "dflash"))
+    {
+        using ConfigurePagesPerSlotFn = bool (*)(nvinfer1::INetworkDefinition*, int32_t);
+        auto* configureFn = reinterpret_cast<ConfigurePagesPerSlotFn>(
+            dlsym(pluginHandles.get(), "edgellm_dflash_configure_pages_per_slot"));
+        if (configureFn == nullptr)
+        {
+            LOG_ERROR(
+                "Failed to resolve edgellm_dflash_configure_pages_per_slot from the plugin library: %s", dlerror());
+            return false;
+        }
+        int32_t const pagesPerSlot = rt::computeMaxPagesPerSeq(static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
+        if (!configureFn(network.get(), pagesPerSlot))
+        {
+            LOG_ERROR("Failed to configure DFlashTargetKVCacheUpdate plugin pages_per_slot=%d", pagesPerSlot);
+            return false;
+        }
     }
 
     // Print network information
@@ -593,6 +620,17 @@ bool LLMBuilder::setupCommonProfiles(
     result &= setOptimizationProfile(&generationProfile, binding_names::kKVCacheStartIndex, createDims({1}),
         createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
 
+    // kv_page_table: [batch, 2, maxPagesPerSeq] int32. Per-request page table (default
+    // identity => bit-equivalent to the non-paged path). Column count is fixed
+    // (maxPagesPerSeq = ceil(maxKVCacheCapacity / kTOKENS_PER_PAGE)); batch is dynamic.
+    int32_t const maxPagesPerSeq = rt::computeMaxPagesPerSeq(static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
+    result &= setOptimizationProfile(&contextProfile, binding_names::kKVPageTable, createDims({1, 2, maxPagesPerSeq}),
+        createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}),
+        createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}));
+    result &= setOptimizationProfile(&generationProfile, binding_names::kKVPageTable,
+        createDims({1, 2, maxPagesPerSeq}), createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}),
+        createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}));
+
     // KV cache profiles
     LOG_DEBUG("Setting up KV cache profiles for %d layers...", mNbKVCacheInputs);
     result &= setupKVCacheProfiles(contextProfile, generationProfile);
@@ -783,6 +821,13 @@ bool LLMBuilder::setupDFlashDraftProfiles(
         // kvcache_start_index: [batch]
         ok &= setOptimizationProfile(&profile, binding_names::kKVCacheStartIndex, createDims({1}),
             createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+        // kv_page_table: [batch, 2, maxPagesPerSeq] int32. Proposal self-attention's page
+        // table (default identity); the draft's own KV cache above has no page table.
+        int32_t const maxPagesPerSeq
+            = rt::computeMaxPagesPerSeq(static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
+        ok &= setOptimizationProfile(&profile, binding_names::kKVPageTable, createDims({1, 2, maxPagesPerSeq}),
+            createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}),
+            createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}));
         // dflash_delta_lengths: [batch]
         ok &= setOptimizationProfile(&profile, binding_names::kDFlashDeltaLengths, createDims({1}),
             createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
@@ -794,25 +839,24 @@ bool LLMBuilder::setupDFlashDraftProfiles(
         ok &= setOptimizationProfile(&profile, binding_names::kAttentionPosId, createDims({1, 1}),
             createDims({mBuilderConfig.maxBatchSize, optDraftTokens}),
             createDims({mBuilderConfig.maxBatchSize, maxDraftTokens}));
-        // KV cache per-layer: [batch, 2, numKVHeads, kv_capacity, headDim]
+        // KV cache per-layer: DFlash's own combined draft cache, now unified on the paged-pool
+        // contract shared with the AttentionPlugin binding: [2, numPages, kTOKENS_PER_PAGE,
+        // numKVHeads, headDim] (single fixed numPages value, same as setupKVCacheProfiles).
+        // DFlashTargetKVCacheUpdatePlugin recovers maxBatch/cap at enqueue time from numPages and
+        // the pages_per_slot attribute the builder configures via edgellm_dflash_configure_pages_per_slot
+        // (see build()); this cache still has no page table of its own.
+        int64_t const numPages = rt::computeKvPoolFloorPages(
+            static_cast<int32_t>(mBuilderConfig.maxBatchSize), static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
         for (int32_t i = 0; i < mNbKVCacheInputs; ++i)
         {
             int64_t layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
             int64_t layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
             std::string pastName = std::string(binding_names::kPastKeyValuesTemplate) + "_" + std::to_string(i);
             std::string presentName = std::string(binding_names::kPresentKeyValuesTemplate) + "_" + std::to_string(i);
-            ok &= setOptimizationProfile(&profile, pastName.c_str(),
-                createDims({1, 2, layerNumKVHeads, 1, layerHeadSize}),
-                createDims({mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity,
-                    layerHeadSize}),
-                createDims({mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity,
-                    layerHeadSize}));
-            ok &= setOptimizationProfile(&profile, presentName.c_str(),
-                createDims({1, 2, layerNumKVHeads, 1, layerHeadSize}),
-                createDims({mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity,
-                    layerHeadSize}),
-                createDims({mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity,
-                    layerHeadSize}));
+            nvinfer1::Dims const kvCacheShape
+                = createDims({2, numPages, rt::kTOKENS_PER_PAGE, layerNumKVHeads, layerHeadSize});
+            ok &= setOptimizationProfile(&profile, pastName.c_str(), kvCacheShape, kvCacheShape, kvCacheShape);
+            ok &= setOptimizationProfile(&profile, presentName.c_str(), kvCacheShape, kvCacheShape, kvCacheShape);
         }
         return ok;
     };
@@ -846,6 +890,15 @@ bool LLMBuilder::setupGemma4MTPDraftProfiles(nvinfer1::IOptimizationProfile& con
         ok &= setOptimizationProfile(&profile, binding_names::kContextLengths, createDims({1}),
             createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
 
+        // kv_page_table: [batch, 2, maxPagesPerSeq] int32 — the TARGET pool's page table
+        // (the assistant reads the target's paged KV pool; the runtime binds the target's
+        // identity table here).
+        int32_t const maxPagesPerSeq
+            = rt::computeMaxPagesPerSeq(static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
+        ok &= setOptimizationProfile(&profile, binding_names::kKVPageTable, createDims({1, 2, maxPagesPerSeq}),
+            createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}),
+            createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}));
+
         if (auto const rotaryDim = getStaticInputDim(network, binding_names::kRopeCosSinSliding, 2))
         {
             ok &= setupRopeProfile(profile, binding_names::kRopeCosSinSliding, *rotaryDim);
@@ -859,16 +912,19 @@ bool LLMBuilder::setupGemma4MTPDraftProfiles(nvinfer1::IOptimizationProfile& con
             ok &= setupRopeProfile(profile, binding_names::kRopeCosSin, *rotaryDim);
         }
 
+        // KV cache per-layer: the assistant binds the TARGET model's paged pool tensors
+        // directly ([2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim]), so the profile
+        // uses the same fixed page count as the target's setupKVCacheProfiles.
+        int64_t const numPages = rt::computeKvPoolFloorPages(
+            static_cast<int32_t>(mBuilderConfig.maxBatchSize), static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
         for (int i = 0; i < mNbKVCacheInputs; ++i)
         {
             int64_t const layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
             int64_t const layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
-            nvinfer1::Dims const minKVCacheShape = createDims({1, 2, layerNumKVHeads, 1, layerHeadSize});
-            nvinfer1::Dims const optKVCacheShape = createDims(
-                {mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
-            nvinfer1::Dims const maxKVCacheShape = optKVCacheShape;
-            ok &= setOptimizationProfile(&profile, binding_names::formatKVCacheName(i, true).c_str(), minKVCacheShape,
-                optKVCacheShape, maxKVCacheShape);
+            nvinfer1::Dims const kvCacheShape
+                = createDims({2, numPages, rt::kTOKENS_PER_PAGE, layerNumKVHeads, layerHeadSize});
+            ok &= setOptimizationProfile(
+                &profile, binding_names::formatKVCacheName(i, true).c_str(), kvCacheShape, kvCacheShape, kvCacheShape);
         }
 
         return ok;
@@ -1125,21 +1181,27 @@ bool LLMBuilder::setupKVCacheProfiles(
     nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
 {
     bool result = true;
-    // KV cache shape is [B, 2, num_kv_heads, 0 to max_kv_cache_capacity, head_dim]
+    // Plugin path: paged pool binding [2, numPages, kTOKENS_PER_PAGE, num_kv_heads, head_dim].
+    // numPages is fixed at the active-capacity floor (maxBatchSize * ceil(maxKVCacheCapacity /
+    // kTOKENS_PER_PAGE)) for the life of the engine — it is not resized per inference step.
+    // "Empty vs non-empty" cache is conveyed by kvcache_start_index's own profile, not by this
+    // tensor's shape (the plugin reads numPages from dims.d[1], so the binding must always be
+    // pool-shaped). Retention headroom beyond the floor is a follow-up that accepts a full
+    // engine rebuild (owner decision, 2026-07-05).
+    int64_t const numPages = rt::computeKvPoolFloorPages(
+        static_cast<int32_t>(mBuilderConfig.maxBatchSize), static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
     for (int i = 0; i < mNbKVCacheInputs; ++i)
     {
+        // Per-layer dims mirror the runtime registry (kv_layer_configs): head size varies on
+        // Gemma4 today; the KV head count is per-layer for the same forward-compat reason.
         int64_t layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
         int64_t layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
-        nvinfer1::Dims minKVCacheShape = createDims({1, 2, layerNumKVHeads, 0, layerHeadSize});
-        nvinfer1::Dims optKVCacheShape = createDims(
-            {mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
-        nvinfer1::Dims maxKVCacheShape = createDims(
-            {mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
+        nvinfer1::Dims kvCacheShape = createDims({2, numPages, rt::kTOKENS_PER_PAGE, layerNumKVHeads, layerHeadSize});
 
         result &= setOptimizationProfile(&contextProfile, binding_names::formatKVCacheName(i, true).c_str(),
-            minKVCacheShape, optKVCacheShape, maxKVCacheShape);
+            kvCacheShape, kvCacheShape, kvCacheShape);
         result &= setOptimizationProfile(&generationProfile, binding_names::formatKVCacheName(i, true).c_str(),
-            minKVCacheShape, optKVCacheShape, maxKVCacheShape);
+            kvCacheShape, kvCacheShape, kvCacheShape);
     }
 
     return result;

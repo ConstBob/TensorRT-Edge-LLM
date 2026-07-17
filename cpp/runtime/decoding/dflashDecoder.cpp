@@ -23,6 +23,7 @@
 #include "common/mathUtils.h"
 #include "common/safetensorsUtils.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
+#include "kernels/posEncoding/applyRopeWriteKV.h"
 #include "kernels/speculative/ddtreeKernels.h"
 #include "kernels/speculative/dflashRuntimeKernels.h"
 #include "kernels/speculative/eagleAcceptKernels.h"
@@ -141,6 +142,10 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
     mDraftTensorMap.set(binding_names::kContextLengths, mDraftContextLengths);
     mDraftTensorMap.set(binding_names::kDFlashDeltaLengths, mDraftDeltaLens);
 
+    // KV cache bindings: bind to draft cache manager's combined KV cache (index 1). Unified on
+    // the paged-pool view — the engine's past/present_key_values_i binding for DFlash's own draft
+    // cache is the same [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim] contract as the main
+    // model and EAGLE/MTP drafts (see KVCacheManager::getCombinedKVCachePoolView()).
     auto& kvMgr = mDraftCacheManager.getKVCacheManager();
     LLMEngineConfig const& draftCfg = *deployment.draft;
     int32_t localAttnIdx = 0;
@@ -150,12 +155,16 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
         {
             continue;
         }
-        auto& combinedKV = kvMgr.getCombinedKVCache(localAttnIdx);
+        auto& combinedKV = kvMgr.getCombinedKVCachePoolView(localAttnIdx);
         mDraftTensorMap.set(binding_names::formatKVCacheName(localAttnIdx, /*isPast=*/true), combinedKV);
         mDraftTensorMap.set(binding_names::formatKVCacheName(localAttnIdx, /*isPast=*/false), combinedKV);
         ++localAttnIdx;
     }
     mDraftTensorMap.set(binding_names::kKVCacheStartIndex, mDraftCacheManager.getKVCacheLengths());
+
+    // kv_page_table: static identity mapping for the draft's proposal self-attention
+    // (shared resource index 1) — see SharedResources::kvPageTables.
+    mDraftTensorMap.set(binding_names::kKVPageTable, mRuntime.base.sharedResources.kvPageTables[1]->kernelView());
 
     if (draftCfg.ropeConfig.type == RopeType::kMRope)
     {
@@ -396,6 +405,32 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
     {
         check::check(mAcceptLength.reshape({activeBatchSize}), "Tensor reshape failed");
         mDraftCacheManager.commitSequenceLength(mAcceptLength, context.stream);
+    }
+
+    // The DFlashTargetKVCacheUpdate plugin has no page-table input -- it always
+    // writes at slot b's own contiguous row (DFlash is identity-only: it opts out of reuse).
+    // Assert that invariant against the draft cache manager's REAL page table (the same object
+    // bound to the draft AttentionPlugin layers, see kKVPageTable above) rather than just
+    // documenting it: HybridCacheManager::compactBatch preserves row == slot for the draft cache
+    // today, so this should always pass, but if that ever regresses (or non-identity draft reuse
+    // is ever introduced) DFlash would otherwise silently write through the wrong physical slot.
+    // `hostRow()` reads the host mirror directly -- no device sync needed.
+    try
+    {
+        auto const& draftPageTable = *mRuntime.base.sharedResources.kvPageTables[1];
+        int32_t const draftMaxPagesPerSeq = draftPageTable.maxPagesPerSeq();
+        for (int32_t b = 0; b < activeBatchSize; ++b)
+        {
+            kernel::checkDFlashPageTableIdentity(draftPageTable.hostRow(b), b, draftMaxPagesPerSeq);
+        }
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR(
+            "DFlashDecoder: draft page table is not identity-mapped (%s); DFlashTargetKVCacheUpdate is "
+            "identity-only and would silently write through the wrong physical slot. Failing the request.",
+            e.what());
+        return false;
     }
 
     return true;
@@ -1019,6 +1054,10 @@ bool DFlashDecoder::runSystemPromptPrefill(DecodingInferenceContext& context)
     CUDA_CHECK(cudaMemcpyAsync(mDraftDeltaLenCommit.rawPointer(), mDraftDeltaLens.rawPointer(),
         activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToDevice, context.stream));
     mDraftCacheManager.commitSequenceLength(mDraftDeltaLenCommit, context.stream);
+
+    // Invariant (not runtime-checked): see the comment after the equivalent commit in
+    // runDraftForward — DFlash's target-KV update assumes row == slot for the draft cache, guaranteed
+    // by HybridCacheManager::compactBatch; no live page table exists yet to check against.
 
     return true;
 }

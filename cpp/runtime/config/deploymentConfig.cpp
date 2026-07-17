@@ -18,6 +18,7 @@
 #include "runtime/config/deploymentConfig.h"
 
 #include "common/checkMacros.h"
+#include "common/pagedKvTypes.h"
 
 #include "common/logger.h"
 #include "common/trtUtils.h"
@@ -101,6 +102,25 @@ void validateGemma4MTPConfig(LLMEngineConfig const& base, LLMEngineConfig& draft
     ELLM_CHECK(base.kvCacheDtype == draft.kvCacheDtype,
         std::string("Gemma4 MTP base/draft KV dtype mismatch: base=") + getDataTypeString(base.kvCacheDtype)
             + ", draft=" + getDataTypeString(draft.kvCacheDtype) + ".");
+
+    // Paged shared-KV geometry must be IDENTICAL: the assistant's engine profiles fix the pool page
+    // count (min=opt=max) and the kv_page_table width from ITS OWN build limits, while the runtime
+    // binds the TARGET's pool and page table to those bindings. Unequal build limits therefore
+    // cannot be reconciled at runtime (there is no min() escape hatch as there is for batch size),
+    // so reject them here with the numbers instead of failing deep inside TensorRT shape checks.
+    int32_t const basePoolPages = rt::computeKvPoolFloorPages(base.maxSupportedBatchSize, base.maxKVCacheCapacity);
+    int32_t const draftPoolPages = rt::computeKvPoolFloorPages(draft.maxSupportedBatchSize, draft.maxKVCacheCapacity);
+    int32_t const basePagesPerSeq = rt::computeMaxPagesPerSeq(base.maxKVCacheCapacity);
+    int32_t const draftPagesPerSeq = rt::computeMaxPagesPerSeq(draft.maxKVCacheCapacity);
+    ELLM_CHECK(basePoolPages == draftPoolPages && basePagesPerSeq == draftPagesPerSeq,
+        "Gemma4 MTP shared-KV pool geometry mismatch: base engine (maxBatchSize="
+            + std::to_string(base.maxSupportedBatchSize) + ", maxKVCacheCapacity="
+            + std::to_string(base.maxKVCacheCapacity) + ") implies numPages=" + std::to_string(basePoolPages)
+            + "/maxPagesPerSeq=" + std::to_string(basePagesPerSeq)
+            + ", assistant engine (maxBatchSize=" + std::to_string(draft.maxSupportedBatchSize)
+            + ", maxKVCacheCapacity=" + std::to_string(draft.maxKVCacheCapacity) + ") implies numPages="
+            + std::to_string(draftPoolPages) + "/maxPagesPerSeq=" + std::to_string(draftPagesPerSeq)
+            + ". Rebuild the assistant engine with the target's --maxBatchSize/--maxKVCacheCapacity.");
     ELLM_CHECK(static_cast<int32_t>(draft.gemma4MTPKVSharingMap.size()) == draft.numAttentionLayers,
         "Gemma4 MTP kv_sharing_map size (" + std::to_string(draft.gemma4MTPKVSharingMap.size())
             + ") must equal draft attention layer count (" + std::to_string(draft.numAttentionLayers) + ").");

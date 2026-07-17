@@ -22,6 +22,7 @@
 #include "common/mathUtils.h"
 #include "common/safetensorsUtils.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
+#include "kernels/posEncoding/applyRopeWriteKV.h"
 #include "kernels/speculative/batchEvictKernels.h"
 #include "kernels/speculative/eagleAcceptKernels.h"
 #include "kernels/speculative/eagleUtilKernels.h"
@@ -525,12 +526,21 @@ bool EagleDecoder::runBaseModelVerification(DecodingInferenceContext& context)
                      {activeBatchSize, mRuntime.deployment.specConfig->verifySize, baseOutputHiddenDim}),
         "Tensor reshape failed");
 
+    // Pass the base cache manager's real page table (same source as the AttentionPlugin binding,
+    // see pipelineIO.cpp's kKVPageTable set) rather than the nullptr/identity default. Every base
+    // table is identity-mapped today (SharedResources::kvPageTables), so this is currently
+    // byte-equivalent to the old nullptr call, but wires the production path for future non-identity
+    // EAGLE reuse instead of silently mis-addressing accepted-KV writes once reuse lands.
+    auto const& basePageTable = *mRuntime.base.sharedResources.kvPageTables[0];
+    int32_t const* basePageTablePtr = basePageTable.kernelView().dataPointer<int32_t>();
+    int32_t const baseMaxPagesPerSeq = basePageTable.maxPagesPerSeq();
     for (auto const& group : kvHeadDimGroups)
     {
         kernel::eagleBaseCommitKVCache(mAcceptedTokenIndices, mAcceptLength, kvCacheLengths, group.deviceLayerInfos,
             group.numLayers, group.headDim, group.maxKVHeads, activeBatchSize, maxAcceptDepth, kvCacheType,
-            context.stream);
+            context.stream, basePageTablePtr, baseMaxPagesPerSeq);
     }
+
     kernel::eagleBaseAssembleHiddenState(
         mAcceptedTokenIndices, mAcceptLength, mRuntime.base.pipelineIO.baseHiddenStates, context.stream);
     mRuntime.base.cacheManager.commitSequenceLength(mAcceptLength, context.stream);
@@ -826,7 +836,11 @@ void EagleDecoder::restoreSystemPromptKVCache(SystemPromptCacheKey const& key, i
 
 bool EagleDecoder::runSystemPromptPrefill(DecodingInferenceContext& context)
 {
-    return runDraftModelPrefill(context);
+    if (!runDraftModelPrefill(context))
+    {
+        return false;
+    }
+    return true;
 }
 
 void EagleDecoder::saveSystemPromptKVCache(SystemPromptCacheKey const& key, std::string const& prompt,
