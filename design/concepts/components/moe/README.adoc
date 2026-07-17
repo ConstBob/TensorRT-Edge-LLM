@@ -96,7 +96,7 @@ steps:
 4. Count selected slots per expert, compute padded offsets, build slot lists,
    and build Marlin `sortedTokenIds` / `expertIds` indices.
 5. Run `moeAwqW4A16MarlinGemm()` for fused gate+up projection.
-6. Apply `swiGluActivation()` to produce the expert intermediate.
+6. Apply `moeActivation()` with SwiGLU to produce the expert intermediate.
 7. Run `moeAwqW4A16MarlinGemm()` for the down projection with route weights.
 8. Run `launchAggregateSlotOutputsKernel()` to reduce top-k slots back to one
    output row per token.

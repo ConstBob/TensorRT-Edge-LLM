@@ -46,6 +46,7 @@ constexpr char const* kINT4_MOE_PLUGIN_VERSION{"1"};
 constexpr char const* kINT4_MOE_PLUGIN_NAME{"Int4MoePlugin"};
 // SiLU (Swish) is the only activation type currently supported by the MoE plugin.
 constexpr auto kSUPPORTED_ACTIVATION_TYPE = static_cast<ActivationType>(0);
+constexpr int32_t kMoeSwiGluActivationType{2};
 
 // Workspace size for Int4 MoE plugin using accumulateWorkspaceSize (same order as assignTensorFromWorkspace in
 // enqueue).
@@ -539,7 +540,8 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
         rt::Tensor activationOutputTensor(
             activationOutputPtr, {totalSlots, mMoeInterSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
-        swiGluActivation(gateUpOutputTensor, activationOutputTensor, totalSlots, mMoeInterSize, stream);
+        moeActivation(
+            gateUpOutputTensor, activationOutputTensor, totalSlots, mMoeInterSize, kMoeSwiGluActivationType, stream);
         CUDA_CHECK(cudaGetLastError());
 
         // ==================== Step 5: Down Projection (Marlin INT4 GEMM) ====================
