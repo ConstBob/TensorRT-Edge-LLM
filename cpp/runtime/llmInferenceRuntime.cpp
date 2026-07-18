@@ -274,11 +274,19 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     int32_t const vanillaSamplingWorkspaceSize
         = static_cast<int32_t>(getTopKtopPSamplingWorkspaceSize(mMaxRuntimeBatchSize, mDeployment.base.outputVocabSize,
             SamplingParams(mMaxRuntimeBatchSize, mDeployment.base.outputVocabSize, 1.0f, 0, 0.9f)));
-    int32_t const draftSamplingRows = hasDraft && mDeployment.specDecodeMode() == SpecDecodeMode::kDFlash
-        ? mMaxRuntimeBatchSize * mDeployment.specConfig->verifySize
-        : mMaxRuntimeBatchSize * effectiveDraftTopK;
+    bool const isDSparkDraft = hasDraft && mDeployment.specDecodeMode() == SpecDecodeMode::kDSpark;
+    constexpr int32_t kDSparkMaxSparseTopK = 128;
+    bool const isLinearBlockDraft = hasDraft
+        && (mDeployment.specDecodeMode() == SpecDecodeMode::kDFlash
+            || mDeployment.specDecodeMode() == SpecDecodeMode::kDSpark);
+    int32_t const draftSamplingRows = isLinearBlockDraft ? mMaxRuntimeBatchSize * mDeployment.specConfig->verifySize
+                                                         : mMaxRuntimeBatchSize * effectiveDraftTopK;
     int32_t const draftSamplingTopK
-        = hasDraft && mDeployment.specDecodeMode() == SpecDecodeMode::kDFlash ? 1 : effectiveDraftTopK;
+        = isLinearBlockDraft ? (isDSparkDraft ? kDSparkMaxSparseTopK : 1) : effectiveDraftTopK;
+    int32_t const dsparkBaseTopKWorkspaceSize = isDSparkDraft
+        ? static_cast<int32_t>(getSelectAllTopKWorkspaceSize(mMaxRuntimeBatchSize * mDeployment.specConfig->verifySize,
+              mDeployment.base.outputVocabSize, kDSparkMaxSparseTopK))
+        : 0;
     mLogprobsMaxBatchDim = mMaxRuntimeBatchSize * mDeployment.maxAcceptedTokensPerRound();
     int32_t const logprobsWorkspaceSize = static_cast<int32_t>(
         getExtractTopKLogprobsWorkspaceSize(mLogprobsMaxBatchDim, mDeployment.base.outputVocabSize, kMaxLogprobsK));
@@ -288,7 +296,7 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
                   getSelectAllTopKWorkspaceSize(mMaxRuntimeBatchSize, mDeployment.base.outputVocabSize, 1)),
               static_cast<int32_t>(getSelectAllTopKWorkspaceSize(
                   draftSamplingRows, mDeployment.draft->outputVocabSize, draftSamplingTopK)),
-              logprobsWorkspaceSize})
+              dsparkBaseTopKWorkspaceSize, logprobsWorkspaceSize})
         : std::max(vanillaSamplingWorkspaceSize, logprobsWorkspaceSize);
 
     try
@@ -556,10 +564,11 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     DecodingStrategy& decodingStrategy = mDecoderRegistry->select(request);
     bool const enableSpecDecode = decodingStrategy.isSpeculative();
 
-    // Current speculative decoders only support greedy-compatible sampling.
-    // Warn here; active spec-decode requests are normalized when context sampling params are populated below.
+    // DSpark implements the paper-equivalent probabilistic verifier and can keep non-greedy sampling params.
+    // Other speculative decoders still run greedy-compatible verification.
     bool const hasNonGreedySampling = shouldUseNonGreedySampling(request.temperature, request.topK, request.topP);
-    if (enableSpecDecode && hasNonGreedySampling)
+    bool const dsparkSpecDecode = enableSpecDecode && decodingStrategy.kind() == DecodingStrategyKind::kDSpark;
+    if (enableSpecDecode && hasNonGreedySampling && !dsparkSpecDecode)
     {
         LOG_WARNING("Spec-decode active: overriding sampling params to greedy (ignoring temp/topK/topP).");
     }
@@ -627,10 +636,11 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
         }
     }
 
-    // Forward sampling params to context; selected spec-decode requests run greedy.
-    context.temperature = enableSpecDecode ? 1.0f : request.temperature;
-    context.topP = enableSpecDecode ? 1.0f : request.topP;
-    context.topK = enableSpecDecode ? 0 : request.topK;
+    // Forward sampling params to context; non-DSpark speculative decoders run greedy.
+    bool const forceGreedySpecDecode = enableSpecDecode && !dsparkSpecDecode;
+    context.temperature = forceGreedySpecDecode ? 1.0f : request.temperature;
+    context.topP = forceGreedySpecDecode ? 1.0f : request.topP;
+    context.topK = forceGreedySpecDecode ? 0 : request.topK;
     context.outputThinkerEmbeddings = outputThinkerEmbeddings;
     context.onTokenGenerated = request.onTokenGenerated;
 
@@ -1440,8 +1450,8 @@ bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context)
     applyLogitBias(mLogitBias, mPipelineIO->outputLogits, context, context.stream);
 
     // Sampling from the prefill stage logits follows the same policy as vanilla decoding.
-    // Speculative decoders reach this code with greedy-compatible context params because
-    // handleRequest normalizes active spec-decode requests before decoding.
+    // DSpark keeps non-greedy params; other speculative decoders are normalized to greedy
+    // before decoding.
     check::check(mSamplingIndices.reshape({activeBatchSize, 1}), "Tensor reshape failed");
     if (shouldUseNonGreedySampling(context.temperature, context.topK, context.topP))
     {

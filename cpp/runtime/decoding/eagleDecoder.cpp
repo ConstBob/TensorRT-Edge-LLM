@@ -113,19 +113,80 @@ EagleDecoder::EagleDecoder(DecodingRuntimeContext& runtime, std::filesystem::pat
     mHostAcceptedTokenIds = Tensor({maxRuntimeBatchSize, effectiveMaxAcceptDepth}, DeviceType::kCPU,
         nvinfer1::DataType::kINT32, "SpecDecode::hostAcceptedIds");
 
-    // Eagle: load d2t.safetensors for vocab mapping
+    // EAGLE kernels consume draft-token -> target-token offsets. Older
+    // reduced-vocab exports already store offsets in d2t.safetensors, while
+    // newer/full-vocab EAGLE3 exports store direct target token ids. Normalize
+    // both forms once at load time.
+    CUDA_CHECK(
+        cudaMemsetAsync(mDraftVocabMappingTable.rawPointer(), 0, mDraftVocabMappingTable.getMemoryCapacity(), stream));
     {
-        std::vector<Tensor> d2tTensors;
-        if (!safetensors::loadSafetensors(engineDir / "d2t.safetensors", d2tTensors, stream))
+        auto const d2tPath = engineDir / "d2t.safetensors";
+        if (std::filesystem::exists(d2tPath))
         {
-            LOG_ERROR("Failed to load d2t.safetensors from model directory: %s", engineDir.c_str());
-            throw std::runtime_error("Failed to load d2t.safetensors from model directory: " + engineDir.string());
+            std::vector<Tensor> d2tTensors;
+            if (!safetensors::loadSafetensors(d2tPath, d2tTensors, stream))
+            {
+                LOG_ERROR("Failed to load d2t.safetensors from model directory: %s", engineDir.c_str());
+                throw std::runtime_error("Failed to load d2t.safetensors from model directory: " + engineDir.string());
+            }
+            check::check(d2tTensors.size() == 1, "d2t.safetensors should contain exactly one tensor");
+            check::check(d2tTensors[0].getShape().getNumDims() == 1, "d2t tensor should be 1D");
+            check::check(d2tTensors[0].getShape()[0] == mRuntime.deployment.draft->outputVocabSize,
+                "d2t tensor length should match draft vocab size");
+            mDraftVocabMappingTable = std::move(d2tTensors[0]);
+
+            int32_t const draftVocabSize = static_cast<int32_t>(mDraftVocabMappingTable.getShape()[0]);
+            int32_t const baseVocabSize = mRuntime.deployment.base.vocabSize;
+            std::vector<int32_t> hostD2T(static_cast<size_t>(draftVocabSize));
+            CUDA_CHECK(cudaMemcpyAsync(hostD2T.data(), mDraftVocabMappingTable.dataPointer<int32_t>(),
+                static_cast<size_t>(draftVocabSize) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            bool directMapValid{true};
+            bool offsetMapValid{true};
+            std::vector<int32_t> offsetTargets(static_cast<size_t>(draftVocabSize));
+            for (int32_t draftTokenId = 0; draftTokenId < draftVocabSize; ++draftTokenId)
+            {
+                int32_t const rawValue = hostD2T[static_cast<size_t>(draftTokenId)];
+                directMapValid = directMapValid && rawValue >= 0 && rawValue < baseVocabSize;
+                int64_t const offsetTarget = static_cast<int64_t>(draftTokenId) + rawValue;
+                bool const offsetValid = offsetTarget >= 0 && offsetTarget < baseVocabSize;
+                offsetMapValid = offsetMapValid && offsetValid;
+                if (offsetValid)
+                {
+                    offsetTargets[static_cast<size_t>(draftTokenId)] = static_cast<int32_t>(offsetTarget);
+                }
+            }
+            check::check(
+                directMapValid || offsetMapValid, "EAGLE d2t table is neither a valid direct map nor offset map.");
+
+            auto uniqueCount = [](std::vector<int32_t> values) {
+                std::sort(values.begin(), values.end());
+                return static_cast<int64_t>(std::unique(values.begin(), values.end()) - values.begin());
+            };
+            bool useOffsetMap{false};
+            if (offsetMapValid && !directMapValid)
+            {
+                useOffsetMap = true;
+            }
+            else if (offsetMapValid && directMapValid)
+            {
+                int64_t const directUniqueCount = uniqueCount(hostD2T);
+                int64_t const offsetUniqueCount = uniqueCount(offsetTargets);
+                useOffsetMap = offsetUniqueCount > directUniqueCount;
+            }
+
+            if (!useOffsetMap)
+            {
+                for (int32_t draftTokenId = 0; draftTokenId < draftVocabSize; ++draftTokenId)
+                {
+                    int32_t const targetTokenId = hostD2T[static_cast<size_t>(draftTokenId)];
+                    hostD2T[static_cast<size_t>(draftTokenId)] = targetTokenId - draftTokenId;
+                }
+            }
+            LOG_INFO("Loaded EAGLE d2t.safetensors as %s table", useOffsetMap ? "offset" : "direct");
+            CUDA_CHECK(cudaMemcpyAsync(mDraftVocabMappingTable.dataPointer<int32_t>(), hostD2T.data(),
+                static_cast<size_t>(draftVocabSize) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
         }
-        check::check(d2tTensors.size() == 1, "d2t.safetensors should contain exactly one tensor");
-        check::check(d2tTensors[0].getShape().getNumDims() == 1, "d2t tensor should be 1D");
-        check::check(d2tTensors[0].getShape()[0] == mRuntime.deployment.draft->outputVocabSize,
-            "d2t tensor length should match draft vocab size");
-        mDraftVocabMappingTable = std::move(d2tTensors[0]);
     }
 }
 
@@ -534,6 +595,9 @@ bool EagleDecoder::runBaseModelVerification(DecodingInferenceContext& context)
     auto const& basePageTable = *mRuntime.base.sharedResources.kvPageTables[0];
     int32_t const* basePageTablePtr = basePageTable.kernelView().dataPointer<int32_t>();
     int32_t const baseMaxPagesPerSeq = basePageTable.maxPagesPerSeq();
+
+    decoder_utils::clampAcceptLengthsToRemainingGeneration(context, mHostAcceptLengths, mAcceptLength, context.stream);
+
     for (auto const& group : kvHeadDimGroups)
     {
         kernel::eagleBaseCommitKVCache(mAcceptedTokenIndices, mAcceptLength, kvCacheLengths, group.deviceLayerInfos,

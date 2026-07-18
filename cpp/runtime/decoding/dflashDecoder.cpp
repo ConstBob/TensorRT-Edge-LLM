@@ -86,7 +86,16 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
 
     mBlockSize = dflash_utils::runtimeBlockSize(deployment);
     mUseDDTree = dflash_utils::shouldUseDDTree(deployment);
-    mVerifySize = mUseDDTree ? deployment.specConfig->verifySize : mBlockSize;
+    mVerifySize = deployment.specConfig->verifySize;
+    mProposalLen = mUseDDTree ? mBlockSize : (mVerifySize - 1);
+    if (!mUseDDTree)
+    {
+        ELLM_CHECK(mVerifySize == mBlockSize,
+            "DFlash linear verifySize must equal dflashBlockSize: verifySize=" + std::to_string(mVerifySize)
+                + ", dflashBlockSize=" + std::to_string(mBlockSize) + ".");
+        ELLM_CHECK(mProposalLen > 0,
+            "DFlash linear requires verifySize >= 2 because node 0 is the root and later nodes are draft tokens.");
+    }
     mCandidateTopK = deployment.specConfig->draftingTopK;
     ELLM_CHECK(mCandidateTopK >= 1, "DFlashDecoder requires draftingTopK >= 1.");
     if (mUseDDTree)
@@ -99,13 +108,13 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
     // (e.g. 248070 > vocab_size on Qwen3-8B) which, if fed to the draft engine,
     // produces out-of-vocab embeddings and degenerate proposals. Prefer the draft's
     // value and only fall back to base when the draft doesn't specify one.
-    mMaskTokenId
-        = deployment.draft->dflashMaskTokenId > 0 ? deployment.draft->dflashMaskTokenId : baseCfg.dflashMaskTokenId;
+    mMaskTokenId = deployment.draft->specDraftMaskTokenId > 0 ? deployment.draft->specDraftMaskTokenId
+                                                              : baseCfg.specDraftMaskTokenId;
     mDraftHiddenSize = deployment.specConfig->draftHiddenSize;
     mBaseOutputHiddenDim = deployment.specConfig->baseOutputHiddenDim;
     mDraftVocabSize = deployment.draft->outputVocabSize;
     ELLM_CHECK(mMaskTokenId >= 0 && mMaskTokenId < mDraftVocabSize,
-        "DFlashDecoder: mask_token_id (" + std::to_string(mMaskTokenId) + ") out of draft vocab range [0,"
+        "DFlashDecoder: mask_token_id (" + std::to_string(mMaskTokenId) + ") out of draft vocab range [0, "
             + std::to_string(mDraftVocabSize) + ").");
 
     int32_t const maxBatch = deployment.maxRuntimeBatchSize();
@@ -196,14 +205,15 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
         = Tensor({maxBatch, mVerifySize}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "DFlash::verifyTokenIds");
     mVerifyTreeMask = Tensor(
         {maxBatch, mVerifySize, mVerifySize}, DeviceType::kGPU, nvinfer1::DataType::kINT8, "DFlash::verifyTreeMask");
-    mAcceptedTokenIds
-        = Tensor({maxBatch, mBlockSize}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "DFlash::acceptedTokenIds");
-    mAcceptedTokenIndices
-        = Tensor({maxBatch, mBlockSize}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "DFlash::acceptedTokenIndices");
+    int32_t const maxAcceptBufferSize = mUseDDTree ? std::min(mBlockSize, mVerifySize) : mVerifySize;
+    mAcceptedTokenIds = Tensor(
+        {maxBatch, maxAcceptBufferSize}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "DFlash::acceptedTokenIds");
+    mAcceptedTokenIndices = Tensor(
+        {maxBatch, maxAcceptBufferSize}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "DFlash::acceptedTokenIndices");
     mAcceptLength = Tensor({maxBatch}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "DFlash::acceptLength");
     mHostAcceptLengths = Tensor({maxBatch}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "DFlash::hostAcceptLengths");
-    mHostAcceptedTokenIds
-        = Tensor({maxBatch, mBlockSize}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "DFlash::hostAcceptedIds");
+    mHostAcceptedTokenIds = Tensor(
+        {maxBatch, maxAcceptBufferSize}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "DFlash::hostAcceptedIds");
 
     size_t const buildWorkspaceSize = mUseDDTree ? kernel::getDDTreeBuildWorkspaceSize(maxBatch, mBlockSize,
                                                        mVerifySize, deployment.draft->outputVocabSize, mCandidateTopK)
@@ -442,7 +452,7 @@ bool DFlashDecoder::prepareDFlashVerifyInputs(DecodingInferenceContext& context)
         nvtx_dflash_prepare_verify, "DFlashDecoder::prepareDFlashVerifyInputs", nvtx_colors::LIGHT_ORANGE);
 
     int32_t const activeBatchSize = context.activeBatchSize;
-    int32_t const verifySize = mUseDDTree ? mVerifySize : mBlockSize;
+    int32_t const verifySize = mVerifySize;
     check::check(mVerifyTokenIds.reshape({activeBatchSize, verifySize}), "Tensor reshape failed");
     check::check(mVerifyTreeMask.reshape({activeBatchSize, verifySize, verifySize}), "Tensor reshape failed");
 
@@ -466,7 +476,8 @@ bool DFlashDecoder::prepareDFlashVerifyInputs(DecodingInferenceContext& context)
 
         kernel::launchDFlashBuildLinearVerifyInputs(mLastAcceptedTokens.dataPointer<int32_t>(),
             mDraftTokenIds.dataPointer<int32_t>(), mVerifyTokenIds.dataPointer<int32_t>(),
-            mVerifyTreeMask.dataPointer<int8_t>(), activeBatchSize, mBlockSize, context.stream);
+            mVerifyTreeMask.dataPointer<int8_t>(), activeBatchSize, mProposalLen, mBlockSize, verifySize,
+            context.stream);
         prepareLinearBaseVerificationMetadata(activeBatchSize, verifySize, context.stream);
     }
     else if (!buildTreeVerifyInputs(context))
@@ -593,8 +604,8 @@ bool DFlashDecoder::runBaseVerification(DecodingInferenceContext& context)
 
     int32_t const activeBatchSize = context.activeBatchSize;
     int32_t const BS = mBlockSize;
-    int32_t const verifySize = mUseDDTree ? mVerifySize : BS;
-    int32_t const maxAcceptLength = mUseDDTree ? std::min(BS, verifySize) : BS;
+    int32_t const verifySize = mVerifySize;
+    int32_t const maxAcceptLength = mUseDDTree ? std::min(BS, verifySize) : verifySize;
 
     cudaGetLastError();
     bool const verifySuccess = executeBaseVerification(context, verifySize);
@@ -619,6 +630,8 @@ bool DFlashDecoder::runBaseVerification(DecodingInferenceContext& context)
         mAcceptedTokenIndices, mAcceptLength, std::nullopt, mRuntime.sampling.workspace.rawPointer(),
         mRuntime.sampling.workspace.getMemoryCapacity(), context.stream);
 
+    decoder_utils::clampAcceptLengthsToRemainingGeneration(context, mHostAcceptLengths, mAcceptLength, context.stream);
+
     if (mUseDDTree)
     {
         commitAcceptedTreePath(context, verifySize, maxAcceptLength);
@@ -627,7 +640,8 @@ bool DFlashDecoder::runBaseVerification(DecodingInferenceContext& context)
     {
         mRuntime.base.cacheManager.commitSequenceLength(mAcceptLength, context.stream);
 
-        check::check(mRuntime.base.pipelineIO.baseHiddenStates.reshape({activeBatchSize, BS, mBaseOutputHiddenDim}),
+        check::check(
+            mRuntime.base.pipelineIO.baseHiddenStates.reshape({activeBatchSize, maxAcceptLength, mBaseOutputHiddenDim}),
             "Tensor reshape failed");
 
         mRuntime.base.cacheManager.getMambaCacheManager().scatterAcceptedLinearStates(mAcceptLength, context.stream);
@@ -838,8 +852,7 @@ bool DFlashDecoder::captureCudaGraphs(cudaStream_t stream)
     bool baseVerificationCaptureStatus{true};
 
     static constexpr int32_t kSimulateCacheLength{128};
-    int32_t const BS = mBlockSize;
-    int32_t const verifySize = mUseDDTree ? mVerifySize : BS;
+    int32_t const verifySize = mVerifySize;
     int32_t const packedMaskLen = static_cast<int32_t>(divUp(verifySize, 32));
 
     // ScopeGuard: reset cache state after capture

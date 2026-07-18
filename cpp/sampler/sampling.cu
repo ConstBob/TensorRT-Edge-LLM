@@ -937,6 +937,121 @@ void topKtopPSamplingFromLogits(rt::Tensor const& logits, rt::Tensor& selectedIn
     }
 }
 
+template <int BLOCK_SIZE>
+__global__ void topKLogitsToDenseProbabilitiesKernel(float const* __restrict__ topKValues,
+    int32_t const* __restrict__ topKIndices, float* __restrict__ probabilities, int32_t batchSize, int32_t vocabSize,
+    int32_t topK, float temperature)
+{
+    int32_t const batchIdx = static_cast<int32_t>(blockIdx.x);
+    int32_t const tid = static_cast<int32_t>(threadIdx.x);
+    if (batchIdx >= batchSize || vocabSize <= 0 || topK <= 0)
+    {
+        return;
+    }
+
+    float* rowProbs = probabilities + static_cast<int64_t>(batchIdx) * vocabSize;
+    for (int32_t vocabIdx = tid; vocabIdx < vocabSize; vocabIdx += BLOCK_SIZE)
+    {
+        rowProbs[vocabIdx] = 0.0F;
+    }
+    __syncthreads();
+
+    int32_t const effectiveTopK = topK < vocabSize ? topK : vocabSize;
+    float const invTemp = invTemp_device(temperature);
+    float const* rowValues = topKValues + static_cast<int64_t>(batchIdx) * topK;
+    int32_t const* rowIndices = topKIndices + static_cast<int64_t>(batchIdx) * topK;
+
+    typedef cub::BlockReduce<float, BLOCK_SIZE> BlockReduce;
+    __shared__ typename BlockReduce::TempStorage tempStorage;
+    __shared__ float sharedMax;
+    __shared__ float sharedSum;
+
+    float localMax = -FLT_MAX;
+    for (int32_t k = tid; k < effectiveTopK; k += BLOCK_SIZE)
+    {
+        int32_t const token = rowIndices[k];
+        if (token >= 0 && token < vocabSize)
+        {
+            localMax = fmaxf(localMax, rowValues[k] * invTemp);
+        }
+    }
+    float const maxValue = BlockReduce(tempStorage).Reduce(localMax, maxOpFunctor());
+    if (tid == 0)
+    {
+        sharedMax = maxValue;
+    }
+    __syncthreads();
+
+    float localSum = 0.0F;
+    for (int32_t k = tid; k < effectiveTopK; k += BLOCK_SIZE)
+    {
+        int32_t const token = rowIndices[k];
+        if (token >= 0 && token < vocabSize)
+        {
+            localSum += expf(rowValues[k] * invTemp - sharedMax);
+        }
+    }
+    float const sumValue = BlockReduce(tempStorage).Reduce(localSum, sumOpFunctor());
+    if (tid == 0)
+    {
+        sharedSum = sumValue;
+    }
+    __syncthreads();
+
+    if (sharedSum <= 0.0F || !isfinite(sharedSum))
+    {
+        for (int32_t k = tid; k < effectiveTopK; k += BLOCK_SIZE)
+        {
+            int32_t const token = rowIndices[k];
+            if (token >= 0 && token < vocabSize)
+            {
+                rowProbs[token] = 1.0F / static_cast<float>(effectiveTopK);
+            }
+        }
+        return;
+    }
+
+    for (int32_t k = tid; k < effectiveTopK; k += BLOCK_SIZE)
+    {
+        int32_t const token = rowIndices[k];
+        if (token >= 0 && token < vocabSize)
+        {
+            rowProbs[token] = expf(rowValues[k] * invTemp - sharedMax) / sharedSum;
+        }
+    }
+}
+
+void topKLogitsToDenseProbabilities(rt::Tensor const& topKValues, rt::Tensor const& topKIndices,
+    rt::Tensor& probabilities, int32_t vocabSize, float temperature, cudaStream_t stream)
+{
+    check::check(topKValues.getDeviceType() == rt::DeviceType::kGPU
+            && topKIndices.getDeviceType() == rt::DeviceType::kGPU
+            && probabilities.getDeviceType() == rt::DeviceType::kGPU,
+        "All tensors must be on GPU");
+    check::check(topKValues.getDataType() == nvinfer1::DataType::kFLOAT
+            && topKIndices.getDataType() == nvinfer1::DataType::kINT32
+            && probabilities.getDataType() == nvinfer1::DataType::kFLOAT,
+        "Invalid tensor data types");
+
+    auto const topKValuesShape = topKValues.getShape();
+    auto const topKIndicesShape = topKIndices.getShape();
+    auto const probabilitiesShape = probabilities.getShape();
+    check::check(
+        topKValuesShape.getNumDims() == 2 && topKIndicesShape.getNumDims() == 2 && probabilitiesShape.getNumDims() == 2,
+        "Invalid tensor dimensions");
+    int32_t const batchSize = topKValuesShape[0];
+    int32_t const topK = topKValuesShape[1];
+    check::check(topKIndicesShape[0] == batchSize && topKIndicesShape[1] == topK, "TopK tensor shape mismatch");
+    check::check(
+        probabilitiesShape[0] == batchSize && probabilitiesShape[1] == vocabSize, "Probability tensor shape mismatch");
+
+    constexpr int32_t BLOCK_SIZE = 256;
+    topKLogitsToDenseProbabilitiesKernel<BLOCK_SIZE>
+        <<<batchSize, BLOCK_SIZE, 0, stream>>>(topKValues.dataPointer<float>(), topKIndices.dataPointer<int32_t>(),
+            probabilities.dataPointer<float>(), batchSize, vocabSize, topK, temperature);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void selectAllTopK(rt::Tensor const& input, rt::OptionalOutputTensor topKValues, rt::Tensor& topKIndices, int32_t topK,
     rt::Tensor& workspace, cudaStream_t stream)
 {

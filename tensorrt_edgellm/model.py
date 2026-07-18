@@ -34,8 +34,8 @@ from .checkpoint.checkpoint_utils import load_checkpoint_config_dicts
 from .checkpoint.loader import load_weights
 from .config import (QUANT_FP16, QUANT_INT4_AWQ, QUANT_INT4_AWQ_MODELOPT,
                      QUANT_INT4_GPTQ, QUANT_MXFP8, QUANT_NVFP4, ModelConfig,
-                     make_dflash_draft_config, make_mtp_draft_config,
-                     module_quant_type)
+                     make_dflash_draft_config, make_dspark_draft_config,
+                     make_mtp_draft_config, module_quant_type)
 
 __all__ = [
     "AutoModel", "load_model_config", "register_attention_scale_default",
@@ -107,6 +107,13 @@ def register_attention_scale_default(
 
 def load_model_config(model_dir: str) -> ModelConfig:
     """Load ModelConfig using the default declared by its model family."""
+    default_attention_scale = _default_attention_scale_for_model_dir(model_dir)
+    return ModelConfig.from_pretrained(model_dir, default_attention_scale)
+
+
+def _default_attention_scale_for_model_dir(
+        model_dir: str) -> AttentionScaleDefault:
+    """Return the attention-scale default registered by checkpoint model_type."""
     root, llm_dict = load_checkpoint_config_dicts(model_dir)
     default_attention_scale = standard_attention_scale
     for config in (root, llm_dict):
@@ -115,7 +122,7 @@ def load_model_config(model_dir: str) -> ModelConfig:
             default_attention_scale = _ATTENTION_SCALE_DEFAULT_REGISTRY[
                 model_type]
             break
-    return ModelConfig.from_pretrained(model_dir, default_attention_scale)
+    return default_attention_scale
 
 
 class AutoModel:
@@ -128,6 +135,7 @@ class AutoModel:
                         key_remap=None,
                         key_prefix: "str | None" = None,
                         eagle_base: bool = False,
+                        eagle_draft_dir: "str | None" = None,
                         reduced_vocab_dir: "str | None" = None,
                         mtp_base: bool = False,
                         mtp_draft: bool = False,
@@ -137,6 +145,9 @@ class AutoModel:
                         dflash_tree_base: bool = False,
                         dflash_draft: bool = False,
                         dflash_draft_dir: "str | None" = None,
+                        dspark_base: bool = False,
+                        dspark_draft: bool = False,
+                        dspark_draft_dir: "str | None" = None,
                         gemma4_mtp_base: bool = False,
                         gemma4_mtp_draft: bool = False,
                         gemma4_kv_sharing_map: "list[dict] | None" = None,
@@ -160,6 +171,10 @@ class AutoModel:
                             ``"talker."``).  Passed through to :func:`load_weights`.
             eagle_base:     When True, export as EAGLE3 base model with extra
                             tree-attention inputs and hidden_states output.
+            eagle_draft_dir:
+                            Optional EAGLE3 draft checkpoint directory. Gemma4
+                            EAGLE3 uses it to select the draft-trained target
+                            hidden layers for base hidden_states output.
             reduced_vocab_dir:
                             Optional directory containing ``vocab_map.safetensors``.
             mtp_base:       When True, export the standard Qwen3.5 text model as
@@ -178,6 +193,10 @@ class AutoModel:
             dflash_draft:   When True, build the DFlash draft model.
             dflash_draft_dir:
                             Path to the DFlash draft checkpoint directory.
+            dspark_base:    When True, export as DSpark base model.
+            dspark_draft:   When True, build the DSpark draft backbone model.
+            dspark_draft_dir:
+                            Path to the DSpark draft checkpoint directory.
             gemma4_mtp_base:
                             Export a Gemma4 target checkpoint as the base
                             engine for paired Gemma4 MTP.
@@ -193,8 +212,8 @@ class AutoModel:
                             When set, truncate the model to only the first N
                             decoder layers (few-layer numeric validation).
                             Only supported for the plain default ``CausalLM``
-                            path (e.g. Qwen3); rejected for eagle/mtp/dflash and
-                            registered non-default variants. The checkpoint's
+                            path (e.g. Qwen3); rejected for eagle/mtp/dflash/dspark
+                            and registered non-default variants. The checkpoint's
                             extra-layer weights are simply skipped by the loader.
 
         Returns:
@@ -205,6 +224,14 @@ class AutoModel:
         config = load_model_config(model_dir)
         if eagle_base:
             config.eagle_base = True
+            if eagle_draft_dir:
+                import json
+                draft_cfg_path = os.path.join(eagle_draft_dir, "config.json")
+                if os.path.isfile(draft_cfg_path):
+                    with open(draft_cfg_path) as f:
+                        draft_cfg = json.load(f)
+                    config.eagle3_target_layer_ids = list(
+                        draft_cfg.get("target_layer_ids", []) or [])
         if mtp_base or config.mtp_base:
             config.mtp_base = True
         if gemma4_mtp_base:
@@ -224,14 +251,65 @@ class AutoModel:
                 if os.path.isfile(draft_cfg_path):
                     with open(draft_cfg_path) as f:
                         draft_cfg = json.load(f)
-                    dflash_cfg = draft_cfg.get("dflash_config", {})
+                    dflash_cfg = draft_cfg.get("dflash_config", {}) or {}
                     config.dflash_target_layer_ids = dflash_cfg.get(
-                        "target_layer_ids", [1, 8, 15, 22, 29])
-                    config.dflash_block_size = dflash_cfg.get("block_size", 16)
-                    config.dflash_mask_token_id = dflash_cfg.get(
-                        "mask_token_id", 248070)
+                        "target_layer_ids",
+                        draft_cfg.get("target_layer_ids", [1, 8, 15, 22, 29]))
+                    config.dflash_block_size = int(
+                        dflash_cfg.get("block_size",
+                                       draft_cfg.get("block_size", 16)))
+                    default_mask_token_id = (4 if str(
+                        draft_cfg.get("model_type", "")).startswith("gemma4")
+                                             else 248070)
+                    config.dflash_mask_token_id = int(
+                        dflash_cfg.get(
+                            "mask_token_id",
+                            draft_cfg.get("mask_token_id",
+                                          default_mask_token_id)))
             if not config.dflash_target_layer_ids:
                 config.dflash_target_layer_ids = [1, 8, 15, 22, 29]
+        if dspark_base:
+            config.dspark_base = True
+            if not config.dspark_target_layer_ids and dspark_draft_dir:
+                import json
+                draft_cfg_path = os.path.join(dspark_draft_dir, "config.json")
+                if os.path.isfile(draft_cfg_path):
+                    with open(draft_cfg_path) as f:
+                        draft_cfg = json.load(f)
+                    dspark_cfg = draft_cfg.get("dspark_config", {})
+                    config.dspark_target_layer_ids = (
+                        dspark_cfg.get("target_layer_ids")
+                        or draft_cfg.get("target_layer_ids", []))
+                    config.dspark_block_size = int(
+                        dspark_cfg.get("block_size",
+                                       draft_cfg.get("block_size", 7)))
+                    default_mask_token_id = (4 if str(
+                        draft_cfg.get("model_type", "")).startswith("gemma4")
+                                             else 151669)
+                    config.dspark_mask_token_id = int(
+                        dspark_cfg.get(
+                            "mask_token_id",
+                            draft_cfg.get("mask_token_id",
+                                          default_mask_token_id)))
+                    config.dspark_enable_confidence_head = bool(
+                        dspark_cfg.get(
+                            "enable_confidence_head",
+                            draft_cfg.get("enable_confidence_head", False)))
+                    config.dspark_confidence_head_with_markov = bool(
+                        dspark_cfg.get(
+                            "confidence_head_with_markov",
+                            draft_cfg.get("confidence_head_with_markov",
+                                          False)))
+                    config.dspark_markov_head_type = str(
+                        dspark_cfg.get("markov_head_type",
+                                       draft_cfg.get("markov_head_type", "")))
+                    config.dspark_markov_rank = int(
+                        dspark_cfg.get("markov_rank",
+                                       draft_cfg.get("markov_rank", 0)))
+            if not config.dspark_target_layer_ids:
+                raise ValueError(
+                    "dspark_base requires DSpark target_layer_ids; pass "
+                    "dspark_draft_dir or set dspark_target_layer_ids.")
         if tp_size > 1:
             config = config.for_rank(tp_rank, tp_size)
 
@@ -241,6 +319,8 @@ class AutoModel:
                                          mtp_draft=mtp_draft,
                                          dflash_base=config.dflash_base,
                                          dflash_draft=dflash_draft,
+                                         dspark_base=config.dspark_base,
+                                         dspark_draft=dspark_draft,
                                          gemma4_mtp_base=gemma4_mtp_base,
                                          gemma4_mtp_draft=gemma4_mtp_draft)
 
@@ -277,8 +357,9 @@ class AutoModel:
             base_tie_word_embeddings = base_config.tie_word_embeddings
             draft_has_lm_head = _checkpoint_has_dflash_lm_head(
                 dflash_draft_dir)
-            config = make_dflash_draft_config(dflash_draft_dir,
-                                              standard_attention_scale)
+            config = make_dflash_draft_config(
+                dflash_draft_dir,
+                _default_attention_scale_for_model_dir(dflash_draft_dir))
             if not draft_has_lm_head:
                 config = _inherit_dflash_lm_head_quant(config, base_config)
             model_class = DFlashDraftModel
@@ -300,6 +381,18 @@ class AutoModel:
             if gemma4_target_kv_cache_quant is not None:
                 config.quant.kv_cache_quant = gemma4_target_kv_cache_quant
             model_class = Gemma4AssistantForCausalLM
+        elif variant == "dspark_draft":
+            if dspark_draft_dir is None:
+                raise ValueError(
+                    "dspark_draft requires dspark_draft_dir to be set.")
+            from .models.dspark.modeling_dspark_draft import DSparkDraftModel
+            config = make_dspark_draft_config(
+                dspark_draft_dir,
+                _default_attention_scale_for_model_dir(dspark_draft_dir))
+            model_class = DSparkDraftModel
+            model_dir = dspark_draft_dir
+            if key_remap is None:
+                key_remap = _dspark_key_remap
         else:
             if (variant == "mtp_base"
                     and not _is_qwen3_5_mtp_base_supported(config.model_type)):
@@ -335,13 +428,14 @@ class AutoModel:
         # different per-layer structure and remain out of scope.
         if num_decoder_layers is not None:
             if (eagle_base or config.eagle_base or mtp_base or config.mtp_base
-                    or dflash_base or config.dflash_base or mtp_draft
-                    or dflash_draft or gemma4_mtp_base
-                    or config.gemma4_mtp_base or gemma4_mtp_draft
-                    or config.gemma4_mtp_draft):
+                    or dflash_base or config.dflash_base or dspark_base
+                    or config.dspark_base or mtp_draft or dflash_draft
+                    or dspark_draft or config.is_dspark_draft
+                    or gemma4_mtp_base or config.gemma4_mtp_base
+                    or gemma4_mtp_draft or config.gemma4_mtp_draft):
                 raise NotImplementedError(
                     "num_decoder_layers cannot be combined with the "
-                    "eagle/mtp/dflash/gemma4-mtp speculative-decoding variants."
+                    "eagle/mtp/dflash/dspark/gemma4-mtp speculative-decoding variants."
                 )
             if not 1 <= num_decoder_layers <= config.num_hidden_layers:
                 raise ValueError(
@@ -479,6 +573,8 @@ def _resolve_model_variant(config: ModelConfig,
                            mtp_draft: bool,
                            dflash_base: bool = False,
                            dflash_draft: bool = False,
+                           dspark_base: bool = False,
+                           dspark_draft: bool = False,
                            gemma4_mtp_base: bool = False,
                            gemma4_mtp_draft: bool = False) -> str:
     """Resolve the requested model variant while keeping EAGLE3 behavior intact."""
@@ -491,19 +587,32 @@ def _resolve_model_variant(config: ModelConfig,
     if dflash_base and dflash_draft:
         raise ValueError(
             "dflash_base and dflash_draft cannot both be enabled.")
-    if dflash_base and (eagle_base or mtp_base or mtp_draft):
+    if dspark_base and dspark_draft:
         raise ValueError(
-            "dflash_base cannot be combined with eagle/mtp variants.")
-    if dflash_draft and (eagle_base or mtp_base or mtp_draft):
+            "dspark_base and dspark_draft cannot both be enabled.")
+    if dflash_base and (eagle_base or mtp_base or mtp_draft or dspark_base or
+                        dspark_draft or gemma4_mtp_base or gemma4_mtp_draft):
         raise ValueError(
-            "dflash_draft cannot be combined with eagle/mtp variants.")
+            "dflash_base cannot be combined with other spec variants.")
+    if dflash_draft and (eagle_base or mtp_base or mtp_draft or dspark_base or
+                         dspark_draft or gemma4_mtp_base or gemma4_mtp_draft):
+        raise ValueError(
+            "dflash_draft cannot be combined with other spec variants.")
+    if dspark_base and (eagle_base or mtp_base or mtp_draft or dflash_base or
+                        dflash_draft or gemma4_mtp_base or gemma4_mtp_draft):
+        raise ValueError(
+            "dspark_base cannot be combined with other spec variants.")
+    if dspark_draft and (eagle_base or mtp_base or mtp_draft or dflash_base or
+                         dflash_draft or gemma4_mtp_base or gemma4_mtp_draft):
+        raise ValueError(
+            "dspark_draft cannot be combined with other spec variants.")
     if gemma4_mtp_base and (eagle_base or mtp_base or mtp_draft or dflash_base
-                            or dflash_draft):
+                            or dflash_draft or dspark_base or dspark_draft):
         raise ValueError(
             "gemma4_mtp_base cannot be combined with other speculative variants."
         )
     if gemma4_mtp_draft and (eagle_base or mtp_base or mtp_draft or dflash_base
-                             or dflash_draft):
+                             or dflash_draft or dspark_base or dspark_draft):
         raise ValueError(
             "gemma4_mtp_draft cannot be combined with other speculative variants."
         )
@@ -522,6 +631,10 @@ def _resolve_model_variant(config: ModelConfig,
         return "dflash_draft"
     if dflash_base:
         return "dflash_base"
+    if dspark_draft:
+        return "dspark_draft"
+    if dspark_base:
+        return "dspark_base"
     if mtp_draft:
         return "mtp_draft"
     if mtp_base:
@@ -755,6 +868,17 @@ def _checkpoint_has_dflash_lm_head(model_dir: str) -> bool:
 
 def _dflash_key_remap(key: str) -> "str | None":
     """Remap DFlash draft checkpoint keys."""
+    if "rotary_emb" in key:
+        return None
+    return key
+
+
+def _dspark_key_remap(key: str) -> "str | None":
+    """Remap DSpark draft checkpoint keys for the backbone engine.
+
+    Markov and confidence tensors are exported as sidecars rather than baked
+    into the backbone engine, so the generic loader may skip them.
+    """
     if "rotary_emb" in key:
         return None
     return key

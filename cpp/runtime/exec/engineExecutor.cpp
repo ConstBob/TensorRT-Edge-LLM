@@ -129,6 +129,11 @@ std::unique_ptr<EngineExecutor> EngineExecutor::createForDraft(
         auto registry = buildRegistryForGemma4MTPDraft(bundle);
         return std::unique_ptr<EngineExecutor>(new EngineExecutor(enginePath, std::move(registry)));
     }
+    case SpecDecodeMode::kDSpark:
+    {
+        auto registry = buildRegistryForDSparkDraft(bundle);
+        return std::unique_ptr<EngineExecutor>(new EngineExecutor(enginePath, std::move(registry)));
+    }
     case SpecDecodeMode::kNONE:
     default: ELLM_CHECK(false, "createForDraft requires a speculative decoding deployment with a draft engine.");
     }

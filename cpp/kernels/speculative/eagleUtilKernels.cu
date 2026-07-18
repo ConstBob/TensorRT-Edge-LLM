@@ -194,12 +194,14 @@ __global__ void initializeDraftTreeFullTablesKernel(int32_t const* selectedIndic
         }
         else if (i <= draftTopK)
         {
-            // First level of the draft tree, token shall be translated into full vocab size.
+            // First-level candidates come from draft logits produced by draft prefill
+            // or draft accept. Translate them to target-vocabulary token ids for
+            // base verification. Full-vocab drafts use a zero-offset identity table.
             // Score is 0 (root) + log probability, parent points to root (0)
             int32_t const selectedOffset = batchIdx * draftTopK + i - 1;
             int32_t const draftTokenId = selectedIndices[selectedOffset];
-            float const logProbVal = logProbs[selectedOffset];
             int32_t const baseTokenId = draftTokenId + vocabMappingTable[draftTokenId];
+            float const logProbVal = logProbs[selectedOffset];
             draftIdFullTable[tableOffset] = baseTokenId;
             draftScoreFullTable[tableOffset] = logProbVal;
             draftParentFullTable[tableOffset] = 0;
@@ -684,9 +686,10 @@ __global__ void eagleBaseCommitKVCacheBatchedKernel(int32_t const* __restrict__ 
     KVLayerInfo const* __restrict__ layerInfos, int32_t const activeBatchSize, int32_t const maxDepth,
     int32_t const* __restrict__ pageTable, int32_t const maxPagesPerSeq)
 {
-    static_assert(HEAD_DIM == 64 || HEAD_DIM == 128 || HEAD_DIM == 256, "Only HEAD_DIM = 64, 128 or 256 are supported");
+    static_assert(HEAD_DIM == 64 || HEAD_DIM == 128 || HEAD_DIM == 256 || HEAD_DIM == 512,
+        "Only HEAD_DIM = 64, 128, 256 or 512 are supported");
     // NOT blanket-initialised: zeroing all MAX_PATH vectors up front measurably slows this
-    // µs-scale kernel (Thor perf gate). Instead, every phase-1 path that skips the load writes an
+    // us-scale kernel (Thor perf gate). Instead, every phase-1 path that skips the load writes an
     // explicit zero below, so phase 2 always stores deterministic bytes.
     DVec<KV_T> tempBuffer[MAX_PATH];
 
@@ -934,10 +937,28 @@ void eagleBaseCommitKVCache(rt::Tensor const& acceptedIndices, rt::Tensor const&
 #endif
         }
         break;
+    case 512:
+        if (kvCacheType == DataType::kHALF)
+        {
+            eagleBaseCommitKVCacheBatchedKernel<512, MAX_PATH, half>
+                <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndicesPtr, acceptLengthsPtr, kvCacheLengthsPtr,
+                    deviceLayerInfos, activeBatchSize, maxDepth, pageTable, maxPagesPerSeq);
+        }
+        else
+        {
+#if SUPPORTS_FP8
+            eagleBaseCommitKVCacheBatchedKernel<512, MAX_PATH, __nv_fp8_e4m3>
+                <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndicesPtr, acceptLengthsPtr, kvCacheLengthsPtr,
+                    deviceLayerInfos, activeBatchSize, maxDepth, pageTable, maxPagesPerSeq);
+#else
+            throw std::runtime_error("FP8 KV cache requested but CUDA_VERSION < 11080 (cuda_fp8.h unavailable).");
+#endif
+        }
+        break;
     default:
         throw std::runtime_error(
-            "Only HEAD_DIM = 64, 128 or 256 are supported by eagleBaseCommitKVCacheAndAssembleHiddenState, current "
-            "HEAD_DIM = "
+            "Only HEAD_DIM = 64, 128, 256 or 512 are supported by eagleBaseCommitKVCacheAndAssembleHiddenState, "
+            "current HEAD_DIM = "
             + std::to_string(headDim));
     }
     CUDA_CHECK(cudaGetLastError());

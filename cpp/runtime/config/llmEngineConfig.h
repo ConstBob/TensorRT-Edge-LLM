@@ -44,6 +44,7 @@ enum class SpecDecodeMode : int32_t
     kMTP,
     kDFlash,
     kGemma4MTP,
+    kDSpark,
 };
 
 //! Gemma4 MTP assistant-layer to target-layer shared-KV mapping.
@@ -150,15 +151,15 @@ struct LLMEngineConfig
     //! `DeploymentConfig::specDecode->baseOutputHiddenDim`.
     int32_t baseModelHiddenSize{0};
 
-    //! DFlash draft block size. Parsed from `dflash_config.block_size` or
-    //! top-level `block_size` on DFlash base/draft configs.
-    int32_t dflashBlockSize{0};
+    //! Cached draft proposal block size for DFlash/DSpark. Parsed from the
+    //! mode-specific config object (`dflash_config` or `dspark_config`).
+    int32_t specDraftBlockSize{0};
 
-    //! DFlash mask token ID used to seed draft input blocks.
-    int32_t dflashMaskTokenId{0};
+    //! Mask token ID used to seed cached draft input blocks for DFlash/DSpark.
+    int32_t specDraftMaskTokenId{0};
 
-    //! Target decoder-layer IDs whose hidden states are concatenated for DFlash.
-    std::vector<int32_t> dflashTargetLayerIds{};
+    //! Target decoder-layer IDs whose hidden states are concatenated for cached drafts.
+    std::vector<int32_t> specTargetLayerIds{};
 
     // --- Gemma4 MTP shared-target-KV metadata ---
     std::string modelType;              //!< Top-level model type string, if exported.
@@ -168,6 +169,14 @@ struct LLMEngineConfig
     bool returnsFeedbackHidden{false};  //!< Assistant emits backbone-space feedback hidden states.
     int32_t assistantHiddenSize{0};     //!< Assistant internal hidden dim, when distinct from hiddenSize.
     std::vector<Gemma4MTPKVSharingEntry> gemma4MTPKVSharingMap{}; //!< Assistant -> target KV sharing map.
+
+    //! DSpark Markov/confidence sidecar metadata.
+    bool dsparkEnableConfidenceHead{false};
+    bool dsparkConfidenceHeadWithMarkov{false};
+    std::string dsparkMarkovHeadType{};
+    int32_t dsparkMarkovRank{0};
+    std::string dsparkHeadsFile{};
+    std::string dsparkHeadsInfoFile{};
 
     // --- Per-layer type routing (hybrid cache) ---
 

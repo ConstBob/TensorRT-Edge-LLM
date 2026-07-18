@@ -124,18 +124,22 @@ void launchDFlashPrepareBaseVerifyInputs(int32_t const* baseKVCacheLengths, int3
 
 /// Launch kernel to build DFlash linear verification inputs for EAGLE accept.
 ///
-/// verifyTokenIds[b, 0] = lastAcceptedTokens[b], verifyTokenIds[b, j] = draftTokenIds[b, j] for j >= 1.
+/// verifyTokenIds[b, 0] = lastAcceptedTokens[b];
+/// verifyTokenIds[b, j + 1] = draftTokenIds[b, j], j in [0, proposalLen).
 /// verifyTreeMask is an unpacked causal tree mask where row i attends to [0, i].
 ///
 /// @param lastAcceptedTokens [B] INT32 — last committed token per batch
-/// @param draftTokenIds [B, BS] INT32 — DFlash draft argmax token IDs
-/// @param verifyTokenIds [B, BS] INT32 — output base verify token IDs
-/// @param verifyTreeMask [B, BS, BS] INT8 — output EAGLE-style causal tree mask
+/// @param draftTokenIds [B, draftTokenStride] INT32 — DFlash draft argmax token IDs
+/// @param verifyTokenIds [B, verifySize] INT32 — output base verify token IDs
+/// @param verifyTreeMask [B, verifySize, verifySize] INT8 — output EAGLE-style causal tree mask
 /// @param batchSize batch size
-/// @param blockSize DFlash block size
+/// @param proposalLen number of proposal tokens copied after the anchor
+/// @param draftTokenStride row stride of draftTokenIds, usually dflashBlockSize
+/// @param verifySize base verification input size, must equal proposalLen + 1
 /// @param stream CUDA stream
 void launchDFlashBuildLinearVerifyInputs(int32_t const* lastAcceptedTokens, int32_t const* draftTokenIds,
-    int32_t* verifyTokenIds, int8_t* verifyTreeMask, int32_t batchSize, int32_t blockSize, cudaStream_t stream);
+    int32_t* verifyTokenIds, int8_t* verifyTreeMask, int32_t batchSize, int32_t proposalLen, int32_t draftTokenStride,
+    int32_t verifySize, cudaStream_t stream);
 
 } // namespace kernel
 } // namespace trt_edgellm

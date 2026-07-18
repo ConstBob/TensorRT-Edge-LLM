@@ -44,8 +44,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ...config import ModelConfig
+from ...config import ModelConfig, _is_gemma4_model_type
 from ..default.modeling_default import OnnxSpec, RMSNorm
+# yapf: disable
+from ..gemma4.modeling_gemma4_text import (Gemma4MLP, Gemma4RMSNorm,
+                                           Gemma4ValueRMSNorm,
+                                           _attention_type_for_layer,
+                                           _head_dim_for_attention_type,
+                                           _num_kv_heads_for_attention_type,
+                                           _rotary_dim_from_rope_config,
+                                           _uses_attention_k_eq_v)
+# yapf: enable
 from ..linear import make_linear
 from ..ops import KV_PAGE_SIZE, attention_plugin
 
@@ -75,40 +84,56 @@ class Eagle3Attention(nn.Module):
 
     def __init__(self, config: ModelConfig, layer_idx: int) -> None:
         super().__init__()
-        num_attention_heads = config.num_attention_heads
-        num_key_value_heads = config.num_key_value_heads
-        head_dim = config.head_dim
         hidden_size = config.hidden_size
         qkv_in_features = hidden_size * 2
 
         self.layer_idx = layer_idx
-        self.num_heads = num_attention_heads
-        self.num_kv_heads = num_key_value_heads
-        self.head_dim = head_dim
+        self.is_gemma4 = _is_gemma4_model_type(config.model_type)
+        if self.is_gemma4:
+            self.attention_type = _attention_type_for_layer(config, layer_idx)
+            self.attention_k_eq_v = _uses_attention_k_eq_v(
+                config, self.attention_type)
+            self.num_heads = int(config.num_attention_heads)
+            self.num_kv_heads = _num_kv_heads_for_attention_type(
+                config, self.attention_type)
+            self.head_dim = _head_dim_for_attention_type(
+                config, self.attention_type)
+            self.sliding_window_size = (config.sliding_window_size
+                                        if self.attention_type
+                                        == "sliding_attention" else -1)
+        else:
+            self.attention_k_eq_v = False
+            self.num_heads = config.num_attention_heads
+            self.num_kv_heads = config.num_key_value_heads
+            self.head_dim = config.head_dim
+            self.sliding_window_size = -1
         self.attention_scale = config.attention_scaling
-        self.sliding_window_size = -1
 
         self.q_proj = make_linear(config,
                                   qkv_in_features,
-                                  num_attention_heads * head_dim,
+                                  self.num_heads * self.head_dim,
                                   bias=config.attention_bias)
         self.k_proj = make_linear(config,
                                   qkv_in_features,
-                                  num_key_value_heads * head_dim,
+                                  self.num_kv_heads * self.head_dim,
                                   bias=config.attention_bias)
-        self.v_proj = make_linear(config,
-                                  qkv_in_features,
-                                  num_key_value_heads * head_dim,
-                                  bias=config.attention_bias)
-        self.o_proj = make_linear(config, num_attention_heads * head_dim,
+        if not self.attention_k_eq_v:
+            self.v_proj = make_linear(config,
+                                      qkv_in_features,
+                                      self.num_kv_heads * self.head_dim,
+                                      bias=config.attention_bias)
+        self.o_proj = make_linear(config, self.num_heads * self.head_dim,
                                   hidden_size)
 
         if config.has_qk_norm:
-            self.q_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
-            self.k_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
+            norm_cls = Gemma4RMSNorm if self.is_gemma4 else RMSNorm
+            self.q_norm = norm_cls(self.head_dim, eps=config.rms_norm_eps)
+            self.k_norm = norm_cls(self.head_dim, eps=config.rms_norm_eps)
         else:
             self.q_norm = None
             self.k_norm = None
+        self.v_norm = (Gemma4ValueRMSNorm(self.head_dim, config.rms_norm_eps)
+                       if self.is_gemma4 and config.has_value_norm else None)
 
     def forward(
         self,
@@ -124,8 +149,10 @@ class Eagle3Attention(nn.Module):
         batch_size, seq_len, _ = hidden_states.shape
 
         query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        key_states_raw = self.k_proj(hidden_states)
+        value_states = (key_states_raw if self.attention_k_eq_v else
+                        self.v_proj(hidden_states))
+        key_states = key_states_raw
 
         if self.q_norm is not None:
             query_states = self.q_norm(
@@ -139,6 +166,12 @@ class Eagle3Attention(nn.Module):
                                    self.head_dim)).reshape(
                                        batch_size, seq_len,
                                        self.num_kv_heads * self.head_dim)
+        if self.v_norm is not None:
+            value_states = self.v_norm(
+                value_states.reshape(batch_size, seq_len, self.num_kv_heads,
+                                     self.head_dim)).reshape(
+                                         batch_size, seq_len,
+                                         self.num_kv_heads * self.head_dim)
 
         attn_output, present_key_value = attention_plugin(
             query_states,
@@ -208,12 +241,22 @@ class Eagle3DecoderLayer(nn.Module):
     def __init__(self, config: ModelConfig, layer_idx: int) -> None:
         super().__init__()
         self.layer_idx = layer_idx
+        self.is_gemma4 = _is_gemma4_model_type(config.model_type)
         self.self_attn = Eagle3Attention(config, layer_idx=layer_idx)
-        self.mlp = MLP(config)
-        self.hidden_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size,
-                                                config.rms_norm_eps)
+        self.mlp = (Gemma4MLP(config, layer_idx=layer_idx)
+                    if self.is_gemma4 else MLP(config))
+        norm_cls = Gemma4RMSNorm if self.is_gemma4 else RMSNorm
+        self.hidden_norm = norm_cls(config.hidden_size, config.rms_norm_eps)
+        self.input_layernorm = norm_cls(config.hidden_size,
+                                        config.rms_norm_eps)
+        self.post_attention_layernorm = norm_cls(config.hidden_size,
+                                                 config.rms_norm_eps)
+        if self.is_gemma4:
+            self.pre_feedforward_layernorm = Gemma4RMSNorm(
+                config.hidden_size, config.rms_norm_eps)
+            self.post_feedforward_layernorm = Gemma4RMSNorm(
+                config.hidden_size, config.rms_norm_eps)
+            self.register_buffer("layer_scalar", torch.ones(1))
 
     def forward(
         self,
@@ -244,11 +287,23 @@ class Eagle3DecoderLayer(nn.Module):
             attention_mask,
             attention_pos_id,
         )
-        hidden_states = residual + attn_output
+        if self.is_gemma4:
+            hidden_states = self.post_attention_layernorm(attn_output)
+            hidden_states = residual + hidden_states
 
-        residual = hidden_states
-        hidden_states = residual + self.mlp(
-            self.post_attention_layernorm(hidden_states))
+            residual = hidden_states
+            hidden_states = self.pre_feedforward_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.post_feedforward_layernorm(hidden_states)
+            hidden_states = residual + hidden_states
+            hidden_states = hidden_states * self.layer_scalar.to(
+                dtype=hidden_states.dtype)
+        else:
+            hidden_states = residual + attn_output
+
+            residual = hidden_states
+            hidden_states = residual + self.mlp(
+                self.post_attention_layernorm(hidden_states))
 
         return hidden_states, present_key_value
 
@@ -311,6 +366,8 @@ class Eagle3DraftModel(nn.Module):
     The C++ builder already skips ``embedding.safetensors`` for draft models.
     """
 
+    match_fp32_elementwise_initializers = True
+
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
         self.config = config
@@ -319,7 +376,7 @@ class Eagle3DraftModel(nn.Module):
         draft_vocab_size = config.draft_vocab_size or config.vocab_size
 
         self.fc = make_linear(config,
-                              target_hidden * 3,
+                              target_hidden * config.eagle3_num_target_layers,
                               hidden_size,
                               module_name="fc")
 
@@ -327,7 +384,9 @@ class Eagle3DraftModel(nn.Module):
             Eagle3DecoderLayer(config, layer_idx=i)
             for i in range(config.num_hidden_layers)
         ])
-        self.norm = RMSNorm(hidden_size, config.rms_norm_eps)
+        norm_cls = Gemma4RMSNorm if _is_gemma4_model_type(
+            config.model_type) else RMSNorm
+        self.norm = norm_cls(hidden_size, config.rms_norm_eps)
         # Always pass module_name="lm_head" so that the excluded list and
         # tie_word_embeddings overrides work correctly (both force FP16).
         self.lm_head = make_linear(config,
@@ -336,8 +395,10 @@ class Eagle3DraftModel(nn.Module):
                                    bias=False,
                                    module_name="lm_head")
 
-        self.register_buffer("d2t",
-                             torch.zeros(draft_vocab_size, dtype=torch.int32))
+        d2t = (torch.arange(draft_vocab_size, dtype=torch.int32)
+               if draft_vocab_size == config.vocab_size else torch.zeros(
+                   draft_vocab_size, dtype=torch.int32))
+        self.register_buffer("d2t", d2t)
 
     def forward(
         self,
@@ -384,6 +445,11 @@ class Eagle3DraftModel(nn.Module):
         hidden_states = torch.ops.trt.gather_nd(hidden_states, last_token_ids)
         hidden_states_normed = self.norm(hidden_states)
         logits = self.lm_head(hidden_states_normed).to(torch.float32)
+        final_logit_softcapping = getattr(self.config,
+                                          "final_logit_softcapping", None)
+        if final_logit_softcapping is not None:
+            logits = torch.tanh(
+                logits / final_logit_softcapping) * final_logit_softcapping
         logits = F.log_softmax(logits, dim=-1)
 
         return logits, hidden_states, tuple(present_key_values)
@@ -419,6 +485,9 @@ class Eagle3DraftModel(nn.Module):
                         device=device) for _ in range(Na)
         ]
         rotary_dim = int(config.head_dim * config.partial_rotary_factor)
+        if _is_gemma4_model_type(config.model_type):
+            rotary_dim = _rotary_dim_from_rope_config(config, None,
+                                                      config.head_dim)
         rope_rotary_cos_sin = torch.zeros(batch_size,
                                           max_pos,
                                           rotary_dim,
@@ -441,7 +510,8 @@ class Eagle3DraftModel(nn.Module):
                                      device=device)
         hidden_states_input = torch.zeros(batch_size,
                                           seq_len,
-                                          target_hidden * 3,
+                                          target_hidden *
+                                          config.eagle3_num_target_layers,
                                           dtype=dtype16,
                                           device=device)
         hidden_states_from_draft = torch.zeros(batch_size,

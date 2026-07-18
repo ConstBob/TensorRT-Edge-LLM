@@ -536,6 +536,9 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
     // MTP intentionally still uses the identity-only default (no page table passed) here -- unlike
     // eagleDecoder.cpp, MTP reuse is deferred so this call is not wired to the real
     // base page table yet. Revisit together with EAGLE if/when MTP gains non-identity reuse support.
+
+    decoder_utils::clampAcceptLengthsToRemainingGeneration(context, mHostAcceptLengths, mAcceptLength, context.stream);
+
     for (auto const& group : kvHeadDimGroups)
     {
         kernel::eagleBaseCommitKVCache(mAcceptedTokenIndices, mAcceptLength, kvCacheLengths, group.deviceLayerInfos,

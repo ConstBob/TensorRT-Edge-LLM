@@ -1,4 +1,8 @@
 build/
+build*
+engines/
+onnx*
+feature-spec/
 dist/
 *.egg-info
 *_engine/

@@ -307,6 +307,8 @@ def _determine_spec_decode_type(config) -> str:
         return "eagle3"
     if config.is_dflash_draft or config.dflash_base:
         return "dflash"
+    if config.is_dspark_draft or config.dspark_base:
+        return "dspark"
     if config.is_mtp_draft or config.mtp_base:
         return "mtp"
     return "none"
@@ -314,11 +316,12 @@ def _determine_spec_decode_type(config) -> str:
 
 def _determine_engine_role(config) -> str:
     """Return the engine role within the speculative decoding deployment."""
-    if (config.is_eagle3_draft or config.is_dflash_draft or config.is_mtp_draft
+    if (config.is_eagle3_draft or config.is_dflash_draft
+            or config.is_dspark_draft or config.is_mtp_draft
             or config.gemma4_mtp_draft):
         return "draft"
-    if (config.eagle_base or config.dflash_base or config.mtp_base
-            or config.gemma4_mtp_base):
+    if (config.eagle_base or config.dflash_base or config.dspark_base
+            or config.mtp_base or config.gemma4_mtp_base):
         return "base"
     return "llm"
 
@@ -371,7 +374,12 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
         "num_deepstack_features":
         config.num_deepstack_features,
         "use_vision_bidirectional_attention":
-        config.use_vision_bidirectional_attention,
+        bool(config.use_vision_bidirectional_attention
+             and not (config.eagle_base or config.dflash_base
+                      or config.dspark_base or config.mtp_base
+                      or config.gemma4_mtp_base or config.is_eagle3_draft
+                      or config.is_dflash_draft or config.is_dspark_draft
+                      or config.is_mtp_draft or config.gemma4_mtp_draft)),
     }
     if tp_size > 1:
         out["tp_size"] = tp_size
@@ -506,12 +514,23 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
         attention_types = (LAYER_ATTN, ) + _VALID_ATTENTION_LAYER_TYPES
         normalized_layer_types: list = []
         kv_layer_configs: list = []
-        for lt in config.layer_types:
+        for layer_idx, lt in enumerate(config.layer_types):
             if lt in attention_types:
                 normalized_layer_types.append("attention")
+                num_kv_heads = config.num_key_value_heads
+                head_dim = config.head_dim
+                if (str(config.model_type).startswith("gemma4")
+                        and config.attention_layer_types):
+                    attention_type = config.attention_layer_types[layer_idx]
+                    if attention_type == "full_attention":
+                        if config.global_head_dim:
+                            head_dim = config.global_head_dim
+                        if (config.attention_k_eq_v
+                                and config.num_global_key_value_heads):
+                            num_kv_heads = config.num_global_key_value_heads
                 kv_layer_configs.append({
-                    "num_kv_heads": config.num_key_value_heads,
-                    "head_dim": config.head_dim,
+                    "num_kv_heads": num_kv_heads,
+                    "head_dim": head_dim,
                 })
             elif lt in (LAYER_MAMBA, LAYER_GDN):
                 normalized_layer_types.append("mamba")
@@ -526,7 +545,12 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
         target_hidden = config.eagle3_target_hidden_size
         out.update({
             "draft_vocab_size": draft_vocab,
-            "base_model_hidden_size": target_hidden * 3,
+            "base_model_hidden_size":
+            target_hidden * config.eagle3_num_target_layers,
+            "eagle3_config": {
+                "target_layer_ids": list(config.eagle3_target_layer_ids),
+                "num_target_layers": config.eagle3_num_target_layers,
+            },
         })
 
     if config.is_mtp_draft:
@@ -603,8 +627,6 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
             config.vocab_size,
             "base_model_hidden_size":
             len(config.dflash_target_layer_ids) * config.hidden_size,
-            "block_size":
-            config.dflash_block_size,
             "dflash_config": {
                 "target_layer_ids": list(config.dflash_target_layer_ids),
                 "block_size": config.dflash_block_size,
@@ -621,10 +643,49 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
             },
         })
 
+    if config.is_dspark_draft:
+        dspark_cfg = {
+            "target_layer_ids": list(config.dspark_target_layer_ids),
+            "block_size": config.dspark_block_size,
+            "mask_token_id": config.dspark_mask_token_id,
+            "enable_confidence_head": config.dspark_enable_confidence_head,
+            "confidence_head_with_markov":
+            config.dspark_confidence_head_with_markov,
+            "markov_head_type": config.dspark_markov_head_type,
+            "markov_rank": config.dspark_markov_rank,
+            "heads_file": "dspark_heads.safetensors",
+            "heads_info_file": "dspark_heads_info.json",
+        }
+        out.update({
+            "draft_vocab_size":
+            config.vocab_size,
+            "base_model_hidden_size":
+            len(config.dspark_target_layer_ids) * config.hidden_size,
+            "dspark_config":
+            dspark_cfg,
+        })
+
+    if config.dspark_base:
+        out.update({
+            "dspark_config": {
+                "target_layer_ids": list(config.dspark_target_layer_ids),
+                "block_size": config.dspark_block_size,
+                "mask_token_id": config.dspark_mask_token_id,
+                "enable_confidence_head": config.dspark_enable_confidence_head,
+                "confidence_head_with_markov":
+                config.dspark_confidence_head_with_markov,
+                "markov_head_type": config.dspark_markov_head_type,
+                "markov_rank": config.dspark_markov_rank,
+            },
+        })
+
     if config.eagle_base:
         # EAGLE3 base: record which layers provide hidden states to the draft.
-        n_layers = config.num_hidden_layers
-        out["eagle_hidden_state_layers"] = [2, n_layers // 2, n_layers - 4]
+        target_layers = list(config.eagle3_target_layer_ids)
+        if not target_layers:
+            n_layers = config.num_hidden_layers
+            target_layers = [2, n_layers // 2, n_layers - 4]
+        out["eagle_hidden_state_layers"] = target_layers
 
     if config.reduced_vocab_size:
         out["reduced_vocab_size"] = config.reduced_vocab_size

@@ -80,7 +80,7 @@ TEST(EagleKernels, PrepareEaglePrefillInputs)
 
 // ============================================================================
 // Test 2: initializeDraftTreeTables
-// Description: Initialize draft tree with root + level1 tokens, translate to full vocab
+// Description: Initialize draft tree with root + level1 draft tokens translated to target ids
 // Format: [root(score=0, parent=-1), level1_tokens(score=logProb, parent=0), empty(-inf, -5)]
 // ============================================================================
 TEST(EagleKernels, InitializeDraftTreeTables)
@@ -187,6 +187,42 @@ TEST(EagleKernels, InitializeDraftTreeTables)
             }
         }
     }
+}
+
+TEST(EagleKernels, InitializeDraftTreeTablesWithIdentityMapping)
+{
+    cudaStream_t stream = nullptr;
+    int32_t const batchSize = 1;
+    int32_t const draftTopK = 3;
+    int32_t const tableLength = 13;
+
+    std::vector<int32_t> selectedIndices = {101, 107, 113};
+    std::vector<float> logProbs = {-0.1f, -0.2f, -0.3f};
+    std::vector<int32_t> rootTokens = {5000};
+    std::vector<int32_t> vocabOffsets(128, 0);
+
+    auto selectedIndicesDevice = rt::Tensor({batchSize, draftTopK}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto logProbsDevice = rt::Tensor({batchSize, draftTopK}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    auto rootTokensDevice = rt::Tensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto vocabOffsetsDevice
+        = rt::Tensor({static_cast<int64_t>(vocabOffsets.size())}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto draftIdFullTableDevice = rt::Tensor({batchSize, tableLength}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto draftScoreFullTableDevice = rt::Tensor({batchSize, tableLength}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    auto draftParentFullTableDevice = rt::Tensor({batchSize, tableLength}, rt::DeviceType::kGPU, DataType::kINT32);
+
+    copyHostToDevice<int32_t>(selectedIndicesDevice, selectedIndices);
+    copyHostToDevice<float>(logProbsDevice, logProbs);
+    copyHostToDevice<int32_t>(rootTokensDevice, rootTokens);
+    copyHostToDevice<int32_t>(vocabOffsetsDevice, vocabOffsets);
+
+    initializeDraftTreeTables(selectedIndicesDevice, logProbsDevice, rootTokensDevice, vocabOffsetsDevice,
+        draftIdFullTableDevice, draftScoreFullTableDevice, draftParentFullTableDevice, draftTopK, stream);
+
+    auto const actualIds = copyDeviceToHost<int32_t>(draftIdFullTableDevice);
+    EXPECT_EQ(actualIds[0], 5000);
+    EXPECT_EQ(actualIds[1], 101);
+    EXPECT_EQ(actualIds[2], 107);
+    EXPECT_EQ(actualIds[3], 113);
 }
 
 // ============================================================================
@@ -1022,118 +1058,105 @@ TEST(EagleKernels, EagleBaseCommitKVCacheHeterogeneousLayers)
 {
     cudaStream_t stream = nullptr;
 
-    // Two attention layers in the same head-dim group, with different numKVHeads.
-    int32_t const headDim = 128;
-    int32_t const maxBatchSize = 1;
-    int32_t const maxSeqLen = 64;
-    int32_t const numLayers = 2;
-    std::vector<int32_t> const numKVHeadsPerLayer = {4, 2}; // heterogeneous; group maxKVHeads = 4
-    int32_t const maxKVHeads = 4;
-    int32_t const activeBatchSize = 1;
-    int32_t const maxDepth = 4;
-
-    // Single batch with pastKvCacheLength=4 and accepted indices [0, 3, 5] (length=3).
-    // Kernel writes to positions {pastKv+i for i in 1..acceptLen-1} reading from
-    // {pastKv+acceptedIdx[i]}; here that's pos 5 ← pos 7 and pos 6 ← pos 9.
-    std::vector<int32_t> inputAcceptedIndices = {0, 3, 5, -1};
-    std::vector<int32_t> inputAcceptLengths = {3};
-    std::vector<int32_t> inputKvCacheLengths = {4};
-
-    // Initialise each layer's cache with a per-(layer, kv, head, pos) pattern so we can verify
-    // both source-position selection and per-layer addressing. Encoding is bit-packed into
-    // non-overlapping ranges so every combination is unique AND fits inside FP16 (max 65504):
-    //   L<2  → bit 9 (0 or 512)
-    //   kv<2 → bit 8 (0 or 256)
-    //   h<4  → bits 6-7 (0,64,128,192)
-    //   pos<64 → bits 0-5 (0-63)
-    // Max value across the test: 1*512 + 1*256 + 3*64 + 63 = 1023. Well within FP16.
-    auto kvAt = [&](int32_t layer, int32_t kv, int32_t head, int32_t pos) {
-        return static_cast<float>(layer * 512 + kv * 256 + head * 64 + pos);
-    };
-
-    std::vector<rt::Tensor> kvCachePerLayer;
-    kvCachePerLayer.reserve(numLayers);
-    std::vector<KVLayerInfo> hostInfos(numLayers);
-    for (int32_t L = 0; L < numLayers; ++L)
+    for (int32_t const headDim : {128, 512})
     {
-        int32_t const numKVHeads = numKVHeadsPerLayer[L];
-        // Two-pool NHD layout [2, maxBatch, maxSeqLen, numKVHeads, headDim] (K-half then V-half
-        // split outermost, token-major within a slot) — matches the cache manager + the commit kernel.
-        rt::Tensor layerCache({2, maxBatchSize, maxSeqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
-        std::vector<half> hostInit(static_cast<size_t>(maxBatchSize) * 2 * numKVHeads * maxSeqLen * headDim);
-        for (int32_t kv = 0; kv < 2; ++kv)
+        // Two attention layers in the same head-dim group, with different numKVHeads.
+        int32_t const maxBatchSize = 1;
+        int32_t const maxSeqLen = 64;
+        int32_t const numLayers = 2;
+        std::vector<int32_t> const numKVHeadsPerLayer = {4, 2}; // heterogeneous; group maxKVHeads = 4
+        int32_t const maxKVHeads = 4;
+        int32_t const activeBatchSize = 1;
+        int32_t const maxDepth = 4;
+
+        // Single batch with pastKvCacheLength=4 and accepted indices [0, 3, 5] (length=3).
+        // Kernel writes to positions {pastKv+i for i in 1..acceptLen-1} reading from
+        // {pastKv+acceptedIdx[i]}; here that is pos 5 <- pos 7 and pos 6 <- pos 9.
+        std::vector<int32_t> inputAcceptedIndices = {0, 3, 5, -1};
+        std::vector<int32_t> inputAcceptLengths = {3};
+        std::vector<int32_t> inputKvCacheLengths = {4};
+
+        auto kvAt = [&](int32_t layer, int32_t kv, int32_t head, int32_t pos) {
+            return static_cast<float>(layer * 512 + kv * 256 + head * 64 + pos);
+        };
+
+        std::vector<rt::Tensor> kvCachePerLayer;
+        kvCachePerLayer.reserve(numLayers);
+        std::vector<KVLayerInfo> hostInfos(numLayers);
+        for (int32_t L = 0; L < numLayers; ++L)
         {
-            for (int32_t h = 0; h < numKVHeads; ++h)
+            int32_t const numKVHeads = numKVHeadsPerLayer[L];
+            // Two-pool NHD layout [2, maxBatch, maxSeqLen, numKVHeads, headDim].
+            rt::Tensor layerCache(
+                {2, maxBatchSize, maxSeqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+            std::vector<half> hostInit(static_cast<size_t>(maxBatchSize) * 2 * numKVHeads * maxSeqLen * headDim);
+            for (int32_t kv = 0; kv < 2; ++kv)
             {
-                for (int32_t p = 0; p < maxSeqLen; ++p)
+                for (int32_t h = 0; h < numKVHeads; ++h)
                 {
-                    half const v = __float2half(kvAt(L, kv, h, p));
-                    // NHD: V-half = kv*(maxBatch*maxSeqLen*H*D); slot b=0; token p stride = H*D; head h stride = D.
-                    int64_t const base = static_cast<int64_t>(kv) * maxBatchSize * maxSeqLen * numKVHeads * headDim
-                        + (static_cast<int64_t>(p) * numKVHeads + h) * headDim;
-                    for (int32_t d = 0; d < headDim; ++d)
+                    for (int32_t pos = 0; pos < maxSeqLen; ++pos)
                     {
-                        hostInit[base + d] = v;
+                        half const v = __float2half(kvAt(L, kv, h, pos));
+                        int64_t const base = static_cast<int64_t>(kv) * maxBatchSize * maxSeqLen * numKVHeads * headDim
+                            + (static_cast<int64_t>(pos) * numKVHeads + h) * headDim;
+                        for (int32_t d = 0; d < headDim; ++d)
+                        {
+                            hostInit[base + d] = v;
+                        }
                     }
                 }
             }
+            copyHostToDevice<half>(layerCache, hostInit);
+            hostInfos[L] = KVLayerInfo{layerCache.rawPointer(), numKVHeads, maxSeqLen, maxBatchSize};
+            kvCachePerLayer.push_back(std::move(layerCache));
         }
-        copyHostToDevice<half>(layerCache, hostInit);
-        hostInfos[L] = KVLayerInfo{layerCache.rawPointer(), numKVHeads, maxSeqLen, maxBatchSize};
-        kvCachePerLayer.push_back(std::move(layerCache));
-    }
-    rt::Tensor deviceInfos = uploadLayerInfos(hostInfos, stream);
+        rt::Tensor deviceInfos = uploadLayerInfos(hostInfos, stream);
 
-    auto acceptedIndicesDevice = rt::Tensor({activeBatchSize, maxDepth}, rt::DeviceType::kGPU, DataType::kINT32);
-    auto acceptLengthsDevice = rt::Tensor({activeBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
-    auto kvCacheLengthsDevice = rt::Tensor({activeBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
-    copyHostToDevice<int32_t>(acceptedIndicesDevice, inputAcceptedIndices);
-    copyHostToDevice<int32_t>(acceptLengthsDevice, inputAcceptLengths);
-    copyHostToDevice<int32_t>(kvCacheLengthsDevice, inputKvCacheLengths);
+        auto acceptedIndicesDevice = rt::Tensor({activeBatchSize, maxDepth}, rt::DeviceType::kGPU, DataType::kINT32);
+        auto acceptLengthsDevice = rt::Tensor({activeBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+        auto kvCacheLengthsDevice = rt::Tensor({activeBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+        copyHostToDevice<int32_t>(acceptedIndicesDevice, inputAcceptedIndices);
+        copyHostToDevice<int32_t>(acceptLengthsDevice, inputAcceptLengths);
+        copyHostToDevice<int32_t>(kvCacheLengthsDevice, inputKvCacheLengths);
 
-    eagleBaseCommitKVCache(acceptedIndicesDevice, acceptLengthsDevice, kvCacheLengthsDevice,
-        static_cast<KVLayerInfo const*>(deviceInfos.rawPointer()), numLayers, headDim, maxKVHeads, activeBatchSize,
-        maxDepth, DataType::kHALF, stream);
+        eagleBaseCommitKVCache(acceptedIndicesDevice, acceptLengthsDevice, kvCacheLengthsDevice,
+            static_cast<KVLayerInfo const*>(deviceInfos.rawPointer()), numLayers, headDim, maxKVHeads, activeBatchSize,
+            maxDepth, DataType::kHALF, stream);
 
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    // Verify: for each layer / kv / head, position pastKv+i (for i ∈ {1,2}) equals the value
-    // originally at pastKv+acceptedIdx[i]. Position 0 (root) and untouched positions retain
-    // their original values.
-    int32_t const pastKv = inputKvCacheLengths[0];
-    std::vector<int32_t> const acceptedSrc = {0, 3, 5}; // length-3 accept
-    for (int32_t L = 0; L < numLayers; ++L)
-    {
-        int32_t const numKVHeads = numKVHeadsPerLayer[L];
-        auto host = copyDeviceToHost<half>(kvCachePerLayer[L]);
-        for (int32_t kv = 0; kv < 2; ++kv)
+        int32_t const pastKv = inputKvCacheLengths[0];
+        std::vector<int32_t> const acceptedSrc = {0, 3, 5};
+        for (int32_t L = 0; L < numLayers; ++L)
         {
-            for (int32_t h = 0; h < numKVHeads; ++h)
+            int32_t const numKVHeads = numKVHeadsPerLayer[L];
+            auto host = copyDeviceToHost<half>(kvCachePerLayer[L]);
+            for (int32_t kv = 0; kv < 2; ++kv)
             {
-                // NHD: (kv,h) base at token 0 (b=0); token p stride = numKVHeads*headDim.
-                int64_t const headBase = static_cast<int64_t>(kv) * maxBatchSize * maxSeqLen * numKVHeads * headDim
-                    + static_cast<int64_t>(h) * headDim;
-                int64_t const tokenStride = static_cast<int64_t>(numKVHeads) * headDim;
-
-                // Position 0 (root) is untouched.
+                for (int32_t h = 0; h < numKVHeads; ++h)
                 {
-                    float const expected = kvAt(L, kv, h, pastKv);
-                    float const actual = __half2float(host[headBase + pastKv * tokenStride]);
-                    EXPECT_TRUE(isclose(actual, expected, 1e-3f, 1e-3f))
-                        << "L=" << L << " kv=" << kv << " h=" << h << " pos=root: expected " << expected << " got "
-                        << actual;
-                }
+                    int64_t const headBase = static_cast<int64_t>(kv) * maxBatchSize * maxSeqLen * numKVHeads * headDim
+                        + static_cast<int64_t>(h) * headDim;
+                    int64_t const tokenStride = static_cast<int64_t>(numKVHeads) * headDim;
 
-                // Accepted positions i ∈ {1, 2} should have moved from pastKv + acceptedSrc[i].
-                for (int32_t i = 1; i < static_cast<int32_t>(acceptedSrc.size()); ++i)
-                {
-                    int32_t const dstPos = pastKv + i;
-                    int32_t const srcPos = pastKv + acceptedSrc[i];
-                    float const expected = kvAt(L, kv, h, srcPos);
-                    float const actual = __half2float(host[headBase + dstPos * tokenStride]);
-                    EXPECT_TRUE(isclose(actual, expected, 1e-3f, 1e-3f))
-                        << "L=" << L << " kv=" << kv << " h=" << h << " dstPos=" << dstPos << " (src=" << srcPos
-                        << "): expected " << expected << " got " << actual;
+                    {
+                        float const expected = kvAt(L, kv, h, pastKv);
+                        float const actual = __half2float(host[headBase + pastKv * tokenStride]);
+                        EXPECT_TRUE(isclose(actual, expected, 1e-3f, 1e-3f))
+                            << "headDim=" << headDim << " L=" << L << " kv=" << kv << " h=" << h << " root: expected "
+                            << expected << " got " << actual;
+                    }
+
+                    for (int32_t i = 1; i < static_cast<int32_t>(acceptedSrc.size()); ++i)
+                    {
+                        int32_t const dstPos = pastKv + i;
+                        int32_t const srcPos = pastKv + acceptedSrc[i];
+                        float const expected = kvAt(L, kv, h, srcPos);
+                        float const actual = __half2float(host[headBase + dstPos * tokenStride]);
+                        EXPECT_TRUE(isclose(actual, expected, 1e-3f, 1e-3f))
+                            << "headDim=" << headDim << " L=" << L << " kv=" << kv << " h=" << h << " dstPos=" << dstPos
+                            << " srcPos=" << srcPos << ": expected " << expected << " got " << actual;
+                    }
                 }
             }
         }

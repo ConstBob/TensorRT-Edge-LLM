@@ -257,6 +257,12 @@ private:
     bool setupGemma4MTPDraftProfiles(nvinfer1::IOptimizationProfile& contextProfile,
         nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network);
 
+    //! Set up optimization profiles for DSpark draft models.
+    //! DSpark draft consumes proposal embeddings, target-hidden delta, delta-lengths,
+    //! a proposal self-attention page table, and per-layer paged KV cache bindings.
+    bool setupDSparkDraftProfiles(
+        nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
+
     //! Set up optimization profiles for Gemma4 PLE tensor inputs.
     //! Gemma4 E-model engines receive one ple_token_embeds_* tensor per layer.
     //! @param contextProfile Optimization profile for context processing
@@ -318,7 +324,7 @@ private:
 
     //! Set up optimization profiles for MTP intermediate recurrent state output tensors.
     //! These are per-step checkpoints of GDN recurrent states during tree verification.
-    //! Only needed for hybrid MTP/DFlash base verification engines.
+    //! Only needed for hybrid MTP/DFlash/DSpark base verification engines.
     //! @param contextProfile Optimization profile for context processing
     //! @param generationProfile Optimization profile for generation processing
     //! @return true if setup was successful, false otherwise
@@ -327,7 +333,7 @@ private:
 
     //! Set up optimization profiles for MTP intermediate conv state output tensors.
     //! These are per-step checkpoints of conv1d states during tree verification.
-    //! Only needed for hybrid MTP/DFlash base verification engines.
+    //! Only needed for hybrid MTP/DFlash/DSpark base verification engines.
     //! @param contextProfile Optimization profile for context processing
     //! @param generationProfile Optimization profile for generation processing
     //! @return true if setup was successful, false otherwise
@@ -358,6 +364,10 @@ private:
     //! Copies d2t.safetensors file for Eagle3 draft models.
     //! @return true if copying was successful, false otherwise
     bool copyEagleFiles();
+
+    //! Copy DSpark Markov/confidence head sidecars to the engine directory.
+    //! @return true if copying was successful or this is not a DSpark draft.
+    bool copyDSparkFiles();
 
     //! Copy vocabulary mapping files to the engine directory.
     //! Copies vocab_map.safetensors file if reduced vocabulary is used.

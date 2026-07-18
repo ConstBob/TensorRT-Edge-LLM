@@ -38,7 +38,8 @@ bool needsBaseVerifyIntermediateStates(DeploymentConfig const& bundle)
     switch (bundle.base.specDecodeType)
     {
     case SpecDecodeMode::kMTP:
-    case SpecDecodeMode::kDFlash: return true;
+    case SpecDecodeMode::kDFlash:
+    case SpecDecodeMode::kDSpark: return true;
     case SpecDecodeMode::kGemma4MTP:
     case SpecDecodeMode::kEAGLE:
     case SpecDecodeMode::kNONE: return false;

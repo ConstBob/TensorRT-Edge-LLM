@@ -33,6 +33,7 @@
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace trt_edgellm
@@ -129,8 +130,12 @@ SpecDecodeMode parseSpecDecodeMode(Json const& configJson)
     {
         return SpecDecodeMode::kGemma4MTP;
     }
+    if (specDecodeType == "dspark")
+    {
+        return SpecDecodeMode::kDSpark;
+    }
     throw std::runtime_error("parseEngineConfig: invalid spec_decode_type '" + specDecodeType
-        + "'. Allowed values: none, mtp, eagle3, dflash, gemma4_mtp.");
+        + "'. Allowed values: none, mtp, eagle3, dflash, dspark, gemma4_mtp.");
 }
 
 std::string parseEngineRole(Json const& configJson)
@@ -144,14 +149,27 @@ std::string parseEngineRole(Json const& configJson)
         "parseEngineConfig: invalid engine_role '" + engineRole + "'. Allowed values: llm, base, draft.");
 }
 
-void validateDFlashTargetLayerIds(
-    std::vector<int32_t> const& targetLayerIds, int32_t numDecoderLayers, char const* layerCountOwner)
+void validateSpecTargetLayerIds(std::vector<int32_t> const& targetLayerIds, int32_t numDecoderLayers,
+    char const* modeName, char const* layerCountOwner)
 {
     for (int32_t layerId : targetLayerIds)
     {
         ELLM_CHECK(layerId >= 0 && layerId < numDecoderLayers,
-            "parseEngineConfig: DFlash target layer id " + std::to_string(layerId) + " is outside [0, "
-                + layerCountOwner + ".num_hidden_layers).");
+            "parseEngineConfig: " + std::string(modeName) + " target layer id " + std::to_string(layerId)
+                + " is outside [0, " + layerCountOwner + ".num_hidden_layers).");
+    }
+}
+
+void parseSpecTargetLayerIds(Json const& modeConfig, char const* modeConfigName, LLMEngineConfig& cfg)
+{
+    if (modeConfig.contains("target_layer_ids"))
+    {
+        ELLM_CHECK(modeConfig["target_layer_ids"].is_array(),
+            "parseEngineConfig: " + std::string(modeConfigName) + ".target_layer_ids must be an array");
+        for (auto const& id : modeConfig["target_layer_ids"])
+        {
+            cfg.specTargetLayerIds.push_back(id.get<int32_t>());
+        }
     }
 }
 
@@ -166,36 +184,21 @@ void parseDFlashFields(
     Json const empty = Json::object();
     Json const& dflashConfig = configJson.contains("dflash_config") ? configJson["dflash_config"] : empty;
 
-    cfg.dflashBlockSize = dflashConfig.value("block_size", configJson.value("block_size", 16));
-    cfg.dflashMaskTokenId = dflashConfig.value("mask_token_id", configJson.value("dflash_mask_token_id", 248070));
-    ELLM_CHECK(cfg.dflashBlockSize > 0,
-        "parseEngineConfig: invalid DFlash block_size: " + std::to_string(cfg.dflashBlockSize) + " (must be positive)");
-    ELLM_CHECK(cfg.dflashMaskTokenId >= 0,
-        "parseEngineConfig: invalid DFlash mask_token_id: " + std::to_string(cfg.dflashMaskTokenId)
+    cfg.specDraftBlockSize = dflashConfig.value("block_size", 16);
+    cfg.specDraftMaskTokenId = dflashConfig.value("mask_token_id", 248070);
+    ELLM_CHECK(cfg.specDraftBlockSize > 0,
+        "parseEngineConfig: invalid DFlash block_size: " + std::to_string(cfg.specDraftBlockSize)
+            + " (must be positive)");
+    ELLM_CHECK(cfg.specDraftMaskTokenId >= 0,
+        "parseEngineConfig: invalid DFlash mask_token_id: " + std::to_string(cfg.specDraftMaskTokenId)
             + " (must be non-negative)");
 
-    if (dflashConfig.contains("target_layer_ids"))
-    {
-        ELLM_CHECK(dflashConfig["target_layer_ids"].is_array(),
-            "parseEngineConfig: dflash_config.target_layer_ids must be an array");
-        for (auto const& id : dflashConfig["target_layer_ids"])
-        {
-            cfg.dflashTargetLayerIds.push_back(id.get<int32_t>());
-        }
-    }
-    else if (configJson.contains("dflash_target_layer_ids"))
-    {
-        ELLM_CHECK(configJson["dflash_target_layer_ids"].is_array(),
-            "parseEngineConfig: dflash_target_layer_ids must be an array");
-        for (auto const& id : configJson["dflash_target_layer_ids"])
-        {
-            cfg.dflashTargetLayerIds.push_back(id.get<int32_t>());
-        }
-    }
-
+    parseSpecTargetLayerIds(dflashConfig, "dflash_config", cfg);
+    ELLM_CHECK(
+        !cfg.specTargetLayerIds.empty(), "parseEngineConfig: DFlash requires non-empty dflash_config.target_layer_ids");
     if (targetLayerValidationUpperBound.has_value())
     {
-        validateDFlashTargetLayerIds(cfg.dflashTargetLayerIds, *targetLayerValidationUpperBound, "base");
+        validateSpecTargetLayerIds(cfg.specTargetLayerIds, *targetLayerValidationUpperBound, "DFlash", "base");
     }
 }
 
@@ -239,6 +242,46 @@ void parseGemma4MTPFields(Json const& configJson, LLMEngineConfig& cfg)
     }
 }
 
+void parseDSparkFields(
+    Json const& configJson, LLMEngineConfig& cfg, std::optional<int32_t> targetLayerValidationUpperBound = std::nullopt)
+{
+    if (cfg.specDecodeType != SpecDecodeMode::kDSpark)
+    {
+        return;
+    }
+
+    Json const empty = Json::object();
+    Json const& dsparkConfig = configJson.contains("dspark_config") ? configJson["dspark_config"] : empty;
+
+    cfg.specDraftBlockSize = dsparkConfig.value("block_size", 7);
+    cfg.specDraftMaskTokenId = dsparkConfig.value("mask_token_id", 151669);
+    cfg.dsparkEnableConfidenceHead = dsparkConfig.value("enable_confidence_head", false);
+    cfg.dsparkConfidenceHeadWithMarkov = dsparkConfig.value("confidence_head_with_markov", false);
+    cfg.dsparkMarkovHeadType = dsparkConfig.value("markov_head_type", std::string{});
+    cfg.dsparkMarkovRank = dsparkConfig.value("markov_rank", 0);
+    cfg.dsparkHeadsFile = dsparkConfig.value("heads_file", std::string(binding_names::kDSparkHeadsFileName));
+    cfg.dsparkHeadsInfoFile
+        = dsparkConfig.value("heads_info_file", std::string(binding_names::kDSparkHeadsInfoFileName));
+
+    ELLM_CHECK(cfg.specDraftBlockSize > 0,
+        "parseEngineConfig: invalid DSpark block_size: " + std::to_string(cfg.specDraftBlockSize)
+            + " (must be positive)");
+    ELLM_CHECK(cfg.specDraftMaskTokenId >= 0,
+        "parseEngineConfig: invalid DSpark mask_token_id: " + std::to_string(cfg.specDraftMaskTokenId)
+            + " (must be non-negative)");
+    ELLM_CHECK(cfg.dsparkMarkovRank >= 0,
+        "parseEngineConfig: invalid DSpark markov_rank: " + std::to_string(cfg.dsparkMarkovRank)
+            + " (must be non-negative)");
+
+    parseSpecTargetLayerIds(dsparkConfig, "dspark_config", cfg);
+    ELLM_CHECK(
+        !cfg.specTargetLayerIds.empty(), "parseEngineConfig: DSpark requires non-empty dspark_config.target_layer_ids");
+    if (targetLayerValidationUpperBound.has_value())
+    {
+        validateSpecTargetLayerIds(cfg.specTargetLayerIds, *targetLayerValidationUpperBound, "DSpark", "base");
+    }
+}
+
 bool isDFlashDraftConfig(LLMEngineConfig const& config)
 {
     return config.specDecodeType == SpecDecodeMode::kDFlash && !config.isSpecDecodeBase;
@@ -247,6 +290,11 @@ bool isDFlashDraftConfig(LLMEngineConfig const& config)
 bool isGemma4MTPDraftConfig(LLMEngineConfig const& config)
 {
     return config.specDecodeType == SpecDecodeMode::kGemma4MTP && !config.isSpecDecodeBase;
+}
+
+bool isDSparkDraftConfig(LLMEngineConfig const& config)
+{
+    return config.specDecodeType == SpecDecodeMode::kDSpark && !config.isSpecDecodeBase;
 }
 
 //! Helper: parse explicit sliding/full RoPE config blocks when present.
@@ -489,7 +537,8 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     if (cfg.isSpecDecodeBase)
     {
         ELLM_CHECK(cfg.specDecodeType != SpecDecodeMode::kNONE,
-            "parseEngineConfig: engine_role=base requires spec_decode_type to be mtp, eagle3, dflash, or gemma4_mtp.");
+            "parseEngineConfig: engine_role=base requires spec_decode_type to be mtp, eagle3, dflash, dspark, or "
+            "gemma4_mtp.");
     }
     else
     {
@@ -527,6 +576,7 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     cfg.convDim = configJson.value("conv_dim", 0);
     cfg.convKernel = configJson.value("conv_kernel", 0);
     parseDFlashFields(configJson, cfg, cfg.numDecoderLayers);
+    parseDSparkFields(configJson, cfg, cfg.numDecoderLayers);
 
     auto const& bc = configJson["builder_config"];
     cfg.maxSupportedLoraRank = bc.value("max_lora_rank", 0);
@@ -653,7 +703,7 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath)
     std::string const engineRole = parseEngineRole(configJson);
     ELLM_CHECK(engineRole == "draft", "parseDraftEngineConfig: draft config must set engine_role=draft.");
     ELLM_CHECK(cfg.specDecodeType != SpecDecodeMode::kNONE,
-        "parseDraftEngineConfig: engine_role=draft requires spec_decode_type to be mtp, eagle3, dflash, or "
+        "parseDraftEngineConfig: engine_role=draft requires spec_decode_type to be mtp, eagle3, dflash, dspark, or "
         "gemma4_mtp.");
 
     // Shared core fields (layers, kv heads, head_dim, hidden_size, kv_cache_dtype,
@@ -672,6 +722,7 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath)
     cfg.reducedVocabSize = configJson.value(binding_names::kReducedVocabSizeKey, 0);
     cfg.outputVocabSize = (cfg.reducedVocabSize > 0) ? cfg.reducedVocabSize : cfg.vocabSize;
     parseDFlashFields(configJson, cfg);
+    parseDSparkFields(configJson, cfg);
 
     // Draft engines do not own speculative base verification bindings.
     cfg.isSpecDecodeBase = false;
@@ -759,10 +810,15 @@ std::string formatEngineConfig(LLMEngineConfig const& cfg)
     {
         ss << " maxDraftTreeSize=" << cfg.maxDraftTreeSize;
     }
-    if (cfg.specDecodeType == SpecDecodeMode::kDFlash)
+    if (cfg.specDecodeType == SpecDecodeMode::kDFlash || cfg.specDecodeType == SpecDecodeMode::kDSpark)
     {
-        ss << " dflashBlockSize=" << cfg.dflashBlockSize << " dflashMaskTokenId=" << cfg.dflashMaskTokenId
-           << " dflashTargetLayerIds=" << cfg.dflashTargetLayerIds.size();
+        ss << " specDraftBlockSize=" << cfg.specDraftBlockSize << " specDraftMaskTokenId=" << cfg.specDraftMaskTokenId
+           << " specTargetLayerIds=" << cfg.specTargetLayerIds.size();
+    }
+    if (cfg.specDecodeType == SpecDecodeMode::kDSpark)
+    {
+        ss << " dsparkMarkovHeadType=" << cfg.dsparkMarkovHeadType << " dsparkMarkovRank=" << cfg.dsparkMarkovRank
+           << " dsparkConfidence=" << cfg.dsparkEnableConfidenceHead;
     }
     if (!cfg.eosTokenIds.empty())
     {
@@ -1019,6 +1075,52 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
                             + std::to_string(kvConfig.numKVHeads) + "," + std::to_string(kvConfig.headDim) + "].");
                 }
             }
+        }
+
+        return;
+    }
+
+    if (isDSparkDraftConfig(config))
+    {
+        // DSpark cached draft engines reuse the DFlash cached-draft target-hidden
+        // and delta-length binding names, plus a DSpark-specific hidden-state output.
+        LOG_INFO("DSpark draft engine (%s): validating cached-path bindings.", engineLabel);
+
+        static char const* const kRequiredBindings[] = {
+            binding_names::kInputsEmbeds,
+            binding_names::kDFlashTargetHiddenConcat,
+            binding_names::kLogits,
+            binding_names::kDSparkHiddenStates,
+            binding_names::kContextLengths,
+            binding_names::kKVCacheStartIndex,
+            binding_names::kDFlashDeltaLengths,
+            binding_names::kRopeCosSin,
+            binding_names::kAttentionMask,
+            binding_names::kAttentionPosId,
+        };
+        for (auto const* name : kRequiredBindings)
+        {
+            ELLM_CHECK(executor.hasIOTensor(name),
+                std::string("DSpark cached draft engine (") + engineLabel + ") is missing required binding '" + name
+                    + "'. Re-export and rebuild the DSpark draft engine.");
+        }
+
+        if (config.numAttentionLayers > 0)
+        {
+            std::string const kvPastName = binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/true);
+            std::string const kvPresentName = binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/false);
+            ELLM_CHECK(executor.hasIOTensor(kvPastName.c_str()),
+                std::string("DSpark cached draft engine (") + engineLabel + ") missing KV cache binding '" + kvPastName
+                    + "'. Re-export and rebuild.");
+            ELLM_CHECK(executor.hasIOTensor(kvPresentName.c_str()),
+                std::string("DSpark cached draft engine (") + engineLabel + ") missing KV cache binding '"
+                    + kvPresentName + "'.");
+
+            auto const engineDtype = executor.getBindingDataType(kvPastName.c_str());
+            ELLM_CHECK(engineDtype == config.kvCacheDtype,
+                std::string("KV cache dtype mismatch (") + engineLabel + "): config says "
+                    + getDataTypeString(config.kvCacheDtype) + ", engine reports " + getDataTypeString(engineDtype)
+                    + " for binding '" + kvPastName + "'.");
         }
 
         return;
