@@ -628,8 +628,8 @@ BASE = dict(num_q_heads=8,
 # head 512) and the decode XQA path to support a config. Supported space:
 #   head 64/128 -> GQA ratio 1..8 (head 128 also supports ratio 16, Nemotron-H);
 #   head 256    -> GQA ratio 2/4/6/8 only (XQA constraint; Qwen3.5 family);
-#   head 512    -> GQA ratio 4/8 only (FFPA prefill + XQA-512 decode,
-#                  Gemma4 E4B/E2B global attention layers).
+#   head 512    -> GQA ratio 4/8/16 only (FFPA prefill + XQA-512 decode,
+#                  Gemma4 E4B/E2B/Gemma4 12B global attention layers).
 # head 32 is excluded from this sweep: the prefill FMHA has no head-32 kernel,
 # so the plugin runs in the degraded XQA-only mode (decode works, covered by
 # test_decode_head32 below; prefill has no kernel and enqueue fails).
@@ -655,6 +655,7 @@ ATTN_CONFIGS = [
     (256, 16, 8),
     (512, 8, 2),
     (512, 8, 1),
+    (512, 16, 1),
 ]
 
 # Prefill side of the sweep: head 512 is excluded (FFPA dense-causal prefill
@@ -695,14 +696,16 @@ def test_gqa_prefill(head_size, num_q_heads, num_kv_heads):
 # --------------------------------------------------------------------------- #
 # head 512 prefill (FFPA path). FMHA has no head-512 kernels, so prefill runs
 # the FFPA d512 causal kernel (Ampere instruction floor, all SMs). kv1/kv2 are
-# the Gemma4 E2B / E4B global-attention-layer configs. Round 2 is a chunked
+# the Gemma4 E2B / E4B / 12B global-attention-layer configs. Round 2 is a chunked
 # continuation: FFPA reads the cache prefix back and per-batch cu_kv_seqlens
 # drive the bottom-right causal offset.
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("num_kv_heads", [1, 2], ids=lambda k: f"kv{k}")
-def test_prefill_head512(num_kv_heads):
+@pytest.mark.parametrize("num_q_heads,num_kv_heads", [(8, 1), (8, 2), (16, 1)],
+                         ids=["q8_kv1", "q8_kv2", "q16_kv1"])
+def test_prefill_head512(num_q_heads, num_kv_heads):
     cfg = dict(BASE)
     cfg["head_size"] = 512
+    cfg["num_q_heads"] = num_q_heads
     cfg["num_kv_heads"] = num_kv_heads
     p = AttentionParams(batch_size=2, seq_len=8, is_prefill=True, **cfg)
     _run_rounds(p, num_rounds=2, atol=1e-2, rtol=1e-2)

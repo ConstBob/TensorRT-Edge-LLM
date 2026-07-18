@@ -928,9 +928,6 @@ class Gemma4Transformer(nn.Module):
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
-        if config.use_dual_rope and config.eagle_base:
-            raise ValueError(
-                "Gemma4 dual RoPE is incompatible with EAGLE base mode.")
         self.hidden_size_per_layer_input = int(
             config.hidden_size_per_layer_input)
         self.vocab_size_per_layer_input = int(
