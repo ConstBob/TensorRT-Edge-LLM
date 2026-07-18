@@ -352,42 +352,47 @@ void launchDFlashPrepareBaseVerifyInputs(int32_t const* baseKVCacheLengths, int3
 
 __global__ void dflashBuildLinearVerifyInputsKernel(int32_t const* __restrict__ lastAcceptedTokens,
     int32_t const* __restrict__ draftTokenIds, int32_t* __restrict__ verifyTokenIds,
-    int8_t* __restrict__ verifyTreeMask, int32_t blockSize, int32_t tokenElements, int32_t maskElements)
+    int8_t* __restrict__ verifyTreeMask, int32_t proposalLen, int32_t draftTokenStride, int32_t verifySize,
+    int32_t tokenElements, int32_t maskElements)
 {
     int32_t const idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < tokenElements)
     {
-        int32_t const batchIdx = idx / blockSize;
-        int32_t const posIdx = idx % blockSize;
-        verifyTokenIds[idx] = posIdx == 0 ? lastAcceptedTokens[batchIdx] : draftTokenIds[idx];
+        int32_t const batchIdx = idx / verifySize;
+        int32_t const posIdx = idx % verifySize;
+        verifyTokenIds[idx]
+            = posIdx == 0 ? lastAcceptedTokens[batchIdx] : draftTokenIds[batchIdx * draftTokenStride + (posIdx - 1)];
     }
 
     // Token ids and mask entries are independent output buffers, so one flat
     // launch can populate both ranges without cross-thread ordering.
     if (idx < maskElements)
     {
-        int32_t const localIdx = idx % (blockSize * blockSize);
-        int32_t const rowIdx = localIdx / blockSize;
-        int32_t const colIdx = localIdx % blockSize;
+        int32_t const localIdx = idx % (verifySize * verifySize);
+        int32_t const rowIdx = localIdx / verifySize;
+        int32_t const colIdx = localIdx % verifySize;
         verifyTreeMask[idx] = colIdx <= rowIdx ? int8_t{1} : int8_t{0};
     }
 }
 
 void launchDFlashBuildLinearVerifyInputs(int32_t const* lastAcceptedTokens, int32_t const* draftTokenIds,
-    int32_t* verifyTokenIds, int8_t* verifyTreeMask, int32_t batchSize, int32_t blockSize, cudaStream_t stream)
+    int32_t* verifyTokenIds, int8_t* verifyTreeMask, int32_t batchSize, int32_t proposalLen, int32_t draftTokenStride,
+    int32_t verifySize, cudaStream_t stream)
 {
-    if (batchSize == 0 || blockSize == 0)
+    if (batchSize == 0 || proposalLen == 0 || verifySize == 0)
     {
         return;
     }
 
-    int32_t const tokenElements = batchSize * blockSize;
-    int32_t const maskElements = batchSize * blockSize * blockSize;
+    assert(verifySize == proposalLen + 1 && "DFlash linear verify expects [anchor] + proposal tokens");
+    assert(draftTokenStride >= proposalLen && "DFlash draft token stride must cover proposalLen tokens");
+    int32_t const tokenElements = batchSize * verifySize;
+    int32_t const maskElements = batchSize * verifySize * verifySize;
     constexpr int32_t kThreadsPerBlock{256};
     int32_t const blocks = (std::max(tokenElements, maskElements) + kThreadsPerBlock - 1) / kThreadsPerBlock;
 
-    dflashBuildLinearVerifyInputsKernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
-        lastAcceptedTokens, draftTokenIds, verifyTokenIds, verifyTreeMask, blockSize, tokenElements, maskElements);
+    dflashBuildLinearVerifyInputsKernel<<<blocks, kThreadsPerBlock, 0, stream>>>(lastAcceptedTokens, draftTokenIds,
+        verifyTokenIds, verifyTreeMask, proposalLen, draftTokenStride, verifySize, tokenElements, maskElements);
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -15,18 +15,20 @@
  * limitations under the License.
  */
 
-// checkDFlashPageTableIdentity: DFlash's target-KV update stays contiguous (identity-only, per
-// DFlash opts out of KV-cache reuse). This guard makes that assumption explicit
-// and checkable: it must accept a slot whose K row is the static identity range and reject any
-// deviation (a remapped/scrambled page, or a short row with an unallocated tail).
-
+#include "common/cudaUtils.h"
 #include "kernels/speculative/dflashRuntimeKernels.h"
 #include "runtime/state/kvPageTable.h"
+#include "testUtils.h"
+
+#include <cuda_runtime.h>
 #include <gtest/gtest.h>
+
+#include <cstdint>
 #include <stdexcept>
 #include <vector>
 
 using namespace trt_edgellm;
+using namespace nvinfer1;
 
 TEST(DFlashRuntimeKernels, CheckPageTableIdentityAcceptsIdentityRows)
 {
@@ -55,20 +57,14 @@ TEST(DFlashRuntimeKernels, CheckPageTableIdentityRejectsScrambledRow)
 TEST(DFlashRuntimeKernels, CheckPageTableIdentityRejectsUnallocatedTail)
 {
     int32_t const maxPagesPerSeq = 4;
-    // Slot 0's identity range is [0, 4); a short row (unallocated tail) is not identity either.
+    // Slot 0's identity range is [0, 4); a short row with an unallocated tail is not identity either.
     std::vector<int32_t> const shortRow = {0, 1, -1, -1};
     EXPECT_THROW(kernel::checkDFlashPageTableIdentity(shortRow.data(), /*slot=*/0, maxPagesPerSeq), std::runtime_error);
 }
 
-// checkDFlashRopeCapacity: the KV pool's per-slot capacity (`cap`) is PADDED up to a multiple of
-// kTOKENS_PER_PAGE, while the RoPE cache is sized to the real (unpadded) configured max sequence
-// length. Whenever that configured length is not itself page-aligned, cosSinSeqLen < cap is the
-// NORMAL case, not an error — this is the exact class of bug (padded vs. unpadded capacity) that
-// previously caused a spurious rejection on every enqueue() call for a non-128-aligned config.
-
 TEST(DFlashRuntimeKernels, CheckRopeCapacityAcceptsNonPageAlignedCapacity)
 {
-    // maxKVCacheCapacity=4000 (not a multiple of 128) -> capPadded=4096. This must NOT throw.
+    // maxKVCacheCapacity=4000 (not a multiple of 128) -> capPadded=4096. This must not throw.
     EXPECT_NO_THROW(kernel::checkDFlashRopeCapacity(/*cosSinSeqLen=*/4000, /*kvCapacity=*/4096));
 }
 
@@ -79,7 +75,44 @@ TEST(DFlashRuntimeKernels, CheckRopeCapacityAcceptsExactlyPageAlignedCapacity)
 
 TEST(DFlashRuntimeKernels, CheckRopeCapacityRejectsSeqLenExceedingCap)
 {
-    // A rope cache sized past the KV pool's own padded capacity indicates a genuine mismatch
-    // (e.g. bound to the wrong tensor / wrong model's config).
+    // A rope cache sized past the KV pool's padded capacity indicates a genuine mismatch.
     EXPECT_THROW(kernel::checkDFlashRopeCapacity(/*cosSinSeqLen=*/5000, /*kvCapacity=*/4096), std::runtime_error);
+}
+
+TEST(DFlashRuntimeKernels, BuildLinearVerifyInputsUsesDraftStrideForBatchRows)
+{
+    cudaStream_t stream = nullptr;
+    constexpr int32_t batchSize = 2;
+    constexpr int32_t dflashBlockSize = 4;
+    constexpr int32_t proposalLen = dflashBlockSize - 1;
+    constexpr int32_t verifySize = proposalLen + 1;
+
+    auto lastAcceptedTokens = rt::Tensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto draftTokenIds = rt::Tensor({batchSize, dflashBlockSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto verifyTokenIds = rt::Tensor({batchSize, verifySize}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto verifyTreeMask = rt::Tensor({batchSize, verifySize, verifySize}, rt::DeviceType::kGPU, DataType::kINT8);
+
+    copyHostToDevice<int32_t>(lastAcceptedTokens, {10, 20});
+    copyHostToDevice<int32_t>(draftTokenIds, {101, 102, 103, 999, 201, 202, 203, 999});
+
+    kernel::launchDFlashBuildLinearVerifyInputs(lastAcceptedTokens.dataPointer<int32_t>(),
+        draftTokenIds.dataPointer<int32_t>(), verifyTokenIds.dataPointer<int32_t>(),
+        verifyTreeMask.dataPointer<int8_t>(), batchSize, proposalLen, dflashBlockSize, verifySize, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    EXPECT_EQ(copyDeviceToHost<int32_t>(verifyTokenIds), (std::vector<int32_t>{10, 101, 102, 103, 20, 201, 202, 203}));
+
+    std::vector<int8_t> expectedMask;
+    expectedMask.reserve(static_cast<size_t>(batchSize) * verifySize * verifySize);
+    for (int32_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+    {
+        for (int32_t rowIdx = 0; rowIdx < verifySize; ++rowIdx)
+        {
+            for (int32_t colIdx = 0; colIdx < verifySize; ++colIdx)
+            {
+                expectedMask.push_back(colIdx <= rowIdx ? int8_t{1} : int8_t{0});
+            }
+        }
+    }
+    EXPECT_EQ(copyDeviceToHost<int8_t>(verifyTreeMask), expectedMask);
 }

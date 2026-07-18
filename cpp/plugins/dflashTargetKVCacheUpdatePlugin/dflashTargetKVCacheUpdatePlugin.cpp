@@ -243,8 +243,8 @@ size_t DFlashTargetKVCacheUpdatePlugin::getWorkspaceSize(DynamicPluginTensorDesc
 int32_t DFlashTargetKVCacheUpdatePlugin::getAliasedInput(int32_t outputIndex) noexcept
 {
     // present_key_value (output 0) aliases past_key_value (input 2). DFlash
-    // draft depends on this in-engine target KV update before subsequent
-    // attention layers read the same KV cache.
+    // and DSpark draft engines depend on this in-engine target KV update before
+    // subsequent attention layers read the same KV cache.
     if (outputIndex == kOUT_PRESENT_KV)
     {
         return kIN_PAST_KV;

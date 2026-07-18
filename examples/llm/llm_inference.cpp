@@ -73,7 +73,11 @@ enum LLMInferenceOptionId : int
     OUTPUT_AUDIO_DIR = 919,
     ENABLE_THINKER_TALKER_STREAMING = 920,
     DFLASH_BLOCK_SIZE = 921,
-    NUM_LOGPROBS = 922
+    NUM_LOGPROBS = 922,
+    DSPARK_SCHEDULER = 923,
+    DSPARK_CONFIDENCE_THRESHOLD = 924,
+    DSPARK_MIN_PROPOSAL_LEN = 925,
+    DSPARK_MAX_PROPOSAL_LEN = 926
 };
 
 // Struct to hold speculative decoding arguments (used by both EAGLE and MTP)
@@ -90,11 +94,16 @@ struct SpecDecodeArgs
     // Each step extends the current draft proposal.
     int32_t draftStep{6};
 
-    // Number of proposal tokens to select for base model verification.
+    // Number of tokens in the base verification input.
     int32_t verifySize{60};
 
     // DFlash-only draft horizon. 0 means infer from the engine config.
     int32_t dflashBlockSize{0};
+
+    rt::DSparkSchedulerMode dsparkSchedulerMode{rt::DSparkSchedulerMode::kOff};
+    float dsparkConfidenceThreshold{0.0F};
+    int32_t dsparkMinProposalLen{1};
+    int32_t dsparkMaxProposalLen{0};
 };
 
 struct LLMInferenceArgs
@@ -146,7 +155,10 @@ void printUsage(char const* programName)
                  "[--dumpProfile] [--profileOutputFile=<path to profile output file>] [--warmup=<number>] [--debug] "
                  "[--dumpOutput] [--batchSize=<number>] [--maxGenerateLength=<number>] [--specDecode] "
                  "[--specDraftTopK=<number>] [--specDraftStep=<number>] "
-                 "[--specVerifySize=<number>] [--dflashBlockSize=<number>]"
+                 "[--specVerifySize=<number>] [--dflashBlockSize=<number>] "
+                 "[--dsparkScheduler=off|threshold|sps] "
+                 "[--dsparkConfidenceThreshold=<float>] "
+                 "[--dsparkMinProposalLen=<number>] [--dsparkMaxProposalLen=<number>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --help                    Display this help message" << std::endl;
@@ -171,9 +183,16 @@ void printUsage(char const* programName)
     std::cerr << "                            For DFlash: candidateTopK; 1 is linear, >1 enables branching DDTree"
               << std::endl;
     std::cerr << "  --specDraftStep           Number of drafting steps to perform (default: 6)" << std::endl;
-    std::cerr << "                            DFlash requires this to be 1; use dflashBlockSize for proposal horizon"
+    std::cerr
+        << "                            Each step extends the current draft proposal; DFlash requires this to be 1"
+        << std::endl;
+    std::cerr << "  --specVerifySize          Number of tokens in the base verification input (default: 60)"
               << std::endl;
-    std::cerr << "  --specVerifySize          Number of proposal tokens for base verification (default: 60)"
+    std::cerr << "  --dsparkScheduler         DSpark scheduler mode: off, threshold, or sps (default: off)"
+              << std::endl;
+    std::cerr << "  --dsparkConfidenceThreshold  DSpark threshold scheduler survival threshold in [0,1]" << std::endl;
+    std::cerr << "  --dsparkMinProposalLen    DSpark scheduler minimum proposal length (default: 1)" << std::endl;
+    std::cerr << "  --dsparkMaxProposalLen    DSpark scheduler maximum proposal length (default: full block)"
               << std::endl;
     std::cerr << "  --dflashBlockSize         DFlash proposal block size; 0 means infer from engine config"
               << std::endl;
@@ -214,7 +233,10 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"code2wavEngineDir", required_argument, 0, LLMInferenceOptionId::CODE2WAV_ENGINE_DIR},
         {"outputAudioDir", required_argument, 0, LLMInferenceOptionId::OUTPUT_AUDIO_DIR},
         {"enableThinkerTalkerStreaming", no_argument, 0, LLMInferenceOptionId::ENABLE_THINKER_TALKER_STREAMING},
-        {0, 0, 0, 0}};
+        {"dsparkScheduler", required_argument, 0, LLMInferenceOptionId::DSPARK_SCHEDULER},
+        {"dsparkConfidenceThreshold", required_argument, 0, LLMInferenceOptionId::DSPARK_CONFIDENCE_THRESHOLD},
+        {"dsparkMinProposalLen", required_argument, 0, LLMInferenceOptionId::DSPARK_MIN_PROPOSAL_LEN},
+        {"dsparkMaxProposalLen", required_argument, 0, LLMInferenceOptionId::DSPARK_MAX_PROPOSAL_LEN}, {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", inferenceOptions, nullptr)) != -1)
@@ -344,6 +366,77 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
             }
             break;
         case LLMInferenceOptionId::ENABLE_AUDIO_OUTPUT: args.enableAudioOutput = true; break;
+        case LLMInferenceOptionId::DSPARK_SCHEDULER:
+        {
+            std::string const mode{optarg};
+            if (mode == "off")
+            {
+                args.specDecodeArgs.dsparkSchedulerMode = rt::DSparkSchedulerMode::kOff;
+            }
+            else if (mode == "threshold")
+            {
+                args.specDecodeArgs.dsparkSchedulerMode = rt::DSparkSchedulerMode::kThreshold;
+            }
+            else if (mode == "sps")
+            {
+                args.specDecodeArgs.dsparkSchedulerMode = rt::DSparkSchedulerMode::kSPS;
+            }
+            else
+            {
+                LOG_ERROR("Invalid dsparkScheduler value: %s (expected off, threshold, or sps)", optarg);
+                return false;
+            }
+            break;
+        }
+        case LLMInferenceOptionId::DSPARK_CONFIDENCE_THRESHOLD:
+            try
+            {
+                args.specDecodeArgs.dsparkConfidenceThreshold = std::stof(optarg);
+                if (args.specDecodeArgs.dsparkConfidenceThreshold < 0.0F
+                    || args.specDecodeArgs.dsparkConfidenceThreshold > 1.0F)
+                {
+                    LOG_ERROR("Invalid dsparkConfidenceThreshold value: %s (must be in [0,1])", optarg);
+                    return false;
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Invalid dsparkConfidenceThreshold value: %s", optarg);
+                return false;
+            }
+            break;
+        case LLMInferenceOptionId::DSPARK_MIN_PROPOSAL_LEN:
+            try
+            {
+                args.specDecodeArgs.dsparkMinProposalLen = std::stoi(optarg);
+                if (args.specDecodeArgs.dsparkMinProposalLen <= 0)
+                {
+                    LOG_ERROR("Invalid dsparkMinProposalLen value: %s (must be positive)", optarg);
+                    return false;
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Invalid dsparkMinProposalLen value: %s", optarg);
+                return false;
+            }
+            break;
+        case LLMInferenceOptionId::DSPARK_MAX_PROPOSAL_LEN:
+            try
+            {
+                args.specDecodeArgs.dsparkMaxProposalLen = std::stoi(optarg);
+                if (args.specDecodeArgs.dsparkMaxProposalLen < 0)
+                {
+                    LOG_ERROR("Invalid dsparkMaxProposalLen value: %s (must be non-negative)", optarg);
+                    return false;
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Invalid dsparkMaxProposalLen value: %s", optarg);
+                return false;
+            }
+            break;
         case LLMInferenceOptionId::TALKER_ENGINE_DIR: args.talkerEngineDir = optarg; break;
         case LLMInferenceOptionId::CODE2WAV_ENGINE_DIR: args.code2wavEngineDir = optarg; break;
         case LLMInferenceOptionId::OUTPUT_AUDIO_DIR: args.outputAudioDir = optarg; break;
@@ -419,6 +512,10 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         LOG_INFO("Spec draft step: %d", args.specDecodeArgs.draftStep);
         LOG_INFO("Spec verify size: %d", args.specDecodeArgs.verifySize);
         LOG_INFO("DFlash block size: %d", args.specDecodeArgs.dflashBlockSize);
+        LOG_INFO("DSpark scheduler mode: %d", static_cast<int32_t>(args.specDecodeArgs.dsparkSchedulerMode));
+        LOG_INFO("DSpark confidence threshold: %.4f", args.specDecodeArgs.dsparkConfidenceThreshold);
+        LOG_INFO("DSpark proposal length range: [%d, %d]", args.specDecodeArgs.dsparkMinProposalLen,
+            args.specDecodeArgs.dsparkMaxProposalLen);
     }
 
     if (args.enableAudioOutput)
@@ -568,6 +665,10 @@ int main(int argc, char* argv[])
         draftingConfig.draftingStep = args.specDecodeArgs.draftStep;
         draftingConfig.verifySize = args.specDecodeArgs.verifySize;
         draftingConfig.dflashBlockSize = args.specDecodeArgs.dflashBlockSize;
+        draftingConfig.dsparkSchedulerMode = args.specDecodeArgs.dsparkSchedulerMode;
+        draftingConfig.dsparkConfidenceThreshold = args.specDecodeArgs.dsparkConfidenceThreshold;
+        draftingConfig.dsparkMinProposalLen = args.specDecodeArgs.dsparkMinProposalLen;
+        draftingConfig.dsparkMaxProposalLen = args.specDecodeArgs.dsparkMaxProposalLen;
         try
         {
             runtime = std::make_unique<rt::LLMInferenceRuntime>(

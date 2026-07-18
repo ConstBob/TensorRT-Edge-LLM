@@ -417,7 +417,7 @@ TEST_F(DeploymentConfigTest, MTPRejectsVerifySizeAboveCurrentEagleUtilityKernelL
         std::runtime_error);
 }
 
-TEST_F(DeploymentConfigTest, DFlashHybridVerifySize16ValidatesOk)
+TEST_F(DeploymentConfigTest, DFlashLinearInfersVerifySizeFromBlockSize)
 {
     Json const baseJson = makeHybridDFlashBaseConfig(/*maxVerify=*/16);
     Json const draftJson = makeDFlashDraftConfig(/*maxDraft=*/16);
@@ -427,7 +427,49 @@ TEST_F(DeploymentConfigTest, DFlashHybridVerifySize16ValidatesOk)
     SpecDecodeDraftingConfig drafting{};
     drafting.draftingTopK = 1;
     drafting.draftingStep = 1;
+    drafting.verifySize = 0;
+
+    DeploymentConfig bundle = createDeploymentConfig(
+        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<SpecDecodeDraftingConfig>{drafting});
+
+    EXPECT_EQ(bundle.specDecodeMode(), SpecDecodeMode::kDFlash);
+    ASSERT_TRUE(bundle.specConfig.has_value());
+    EXPECT_EQ(bundle.specConfig->verifySize, 16);
+    EXPECT_EQ(bundle.specConfig->dflashBlockSize, 16);
+}
+
+TEST_F(DeploymentConfigTest, DFlashLinearVerifySizeEqualBlockSizeValidatesOk)
+{
+    Json const baseJson = makeDenseDFlashBaseConfig(/*maxVerify=*/16);
+    Json const draftJson = makeDFlashDraftConfig(/*maxDraft=*/16);
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto const draftPath = writeJsonToTempFile(draftJson, "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 1;
+    drafting.draftingStep = 1;
     drafting.verifySize = 16;
+
+    DeploymentConfig bundle = createDeploymentConfig(
+        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<SpecDecodeDraftingConfig>{drafting});
+
+    EXPECT_EQ(bundle.specDecodeMode(), SpecDecodeMode::kDFlash);
+    ASSERT_TRUE(bundle.specConfig.has_value());
+    EXPECT_EQ(bundle.specConfig->verifySize, 16);
+    EXPECT_EQ(bundle.specConfig->dflashBlockSize, 16);
+}
+
+TEST_F(DeploymentConfigTest, DFlashLinearOverridesCallerVerifySizeToBlockSize)
+{
+    Json const baseJson = makeDenseDFlashBaseConfig(/*maxVerify=*/32);
+    Json const draftJson = makeDFlashDraftConfig(/*maxDraft=*/16);
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto const draftPath = writeJsonToTempFile(draftJson, "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 1;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 17;
 
     DeploymentConfig bundle = createDeploymentConfig(
         basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<SpecDecodeDraftingConfig>{drafting});
@@ -600,7 +642,7 @@ TEST_F(DeploymentConfigTest, DFlashChainInfersBlockSizeFromEngineConfig)
     SpecDecodeDraftingConfig drafting{};
     drafting.draftingTopK = 1;
     drafting.draftingStep = 1;
-    drafting.verifySize = 17;
+    drafting.verifySize = 0;
 
     DeploymentConfig bundle = createDeploymentConfig(
         basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<SpecDecodeDraftingConfig>{drafting});
@@ -609,6 +651,24 @@ TEST_F(DeploymentConfigTest, DFlashChainInfersBlockSizeFromEngineConfig)
     EXPECT_EQ(bundle.specConfig->draftingTopK, 1);
     EXPECT_EQ(bundle.specConfig->verifySize, 16);
     EXPECT_EQ(bundle.specConfig->dflashBlockSize, 16);
+}
+
+TEST_F(DeploymentConfigTest, DFlashLinearBlockSizeOneThrows)
+{
+    Json const baseJson = makeDenseDFlashBaseConfig(/*maxVerify=*/16);
+    Json const draftJson = makeDFlashDraftConfig(/*maxDraft=*/16);
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto const draftPath = writeJsonToTempFile(draftJson, "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 1;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 0;
+    drafting.dflashBlockSize = 1;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
 }
 
 TEST_F(DeploymentConfigTest, DFlashCandidateTopKGreaterThanOneSelectsDDTree)

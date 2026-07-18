@@ -213,6 +213,7 @@ _DEFAULT_LAYOUT: dict[str, str] = {
     "action": "action",
     "mtp_draft": "mtp_draft",
     "dflash_draft": "dflash_draft",
+    "dspark_draft": "dspark_draft",
 }
 
 # Per-model overrides on top of ``_DEFAULT_LAYOUT``.
@@ -808,12 +809,15 @@ def _export_llm(model_dir: str,
                 llm_out_dir: str,
                 model_type: str = "",
                 eagle_base: bool = False,
+                eagle_draft_dir: str = "",
                 fp8_embedding: bool = False,
                 reduced_vocab_dir: str = "",
                 mtp_base: bool = False,
                 dflash_base: bool = False,
                 dflash_tree_base: bool = False,
                 dflash_draft_dir: str = "",
+                dspark_base: bool = False,
+                dspark_draft_dir: str = "",
                 gemma4_mtp_base: bool = False,
                 externalize_weights: "list[str] | None" = None,
                 tp_size: int = 1,
@@ -883,12 +887,15 @@ def _export_llm(model_dir: str,
                 model_dir,
                 device="cpu",
                 eagle_base=eagle_base,
+                eagle_draft_dir=eagle_draft_dir or None,
                 key_remap=key_remap,
                 reduced_vocab_dir=reduced_vocab_dir or None,
                 mtp_base=mtp_base,
                 dflash_base=dflash_base,
                 dflash_tree_base=dflash_tree_base,
                 dflash_draft_dir=dflash_draft_dir or None,
+                dspark_base=dspark_base,
+                dspark_draft_dir=dspark_draft_dir or None,
                 gemma4_mtp_base=gemma4_mtp_base,
                 tp_size=world,
                 tp_rank=rank,
@@ -1086,6 +1093,147 @@ def _export_dflash_draft(model_dir: str,
                 indent=2)
 
     logger.info("[DFlash Draft] Done: %s", output_path)
+
+
+_DSPARK_HEAD_TENSOR_KEYS = {
+    "markov_w1": "markov_head.markov_w1.weight",
+    "markov_w2": "markov_head.markov_w2.weight",
+    "confidence_weight": "confidence_head.proj.weight",
+    "confidence_bias": "confidence_head.proj.bias",
+}
+
+
+def _load_dspark_head_tensors(draft_dir: str, required_keys: set[str]) -> dict:
+    """Load DSpark Markov/confidence sidecar tensors from safetensors shards."""
+    import glob
+
+    from safetensors import safe_open
+
+    shards = sorted(glob.glob(os.path.join(draft_dir, "*.safetensors")))
+    if not shards:
+        raise FileNotFoundError(f"No safetensors files found in {draft_dir}")
+
+    remaining = dict(_DSPARK_HEAD_TENSOR_KEYS)
+    loaded: dict = {}
+    source: dict = {}
+    for shard in shards:
+        with safe_open(shard, framework="pt", device="cpu") as f:
+            keys = set(f.keys())
+            for save_name, ckpt_key in list(remaining.items()):
+                if ckpt_key in keys:
+                    tensor = f.get_tensor(ckpt_key).cpu()
+                    if save_name == "confidence_weight" and tensor.ndim == 2 and tensor.shape[
+                            0] == 1:
+                        tensor = tensor.squeeze(0)
+                    loaded[save_name] = tensor
+                    source[save_name] = {
+                        "checkpoint_key": ckpt_key,
+                        "shard": os.path.basename(shard),
+                        "shape": list(tensor.shape),
+                        "dtype": str(tensor.dtype).replace("torch.", ""),
+                    }
+                    del remaining[save_name]
+
+    missing_required = sorted(required_keys - loaded.keys())
+    if missing_required:
+        details = ", ".join(f"{name}<-{_DSPARK_HEAD_TENSOR_KEYS[name]}"
+                            for name in missing_required)
+        raise KeyError(
+            f"DSpark draft checkpoint is missing required head tensors: {details}"
+        )
+    return loaded, source
+
+
+def _export_dspark_sidecars(dspark_draft_dir: str, draft_out_dir: str) -> None:
+    """Export DSpark Markov and confidence heads as runtime sidecars.
+
+    The draft ONNX engine contains the parallel DSpark backbone only. The
+    sequential Markov head and confidence scheduler are intentionally kept as
+    sidecar tensors so the runtime can execute token-by-token scheduling
+    without inflating the TensorRT graph with dynamic control flow.
+    """
+    from safetensors.torch import save_file
+
+    cfg = _load_config(dspark_draft_dir)
+    dspark_cfg = cfg.get("dspark_config", {}) or {}
+    markov_type = str(
+        dspark_cfg.get("markov_head_type", cfg.get("markov_head_type", "")))
+    enable_confidence = bool(
+        dspark_cfg.get("enable_confidence_head",
+                       cfg.get("enable_confidence_head", False)))
+    confidence_with_markov = bool(
+        dspark_cfg.get("confidence_head_with_markov",
+                       cfg.get("confidence_head_with_markov", False)))
+    required = {"markov_w1", "markov_w2"}
+    if enable_confidence:
+        required.update({"confidence_weight", "confidence_bias"})
+
+    tensors, source = _load_dspark_head_tensors(dspark_draft_dir, required)
+    out_tensors = _to_fp16(tensors)
+    heads_path = os.path.join(draft_out_dir, "dspark_heads.safetensors")
+    save_file(out_tensors, heads_path)
+
+    info = {
+        "format":
+        "tensorrt-edgellm-dspark-heads-v1",
+        "source":
+        dspark_draft_dir,
+        "markov_head_type":
+        markov_type,
+        "markov_rank":
+        int(dspark_cfg.get("markov_rank", cfg.get("markov_rank", 0)) or 0),
+        "enable_confidence_head":
+        enable_confidence,
+        "confidence_head_with_markov":
+        confidence_with_markov,
+        "tensor_keys":
+        sorted(out_tensors.keys()),
+        "source_tensors":
+        source,
+        "notes": [
+            "markov_w2 is saved in checkpoint Linear weight layout [vocab_size, markov_rank].",
+            "confidence_weight is squeezed to [input_dim] when the checkpoint stores [1, input_dim].",
+        ],
+    }
+    info_path = os.path.join(draft_out_dir, "dspark_heads_info.json")
+    with open(info_path, "w") as f:
+        json.dump(info, f, indent=2)
+    logger.info("[DSpark Draft] Wrote head sidecars: %s, %s", heads_path,
+                info_path)
+
+
+def _export_dspark_draft(model_dir: str, draft_out_dir: str,
+                         dspark_draft_dir: str) -> None:
+    """Export the DSpark draft backbone plus Markov/confidence sidecars."""
+    os.makedirs(draft_out_dir, exist_ok=True)
+    output_path = os.path.join(draft_out_dir, "model.onnx")
+
+    logger.info("[DSpark Draft] Loading checkpoint from %s", dspark_draft_dir)
+    try:
+        from ..model import AutoModel
+        model = AutoModel.from_pretrained(model_dir,
+                                          device="cpu",
+                                          dspark_draft=True,
+                                          dspark_draft_dir=dspark_draft_dir)
+    except (OSError, ValueError, RuntimeError, ImportError) as exc:
+        logger.exception("[DSpark Draft] Failed to load checkpoint")
+        raise SystemExit(1) from exc
+
+    logger.info("[DSpark Draft] Exporting backbone ONNX to %s", output_path)
+    try:
+        from ..onnx.export import export_onnx
+        export_onnx(model, output_path, model_dir=dspark_draft_dir)
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.exception("[DSpark Draft] ONNX export failed")
+        raise SystemExit(1) from exc
+
+    try:
+        _export_dspark_sidecars(dspark_draft_dir, draft_out_dir)
+    except (OSError, ValueError, RuntimeError, KeyError) as exc:
+        logger.exception("[DSpark Draft] Sidecar export failed")
+        raise SystemExit(1) from exc
+
+    logger.info("[DSpark Draft] Done: %s", output_path)
 
 
 def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
@@ -2748,6 +2896,14 @@ def main() -> None:
         "Export as EAGLE3 base model (adds tree-attention I/O and hidden_states output).",
     )
     p.add_argument(
+        "--eagle-draft-dir",
+        default="",
+        help=(
+            "Path to the EAGLE3 draft checkpoint directory. Required for "
+            "Gemma4 EAGLE3 base export so target hidden layers match the draft."
+        ),
+    )
+    p.add_argument(
         "--fp8-embedding",
         "--fp8_embedding",
         dest="fp8_embedding",
@@ -2820,6 +2976,22 @@ def main() -> None:
         "--dflash-draft-dir",
         default="",
         help="Path to the DFlash draft checkpoint directory.",
+    )
+    p.add_argument(
+        "--dspark-base",
+        action="store_true",
+        help="Export as DSpark base model (adds target hidden-state output).",
+    )
+    p.add_argument(
+        "--dspark-draft",
+        action="store_true",
+        help=
+        "Export DSpark draft backbone model plus Markov/confidence sidecars.",
+    )
+    p.add_argument(
+        "--dspark-draft-dir",
+        default="",
+        help="Path to the DSpark draft checkpoint directory.",
     )
     p.add_argument(
         "--externalize-weights",
@@ -2900,29 +3072,52 @@ def main() -> None:
 
     if args.eagle_base and args.mtp:
         p.error("--eagle-base and --mtp cannot be enabled together")
+    if args.eagle_draft_dir and not args.eagle_base:
+        p.error("--eagle-draft-dir requires --eagle-base")
+    if args.eagle_base and is_gemma4_target and not args.eagle_draft_dir:
+        p.error("Gemma4 --eagle-base requires --eagle-draft-dir")
     if args.mtp_draft_dir and args.gemma4_mtp_assistant_dir:
         p.error("Use only one MTP draft checkpoint directory option")
     if mtp_draft_dir_arg and args.eagle_base:
         p.error("--mtp-draft-dir cannot be combined with --eagle-base")
-    if mtp_draft_dir_arg and (args.dflash_base or args.dflash_draft):
-        p.error("--mtp-draft-dir cannot be combined with DFlash export")
     if args.dflash_tree_base:
         args.dflash_base = True
+    if mtp_draft_dir_arg and (args.dflash_base or args.dflash_draft
+                              or args.dspark_base or args.dspark_draft):
+        p.error("--mtp-draft-dir cannot be combined with DFlash/DSpark export")
     if args.dflash_base and (args.eagle_base or args.mtp):
         p.error("--dflash-base cannot be combined with --eagle-base or --mtp")
     if args.dflash_draft and (args.eagle_base or args.mtp):
         p.error("--dflash-draft cannot be combined with --eagle-base or --mtp")
     if args.dflash_draft and not args.dflash_draft_dir:
         p.error("--dflash-draft requires --dflash-draft-dir")
+    if args.dspark_base and (args.eagle_base or args.mtp or args.dflash_base
+                             or args.dflash_draft):
+        p.error("--dspark-base cannot be combined with EAGLE/MTP/DFlash modes")
+    if args.dspark_draft and (args.eagle_base or args.mtp or args.dflash_base
+                              or args.dflash_draft):
+        p.error(
+            "--dspark-draft cannot be combined with EAGLE/MTP/DFlash modes")
+    if args.dspark_base and not args.dspark_draft_dir:
+        p.error(
+            "--dspark-base requires --dspark-draft-dir for target layer metadata"
+        )
+    if args.dspark_draft and not args.dspark_draft_dir:
+        p.error("--dspark-draft requires --dspark-draft-dir")
     if args.mtp and args.skip_llm:
         p.error("--mtp requires LLM export; remove --skip-llm")
     if mtp_draft_dir_arg and args.skip_llm:
         p.error("--mtp-draft-dir requires LLM export; remove --skip-llm")
     if args.dflash_base and args.skip_llm:
         p.error("--dflash-base requires LLM export; remove --skip-llm")
+    if args.dspark_base and args.skip_llm:
+        p.error("--dspark-base requires LLM export; remove --skip-llm")
     if args.dflash_draft and args.skip_llm:
         logger.info(
             "--dflash-draft implies --skip-llm (draft export is independent)")
+    if args.dspark_draft and args.skip_llm:
+        logger.info(
+            "--dspark-draft implies --skip-llm (draft export is independent)")
     if mtp_draft_dir_arg and not args.mtp:
         p.error("--mtp-draft-dir requires --mtp")
     if args.mtp and is_gemma4_target and not mtp_draft_dir_arg:
@@ -2946,9 +3141,11 @@ def main() -> None:
     if args.num_decoder_layer is not None:
         if args.num_decoder_layer < 1:
             p.error("--num-decoder-layer must be >= 1")
-        if args.eagle_base or args.mtp or args.dflash_base or args.dflash_draft:
+        if (args.eagle_base or args.mtp or args.dflash_base
+                or args.dflash_draft or args.dspark_base or args.dspark_draft):
             p.error("--num-decoder-layer cannot be combined with "
-                    "--eagle-base / --mtp / --dflash-base / --dflash-draft")
+                    "--eagle-base / --mtp / --dflash-base / --dflash-draft / "
+                    "--dspark-base / --dspark-draft")
 
     _VALID_COMPONENTS = {
         "thinker", "mtp_draft", "talker", "code_predictor", "visual", "audio",
@@ -2991,10 +3188,10 @@ def main() -> None:
             return {}
         return _get_weights()
 
-    # When --dflash-draft is set, only the dflash_draft stage runs.
-    # DFlash draft is a standalone export (like Eagle draft) — no base LLM,
-    # visual, audio, or other components needed.
-    _draft_only = args.dflash_draft
+    # When only a standalone draft flag is set, run just that draft stage.
+    # If a matching base flag is also set, export both base and draft artifacts.
+    _draft_only = ((args.dflash_draft and not args.dflash_base)
+                   or (args.dspark_draft and not args.dspark_base))
 
     def _export_visual_component(out: str) -> None:
         if _is_alpamayo(model_type):
@@ -3028,10 +3225,13 @@ def main() -> None:
                      out,
                      model_type=model_type,
                      eagle_base=args.eagle_base,
+                     eagle_draft_dir=args.eagle_draft_dir,
                      mtp_base=args.mtp and not gemma4_mtp_requested,
                      dflash_base=args.dflash_base,
                      dflash_tree_base=args.dflash_tree_base,
                      dflash_draft_dir=args.dflash_draft_dir,
+                     dspark_base=args.dspark_base,
+                     dspark_draft_dir=args.dspark_draft_dir,
                      gemma4_mtp_base=gemma4_mtp_requested,
                      fp8_embedding=args.fp8_embedding,
                      reduced_vocab_dir=args.reduced_vocab_dir,
@@ -3049,6 +3249,8 @@ def main() -> None:
             out,
             args.dflash_draft_dir,
             draft_reduced_vocab_dir=args.draft_reduced_vocab_dir)),
+        (args.dspark_draft, "dspark_draft", lambda out: _export_dspark_draft(
+            model_dir, out, args.dspark_draft_dir)),
         (_has_llm_component(model_type, "talker") and not args.skip_llm
          and not _draft_only and _allow("talker"), "talker",
          lambda out: _export_talker(model_dir, out, model_type)),
@@ -3094,6 +3296,8 @@ def main() -> None:
                 gemma4_mtp_assistant_dir if gemma4_mtp_assistant_dir else "no")
     logger.info("DFlash base   : %s", "yes" if args.dflash_base else "no")
     logger.info("DFlash draft  : %s", "yes" if args.dflash_draft else "no")
+    logger.info("DSpark base   : %s", "yes" if args.dspark_base else "no")
+    logger.info("DSpark draft  : %s", "yes" if args.dspark_draft else "no")
     logger.info("Reduced vocab : %s",
                 args.reduced_vocab_dir if args.reduced_vocab_dir else "no")
     logger.info(

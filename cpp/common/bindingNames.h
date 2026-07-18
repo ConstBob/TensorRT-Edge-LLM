@@ -80,18 +80,31 @@ inline constexpr char const* kLogits = "logits";
 inline constexpr char const* kOutputHiddenStates = "hidden_states";
 
 /*!
- * @brief DFlash draft model input: concatenated target hidden states.
+ * @brief Cached speculative draft model input: concatenated target hidden states.
  *
  * Shape: [batch_size, context_length, base_output_hidden_dim] (FLOAT16)
  */
 inline constexpr char const* kDFlashTargetHiddenConcat = "dflash_target_hidden_concat";
 
 /*!
- * @brief DFlash draft model input: per-batch delta lengths for multi-batch.
+ * @brief Cached speculative draft model input: per-batch delta lengths for multi-batch.
  *
  * Shape: [batch_size] (INT32)
  */
 inline constexpr char const* kDFlashDeltaLengths = "dflash_delta_lengths";
+
+/*!
+ * @brief DSpark draft model output: final proposal hidden states.
+ *
+ * Shape: [batch_size, proposal_length, hidden_size] (FLOAT16)
+ */
+inline constexpr char const* kDSparkHiddenStates = "dspark_hidden_states";
+
+/*!
+ * @brief DSpark Markov/confidence head sidecar file names.
+ */
+inline constexpr char const* kDSparkHeadsFileName = "dspark_heads.safetensors";
+inline constexpr char const* kDSparkHeadsInfoFileName = "dspark_heads_info.json";
 
 /*!
  * @brief Gemma4 PLE token-identity embedding table sidecar.

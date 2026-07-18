@@ -497,12 +497,14 @@ class Transformer(nn.Module):
         # consumes exactly this tensor.
         self.last_pre_norm_hidden_states = hidden_states
 
-        # DFlash hidden concat: concatenate target-layer hidden states.
+        # Target-hidden concat for DFlash/DSpark-style draft feedback.
         # Stored as an attribute (like last_pre_norm_hidden_states) so that
         # Transformer.forward() keeps its 3-value return signature and
         # downstream callers (TTS talker, Qwen3.5 text, etc.) are unaffected.
-        self.dflash_hidden_concat = (torch.cat(dflash_hidden_list, dim=-1)
+        self.target_hidden_concat = (torch.cat(dflash_hidden_list, dim=-1)
                                      if dflash_hidden_list else None)
+        # Backward-compatible alias used by existing DFlash callers.
+        self.dflash_hidden_concat = self.target_hidden_concat
 
         normed = self.norm(hidden_states)
 
@@ -573,10 +575,11 @@ class CausalLM(nn.Module):
         Builds dummy inputs, I/O name lists, and dynamic shape descriptors
         matching the flat wrapper signature produced by :func:`_make_flat_wrapper`.
 
-        When ``config.eagle_base`` or ``config.dflash_base`` is True, extra inputs
-        (``attention_pos_id``, ``attention_mask``) and an extra output
-        (``hidden_states``) are added. For DFlash base, hidden_states is the
-        concatenated target-layer hidden (shape: [B, S, len(target_layer_ids)*H]).
+        When ``config.eagle_base``, ``config.dflash_base``, or
+        ``config.dspark_base`` is True, extra inputs (``attention_pos_id``,
+        ``attention_mask``) and an extra output (``hidden_states``) are added.
+        For DFlash/DSpark base, hidden_states is the concatenated target-layer
+        hidden (shape: [B, S, len(target_layer_ids)*H]).
 
         When ``config.eagle_base`` is True, extra inputs (``attention_pos_id``,
         ``attention_mask``) and an extra output (``hidden_states``) are added
@@ -586,9 +589,12 @@ class CausalLM(nn.Module):
         Na = config.num_hidden_layers
         Nd = config.num_deepstack_features
         dflash_base = getattr(config, 'dflash_base', False)
-        # DFlash base uses the same export structure as Eagle base (tree-attention
-        # inputs + hidden_states output), so we treat it as eagle_base for the wrapper.
-        eagle_base = config.eagle_base or dflash_base
+        dspark_base = getattr(config, 'dspark_base', False)
+        target_hidden_base = dflash_base or dspark_base
+        # DFlash/DSpark base uses the same export structure as Eagle base
+        # (tree-attention inputs + hidden_states output), so we treat it as
+        # eagle_base for the wrapper.
+        eagle_base = config.eagle_base or target_hidden_base
         device = next(itertools.chain(self.parameters(),
                                       self.buffers())).device
         dtype16 = torch.float16
@@ -744,8 +750,14 @@ class CausalLM(nn.Module):
     ) -> Tuple:
         eagle_base = self.config.eagle_base
         dflash_base = getattr(self.config, 'dflash_base', False)
+        dspark_base = getattr(self.config, 'dspark_base', False)
+        target_hidden_base = dflash_base or dspark_base
         dflash_target_layer_ids = getattr(self.config,
                                           'dflash_target_layer_ids', None)
+        dspark_target_layer_ids = getattr(self.config,
+                                          'dspark_target_layer_ids', None)
+        target_layer_ids = (dspark_target_layer_ids
+                            if dspark_base else dflash_target_layer_ids)
 
         hidden_states, present_key_values, all_hidden_states = self.model(
             inputs_embeds,
@@ -757,11 +769,11 @@ class CausalLM(nn.Module):
             deepstack_embeds,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
-            output_hidden_states=eagle_base and not dflash_base,
-            dflash_target_layer_ids=dflash_target_layer_ids
-            if dflash_base else None,
+            output_hidden_states=eagle_base and not target_hidden_base,
+            dflash_target_layer_ids=target_layer_ids
+            if target_hidden_base else None,
         )
-        dflash_hidden_concat = getattr(self.model, 'dflash_hidden_concat',
+        target_hidden_concat = getattr(self.model, 'target_hidden_concat',
                                        None)
 
         # Select hidden states for specified token positions before lm_head.
@@ -773,11 +785,11 @@ class CausalLM(nn.Module):
 
         logits = self.lm_head(selected_hidden_states).to(torch.float32)
 
-        if dflash_base and dflash_hidden_concat is not None:
-            # DFlash base: concatenate hidden states from target layers.
+        if target_hidden_base and target_hidden_concat is not None:
+            # DFlash/DSpark base: concatenate hidden states from target layers.
             # Output the full-sequence hidden states (NOT gathered) — the C++
-            # runtime passes these to the DFlash draft engine per round.
-            return logits, dflash_hidden_concat, present_key_values
+            # runtime passes these to the draft engine per round.
+            return logits, target_hidden_concat, present_key_values
 
         if eagle_base and all_hidden_states is not None:
             # EAGLE3 base: concatenate hidden states from 3 selected layers.

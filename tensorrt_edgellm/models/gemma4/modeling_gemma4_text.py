@@ -980,6 +980,8 @@ class Gemma4Transformer(nn.Module):
             )
 
         self.last_pre_norm_hidden_states: torch.Tensor | None = None
+        self.target_hidden_concat: torch.Tensor | None = None
+        self.dflash_hidden_concat: torch.Tensor | None = None
 
     def _project_per_layer_inputs(
             self, inputs_embeds: torch.Tensor) -> torch.Tensor | None:
@@ -1046,6 +1048,7 @@ class Gemma4Transformer(nn.Module):
         attention_pos_id: torch.Tensor | None = None,
         vision_block_ids: torch.Tensor | None = None,
         output_hidden_states: bool = False,
+        target_layer_ids: List[int] | None = None,
         ple_token_embeds: Tuple[torch.Tensor, ...] = (),
         rope_rotary_cos_sin_sliding: torch.Tensor | None = None,
         rope_rotary_cos_sin_full: torch.Tensor | None = None,
@@ -1055,6 +1058,8 @@ class Gemma4Transformer(nn.Module):
             inputs_embeds)
         present_key_values_list: List[torch.Tensor] = []
         all_hidden_states: list = []
+        target_hidden_list: list = []
+        target_layer_set = set(target_layer_ids or [])
 
         for layer_index, layer in enumerate(self.layers):
             if output_hidden_states:
@@ -1082,7 +1087,13 @@ class Gemma4Transformer(nn.Module):
             )
             present_key_values_list.append(next_key_value)
 
+            if layer_index in target_layer_set:
+                target_hidden_list.append(hidden_states)
+
         self.last_pre_norm_hidden_states = hidden_states
+        self.target_hidden_concat = (torch.cat(target_hidden_list, dim=-1)
+                                     if target_hidden_list else None)
+        self.dflash_hidden_concat = self.target_hidden_concat
         normed = self.norm(hidden_states)
 
         if output_hidden_states:
@@ -1117,26 +1128,20 @@ class Gemma4ForCausalLM(CausalLM):
 
     def onnx_export_spec(self) -> OnnxSpec:
         """Return Gemma4-specific ONNX export parameters."""
-        vision_block_attention = bool(
-            self.config.use_vision_bidirectional_attention)
-        if (not self.ple_enabled and not self.config.use_dual_rope
-                and not vision_block_attention
-                and not self.config.gemma4_mtp_base):
+        config = self.config
+        dflash_base = getattr(config, "dflash_base", False)
+        dspark_base = getattr(config, "dspark_base", False)
+        target_hidden_base = dflash_base or dspark_base
+        eagle_base = config.eagle_base
+        tree_attention_base = (eagle_base or config.gemma4_mtp_base
+                               or target_hidden_base)
+        vision_block_attention = bool(config.use_vision_bidirectional_attention
+                                      ) and not tree_attention_base
+        if (not self.ple_enabled and not config.use_dual_rope
+                and not vision_block_attention and not tree_attention_base):
             return super().onnx_export_spec()
 
-        config = self.config
-        if config.use_dual_rope and config.eagle_base:
-            raise NotImplementedError(
-                "Gemma4 dual RoPE export is not supported for EAGLE base models."
-            )
-        if vision_block_attention and config.eagle_base:
-            raise NotImplementedError(
-                "Gemma4 vision block attention is not supported with EAGLE base models."
-            )
-
         Na = config.num_hidden_layers
-        eagle_base = config.eagle_base
-        tree_attention_base = eagle_base or config.gemma4_mtp_base
         num_ple_inputs = Na if self.ple_enabled else 0
         device = next(itertools.chain(self.parameters(),
                                       self.buffers())).device
@@ -1337,6 +1342,22 @@ class Gemma4ForCausalLM(CausalLM):
     ) -> Tuple:
         eagle_base = self.config.eagle_base
         gemma4_mtp_base = self.config.gemma4_mtp_base
+        dflash_base = getattr(self.config, "dflash_base", False)
+        dspark_base = getattr(self.config, "dspark_base", False)
+        target_hidden_base = dflash_base or dspark_base
+        eagle_target_layer_ids = getattr(self.config,
+                                         "eagle3_target_layer_ids", [])
+        eagle_target_hidden_base = eagle_base and bool(eagle_target_layer_ids)
+        target_layer_ids = None
+        if dspark_base:
+            target_layer_ids = getattr(self.config, "dspark_target_layer_ids",
+                                       None)
+        elif dflash_base:
+            target_layer_ids = getattr(self.config, "dflash_target_layer_ids",
+                                       None)
+        elif eagle_target_hidden_base:
+            target_layer_ids = eagle_target_layer_ids
+
         hidden_states, present_key_values, all_hidden_states = self.model(
             inputs_embeds,
             past_key_values,
@@ -1347,11 +1368,15 @@ class Gemma4ForCausalLM(CausalLM):
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
             vision_block_ids=vision_block_ids,
-            output_hidden_states=eagle_base,
+            output_hidden_states=eagle_base and not eagle_target_hidden_base
+            and not target_hidden_base,
+            target_layer_ids=target_layer_ids,
             ple_token_embeds=ple_token_embeds,
             rope_rotary_cos_sin_sliding=rope_rotary_cos_sin_sliding,
             rope_rotary_cos_sin_full=rope_rotary_cos_sin_full,
         )
+        target_hidden_concat = getattr(self.model, "target_hidden_concat",
+                                       None)
 
         selected_hidden_states = torch.ops.trt.gather_nd(
             hidden_states, last_token_ids)
@@ -1362,6 +1387,11 @@ class Gemma4ForCausalLM(CausalLM):
         if final_logit_softcapping is not None:
             logits = torch.tanh(
                 logits / final_logit_softcapping) * final_logit_softcapping
+
+        if ((target_hidden_base or eagle_target_hidden_base)
+                and target_hidden_concat is not None):
+            return logits, target_hidden_concat.to(
+                torch.float16), present_key_values
 
         if eagle_base and all_hidden_states is not None:
             n_layers = len(all_hidden_states) - 1

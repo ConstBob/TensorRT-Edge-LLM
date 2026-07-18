@@ -526,6 +526,22 @@ KERNEL_VARIANTS = [
             "--export_only",
         ],
     ),
+    KernelVariant(
+        name="ffpa_d512_causal_gqa16",
+        group="ffpa",
+        supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+        script="ffpa_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "512",
+            "--m_block_size", "64", "--n_block_size", "16", "--num_threads", "128",
+            "--dtype", "Float16",
+            "--is_causal",
+            "--skip_rescale",
+            "--kv_group_size", "16",
+            "--num_head", "16",
+            "--export_only",
+        ],
+    ),
     # FFPA vision-block overlay variant (Gemma4 Unified prefill, global d512
     # layers): the causal kernel plus two (B, S) Int32 mBlockBegin/mBlockEnd
     # tensors carrying a per-query-row extra allowed KV interval so image

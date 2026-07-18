@@ -13,18 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-DFlash Draft Model for speculative decoding — cached KV path.
+DSpark Draft Model for speculative decoding - cached KV path.
 
-The DFlash draft model generates an entire block of draft tokens in a SINGLE
+The DSpark draft model generates an entire block of draft tokens in a SINGLE
 forward pass.  Target-hidden-derived K/V is updated into a persistent
-draft KV cache via the DFlashTargetKVCacheUpdate plugin; proposal self K/V
+draft KV cache via the DFlashTargetKVCacheUpdate plugin implementation; proposal self K/V
 is written and attention is performed by the standard AttentionPlugin with
 tree attention enabled.
 
 Engine bindings (cached path):
+    Shape legend: B=batch size, BS=proposal sequence length,
+                  L=target hidden delta length.
     inputs_embeds        [B, BS, H]     Embedding of [y0, mask, mask, ..., mask]
     target_hidden_concat [B, L, Nl*H]   Target hidden DELTA from base
-    past_key_values_i    [2, num_pages, KV_PAGE_SIZE, Hkv, D]  Draft combined KV cache —
+    past_key_values_i    [2, num_pages, KV_PAGE_SIZE, Hkv, D]  Draft combined KV cache -
                          the paged pool (same contract as the AttentionPlugin kv_cache
                          binding). maxBatch/capPadded are recovered at enqueue time from
                          numPages and the builder-configured pages_per_slot attribute
@@ -63,14 +65,14 @@ from ..gemma4.modeling_gemma4_text import (Gemma4MLP, Gemma4RMSNorm,
 from ..linear import FP16Linear, make_linear
 from ..ops import KV_PAGE_SIZE, attention_plugin, dflash_target_kv_cache_update
 
-__all__ = ["DFlashDraftModel"]
+__all__ = ["DSparkDraftModel"]
 
 # ---------------------------------------------------------------------------
 # Dummy-shape constants for ONNX export
 # ---------------------------------------------------------------------------
 
 _BATCH_SIZE = 2
-_BLOCK_SIZE = 16  # DFlash block size
+_BLOCK_SIZE = 7  # DSpark block size
 _CTX_LEN = 2  # Delta length for dummy shapes
 _KV_CAPACITY = 64  # Dummy KV cache capacity
 
@@ -105,12 +107,12 @@ class MLP(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# DFlash Cached Attention Layer
+# DSpark Cached Attention Layer
 # ---------------------------------------------------------------------------
 
 
-class DFlashCachedAttention(nn.Module):
-    """Cached attention for DFlash draft model.
+class DSparkCachedAttention(nn.Module):
+    """Cached attention for DSpark draft model.
 
     Per-layer: updates the draft KV cache with target delta K/V,
     then runs AttentionPlugin for proposal self-attention over the
@@ -190,15 +192,17 @@ class DFlashCachedAttention(nn.Module):
         Returns:
             (attn_output [B, BS, H], present_key_value [B, 2, Hkv, capacity, D])
         """
-        B, BS, _ = hidden_states.shape
-        L = h_delta.shape[1]
+        batch_size, proposal_seq_len, _ = hidden_states.shape
+        delta_seq_len = h_delta.shape[1]
 
         # --- Target delta K/V: project and update cache ---
         k_delta_raw = self.k_proj(h_delta)  # [B, L, Hkv*D]
         v_delta_raw = (k_delta_raw
                        if self.attention_k_eq_v else self.v_proj(h_delta))
-        k_delta = k_delta_raw.reshape(B, L, self.num_kv_heads, self.head_dim)
-        v_delta = v_delta_raw.reshape(B, L, self.num_kv_heads, self.head_dim)
+        k_delta = k_delta_raw.reshape(batch_size, delta_seq_len,
+                                      self.num_kv_heads, self.head_dim)
+        v_delta = v_delta_raw.reshape(batch_size, delta_seq_len,
+                                      self.num_kv_heads, self.head_dim)
         k_delta = self.k_norm(k_delta)  # [B, L, Hkv, D]
         if self.v_norm is not None:
             v_delta = self.v_norm(v_delta)
@@ -211,20 +215,26 @@ class DFlashCachedAttention(nn.Module):
 
         # --- Proposal self Q/K/V ---
         q = self.q_proj(hidden_states)  # [B, BS, Hq*D]
-        q = q.reshape(B, BS, self.num_heads, self.head_dim)
+        q = q.reshape(batch_size, proposal_seq_len, self.num_heads,
+                      self.head_dim)
         q = self.q_norm(q)
-        q = q.reshape(B, BS, self.num_heads * self.head_dim)
+        q = q.reshape(batch_size, proposal_seq_len,
+                      self.num_heads * self.head_dim)
 
         k_self_raw = self.k_proj(hidden_states)  # [B, BS, Hkv*D]
         v_self = (k_self_raw
                   if self.attention_k_eq_v else self.v_proj(hidden_states))
-        k_self = k_self_raw.reshape(B, BS, self.num_kv_heads, self.head_dim)
+        k_self = k_self_raw.reshape(batch_size, proposal_seq_len,
+                                    self.num_kv_heads, self.head_dim)
         k_self = self.k_norm(k_self)
-        k_self = k_self.reshape(B, BS, self.num_kv_heads * self.head_dim)
+        k_self = k_self.reshape(batch_size, proposal_seq_len,
+                                self.num_kv_heads * self.head_dim)
         if self.v_norm is not None:
             v_self = self.v_norm(
-                v_self.reshape(B, BS, self.num_kv_heads, self.head_dim))
-            v_self = v_self.reshape(B, BS, self.num_kv_heads * self.head_dim)
+                v_self.reshape(batch_size, proposal_seq_len, self.num_kv_heads,
+                               self.head_dim))
+            v_self = v_self.reshape(batch_size, proposal_seq_len,
+                                    self.num_kv_heads * self.head_dim)
 
         # --- AttentionPlugin: proposal attention over full context ---
         attn_4d, present_kv = attention_plugin(
@@ -249,25 +259,26 @@ class DFlashCachedAttention(nn.Module):
             qkv_scales=[1.0, 1.0, 1.0])
 
         # attn_4d: [B, BS, Hq, D] -> [B, BS, Hq*D]
-        attn_output = attn_4d.reshape(B, BS, self.num_heads * self.head_dim)
+        attn_output = attn_4d.reshape(batch_size, proposal_seq_len,
+                                      self.num_heads * self.head_dim)
         attn_output = self.o_proj(attn_output)
 
         return attn_output, present_kv
 
 
 # ---------------------------------------------------------------------------
-# DFlash Cached Decoder Layer
+# DSpark Cached Decoder Layer
 # ---------------------------------------------------------------------------
 
 
-class DFlashCachedDecoderLayer(nn.Module):
-    """Decoder layer for cached DFlash draft model."""
+class DSparkCachedDecoderLayer(nn.Module):
+    """Decoder layer for cached DSpark draft model."""
 
     def __init__(self, config: ModelConfig, layer_idx: int) -> None:
         super().__init__()
         self.layer_idx = layer_idx
         self.is_gemma4 = _is_gemma4_model_type(config.model_type)
-        self.self_attn = DFlashCachedAttention(config, layer_idx=layer_idx)
+        self.self_attn = DSparkCachedAttention(config, layer_idx=layer_idx)
         self.mlp = (Gemma4MLP(config, layer_idx=layer_idx)
                     if self.is_gemma4 else MLP(config, layer_idx=layer_idx))
         norm_cls = Gemma4RMSNorm if self.is_gemma4 else RMSNorm
@@ -329,8 +340,8 @@ class DFlashCachedDecoderLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def _make_flat_wrapper_dflash(model: nn.Module, num_layers: int) -> nn.Module:
-    """Build a flat-signature wrapper for cached DFlash draft ONNX export.
+def _make_flat_wrapper_dspark(model: nn.Module, num_layers: int) -> nn.Module:
+    """Build a flat-signature wrapper for cached DSpark draft ONNX export.
 
     Uses exec() to generate a forward() with explicit named parameters for
     each past_key_values_i, matching the pattern used by the default LLM
@@ -348,13 +359,13 @@ def _make_flat_wrapper_dflash(model: nn.Module, num_layers: int) -> nn.Module:
                                              for i in range(num_layers)))
 
     body = (
-        f"    logits, present_kv_list = self._model(\n"
+        f"    logits, draft_hidden_states, present_kv_list = self._model(\n"
         f"        inputs_embeds, dflash_target_hidden_concat,\n"
         f"        rope_rotary_cos_sin, context_lengths,\n"
         f"        kvcache_start_index, kv_page_table, dflash_delta_lengths,\n"
         f"        attention_mask, attention_pos_id,\n"
         f"        list({past_kv_tuple}))\n"
-        f"    return (logits,) + tuple(present_kv_list)\n")
+        f"    return (logits, draft_hidden_states) + tuple(present_kv_list)\n")
 
     src = "def _forward(self, {}):\n{}".format(", ".join(param_names), body)
     globs: dict = {}
@@ -371,17 +382,17 @@ def _make_flat_wrapper_dflash(model: nn.Module, num_layers: int) -> nn.Module:
 
 
 # ---------------------------------------------------------------------------
-# DFlash Draft Model (Cached)
+# DSpark Draft Model (Cached)
 # ---------------------------------------------------------------------------
 
 
-class DFlashDraftModel(nn.Module):
-    """DFlash draft model for speculative decoding — cached KV path.
+class DSparkDraftModel(nn.Module):
+    """DSpark draft model for speculative decoding - cached KV path.
 
     Module tree (matches checkpoint keys after remapping):
         fc              Linear(Nl * H, H, bias=False)   - feature fusion
         hidden_norm     RMSNorm(H)                       - normalize fused features
-        layers.0..4     DFlashCachedDecoderLayer          - 5 decoder layers
+        layers.0..4     DSparkCachedDecoderLayer          - 5 decoder layers
         norm            RMSNorm(H)                        - final norm
         lm_head         Linear(H, V)                      - shared with base
     """
@@ -392,7 +403,7 @@ class DFlashDraftModel(nn.Module):
         super().__init__()
         self.config = config
         hidden_size = config.hidden_size
-        num_target_layers = len(config.dflash_target_layer_ids)
+        num_target_layers = len(config.dspark_target_layer_ids)
 
         self.fc = make_linear(config,
                               num_target_layers * hidden_size,
@@ -401,7 +412,7 @@ class DFlashDraftModel(nn.Module):
                               module_name="fc")
         if not isinstance(self.fc, FP16Linear):
             raise ValueError(
-                "DFlash draft fc projector must remain dense FP16 for the "
+                "DSpark draft fc projector must remain dense FP16 for the "
                 "full-FP32 target-hidden projection. Exclude module 'fc' "
                 "from draft quantization.")
         norm_cls = (Gemma4RMSNorm
@@ -409,7 +420,7 @@ class DFlashDraftModel(nn.Module):
         self.hidden_norm = norm_cls(hidden_size, config.rms_norm_eps)
 
         self.layers = nn.ModuleList([
-            DFlashCachedDecoderLayer(config, layer_idx=i)
+            DSparkCachedDecoderLayer(config, layer_idx=i)
             for i in range(config.num_hidden_layers)
         ])
         self.norm = norm_cls(hidden_size, config.rms_norm_eps)
@@ -431,15 +442,13 @@ class DFlashDraftModel(nn.Module):
         attention_mask: torch.Tensor,  # [B, BS, packedMaskLen] INT32
         attention_pos_id: torch.Tensor,  # [B, BS] INT32
         past_key_values: List[
-            torch.Tensor],  # list of [B, 2, Hkv, capacity, D]
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+            torch.Tensor],  # list of [2, num_pages, KV_PAGE_SIZE, Hkv, D]
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
         """Forward pass.
 
         Returns:
-            (logits [B, BS, V], present_key_values list)
+            (logits [B, BS, V], hidden_states [B, BS, H], present_key_values list)
         """
-        B, BS, _ = inputs_embeds.shape
-
         # Project multi-layer hidden states: [B, L, Nl*H] -> [B, L, H]
         # Qwen3-8B target_hidden can spike above abs=2e4 for some first-token
         # channels. The visible pre-RMSNorm FC result must remain FP32; casting
@@ -471,7 +480,7 @@ class DFlashDraftModel(nn.Module):
             logits = torch.tanh(
                 logits / final_logit_softcapping) * final_logit_softcapping
 
-        return logits, present_key_values
+        return logits, hidden_states.to(torch.float16), present_key_values
 
     # ------------------------------------------------------------------
     # ONNX export
@@ -483,9 +492,9 @@ class DFlashDraftModel(nn.Module):
         device = next(itertools.chain(self.parameters(),
                                       self.buffers())).device
         dtype16 = torch.float16
-        num_target_layers = len(config.dflash_target_layer_ids)
+        num_target_layers = len(config.dspark_target_layer_ids)
         batch_size = _BATCH_SIZE
-        block_size = config.dflash_block_size
+        block_size = config.dspark_block_size
         delta_len = _CTX_LEN
         kv_capacity = _KV_CAPACITY
         num_kv_heads = config.num_key_value_heads
@@ -536,7 +545,7 @@ class DFlashDraftModel(nn.Module):
                                        dtype=torch.int32,
                                        device=device)
 
-        # Paged KV pool binding — same contract as the AttentionPlugin's kv_cache input:
+        # Paged KV pool binding - same contract as the AttentionPlugin's kv_cache input:
         # [2, num_pages, KV_PAGE_SIZE, numKVHeads, headDim]. See
         # DFlashTargetKVCacheUpdatePlugin's input 2 doc; maxBatch/cap are recovered at
         # enqueue time from the builder-configured pages_per_slot attribute.
@@ -569,7 +578,7 @@ class DFlashDraftModel(nn.Module):
         for i in range(num_layers):
             input_names.append(f"past_key_values_{i}")
 
-        output_names = ["logits"]
+        output_names = ["logits", "dspark_hidden_states"]
         for i in range(num_layers):
             output_names.append(f"present_key_values_{i}")
 
@@ -621,7 +630,7 @@ class DFlashDraftModel(nn.Module):
             dynamic_shapes.append({1: num_pages
                                    })  # past_key_values_i (pool-shaped)
 
-        wrapped = _make_flat_wrapper_dflash(self, num_layers)
+        wrapped = _make_flat_wrapper_dspark(self, num_layers)
         wrapped.eval()
 
         return OnnxSpec(wrapped=wrapped,

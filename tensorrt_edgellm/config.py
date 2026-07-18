@@ -596,6 +596,8 @@ class ModelConfig:
     # ------------------------------------------ EAGLE3 draft config
     draft_vocab_size: Optional[int] = None
     target_hidden_size: Optional[int] = None
+    is_eagle3_draft_flag: bool = False
+    eagle3_target_layer_ids: List[int] = field(default_factory=list)
     # ------------------------------------------ EAGLE3 base config
     # When True, the standard CausalLM is exported as an EAGLE3 base model
     # with tree-attention inputs (attention_mask, attention_pos_id) and
@@ -612,6 +614,18 @@ class ModelConfig:
     dflash_target_layer_ids: List[int] = field(default_factory=list)
     dflash_block_size: int = 16
     dflash_mask_token_id: int = 248070
+    # ------------------------------------------ DSpark config
+    # DSpark uses the DFlash-like target-hidden feedback path, then applies
+    # a sequential Markov/confidence head outside the draft backbone engine.
+    dspark_base: bool = False
+    is_dspark_draft_flag: bool = False
+    dspark_target_layer_ids: List[int] = field(default_factory=list)
+    dspark_block_size: int = 7
+    dspark_mask_token_id: int = 151669
+    dspark_enable_confidence_head: bool = False
+    dspark_confidence_head_with_markov: bool = False
+    dspark_markov_head_type: str = ""
+    dspark_markov_rank: int = 0
     # ------------------------------------------ sparse MoE config (Qwen3-style)
     # num_experts=0 means dense (no MoE) for Qwen/Mixtral-style keys; Nemotron-H instead reports
     # its expert count via n_routed_experts, so n_routed_experts > 0 also indicates MoE.
@@ -698,14 +712,15 @@ class ModelConfig:
 
     @property
     def is_eagle3_draft(self) -> bool:
-        return self.draft_vocab_size is not None
+        return self.draft_vocab_size is not None or self.is_eagle3_draft_flag
 
     @property
     def is_mtp_draft(self) -> bool:
         """True for a derived MTP draft config built from a base checkpoint."""
         return bool(self.mtp_num_hidden_layers is not None
                     and self.gdn_cfg is None and not self.mtp_base
-                    and not self.is_eagle3_draft and not self.is_dflash_draft)
+                    and not self.is_eagle3_draft and not self.is_dflash_draft
+                    and not self.is_dspark_draft)
 
     @property
     def is_gemma4_mtp_draft(self) -> bool:
@@ -717,6 +732,10 @@ class ModelConfig:
         return self.is_dflash_draft_flag
 
     @property
+    def is_dspark_draft(self) -> bool:
+        return self.is_dspark_draft_flag
+
+    @property
     def ple_enabled(self) -> bool:
         """True when Gemma4 per-layer embeddings are enabled."""
         return self.hidden_size_per_layer_input > 0
@@ -724,6 +743,10 @@ class ModelConfig:
     @property
     def eagle3_target_hidden_size(self) -> int:
         return self.target_hidden_size or self.hidden_size
+
+    @property
+    def eagle3_num_target_layers(self) -> int:
+        return len(self.eagle3_target_layer_ids) or 3
 
     @property
     def is_hybrid(self) -> bool:
@@ -844,6 +867,16 @@ class ModelConfig:
         layer_types = _parse_layer_types(llm_dict)
         attention_layer_types = _parse_attention_layer_types(
             llm_dict, llm_dict["num_hidden_layers"], model_type)
+        num_kv_heads = llm_dict.get("num_key_value_heads", num_attn_heads)
+        full_attention_only = (_is_gemma4_model_type(model_type)
+                               and attention_layer_types and all(
+                                   layer_type == "full_attention"
+                                   for layer_type in attention_layer_types))
+        if full_attention_only:
+            if global_head_dim:
+                head_dim = global_head_dim
+            if num_global_kv_heads:
+                num_kv_heads = num_global_kv_heads
         dual_rope_configs = _get_dual_rope_configs(llm_dict)
         mamba_cfg = _parse_mamba_cfg(llm_dict,
                                      layer_types,
@@ -871,8 +904,18 @@ class ModelConfig:
         )
 
         # EAGLE3 draft model fields
+        architectures = llm_dict.get("architectures", []) or []
+        is_eagle3_draft_flag = any("Eagle3" in str(arch)
+                                   for arch in architectures) or ("ttt_length"
+                                                                  in llm_dict)
         draft_vocab_size = llm_dict.get("draft_vocab_size", None)
         target_hidden_size = llm_dict.get("target_hidden_size", None)
+        eagle3_target_layer_ids = list(
+            llm_dict.get("target_layer_ids", [])
+            or []) if is_eagle3_draft_flag else []
+        if is_eagle3_draft_flag:
+            draft_vocab_size = draft_vocab_size or llm_dict.get("vocab_size")
+            target_hidden_size = target_hidden_size or hidden_size
         # Sliding window: active when use_sliding_window=True, or when
         # layer_types contains "sliding_attention" (Gemma4 convention).
         use_sw = llm_dict.get("use_sliding_window", False) or any(
@@ -930,8 +973,7 @@ class ModelConfig:
             hidden_size=hidden_size,
             num_hidden_layers=llm_dict["num_hidden_layers"],
             num_attention_heads=num_attn_heads,
-            num_key_value_heads=llm_dict.get("num_key_value_heads",
-                                             num_attn_heads),
+            num_key_value_heads=num_kv_heads,
             intermediate_size=intermediate_size,
             head_dim=head_dim,
             global_head_dim=global_head_dim,
@@ -991,12 +1033,15 @@ class ModelConfig:
                 llm_dict.get("centroid_intermediate_top_k", 0) or 0),
             dflash_base=bool(llm_dict.get("dflash_base", False)),
             dflash_tree_base=bool(llm_dict.get("dflash_tree_base", False)),
+            dspark_base=bool(llm_dict.get("dspark_base", False)),
             num_deepstack_features=_parse_num_deepstack_features(
                 llm_dict, model_type, root_config=root),
             accept_hidden_layer=_parse_accept_hidden_layer(llm_dict,
                                                            root_config=root),
             draft_vocab_size=draft_vocab_size,
             target_hidden_size=target_hidden_size,
+            is_eagle3_draft_flag=is_eagle3_draft_flag,
+            eagle3_target_layer_ids=eagle3_target_layer_ids,
             num_experts=num_experts,
             n_routed_experts=n_routed_experts,
             num_experts_per_tok=num_experts_per_tok,
@@ -1117,6 +1162,109 @@ def make_mtp_draft_config(base_config: ModelConfig) -> ModelConfig:
     )
 
 
+def make_dspark_draft_config(
+        draft_dir: str,
+        default_attention_scale: Callable[[int], float]) -> ModelConfig:
+    """Build a DSpark draft ModelConfig from a DeepSpec DSpark checkpoint."""
+    _, llm_dict = load_checkpoint_config_dicts(draft_dir)
+    dspark_config = llm_dict.get("dspark_config", {}) or {}
+
+    quant = _parse_quant(draft_dir, llm_dict)
+    target_layer_ids = list(
+        dspark_config.get("target_layer_ids",
+                          llm_dict.get("target_layer_ids", [])))
+    if not target_layer_ids:
+        raise ValueError(
+            "DSpark draft config requires target_layer_ids in config.json.")
+
+    model_type = llm_dict.get("model_type", "qwen3")
+    raw_layer_types = _parse_raw_layer_types(llm_dict)
+    layer_types = _parse_layer_types(llm_dict)
+    attention_layer_types = _parse_attention_layer_types(
+        llm_dict, llm_dict["num_hidden_layers"], model_type)
+    full_attention_only = (_is_gemma4_model_type(model_type)
+                           and attention_layer_types
+                           and all(layer_type == "full_attention"
+                                   for layer_type in attention_layer_types))
+    head_dim = llm_dict.get(
+        "global_head_dim" if full_attention_only else "head_dim",
+        llm_dict.get(
+            "head_dim",
+            llm_dict["hidden_size"] // llm_dict["num_attention_heads"]))
+    global_head_dim = int(llm_dict.get("global_head_dim", 0) or 0)
+    num_global_kv_heads = int(
+        llm_dict.get("num_global_key_value_heads", 0) or 0)
+    num_kv_heads = (
+        num_global_kv_heads if full_attention_only and num_global_kv_heads else
+        llm_dict.get("num_key_value_heads", llm_dict["num_attention_heads"]))
+    dual_rope_configs = _get_dual_rope_configs(llm_dict)
+    use_sw = llm_dict.get("use_sliding_window", False) or any(
+        layer_type == "sliding_attention" for layer_type in raw_layer_types)
+    sw_raw = llm_dict.get("sliding_window") if use_sw else None
+    sliding_window_size = int(sw_raw) if sw_raw is not None else -1
+    default_attention_scale_value = float(default_attention_scale(head_dim))
+    default_mask_token_id = 4 if _is_gemma4_model_type(model_type) else 151669
+
+    return ModelConfig(
+        model_type=model_type,
+        hidden_size=llm_dict["hidden_size"],
+        num_hidden_layers=llm_dict["num_hidden_layers"],
+        num_attention_heads=llm_dict["num_attention_heads"],
+        num_key_value_heads=num_kv_heads,
+        intermediate_size=llm_dict["intermediate_size"],
+        head_dim=head_dim,
+        global_head_dim=global_head_dim,
+        num_global_key_value_heads=num_global_kv_heads,
+        rms_norm_eps=llm_dict.get("rms_norm_eps", 1e-6),
+        vocab_size=llm_dict["vocab_size"],
+        rope_theta=_get_rope_theta(llm_dict),
+        max_position_embeddings=llm_dict.get("max_position_embeddings", 4096),
+        default_attention_scale=default_attention_scale_value,
+        rope_scaling=_select_rope_scaling(llm_dict),
+        partial_rotary_factor=_get_partial_rotary_factor(llm_dict),
+        hidden_activation=llm_dict.get("hidden_activation",
+                                       llm_dict.get("hidden_act", "silu")),
+        sliding_rope_config=dual_rope_configs.get("sliding_rope_config"),
+        full_rope_config=dual_rope_configs.get("full_rope_config"),
+        has_qk_norm=True,
+        has_value_norm=_get_has_value_norm(llm_dict, model_type),
+        attention_bias=bool(llm_dict.get("attention_bias", False)),
+        attention_scaling=_get_attention_scaling(
+            llm_dict, head_dim, default_attention_scale_value),
+        attention_k_eq_v=bool(llm_dict.get("attention_k_eq_v", False)),
+        final_logit_softcapping=llm_dict.get("final_logit_softcapping", None),
+        torch_dtype=llm_dict.get("torch_dtype",
+                                 llm_dict.get("dtype", "bfloat16")),
+        tie_word_embeddings=False,
+        sliding_window_size=sliding_window_size,
+        layer_types=layer_types,
+        attention_layer_types=attention_layer_types,
+        raw_layer_types=raw_layer_types,
+        rope_parameters=llm_dict.get("rope_parameters", None),
+        is_dspark_draft_flag=True,
+        dspark_target_layer_ids=target_layer_ids,
+        dspark_block_size=int(
+            dspark_config.get("block_size", llm_dict.get("block_size", 7))),
+        dspark_mask_token_id=int(
+            dspark_config.get(
+                "mask_token_id",
+                llm_dict.get("mask_token_id", default_mask_token_id))),
+        dspark_enable_confidence_head=bool(
+            dspark_config.get("enable_confidence_head",
+                              llm_dict.get("enable_confidence_head", False))),
+        dspark_confidence_head_with_markov=bool(
+            dspark_config.get(
+                "confidence_head_with_markov",
+                llm_dict.get("confidence_head_with_markov", False))),
+        dspark_markov_head_type=str(
+            dspark_config.get("markov_head_type",
+                              llm_dict.get("markov_head_type", ""))),
+        dspark_markov_rank=int(
+            dspark_config.get("markov_rank", llm_dict.get("markov_rank", 0))),
+        quant=quant,
+    )
+
+
 def make_dflash_draft_config(
         draft_dir: str,
         default_attention_scale: Callable[[int], float]) -> ModelConfig:
@@ -1136,40 +1284,79 @@ def make_dflash_draft_config(
 
     model_type = llm_dict.get("model_type", "qwen3")
     _check_num_attention_heads(llm_dict["num_attention_heads"])
+    raw_layer_types = _parse_raw_layer_types(llm_dict)
+    layer_types = _parse_layer_types(llm_dict)
+    attention_layer_types = _parse_attention_layer_types(
+        llm_dict, llm_dict["num_hidden_layers"], model_type)
+    full_attention_only = (_is_gemma4_model_type(model_type)
+                           and attention_layer_types
+                           and all(layer_type == "full_attention"
+                                   for layer_type in attention_layer_types))
     head_dim = llm_dict.get(
-        "head_dim", llm_dict["hidden_size"] // llm_dict["num_attention_heads"])
+        "global_head_dim" if full_attention_only else "head_dim",
+        llm_dict.get(
+            "head_dim",
+            llm_dict["hidden_size"] // llm_dict["num_attention_heads"]))
+    global_head_dim = int(llm_dict.get("global_head_dim", 0) or 0)
+    num_global_kv_heads = int(
+        llm_dict.get("num_global_key_value_heads", 0) or 0)
+    num_kv_heads = (
+        num_global_kv_heads if full_attention_only and num_global_kv_heads else
+        llm_dict.get("num_key_value_heads", llm_dict["num_attention_heads"]))
+    dual_rope_configs = _get_dual_rope_configs(llm_dict)
+    use_sw = llm_dict.get("use_sliding_window", False) or any(
+        layer_type == "sliding_attention" for layer_type in raw_layer_types)
+    sw_raw = llm_dict.get("sliding_window") if use_sw else None
+    sliding_window_size = int(sw_raw) if sw_raw is not None else -1
 
     default_attention_scale_value = float(default_attention_scale(head_dim))
+    default_mask_token_id = 4 if _is_gemma4_model_type(model_type) else 248070
 
     return ModelConfig(
         model_type=model_type,
         hidden_size=llm_dict["hidden_size"],
         num_hidden_layers=llm_dict["num_hidden_layers"],
         num_attention_heads=llm_dict["num_attention_heads"],
-        num_key_value_heads=llm_dict.get("num_key_value_heads",
-                                         llm_dict["num_attention_heads"]),
+        num_key_value_heads=num_kv_heads,
         intermediate_size=llm_dict["intermediate_size"],
         head_dim=head_dim,
+        global_head_dim=global_head_dim,
+        num_global_key_value_heads=num_global_kv_heads,
         rms_norm_eps=llm_dict.get("rms_norm_eps", 1e-6),
         vocab_size=llm_dict["vocab_size"],
         rope_theta=_get_rope_theta(llm_dict),
         max_position_embeddings=llm_dict.get("max_position_embeddings", 4096),
-        rope_scaling=(llm_dict.get("rope_scaling")
-                      or llm_dict.get("rope_parameters") or None),
+        default_attention_scale=default_attention_scale_value,
+        rope_scaling=_select_rope_scaling(llm_dict),
         partial_rotary_factor=_get_partial_rotary_factor(llm_dict),
+        hidden_activation=llm_dict.get("hidden_activation",
+                                       llm_dict.get("hidden_act", "silu")),
+        sliding_rope_config=dual_rope_configs.get("sliding_rope_config"),
+        full_rope_config=dual_rope_configs.get("full_rope_config"),
         has_qk_norm=True,
+        has_value_norm=_get_has_value_norm(llm_dict, model_type),
         attention_scaling=_get_attention_scaling(
             llm_dict, head_dim, default_attention_scale_value),
-        default_attention_scale=default_attention_scale_value,
+        attention_k_eq_v=bool(llm_dict.get("attention_k_eq_v", False)),
+        final_logit_softcapping=llm_dict.get("final_logit_softcapping", None),
         torch_dtype=llm_dict.get("torch_dtype", "bfloat16"),
         tie_word_embeddings=False,
-        layer_types=[LAYER_ATTN] * int(llm_dict["num_hidden_layers"]),
+        sliding_window_size=sliding_window_size,
+        layer_types=layer_types,
+        attention_layer_types=attention_layer_types,
+        raw_layer_types=raw_layer_types,
+        rope_parameters=llm_dict.get("rope_parameters", None),
         is_dflash_draft_flag=True,
         dflash_target_layer_ids=list(
-            dflash_config.get("target_layer_ids", [1, 8, 15, 22, 29])),
+            dflash_config.get(
+                "target_layer_ids",
+                llm_dict.get("target_layer_ids", [1, 8, 15, 22, 29]))),
         dflash_block_size=int(
             dflash_config.get("block_size", llm_dict.get("block_size", 16))),
-        dflash_mask_token_id=int(dflash_config.get("mask_token_id", 248070)),
+        dflash_mask_token_id=int(
+            dflash_config.get(
+                "mask_token_id",
+                llm_dict.get("mask_token_id", default_mask_token_id))),
         quant=quant,
     )
 

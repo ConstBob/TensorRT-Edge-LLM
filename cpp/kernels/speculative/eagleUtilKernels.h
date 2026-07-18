@@ -153,14 +153,14 @@ void eagleBaseAssembleHiddenState(rt::Tensor const& acceptedIndices, rt::Tensor 
     rt::Tensor& hiddenState, cudaStream_t stream);
 
 //! The kernel will initialize the draft table for a new round of drafting.
-//! Draft token ids will be translated towards full vocab size. During eagle spec-decode draft tree construction,
-//! we will build multiple full data tables to record the complete description of a draft tree. The full table will contain
+//! First-level draft logits are translated to target-vocabulary token ids. During eagle spec-decode draft tree
+//! construction, we build multiple full data tables to record the complete description of a draft tree. The full table will contain
 //! the root node so the full-table size is (1 + draft-topK + total-draft-round x draft-topK x draft-topK).
 //! Inputs:
-//!     selectedIndices [GPU, Int32]: Selected indices from logits, shape [batch, draftTopK].
+//!     selectedIndices [GPU, Int32]: Draft-vocabulary selected token ids, shape [batch, draftTopK].
 //!     logProbs [GPU, Float]: Log probabilities of the selected tokens, shape [batch, draftTopK].
 //!     rootTokens [GPU, Int32]: Committed tokens selected by base model to act as the root token of the draft tree [batch].
-//!     vocabMappingTable [GPU, Int32]: The mapping table from draft vocab token to full vocab token, shape [draft-vocab-size].
+//!     vocabMappingTable [GPU, Int32]: Draft-token to target-token offset table, shape [draft-vocab-size].
 //!     stream: The CUDA stream to execute the kernel.
 //! Outputs:
 //!     draftIdFullTable [GPU, Int32]: Table to store the token ids of the whole tree. [batch, full-table-size]

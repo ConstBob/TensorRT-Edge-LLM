@@ -110,6 +110,9 @@ private:
 #if defined(CUTE_DSL_FFPA_GQA8_ENABLED)
     static ffpa_d512_causal_gqa8_Kernel_Module_t sD512CausalGqa8Module;
 #endif
+#if defined(CUTE_DSL_FFPA_GQA16_ENABLED)
+    static ffpa_d512_causal_gqa16_Kernel_Module_t sD512CausalGqa16Module;
+#endif
     static bool sLoaded;
     static std::mutex sMutex;
 };

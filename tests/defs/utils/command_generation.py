@@ -45,7 +45,8 @@ def resolve_lora_model_name(model_name: str) -> Optional[str]:
 
 
 def _uses_spec_decode(config: TestConfig) -> bool:
-    return bool(config.is_eagle or config.is_mtp or config.is_dflash)
+    return bool(config.is_eagle or config.is_mtp or config.is_dflash
+                or config.is_dspark)
 
 
 def _tensorrt_edgellm_module_shell(module: str, args: List[str]) -> str:
@@ -675,7 +676,9 @@ def generate_inference_commands(
         cmd.append("--specDecode")
         cmd.append(f"--specDraftTopK={config.eagle_draft_top_k}")
         cmd.append(f"--specDraftStep={config.eagle_draft_step}")
-        cmd.append(f"--specVerifyTreeSize={config.max_verify_tree_size}")
+        cmd.append(f"--specVerifySize={config.max_verify_tree_size}")
+        if config.is_dspark:
+            cmd.append(f"--dsparkMaxProposalLen={config.max_draft_tree_size}")
 
     if config.model_type == ModelType.VLM:
         cmd.append(f"--multimodalEngineDir={config.get_visual_engine_dir()}")
@@ -685,9 +688,11 @@ def generate_inference_commands(
         cmd.append(
             f"--multimodalEngineDir={config.get_multimodal_engine_dir()}")
 
-    # Add batch size override if specified
+    # Add batch size and generation length overrides if specified.
     if config.batch_size is not None:
         cmd.append(f"--batchSize={config.batch_size}")
+    if config.output_seq_len is not None:
+        cmd.append(f"--maxGenerateLength={config.output_seq_len}")
 
     if config.debug:
         cmd.append("--debug")
@@ -747,7 +752,9 @@ def generate_e2e_bench_commands(
         cmd.append("--specDecode")
         cmd.append(f"--specDraftTopK={config.eagle_draft_top_k}")
         cmd.append(f"--specDraftStep={config.eagle_draft_step}")
-        cmd.append(f"--specVerifyTreeSize={config.max_verify_tree_size}")
+        cmd.append(f"--specVerifySize={config.max_verify_tree_size}")
+        if config.is_dspark:
+            cmd.append(f"--dsparkMaxProposalLen={config.max_draft_tree_size}")
 
     if config.model_type == ModelType.VLM:
         cmd.append(f"--multimodalEngineDir={config.get_visual_engine_dir()}")
@@ -757,9 +764,11 @@ def generate_e2e_bench_commands(
         cmd.append(
             f"--multimodalEngineDir={config.get_multimodal_engine_dir()}")
 
-    # Add batch size override if specified
+    # Add batch size and generation length overrides if specified.
     if config.batch_size is not None:
         cmd.append(f"--batchSize={config.batch_size}")
+    if config.output_seq_len is not None:
+        cmd.append(f"--maxGenerateLength={config.output_seq_len}")
 
     # Add warmup if specified
     cmd.append(f"--warmup={config.warmup or 10}")

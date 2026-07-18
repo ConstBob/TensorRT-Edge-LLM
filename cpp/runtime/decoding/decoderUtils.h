@@ -43,6 +43,10 @@ void appendAcceptedTokens(DecodingInferenceContext& context, Tensor& hostAcceptL
     Tensor const& deviceAcceptLength, Tensor const& deviceAcceptedTokenIds, int32_t maxAcceptDepth,
     tokenizer::Tokenizer const& tokenizer, cudaStream_t stream);
 
+//! @brief Clamp device accept lengths so multi-token speculative commits never exceed max_generate_length.
+void clampAcceptLengthsToRemainingGeneration(
+    DecodingInferenceContext& context, Tensor& hostAcceptLengths, Tensor& deviceAcceptLength, cudaStream_t stream);
+
 // Logprobs collection is split into a device-side enqueue and a host-side collect so that
 // decoding keeps a single host<->device synchronization point per round: decoders call
 // enqueueLogprobsD2H() before their round synchronization (the token / accepted-token D2H

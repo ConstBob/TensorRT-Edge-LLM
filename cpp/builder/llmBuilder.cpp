@@ -112,7 +112,8 @@ bool isSpecDecodeDraft(Json const& config, char const* type)
 
 bool isValidSpecDecodeType(std::string const& type)
 {
-    return type == "none" || type == "mtp" || type == "eagle3" || type == "dflash" || type == "gemma4_mtp";
+    return type == "none" || type == "mtp" || type == "eagle3" || type == "dflash" || type == "dspark"
+        || type == "gemma4_mtp";
 }
 
 bool isValidEngineRole(std::string const& role)
@@ -213,14 +214,15 @@ bool LLMBuilder::build()
         return false;
     }
 
-    // DFlash draft's DFlashTargetKVCacheUpdate plugin needs pages_per_slot (capPadded /
-    // kTOKENS_PER_PAGE) to split its now-pool-shaped past_key_value binding's numPages back into
-    // (maxBatch, cap). That fact is builder-only (mBuilderConfig.maxKVCacheCapacity), unavailable at
-    // ONNX-export time, and this plugin's concrete class is intentionally not linked into the
-    // builder (plugins are opaque .so modules, loaded via EDGELLM_PLUGIN_PATH — see
-    // common/trtUtils.h). Resolve the plugin's exported configuration hook via dlsym on the already
-    // -loaded handle instead of adding a new link dependency.
-    if (isSpecDecodeDraft(mModelConfig, "dflash"))
+    // DFlash/DSpark drafts use DFlashTargetKVCacheUpdate, which needs pages_per_slot
+    // (capPadded / kTOKENS_PER_PAGE) to split its pool-shaped past_key_value binding's
+    // numPages back into (maxBatch, cap). That fact is builder-only
+    // (mBuilderConfig.maxKVCacheCapacity), unavailable at ONNX-export time, and this
+    // plugin's concrete class is intentionally not linked into the builder (plugins are
+    // opaque .so modules, loaded via EDGELLM_PLUGIN_PATH -- see common/trtUtils.h).
+    // Resolve the plugin's exported configuration hook via dlsym on the already-loaded
+    // handle instead of adding a new link dependency.
+    if (isSpecDecodeDraft(mModelConfig, "dflash") || isSpecDecodeDraft(mModelConfig, "dspark"))
     {
         using ConfigurePagesPerSlotFn = bool (*)(nvinfer1::INetworkDefinition*, int32_t);
         auto* configureFn = reinterpret_cast<ConfigurePagesPerSlotFn>(
@@ -330,6 +332,11 @@ bool LLMBuilder::build()
         return false;
     }
 
+    if (!copyDSparkFiles())
+    {
+        return false;
+    }
+
     if (!copyVocabMappingFiles())
     {
         return false;
@@ -364,8 +371,8 @@ bool LLMBuilder::parseConfig()
     std::string const role = engineRole(mModelConfig);
     if (!isValidSpecDecodeType(specType))
     {
-        LOG_ERROR(
-            "Invalid spec_decode_type='%s'. Expected one of: none, mtp, eagle3, dflash, gemma4_mtp.", specType.c_str());
+        LOG_ERROR("Invalid spec_decode_type='%s'. Expected one of: none, mtp, eagle3, dflash, dspark, gemma4_mtp.",
+            specType.c_str());
         return false;
     }
     if (!isValidEngineRole(role))
@@ -392,12 +399,15 @@ bool LLMBuilder::parseConfig()
     }
 
     mHiddenSize = mModelConfig["hidden_size"].get<int32_t>();
-    // For MTP draft, base model outputs hidden_size (1x); for EAGLE3 draft, it outputs hidden_size * 3.
+    // MTP draft consumes one target hidden state. Other draft modes may
+    // concatenate multiple target layers; prefer the exported contract when it
+    // is present and keep the legacy EAGLE3 hidden_size*3 fallback below.
     if (isSpecDecodeDraft(mModelConfig, "mtp"))
     {
         mTargetModelOutputHiddenDim = mHiddenSize;
     }
-    else if ((isSpecDecodeDraft(mModelConfig, "dflash") || isSpecDecodeDraft(mModelConfig, "gemma4_mtp"))
+    else if ((isSpecDecodeDraft(mModelConfig, "eagle3") || isSpecDecodeDraft(mModelConfig, "dflash")
+                 || isSpecDecodeDraft(mModelConfig, "dspark") || isSpecDecodeDraft(mModelConfig, "gemma4_mtp"))
         && mModelConfig.contains("base_model_hidden_size"))
     {
         mTargetModelOutputHiddenDim = mModelConfig["base_model_hidden_size"].get<int32_t>();
@@ -551,6 +561,21 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
         return true;
     }
 
+    if (isSpecDecodeDraft(mModelConfig, "dspark"))
+    {
+        result &= setupDSparkDraftProfiles(*contextProfile, *generationProfile);
+        if (!result)
+        {
+            LOG_ERROR("Failed to setup DSpark draft optimization profiles");
+            return false;
+        }
+        LOG_DEBUG("%s", printOptimizationProfile(contextProfile, "context_profile", &network).c_str());
+        LOG_DEBUG("%s", printOptimizationProfile(generationProfile, "generation_profile", &network).c_str());
+        config.addOptimizationProfile(contextProfile);
+        config.addOptimizationProfile(generationProfile);
+        return true;
+    }
+
     // Setup common profiles
     result &= setupCommonProfiles(*contextProfile, *generationProfile);
     result &= setupRopeProfiles(*contextProfile, *generationProfile, network);
@@ -565,8 +590,9 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
         result &= setupVanillaProfiles(*contextProfile, *generationProfile);
     }
 
-    // Setup hybrid state profiles for MTP/DFlash base models.
-    if (isSpecDecodeBase(mModelConfig, "mtp") || isSpecDecodeBase(mModelConfig, "dflash"))
+    // Setup hybrid state profiles for MTP/DFlash/DSpark base models.
+    if (isSpecDecodeBase(mModelConfig, "mtp") || isSpecDecodeBase(mModelConfig, "dflash")
+        || isSpecDecodeBase(mModelConfig, "dspark"))
     {
         result &= setupIntermediateRecurrentStateProfiles(*contextProfile, *generationProfile);
         result &= setupIntermediateConvStateProfiles(*contextProfile, *generationProfile);
@@ -791,8 +817,11 @@ bool LLMBuilder::setupDFlashDraftProfiles(
     int64_t const optDraftTokens = maxDraftTokens;
     int64_t const maxPrefillTargetHiddenLen = std::max<int64_t>(1, mBuilderConfig.maxInputLen);
     int64_t const optPrefillTargetHiddenLen = std::max<int64_t>(1, maxPrefillTargetHiddenLen / 2);
-    int64_t const maxDecodeTargetHiddenLen = maxDraftTokens;
-    int64_t const optDecodeTargetHiddenLen = maxDraftTokens;
+    // DFlash verifies [anchor] + proposal tokens and can accept the base
+    // bonus token, so the next draft round may need one more target-hidden row
+    // than the proposal block.
+    int64_t const maxDecodeTargetHiddenLen = maxDraftTokens + 1;
+    int64_t const optDecodeTargetHiddenLen = maxDraftTokens + 1;
 
     int64_t const packedMaskLen = static_cast<int64_t>(divUp(maxDraftTokens, 32));
     int64_t const optPackedMaskLen = static_cast<int64_t>(divUp(optDraftTokens, 32));
@@ -932,6 +961,91 @@ bool LLMBuilder::setupGemma4MTPDraftProfiles(nvinfer1::IOptimizationProfile& con
 
     result &= setupOneProfile(contextProfile);
     result &= setupOneProfile(generationProfile);
+    return result;
+}
+
+bool LLMBuilder::setupDSparkDraftProfiles(
+    nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
+{
+    bool result = true;
+
+    int64_t const maxDraftTokens = std::max<int64_t>(1, mBuilderConfig.maxDraftTreeSize);
+    int64_t const optDraftTokens = maxDraftTokens;
+    int64_t const maxPrefillTargetHiddenLen = std::max<int64_t>(1, mBuilderConfig.maxInputLen);
+    int64_t const optPrefillTargetHiddenLen = std::max<int64_t>(1, maxPrefillTargetHiddenLen / 2);
+    // DSpark verifies [anchor] + proposal tokens and can accept the base bonus token,
+    // so the next draft round may need one more target-hidden row than the proposal block.
+    int64_t const maxDecodeTargetHiddenLen = maxDraftTokens + 1;
+    int64_t const optDecodeTargetHiddenLen = maxDraftTokens + 1;
+
+    int64_t const packedMaskLen = static_cast<int64_t>(divUp(maxDraftTokens, 32));
+    int64_t const optPackedMaskLen = static_cast<int64_t>(divUp(optDraftTokens, 32));
+
+    // Profile 0 handles round-0/system-prompt cache update, where target hidden spans the prompt.
+    // Profile 1 handles steady-state block proposal, where target hidden delta is bounded by block size.
+    auto setupOneProfile = [&](nvinfer1::IOptimizationProfile& profile, int64_t optTargetHiddenLen,
+                               int64_t maxTargetHiddenLen) {
+        bool ok = true;
+        // inputs_embeds: [batch, block_seq, hiddenSize]
+        ok &= setOptimizationProfile(&profile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, optDraftTokens, mHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, maxDraftTokens, mHiddenSize}));
+        // dflash_target_hidden_concat: [batch, delta_seq, baseOutputHiddenDim]
+        ok &= setOptimizationProfile(&profile, binding_names::kDFlashTargetHiddenConcat,
+            createDims({1, 1, mTargetModelOutputHiddenDim}),
+            createDims({mBuilderConfig.maxBatchSize, optTargetHiddenLen, mTargetModelOutputHiddenDim}),
+            createDims({mBuilderConfig.maxBatchSize, maxTargetHiddenLen, mTargetModelOutputHiddenDim}));
+        // rope_rotary_cos_sin: [1, kv_capacity, rotaryDim]
+        ok &= setOptimizationProfile(&profile, binding_names::kRopeCosSin, createDims({1, 1, mRotaryDim}),
+            createDims({1, mBuilderConfig.maxKVCacheCapacity, mRotaryDim}),
+            createDims({1, mBuilderConfig.maxKVCacheCapacity, mRotaryDim}));
+        // context_lengths: [batch]
+        ok &= setOptimizationProfile(&profile, binding_names::kContextLengths, createDims({1}),
+            createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+        // kvcache_start_index: [batch]
+        ok &= setOptimizationProfile(&profile, binding_names::kKVCacheStartIndex, createDims({1}),
+            createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+        // kv_page_table: [batch, 2, maxPagesPerSeq] int32. Proposal self-attention's page
+        // table (default identity); the draft's own KV cache above has no page table.
+        int32_t const maxPagesPerSeq
+            = rt::computeMaxPagesPerSeq(static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
+        ok &= setOptimizationProfile(&profile, binding_names::kKVPageTable, createDims({1, 2, maxPagesPerSeq}),
+            createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}),
+            createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}));
+        // dflash_delta_lengths: [batch]
+        ok &= setOptimizationProfile(&profile, binding_names::kDFlashDeltaLengths, createDims({1}),
+            createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+        // attention_mask: [batch, block_seq, packed_mask_len]
+        ok &= setOptimizationProfile(&profile, binding_names::kAttentionMask, createDims({1, 1, 1}),
+            createDims({mBuilderConfig.maxBatchSize, optDraftTokens, optPackedMaskLen}),
+            createDims({mBuilderConfig.maxBatchSize, maxDraftTokens, packedMaskLen}));
+        // attention_pos_id: [batch, block_seq]
+        ok &= setOptimizationProfile(&profile, binding_names::kAttentionPosId, createDims({1, 1}),
+            createDims({mBuilderConfig.maxBatchSize, optDraftTokens}),
+            createDims({mBuilderConfig.maxBatchSize, maxDraftTokens}));
+        // KV cache per-layer: DSpark's own combined draft cache uses the same paged-pool
+        // contract as AttentionPlugin: [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim].
+        // DFlashTargetKVCacheUpdatePlugin recovers maxBatch/cap at enqueue time from numPages
+        // and the pages_per_slot attribute configured above; this cache still has no page table
+        // of its own.
+        int64_t const numPages = rt::computeKvPoolFloorPages(
+            static_cast<int32_t>(mBuilderConfig.maxBatchSize), static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
+        for (int32_t i = 0; i < mNbKVCacheInputs; ++i)
+        {
+            int64_t layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
+            int64_t layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
+            std::string pastName = std::string(binding_names::kPastKeyValuesTemplate) + "_" + std::to_string(i);
+            std::string presentName = std::string(binding_names::kPresentKeyValuesTemplate) + "_" + std::to_string(i);
+            nvinfer1::Dims const kvCacheShape
+                = createDims({2, numPages, rt::kTOKENS_PER_PAGE, layerNumKVHeads, layerHeadSize});
+            ok &= setOptimizationProfile(&profile, pastName.c_str(), kvCacheShape, kvCacheShape, kvCacheShape);
+            ok &= setOptimizationProfile(&profile, presentName.c_str(), kvCacheShape, kvCacheShape, kvCacheShape);
+        }
+        return ok;
+    };
+
+    result &= setupOneProfile(contextProfile, optPrefillTargetHiddenLen, maxPrefillTargetHiddenLen);
+    result &= setupOneProfile(generationProfile, optDecodeTargetHiddenLen, maxDecodeTargetHiddenLen);
     return result;
 }
 
@@ -1569,6 +1683,35 @@ bool LLMBuilder::copyEagleFiles()
     }
 
     return true;
+}
+
+bool LLMBuilder::copyDSparkFiles()
+{
+    if (!isSpecDecodeDraft(mModelConfig, "dspark"))
+    {
+        return true;
+    }
+
+    bool allSuccess = true;
+    char const* const requiredFiles[] = {
+        binding_names::kDSparkHeadsFileName,
+        binding_names::kDSparkHeadsInfoFileName,
+    };
+    for (auto const* filename : requiredFiles)
+    {
+        std::string const srcPath = (mOnnxDir / filename).string();
+        std::string const dstPath = (mEngineDir / filename).string();
+        if (file_io::copyFile(srcPath, dstPath))
+        {
+            LOG_INFO("Copied DSpark sidecar %s to %s", filename, dstPath.c_str());
+        }
+        else
+        {
+            LOG_ERROR("Failed to copy DSpark sidecar %s from %s to %s", filename, srcPath.c_str(), dstPath.c_str());
+            allSuccess = false;
+        }
+    }
+    return allSuccess;
 }
 
 bool LLMBuilder::copyVocabMappingFiles()

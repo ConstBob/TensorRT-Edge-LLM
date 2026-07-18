@@ -163,6 +163,16 @@ void selectAllTopK(rt::Tensor const& input, rt::OptionalOutputTensor topKValues,
     rt::Tensor& workspace, cudaStream_t stream);
 
 /*!
+ * \brief Scatter selected top-k logits into a dense probability tensor.
+ *
+ * topKValues/topKIndices are [batch-size, top-k] outputs from selectAllTopK().
+ * The output probabilities tensor is [batch-size, vocab-size] and is zero
+ * outside the selected top-k support.
+ */
+void topKLogitsToDenseProbabilities(rt::Tensor const& topKValues, rt::Tensor const& topKIndices,
+    rt::Tensor& probabilities, int32_t vocabSize, float temperature, cudaStream_t stream);
+
+/*!
  * \brief Get workspace size required for top-K/top-P sampling (FP32 only).
  *
  * Calculates the amount of GPU memory needed for intermediate computations
