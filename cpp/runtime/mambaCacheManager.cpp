@@ -18,6 +18,7 @@
 #include "runtime/mambaCacheManager.h"
 #include "common/checkMacros.h"
 #include "common/logger.h"
+#include "kernels/gdnKernels/gdnTreeChunkKernels.h"
 #include "kernels/speculative/mtpStateScatterKernels.h"
 
 using namespace nvinfer1;
@@ -351,6 +352,66 @@ void MambaCacheManager::scatterAcceptedTreeStates(
         verifyTreeSize, recElements, acceptedStateNodeIdsPtr, maxAcceptLen, acceptLengthsPtr, stream);
     kernel::mtpScatterAcceptedTreeConvStates(layerInfos, mConfig.numRecurrentLayers, activeBatchSize, verifyTreeSize,
         convElements, acceptedStateNodeIdsPtr, maxAcceptLen, acceptLengthsPtr, stream);
+}
+
+void MambaCacheManager::replayCommitAcceptedTreeStates(
+    rt::Tensor const& acceptedStateNodeIds, rt::Tensor const& acceptLengths, cudaStream_t stream)
+{
+    if (mIntermediateRecurrentStates.empty())
+    {
+        return;
+    }
+
+    check::check(!mIntermediateConvStates.empty(), "Intermediate conv states are not allocated.");
+    check::check(mConfig.recurrentStateType == DataType::kFLOAT, "Replay commit supports FP32 recurrent states only.");
+    check::check(
+        acceptedStateNodeIds.getDataType() == DataType::kINT32, "acceptedStateNodeIds must have INT32 data type.");
+    check::check(acceptLengths.getDataType() == DataType::kINT32, "acceptLengths must have INT32 data type.");
+
+    auto const idsShape = acceptedStateNodeIds.getShape();
+    int32_t const activeBatchSize = static_cast<int32_t>(idsShape[0]);
+    int32_t const maxAcceptLen = static_cast<int32_t>(idsShape[1]);
+    if (activeBatchSize == 0 || maxAcceptLen == 0)
+    {
+        return;
+    }
+    check::check(maxAcceptLen <= kernel::kGDN_TREE_CHUNK_MAX_ACCEPT,
+        format::fmtstr("replayCommitAcceptedTreeStates: maxAcceptLen (%d) exceeds kGDN_TREE_CHUNK_MAX_ACCEPT (%d); "
+                       "blockSize must not exceed %d for the chunk-form replay kernel.",
+            maxAcceptLen, kernel::kGDN_TREE_CHUNK_MAX_ACCEPT, kernel::kGDN_TREE_CHUNK_MAX_ACCEPT));
+
+    auto const intermediateShape = mIntermediateRecurrentStates[0].getShape();
+    check::check(intermediateShape[0] == activeBatchSize,
+        "Intermediate recurrent states must be reshaped to the active batch size before replay commit.");
+    int32_t const verifyTreeSize = static_cast<int32_t>(intermediateShape[1]);
+
+    // GDN dims: hv/dk/dv live in the config; the k-head count derives from
+    // the fused-QKV conv width: convDim = 2*h*dk + hv*dv.
+    int32_t const hv = mConfig.recurrentStateNumHeads;
+    int32_t const dk = mConfig.recurrentStateHeadDim;
+    int32_t const dv = mConfig.recurrentStateSize;
+    check::check(dk == 128 && dv == 128, "Replay commit requires dk == dv == 128.");
+    int32_t const h = (mConfig.convDim / dk - hv) / 2;
+    check::check(h > 0 && hv % h == 0, "Replay commit: derived k-head count is inconsistent.");
+
+    // Stash rows sit at the head of each per-batch intermediate row; the
+    // stride is the (now unused) checkpoint row size. Must match the layout
+    // the chunk-form verify wrote in gatedDeltaNetPlugin.
+    size_t const stashBatchStrideBytes
+        = static_cast<size_t>(verifyTreeSize) * hv * static_cast<size_t>(dk) * dv * sizeof(float);
+
+    int32_t const* const idsPtr = acceptedStateNodeIds.dataPointer<int32_t>();
+    int32_t const* const lensPtr = acceptLengths.dataPointer<int32_t>();
+    auto const* const layerInfosForReplay = static_cast<kernel::MtpLayerInfo const*>(mDeviceMtpLayerInfos.rawPointer());
+    CUDA_CHECK(kernel::gdnTreeReplayCommitBatched(layerInfosForReplay, mConfig.numRecurrentLayers,
+        stashBatchStrideBytes, idsPtr, lensPtr, activeBatchSize, maxAcceptLen, verifyTreeSize, h, hv, stream));
+
+    // Conv states keep the checkpoint scatter (conv checkpoints remain valid
+    // in chunk mode — the conv plugin path is unchanged).
+    int32_t const convElements = mConfig.convDim * mConfig.convKernel;
+    auto const* const layerInfos = static_cast<kernel::MtpLayerInfo const*>(mDeviceMtpLayerInfos.rawPointer());
+    kernel::mtpScatterAcceptedTreeConvStates(layerInfos, mConfig.numRecurrentLayers, activeBatchSize, verifyTreeSize,
+        convElements, idsPtr, maxAcceptLen, lensPtr, stream);
 }
 
 } // namespace rt
