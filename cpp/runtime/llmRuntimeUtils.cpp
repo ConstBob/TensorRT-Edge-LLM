@@ -581,8 +581,8 @@ int32_t clampMaxGenerateLengthForKVCapacity(std::vector<int32_t> const& effectiv
     return clampedMaxGenerateLength;
 }
 
-rt::Tensor generateMultimodalIndices(rt::Tensor const& inputIds, std::optional<int32_t> audioTokenId,
-    std::optional<int32_t> imageTokenId, int32_t vocabSize)
+rt::Tensor generateMultimodalIndices(
+    rt::Tensor const& inputIds, std::optional<int32_t> audioTokenId, std::optional<int32_t> imageTokenId)
 {
     auto const shape = inputIds.getShape();
     check::check(shape.getNumDims() == 2, "inputIds must be 2D tensor");
@@ -608,7 +608,7 @@ rt::Tensor generateMultimodalIndices(rt::Tensor const& inputIds, std::optional<i
             {
                 indicesPtr[pos] = audioIndex++;
             }
-            else if ((imageTokenId.has_value() && tokenId == *imageTokenId) || tokenId >= vocabSize)
+            else if (imageTokenId.has_value() && tokenId == *imageTokenId)
             {
                 indicesPtr[pos] = imageIndex++;
             }

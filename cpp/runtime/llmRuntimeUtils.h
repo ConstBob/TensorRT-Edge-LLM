@@ -352,7 +352,7 @@ int32_t clampMaxGenerateLengthForKVCapacity(std::vector<int32_t> const& effectiv
     int32_t requestedMaxGenerateLength, int32_t kvCacheCapacity, int32_t kvCacheReserveLength);
 
 /*!
- * @brief Generate multimodal indices for embeddingLookupMultimodal kernel
+ * @brief Generate multimodal indices for embeddingLookup kernel
  *
  * Scans input IDs and generates sequential indices for audio/image embeddings.
  * Audio and image indices are tracked independently, both globally across batches.
@@ -360,11 +360,10 @@ int32_t clampMaxGenerateLengthForKVCapacity(std::vector<int32_t> const& effectiv
  * @param inputIds Input token IDs on CPU [batchSize, seqLen]
  * @param audioTokenId Special token ID for audio, or std::nullopt if no audio
  * @param imageTokenId Special token ID for image, or std::nullopt if no image
- * @param vocabSize Vocabulary size (tokens >= vocabSize are treated as image tokens)
  * @return multimodalIndices tensor on CPU [batchSize, seqLen]
  */
-rt::Tensor generateMultimodalIndices(rt::Tensor const& inputIds, std::optional<int32_t> audioTokenId,
-    std::optional<int32_t> imageTokenId, int32_t vocabSize);
+rt::Tensor generateMultimodalIndices(
+    rt::Tensor const& inputIds, std::optional<int32_t> audioTokenId, std::optional<int32_t> imageTokenId);
 
 /*! \brief Build Gemma4 block IDs from host token IDs.
  *

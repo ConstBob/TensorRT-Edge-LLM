@@ -146,7 +146,7 @@ void Qwen3OmniViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     trt_edgellm::tokenizer::Tokenizer const* tokenizer)
 {
     // Qwen3-Omni: flat-only (computeVisionSpans delegates to the base flat layout, so spans never carry timestamps)
-    // and every visual pad is filled with a CONSTANT imageTokenId — embeddingLookupMultimodal inserts the visual
+    // and every visual pad is filled with a CONSTANT imageTokenId — embeddingLookup inserts the visual
     // features at those positions. No incrementing IDs, no <X.X s> markers, no video-triplet expansion.
     size_t spanIdx = 0;
     for (size_t i = 0; i < request.requests.size(); ++i)

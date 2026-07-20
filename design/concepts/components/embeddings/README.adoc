@@ -6,7 +6,7 @@
 
 All current Edge-LLM decoder engines consume one dense embedding input:
 `inputs_embeds` with shape `[batch_size, sequence_length, hidden_size]`.
-Text-only, vision, audio, and legacy multimodal requests differ in how the C++
+Text-only, vision, and audio requests differ in how the C++
 runtime assembles that tensor before engine enqueue; they do not use separate
 text/vision input streams.
 
@@ -24,10 +24,10 @@ documented in link:deepstack.adoc[deepstack.adoc].
 | Text embedding lookup into `inputs_embeds`
 | `input_ids` index the text embedding table; FP8 tables use per-group scales.
 
-| Qwen2-VL, InternVL legacy vision paths
-| Text lookup plus image insertion into `inputs_embeds`
-| Image placeholders are represented by token IDs at or above `vocab_size`, so
-  `token_id - vocab_size` selects the image embedding row.
+| Vision LLMs (Qwen2.5-VL, InternVL, Qwen3-VL)
+| Multimodal lookup into `inputs_embeds`
+| Image placeholders use the explicit `imageTokenId`; `multimodalIndices`
+  selects the image embedding row for each placeholder position.
 
 | Qwen3-Omni audio/image paths
 | Multimodal lookup into `inputs_embeds`
@@ -48,13 +48,10 @@ flowchart TD
     IDS[input_ids] --> MODE{Modal inputs present?}
     TEXT[Text embedding table<br/>FP16 or FP8+scales] --> KERNELS[embeddingKernels]
     MODE -->|No| LOOKUP[embeddingLookup]
-    MODE -->|Legacy image remap| LEGACY[embeddingLookupWithImageInsertion]
     MODE -->|Explicit image/audio IDs| MM[embeddingLookupMultimodal]
     LOOKUP --> KERNELS
-    LEGACY --> KERNELS
     MM --> KERNELS
-    IMG[Visual embeddings] --> LEGACY
-    IMG --> MM
+    IMG[Visual embeddings] --> MM
     AUD[Audio embeddings] --> MM
     IND[multimodalIndices] --> MM
     KERNELS --> INPUTS[inputs_embeds]
@@ -72,16 +69,12 @@ flowchart TD
 The core embedding assembly happens in
 `cpp/kernels/embeddingKernels/embeddingKernels.{h,cu}`:
 
-* `embeddingLookup()` handles pure text. Each token ID indexes
-  `[vocab_size, hidden_size]`; FP16 tables are copied directly, while FP8 tables
-  are dequantized with FP32 per-group scales into FP16 `inputs_embeds`.
-* `embeddingLookupWithImageInsertion()` handles legacy image-token remapping.
-  Text IDs index the text table. IDs outside the vocabulary select
-  `imageEmbeds[token_id - vocab_size]`.
-* `embeddingLookupMultimodal()` handles explicit image/audio token IDs. Text
-  IDs use the text table. Positions whose token ID matches `imageTokenId` or
+* `embeddingLookup()` handles every modality in a single kernel. Text IDs index
+  the `[vocab_size, hidden_size]` table (FP16 copied directly, FP8 dequantized
+  with FP32 per-group scales into FP16 `inputs_embeds`). When image and/or audio
+  embeddings are provided, positions whose token ID matches `imageTokenId` /
   `audioTokenId` use `multimodalIndices` to select the corresponding visual or
-  audio embedding row.
+  audio embedding row; with no image/audio inputs it is a pure text lookup.
 * `assembleDeepstackEmbedding()` builds dense `[B,S,H]`
   `deepstack_embeds_<idx>` tensors from raw visual `deepstack_features_<idx>`.
   Image positions receive the selected deepstack feature row; non-image
@@ -95,10 +88,9 @@ of emitting partial embeddings.
 
 1. `EmbeddingPreprocessor` receives request token IDs and reshapes the
    `inputs_embeds` buffer to `[active_batch, input_ids_len, hidden_size]`.
-2. The runtime selects one assembly kernel:
-   * pure text -> `embeddingLookup()`;
-   * legacy vision-only remap -> `embeddingLookupWithImageInsertion()`;
-   * audio or explicit image/audio token IDs -> `embeddingLookupMultimodal()`.
+2. `embeddingLookup()` assembles `inputs_embeds` for every request: prefill
+   passes any image/audio embeddings for insertion, and decode (text-only)
+   calls the same kernel with no multimodal inputs.
 3. If the engine expects deepstack inputs, visual runner outputs are converted
    into `deepstack_embeds_<idx>` by `assembleDeepstackEmbedding()`. Text-only
    requests on deepstack-capable engines bind zero deepstack tensors.

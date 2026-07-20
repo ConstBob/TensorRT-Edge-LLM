@@ -293,8 +293,6 @@ void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     }
 
     int64_t imageIndex = 0;
-    // Image token id will start from vocabSize and increment for each image token position
-    int32_t imageTokenId = mConfig.vocabSize;
 
     for (size_t i = 0; i < request.requests.size(); ++i)
     {
@@ -314,8 +312,7 @@ void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
                 int64_t numImageTokens = imageTokenLengths.at(imageIndex);
                 for (int64_t k = 0; k < numImageTokens; ++k)
                 {
-                    newIds.push_back(imageTokenId);
-                    ++imageTokenId;
+                    newIds.push_back(mConfig.imageTokenId);
                 }
 
                 // Append </img> token

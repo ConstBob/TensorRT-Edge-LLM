@@ -595,9 +595,8 @@ void QwenViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchInputIds, std::vector<VisionSpan> const& spans,
     trt_edgellm::tokenizer::Tokenizer const* tokenizer)
 {
-    // Flat visual-pad expansion: each vision pad (<|image_pad|>/<|video_pad|>) -> its span's numTokens incrementing
-    // IDs (>= vocabSize), consumed by embeddingLookupWithImageInsertion.
-    int32_t nextImageTokenId = mConfig.vocabSize;
+    // Flat visual-pad expansion: each vision pad (<|image_pad|>/<|video_pad|>) -> its span's numTokens copies of
+    // mConfig.imageTokenId (matches HF); embeddingLookup fills those positions from the visual embeds.
     size_t spanIdx = 0;
 
     for (size_t i = 0; i < request.requests.size(); ++i)
@@ -623,7 +622,7 @@ void QwenViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
                 LlmVisionBlock const& block = spans[spanIdx++].llm;
                 for (int64_t k = 0; k < block.numTokens; ++k)
                 {
-                    newIds.push_back(nextImageTokenId++);
+                    newIds.push_back(mConfig.imageTokenId);
                 }
             }
             else

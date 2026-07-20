@@ -47,7 +47,7 @@ protected:
     void getMRopePositionIds(
         std::vector<std::vector<int32_t>> const& batchInputIds, std::vector<VisionSpan> const& spans) noexcept override;
 
-    //! Fills visual pads with a constant imageTokenId (embeddingLookupMultimodal), vs the base's incrementing IDs.
+    //! Fills visual pads with a constant imageTokenId (embeddingLookup), vs the base's incrementing IDs.
     //! Omni is flat-only (no timestamped sub-spans), so this is a simpler walk than the base's.
     void textPreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchInputIds,
         std::vector<VisionSpan> const& spans, trt_edgellm::tokenizer::Tokenizer const* tokenizer) override;

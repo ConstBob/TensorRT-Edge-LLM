@@ -165,11 +165,10 @@ void Qwen3VLViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchInputIds, std::vector<VisionSpan> const& spans,
     trt_edgellm::tokenizer::Tokenizer const* tokenizer)
 {
-    // Pads expand to incrementing IDs (>= vocabSize; embeddingLookupWithImageInsertion). Two paths:
+    // Pads expand to copies of mConfig.imageTokenId (embeddingLookup fills them in order). Two paths:
     //   (a) VIDEO: the <|vision_start|><|video_pad|><|vision_end|> triplet -> one timestamped (<X.X s> + vision_start
     //       + pads + vision_end) group per per-frame sub-span. Detected data-driven (next span carries a timestamp).
     //   (b) IMAGE (and any non-video pad): one flat pad run.
-    int32_t nextImageTokenId = mConfig.vocabSize;
     size_t spanIdx = 0;
 
     for (size_t i = 0; i < request.requests.size(); ++i)
@@ -218,7 +217,7 @@ void Qwen3VLViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
                     newIds.push_back(mConfig.visionStartTokenId);
                     for (int64_t k = 0; k < block.numTokens; ++k)
                     {
-                        newIds.push_back(nextImageTokenId++);
+                        newIds.push_back(mConfig.imageTokenId);
                     }
                     newIds.push_back(mConfig.visionEndTokenId);
                 }
@@ -232,7 +231,7 @@ void Qwen3VLViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
                 LlmVisionBlock const& block = spans[spanIdx++].llm;
                 for (int64_t k = 0; k < block.numTokens; ++k)
                 {
-                    newIds.push_back(nextImageTokenId++);
+                    newIds.push_back(mConfig.imageTokenId);
                 }
                 ++bufferIdx;
             }

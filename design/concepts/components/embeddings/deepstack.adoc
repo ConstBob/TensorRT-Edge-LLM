@@ -85,11 +85,8 @@ consume them, runtime expands each feature tensor to the full prompt shape:
 2. For each feature tensor, it reshapes a preallocated output buffer to
    `[active_batch, input_ids_len, hidden_size]`.
 3. `kernel::assembleDeepstackEmbedding()` scans `input_ids` and identifies image
-   token positions in one of two ways:
-   * legacy vision remap: `token_id >= vocab_size`, with image row index
-     `token_id - vocab_size`;
-   * explicit image token ID: `token_id == imageTokenId`, with row index from
-     `multimodalIndices`.
+   token positions by `token_id == imageTokenId`, with the image row index taken
+   from `multimodalIndices`.
 4. Image positions receive the selected deepstack feature row. Text, audio,
    padding, and other non-image positions are zero-filled.
 5. `TensorRegistry` binds the resulting `deepstack_embeds_<idx>` tensors by
@@ -149,6 +146,6 @@ corresponding decoder layer index.
 
 * `unittests/embeddingLookupTests.cpp` covers `assembleDeepstackEmbedding()`
   accuracy, out-of-bounds handling, explicit image-token IDs,
-  `multimodalIndices`, legacy image-token indexing, and shape-error handling.
+  `multimodalIndices`, and shape-error handling.
 * There is currently no separate engine-level test for deepstack binding
   count/shape validation.
