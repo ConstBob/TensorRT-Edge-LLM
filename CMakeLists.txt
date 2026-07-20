@@ -45,9 +45,20 @@ macro(set_ifndef var val)
 endmacro()
 
 macro(add_cross_build_link_options target)
-  if(DEFINED AARCH64_BUILD)
-    target_link_options(${target} PRIVATE "-L${CUDA_DIR}/lib")
-    target_link_options(${target} PRIVATE "-L${CUDA_DIR}/lib/stubs")
+  if(AARCH64_BUILD)
+    get_target_property(_cross_link_options_added ${target}
+                        TRT_EDGELLM_CROSS_LINK_OPTIONS_ADDED)
+    if(NOT _cross_link_options_added)
+      get_target_property(_cross_target_type ${target} TYPE)
+      set(_cross_link_scope PRIVATE)
+      if(_cross_target_type STREQUAL "STATIC_LIBRARY")
+        set(_cross_link_scope INTERFACE)
+      endif()
+      target_link_options(${target} ${_cross_link_scope} "-L${CUDA_DIR}/lib"
+                          "-L${CUDA_DIR}/lib/stubs")
+      set_property(TARGET ${target}
+                   PROPERTY TRT_EDGELLM_CROSS_LINK_OPTIONS_ADDED TRUE)
+    endif()
   endif()
 endmacro(add_cross_build_link_options)
 
@@ -61,7 +72,7 @@ endif()
 set_ifndef(CUDA_CTK_VERSION 12.8)
 set_ifndef(CUDA_DIR /usr/local/cuda-${CUDA_CTK_VERSION})
 
-if(NOT DEFINED AARCH64_BUILD)
+if(NOT AARCH64_BUILD)
   set(CMAKE_CUDA_ARCHITECTURES 80;86;89)
   if(CUDA_CTK_VERSION VERSION_GREATER_EQUAL 12.8)
     list(APPEND CMAKE_CUDA_ARCHITECTURES 100a 120)
@@ -88,6 +99,13 @@ find_library(
   CUDA_DRIVER_LIB cuda
   HINTS ${CUDA_DIR} ${CUDA_TARGET_DIR}
   PATH_SUFFIXES lib lib64 lib/stubs)
+set(CUDA_DRIVER_LINK_LIB "${CUDA_DRIVER_LIB}")
+if(AARCH64_BUILD)
+  # Cross builds link against the CUDA driver stub via -L.../lib/stubs -lcuda.
+  # Do not pass the absolute stub .so to target_link_libraries(), or CMake will
+  # bake the stub directory into build RUNPATH and target execution can load it.
+  set(CUDA_DRIVER_LINK_LIB cuda)
+endif()
 
 find_path(
   CURAND_KERNEL_INCLUDE_DIR
@@ -198,8 +216,9 @@ if(BUILD_UNIT_TESTS)
   # Define project root path for tests to access resources
   target_compile_definitions(unitTest
                              PRIVATE PROJECT_ROOT_DIR="${CMAKE_SOURCE_DIR}")
-  target_link_libraries(unitTest PRIVATE gtest gtest_main edgellmCore
-                                         commonLibraryExt ${CUDA_DRIVER_LIB})
+  target_link_libraries(
+    unitTest PRIVATE gtest gtest_main edgellmCore commonLibraryExt
+                     ${CUDA_DRIVER_LINK_LIB})
   if(NOT ENABLE_CUTE_DSL STREQUAL "OFF")
     include(${CMAKE_SOURCE_DIR}/cmake/CuteDsl.cmake)
     cute_dsl_setup(LINK_TARGETS unitTest)

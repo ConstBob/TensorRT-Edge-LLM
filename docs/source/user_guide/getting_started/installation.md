@@ -91,17 +91,19 @@ python3 -m venv venv
 source venv/bin/activate
 ```
 
-Install the base checkpoint export dependencies. Optional tool dependencies stay
+Install the package and its dependencies. The base install registers the CLI
+entry points (`tensorrt-edgellm-export`, `tensorrt-edgellm-quantize`, etc.) and
+pulls the core checkpoint export dependencies. Optional tool dependencies stay
 out of the base environment so export-only and server images do not pull
 quantization, audio, and LoRA-merge packages unnecessarily.
 
 ```bash
-# Required for checkpoint export (dependencies plus tensorrt-edgellm-* entry points)
-pip3 install .
+# Install the package (registers CLI entry points and core export dependencies)
+pip3 install -e .
 
 # Required for quantization, LoRA merge, vocabulary reduction, audio preprocessing,
-# and tokenizer helpers
-pip3 install ".[tools]"
+# and tokenizer helpers (re-installs with the tools extra)
+pip3 install -e ".[tools]"
 
 # Required only for the experimental high-level Python API and server
 pip3 install -r requirements-server.txt
@@ -176,7 +178,7 @@ from the platform row that matches the device or SDK image.
 |:---------|:-----------------|:-------------------|:---------------|:------------------|
 | Jetson Thor | JetPack 7.0/7.1 | `13.0` | Jetson device | See [Supported Models](supported-models.md) |
 | Jetson Thor | JetPack 7.2 | `13.2` | Jetson device | See [Supported Models](supported-models.md) |
-| DRIVE Thor | DriveOS 7.2 | `13.3` | DriveOS SDK Docker image, then copy `build/` to the DRIVE system | See [Supported Models](supported-models.md) |
+| DRIVE Thor | DriveOS 7.2 | `13.2` | DriveOS SDK Docker image, then copy `build/` to the DRIVE system | See [Supported Models](supported-models.md) |
 | DGX Spark (GB10) | DGX Spark software stack | `13.0` | DGX Spark system | See [Supported Models](supported-models.md) |
 | Jetson Orin | JetPack 7.2 | `13.2` | Jetson device | FP16, INT8, and INT4 |
 | Jetson Orin | JetPack 6.2+ | `12.6` | Jetson device | FP16, INT8, and INT4 |
@@ -273,7 +275,7 @@ cmake .. \
     -DTRT_PACKAGE_DIR=/usr \
     -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake \
     -DEMBEDDED_TARGET=auto-thor \
-    -DCUDA_CTK_VERSION=13.0 \
+    -DCUDA_CTK_VERSION=13.2 \
     -DENABLE_CUTE_DSL=ALL
 ```
 
@@ -349,18 +351,19 @@ cmake .. \
 | `TRT_PACKAGE_DIR` | Path to TensorRT installation. Auto-detected; manual hint to disambiguate multiple versions. | N/A |
 | `CMAKE_TOOLCHAIN_FILE` | **Required for Edge devices**: Use `cmake/aarch64_linux_toolchain.cmake` for Edge device builds. **Not needed for GPU builds** | N/A |
 | `EMBEDDED_TARGET` | **Required for Edge devices**: `jetson-thor` (Jetson Thor), `auto-thor` (DRIVE Thor / DriveOS), `gb10` (DGX Spark), or `jetson-orin` (Jetson Orin). **Not needed for GPU builds** | N/A |
-| `CUDA_CTK_VERSION` | CUDA Toolkit version. Use the platform command above to select `13.2`, `13.0`, or `12.6`. Do not pass `-DCUDA_VERSION`; CMake reserves that name for CUDA headers and rejects it. | target default |
+| `CUDA_CTK_VERSION` | CUDA Toolkit version. Use the platform command above to select `13.2`, `13.0`, or `12.6`. | target default |
 | `BUILD_UNIT_TESTS` | Build unit tests | OFF |
 | `ENABLE_COVERAGE` | Enable gcov code coverage instrumentation (see [Code Coverage](../../developer_guide/testing/code-coverage.md)) | OFF |
-| `ENABLE_CUTE_DSL` | Enable prebuilt CuTe DSL kernels: `OFF`, `ALL`, or a group list such as `gdn`, `fmha`, `gemm`, or `ssd`. Set this to `ALL` for customer builds. | OFF |
+| `ENABLE_CUTE_DSL` | Enable generated CuTe DSL kernels: `OFF`, `ALL`, or a group list such as `gdn`, `fmha`, `gemm`, or `ssd`. Set this to `ALL` for customer builds. | OFF |
 | `CUTE_DSL_ARTIFACT_TAG` | Optional artifact tag under `cpp/kernels/cuteDSLArtifact/<arch>/`, for example `sm_87`, `sm_110`, or `sm_121`. Required when multiple local artifact tags exist for the same CPU architecture. | auto |
 
 **CuTe DSL Kernel Artifacts**
 
-CuTe DSL binaries are prebuilt and shipped with the repository. The platform
-commands above pass `-DENABLE_CUTE_DSL=ALL` because Qwen3.5 and several other
-model paths require them. If you select groups manually, Qwen3.5 GDN requires
-`-DENABLE_CUTE_DSL=gdn` or `-DENABLE_CUTE_DSL=ALL`.
+CuTe DSL binaries are generated with `kernelSrcs/build_cutedsl.py` before
+configuring CMake. The platform commands above pass `-DENABLE_CUTE_DSL=ALL`
+because Qwen3.5 and several other model paths require them. If you select groups
+manually, Qwen3.5 GDN requires `-DENABLE_CUTE_DSL=gdn` or
+`-DENABLE_CUTE_DSL=ALL`.
 
 If you have multiple local artifact tags for the same CPU architecture, also
 pass `-DCUTE_DSL_ARTIFACT_TAG=<tag>`.

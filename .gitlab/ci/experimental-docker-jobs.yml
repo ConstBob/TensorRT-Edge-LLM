@@ -5,7 +5,7 @@
 l0_experimental_docker_jedha:
   stage: l0_test
   needs:
-    - job: build_cutedsl_sm110_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   tags:
     - jedha-edgellm-nvks
@@ -15,7 +15,6 @@ l0_experimental_docker_jedha:
     BOARD_IP: "192.168.55.1"
     REMOTE_WORKSPACE: "/home/tensorrt_user/tensorrt-edge-llm-docker-${CI_PIPELINE_ID}-${CI_JOB_ID}"
     EXPERIMENTAL_DOCKER_IMAGE: "tensorrt-edge-llm:experimental-${CI_COMMIT_SHORT_SHA}"
-    CUTE_DSL_ARTIFACT_NAME: "cutedsl_aarch64_sm_110_cuda13.tar.gz"
   before_script:
     - apt-get update -qq
     - apt-get install -y -qq --no-install-recommends openssh-client sshpass rsync

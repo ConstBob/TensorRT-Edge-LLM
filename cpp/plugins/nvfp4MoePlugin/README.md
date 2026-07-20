@@ -7,7 +7,7 @@ NVFP4 MoE kernel in
 This plugin is the **SM100/SM101/SM110** counterpart of
 [`NvFP4MoEPluginGeforce`](../nvfp4MoePluginGeforce/nvfp4MoePluginGeforce.cpp),
 which targets **SM120 / SM121 (consumer Blackwell)** via the fused
-CuTeDSL path.
+CuTe DSL path.
 
 The two plugins share the same 11-input / 1-output ONNX surface and
 attribute set, but consume **different on-disk weight layouts**:
@@ -18,7 +18,7 @@ attribute set, but consume **different on-disk weight layouts**:
   axis (the layout the split FC1 kernel reads natively).
 * `NvFP4MoEPluginGeforce` expects FC1 packed as the plain
   ``[up_all, gate_all]`` concat along the M axis (the layout the SM12x
-  fused CuTeDSL kernel reads natively).
+  fused CuTe DSL kernel reads natively).
 
 The Python export side picks the plugin and the matching weight repack
 based on the target arch.
@@ -39,7 +39,7 @@ may be generated but are not dispatched yet.
 | `backend` | decode + prefill (`auto` picks decode when `num_tokens*top_k` is small) |
 | `hidden_size` (H) | `H > 0 && H % 128 == 0` |
 | `moe_inter_size` (I) | `I > 0 && I % 64 == 0`, `FC1_N % 128 == 0` |
-| `num_experts` (E) | `E in {128, 256}` (FC1/FC2 cubins are runtime-polymorphic in E) |
+| `num_experts` (E) | `E == 128` |
 | `top_k` | `0 < top_k <= 8` |
 
 The plugin's `configurePlugin` enforces the divisibility and alignment
@@ -75,26 +75,16 @@ e_score_correction_bias  fp32    [E]     # router correction bias; zeros for sof
 -> output                fp16    [B, S, H]
 ```
 
-Block scales use the contiguous physical CuTeDSL NVFP4 layout
+Block scales use the contiguous physical CuTe DSL NVFP4 layout
 `[E, m_tiles, k_tiles, 32, 4, 4]`.
 
-## Build
+## Artifact Development
 
-Install `nvidia-cutlass-dsl[cu13]==4.6.1` (the `[cu13]` extra is mandatory on
-CUDA 13), then:
-
-```bash
-python kernelSrcs/build_cutedsl.py \
-  --kernels nvfp4_moe \
-  --gpu_arch sm_110 \
-  --arch aarch64 \
-  --clean
-cmake -S . -B build \
-  -DENABLE_CUTE_DSL=nvfp4_moe \
-  -DCMAKE_CUDA_ARCHITECTURES=110a \
-  ...
-cmake --build build -j
-```
+If you modify the associated kernel or its registry entries, manually
+regenerate the `nvfp4_moe` artifact before building this plugin. Otherwise,
+CMake uses the matching prebuilt tarball by default. Use the shared
+[CuTe DSL kernel development workflow](../../../kernelSrcs/README.md#cute-dsl-kernel-development-workflow)
+for the Docker or local-venv build and the subsequent CMake configuration.
 
 CMake auto-defines `CUTE_DSL_NVFP4_MOE_ENABLED` on the plugin target.
 Without it, the plugin still compiles but every `enqueue` call returns
@@ -103,9 +93,10 @@ in build-only environments).
 
 ## Retargeting other shapes
 
-The split FC1/FC2 pack is specialized to `E=128` and `top_k<=8`;
-hidden size and intermediate size stay runtime dimensions subject to the
-alignment contract above.
+For `(H, I)` changes that still match the alignment contract in
+[Supported shapes](#supported-shapes) (`E=128`, `top_k<=8`, `H % 128 == 0`,
+`I % 64 == 0`, `FC1_N % 128 == 0`): no rebuild needed. Configure the plugin
+with the desired tuple.
 
 If a new MMA N-tile granularity is needed (e.g. `n64` / `n512`), add a
 new `KernelVariant` row to `build_cutedsl.py`, add the matching static
@@ -116,16 +107,15 @@ and rebuild.
 ## Validation
 
 The split-path plugin accuracy entry is
-[the SM110 CuTeDSL MoE unit test](../../../unittests/nvfp4MoeCuteDslSm110Tests.cu)
-(`CuteDslNvfp4MoeSm110Test.accuracy`).
+[the SM100/101/110 plugin accuracy test](../../../tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py).
 Avoid validating production routing by instantiating Python-only helper
 modules directly; model integration should be tested at the export path
 that explicitly emits `Nvfp4MoePlugin` for an SM100/101/110 target.
 
 ### Thor sign-off checklist (runner-test equivalent)
 
-1. `mount-thor-sshfs` the workspace onto Thor.
-2. `python kernelSrcs/build_cutedsl.py --kernels nvfp4_moe --gpu_arch sm_110 --arch aarch64 --clean`
+1. Manually generate the `nvfp4_moe` artifact with the shared workflow.
+2. `mount-thor-sshfs` the workspace onto Thor.
 3. Build the plugin with `-DENABLE_CUTE_DSL=nvfp4_moe -DCMAKE_CUDA_ARCHITECTURES=110a`.
-4. Run the split-path plugin accuracy test:
-   `./build/unitTest --gtest_filter="CuteDslNvfp4MoeSm110Test.accuracy"`.
+4. Run the split-path plugin accuracy test
+   (`tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py`).

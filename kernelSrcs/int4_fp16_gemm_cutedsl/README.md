@@ -83,18 +83,15 @@ consumer must pick a factor that divides `ceil(K/64)` for the runtime `K`. For
 semaphore — no separate reduction kernel and no extra workspace (the running sum
 folds into `C`).
 
-## Building
+## Artifact Development
 
-```bash
-cd tensorrt-edge-llm
-
-# Build all 75 INT4 variants for the current Ampere GPU
-python kernelSrcs/build_cutedsl.py --kernels int4_fp16_gemm
-
-# Or for a specific Ampere SM
-python kernelSrcs/build_cutedsl.py --kernels int4_fp16_gemm --gpu_arch sm_80
-python kernelSrcs/build_cutedsl.py --kernels int4_fp16_gemm --gpu_arch sm_87
-```
+If you modify this kernel or its registry entries, manually regenerate the
+`int4_fp16_gemm` group before running CMake. Otherwise, CMake uses the matching
+prebuilt tarball by default. Follow the shared
+[CuTe DSL kernel development workflow](../README.md#cute-dsl-kernel-development-workflow)
+for the supported Docker and local-venv commands, dependency versions,
+cross-compilation, artifact layout, and CMake configuration. This group emits all 75 registered
+variants, so allow additional build time and GPU memory.
 
 Supported SMs: **SM80 and newer**. The kernel uses the SM80 instruction floor
 (`cp.async` + `mma.sync` 16×8×16 + `ldmatrix`), which is forward-compatible and
@@ -158,15 +155,12 @@ wires the artifact include dir + define onto `unitTest`.
 ### Build + run the test
 
 ```bash
-# 1. Build the int4 artifact (all 75 variants) for the current Ampere GPU
-python kernelSrcs/build_cutedsl.py --kernels int4_fp16_gemm
-
-# 2. Configure with unit tests + the int4 group enabled, then build
+# After manually generating the full group with the shared workflow:
 cmake -B build -DBUILD_UNIT_TESTS=ON -DENABLE_CUTE_DSL=int4_fp16_gemm \
       -DTRT_PACKAGE_DIR=/path/to/TensorRT ..
 cmake --build build -j
 
-# 3. Run just the int4 accuracy cases
+# Run just the int4 accuracy cases
 ./build/unitTest --gtest_filter='Int4Fp16GemmAllVariants/*'
 ```
 

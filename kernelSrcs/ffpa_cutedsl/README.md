@@ -22,32 +22,14 @@ Supported artifact targets:
 | 80, 86, 87, 89 | Native Ampere/Ada path. The default tuning was validated on sm_86. |
 | 100, 101, 110, 120, 121 | Portability fallback. Prefer `fmha_cutedsl_blackwell/` for peak Blackwell performance. |
 
-## Quick Start
+## Artifact Development
 
-```bash
-python3 -m venv build_kernel_venv
-source build_kernel_venv/bin/activate
-pip install nvidia-cutlass-dsl==4.6.1 cupy-cuda12x==12.3.0 cuda-python
-
-cd tensorrt-edge-llm
-python kernelSrcs/build_cutedsl.py --kernels ffpa --gpu_arch sm_86 --clean -j 4
-
-cmake .. -DENABLE_CUTE_DSL=ffpa -DTRT_PACKAGE_DIR=/path/to/TensorRT
-```
-
-Use `cupy-cuda13x==13.6.0` instead of `cupy-cuda12x` for CUDA 13.x.
-If `--gpu_arch` is omitted, `build_cutedsl.py` auto-detects the local GPU.
-
-Artifacts are written under `cpp/kernels/cuteDSLArtifact/{arch}/sm_<NN>/`:
-
-```text
-libcutedsl_{arch}.a
-include/
-    cutedsl_all.h
-    cutedsl_ffpa_all.h
-    ffpa_d512_causal.h
-metadata.json
-```
+If you modify this kernel or its registry entries, manually regenerate the
+`ffpa` group before running CMake. Otherwise, CMake uses the matching prebuilt
+tarball by default. Follow the shared
+[CuTe DSL kernel development workflow](../README.md#cute-dsl-kernel-development-workflow)
+for the supported Docker and local-venv commands, dependency versions,
+cross-compilation, artifact layout, and CMake configuration.
 
 When the `ffpa` group is active, CMake defines `CUTE_DSL_FFPA_ENABLED` for
 targets passed through `cute_dsl_setup()`. Correctness is covered by
@@ -216,6 +198,6 @@ Useful axes:
   — FFPA-style FMHA forward kernel by DefTruth and the xlite-dev community.
   Original CUDA sources at `csrc/cuffpa/prefill.cuh` +
   `csrc/cuffpa/ffpa_attn_fwd.cuh`.
-- [NVIDIA CUTLASS](https://github.com/NVIDIA/cutlass) (Apache-2.0) — CuTeDSL
+- [NVIDIA CUTLASS](https://github.com/NVIDIA/cutlass) (Apache-2.0) — CuTe DSL
   Ampere FA2 example used as the structural skeleton, at
   `examples/python/CuTeDSL/cute/ampere/kernel/attention/flash_attention_v2.py`.

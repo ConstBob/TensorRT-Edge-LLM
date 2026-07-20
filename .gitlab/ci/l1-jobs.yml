@@ -389,7 +389,7 @@ l1_rtx5080_llm:
     - l1_blackwell_export_small
     - l1_blackwell_export_large
     - l1_dataset_prep
-    - job: build_cutedsl_x86_sm120_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     CUDA_VERSION: "12.9"
@@ -406,9 +406,6 @@ l1_rtx5080_llm:
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_rtx5080.csv"
-  before_script:
-    - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_x86_64_sm_120_cuda12.tar.gz cutedsl_x86_64_sm_120_cuda12.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   tags:
     - rtx5080-edgellm-nvks
   image: "$IMAGE"
@@ -424,7 +421,7 @@ l1_rtx5080_vlm:
     - l1_blackwell_export_small
     - l1_blackwell_export_large
     - l1_dataset_prep
-    - job: build_cutedsl_x86_sm120_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     CUDA_VERSION: "12.9"
@@ -441,9 +438,6 @@ l1_rtx5080_vlm:
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_rtx5080.csv"
-  before_script:
-    - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_x86_64_sm_120_cuda12.tar.gz cutedsl_x86_64_sm_120_cuda12.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   tags:
     - rtx5080-edgellm-nvks
   image: "$IMAGE"
@@ -459,7 +453,7 @@ l1_rtx5090_llm:
     - l1_blackwell_export_small
     - l1_blackwell_export_moe
     - l1_dataset_prep
-    - job: build_cutedsl_x86_sm120_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     CUDA_VERSION: "13.2"
@@ -475,9 +469,6 @@ l1_rtx5090_llm:
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_rtx5090.csv"
-  before_script:
-    - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_x86_64_sm_120_cuda12.tar.gz cutedsl_x86_64_sm_120_cuda12.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   tags:
     - rtx5090-edgellm-nvks
   image: "$IMAGE"
@@ -493,7 +484,7 @@ l1_rtx5090_vlm:
     - l1_blackwell_export_large
     - l1_blackwell_export_moe
     - l1_dataset_prep
-    - job: build_cutedsl_x86_sm120_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     CUDA_VERSION: "13.2"
@@ -509,9 +500,6 @@ l1_rtx5090_vlm:
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_rtx5090.csv"
-  before_script:
-    - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_x86_64_sm_120_cuda12.tar.gz cutedsl_x86_64_sm_120_cuda12.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   tags:
     - rtx5090-edgellm-nvks
   image: "$IMAGE"
@@ -528,7 +516,7 @@ l1_rtx5090_eagle:
     - l1_blackwell_export_large
     - l1_blackwell_export_eagle
     - l1_dataset_prep
-    - job: build_cutedsl_x86_sm120_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     CUDA_VERSION: "13.2"
@@ -544,9 +532,6 @@ l1_rtx5090_eagle:
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_rtx5090.csv"
-  before_script:
-    - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_x86_64_sm_120_cuda12.tar.gz cutedsl_x86_64_sm_120_cuda12.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   tags:
     - rtx5090-edgellm-nvks
   image: "$IMAGE"
@@ -568,8 +553,6 @@ l1_rtx5090_eagle:
     LOCAL_LLM: "openai/openai/gpt-5.1"
     OPENAI_API_BASE: "https://inference-api.nvidia.com/v1/chat/completions"
   before_script:
-    - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_x86_64_sm_120_cuda12.tar.gz cutedsl_x86_64_sm_120_cuda12.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
     - |
       if [ ! -d "$VLMEVALKIT_DIR/.git" ]; then
         echo "Cloning VLMEvalKit into $VLMEVALKIT_DIR"
@@ -585,7 +568,7 @@ l1_b100_qwen:
   needs:
     - l1_blackwell_export_large
     - l1_dataset_prep
-    - job: build_cutedsl_x86_sm120_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     CUDA_VERSION: "13.2"
@@ -621,7 +604,7 @@ l1_b100_misc:
     - l1_blackwell_export_large
     - l1_blackwell_export_moe
     - l1_dataset_prep
-    - job: build_cutedsl_x86_sm120_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     CUDA_VERSION: "13.2"
@@ -657,7 +640,7 @@ l1_spark:
     - l1_blackwell_export_large
     - l1_blackwell_export_moe
     - l1_dataset_prep
-    - job: build_cutedsl_gb10_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     CUDA_VERSION: "13.0"
@@ -673,9 +656,6 @@ l1_spark:
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_spark.csv"
   tags:
     - local-spark
-  before_script:
-    - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_aarch64_sm_121_cuda13.tar.gz cutedsl_aarch64_sm_121_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   script:
     - echo "Pipeline start time:$(date)"
     - echo "Node name:$(hostname)"
@@ -709,7 +689,7 @@ l1_drive_thor_1_llm:
     - l1_blackwell_export_small
     - l1_blackwell_export_moe
     - l1_dataset_prep
-    - job: build_cutedsl_sm110_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     TRT_CUDA_VERSION: "12.8"
@@ -725,9 +705,6 @@ l1_drive_thor_1_llm:
     ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_drive_thor_1.csv"
-  before_script:
-    - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   tags:
     - thor_drive-nvks
   image: "ubuntu:24.04"
@@ -743,7 +720,7 @@ l1_drive_thor_1_vlm:
     - l1_blackwell_export_large
     - l1_blackwell_export_moe
     - l1_dataset_prep
-    - job: build_cutedsl_sm110_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     TRT_CUDA_VERSION: "12.8"
@@ -759,9 +736,6 @@ l1_drive_thor_1_vlm:
     ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_drive_thor_1.csv"
-  before_script:
-    - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   tags:
     - thor_drive-nvks
   image: "ubuntu:24.04"
@@ -777,7 +751,7 @@ l1_drive_thor_1_eagle:
     - l1_blackwell_export_small
     - l1_blackwell_export_eagle
     - l1_dataset_prep
-    - job: build_cutedsl_sm110_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     TRT_CUDA_VERSION: "12.8"
@@ -793,9 +767,6 @@ l1_drive_thor_1_eagle:
     ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_drive_thor_1.csv"
-  before_script:
-    - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   tags:
     - thor_drive-nvks
   image: "ubuntu:24.04"
@@ -811,7 +782,7 @@ l1_drive_thor_2_llm:
     - l1_blackwell_export_small
     - l1_blackwell_export_moe
     - l1_dataset_prep
-    - job: build_cutedsl_sm110_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     BOARD_USER: "tensorrt_user"
@@ -827,9 +798,6 @@ l1_drive_thor_2_llm:
     ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_drive_thor_2.csv"
-  before_script:
-    - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   tags:
     - thor_ts4_724-nvks
   image: "ubuntu:24.04"
@@ -845,7 +813,7 @@ l1_drive_thor_2_vlm:
     - l1_blackwell_export_large
     - l1_blackwell_export_moe
     - l1_dataset_prep
-    - job: build_cutedsl_sm110_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     BOARD_USER: "tensorrt_user"
@@ -861,9 +829,6 @@ l1_drive_thor_2_vlm:
     ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_drive_thor_2.csv"
-  before_script:
-    - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   tags:
     - thor_ts4_724-nvks
   image: "ubuntu:24.04"
@@ -880,7 +845,7 @@ l1_drive_thor_2_eagle:
     - l1_blackwell_export_large
     - l1_blackwell_export_eagle
     - l1_dataset_prep
-    - job: build_cutedsl_sm110_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     BOARD_USER: "tensorrt_user"
@@ -896,9 +861,6 @@ l1_drive_thor_2_eagle:
     ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_drive_thor_2.csv"
-  before_script:
-    - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   tags:
     - thor_ts4_724-nvks
   image: "ubuntu:24.04"
@@ -913,7 +875,7 @@ l1_drive_thor_2_extras:
   needs:
     - l1_ampere_export
     - l1_dataset_prep
-    - job: build_cutedsl_sm110_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     BOARD_USER: "tensorrt_user"
@@ -929,9 +891,6 @@ l1_drive_thor_2_extras:
     ONNX_DIR: "$L1_CACHE_DIR/l1_ampere_exports/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_drive_thor_2.csv"
-  before_script:
-    - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   tags:
     - thor_ts4_724-nvks
   image: "ubuntu:24.04"
@@ -947,7 +906,7 @@ l1_drive_thor_2_extras_blackwell:
     - l1_blackwell_export_small
     - l1_blackwell_export_large
     - l1_dataset_prep
-    - job: build_cutedsl_sm110_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     BOARD_USER: "tensorrt_user"
@@ -963,9 +922,6 @@ l1_drive_thor_2_extras_blackwell:
     ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_drive_thor_2.csv"
-  before_script:
-    - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   tags:
     - thor_ts4_724-nvks
   image: "ubuntu:24.04"
@@ -981,7 +937,7 @@ l1_jedha_vlm:
     - l1_blackwell_export_large
     - l1_blackwell_export_moe
     - l1_dataset_prep
-    - job: build_cutedsl_sm110_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     BOARD_USER: "tensorrt_user"
@@ -997,9 +953,6 @@ l1_jedha_vlm:
     ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_jedha.csv"
-  before_script:
-    - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   tags:
     - jedha-edgellm-nvks
   image: "ubuntu:24.04"
@@ -1017,7 +970,7 @@ l1_jedha_llm_eagle:
     - l1_blackwell_export_moe
     - l1_blackwell_export_eagle
     - l1_dataset_prep
-    - job: build_cutedsl_sm110_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     BOARD_USER: "tensorrt_user"
@@ -1033,9 +986,6 @@ l1_jedha_llm_eagle:
     ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_jedha.csv"
-  before_script:
-    - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   tags:
     - jedha-edgellm-nvks
   image: "ubuntu:24.04"
