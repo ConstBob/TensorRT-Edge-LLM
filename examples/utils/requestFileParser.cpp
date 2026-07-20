@@ -118,6 +118,16 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
     bool applyChatTemplate = inputData.value("apply_chat_template", true);
     bool addGenerationPrompt = inputData.value("add_generation_prompt", true);
     bool enableThinking = inputData.value("enable_thinking", false);
+    int32_t diffusionMaxDenoisingSteps = 0;
+    if (inputData.contains("diffusion_config") && !inputData["diffusion_config"].is_null())
+    {
+        check::check(inputData["diffusion_config"].is_object(), "diffusion_config must be an object");
+        diffusionMaxDenoisingSteps = inputData["diffusion_config"].value("max_denoising_steps", 0);
+    }
+    diffusionMaxDenoisingSteps = inputData.value("diffusion_max_denoising_steps", diffusionMaxDenoisingSteps);
+    check::check(diffusionMaxDenoisingSteps >= 0,
+        format::fmtstr(
+            "Invalid diffusion max_denoising_steps value: %d (must be non-negative)", diffusionMaxDenoisingSteps));
     std::unordered_map<int32_t, float> defaultLogitBias;
     if (inputData.contains("logit_bias") && !inputData["logit_bias"].is_null())
     {
@@ -160,6 +170,7 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
         batchRequest.topP = topP;
         batchRequest.topK = topK;
         batchRequest.maxGenerateLength = maxGenerateLength;
+        batchRequest.diffusionMaxDenoisingSteps = diffusionMaxDenoisingSteps;
         batchRequest.applyChatTemplate = applyChatTemplate;
         batchRequest.addGenerationPrompt = addGenerationPrompt;
         batchRequest.enableThinking = enableThinking;

@@ -516,7 +516,20 @@ KERNEL_VARIANTS = [
         script="fmha_cutedsl_blackwell/fmha.py",
         script_args=["--q_shape", "1,1024,14,128", "--k_shape", "1,1024,14,128"] + _VIT,
     ),
-    # FFPA group which handles large head size attention
+    # FFPA group which handles large head size attention.
+    KernelVariant(
+        name="ffpa_d512",
+        group="ffpa",
+        supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+        script="ffpa_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "512",
+            "--m_block_size", "64", "--n_block_size", "16", "--num_threads", "128",
+            "--dtype", "Float16",
+            "--skip_rescale",
+            "--export_only",
+        ],
+    ),
     KernelVariant(
         name="ffpa_d512_causal",
         group="ffpa",

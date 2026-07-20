@@ -64,10 +64,13 @@ struct PipelineIO
     Tensor inputsEmbeds;
     Tensor outputLogits;
     Tensor selectTokenIndices;
-    Tensor contextLengths;     //!< GPU
-    Tensor hostContextLengths; //!< CPU (pinned, [maxBatch] INT32)
+    Tensor phaseIsEncoder;      //!< DiffusionGemma phase selector, [batch] INT32
+    Tensor contextMaskSelector; //!< DiffusionGemma context-mask selector, [0] or [batch] INT32
+    Tensor contextLengths;      //!< GPU
+    Tensor hostContextLengths;  //!< CPU (pinned, [maxBatch] INT32)
     Tensor
         hostSelectTokenIndices; //!< CPU (pinned, [maxBatch, 1] INT64) — pairs with selectTokenIndices for H2D staging
+    Tensor hostPhaseIsEncoder;  //!< CPU (pinned, [maxBatch] INT32) — pairs with phaseIsEncoder for H2D staging
     //! Gemma4 Unified block IDs, [batch, seq_len] INT32; empty for other models.
     Tensor visionBlockIds;
 
@@ -144,6 +147,20 @@ void allocateMRope(PipelineIO& io, int32_t maxBatch, int32_t maxKVCacheCapacity,
 //! @param kvCacheIndex Index into res.cacheManagers for the target engine.
 void buildTensorMap(
     TensorMap& map, PipelineIO& io, SharedResources& res, LLMEngineConfig const& cfg, int32_t kvCacheIndex);
+
+//! Populate a TensorMap for a DiffusionGemma unified-backbone engine.
+//!
+//! This keeps DiffusionGemma-only phase/canvas bindings out of the default
+//! autoregressive tensor-map path while still sharing the common KV/RoPE/state
+//! bindings with standard LLM engines.
+void buildTensorMapForDiffusionBackbone(
+    TensorMap& map, PipelineIO& io, SharedResources& res, LLMEngineConfig const& cfg, int32_t kvCacheIndex);
+
+//! Rebind DiffusionGemma unified-backbone tensors for the current denoise,
+//! prefill, or commit step. Self-conditioning feedback is hidden-size state
+//! ping-ponged by the block-diffusion decoder.
+void bindDiffusionUnifiedBackboneTensors(TensorMap& map, PipelineIO& io, Tensor& logits, Tensor& canvasIds,
+    Tensor& prevSelfConditioningEmbeds, Tensor& nextSelfConditioningEmbeds, Tensor& selfConditioningTemperature);
 
 //! Populate a TensorMap for a SpecDecode draft engine. Delegates to `buildTensorMap`
 //! with `kvCacheIndex=1` for the common bindings, then patches in draft-engine-

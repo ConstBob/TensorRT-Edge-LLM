@@ -57,12 +57,15 @@ public:
     //! \param[in] supportsSpecDecode Whether to support speculative decoding (Tree attention)
     //! \param[in] enableFp8KVCache Whether to enable FP8 KV cache
     //! \param[in] enableVisionBlockAttention Enable Gemma4 vision block attention
+    //! \param[in] enableContextMaskSelector Whether to enable the optional context-mask selector input. When present,
+    //! runtime shape [0] keeps the default causal/sliding context mask, while [batch] selects padding/non-causal
+    //! context masking. The tensor value is ignored.
     //! \param[in] slidingWindowSize Sliding window size (-1 = no sliding window)
     //! \param[in] qkvScales Optional [q, k, v] FP8 dequant scales (required when enableFp8KVCache)
     //! \param[in] attentionScale Optional absolute QK^T multiplier; defaults to 1/sqrt(headSize)
     AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
         int32_t supportsSpecDecode, int32_t enableFp8KVCache, int32_t enableVisionBlockAttention,
-        int32_t slidingWindowSize = -1, std::vector<float> const& qkvScales = {},
+        int32_t enableContextMaskSelector, int32_t slidingWindowSize = -1, std::vector<float> const& qkvScales = {},
         std::optional<float> attentionScale = std::nullopt);
     AttentionPlugin(std::string const& name, nvinfer1::PluginFieldCollection const* fc);
 
@@ -127,9 +130,10 @@ private:
     int32_t enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream);
 
-    //! Launch the CuTe DSL FFPA d512 causal attention kernel with per-batch varlen masking.
+    //! Launch the CuTe DSL FFPA d512 attention kernel with per-batch varlen masking.
     void dispatchFFPAKernel(half const* q, half const* k, half const* v, half* o, int32_t const* cuSeqLenQ,
-        int32_t const* cuSeqLenK, int32_t batchSize, int32_t seqlenQ, int32_t seqlenK, cudaStream_t stream);
+        int32_t const* cuSeqLenK, int32_t batchSize, int32_t seqlenQ, int32_t seqlenK, int32_t numQHeads,
+        int32_t numKVHeads, int32_t headDim, bool isCausal, cudaStream_t stream);
 
     //! Prefill routing under vision-block attention: the FFPA d512
     //! vision-block overlay kernel serves full-causal headSize=512 layers;
@@ -178,6 +182,9 @@ protected:
     int32_t mSMVersion; //!< CUDA SM version
 
     int32_t mEnableFp8KVCache{}; //!< Whether FP8 KV cache is enabled
+    //! Whether the optional runtime context-mask selector input is present. Shape [0] keeps default causal/sliding
+    //! context attention; shape [batch] selects padding/non-causal context attention. The tensor value is ignored.
+    int32_t mEnableContextMaskSelector{};
     //! Host QKV dequant scales [q, k, v] (quant→orig).
     //! - q scale: used to quantize FP16 Q to FP8 (CuTe DSL path) and folded into softmaxScale.
     //! - k scale: used for FP8 KV cache quantization/dequantization and folded into softmaxScale.
@@ -201,7 +208,7 @@ protected:
     //! Whether FMHA context kernels are available for this configuration.
     bool mCanImplementFMHA{true};
 
-    //! Whether the FFPA d512 kernel is available for headSize=512 prefill.
+    //! Whether FFPA d512 causal kernel is available for headSize=512 context attention.
     bool mCanImplementFFPA{false};
 
     //! Whether FMHA_v2 CUSTOM_MASK context kernels are available for this
@@ -210,6 +217,14 @@ protected:
     //! the exact per-sequence-length kernel is re-probed at enqueue via
     //! ContextFMHARunner::isKernelAvailable().
     bool mCanImplementCustomMaskFMHA{false};
+
+    //! Whether FMHA_v2 PADDING context kernels are loaded for runtime-selected
+    //! non-causal context attention, used by DiffusionGemma denoise when the
+    //! normal prefill backend is CuTe DSL FMHA.
+    bool mCanImplementPaddingFMHA{false};
+
+    //! Whether FFPA d512 dense/non-causal kernel is available.
+    bool mCanImplementNonCausalFFPA{false};
 
     //! Whether XQA decode kernels are available.
     bool mCanImplementXQA{false};

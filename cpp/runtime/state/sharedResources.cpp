@@ -171,7 +171,7 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
         int64_t const maxBatch = cfg.maxSupportedBatchSize;
         int64_t const deepstackSeqLen = cfg.isSpecDecodeBase ? std::max(cfg.maxVerifyTreeSize, 1) : 1;
         int64_t deepstackSize = 0;
-        if (cfg.numDeepstackFeatures > 0)
+        if (!cfg.isDiffusionBackbone && cfg.numDeepstackFeatures > 0)
         {
             deepstackSize = maxBatch * deepstackSeqLen * cfg.hiddenSize * static_cast<int64_t>(sizeof(uint16_t));
         }
@@ -317,7 +317,7 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
         int64_t const maxBatch = maxRuntimeBatchSize;
         int64_t const verifySeqLen = bundle.specConfig->verifySize;
         int64_t deepstackSize = 0;
-        if (bundle.base.numDeepstackFeatures > 0)
+        if (!bundle.base.isDiffusionBackbone && bundle.base.numDeepstackFeatures > 0)
         {
             deepstackSize = maxBatch * verifySeqLen * bundle.base.hiddenSize * static_cast<int64_t>(sizeof(uint16_t));
         }

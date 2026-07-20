@@ -41,6 +41,9 @@ namespace exampleUtils
  *     "top_k": int,                           // optional, default 50
  *     "logit_bias": {token_id: bias},         // optional default for all requests
  *     "max_generate_length": int,             // optional, default 256
+ *     "diffusion_config": {                    // optional DiffusionGemma runtime overrides
+ *       "max_denoising_steps": int             // optional, 0/default uses engine config
+ *     },
  *     "num_logprobs": int,                    // optional default for all requests, 0..kMaxLogprobsK
  *     "apply_chat_template": bool,            // optional, default true
  *     "add_generation_prompt": bool,          // optional, default true

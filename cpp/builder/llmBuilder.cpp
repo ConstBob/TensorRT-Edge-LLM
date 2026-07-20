@@ -118,7 +118,7 @@ bool isValidSpecDecodeType(std::string const& type)
 
 bool isValidEngineRole(std::string const& role)
 {
-    return role == "llm" || role == "base" || role == "draft";
+    return role == "llm" || role == "base" || role == "draft" || role == "dllm";
 }
 
 bool hasInputBinding(nvinfer1::INetworkDefinition const& network, char const* inputName)
@@ -289,6 +289,10 @@ bool LLMBuilder::build()
     {
         engineFileName = "spec_base.engine";
     }
+    else if (mIsDiffusionBackbone)
+    {
+        engineFileName = "dllm.engine";
+    }
     else
     {
         engineFileName = "llm.engine";
@@ -377,23 +381,35 @@ bool LLMBuilder::parseConfig()
     }
     if (!isValidEngineRole(role))
     {
-        LOG_ERROR("Invalid engine_role='%s'. Expected one of: llm, base, draft.", role.c_str());
+        LOG_ERROR("Invalid engine_role='%s'. Expected one of: llm, base, draft, dllm.", role.c_str());
         return false;
     }
-    if ((role == "llm") != (specType == "none"))
+    bool const isSpecRole = role == "base" || role == "draft";
+    mIsDiffusionBackbone = role == "dllm";
+    if ((role == "llm" || role == "dllm") && specType != "none")
     {
         LOG_ERROR(
-            "Invalid config: engine_role='%s' with spec_decode_type='%s'. LLM engines require "
-            "spec_decode_type=none; speculative base/draft engines require a non-none spec_decode_type.",
+            "Invalid config: engine_role='%s' with spec_decode_type='%s'. Non-speculative engines require "
+            "spec_decode_type=none.",
             role.c_str(), specType.c_str());
         return false;
     }
+    if (isSpecRole && specType == "none")
+    {
+        LOG_ERROR(
+            "Invalid config: engine_role='%s' with spec_decode_type='%s'. Speculative base/draft engines require "
+            "a non-none spec_decode_type.",
+            role.c_str(), specType.c_str());
+        return false;
+    }
+    bool const nonSpecBuild = !mBuilderConfig.specDraft && !mBuilderConfig.specBase;
+    bool const nonSpecRole = role == "llm" || role == "dllm";
     if ((mBuilderConfig.specDraft && role != "draft") || (mBuilderConfig.specBase && role != "base")
-        || (!mBuilderConfig.specDraft && !mBuilderConfig.specBase && role != "llm"))
+        || (nonSpecBuild && !nonSpecRole))
     {
         LOG_ERROR(
             "Build mode does not match config: engine_role='%s' (use --specBase for base, --specDraft for "
-            "draft, and neither flag for vanilla LLM).",
+            "draft, and neither flag for non-speculative engines).",
             role.c_str());
         return false;
     }
@@ -520,6 +536,12 @@ bool LLMBuilder::parseConfig()
             globalHeadSize);
     }
 
+    if (mModelConfig.contains("diffusion_config") && mModelConfig["diffusion_config"].is_object())
+    {
+        mDiffusionCanvasLength = mModelConfig["diffusion_config"].value("canvas_length", static_cast<int64_t>(0));
+    }
+    mDiffusionCanvasLength = mModelConfig.value("diffusion_canvas_length", mDiffusionCanvasLength);
+
     return true;
 }
 
@@ -585,6 +607,10 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
     {
         result &= setupSpecDecodeProfiles(*contextProfile, *generationProfile);
     }
+    else if (mIsDiffusionBackbone)
+    {
+        result &= setupDiffusionBackboneProfiles(*contextProfile, *generationProfile, network);
+    }
     else
     {
         result &= setupVanillaProfiles(*contextProfile, *generationProfile);
@@ -639,9 +665,10 @@ bool LLMBuilder::setupCommonProfiles(
     result &= setOptimizationProfile(&generationProfile, binding_names::kContextLengths, createDims({1}),
         createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
 
-    // For KVCacheStartIndex, we use zero shape to indicate the kvcache is empty for all sequences in the batch.
-    // This can help distinguish the normal prefill and chunked prefill execution.
-    result &= setOptimizationProfile(&contextProfile, binding_names::kKVCacheStartIndex, createDims({0}),
+    // Autoregressive engines use shape [0] as the initial-prefill empty-KV sentinel.
+    // DiffusionGemma keeps kvcache_start_index materialized and uses context_mask_selector as its mask sentinel.
+    nvinfer1::Dims const contextKvStartMin = mIsDiffusionBackbone ? createDims({1}) : createDims({0});
+    result &= setOptimizationProfile(&contextProfile, binding_names::kKVCacheStartIndex, contextKvStartMin,
         createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
     result &= setOptimizationProfile(&generationProfile, binding_names::kKVCacheStartIndex, createDims({1}),
         createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
@@ -701,6 +728,62 @@ bool LLMBuilder::setupRopeProfiles(nvinfer1::IOptimizationProfile& contextProfil
     if (hasInputBinding(network, binding_names::kRopeCosSin))
     {
         setRopeProfile(binding_names::kRopeCosSin, mRotaryDim);
+    }
+
+    return result;
+}
+
+bool LLMBuilder::setupDiffusionBackboneProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+    nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network)
+{
+    bool result = true;
+
+    int64_t const maxCanvasLen = std::max<int64_t>(1, std::max(mDiffusionCanvasLength, mBuilderConfig.maxInputLen));
+    int64_t const optPromptLen = std::max<int64_t>(1, mBuilderConfig.maxInputLen / 2);
+
+    result &= setOptimizationProfile(&contextProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
+        createDims({mBuilderConfig.maxBatchSize, optPromptLen, mHiddenSize}),
+        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
+    result &= setOptimizationProfile(&generationProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
+        createDims({mBuilderConfig.maxBatchSize, maxCanvasLen, mHiddenSize}),
+        createDims({mBuilderConfig.maxBatchSize, maxCanvasLen, mHiddenSize}));
+
+    result &= setOptimizationProfile(&contextProfile, binding_names::kPhaseIsEncoder, createDims({1}),
+        createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+    result &= setOptimizationProfile(&generationProfile, binding_names::kPhaseIsEncoder, createDims({1}),
+        createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+
+    result &= setOptimizationProfile(&contextProfile, binding_names::kSelectTokenIndices, createDims({1, 1}),
+        createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, 1}));
+    result &= setOptimizationProfile(&generationProfile, binding_names::kSelectTokenIndices, createDims({1, 1}),
+        createDims({mBuilderConfig.maxBatchSize, maxCanvasLen}),
+        createDims({mBuilderConfig.maxBatchSize, maxCanvasLen}));
+
+    if (hasInputBinding(network, binding_names::kContextMaskSelector))
+    {
+        result &= setOptimizationProfile(&contextProfile, binding_names::kContextMaskSelector, createDims({0}),
+            createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+        result &= setOptimizationProfile(&generationProfile, binding_names::kContextMaskSelector, createDims({0}),
+            createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+    }
+
+    if (hasInputBinding(network, binding_names::kCanvasIds))
+    {
+        result &= setOptimizationProfile(&contextProfile, binding_names::kCanvasIds, createDims({1, 1}),
+            createDims({mBuilderConfig.maxBatchSize, optPromptLen}),
+            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen}));
+        result &= setOptimizationProfile(&generationProfile, binding_names::kCanvasIds, createDims({1, 1}),
+            createDims({mBuilderConfig.maxBatchSize, maxCanvasLen}),
+            createDims({mBuilderConfig.maxBatchSize, maxCanvasLen}));
+    }
+    if (hasInputBinding(network, binding_names::kPrevSelfConditioningEmbeds))
+    {
+        result &= setOptimizationProfile(&contextProfile, binding_names::kPrevSelfConditioningEmbeds,
+            createDims({1, 1, mHiddenSize}), createDims({mBuilderConfig.maxBatchSize, optPromptLen, mHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
+        result &= setOptimizationProfile(&generationProfile, binding_names::kPrevSelfConditioningEmbeds,
+            createDims({1, 1, mHiddenSize}), createDims({mBuilderConfig.maxBatchSize, maxCanvasLen, mHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, maxCanvasLen, mHiddenSize}));
     }
 
     return result;

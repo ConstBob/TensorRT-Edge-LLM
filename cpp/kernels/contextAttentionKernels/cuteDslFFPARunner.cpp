@@ -39,10 +39,12 @@ ffpa_d512_causal_gqa8_Kernel_Module_t CuteDslFFPARunner::sD512CausalGqa8Module{}
 #if defined(CUTE_DSL_FFPA_GQA16_ENABLED)
 ffpa_d512_causal_gqa16_Kernel_Module_t CuteDslFFPARunner::sD512CausalGqa16Module{};
 #endif
+ffpa_d512_Kernel_Module_t CuteDslFFPARunner::sD512DenseModule{};
 bool CuteDslFFPARunner::sLoaded{false};
 std::mutex CuteDslFFPARunner::sMutex;
 
-bool CuteDslFFPARunner::canImplement(int32_t headDim, int32_t smVersion, int32_t numQHeads, int32_t numKVHeads)
+bool CuteDslFFPARunner::canImplement(
+    int32_t headDim, int32_t smVersion, int32_t numQHeads, int32_t numKVHeads, bool isCausal)
 {
     if (headDim != 512)
     {
@@ -63,10 +65,14 @@ bool CuteDslFFPARunner::canImplement(int32_t headDim, int32_t smVersion, int32_t
     default: return false;
     }
 
-    // GQA group size check.
     if (numKVHeads <= 0 || numQHeads % numKVHeads != 0)
     {
         return false;
+    }
+
+    if (!isCausal)
+    {
+        return true;
     }
 
     int32_t const kvGroupSize = numQHeads / numKVHeads;
@@ -120,13 +126,14 @@ bool CuteDslFFPARunner::loadKernelModule()
 #if defined(CUTE_DSL_FFPA_GQA16_ENABLED)
         ffpa_d512_causal_gqa16_Kernel_Module_Load(&sD512CausalGqa16Module);
 #endif
+        ffpa_d512_Kernel_Module_Load(&sD512DenseModule);
         sLoaded = true;
-        LOG_DEBUG("CuTe DSL FFPA d512 causal kernel module(s) loaded");
+        LOG_DEBUG("CuTe DSL FFPA d512 kernel module(s) loaded");
         return true;
     }
     catch (...)
     {
-        LOG_ERROR("Failed to load FFPA d512 causal CuTe DSL kernel module.");
+        LOG_ERROR("Failed to load FFPA d512 CuTe DSL kernel module.");
         return false;
     }
 }
@@ -151,6 +158,8 @@ void CuteDslFFPARunner::unloadKernelModule()
     ffpa_d512_causal_gqa4_Kernel_Module_Unload(&sD512CausalGqa4Module);
     sD512CausalGqa4Module = {};
 #endif
+    ffpa_d512_Kernel_Module_Unload(&sD512DenseModule);
+    sD512DenseModule = {};
     ffpa_d512_causal_Kernel_Module_Unload(&sD512CausalModule);
     sD512CausalModule = {};
 #ifdef CUTE_DSL_FFPA_VISIONBLOCK_ENABLED
@@ -209,9 +218,19 @@ int CuteDslFFPARunner::run(CuteDslFFPAParams const& params, cudaStream_t stream)
         return -1;
     }
 
+    if (!params.isCausal && useVisionBlock)
+    {
+        LOG_ERROR("FFPA vision-block overlay is only valid for causal context attention.");
+        return -1;
+    }
+
+    // GQA: the kernel takes num_kv_heads as a runtime argument and derives the
+    // group size as numQHeads / numKVHeads internally, so a single AOT kernel
+    // serves MHA (numKVHeads == numQHeads) and any GQA group size. The only
+    // constraint is that Q heads partition evenly across K/V heads.
     if (params.numQHeads % params.numKVHeads != 0)
     {
-        LOG_ERROR("FFPA d512 causal CuTe DSL kernel requires numQHeads (%d) to be divisible by numKVHeads (%d).",
+        LOG_ERROR("FFPA d512 CuTe DSL kernel requires numQHeads (%d) to be divisible by numKVHeads (%d).",
             params.numQHeads, params.numKVHeads);
         return -1;
     }
@@ -225,6 +244,52 @@ int CuteDslFFPARunner::run(CuteDslFFPAParams const& params, cudaStream_t stream)
     int64_t const kStrideSeq = static_cast<int64_t>(params.numKVHeads) * params.headDim;
     float const softmaxScale
         = params.softmaxScale > 0.0F ? params.softmaxScale : 1.0F / std::sqrt(static_cast<float>(params.headDim));
+
+    if (!params.isCausal)
+    {
+        ffpa_d512_Tensor_mQ_t qTensor{};
+        qTensor.data = const_cast<void*>(params.q);
+        qTensor.dynamic_shapes[0] = params.batchSize;
+        qTensor.dynamic_shapes[1] = params.seqlenQ;
+        qTensor.dynamic_shapes[2] = params.numQHeads;
+        qTensor.dynamic_strides[0] = qStrideBatch;
+        qTensor.dynamic_strides[1] = qStrideSeq;
+
+        ffpa_d512_Tensor_mK_t kTensor{};
+        kTensor.data = const_cast<void*>(params.k);
+        kTensor.dynamic_shapes[0] = params.batchSize;
+        kTensor.dynamic_shapes[1] = params.seqlenK;
+        kTensor.dynamic_shapes[2] = params.numKVHeads;
+        kTensor.dynamic_strides[0] = kStrideBatch;
+        kTensor.dynamic_strides[1] = kStrideSeq;
+
+        ffpa_d512_Tensor_mV_t vTensor{};
+        vTensor.data = const_cast<void*>(params.v);
+        vTensor.dynamic_shapes[0] = params.batchSize;
+        vTensor.dynamic_shapes[1] = params.seqlenK;
+        vTensor.dynamic_shapes[2] = params.numKVHeads;
+        vTensor.dynamic_strides[0] = kStrideBatch;
+        vTensor.dynamic_strides[1] = kStrideSeq;
+
+        ffpa_d512_Tensor_mO_t oTensor{};
+        oTensor.data = params.o;
+        oTensor.dynamic_shapes[0] = params.batchSize;
+        oTensor.dynamic_shapes[1] = params.seqlenQ;
+        oTensor.dynamic_shapes[2] = params.numQHeads;
+        oTensor.dynamic_strides[0] = qStrideBatch;
+        oTensor.dynamic_strides[1] = qStrideSeq;
+
+        ffpa_d512_Tensor_mCuSeqLenQ_t cuSeqLenQTensor{};
+        cuSeqLenQTensor.data = const_cast<int32_t*>(params.cuSeqLenQ);
+        cuSeqLenQTensor.dynamic_shapes[0] = params.batchSize + 1;
+
+        ffpa_d512_Tensor_mCuSeqLenK_t cuSeqLenKTensor{};
+        cuSeqLenKTensor.data = const_cast<int32_t*>(params.cuSeqLenK);
+        cuSeqLenKTensor.dynamic_shapes[0] = params.batchSize + 1;
+
+        return cute_dsl_ffpa_d512_wrapper(&sD512DenseModule, &qTensor, &kTensor, &vTensor, &oTensor, &cuSeqLenQTensor,
+            &cuSeqLenKTensor, softmaxScale, params.numKVHeads, stream);
+    }
 
 #ifdef CUTE_DSL_FFPA_VISIONBLOCK_ENABLED
     if (useVisionBlock)

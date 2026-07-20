@@ -54,7 +54,7 @@ struct Message
 };
 
 // Streaming types (StreamChannel, StreamChunk, SlotStreamState, FinishReason,
-// StreamChannelFinalizer, and the four streaming free functions) live in
+// StreamChannelFinalizer, and streaming free functions) live in
 // `runtime/streaming.h`. LLMGenerationRequest::streamChannels holds a vector
 // of shared_ptr<StreamChannel>, which only needs a forward declaration here —
 // consumers that actually manipulate channels include `runtime/streaming.h`.
@@ -124,12 +124,13 @@ struct LLMGenerationRequest
     //! \endcond
     std::vector<Request> requests; //!< Vector of requests for a batch
     mutable std::vector<FormattedRequest>
-        formattedRequests;           //!< Formatted requests (mutable to allow runtime modification)
-    float temperature;               //!< Temperature parameter for sampling
-    float topP;                      //!< Top-p (nucleus) sampling parameter
-    int64_t topK;                    //!< Top-k sampling parameter
-    int64_t maxGenerateLength;       //!< Max length of the generated tokens
-    std::string loraWeightsName{""}; //!< Name of the LoRA weights. Default to empty string for no LoRA weights
+        formattedRequests;                 //!< Formatted requests (mutable to allow runtime modification)
+    float temperature;                     //!< Temperature parameter for sampling
+    float topP;                            //!< Top-p (nucleus) sampling parameter
+    int64_t topK;                          //!< Top-k sampling parameter
+    int64_t maxGenerateLength;             //!< Max length of the generated tokens
+    int32_t diffusionMaxDenoisingSteps{0}; //!< Optional DiffusionGemma max denoising steps override (0 = engine config)
+    std::string loraWeightsName{""};       //!< Name of the LoRA weights. Default to empty string for no LoRA weights
 
     // Whether to save system prompt KV cache of this request to be used by later requests
     bool saveSystemPromptKVCache{false};

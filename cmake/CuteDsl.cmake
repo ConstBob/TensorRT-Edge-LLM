@@ -457,28 +457,40 @@ function(cute_dsl_setup)
     endforeach()
   endforeach()
 
-  # Per-variant defines for FFPA GQA kernels (native grouped-query attention
-  # without K/V head expansion). Each GQA group size is a separate AOT cubin.
-  list(FIND _variants "ffpa_d512_causal_gqa4" _ffpa_gqa4_idx)
-  if(NOT ${_ffpa_gqa4_idx} EQUAL -1)
-    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
-      target_compile_definitions(${_tgt} PRIVATE "CUTE_DSL_FFPA_GQA4_ENABLED")
-    endforeach()
-    message(
-      STATUS
-        "CuTe DSL: ffpa_d512_causal_gqa4 variant found — CUTE_DSL_FFPA_GQA4_ENABLED set"
-    )
-  endif()
+  # Required and optional per-variant definitions for FFPA kernels.
+  list(FIND _active_groups "ffpa" _ffpa_active_idx)
+  if(NOT _ffpa_active_idx EQUAL -1)
+    list(FIND _variants "ffpa_d512_causal" _ffpa_causal_idx)
+    list(FIND _variants "ffpa_d512" _ffpa_dense_idx)
+    if(_ffpa_causal_idx EQUAL -1 OR _ffpa_dense_idx EQUAL -1)
+      message(
+        FATAL_ERROR
+          "CuTe DSL ffpa group requires both ffpa_d512_causal and ffpa_d512 variants in ${_metadata}."
+      )
+    endif()
 
-  list(FIND _variants "ffpa_d512_causal_gqa8" _ffpa_gqa8_idx)
-  if(NOT ${_ffpa_gqa8_idx} EQUAL -1)
-    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
-      target_compile_definitions(${_tgt} PRIVATE "CUTE_DSL_FFPA_GQA8_ENABLED")
-    endforeach()
-    message(
-      STATUS
-        "CuTe DSL: ffpa_d512_causal_gqa8 variant found — CUTE_DSL_FFPA_GQA8_ENABLED set"
-    )
+    # Native grouped-query attention without K/V head expansion.
+    list(FIND _variants "ffpa_d512_causal_gqa4" _ffpa_gqa4_idx)
+    if(NOT _ffpa_gqa4_idx EQUAL -1)
+      foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+        target_compile_definitions(${_tgt} PRIVATE "CUTE_DSL_FFPA_GQA4_ENABLED")
+      endforeach()
+      message(
+        STATUS
+          "CuTe DSL: ffpa_d512_causal_gqa4 variant found - CUTE_DSL_FFPA_GQA4_ENABLED set"
+      )
+    endif()
+
+    list(FIND _variants "ffpa_d512_causal_gqa8" _ffpa_gqa8_idx)
+    if(NOT _ffpa_gqa8_idx EQUAL -1)
+      foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+        target_compile_definitions(${_tgt} PRIVATE "CUTE_DSL_FFPA_GQA8_ENABLED")
+      endforeach()
+      message(
+        STATUS
+          "CuTe DSL: ffpa_d512_causal_gqa8 variant found - CUTE_DSL_FFPA_GQA8_ENABLED set"
+      )
+    endif()
   endif()
 
   list(FIND _variants "ffpa_d512_causal_gqa16" _ffpa_gqa16_idx)

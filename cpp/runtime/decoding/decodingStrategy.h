@@ -54,6 +54,7 @@ enum class DecodingStrategyKind : int32_t
     kDFlash,
     kGemma4MTP,
     kDSpark,
+    kBlockDiffusion,
 };
 
 struct SamplingBuffers

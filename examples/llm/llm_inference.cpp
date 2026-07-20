@@ -33,6 +33,7 @@
 #include "runtime/streaming.h"
 #include "tokenizer/tokenizer.h"
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <getopt.h>
@@ -695,7 +696,12 @@ int main(int argc, char* argv[])
         }
     }
 
-    if (!runtime->captureDecodingCUDAGraph(stream))
+    bool const disableDecodingCudaGraph = std::getenv("EDGELLM_DISABLE_DECODING_CUDA_GRAPH") != nullptr;
+    if (disableDecodingCudaGraph)
+    {
+        LOG_INFO("Skipping decoding CUDA graph capture because EDGELLM_DISABLE_DECODING_CUDA_GRAPH is set.");
+    }
+    else if (!runtime->captureDecodingCUDAGraph(stream))
     {
         LOG_WARNING("Failed to capture CUDA graph for decoding, proceeding with normal engine execution.");
     }

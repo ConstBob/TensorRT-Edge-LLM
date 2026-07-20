@@ -35,6 +35,7 @@ InferenceDims makeValid()
         /*.attnMaskSeqLen=*/1,
         /*.ropeBatch=*/1,
         /*.packedMaskLen=*/4,
+        /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/2,
         /*.specVerifyPhaseLen=*/0,
     };
@@ -50,6 +51,7 @@ std::vector<int64_t InferenceDims::*> allReferenced()
         &InferenceDims::attnMaskSeqLen,
         &InferenceDims::ropeBatch,
         &InferenceDims::packedMaskLen,
+        &InferenceDims::contextMaskSelectorLen,
         &InferenceDims::startIndexLen,
         &InferenceDims::specVerifyPhaseLen,
     };
@@ -70,6 +72,7 @@ TEST(InferenceDimsTest, DimNameKnownMembers)
     EXPECT_EQ(dimName(&InferenceDims::attnMaskSeqLen), "attn_seq_len");
     EXPECT_EQ(dimName(&InferenceDims::ropeBatch), "rope_batch");
     EXPECT_EQ(dimName(&InferenceDims::packedMaskLen), "packed_mask_len");
+    EXPECT_EQ(dimName(&InferenceDims::contextMaskSelectorLen), "context_mask_selector_len");
     EXPECT_EQ(dimName(&InferenceDims::startIndexLen), "start_index_len");
     EXPECT_EQ(dimName(&InferenceDims::specVerifyPhaseLen), "spec_verify_phase_len");
 }
@@ -95,6 +98,7 @@ TEST(InferenceDimsTest, ToStringContainsAllFields)
     EXPECT_NE(s.find("attn_seq_len=1"), std::string::npos) << s;
     EXPECT_NE(s.find("rope_batch=1"), std::string::npos) << s;
     EXPECT_NE(s.find("packed_mask_len=4"), std::string::npos) << s;
+    EXPECT_NE(s.find("context_mask_selector_len=0"), std::string::npos) << s;
     EXPECT_NE(s.find("start_index_len=2"), std::string::npos) << s;
     EXPECT_NE(s.find("spec_verify_phase_len=0"), std::string::npos) << s;
 }
@@ -180,6 +184,24 @@ TEST(InferenceDimsTest, FirstInvalidMemberStartIndexLenNegativeFails)
     d.startIndexLen = -1;
     auto const refs = allReferenced();
     EXPECT_EQ(firstInvalidMember(d, refs), &InferenceDims::startIndexLen);
+}
+
+TEST(InferenceDimsTest, FirstInvalidMemberContextMaskSelectorLenZeroIsValid)
+{
+    // `contextMaskSelectorLen` is a shape sentinel: 0 keeps causal/default
+    // attention, while batch selects DiffusionGemma non-causal denoise.
+    InferenceDims d = makeValid();
+    d.contextMaskSelectorLen = 0;
+    auto const refs = allReferenced();
+    EXPECT_EQ(firstInvalidMember(d, refs), nullptr);
+}
+
+TEST(InferenceDimsTest, FirstInvalidMemberContextMaskSelectorLenNegativeFails)
+{
+    InferenceDims d = makeValid();
+    d.contextMaskSelectorLen = -1;
+    auto const refs = allReferenced();
+    EXPECT_EQ(firstInvalidMember(d, refs), &InferenceDims::contextMaskSelectorLen);
 }
 
 TEST(InferenceDimsTest, FirstInvalidMemberSpecVerifyPhaseLenZeroIsValid)

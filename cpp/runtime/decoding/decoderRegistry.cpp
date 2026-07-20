@@ -18,6 +18,7 @@
 #include "runtime/decoding/decoderRegistry.h"
 
 #include "common/logger.h"
+#include "runtime/decoding/blockDiffusionDecoder.h"
 #include "runtime/decoding/dflashDecoder.h"
 #include "runtime/decoding/dsparkDecoder.h"
 #include "runtime/decoding/eagleDecoder.h"
@@ -33,8 +34,18 @@ namespace trt_edgellm
 namespace rt
 {
 DecoderRegistry::DecoderRegistry(DecodingRuntimeContext& runtime, DecoderRegistryConfig const& config)
-    : mDefaultDecoder(std::make_unique<VanillaDecoder>(runtime))
+    : mDefaultDecoder([&runtime, &config]() -> std::unique_ptr<DecodingStrategy> {
+        if (runtime.deployment.base.isDiffusionBackbone)
+        {
+            return std::make_unique<BlockDiffusionDecoder>(runtime, config.engineDir, config.stream);
+        }
+        return std::make_unique<VanillaDecoder>(runtime);
+    }())
 {
+    if (runtime.deployment.base.isDiffusionBackbone)
+    {
+        LOG_INFO("Selected block_diffusion decoding strategy.");
+    }
     if (config.draftingConfig.has_value())
     {
         switch (runtime.deployment.specDecodeMode())

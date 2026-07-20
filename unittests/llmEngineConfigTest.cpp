@@ -351,6 +351,55 @@ TEST_F(LLMEngineConfigTest, DeepstackAndMultimodal)
     EXPECT_EQ(cfg.audioTokenId, 151656);
 }
 
+TEST_F(LLMEngineConfigTest, DiffusionGemmaSamplerConfig)
+{
+    Json json = makeMinimalConfig();
+    json["engine_role"] = "dllm";
+    json["decoding_strategy"] = "block_diffusion";
+    json["context_mask_selector_enabled"] = true;
+    json["diffusion_unified_conditioning"] = true;
+    json["self_conditioning_size"] = 256;
+    json["diffusion_config"] = {
+        {"canvas_length", 8},
+        {"max_denoising_steps", 48},
+        {"t_max", 0.9},
+        {"t_min", 0.3},
+        {"entropy_bound", 0.2},
+        {"entropy_threshold", 0.01},
+        {"stability_window", 3},
+        {"prefix_check_interval", 4},
+    };
+    auto const path = writeJsonToTempFile(json);
+
+    LLMEngineConfig cfg = parseEngineConfig(path);
+    EXPECT_TRUE(cfg.isDiffusionBackbone);
+    EXPECT_TRUE(cfg.contextMaskSelectorEnabled);
+    EXPECT_TRUE(cfg.diffusionUnifiedConditioning);
+    EXPECT_EQ(cfg.diffusionCanvasLength, 8);
+    EXPECT_EQ(cfg.diffusionMaxDenoisingSteps, 48);
+    EXPECT_EQ(cfg.diffusionSelfConditioningSize, 256);
+    EXPECT_FLOAT_EQ(cfg.diffusionTMax, 0.9F);
+    EXPECT_FLOAT_EQ(cfg.diffusionTMin, 0.3F);
+    EXPECT_FLOAT_EQ(cfg.diffusionEntropyBound, 0.2F);
+    EXPECT_FLOAT_EQ(cfg.diffusionEntropyThreshold, 0.01F);
+    EXPECT_EQ(cfg.diffusionStabilityWindow, 3);
+    EXPECT_EQ(cfg.diffusionPrefixCheckInterval, 4);
+}
+
+TEST_F(LLMEngineConfigTest, DiffusionGemmaDllmRequiresUnifiedConditioning)
+{
+    Json json = makeMinimalConfig();
+    json["engine_role"] = "dllm";
+    json["self_conditioning_size"] = 256;
+    json["diffusion_config"] = {
+        {"canvas_length", 8},
+        {"max_denoising_steps", 48},
+    };
+    auto const path = writeJsonToTempFile(json);
+
+    EXPECT_THROW(parseEngineConfig(path), std::runtime_error);
+}
+
 // ===========================================================================
 // Layer-types and kv_layer_configs parsing
 // ===========================================================================
@@ -497,7 +546,8 @@ TEST(LLMEngineConfigRecipesTest, PrefillDims)
     EXPECT_EQ(d.attnMaskSeqLen, 1); // dummy attention shape during prefill
     EXPECT_EQ(d.ropeBatch, 1);      // non-MRope
     EXPECT_EQ(d.packedMaskLen, 1);  // pinned to 1 alongside attnMaskSeqLen
-    EXPECT_EQ(d.startIndexLen, 0);  // plugin-path empty-cache sentinel
+    EXPECT_EQ(d.contextMaskSelectorLen, 0);
+    EXPECT_EQ(d.startIndexLen, 0); // plugin-path empty-cache sentinel
     EXPECT_EQ(d.specVerifyPhaseLen, 0);
 }
 
@@ -508,7 +558,8 @@ TEST(LLMEngineConfigRecipesTest, PrefillDimsMRope)
     EXPECT_EQ(d.ropeBatch, 3);      // MRope → batch
     EXPECT_EQ(d.attnMaskSeqLen, 1); // dummy attention shape during prefill
     EXPECT_EQ(d.packedMaskLen, 1);  // pinned to 1 alongside attnMaskSeqLen
-    EXPECT_EQ(d.startIndexLen, 0);  // plugin-path empty-cache sentinel
+    EXPECT_EQ(d.contextMaskSelectorLen, 0);
+    EXPECT_EQ(d.startIndexLen, 0); // plugin-path empty-cache sentinel
     EXPECT_EQ(d.specVerifyPhaseLen, 0);
 }
 
@@ -519,6 +570,51 @@ TEST(LLMEngineConfigRecipesTest, PrefillDimsChunked)
     auto const d = cfg.prefillDims(/*batch=*/2, /*seqLen=*/128, /*kvCacheAllEmpty=*/false);
     EXPECT_EQ(d.startIndexLen, 2);
     EXPECT_EQ(d.specVerifyPhaseLen, 0);
+}
+
+TEST(LLMEngineConfigRecipesTest, DiffusionGemmaInitialPrefillBindsFullKVCapacity)
+{
+    LLMEngineConfig cfg = makeRecipeConfig(/*maxKV=*/1024, /*mrope=*/false);
+    cfg.isDiffusionBackbone = true;
+    auto const d = cfg.prefillDims(/*batch=*/1, /*seqLen=*/36, /*kvCacheAllEmpty=*/true);
+    EXPECT_EQ(d.batch, 1);
+    EXPECT_EQ(d.seqLen, 36);
+    EXPECT_EQ(d.kvLen, 1024);
+    EXPECT_EQ(d.selectLen, 1);
+    EXPECT_EQ(d.contextMaskSelectorLen, 0);
+    EXPECT_EQ(d.startIndexLen, 1);
+}
+
+TEST(LLMEngineConfigRecipesTest, DiffusionGemmaDenoiseAndCommitDims)
+{
+    LLMEngineConfig cfg = makeRecipeConfig(/*maxKV=*/1024, /*mrope=*/false);
+    auto const denoise = cfg.denoiseDims(/*batch=*/1, /*canvasLen=*/8);
+    EXPECT_EQ(denoise.kvLen, 1024);
+    EXPECT_EQ(denoise.seqLen, 8);
+    EXPECT_EQ(denoise.selectLen, 8);
+    EXPECT_EQ(denoise.contextMaskSelectorLen, 1);
+    EXPECT_EQ(denoise.startIndexLen, 1);
+
+    auto const denoiseVarlenBatch = cfg.denoiseDims(/*batch=*/2, /*canvasLen=*/8);
+    EXPECT_EQ(denoiseVarlenBatch.kvLen, 1024);
+    EXPECT_EQ(denoiseVarlenBatch.seqLen, 8);
+    EXPECT_EQ(denoiseVarlenBatch.selectLen, 8);
+    EXPECT_EQ(denoiseVarlenBatch.contextMaskSelectorLen, 2);
+    EXPECT_EQ(denoiseVarlenBatch.startIndexLen, 2);
+
+    auto const commit = cfg.diffusionCommitDims(/*batch=*/1, /*commitLen=*/8);
+    EXPECT_EQ(commit.kvLen, 1024);
+    EXPECT_EQ(commit.seqLen, 8);
+    EXPECT_EQ(commit.selectLen, 8);
+    EXPECT_EQ(commit.contextMaskSelectorLen, 0);
+    EXPECT_EQ(commit.startIndexLen, 1);
+
+    auto const commitVarlenBatch = cfg.diffusionCommitDims(/*batch=*/2, /*commitLen=*/8);
+    EXPECT_EQ(commitVarlenBatch.kvLen, 1024);
+    EXPECT_EQ(commitVarlenBatch.seqLen, 8);
+    EXPECT_EQ(commitVarlenBatch.selectLen, 8);
+    EXPECT_EQ(commitVarlenBatch.contextMaskSelectorLen, 0);
+    EXPECT_EQ(commitVarlenBatch.startIndexLen, 2);
 }
 
 TEST(LLMEngineConfigRecipesTest, DecodeDims)

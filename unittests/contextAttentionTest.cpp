@@ -19,7 +19,9 @@
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
+#include <limits>
 #include <optional>
 
 #include "common/checkMacros.h"
@@ -280,4 +282,176 @@ TEST(ContextAttentionTest, configurableScale)
     TestContextAttentionAccuracy(1, 256, 8, 1, 256, true, kCUSTOM_SCALE);
     TestContextAttentionCompactAccuracy({0, 16, 48}, 8, 8, 64, 48, kIDENTITY_SCALE);
     TestContextAttentionCompactAccuracy({0, 24, 64}, 8, 8, 80, 64, kCUSTOM_SCALE);
+}
+
+namespace
+{
+
+void fillNonCausalVarlenReference(std::vector<half> const& qInput, std::vector<half> const& kInput,
+    std::vector<half> const& vInput, std::vector<half>& output, std::vector<int32_t> const& qLens,
+    std::vector<int32_t> const& kvLens, int32_t seqLenQ, int32_t seqLenK, int32_t numQHeads, int32_t numKVHeads,
+    int32_t headSize)
+{
+    int32_t const batchSize = static_cast<int32_t>(qLens.size());
+    float const softmaxScale = 1.0F / std::sqrt(static_cast<float>(headSize));
+    std::fill(output.begin(), output.end(), __float2half(0.0F));
+
+    for (int32_t b = 0; b < batchSize; ++b)
+    {
+        for (int32_t qPos = 0; qPos < qLens[static_cast<size_t>(b)]; ++qPos)
+        {
+            for (int32_t qHead = 0; qHead < numQHeads; ++qHead)
+            {
+                int32_t const kvHead = qHead * numKVHeads / numQHeads;
+                float rowMax = -std::numeric_limits<float>::infinity();
+                for (int32_t kPos = 0; kPos < kvLens[static_cast<size_t>(b)]; ++kPos)
+                {
+                    float score = 0.0F;
+                    for (int32_t d = 0; d < headSize; ++d)
+                    {
+                        size_t const qIdx
+                            = (((static_cast<size_t>(b) * seqLenQ + qPos) * numQHeads + qHead) * headSize) + d;
+                        size_t const kIdx
+                            = (((static_cast<size_t>(b) * seqLenK + kPos) * numKVHeads + kvHead) * headSize) + d;
+                        score += __half2float(qInput[qIdx]) * __half2float(kInput[kIdx]);
+                    }
+                    rowMax = std::max(rowMax, score * softmaxScale);
+                }
+
+                float rowSum = 0.0F;
+                std::vector<float> weights(static_cast<size_t>(kvLens[static_cast<size_t>(b)]));
+                for (int32_t kPos = 0; kPos < kvLens[static_cast<size_t>(b)]; ++kPos)
+                {
+                    float score = 0.0F;
+                    for (int32_t d = 0; d < headSize; ++d)
+                    {
+                        size_t const qIdx
+                            = (((static_cast<size_t>(b) * seqLenQ + qPos) * numQHeads + qHead) * headSize) + d;
+                        size_t const kIdx
+                            = (((static_cast<size_t>(b) * seqLenK + kPos) * numKVHeads + kvHead) * headSize) + d;
+                        score += __half2float(qInput[qIdx]) * __half2float(kInput[kIdx]);
+                    }
+                    float const weight = std::exp((score * softmaxScale) - rowMax);
+                    weights[static_cast<size_t>(kPos)] = weight;
+                    rowSum += weight;
+                }
+
+                for (int32_t d = 0; d < headSize; ++d)
+                {
+                    float acc = 0.0F;
+                    for (int32_t kPos = 0; kPos < kvLens[static_cast<size_t>(b)]; ++kPos)
+                    {
+                        size_t const vIdx
+                            = (((static_cast<size_t>(b) * seqLenK + kPos) * numKVHeads + kvHead) * headSize) + d;
+                        acc += (weights[static_cast<size_t>(kPos)] / rowSum) * __half2float(vInput[vIdx]);
+                    }
+                    size_t const outIdx
+                        = (((static_cast<size_t>(b) * seqLenQ + qPos) * numQHeads + qHead) * headSize) + d;
+                    output[outIdx] = __float2half(acc);
+                }
+            }
+        }
+    }
+}
+
+void TestContextAttentionDenoisePaddingVarlen(std::vector<int32_t> const& qLens, std::vector<int32_t> const& kvLens)
+{
+    int32_t smVersion = getSMVersion();
+    applyThorSMRenumberWAR(smVersion);
+
+    AttentionInputLayout const inputLayout = AttentionInputLayout::SEPARATE_Q_K_V;
+    ContextAttentionMaskType const maskType = ContextAttentionMaskType::PADDING;
+    int32_t constexpr headSize = 256;
+    int32_t constexpr numQHeads = 16;
+    int32_t constexpr numKVHeads = 8;
+    int32_t const batchSize = static_cast<int32_t>(qLens.size());
+    int32_t const seqLenQ = *std::max_element(qLens.begin(), qLens.end());
+    int32_t const seqLenK = *std::max_element(kvLens.begin(), kvLens.end());
+
+    if (!ContextFMHARunner::canImplement(headSize, smVersion, DataType::kHALF, inputLayout, maskType))
+    {
+        GTEST_SKIP() << "Context FMHA PADDING is not supported for headSize=" << headSize << ", SM=" << smVersion;
+    }
+
+    size_t const qSize = static_cast<size_t>(batchSize) * seqLenQ * numQHeads * headSize;
+    size_t const kvSize = static_cast<size_t>(batchSize) * seqLenK * numKVHeads * headSize;
+    size_t const outSize = qSize;
+
+    std::vector<half> qInput(qSize);
+    std::vector<half> kInput(kvSize);
+    std::vector<half> vInput(kvSize);
+    uniformFloatInitialization(qInput, -1.0F, 1.0F);
+    uniformFloatInitialization(kInput, -1.0F, 1.0F);
+    uniformFloatInitialization(vInput, -1.0F, 1.0F);
+
+    std::vector<int32_t> cuQ(static_cast<size_t>(batchSize + 1), 0);
+    std::vector<int32_t> cuKV(static_cast<size_t>(batchSize + 1), 0);
+    for (int32_t b = 0; b < batchSize; ++b)
+    {
+        cuQ[static_cast<size_t>(b + 1)] = cuQ[static_cast<size_t>(b)] + qLens[static_cast<size_t>(b)];
+        cuKV[static_cast<size_t>(b + 1)] = cuKV[static_cast<size_t>(b)] + kvLens[static_cast<size_t>(b)];
+    }
+
+    rt::Tensor qTensor({batchSize, seqLenQ, numQHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor kTensor({batchSize, seqLenK, numKVHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor vTensor({batchSize, seqLenK, numKVHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor oTensor({batchSize, seqLenQ, numQHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor cuQTensor({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor cuKVTensor({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
+
+    CUDA_CHECK(cudaMemcpy(qTensor.rawPointer(), qInput.data(), qSize * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(kTensor.rawPointer(), kInput.data(), kvSize * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(vTensor.rawPointer(), vInput.data(), kvSize * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(cuQTensor.rawPointer(), cuQ.data(), static_cast<size_t>(batchSize + 1) * sizeof(int32_t),
+        cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(cuKVTensor.rawPointer(), cuKV.data(), static_cast<size_t>(batchSize + 1) * sizeof(int32_t),
+        cudaMemcpyHostToDevice));
+
+    EXPECT_TRUE(ContextFMHARunner::loadContextFMHAKernels(smVersion, DataType::kHALF));
+    ContextFMHARunner runner(
+        DataType::kHALF, batchSize, seqLenQ, numQHeads, numKVHeads, headSize, smVersion, inputLayout, maskType);
+    FusedMultiheadAttentionParamsV2 params{};
+    runner.setupParams(params, 1.0F / std::sqrt(static_cast<float>(headSize)));
+    params.s_kv = seqLenK;
+    params.q_ptr = qTensor.rawPointer();
+    params.k_ptr = kTensor.rawPointer();
+    params.v_ptr = vTensor.rawPointer();
+    params.o_ptr = oTensor.rawPointer();
+    params.cu_q_seqlens = cuQTensor.dataPointer<int32_t>();
+    params.cu_kv_seqlens = cuKVTensor.dataPointer<int32_t>();
+    runner.dispatchFMHAKernel(params, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaGetLastError());
+
+    std::vector<half> expected(outSize);
+    fillNonCausalVarlenReference(
+        qInput, kInput, vInput, expected, qLens, kvLens, seqLenQ, seqLenK, numQHeads, numKVHeads, headSize);
+    std::vector<half> actual(outSize);
+    CUDA_CHECK(cudaMemcpy(actual.data(), oTensor.rawPointer(), outSize * sizeof(half), cudaMemcpyDeviceToHost));
+
+    for (int32_t b = 0; b < batchSize; ++b)
+    {
+        for (int32_t qPos = 0; qPos < qLens[static_cast<size_t>(b)]; ++qPos)
+        {
+            for (int32_t h = 0; h < numQHeads; ++h)
+            {
+                for (int32_t d = 0; d < headSize; ++d)
+                {
+                    size_t const idx = (((static_cast<size_t>(b) * seqLenQ + qPos) * numQHeads + h) * headSize) + d;
+                    ASSERT_TRUE(isclose(actual[idx], expected[idx], 1e-2F, 1e-2F))
+                        << "DiffusionGemma denoise PADDING mismatch at b=" << b << " q=" << qPos << " h=" << h
+                        << " d=" << d << " expected=" << __half2float(expected[idx])
+                        << " actual=" << __half2float(actual[idx]);
+                }
+            }
+        }
+    }
+}
+
+} // namespace
+
+TEST(ContextAttentionTest, diffusionGemmaDenoisePaddingVarlen)
+{
+    TestContextAttentionDenoisePaddingVarlen({4}, {24});
+    TestContextAttentionDenoisePaddingVarlen({4, 3}, {24, 11});
 }

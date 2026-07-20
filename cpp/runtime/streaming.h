@@ -115,6 +115,11 @@ void decodePerSlot(DecodingInferenceContext& context, tokenizer::Tokenizer const
 //! raw token piece for per-token logprobs (LogprobEntry::piece).
 void emitChunks(DecodingInferenceContext& context, tokenizer::Tokenizer const& tokenizer);
 
+//! Fires `context.onTokenGenerated` for every token appended since the previous
+//! callback emission. Speculative decoders and DiffusionGemma can accept more
+//! than one token in a single decode iteration.
+void emitTokenCallbacks(DecodingInferenceContext& context);
+
 /*! @brief Result of applyStopStringMatch. */
 struct StopMatchOutcome
 {
