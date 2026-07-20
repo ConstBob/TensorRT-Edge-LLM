@@ -237,6 +237,15 @@ _LAYOUT_OVERRIDES: dict[str, dict[str, str]] = {
         "code2wav": "audio/code2wav",
         "visual": "vision",
     },
+    # ``qwen3_omni_moe`` shares the Omni ONNX layout.
+    "qwen3_omni_moe": {
+        "thinker": "llm/thinker",
+        "talker": "llm/talker",
+        "code_predictor": "llm/code_predictor",
+        "audio": "audio/audio_encoder",
+        "code2wav": "audio/code2wav",
+        "visual": "vision",
+    },
     "qwen3_tts": {
         # Qwen3-TTS has no thinker; the Talker is written under ``llm/`` so
         # existing engine-build scripts that expect a single ``llm/`` dir
@@ -1236,6 +1245,26 @@ def _export_dspark_draft(model_dir: str, draft_out_dir: str,
     logger.info("[DSpark Draft] Done: %s", output_path)
 
 
+def _tower_model_config(model_config: "ModelConfig", weights: dict,
+                        prefixes: tuple) -> "ModelConfig":
+    """Return *model_config* with quant reset to fp16 when the tower under
+    *prefixes* ships no ``.weight_scale`` tensors (i.e. it was left
+    unquantized in an otherwise-quantized consolidated checkpoint).
+
+    Detects per-tower quantization from the checkpoint instead of assuming
+    the backbone quant_type applies (same pattern as the CodePredictor).
+    """
+    import dataclasses
+
+    from ..config import QuantConfig
+    tower_quantized = any(
+        k.endswith(".weight_scale") and k.startswith(prefixes)
+        for k in weights)
+    if tower_quantized:
+        return model_config
+    return dataclasses.replace(model_config, quant=QuantConfig())
+
+
 def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
                    config: dict, model_type: str, dtype: "torch.dtype",
                    model_config: "ModelConfig") -> None:
@@ -1248,6 +1277,9 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
     ``qwen3_omni`` / ``qwen3_omni_moe`` model_types and runs the
     remap inside its own ``build_qwen3_omni_visual``.
     """
+    model_config = _tower_model_config(
+        model_config, weights,
+        ("visual.", "thinker.visual.", "model.visual.", "vision_tower."))
     os.makedirs(visual_out_dir, exist_ok=True)
     output_path = os.path.join(visual_out_dir, "model.onnx")
 
@@ -1546,6 +1578,10 @@ def _export_audio(model_dir: str,
                   dtype: "torch.dtype",
                   model_config: "ModelConfig | None" = None) -> None:
     """Export audio encoder via from-scratch tensorrt_edgellm pipeline."""
+    if model_config is not None:
+        model_config = _tower_model_config(
+            model_config, weights,
+            ("audio_tower.", "thinker.audio_tower.", "audio_embed."))
     os.makedirs(audio_out_dir, exist_ok=True)
     output_path = os.path.join(audio_out_dir, "model.onnx")
 
@@ -1908,8 +1944,10 @@ def _make_talker_sub_config(model_dir: str,
 
     from ..model import load_model_config
 
+    root_cfg = _load_config(model_dir)
+    root_quant = root_cfg.get("quantization_config")
     if sub_cfg is None:
-        cfg = _load_config(model_dir)
+        cfg = root_cfg
         for key in sub_path or ():
             if not isinstance(cfg, dict) or key not in cfg:
                 logger.error("sub-config path %s not found in %s/config.json",
@@ -1918,11 +1956,14 @@ def _make_talker_sub_config(model_dir: str,
             cfg = cfg[key]
     else:
         cfg = sub_cfg
+    # Quant metadata lives at the root config only; the sub-model inherits it.
+    if root_quant is not None and "quantization_config" not in cfg:
+        cfg = {**cfg, "quantization_config": root_quant}
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         for fname in os.listdir(model_dir):
-            if fname.endswith(".safetensors") or fname.endswith(
-                    ".safetensors.index.json"):
+            if (fname.endswith(".safetensors")
+                    or fname.endswith(".safetensors.index.json")):
                 src = os.path.join(model_dir, fname)
                 dst = os.path.join(tmp_dir, fname)
                 if not os.path.exists(dst):
@@ -1943,10 +1984,15 @@ def _maybe_stage_hf_quant_config(model_dir: str, tmp_dir: str, key_prefix: str,
     excluded (glob becomes ``*``).
     """
     hf_qc_src = os.path.join(model_dir, "hf_quant_config.json")
-    if not (key_prefix and os.path.isfile(hf_qc_src)):
-        # If key_prefix is empty (existing Qwen3-Omni behavior) we just symlink
-        # or leave it alone — hf_quant_config's exclusion patterns already
-        # match the (non-nested) checkpoint keys.
+    if not os.path.isfile(hf_qc_src):
+        return
+    if not key_prefix:
+        # No sub-LLM namespace: the exclusion patterns already match the
+        # checkpoint keys — stage the sidecar as-is (modelopt-quantized
+        # consolidated roots keep their quant metadata there).
+        dst = os.path.join(tmp_dir, "hf_quant_config.json")
+        if not os.path.exists(dst):
+            os.symlink(hf_qc_src, dst)
         return
     with open(hf_qc_src) as f:
         hf_qc = json.load(f)
@@ -1981,8 +2027,8 @@ def _patch_tts_config(model_dir: str, out_dir: str) -> None:
 
     Accepts two input layouts:
       * HF root config with nested ``talker_config`` (fields under sub-dict).
-      * Standalone Talker config from a prior quant export (fields at top
-        level, written by ``_write_standalone_talker_config``).
+      * Standalone Talker config from an older split-checkpoint export
+        (fields at top level).
     """
     root_config = _load_config(model_dir)
     # ``or {}`` guards against explicit ``"talker_config": null`` in a
@@ -2052,7 +2098,7 @@ def _patch_tts_config(model_dir: str, out_dir: str) -> None:
         if "default_speaker_id" not in cfg:
             cfg["default_speaker_id"] = next(iter(spk_map.values()))
     # Also propagate an explicit ``default_speaker_id`` if the input
-    # already had one (e.g. set by ``_write_standalone_talker_config``).
+    # already had one (e.g. from an older split-checkpoint export).
     dsi = pick("default_speaker_id")
     if dsi is not None and "default_speaker_id" not in cfg:
         cfg["default_speaker_id"] = dsi
@@ -2133,7 +2179,6 @@ def _export_sub_llm(
             config.model_type = model_type_override
 
         model = model_class(config)
-        model.to("cpu")
         load_weights(model,
                      model_dir,
                      device="cpu",
@@ -2422,10 +2467,16 @@ def _export_talker(model_dir: str, llm_out_dir: str, model_type: str) -> None:
     from ..models.qwen3_tts import TalkerCausalLM
 
     is_omni = model_type in ("qwen3_omni", "qwen3_omni_moe")
+    talker_cls = TalkerCausalLM
+    if model_type == "qwen3_omni_moe":
+        # The MoE Talker is a 128-expert MoE decoder, not the dense
+        # CausalLM the TTS Talker class models.
+        from ..models.qwen3_omni import Qwen3OmniMoeTalkerCausalLM
+        talker_cls = Qwen3OmniMoeTalkerCausalLM
     _export_sub_llm(
         model_dir,
         llm_out_dir,
-        model_class=TalkerCausalLM,
+        model_class=talker_cls,
         sub_path=["talker_config", "text_config"] if is_omni else None,
         key_prefix="talker.",
         key_remap=_talker_key_remap,
@@ -2609,8 +2660,8 @@ def _extract_code_predictor_weights(model_dir: str, out_dir: str,
     """Extract codec_embeddings, lm_heads, and small_to_mtp_projection.
 
     ``key_prefix`` is either ``talker.code_predictor.`` (full-Omni HF root
-    layout) or ``code_predictor.`` (Talker-only submodule layout produced by
-    ``qwen3_omni._export_submodel`` for MoE CP-only exports).
+    layout) or ``code_predictor.`` (Talker-only layout from older split
+    exports).
     """
     from safetensors.torch import save_file
 

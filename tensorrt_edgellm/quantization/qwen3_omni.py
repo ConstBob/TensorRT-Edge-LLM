@@ -12,18 +12,30 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Qwen3-Omni Thinker + Talker NVFP4 quantization driver.
+"""Qwen3-Omni Thinker + Talker quantization driver (NVFP4 + INT4 AWQ).
 
-End-to-end NVFP4 quantization for both the Thinker text-MoE subgraph and
-the Talker text-MoE subgraph of Qwen3-Omni-30B-A3B-Instruct. Produces two
-standalone HF checkpoints in <output_dir>:
+End-to-end quantization for both the Thinker text subgraph and the Talker
+text subgraph of Qwen3-Omni.  Two model-variant conventions are handled
+via a single ``quantize_qwen3_omni`` entry point:
 
-  thinker/   model_type=qwen3_omni_moe_text    (H=2048, 128 experts top-8)
-  talker/    model_type=qwen3_omni_moe_talker  (H=1024, 128 experts top-6 + shared expert)
+  * ``model_type="qwen3_omni_moe"`` -- top-level class
+    ``Qwen3OmniMoeForConditionalGeneration`` (released transformers).
+  * ``model_type="qwen3_omni"``     -- top-level class
+    ``Qwen3OmniForConditionalGeneration`` (requires a transformers build
+    that carries the non-MoE class).
 
-Audio encoder, visual encoder, code2wav vocoder, Talker projections, and
-the talker code_predictor/output heads stay in FP16 and are exported
-separately by ``experimental.llm_loader.export_all_cli``.
+Two backbones are supported and selected via the ``quantization`` argument:
+
+  * ``"nvfp4"`` (default) -- per-block FP4 weights + FP8 scale; consumed by
+    the NVFP4 MoE plugin.
+  * ``"int4_awq"``         -- W4A16-AWQ group=128; consumed by the Marlin
+    ``int4MoePlugin`` GEMM.
+
+Produces a single HF root under ``<output_dir>`` (same layout as the
+source HF root) with quantized Thinker + Talker text weights and
+FP16-kept visual / audio_tower / code2wav / code_predictor / talker
+sidecars all in one consolidated safetensors set.  ``tensorrt-edgellm-export``
+consumes the whole directory in one shot; no submodel split.
 
 Calibration is **joint and multimodal**: a single ``mtq.quantize(model, ...)``
 call observes both Thinker and Talker quantizers in the same forward loop.
@@ -40,26 +52,22 @@ Per sample:
   3. Talker(inputs_embeds=..., talker_input_ids=thinker_input_ids,
      attention_mask=...) -- Talker quantizers observe activations.
 
-This mirrors the dense Qwen3-Omni quantization convention used by
-``tensorrt_edgellm.quantization.llm_quantization.quantize_llm`` /
-``omni_quantization.omni_multimodal_calib_loop``.
-
-Usage::
-
-    tensorrt-edgellm-quantize qwen3-omni \\
-        --model_dir Qwen/Qwen3-Omni-30B-A3B-Instruct \\
-        --output_dir ./out_qwen3_omni_nvfp4 \\
-        --kv_cache_quantization fp8 \\
-        --num_samples 64
+For ``quantization="int4_awq"`` two modelopt 0.44.0 quirks are patched
+inline (see ``_int4_awq_modelopt_wars``); NVFP4 is unaffected.
 """
 
-import json
+import copy
 import os
+import shutil
 import time
-from typing import Optional, Tuple
+import warnings
+from contextlib import contextmanager, nullcontext
+from typing import Optional
 
+import modelopt.torch.opt as mto
 import modelopt.torch.quantization as mtq
 import torch
+import torch.nn as nn
 from datasets import (Audio, concatenate_datasets, get_dataset_config_names,
                       load_dataset)
 from modelopt.torch.export import export_hf_checkpoint
@@ -69,8 +77,6 @@ from tqdm import tqdm
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
 from .quantization_configs import build_quant_config
-# Reuse Thinker-side helpers from the dedicated thinker driver.
-from .qwen3_omni_thinker import _extract_and_save_thinker_text
 
 try:
     import librosa
@@ -82,40 +88,58 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 
-def _build_full_model_quant_cfg(lm_head_quantization: Optional[str],
-                                kv_cache_quantization: Optional[str]) -> dict:
-    """Build a NVFP4 quant_cfg for the full ``Qwen3OmniMoeForConditionalGeneration``.
+def _build_full_model_quant_cfg(quantization: str,
+                                lm_head_quantization: Optional[str],
+                                kv_cache_quantization: Optional[str],
+                                is_moe: bool = True,
+                                visual_quantization: Optional[str] = None,
+                                audio_quantization: Optional[str] = None,
+                                cp_quantization: Optional[str] = None) -> dict:
+    """Build a quant_cfg for the full Qwen3-Omni model (both variants).
+
+    ``quantization`` selects the backbone: ``"nvfp4"`` (per-block FP4 + FP8
+    scale) or ``"int4_awq"`` (W4A16-AWQ group=128). Both share the same
+    disable_globs (FP16 keep-set) and the same joint multimodal calib
+    downstream; only the backbone precision differs.
+
+    ``is_moe`` toggles two MoE-only disable_globs (``mlp.gate`` router and
+    ``shared_expert_gate``); the non-MoE variant lacks these modules so
+    the globs are dropped from its config.
+
+    ``visual_quantization`` / ``audio_quantization`` / ``cp_quantization``:
+    when ``None`` the visual encoder / audio_tower / code_predictor stay
+    FP16. When set (only ``"fp8"`` exposed today), :func:`build_quant_config`
+    layers an explicit override on the corresponding submodule patterns, and
+    this driver drops its own disable glob for that submodule so the
+    override wins. The joint multimodal calibration forward loop already
+    exercises visual + audio_tower activations; the code_predictor needs a
+    dedicated drive (see :func:`qwen3_cp_calibration_loop`) appended to the
+    forward loop by the caller.
 
     Used by a single joint ``mtq.quantize(model, cfg, forward_loop=...)`` call
-    that calibrates both Thinker and Talker subgraphs in one multimodal pass
-    (mirrors the dense Qwen3-Omni convention in
-    ``tensorrt_edgellm.quantization.llm_quantization.quantize_llm``).  Because
-    the recipe is applied to the full model, all module paths in the
+    that calibrates both Thinker and Talker subgraphs in one multimodal pass.
+    Because the recipe is applied to the full model, all module paths in the
     ``disable_globs`` carry the ``thinker.`` / ``talker.`` prefix; this avoids
     cross-contamination between submodels that bare wildcards would risk.
 
-    Disables: visual encoder, audio encoder, code2wav, talker sidecar
-    projections/code-predictor/output heads, all MoE routers and
-    shared-expert gates.
+    Disables: code2wav, talker sidecar projections/output heads, all MoE
+    routers and shared-expert gates; plus visual / audio_tower /
+    code_predictor unless opted in via their respective parameters.
     """
-    cfg = build_quant_config("nvfp4", lm_head_quantization,
-                             kv_cache_quantization)
+    cfg = build_quant_config(quantization,
+                             lm_head_quantization,
+                             kv_cache_quantization,
+                             visual_quantization=visual_quantization,
+                             audio_quantization=audio_quantization,
+                             cp_quantization=cp_quantization)
 
-    # Optional AWQ-Lite calibration: rebalances per-channel weight scales
-    # against activation outliers. modelopt's NVFP4_DEFAULT_CFG and
-    # NVFP4_AWQ_LITE_CFG share an identical ``quant_cfg`` (per-block FP4
-    # weight + FP8 scale); they differ only in ``algorithm`` -- ``"max"``
-    # runs plain RTN absmax calibration, ``"awq_lite"`` runs an additional
-    # per-channel AWQ scale search. Output checkpoint format is identical;
-    # the same NVFP4 kernels consume either.
-    #
-    # Opted in via env var to keep RTN as the default. ``QWEN3_OMNI_AWQ_ALPHA_STEP``
-    # defaults to 0.25 (5 alpha values across [0, 1]) because modelopt's
-    # default of 0.1 (11 alpha values) is prohibitively slow on this MoE
-    # (~10 s per multimodal sample -> ~18 h for 500 samples * 11 alphas).
-    # AWQ typically lands best_alpha in [0.3, 0.7], so a 0.25 step still
-    # resolves the optimum.
-    if os.environ.get("QWEN3_OMNI_USE_AWQ_LITE") == "1":
+    # AWQ-Lite (per-channel alpha search): default-on for INT4 AWQ (needed
+    # for the Talker's large per-channel absmax spread at g=128), env-var
+    # opt-in for NVFP4 (RTN suffices). alpha_step=0.25 keeps the search
+    # tractable on this MoE (modelopt's 0.1 default is ~4x slower).
+    use_awq_lite = (quantization == "int4_awq"
+                    or os.environ.get("QWEN3_OMNI_USE_AWQ_LITE") == "1")
+    if use_awq_lite:
         alpha_step = float(os.environ.get("QWEN3_OMNI_AWQ_ALPHA_STEP", "0.25"))
         cfg["algorithm"] = {"method": "awq_lite", "alpha_step": alpha_step}
         print(
@@ -124,12 +148,9 @@ def _build_full_model_quant_cfg(lm_head_quantization: Optional[str],
             flush=True)
 
     disable_globs = [
-        # ---- Thinker non-LLM submodules (exported separately, FP16) ----
-        "*thinker.visual.*",  # Visual encoder (handled by visual.py path)
-        "*thinker.audio_tower.*",  # Whisper-style audio encoder
+        # ---- Thinker non-LLM submodules (FP16) ----
         "*thinker.lm_head*",  # Final LM head — FP16 for logit fidelity
         # ---- Talker non-LLM submodules (FP16) ----
-        "*talker.code_predictor.*",  # CodePredictor head + transformer
         "*talker.code2wav.*",  # Code2Wav vocoder (not actually attached
         #   to the talker subtree in HF but kept
         #   here defensively for any wrappers)
@@ -138,25 +159,36 @@ def _build_full_model_quant_cfg(lm_head_quantization: Optional[str],
         "*talker.codec_head*",  # Codec output projection (FP16: feeds
         #   Code2Wav; FP4 noise here materially
         #   hurts audio quality)
+    ]
+    # Only pin the visual encoder / audio_tower to FP16 when the caller did
+    # not opt them into quantization via ``visual_quantization`` /
+    # ``audio_quantization``. When they are opted in, ``build_quant_config``
+    # has already layered the corresponding per-submodule override; adding
+    # our own disable glob here would clobber that.
+    if visual_quantization is None:
+        disable_globs.append("*thinker.visual.*")
+    if audio_quantization is None:
+        disable_globs.append("*thinker.audio_tower.*")
+    if cp_quantization is None:
+        disable_globs.append("*talker.code_predictor.*")
+    if is_moe:
         # ---- MoE routers and shared-expert gates (FP16 for top-k stability) ----
         # The router is a tiny [H × num_experts] linear; its output drives
         # discrete top-k selection so even small quant noise can flip experts
         # and propagate large output errors.
-        "*mlp.gate.*",
+        disable_globs.append("*mlp.gate.*")
         # ``shared_expert_gate`` is a 1-output Linear producing a sigmoid
         # mixer scalar; quantizing it directly biases per-token shared-expert
         # contribution.
-        "*shared_expert_gate.*",
+        disable_globs.append("*shared_expert_gate.*")
         # ``shared_expert`` FFN runs at NVFP4: a layer-wise SNR audit showed
         # its contribution to downstream noise is negligible (Δcos < 2e-4
         # at the late layers), so the quantization-sensitivity budget is
-        # better spent on the routed experts. Uncomment the three globs
-        # below to put it back at FP16 if a future model proves more
-        # sensitive.
-        # "*shared_expert.gate_proj.*",
-        # "*shared_expert.up_proj.*",
-        # "*shared_expert.down_proj.*",
-    ]
+        # better spent on the routed experts. Add the three globs below to
+        # put it back at FP16 if a future model proves more sensitive.
+        # disable_globs.append("*shared_expert.gate_proj.*")
+        # disable_globs.append("*shared_expert.up_proj.*")
+        # disable_globs.append("*shared_expert.down_proj.*")
     # modelopt's ``quant_cfg`` is an ordered list of rule dicts; append a
     # disable rule per glob at the end so it overrides the earlier
     # ``*weight_quantizer`` / ``*input_quantizer`` enables. A ``dict``
@@ -168,6 +200,245 @@ def _build_full_model_quant_cfg(lm_head_quantization: Optional[str],
         else:
             qc[g] = {"enable": False}
     return cfg
+
+
+# ---------------------------------------------------------------------------
+# modelopt 0.44.0 INT4 AWQ workarounds (active only when quantization ==
+# "int4_awq"; gated via ``_maybe_int4_awq_wars``).  See the module docstring
+# for the two upstream quirks these patches address.
+# ---------------------------------------------------------------------------
+
+
+def _block_amax_fallback(quantizer, weight_2d) -> None:
+    """Derive per-block amax for an uncalibrated INT4-block quantizer.
+
+    ``weight_2d``: ``[out, in]``; the block dim is the last dim, with
+    ``block_sizes.get(-1)`` giving the group size (defaults to 128).
+    Writes back to ``quantizer._amax`` in flat ``[out*num_blocks, 1]``
+    storage with ``_amax_shape_for_export=(out, -1)``.
+    """
+    bs = quantizer.block_sizes.get(-1) or quantizer.block_sizes.get(
+        weight_2d.dim() - 1, 128)
+    out, K = weight_2d.shape
+    num_blocks = K // bs
+    per_block = weight_2d.abs().reshape(out, num_blocks, bs).amax(dim=-1)
+    flat = per_block.reshape(-1, 1).contiguous().to(torch.float32)
+    if hasattr(quantizer, "_amax"):
+        delattr(quantizer, "_amax")
+    quantizer.register_buffer("_amax", flat)
+    quantizer._amax_shape_for_export = (out, -1)
+
+
+def _slice_fused_amax(w_quantizer, fused_start: int, weight_slice_dim0: int,
+                      fused_total: int) -> bool:
+    """Slice the export-shape view of ``_amax`` for a gate/up projection.
+
+    The amax storage layout for INT4 block quant is flat
+    ``[out_full * num_blocks, 1]`` with a separate reshape hint
+    ``_amax_shape_for_export=(out_full, -1)``. The upstream slicing code
+    in ``_export_fused_experts`` keys off ``amax.shape[0]`` (flat) instead
+    of the export-shape dim 0, so the divisibility check always fails for
+    block-quant and slicing is silently skipped. We slice on the
+    export-shape dim 0 and rewrite the flat storage to match.
+
+    Returns ``True`` if the buffer was sliced, ``False`` if the layout is
+    not the flat-block form (caller falls back to upstream behaviour).
+    """
+    amax = getattr(w_quantizer, "_amax", None)
+    if amax is None:
+        return False
+    shape_for_export = getattr(w_quantizer, "_amax_shape_for_export", None)
+    if shape_for_export is None:
+        return False
+    try:
+        amax_view = amax.reshape(shape_for_export)
+    except Exception:
+        return False
+    if amax_view.dim() < 1 or amax_view.shape[0] != fused_total:
+        return False
+    sliced = amax_view[fused_start:fused_start +
+                       weight_slice_dim0].contiguous()
+    new_dim0 = sliced.shape[0]
+    new_flat = sliced.reshape(-1, 1).contiguous()
+    delattr(w_quantizer, "_amax")
+    w_quantizer.register_buffer("_amax", new_flat)
+    w_quantizer._amax_shape_for_export = (new_dim0, -1)
+    return True
+
+
+def _export_fused_experts_int4_aware(module, dtype) -> None:
+    """Replacement for ``modelopt.torch.export.moe_utils._export_fused_experts``
+    that slices flat per-block amax on the export-shape dim and supplies a
+    per-block weight-derived amax fallback for uncalibrated experts.
+
+    Functionally equivalent to the upstream implementation for non-INT4
+    paths (the flat-amax slice and the uncalibrated fallback are guarded
+    by ``block_sizes.get("type") == "static"``); only the INT4 AWQ block
+    path takes the new code path.
+    """
+    from modelopt.torch.export.unified_export_hf import \
+        _export_quantized_weight
+    from modelopt.torch.quantization.plugins.huggingface import \
+        _get_fused_expert_intermediate_dim
+
+    expert_dim = _get_fused_expert_intermediate_dim(module)
+    fused_dim0 = 2 * expert_dim
+    n = module.num_experts
+    gate_up_input_q = module.gate_up_proj_input_quantizer
+    down_input_q = module.down_proj_input_quantizer
+    gate_up = module.gate_up_proj.data
+    down = module.down_proj.data
+
+    for idx in range(n):
+        expert = nn.Module()
+
+        # Pre-export uncalibrated fallback for the fused gate_up quantizer.
+        gate_up_q = module.gate_up_proj_weight_quantizers[idx]
+        is_block_quant = (getattr(gate_up_q, "block_sizes", None) is not None
+                          and gate_up_q.block_sizes.get("type",
+                                                        None) == "static")
+        if getattr(gate_up_q, "is_enabled",
+                   False) and (not hasattr(gate_up_q, "_amax")
+                               or gate_up_q._amax is None
+                               or torch.all(gate_up_q._amax == 0)):
+            if is_block_quant:
+                _block_amax_fallback(gate_up_q, gate_up[idx])
+                warnings.warn(
+                    f"Expert {idx} gate_up_proj: uncalibrated, using "
+                    f"per-block weight-derived amax.",
+                    stacklevel=2)
+            else:
+                gate_up_q.amax = gate_up[idx].abs().amax().to(torch.float32)
+                warnings.warn(
+                    f"Expert {idx} gate_up_proj: uncalibrated, using "
+                    f"scalar amax fallback.",
+                    stacklevel=2)
+
+        projections = [
+            ("gate_proj", gate_up[idx, :expert_dim, :], 0, fused_dim0, True),
+            ("up_proj", gate_up[idx,
+                                expert_dim:, :], expert_dim, fused_dim0, True),
+            ("down_proj", down[idx], 0, down.shape[1], False),
+        ]
+
+        for proj_name, weight_slice, fused_start, fused_total, is_gate_up in projections:
+            w_quantizer_src = (module.gate_up_proj_weight_quantizers[idx]
+                               if is_gate_up else
+                               module.down_proj_weight_quantizers[idx])
+            i_quantizer = gate_up_input_q if is_gate_up else down_input_q
+
+            # gate/up share a weight quantizer -- clone so each gets its own
+            # sliced amax. down_proj uses the source directly.
+            w_quantizer = (copy.deepcopy(w_quantizer_src)
+                           if is_gate_up else w_quantizer_src)
+
+            sliced_ok = _slice_fused_amax(w_quantizer, fused_start,
+                                          weight_slice.shape[0], fused_total)
+            if not sliced_ok and hasattr(w_quantizer, "_amax") and \
+                    w_quantizer._amax is not None and w_quantizer._amax.dim() >= 1:
+                # Upstream behaviour for non-flat-block amax layout.
+                amax = w_quantizer._amax
+                amax_dim0 = amax.shape[0]
+                if fused_total % amax_dim0 == 0:
+                    slice_start = fused_start * amax_dim0 // fused_total
+                    slice_end = (fused_start + weight_slice.shape[0]
+                                 ) * amax_dim0 // fused_total
+                    delattr(w_quantizer, "_amax")
+                    w_quantizer.register_buffer(
+                        "_amax", amax[slice_start:slice_end].contiguous())
+
+            if (hasattr(w_quantizer, "is_enabled") and w_quantizer.is_enabled
+                    and
+                (not hasattr(w_quantizer, "_amax") or w_quantizer._amax is None
+                 or torch.all(w_quantizer._amax == 0))):
+                is_bq = (getattr(w_quantizer, "block_sizes", None) is not None
+                         and w_quantizer.block_sizes.get("type",
+                                                         None) == "static")
+                if is_bq:
+                    _block_amax_fallback(w_quantizer, weight_slice)
+                    warnings.warn(
+                        f"Expert {idx} {proj_name}: uncalibrated, using "
+                        f"per-block weight-derived amax.",
+                        stacklevel=2)
+                else:
+                    w_quantizer.amax = weight_slice.abs().amax().to(
+                        torch.float32)
+                    warnings.warn(
+                        f"Expert {idx} {proj_name}: uncalibrated, using "
+                        f"scalar amax fallback.",
+                        stacklevel=2)
+
+            wrapper = nn.Module()
+            wrapper.weight = nn.Parameter(weight_slice.contiguous(),
+                                          requires_grad=False)
+            wrapper.weight_quantizer = w_quantizer
+            wrapper.input_quantizer = i_quantizer
+
+            _export_quantized_weight(wrapper, dtype)
+
+            proj = nn.Module()
+            proj.weight = wrapper.weight
+            for attr in ("weight_scale", "weight_scale_2", "input_scale"):
+                if hasattr(wrapper, attr):
+                    proj.register_buffer(attr, getattr(wrapper, attr))
+
+            expert.add_module(proj_name, proj)
+
+        module.add_module(str(idx), expert)
+
+    for attr in ("gate_up_proj", "down_proj", "gate_up_proj_weight_quantizers",
+                 "gate_up_proj_input_quantizer", "down_proj_weight_quantizers",
+                 "down_proj_input_quantizer"):
+        if hasattr(module, attr):
+            delattr(module, attr)
+
+
+@contextmanager
+def _int4_awq_modelopt_wars():
+    """Patch two modelopt 0.44.0 functions for the duration of an INT4 AWQ
+    ``mtq.quantize`` + submodel export run, then restore them.
+    """
+    import modelopt.torch.export.layer_utils as _layer_utils
+    import modelopt.torch.export.moe_utils as _moe_utils
+    import modelopt.torch.export.unified_export_hf as _uehf
+
+    _orig_get_experts_list = _layer_utils.get_experts_list
+
+    def _patched_get_experts_list(module, model_type):
+        try:
+            return _orig_get_experts_list(module, model_type)
+        except NotImplementedError:
+            mt = (model_type or "").lower()
+            if any(s in mt
+                   for s in ("qwen3omnimoe", "qwen3_omni_moe", "qwen3omni")):
+                # Fused-experts share an input quantizer across experts, so
+                # cross-expert resmooth is structurally unnecessary.
+                return []
+            raise
+
+    _orig_export_fused = _moe_utils._export_fused_experts
+    _orig_export_fused_uehf = getattr(_uehf, "_export_fused_experts", None)
+
+    _layer_utils.get_experts_list = _patched_get_experts_list
+    _uehf.get_experts_list = _patched_get_experts_list
+    _moe_utils._export_fused_experts = _export_fused_experts_int4_aware
+    if _orig_export_fused_uehf is not None:
+        _uehf._export_fused_experts = _export_fused_experts_int4_aware
+
+    try:
+        yield
+    finally:
+        _layer_utils.get_experts_list = _orig_get_experts_list
+        _uehf.get_experts_list = _orig_get_experts_list
+        _moe_utils._export_fused_experts = _orig_export_fused
+        if _orig_export_fused_uehf is not None:
+            _uehf._export_fused_experts = _orig_export_fused_uehf
+
+
+def _maybe_int4_awq_wars(quantization: str):
+    """Return the INT4 AWQ WAR context manager, or a nullcontext for NVFP4."""
+    return _int4_awq_modelopt_wars(
+    ) if quantization == "int4_awq" else nullcontext()
 
 
 # ---------------------------------------------------------------------------
@@ -284,14 +555,15 @@ def _build_multimodal_calib_dataset(
     num_text: int,
     audio_dataset_dir: str = "openslr/librispeech_asr",
     visual_dataset_dir: str = "lmms-lab/MMMU",
-    text_dataset: str = "cnn_dailymail",
+    text_ds=None,
 ) -> "_OmniMultimodalCalibDataset":
     """Build the multimodal calibration dataset (audio + image + text).
 
-    Setting any ``num_*`` to 0 skips that modality. Dataset paths are optional
-    overrides for the auto-dispatch path (``quantize_and_export_omni``); the
-    ``quantize_qwen3_omni`` CLI leaves them at their defaults for the original
-    LibriSpeech / MMMU / cnn_dailymail recipe.
+    Setting any ``num_*`` to 0 skips that modality. ``audio_dataset_dir`` /
+    ``visual_dataset_dir`` are optional HF dataset overrides
+    (Qwen3.5-Omni orchestrator). ``text_ds`` is a registered dataset name,
+    a generator, or ``None`` for the registry default — resolved via
+    :func:`~tensorrt_edgellm.quantization.datasets.resolve_dataset`.
     """
     audio_data = []
     if num_audio > 0:
@@ -325,15 +597,13 @@ def _build_multimodal_calib_dataset(
 
     text_data = []
     if num_text > 0:
-        print(f"[Omni calib] Loading text from {text_dataset}, n={num_text}")
-        if "cnn_dailymail" in text_dataset:
-            text_ds = load_dataset(text_dataset, name="3.0.0", split="train")
-            text_data = text_ds["article"][:num_text]
-        elif os.path.isdir(text_dataset):
-            text_ds = load_dataset(text_dataset, split="train")
-            text_data = text_ds["text"][:num_text]
-        else:
-            text_data = ["Describe the weather today."] * num_text
+        from itertools import islice
+
+        from .datasets import dataset_name, resolve_dataset
+        text_ds = resolve_dataset(text_ds, "text")
+        print(f"[Omni calib] Loading text ({dataset_name(text_ds)}), "
+              f"n={num_text}")
+        text_data = list(islice(text_ds(), num_text))
 
     return _OmniMultimodalCalibDataset(processor, audio_data, image_data,
                                        text_data)
@@ -341,12 +611,11 @@ def _build_multimodal_calib_dataset(
 
 def _calib_full_multimodal(model, calib_dataset,
                            accept_hidden_layer: int) -> None:
-    """Joint multimodal calibration forward loop for the full Omni-MoE model.
+    """Joint multimodal calibration forward loop for the full Qwen3-Omni model.
 
     Runs one Thinker forward and one Talker forward per sample so that
     BOTH submodels' quantizers observe activations in a single calibration
-    pass.  Mirrors the dense Qwen3-Omni convention in
-    :func:`tensorrt_edgellm.quantization.omni_quantization.omni_multimodal_calib_loop`.
+    pass.
 
     During calibration, modelopt's freshly-inserted quantizers are in
     observe-only mode (collecting amax statistics; no QDQ applied), so the
@@ -444,170 +713,6 @@ def _calib_full_multimodal(model, calib_dataset,
 
 
 # ---------------------------------------------------------------------------
-# Standalone Talker checkpoint extraction
-# ---------------------------------------------------------------------------
-
-
-def _write_standalone_talker_config(talker_text_dict: dict, talker_dict: dict,
-                                    root_dict: dict, output_dir: str) -> None:
-    """Drop a standalone ``config.json`` with ``model_type=qwen3_omni_moe_talker``.
-
-    The Talker config is the union of ``talker_config.text_config`` (the
-    main MoE backbone) and the talker-level fields needed by downstream
-    consumers (codec ids, accept_hidden_layer, thinker_hidden_size, etc.).
-    """
-    cfg = dict(talker_text_dict)
-    talker_fields = (
-        "accept_hidden_layer",
-        "audio_token_id",
-        "audio_start_token_id",
-        "audio_end_token_id",
-        "image_token_id",
-        "video_token_id",
-        "vision_start_token_id",
-        "codec_bos_id",
-        "codec_eos_token_id",
-        "codec_nothink_id",
-        "codec_pad_id",
-        "codec_think_bos_id",
-        "codec_think_eos_id",
-        "num_code_groups",
-        "speaker_id",
-        "thinker_hidden_size",
-        "position_id_per_seconds",
-        "seconds_per_chunk",
-        "spatial_merge_size",
-        "output_router_logits",
-    )
-    for k in talker_fields:
-        if k in talker_dict and k not in cfg:
-            cfg[k] = talker_dict[k]
-    for k in ("tts_pad_token_id", "tts_bos_token_id", "tts_eos_token_id",
-              "user_token_id", "assistant_token_id", "system_token_id",
-              "im_start_token_id", "im_end_token_id"):
-        if k in root_dict and k not in cfg:
-            cfg[k] = root_dict[k]
-    if "text_vocab_size" not in cfg:
-        thinker_cfg = root_dict.get("thinker_config", {}) or {}
-        thinker_text = thinker_cfg.get("text_config", {}) or {}
-        text_vocab_size = thinker_text.get("vocab_size") or thinker_cfg.get(
-            "vocab_size")
-        if text_vocab_size is not None:
-            cfg["text_vocab_size"] = text_vocab_size
-    speaker_map = cfg.get("speaker_id")
-    if isinstance(speaker_map, dict) and speaker_map:
-        cfg.setdefault("default_speaker_id", next(iter(speaker_map.values())))
-        cfg.setdefault("available_speakers", list(speaker_map.keys()))
-    cfg["model_type"] = "qwen3_omni_moe_talker"
-    cfg["architectures"] = ["Qwen3OmniMoeTalkerCausalLM"]
-    # Talker is a text-only MoE without visual deepstack. Explicit 0 prevents
-    # the llm_loader substring fallback from misclassifying ``qwen3_omni_moe_talker``
-    # as deepstack=3 (the substring match on "qwen3_omni" would otherwise hit),
-    # which would bake 3 dangling deepstack input ports into the engine and
-    # SIGSEGV in executePrefillStep when the caller passes an empty deepstack vector.
-    cfg["num_deepstack_features"] = 0
-    out_path = os.path.join(output_dir, "config.json")
-    with open(out_path, "w") as f:
-        json.dump(cfg, f, indent=2)
-
-
-def _extract_and_save_talker(model_dir: str, full_export_dir: str,
-                             output_dir: str) -> None:
-    """Extract the Talker text MoE backbone (``model.layers.*`` + norms +
-    embed_tokens) from a full-talker NVFP4 export.
-
-    Drops the ``code_predictor`` / projection side modules and normalizes the
-    HF Talker text-backbone keys. The exported keys end up at:
-
-        model.layers.{i}.mlp.experts._experts.{j}.{gate,up,down}_proj.*
-        model.layers.{i}.mlp.shared_expert.{gate,up,down}_proj.*
-        model.layers.{i}.self_attn.{q,k,v,o}_proj.*
-        model.layers.{i}.{input,post_attention}_layernorm.weight
-        model.codec_embedding.weight
-        model.norm.weight
-        codec_head.weight
-    """
-    from safetensors import safe_open
-    from safetensors.torch import save_file
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    SKIP_TOKENS = ("code_predictor.", "audio_tower.", "visual.", "code2wav.",
-                   "text_projection.", "hidden_projection.")
-
-    keep_state: dict = {}
-    for fname in sorted(os.listdir(full_export_dir)):
-        if not fname.endswith(".safetensors"):
-            continue
-        fpath = os.path.join(full_export_dir, fname)
-        with safe_open(fpath, framework="pt", device="cpu") as f:
-            for key in f.keys():
-                if any(s in key for s in SKIP_TOKENS):
-                    continue
-                if key.startswith("talker.model."):
-                    new_key = key[len("talker."):]
-                elif key.startswith("talker.codec_head."):
-                    new_key = key[len("talker."):]
-                elif key.startswith("model.") and "code_predictor" not in key:
-                    new_key = key
-                elif key.startswith("codec_head."):
-                    new_key = key
-                else:
-                    continue
-                keep_state[new_key] = f.get_tensor(key)
-    if not keep_state:
-        raise RuntimeError(f"No Talker text-backbone tensors found under "
-                           f"{full_export_dir}")
-    print(f"[extract-talker] keeping {len(keep_state)} tensors")
-    save_file(keep_state, os.path.join(output_dir, "model.safetensors"))
-
-    # Standalone config: text_config + a handful of talker-level fields.
-    full_cfg = AutoConfig.from_pretrained(model_dir,
-                                          trust_remote_code=True).to_dict()
-    talker_cfg = full_cfg["talker_config"]
-    text_cfg = talker_cfg["text_config"]
-    _write_standalone_talker_config(text_cfg, talker_cfg, full_cfg, output_dir)
-
-    # hf_quant_config.json — keep only patterns relevant to the talker
-    # backbone, rewrite ``talker.model.`` -> ``model.``.
-    src_hf = os.path.join(full_export_dir, "hf_quant_config.json")
-    if os.path.isfile(src_hf):
-        with open(src_hf) as f:
-            hfq = json.load(f)
-
-        def _rewrite_pattern(p: str) -> Optional[str]:
-            if any(skip in p for skip in ("audio_tower", "visual", "code2wav",
-                                          "code_predictor", "text_projection",
-                                          "hidden_projection")):
-                return None
-            if "thinker" in p:
-                return None
-            return p.replace("talker.model.",
-                             "model.").replace("talker.codec_head.",
-                                               "codec_head.")
-
-        for list_key in ("exclude_modules", ):
-            if list_key in hfq and isinstance(hfq[list_key], list):
-                hfq[list_key] = [
-                    p for p in (_rewrite_pattern(x) for x in hfq[list_key])
-                    if p is not None
-                ]
-        with open(os.path.join(output_dir, "hf_quant_config.json"), "w") as f:
-            json.dump(hfq, f, indent=2)
-
-    # chat_template.json. HF Qwen3-Omni stores its Jinja chat template in a
-    # dedicated file (not in tokenizer_config.json), so a plain
-    # ``tokenizer.save_pretrained`` would lose it and downstream
-    # ``apply_chat_template`` would fall back to the generic
-    # ``User:/Assistant:`` template.
-    src_tpl = os.path.join(model_dir, "chat_template.json")
-    if os.path.isfile(src_tpl):
-        import shutil
-        shutil.copyfile(src_tpl, os.path.join(output_dir,
-                                              "chat_template.json"))
-
-
-# ---------------------------------------------------------------------------
 # Top-level entry
 # ---------------------------------------------------------------------------
 
@@ -615,59 +720,94 @@ def _extract_and_save_talker(model_dir: str, full_export_dir: str,
 def quantize_qwen3_omni(
     model_dir: str,
     output_dir: str,
+    quantization: Optional[str] = "nvfp4",
     lm_head_quantization: Optional[str] = None,
     kv_cache_quantization: Optional[str] = None,
+    visual_quantization: Optional[str] = None,
+    audio_quantization: Optional[str] = None,
+    cp_quantization: Optional[str] = None,
     dtype: str = "fp16",
     device: str = "cuda",
-    dataset: str = "cnn_dailymail",
+    text_dataset=None,
     num_samples: int = 64,
     max_length: int = 64,
     talker_num_audio: int = 150,
     talker_num_image: int = 150,
     talker_num_text: int = 200,
     talker_accept_hidden_layer: Optional[int] = None,
-    keep_full_export: bool = False,
-) -> Tuple[str, str]:
-    """Quantize Thinker + Talker text MoE to NVFP4 and save both standalone.
+) -> str:
+    """Quantize Thinker + Talker text and save a single HF root.
 
-    Calibration is **joint and multimodal**: a single ``mtq.quantize(model,
-    ...)`` call is made on the full ``Qwen3OmniMoeForConditionalGeneration``,
-    with a forward loop that for each sample runs
+    ``quantization`` selects the backbone: ``"nvfp4"`` (default) or
+    ``"int4_awq"``. Calibration is **joint and multimodal**: a single
+    ``mtq.quantize(model, ...)`` call is made on the full
+    ``Qwen3Omni(Moe)?ForConditionalGeneration``, with a per-sample forward
+    loop that runs
 
         Thinker(multimodal input)  -- quantizers observe Thinker activations
           → hidden_projection / text_projection
           → Talker(projected inputs_embeds)  -- quantizers observe Talker
                                                 activations
 
-    in a single pass.  Both submodels' amax statistics come from the SAME
-    realistic multimodal distribution, matching what
-    ``tensorrt_edgellm.quantization.llm_quantization.quantize_llm`` does
-    for the dense model.
+    Both submodels' amax statistics come from the SAME realistic multimodal
+    distribution.  See the module docstring for the INT4 AWQ modelopt
+    workarounds.
 
-    Notes:
-      * ``num_samples`` / ``max_length`` / ``dataset`` are kept in the
-        signature for backwards-compatible CLI but are now unused (the
-        Thinker no longer runs a separate text-only calibration pass).
-      * ``talker_accept_hidden_layer`` defaults to the value baked into
-        ``config.talker_config.accept_hidden_layer``; the same integer is
-        embedded into both the standalone Thinker config (so the ONNX
-        export emits the correct hidden-states layer) and the standalone
-        Talker config (so the C++ runtime fetches the right tensor).
+    ``cp_quantization="fp8"`` additionally quantizes the Talker
+    CodePredictor: the quant config opts CP in (see
+    :func:`_build_full_model_quant_cfg`) and the forward loop appends a
+    dedicated Thinker → Talker → CP generation drive
+    (:func:`qwen3_cp_calibration_loop`) so CP quantizers see real
+    activations — the joint pass alone never reaches CP.
 
-    Returns (thinker_dir, talker_dir).
+    Output is a single HF root under ``output_dir`` (same layout as the
+    source ``model_dir``), consumable by ``tensorrt-edgellm-export`` in
+    one shot.  ``num_samples`` / ``max_length`` are accepted for CLI parity
+    but unused (joint multimodal calibration supersedes text-only);
+    ``text_dataset`` (registered name, generator, or ``None`` for the
+    default) feeds the joint calibration's text portion and the CP drive.
+    Audio / image calibration data use a fixed recipe (LibriSpeech + MMMU).
+    Returns ``output_dir``.
     """
-    del num_samples, max_length, dataset  # Joint multimodal calib supersedes
+    del num_samples, max_length  # Joint multimodal calib supersedes
+    if (quantization is None and visual_quantization is None
+            and audio_quantization is None and cp_quantization is None):
+        raise ValueError(
+            "Nothing to quantize: pass --quantization and/or one of "
+            "--visual_quantization / --audio_quantization / "
+            "--cp_quantization.")
     t0 = time.time()
     torch_dtype = torch.float16 if dtype == "fp16" else torch.bfloat16
 
-    # 1. Load multimodal model.
-    from transformers import Qwen3OmniMoeForConditionalGeneration
-    print(f"[load] {model_dir}")
+    # 1. Detect model variant + load. Two Qwen3-Omni variants share this
+    #    driver:
+    #      - model_type "qwen3_omni_moe" -> Qwen3OmniMoeForConditionalGeneration
+    #        (in released transformers).
+    #      - model_type "qwen3_omni"     -> Qwen3OmniForConditionalGeneration
+    #        (requires a transformers build that carries the non-MoE class;
+    #        not present in released transformers tags).
+    hf_cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+    model_type = getattr(hf_cfg, "model_type", None)
+    is_moe = (model_type == "qwen3_omni_moe")
+    print(f"[load] {model_dir} (model_type={model_type}, is_moe={is_moe})")
     tokenizer = AutoTokenizer.from_pretrained(model_dir,
                                               trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
+    if is_moe:
+        from transformers import Qwen3OmniMoeForConditionalGeneration
+        _model_cls = Qwen3OmniMoeForConditionalGeneration
+    else:
+        try:
+            from transformers import Qwen3OmniForConditionalGeneration
+        except ImportError as error:
+            raise ImportError(
+                f"model_type={model_type!r} requires a transformers build "
+                "that exposes Qwen3OmniForConditionalGeneration; the "
+                "released transformers tags only carry the MoE variant."
+            ) from error
+        _model_cls = Qwen3OmniForConditionalGeneration
+    model = _model_cls.from_pretrained(
         model_dir, dtype=torch_dtype,
         trust_remote_code=True).to(device).eval()
     if talker_accept_hidden_layer is None or talker_accept_hidden_layer < 0:
@@ -689,199 +829,148 @@ def quantize_qwen3_omni(
     #    Talker sees the same input distribution it will encounter at
     #    inference time.
     if not is_quantized(model.thinker) or not is_quantized(model.talker):
-        from transformers import AutoProcessor
-        processor = AutoProcessor.from_pretrained(model_dir,
-                                                  trust_remote_code=True)
-        calib_ds = _build_multimodal_calib_dataset(processor,
-                                                   num_audio=talker_num_audio,
-                                                   num_image=talker_num_image,
-                                                   num_text=talker_num_text)
-        print(f"[calib] multimodal dataset: {len(calib_ds)} samples "
-              f"(joint thinker + talker calibration)")
+        # The joint multimodal pass only pays off when quantizers outside
+        # CP are enabled; a CP-only run needs just the dedicated CP drive.
+        needs_multimodal_calib = (quantization is not None
+                                  or visual_quantization is not None
+                                  or audio_quantization is not None)
+        calib_ds = None
+        if needs_multimodal_calib:
+            from transformers import AutoProcessor
+            processor = AutoProcessor.from_pretrained(model_dir,
+                                                      trust_remote_code=True)
+            calib_ds = _build_multimodal_calib_dataset(
+                processor,
+                num_audio=talker_num_audio,
+                num_image=talker_num_image,
+                num_text=talker_num_text,
+                text_ds=text_dataset)
+            print(f"[calib] multimodal dataset: {len(calib_ds)} samples "
+                  f"(joint thinker + talker calibration)")
 
-        cfg = _build_full_model_quant_cfg(lm_head_quantization,
-                                          kv_cache_quantization)
-        mtq.quantize(
-            model,
-            cfg,
-            forward_loop=lambda m: _calib_full_multimodal(
-                model, calib_ds, talker_accept_hidden_layer),
-        )
-        mtq.print_quant_summary(model.thinker)
-        mtq.print_quant_summary(model.talker)
+        cfg = _build_full_model_quant_cfg(
+            quantization,
+            lm_head_quantization,
+            kv_cache_quantization,
+            is_moe=is_moe,
+            visual_quantization=visual_quantization,
+            audio_quantization=audio_quantization,
+            cp_quantization=cp_quantization)
+
+        def _forward_loop(m):
+            if calib_ds is not None:
+                _calib_full_multimodal(model, calib_ds,
+                                       talker_accept_hidden_layer)
+            if cp_quantization is not None:
+                from .datasets import resolve_dataset
+                from .quantize import _text_calib_dataloader
+                from .qwen3_cp_loader import qwen3_cp_calibration_loop
+                cp_loader = _text_calib_dataloader(tokenizer,
+                                                   resolve_dataset(
+                                                       text_dataset, "text"),
+                                                   batch_size=1,
+                                                   num_samples=64)
+                qwen3_cp_calibration_loop(model, cp_loader, num_cp_samples=64)
+
+        with _maybe_int4_awq_wars(quantization):
+            mtq.quantize(model, cfg, forward_loop=_forward_loop)
+            mtq.print_quant_summary(model.thinker)
+            mtq.print_quant_summary(model.talker)
     print(f"[quant] {time.time() - t0:.1f}s")
 
-    # 3c. Save modelopt state for PyTorch QDQ verification.
-    # Persists the full quantizer state (all amax / scale / on/off flags) so
-    # the v4_joint-equivalent quant ckpt can be reloaded into an FP16 HF model
-    # via ``mto.restore``, after which forward runs in QDQ emulation mode --
-    # numerically equivalent to hardware NVFP4 to a few ULP.  This lets us
-    # validate the quant ckpt independent of the TRT export / CuTeDSL kernel
-    # path (see ``verify_quant_ckpt.py``).
-    import modelopt.torch.opt as mto
+    # 3c. Persist modelopt state for PyTorch QDQ verification.
     os.makedirs(output_dir, exist_ok=True)
     mto_state_path = os.path.join(output_dir, "modelopt_state.pt")
     mto.save(model, mto_state_path)
     print(f"[mto] saved modelopt state to {mto_state_path}")
 
-    # 4. Export Thinker subgraph.
-    thinker_dir = os.path.join(output_dir, "thinker")
-    os.makedirs(thinker_dir, exist_ok=True)
-    full_thinker = thinker_dir + (".keep" if keep_full_export else ".staging")
-    os.makedirs(full_thinker, exist_ok=True)
-    _export_submodel(model, "thinker", full_thinker)
-    _extract_and_save_thinker_text(model_dir, full_thinker, thinker_dir)
-    tokenizer.save_pretrained(thinker_dir)
-    if not keep_full_export:
-        import shutil
-        shutil.rmtree(full_thinker, ignore_errors=True)
+    # 4. Full-model HF-root export.
+    with _maybe_int4_awq_wars(quantization), _omni_export_wars(model):
+        with torch.inference_mode():
+            export_hf_checkpoint(model, export_dir=output_dir)
 
-    # 5. Export Talker subgraph.
-    talker_dir = os.path.join(output_dir, "talker")
-    os.makedirs(talker_dir, exist_ok=True)
-    full_talker = talker_dir + (".keep" if keep_full_export else ".staging")
-    os.makedirs(full_talker, exist_ok=True)
-    _export_submodel(model, "talker", full_talker)
-    _extract_and_save_talker(model_dir, full_talker, talker_dir)
-    tokenizer.save_pretrained(talker_dir)
-    if not keep_full_export:
-        import shutil
-        shutil.rmtree(full_talker, ignore_errors=True)
+    # Copy tokenizer + preprocessor + chat template to make ``output_dir``
+    # a self-contained HF root (same convention as `quantize_and_export`).
+    tokenizer.save_pretrained(output_dir)
+    try:
+        processor = AutoProcessor.from_pretrained(model_dir,
+                                                  trust_remote_code=True)
+        processor.save_pretrained(output_dir)
+    except Exception as error:  # non-fatal: raw files are copied below
+        warnings.warn(f"AutoProcessor save failed ({error}); relying on raw "
+                      "processor-file copies.")
+    for fname in ("preprocessor_config.json", "processor_config.json",
+                  "video_preprocessor_config.json", "chat_template.json",
+                  "chat_template.jinja"):
+        src = os.path.join(model_dir, fname)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(output_dir, fname))
 
-    print(f"[done] thinker={thinker_dir}  talker={talker_dir}  "
-          f"(total {time.time() - t0:.1f}s)")
-    return thinker_dir, talker_dir
+    print(f"[done] {output_dir}  (total {time.time() - t0:.1f}s)")
+    return output_dir
 
 
 # ---------------------------------------------------------------------------
-# Submodule export helper
+# Full-model export workarounds
 # ---------------------------------------------------------------------------
 
 
-def _export_submodel(model, which: str, full_dir: str) -> None:
-    """``export_hf_checkpoint`` either the Thinker or Talker submodule.
+@contextmanager
+def _omni_export_wars(model):
+    """Scoped patches for ``export_hf_checkpoint`` on a full Qwen3-Omni model.
 
-    Detaches the unused sibling encoders, forces ``architectures``, and
-    monkey-patches ``modelopt.torch.export.model_utils.is_multimodal_model``
-    to False so ModelOpt's resmooth dummy-forward walks the plain CausalLM
-    path. For Talker, also wraps ``forward`` with default
-    ``inputs_embeds`` / ``attention_mask`` / ``talker_input_ids`` so the
-    dummy walk does not crash on un-derivable tensors.
+    - Strip ``codec_head`` from Talker ``_tied_weights_keys`` (declared but
+      not actually tied at runtime; leaving it in drops ``codec_head.weight``).
+    - Skip ``requantize_resmooth_fused_llm_layers`` (its dummy forward calls
+      ``model(input_ids)`` but Qwen3-Omni's top-level class ships no forward).
+    - Teach ``get_expert_linear_names`` about Qwen3-Omni MoE expert MLPs
+      (substring match misses ``Qwen3OmniMoe(Thinker|Talker)TextSparseMoeBlock``).
     """
-    sub = getattr(model, which)
-    saved_attrs: dict = {}
-    saved_cfgs: dict = {}
-    saved_forward = None
     saved_tied_keys = None
-    _tied_keys_was_patched = False
-
-    if which == "thinker":
-        if sub.config.architectures is None:
-            sub.config.architectures = ["Qwen3MoeForCausalLM"]
-        for attr in ("audio_tower", "visual"):
-            if hasattr(sub, attr) and getattr(sub, attr) is not None:
-                saved_attrs[attr] = getattr(sub, attr)
-                setattr(sub, attr, None)
-        for cfg_attr in ("vision_config", "audio_config"):
-            if hasattr(sub.config, cfg_attr) and getattr(sub.config,
-                                                         cfg_attr) is not None:
-                saved_cfgs[cfg_attr] = getattr(sub.config, cfg_attr)
-                delattr(sub.config, cfg_attr)
-    elif which == "talker":
-        if sub.config.architectures is None:
-            sub.config.architectures = ["Qwen3MoeForCausalLM"]
-
-        # HF ``Qwen3OmniMoeTalkerForConditionalGeneration`` declares
-        #   _tied_weights_keys = {"codec_head": "model.codec_embedding.weight"}
-        # but the runtime does NOT actually tie them: ``tie_weights()`` early-
-        # returns because ``config.tie_word_embeddings == False``, and the
-        # source HF checkpoint stores two independent BF16 tensors with
-        # 99.9% of elements differing (max_abs_diff ~ 8.1). ModelOpt's
-        # ``export_hf_checkpoint`` trusts the declarative metadata, treats
-        # codec_head as a redundant tied copy, and drops codec_head.weight
-        # from the exported safetensors -- leaving a randomly-initialised
-        # codec output projection at inference and producing garbled audio.
-        # Strip the codec_head entry from the tied-keys metadata for the
-        # duration of the export so modelopt writes codec_head.weight
-        # explicitly. Restored in the ``finally`` block below.
-        orig_tied = getattr(sub, "_tied_weights_keys", None)
+    _tied_was_patched = False
+    if hasattr(model, "talker"):
+        orig_tied = getattr(model.talker, "_tied_weights_keys", None)
         if isinstance(orig_tied, dict):
             saved_tied_keys = orig_tied
-            sub._tied_weights_keys = {
+            model.talker._tied_weights_keys = {
                 k: v
                 for k, v in orig_tied.items() if "codec_head" not in k
             }
-            _tied_keys_was_patched = True
+            _tied_was_patched = True
         elif isinstance(orig_tied, (list, tuple)):
             saved_tied_keys = orig_tied
-            sub._tied_weights_keys = type(orig_tied)(
+            model.talker._tied_weights_keys = type(orig_tied)(
                 k for k in orig_tied if "codec_head" not in str(k))
-            _tied_keys_was_patched = True
+            _tied_was_patched = True
 
-        # ModelOpt's resmooth path calls ``model(fake_input_ids)`` with every
-        # other arg None, but the Talker top-forward never derives
-        # ``inputs_embeds`` from ``input_ids`` (the runtime always feeds
-        # ``inputs_embeds`` directly from Thinker hidden states) and dereferences
-        # ``attention_mask`` / ``talker_input_ids`` unguarded. Wrap forward to
-        # synthesize the missing tensors so the dummy walk reaches every
-        # quantizable linear.
-        saved_forward = sub.forward
-        _t_hidden_size = sub.config.text_config.hidden_size
-        _t_device = next(sub.parameters()).device
-        _t_dtype = next(sub.parameters()).dtype
+    import modelopt.torch.export.unified_export_hf as _ueh
+    _orig_resmooth = _ueh.requantize_resmooth_fused_llm_layers
+    _ueh.requantize_resmooth_fused_llm_layers = lambda m: None
 
-        def _talker_forward_with_defaults(*args, **kwargs):
-            if args and "input_ids" not in kwargs:
-                kwargs["input_ids"] = args[0]
-                args = args[1:]
-            input_ids = kwargs.pop("input_ids", None)
-            if input_ids is not None:
-                if input_ids.dim() == 1:
-                    input_ids = input_ids.unsqueeze(0)
-                bsz, seq = input_ids.shape
-                if kwargs.get("inputs_embeds", None) is None:
-                    kwargs["inputs_embeds"] = torch.zeros(bsz,
-                                                          seq,
-                                                          _t_hidden_size,
-                                                          dtype=_t_dtype,
-                                                          device=_t_device)
-                if kwargs.get("attention_mask", None) is None:
-                    kwargs["attention_mask"] = torch.ones(bsz,
-                                                          seq,
-                                                          dtype=torch.long,
-                                                          device=_t_device)
-                if kwargs.get("talker_input_ids", None) is None:
-                    kwargs["talker_input_ids"] = input_ids
-            return saved_forward(*args, **kwargs)
+    _orig_gel = _ueh.get_expert_linear_names
 
-        sub.forward = _talker_forward_with_defaults
-    else:
-        raise ValueError(f"unknown submodule: {which}")
+    def _patched_gel(module):
+        cls_name = type(module).__name__
+        if "Qwen3OmniMoe" in cls_name and ("Thinker" in cls_name
+                                           or "Talker" in cls_name):
+            return ["gate_proj", "down_proj", "up_proj"]
+        return _orig_gel(module)
 
-    from modelopt.torch.export import model_utils as _mu
-    _orig_is_mm = _mu.is_multimodal_model
-    _mu.is_multimodal_model = lambda *a, **kw: False
+    _ueh.get_expert_linear_names = _patched_gel
+
     try:
-        with torch.inference_mode():
-            export_hf_checkpoint(sub, export_dir=full_dir)
+        yield
     finally:
-        _mu.is_multimodal_model = _orig_is_mm
-        for attr, val in saved_attrs.items():
-            setattr(sub, attr, val)
-        for cfg_attr, val in saved_cfgs.items():
-            setattr(sub.config, cfg_attr, val)
-        if saved_forward is not None:
-            sub.forward = saved_forward
-        if _tied_keys_was_patched:
-            sub._tied_weights_keys = saved_tied_keys
-    print(f"[export-{which}] {full_dir}")
+        _ueh.get_expert_linear_names = _orig_gel
+        _ueh.requantize_resmooth_fused_llm_layers = _orig_resmooth
+        if _tied_was_patched and hasattr(model, "talker"):
+            model.talker._tied_weights_keys = saved_tied_keys
 
 
 # ===========================================================================
-#         Auto-dispatch path used by ``tensorrt-edgellm-quantize llm``
-#     for any Qwen3-Omni / Qwen3-Next Omni checkpoint. Separate from the
-#     ``qwen3-omni`` CLI subcommand above (which targets the joint MoE
-#     NVFP4 Thinker+Talker recipe with a per-submodule extraction step).
+#     Qwen3.5-Omni (qwen3_omni_next) orchestrator — auto-dispatched from
+#     ``tensorrt-edgellm-quantize llm``. Separate from the Qwen3-Omni
+#     joint driver above (``quantize_qwen3_omni``).
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
@@ -1165,13 +1254,30 @@ def quantize_and_export_omni(
     quantization: Optional[str] = None,
     lm_head_quantization: Optional[str] = None,
     kv_cache_quantization: Optional[str] = None,
+    visual_quantization: Optional[str] = None,
+    audio_quantization: Optional[str] = None,
+    cp_quantization: Optional[str] = None,
     dtype: str = "fp16",
     device: str = "cuda",
     audio_dataset: str = "openslr/librispeech_asr",
     visual_dataset: str = "lmms-lab/MMMU",
     text_dataset: str = "cnn_dailymail",
+    num_samples: int = 500,
 ) -> str:
-    """Load a Qwen3-Omni / Qwen3-Next Omni model, quantize it, and export."""
+    """Load a Qwen3-Next Omni model, quantize it, and export.
+
+    Shares the ``tensorrt-edgellm-quantize llm`` flag surface with the
+    Qwen3-Omni driver; sub-encoder quantization flags are rejected until
+    validated on this family. ``num_samples`` is split roughly evenly
+    across the three calibration modalities.
+    """
+    for flag, val in (("visual_quantization", visual_quantization),
+                      ("audio_quantization", audio_quantization),
+                      ("cp_quantization", cp_quantization)):
+        if val is not None:
+            raise ValueError(
+                f"--{flag} is not supported for qwen3_omni_next yet.")
+
     t0 = time.time()
     model, tokenizer, processor = _load_omni_model(model_dir, dtype, device)
 
@@ -1184,14 +1290,15 @@ def quantize_and_export_omni(
                 "AutoProcessor.from_pretrained failed.")
         accept_layer = getattr(getattr(model.config, "talker_config", None),
                                "accept_hidden_layer", 14)
+        third = max(1, num_samples // 3)
         calib_dataset = _build_multimodal_calib_dataset(
             processor,
-            num_audio=150,
-            num_image=150,
-            num_text=200,
+            num_audio=third,
+            num_image=third,
+            num_text=num_samples - 2 * third,
             audio_dataset_dir=audio_dataset,
             visual_dataset_dir=visual_dataset,
-            text_dataset=text_dataset,
+            text_ds=text_dataset,
         )
         has_talker = bool(getattr(model, "has_talker", False))
         print(f"Omni multimodal calibration: {len(calib_dataset)} samples "

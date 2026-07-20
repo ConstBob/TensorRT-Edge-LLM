@@ -1701,6 +1701,10 @@ def _normalize_module_name(name: str) -> str:
     # ``_make_sub_model_dir(key_prefix='talker.')`` staging.
     if name.startswith("talker.model."):
         return name[len("talker.model."):]
+    # Bare submodel prefixes (consolidated Qwen3-Omni roots): the visual /
+    # audio / code_predictor builders use short names without them.
+    if name.startswith("thinker."):
+        return name[len("thinker."):]
     if name.startswith("talker."):
         return name[len("talker."):]
     for prefix in _VL_LLM_PREFIXES + ("model.", ):

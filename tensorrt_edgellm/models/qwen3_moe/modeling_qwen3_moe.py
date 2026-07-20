@@ -282,8 +282,23 @@ class Qwen3SparseMoeBlock(nn.Module):
             self._prepare_nvfp4_moe_weights()
             return
 
-        from ...checkpoint.repacking import (_extract_gptq_for_marlin,
+        from ...checkpoint.repacking import (_extract_awq_for_marlin,
+                                             _extract_gptq_for_marlin,
                                              pack_int4_awq_marlin)
+        from ..linear import ModelOptAWQPrepackedLinear
+
+        # Detect ckpt format by inspecting the first expert. Both AWQ and GPTQ
+        # produce ([N,K] int16 nibbles, [N,G] fp16 scales) — same Marlin pack
+        # downstream. AWQ folds ``pre_quant_scale`` into the weight; GPTQ
+        # applies zero_point_offset.
+        first_proj = self.experts[0].gate_proj
+        is_awq_moe = isinstance(first_proj, ModelOptAWQPrepackedLinear)
+
+        def _extract(proj):
+            if is_awq_moe:
+                return _extract_awq_for_marlin(proj, self.group_size)
+            return _extract_gptq_for_marlin(proj, self.group_size,
+                                            self.zero_point_offset)
 
         # Promote Qwen3MoERouter weight -> nn.Linear for standard MatMul trace.
         self.gate_linear = nn.Linear(self.hidden_size,
@@ -292,24 +307,19 @@ class Qwen3SparseMoeBlock(nn.Module):
                                      dtype=torch.float16)
         self.gate_linear.weight.data = self.gate.weight.data
 
-        # Extract per-expert GPTQ weights -> [N, K] int16 + [N, groups] fp16.
+        # Extract per-expert quantized weights -> [N, K] int16 + [N, groups] fp16.
         gate_up_weights_list = []
         gate_up_scales_list = []
         down_weights_list = []
         down_scales_list = []
 
         for expert in self.experts:
-            gw, gs = _extract_gptq_for_marlin(expert.gate_proj,
-                                              self.group_size,
-                                              self.zero_point_offset)
-            uw, us = _extract_gptq_for_marlin(expert.up_proj, self.group_size,
-                                              self.zero_point_offset)
+            gw, gs = _extract(expert.gate_proj)
+            uw, us = _extract(expert.up_proj)
             gate_up_weights_list.append(torch.cat([gw, uw], dim=0))
             gate_up_scales_list.append(torch.cat([gs, us], dim=0))
 
-            dw, ds = _extract_gptq_for_marlin(expert.down_proj,
-                                              self.group_size,
-                                              self.zero_point_offset)
+            dw, ds = _extract(expert.down_proj)
             down_weights_list.append(dw)
             down_scales_list.append(ds)
 
