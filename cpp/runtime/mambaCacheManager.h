@@ -173,6 +173,14 @@ public:
     void scatterAcceptedTreeStates(
         rt::Tensor const& acceptedStateNodeIds, rt::Tensor const& acceptLengths, cudaStream_t stream);
 
+    //! Chunk impl (the default): commit DDTree recurrent states by
+    //! REPLAYING the accepted path from the committed state, consuming the
+    //! per-node stash the chunk-form verify wrote into the head of each
+    //! layer's intermediate buffer. Conv states still commit via the
+    //! checkpoint scatter (conv checkpoints stay valid in this mode).
+    void replayCommitAcceptedTreeStates(
+        rt::Tensor const& acceptedStateNodeIds, rt::Tensor const& acceptLengths, cudaStream_t stream);
+
 private:
     Config mConfig{};                                     //!< Cache configuration
     std::vector<rt::Tensor> mRecurrentStates;             //!< Per-layer recurrent state tensors on device

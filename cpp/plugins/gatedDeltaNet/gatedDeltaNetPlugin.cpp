@@ -25,8 +25,11 @@
 #include "kernels/gdnKernels/gdnKernelUtils.cuh"
 #endif
 
+#include "kernels/gdnKernels/gdnTreeChunkKernels.h"
+
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstdint>
 #include <mutex>
 #include <stdexcept>
@@ -377,6 +380,15 @@ size_t GatedDeltaNetPlugin::getWorkspaceSize([[maybe_unused]] DynamicPluginTenso
         size_t const gateValueBytes
             = alignTensorSize(static_cast<size_t>(maxN) * maxSeqLen * maxHv * 2U * sizeof(float));
         total = std::max(total, qkScaleBytes + gateValueBytes);
+
+        // Chunk-form verify (the default impl): ancestor masks
+        // only. The KS/QS + prep scratch lives in the intermediate-states
+        // row tail, NOT here — engine plans serialize this size at build
+        // time, so growing it silently overflows on pre-existing engines.
+        int32_t const chunkNodes = std::min(maxSeqLen, kernel::kGDN_TREE_CHUNK_MAX_NODES);
+        size_t const maskBytes = alignTensorSize(
+            static_cast<size_t>(maxN) * chunkNodes * kernel::kGDN_TREE_CHUNK_MASK_WORDS * sizeof(uint32_t));
+        total = std::max(total, maskBytes);
     }
 
     return total;
@@ -464,6 +476,48 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
     if (!ddtreeActive && h0Out != inputs[kIN_H0_SOURCE_IDX])
     {
         cudaMemcpyAsync(h0Out, inputs[kIN_H0_SOURCE_IDX], h0Bytes, cudaMemcpyDeviceToDevice, stream);
+    }
+
+    // Stateless chunk-form tree verify (the default; gdnTreeChunkVerifyEnabled
+    // encapsulates the env toggle + the oversized-tree fallback, and the
+    // decoder commit path gates on the same predicate). Reads h0 strictly
+    // read-only, writes o + a small replay stash into the head of the
+    // intermediate_states buffer (whose checkpoint contents are then unused;
+    // commit switches to replay in the decoder).
+    if (ddtreeActive && kernel::gdnTreeChunkVerifyEnabled(seq_len))
+    {
+        // Workspace: ancestor masks only (reserved by getWorkspaceSize when
+        // mUseDDTree). The KS/QS + prep scratch lives in the row tail of the
+        // intermediate-states buffer.
+        uint32_t* masks = static_cast<uint32_t*>(workspace);
+        if (cudaError_t const e
+            = kernel::gdnTreeBuildAncestorMasks(static_cast<int32_t const*>(inputs[kIN_TREE_PARENT_IDS_IDX]), masks, n,
+                seq_len, /*maxDepth=*/seq_len, stream);
+            e != cudaSuccess)
+        {
+            LOG_ERROR("gated_delta_net: gdnTreeBuildAncestorMasks launch failed: %s", cudaGetErrorString(e));
+            return -1;
+        }
+
+        // Per-batch stash stride == one checkpoint row of the intermediate
+        // buffer, so batches land in disjoint, engine-compatible regions.
+        size_t const stashBatchStrideBytes
+            = static_cast<size_t>(seq_len) * hv * static_cast<size_t>(k_dim) * v_dim * sizeof(float);
+        // Standard scaled dot-product attention scale for the chunk-form verify kernel.
+        float const qScale = 1.f / std::sqrt(static_cast<float>(k_dim));
+        cudaError_t const verifyErr = kernel::gdnTreeVerifyChunk(static_cast<float const*>(inputs[kIN_H0_SOURCE_IDX]),
+            static_cast<__half const*>(inputs[kIN_Q_IDX]), static_cast<__half const*>(inputs[kIN_K_IDX]),
+            static_cast<__half const*>(inputs[kIN_V_IDX]), static_cast<__half const*>(inputs[kIN_A_IDX]),
+            static_cast<__half const*>(inputs[kIN_B_IDX]), static_cast<float const*>(inputs[kIN_A_LOG_IDX]),
+            static_cast<__half const*>(inputs[kIN_DT_BIAS_IDX]), masks, static_cast<__half*>(outputs[kOUT_O_IDX]),
+            outputs[kOUT_INTERMEDIATE_STATES_IDX], stashBatchStrideBytes, n, seq_len, h, hv, qScale,
+            /*useQKL2Norm=*/true, stream);
+        if (verifyErr != cudaSuccess)
+        {
+            LOG_ERROR("gated_delta_net: chunk-form verify launch failed: %s", cudaGetErrorString(verifyErr));
+            return -1;
+        }
+        return 0;
     }
 
     GDNParams params{};
