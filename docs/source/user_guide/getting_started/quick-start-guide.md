@@ -36,7 +36,7 @@ cd ..
 ```
 
 For Jetson Thor on JetPack 7.2, follow the CMake pattern used by CI and enable
-CuTe DSL prebuilt kernels. For JetPack 7.0/7.1, use
+CuTe DSL kernels. For JetPack 7.0/7.1, use
 `-DCUDA_CTK_VERSION=13.0` instead.
 
 ```bash
@@ -264,23 +264,8 @@ You should see a JSON response with the model's answer, similar to:
 {
   "responses": [
     {
-      "output_text": "The capital of the United States is Washington, D.C.",
-      "request_idx": 0,
-      "batch_idx": 0,
-      "finish_reason": "stop",
-      "messages": [
-        {
-          "role": "user",
-          "content": [
-            {
-              "type": "text",
-              "text": "What is the capital of the United States?"
-            }
-          ]
-        }
-      ],
-      "formatted_system_prompt": "",
-      "formatted_complete_request": "..."
+      "text": "The capital of the United States is Washington, D.C.",
+      "finish_reason": "stop"
     }
   ]
 }

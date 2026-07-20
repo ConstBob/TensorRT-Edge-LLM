@@ -26,324 +26,98 @@
     - if: $CI_COMMIT_BRANCH == "main"
     - if: $CI_COMMIT_BRANCH =~ /^release/
 
+.cutedsl_builder_version:
+  variables:
+    # Developers bump the component version manually when needed. Each pipeline
+    # appends its unique ID so concurrent pipelines cannot overwrite or consume
+    # one another's builder image.
+    CUTE_DSL_BUILDER_VERSION: "4.6.1"
+    CUTE_DSL_BUILDER_TAG: "$CUTE_DSL_BUILDER_VERSION-$CI_PIPELINE_ID"
+    CUTE_DSL_BUILDER_IMAGE: "$CI_REGISTRY_IMAGE/cutedsl-kernel-builder:$CUTE_DSL_BUILDER_TAG"
+
 .cutedsl_artifact_base:
   stage: setup
   extends:
     - .cutedsl_artifact_rules
   interruptible: true
 
-.cutedsl_remote_artifact_base:
+build_cutedsl_docker_image:
+  stage: precheck
+  extends:
+    - .cutedsl_artifact_rules
+    - .cutedsl_builder_version
+  tags:
+    - cpu-k8s
+  image:
+    name: "gcr.io/kaniko-project/executor:debug"
+    entrypoint: [""]
+  script:
+    - test "$CI_REGISTRY" = "gitlab-master.nvidia.com:5005"
+    - test -n "$CI_REGISTRY_USER" && test -n "$CI_REGISTRY_PASSWORD"
+    - |
+      registry_auth="$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')"
+      mkdir -p /kaniko/.docker
+      printf '{"auths":{"%s":{"auth":"%s"}}}' \
+        "$CI_REGISTRY" "$registry_auth" > /kaniko/.docker/config.json
+    - |
+      /kaniko/executor \
+        --context "$CI_PROJECT_DIR/kernelSrcs" \
+        --dockerfile "$CI_PROJECT_DIR/kernelSrcs/Dockerfile.cutedsl" \
+        --build-arg "CUTE_DSL_BUILDER_VERSION=$CUTE_DSL_BUILDER_VERSION" \
+        --cache=false \
+        --destination "$CUTE_DSL_BUILDER_IMAGE"
+  after_script:
+    - !reference [.record_runner_usage, after_script]
+  interruptible: true
+
+build_cutedsl_docker_matrix:
   extends:
     - .cutedsl_artifact_base
-  image: "ubuntu:24.04"
+    - .cutedsl_builder_version
+  needs:
+    - job: build_cutedsl_docker_image
+  tags:
+    - b100-edgellm-nvks
+  image:
+    name: "$CUTE_DSL_BUILDER_IMAGE"
+    entrypoint: [""]
   variables:
-    BOARD_IP: "192.168.55.1"
-    BOARD_USER: "tensorrt_user"
-    # Temporary build output lives under L0 and is cleaned on success. Durable
-    # copies are published by publish_cutedsl_artifacts after the pipeline passes.
-    CUTE_DSL_OUTPUT_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}/cutedsl_artifacts/${CI_JOB_NAME}"
+    CUTE_DSL_OUTPUT_DIR: "$CI_PROJECT_DIR/cutedsl-out/artifacts"
+    CUTE_DSL_PREBUILT_DIR: "$CI_PROJECT_DIR/kernelSrcs/cuteDSLPrebuilt"
   script:
     - echo "Pipeline start time:$(date)"
     - 'echo "Runner node:${NODE_NAME:-$(hostname)}"'
-    - echo "Scratch output dir:$CUTE_DSL_OUTPUT_DIR"
-    - mkdir -p "$CUTE_DSL_OUTPUT_DIR"
-    - export DEBIAN_FRONTEND=noninteractive
-    - apt update -qq >/dev/null 2>&1
-    - apt install -y -qq git openssh-client sshpass rsync python3 python3-venv >/dev/null 2>&1
-    - echo "Board IP:$BOARD_IP"
-    - export REMOTE_WORKSPACE="/home/$BOARD_USER/tensorrt-edge-llm-cutedsl-artifact-${CI_JOB_ID}"
-    - export REMOTE_OUTPUT_DIR="/home/$BOARD_USER/cutedsl-artifacts-${CI_JOB_ID}"
-    - |
-      remote() {
-        SSHPASS="$BOARD_PASSWORD_NVKS" sshpass -e ssh -o StrictHostKeyChecking=no "$BOARD_USER@$BOARD_IP" "$@"
-      }
-    - echo "Preparing remote workspace:$REMOTE_WORKSPACE"
-    - remote "rm -rf '$REMOTE_WORKSPACE' '$REMOTE_OUTPUT_DIR' && mkdir -p '$REMOTE_WORKSPACE' '$REMOTE_OUTPUT_DIR'"
-    - SSHPASS="$BOARD_PASSWORD_NVKS" rsync -az --delete -e "sshpass -e ssh -o StrictHostKeyChecking=no" "$CI_PROJECT_DIR/" "$BOARD_USER@$BOARD_IP:$REMOTE_WORKSPACE/"
-    - echo "Installing remote build dependencies"
-    - remote "printf '%s\n' '$BOARD_PASSWORD_NVKS' | sudo -S apt update -qq >/dev/null 2>&1"
-    - remote "printf '%s\n' '$BOARD_PASSWORD_NVKS' | sudo -S apt install -y -qq python3 python3-pip python3-venv binutils >/dev/null 2>&1"
-    - |
-      cat > cutedsl_remote_build.sh <<'REMOTE_SCRIPT'
-      set -e
-      export PATH=/usr/local/cuda/bin:$PATH
-      echo "CUDA version:$(nvcc --version | grep release)"
-      python3 -m venv venv/cutedsl
-      venv/cutedsl/bin/pip install -q "$CUTE_DSL_PACKAGE" "$CUTE_DSL_CUPY_PACKAGE"
-
-      venv/cutedsl/bin/python kernelSrcs/build_cutedsl.py --kernels ALL ${CUTE_DSL_BUILD_GPU_ARCH_ARG} --output_dir "$REMOTE_OUTPUT_DIR" --clean
-      REMOTE_SCRIPT
-    - SSHPASS="$BOARD_PASSWORD_NVKS" sshpass -e scp -o StrictHostKeyChecking=no cutedsl_remote_build.sh "$BOARD_USER@$BOARD_IP:$REMOTE_WORKSPACE/cutedsl_remote_build.sh"
-    - echo "Building CuTe DSL artifact on remote board"
-    - |
-      remote "cd '$REMOTE_WORKSPACE' && \
-        CUTE_DSL_PACKAGE='$CUTE_DSL_PACKAGE' \
-        CUTE_DSL_CUPY_PACKAGE='$CUTE_DSL_CUPY_PACKAGE' \
-        CUTE_DSL_BUILD_GPU_ARCH_ARG='$CUTE_DSL_BUILD_GPU_ARCH_ARG' \
-        REMOTE_OUTPUT_DIR='$REMOTE_OUTPUT_DIR' \
-        bash cutedsl_remote_build.sh"
-    - mkdir -p "$CUTE_DSL_OUTPUT_DIR/aarch64"
-    # `--no-owner --no-group` because the runner-side $CUTE_DSL_OUTPUT_DIR lives on an
-    # NFS export with root_squash; the squashed user can write file content but cannot
-    # chown — `rsync -a` (which implies `-o`/`-g`) errors with EPERM on every file.
-    - SSHPASS="$BOARD_PASSWORD_NVKS" rsync -rlptDz --no-owner --no-group -e "sshpass -e ssh -o StrictHostKeyChecking=no" "$BOARD_USER@$BOARD_IP:$REMOTE_OUTPUT_DIR/aarch64/$CUTE_DSL_ARTIFACT_TAG" "$CUTE_DSL_OUTPUT_DIR/aarch64/"
-    - ARTIFACT_DIR="$CUTE_DSL_OUTPUT_DIR/aarch64/$CUTE_DSL_ARTIFACT_TAG"
-    - test -f "$ARTIFACT_DIR/metadata.json"
-    - tar -C "$CUTE_DSL_OUTPUT_DIR/aarch64" -czf "$CUTE_DSL_OUTPUT_DIR/$CUTE_DSL_ARTIFACT_NAME" "$CUTE_DSL_ARTIFACT_TAG"
-    - (cd "$CUTE_DSL_OUTPUT_DIR" && sha256sum "$CUTE_DSL_ARTIFACT_NAME" | tee "$CUTE_DSL_ARTIFACT_NAME.sha256")
-    - cat "$ARTIFACT_DIR/metadata.json"
-    # Copy the tar + sha256 into $CI_PROJECT_DIR so GitLab's `artifacts.paths` (project-relative) can upload them.
-    - cp "$CUTE_DSL_OUTPUT_DIR/$CUTE_DSL_ARTIFACT_NAME" "$CUTE_DSL_OUTPUT_DIR/$CUTE_DSL_ARTIFACT_NAME.sha256" "$CI_PROJECT_DIR/"
-    - echo "Durable scratch publish is handled by publish_cutedsl_artifacts after the pipeline passes."
+    - nvidia-smi
+    - bash /workspace/kernelSrcs/build_cutedsl_tarballs.sh
+    - compgen -G "$CUTE_DSL_PREBUILT_DIR/cutedsl_*.tar.gz" >/dev/null
+    - (cd "$CUTE_DSL_PREBUILT_DIR" && sha256sum -c cutedsl_*.tar.gz.sha256)
+    - ls -lh "$CUTE_DSL_PREBUILT_DIR"/cutedsl_*.tar.gz*
     - echo "Pipeline end time:$(date)"
   after_script:
-    # Always tear down the on-board temp dirs (keyed by CI_JOB_ID, no cross-job interest).
-    # Preserve the runner-side scratch dir on failure so a developer can SSH in and inspect.
-    - |
-      if command -v sshpass >/dev/null 2>&1; then
-        SSHPASS="$BOARD_PASSWORD_NVKS" sshpass -e ssh -o StrictHostKeyChecking=no \
-          "$BOARD_USER@$BOARD_IP" \
-          "rm -rf '/home/$BOARD_USER/tensorrt-edge-llm-cutedsl-artifact-${CI_JOB_ID}' '/home/$BOARD_USER/cutedsl-artifacts-${CI_JOB_ID}'" \
-          || echo "Warning: remote cleanup failed; remote dirs may need manual removal"
-      fi
-    - |
-      if [ "$CI_JOB_STATUS" = "success" ]; then
-        echo "Job succeeded — cleaning scratch dir $CUTE_DSL_OUTPUT_DIR"
-        rm -rf "$CUTE_DSL_OUTPUT_DIR"
-      else
-        echo "Job did not succeed (status=$CI_JOB_STATUS) — preserving $CUTE_DSL_OUTPUT_DIR for debugging"
-      fi
     - !reference [.record_runner_usage, after_script]
-
-build_cutedsl_gb10_artifact:
-  extends:
-    - .cutedsl_artifact_base
-  tags:
-    - local-spark
-  variables:
-    CUTE_DSL_ARTIFACT_NAME: "cutedsl_aarch64_sm_121_cuda13.tar.gz"
-    CUTE_DSL_ARTIFACT_TAG: "sm_121"
-    # Build into the runner-local project dir. The `local-spark` runner does not have
-    # a reliable writable /scratch.edge_llm_cache mount, so scratch publishing is
-    # handled by publish_cutedsl_artifacts on a scratch-writable runner.
-    CUTE_DSL_OUTPUT_DIR: "$CI_PROJECT_DIR/cutedsl_artifacts"
-  script:
-    - echo "Pipeline start time:$(date)"
-    - echo "Node name:$(hostname)"
-    - echo "Build output dir:$CUTE_DSL_OUTPUT_DIR"
-    - mkdir -p "$CUTE_DSL_OUTPUT_DIR"
-    - export PATH=/usr/local/cuda/bin:$PATH
-    - export LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH
-    - echo "CUDA version:$(nvcc --version | grep release)"
-    - echo "Building CuTe DSL artifact for GB10"
-    - python3 -m venv "$CUTE_DSL_OUTPUT_DIR/venv/cutedsl"
-    - '"$CUTE_DSL_OUTPUT_DIR/venv/cutedsl/bin/pip" install -q ''nvidia-cutlass-dsl[cu13]==4.6.1'' cupy-cuda13x==13.6.0'
-    - '"$CUTE_DSL_OUTPUT_DIR/venv/cutedsl/bin/python" kernelSrcs/build_cutedsl.py --kernels ALL --gpu_arch sm_121 --arch aarch64 --output_dir "$CUTE_DSL_OUTPUT_DIR" --clean'
-    - ARTIFACT_DIR="$CUTE_DSL_OUTPUT_DIR/aarch64/$CUTE_DSL_ARTIFACT_TAG"
-    - test -f "$ARTIFACT_DIR/metadata.json"
-    - tar -C "$CUTE_DSL_OUTPUT_DIR/aarch64" -czf "$CUTE_DSL_OUTPUT_DIR/$CUTE_DSL_ARTIFACT_NAME" "$CUTE_DSL_ARTIFACT_TAG"
-    - (cd "$CUTE_DSL_OUTPUT_DIR" && sha256sum "$CUTE_DSL_ARTIFACT_NAME" | tee "$CUTE_DSL_ARTIFACT_NAME.sha256")
-    - cat "$ARTIFACT_DIR/metadata.json"
-    # Copy the tar + sha256 into $CI_PROJECT_DIR so GitLab's `artifacts.paths` (project-relative) can upload them.
-    - cp "$CUTE_DSL_OUTPUT_DIR/$CUTE_DSL_ARTIFACT_NAME" "$CUTE_DSL_OUTPUT_DIR/$CUTE_DSL_ARTIFACT_NAME.sha256" "$CI_PROJECT_DIR/"
-    - echo "Durable scratch publish is handled by publish_cutedsl_artifacts after the pipeline passes."
-    - echo "Pipeline end time:$(date)"
   artifacts:
-    name: "cutedsl-gb10-${CI_COMMIT_SHORT_SHA}"
-    expire_in: 1 day
-    # NOTE: GitLab does not expand job-level `variables:` inside `artifacts.paths`,
-    # so this literal must stay in sync with CUTE_DSL_ARTIFACT_NAME above.
-    # metadata.json is intentionally not listed — it's already packaged inside the tarball
-    # (extract with `tar -xzOf <tar> sm_121/metadata.json`).
+    name: "cutedsl-matrix-${CI_COMMIT_SHORT_SHA}"
+    expire_in: 30 days
     paths:
-      - cutedsl_aarch64_sm_121_cuda13.tar.gz
-      - cutedsl_aarch64_sm_121_cuda13.tar.gz.sha256
+      - kernelSrcs/cuteDSLPrebuilt/*.tar.gz
+      - kernelSrcs/cuteDSLPrebuilt/*.tar.gz.sha256
 
-build_cutedsl_sm110_artifact:
-  extends:
-    - .cutedsl_remote_artifact_base
-  tags:
-    - thor_drive-nvks
-  variables:
-    CUTE_DSL_ARTIFACT_NAME: "cutedsl_aarch64_sm_110_cuda13.tar.gz"
-    CUTE_DSL_ARTIFACT_TAG: "sm_110"
-    CUTE_DSL_BUILD_GPU_ARCH_ARG: ""
-    CUTE_DSL_PACKAGE: "nvidia-cutlass-dsl[cu13]==4.6.1"
-    CUTE_DSL_CUPY_PACKAGE: "cupy-cuda13x==13.6.0"
-  artifacts:
-    name: "cutedsl-sm110-${CI_COMMIT_SHORT_SHA}"
-    expire_in: 1 day
-    # NOTE: GitLab does not expand job-level `variables:` inside `artifacts.paths`,
-    # so this literal must stay in sync with CUTE_DSL_ARTIFACT_NAME above.
-    # metadata.json is intentionally not listed — it's already packaged inside the tarball
-    # (extract with `tar -xzOf <tar> sm_110/metadata.json`).
-    paths:
-      - cutedsl_aarch64_sm_110_cuda13.tar.gz
-      - cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256
-
-# One x86_64 artifact job per unit-test SKU SM, each built natively on a runner
-# with that GPU (a30=sm_80, rtx3090=sm_86, b100=sm_100, rtx5080=sm_120): the
-# CuTe DSL resolves the compile arch from the local GPU, so cross-compiling on
-# a different SM produces wrong-arch (or failing) kernels.
-.build_cutedsl_x86_base:
-  extends:
-    - .cutedsl_artifact_base
-  variables:
-    CUDA_VERSION: "12.9"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    CUTE_DSL_OUTPUT_DIR: "$CI_PROJECT_DIR/cutedsl_artifacts"
-    CUTE_DSL_KERNELS: "ALL"
-  image: "$IMAGE"
-  script:
-    - echo "Pipeline start time:$(date)"
-    - echo "Node name:$(hostname)"
-    - echo "Build output dir:$CUTE_DSL_OUTPUT_DIR"
-    - mkdir -p "$CUTE_DSL_OUTPUT_DIR"
-    - export DEBIAN_FRONTEND=noninteractive
-    - apt update -qq >/dev/null 2>&1
-    - apt install -y -qq python3 python3-pip python3-venv binutils >/dev/null 2>&1
-    - echo "CUDA version:$(nvcc --version | grep release)"
-    - echo "Building CuTe DSL artifact for x86_64 $CUTE_DSL_ARTIFACT_TAG"
-    - python3 -m venv "$CUTE_DSL_OUTPUT_DIR/venv/cutedsl"
-    - '"$CUTE_DSL_OUTPUT_DIR/venv/cutedsl/bin/pip" install -q ''nvidia-cutlass-dsl==4.6.1'' cupy-cuda12x==12.3.0'
-    - '"$CUTE_DSL_OUTPUT_DIR/venv/cutedsl/bin/python" kernelSrcs/build_cutedsl.py --kernels $CUTE_DSL_KERNELS --gpu_arch $CUTE_DSL_ARTIFACT_TAG --arch x86_64 --output_dir "$CUTE_DSL_OUTPUT_DIR" --clean'
-    - ARTIFACT_DIR="$CUTE_DSL_OUTPUT_DIR/x86_64/$CUTE_DSL_ARTIFACT_TAG"
-    - test -f "$ARTIFACT_DIR/metadata.json"
-    - tar -C "$CUTE_DSL_OUTPUT_DIR/x86_64" -czf "$CUTE_DSL_OUTPUT_DIR/$CUTE_DSL_ARTIFACT_NAME" "$CUTE_DSL_ARTIFACT_TAG"
-    - (cd "$CUTE_DSL_OUTPUT_DIR" && sha256sum "$CUTE_DSL_ARTIFACT_NAME" | tee "$CUTE_DSL_ARTIFACT_NAME.sha256")
-    - cat "$ARTIFACT_DIR/metadata.json"
-    - cp "$CUTE_DSL_OUTPUT_DIR/$CUTE_DSL_ARTIFACT_NAME" "$CUTE_DSL_OUTPUT_DIR/$CUTE_DSL_ARTIFACT_NAME.sha256" "$CI_PROJECT_DIR/"
-    - echo "Pipeline end time:$(date)"
-  artifacts:
-    name: "cutedsl-x86-${CI_JOB_NAME_SLUG}-${CI_COMMIT_SHORT_SHA}"
-    expire_in: 1 day
-    # NOTE: GitLab does not expand job-level `variables:` inside `artifacts.paths`,
-    # so a glob keeps this in sync with CUTE_DSL_ARTIFACT_NAME for every SM variant.
-    paths:
-      - cutedsl_x86_64_sm_*_cuda12.tar.gz
-      - cutedsl_x86_64_sm_*_cuda12.tar.gz.sha256
-
-build_cutedsl_x86_sm120_artifact:
-  extends:
-    - .build_cutedsl_x86_base
-  tags:
-    - rtx5080-edgellm-nvks
-  variables:
-    CUTE_DSL_ARTIFACT_NAME: "cutedsl_x86_64_sm_120_cuda12.tar.gz"
-    CUTE_DSL_ARTIFACT_TAG: "sm_120"
-
-build_cutedsl_x86_sm100_artifact:
-  extends:
-    - .build_cutedsl_x86_base
-  tags:
-    - b100-edgellm-nvks
-  variables:
-    CUTE_DSL_ARTIFACT_NAME: "cutedsl_x86_64_sm_100_cuda12.tar.gz"
-    CUTE_DSL_ARTIFACT_TAG: "sm_100"
-    # The nvfp4_moe FC1 variants fail to compile on sm_100 (the sibling FC2 and
-    # gemm_nvfp4 tcgen05 kernels compile fine there), so skip the group here
-    # until the FC1 kernel is fixed; the unit tests do not cover the MoE plugin.
-    CUTE_DSL_KERNELS: "fmha,ffpa,gdn,ssd,gemm,gemm_nvfp4"
-
-# No sm_86 job: rtx3090 reuses the sm_80 artifact (cubins are forward
-# compatible within a major compute capability and the sm_80/sm_86 variant
-# sets are identical).
-build_cutedsl_x86_sm80_artifact:
-  extends:
-    - .build_cutedsl_x86_base
-  tags:
-    - a30-edgellm-nvks
-  variables:
-    CUTE_DSL_ARTIFACT_NAME: "cutedsl_x86_64_sm_80_cuda12.tar.gz"
-    CUTE_DSL_ARTIFACT_TAG: "sm_80"
-
-build_cutedsl_sm87_cuda13_artifact:
-  extends:
-    - .cutedsl_remote_artifact_base
-  tags:
-    - p3730-k8s
-  variables:
-    CUTE_DSL_ARTIFACT_NAME: "cutedsl_aarch64_sm_87_cuda13.tar.gz"
-    CUTE_DSL_ARTIFACT_TAG: "sm_87"
-    CUTE_DSL_BUILD_GPU_ARCH_ARG: "--gpu_arch sm_87"
-    CUTE_DSL_PACKAGE: "nvidia-cutlass-dsl[cu13]==4.6.1"
-    CUTE_DSL_CUPY_PACKAGE: "cupy-cuda13x==13.6.0"
-  artifacts:
-    name: "cutedsl-sm87-cuda13-${CI_COMMIT_SHORT_SHA}"
-    expire_in: 1 day
-    # NOTE: GitLab does not expand job-level `variables:` inside `artifacts.paths`,
-    # so this literal must stay in sync with CUTE_DSL_ARTIFACT_NAME above.
-    # metadata.json is intentionally not listed — it's already packaged inside the tarball
-    # (extract with `tar -xzOf <tar> sm_87/metadata.json`).
-    paths:
-      - cutedsl_aarch64_sm_87_cuda13.tar.gz
-      - cutedsl_aarch64_sm_87_cuda13.tar.gz.sha256
-
-publish_cutedsl_artifacts:
-  stage: publish
+cleanup_cutedsl_docker_image:
+  stage: .post
   extends:
     - .cutedsl_artifact_rules
+    - .cutedsl_builder_version
+  needs:
+    - job: build_cutedsl_docker_matrix
+      artifacts: false
   tags:
-    - a30-edgellm-nvks
-  image: "ubuntu:24.04"
-  dependencies:
-    - build_cutedsl_gb10_artifact
-    - build_cutedsl_sm110_artifact
-    - build_cutedsl_x86_sm120_artifact
-    - build_cutedsl_sm87_cuda13_artifact
+    - cpu-k8s
+  image:
+    name: "gcr.io/go-containerregistry/crane:debug"
+    entrypoint: [""]
   script:
-    - echo "Pipeline start time:$(date)"
-    - 'echo "Node name:${NODE_NAME:-$(hostname)}"'
-    - |
-      set -eu
-      set -- cutedsl_*.tar.gz
-      test -f "$1"
-      test "$#" -eq 4
-
-      artifact_root="${EDGE_LLM_CACHE_DIR}/cutedsl_artifacts"
-      if [ -n "${CI_MERGE_REQUEST_IID:-}" ]; then
-        publish_root="$artifact_root/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
-        latest_root=""
-      else
-        branch_root="$artifact_root/${CI_COMMIT_REF_SLUG}"
-        publish_root="$branch_root/${CI_COMMIT_SHORT_SHA}"
-        latest_root="$branch_root/latest"
-      fi
-
-      publish_tmp="${publish_root}.tmp.${CI_PIPELINE_ID}"
-      rm -rf "$publish_tmp"
-      mkdir -p "$publish_tmp"
-
-      for tarball in "$@"; do
-        checksum="$tarball.sha256"
-        tag="$(printf '%s\n' "$tarball" | sed -E 's/^cutedsl_.*_(sm_[0-9]+)_cuda[0-9]+\.tar\.gz$/\1/')"
-        test "$tag" != "$tarball"
-        test -f "$checksum"
-        dest="$publish_tmp/$tag"
-        mkdir -p "$dest"
-        cp "$tarball" "$checksum" "$dest/"
-        (cd "$dest" && sha256sum -c "$(basename "$checksum")")
-      done
-
-      printf '%s\n' "$CI_COMMIT_SHA" > "$publish_tmp/commit_sha"
-      printf '%s\n' "$CI_PIPELINE_ID" > "$publish_tmp/pipeline_id"
-      rm -rf "$publish_root"
-      mv "$publish_tmp" "$publish_root"
-
-      if [ -n "${latest_root:-}" ]; then
-        latest_tmp="${latest_root}.tmp.${CI_PIPELINE_ID}"
-        rm -rf "$latest_tmp"
-        mkdir -p "$latest_tmp"
-        cp -a "$publish_root/." "$latest_tmp/"
-        rm -rf "$latest_root"
-        mv "$latest_tmp" "$latest_root"
-      fi
-
-      echo "Published $# CuTeDSL package(s) under $publish_root"
-      find "$publish_root" -maxdepth 2 -type f -print | sort
-      if [ -n "${latest_root:-}" ]; then
-        echo "Updated latest directory: $latest_root"
-        find "$latest_root" -maxdepth 2 -type f -print | sort
-      fi
-    - echo "Pipeline end time:$(date)"
-  interruptible: true
+    - test -n "$CI_REGISTRY_USER" && test -n "$CI_REGISTRY_PASSWORD"
+    - crane auth login "$CI_REGISTRY" --username "$CI_REGISTRY_USER" --password "$CI_REGISTRY_PASSWORD"
+    - crane delete "$CUTE_DSL_BUILDER_IMAGE"
+  when: always
+  interruptible: false

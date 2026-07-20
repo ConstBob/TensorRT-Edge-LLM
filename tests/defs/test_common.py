@@ -62,29 +62,22 @@ def test_build_project(env_config: EnvironmentConfig,
 
     # Enable CuteDSL kernels for Blackwell aarch64 targets.
     if device_config.target in ['auto-thor', 'jetson-thor', 'gb10']:
-        # Prebuilt tarballs are committed in kernelSrcs/cuteDSLPrebuilt/.
-        # CMake auto-extracts them -- no on-device build needed.
         cmake_cmd.append('-DENABLE_CUTE_DSL=ALL')
-        test_logger.info(
-            "CuTe DSL: using prebuilt tarball (CMake auto-extracts)")
+        test_logger.info("CuTe DSL: using available artifact")
 
-    # Jetson Orin (SM87): the GDN/SSD cuteDSL kernels have sm_87 variants, but
-    # only the unit-test job stages the tarball, so enable cuteDSL only when it
-    # is present (the pipeline jobs build without it, as before).
-    if device_config.target == 'jetson-orin' and glob.glob(
-            os.path.join(env_config.llm_sdk_dir, 'kernelSrcs',
-                         'cuteDSLPrebuilt', 'cutedsl_aarch64_sm_87_*.tar.gz')):
+    # Enable CuteDSL kernels for x86 Blackwell (SM120+) targets.
+    if (device_config.target == 'x86'
+            and device_config.compute_capability is not None
+            and device_config.compute_capability >= 120):
         cmake_cmd.append('-DENABLE_CUTE_DSL=ALL')
-        cmake_cmd.append('-DCUTE_DSL_ARTIFACT_TAG=sm_87')
-        test_logger.info("CuTe DSL: jetson-orin sm_87, using prebuilt tarball "
-                         "(CMake auto-extracts)")
+        test_logger.info("CuTe DSL: x86 Blackwell, using available artifact")
 
     # Enable CuteDSL kernels on x86 when the job staged a prebuilt tarball for
-    # the detected SM. The unit-test jobs stage one artifact per SKU (see the
-    # build_cutedsl_x86_sm*_artifact jobs); pipeline jobs that only stage the
-    # sm_120 tarball keep their previous behavior on other SMs. sm86 reuses the
-    # sm_80 artifact: cubins are forward compatible within a major compute
-    # capability and the sm_80/sm_86 kernel variant sets are identical.
+    # the detected SM. The unified matrix producer downloads tarballs directly
+    # into kernelSrcs/cuteDSLPrebuilt so CMake can auto-extract the matching
+    # architecture, SM, and CUDA-major artifact. sm86 reuses the sm_80 artifact:
+    # cubins are forward compatible within a major compute capability and the
+    # sm_80/sm_86 kernel variant sets are identical.
     x86_cutedsl_tags = {80: 'sm_80', 86: 'sm_80', 100: 'sm_100', 120: 'sm_120'}
     x86_tag = x86_cutedsl_tags.get(device_config.compute_capability)
     if (device_config.target == 'x86' and x86_tag and glob.glob(
@@ -95,7 +88,7 @@ def test_build_project(env_config: EnvironmentConfig,
         cmake_cmd.append(f'-DCUTE_DSL_ARTIFACT_TAG={x86_tag}')
         test_logger.info(
             f"CuTe DSL: x86 SM{device_config.compute_capability}, "
-            f"using prebuilt {x86_tag} tarball (CMake auto-extracts)")
+            "using staged prebuilt artifact")
 
     build_cmd = ' && '.join([
         f'mkdir -p {build_dir}', f'cd {build_dir}', ' '.join(cmake_cmd),

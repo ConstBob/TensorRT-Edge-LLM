@@ -135,7 +135,7 @@ l0_rtx5080:
     stage: l0_test
     needs:
       - l0_checkpoint_export
-      - job: build_cutedsl_x86_sm120_artifact
+      - job: build_cutedsl_docker_matrix
         artifacts: true
     variables:
       # There's a known issue that CUDA TILE breaks myelin compilation on 5080, it has been fixed in TRT 10.15 while it is not picked to TRT main branch yet. Use 10.13.3.9 with CUDA 12.9 for now.
@@ -151,13 +151,6 @@ l0_rtx5080:
       ENGINE_DIR: "$TEST_CACHE_DIR/engines"
       TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
       BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/rtx5080.csv"
-    before_script:
-      # CuTeDSL tarball comes from build_cutedsl_x86_sm120_artifact (stage: setup);
-      # GitLab fetches it into $CI_PROJECT_DIR. Move it where cmake/CuteDsl.cmake
-      # expects it. Keep `|| true` so a missing artifact still reaches cmake with
-      # a clear "run build_cutedsl.py" hint.
-      - mkdir -p kernelSrcs/cuteDSLPrebuilt
-      - mv -f cutedsl_x86_64_sm_120_cuda12.tar.gz cutedsl_x86_64_sm_120_cuda12.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
     tags:
       - rtx5080-edgellm-nvks
     image: "$IMAGE"
@@ -167,12 +160,12 @@ l0_rtx5080:
       - .l0_environment
     interruptible: true
 
-# Building and testing with B100 Linux (x86 Blackwell, SM120)
+# Building and testing with B100 Linux (x86 Blackwell, SM100)
 l0_b100:
   stage: l0_test
   needs:
     - l0_checkpoint_export
-    - job: build_cutedsl_x86_sm120_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     CUDA_VERSION: "13.2"
@@ -186,9 +179,6 @@ l0_b100:
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/b100.csv"
-  before_script:
-    - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_x86_64_sm_120_cuda12.tar.gz cutedsl_x86_64_sm_120_cuda12.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   tags:
     - b100-edgellm-nvks
   image: "$IMAGE"
@@ -203,7 +193,7 @@ l0_rtx5090:
   stage: l0_test
   needs:
     - l0_checkpoint_export
-    - job: build_cutedsl_x86_sm120_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     CUDA_VERSION: "13.2"
@@ -217,9 +207,6 @@ l0_rtx5090:
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/rtx5090.csv"
-  before_script:
-    - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_x86_64_sm_120_cuda12.tar.gz cutedsl_x86_64_sm_120_cuda12.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   tags:
     - rtx5090-edgellm-nvks
   image: "$IMAGE"
@@ -237,11 +224,7 @@ l0_rtx5090:
 l0_unit_tests_x86:
   stage: l0_test
   needs:
-    - job: build_cutedsl_x86_sm120_artifact
-      artifacts: true
-    - job: build_cutedsl_x86_sm100_artifact
-      artifacts: true
-    - job: build_cutedsl_x86_sm80_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     CUDA_VERSION: "13.2"
@@ -254,9 +237,6 @@ l0_unit_tests_x86:
     ONNX_DIR: "$TEST_CACHE_DIR/onnx"
     TRT_CUDA_VERSION: "13.2"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
-  before_script:
-    - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_x86_64_sm_*_cuda12.tar.gz cutedsl_x86_64_sm_*_cuda12.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   parallel:
     matrix:
       - RUNNER_TAG: a30-edgellm-nvks
@@ -276,11 +256,7 @@ l0_unit_tests_x86:
 l0_unit_tests_x86_trt11:
   stage: l0_test
   needs:
-    - job: build_cutedsl_x86_sm120_artifact
-      artifacts: true
-    - job: build_cutedsl_x86_sm100_artifact
-      artifacts: true
-    - job: build_cutedsl_x86_sm80_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     CUDA_VERSION: "13.2"
@@ -293,9 +269,6 @@ l0_unit_tests_x86_trt11:
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     ONNX_DIR: "$TEST_CACHE_DIR/onnx"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
-  before_script:
-    - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_x86_64_sm_*_cuda12.tar.gz cutedsl_x86_64_sm_*_cuda12.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   parallel:
     matrix:
       - RUNNER_TAG: a30-edgellm-nvks
@@ -319,7 +292,7 @@ l0_unit_tests_thor:
   stage: l0_test
   allow_failure: true
   needs:
-    - job: build_cutedsl_sm110_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     BOARD_USER: "tensorrt_user"
@@ -331,9 +304,6 @@ l0_unit_tests_thor:
     PRIORITY: l0_python_ut
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BOARD_IP: "192.168.55.1"
-  before_script:
-    - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   tags:
     - thor_drive-nvks
   image: "ubuntu:24.04"
@@ -348,7 +318,7 @@ l0_unit_tests_orin:
   stage: l0_test
   allow_failure: true
   needs:
-    - job: build_cutedsl_sm87_cuda13_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     BOARD_USER: "tensorrt_user"
@@ -359,9 +329,6 @@ l0_unit_tests_orin:
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.aarch64.cuda-$TRT_CUDA_VERSION"
     PRIORITY: l0_python_ut
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
-  before_script:
-    - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_aarch64_sm_87_cuda13.tar.gz cutedsl_aarch64_sm_87_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   tags:
     - p3730-k8s
   image: "ubuntu:24.04"
@@ -401,7 +368,7 @@ l0_drive_thor_1:
   stage: l0_test
   needs:
     - l0_checkpoint_export
-    - job: build_cutedsl_sm110_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     BOARD_USER: "tensorrt_user"
@@ -416,13 +383,6 @@ l0_drive_thor_1:
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/drive_thor_1.csv"
     BOARD_IP: "192.168.55.1"
-  before_script:
-    # CuTeDSL tarball comes from build_cutedsl_sm110_artifact (stage: setup);
-    # GitLab fetches it into $CI_PROJECT_DIR. Move it where cmake/CuteDsl.cmake:244
-    # expects it. Keep `|| true` so a missing artifact still reaches cmake with
-    # a clear "run build_cutedsl.py" hint.
-    - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   tags:
     - thor_drive-nvks
   image: "ubuntu:24.04"
@@ -436,7 +396,7 @@ l0_drive_thor_1_trt11:
   stage: l0_test
   needs:
     - l0_checkpoint_export
-    - job: build_cutedsl_sm110_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     BOARD_USER: "tensorrt_user"
@@ -454,9 +414,6 @@ l0_drive_thor_1_trt11:
   tags:
     - thor_drive-nvks
   image: "ubuntu:24.04"
-  before_script:
-    - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   extends:
     - .device_test_template
     - .l0_rules
@@ -468,7 +425,7 @@ l0_drive_thor_2:
   stage: l0_test
   needs:
     - l0_checkpoint_export
-    - job: build_cutedsl_sm110_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     BOARD_USER: "tensorrt_user"
@@ -483,13 +440,6 @@ l0_drive_thor_2:
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/drive_thor_2.csv"
     BOARD_IP: "192.168.55.1"
-  before_script:
-    # CuTeDSL tarball comes from build_cutedsl_sm110_artifact (stage: setup);
-    # GitLab fetches it into $CI_PROJECT_DIR. Move it where cmake/CuteDsl.cmake:244
-    # expects it. Keep `|| true` so a missing artifact still reaches cmake with
-    # a clear "run build_cutedsl.py" hint.
-    - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   tags:
     - thor_ts4_724-nvks
   image: "ubuntu:24.04"
@@ -503,7 +453,7 @@ l0_drive_thor_2_trt11:
   stage: l0_test
   needs:
     - l0_checkpoint_export
-    - job: build_cutedsl_sm110_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     BOARD_USER: "tensorrt_user"
@@ -521,9 +471,6 @@ l0_drive_thor_2_trt11:
   tags:
     - thor_ts4_724-nvks
   image: "ubuntu:24.04"
-  before_script:
-    - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   extends:
     - .device_test_template
     - .l0_rules
@@ -535,7 +482,7 @@ l0_jedha:
   stage: l0_test
   needs:
     - l0_checkpoint_export
-    - job: build_cutedsl_sm110_artifact
+    - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     BOARD_USER: "tensorrt_user"
@@ -552,9 +499,6 @@ l0_jedha:
   tags:
     - jedha-edgellm-nvks
   image: "ubuntu:24.04"
-  before_script:
-    - mkdir -p kernelSrcs/cuteDSLPrebuilt
-    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   extends:
     - .device_test_template
     - .l0_rules

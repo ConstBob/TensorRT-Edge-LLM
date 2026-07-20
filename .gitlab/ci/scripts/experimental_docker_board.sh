@@ -6,8 +6,6 @@ ACTION="${1:-run}"
 : "${BOARD_IP:=192.168.55.1}"
 : "${REMOTE_WORKSPACE:=/home/${BOARD_USER}/tensorrt-edge-llm-docker-${CI_PIPELINE_ID:-manual}-${CI_JOB_ID:-local}}"
 : "${EXPERIMENTAL_DOCKER_IMAGE:=tensorrt-edge-llm:experimental-${CI_COMMIT_SHORT_SHA:-local}}"
-: "${CUTE_DSL_ARTIFACT_NAME:=cutedsl_aarch64_sm_110_cuda13.tar.gz}"
-: "${CUTE_DSL_PREBUILT_DIR:=kernelSrcs/cuteDSLPrebuilt}"
 
 require_env() {
   if [ -z "${!1:-}" ]; then
@@ -24,27 +22,6 @@ ssh_to_board() {
 remote_bash() {
   ssh_to_board \
     "SUDO_PASS=${BOARD_PASSWORD_NVKS@Q} EXPERIMENTAL_DOCKER_IMAGE=${EXPERIMENTAL_DOCKER_IMAGE@Q} REMOTE_WORKSPACE=${REMOTE_WORKSPACE@Q} bash -se"
-}
-
-stage_cutedsl_artifact() {
-  mkdir -p "$CUTE_DSL_PREBUILT_DIR"
-
-  if [ -f "$CUTE_DSL_ARTIFACT_NAME" ]; then
-    mv -f "$CUTE_DSL_ARTIFACT_NAME" "$CUTE_DSL_PREBUILT_DIR/"
-  fi
-  if [ -f "$CUTE_DSL_ARTIFACT_NAME.sha256" ]; then
-    mv -f "$CUTE_DSL_ARTIFACT_NAME.sha256" "$CUTE_DSL_PREBUILT_DIR/"
-  fi
-
-  if [ ! -f "$CUTE_DSL_PREBUILT_DIR/$CUTE_DSL_ARTIFACT_NAME" ]; then
-    echo "Missing CuteDSL artifact: $CUTE_DSL_PREBUILT_DIR/$CUTE_DSL_ARTIFACT_NAME"
-    echo "The Docker job must download build_cutedsl_sm110_artifact before building."
-    exit 1
-  fi
-
-  if [ -f "$CUTE_DSL_PREBUILT_DIR/$CUTE_DSL_ARTIFACT_NAME.sha256" ]; then
-    (cd "$CUTE_DSL_PREBUILT_DIR" && sha256sum -c "$CUTE_DSL_ARTIFACT_NAME.sha256")
-  fi
 }
 
 sync_workspace() {
@@ -97,7 +74,6 @@ case "$ACTION" in
   run)
     echo "Board target: ${BOARD_USER}@${BOARD_IP}"
     echo "Remote workspace: ${REMOTE_WORKSPACE}"
-    stage_cutedsl_artifact
     sync_workspace
     run_on_board
     ;;

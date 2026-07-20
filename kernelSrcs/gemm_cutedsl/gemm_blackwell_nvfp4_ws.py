@@ -61,8 +61,6 @@ requires a different AOT variant. Variants registered in
 
 Supported Blackwell-family SMs: 100, 101, 103, 110. SM 120/121
 (GeForce Blackwell Ultra) lack tcgen05.blockscaled and are NOT supported.
-SM110 additionally requires the two CuteDSL patches documented in
-``kernelSrcs/nvfp4_moe_cutedsl/README.md`` before AOT export.
 
 Usage::
 
