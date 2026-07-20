@@ -813,6 +813,7 @@ def _export_llm(model_dir: str,
                 fp8_embedding: bool = False,
                 reduced_vocab_dir: str = "",
                 mtp_base: bool = False,
+                mtp_tree_base: bool = False,
                 dflash_base: bool = False,
                 dflash_tree_base: bool = False,
                 dflash_draft_dir: str = "",
@@ -891,6 +892,7 @@ def _export_llm(model_dir: str,
                 key_remap=key_remap,
                 reduced_vocab_dir=reduced_vocab_dir or None,
                 mtp_base=mtp_base,
+                mtp_tree_base=mtp_tree_base,
                 dflash_base=dflash_base,
                 dflash_tree_base=dflash_tree_base,
                 dflash_draft_dir=dflash_draft_dir or None,
@@ -2958,6 +2960,12 @@ def main() -> None:
         help=argparse.SUPPRESS,
     )
     p.add_argument(
+        "--mtp-tree-base",
+        action="store_true",
+        help="Export MTP base with DDTree hybrid state metadata inputs "
+        "(implies --mtp; required for MTP tree drafting).",
+    )
+    p.add_argument(
         "--dflash-base",
         action="store_true",
         help="Export as DFlash base model (adds DFlash hidden_states output).",
@@ -3070,6 +3078,8 @@ def main() -> None:
         p.error("Only Qwen3-TTS CustomVoice checkpoints are supported. "
                 f"Got tts_model_type={config.get('tts_model_type')!r}.")
 
+    if args.mtp_tree_base:
+        args.mtp = True
     if args.eagle_base and args.mtp:
         p.error("--eagle-base and --mtp cannot be enabled together")
     if args.eagle_draft_dir and not args.eagle_base:
@@ -3227,6 +3237,7 @@ def main() -> None:
                      eagle_base=args.eagle_base,
                      eagle_draft_dir=args.eagle_draft_dir,
                      mtp_base=args.mtp and not gemma4_mtp_requested,
+                     mtp_tree_base=args.mtp_tree_base,
                      dflash_base=args.dflash_base,
                      dflash_tree_base=args.dflash_tree_base,
                      dflash_draft_dir=args.dflash_draft_dir,

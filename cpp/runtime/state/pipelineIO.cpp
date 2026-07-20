@@ -423,9 +423,10 @@ PipelineIO PipelineIO::createForSpecDecode(
     CUDA_CHECK(cudaMemsetAsync(
         io.specVerifyPhaseMarker.rawPointer(), 0, io.specVerifyPhaseMarker.getMemoryCapacity(), stream));
 
-    bool const useDFlashTree
-        = bundle.specDecodeMode() == SpecDecodeMode::kDFlash && bundle.specConfig->draftingTopK > 1;
-    if (useDFlashTree)
+    bool const useSpecTree
+        = (bundle.specDecodeMode() == SpecDecodeMode::kDFlash || bundle.specDecodeMode() == SpecDecodeMode::kMTP)
+        && bundle.specConfig->draftingTopK > 1;
+    if (useSpecTree)
     {
         io.specTreeParentIds = Tensor({maxRuntimeBatchSize, effectiveMaxDraftProposalSize}, DeviceType::kGPU,
             nvinfer1::DataType::kINT32, "PipelineIO::specTreeParentIds");

@@ -138,6 +138,7 @@ class AutoModel:
                         eagle_draft_dir: "str | None" = None,
                         reduced_vocab_dir: "str | None" = None,
                         mtp_base: bool = False,
+                        mtp_tree_base: bool = False,
                         mtp_draft: bool = False,
                         tp_size: int = 1,
                         tp_rank: int = 0,
@@ -186,6 +187,9 @@ class AutoModel:
                             :meth:`ModelConfig.for_rank`, and weights
                             are sharded on assignment.  Default 1 = no TP.
             tp_rank:        This rank's index in [0, tp_size).
+            mtp_tree_base:  When True, MTP base export adds DDTree parent/depth
+                            metadata inputs for Qwen3.5 hybrid state execution
+                            (MTP tree drafting).
             dflash_base:    When True, export as DFlash base model.
             dflash_tree_base:
                             When True, add DDTree parent/depth metadata inputs
@@ -236,6 +240,11 @@ class AutoModel:
             config.mtp_base = True
         if gemma4_mtp_base:
             config.gemma4_mtp_base = True
+        if mtp_tree_base:
+            config.mtp_base = True
+            config.mtp_tree_base = True
+        elif config.mtp_tree_base:
+            config.mtp_base = True
         if dflash_base:
             config.dflash_base = True
         if dflash_tree_base:
