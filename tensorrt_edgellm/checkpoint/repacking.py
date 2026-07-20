@@ -481,6 +481,71 @@ def _extract_gptq_for_marlin(
     return weights, scales
 
 
+def _extract_awq_for_marlin(
+    proj: nn.Module,
+    group_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Extract ``(weights [N, K] int16, scales [N, num_groups] fp16)`` from a
+    ``ModelOptAWQPrepackedLinear`` module by folding ``pre_quant_scale`` into
+    the weight and re-quantizing symmetric INT4 per-group.
+
+    AWQ math::
+
+        y = W @ (s_pqs ⊙ x) = (W ⊙ s_pqs[None, :]) @ x
+
+    The Marlin MoE plugin has no ``pre_quant_scale`` input, so we fold it
+    into the weight here and emit the same ``([N, K] int16, [N, G] fp16)``
+    format that ``_extract_gptq_for_marlin`` produces — downstream Marlin
+    packing in ``_prepare_moe_weights`` is unchanged.
+
+    Inputs (raw modelopt buffers, BEFORE ``_cast_modelopt_awq_prepacked``):
+        proj.weight:          uint8/int8 [N//2, K]  modelopt 2's-complement packed
+        proj.weight_scale:    fp32       [N, K//g]
+        proj.pre_quant_scale: fp16       [K]        (ones if absent — no-op)
+    """
+    w_u8 = proj.weight  # [N//2, K]
+    sc = proj.weight_scale.data.to(torch.float32)  # [N, K//g]
+    _pqs = getattr(proj, "pre_quant_scale", None)
+    pqs = (_pqs.data.to(torch.float32) if _pqs is not None else torch.ones(
+        w_u8.shape[1], dtype=torch.float32, device=w_u8.device))  # [K]
+
+    N_half, K = w_u8.shape
+    N = N_half * 2
+    assert K % group_size == 0, (
+        f"K={K} not divisible by group_size={group_size}")
+    num_groups = K // group_size
+
+    # 1. Unpack 2 nibbles per byte. modelopt convention:
+    #    signed s in [-8, 7] -> u = s & 0xF; even N rows = low nibble,
+    #    odd N rows = high nibble (see _cast_modelopt_awq_prepacked).
+    w_u16 = w_u8.to(torch.int16) & 0xFF
+    nibbles = torch.zeros(N, K, dtype=torch.int16, device=w_u8.device)
+    nibbles[0::2] = w_u16 & 0xF
+    nibbles[1::2] = (w_u16 >> 4) & 0xF
+    # Convert 2's-complement nibble -> signed [-8, 7]
+    s_signed = torch.where(nibbles < 8, nibbles, nibbles - 16)
+
+    # 2. Dequantize symmetrically: W_fp32 = s * weight_scale (no zero point)
+    sc_expanded = sc.repeat_interleave(group_size, dim=1)  # [N, K]
+    w_fp32 = s_signed.to(torch.float32) * sc_expanded  # [N, K]
+
+    # 3. Fold pre_quant_scale into weight (per-K-channel): W_eff = W * diag(pqs)
+    w_folded = w_fp32 * pqs.unsqueeze(0)  # [N, K]
+
+    # 4. Re-quantize per-group symmetric INT4. Scale = absmax / 7 so signed
+    #    values land in [-7, 7]; plugin convention is (q_marlin - 8) * scale,
+    #    so we shift to [1, 15] below.
+    w_folded_grouped = w_folded.view(N, num_groups, group_size)  # [N, G, g]
+    new_scale = w_folded_grouped.abs().amax(dim=-1) / 7.0  # [N, G]
+    new_scale = new_scale.clamp(min=1e-10)
+    new_q_signed = torch.round(
+        w_folded_grouped / new_scale.unsqueeze(-1)).clamp(-7,
+                                                          7).to(torch.int16)
+    new_q_marlin = (new_q_signed + 8).view(N,
+                                           K).contiguous()  # [N, K] in [1, 15]
+    return new_q_marlin, new_scale.to(torch.float16).contiguous()
+
+
 # Pre-computed Marlin tensor core layout indices (from int4_moe_plugin.py).
 _MARLIN_PACK_IDX = np.array([0, 2, 4, 6, 1, 3, 5, 7], dtype=np.int32)
 

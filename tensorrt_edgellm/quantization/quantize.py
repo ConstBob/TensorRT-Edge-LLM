@@ -649,20 +649,56 @@ def quantize_and_export(
     never fails the run; an unknown name for the modality in use fails out
     with a pointer to the customization guide.
     """
-    # Qwen3-Omni / Qwen3-Next Omni: the Thinker+Talker pair requires a multimodal
-    # calibration loop that pushes audio + image + text through the Thinker and
-    # then projects the chosen hidden layer through the Talker bridge, so the
-    # Talker layers see realistic activations.  Delegate to the standalone
-    # orchestrator instead of the generic flow below.
+    from ..chat_template import _is_qwen3_omni_model
+
+    # Qwen3-Omni needs a joint Thinker+Talker multimodal calibration chain
+    # the generic single-model path below can't express; delegate the full
+    # quant+export pipeline to the dedicated driver (auto-branches MoE vs
+    # non-MoE from ``config.json``).
+    if _is_qwen3_omni_model(model_dir):
+        from .qwen3_omni import quantize_qwen3_omni
+
+        # Split num_samples across audio/image/text roughly evenly.
+        third = max(1, num_samples // 3)
+        quantize_qwen3_omni(
+            model_dir=model_dir,
+            output_dir=output_dir,
+            quantization=quantization,
+            lm_head_quantization=lm_head_quantization,
+            kv_cache_quantization=kv_cache_quantization,
+            visual_quantization=visual_quantization,
+            audio_quantization=audio_quantization,
+            cp_quantization=cp_quantization,
+            dtype=dtype,
+            device=device,
+            text_dataset=text_dataset,
+            num_samples=num_samples,
+            talker_num_audio=third,
+            talker_num_image=third,
+            talker_num_text=num_samples - 2 * third,
+        )
+        return output_dir
+
+    # Qwen3.5-Omni (qwen3_omni_next): dedicated orchestrator (transformers
+    # patch + thinker/talker multimodal calib + amax backfill). Shares the
+    # ``llm`` flag surface; unsupported sub-encoder flags fail loudly there.
     if is_omni_model_dir(model_dir):
+        kwargs = {}
+        if text_dataset is not None:
+            kwargs["text_dataset"] = text_dataset
         return quantize_and_export_omni(
             model_dir=model_dir,
             output_dir=output_dir,
             quantization=quantization,
             lm_head_quantization=lm_head_quantization,
             kv_cache_quantization=kv_cache_quantization,
+            visual_quantization=visual_quantization,
+            audio_quantization=audio_quantization,
+            cp_quantization=cp_quantization,
             dtype=dtype,
             device=device,
+            num_samples=num_samples,
+            **kwargs,
         )
 
     t0 = time.time()
@@ -712,19 +748,15 @@ def quantize_and_export(
                 f"--cp_quantization={cp_quantization} requires a model with "
                 "talker.code_predictor (Qwen3-Omni / Qwen3-TTS); the loaded "
                 "checkpoint has none.")
-        # MoE Thinker backbone quantization runs through the dedicated
-        # ``tensorrt-edgellm-quantize thinker`` command (qwen3_omni_thinker.py);
-        # the ``llm`` command can't dummy-walk the MoE wrapper. Joint mode
-        # here would silently produce a Thinker-unquantized checkpoint.
+        # The generic path can't dummy-walk a MoE thinker wrapper; joint
+        # mode here would silently produce a Thinker-unquantized checkpoint.
+        # (Qwen3-Omni never reaches here — it is delegated above.)
         if (cp_quantization is not None and quantization is not None
                 and getattr(model, "thinker", None) is not None
                 and "Moe" in type(model).__name__):
             raise ValueError(
-                "Joint --quantization + --cp_quantization on the Qwen3-Omni-MoE "
-                "wrapper is not supported here. Use `--cp_quantization fp8` "
-                "alone via `tensorrt-edgellm-quantize llm`, and run "
-                "`tensorrt-edgellm-quantize thinker --quantization fp8` "
-                "separately for the MoE Thinker backbone.")
+                "Joint --quantization + --cp_quantization is not supported "
+                "on this MoE thinker wrapper via the generic path.")
         quant_cfg = build_quant_config(
             quantization,
             lm_head_quantization,
@@ -844,25 +876,14 @@ def quantize_and_export(
     extra_state_dict.update(attention_q_scales)
 
     os.makedirs(output_dir, exist_ok=True)
-    # MoE wrapper has no top-level ``forward`` → ``export_hf_checkpoint``'s
-    # dummy walk crashes. Route CP-only quantization on such wrappers through
-    # ``qwen3_omni._export_submodel(model, "talker", ...)``.
-    cp_only_moe_wrapper = (cp_quantization is not None and quantization is None
-                           and has_code_predictor(model)
-                           and getattr(model, "thinker", None) is not None
-                           and "Moe" in type(model).__name__)
-    if cp_only_moe_wrapper:
-        from .qwen3_omni import _export_submodel
-        _export_submodel(model, "talker", output_dir)
-    else:
-        with torch.inference_mode(), _skip_resmooth_for_hybrid(
-                model, quantization or ""):
-            export_hf_checkpoint(model,
-                                 export_dir=output_dir,
-                                 extra_state_dict=extra_state_dict)
-        if attention_q_scales:
-            print("Exported calibrated Q-BMM scales for "
-                  f"{len(attention_q_scales)} attention layer(s).")
+    with torch.inference_mode(), _skip_resmooth_for_hybrid(
+            model, quantization or ""):
+        export_hf_checkpoint(model,
+                             export_dir=output_dir,
+                             extra_state_dict=extra_state_dict)
+    if attention_q_scales:
+        print("Exported calibrated Q-BMM scales for "
+              f"{len(attention_q_scales)} attention layer(s).")
     _remove_stale_safetensors_index(output_dir)
     tokenizer.save_pretrained(output_dir)
     if processor is not None:
