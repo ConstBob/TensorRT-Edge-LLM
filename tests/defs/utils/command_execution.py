@@ -22,6 +22,7 @@ unnecessary abstraction layers.
 
 import json
 import os
+import subprocess
 from typing import Any, Dict, Optional
 
 import pytest
@@ -40,6 +41,41 @@ from .command_generation import (generate_build_commands,
                                  generate_vlmevalkit_commands)
 
 _ALPAMAYO_DATASET_PLACEHOLDER = "$ALPAMAYO_DATASET_DIR"
+
+
+def _sync_remote_output_file(filepath: str,
+                             remote_config: Optional[RemoteConfig],
+                             logger) -> str:
+    if remote_config is None or os.path.exists(filepath):
+        return filepath
+
+    local_dir = os.path.dirname(filepath)
+    if local_dir:
+        os.makedirs(local_dir, exist_ok=True)
+
+    remote_host = f"{remote_config.user}@{remote_config.host}"
+    env = os.environ.copy()
+    env["SSHPASS"] = remote_config.password
+    cmd = [
+        "sshpass", "-e", "rsync", "-a", "-e",
+        "ssh -o StrictHostKeyChecking=no", f"{remote_host}:{filepath}",
+        filepath
+    ]
+
+    if logger:
+        logger.info("Copying remote output file back for metrics: %s",
+                    filepath)
+
+    result = subprocess.run(cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            env=env)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to copy remote output file {filepath}: {result.stdout}")
+
+    return filepath
 
 
 def _source_test_case_file(config: TestConfig) -> Optional[str]:
@@ -381,10 +417,12 @@ def execute_e2e_bench_test(
         # Use model-specific reference if available, fallback to generic test case file
         reference_file = config.get_reference_json_file(
         ) or config.get_test_case_file()
+        output_file = _sync_remote_output_file(config.get_output_json_file(),
+                                               remote_config, logger)
         # Pass file paths directly to the accuracy checker (runs on host only)
-        metrics_result = check_accuracy_with_dataset(
-            config.get_output_json_file(), reference_file, config.test_case,
-            logger)
+        metrics_result = check_accuracy_with_dataset(output_file,
+                                                     reference_file,
+                                                     config.test_case, logger)
 
         # Merge metrics result into final result
         final_result.update(metrics_result)
@@ -461,10 +499,12 @@ def execute_inference_test(
         # Use model-specific reference if available, fallback to generic test case file
         reference_file = config.get_reference_json_file(
         ) or config.get_test_case_file()
+        output_file = _sync_remote_output_file(config.get_output_json_file(),
+                                               remote_config, logger)
         # Pass file paths directly to the accuracy checker (runs on host only)
-        metrics_result = check_accuracy_with_dataset(
-            config.get_output_json_file(), reference_file, config.test_case,
-            logger)
+        metrics_result = check_accuracy_with_dataset(output_file,
+                                                     reference_file,
+                                                     config.test_case, logger)
 
         # Merge metrics result into final result
         final_result.update(metrics_result)

@@ -170,6 +170,7 @@ l0_rtx5080:
 # Building and testing with B100 Linux (x86 Blackwell, SM120)
 l0_b100:
   stage: l0_test
+  allow_failure: true
   needs:
     - l0_checkpoint_export
     - job: build_cutedsl_x86_sm120_artifact
@@ -194,7 +195,7 @@ l0_b100:
   image: "$IMAGE"
   extends:
     - .x86_test_template
-    - .l0_rules
+    - .l0_manual_rules
     - .l0_environment
   interruptible: true
 
@@ -229,17 +230,13 @@ l0_rtx5090:
     - .l0_environment
   interruptible: true
 
-# Unit tests for low-level components (attention kernels, etc.)
-# Each SKU in the matrix needs a cuteDSL artifact matching its own SM
-# (a30=sm_80, rtx3090=sm_86, b100=sm_100, rtx5080/rtx5090=sm_120), so all four
-# tarballs are staged and test_build_project selects the tag from the detected
-# compute capability.
+# Unit tests for low-level components (attention kernels, etc.). Automatic x86
+# SKUs stage sm_80 and sm_120 artifacts; B100/sm_100 stays available as manual
+# jobs below while the B100 runner is unstable.
 l0_unit_tests_x86:
   stage: l0_test
   needs:
     - job: build_cutedsl_x86_sm120_artifact
-      artifacts: true
-    - job: build_cutedsl_x86_sm100_artifact
       artifacts: true
     - job: build_cutedsl_x86_sm80_artifact
       artifacts: true
@@ -263,7 +260,6 @@ l0_unit_tests_x86:
       - RUNNER_TAG: rtx5080-edgellm-nvks
       - RUNNER_TAG: rtx5090-edgellm-nvks
       - RUNNER_TAG: rtx3090-edgellm-nvks
-      - RUNNER_TAG: b100-edgellm-nvks
   tags:
     - ${RUNNER_TAG}
   image: "$IMAGE"
@@ -277,8 +273,6 @@ l0_unit_tests_x86_trt11:
   stage: l0_test
   needs:
     - job: build_cutedsl_x86_sm120_artifact
-      artifacts: true
-    - job: build_cutedsl_x86_sm100_artifact
       artifacts: true
     - job: build_cutedsl_x86_sm80_artifact
       artifacts: true
@@ -302,13 +296,70 @@ l0_unit_tests_x86_trt11:
       - RUNNER_TAG: rtx5080-edgellm-nvks
       - RUNNER_TAG: rtx5090-edgellm-nvks
       - RUNNER_TAG: rtx3090-edgellm-nvks
-      - RUNNER_TAG: b100-edgellm-nvks
   tags:
     - ${RUNNER_TAG}
   image: "$IMAGE"
   extends:
     - .x86_unit_test_template
     - .l0_rules
+    - .l0_environment
+  interruptible: true
+
+l0_unit_tests_x86_b100:
+  stage: l0_test
+  allow_failure: true
+  needs:
+    - job: build_cutedsl_x86_sm100_artifact
+      artifacts: true
+  variables:
+    CUDA_VERSION: "13.2"
+    TRT_VERSION: "$TRT10_X86_VERSION"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/unit_tests_x86_b100"
+    PRIORITY: l0_python_ut
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
+    ONNX_DIR: "$TEST_CACHE_DIR/onnx"
+    TRT_CUDA_VERSION: "13.2"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
+  before_script:
+    - mkdir -p kernelSrcs/cuteDSLPrebuilt
+    - mv -f cutedsl_x86_64_sm_100_cuda12.tar.gz cutedsl_x86_64_sm_100_cuda12.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
+  tags:
+    - b100-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .x86_unit_test_template
+    - .l0_manual_rules
+    - .l0_environment
+  interruptible: true
+
+l0_unit_tests_x86_trt11_b100:
+  stage: l0_test
+  allow_failure: true
+  needs:
+    - job: build_cutedsl_x86_sm100_artifact
+      artifacts: true
+  variables:
+    CUDA_VERSION: "13.2"
+    TRT_VERSION: "$TRT11_VERSION"
+    TRT_CUDA_VERSION: "13.2"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/unit_tests_x86_trt11_b100"
+    PRIORITY: l0_python_ut
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
+    ONNX_DIR: "$TEST_CACHE_DIR/onnx"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
+  before_script:
+    - mkdir -p kernelSrcs/cuteDSLPrebuilt
+    - mv -f cutedsl_x86_64_sm_100_cuda12.tar.gz cutedsl_x86_64_sm_100_cuda12.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
+  tags:
+    - b100-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .x86_unit_test_template
+    - .l0_manual_rules
     - .l0_environment
   interruptible: true
 
