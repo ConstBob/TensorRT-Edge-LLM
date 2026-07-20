@@ -87,8 +87,6 @@ bool Phi4MMViTRunner::validateAndFillConfig(std::string const& configPath)
         return false;
     }
 
-    mConfig.vocabSize = jsonConfig["vocab_size"].get<int32_t>();
-
     auto visionConfig = jsonConfig["embd_layer"]["image_embd_layer"];
     mConfig.blockImageSizeH = visionConfig["crop_size"].get<int32_t>();
     mConfig.blockImageSizeW = mConfig.blockImageSizeH;
@@ -396,8 +394,6 @@ void Phi4MMViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
         throw std::runtime_error(errorMsg);
     }
 
-    int32_t imageTokenId = mConfig.vocabSize;
-
     int imageIndex = 0;
 
     for (size_t i = 0; i < request.requests.size(); ++i)
@@ -406,7 +402,7 @@ void Phi4MMViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
         std::vector<int32_t> ids = tokenizer->encode(request.formattedRequests[i].formattedCompleteRequest);
         check::check(!ids.empty(), "Phi4MMViTRunner::textPreprocess() Failed to encode text");
 
-        // Replace image placeholder tokens with sequential image token IDs
+        // Replace each image placeholder with copies of the image token id (matches HF)
         std::vector<int32_t> newIds;
         for (size_t j = 0; j < ids.size(); ++j)
         {
@@ -416,8 +412,7 @@ void Phi4MMViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
                 int64_t numImageTokens = imageTokenLengths.at(imageIndex);
                 for (int k = 0; k < numImageTokens; ++k)
                 {
-                    newIds.push_back(imageTokenId);
-                    ++imageTokenId;
+                    newIds.push_back(mConfig.imageTokenId);
                 }
                 ++imageIndex;
             }

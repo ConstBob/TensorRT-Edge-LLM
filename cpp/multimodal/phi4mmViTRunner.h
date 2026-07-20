@@ -39,7 +39,6 @@ struct Phi4MMViTConfig
     int32_t numChannels{3};       //!< Image channels (RGB=3)
     int32_t outHiddenSize{0};     //!< Visual output hidden size (projection dim)
     int32_t imageTokenId{200010}; //!< Placeholder token id in text to be expanded into image tokens
-    int32_t vocabSize{0};         //!< Base vocabulary size; image ids start from vocabSize
     std::array<float, 3> imageMean{{0.5F, 0.5F, 0.5F}}; //!< Mean per channel used in normalize: (val/255 - mean)/std
     std::array<float, 3> imageStd{{0.5F, 0.5F, 0.5F}};  //!< Std per channel used in normalize
     int32_t minImageTokensPerImage{0};                  //!< Min visual tokens per image (for resize/grid selection)

@@ -32,6 +32,7 @@
 #include "profiling/timer.h"
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/decoding/decoderUtils.h"
+#include "runtime/preprocess/embeddingPreprocessor.h"
 #include "sampler/sampling.h"
 
 #include <algorithm>
@@ -248,18 +249,11 @@ bool MTPDecoder::runDraftModelPrefill(DecodingInferenceContext& context)
 
     check::check(mRuntime.base.pipelineIO.inputsEmbeds.reshape({activeBatchSize, inputIdsLength, draftHiddenSize}),
         "Tensor reshape failed");
-    if (context.visualEmbeddings.has_value())
-    {
-        Tensor const& imageEmbedsTensor = context.visualEmbeddings.value().get();
-        kernel::embeddingLookupWithImageInsertion(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
-            mRuntime.preprocess.embedding.scalesAsOptional(), imageEmbedsTensor, mRuntime.base.pipelineIO.inputsEmbeds,
-            context.stream);
-    }
-    else
-    {
-        kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
-            mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
-    }
+    // Unified embedding lookup (text, or vision by inserting image embeddings at the image
+    // placeholder positions). Reuses the shared EmbeddingPreprocessor, which generates the
+    // multimodal indices on-device and shares this decoder's embedding table.
+    mRuntime.preprocess.embeddingPreprocessor.embed(
+        mRuntime.preprocess.idsInput, context.visualEmbeddings, std::nullopt, mRuntime.base.pipelineIO, context.stream);
     if (mRuntime.preprocess.gemma4Ple)
     {
         mRuntime.preprocess.gemma4Ple->embed(mRuntime.preprocess.idsInput, context.stream);

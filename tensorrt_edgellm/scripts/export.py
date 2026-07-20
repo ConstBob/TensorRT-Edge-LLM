@@ -745,6 +745,19 @@ def _patch_multimodal_token_ids(model_dir: str, llm_out_dir: str,
             collected.update(
                 _collect_tokens_from_tokenizer_fallback(llm_out_dir))
 
+    # Phi-4 Multimodal names its image placeholder ``<|endoftext10|>`` (id
+    # 200010) rather than ``<|image_pad|>``, so the generic fallback above does
+    # not find it. The runtime needs image_token_id in the LLM config to insert
+    # visual embeddings at those positions (there is no image_token_id field in
+    # the source config), so resolve it from the tokenizer here.
+    if "image_token_id" not in collected and model_type in ("phi4mm",
+                                                            "phi4_multimodal"):
+        image_id = _find_token_id(model_dir, "<|endoftext10|>")
+        if image_id is None:
+            image_id = _find_token_id(llm_out_dir, "<|endoftext10|>")
+        if image_id is not None:
+            collected["image_token_id"] = image_id
+
     # Gemma4 PLE needs multimodal placeholder IDs for zero-filling PLE token
     # identity at image/audio positions.
     if model_type in _GEMMA4_MODEL_TYPES:
