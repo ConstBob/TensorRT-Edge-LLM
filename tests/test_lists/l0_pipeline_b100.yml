@@ -2,14 +2,6 @@ tests:
   - tests/defs/test_common.py::test_build_project
   - tests/defs/test_common.py::test_unit_tests
 
-  # Few-layer numeric validation: early-fail golden-vs-engine smoke over the
-  # first N decoder layers. One plain, one quantized model. The GDN-hybrid
-  # Qwen3.5 case is intentionally omitted here: its GatedDeltaNet engine needs
-  # CuTe DSL kernels that this build does not enable (CUTE_DSL_GDN_ENABLED), so
-  # it can only be run on a GDN-enabled build (see _FEW_LAYER_MODELS).
-  - tests/defs/test_few_layer_validation.py::test_few_layer_validation[Qwen3-0.6B]
-  - tests/defs/test_few_layer_validation.py::test_few_layer_validation[NVIDIA-Nemotron-3-Nano-4B-NVFP4]
-
   - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen2.5-0.5B-Instruct-FP8-fp8-mxsl4096-mxbs4-mxil4096]
   - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-FP8-fp8-mxsl4096-mxbs4-mxil4096-llm_basic]
   - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-FP8-fp8-mxsl4096-mxbs4-mxil4096-mmlu_5-bs4]

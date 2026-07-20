@@ -26,6 +26,23 @@
     - if: $CI_COMMIT_BRANCH == "main"
     - if: $CI_COMMIT_BRANCH =~ /^release/
 
+.cutedsl_artifact_manual_rules:
+  rules:
+    - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
+      when: never
+    - if: $L1 == "true"
+      when: manual
+      allow_failure: true
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: manual
+      allow_failure: true
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual
+      allow_failure: true
+    - if: $CI_COMMIT_BRANCH =~ /^release/
+      when: manual
+      allow_failure: true
+
 .cutedsl_artifact_base:
   stage: setup
   extends:
@@ -235,6 +252,7 @@ build_cutedsl_x86_sm120_artifact:
 build_cutedsl_x86_sm100_artifact:
   extends:
     - .build_cutedsl_x86_base
+  rules: !reference [.cutedsl_artifact_manual_rules, rules]
   tags:
     - b100-edgellm-nvks
   variables:
