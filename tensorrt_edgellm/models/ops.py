@@ -99,7 +99,9 @@ def attention_plugin(
     enable_tree_attention: bool,
     enable_fp8_kv_cache: bool,
     attention_scale: float,
+    enable_context_mask_selector: bool,
     enable_vision_block_attention: bool,
+    context_mask_selector: Optional[torch.Tensor] = None,
     attention_mask: Optional[torch.Tensor] = None,
     attention_pos_id: Optional[torch.Tensor] = None,
     qkv_scales: Optional[List[float]] = None,
@@ -144,7 +146,8 @@ def attention_plugin(
     ``[2, max_batch, cap_padded, num_kv_heads, head_size]`` view at enqueue).
 
     ``enable_tree_attention``, ``enable_fp8_kv_cache``,
-    ``enable_vision_block_attention``, and ``attention_scale`` are
+    ``enable_context_mask_selector``, ``enable_vision_block_attention``,
+    and ``attention_scale`` are
     required (no default) so that ``torch.export`` always includes them
     in the FX graph — default-matching kwargs get stripped, breaking
     ONNX translation.
@@ -196,7 +199,9 @@ def _(qkv,
       enable_tree_attention,
       enable_fp8_kv_cache,
       attention_scale,
+      enable_context_mask_selector,
       enable_vision_block_attention,
+      context_mask_selector=None,
       attention_mask=None,
       attention_pos_id=None,
       qkv_scales=None,

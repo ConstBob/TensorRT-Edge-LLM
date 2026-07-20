@@ -345,13 +345,17 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
     tp_size = max(1, getattr(config, "tp_size", 1))
     tp_rank = max(0, getattr(config, "tp_rank", 0))
 
+    diffusion_engine_role = getattr(model, "diffusion_engine_role", None)
+    if config.is_diffusion_gemma and diffusion_engine_role is None:
+        diffusion_engine_role = "dllm"
+
     out: Dict[str, Any] = {
-        "model":
-        config.model_type,
+        "model": ("diffusion_gemma_text"
+                  if config.is_diffusion_gemma else config.model_type),
         "spec_decode_type":
         _determine_spec_decode_type(config),
         "engine_role":
-        _determine_engine_role(config),
+        diffusion_engine_role or _determine_engine_role(config),
         "edgellm_version":
         _export_tool_version(),
         "vocab_size":
@@ -385,10 +389,62 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
                       or config.gemma4_mtp_base or config.is_eagle3_draft
                       or config.is_dflash_draft or config.is_dspark_draft
                       or config.is_mtp_draft or config.gemma4_mtp_draft)),
+        "rms_norm_eps":
+        float(config.rms_norm_eps),
     }
+    if config.attention_scaling:
+        out["attention_scaling"] = float(config.attention_scaling)
+    if config.final_logit_softcapping is not None:
+        out["final_logit_softcapping"] = float(config.final_logit_softcapping)
+    if config.attention_layer_types:
+        out["attention_layer_types"] = list(config.attention_layer_types)
+    if config.sliding_window_size >= 0:
+        out["sliding_window_size"] = int(config.sliding_window_size)
+    if config.attention_k_eq_v:
+        out["attention_k_eq_v"] = True
+    if config.num_global_key_value_heads:
+        out["num_global_key_value_heads"] = int(
+            config.num_global_key_value_heads)
+
+    if config.num_experts > 0:
+        out.update({
+            "num_experts": int(config.num_experts),
+            "num_experts_per_tok": int(config.num_experts_per_tok),
+            "moe_intermediate_size": int(config.moe_intermediate_size),
+            "enable_moe_block": bool(config.enable_moe_block),
+        })
+
     if tp_size > 1:
         out["tp_size"] = tp_size
         out["tp_rank"] = tp_rank
+
+    if config.is_diffusion_gemma:
+        diffusion_cfg = (config.diffusion.to_dict()
+                         if config.diffusion is not None else {})
+        diffusion_unified_conditioning = bool(
+            getattr(model, "diffusion_unified_conditioning", False))
+        if diffusion_engine_role == "dllm" and not diffusion_unified_conditioning:
+            raise ValueError(
+                "DiffusionGemma dllm export requires unified self-conditioning. "
+                "Call enable_unified_conditioning() before writing runtime config."
+            )
+        out.update({
+            "decoding_strategy":
+            "block_diffusion",
+            "diffusion_config":
+            diffusion_cfg,
+            "self_conditioning_size":
+            config.self_conditioning_size,
+            "diffusion_unified_conditioning":
+            diffusion_unified_conditioning,
+            "context_mask_selector_enabled": (diffusion_engine_role == "dllm"),
+            "diffusion_engines": {
+                "dllm": {
+                    "path": "dllm.engine",
+                    "role": "dllm",
+                },
+            },
+        })
 
     # Heterogeneous head dimensions (e.g. Gemma4: sliding=256, global=512)
     if config.global_head_dim and config.global_head_dim != config.head_dim:

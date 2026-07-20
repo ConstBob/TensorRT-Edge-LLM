@@ -723,6 +723,7 @@ class NemotronHAttentionMixer(nn.Module):
             "enable_tree_attention": False,
             "enable_fp8_kv_cache": self.enable_fp8_kv_cache,
             "attention_scale": self.attention_scale,
+            "enable_context_mask_selector": False,
             "enable_vision_block_attention": False,
         }
         # Always pass qkv_scales so torch.export includes a valid FLOATS

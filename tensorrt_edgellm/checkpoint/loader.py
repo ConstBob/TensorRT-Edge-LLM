@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -97,6 +97,7 @@ def load_weights(
     key_prefix: Optional[str] = None,
     pre_repack_hook: Optional[Callable[[nn.Module], None]] = None,
     mapping: Optional[Mapping] = None,
+    do_repack: bool = True,
 ) -> None:
     """Load all safetensors weights from *model_dir* into *model* in-place.
 
@@ -121,6 +122,9 @@ def load_weights(
                     :func:`_shard_for_module` to slice each NVFP4
                     weight/scale to its per-rank shard before assignment.
                     Must match ``ModelConfig.mapping`` used to build *model*.
+        do_repack:  When ``True`` (default), run quantization repacking after
+                    loading. Set to ``False`` only for partial follow-up loads
+                    into a model whose quantized weights were already repacked.
     """
     mapping = mapping or Mapping()
     shard_map = _build_shard_map(model_dir)
@@ -211,7 +215,8 @@ def load_weights(
     if pre_repack_hook is not None:
         pre_repack_hook(model)
 
-    apply_all_repacking(model)
+    if do_repack:
+        apply_all_repacking(model)
     # Post-process: apply tied embeddings (HF tie_word_embeddings=True models
     # omit lm_head.weight from the checkpoint; tie_weights() restores the share).
     config = getattr(model, "config", None)

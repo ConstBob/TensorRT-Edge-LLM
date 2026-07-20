@@ -201,3 +201,28 @@ def test_attention_plugin_call_sites_pass_kv_page_table():
                 "call site predates the paged-KV ABI or binds arguments in "
                 "the wrong order")
     assert not failures, "\n".join(failures)
+
+
+def test_attention_plugin_direct_call_sites_pass_required_static_flags():
+    """Static guard for required bool attrs in direct ``attention_plugin`` calls.
+
+    Calls routed through a local ``**kwargs`` dict are checked by their owning
+    model tests. Direct call sites must pass the required bool attributes
+    explicitly so ``torch.export`` cannot drop default-valued arguments.
+    """
+    call_sites = list(_iter_attention_plugin_calls())
+    failures = []
+    required_flags = {
+        "enable_context_mask_selector",
+        "enable_vision_block_attention",
+    }
+    for path, node in call_sites:
+        keyword_names = {kw.arg for kw in node.keywords}
+        if None in keyword_names:
+            continue
+        missing = sorted(required_flags - keyword_names)
+        if missing:
+            failures.append(
+                f"{path}:{node.lineno}: attention_plugin( direct call is "
+                f"missing required static flag(s): {', '.join(missing)}")
+    assert not failures, "\n".join(failures)

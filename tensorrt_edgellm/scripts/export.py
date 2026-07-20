@@ -70,7 +70,9 @@ if TYPE_CHECKING:
     from ..config import ModelConfig
 
 from ..checkpoint.checkpoint_utils import normalize_rope_scaling_for_runtime
+from ..config import _is_diffusion_gemma_model_type
 from ..external_weights import (EXTERNAL_WEIGHT_CHOICES,
+                                EXTERNAL_WEIGHT_NVFP4_MOE,
                                 resolve_externalize_weights)
 
 logging.basicConfig(
@@ -199,6 +201,12 @@ def _has_llm_component(model_type: str, component: str) -> bool:
 
 def _is_alpamayo(model_type: str) -> bool:
     return model_type == "alpamayo_r1"
+
+
+def _is_diffusion_gemma(model_type: str, config: dict) -> bool:
+    architectures = [str(a).lower() for a in config.get("architectures", [])]
+    return (_is_diffusion_gemma_model_type(model_type)
+            or any("diffusiongemma" in arch for arch in architectures))
 
 
 # Default output sub-path for every component.  Model types that need a
@@ -820,6 +828,19 @@ def _is_nvfp4_checkpoint(model_dir: str) -> bool:
     return False
 
 
+def _diffusion_gemma_backbone_externalize_weights(
+        model_dir: str,
+        externalize_weights: "list[str] | None") -> "list[str]":
+    """Return externalized weight kinds required by DiffusionGemma backbone."""
+    backbone_externalize_weights = list(externalize_weights or [])
+    if (_is_nvfp4_checkpoint(model_dir)
+            and EXTERNAL_WEIGHT_NVFP4_MOE not in backbone_externalize_weights):
+        backbone_externalize_weights.append(EXTERNAL_WEIGHT_NVFP4_MOE)
+        logger.info("[DiffusionGemma] Auto-enabling NVFP4 MoE external "
+                    "weights for the backbone export")
+    return backbone_externalize_weights
+
+
 def _alpamayo_llm_key_remap(key: str) -> "Optional[str]":
     """Remap ``vlm.lm_head.*`` → ``lm_head.*`` (not covered by prefix detection)."""
     if key.startswith("vlm.lm_head."):
@@ -972,6 +993,157 @@ def _export_llm(model_dir: str,
         _patch_tts_config(model_dir, llm_out_dir)
 
     logger.info("[LLM] Done: %s", output_path)
+
+
+def _patch_diffusion_export_config(model_dir: str, output_dir: str) -> None:
+    """Patch DiffusionGemma runtime metadata that is not present in HF config.json."""
+    root = _load_config(model_dir)
+    token_ids = {}
+    for key in ("image_token_id", "audio_token_id"):
+        value = root.get(key)
+        if isinstance(value, int):
+            token_ids[key] = value
+    if "image_token_id" not in token_ids:
+        image_token_id = _find_token_id(model_dir, "<|image_pad|>")
+        if image_token_id is not None:
+            token_ids["image_token_id"] = image_token_id
+    if not token_ids:
+        return
+
+    cfg_patch_path = os.path.join(output_dir, "dllm", "config.json")
+    if not os.path.exists(cfg_patch_path):
+        return
+    with open(cfg_patch_path) as f:
+        cfg = json.load(f)
+    cfg.update(token_ids)
+    with open(cfg_patch_path, "w") as f:
+        json.dump(cfg, f, indent=2)
+    logger.info("[DiffusionGemma] Patched multimodal token IDs into %s",
+                cfg_patch_path)
+
+
+def _diffusion_gemma_has_visual(config: dict) -> bool:
+    return isinstance(config.get("vision_config"), dict)
+
+
+def _remap_diffusion_gemma_visual_weights(weights: dict) -> dict:
+    """Return a Gemma4-visual-compatible view of DiffusionGemma visual weights."""
+    remapped = {}
+    prefix_map = (
+        ("model.encoder.vision_tower.", "model.vision_tower."),
+        ("model.encoder.embed_vision.", "model.embed_vision."),
+        ("model.encoder.multimodal_embedder.", "model.embed_vision."),
+        ("model.encoder.mm_soft_embedding_projection.",
+         "model.embed_vision.embedding_projection."),
+        ("model.encoder.mm_soft_embedding_norm.",
+         "model.embed_vision.embedding_pre_projection_norm."),
+    )
+    for key, tensor in weights.items():
+        for src, dst in prefix_map:
+            if key.startswith(src):
+                remapped[dst + key[len(src):]] = tensor
+                break
+    if not remapped:
+        raise ValueError("DiffusionGemma checkpoint has vision_config but no "
+                         "model.encoder visual weights were found.")
+    return remapped
+
+
+def _export_diffusion_gemma_visual(model_dir: str, visual_out_dir: str,
+                                   weights: dict, config: dict,
+                                   dtype: "torch.dtype",
+                                   model_config: "ModelConfig") -> None:
+    """Export DiffusionGemma vision tower via the Gemma4 visual exporter."""
+    if not _diffusion_gemma_has_visual(config):
+        raise ValueError("DiffusionGemma checkpoint has no vision_config.")
+    visual_weights = _remap_diffusion_gemma_visual_weights(weights)
+    _export_visual(model_dir,
+                   visual_out_dir,
+                   visual_weights,
+                   config,
+                   "gemma4",
+                   dtype,
+                   model_config=model_config)
+
+
+def _export_diffusion_gemma(model_dir: str,
+                            output_dir: str,
+                            fp8_embedding: bool = False,
+                            reduced_vocab_dir: str = "",
+                            externalize_weights: "list[str] | None" = None,
+                            tp_size: int = 1) -> None:
+    """Export DiffusionGemma as one unified backbone graph."""
+    if tp_size != 1:
+        raise SystemExit(
+            "DiffusionGemma export currently supports only --tp-size 1.")
+
+    backbone_out_dir = os.path.join(output_dir, "dllm")
+    os.makedirs(backbone_out_dir, exist_ok=True)
+    backbone_externalize_weights = _diffusion_gemma_backbone_externalize_weights(
+        model_dir, externalize_weights)
+    use_nvfp4_moe = _is_nvfp4_checkpoint(model_dir)
+
+    try:
+        from ..checkpoint.loader import load_weights
+        from ..model import AutoModel
+        from ..models.diffusion_gemma import make_diffusion_gemma_key_remap
+        from ..models.linear import FP16Linear
+        from ..onnx.export import export_onnx
+    except ImportError as exc:
+        logger.exception("[DiffusionGemma] Failed to import export helpers")
+        raise SystemExit(1) from exc
+
+    logger.info("[DiffusionGemma] Loading backbone checkpoint from %s",
+                model_dir)
+    try:
+        backbone = AutoModel.from_pretrained(
+            model_dir,
+            device="cpu",
+            key_remap=make_diffusion_gemma_key_remap(
+                include_backbone=True,
+                include_self_conditioning=False,
+                nvfp4_moe=use_nvfp4_moe),
+            reduced_vocab_dir=reduced_vocab_dir or None,
+        )
+        backbone.enable_unified_conditioning()
+        load_weights(
+            backbone,
+            model_dir,
+            device="cpu",
+            key_remap=make_diffusion_gemma_key_remap(
+                include_backbone=False, include_self_conditioning=True),
+            mapping=backbone.config.mapping,
+            do_repack=False,
+        )
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            module = getattr(backbone.self_conditioning, name)
+            if not isinstance(module, FP16Linear):
+                raise ValueError(
+                    "DiffusionGemma unified self-conditioning requires "
+                    f"self_conditioning.{name} to export as FP16Linear; "
+                    f"got {type(module).__name__}. Add this module to "
+                    "the checkpoint quantization exclude list.")
+    except (OSError, ValueError, RuntimeError, ImportError) as exc:
+        logger.exception("[DiffusionGemma] Failed to load backbone")
+        raise SystemExit(1) from exc
+
+    backbone_path = os.path.join(backbone_out_dir, "model.onnx")
+    logger.info("[DiffusionGemma] Exporting backbone to %s", backbone_path)
+    try:
+        export_onnx(backbone,
+                    backbone_path,
+                    model_dir=model_dir,
+                    fp8_embedding=fp8_embedding,
+                    reduced_vocab_dir=reduced_vocab_dir,
+                    externalize_weights=backbone_externalize_weights)
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.exception("[DiffusionGemma] Backbone ONNX export failed")
+        raise SystemExit(1) from exc
+
+    del backbone
+
+    _patch_diffusion_export_config(model_dir, output_dir)
+    logger.info("[DiffusionGemma] Done: %s", output_dir)
 
 
 def _export_mtp_draft(model_dir: str,
@@ -3238,7 +3410,7 @@ def main() -> None:
 
     _VALID_COMPONENTS = {
         "thinker", "mtp_draft", "talker", "code_predictor", "visual", "audio",
-        "code2wav", "action"
+        "code2wav", "action", "dllm"
     }
     requested_components = {
         c.strip()
@@ -3248,6 +3420,92 @@ def main() -> None:
     if unknown:
         p.error(f"--components contains unknown values {sorted(unknown)}; "
                 f"valid choices: {sorted(_VALID_COMPONENTS)}")
+
+    if _is_diffusion_gemma(model_type, config):
+        has_diffusion_visual = _diffusion_gemma_has_visual(config)
+        allowed = {
+            "thinker",
+            "dllm",
+        }
+        if has_diffusion_visual:
+            allowed.add("visual")
+        disallowed = requested_components - allowed
+        if disallowed:
+            p.error("DiffusionGemma supports only components "
+                    f"{sorted(allowed)}; got {sorted(disallowed)}")
+        wants_diffusion_engines = (not args.skip_llm
+                                   and (not requested_components
+                                        or bool(requested_components & {
+                                            "thinker",
+                                            "dllm",
+                                        })))
+        wants_visual = (has_diffusion_visual and not args.skip_visual
+                        and (not requested_components
+                             or "visual" in requested_components))
+        if args.skip_llm and not wants_visual:
+            p.error("DiffusionGemma --skip-llm is only valid when exporting "
+                    "the visual component.")
+        if not wants_diffusion_engines and not wants_visual:
+            p.error("No DiffusionGemma components selected for export.")
+        if args.mtp or args.eagle_base or args.dflash_base or args.dflash_draft:
+            p.error("DiffusionGemma cannot be combined with speculative "
+                    "decode export flags")
+        if args.reduced_vocab_dir:
+            p.error("DiffusionGemma unified self-conditioning does not "
+                    "support --reduced-vocab-dir because hidden feedback "
+                    "must align with the full embedding table.")
+
+        logger.info("=" * 60)
+        logger.info("Model type    : diffusion_gemma_text")
+        logger.info("Checkpoint    : %s", model_dir)
+        logger.info("Output dir    : %s", args.output_dir)
+        logger.info("  %-15s: %s", "dllm",
+                    "yes" if wants_diffusion_engines else "no")
+        logger.info("  %-15s: %s", "visual", "yes" if wants_visual else "no")
+        logger.info("FP8 embedding : %s",
+                    "yes" if args.fp8_embedding else "no")
+        logger.info("TP size       : %d", args.tp_size)
+        logger.info("=" * 60)
+        if wants_diffusion_engines:
+            _export_diffusion_gemma(
+                model_dir,
+                args.output_dir,
+                fp8_embedding=args.fp8_embedding,
+                reduced_vocab_dir=args.reduced_vocab_dir,
+                externalize_weights=externalize_weights,
+                tp_size=args.tp_size,
+            )
+        if wants_visual:
+            from ..model import load_model_config
+            weights = _load_all_weights(model_dir)
+            model_config = load_model_config(model_dir)
+            _export_diffusion_gemma_visual(
+                model_dir,
+                os.path.join(args.output_dir, "visual"),
+                weights,
+                config,
+                dtype,
+                model_config=model_config,
+            )
+
+        print()
+        print("=" * 60)
+        print("Export complete")
+        print(f"  output dir: {args.output_dir}")
+        for component in ("dllm", "visual"):
+            p_sub = os.path.join(args.output_dir, component)
+            onnx = os.path.join(p_sub, "model.onnx")
+            mb = os.path.getsize(onnx) / 1e6 if os.path.exists(onnx) else 0
+            if os.path.exists(onnx):
+                print(f"  {component:27s}: {onnx}  ({mb:.1f} MB)")
+                for sidecar in ("external_nvfp4_moe_weights.safetensors", ):
+                    sc_path = os.path.join(p_sub, sidecar)
+                    if os.path.exists(sc_path):
+                        sc_mb = os.path.getsize(sc_path) / 1e6
+                        print(f"                             + {sidecar}  "
+                              f"({sc_mb:.1f} MB)")
+        print("=" * 60)
+        return
 
     # Load weights lazily — only needed when a weight-consuming exporter runs.
     _weights: dict = {}

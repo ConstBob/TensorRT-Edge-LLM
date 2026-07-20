@@ -12,19 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Gemma4 text, audio, and paired MTP assistant decoder implementations."""
+"""Gemma4 text, audio, visual, and paired MTP assistant decoder implementations."""
 
 from .modeling_gemma4_assistant import (Gemma4AssistantDecoderLayer,
                                         Gemma4AssistantForCausalLM)
-from .modeling_gemma4_audio import (Gemma4AudioModel,
-                                    Gemma4AudioMultimodalEmbedder,
-                                    Gemma4AudioWithEmbedder,
-                                    build_gemma4_audio)
 from .modeling_gemma4_text import (GEMMA4_NVFP4_KEY_REMAP, Gemma4Attention,
                                    Gemma4DecoderLayer, Gemma4ForCausalLM,
                                    Gemma4NvFP4MoEBlock, Gemma4NvFP4MoEExperts,
                                    Gemma4Transformer, Gemma4ValueRMSNorm)
-from .modeling_gemma4_visual import Gemma4VisualModel, build_gemma4_visual
 
 __all__ = [
     "GEMMA4_NVFP4_KEY_REMAP",
@@ -37,10 +32,29 @@ __all__ = [
     "Gemma4NvFP4MoEExperts",
     "Gemma4Transformer",
     "Gemma4ValueRMSNorm",
-    "Gemma4AudioModel",
-    "Gemma4AudioMultimodalEmbedder",
-    "Gemma4AudioWithEmbedder",
-    "build_gemma4_audio",
-    "Gemma4VisualModel",
-    "build_gemma4_visual",
 ]
+
+try:
+    from .modeling_gemma4_audio import (Gemma4AudioModel,
+                                        Gemma4AudioMultimodalEmbedder,
+                                        Gemma4AudioWithEmbedder,
+                                        build_gemma4_audio)
+except ImportError:
+    pass
+else:
+    __all__ += [
+        "Gemma4AudioModel",
+        "Gemma4AudioMultimodalEmbedder",
+        "Gemma4AudioWithEmbedder",
+        "build_gemma4_audio",
+    ]
+
+try:
+    from .modeling_gemma4_visual import Gemma4VisualModel, build_gemma4_visual
+except ImportError:
+    pass
+else:
+    __all__ += [
+        "Gemma4VisualModel",
+        "build_gemma4_visual",
+    ]

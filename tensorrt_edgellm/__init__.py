@@ -38,6 +38,7 @@ from .config import ModelConfig, QuantConfig
 from .model import (AutoModel, register_attention_scale_default,
                     register_model, standard_attention_scale)
 # Register model-type-specific implementations
+from .models.diffusion_gemma import DiffusionGemmaBackbone
 from .models.gemma4.modeling_gemma4_text import Gemma4ForCausalLM
 from .models.nemotron_h.modeling_nemotron_h import NemotronHCausalLM
 from .models.qwen3_5.modeling_qwen3_5_text import Qwen3_5CausalLM
@@ -63,6 +64,12 @@ register_model("gemma4", Gemma4ForCausalLM, _identity_attention_scale)
 register_model("gemma4_text", Gemma4ForCausalLM, _identity_attention_scale)
 register_model("gemma4_unified", Gemma4ForCausalLM, _identity_attention_scale)
 register_model("gemma4_unified_text", Gemma4ForCausalLM,
+               _identity_attention_scale)
+register_model("diffusion_gemma", DiffusionGemmaBackbone,
+               _identity_attention_scale)
+register_model("diffusion_gemma_text", DiffusionGemmaBackbone,
+               _identity_attention_scale)
+register_model("diffusiongemma", DiffusionGemmaBackbone,
                _identity_attention_scale)
 register_attention_scale_default("gemma4_assistant", _identity_attention_scale)
 register_model("nemotron_h", NemotronHCausalLM, standard_attention_scale)

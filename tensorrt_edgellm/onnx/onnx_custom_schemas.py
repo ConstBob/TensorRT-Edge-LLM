@@ -106,6 +106,12 @@ _attention_plugin_schema = OpSchema(
             param_option=OpSchema.FormalParameterOption.Optional,
         ),
         OpSchema.FormalParameter(
+            name="context_mask_selector",
+            description="Runtime context-mask selector tensor (optional)",
+            type_str="tensor(int32)",
+            param_option=OpSchema.FormalParameterOption.Optional,
+        ),
+        OpSchema.FormalParameter(
             name="attention_mask",
             description="Attention mask tensor (optional)",
             type_str="tensor(int32)",
@@ -172,6 +178,14 @@ _attention_plugin_schema = OpSchema(
             type=OpSchema.AttrType.INT,
             description=
             "Whether to use FP8 KV cache (0(false), 1(true)). Optional.",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="enable_context_mask_selector",
+            type=OpSchema.AttrType.INT,
+            description=(
+                "Use context_mask_selector as a runtime causal/non-causal "
+                "context-mask shape selector (0(false), 1(true)). Optional."),
             required=False,
         ),
         OpSchema.Attribute(

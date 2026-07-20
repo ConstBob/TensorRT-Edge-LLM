@@ -501,6 +501,9 @@ class AutoModel:
                      key_prefix=key_prefix,
                      pre_repack_hook=pre_repack_hook,
                      mapping=config.mapping)
+        refresh_router_bias = getattr(model, "refresh_fp32_router_bias", None)
+        if callable(refresh_router_bias):
+            refresh_router_bias()
         if variant == "dflash_draft":
             if draft_has_lm_head:
                 logging.getLogger(__name__).info(
