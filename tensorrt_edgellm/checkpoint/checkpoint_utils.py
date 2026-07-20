@@ -831,7 +831,8 @@ def write_runtime_artifacts(model: "CausalLM",
     ``"config_tp{N}_rank{R}.json"`` for per-rank TP exports.
     """
     import torch
-    from safetensors.torch import save_file
+
+    from tensorrt_edgellm._safetensors_io import save_file
 
     from ..chat_template import (process_chat_template,
                                  write_fallback_processed_chat_template)

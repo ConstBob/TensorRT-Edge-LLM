@@ -216,7 +216,8 @@ def quantize_and_export_draft(
         QUANTIZATION_NONE, _export_quantized_weight, get_quantization_format,
         is_quantlinear, postprocess_state_dict)
     from modelopt.torch.quantization.utils import is_quantized
-    from safetensors.torch import save_file
+
+    from tensorrt_edgellm._safetensors_io import save_file
 
     t0 = time.time()
     torch_dtype = torch.float16 if dtype == "fp16" else torch.bfloat16

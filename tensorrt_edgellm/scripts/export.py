@@ -1093,7 +1093,8 @@ def _export_dflash_draft(model_dir: str,
 
     # --- Save draft vocab map sidecar for C++ runtime ---
     if draft_reduced_vocab_dir:
-        from safetensors.torch import save_file as _save_safetensors
+        from tensorrt_edgellm._safetensors_io import \
+            save_file as _save_safetensors
 
         from ..vocab_reduction.constants import (DRAFT_VOCAB_INFO_NAME,
                                                  DRAFT_VOCAB_MAP_NAME)
@@ -1176,7 +1177,7 @@ def _export_dspark_sidecars(dspark_draft_dir: str, draft_out_dir: str) -> None:
     sidecar tensors so the runtime can execute token-by-token scheduling
     without inflating the TensorRT graph with dynamic control flow.
     """
-    from safetensors.torch import save_file
+    from tensorrt_edgellm._safetensors_io import save_file
 
     cfg = _load_config(dspark_draft_dir)
     dspark_cfg = cfg.get("dspark_config", {}) or {}
@@ -2228,7 +2229,7 @@ def _extract_sidecars(model_dir: str,
     default ``strict=False`` a missing key is logged as a warning and the
     file is skipped if no tensors survive.
     """
-    from safetensors.torch import save_file
+    from tensorrt_edgellm._safetensors_io import save_file
 
     weights = _load_all_weights(model_dir)
     for filename, keys, fp16 in specs:
@@ -2269,7 +2270,8 @@ def _write_downcast_fp16_sidecar(model_dir: str,
     (matches :func:`_extract_sidecars`).
     """
     import torch
-    from safetensors.torch import save_file
+
+    from tensorrt_edgellm._safetensors_io import save_file
     weights = _load_all_weights(model_dir)
     out: dict = {}
     for save_name, ckpt_key in keys:
@@ -2678,7 +2680,7 @@ def _extract_code_predictor_weights(model_dir: str, out_dir: str,
     layout) or ``code_predictor.`` (Talker-only layout from older split
     exports).
     """
-    from safetensors.torch import save_file
+    from tensorrt_edgellm._safetensors_io import save_file
 
     weights = _load_all_weights(model_dir)
 
