@@ -44,10 +44,12 @@ from typing import Optional, Union
 
 import modelopt.torch.quantization as mtq
 import torch
-from safetensors.torch import safe_open, save_file
+from safetensors.torch import safe_open
 from torch import nn
 from tqdm import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+from tensorrt_edgellm._safetensors_io import save_file
 
 from ..datasets import TextDataset, dataset_name, resolve_dataset
 from ..quantization_configs import build_quant_config

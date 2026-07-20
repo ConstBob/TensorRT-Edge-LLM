@@ -331,7 +331,8 @@ def _write_external_weight_file(out_dir: str, external_weight_file: str,
     import numpy as np
     import onnx
     import torch
-    from safetensors.torch import save_file
+
+    from tensorrt_edgellm._safetensors_io import save_file
 
     external_weight_tensors = {}
     for tensor_name in tensor_names:
