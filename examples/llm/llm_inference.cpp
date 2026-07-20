@@ -681,6 +681,10 @@ int main(int argc, char* argv[])
     bool hasFailedRequest = false;
     std::string errorMessage = "TensorRT Edge LLM cannot handle this request. Fails.";
     size_t failedCount = 0;
+    // Index of the request in the input file's flat "requests" array. Batching packs
+    // batchSize consecutive requests into one batched request, so downstream consumers
+    // (e.g. calculate_wer_score.py) must receive the flat index, not the batch index.
+    size_t flatRequestIdx = 0;
 
     // Process each request with progress indication
     LOG_INFO("Processing %zu batched requests...", batchedRequests.size());
@@ -990,7 +994,7 @@ int main(int argc, char* argv[])
             // Validate UTF-8 for output text (inputs are always valid)
             // If invalid UTF-8 detected, error message is returned and original text is logged
             responseJson["output_text"] = sanitizeUtf8ForJson(outputText);
-            responseJson["request_idx"] = requestIdx;
+            responseJson["request_idx"] = flatRequestIdx++;
             responseJson["batch_idx"] = batchIdx;
             responseJson["finish_reason"] = (requestStatus && batchIdx < response.finishReasons.size())
                 ? rt::finishReasonName(response.finishReasons[batchIdx])
