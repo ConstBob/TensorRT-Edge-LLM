@@ -38,6 +38,8 @@ struct Gemma4AudioConfig
     int32_t subsamplingFactor{4};  //!< Temporal downsampling factor (2x stride-2 convs)
 
     int32_t audioTokenId{0};            //!< Audio placeholder token ID
+    int32_t beginAudioTokenId{-1};      //!< boa token ID wrapping each audio span (-1 when absent)
+    int32_t endAudioTokenId{-1};        //!< eoa token ID wrapping each audio span (-1 when absent)
     int32_t maxAudioClipsPerRequest{8}; //!< Max audio clips in a single request (for buffer pre-allocation)
 };
 

@@ -22,7 +22,6 @@
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
 #include <cstdint>
-#include <fstream>
 #include <nlohmann/json.hpp>
 
 using Json = nlohmann::json;
@@ -64,7 +63,7 @@ Gemma4AudioRunner::Gemma4AudioRunner(std::string const& engineDir, cudaStream_t 
     // Gemma4 audio uses 128 mel bins, 16kHz, same as Whisper FE, but expects
     // [1, T, mel_bins] layout. The extractor outputs [mel_bins, T] which we
     // transpose during upload.
-    mMelExtractor = rt::audio::makeWhisperExtractor();
+    mMelExtractor = rt::audio::makeGemma4AudioExtractor();
 }
 
 bool Gemma4AudioRunner::validateAndFillConfig(std::string const& engineDir)
@@ -110,6 +109,16 @@ bool Gemma4AudioRunner::validateAndFillConfig(std::string const& engineDir)
     if (jsonConfig.contains("audio_token_id"))
     {
         mConfig.audioTokenId = jsonConfig["audio_token_id"].get<int32_t>();
+        // boa/eoa delimit each audio span so the model can locate it (mirrors
+        // the HF processor layout).
+        mConfig.beginAudioTokenId = jsonConfig.value("boa_token_id", -1);
+        mConfig.endAudioTokenId = jsonConfig.value("eoa_token_id", -1);
+        if (mConfig.beginAudioTokenId < 0 || mConfig.endAudioTokenId < 0)
+        {
+            LOG_WARNING(
+                "Gemma4 audio config has no boa_token_id/eoa_token_id; audio spans will not be delimited and "
+                "may be misread. Re-export the model to add them.");
+        }
     }
     else
     {
@@ -269,7 +278,9 @@ bool Gemma4AudioRunner::encodeSingleClip(
 
     // Set up valid mask — true for real encoded positions, false for padding.
     check::check(mValidMask.reshape({1, encodedSeqLen}), "Valid mask reshape failed");
-    int64_t const validPositions = rawSeqLen / mConfig.subsamplingFactor;
+    // Ceil, matching the HF encoder mask: a trailing partial group still
+    // carries real content and yields a valid soft token.
+    int64_t const validPositions = encodedSeqLen;
     CUDA_CHECK(cudaMemsetAsync(mValidMask.rawPointer(), 0, encodedSeqLen * sizeof(bool), stream));
     if (validPositions > 0)
     {
@@ -389,22 +400,37 @@ void Gemma4AudioRunner::textPreprocess(rt::LLMGenerationRequest const& request,
             : tokenizer->encode(request.formattedRequests[i].formattedCompleteRequest);
         check::check(!ids.empty(), "Failed to encode text");
 
+        bool const wrapAudio = mConfig.beginAudioTokenId >= 0 && mConfig.endAudioTokenId >= 0;
         std::vector<int32_t> newIds;
         size_t expandedSize = 0;
         size_t tmpAudioIdx = audioIndex;
         for (auto const& id : ids)
         {
-            expandedSize += (id == mConfig.audioTokenId) ? audioTokenLengths.at(tmpAudioIdx++) : 1;
+            expandedSize
+                += (id == mConfig.audioTokenId) ? audioTokenLengths.at(tmpAudioIdx++) + (wrapAudio ? 2 : 0) : 1;
         }
         newIds.reserve(expandedSize);
-        for (auto const& id : ids)
+        for (size_t tokenIndex = 0; tokenIndex < ids.size(); ++tokenIndex)
         {
+            int32_t const id = ids[tokenIndex];
             if (id == mConfig.audioTokenId)
             {
+                bool const alreadyHasBegin
+                    = wrapAudio && tokenIndex > 0 && ids[tokenIndex - 1] == mConfig.beginAudioTokenId;
+                bool const alreadyHasEnd
+                    = wrapAudio && tokenIndex + 1 < ids.size() && ids[tokenIndex + 1] == mConfig.endAudioTokenId;
+                if (wrapAudio && !alreadyHasBegin)
+                {
+                    newIds.push_back(mConfig.beginAudioTokenId);
+                }
                 int64_t const numAudioTokens = audioTokenLengths.at(audioIndex);
                 for (int64_t k = 0; k < numAudioTokens; ++k)
                 {
                     newIds.push_back(mConfig.audioTokenId);
+                }
+                if (wrapAudio && !alreadyHasEnd)
+                {
+                    newIds.push_back(mConfig.endAudioTokenId);
                 }
                 ++audioIndex;
             }

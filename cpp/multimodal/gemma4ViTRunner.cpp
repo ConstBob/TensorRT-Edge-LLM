@@ -88,6 +88,22 @@ bool Gemma4ViTRunner::validateAndFillConfig(std::string const& engineDir)
         return false;
     }
     mConfig.imageTokenId = jsonConfig["image_token_id"].get<int32_t>();
+    // boi/eoi delimit each image's soft-token span so the model can tell
+    // adjacent images apart (mirrors the HF processor layout).
+    mConfig.beginImageTokenId = jsonConfig.value("boi_token_id", -1);
+    mConfig.endImageTokenId = jsonConfig.value("eoi_token_id", -1);
+    if (mConfig.beginImageTokenId < 0 || mConfig.endImageTokenId < 0)
+    {
+        std::string missingKeys = mConfig.beginImageTokenId < 0 ? "boi_token_id" : "";
+        if (mConfig.endImageTokenId < 0)
+        {
+            missingKeys += missingKeys.empty() ? "eoi_token_id" : " and eoi_token_id";
+        }
+        LOG_WARNING(
+            "Gemma4 visual config is missing %s; image spans will not be delimited and multi-image prompts may be "
+            "misread. Re-export the model to add it.",
+            missingKeys.c_str());
+    }
 
     auto const& visionConfig = jsonConfig["vision_config"];
     mConfig.patchSize = visionConfig.value("patch_size", 16);
@@ -474,23 +490,39 @@ void Gemma4ViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
             check::check(!ids.empty(), "Gemma4ViTRunner::textPreprocess() Failed to encode text");
         }
 
+        bool const wrapImages = mConfig.beginImageTokenId >= 0 && mConfig.endImageTokenId >= 0;
         std::vector<int32_t> newIds;
-        // Compute expanded size: non-image tokens + sum of image token lengths.
+        // Compute expanded size: non-image tokens + sum of image token lengths
+        // (+2 boundary tokens per image when wrapping).
         size_t expandedSize = 0;
         int64_t imgIdx = imageIndex;
         for (auto tokenId : ids)
         {
-            expandedSize += (tokenId == mConfig.imageTokenId) ? imageTokenLengths.at(imgIdx++) : 1;
+            expandedSize
+                += (tokenId == mConfig.imageTokenId) ? imageTokenLengths.at(imgIdx++) + (wrapImages ? 2 : 0) : 1;
         }
         newIds.reserve(expandedSize);
-        for (auto tokenId : ids)
+        for (size_t tokenIndex = 0; tokenIndex < ids.size(); ++tokenIndex)
         {
+            int32_t const tokenId = ids[tokenIndex];
             if (tokenId == mConfig.imageTokenId)
             {
+                bool const alreadyHasBegin
+                    = wrapImages && tokenIndex > 0 && ids[tokenIndex - 1] == mConfig.beginImageTokenId;
+                bool const alreadyHasEnd
+                    = wrapImages && tokenIndex + 1 < ids.size() && ids[tokenIndex + 1] == mConfig.endImageTokenId;
+                if (wrapImages && !alreadyHasBegin)
+                {
+                    newIds.push_back(mConfig.beginImageTokenId);
+                }
                 int64_t const numImageTokens = imageTokenLengths.at(imageIndex);
                 for (int64_t k = 0; k < numImageTokens; ++k)
                 {
                     newIds.push_back(tokenId);
+                }
+                if (wrapImages && !alreadyHasEnd)
+                {
+                    newIds.push_back(mConfig.endImageTokenId);
                 }
                 ++imageIndex;
             }
