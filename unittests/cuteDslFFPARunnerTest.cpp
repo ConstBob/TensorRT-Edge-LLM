@@ -1193,10 +1193,18 @@ TEST(CuteDslFFPARunnerStaticTest, CanImplementGQAGroupSizes)
     EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, kSM, 16, 2));
 #endif
 
-    // Unsupported group sizes (2, 3, 16) — never compiled
+    // GQA16: Hq=16, Hkv=1 (Gemma4 Unified 12B global attention)
+#if defined(CUTE_DSL_FFPA_GQA16_ENABLED)
+    EXPECT_TRUE(CuteDslFFPARunner::canImplement(512, kSM, 16, 1));
+    EXPECT_TRUE(CuteDslFFPARunner::canImplement(512, kSM, 32, 2));
+#else
+    EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, kSM, 16, 1));
+    EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, kSM, 32, 2));
+#endif
+
+    // Unsupported group sizes (2, 3)
     EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, kSM, 8, 4));  // group=2
     EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, kSM, 12, 4)); // group=3
-    EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, kSM, 16, 1)); // group=16
 
     // Invalid: indivisible
     EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, kSM, 8, 3));
