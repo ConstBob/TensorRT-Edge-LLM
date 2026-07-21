@@ -3,6 +3,7 @@ DO_NOT_RELEASE
 .gitlab/
 .gitlab-ci.yml
 CODEOWNERS
+.greptile/
 sonar-project.properties
 
 # Internal notes and design documents.

@@ -1,0 +1,33 @@
+{
+  "commentTypes": [
+    "logic",
+    "syntax"
+  ],
+  "triggerOnUpdates": false,
+  "triggerOnDrafts": false,
+  "shouldUpdateDescription": false,
+  "strictness": 2,
+  "fixWithAI": false,
+  "ignorePatterns": "3rdParty/**\nbuild/**\ndocs/build/**\ndocs/cpp_docs/html/**\ndocs/cpp_docs/xml/**\nlogs/**\n**/__pycache__/**\n**/.pytest_cache/**\n**/*.pyc\n**/*.egg-info/**\n**/*.engine\n**/*.plan\n**/*.nsys-rep\n**/*.qdrep\n**/*.onnx\n**/*.safetensors\ncpp/kernels/contextAttentionKernels/cubin/**\n",
+  "summarySection": {
+    "included": true,
+    "collapsible": true,
+    "defaultOpen": false
+  },
+  "issuesTableSection": {
+    "included": true,
+    "collapsible": false,
+    "defaultOpen": true
+  },
+  "confidenceScoreSection": {
+    "included": true,
+    "collapsible": true,
+    "defaultOpen": false
+  },
+  "sequenceDiagramSection": {
+    "included": false,
+    "collapsible": true,
+    "defaultOpen": false
+  },
+  "instructions": "Review TensorRT Edge-LLM changes as a maintainer. Do not review draft MRs. Run only the initial non-draft review automatically; do not run follow-up reviews on branch updates unless a user explicitly requests another review. MR titles must include an issue reference, private bug tracker reference, or `None:`. MR descriptions should explain the implementation, validation steps, performance data or why performance is not applicable, and release impact. Prioritize correctness, architecture, model/provider parity, runtime memory/performance, CMake/build correctness, and whether docs plus tests were updated at the first relevant touchpoint. Avoid low-value formatting comments that pre-commit catches. Keep Greptile review comments concise and high-signal: one precise finding per issue, no repetitive summaries, no long generic advice, and no comment unless there is a concrete action."
+}

@@ -18,6 +18,11 @@ TensorRT Edge-LLM: NVIDIA C++/CUDA/Python inference runtime for deploying LLMs a
 - Git submodules must be initialized: `git submodule update --init` (googletest, nlohmann/json, NVTX)
 - Model validation must exercise `export -> build -> inference` in that order. Export-only checks are useful smoke
   tests, but they are not sufficient evidence that a model works.
+- Source comments must be precise and sparse. Add comments only for non-obvious invariants, ownership/lifetime
+  constraints, math/precision assumptions, platform constraints, or surprising control flow. Do not add AI-style
+  narration that restates the code, long block comments that do not change maintainability, or repeated comments
+  explaining the same local pattern. Do not add change narration that compares against previous code, such as
+  "replaces X" or "now uses Y"; that belongs in the commit message or PR description.
 
 ## Common Commands
 
@@ -99,6 +104,9 @@ The pipeline is: `HuggingFace Model → Python Export (quantize + ONNX) → C++ 
 - **One concern per PR** — avoid scope creep. If a PR touches unrelated areas, split it.
 - **HF checkpoint consistency** — Python model classes in `models/` must stay compatible with HuggingFace checkpoint tensor names when adding new models.
 - **Pinned dependencies** — `transformers`, `nvidia-modelopt`, `onnx`, and `torch` versions are pinned in `pyproject.toml`. Changing them can break export/quantization. Check compatibility before bumping.
+- **No noisy source comments** — remove or avoid comments that merely narrate statements, repeat names/types, or
+  explain obvious control flow. A useful comment should shorten future debugging by stating intent, constraints, or
+  non-obvious behavior. Comments should not describe how the code changed relative to an older implementation.
 
 ## Development Workflow
 
