@@ -171,11 +171,14 @@ def _numpy_attention(q: np.ndarray, k_cache: np.ndarray, v_cache: np.ndarray,
 
 def _build_attention_engine(logger,
                             params: SharedKVTestParams,
-                            attention_scale: Optional[float] = None):
+                            attention_scale: Optional[float] = None,
+                            enable_kv_shared: int = 0):
     """Build a TRT engine with the AttentionPlugin.
 
-    Shared-KV mode is detected at runtime by passing K/V with seq_len=0.
-    The optimization profile allows K/V seq_len range [0, max_seq_len].
+    ``enable_kv_shared`` selects the packed-QKV layout the plugin expects:
+    0 → normal own-KV layer, qkv carries (Hq+2*Hkv)*D channels;
+    1 → shared-KV layer, qkv carries Q only (Hq*D channels) and K/V are
+    read from the donated kv_cache without being written.
     """
     p = params
     builder = trt.Builder(logger)
@@ -188,12 +191,15 @@ def _build_attention_engine(logger,
 
     q_hidden = p.num_q_heads * p.head_size
     kv_hidden = p.num_kv_heads * p.head_size
+    full_hidden = q_hidden + 2 * kv_hidden
 
     cap_padded, mpps, num_pages = _pool_geometry(p)
 
-    q_input = network.add_input("q", trt.float16, (-1, -1, q_hidden))
-    k_input = network.add_input("k", trt.float16, (-1, -1, kv_hidden))
-    v_input = network.add_input("v", trt.float16, (-1, -1, kv_hidden))
+    # Packed-QKV input; channel count is fixed by the enable_kv_shared field:
+    #   enable_kv_shared=0 → (Hq + 2*Hkv) * D (normal layer, own K/V)
+    #   enable_kv_shared=1 → Hq * D (Q only; K/V donated via kv_cache)
+    qkv_channels = q_hidden if enable_kv_shared else full_hidden
+    qkv_input = network.add_input("qkv", trt.float16, (-1, -1, -1))
     # Paged-KV pool binding: [2, numPages, PAGE_SIZE, Hkv, D].
     kv_cache_input = network.add_input(
         "kv_cache", trt.float16,
@@ -205,6 +211,9 @@ def _build_attention_engine(logger,
     kv_cache_indices = network.add_input("kv_cache_indices", trt.int32, (-1, ))
     kv_page_table = network.add_input("kv_page_table", trt.int32,
                                       (-1, 2, mpps))
+
+    # qk_norm is disabled here (enable_qk_norm defaults to 0), so the optional
+    # q_norm_gamma / k_norm_gamma engine-weight inputs are not wired at all.
 
     # Plugin creation (V3 API)
     plugin_registry = trt.get_plugin_registry()
@@ -227,6 +236,9 @@ def _build_attention_engine(logger,
                         trt.PluginFieldType.INT32),
         trt.PluginField("sliding_window_size", np.array([-1], dtype=np.int32),
                         trt.PluginFieldType.INT32),
+        trt.PluginField("enable_kv_shared",
+                        np.array([enable_kv_shared], dtype=np.int32),
+                        trt.PluginFieldType.INT32),
     ]
     if attention_scale is not None:
         plugin_fields.append(
@@ -239,8 +251,8 @@ def _build_attention_engine(logger,
                                           trt.TensorRTPhase.BUILD)
 
     plugin_inputs = [
-        q_input, k_input, v_input, kv_cache_input, context_lengths,
-        rope_cos_sin, kv_cache_indices, kv_page_table
+        qkv_input, kv_cache_input, context_lengths, rope_cos_sin,
+        kv_cache_indices, kv_page_table
     ]
     plugin_layer = network.add_plugin_v3(plugin_inputs, [], plugin)
 
@@ -249,17 +261,10 @@ def _build_attention_engine(logger,
     plugin_layer.get_output(1).name = "kv_cache_output"
     network.mark_output(plugin_layer.get_output(1))
 
-    # Optimization profile — K/V seq_len min=0 to support shared-KV mode
     profile = builder.create_optimization_profile()
-    profile.set_shape("q", (1, 1, q_hidden),
-                      (p.batch_size, p.seq_len, q_hidden),
-                      (p.max_batch_size, p.max_seq_len, q_hidden))
-    profile.set_shape("k", (1, 0, kv_hidden),
-                      (p.batch_size, p.seq_len, kv_hidden),
-                      (p.max_batch_size, p.max_seq_len, kv_hidden))
-    profile.set_shape("v", (1, 0, kv_hidden),
-                      (p.batch_size, p.seq_len, kv_hidden),
-                      (p.max_batch_size, p.max_seq_len, kv_hidden))
+    profile.set_shape("qkv", (1, 1, qkv_channels),
+                      (p.batch_size, p.seq_len, qkv_channels),
+                      (p.max_batch_size, p.max_seq_len, qkv_channels))
     # The pool never resizes: numPages is fixed per engine (min=opt=max).
     pool_shape = (2, num_pages, PAGE_SIZE, p.num_kv_heads, p.head_size)
     profile.set_shape("kv_cache", pool_shape, pool_shape, pool_shape)
@@ -364,9 +369,10 @@ class TestSharedKVAttention:
         donor_v_np = self.rng.standard_normal(
             (B, donor_seq_len, H_kv * D)).astype(np.float16)
 
-        d_q = self._to_gpu(donor_q_np)
-        d_k = self._to_gpu(donor_k_np)
-        d_v = self._to_gpu(donor_v_np)
+        # Packed contract: donor layer feeds Q|K|V concatenated on channels.
+        donor_qkv_np = np.concatenate([donor_q_np, donor_k_np, donor_v_np],
+                                      axis=-1)
+        d_qkv = self._to_gpu(donor_qkv_np)
         # Paged-KV pool [2, numPages, PAGE_SIZE, Hkv, D]; the donor plugin call
         # fills it in place under an identity page table.
         cap_padded, mpps, num_pages = _pool_geometry(p)
@@ -396,9 +402,7 @@ class TestSharedKVAttention:
                                  device=self.device)
 
         tensors_donor = {
-            "q": d_q,
-            "k": d_k,
-            "v": d_v,
+            "qkv": d_qkv,
             "kv_cache": d_kv_cache,
             "context_lengths": d_ctx_len,
             "rope_cos_sin": d_rope,
@@ -408,9 +412,7 @@ class TestSharedKVAttention:
             "kv_cache_output": d_kv_cache,  # in-place
         }
         shapes_donor = {
-            "q": (B, donor_seq_len, H_q * D),
-            "k": (B, donor_seq_len, H_kv * D),
-            "v": (B, donor_seq_len, H_kv * D),
+            "qkv": (B, donor_seq_len, (H_q + 2 * H_kv) * D),
             "kv_cache": (2, num_pages, PAGE_SIZE, H_kv, D),
             "context_lengths": (B, ),
             "rope_cos_sin": (1, p.max_position_embeddings, D),
@@ -435,17 +437,17 @@ class TestSharedKVAttention:
         kv_cache_after_donor = torch.stack((k_logical, v_logical),
                                            dim=1).cpu().numpy().copy()
 
-        # --- Step 2: Shared layer reads donor's cache (K/V have seq_len=0) ---
-        shared_engine, shared_ctx = _build_attention_engine(
-            self.logger, p, attention_scale)
+        # --- Step 2: Shared layer reads donor's cache (Q-only channels) ---
+        shared_engine, shared_ctx = _build_attention_engine(self.logger,
+                                                            p,
+                                                            attention_scale,
+                                                            enable_kv_shared=1)
 
         shared_q_np = self.rng.standard_normal(
             (B, shared_seq_len, H_q * D)).astype(np.float16)
-        d_q_shared = self._to_gpu(shared_q_np)
-        # Empty K/V tensors signal shared-KV mode (seq_len=0).
-        # Allocate 1 element so TRT gets a non-null address; shape (B,0,kv_hidden) is set separately.
-        d_k_shared = torch.zeros(1, dtype=torch.float16, device=self.device)
-        d_v_shared = torch.zeros(1, dtype=torch.float16, device=self.device)
+        # Shared-KV engine: qkv carries Q only — K/V come from the donor's
+        # kv_cache.
+        d_qkv_shared = self._to_gpu(shared_q_np)
 
         total_ctx = donor_seq_len + shared_seq_len
         # In prefill (FMHA path): context_lengths feeds cuQSeqLens which must equal the
@@ -472,9 +474,7 @@ class TestSharedKVAttention:
         kv_cache_before_shared = d_kv_cache.cpu().numpy().copy()
 
         tensors_shared = {
-            "q": d_q_shared,
-            "k": d_k_shared,
-            "v": d_v_shared,
+            "qkv": d_qkv_shared,
             "kv_cache": d_kv_cache,  # same buffer as donor wrote to
             "context_lengths": d_ctx_len_shared,
             "rope_cos_sin": d_rope,
@@ -484,9 +484,7 @@ class TestSharedKVAttention:
             "kv_cache_output": d_kv_cache,  # in-place (should NOT be modified)
         }
         shapes_shared = {
-            "q": (B, shared_seq_len, H_q * D),
-            "k": (B, 0, H_kv * D),
-            "v": (B, 0, H_kv * D),
+            "qkv": (B, shared_seq_len, H_q * D),
             "kv_cache": (2, num_pages, PAGE_SIZE, H_kv, D),
             "context_lengths": (B, ),
             "rope_cos_sin": (1, p.max_position_embeddings, D),
@@ -520,11 +518,13 @@ class TestSharedKVAttention:
                 kv_cache_after_shared, np_ref)
 
     def test_shared_kv_engine_builds(self):
-        """Engine builds successfully (shared-KV detected via empty K/V at runtime)."""
-        engine, ctx = _build_attention_engine(self.logger, self.params)
+        """Shared-KV (enable_kv_shared=1) engine builds successfully."""
+        engine, ctx = _build_attention_engine(self.logger,
+                                              self.params,
+                                              enable_kv_shared=1)
         assert engine is not None
         assert ctx is not None
-        print("PASS: engine built (shared-KV via empty K/V)")
+        print("PASS: shared-KV engine built (enable_kv_shared=1)")
 
     def test_shared_kv_cache_not_modified(self):
         """Shared-KV layer must NOT write to the KV cache."""

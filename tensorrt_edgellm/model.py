@@ -516,6 +516,10 @@ class AutoModel:
             from .models.qwen3_5 import fuse_gdn_input_projections
             fuse_gdn_input_projections(model)
 
+        # Fuse attention Q/K/V projections into one packed-QKV GEMM where eligible.
+        from .models.default.modeling_default import fuse_qkv_projections
+        fuse_qkv_projections(model)
+
         return model
 
 

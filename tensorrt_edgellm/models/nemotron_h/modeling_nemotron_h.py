@@ -730,9 +730,9 @@ class NemotronHAttentionMixer(nn.Module):
         kwargs["qkv_scales"] = getattr(self, "_qkv_scales_float",
                                        [1.0, 1.0, 1.0])
         attn_output, present_key_value = attention_plugin(
-            query_states, key_states, value_states, past_key_value,
-            context_lengths, rope_rotary_cos_sin, kvcache_start_index,
-            kv_page_table, **kwargs)
+            torch.cat([query_states, key_states, value_states],
+                      dim=-1), past_key_value, context_lengths,
+            rope_rotary_cos_sin, kvcache_start_index, kv_page_table, **kwargs)
 
         attn_output = attn_output.reshape(batch_size, seq_len,
                                           self.num_heads * self.head_dim)

@@ -468,12 +468,10 @@ class Gemma4Attention(Attention):
         query_states = self.q_proj(hidden_states)
 
         if self.is_kv_shared:
-            # Shared-KV mode: pass zero-length K/V to the attention plugin.
-            # The plugin detects kvSeqLen==0 and skips KV cache writes,
-            # reading from the donor layer's cache (bound as past_key_value).
-            kv_dim = self.num_kv_heads * self.head_dim
-            key_states = hidden_states.new_zeros(batch_size, 0, kv_dim)
-            value_states = hidden_states.new_zeros(batch_size, 0, kv_dim)
+            # Shared-KV layer (enable_kv_shared=1): qkv carries Q only; K/V come
+            # from the donor layer's cache (past_key_value).
+            key_states = None
+            value_states = None
         else:
             key_states = self.k_proj(hidden_states)
             if self.attention_k_eq_v:
@@ -529,10 +527,14 @@ class Gemma4Attention(Attention):
         kwargs["qkv_scales"] = getattr(self, "_qkv_scales_float",
                                        [1.0, 1.0, 1.0])
 
+        # Packed QKV input: Q-only for shared-KV layers, Q+K+V otherwise.
+        if key_states is None:
+            qkv = query_states
+            kwargs["enable_kv_shared"] = 1
+        else:
+            qkv = torch.cat([query_states, key_states, value_states], dim=-1)
         attn_output, present_key_value = attention_plugin(
-            query_states,
-            key_states,
-            value_states,
+            qkv,
             past_key_value,
             context_lengths,
             rope_rotary_cos_sin,

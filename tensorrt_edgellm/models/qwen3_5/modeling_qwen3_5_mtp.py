@@ -79,9 +79,7 @@ class Qwen3_5MtpDecoderLayer(nn.Module):
                                    attn.num_kv_heads * attn.head_dim)
 
         attn_output, present_key_value = attention_plugin(
-            query_states,
-            key_states,
-            value_states,
+            torch.cat([query_states, key_states, value_states], dim=-1),
             past_key_value,
             context_lengths,
             rope_rotary_cos_sin,

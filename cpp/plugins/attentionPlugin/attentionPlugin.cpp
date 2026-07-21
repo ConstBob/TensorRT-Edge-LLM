@@ -42,6 +42,8 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -66,25 +68,52 @@ static inline DataType selectKvCacheDataType(bool enableFp8KVCache)
 }
 
 // Define the mapping of input and output indices of the AttentionPlugin.
-constexpr int32_t kIN_Q_IDX{0};
-constexpr int32_t kIN_K_IDX{1};
-constexpr int32_t kIN_V_IDX{2};
-constexpr int32_t kIN_KV_CACHE_IDX{3};
-constexpr int32_t kIN_CONTEXT_LENGTH_IDX{4};
-constexpr int32_t kIN_ROPE_COS_SIN_IDX{5};
-constexpr int32_t kIN_KV_CACHE_START_IDX{6};
-constexpr int32_t kIN_KV_PAGE_TABLE_IDX{7};
-constexpr int32_t kIN_OPTIONAL_ATTN_MASK_IDX{8};
-constexpr int32_t kIN_OPTIONAL_ATTN_POS_ID_IDX{9};
+// Packed-QKV contract: Q/K/V concatenated on the last dim into one input tensor (a single
+// fused QKV GEMM output). RoPE + split happens internally via launchApplyRopeFromPackedToSplit.
+// See applyRopeWriteKV.h for kernel docs.
+//
+// Optional inputs follow the required ones in a fixed relative order:
+//   [q_norm_gamma, k_norm_gamma]        when enable_qk_norm         (engine-weight constants)
+//   [attention_mask, attention_pos_id]  when enable_tree_attention
+//
+// The gamma weights are engine weights: FP16 Constant initializers wired to plugin inputs,
+// baked into the engine at build time (device-resident, no runtime upload). Models without
+// qk_norm do not wire these inputs at all.
+constexpr int32_t kIN_QKV_IDX{0};
+constexpr int32_t kIN_KV_CACHE_IDX{1};
+constexpr int32_t kIN_CONTEXT_LENGTH_IDX{2};
+constexpr int32_t kIN_ROPE_COS_SIN_IDX{3};
+constexpr int32_t kIN_KV_CACHE_START_IDX{4};
+constexpr int32_t kIN_KV_PAGE_TABLE_IDX{5};
 constexpr int32_t kOUT_ATTENTION_IDX{0};
 constexpr int32_t kOUT_KV_CACHE_IDX{1};
 
 // Reflect the count of Inputs and Outputs of the AttentionPlugin,
 // these definitions shall be consistent.
-constexpr int32_t kNUM_REQUIRED_INPUTS{8};
+constexpr int32_t kNUM_REQUIRED_INPUTS{6};
+constexpr int32_t kNUM_QK_NORM_OPTIONAL_INPUTS{2};
 constexpr int32_t kNUM_TREE_ATTN_OPTIONAL_INPUTS{2};
 constexpr int32_t kNUM_VISION_BLOCK_OPTIONAL_INPUTS{1};
 constexpr int32_t kNUM_REQUIRED_OUTPUTS{2};
+
+// Dynamic input-index helpers for the optional inputs (positions depend on which optional
+// groups are enabled; qk_norm gammas always precede the tree-attention inputs).
+constexpr int32_t qNormGammaInputIdx()
+{
+    return kNUM_REQUIRED_INPUTS; // valid only when enable_qk_norm
+}
+constexpr int32_t kNormGammaInputIdx()
+{
+    return kNUM_REQUIRED_INPUTS + 1; // valid only when enable_qk_norm
+}
+constexpr int32_t attnMaskInputIdx(bool enableQKNorm)
+{
+    return kNUM_REQUIRED_INPUTS + (enableQKNorm ? kNUM_QK_NORM_OPTIONAL_INPUTS : 0);
+}
+constexpr int32_t attnPosIdInputIdx(bool enableQKNorm)
+{
+    return attnMaskInputIdx(enableQKNorm) + 1;
+}
 
 // Support Tree Attention decoding schema up to 128 tokens in the draft tree per batch.
 // We are unable to check this property during shape checking since prefill length is much larger than this value.
@@ -99,7 +128,7 @@ enum class AttentionExecutionMode
     kTREE_DECODING
 };
 
-AttentionExecutionMode deduceModeVanilla(rt::Tensor const& qInputTensor, rt::Tensor const& kvCacheStartIdxTensor)
+AttentionExecutionMode deduceModeVanilla(rt::Tensor const& packedQKVTensor, rt::Tensor const& kvCacheStartIdxTensor)
 {
     // Empty KVCache Start indices means normal prefill without previous KVCache. Notice single token is also a valid
     // prefill length.
@@ -110,7 +139,7 @@ AttentionExecutionMode deduceModeVanilla(rt::Tensor const& qInputTensor, rt::Ten
 
     // Otherwise, distinguish between chunked prefill and vanilla decoding based on the runtime Sequence Length.
     // Vanilla decoding should always have runtime sequence length of 1.
-    int64_t const runtimeSeqLen = qInputTensor.getShape()[1];
+    int64_t const runtimeSeqLen = packedQKVTensor.getShape()[1];
     if (runtimeSeqLen > 1)
     {
         return AttentionExecutionMode::kCHUNKED_PREFILL;
@@ -119,7 +148,7 @@ AttentionExecutionMode deduceModeVanilla(rt::Tensor const& qInputTensor, rt::Ten
 }
 
 AttentionExecutionMode deduceModeTreeAttention(
-    rt::Tensor const& qInputTensor, rt::Tensor const& kvCacheStartIdxTensor, rt::Tensor const& attentionPosIdTensor)
+    rt::Tensor const& packedQKVTensor, rt::Tensor const& kvCacheStartIdxTensor, rt::Tensor const& attentionPosIdTensor)
 {
     // Normal prefill if there is no previous KVCache.
     if (kvCacheStartIdxTensor.getShape()[0] == 0)
@@ -134,7 +163,7 @@ AttentionExecutionMode deduceModeTreeAttention(
     // Note, chunked prefill is very similar to tree decoding, the difference is chunked prefill will have contiguous
     // tokens in the sequence while tree decoding has a "tree" structure described by attention mask and position ids.
     // By convention, we will supply 1 shape for position id tensor under prefill execution.
-    int64_t const runtimeSeqLen = qInputTensor.getShape()[1];
+    int64_t const runtimeSeqLen = packedQKVTensor.getShape()[1];
     int64_t const positionIdLen = attentionPosIdTensor.getShape()[1];
 
     if (runtimeSeqLen == 1)
@@ -223,6 +252,17 @@ size_t getAttentionWorkspaceSize(int64_t batchSize, int64_t seqLen, int64_t kvCa
     workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{batchSize + 1}, DataType::kINT32);
     workspaceSize = accumulateWorkspaceSize(
         workspaceSize, rt::Coords{batchSize, 2, numKVHeads, kvCacheCapacity, headSize}, DataType::kHALF);
+
+    // Roped Q is written to a scratch tensor (always needed).
+    workspaceSize
+        = accumulateWorkspaceSize(workspaceSize, rt::Coords{batchSize, seqLen, numQHeads, headSize}, DataType::kHALF);
+
+    // Scratch K/V are needed only for the SEPARATE_Q_K_V FMHA path; allocate
+    // unconditionally as an upper bound.
+    workspaceSize
+        = accumulateWorkspaceSize(workspaceSize, rt::Coords{batchSize, seqLen, numKVHeads, headSize}, DataType::kHALF);
+    workspaceSize
+        = accumulateWorkspaceSize(workspaceSize, rt::Coords{batchSize, seqLen, numKVHeads, headSize}, DataType::kHALF);
 
     // FP8 Q output: RoPE kernel writes FP8 Q to this workspace buffer (CuTe DSL FMHA path).
     if (useCuteDslFMHA && enableFp8KVCache)
@@ -395,6 +435,13 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     , mQkvScales(enableFp8KVCache ? qkvScales : std::vector<float>{1.f, 1.f, 1.f})
     , mSlidingWindowSize(slidingWindowSize)
 {
+    // The fused-norm warp reduction covers at most 32 lanes (headDim / vec width 8)
+    // => no fused-norm kernel above head_size 256; fail at construction.
+    ELLM_CHECK(!mEnableQKNorm || mHeadSize <= 256,
+        "enable_qk_norm requires head_size <= 256 (no fused-norm kernel for larger heads).");
+    ELLM_CHECK(!(mEnableQKNorm && mEnableKVShared),
+        "enable_qk_norm with a shared-KV (Q-only) layer is not supported: the Q-only path has "
+        "no fused-norm kernel.");
     ELLM_CHECK(!(mEnableTreeAttention && mEnableVisionBlockAttention),
         "Tree attention and vision block attention are mutually exclusive.");
     ELLM_CHECK(!mEnableVisionBlockAttention || !mEnableFp8KVCache, "Vision block attention requires an FP16 KV cache.");
@@ -492,10 +539,19 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
     , mHeadSize(parsePluginScalarField<int32_t>("head_size", fc).value_or(0))
     , mAttentionScale(resolveAttentionScale(parsePluginScalarField<float>("attention_scale", fc), mHeadSize))
     , mEnableTreeAttention(parsePluginScalarField<int32_t>("enable_tree_attention", fc).value_or(0))
+    , mEnableQKNorm(parsePluginScalarField<int32_t>("enable_qk_norm", fc).value_or(0))
+    , mEnableKVShared(parsePluginScalarField<int32_t>("enable_kv_shared", fc).value_or(0))
     , mEnableFp8KVCache(parsePluginScalarField<int32_t>("enable_fp8_kv_cache", fc).value_or(0))
     , mSlidingWindowSize(parsePluginScalarField<int32_t>("sliding_window_size", fc).value_or(-1))
 {
     mEnableVisionBlockAttention = parsePluginScalarField<int32_t>("enable_vision_block_attention", fc).value_or(0);
+    // The fused-norm warp reduction covers at most 32 lanes (headDim / vec width 8)
+    // => no fused-norm kernel above head_size 256; fail at construction.
+    ELLM_CHECK(!mEnableQKNorm || mHeadSize <= 256,
+        "enable_qk_norm requires head_size <= 256 (no fused-norm kernel for larger heads).");
+    ELLM_CHECK(!(mEnableQKNorm && mEnableKVShared),
+        "enable_qk_norm with a shared-KV (Q-only) layer is not supported: the Q-only path has "
+        "no fused-norm kernel.");
     ELLM_CHECK(!(mEnableTreeAttention && mEnableVisionBlockAttention),
         "Tree attention and vision block attention are mutually exclusive.");
     ELLM_CHECK(!mEnableVisionBlockAttention || !mEnableFp8KVCache, "Vision block attention requires an FP16 KV cache.");
@@ -508,6 +564,17 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
             auto const* data = static_cast<float const*>(fc->fields[i].data);
             mQkvScales.assign(data, data + fc->fields[i].length);
             break;
+        }
+    }
+
+    // The q/k gamma weights are not plugin fields — they arrive as optional engine-weight
+    // constant inputs (see the input-layout block at the top of this file).
+    for (int32_t i = 0; i < fc->nbFields; ++i)
+    {
+        std::string const name = fc->fields[i].name;
+        if (name == "rms_norm_eps")
+        {
+            mRmsNormEps = *static_cast<float const*>(fc->fields[i].data);
         }
     }
 
@@ -595,6 +662,9 @@ IPluginV3* AttentionPlugin::clone() noexcept
     {
         auto* p = new AttentionPlugin(mLayerName, mNumQHeads, mNumKVHeads, mHeadSize, mEnableTreeAttention,
             mEnableFp8KVCache, mEnableVisionBlockAttention, mSlidingWindowSize, mQkvScales, mAttentionScale);
+        p->mEnableQKNorm = mEnableQKNorm;
+        p->mEnableKVShared = mEnableKVShared;
+        p->mRmsNormEps = mRmsNormEps;
         p->setPluginNamespace(mNamespace.c_str());
         return p;
     }
@@ -646,7 +716,7 @@ int32_t AttentionPlugin::getOutputDataTypes(DataType* outputTypes, [[maybe_unuse
         assert(nbOutputs == kNUM_REQUIRED_OUTPUTS);
         // Output[0] (attention): always FP16 (follows Q input dtype).
         // Output[1] (KV cache) follows KV input dtype (HALF or FP8).
-        outputTypes[kOUT_ATTENTION_IDX] = inputTypes[kIN_Q_IDX];
+        outputTypes[kOUT_ATTENTION_IDX] = inputTypes[kIN_QKV_IDX];
         outputTypes[kOUT_KV_CACHE_IDX] = inputTypes[kIN_KV_CACHE_IDX];
         return 0;
     }
@@ -665,8 +735,9 @@ int32_t AttentionPlugin::getOutputShapes(DimsExprs const* inputs, [[maybe_unused
         assert(nbOutputs == kNUM_REQUIRED_OUTPUTS);
         // Output[0] is attention result, has shape [B, S, Hq, D]. Refers to Q shape [B, S, Hq*D]
         outputs[kOUT_ATTENTION_IDX].nbDims = 4;
-        outputs[kOUT_ATTENTION_IDX].d[0] = inputs[kIN_Q_IDX].d[0];
-        outputs[kOUT_ATTENTION_IDX].d[1] = inputs[kIN_Q_IDX].d[1];
+        // B,S taken from packed QKV input (same as Q's B,S since they're concat-ed on head dim)
+        outputs[kOUT_ATTENTION_IDX].d[0] = inputs[kIN_QKV_IDX].d[0];
+        outputs[kOUT_ATTENTION_IDX].d[1] = inputs[kIN_QKV_IDX].d[1];
         outputs[kOUT_ATTENTION_IDX].d[2] = exprBuilder.constant(mNumQHeads);
         outputs[kOUT_ATTENTION_IDX].d[3] = exprBuilder.constant(mHeadSize);
 
@@ -691,9 +762,7 @@ bool AttentionPlugin::supportsFormatCombination(
     int32_t pos, DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
 {
     // Support context/generation phase inputs:
-    //      Q tensor (linear FP16) with shape [B, S, Hq, D]
-    //      K tensor (linear FP16) with shape [B, S, Hkv, D]
-    //      V tensor (linear FP16) with shape [B, S, Hkv, D]
+    //      packed QKV tensor (linear FP16) with shape [B, S, (Hq + 2*Hkv) * D]
     //      KV-cache tensor (linear FP16/FP8): paged pool [2, numPages, kTOKENS_PER_PAGE, Hkv, D].
     //      (numPages is a fixed value per engine build; see setupKVCacheProfiles in llmBuilder.cpp.)
     //      Real context length: [B] (a vector of scalars) with type int32_t.
@@ -707,29 +776,14 @@ bool AttentionPlugin::supportsFormatCombination(
     // Support context/generation phase outputs:
     //      attention result (linear FP16) with shape [B, S, Hq, D]
     //      KV-cache tensor, same as the above.
-    auto checkQ = [this](PluginTensorDesc const& tensorDesc) {
+    // Packed-QKV input channel count: (Hq + 2*Hkv) * D for normal layers, Hq * D for
+    // shared-KV layers (Q only). No channel assertion here — Gemma4 uses heterogeneous
+    // per-layer head configurations; the exact count is validated in enqueue().
+    auto checkPackedQKV = [](PluginTensorDesc const& tensorDesc) {
         bool status{true};
         status &= tensorDesc.type == DataType::kHALF;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
         status &= tensorDesc.dims.nbDims == 3;
-        auto const tensorDim = tensorDesc.dims;
-        if (status)
-        {
-            status &= tensorDim.d[2] == mNumQHeads * mHeadSize;
-        }
-        return status;
-    };
-
-    auto checkKV = [this](PluginTensorDesc const& tensorDesc) {
-        bool status{true};
-        status &= tensorDesc.type == DataType::kHALF;
-        status &= tensorDesc.format == TensorFormat::kLINEAR;
-        status &= tensorDesc.dims.nbDims == 3;
-        auto const tensorDim = tensorDesc.dims;
-        if (status)
-        {
-            status &= tensorDim.d[2] == mNumKVHeads * mHeadSize;
-        }
         return status;
     };
 
@@ -828,7 +882,8 @@ bool AttentionPlugin::supportsFormatCombination(
         return status;
     };
 
-    int32_t const expectedNbInputs = kNUM_REQUIRED_INPUTS + (mEnableTreeAttention ? kNUM_TREE_ATTN_OPTIONAL_INPUTS : 0)
+    int32_t const expectedNbInputs = kNUM_REQUIRED_INPUTS + (mEnableQKNorm ? kNUM_QK_NORM_OPTIONAL_INPUTS : 0)
+        + (mEnableTreeAttention ? kNUM_TREE_ATTN_OPTIONAL_INPUTS : 0)
         + (mEnableVisionBlockAttention ? kNUM_VISION_BLOCK_OPTIONAL_INPUTS : 0);
     bool const checkNumIOs = nbInputs == expectedNbInputs && nbOutputs == kNUM_REQUIRED_OUTPUTS;
     if (!checkNumIOs)
@@ -846,9 +901,7 @@ bool AttentionPlugin::supportsFormatCombination(
     {
         switch (pos)
         {
-        case kIN_Q_IDX: result = checkQ(inOut[pos].desc); break;
-        case kIN_K_IDX: result = checkKV(inOut[pos].desc); break;
-        case kIN_V_IDX: result = checkKV(inOut[pos].desc); break;
+        case kIN_QKV_IDX: result = checkPackedQKV(inOut[pos].desc); break;
         case kIN_KV_CACHE_IDX: result = checkKVCache(inOut[pos].desc); break;
         case kIN_CONTEXT_LENGTH_IDX: result = checkSequenceLen(inOut[pos].desc); break;
         case kIN_ROPE_COS_SIN_IDX: result = checkPosEncodingCosSin(inOut[pos].desc); break;
@@ -857,10 +910,21 @@ bool AttentionPlugin::supportsFormatCombination(
         default: break;
         }
 
-        // Handle optional inputs (tree attention mask/pos and FP8 scales) with dynamic ordering
-        if (result && pos > kIN_KV_PAGE_TABLE_IDX)
+        // Handle optional inputs (qk_norm gammas, then tree attention mask/pos) with dynamic ordering
+        if (result && pos >= kNUM_REQUIRED_INPUTS)
         {
-            int32_t currentOptionalInputIdx = kIN_KV_PAGE_TABLE_IDX + 1;
+            int32_t currentOptionalInputIdx = kNUM_REQUIRED_INPUTS;
+            if (mEnableQKNorm)
+            {
+                if (pos == currentOptionalInputIdx || pos == currentOptionalInputIdx + 1)
+                {
+                    // Engine-weight constant: FP16 1-D vector of length head_size,
+                    // baked into the engine at build time.
+                    result = inOut[pos].desc.type == DataType::kHALF && inOut[pos].desc.format == TensorFormat::kLINEAR
+                        && inOut[pos].desc.dims.nbDims == 1 && inOut[pos].desc.dims.d[0] == mHeadSize;
+                }
+                currentOptionalInputIdx += kNUM_QK_NORM_OPTIONAL_INPUTS;
+            }
             if (mEnableTreeAttention)
             {
                 if (pos == currentOptionalInputIdx)
@@ -904,8 +968,8 @@ int32_t AttentionPlugin::configurePlugin([[maybe_unused]] DynamicPluginTensorDes
 size_t AttentionPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
     [[maybe_unused]] DynamicPluginTensorDesc const* outputs, [[maybe_unused]] int32_t nbOutputs) const noexcept
 {
-    // Guard against a stale pre-kv_page_table engine (7 inputs) deserialized against this newer
-    // .so: that path skips supportsFormatCombination() and would index inputs[7] out of bounds
+    // Guard against a stale pre-kv_page_table engine deserialized against this newer .so:
+    // that path skips supportsFormatCombination() and would index inputs out of bounds
     // below. This method is noexcept with no failure sentinel, so log and return 0 instead of
     // throwing (TRT calls it at context creation, surfacing the failure at load time).
     if (nbInputs <= kIN_KV_PAGE_TABLE_IDX)
@@ -918,8 +982,9 @@ size_t AttentionPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, 
         return 0;
     }
 
-    int64_t const maxBatchSize = inputs[kIN_Q_IDX].max.d[0];
-    int64_t const maxSeqLen = inputs[kIN_Q_IDX].max.d[1];
+    // Packed QKV: max batch/seq derived from packed input's first two dims (same as Q).
+    int64_t const maxBatchSize = inputs[kIN_QKV_IDX].max.d[0];
+    int64_t const maxSeqLen = inputs[kIN_QKV_IDX].max.d[1];
     // KV binding is the paged pool [2, numPages, 128, Hkv, D]; the per-slot padded capacity is the
     // page-table width times the page size (kv_page_table is [batch, 2, maxPagesPerSeq]).
     int64_t const maxKVCacheCapacity = inputs[kIN_KV_PAGE_TABLE_IDX].max.d[2] * rt::kTOKENS_PER_PAGE;
@@ -968,40 +1033,54 @@ int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensor
     }
 }
 
+//! Resolve one qk_norm gamma engine-weight input to a device pointer (nullptr when absent
+//! or zero-length => RoPE-only path). Not noexcept: throws are caught by enqueue().
+half const* AttentionPlugin::resolveNormGammaInput(
+    PluginTensorDesc const* inputDesc, void const* const* inputs, int32_t inputIdx) const
+{
+    if (inputDesc[inputIdx].dims.d[0] <= 0)
+    {
+        return nullptr;
+    }
+    check::check(inputDesc[inputIdx].dims.d[0] == mHeadSize, "qk_norm gamma length must equal head_size.");
+    return static_cast<half const*>(inputs[inputIdx]);
+}
+
 int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
     [[maybe_unused]] PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs,
     void* workspace, cudaStream_t stream)
 {
-    // Construct non-owned tensor objects from I/O data pointers and shapes.
-    // Q input in the graph will be in shape [B, S, Hq x D], for convenience,
-    // we will use shape of [B, S, Hq, D] to represent the tensor.
-    // K and V inputs are in shape [B, S, Hkv x D], represented as [B, S, Hkv, D].
-    PluginTensorDesc const& qInputDesc = inputDesc[kIN_Q_IDX];
-    PluginTensorDesc const& kInputDesc = inputDesc[kIN_K_IDX];
-    PluginTensorDesc const& vInputDesc = inputDesc[kIN_V_IDX];
-    int32_t const runtimeBatchSize = static_cast<int32_t>(qInputDesc.dims.d[0]);
-    int32_t const runtimeSeqLen = static_cast<int32_t>(qInputDesc.dims.d[1]);
-    int32_t const kvSeqLen = static_cast<int32_t>(kInputDesc.dims.d[1]);
-    bool const sharedKV = (kvSeqLen == 0);
+    // Packed QKV input, layout selected by the enable_kv_shared field:
+    //   0: [B, S, (Hq+2*Hkv)*D] — Q+K+V; K/V are written to the KV cache.
+    //   1: [B, S, Hq*D] — Q only; K/V come from a donated cache and are not written.
+    PluginTensorDesc const& packedQKVInputDesc = inputDesc[kIN_QKV_IDX];
+    int32_t const runtimeBatchSize = static_cast<int32_t>(packedQKVInputDesc.dims.d[0]);
+    int32_t const runtimeSeqLen = static_cast<int32_t>(packedQKVInputDesc.dims.d[1]);
+    int32_t const actualChannels = static_cast<int32_t>(packedQKVInputDesc.dims.d[2]);
+    bool const sharedKV = (mEnableKVShared != 0);
+    int32_t const expectedChannels = (sharedKV ? mNumQHeads : (mNumQHeads + 2 * mNumKVHeads)) * mHeadSize;
+    check::check(actualChannels == expectedChannels,
+        "Packed QKV input last dim does not match enable_kv_shared: expected (Hq + 2*Hkv)*head_dim "
+        "(enable_kv_shared=0) or Hq*head_dim (enable_kv_shared=1).");
+    int32_t const combinedHeads = sharedKV ? mNumQHeads : (mNumQHeads + 2 * mNumKVHeads);
 
-    check::check(kInputDesc.dims.d[0] == runtimeBatchSize && vInputDesc.dims.d[0] == runtimeBatchSize,
-        "Batch size must be consistent across Q/K/V inputs.");
-    check::check(kInputDesc.dims.d[1] == vInputDesc.dims.d[1], "K and V sequence lengths must be consistent.");
-    if (!sharedKV)
-    {
-        check::check(
-            kvSeqLen == runtimeSeqLen, "K/V sequence length must equal Q sequence length when not in shared-KV mode.");
-    }
-    check::check(qInputDesc.dims.d[2] == mNumQHeads * mHeadSize, "Q input shape shall be consistent.");
-    check::check(kInputDesc.dims.d[2] == mNumKVHeads * mHeadSize, "K input shape shall be consistent.");
-    check::check(vInputDesc.dims.d[2] == mNumKVHeads * mHeadSize, "V input shape shall be consistent.");
+    rt::Tensor packedQKVTensor(const_cast<void*>(inputs[kIN_QKV_IDX]),
+        rt::Coords{runtimeBatchSize, runtimeSeqLen, combinedHeads, mHeadSize}, rt::DeviceType::kGPU,
+        packedQKVInputDesc.type);
 
-    rt::Tensor qInputTensor(const_cast<void*>(inputs[kIN_Q_IDX]),
-        rt::Coords{runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, rt::DeviceType::kGPU, qInputDesc.type);
-    rt::Tensor kInputTensor(const_cast<void*>(inputs[kIN_K_IDX]),
-        rt::Coords{runtimeBatchSize, kvSeqLen, mNumKVHeads, mHeadSize}, rt::DeviceType::kGPU, kInputDesc.type);
-    rt::Tensor vInputTensor(const_cast<void*>(inputs[kIN_V_IDX]),
-        rt::Coords{runtimeBatchSize, kvSeqLen, mNumKVHeads, mHeadSize}, rt::DeviceType::kGPU, vInputDesc.type);
+    // qInputTensor / kInputTensor / vInputTensor are assigned from workspace below and
+    // populated by launchApplyRopeFromPackedToSplit.
+    rt::Tensor qInputTensor;
+    rt::Tensor kInputTensor;
+    rt::Tensor vInputTensor;
+
+    // Shared-KV helper: the packed input is already [B, S, Hq, D] (Q only) — alias it as
+    // qInputTensor so the Q-only RoPE kernels run in-place.
+    auto aliasPackedAsQInput = [&]() {
+        return rt::Tensor(const_cast<void*>(inputs[kIN_QKV_IDX]),
+            rt::Coords{runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, rt::DeviceType::kGPU,
+            packedQKVInputDesc.type);
+    };
 
     PluginTensorDesc const& contextLengthInputDesc = inputDesc[kIN_CONTEXT_LENGTH_IDX];
     rt::Tensor const contextLengthTensor(const_cast<void*>(inputs[kIN_CONTEXT_LENGTH_IDX]),
@@ -1081,18 +1160,23 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
     rt::Tensor visionBlockIdsTensor{};
     if (mEnableTreeAttention)
     {
-        PluginTensorDesc const& attentionMaskInputDesc = inputDesc[kIN_OPTIONAL_ATTN_MASK_IDX];
-        PluginTensorDesc const& attentionPosIdInputDesc = inputDesc[kIN_OPTIONAL_ATTN_POS_ID_IDX];
-        attentionMaskTensor = rt::Tensor(const_cast<void*>(inputs[kIN_OPTIONAL_ATTN_MASK_IDX]),
-            rt::Coords{attentionMaskInputDesc.dims}, rt::DeviceType::kGPU, attentionMaskInputDesc.type);
-        attentionPosIdTensor = rt::Tensor(const_cast<void*>(inputs[kIN_OPTIONAL_ATTN_POS_ID_IDX]),
-            rt::Coords{attentionPosIdInputDesc.dims}, rt::DeviceType::kGPU, attentionPosIdInputDesc.type);
+        int32_t const maskIdx = attnMaskInputIdx(mEnableQKNorm != 0);
+        int32_t const posIdIdx = attnPosIdInputIdx(mEnableQKNorm != 0);
+        PluginTensorDesc const& attentionMaskInputDesc = inputDesc[maskIdx];
+        PluginTensorDesc const& attentionPosIdInputDesc = inputDesc[posIdIdx];
+        attentionMaskTensor = rt::Tensor(const_cast<void*>(inputs[maskIdx]), rt::Coords{attentionMaskInputDesc.dims},
+            rt::DeviceType::kGPU, attentionMaskInputDesc.type);
+        attentionPosIdTensor = rt::Tensor(const_cast<void*>(inputs[posIdIdx]), rt::Coords{attentionPosIdInputDesc.dims},
+            rt::DeviceType::kGPU, attentionPosIdInputDesc.type);
     }
     else if (mEnableVisionBlockAttention)
     {
-        PluginTensorDesc const& visionBlockIdsDesc = inputDesc[kIN_OPTIONAL_ATTN_MASK_IDX];
-        visionBlockIdsTensor = rt::Tensor(const_cast<void*>(inputs[kIN_OPTIONAL_ATTN_MASK_IDX]),
-            rt::Coords{visionBlockIdsDesc.dims}, rt::DeviceType::kGPU, visionBlockIdsDesc.type);
+        // The vision-block-ID tensor rides the attention_mask slot; its position
+        // depends on whether the qk_norm gamma inputs precede it.
+        int32_t const maskIdx = attnMaskInputIdx(mEnableQKNorm != 0);
+        PluginTensorDesc const& visionBlockIdsDesc = inputDesc[maskIdx];
+        visionBlockIdsTensor = rt::Tensor(const_cast<void*>(inputs[maskIdx]), rt::Coords{visionBlockIdsDesc.dims},
+            rt::DeviceType::kGPU, visionBlockIdsDesc.type);
     }
     bool const useExplicitPositionIds = mEnableTreeAttention && !attentionPosIdTensor.isEmpty()
         && attentionPosIdTensor.getShape().getNumDims() == 2 && attentionPosIdTensor.getShape()[1] == runtimeSeqLen;
@@ -1101,14 +1185,15 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
     float const vScale = mQkvScales[2];
 
     // Determine the attention execution mode based on the input tensors.
+    // deduceMode* only reads seq_len (.getShape()[1]), which equals Q's seq_len.
     AttentionExecutionMode executionMode{};
     if (!mEnableTreeAttention)
     {
-        executionMode = deduceModeVanilla(qInputTensor, kvCacheStartIdxTensor);
+        executionMode = deduceModeVanilla(packedQKVTensor, kvCacheStartIdxTensor);
     }
     else
     {
-        executionMode = deduceModeTreeAttention(qInputTensor, kvCacheStartIdxTensor, attentionPosIdTensor);
+        executionMode = deduceModeTreeAttention(packedQKVTensor, kvCacheStartIdxTensor, attentionPosIdTensor);
     }
 
     // For invalid execution mode, log error and report error return value.
@@ -1125,6 +1210,14 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
         LOG_ERROR("Workspace pointer is not aligned to device alignment granularity");
         return 1;
     }
+
+    // Gamma engine-weight inputs are device-resident at engine load. Models without
+    // qk_norm do not wire them ⇒ nullptr ⇒ the kernel takes the RoPE-only path.
+    half const* qNormGammaDevicePtr
+        = mEnableQKNorm ? resolveNormGammaInput(inputDesc, inputs, qNormGammaInputIdx()) : nullptr;
+    half const* kNormGammaDevicePtr
+        = mEnableQKNorm ? resolveNormGammaInput(inputDesc, inputs, kNormGammaInputIdx()) : nullptr;
+    float const rmsNormEpsVal = mRmsNormEps;
 
     // ==================== Prefill path ====================
     // Dispatch order: vision-block attention first (FFPA d512 overlay or FMHA
@@ -1173,12 +1266,14 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                 return 1;
             }
 
-            // Keep K input unmodified: Gemma4 full-attention layers may alias
-            // V=K before RoPE. The cache receives roped K and the original V,
-            // and both vision prefill paths read K/V from that canonical
-            // cache layout.
-            kernel::launchApplyRopeWriteKV(ropeCosSinTensor, std::nullopt, qInputTensor, kInputTensor, vInputTensor,
-                kvCacheWriteView, kScale, vScale, stream, false, pageTable, maxPagesPerSeq);
+            // Unpack packed QKV: roped Q to qScratch, roped K + V to the paged pool.
+            // Both vision prefill paths read K/V back from the pool.
+            qInputTensor = assignTensorFromWorkspace(
+                alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
+            kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor, rt::OptionalInputTensor{},
+                rt::OptionalInputTensor{}, packedQKVTensor, qInputTensor, kvCacheWriteView, kScale, vScale, stream,
+                pageTable, maxPagesPerSeq, nullptr /* kScratchOut */, nullptr /* vScratchOut */, nullptr /* fp8QOut */,
+                1.0f /* qScale */, qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal);
 
 #ifdef CUTE_DSL_FFPA_ENABLED
             if (canUseFFPAOverlayForVisionPrefill())
@@ -1331,6 +1426,8 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
 
         if (sharedKV)
         {
+            // Shared-KV: RoPE Q in-place only; the donor layer's cache is already populated.
+            qInputTensor = aliasPackedAsQInput();
             if (useExplicitPositionIds)
             {
                 kernel::launchApplyRopeQOnlyTreeDecoding(ropeCosSinTensor, attentionPosIdTensor, qInputTensor, stream);
@@ -1447,10 +1544,6 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
         // head size.
         if (!mCanImplementFMHA)
         {
-            // headSize=512 prefill: apply RoPE, write K/V to cache, then use FFPA.
-            kernel::launchApplyRopeWriteKV(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor, kInputTensor,
-                vInputTensor, kvCacheWriteView, kScale, vScale, stream, true, pageTable, maxPagesPerSeq);
-
 #ifdef CUTE_DSL_FFPA_ENABLED
             if (!mCanImplementFFPA)
             {
@@ -1458,6 +1551,19 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                     mHeadSize == 512 ? ", FFPA module failed to load" : "; FFPA serves headSize=512 only");
                 return -1;
             }
+
+            // Packed RoPE: Q to qScratch, K/V to cache, plus roped K + raw V to
+            // kScratch/vScratch so FFPA can read them in the normal-prefill case.
+            qInputTensor = assignTensorFromWorkspace(
+                alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
+            kInputTensor = assignTensorFromWorkspace(
+                alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumKVHeads, mHeadSize}, DataType::kHALF);
+            vInputTensor = assignTensorFromWorkspace(
+                alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumKVHeads, mHeadSize}, DataType::kHALF);
+            kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor, rt::OptionalInputTensor{kvCacheEndIdxsTensor},
+                rt::OptionalInputTensor{}, packedQKVTensor, qInputTensor, kvCacheWriteView, kScale, vScale, stream,
+                pageTable, maxPagesPerSeq, kInputTensor.rawPointer(), vInputTensor.rawPointer(), nullptr /* fp8QOut */,
+                1.0f /* qScale */, qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal);
 
             // Use FFPA d512 causal kernel with native GQA support (no K/V expansion needed).
             LOG_DEBUG(
@@ -1482,9 +1588,10 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
             }
             else
             {
-                // Normal prefill: K/V inputs are the current (right-padded) sequences, so
-                // per-batch Q and KV logical lengths coincide (offset 0) — pass cuQSeqLens
-                // for both and ragged padding rows/keys are masked (bug 6384817).
+                // Normal prefill: the K/V scratch buffers hold the current (right-padded)
+                // roped K and raw V, so per-batch Q and KV logical lengths coincide
+                // (offset 0) — pass cuQSeqLens for both and ragged padding rows/keys are
+                // masked (bug 6384817).
                 dispatchFFPAKernel(qInputTensor.dataPointer<half>(), kInputTensor.dataPointer<half>(),
                     vInputTensor.dataPointer<half>(), attentionOutputTensor.dataPointer<half>(),
                     cuQSeqLensTensor.dataPointer<int32_t>(), cuQSeqLensTensor.dataPointer<int32_t>(), runtimeBatchSize,
@@ -1508,7 +1615,8 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                     return 1;
                 }
 
-                // CuTe DSL FMHA uses SplitQKV RoPE variant that writes K/V to interleaved cache.
+                // CuTe DSL FMHA: single packed kernel splits QKV, applies RoPE (+ optional
+                // fused qk_norm RMSNorm), and writes K/V to the paged pool.
                 float const qScale = mQkvScales[0];
                 // windowSizeLeft excludes the query itself; sliding_window_size counts it
                 // (last W keys, the XQA/HF convention), so pass W - 1.
@@ -1517,16 +1625,23 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                 CuteDslFMHARunner runner(
                     mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen, kvCacheCapacity);
 
+                // qScratch: roped Q [B, S, Hq, D], always allocated. On the FP8 path the
+                // kernel writes the quantized Q to fp8QTensor instead and qScratch is unused.
+                qInputTensor = assignTensorFromWorkspace(
+                    alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
                 if (mEnableFp8KVCache)
                 {
-                    // FP8 Q workspace: RoPE kernel quantizes roped Q to FP8 using calibrated qScale.
+                    // FP8 Q workspace: packed RoPE kernel quantizes roped Q to FP8 using calibrated qScale.
                     rt::Tensor fp8QTensor = assignTensorFromWorkspace(
                         alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, DataType::kFP8);
 
-                    // Single kernel: RoPE Q → FP8 output, RoPE K + write FP8 K/V to the paged pool.
-                    kernel::launchApplyRopeWriteKVSplitQKV(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor,
-                        kInputTensor, vInputTensor, kvCacheWriteView, kScale, vScale, stream, pageTable, maxPagesPerSeq,
-                        fp8QTensor.rawPointer(), qScale);
+                    // Packed kernel: RoPE Q to FP8 (fp8QTensor), RoPE K + write FP8 K/V to the
+                    // paged pool. The CuTe DSL runner reads K/V from the pool only.
+                    kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor,
+                        rt::OptionalInputTensor{kvCacheEndIdxsTensor}, rt::OptionalInputTensor{}, packedQKVTensor,
+                        qInputTensor, kvCacheWriteView, kScale, vScale, stream, pageTable, maxPagesPerSeq,
+                        nullptr /* kScratch */, nullptr /* vScratch */, fp8QTensor.rawPointer(), qScale,
+                        qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal);
 
                     runner.runPaged(fp8QTensor.rawPointer(),       // Q  [b, s_q, h_q, d] FP8
                         kvCacheTensor.rawPointer(),                // paged KV pool [2, numPages, 128, h_k, d] FP8
@@ -1538,10 +1653,13 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                 }
                 else
                 {
-                    // FP16 path: RoPE Q in-place, write FP16 K/V to the paged pool.
-                    kernel::launchApplyRopeWriteKVSplitQKV(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor,
-                        kInputTensor, vInputTensor, kvCacheWriteView, kScale, vScale, stream, pageTable, maxPagesPerSeq,
-                        /*fp8QOut=*/nullptr, /*qScale=*/1.0f);
+                    // FP16 path: RoPE Q to qScratch, write FP16 K/V to the paged pool.
+                    // The CuTe DSL runner reads K/V from the pool only.
+                    kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor,
+                        rt::OptionalInputTensor{kvCacheEndIdxsTensor}, rt::OptionalInputTensor{}, packedQKVTensor,
+                        qInputTensor, kvCacheWriteView, kScale, vScale, stream, pageTable, maxPagesPerSeq,
+                        nullptr /* kScratch */, nullptr /* vScratch */, nullptr /* fp8QOut */, 1.0f /* qScale */,
+                        qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal);
 
                     runner.runPaged(qInputTensor.dataPointer<half>(), // Q  [b, s_q, h_q, d]
                         kvCacheTensor.rawPointer(),                   // paged KV pool [2, numPages, 128, h_k, d]
@@ -1566,11 +1684,18 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                 }
                 params.cu_q_seqlens = cuQSeqLensTensor.dataPointer<int32_t>();
 
+                // Allocate qScratch (roped Q output). FMHA_v2 always reads Q from qScratch.
+                qInputTensor = assignTensorFromWorkspace(
+                    alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
                 if (executionMode == AttentionExecutionMode::kCHUNKED_PREFILL)
                 {
-                    // Chunked: RoPE + write to the paged pool, then assemble split K/V for FMHA_v2.
-                    kernel::launchApplyRopeWriteKV(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor, kInputTensor,
-                        vInputTensor, kvCacheWriteView, kScale, vScale, stream, false, pageTable, maxPagesPerSeq);
+                    // Chunked: packed RoPE + write to the paged pool, then assemble split K/V for
+                    // FMHA_v2 input. No separate kScratch/vScratch outputs needed.
+                    kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor,
+                        rt::OptionalInputTensor{kvCacheEndIdxsTensor}, rt::OptionalInputTensor{}, packedQKVTensor,
+                        qInputTensor, kvCacheWriteView, kScale, vScale, stream, pageTable, maxPagesPerSeq,
+                        nullptr /* kScratch */, nullptr /* vScratch */, nullptr /* fp8QOut */, 1.0f /* qScale */,
+                        qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal);
 
                     // Chunked prefill: full gather (seqLen = 0) — cu_kv_seqlens spans the whole
                     // cache context, so s_kv (and the split K/V batch stride) is the capacity.
@@ -1586,9 +1711,19 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                     params.o_ptr = attentionOutputTensor.dataPointer<half>();
                 }
                 else
-                { // SEPARATE_Q_K_V
-                    kernel::launchApplyRopeWriteKV(ropeCosSinTensor, std::nullopt, qInputTensor, kInputTensor,
-                        vInputTensor, kvCacheWriteView, kScale, vScale, stream, true, pageTable, maxPagesPerSeq);
+                { // SEPARATE_Q_K_V (NORMAL_PREFILL)
+                    // FMHA_v2 SEPARATE_Q_K_V reads K/V from scratch tensors — allocate + pass
+                    // non-null outputs to the packed RoPE kernel.
+                    kInputTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
+                        {runtimeBatchSize, runtimeSeqLen, mNumKVHeads, mHeadSize}, DataType::kHALF);
+                    vInputTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
+                        {runtimeBatchSize, runtimeSeqLen, mNumKVHeads, mHeadSize}, DataType::kHALF);
+                    // NORMAL_PREFILL: no prior cache -> pass nullopt for kvCacheEndLens (kernel starts at pos 0).
+                    kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor, rt::OptionalInputTensor{},
+                        rt::OptionalInputTensor{}, packedQKVTensor, qInputTensor, kvCacheWriteView, kScale, vScale,
+                        stream, pageTable, maxPagesPerSeq, kInputTensor.rawPointer(), vInputTensor.rawPointer(),
+                        nullptr /* fp8QOut */, 1.0f /* qScale */, qNormGammaDevicePtr, kNormGammaDevicePtr,
+                        rmsNormEpsVal);
 
                     params.s_kv = runtimeSeqLen;
                     params.q_ptr = qInputTensor.dataPointer<half>();
@@ -1605,41 +1740,45 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
     }
     else
     {
-        // Apply RoPE and (optionally) write K/V to cache.
-        // Shared KV: RoPE Q only, skip KV write (donor's cache is already populated).
-        // Non-shared: RoPE Q+K, write K/V to cache.
-        if (executionMode == AttentionExecutionMode::kTREE_DECODING)
+        // RoPE setup: sharedKV → Q only; own-KV → packed kernel (Q to qScratch + KV cache
+        // write). Decode reads K/V from the KV cache via XQA — no scratch K/V needed.
+        if (sharedKV)
         {
-            if (sharedKV)
+            // Shared-KV: packed input is [B,S,Hq,D] (Q only) — alias as qInputTensor
+            // and RoPE in-place.
+            qInputTensor = aliasPackedAsQInput();
+            if (executionMode == AttentionExecutionMode::kTREE_DECODING || useExplicitPositionIds)
             {
                 kernel::launchApplyRopeQOnlyTreeDecoding(ropeCosSinTensor, attentionPosIdTensor, qInputTensor, stream);
             }
             else
             {
-                kernel::launchApplyRopeWriteKVTreeDecoding(ropeCosSinTensor, contextLengthTensor, attentionPosIdTensor,
-                    qInputTensor, kInputTensor, vInputTensor, kvCacheWriteView, kScale, vScale, stream, pageTable,
-                    maxPagesPerSeq);
+                kernel::launchApplyRopeQOnly(ropeCosSinTensor, contextLengthTensor, qInputTensor, stream);
             }
+            // The Q-only path has no fused-norm kernel; enable_qk_norm + enable_kv_shared is
+            // rejected at plugin construction.
+        }
+        else if (executionMode == AttentionExecutionMode::kTREE_DECODING)
+        {
+            // Tree decoding: pass tokenPosIds for per-token RoPE positions.
+            // Allocate qScratch (roped Q output written by launchApplyRopeFromPackedToSplit).
+            qInputTensor = assignTensorFromWorkspace(
+                alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
+            kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor, rt::OptionalInputTensor{contextLengthTensor},
+                rt::OptionalInputTensor{attentionPosIdTensor}, packedQKVTensor, qInputTensor, kvCacheWriteView, kScale,
+                vScale, stream, pageTable, maxPagesPerSeq, nullptr /* kScratch */, nullptr /* vScratch */,
+                nullptr /* fp8QOut */, 1.0f /* qScale */, qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal);
         }
         else
         {
-            if (sharedKV)
-            {
-                if (useExplicitPositionIds)
-                {
-                    kernel::launchApplyRopeQOnlyTreeDecoding(
-                        ropeCosSinTensor, attentionPosIdTensor, qInputTensor, stream);
-                }
-                else
-                {
-                    kernel::launchApplyRopeQOnly(ropeCosSinTensor, contextLengthTensor, qInputTensor, stream);
-                }
-            }
-            else
-            {
-                kernel::launchApplyRopeWriteKV(ropeCosSinTensor, contextLengthTensor, qInputTensor, kInputTensor,
-                    vInputTensor, kvCacheWriteView, kScale, vScale, stream, false, pageTable, maxPagesPerSeq);
-            }
+            // Vanilla decoding: derive RoPE position from contextLengthTensor (kvCacheEndLens).
+            // Allocate qScratch (roped Q output written by launchApplyRopeFromPackedToSplit).
+            qInputTensor = assignTensorFromWorkspace(
+                alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
+            kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor, rt::OptionalInputTensor{contextLengthTensor},
+                rt::OptionalInputTensor{}, packedQKVTensor, qInputTensor, kvCacheWriteView, kScale, vScale, stream,
+                pageTable, maxPagesPerSeq, nullptr /* kScratch */, nullptr /* vScratch */, nullptr /* fp8QOut */,
+                1.0f /* qScale */, qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal);
         }
 
         // Vision-block decode goes to XQA (a hard construction-time
@@ -1706,12 +1845,17 @@ PluginFieldCollection const* AttentionPlugin::getFieldsToSerialize() noexcept
     mDataToSerialize.emplace_back("head_size", &mHeadSize, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("attention_scale", &mAttentionScale, PluginFieldType::kFLOAT32, 1);
     mDataToSerialize.emplace_back("enable_tree_attention", &mEnableTreeAttention, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back("enable_qk_norm", &mEnableQKNorm, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back("enable_kv_shared", &mEnableKVShared, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("enable_fp8_kv_cache", &mEnableFp8KVCache, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back(
         "enable_vision_block_attention", &mEnableVisionBlockAttention, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("sliding_window_size", &mSlidingWindowSize, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back(
         "qkv_scales", mQkvScales.data(), PluginFieldType::kFLOAT32, static_cast<int32_t>(mQkvScales.size()));
+    // Serialize the RMSNorm eps for the fused qk_norm path. The gamma WEIGHTS live as
+    // engine-weight constant inputs (baked at build time), not plugin fields.
+    mDataToSerialize.emplace_back("rms_norm_eps", &mRmsNormEps, PluginFieldType::kFLOAT32, 1);
     mFCToSerialize.nbFields = static_cast<int32_t>(mDataToSerialize.size());
     mFCToSerialize.fields = mDataToSerialize.data();
     return &mFCToSerialize;
@@ -1733,12 +1877,19 @@ AttentionPluginCreator::AttentionPluginCreator()
     mPluginAttributes.emplace_back(PluginField("attention_scale", nullptr, PluginFieldType::kFLOAT32, 0));
     // Make enable_fp8_kv_cache optional with default value 0 (disable by default)
     mPluginAttributes.emplace_back(PluginField("enable_tree_attention", nullptr, PluginFieldType::kINT32, 0));
+    // Optional (default 0). Adds the gamma engine-weight inputs and fuses per-head RMSNorm.
+    mPluginAttributes.emplace_back(PluginField("enable_qk_norm", nullptr, PluginFieldType::kINT32, 0));
+    // Optional (default 0). Shared-KV layer: packed input is Q only; no KV-cache write.
+    mPluginAttributes.emplace_back(PluginField("enable_kv_shared", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("enable_fp8_kv_cache", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("enable_vision_block_attention", nullptr, PluginFieldType::kINT32, 0));
     // Sliding window size (-1 = no sliding window, >0 = window size)
     mPluginAttributes.emplace_back(PluginField("sliding_window_size", nullptr, PluginFieldType::kINT32, 0));
     // Optional QKV dequant scales [q, k, v] for FP8 attention
     mPluginAttributes.emplace_back(PluginField("qkv_scales", nullptr, PluginFieldType::kFLOAT32, 0));
+    // Optional per-head RMSNorm gamma weights (length == head_size) and eps. Empty / missing ->
+    // qk_norm disabled. When supplied, the plugin fuses RMSNorm into the RoPE+KVWrite kernel.
+    mPluginAttributes.emplace_back(PluginField("rms_norm_eps", nullptr, PluginFieldType::kFLOAT32, 1));
     // Enforce Core parameters are specified.
     mFieldCollection.nbFields = mPluginAttributes.size();
     mFieldCollection.fields = mPluginAttributes.data();

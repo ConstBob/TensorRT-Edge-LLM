@@ -48,22 +48,16 @@ _attention_plugin_schema = OpSchema(
     name="AttentionPlugin",
     domain="trt_edgellm",
     since_version=_SCHEMA_SINCE_VERSION,
-    doc=
-    "Custom TensorRT attention plugin with RoPE, KV cache, and attention computation.",
+    doc="Custom TensorRT attention plugin (packed-QKV contract) with RoPE, "
+    "KV cache, and attention computation.  Q/K/V are concatenated on the "
+    "last dim by the dynamo translation; the plugin internally splits the "
+    "packed tensor and fuses RoPE + KV-cache write in a single kernel.",
     inputs=[
         OpSchema.FormalParameter(
-            name="q",
-            description="Query tensor",
-            type_str="T",
-        ),
-        OpSchema.FormalParameter(
-            name="k",
-            description="Key tensor",
-            type_str="T",
-        ),
-        OpSchema.FormalParameter(
-            name="v",
-            description="Value tensor",
+            name="qkv",
+            description=
+            "Packed QKV tensor [B, S, (H_q + 2*H_kv) * D] (concat on last "
+            "dim of separate Q/K/V projections)",
             type_str="T",
         ),
         OpSchema.FormalParameter(
@@ -94,6 +88,24 @@ _attention_plugin_schema = OpSchema(
             type_str="tensor(int32)",
         ),
         OpSchema.FormalParameter(
+            name="q_norm_gamma",
+            description=
+            "Per-head RMSNorm gamma weights for Q (FP16, 1-D, length == head_size). Fed as a "
+            "Constant initializer so TRT bakes it into the engine as weights at build time. "
+            "Optional: only wired when enable_qk_norm=1 (models without qk_norm, e.g. Qwen2.5, "
+            "omit this input entirely).",
+            type_str="T",
+            param_option=OpSchema.FormalParameterOption.Optional,
+        ),
+        OpSchema.FormalParameter(
+            name="k_norm_gamma",
+            description=
+            "Per-head RMSNorm gamma weights for K (FP16, 1-D, length == head_size). Same "
+            "conventions as q_norm_gamma.",
+            type_str="T",
+            param_option=OpSchema.FormalParameterOption.Optional,
+        ),
+        OpSchema.FormalParameter(
             name="attention_mask",
             description="Attention mask tensor (optional)",
             type_str="tensor(int32)",
@@ -122,7 +134,7 @@ _attention_plugin_schema = OpSchema(
         (
             "T",
             ["tensor(float16)"],
-            "Input Q/K/V data type.",
+            "Input packed QKV data type.",
         ),
         (
             "T_KV",
@@ -189,6 +201,29 @@ _attention_plugin_schema = OpSchema(
             name="attention_scale",
             type=OpSchema.AttrType.FLOAT,
             description="Absolute multiplier applied to QK^T before softmax.",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="enable_qk_norm",
+            type=OpSchema.AttrType.INT,
+            description=
+            "Whether the fused per-head q_norm / k_norm RMSNorm is enabled (0(false), 1(true)). "
+            "When 1, the q_norm_gamma / k_norm_gamma optional inputs must be wired.",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="rms_norm_eps",
+            type=OpSchema.AttrType.FLOAT,
+            description=
+            "Epsilon for the q_norm / k_norm RMSNorm formula. Ignored when enable_qk_norm=0.",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="enable_kv_shared",
+            type=OpSchema.AttrType.INT,
+            description=
+            "Whether this layer reads K/V from a donated (shared) cache; the packed qkv "
+            "input then carries Q only [B, S, Hq*D] (0(false), 1(true)).",
             required=False,
         ),
     ],

@@ -32,6 +32,12 @@ tests:
   - tests/python-unittests/test_attention_plugin.py::test_tree_attention
   - tests/python-unittests/test_attention_plugin.py::test_tree_attention_topology
   - tests/python-unittests/test_attention_plugin.py::test_prefill_decode_handoff
+  - tests/python-unittests/test_attention_plugin.py::test_prefill_qknorm
+  - tests/python-unittests/test_attention_plugin.py::test_decode_qknorm
+  - tests/python-unittests/test_attention_plugin.py::test_tree_attention_qknorm
+  - tests/python-unittests/test_attention_plugin.py::test_decode_qknorm_odd_tokens
+  - tests/python-unittests/test_attention_plugin.py::test_prefill_qknorm_odd_tokens
+  - tests/python-unittests/test_attention_plugin.py::test_decode_qknorm_fp8kv
 
   # Sliding-window attention tests
   - tests/python-unittests/test_sliding_window_attention_plugin.py::test_sliding_window_prefill

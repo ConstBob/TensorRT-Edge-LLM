@@ -39,6 +39,7 @@ LayerNorm        -> model.layers.N.input_layernorm.*, post_attention_layernorm.*
 """
 
 import itertools
+import logging
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -47,8 +48,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ...config import ModelConfig
-from ..linear import FP16Linear, TPMode, make_linear
+from ..linear import (FP16Linear, NVFP4LinearMethod, ReplicatedLinear, TPMode,
+                      is_nvfp4_linear, make_linear)
 from ..ops import KV_PAGE_SIZE, attention_plugin
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "OnnxSpec",
@@ -262,6 +266,39 @@ class Attention(nn.Module):
             self.q_norm = None
             self.k_norm = None
 
+        # Cache RMSNorm eps as a plain float so the attention_plugin custom-op gets a stable
+        # default-free kwarg in the FX graph (torch.export strips default-matching kwargs).
+        self._rms_norm_eps = float(
+            config.rms_norm_eps) if config.has_qk_norm else 1e-6
+
+        # Per-head q/k_norm gamma weights as plain list[float] (NOT tensors): the
+        # attention_plugin custom-op needs literal List[float] kwargs at trace time.
+        self._q_norm_gamma_list: list = []
+        self._k_norm_gamma_list: list = []
+        if config.has_qk_norm:
+            # Capture again whenever weights change (e.g. after `load_state_dict`).
+            self.register_load_state_dict_post_hook(
+                lambda *_args, **_kwargs: self._capture_qk_norm_gamma_lists())
+
+    def _capture_qk_norm_gamma_lists(self) -> None:
+        """Extract gamma weights from `self.q_norm` / `self.k_norm` into plain Python lists.
+
+        Called from the post-state-dict-load hook so the lists reflect real checkpoint values
+        (not the random `__init__` values). Idempotent — safe to call multiple times.
+
+        Uses ``getattr`` defaults: subclasses may delete the norm submodules
+        (e.g. Gemma4Attention removes ``k_norm`` on KV-shared layers) while
+        still inheriting this method.
+        """
+        q_norm = getattr(self, "q_norm", None)
+        k_norm = getattr(self, "k_norm", None)
+        if q_norm is not None:
+            self._q_norm_gamma_list = q_norm.weight.detach().to(
+                torch.float32).cpu().flatten().tolist()
+        if k_norm is not None:
+            self._k_norm_gamma_list = k_norm.weight.detach().to(
+                torch.float32).cpu().flatten().tolist()
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -275,22 +312,20 @@ class Attention(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = hidden_states.shape
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        # Packed QKV: prefer the single fused GEMM installed by
+        # `fuse_qkv_projections`; fall back to three projections + concat.
+        if hasattr(self, "qkv_proj_fused"):
+            qkv = self.qkv_proj_fused(hidden_states)
+        else:
+            qkv = torch.cat([
+                self.q_proj(hidden_states),
+                self.k_proj(hidden_states),
+                self.v_proj(hidden_states),
+            ],
+                            dim=-1)
 
-        if self.q_norm is not None:
-            query_states = self.q_norm(
-                query_states.reshape(batch_size, seq_len, self.num_heads,
-                                     self.head_dim)).reshape(
-                                         batch_size, seq_len,
-                                         self.num_heads * self.head_dim)
-        if self.k_norm is not None:
-            key_states = self.k_norm(
-                key_states.reshape(batch_size, seq_len, self.num_kv_heads,
-                                   self.head_dim)).reshape(
-                                       batch_size, seq_len,
-                                       self.num_kv_heads * self.head_dim)
+        # qk_norm is fused inside the AttentionPlugin — do NOT apply q_norm / k_norm here.
+        # The modules stay registered only so checkpoint loading finds their weights.
 
         enable_tree = attention_mask is not None and attention_pos_id is not None
         kwargs: dict = {
@@ -310,11 +345,16 @@ class Attention(nn.Module):
         # value in the FX graph for the unified ONNX translation.
         kwargs["qkv_scales"] = getattr(self, "_qkv_scales_float",
                                        [1.0, 1.0, 1.0])
+        # Gamma kwargs are passed only when the model uses qk_norm; otherwise the ONNX
+        # node carries no enable_qk_norm attribute.
+        if self._q_norm_gamma_list or self._k_norm_gamma_list:
+            kwargs["q_norm_gamma"] = self._q_norm_gamma_list
+            kwargs["k_norm_gamma"] = self._k_norm_gamma_list
+            kwargs["rms_norm_eps"] = float(self._rms_norm_eps)
+            kwargs["enable_qk_norm"] = 1
 
         attn_output, present_key_value = attention_plugin(
-            query_states,
-            key_states,
-            value_states,
+            qkv,
             past_key_value,
             context_lengths,
             rope_rotary_cos_sin,
@@ -327,6 +367,158 @@ class Attention(nn.Module):
                                           self.num_heads * self.head_dim)
 
         return self.o_proj(attn_output), present_key_value
+
+
+# ---------------------------------------------------------------------------
+# Post-load optimisation: fuse attention Q/K/V projections into one GEMM
+# (mirrors qwen3_5.fuse_gdn_input_projections)
+# ---------------------------------------------------------------------------
+
+_QKV_PROJ_NAMES = ("q_proj", "k_proj", "v_proj")
+_NVFP4_SCALAR_SCALE_SUFFIXES = ("input_scale", "weight_scale_2")
+
+
+def _can_fuse_nvfp4_scales(attn: "Attention") -> bool:
+    """True if all 3 NVFP4 Q/K/V projections have identical scalar scales."""
+    for suffix in _NVFP4_SCALAR_SCALE_SUFFIXES:
+        tensors = []
+        for name in _QKV_PROJ_NAMES:
+            proj = getattr(attn, name, None)
+            if proj is None:
+                return False
+            t = getattr(proj, suffix, None)
+            if t is None:
+                return False
+            tensors.append(t)
+        if not all(torch.equal(tensors[0], t) for t in tensors[1:]):
+            return False
+    return True
+
+
+def fuse_qkv_projections(model: nn.Module) -> int:
+    """Post-load optimisation: fuse attention Q/K/V projections into one GEMM.
+
+    A single fused GEMM feeds the packed-QKV plugin input directly (no Concat,
+    no reliance on the compiler backend's horizontal GEMM fusion).
+
+    Per quant type: FP16 always fuses; NVFP4 fuses only when the per-tensor
+    scales (``input_scale``, ``weight_scale_2``) match across Q/K/V (mismatch
+    => warn and fall back to 3 GEMMs + concat); other quant types skip.
+    FP8-KV-cache layers also skip — ``k_scale`` / ``v_scale`` live on
+    ``k_proj`` / ``v_proj`` and are read at export time.
+
+    Fused layers replace the three sub-modules with ``qkv_proj_fused``
+    (auto-detected in ``Attention.forward``). Returns the number fused.
+    """
+
+    fused_count = 0
+    for name, module in model.named_modules():
+        # Exact type match: subclasses (e.g. Gemma4Attention) have their own
+        # forward() and may not own k_proj / v_proj.
+        if type(module) is not Attention:
+            continue
+        attn: Attention = module
+        if hasattr(attn, "qkv_proj_fused"):
+            continue  # idempotent
+        if attn.enable_fp8_kv_cache:
+            continue  # k_scale / v_scale buffers must stay on k_proj / v_proj
+        # Defensive: skip any layer that doesn't own all three projections.
+        if any(getattr(attn, n, None) is None for n in _QKV_PROJ_NAMES):
+            continue
+
+        proj_modules = [getattr(attn, n) for n in _QKV_PROJ_NAMES]
+        first_proj = attn.q_proj
+        # Mixed quantization across Q/K/V cannot be fused into one GEMM.
+        if any(type(p) is not type(first_proj) for p in proj_modules):
+            logger.warning(
+                "QKV fusion skipped for %s: mixed projection types (%s).",
+                name, [type(p).__name__ for p in proj_modules])
+            continue
+        if isinstance(first_proj, FP16Linear):
+            pass  # always fusible
+        elif is_nvfp4_linear(first_proj):
+            if not _can_fuse_nvfp4_scales(attn):
+                logger.warning(
+                    "QKV fusion skipped for %s: NVFP4 scalar scales differ "
+                    "across projections. Re-quantize with resmoothing "
+                    "enabled to equalise scales.", name)
+                continue
+        else:
+            # INT4, FP8, MXFP8, etc. — not fusible.
+            continue
+
+        # --- Fuse: concatenate weights along output dim (dim 0) ----------
+        fused_buffers: dict = {}
+        # Union across all three projections so an attribute missing on any
+        # side is caught (fail-loud below) instead of silently dropped.
+        attr_names = list(
+            dict.fromkeys(
+                itertools.chain.from_iterable(
+                    itertools.chain(p._buffers, p._parameters)
+                    for p in proj_modules)))
+        # The checkpoint loader may rebind `bias` as a plain attribute
+        # (outside _buffers/_parameters); include it explicitly.
+        if "bias" not in attr_names and any(
+                getattr(p, "bias", None) is not None for p in proj_modules):
+            attr_names.append("bias")
+        for attr in attr_names:
+            parts = [getattr(p, attr, None) for p in proj_modules]
+            if all(p is None for p in parts):
+                continue
+            # An attribute present on only a subset of Q/K/V would either
+            # crash torch.cat or be silently dropped — fail loudly instead.
+            if any(p is None for p in parts):
+                raise RuntimeError(
+                    f"QKV fusion: attribute '{attr}' present on only a "
+                    "subset of q/k/v projections; cannot fuse.")
+            if parts[0].numel() == 1:
+                # Per-tensor scalar (0-d or (1,)-shaped): take first —
+                # equality across Q/K/V is a fusion precondition.
+                fused_buffers[attr] = parts[0]
+            else:
+                # Per-output-channel: concat along dim 0.
+                fused_buffers[attr] = torch.cat(parts, dim=0)
+
+        # Build a fused linear with correct type.
+        fused_out_dim = sum(p.out_features for p in proj_modules)
+        in_features = first_proj.in_features
+        has_bias = getattr(first_proj, "bias", None) is not None
+        if is_nvfp4_linear(first_proj):
+            method = NVFP4LinearMethod(
+                group_size=first_proj.quant_method.group_size)
+            fused_linear = ReplicatedLinear(in_features,
+                                            fused_out_dim,
+                                            bias=has_bias,
+                                            dtype=torch.float16,
+                                            mapping=first_proj.mapping,
+                                            quant_method=method)
+        else:
+            fused_linear = FP16Linear(in_features,
+                                      fused_out_dim,
+                                      bias=has_bias)
+
+        # Assign fused buffers/params.
+        for attr, tensor in fused_buffers.items():
+            if attr in fused_linear._buffers:
+                fused_linear._buffers[attr] = tensor
+            elif attr in fused_linear._parameters:
+                fused_linear._parameters[attr] = nn.Parameter(
+                    tensor, requires_grad=False)
+            else:
+                setattr(fused_linear, attr, tensor)
+
+        # Replace: add fused, delete originals.
+        attn.qkv_proj_fused = fused_linear
+        for proj_name in _QKV_PROJ_NAMES:
+            delattr(attn, proj_name)
+
+        fused_count += 1
+        logger.debug("Fused QKV projections for %s", name)
+
+    if fused_count:
+        logger.info("Fused attention QKV projections in %d layer(s)",
+                    fused_count)
+    return fused_count
 
 
 # ---------------------------------------------------------------------------

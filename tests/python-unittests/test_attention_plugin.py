@@ -19,9 +19,10 @@ Drives the custom AttentionPlugin entirely through torch CUDA tensors and
 validates it against a PyTorch reference across a sweep of configs:
 prefill / decode, grouped-query attention, head-size variants, FP8 KV cache,
 chunked prefill, ragged context lengths, batch-order permutation invariance,
-tree (speculative) attention, shared-KV (donor-cache) layers, and the Q
-pre-scaling convention for non-standard softmax scales. Sliding-window
-attention is covered in test_sliding_window_attention_plugin.py.
+tree (speculative) attention, shared-KV (donor-cache) layers, fused qk_norm
+(per-head RMSNorm on Q/K before RoPE), and the Q pre-scaling convention for
+non-standard softmax scales. Sliding-window attention is covered in
+test_sliding_window_attention_plugin.py.
 
 The plugin's KV-cache ABI is paged: a pool binding [2, numPages, PAGE_SIZE,
 Hkv, D] plus an int32 page table [batch, 2, maxPagesPerSeq]. The tests (and
@@ -75,6 +76,7 @@ class AttentionParams:
     enable_fp8_kv_cache: bool = False
     sliding_window_size: int = -1  # -1 disables
     qkv_scales: List[float] = field(default_factory=lambda: [1.0, 1.0, 1.0])
+    rms_norm_eps: float = 1e-6  # qk_norm epsilon (used when gammas are set)
 
     def __post_init__(self):
         assert self.num_q_heads % self.num_kv_heads == 0, \
@@ -127,6 +129,17 @@ def apply_rotary_embedding(x: torch.Tensor, cos_cache: torch.Tensor,
     return torch.cat([rot1, rot2], dim=-1)
 
 
+def rms_norm(x: torch.Tensor, gamma: torch.Tensor, eps: float) -> torch.Tensor:
+    """Per-head RMSNorm in FP32 (qk_norm): x * rsqrt(mean(x^2) + eps) * gamma.
+
+    x: [..., head_size]; gamma: [head_size]. Mirrors the plugin's fused
+    qk_norm, which normalizes Q and K per head before RoPE (V is untouched).
+    """
+    xf = x.float()
+    return xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) +
+                            eps) * gamma.float()
+
+
 def sliding_window_mask(seq_q: int, seq_k: int, window: int,
                         device) -> torch.Tensor:
     """Causal mask with a sliding window. 1 = attend, 0 = masked.
@@ -175,12 +188,18 @@ def compute_attention(
     cache_indices: torch.Tensor,
     params: AttentionParams,
     attn_mask: Optional[torch.Tensor] = None,
+    q_norm_gamma: Optional[torch.Tensor] = None,
+    k_norm_gamma: Optional[torch.Tensor] = None,
+    rms_norm_eps: float = 1e-6,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Full attention with RoPE + KV cache. Returns (out, k_cache, v_cache).
 
     Shapes: qkv [b, s, qkv_hidden]; k_cache/v_cache [b, Hkv, cap, d]
             (post-RoPE keys, raw values — as the plugin stores them).
     Caches are returned updated (not in-place).
+
+    ``q_norm_gamma`` / ``k_norm_gamma`` ([head_size]) enable qk_norm: per-head
+    FP32 RMSNorm applied to Q / K before RoPE (V is never normalized).
     """
     b, s = params.batch_size, params.seq_len
     Hq, Hkv, d = params.num_q_heads, params.num_kv_heads, params.head_size
@@ -192,6 +211,11 @@ def compute_attention(
     q = q.reshape(b, s, Hq, d).transpose(1, 2)
     k = k.reshape(b, s, Hkv, d).transpose(1, 2)
     v = v.reshape(b, s, Hkv, d).transpose(1, 2)
+
+    if q_norm_gamma is not None:
+        q = rms_norm(q, q_norm_gamma, rms_norm_eps)
+    if k_norm_gamma is not None:
+        k = rms_norm(k, k_norm_gamma, rms_norm_eps)
 
     q = apply_rotary_embedding(q, cos_cache, sin_cache, position_ids)
     k = apply_rotary_embedding(k, cos_cache, sin_cache, position_ids)
@@ -303,6 +327,12 @@ def _fp8_prefill_supported() -> bool:
 class AttentionPluginRunner:
     """Builds + runs the AttentionPlugin for a given AttentionParams config.
 
+    The plugin takes a single packed QKV input [B, S, C].  The
+    ``enable_kv_shared`` plugin field selects the layout: C = (Hq + 2*Hkv)*D
+    for normal (own-KV) layers, or C = Hq*D (Q only) for shared-KV (Gemma4
+    KV-sharing) layers, where K/V are read from a donor layer's cache without
+    being written.
+
     The plugin's kv_cache binding is a paged POOL [2, numPages, PAGE_SIZE,
     Hkv, D] plus an int32 page table [batch, 2, maxPagesPerSeq], but the tests
     keep working in the LOGICAL per-slot layout [batch, 2, Hkv, cap, D]:
@@ -310,21 +340,25 @@ class AttentionPluginRunner:
     table (slot b owns pages [b*mpps, (b+1)*mpps)), executes, and gathers the
     pool back into the logical tensor in place.
 
-    ``allow_empty_kv`` lowers the K/V profile minimum to sequence length 0 so
-    the same engine also accepts shared-KV calls (K/V with S=0, Gemma4
-    KV-sharing layers); the plugin deduces shared-KV per enqueue from the
-    runtime K/V dims.
+    ``q_norm_gamma`` / ``k_norm_gamma`` ([head_size] float tensors) enable
+    fused qk_norm: per-head FP32 RMSNorm on Q and K before RoPE. They are
+    wired as OPTIONAL engine-weight constant inputs (enable_qk_norm=1); when
+    omitted the plugin gets no gamma inputs at all (enable_qk_norm=0).
     """
 
     def __init__(self,
                  p: AttentionParams,
                  enable_tree_attention=False,
-                 allow_empty_kv=False,
-                 attention_scale: Optional[float] = None):
+                 q_norm_gamma=None,
+                 k_norm_gamma=None,
+                 attention_scale: Optional[float] = None,
+                 enable_kv_shared: int = 0):
         self.p = p
         self.tree = enable_tree_attention
-        self.allow_empty_kv = allow_empty_kv
+        self.q_norm_gamma = q_norm_gamma
+        self.k_norm_gamma = k_norm_gamma
         self.attention_scale = attention_scale
+        self.kv_shared = enable_kv_shared
         self.kv_dtype = trt.fp8 if p.enable_fp8_kv_cache else trt.float16
         # Paged-pool geometry: capacity padded up to whole pages, one fixed
         # page range per batch slot (identity page table).
@@ -338,29 +372,26 @@ class AttentionPluginRunner:
 
     def _build(self):
         p = self.p
-        qh, kvh = p.q_hidden, p.kv_hidden
+        qh = p.q_hidden
         D, Hkv = p.head_size, p.num_kv_heads
         mb, ms, mpe = p.max_batch_size, p.max_seq_len, p.max_position_embeddings
 
         input_specs = [
-            ("q", trt.float16, (-1, -1, qh)),
-            ("k", trt.float16, (-1, -1, kvh)),
-            ("v", trt.float16, (-1, -1, kvh)),
+            ("qkv", trt.float16, (-1, -1, -1)),
             ("kv_cache", self.kv_dtype, (2, -1, PAGE_SIZE, Hkv, D)),
             ("context_lengths", trt.int32, (-1, )),
             ("rope_cos_sin", trt.float32, (1, mpe, D)),
             ("kv_cache_indices", trt.int32, (-1, )),
             ("kv_page_table", trt.int32, (-1, 2, self.mpps)),
         ]
-        kv_min_seq = 0 if self.allow_empty_kv else 1
         # The pool never resizes: numPages is fixed per engine (min=opt=max).
         pool_shape = (2, self.num_pages, PAGE_SIZE, Hkv, D)
+        # Channel width is fixed by the mode: Q-only (q_hidden) for shared-KV
+        # engines, the full packed width otherwise.
+        qkv_c = qh if self.kv_shared else p.qkv_hidden_size
         profiles = {
-            "q": ((1, 1, qh), (p.batch_size, p.seq_len, qh), (mb, ms, qh)),
-            "k": ((1, kv_min_seq, kvh), (p.batch_size, p.seq_len, kvh),
-                  (mb, ms, kvh)),
-            "v": ((1, kv_min_seq, kvh), (p.batch_size, p.seq_len, kvh),
-                  (mb, ms, kvh)),
+            "qkv":
+            ((1, 1, qkv_c), (p.batch_size, p.seq_len, qkv_c), (mb, ms, qkv_c)),
             "kv_cache": (pool_shape, pool_shape, pool_shape),
             "context_lengths": ((1, ), (p.batch_size, ), (mb, )),
             "rope_cos_sin": ((1, mpe, D), (1, mpe, D), (1, mpe, D)),
@@ -378,11 +409,30 @@ class AttentionPluginRunner:
             profiles["position_ids"] = ((1, 1), (p.batch_size, p.seq_len),
                                         (mb, ms))
 
+        # qk_norm gammas are OPTIONAL engine-weight constant inputs, wired only
+        # when enable_qk_norm=1.
+        qk_norm = self.q_norm_gamma is not None or self.k_norm_gamma is not None
+        constant_specs = []
+        plugin_input_order = [
+            "qkv", "kv_cache", "context_lengths", "rope_cos_sin",
+            "kv_cache_indices", "kv_page_table"
+        ]
+        if qk_norm:
+            constant_specs = [
+                ("q_norm_gamma", trt.float16, (D, ), self.q_norm_gamma),
+                ("k_norm_gamma", trt.float16, (D, ), self.k_norm_gamma),
+            ]
+            plugin_input_order += ["q_norm_gamma", "k_norm_gamma"]
+        if self.tree:
+            plugin_input_order += ["tree_mask", "position_ids"]
+
         fields = [
             pf_int32("num_q_heads", p.num_q_heads),
             pf_int32("num_kv_heads", p.num_kv_heads),
             pf_int32("head_size", p.head_size),
             pf_int32("enable_tree_attention", int(self.tree)),
+            pf_int32("enable_qk_norm", int(qk_norm)),
+            pf_int32("enable_kv_shared", int(self.kv_shared)),
             pf_int32("enable_fp8_kv_cache", int(p.enable_fp8_kv_cache)),
             pf_int32("sliding_window_size", p.sliding_window_size),
         ]
@@ -390,6 +440,8 @@ class AttentionPluginRunner:
             fields.append(pf_float32("qkv_scales", p.qkv_scales))
         if self.attention_scale is not None:
             fields.append(pf_float32("attention_scale", self.attention_scale))
+        if qk_norm:
+            fields.append(pf_float32("rms_norm_eps", p.rms_norm_eps))
 
         self.runner.build(
             input_specs=input_specs,
@@ -398,6 +450,8 @@ class AttentionPluginRunner:
             plugin_version="1",
             plugin_fields=fields,
             profiles=profiles,
+            constant_specs=constant_specs,
+            plugin_input_order=plugin_input_order,
         )
 
     def _pool_views(self, kv_dtype):
@@ -431,9 +485,7 @@ class AttentionPluginRunner:
         return self._page_table
 
     def run(self,
-            q,
-            k,
-            v,
+            qkv,
             kv_cache,
             context_lengths,
             rope_cos_sin,
@@ -443,15 +495,18 @@ class AttentionPluginRunner:
             input_shapes=None):
         """Execute; returns (attn_output fp16, kv_cache after update).
 
+        ``qkv`` is the packed [B, S, (Hq+2*Hkv)*D] input, or a Q-only
+        [B, S, Hq*D] tensor when the runner was built with
+        ``enable_kv_shared=1``.
+
         ``kv_cache`` is the LOGICAL cache [batch, 2, Hkv, cap, D]: it is
         scattered into the paged pool before the enqueue and the pool is
         gathered back into it (in place) afterwards, so callers never see the
         pool layout.
 
         ``input_shapes`` optionally overrides runtime input shapes (see
-        PluginRunner.execute); used to bind K/V with sequence length 0 for
-        shared-KV calls. kv_page_table always binds its full runtime shape
-        (taken from the tensor itself).
+        PluginRunner.execute). kv_page_table always binds its full runtime
+        shape (taken from the tensor itself).
         """
         p = self.p
         batch, cap = kv_cache.shape[0], p.kv_cache_capacity
@@ -460,13 +515,11 @@ class AttentionPluginRunner:
         # slot-major NHD view (identity page table).
         pool_k[:batch, :cap] = kv_cache[:, 0].permute(0, 2, 1, 3)
         pool_v[:batch, :cap] = kv_cache[:, 1].permute(0, 2, 1, 3)
-        attn_out = torch.empty((q.shape[0], q.shape[1], p.q_hidden),
+        attn_out = torch.empty((qkv.shape[0], qkv.shape[1], p.q_hidden),
                                dtype=torch.float16,
                                device=DEV)
         tensors = {
-            "q": q,
-            "k": k,
-            "v": v,
+            "qkv": qkv,
             "kv_cache": pool,
             "context_lengths": context_lengths,
             "rope_cos_sin": rope_cos_sin,
@@ -524,13 +577,6 @@ def _empty_caches(p: AttentionParams):
     return ref_k, ref_v, plugin_kv
 
 
-def _split_qkv(qkv, p):
-    q = qkv[:, :, :p.q_hidden].to(torch.float16)
-    k = qkv[:, :, p.q_hidden:p.q_hidden + p.kv_hidden].to(torch.float16)
-    v = qkv[:, :, p.q_hidden + p.kv_hidden:].to(torch.float16)
-    return q, k, v
-
-
 def _plugin_kv_to_ref(plugin_kv, p):
     """Dequantize plugin KV cache -> (k_fp32, v_fp32) matching the reference."""
     ks, vs = (p.qkv_scales[1],
@@ -546,10 +592,28 @@ def _run_rounds(p: AttentionParams,
                 rtol: float,
                 seed: int = 42,
                 cos_threshold: float = 0.99999,
+                q_prescale: float = 1.0,
+                q_norm_gamma=None,
+                k_norm_gamma=None,
                 attention_scale: Optional[float] = None):
-    """Generic multi-round decode/prefill driver comparing plugin vs reference."""
+    """Generic multi-round decode/prefill driver comparing plugin vs reference.
+
+    ``q_prescale`` multiplies the plugin-side Q only (the export-time Q
+    pre-scaling convention for a non-default softmax scale); the reference
+    keeps the unscaled Q and applies ``p.qk_scale`` directly.
+
+    ``q_norm_gamma`` / ``k_norm_gamma`` enable fused qk_norm in the plugin and
+    the matching RMSNorm in the reference.
+
+    ``attention_scale`` passes a non-default absolute QK^T multiplier to the
+    plugin via the ``attention_scale`` field (the reference applies
+    ``p.qk_scale`` directly).
+    """
     gen = torch.Generator().manual_seed(seed)
-    runner = AttentionPluginRunner(p, attention_scale=attention_scale)
+    runner = AttentionPluginRunner(p,
+                                   q_norm_gamma=q_norm_gamma,
+                                   k_norm_gamma=k_norm_gamma,
+                                   attention_scale=attention_scale)
     cos, sin, combined = _make_rope(p, gen)
     ref_k, ref_v, plugin_kv = _empty_caches(p)
 
@@ -558,7 +622,10 @@ def _run_rounds(p: AttentionParams,
         qkv = torch.randn((p.batch_size, p.seq_len, p.qkv_hidden_size),
                           generator=gen,
                           dtype=torch.float32).to(DEV)
-        q, k, v = _split_qkv(qkv, p)
+        qkv_plugin = qkv.to(torch.float16)  # fresh copy per enqueue
+        if q_prescale != 1.0:
+            qkv_plugin[:, :, :p.q_hidden] = (qkv[:, :, :p.q_hidden] *
+                                             q_prescale).to(torch.float16)
         position_ids = torch.arange(pos,
                                     pos + p.seq_len,
                                     dtype=torch.int32,
@@ -583,12 +650,21 @@ def _run_rounds(p: AttentionParams,
                                        p.sliding_window_size, DEV) \
                 if p.sliding_window_size > 0 else None
 
-        ref_out, ref_k, ref_v = compute_attention(qkv.float(), ref_k, ref_v,
-                                                  cos, sin, position_ids,
-                                                  cache_idx, p, mask)
+        ref_out, ref_k, ref_v = compute_attention(qkv.float(),
+                                                  ref_k,
+                                                  ref_v,
+                                                  cos,
+                                                  sin,
+                                                  position_ids,
+                                                  cache_idx,
+                                                  p,
+                                                  mask,
+                                                  q_norm_gamma=q_norm_gamma,
+                                                  k_norm_gamma=k_norm_gamma,
+                                                  rms_norm_eps=p.rms_norm_eps)
 
-        attn_out, plugin_kv = runner.run(q, k, v, plugin_kv, ctx_len, combined,
-                                         cache_idx)
+        attn_out, plugin_kv = runner.run(qkv_plugin, plugin_kv, ctx_len,
+                                         combined, cache_idx)
         pk, pv = _plugin_kv_to_ref(plugin_kv, p)
 
         assert_close(f"attn[r{r}]",
@@ -797,7 +873,6 @@ def test_ragged_context_lengths_decode():
         qkv = torch.randn((p.batch_size, 1, p.qkv_hidden_size),
                           generator=gen,
                           dtype=torch.float32).to(DEV)
-        q, k, v = _split_qkv(qkv, p)
         pos_ids = torch.full((p.batch_size, 1),
                              step,
                              dtype=torch.int32,
@@ -814,8 +889,8 @@ def test_ragged_context_lengths_decode():
         rk, rv = ref_k.clone(), ref_v.clone()
         ro, ref_k, ref_v = compute_attention(qkv.float(), ref_k, ref_v, cos,
                                              sin, pos_ids, cache_idx, p, None)
-        attn_out, plugin_kv = runner.run(q, k, v, plugin_kv, ctx_len, combined,
-                                         cache_idx)
+        attn_out, plugin_kv = runner.run(qkv.to(torch.float16), plugin_kv,
+                                         ctx_len, combined, cache_idx)
         # Roll back inactive rows so each row only accumulates its own history.
         for bi in range(p.batch_size):
             if not bool(active[bi]):
@@ -845,17 +920,17 @@ def test_batch_permutation_invariance_decode():
     qkv = torch.randn((p.batch_size, 1, p.qkv_hidden_size),
                       generator=gen,
                       dtype=torch.float32).to(DEV)
-    q, k, v = _split_qkv(qkv, p)
+    qkv16 = qkv.to(torch.float16)
     cache_idx = torch.zeros((p.batch_size, ), dtype=torch.int32, device=DEV)
     ctx_len = torch.ones((p.batch_size, ), dtype=torch.int32, device=DEV)
 
     runner = AttentionPluginRunner(p)
     _, _, kv0 = _empty_caches(p)
-    out0, _ = runner.run(q, k, v, kv0, ctx_len, combined, cache_idx)
+    out0, _ = runner.run(qkv16.clone(), kv0, ctx_len, combined, cache_idx)
 
     perm = torch.tensor([2, 0, 3, 1], device=DEV)
     _, _, kv1 = _empty_caches(p)
-    out1, _ = runner.run(q[perm], k[perm], v[perm], kv1, ctx_len, combined,
+    out1, _ = runner.run(qkv16[perm].contiguous(), kv1, ctx_len, combined,
                          cache_idx)
     assert_close("batch-perm", out0[perm], out1, 1e-3, 1e-3)
 
@@ -863,11 +938,14 @@ def test_batch_permutation_invariance_decode():
 # --------------------------------------------------------------------------- #
 # Tree (speculative) attention
 # --------------------------------------------------------------------------- #
-def test_tree_attention():
+def _tree_attention_rounds(q_norm_gamma=None, k_norm_gamma=None):
     p = AttentionParams(batch_size=4, seq_len=4, **BASE)
     num_rounds = 5
     gen = torch.Generator().manual_seed(42)
-    runner = AttentionPluginRunner(p, enable_tree_attention=True)
+    runner = AttentionPluginRunner(p,
+                                   enable_tree_attention=True,
+                                   q_norm_gamma=q_norm_gamma,
+                                   k_norm_gamma=k_norm_gamma)
     cos, sin, combined = _make_rope(p, gen)
     ref_k, ref_v, plugin_kv = _empty_caches(p)
 
@@ -881,7 +959,6 @@ def test_tree_attention():
         qkv = torch.randn((p.batch_size, p.seq_len, p.qkv_hidden_size),
                           generator=gen,
                           dtype=torch.float32).to(DEV)
-        q, k, v = _split_qkv(qkv, p)
         depth = base_depth[:p.seq_len]
         pos_ids = (pos + depth)[None].repeat(p.batch_size,
                                              1).to(torch.int32).to(DEV)
@@ -899,11 +976,22 @@ def test_tree_attention():
                                device=DEV)
         full_mask[:, pos:] = tree_mask
         ref_out, ref_k_out, ref_v_out = compute_attention(
-            qkv.float(), ref_k, ref_v, cos, sin, pos_ids, cache_idx, p,
-            full_mask)
+            qkv.float(),
+            ref_k,
+            ref_v,
+            cos,
+            sin,
+            pos_ids,
+            cache_idx,
+            p,
+            full_mask,
+            q_norm_gamma=q_norm_gamma,
+            k_norm_gamma=k_norm_gamma,
+            rms_norm_eps=p.rms_norm_eps)
 
-        attn_out, plugin_kv = runner.run(q, k, v, plugin_kv, ctx_len, combined,
-                                         cache_idx, packed, pos_ids)
+        attn_out, plugin_kv = runner.run(qkv.to(torch.float16), plugin_kv,
+                                         ctx_len, combined, cache_idx, packed,
+                                         pos_ids)
         pk, pv = _plugin_kv_to_ref(plugin_kv, p)
 
         assert_close(f"tree-attn[r{r}]", ref_out, attn_out, 1e-2, 1e-2)
@@ -927,6 +1015,17 @@ def test_tree_attention():
             plugin_kv[:, 0] = pk_c.to(kv_dtype)
             plugin_kv[:, 1] = pv_c.to(kv_dtype)
         pos += int(len(accepted))
+
+
+def test_tree_attention():
+    _tree_attention_rounds()
+
+
+def test_tree_attention_qknorm():
+    # EAGLE3 cross path: fused qk_norm combined with tree attention.
+    gen = torch.Generator().manual_seed(1012)
+    qg, kg = _make_qk_norm_gammas(BASE["head_size"], gen)
+    _tree_attention_rounds(q_norm_gamma=qg, k_norm_gamma=kg)
 
 
 def _tree_from_parents(parent):
@@ -994,7 +1093,6 @@ def test_tree_attention_topology(width, kind):
     qkv = torch.randn((p.batch_size, width, p.qkv_hidden_size),
                       generator=gen,
                       dtype=torch.float32).to(DEV)
-    q, k, v = _split_qkv(qkv, p)
     pos_ids = depth[None].repeat(p.batch_size, 1).to(DEV)
     cache_idx = torch.zeros(p.batch_size, dtype=torch.int32, device=DEV)
     ctx_len = torch.full((p.batch_size, ),
@@ -1004,8 +1102,8 @@ def test_tree_attention_topology(width, kind):
 
     ref_out, _, _ = compute_attention(qkv.float(), ref_k, ref_v, cos, sin,
                                       pos_ids, cache_idx, p, tree_mask)
-    attn_out, _ = runner.run(q, k, v, plugin_kv, ctx_len, combined, cache_idx,
-                             packed, pos_ids)
+    attn_out, _ = runner.run(qkv.to(torch.float16), plugin_kv, ctx_len,
+                             combined, cache_idx, packed, pos_ids)
     assert_close(f"tree-topology[{kind},W{width}]", ref_out, attn_out)
 
 
@@ -1048,6 +1146,95 @@ def test_decode_head32(num_kv_heads):
 
 
 # --------------------------------------------------------------------------- #
+# Fused qk_norm (per-head FP32 RMSNorm on Q/K before RoPE, e.g. Qwen3):
+# enable_qk_norm=1 wires the [head_size] gamma constants as optional plugin inputs.
+# --------------------------------------------------------------------------- #
+def _make_qk_norm_gammas(head_size: int, gen):
+    """Random per-head Q/K gammas in [0.5, 1.5]."""
+    qg = torch.empty(head_size).uniform_(0.5, 1.5, generator=gen).to(DEV)
+    kg = torch.empty(head_size).uniform_(0.5, 1.5, generator=gen).to(DEV)
+    return qg, kg
+
+
+def test_prefill_qknorm():
+    p = AttentionParams(batch_size=2, seq_len=8, is_prefill=True, **BASE)
+    gen = torch.Generator().manual_seed(1010)
+    qg, kg = _make_qk_norm_gammas(p.head_size, gen)
+    _run_rounds(p,
+                num_rounds=3,
+                atol=1e-2,
+                rtol=1e-2,
+                q_norm_gamma=qg,
+                k_norm_gamma=kg)
+
+
+def test_decode_qknorm():
+    p = AttentionParams(batch_size=2, seq_len=1, **BASE)
+    gen = torch.Generator().manual_seed(1011)
+    qg, kg = _make_qk_norm_gammas(p.head_size, gen)
+    _run_rounds(p,
+                num_rounds=4,
+                atol=1e-2,
+                rtol=1e-2,
+                q_norm_gamma=qg,
+                k_norm_gamma=kg)
+
+
+def test_decode_qknorm_odd_tokens():
+    """bs=1 decode: 1 token/step — an ODD total token count.
+
+    At head_size=128 the packed RoPE kernel packs two token rows per warp,
+    so an odd token count leaves a tail row that must stay alive through the
+    fused-norm warp collectives without storing anything.
+    """
+    p = AttentionParams(batch_size=1, seq_len=1, **BASE)
+    gen = torch.Generator().manual_seed(1012)
+    qg, kg = _make_qk_norm_gammas(p.head_size, gen)
+    _run_rounds(p,
+                num_rounds=5,
+                atol=1e-2,
+                rtol=1e-2,
+                q_norm_gamma=qg,
+                k_norm_gamma=kg)
+
+
+def test_prefill_qknorm_odd_tokens():
+    """bs=1 prefill with an odd sequence length (7 tokens) — same warp-tail
+    coverage as test_decode_qknorm_odd_tokens but through the prefill path."""
+    p = AttentionParams(batch_size=1, seq_len=7, is_prefill=True, **BASE)
+    gen = torch.Generator().manual_seed(1013)
+    qg, kg = _make_qk_norm_gammas(p.head_size, gen)
+    _run_rounds(p,
+                num_rounds=2,
+                atol=1e-2,
+                rtol=1e-2,
+                q_norm_gamma=qg,
+                k_norm_gamma=kg)
+
+
+@pytest.mark.skipif(not _fp8_decode_supported(),
+                    reason="FP8 XQA decode not supported on this device")
+def test_decode_qknorm_fp8kv():
+    """Fused qk_norm combined with the FP8 KV cache path (norm + RoPE + FP8
+    quantized K/V cache write in one kernel). Relaxed threshold matches
+    test_fp8_kv_cache_decode: the FP8 e4m3 storage precision floor."""
+    p = AttentionParams(batch_size=2,
+                        seq_len=1,
+                        enable_fp8_kv_cache=True,
+                        qkv_scales=[1.0, 1.0, 1.0],
+                        **BASE)
+    gen = torch.Generator().manual_seed(1014)
+    qg, kg = _make_qk_norm_gammas(p.head_size, gen)
+    _run_rounds(p,
+                num_rounds=4,
+                atol=2e-1,
+                rtol=2e-1,
+                cos_threshold=0.999,
+                q_norm_gamma=qg,
+                k_norm_gamma=kg)
+
+
+# --------------------------------------------------------------------------- #
 # Prefill -> decode handoff: a long prefill (ISL in 10..2048) fills the KV
 # cache, then N decode steps continue from it. The plugin KV cache is shared
 # across both phases; compared against a continuous reference.
@@ -1076,7 +1263,6 @@ def test_prefill_decode_handoff(seed):
     qkv = torch.randn((bs, prefill_len, p.qkv_hidden_size),
                       generator=gen,
                       dtype=torch.float32).to(DEV)
-    q, k, v = _split_qkv(qkv, p)
     pos_ids = torch.arange(prefill_len, dtype=torch.int32,
                            device=DEV)[None].repeat(bs, 1)
     cache_idx = torch.zeros(bs, dtype=torch.int32, device=DEV)
@@ -1084,8 +1270,8 @@ def test_prefill_decode_handoff(seed):
     mask = sliding_window_mask(prefill_len, prefill_len, -1, DEV)
     ref_out, ref_k, ref_v = compute_attention(qkv.float(), ref_k, ref_v, cos,
                                               sin, pos_ids, cache_idx, p, mask)
-    attn_out, plugin_kv = runner.run(q, k, v, plugin_kv, ctx_len, combined,
-                                     cache_idx)
+    attn_out, plugin_kv = runner.run(qkv.to(torch.float16), plugin_kv, ctx_len,
+                                     combined, cache_idx)
     assert_close("handoff-prefill", ref_out, attn_out)
 
     # --- decode steps, continuing from the prefilled KV cache ---
@@ -1094,15 +1280,14 @@ def test_prefill_decode_handoff(seed):
         qkv_d = torch.randn((bs, 1, p.qkv_hidden_size),
                             generator=gen,
                             dtype=torch.float32).to(DEV)
-        q, k, v = _split_qkv(qkv_d, p_dec)
         pos_ids = torch.full((bs, 1), pos, dtype=torch.int32, device=DEV)
         cache_idx = torch.full((bs, ), pos, dtype=torch.int32, device=DEV)
         ctx_len = torch.full((bs, ), pos + 1, dtype=torch.int32, device=DEV)
         ref_out, ref_k, ref_v = compute_attention(qkv_d.float(), ref_k, ref_v,
                                                   cos, sin, pos_ids, cache_idx,
                                                   p_dec, None)
-        attn_out, plugin_kv = runner.run(q, k, v, plugin_kv, ctx_len, combined,
-                                         cache_idx)
+        attn_out, plugin_kv = runner.run(qkv_d.to(torch.float16), plugin_kv,
+                                         ctx_len, combined, cache_idx)
         assert_close(f"handoff-decode[t={pos}]", ref_out, attn_out)
         pos += 1
 
@@ -1167,10 +1352,10 @@ def test_ragged_prefill(label, seqlens):
     cos, sin, combined = _make_rope(p, gen)
     _, _, plugin_kv = _empty_caches(p)
     qkv = _ragged_qkv(seqlens, p, gen)
-    q, k, v = _split_qkv(qkv, p)
     ctx_len = torch.tensor(seqlens, dtype=torch.int32, device=DEV)
     cache_idx = torch.zeros(len(seqlens), dtype=torch.int32, device=DEV)
-    attn_out, _ = runner.run(q, k, v, plugin_kv, ctx_len, combined, cache_idx)
+    attn_out, _ = runner.run(qkv.to(torch.float16), plugin_kv, ctx_len,
+                             combined, cache_idx)
     ref_rows = _ragged_prefill_ref(qkv.float(), cos, sin, seqlens, p)
     for b, L in enumerate(seqlens):
         assert_close(f"ragged[{label}].b{b}", ref_rows[b], attn_out[b, :L])
@@ -1191,21 +1376,20 @@ def test_ragged_prefill_batch_invariance():
     runner = AttentionPluginRunner(p)
     cos, sin, combined = _make_rope(p, gen)
     qkv = _ragged_qkv(seqlens, p, gen)
-    q, k, v = _split_qkv(qkv, p)
+    qkv16 = qkv.to(torch.float16)
     cache_idx = torch.zeros(len(seqlens), dtype=torch.int32, device=DEV)
 
     _, _, kv0 = _empty_caches(p)
     ctx0 = torch.tensor(seqlens, dtype=torch.int32, device=DEV)
-    # clone so the in-place RoPE does not corrupt the buffers reused below
-    out0, _ = runner.run(q.clone(), k.clone(), v.clone(), kv0, ctx0, combined,
-                         cache_idx)
+    # clone so the in-place RoPE does not corrupt the buffer reused below
+    out0, _ = runner.run(qkv16.clone(), kv0, ctx0, combined, cache_idx)
 
     perm = [2, 0, 1]
     sl_p = [seqlens[i] for i in perm]
     _, _, kv1 = _empty_caches(p)
     ctx1 = torch.tensor(sl_p, dtype=torch.int32, device=DEV)
-    out1, _ = runner.run(q[perm].contiguous(), k[perm].contiguous(),
-                         v[perm].contiguous(), kv1, ctx1, combined, cache_idx)
+    out1, _ = runner.run(qkv16[perm].contiguous(), kv1, ctx1, combined,
+                         cache_idx)
     for new_i, orig in enumerate(perm):
         L = seqlens[orig]
         assert_close(f"ragged-batch-inv[{new_i}]", out0[orig, :L],
@@ -1213,30 +1397,10 @@ def test_ragged_prefill_batch_invariance():
 
 
 # --------------------------------------------------------------------------- #
-# Shared KV (Gemma4 KV-sharing layers): the plugin detects shared-KV mode from
-# K/V inputs with sequence length 0. The KV-cache input is then a DONOR layer's
-# cache (already-RoPE'd K + raw V); the plugin applies RoPE to Q ONLY and
-# attends against the donor cache without writing to it. Each test first runs
-# an own-KV pass through the same engine to populate the donor cache (the K/V
-# profile min is lowered to S=0 so one engine serves both modes).
+# Shared KV (Gemma4 KV-sharing layers): a shared engine (enable_kv_shared=1) takes a
+# Q-only packed input and reads a donor engine's cache without writing it. Each test
+# populates the cache with a donor (enable_kv_shared=0) pass first.
 # --------------------------------------------------------------------------- #
-def _empty_kv(p: AttentionParams):
-    """K/V binding for shared-KV calls: (dummy tensor, input-shape overrides).
-
-    The runtime K/V shape must be [B, 0, Hkv*D], but a 0-element torch tensor
-    reports ``data_ptr() == 0`` and TensorRT rejects a null binding address.
-    So bind a 1-token dummy buffer and override the runtime shape to S=0 (the
-    plugin never reads K/V in shared-KV mode)."""
-    dummy = torch.zeros((p.batch_size, 1, p.kv_hidden),
-                        dtype=torch.float16,
-                        device=DEV)
-    shapes = {
-        "k": (p.batch_size, 0, p.kv_hidden),
-        "v": (p.batch_size, 0, p.kv_hidden),
-    }
-    return dummy, shapes
-
-
 def _assert_cache_untouched(name: str, before: "torch.Tensor",
                             after: "torch.Tensor"):
     """Bit-exact check that a shared-KV call did not write the donor cache."""
@@ -1264,7 +1428,8 @@ def test_shared_kv_prefill(head_size, num_q_heads, num_kv_heads):
     cfg["num_kv_heads"] = num_kv_heads
     p = AttentionParams(batch_size=2, seq_len=8, is_prefill=True, **cfg)
     gen = torch.Generator().manual_seed(2400 + head_size)
-    runner = AttentionPluginRunner(p, allow_empty_kv=True)
+    runner = AttentionPluginRunner(p)
+    shared_runner = AttentionPluginRunner(p, enable_kv_shared=1)
     cos, sin, combined = _make_rope(p, gen)
     ref_k, ref_v, plugin_kv = _empty_caches(p)
     b, s = p.batch_size, p.seq_len
@@ -1278,25 +1443,17 @@ def test_shared_kv_prefill(head_size, num_q_heads, num_kv_heads):
     qkv = torch.randn((b, s, p.qkv_hidden_size),
                       generator=gen,
                       dtype=torch.float32).to(DEV)
-    q, k, v = _split_qkv(qkv, p)
     _, ref_k, ref_v = compute_attention(qkv.float(), ref_k, ref_v, cos, sin,
                                         pos_ids, cache_idx, p, mask)
-    runner.run(q, k, v, plugin_kv, ctx_len, combined, cache_idx)
+    runner.run(qkv.to(torch.float16), plugin_kv, ctx_len, combined, cache_idx)
 
-    # Shared-KV pass: fresh Q for the same positions, K/V with S=0, the donor
-    # cache as KV-cache input.
+    # Shared-KV pass: a Q-only QKV (C = Hq*D) for the same positions, the
+    # donor cache as KV-cache input.
     q2 = torch.randn((b, s, p.q_hidden), generator=gen,
                      dtype=torch.float32).to(DEV)
-    kv_dummy, kv_shapes = _empty_kv(p)
     donor_before = plugin_kv.clone()
-    attn_out, plugin_kv = runner.run(q2.to(torch.float16),
-                                     kv_dummy,
-                                     kv_dummy,
-                                     plugin_kv,
-                                     ctx_len,
-                                     combined,
-                                     cache_idx,
-                                     input_shapes=kv_shapes)
+    attn_out, plugin_kv = shared_runner.run(q2.to(torch.float16), plugin_kv,
+                                            ctx_len, combined, cache_idx)
 
     # Reference: RoPE Q at positions 0..S-1, causal attention against the
     # donor cache contents.
@@ -1320,9 +1477,10 @@ def test_shared_kv_decode():
     p = AttentionParams(batch_size=2, seq_len=8, is_prefill=True, **cfg)
     p_dec = AttentionParams(batch_size=2, seq_len=1, **cfg)
     gen = torch.Generator().manual_seed(2500)
-    # One engine (dynamic S, K/V min S=0) serves donor prefill, donor decode
-    # and shared-KV decode.
-    runner = AttentionPluginRunner(p, allow_empty_kv=True)
+    # Donor engine (own KV) serves prefill + decode writes; a separate
+    # enable_kv_shared=1 engine serves the Q-only shared-KV decode reads.
+    runner = AttentionPluginRunner(p)
+    shared_runner = AttentionPluginRunner(p, enable_kv_shared=1)
     cos, sin, combined = _make_rope(p, gen)
     ref_k, ref_v, plugin_kv = _empty_caches(p)
     b, s = p.batch_size, p.seq_len
@@ -1331,14 +1489,13 @@ def test_shared_kv_decode():
     qkv = torch.randn((b, s, p.qkv_hidden_size),
                       generator=gen,
                       dtype=torch.float32).to(DEV)
-    q, k, v = _split_qkv(qkv, p)
     pos_ids = torch.arange(s, dtype=torch.int32, device=DEV)[None].repeat(b, 1)
     cache_idx = torch.zeros(b, dtype=torch.int32, device=DEV)
     ctx_len = torch.full((b, ), s, dtype=torch.int32, device=DEV)
     mask = sliding_window_mask(s, s, -1, DEV)
     _, ref_k, ref_v = compute_attention(qkv.float(), ref_k, ref_v, cos, sin,
                                         pos_ids, cache_idx, p, mask)
-    runner.run(q, k, v, plugin_kv, ctx_len, combined, cache_idx)
+    runner.run(qkv.to(torch.float16), plugin_kv, ctx_len, combined, cache_idx)
 
     pos = s
     for step in range(3):
@@ -1350,26 +1507,20 @@ def test_shared_kv_decode():
         qkv_d = torch.randn((b, 1, p.qkv_hidden_size),
                             generator=gen,
                             dtype=torch.float32).to(DEV)
-        q, k, v = _split_qkv(qkv_d, p_dec)
         _, ref_k, ref_v = compute_attention(qkv_d.float(), ref_k, ref_v, cos,
                                             sin, pos_ids, cache_idx, p_dec,
                                             None)
-        runner.run(q, k, v, plugin_kv, ctx_len, combined, cache_idx)
+        runner.run(qkv_d.to(torch.float16), plugin_kv, ctx_len, combined,
+                   cache_idx)
 
-        # Shared-KV decode: fresh Q, K/V with S=0, no cache write.
+        # Shared-KV decode: Q-only QKV (C = Hq*D), no cache write.
         q_s = torch.randn((b, 1, p.q_hidden),
                           generator=gen,
                           dtype=torch.float32).to(DEV)
-        kv_dummy, kv_shapes = _empty_kv(p_dec)
         donor_before = plugin_kv.clone()
-        attn_out, plugin_kv = runner.run(q_s.to(torch.float16),
-                                         kv_dummy,
-                                         kv_dummy,
-                                         plugin_kv,
-                                         ctx_len,
-                                         combined,
-                                         cache_idx,
-                                         input_shapes=kv_shapes)
+        attn_out, plugin_kv = shared_runner.run(q_s.to(torch.float16),
+                                                plugin_kv, ctx_len, combined,
+                                                cache_idx)
 
         # Reference: RoPE Q at position ctx-1, attend all ctx donor entries.
         qr = apply_rotary_embedding(
@@ -1401,7 +1552,8 @@ def test_shared_kv_chunked_prefill(head_size, num_q_heads, num_kv_heads):
     cfg["num_kv_heads"] = num_kv_heads
     p = AttentionParams(batch_size=2, seq_len=8, is_prefill=True, **cfg)
     gen = torch.Generator().manual_seed(2600 + head_size)
-    runner = AttentionPluginRunner(p, allow_empty_kv=True)
+    runner = AttentionPluginRunner(p)
+    shared_runner = AttentionPluginRunner(p, enable_kv_shared=1)
     cos, sin, combined = _make_rope(p, gen)
     ref_k, ref_v, plugin_kv = _empty_caches(p)
     b, s = p.batch_size, p.seq_len
@@ -1416,26 +1568,18 @@ def test_shared_kv_chunked_prefill(head_size, num_q_heads, num_kv_heads):
         qkv = torch.randn((b, s, p.qkv_hidden_size),
                           generator=gen,
                           dtype=torch.float32).to(DEV)
-        q, k, v = _split_qkv(qkv, p)
         _, ref_k, ref_v = compute_attention(qkv.float(), ref_k, ref_v, cos,
                                             sin, pos_ids, cache_idx, p, mask)
-        runner.run(q, k, v, plugin_kv, ctx_len, combined, cache_idx)
+        runner.run(qkv.to(torch.float16), plugin_kv, ctx_len, combined,
+                   cache_idx)
 
-    # Shared-KV second chunk: fresh Q at positions S..2S-1 attends the full
-    # donor cache (prefix + current chunk). pos_ids/cache_idx/mask still hold
-    # the chunk-2 values from the loop.
+    # Shared-KV second chunk: Q-only QKV at positions S..2S-1 attends the full
+    # donor cache (pos_ids/cache_idx/mask keep the chunk-2 values from the loop).
     q2 = torch.randn((b, s, p.q_hidden), generator=gen,
                      dtype=torch.float32).to(DEV)
-    kv_dummy, kv_shapes = _empty_kv(p)
     donor_before = plugin_kv.clone()
-    attn_out, plugin_kv = runner.run(q2.to(torch.float16),
-                                     kv_dummy,
-                                     kv_dummy,
-                                     plugin_kv,
-                                     ctx_len,
-                                     combined,
-                                     cache_idx,
-                                     input_shapes=kv_shapes)
+    attn_out, plugin_kv = shared_runner.run(q2.to(torch.float16), plugin_kv,
+                                            ctx_len, combined, cache_idx)
 
     q2r = apply_rotary_embedding(
         q2.reshape(b, s, p.num_q_heads, p.head_size).transpose(1, 2), cos, sin,
@@ -1457,9 +1601,10 @@ def test_shared_kv_tree_decode():
     cfg["num_kv_heads"] = 4
     p = AttentionParams(batch_size=2, seq_len=4, **cfg)
     gen = torch.Generator().manual_seed(2700)
-    runner = AttentionPluginRunner(p,
-                                   enable_tree_attention=True,
-                                   allow_empty_kv=True)
+    runner = AttentionPluginRunner(p, enable_tree_attention=True)
+    shared_runner = AttentionPluginRunner(p,
+                                          enable_tree_attention=True,
+                                          enable_kv_shared=1)
     cos, sin, combined = _make_rope(p, gen)
     ref_k, ref_v, plugin_kv = _empty_caches(p)
     b, s = p.batch_size, p.seq_len
@@ -1481,29 +1626,20 @@ def test_shared_kv_tree_decode():
         qkv = torch.randn((b, s, p.qkv_hidden_size),
                           generator=gen,
                           dtype=torch.float32).to(DEV)
-        q, k, v = _split_qkv(qkv, p)
         _, ref_k_out, ref_v_out = compute_attention(qkv.float(), ref_k, ref_v,
                                                     cos, sin, pos_ids,
                                                     cache_idx, p, full_mask)
-        runner.run(q, k, v, plugin_kv, ctx_len, combined, cache_idx, packed,
-                   pos_ids)
+        runner.run(qkv.to(torch.float16), plugin_kv, ctx_len, combined,
+                   cache_idx, packed, pos_ids)
 
-        # Shared-KV tree pass: fresh Q, K/V with S=0, donor cache read-only.
+        # Shared-KV tree pass: Q-only QKV (C = Hq*D), donor cache read-only.
         q2 = torch.randn((b, s, p.q_hidden),
                          generator=gen,
                          dtype=torch.float32).to(DEV)
-        kv_dummy, kv_shapes = _empty_kv(p)
         donor_before = plugin_kv.clone()
-        attn_out, plugin_kv = runner.run(q2.to(torch.float16),
-                                         kv_dummy,
-                                         kv_dummy,
-                                         plugin_kv,
-                                         ctx_len,
-                                         combined,
-                                         cache_idx,
-                                         packed,
-                                         pos_ids,
-                                         input_shapes=kv_shapes)
+        attn_out, plugin_kv = shared_runner.run(q2.to(torch.float16),
+                                                plugin_kv, ctx_len, combined,
+                                                cache_idx, packed, pos_ids)
 
         end = pos + s
         q2r = apply_rotary_embedding(

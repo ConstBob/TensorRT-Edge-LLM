@@ -238,9 +238,7 @@ class DSparkCachedAttention(nn.Module):
 
         # --- AttentionPlugin: proposal attention over full context ---
         attn_4d, present_kv = attention_plugin(
-            q,
-            k_self,
-            v_self,
+            torch.cat([q, k_self, v_self], dim=-1),
             updated_kv,
             context_lengths,
             rope_cos_sin,

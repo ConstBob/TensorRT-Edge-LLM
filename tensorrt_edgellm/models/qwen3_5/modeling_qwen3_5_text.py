@@ -426,9 +426,9 @@ class GatedAttention(nn.Module):
                                        [1.0, 1.0, 1.0])
 
         attn_output, present_key_value = attention_plugin(
-            query_states, key_states, value_states, past_key_value,
-            context_lengths, rope_rotary_cos_sin, kvcache_start_index,
-            kv_page_table, **kwargs)
+            torch.cat([query_states, key_states, value_states],
+                      dim=-1), past_key_value, context_lengths,
+            rope_rotary_cos_sin, kvcache_start_index, kv_page_table, **kwargs)
 
         # attn_output: [batch, seq, num_heads, head_dim]
         # Apply gating: sigmoid(gate) * attn_output
