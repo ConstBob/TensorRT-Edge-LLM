@@ -156,6 +156,19 @@ bool Gemma4ViTRunner::validateAndFillConfig(std::string const& engineDir)
         return false;
     }
 
+    // Clamp per-image patch budget to the engine profile capacity so that
+    // gemma4ResizeTarget never produces an image exceeding the inputPatches buffer.
+    if (mConfig.maxPatchesPerImage > mConfig.maxPatches)
+    {
+        LOG_WARNING(
+            "Gemma4 max_image_tokens_per_image (%ld patches) exceeds engine profile capacity (%ld patches); "
+            "clamping per-image budget to engine capacity",
+            mConfig.maxPatchesPerImage, mConfig.maxPatches);
+        mConfig.maxPatchesPerImage = mConfig.maxPatches;
+        int64_t const k2 = mConfig.poolingKernelSize * mConfig.poolingKernelSize;
+        mConfig.maxImageTokensPerImage = mConfig.maxPatches / k2;
+    }
+
     return true;
 }
 
@@ -357,6 +370,11 @@ void Gemma4ViTRunner::generatePoolingWeights(
 void Gemma4ViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<ImageGrid>& imageGrids,
     std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream)
 {
+    // Restore mVitInput to full engine-profile capacity before writing patches.
+    // imagePreprocess shrinks it to {totalPatches, inputDim} at the end (for engine execution),
+    // so a subsequent call would see a reduced shape and fail the capacity check in the kernel.
+    check::check(mVitInput.reshape({mConfig.maxPatches, mConfig.inputDim}), "Tensor reshape failed");
+
     int32_t* cuSeqlensData = mCuSeqlensHost.dataPointer<int32_t>();
     cuSeqlensData[0] = 0;
     int64_t cuSeqlensSize = 1;
