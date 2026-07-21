@@ -469,6 +469,17 @@ function(cute_dsl_setup)
     )
   endif()
 
+  list(FIND _variants "ffpa_d512_causal_gqa16" _ffpa_gqa16_idx)
+  if(NOT ${_ffpa_gqa16_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(${_tgt} PRIVATE "CUTE_DSL_FFPA_GQA16_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: ffpa_d512_causal_gqa16 variant found - CUTE_DSL_FFPA_GQA16_ENABLED set"
+    )
+  endif()
+
   # FFPA vision-block overlay variant.
   list(FIND _variants "ffpa_d512_causal_visionblock" _ffpa_visionblock_idx)
   if(NOT ${_ffpa_visionblock_idx} EQUAL -1)
