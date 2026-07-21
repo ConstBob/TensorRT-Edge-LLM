@@ -1,0 +1,100 @@
+{
+  "files": [
+    {
+      "path": "AGENTS.md",
+      "description": "Repository architecture, build/test commands, anti-patterns, and MR expectations."
+    },
+    {
+      "path": "CODING_GUIDELINES.md",
+      "description": "Project C++/CUDA/Python coding rules."
+    },
+    {
+      "path": "CONTRIBUTING.md",
+      "description": "Contribution, formatting, and sign-off requirements."
+    },
+    {
+      "path": "tests/README.md",
+      "description": "Test layout, priorities, model parameter strings, and pipeline requirements.",
+      "scope": [
+        "tests/**/*",
+        "unittests/**/*",
+        ".gitlab/**/*"
+      ]
+    },
+    {
+      "path": "design/README.adoc",
+      "description": "Architecture-design document index and design vocabulary.",
+      "scope": [
+        "design/**/*.adoc"
+      ]
+    },
+    {
+      "path": "design/general/design_principles.adoc",
+      "description": "General TensorRT Edge-LLM design principles.",
+      "scope": [
+        "design/**/*.adoc",
+        "tensorrt_edgellm/**/*",
+        "cpp/**/*"
+      ]
+    },
+    {
+      "path": "docs/source/developer_guide/software-design/checkpoint-export.md",
+      "description": "Checkpoint-driven exporter design and model/component dispatch contract.",
+      "scope": [
+        "tensorrt_edgellm/**/*.py",
+        "experimental/**/*.py",
+        "docs/source/**/*.md"
+      ]
+    },
+    {
+      "path": "docs/source/developer_guide/software-design/engine-builder.md",
+      "description": "Engine builder design and builder/runtime artifact contract.",
+      "scope": [
+        "cpp/builder/**/*",
+        "examples/**/*build*",
+        "docs/source/**/*.md"
+      ]
+    },
+    {
+      "path": "docs/source/developer_guide/software-design/cpp-runtime-overview.md",
+      "description": "C++ runtime design and runtime contract.",
+      "scope": [
+        "cpp/runtime/**/*",
+        "cpp/common/**/*",
+        "cpp/multimodal/**/*",
+        "cpp/action/**/*",
+        "experimental/**/*"
+      ]
+    },
+    {
+      "path": "docs/source/developer_guide/customization/tensorrt-plugins.md",
+      "description": "TensorRT plugin integration workflow and expected plugin documentation.",
+      "scope": [
+        "cpp/plugins/**/*",
+        "tensorrt_edgellm/onnx/**/*",
+        "tensorrt_edgellm/models/ops.py",
+        "tests/python-unittests/*plugin*.py"
+      ]
+    },
+    {
+      "path": "docs/source/user_guide/getting_started/supported-models.md",
+      "description": "Supported model matrix; update when support, precision, limitation, or checkpoint coverage changes.",
+      "scope": [
+        "tensorrt_edgellm/models/**/*",
+        "tensorrt_edgellm/quantization/**/*",
+        "tensorrt_edgellm/scripts/**/*",
+        "experimental/**/*",
+        "tests/test_lists/**/*"
+      ]
+    },
+    {
+      "path": "CMakeLists.txt",
+      "description": "Top-level CMake build graph, options, dependency registration, and target wiring.",
+      "scope": [
+        "**/CMakeLists.txt",
+        "cmake/**/*.cmake",
+        "cmake/**/*"
+      ]
+    }
+  ]
+}
