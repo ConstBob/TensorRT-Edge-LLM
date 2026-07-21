@@ -100,12 +100,13 @@ below; update this table when those checks change.
   `cpp/kernels/contextAttentionKernels/cuteDslFMHARunner.cpp`,
   `cmake/CuteDsl.cmake`
 
-| FMHA_v2 context cubins
-| Prefill/context attention fallback
-| FP16 context path. Causal decoder attention supports head dim 64, 128, or
-  256. Cubins are compiled for the target SMs selected in CMake.
-| `cpp/kernels/contextAttentionKernels/contextFMHARunner.cpp`,
-  `cpp/CMakeLists.txt`
+| FMHA-v2 CuTe DSL
+| Prefill/context and ViT attention outside the optimized Blackwell path
+| FP16 causal or sliding context attention supports head dim 64, 128, or 256;
+  packed ViT attention supports head dim 64, 72, 80, or 128. Matching CuTe DSL
+  artifacts are generated for the target SM.
+| `cpp/kernels/contextAttentionKernels/cuteDslFMHAV2Runner.cpp`,
+  `kernelSrcs/fmha_v2_cutedsl/fmha.py`
 
 | Decode XQA (`cpp/kernels/decodeAttentionKernels/`)
 | Token-by-token decode and tree/speculative decode

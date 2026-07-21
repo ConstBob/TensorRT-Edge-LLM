@@ -451,29 +451,26 @@ void fillNonCausalVarlenReference(std::vector<half> const& qInput, std::vector<h
     }
 }
 
-void runLlmD512PagedNonCausalAccuracyCase(bool fp8Input)
+void runLlmPagedNonCausalAccuracyCase(int32_t physicalSeqLenQ, int32_t numQHeads, int32_t numKVHeads, int32_t headDim,
+    std::vector<int32_t> const& qSeqLens, std::vector<int32_t> const& kvSeqLens, bool fp8Input)
 {
-    constexpr int32_t kBatchSize = 2;
-    constexpr int32_t kPhysicalSeqLenQ = 32;
     constexpr int32_t kPhysicalSeqLenKV = 128;
-    constexpr int32_t kNumQHeads = 8;
-    constexpr int32_t kNumKVHeads = 1;
-    constexpr int32_t kHeadDim = 512;
     constexpr int32_t kTokensPerPage = 128;
     constexpr float kQScale = 0.03125F;
     constexpr float kKScale = 0.0625F;
     constexpr float kVScale = 0.125F;
 
-    std::vector<int32_t> const qSeqLens{17, 9};
-    std::vector<int32_t> const kvSeqLens{96, 37};
+    int32_t const batchSize = static_cast<int32_t>(qSeqLens.size());
+    ASSERT_EQ(qSeqLens.size(), kvSeqLens.size());
+    ASSERT_GT(batchSize, 0);
     int32_t constexpr kMaxPagesPerSeq = 1;
     int32_t constexpr kCapacity = kMaxPagesPerSeq * kTokensPerPage;
     int32_t constexpr kPhysicalPagesPerGroup = kMaxPagesPerSeq + 1;
-    int32_t constexpr kNumPages = kBatchSize * 2 * kPhysicalPagesPerGroup;
+    int32_t const numPages = batchSize * 2 * kPhysicalPagesPerGroup;
 
-    size_t const qSize = static_cast<size_t>(kBatchSize) * kPhysicalSeqLenQ * kNumQHeads * kHeadDim;
-    size_t const kvSize = static_cast<size_t>(kBatchSize) * kPhysicalSeqLenKV * kNumKVHeads * kHeadDim;
-    size_t const pagedKVSize = static_cast<size_t>(kNumPages) * kTokensPerPage * kNumKVHeads * kHeadDim;
+    size_t const qSize = static_cast<size_t>(batchSize) * physicalSeqLenQ * numQHeads * headDim;
+    size_t const kvSize = static_cast<size_t>(batchSize) * kPhysicalSeqLenKV * numKVHeads * headDim;
+    size_t const pagedKVSize = static_cast<size_t>(numPages) * kTokensPerPage * numKVHeads * headDim;
 
     std::vector<half> qHalf(qSize);
     std::vector<half> kHalf(kvSize);
@@ -495,15 +492,15 @@ void runLlmD512PagedNonCausalAccuracyCase(bool fp8Input)
         return __float2half(value);
     };
 
-    for (int32_t batchIdx = 0; batchIdx < kBatchSize; ++batchIdx)
+    for (int32_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
     {
-        for (int32_t token = 0; token < kPhysicalSeqLenQ; ++token)
+        for (int32_t token = 0; token < physicalSeqLenQ; ++token)
         {
-            for (int32_t head = 0; head < kNumQHeads; ++head)
+            for (int32_t head = 0; head < numQHeads; ++head)
             {
-                for (int32_t dim = 0; dim < kHeadDim; ++dim)
+                for (int32_t dim = 0; dim < headDim; ++dim)
                 {
-                    size_t const idx = bshdIdx(batchIdx, token, head, dim, kPhysicalSeqLenQ, kNumQHeads, kHeadDim);
+                    size_t const idx = bshdIdx(batchIdx, token, head, dim, physicalSeqLenQ, numQHeads, headDim);
                     float const value
                         = token < qSeqLens[static_cast<size_t>(batchIdx)] ? distribution(generator) : 7.0F;
                     qHalf[idx] = fillValue(value, kQScale, qFp8[idx]);
@@ -512,11 +509,11 @@ void runLlmD512PagedNonCausalAccuracyCase(bool fp8Input)
         }
         for (int32_t token = 0; token < kPhysicalSeqLenKV; ++token)
         {
-            for (int32_t head = 0; head < kNumKVHeads; ++head)
+            for (int32_t head = 0; head < numKVHeads; ++head)
             {
-                for (int32_t dim = 0; dim < kHeadDim; ++dim)
+                for (int32_t dim = 0; dim < headDim; ++dim)
                 {
-                    size_t const idx = bshdIdx(batchIdx, token, head, dim, kPhysicalSeqLenKV, kNumKVHeads, kHeadDim);
+                    size_t const idx = bshdIdx(batchIdx, token, head, dim, kPhysicalSeqLenKV, numKVHeads, headDim);
                     bool const validKV = token < kvSeqLens[static_cast<size_t>(batchIdx)];
                     kHalf[idx] = fillValue(validKV ? distribution(generator) : -9.0F, kKScale, kFp8[idx]);
                     vHalf[idx] = fillValue(validKV ? distribution(generator) : 11.0F, kVScale, vFp8[idx]);
@@ -527,8 +524,8 @@ void runLlmD512PagedNonCausalAccuracyCase(bool fp8Input)
 
     std::vector<half> kvPagedHalf(pagedKVSize, __float2half(-13.0F));
     std::vector<__nv_fp8_e4m3> kvPagedFp8(pagedKVSize, __nv_fp8_e4m3{-13.0F});
-    std::vector<int32_t> pageList(static_cast<size_t>(kBatchSize) * 2 * kMaxPagesPerSeq);
-    for (int32_t batchIdx = 0; batchIdx < kBatchSize; ++batchIdx)
+    std::vector<int32_t> pageList(static_cast<size_t>(batchSize) * 2 * kMaxPagesPerSeq);
+    for (int32_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
     {
         for (int32_t kv = 0; kv < 2; ++kv)
         {
@@ -540,14 +537,14 @@ void runLlmD512PagedNonCausalAccuracyCase(bool fp8Input)
             for (int32_t token = 0; token < kvSeqLens[static_cast<size_t>(batchIdx)]; ++token)
             {
                 int32_t const physicalPage = pageList[(batchIdx * 2 + kv) * kMaxPagesPerSeq];
-                for (int32_t head = 0; head < kNumKVHeads; ++head)
+                for (int32_t head = 0; head < numKVHeads; ++head)
                 {
-                    for (int32_t dim = 0; dim < kHeadDim; ++dim)
+                    for (int32_t dim = 0; dim < headDim; ++dim)
                     {
                         size_t const sourceIdx
-                            = bshdIdx(batchIdx, token, head, dim, kPhysicalSeqLenKV, kNumKVHeads, kHeadDim);
+                            = bshdIdx(batchIdx, token, head, dim, kPhysicalSeqLenKV, numKVHeads, headDim);
                         size_t const pageIdx
-                            = pagedKVIdx(physicalPage, head, token, dim, kNumKVHeads, kTokensPerPage, kHeadDim);
+                            = pagedKVIdx(physicalPage, head, token, dim, numKVHeads, kTokensPerPage, headDim);
                         kvPagedHalf[pageIdx] = kv == 0 ? kHalf[sourceIdx] : vHalf[sourceIdx];
                         kvPagedFp8[pageIdx] = kv == 0 ? kFp8[sourceIdx] : vFp8[sourceIdx];
                     }
@@ -556,25 +553,24 @@ void runLlmD512PagedNonCausalAccuracyCase(bool fp8Input)
         }
     }
 
-    std::vector<int32_t> cuKVSeqLens(static_cast<size_t>(kBatchSize + 1));
-    for (int32_t batchIdx = 0; batchIdx < kBatchSize; ++batchIdx)
+    std::vector<int32_t> cuKVSeqLens(static_cast<size_t>(batchSize + 1));
+    for (int32_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
     {
         cuKVSeqLens[static_cast<size_t>(batchIdx + 1)]
             = cuKVSeqLens[static_cast<size_t>(batchIdx)] + kvSeqLens[static_cast<size_t>(batchIdx)];
     }
 
-    float const attentionScale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
-    fillNonCausalVarlenReference(qHalf, kHalf, vHalf, outputReferenceHost, qSeqLens, kvSeqLens, kPhysicalSeqLenQ,
-        kPhysicalSeqLenKV, kNumQHeads, kNumKVHeads, kHeadDim, attentionScale);
+    float const attentionScale = 1.0F / std::sqrt(static_cast<float>(headDim));
+    fillNonCausalVarlenReference(qHalf, kHalf, vHalf, outputReferenceHost, qSeqLens, kvSeqLens, physicalSeqLenQ,
+        kPhysicalSeqLenKV, numQHeads, numKVHeads, headDim, attentionScale);
 
-    rt::Tensor qHalfTensor({kBatchSize, kPhysicalSeqLenQ, kNumQHeads, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor qHalfTensor({batchSize, physicalSeqLenQ, numQHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
     rt::Tensor kvHalfTensor(
-        pagedKVPoolShape(kNumPages, kNumKVHeads, kTokensPerPage, kHeadDim), rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor pageListTensor({kBatchSize, 2, kMaxPagesPerSeq}, rt::DeviceType::kGPU, DataType::kINT32);
-    rt::Tensor cuKVSeqLensTensor({kBatchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
-    rt::Tensor outputFp16({kBatchSize, kPhysicalSeqLenQ, kNumQHeads, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor outputReference(
-        {kBatchSize, kPhysicalSeqLenQ, kNumQHeads, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
+        pagedKVPoolShape(numPages, numKVHeads, kTokensPerPage, headDim), rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor pageListTensor({batchSize, 2, kMaxPagesPerSeq}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor cuKVSeqLensTensor({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor outputFp16({batchSize, physicalSeqLenQ, numQHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor outputReference({batchSize, physicalSeqLenQ, numQHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
 
     copyHostToDevice(qHalfTensor, qHalf);
     copyHostToDevice(kvHalfTensor, kvPagedHalf);
@@ -583,35 +579,36 @@ void runLlmD512PagedNonCausalAccuracyCase(bool fp8Input)
     copyHostToDevice(outputReference, outputReferenceHost);
 
     cudaStream_t stream = nullptr;
-    CuteDslFMHARunner runner(kNumQHeads, kNumKVHeads, kHeadDim, kBatchSize, kPhysicalSeqLenQ, kCapacity);
+    CuteDslFMHARunner runner(numQHeads, numKVHeads, headDim, batchSize, physicalSeqLenQ, kCapacity);
     runner.runPaged(qHalfTensor.rawPointer(), kvHalfTensor.rawPointer(), pageListTensor.dataPointer<int32_t>(),
-        outputFp16.rawPointer(), cuKVSeqLensTensor.dataPointer<int32_t>(), kNumPages, kMaxPagesPerSeq, kTokensPerPage,
+        outputFp16.rawPointer(), cuKVSeqLensTensor.dataPointer<int32_t>(), numPages, kMaxPagesPerSeq, kTokensPerPage,
         DataType::kHALF, stream, attentionScale, INT_MAX, /*fp8Input=*/false, 1.0F, 1.0F, 1.0F, /*isCausal=*/false);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
 
-    expectHalfOutputRowsClose(outputFp16, outputReference, qSeqLens, "D512 paged non-causal FP16 CuTe DSL FMHA");
+    std::string const labelPrefix = "D" + std::to_string(headDim) + " paged non-causal ";
+    expectHalfOutputRowsClose(outputFp16, outputReference, qSeqLens, labelPrefix + "FP16 CuTe DSL FMHA");
 
     if (!fp8Input)
     {
         return;
     }
 
-    rt::Tensor qFp8Tensor({kBatchSize, kPhysicalSeqLenQ, kNumQHeads, kHeadDim}, rt::DeviceType::kGPU, DataType::kFP8);
+    rt::Tensor qFp8Tensor({batchSize, physicalSeqLenQ, numQHeads, headDim}, rt::DeviceType::kGPU, DataType::kFP8);
     rt::Tensor kvFp8Tensor(
-        pagedKVPoolShape(kNumPages, kNumKVHeads, kTokensPerPage, kHeadDim), rt::DeviceType::kGPU, DataType::kFP8);
-    rt::Tensor outputFp8({kBatchSize, kPhysicalSeqLenQ, kNumQHeads, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
+        pagedKVPoolShape(numPages, numKVHeads, kTokensPerPage, headDim), rt::DeviceType::kGPU, DataType::kFP8);
+    rt::Tensor outputFp8({batchSize, physicalSeqLenQ, numQHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
     copyHostToDevice(qFp8Tensor, qFp8);
     copyHostToDevice(kvFp8Tensor, kvPagedFp8);
 
     runner.runPaged(qFp8Tensor.rawPointer(), kvFp8Tensor.rawPointer(), pageListTensor.dataPointer<int32_t>(),
-        outputFp8.rawPointer(), cuKVSeqLensTensor.dataPointer<int32_t>(), kNumPages, kMaxPagesPerSeq, kTokensPerPage,
+        outputFp8.rawPointer(), cuKVSeqLensTensor.dataPointer<int32_t>(), numPages, kMaxPagesPerSeq, kTokensPerPage,
         DataType::kFP8, stream, attentionScale, INT_MAX, /*fp8Input=*/true, kQScale, kKScale, kVScale,
         /*isCausal=*/false);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
 
-    expectFp8HalfOutputRowsClose(outputFp8, outputFp16, qSeqLens, "D512 paged non-causal FP8 CuTe DSL FMHA");
+    expectFp8HalfOutputRowsClose(outputFp8, outputFp16, qSeqLens, labelPrefix + "FP8 CuTe DSL FMHA");
 }
 
 void runLlmD512PagedAccuracyCase(int32_t physicalSeqLen, int32_t numQHeads, int32_t numKVHeads,
@@ -1149,7 +1146,23 @@ TEST(CuteDslFMHARunnerTest, llmD512PagedNonCausalAccuracy)
         FAIL() << "Failed to load CuTe DSL LLM FMHA kernel modules";
     }
 
-    runLlmD512PagedNonCausalAccuracyCase(/*fp8Input=*/false);
+    runLlmPagedNonCausalAccuracyCase(32, 8, 1, 512, /*qSeqLens=*/{17, 9}, /*kvSeqLens=*/{96, 37}, /*fp8Input=*/false);
+}
+
+TEST(CuteDslFMHARunnerTest, llmD256PagedNonCausalAccuracy)
+{
+    int32_t const rawSmVersion = getSMVersion();
+    if (!isSupportedCuteDslTestSm(rawSmVersion))
+    {
+        GTEST_SKIP() << "D256 CuTe DSL FMHA unit tests only run on SM100/101/110. Current SM=" << rawSmVersion;
+    }
+
+    if (!CuteDslFMHARunner::loadLLMKernelModule())
+    {
+        FAIL() << "Failed to load CuTe DSL LLM FMHA kernel modules";
+    }
+
+    runLlmPagedNonCausalAccuracyCase(4, 16, 8, 256, /*qSeqLens=*/{4, 3}, /*kvSeqLens=*/{24, 11}, /*fp8Input=*/false);
 }
 
 TEST(CuteDslFMHARunnerTest, llmD512PagedFp8Accuracy)
@@ -1181,7 +1194,22 @@ TEST(CuteDslFMHARunnerTest, llmD512PagedFp8NonCausalAccuracy)
         FAIL() << "Failed to load CuTe DSL LLM FMHA kernel modules";
     }
 
-    runLlmD512PagedNonCausalAccuracyCase(/*fp8Input=*/true);
+    runLlmPagedNonCausalAccuracyCase(32, 8, 1, 512, /*qSeqLens=*/{17, 9}, /*kvSeqLens=*/{96, 37}, /*fp8Input=*/true);
+}
+
+TEST(CuteDslFMHARunnerTest, llmD256PagedFp8NonCausalAccuracy)
+{
+    int32_t const rawSmVersion = getSMVersion();
+    if (!isSupportedCuteDslTestSm(rawSmVersion))
+    {
+        GTEST_SKIP() << "D256 CuTe DSL FMHA unit tests only run on SM100/101/110. Current SM=" << rawSmVersion;
+    }
+    if (!CuteDslFMHARunner::loadLLMKernelModule())
+    {
+        FAIL() << "Failed to load CuTe DSL LLM FMHA kernel modules";
+    }
+
+    runLlmPagedNonCausalAccuracyCase(4, 16, 8, 256, /*qSeqLens=*/{4, 3}, /*kvSeqLens=*/{24, 11}, /*fp8Input=*/true);
 }
 
 TEST(CuteDslFMHARunnerTest, vitAccuracy)

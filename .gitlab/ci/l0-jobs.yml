@@ -58,6 +58,8 @@ l0_a30:
   stage: l0_test
   needs:
     - l0_checkpoint_export_ampere
+    - job: build_cutedsl_docker_matrix
+      artifacts: true
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
@@ -83,6 +85,8 @@ l0_a30_trt11:
   stage: l0_test
   needs:
     - l0_checkpoint_export_ampere
+    - job: build_cutedsl_docker_matrix
+      artifacts: true
   variables:
     CUDA_VERSION: "13.2"
     TRT_VERSION: "$TRT11_VERSION"
@@ -109,6 +113,8 @@ l0_rtx3090:
   stage: l0_test
   needs:
     - l0_checkpoint_export_ampere
+    - job: build_cutedsl_docker_matrix
+      artifacts: true
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
@@ -392,6 +398,8 @@ l0_jetson_orin:
   stage: l0_test
   needs:
     - l0_checkpoint_export_ampere
+    - job: build_cutedsl_docker_matrix
+      artifacts: true
   variables:
     BOARD_USER: "tensorrt_user"
     CUDA_VERSION: "13.2"

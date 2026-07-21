@@ -32,6 +32,14 @@ namespace trt_edgellm
 namespace plugins
 {
 
+//! Internal context-attention implementation selected from build artifacts and runtime capabilities.
+enum class ContextFMHABackend
+{
+    kNONE,
+    kCUTE_DSL_OPTIMIZED,
+    kCUTE_DSL_FMHA_V2
+};
+
 //! \brief TensorRT plugin for attention operations (V3 — IPluginV3).
 //!
 //! This plugin implements efficient attention mechanisms including context attention (prefill)
@@ -109,7 +117,8 @@ public:
 
 private:
     //! Produce split K/V FP16 for prefill consumers that cannot read the paged pool directly
-    //! (FMHA_v2 fallback, FFPA d512). Always device-gathers the page table into @p workspacePtr
+    //! (FMHA-v2 CuTe DSL cache-readback paths and FFPA d512). Always device-gathers the page table into
+    //! @p workspacePtr
     //! (no in-place alias): the gather follows any page table (identity or scrambled) correctly
     //! and identically in debug and release, and dequantizes an FP8 pool to FP16 using @p kScale /
     //! @p vScale so `dataPointer<half>()` consumers never reinterpret FP8 bytes. The V half lives
@@ -136,14 +145,13 @@ private:
 
     //! Prefill routing under vision-block attention: the FFPA d512
     //! vision-block overlay kernel serves full-causal headSize=512 layers;
-    //! all other vision layers (the sliding d256 class) go to FMHA
-    //! CUSTOM_MASK (see mCanImplementCustomMaskFMHA).  There is no fallback:
-    //! enforceVisionBlockKernelSupport() makes both hard requirements.
+    //! sliding d256 layers use FMHA-v2 CuTe DSL. There is no fallback:
+    //! enforceVisionBlockKernelSupport() makes the required kernel explicit.
     bool canUseFFPAOverlayForVisionPrefill() const noexcept;
 
     //! Hard construction-time validation of the vision-block kernel set:
-    //! FFPA d512 vision-block overlay (full-causal d512 prefill) or FMHA_v2
-    //! CUSTOM_MASK cubins (all other vision prefill), plus XQA decode.
+    //! FFPA d512 vision-block overlay (full-causal d512 prefill), FMHA-v2
+    //! CuTe DSL d256, plus XQA decode.
     //! Throws (via ELLM_CHECK) naming the missing kernel/artifact and the SM
     //! — vision-block attention has no fallback path, so a clear build/
     //! load-time error beats a silently wrong deployment.
@@ -198,11 +206,7 @@ protected:
     //! Sliding window size for attention (-1 = no sliding window, >0 = window size)
     int32_t mSlidingWindowSize = -1;
 
-#ifdef CUTE_DSL_FMHA_ENABLED
-    bool mUseCuteDslFMHA{true};
-#else
-    bool mUseCuteDslFMHA{false};
-#endif
+    ContextFMHABackend mContextFMHABackend{ContextFMHABackend::kNONE};
 
     //! Whether FMHA context kernels are available for this configuration.
     bool mCanImplementFMHA{true};
@@ -210,12 +214,8 @@ protected:
     //! Whether FFPA d512 causal kernel is available for headSize=512 context attention.
     bool mCanImplementFFPA{false};
 
-    //! Whether FMHA_v2 CUSTOM_MASK context kernels are available for this
-    //! head size (vision-block prefill production path for the sliding d256
-    //! layers).  Discovered from the cubin metadata table at construction;
-    //! the exact per-sequence-length kernel is re-probed at enqueue via
-    //! ContextFMHARunner::isKernelAvailable().
-    bool mCanImplementCustomMaskFMHA{false};
+    //! Whether the FMHA-v2 CuTe DSL d256 vision-block context variant is active.
+    bool mUseFMHAV2VisionBlockFMHA{false};
 
     //! Whether FMHA_v2 PADDING context kernels are loaded for runtime-selected
     //! non-causal context attention, used by DiffusionGemma denoise when the

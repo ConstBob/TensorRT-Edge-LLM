@@ -238,6 +238,41 @@ def test_default_compile_gpu_arch_is_derived_from_target_sm(sm, expected):
     assert build_cutedsl.default_compile_gpu_arch(sm) == expected
 
 
+@pytest.mark.parametrize("sm", [80, 86, 87, 89, 100, 101, 120, 121])
+def test_fmha_v2_registry_is_complete_for_supported_sms(sm):
+    variants = build_cutedsl.select_variants(sm, "fmha_v2")
+
+    assert {variant.name
+            for variant in variants} == {
+                "fmha_v2_d64",
+                "fmha_v2_d64_small",
+                "fmha_v2_d128",
+                "fmha_v2_d256",
+                "fmha_v2_d256_padding",
+                "fmha_v2_d64_sw",
+                "fmha_v2_d128_sw",
+                "fmha_v2_d256_sw",
+                "fmha_v2_vit_d64",
+                "fmha_v2_vit_d72",
+                "fmha_v2_vit_d80",
+                "fmha_v2_vit_d128",
+                "fmha_v2_d256_visionblock",
+            }
+    assert all(variant.script == "fmha_v2_cutedsl/fmha.py"
+               for variant in variants)
+    assert all("--export_only" in variant.script_args for variant in variants)
+    padding_variant = next(variant for variant in variants
+                           if variant.name == "fmha_v2_d256_padding")
+    assert "--is_causal" not in padding_variant.script_args
+    assert "--fmha_v2_context" not in padding_variant.script_args
+
+
+@pytest.mark.parametrize("sm", [90, 103, 110])
+def test_fmha_v2_registry_rejects_unsupported_sms(sm):
+    with pytest.raises(ValueError, match="No variants"):
+        build_cutedsl.select_variants(sm, "fmha_v2")
+
+
 def test_build_allows_f16_moe_for_foreign_target_sm(tmp_path, monkeypatch):
     args = argparse.Namespace(
         gpu_arch="sm_120",
