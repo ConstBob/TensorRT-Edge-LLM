@@ -244,9 +244,12 @@ class GemmBlackwellNvFp4WS:
         self.cluster_shape_mn = cluster_shape_mn
         self.mma_tiler_mn = mma_tiler_mn
         self.mma_tiler = (*mma_tiler_mn, 1)
-        # TMA-store epilogue: required for the runner's no-scratch path —
+        # TMA-store epilogue: always enabled for the WS variant.
+        # {$edge-llm-internal-release begin}
+        # It is required for the runner's no-scratch path:
         # async TMA bulk-store to pinned memory does not block the SM,
         # unlike SIMT register-to-GMEM stores.
+        # {$edge-llm-internal-release end}
         self.use_tma_store = True
         self.sf_vec_size = sf_vec_size
 
@@ -601,11 +604,13 @@ class GemmBlackwellNvFp4WS:
         )
 
         # --- TMA store atom for C (SMEM -> GMEM async bulk store) ---
+        # {$edge-llm-internal-release begin}
         # Ported from upstream dense_blockscaled_gemm_persistent.py (line
         # ~536). The async TMA store replaces the legacy SIMT
         # CopyUniversalOp register->GMEM path; see comment in __init__ for
         # the production motivation (pinned-memory writes). Always on for
         # the WS variant.
+        # {$edge-llm-internal-release end}
         assert self.use_tma_store, "WS variant always uses TMA store"
         epi_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0))
         tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
