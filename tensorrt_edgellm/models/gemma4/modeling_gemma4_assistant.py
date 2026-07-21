@@ -146,11 +146,6 @@ class Gemma4SharedKVAttention(nn.Module):
                                      batch_size, seq_len,
                                      self.num_heads * self.head_dim)
 
-        dummy_kv = torch.zeros(batch_size,
-                               0,
-                               self.num_kv_heads * self.head_dim,
-                               dtype=query_states.dtype,
-                               device=query_states.device)
         attention_mask = torch.ones(batch_size,
                                     seq_len,
                                     seq_len,
@@ -161,10 +156,10 @@ class Gemma4SharedKVAttention(nn.Module):
         frontier_pos_id = torch.clamp(context_lengths - 1, min=0)
         attention_pos_id = frontier_pos_id.reshape(batch_size, 1).expand(
             batch_size, seq_len)
+        # Shared-KV layer: qkv carries Q only; K/V are read from the donated
+        # target cache without being written.
         attn_output, _ = attention_plugin(
             query_states,
-            dummy_kv,
-            dummy_kv,
             target_past_key_value,
             context_lengths,
             rope_rotary_cos_sin,
@@ -181,6 +176,7 @@ class Gemma4SharedKVAttention(nn.Module):
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
             qkv_scales=[1.0, 1.0, 1.0],
+            enable_kv_shared=1,
         )
         return self.o_proj(
             attn_output.reshape(batch_size, seq_len,

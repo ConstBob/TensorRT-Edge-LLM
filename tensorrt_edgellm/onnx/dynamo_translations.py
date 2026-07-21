@@ -49,9 +49,7 @@ _trt_edgellm = onnxscript.values.Opset("trt_edgellm", 1)
 
 @script()
 def _attention_plugin_translation(
-    query_states: onnxscript.FLOAT16,
-    key_states: onnxscript.FLOAT16,
-    value_states: onnxscript.FLOAT16,
+    qkv: onnxscript.FLOAT16,
     past_key_value: onnxscript.FLOAT16,
     context_lengths: onnxscript.INT32,
     rope_rotary_cos_sin: onnxscript.FLOAT,
@@ -68,24 +66,44 @@ def _attention_plugin_translation(
     attention_mask: onnxscript.INT32,
     attention_pos_id: onnxscript.INT32,
     qkv_scales: Sequence[float],
+    # Defaults REQUIRED: torch.export strips default-matching kwargs, so callers
+    # without these features produce FX nodes lacking the attributes.
+    q_norm_gamma: Sequence[float] = (),
+    k_norm_gamma: Sequence[float] = (),
+    rms_norm_eps: float = 1e-6,
+    enable_qk_norm: int = 0,
+    enable_kv_shared: int = 0,
 ) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT16]:
     """Unified attention plugin covering vanilla, FP8-KV, tree, and tree+FP8-KV.
 
-    The signature matches the full ``trt::attention_plugin`` custom-op schema
-    so torch.export's positional-arg normalisation is always aligned.
-    ``attention_mask`` / ``attention_pos_id`` are optional ONNX inputs (empty
-    when tree attention is off).  ``qkv_scales`` defaults to [1, 1, 1] in the
-    op schema and is always a valid FLOATS attribute.
+    Feeds the packed ``qkv`` tensor ``[B, S, (H_q + 2*H_kv) * D]`` to the V3
+    ``AttentionPlugin``: 5 required inputs plus two optional groups —
+    ``q_norm_gamma`` / ``k_norm_gamma`` (enable_qk_norm) and ``attention_mask``
+    / ``attention_pos_id`` (tree attention).
+
+    onnxscript traces a fixed graph, so all 9 inputs are always wired; the
+    export post-pass (``_strip_attention_plugin_optional_inputs``) removes the
+    disabled optional groups.
     """
+    # Gammas enter the plugin as FP16 constant INPUTS (engine weights baked at
+    # build time); zero-length constants signal "qk_norm disabled".
+    q_norm_gamma_fp16 = _op21.Cast(
+        _op21.Constant(value_floats=q_norm_gamma),
+        to=int(onnx.TensorProto.FLOAT16),
+    )
+    k_norm_gamma_fp16 = _op21.Cast(
+        _op21.Constant(value_floats=k_norm_gamma),
+        to=int(onnx.TensorProto.FLOAT16),
+    )
     attn_4d, present_kv = _trt_edgellm.AttentionPlugin(
-        query_states,
-        key_states,
-        value_states,
+        qkv,
         past_key_value,
         context_lengths,
         rope_rotary_cos_sin,
         kvcache_start_index,
         kv_page_table,
+        q_norm_gamma_fp16,
+        k_norm_gamma_fp16,
         attention_mask,
         attention_pos_id,
         num_q_heads=num_q_heads,
@@ -97,6 +115,9 @@ def _attention_plugin_translation(
         sliding_window_size=sliding_window_size,
         qkv_scales=qkv_scales,
         attention_scale=attention_scale,
+        rms_norm_eps=rms_norm_eps,
+        enable_qk_norm=enable_qk_norm,
+        enable_kv_shared=enable_kv_shared,
         _outputs=2,
     )
     return attn_4d, present_kv

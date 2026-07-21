@@ -134,6 +134,17 @@ def trt_dtype_to_torch(dtype):
     return _trt_to_torch_dtype_map()[dtype]
 
 
+def trt_dtype_to_numpy(dtype):
+    """Map a TensorRT DataType to the matching numpy dtype (constants)."""
+    m = {
+        trt.float32: np.float32,
+        trt.float16: np.float16,
+        trt.int32: np.int32,
+        trt.int8: np.int8,
+    }
+    return m[dtype]
+
+
 def make_field(name: str, value, field_type) -> "trt.PluginField":
     """Build a trt.PluginField from a python scalar / sequence."""
     np_dtype = {
@@ -199,13 +210,27 @@ class PluginRunner:
         plugin_fields: Sequence["trt.PluginField"],
         profiles: Dict[str, Tuple[Tuple[int, ...], Tuple[int, ...],
                                   Tuple[int, ...]]],
+        constant_specs: Optional[Sequence[Tuple[str, object, Tuple[int, ...],
+                                                object]]] = None,
+        plugin_input_order: Optional[Sequence[str]] = None,
         plugin_namespace: str = "",
         workspace_bytes: int = 1 << 30,
     ):
-        """Construct the engine. ``input_specs`` order defines plugin input order.
+        """Construct the engine.
 
         ``profiles`` maps each input name to (min, opt, max) shape tuples.
         ``output_names`` are assigned to plugin outputs 0..N in order.
+
+        ``constant_specs`` optionally declares engine-weight constants wired
+        as plugin inputs: (name, trt_dtype, shape, values). ``values`` may be
+        a torch tensor, numpy array, or None; a None value or zero-volume
+        shape produces a zero-length constant (type-only weights).
+
+        ``plugin_input_order`` optionally lists names from ``input_specs`` and
+        ``constant_specs`` defining the plugin input order (so constants can
+        interleave with regular inputs). Defaults to all inputs in
+        ``input_specs`` order followed by all constants in ``constant_specs``
+        order.
         """
         builder = trt.Builder(self.logger)
         network = builder.create_network(
@@ -218,9 +243,36 @@ class PluginRunner:
             config.set_preview_feature(
                 trt.PreviewFeature.ALIASED_PLUGIN_IO_10_03, True)
 
-        inputs = []
+        tensors_by_name = {}
         for name, dtype, shape in input_specs:
-            inputs.append(network.add_input(name, dtype, shape))
+            tensors_by_name[name] = network.add_input(name, dtype, shape)
+
+        # trt.Weights does not own memory — keep the numpy buffers alive until
+        # the build completes.
+        self._constant_arrays = []
+        constant_names = []
+        for name, dtype, shape, values in (constant_specs or []):
+            if values is None or int(np.prod(shape)) == 0:
+                # TRT requires values == nullptr when count == 0 — use the
+                # type-only Weights constructor.
+                weights = trt.Weights(dtype)
+            else:
+                arr = values
+                if not isinstance(arr, np.ndarray):
+                    arr = arr.detach().cpu().numpy() if hasattr(
+                        arr, "detach") else np.asarray(arr)
+                arr = np.ascontiguousarray(
+                    arr.astype(trt_dtype_to_numpy(dtype)))
+                self._constant_arrays.append(arr)
+                weights = trt.Weights(arr)
+            const = network.add_constant(shape, weights)
+            const.get_output(0).name = name
+            tensors_by_name[name] = const.get_output(0)
+            constant_names.append(name)
+
+        if plugin_input_order is None:
+            plugin_input_order = [s[0] for s in input_specs] + constant_names
+        inputs = [tensors_by_name[n] for n in plugin_input_order]
 
         registry = trt.get_plugin_registry()
         creator = registry.get_creator(plugin_name, plugin_version,

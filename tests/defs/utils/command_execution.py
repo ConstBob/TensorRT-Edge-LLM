@@ -22,6 +22,7 @@ unnecessary abstraction layers.
 
 import json
 import os
+import time
 from typing import Any, Dict, Optional
 
 import pytest
@@ -40,6 +41,36 @@ from .command_generation import (generate_build_commands,
                                  generate_vlmevalkit_commands)
 
 _ALPAMAYO_DATASET_PLACEHOLDER = "$ALPAMAYO_DATASET_DIR"
+
+
+def _wait_for_output_file(path: str,
+                          logger,
+                          timeout_s: float = 60.0,
+                          poll_s: float = 2.0) -> None:
+    """Wait until *path* is visible on the local filesystem.
+
+    In remote execution mode the inference binary writes the output JSON on
+    the DEVICE to a shared NFS export, and the host-side metrics step reads
+    it back immediately. The very first file written into a fresh log
+    directory can be masked by the host's NFS negative-dentry cache for a
+    few seconds, which intermittently fails the first inference test of a
+    job with ``[Errno 2] No such file or directory`` even though the device
+    log shows a successful export. Poll (with a parent-directory listing to
+    invalidate the dentry cache) before giving up.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if os.path.exists(path):
+            return
+        parent = os.path.dirname(path) or "."
+        try:
+            os.listdir(parent)  # bust the NFS negative-dentry cache
+        except OSError:
+            pass
+        if logger is not None:
+            logger.info("Waiting for output file to appear on NFS: %s", path)
+        time.sleep(poll_s)
+    # Fall through: let the reader raise its own error for a missing file.
 
 
 def _source_test_case_file(config: TestConfig) -> Optional[str]:
@@ -381,6 +412,9 @@ def execute_e2e_bench_test(
         # Use model-specific reference if available, fallback to generic test case file
         reference_file = config.get_reference_json_file(
         ) or config.get_test_case_file()
+        # In remote mode the device writes the output JSON to shared NFS;
+        # wait for it to become visible on the host before reading.
+        _wait_for_output_file(config.get_output_json_file(), logger)
         # Pass file paths directly to the accuracy checker (runs on host only)
         metrics_result = check_accuracy_with_dataset(
             config.get_output_json_file(), reference_file, config.test_case,
@@ -461,6 +495,9 @@ def execute_inference_test(
         # Use model-specific reference if available, fallback to generic test case file
         reference_file = config.get_reference_json_file(
         ) or config.get_test_case_file()
+        # In remote mode the device writes the output JSON to shared NFS;
+        # wait for it to become visible on the host before reading.
+        _wait_for_output_file(config.get_output_json_file(), logger)
         # Pass file paths directly to the accuracy checker (runs on host only)
         metrics_result = check_accuracy_with_dataset(
             config.get_output_json_file(), reference_file, config.test_case,

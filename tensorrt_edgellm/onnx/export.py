@@ -226,25 +226,18 @@ def _fix_nvfp4_weight_dtype(onnx_path: str) -> None:
 
 
 def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
-    """Strip trailing empty optional inputs from AttentionPlugin ONNX nodes.
+    """Strip disabled optional inputs from AttentionPlugin ONNX nodes.
 
-    ``torch.export`` emits the two optional inputs (``attention_mask``,
-    ``attention_pos_id``) on every node, as empty strings when unused.  The
-    TRT AttentionPlugin C++ requires exactly ``kNUM_REQUIRED_INPUTS=8``
-    inputs (``[..., kvcache_start_index, kv_page_table]``; optionals start
-    at index 8) for vanilla mode and raises ``(input) != nullptr`` when it
-    encounters the extra null entries via
-    ``INetworkDefinition::addPluginV2``.
-
-    This pass trims each ``AttentionPlugin`` node to its expected input
-    count: 8 for vanilla nodes, 9 for vision-block-attention nodes (the
-    real ``attention_mask`` input carrying block IDs is kept, the empty
-    ``attention_pos_id`` placeholder is dropped), and 10 for tree-attention
-    nodes (both optional inputs are real and kept).
+    The onnxscript translation always emits all 10 inputs; the plugin contract
+    only wires the enabled optional groups (gammas when enable_qk_norm, mask /
+    pos_id per tree / vision-block mode). Rewrites each node's input list to
+    match and prunes gamma Constant/Cast producers orphaned by the removal.
     """
-    _REQUIRED = 8
+    _NUM_REQUIRED = 6
+    _GAMMA_POSITIONS = (6, 7)
     model = onnx.load(onnx_path, load_external_data=False)
     changed = 0
+    dropped_gamma_tensors: set = set()
     for node in model.graph.node:
         if node.op_type != "AttentionPlugin":
             continue
@@ -257,21 +250,57 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
              if a.name == "enable_vision_block_attention"),
             0,
         )
-        optional_count = 2 if tree_attn else (1 if vision_block_attn else 0)
-        keep = _REQUIRED + optional_count
-        trailing = list(node.input)[keep:]
-        if not trailing or any(i != "" for i in trailing):
+        qk_norm = next(
+            (a.i for a in node.attribute if a.name == "enable_qk_norm"),
+            0,
+        )
+        inputs = list(node.input)
+        new_inputs = inputs[:_NUM_REQUIRED]
+        if qk_norm:
+            new_inputs += [inputs[i] for i in _GAMMA_POSITIONS]
+        else:
+            dropped_gamma_tensors.update(inputs[i] for i in _GAMMA_POSITIONS
+                                         if i < len(inputs) and inputs[i])
+        if tree_attn or vision_block_attn:
+            # Tree nodes keep mask + pos_id; vision-block nodes keep the block-ID
+            # mask and drop the empty attention_pos_id placeholder.
+            new_inputs += [i for i in inputs[_GAMMA_POSITIONS[1] + 1:] if i]
+        if new_inputs == inputs:
             continue
-        # Keep the real vision-block-ID input while dropping its unused
-        # attention_pos_id placeholder.  Vanilla nodes retain only required
-        # inputs; tree nodes retain both optional inputs.
-        del node.input[keep:]
-        changed += len(trailing)
+        del node.input[:]
+        node.input.extend(new_inputs)
+        changed += 1
+
+    # Prune the gamma Constant/Cast chains that no longer feed any node.
+    if dropped_gamma_tensors:
+        consumed = {i for n in model.graph.node for i in n.input}
+        graph_outputs = {o.name for o in model.graph.output}
+        pruned = True
+        while pruned:
+            pruned = False
+            for n in list(model.graph.node):
+                if not n.output:
+                    continue
+                if all(o in dropped_gamma_tensors and o not in consumed
+                       and o not in graph_outputs for o in n.output):
+                    model.graph.node.remove(n)
+                    dropped_gamma_tensors.update(n.input)
+                    consumed = {
+                        i
+                        for node_ in model.graph.node
+                        for i in node_.input
+                    }
+                    pruned = True
+        # The dynamo exporter may lift the gamma Constants to graph
+        # initializers instead of Constant nodes — drop those as well.
+        for init in list(model.graph.initializer):
+            if init.name in dropped_gamma_tensors and init.name not in consumed:
+                model.graph.initializer.remove(init)
 
     if not changed:
         return
     logger.info(
-        "TRT fix: stripped %d empty optional input(s) from AttentionPlugin nodes",
+        "TRT fix: normalized optional inputs on %d AttentionPlugin node(s)",
         changed,
     )
     data_file = os.path.basename(onnx_path) + ".data"
@@ -283,6 +312,37 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
         location=data_file,
         size_threshold=0,
     )
+
+
+def _fix_zero_volume_initializers(onnx_path: str) -> None:
+    """Clear stray payload bytes on zero-volume initializers.
+
+    A zero-volume initializer must carry zero payload bytes, otherwise the
+    TRT ONNX parser rejects the model with a size mismatch. Only the model
+    proto is rewritten; external-data references are left untouched.
+    """
+    model = onnx.load(onnx_path, load_external_data=False)
+    fixed = 0
+    for init in model.graph.initializer:
+        volume = 1
+        for d in init.dims:
+            volume *= d
+        if volume != 0:
+            continue
+        has_payload = (len(init.raw_data) > 0 or len(init.external_data) > 0
+                       or init.data_location != onnx.TensorProto.DEFAULT)
+        if not has_payload:
+            continue
+        init.raw_data = b""
+        del init.external_data[:]
+        init.data_location = onnx.TensorProto.DEFAULT
+        fixed += 1
+    if not fixed:
+        return
+    logger.info(
+        "TRT fix: cleared stray payload on %d zero-volume initializer(s)",
+        fixed)
+    onnx.save(model, onnx_path)
 
 
 def _strip_onnxscript_internal_attrs(onnx_path: str) -> None:
@@ -321,7 +381,7 @@ def _dedup_shared_dql_scales(model) -> int:
 
     The dynamo exporter deduplicates identical scalar initializers (e.g.
     per-tensor NVFP4 global scales) into a single initializer referenced
-    by DequantizeLinear nodes across many layers.  TRT's Myelin compiler
+    by DequantizeLinear nodes across many layers.  TRT's compiler backend
     segfaults when a single scalar initializer fans out to many DQL nodes
     spanning different transformer layers.
 
@@ -465,6 +525,31 @@ def _setup_fp8kv_scales_for_export(model: "CausalLM") -> None:
             float(k_buf.item()) if k_buf is not None else 1.0,
             float(v_buf.item()) if v_buf is not None else 1.0,
         ]
+
+
+def _capture_qk_norm_gammas_for_export(model: "CausalLM") -> None:
+    """Populate qk_norm gamma lists on every attention module before tracing.
+
+    Runs in the shared export path so every export entrypoint captures the
+    loaded gamma weights. Raises if a module carries qk_norm weights but no
+    gamma values were captured — the export must never silently drop the
+    fused norm.
+    """
+    for module in model.modules():
+        if not hasattr(module, "_capture_qk_norm_gamma_lists"):
+            continue
+        module._capture_qk_norm_gamma_lists()
+        has_norm = (getattr(module, "q_norm", None) is not None
+                    or getattr(module, "k_norm", None) is not None)
+        captured = bool(
+            getattr(module, "_q_norm_gamma_list", None)
+            or getattr(module, "_k_norm_gamma_list", None))
+        if has_norm and not captured:
+            raise RuntimeError(
+                "qk_norm gamma capture failed for "
+                f"{type(module).__name__}: the module has q_norm/k_norm "
+                "weights but no gamma values were captured — the export "
+                "would silently drop the fused qk_norm.")
 
 
 def _fix_initializer_dtypes(
@@ -719,6 +804,7 @@ def _export_model(
     externalize_weights=None,
 ) -> "list[dict[str, object]]":
     _setup_fp8kv_scales_for_export(model)
+    _capture_qk_norm_gammas_for_export(model)
     spec = model.onnx_export_spec()
 
     translation_table = build_custom_translation_table()
@@ -763,6 +849,9 @@ def _export_model(
                                         "match_fp32_elementwise_initializers",
                                         False)))
     _strip_attention_plugin_optional_inputs(output_path)
+    # Must run after every pass that re-saves with save_as_external_data
+    # (which can re-materialize stray payloads on zero-volume tensors).
+    _fix_zero_volume_initializers(output_path)
     external_weight_files = externalize_model_weights(
         output_path, model, externalize_weights=externalize_weights)
     logger.info("Export complete: %s", output_path)

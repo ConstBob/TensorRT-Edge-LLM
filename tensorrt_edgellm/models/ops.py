@@ -86,9 +86,7 @@ def use_geforce_nvfp4_moe() -> bool:
 
 @torch.library.custom_op("trt::attention_plugin", mutates_args=())
 def attention_plugin(
-    query_states: torch.Tensor,
-    key_states: torch.Tensor,
-    value_states: torch.Tensor,
+    qkv: torch.Tensor,
     past_key_value: torch.Tensor,
     context_lengths: torch.Tensor,
     rope_rotary_cos_sin: torch.Tensor,
@@ -105,6 +103,16 @@ def attention_plugin(
     attention_mask: Optional[torch.Tensor] = None,
     attention_pos_id: Optional[torch.Tensor] = None,
     qkv_scales: Optional[List[float]] = None,
+    q_norm_gamma: Optional[List[float]] = None,
+    k_norm_gamma: Optional[List[float]] = None,
+    # Callers pass the real config value explicitly; the default matches the C++ side
+    # (attentionPlugin.h: mRmsNormEps{1e-6f}) so a stripped attr still behaves correctly.
+    rms_norm_eps: float = 1e-6,
+    # Default 0 so torch.export strips the kwarg for non-qk_norm models.
+    enable_qk_norm: int = 0,
+    # Whether this layer reads K/V from a donated (shared) cache: the packed input
+    # carries Q only. Default 0 so torch.export strips the kwarg for normal layers.
+    enable_kv_shared: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Unified stub for AttentionPlugin covering all feature combinations.
 
@@ -153,26 +161,29 @@ def attention_plugin(
     one contiguous image run whose tokens may attend bidirectionally to
     each other.  This mode is mutually exclusive with tree attention.
 
+    ``qkv`` is the PACKED projection output ``[B, S, (Hq + 2*Hkv) * D]``
+    (Q/K/V concatenated on the last dim — either a single fused QKV GEMM
+    output or ``torch.cat`` of the three separate projections), or
+    ``[B, S, Hq * D]`` (Q only) for shared-KV layers (``enable_kv_shared=1``).
+
     The TRT AttentionPlugin kernel returns a 4-D tensor
     ``[batch, seq_len, num_q_heads, head_size]``.
     The caller (``Attention.forward``) is responsible for reshaping to
     ``[batch, seq_len, num_q_heads * head_size]``.
     """
-    batch_size, seq_len, _ = query_states.shape
+    batch_size, seq_len, _ = qkv.shape
     attn_output = torch.zeros(batch_size,
                               seq_len,
                               num_q_heads,
                               head_size,
-                              dtype=query_states.dtype,
-                              device=query_states.device)
+                              dtype=qkv.dtype,
+                              device=qkv.device)
     present_key_value = torch.zeros_like(past_key_value)
     return attn_output, present_key_value
 
 
 @attention_plugin.register_fake
-def _(query_states,
-      key_states,
-      value_states,
+def _(qkv,
       past_key_value,
       context_lengths,
       rope_rotary_cos_sin,
@@ -188,15 +199,19 @@ def _(query_states,
       enable_vision_block_attention,
       attention_mask=None,
       attention_pos_id=None,
-      qkv_scales=None):
-    batch_size, seq_len, _ = query_states.shape
+      qkv_scales=None,
+      q_norm_gamma=None,
+      k_norm_gamma=None,
+      rms_norm_eps=1e-6,
+      enable_qk_norm=0,
+      enable_kv_shared=0):
+    batch_size, seq_len, _ = qkv.shape
     return (torch.empty(batch_size,
                         seq_len,
                         num_q_heads,
                         head_size,
-                        dtype=query_states.dtype,
-                        device=query_states.device),
-            torch.empty_like(past_key_value))
+                        dtype=qkv.dtype,
+                        device=qkv.device), torch.empty_like(past_key_value))
 
 
 # ---------------------------------------------------------------------------

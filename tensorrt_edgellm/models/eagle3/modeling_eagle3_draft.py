@@ -174,9 +174,7 @@ class Eagle3Attention(nn.Module):
                                          self.num_kv_heads * self.head_dim)
 
         attn_output, present_key_value = attention_plugin(
-            query_states,
-            key_states,
-            value_states,
+            torch.cat([query_states, key_states, value_states], dim=-1),
             past_key_value,
             context_lengths,
             rope_rotary_cos_sin,

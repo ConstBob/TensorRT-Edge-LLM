@@ -37,12 +37,13 @@ from tensorrt_edgellm.models.default.modeling_default import CausalLM
 from tensorrt_edgellm.models.ops import KV_PAGE_SIZE
 from tensorrt_edgellm.onnx.export import _export_model
 
-_NUM_REQUIRED_ATTENTION_INPUTS = 8
+_NUM_REQUIRED_ATTENTION_INPUTS = 6
 
 # ``attention_plugin``'s positional signature ends
-# (..., kvcache_start_index, kv_page_table, ...); a call site must supply at
-# least this many positional args, or pass ``kv_page_table`` as a keyword.
-_MIN_ATTENTION_PLUGIN_POSITIONAL_ARGS = 8
+# (..., kvcache_start_index, kv_page_table, ...) — with the packed-QKV
+# contract that is positional slot 6; a call site must supply at least this
+# many positional args, or pass ``kv_page_table`` as a keyword.
+_MIN_ATTENTION_PLUGIN_POSITIONAL_ARGS = 6
 
 _MODELS_DIR = (pathlib.Path(__file__).resolve().parents[2] /
                "tensorrt_edgellm" / "models")
@@ -110,8 +111,8 @@ def test_attention_plugin_nodes_have_required_inputs(tmp_path):
         assert len(node.input) == _NUM_REQUIRED_ATTENTION_INPUTS, (
             f"AttentionPlugin node {node.name!r} has {len(node.input)} "
             f"inputs, expected {_NUM_REQUIRED_ATTENTION_INPUTS}")
-        assert node.input[7] != "", (
-            "AttentionPlugin input index 7 (kv_page_table) must not be empty")
+        assert node.input[5] != "", (
+            "AttentionPlugin input index 5 (kv_page_table) must not be empty")
 
 
 def test_kv_cache_graph_input_is_pool_shaped(tmp_path):
@@ -181,9 +182,9 @@ def test_attention_plugin_call_sites_pass_kv_page_table():
     for path, node in call_sites:
         if any(kw.arg == "kv_page_table" for kw in node.keywords):
             continue
-        # Positional form: the 8th positional argument slot IS kv_page_table.
-        # Merely counting args would let a stale pre-paged call with >= 8
-        # positional args slip through (its 8th arg would be num_q_heads),
+        # Positional form: the 6th positional argument slot IS kv_page_table
+        # (packed contract). Merely counting args would let a stale call with
+        # enough positional args slip through,
         # so require the expression in that slot to visibly be a page table.
         if len(node.args) < _MIN_ATTENTION_PLUGIN_POSITIONAL_ARGS:
             failures.append(
@@ -195,7 +196,7 @@ def test_attention_plugin_call_sites_pass_kv_page_table():
         slot_src = ast.unparse(slot)
         if "page_table" not in slot_src:
             failures.append(
-                f"{path}:{node.lineno}: attention_plugin( positional arg 8 "
+                f"{path}:{node.lineno}: attention_plugin( positional arg 6 "
                 f"is {slot_src!r}, expected the kv_page_table tensor -- the "
                 "call site predates the paged-KV ABI or binds arguments in "
                 "the wrong order")

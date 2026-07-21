@@ -227,10 +227,9 @@ class DFlashCachedAttention(nn.Module):
             v_self = v_self.reshape(B, BS, self.num_kv_heads * self.head_dim)
 
         # --- AttentionPlugin: proposal attention over full context ---
+        # (packed QKV: dflash applies q/k_norm explicitly above, so pack here)
         attn_4d, present_kv = attention_plugin(
-            q,
-            k_self,
-            v_self,
+            torch.cat([q, k_self, v_self], dim=-1),
             updated_kv,
             context_lengths,
             rope_cos_sin,

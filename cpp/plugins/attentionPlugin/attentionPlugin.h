@@ -146,6 +146,11 @@ private:
     //! load-time error beats a silently wrong deployment.
     void enforceVisionBlockKernelSupport() const;
 
+    //! Resolve one qk_norm gamma engine-weight input to a device pointer
+    //! (nullptr when absent).
+    half const* resolveNormGammaInput(
+        nvinfer1::PluginTensorDesc const* inputDesc, void const* const* inputs, int32_t inputIdx) const;
+
 protected:
     std::string mLayerName; //!< Plugin layer name
     std::string mNamespace; //!< Plugin namespace
@@ -161,6 +166,12 @@ protected:
     int32_t mEnableTreeAttention{};
     //! Whether slot 7 carries [B,S] Gemma4 image block IDs.
     int32_t mEnableVisionBlockAttention{};
+    //! Whether the fused per-head q_norm / k_norm RMSNorm is enabled. When set, the q/k gamma
+    //! engine-weight constants are wired as optional plugin inputs right after the required ones.
+    int32_t mEnableQKNorm{};
+    //! Whether this layer reads K/V from a donated (shared) cache: the packed input carries
+    //! Q only [B, S, Hq*D] and the plugin skips the KV-cache write.
+    int32_t mEnableKVShared{};
 
     //! Datatype of QKV and KV cache. Only supports FP16 as of now.
     nvinfer1::DataType const mDataType{nvinfer1::DataType::kHALF};
@@ -173,6 +184,10 @@ protected:
     //! - v scale: used for FP8 KV cache quantization/dequantization and folded into scaleOutput.
     //! Attention output is always FP16; downstream Q/DQ for o_proj is handled by the TRT graph.
     std::vector<float> mQkvScales{1.f, 1.f, 1.f};
+
+    //! Epsilon for the fused per-head q/k RMSNorm. The gamma weights themselves are
+    //! optional engine-weight constant inputs (wired only when enable_qk_norm).
+    float mRmsNormEps{1e-6f};
 
     //! Sliding window size for attention (-1 = no sliding window, >0 = window size)
     int32_t mSlidingWindowSize = -1;

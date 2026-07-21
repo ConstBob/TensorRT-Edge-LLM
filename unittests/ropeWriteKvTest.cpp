@@ -668,6 +668,153 @@ void BenchmarkRopeWriteKv(
 #endif
 }
 
+//! Fused qk_norm + RoPE on the packed-QKV kernel (launchApplyRopeFromPackedToSplit).
+//! Covers non-power-of-2 lane counts (headDim=96/80 -> ghost-lane padding) and tail tokens
+//! (totalNumTokens not a multiple of tokens-per-CTA), which must join the warp collectives
+//! without storing anything. Reference: per-head RMSNorm + this file's RoPE reference.
+void TestRopePackedFusedNorm(
+    int32_t const batchSize, AttnParams const& attnParams, int32_t const kvCacheCapacity, int32_t const qSeqLen)
+{
+    cudaStream_t stream{nullptr};
+
+    int32_t const headDim = attnParams.headDim;
+    int32_t const rotaryDim = attnParams.rotaryDim;
+    int32_t const numQHeads = attnParams.numQHeads;
+    int32_t const numKVHeads = attnParams.numKVHeads;
+    int32_t const combinedHeads = numQHeads + 2 * numKVHeads;
+    float const rmsEps = 1e-6f;
+    bool const permuteRope = true;
+
+    std::vector<float> cosSinCache(static_cast<size_t>(kvCacheCapacity) * rotaryDim);
+    uniformFloatInitialization(cosSinCache, -1, 1);
+    rt::Tensor cosSinCacheTensor(
+        rt::Coords{1, kvCacheCapacity, rotaryDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    copyHostToDevice(cosSinCacheTensor, cosSinCache);
+
+    std::vector<half> qGamma(headDim);
+    std::vector<half> kGamma(headDim);
+    uniformFloatInitialization(qGamma, 0.5f, 1.5f);
+    uniformFloatInitialization(kGamma, 0.5f, 1.5f);
+    rt::Tensor qGammaTensor(rt::Coords{headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor kGammaTensor(rt::Coords{headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    copyHostToDevice(qGammaTensor, qGamma);
+    copyHostToDevice(kGammaTensor, kGamma);
+
+    std::vector<half> packedInput(static_cast<size_t>(batchSize) * qSeqLen * combinedHeads * headDim);
+    uniformFloatInitialization(packedInput);
+    rt::Tensor packedTensor(
+        rt::Coords{batchSize, qSeqLen, combinedHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    copyHostToDevice(packedTensor, packedInput);
+
+    rt::Tensor qScratchTensor(
+        rt::Coords{batchSize, qSeqLen, numQHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    // Sentinel-fill the KV cache so stray writes (tail tokens / ghost lanes) are detectable.
+    half const sentinel = __float2half(777.f);
+    std::vector<half> kvCacheInit(
+        static_cast<size_t>(batchSize) * 2 * numKVHeads * kvCacheCapacity * headDim, sentinel);
+    rt::Tensor kvCacheTensor(rt::Coords{batchSize, 2, numKVHeads, kvCacheCapacity, headDim}, rt::DeviceType::kGPU,
+        nvinfer1::DataType::kHALF);
+    copyHostToDevice(kvCacheTensor, kvCacheInit);
+
+    launchApplyRopeFromPackedToSplit(cosSinCacheTensor, std::nullopt, std::nullopt, packedTensor, qScratchTensor,
+        kvCacheTensor, 1.0f, 1.0f, stream, /*pageTable=*/nullptr, /*maxPagesPerSeq=*/0, nullptr, nullptr, nullptr, 1.0f,
+        qGammaTensor.dataPointer<half>(), kGammaTensor.dataPointer<half>(), rmsEps);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    auto const qOut = copyDeviceToHost<half>(qScratchTensor);
+    auto const kvCacheOut = copyDeviceToHost<half>(kvCacheTensor);
+    KvCacheIndexer kvIndexer(batchSize, numKVHeads, kvCacheCapacity, headDim);
+
+    // Host reference: RMSNorm (float accumulate, half rounding) then RoPE.
+    auto rmsNormHead = [&](half const* src, std::vector<half> const& gamma) {
+        float sumSq = 0.f;
+        for (int32_t d = 0; d < headDim; ++d)
+        {
+            float const v = __half2float(src[d]);
+            sumSq += v * v;
+        }
+        float const invRms = 1.f / std::sqrt(sumSq / static_cast<float>(headDim) + rmsEps);
+        std::vector<half> normed(headDim);
+        for (int32_t d = 0; d < headDim; ++d)
+        {
+            // Kernel order: fp32 scale, round to half, then half-precision gamma
+            // multiply (exact via fp32 — an 11x11-bit product fits fp32).
+            half const scaledH = __float2half(__half2float(src[d]) * invRms);
+            normed[d] = __float2half(__half2float(scaledH) * __half2float(gamma[d]));
+        }
+        return normed;
+    };
+
+    for (int32_t i = 0; i < batchSize; ++i)
+    {
+        for (int32_t j = 0; j < qSeqLen; ++j)
+        {
+            int64_t const tokenBase = (static_cast<int64_t>(i) * qSeqLen + j) * combinedHeads * headDim;
+            int32_t const cosSinOffset = j * rotaryDim;
+            auto const cosVec = std::vector<float>(
+                cosSinCache.begin() + cosSinOffset, cosSinCache.begin() + cosSinOffset + rotaryDim / 2);
+            auto const sinVec = std::vector<float>(
+                cosSinCache.begin() + cosSinOffset + rotaryDim / 2, cosSinCache.begin() + cosSinOffset + rotaryDim);
+
+            for (int32_t hq = 0; hq < numQHeads; ++hq)
+            {
+                auto const normed = rmsNormHead(packedInput.data() + tokenBase + hq * headDim, qGamma);
+                auto const qRef = ropeRefCosSin(normed, 1, headDim, rotaryDim, cosVec, sinVec, permuteRope);
+                int64_t const qOffset = (static_cast<int64_t>(i) * qSeqLen + j) * numQHeads * headDim + hq * headDim;
+                for (int32_t d = 0; d < headDim; ++d)
+                {
+                    ASSERT_TRUE(isclose(qOut[qOffset + d], qRef[d], 1e-3, 1e-3))
+                        << "Q mismatch b=" << i << " s=" << j << " h=" << hq << " d=" << d;
+                }
+            }
+            for (int32_t hkv = 0; hkv < numKVHeads; ++hkv)
+            {
+                auto const normed = rmsNormHead(packedInput.data() + tokenBase + (numQHeads + hkv) * headDim, kGamma);
+                auto const kRef = ropeRefCosSin(normed, 1, headDim, rotaryDim, cosVec, sinVec, permuteRope);
+                int64_t const vSrcBase = tokenBase + (numQHeads + numKVHeads + hkv) * headDim;
+                for (int32_t d = 0; d < headDim; ++d)
+                {
+                    ASSERT_TRUE(isclose(kvCacheOut[kvIndexer.indexK(i, hkv, j, d)], kRef[d], 1e-3, 1e-3))
+                        << "K cache mismatch b=" << i << " s=" << j << " h=" << hkv << " d=" << d;
+                    ASSERT_TRUE(
+                        isclose(kvCacheOut[kvIndexer.indexV(i, hkv, j, d)], packedInput[vSrcBase + d], 1e-5, 1e-5))
+                        << "V cache mismatch b=" << i << " s=" << j << " h=" << hkv << " d=" << d;
+                }
+            }
+        }
+        // Cache slots past the written sequence must keep the sentinel: tail tokens and
+        // ghost lanes participate in the warp collectives but must not store anything.
+        for (int32_t hkv = 0; hkv < numKVHeads; ++hkv)
+        {
+            for (int32_t slot = qSeqLen; slot < kvCacheCapacity; ++slot)
+            {
+                for (int32_t d = 0; d < headDim; ++d)
+                {
+                    ASSERT_TRUE(__half2float(kvCacheOut[kvIndexer.indexK(i, hkv, slot, d)]) == 777.f
+                        && __half2float(kvCacheOut[kvIndexer.indexV(i, hkv, slot, d)]) == 777.f)
+                        << "Stray KV-cache write b=" << i << " h=" << hkv << " slot=" << slot << " d=" << d;
+                }
+            }
+        }
+    }
+
+    std::cout << "TestRopePackedFusedNorm BatchSize: " << batchSize << " QHeadNum: " << numQHeads
+              << " KVHeadNum: " << numKVHeads << " HeadSize: " << headDim << " RotaryDim: " << rotaryDim
+              << " qSeqLen: " << qSeqLen << std::endl;
+}
+
+TEST(RopePackedFusedNorm, Accuracy)
+{
+    // Power-of-2 lane count baseline (headDim=128 -> 16 lanes, no ghosts); odd seq len for
+    // tail tokens (2*7=14 tokens, 8 tokens/CTA -> the second CTA carries 2 tail rows).
+    TestRopePackedFusedNorm(2, {8, 2, 128, 128}, 16, 7);
+    // headDim=96 -> 12 lanes padded to 16 (4 ghost lanes per head), non-XOR-able RoPE
+    // partner (gmem-reload path), plus tail tokens (2*5=10 tokens, 8 tokens/CTA).
+    TestRopePackedFusedNorm(2, {4, 2, 96, 96}, 16, 5);
+    // headDim=80 -> 10 lanes padded to 16 (6 ghost lanes per head).
+    TestRopePackedFusedNorm(1, {4, 2, 80, 80}, 16, 3);
+}
+
 TEST(RopeWriteKvPrefill, Accuracy)
 {
     // QheadNum = 32, kvHeadNum = 8, headSize = 128, rotaryDim = 128, kvCacheCapacity = 2048, qLen = 512

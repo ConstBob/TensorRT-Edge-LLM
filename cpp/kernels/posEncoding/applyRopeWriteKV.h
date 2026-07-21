@@ -141,5 +141,50 @@ void launchApplyRopeQOnly(
 void launchApplyRopeQOnlyTreeDecoding(
     rt::Tensor const& cosSinCache, rt::Tensor const& tokenPosIds, rt::Tensor& q, cudaStream_t stream);
 
+//! @brief Launch kernel to read a packed QKV tensor, apply RoPE to Q and K, write roped Q to
+//!        a split scratch tensor, and always write roped K and V to KVCache. Optionally also
+//!        mirrors roped K and V to separate scratch tensors for the SEPARATE_Q_K_V FMHA path.
+//!
+//! Packed-input variant of @ref launchApplyRopeWriteKV — one fused QKV tensor in:
+//!   - NORMAL_PREFILL (SEPARATE_Q_K_V FMHA): pass non-null @p kScratchOut / @p vScratchOut.
+//!   - CHUNKED_PREFILL / decode: pass nullptr — K/V are read back from the cache.
+//!   - Tree decoding: pass @p tokenPosIds (-1 = padding token, no cache write).
+//!   - CuTeDSL + FP8: pass @p fp8QOut for FP8 roped Q; otherwise qScratch gets FP16 Q.
+//!
+//! @param[in]  cosSinCache  FP32 tensor [cosSinCacheBatchSize, cosSinCacheSeqLen, rotaryDim]
+//! @param[in]  kvCacheEndLens Optional INT32 tensor [batchSize] — KV cache end position after insertion.
+//!             Pass nullopt for prefill without prior cache (starts at position 0).
+//! @param[in]  tokenPosIds  Optional INT32 tensor [batchSize, runtimeSeqLen] for tree decoding.
+//!             Position -1 marks padding tokens whose Q is zeroed and K/V writes are skipped.
+//! @param[in]  packedQKV    FP16 tensor [batchSize, runtimeSeqLen, Hq+2*Hkv, headDim], read-only.
+//! @param[out] qScratch     FP16 tensor [batchSize, runtimeSeqLen, Hq, headDim] — roped Q output
+//!             (unless @p fp8QOut is non-null, in which case this is unused).
+//! @param[out] kvCache      FP16/FP8 tensor [batchSize, 2, Hkv, kvCacheCapacity, headDim] — K/V written here.
+//! @param[in]  kScale       K dequant scale (quant→orig). Use 1.0f for FP16 KV cache.
+//! @param[in]  vScale       V dequant scale (quant→orig). Use 1.0f for FP16 KV cache.
+//! @param[in]  stream       CUDA stream.
+//! @param[in]  pageTable    Optional INT32 device page table `[batchSize, 2, maxPagesPerSeq]`.
+//!             See launchApplyRopeWriteKV. Pass nullptr for the legacy [B, 2, Hkv, S, D] addressing.
+//! @param[in]  maxPagesPerSeq Page-table inner dimension. Only used when pageTable != nullptr.
+//! @param[out] kScratchOut  Optional FP16 buffer [batchSize, runtimeSeqLen, Hkv, headDim] — mirrored roped K.
+//!             Pass nullptr if downstream does not need scratch K.
+//! @param[out] vScratchOut  Optional FP16 buffer [batchSize, runtimeSeqLen, Hkv, headDim] — mirrored V.
+//!             Pass nullptr if downstream does not need scratch V.
+//! @param[out] fp8QOut      Optional FP8 buffer [batchSize, runtimeSeqLen, Hq, headDim] — FP8-quantized roped Q.
+//!             Pass nullptr for FP16 Q via qScratch.
+//! @param[in]  qScale       Q dequant scale (quant→orig). Only used when @p fp8QOut is non-null.
+//! @param[in]  qNormGamma   Optional FP16 device pointer [headDim] for per-head RMSNorm gamma applied to Q
+//!             BEFORE RoPE. When non-null, qk_norm is computed inside this kernel via warp-shuffle
+//!             reduction across the headDim/vec_size threads of blockDim.x.
+//! @param[in]  kNormGamma   Optional FP16 device pointer [headDim] for per-head RMSNorm gamma applied to K
+//!             BEFORE RoPE. Same conventions as @p qNormGamma. V is never RMSNormed.
+//! @param[in]  rmsNormEps   Epsilon for the RMSNorm formula. Ignored when both gamma pointers are null.
+//! @throws std::runtime_error if tensor shape or data type is incorrect.
+void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::OptionalInputTensor kvCacheEndLens,
+    rt::OptionalInputTensor tokenPosIds, rt::Tensor const& packedQKV, rt::Tensor& qScratch, rt::Tensor& kvCache,
+    float kScale, float vScale, cudaStream_t stream, int32_t const* pageTable, int32_t maxPagesPerSeq,
+    void* kScratchOut = nullptr, void* vScratchOut = nullptr, void* fp8QOut = nullptr, float qScale = 1.0f,
+    half const* qNormGamma = nullptr, half const* kNormGamma = nullptr, float rmsNormEps = 1e-6f);
+
 } // namespace kernel
 } // namespace trt_edgellm
