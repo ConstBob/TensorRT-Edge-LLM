@@ -89,9 +89,10 @@ private:
     std::unique_ptr<EngineExecutor> mDraftExecutor;
     TensorMap mDraftTensorMap;
 
-    Tensor mDraftInputsEmbeds; //!< [B, blockSize, draftHiddenSize] FP16
-    Tensor mDraftTargetHidden; //!< [B, deltaLen, baseOutputHiddenDim] FP16
-    Tensor mDraftOutputLogits; //!< [B, blockSize, vocabSize] FP32
+    Tensor mDraftInputsEmbeds;        //!< [B, blockSize, draftHiddenSize] FP16
+    Tensor mDraftTargetHidden;        //!< Compact scratch for [B, <= blockSize, baseOutputHiddenDim] FP16
+    Tensor mDraftPrefillTargetHidden; //!< Lazy scratch for non-compact round-0 target hidden FP16, max batch reserve
+    Tensor mDraftOutputLogits;        //!< [B, blockSize, vocabSize] FP32
 
     Tensor mDraftPackedAttentionMask; //!< [B, blockSize, divUp(blockSize,32)] INT32
     Tensor mDraftAttentionPosId;      //!< [B, blockSize] INT32

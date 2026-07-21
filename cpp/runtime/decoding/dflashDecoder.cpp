@@ -108,7 +108,6 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
             + std::to_string(mDraftVocabSize) + ").");
 
     int32_t const maxBatch = deployment.maxRuntimeBatchSize();
-    int32_t const maxSeqForDraft = baseCfg.maxKVCacheCapacity;
 
     auto const draftEnginePath = engineDir / "spec_draft.engine";
     LOG_INFO("DFlashDecoder: loading draft engine from %s", draftEnginePath.string().c_str());
@@ -117,8 +116,8 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
 
     mDraftInputsEmbeds = Tensor({maxBatch, mBlockSize, mDraftHiddenSize}, DeviceType::kGPU, nvinfer1::DataType::kHALF,
         "DFlashDraft::inputsEmbeds");
-    mDraftTargetHidden = Tensor({maxBatch, maxSeqForDraft, mBaseOutputHiddenDim}, DeviceType::kGPU,
-        nvinfer1::DataType::kHALF, "DFlashDraft::targetHidden");
+    mDraftTargetHidden = Tensor({maxBatch, mBlockSize, mBaseOutputHiddenDim}, DeviceType::kGPU,
+        nvinfer1::DataType::kHALF, "DFlashDraft::targetHiddenScratch");
     mDraftOutputLogits = Tensor({maxBatch, mBlockSize, mDraftVocabSize}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT,
         "DFlashDraft::outputLogits");
 
@@ -134,7 +133,7 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
     mDraftDeltaLens = Tensor({maxBatch}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "DFlashDraft::deltaLens");
 
     mDraftTensorMap.set(binding_names::kInputsEmbeds, mDraftInputsEmbeds);
-    mDraftTensorMap.set(binding_names::kDFlashTargetHiddenConcat, mDraftTargetHidden);
+    mDraftTensorMap.set(binding_names::kDFlashTargetHiddenConcat, mRuntime.base.pipelineIO.baseHiddenStates);
     mDraftTensorMap.set(binding_names::kLogits, mDraftOutputLogits);
     mDraftTensorMap.set(binding_names::kAttentionMask, mDraftPackedAttentionMask);
     mDraftTensorMap.set(binding_names::kAttentionPosId, mDraftAttentionPosId);
@@ -333,17 +332,56 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
     CUDA_CHECK(cudaMemcpyAsync(mDraftDeltaLens.rawPointer(), mHostDeltaLens.rawPointer(),
         activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
 
-    check::check(
-        mDraftTargetHidden.reshape({activeBatchSize, maxDeltaLen, mBaseOutputHiddenDim}), "Tensor reshape failed");
-    {
-        size_t const elementBytes = utils::getTypeSize(mDraftTargetHidden.getDataType());
+    auto const compactTargetHidden = [&](Tensor& targetHidden) {
+        check::check(
+            targetHidden.reshape({activeBatchSize, maxDeltaLen, mBaseOutputHiddenDim}), "Tensor reshape failed");
+        size_t const elementBytes = utils::getTypeSize(targetHidden.getDataType());
         size_t const rowBytes = static_cast<size_t>(mBaseOutputHiddenDim) * elementBytes;
         size_t const dstPitch = static_cast<size_t>(maxDeltaLen) * rowBytes;
         size_t const srcPitch = static_cast<size_t>(sourceSeqLen) * rowBytes;
         size_t const widthBytes = static_cast<size_t>(maxDeltaLen) * rowBytes;
-        CUDA_CHECK(cudaMemcpy2DAsync(mDraftTargetHidden.rawPointer(), dstPitch,
+        CUDA_CHECK(cudaMemcpy2DAsync(targetHidden.rawPointer(), dstPitch,
             mRuntime.base.pipelineIO.baseHiddenStates.rawPointer(), srcPitch, widthBytes, activeBatchSize,
             cudaMemcpyDeviceToDevice, context.stream));
+        mDraftTensorMap.set(binding_names::kDFlashTargetHiddenConcat, targetHidden);
+    };
+
+    // TensorRT reads dflash_target_hidden_concat as a compact [B, selectLen, H]
+    // tensor. Bind baseHiddenStates directly only when its batch stride already
+    // matches selectLen; otherwise compact into a scratch buffer first.
+    if (context.generationRound == 0 && sourceSeqLen == maxDeltaLen)
+    {
+        // This intentionally narrows baseHiddenStates to the compact draft binding shape. The base runner reshapes
+        // and rebinds it before the next base-engine enqueue.
+        check::check(
+            mRuntime.base.pipelineIO.baseHiddenStates.reshape({activeBatchSize, maxDeltaLen, mBaseOutputHiddenDim}),
+            "Tensor reshape failed");
+        mDraftTensorMap.set(binding_names::kDFlashTargetHiddenConcat, mRuntime.base.pipelineIO.baseHiddenStates);
+    }
+    else
+    {
+        check::check(context.generationRound == 0 || maxDeltaLen <= mBlockSize,
+            "DFlash decode target-hidden delta exceeds block-size scratch.");
+        if (maxDeltaLen <= mBlockSize)
+        {
+            compactTargetHidden(mDraftTargetHidden);
+        }
+        else
+        {
+            // This is only for an uncommon round-0 layout where baseHiddenStates
+            // is wider than the active max prefill length. Keep it lazy so the
+            // normal DFlash path does not pay a max-input/max-KV allocation.
+            int32_t const reserveBatchSize = mRuntime.maxRuntimeBatchSize;
+            int64_t const requiredBytes = static_cast<int64_t>(reserveBatchSize) * maxDeltaLen * mBaseOutputHiddenDim
+                * static_cast<int64_t>(utils::getTypeSize(nvinfer1::DataType::kHALF));
+            if (mDraftPrefillTargetHidden.getMemoryCapacity() < requiredBytes)
+            {
+                mDraftPrefillTargetHidden = Tensor{};
+                mDraftPrefillTargetHidden = Tensor({reserveBatchSize, maxDeltaLen, mBaseOutputHiddenDim},
+                    DeviceType::kGPU, nvinfer1::DataType::kHALF, "DFlashDraft::prefillTargetHiddenScratch");
+            }
+            compactTargetHidden(mDraftPrefillTargetHidden);
+        }
     }
 
     // Step 4: Prepare proposal attention inputs.
@@ -507,6 +545,7 @@ bool DFlashDecoder::captureDraftCudaGraphs(cudaStream_t stream)
             check::check(
                 mDraftTargetHidden.reshape({batchSize, static_cast<int64_t>(simDeltaLen), mBaseOutputHiddenDim}),
                 "Tensor reshape failed");
+            mDraftTensorMap.set(binding_names::kDFlashTargetHiddenConcat, mDraftTargetHidden);
             check::check(mDraftOutputLogits.reshape({batchSize, BS, mDraftVocabSize}), "Tensor reshape failed");
             check::check(mDraftPackedAttentionMask.reshape({batchSize, BS, pmLen}), "Tensor reshape failed");
             check::check(mDraftAttentionPosId.reshape({batchSize, BS}), "Tensor reshape failed");
@@ -965,12 +1004,11 @@ bool DFlashDecoder::runSystemPromptPrefill(DecodingInferenceContext& context)
     kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
         mRuntime.preprocess.embedding.scalesAsOptional(), mDraftInputsEmbeds, context.stream);
 
-    check::check(
-        mDraftTargetHidden.reshape({activeBatchSize, prefillLen, mBaseOutputHiddenDim}), "Tensor reshape failed");
-    size_t const targetHiddenBytes = static_cast<size_t>(activeBatchSize) * prefillLen * mBaseOutputHiddenDim
-        * utils::getTypeSize(mDraftTargetHidden.getDataType());
-    CUDA_CHECK(cudaMemcpyAsync(mDraftTargetHidden.rawPointer(), mRuntime.base.pipelineIO.baseHiddenStates.rawPointer(),
-        targetHiddenBytes, cudaMemcpyDeviceToDevice, context.stream));
+    // This intentionally narrows baseHiddenStates to the compact draft binding shape. The base runner reshapes and
+    // rebinds it before the next base-engine enqueue.
+    check::check(mRuntime.base.pipelineIO.baseHiddenStates.reshape({activeBatchSize, prefillLen, mBaseOutputHiddenDim}),
+        "Tensor reshape failed");
+    mDraftTensorMap.set(binding_names::kDFlashTargetHiddenConcat, mRuntime.base.pipelineIO.baseHiddenStates);
 
     check::check(mHostDeltaLens.reshape({activeBatchSize}), "Tensor reshape failed");
     int32_t* hostDeltaLens = mHostDeltaLens.dataPointer<int32_t>();
