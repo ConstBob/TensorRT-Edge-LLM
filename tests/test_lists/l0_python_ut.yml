@@ -67,6 +67,16 @@ tests:
   - tests/python-unittests/test_gated_delta_net_plugin.py::test_batch_invariance
   - tests/python-unittests/test_gated_delta_net_plugin.py::test_prefill_decode_handoff
 
+  # Marlin MoE plugin tests
+  - tests/python-unittests/test_nvfp4_a16_moe_plugin.py::test_qwen_softmax_swiglu_decode_and_prefill_dynamic_engine
+  - tests/python-unittests/test_nvfp4_a16_moe_plugin.py::test_nemotron_sigmoid_group_relu2_decode_and_prefill_dynamic_engine
+  - tests/python-unittests/test_nvfp4_a16_moe_plugin.py::test_int4_fp16_swiglu_preserves_legacy_rounding
+  - tests/python-unittests/test_nvfp4_a16_moe_plugin.py::test_build_rejects_insufficient_max_routed_rows
+  - tests/python-unittests/test_nvfp4_a16_moe_plugin.py::test_build_rejects_unsupported_activation_or_routing
+  - tests/python-unittests/test_nvfp4_a16_moe_plugin.py::test_build_rejects_wrong_hidden_state_dtype
+  - tests/python-unittests/test_nvfp4_a16_moe_plugin.py::test_build_rejects_nonpositive_sigmoid_routed_scaling_factor
+  - tests/python-unittests/test_nvfp4_a16_moe_plugin.py::test_build_rejects_misaligned_dimensions
+
   # ViT attention plugin tests
   - tests/python-unittests/test_vit_attention_plugin.py::test_ragged_prefill_batch_sizes
   - tests/python-unittests/test_vit_attention_plugin.py::test_window_partition

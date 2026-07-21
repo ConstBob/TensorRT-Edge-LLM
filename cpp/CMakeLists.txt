@@ -86,9 +86,15 @@ file(GLOB_RECURSE COMMON_CPP_SRCS "common/*.cpp")
 file(GLOB_RECURSE KERNELS_CPP_SRCS "kernels/*.cpp")
 edgellm_xqa_add_generated_sources(KERNELS_CPP_SRCS)
 file(GLOB_RECURSE KERNELS_CU_SRCS "kernels/*.cu")
-# Exclude MoE Marlin ops/sm80 - compiled only via include from moeMarlin.cu
-list(FILTER KERNELS_CU_SRCS EXCLUDE REGEX
-     "marlin_moe_wna16/(ops|sm80_kernel_float16_u4_float16)\\.cu$")
+# Exclude MoE Marlin ops/instantiations - compiled only via include from
+# moeMarlin.cu.
+list(
+  FILTER
+  KERNELS_CU_SRCS
+  EXCLUDE
+  REGEX
+  "marlin_moe_wna16/(ops|sm80_kernel_(float16_u4_float16|float16_fe2m1_float16|bfloat16_fe2m1_bfloat16))\\.cu$"
+)
 file(GLOB_RECURSE SAMPLER_CPP_SRCS "sampler/*.cpp")
 file(GLOB_RECURSE SAMPLER_CU_SRCS "sampler/*.cu")
 file(GLOB_RECURSE MULTIMODAL_CPP_SRCS "multimodal/*.cpp")

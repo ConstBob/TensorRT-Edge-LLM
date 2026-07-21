@@ -18,6 +18,7 @@
 #include "common/cudaUtils.h"
 #include "moeMarlinIndicesKernels.h"
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
 namespace trt_edgellm
@@ -66,26 +67,77 @@ __global__ void buildMarlinIndicesKernel(int32_t const* slotsByExpertWorkspace, 
     }
 }
 
-// Aggregate slot outputs back to tokens: sum over topK in slot order
-__global__ void aggregateSlotOutputsKernel(
-    half const* slotOutputs, half* aggregatedOutput, int32_t numTokens, int32_t topK, int32_t outDim)
+namespace
 {
-    int32_t tokenId = blockIdx.x;
-    int32_t dimIdx = blockIdx.y * blockDim.x + threadIdx.x;
 
-    if (tokenId >= numTokens || dimIdx >= outDim)
-        return;
+constexpr int32_t kAggregateThreadsPerBlock{256};
 
-    float accum = 0.0f;
-    int32_t base = tokenId * topK;
-    for (int32_t k = 0; k < topK; ++k)
+template <typename T>
+struct AggregationTypeTraits;
+
+template <>
+struct AggregationTypeTraits<half>
+{
+    static __device__ float toFloat(half const value)
     {
-        int32_t slot = base + k;
-        accum += __half2float(slotOutputs[slot * outDim + dimIdx]);
+        return __half2float(value);
     }
 
-    aggregatedOutput[tokenId * outDim + dimIdx] = __float2half(accum);
+    static __device__ half fromFloat(float const value)
+    {
+        return __float2half(value);
+    }
+};
+
+template <>
+struct AggregationTypeTraits<__nv_bfloat16>
+{
+    static __device__ float toFloat(__nv_bfloat16 const value)
+    {
+        return __bfloat162float(value);
+    }
+
+    static __device__ __nv_bfloat16 fromFloat(float const value)
+    {
+        return __float2bfloat16_rn(value);
+    }
+};
+
+// Aggregate slot outputs back to tokens: sum over topK in slot order.
+template <typename T>
+__global__ void aggregateSlotOutputsKernel(
+    T const* slotOutputs, T* aggregatedOutput, int32_t numTokens, int32_t topK, int32_t outDim)
+{
+    int32_t const tokenId = blockIdx.x;
+    int32_t const dimIdx = blockIdx.y * blockDim.x + threadIdx.x;
+
+    if (tokenId >= numTokens || dimIdx >= outDim)
+    {
+        return;
+    }
+
+    float accum = 0.0F;
+    int32_t const base = tokenId * topK;
+    for (int32_t k = 0; k < topK; ++k)
+    {
+        int32_t const slot = base + k;
+        accum += AggregationTypeTraits<T>::toFloat(slotOutputs[slot * outDim + dimIdx]);
+    }
+
+    aggregatedOutput[tokenId * outDim + dimIdx] = AggregationTypeTraits<T>::fromFloat(accum);
 }
+
+template <typename T>
+void launchAggregateSlotOutputsKernelImpl(
+    T const* slotOutputs, T* aggregatedOutput, int32_t numTokens, int32_t topK, int32_t outDim, cudaStream_t stream)
+{
+    dim3 const grid(numTokens, static_cast<uint32_t>(trt_edgellm::divUp(outDim, kAggregateThreadsPerBlock)));
+    dim3 const block(kAggregateThreadsPerBlock);
+    aggregateSlotOutputsKernel<T><<<grid, block, 0, stream>>>(slotOutputs, aggregatedOutput, numTokens, topK, outDim);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
 
 void launchBuildMarlinIndicesKernel(int32_t const* slotsByExpertWorkspace, int32_t const* slotsPerExpertWorkspace,
     int32_t const* paddedCounts, int32_t const* paddedOffsets, float const* topkWeights, int32_t* sortedTokenIds,
@@ -101,11 +153,15 @@ void launchBuildMarlinIndicesKernel(int32_t const* slotsByExpertWorkspace, int32
 void launchAggregateSlotOutputsKernel(void const* slotOutputs, void* aggregatedOutput, int32_t numTokens, int32_t topK,
     int32_t outDim, cudaStream_t stream)
 {
-    dim3 grid(numTokens, static_cast<uint32_t>(trt_edgellm::divUp(outDim, 256)));
-    dim3 block(256);
-    aggregateSlotOutputsKernel<<<grid, block, 0, stream>>>(
-        static_cast<half const*>(slotOutputs), static_cast<half*>(aggregatedOutput), numTokens, topK, outDim);
-    CUDA_CHECK(cudaGetLastError());
+    launchAggregateSlotOutputsKernelImpl(
+        static_cast<half const*>(slotOutputs), static_cast<half*>(aggregatedOutput), numTokens, topK, outDim, stream);
+}
+
+void launchAggregateSlotOutputsBf16Kernel(void const* slotOutputs, void* aggregatedOutput, int32_t numTokens,
+    int32_t topK, int32_t outDim, cudaStream_t stream)
+{
+    launchAggregateSlotOutputsKernelImpl(static_cast<__nv_bfloat16 const*>(slotOutputs),
+        static_cast<__nv_bfloat16*>(aggregatedOutput), numTokens, topK, outDim, stream);
 }
 
 } // namespace kernel

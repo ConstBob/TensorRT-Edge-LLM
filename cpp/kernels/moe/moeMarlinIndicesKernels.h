@@ -39,5 +39,13 @@ void launchBuildMarlinIndicesKernel(int32_t const* slotsByExpertWorkspace, int32
 void launchAggregateSlotOutputsKernel(void const* slotOutputs, void* aggregatedOutput, int32_t numTokens, int32_t topK,
     int32_t outDim, cudaStream_t stream);
 
+/**
+ * @brief Launch the BF16 slot-output aggregation kernel.
+ *
+ * Each output element is accumulated over topK slots in FP32 and converted to BF16 once at the final store.
+ */
+void launchAggregateSlotOutputsBf16Kernel(void const* slotOutputs, void* aggregatedOutput, int32_t numTokens,
+    int32_t topK, int32_t outDim, cudaStream_t stream);
+
 } // namespace kernel
 } // namespace trt_edgellm
