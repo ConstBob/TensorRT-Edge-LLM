@@ -1122,7 +1122,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                 ffpaParams.numQHeads = mNumQHeads;
                 ffpaParams.numKVHeads = mNumKVHeads;
                 ffpaParams.headDim = mHeadSize;
-                ffpaParams.softmaxScale = 1.0F / std::sqrt(static_cast<float>(mHeadSize));
+                ffpaParams.softmaxScale = mAttentionScale;
                 CuteDslFFPARunner::run(ffpaParams, stream);
                 return 0;
             }

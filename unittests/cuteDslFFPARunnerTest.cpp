@@ -295,7 +295,11 @@ INSTANTIATE_TEST_SUITE_P(FP16Causal, CuteDslFFPAAccuracySweep,
         ShapeParam{1, 256, 4, 1, /*useNormalInit=*/true, "mqa_g4_H4_KV1"},
         ShapeParam{1, 1024, 8, 1, /*useNormalInit=*/true, "mqa_H8_KV1_1k"},
         // Gemma4 Unified 12B global-attention layers use Hq=16, Hkv=1.
-        ShapeParam{1, 128, 16, 1, /*useNormalInit=*/true, "gemma4_mqa_g16_H16_KV1"}),
+        ShapeParam{1, 128, 16, 1, /*useNormalInit=*/true, "gemma4_mqa_g16_H16_KV1"},
+        // Br/Bc-unaligned lengths exercising the KV tail block.
+        ShapeParam{1, 45, 16, 1, /*useNormalInit=*/true, "gemma4_g16_S45_tail"},
+        ShapeParam{1, 282, 16, 1, /*useNormalInit=*/true, "gemma4_g16_S282_tail"},
+        ShapeParam{1, 45, 8, 1, /*useNormalInit=*/true, "gqa8_S45_tail_control"}),
     [](::testing::TestParamInfo<ShapeParam> const& info) { return std::string{info.param.name}; });
 
 class CuteDslFFPACausalProperty : public CuteDslFFPABase, public ::testing::WithParamInterface<float>
@@ -996,6 +1000,32 @@ TEST_F(CuteDslFFPAVisionBlock, SentinelDegeneratesToCausal)
     int32_t constexpr kSeqLen = 130; // Br/Bc-unaligned on purpose
     std::vector<int32_t> const blockIds(kSeqLen, -1);
     runAndCheck(blockIds, {kSeqLen}, kSeqLen, 4, 2, /*poisonPadding=*/false, "sentinel_degenerates_to_causal");
+}
+
+// Gemma4-12B Unified head shape (Hq=16, Hkv=1) at Br/Bc-unaligned lengths.
+TEST_F(CuteDslFFPAVisionBlock, SentinelCausalG16UnalignedS45)
+{
+    int32_t constexpr kSeqLen = 45;
+    std::vector<int32_t> const blockIds(kSeqLen, -1);
+    runAndCheck(blockIds, {kSeqLen}, kSeqLen, 16, 1, /*poisonPadding=*/false, "sentinel_g16_s45");
+}
+
+TEST_F(CuteDslFFPAVisionBlock, SentinelCausalG16UnalignedS283)
+{
+    int32_t constexpr kSeqLen = 283;
+    std::vector<int32_t> const blockIds(kSeqLen, -1);
+    runAndCheck(blockIds, {kSeqLen}, kSeqLen, 16, 1, /*poisonPadding=*/false, "sentinel_g16_s283");
+}
+
+TEST_F(CuteDslFFPAVisionBlock, ImageSpanG16UnalignedS282)
+{
+    int32_t constexpr kSeqLen = 282; // mirrors the 12B probe: boi@4, image 5..270, eoi@271
+    std::vector<int32_t> blockIds(kSeqLen, -1);
+    for (int32_t s = 5; s <= 270; ++s)
+    {
+        blockIds[static_cast<size_t>(s)] = 0;
+    }
+    runAndCheck(blockIds, {kSeqLen}, kSeqLen, 16, 1, /*poisonPadding=*/false, "image_span_g16_s282");
 }
 
 class CuteDslFFPANegativePath : public CuteDslFFPABase

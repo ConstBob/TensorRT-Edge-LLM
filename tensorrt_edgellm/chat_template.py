@@ -56,8 +56,13 @@ _HARDCODED_TEMPLATE_MAP: Dict[str, str] = {
     "qwen3_omni_moe_talker": "qwen3_omni.json",
     # Gemma4 uses <bos><|turn>system/user/model tokens; Jinja extraction
     # fails when tokenizer.json is absent from standalone checkpoints.
+    # The Unified variants share the same turn structure; without the map
+    # entry they fall through to Jinja extraction, whose template emits the
+    # thought channel unconditionally in generation_prompt (nvbug 6485157).
     "gemma4_text": "gemma4.json",
     "gemma4": "gemma4.json",
+    "gemma4_unified": "gemma4.json",
+    "gemma4_unified_text": "gemma4.json",
 }
 
 
