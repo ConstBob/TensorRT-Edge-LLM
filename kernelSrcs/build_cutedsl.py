@@ -294,6 +294,38 @@ KERNEL_VARIANTS = [
         script="fmha_cutedsl_blackwell/fmha.py",
         script_args=["--q_shape", "1,1024,16,256", "--k_shape", "1,1024,2,256"] + _LLM,
     ),
+    # D512 paged prefill. Keep every generated variant in the common Blackwell
+    # FMHA artifact so D512 shares the existing LLM module lifecycle and ABI.
+    KernelVariant(
+        name="fmha_d512_paged",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,8,512", "--k_shape", "1,1024,1,512"] + _LLM_PAGED,
+    ),
+    KernelVariant(
+        name="fmha_d512_sw_paged",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,8,512", "--k_shape", "1,1024,1,512"]
+                    + _LLM_PAGED + ["--window_size", "4096,-1"],
+    ),
+    KernelVariant(
+        name="fmha_d512_paged_fp8",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,8,512", "--k_shape", "1,1024,1,512"] + _LLM_FP8_PAGED,
+    ),
+    KernelVariant(
+        name="fmha_d512_sw_paged_fp8",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,8,512", "--k_shape", "1,1024,1,512"]
+                    + _LLM_FP8_PAGED + ["--window_size", "4096,-1"],
+    ),
     KernelVariant(
         name="fmha_d64_sw",
         group="fmha",

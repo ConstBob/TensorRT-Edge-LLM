@@ -38,15 +38,19 @@ The build produces AOT-compiled kernel objects (`.o` + `.h` pairs):
 | `fmha_d64_paged` | 64 | No | LLM (paged) | Yes |
 | `fmha_d128_paged` | 128 | No | LLM (paged) | Yes |
 | `fmha_d256_paged` | 256 | No | LLM (paged) | Yes |
+| `fmha_d512_paged` | 256 | No | LLM (paged) | Yes |
 | `fmha_d64_sw_paged` | 64 | Yes | LLM (paged) | Yes |
 | `fmha_d128_sw_paged` | 128 | Yes | LLM (paged) | Yes |
 | `fmha_d256_sw_paged` | 256 | Yes | LLM (paged) | Yes |
+| `fmha_d512_sw_paged` | 256 | Yes | LLM (paged) | Yes |
 | `fmha_d64_paged_fp8` | 64 | No | LLM (paged+FP8) | Yes |
 | `fmha_d128_paged_fp8` | 128 | No | LLM (paged+FP8) | Yes |
 | `fmha_d256_paged_fp8` | 256 | No | LLM (paged+FP8) | Yes |
+| `fmha_d512_paged_fp8` | 256 | No | LLM (paged+FP8) | Yes |
 | `fmha_d64_sw_paged_fp8` | 64 | Yes | LLM (paged+FP8) | Yes |
 | `fmha_d128_sw_paged_fp8` | 128 | Yes | LLM (paged+FP8) | Yes |
 | `fmha_d256_sw_paged_fp8` | 256 | Yes | LLM (paged+FP8) | Yes |
+| `fmha_d512_sw_paged_fp8` | 256 | Yes | LLM (paged+FP8) | Yes |
 | `vit_fmha_d64` | 64 | No | ViT | No |
 | `vit_fmha_d72` | 72 | No | ViT | No |
 | `vit_fmha_d80` | 80 | No | ViT | No |
@@ -91,6 +95,13 @@ python3 fmha.py \
   --window_size 4096,-1 \
   --export_only --output_dir ./out --file_name fmha_d64_sw --function_prefix fmha_d64_sw
 
+# LLM d512 full-causal paged prefill
+python3 fmha.py \
+  --q_shape 1,1024,8,512 --k_shape 1,1024,1,512 \
+  --is_causal --is_persistent --bottom_right_align --paged_kv \
+  --export_only --output_dir ./out \
+  --file_name fmha_d512_paged --function_prefix fmha_d512_paged
+
 # ViT d64
 python3 fmha.py \
   --q_shape 1,1024,14,64 --k_shape 1,1024,14,64 \
@@ -126,9 +137,13 @@ provides the C++ interface:
 - **Module loading**: `loadLLMKernelModule()` / `loadViTKernelModule()` — loads
   the AOT-compiled CUDA libraries. Thread-safe (static, guarded by mutex).
 - **Dispatch**: `canImplement(headSize, smVersion)` — returns `true` for
-  SM >= 100 and head dim 64 or 128.
+  SM100/101/110 and head dim 64, 128, 256, or 512.
 - **LLM run**: `run(qPtr, kvPtr, oPtr, cuKVSeqLens, stream, slidingWindowSize)`
-  — dispatches to the appropriate d64/d128 + SWA/non-SWA variant.
+  — dispatches to the appropriate d64/d128/d256 + SWA/non-SWA variant.
+- **Paged LLM run**:
+  `runPaged(qPtr, pagedKVPoolPtr, pageTable, oPtr, paddedCuKVSeqLens, ...)`
+  — dispatches D64/D128/D256 and the full-causal FP16 D512 variant through the
+  common paged ABI.
 - **ViT run**: `run(qPtr, kPtr, vPtr, oPtr, cuSeqLens, totalSeqLen, maxSeqLen, batchSize, stream)`
   — dispatches to the appropriate d64/d72/d80/d128 variant.
 
@@ -155,6 +170,8 @@ as the primary path on Blackwell, with automatic fallback to FMHA_v2.
 Key adaptations from upstream:
 - Replaced PyTorch with CuPy/NumPy
 - Fused KV cache layout `(B, 2, H_kv, S_k, D)` instead of separate K/V
+- Direct paged-KV loading, including four K stages and the CTA-owned two V
+  stages for D512
 - Dynamic batch/seq_len/nheads as runtime arguments
 - Sliding window attention with compile-time dispatch
 - ViT mode with packed varlen bidirectional attention

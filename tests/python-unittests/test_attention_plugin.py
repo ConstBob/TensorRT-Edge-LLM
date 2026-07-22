@@ -395,7 +395,7 @@ class AttentionPluginRunner:
             "kv_cache": (pool_shape, pool_shape, pool_shape),
             "context_lengths": ((1, ), (p.batch_size, ), (mb, )),
             "rope_cos_sin": ((1, mpe, D), (1, mpe, D), (1, mpe, D)),
-            "kv_cache_indices": ((1, ), (p.batch_size, ), (mb, )),
+            "kv_cache_indices": ((0, ), (p.batch_size, ), (mb, )),
             "kv_page_table": ((1, 2, self.mpps), (p.batch_size, 2, self.mpps),
                               (mb, 2, self.mpps)),
         }
@@ -663,8 +663,15 @@ def _run_rounds(p: AttentionParams,
                                                   k_norm_gamma=k_norm_gamma,
                                                   rms_norm_eps=p.rms_norm_eps)
 
-        attn_out, plugin_kv = runner.run(qkv_plugin, plugin_kv, ctx_len,
-                                         combined, cache_idx)
+        # First prefill
+        input_shapes = {"kv_cache_indices": (0, )} \
+            if p.is_prefill and r == 0 else None
+        attn_out, plugin_kv = runner.run(qkv_plugin,
+                                         plugin_kv,
+                                         ctx_len,
+                                         combined,
+                                         cache_idx,
+                                         input_shapes=input_shapes)
         pk, pv = _plugin_kv_to_ref(plugin_kv, p)
 
         assert_close(f"attn[r{r}]",
@@ -700,12 +707,13 @@ BASE = dict(num_q_heads=8,
 
 # --------------------------------------------------------------------------- #
 # (head_size, num_q_heads, num_kv_heads) sweep, shared by the GQA prefill and
-# decode tests. The plugin requires BOTH a prefill path (FMHA, or FFPA for
-# head 512) and the decode XQA path to support a config. Supported space:
+# decode tests. The plugin requires BOTH a prefill path (FMHA or FFPA) and the
+# decode XQA path to support a config. Supported space:
 #   head 64/128 -> GQA ratio 1..8 (head 128 also supports ratio 16, Nemotron-H);
 #   head 256    -> GQA ratio 2/4/6/8 only (XQA constraint; Qwen3.5 family);
-#   head 512    -> GQA ratio 4/8/16 only (FFPA prefill + XQA-512 decode,
-#                  Gemma4 E4B/E2B/Gemma4 12B global attention layers).
+#   head 512    -> GQA ratio 2 through D512 CuTe DSL paged prefill;
+#                  ratios 4/8 also have FFPA fallback and XQA-512 decode
+#                  (Gemma4 E4B/E2B global attention layers).
 # head 32 is excluded from this sweep: the prefill FMHA has no head-32 kernel,
 # so the plugin runs in the degraded XQA-only mode (decode works, covered by
 # test_decode_head32 below; prefill has no kernel and enqueue fails).
@@ -734,8 +742,7 @@ ATTN_CONFIGS = [
     (512, 16, 1),
 ]
 
-# Prefill side of the sweep: head 512 is excluded (FFPA dense-causal prefill
-# has its own dedicated tests below).
+# Prefill side of the sweep: head 512 has its own routing test below.
 PREFILL_CONFIGS = [c for c in ATTN_CONFIGS if c[0] != 512]
 
 
@@ -770,11 +777,10 @@ def test_gqa_prefill(head_size, num_q_heads, num_kv_heads):
 
 
 # --------------------------------------------------------------------------- #
-# head 512 prefill (FFPA path). FMHA has no head-512 kernels, so prefill runs
-# the FFPA d512 causal kernel (Ampere instruction floor, all SMs). kv1/kv2 are
-# the Gemma4 E2B / E4B / 12B global-attention-layer configs. Round 2 is a chunked
-# continuation: FFPA reads the cache prefix back and per-batch cu_kv_seqlens
-# drive the bottom-right causal offset.
+# head 512 prefill routing. On SM100/101/110 with the D512 paged artifact,
+# round 1 uses normal prefill and round 2 uses chunked prefill through the same
+# common paged FMHA ABI. Other builds retain FFPA where supported. kv1/kv2 are
+# the Gemma4 E2B / E4B global-attention-layer configs.
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("num_q_heads,num_kv_heads", [(8, 1), (8, 2), (16, 1)],
                          ids=["q8_kv1", "q8_kv2", "q16_kv1"])
@@ -785,6 +791,75 @@ def test_prefill_head512(num_q_heads, num_kv_heads):
     cfg["num_kv_heads"] = num_kv_heads
     p = AttentionParams(batch_size=2, seq_len=8, is_prefill=True, **cfg)
     _run_rounds(p, num_rounds=2, atol=1e-2, rtol=1e-2)
+
+
+# FFPA does not support GQA ratio 2 for D512, so fallback is impossible:
+# numerical success across both rounds proves the D512 CuTe DSL module was
+# loaded and both normal and chunked paged routes launched it.
+@pytest.mark.skipif(_device_sm() not in (100, 101, 110),
+                    reason="D512 CuTe DSL FMHA requires SM100/101/110")
+def test_prefill_head512_cutedsl_gqa_2():
+    cfg = dict(BASE)
+    cfg["head_size"] = 512
+    cfg["num_q_heads"] = 4
+    cfg["num_kv_heads"] = 2
+    p = AttentionParams(batch_size=2, seq_len=8, is_prefill=True, **cfg)
+    _run_rounds(p, num_rounds=2, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("case",
+                         ["vision_fp8", "tree_vision", "vision_sliding"])
+def test_head512_retained_vision_rejections(case):
+    """Vision D512 stays on the specialized path and rejects unsupported mixes."""
+    PluginRunner()
+    registry = trt.get_plugin_registry()
+    creator = registry.get_creator("AttentionPlugin", "1", "")
+    assert creator is not None
+    enable_fp8 = case == "vision_fp8"
+    fields = [
+        pf_int32("num_q_heads", 8),
+        pf_int32("num_kv_heads", 2),
+        pf_int32("head_size", 512),
+        pf_int32("enable_tree_attention", int(case == "tree_vision")),
+        pf_int32("enable_vision_block_attention", 1),
+        pf_int32("enable_fp8_kv_cache", int(enable_fp8)),
+        pf_int32("sliding_window_size", 4 if case == "vision_sliding" else -1),
+    ]
+    if enable_fp8:
+        fields.append(pf_float32("qkv_scales", [0.5, 0.25, 0.125]))
+    plugin = creator.create_plugin("AttentionPlugin",
+                                   trt.PluginFieldCollection(fields),
+                                   trt.TensorRTPhase.BUILD)
+    assert plugin is None
+
+
+def test_head512_shared_fp8_prefill_rejected():
+    cfg = dict(BASE)
+    cfg.update(head_size=512,
+               num_q_heads=4,
+               num_kv_heads=2,
+               enable_fp8_kv_cache=True,
+               qkv_scales=[0.5, 0.25, 0.125])
+    p = AttentionParams(batch_size=2, seq_len=8, is_prefill=True, **cfg)
+    runner = AttentionPluginRunner(p, enable_kv_shared=1)
+    gen = torch.Generator().manual_seed(5152)
+    _, _, combined = _make_rope(p, gen)
+    _, _, plugin_kv = _empty_caches(p)
+    q = torch.randn((p.batch_size, p.seq_len, p.q_hidden),
+                    generator=gen,
+                    dtype=torch.float32).to(DEV)
+    ctx_len = torch.full((p.batch_size, ),
+                         p.seq_len,
+                         dtype=torch.int32,
+                         device=DEV)
+    cache_idx = torch.zeros(p.batch_size, dtype=torch.int32, device=DEV)
+    with pytest.raises(RuntimeError, match="execute_async_v3 returned False"):
+        runner.run(q.to(torch.float16),
+                   plugin_kv,
+                   ctx_len,
+                   combined,
+                   cache_idx,
+                   input_shapes={"kv_cache_indices": (0, )})
 
 
 # --------------------------------------------------------------------------- #
@@ -1029,6 +1104,105 @@ def test_tree_attention_qknorm():
     gen = torch.Generator().manual_seed(1012)
     qg, kg = _make_qk_norm_gammas(BASE["head_size"], gen)
     _tree_attention_rounds(q_norm_gamma=qg, k_norm_gamma=kg)
+
+
+@pytest.mark.skipif(_device_sm() not in (100, 101, 110),
+                    reason="D512 CuTe DSL FMHA requires SM100/101/110")
+@pytest.mark.parametrize("sliding_window", [-1, 4], ids=["causal", "sliding"])
+def test_tree_attention_head512_prefill_then_decode(sliding_window):
+    cfg = dict(BASE)
+    cfg.update(head_size=512,
+               num_q_heads=4,
+               num_kv_heads=2,
+               sliding_window_size=sliding_window)
+    p = AttentionParams(batch_size=2, seq_len=8, is_prefill=True, **cfg)
+    runner = AttentionPluginRunner(p, enable_tree_attention=True)
+    gen = torch.Generator().manual_seed(5120 + max(sliding_window, 0))
+    cos, sin, combined = _make_rope(p, gen)
+    ref_k, ref_v, plugin_kv = _empty_caches(p)
+    placeholder_mask = torch.ones((p.batch_size, 1, 1),
+                                  dtype=torch.int32,
+                                  device=DEV)
+    placeholder_pos = torch.zeros((p.batch_size, 1),
+                                  dtype=torch.int32,
+                                  device=DEV)
+
+    # Tree-enabled engines still use ordinary FMHA for normal and chunked
+    # prefill. A length-one position-id input is the runtime mode convention.
+    for round_idx, pos in enumerate((0, p.seq_len)):
+        qkv = torch.randn((p.batch_size, p.seq_len, p.qkv_hidden_size),
+                          generator=gen,
+                          dtype=torch.float32).to(DEV)
+        pos_ids = torch.arange(pos,
+                               pos + p.seq_len,
+                               dtype=torch.int32,
+                               device=DEV)[None].repeat(p.batch_size, 1)
+        cache_idx = torch.full((p.batch_size, ),
+                               pos,
+                               dtype=torch.int32,
+                               device=DEV)
+        ctx_len = torch.full((p.batch_size, ),
+                             pos + p.seq_len,
+                             dtype=torch.int32,
+                             device=DEV)
+        mask = sliding_window_mask(p.seq_len, pos + p.seq_len, sliding_window,
+                                   DEV)
+        ref_out, ref_k, ref_v = compute_attention(qkv.float(), ref_k, ref_v,
+                                                  cos, sin, pos_ids, cache_idx,
+                                                  p, mask)
+        input_shapes = {"kv_cache_indices": (0, )} if round_idx == 0 else None
+        attn_out, plugin_kv = runner.run(qkv.to(torch.float16),
+                                         plugin_kv,
+                                         ctx_len,
+                                         combined,
+                                         cache_idx,
+                                         placeholder_mask,
+                                         placeholder_pos,
+                                         input_shapes=input_shapes)
+        assert_close(f"tree-d512-prefill[r{round_idx}]",
+                     ref_out,
+                     attn_out,
+                     atol=8e-2,
+                     rtol=2e-2,
+                     cos_threshold=0.9999)
+
+    # A full-width position-id input selects tree decode, which must use XQA.
+    width = 4
+    p_tree = AttentionParams(batch_size=p.batch_size,
+                             seq_len=width,
+                             is_prefill=False,
+                             **cfg)
+    tree_mask, _ = get_tree_attention_mask(width)
+    packed = pack_tree_mask(tree_mask, width, p.batch_size).to(DEV)
+    tree_mask = tree_mask.to(DEV)
+    pos = 2 * p.seq_len
+    depth = torch.tensor([0, 1, 1, 2], dtype=torch.int32, device=DEV)
+    pos_ids = (pos + depth)[None].repeat(p.batch_size, 1)
+    cache_idx = torch.full((p.batch_size, ),
+                           pos,
+                           dtype=torch.int32,
+                           device=DEV)
+    ctx_len = torch.full((p.batch_size, ),
+                         pos + width,
+                         dtype=torch.int32,
+                         device=DEV)
+    full_mask = torch.ones((width, pos + width), dtype=torch.int32, device=DEV)
+    full_mask[:, pos:] = tree_mask
+    if sliding_window > 0:
+        full_mask[:, :max(0, pos + width - sliding_window)] = 0
+    qkv = torch.randn((p.batch_size, width, p.qkv_hidden_size),
+                      generator=gen,
+                      dtype=torch.float32).to(DEV)
+    ref_out, _, _ = compute_attention(qkv.float(), ref_k, ref_v, cos, sin,
+                                      pos_ids, cache_idx, p_tree, full_mask)
+    attn_out, _ = runner.run(qkv.to(torch.float16), plugin_kv, ctx_len,
+                             combined, cache_idx, packed, pos_ids)
+    assert_close("tree-d512-decode",
+                 ref_out,
+                 attn_out,
+                 atol=8e-2,
+                 rtol=2e-2,
+                 cos_threshold=0.9999)
 
 
 def _tree_from_parents(parent):
@@ -1345,6 +1519,51 @@ def _ragged_qkv(seqlens, p, gen):
     return qkv
 
 
+# D512 paged normal-prefill ragged coverage. The physical S=257 tensor crosses
+# both 128-token CTA boundaries; padded cumulative KV lengths match the common
+# batch-strided Q ABI, while poisoned padding and valid-row checks catch reads
+# outside each request's logical prefix.
+@pytest.mark.skipif(_device_sm() not in (100, 101, 110),
+                    reason="D512 CuTe DSL FMHA requires SM100/101/110")
+def test_ragged_prefill_head512_cutedsl():
+    seqlens = [1, 128, 257]
+    cfg = dict(BASE)
+    cfg["num_q_heads"] = 4
+    cfg["num_kv_heads"] = 2
+    cfg["head_size"] = 512
+    cfg["kv_cache_capacity"] = 257
+    cfg["max_batch_size"] = len(seqlens)
+    cfg["max_seq_len"] = 257
+    cfg["max_position_embeddings"] = 257
+    p = AttentionParams(batch_size=len(seqlens),
+                        seq_len=257,
+                        is_prefill=True,
+                        **cfg)
+    gen = torch.Generator().manual_seed(512257)
+    runner = AttentionPluginRunner(p)
+    cos, sin, combined = _make_rope(p, gen)
+    _, _, plugin_kv = _empty_caches(p)
+    qkv = _ragged_qkv(seqlens, p, gen)
+    ctx_len = torch.tensor(seqlens, dtype=torch.int32, device=DEV)
+    cache_idx = torch.zeros(len(seqlens), dtype=torch.int32, device=DEV)
+    attn_out, _ = runner.run(qkv.to(torch.float16),
+                             plugin_kv,
+                             ctx_len,
+                             combined,
+                             cache_idx,
+                             input_shapes={"kv_cache_indices": (0, )})
+    ref_rows = _ragged_prefill_ref(qkv.float(), cos, sin, seqlens, p)
+    # D512's two-CTA FP16 accumulation order has a wider elementwise envelope
+    # at S=257; retain a tight cosine gate to catch structural masking errors.
+    for b, length in enumerate(seqlens):
+        assert_close(f"d512-ragged.b{b}",
+                     ref_rows[b],
+                     attn_out[b, :length],
+                     atol=8e-2,
+                     rtol=2e-2,
+                     cos_threshold=0.9999)
+
+
 # Required even/uneven batch cases (bs 1/2/3/4/8, seq up to 2048) as one ragged
 # prefill call, per-row context_lengths, padding poisoned.
 @pytest.mark.parametrize("label,seqlens", RAGGED_CASES)
@@ -1357,8 +1576,12 @@ def test_ragged_prefill(label, seqlens):
     qkv = _ragged_qkv(seqlens, p, gen)
     ctx_len = torch.tensor(seqlens, dtype=torch.int32, device=DEV)
     cache_idx = torch.zeros(len(seqlens), dtype=torch.int32, device=DEV)
-    attn_out, _ = runner.run(qkv.to(torch.float16), plugin_kv, ctx_len,
-                             combined, cache_idx)
+    attn_out, _ = runner.run(qkv.to(torch.float16),
+                             plugin_kv,
+                             ctx_len,
+                             combined,
+                             cache_idx,
+                             input_shapes={"kv_cache_indices": (0, )})
     ref_rows = _ragged_prefill_ref(qkv.float(), cos, sin, seqlens, p)
     for b, L in enumerate(seqlens):
         assert_close(f"ragged[{label}].b{b}", ref_rows[b], attn_out[b, :L])
@@ -1385,14 +1608,24 @@ def test_ragged_prefill_batch_invariance():
     _, _, kv0 = _empty_caches(p)
     ctx0 = torch.tensor(seqlens, dtype=torch.int32, device=DEV)
     # clone so the in-place RoPE does not corrupt the buffer reused below
-    out0, _ = runner.run(qkv16.clone(), kv0, ctx0, combined, cache_idx)
+    prefill_shapes = {"kv_cache_indices": (0, )}
+    out0, _ = runner.run(qkv16.clone(),
+                         kv0,
+                         ctx0,
+                         combined,
+                         cache_idx,
+                         input_shapes=prefill_shapes)
 
     perm = [2, 0, 1]
     sl_p = [seqlens[i] for i in perm]
     _, _, kv1 = _empty_caches(p)
     ctx1 = torch.tensor(sl_p, dtype=torch.int32, device=DEV)
-    out1, _ = runner.run(qkv16[perm].contiguous(), kv1, ctx1, combined,
-                         cache_idx)
+    out1, _ = runner.run(qkv16[perm].contiguous(),
+                         kv1,
+                         ctx1,
+                         combined,
+                         cache_idx,
+                         input_shapes=prefill_shapes)
     for new_i, orig in enumerate(perm):
         L = seqlens[orig]
         assert_close(f"ragged-batch-inv[{new_i}]", out0[orig, :L],
@@ -1413,22 +1646,38 @@ def _assert_cache_untouched(name: str, before: "torch.Tensor",
 
 # Shared-KV prefill. head 128 runs the CuTe DSL FMHA path where available
 # (SM100+) and FMHA_v2 elsewhere; head 256 forces the FMHA_v2 deinterleave
-# path on every SKU (CuTe DSL FMHA only supports head 64/128); head 512 runs
-# FFPA against the deinterleaved donor cache (the Gemma4 E2B/E4B
-# KV-sharing-layer configs).
-@pytest.mark.parametrize("head_size,num_q_heads,num_kv_heads", [(128, 8, 4),
-                                                                (256, 16, 8),
-                                                                (512, 8, 1),
-                                                                (512, 8, 2)],
-                         ids=[
-                             "head128_q8_kv4", "head256_q16_kv8",
-                             "head512_q8_kv1", "head512_q8_kv2"
-                         ])
-def test_shared_kv_prefill(head_size, num_q_heads, num_kv_heads):
+# path on every SKU; full-causal FP16 head 512 runs the common CuTe DSL paged
+# path on SM100/101/110 and FFPA elsewhere. The q4/kv2 case cannot use FFPA,
+# so it proves the D512 shared-KV route directly.
+@pytest.mark.parametrize("head_size,num_q_heads,num_kv_heads,sliding_window", [
+    pytest.param(128, 8, 4, -1, id="head128_q8_kv4"),
+    pytest.param(256, 16, 8, -1, id="head256_q16_kv8"),
+    pytest.param(512,
+                 4,
+                 2,
+                 -1,
+                 id="head512_q4_kv2",
+                 marks=pytest.mark.skipif(
+                     _device_sm() not in (100, 101, 110),
+                     reason="D512 CuTe DSL FMHA requires SM100/101/110")),
+    pytest.param(512,
+                 4,
+                 2,
+                 4,
+                 id="head512_q4_kv2_sliding",
+                 marks=pytest.mark.skipif(
+                     _device_sm() not in (100, 101, 110),
+                     reason="D512 CuTe DSL FMHA requires SM100/101/110")),
+    pytest.param(512, 8, 1, -1, id="head512_q8_kv1"),
+    pytest.param(512, 8, 2, -1, id="head512_q8_kv2"),
+])
+def test_shared_kv_prefill(head_size, num_q_heads, num_kv_heads,
+                           sliding_window):
     cfg = dict(BASE)
     cfg["head_size"] = head_size
     cfg["num_q_heads"] = num_q_heads
     cfg["num_kv_heads"] = num_kv_heads
+    cfg["sliding_window_size"] = sliding_window
     p = AttentionParams(batch_size=2, seq_len=8, is_prefill=True, **cfg)
     gen = torch.Generator().manual_seed(2400 + head_size)
     runner = AttentionPluginRunner(p)
@@ -1440,7 +1689,7 @@ def test_shared_kv_prefill(head_size, num_q_heads, num_kv_heads):
     pos_ids = torch.arange(s, dtype=torch.int32, device=DEV)[None].repeat(b, 1)
     cache_idx = torch.zeros(b, dtype=torch.int32, device=DEV)
     ctx_len = torch.full((b, ), s, dtype=torch.int32, device=DEV)
-    mask = sliding_window_mask(s, s, -1, DEV)
+    mask = sliding_window_mask(s, s, sliding_window, DEV)
 
     # Donor pass (own KV) populates the cache: RoPE'd K + raw V.
     qkv = torch.randn((b, s, p.qkv_hidden_size),
@@ -1448,15 +1697,25 @@ def test_shared_kv_prefill(head_size, num_q_heads, num_kv_heads):
                       dtype=torch.float32).to(DEV)
     _, ref_k, ref_v = compute_attention(qkv.float(), ref_k, ref_v, cos, sin,
                                         pos_ids, cache_idx, p, mask)
-    runner.run(qkv.to(torch.float16), plugin_kv, ctx_len, combined, cache_idx)
+    prefill_shapes = {"kv_cache_indices": (0, )}
+    runner.run(qkv.to(torch.float16),
+               plugin_kv,
+               ctx_len,
+               combined,
+               cache_idx,
+               input_shapes=prefill_shapes)
 
     # Shared-KV pass: a Q-only QKV (C = Hq*D) for the same positions, the
     # donor cache as KV-cache input.
     q2 = torch.randn((b, s, p.q_hidden), generator=gen,
                      dtype=torch.float32).to(DEV)
     donor_before = plugin_kv.clone()
-    attn_out, plugin_kv = shared_runner.run(q2.to(torch.float16), plugin_kv,
-                                            ctx_len, combined, cache_idx)
+    attn_out, plugin_kv = shared_runner.run(q2.to(torch.float16),
+                                            plugin_kv,
+                                            ctx_len,
+                                            combined,
+                                            cache_idx,
+                                            input_shapes=prefill_shapes)
 
     # Reference: RoPE Q at positions 0..S-1, causal attention against the
     # donor cache contents.
@@ -1498,7 +1757,12 @@ def test_shared_kv_decode():
     mask = sliding_window_mask(s, s, -1, DEV)
     _, ref_k, ref_v = compute_attention(qkv.float(), ref_k, ref_v, cos, sin,
                                         pos_ids, cache_idx, p, mask)
-    runner.run(qkv.to(torch.float16), plugin_kv, ctx_len, combined, cache_idx)
+    runner.run(qkv.to(torch.float16),
+               plugin_kv,
+               ctx_len,
+               combined,
+               cache_idx,
+               input_shapes={"kv_cache_indices": (0, )})
 
     pos = s
     for step in range(3):
@@ -1543,16 +1807,36 @@ def test_shared_kv_decode():
 # Shared-KV chunked prefill: the second chunk's Q must also attend the donor
 # cache prefix, driving the chunked shared-KV kernel variants (CuTe DSL FMHA
 # via padded cu_kv_seqlens, FMHA_v2 with s_kv=capacity, FFPA with the
-# bottom-right causal offset -- head 512 is the Gemma4 E4B config).
-@pytest.mark.parametrize(
-    "head_size,num_q_heads,num_kv_heads", [(128, 8, 4), (256, 16, 8),
-                                           (512, 8, 2)],
-    ids=["head128_q8_kv4", "head256_q16_kv8", "head512_q8_kv2"])
-def test_shared_kv_chunked_prefill(head_size, num_q_heads, num_kv_heads):
+# bottom-right causal offset. The head512 q4/kv2 case cannot use FFPA and
+# therefore proves the shared chunked paged route.)
+@pytest.mark.parametrize("head_size,num_q_heads,num_kv_heads,sliding_window", [
+    pytest.param(128, 8, 4, -1, id="head128_q8_kv4"),
+    pytest.param(256, 16, 8, -1, id="head256_q16_kv8"),
+    pytest.param(512,
+                 4,
+                 2,
+                 -1,
+                 id="head512_q4_kv2",
+                 marks=pytest.mark.skipif(
+                     _device_sm() not in (100, 101, 110),
+                     reason="D512 CuTe DSL FMHA requires SM100/101/110")),
+    pytest.param(512,
+                 4,
+                 2,
+                 4,
+                 id="head512_q4_kv2_sliding",
+                 marks=pytest.mark.skipif(
+                     _device_sm() not in (100, 101, 110),
+                     reason="D512 CuTe DSL FMHA requires SM100/101/110")),
+    pytest.param(512, 8, 2, -1, id="head512_q8_kv2"),
+])
+def test_shared_kv_chunked_prefill(head_size, num_q_heads, num_kv_heads,
+                                   sliding_window):
     cfg = dict(BASE)
     cfg["head_size"] = head_size
     cfg["num_q_heads"] = num_q_heads
     cfg["num_kv_heads"] = num_kv_heads
+    cfg["sliding_window_size"] = sliding_window
     p = AttentionParams(batch_size=2, seq_len=8, is_prefill=True, **cfg)
     gen = torch.Generator().manual_seed(2600 + head_size)
     runner = AttentionPluginRunner(p)
@@ -1567,14 +1851,19 @@ def test_shared_kv_chunked_prefill(head_size, num_q_heads, num_kv_heads):
         pos_ids = torch.arange(pos, pos + s, dtype=torch.int32,
                                device=DEV)[None].repeat(b, 1)
         cache_idx = torch.full((b, ), pos, dtype=torch.int32, device=DEV)
-        mask = sliding_window_mask(s, pos + s, -1, DEV)
+        mask = sliding_window_mask(s, pos + s, sliding_window, DEV)
         qkv = torch.randn((b, s, p.qkv_hidden_size),
                           generator=gen,
                           dtype=torch.float32).to(DEV)
         _, ref_k, ref_v = compute_attention(qkv.float(), ref_k, ref_v, cos,
                                             sin, pos_ids, cache_idx, p, mask)
-        runner.run(qkv.to(torch.float16), plugin_kv, ctx_len, combined,
-                   cache_idx)
+        runner.run(qkv.to(torch.float16),
+                   plugin_kv,
+                   ctx_len,
+                   combined,
+                   cache_idx,
+                   input_shapes={"kv_cache_indices":
+                                 (0, )} if pos == 0 else None)
 
     # Shared-KV second chunk: Q-only QKV at positions S..2S-1 attends the full
     # donor cache (pos_ids/cache_idx/mask keep the chunk-2 values from the loop).

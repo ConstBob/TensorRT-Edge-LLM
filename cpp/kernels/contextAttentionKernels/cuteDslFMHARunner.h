@@ -30,9 +30,9 @@ namespace trt_edgellm
 {
 
 /**
- * @brief Unified runner for CuTe DSL compiled FMHA kernels (Blackwell SM100+).
+ * @brief Unified runner for CuTe DSL compiled FMHA kernels (Blackwell SM100/101/110).
  *
- * Supports two execution modes via separate AOT-compiled kernel variants:
+ * Supports two execution modes via AOT-compiled kernel variants:
  *
  * 1. LLM prefill/chunked-prefill: batched Q [B,S_q,H_q,D] + combined KV cache
  *    [B,2,H_kv,Cap,D] with causal masking and optional sliding window.
@@ -172,17 +172,21 @@ private:
     static fmha_d64_paged_Kernel_Module_t sLLM_d64_paged;
     static fmha_d128_paged_Kernel_Module_t sLLM_d128_paged;
     static fmha_d256_paged_Kernel_Module_t sLLM_d256_paged;
+    static fmha_d512_paged_Kernel_Module_t sLLM_d512_paged;
     static fmha_d64_sw_paged_Kernel_Module_t sLLM_d64_sw_paged;
     static fmha_d128_sw_paged_Kernel_Module_t sLLM_d128_sw_paged;
     static fmha_d256_sw_paged_Kernel_Module_t sLLM_d256_sw_paged;
+    static fmha_d512_sw_paged_Kernel_Module_t sLLM_d512_sw_paged;
 
     // LLM paged KV cache kernel modules (FP8 input, FP16 output)
     static fmha_d64_paged_fp8_Kernel_Module_t sLLM_d64_paged_fp8;
     static fmha_d128_paged_fp8_Kernel_Module_t sLLM_d128_paged_fp8;
     static fmha_d256_paged_fp8_Kernel_Module_t sLLM_d256_paged_fp8;
+    static fmha_d512_paged_fp8_Kernel_Module_t sLLM_d512_paged_fp8;
     static fmha_d64_sw_paged_fp8_Kernel_Module_t sLLM_d64_sw_paged_fp8;
     static fmha_d128_sw_paged_fp8_Kernel_Module_t sLLM_d128_sw_paged_fp8;
     static fmha_d256_sw_paged_fp8_Kernel_Module_t sLLM_d256_sw_paged_fp8;
+    static fmha_d512_sw_paged_fp8_Kernel_Module_t sLLM_d512_sw_paged_fp8;
 
     static bool sLLMLoaded;
     static std::mutex sLLMMutex;

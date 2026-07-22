@@ -316,6 +316,7 @@ def compute_grid(
     cta_tiler: Tuple[int, int, int],
     is_persistent: bool,
     sm_count: Optional[Int32] = None,
+    head_dim_ctas: int = 1,
 ) -> Tuple[FmhaStaticTileSchedulerParams, Tuple[int, int, int]]:
     """
     Compute grid parameters for FMHA operation.
@@ -337,6 +338,9 @@ def compute_grid(
     :type cta_tiler: Tuple[int, int, int]
     :param is_persistent: Whether to use persistent kernel mode.
     :type is_persistent: bool
+    :param head_dim_ctas: Number of independent CTAs that split each attention
+        head along the V/O head dimension.
+    :type head_dim_ctas: int
 
     :return: Tuple of (scheduler_params, grid_shape).
     :rtype: Tuple[FmhaStaticTileSchedulerParams, Tuple[int, int, int]]
@@ -345,7 +349,7 @@ def compute_grid(
         is_persistent,
         (
             cute.ceil_div(cute.size(o_shape[0]), cta_tiler[0]),
-            cute.size(o_shape[2][0]),
+            cute.size(o_shape[2][0]) * head_dim_ctas,
             cute.size(o_shape[2][1]),
         ),
     )
