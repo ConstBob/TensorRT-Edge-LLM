@@ -704,11 +704,12 @@ def quantize_and_export(
     t0 = time.time()
     model, tokenizer, processor = _load_model(model_dir, dtype, device)
 
+    base_already_quantized = is_quantized(model)
     mtp_layers = _mtp_num_hidden_layers(model)
     mtp_quantized = False
     mtp_state_dict: dict[str, torch.Tensor] = {}
     if (mtp_layers > 0 and quantization is not None
-            and not is_quantized(model)):
+            and not base_already_quantized):
         text_ds = resolve_dataset(text_dataset, "text")
         from .models.mtp_draft import (export_quantized_mtp_state_dict,
                                        quantize_mtp_from_base)
@@ -736,7 +737,7 @@ def quantize_and_export(
             torch.cuda.empty_cache()
 
     # --- Quantize base model ----------------------------------------------
-    if is_quantized(model):
+    if base_already_quantized:
         print("Model already quantized — skipping.")
     else:
         # Fail fast when the user asks for CP quantization on a model that

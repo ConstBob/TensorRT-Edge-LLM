@@ -130,16 +130,11 @@ def _promote_llm_subconfig(config: Any, root: Dict[str,
     if root.get("num_attention_heads") is not None:
         return root
 
-    for name in ("llm_config", "text_config", "language_config"):
-        sub = getattr(config, name, None)
-        if sub is None and name in root:
-            sub = root[name]
-        sub_dict = _nested_config_to_dict(sub)
-        if (sub_dict.get("hidden_size") is not None
-                and sub_dict.get("num_attention_heads") is not None):
-            return sub_dict
-
-    # Qwen3-ASR / Qwen3-Omni: LLM lives at thinker_config.text_config
+    # Qwen3-ASR / Qwen3-Omni: LLM lives at thinker_config.text_config.
+    # Resolve the thinker/talker wrappers BEFORE the generic top-level loop:
+    # newer transformers can expose a spurious top-level ``text_config`` (with
+    # the wrong hidden_size) alongside the real thinker_config.text_config, and
+    # the generic loop would otherwise pick that wrong one.
     thinker = root.get("thinker_config")
     if isinstance(thinker, dict):
         for name in ("text_config", "llm_config", "language_config"):
@@ -154,6 +149,16 @@ def _promote_llm_subconfig(config: Any, root: Dict[str,
         if (talker.get("hidden_size") is not None
                 and talker.get("num_attention_heads") is not None):
             return talker
+
+    # Standard VLMs (e.g. Qwen2.5-VL): LLM is a top-level sub-config.
+    for name in ("llm_config", "text_config", "language_config"):
+        sub = getattr(config, name, None)
+        if sub is None and name in root:
+            sub = root[name]
+        sub_dict = _nested_config_to_dict(sub)
+        if (sub_dict.get("hidden_size") is not None
+                and sub_dict.get("num_attention_heads") is not None):
+            return sub_dict
 
     return root
 
