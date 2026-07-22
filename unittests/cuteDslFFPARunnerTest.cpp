@@ -86,7 +86,7 @@ rt::Tensor makeCuSeqLens(std::vector<int32_t> const& lens)
 
 //! Poison padding rows (>= lens[b]) of a [B, S, H, D] fp16 tensor with random
 //! near-fp16-max garbage — models the token-0 / PLE-0 large-magnitude values
-//! that padding positions carry in bug 6384817.  When nanPoison is set, fill
+//! that padding positions carry.  When nanPoison is set, fill
 //! with NaN (first padding row: Inf) instead — padding rows legitimately hold
 //! NaN/Inf mid-network once fp16 overflow of garbage embeddings has occurred
 //! in non-attention layers, and the kernel must not leak them into valid rows
@@ -424,7 +424,7 @@ protected:
 };
 
 // Ragged BS=3 right-padded batch with near-fp16-max garbage in the padding
-// positions — the bug 6384817 shape (Gemma4 BS>1 MMLU prefill).  The dense
+// positions — the Gemma4 BS>1 MMLU prefill shape.  The dense
 // FFPA kernel attends the poisoned padding and corrupts the batch; with
 // per-batch cu_seqlens the valid rows must match the per-batch FP32 reference,
 // padding rows must stay bounded, and nothing may be NaN/Inf.
@@ -521,7 +521,7 @@ TEST_F(CuteDslFFPAVarlen, RaggedBatchPoisonedPadding)
 }
 
 // NaN-poisoned padding: padding K/V rows can legitimately contain NaN/Inf at
-// inference time (bug 6384817 forensics: fp16 overflow of garbage padding
+// inference time (fp16 overflow of garbage padding
 // embeddings in the FFN turns pad rows NaN from layer 1 on).  Score masking
 // alone is not NaN-safe — BMM2 computes P(0) x V(NaN) = NaN and poisons the
 // whole boundary q-tile — so the boundary-tile K/V loads zero-fill logical
@@ -971,7 +971,7 @@ TEST_F(CuteDslFFPAVisionBlock, TwoBlocksGemma4HeadShape)
 
 // Ragged BS=2 right-padded batch with poisoned padding and different block
 // layouts per batch — the overlay must stay per-batch correct under varlen
-// masking (reusing the bug 6384817 test structure).
+// masking (reusing the ragged-padding test structure).
 TEST_F(CuteDslFFPAVisionBlock, RaggedBatchWithBlocks)
 {
     int32_t constexpr kSeqLen = 192;

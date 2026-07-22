@@ -80,7 +80,7 @@ Runtime axes:
   the C++ runner passes `numKVHeads` from `CuteDslFFPAParams` and rejects any
   `numQHeads % numKVHeads != 0`.
 - `mCuSeqLenQ` / `mCuSeqLenK` — `(B+1,)` Int32 cumulative sequence lengths
-  carrying the *logical* per-batch valid lengths (nvbug 6384817).  Per batch
+  carrying the *logical* per-batch valid lengths.  Per batch
   `b`, `seqlen_q_b = cu_q[b+1] - cu_q[b]` and `seqlen_k_b = cu_k[b+1] -
   cu_k[b]`; the causal mask is bottom-right aligned with offset
   `seqlen_k_b - seqlen_q_b` (0 for right-padded prefill, the KV prefix length

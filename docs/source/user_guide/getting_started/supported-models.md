@@ -363,7 +363,7 @@ Qwen3.5 and Qwen3.6 checkpoints are unified text+VLM models. The same checkpoint
 
 | Model Series | Transformers Class | `tensorrt_edgellm` Handling | Supported Precisions |
 |--------------|--------------------|-----------------------|----------------------|
-| Qwen3-Omni | [`Qwen3OmniMoeForConditionalGeneration`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_omni_moe/modeling_qwen3_omni_moe.py) | `Qwen3OmniMoeThinkerCausalLM` + `Qwen3OmniMoeTalkerCausalLM` + visual/audio/Code2Wav | NVFP4 only |
+| Qwen3-Omni | [`Qwen3OmniMoeForConditionalGeneration`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_omni_moe/modeling_qwen3_omni_moe.py) | `Qwen3OmniMoeThinkerCausalLM` + `Qwen3OmniMoeTalkerCausalLM` + `CodePredictorCausalLM` + visual/audio/Code2Wav (six-engine layout; see the [Omni example](../examples/omni.md)) | NVFP4 only |
 | [Nemotron-Omni](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4/blob/main/modeling.py) | Checkpoint architecture `NemotronH_Nano_Omni_Reasoning_V3`; LLM is Nemotron-H compatible with [`NemotronHForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/nemotron_h/modeling_nemotron_h.py) | `NemotronHCausalLM` + `NemotronOmniVisualModel` + `NemotronOmniAudioModel` | NVFP4 only |
 | Gemma4 E2B/E4B (text + image + audio) | [`Gemma4ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma4/modeling_gemma4.py) | `gemma4` / `gemma4_text` -> text decoder (PLE, dual-RoPE) with paired-assistant MTP, plus `Gemma4VisualModel` (image) and `Gemma4AudioModel` (audio) | BF16/FP16 source checkpoints; paired-assistant MTP via a matched Gemma4 assistant checkpoint (released for both sizes); text + image + audio input |
 | Gemma4 31B (text + image) | [`Gemma4ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma4/modeling_gemma4.py) | `gemma4` / `gemma4_text` -> text decoder (PLE, dual-RoPE) with paired-assistant MTP, plus `Gemma4VisualModel` for image input | BF16/FP16 source plus NVFP4; paired-assistant MTP via a matched Gemma4 assistant checkpoint; text + image input |
@@ -376,6 +376,8 @@ Qwen3.5 and Qwen3.6 checkpoints are unified text+VLM models. The same checkpoint
 - [nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4)
 
 </details>
+
+> **Note:** The end-to-end Omni [example workflow](../examples/omni.md) currently documents **Qwen3-Omni**. Nemotron-Omni is supported through its dedicated `NemotronOmniVisualModel` / `NemotronOmniAudioModel` component paths; follow the same export → engine-build → inference structure as the Qwen3-Omni example, substituting the Nemotron-Omni checkpoint.
 
 <details>
 <summary><b>Gemma4 E2B/E4B/12B/31B</b> checkpoints</summary>

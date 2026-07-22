@@ -1639,7 +1639,7 @@ bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerStat
     // NOTE: the host set / GPU buffer are still off-by-one (host set tracks the token entering
     // each iteration while the GPU buffer receives the newly sampled token). That functional
     // drift is pre-existing and tracked as a follow-up together with the standalone-TTS
-    // Chinese-prompt prefill-EOS anomaly surfaced during MR 770 review.
+    // Known Chinese-prompt prefill-EOS anomaly; pending technical follow-up.
     for (int32_t b = 0; b < activeBatchSize; ++b)
     {
         states[b].numSeenTokens = 0;
