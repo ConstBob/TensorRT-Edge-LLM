@@ -1607,7 +1607,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                     usePaddingContextMask ? 0 : 1);
 
                 // Per-batch cu_seqlens bound the logical lengths inside the
-                // kernel (bug 6384817): ragged padding keys/rows are masked and
+                // kernel: ragged padding keys/rows are masked and
                 // the boundary tile is zero-filled, so no output zeroing WAR is
                 // needed. Assemble split K/V from the donor's paged pool via
                 // the page-table-aware gather (zero-fills unmapped in-range

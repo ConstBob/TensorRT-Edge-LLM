@@ -90,7 +90,8 @@ private:
     bool updateSelfConditioningTemperature(float temperature, cudaStream_t stream);
     bool prepareUnifiedConditioning(
         int32_t batchSize, int32_t canvasLen, int32_t step, float temperature, cudaStream_t stream);
-    void restoreUnifiedBackboneBindings();
+    void bindUnifiedBackboneTensors();
+    void bindDefaultSelfConditioningTensors();
     Tensor& currentDenoiseLogits() noexcept;
     bool runDenoiseStep(DenoiseStepParams const& params);
     bool sampleCanvasEntropyBound(
@@ -98,9 +99,8 @@ private:
     int32_t effectiveMaxDenoisingSteps(DecodingInferenceContext const& context) const noexcept;
     float denoiseTemperature(int32_t step, int32_t maxDenoisingSteps) const noexcept;
     float denoiseTemperature(int32_t step) const noexcept;
-    int32_t readAcceptedPrefixLength(int32_t batchSize, int32_t canvasLen, cudaStream_t stream);
-    bool copyCanvasToHost(int32_t batchSize, int32_t canvasLen, cudaStream_t stream);
-    std::vector<int32_t> getCommittedLengths(DecodingInferenceContext const& context) const;
+    bool copyCanvasStateToHost(int32_t batchSize, int32_t canvasLen, cudaStream_t stream);
+    void fillCommittedLengths(DecodingInferenceContext const& context, std::vector<int32_t>& committedLengths) const;
     bool compactCommitCanvas(int32_t batchSize, int32_t canvasLen, int32_t maxBlockLen,
         std::vector<int32_t> const& commitLengths, cudaStream_t stream);
     bool commitBlock(DecodingInferenceContext& context, std::vector<int32_t> const& commitLengths, int32_t canvasLen);
@@ -119,13 +119,16 @@ private:
     Tensor mStableCounts;
     Tensor mAcceptedMask;
     Tensor mPrefixLengths;
-    std::vector<int32_t> mHostPrefixLengths;
+    Tensor mHostPrefixLengths;
+    std::vector<int32_t> mCommittedLengthsScratch;
+    std::vector<int32_t> mRemainingLengthsScratch;
+    std::vector<int32_t> mValidCanvasLengthsScratch;
+    std::vector<int32_t> mCommitLengthsScratch;
     Tensor* mCurrentDenoiseLogits{nullptr};
     uint64_t mRandomOffset{0};
     int32_t mCanvasLen{0};
     int32_t mMaxConditioningSeqLen{0};
     int32_t mMaxDenoisingSteps{0};
-    int32_t mPrefixCheckInterval{1};
 };
 
 } // namespace rt

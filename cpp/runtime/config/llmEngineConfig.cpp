@@ -563,12 +563,9 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
         cfg.diffusionEntropyThreshold = diffusionConfig.value("entropy_threshold", 0.005F);
         cfg.rmsNormEps = configJson.value("rms_norm_eps", 1.0e-6F);
         cfg.diffusionStabilityWindow = diffusionConfig.value("stability_window", 2);
-        cfg.diffusionPrefixCheckInterval
-            = diffusionConfig.value("prefix_check_interval", configJson.value("prefix_check_interval", 1));
         requirePositive(cfg.diffusionCanvasLength, "diffusion canvas_length");
         requirePositive(cfg.diffusionMaxDenoisingSteps, "diffusion max_denoising_steps");
         requirePositive(cfg.diffusionStabilityWindow, "diffusion stability_window");
-        requirePositive(cfg.diffusionPrefixCheckInterval, "diffusion prefix_check_interval");
         ELLM_CHECK(cfg.diffusionUnifiedConditioning,
             "parseEngineConfig: DiffusionGemma dllm engines require diffusion_unified_conditioning=true. Re-export the "
             "model with the latest DiffusionGemma exporter and rebuild the engine.");
@@ -878,7 +875,6 @@ std::string formatEngineConfig(LLMEngineConfig const& cfg)
            << " diffusionTMax=" << cfg.diffusionTMax << " diffusionEntropyBound=" << cfg.diffusionEntropyBound
            << " diffusionEntropyThreshold=" << cfg.diffusionEntropyThreshold << " rmsNormEps=" << cfg.rmsNormEps
            << " diffusionStabilityWindow=" << cfg.diffusionStabilityWindow
-           << " diffusionPrefixCheckInterval=" << cfg.diffusionPrefixCheckInterval
            << " diffusionUnifiedConditioning=" << cfg.diffusionUnifiedConditioning;
     }
     ss << " }";

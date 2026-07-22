@@ -13,6 +13,15 @@ Small JSON request sets for `llm_inference` smoke and runtime-sanity runs.
 - `llm_runtime_sanity_check.json`
   Text-runtime sanity coverage for chat templating, system-prompt KV cache, `disable_spec_decode`, and same-process reuse.
   Recommended engine: vanilla or EAGLE LLM, `maxBatchSize >= 1`, `maxInputLen >= 1024`, `maxKVCacheCapacity >= 4096`.
+- `llm_diffusion_gemma.json`
+  Text-only DiffusionGemma block-diffusion smoke coverage, including the
+  request-level `diffusion_config.max_denoising_steps` override. It sets 16
+  denoise steps to mirror the default runtime budget used when the request omits
+  the override.
+  Recommended engine: DiffusionGemma `dllm.engine` built with
+  `decoding_strategy: block_diffusion`, `diffusion_unified_conditioning: true`,
+  `maxBatchSize >= 1`, and KV capacity large enough for the prompt plus
+  `max_generate_length`.
 
 ### VLM
 

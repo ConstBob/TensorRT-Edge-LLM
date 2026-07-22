@@ -331,9 +331,15 @@ void bindDiffusionUnifiedBackboneTensors(TensorMap& map, PipelineIO& io, Tensor&
     map.set(binding_names::kInputsEmbeds, io.inputsEmbeds);
     map.set(binding_names::kLogits, logits);
     map.set(binding_names::kCanvasIds, canvasIds);
+    bindDiffusionUnifiedBackboneSelfConditioningTensors(map, prevSelfConditioningEmbeds, nextSelfConditioningEmbeds);
+    map.set(binding_names::kSelfConditioningTemperature, selfConditioningTemperature);
+}
+
+void bindDiffusionUnifiedBackboneSelfConditioningTensors(
+    TensorMap& map, Tensor& prevSelfConditioningEmbeds, Tensor& nextSelfConditioningEmbeds)
+{
     map.set(binding_names::kPrevSelfConditioningEmbeds, prevSelfConditioningEmbeds);
     map.set(binding_names::kNextSelfConditioningEmbeds, nextSelfConditioningEmbeds);
-    map.set(binding_names::kSelfConditioningTemperature, selfConditioningTemperature);
 }
 
 void buildTensorMapForSpecDecodeDraft(TensorMap& map, PipelineIO& io, SharedResources& res, LLMEngineConfig const& cfg)

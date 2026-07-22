@@ -368,6 +368,18 @@ manually, Qwen3.5 GDN requires `-DENABLE_CUTE_DSL=gdn` or
 If you have multiple local artifact tags for the same CPU architecture, also
 pass `-DCUTE_DSL_ARTIFACT_TAG=<tag>`.
 
+For B200 or other SM100 build hosts without a matching prebuilt artifact, install
+the CuTe DSL package expected by `kernelSrcs/build_cutedsl.py`, then generate the
+artifact before running CMake:
+
+```bash
+pip install 'nvidia-cutlass-dsl==4.6.1'
+python kernelSrcs/build_cutedsl.py --gpu_arch sm_100
+```
+
+For cross-compilation, pass `--arch aarch64` when the artifact must be consumed
+by an AArch64 target build.
+
 > **For supported model families, precisions, and hardware notes**, see [Supported Models](supported-models.md).
 
 **5. Build Project**

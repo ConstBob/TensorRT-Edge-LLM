@@ -129,7 +129,7 @@ struct LLMGenerationRequest
     float topP;                            //!< Top-p (nucleus) sampling parameter
     int64_t topK;                          //!< Top-k sampling parameter
     int64_t maxGenerateLength;             //!< Max length of the generated tokens
-    int32_t diffusionMaxDenoisingSteps{0}; //!< Optional DiffusionGemma max denoising steps override (0 = engine config)
+    int32_t diffusionMaxDenoisingSteps{0}; //!< Optional DiffusionGemma denoise-step override (0 = runtime default)
     std::string loraWeightsName{""};       //!< Name of the LoRA weights. Default to empty string for no LoRA weights
 
     // Whether to save system prompt KV cache of this request to be used by later requests

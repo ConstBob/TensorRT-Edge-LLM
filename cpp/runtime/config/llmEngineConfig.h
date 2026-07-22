@@ -84,7 +84,6 @@ struct LLMEngineConfig
     float diffusionEntropyThreshold{0.005F};
     float rmsNormEps{1.0e-6F};
     int32_t diffusionStabilityWindow{2};
-    int32_t diffusionPrefixCheckInterval{1};
 
     // --- Feature flags ---
     bool isSpecDecodeBase{false};             //!< Base engine exposes speculative decoding verification bindings

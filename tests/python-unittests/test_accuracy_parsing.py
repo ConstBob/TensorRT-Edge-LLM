@@ -65,3 +65,14 @@ def test_parse_explicit_answer_outside_tail_window():
 
 def test_parse_short_answer_unchanged():
     assert _parse("B<turn|>") == "B"
+
+
+def test_parse_mmlu_pro_answer_letters():
+    assert _parse("Final answer: J<eos>") == "J"
+    assert _parse("(I)") == "I"
+
+
+def test_parse_mmlu_pro_rejected_option_is_not_answer():
+    text = "Option I is tempting, but it contradicts the premise; option J is also wrong."
+
+    assert _parse(text) == clean_text(text)

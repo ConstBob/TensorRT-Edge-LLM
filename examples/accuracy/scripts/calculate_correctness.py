@@ -18,6 +18,8 @@ import json
 import re
 from collections import defaultdict
 
+MULTI_CHOICE_LETTERS = "ABCDEFGHIJ"
+
 
 def _apply_byte_fallback(text):
     """
@@ -122,24 +124,25 @@ def parse_multi_choice_response(text):
     """
     Parse multiple choice answer from text that may be in various formats.
     Handles "A. xxx", "A", "(A)", "**Answer: A**", "the answer is A", or just
-    returns the first letter if it's A-H.
+    returns the first letter if it's A-J.
 
     Args:
         text: Input text string potentially containing a multiple choice answer.
     Returns:
-        Single letter (A-H) if found, otherwise returns the original cleaned text.
+        Single letter (A-J) if found, otherwise returns the original cleaned text.
     """
     text = _strip_markdown(text.strip())
 
-    # If text is already just a single letter A-H, return it.
-    if len(text) == 1 and text in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']:
+    # If text is already just a single choice letter, return it.
+    if len(text) == 1 and text in MULTI_CHOICE_LETTERS:
         return text
 
     explicit_answer_patterns = [
-        r"\b(?:final\s+answer|answer|correct\s+(?:answer|option)|correct\s+choice|letter|matches?\s+option)\s*(?:is|:)?\s*\(?([A-H])\b",
-        r"\boption\s+(?:is\s+)?\(?([A-H])\b",
-        r"\b(?:the\s+)?(?:answer|letter)\s+is\s+\(?([A-H])\b",
-        r"\bresult\s*(?:is|:)?\s*\(?([A-H])\b",
+        r"\b(?:final\s+answer|answer|correct\s+(?:answer|option)|correct\s+choice|letter|matches?\s+option)\s*(?:is|:)?\s*\(?([A-J])\b",
+        r"\boption\s*(?:is|:)\s*\(?([A-J])\b",
+        r"\boption\s+\(?([A-J])\)?(?:[\.\)]\s*|$)",
+        r"\b(?:the\s+)?(?:answer|letter)\s+is\s+\(?([A-J])\b",
+        r"\bresult\s*(?:is|:)?\s*\(?([A-J])\b",
     ]
     for pattern in explicit_answer_patterns:
         matches = list(re.finditer(pattern, text,
@@ -148,12 +151,12 @@ def parse_multi_choice_response(text):
             return matches[-1].group(1).upper()
 
     # Try to match pattern like "A." or "A)" or "(A)" at the start.
-    match = re.match(r'^[\(]?([A-H])[\.\):\s]', text)
+    match = re.match(r'^[\(]?([A-J])[\.\):\s]', text)
     if match:
         return match.group(1)
 
     # Handle short responses that start with a valid letter (e.g. "A\n" or "B.").
-    if len(text) <= 3 and text and text[0] in 'ABCDEFGH':
+    if len(text) <= 3 and text and text[0] in MULTI_CHOICE_LETTERS:
         return text[0]
 
     # Search the tail for an explicit final answer/option/letter marker. Some
@@ -163,7 +166,7 @@ def parse_multi_choice_response(text):
     # "So B is wrong, leaving C."
     tail = text[-800:]
     tail_patterns = [
-        r"(?:^|[\n\r])\s*([A-H])\s*(?:\.\s*)?$",
+        r"(?:^|[\n\r])\s*([A-J])\s*(?:\.\s*)?$",
     ]
     for pattern in tail_patterns:
         matches = list(re.finditer(pattern, tail,
@@ -189,7 +192,7 @@ def is_correct(pred, ref):
     pred_clean = clean_text(pred)
     ref_clean = clean_text(ref)
 
-    if ref_clean in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']:
+    if ref_clean in MULTI_CHOICE_LETTERS:
         pred_clean = parse_multi_choice_response(pred_clean)
 
     return pred_clean == ref_clean

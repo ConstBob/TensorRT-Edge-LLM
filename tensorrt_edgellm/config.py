@@ -509,7 +509,6 @@ class DiffusionConfig:
     entropy_bound: float = 0.1
     entropy_threshold: float = 0.005
     stability_window: int = 2
-    prefix_check_interval: int = 1
     self_conditioning_enabled: bool = True
     self_conditioning_repr: str = "embeds"
     supported_modalities: List[str] = field(default_factory=lambda: ["text"])
@@ -544,9 +543,6 @@ class DiffusionConfig:
             stability_window=int(
                 gen_config.get("stability_window",
                                gen_config.get("stability_threshold", 2))),
-            prefix_check_interval=int(
-                gen_config.get("prefix_check_interval",
-                               sampler_cfg.get("prefix_check_interval", 1))),
         )
 
     def to_dict(self) -> Dict[str, Any]:

@@ -91,7 +91,7 @@ struct DecodingInferenceContext
     rt::OptionalInputTensors deepstackFeatures;                //!< Optional Deepstack features
     int32_t generationRound{};                                 //!< Current generation round
     int32_t maxGenerateLength{};                               //!< Maximum generation length
-    int32_t diffusionMaxDenoisingSteps{0}; //!< Optional DiffusionGemma max denoising steps override (0 = engine config)
+    int32_t diffusionMaxDenoisingSteps{0}; //!< Optional DiffusionGemma denoise-step override (0 = runtime default)
     int32_t activeBatchSize{};             //!< Current active batch size
     std::string loraWeightsName{""};       //!< LoRA adapter name used by this request
     cudaStream_t stream{};                 //!< CUDA stream

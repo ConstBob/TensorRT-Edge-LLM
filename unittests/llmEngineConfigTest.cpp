@@ -367,7 +367,6 @@ TEST_F(LLMEngineConfigTest, DiffusionGemmaSamplerConfig)
         {"entropy_bound", 0.2},
         {"entropy_threshold", 0.01},
         {"stability_window", 3},
-        {"prefix_check_interval", 4},
     };
     auto const path = writeJsonToTempFile(json);
 
@@ -383,7 +382,6 @@ TEST_F(LLMEngineConfigTest, DiffusionGemmaSamplerConfig)
     EXPECT_FLOAT_EQ(cfg.diffusionEntropyBound, 0.2F);
     EXPECT_FLOAT_EQ(cfg.diffusionEntropyThreshold, 0.01F);
     EXPECT_EQ(cfg.diffusionStabilityWindow, 3);
-    EXPECT_EQ(cfg.diffusionPrefixCheckInterval, 4);
 }
 
 TEST_F(LLMEngineConfigTest, DiffusionGemmaDllmRequiresUnifiedConditioning)

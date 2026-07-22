@@ -696,12 +696,7 @@ int main(int argc, char* argv[])
         }
     }
 
-    bool const disableDecodingCudaGraph = std::getenv("EDGELLM_DISABLE_DECODING_CUDA_GRAPH") != nullptr;
-    if (disableDecodingCudaGraph)
-    {
-        LOG_INFO("Skipping decoding CUDA graph capture because EDGELLM_DISABLE_DECODING_CUDA_GRAPH is set.");
-    }
-    else if (!runtime->captureDecodingCUDAGraph(stream))
+    if (!runtime->captureDecodingCUDAGraph(stream))
     {
         LOG_WARNING("Failed to capture CUDA graph for decoding, proceeding with normal engine execution.");
     }

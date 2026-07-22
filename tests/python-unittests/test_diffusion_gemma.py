@@ -71,7 +71,6 @@ def _write_minimal_diffusion_gemma_config(tmp_path):
             "entropy_bound": 0.02,
         },
         "stability_threshold": 3,
-        "prefix_check_interval": 4,
     }
     (tmp_path / "config.json").write_text(json.dumps(config))
     (tmp_path / "generation_config.json").write_text(
@@ -102,7 +101,6 @@ def test_model_config_detects_diffusion_gemma(tmp_path):
     assert cfg.diffusion.max_denoising_steps == 8
     assert cfg.diffusion.entropy_bound == 0.02
     assert cfg.diffusion.stability_window == 3
-    assert cfg.diffusion.prefix_check_interval == 4
 
 
 def test_diffusion_config_detection_allows_null_architectures():
@@ -179,8 +177,6 @@ def test_runtime_config_emits_diffusion_engine_metadata(tmp_path):
             "role": "dllm",
         },
     }
-    assert runtime_cfg["diffusion_config"]["prefix_check_interval"] == 4
-
     assert runtime_cfg["attention_scaling"] == 1.0
     assert runtime_cfg["final_logit_softcapping"] == 30.0
     assert runtime_cfg["attention_k_eq_v"] is True

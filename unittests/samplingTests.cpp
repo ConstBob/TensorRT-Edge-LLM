@@ -592,6 +592,63 @@ TEST_F(SamplingTest, DiffusionCanvasSamplerUpdatesOnDevice)
     EXPECT_EQ(hostCommitCanvas, (std::vector<int32_t>{1, 0, 3, 2}));
 }
 
+TEST_F(SamplingTest, DiffusionCanvasSamplerEntropyBudgetSortsAndIgnoresNonFinite)
+{
+    constexpr int32_t batchSize = 1;
+    constexpr int32_t canvasLen = 5;
+    constexpr int32_t vocabSize = 16;
+    constexpr int32_t rows = batchSize * canvasLen;
+    std::vector<int32_t> const hostArgmax{10, 11, 12, 13, 14};
+    std::vector<int32_t> const hostSampled{0, 1, 2, 3, 4};
+    std::vector<float> const hostEntropy{
+        0.4F,
+        0.1F,
+        std::numeric_limits<float>::infinity(),
+        0.2F,
+        0.1F,
+    };
+
+    rt::Tensor argmax({rows, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor sampled({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor entropy({rows}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor canvas({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor argmaxCanvas({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor previous({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor stable({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor accepted({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8);
+    rt::Tensor prefix({batchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice<int32_t>(argmax, hostArgmax);
+    copyHostToDevice<int32_t>(sampled, hostSampled);
+    copyHostToDevice<float>(entropy, hostEntropy);
+
+    initializeDiffusionCanvas(
+        canvas, previous, stable, accepted, prefix, makeDiffusionInitParams(vocabSize), /*stream=*/0);
+    diffusionSampleAndUpdateCanvas(sampled, argmax, entropy, canvas, argmaxCanvas, previous, stable, accepted, prefix,
+        makeDiffusionUpdateParams(
+            /*entropyThreshold=*/1e-3F, /*entropyBound=*/0.25F, /*stabilityWindow=*/2, /*forceAccept=*/false,
+            vocabSize),
+        /*stream=*/0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    auto const hostCanvas = copyDeviceToHost<int32_t>(canvas);
+    auto const hostAccepted = copyDeviceToHost<int8_t>(accepted);
+    auto const hostPrefix = copyDeviceToHost<int32_t>(prefix);
+
+    EXPECT_EQ(hostPrefix, (std::vector<int32_t>{0}));
+    EXPECT_EQ(static_cast<int32_t>(hostAccepted[0]), 0);
+    EXPECT_EQ(static_cast<int32_t>(hostAccepted[1]), 1);
+    EXPECT_EQ(static_cast<int32_t>(hostAccepted[2]), 0);
+    EXPECT_EQ(static_cast<int32_t>(hostAccepted[3]), 1);
+    EXPECT_EQ(static_cast<int32_t>(hostAccepted[4]), 1);
+    EXPECT_EQ(hostCanvas[1], hostSampled[1]);
+    EXPECT_EQ(hostCanvas[3], hostSampled[3]);
+    EXPECT_EQ(hostCanvas[4], hostSampled[4]);
+    EXPECT_GE(hostCanvas[0], 0);
+    EXPECT_LT(hostCanvas[0], vocabSize);
+    EXPECT_GE(hostCanvas[2], 0);
+    EXPECT_LT(hostCanvas[2], vocabSize);
+}
+
 TEST_F(SamplingTest, DiffusionCanvasSamplerHonorsValidLengths)
 {
     constexpr int32_t batchSize = 2;

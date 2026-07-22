@@ -429,24 +429,6 @@ __device__ float logitToFloat<__nv_bfloat16>(__nv_bfloat16 value)
     return __bfloat162float(value);
 }
 
-template <typename T>
-__device__ T floatToLogit(float value)
-{
-    return static_cast<T>(value);
-}
-
-template <>
-__device__ half floatToLogit<half>(float value)
-{
-    return __float2half(value);
-}
-
-template <>
-__device__ __nv_bfloat16 floatToLogit<__nv_bfloat16>(float value)
-{
-    return __float2bfloat16(value);
-}
-
 template <typename T, int32_t BLOCK_SIZE_>
 __global__ void argmaxEntropyKernel(T const* __restrict__ logits, int32_t* __restrict__ topIndices,
     float* __restrict__ entropy, int32_t rows, int32_t vocabSize, float temperature)
@@ -1267,6 +1249,7 @@ void selectArgmaxAndComputeEntropy(
         argmaxEntropyKernel<float, kBlockSize><<<grid, block, 0, stream>>>(input.dataPointer<float>(),
             topIndices.dataPointer<int32_t>(), entropy.dataPointer<float>(), rows, vocabSize, temperature);
     }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 // =======================================================================================

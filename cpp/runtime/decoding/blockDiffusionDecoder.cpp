@@ -37,7 +37,6 @@
 #include <filesystem>
 #include <functional>
 #include <optional>
-#include <sstream>
 #include <vector>
 
 namespace trt_edgellm
@@ -47,6 +46,7 @@ namespace rt
 namespace
 {
 constexpr int32_t kDecodeProfile{1};
+constexpr int32_t kDefaultRuntimeDenoisingSteps{16};
 } // namespace
 
 BlockDiffusionDecoder::BlockDiffusionDecoder(
@@ -55,7 +55,6 @@ BlockDiffusionDecoder::BlockDiffusionDecoder(
     , mCanvasLen(std::max(1, runtime.deployment.base.diffusionCanvasLength))
     , mMaxConditioningSeqLen(std::max(mCanvasLen, runtime.deployment.base.maxSupportedInputLength))
     , mMaxDenoisingSteps(std::max(1, runtime.deployment.base.diffusionMaxDenoisingSteps))
-    , mPrefixCheckInterval(std::max(1, runtime.deployment.base.diffusionPrefixCheckInterval))
 {
     if (runtime.deployment.base.diffusionSelfConditioningSize > 0)
     {
@@ -84,6 +83,8 @@ BlockDiffusionDecoder::BlockDiffusionDecoder(
         {maxBatch, mCanvasLen}, DeviceType::kGPU, nvinfer1::DataType::kINT8, "BlockDiffusionDecoder::acceptedMask");
     mPrefixLengths
         = Tensor({maxBatch}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "BlockDiffusionDecoder::prefixLengths");
+    mHostPrefixLengths
+        = Tensor({maxBatch}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "BlockDiffusionDecoder::hostPrefixLengths");
     mSelfConditioningEmbedsA = Tensor({maxBatch, mMaxConditioningSeqLen, runtime.deployment.base.hiddenSize},
         DeviceType::kGPU, nvinfer1::DataType::kHALF, "BlockDiffusionDecoder::selfConditioningEmbedsA");
     mSelfConditioningEmbedsB = Tensor({maxBatch, mMaxConditioningSeqLen, runtime.deployment.base.hiddenSize},
@@ -94,6 +95,10 @@ BlockDiffusionDecoder::BlockDiffusionDecoder(
         {1}, DeviceType::kCPU, nvinfer1::DataType::kFLOAT, "BlockDiffusionDecoder::hostSelfConditioningTemperature");
 
     mHostSelfConditioningTemperature.dataPointer<float>()[0] = denoiseTemperature(0);
+    mCommittedLengthsScratch.resize(maxBatch);
+    mRemainingLengthsScratch.resize(maxBatch);
+    mValidCanvasLengthsScratch.resize(maxBatch);
+    mCommitLengthsScratch.resize(maxBatch);
     CUDA_CHECK(cudaMemcpyAsync(mSelfConditioningTemperature.rawPointer(), mHostSelfConditioningTemperature.rawPointer(),
         sizeof(float), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemsetAsync(mCanvasIds.rawPointer(), 0, mCanvasIds.getMemoryCapacity(), stream));
@@ -101,7 +106,7 @@ BlockDiffusionDecoder::BlockDiffusionDecoder(
         mSelfConditioningEmbedsA.rawPointer(), 0, mSelfConditioningEmbedsA.getMemoryCapacity(), stream));
     CUDA_CHECK(cudaMemsetAsync(
         mSelfConditioningEmbedsB.rawPointer(), 0, mSelfConditioningEmbedsB.getMemoryCapacity(), stream));
-    restoreUnifiedBackboneBindings();
+    bindUnifiedBackboneTensors();
 }
 
 bool BlockDiffusionDecoder::initializeCanvas(int32_t batchSize, int32_t canvasLen, cudaStream_t stream)
@@ -182,12 +187,19 @@ bool BlockDiffusionDecoder::updateSelfConditioningTemperature(float temperature,
     return true;
 }
 
-void BlockDiffusionDecoder::restoreUnifiedBackboneBindings()
+void BlockDiffusionDecoder::bindUnifiedBackboneTensors()
 {
     PipelineIO& io = mRuntime.base.pipelineIO;
     bindDiffusionUnifiedBackboneTensors(mRuntime.base.tensorMap, io, io.outputLogits, mCanvasIds,
         mSelfConditioningEmbedsA, mSelfConditioningEmbedsB, mSelfConditioningTemperature);
     mCurrentDenoiseLogits = &io.outputLogits;
+}
+
+void BlockDiffusionDecoder::bindDefaultSelfConditioningTensors()
+{
+    bindDiffusionUnifiedBackboneSelfConditioningTensors(
+        mRuntime.base.tensorMap, mSelfConditioningEmbedsA, mSelfConditioningEmbedsB);
+    mCurrentDenoiseLogits = &mRuntime.base.pipelineIO.outputLogits;
 }
 
 Tensor& BlockDiffusionDecoder::currentDenoiseLogits() noexcept
@@ -225,8 +237,8 @@ bool BlockDiffusionDecoder::prepareUnifiedConditioning(
         return false;
     }
 
-    bindDiffusionUnifiedBackboneTensors(mRuntime.base.tensorMap, io, io.outputLogits, mCanvasIds,
-        prevSelfConditioningEmbeds, nextSelfConditioningEmbeds, mSelfConditioningTemperature);
+    bindDiffusionUnifiedBackboneSelfConditioningTensors(
+        mRuntime.base.tensorMap, prevSelfConditioningEmbeds, nextSelfConditioningEmbeds);
     mCurrentDenoiseLogits = &io.outputLogits;
     return true;
 }
@@ -274,7 +286,7 @@ int32_t BlockDiffusionDecoder::effectiveMaxDenoisingSteps(DecodingInferenceConte
 {
     if (context.diffusionMaxDenoisingSteps <= 0)
     {
-        return mMaxDenoisingSteps;
+        return std::min(mMaxDenoisingSteps, kDefaultRuntimeDenoisingSteps);
     }
     return std::clamp(context.diffusionMaxDenoisingSteps, 1, mMaxDenoisingSteps);
 }
@@ -297,27 +309,14 @@ float BlockDiffusionDecoder::denoiseTemperature(int32_t step) const noexcept
     return denoiseTemperature(step, mMaxDenoisingSteps);
 }
 
-int32_t BlockDiffusionDecoder::readAcceptedPrefixLength(int32_t batchSize, int32_t canvasLen, cudaStream_t stream)
-{
-    check::check(mPrefixLengths.reshape({batchSize}), "Tensor reshape failed");
-    mHostPrefixLengths.resize(batchSize);
-    CUDA_CHECK(cudaMemcpyAsync(mHostPrefixLengths.data(), mPrefixLengths.rawPointer(),
-        static_cast<size_t>(batchSize) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    int32_t prefixLen = canvasLen;
-    for (int32_t b = 0; b < batchSize; ++b)
-    {
-        prefixLen = std::min(prefixLen, mHostPrefixLengths[b]);
-    }
-    return prefixLen;
-}
-
-bool BlockDiffusionDecoder::copyCanvasToHost(int32_t batchSize, int32_t canvasLen, cudaStream_t stream)
+bool BlockDiffusionDecoder::copyCanvasStateToHost(int32_t batchSize, int32_t canvasLen, cudaStream_t stream)
 {
     check::check(mRuntime.sampling.hostPackedTokenIds.reshape({batchSize, canvasLen}), "Tensor reshape failed");
+    check::check(mHostPrefixLengths.reshape({batchSize}), "Tensor reshape failed");
     CUDA_CHECK(cudaMemcpyAsync(mRuntime.sampling.hostPackedTokenIds.rawPointer(), mArgmaxCanvasIds.rawPointer(),
         static_cast<size_t>(batchSize) * canvasLen * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(mHostPrefixLengths.rawPointer(), mPrefixLengths.rawPointer(),
+        static_cast<size_t>(batchSize) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     return true;
 }
@@ -371,10 +370,11 @@ bool BlockDiffusionDecoder::sampleCanvasEntropyBound(
     return true;
 }
 
-std::vector<int32_t> BlockDiffusionDecoder::getCommittedLengths(DecodingInferenceContext const& context) const
+void BlockDiffusionDecoder::fillCommittedLengths(
+    DecodingInferenceContext const& context, std::vector<int32_t>& committedLengths) const
 {
     int32_t const batchSize = context.activeBatchSize;
-    std::vector<int32_t> committedLengths(std::max(0, batchSize), 0);
+    committedLengths.resize(std::max(0, batchSize));
     check::check(static_cast<int32_t>(context.effectivePrefillLengths.size()) >= batchSize,
         "DiffusionGemma context effectivePrefillLengths is smaller than active batch size.");
     check::check(static_cast<int32_t>(context.currentGenerateLengths.size()) >= batchSize,
@@ -384,7 +384,6 @@ std::vector<int32_t> BlockDiffusionDecoder::getCommittedLengths(DecodingInferenc
     {
         committedLengths[b] = context.effectivePrefillLengths[b] + context.currentGenerateLengths[b];
     }
-    return committedLengths;
 }
 
 bool BlockDiffusionDecoder::compactCommitCanvas(int32_t batchSize, int32_t canvasLen, int32_t maxBlockLen,
@@ -433,7 +432,7 @@ bool BlockDiffusionDecoder::commitBlock(
     {
         mRuntime.preprocess.gemma4Ple->embed(mCommitCanvasIds, context.stream);
     }
-    restoreUnifiedBackboneBindings();
+    bindDefaultSelfConditioningTensors();
     check::check(mSelfConditioningEmbedsA.reshape({batchSize, commitSeqLen, mRuntime.deployment.base.hiddenSize}),
         "Tensor reshape failed");
     check::check(mSelfConditioningEmbedsB.reshape({batchSize, commitSeqLen, mRuntime.deployment.base.hiddenSize}),
@@ -484,11 +483,13 @@ bool BlockDiffusionDecoder::decodeStep(DecodingInferenceContext& context)
     TIME_STAGE(metrics::StageNames::kLLM_GENERATION, context.stream);
 
     int32_t const batchSize = context.activeBatchSize;
-    std::vector<int32_t> const committedLengths = getCommittedLengths(context);
+    fillCommittedLengths(context, mCommittedLengthsScratch);
+    std::vector<int32_t> const& committedLengths = mCommittedLengthsScratch;
     int32_t const maxCommittedLen
         = committedLengths.empty() ? 0 : *std::max_element(committedLengths.begin(), committedLengths.end());
 
-    std::vector<int32_t> remainingLengths(batchSize, 0);
+    std::vector<int32_t>& remainingLengths = mRemainingLengthsScratch;
+    remainingLengths.assign(batchSize, 0);
     int32_t maxRemaining = 0;
     for (int32_t b = 0; b < batchSize; ++b)
     {
@@ -520,14 +521,14 @@ bool BlockDiffusionDecoder::decodeStep(DecodingInferenceContext& context)
     // changes the bidirectional denoise distribution and can bias position 0
     // toward EOS on short-answer workloads.
     int32_t const canvasLen = std::max(1, std::min(mCanvasLen, availableKVLen));
-    std::vector<int32_t> validCanvasLengths(batchSize, canvasLen);
+    std::vector<int32_t>& validCanvasLengths = mValidCanvasLengthsScratch;
+    validCanvasLengths.assign(batchSize, canvasLen);
     if (!initializeCanvas(batchSize, canvasLen, context.stream))
     {
         return false;
     }
 
     int32_t const maxDenoisingSteps = effectiveMaxDenoisingSteps(context);
-    int32_t minAcceptedPrefix = 0;
     int32_t denoiseSteps = 0;
     for (int32_t step = 0; step < maxDenoisingSteps; ++step)
     {
@@ -544,38 +545,31 @@ bool BlockDiffusionDecoder::decodeStep(DecodingInferenceContext& context)
         }
         denoiseSteps = step + 1;
         bool const forceAccept = (step + 1) >= maxDenoisingSteps;
-        bool const checkPrefix = forceAccept || ((step + 1) % mPrefixCheckInterval == 0);
-        if (checkPrefix)
+        if (forceAccept)
         {
-            minAcceptedPrefix = readAcceptedPrefixLength(batchSize, canvasLen, context.stream);
-            bool allRowsAccepted = static_cast<int32_t>(mHostPrefixLengths.size()) >= batchSize;
-            for (int32_t b = 0; b < batchSize && allRowsAccepted; ++b)
-            {
-                allRowsAccepted
-                    = mHostPrefixLengths[static_cast<size_t>(b)] >= validCanvasLengths[static_cast<size_t>(b)];
-            }
-            if (forceAccept || allRowsAccepted)
-            {
-                break;
-            }
+            break;
         }
     }
 
-    if (!copyCanvasToHost(batchSize, canvasLen, context.stream))
+    if (!copyCanvasStateToHost(batchSize, canvasLen, context.stream))
     {
         return false;
     }
 
     int32_t const* hostCanvas = mRuntime.sampling.hostPackedTokenIds.dataPointer<int32_t>();
-    std::vector<int32_t> commitLengths(batchSize, 1);
+    int32_t const* hostPrefix = mHostPrefixLengths.dataPointer<int32_t>();
+    int32_t minAcceptedPrefix = canvasLen;
+    std::vector<int32_t>& commitLengths = mCommitLengthsScratch;
+    commitLengths.assign(batchSize, 1);
     int32_t maxBlockLen = 1;
     for (int32_t b = 0; b < batchSize; ++b)
     {
-        int32_t acceptedPrefix = (b < static_cast<int32_t>(mHostPrefixLengths.size())) ? mHostPrefixLengths[b] : 0;
+        int32_t acceptedPrefix = hostPrefix[b];
         if (acceptedPrefix <= 0)
         {
             acceptedPrefix = 1;
         }
+        minAcceptedPrefix = std::min(minAcceptedPrefix, acceptedPrefix);
         int32_t const validLen = validCanvasLengths[b];
         int32_t const remaining = std::max(1, std::min(validLen, remainingLengths[b]));
         int32_t length = std::min(acceptedPrefix, remaining);
@@ -596,24 +590,6 @@ bool BlockDiffusionDecoder::decodeStep(DecodingInferenceContext& context)
         }
         commitLengths[b] = length;
         maxBlockLen = std::max(maxBlockLen, length);
-        std::ostringstream tokenTrace;
-        tokenTrace << "DiffusionGemma canvas batch=" << b << " validLen=" << validLen << " remaining=" << remaining
-                   << " acceptedPrefix=" << acceptedPrefix << " commitLength=" << length << " tokens=[";
-        int32_t const traceLen = std::min(validLen, 16);
-        for (int32_t i = 0; i < traceLen; ++i)
-        {
-            if (i > 0)
-            {
-                tokenTrace << ",";
-            }
-            tokenTrace << hostCanvas[b * canvasLen + i];
-        }
-        if (validLen > traceLen)
-        {
-            tokenTrace << ",...";
-        }
-        tokenTrace << "]";
-        LOG_DEBUG("%s", tokenTrace.str().c_str());
     }
     LOG_DEBUG("DiffusionGemma finalized commit maxBlockLen=%d minAcceptedPrefix=%d canvasLen=%d denoiseSteps=%d",
         maxBlockLen, minAcceptedPrefix, canvasLen, denoiseSteps);
@@ -655,7 +631,7 @@ bool BlockDiffusionDecoder::captureCudaGraphs(cudaStream_t stream)
         }
     } stateGuard{[&]() noexcept {
         mRandomOffset = savedRandomOffset;
-        restoreUnifiedBackboneBindings();
+        bindDefaultSelfConditioningTensors();
         std::vector<int32_t> zeroCacheLens(mRuntime.maxRuntimeBatchSize, 0);
         Tensor zeroCacheLensTensor(
             zeroCacheLens.data(), {mRuntime.maxRuntimeBatchSize}, DeviceType::kCPU, nvinfer1::DataType::kINT32);
@@ -726,7 +702,7 @@ bool BlockDiffusionDecoder::captureCudaGraphs(cudaStream_t stream)
         {
             mRuntime.preprocess.gemma4Ple->embed(mCommitCanvasIds, stream);
         }
-        restoreUnifiedBackboneBindings();
+        bindDefaultSelfConditioningTensors();
         check::check(
             mSelfConditioningEmbedsA.reshape({batchSize, captureCanvasLen, mRuntime.deployment.base.hiddenSize}),
             "Tensor reshape failed");

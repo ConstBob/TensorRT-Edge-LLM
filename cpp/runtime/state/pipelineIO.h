@@ -162,6 +162,12 @@ void buildTensorMapForDiffusionBackbone(
 void bindDiffusionUnifiedBackboneTensors(TensorMap& map, PipelineIO& io, Tensor& logits, Tensor& canvasIds,
     Tensor& prevSelfConditioningEmbeds, Tensor& nextSelfConditioningEmbeds, Tensor& selfConditioningTemperature);
 
+//! Rebind only the DiffusionGemma self-conditioning tensors that ping-pong
+//! between denoise steps. Static unified-backbone bindings are established by
+//! bindDiffusionUnifiedBackboneTensors().
+void bindDiffusionUnifiedBackboneSelfConditioningTensors(
+    TensorMap& map, Tensor& prevSelfConditioningEmbeds, Tensor& nextSelfConditioningEmbeds);
+
 //! Populate a TensorMap for a SpecDecode draft engine. Delegates to `buildTensorMap`
 //! with `kvCacheIndex=1` for the common bindings, then patches in draft-engine-
 //! specific bindings (base/draft hidden states in+out, packed proposal attention

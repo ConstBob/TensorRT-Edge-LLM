@@ -42,7 +42,7 @@ namespace exampleUtils
  *     "logit_bias": {token_id: bias},         // optional default for all requests
  *     "max_generate_length": int,             // optional, default 256
  *     "diffusion_config": {                    // optional DiffusionGemma runtime overrides
- *       "max_denoising_steps": int             // optional, 0/default uses engine config
+ *       "max_denoising_steps": int             // optional, 0/default uses runtime default capped by engine config
  *     },
  *     "num_logprobs": int,                    // optional default for all requests, 0..kMaxLogprobsK
  *     "apply_chat_template": bool,            // optional, default true

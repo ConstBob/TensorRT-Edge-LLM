@@ -24,7 +24,6 @@
 #include <cub/cub.cuh>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include <curand_kernel.h>
 
 namespace trt_edgellm
 {
@@ -172,6 +171,13 @@ __device__ __forceinline__ float diffusionUniform01(
     return value == 0x01000000U ? 0x1.fffffep-1F : static_cast<float>(value) * 0x1.0p-24F;
 }
 
+__device__ __forceinline__ int32_t diffusionUniformToken(
+    uint64_t randomSeed, uint64_t row, uint64_t randomOffset, int32_t vocabSize)
+{
+    uint64_t const mixed = diffusionSplitMix64(randomSeed ^ (row * 0xD1B54A32D192ED03ULL) ^ randomOffset);
+    return static_cast<int32_t>(mixed % static_cast<uint64_t>(vocabSize));
+}
+
 template <typename T, int32_t BLOCK_SIZE_>
 __global__ void diffusionGumbelSampleKernel(T const* __restrict__ logits, int32_t* __restrict__ sampledIds,
     int32_t rows, int32_t vocabSize, float temperature, uint64_t randomSeed, uint64_t randomOffset)
@@ -251,9 +257,12 @@ __global__ void diffusionSampleAndEntropyKernel(T const* __restrict__ logits, in
     using TopKReduce = cub::BlockReduce<DiffusionTopK, BLOCK_SIZE_>;
     using EntropyReduce = cub::BlockReduce<DiffusionEntropyState, BLOCK_SIZE_>;
 
-    __shared__ typename TopKReduce::TempStorage argmaxStorage;
-    __shared__ typename TopKReduce::TempStorage sampleStorage;
-    __shared__ typename EntropyReduce::TempStorage entropyStorage;
+    union ReduceStorage
+    {
+        typename TopKReduce::TempStorage topK;
+        typename EntropyReduce::TempStorage entropy;
+    };
+    __shared__ ReduceStorage reduceStorage;
 
     int32_t const row = static_cast<int32_t>(blockIdx.x);
     int32_t const tid = static_cast<int32_t>(threadIdx.x);
@@ -288,10 +297,12 @@ __global__ void diffusionSampleAndEntropyKernel(T const* __restrict__ logits, in
         samplePartial.insert(sampleScore, v);
     }
 
-    DiffusionTopK const best = TopKReduce(argmaxStorage).Reduce(argmaxPartial, DiffusionTopKMax());
-    DiffusionTopK const sampled = TopKReduce(sampleStorage).Reduce(samplePartial, DiffusionTopKMax());
+    DiffusionTopK const best = TopKReduce(reduceStorage.topK).Reduce(argmaxPartial, DiffusionTopKMax());
+    __syncthreads();
+    DiffusionTopK const sampled = TopKReduce(reduceStorage.topK).Reduce(samplePartial, DiffusionTopKMax());
+    __syncthreads();
     DiffusionEntropyState const entropyState
-        = EntropyReduce(entropyStorage).Reduce(entropyPartial, DiffusionEntropyStateReduce());
+        = EntropyReduce(reduceStorage.entropy).Reduce(entropyPartial, DiffusionEntropyStateReduce());
     if (tid == 0)
     {
         topIndices[row] = best.index >= 0 ? best.index : vocabSize - 1;
@@ -325,9 +336,7 @@ __global__ void initializeDiffusionCanvasKernel(int32_t* canvasIds, int32_t* pre
     int32_t const idx = static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
     if (idx < rows)
     {
-        curandStatePhilox4_32_10_t rng;
-        curand_init(randomSeed, static_cast<uint64_t>(idx), randomOffset, &rng);
-        canvasIds[idx] = static_cast<int32_t>(curand(&rng) % static_cast<uint32_t>(vocabSize));
+        canvasIds[idx] = diffusionUniformToken(randomSeed, static_cast<uint64_t>(idx), randomOffset, vocabSize);
         previousArgmaxIds[idx] = -1;
         stableCounts[idx] = 0;
         acceptedMask[idx] = 0;
@@ -345,10 +354,17 @@ __global__ void diffusionSampleAndUpdateCanvasKernel(int32_t const* sampledIds, 
     int32_t canvasLen, float entropyThreshold, float entropyBound, int32_t stabilityWindow, bool forceAccept,
     int32_t vocabSize, uint64_t randomSeed, uint64_t randomOffset)
 {
-    extern __shared__ int8_t budgetAccepted[];
+    using FloatScan = cub::BlockScan<float, BLOCK_SIZE_>;
+
+    extern __shared__ int8_t dynamicBudgetAccepted[];
+    __shared__ int8_t staticBudgetAccepted[BLOCK_SIZE_];
+    __shared__ float sortedEntropy[BLOCK_SIZE_];
+    __shared__ float sortedBudgetEntropy[BLOCK_SIZE_];
+    __shared__ int32_t sortedPosition[BLOCK_SIZE_];
     __shared__ float reductionEntropy[BLOCK_SIZE_];
     __shared__ int32_t reductionPosition[BLOCK_SIZE_];
     __shared__ int32_t reductionStable[BLOCK_SIZE_];
+    __shared__ typename FloatScan::TempStorage scanStorage;
     __shared__ int32_t clampedValidLen;
     __shared__ int32_t skipRow;
     __shared__ int32_t keepSelecting;
@@ -396,13 +412,83 @@ __global__ void diffusionSampleAndUpdateCanvasKernel(int32_t const* sampledIds, 
         return;
     }
 
-    for (int32_t i = tid; i < canvasLen; i += BLOCK_SIZE_)
+    int8_t* budgetAccepted = clampedValidLen <= BLOCK_SIZE_ ? staticBudgetAccepted : dynamicBudgetAccepted;
+    for (int32_t i = tid; i < clampedValidLen; i += BLOCK_SIZE_)
     {
         budgetAccepted[i] = 0;
     }
     __syncthreads();
 
-    if (entropyBound >= 0.0F)
+    if (entropyBound >= 0.0F && clampedValidLen <= BLOCK_SIZE_)
+    {
+        if (tid < BLOCK_SIZE_)
+        {
+            float entropyKey = FLT_MAX;
+            float budgetEntropy = 0.0F;
+            int32_t position = INT32_MAX;
+            if (tid < clampedValidLen)
+            {
+                float const rowEntropy = entropy[base + tid];
+                if (isfinite(rowEntropy))
+                {
+                    entropyKey = rowEntropy;
+                    budgetEntropy = fmaxf(0.0F, rowEntropy);
+                    position = tid;
+                }
+            }
+            sortedEntropy[tid] = entropyKey;
+            sortedBudgetEntropy[tid] = budgetEntropy;
+            sortedPosition[tid] = position;
+        }
+        __syncthreads();
+
+        for (int32_t sortSize = 2; sortSize <= BLOCK_SIZE_; sortSize <<= 1)
+        {
+            for (int32_t stride = sortSize >> 1; stride > 0; stride >>= 1)
+            {
+                int32_t const other = tid ^ stride;
+                if (other > tid)
+                {
+                    bool const ascending = (tid & sortSize) == 0;
+                    bool const otherFirst = diffusionEntropyCandidateBetter(
+                        sortedEntropy[other], sortedPosition[other], sortedEntropy[tid], sortedPosition[tid]);
+                    if ((ascending && otherFirst) || (!ascending && !otherFirst))
+                    {
+                        float const entropyTmp = sortedEntropy[tid];
+                        float const budgetEntropyTmp = sortedBudgetEntropy[tid];
+                        int32_t const positionTmp = sortedPosition[tid];
+                        sortedEntropy[tid] = sortedEntropy[other];
+                        sortedBudgetEntropy[tid] = sortedBudgetEntropy[other];
+                        sortedPosition[tid] = sortedPosition[other];
+                        sortedEntropy[other] = entropyTmp;
+                        sortedBudgetEntropy[other] = budgetEntropyTmp;
+                        sortedPosition[other] = positionTmp;
+                    }
+                }
+                __syncthreads();
+            }
+        }
+
+        float scanInput = 0.0F;
+        if (tid < clampedValidLen && sortedPosition[tid] != INT32_MAX)
+        {
+            scanInput = sortedBudgetEntropy[tid];
+        }
+        float inclusiveEntropy = 0.0F;
+        FloatScan(scanStorage).InclusiveSum(scanInput, inclusiveEntropy);
+        __syncthreads();
+
+        if (tid < clampedValidLen && sortedPosition[tid] != INT32_MAX)
+        {
+            bool const exceedsBudget = inclusiveEntropy - sortedBudgetEntropy[tid] > entropyBound;
+            if (!exceedsBudget)
+            {
+                budgetAccepted[sortedPosition[tid]] = 1;
+            }
+        }
+        __syncthreads();
+    }
+    else if (entropyBound >= 0.0F)
     {
         if (tid == 0)
         {
@@ -509,9 +595,7 @@ __global__ void diffusionSampleAndUpdateCanvasKernel(int32_t const* sampledIds, 
         }
         else
         {
-            curandStatePhilox4_32_10_t rng;
-            curand_init(randomSeed, static_cast<uint64_t>(row), randomOffset, &rng);
-            canvasIds[row] = static_cast<int32_t>(curand(&rng) % static_cast<uint32_t>(vocabSize));
+            canvasIds[row] = diffusionUniformToken(randomSeed, static_cast<uint64_t>(row), randomOffset, vocabSize);
         }
     }
 
@@ -622,6 +706,7 @@ void sampleDiffusionTokensFromLogits(rt::Tensor const& input, rt::Tensor& sample
         diffusionGumbelSampleKernel<float, kBlockSize><<<grid, block, 0, stream>>>(input.dataPointer<float>(),
             sampledIds.dataPointer<int32_t>(), rows, vocabSize, temperature, random.seed, random.offset);
     }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void sampleDiffusionTokensAndComputeEntropy(rt::Tensor const& input, rt::Tensor& sampledIds, rt::Tensor& topIndices,
@@ -675,6 +760,7 @@ void sampleDiffusionTokensAndComputeEntropy(rt::Tensor const& input, rt::Tensor&
             sampledIds.dataPointer<int32_t>(), topIndices.dataPointer<int32_t>(), entropy.dataPointer<float>(), rows,
             vocabSize, temperature, random.seed, random.offset);
     }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void selectDiffusionArgmaxFromLogits(
@@ -762,6 +848,7 @@ void initializeDiffusionCanvas(rt::Tensor& canvasIds, rt::Tensor& previousArgmax
         previousArgmaxIds.dataPointer<int32_t>(), stableCounts.dataPointer<int32_t>(),
         acceptedMask.dataPointer<int8_t>(), prefixLengths.dataPointer<int32_t>(), rows, batchSize, params.vocabSize,
         params.random.seed, params.random.offset);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void diffusionSampleAndUpdateCanvas(rt::Tensor const& sampledIds, rt::Tensor const& argmaxIds,
@@ -833,6 +920,7 @@ void diffusionSampleAndUpdateCanvas(rt::Tensor const& sampledIds, rt::Tensor con
             acceptedMask.dataPointer<int8_t>(), prefixLengths.dataPointer<int32_t>(), validCanvasLengthsPtr, canvasLen,
             params.entropyThreshold, params.entropyBound, params.stabilityWindow, params.forceAccept, params.vocabSize,
             params.random.seed, params.random.offset);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void compactDiffusionCanvas(rt::Tensor const& canvasIds, rt::Tensor& commitCanvasIds, int32_t batchSize,
@@ -859,6 +947,7 @@ void compactDiffusionCanvas(rt::Tensor const& canvasIds, rt::Tensor& commitCanva
     int32_t const blocks = (totalElements + kBlockSize - 1) / kBlockSize;
     compactDiffusionCanvasKernel<<<blocks, kBlockSize, 0, stream>>>(
         canvasIds.dataPointer<int32_t>(), commitCanvasIds.dataPointer<int32_t>(), canvasLen, blockLen, totalElements);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void compactDiffusionCanvas(rt::Tensor const& canvasIds, rt::Tensor const& commitLengths, rt::Tensor& commitCanvasIds,
@@ -891,6 +980,7 @@ void compactDiffusionCanvas(rt::Tensor const& canvasIds, rt::Tensor const& commi
     compactDiffusionCanvasVarLenKernel<<<blocks, kBlockSize, 0, stream>>>(canvasIds.dataPointer<int32_t>(),
         commitLengths.dataPointer<int32_t>(), commitCanvasIds.dataPointer<int32_t>(), canvasLen, maxBlockLen,
         padTokenId, totalElements);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace trt_edgellm
