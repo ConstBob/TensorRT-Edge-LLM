@@ -77,7 +77,7 @@ build_cutedsl_docker_matrix:
   needs:
     - job: build_cutedsl_docker_image
   tags:
-    - b100-edgellm-nvks
+    - rtx5090-edgellm-nvks
   image:
     name: "$CUTE_DSL_BUILDER_IMAGE"
     entrypoint: [""]

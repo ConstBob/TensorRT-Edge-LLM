@@ -6892,7 +6892,13 @@ def run(
                                                and dtype.width == 4)
         dtype_gpu_full = cp.empty(shape_, dtype=cp_dtype)
 
-        if is_narrow:
+        if export_only:
+            # AOT export only traces tensor metadata, so buffer contents are
+            # irrelevant. Skipping the fill also avoids cute.testing.convert,
+            # whose target-arch JIT helper fails when the build GPU's SM
+            # differs from the artifact target.
+            pass
+        elif is_narrow:
             # FP8/Int4: use cute.testing.convert
             f32_cute = from_dlpack(f32_gpu_full)
             if is_dynamic_layout:

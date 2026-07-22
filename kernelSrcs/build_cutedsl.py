@@ -1511,6 +1511,11 @@ def default_compile_gpu_arch(sm: int) -> str:
 def default_host_target_for_arch(target_arch: str, host_arch: str) -> str:
     if target_arch == "aarch64" and host_arch != target_arch:
         return "linux-aarch64"
+    if target_arch == "x86_64":
+        # Pin a generic x86-64 host target so the exported host-side launch code uses
+        # the portable baseline ISA; an empty target bakes in the build machine's
+        # native ISA (e.g. AVX-512 on Zen4 runners), which SIGILLs on older deployment CPUs.
+        return  "llvm -mtriple=x86_64-unknown-linux-gnu"
     return ""
 
 

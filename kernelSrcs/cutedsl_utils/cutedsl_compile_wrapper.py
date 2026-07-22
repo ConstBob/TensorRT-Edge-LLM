@@ -33,6 +33,7 @@ import inspect
 import os
 from pathlib import Path
 import runpy
+import shlex
 import shutil
 import subprocess
 import sys
@@ -231,7 +232,9 @@ def _merge_compile_options(existing_options, gpu_arch: str, host_target: str) ->
     if gpu_arch:
         extra_options.append(f"--gpu-arch {gpu_arch}")
     if host_target:
-        extra_options.append(f"--host-target {host_target}")
+        # Quote: the long form ("llvm -mtriple=...") has spaces and the DSL
+        # re-tokenizes this string, so an unquoted value would be split apart.
+        extra_options.append(f"--host-target {shlex.quote(host_target)}")
     return " ".join([option for option in [options, *extra_options] if option])
 
 
