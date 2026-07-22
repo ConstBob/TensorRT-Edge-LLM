@@ -453,6 +453,12 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
 
+    // Vision-block D512 retains its specialized FFPA/FMHA_v2 prefill path.
+    if (mHeadSize == 512 && mEnableVisionBlockAttention)
+    {
+        mUseCuteDslFMHA = false;
+    }
+
     LOG_DEBUG("AttentionPlugin FMHA path: %s, sliding_window: %s", mUseCuteDslFMHA ? "CuTe DSL FMHA" : "FMHA_v2",
         mSlidingWindowSize > 0 ? std::to_string(mSlidingWindowSize).c_str() : "disabled");
 
@@ -468,20 +474,22 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
         DecoderXQARunner::loadDecodeXQAKernels(
             mSMVersion, mDataType, selectKvCacheDataType(mEnableFp8KVCache), useSpecDecode, /*usePagedKVCache=*/true);
     }
+    ELLM_CHECK(!(mHeadSize == 512 && mSlidingWindowSize > 0 && !mEnableVisionBlockAttention) || mCanImplementFMHA,
+        "D512 sliding-window prefill requires the CuTe DSL paged FMHA kernel; full-causal FFPA is not a valid "
+        "fallback.");
 
     // Kernel selection priority for prefill and decode:
     //   1. Vision-block attention        — per-layer routing: FFPA d512 vision-block overlay
     //      (full-causal d512 prefill) or FMHA CUSTOM_MASK (sliding d256-class prefill); XQA
     //      decode.  All three are hard requirements (no fallback; construction fails loudly).
-    //   2. FMHA (prefill) + XQA (decode) — standard path for most head sizes.
-    //   3. FFPA (prefill) + XQA (decode) — fallback for headSize=512 where FMHA has no cubins.
-    //   4. FFPA (prefill) only           — headSize=512 without XQA decode support.
+    //   2. FMHA (prefill) + XQA (decode) — common paged path, including
+    //      full-causal FP16 D512 normal/chunked/shared prefill.
+    //   3. FFPA (prefill) + XQA (decode) — fallback for unsupported D512 prefill modes.
+    //   4. FFPA (prefill) only           — D512 without XQA decode support.
     //   5. XQA (decode) only             — prefill unsupported for this head size.
     //   6. None                          — fatal, cannot serve this configuration.
 
-    // FMHA unavailable — try to load the FFPA d512 kernel module.  It serves
-    // both the plain headSize=512 prefill and (when the visionblock AOT
-    // variant is present) the vision-block overlay prefill.
+    // Load FFPA only when common FMHA selection did not find a prefill path.
     if (!mCanImplementFMHA)
     {
 #ifdef CUTE_DSL_FFPA_ENABLED
@@ -592,6 +600,11 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
 
+    if (mHeadSize == 512 && mEnableVisionBlockAttention)
+    {
+        mUseCuteDslFMHA = false;
+    }
+
     LOG_DEBUG("AttentionPlugin FMHA path: %s", mUseCuteDslFMHA ? "CuTe DSL FMHA" : "FMHA_v2");
 
     mCanImplementFMHA = loadFMHAKernels(mUseCuteDslFMHA, mHeadSize, mSMVersion, mDataType, mSlidingWindowSize > 0);
@@ -604,6 +617,9 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
         DecoderXQARunner::loadDecodeXQAKernels(mSMVersion, mDataType, selectKvCacheDataType(mEnableFp8KVCache),
             /*useSpecDecodeKernels=*/true, /*usePagedKVCache=*/true);
     }
+    ELLM_CHECK(!(mHeadSize == 512 && mSlidingWindowSize > 0 && !mEnableVisionBlockAttention) || mCanImplementFMHA,
+        "D512 sliding-window prefill requires the CuTe DSL paged FMHA kernel; full-causal FFPA is not a valid "
+        "fallback.");
 
     if (!mCanImplementFMHA)
     {
@@ -1437,8 +1453,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                 kernel::launchApplyRopeQOnly(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor, stream);
             }
 
-            // Shared-KV without FMHA cubins: FFPA for headSize=512, reject any
-            // other head size.
+            // Configurations without common FMHA use FFPA for shared-KV prefill.
             if (!mCanImplementFMHA)
             {
 #ifdef CUTE_DSL_FFPA_ENABLED
@@ -1540,8 +1555,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
 
         // --- Own KV prefill: RoPE Q+K, write K/V to cache, then run attention kernel ---
 
-        // Own-KV without FMHA cubins: FFPA for headSize=512, reject any other
-        // head size.
+        // Configurations without a common FMHA implementation use FFPA where available.
         if (!mCanImplementFMHA)
         {
 #ifdef CUTE_DSL_FFPA_ENABLED

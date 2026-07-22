@@ -199,8 +199,6 @@ protected:
 #endif
 
     //! Whether FMHA context kernels are available for this configuration.
-    //! When false, prefill runs FFPA (headSize=512); other head sizes have no
-    //! prefill support.
     bool mCanImplementFMHA{true};
 
     //! Whether the FFPA d512 kernel is available for headSize=512 prefill.

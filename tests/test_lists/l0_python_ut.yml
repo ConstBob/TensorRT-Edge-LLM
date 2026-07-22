@@ -16,6 +16,7 @@ tests:
   - tests/python-unittests/test_attention_plugin.py::test_gqa_decode
   - tests/python-unittests/test_attention_plugin.py::test_gqa_prefill
   - tests/python-unittests/test_attention_plugin.py::test_prefill_head512
+  - tests/python-unittests/test_attention_plugin.py::test_prefill_head512_cutedsl_gqa_2
   - tests/python-unittests/test_attention_plugin.py::test_fp8_kv_cache_decode
   - tests/python-unittests/test_attention_plugin.py::test_fp8_kv_cache_prefill
   - tests/python-unittests/test_attention_plugin.py::test_decode_head32
@@ -26,6 +27,7 @@ tests:
   - tests/python-unittests/test_attention_plugin.py::test_prefill_successive_chunks
   - tests/python-unittests/test_attention_plugin.py::test_ragged_context_lengths_decode
   - tests/python-unittests/test_attention_plugin.py::test_ragged_prefill
+  - tests/python-unittests/test_attention_plugin.py::test_ragged_prefill_head512_cutedsl
   - tests/python-unittests/test_attention_plugin.py::test_ragged_prefill_batch_invariance
   - tests/python-unittests/test_attention_plugin.py::test_batch_permutation_invariance_decode
   - tests/python-unittests/test_attention_plugin.py::test_tree_attention

@@ -30,6 +30,16 @@
 namespace trt_edgellm
 {
 
+namespace
+{
+
+bool isSupportedBlackwellFmha(int32_t smVersion)
+{
+    return smVersion == 100 || smVersion == 101 || smVersion == 110;
+}
+
+} // namespace
+
 // =====================================================================
 // Static member initialization
 // =====================================================================
@@ -55,16 +65,20 @@ fmha_d256_sw_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d256_sw_fp8 = {};
 fmha_d64_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_paged = {};
 fmha_d128_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_paged = {};
 fmha_d256_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d256_paged = {};
+fmha_d512_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d512_paged = {};
 fmha_d64_sw_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_sw_paged = {};
 fmha_d128_sw_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_sw_paged = {};
 fmha_d256_sw_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d256_sw_paged = {};
+fmha_d512_sw_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d512_sw_paged = {};
 // LLM paged KV cache (FP8 input, FP16 output)
 fmha_d64_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_paged_fp8 = {};
 fmha_d128_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_paged_fp8 = {};
 fmha_d256_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d256_paged_fp8 = {};
+fmha_d512_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d512_paged_fp8 = {};
 fmha_d64_sw_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_sw_paged_fp8 = {};
 fmha_d128_sw_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_sw_paged_fp8 = {};
 fmha_d256_sw_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d256_sw_paged_fp8 = {};
+fmha_d512_sw_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d512_sw_paged_fp8 = {};
 bool CuteDslFMHARunner::sLLMLoaded = false;
 std::mutex CuteDslFMHARunner::sLLMMutex;
 
@@ -106,15 +120,19 @@ bool CuteDslFMHARunner::loadLLMKernelModule()
         fmha_d64_paged_Kernel_Module_Load(&sLLM_d64_paged);
         fmha_d128_paged_Kernel_Module_Load(&sLLM_d128_paged);
         fmha_d256_paged_Kernel_Module_Load(&sLLM_d256_paged);
+        fmha_d512_paged_Kernel_Module_Load(&sLLM_d512_paged);
         fmha_d64_sw_paged_Kernel_Module_Load(&sLLM_d64_sw_paged);
         fmha_d128_sw_paged_Kernel_Module_Load(&sLLM_d128_sw_paged);
         fmha_d256_sw_paged_Kernel_Module_Load(&sLLM_d256_sw_paged);
+        fmha_d512_sw_paged_Kernel_Module_Load(&sLLM_d512_sw_paged);
         fmha_d64_paged_fp8_Kernel_Module_Load(&sLLM_d64_paged_fp8);
         fmha_d128_paged_fp8_Kernel_Module_Load(&sLLM_d128_paged_fp8);
         fmha_d256_paged_fp8_Kernel_Module_Load(&sLLM_d256_paged_fp8);
+        fmha_d512_paged_fp8_Kernel_Module_Load(&sLLM_d512_paged_fp8);
         fmha_d64_sw_paged_fp8_Kernel_Module_Load(&sLLM_d64_sw_paged_fp8);
         fmha_d128_sw_paged_fp8_Kernel_Module_Load(&sLLM_d128_sw_paged_fp8);
         fmha_d256_sw_paged_fp8_Kernel_Module_Load(&sLLM_d256_sw_paged_fp8);
+        fmha_d512_sw_paged_fp8_Kernel_Module_Load(&sLLM_d512_sw_paged_fp8);
         sLLMLoaded = true;
         LOG_DEBUG("CuTe DSL LLM FMHA kernel modules loaded (FP16 + FP8 + paged)");
         return true;
@@ -148,15 +166,19 @@ void CuteDslFMHARunner::unloadLLMKernelModule()
         fmha_d64_paged_Kernel_Module_Unload(&sLLM_d64_paged);
         fmha_d128_paged_Kernel_Module_Unload(&sLLM_d128_paged);
         fmha_d256_paged_Kernel_Module_Unload(&sLLM_d256_paged);
+        fmha_d512_paged_Kernel_Module_Unload(&sLLM_d512_paged);
         fmha_d64_sw_paged_Kernel_Module_Unload(&sLLM_d64_sw_paged);
         fmha_d128_sw_paged_Kernel_Module_Unload(&sLLM_d128_sw_paged);
         fmha_d256_sw_paged_Kernel_Module_Unload(&sLLM_d256_sw_paged);
+        fmha_d512_sw_paged_Kernel_Module_Unload(&sLLM_d512_sw_paged);
         fmha_d64_paged_fp8_Kernel_Module_Unload(&sLLM_d64_paged_fp8);
         fmha_d128_paged_fp8_Kernel_Module_Unload(&sLLM_d128_paged_fp8);
         fmha_d256_paged_fp8_Kernel_Module_Unload(&sLLM_d256_paged_fp8);
+        fmha_d512_paged_fp8_Kernel_Module_Unload(&sLLM_d512_paged_fp8);
         fmha_d64_sw_paged_fp8_Kernel_Module_Unload(&sLLM_d64_sw_paged_fp8);
         fmha_d128_sw_paged_fp8_Kernel_Module_Unload(&sLLM_d128_sw_paged_fp8);
         fmha_d256_sw_paged_fp8_Kernel_Module_Unload(&sLLM_d256_sw_paged_fp8);
+        fmha_d512_sw_paged_fp8_Kernel_Module_Unload(&sLLM_d512_sw_paged_fp8);
         sLLMLoaded = false;
     }
 }
@@ -200,13 +222,14 @@ void CuteDslFMHARunner::unloadViTKernelModule()
 
 bool CuteDslFMHARunner::canImplement(int32_t headSize, int32_t smVersion)
 {
-    bool const supportedHeadSize = headSize == 64 || headSize == 128 || headSize == 256;
-    return smVersion >= 100 && supportedHeadSize;
+    bool const supportedHeadSize = headSize == 64 || headSize == 128 || headSize == 256 || headSize == 512;
+    return isSupportedBlackwellFmha(smVersion) && supportedHeadSize;
 }
 
 bool CuteDslFMHARunner::canImplementViT(int32_t headSize, int32_t smVersion)
 {
-    return (smVersion >= 100) && (headSize == 64 || headSize == 72 || headSize == 80 || headSize == 128);
+    return isSupportedBlackwellFmha(smVersion)
+        && (headSize == 64 || headSize == 72 || headSize == 80 || headSize == 128);
 }
 
 // =====================================================================
@@ -491,7 +514,8 @@ void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, i
         DISPATCH_PAGED_HEADD(64, fmha_d64_paged_fp8, sLLM_d64_paged_fp8, fmha_d64_sw_paged_fp8, sLLM_d64_sw_paged_fp8)
         else DISPATCH_PAGED_HEADD(128, fmha_d128_paged_fp8, sLLM_d128_paged_fp8, fmha_d128_sw_paged_fp8,
             sLLM_d128_sw_paged_fp8) else DISPATCH_PAGED_HEADD(256, fmha_d256_paged_fp8, sLLM_d256_paged_fp8,
-            fmha_d256_sw_paged_fp8, sLLM_d256_sw_paged_fp8) else
+            fmha_d256_sw_paged_fp8, sLLM_d256_sw_paged_fp8) else DISPATCH_PAGED_HEADD(512, fmha_d512_paged_fp8,
+            sLLM_d512_paged_fp8, fmha_d512_sw_paged_fp8, sLLM_d512_sw_paged_fp8) else
         {
             LOG_ERROR("CuTe DSL paged LLM FMHA: unsupported head_dim=%d", headDim);
             return;
@@ -502,7 +526,8 @@ void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, i
         DISPATCH_PAGED_HEADD(64, fmha_d64_paged, sLLM_d64_paged, fmha_d64_sw_paged, sLLM_d64_sw_paged)
         else DISPATCH_PAGED_HEADD(128, fmha_d128_paged, sLLM_d128_paged, fmha_d128_sw_paged,
             sLLM_d128_sw_paged) else DISPATCH_PAGED_HEADD(256, fmha_d256_paged, sLLM_d256_paged, fmha_d256_sw_paged,
-            sLLM_d256_sw_paged) else
+            sLLM_d256_sw_paged) else DISPATCH_PAGED_HEADD(512, fmha_d512_paged, sLLM_d512_paged, fmha_d512_sw_paged,
+            sLLM_d512_sw_paged) else
         {
             LOG_ERROR("CuTe DSL paged LLM FMHA: unsupported head_dim=%d", headDim);
             return;
