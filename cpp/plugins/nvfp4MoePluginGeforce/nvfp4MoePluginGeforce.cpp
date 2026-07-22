@@ -269,11 +269,12 @@ NvFP4MoEPluginGeforce::NvFP4MoEPluginGeforce(std::string const& name, PluginFiel
     case kACT_SILU:
     case kACT_SWIGLU:
     case kACT_GELU:
-    case kACT_RELU2: break;
+    case kACT_RELU2:
+    case kACT_GEGLU: break;
     default:
         throw std::invalid_argument(
             "NvFP4MoEPluginGeforce: activation_type must be 0 (identity), 1 (silu), "
-            "2 (swiglu), 3 (gelu), or 4 (relu2)");
+            "2 (swiglu), 3 (gelu), 4 (relu2), or 5 (geglu)");
     }
     if (mBackend != kBACKEND_AUTO && mBackend != kBACKEND_DECODE && mBackend != kBACKEND_PREFILL)
     {

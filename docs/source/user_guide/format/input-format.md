@@ -247,7 +247,7 @@ Top-level `logit_bias` applies to every request by default. A request-level `log
 }
 ```
 
-**Speculative decoding limitation:** Requests with a non-empty `logit_bias` map are rejected while speculative decoding is active. Set `disable_spec_decode: true` to explicitly use vanilla decoding for that batch before sending logit bias. Future support for using `logit_bias` with speculative decoding is tracked in [GitLab issue #479](https://gitlab-master.nvidia.com/TensorRT/tensorrt-edge-llm/tensorrt-edge-llm/-/issues/479).
+**Speculative decoding limitation:** Requests with a non-empty `logit_bias` map are rejected while speculative decoding is active. Set `disable_spec_decode: true` to explicitly use vanilla decoding for that batch before sending logit bias.
 
 ### Top-N Log-Probabilities
 

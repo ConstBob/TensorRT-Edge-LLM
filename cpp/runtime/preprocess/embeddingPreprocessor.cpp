@@ -43,6 +43,7 @@ void EmbeddingPreprocessor::embed(Tensor const& tokenIds, OptionalInputTensor vi
     // positions using multimodalIndices, and text tokens use the embedding table.
     if (visionEmbeds.has_value() || audioEmbeds.has_value())
     {
+
         std::optional<int32_t> audioTokenOpt
             = (mConfig.audioTokenId >= 0) ? std::optional{mConfig.audioTokenId} : std::nullopt;
         std::optional<int32_t> imageTokenOpt

@@ -86,7 +86,7 @@ rt::Tensor makeCuSeqLens(std::vector<int32_t> const& lens)
 
 //! Poison padding rows (>= lens[b]) of a [B, S, H, D] fp16 tensor with random
 //! near-fp16-max garbage — models the token-0 / PLE-0 large-magnitude values
-//! that padding positions carry in bug 6384817.  When nanPoison is set, fill
+//! that padding positions carry.  When nanPoison is set, fill
 //! with NaN (first padding row: Inf) instead — padding rows legitimately hold
 //! NaN/Inf mid-network once fp16 overflow of garbage embeddings has occurred
 //! in non-attention layers, and the kernel must not leak them into valid rows
@@ -294,8 +294,12 @@ INSTANTIATE_TEST_SUITE_P(FP16Causal, CuteDslFFPAAccuracySweep,
         ShapeParam{1, 128, 8, 1, /*useNormalInit=*/true, "gemma_mqa_custom", 0.37F},
         ShapeParam{1, 256, 4, 1, /*useNormalInit=*/true, "mqa_g4_H4_KV1"},
         ShapeParam{1, 1024, 8, 1, /*useNormalInit=*/true, "mqa_H8_KV1_1k"},
-        // Gemma4 12B global-attention layers use Hq=16, Hkv=1.
-        ShapeParam{1, 128, 16, 1, /*useNormalInit=*/true, "gemma4_mqa_g16_H16_KV1"}),
+        // Gemma4 Unified 12B global-attention layers use Hq=16, Hkv=1.
+        ShapeParam{1, 128, 16, 1, /*useNormalInit=*/true, "gemma4_mqa_g16_H16_KV1"},
+        // Br/Bc-unaligned lengths exercising the KV tail block.
+        ShapeParam{1, 45, 16, 1, /*useNormalInit=*/true, "gemma4_g16_S45_tail"},
+        ShapeParam{1, 282, 16, 1, /*useNormalInit=*/true, "gemma4_g16_S282_tail"},
+        ShapeParam{1, 45, 8, 1, /*useNormalInit=*/true, "gqa8_S45_tail_control"}),
     [](::testing::TestParamInfo<ShapeParam> const& info) { return std::string{info.param.name}; });
 
 class CuteDslFFPACausalProperty : public CuteDslFFPABase, public ::testing::WithParamInterface<float>
@@ -420,7 +424,7 @@ protected:
 };
 
 // Ragged BS=3 right-padded batch with near-fp16-max garbage in the padding
-// positions — the bug 6384817 shape (Gemma4 BS>1 MMLU prefill).  The dense
+// positions — the Gemma4 BS>1 MMLU prefill shape.  The dense
 // FFPA kernel attends the poisoned padding and corrupts the batch; with
 // per-batch cu_seqlens the valid rows must match the per-batch FP32 reference,
 // padding rows must stay bounded, and nothing may be NaN/Inf.
@@ -517,7 +521,7 @@ TEST_F(CuteDslFFPAVarlen, RaggedBatchPoisonedPadding)
 }
 
 // NaN-poisoned padding: padding K/V rows can legitimately contain NaN/Inf at
-// inference time (bug 6384817 forensics: fp16 overflow of garbage padding
+// inference time (fp16 overflow of garbage padding
 // embeddings in the FFN turns pad rows NaN from layer 1 on).  Score masking
 // alone is not NaN-safe — BMM2 computes P(0) x V(NaN) = NaN and poisons the
 // whole boundary q-tile — so the boundary-tile K/V loads zero-fill logical
@@ -967,7 +971,7 @@ TEST_F(CuteDslFFPAVisionBlock, TwoBlocksGemma4HeadShape)
 
 // Ragged BS=2 right-padded batch with poisoned padding and different block
 // layouts per batch — the overlay must stay per-batch correct under varlen
-// masking (reusing the bug 6384817 test structure).
+// masking (reusing the ragged-padding test structure).
 TEST_F(CuteDslFFPAVisionBlock, RaggedBatchWithBlocks)
 {
     int32_t constexpr kSeqLen = 192;
@@ -996,6 +1000,32 @@ TEST_F(CuteDslFFPAVisionBlock, SentinelDegeneratesToCausal)
     int32_t constexpr kSeqLen = 130; // Br/Bc-unaligned on purpose
     std::vector<int32_t> const blockIds(kSeqLen, -1);
     runAndCheck(blockIds, {kSeqLen}, kSeqLen, 4, 2, /*poisonPadding=*/false, "sentinel_degenerates_to_causal");
+}
+
+// Gemma4-12B Unified head shape (Hq=16, Hkv=1) at Br/Bc-unaligned lengths.
+TEST_F(CuteDslFFPAVisionBlock, SentinelCausalG16UnalignedS45)
+{
+    int32_t constexpr kSeqLen = 45;
+    std::vector<int32_t> const blockIds(kSeqLen, -1);
+    runAndCheck(blockIds, {kSeqLen}, kSeqLen, 16, 1, /*poisonPadding=*/false, "sentinel_g16_s45");
+}
+
+TEST_F(CuteDslFFPAVisionBlock, SentinelCausalG16UnalignedS283)
+{
+    int32_t constexpr kSeqLen = 283;
+    std::vector<int32_t> const blockIds(kSeqLen, -1);
+    runAndCheck(blockIds, {kSeqLen}, kSeqLen, 16, 1, /*poisonPadding=*/false, "sentinel_g16_s283");
+}
+
+TEST_F(CuteDslFFPAVisionBlock, ImageSpanG16UnalignedS282)
+{
+    int32_t constexpr kSeqLen = 282; // mirrors the 12B probe: boi@4, image 5..270, eoi@271
+    std::vector<int32_t> blockIds(kSeqLen, -1);
+    for (int32_t s = 5; s <= 270; ++s)
+    {
+        blockIds[static_cast<size_t>(s)] = 0;
+    }
+    runAndCheck(blockIds, {kSeqLen}, kSeqLen, 16, 1, /*poisonPadding=*/false, "image_span_g16_s282");
 }
 
 class CuteDslFFPANegativePath : public CuteDslFFPABase
@@ -1193,11 +1223,13 @@ TEST(CuteDslFFPARunnerStaticTest, CanImplementGQAGroupSizes)
     EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, kSM, 16, 2));
 #endif
 
-    // GQA16: Hq=16, Hkv=1 (Gemma4 12B global attention)
+    // GQA16: Hq=16, Hkv=1 (Gemma4 Unified 12B global attention)
 #if defined(CUTE_DSL_FFPA_GQA16_ENABLED)
     EXPECT_TRUE(CuteDslFFPARunner::canImplement(512, kSM, 16, 1));
+    EXPECT_TRUE(CuteDslFFPARunner::canImplement(512, kSM, 32, 2));
 #else
     EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, kSM, 16, 1));
+    EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, kSM, 32, 2));
 #endif
 
     // Unsupported group sizes (2, 3)
