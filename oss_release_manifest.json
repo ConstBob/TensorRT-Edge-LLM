@@ -17,6 +17,7 @@
       "unittests/shmAllReduceTests.cu"
     ],
     "strip_paths": [
+      ".dockerignore",
       "cmake/CuteDsl.cmake",
       "kernelSrcs/build_cutedsl.py",
       "kernelSrcs/gemm_cutedsl/gemm_blackwell_nvfp4_ws.py",

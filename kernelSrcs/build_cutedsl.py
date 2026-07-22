@@ -47,8 +47,8 @@ Output (under {output_dir}/{arch}/{artifact_tag}/):
 Prebuilt tarballs:
   Prebuilt CuTe DSL artifacts are shipped in the release package. When building
   from the source tree, no tarball is committed — CI generates per-target
-  artifacts for testing (see .gitlab/ci/cutedsl-jobs.yml). The container/build
-  flow still extracts a tarball if one is placed under
+  artifacts for testing. The container/build flow still extracts a tarball if
+  one is placed under
   kernelSrcs/cuteDSLPrebuilt/; otherwise build from source for your target:
     python kernelSrcs/build_cutedsl.py --gpu_arch sm_110 --arch aarch64 --clean
 """
