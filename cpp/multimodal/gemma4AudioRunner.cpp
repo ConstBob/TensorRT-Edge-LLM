@@ -224,9 +224,20 @@ bool Gemma4AudioRunner::loadMelSpectrogramFromFile(
 
 bool Gemma4AudioRunner::extractMelFromPcm(rt::audio::AudioPCM const& pcm, rt::Tensor& melGpu, cudaStream_t stream)
 {
+    // HF Gemma4AudioFeatureExtractor pads the raw waveform to a multiple of 128 samples
+    // before mel extraction (pad_to_multiple_of=128). Replicate this to match frame counts.
+    static constexpr int32_t kPadToMultipleOf = 128;
+    rt::audio::AudioPCM paddedPcm = pcm;
+    size_t const rawLen = paddedPcm.samples.size();
+    size_t const paddedLen = ((rawLen + kPadToMultipleOf - 1) / kPadToMultipleOf) * kPadToMultipleOf;
+    if (paddedLen > rawLen)
+    {
+        paddedPcm.samples.resize(paddedLen, 0.0f);
+    }
+
     // Extract mel-spectrogram on CPU. Output shape: [mel_bins, T] (kMelTime layout).
     rt::Tensor hostMel;
-    if (!mMelExtractor.extract(pcm, hostMel))
+    if (!mMelExtractor.extract(paddedPcm, hostMel))
     {
         LOG_ERROR("Gemma4AudioRunner: mel extraction from PCM failed");
         return false;
