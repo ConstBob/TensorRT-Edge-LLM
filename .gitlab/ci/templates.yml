@@ -297,10 +297,12 @@
     - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
     - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
     - echo "Installing test dependencies"
-    - pip3 install -q -r tests/requirements.txt torch
+    - pip3 install -q -r tests/requirements.txt -r tests/requirements-ut.txt
     - echo "Installing TensorRT Python package from cache"
     - pip3 install -q $TRT_PACKAGE_DIR/python/tensorrt-$TRT_VERSION*-cp312*.whl
     - export LD_LIBRARY_PATH=$TRT_PACKAGE_DIR/lib:$LD_LIBRARY_PATH
+    # test_build_project_with_pybind (l0_python_ut list) builds _edgellm_runtime.
+    - export PYTHONPATH="$PWD/build/pybind${PYTHONPATH:+:$PYTHONPATH}"
     - echo "Running unit tests with pytest. Time:$(date)"
     # Test selection is driven by the tests/test_lists/$PRIORITY.yml list.
     - python3 -m pytest tests/ --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml

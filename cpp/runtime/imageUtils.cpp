@@ -142,6 +142,7 @@ ImageData loadVideoFromFrames(std::vector<std::string> const& framePaths, double
 
     ImageData video(std::move(stacked));
     video.fps = fps;
+    video.isVideo = true;
     return video;
 }
 

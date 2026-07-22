@@ -108,11 +108,13 @@ private:
     //! \param[out] imageTokenLengths Token lengths for each image
     //! \param[out] numImages Number of images processed
     //! \param[out] totalNumBlocks Total number of image blocks
-    //! \param[in] isThumbnail Whether the image is a thumbnail
+    //! \param[in] isThumbnail Whether the image is a thumbnail (or, for video, a follow-on frame:
+    //!            appends its tokens to the previous visual item instead of starting a new one)
     //! \param[in] stream CUDA stream for execution
+    //! \param[in] frameIdx Frame index into a multi-frame (video) ImageData; 0 for a still image
     //! \throws std::runtime_error if image size is unexpected, or number of blocks is excessive
     void formatPatch(rt::imageUtils::ImageData const& image, std::vector<int64_t>& imageTokenLengths,
-        int64_t& numImages, int64_t& totalNumBlocks, bool isThumbnail, cudaStream_t stream);
+        int64_t& numImages, int64_t& totalNumBlocks, bool isThumbnail, cudaStream_t stream, int64_t frameIdx = 0);
 
     //! \brief Preprocess all images in the request
     //! \param[in] request LLM generation request containing images

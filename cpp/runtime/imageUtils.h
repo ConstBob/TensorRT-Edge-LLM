@@ -34,8 +34,9 @@ namespace imageUtils
 /*!
  * @brief Image data container (image or video frame stack)
  *
- * Wraps a uint8 RGB tensor with the unified 4D layout `[frames, height, width, channels]`. Single still
- * images are represented as `frames == 1`; video frame stacks have `frames > 1`. Channels must be 3.
+ * Wraps a uint8 RGB tensor with the unified 4D layout `[frames, height, width, channels]`. Still
+ * images have `frames == 1`; videos carry `isVideo == true` (a single-frame video is still a video).
+ * Channels must be 3.
  */
 class ImageData
 {
@@ -44,9 +45,11 @@ public:
     int64_t width{0};                   //!< Image width
     int64_t height{0};                  //!< Image height
     int64_t channels{0};                //!< Number of channels (e.g., 3 for RGB)
-    int64_t frames{1};                  //!< Number of frames (T). 1 for static images, >1 for video.
-    double fps{1.0};     //!< Video sample fps (used to compute MRoPE timestamps); ignored when frames == 1.
-    bool doResize{true}; //!< When false, the vision runner skips its internal resize.
+    int64_t frames{1};                  //!< Number of frames (T); the modality is flagged by isVideo.
+    double fps{1.0};                    //!< Video sample fps for MRoPE timestamps; ignored unless isVideo.
+    bool doResize{true};                //!< When false, the vision runner skips its internal resize.
+    bool isVideo{false};                //!< Explicit modality: a single-frame video is still a video.
+    std::vector<double> timestamps;     //!< Optional source timestamps (seconds); empty assumes uniform fps spacing.
 
     /*!
      * @brief Default constructor (creates uninitialized ImageData)

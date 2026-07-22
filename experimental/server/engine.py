@@ -194,8 +194,9 @@ def _engine_config_tag(
     return f"i{max_input_len}_b{max_batch_size}_kv{max_kv_cache_capacity}"
 
 
-def _is_vlm(model_dir: str) -> bool:
-    """Check if the model is a VLM by reading config.json."""
+def _is_multimodal(model_dir: str) -> bool:
+    """Visual-encoder model_type in config.json (audio model types are
+    detected separately via _AUDIO_MODEL_TYPES)."""
     cfg_path = os.path.join(model_dir, "config.json")
     if not os.path.exists(cfg_path):
         return False
@@ -349,6 +350,8 @@ def _validate_logit_bias_spec_decode(logit_bias: Dict[int, float], *,
 # LLM class
 # ---------------------------------------------------------------------------
 
+_STREAM_JOIN_TIMEOUT_S = 5.0
+
 
 class LLM:
     """vLLM-style entry point for TensorRT Edge-LLM inference.
@@ -367,7 +370,7 @@ class LLM:
     3. **Pre-built engine** — loads directly::
 
            llm = LLM(engine_dir="/path/to/engine")
-           llm = LLM(engine_dir="...", visual_engine_dir="...")
+           llm = LLM(engine_dir="...", multimodal_engine_dir="...")
 
     See :mod:`experimental.server.engine_layout` for the expected
     directory layouts.
@@ -380,6 +383,7 @@ class LLM:
         onnx_dir: str = "",
         visual_onnx_dir: str = "",
         engine_dir: str = "",
+        multimodal_engine_dir: str = "",
         visual_engine_dir: str = "",
         max_input_len: int = 4096,
         max_batch_size: int = 1,
@@ -395,6 +399,10 @@ class LLM:
                 "Exactly one of 'model', 'onnx_dir', or 'engine_dir' "
                 "must be provided.")
 
+        # `visual_engine_dir` is the deprecated alias for `multimodal_engine_dir`
+        # (the encoder slot now also serves audio).
+        multimodal_engine_dir = multimodal_engine_dir or visual_engine_dir
+
         self._model_id = (model or os.path.basename(onnx_dir)
                           or os.path.basename(engine_dir))
         self._eagle_engine_dir = eagle_engine_dir
@@ -405,7 +413,7 @@ class LLM:
             ToolChatTemplateFormatter] = None
 
         if engine_dir:
-            self._init_from_engine(engine_dir, visual_engine_dir)
+            self._init_from_engine(engine_dir, multimodal_engine_dir)
         elif onnx_dir:
             self._init_from_onnx(
                 onnx_dir,
@@ -429,13 +437,13 @@ class LLM:
     # ------------------------------------------------------------------
 
     def _init_from_engine(self, engine_dir: str,
-                          visual_engine_dir: str) -> None:
+                          multimodal_engine_dir: str) -> None:
         """Load from pre-built engine directories (no export, no build)."""
         from .engine_layout import (EngineType, detect_engine_type,
-                                    find_visual_engine_dir,
+                                    find_multimodal_engine_dir,
                                     validate_llm_engine_dir,
-                                    validate_spec_decode_engine_dir,
-                                    validate_visual_engine_dir)
+                                    validate_multimodal_engine_dir,
+                                    validate_spec_decode_engine_dir)
 
         engine_type = detect_engine_type(engine_dir)
         if engine_type == EngineType.SPEC_DECODE:
@@ -443,17 +451,17 @@ class LLM:
                 raise ValueError(
                     f"spec_base.engine/spec_draft.engine not found in: {engine_dir}"
                 )
-            if visual_engine_dir:
+            if multimodal_engine_dir:
                 logger.warning(
-                    "visual_engine_dir=%r is ignored for spec-decode engines",
-                    visual_engine_dir)
+                    "multimodal_engine_dir=%r is ignored for spec-decode engines",
+                    multimodal_engine_dir)
             # Spec-decode dir (spec_base.engine + spec_draft.engine): route through
             # the spec-decode path by promoting engine_dir to eagle_engine_dir.
             self._engine_dir = engine_dir
             self._model_dir = engine_dir
             self._eagle_engine_dir = engine_dir
-            self._visual_engine_dir = ""
-            self._is_vlm = False
+            self._multimodal_engine_dir = ""
+            self._is_multimodal = False
             logger.info("Using pre-built spec-decode engine: %s",
                         self._engine_dir)
             return
@@ -461,19 +469,19 @@ class LLM:
             raise ValueError(f"llm.engine not found in: {engine_dir}")
         self._engine_dir = engine_dir
         self._model_dir = engine_dir
-        self._is_vlm = False
+        self._is_multimodal = False
 
-        if visual_engine_dir:
-            if not validate_visual_engine_dir(visual_engine_dir):
+        if multimodal_engine_dir:
+            if not validate_multimodal_engine_dir(multimodal_engine_dir):
                 raise ValueError(
-                    f"visual.engine not found in: {visual_engine_dir}")
-            self._visual_engine_dir = visual_engine_dir
-            self._is_vlm = True
+                    f"visual.engine not found in: {multimodal_engine_dir}")
+            self._multimodal_engine_dir = multimodal_engine_dir
+            self._is_multimodal = True
         else:
-            auto = find_visual_engine_dir(engine_dir)
-            self._visual_engine_dir = auto or ""
+            auto = find_multimodal_engine_dir(engine_dir)
+            self._multimodal_engine_dir = auto or ""
             if auto:
-                self._is_vlm = True
+                self._is_multimodal = True
                 logger.info("Auto-detected visual engine: %s", auto)
 
         logger.info("Using pre-built engine: %s", self._engine_dir)
@@ -494,7 +502,7 @@ class LLM:
         self._onnx_dir = onnx_dir
         self._visual_onnx_dir = visual_onnx_dir
         self._model_dir = onnx_dir
-        self._is_vlm = bool(visual_onnx_dir)
+        self._is_multimodal = bool(visual_onnx_dir)
 
         cfg_tag = _engine_config_tag(max_input_len, max_batch_size,
                                      max_kv_cache_capacity)
@@ -510,16 +518,17 @@ class LLM:
         else:
             logger.info("Using cached engine: %s", self._engine_dir)
 
-        self._visual_engine_dir = ""
-        if self._is_vlm:
-            self._visual_engine_dir = os.path.join(artifacts, "engine",
-                                                   cfg_tag, "visual")
+        self._multimodal_engine_dir = ""
+        if self._is_multimodal:
+            self._multimodal_engine_dir = os.path.join(artifacts, "engine",
+                                                       cfg_tag, "visual")
             if not os.path.exists(
-                    os.path.join(self._visual_engine_dir, "visual.engine")):
+                    os.path.join(self._multimodal_engine_dir,
+                                 "visual.engine")):
                 self._build_visual_engine()
             else:
                 logger.info("Using cached visual engine: %s",
-                            self._visual_engine_dir)
+                            self._multimodal_engine_dir)
 
     def _init_from_model(
         self,
@@ -537,9 +546,9 @@ class LLM:
         logger.info("Resolving model: %s", model)
         self._model_dir = _resolve_model_dir(model)
         artifacts = _artifacts_dir_for_model(self._model_dir)
-        self._is_vlm = _is_vlm(self._model_dir)
+        self._is_multimodal = _is_multimodal(self._model_dir)
         self._model_type = _read_model_type(self._model_dir)
-        if self._is_vlm:
+        if self._is_multimodal:
             logger.info("Detected VLM model (type=%s)", self._model_type)
 
         self._onnx_dir = os.path.join(artifacts, "onnx", "llm")
@@ -549,7 +558,7 @@ class LLM:
             logger.info("Using cached ONNX: %s", self._onnx_dir)
 
         self._visual_onnx_dir = ""
-        if self._is_vlm:
+        if self._is_multimodal:
             self._visual_onnx_dir = os.path.join(artifacts, "onnx", "visual")
             if not os.path.exists(
                     os.path.join(self._visual_onnx_dir, "model.onnx")):
@@ -571,9 +580,9 @@ class LLM:
         """Load the C++ runtime from engine directories."""
         self._rt = _import_runtime()
         logger.info("Loading TensorRT engine from %s ...", self._engine_dir)
-        if self._visual_engine_dir:
+        if self._multimodal_engine_dir:
             logger.info("Loading visual engine from %s ...",
-                        self._visual_engine_dir)
+                        self._multimodal_engine_dir)
         spec_decode_engine_dir = self._eagle_engine_dir
         if spec_decode_engine_dir:
             logger.info(
@@ -584,7 +593,7 @@ class LLM:
             )
             self._runtime = self._rt.LLMRuntime(
                 self._engine_dir,
-                self._visual_engine_dir,
+                self._multimodal_engine_dir,
                 {},
                 self._draft_top_k,
                 self._draft_step,
@@ -593,7 +602,7 @@ class LLM:
         else:
             self._runtime = self._rt.LLMRuntime(
                 self._engine_dir,
-                self._visual_engine_dir,
+                self._multimodal_engine_dir,
                 {},
             )
         self._runtime.capture_decoding_cuda_graph()
@@ -616,7 +625,7 @@ class LLM:
         export_onnx(model, output_path, model_dir=self._model_dir)
 
         # Patch image_token_id for VLM models
-        if self._is_vlm:
+        if self._is_multimodal:
             _ensure_export_package()
             from tensorrt_edgellm.scripts.export import _find_token_id
             image_token_id = _find_token_id(self._model_dir, "<|image_pad|>")
@@ -692,9 +701,9 @@ class LLM:
         logger.info(
             "Building visual TensorRT engine: %s -> %s",
             self._visual_onnx_dir,
-            self._visual_engine_dir,
+            self._multimodal_engine_dir,
         )
-        os.makedirs(self._visual_engine_dir, exist_ok=True)
+        os.makedirs(self._multimodal_engine_dir, exist_ok=True)
 
         rt = _import_runtime()
         config = rt.VisualBuilderConfig()
@@ -715,16 +724,16 @@ class LLM:
 
         builder = rt.VisualBuilder(
             self._visual_onnx_dir,
-            self._visual_engine_dir,
+            self._multimodal_engine_dir,
             config,
         )
         if not builder.build():
             raise RuntimeError(f"Visual TensorRT engine build failed. "
                                f"ONNX dir: {self._visual_onnx_dir}, "
-                               f"engine dir: {self._visual_engine_dir}")
+                               f"engine dir: {self._multimodal_engine_dir}")
         logger.info(
             "Visual engine build complete: %s",
-            self._visual_engine_dir,
+            self._multimodal_engine_dir,
         )
 
     def _tool_template_dirs(self) -> List[str]:
@@ -750,6 +759,107 @@ class LLM:
             }
         return tool_config.tool_choice
 
+    def _visual_config(self) -> dict:
+        """The visual engine's config.json, read once. The C++ runtime prefers
+        the nested <root>/visual/ layout over legacy flat, so read in the same
+        order. Empty dict when unavailable."""
+        cached = getattr(self, "_visual_config_cache", None)
+        if cached is not None:
+            return cached
+        cfg: dict = {}
+        root = getattr(self, "_multimodal_engine_dir", "") or ""
+        for cfg_path in (os.path.join(root, "visual", "config.json"),
+                         os.path.join(root, "config.json")):
+            if os.path.isfile(cfg_path):
+                try:
+                    with open(cfg_path) as f:
+                        cfg = json.load(f)
+                except (OSError, ValueError):
+                    cfg = {}
+                if cfg.get("model_type"):
+                    break
+        self._visual_config_cache = cfg
+        return cfg
+
+    def _video_model_family(self) -> str:
+        """Frame-sampling family ("qwen" / "internvl") from the visual engine's
+        model_type. Types without a video path (phi4mm, gemma, ...) are
+        rejected: their runners read only the first frame."""
+        cached = getattr(self, "_video_family_cache", None)
+        if cached is not None:
+            return cached
+        model_type = self._visual_config().get("model_type", "")
+        qwen_video_types = ("qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_5",
+                            "qwen3_omni")
+        # Audio-side model types have no video path (qwen3_omni_audio_encoder,
+        # qwen3_omni_code2wav, qwen3_asr*); the omni ones share the qwen3_omni
+        # prefix, so exclude before the prefix match.
+        is_audio_type = any(tag in model_type
+                            for tag in ("audio", "code2wav", "asr"))
+        root = getattr(self, "_multimodal_engine_dir", "") or ""
+        has_visual = (os.path.isdir(os.path.join(root, "visual"))
+                      or os.path.isfile(os.path.join(root, "visual.engine")))
+        if "internvl" in model_type and has_visual:
+            family = "internvl"
+        elif (model_type.startswith(qwen_video_types) and not is_audio_type
+              and has_visual):
+            family = "qwen"
+        else:
+            # Covers audio-only engines (audio/ but no visual/) and model
+            # types whose runners have no video path (phi4mm, gemma, ...).
+            raise ValueError(
+                f"video input is not supported for model_type={model_type!r}"
+                " on this multimodal engine; supported families: Qwen-VL "
+                "(qwen2_vl/qwen2_5_vl/qwen3_vl/qwen3_5/qwen3_omni) and "
+                "InternVL")
+        self._video_family_cache = family
+        return family
+
+    def _video_frame_limits(self) -> dict:
+        """Engine-profile inputs for frame-count clamping (see video_sampling):
+        builder token bounds from the visual config.json + patch geometry from
+        preprocessor_config.json. Empty dict when unavailable (no clamping)."""
+        cached = getattr(self, "_video_limits_cache", None)
+        if cached is not None:
+            return cached
+        limits: dict = {}
+        cfg = self._visual_config()
+        builder = cfg.get("builder_config") or {}
+        root = getattr(self, "_multimodal_engine_dir", "") or ""
+        pre: dict = {}
+        for pre_path in (os.path.join(root, "visual",
+                                      "preprocessor_config.json"),
+                         os.path.join(root, "preprocessor_config.json")):
+            if os.path.isfile(pre_path):
+                try:
+                    with open(pre_path) as f:
+                        pre = json.load(f)
+                except (OSError, ValueError):
+                    pre = {}
+                break
+        pre = pre.get("image_processor", pre)
+        if builder.get("max_image_tokens"):
+            limits = {
+                "model_type":
+                cfg.get("model_type", ""),
+                "min_image_tokens":
+                int(builder.get("min_image_tokens", 1)),
+                "max_image_tokens":
+                int(builder["max_image_tokens"]),
+                "max_image_tokens_per_image":
+                int(builder.get("max_image_tokens_per_image", 0)),
+                "max_cu_seqlen_entries":
+                int(builder.get("max_cu_seqlen_entries", 0)),
+                "patch_size":
+                int(pre.get("patch_size", 0)),
+                "merge_size":
+                int(pre.get("merge_size", 0)),
+                "temporal_patch_size":
+                int(pre.get("temporal_patch_size", 2)),
+            }
+        self._video_limits_cache = limits
+        return limits
+
     def _prepare_messages_for_runtime(
         self,
         messages: List[Dict[str, Any]],
@@ -764,7 +874,9 @@ class LLM:
             messages, tools, tool_choice)
         template_tools = (tool_config.tools
                           if tool_config.tool_choice != "none" else [])
-        image_buffers = _load_image_buffers(self._rt, messages)
+        image_buffers = _load_image_buffers(self._rt, messages,
+                                            self._video_model_family,
+                                            self._video_frame_limits)
 
         if needs_tool_chat_template(messages, template_tools,
                                     tool_config.tool_choice):
@@ -867,6 +979,32 @@ class LLM:
     # Inference API (vLLM-style)
     # ------------------------------------------------------------------
 
+    # The C++ runtime shares per-request buffers/CUDA streams and pybind
+    # releases the GIL: handle_request calls must serialize. Locks are per
+    # instance so runtimes on separate GPUs stay parallel.
+    _infer_lock_guard = threading.Lock()
+
+    def _admission(self):
+        """Per-instance gate from media decode through inference completion:
+        queued requests must not each pin decoded frames. Semaphore, not Lock --
+        streaming releases from the worker/SSE side."""
+        sem = self.__dict__.get("_admission_sem")
+        if sem is None:
+            with LLM._infer_lock_guard:
+                sem = self.__dict__.setdefault("_admission_sem",
+                                               threading.Semaphore(1))
+        return sem
+
+    def _handle_request(self, request):
+        """Serialized entry to the C++ runtime."""
+        lock = self.__dict__.get("_infer_lock")
+        if lock is None:
+            with LLM._infer_lock_guard:
+                lock = self.__dict__.setdefault("_infer_lock",
+                                                threading.Lock())
+        with lock:
+            return self._runtime.handle_request(request)
+
     def generate(
         self,
         prompts: Union[str, List[str], List[List[Dict[str, Any]]]],
@@ -904,15 +1042,16 @@ class LLM:
         outputs = []
         for messages in message_batches:
             tool_config = validate_tool_request(messages, tools, tool_choice)
-            request = self._make_generation_request(
-                messages,
-                params,
-                tools=tool_config.tools,
-                tool_choice=tool_config.tool_choice,
-                tool_config=tool_config,
-            )
+            with self._admission():
+                request = self._make_generation_request(
+                    messages,
+                    params,
+                    tools=tool_config.tools,
+                    tool_choice=tool_config.tool_choice,
+                    tool_config=tool_config,
+                )
 
-            response = self._runtime.handle_request(request)
+                response = self._handle_request(request)
             text = response.output_texts[0] if response.output_texts else ""
             ids = response.output_ids[0] if response.output_ids else []
             reason = finish_reason_name(self._rt, response.finish_reasons[0]) \
@@ -956,6 +1095,8 @@ class LLM:
         *,
         tools: Optional[Sequence[Dict[str, Any]]] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        prebuilt_request: Optional[Any] = None,
+        admission_handoff: Optional[Any] = None,
     ) -> Generator[StreamDelta, None, None]:
         """Stream generation deltas for a single message list.
 
@@ -968,25 +1109,52 @@ class LLM:
         channel = self._rt.StreamChannel.create()
         channel.set_skip_special_tokens(True)
 
-        request = self._make_generation_request(
-            messages,
-            params,
-            tools=tools,
-            tool_choice=tool_choice,
-            stream_channel=channel,
-        )
+        # Admission spans decode through inference; the HTTP layer acquires
+        # it itself before prebuilding (and owns the release), so only the
+        # self-building path acquires here.
+        sem = None if prebuilt_request is not None else self._admission()
+        if sem is not None:
+            sem.acquire()
+        try:
+            if prebuilt_request is not None:
+                # Reuse a request built by the caller (the HTTP layer
+                # validates media before the SSE response starts); just
+                # attach the channel.
+                request = prebuilt_request
+                request.stream_channels = [channel]
+            else:
+                request = self._make_generation_request(
+                    messages,
+                    params,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    stream_channel=channel,
+                )
+        except BaseException:
+            if sem is not None:
+                sem.release()
+            raise
 
         error_holder = [None]
 
         def _run():
             try:
-                self._runtime.handle_request(request)
+                self._handle_request(request)
             except Exception as exc:
                 error_holder[0] = exc
                 channel.cancel()
+            finally:
+                if sem is not None:
+                    sem.release()
+                if admission_handoff is not None:
+                    admission_handoff.release()
 
         worker = threading.Thread(target=_run, daemon=True)
         worker.start()
+        if admission_handoff is not None:
+            # The worker owns the gate now: a join timeout below must not
+            # release it while the C++ call is still running.
+            admission_handoff.worker_started()
 
         try:
             while True:
@@ -1007,7 +1175,12 @@ class LLM:
                 if chunk.finished:
                     break
         finally:
-            worker.join(timeout=5.0)
+            # A consumer that stops early (client disconnect closes this
+            # generator) must cancel the channel, or the worker keeps
+            # generating while holding the inference lock.
+            if not (channel.is_finished() or channel.is_cancelled()):
+                channel.cancel()
+            worker.join(timeout=_STREAM_JOIN_TIMEOUT_S)
 
         if error_holder[0] is not None:
             raise error_holder[0]
@@ -1100,6 +1273,12 @@ def _convert_messages_to_cpp(rt_module, messages: List[Dict[str, Any]]):
                                 "image",
                                 item.get("image", ""),
                             ))
+                    elif ct in ("video", "video_url"):
+                        # Frames are decoded out-of-band by _load_image_buffers; the chat
+                        # template expands this placeholder into the video triplet and the
+                        # ViT runner keys off ImageData.isVideo.
+                        contents_list.append(
+                            rt_module.MessageContent("video", ""))
                     elif ct in ("audio", "input_audio", "audio_url"):
                         # Audio bytes are decoded out-of-band by
                         # `_load_audio_buffers`; the chat template just emits
@@ -1117,22 +1296,110 @@ def _convert_messages_to_cpp(rt_module, messages: List[Dict[str, Any]]):
     return cpp_messages
 
 
-def _load_image_buffers(rt_module, messages: List[Dict[str, Any]]):
-    """Load image files referenced in messages into ImageData buffers."""
+def _load_image_buffers(rt_module,
+                        messages: List[Dict[str, Any]],
+                        video_family_fn=lambda: "qwen",
+                        video_frame_limits_fn=lambda: {}):
+    """Build the ordered ImageData list for the messages: images and videos
+    share one list the C++ runner matches positionally against the
+    <|image_pad|> / <|video_pad|> placeholders, so append in message order."""
     images = []
-    for msg in messages:
-        content = msg.get("content", [])
-        if not isinstance(content, list):
-            continue
-        for item in content:
-            if not isinstance(item, dict):
+    items = [
+        item for msg in messages if isinstance(msg.get("content"), list)
+        for item in msg["content"] if isinstance(item, dict)
+    ]
+    # Videos and images share one engine token profile: track the remaining
+    # budget so multiple media cannot each claim full capacity. Lazy so
+    # non-video requests never touch the video family whitelist.
+    has_video = any(
+        item.get("type") in ("video", "video_url") for item in items)
+    family = video_family_fn() if has_video else "qwen"
+    limits = video_frame_limits_fn() if has_video else {}
+    budget = limits.get("max_image_tokens") if limits else None
+    video_tokens = 0
+    # Request-wide decoded-pixel budget: several videos each under the
+    # per-video ceiling must not jointly exhaust host memory.
+    pixel_budget = None
+    # Request-wide cu_seqlens group budget (Qwen only; InternVL has no
+    # cu_seqlens binding): builder-recorded capacity, else the legacy formula.
+    cu_budget = None
+    if limits and family != "internvl":
+        cu_budget = (limits.get("max_cu_seqlen_entries")
+                     or limits["max_image_tokens"] //
+                     max(1, limits.get("min_image_tokens", 1)))
+    image_upper = 0
+    # Phase 1: reserve every image up front so the video sampler's budget is
+    # order-independent ([image, video] and [video, image] behave identically).
+    if budget is not None:
+        from .video_sampling import estimate_image_tokens
+        for item in items:
+            if item.get("type") != "image":
                 continue
-            if item.get("type") == "image":
-                path = item.get("image", "")
-                if path and os.path.isfile(path):
-                    image = rt_module.load_image_from_path(path)
-                    image.do_resize = bool(item.get("do_resize", True))
-                    images.append(image)
+            path = item.get("image", "")
+            if path and os.path.isfile(path):
+                est = estimate_image_tokens(path,
+                                            family,
+                                            limits,
+                                            do_resize=bool(
+                                                item.get("do_resize", True)))
+                image_upper += est
+                budget -= est
+                if cu_budget is not None:
+                    # One cu_seqlens entry per image (Qwen families only;
+                    # InternVL has no cu_seqlens binding).
+                    cu_budget -= 1
+    # Phase 2: build the buffers in original message order (the C++ runner
+    # matches them positionally against the placeholders).
+    for item in items:
+        itype = item.get("type")
+        if itype == "image":
+            path = item.get("image", "")
+            if path and os.path.isfile(path):
+                image = rt_module.load_image_from_path(path)
+                image.do_resize = bool(item.get("do_resize", True))
+                images.append(image)
+        elif itype in ("video", "video_url"):
+            from .video_sampling import MAX_DECODE_PIXELS, load_video_buffer
+            if pixel_budget is None:
+                pixel_budget = MAX_DECODE_PIXELS
+            buffer, est_tokens, used_px, used_groups = load_video_buffer(
+                rt_module,
+                item,
+                family,
+                frame_limits=limits,
+                budget=budget,
+                pixel_budget=pixel_budget,
+                cu_budget=cu_budget)
+            images.append(buffer)
+            video_tokens += est_tokens
+            pixel_budget -= used_px
+            if cu_budget is not None:
+                cu_budget -= used_groups
+            if budget is not None:
+                budget -= est_tokens
+    # Engine bounds are request-wide (all media accumulate in one ViT batch),
+    # so validate after the loop: two videos jointly reaching the minimum are
+    # fine, one alone may not be.
+    if cu_budget is not None and cu_budget < 0:
+        raise ValueError(
+            "request media exceed the visual engine's cu_seqlens capacity; "
+            "reduce the media count")
+    if budget is not None and budget < 0:
+        raise ValueError(
+            "request media need more visual tokens than the engine's "
+            f"budget of {limits['max_image_tokens']}; reduce the media in "
+            "the request")
+    if (video_tokens or image_upper) and limits and \
+            limits.get("min_image_tokens"):
+        # The engine minimum is request-wide; reject only when the upper estimate
+        # falls short -- only do_resize=false media can genuinely undershoot
+        # (resized media are floored per item).
+        upper_tokens = video_tokens + image_upper
+        if upper_tokens < limits["min_image_tokens"]:
+            raise ValueError(
+                f"request media yield ~{upper_tokens} visual tokens but the "
+                f"engine needs at least {limits['min_image_tokens']}; use "
+                "longer videos or raise nframes/fps")
     return images
 
 

@@ -194,7 +194,7 @@ std::tuple<int64_t, int64_t> Qwen25VLViTRunner::computeVisionSpans(
 {
     // Reuse the base flat layout, then fill the fps-derived secondPerGrid.
     auto const extent = QwenViTRunner::computeVisionSpans(image, patchBase, spans);
-    spans.back().llm.secondPerGrid = static_cast<int64_t>(mConfig.temporalPatchSize / image.fps);
+    spans.back().llm.secondPerGrid = mConfig.temporalPatchSize / image.fps;
     return extent;
 }
 
@@ -219,8 +219,18 @@ void Qwen25VLViTRunner::getMRopePositionIds(
         int64_t startIdx = 0;
         int64_t remainingStartPos = 0;
 
-        while ((it = std::find(start, end, mConfig.visionStartTokenId)) != end)
+        auto searchFrom = start;
+        while ((it = std::find(searchFrom, end, mConfig.visionStartTokenId)) != end)
         {
+            // A visual block is <|vision_start|> immediately followed by pads (textPreprocess fills the
+            // constant imageTokenId); a stray start token, or more starts than media spans, must not
+            // consume/overrun the span list.
+            if (it + 1 == end || *(it + 1) != mConfig.imageTokenId
+                || totalImageIdx >= static_cast<int64_t>(spans.size()))
+            {
+                searchFrom = it + 1;
+                continue;
+            }
             // Text part
             int64_t textLen = it + 1 - start;
             for (int64_t i = 0; i < 3; ++i)
@@ -236,7 +246,8 @@ void Qwen25VLViTRunner::getMRopePositionIds(
             int64_t const llmGridT = block.llmGridT;
             int64_t const llmGridH = block.llmGridH;
             int64_t const llmGridW = block.llmGridW;
-            int64_t const timeInterval = block.secondPerGrid * mTokensPerSecond; // fps-aware temporal step
+            // HF get_rope_index truncates: tokens_per_second * int(second_per_grid_ts).
+            int64_t const timeInterval = static_cast<int64_t>(block.secondPerGrid) * mTokensPerSecond;
             ++totalImageIdx;
 
             for (int64_t t = 0; t < llmGridT; ++t)
@@ -255,6 +266,7 @@ void Qwen25VLViTRunner::getMRopePositionIds(
             }
 
             start = it + 1 + llmGridT * llmGridH * llmGridW;
+            searchFrom = start;
             startIdx += std::max(llmGridH, llmGridW) + textLen; // spatial-only advance (T not counted)
             remainingStartPos = start - inputIds.begin();
         }

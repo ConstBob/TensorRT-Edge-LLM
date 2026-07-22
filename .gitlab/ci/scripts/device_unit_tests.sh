@@ -31,7 +31,9 @@ python3 -m venv ut_venv
 # shellcheck disable=SC1091
 source ut_venv/bin/activate
 pip3 install -q --upgrade pip
-pip3 install -q -r tests/requirements.txt
+pip3 install -q \
+    -r tests/requirements.txt \
+    -r tests/requirements-ut.txt
 
 echo "Installing TensorRT python package from $TRT_PACKAGE_DIR"
 # Pick the wheel matching this board's python ABI (the package ships several
@@ -45,8 +47,6 @@ if [ -z "$TRT_WHL" ]; then
 fi
 pip3 install -q "$TRT_WHL"
 
-echo "Installing torch"
-pip3 install -q torch
 python3 -c "import torch; assert torch.cuda.is_available(), 'torch has no CUDA support on this board'"
 
 export LLM_SDK_DIR="$REMOTE_WORKSPACE"
@@ -54,7 +54,10 @@ export ONNX_DIR="$REMOTE_WORKSPACE/onnx"
 export LD_LIBRARY_PATH="$TRT_PACKAGE_DIR/lib:${LD_LIBRARY_PATH:-}"
 mkdir -p "$ONNX_DIR" logs
 
-echo "Running plugin unit tests with pytest. Time:$(date)"
+# test_build_project_with_pybind (l0_python_ut list) builds _edgellm_runtime.
+export PYTHONPATH="$REMOTE_WORKSPACE/build/pybind${PYTHONPATH:+:$PYTHONPATH}"
+
+echo "Running unit tests with pytest. Time:$(date)"
 # Test selection is driven by the tests/test_lists/$PRIORITY.yml list.
 python3 -m pytest tests/ --priority="$PRIORITY" -v --color=yes \
     --html="logs/test_report_$PRIORITY.html" --self-contained-html \
