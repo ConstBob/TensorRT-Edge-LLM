@@ -1242,7 +1242,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                     runtimeBatchSize, runtimeSeqLen, mNumQHeads, mNumKVHeads, mHeadSize, kvCacheCapacity);
 
                 // Per-batch cu_seqlens bound the logical lengths inside the kernel
-                // (bug 6384817): ragged padding keys/rows are masked and the boundary
+                // Ragged padding keys/rows are masked and the boundary
                 // tile is zero-filled, so no output zeroing WAR is needed.
                 if (executionMode == AttentionExecutionMode::kCHUNKED_PREFILL)
                 {
@@ -1369,7 +1369,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
             {
                 // Normal prefill: K/V inputs are the current (right-padded) sequences, so
                 // per-batch Q and KV logical lengths coincide (offset 0) — pass cuQSeqLens
-                // for both and ragged padding rows/keys are masked (bug 6384817).
+                // for both and ragged padding rows/keys are masked.
                 dispatchFFPAKernel(qInputTensor.dataPointer<half>(), kInputTensor.dataPointer<half>(),
                     vInputTensor.dataPointer<half>(), attentionOutputTensor.dataPointer<half>(),
                     cuQSeqLensTensor.dataPointer<int32_t>(), cuQSeqLensTensor.dataPointer<int32_t>(), runtimeBatchSize,
