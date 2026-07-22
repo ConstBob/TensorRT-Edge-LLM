@@ -160,12 +160,13 @@ bool InternViTRunner::allocateBuffer(cudaStream_t stream)
 }
 
 void InternViTRunner::formatPatch(imageUtils::ImageData const& image, std::vector<int64_t>& imageTokenLengths,
-    int64_t& numImages, int64_t& totalNumBlocks, bool isThumbnail, cudaStream_t stream)
+    int64_t& numImages, int64_t& totalNumBlocks, bool isThumbnail, cudaStream_t stream, int64_t frameIdx)
 {
     int64_t height = image.height;
     int64_t width = image.width;
     int64_t channels = image.channels;
-    unsigned char* imageData = image.data(); // In hwc order
+    // For a multi-frame (video) ImageData, select frame frameIdx; a still image has frameIdx == 0.
+    unsigned char* imageData = image.data() + frameIdx * height * width * channels; // In hwc order
 
     ELLM_CHECK(channels == mConfig.numChannels,
         "Image channels mismatch, got " + std::to_string(channels) + ", expected "
@@ -223,6 +224,33 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
         int64_t numImage = 0;
         for (auto const& image : req.imageBuffers)
         {
+            if (image.isVideo)
+            {
+                // Video: one 448 tile per frame (InternVL max_num=1). Downstream re-derives the
+                // frame count as tokens/256, so un-resized frames must already be a single block.
+                if (!image.doResize)
+                {
+                    ELLM_CHECK(image.width == mConfig.blockImageSizeW && image.height == mConfig.blockImageSizeH,
+                        "do_resize=false InternVL video frames must be exactly "
+                            + std::to_string(mConfig.blockImageSizeW) + "x" + std::to_string(mConfig.blockImageSizeH)
+                            + ", got " + std::to_string(image.width) + "x" + std::to_string(image.height));
+                }
+                auto const& src = image.doResize
+                    ? rt::imageUtils::resizeImage(image, mResizedImageHost, mConfig.blockImageSizeW,
+                          mConfig.blockImageSizeH, rt::imageUtils::InterpolationMode::kBICUBIC)
+                    : image;
+                // resizeImage is multi-frame aware (reshapes the destination to {frames, H, W, C}
+                // and resizes every frame); guard the contract formatPatch's frameIdx offsets rely on.
+                ELLM_CHECK(src.frames == image.frames,
+                    "resizeImage must produce one resized tile per source frame, got " + std::to_string(src.frames)
+                        + " for " + std::to_string(image.frames));
+                for (int64_t t = 0; t < image.frames; ++t)
+                {
+                    formatPatch(src, imageTokenLengths, numImage, totalNumBlocks,
+                        /*isThumbnail=*/t > 0, stream, /*frameIdx=*/t);
+                }
+                continue;
+            }
             int64_t const blocksBeforePatch = totalNumBlocks;
             if (image.doResize)
             {
@@ -293,6 +321,10 @@ void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     }
 
     int64_t imageIndex = 0;
+    // Video placeholder ("<video>", one per video): expanded the HF way into per-frame
+    // "Frame{i}: <img>{256 IMG_CONTEXT}</img>" groups, newline-separated. getTokenId returns -1
+    // when the tokenizer has no such token (non-video models / older InternVL).
+    int32_t const videoTokenId = static_cast<int32_t>(tokenizer->getTokenId("<video>"));
 
     for (size_t i = 0; i < request.requests.size(); ++i)
     {
@@ -306,17 +338,51 @@ void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
         {
             if (ids[j] == mConfig.imageTokenId)
             {
-                // Prepend <img> token
+                // Image: <img> + N IMG_CONTEXT + </img>
                 newIds.push_back(mConfig.imgStartTokenId);
-
-                int64_t numImageTokens = imageTokenLengths.at(imageIndex);
+                int64_t const numImageTokens = imageTokenLengths.at(imageIndex);
                 for (int64_t k = 0; k < numImageTokens; ++k)
                 {
                     newIds.push_back(mConfig.imageTokenId);
                 }
-
-                // Append </img> token
                 newIds.push_back(mConfig.imgEndTokenId);
+                ++imageIndex;
+            }
+            else if (videoTokenId >= 0 && ids[j] == videoTokenId)
+            {
+                // Video: per-frame groups (format above); IMG_CONTEXT positions across
+                // all frames still total N, matching the ViT output.
+                int64_t const numImageTokens = imageTokenLengths.at(imageIndex);
+                int64_t const numFrames = numImageTokens / 256;
+                if (numFrames >= 1 && numImageTokens % 256 == 0)
+                {
+                    for (int64_t f = 0; f < numFrames; ++f)
+                    {
+                        if (f > 0)
+                        {
+                            std::vector<int32_t> const nl = tokenizer->encode("\n");
+                            newIds.insert(newIds.end(), nl.begin(), nl.end());
+                        }
+                        std::vector<int32_t> const prefix = tokenizer->encode("Frame" + std::to_string(f + 1) + ": ");
+                        newIds.insert(newIds.end(), prefix.begin(), prefix.end());
+                        newIds.push_back(mConfig.imgStartTokenId);
+                        for (int64_t k = 0; k < 256; ++k)
+                        {
+                            newIds.push_back(mConfig.imageTokenId);
+                        }
+                        newIds.push_back(mConfig.imgEndTokenId);
+                    }
+                }
+                else
+                {
+                    // Fallback (shouldn't happen for sampled video): single <img> wrap.
+                    newIds.push_back(mConfig.imgStartTokenId);
+                    for (int64_t k = 0; k < numImageTokens; ++k)
+                    {
+                        newIds.push_back(mConfig.imageTokenId);
+                    }
+                    newIds.push_back(mConfig.imgEndTokenId);
+                }
                 ++imageIndex;
             }
             else

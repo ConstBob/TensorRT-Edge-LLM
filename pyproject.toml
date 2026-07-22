@@ -48,6 +48,8 @@ server = [
     "fastapi==0.139.2",
     "pybind11==3.0.4",
     "uvicorn==0.51.0",
+    "av==17.1.0",
+    "python-multipart==0.0.32",
 ]
 dev = []
 

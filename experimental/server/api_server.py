@@ -36,9 +36,12 @@ Usage (from LLM object)::
 """
 
 import argparse
+import asyncio
+import base64
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
@@ -49,6 +52,121 @@ from .tool_calling import (ToolConfig, parse_assistant_output,
                            validate_tool_request)
 
 logger = logging.getLogger("edgellm.api_server")
+
+# Whole-file uploads are buffered in memory (and copied again as base64),
+# and compressed audio expands further when decoded (the C++ loader also
+# caps the decoded duration); 25 MiB matches the OpenAI/vLLM limit.
+MAX_AUDIO_UPLOAD_BYTES = 25 * 1024 * 1024
+
+# Qwen3-ASR language normalization (mirrors the HF processor's
+# resolve_language): ISO codes or full names -> the canonical full name the
+# model expects in its system turn.
+_ASR_LANGUAGES = {
+    "zh": "Chinese",
+    "en": "English",
+    "yue": "Cantonese",
+    "ar": "Arabic",
+    "de": "German",
+    "es": "Spanish",
+    "fr": "French",
+    "it": "Italian",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "pt": "Portuguese",
+    "ru": "Russian",
+}
+_ASR_LANGUAGES.update({v.lower(): v for v in list(_ASR_LANGUAGES.values())})
+
+
+def _parse_content_length(value):
+    """None when absent, -1 when malformed (proxies can inject non-integer
+    values), else the parsed byte count."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return -1
+
+
+class _ServerBusy(Exception):
+    """Admission gate unavailable; mapped to HTTP 429."""
+
+
+def _release_once(sem):
+    """Idempotent release: the gate is handed to both the SSE generator's
+    finally and the response's ASGI-call finally; only one may fire it."""
+    import threading
+    lock = threading.Lock()
+    fired = [False]
+
+    def _release():
+        with lock:
+            if fired[0]:
+                return
+            fired[0] = True
+        sem.release()
+
+    return _release
+
+
+class _AdmissionHandoff:
+    """Gate ownership for streams: HTTP releases only while no worker has
+    started; once the worker starts, only its exit releases (a join timeout
+    must not free the gate while the C++ call still runs)."""
+
+    def __init__(self, sem):
+        self._fire = _release_once(sem)
+        self._started = False
+
+    def worker_started(self):
+        self._started = True
+
+    def release(self):
+        self._fire()
+
+    def release_if_unstarted(self):
+        if not self._started:
+            self._fire()
+
+
+def _releasing_streaming_response(content, release, **kw):
+    """StreamingResponse that releases on ASGI-call exit: a client that
+    disconnects before the first body iteration never starts the generator,
+    so its finally cannot run."""
+    from fastapi.responses import StreamingResponse
+
+    class _Resp(StreamingResponse):
+
+        async def __call__(self, scope, receive, send):
+            try:
+                await super().__call__(scope, receive, send)
+            finally:
+                release()
+
+    return _Resp(content, **kw)
+
+
+def _busy_response():
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=429,
+        content={"error": "server busy: another request is in progress"},
+        headers={"Retry-After": "1"})
+
+
+def _is_asr_model(llm_instance, audio_dir: str) -> bool:
+    """The transcription protocol is Qwen3-ASR specific: accept when the LLM
+    or the audio encoder identifies as an ASR model type."""
+    if "asr" in str(getattr(llm_instance, "_model_type", "") or "").lower():
+        return True
+    try:
+        with open(os.path.join(audio_dir, "config.json"),
+                  encoding="utf-8") as f:
+            return "asr" in str(json.load(f).get("model_type", "")).lower()
+    except (OSError, ValueError):
+        return False
+
 
 THINK_OPEN_TAG = "<think>"
 THINK_CLOSE_TAG = "</think>"
@@ -69,8 +187,8 @@ def _split_reasoning_and_content(text: str):
 def _create_app(llm_instance):
     """Create a FastAPI app backed by the given LLM instance."""
     try:
-        from fastapi import FastAPI
-        from fastapi.responses import JSONResponse, StreamingResponse
+        from fastapi import FastAPI, File, Form, UploadFile
+        from fastapi.responses import JSONResponse, PlainTextResponse
     except ImportError as exc:
         raise RuntimeError("FastAPI is required for the server. "
                            "Install: pip install fastapi uvicorn") from exc
@@ -81,6 +199,32 @@ def _create_app(llm_instance):
         description=
         "OpenAI-compatible inference server powered by TensorRT Edge-LLM",
     )
+
+    @app.middleware("http")
+    async def _cap_upload_body(request, call_next):
+        # Starlette spools multipart uploads to disk before the handler runs, so
+        # cap at the transport layer: require a Content-Length on the upload
+        # route and bound it (margin for the multipart framing).
+        if request.url.path == "/v1/audio/transcriptions":
+            length = _parse_content_length(
+                request.headers.get("content-length"))
+            if length is None:
+                return JSONResponse(
+                    status_code=411,
+                    content={"error": "Content-Length required"})
+            if length < 0:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "invalid Content-Length header"})
+            if length > MAX_AUDIO_UPLOAD_BYTES + 1024 * 1024:
+                return JSONResponse(
+                    status_code=413,
+                    content={
+                        "error":
+                        f"audio upload exceeds the supported "
+                        f"maximum of {MAX_AUDIO_UPLOAD_BYTES} bytes"
+                    })
+        return await call_next(request)
 
     @app.get("/health")
     def health():
@@ -192,7 +336,27 @@ def _create_app(llm_instance):
         include_top_logprobs = req_top_logprobs is not None
 
         if stream:
-            return StreamingResponse(
+            # Prebuild before the SSE response (bad input stays a 400; media
+            # decodes once). Non-blocking acquire: a parked pool thread would
+            # starve the SSE generator that releases the gate (busy -> 429).
+            sem = llm_instance._admission()
+            if not sem.acquire(blocking=False):
+                return _busy_response()
+            try:
+                prebuilt_request = llm_instance._make_generation_request(
+                    messages,
+                    params,
+                    tools=tool_config.tools,
+                    tool_choice=tool_config.tool_choice)
+            except (ValueError, KeyError) as exc:
+                sem.release()
+                return JSONResponse(status_code=400,
+                                    content={"error": str(exc)})
+            except BaseException:
+                sem.release()
+                raise
+            handoff = _AdmissionHandoff(sem)
+            return _releasing_streaming_response(
                 _generate_stream_sse(
                     llm_instance,
                     messages,
@@ -201,7 +365,10 @@ def _create_app(llm_instance):
                     enable_thinking,
                     tool_config=tool_config,
                     include_top_logprobs=include_top_logprobs,
+                    prebuilt_request=prebuilt_request,
+                    handoff=handoff,
                 ),
+                handoff.release_if_unstarted,
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -209,15 +376,21 @@ def _create_app(llm_instance):
                 },
             )
 
+        sem = llm_instance._admission()
+        if not sem.acquire(blocking=False):
+            return _busy_response()
         try:
-            request = llm_instance._make_generation_request(
-                messages,
-                params,
-                tools=tool_config.tools,
-                tool_choice=tool_config.tool_choice,
-                tool_config=tool_config,
-            )
-            response = llm_instance._runtime.handle_request(request)
+            try:
+                request = llm_instance._make_generation_request(
+                    messages,
+                    params,
+                    tools=tool_config.tools,
+                    tool_choice=tool_config.tool_choice,
+                    tool_config=tool_config,
+                )
+                response = llm_instance._handle_request(request)
+            finally:
+                sem.release()
         except (ValueError, KeyError) as exc:
             return JSONResponse(
                 status_code=400,
@@ -277,6 +450,131 @@ def _create_app(llm_instance):
                 "total_tokens": completion_tokens,
             },
         }
+
+    @app.post("/v1/audio/transcriptions")
+    async def audio_transcriptions(
+            file: UploadFile = File(...),
+            model: str = Form(""),
+            prompt: str = Form(""),
+            language: str = Form(""),
+            response_format: str = Form("json"),
+            temperature: float = Form(0.0),
+    ):
+        """OpenAI-compatible ASR endpoint (Whisper SDK): routes the upload through
+        the ``input_audio`` chat path (C++ extracts mel + transcribes).
+        ``model``/``language`` accepted for SDK compatibility."""
+        audio_dir = os.path.join(
+            getattr(llm_instance, "_multimodal_engine_dir", "") or "", "audio")
+        if not os.path.isdir(audio_dir):
+            return JSONResponse(status_code=400,
+                                content={
+                                    "error":
+                                    "the loaded engine has no audio encoder; "
+                                    "transcription is unsupported"
+                                })
+        # The prompt/output protocol below is Qwen3-ASR specific; other
+        # audio-capable families (Omni) do chat-audio, not transcription.
+        if not _is_asr_model(llm_instance, audio_dir):
+            return JSONResponse(status_code=400,
+                                content={
+                                    "error":
+                                    "the loaded model is not an ASR model; "
+                                    "transcription is unsupported"
+                                })
+        if response_format not in ("json", "text"):
+            return JSONResponse(status_code=400,
+                                content={
+                                    "error":
+                                    f"unsupported response_format "
+                                    f"{response_format!r}; use json or text"
+                                })
+        # Bounded read: one extra byte detects oversize without buffering
+        # an unbounded upload (the base64 copy would double it again).
+        raw = await file.read(MAX_AUDIO_UPLOAD_BYTES + 1)
+        if len(raw) > MAX_AUDIO_UPLOAD_BYTES:
+            return JSONResponse(
+                status_code=413,
+                content={
+                    "error":
+                    f"audio upload exceeds the supported "
+                    f"maximum of {MAX_AUDIO_UPLOAD_BYTES} bytes"
+                })
+        if not raw:
+            return JSONResponse(status_code=400,
+                                content={"error": "empty audio file"})
+        ext = (os.path.splitext(file.filename or "")[1].lstrip(".").lower()
+               or "wav")
+        content: List[Dict[str, Any]] = [{
+            "type": "input_audio",
+            "input_audio": {
+                "data": base64.b64encode(raw).decode(),
+                "format": ext,
+            },
+        }]
+        if prompt:
+            content.append({"type": "text", "text": prompt})
+        messages = []
+        if language:
+            # HF Qwen3-ASR protocol: the normalized language name is a
+            # system turn ("en" -> "English").
+            lang = _ASR_LANGUAGES.get(language.strip().lower())
+            if not lang:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": f"unsupported language {language!r}"})
+            messages.append({"role": "system", "content": lang})
+        messages.append({"role": "user", "content": content})
+        params = SamplingParams(temperature=temperature,
+                                top_p=1.0,
+                                top_k=1,
+                                max_tokens=4096)
+
+        def _prepare_and_infer():
+            sem = llm_instance._admission()
+            if not sem.acquire(blocking=False):
+                raise _ServerBusy()
+            try:
+                request = llm_instance._make_generation_request(
+                    messages, params)
+                return llm_instance._handle_request(request)
+            finally:
+                sem.release()
+
+        try:
+            # Request construction includes the C++ audio decode; run the
+            # whole prepare+infer off the event loop.
+            response = await asyncio.get_running_loop().run_in_executor(
+                None, _prepare_and_infer)
+        except _ServerBusy:
+            return _busy_response()
+        except (ValueError, KeyError, RuntimeError) as exc:
+            # ValueError/KeyError: malformed request; RuntimeError from
+            # the C++ audio loader: undecodable or over-long audio.
+            if "EDGELLM_INPUT_TOO_LONG" in str(exc):
+                return JSONResponse(status_code=413,
+                                    content={"error": str(exc)})
+            return JSONResponse(status_code=400,
+                                content={"error": f"Invalid audio: {exc}"})
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Transcription failed")
+            return JSONResponse(status_code=500, content={"error": str(exc)})
+        text = (response.output_texts[0] if response.output_texts else
+                "").replace(IM_END_TOKEN, "").strip()
+        # Qwen3-ASR output protocol: "language <LANG><asr_text><text>";
+        # split on the delimiter (HF _parse_single_output semantics).
+        detected = ""
+        if "<asr_text>" in text:
+            prefix, text = text.split("<asr_text>", 1)
+            text = text.strip()
+            m = re.search(r"language[ :]*([A-Za-z_\- ]+)", prefix)
+            if m:
+                detected = m.group(1).strip()
+        if response_format == "text":
+            return PlainTextResponse(text)
+        body = {"text": text}
+        if detected:
+            body["language"] = detected
+        return body
 
     return app
 
@@ -339,11 +637,8 @@ class _ThinkingStateMachine:
 
 
 def _sse_error(message: str) -> str:
-    """Terminal SSE event carrying an error message, emitted before ``[DONE]``.
-
-    Lets a streaming client see an actionable failure (e.g. the
-    ``EDGELLM_INPUT_TOO_LONG`` marker) instead of a silent ``finish_reason=error``.
-    """
+    """Terminal SSE event before ``[DONE]``: streaming clients get an actionable
+    failure instead of a silent ``finish_reason=error``."""
     return "data: " + json.dumps({"error": {"message": message}}) + "\n\n"
 
 
@@ -353,13 +648,38 @@ def _generate_stream_sse(llm_instance,
                          response_id,
                          enable_thinking,
                          tool_config: Optional[ToolConfig] = None,
-                         include_top_logprobs: bool = True):
-    """Yield real SSE chunks via StreamChannel streaming."""
+                         include_top_logprobs: bool = True,
+                         prebuilt_request=None,
+                         handoff=None):
+    """Yield SSE chunks via StreamChannel streaming. ``handoff`` carries the
+    admission gate; it is only released here while no worker owns it."""
+    try:
+        yield from _generate_stream_sse_inner(llm_instance, messages, params,
+                                              response_id, enable_thinking,
+                                              tool_config,
+                                              include_top_logprobs,
+                                              prebuilt_request, handoff)
+    finally:
+        if handoff is not None:
+            handoff.release_if_unstarted()
+
+
+def _generate_stream_sse_inner(llm_instance,
+                               messages,
+                               params,
+                               response_id,
+                               enable_thinking,
+                               tool_config: Optional[ToolConfig] = None,
+                               include_top_logprobs: bool = True,
+                               prebuilt_request=None,
+                               handoff=None):
+    """Yield SSE chunks via StreamChannel streaming."""
     yield _sse_chunk(response_id, {"role": "assistant"})
 
     if tool_config is not None and tool_config.parse_output:
         yield from _generate_tool_stream_sse(llm_instance, messages, params,
-                                             response_id, tool_config)
+                                             response_id, tool_config,
+                                             prebuilt_request, handoff)
         return
 
     sm = _ThinkingStateMachine(enable_thinking)
@@ -373,7 +693,9 @@ def _generate_stream_sse(llm_instance,
                 messages,
                 params,
                 tools=stream_tools,
-                tool_choice=stream_tool_choice):
+                tool_choice=stream_tool_choice,
+                prebuilt_request=prebuilt_request,
+                admission_handoff=handoff):
             lp_obj: Optional[Dict[str, Any]] = None
             if delta.logprobs:
                 # OpenAI streaming schema: choices[0].logprobs = {"content": [...]},
@@ -424,8 +746,13 @@ def _generate_stream_sse(llm_instance,
     yield "data: [DONE]\n\n"
 
 
-def _generate_tool_stream_sse(llm_instance, messages, params, response_id,
-                              tool_config: ToolConfig):
+def _generate_tool_stream_sse(llm_instance,
+                              messages,
+                              params,
+                              response_id,
+                              tool_config: ToolConfig,
+                              prebuilt_request=None,
+                              handoff=None):
     text_parts: List[str] = []
     finish_reason: Optional[str] = None
     error_message: Optional[str] = None
@@ -433,6 +760,8 @@ def _generate_tool_stream_sse(llm_instance, messages, params, response_id,
         for delta in llm_instance.generate_stream(
                 messages,
                 params,
+                prebuilt_request=prebuilt_request,
+                admission_handoff=handoff,
                 tools=tool_config.tools,
                 tool_choice=tool_config.tool_choice):
             if delta.text:
@@ -610,11 +939,12 @@ def main():
         "ONNX + builds an engine).",
     )
     parser.add_argument(
+        "--multimodal-engine-dir",
         "--visual-engine-dir",
-        dest="visual_engine_dir",
+        dest="multimodal_engine_dir",
         default="",
-        help="Pre-built visual.engine directory for a VLM "
-        "(use when --model is a prebuilt engine dir)",
+        help="Pre-built multimodal engine directory (visual and/or audio "
+        "encoders) for a prebuilt --model engine dir",
     )
     parser.add_argument(
         "--visual-onnx-dir",
@@ -682,7 +1012,7 @@ def main():
         onnx_dir=onnx_dir,
         visual_onnx_dir=args.visual_onnx_dir,
         engine_dir=engine_dir,
-        visual_engine_dir=args.visual_engine_dir,
+        multimodal_engine_dir=args.multimodal_engine_dir,
         max_input_len=args.max_input_len,
         max_batch_size=args.max_batch_size,
         max_kv_cache_capacity=args.max_kv_cache_capacity,

@@ -30,7 +30,9 @@ std::tuple<int64_t, int64_t> Qwen3OmniViTRunner::computeVisionSpans(
     // Reuse the base flat layout, then fill the fps-derived secondPerGrid. Omni's
     // getMRopePositionIds applies the position_id_per_seconds scale + T-extent advance.
     auto const extent = QwenViTRunner::computeVisionSpans(image, patchBase, spans);
-    spans.back().llm.secondPerGrid = static_cast<int64_t>(mConfig.temporalPatchSize / image.fps);
+    // HF Qwen3-Omni keeps second_per_grid as float all the way into RoPE (arange(t) * spg *
+    // position_id_per_seconds) — pre-truncating collapses the T axis for non-integer tps/fps.
+    spans.back().llm.secondPerGrid = mConfig.temporalPatchSize / image.fps;
     return extent;
 }
 
@@ -49,7 +51,7 @@ bool Qwen3OmniViTRunner::validateExtraConfig(nlohmann::json const& jsonConfig)
         return false;
     }
     auto visionConfig = jsonConfig["vision_config"];
-    // Qwen3-Omni video MRoPE temporal interval = position_id_per_seconds * int(temporal_patch_size / fps).
+    // Qwen3-Omni video MRoPE temporal interval = position_id_per_seconds * temporal_patch_size / fps.
     if (visionConfig.contains("position_id_per_seconds"))
     {
         mPositionIdPerSecond = visionConfig["position_id_per_seconds"].get<int64_t>();
@@ -85,8 +87,18 @@ void Qwen3OmniViTRunner::getMRopePositionIds(
         int64_t startIdx = 0;
         int64_t remainingStartPos = 0;
 
-        while ((it = std::find(start, end, mConfig.visionStartTokenId)) != end)
+        auto searchFrom = start;
+        while ((it = std::find(searchFrom, end, mConfig.visionStartTokenId)) != end)
         {
+            // A visual block is <|vision_start|> immediately followed by pads (see textPreprocess below);
+            // a stray start token, or more starts than media spans, must not consume/overrun the span
+            // list.
+            if (it + 1 == end || (*(it + 1) != mConfig.imageTokenId && *(it + 1) != mConfig.videoTokenId)
+                || totalImageIdx >= static_cast<int64_t>(spans.size()))
+            {
+                searchFrom = it + 1;
+                continue;
+            }
             int64_t textLen = it + 1 - start;
             for (int64_t i = 0; i < 3; ++i)
             {
@@ -100,7 +112,10 @@ void Qwen3OmniViTRunner::getMRopePositionIds(
             int64_t const llmGridT = block.llmGridT;
             int64_t const llmGridH = block.llmGridH;
             int64_t const llmGridW = block.llmGridW;
-            int64_t const timeInterval = block.secondPerGrid * mPositionIdPerSecond; // fps-aware temporal step
+            // Float temporal step. Positions are stored as int64, so each t*timeInterval is
+            // truncated per position; HF keeps the float value all the way into RoPE, so exact
+            // parity needs float position support in the cos/sin generation.
+            double const timeInterval = block.secondPerGrid * mPositionIdPerSecond;
             ++totalImageIdx;
 
             for (int64_t t = 0; t < llmGridT; ++t)
@@ -111,7 +126,7 @@ void Qwen3OmniViTRunner::getMRopePositionIds(
                     {
                         int64_t idx = remainingStartPos + textLen + t * llmGridH * llmGridW + h * llmGridW + w;
                         mropePositionIdsPtr[batchOffset + 0 * maxPositionEmbeddings + idx]
-                            = t * timeInterval + textLen + startIdx;
+                            = static_cast<int64_t>(t * timeInterval) + textLen + startIdx;
                         mropePositionIdsPtr[batchOffset + 1 * maxPositionEmbeddings + idx] = h + textLen + startIdx;
                         mropePositionIdsPtr[batchOffset + 2 * maxPositionEmbeddings + idx] = w + textLen + startIdx;
                     }
@@ -119,10 +134,13 @@ void Qwen3OmniViTRunner::getMRopePositionIds(
             }
 
             start = it + 1 + llmGridT * llmGridH * llmGridW;
-            // Advance counts the temporal extent too (unlike the base/Qwen2.5 spatial-only advance).
-            int64_t const advance = std::max(std::max(llmGridH, llmGridW), (llmGridT - 1) * timeInterval + 1);
+            // Advance counts the temporal extent too (unlike the base/Qwen2.5 spatial-only
+            // advance), truncated consistently with the per-position ids above.
+            int64_t const lastT = static_cast<int64_t>((llmGridT - 1) * timeInterval);
+            int64_t const advance = std::max(std::max(llmGridH, llmGridW), lastT + 1);
             startIdx += advance + textLen;
             remainingStartPos = start - inputIds.begin();
+            searchFrom = start;
         }
 
         int64_t const maxMropePositionId = startIdx + inputIds.size() - remainingStartPos - 1;

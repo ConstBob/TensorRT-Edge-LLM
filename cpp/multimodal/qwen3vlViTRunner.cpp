@@ -167,7 +167,7 @@ void Qwen3VLViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
 {
     // Pads expand to copies of mConfig.imageTokenId (embeddingLookup fills them in order). Two paths:
     //   (a) VIDEO: the <|vision_start|><|video_pad|><|vision_end|> triplet -> one timestamped (<X.X s> + vision_start
-    //       + pads + vision_end) group per per-frame sub-span. Detected data-driven (next span carries a timestamp).
+    //       + pads + vision_end) group per per-frame sub-span. Detected by the token triplet itself.
     //   (b) IMAGE (and any non-video pad): one flat pad run.
     size_t spanIdx = 0;
 
@@ -198,17 +198,20 @@ void Qwen3VLViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
                 int64_t const frames = imgBuffers[bufferIdx].frames;
                 double const fps = imgBuffers[bufferIdx].fps;
                 int64_t const gridT = (frames + tps - 1) / tps;
+                // HF replaces the whole triplet: each timestamped frame group carries its own start/end.
                 for (int64_t t = 0; t < gridT; ++t)
                 {
                     ELLM_CHECK(spanIdx < spans.size(),
                         "Pad token found but no matching vision span at index " + std::to_string(spanIdx));
                     LlmVisionBlock const& block = spans[spanIdx++].llm;
-                    // Frame-pair midpoint time. Matches HF (frames_indices/video_fps) only when frames are uniformly
-                    // sampled from frame 0 and fps is the post-sampling rate (we renumber 0..frames-1, no
-                    // frames_indices).
+                    // HF _calculate_timestamps: midpoint of the group's first/last source timestamps.
+                    // Without per-frame timestamps (pre-sampled frame paths), fall back to renumbered
+                    // indices / sample fps — HF's own no-metadata behavior.
                     int64_t const firstIdx = std::min(t * tps, frames - 1);
                     int64_t const lastIdx = std::min(t * tps + tps - 1, frames - 1);
-                    double const ts = static_cast<double>(firstIdx + lastIdx) / 2.0 / fps;
+                    auto const& tsList = imgBuffers[bufferIdx].timestamps;
+                    double const ts = !tsList.empty() ? (tsList[firstIdx] + tsList[lastIdx]) / 2.0
+                                                      : static_cast<double>(firstIdx + lastIdx) / 2.0 / fps;
                     char tsBuf[32];
                     std::snprintf(tsBuf, sizeof(tsBuf), "<%.1f seconds>", ts);
                     std::vector<int32_t> tsTokens = tokenizer->encode(std::string(tsBuf));

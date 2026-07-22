@@ -37,43 +37,21 @@ never touches a feature extractor or PCM samples.
 import base64
 import logging
 from typing import Any, Dict, List
-from urllib.parse import unquote, urlparse
+
+from .media_source import decode_base64_data_url, resolve_file_url
 
 logger = logging.getLogger("edgellm.audio")
 
 
 def _decode_data_url(url: str) -> bytes:
-    """Decode ``data:audio/...;base64,<payload>`` URLs.
-
-    Non-base64 ``data:`` URLs are rejected — audio payloads are binary and
-    always base64-encoded in practice.
-    """
-    head, _, payload = url.partition(",")
-    if ";base64" not in head:
-        raise ValueError("data: audio URLs must use base64 encoding")
-    try:
-        return base64.b64decode(payload, validate=False)
-    except Exception as exc:
-        raise ValueError(f"Malformed base64 data URL: {exc}") from exc
+    """Decode ``data:audio/...;base64,<payload>`` URLs (lenient base64, the
+    historical audio behavior)."""
+    return decode_base64_data_url(url, "audio", strict=False)
 
 
 def _resolve_file_url(url: str) -> str:
-    """Convert a ``file://`` URL to a local filesystem path.
-
-    Callers guard with ``url.startswith("file:")`` before calling, so this
-    handles only ``file:///abs/path`` / ``file://localhost/abs/path``;
-    non-local ``netloc`` and empty paths raise ``ValueError``.
-    """
-    parsed = urlparse(url)
-    # Reject anything that isn't local. `urlparse('file:///x').netloc` is ''.
-    if parsed.netloc and parsed.netloc not in ("", "localhost"):
-        raise ValueError(
-            f"file:// URL must be local (no host); got netloc={parsed.netloc!r}"
-        )
-    path = unquote(parsed.path)
-    if not path:
-        raise ValueError("file:// URL has empty path")
-    return path
+    """Convert a local ``file://`` URL to a filesystem path."""
+    return resolve_file_url(url)
 
 
 def resolve_audio_message(item: Dict[str, Any]):

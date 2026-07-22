@@ -37,7 +37,7 @@ LLM engine directory::
 VLM (LLM + Visual encoder)::
 
     {llm_engine_dir}/              # Same as LLM above
-    {visual_engine_dir}/
+    {multimodal_engine_dir}/
         visual.engine
         config.json
 
@@ -97,7 +97,7 @@ def validate_llm_engine_dir(engine_dir: str) -> bool:
     return os.path.isfile(os.path.join(engine_dir, LLM_ENGINE_FILE))
 
 
-def validate_visual_engine_dir(engine_dir: str) -> bool:
+def validate_multimodal_engine_dir(engine_dir: str) -> bool:
     """Check that a multimodal engine directory has at least one encoder.
 
     Matches the C++ ``MultimodalRunner::create`` layout: a ``visual/`` or
@@ -135,22 +135,28 @@ def classify_model_source(path: str) -> str:
     return "model"
 
 
-def find_visual_engine_dir(
-    llm_engine_dir: str,
-    model_name: str = "",
-) -> Optional[str]:
+def find_multimodal_engine_dir(llm_engine_dir: str) -> Optional[str]:
     """Auto-detect a sibling visual engine directory.
 
     Searches for a sibling of the LLM engine directory that contains
-    ``visual/visual.engine`` or ``visual.engine``.
+    ``visual/visual.engine`` or ``visual.engine``. Audio-only siblings are
+    never auto-attached (no signal for which modality the LLM expects); pass
+    them explicitly.
     """
     parent = os.path.dirname(llm_engine_dir)
     if not os.path.isdir(parent):
         return None
-    for entry in os.listdir(parent):
+    candidates = []
+    for entry in sorted(os.listdir(parent)):
         candidate = os.path.join(parent, entry)
         if candidate == llm_engine_dir:
             continue
-        if validate_visual_engine_dir(candidate):
-            return candidate
-    return None
+        if (os.path.isfile(
+                os.path.join(candidate, "visual", VISUAL_ENGINE_FILE)) or
+                os.path.isfile(os.path.join(candidate, VISUAL_ENGINE_FILE))):
+            candidates.append(candidate)
+    if len(candidates) > 1:
+        raise ValueError(
+            "multiple sibling multimodal engine directories found: "
+            f"{candidates}; pass --multimodal-engine-dir explicitly")
+    return candidates[0] if candidates else None

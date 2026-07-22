@@ -30,11 +30,12 @@ namespace rt
 //! \brief What the LLM token stream & MRoPE see for one vision span (HF `get_rope_index` `llm_grid_*` view).
 struct LlmVisionBlock
 {
-    int64_t numTokens{0};     //!< LLM tokens this span inserts (llmGridT * llmGridH * llmGridW)
-    int64_t llmGridT{0};      //!< HF llm_grid_t (== vit.gridT)
-    int64_t llmGridH{0};      //!< HF llm_grid_h (vit.gridH / mergeSize)
-    int64_t llmGridW{0};      //!< HF llm_grid_w (vit.gridW / mergeSize)
-    int64_t secondPerGrid{1}; //!< HF second_per_grid_t = int(temporalPatchSize / fps)
+    int64_t numTokens{0};      //!< LLM tokens this span inserts (llmGridT * llmGridH * llmGridW)
+    int64_t llmGridT{0};       //!< HF llm_grid_t (== vit.gridT)
+    int64_t llmGridH{0};       //!< HF llm_grid_h (vit.gridH / mergeSize)
+    int64_t llmGridW{0};       //!< HF llm_grid_w (vit.gridW / mergeSize)
+    double secondPerGrid{1.0}; //!< temporalPatchSize / fps, kept as float; each family's MRoPE
+                               //!< decides how to map it onto its int64 position ids
 };
 
 //! \brief What the ViT engine sees for one vision span (HF `grid_thw`; cu_seqlens / rotary / fast-pos-emb / window).
@@ -191,7 +192,7 @@ protected:
         std::vector<std::vector<int32_t>> const& batchInputIds, std::vector<VisionSpan> const& spans) noexcept;
 
     //! \brief Calculate resized image dimensions based on dynamic resolution constraints
-    //! \param[in] numFrames Source frame count (1 for still image, >1 for video; used only by the 3D override)
+    //! \param[in] numFrames Source frame count (used only by the 3D override; videos are flagged by isVideo)
     //! \param[in] height Input image height
     //! \param[in] width Input image width
     //! \param[in] maxRatio Maximum aspect ratio (default: 200)
@@ -211,7 +212,7 @@ protected:
 
     //! \brief Format and process a single image buffer (or video frame stack): append its spans and
     //!        copy/normalize/transpose its (padded) frames into the ViT input scratch.
-    //! \param[in] image Input media data (image with frames==1 or video with frames>1)
+    //! \param[in] image Input media data (still image or video frame stack; isVideo flags the modality)
     //! \param[in,out] spans Flat global-order span list to append this buffer's spans to
     //! \param[in,out] patchBase Running ViT patch offset; read as this buffer's base, advanced by its patch count
     //! \param[in] stream CUDA stream for execution

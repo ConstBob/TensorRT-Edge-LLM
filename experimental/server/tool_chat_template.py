@@ -76,6 +76,17 @@ def normalize_messages_for_tools(
     for raw_msg in messages:
         msg = copy.deepcopy(raw_msg)
 
+        # HF templates only know {"type": "video"}: normalize the OpenAI
+        # "video_url" alias here or the template emits no placeholder and the
+        # loaded ViT buffer is silently dropped.
+        if isinstance(msg.get("content"), list):
+            for item in msg["content"]:
+                if isinstance(item, dict) and item.get("type") == "video_url":
+                    ref = item.pop("video_url", None)
+                    item["type"] = "video"
+                    item["video"] = (ref.get("url", "") if isinstance(
+                        ref, dict) else ref)
+
         if msg.get("function_call") and not msg.get("tool_calls"):
             function_call = msg.pop("function_call")
             if isinstance(function_call, dict):

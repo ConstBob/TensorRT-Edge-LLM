@@ -498,11 +498,20 @@ void QwenViTRunner::getMRopePositionIds(
         auto start = inputIds.begin();
         auto end = inputIds.end();
         auto it = inputIds.begin();
+        auto searchFrom = start;
         int64_t startIdx = 0;
         int64_t remainingStartPos = 0;
 
-        while ((it = std::find(start, end, mConfig.visionStartTokenId)) != end)
+        while ((it = std::find(searchFrom, end, mConfig.visionStartTokenId)) != end)
         {
+            // A visual block is a <|vision_start|> immediately followed by visual placeholders
+            // (textPreprocess fills pads with the constant imageTokenId). Defensive: a start token
+            // followed by anything else (e.g. plain text) is not a span and must not consume one.
+            if (it + 1 == end || *(it + 1) != mConfig.imageTokenId)
+            {
+                searchFrom = it + 1;
+                continue;
+            }
             // Text part
             int64_t textLen = it + 1 - start;
             for (int64_t i = 0; i < 3; ++i)
@@ -535,6 +544,7 @@ void QwenViTRunner::getMRopePositionIds(
             }
 
             start = it + 1 + llmGridT * llmGridH * llmGridW;
+            searchFrom = start;
             startIdx += std::max(llmGridH, llmGridW) + textLen; // spatial-only advance (T not counted)
             remainingStartPos = start - inputIds.begin();
         }
@@ -578,6 +588,16 @@ void QwenViTRunner::generateMropeParams(std::vector<std::vector<int32_t>> const&
     // Initialize mropePositionIds and copy to device
     check::check(mMropePositionIdsHost.reshape({activeBatchSize, 3, maxPositionEmbeddings}), "Tensor reshape failed");
     check::check(mMropePositionIdsDevice.reshape({activeBatchSize, 3, maxPositionEmbeddings}), "Tensor reshape failed");
+    // getMRopePositionIds writes per-token entries into the (bs, 3, maxPositionEmbeddings) host
+    // buffer; multimodal expansion can exceed the raw-input length the runtime checks later, so
+    // reject before writing out of bounds.
+    for (auto const& inputIds : batchInputIds)
+    {
+        ELLM_CHECK(static_cast<int64_t>(inputIds.size()) <= maxPositionEmbeddings,
+            "EDGELLM_INPUT_TOO_LONG: expanded multimodal input length " + std::to_string(inputIds.size())
+                + " exceeds the engine's maxPositionEmbeddings " + std::to_string(maxPositionEmbeddings)
+                + "; shorten the prompt or reduce the media");
+    }
     getMRopePositionIds(batchInputIds, spans);
     CUDA_CHECK(cudaMemcpyAsync(mMropePositionIdsDevice.rawPointer(), mMropePositionIdsHost.rawPointer(),
         activeBatchSize * 3 * maxPositionEmbeddings * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
@@ -664,6 +684,10 @@ bool QwenViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     }
     catch (std::exception const& e)
     {
+        if (std::string(e.what()).find("EDGELLM_INPUT_TOO_LONG") != std::string::npos)
+        {
+            throw; // caller-actionable input error: propagate instead of swallowing to false
+        }
         LOG_ERROR("Failed: %s", e.what());
         return false;
     }

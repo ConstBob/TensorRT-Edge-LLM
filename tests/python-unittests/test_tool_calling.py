@@ -148,12 +148,17 @@ class _FakeLLM:
     def __init__(self, model_dir):
         self.model_dir = str(model_dir)
 
+    def _make_generation_request(self, messages, params, **kw):
+        return object()  # the streaming path prebuilds (and reuses) a request
+
     def generate_stream(self,
                         messages,
                         params,
                         *,
                         tools=None,
-                        tool_choice=None):
+                        tool_choice=None,
+                        prebuilt_request=None,
+                        admission_handoff=None):
         yield StreamDelta(text="<think>plan</think>", finished=False)
         yield StreamDelta(
             text="<tool_call>{\"name\":\"get_weather\","

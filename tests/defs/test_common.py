@@ -38,6 +38,20 @@ def test_build_project(env_config: EnvironmentConfig,
                        remote_config: Optional[RemoteConfig],
                        test_logger: logging.Logger):
     """Test project build - builds all components"""
+    _build_project(env_config, remote_config, test_logger, build_pybind=False)
+
+
+def test_build_project_with_pybind(env_config: EnvironmentConfig,
+                                   remote_config: Optional[RemoteConfig],
+                                   test_logger: logging.Logger):
+    """Project build that also builds + import-checks the pybind runtime
+    (the unit-job lists use this; pipeline lists use test_build_project)."""
+    _build_project(env_config, remote_config, test_logger, build_pybind=True)
+
+
+def _build_project(env_config: EnvironmentConfig,
+                   remote_config: Optional[RemoteConfig],
+                   test_logger: logging.Logger, build_pybind: bool):
     execution_mode = "remote" if remote_config else "local"
     device_config = DeviceConfig.auto_detect(remote_config, test_logger)
     test_logger.info(
@@ -47,6 +61,17 @@ def test_build_project(env_config: EnvironmentConfig,
 
     # Build cmake command with required components only
     cmake_cmd = ['cmake', '..', '-DBUILD_UNIT_TESTS=ON']
+
+    # Opt-in for jobs whose test lists import the pybind runtime (the
+    # preprocessing suites); resolved from the pytest interpreter's pybind11.
+    if build_pybind:
+        import pybind11
+        cmake_cmd.append('-DBUILD_PYTHON_BINDINGS=ON')
+        cmake_cmd.append(f'-Dpybind11_DIR={pybind11.get_cmake_dir()}')
+    else:
+        # Explicit OFF: a build/ dir previously configured ON would keep
+        # building pybind from the CMake cache.
+        cmake_cmd.append('-DBUILD_PYTHON_BINDINGS=OFF')
 
     # Use trt_package_dir from env_config
     if env_config.trt_package_dir:
@@ -112,6 +137,23 @@ def test_build_project(env_config: EnvironmentConfig,
         'examples/multimodal/visual_build',
         'examples/multimodal/audio_build',
     ]
+    if build_pybind:
+        # The preprocessing suites skip when this module is missing; gate with
+        # a real import so a pybind link/ABI regression fails the build step
+        # instead of silently skipping every parity test.
+        import_check = ('import importlib; importlib.invalidate_caches(); '
+                        'import _edgellm_runtime')
+        result = run_command(cmd=[
+            'bash', '-c', f'PYTHONPATH={build_dir}/pybind '
+            f'python3 -c "{import_check}"'
+        ],
+                             remote_config=remote_config,
+                             timeout=120,
+                             logger=test_logger)
+        if not result['success']:
+            pytest.fail('pybind build requested but _edgellm_runtime is not '
+                        f'importable from {build_dir}/pybind: '
+                        f"{result.get('output', '')[-500:]}")
     # Executables that support --help smoke test
     help_check_files = [
         'examples/llm/llm_build',

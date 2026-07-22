@@ -15,8 +15,9 @@
 
 import json
 
-from experimental.server.tool_chat_template import (ToolChatTemplateFormatter,
-                                                    needs_tool_chat_template)
+from experimental.server.tool_chat_template import (
+    ToolChatTemplateFormatter, needs_tool_chat_template,
+    normalize_messages_for_tools)
 
 
 def test_needs_tool_template():
@@ -116,3 +117,32 @@ def test_formats_tool_template():
     assert formatted["add_generation_prompt"] is True
     assert tool_call["function"]["arguments"] == {"city": "Paris"}
     assert tool_message["content"] == '{"temperature": 22}'
+
+
+def test_normalize_converts_video_url_spelling():
+    # HF chat templates only know {"type": "video"}; the video_url alias must
+    # be converted before formatting or the template emits no video
+    # placeholder and the loaded ViT buffer is silently dropped.
+    messages = [{
+        "role":
+        "user",
+        "content": [
+            {
+                "type": "text",
+                "text": "describe"
+            },
+            {
+                "type": "video_url",
+                "video_url": {
+                    "url": "file:///tmp/clip.mp4"
+                }
+            },
+        ],
+    }]
+    out = normalize_messages_for_tools(messages)
+    item = out[0]["content"][1]
+    assert item["type"] == "video"
+    assert item["video"] == "file:///tmp/clip.mp4"
+    assert "video_url" not in item
+    # the original request dict must not be mutated
+    assert messages[0]["content"][1]["type"] == "video_url"

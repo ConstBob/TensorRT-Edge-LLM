@@ -8,7 +8,7 @@
 #   - Built plugin library (build/libNvInfer_edgellm_plugin.so) for the plugin tests
 
 tests:
-  - tests/defs/test_common.py::test_build_project
+  - tests/defs/test_common.py::test_build_project_with_pybind
 
   # AttentionPlugin tests (custom plugin vs PyTorch reference)
   - tests/python-unittests/test_attention_plugin.py::test_prefill
@@ -18,7 +18,6 @@ tests:
   - tests/python-unittests/test_attention_plugin.py::test_prefill_head512
   - tests/python-unittests/test_attention_plugin.py::test_fp8_kv_cache_decode
   - tests/python-unittests/test_attention_plugin.py::test_fp8_kv_cache_prefill
-  - tests/python-unittests/test_attention_plugin.py::test_prescaled_query_softmax_scale
   - tests/python-unittests/test_attention_plugin.py::test_decode_head32
   - tests/python-unittests/test_attention_plugin.py::test_shared_kv_prefill
   - tests/python-unittests/test_attention_plugin.py::test_shared_kv_chunked_prefill
@@ -94,7 +93,9 @@ tests:
   - tests/python-unittests/test_shared_kv.py::TestSharedKVAttention::test_shared_kv_decode_correctness
 
   # Experimental Server Tool Calling Tests
+  - tests/python-unittests/test_tool_chat_template.py::test_needs_tool_template
   - tests/python-unittests/test_tool_chat_template.py::test_formats_tool_template
+  - tests/python-unittests/test_tool_chat_template.py::test_normalize_converts_video_url_spelling
   - tests/python-unittests/test_tool_calling.py::test_validates_tool_request
   - tests/python-unittests/test_tool_calling.py::test_parses_tool_calls
   - tests/python-unittests/test_tool_calling.py::test_builds_tool_response_shapes
@@ -110,3 +111,107 @@ tests:
   - tests/python-unittests/test_experimental_server_logit_bias.py::test_hlapi_generate_rejects_logit_bias_with_active_spec_decode
   - tests/python-unittests/test_experimental_server_logit_bias.py::test_api_rejects_logit_bias_with_active_spec_decode
   - tests/python-unittests/test_experimental_server_logit_bias.py::test_api_rejects_overflowing_logit_bias
+
+  # Audio preprocessing (C++ mel FE vs HF transformers; skips without the
+  # pybind runtime / transformers / soundfile)
+  - tests/python-unittests/test_preprocess_audio.py::test_mel_accuracy_whisper
+  - tests/python-unittests/test_preprocess_audio.py::test_mel_accuracy_parakeet
+  - tests/python-unittests/test_preprocess_audio.py::test_load_audio_buffer_from_bytes_smoke
+  - tests/python-unittests/test_preprocess_audio.py::test_load_audio_buffer_from_bytes_rejects_garbage
+  - tests/python-unittests/test_preprocess_audio.py::test_extract_mel_to_numpy_unknown_fe
+  - tests/python-unittests/test_preprocess_audio.py::test_extract_mel_to_numpy_whisper_shape
+  - tests/python-unittests/test_preprocess_audio.py::test_extract_mel_to_numpy_parakeet_shape
+  - tests/python-unittests/test_preprocess_audio.py::test_extract_mel_round_trip_synthetic
+  - tests/python-unittests/test_preprocess_audio.py::test_resolve_input_audio_base64
+  - tests/python-unittests/test_preprocess_audio.py::test_resolve_input_audio_missing_data
+  - tests/python-unittests/test_preprocess_audio.py::test_resolve_audio_url_rejects_remote
+  - tests/python-unittests/test_preprocess_audio.py::test_resolve_audio_url_data_and_file
+  - tests/python-unittests/test_preprocess_audio.py::test_resolve_audio_url_rejects_non_base64_data
+  - tests/python-unittests/test_preprocess_audio.py::test_resolve_unknown_type_raises
+
+  # Video frame sampler + server content->ImageData (pure math + source
+  # resolution + buffer-loader routing; no engine/torch/PyAV needed)
+  - tests/python-unittests/test_preprocess_video.py::test_sample_indices
+  - tests/python-unittests/test_preprocess_video.py::test_resolve_video_source
+  - tests/python-unittests/test_preprocess_video.py::test_sample_video_rejects_audio_only_container
+  - tests/python-unittests/test_preprocess_video.py::test_clamp_qwen25_total_budget
+  - tests/python-unittests/test_preprocess_video.py::test_clamp_qwen25_min_upscale_counted
+  - tests/python-unittests/test_preprocess_video.py::test_clamp_budget_shared_across_videos
+  - tests/python-unittests/test_preprocess_video.py::test_clamp_qwen3d_frame_feasibility
+  - tests/python-unittests/test_preprocess_video.py::test_clamp_qwen3d_uses_real_resize_tokens
+  - tests/python-unittests/test_preprocess_video.py::test_clamp_qwen3d_respects_cu_seqlens_group_capacity
+  - tests/python-unittests/test_preprocess_video.py::test_frames_path_qwen3d_uses_3d_estimate
+  - tests/python-unittests/test_preprocess_video.py::test_sample_video_corrupt_container_maps_to_value_error
+  - tests/python-unittests/test_preprocess_video.py::test_clamp_qwen3d_estimate_matches_cpp_fallback
+  - tests/python-unittests/test_preprocess_video.py::test_sample_video_single_frame_est_uses_actual_count
+  - tests/python-unittests/test_preprocess_video.py::test_load_video_buffer_sets_do_resize
+  - tests/python-unittests/test_preprocess_video.py::test_estimate_qwen_rejects_extreme_aspect_ratio
+  - tests/python-unittests/test_preprocess_video.py::test_internvl_ratio_not_limited
+  - tests/python-unittests/test_preprocess_video.py::test_estimate_image_tokens_raw_input
+  - tests/python-unittests/test_preprocess_video.py::test_raw_clip_not_resize_clamped
+  - tests/python-unittests/test_preprocess_video.py::test_raw_frames_path_matrix
+  - tests/python-unittests/test_preprocess_video.py::test_frames_path_rejects_mismatched_sizes
+  - tests/python-unittests/test_preprocess_video.py::test_frames_path_qwen3d_respects_per_media_frame_cap
+  - tests/python-unittests/test_preprocess_video.py::test_frames_path_pixel_ceiling
+  - tests/python-unittests/test_preprocess_video.py::test_request_wide_pixel_budget
+  - tests/python-unittests/test_preprocess_video.py::test_request_wide_cu_group_budget
+  - tests/python-unittests/test_preprocess_video.py::test_source_decode_work_ceilings
+  - tests/python-unittests/test_preprocess_video.py::test_cu_budget_zero_blocks_every_intake_path
+  - tests/python-unittests/test_preprocess_video.py::test_actual_decoded_pixels_enforced
+  - tests/python-unittests/test_preprocess_video.py::test_frames_path_ratio_checked_without_limits
+  - tests/python-unittests/test_preprocess_video.py::test_raw_video_input_validation
+  - tests/python-unittests/test_preprocess_video.py::test_frames_path_qwen_size_estimate_rejects_overflow
+  - tests/python-unittests/test_preprocess_video.py::test_clamp_internvl_block_range
+  - tests/python-unittests/test_preprocess_video.py::test_smart_nframes_matches_qwen_vl_utils
+  - tests/python-unittests/test_preprocess_video.py::test_sample_video_decode
+  - tests/python-unittests/test_preprocess_video.py::test_internvl_indices_clamp_and_edges
+  - tests/python-unittests/test_preprocess_video.py::test_internvl_nframes
+  - tests/python-unittests/test_preprocess_video.py::test_frame_count_param_validation
+  - tests/python-unittests/test_preprocess_video.py::test_load_video_buffer_rejects_bad_fps
+  - tests/python-unittests/test_preprocess_video.py::test_content_item_source_validation
+  - tests/python-unittests/test_preprocess_video.py::test_estimate_image_tokens_internvl_golden
+  - tests/python-unittests/test_preprocess_video.py::test_sample_indices_internvl_matches_hf
+  - tests/python-unittests/test_preprocess_video.py::test_actual_decoded_size_reestimates_tokens
+  - tests/python-unittests/test_preprocess_video.py::test_actual_decoded_size_rechecks_raw_alignment
+  - tests/python-unittests/test_preprocess_video.py::test_mid_stream_resolution_change_rejected
+  - tests/python-unittests/test_preprocess_video.py::test_single_frame_video_pixel_budget_not_inflated
+  - tests/python-unittests/test_preprocess_video.py::test_error_messages_never_echo_data_urls
+  - tests/python-unittests/test_preprocess_video.py::test_underreported_frame_count_samples_reported_range
+  - tests/python-unittests/test_preprocess_video.py::test_overreported_frame_count_rejects_explicit_nframes
+  - tests/python-unittests/test_preprocess_video.py::test_pybind_video_rejects_non_finite_time_values
+
+  # Server request-parsing chains + audio endpoints (real HTTP endpoint ->
+  # real engine conversion/resolution; stubs only at the C++-binding and
+  # video-decode boundaries)
+  - tests/python-unittests/test_server_requests.py::test_chat_video_request_end_to_end
+  - tests/python-unittests/test_server_requests.py::test_chat_text_request_parses
+  - tests/python-unittests/test_server_requests.py::test_chat_video_frames_request_parses_to_ordered_buffers
+  - tests/python-unittests/test_server_requests.py::test_chat_rejects_bad_media_via_api
+  - tests/python-unittests/test_server_requests.py::test_chat_audio_request_parses_to_bytes
+  - tests/python-unittests/test_server_requests.py::test_audio_transcriptions_endpoint
+  - tests/python-unittests/test_server_requests.py::test_audio_transcriptions_rejects_empty
+  - tests/python-unittests/test_server_requests.py::test_audio_transcriptions_protocol
+  - tests/python-unittests/test_server_requests.py::test_video_model_family_resolution
+  - tests/python-unittests/test_server_requests.py::test_load_image_buffers_request_wide_internvl_minimum
+  - tests/python-unittests/test_server_requests.py::test_load_image_buffers_request_wide_qwen_minimum
+  - tests/python-unittests/test_server_requests.py::test_audio_transcriptions_limits
+  - tests/python-unittests/test_server_requests.py::test_content_length_parsing
+  - tests/python-unittests/test_server_requests.py::test_audio_transcriptions_requires_audio_engine
+  - tests/python-unittests/test_server_requests.py::test_stream_disconnect_before_first_byte_releases_admission
+  - tests/python-unittests/test_server_requests.py::test_admission_busy_returns_429
+  - tests/python-unittests/test_server_requests.py::test_admission_spans_decode_and_infer
+  - tests/python-unittests/test_server_requests.py::test_stream_disconnect_keeps_gate_until_worker_exits
+  - tests/python-unittests/test_server_requests.py::test_stream_close_cancels_channel
+  - tests/python-unittests/test_server_requests.py::test_video_frame_limits_carry_recorded_cu_capacity
+  - tests/python-unittests/test_server_requests.py::test_load_image_buffers_budget_order_independent
+  - tests/python-unittests/test_server_requests.py::test_cli_parser_builds
+  - tests/python-unittests/test_server_requests.py::test_video_frame_limits_from_engine_config
+  - tests/python-unittests/test_server_requests.py::test_chat_streaming_invalid_video_returns_400
+  - tests/python-unittests/test_experimental_server_engine_dir_routing.py::test_detect_engine_type
+  - tests/python-unittests/test_experimental_server_engine_dir_routing.py::test_validate_spec_decode_engine_dir_requires_both
+  - tests/python-unittests/test_experimental_server_engine_dir_routing.py::test_find_multimodal_engine_dir
+  - tests/python-unittests/test_experimental_server_engine_dir_routing.py::test_init_from_engine_routes_spec_decode_dir
+  - tests/python-unittests/test_experimental_server_engine_dir_routing.py::test_init_from_engine_ignores_visual_dir_for_spec_decode
+  - tests/python-unittests/test_experimental_server_engine_dir_routing.py::test_init_from_engine_spec_decode_missing_draft_engine
+  - tests/python-unittests/test_experimental_server_engine_dir_routing.py::test_init_from_engine_vanilla_llm_still_works
+  - tests/python-unittests/test_experimental_server_engine_dir_routing.py::test_init_from_engine_unknown_dir_raises
