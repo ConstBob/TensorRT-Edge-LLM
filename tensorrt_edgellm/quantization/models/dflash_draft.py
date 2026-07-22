@@ -548,14 +548,7 @@ def _resolve_base_embed_layer(base):
 
 def _disable_dflash_fc_quantization(quant_cfg):
     """Exclude only the DFlash target-hidden projector from draft PTQ."""
-    section = quant_cfg.setdefault("quant_cfg", {})
+    section = quant_cfg["quant_cfg"]
     names = ("fc.input_quantizer", "fc.weight_quantizer",
              "fc.output_quantizer")
-    if isinstance(section, list):
-        section.extend({
-            "quantizer_name": name,
-            "enable": False
-        } for name in names)
-    else:
-        for name in names:
-            section[name] = {"enable": False}
+    section.extend({"quantizer_name": name, "enable": False} for name in names)

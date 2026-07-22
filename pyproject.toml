@@ -33,7 +33,7 @@ dependencies = [
 
 [project.optional-dependencies]
 tools = [
-    "nvidia-modelopt==0.44.0",
+    "nvidia-modelopt==0.45.0",
     "datasets==5.0.0",
     "tqdm==4.69.0",
     "einops==0.8.2",

@@ -27,6 +27,31 @@ pre_commit_checks:
   extends: .setup_common_rules
   interruptible: true
 
+# Quantization sanity (GPU / A30): run the quantization unit tests (which
+# actually quantize small real models) in the py3.12 TensorRT base image.
+# `needs: []` so it is independent of the CuTe-DSL builder / setup stage.
+quantization_sanity:
+  stage: l0_test
+  needs: []
+  tags:
+    - a30-edgellm-nvks
+  variables:
+    CUDA_VERSION: "13.2"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+  image: "$IMAGE"
+  script:
+    - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
+    - nvidia-smi -L
+    - export LLM_SDK_DIR=$(pwd)
+    - export PYTHONPATH=$LLM_SDK_DIR:$PYTHONPATH
+    - pip3 install -q -r tests/requirements.txt torch
+    # conftest.from_environment requires these paths; the unit tests do not use them.
+    - export ONNX_DIR=$(pwd)/.ci_qc_onnx LLM_MODELS_DIR=$(pwd)/.ci_qc_models EDGELLM_DATA_DIR=$(pwd)/.ci_qc_data
+    - mkdir -p "$ONNX_DIR" "$LLM_MODELS_DIR" "$EDGELLM_DATA_DIR"
+    - python3 -m pytest tests/python-unittests/test_quantize.py -v --color=yes
+  extends: .setup_common_rules
+  interruptible: true
+
 # Cache cleanup for L0 directory
 l0_cache_cleanup:
   stage: setup

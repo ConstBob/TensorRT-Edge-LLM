@@ -57,6 +57,7 @@ inline (see ``_int4_awq_modelopt_wars``); NVFP4 is unaffected.
 """
 
 import copy
+import json
 import os
 import shutil
 import time
@@ -191,14 +192,10 @@ def _build_full_model_quant_cfg(quantization: str,
         # disable_globs.append("*shared_expert.down_proj.*")
     # modelopt's ``quant_cfg`` is an ordered list of rule dicts; append a
     # disable rule per glob at the end so it overrides the earlier
-    # ``*weight_quantizer`` / ``*input_quantizer`` enables. A ``dict``
-    # ``quant_cfg`` (``{pattern: cfg}``) is handled too.
+    # ``*weight_quantizer`` / ``*input_quantizer`` enables.
     qc = cfg["quant_cfg"]
     for g in disable_globs:
-        if isinstance(qc, list):
-            qc.append({"quantizer_name": g, "enable": False})
-        else:
-            qc[g] = {"enable": False}
+        qc.append({"quantizer_name": g, "enable": False})
     return cfg
 
 
