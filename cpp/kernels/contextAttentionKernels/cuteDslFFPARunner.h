@@ -85,8 +85,8 @@ class CuteDslFFPARunner
 public:
     //! Returns true if the given configuration is supported. Checks head dimension,
     //! SM version, and GQA group size (numQHeads / numKVHeads). Group size 1 (MHA) is
-    //! always supported; group sizes 4 and 8 require CUTE_DSL_FFPA_GQA4_ENABLED /
-    //! CUTE_DSL_FFPA_GQA8_ENABLED respectively.
+    //! always supported; group sizes 4, 8, and 16 require CUTE_DSL_FFPA_GQA4_ENABLED /
+    //! CUTE_DSL_FFPA_GQA8_ENABLED / CUTE_DSL_FFPA_GQA16_ENABLED respectively.
     static bool canImplement(int32_t headDim, int32_t smVersion, int32_t numQHeads = 1, int32_t numKVHeads = 1);
 
     //! Whether the vision-block overlay variant was compiled into this build

@@ -61,10 +61,14 @@ void allocateDeepstackEmbeds(
 }
 
 void allocateSpecDecodeHiddenStates(PipelineIO& io, int32_t maxBatch, int32_t maxSeq, int32_t baseHiddenDim,
-    int32_t draftHiddenDim, nvinfer1::DataType dtype)
+    int32_t draftHiddenDim, nvinfer1::DataType dtype, bool allocateDraftHiddenStates)
 {
     io.baseHiddenStates
         = Tensor({maxBatch, maxSeq, baseHiddenDim}, DeviceType::kGPU, dtype, "PipelineIO::baseHiddenStates");
+    if (!allocateDraftHiddenStates)
+    {
+        return;
+    }
     io.draftHiddenStatesIn
         = Tensor({maxBatch, maxSeq, draftHiddenDim}, DeviceType::kGPU, dtype, "PipelineIO::draftHiddenStatesIn");
     io.draftHiddenStatesOut
@@ -378,9 +382,11 @@ PipelineIO PipelineIO::createForSpecDecode(
     io.outputLogits = rt::Tensor(
         {maxLogitsSize, maxVocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "PipelineIO::outputLogits");
 
-    // Allocate hidden states for SpecDecode.
+    // Allocate hidden states for SpecDecode. DFlash binds the draft target-hidden
+    // input directly to baseHiddenStates, so it does not need the generic
+    // EAGLE/MTP draft hidden-state ping-pong buffers.
     allocateSpecDecodeHiddenStates(io, maxRuntimeBatchSize, maxTensorSeqLen, baseOutputHiddenDim,
-        draftRuntimeHiddenSize, nvinfer1::DataType::kHALF);
+        draftRuntimeHiddenSize, nvinfer1::DataType::kHALF, bundle.specDecodeMode() != SpecDecodeMode::kDFlash);
 
     if (bundle.base.numDeepstackFeatures > 0)
     {

@@ -128,7 +128,7 @@ void allocateDeepstackEmbeds(PipelineIO& io, int32_t numFeatures, int32_t maxBat
     nvinfer1::DataType dtype);
 
 void allocateSpecDecodeHiddenStates(PipelineIO& io, int32_t maxBatch, int32_t maxSeq, int32_t baseHiddenDim,
-    int32_t draftHiddenDim, nvinfer1::DataType dtype);
+    int32_t draftHiddenDim, nvinfer1::DataType dtype, bool allocateDraftHiddenStates);
 
 void allocateMRope(PipelineIO& io, int32_t maxBatch, int32_t maxKVCacheCapacity, int32_t rotaryDim);
 
@@ -151,8 +151,9 @@ void buildTensorMap(
 //! mask, proposal position IDs).
 //!
 //! Preconditions: `io` must have been constructed via `PipelineIO::createForSpecDecode`
-//! (baseHiddenStates / draftHiddenStatesIn/Out / packedAttentionMask /
-//! specDecodePositionIds populated).
+//! for an EAGLE/MTP-style draft path where draftHiddenStatesIn/Out are
+//! populated alongside baseHiddenStates, packedAttentionMask, and
+//! specDecodePositionIds. DFlash uses its own draft TensorMap.
 //!
 //! @param map Output map for the draft engine's bindings.
 //! @param io  Pipeline I/O (must be the SpecDecode-flavoured one).

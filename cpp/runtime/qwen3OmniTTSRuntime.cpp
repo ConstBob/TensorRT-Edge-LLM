@@ -1841,8 +1841,14 @@ bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerStat
         }
     }
 
-    // Zero-init per-batch seen tokens so the repetition penalty reads no entries on the first
-    // frame. Host set / GPU buffer are still off-by-one — see MR 770 follow-ups.
+    // Initialize per-batch seen token tracking. numSeenTokens starts at 0 so the repetition
+    // penalty kernel reads no entries on the first decode frame, avoiding a read of the
+    // unseeded GPU buffer. The in-loop code below records tokens into both the host set and
+    // GPU buffer starting from the first iteration.
+    // NOTE: the host set / GPU buffer are still off-by-one (host set tracks the token entering
+    // each iteration while the GPU buffer receives the newly sampled token). That functional
+    // drift is pre-existing and tracked as a follow-up together with the standalone-TTS
+    // Known Chinese-prompt prefill-EOS anomaly; pending technical follow-up.
     for (int32_t b = 0; b < activeBatchSize; ++b)
     {
         states[b].numSeenTokens = 0;

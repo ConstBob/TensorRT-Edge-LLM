@@ -1684,6 +1684,19 @@ def _export_audio(model_dir: str,
             audio_token_id = _find_token_id(model_dir, "<|audio_pad|>")
         if audio_token_id is not None:
             audio_cfg_out["audio_token_id"] = audio_token_id
+        # boa/eoa delimiters: gemma4AudioRunner wraps each audio span with
+        # them to mirror the HF processor layout (boa + N soft tokens + eoa).
+        boa_token_id = config.get("boa_token_id")
+        if boa_token_id is None:
+            boa_token_id = _find_token_id(model_dir, "<|audio>")
+        if boa_token_id is not None:
+            audio_cfg_out["boa_token_id"] = boa_token_id
+        eoa_token_id = config.get("eoa_token_index",
+                                  config.get("eoa_token_id"))
+        if eoa_token_id is None:
+            eoa_token_id = _find_token_id(model_dir, "<audio|>")
+        if eoa_token_id is not None:
+            audio_cfg_out["eoa_token_id"] = eoa_token_id
     else:
         # Qwen3-family: read the nested ``audio_config`` and map top-level
         # model_type to the encoder-specific enum the C++ builder expects

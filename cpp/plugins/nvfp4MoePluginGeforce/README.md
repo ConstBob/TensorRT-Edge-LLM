@@ -49,7 +49,7 @@ polymorphism but should be accuracy-checked before production use.
 | Parameter | Supported values |
 |---|---|
 | `io_dtype` | FP16 |
-| `activation_type` | identity, silu, swiglu, gelu, relu2 |
+| `activation_type` | identity, silu, swiglu, gelu, relu2, geglu |
 | `routing_mode` | 0=softmax top-k (Qwen3), 1=sigmoid grouped top-k (Nemotron-H) |
 | `backend` | decode + prefill (`auto` picks decode when `num_tokens*top_k <= 640` else prefill; mirrors `select_sm120_moe_backend`) |
 | `hidden_size` (H) | positive multiple of `kHiddenSizeAlignment` (= 256 = `kCuteDslTileK * kStaticAbStage`) |
@@ -93,7 +93,7 @@ plugin layer name and the FC1 packing convention differ):
 ```
 router_logits      fp32    [T, E]         # pre-softmax; plugin applies moeTopkSoftmax
 hidden_states      fp16    [B, S, H]      # per-token NVFP4 quant done inside the kernel
-fc1_qweights       int8    [E, N1, H/2]   # N1 = 2*I (swiglu) or I (identity); plain [up,gate] concat
+fc1_qweights       int8    [E, N1, H/2]   # N1 = 2*I (swiglu/geglu) or I otherwise; plain [up,gate] concat
 fc1_blocks_scale   int8    [E, m_tiles_1, k_tiles_1, 32, 4, 4]
 fc1_alpha          fp32    [E]
 fc2_qweights       int8    [E, H, I/2]

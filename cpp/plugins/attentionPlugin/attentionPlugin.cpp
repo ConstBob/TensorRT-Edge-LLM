@@ -1348,7 +1348,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                 ffpaParams.numQHeads = mNumQHeads;
                 ffpaParams.numKVHeads = mNumKVHeads;
                 ffpaParams.headDim = mHeadSize;
-                ffpaParams.softmaxScale = 1.0F / std::sqrt(static_cast<float>(mHeadSize));
+                ffpaParams.softmaxScale = mAttentionScale;
                 CuteDslFFPARunner::run(ffpaParams, stream);
                 return 0;
             }
@@ -1470,7 +1470,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                     runtimeBatchSize, runtimeSeqLen, mNumQHeads, mNumKVHeads, mHeadSize, kvCacheCapacity);
 
                 // Per-batch cu_seqlens bound the logical lengths inside the kernel
-                // (bug 6384817): ragged padding keys/rows are masked and the boundary
+                // Ragged padding keys/rows are masked and the boundary
                 // tile is zero-filled, so no output zeroing WAR is needed.
                 // Assemble split K/V from the donor's paged pool via the page-table-aware
                 // gather (zero-fills unmapped in-range pages). Chunked prefill gathers the
