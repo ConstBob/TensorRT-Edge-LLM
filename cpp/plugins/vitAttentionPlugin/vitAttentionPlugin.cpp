@@ -76,8 +76,8 @@ ViTFMHAKernelSelection loadViTFMHAKernels(int32_t headSize, int32_t smVersion, n
 #ifdef CUTE_DSL_FMHA_ENABLED
     if (CuteDslFMHARunner::canImplementViT(headSize, smVersion) && CuteDslFMHARunner::loadViTKernelModule())
     {
-        LOG_DEBUG("Optimized CuTe DSL ViT FMHA kernel loaded for SM%d", smVersion);
-        return {ViTFMHABackend::kCUTE_DSL_OPTIMIZED, true};
+        LOG_DEBUG("CuTe DSL ViT FMHA kernel loaded for SM%d", smVersion);
+        return {ViTFMHABackend::kCUTE_DSL_FMHA, true};
     }
 #endif
 
@@ -376,7 +376,7 @@ int32_t ViTAttentionPlugin::enqueue(PluginTensorDesc const* inputDesc,
 #endif
 
 #ifdef CUTE_DSL_FMHA_ENABLED
-    if (mFMHABackend == ViTFMHABackend::kCUTE_DSL_OPTIMIZED)
+    if (mFMHABackend == ViTFMHABackend::kCUTE_DSL_FMHA)
     {
         int32_t totalSeqLen = static_cast<int32_t>(qInputDesc.dims.d[0]);
         CuteDslFMHARunner runner(mNumHeads, mNumHeads, mHeadSize);

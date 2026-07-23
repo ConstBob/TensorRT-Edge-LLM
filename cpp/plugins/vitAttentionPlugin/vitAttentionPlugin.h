@@ -33,7 +33,7 @@ namespace plugins
 enum class ViTFMHABackend
 {
     kNONE,
-    kCUTE_DSL_OPTIMIZED,
+    kCUTE_DSL_FMHA,
     kCUTE_DSL_FMHA_V2
 };
 
