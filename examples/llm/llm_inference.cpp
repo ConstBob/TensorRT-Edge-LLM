@@ -710,7 +710,7 @@ int main(int argc, char* argv[])
             std::filesystem::path const codePredictorDir
                 = std::filesystem::path(args.talkerEngineDir).parent_path() / "code_predictor";
             ttsRuntime = std::make_unique<rt::Qwen3OmniTTSRuntime>(
-                args.talkerEngineDir, codePredictorDir.string(), args.engineDir, stream);
+                args.talkerEngineDir, codePredictorDir.string(), args.engineDir, /*cloneEncoderDir=*/"", stream);
             LOG_INFO("TTS runtime initialized for audio output");
         }
         catch (std::exception const& e)

@@ -63,7 +63,8 @@ def check_accuracy_with_dataset(output_json_file,
 
     # Other datasets to be handled later (TTS output is audio, not text — skip accuracy).
     OTHER_DATASETS = [
-        "mtbench", "coco", "aime", "humaneval", "math500", "tts_basic"
+        "mtbench", "coco", "aime", "humaneval", "math500", "tts_basic",
+        "tts_language", "tts_instruct"
     ]
 
     # Dataset-specific thresholds for ROUGE scores (rouge1, rougeL). Current thresholds are set to 25% for ROUGE-1 and 20% for ROUGE-L.

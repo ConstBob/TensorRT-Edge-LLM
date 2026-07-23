@@ -1774,6 +1774,19 @@ def _export_code2wav(model_dir: str, c2w_out_dir: str, weights: dict,
             logger.exception("[Code2Wav] Qwen3-TTS export failed")
             raise SystemExit(1) from exc
         logger.info("[Code2Wav] Done: %s", output_path)
+        if config.get("tts_model_type") == "base":
+            # Base checkpoints clone voices from reference audio: export the
+            # reference encoders (ECAPA x-vector + Mimi codec encoder) too.
+            logger.info(
+                "[CloneEncoders] Exporting voice-clone reference encoders")
+            try:
+                from ..models.qwen3_tts import export_qwen3_tts_clone_encoders
+                clone_out_dir = os.path.join(os.path.dirname(c2w_out_dir),
+                                             "clone_encoders")
+                export_qwen3_tts_clone_encoders(model_dir, clone_out_dir)
+            except (OSError, ValueError, RuntimeError, ImportError) as exc:
+                logger.exception("[CloneEncoders] export failed")
+                raise SystemExit(1) from exc
         return
 
     if model_type == "qwen3_omni_next":
@@ -2131,6 +2144,21 @@ def _patch_tts_config(model_dir: str, out_dir: str) -> None:
     dsi = pick("default_speaker_id")
     if dsi is not None and "default_speaker_id" not in cfg:
         cfg["default_speaker_id"] = dsi
+
+    # CustomVoice language conditioning. Qwen3-TTS stores the name→codec-id
+    # dict under ``talker_config.codec_language_id``; some checkpoints keep it
+    # at root level as ``talker_language_id`` (pick's root fallback covers both).
+    # Absent maps are not written (no ``null`` keys) — the runtime then keeps
+    # the no-language prefill.
+    lang_map = pick("codec_language_id", "talker_language_id")
+    if isinstance(lang_map, dict) and lang_map:
+        cfg["codec_language_id"] = lang_map
+    # Dialect speaker map: values are false (non-dialect) or a dialect name
+    # string; forwarded verbatim so the runtime can apply the PyTorch
+    # dialect-override rule for speakers like eric/dylan.
+    dialect_map = pick("spk_is_dialect")
+    if isinstance(dialect_map, dict) and dialect_map:
+        cfg["spk_is_dialect"] = dialect_map
 
     with open(cfg_path, "w") as f:
         json.dump(cfg, f, indent=2)
@@ -3152,10 +3180,11 @@ def main() -> None:
     gemma4_kv_sharing_map: list[dict] = []
     externalize_weights = resolve_externalize_weights(args.externalize_weights)
 
-    if (model_type == "qwen3_tts"
-            and config.get("tts_model_type") != "custom_voice"):
-        p.error("Only Qwen3-TTS CustomVoice checkpoints are supported. "
-                f"Got tts_model_type={config.get('tts_model_type')!r}.")
+    if (model_type == "qwen3_tts" and config.get("tts_model_type")
+            not in ("custom_voice", "voice_design", "base")):
+        p.error(
+            "Only Qwen3-TTS CustomVoice / VoiceDesign / Base checkpoints are "
+            f"supported. Got tts_model_type={config.get('tts_model_type')!r}.")
 
     if args.mtp_tree_base:
         args.mtp = True
