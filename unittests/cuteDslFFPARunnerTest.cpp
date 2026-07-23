@@ -71,32 +71,17 @@ void initializeNormalFp16(rt::Tensor& tensor, uint32_t seed)
     copyHostToDevice(tensor, host);
 }
 
-rt::Tensor makeCuSeqLens(int32_t batchSize, int32_t seqLen)
+//! Build a (B+1,) int32 device tensor of cumulative sequence lengths.
+rt::Tensor makeCuSeqLens(std::vector<int32_t> const& lens)
 {
-    rt::Tensor cuSeqLens({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
-    std::vector<int32_t> host(static_cast<size_t>(batchSize + 1));
-    for (int32_t b = 0; b <= batchSize; ++b)
+    std::vector<int32_t> cu(lens.size() + 1, 0);
+    for (size_t i = 0; i < lens.size(); ++i)
     {
-        host[static_cast<size_t>(b)] = b * seqLen;
+        cu[i + 1] = cu[i] + lens[i];
     }
-    copyHostToDevice(cuSeqLens, host);
-    return cuSeqLens;
-}
-
-rt::Tensor makeCuSeqLens(std::vector<int32_t> const& lengths)
-{
-    int32_t const batchSize = static_cast<int32_t>(lengths.size());
-    rt::Tensor cuSeqLens({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
-    std::vector<int32_t> host(static_cast<size_t>(batchSize + 1));
-    int32_t runningTotal = 0;
-    host[0] = 0;
-    for (int32_t b = 0; b < batchSize; ++b)
-    {
-        runningTotal += lengths[static_cast<size_t>(b)];
-        host[static_cast<size_t>(b + 1)] = runningTotal;
-    }
-    copyHostToDevice(cuSeqLens, host);
-    return cuSeqLens;
+    rt::Tensor tensor(rt::Coords{static_cast<int32_t>(cu.size())}, rt::DeviceType::kGPU, DataType::kINT32);
+    copyHostToDevice(tensor, cu);
+    return tensor;
 }
 
 //! Poison padding rows (>= lens[b]) of a [B, S, H, D] fp16 tensor with random
@@ -106,57 +91,33 @@ rt::Tensor makeCuSeqLens(std::vector<int32_t> const& lengths)
 //! NaN/Inf mid-network once fp16 overflow of garbage embeddings has occurred
 //! in non-attention layers, and the kernel must not leak them into valid rows
 //! (IEEE 0 x NaN = NaN defeats score-only masking).
-void poisonPaddingRows(rt::Tensor& tensor, std::vector<int32_t> const& lengths, uint32_t seed, bool nanPoison = false)
+void poisonPaddingRows(rt::Tensor& tensor, std::vector<int32_t> const& lens, uint32_t seed, bool nanPoison = false)
 {
     auto host = copyDeviceToHost<__half>(tensor);
     auto const& shape = tensor.getShape();
-    int64_t const batchSize = shape[0];
+    int64_t const batch = shape[0];
     int64_t const seqLen = shape[1];
     int64_t const rowElems = shape[2] * shape[3];
     std::mt19937 rng{seed};
     std::uniform_real_distribution<float> dist{-60000.0F, 60000.0F};
-    for (int64_t batch = 0; batch < batchSize; ++batch)
+    for (int64_t b = 0; b < batch; ++b)
     {
-        for (int64_t seq = lengths[static_cast<size_t>(batch)]; seq < seqLen; ++seq)
+        for (int64_t s = lens[static_cast<size_t>(b)]; s < seqLen; ++s)
         {
-            int64_t const base = (batch * seqLen + seq) * rowElems;
-            for (int64_t elem = 0; elem < rowElems; ++elem)
+            int64_t const base = (b * seqLen + s) * rowElems;
+            for (int64_t e = 0; e < rowElems; ++e)
             {
                 float value = dist(rng);
                 if (nanPoison)
                 {
-                    value = (seq == lengths[static_cast<size_t>(batch)]) ? std::numeric_limits<float>::infinity()
-                                                                         : std::numeric_limits<float>::quiet_NaN();
+                    value = (s == lens[static_cast<size_t>(b)]) ? std::numeric_limits<float>::infinity()
+                                                                : std::numeric_limits<float>::quiet_NaN();
                 }
-                host[static_cast<size_t>(base + elem)] = __float2half(value);
+                host[static_cast<size_t>(base + e)] = __float2half(value);
             }
         }
     }
     copyHostToDevice(tensor, host);
-}
-
-void expectFinitePaddingRows(rt::Tensor const& actual, std::vector<int32_t> const& qLens, std::string const& label)
-{
-    auto const actualHost = copyDeviceToHost<__half>(actual);
-    auto const shape = actual.getShape();
-    int64_t const batchSize = shape[0];
-    int64_t const seqLen = shape[1];
-    int64_t const rowElems = shape[2] * shape[3];
-    for (int64_t batch = 0; batch < batchSize; ++batch)
-    {
-        for (int64_t seq = qLens[static_cast<size_t>(batch)]; seq < seqLen; ++seq)
-        {
-            for (int64_t elem = 0; elem < rowElems; ++elem)
-            {
-                int64_t const idx = (batch * seqLen + seq) * rowElems + elem;
-                float const actualValue = __half2float(actualHost[static_cast<size_t>(idx)]);
-                ASSERT_FALSE(std::isnan(actualValue)) << label << " padding NaN at batch=" << batch << " seq=" << seq;
-                ASSERT_FALSE(std::isinf(actualValue)) << label << " padding Inf at batch=" << batch << " seq=" << seq;
-                ASSERT_LT(std::abs(actualValue), 1.0F) << label << " padding row not bounded at batch=" << batch
-                                                       << " seq=" << seq << " value=" << actualValue;
-            }
-        }
-    }
 }
 
 void expectFp16Close(rt::Tensor const& actual, rt::Tensor const& expected, std::string const& label)
@@ -194,115 +155,6 @@ void expectFp16Close(rt::Tensor const& actual, rt::Tensor const& expected, std::
     EXPECT_FALSE(nanDetected) << label;
 }
 
-void fillMaskedReference(rt::Tensor const& q, rt::Tensor const& k, rt::Tensor const& v, rt::Tensor& output,
-    std::vector<int32_t> const& qLens, std::vector<int32_t> const& kvLens, bool isCausal)
-{
-    auto const qHost = copyDeviceToHost<__half>(q);
-    auto const kHost = copyDeviceToHost<__half>(k);
-    auto const vHost = copyDeviceToHost<__half>(v);
-    auto const qShape = q.getShape();
-    auto const kShape = k.getShape();
-    int32_t const batchSize = static_cast<int32_t>(qShape[0]);
-    int32_t const seqLenQ = static_cast<int32_t>(qShape[1]);
-    int32_t const seqLenK = static_cast<int32_t>(kShape[1]);
-    int32_t const numQHeads = static_cast<int32_t>(qShape[2]);
-    int32_t const numKVHeads = static_cast<int32_t>(kShape[2]);
-    int32_t const headDim = static_cast<int32_t>(qShape[3]);
-    float const softmaxScale = 1.0F / std::sqrt(static_cast<float>(headDim));
-    std::vector<__half> outputHost(static_cast<size_t>(output.getShape().volume()), __float2half(0.0F));
-
-    for (int32_t b = 0; b < batchSize; ++b)
-    {
-        int32_t const validQ = qLens[static_cast<size_t>(b)];
-        int32_t const validKV = kvLens[static_cast<size_t>(b)];
-        int32_t const kvPrefix = isCausal ? (validKV - validQ) : 0;
-        for (int32_t qPos = 0; qPos < validQ; ++qPos)
-        {
-            int32_t const maxKPos = isCausal ? std::min(kvPrefix + qPos, validKV - 1) : (validKV - 1);
-            for (int32_t qHead = 0; qHead < numQHeads; ++qHead)
-            {
-                int32_t const kvHead = qHead * numKVHeads / numQHeads;
-                float rowMax = -std::numeric_limits<float>::infinity();
-                for (int32_t kPos = 0; kPos <= maxKPos; ++kPos)
-                {
-                    float score = 0.0F;
-                    for (int32_t d = 0; d < headDim; ++d)
-                    {
-                        size_t const qIdx
-                            = (((static_cast<size_t>(b) * seqLenQ + qPos) * numQHeads + qHead) * headDim) + d;
-                        size_t const kIdx
-                            = (((static_cast<size_t>(b) * seqLenK + kPos) * numKVHeads + kvHead) * headDim) + d;
-                        score += __half2float(qHost[qIdx]) * __half2float(kHost[kIdx]);
-                    }
-                    rowMax = std::max(rowMax, score * softmaxScale);
-                }
-
-                float rowSum = 0.0F;
-                std::vector<float> weights(static_cast<size_t>(maxKPos + 1));
-                for (int32_t kPos = 0; kPos <= maxKPos; ++kPos)
-                {
-                    float score = 0.0F;
-                    for (int32_t d = 0; d < headDim; ++d)
-                    {
-                        size_t const qIdx
-                            = (((static_cast<size_t>(b) * seqLenQ + qPos) * numQHeads + qHead) * headDim) + d;
-                        size_t const kIdx
-                            = (((static_cast<size_t>(b) * seqLenK + kPos) * numKVHeads + kvHead) * headDim) + d;
-                        score += __half2float(qHost[qIdx]) * __half2float(kHost[kIdx]);
-                    }
-                    float const weight = std::exp((score * softmaxScale) - rowMax);
-                    weights[static_cast<size_t>(kPos)] = weight;
-                    rowSum += weight;
-                }
-
-                for (int32_t d = 0; d < headDim; ++d)
-                {
-                    float acc = 0.0F;
-                    for (int32_t kPos = 0; kPos <= maxKPos; ++kPos)
-                    {
-                        size_t const vIdx
-                            = (((static_cast<size_t>(b) * seqLenK + kPos) * numKVHeads + kvHead) * headDim) + d;
-                        acc += (weights[static_cast<size_t>(kPos)] / rowSum) * __half2float(vHost[vIdx]);
-                    }
-                    size_t const outIdx
-                        = (((static_cast<size_t>(b) * seqLenQ + qPos) * numQHeads + qHead) * headDim) + d;
-                    outputHost[outIdx] = __float2half(acc);
-                }
-            }
-        }
-    }
-    copyHostToDevice(output, outputHost);
-}
-
-void expectFp16CloseValidRows(
-    rt::Tensor const& actual, rt::Tensor const& expected, std::vector<int32_t> const& qLens, std::string const& label)
-{
-    auto const actualHost = copyDeviceToHost<__half>(actual);
-    auto const expectedHost = copyDeviceToHost<__half>(expected);
-    auto const shape = actual.getShape();
-    int32_t const batchSize = static_cast<int32_t>(shape[0]);
-    int32_t const seqLen = static_cast<int32_t>(shape[1]);
-    int32_t const numHeads = static_cast<int32_t>(shape[2]);
-    int32_t const headDim = static_cast<int32_t>(shape[3]);
-    for (int32_t b = 0; b < batchSize; ++b)
-    {
-        for (int32_t qPos = 0; qPos < qLens[static_cast<size_t>(b)]; ++qPos)
-        {
-            for (int32_t h = 0; h < numHeads; ++h)
-            {
-                for (int32_t d = 0; d < headDim; ++d)
-                {
-                    size_t const idx = (((static_cast<size_t>(b) * seqLen + qPos) * numHeads + h) * headDim) + d;
-                    ASSERT_TRUE(isclose(actualHost[idx], expectedHost[idx], 1e-2F, 1e-2F))
-                        << label << " mismatch at b=" << b << " q=" << qPos << " h=" << h << " d=" << d
-                        << " expected=" << __half2float(expectedHost[idx])
-                        << " actual=" << __half2float(actualHost[idx]);
-                }
-            }
-        }
-    }
-}
-
 struct ShapeParam
 {
     int32_t batchSize;
@@ -314,7 +166,7 @@ struct ShapeParam
     float attentionScale{1.0F / std::sqrt(512.0F)};
 };
 
-void runAccuracyCase(ShapeParam const& p, cudaStream_t stream, bool isCausal = true)
+void runAccuracyCase(ShapeParam const& p, cudaStream_t stream)
 {
     int32_t constexpr kHeadDim = 512;
     // Q / O carry the full Q-head count; K / V carry the (possibly smaller) KV-head
@@ -327,8 +179,6 @@ void runAccuracyCase(ShapeParam const& p, cudaStream_t stream, bool isCausal = t
     rt::Tensor v(kvShape, rt::DeviceType::kGPU, DataType::kHALF);
     rt::Tensor output(qShape, rt::DeviceType::kGPU, DataType::kHALF);
     rt::Tensor outputReference(qShape, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor cuSeqLenQ = makeCuSeqLens(p.batchSize, p.seqLen);
-    rt::Tensor cuSeqLenK = makeCuSeqLens(p.batchSize, p.seqLen);
 
     if (p.useNormalInit)
     {
@@ -343,15 +193,19 @@ void runAccuracyCase(ShapeParam const& p, cudaStream_t stream, bool isCausal = t
         initializeFp16(v, 47);
     }
 
-    rt::launchFmhaReferenceBshd(q, k, v, outputReference, isCausal, p.attentionScale, stream);
+    rt::launchFmhaReferenceBshd(q, k, v, outputReference, true, p.attentionScale, stream);
+
+    // Uniform (dense) cumulative lengths: varlen masking degenerates to the
+    // padded extents, preserving the original dense-kernel semantics.
+    rt::Tensor cuSeqLens = makeCuSeqLens(std::vector<int32_t>(p.batchSize, p.seqLen));
 
     CuteDslFFPAParams params;
     params.q = q.rawPointer();
     params.k = k.rawPointer();
     params.v = v.rawPointer();
     params.o = output.rawPointer();
-    params.cuSeqLenQ = cuSeqLenQ.dataPointer<int32_t>();
-    params.cuSeqLenK = cuSeqLenK.dataPointer<int32_t>();
+    params.cuSeqLenQ = cuSeqLens.dataPointer<int32_t>();
+    params.cuSeqLenK = cuSeqLens.dataPointer<int32_t>();
     params.batchSize = p.batchSize;
     params.seqlenQ = p.seqLen;
     params.seqlenK = p.seqLen;
@@ -359,7 +213,6 @@ void runAccuracyCase(ShapeParam const& p, cudaStream_t stream, bool isCausal = t
     params.numKVHeads = p.numKVHeads;
     params.headDim = kHeadDim;
     params.softmaxScale = p.attentionScale;
-    params.isCausal = isCausal;
 
     ASSERT_EQ(CuteDslFFPARunner::run(params, stream), 0) << p.name;
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -416,329 +269,6 @@ TEST_P(CuteDslFFPAAccuracySweep, Causal)
     runAccuracyCase(p, mStream);
 }
 
-TEST_F(CuteDslFFPABase, NonCausalMatchesReference)
-{
-    if (!CuteDslFFPARunner::canImplement(512, mSmVersion, 1, 1, false))
-    {
-        GTEST_SKIP() << "FFPA d512 dense CuTe DSL kernel is not enabled on SM" << mSmVersion;
-    }
-
-    runAccuracyCase(ShapeParam{1, 16, 4, 4, /*useNormalInit=*/true, "dense_eq_Bc"}, mStream, false);
-    runAccuracyCase(ShapeParam{1, 128, 8, 2, /*useNormalInit=*/true, "dense_gqa_g4_H8_KV2"}, mStream, false);
-}
-
-TEST_F(CuteDslFFPABase, BottomRightCausalMatchesReferenceWhenKvIsLongerThanQ)
-{
-    int32_t constexpr kHeadDim = 512;
-    std::vector<int32_t> const qLens{16};
-    std::vector<int32_t> const kvLens{48};
-    rt::Coords const qShape{1, 16, 4, kHeadDim};
-    rt::Coords const kvShape{1, 48, 1, kHeadDim};
-    rt::Tensor q(qShape, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor k(kvShape, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor v(kvShape, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor output(qShape, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor outputReference(qShape, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor cuSeqLenQ = makeCuSeqLens(1, 16);
-    rt::Tensor cuSeqLenK = makeCuSeqLens(1, 48);
-
-    initializeNormalFp16(q, 113);
-    initializeNormalFp16(k, 227);
-    initializeNormalFp16(v, 331);
-    fillMaskedReference(q, k, v, outputReference, qLens, kvLens, /*isCausal=*/true);
-
-    CuteDslFFPAParams params;
-    params.q = q.rawPointer();
-    params.k = k.rawPointer();
-    params.v = v.rawPointer();
-    params.o = output.rawPointer();
-    params.cuSeqLenQ = cuSeqLenQ.dataPointer<int32_t>();
-    params.cuSeqLenK = cuSeqLenK.dataPointer<int32_t>();
-    params.batchSize = 1;
-    params.seqlenQ = 16;
-    params.seqlenK = 48;
-    params.numQHeads = 4;
-    params.numKVHeads = 1;
-    params.headDim = kHeadDim;
-    params.softmaxScale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
-    params.isCausal = true;
-
-    ASSERT_EQ(CuteDslFFPARunner::run(params, mStream), 0);
-    CUDA_CHECK(cudaStreamSynchronize(mStream));
-    CUDA_CHECK(cudaGetLastError());
-    expectFp16Close(output, outputReference, "bottom_right_causal");
-}
-
-TEST_F(CuteDslFFPABase, NonCausalVarlenMasksPaddedKV)
-{
-    if (!CuteDslFFPARunner::canImplement(512, mSmVersion, 1, 1, false))
-    {
-        GTEST_SKIP() << "FFPA d512 dense CuTe DSL kernel is not enabled on SM" << mSmVersion;
-    }
-
-    int32_t constexpr kHeadDim = 512;
-    std::vector<int32_t> const qLens{8, 5};
-    std::vector<int32_t> const kvLens{12, 7};
-    rt::Tensor q({2, 8, 4, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor k({2, 12, 2, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor v({2, 12, 2, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor output({2, 8, 4, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor outputReference({2, 8, 4, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor cuSeqLenQ = makeCuSeqLens(qLens);
-    rt::Tensor cuSeqLenK = makeCuSeqLens(kvLens);
-
-    initializeNormalFp16(q, 131);
-    initializeNormalFp16(k, 241);
-    initializeNormalFp16(v, 353);
-    poisonPaddingRows(q, qLens, 421);
-    poisonPaddingRows(k, kvLens, 431);
-    poisonPaddingRows(v, kvLens, 439);
-    fillMaskedReference(q, k, v, outputReference, qLens, kvLens, /*isCausal=*/false);
-
-    CuteDslFFPAParams params;
-    params.q = q.rawPointer();
-    params.k = k.rawPointer();
-    params.v = v.rawPointer();
-    params.o = output.rawPointer();
-    params.cuSeqLenQ = cuSeqLenQ.dataPointer<int32_t>();
-    params.cuSeqLenK = cuSeqLenK.dataPointer<int32_t>();
-    params.batchSize = 2;
-    params.seqlenQ = 8;
-    params.seqlenK = 12;
-    params.numQHeads = 4;
-    params.numKVHeads = 2;
-    params.headDim = kHeadDim;
-    params.softmaxScale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
-    params.isCausal = false;
-
-    ASSERT_EQ(CuteDslFFPARunner::run(params, mStream), 0);
-    CUDA_CHECK(cudaStreamSynchronize(mStream));
-    CUDA_CHECK(cudaGetLastError());
-    expectFp16CloseValidRows(output, outputReference, qLens, "non_causal_varlen");
-    expectFinitePaddingRows(output, qLens, "non_causal_varlen");
-}
-
-TEST_F(CuteDslFFPABase, NonCausalDiffusionGemmaShapeMatchesReference)
-{
-    if (!CuteDslFFPARunner::canImplement(512, mSmVersion, 1, 1, false))
-    {
-        GTEST_SKIP() << "FFPA d512 dense CuTe DSL kernel is not enabled on SM" << mSmVersion;
-    }
-
-    int32_t constexpr kHeadDim = 512;
-    std::vector<int32_t> const qLens{4, 3};
-    std::vector<int32_t> const kvLens{24, 11};
-    rt::Tensor q({2, 4, 16, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor k({2, 24, 2, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor v({2, 24, 2, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor output({2, 4, 16, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor outputReference({2, 4, 16, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor cuSeqLenQ = makeCuSeqLens(qLens);
-    rt::Tensor cuSeqLenK = makeCuSeqLens(kvLens);
-
-    initializeNormalFp16(q, 149);
-    initializeNormalFp16(k, 263);
-    initializeNormalFp16(v, 379);
-    poisonPaddingRows(q, qLens, 0, /*nanPoison=*/true);
-    poisonPaddingRows(k, kvLens, 0, /*nanPoison=*/true);
-    poisonPaddingRows(v, kvLens, 0, /*nanPoison=*/true);
-    fillMaskedReference(q, k, v, outputReference, qLens, kvLens, /*isCausal=*/false);
-
-    CuteDslFFPAParams params;
-    params.q = q.rawPointer();
-    params.k = k.rawPointer();
-    params.v = v.rawPointer();
-    params.o = output.rawPointer();
-    params.cuSeqLenQ = cuSeqLenQ.dataPointer<int32_t>();
-    params.cuSeqLenK = cuSeqLenK.dataPointer<int32_t>();
-    params.batchSize = 2;
-    params.seqlenQ = 4;
-    params.seqlenK = 24;
-    params.numQHeads = 16;
-    params.numKVHeads = 2;
-    params.headDim = kHeadDim;
-    params.softmaxScale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
-    params.isCausal = false;
-
-    ASSERT_EQ(CuteDslFFPARunner::run(params, mStream), 0);
-    CUDA_CHECK(cudaStreamSynchronize(mStream));
-    CUDA_CHECK(cudaGetLastError());
-    expectFp16CloseValidRows(output, outputReference, qLens, "non_causal_diffusion_gemma_shape");
-    expectFinitePaddingRows(output, qLens, "non_causal_diffusion_gemma_shape");
-}
-
-TEST_F(CuteDslFFPABase, CausalVarlenUsesPerBatchPrefix)
-{
-    int32_t constexpr kHeadDim = 512;
-    std::vector<int32_t> const qLens{8, 5};
-    std::vector<int32_t> const kvLens{8, 5};
-    rt::Tensor q({2, 8, 4, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor k({2, 16, 1, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor v({2, 16, 1, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor output({2, 8, 4, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor outputReference({2, 8, 4, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor cuSeqLenQ = makeCuSeqLens(qLens);
-    rt::Tensor cuSeqLenK = makeCuSeqLens(kvLens);
-
-    initializeNormalFp16(q, 137);
-    initializeNormalFp16(k, 251);
-    initializeNormalFp16(v, 359);
-    fillMaskedReference(q, k, v, outputReference, qLens, kvLens, /*isCausal=*/true);
-
-    CuteDslFFPAParams params;
-    params.q = q.rawPointer();
-    params.k = k.rawPointer();
-    params.v = v.rawPointer();
-    params.o = output.rawPointer();
-    params.cuSeqLenQ = cuSeqLenQ.dataPointer<int32_t>();
-    params.cuSeqLenK = cuSeqLenK.dataPointer<int32_t>();
-    params.batchSize = 2;
-    params.seqlenQ = 8;
-    params.seqlenK = 16;
-    params.numQHeads = 4;
-    params.numKVHeads = 1;
-    params.headDim = kHeadDim;
-    params.softmaxScale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
-    params.isCausal = true;
-
-    ASSERT_EQ(CuteDslFFPARunner::run(params, mStream), 0);
-    CUDA_CHECK(cudaStreamSynchronize(mStream));
-    CUDA_CHECK(cudaGetLastError());
-    expectFp16CloseValidRows(output, outputReference, qLens, "causal_varlen_prefix");
-}
-
-TEST_F(CuteDslFFPABase, CausalVarlenPoisonedPaddingRowsAreBounded)
-{
-    int32_t constexpr kHeadDim = 512;
-    std::vector<int32_t> const qLens{33, 17};
-    std::vector<int32_t> const kvLens{33, 17};
-    rt::Tensor q({2, 40, 4, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor k({2, 40, 1, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor v({2, 40, 1, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor output({2, 40, 4, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor outputReference({2, 40, 4, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor cuSeqLenQ = makeCuSeqLens(qLens);
-    rt::Tensor cuSeqLenK = makeCuSeqLens(kvLens);
-
-    initializeNormalFp16(q, 503);
-    initializeNormalFp16(k, 607);
-    initializeNormalFp16(v, 709);
-    poisonPaddingRows(q, qLens, 541);
-    poisonPaddingRows(k, kvLens, 557);
-    poisonPaddingRows(v, kvLens, 563);
-    fillMaskedReference(q, k, v, outputReference, qLens, kvLens, /*isCausal=*/true);
-
-    CuteDslFFPAParams params;
-    params.q = q.rawPointer();
-    params.k = k.rawPointer();
-    params.v = v.rawPointer();
-    params.o = output.rawPointer();
-    params.cuSeqLenQ = cuSeqLenQ.dataPointer<int32_t>();
-    params.cuSeqLenK = cuSeqLenK.dataPointer<int32_t>();
-    params.batchSize = 2;
-    params.seqlenQ = 40;
-    params.seqlenK = 40;
-    params.numQHeads = 4;
-    params.numKVHeads = 1;
-    params.headDim = kHeadDim;
-    params.softmaxScale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
-    params.isCausal = true;
-
-    ASSERT_EQ(CuteDslFFPARunner::run(params, mStream), 0);
-    CUDA_CHECK(cudaStreamSynchronize(mStream));
-    CUDA_CHECK(cudaGetLastError());
-    expectFp16CloseValidRows(output, outputReference, qLens, "causal_poisoned_padding");
-    expectFinitePaddingRows(output, qLens, "causal_poisoned_padding");
-}
-
-TEST_F(CuteDslFFPABase, CausalVarlenNaNPoisonedPaddingDoesNotLeak)
-{
-    int32_t constexpr kHeadDim = 512;
-    std::vector<int32_t> const qLens{33, 17};
-    std::vector<int32_t> const kvLens{33, 17};
-    rt::Tensor q({2, 40, 4, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor k({2, 40, 1, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor v({2, 40, 1, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor output({2, 40, 4, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor outputReference({2, 40, 4, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor cuSeqLenQ = makeCuSeqLens(qLens);
-    rt::Tensor cuSeqLenK = makeCuSeqLens(kvLens);
-
-    initializeNormalFp16(q, 811);
-    initializeNormalFp16(k, 823);
-    initializeNormalFp16(v, 827);
-    poisonPaddingRows(q, qLens, 0, /*nanPoison=*/true);
-    poisonPaddingRows(k, kvLens, 0, /*nanPoison=*/true);
-    poisonPaddingRows(v, kvLens, 0, /*nanPoison=*/true);
-    fillMaskedReference(q, k, v, outputReference, qLens, kvLens, /*isCausal=*/true);
-
-    CuteDslFFPAParams params;
-    params.q = q.rawPointer();
-    params.k = k.rawPointer();
-    params.v = v.rawPointer();
-    params.o = output.rawPointer();
-    params.cuSeqLenQ = cuSeqLenQ.dataPointer<int32_t>();
-    params.cuSeqLenK = cuSeqLenK.dataPointer<int32_t>();
-    params.batchSize = 2;
-    params.seqlenQ = 40;
-    params.seqlenK = 40;
-    params.numQHeads = 4;
-    params.numKVHeads = 1;
-    params.headDim = kHeadDim;
-    params.softmaxScale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
-    params.isCausal = true;
-
-    ASSERT_EQ(CuteDslFFPARunner::run(params, mStream), 0);
-    CUDA_CHECK(cudaStreamSynchronize(mStream));
-    CUDA_CHECK(cudaGetLastError());
-    expectFp16CloseValidRows(output, outputReference, qLens, "causal_nan_poisoned_padding");
-    expectFinitePaddingRows(output, qLens, "causal_nan_poisoned_padding");
-}
-
-TEST_F(CuteDslFFPABase, ChunkedCausalVarlenOffsetMatchesReference)
-{
-    int32_t constexpr kHeadDim = 512;
-    std::vector<int32_t> const qLens{16, 9};
-    std::vector<int32_t> const kvLens{40, 23};
-    rt::Tensor q({2, 16, 4, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor k({2, 48, 1, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor v({2, 48, 1, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor output({2, 16, 4, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor outputReference({2, 16, 4, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor cuSeqLenQ = makeCuSeqLens(qLens);
-    rt::Tensor cuSeqLenK = makeCuSeqLens(kvLens);
-
-    initializeNormalFp16(q, 911);
-    initializeNormalFp16(k, 919);
-    initializeNormalFp16(v, 929);
-    poisonPaddingRows(q, qLens, 937);
-    poisonPaddingRows(k, kvLens, 941);
-    poisonPaddingRows(v, kvLens, 947);
-    fillMaskedReference(q, k, v, outputReference, qLens, kvLens, /*isCausal=*/true);
-
-    CuteDslFFPAParams params;
-    params.q = q.rawPointer();
-    params.k = k.rawPointer();
-    params.v = v.rawPointer();
-    params.o = output.rawPointer();
-    params.cuSeqLenQ = cuSeqLenQ.dataPointer<int32_t>();
-    params.cuSeqLenK = cuSeqLenK.dataPointer<int32_t>();
-    params.batchSize = 2;
-    params.seqlenQ = 16;
-    params.seqlenK = 48;
-    params.numQHeads = 4;
-    params.numKVHeads = 1;
-    params.headDim = kHeadDim;
-    params.softmaxScale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
-    params.isCausal = true;
-
-    ASSERT_EQ(CuteDslFFPARunner::run(params, mStream), 0);
-    CUDA_CHECK(cudaStreamSynchronize(mStream));
-    CUDA_CHECK(cudaGetLastError());
-    expectFp16CloseValidRows(output, outputReference, qLens, "chunked_causal_varlen_offset");
-    expectFinitePaddingRows(output, qLens, "chunked_causal_varlen_offset");
-}
-
 INSTANTIATE_TEST_SUITE_P(FP16Causal, CuteDslFFPAAccuracySweep,
     ::testing::Values(
         // --- MHA (numKVHeads == numQHeads) ---
@@ -758,8 +288,6 @@ INSTANTIATE_TEST_SUITE_P(FP16Causal, CuteDslFFPAAccuracySweep,
         ShapeParam{1, 128, 8, 2, /*useNormalInit=*/true, "gqa_g4_H8_KV2"},
         ShapeParam{1, 1024, 8, 2, /*useNormalInit=*/true, "gqa_g4_H8_KV2_1k"},
         ShapeParam{2, 256, 8, 2, /*useNormalInit=*/true, "gqa_g4_H8_KV2_batch"},
-        // --- DiffusionGemma full-attention prompt shape (Hq/Hkv == 8) ---
-        ShapeParam{1, 20, 16, 2, /*useNormalInit=*/true, "gqa_g8_H16_KV2_prompt"},
         // --- Other GQA / MQA group sizes for coverage ---
         ShapeParam{1, 128, 8, 4, /*useNormalInit=*/true, "gqa_g2_H8_KV4"},
         ShapeParam{1, 128, 8, 1, /*useNormalInit=*/true, "gemma_mqa_identity", 1.0F},
@@ -787,16 +315,15 @@ protected:
         int32_t constexpr kHeadDim = 512;
         rt::Coords const outShape{1, seqLen, numHeads, kHeadDim};
         rt::Tensor output(outShape, rt::DeviceType::kGPU, DataType::kHALF);
-        rt::Tensor cuSeqLenQ = makeCuSeqLens(1, seqLen);
-        rt::Tensor cuSeqLenK = makeCuSeqLens(1, seqLen);
+        rt::Tensor cuSeqLens = makeCuSeqLens({seqLen});
 
         CuteDslFFPAParams params;
         params.q = fullQ.rawPointer();
         params.k = fullK.rawPointer();
         params.v = fullV.rawPointer();
         params.o = output.rawPointer();
-        params.cuSeqLenQ = cuSeqLenQ.dataPointer<int32_t>();
-        params.cuSeqLenK = cuSeqLenK.dataPointer<int32_t>();
+        params.cuSeqLenQ = cuSeqLens.dataPointer<int32_t>();
+        params.cuSeqLenK = cuSeqLens.dataPointer<int32_t>();
         params.batchSize = 1;
         params.seqlenQ = seqLen;
         params.seqlenK = seqLen;
@@ -897,7 +424,7 @@ protected:
 };
 
 // Ragged BS=3 right-padded batch with near-fp16-max garbage in the padding
-// positions in the Gemma4 BS>1 MMLU prefill shape. The dense
+// positions — the Gemma4 BS>1 MMLU prefill shape.  The dense
 // FFPA kernel attends the poisoned padding and corrupts the batch; with
 // per-batch cu_seqlens the valid rows must match the per-batch FP32 reference,
 // padding rows must stay bounded, and nothing may be NaN/Inf.
@@ -994,7 +521,7 @@ TEST_F(CuteDslFFPAVarlen, RaggedBatchPoisonedPadding)
 }
 
 // NaN-poisoned padding: padding K/V rows can legitimately contain NaN/Inf at
-// inference time; fp16 overflow of garbage padding
+// inference time (fp16 overflow of garbage padding
 // embeddings in the FFN turns pad rows NaN from layer 1 on).  Score masking
 // alone is not NaN-safe — BMM2 computes P(0) x V(NaN) = NaN and poisons the
 // whole boundary q-tile — so the boundary-tile K/V loads zero-fill logical
@@ -1443,8 +970,8 @@ TEST_F(CuteDslFFPAVisionBlock, TwoBlocksGemma4HeadShape)
 }
 
 // Ragged BS=2 right-padded batch with poisoned padding and different block
-// layouts per batch - the overlay must stay per-batch correct under varlen
-// masking while reusing the ragged-padding test structure.
+// layouts per batch — the overlay must stay per-batch correct under varlen
+// masking (reusing the ragged-padding test structure).
 TEST_F(CuteDslFFPAVisionBlock, RaggedBatchWithBlocks)
 {
     int32_t constexpr kSeqLen = 192;
@@ -1547,8 +1074,8 @@ TEST_F(CuteDslFFPANegativePath, RejectsUnsupportedHeadDim)
     params.k = dummy;
     params.v = dummy;
     params.o = dummy;
-    params.cuSeqLenQ = static_cast<int32_t*>(dummy);
-    params.cuSeqLenK = static_cast<int32_t*>(dummy);
+    params.cuSeqLenQ = static_cast<int32_t const*>(dummy);
+    params.cuSeqLenK = static_cast<int32_t const*>(dummy);
     params.batchSize = 1;
     params.seqlenQ = 16;
     params.seqlenK = 16;
@@ -1579,8 +1106,8 @@ TEST_F(CuteDslFFPANegativePath, RejectsIndivisibleKvHeads)
     params.k = dummy;
     params.v = dummy;
     params.o = dummy;
-    params.cuSeqLenQ = static_cast<int32_t*>(dummy);
-    params.cuSeqLenK = static_cast<int32_t*>(dummy);
+    params.cuSeqLenQ = static_cast<int32_t const*>(dummy);
+    params.cuSeqLenK = static_cast<int32_t const*>(dummy);
     params.batchSize = 1;
     params.seqlenQ = 16;
     params.seqlenK = 16;
@@ -1607,8 +1134,8 @@ TEST_F(CuteDslFFPANegativePath, RejectsNullPointers)
     params.k = dummy;
     params.v = dummy;
     params.o = dummy;
-    params.cuSeqLenQ = static_cast<int32_t*>(dummy);
-    params.cuSeqLenK = static_cast<int32_t*>(dummy);
+    params.cuSeqLenQ = static_cast<int32_t const*>(dummy);
+    params.cuSeqLenK = static_cast<int32_t const*>(dummy);
     params.batchSize = 1;
     params.seqlenQ = 16;
     params.seqlenK = 16;
@@ -1624,8 +1151,8 @@ TEST_F(CuteDslFFPANegativePath, RejectsNullPointers)
     CUDA_CHECK(cudaFree(dummy));
 }
 
-// Runtime guard: cuSeqLenQ/cuSeqLenK must both be provided; keep Q/K/V/O
-// non-null so this specifically exercises the sequence-length guard.
+// Runtime guard: the varlen kernel requires (batchSize + 1) int32 cu_seqlen
+// device tensors; null pointers must be rejected before any kernel launch.
 TEST_F(CuteDslFFPANegativePath, RejectsNullCuSeqLens)
 {
     void* dummy = nullptr;
@@ -1637,7 +1164,7 @@ TEST_F(CuteDslFFPANegativePath, RejectsNullCuSeqLens)
     params.v = dummy;
     params.o = dummy;
     params.cuSeqLenQ = nullptr; // intentionally null
-    params.cuSeqLenK = static_cast<int32_t*>(dummy);
+    params.cuSeqLenK = nullptr;
     params.batchSize = 1;
     params.seqlenQ = 16;
     params.seqlenK = 16;
@@ -1645,13 +1172,6 @@ TEST_F(CuteDslFFPANegativePath, RejectsNullCuSeqLens)
     params.numKVHeads = 1;
     params.headDim = 512;
     params.softmaxScale = 1.0F / std::sqrt(512.0F);
-
-    EXPECT_NE(CuteDslFFPARunner::run(params, mStream), 0);
-    CUDA_CHECK(cudaStreamSynchronize(mStream));
-    CUDA_CHECK(cudaGetLastError());
-
-    params.cuSeqLenQ = static_cast<int32_t*>(dummy);
-    params.cuSeqLenK = nullptr; // intentionally null
 
     EXPECT_NE(CuteDslFFPARunner::run(params, mStream), 0);
     CUDA_CHECK(cudaStreamSynchronize(mStream));
@@ -1675,8 +1195,6 @@ TEST(CuteDslFFPARunnerStaticTest, CanImplementSupportedHeadDimAndSMs)
     EXPECT_FALSE(CuteDslFFPARunner::canImplement(128, 100));
     EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, 75));
     EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, 90));
-
-    EXPECT_TRUE(CuteDslFFPARunner::canImplement(512, 100, 1, 1, false));
 }
 
 TEST(CuteDslFFPARunnerStaticTest, CanImplementGQAGroupSizes)

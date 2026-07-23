@@ -16,6 +16,7 @@
 
 import json
 import math
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -27,11 +28,59 @@ from tensorrt_edgellm.config import (ModelConfig, _is_diffusion_gemma_config,
                                      module_quant_type)
 from tensorrt_edgellm.models.diffusion_gemma import (
     DiffusionGemmaBackbone, make_diffusion_gemma_key_remap)
-from tensorrt_edgellm.models.diffusion_gemma.sampling import (
-    EntropyBoundSamplerConfig, entropy_bound_accept_mask, soft_token_embeds)
 from tensorrt_edgellm.models.gemma4.modeling_gemma4_text import \
     _gemma4_dense_moe_routing
 from tensorrt_edgellm.scripts import export as export_script
+
+
+@dataclass(frozen=True)
+class EntropyBoundSamplerConfig:
+    entropy_threshold: float = 0.005
+    entropy_bound: float = 0.1
+    stability_window: int = 2
+
+
+def entropy_bound_accept_mask(
+    logits: torch.Tensor,
+    previous_tokens: torch.Tensor | None,
+    stable_counts: torch.Tensor | None,
+    config: EntropyBoundSamplerConfig,
+    temperature: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reference DiffusionGemma block sampler used by correctness tests."""
+    if logits.ndim != 3:
+        raise ValueError(
+            "entropy_bound_accept_mask expects logits with shape [B, C, V].")
+    scaled_logits = logits.float() / max(float(temperature), 1e-6)
+    probs = torch.softmax(scaled_logits, dim=-1)
+    tokens = torch.argmax(probs, dim=-1)
+    entropy = -(probs * torch.log(probs.clamp_min(1e-20))).sum(dim=-1)
+
+    if previous_tokens is None:
+        previous_tokens = torch.full_like(tokens, -1)
+    if stable_counts is None:
+        stable_counts = torch.zeros_like(tokens, dtype=torch.int32)
+
+    same_as_previous = tokens == previous_tokens
+    next_stable_counts = torch.where(same_as_previous, stable_counts + 1,
+                                     torch.ones_like(stable_counts))
+
+    sorted_entropy, sorted_idx = torch.sort(entropy, dim=-1)
+    cumsum_entropy = torch.cumsum(sorted_entropy, dim=-1)
+    cummax_entropy = torch.cummax(sorted_entropy, dim=-1).values
+    sorted_accept = ((cumsum_entropy - cummax_entropy)
+                     <= float(config.entropy_bound))
+    accept_mask = torch.zeros_like(sorted_accept, dtype=torch.bool)
+    accept_mask.scatter_(1, sorted_idx, sorted_accept)
+    return tokens, accept_mask, next_stable_counts, entropy
+
+
+def soft_token_embeds(logits: torch.Tensor,
+                      embedding_weight: torch.Tensor,
+                      temperature: float = 1.0) -> torch.Tensor:
+    scaled_logits = logits.float() / max(float(temperature), 1e-6)
+    probs = torch.softmax(scaled_logits, dim=-1)
+    return torch.matmul(probs.to(embedding_weight.dtype), embedding_weight)
 
 
 def _load_model_config(tmp_path):
@@ -206,8 +255,20 @@ def test_backbone_export_spec_has_dynamic_batch_dims(tmp_path):
     spec = model.onnx_export_spec()
     shapes_by_name = dict(zip(spec.input_names, spec.dynamic_shapes))
 
+    assert model.diffusion_unified_conditioning is True
+    assert spec.input_names[:5] == [
+        "inputs_embeds",
+        "phase_is_encoder",
+        "canvas_ids",
+        "prev_self_conditioning_embeds",
+        "self_conditioning_temperature",
+    ]
     assert 0 in shapes_by_name["inputs_embeds"]
     assert 0 in shapes_by_name["phase_is_encoder"]
+    assert list(shapes_by_name["canvas_ids"].keys()) == [0, 1]
+    assert list(
+        shapes_by_name["prev_self_conditioning_embeds"].keys()) == [0, 1]
+    assert shapes_by_name["self_conditioning_temperature"] == {}
     assert list(shapes_by_name["past_key_values_0"].keys()) == [1]
     assert 0 in shapes_by_name["rope_rotary_cos_sin"]
     assert 0 in shapes_by_name["context_lengths"]
@@ -215,12 +276,12 @@ def test_backbone_export_spec_has_dynamic_batch_dims(tmp_path):
     assert list(shapes_by_name["kv_page_table"].keys()) == [0, 2]
     assert 0 in shapes_by_name["select_token_indices"]
     assert list(shapes_by_name["context_mask_selector"].keys()) == [0]
-    assert "canvas_ids" not in shapes_by_name
     assert "prev_logits" not in shapes_by_name
-    assert "prev_self_conditioning_embeds" not in shapes_by_name
-    assert "self_conditioning_temperature" not in shapes_by_name
-    assert spec.output_names[0] == "logits"
-    assert spec.output_names[1] == "present_key_values_0"
+    assert spec.output_names[:3] == [
+        "logits",
+        "next_self_conditioning_embeds",
+        "present_key_values_0",
+    ]
 
 
 def test_unified_backbone_export_spec_has_conditioning_bindings(tmp_path):
@@ -259,14 +320,9 @@ def test_unified_backbone_rejects_reduced_vocab(tmp_path):
     _write_minimal_diffusion_gemma_config(tmp_path)
     cfg = _load_model_config(tmp_path)
     cfg.reduced_vocab_size = 16
-    model = DiffusionGemmaBackbone(cfg)
 
-    try:
-        model.enable_unified_conditioning()
-    except ValueError as exc:
-        assert "reduced vocabulary" in str(exc)
-    else:
-        raise AssertionError("Expected reduced vocabulary rejection")
+    with pytest.raises(ValueError, match="reduced vocabulary"):
+        DiffusionGemmaBackbone(cfg)
 
 
 def test_unified_backbone_conditioning_matches_reference(tmp_path):
@@ -309,6 +365,10 @@ def test_unified_backbone_conditioning_matches_reference(tmp_path):
 
 
 def test_diffusion_gemma_key_remap_splits_backbone_and_self_conditioning():
+    unified_remap = make_diffusion_gemma_key_remap(
+        include_backbone=True,
+        include_self_conditioning=True,
+    )
     backbone_remap = make_diffusion_gemma_key_remap(
         include_backbone=True,
         include_self_conditioning=False,
@@ -317,6 +377,8 @@ def test_diffusion_gemma_key_remap_splits_backbone_and_self_conditioning():
                                               include_self_conditioning=True)
     assert (backbone_remap("model.decoder.layers.0.self_attn.q_proj.weight") ==
             "model.layers.0.self_attn.q_proj.weight")
+    assert (unified_remap("model.decoder.self_conditioning.pre_norm.weight") ==
+            "self_conditioning.pre_norm.weight")
     assert (backbone_remap("model.decoder.layers.0.router.proj.weight") ==
             "model.layers.0.router.proj.weight")
     assert (backbone_remap(

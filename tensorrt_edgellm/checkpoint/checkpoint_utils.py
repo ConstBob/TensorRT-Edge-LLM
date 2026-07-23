@@ -426,8 +426,8 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
         if diffusion_engine_role == "dllm" and not diffusion_unified_conditioning:
             raise ValueError(
                 "DiffusionGemma dllm export requires unified self-conditioning. "
-                "Call enable_unified_conditioning() before writing runtime config."
-            )
+                "Use DiffusionGemmaBackbone so the self-conditioning module is "
+                "created with the backbone before writing runtime config.")
         out.update({
             "decoding_strategy":
             "block_diffusion",

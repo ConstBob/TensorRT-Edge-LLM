@@ -66,6 +66,7 @@ fmha_d64_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_paged = {};
 fmha_d128_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_paged = {};
 fmha_d256_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d256_paged = {};
 fmha_d512_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d512_paged = {};
+fmha_d512_dense_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d512_dense_paged = {};
 fmha_d64_sw_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_sw_paged = {};
 fmha_d128_sw_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_sw_paged = {};
 fmha_d256_sw_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d256_sw_paged = {};
@@ -75,6 +76,7 @@ fmha_d64_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_paged_fp8 = {};
 fmha_d128_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_paged_fp8 = {};
 fmha_d256_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d256_paged_fp8 = {};
 fmha_d512_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d512_paged_fp8 = {};
+fmha_d512_dense_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d512_dense_paged_fp8 = {};
 fmha_d64_sw_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_sw_paged_fp8 = {};
 fmha_d128_sw_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_sw_paged_fp8 = {};
 fmha_d256_sw_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d256_sw_paged_fp8 = {};
@@ -121,6 +123,7 @@ bool CuteDslFMHARunner::loadLLMKernelModule()
         fmha_d128_paged_Kernel_Module_Load(&sLLM_d128_paged);
         fmha_d256_paged_Kernel_Module_Load(&sLLM_d256_paged);
         fmha_d512_paged_Kernel_Module_Load(&sLLM_d512_paged);
+        fmha_d512_dense_paged_Kernel_Module_Load(&sLLM_d512_dense_paged);
         fmha_d64_sw_paged_Kernel_Module_Load(&sLLM_d64_sw_paged);
         fmha_d128_sw_paged_Kernel_Module_Load(&sLLM_d128_sw_paged);
         fmha_d256_sw_paged_Kernel_Module_Load(&sLLM_d256_sw_paged);
@@ -129,6 +132,7 @@ bool CuteDslFMHARunner::loadLLMKernelModule()
         fmha_d128_paged_fp8_Kernel_Module_Load(&sLLM_d128_paged_fp8);
         fmha_d256_paged_fp8_Kernel_Module_Load(&sLLM_d256_paged_fp8);
         fmha_d512_paged_fp8_Kernel_Module_Load(&sLLM_d512_paged_fp8);
+        fmha_d512_dense_paged_fp8_Kernel_Module_Load(&sLLM_d512_dense_paged_fp8);
         fmha_d64_sw_paged_fp8_Kernel_Module_Load(&sLLM_d64_sw_paged_fp8);
         fmha_d128_sw_paged_fp8_Kernel_Module_Load(&sLLM_d128_sw_paged_fp8);
         fmha_d256_sw_paged_fp8_Kernel_Module_Load(&sLLM_d256_sw_paged_fp8);
@@ -167,6 +171,7 @@ void CuteDslFMHARunner::unloadLLMKernelModule()
         fmha_d128_paged_Kernel_Module_Unload(&sLLM_d128_paged);
         fmha_d256_paged_Kernel_Module_Unload(&sLLM_d256_paged);
         fmha_d512_paged_Kernel_Module_Unload(&sLLM_d512_paged);
+        fmha_d512_dense_paged_Kernel_Module_Unload(&sLLM_d512_dense_paged);
         fmha_d64_sw_paged_Kernel_Module_Unload(&sLLM_d64_sw_paged);
         fmha_d128_sw_paged_Kernel_Module_Unload(&sLLM_d128_sw_paged);
         fmha_d256_sw_paged_Kernel_Module_Unload(&sLLM_d256_sw_paged);
@@ -175,6 +180,7 @@ void CuteDslFMHARunner::unloadLLMKernelModule()
         fmha_d128_paged_fp8_Kernel_Module_Unload(&sLLM_d128_paged_fp8);
         fmha_d256_paged_fp8_Kernel_Module_Unload(&sLLM_d256_paged_fp8);
         fmha_d512_paged_fp8_Kernel_Module_Unload(&sLLM_d512_paged_fp8);
+        fmha_d512_dense_paged_fp8_Kernel_Module_Unload(&sLLM_d512_dense_paged_fp8);
         fmha_d64_sw_paged_fp8_Kernel_Module_Unload(&sLLM_d64_sw_paged_fp8);
         fmha_d128_sw_paged_fp8_Kernel_Module_Unload(&sLLM_d128_sw_paged_fp8);
         fmha_d256_sw_paged_fp8_Kernel_Module_Unload(&sLLM_d256_sw_paged_fp8);
@@ -401,7 +407,7 @@ void CuteDslFMHARunner::run(void const* qPtr, void const* kvPtr, void* oPtr, int
 void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, int32_t const* kvCachePageList,
     void* oPtr, int32_t const* cuKVSeqLens, int32_t numPages, int32_t maxPagesPerSeq, int32_t tokensPerPage,
     nvinfer1::DataType kvDataType, cudaStream_t stream, float attentionScale, int32_t slidingWindowSize, bool fp8Input,
-    float qScale, float kScale, float vScale)
+    float qScale, float kScale, float vScale, bool isCausal)
 {
     if (!sLLMLoaded)
     {
@@ -426,6 +432,10 @@ void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, i
         "CuTe DSL paged FMHA supports FP16 or FP8 KV cache.");
     check::check((kvDataType == nvinfer1::DataType::kFP8) == fp8Input,
         "CuTe DSL paged FMHA requires fp8Input to match the paged KV cache dtype.");
+    check::check(isCausal || slidingWindowSize == INT_MAX,
+        "CuTe DSL dense non-causal paged FMHA does not support sliding-window masking.");
+    check::check(
+        isCausal || mHeadDim == 512, "CuTe DSL dense non-causal paged FMHA currently supports head_dim=512 only.");
 
     float const scaleQ = qScale;
     float const scaleK = kScale;
@@ -494,6 +504,7 @@ void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, i
         ret = cute_dsl_##PREFIX##_wrapper(&(MODULE), &qTensor, &kvPoolTensor, &pageListTensor, &oTensor, &cumSeqlenK,  \
             (WSL), attentionScale, scaleQ, scaleK, scaleV, invScaleO, getDeviceMultiProcessorCount(), stream);                         \
     } while (0)
+
     // clang-format on
 
 #define DISPATCH_PAGED_HEADD(D, NO_SW_PREFIX, NO_SW_MOD, SW_PREFIX, SW_MOD)                                            \
@@ -509,7 +520,18 @@ void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, i
         }                                                                                                              \
     }
 
-    if (fp8Input)
+    if (!isCausal)
+    {
+        if (fp8Input)
+        {
+            CALL_LLM_FMHA_PAGED(fmha_d512_dense_paged_fp8, sLLM_d512_dense_paged_fp8, windowSizeLeft);
+        }
+        else
+        {
+            CALL_LLM_FMHA_PAGED(fmha_d512_dense_paged, sLLM_d512_dense_paged, windowSizeLeft);
+        }
+    }
+    else if (fp8Input)
     {
         DISPATCH_PAGED_HEADD(64, fmha_d64_paged_fp8, sLLM_d64_paged_fp8, fmha_d64_sw_paged_fp8, sLLM_d64_sw_paged_fp8)
         else DISPATCH_PAGED_HEADD(128, fmha_d128_paged_fp8, sLLM_d128_paged_fp8, fmha_d128_sw_paged_fp8,
@@ -539,8 +561,9 @@ void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, i
 
     if (ret != 0)
     {
-        LOG_ERROR("CuTe DSL paged LLM FMHA kernel (d=%d, sw=%s, fp8in=%s) failed with error code: %d", headDim,
-            useSlidingWindow ? "true" : "false", fp8Input ? "true" : "false", ret);
+        LOG_ERROR("CuTe DSL paged LLM FMHA kernel (d=%d, causal=%s, sw=%s, fp8in=%s) failed with error code: %d",
+            headDim, isCausal ? "true" : "false", useSlidingWindow ? "true" : "false", fp8Input ? "true" : "false",
+            ret);
     }
 }
 

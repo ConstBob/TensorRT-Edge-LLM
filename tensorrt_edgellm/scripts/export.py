@@ -1084,7 +1084,6 @@ def _export_diffusion_gemma(model_dir: str,
     use_nvfp4_moe = _is_nvfp4_checkpoint(model_dir)
 
     try:
-        from ..checkpoint.loader import load_weights
         from ..model import AutoModel
         from ..models.diffusion_gemma import make_diffusion_gemma_key_remap
         from ..models.linear import FP16Linear
@@ -1101,19 +1100,9 @@ def _export_diffusion_gemma(model_dir: str,
             device="cpu",
             key_remap=make_diffusion_gemma_key_remap(
                 include_backbone=True,
-                include_self_conditioning=False,
+                include_self_conditioning=True,
                 nvfp4_moe=use_nvfp4_moe),
             reduced_vocab_dir=reduced_vocab_dir or None,
-        )
-        backbone.enable_unified_conditioning()
-        load_weights(
-            backbone,
-            model_dir,
-            device="cpu",
-            key_remap=make_diffusion_gemma_key_remap(
-                include_backbone=False, include_self_conditioning=True),
-            mapping=backbone.config.mapping,
-            do_repack=False,
         )
         for name in ("gate_proj", "up_proj", "down_proj"):
             module = getattr(backbone.self_conditioning, name)

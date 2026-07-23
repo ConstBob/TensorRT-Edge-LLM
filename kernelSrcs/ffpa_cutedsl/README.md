@@ -9,11 +9,11 @@ Ampere instruction floor:
 - `ldmatrix`
 - warp shuffle reductions
 
-The current registry scope is **D=512 FP16 causal and dense/non-causal**. GQA
-is supported at runtime: the exported kernel takes `num_kv_heads` as a launch
-argument, so a single AOT kernel serves MHA and any GQA/MQA group size (the
-only constraint is `num_head % num_kv_heads == 0`). The Python kernel also
-supports BF16, but that is not exported by default.
+The current registry scope is **D=512 causal FP16**. GQA is supported at
+runtime: the exported kernel takes `num_kv_heads` as a launch argument, so a
+single AOT kernel serves MHA and any GQA/MQA group size (the only constraint
+is `num_head % num_kv_heads == 0`). The Python kernel also supports dense mode
+and BF16, but those are not exported by default.
 
 Supported artifact targets:
 
@@ -41,14 +41,13 @@ in-tree FP32 BSHD reference.
 
 | Variant | D | Mask | KV group | Dtype | Tuning |
 |---------|---:|------|---------:|-------|--------|
-| `ffpa_d512` | 512 | dense/non-causal | runtime | FP16 | `Br=64, Bc=16, threads=128` |
 | `ffpa_d512_causal` | 512 | causal | runtime | FP16 | `Br=64, Bc=16, threads=128` |
 | `ffpa_d512_causal_visionblock` | 512 | causal + vision-block overlay | runtime | FP16 | `Br=64, Bc=16, threads=128` |
 
 Compile-time axes:
 
 - `head_dim`
-- `is_causal` (causal mode is bottom-right aligned when `seqlen_k > seqlen_q`)
+- `is_causal`
 - `vision_block` (Gemma4 vision-block overlay; requires `is_causal`)
 - `Br`, `Bc`, `num_threads`
 - `skip_rescale`
@@ -144,20 +143,6 @@ python3 fmha.py \
   --output_dir ./out \
   --file_name ffpa_d512_causal \
   --function_prefix ffpa_d512_causal
-```
-
-Export a dense tuning variant (drop `--is_causal`; FP16):
-
-```bash
-python3 fmha.py \
-  --head_dim 512 \
-  --m_block_size 64 --n_block_size 16 --num_threads 128 \
-  --dtype Float16 \
-  --skip_rescale \
-  --export_only \
-  --output_dir ./out \
-  --file_name ffpa_d512 \
-  --function_prefix ffpa_d512
 ```
 
 Smoke launch without exporting (matches the registry-exported variant —

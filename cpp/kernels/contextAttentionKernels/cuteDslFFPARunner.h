@@ -35,7 +35,6 @@ extern "C" cudaError_t cudaLibraryUnload(cudaLibrary_t library);
 #endif
 
 #include "cutedsl_all.h"
-#include "ffpa_d512.h"
 
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -75,10 +74,9 @@ struct CuteDslFFPAParams
     int32_t numKVHeads{0};
     int32_t headDim{0};
     float softmaxScale{0.0F};
-    bool isCausal{true};
 };
 
-//! Runner for the generated FP16 FFPA d=512 kernels.
+//! Runner for the generated FP16 FFPA d=512 causal kernel.
 //! Supports MHA and GQA dynamically via numKVHeads runtime argument.
 //! When params.blockBegin/blockEnd are set, dispatches the vision-block
 //! overlay variant (CUTE_DSL_FFPA_VISIONBLOCK_ENABLED) instead.
@@ -89,8 +87,7 @@ public:
     //! SM version, and GQA group size (numQHeads / numKVHeads). Group size 1 (MHA) is
     //! always supported; group sizes 4, 8, and 16 require CUTE_DSL_FFPA_GQA4_ENABLED /
     //! CUTE_DSL_FFPA_GQA8_ENABLED / CUTE_DSL_FFPA_GQA16_ENABLED respectively.
-    static bool canImplement(
-        int32_t headDim, int32_t smVersion, int32_t numQHeads = 1, int32_t numKVHeads = 1, bool isCausal = true);
+    static bool canImplement(int32_t headDim, int32_t smVersion, int32_t numQHeads = 1, int32_t numKVHeads = 1);
 
     //! Whether the vision-block overlay variant was compiled into this build
     //! (requires the ffpa_d512_causal_visionblock AOT artifact).
@@ -116,7 +113,6 @@ private:
 #if defined(CUTE_DSL_FFPA_GQA16_ENABLED)
     static ffpa_d512_causal_gqa16_Kernel_Module_t sD512CausalGqa16Module;
 #endif
-    static ffpa_d512_Kernel_Module_t sD512DenseModule;
     static bool sLoaded;
     static std::mutex sMutex;
 };

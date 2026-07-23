@@ -957,6 +957,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
         o = cute.make_tensor(o_iter + qo_offset, o_layout)
         lse = None
+        self.is_packed_qkv = False
 
         self.q_dtype = q.element_type
         self.k_dtype = k.element_type
@@ -4242,6 +4243,7 @@ class BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256:
         )
         o = cute.make_tensor(o_iter + qo_offset, o_layout)
         lse = None
+        self.is_packed_qkv = False
 
         self.q_dtype = q.element_type
         self.k_dtype = k.element_type
@@ -6814,6 +6816,7 @@ def run(
         window_size_right = None
     if is_causal:
         window_size_right = 0
+    use_sliding_window = window_size_left is not None
 
     if b != b_:
         raise ValueError("q & k must have the same batch size")
@@ -6841,10 +6844,14 @@ def run(
     if d == 512:
         if out_dtype != cutlass.Float16:
             raise ValueError("head dimension 512 requires FP16 output")
-        if not is_persistent or not is_causal or not bottom_right_align:
-            raise ValueError(
-                "head dimension 512 requires persistent bottom-right causal attention"
-            )
+        if not is_persistent:
+            raise ValueError("head dimension 512 requires persistent attention")
+        if is_causal and not bottom_right_align:
+            raise ValueError("head dimension 512 causal attention requires bottom-right alignment")
+        if not is_causal and bottom_right_align:
+            raise ValueError("head dimension 512 non-causal attention does not use bottom-right alignment")
+        if not is_causal and (window_size_left is not None or window_size_right is not None):
+            raise ValueError("head dimension 512 non-causal attention does not support sliding/window masks")
         if not paged_kv:
             raise ValueError("head dimension 512 requires paged KV")
         if vit_mode or lse_calculation or skip_softmax_threshold is not None:
@@ -6998,11 +7005,11 @@ def run(
 
     mma_tiler = (*mma_tiler_mn, padded_d)
 
-    mask_type = fmha_utils.MaskEnum.WINDOW_MASK
-    if bottom_right_align:
+    mask_type = fmha_utils.MaskEnum.RESIDUAL_MASK
+    if is_causal and bottom_right_align:
         mask_type = fmha_utils.MaskEnum.WINDOW_MASK_INFERENCE
-    # Note: window_size_right is always 0 (causal), so window/causal masking is
-    # always active. RESIDUAL_MASK fallback (no masking) is not reachable.
+    elif is_causal:
+        mask_type = fmha_utils.MaskEnum.WINDOW_MASK
 
     s_q_list = s_q if isinstance(s_q, tuple) else [s_q] * b
     s_k_list = s_k if isinstance(s_k, tuple) else [s_k] * b
@@ -7037,7 +7044,6 @@ def run(
         ):
             raise ValueError("sliding window doesn't support current setting")
 
-    use_sliding_window = window_size_left is not None
     if vit_mode:
         mask_type = fmha_utils.MaskEnum.RESIDUAL_MASK
     if paged_kv and vit_mode:
@@ -7073,7 +7079,7 @@ def run(
             (128, 128, 256),
             is_persistent,
             mask_type,
-            is_causal=True,
+            is_causal=is_causal,
             use_sliding_window=use_sliding_window,
             actual_head_dim=512,
             enable_skip_correction=enable_skip_correction,
@@ -7232,9 +7238,9 @@ def run(
             kv_pool_dyn = mark_kv_pool_dynamic(kv_pool_tensor)
             compiled_fmha = cute.compile(
                 fmha.__call_paged__,
-                q_dyn, kv_pool_dyn, page_list_tensor, o_dyn, cu_kv_seqlens,
-                _wsl, scale_softmax, scale_q, scale_k, scale_v, inv_scale_o,
-                _sm_count, current_stream,
+                q_dyn, kv_pool_dyn, page_list_tensor, o_dyn,
+                cu_kv_seqlens, _wsl, scale_softmax, scale_q, scale_k,
+                scale_v, inv_scale_o, _sm_count, current_stream,
             )
         else:
             kv_dyn = mark_kv_cache_dynamic(kvcache_tensor)
@@ -7631,9 +7637,11 @@ def run_llm_multi_round_prefill_test(
         raise ValueError("attention_scale must be finite and greater than zero")
     ref_scale_softmax = _attention_scale
 
-    mask_type = fmha_utils.MaskEnum.WINDOW_MASK
-    if bottom_right_align:
+    mask_type = fmha_utils.MaskEnum.RESIDUAL_MASK
+    if is_causal and bottom_right_align:
         mask_type = fmha_utils.MaskEnum.WINDOW_MASK_INFERENCE
+    elif is_causal:
+        mask_type = fmha_utils.MaskEnum.WINDOW_MASK
 
     # Real-activation replay for the accuracy test: randint data produces ~no
     # threshold skips, silently reducing the test to the dense path.

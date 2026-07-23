@@ -130,10 +130,9 @@ private:
     int32_t enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream);
 
-    //! Launch the CuTe DSL FFPA d512 attention kernel with per-batch varlen masking.
+    //! Launch the CuTe DSL FFPA d512 causal attention kernel with per-batch varlen masking.
     void dispatchFFPAKernel(half const* q, half const* k, half const* v, half* o, int32_t const* cuSeqLenQ,
-        int32_t const* cuSeqLenK, int32_t batchSize, int32_t seqlenQ, int32_t seqlenK, int32_t numQHeads,
-        int32_t numKVHeads, int32_t headDim, bool isCausal, cudaStream_t stream);
+        int32_t const* cuSeqLenK, int32_t batchSize, int32_t seqlenQ, int32_t seqlenK, cudaStream_t stream);
 
     //! Prefill routing under vision-block attention: the FFPA d512
     //! vision-block overlay kernel serves full-causal headSize=512 layers;
@@ -222,9 +221,6 @@ protected:
     //! non-causal context attention, used by DiffusionGemma denoise when the
     //! normal prefill backend is CuTe DSL FMHA.
     bool mCanImplementPaddingFMHA{false};
-
-    //! Whether FFPA d512 dense/non-causal kernel is available.
-    bool mCanImplementNonCausalFFPA{false};
 
     //! Whether XQA decode kernels are available.
     bool mCanImplementXQA{false};

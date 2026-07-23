@@ -49,7 +49,7 @@ def make_diffusion_gemma_key_remap(
     include_self_conditioning: bool = False,
     nvfp4_moe: bool = False,
 ) -> Callable[[str], Optional[str]]:
-    """Return a checkpoint-key remapper for DiffusionGemma split exports.
+    """Return a checkpoint-key remapper for DiffusionGemma backbone exports.
 
     DiffusionGemma checkpoints carry the text backbone under
     ``model.decoder``.  The encoder tree holds vision weights plus per-layer
@@ -57,9 +57,9 @@ def make_diffusion_gemma_key_remap(
     The Edge-LLM backbone graph is intentionally one large phase-aware
     transformer, so decoder tensors load into ``model.*`` while encoder and
     decoder phase scalars load into separate buffers.  Current production
-    exports call :meth:`DiffusionGemmaBackbone.enable_unified_conditioning`,
-    so ``model.decoder.self_conditioning.*`` loads into the same DLLM backbone
-    after the main quantized weights have already been repacked.
+    exports build unified self-conditioning in ``DiffusionGemmaBackbone`` and
+    load ``model.decoder.self_conditioning.*`` into the same DLLM backbone
+    pass as the quantized decoder weights.
     """
     seen_backbone_keys: set[str] = set()
 
@@ -252,6 +252,7 @@ class DiffusionGemmaBackbone(gemma4_text.Gemma4ForCausalLM):
         self.model = DiffusionGemmaTransformer(config)
         self.diffusion_engine_role = "dllm"
         self.diffusion_unified_conditioning = False
+        self.enable_unified_conditioning()
 
     def enable_unified_conditioning(self) -> None:
         """Embed DiffusionGemma self-conditioning into the backbone graph."""

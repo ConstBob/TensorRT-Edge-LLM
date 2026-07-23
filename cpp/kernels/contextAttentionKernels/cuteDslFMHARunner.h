@@ -117,11 +117,12 @@ public:
      * @param qScale Q dequant scale, ignored when fp8Input=false
      * @param kScale K dequant scale, ignored when fp8Input=false
      * @param vScale V dequant scale, ignored when fp8Input=false
+     * @param isCausal Whether to dispatch a causal or dense non-causal variant
      */
     void runPaged(void const* qPtr, void const* pagedKVPoolPtr, int32_t const* kvCachePageList, void* oPtr,
         int32_t const* cuKVSeqLens, int32_t numPages, int32_t maxPagesPerSeq, int32_t tokensPerPage,
         nvinfer1::DataType kvDataType, cudaStream_t stream, float attentionScale, int32_t slidingWindowSize = INT_MAX,
-        bool fp8Input = false, float qScale = 1.0f, float kScale = 1.0f, float vScale = 1.0f);
+        bool fp8Input = false, float qScale = 1.0f, float kScale = 1.0f, float vScale = 1.0f, bool isCausal = true);
 
     /**
      * @brief ViT FMHA: packed varlen separate Q/K/V, bidirectional.
@@ -173,6 +174,7 @@ private:
     static fmha_d128_paged_Kernel_Module_t sLLM_d128_paged;
     static fmha_d256_paged_Kernel_Module_t sLLM_d256_paged;
     static fmha_d512_paged_Kernel_Module_t sLLM_d512_paged;
+    static fmha_d512_dense_paged_Kernel_Module_t sLLM_d512_dense_paged;
     static fmha_d64_sw_paged_Kernel_Module_t sLLM_d64_sw_paged;
     static fmha_d128_sw_paged_Kernel_Module_t sLLM_d128_sw_paged;
     static fmha_d256_sw_paged_Kernel_Module_t sLLM_d256_sw_paged;
@@ -183,6 +185,7 @@ private:
     static fmha_d128_paged_fp8_Kernel_Module_t sLLM_d128_paged_fp8;
     static fmha_d256_paged_fp8_Kernel_Module_t sLLM_d256_paged_fp8;
     static fmha_d512_paged_fp8_Kernel_Module_t sLLM_d512_paged_fp8;
+    static fmha_d512_dense_paged_fp8_Kernel_Module_t sLLM_d512_dense_paged_fp8;
     static fmha_d64_sw_paged_fp8_Kernel_Module_t sLLM_d64_sw_paged_fp8;
     static fmha_d128_sw_paged_fp8_Kernel_Module_t sLLM_d128_sw_paged_fp8;
     static fmha_d256_sw_paged_fp8_Kernel_Module_t sLLM_d256_sw_paged_fp8;
