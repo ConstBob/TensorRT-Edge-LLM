@@ -19,10 +19,10 @@ Drives the custom AttentionPlugin entirely through torch CUDA tensors and
 validates it against a PyTorch reference across a sweep of configs:
 prefill / decode, grouped-query attention, head-size variants, FP8 KV cache,
 chunked prefill, ragged context lengths, batch-order permutation invariance,
-tree (speculative) attention, shared-KV (donor-cache) layers, fused qk_norm
-(per-head RMSNorm on Q/K before RoPE), and the Q pre-scaling convention for
-non-standard softmax scales. Sliding-window attention is covered in
-test_sliding_window_attention_plugin.py.
+tree (speculative) attention, vision-block attention, shared-KV (donor-cache)
+layers, fused qk_norm (per-head RMSNorm on Q/K before RoPE), and the Q
+pre-scaling convention for non-standard softmax scales. Sliding-window
+attention is covered in test_sliding_window_attention_plugin.py.
 
 The plugin's KV-cache ABI is paged: a pool binding [2, numPages, PAGE_SIZE,
 Hkv, D] plus an int32 page table [batch, 2, maxPagesPerSeq]. The tests (and
@@ -173,9 +173,38 @@ def scaled_dot_product_attention(q: torch.Tensor, k: torch.Tensor,
         v = v.repeat_interleave(rep, dim=1)
     scores = torch.matmul(q, k.transpose(-1, -2)) * scale
     if attn_mask is not None:
-        scores = scores.masked_fill(attn_mask[None, None] == 0, float("-inf"))
+        mask = attn_mask[None,
+                         None] if attn_mask.ndim == 2 else attn_mask[:, None]
+        scores = scores.masked_fill(mask == 0, float("-inf"))
     weights = torch.softmax(scores, dim=-1)
     return torch.matmul(weights, v)
+
+
+def attention_bidirectional_mask(
+        vision_block_ids: torch.Tensor,
+        context_lengths: torch.Tensor,
+        sliding_window_size: int = -1) -> torch.Tensor:
+    """Causal/sliding mask OR each contiguous non-negative vision-ID run."""
+    batch_size, seq_len = vision_block_ids.shape
+    base = sliding_window_mask(seq_len, seq_len, sliding_window_size, DEV)
+    mask = base[None].expand(batch_size, -1, -1).clone().to(torch.bool)
+    block_ids_cpu = vision_block_ids.cpu()
+    context_lengths_cpu = context_lengths.cpu()
+    for batch_idx in range(batch_size):
+        context_len = min(int(context_lengths_cpu[batch_idx]), seq_len)
+        mask[batch_idx, context_len:, :] = False
+        mask[batch_idx, :, context_len:] = False
+        begin = 0
+        while begin < context_len:
+            block_id = int(block_ids_cpu[batch_idx, begin])
+            end = begin + 1
+            while end < context_len and int(block_ids_cpu[batch_idx,
+                                                          end]) == block_id:
+                end += 1
+            if block_id >= 0:
+                mask[batch_idx, begin:end, begin:end] = True
+            begin = end
+    return mask.to(torch.int32)
 
 
 def compute_attention(
@@ -353,9 +382,11 @@ class AttentionPluginRunner:
                  k_norm_gamma=None,
                  attention_scale: Optional[float] = None,
                  enable_kv_shared: int = 0,
-                 enable_context_mask_selector: bool = False):
+                 enable_context_mask_selector: bool = False,
+                 enable_vision_block_attention: bool = False):
         self.p = p
         self.tree = enable_tree_attention
+        self.vision = enable_vision_block_attention
         self.q_norm_gamma = q_norm_gamma
         self.k_norm_gamma = k_norm_gamma
         self.attention_scale = attention_scale
@@ -410,6 +441,10 @@ class AttentionPluginRunner:
                                                  p.seq_len), (mb, ms, ms))
             profiles["position_ids"] = ((1, 1), (p.batch_size, p.seq_len),
                                         (mb, ms))
+        if self.vision:
+            input_specs.append(("vision_block_ids", trt.int32, (-1, -1)))
+            profiles["vision_block_ids"] = ((1, 1), (p.batch_size, p.seq_len),
+                                            (mb, ms))
 
         # qk_norm gammas are OPTIONAL engine-weight constant inputs, wired only
         # when enable_qk_norm=1.
@@ -432,12 +467,15 @@ class AttentionPluginRunner:
             plugin_input_order.append("context_mask_selector")
         if self.tree:
             plugin_input_order += ["tree_mask", "position_ids"]
+        if self.vision:
+            plugin_input_order.append("vision_block_ids")
 
         fields = [
             pf_int32("num_q_heads", p.num_q_heads),
             pf_int32("num_kv_heads", p.num_kv_heads),
             pf_int32("head_size", p.head_size),
             pf_int32("enable_tree_attention", int(self.tree)),
+            pf_int32("enable_vision_block_attention", int(self.vision)),
             pf_int32("enable_qk_norm", int(qk_norm)),
             pf_int32("enable_kv_shared", int(self.kv_shared)),
             pf_int32("enable_context_mask_selector",
@@ -501,6 +539,7 @@ class AttentionPluginRunner:
             cache_indices,
             tree_mask=None,
             position_ids=None,
+            vision_block_ids=None,
             input_shapes=None,
             context_mask_selector=None):
         """Execute; returns (attn_output fp16, kv_cache after update).
@@ -543,6 +582,8 @@ class AttentionPluginRunner:
             tensors["position_ids"] = position_ids
         if self.context_mask_selector:
             tensors["context_mask_selector"] = context_mask_selector
+        if self.vision:
+            tensors["vision_block_ids"] = vision_block_ids
         self.runner.execute(tensors, input_shapes)
         # Gather the (possibly updated) pool back into the logical cache.
         kv_cache[:, 0] = pool_k[:batch, :cap].permute(0, 2, 1, 3)
@@ -819,10 +860,119 @@ def test_prefill_head512_cutedsl_gqa_2():
     _run_rounds(p, num_rounds=2, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("case",
-                         ["vision_fp8", "tree_vision", "vision_sliding"])
-def test_head512_retained_vision_rejections(case):
-    """Vision D512 stays on the specialized path and rejects unsupported mixes."""
+def _run_vision_prefill_case(*, label: str, head_size: int, num_q_heads: int,
+                             num_kv_heads: int, seq_len: int,
+                             sliding_window_size: int, vision_ranges):
+    # Require plugin construction explicitly because PluginRunner otherwise
+    # treats an unavailable plugin as a platform skip.
+    torch.empty(0, device=DEV)
+    PluginRunner()
+    creator = trt.get_plugin_registry().get_creator("AttentionPlugin", "1", "")
+    assert creator is not None
+    plugin = creator.create_plugin(
+        "AttentionPlugin",
+        trt.PluginFieldCollection([
+            pf_int32("num_q_heads", num_q_heads),
+            pf_int32("num_kv_heads", num_kv_heads),
+            pf_int32("head_size", head_size),
+            pf_int32("enable_vision_block_attention", 1),
+            pf_int32("sliding_window_size", sliding_window_size),
+        ]), trt.TensorRTPhase.BUILD)
+    assert plugin is not None
+
+    p = AttentionParams(batch_size=1,
+                        seq_len=seq_len,
+                        num_q_heads=num_q_heads,
+                        num_kv_heads=num_kv_heads,
+                        head_size=head_size,
+                        kv_cache_capacity=seq_len,
+                        max_batch_size=1,
+                        max_seq_len=seq_len,
+                        max_position_embeddings=seq_len,
+                        qk_scale=1.0,
+                        is_prefill=True,
+                        sliding_window_size=sliding_window_size)
+    gen = torch.Generator().manual_seed(625)
+    runner = AttentionPluginRunner(p,
+                                   attention_scale=1.0,
+                                   enable_vision_block_attention=True)
+    cos, sin, combined = _make_rope(p, gen)
+    ref_k, ref_v, plugin_kv = _empty_caches(p)
+    qkv = (0.1 * torch.randn(
+        (1, seq_len, p.qkv_hidden_size), generator=gen,
+        dtype=torch.float32)).to(DEV)
+    position_ids = torch.arange(seq_len, dtype=torch.int32, device=DEV)[None]
+    cache_idx = torch.zeros(1, dtype=torch.int32, device=DEV)
+    context_lengths = torch.full((1, ), seq_len, dtype=torch.int32, device=DEV)
+    vision_block_ids = torch.full((1, seq_len),
+                                  -1,
+                                  dtype=torch.int32,
+                                  device=DEV)
+    for block_id, (begin, end) in enumerate(vision_ranges):
+        vision_block_ids[:, begin:end] = block_id
+    mask = attention_bidirectional_mask(vision_block_ids, context_lengths,
+                                        sliding_window_size)
+    ref_out, _, _ = compute_attention(qkv, ref_k, ref_v, cos, sin,
+                                      position_ids, cache_idx, p, mask)
+    attn_out, _ = runner.run(qkv.to(torch.float16),
+                             plugin_kv,
+                             context_lengths,
+                             combined,
+                             cache_idx,
+                             vision_block_ids=vision_block_ids,
+                             input_shapes={"kv_cache_indices": (0, )})
+    assert_close(label, ref_out, attn_out, atol=2e-2, rtol=2e-2)
+
+
+def _run_head512_vision_prefill_case(case: str):
+    gemma4_shape = case == "gemma4_blocks"
+    seq_len = 128 if gemma4_shape else 129
+    num_q_heads = 16 if gemma4_shape else 4
+    num_kv_heads = 1 if gemma4_shape else 2
+    sliding_window_size = 32 if case == "blocks_sliding" else -1
+    vision_ranges = ()
+    if case != "all_text":
+        vision_ranges = ((8, 40), (80, 112)) if gemma4_shape else ((8, 32),
+                                                                   (120, 129))
+
+    _run_vision_prefill_case(label=f"vision-d512-{case}",
+                             head_size=512,
+                             num_q_heads=num_q_heads,
+                             num_kv_heads=num_kv_heads,
+                             seq_len=seq_len,
+                             sliding_window_size=sliding_window_size,
+                             vision_ranges=vision_ranges)
+
+
+@pytest.mark.skipif(
+    _device_sm() not in (80, 86, 87, 89, 100, 101, 110, 120, 121),
+    reason="D256 FMHA-v2 bidirectional attention requires a supported CUDA SM")
+@pytest.mark.parametrize("case", ["all_text", "page_crossing"])
+def test_prefill_head256_vision_fmha_v2_bidirectional(case):
+    """Exercise the Gemma4 D256 FMHA-v2 bidirectional route."""
+    vision_ranges = () if case == "all_text" else ((120, 129), )
+    sliding_window_size = 1024 if case == "all_text" else 32
+    _run_vision_prefill_case(label=f"vision-d256-{case}",
+                             head_size=256,
+                             num_q_heads=16,
+                             num_kv_heads=8,
+                             seq_len=129,
+                             sliding_window_size=sliding_window_size,
+                             vision_ranges=vision_ranges)
+
+
+@pytest.mark.skipif(_device_sm() not in (100, 101, 110),
+                    reason="D512 CuTe DSL FMHA requires SM100/101/110")
+@pytest.mark.parametrize(
+    "case", ["all_text", "blocks", "blocks_sliding", "gemma4_blocks"])
+def test_prefill_head512_vision_cutedsl(case):
+    """Prove all D512 vision modes route through paged CuTe DSL FMHA."""
+    _run_head512_vision_prefill_case(case)
+
+
+@pytest.mark.parametrize("case", ["vision_fp8", "tree_vision"])
+def test_head512_vision_rejections(case):
+    """Vision D512 rejects unsupported precision and mask combinations."""
     PluginRunner()
     registry = trt.get_plugin_registry()
     creator = registry.get_creator("AttentionPlugin", "1", "")
@@ -835,7 +985,7 @@ def test_head512_retained_vision_rejections(case):
         pf_int32("enable_tree_attention", int(case == "tree_vision")),
         pf_int32("enable_vision_block_attention", 1),
         pf_int32("enable_fp8_kv_cache", int(enable_fp8)),
-        pf_int32("sliding_window_size", 4 if case == "vision_sliding" else -1),
+        pf_int32("sliding_window_size", -1),
     ]
     if enable_fp8:
         fields.append(pf_float32("qkv_scales", [0.5, 0.25, 0.125]))
@@ -843,6 +993,75 @@ def test_head512_retained_vision_rejections(case):
                                    trt.PluginFieldCollection(fields),
                                    trt.TensorRTPhase.BUILD)
     assert plugin is None
+
+
+@pytest.mark.skipif(_device_sm() == 0 or _device_sm() >= 100,
+                    reason="requires a non-Blackwell CUDA device")
+def test_head512_sliding_vision_rejected_on_non_blackwell():
+    """Full-causal FFPA must not serve sliding vision-block attention."""
+    PluginRunner()
+    creator = trt.get_plugin_registry().get_creator("AttentionPlugin", "1", "")
+    assert creator is not None
+    plugin = creator.create_plugin(
+        "AttentionPlugin",
+        trt.PluginFieldCollection([
+            pf_int32("num_q_heads", 8),
+            pf_int32("num_kv_heads", 2),
+            pf_int32("head_size", 512),
+            pf_int32("enable_vision_block_attention", 1),
+            pf_int32("sliding_window_size", 1024),
+        ]), trt.TensorRTPhase.BUILD)
+    assert plugin is None
+
+
+@pytest.mark.skipif(_device_sm() not in (100, 101, 110),
+                    reason="D512 CuTe DSL FMHA requires SM100/101/110")
+@pytest.mark.parametrize("route", ["chunked", "shared"])
+def test_head512_vision_prefill_route_rejections(route):
+    """Vision blocks are supported only for normal prefill with owned KV."""
+    p = AttentionParams(batch_size=1,
+                        seq_len=8,
+                        num_q_heads=4,
+                        num_kv_heads=2,
+                        head_size=512,
+                        kv_cache_capacity=16,
+                        max_batch_size=1,
+                        max_seq_len=8,
+                        max_position_embeddings=16,
+                        is_prefill=True)
+    shared = route == "shared"
+    runner = AttentionPluginRunner(p,
+                                   enable_kv_shared=int(shared),
+                                   enable_vision_block_attention=True)
+    gen = torch.Generator().manual_seed(626)
+    _, _, combined = _make_rope(p, gen)
+    _, _, plugin_kv = _empty_caches(p)
+    width = p.q_hidden if shared else p.qkv_hidden_size
+    qkv = torch.randn((1, p.seq_len, width),
+                      generator=gen,
+                      dtype=torch.float32).to(DEV)
+    context_lengths = torch.full((1, ),
+                                 p.seq_len,
+                                 dtype=torch.int32,
+                                 device=DEV)
+    cache_idx = torch.zeros(1, dtype=torch.int32, device=DEV)
+    input_shapes = {"kv_cache_indices": (0, )}
+    if route == "chunked":
+        cache_idx.fill_(1)
+        context_lengths.fill_(p.seq_len + 1)
+        input_shapes = None
+    vision_block_ids = torch.full((1, p.seq_len),
+                                  -1,
+                                  dtype=torch.int32,
+                                  device=DEV)
+    with pytest.raises(RuntimeError, match="execute_async_v3 returned False"):
+        runner.run(qkv.to(torch.float16),
+                   plugin_kv,
+                   context_lengths,
+                   combined,
+                   cache_idx,
+                   vision_block_ids=vision_block_ids,
+                   input_shapes=input_shapes)
 
 
 def test_head512_shared_fp8_prefill_rejected():

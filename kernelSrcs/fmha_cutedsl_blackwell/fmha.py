@@ -3561,6 +3561,47 @@ class BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256:
         return logical_coord, head_dim_cta_coord
 
     @cute.jit
+    def _get_kv_tile_span(
+        self,
+        blk_coord: cute.Coord,
+        seqlen_q: Int32,
+        seqlen_k: Int32,
+        window_size_left: Optional[Int32],
+        window_size_right: Optional[Int32],
+        block_begin: Optional[cute.Tensor],
+        block_end: Optional[cute.Tensor],
+    ):
+        """Return the common KV traversal span for every warp-specialized role.
+
+        Bidirectional metadata stores one inclusive contiguous block interval
+        per query row. The base traversal already covers every KV position
+        between the first and last query rows in this Q tile. Therefore only a
+        block containing the first row can extend the span to the left, and only
+        a block containing the last valid row can extend it to the right.
+        """
+        bidirectional_begin = None
+        bidirectional_end = None
+        if cutlass.const_expr(block_begin is not None):
+            batch_coord = blk_coord[2][1]
+            q_tile_begin = blk_coord[0] * self.cta_tiler[0]
+            q_tile_end = cutlass.min(
+                q_tile_begin + self.cta_tiler[0], seqlen_q
+            ) - 1
+            bidirectional_begin = block_begin[batch_coord, q_tile_begin]
+            bidirectional_end = block_end[batch_coord, q_tile_end]
+        return fmha_utils.FusedMask.get_trip_span(
+            self.mask_type,
+            blk_coord,
+            self.cta_tiler,
+            seqlen_q,
+            seqlen_k,
+            window_size_left,
+            window_size_right,
+            bidirectional_begin,
+            bidirectional_end,
+        )
+
+    @cute.jit
     def _qk_mma_stage(
         self,
         qk_tiled_mma: cute.TiledMma,
@@ -3946,6 +3987,8 @@ class BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256:
             cum_seqlen_k,
             lse,
             None,
+            None,
+            None,
             scale_softmax_log2,
             scale_softmax,
             scale_output,
@@ -4168,6 +4211,8 @@ class BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256:
             tma_atom_o, tma_tensor_o, o,
             cum_seqlen_q, cum_seqlen_k, lse,
             None,
+            None,
+            None,
             scale_softmax_log2, scale_softmax, scale_output,
             _wsl, _wsr,
             q_smem_layout_staged, k_smem_layout_staged,
@@ -4187,6 +4232,9 @@ class BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256:
         kv_cache_page_list: cute.Tensor,  # (B, 2, max_pages_per_seq) Int32
         o_tensor: cute.Tensor,  # (B, S_q, H_q, D) — same layout as Q
         cum_seqlen_k: cute.Tensor,  # (B+1,) Int32 — cumulative KV sequence lengths
+        # D512 BIDIRECTIONAL adds these two tensors to the paged ABI.
+        block_begin: Optional[cute.Tensor],  # (B, S_q) Int32, inclusive
+        block_end: Optional[cute.Tensor],  # (B, S_q) Int32, inclusive
         window_size_left: Int32,
         attention_scale: Float32,
         scale_q: Float32,
@@ -4204,8 +4252,47 @@ class BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256:
         The logical pool shape is (P,H,T,D); dynamic strides select the physical
         pool layout, either (P,H,T,D) or (P,T,H,D).
 
+        With MaskEnum.BIDIRECTIONAL, block_begin/block_end add an inclusive KV
+        interval to the base causal/sliding mask for each query row.
+        Text/padding rows contain -1/-1, and every row in each disjoint
+        contiguous run repeats that run's begin/end. Both tensors must be
+        present together. Other mask types require both tensors to be None.
+
         attention_scale is the absolute model-defined QK^T multiplier.
         """
+        if cutlass.const_expr((block_begin is None) != (block_end is None)):
+            raise ValueError(
+                "block_begin and block_end must be both set or both None"
+            )
+        if cutlass.const_expr(
+            self.mask_type is fmha_utils.MaskEnum.BIDIRECTIONAL
+            and block_begin is None
+        ):
+            raise ValueError(
+                "BIDIRECTIONAL requires block_begin and block_end"
+            )
+        if cutlass.const_expr(
+            self.mask_type is not fmha_utils.MaskEnum.BIDIRECTIONAL
+            and block_begin is not None
+        ):
+            raise ValueError(
+                "block_begin and block_end require MaskEnum.BIDIRECTIONAL"
+            )
+        if cutlass.const_expr(block_begin is not None):
+            if cutlass.const_expr(
+                self.head_dim != 512
+                or q_tensor.element_type != cutlass.Float16
+            ):
+                raise TypeError(
+                    "BIDIRECTIONAL paged FMHA supports FP16 head dimension 512 only"
+                )
+            if cutlass.const_expr(
+                block_begin.element_type != cutlass.Int32
+                or block_end.element_type != cutlass.Int32
+            ):
+                raise TypeError(
+                    "block_begin and block_end must contain Int32 values"
+                )
         scale_softmax = scale_q * scale_k
         if attention_scale != 1.0:
             scale_softmax *= attention_scale
@@ -4387,6 +4474,7 @@ class BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256:
             tma_atom_v, tma_tensor_v,
             tma_atom_o, tma_tensor_o, o,
             None, cum_seqlen_k, lse, kv_cache_page_list,
+            block_begin, block_end,
             scale_softmax_log2, scale_softmax, scale_output,
             _wsl, _wsr,
             q_smem_layout_staged, k_smem_layout_staged,
@@ -4417,6 +4505,8 @@ class BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256:
         cum_seqlen_k: Optional[cute.Tensor],
         mLSE: Optional[cute.Tensor],
         kv_cache_page_list: Optional[cute.Tensor],
+        block_begin: Optional[cute.Tensor],
+        block_end: Optional[cute.Tensor],
         scale_softmax_log2: Float32,
         scale_softmax: Float32,
         scale_output: Float32,
@@ -4842,24 +4932,19 @@ class BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256:
                             tma_bar_ptr=q_handle.barrier,
                         )
 
-                    seqlen_kv_loop_start = fmha_utils.FusedMask.get_trip_start(
-                        self.mask_type,
+                    (
+                        seqlen_kv_loop_start,
+                        seqlen_kv_loop_steps,
+                    ) = self._get_kv_tile_span(
                         curr_block_coord,
-                        self.cta_tiler,
-                        seqlen_q,
-                        seqlen_k,
-                        window_size_left,
-                    )
-                    kv_coord = seqlen_kv_loop_start
-                    seqlen_kv_loop_steps = fmha_utils.FusedMask.get_trip_count(
-                        self.mask_type,
-                        curr_block_coord,
-                        self.cta_tiler,
                         seqlen_q,
                         seqlen_k,
                         window_size_left,
                         window_size_right,
+                        block_begin,
+                        block_end,
                     )
+                    kv_coord = seqlen_kv_loop_start
                     for i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
                         k_handle = load_kv_producer.acquire_and_advance()
                         if cutlass.const_expr(kv_cache_page_list is None):
@@ -5024,14 +5109,14 @@ class BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256:
                         q_handle3 = load_q_consumer.wait_and_advance()
                     s0_handle = mma_s0_producer.acquire_and_advance()
                     s1_handle = mma_s1_producer.acquire_and_advance()
-                    seqlen_kv_loop_steps = fmha_utils.FusedMask.get_trip_count(
-                        self.mask_type,
+                    _, seqlen_kv_loop_steps = self._get_kv_tile_span(
                         curr_block_coord,
-                        self.cta_tiler,
                         seqlen_q,
                         seqlen_k,
                         window_size_left,
                         window_size_right,
+                        block_begin,
+                        block_end,
                     )
                     pv_whether_acc = False
                     num_pairs = seqlen_kv_loop_steps // 2
@@ -5276,6 +5361,8 @@ class BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256:
                 seqlen_q=mQ_qdl.shape[0],
                 cum_seqlen_q=cum_seqlen_q,
                 cum_seqlen_k=cum_seqlen_k,
+                block_begin=block_begin,
+                block_end=block_end,
                 scale_softmax_log2=scale_softmax_log2,
                 qk_thr_mma=qk_thr_mma,
                 tStS=tStS,
@@ -5365,14 +5452,14 @@ class BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256:
                     if cutlass.const_expr(cum_seqlen_k is not None):
                         cuseqlen_k = cum_seqlen_k[batch_coord]
                         seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
-                    seqlen_kv_loop_steps = fmha_utils.FusedMask.get_trip_count(
-                        self.mask_type,
+                    _, seqlen_kv_loop_steps = self._get_kv_tile_span(
                         curr_block_coord,
-                        self.cta_tiler,
                         seqlen_q,
                         seqlen_k,
                         window_size_left,
                         window_size_right,
+                        block_begin,
+                        block_end,
                     )
 
                     # Tile zero initializes O, so it has no preceding accumulator to
@@ -5557,6 +5644,8 @@ class BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256:
         scale_softmax_log2: Float32,
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
+        block_begin_q: Optional[Int32],
+        block_end_q: Optional[Int32],
         mma_si_consumer: pipeline.PipelineConsumer,
         si_corr_producer: pipeline.PipelineProducer,
         atom_args: tuple,
@@ -5606,6 +5695,8 @@ class BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256:
             window_size_left,
             window_size_right,
             assume_fragment_single_row=self.is_fragment_single_row,
+            bidirectional_begin=block_begin_q,
+            bidirectional_end=block_end_q,
         )
 
         old_row_max = row_max
@@ -5689,6 +5780,8 @@ class BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256:
         seqlen_q: Int32,
         cum_seqlen_q: Optional[cute.Tensor],
         cum_seqlen_k: Optional[cute.Tensor],
+        block_begin: Optional[cute.Tensor],
+        block_end: Optional[cute.Tensor],
         scale_softmax_log2: Float32,
         qk_thr_mma: cute.ThrMma,
         tStS: cute.Tensor,
@@ -5772,6 +5865,9 @@ class BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256:
             thr_tmem_store_vec0.partition_D(tStS_vec0),
             thr_tmem_store0.partition_D(tStS_p0),
         )
+        # Ld32x32b assigns one score row to each softmax thread. Reuse that
+        # row coordinate to load its bidirectional interval once per tile.
+        thread_row = thr_tmem_load0.partition_D(tScS)[0][0]
 
         tiled_tmem_load1 = tcgen05.make_tmem_copy(tmem_load_atom, tStS1)
         thr_tmem_load1 = tiled_tmem_load1.get_slice(thread_idx)
@@ -5820,23 +5916,26 @@ class BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256:
                     seqlen_k_ = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
                 row_max = -Float32.inf
                 row_sum = 0.0
-                start_count = fmha_utils.FusedMask.get_trip_start(
-                    self.mask_type,
+                start_count, trip_count = self._get_kv_tile_span(
                     curr_block_coord,
-                    self.cta_tiler,
-                    seqlen_q_,
-                    seqlen_k_,
-                    window_size_left,
-                )
-                trip_count = fmha_utils.FusedMask.get_trip_count(
-                    self.mask_type,
-                    curr_block_coord,
-                    self.cta_tiler,
                     seqlen_q_,
                     seqlen_k_,
                     window_size_left,
                     window_size_right,
+                    block_begin,
+                    block_end,
                 )
+                block_begin_q = None
+                block_end_q = None
+                if cutlass.const_expr(block_begin is not None):
+                    query_row = (
+                        curr_block_coord[0] * self.cta_tiler[0] + thread_row
+                    )
+                    block_begin_q = Int32(0)
+                    block_end_q = Int32(-1)
+                    if query_row < seqlen_q_:
+                        block_begin_q = block_begin[batch_coord, query_row]
+                        block_end_q = block_end[batch_coord, query_row]
                 cS = cute.domain_offset(
                     (curr_block_coord[0] * self.cta_tiler[0], 0), cS_base
                 )
@@ -5860,6 +5959,8 @@ class BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256:
                         scale_softmax_log2,
                         window_size_left,
                         window_size_right,
+                        block_begin_q,
+                        block_end_q,
                         mma_s0_consumer,
                         s0_corr_producer,
                         atom_args0,
@@ -5882,6 +5983,8 @@ class BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256:
                         scale_softmax_log2,
                         window_size_left,
                         window_size_right,
+                        block_begin_q,
+                        block_end_q,
                         mma_s1_consumer,
                         s1_corr_producer,
                         atom_args1,
@@ -5907,6 +6010,8 @@ class BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256:
                         scale_softmax_log2,
                         window_size_left,
                         window_size_right,
+                        block_begin_q,
+                        block_end_q,
                         mma_s0_consumer,
                         s0_corr_producer,
                         atom_args0,
@@ -6706,6 +6811,7 @@ def run(
     vit_mode: bool = False,
     enable_skip_correction: bool = True,
     paged_kv: bool = False,
+    bidirectional: bool = False,
     skip_softmax_threshold: Optional[float] = None,
     load_qkv: Optional[str] = None,
     prefill_test_rounds: int = 3,
@@ -6768,6 +6874,9 @@ def run(
     :type skip_ref_check: bool
     :param use_cold_l2: Whether to use circular buffer strategy to ensure cold L2 cache
     :type use_cold_l2: bool
+    :param bidirectional: Whether to union the causal/sliding mask with the
+        per-row inclusive block interval.
+    :type bidirectional: bool
 
     :raises ValueError: If input shapes are incompatible or head dimension is unsupported
     :raises RuntimeError: If GPU is unavailable for computation
@@ -6785,7 +6894,7 @@ def run(
             f"mma_tiler_mn={mma_tiler_mn}, persistent={is_persistent}, "
             f"bottom_right_align={bottom_right_align}, "
             f"sliding_window={window_size[0] != -1}, "
-            f"paged_kv={paged_kv}")
+            f"paged_kv={paged_kv}, bidirectional={bidirectional}")
     else:
         print(f"{_tag} Running Blackwell SM100 FMHA test with:")
         print(f"{_tag}   q_shape={q_shape}, k_shape={k_shape}")
@@ -6872,6 +6981,17 @@ def run(
             raise ValueError("head dimension 512 supports LLM prefill only")
         if mma_tiler_mn != (128, 128):
             raise ValueError("head dimension 512 requires mma_tiler_mn=(128, 128)")
+    if bidirectional:
+        if d != 512 or not paged_kv:
+            raise ValueError(
+                "bidirectional requires head dimension 512 with paged KV"
+            )
+        if in_dtype != cutlass.Float16 or out_dtype != cutlass.Float16:
+            raise ValueError("bidirectional supports FP16 input/output only")
+        if not is_causal or not bottom_right_align:
+            raise ValueError(
+                "bidirectional requires bottom-right-aligned causal attention"
+            )
 
     if qk_acc_dtype not in {Float32}:
         raise ValueError("qk_acc_dtype must be Float32")
@@ -7024,6 +7144,8 @@ def run(
         mask_type = fmha_utils.MaskEnum.WINDOW_MASK_INFERENCE
     elif is_causal:
         mask_type = fmha_utils.MaskEnum.WINDOW_MASK
+    if bidirectional:
+        mask_type = fmha_utils.MaskEnum.BIDIRECTIONAL
 
     s_q_list = s_q if isinstance(s_q, tuple) else [s_q] * b
     s_k_list = s_k if isinstance(s_k, tuple) else [s_k] * b
@@ -7185,6 +7307,12 @@ def run(
             leading_dim=0).mark_compact_shape_dynamic(
                 mode=0, stride_order=(0,))
 
+    def mark_bs_dynamic(tensor):
+        so = (0, 1)
+        return (tensor.mark_compact_shape_dynamic(
+            mode=0, stride_order=so).mark_compact_shape_dynamic(
+                mode=1, stride_order=so))
+
     if vit_mode:
         # ViT: packed [total_S, H, D] with cu_seqlens for ragged batching.
         # For the reference test, total_S = b * s_q, uniform lengths.
@@ -7257,17 +7385,36 @@ def run(
                     mode=0, stride_order=(0, 1, 2)).mark_compact_shape_dynamic(
                         mode=2, stride_order=(0, 1, 2)))
             kv_pool_dyn = mark_kv_pool_dynamic(kv_pool_tensor)
-            # d256 class has no optional skip trailing args; d64/d128 does.
-            _paged_trailing = (() if isinstance(
-                fmha, BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256)
-                else (None, None, _skip_log2))
-            compiled_fmha = cute.compile(
-                fmha.__call_paged__,
-                q_dyn, kv_pool_dyn, page_list_tensor, o_dyn,
-                cu_kv_seqlens, _wsl, scale_softmax, scale_q, scale_k,
-                scale_v, inv_scale_o, _sm_count, current_stream,
-                *_paged_trailing,
-            )
+            block_begin_dyn = None
+            block_end_dyn = None
+            if bidirectional:
+                # LLM D512 AOT trace inputs; their values are placeholders,
+                # while the tensors become runtime ABI arguments.
+                block_begin_cp = cp.full((b, s_q), -1, dtype=cp.int32)
+                block_end_cp = cp.full((b, s_q), -1, dtype=cp.int32)
+                block_begin_dyn = mark_bs_dynamic(
+                    from_dlpack(block_begin_cp, assumed_align=16)
+                )
+                block_end_dyn = mark_bs_dynamic(
+                    from_dlpack(block_end_cp, assumed_align=16)
+                )
+            if isinstance(
+                fmha, BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256
+            ):
+                compiled_fmha = cute.compile(
+                    fmha.__call_paged__,
+                    q_dyn, kv_pool_dyn, page_list_tensor, o_dyn, cu_kv_seqlens,
+                    block_begin_dyn, block_end_dyn, _wsl, scale_softmax,
+                    scale_q, scale_k, scale_v, inv_scale_o, _sm_count,
+                    current_stream,
+                )
+            else:
+                compiled_fmha = cute.compile(
+                    fmha.__call_paged__,
+                    q_dyn, kv_pool_dyn, page_list_tensor, o_dyn, cu_kv_seqlens,
+                    _wsl, scale_softmax, scale_q, scale_k, scale_v, inv_scale_o,
+                    _sm_count, current_stream, None, None, _skip_log2,
+                )
         else:
             kv_dyn = mark_kv_cache_dynamic(kvcache_tensor)
             _trailing = (() if isinstance(
@@ -8169,6 +8316,14 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--bidirectional",
+        action="store_true",
+        help="Compile the FP16 D512 paged BIDIRECTIONAL mask ABI with "
+        "per-row inclusive blockBegin/blockEnd tensors. Each interval is "
+        "unioned with the base causal/sliding mask.",
+    )
+
+    parser.add_argument(
         "--load_qkv",
         type=str,
         default=None,
@@ -8253,6 +8408,7 @@ if __name__ == "__main__":
         vit_mode=args.vit_mode,
         enable_skip_correction=args.enable_skip_correction,
         paged_kv=args.paged_kv,
+        bidirectional=args.bidirectional,
         skip_softmax_threshold=args.skip_softmax_threshold,
         load_qkv=args.load_qkv,
         prefill_test_rounds=args.prefill_test_rounds,

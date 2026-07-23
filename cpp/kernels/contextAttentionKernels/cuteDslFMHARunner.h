@@ -101,7 +101,9 @@ public:
      * NHD [numPages, tokensPerPage, H_kv, D]. This path maps one logical K/V
      * TMA tile to one physical page. The current CuTe DSL variants use a K/V
      * tile width of 128 tokens, so tokensPerPage must be 128 to avoid
-     * multi-page tile stitching or a gather workspace.
+     * multi-page tile stitching or a gather workspace. Setting both block
+     * range pointers selects the FP16 D512 bidirectional-mask variant; mixed
+     * null pointers are invalid.
      *
      * @param qPtr Query [B, S_q, H_q, D]
      * @param pagedKVPoolPtr Paged KV pool [numPages, tokensPerPage, H_kv, D]
@@ -119,12 +121,20 @@ public:
      * @param kScale K dequant scale, ignored when fp8Input=false
      * @param vScale V dequant scale, ignored when fp8Input=false
      * @param isCausal Whether to dispatch a causal or dense non-causal variant
+     * @param skipSoftmaxThresholdLog2 Skip-softmax threshold as log2(lambda), or 0 to disable
+     * @param bidirectionalBlockBegin Optional inclusive bidirectional-block begin positions [B, S_q].
+     * Text/padding rows use -1; every row in a disjoint contiguous vision run
+     * must repeat that run's begin position.
+     * @param bidirectionalBlockEnd Optional inclusive bidirectional-block end positions [B, S_q].
+     * Text/padding rows use -1; every row in a disjoint contiguous vision run
+     * must repeat that run's end position.
      */
     void runPaged(void const* qPtr, void const* pagedKVPoolPtr, int32_t const* kvCachePageList, void* oPtr,
         int32_t const* cuKVSeqLens, int32_t numPages, int32_t maxPagesPerSeq, int32_t tokensPerPage,
         nvinfer1::DataType kvDataType, cudaStream_t stream, float attentionScale, int32_t slidingWindowSize = INT_MAX,
-        bool fp8Input = false, float qScale = 1.0f, float kScale = 1.0f, float vScale = 1.0f, bool isCausal = true,
-        float skipSoftmaxThresholdLog2 = 0.0F);
+        bool fp8Input = false, float qScale = 1.0F, float kScale = 1.0F, float vScale = 1.0F, bool isCausal = true,
+        float skipSoftmaxThresholdLog2 = 0.0F, int32_t const* bidirectionalBlockBegin = nullptr,
+        int32_t const* bidirectionalBlockEnd = nullptr);
 
     /**
      * @brief ViT FMHA: packed varlen separate Q/K/V, bidirectional.
@@ -184,6 +194,9 @@ private:
     static fmha_d128_sw_paged_Kernel_Module_t sLLM_d128_sw_paged;
     static fmha_d256_sw_paged_Kernel_Module_t sLLM_d256_sw_paged;
     static fmha_d512_sw_paged_Kernel_Module_t sLLM_d512_sw_paged;
+
+    // D512 paged bidirectional-mask kernel module (FP16, runtime sliding window)
+    static fmha_d512_paged_bidirectional_Kernel_Module_t sLLM_d512_paged_bidirectional;
 
     // LLM paged KV cache kernel modules (FP8 input, FP16 output)
     static fmha_d64_paged_fp8_Kernel_Module_t sLLM_d64_paged_fp8;

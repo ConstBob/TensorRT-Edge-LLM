@@ -66,6 +66,8 @@ struct LlmFmhaPagedParams
     int32_t const* kvCachePageList{};
     void* oPtr{};
     int32_t const* cuKVSeqLens{};
+    int32_t const* bidirectionalBlockBegin{};
+    int32_t const* bidirectionalBlockEnd{};
     int32_t batchSize{};
     int32_t seqLenQ{};
     int32_t numQHeads{};
