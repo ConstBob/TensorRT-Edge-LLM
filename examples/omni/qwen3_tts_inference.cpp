@@ -48,6 +48,14 @@ struct ParsedInput
     std::vector<std::vector<Message>> requests;
     // Per-request speaker name (parallel to requests). Falls back to top-level "speaker" default.
     std::vector<std::string> requestSpeakers;
+    // Per-request language name (parallel to requests). Falls back to top-level "language" default.
+    // Empty / "auto" keeps the no-language prefill; see TalkerGenerationRequest::languageName.
+    std::vector<std::string> requestLanguages;
+    // Per-request instruction text (parallel to requests). Falls back to top-level "instruct".
+    std::vector<std::string> requestInstructs;
+    // Per-request voice-clone reference audio/transcript (Base checkpoints).
+    std::vector<std::string> requestRefAudios;
+    std::vector<std::string> requestRefTexts;
     bool applyChatTemplate{true};
     bool addGenerationPrompt{true};
     bool enableThinking{false};
@@ -55,7 +63,14 @@ struct ParsedInput
     int32_t talkerTopK{50};
     float talkerTopP{1.0f};
     float repetitionPenalty{1.05f};
+    float subtalkerTemperature{0}; // 0 = runtime default (HF code_predictor.generate values)
+    int32_t subtalkerTopK{0};
+    float subtalkerTopP{0};
     std::string speakerName{""};
+    std::string languageName{""};
+    std::string instructText{""};
+    std::string refAudioPath{""};
+    std::string refText{""};
     int32_t maxAudioLength{4096};
     int32_t batchSize{1}; //!< Number of requests bundled per Talker/CodePredictor call.
 };
@@ -90,7 +105,14 @@ ParsedInput parseInputFile(std::filesystem::path const& inputFilePath, int32_t b
     result.talkerTopK = inputData.value("talker_top_k", 50);
     result.talkerTopP = inputData.value("talker_top_p", 1.0f);
     result.repetitionPenalty = inputData.value("repetition_penalty", 1.05f);
+    result.subtalkerTemperature = inputData.value("subtalker_temperature", 0.0f);
+    result.subtalkerTopK = inputData.value("subtalker_top_k", 0);
+    result.subtalkerTopP = inputData.value("subtalker_top_p", 0.0f);
     result.speakerName = inputData.value("speaker", "");
+    result.languageName = inputData.value("language", "");
+    result.instructText = inputData.value("instruct", "");
+    result.refAudioPath = inputData.value("ref_audio", "");
+    result.refText = inputData.value("ref_text", "");
     result.maxAudioLength = inputData.value("max_audio_length", 4096);
 
     check::check(
@@ -106,6 +128,10 @@ ParsedInput parseInputFile(std::filesystem::path const& inputFilePath, int32_t b
             "Each request must contain a 'messages' array");
 
         std::string requestSpeaker = requestItem.value("speaker", result.speakerName);
+        std::string requestLanguage = requestItem.value("language", result.languageName);
+        std::string requestInstruct = requestItem.value("instruct", result.instructText);
+        std::string requestRefAudio = requestItem.value("ref_audio", result.refAudioPath);
+        std::string requestRefText = requestItem.value("ref_text", result.refText);
 
         auto const& messagesArray = requestItem["messages"];
         check::check(messagesArray.size() <= limits::security::kMaxMessagesPerRequest,
@@ -147,6 +173,10 @@ ParsedInput parseInputFile(std::filesystem::path const& inputFilePath, int32_t b
         }
         result.requests.push_back(std::move(messages));
         result.requestSpeakers.push_back(std::move(requestSpeaker));
+        result.requestLanguages.push_back(std::move(requestLanguage));
+        result.requestInstructs.push_back(std::move(requestInstruct));
+        result.requestRefAudios.push_back(std::move(requestRefAudio));
+        result.requestRefTexts.push_back(std::move(requestRefText));
     }
 
     return result;
@@ -167,7 +197,8 @@ enum Qwen3TTSOptionId : int
     BATCH_SIZE = 912,
     TOKENIZER_DIR = 915,
     STREAMING = 916,
-    CHUNK_FRAMES = 917
+    CHUNK_FRAMES = 917,
+    CLONE_ENCODER_DIR = 918
 };
 
 struct Qwen3TTSInferenceArgs
@@ -175,6 +206,7 @@ struct Qwen3TTSInferenceArgs
     bool help{false};
     std::string talkerEngineDir{""};
     std::string code2wavEngineDir{""};
+    std::string cloneEncoderDir{""};
     std::string tokenizerDir{""};
     std::string inputFile;
     std::string outputFile{""};
@@ -196,6 +228,7 @@ void printUsage(char const* programName)
               << "  --inputFile=<path>           Path to input JSON file (text messages only)\n"
               << "  --talkerEngineDir=<path>     Path to Talker engine directory\n"
               << "  --code2wavEngineDir=<path>   Path to Code2Wav engine directory\n"
+              << "  --cloneEncoderDir=<path>     Voice-clone reference encoder engines (Base checkpoints)\n"
               << "  --tokenizerDir=<path>        Path to tokenizer directory\n"
               << "                               Defaults to --talkerEngineDir/../\n"
               << "  --outputFile=<path>          Path to output JSON file\n"
@@ -219,6 +252,7 @@ bool parseArgs(Qwen3TTSInferenceArgs& args, int argc, char* argv[])
         {"talkerEngineDir", required_argument, 0, Qwen3TTSOptionId::TALKER_ENGINE_DIR},
         {"code2wavEngineDir", required_argument, 0, Qwen3TTSOptionId::CODE2WAV_ENGINE_DIR},
         {"tokenizerDir", required_argument, 0, Qwen3TTSOptionId::TOKENIZER_DIR},
+        {"cloneEncoderDir", required_argument, 0, Qwen3TTSOptionId::CLONE_ENCODER_DIR},
         {"outputFile", required_argument, 0, Qwen3TTSOptionId::OUTPUT_FILE},
         {"outputAudioDir", required_argument, 0, Qwen3TTSOptionId::OUTPUT_AUDIO_DIR},
         {"debug", no_argument, 0, Qwen3TTSOptionId::DEBUG},
@@ -238,6 +272,7 @@ bool parseArgs(Qwen3TTSInferenceArgs& args, int argc, char* argv[])
         case Qwen3TTSOptionId::INPUT_FILE: args.inputFile = optarg; break;
         case Qwen3TTSOptionId::TALKER_ENGINE_DIR: args.talkerEngineDir = optarg; break;
         case Qwen3TTSOptionId::CODE2WAV_ENGINE_DIR: args.code2wavEngineDir = optarg; break;
+        case Qwen3TTSOptionId::CLONE_ENCODER_DIR: args.cloneEncoderDir = optarg; break;
         case Qwen3TTSOptionId::TOKENIZER_DIR: args.tokenizerDir = optarg; break;
         case Qwen3TTSOptionId::OUTPUT_FILE: args.outputFile = optarg; break;
         case Qwen3TTSOptionId::OUTPUT_AUDIO_DIR: args.outputAudioDir = optarg; break;
@@ -340,7 +375,7 @@ int main(int argc, char** argv)
         std::filesystem::path const codePredictorDir
             = std::filesystem::path(args.talkerEngineDir).parent_path() / "code_predictor";
         ttsRuntime = std::make_unique<rt::Qwen3OmniTTSRuntime>(
-            args.talkerEngineDir, codePredictorDir.string(), args.tokenizerDir, stream);
+            args.talkerEngineDir, codePredictorDir.string(), args.tokenizerDir, args.cloneEncoderDir, stream);
         LOG_INFO("TTS runtime initialized");
     }
     catch (std::exception const& e)
@@ -453,10 +488,17 @@ int main(int argc, char** argv)
             talkerReq.talkerTopK = input.talkerTopK;
             talkerReq.talkerTopP = input.talkerTopP;
             talkerReq.repetitionPenalty = input.repetitionPenalty;
+            talkerReq.subtalkerTemperature = input.subtalkerTemperature;
+            talkerReq.subtalkerTopK = input.subtalkerTopK;
+            talkerReq.subtalkerTopP = input.subtalkerTopP;
             talkerReq.applyChatTemplate = input.applyChatTemplate;
             talkerReq.addGenerationPrompt = input.addGenerationPrompt;
             talkerReq.enableThinking = input.enableThinking;
             talkerReq.speakerName = input.requestSpeakers[requestIdx];
+            talkerReq.languageName = input.requestLanguages[requestIdx];
+            talkerReq.instructText = input.requestInstructs[requestIdx];
+            talkerReq.refAudioPath = input.requestRefAudios[requestIdx];
+            talkerReq.refText = input.requestRefTexts[requestIdx];
             talkerReq.maxAudioLength = input.maxAudioLength;
             talkerReq.messages = input.requests[requestIdx];
 

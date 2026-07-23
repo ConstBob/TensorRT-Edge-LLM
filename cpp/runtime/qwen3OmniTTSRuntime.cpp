@@ -16,6 +16,7 @@
  */
 
 #include "qwen3OmniTTSRuntime.h"
+
 #include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
@@ -24,6 +25,9 @@
 #include "common/stringUtils.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
 #include "kernels/talkerMLPKernels/talkerMLPKernels.h"
+#include "multimodal/cloneEncoderRunner.h"
+#include "runtime/audioLoader.h"
+
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -36,6 +40,7 @@
 #include "profiling/timer.h"
 #include "sampler/sampling.h"
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cuda_runtime.h>
@@ -138,7 +143,7 @@ struct ChunkEmitter
 } // anonymous namespace
 
 Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
-    std::string const& tokenizerDir, cudaStream_t stream)
+    std::string const& tokenizerDir, std::string const& cloneEncoderDir, cudaStream_t stream)
     : mStream(stream)
 {
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::init", nvtx_colors::YELLOW);
@@ -245,6 +250,44 @@ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std
         mTalkerConfig.numCodeGroups);
 
     initializeTTSEmbeddings(stream);
+
+    // Prefill row builder for non-fused layouts (instruction segments, VoiceDesign
+    // no-speaker prefixes). Configured after embeddings/tables are resident.
+    {
+        int64_t const maxRows = mTalkerLLMConfig.maxSupportedInputLength;
+        int64_t const stagingBytes = maxRows * static_cast<int64_t>(sizeof(kernel::PrefillRowDesc));
+        mPrefillRows.reserve(maxRows);
+        mPrefillDescsHost
+            = rt::Tensor({stagingBytes}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT8, "prefillDescsHost");
+        mPrefillDescsDevice
+            = rt::Tensor({stagingBytes}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8, "prefillDescsDevice");
+    }
+
+    // Voice clone workspace (Base checkpoints): x-vector slot, reference codes/frame sums for
+    // the ICL prefill, and the per-group embedding-table pointer array for the sum kernel.
+    {
+        constexpr int64_t kMaxRefFrames = 512; // ~40s reference audio at 12.5 Hz
+        int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
+        mVoiceCloneXVector = rt::Tensor({hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "cloneXVector");
+        mIclFrameSumBuffer
+            = rt::Tensor({kMaxRefFrames, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "iclFrameSums");
+
+        std::vector<void const*> tablePtrs(mTalkerConfig.numCodeGroups);
+        tablePtrs[0] = mTalkerEmbeddingTable.rawPointer();
+        for (int32_t g = 1; g < mTalkerConfig.numCodeGroups; ++g)
+        {
+            tablePtrs[g] = mCodePredictorEmbeddingTables[g - 1].rawPointer();
+        }
+        mIclTablePtrsGpu = rt::Tensor({static_cast<int64_t>(tablePtrs.size() * sizeof(void*))}, rt::DeviceType::kGPU,
+            nvinfer1::DataType::kINT8, "iclTablePtrs");
+        CUDA_CHECK(cudaMemcpyAsync(mIclTablePtrsGpu.rawPointer(), tablePtrs.data(), tablePtrs.size() * sizeof(void*),
+            cudaMemcpyHostToDevice, stream));
+    }
+
+    if (!cloneEncoderDir.empty())
+    {
+        mCloneEncoders = std::make_unique<CloneEncoderRunner>(cloneEncoderDir, stream);
+    }
 
     CUDA_CHECK(cudaEventCreateWithFlags(&mTtfaStart, cudaEventDefault));
     CUDA_CHECK(cudaEventCreateWithFlags(&mTtfaEnd, cudaEventDefault));
@@ -416,6 +459,42 @@ bool Qwen3OmniTTSRuntime::validateAndFillConfig(std::string const& talkerEngineD
     else
     {
         mTalkerConfig.codecEosId = configJson["codec_eos_id"].get<int32_t>();
+    }
+
+    // Checkpoint family: custom_voice / voice_design / base; "" for Qwen3-Omni or legacy configs.
+    mTalkerConfig.ttsModelType = configJson.value("tts_model_type", "");
+
+    // CustomVoice language conditioning (optional; absent for Qwen3-Omni checkpoints and
+    // engines exported before language support — resolveLanguageId then always returns -1).
+    mTalkerConfig.codecThinkId = configJson.value("codec_think_id", -1);
+    if (configJson.contains("codec_language_id") && configJson["codec_language_id"].is_object())
+    {
+        for (auto const& [languageName, codecId] : configJson["codec_language_id"].items())
+        {
+            std::string key = languageName;
+            std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return std::tolower(c); });
+            mTalkerConfig.codecLanguageIdMap[key] = codecId.get<int32_t>();
+        }
+        LOG_INFO("Loaded %zu language IDs from config (codec_think_id=%d)", mTalkerConfig.codecLanguageIdMap.size(),
+            mTalkerConfig.codecThinkId);
+    }
+    if (configJson.contains("spk_is_dialect") && configJson["spk_is_dialect"].is_object())
+    {
+        // Values are heterogeneous: JSON false for non-dialect speakers, a dialect-name string
+        // (e.g. "sichuan_dialect") for dialect speakers. Only the strings are kept.
+        for (auto const& [speakerName, dialect] : configJson["spk_is_dialect"].items())
+        {
+            if (dialect.is_string())
+            {
+                std::string key = speakerName;
+                std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return std::tolower(c); });
+                mTalkerConfig.spkDialectMap[key] = dialect.get<std::string>();
+            }
+        }
+        if (!mTalkerConfig.spkDialectMap.empty())
+        {
+            LOG_INFO("Loaded %zu dialect speakers from config", mTalkerConfig.spkDialectMap.size());
+        }
     }
 
     // Speaker ID configuration
@@ -988,8 +1067,8 @@ void Qwen3OmniTTSRuntime::initializeTTSEmbeddings(cudaStream_t stream)
     LOG_INFO("TTS embeddings initialized");
 }
 
-bool Qwen3OmniTTSRuntime::projectToTalkerInput(
-    rt::Tensor const& thinkerEmbed, int32_t speakerId, rt::Tensor& output, int64_t& outputSeqLen, cudaStream_t stream)
+bool Qwen3OmniTTSRuntime::projectToTalkerInput(rt::Tensor const& thinkerEmbed, int32_t speakerId, int32_t languageId,
+    rt::Tensor& output, int64_t& outputSeqLen, cudaStream_t stream)
 {
     int64_t const seqLen = thinkerEmbed.getShape()[0];
     int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
@@ -997,10 +1076,13 @@ bool Qwen3OmniTTSRuntime::projectToTalkerInput(
 
     // N = text tokens after stripping 3-token role prefix and 5-token suffix
     int64_t const N = seqLen - kAssistantPrefixLen - kAssistantTrailingSuffix;
-    // Non-streaming prefill: 8 fixed prefix rows + N text rows + 2 suffix rows
-    outputSeqLen = kNonStreamingPrefixRows + N + 2; // = seqLen + 2
-    LOG_INFO("projectToTalkerInput: seqLen=%ld, N=%ld (stripped prefix=%d suffix=%d), outputSeqLen=%ld, speakerId=%d",
-        seqLen, N, kAssistantPrefixLen, kAssistantTrailingSuffix, outputSeqLen, speakerId);
+    // Non-streaming prefill: prefix rows (8, or 9 with language) + N text rows + 2 suffix rows
+    int32_t const prefixRows = (languageId >= 0) ? kPrefixRowsWithLanguage : kNonStreamingPrefixRows;
+    outputSeqLen = prefixRows + N + 2; // = seqLen + 2 (+1 with language)
+    LOG_INFO(
+        "projectToTalkerInput: seqLen=%ld, N=%ld (stripped prefix=%d suffix=%d), outputSeqLen=%ld, speakerId=%d, "
+        "languageId=%d, prefixRows=%d",
+        seqLen, N, kAssistantPrefixLen, kAssistantTrailingSuffix, outputSeqLen, speakerId, languageId, prefixRows);
 
     // Project all tokens via text_projection MLP (Qwen3-Omni) or copy directly (Qwen3-Next Omni
     // — Talker's own embed_tokens is already at talker hidden dim).
@@ -1021,7 +1103,8 @@ bool Qwen3OmniTTSRuntime::projectToTalkerInput(
     check::check(output.reshape({outputSeqLen, hiddenSize}), "Tensor reshape failed");
     kernel::invokeAssistantPreamble(mProjectedBuffer, mTtsPadEmbed, mTtsBosEmbed, mTtsEosEmbed, mTalkerEmbeddingTable,
         mTalkerConfig.codecNothinkId, mTalkerConfig.codecThinkBosId, mTalkerConfig.codecThinkEosId, speakerId,
-        mTalkerConfig.codecPadId, mTalkerConfig.codecBosId, static_cast<int32_t>(N), output, stream);
+        mTalkerConfig.codecPadId, mTalkerConfig.codecBosId, mTalkerConfig.codecThinkId, languageId,
+        static_cast<int32_t>(N), output, stream);
 
     return true;
 }
@@ -1337,15 +1420,58 @@ bool Qwen3OmniTTSRuntime::prepareTalkerInput(std::vector<int32_t> const& textTok
         LOG_ERROR("prepareTalkerInput: empty token ID list");
         return false;
     }
-    int64_t const thinkerHiddenSize = mTextEmbeddingTable.getShape()[1];
-    check::check(mGpuTokenIdsBuffer.reshape({1, seqLen}), "Tensor reshape failed");
-    CUDA_CHECK(cudaMemcpyAsync(mGpuTokenIdsBuffer.rawPointer(), textTokenIds.data(), seqLen * sizeof(int32_t),
-        cudaMemcpyHostToDevice, stream));
-    check::check(mThinkerEmbedBuffer.reshape({1, seqLen, thinkerHiddenSize}), "Tensor reshape failed");
-    kernel::embeddingLookup(mGpuTokenIdsBuffer, mTextEmbeddingTable, std::nullopt, mThinkerEmbedBuffer, stream);
-    check::check(mThinkerEmbedBuffer.reshape({seqLen, thinkerHiddenSize}), "Tensor reshape failed");
 
-    // Determine speaker ID
+    bool const isVoiceDesign = (mTalkerConfig.ttsModelType == "voice_design");
+
+    // Voice clone prompt (Base checkpoints): load per request; iclFrames > 0 selects ICL mode.
+    bool const hasClonePrompt = !request.refAudioPath.empty();
+    int32_t iclFrames = 0;
+    if (hasClonePrompt)
+    {
+        if (!encodeVoiceCloneReference(request.refAudioPath, request.refText, iclFrames, stream))
+        {
+            return false;
+        }
+    }
+    bool const iclMode = (iclFrames > 0);
+    // PyTorch strips the assistant wrap from the reference transcript: ref_ids[:, 3:-2].
+    // The stripped range is consumed as iterators below — no intermediate copy.
+    if (iclMode)
+    {
+        check::check(static_cast<int64_t>(mIclRefTextIds.size()) > 5, "voice clone ref_text_ids too short");
+    }
+    int64_t const refLen = iclMode ? static_cast<int64_t>(mIclRefTextIds.size()) - 5 : 0;
+
+    // Instruction control: wrap as a user turn (matches PyTorch _build_instruct_text) and
+    // prepend its token IDs so the whole sequence shares one embed+projection pass.
+    std::vector<int32_t> instructIds;
+    if (!request.instructText.empty())
+    {
+        std::string const wrapped = "<|im_start|>user\n" + request.instructText + "<|im_end|>\n";
+        instructIds = mTokenizer->encode(wrapped);
+    }
+    int64_t const instructLen = static_cast<int64_t>(instructIds.size());
+
+    // Projection layout: [instruct K][main text seqLen][ref transcript refLen].
+    std::vector<int32_t> combinedIds;
+    combinedIds.reserve(instructLen + seqLen + refLen);
+    combinedIds.insert(combinedIds.end(), instructIds.begin(), instructIds.end());
+    combinedIds.insert(combinedIds.end(), textTokenIds.begin(), textTokenIds.end());
+    if (refLen > 0)
+    {
+        combinedIds.insert(combinedIds.end(), mIclRefTextIds.begin() + 3, mIclRefTextIds.end() - 2);
+    }
+    int64_t const combinedLen = static_cast<int64_t>(combinedIds.size());
+
+    int64_t const thinkerHiddenSize = mTextEmbeddingTable.getShape()[1];
+    check::check(mGpuTokenIdsBuffer.reshape({1, combinedLen}), "Tensor reshape failed");
+    CUDA_CHECK(cudaMemcpyAsync(mGpuTokenIdsBuffer.rawPointer(), combinedIds.data(), combinedLen * sizeof(int32_t),
+        cudaMemcpyHostToDevice, stream));
+    check::check(mThinkerEmbedBuffer.reshape({1, combinedLen, thinkerHiddenSize}), "Tensor reshape failed");
+    kernel::embeddingLookup(mGpuTokenIdsBuffer, mTextEmbeddingTable, std::nullopt, mThinkerEmbedBuffer, stream);
+    check::check(mThinkerEmbedBuffer.reshape({combinedLen, thinkerHiddenSize}), "Tensor reshape failed");
+
+    // Determine speaker ID (unused for VoiceDesign — its prefix has no speaker row).
     int32_t speakerId = mTalkerConfig.defaultSpeakerId;
     if (request.speakerId >= 0)
     {
@@ -1356,13 +1482,136 @@ bool Qwen3OmniTTSRuntime::prepareTalkerInput(std::vector<int32_t> const& textTok
         speakerId = getSpeakerIdByName(request.speakerName);
     }
 
-    // MLP projection: thinker embed → talker input embeds (non-streaming, outputSeqLen = seqLen + 2)
+    // CustomVoice language conditioning: -1 keeps the historical no-language prefill.
+    int32_t const languageId = resolveLanguageId(request.languageName, request.speakerName);
+
     int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
-    if (!projectToTalkerInput(mThinkerEmbedBuffer, speakerId, mTalkerInputEmbeds, outSeqLen, stream))
+    if (instructLen == 0 && !isVoiceDesign && !hasClonePrompt)
     {
-        LOG_ERROR("MLP projection failed");
-        return false;
+        // Fast path: fused fixed-layout kernel (byte-identical historical behavior).
+        if (!projectToTalkerInput(mThinkerEmbedBuffer, speakerId, languageId, mTalkerInputEmbeds, outSeqLen, stream))
+        {
+            LOG_ERROR("MLP projection failed");
+            return false;
+        }
     }
+    else
+    {
+        // Builder path: instruction segment / VoiceDesign no-speaker prefix / voice clone.
+        check::check(mProjectedBuffer.reshape({combinedLen, hiddenSize}), "Tensor reshape failed");
+        check::check(mMLPWorkspace.reshape({combinedLen, thinkerHiddenSize}), "Tensor reshape failed");
+        kernel::invokeTalkerMLP(mThinkerEmbedBuffer, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias,
+            mProjectedBuffer, mMLPWorkspace, stream);
+
+        // N = text tokens after stripping the 3-token role prefix and 5-token suffix.
+        int64_t const N = seqLen - kAssistantPrefixLen - kAssistantTrailingSuffix;
+        check::check(N > 0, "prepareTalkerInput: text too short after prefix/suffix strip");
+
+        half const* projBase = static_cast<half const*>(mProjectedBuffer.rawPointer());
+        half const* ttsPad = static_cast<half const*>(mTtsPadEmbed.rawPointer());
+        half const* ttsBos = static_cast<half const*>(mTtsBosEmbed.rawPointer());
+        half const* ttsEos = static_cast<half const*>(mTtsEosEmbed.rawPointer());
+
+        mPrefillRows.clear();
+        // Instruct segment: pure text-projected rows (no codec addend).
+        for (int64_t i = 0; i < instructLen; ++i)
+        {
+            pushPrefillRow(projBase + i * hiddenSize, nullptr);
+        }
+        // Role prefix rows: projected[instructLen .. instructLen+3) copied as-is.
+        for (int64_t i = 0; i < kAssistantPrefixLen; ++i)
+        {
+            pushPrefillRow(projBase + (instructLen + i) * hiddenSize, nullptr);
+        }
+        // Think block: 3 rows without language, 4 with (language row before think-eos).
+        bool const hasLanguage = (languageId >= 0);
+        check::check(!hasLanguage || mTalkerConfig.codecThinkId >= 0,
+            "prepareTalkerInput: language requested but codec_think_id unavailable");
+        pushPrefillRow(ttsPad, talkerEmbRow(hasLanguage ? mTalkerConfig.codecThinkId : mTalkerConfig.codecNothinkId));
+        pushPrefillRow(ttsPad, talkerEmbRow(mTalkerConfig.codecThinkBosId));
+        if (hasLanguage)
+        {
+            pushPrefillRow(ttsPad, talkerEmbRow(languageId));
+        }
+        pushPrefillRow(ttsPad, talkerEmbRow(mTalkerConfig.codecThinkEosId));
+        // Speaker row: continuous x-vector for voice clone, codec token for CustomVoice,
+        // omitted entirely for VoiceDesign (speaker_embed is None in the PyTorch reference).
+        if (hasClonePrompt)
+        {
+            pushPrefillRow(ttsPad, static_cast<half const*>(mVoiceCloneXVector.rawPointer()));
+        }
+        else if (!isVoiceDesign)
+        {
+            pushPrefillRow(ttsPad, talkerEmbRow(speakerId));
+        }
+        pushPrefillRow(ttsBos, talkerEmbRow(mTalkerConfig.codecPadId));
+
+        if (iclMode)
+        {
+            // ICL segment replaces the standard text/suffix rows. Uses the overlapped-add
+            // layout from PyTorch generate_icl_prompt's default (streaming) branch — the
+            // sequential non-streaming variant drifts badly in the reference implementation
+            // itself (hundreds of frames for a one-sentence target). Row i pairs the text-side
+            // row (ref transcript, main text, tts_eos, then tts_pad padding) with the
+            // codec-side row (codec_bos, then per-frame summed reference codec embeddings).
+            int64_t const textLens = refLen + N + 1;
+            int64_t const codecLens = 1 + iclFrames;
+            check::check(textLens <= codecLens,
+                "ICL target text (" + std::to_string(textLens) + " rows) exceeds reference codes ("
+                    + std::to_string(codecLens)
+                    + " rows); streaming text feed-in is not supported yet — use a longer reference or "
+                      "x-vector-only mode");
+            half const* frameSums = static_cast<half const*>(mIclFrameSumBuffer.rawPointer());
+            for (int64_t i = 0; i < codecLens; ++i)
+            {
+                half const* textRow;
+                if (i < refLen)
+                {
+                    textRow = projBase + (instructLen + seqLen + i) * hiddenSize;
+                }
+                else if (i < refLen + N)
+                {
+                    textRow = projBase + (instructLen + kAssistantPrefixLen + (i - refLen)) * hiddenSize;
+                }
+                else if (i == textLens - 1)
+                {
+                    textRow = ttsEos;
+                }
+                else
+                {
+                    textRow = ttsPad;
+                }
+                half const* codecRow
+                    = (i == 0) ? talkerEmbRow(mTalkerConfig.codecBosId) : frameSums + (i - 1) * hiddenSize;
+                pushPrefillRow(textRow, codecRow);
+            }
+        }
+        else
+        {
+            // Text rows: projected text + codec_pad, last row pairs codec_bos; then suffix.
+            for (int64_t i = 0; i < N; ++i)
+            {
+                int32_t const codecId = (i == N - 1) ? mTalkerConfig.codecBosId : mTalkerConfig.codecPadId;
+                pushPrefillRow(projBase + (instructLen + kAssistantPrefixLen + i) * hiddenSize, talkerEmbRow(codecId));
+            }
+            pushPrefillRow(ttsEos, talkerEmbRow(mTalkerConfig.codecPadId));
+            pushPrefillRow(ttsPad, talkerEmbRow(mTalkerConfig.codecBosId));
+        }
+
+        outSeqLen = static_cast<int64_t>(mPrefillRows.size());
+        check::check(mTalkerInputEmbeds.reshape({outSeqLen, hiddenSize}), "Tensor reshape failed");
+        flushPrefillRows(mTalkerInputEmbeds, stream);
+        LOG_INFO(
+            "prepareTalkerInput (builder): instruct=%ld, N=%ld, languageId=%d, voiceDesign=%d, clone=%d, "
+            "iclFrames=%d, outputSeqLen=%ld",
+            instructLen, N, languageId, isVoiceDesign ? 1 : 0, hasClonePrompt ? 1 : 0, iclFrames, outSeqLen);
+    }
+
+    // Guard the workspace bound (mTalkerInputEmbeds slots are strided by maxSupportedInputLength
+    // for batched prefill; instruct/language rows extend outputSeqLen beyond seqLen + 2).
+    check::check(outSeqLen <= mTalkerLLMConfig.maxSupportedInputLength,
+        "Talker prefill length " + std::to_string(outSeqLen) + " exceeds engine maxInputLen "
+            + std::to_string(mTalkerLLMConfig.maxSupportedInputLength));
 
     // Reshape buffers to 3D [1, seqLen, H] for Talker LLM input
     check::check(mTalkerInputEmbeds.reshape({1, outSeqLen, hiddenSize}), "Tensor reshape failed");
@@ -1394,11 +1643,15 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
 
     SamplingParams talkerSamplingParams(
         activeBatchSize, mTalkerConfig.talkerVocabSize, talkerTemperature, talkerTopK, talkerTopP);
-    // CP sampling params come from HF's hardcoded ``code_predictor.generate``
-    // defaults; see ``kCPSamplingTemperature`` / ``kCPSamplingTopK`` /
-    // ``kCPSamplingTopP`` in qwen3OmniTTSRuntime.h for the source-code links.
+    // Sub-talker (CodePredictor) sampling: per-request override, defaulting to HF's
+    // hardcoded ``code_predictor.generate`` values (kCPSampling*; they do NOT inherit
+    // the talker request values).
+    float const subtalkerTemperature
+        = (req0.subtalkerTemperature > 0) ? req0.subtalkerTemperature : kCPSamplingTemperature;
+    int32_t const subtalkerTopK = (req0.subtalkerTopK > 0) ? req0.subtalkerTopK : kCPSamplingTopK;
+    float const subtalkerTopP = (req0.subtalkerTopP > 0) ? req0.subtalkerTopP : kCPSamplingTopP;
     SamplingParams predictorSamplingParams(
-        1, mTalkerConfig.codebookSize, kCPSamplingTemperature, kCPSamplingTopK, kCPSamplingTopP);
+        1, mTalkerConfig.codebookSize, subtalkerTemperature, subtalkerTopK, subtalkerTopP);
     SamplingParams singleSamplingParams(1, mTalkerConfig.talkerVocabSize, talkerTemperature, talkerTopK, talkerTopP);
 
     // Build per-batch Talker prefill embeddings into mTalkerInputEmbeds, then run a single
@@ -2439,6 +2692,151 @@ int32_t Qwen3OmniTTSRuntime::getSpeakerIdByName(std::string const& speakerName) 
     return mTalkerConfig.defaultSpeakerId;
 }
 
+half const* Qwen3OmniTTSRuntime::talkerEmbRow(int32_t tokenId) const
+{
+    return static_cast<half const*>(mTalkerEmbeddingTable.rawPointer())
+        + static_cast<int64_t>(tokenId) * mTalkerConfig.talkerHiddenSize;
+}
+
+void Qwen3OmniTTSRuntime::pushPrefillRow(half const* srcA, half const* srcB)
+{
+    check::check(srcA != nullptr, "pushPrefillRow: null srcA");
+    mPrefillRows.push_back({srcA, srcB});
+}
+
+int64_t Qwen3OmniTTSRuntime::flushPrefillRows(rt::Tensor& output, cudaStream_t stream)
+{
+    int64_t const numRows = static_cast<int64_t>(mPrefillRows.size());
+    check::check(numRows > 0, "flushPrefillRows: no rows queued");
+    int64_t const bytes = numRows * static_cast<int64_t>(sizeof(kernel::PrefillRowDesc));
+    check::check(bytes <= static_cast<int64_t>(mPrefillDescsHost.getMemoryCapacity()),
+        "flushPrefillRows: " + std::to_string(numRows) + " rows exceed staging capacity");
+    std::memcpy(mPrefillDescsHost.rawPointer(), mPrefillRows.data(), bytes);
+    CUDA_CHECK(cudaMemcpyAsync(
+        mPrefillDescsDevice.rawPointer(), mPrefillDescsHost.rawPointer(), bytes, cudaMemcpyHostToDevice, stream));
+    kernel::invokePrefillRowAssemble(reinterpret_cast<kernel::PrefillRowDesc const*>(mPrefillDescsDevice.rawPointer()),
+        static_cast<int32_t>(numRows), static_cast<int32_t>(mTalkerConfig.talkerHiddenSize), output, stream);
+    return numRows;
+}
+
+bool Qwen3OmniTTSRuntime::encodeVoiceCloneReference(
+    std::string const& refAudioPath, std::string const& refText, int32_t& iclFrames, cudaStream_t stream)
+{
+    iclFrames = 0;
+    if (mCloneEncoders == nullptr)
+    {
+        LOG_ERROR("Voice clone requested but no clone encoder engines loaded (pass --cloneEncoderDir)");
+        return false;
+    }
+
+    audio::AudioPCM pcm;
+    if (!audio::loadAudioFile(refAudioPath, /*targetSampleRate=*/24000, pcm))
+    {
+        LOG_ERROR("Failed to load reference audio: %s", refAudioPath.c_str());
+        return false;
+    }
+
+    int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
+    check::check(mCloneEncoders->speakerEmbeddingDim() == hiddenSize, "speaker encoder dim != talker hidden");
+    if (!mCloneEncoders->extractSpeakerEmbedding(pcm.samples, mVoiceCloneXVector, stream))
+    {
+        return false;
+    }
+
+    mIclRefTextIds.clear();
+    if (refText.empty())
+    {
+        return true; // x-vector-only mode
+    }
+    check::check(
+        mCloneEncoders->hasTokenizerEncoder() && mCloneEncoders->numQuantizers() == mTalkerConfig.numCodeGroups,
+        "ICL cloning needs speech_tokenizer_encoder.engine with matching code groups");
+
+    int32_t numFrames = 0;
+    if (!mCloneEncoders->encodeReferenceCodes(pcm.samples, numFrames, stream))
+    {
+        return false;
+    }
+    // Capacity check must not depend on the current shape — a previous request may have
+    // reshaped the buffer to fewer rows.
+    int64_t const maxRefFrames
+        = static_cast<int64_t>(mIclFrameSumBuffer.getMemoryCapacity()) / (hiddenSize * sizeof(__half));
+    check::check(numFrames <= maxRefFrames,
+        "reference frames " + std::to_string(numFrames) + " exceed ICL workspace capacity "
+            + std::to_string(maxRefFrames));
+
+    // Per-frame sum across all code groups (group 0 = talker table, 1.. = CodePredictor tables).
+    check::check(mIclFrameSumBuffer.reshape({numFrames, hiddenSize}), "Tensor reshape failed");
+    // Sum kernel consumes the codec-encoder engine output in place (INT64, still on device).
+    kernel::invokeSumCodecEmbeddings(mCloneEncoders->refCodesDevice(),
+        reinterpret_cast<half const* const*>(mIclTablePtrsGpu.rawPointer()), numFrames, mTalkerConfig.numCodeGroups,
+        static_cast<int32_t>(hiddenSize), mIclFrameSumBuffer, stream);
+
+    // Reference transcript: assistant-wrapped then stripped [3:-2] at recipe time, matching
+    // the PyTorch reference tokenization exactly.
+    mIclRefTextIds = mTokenizer->encode("<|im_start|>assistant\n" + refText + "<|im_end|>\n");
+
+    iclFrames = numFrames;
+    return true;
+}
+
+int32_t Qwen3OmniTTSRuntime::resolveLanguageId(std::string const& languageName, std::string const& speakerName) const
+{
+    // Engines without language support (no codec_think_id or empty map) always use the
+    // no-language path, regardless of what the request asks for.
+    if (mTalkerConfig.codecThinkId < 0 || mTalkerConfig.codecLanguageIdMap.empty())
+    {
+        if (!languageName.empty() && languageName != "auto")
+        {
+            LOG_WARNING(
+                "Request language '%s' ignored: engine config has no codec_language_id map "
+                "(re-export with a CustomVoice checkpoint to enable language conditioning)",
+                languageName.c_str());
+        }
+        return -1;
+    }
+
+    auto toLower = [](std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
+        return s;
+    };
+    std::string const lang = toLower(languageName);
+
+    int32_t languageId = -1;
+    if (!lang.empty() && lang != "auto")
+    {
+        auto it = mTalkerConfig.codecLanguageIdMap.find(lang);
+        if (it != mTalkerConfig.codecLanguageIdMap.end())
+        {
+            languageId = it->second;
+        }
+        else
+        {
+            LOG_WARNING("Language '%s' not found in codec_language_id map, falling back to auto (no-language)",
+                languageName.c_str());
+        }
+    }
+
+    // Dialect override (matches PyTorch modeling_qwen3_tts.py): when the language is auto or
+    // chinese and the speaker is a dialect speaker, the dialect's language ID wins.
+    if ((lang.empty() || lang == "auto" || lang == "chinese") && !speakerName.empty())
+    {
+        auto dialectIt = mTalkerConfig.spkDialectMap.find(toLower(speakerName));
+        if (dialectIt != mTalkerConfig.spkDialectMap.end())
+        {
+            auto langIt = mTalkerConfig.codecLanguageIdMap.find(dialectIt->second);
+            if (langIt != mTalkerConfig.codecLanguageIdMap.end())
+            {
+                LOG_INFO("Dialect speaker '%s' → language '%s' (codec id %d)", speakerName.c_str(),
+                    dialectIt->second.c_str(), langIt->second);
+                languageId = langIt->second;
+            }
+        }
+    }
+
+    return languageId;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //        Shared Decode Frame + Prefill Construction
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2646,9 +3044,12 @@ bool Qwen3OmniTTSRuntime::buildTalkerPrefillFromSegments(std::vector<int32_t> co
         rt::Tensor assistantSlice(const_cast<__half*>(assistantProjPtr), rt::Coords{assistantInputLen, hiddenSize},
             rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
+        // Omni path stays language-free: Omni checkpoints have no codec_think_id and build
+        // their prefill without language conditioning.
         kernel::invokeAssistantPreamble(assistantSlice, mTtsPadEmbed, mTtsBosEmbed, mTtsEosEmbed, mTalkerEmbeddingTable,
             mTalkerConfig.codecNothinkId, mTalkerConfig.codecThinkBosId, mTalkerConfig.codecThinkEosId, speakerId,
-            mTalkerConfig.codecPadId, mTalkerConfig.codecBosId, 1, preambleScratch, stream);
+            mTalkerConfig.codecPadId, mTalkerConfig.codecBosId, /*codecThinkId=*/-1, /*languageId=*/-1, 1,
+            preambleScratch, stream);
 
         __half* const aOut = static_cast<__half*>(mTalkerInputEmbeds.rawPointer()) + userTotalLen * hiddenSize;
         CUDA_CHECK(cudaMemcpyAsync(aOut, scratchPtr, kAssistantRestructuredLen * hiddenSize * sizeof(__half),

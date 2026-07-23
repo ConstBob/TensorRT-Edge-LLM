@@ -2146,6 +2146,10 @@ class TestConfig:
             f"{self.edgellm_data_dir}/updated_datasets/librispeech_clean_test/librispeech_clean_test.json",
             "tts_basic":
             "tests/test_cases/tts_basic.json",
+            "tts_language":
+            "tests/test_cases/tts_language.json",
+            "tts_instruct":
+            "tests/test_cases/tts_instruct.json",
             "SeedTTS_en_meta":
             f"{self.edgellm_data_dir}/updated_datasets/SeedTTS_en_meta/seedtts_en_meta.json",
             "vlm_basic":

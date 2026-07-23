@@ -18,6 +18,7 @@
 #pragma once
 
 #include "common/tensor.h"
+#include "kernels/talkerMLPKernels/talkerMLPKernels.h"
 #include "profiling/metrics.h"
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/exec/engineExecutor.h"
@@ -28,6 +29,7 @@
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/sharedResources.h"
 #include "tokenizer/tokenizer.h"
+#include <cuda_fp16.h>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -42,6 +44,8 @@ struct SamplingParams;
 namespace rt
 {
 
+class CloneEncoderRunner;
+
 // ========== Constants ==========
 
 namespace talker_constants
@@ -51,6 +55,7 @@ constexpr int32_t kAssistantPrefixLen = 3;   //!< Assistant prefix tokens ([:3])
 constexpr int32_t kAssistantTrailingSuffix
     = 5; //!< Trailing tokens to strip from end of sequence ("<|im_end|>\n<|im_start|>assistant\n")
 constexpr int32_t kNonStreamingPrefixRows = 8;     //!< Fixed prefix rows in non-streaming prefill (rows 0-7)
+constexpr int32_t kPrefixRowsWithLanguage = 9;     //!< Prefix rows with CustomVoice language conditioning
 constexpr int32_t kCodePredictorPrefillSeqLen = 2; //!< CodePredictor prefill sequence length
 constexpr int32_t kCodecEmbeddingCount = 6;        //!< Number of codec embeddings to add
 
@@ -121,8 +126,11 @@ public:
      * @param stream CUDA stream for operations
      * @throws std::runtime_error on any initialization failure
      */
+    //! @param cloneEncoderDir Optional directory with the voice-clone reference encoder
+    //!        engines (speaker_encoder.engine / speech_tokenizer_encoder.engine, Base
+    //!        checkpoints). Empty disables voice cloning.
     Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
-        std::string const& tokenizerDir, cudaStream_t stream);
+        std::string const& tokenizerDir, std::string const& cloneEncoderDir, cudaStream_t stream);
 
     //! @brief Destructor
     ~Qwen3OmniTTSRuntime();
@@ -146,9 +154,37 @@ public:
         float talkerTopP{0};            //!< Talker top-P (0 = default 1.0)
         float repetitionPenalty{1.05f}; //!< Repetition penalty applied to seen codec tokens (1.0 = disabled)
 
+        // CodePredictor (sub-talker) sampling parameters, independent from the Talker.
+        // 0 = use HF's hardcoded code_predictor.generate defaults (kCPSampling*: 1.0/50/0.8);
+        // these do NOT inherit the talker* request values.
+        float subtalkerTemperature{0}; //!< Sub-talker temperature (0 = kCPSamplingTemperature)
+        int32_t subtalkerTopK{0};      //!< Sub-talker top-K (0 = kCPSamplingTopK)
+        float subtalkerTopP{0};        //!< Sub-talker top-P (0 = kCPSamplingTopP)
+
         // Speaker selection (optional, defaults to config default)
         std::string speakerName{""}; //!< Speaker name (e.g., "f245", "m02") - empty means use default
         int32_t speakerId{-1};       //!< Speaker ID - if >= 0, overrides speakerName
+
+        //!< CustomVoice language conditioning (optional). Empty or "auto" keeps the historical
+        //!< no-language prefill. A known language name (e.g. "chinese", "english"; matched
+        //!< case-insensitively against the engine config codec_language_id map) switches the
+        //!< Talker prefill to the 9-row language-conditioned layout. Unknown names fall back
+        //!< to no-language with a warning. Dialect speakers (spk_is_dialect in config) override
+        //!< this automatically when language is "auto" or "chinese", matching the PyTorch reference.
+        std::string languageName{""};
+
+        //!< CustomVoice/VoiceDesign instruction control (optional). Natural-language style
+        //!< instruction (e.g. "Speak in a whisper"). Wrapped as a user turn, projected through
+        //!< text_projection, and prepended to the Talker prefill, matching the PyTorch reference.
+        //!< Empty = no instruction.
+        std::string instructText{""};
+
+        //!< Voice clone (Base checkpoints, optional): reference audio file (wav/mp3/flac).
+        //!< The reference encoders run on-device (requires cloneEncoderDir at construction).
+        //!< With refText set, ICL mode conditions on (transcript, codec codes) of the
+        //!< reference; without it, x-vector-only mode clones timbre alone.
+        std::string refAudioPath{""};
+        std::string refText{""}; //!< Reference transcript (enables ICL mode)
 
         // Input: conversation messages for this request (runtime tokenizes internally)
         std::vector<Message> messages;
@@ -373,6 +409,25 @@ public:
      * @return Speaker ID, or default speaker ID if not found
      */
     int32_t getSpeakerIdByName(std::string const& speakerName) const;
+
+    /*!
+     * @brief Resolve the language codec token ID for a request (CustomVoice language conditioning)
+     *
+     * Mirrors the PyTorch reference (modeling_qwen3_tts.py):
+     *   1. Empty / "auto" language → -1 (no-language path), unless step 3 overrides.
+     *   2. Known language name (case-insensitive lookup in codecLanguageIdMap) → its codec ID.
+     *      Unknown names log a warning and fall back to -1.
+     *   3. Dialect override: when the resolved language is "auto" or "chinese" and the speaker
+     *      is a dialect speaker (spkDialectMap), the dialect's codec ID wins.
+     *
+     * Always returns -1 when the engine config has no codec_think_id / codec_language_id
+     * (e.g. Qwen3-Omni checkpoints or engines exported before language support).
+     *
+     * @param languageName Request language name ("" = auto)
+     * @param speakerName  Request speaker name (for dialect override; "" = default speaker)
+     * @return Language codec token ID, or -1 for the no-language 8-row prefill
+     */
+    int32_t resolveLanguageId(std::string const& languageName, std::string const& speakerName) const;
 
 private:
     // ========== Internal Methods ==========
@@ -603,6 +658,26 @@ private:
         int32_t codecBosId{};      //!< Codec begin-of-sequence (2149)
         int32_t codecEosId{};      //!< Codec end-of-sequence
 
+        //! Codec think control token (e.g. 2154 for Qwen3-TTS CustomVoice); -1 when absent.
+        //! Used instead of codecNothinkId when language conditioning is active. Sentinel -1
+        //! means the checkpoint has no think token — language conditioning stays disabled.
+        int32_t codecThinkId{-1};
+
+        //! Language name (lower-case) → codec token ID map from config `codec_language_id`
+        //! (falls back to `talker_language_id` at export time). Empty for checkpoints without
+        //! language conditioning (e.g. Qwen3-Omni 4B) — resolveLanguageId then always returns -1.
+        std::unordered_map<std::string, int32_t> codecLanguageIdMap;
+
+        //! Speaker name (lower-case) → dialect language name from config `spk_is_dialect`.
+        //! Only speakers whose value is a dialect string are present (e.g. eric → sichuan_dialect,
+        //! dylan → beijing_dialect); non-dialect speakers (JSON false) are omitted.
+        std::unordered_map<std::string, std::string> spkDialectMap;
+
+        //! Checkpoint family from config `tts_model_type`: "custom_voice" (preset speakers),
+        //! "voice_design" (no speaker row, instruction-driven), "base" (voice clone), or ""
+        //! (Qwen3-Omni / legacy configs).
+        std::string ttsModelType;
+
         // Speaker configuration (read from config)
         int32_t defaultSpeakerId{}; //!< Default speaker ID (e.g., 2301 for f245)
 
@@ -672,6 +747,34 @@ private:
     //! tokens between [im_start, system, nl] and the codec_bos when building the Talker system
     //! prefill section (modeling_qwen3_omni_next.py:_get_talker_system_parts).
     std::unordered_map<int32_t, std::vector<int32_t>> mSpeakerSystemPromptIds;
+
+    // Descriptor-driven prefill assembly (instruction / VoiceDesign / voice-clone layouts).
+    // Rows are queued host-side as (srcA, optional srcB) device-pointer pairs and assembled
+    // in one invokePrefillRowAssemble launch; per-row math matches the fused
+    // invokeAssistantPreamble kernel bit-exactly (see talkerMLPKernelTests).
+    std::vector<kernel::PrefillRowDesc> mPrefillRows; //!< Queued row descriptors (reused per prefill)
+    rt::Tensor mPrefillDescsHost;                     //!< Pinned host staging for descriptors
+    rt::Tensor mPrefillDescsDevice;                   //!< Device descriptor buffer
+
+    //! Talker codec-embedding-table row pointer for a token ID.
+    half const* talkerEmbRow(int32_t tokenId) const;
+    //! Queue one prefill row: srcA (+ srcB when non-null), both device pointers to [H] rows.
+    void pushPrefillRow(half const* srcA, half const* srcB);
+    //! Upload queued descriptors and assemble rows into output[0..numRows). Returns numRows.
+    int64_t flushPrefillRows(rt::Tensor& output, cudaStream_t stream);
+
+    // Voice clone workspace (loaded per request from voiceClonePromptPath)
+    rt::Tensor mVoiceCloneXVector;       //!< [talkerH] FP16 GPU x-vector
+    rt::Tensor mIclFrameSumBuffer;       //!< [maxRefFrames, talkerH] FP16 GPU summed codec embeddings
+    rt::Tensor mIclTablePtrsGpu;         //!< [numGroups] device pointer array for sum kernel
+    std::vector<int32_t> mIclRefTextIds; //!< Host reference transcript token IDs (assistant-wrapped)
+
+    std::unique_ptr<CloneEncoderRunner> mCloneEncoders; //!< Reference encoders (null unless cloneEncoderDir given)
+
+    //! Run the reference encoders on refAudioPath and fill the clone workspace. Returns false
+    //! on error; iclFrames receives the reference frame count (0 = x-vector-only mode).
+    bool encodeVoiceCloneReference(
+        std::string const& refAudioPath, std::string const& refText, int32_t& iclFrames, cudaStream_t stream);
     int32_t mMaxBatchSize{1}; //!< Maximum batch size from Talker engine config (min of Talker and CodePredictor)
 
     int32_t mNumRvqLayers{talker_constants::kDefaultNumRvqLayers};
@@ -852,17 +955,19 @@ private:
      *
      * @param thinkerEmbed Embedded token sequence [seqLen, thinkerHiddenSize]
      * @param speakerId Speaker ID for codec embedding
-     * @param output Projected talker input embeddings [seqLen+2, talkerHiddenSize]
-     * @param outputSeqLen seqLen + 2
+     * @param languageId Language codec token ID (-1 = no-language 8-row prefix; >= 0 = 9-row
+     *        CustomVoice language-conditioned prefix)
+     * @param output Projected talker input embeddings [outputSeqLen, talkerHiddenSize]
+     * @param outputSeqLen seqLen + 2 (no language) or seqLen + 3 (with language)
      * @param stream CUDA stream
      * @return True on success, false on failure
      */
-    bool projectToTalkerInput(rt::Tensor const& thinkerEmbed, int32_t speakerId, rt::Tensor& output,
+    bool projectToTalkerInput(rt::Tensor const& thinkerEmbed, int32_t speakerId, int32_t languageId, rt::Tensor& output,
         int64_t& outputSeqLen, cudaStream_t stream);
 
     //! Embed token IDs, run MLP projection, and reshape buffers ready for Talker prefill.
     //! Populates mTalkerInputEmbeds and mTalkerHiddenStatesBuffer as side effects.
-    //! \param[out] outSeqLen  seqLen + 2 (non-streaming prefill length)
+    //! \param[out] outSeqLen  non-streaming prefill length (seqLen + 2, or seqLen + 3 with language)
     bool prepareTalkerInput(std::vector<int32_t> const& textTokenIds, TalkerGenerationRequest const& request,
         int64_t& outSeqLen, cudaStream_t stream);
 
