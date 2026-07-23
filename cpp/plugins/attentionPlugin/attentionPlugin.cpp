@@ -1352,8 +1352,8 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
         || executionMode == AttentionExecutionMode::kCHUNKED_PREFILL)
     {
         bool const usePaddingContextMask = isPaddingContextMask(runtimeContextMaskMode);
-        // Shared-KV prefill reads a donor cache, and the direct CuTe DSL shared-KV path below still expects FP16 KV.
-        // Keep the original rejection until that path explicitly handles FP8 donor cache.
+        // Shared layers do not own the donor cache's K/V quantization scales, so they cannot safely dequantize an
+        // FP8 donor cache during prefill.
         if (mEnableFp8KVCache && sharedKV)
         {
             LOG_ERROR("AttentionPlugin: shared-KV prefill cannot read an FP8 donor cache.");

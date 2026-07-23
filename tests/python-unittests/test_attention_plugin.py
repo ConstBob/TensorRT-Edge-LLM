@@ -1637,6 +1637,33 @@ def test_ragged_prefill_batch_invariance():
 # Q-only packed input and reads a donor engine's cache without writing it. Each test
 # populates the cache with a donor (enable_kv_shared=0) pass first.
 # --------------------------------------------------------------------------- #
+@pytest.mark.skipif(not _fp8_prefill_supported(),
+                    reason="FP8 prefill not supported on this device")
+def test_fp8_shared_kv_prefill_rejected():
+    """Shared-KV prefill rejects FP8 because the shared layer lacks donor K/V scales."""
+    p = AttentionParams(batch_size=2,
+                        seq_len=8,
+                        is_prefill=True,
+                        enable_fp8_kv_cache=True,
+                        qkv_scales=[0.5, 0.25, 0.125],
+                        **BASE)
+    shared_runner = AttentionPluginRunner(p, enable_kv_shared=1)
+    _, _, combined = _make_rope(p, torch.Generator().manual_seed(2300))
+    _, _, plugin_kv = _empty_caches(p)
+    q = torch.zeros((p.batch_size, p.seq_len, p.q_hidden),
+                    dtype=torch.float16,
+                    device=DEV)
+    context_lengths = torch.full((p.batch_size, ),
+                                 p.seq_len,
+                                 dtype=torch.int32,
+                                 device=DEV)
+    cache_indices = torch.zeros(p.batch_size, dtype=torch.int32, device=DEV)
+
+    with pytest.raises(RuntimeError, match="execute_async_v3 returned False"):
+        shared_runner.run(q, plugin_kv, context_lengths, combined,
+                          cache_indices)
+
+
 def _assert_cache_untouched(name: str, before: "torch.Tensor",
                             after: "torch.Tensor"):
     """Bit-exact check that a shared-KV call did not write the donor cache."""

@@ -30,6 +30,7 @@
 #include "common/tensor.h"
 #include "contextAttnReference.h"
 #include "kernels/contextAttentionKernels/cuteDslFMHAV2Runner.h"
+#include "kernels/contextAttentionKernels/utilKernels.h"
 #include "testUtils.h"
 
 using namespace nvinfer1;
@@ -38,25 +39,23 @@ using namespace trt_edgellm;
 #if defined(CUTE_DSL_FMHA_V2_ENABLED)
 
 void TestContextAttentionAccuracy(std::vector<int32_t> const& cuSeqlens, int32_t numQHeads, int32_t numKVHeads,
-    int32_t headSize, int32_t maxSeqLen, bool isCompact = false, bool causal = true,
+    int32_t headSize, int32_t maxSeqLen, bool isPackedViT = false, bool causal = true,
     std::optional<float> attentionScale = std::nullopt)
 {
     float const resolvedAttentionScale = attentionScale.value_or(1.0F / std::sqrt(static_cast<float>(headSize)));
     int32_t smVersion = getSMVersion();
     applyThorSMRenumberWAR(smVersion);
 
-    bool const canImplement = isCompact ? CuteDslFMHAV2Runner::canImplementViT(headSize, smVersion, DataType::kHALF)
-                                        : causal
+    bool const canImplement = isPackedViT ? CuteDslFMHAV2Runner::canImplementViT(headSize, smVersion, DataType::kHALF)
+                                          : causal
             && CuteDslFMHAV2Runner::canImplement(
                 numQHeads, numKVHeads, headSize, smVersion, DataType::kHALF, CuteDslFMHAV2MaskType::kCAUSAL);
-    if (!canImplement)
-    {
-        GTEST_SKIP() << "FMHA-v2 CuTe DSL not supported for headSize=" << headSize << ", SM=" << smVersion;
-    }
+    ASSERT_TRUE(canImplement) << "FMHA-v2 CuTe DSL unexpectedly unsupported for headSize=" << headSize
+                              << ", SM=" << smVersion;
 
     // Calculate total elements
     int32_t const batchSize = static_cast<int32_t>(cuSeqlens.size()) - 1;
-    int32_t const totalTokens = cuSeqlens.back();
+    int32_t const totalTokens = isPackedViT ? cuSeqlens.back() : batchSize * maxSeqLen;
 
     size_t const qSize = static_cast<size_t>(totalTokens) * numQHeads * headSize;
     size_t const kvSize = static_cast<size_t>(totalTokens) * numKVHeads * headSize;
@@ -73,7 +72,7 @@ void TestContextAttentionAccuracy(std::vector<int32_t> const& cuSeqlens, int32_t
 
     // Create Tensor objects based on layout (they allocate device memory internally)
     rt::Tensor qTensor, kTensor, vTensor, oTensorRef, oTensorKernel;
-    if (isCompact)
+    if (isPackedViT)
     {
         qTensor = rt::Tensor({totalTokens, numQHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
         kTensor = rt::Tensor({totalTokens, numKVHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
@@ -97,10 +96,29 @@ void TestContextAttentionAccuracy(std::vector<int32_t> const& cuSeqlens, int32_t
     rt::Tensor cuSeqLensTensor({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
     CUDA_CHECK(cudaMemcpy(
         cuSeqLensTensor.rawPointer(), cuSeqlens.data(), (batchSize + 1) * sizeof(int32_t), cudaMemcpyHostToDevice));
+    rt::Tensor paddedCuKVSeqLensTensor;
+    if (!isPackedViT)
+    {
+        std::vector<int32_t> inputSeqLens(batchSize);
+        for (int32_t i = 0; i < batchSize; ++i)
+        {
+            inputSeqLens[i] = cuSeqlens[i + 1] - cuSeqlens[i];
+        }
+
+        rt::Tensor inputSeqLensTensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+        CUDA_CHECK(cudaMemcpy(
+            inputSeqLensTensor.rawPointer(), inputSeqLens.data(), batchSize * sizeof(int32_t), cudaMemcpyHostToDevice));
+        rt::Tensor cuQSeqLensTensor({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
+        rt::Tensor cuKVSeqLensTensor({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
+        rt::Tensor kvCacheEndIdxsTensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+        paddedCuKVSeqLensTensor = rt::Tensor({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
+        kernel::calCuQCuKVSeqLensAndKVEndIdxs(inputSeqLensTensor, rt::Tensor{}, cuQSeqLensTensor, cuKVSeqLensTensor,
+            kvCacheEndIdxsTensor, paddedCuKVSeqLensTensor, maxSeqLen, nullptr);
+    }
 
     // Compute reference output
     cudaStream_t stream = nullptr;
-    if (isCompact)
+    if (isPackedViT)
     {
         rt::launchFmhaReferenceCompact(
             qTensor, kTensor, vTensor, oTensorRef, cuSeqLensTensor, maxSeqLen, false, resolvedAttentionScale, stream);
@@ -120,7 +138,7 @@ void TestContextAttentionAccuracy(std::vector<int32_t> const& cuSeqlens, int32_t
     CuteDslFMHAV2Runner runner(numQHeads, numKVHeads, headSize, batchSize, maxSeqLen, maxSeqLen,
         /*useSmallD64=*/maxSeqLen <= 512);
     bool ranKernel = false;
-    if (isCompact)
+    if (isPackedViT)
     {
         ASSERT_TRUE(CuteDslFMHAV2Runner::loadViTKernelModule());
         ranKernel = runner.run(qTensor.rawPointer(), kTensor.rawPointer(), vTensor.rawPointer(),
@@ -131,7 +149,7 @@ void TestContextAttentionAccuracy(std::vector<int32_t> const& cuSeqlens, int32_t
     {
         ASSERT_TRUE(CuteDslFMHAV2Runner::loadLLMKernelModule());
         ranKernel = runner.run(qTensor.rawPointer(), kTensor.rawPointer(), vTensor.rawPointer(),
-            oTensorKernel.rawPointer(), cuSeqLensTensor.dataPointer<int32_t>(), stream, resolvedAttentionScale);
+            oTensorKernel.rawPointer(), paddedCuKVSeqLensTensor.dataPointer<int32_t>(), stream, resolvedAttentionScale);
     }
     ASSERT_TRUE(ranKernel);
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -164,10 +182,10 @@ void TestContextAttentionAccuracy(std::vector<int32_t> const& cuSeqlens, int32_t
 
     float passRate1E_3 = static_cast<float>(numCloseWithin1E_3) / totalElements;
 
-    std::string layoutStr = isCompact ? "[Compact]" : "[Padded]";
+    std::string layoutStr = isPackedViT ? "[Compact]" : "[Padded]";
     std::string maskStr = causal ? "[Causal] " : "[Non-causal] ";
     std::cout << "Context Attention test. " << layoutStr << maskStr << "batch_size: " << batchSize;
-    if (isCompact)
+    if (isPackedViT)
     {
         std::cout << " total_tokens: " << totalTokens << " max_seq_len: " << maxSeqLen;
     }
@@ -239,6 +257,11 @@ TEST(ContextAttentionTest, accuracyKVRatio8_Causal)
     TestContextAttentionAccuracy(2, 256, 16, 2, 128, true);
     TestContextAttentionAccuracy(4, 512, 16, 2, 128, true);
     TestContextAttentionAccuracy(2, 256, 16, 2, 256, true);
+}
+
+TEST(ContextAttentionTest, paddedLayout_VariableSequenceLengths)
+{
+    TestContextAttentionAccuracy({0, 64, 160}, 8, 2, 128, 128);
 }
 
 // Long sequence tests

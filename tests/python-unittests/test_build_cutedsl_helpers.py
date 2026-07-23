@@ -267,6 +267,8 @@ def test_fmha_v2_registry_is_complete_for_supported_sms(sm):
     assert "--fmha_v2_context" not in padding_variant.script_args
 
 
+# SM110 uses the FA4-based `fmha` kernels. Keep the FA2-based `fmha_v2`
+# group disabled unless a faster SM110 FA2 kernel is found.
 @pytest.mark.parametrize("sm", [90, 103, 110])
 def test_fmha_v2_registry_rejects_unsupported_sms(sm):
     with pytest.raises(ValueError, match="No variants"):
