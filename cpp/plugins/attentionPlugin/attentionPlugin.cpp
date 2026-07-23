@@ -275,6 +275,17 @@ bool loadPaddingFMHAKernels(int32_t headSize, int32_t smVersion, nvinfer1::DataT
     return canImplement;
 }
 
+bool shouldLoadFFPAFallback(bool canImplementFMHA, bool enableContextMaskSelector, int32_t headSize)
+{
+    return !canImplementFMHA || (enableContextMaskSelector && headSize == 512);
+}
+
+bool shouldUseFFPAPrefillFallback(
+    bool canImplementFMHA, bool usePaddingContextMask, int32_t headSize, bool canImplementPaddingFMHA)
+{
+    return !canImplementFMHA || (usePaddingContextMask && headSize == 512 && !canImplementPaddingFMHA);
+}
+
 // Workspace layout (cumulative, worst-case across all execution paths):
 //
 //   Slot  | Shape                            | Type  | Used by
@@ -549,17 +560,21 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     //   5. XQA (decode) only             — prefill unsupported for this head size.
     //   6. None                          — fatal, cannot serve this configuration.
 
-    // Load FFPA only when common FMHA selection did not find a prefill path.
-    if (!mCanImplementFMHA)
+    // Load FFPA when common FMHA is unavailable, or when a runtime-selected
+    // non-causal D512 padding mask may need the FFPA dense variant.
+    if (shouldLoadFFPAFallback(mCanImplementFMHA, mEnableContextMaskSelector, mHeadSize))
     {
 #ifdef CUTE_DSL_FFPA_ENABLED
-        if (mHeadSize == 512 && CuteDslFFPARunner::canImplement(mHeadSize, mSMVersion, mNumQHeads, mNumKVHeads))
+        bool const canImplementCausalFFPA
+            = CuteDslFFPARunner::canImplement(mHeadSize, mSMVersion, mNumQHeads, mNumKVHeads);
+        bool const canImplementNonCausalFFPA
+            = CuteDslFFPARunner::canImplement(mHeadSize, mSMVersion, mNumQHeads, mNumKVHeads, false);
+        if (mHeadSize == 512 && (canImplementCausalFFPA || canImplementNonCausalFFPA))
         {
             if (CuteDslFFPARunner::loadKernelModule())
             {
-                mCanImplementFFPA = true;
-                mCanImplementNonCausalFFPA
-                    = CuteDslFFPARunner::canImplement(mHeadSize, mSMVersion, mNumQHeads, mNumKVHeads, false);
+                mCanImplementFFPA = canImplementCausalFFPA;
+                mCanImplementNonCausalFFPA = canImplementNonCausalFFPA;
             }
             else
             {
@@ -693,16 +708,19 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
         "D512 sliding-window prefill requires the CuTe DSL paged FMHA kernel; full-causal FFPA is not a valid "
         "fallback.");
 
-    if (!mCanImplementFMHA)
+    if (shouldLoadFFPAFallback(mCanImplementFMHA, mEnableContextMaskSelector, mHeadSize))
     {
 #ifdef CUTE_DSL_FFPA_ENABLED
-        if (mHeadSize == 512 && CuteDslFFPARunner::canImplement(mHeadSize, mSMVersion, mNumQHeads, mNumKVHeads))
+        bool const canImplementCausalFFPA
+            = CuteDslFFPARunner::canImplement(mHeadSize, mSMVersion, mNumQHeads, mNumKVHeads);
+        bool const canImplementNonCausalFFPA
+            = CuteDslFFPARunner::canImplement(mHeadSize, mSMVersion, mNumQHeads, mNumKVHeads, false);
+        if (mHeadSize == 512 && (canImplementCausalFFPA || canImplementNonCausalFFPA))
         {
             if (CuteDslFFPARunner::loadKernelModule())
             {
-                mCanImplementFFPA = true;
-                mCanImplementNonCausalFFPA
-                    = CuteDslFFPARunner::canImplement(mHeadSize, mSMVersion, mNumQHeads, mNumKVHeads, false);
+                mCanImplementFFPA = canImplementCausalFFPA;
+                mCanImplementNonCausalFFPA = canImplementNonCausalFFPA;
             }
         }
 #endif
@@ -1580,13 +1598,14 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                 kernel::launchApplyRopeQOnly(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor, stream);
             }
 
-            // Configurations without common FMHA use FFPA for shared-KV prefill.
-            if (!mCanImplementFMHA)
+            bool const useFFPAPrefillFallback = shouldUseFFPAPrefillFallback(
+                mCanImplementFMHA, usePaddingContextMask, mHeadSize, mCanImplementPaddingFMHA);
+
+            // Configurations without common FMHA, or D512 non-causal padding
+            // masks without an FMHA_v2 padding backend, use FFPA prefill.
+            if (useFFPAPrefillFallback)
             {
 #ifdef CUTE_DSL_FFPA_ENABLED
-                // Shared-KV without FMHA cubins: FFPA serves headSize=512.
-                // DiffusionGemma's non-causal padding mask additionally needs
-                // the dense/non-causal FFPA variant.
                 if (usePaddingContextMask && !mCanImplementNonCausalFFPA)
                 {
                     LOG_ERROR(
@@ -1707,12 +1726,14 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
 
         // --- Own KV prefill: RoPE Q+K, write K/V to cache, then run attention kernel ---
 
-        // Configurations without a common FMHA implementation use FFPA where available.
-        if (!mCanImplementFMHA)
+        bool const useFFPAPrefillFallback = shouldUseFFPAPrefillFallback(
+            mCanImplementFMHA, usePaddingContextMask, mHeadSize, mCanImplementPaddingFMHA);
+
+        // Configurations without common FMHA, or D512 non-causal padding masks
+        // without an FMHA_v2 padding backend, use FFPA prefill.
+        if (useFFPAPrefillFallback)
         {
 #ifdef CUTE_DSL_FFPA_ENABLED
-            // Own-KV without FMHA cubins: FFPA serves headSize=512. Padding
-            // context attention requires the dense/non-causal FFPA variant.
             if (usePaddingContextMask && !mCanImplementNonCausalFFPA)
             {
                 LOG_ERROR(
