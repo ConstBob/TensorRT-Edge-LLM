@@ -36,7 +36,7 @@ namespace plugins
 enum class ContextFMHABackend
 {
     kNONE,
-    kCUTE_DSL_FMHA,
+    kCUTE_DSL_FMHA_BLACKWELL,
     kCUTE_DSL_FMHA_V2
 };
 

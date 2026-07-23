@@ -232,7 +232,7 @@ FMHAKernelSelection loadFMHAKernels(int32_t numQHeads, int32_t numKVHeads, int32
     if (CuteDslFMHARunner::canImplement(headSize, smVersion) && CuteDslFMHARunner::loadLLMKernelModule())
     {
         LOG_DEBUG("CuTe DSL FMHA kernel loaded for SM%d", smVersion);
-        return {ContextFMHABackend::kCUTE_DSL_FMHA, true};
+        return {ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL, true};
     }
 #endif
 
@@ -1100,7 +1100,7 @@ size_t AttentionPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, 
     // page-table width times the page size (kv_page_table is [batch, 2, maxPagesPerSeq]).
     int64_t const maxKVCacheCapacity = inputs[kIN_KV_PAGE_TABLE_IDX].max.d[2] * rt::kTOKENS_PER_PAGE;
     size_t const workspaceSize = getAttentionWorkspaceSize(maxBatchSize, maxSeqLen, maxKVCacheCapacity, mNumQHeads,
-        mNumKVHeads, mHeadSize, mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA, mEnableFp8KVCache,
+        mNumKVHeads, mHeadSize, mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL, mEnableFp8KVCache,
         mEnableVisionBlockAttention != 0);
 
     LOG_DEBUG("AttentionPlugin workspace size: %zu bytes", workspaceSize);
@@ -1362,7 +1362,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
         // FP8 KV cache can be consumed directly only by CuTe DSL FMHA. FMHA_v2 and FFPA consume it through the
         // deinterleave/dequantize fallback below, which materializes split FP16 K/V in workspace.
         bool const hasDirectFp8KVPrefillBackend
-            = mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA && mCanImplementFMHA;
+            = mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL && mCanImplementFMHA;
         bool const hasSplitKVPrefillFallback = mCanImplementFMHA || mCanImplementFFPA;
         if (mEnableFp8KVCache && executionMode == AttentionExecutionMode::kCHUNKED_PREFILL
             && !hasDirectFp8KVPrefillBackend && !hasSplitKVPrefillFallback)
@@ -1597,7 +1597,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
 
             // Run FMHA reading from the donor's KV cache (bound to this layer's KV cache input).
 #ifdef CUTE_DSL_FMHA_ENABLED
-            if (mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA
+            if (mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL
                 && (!usePaddingContextMask || mCanImplementPaddingFMHA))
             {
                 if (!validatePagedKVCacheShape())
@@ -1729,7 +1729,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
         else
         {
 #ifdef CUTE_DSL_FMHA_ENABLED
-            if (mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA
+            if (mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL
                 && (!usePaddingContextMask || mCanImplementPaddingFMHA))
             {
                 if (!validatePagedKVCacheShape())
