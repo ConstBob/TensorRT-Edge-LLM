@@ -360,8 +360,11 @@ __global__ void dflashBuildLinearVerifyInputsKernel(int32_t const* __restrict__ 
     {
         int32_t const batchIdx = idx / verifySize;
         int32_t const posIdx = idx % verifySize;
+        // DFlash draft output at position 0 predicts the current token (t_last),
+        // not the next token. Real draft proposals start at position 1.
+        // DDTree explicitly skips depthIdx==0 for the same reason (see ddtreeKernels.cu).
         verifyTokenIds[idx]
-            = posIdx == 0 ? lastAcceptedTokens[batchIdx] : draftTokenIds[batchIdx * draftTokenStride + (posIdx - 1)];
+            = posIdx == 0 ? lastAcceptedTokens[batchIdx] : draftTokenIds[batchIdx * draftTokenStride + posIdx];
     }
 
     // Token ids and mask entries are independent output buffers, so one flat

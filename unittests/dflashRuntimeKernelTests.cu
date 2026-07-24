@@ -93,7 +93,10 @@ TEST(DFlashRuntimeKernels, BuildLinearVerifyInputsUsesDraftStrideForBatchRows)
     auto verifyTreeMask = rt::Tensor({batchSize, verifySize, verifySize}, rt::DeviceType::kGPU, DataType::kINT8);
 
     copyHostToDevice<int32_t>(lastAcceptedTokens, {10, 20});
-    copyHostToDevice<int32_t>(draftTokenIds, {101, 102, 103, 999, 201, 202, 203, 999});
+    // DFlash draft output at position 0 predicts the current token (t_last), not the next token.
+    // Real draft proposals start at position 1 — consistent with DDTree which skips depthIdx==0.
+    // Layout per batch row: [<pos0: unused t_last prediction>, pos1, pos2, pos3]
+    copyHostToDevice<int32_t>(draftTokenIds, {999, 101, 102, 103, 999, 201, 202, 203});
 
     kernel::launchDFlashBuildLinearVerifyInputs(lastAcceptedTokens.dataPointer<int32_t>(),
         draftTokenIds.dataPointer<int32_t>(), verifyTokenIds.dataPointer<int32_t>(),
