@@ -702,7 +702,7 @@ When TRT 10.x parses a custom-domain ONNX node with ``AttributeProto.INT`` (type
 The C++ plugin helper ``parsePluginScalarField<int32_t>`` in ``cpp/plugins/utils/pluginUtils.h`` was originally specialised only for ``kINT32``.  This caused:
 
 * Debug builds: assertion ``kINT32 != kINT64`` -> SIGABRT during engine build.
-* Release builds: no-op fall-through -> headSize=0 -> SIGFPE in contextFMHARunner.
+* Release builds: no-op fall-through -> headSize=0 -> SIGFPE during context-attention setup.
 
 **Fix (``pluginUtils.h``):** Added an explicit ``parsePluginScalarField<int32_t>`` specialisation that handles both ``kINT32`` and ``kINT64`` (safe ``static_cast<int32_t>`` from the int64 pointer).
 
