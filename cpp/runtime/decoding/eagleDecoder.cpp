@@ -645,6 +645,7 @@ bool EagleDecoder::runDraftModelAcceptToken(DecodingInferenceContext& context)
             + std::to_string(context.activeBatchSize) + "]")
             .c_str(),
         nvtx_colors::YELLOW);
+    TIME_STAGE(metrics::StageNames::kSPEC_DECODE_DRAFT_ACCEPT, context.stream);
 
     int32_t const activeBatchSize = context.activeBatchSize;
     int32_t const draftHiddenSize = mRuntime.deployment.specConfig->draftHiddenSize;

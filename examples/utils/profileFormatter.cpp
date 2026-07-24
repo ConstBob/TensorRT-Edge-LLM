@@ -214,6 +214,12 @@ float getSpecDecodeOverallTokensPerSecond(metrics::SpecDecodeGenerationMetrics c
         totalTimeMs += baseVerificationData->getTotalGpuTimeMs();
     }
 
+    auto draftAcceptData = gTimer.getTimingData(metrics::StageNames::kSPEC_DECODE_DRAFT_ACCEPT);
+    if (draftAcceptData)
+    {
+        totalTimeMs += draftAcceptData->getTotalGpuTimeMs();
+    }
+
     if (totalTimeMs > 0.0f)
     {
         return static_cast<float>(specDecodeGenerationMetrics.totalGeneratedTokens) / (totalTimeMs / 1000.0f);
@@ -346,6 +352,7 @@ void outputSpecDecodeGenerationProfile(std::ostream& output,
         appendStageTimingData(output, metrics::StageNames::kSPEC_DECODE_DRAFT_PREFILL, "Draft Model Prefill");
         appendStageTimingData(output, metrics::StageNames::kSPEC_DECODE_DRAFT_PROPOSAL, "Construct Draft Proposal");
         appendStageTimingData(output, metrics::StageNames::kSPEC_DECODE_BASE_VERIFICATION, "Base Model Verification");
+        appendStageTimingData(output, metrics::StageNames::kSPEC_DECODE_DRAFT_ACCEPT, "Draft Model Accept Token");
     }
 }
 
