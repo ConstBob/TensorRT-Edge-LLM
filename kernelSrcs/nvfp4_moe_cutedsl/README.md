@@ -210,10 +210,10 @@ for SM110.
 - **Alpha scaling.** FC1 applies per-expert `alpha = input_gsf * weight_gsf`
   inside the kernel epilogue, before the fused activation. Alpha is a `[E]`
   FP32 tensor on the plugin's input slot.
-- **SwiGLU weight interleave.** SwiGLU FC1 weights must be laid out as 32-col
+- **SwiGLU weight interleave.** SwiGLU FC1 weights must be laid out as 64-row
   interleaved `(up, gate)` chunks along the N axis (`moe_inter_size = 2 * I`).
   Plain `[up..., gate...]` concatenation produces wrong results silently.
-  See `repack_nvfp4_qwen3_moe_experts` in
+  See `repack_nvfp4_gated_moe_experts` in
   [`tensorrt_edgellm/checkpoint/repacking.py`](../../tensorrt_edgellm/checkpoint/repacking.py).
 - **PDL.** Programmatic Dependent Launch is currently disabled
   (`EDGELLM_ENABLE_PDL = False` in [`cute_utils.py`](cute_utils.py)).

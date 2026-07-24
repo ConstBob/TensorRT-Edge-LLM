@@ -43,9 +43,9 @@ KV_PAGE_SIZE = 128
 # attribute set, but consume **different FC1 weight layouts** for SwiGLU MoE:
 #
 #   * SM100/101/110 expect FC1 packed as the 64-row up/gate interleave that
-#     ``_interleave_qwen3_swiglu_fc1`` produces.
+#     ``repack_nvfp4_gated_moe_experts(..., fc1_layout="interleave")`` produces.
 #   * SM12x expects FC1 packed as the plain ``[up_all, gate_all]`` concat
-#     that ``_concat_qwen3_swiglu_fc1`` produces.
+#     that ``repack_nvfp4_gated_moe_experts(..., fc1_layout="concat")`` produces.
 #
 # Repacking and modeling code call :func:`use_geforce_nvfp4_moe` to pick the
 # matching plugin op and FC1 layout at export time. Override via env var:

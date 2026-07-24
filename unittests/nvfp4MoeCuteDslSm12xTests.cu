@@ -44,8 +44,8 @@ namespace
 // SM12x NVFP4 fused MoE runner constants. The geometry (FP4 levels, FP8 SF
 // vector size, 6D MMA swizzle, alpha-with-scale dequant) is shared with the
 // SM110 plugin; the GeForce kernel differs in the FC1 SwiGLU output layout
-// (plain [up_all, gate_all] concat -- see _concat_qwen3_swiglu_fc1 in
-// tensorrt_edgellm/checkpoint/repacking.py).
+// (plain [up_all, gate_all] concat -- see repack_nvfp4_gated_moe_experts with
+// fc1_layout="concat" in tensorrt_edgellm/checkpoint/repacking.py).
 // ---------------------------------------------------------------------------
 constexpr int32_t kSfVecSize = 16;
 constexpr int32_t kRowTile = 128;
