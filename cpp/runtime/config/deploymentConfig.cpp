@@ -232,6 +232,10 @@ SpecDecodeMode DeploymentConfig::specDecodeMode() const noexcept
 
 int32_t DeploymentConfig::maxAcceptedTokensPerRound() const
 {
+    if (base.isDiffusionBackbone)
+    {
+        return std::max(1, base.diffusionCanvasLength);
+    }
     switch (specDecodeMode())
     {
     case SpecDecodeMode::kNONE: return 1;
@@ -258,6 +262,9 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
 
     // --- Parse base ---
     cfg.base = parseEngineConfig(baseConfigPath);
+
+    ELLM_CHECK(!cfg.base.isDiffusionBackbone || !draftingConfig.has_value(),
+        "DiffusionGemma block diffusion engines do not support speculative decoding drafting.");
 
     // --- Parse draft (if present) ---
     if (draftConfigPath.has_value())

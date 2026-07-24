@@ -36,11 +36,13 @@ __all__ = [
     "Gemma4Attention",
     "Gemma4ForCausalLM",
     "Gemma4DecoderLayer",
+    "Gemma4DenseMoEBlock",
     "Gemma4NvFP4MoEBlock",
     "Gemma4NvFP4MoEExperts",
     "Gemma4Transformer",
     "Gemma4ValueRMSNorm",
     "GEMMA4_NVFP4_KEY_REMAP",
+    "_gemma4_dense_moe_routing",
 ]
 
 # Plugin constants for ``Nvfp4MoePlugin`` (same as Qwen3 MoE).
@@ -89,6 +91,22 @@ def _num_kv_heads_for_attention_type(config: ModelConfig,
             and config.num_global_key_value_heads):
         return int(config.num_global_key_value_heads)
     return int(config.num_key_value_heads)
+
+
+def _gemma4_dense_moe_routing(
+    router_logits: torch.Tensor,
+    top_k: int,
+    per_expert_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return Gemma4 dense-MoE top-k expert weights and expert IDs."""
+    expert_ids = torch.topk(router_logits, k=top_k, dim=-1).indices
+    routing_weights = torch.softmax(router_logits.float(),
+                                    dim=-1).gather(1, expert_ids)
+    routing_weights = routing_weights / routing_weights.sum(dim=-1,
+                                                            keepdim=True)
+    routing_weights = routing_weights * per_expert_scale.to(
+        dtype=routing_weights.dtype, device=routing_weights.device)[expert_ids]
+    return routing_weights, expert_ids
 
 
 def _kv_cache_dims_for_layer(config: ModelConfig,
@@ -462,6 +480,7 @@ class Gemma4Attention(Attention):
         attention_mask: torch.Tensor | None = None,
         attention_pos_id: torch.Tensor | None = None,
         vision_block_ids: torch.Tensor | None = None,
+        context_mask_selector: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -515,8 +534,11 @@ class Gemma4Attention(Attention):
             "enable_tree_attention": enable_tree,
             "enable_fp8_kv_cache": self.enable_fp8_kv_cache,
             "attention_scale": self.attention_scale,
+            "enable_context_mask_selector": context_mask_selector is not None,
             "enable_vision_block_attention": enable_vision_block,
         }
+        if context_mask_selector is not None:
+            kwargs["context_mask_selector"] = context_mask_selector
         if enable_tree:
             kwargs["attention_mask"] = attention_mask
             kwargs["attention_pos_id"] = attention_pos_id
@@ -644,6 +666,48 @@ class Gemma4NvFP4MoEExperts(nn.Module):
 
     def __iter__(self):
         return iter(self._experts)
+
+
+class Gemma4DenseMoEBlock(nn.Module):
+    """Dense Gemma4 MoE fallback for non-NVFP4 checkpoints."""
+
+    def __init__(self, config: ModelConfig, layer_idx: int) -> None:
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+        self.hidden_size = config.hidden_size
+        self.router = Gemma4Router(config, layer_idx)
+        self.experts = Gemma4NvFP4MoEExperts(config)
+        self.act_fn = _resolve_hidden_activation(config.hidden_activation)
+
+    def forward(self, expert_input: torch.Tensor,
+                residual: torch.Tensor) -> torch.Tensor:
+        hidden_flat = residual.reshape(-1, self.hidden_size)
+        normed = self.router.norm(hidden_flat)
+        scaled = normed * (self.router.scale *
+                           self.router.scalar_root_size).to(normed.dtype)
+        router_logits = self.router.proj(scaled).float()
+        routing_weights, expert_ids = _gemma4_dense_moe_routing(
+            router_logits, self.top_k, self.router.per_expert_scale)
+
+        output = torch.zeros_like(expert_input)
+        for expert_idx, expert in enumerate(self.experts):
+            gate = self.act_fn(
+                expert.gate_proj(expert_input).to(torch.float32))
+            up = expert.up_proj(expert_input).to(torch.float32)
+            expert_output = expert.down_proj(
+                (gate * up).to(expert_input.dtype))
+            expert_weight = torch.sum(
+                torch.where(
+                    expert_ids == expert_idx,
+                    routing_weights,
+                    torch.zeros_like(routing_weights),
+                ),
+                dim=-1,
+                keepdim=True,
+            )
+            output = output + expert_output * expert_weight.to(output.dtype)
+        return output
 
 
 class Gemma4NvFP4MoEBlock(nn.Module):
@@ -794,23 +858,20 @@ class Gemma4DecoderLayer(DecoderLayer):
         self.register_buffer("layer_scalar", torch.ones(1))
 
         # MoE block: parallel routed experts alongside dense MLP (Gemma4 26B).
-        # Only NVFP4 quantization is supported for MoE.
+        # NVFP4 checkpoints use the TRT plugin; dense weights use a reference
+        # fallback for export smoke tests and non-quantized checkpoints.
         self.enable_moe_block = config.enable_moe_block
         if self.enable_moe_block:
-            if config.quant.quant_type != QUANT_NVFP4:
-                raise ValueError(
-                    "Gemma4 MoE requires NVFP4 quantization "
-                    f"(got quant_type={config.quant.quant_type!r})")
-            self.moe_block = Gemma4NvFP4MoEBlock(config, layer_idx)
+            if config.quant.quant_type == QUANT_NVFP4:
+                self.moe_block = Gemma4NvFP4MoEBlock(config, layer_idx)
+            else:
+                self.moe_block = Gemma4DenseMoEBlock(config, layer_idx)
             self.post_feedforward_layernorm_1 = RMSNorm(
                 config.hidden_size, config.rms_norm_eps)
             self.post_feedforward_layernorm_2 = RMSNorm(
                 config.hidden_size, config.rms_norm_eps)
             self.pre_feedforward_layernorm_2 = RMSNorm(config.hidden_size,
                                                        config.rms_norm_eps)
-
-        # HF applies layer_scalar unconditionally (it's 1.0 for non-PLE models).
-        self.register_buffer("layer_scalar", torch.ones(1))
 
         if self.hidden_size_per_layer_input > 0:
             self.per_layer_input_gate = make_linear(
@@ -865,6 +926,12 @@ class Gemma4DecoderLayer(DecoderLayer):
         gated = self.post_per_layer_input_norm(gated)
         return hidden_states + gated
 
+    def _layer_scalar(self, phase_is_encoder: torch.Tensor | None,
+                      hidden_states: torch.Tensor) -> torch.Tensor:
+        del phase_is_encoder
+        return self.layer_scalar.to(dtype=hidden_states.dtype,
+                                    device=hidden_states.device)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -876,7 +943,9 @@ class Gemma4DecoderLayer(DecoderLayer):
         attention_mask: torch.Tensor | None = None,
         attention_pos_id: torch.Tensor | None = None,
         vision_block_ids: torch.Tensor | None = None,
+        context_mask_selector: torch.Tensor | None = None,
         per_layer_input: torch.Tensor | None = None,
+        phase_is_encoder: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -890,6 +959,7 @@ class Gemma4DecoderLayer(DecoderLayer):
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
             vision_block_ids=vision_block_ids,
+            context_mask_selector=context_mask_selector,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
@@ -919,8 +989,8 @@ class Gemma4DecoderLayer(DecoderLayer):
 
         hidden_states = self._apply_per_layer_input(hidden_states,
                                                     per_layer_input)
-        hidden_states = hidden_states * self.layer_scalar.to(
-            dtype=hidden_states.dtype)
+        hidden_states = hidden_states * self._layer_scalar(
+            phase_is_encoder, hidden_states)
 
         return hidden_states, present_key_value
 
@@ -1046,6 +1116,8 @@ class Gemma4Transformer(nn.Module):
         attention_mask: torch.Tensor | None = None,
         attention_pos_id: torch.Tensor | None = None,
         vision_block_ids: torch.Tensor | None = None,
+        context_mask_selector: torch.Tensor | None = None,
+        phase_is_encoder: torch.Tensor | None = None,
         output_hidden_states: bool = False,
         target_layer_ids: List[int] | None = None,
         ple_token_embeds: Tuple[torch.Tensor, ...] = (),
@@ -1082,7 +1154,9 @@ class Gemma4Transformer(nn.Module):
                 attention_mask=attention_mask,
                 attention_pos_id=attention_pos_id,
                 vision_block_ids=vision_block_ids,
+                context_mask_selector=context_mask_selector,
                 per_layer_input=per_layer_input,
+                phase_is_encoder=phase_is_encoder,
             )
             present_key_values_list.append(next_key_value)
 

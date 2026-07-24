@@ -275,8 +275,8 @@ private:
     // [5] Multimodal support tensors for audio/image token indexing
     rt::Tensor mMultimodalIndices; //!< Multimodal indices tensor [batchSize, seqLen] for audio/image embeddings
 
-    // [6] Logprobs support tensors (allocated once in the constructor)
-    // logprobsRows = B (vanilla) or B * maxAcceptDepth (EAGLE, accepted rows only, not the full verify tree).
+    // [6] Logprobs support tensors. Non-Diffusion paths allocate at construction to preserve existing behavior.
+    // DiffusionGemma allocates lazily when a request asks for numLogprobs because its row count is B * canvasLen.
     rt::Tensor mDeviceLogprobsValues;  //!< GPU [logprobsRows, kMaxLogprobsK] top-K log-prob values
     rt::Tensor mDeviceLogprobsIndices; //!< GPU [logprobsRows, kMaxLogprobsK] top-K token indices
     rt::Tensor mHostLogprobsValues;    //!< CPU pinned D2H target for mDeviceLogprobsValues
@@ -295,8 +295,8 @@ private:
     int32_t mLastPrefillLength{0};                                        //!< Valid prefill length in buffers
     std::vector<std::vector<int32_t>> mLastInputTokenIds;                 //!< Per-batch input token IDs
 
-    //! @brief Allocate logprobs tensors. Called once from the constructor.
-    void allocateLogprobsTensors();
+    //! @brief Allocate or grow logprobs tensors/workspace to cover a request that enabled numLogprobs.
+    void ensureLogprobsCapacity(int32_t logprobsRows, int32_t topK);
 
     //! @brief Restore recurrent/conv states from a cached system prompt.
     void restoreRecurrentStates(int32_t batchIdx, SystemPromptKVCache const& cachedStates, cudaStream_t stream);

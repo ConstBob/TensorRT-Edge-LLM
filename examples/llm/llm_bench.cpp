@@ -37,6 +37,7 @@
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/sharedResources.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -607,6 +608,10 @@ int main(int argc, char** argv)
     std::unique_ptr<rt::DeepstackBinding> deepstack;
     rt::DeploymentConfig deployment;
     rt::Tensor contextMemory;
+    rt::Tensor diffusionCanvasIds;
+    rt::Tensor diffusionPrevSelfConditioningEmbeds;
+    rt::Tensor diffusionNextSelfConditioningEmbeds;
+    rt::Tensor diffusionSelfConditioningTemperature;
 
     // Visual mode uses MultimodalRunner (unchanged from legacy)
     std::unique_ptr<rt::MultimodalRunner> visualRunner;
@@ -717,6 +722,14 @@ int main(int argc, char** argv)
             LOG_ERROR("Failed to parse engine configuration: %s", e.what());
             return EXIT_FAILURE;
         }
+        if (deployment.base.isDiffusionBackbone && args.mode == BenchMode::kDECODE)
+        {
+            LOG_ERROR(
+                "llm_bench --mode decode is not a valid DiffusionGemma serving benchmark because DiffusionGemma decode "
+                "uses a denoise/sample/commit runtime state machine. Use llm_inference or add a dedicated "
+                "diffusion_decode bench mode for end-to-end DG decode timing.");
+            return EXIT_FAILURE;
+        }
 
         // --- Determine which engine this mode operates on ---
         bool const useDraftEngine = isDraftEngineMode(args.mode);
@@ -727,6 +740,10 @@ int main(int argc, char** argv)
         if (useDraftEngine)
         {
             enginePath = dir / "spec_draft.engine";
+        }
+        else if (deployment.base.isDiffusionBackbone)
+        {
+            enginePath = dir / "dllm.engine";
         }
         else
         {
@@ -795,7 +812,48 @@ int main(int argc, char** argv)
         }
         else
         {
-            rt::buildTensorMap(tensorMap, *io, *resources, deployment.base, /*kvCacheIndex=*/0);
+            if (deployment.base.isDiffusionBackbone)
+            {
+                rt::buildTensorMapForDiffusionBackbone(tensorMap, *io, *resources, deployment.base, /*kvCacheIndex=*/0);
+            }
+            else
+            {
+                rt::buildTensorMap(tensorMap, *io, *resources, deployment.base, /*kvCacheIndex=*/0);
+            }
+        }
+
+        if (!useDraftEngine && deployment.base.isDiffusionBackbone && deployment.base.diffusionUnifiedConditioning)
+        {
+            int32_t maxConditioningSeqLen = deployment.base.maxSupportedInputLength;
+            if (deployment.base.diffusionCanvasLength > maxConditioningSeqLen)
+            {
+                maxConditioningSeqLen = deployment.base.diffusionCanvasLength;
+            }
+            diffusionCanvasIds = rt::Tensor({maxBatch, maxConditioningSeqLen}, rt::DeviceType::kGPU,
+                nvinfer1::DataType::kINT32, "llm_bench::diffusionCanvasIds");
+            diffusionPrevSelfConditioningEmbeds
+                = rt::Tensor({maxBatch, maxConditioningSeqLen, deployment.base.hiddenSize}, rt::DeviceType::kGPU,
+                    nvinfer1::DataType::kHALF, "llm_bench::diffusionPrevSelfConditioningEmbeds");
+            diffusionNextSelfConditioningEmbeds
+                = rt::Tensor({maxBatch, maxConditioningSeqLen, deployment.base.hiddenSize}, rt::DeviceType::kGPU,
+                    nvinfer1::DataType::kHALF, "llm_bench::diffusionNextSelfConditioningEmbeds");
+            diffusionSelfConditioningTemperature = rt::Tensor({1}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT,
+                "llm_bench::diffusionSelfConditioningTemperature");
+
+            CUDA_CHECK(
+                cudaMemsetAsync(diffusionCanvasIds.rawPointer(), 0, diffusionCanvasIds.getMemoryCapacity(), stream));
+            CUDA_CHECK(cudaMemsetAsync(diffusionPrevSelfConditioningEmbeds.rawPointer(), 0,
+                diffusionPrevSelfConditioningEmbeds.getMemoryCapacity(), stream));
+            CUDA_CHECK(cudaMemsetAsync(diffusionNextSelfConditioningEmbeds.rawPointer(), 0,
+                diffusionNextSelfConditioningEmbeds.getMemoryCapacity(), stream));
+            float const diffusionTemperatureInit = 1.0F;
+            CUDA_CHECK(cudaMemcpyAsync(diffusionSelfConditioningTemperature.rawPointer(), &diffusionTemperatureInit,
+                sizeof(float), cudaMemcpyHostToDevice, stream));
+
+            tensorMap.set(binding_names::kCanvasIds, diffusionCanvasIds);
+            tensorMap.set(binding_names::kPrevSelfConditioningEmbeds, diffusionPrevSelfConditioningEmbeds);
+            tensorMap.set(binding_names::kNextSelfConditioningEmbeds, diffusionNextSelfConditioningEmbeds);
+            tensorMap.set(binding_names::kSelfConditioningTemperature, diffusionSelfConditioningTemperature);
         }
 
         // --- Load externalized model weights ---
@@ -814,7 +872,7 @@ int main(int argc, char** argv)
         stepPreparer = std::make_unique<rt::StepPreparer>(activeCfg);
 
         // --- DeepstackBinding (if applicable, base engine only) ---
-        if (!useDraftEngine && deployment.base.numDeepstackFeatures > 0)
+        if (!useDraftEngine && !deployment.base.isDiffusionBackbone && deployment.base.numDeepstackFeatures > 0)
         {
             deepstack = std::make_unique<rt::DeepstackBinding>(io->deepstackEmbeds, resources->zeroBuffer);
         }
@@ -888,6 +946,26 @@ int main(int argc, char** argv)
         // Reshape inputsEmbeds for this bench config
         check::check(
             io->inputsEmbeds.reshape({B, args.inputLen, deployment.base.hiddenSize}), "inputsEmbeds reshape failed");
+        if (deployment.base.isDiffusionBackbone)
+        {
+            check::check(
+                io->outputLogits.reshape({B, 1, deployment.base.outputVocabSize}), "outputLogits reshape failed");
+            check::check(io->phaseIsEncoder.reshape({B}), "phaseIsEncoder reshape failed");
+            check::check(io->hostPhaseIsEncoder.reshape({B}), "hostPhaseIsEncoder reshape failed");
+            int32_t* hostPhase = io->hostPhaseIsEncoder.dataPointer<int32_t>();
+            std::fill(hostPhase, hostPhase + B, 1);
+            CUDA_CHECK(cudaMemcpyAsync(
+                io->phaseIsEncoder.rawPointer(), hostPhase, B * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+            if (deployment.base.diffusionUnifiedConditioning)
+            {
+                check::check(diffusionCanvasIds.reshape({B, args.inputLen}), "diffusionCanvasIds reshape failed");
+                check::check(
+                    diffusionPrevSelfConditioningEmbeds.reshape({B, args.inputLen, deployment.base.hiddenSize}),
+                    "diffusionPrevSelfConditioningEmbeds reshape failed");
+                check::check(diffusionNextSelfConditioningEmbeds.reshape({B, 1, deployment.base.hiddenSize}),
+                    "diffusionNextSelfConditioningEmbeds reshape failed");
+            }
+        }
 
         // Set context lengths on PipelineIO (host side, for StepPreparer)
         int32_t const contextLen = args.reuseKVLen + args.inputLen;

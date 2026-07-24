@@ -82,6 +82,8 @@ _LLM = ["--is_causal", "--is_persistent", "--export_only", "--bottom_right_align
 _LLM_FP8 = _LLM + ["--in_dtype", "Float8E4M3FN"]
 _LLM_PAGED = _LLM + ["--paged_kv"]
 _LLM_FP8_PAGED = _LLM_FP8 + ["--paged_kv"]
+_LLM_DENSE_PAGED = ["--is_persistent", "--export_only", "--paged_kv"]
+_LLM_DENSE_FP8_PAGED = _LLM_DENSE_PAGED + ["--in_dtype", "Float8E4M3FN"]
 _VIT = ["--is_persistent", "--export_only", "--vit_mode"]
 
 
@@ -319,6 +321,20 @@ KERNEL_VARIANTS = [
         script_args=["--q_shape", "1,1024,8,512", "--k_shape", "1,1024,1,512"] + _LLM_FP8_PAGED,
     ),
     KernelVariant(
+        name="fmha_d512_dense_paged",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,8,512", "--k_shape", "1,1024,1,512"] + _LLM_DENSE_PAGED,
+    ),
+    KernelVariant(
+        name="fmha_d512_dense_paged_fp8",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,8,512", "--k_shape", "1,1024,1,512"] + _LLM_DENSE_FP8_PAGED,
+    ),
+    KernelVariant(
         name="fmha_d512_sw_paged_fp8",
         group="fmha",
         supported_sms=[100, 101, 110],
@@ -516,7 +532,7 @@ KERNEL_VARIANTS = [
         script="fmha_cutedsl_blackwell/fmha.py",
         script_args=["--q_shape", "1,1024,14,128", "--k_shape", "1,1024,14,128"] + _VIT,
     ),
-    # FFPA group which handles large head size attention
+    # FFPA group which handles large head size attention.
     KernelVariant(
         name="ffpa_d512_causal",
         group="ffpa",

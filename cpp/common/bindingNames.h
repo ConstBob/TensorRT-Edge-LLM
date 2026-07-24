@@ -66,6 +66,41 @@ inline constexpr char const* kContextLengths = "context_lengths";
 inline constexpr char const* kLastTokenIds = "last_token_ids";
 
 /*!
+ * @brief DiffusionGemma phase selector. Non-zero selects encoder-phase layer scalars.
+ */
+inline constexpr char const* kPhaseIsEncoder = "phase_is_encoder";
+
+/*!
+ * @brief DiffusionGemma hidden-state gather indices for logits output.
+ */
+inline constexpr char const* kSelectTokenIndices = "select_token_indices";
+
+/*!
+ * @brief DiffusionGemma context-mask shape selector: [0] causal, [B] padding/non-causal.
+ */
+inline constexpr char const* kContextMaskSelector = "context_mask_selector";
+
+/*!
+ * @brief DiffusionGemma fused conditioning engine canvas token IDs.
+ */
+inline constexpr char const* kCanvasIds = "canvas_ids";
+
+/*!
+ * @brief DiffusionGemma fused conditioning engine previous hidden feedback embeddings.
+ */
+inline constexpr char const* kPrevSelfConditioningEmbeds = "prev_self_conditioning_embeds";
+
+/*!
+ * @brief DiffusionGemma fused conditioning engine next hidden feedback embeddings.
+ */
+inline constexpr char const* kNextSelfConditioningEmbeds = "next_self_conditioning_embeds";
+
+/*!
+ * @brief DiffusionGemma fused conditioning engine feedback softmax temperature.
+ */
+inline constexpr char const* kSelfConditioningTemperature = "self_conditioning_temperature";
+
+/*!
  * @brief Output logits tensor - probability distribution over vocabulary
  *
  * Shape: [batch_size, vocab_size] or [select_tokens, vocab_size] (FLOAT32)

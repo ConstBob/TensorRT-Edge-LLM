@@ -16,6 +16,7 @@
  */
 
 #pragma once
+#include <algorithm>
 #include <cassert>
 #include <filesystem>
 #include <forward_list>
@@ -43,8 +44,11 @@ namespace tokenizer
  */
 struct ChatTemplateRole
 {
-    std::string prefix; //!< Prefix for this role
-    std::string suffix; //!< Suffix for this role
+    std::string prefix;         //!< Prefix for this role
+    std::string suffix;         //!< Suffix for this role
+    std::string prefixThinking; //!< Prefix when thinking mode is enabled
+    std::string suffixThinking; //!< Suffix when thinking mode is enabled
+    bool trimContent{false};    //!< Trim text content before applying suffix
 };
 
 /*!
@@ -212,6 +216,31 @@ public:
     }
 
     /*!
+     * @brief Get all configured end-of-sequence token IDs.
+     * @return EOS token IDs, including IDs injected from engine config when present.
+     */
+    std::vector<Rank> getEosIds() const
+    {
+        std::vector<Rank> eosIds;
+        if (mEosId >= 0)
+        {
+            eosIds.push_back(mEosId);
+        }
+        eosIds.insert(eosIds.end(), mAdditionalEosIds.begin(), mAdditionalEosIds.end());
+        return eosIds;
+    }
+
+    /*!
+     * @brief Check whether a token is one of the configured EOS IDs.
+     * @param token Token ID to check
+     * @return true if the token is an EOS token
+     */
+    bool isEosId(Rank token) const noexcept
+    {
+        return isEosToken(token);
+    }
+
+    /*!
      * @brief Check if a token is an end-of-sequence token
      * @param tokenId Token ID to check
      * @return true if the token is any EOS token (primary or additional)
@@ -234,7 +263,7 @@ public:
 
     /*!
      * @brief Set additional end-of-sequence token IDs
-     * @param ids Vector of additional EOS token IDs (from config.json eos_token_id array)
+     * @param ids Vector of EOS token IDs from engine config.
      */
     void setAdditionalEosIds(std::vector<Rank> const& ids)
     {
@@ -243,7 +272,12 @@ public:
         {
             if (id != mEosId && id >= 0)
             {
-                mAdditionalEosIds.push_back(id);
+                bool const duplicate
+                    = std::find(mAdditionalEosIds.begin(), mAdditionalEosIds.end(), id) != mAdditionalEosIds.end();
+                if (!duplicate)
+                {
+                    mAdditionalEosIds.push_back(id);
+                }
             }
         }
     }

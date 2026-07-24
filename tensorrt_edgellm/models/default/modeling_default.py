@@ -336,6 +336,7 @@ class Attention(nn.Module):
             "enable_tree_attention": enable_tree,
             "enable_fp8_kv_cache": self.enable_fp8_kv_cache,
             "attention_scale": self.attention_scale,
+            "enable_context_mask_selector": False,
             "enable_vision_block_attention": False,
         }
         if enable_tree:

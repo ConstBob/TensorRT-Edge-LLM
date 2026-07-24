@@ -141,12 +141,12 @@ SpecDecodeMode parseSpecDecodeMode(Json const& configJson)
 std::string parseEngineRole(Json const& configJson)
 {
     std::string const engineRole = configJson.value("engine_role", "llm");
-    if (engineRole == "llm" || engineRole == "base" || engineRole == "draft")
+    if (engineRole == "llm" || engineRole == "base" || engineRole == "draft" || engineRole == "dllm")
     {
         return engineRole;
     }
     throw std::runtime_error(
-        "parseEngineConfig: invalid engine_role '" + engineRole + "'. Allowed values: llm, base, draft.");
+        "parseEngineConfig: invalid engine_role '" + engineRole + "'. Allowed values: llm, base, draft, dllm.");
 }
 
 void validateSpecTargetLayerIds(std::vector<int32_t> const& targetLayerIds, int32_t numDecoderLayers,
@@ -534,6 +534,7 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     std::string const engineRole = parseEngineRole(configJson);
     ELLM_CHECK(engineRole != "draft", "parseEngineConfig: use parseDraftEngineConfig for engine_role=draft.");
     cfg.isSpecDecodeBase = (engineRole == "base");
+    cfg.isDiffusionBackbone = (engineRole == "dllm");
     if (cfg.isSpecDecodeBase)
     {
         ELLM_CHECK(cfg.specDecodeType != SpecDecodeMode::kNONE,
@@ -543,7 +544,35 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     else
     {
         ELLM_CHECK(cfg.specDecodeType == SpecDecodeMode::kNONE,
-            "parseEngineConfig: engine_role=llm requires spec_decode_type=none.");
+            "parseEngineConfig: non-speculative engine roles require spec_decode_type=none.");
+    }
+
+    if (cfg.isDiffusionBackbone)
+    {
+        Json const empty = Json::object();
+        Json const& diffusionConfig = configJson.contains("diffusion_config") ? configJson["diffusion_config"] : empty;
+        cfg.contextMaskSelectorEnabled = configJson.value("context_mask_selector_enabled", true);
+        cfg.diffusionUnifiedConditioning = configJson.value("diffusion_unified_conditioning", false);
+        cfg.diffusionCanvasLength = diffusionConfig.value("canvas_length", configJson.value("canvas_length", 256));
+        cfg.diffusionMaxDenoisingSteps
+            = diffusionConfig.value("max_denoising_steps", configJson.value("max_denoising_steps", 48));
+        cfg.diffusionSelfConditioningSize = configJson.value("self_conditioning_size", 0);
+        cfg.diffusionTMax = diffusionConfig.value("t_max", 0.8F);
+        cfg.diffusionTMin = diffusionConfig.value("t_min", 0.4F);
+        cfg.diffusionEntropyBound = diffusionConfig.value("entropy_bound", 0.1F);
+        cfg.diffusionEntropyThreshold = diffusionConfig.value("entropy_threshold", 0.005F);
+        cfg.rmsNormEps = configJson.value("rms_norm_eps", 1.0e-6F);
+        cfg.diffusionStabilityWindow = diffusionConfig.value("stability_window", 2);
+        requirePositive(cfg.diffusionCanvasLength, "diffusion canvas_length");
+        requirePositive(cfg.diffusionMaxDenoisingSteps, "diffusion max_denoising_steps");
+        requirePositive(cfg.diffusionStabilityWindow, "diffusion stability_window");
+        ELLM_CHECK(cfg.diffusionUnifiedConditioning,
+            "parseEngineConfig: DiffusionGemma dllm engines require diffusion_unified_conditioning=true. Re-export the "
+            "model with the latest DiffusionGemma exporter and rebuild the engine.");
+        ELLM_CHECK(cfg.diffusionTMax > 0.0F && cfg.diffusionTMin > 0.0F,
+            "parseEngineConfig: diffusion t_min/t_max must be positive");
+        ELLM_CHECK(cfg.diffusionEntropyBound >= 0.0F && cfg.diffusionEntropyThreshold >= 0.0F,
+            "parseEngineConfig: diffusion entropy thresholds must be non-negative");
     }
 
     // Shared core fields (layers, kv heads, head_dim, hidden_size, kv_cache_dtype,
@@ -558,7 +587,7 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     cfg.reducedVocabSize = configJson.value(binding_names::kReducedVocabSizeKey, 0);
     cfg.outputVocabSize = (cfg.reducedVocabSize > 0) ? cfg.reducedVocabSize : cfg.vocabSize;
 
-    cfg.numDeepstackFeatures = configJson.value("num_deepstack_features", 0);
+    cfg.numDeepstackFeatures = cfg.isDiffusionBackbone ? 0 : configJson.value("num_deepstack_features", 0);
     cfg.pleEnabled = configJson.value("ple_enabled", false);
     cfg.numPleInputs = configJson.value("num_ple_inputs", 0);
     cfg.pleHiddenSize = configJson.value("ple_hidden_size", 0);
@@ -826,7 +855,9 @@ std::string formatEngineConfig(LLMEngineConfig const& cfg)
         for (size_t i = 0; i < cfg.eosTokenIds.size(); ++i)
         {
             if (i > 0)
+            {
                 ss << ",";
+            }
             ss << cfg.eosTokenIds[i];
         }
         ss << "]";
@@ -836,6 +867,15 @@ std::string formatEngineConfig(LLMEngineConfig const& cfg)
         ss << " modelType=" << cfg.modelType << " sharesTargetKV=" << cfg.sharesTargetKV
            << " hasOwnKVCache=" << cfg.hasOwnKVCache << " assistantHiddenSize=" << cfg.assistantHiddenSize
            << " kvSharingMap=" << cfg.gemma4MTPKVSharingMap.size();
+    }
+    if (cfg.isDiffusionBackbone)
+    {
+        ss << " diffusionCanvasLength=" << cfg.diffusionCanvasLength
+           << " diffusionMaxDenoisingSteps=" << cfg.diffusionMaxDenoisingSteps << " diffusionTMin=" << cfg.diffusionTMin
+           << " diffusionTMax=" << cfg.diffusionTMax << " diffusionEntropyBound=" << cfg.diffusionEntropyBound
+           << " diffusionEntropyThreshold=" << cfg.diffusionEntropyThreshold << " rmsNormEps=" << cfg.rmsNormEps
+           << " diffusionStabilityWindow=" << cfg.diffusionStabilityWindow
+           << " diffusionUnifiedConditioning=" << cfg.diffusionUnifiedConditioning;
     }
     ss << " }";
     return ss.str();
@@ -861,17 +901,23 @@ InferenceDims LLMEngineConfig::prefillDims(int64_t batch, int64_t seqLen, bool k
     // larger attention shape would be interpreted as a proposal-attention mask
     // and read uninitialized buffer bits, producing garbage outputs.
     //
-    // startIndexLen=0 is the plugin-path sentinel for "initial prefill of an
-    // empty KV cache"; chunked prefill uses [batch].
-    int64_t const startIndexLen = kvCacheAllEmpty ? 0 : batch;
+    // startIndexLen=0 is the autoregressive plugin-path sentinel for "initial
+    // prefill of an empty KV cache"; chunked prefill uses [batch].
+    // DiffusionGemma keeps kvcache_start_index materialized and uses
+    // context_mask_selector's shape sentinel to switch attention mask modes.
+    int64_t const startIndexLen = (kvCacheAllEmpty && !isDiffusionBackbone) ? 0 : batch;
+    // Keep KV cache binding shape at physical capacity for CUDA graph stability.
+    // Logical work length is carried by context_lengths + kvcache_start_index.
+    int64_t const kvLen = maxKVCacheCapacity;
     return InferenceDims{
         /*.batch=*/batch,
         /*.seqLen=*/seqLen,
-        /*.kvLen=*/maxKVCacheCapacity,
+        /*.kvLen=*/kvLen,
         /*.selectLen=*/1,
         /*.attnMaskSeqLen=*/1,
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
         /*.packedMaskLen=*/1,
+        /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/startIndexLen,
         /*.specVerifyPhaseLen=*/0,
     };
@@ -887,6 +933,39 @@ InferenceDims LLMEngineConfig::decodeDims(int64_t batch) const
         /*.attnMaskSeqLen=*/1,
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
         /*.packedMaskLen=*/1,
+        /*.contextMaskSelectorLen=*/0,
+        /*.startIndexLen=*/batch,
+        /*.specVerifyPhaseLen=*/0,
+    };
+}
+
+InferenceDims LLMEngineConfig::denoiseDims(int64_t batch, int64_t canvasLen) const
+{
+    return InferenceDims{
+        /*.batch=*/batch,
+        /*.seqLen=*/canvasLen,
+        /*.kvLen=*/maxKVCacheCapacity,
+        /*.selectLen=*/canvasLen,
+        /*.attnMaskSeqLen=*/1,
+        /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
+        /*.packedMaskLen=*/1,
+        /*.contextMaskSelectorLen=*/batch,
+        /*.startIndexLen=*/batch,
+        /*.specVerifyPhaseLen=*/0,
+    };
+}
+
+InferenceDims LLMEngineConfig::diffusionCommitDims(int64_t batch, int64_t commitLen) const
+{
+    return InferenceDims{
+        /*.batch=*/batch,
+        /*.seqLen=*/commitLen,
+        /*.kvLen=*/maxKVCacheCapacity,
+        /*.selectLen=*/commitLen,
+        /*.attnMaskSeqLen=*/1,
+        /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
+        /*.packedMaskLen=*/1,
+        /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/batch,
         /*.specVerifyPhaseLen=*/0,
     };
@@ -905,6 +984,7 @@ InferenceDims LLMEngineConfig::specVerifyDims(int64_t batch, int64_t verifySize)
         /*.attnMaskSeqLen=*/verifySize,
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
         /*.packedMaskLen=*/static_cast<int64_t>(divUp(verifySize, 32)),
+        /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/batch,
         /*.specVerifyPhaseLen=*/1,
     };
@@ -925,6 +1005,7 @@ InferenceDims LLMEngineConfig::proposalDims(int64_t batch, int64_t proposalSize,
         /*.attnMaskSeqLen=*/proposalSize,
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
         /*.packedMaskLen=*/static_cast<int64_t>(divUp(proposalSize, 32)),
+        /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/batch,
         /*.specVerifyPhaseLen=*/0,
     };
@@ -944,6 +1025,7 @@ InferenceDims LLMEngineConfig::acceptDims(int64_t batch, int64_t acceptLen) cons
         /*.attnMaskSeqLen=*/acceptLen,
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
         /*.packedMaskLen=*/static_cast<int64_t>(divUp(acceptLen, 32)),
+        /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/batch,
         /*.specVerifyPhaseLen=*/0,
     };
@@ -1192,6 +1274,7 @@ InferenceDims LLMEngineConfig::resetDims() const
         /*.attnMaskSeqLen=*/1,
         /*.ropeBatch=*/1,
         /*.packedMaskLen=*/1,
+        /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/1,
         /*.specVerifyPhaseLen=*/0,
     };

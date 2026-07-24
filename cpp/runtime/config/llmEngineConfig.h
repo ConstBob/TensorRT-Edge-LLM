@@ -75,9 +75,21 @@ struct LLMEngineConfig
     int32_t numDecoderLayers{};        //!< Total decoder layers (attention + linear)
     int32_t vocabSize{};               //!< Full vocabulary size
     int32_t reducedVocabSize{0};       //!< 0 = no vocab reduction
+    int32_t diffusionCanvasLength{0};
+    int32_t diffusionMaxDenoisingSteps{0};
+    int32_t diffusionSelfConditioningSize{0};
+    float diffusionTMax{0.8F};
+    float diffusionTMin{0.4F};
+    float diffusionEntropyBound{0.1F};
+    float diffusionEntropyThreshold{0.005F};
+    float rmsNormEps{1.0e-6F};
+    int32_t diffusionStabilityWindow{2};
 
     // --- Feature flags ---
-    bool isSpecDecodeBase{false}; //!< Base engine exposes speculative decoding verification bindings
+    bool isSpecDecodeBase{false};             //!< Base engine exposes speculative decoding verification bindings
+    bool isDiffusionBackbone{false};          //!< DiffusionGemma phase-aware transformer backbone engine
+    bool diffusionUnifiedConditioning{false}; //!< Backbone engine owns DiffusionGemma self-conditioning inputs
+    bool contextMaskSelectorEnabled{false};   //!< Engine exposes context_mask_selector binding
     SpecDecodeMode specDecodeType{
         SpecDecodeMode::kNONE}; //!< Speculative decoding strategy mode (parsed from spec_decode_type)
     //! KV cache data type. Parsed from required top-level `kv_cache_dtype` in
@@ -215,13 +227,24 @@ struct LLMEngineConfig
     //! Prefill dims (vanilla LLM, SpecDecode base, and SpecDecode draft).
     //! seqLen is the prompt length being processed this step.
     //! kvCacheAllEmpty signals whether this is the initial prefill of an empty
-    //! KV cache — this drives the `kvcache_start_index` shape to `[0]` (engine's
-    //! "initial prefill" sentinel) instead of `[batch]`.
+    //! KV cache — this drives autoregressive engines' `kvcache_start_index`
+    //! shape to `[0]` (engine's "initial prefill" sentinel) instead of `[batch]`.
+    //! DiffusionGemma keeps `kvcache_start_index` at `[batch]` and uses
+    //! `context_mask_selector` as its attention-mask sentinel.
     InferenceDims prefillDims(int64_t batch, int64_t seqLen, bool kvCacheAllEmpty) const;
 
     //! Vanilla single-token decode dims.
     //! seqLen is always 1 here; packedMaskLen is 1 (no proposal mask in vanilla).
     InferenceDims decodeDims(int64_t batch) const;
+
+    //! DiffusionGemma denoise dims. Uses existing chunked-prefill execution:
+    //! seqLen/selectLen are the canvas length, kvcache_start_index is [batch],
+    //! and context_mask_selector is [batch] to select non-causal PADDING mask.
+    InferenceDims denoiseDims(int64_t batch, int64_t canvasLen) const;
+
+    //! DiffusionGemma commit dims. Reruns finalized tokens causally before KV
+    //! commit; context_mask_selector is [0], so AttentionPlugin keeps causal mask.
+    InferenceDims diffusionCommitDims(int64_t batch, int64_t commitLen) const;
 
     //! SpecDecode base verification dims.
     //! verifySize feeds three fields: seqLen, selectLen, and packedMaskLen.

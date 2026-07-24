@@ -49,8 +49,11 @@ static int32_t computeFloorNumPages(int32_t maxBatchSize, int32_t maxKVCacheCapa
 void addRopeTensorSpecs(TensorRegistry& reg, LLMEngineConfig const& cfg)
 {
     auto addRopeTensor = [&](char const* name, int32_t rotaryDim) {
+        // RoPE caches are exported/bound as full-length lookup tables. KV cache
+        // tensors also bind physical capacity; logical lengths come from the
+        // runtime length tensors.
         reg.addTensor({name, TensorIO::kInput, nvinfer1::DataType::kFLOAT,
-            {sym(&InferenceDims::ropeBatch), sym(&InferenceDims::kvLen), fixed(rotaryDim)}});
+            {sym(&InferenceDims::ropeBatch), fixed(cfg.maxKVCacheCapacity), fixed(rotaryDim)}});
     };
 
     if (cfg.useDualRope)
@@ -75,20 +78,58 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
     reg.addTensor({binding_names::kInputsEmbeds, TensorIO::kInput, nvinfer1::DataType::kHALF,
         {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(cfg.hiddenSize)}});
 
-    // logits: [batch, outputVocabSize] FLOAT for vanilla, or
-    // [batch, seq_len, outputVocabSize] for SpecDecode. The engine binding
-    // shape depends on mode, but output address is always set.
-    // For the registry we use the common 2D shape; SpecDecode resolves via symbolic dims.
-    reg.addTensor({binding_names::kLogits, TensorIO::kOutput, nvinfer1::DataType::kFLOAT,
-        {sym(&InferenceDims::batch), fixed(cfg.outputVocabSize)}});
+    if (cfg.isDiffusionBackbone)
+    {
+        // DiffusionGemma backbone emits F32 logits for every selected canvas token.
+        reg.addTensor({binding_names::kLogits, TensorIO::kOutput, nvinfer1::DataType::kFLOAT,
+            {sym(&InferenceDims::batch), sym(&InferenceDims::selectLen), fixed(cfg.outputVocabSize)}});
+    }
+    else
+    {
+        // logits: [batch, outputVocabSize] FLOAT for vanilla, or
+        // [batch, seq_len, outputVocabSize] for SpecDecode. The engine binding
+        // shape depends on mode, but output address is always set.
+        // For the registry we use the common 2D shape; SpecDecode resolves via symbolic dims.
+        reg.addTensor({binding_names::kLogits, TensorIO::kOutput, nvinfer1::DataType::kFLOAT,
+            {sym(&InferenceDims::batch), fixed(cfg.outputVocabSize)}});
+    }
 
     // context_lengths: [batch] INT32
     reg.addTensor(
         {binding_names::kContextLengths, TensorIO::kInput, nvinfer1::DataType::kINT32, {sym(&InferenceDims::batch)}});
 
-    // last_token_ids: [batch, select_len] INT64 — always [batch, 1] for vanilla, varies for SpecDecode.
-    reg.addTensor({binding_names::kLastTokenIds, TensorIO::kInput, nvinfer1::DataType::kINT64,
-        {sym(&InferenceDims::batch), sym(&InferenceDims::selectLen)}});
+    if (cfg.isDiffusionBackbone)
+    {
+        // phase_is_encoder: [batch] INT32. Non-zero selects encoder-phase layer scalars.
+        reg.addTensor({binding_names::kPhaseIsEncoder, TensorIO::kInput, nvinfer1::DataType::kINT32,
+            {sym(&InferenceDims::batch)}});
+
+        // select_token_indices: [batch, select_len] INT64. Denoise selects the full canvas.
+        reg.addTensor({binding_names::kSelectTokenIndices, TensorIO::kInput, nvinfer1::DataType::kINT64,
+            {sym(&InferenceDims::batch), sym(&InferenceDims::selectLen)}});
+
+        if (cfg.diffusionUnifiedConditioning)
+        {
+            // Unified DiffusionGemma ONNX embeds the self-conditioning graph in the backbone.
+            // These inputs share ONNX's seq_len symbol with inputs_embeds, so
+            // TRT requires equal binding dimensions even in encoder prefill
+            // where the branch does not read conditioning values.
+            reg.addTensor({binding_names::kCanvasIds, TensorIO::kInput, nvinfer1::DataType::kINT32,
+                {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen)}});
+            reg.addTensor({binding_names::kPrevSelfConditioningEmbeds, TensorIO::kInput, nvinfer1::DataType::kHALF,
+                {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(cfg.hiddenSize)}});
+            reg.addTensor({binding_names::kSelfConditioningTemperature, TensorIO::kInput, nvinfer1::DataType::kFLOAT,
+                {fixed(1)}});
+            reg.addTensor({binding_names::kNextSelfConditioningEmbeds, TensorIO::kOutput, nvinfer1::DataType::kHALF,
+                {sym(&InferenceDims::batch), sym(&InferenceDims::selectLen), fixed(cfg.hiddenSize)}});
+        }
+    }
+    else
+    {
+        // last_token_ids: [batch, select_len] INT64 — always [batch, 1] for vanilla, varies for SpecDecode.
+        reg.addTensor({binding_names::kLastTokenIds, TensorIO::kInput, nvinfer1::DataType::kINT64,
+            {sym(&InferenceDims::batch), sym(&InferenceDims::selectLen)}});
+    }
 
     // kvcache_start_index: [start_index_len] INT32. The engine's context profile
     // uses shape [0] as a sentinel for "initial prefill of an empty KV cache";
@@ -99,11 +140,19 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
     // the bound address and the engine branches to the initial-prefill path.
     reg.addTensor({binding_names::kKVCacheStartIndex, TensorIO::kInput, nvinfer1::DataType::kINT32,
         {sym(&InferenceDims::startIndexLen)}});
+    int32_t const maxPagesPerSeq = rt::computeMaxPagesPerSeq(cfg.maxKVCacheCapacity);
+    reg.addTensor({binding_names::kKVPageTable, TensorIO::kInput, nvinfer1::DataType::kINT32,
+        {sym(&InferenceDims::batch), fixed(2), fixed(maxPagesPerSeq)}});
 
     if (cfg.useVisionBidirectionalAttention)
     {
         reg.addTensor({binding_names::kVisionBlockIds, TensorIO::kInput, nvinfer1::DataType::kINT32,
             {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen)}});
+    }
+    if (cfg.contextMaskSelectorEnabled)
+    {
+        reg.addTensor({binding_names::kContextMaskSelector, TensorIO::kInput, nvinfer1::DataType::kINT32,
+            {sym(&InferenceDims::contextMaskSelectorLen)}});
     }
 
     // RoPE cache inputs: single binding for single-RoPE models, explicit
@@ -185,7 +234,7 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
     // ---------------------------------------------------------------
     // Deepstack (Qwen3-VL / Qwen3-Omni)
     // ---------------------------------------------------------------
-    if (cfg.numDeepstackFeatures > 0)
+    if (!cfg.isDiffusionBackbone && cfg.numDeepstackFeatures > 0)
     {
         // deepstack_embeds_%d: [batch, seq_len, hiddenSize] HALF — one per feature.
         // DeepstackBinding swaps the backing tensor (real per-request buffer
@@ -280,6 +329,12 @@ TensorRegistry buildRegistryForSpecDecodeDraft(DeploymentConfig const& bundle)
     // KV cache); [batch] for proposal / accept.
     reg.addTensor({binding_names::kKVCacheStartIndex, TensorIO::kInput, nvinfer1::DataType::kINT32,
         {sym(&InferenceDims::startIndexLen)}});
+
+    if (cfg.contextMaskSelectorEnabled)
+    {
+        reg.addTensor({binding_names::kContextMaskSelector, TensorIO::kInput, nvinfer1::DataType::kINT32,
+            {sym(&InferenceDims::contextMaskSelectorLen)}});
+    }
 
     // RoPE cache inputs: single binding for single-RoPE models, explicit
     // sliding/full bindings for mixed-attention dual-RoPE models.

@@ -245,6 +245,14 @@ private:
     bool setupSpecDecodeProfiles(
         nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
 
+    //! Set up optimization profiles for the DiffusionGemma backbone engine.
+    //! Configures full-canvas denoise shapes and finalized-token commit shapes.
+    //! @param contextProfile Optimization profile for prompt/commit processing
+    //! @param generationProfile Optimization profile for denoise processing
+    //! @return true if setup was successful, false otherwise
+    bool setupDiffusionBackboneProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+        nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network);
+
     //! Set up optimization profiles for DFlash draft models.
     //! DFlash draft consumes proposal embeddings, dflash_target_hidden_concat,
     //! dflash_delta_lengths, and per-layer KV cache bindings.
@@ -404,6 +412,8 @@ private:
     int32_t mConvDim{0};                //!< Conv state dimension
     int32_t mConvKernel{0};             //!< Conv kernel size (d_conv)
     Json mModelConfig;                  //!< Parsed model configuration
+    bool mIsDiffusionBackbone{false};   //!< Whether this builder builds the DiffusionGemma DLLM engine
+    int64_t mDiffusionCanvasLength{0};  //!< DiffusionGemma fixed canvas/block length
 };
 
 } // namespace builder

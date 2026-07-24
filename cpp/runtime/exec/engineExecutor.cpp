@@ -168,11 +168,12 @@ bool EngineExecutor::prepare(int32_t profileIndex, InferenceDims const& dims, Te
         return false;
     }
 
-    if (!mContext->setOptimizationProfileAsync(profileIndex, stream))
+    if (mCurrentProfileIndex != profileIndex && !mContext->setOptimizationProfileAsync(profileIndex, stream))
     {
         LOG_ERROR("failed to set optimization profile %d", profileIndex);
         return false;
     }
+    mCurrentProfileIndex = profileIndex;
 
     if (!mRegistry.bindAll(mContext.get(), map, dims))
     {

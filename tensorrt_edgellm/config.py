@@ -48,10 +48,11 @@ is absent (e.g. NemotronH-4B-BF16), it is derived from the ``conv1d.weight``
 shape in the checkpoint to break the circular dependency with ``n_groups``.
 """
 
+import fnmatch
 import json
 import math
 import os
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 if TYPE_CHECKING:
@@ -88,9 +89,36 @@ LAYER_MOE = "moe"
 
 _VALID_ATTENTION_LAYER_TYPES = ("sliding_attention", "full_attention")
 
+_DIFFUSION_GEMMA_MODEL_TYPES = frozenset({
+    "diffusion_gemma",
+    "diffusion_gemma_text",
+    "diffusiongemma",
+})
+_DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
+
+
+def _is_diffusion_gemma_model_type(model_type: str) -> bool:
+    return str(model_type).lower() in _DIFFUSION_GEMMA_MODEL_TYPES
+
+
+def _is_diffusion_gemma_config(root_dict: Dict[str, Any],
+                               llm_dict: Dict[str, Any]) -> bool:
+    model_type = str(
+        root_dict.get("model_type", llm_dict.get("model_type", ""))).lower()
+    architectures_value = (root_dict.get("architectures")
+                           or llm_dict.get("architectures") or [])
+    if isinstance(architectures_value, str):
+        architectures = [architectures_value]
+    else:
+        architectures = [str(x) for x in architectures_value]
+    return (_is_diffusion_gemma_model_type(model_type)
+            or any("DiffusionGemma" in arch for arch in architectures))
+
 
 def _is_gemma4_model_type(model_type: str) -> bool:
-    return str(model_type).startswith("gemma4")
+    model_type = str(model_type)
+    return (model_type.startswith("gemma4")
+            or _is_diffusion_gemma_model_type(model_type))
 
 
 def _check_num_attention_heads(num_attn_heads: int) -> None:
@@ -403,7 +431,9 @@ def module_quant_type(module_name: str, model_config: "ModelConfig") -> str:
     (e.g. ``"lm_head"``).
     """
     quant = model_config.quant
-    if module_name and module_name in quant.excluded:
+    if module_name and any(
+            fnmatch.fnmatchcase(module_name, pattern)
+            for pattern in quant.excluded):
         return QUANT_FP16
     # Tied lm_head with no explicit override and an unquantized backbone has
     # no separate lm_head.weight in the checkpoint; treat it as fp16 so the
@@ -467,6 +497,59 @@ class GdnConfig:
 
 
 @dataclass
+class DiffusionConfig:
+    """Block-diffusion generation parameters parsed at export time."""
+
+    diffusion_family: str = "uniform_renoise"
+    canvas_length: int = 256
+    max_denoising_steps: int = _DEFAULT_DIFFUSION_MAX_DENOISING_STEPS
+    t_max: float = 0.8
+    t_min: float = 0.4
+    sampler_type: str = "entropy_bound"
+    entropy_bound: float = 0.1
+    entropy_threshold: float = 0.005
+    stability_window: int = 2
+    self_conditioning_enabled: bool = True
+    self_conditioning_repr: str = "embeds"
+    supported_modalities: List[str] = field(default_factory=lambda: ["text"])
+
+    @classmethod
+    def from_hf(
+            cls,
+            hf_config: Dict[str, Any],
+            gen_config: Optional[Dict[str, Any]] = None) -> "DiffusionConfig":
+        gen_config = gen_config or {}
+        sampler_cfg = gen_config.get("sampler_config", {}) or {}
+        sampler_name = str(sampler_cfg.get("_cls_name", "EntropyBound"))
+        sampler_type = ("entropy_bound"
+                        if "entropybound" in sampler_name.lower().replace(
+                            "_", "") else sampler_name.lower())
+        return cls(
+            canvas_length=int(
+                hf_config.get("canvas_length",
+                              gen_config.get("canvas_length", 256))),
+            max_denoising_steps=int(
+                gen_config.get("max_denoising_steps",
+                               _DEFAULT_DIFFUSION_MAX_DENOISING_STEPS)),
+            t_max=float(gen_config.get("t_max", 0.8)),
+            t_min=float(gen_config.get("t_min", 0.4)),
+            sampler_type=sampler_type,
+            entropy_bound=float(
+                sampler_cfg.get("entropy_bound",
+                                gen_config.get("entropy_bound", 0.1))),
+            entropy_threshold=float(
+                gen_config.get("entropy_threshold",
+                               gen_config.get("confidence_threshold", 0.005))),
+            stability_window=int(
+                gen_config.get("stability_window",
+                               gen_config.get("stability_threshold", 2))),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class ModelConfig:
     """Flat model hyper-parameter config consumed by module builders."""
 
@@ -520,6 +603,11 @@ class ModelConfig:
     # Gemma4 full/global attention reuses k_proj(hidden_states) as the value
     # projection source when enabled.
     attention_k_eq_v: bool = False
+    # DiffusionGemma uses one shared backbone with phase-dependent layer scalars.
+    encoder_layer_scalars: List[float] = field(default_factory=list)
+    decoder_layer_scalars: List[float] = field(default_factory=list)
+    self_conditioning_size: int = 0
+    diffusion: Optional[DiffusionConfig] = None
     # Multiplicative scale applied by the HF embedding module.
     embedding_scale: float = 1.0
     # Final logit softcapping: tanh(logits/cap)*cap.  None = disabled.
@@ -678,7 +766,7 @@ class ModelConfig:
     # tp_size>1 returns a per-rank ONNX graph with col/row-parallel projections.
     mapping: Mapping = field(default_factory=Mapping)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         # For standalone models, num_kv_shared_layers < num_hidden_layers is
         # required so that at least one non-shared donor layer exists.
         # Gemma4 assistant models (shares_target_kv=True) share KV from the
@@ -691,12 +779,7 @@ class ModelConfig:
                 f"num_kv_shared_layers ({self.num_kv_shared_layers}) must be "
                 f"less than num_hidden_layers ({self.num_hidden_layers})")
 
-    # ------------------------------------------------------------------
-    # Derived properties
-    # ------------------------------------------------------------------
-
-    def __post_init__(self) -> None:
-        """Resolve and validate the model family's attention scale."""
+        # Resolve and validate the model family's attention scale.
         self.default_attention_scale = _get_attention_scaling(
             {}, self.head_dim, self.default_attention_scale)
         scale_config = ({} if self.attention_scaling is None else {
@@ -704,6 +787,10 @@ class ModelConfig:
         })
         self.attention_scaling = _get_attention_scaling(
             scale_config, self.head_dim, self.default_attention_scale)
+
+    # ------------------------------------------------------------------
+    # Derived properties
+    # ------------------------------------------------------------------
 
     @property
     def tp_size(self) -> int:
@@ -729,6 +816,11 @@ class ModelConfig:
     def is_gemma4_mtp_draft(self) -> bool:
         """True for a paired Gemma4 assistant draft checkpoint."""
         return self.gemma4_mtp_draft
+
+    @property
+    def is_diffusion_gemma(self) -> bool:
+        return self.diffusion is not None or _is_diffusion_gemma_model_type(
+            self.model_type)
 
     @property
     def is_dflash_draft(self) -> bool:
@@ -855,8 +947,11 @@ class ModelConfig:
 
         root_model_type = root.get("model_type", "")
         model_type = llm_dict.get("model_type", "llama")
+        is_diffusion_gemma = _is_diffusion_gemma_config(root, llm_dict)
         if root_model_type == "gemma4_assistant":
             model_type = root_model_type
+        elif is_diffusion_gemma:
+            model_type = "diffusion_gemma"
         hidden_size = llm_dict["hidden_size"]
         num_attn_heads = llm_dict["num_attention_heads"]
         _check_num_attention_heads(num_attn_heads)
@@ -893,6 +988,19 @@ class ModelConfig:
             llm_dict, head_dim, default_attention_scale_value)
         embedding_scale = _get_embedding_scale(llm_dict, model_type,
                                                hidden_size)
+
+        generation_config_path = os.path.join(model_dir,
+                                              "generation_config.json")
+        generation_config: Dict[str, Any] = {}
+        if os.path.isfile(generation_config_path):
+            with open(generation_config_path) as f:
+                generation_config = json.load(f)
+        diffusion_source_config = dict(root)
+        diffusion_source_config.update(llm_dict)
+        diffusion_config = (DiffusionConfig.from_hf(diffusion_source_config,
+                                                    generation_config)
+                            if is_diffusion_gemma else None)
+        self_conditioning_size = 0
 
         # MTP config
         mtp_num_hidden_layers = llm_dict.get("mtp_num_hidden_layers")
@@ -970,6 +1078,12 @@ class ModelConfig:
             or llm_dict.get("shared_expert_intermediate_size")
             or llm_dict.get("moe_shared_expert_intermediate_size")
             or llm_dict.get("moe_intermediate_size", 0))
+        if self_conditioning_size <= 0:
+            self_conditioning_size = int(
+                llm_dict.get(
+                    "self_conditioning_size",
+                    root.get("self_conditioning_size", intermediate_size))
+                or intermediate_size)
 
         return cls(
             model_type=model_type,
@@ -999,7 +1113,16 @@ class ModelConfig:
             has_value_norm=has_value_norm,
             attention_bias=bool(llm_dict.get("attention_bias", False)),
             attention_scaling=attention_scaling,
-            attention_k_eq_v=bool(llm_dict.get("attention_k_eq_v", False)),
+            attention_k_eq_v=(True if is_diffusion_gemma else bool(
+                llm_dict.get("attention_k_eq_v", False))),
+            encoder_layer_scalars=list(
+                llm_dict.get("encoder_layer_scalars",
+                             root.get("encoder_layer_scalars", [])) or []),
+            decoder_layer_scalars=list(
+                llm_dict.get("decoder_layer_scalars",
+                             root.get("decoder_layer_scalars", [])) or []),
+            self_conditioning_size=self_conditioning_size,
+            diffusion=diffusion_config,
             embedding_scale=embedding_scale,
             final_logit_softcapping=llm_dict.get("final_logit_softcapping",
                                                  None),
@@ -1067,7 +1190,15 @@ class ModelConfig:
                 llm_dict.get("num_kv_shared_layers", 0) or 0),
             use_double_wide_mlp=bool(llm_dict.get("use_double_wide_mlp",
                                                   False)),
-            enable_moe_block=bool(llm_dict.get("enable_moe_block", False)),
+            enable_moe_block=bool(
+                llm_dict.get(
+                    "enable_moe_block", model_type in (
+                        "gemma4",
+                        "gemma4_text",
+                        "gemma4_unified",
+                        "gemma4_unified_text",
+                        "diffusion_gemma",
+                    ) and num_experts > 0 and moe_intermediate_size > 0)),
         )
 
 
@@ -1711,6 +1842,8 @@ def _normalize_module_name(name: str) -> str:
         return name[len("thinker."):]
     if name.startswith("talker."):
         return name[len("talker."):]
+    if name.startswith("model.decoder."):
+        return name[len("model.decoder."):]
     for prefix in _VL_LLM_PREFIXES + ("model.", ):
         if name.startswith(prefix):
             return name[len(prefix):]

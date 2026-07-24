@@ -285,6 +285,42 @@ TEST_F(DeploymentConfigTest, SpecDecodeBundle)
     EXPECT_EQ(bundle.specConfig->draftingTopK, 4);
 }
 
+TEST_F(DeploymentConfigTest, DiffusionBackboneRejectsDraftingConfig)
+{
+    Json baseJson = makeBaseConfig();
+    baseJson["model"] = "diffusion_gemma_text";
+    baseJson["engine_role"] = "dllm";
+    baseJson["diffusion_unified_conditioning"] = true;
+    baseJson["diffusion_config"] = {{"canvas_length", 8}};
+    Json const draftJson = makeDraftConfig(/*maxVerify=*/16, /*maxDraft=*/16);
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto const draftPath = writeJsonToTempFile(draftJson, "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 4;
+    drafting.draftingStep = 4;
+    drafting.verifySize = 8;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
+}
+
+TEST_F(DeploymentConfigTest, DiffusionBackboneMaxAcceptedTokensUsesCanvasLength)
+{
+    Json baseJson = makeBaseConfig();
+    baseJson["model"] = "diffusion_gemma_text";
+    baseJson["engine_role"] = "dllm";
+    baseJson["diffusion_unified_conditioning"] = true;
+    baseJson["diffusion_config"] = {{"canvas_length", 8}};
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+
+    DeploymentConfig bundle = createDeploymentConfig(basePath, std::nullopt, std::nullopt);
+
+    EXPECT_EQ(bundle.specDecodeMode(), SpecDecodeMode::kNONE);
+    EXPECT_EQ(bundle.maxAcceptedTokensPerRound(), 8);
+}
+
 TEST_F(DeploymentConfigTest, DraftingWithoutDraftThrows)
 {
     // Drafting set but draft not set → throws.

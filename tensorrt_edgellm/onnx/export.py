@@ -46,6 +46,7 @@ Extra outputs:
 """
 
 import contextlib
+import gc
 import logging
 import os
 
@@ -228,13 +229,16 @@ def _fix_nvfp4_weight_dtype(onnx_path: str) -> None:
 def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
     """Strip disabled optional inputs from AttentionPlugin ONNX nodes.
 
-    The onnxscript translation always emits all 10 inputs; the plugin contract
-    only wires the enabled optional groups (gammas when enable_qk_norm, mask /
-    pos_id per tree / vision-block mode). Rewrites each node's input list to
-    match and prunes gamma Constant/Cast producers orphaned by the removal.
+    The onnxscript translation always emits the full optional layout:
+    q/k norm gammas, context-mask selector, and tree/vision mask inputs. The
+    C++ plugin expects those optional groups compacted in that relative order,
+    with disabled groups removed from the ONNX node input list.
     """
     _NUM_REQUIRED = 6
     _GAMMA_POSITIONS = (6, 7)
+    _CONTEXT_MASK_SELECTOR_POSITION = 8
+    _ATTENTION_MASK_POSITION = 9
+    _ATTENTION_POS_ID_POSITION = 10
     model = onnx.load(onnx_path, load_external_data=False)
     changed = 0
     dropped_gamma_tensors: set = set()
@@ -243,6 +247,11 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
             continue
         tree_attn = next(
             (a.i for a in node.attribute if a.name == "enable_tree_attention"),
+            0,
+        )
+        context_mask_selector = next(
+            (a.i for a in node.attribute
+             if a.name == "enable_context_mask_selector"),
             0,
         )
         vision_block_attn = next(
@@ -254,17 +263,26 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
             (a.i for a in node.attribute if a.name == "enable_qk_norm"),
             0,
         )
+
+        def get_input(index: int) -> str:
+            return inputs[index] if index < len(inputs) else ""
+
         inputs = list(node.input)
         new_inputs = inputs[:_NUM_REQUIRED]
         if qk_norm:
-            new_inputs += [inputs[i] for i in _GAMMA_POSITIONS]
+            new_inputs += [get_input(i) for i in _GAMMA_POSITIONS]
         else:
-            dropped_gamma_tensors.update(inputs[i] for i in _GAMMA_POSITIONS
-                                         if i < len(inputs) and inputs[i])
-        if tree_attn or vision_block_attn:
-            # Tree nodes keep mask + pos_id; vision-block nodes keep the block-ID
-            # mask and drop the empty attention_pos_id placeholder.
-            new_inputs += [i for i in inputs[_GAMMA_POSITIONS[1] + 1:] if i]
+            dropped_gamma_tensors.update(
+                get_input(i) for i in _GAMMA_POSITIONS if get_input(i))
+        if context_mask_selector:
+            new_inputs.append(get_input(_CONTEXT_MASK_SELECTOR_POSITION))
+        if tree_attn:
+            new_inputs.extend([
+                get_input(_ATTENTION_MASK_POSITION),
+                get_input(_ATTENTION_POS_ID_POSITION),
+            ])
+        elif vision_block_attn:
+            new_inputs.append(get_input(_ATTENTION_MASK_POSITION))
         if new_inputs == inputs:
             continue
         del node.input[:]
@@ -418,7 +436,7 @@ def _dedup_shared_dql_scales(model) -> int:
     skipped = 0
     for init_name, node_indices in shared.items():
         orig = init_map[init_name]
-        nbytes = len(orig.raw_data) if orig.raw_data else 0
+        nbytes = _initializer_data_nbytes(orig)
         if nbytes > _MAX_DUP_BYTES:
             skipped += 1
             logger.warning(
@@ -449,6 +467,158 @@ def _dedup_shared_dql_scales(model) -> int:
             "(%d unique, %d skipped as too large)", duplicated,
             len(shared) - skipped, skipped)
     return duplicated
+
+
+def _external_data_value(init, key: str) -> "str | None":
+    for entry in init.external_data:
+        if entry.key == key:
+            return entry.value
+    return None
+
+
+def _initializer_data_nbytes(init) -> int:
+    if init.raw_data:
+        return len(init.raw_data)
+    length = _external_data_value(init, "length")
+    if length is None:
+        return 0
+    try:
+        return int(length)
+    except ValueError:
+        return 0
+
+
+def _count_shared_dql_scale_duplicates(model) -> int:
+    _MAX_DUP_BYTES = 1024
+    dql_consumers: dict[str, list] = {}
+    for idx, node in enumerate(model.graph.node):
+        if node.op_type != "DequantizeLinear":
+            continue
+        for inp in node.input:
+            dql_consumers.setdefault(inp, []).append(idx)
+
+    init_map = {init.name: init for init in model.graph.initializer}
+    duplicated = 0
+    for init_name, node_indices in dql_consumers.items():
+        if len(node_indices) <= 1:
+            continue
+        init = init_map.get(init_name)
+        if init is None:
+            continue
+        if _initializer_data_nbytes(init) > _MAX_DUP_BYTES:
+            continue
+        duplicated += len(node_indices) - 1
+    return duplicated
+
+
+def _initializer_dtype_fixup_required(
+    model,
+    dedup_dql_scales: bool,
+    cast_fp32_weights_to_fp16: bool,
+    preserve_fp32_patterns: "tuple[str, ...]",
+    match_fp32_matmul_initializers: bool,
+    match_fp32_elementwise_initializers: bool,
+) -> bool:
+    if dedup_dql_scales and _count_shared_dql_scale_duplicates(model) > 0:
+        return True
+
+    plugin_fp32_init_names: set = set()
+    for node in model.graph.node:
+        if node.op_type == "update_ssm_state" and len(node.input) > 1:
+            plugin_fp32_init_names.add(node.input[1])
+        if node.op_type == "gated_delta_net" and len(node.input) > 5:
+            plugin_fp32_init_names.add(node.input[5])
+        if node.op_type in ("Nvfp4MoePlugin", "NvFP4MoEPluginGeforce"):
+            for input_idx in (4, 7, 8, 9, 10):
+                if len(node.input) > input_idx:
+                    plugin_fp32_init_names.add(node.input[input_idx])
+
+    init_map = {init.name: init for init in model.graph.initializer}
+    elem_types: dict[str, int] = {}
+    if match_fp32_matmul_initializers or match_fp32_elementwise_initializers:
+        for value in (list(model.graph.input) + list(model.graph.value_info) +
+                      list(model.graph.output)):
+            tensor_type = value.type.tensor_type
+            if tensor_type.HasField("elem_type"):
+                elem_types[value.name] = tensor_type.elem_type
+        for init in model.graph.initializer:
+            elem_types[init.name] = init.data_type
+
+    matmul_fp32_init_names: set = set()
+    if match_fp32_matmul_initializers:
+        for node in model.graph.node:
+            if node.op_type != "MatMul" or len(node.input) < 2:
+                continue
+            for init_idx, other_idx in ((0, 1), (1, 0)):
+                init = init_map.get(node.input[init_idx])
+                if init is None:
+                    continue
+                if elem_types.get(node.input[other_idx]) == 1:  # FLOAT
+                    matmul_fp32_init_names.add(init.name)
+
+    _EW_OPS = frozenset({"Mul", "Add", "Sub", "Div"})
+    elementwise_fp32_init_names: set = set()
+    if match_fp32_elementwise_initializers:
+        for node in model.graph.node:
+            if node.op_type not in _EW_OPS or len(node.input) < 2:
+                continue
+            for init_idx, other_idx in ((0, 1), (1, 0)):
+                init = init_map.get(node.input[init_idx])
+                if init is None:
+                    continue
+                if elem_types.get(node.input[other_idx]) == 1:  # FLOAT
+                    elementwise_fp32_init_names.add(init.name)
+
+    def _is_preserved_fp32(init_name: str) -> bool:
+        return any(p in init_name for p in preserve_fp32_patterns)
+
+    for init in model.graph.initializer:
+        if init.name in plugin_fp32_init_names and init.data_type == 10:
+            return True
+
+        if cast_fp32_weights_to_fp16 and init.data_type == 1:
+            dims = list(init.dims)
+            if len(dims) == 0 or (len(dims) == 1 and dims[0] <= 1):
+                continue
+            if (init.name.endswith(".weight_scale")
+                    or init.name.endswith(".input_scale")
+                    or init.name.endswith(".pre_quant_scale")
+                    or init.name.endswith("_scale")
+                    or init.name.endswith("_scale_2")):
+                continue
+            if init.name in plugin_fp32_init_names:
+                continue
+            if _is_preserved_fp32(init.name):
+                continue
+            if init.name in matmul_fp32_init_names:
+                continue
+            if init.name in elementwise_fp32_init_names:
+                continue
+            return True
+
+    if match_fp32_matmul_initializers:
+        for node in model.graph.node:
+            if node.op_type != "MatMul" or len(node.input) < 2:
+                continue
+            for init_idx, other_idx in ((0, 1), (1, 0)):
+                init = init_map.get(node.input[init_idx])
+                if init is None or init.data_type != 10:  # FLOAT16
+                    continue
+                if elem_types.get(node.input[other_idx]) == 1:  # FLOAT
+                    return True
+
+    if match_fp32_elementwise_initializers:
+        for node in model.graph.node:
+            if node.op_type not in _EW_OPS or len(node.input) < 2:
+                continue
+            for init_idx, other_idx in ((0, 1), (1, 0)):
+                init = init_map.get(node.input[init_idx])
+                if init is None or init.data_type != 10:  # FLOAT16
+                    continue
+                if elem_types.get(node.input[other_idx]) == 1:  # FLOAT
+                    return True
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -597,6 +767,23 @@ def _fix_initializer_dtypes(
     import numpy as np
 
     _onnx = __import__("onnx")
+    metadata_model = _onnx.load(onnx_path, load_external_data=False)
+    if not _initializer_dtype_fixup_required(
+            metadata_model,
+            dedup_dql_scales=dedup_dql_scales,
+            cast_fp32_weights_to_fp16=cast_fp32_weights_to_fp16,
+            preserve_fp32_patterns=preserve_fp32_patterns,
+            match_fp32_matmul_initializers=match_fp32_matmul_initializers,
+            match_fp32_elementwise_initializers=
+            match_fp32_elementwise_initializers,
+    ):
+        logger.info(
+            "_fix_initializer_dtypes: no dtype fixup required; skipped "
+            "external tensor load")
+        return
+    del metadata_model
+    gc.collect()
+
     model = _onnx.load(onnx_path)
 
     # --- Dedup shared DQL scale initializers (NVFP4 dynamo fix) ---
@@ -827,6 +1014,8 @@ def _export_model(
     prog.save(output_path, external_data=True)
     with open(output_path, "rb") as _f:
         os.fsync(_f.fileno())
+    del prog
+    gc.collect()
     nvfp4 = model.config.quant.uses_nvfp4_weights
     mxfp8 = model.config.quant.uses_mxfp8_weights
     if nvfp4:

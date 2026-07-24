@@ -69,9 +69,10 @@ void enqueueLogprobsD2H(
 void collectLogprobsFromHost(
     DecodingRuntimeContext& runtime, DecodingInferenceContext& context, int32_t activeBatchSize, int32_t topK);
 
-//! @brief Collect staged logprobs into context.stepLogprobs (spec decode: acceptLen rows per slot).
+//! @brief Collect staged logprobs into context.stepLogprobs (multi-row decode: acceptLen rows per slot).
 //! Call after the round synchronization (appendAcceptedTokens) that made hostAcceptLens valid.
-//! @param rowsPerBatch Max rows per batch item: maxAcceptDepth for EAGLE/MTP, blockSize for DFlash.
+//! @param rowsPerBatch Max rows per batch item: maxAcceptDepth for EAGLE/MTP, blockSize for DFlash, or
+//!                    canvasLen for DiffusionGemma.
 void collectSpecLogprobsFromHost(DecodingRuntimeContext& runtime, DecodingInferenceContext& context,
     int32_t activeBatchSize, int32_t rowsPerBatch, int32_t const* hostAcceptLens, int32_t topK);
 

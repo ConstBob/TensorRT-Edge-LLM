@@ -33,6 +33,7 @@
 #include "runtime/streaming.h"
 #include "tokenizer/tokenizer.h"
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <getopt.h>

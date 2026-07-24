@@ -426,6 +426,7 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
         /*.attnMaskSeqLen=*/BS,
         /*.ropeBatch=*/1,
         /*.packedMaskLen=*/static_cast<int64_t>(pmLen),
+        /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/activeBatchSize,
         /*.specVerifyPhaseLen=*/0,
     };
@@ -617,6 +618,7 @@ bool DFlashDecoder::captureDraftCudaGraphs(cudaStream_t stream)
                 /*.attnMaskSeqLen=*/BS,
                 /*.ropeBatch=*/1,
                 /*.packedMaskLen=*/static_cast<int64_t>(pmLen),
+                /*.contextMaskSelectorLen=*/0,
                 /*.startIndexLen=*/batchSize,
                 /*.specVerifyPhaseLen=*/0,
             };
@@ -1103,6 +1105,7 @@ bool DFlashDecoder::runSystemPromptPrefill(DecodingInferenceContext& context)
         /*.attnMaskSeqLen=*/BS,
         /*.ropeBatch=*/1,
         /*.packedMaskLen=*/static_cast<int64_t>(pmLen),
+        /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/activeBatchSize,
         /*.specVerifyPhaseLen=*/0,
     };

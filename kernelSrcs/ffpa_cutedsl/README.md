@@ -145,20 +145,6 @@ python3 fmha.py \
   --function_prefix ffpa_d512_causal
 ```
 
-Export a dense tuning variant (drop `--is_causal`; FP16):
-
-```bash
-python3 fmha.py \
-  --head_dim 512 \
-  --m_block_size 64 --n_block_size 16 --num_threads 128 \
-  --dtype Float16 \
-  --skip_rescale \
-  --export_only \
-  --output_dir ./out \
-  --file_name ffpa_d512 \
-  --function_prefix ffpa_d512
-```
-
 Smoke launch without exporting (matches the registry-exported variant —
 causal, FP16, default tuning):
 

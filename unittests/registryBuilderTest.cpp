@@ -97,6 +97,7 @@ TEST(RegistryBuilderTest, StandardLLMHasExpectedTensors)
     // kvcache_start_index is registered with a symbolic `start_index_len` dim
     // (0 for initial-prefill sentinel, batch otherwise). See registryBuilder.
     EXPECT_TRUE(hasName(names, "kvcache_start_index"));
+    EXPECT_TRUE(hasName(names, trt_edgellm::binding_names::kKVPageTable));
     EXPECT_TRUE(hasName(names, "rope_rotary_cos_sin"));
 
     // KV cache: 32 layers x 2 (past + present) = 64 entries
@@ -105,8 +106,88 @@ TEST(RegistryBuilderTest, StandardLLMHasExpectedTensors)
     EXPECT_TRUE(hasName(names, "present_key_values_0"));
     EXPECT_TRUE(hasName(names, "present_key_values_31"));
 
-    // Total: 6 core (incl. kvcache_start_index) + 64 KV = 70
-    EXPECT_EQ(names.size(), 70u);
+    // Total: 7 core (incl. kvcache_start_index and kv_page_table) + 64 KV = 71
+    EXPECT_EQ(names.size(), 71u);
+}
+
+TEST(RegistryBuilderTest, DiffusionBackboneHasSelectorAndPhaseTensors)
+{
+    namespace bn = trt_edgellm::binding_names;
+    LLMEngineConfig cfg = makeBasicLLMConfig();
+    cfg.isDiffusionBackbone = true;
+    cfg.contextMaskSelectorEnabled = true;
+
+    populateHybridFieldsFromScalars(cfg);
+    auto reg = buildRegistryForLLM(cfg);
+    auto names = reg.allTensorNames();
+
+    EXPECT_TRUE(hasName(names, bn::kInputsEmbeds));
+    EXPECT_TRUE(hasName(names, bn::kLogits));
+    EXPECT_TRUE(hasName(names, bn::kPhaseIsEncoder));
+    EXPECT_TRUE(hasName(names, bn::kSelectTokenIndices));
+    EXPECT_TRUE(hasName(names, bn::kContextMaskSelector));
+    EXPECT_TRUE(hasName(names, bn::kKVPageTable));
+    EXPECT_FALSE(hasName(names, bn::kLastTokenIds));
+
+    auto specs = reg.allExpandedSpecs();
+    auto const logits
+        = std::find_if(specs.begin(), specs.end(), [](TensorSpec const& s) { return s.name == bn::kLogits; });
+    ASSERT_NE(logits, specs.end());
+    EXPECT_EQ(logits->io, TensorIO::kOutput);
+    EXPECT_EQ(logits->dtype, nvinfer1::DataType::kFLOAT);
+    ASSERT_EQ(logits->shape.size(), 3u);
+    EXPECT_TRUE(logits->shape[1].isSymbolic());
+    EXPECT_EQ(logits->shape[1].symbol, &InferenceDims::selectLen);
+
+    auto const selector = std::find_if(
+        specs.begin(), specs.end(), [](TensorSpec const& s) { return s.name == bn::kContextMaskSelector; });
+    ASSERT_NE(selector, specs.end());
+    ASSERT_EQ(selector->shape.size(), 1u);
+    EXPECT_TRUE(selector->shape[0].isSymbolic());
+    EXPECT_EQ(selector->shape[0].symbol, &InferenceDims::contextMaskSelectorLen);
+}
+
+TEST(RegistryBuilderTest, DiffusionBackboneUnifiedConditioningAddsInputs)
+{
+    namespace bn = trt_edgellm::binding_names;
+    LLMEngineConfig cfg = makeBasicLLMConfig();
+    cfg.isDiffusionBackbone = true;
+    cfg.contextMaskSelectorEnabled = true;
+    cfg.diffusionUnifiedConditioning = true;
+
+    populateHybridFieldsFromScalars(cfg);
+    auto reg = buildRegistryForLLM(cfg);
+    auto names = reg.allTensorNames();
+
+    EXPECT_TRUE(hasName(names, bn::kCanvasIds));
+    EXPECT_TRUE(hasName(names, bn::kPrevSelfConditioningEmbeds));
+    EXPECT_TRUE(hasName(names, bn::kSelfConditioningTemperature));
+    EXPECT_TRUE(hasName(names, bn::kNextSelfConditioningEmbeds));
+    EXPECT_FALSE(hasName(names, "prev_logits"));
+    EXPECT_FALSE(hasName(names, "temperature"));
+    EXPECT_FALSE(hasName(names, "prev_logits_valid"));
+    EXPECT_FALSE(hasName(names, "conditioned_inputs_embeds"));
+
+    auto specs = reg.allExpandedSpecs();
+    auto const prevFeedback = std::find_if(
+        specs.begin(), specs.end(), [](TensorSpec const& s) { return s.name == bn::kPrevSelfConditioningEmbeds; });
+    ASSERT_NE(prevFeedback, specs.end());
+    EXPECT_EQ(prevFeedback->io, TensorIO::kInput);
+    EXPECT_EQ(prevFeedback->dtype, nvinfer1::DataType::kHALF);
+    ASSERT_EQ(prevFeedback->shape.size(), 3u);
+    EXPECT_EQ(prevFeedback->shape[0].symbol, &InferenceDims::batch);
+    EXPECT_EQ(prevFeedback->shape[1].symbol, &InferenceDims::seqLen);
+    EXPECT_EQ(prevFeedback->shape[2].value, cfg.hiddenSize);
+
+    auto const nextFeedback = std::find_if(
+        specs.begin(), specs.end(), [](TensorSpec const& s) { return s.name == bn::kNextSelfConditioningEmbeds; });
+    ASSERT_NE(nextFeedback, specs.end());
+    EXPECT_EQ(nextFeedback->io, TensorIO::kOutput);
+    EXPECT_EQ(nextFeedback->dtype, nvinfer1::DataType::kHALF);
+    ASSERT_EQ(nextFeedback->shape.size(), 3u);
+    EXPECT_EQ(nextFeedback->shape[0].symbol, &InferenceDims::batch);
+    EXPECT_EQ(nextFeedback->shape[1].symbol, &InferenceDims::selectLen);
+    EXPECT_EQ(nextFeedback->shape[2].value, cfg.hiddenSize);
 }
 
 TEST(RegistryBuilderTest, StandardLLMHasCorrectSpecAttributes)
@@ -152,8 +233,8 @@ TEST(RegistryBuilderTest, DeepstackAddsExtraTensors)
     EXPECT_TRUE(hasName(names, "deepstack_embeds_1"));
     EXPECT_TRUE(hasName(names, "deepstack_embeds_2"));
 
-    // 6 core (incl. kvcache_start_index) + 4 KV (2 layers * 2) + 3 deepstack = 13
-    EXPECT_EQ(names.size(), 13u);
+    // 7 core (incl. kvcache_start_index and kv_page_table) + 4 KV (2 layers * 2) + 3 deepstack = 14
+    EXPECT_EQ(names.size(), 14u);
 }
 
 TEST(RegistryBuilderTest, DeepstackShapeMatchesConfig)
@@ -213,8 +294,8 @@ TEST(RegistryBuilderTest, SpecDecodeBaseAddsProposalTensors)
     EXPECT_TRUE(hasName(names, "attention_mask"));
     EXPECT_TRUE(hasName(names, "attention_pos_id"));
 
-    // 6 core (incl. kvcache_start_index) + 4 KV + 3 SpecDecode = 13
-    EXPECT_EQ(names.size(), 13u);
+    // 7 core (incl. kvcache_start_index and kv_page_table) + 4 KV + 3 SpecDecode = 14
+    EXPECT_EQ(names.size(), 14u);
 }
 
 TEST(RegistryBuilderTest, SpecDecodeBaseUsesConfiguredOutputHiddenDim)
@@ -284,8 +365,8 @@ TEST(RegistryBuilderTest, MambaStateAddsRecurrentAndConvTensors)
     EXPECT_TRUE(hasName(names, "present_conv_state_0"));
     EXPECT_TRUE(hasName(names, "present_conv_state_1"));
 
-    // 6 core (incl. kvcache_start_index) + 4 KV (2 attn layers) + 4 recurrent + 4 conv = 18
-    EXPECT_EQ(names.size(), 18u);
+    // 7 core (incl. kvcache_start_index and kv_page_table) + 4 KV (2 attn layers) + 4 recurrent + 4 conv = 19
+    EXPECT_EQ(names.size(), 19u);
 }
 
 TEST(RegistryBuilderTest, RecurrentStateShapeMatchesConfig)
@@ -360,10 +441,10 @@ TEST(RegistryBuilderTest, AllFeaturesEnabled)
     auto reg = buildRegistryForLLM(cfg);
     auto names = reg.allTensorNames();
 
-    // 6 core (incl. kvcache_start_index) + 4 KV (2 layers) + 2 deepstack + 4 SpecDecode
+    // 7 core (incl. kvcache_start_index and kv_page_table) + 4 KV (2 layers) + 2 deepstack + 4 SpecDecode
     //   + 4 recurrent + 4 conv + 4 intermediate (2 layers × {recurrent, conv})
-    // = 28. The extra 4 intermediate-state outputs and phase marker come from the MTP-base path.
-    EXPECT_EQ(names.size(), 28u);
+    // = 29. The extra 4 intermediate-state outputs and phase marker come from the MTP-base path.
+    EXPECT_EQ(names.size(), 29u);
     EXPECT_TRUE(hasName(names, trt_edgellm::binding_names::kSpecVerifyPhaseMarker));
     EXPECT_TRUE(hasName(names, "intermediate_recurrent_state_0"));
     EXPECT_TRUE(hasName(names, "intermediate_recurrent_state_1"));
@@ -580,8 +661,8 @@ TEST(RegistryBuilderTest, HybridModelKVCacheCountMatchesAttentionLayers)
     EXPECT_TRUE(hasName(names, "past_key_values_9"));
     EXPECT_FALSE(hasName(names, "past_key_values_10"));
 
-    // 6 core (incl. kvcache_start_index) + 20 KV (10 layers * 2) = 26
-    EXPECT_EQ(names.size(), 26u);
+    // 7 core (incl. kvcache_start_index and kv_page_table) + 20 KV (10 layers * 2) = 27
+    EXPECT_EQ(names.size(), 27u);
 }
 
 // Heterogeneous-KV models (Gemma-4, Qwen3-Next, etc.) give each attention

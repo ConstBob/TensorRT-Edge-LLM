@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <limits>
 #include <optional>
 #include <random>
 #include <string>
@@ -146,6 +147,51 @@ void expectFp8HalfOutputsClose(
     }
 
     double const meanAbsError = sumAbsError / static_cast<double>(actual.size());
+    double const cosineSimilarity = dot / std::sqrt(std::max(sumSquaredActual * sumSquaredExpected, 1.0e-30));
+    EXPECT_FALSE(nanDetected) << label;
+    EXPECT_LT(meanAbsError, 0.05) << label;
+    EXPECT_GT(cosineSimilarity, 0.99) << label;
+}
+
+void expectFp8HalfOutputRowsClose(rt::Tensor const& actualTensor, rt::Tensor const& expectedTensor,
+    std::vector<int32_t> const& validSeqLens, std::string const& label)
+{
+    ASSERT_EQ(actualTensor.getShape(), expectedTensor.getShape()) << label;
+    auto const actual = copyDeviceToHost<half>(actualTensor);
+    auto const expected = copyDeviceToHost<half>(expectedTensor);
+    auto const& shape = actualTensor.getShape();
+    ASSERT_EQ(static_cast<int64_t>(validSeqLens.size()), shape[0]) << label;
+
+    int64_t const rowElements = shape[2] * shape[3];
+    double sumAbsError = 0.0;
+    double sumSquaredActual = 0.0;
+    double sumSquaredExpected = 0.0;
+    double dot = 0.0;
+    bool nanDetected = false;
+    int64_t totalElements = 0;
+    for (int64_t batchIdx = 0; batchIdx < shape[0]; ++batchIdx)
+    {
+        ASSERT_GE(validSeqLens[static_cast<size_t>(batchIdx)], 0) << label;
+        ASSERT_LE(validSeqLens[static_cast<size_t>(batchIdx)], shape[1]) << label;
+        for (int64_t row = 0; row < validSeqLens[static_cast<size_t>(batchIdx)]; ++row)
+        {
+            for (int64_t col = 0; col < rowElements; ++col)
+            {
+                int64_t const idx = (batchIdx * shape[1] + row) * rowElements + col;
+                float const actualValue = __half2float(actual[static_cast<size_t>(idx)]);
+                float const expectedValue = __half2float(expected[static_cast<size_t>(idx)]);
+                sumAbsError += std::fabs(actualValue - expectedValue);
+                sumSquaredActual += static_cast<double>(actualValue) * actualValue;
+                sumSquaredExpected += static_cast<double>(expectedValue) * expectedValue;
+                dot += static_cast<double>(actualValue) * expectedValue;
+                nanDetected = nanDetected || std::isnan(actualValue);
+                ++totalElements;
+            }
+        }
+    }
+
+    ASSERT_GT(totalElements, 0) << label;
+    double const meanAbsError = sumAbsError / static_cast<double>(totalElements);
     double const cosineSimilarity = dot / std::sqrt(std::max(sumSquaredActual * sumSquaredExpected, 1.0e-30));
     EXPECT_FALSE(nanDetected) << label;
     EXPECT_LT(meanAbsError, 0.05) << label;
@@ -336,6 +382,236 @@ rt::Coords pagedKVPoolShape(int32_t numPages, int32_t numKVHeads, int32_t tokens
 size_t bshdIdx(int32_t b, int32_t s, int32_t h, int32_t d, int32_t S, int32_t H, int32_t D)
 {
     return static_cast<size_t>(((static_cast<int64_t>(b) * S + s) * H + h) * D + d);
+}
+
+void fillNonCausalVarlenReference(std::vector<half> const& qInput, std::vector<half> const& kInput,
+    std::vector<half> const& vInput, std::vector<half>& output, std::vector<int32_t> const& qSeqLens,
+    std::vector<int32_t> const& kvSeqLens, int32_t physicalSeqLenQ, int32_t physicalSeqLenKV, int32_t numQHeads,
+    int32_t numKVHeads, int32_t headDim, float attentionScale)
+{
+    int32_t const batchSize = static_cast<int32_t>(qSeqLens.size());
+    ASSERT_EQ(qSeqLens.size(), kvSeqLens.size());
+    ASSERT_EQ(numQHeads % numKVHeads, 0);
+    int32_t const qHeadsPerKVHead = numQHeads / numKVHeads;
+    std::fill(output.begin(), output.end(), __float2half(0.0F));
+
+    for (int32_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+    {
+        ASSERT_GE(qSeqLens[static_cast<size_t>(batchIdx)], 0);
+        ASSERT_LE(qSeqLens[static_cast<size_t>(batchIdx)], physicalSeqLenQ);
+        ASSERT_GT(kvSeqLens[static_cast<size_t>(batchIdx)], 0);
+        ASSERT_LE(kvSeqLens[static_cast<size_t>(batchIdx)], physicalSeqLenKV);
+
+        int32_t const qSeqLen = qSeqLens[static_cast<size_t>(batchIdx)];
+        int32_t const kvSeqLen = kvSeqLens[static_cast<size_t>(batchIdx)];
+        std::vector<float> scores(static_cast<size_t>(kvSeqLen));
+        for (int32_t qToken = 0; qToken < qSeqLen; ++qToken)
+        {
+            for (int32_t qHead = 0; qHead < numQHeads; ++qHead)
+            {
+                int32_t const kvHead = qHead / qHeadsPerKVHead;
+                float maxScore = -std::numeric_limits<float>::infinity();
+                for (int32_t kvToken = 0; kvToken < kvSeqLen; ++kvToken)
+                {
+                    float dot = 0.0F;
+                    for (int32_t dim = 0; dim < headDim; ++dim)
+                    {
+                        dot += __half2float(
+                                   qInput[bshdIdx(batchIdx, qToken, qHead, dim, physicalSeqLenQ, numQHeads, headDim)])
+                            * __half2float(
+                                kInput[bshdIdx(batchIdx, kvToken, kvHead, dim, physicalSeqLenKV, numKVHeads, headDim)]);
+                    }
+                    scores[static_cast<size_t>(kvToken)] = dot * attentionScale;
+                    maxScore = std::max(maxScore, scores[static_cast<size_t>(kvToken)]);
+                }
+
+                float sum = 0.0F;
+                for (float& score : scores)
+                {
+                    score = std::exp(score - maxScore);
+                    sum += score;
+                }
+                ASSERT_GT(sum, 0.0F);
+
+                for (int32_t dim = 0; dim < headDim; ++dim)
+                {
+                    float value = 0.0F;
+                    for (int32_t kvToken = 0; kvToken < kvSeqLen; ++kvToken)
+                    {
+                        float const probability = scores[static_cast<size_t>(kvToken)] / sum;
+                        value += probability
+                            * __half2float(
+                                vInput[bshdIdx(batchIdx, kvToken, kvHead, dim, physicalSeqLenKV, numKVHeads, headDim)]);
+                    }
+                    output[bshdIdx(batchIdx, qToken, qHead, dim, physicalSeqLenQ, numQHeads, headDim)]
+                        = __float2half(value);
+                }
+            }
+        }
+    }
+}
+
+void runLlmD512PagedNonCausalAccuracyCase(bool fp8Input)
+{
+    constexpr int32_t kBatchSize = 2;
+    constexpr int32_t kPhysicalSeqLenQ = 32;
+    constexpr int32_t kPhysicalSeqLenKV = 128;
+    constexpr int32_t kNumQHeads = 8;
+    constexpr int32_t kNumKVHeads = 1;
+    constexpr int32_t kHeadDim = 512;
+    constexpr int32_t kTokensPerPage = 128;
+    constexpr float kQScale = 0.03125F;
+    constexpr float kKScale = 0.0625F;
+    constexpr float kVScale = 0.125F;
+
+    std::vector<int32_t> const qSeqLens{17, 9};
+    std::vector<int32_t> const kvSeqLens{96, 37};
+    int32_t constexpr kMaxPagesPerSeq = 1;
+    int32_t constexpr kCapacity = kMaxPagesPerSeq * kTokensPerPage;
+    int32_t constexpr kPhysicalPagesPerGroup = kMaxPagesPerSeq + 1;
+    int32_t constexpr kNumPages = kBatchSize * 2 * kPhysicalPagesPerGroup;
+
+    size_t const qSize = static_cast<size_t>(kBatchSize) * kPhysicalSeqLenQ * kNumQHeads * kHeadDim;
+    size_t const kvSize = static_cast<size_t>(kBatchSize) * kPhysicalSeqLenKV * kNumKVHeads * kHeadDim;
+    size_t const pagedKVSize = static_cast<size_t>(kNumPages) * kTokensPerPage * kNumKVHeads * kHeadDim;
+
+    std::vector<half> qHalf(qSize);
+    std::vector<half> kHalf(kvSize);
+    std::vector<half> vHalf(kvSize);
+    std::vector<__nv_fp8_e4m3> qFp8(qSize);
+    std::vector<__nv_fp8_e4m3> kFp8(kvSize);
+    std::vector<__nv_fp8_e4m3> vFp8(kvSize);
+    std::vector<half> outputReferenceHost(qSize);
+    std::mt19937 generator{20260723};
+    std::uniform_real_distribution<float> distribution{-0.25F, 0.25F};
+
+    auto fillValue = [&](float value, float scale, __nv_fp8_e4m3& fp8Value) {
+        if (fp8Input)
+        {
+            fp8Value = __nv_fp8_e4m3{value / scale};
+            return __float2half(static_cast<float>(fp8Value) * scale);
+        }
+        fp8Value = __nv_fp8_e4m3{0.0F};
+        return __float2half(value);
+    };
+
+    for (int32_t batchIdx = 0; batchIdx < kBatchSize; ++batchIdx)
+    {
+        for (int32_t token = 0; token < kPhysicalSeqLenQ; ++token)
+        {
+            for (int32_t head = 0; head < kNumQHeads; ++head)
+            {
+                for (int32_t dim = 0; dim < kHeadDim; ++dim)
+                {
+                    size_t const idx = bshdIdx(batchIdx, token, head, dim, kPhysicalSeqLenQ, kNumQHeads, kHeadDim);
+                    float const value
+                        = token < qSeqLens[static_cast<size_t>(batchIdx)] ? distribution(generator) : 7.0F;
+                    qHalf[idx] = fillValue(value, kQScale, qFp8[idx]);
+                }
+            }
+        }
+        for (int32_t token = 0; token < kPhysicalSeqLenKV; ++token)
+        {
+            for (int32_t head = 0; head < kNumKVHeads; ++head)
+            {
+                for (int32_t dim = 0; dim < kHeadDim; ++dim)
+                {
+                    size_t const idx = bshdIdx(batchIdx, token, head, dim, kPhysicalSeqLenKV, kNumKVHeads, kHeadDim);
+                    bool const validKV = token < kvSeqLens[static_cast<size_t>(batchIdx)];
+                    kHalf[idx] = fillValue(validKV ? distribution(generator) : -9.0F, kKScale, kFp8[idx]);
+                    vHalf[idx] = fillValue(validKV ? distribution(generator) : 11.0F, kVScale, vFp8[idx]);
+                }
+            }
+        }
+    }
+
+    std::vector<half> kvPagedHalf(pagedKVSize, __float2half(-13.0F));
+    std::vector<__nv_fp8_e4m3> kvPagedFp8(pagedKVSize, __nv_fp8_e4m3{-13.0F});
+    std::vector<int32_t> pageList(static_cast<size_t>(kBatchSize) * 2 * kMaxPagesPerSeq);
+    for (int32_t batchIdx = 0; batchIdx < kBatchSize; ++batchIdx)
+    {
+        for (int32_t kv = 0; kv < 2; ++kv)
+        {
+            int32_t const physicalBase = (batchIdx * 2 + kv) * kPhysicalPagesPerGroup;
+            pageList[(batchIdx * 2 + kv) * kMaxPagesPerSeq] = physicalBase + 1;
+        }
+        for (int32_t kv = 0; kv < 2; ++kv)
+        {
+            for (int32_t token = 0; token < kvSeqLens[static_cast<size_t>(batchIdx)]; ++token)
+            {
+                int32_t const physicalPage = pageList[(batchIdx * 2 + kv) * kMaxPagesPerSeq];
+                for (int32_t head = 0; head < kNumKVHeads; ++head)
+                {
+                    for (int32_t dim = 0; dim < kHeadDim; ++dim)
+                    {
+                        size_t const sourceIdx
+                            = bshdIdx(batchIdx, token, head, dim, kPhysicalSeqLenKV, kNumKVHeads, kHeadDim);
+                        size_t const pageIdx
+                            = pagedKVIdx(physicalPage, head, token, dim, kNumKVHeads, kTokensPerPage, kHeadDim);
+                        kvPagedHalf[pageIdx] = kv == 0 ? kHalf[sourceIdx] : vHalf[sourceIdx];
+                        kvPagedFp8[pageIdx] = kv == 0 ? kFp8[sourceIdx] : vFp8[sourceIdx];
+                    }
+                }
+            }
+        }
+    }
+
+    std::vector<int32_t> cuKVSeqLens(static_cast<size_t>(kBatchSize + 1));
+    for (int32_t batchIdx = 0; batchIdx < kBatchSize; ++batchIdx)
+    {
+        cuKVSeqLens[static_cast<size_t>(batchIdx + 1)]
+            = cuKVSeqLens[static_cast<size_t>(batchIdx)] + kvSeqLens[static_cast<size_t>(batchIdx)];
+    }
+
+    float const attentionScale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
+    fillNonCausalVarlenReference(qHalf, kHalf, vHalf, outputReferenceHost, qSeqLens, kvSeqLens, kPhysicalSeqLenQ,
+        kPhysicalSeqLenKV, kNumQHeads, kNumKVHeads, kHeadDim, attentionScale);
+
+    rt::Tensor qHalfTensor({kBatchSize, kPhysicalSeqLenQ, kNumQHeads, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor kvHalfTensor(
+        pagedKVPoolShape(kNumPages, kNumKVHeads, kTokensPerPage, kHeadDim), rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor pageListTensor({kBatchSize, 2, kMaxPagesPerSeq}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor cuKVSeqLensTensor({kBatchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor outputFp16({kBatchSize, kPhysicalSeqLenQ, kNumQHeads, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor outputReference(
+        {kBatchSize, kPhysicalSeqLenQ, kNumQHeads, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
+
+    copyHostToDevice(qHalfTensor, qHalf);
+    copyHostToDevice(kvHalfTensor, kvPagedHalf);
+    copyHostToDevice(pageListTensor, pageList);
+    copyHostToDevice(cuKVSeqLensTensor, cuKVSeqLens);
+    copyHostToDevice(outputReference, outputReferenceHost);
+
+    cudaStream_t stream = nullptr;
+    CuteDslFMHARunner runner(kNumQHeads, kNumKVHeads, kHeadDim, kBatchSize, kPhysicalSeqLenQ, kCapacity);
+    runner.runPaged(qHalfTensor.rawPointer(), kvHalfTensor.rawPointer(), pageListTensor.dataPointer<int32_t>(),
+        outputFp16.rawPointer(), cuKVSeqLensTensor.dataPointer<int32_t>(), kNumPages, kMaxPagesPerSeq, kTokensPerPage,
+        DataType::kHALF, stream, attentionScale, INT_MAX, /*fp8Input=*/false, 1.0F, 1.0F, 1.0F, /*isCausal=*/false);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaGetLastError());
+
+    expectHalfOutputRowsClose(outputFp16, outputReference, qSeqLens, "D512 paged non-causal FP16 CuTe DSL FMHA");
+
+    if (!fp8Input)
+    {
+        return;
+    }
+
+    rt::Tensor qFp8Tensor({kBatchSize, kPhysicalSeqLenQ, kNumQHeads, kHeadDim}, rt::DeviceType::kGPU, DataType::kFP8);
+    rt::Tensor kvFp8Tensor(
+        pagedKVPoolShape(kNumPages, kNumKVHeads, kTokensPerPage, kHeadDim), rt::DeviceType::kGPU, DataType::kFP8);
+    rt::Tensor outputFp8({kBatchSize, kPhysicalSeqLenQ, kNumQHeads, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    copyHostToDevice(qFp8Tensor, qFp8);
+    copyHostToDevice(kvFp8Tensor, kvPagedFp8);
+
+    runner.runPaged(qFp8Tensor.rawPointer(), kvFp8Tensor.rawPointer(), pageListTensor.dataPointer<int32_t>(),
+        outputFp8.rawPointer(), cuKVSeqLensTensor.dataPointer<int32_t>(), kNumPages, kMaxPagesPerSeq, kTokensPerPage,
+        DataType::kFP8, stream, attentionScale, INT_MAX, /*fp8Input=*/true, kQScale, kKScale, kVScale,
+        /*isCausal=*/false);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaGetLastError());
+
+    expectFp8HalfOutputRowsClose(outputFp8, outputFp16, qSeqLens, "D512 paged non-causal FP8 CuTe DSL FMHA");
 }
 
 void runLlmD512PagedAccuracyCase(int32_t physicalSeqLen, int32_t numQHeads, int32_t numKVHeads,
@@ -860,6 +1136,22 @@ TEST(CuteDslFMHARunnerTest, llmD512PagedRaggedAccuracy)
     runLlmD512PagedAccuracyCase(257, 8, 2, validSeqLens, 1.0F / std::sqrt(static_cast<float>(512)));
 }
 
+TEST(CuteDslFMHARunnerTest, llmD512PagedNonCausalAccuracy)
+{
+    int32_t const rawSmVersion = getSMVersion();
+    if (!isSupportedCuteDslTestSm(rawSmVersion))
+    {
+        GTEST_SKIP() << "D512 CuTe DSL FMHA unit tests only run on SM100/101/110. Current SM=" << rawSmVersion;
+    }
+
+    if (!CuteDslFMHARunner::loadLLMKernelModule())
+    {
+        FAIL() << "Failed to load CuTe DSL LLM FMHA kernel modules";
+    }
+
+    runLlmD512PagedNonCausalAccuracyCase(/*fp8Input=*/false);
+}
+
 TEST(CuteDslFMHARunnerTest, llmD512PagedFp8Accuracy)
 {
     int32_t const rawSmVersion = getSMVersion();
@@ -875,6 +1167,21 @@ TEST(CuteDslFMHARunnerTest, llmD512PagedFp8Accuracy)
     runLlmD512PagedFp8AccuracyCase(128, INT_MAX);
     runLlmD512PagedFp8AccuracyCase(128, 63);
     runLlmD512PagedFp8AccuracyCase(1024, INT_MAX);
+}
+
+TEST(CuteDslFMHARunnerTest, llmD512PagedFp8NonCausalAccuracy)
+{
+    int32_t const rawSmVersion = getSMVersion();
+    if (!isSupportedCuteDslTestSm(rawSmVersion))
+    {
+        GTEST_SKIP() << "D512 CuTe DSL FMHA unit tests only run on SM100/101/110. Current SM=" << rawSmVersion;
+    }
+    if (!CuteDslFMHARunner::loadLLMKernelModule())
+    {
+        FAIL() << "Failed to load CuTe DSL LLM FMHA kernel modules";
+    }
+
+    runLlmD512PagedNonCausalAccuracyCase(/*fp8Input=*/true);
 }
 
 TEST(CuteDslFMHARunnerTest, vitAccuracy)

@@ -24,10 +24,10 @@ A single ``_attention_plugin_translation`` covers all feature combinations
 (vanilla, FP8-KV, tree attention, FP8-KV + tree attention).  Its signature
 matches the full ``trt::attention_plugin`` custom-op schema so positional
 alignment with the FX graph (where ``torch.export`` normalizes every kwarg
-into a positional arg) is always correct.  ``attention_mask`` /
-``attention_pos_id`` are optional ONNX inputs (empty when tree attention is
-off); ``qkv_scales`` defaults to ``[1.0, 1.0, 1.0]`` in the op schema so it
-is always a valid FLOATS attribute.
+into a positional arg) is always correct.  ``context_mask_selector``,
+``attention_mask`` and ``attention_pos_id`` are
+optional ONNX inputs; ``qkv_scales`` defaults to ``[1.0, 1.0, 1.0]`` in the op
+schema so it is always a valid FLOATS attribute.
 """
 
 from typing import Sequence
@@ -62,7 +62,9 @@ def _attention_plugin_translation(
     enable_tree_attention: int,
     enable_fp8_kv_cache: int,
     attention_scale: float,
+    enable_context_mask_selector: int,
     enable_vision_block_attention: int,
+    context_mask_selector: onnxscript.INT32,
     attention_mask: onnxscript.INT32,
     attention_pos_id: onnxscript.INT32,
     qkv_scales: Sequence[float],
@@ -77,13 +79,10 @@ def _attention_plugin_translation(
     """Unified attention plugin covering vanilla, FP8-KV, tree, and tree+FP8-KV.
 
     Feeds the packed ``qkv`` tensor ``[B, S, (H_q + 2*H_kv) * D]`` to the V3
-    ``AttentionPlugin``: 5 required inputs plus two optional groups —
-    ``q_norm_gamma`` / ``k_norm_gamma`` (enable_qk_norm) and ``attention_mask``
-    / ``attention_pos_id`` (tree attention).
-
-    onnxscript traces a fixed graph, so all 9 inputs are always wired; the
-    export post-pass (``_strip_attention_plugin_optional_inputs``) removes the
-    disabled optional groups.
+    ``AttentionPlugin``. The translation always wires the complete optional
+    input layout in a stable order: q/k norm gammas, context-mask selector, and
+    tree/vision attention mask inputs. The export post-pass compacts disabled
+    optional groups so the ONNX node matches the C++ plugin contract.
     """
     # Gammas enter the plugin as FP16 constant INPUTS (engine weights baked at
     # build time); zero-length constants signal "qk_norm disabled".
@@ -104,6 +103,7 @@ def _attention_plugin_translation(
         kv_page_table,
         q_norm_gamma_fp16,
         k_norm_gamma_fp16,
+        context_mask_selector,
         attention_mask,
         attention_pos_id,
         num_q_heads=num_q_heads,
@@ -111,6 +111,7 @@ def _attention_plugin_translation(
         head_size=head_size,
         enable_tree_attention=enable_tree_attention,
         enable_fp8_kv_cache=enable_fp8_kv_cache,
+        enable_context_mask_selector=enable_context_mask_selector,
         enable_vision_block_attention=enable_vision_block_attention,
         sliding_window_size=sliding_window_size,
         qkv_scales=qkv_scales,

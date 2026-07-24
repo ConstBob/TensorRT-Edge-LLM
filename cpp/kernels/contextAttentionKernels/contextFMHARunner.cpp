@@ -444,7 +444,7 @@ bool ContextFMHARunner::canImplement(int32_t headSize, [[maybe_unused]] int32_t 
 {
     if (dataType != DataType::kHALF)
     {
-        LOG_ERROR(
+        LOG_DEBUG(
             "ContextFMHARunner::canImplement() only supports FP16. Got dataType=%d.", static_cast<int32_t>(dataType));
         return false;
     }
@@ -476,7 +476,7 @@ bool ContextFMHARunner::canImplement(int32_t headSize, [[maybe_unused]] int32_t 
     {
         if (inputLayout != AttentionInputLayout::SEPARATE_Q_K_V || maskType != ContextAttentionMaskType::PADDING)
         {
-            LOG_ERROR(
+            LOG_DEBUG(
                 "ContextFMHARunner::canImplement() headSize=%d requires inputLayout=SEPARATE_Q_K_V and "
                 "maskType=PADDING. Got inputLayout=%d, maskType=%d.",
                 headSize, static_cast<int32_t>(inputLayout), static_cast<int32_t>(maskType));
@@ -485,7 +485,7 @@ bool ContextFMHARunner::canImplement(int32_t headSize, [[maybe_unused]] int32_t 
         return true;
     }
 
-    LOG_ERROR(
+    LOG_DEBUG(
         "ContextFMHARunner::canImplement() unsupported headSize=%d. Supported head sizes are 64, 72, 80, 128, 256.",
         headSize);
     return false;

@@ -38,9 +38,11 @@
 #include "sampler/sampling.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -57,29 +59,6 @@ namespace
 //! into the engines by `llmBuilder`.
 constexpr int32_t kPrefillProfile{0};
 constexpr int32_t kDecodeProfile{1};
-
-//! Fires `context.onTokenGenerated` once per active slot using the most recent
-//! token in `tokenIds`. Called at the end of prefill (one token sampled per
-//! slot) and after every decode iteration so streaming consumers see every
-//! emitted token in order.
-inline void emitTokenCallbacks(rt::DecodingInferenceContext& context)
-{
-    if (!context.onTokenGenerated.has_value())
-    {
-        return;
-    }
-    auto const& callback = context.onTokenGenerated.value();
-    for (int32_t i = 0; i < context.activeBatchSize; ++i)
-    {
-        auto const& slotTokens = context.tokenIds[i];
-        if (slotTokens.empty())
-        {
-            continue;
-        }
-        bool const isFinished = context.finishedStates[i] != 0;
-        callback(rt::TokenCallbackInfo{slotTokens.back(), i, context.generationRound, isFinished});
-    }
-}
 
 } // namespace
 
@@ -159,8 +138,6 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     //    performs cross-engine consistency and drafting-vs-capacity checks).
     // -----------------------------------------------------------------------
     std::filesystem::path const engineDirPath{engineDir};
-    std::filesystem::path const baseEnginePath
-        = draftingConfig.has_value() ? engineDirPath / "spec_base.engine" : engineDirPath / "llm.engine";
     std::filesystem::path const baseConfigPath
         = draftingConfig.has_value() ? engineDirPath / "base_config.json" : engineDirPath / "config.json";
     std::optional<std::filesystem::path> const draftConfigPath = draftingConfig.has_value()
@@ -169,7 +146,12 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
 
     mDeployment = createDeploymentConfig(baseConfigPath, draftConfigPath, draftingConfig);
 
-    ELLM_CHECK(mDeployment.base.numDeepstackFeatures <= 0 || !multimodalEngineDir.empty(),
+    std::filesystem::path const baseEnginePath = draftingConfig.has_value()
+        ? engineDirPath / "spec_base.engine"
+        : (mDeployment.base.isDiffusionBackbone ? engineDirPath / "dllm.engine" : engineDirPath / "llm.engine");
+
+    ELLM_CHECK(mDeployment.base.isDiffusionBackbone || mDeployment.base.numDeepstackFeatures <= 0
+            || !multimodalEngineDir.empty(),
         "--multimodalEngineDir is required for VLM engine.");
 
     // -----------------------------------------------------------------------
@@ -231,7 +213,15 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     //    weight bindings. Speculative decoders add tree-mask / position IDs
     //    to this same map further down.
     // -----------------------------------------------------------------------
-    buildTensorMap(mBaseTensorMap, *mPipelineIO, *mSharedResources, mDeployment.base, /*kvCacheIndex=*/0);
+    if (mDeployment.base.isDiffusionBackbone)
+    {
+        buildTensorMapForDiffusionBackbone(
+            mBaseTensorMap, *mPipelineIO, *mSharedResources, mDeployment.base, /*kvCacheIndex=*/0);
+    }
+    else
+    {
+        buildTensorMap(mBaseTensorMap, *mPipelineIO, *mSharedResources, mDeployment.base, /*kvCacheIndex=*/0);
+    }
     mSharedResources->externalWeightManager->registerTensorMapEntries(mBaseTensorMap);
 
     // -----------------------------------------------------------------------
@@ -250,7 +240,7 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     // -----------------------------------------------------------------------
     mStepPreparer = std::make_unique<StepPreparer>(mDeployment.base);
     mEmbeddingPre = std::make_unique<EmbeddingPreprocessor>(mEmbedding, mDeployment.base);
-    if (mDeployment.base.numDeepstackFeatures > 0)
+    if (!mDeployment.base.isDiffusionBackbone && mDeployment.base.numDeepstackFeatures > 0)
     {
         mDeepstack = std::make_unique<DeepstackBinding>(mPipelineIO->deepstackEmbeds, mSharedResources->zeroBuffer);
     }
@@ -261,19 +251,27 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     // -----------------------------------------------------------------------
     int32_t const effectiveMaxProposalSize = hasDraft ? mDeployment.effectiveMaxDraftProposalSize() : 1;
     int32_t const effectiveDraftTopK = hasDraft ? draftingConfig->draftingTopK : 1;
+    int32_t const diffusionCanvasLen
+        = mDeployment.base.isDiffusionBackbone ? std::max(1, mDeployment.base.diffusionCanvasLength) : 1;
     int32_t const maxInputLength = hasDraft
         ? std::max(mDeployment.base.maxSupportedInputLength, mDeployment.draft->maxSupportedInputLength)
-        : mDeployment.base.maxSupportedInputLength;
+        : std::max(mDeployment.base.maxSupportedInputLength, diffusionCanvasLen);
+    int32_t const diffusionSamplingSize = mMaxRuntimeBatchSize * diffusionCanvasLen;
     int32_t const maxSamplingSize = hasDraft ? std::max(mMaxRuntimeBatchSize * effectiveMaxProposalSize,
                                                    mMaxRuntimeBatchSize * effectiveDraftTopK * effectiveDraftTopK)
-                                             : mMaxRuntimeBatchSize;
+                                             : diffusionSamplingSize;
 
     // Reserve enough workspace for sampling, accounting for batch dimension in draft proposal stage.
     // Always include vanilla sampling workspace size because per-request disable_spec_decode
     // can fall back to topK/topP sampling even when draft is loaded.
-    int32_t const vanillaSamplingWorkspaceSize
-        = static_cast<int32_t>(getTopKtopPSamplingWorkspaceSize(mMaxRuntimeBatchSize, mDeployment.base.outputVocabSize,
-            SamplingParams(mMaxRuntimeBatchSize, mDeployment.base.outputVocabSize, 1.0f, 0, 0.9f)));
+    int32_t const vanillaSamplingRows = mDeployment.base.isDiffusionBackbone ? 0 : mMaxRuntimeBatchSize;
+    // DiffusionGemma uses BlockDiffusionDecoder's custom sampler kernels on full-canvas logits and does not use the
+    // generic vanilla selectAllTopK/topKtopP workspace. Keeping that workspace sized to B*C rows would reserve about
+    // 1 GiB for B=4, canvas=256, vocab=262144 with no runtime consumer.
+    size_t const vanillaSamplingWorkspaceSize = mDeployment.base.isDiffusionBackbone
+        ? 0U
+        : getTopKtopPSamplingWorkspaceSize(vanillaSamplingRows, mDeployment.base.outputVocabSize,
+              SamplingParams(vanillaSamplingRows, mDeployment.base.outputVocabSize, 1.0f, 0, 0.9f));
     bool const isDSparkDraft = hasDraft && mDeployment.specDecodeMode() == SpecDecodeMode::kDSpark;
     constexpr int32_t kDSparkMaxSparseTopK = 128;
     bool const isLinearBlockDraft = hasDraft
@@ -283,28 +281,33 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
                                                          : mMaxRuntimeBatchSize * effectiveDraftTopK;
     int32_t const draftSamplingTopK
         = isLinearBlockDraft ? (isDSparkDraft ? kDSparkMaxSparseTopK : 1) : effectiveDraftTopK;
-    int32_t const dsparkBaseTopKWorkspaceSize = isDSparkDraft
-        ? static_cast<int32_t>(getSelectAllTopKWorkspaceSize(mMaxRuntimeBatchSize * mDeployment.specConfig->verifySize,
-              mDeployment.base.outputVocabSize, kDSparkMaxSparseTopK))
+    size_t const dsparkBaseTopKWorkspaceSize = isDSparkDraft
+        ? getSelectAllTopKWorkspaceSize(mMaxRuntimeBatchSize * mDeployment.specConfig->verifySize,
+              mDeployment.base.outputVocabSize, kDSparkMaxSparseTopK)
         : 0;
-    mLogprobsMaxBatchDim = mMaxRuntimeBatchSize * mDeployment.maxAcceptedTokensPerRound();
-    int32_t const logprobsWorkspaceSize = static_cast<int32_t>(
-        getExtractTopKLogprobsWorkspaceSize(mLogprobsMaxBatchDim, mDeployment.base.outputVocabSize, kMaxLogprobsK));
-    int32_t const maxSamplingWorkspaceSize = hasDraft
+    // DiffusionGemma logprobs require B*canvasLen rows, which is a GiB-scale log-softmax workspace for 26B.
+    // Keep that allocation off the default serving path and grow it lazily only for numLogprobs requests.
+    mLogprobsMaxBatchDim
+        = mDeployment.base.isDiffusionBackbone ? 0 : mMaxRuntimeBatchSize * mDeployment.maxAcceptedTokensPerRound();
+    size_t const logprobsWorkspaceSize = mLogprobsMaxBatchDim > 0
+        ? getExtractTopKLogprobsWorkspaceSize(mLogprobsMaxBatchDim, mDeployment.base.outputVocabSize, kMaxLogprobsK)
+        : 0U;
+    size_t const maxSamplingWorkspaceSize = hasDraft
         ? std::max({vanillaSamplingWorkspaceSize,
-              static_cast<int32_t>(
-                  getSelectAllTopKWorkspaceSize(mMaxRuntimeBatchSize, mDeployment.base.outputVocabSize, 1)),
-              static_cast<int32_t>(getSelectAllTopKWorkspaceSize(
-                  draftSamplingRows, mDeployment.draft->outputVocabSize, draftSamplingTopK)),
+              getSelectAllTopKWorkspaceSize(vanillaSamplingRows, mDeployment.base.outputVocabSize, 1),
+              getSelectAllTopKWorkspaceSize(draftSamplingRows, mDeployment.draft->outputVocabSize, draftSamplingTopK),
               dsparkBaseTopKWorkspaceSize, logprobsWorkspaceSize})
         : std::max(vanillaSamplingWorkspaceSize, logprobsWorkspaceSize);
+    check::check(maxSamplingWorkspaceSize <= static_cast<size_t>(std::numeric_limits<int64_t>::max()),
+        "Sampling workspace size exceeds tensor dimension range");
+    int64_t const maxSamplingWorkspaceLen = static_cast<int64_t>(std::max<size_t>(maxSamplingWorkspaceSize, 1U));
 
     try
     {
         mIdsInput = rt::Tensor({mMaxRuntimeBatchSize, maxInputLength}, rt::DeviceType::kGPU, DataType::kINT32,
             "LLMInferenceRuntime::mIdsInput");
 
-        mSamplingWorkspace = rt::Tensor({maxSamplingWorkspaceSize}, rt::DeviceType::kGPU, DataType::kINT8,
+        mSamplingWorkspace = rt::Tensor({maxSamplingWorkspaceLen}, rt::DeviceType::kGPU, DataType::kINT8,
             "LLMInferenceRuntime::mSamplingWorkspace");
         mSamplingIndices = rt::Tensor(
             {maxSamplingSize}, rt::DeviceType::kGPU, DataType::kINT32, "LLMInferenceRuntime::mSamplingIndices");
@@ -318,8 +321,8 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
 
         mHostPackedTokenIds = rt::Tensor({mMaxRuntimeBatchSize, maxInputLength}, rt::DeviceType::kCPU, DataType::kINT32,
             "LLMInferenceRuntime::mHostPackedTokenIds");
-        mHostSelectedTokenIds = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32,
-            "LLMInferenceRuntime::mHostSelectedTokenIds");
+        mHostSelectedTokenIds = rt::Tensor(
+            {maxSamplingSize}, rt::DeviceType::kCPU, DataType::kINT32, "LLMInferenceRuntime::mHostSelectedTokenIds");
         mHostReuseKVCacheLengths = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32,
             "LLMInferenceRuntime::mHostReuseKVCacheLengths");
 
@@ -327,7 +330,10 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
         mMultimodalIndices = rt::Tensor({mMaxRuntimeBatchSize, maxInputLength}, rt::DeviceType::kGPU, DataType::kINT32,
             "LLMInferenceRuntime::mMultimodalIndices");
 
-        allocateLogprobsTensors();
+        if (mLogprobsMaxBatchDim > 0)
+        {
+            ensureLogprobsCapacity(mLogprobsMaxBatchDim, kMaxLogprobsK);
+        }
     }
     catch (std::exception const& e)
     {
@@ -407,7 +413,7 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
             }
             catch (std::exception const& e)
             {
-                LOG_DEBUG("Failed to load %s runner from %s: %s", name.c_str(), dir.c_str(), e.what());
+                LOG_WARNING("Failed to load %s runner from %s: %s", name.c_str(), dir.c_str(), e.what());
                 return nullptr;
             }
         };
@@ -490,22 +496,49 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
         static_cast<size_t>(audioContextMemorySize), static_cast<size_t>(actionContextMemorySize));
 }
 
-void LLMInferenceRuntime::allocateLogprobsTensors()
+void LLMInferenceRuntime::ensureLogprobsCapacity(int32_t logprobsRows, int32_t topK)
 {
-    int32_t const logprobsRows = mMaxRuntimeBatchSize * mDeployment.maxAcceptedTokensPerRound();
-    mDeviceLogprobsValues = rt::Tensor({logprobsRows, kMaxLogprobsK}, rt::DeviceType::kGPU, DataType::kFLOAT,
-        "LLMInferenceRuntime::mDeviceLogprobsValues");
-    mDeviceLogprobsIndices = rt::Tensor({logprobsRows, kMaxLogprobsK}, rt::DeviceType::kGPU, DataType::kINT32,
-        "LLMInferenceRuntime::mDeviceLogprobsIndices");
-    mHostLogprobsValues = rt::Tensor({logprobsRows, kMaxLogprobsK}, rt::DeviceType::kCPU, DataType::kFLOAT,
-        "LLMInferenceRuntime::mHostLogprobsValues");
-    mHostLogprobsIndices = rt::Tensor({logprobsRows, kMaxLogprobsK}, rt::DeviceType::kCPU, DataType::kINT32,
-        "LLMInferenceRuntime::mHostLogprobsIndices");
+    check::check(logprobsRows > 0, "logprobsRows must be positive when logprobs are requested.");
+    check::check(topK > 0 && topK <= static_cast<int32_t>(kMaxLogprobsK), "numLogprobs is out of supported range.");
+
+    size_t const requiredWorkspaceSize
+        = getExtractTopKLogprobsWorkspaceSize(logprobsRows, mDeployment.base.outputVocabSize, topK);
+    check::check(requiredWorkspaceSize <= static_cast<size_t>(std::numeric_limits<int64_t>::max()),
+        "Logprobs workspace size exceeds tensor dimension range");
+    if (mSamplingWorkspace.isEmpty()
+        || static_cast<size_t>(mSamplingWorkspace.getMemoryCapacity()) < requiredWorkspaceSize)
+    {
+        mSamplingWorkspace = rt::Tensor({static_cast<int64_t>(requiredWorkspaceSize)}, rt::DeviceType::kGPU,
+            DataType::kINT8, "LLMInferenceRuntime::mSamplingWorkspace");
+    }
+
+    int64_t const requiredValueBytes = static_cast<int64_t>(logprobsRows) * kMaxLogprobsK * sizeof(float);
+    int64_t const requiredIndexBytes = static_cast<int64_t>(logprobsRows) * kMaxLogprobsK * sizeof(int32_t);
+    if (mDeviceLogprobsValues.isEmpty() || mDeviceLogprobsValues.getMemoryCapacity() < requiredValueBytes)
+    {
+        mDeviceLogprobsValues = rt::Tensor({logprobsRows, kMaxLogprobsK}, rt::DeviceType::kGPU, DataType::kFLOAT,
+            "LLMInferenceRuntime::mDeviceLogprobsValues");
+        mHostLogprobsValues = rt::Tensor({logprobsRows, kMaxLogprobsK}, rt::DeviceType::kCPU, DataType::kFLOAT,
+            "LLMInferenceRuntime::mHostLogprobsValues");
+    }
+    if (mDeviceLogprobsIndices.isEmpty() || mDeviceLogprobsIndices.getMemoryCapacity() < requiredIndexBytes)
+    {
+        mDeviceLogprobsIndices = rt::Tensor({logprobsRows, kMaxLogprobsK}, rt::DeviceType::kGPU, DataType::kINT32,
+            "LLMInferenceRuntime::mDeviceLogprobsIndices");
+        mHostLogprobsIndices = rt::Tensor({logprobsRows, kMaxLogprobsK}, rt::DeviceType::kCPU, DataType::kINT32,
+            "LLMInferenceRuntime::mHostLogprobsIndices");
+    }
     if (mDeployment.specConfig.has_value())
     {
-        mGatheredLogits = rt::Tensor({logprobsRows, mDeployment.base.outputVocabSize}, rt::DeviceType::kGPU,
-            DataType::kFLOAT, "LLMInferenceRuntime::mGatheredLogits");
+        int64_t const requiredGatheredBytes
+            = static_cast<int64_t>(logprobsRows) * mDeployment.base.outputVocabSize * sizeof(float);
+        if (mGatheredLogits.isEmpty() || mGatheredLogits.getMemoryCapacity() < requiredGatheredBytes)
+        {
+            mGatheredLogits = rt::Tensor({logprobsRows, mDeployment.base.outputVocabSize}, rt::DeviceType::kGPU,
+                DataType::kFLOAT, "LLMInferenceRuntime::mGatheredLogits");
+        }
     }
+    mLogprobsMaxBatchDim = std::max(mLogprobsMaxBatchDim, logprobsRows);
 }
 
 void LLMInferenceRuntime::buildDecodingRuntimeContext()
@@ -641,6 +674,7 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     context.temperature = forceGreedySpecDecode ? 1.0f : request.temperature;
     context.topP = forceGreedySpecDecode ? 1.0f : request.topP;
     context.topK = forceGreedySpecDecode ? 0 : request.topK;
+    context.diffusionMaxDenoisingSteps = request.diffusionMaxDenoisingSteps;
     context.outputThinkerEmbeddings = outputThinkerEmbeddings;
     context.onTokenGenerated = request.onTokenGenerated;
 
@@ -653,6 +687,9 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     context.numLogprobs = std::min(request.numLogprobs, static_cast<int32_t>(kMaxLogprobsK));
     if (context.numLogprobs > 0)
     {
+        int32_t const logprobsRows = activeBatchSize * mDeployment.maxAcceptedTokensPerRound();
+        ensureLogprobsCapacity(logprobsRows, context.numLogprobs);
+
         // Spec-decode verify may accept more than 1 token in one step, overshooting maxGenerateLength.
         int32_t const overshoot = mDeployment.maxAcceptedTokensPerRound() - 1;
         for (auto& slot : context.stepLogprobs)
@@ -728,6 +765,10 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     // to the prompt length so streaming emits only generated tokens.
     for (int32_t i = 0; i < context.activeBatchSize; ++i)
     {
+        if (static_cast<size_t>(i) < context.callbackEmittedTokenCounts.size())
+        {
+            context.callbackEmittedTokenCounts[i] = static_cast<int32_t>(context.tokenIds[i].size());
+        }
         if (request.streamChannels.empty() || !request.streamChannels[i])
         {
             continue;
@@ -829,6 +870,10 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     };
 
     auto updateThinkingDone = [&]() {
+        if (!request.enableThinking)
+        {
+            return;
+        }
         for (int32_t i = 0; i < context.activeBatchSize; ++i)
         {
             if (context.tokenIds[i].empty())
@@ -839,34 +884,10 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
         }
     };
 
-    context.shouldStopAfterAcceptedToken = [&](int32_t batchIdx, int32_t tokenId) {
-        // Per-token thinking-done check (inline version of updateThinkingDone for a single batch entry).
-        if (request.enableThinking && !thinkingDone[batchIdx])
-        {
-            if (tokenId == endOfChannelId || tokenId == endOfThinkId)
-            {
-                thinkingDone[batchIdx] = true;
-            }
-            else if (context.currentGenerateLengths[batchIdx] == 1 && tokenId != startOfChannelId
-                && tokenId != startOfThinkId)
-            {
-                thinkingDone[batchIdx] = true;
-                LOG_DEBUG("Batch %d: first token %d is not thinking-start, marking thinkingDone", batchIdx, tokenId);
-            }
-        }
-        bool isEos = mTokenizer->isEosToken(tokenId);
-        if (isEos && request.enableThinking && tokenId != mTokenizer->getEosId() && !thinkingDone[batchIdx])
-        {
-            isEos = false;
-        }
-        return isEos || context.currentGenerateLengths[batchIdx] >= context.maxGenerateLength;
-    };
-
-    // Few-layer-validation: when EDGELLM_IGNORE_EOS is set, suppress EOS-based
-    // termination so the run produces exactly maxGenerateLength tokens, matching
-    // the PyTorch golden, which forces a fixed number of decode rounds ignoring
-    // EOS. Off by default; only for the numeric-validation run. (Greedy sampling
-    // itself is requested separately via the input JSON's top_k=1.)
+    // Few-layer-validation / fixed-output perf: when EDGELLM_IGNORE_EOS is set,
+    // suppress EOS-based termination so the run produces exactly maxGenerateLength
+    // tokens. This also applies to multi-token accept paths such as DiffusionGemma
+    // canvas commit; otherwise EOS inside a canvas can truncate a fixed-output block.
     bool const ignoreEos = []() {
         char const* v = std::getenv("EDGELLM_IGNORE_EOS");
         return v != nullptr && std::string(v) != "0" && std::string(v) != "false";
@@ -875,6 +896,16 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     {
         LOG_INFO("EDGELLM_IGNORE_EOS set: ignoring EOS; running to maxGenerateLength.");
     }
+
+    context.shouldStopAfterAcceptedToken = [&](int32_t batchIdx, int32_t tokenId) {
+        updateThinkingDoneForToken(batchIdx, tokenId);
+        bool isEos = !ignoreEos && mTokenizer->isEosToken(tokenId);
+        if (isEos && request.enableThinking && tokenId != mTokenizer->getEosId() && !thinkingDone[batchIdx])
+        {
+            isEos = false;
+        }
+        return isEos || context.currentGenerateLengths[batchIdx] >= context.maxGenerateLength;
+    };
 
     // Lambda to update finish states based on EOS and max_length. Latches
     // terminalReason atomically with the state flip — the !finishedStates guard
@@ -950,23 +981,25 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     };
 
     // Post-prefill per-iter pipeline:
-    //   cancel → decode (emitDelta + stop match) → finalize (EOS/length/stop) → emit
-    applyCancellationToFinishStates(context);
-    decodePerSlot(context, *mTokenizer);
-
-    updateThinkingDone();
-
-    updateFinishStates();
-    emitChunks(context, *mTokenizer);
-
-    // If everything finished during prefill, evict once so activeBatchSize reaches 0
-    if (checkAllFinished() && context.activeBatchSize > 0)
+    //   cancel -> decode (emitDelta + stop match) -> finalize (EOS/length/stop) -> emit.
+    // DiffusionGemma prefill writes prompt KV only and does not produce a generated token.
+    if (!mDeployment.base.isDiffusionBackbone)
     {
-        bool const batchEvictStatus = performBatchEvict(context, decodingStrategy);
-        if (!batchEvictStatus)
+        applyCancellationToFinishStates(context);
+        decodePerSlot(context, *mTokenizer);
+        updateThinkingDone();
+        updateFinishStates();
+        emitChunks(context, *mTokenizer);
+
+        // If everything finished during prefill, evict once so activeBatchSize reaches 0
+        if (checkAllFinished() && context.activeBatchSize > 0)
         {
-            LOG_ERROR("Failed to perform batch eviction.");
-            return false;
+            bool const batchEvictStatus = performBatchEvict(context, decodingStrategy);
+            if (!batchEvictStatus)
+            {
+                LOG_ERROR("Failed to perform batch eviction.");
+                return false;
+            }
         }
     }
 
@@ -1372,8 +1405,41 @@ bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context)
     check::check(mPipelineIO->hostContextLengths.reshape({activeBatchSize}), "Tensor reshape failed");
     check::check(mPipelineIO->inputsEmbeds.reshape({activeBatchSize, inputIdsLength, mDeployment.base.hiddenSize}),
         "Tensor reshape failed");
-    check::check(mPipelineIO->outputLogits.reshape({activeBatchSize, mDeployment.base.outputVocabSize}),
-        "Tensor reshape failed");
+    if (mDeployment.base.isDiffusionBackbone)
+    {
+        check::check(mPipelineIO->outputLogits.reshape({activeBatchSize, 1, mDeployment.base.outputVocabSize}),
+            "Tensor reshape failed");
+        if (mDeployment.base.diffusionUnifiedConditioning)
+        {
+            Tensor* canvasIds = mBaseTensorMap.get(binding_names::kCanvasIds);
+            Tensor* prevSelfConditioningEmbeds = mBaseTensorMap.get(binding_names::kPrevSelfConditioningEmbeds);
+            Tensor* nextSelfConditioningEmbeds = mBaseTensorMap.get(binding_names::kNextSelfConditioningEmbeds);
+            Tensor* selfConditioningTemperature = mBaseTensorMap.get(binding_names::kSelfConditioningTemperature);
+            check::check(canvasIds != nullptr && prevSelfConditioningEmbeds != nullptr
+                    && nextSelfConditioningEmbeds != nullptr && selfConditioningTemperature != nullptr,
+                "DiffusionGemma unified conditioning bindings are missing for prefill.");
+            check::check(canvasIds->reshape({activeBatchSize, inputIdsLength}), "Tensor reshape failed");
+            check::check(
+                prevSelfConditioningEmbeds->reshape({activeBatchSize, inputIdsLength, mDeployment.base.hiddenSize}),
+                "Tensor reshape failed");
+            check::check(nextSelfConditioningEmbeds->reshape({activeBatchSize, 1, mDeployment.base.hiddenSize}),
+                "Tensor reshape failed");
+            bindDiffusionUnifiedBackboneTensors(mBaseTensorMap, *mPipelineIO, mPipelineIO->outputLogits, *canvasIds,
+                *prevSelfConditioningEmbeds, *nextSelfConditioningEmbeds, *selfConditioningTemperature);
+        }
+        check::check(mPipelineIO->phaseIsEncoder.reshape({activeBatchSize}), "Tensor reshape failed");
+        check::check(mPipelineIO->hostPhaseIsEncoder.reshape({activeBatchSize}), "Tensor reshape failed");
+        check::check(mPipelineIO->contextMaskSelector.reshape({0}), "Tensor reshape failed");
+        int32_t* hostPhase = mPipelineIO->hostPhaseIsEncoder.dataPointer<int32_t>();
+        std::fill(hostPhase, hostPhase + activeBatchSize, 1);
+        CUDA_CHECK(cudaMemcpyAsync(mPipelineIO->phaseIsEncoder.rawPointer(), hostPhase,
+            activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
+    }
+    else
+    {
+        check::check(mPipelineIO->outputLogits.reshape({activeBatchSize, mDeployment.base.outputVocabSize}),
+            "Tensor reshape failed");
+    }
     if (mDeployment.specConfig.has_value())
     {
         // SpecDecode base engines emit target features that feed the draft engine.
@@ -1446,6 +1512,11 @@ bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context)
         "Failed to prepare base model for prefill step.");
     check::check(mBaseExecutor->execute(context.stream), "Failed to execute base model for prefill step.");
     mSharedResources->cacheManagers[0]->commitSequenceLength(mPipelineIO->contextLengths, context.stream);
+
+    if (mDeployment.base.isDiffusionBackbone)
+    {
+        return true;
+    }
 
     applyLogitBias(mLogitBias, mPipelineIO->outputLogits, context, context.stream);
 
@@ -2035,6 +2106,7 @@ bool LLMInferenceRuntime::performBatchEvict(DecodingInferenceContext& context, D
     rt::compactVector(batchMapping, context.rawBatchedInputIds);
     rt::compactVector(batchMapping, context.effectivePrefillLengths);
     rt::compactVector(batchMapping, context.batchIndexMapping);
+    rt::compactVector(batchMapping, context.callbackEmittedTokenCounts);
     rt::compactVector(batchMapping, context.slotStreams);
     rt::compactVector(batchMapping, context.stopStringsPerSlot);
     rt::compactVector(batchMapping, context.logitBiasPerSlot);
