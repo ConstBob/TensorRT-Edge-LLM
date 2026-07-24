@@ -74,6 +74,7 @@ from ..config import _is_diffusion_gemma_model_type
 from ..external_weights import (EXTERNAL_WEIGHT_CHOICES,
                                 EXTERNAL_WEIGHT_NVFP4_MOE,
                                 resolve_externalize_weights)
+from ..models.ops import set_int4_gemm_plugin_version
 
 logging.basicConfig(
     level=logging.INFO,
@@ -3327,7 +3328,22 @@ def main() -> None:
             "Qwen3.5, Nemotron-H); not for eagle/mtp/dflash "
             "speculative-decoding variants."),
     )
+    p.add_argument(
+        "--int4-gemm-plugin-version",
+        "--int4_gemm_plugin_version",
+        dest="int4_gemm_plugin_version",
+        type=int,
+        choices=[1, 2],
+        default=2,
+        help=("INT4 groupwise GEMM plugin backend to export with."
+              "2 (default) targets the cuteDSL Int4GroupwiseGemmPluginV2 with "
+              "fragment-layout weights; 1 targets the legacy "
+              "Int4GroupwiseGemmPlugin with AWQ-swizzled weights."),
+    )
     args = p.parse_args()
+
+    # Select the INT4 GEMM plugin backend before any weight repack / op emission.
+    set_int4_gemm_plugin_version(args.int4_gemm_plugin_version)
 
     model_dir = _resolve_model_dir(args.model)
     config = _load_config(model_dir)

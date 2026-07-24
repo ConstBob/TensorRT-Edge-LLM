@@ -245,6 +245,8 @@ l1_a30_llm:
     - l1_ampere_export
     - l1_ampere_export_special
     - l1_dataset_prep
+    - job: build_cutedsl_docker_matrix
+      artifacts: true
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
@@ -273,6 +275,8 @@ l1_a30_vlm:
   needs:
     - l1_ampere_export
     - l1_dataset_prep
+    - job: build_cutedsl_docker_matrix
+      artifacts: true
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
@@ -302,6 +306,8 @@ l1_a30_eagle:
     - l1_ampere_export
     - l1_ampere_export_special
     - l1_dataset_prep
+    - job: build_cutedsl_docker_matrix
+      artifacts: true
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
@@ -330,6 +336,8 @@ l1_rtx3090_trt11_llm:
   needs:
     - l1_ampere_export
     - l1_dataset_prep
+    - job: build_cutedsl_docker_matrix
+      artifacts: true
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
@@ -359,6 +367,8 @@ l1_rtx3090_trt11_vlm:
   needs:
     - l1_ampere_export
     - l1_dataset_prep
+    - job: build_cutedsl_docker_matrix
+      artifacts: true
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
@@ -1000,6 +1010,8 @@ l1_jetson_orin_llm:
   needs:
     - l1_ampere_export
     - l1_dataset_prep
+    - job: build_cutedsl_docker_matrix
+      artifacts: true
   variables:
     TRT_CUDA_VERSION: "13.2"
     BOARD_USER: "tensorrt_user"
@@ -1027,6 +1039,8 @@ l1_jetson_orin_vlm:
   needs:
     - l1_ampere_export
     - l1_dataset_prep
+    - job: build_cutedsl_docker_matrix
+      artifacts: true
   variables:
     TRT_CUDA_VERSION: "13.2"
     BOARD_USER: "tensorrt_user"
@@ -1055,6 +1069,8 @@ l1_jetson_orin_eagle:
     - l1_ampere_export
     - l1_ampere_export_special
     - l1_dataset_prep
+    - job: build_cutedsl_docker_matrix
+      artifacts: true
   variables:
     TRT_CUDA_VERSION: "13.2"
     BOARD_USER: "tensorrt_user"

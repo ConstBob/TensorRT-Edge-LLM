@@ -566,14 +566,14 @@ _trt_mxfp8_dequantize_linear_schema = OpSchema(
 )
 
 # ---------------------------------------------------------------------------
-# trt_edgellm::Int4GroupwiseGemmPlugin
+# trt_edgellm::Int4GroupwiseGemmPlugin (AWQ swizzled weights)
 # ---------------------------------------------------------------------------
 
 _int4_groupwise_gemm_schema = OpSchema(
     name="Int4GroupwiseGemmPlugin",
     domain="trt_edgellm",
     since_version=_SCHEMA_SINCE_VERSION,
-    doc="TensorRT Int4 groupwise GEMM plugin.",
+    doc="TensorRT Int4 groupwise GEMM plugin (AWQ swizzled weights).",
     inputs=[
         OpSchema.FormalParameter(
             name="input",
@@ -582,7 +582,70 @@ _int4_groupwise_gemm_schema = OpSchema(
         ),
         OpSchema.FormalParameter(
             name="qweight",
-            description="Quantized weights (int8)",
+            description="Quantized weights, AWQ swizzle layout (int8)",
+            type_str="tensor(int8)",
+        ),
+        OpSchema.FormalParameter(
+            name="scales",
+            description="Scales (float16)",
+            type_str="tensor(float16)",
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="output",
+            description="Output tensor",
+            type_str="T",
+        ),
+    ],
+    type_constraints=[
+        (
+            "T",
+            ["tensor(float)", "tensor(float16)", "tensor(bfloat16)"],
+            "Input and output data type.",
+        ),
+    ],
+    attributes=[
+        OpSchema.Attribute(
+            name="gemm_n",
+            type=OpSchema.AttrType.INT,
+            description="Output feature dimension",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="gemm_k",
+            type=OpSchema.AttrType.INT,
+            description="Input feature dimension",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="group_size",
+            type=OpSchema.AttrType.INT,
+            description="Group size",
+            required=True,
+        ),
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# trt_edgellm::Int4GroupwiseGemmPluginV2 (cuteDSL fragment-layout weights)
+# ---------------------------------------------------------------------------
+
+_int4_groupwise_gemm_v2_schema = OpSchema(
+    name="Int4GroupwiseGemmPluginV2",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc=
+    "TensorRT Int4 groupwise GEMM plugin (cuteDSL fragment-layout weights).",
+    inputs=[
+        OpSchema.FormalParameter(
+            name="input",
+            description="Input tensor",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="qweight",
+            description="Quantized weights, cuteDSL fragment layout (int8)",
             type_str="tensor(int8)",
         ),
         OpSchema.FormalParameter(
@@ -1534,6 +1597,7 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _trt_mxfp8_dynamic_quantize_schema,
     _trt_mxfp8_dequantize_linear_schema,
     _int4_groupwise_gemm_schema,
+    _int4_groupwise_gemm_v2_schema,
     _causal_conv1d_schema,
     _update_ssm_state_schema,
     _rotary_embedding_schema,

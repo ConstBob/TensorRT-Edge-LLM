@@ -714,8 +714,61 @@ def _(weight, weight_scale, block_size):
 
 
 # ---------------------------------------------------------------------------
-# Custom op: trt::int4_groupwise_gemm
+# INT4 groupwise GEMM plugin backend selector
 # ---------------------------------------------------------------------------
+
+_INT4_PLUGIN_LOGGED = False
+
+# Export-time backend selection, set once from the export CLI
+# (``--int4-gemm-plugin-version``) via :func:`set_int4_gemm_plugin_version`. Defaults to
+# ``2`` (cuteDSL) so callers that never set it keep the V2 behavior.
+_INT4_GEMM_PLUGIN_VERSION = 2
+
+
+def set_int4_gemm_plugin_version(version: int) -> None:
+    """Select the INT4 groupwise GEMM plugin backend for the current export.
+
+    Called once from the export CLI (``--int4-gemm-plugin-version``) before the weight
+    repack / custom-op emission run. ``1`` selects the AWQ
+    ``Int4GroupwiseGemmPlugin``; any other value selects the cuteDSL
+    ``Int4GroupwiseGemmPluginV2`` (default). See :func:`int4_gemm_plugin_version`.
+    """
+    global _INT4_GEMM_PLUGIN_VERSION, _INT4_PLUGIN_LOGGED
+    _INT4_GEMM_PLUGIN_VERSION = 1 if version == 1 else 2
+    _INT4_PLUGIN_LOGGED = False  # re-log the backend after an explicit change
+
+
+def int4_gemm_plugin_version() -> int:
+    """Which INT4 groupwise GEMM plugin backend the export should target.
+
+    Selected at export time via the ``--int4-gemm-plugin-version`` CLI argument (it is
+    not a quantize-time property -- the quantized checkpoint is backend-agnostic):
+
+      * ``2`` -> cuteDSL ``Int4GroupwiseGemmPluginV2`` (default; weights repacked
+        to the tile-independent fragment layout, ``bN=128``/``bK=64``).
+      * ``1`` -> AWQ ``Int4GroupwiseGemmPlugin`` (legacy fallback; weights
+        repacked to the AWQ swizzle by ``_pack_intweights``).
+
+    Both the weight repack (``checkpoint/repacking.py``) and the emitted custom op
+    (``models/linear.py``) call this so they always agree within one export run.
+    """
+    version = _INT4_GEMM_PLUGIN_VERSION
+
+    global _INT4_PLUGIN_LOGGED
+    if not _INT4_PLUGIN_LOGGED:
+        _INT4_PLUGIN_LOGGED = True
+        backend = ("Int4GroupwiseGemmPluginV2 (cuteDSL fragment weights)"
+                   if version == 2 else
+                   "Int4GroupwiseGemmPlugin (AWQ swizzled weights)")
+        logger.info("INT4 groupwise GEMM plugin backend: %s", backend)
+    return version
+
+
+# Custom op: trt::int4_groupwise_gemm (AWQ swizzled weights)
+# ---------------------------------------------------------------------------
+# ``qweight`` is the AWQ swizzle buffer (INT8 [out_features//2, in_features],
+# repacked at export time by checkpoint/repacking.py). Emitted when
+# int4_gemm_plugin_version() == 1; maps to the Int4GroupwiseGemmPlugin ONNX node.
 
 
 @torch.library.custom_op("trt::int4_groupwise_gemm", mutates_args=())
@@ -736,6 +789,40 @@ def int4_groupwise_gemm(
 
 
 @int4_groupwise_gemm.register_fake
+def _(hidden_states, qweight, scales, gemm_n, gemm_k, group_size):
+    *leading, _ = hidden_states.shape
+    return torch.empty(*leading,
+                       gemm_n,
+                       dtype=hidden_states.dtype,
+                       device=hidden_states.device)
+
+
+# Custom op: trt::int4_groupwise_gemm_v2 (cuteDSL fragment-layout weights)
+# ---------------------------------------------------------------------------
+# Same signature and output as trt::int4_groupwise_gemm, but ``qweight`` is the
+# cuteDSL fragment-order buffer (INT8 view of the uint32 [rows, 128] tile) instead
+# of the AWQ swizzle. Emitted when int4_gemm_plugin_version() == 2 (default); maps
+# to the Int4GroupwiseGemmPluginV2 ONNX node.
+
+
+@torch.library.custom_op("trt::int4_groupwise_gemm_v2", mutates_args=())
+def int4_groupwise_gemm_v2(
+    hidden_states: torch.Tensor,  # [*, in_features] float16
+    qweight: torch.Tensor,  # cuteDSL fragment buffer, INT8 [rows, 512]
+    scales: torch.Tensor,  # [in_features//group_size, out_features] float16
+    gemm_n: int,
+    gemm_k: int,
+    group_size: int,
+) -> torch.Tensor:
+    """Stub: cuteDSL INT4 groupwise GEMM - returns zero tensor of correct shape."""
+    *leading, _ = hidden_states.shape
+    return torch.zeros(*leading,
+                       gemm_n,
+                       dtype=hidden_states.dtype,
+                       device=hidden_states.device)
+
+
+@int4_groupwise_gemm_v2.register_fake
 def _(hidden_states, qweight, scales, gemm_n, gemm_k, group_size):
     *leading, _ = hidden_states.shape
     return torch.empty(*leading,

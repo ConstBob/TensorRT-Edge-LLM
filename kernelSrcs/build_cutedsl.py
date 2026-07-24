@@ -23,7 +23,7 @@ Kernel groups:
                      attention (D=512), Ampere instruction floor (sm_80+).
   ssd              — Mamba2 SSM chunk-scan prefill
   gemm             — Talker MLP GEMM (Ampere / Blackwell / BW GeForce)
-  int4_fp16_gemm   — W4A16 INT4-weight FP16 GEMM (Ampere; full 75-config sweep) +
+  int4_fp16_gemm   — W4A16 INT4-weight FP16 GEMM (Ampere; 60-config sweep, bN=128) +
                      the decode GEMV (small-M, shares the GEMM's weight layout;
                      one exported function per M in 1..8) — built together
   f16_moe          — FP16 grouped FC1/FC2 MoE (Ampere / Blackwell / SM12x)
@@ -1461,22 +1461,32 @@ KERNEL_VARIANTS = [
 # (Ampere / Ada / Hopper / Blackwell).
 #
 # These are GENERATED rather than hand-listed: an AOT artifact has no runtime
-# autotune, so the full config universe is baked — 5 CTA tiles x {2,3,4}
-# pipeline stages x {1,2,4,8,16} split-K factors = 75 exported functions, one
-# each, and the consumer selects per shape.  swizzle (grouped-M raster) stays a
-# *runtime* Int32 kernel arg, so it is NOT a baked dimension.  split_k>1 uses an
-# in-kernel reduction; a baked split_k=N is correct only when N divides
-# ceil(K/64) (split_k=1 always works).
-# ---------------------------------------------------------------------------
-_INT4_FP16_GEMM_TILES = [
-    (16, 128, 64),
-    (16, 256, 64),
-    (32, 128, 64),
-    (64, 128, 64),
-    (128, 128, 64),
+# autotune, so the baked config set IS the plugin's autotune universe.  swizzle
+# (grouped-M raster) stays a *runtime* Int32 kernel arg, so it is NOT a baked
+# dimension.  split_k>1 uses an in-kernel reduction; a baked split_k=N is correct
+# only when N divides ceil(K/64) (split_k=1 always works).
+#
+# bN is PINNED to 128 so the offline fragment weight repack is tile-independent
+# (a single buffer serves every variant; Int4GroupwiseGemmPluginV2 / export-time
+# repack). The bN=256 tile (16x256x64) is intentionally excluded.
+#
+# The full config space has size 60: 4 CTA tiles x {2,3,4} stages x
+# {1,2,4,8,16} split-K = 60.  The 16-config subset below is selected for close
+# to optimal perf on all three target SKUs — Orin (SM87), Thor (SM110), and DGX
+# Spark (SM121).  Derived by greedy set-cover over clock-locked autotune traces;
+# shrinks the baked universe — and thus the plugin's per-shape autotune candidate
+# set — from 60 to 16 (~3.75x fewer tactics to time).  Split-K 8 and 16 are
+# dropped entirely (never needed within 2% on any cell of any SKU).
+#
+# Each entry is (bM, stages, split_k); bN=128, bK=64 fixed.
+# NOTE: keep this list in sync with INT4_FP16_GEMM_VARIANTS in
+# cpp/plugins/int4GroupwiseGemmPluginV2/cuteDslInt4Gemm.cpp (same 16, same order).
+_INT4_FP16_GEMM_CONFIGS = [
+    (16, 3, 1), (16, 4, 1), (16, 4, 2), (16, 4, 4),
+    (32, 2, 1), (32, 3, 2), (32, 3, 4), (32, 4, 1),
+    (64, 2, 1), (64, 3, 1), (64, 3, 4), (64, 4, 2), (64, 4, 4),
+    (128, 2, 1), (128, 2, 4), (128, 4, 1),
 ]
-_INT4_FP16_GEMM_STAGES = (2, 3, 4)
-_INT4_FP16_GEMM_SPLIT_K = (1, 2, 4, 8, 16)
 # Quant group size, baked per variant (it sizes the in-kernel scale smem, so it
 # is compile-time, not a runtime arg). The kernel supports {16, 32, 64, 128, ...}
 # (any multiple of 16 mutually divisible with bK=64); only G=128 is baked today.
@@ -1484,27 +1494,25 @@ _INT4_FP16_GEMM_SPLIT_K = (1, 2, 4, 8, 16)
 # `_g{gs}` suffix to the variant name below to ship both group sizes at once.
 _INT4_FP16_GEMM_GROUP_SIZE = 128
 
-for _tile in _INT4_FP16_GEMM_TILES:
-    _tile_tag = f"{_tile[0]}x{_tile[1]}x{_tile[2]}"
-    for _stages in _INT4_FP16_GEMM_STAGES:
-        for _sk in _INT4_FP16_GEMM_SPLIT_K:
-            KERNEL_VARIANTS.append(
-                KernelVariant(
-                    name=f"int4_fp16_gemm_{_tile_tag}_s{_stages}_sk{_sk}",
-                    group="int4_fp16_gemm",
-                    supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
-                    script="int4_fp16_gemm_cutedsl/int4_fp16_gemm_ampere.py",
-                    script_args=[
-                        "--mnk", "256,512,1024",
-                        "--cta_tiler_mnk", ",".join(str(d) for d in _tile),
-                        "--atom_layout_mnk", "1,4,1",
-                        "--num_stages", str(_stages),
-                        "--split_k", str(_sk),
-                        "--group_size", str(_INT4_FP16_GEMM_GROUP_SIZE),
-                        "--export_only",
-                    ],
-                )
-            )
+for _bm, _stages, _sk in _INT4_FP16_GEMM_CONFIGS:
+    _tile_tag = f"{_bm}x128x64"
+    KERNEL_VARIANTS.append(
+        KernelVariant(
+            name=f"int4_fp16_gemm_{_tile_tag}_s{_stages}_sk{_sk}",
+            group="int4_fp16_gemm",
+            supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+            script="int4_fp16_gemm_cutedsl/int4_fp16_gemm_ampere.py",
+            script_args=[
+                "--mnk", "256,512,1024",
+                "--cta_tiler_mnk", f"{_bm},128,64",
+                "--atom_layout_mnk", "1,4,1",
+                "--num_stages", str(_stages),
+                "--split_k", str(_sk),
+                "--group_size", str(_INT4_FP16_GEMM_GROUP_SIZE),
+                "--export_only",
+            ],
+        )
+    )
 
 # int4_fp16_gemm group also includes the W4A16 decode GEMV — a CUDA-core kernel
 # for the decode regime (small M) that consumes the SAME offline fragment weight

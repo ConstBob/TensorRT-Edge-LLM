@@ -29,6 +29,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from ..models.ops import int4_gemm_plugin_version
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -98,9 +100,12 @@ def repack_awq_to_plugin(qweight: torch.Tensor,
     # Transpose [in, out] -> [out, in] = [N, K] for pack_intweights
     nibbles_nk = nibbles.t().contiguous().numpy().astype(np.int16)  # [N, K]
 
-    packed_int16 = _pack_intweights(nibbles_nk)  # [N//4, K] int16
-    packed_int8 = packed_int16.view(np.int8).reshape(
-        packed_int16.shape[0] * 2, packed_int16.shape[1])  # [N//2, K]
+    if int4_gemm_plugin_version() == 2:
+        packed_int8 = repack_to_cutedsl_fragment(nibbles_nk)  # [rows, 512]
+    else:
+        packed_int16 = _pack_intweights(nibbles_nk)  # [N//4, K] int16
+        packed_int8 = packed_int16.view(np.int8).reshape(
+            packed_int16.shape[0] * 2, packed_int16.shape[1])  # [N//2, K]
 
     return torch.tensor(packed_int8, dtype=torch.int8).to(qweight.device)
 
@@ -135,6 +140,84 @@ def _pack_intweights(unpacked_qweight: np.ndarray) -> np.ndarray:
           | (pk[..., 2] << 8)
           | (pk[..., 3] << 12))
     return pk.reshape(N // interleave, K).astype(np.int16)
+
+
+# ---------------------------------------------------------------------------
+# cuteDSL fragment layout (Int4GroupwiseGemmPluginV2)
+# ---------------------------------------------------------------------------
+# The cuteDSL W4A16 kernel consumes a *fragment-order* weight buffer.  With bN
+# pinned to 128 (and bK=64 fixed) the layout is tile-independent, so it can be
+# baked once at export.  This mirrors
+# ``kernelSrcs/int4_fp16_gemm_cutedsl/int4_reference.py::repack_b_for_tile``
+# (bN=128, bK=64) but operates directly on biased nibbles [N, K].
+_CUTEDSL_BN = 128
+_CUTEDSL_BK = 64
+_CUTEDSL_THREADS = 128
+# (bit shift, hi-N selector, K offset) for the 8 nibbles of one 32-bit word.
+_CUTEDSL_NIBBLES = (
+    (0, False, 0),
+    (4, False, 8),
+    (8, True, 0),
+    (12, True, 8),
+    (16, False, 1),
+    (20, False, 9),
+    (24, True, 1),
+    (28, True, 9),
+)
+
+
+def repack_to_cutedsl_fragment(nibbles_nk: np.ndarray) -> np.ndarray:
+    """Biased INT4 nibbles ``[N, K]`` (in ``[0, 15]``) -> cuteDSL fragment-order
+    INT8 buffer ``[rows, 512]``, where ``rows = ceil(N/128)*ceil(K/64)*8`` and
+    each row is 128 uint32 words (viewed as 512 int8 bytes, little-endian).
+
+    Bit-for-bit identical to ``repack_b_for_tile(bN=128, bK=64)``. Out-of-range
+    (padding) nibbles are biased ``8`` so they dequantize to 0. Requires
+    ``N % 64 == 0`` and ``K % 64 == 0``.
+    """
+    bN, bK = _CUTEDSL_BN, _CUTEDSL_BK
+    n, k = int(nibbles_nk.shape[0]), int(nibbles_nk.shape[1])
+    if n % 64 != 0 or k % 64 != 0:
+        raise ValueError(
+            f"cuteDSL fragment repack requires N%64==0 and K%64==0, got N={n}, K={k}. "
+            "Small/misaligned projections should be left in fp16 (skipped) at "
+            "quantize time rather than int4-quantized.")
+    k_blocks = bK // 16  # 4
+    n_pairs = bN // 64  # 2
+    kn = k_blocks * n_pairs  # 8
+    num_n_blocks = (n + bN - 1) // bN
+    num_k_tiles = (k + bK - 1) // bK
+    n_pad, k_pad = num_n_blocks * bN, num_k_tiles * bK
+
+    b = np.full((n_pad, k_pad), 8, dtype=np.int64)
+    b[:n, :k] = nibbles_nk.astype(np.int64) & 0xF
+
+    nb = np.arange(num_n_blocks).reshape(-1, 1)  # (num_n_blocks, 1)
+    kt = np.arange(num_k_tiles).reshape(1, -1)  # (1, num_k_tiles)
+    out = np.zeros((num_n_blocks * num_k_tiles * kn, _CUTEDSL_THREADS),
+                   dtype=np.int64)
+
+    for t in range(_CUTEDSL_THREADS):
+        n_base = t // 4
+        kb = 2 * (t % 4)
+        for kbl in range(k_blocks):
+            for p in range(n_pairs):
+                idx = kbl * n_pairs + p
+                n_lo = nb * bN + (n_base + 64 * p)  # (num_n_blocks, 1)
+                n_hi = n_lo + 32
+                k0 = kt * bK + (16 * kbl + kb)  # (1, num_k_tiles)
+                word = np.zeros((num_n_blocks, num_k_tiles), dtype=np.int64)
+                for shift, hi, koff in _CUTEDSL_NIBBLES:
+                    nrow = np.broadcast_to(n_hi if hi else n_lo,
+                                           (num_n_blocks, num_k_tiles))
+                    kcol = np.broadcast_to(k0 + koff,
+                                           (num_n_blocks, num_k_tiles))
+                    word = word | (b[nrow, kcol] << shift)
+                rows = ((nb * num_k_tiles + kt) * kn + idx).reshape(-1)
+                out[rows, t] = word.reshape(-1)
+
+    out32 = np.ascontiguousarray(out.astype(np.uint32))  # [rows, 128] uint32
+    return out32.view(np.int8).reshape(out32.shape[0], out32.shape[1] * 4)
 
 
 def _gather_rows_by_gidx_order(
@@ -238,9 +321,18 @@ def repack_gptq_to_plugin(
 
     # Transpose [in, out] -> [out, in] = [N, K] for pack_intweights
     nibbles_nk = nibbles.t().contiguous().numpy().astype(np.int16)
-    packed_int16 = _pack_intweights(nibbles_nk)
-    packed_int8 = packed_int16.view(np.int8).reshape(packed_int16.shape[0] * 2,
-                                                     packed_int16.shape[1])
+    if int4_gemm_plugin_version() == 2:
+        n_dim, k_dim = nibbles_nk.shape
+        if n_dim % 64 != 0 or k_dim % 64 != 0:
+            raise ValueError(
+                f"GPTQ projection [N={n_dim}, K={k_dim}] is not 64-aligned, "
+                f"which the cuteDSL Int4GroupwiseGemmPluginV2 fragment layout "
+                f"requires (N%64==0 and K%64==0).")
+        packed_int8 = repack_to_cutedsl_fragment(nibbles_nk)  # [rows, 512]
+    else:
+        packed_int16 = _pack_intweights(nibbles_nk)
+        packed_int8 = packed_int16.view(np.int8).reshape(
+            packed_int16.shape[0] * 2, packed_int16.shape[1])
 
     qw_out = torch.tensor(packed_int8, dtype=torch.int8).to(qweight.device)
     perm = permute_idx.to(torch.int64)
@@ -298,9 +390,20 @@ def _cast_modelopt_awq_prepacked(model: nn.Module) -> None:
                 nibbles = (nibbles +
                            8) % 16  # two's complement -> plugin convention
                 nibbles_np = nibbles.numpy().astype(np.int16)
-                packed_int16 = _pack_intweights(nibbles_np)  # [N//4, K] int16
-                packed_int8 = packed_int16.view(np.int8).reshape(
-                    packed_int16.shape[0] * 2, packed_int16.shape[1])
+                if int4_gemm_plugin_version() == 2:
+                    n_dim, k_dim = nibbles_np.shape
+                    if n_dim % 64 != 0 or k_dim % 64 != 0:
+                        raise ValueError(
+                            f"ModelOpt AWQ-prepacked projection [N={n_dim}, "
+                            f"K={k_dim}] is not 64-aligned, which the cuteDSL "
+                            f"Int4GroupwiseGemmPluginV2 fragment layout requires "
+                            f"(N%64==0 and K%64==0).")
+                    packed_int8 = repack_to_cutedsl_fragment(nibbles_np)
+                else:
+                    packed_int16 = _pack_intweights(
+                        nibbles_np)  # [N//4, K] int16
+                    packed_int8 = packed_int16.view(np.int8).reshape(
+                        packed_int16.shape[0] * 2, packed_int16.shape[1])
                 module._buffers["weight"] = torch.tensor(packed_int8,
                                                          dtype=torch.int8).to(
                                                              w.device)
