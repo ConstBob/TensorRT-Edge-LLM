@@ -352,13 +352,15 @@ class AttentionPluginRunner:
                  q_norm_gamma=None,
                  k_norm_gamma=None,
                  attention_scale: Optional[float] = None,
-                 enable_kv_shared: int = 0):
+                 enable_kv_shared: int = 0,
+                 enable_context_mask_selector: bool = False):
         self.p = p
         self.tree = enable_tree_attention
         self.q_norm_gamma = q_norm_gamma
         self.k_norm_gamma = k_norm_gamma
         self.attention_scale = attention_scale
         self.kv_shared = enable_kv_shared
+        self.context_mask_selector = enable_context_mask_selector
         self.kv_dtype = trt.fp8 if p.enable_fp8_kv_cache else trt.float16
         # Paged-pool geometry: capacity padded up to whole pages, one fixed
         # page range per batch slot (identity page table).
@@ -423,6 +425,11 @@ class AttentionPluginRunner:
                 ("k_norm_gamma", trt.float16, (D, ), self.k_norm_gamma),
             ]
             plugin_input_order += ["q_norm_gamma", "k_norm_gamma"]
+        if self.context_mask_selector:
+            input_specs.append(("context_mask_selector", trt.int32, (-1, )))
+            profiles["context_mask_selector"] = ((0, ), (p.batch_size, ),
+                                                 (mb, ))
+            plugin_input_order.append("context_mask_selector")
         if self.tree:
             plugin_input_order += ["tree_mask", "position_ids"]
 
@@ -433,6 +440,8 @@ class AttentionPluginRunner:
             pf_int32("enable_tree_attention", int(self.tree)),
             pf_int32("enable_qk_norm", int(qk_norm)),
             pf_int32("enable_kv_shared", int(self.kv_shared)),
+            pf_int32("enable_context_mask_selector",
+                     int(self.context_mask_selector)),
             pf_int32("enable_fp8_kv_cache", int(p.enable_fp8_kv_cache)),
             pf_int32("sliding_window_size", p.sliding_window_size),
         ]
@@ -492,7 +501,8 @@ class AttentionPluginRunner:
             cache_indices,
             tree_mask=None,
             position_ids=None,
-            input_shapes=None):
+            input_shapes=None,
+            context_mask_selector=None):
         """Execute; returns (attn_output fp16, kv_cache after update).
 
         ``qkv`` is the packed [B, S, (Hq+2*Hkv)*D] input, or a Q-only
@@ -531,6 +541,8 @@ class AttentionPluginRunner:
         if self.tree:
             tensors["tree_mask"] = tree_mask
             tensors["position_ids"] = position_ids
+        if self.context_mask_selector:
+            tensors["context_mask_selector"] = context_mask_selector
         self.runner.execute(tensors, input_shapes)
         # Gather the (possibly updated) pool back into the logical cache.
         kv_cache[:, 0] = pool_k[:batch, :cap].permute(0, 2, 1, 3)
@@ -1585,6 +1597,99 @@ def test_ragged_prefill(label, seqlens):
     ref_rows = _ragged_prefill_ref(qkv.float(), cos, sin, seqlens, p)
     for b, L in enumerate(seqlens):
         assert_close(f"ragged[{label}].b{b}", ref_rows[b], attn_out[b, :L])
+
+
+# DiffusionGemma denoise uses a non-empty context-mask selector to switch from
+# bottom-right causal attention to dense PADDING attention. Cache starts
+# [20, 8] plus valid Q lengths [4, 3] produce the exact logical KV lengths
+# [24, 11] while the physical Q tensor remains batch-strided at S=4.
+@pytest.mark.skipif(_device_sm()
+                    not in (80, 86, 87, 89, 100, 101, 110, 120, 121),
+                    reason="D256 CuTe DSL PADDING FMHA is unsupported")
+def test_diffusion_gemma_padding_prefill():
+    q_lens = [4, 3]
+    cache_starts = [20, 8]
+    kv_lens = [24, 11]
+    cfg = dict(BASE)
+    cfg["num_q_heads"] = 16
+    cfg["num_kv_heads"] = 8
+    cfg["head_size"] = 256
+    cfg["kv_cache_capacity"] = 32
+    cfg["max_batch_size"] = len(q_lens)
+    cfg["max_seq_len"] = max(q_lens)
+    cfg["max_position_embeddings"] = cfg["kv_cache_capacity"]
+    p = AttentionParams(batch_size=len(q_lens),
+                        seq_len=max(q_lens),
+                        is_prefill=True,
+                        **cfg)
+    gen = torch.Generator().manual_seed(2562411)
+    runner = AttentionPluginRunner(p, enable_context_mask_selector=True)
+    cos, sin, combined = _make_rope(p, gen)
+    ref_k, ref_v, plugin_kv = _empty_caches(p)
+
+    # Seed an already-RoPE'd cache prefix, as the runtime does before a denoise
+    # chunk. Copy through FP16 so the reference starts from the exact values
+    # consumed by the plugin.
+    for b, prefix_len in enumerate(cache_starts):
+        prefix_k = torch.randn((p.num_kv_heads, prefix_len, p.head_size),
+                               generator=gen,
+                               dtype=torch.float32).to(DEV)
+        prefix_v = torch.randn((p.num_kv_heads, prefix_len, p.head_size),
+                               generator=gen,
+                               dtype=torch.float32).to(DEV)
+        plugin_kv[b, 0, :, :prefix_len] = prefix_k.to(torch.float16)
+        plugin_kv[b, 1, :, :prefix_len] = prefix_v.to(torch.float16)
+        ref_k[b, :, :prefix_len] = plugin_kv[b, 0, :, :prefix_len].float()
+        ref_v[b, :, :prefix_len] = plugin_kv[b, 1, :, :prefix_len].float()
+
+    qkv = torch.randn((p.batch_size, p.seq_len, p.qkv_hidden_size),
+                      generator=gen,
+                      dtype=torch.float32).to(DEV)
+    poison_padding(qkv, q_lens)
+    qkv_plugin = qkv.to(torch.float16)
+    qkv_ref = qkv_plugin.float()
+    ref_rows = []
+    for b, (q_len, cache_start,
+            kv_len) in enumerate(zip(q_lens, cache_starts, kv_lens)):
+        q = qkv_ref[b:b + 1, :q_len, :p.q_hidden].reshape(
+            1, q_len, p.num_q_heads, p.head_size).transpose(1, 2)
+        k = qkv_ref[b:b + 1, :q_len,
+                    p.q_hidden:p.q_hidden + p.kv_hidden].reshape(
+                        1, q_len, p.num_kv_heads, p.head_size).transpose(1, 2)
+        v = qkv_ref[b:b + 1, :q_len, p.q_hidden + p.kv_hidden:].reshape(
+            1, q_len, p.num_kv_heads, p.head_size).transpose(1, 2)
+        position_ids = torch.arange(cache_start,
+                                    cache_start + q_len,
+                                    dtype=torch.int32,
+                                    device=DEV)[None]
+        q = apply_rotary_embedding(q, cos, sin, position_ids)
+        k = apply_rotary_embedding(k, cos, sin, position_ids)
+        ref_k[b, :, cache_start:kv_len] = k[0]
+        ref_v[b, :, cache_start:kv_len] = v[0]
+        ref_out = scaled_dot_product_attention(q, ref_k[b:b + 1, :, :kv_len],
+                                               ref_v[b:b + 1, :, :kv_len],
+                                               p.qk_scale, None, p.num_q_heads,
+                                               p.num_kv_heads)
+        ref_rows.append(ref_out.transpose(1, 2).reshape(q_len, p.q_hidden))
+
+    ctx_len = torch.tensor(q_lens, dtype=torch.int32, device=DEV)
+    cache_idx = torch.tensor(cache_starts, dtype=torch.int32, device=DEV)
+    selector = torch.zeros(p.batch_size, dtype=torch.int32, device=DEV)
+    attn_out, plugin_kv = runner.run(qkv_plugin,
+                                     plugin_kv,
+                                     ctx_len,
+                                     combined,
+                                     cache_idx,
+                                     context_mask_selector=selector)
+    plugin_k, plugin_v = _plugin_kv_to_ref(plugin_kv, p)
+
+    for b, (q_len, kv_len) in enumerate(zip(q_lens, kv_lens)):
+        assert_close(f"diffusion-padding-attn.b{b}", ref_rows[b],
+                     attn_out[b, :q_len])
+        assert_close(f"diffusion-padding-k-cache.b{b}", ref_k[b, :, :kv_len],
+                     plugin_k[b, :, :kv_len])
+        assert_close(f"diffusion-padding-v-cache.b{b}", ref_v[b, :, :kv_len],
+                     plugin_v[b, :, :kv_len])
 
 
 # Batch invariance on RAGGED input (plugin-vs-plugin): permuting the rows (and

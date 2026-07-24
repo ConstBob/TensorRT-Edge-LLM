@@ -187,6 +187,7 @@ option(BUILD_PYTHON_BINDINGS "Enable building Python pybind11 bindings" OFF)
 #   OFF              -- no CuTe DSL kernels
 #   ALL              -- enable every kernel group below
 #   fmha             -- FMHA Blackwell attention
+#   fmha_v2          -- portable FP16 Context/ViT FMHA
 #   gdn              -- gated delta net (Mamba2-style hybrid SSM)
 #   f16_moe          -- target-specific FP16 grouped MoE for Ampere,
 #                       Blackwell DC, and Blackwell GeForce
@@ -200,7 +201,7 @@ set(ENABLE_CUTE_DSL
     "OFF"
     CACHE
       STRING
-      "CuTe DSL kernels: OFF (default), ALL, or semicolon-separated group list (fmha;gdn;f16_moe)"
+      "CuTe DSL kernels: OFF (default), ALL, or semicolon-separated group list (fmha;fmha_v2;gdn;f16_moe)"
 )
 
 if(BUILD_UNIT_TESTS)

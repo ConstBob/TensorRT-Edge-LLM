@@ -238,7 +238,7 @@ def test_default_compile_gpu_arch_is_derived_from_target_sm(sm, expected):
     assert build_cutedsl.default_compile_gpu_arch(sm) == expected
 
 
-@pytest.mark.parametrize("sm", [80, 86, 87, 89, 100, 101, 120, 121])
+@pytest.mark.parametrize("sm", [80, 86, 87, 89, 100, 101, 110, 120, 121])
 def test_fmha_v2_registry_is_complete_for_supported_sms(sm):
     variants = build_cutedsl.select_variants(sm, "fmha_v2")
 
@@ -267,9 +267,9 @@ def test_fmha_v2_registry_is_complete_for_supported_sms(sm):
     assert "--fmha_v2_context" not in padding_variant.script_args
 
 
-# SM110 uses the FA4-based `fmha` kernels. Keep the FA2-based `fmha_v2`
-# group disabled unless a faster SM110 FA2 kernel is found.
-@pytest.mark.parametrize("sm", [90, 103, 110])
+# SM110 uses the FA4-based `fmha` kernels for normal attention, but retains
+# `fmha_v2` for the D256 vision-block mode.
+@pytest.mark.parametrize("sm", [90, 103])
 def test_fmha_v2_registry_rejects_unsupported_sms(sm):
     with pytest.raises(ValueError, match="No variants"):
         build_cutedsl.select_variants(sm, "fmha_v2")

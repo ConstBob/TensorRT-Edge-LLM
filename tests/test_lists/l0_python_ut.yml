@@ -29,6 +29,7 @@ tests:
   - tests/python-unittests/test_attention_plugin.py::test_ragged_context_lengths_decode
   - tests/python-unittests/test_attention_plugin.py::test_ragged_prefill
   - tests/python-unittests/test_attention_plugin.py::test_ragged_prefill_head512_cutedsl
+  - tests/python-unittests/test_attention_plugin.py::test_diffusion_gemma_padding_prefill
   - tests/python-unittests/test_attention_plugin.py::test_ragged_prefill_batch_invariance
   - tests/python-unittests/test_attention_plugin.py::test_batch_permutation_invariance_decode
   - tests/python-unittests/test_attention_plugin.py::test_tree_attention

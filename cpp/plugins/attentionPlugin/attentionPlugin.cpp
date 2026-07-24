@@ -250,18 +250,19 @@ FMHAKernelSelection loadFMHAKernels(int32_t numQHeads, int32_t numKVHeads, int32
     return {};
 }
 
-bool loadPaddingFMHAKernels(int32_t numQHeads, int32_t numKVHeads, int32_t headSize, int32_t smVersion,
-    nvinfer1::DataType dataType)
+bool loadPaddingFMHAKernels(ContextFMHABackend backend, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
+    int32_t smVersion, nvinfer1::DataType dataType)
 {
 #ifdef CUTE_DSL_FMHA_ENABLED
-    if ((headSize == 256 || headSize == 512) && CuteDslFMHARunner::canImplement(headSize, smVersion)
-        && CuteDslFMHARunner::loadLLMKernelModule())
+    if (backend == ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL && (headSize == 256 || headSize == 512)
+        && CuteDslFMHARunner::canImplement(headSize, smVersion) && CuteDslFMHARunner::loadLLMKernelModule())
     {
         return true;
     }
 #endif
 #ifdef CUTE_DSL_FMHA_V2_ENABLED
-    if (CuteDslFMHAV2Runner::canImplement(
+    if (backend == ContextFMHABackend::kCUTE_DSL_FMHA_V2
+        && CuteDslFMHAV2Runner::canImplement(
             numQHeads, numKVHeads, headSize, smVersion, dataType, CuteDslFMHAV2MaskType::kPADDING)
         && CuteDslFMHAV2Runner::loadLLMKernelModule())
     {
@@ -563,7 +564,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     if (mEnableContextMaskSelector && mCanImplementFMHA)
     {
         mCanImplementPaddingFMHA
-            = loadPaddingFMHAKernels(mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType);
+            = loadPaddingFMHAKernels(mContextFMHABackend, mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType);
     }
 
     if (mEnableVisionBlockAttention)
@@ -704,7 +705,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
     if (mEnableContextMaskSelector && mCanImplementFMHA)
     {
         mCanImplementPaddingFMHA
-            = loadPaddingFMHAKernels(mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType);
+            = loadPaddingFMHAKernels(mContextFMHABackend, mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType);
     }
 
     // Sliding d256-class vision prefill production path: FMHA-v2 CuTe DSL.
@@ -1538,7 +1539,8 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
             bool const compact = executionMode == AttentionExecutionMode::kNORMAL_PREFILL;
             return compact ? runtimeSeqLen : 0;
         };
-        auto physicalLenForFallback = [&]() { return splitLenForFallback() > 0 ? runtimeSeqLen : kvCacheCapacity; };
+        [[maybe_unused]] auto physicalLenForFallback
+            = [&]() { return splitLenForFallback() > 0 ? runtimeSeqLen : kvCacheCapacity; };
 
         // --- Shared KV prefill: Q gets RoPE, K/V read from donor layer's cache ---
         if (sharedKV)
@@ -1826,14 +1828,13 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                     auto [kSplit, vSplit] = splitPagedKV(kvCacheTensor, pageTable,
                         kvCacheEndIdxsTensor.dataPointer<int32_t>(), maxPagesPerSeq, alignedWorkspacePtr,
                         runtimeBatchSize, mNumKVHeads, kvCacheCapacity, mHeadSize, splitSeqLen, kScale, vScale, stream);
-                    CuteDslFMHAV2Runner runner(
-                        mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen,
+                    CuteDslFMHAV2Runner runner(mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen,
                         physicalLenForFallback(), splitSeqLen > 0);
                     bool const ranKernel = usePaddingContextMask
                         ? runner.runPadding(qInputTensor.dataPointer<half>(), kSplit.dataPointer<half>(),
                               vSplit.dataPointer<half>(), attentionOutputTensor.dataPointer<half>(),
-                              cuQSeqLensTensor.dataPointer<int32_t>(), cuKVSeqLensTensor.dataPointer<int32_t>(),
-                              stream, mAttentionScale)
+                              cuQSeqLensTensor.dataPointer<int32_t>(), cuKVSeqLensTensor.dataPointer<int32_t>(), stream,
+                              mAttentionScale)
                         : runner.run(qInputTensor.dataPointer<half>(), kSplit.dataPointer<half>(),
                               vSplit.dataPointer<half>(), attentionOutputTensor.dataPointer<half>(),
                               paddedCuKVSeqLensTensor.dataPointer<int32_t>(), stream, mAttentionScale, slidingWindow);

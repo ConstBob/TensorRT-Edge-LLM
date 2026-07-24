@@ -386,8 +386,7 @@ void TestContextAttentionDenoisePaddingVarlen(std::vector<int32_t> const& qLens,
     if (!CuteDslFMHAV2Runner::canImplement(
             numQHeads, numKVHeads, headSize, smVersion, DataType::kHALF, CuteDslFMHAV2MaskType::kPADDING))
     {
-        GTEST_SKIP() << "FMHA-v2 CuTe DSL PADDING is not supported for headSize=" << headSize
-                     << ", SM=" << smVersion;
+        GTEST_SKIP() << "FMHA-v2 CuTe DSL PADDING is not supported for headSize=" << headSize << ", SM=" << smVersion;
     }
 
     size_t const qSize = static_cast<size_t>(batchSize) * seqLenQ * numQHeads * headSize;

@@ -20,6 +20,7 @@
 #include "cuteDslFMHAV2Runner.h"
 
 #include "attentionScaleUtils.h"
+#include "common/checkMacros.h"
 #include "common/cudaUtils.h"
 #include "common/logger.h"
 
@@ -54,7 +55,7 @@ namespace
 bool isFMHAV2SM(int32_t smVersion)
 {
     return smVersion == 80 || smVersion == 86 || smVersion == 87 || smVersion == 89 || smVersion == 100
-        || smVersion == 101 || smVersion == 120 || smVersion == 121;
+        || smVersion == 101 || smVersion == 110 || smVersion == 120 || smVersion == 121;
 }
 
 template <typename Module, typename Loader>
@@ -356,6 +357,17 @@ bool CuteDslFMHAV2Runner::runPadding(void const* qPtr, void const* kPtr, void co
         return false;
     }
 
+    check::check(qPtr != nullptr, "FMHA-v2 CuTe DSL padding FMHA qPtr must not be null.");
+    check::check(kPtr != nullptr, "FMHA-v2 CuTe DSL padding FMHA kPtr must not be null.");
+    check::check(vPtr != nullptr, "FMHA-v2 CuTe DSL padding FMHA vPtr must not be null.");
+    check::check(oPtr != nullptr, "FMHA-v2 CuTe DSL padding FMHA oPtr must not be null.");
+    check::check(cuQSeqLens != nullptr, "FMHA-v2 CuTe DSL padding FMHA cuQSeqLens must not be null.");
+    check::check(cuKVSeqLens != nullptr, "FMHA-v2 CuTe DSL padding FMHA cuKVSeqLens must not be null.");
+    check::check(mBatchSize > 0 && mSeqLenQ > 0 && mKVSeqLen > 0 && mNumHeadsQ > 0 && mNumHeadsKV > 0,
+        "FMHA-v2 CuTe DSL padding FMHA requires positive tensor extents.");
+    check::check(mNumHeadsQ >= mNumHeadsKV && mNumHeadsQ % mNumHeadsKV == 0,
+        "FMHA-v2 CuTe DSL padding FMHA requires Q heads to be divisible by KV heads.");
+
     validateAttentionScale(attentionScale);
     fmha_v2_d256_padding_Tensor_mQ_t qTensor{};
     qTensor.data = const_cast<void*>(qPtr);
@@ -397,8 +409,8 @@ bool CuteDslFMHAV2Runner::runPadding(void const* qPtr, void const* kPtr, void co
     cumSeqlenK.data = const_cast<int32_t*>(cuKVSeqLens);
     cumSeqlenK.dynamic_shapes[0] = mBatchSize + 1;
 
-    int32_t const ret = cute_dsl_fmha_v2_d256_padding_wrapper(&sLLM_d256Padding, &qTensor, &kTensor, &vTensor,
-        &oTensor, &cumSeqlenQ, &cumSeqlenK, attentionScale, mNumHeadsKV, stream);
+    int32_t const ret = cute_dsl_fmha_v2_d256_padding_wrapper(&sLLM_d256Padding, &qTensor, &kTensor, &vTensor, &oTensor,
+        &cumSeqlenQ, &cumSeqlenK, attentionScale, mNumHeadsKV, stream);
     if (ret != 0)
     {
         LOG_ERROR("FMHA-v2 CuTe DSL padding FMHA kernel failed with error code: %d", ret);

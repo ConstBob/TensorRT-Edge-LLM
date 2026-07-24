@@ -217,9 +217,8 @@ protected:
     //! Whether the FMHA-v2 CuTe DSL d256 vision-block context variant is active.
     bool mUseFMHAV2VisionBlockFMHA{false};
 
-    //! Whether FMHA_v2 PADDING context kernels are loaded for runtime-selected
-    //! non-causal context attention, used by DiffusionGemma denoise when the
-    //! normal prefill backend is CuTe DSL FMHA.
+    //! Whether the selected CuTe DSL backend has loaded a dense PADDING context
+    //! kernel for runtime-selected non-causal DiffusionGemma denoise attention.
     bool mCanImplementPaddingFMHA{false};
 
     //! Whether XQA decode kernels are available.
