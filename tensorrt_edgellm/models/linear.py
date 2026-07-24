@@ -39,7 +39,8 @@ from ..config import (QUANT_FP8, QUANT_FP16, QUANT_INT4_AWQ,
                       QUANT_MXFP8, QUANT_NVFP4, Mapping, ModelConfig,
                       module_quant_type)
 from .ops import (fp8_dequantize, fp8_quantize, fused_nvfp4_gemm_allreduce,
-                  int4_groupwise_gemm, int8_sq_act_qdq, int8_sq_weight_dq,
+                  int4_gemm_plugin_version, int4_groupwise_gemm,
+                  int4_groupwise_gemm_v2, int8_sq_act_qdq, int8_sq_weight_dq,
                   mxfp8_act_qdq, mxfp8_weight_dq, nvfp4_act_qdq,
                   nvfp4_dequantize)
 
@@ -50,6 +51,22 @@ def _require_fp16_input(hidden_states: torch.Tensor, layer_name: str) -> None:
     if hidden_states.dtype != torch.float16:
         raise TypeError(
             f"{layer_name} expects float16 input, got {hidden_states.dtype}")
+
+
+def _int4_groupwise_gemm_dispatch(hidden_states, qweight, scales, gemm_n,
+                                  gemm_k, group_size):
+    """Emit the INT4 groupwise GEMM custom op for the selected plugin backend.
+
+    ``int4_gemm_plugin_version()`` (CLI ``--int4-gemm-plugin-version``) picks the cuteDSL
+    ``Int4GroupwiseGemmPluginV2`` (default) or the legacy AWQ
+    ``Int4GroupwiseGemmPlugin``. The weight repack in ``checkpoint/repacking.py``
+    reads the same selector so the emitted op matches the weight layout.
+    """
+    if int4_gemm_plugin_version() == 2:
+        return int4_groupwise_gemm_v2(hidden_states, qweight, scales, gemm_n,
+                                      gemm_k, group_size)
+    return int4_groupwise_gemm(hidden_states, qweight, scales, gemm_n, gemm_k,
+                               group_size)
 
 
 __all__ = [
@@ -501,7 +518,7 @@ class AWQLinear(LinearBase):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         _require_fp16_input(hidden_states, "AWQLinear")
-        out = int4_groupwise_gemm(
+        out = _int4_groupwise_gemm_dispatch(
             hidden_states,
             self.qweight,
             self.scales.to(torch.float16),
@@ -561,7 +578,7 @@ class ModelOptAWQPrepackedLinear(LinearBase):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         _require_fp16_input(hidden_states, "ModelOptAWQPrepackedLinear")
         hidden_states = hidden_states * self.pre_quant_scale
-        out = int4_groupwise_gemm(
+        out = _int4_groupwise_gemm_dispatch(
             hidden_states,
             self.weight,
             self.weight_scale,
@@ -636,7 +653,7 @@ class GPTQLinear(LinearBase):
         if perm is not None:
             perm_d = perm.to(device=hidden_states.device, dtype=torch.int64)
             hidden_states = hidden_states.index_select(-1, perm_d)
-        out = int4_groupwise_gemm(
+        out = _int4_groupwise_gemm_dispatch(
             hidden_states,
             self.qweight,
             self.scales.to(torch.float16),

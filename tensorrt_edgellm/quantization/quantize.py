@@ -766,6 +766,23 @@ def quantize_and_export(
             audio_quantization=audio_quantization,
             cp_quantization=cp_quantization,
         )
+        # When INT4 is exported to the cuteDSL GEMM kernel's fragment layout, repack
+        # requires N%64==0 && K%64==0. Small hybrid/GDN projections (e.g. Qwen3.5
+        # in_proj_a / in_proj_b with out_features=16/32) cannot be repacked, so
+        # exclude any 64-misaligned Linear from int4 -- it stays fp16 and exports
+        # as a plain GEMM.
+        if quantization == "int4_awq":
+            for name, module in model.named_modules():
+                if isinstance(
+                        module,
+                        torch.nn.Linear) and (module.out_features % 64 != 0
+                                              or module.in_features % 64 != 0):
+                    quant_cfg["quant_cfg"][f"*{name}.weight_quantizer"] = {
+                        "enable": False
+                    }
+                    print(
+                        f"[int4] skipping {name}: weight [{module.out_features}, "
+                        f"{module.in_features}] not 64-aligned (kept fp16)")
         if cp_quantization is not None and has_code_predictor(model):
             # CP is only reached via the Thinker->Talker->CP generation path,
             # so a dedicated loop drives that chain (bs=1: Talker uses 3D

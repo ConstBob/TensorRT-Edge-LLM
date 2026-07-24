@@ -292,6 +292,25 @@ def _int4_groupwise_gemm_translation(
     )
 
 
+@script()
+def _int4_groupwise_gemm_v2_translation(
+    hidden_states: onnxscript.FLOAT16,
+    qweight: onnxscript.INT8,
+    scales: onnxscript.FLOAT16,
+    gemm_n: int,
+    gemm_k: int,
+    group_size: int,
+) -> onnxscript.FLOAT16:
+    return _trt_edgellm.Int4GroupwiseGemmPluginV2(
+        hidden_states,
+        qweight,
+        scales,
+        gemm_n=gemm_n,
+        gemm_k=gemm_k,
+        group_size=group_size,
+    )
+
+
 # ---------------------------------------------------------------------------
 # INT8 SmoothQuant ops
 # ---------------------------------------------------------------------------
@@ -1101,6 +1120,8 @@ def build_custom_translation_table() -> dict:
         _mxfp8_weight_dq_translation,
         torch.ops.trt.int4_groupwise_gemm.default:
         _int4_groupwise_gemm_translation,
+        torch.ops.trt.int4_groupwise_gemm_v2.default:
+        _int4_groupwise_gemm_v2_translation,
         torch.ops.trt.int8_sq_act_qdq.default:
         _int8_sq_act_qdq_translation,
         torch.ops.trt.int8_sq_weight_dq.default:
