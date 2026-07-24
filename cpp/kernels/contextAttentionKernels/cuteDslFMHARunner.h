@@ -173,6 +173,7 @@ private:
     static fmha_d64_paged_Kernel_Module_t sLLM_d64_paged;
     static fmha_d128_paged_Kernel_Module_t sLLM_d128_paged;
     static fmha_d256_paged_Kernel_Module_t sLLM_d256_paged;
+    static fmha_d256_dense_paged_Kernel_Module_t sLLM_d256_dense_paged;
     static fmha_d512_paged_Kernel_Module_t sLLM_d512_paged;
     static fmha_d512_dense_paged_Kernel_Module_t sLLM_d512_dense_paged;
     static fmha_d64_sw_paged_Kernel_Module_t sLLM_d64_sw_paged;
@@ -184,6 +185,7 @@ private:
     static fmha_d64_paged_fp8_Kernel_Module_t sLLM_d64_paged_fp8;
     static fmha_d128_paged_fp8_Kernel_Module_t sLLM_d128_paged_fp8;
     static fmha_d256_paged_fp8_Kernel_Module_t sLLM_d256_paged_fp8;
+    static fmha_d256_dense_paged_fp8_Kernel_Module_t sLLM_d256_dense_paged_fp8;
     static fmha_d512_paged_fp8_Kernel_Module_t sLLM_d512_paged_fp8;
     static fmha_d512_dense_paged_fp8_Kernel_Module_t sLLM_d512_dense_paged_fp8;
     static fmha_d64_sw_paged_fp8_Kernel_Module_t sLLM_d64_sw_paged_fp8;

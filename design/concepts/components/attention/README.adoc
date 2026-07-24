@@ -86,6 +86,12 @@ selects specialized kernels for the active phase and platform. The exact
 coverage is owned by the `canImplement()` / kernel-loading code paths listed
 below; update this table when those checks change.
 
+Context and ViT attention require a matching CuTe DSL artifact, an enabled
+kernel group, and CUDA Toolkit 12 or newer. There is no legacy embedded-cubin
+fallback. Builds with `ENABLE_CUTE_DSL=OFF`, including the CUDA 11.4 DriveOS 6
+cross-build, remain compile checks but do not provide a context-attention
+runtime backend.
+
 [cols="1,2,3,3", options="header"]
 |===
 | Implementation | Used For | Availability / constraints | Source of truth
@@ -94,18 +100,20 @@ below; update this table when those checks change.
 | Prefill/context attention
 | Built only when `CUTE_DSL_FMHA_ENABLED` is set (`ENABLE_CUTE_DSL=fmha` or
   `ALL`) and a matching CuTe DSL artifact is linked. Current LLM variants
-  support SM >= 100, head dim 64 or 128, FP16 input, FP8 input, and
-  sliding-window variants.
+  support SM100, SM101, and SM110; head dim 64, 128, 256, or 512; FP16 or FP8
+  input; causal/sliding masks; and dense PADDING masks for head dim 256 or 512.
 | `cpp/kernels/contextAttentionKernels/cuteDslFMHARunner.h`,
   `cpp/kernels/contextAttentionKernels/cuteDslFMHARunner.cpp`,
   `cmake/CuteDsl.cmake`
 
-| FMHA_v2 context cubins
-| Prefill/context attention fallback
-| FP16 context path. Causal decoder attention supports head dim 64, 128, or
-  256. Cubins are compiled for the target SMs selected in CMake.
-| `cpp/kernels/contextAttentionKernels/contextFMHARunner.cpp`,
-  `cpp/CMakeLists.txt`
+| FMHA-v2 CuTe DSL
+| Prefill/context and ViT attention outside the optimized Blackwell path
+| FP16 causal or sliding context attention supports head dim 64, 128, or 256;
+  dense PADDING attention with independent Q/KV lengths supports head dim 256;
+  packed ViT attention supports head dim 64, 72, 80, or 128. Matching CuTe DSL
+  artifacts are generated for the target SM.
+| `cpp/kernels/contextAttentionKernels/cuteDslFMHAV2Runner.cpp`,
+  `kernelSrcs/fmha_v2_cutedsl/fmha.py`
 
 | Decode XQA (`cpp/kernels/decodeAttentionKernels/`)
 | Token-by-token decode and tree/speculative decode

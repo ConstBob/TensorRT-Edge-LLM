@@ -85,8 +85,10 @@ def _build_project(env_config: EnvironmentConfig,
         cmake_cmd.append(
             '-DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake')
 
-    # Enable CuteDSL kernels for Blackwell aarch64 targets.
-    if device_config.target in ['auto-thor', 'jetson-thor', 'gb10']:
+    # Enable all available CuTe DSL kernels for aarch64 targets.
+    if device_config.target in [
+            'jetson-orin', 'auto-thor', 'jetson-thor', 'gb10'
+    ]:
         cmake_cmd.append('-DENABLE_CUTE_DSL=ALL')
         test_logger.info("CuTe DSL: using available artifact")
 
@@ -100,20 +102,30 @@ def _build_project(env_config: EnvironmentConfig,
     # Enable CuteDSL kernels on x86 when the job staged a prebuilt tarball for
     # the detected SM. The unified matrix producer downloads tarballs directly
     # into kernelSrcs/cuteDSLPrebuilt so CMake can auto-extract the matching
-    # architecture, SM, and CUDA-major artifact. sm86 reuses the sm_80 artifact:
-    # cubins are forward compatible within a major compute capability and the
-    # sm_80/sm_86 kernel variant sets are identical.
-    x86_cutedsl_tags = {80: 'sm_80', 86: 'sm_80', 100: 'sm_100', 120: 'sm_120'}
-    x86_tag = x86_cutedsl_tags.get(device_config.compute_capability)
-    if (device_config.target == 'x86' and x86_tag and glob.glob(
+    # architecture, SM, and CUDA-major artifact. SM86 reuses the SM80 artifact
+    # for forward-compatible groups. F16 MoE requires an exact artifact SM, so
+    # do not enable that group without a native SM86 artifact.
+    x86_cutedsl_selections = {
+        80: ('sm_80', 'ALL'),
+        86: ('sm_80', r'ffpa\;fmha_v2\;gdn\;gemm\;int4_fp16_gemm\;ssd'),
+        100: ('sm_100', 'ALL'),
+        120: ('sm_120', 'ALL'),
+    }
+    x86_selection = x86_cutedsl_selections.get(
+        device_config.compute_capability)
+    if (device_config.target == 'x86' and x86_selection and glob.glob(
             os.path.join(env_config.llm_sdk_dir, 'kernelSrcs',
                          'cuteDSLPrebuilt',
-                         f'cutedsl_x86_64_{x86_tag}_*.tar.gz'))):
-        cmake_cmd.append('-DENABLE_CUTE_DSL=ALL')
+                         f'cutedsl_x86_64_{x86_selection[0]}_*.tar.gz'))):
+        x86_tag, x86_groups = x86_selection
+        enable_cutedsl_arg = f'-DENABLE_CUTE_DSL={x86_groups}'
+        if enable_cutedsl_arg not in cmake_cmd:
+            cmake_cmd.append(enable_cutedsl_arg)
         cmake_cmd.append(f'-DCUTE_DSL_ARTIFACT_TAG={x86_tag}')
+        x86_groups_log = x86_groups.replace(r'\;', ';')
         test_logger.info(
             f"CuTe DSL: x86 SM{device_config.compute_capability}, "
-            "using staged prebuilt artifact")
+            f"using staged prebuilt artifact groups={x86_groups_log}")
 
     build_cmd = ' && '.join([
         f'mkdir -p {build_dir}', f'cd {build_dir}', ' '.join(cmake_cmd),

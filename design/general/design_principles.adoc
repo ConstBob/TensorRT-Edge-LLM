@@ -396,7 +396,7 @@ For example, `EagleDraftEngineRunner::~EagleDraftEngineRunner()` will call `std:
 
 . *Avoid top-level const specification when passing by value*:
 Avoid declaring by-value input parameters as constant, since it is an implementation detail,
-e.g. the `dataType` argument of the `ContextFMHARunner` constructor should not be declared const
+e.g. the `dataType` argument of `CuteDslFMHAV2Runner::canImplement()` should not be declared const
 (see https://www.fluentcpp.com/2018/11/23/function-parameters-making-interfaces-easy-to-use/[this explanation]).
 
 . *Prefer return values over output arguments*:

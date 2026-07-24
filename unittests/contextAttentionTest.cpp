@@ -29,32 +29,33 @@
 #include "common/cudaUtils.h"
 #include "common/tensor.h"
 #include "contextAttnReference.h"
-#include "kernels/contextAttentionKernels/contextFMHARunner.h"
+#include "kernels/contextAttentionKernels/cuteDslFMHAV2Runner.h"
+#include "kernels/contextAttentionKernels/utilKernels.h"
 #include "testUtils.h"
 
 using namespace nvinfer1;
 using namespace trt_edgellm;
 
+#if defined(CUTE_DSL_FMHA_V2_ENABLED)
+
 void TestContextAttentionAccuracy(std::vector<int32_t> const& cuSeqlens, int32_t numQHeads, int32_t numKVHeads,
-    int32_t headSize, int32_t maxSeqLen, bool isCompact = false, bool causal = true,
+    int32_t headSize, int32_t maxSeqLen, bool isPackedViT = false, bool causal = true,
     std::optional<float> attentionScale = std::nullopt)
 {
     float const resolvedAttentionScale = attentionScale.value_or(1.0F / std::sqrt(static_cast<float>(headSize)));
     int32_t smVersion = getSMVersion();
     applyThorSMRenumberWAR(smVersion);
 
-    // Check if context FMHA is supported for this configuration
-    AttentionInputLayout const inputLayout = AttentionInputLayout::SEPARATE_Q_K_V;
-    ContextAttentionMaskType const maskType
-        = causal ? ContextAttentionMaskType::CAUSAL : ContextAttentionMaskType::PADDING;
-    if (!ContextFMHARunner::canImplement(headSize, smVersion, DataType::kHALF, inputLayout, maskType))
-    {
-        GTEST_SKIP() << "Context FMHA not supported for headSize=" << headSize << ", SM=" << smVersion;
-    }
+    bool const canImplement = isPackedViT ? CuteDslFMHAV2Runner::canImplementViT(headSize, smVersion, DataType::kHALF)
+                                          : causal
+            && CuteDslFMHAV2Runner::canImplement(
+                numQHeads, numKVHeads, headSize, smVersion, DataType::kHALF, CuteDslFMHAV2MaskType::kCAUSAL);
+    ASSERT_TRUE(canImplement) << "FMHA-v2 CuTe DSL unexpectedly unsupported for headSize=" << headSize
+                              << ", SM=" << smVersion;
 
     // Calculate total elements
     int32_t const batchSize = static_cast<int32_t>(cuSeqlens.size()) - 1;
-    int32_t const totalTokens = cuSeqlens.back();
+    int32_t const totalTokens = isPackedViT ? cuSeqlens.back() : batchSize * maxSeqLen;
 
     size_t const qSize = static_cast<size_t>(totalTokens) * numQHeads * headSize;
     size_t const kvSize = static_cast<size_t>(totalTokens) * numKVHeads * headSize;
@@ -71,7 +72,7 @@ void TestContextAttentionAccuracy(std::vector<int32_t> const& cuSeqlens, int32_t
 
     // Create Tensor objects based on layout (they allocate device memory internally)
     rt::Tensor qTensor, kTensor, vTensor, oTensorRef, oTensorKernel;
-    if (isCompact)
+    if (isPackedViT)
     {
         qTensor = rt::Tensor({totalTokens, numQHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
         kTensor = rt::Tensor({totalTokens, numKVHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
@@ -95,10 +96,29 @@ void TestContextAttentionAccuracy(std::vector<int32_t> const& cuSeqlens, int32_t
     rt::Tensor cuSeqLensTensor({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
     CUDA_CHECK(cudaMemcpy(
         cuSeqLensTensor.rawPointer(), cuSeqlens.data(), (batchSize + 1) * sizeof(int32_t), cudaMemcpyHostToDevice));
+    rt::Tensor paddedCuKVSeqLensTensor;
+    if (!isPackedViT)
+    {
+        std::vector<int32_t> inputSeqLens(batchSize);
+        for (int32_t i = 0; i < batchSize; ++i)
+        {
+            inputSeqLens[i] = cuSeqlens[i + 1] - cuSeqlens[i];
+        }
+
+        rt::Tensor inputSeqLensTensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+        CUDA_CHECK(cudaMemcpy(
+            inputSeqLensTensor.rawPointer(), inputSeqLens.data(), batchSize * sizeof(int32_t), cudaMemcpyHostToDevice));
+        rt::Tensor cuQSeqLensTensor({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
+        rt::Tensor cuKVSeqLensTensor({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
+        rt::Tensor kvCacheEndIdxsTensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+        paddedCuKVSeqLensTensor = rt::Tensor({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
+        kernel::calCuQCuKVSeqLensAndKVEndIdxs(inputSeqLensTensor, rt::Tensor{}, cuQSeqLensTensor, cuKVSeqLensTensor,
+            kvCacheEndIdxsTensor, paddedCuKVSeqLensTensor, maxSeqLen, nullptr);
+    }
 
     // Compute reference output
     cudaStream_t stream = nullptr;
-    if (isCompact)
+    if (isPackedViT)
     {
         rt::launchFmhaReferenceCompact(
             qTensor, kTensor, vTensor, oTensorRef, cuSeqLensTensor, maxSeqLen, false, resolvedAttentionScale, stream);
@@ -115,31 +135,23 @@ void TestContextAttentionAccuracy(std::vector<int32_t> const& cuSeqlens, int32_t
     CUDA_CHECK(
         cudaMemcpy(outReference.data(), oTensorRef.rawPointer(), outSize * sizeof(half), cudaMemcpyDeviceToHost));
 
-    // Load context FMHA kernels
-    EXPECT_TRUE(ContextFMHARunner::loadContextFMHAKernels(smVersion, DataType::kHALF));
-
-    // Create context FMHA runner
-    ContextFMHARunner runner(DataType::kHALF, batchSize, maxSeqLen, numQHeads, numKVHeads, headSize, smVersion,
-        inputLayout, maskType, !isCompact);
-
-    // Setup parameters
-    FusedMultiheadAttentionParamsV2 params;
-    runner.setupParams(params, resolvedAttentionScale);
-
-    // Set device pointers
-    if (!isCompact)
+    CuteDslFMHAV2Runner runner(numQHeads, numKVHeads, headSize, batchSize, maxSeqLen, maxSeqLen,
+        /*useSmallD64=*/maxSeqLen <= 512);
+    bool ranKernel = false;
+    if (isPackedViT)
     {
-        params.s_kv = maxSeqLen; // Only needed for padded layout
+        ASSERT_TRUE(CuteDslFMHAV2Runner::loadViTKernelModule());
+        ranKernel = runner.run(qTensor.rawPointer(), kTensor.rawPointer(), vTensor.rawPointer(),
+            oTensorKernel.rawPointer(), cuSeqLensTensor.dataPointer<int32_t>(), totalTokens, maxSeqLen, batchSize,
+            stream, resolvedAttentionScale);
     }
-    params.q_ptr = qTensor.rawPointer();
-    params.k_ptr = kTensor.rawPointer();
-    params.v_ptr = vTensor.rawPointer();
-    params.o_ptr = oTensorKernel.rawPointer();
-    params.cu_q_seqlens = cuSeqLensTensor.dataPointer<int32_t>();
-    params.cu_kv_seqlens = cuSeqLensTensor.dataPointer<int32_t>();
-
-    // Dispatch kernel
-    runner.dispatchFMHAKernel(params, stream);
+    else
+    {
+        ASSERT_TRUE(CuteDslFMHAV2Runner::loadLLMKernelModule());
+        ranKernel = runner.run(qTensor.rawPointer(), kTensor.rawPointer(), vTensor.rawPointer(),
+            oTensorKernel.rawPointer(), paddedCuKVSeqLensTensor.dataPointer<int32_t>(), stream, resolvedAttentionScale);
+    }
+    ASSERT_TRUE(ranKernel);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
 
@@ -162,7 +174,7 @@ void TestContextAttentionAccuracy(std::vector<int32_t> const& cuSeqlens, int32_t
         {
             numCloseWithin1E_3++;
         }
-        if (isnan(__half2float(outHost[i])))
+        if (std::isnan(__half2float(outHost[i])))
         {
             NanValueDetected = true;
         }
@@ -170,10 +182,10 @@ void TestContextAttentionAccuracy(std::vector<int32_t> const& cuSeqlens, int32_t
 
     float passRate1E_3 = static_cast<float>(numCloseWithin1E_3) / totalElements;
 
-    std::string layoutStr = isCompact ? "[Compact]" : "[Padded]";
+    std::string layoutStr = isPackedViT ? "[Compact]" : "[Padded]";
     std::string maskStr = causal ? "[Causal] " : "[Non-causal] ";
     std::cout << "Context Attention test. " << layoutStr << maskStr << "batch_size: " << batchSize;
-    if (isCompact)
+    if (isPackedViT)
     {
         std::cout << " total_tokens: " << totalTokens << " max_seq_len: " << maxSeqLen;
     }
@@ -245,6 +257,11 @@ TEST(ContextAttentionTest, accuracyKVRatio8_Causal)
     TestContextAttentionAccuracy(2, 256, 16, 2, 128, true);
     TestContextAttentionAccuracy(4, 512, 16, 2, 128, true);
     TestContextAttentionAccuracy(2, 256, 16, 2, 256, true);
+}
+
+TEST(ContextAttentionTest, paddedLayout_VariableSequenceLengths)
+{
+    TestContextAttentionAccuracy({0, 64, 160}, 8, 2, 128, 128);
 }
 
 // Long sequence tests
@@ -359,8 +376,6 @@ void TestContextAttentionDenoisePaddingVarlen(std::vector<int32_t> const& qLens,
     int32_t smVersion = getSMVersion();
     applyThorSMRenumberWAR(smVersion);
 
-    AttentionInputLayout const inputLayout = AttentionInputLayout::SEPARATE_Q_K_V;
-    ContextAttentionMaskType const maskType = ContextAttentionMaskType::PADDING;
     int32_t constexpr headSize = 256;
     int32_t constexpr numQHeads = 16;
     int32_t constexpr numKVHeads = 8;
@@ -368,9 +383,10 @@ void TestContextAttentionDenoisePaddingVarlen(std::vector<int32_t> const& qLens,
     int32_t const seqLenQ = *std::max_element(qLens.begin(), qLens.end());
     int32_t const seqLenK = *std::max_element(kvLens.begin(), kvLens.end());
 
-    if (!ContextFMHARunner::canImplement(headSize, smVersion, DataType::kHALF, inputLayout, maskType))
+    if (!CuteDslFMHAV2Runner::canImplement(
+            numQHeads, numKVHeads, headSize, smVersion, DataType::kHALF, CuteDslFMHAV2MaskType::kPADDING))
     {
-        GTEST_SKIP() << "Context FMHA PADDING is not supported for headSize=" << headSize << ", SM=" << smVersion;
+        GTEST_SKIP() << "FMHA-v2 CuTe DSL PADDING is not supported for headSize=" << headSize << ", SM=" << smVersion;
     }
 
     size_t const qSize = static_cast<size_t>(batchSize) * seqLenQ * numQHeads * headSize;
@@ -407,19 +423,11 @@ void TestContextAttentionDenoisePaddingVarlen(std::vector<int32_t> const& qLens,
     CUDA_CHECK(cudaMemcpy(cuKVTensor.rawPointer(), cuKV.data(), static_cast<size_t>(batchSize + 1) * sizeof(int32_t),
         cudaMemcpyHostToDevice));
 
-    EXPECT_TRUE(ContextFMHARunner::loadContextFMHAKernels(smVersion, DataType::kHALF));
-    ContextFMHARunner runner(
-        DataType::kHALF, batchSize, seqLenQ, numQHeads, numKVHeads, headSize, smVersion, inputLayout, maskType);
-    FusedMultiheadAttentionParamsV2 params{};
-    runner.setupParams(params, 1.0F / std::sqrt(static_cast<float>(headSize)));
-    params.s_kv = seqLenK;
-    params.q_ptr = qTensor.rawPointer();
-    params.k_ptr = kTensor.rawPointer();
-    params.v_ptr = vTensor.rawPointer();
-    params.o_ptr = oTensor.rawPointer();
-    params.cu_q_seqlens = cuQTensor.dataPointer<int32_t>();
-    params.cu_kv_seqlens = cuKVTensor.dataPointer<int32_t>();
-    runner.dispatchFMHAKernel(params, nullptr);
+    ASSERT_TRUE(CuteDslFMHAV2Runner::loadLLMKernelModule());
+    CuteDslFMHAV2Runner runner(numQHeads, numKVHeads, headSize, batchSize, seqLenQ, seqLenK);
+    ASSERT_TRUE(runner.runPadding(qTensor.rawPointer(), kTensor.rawPointer(), vTensor.rawPointer(),
+        oTensor.rawPointer(), cuQTensor.dataPointer<int32_t>(), cuKVTensor.dataPointer<int32_t>(), nullptr,
+        1.0F / std::sqrt(static_cast<float>(headSize))));
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaGetLastError());
 
@@ -455,3 +463,4 @@ TEST(ContextAttentionTest, diffusionGemmaDenoisePaddingVarlen)
     TestContextAttentionDenoisePaddingVarlen({4}, {24});
     TestContextAttentionDenoisePaddingVarlen({4, 3}, {24, 11});
 }
+#endif // defined(CUTE_DSL_FMHA_V2_ENABLED)

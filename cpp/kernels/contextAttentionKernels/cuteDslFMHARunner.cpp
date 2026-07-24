@@ -19,10 +19,10 @@
 
 #include "cuteDslFMHARunner.h"
 
+#include "attentionScaleUtils.h"
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
 #include "common/logger.h"
-#include "contextFMHARunner.h"
 
 #include <climits>
 #include <cmath>
@@ -65,6 +65,7 @@ fmha_d256_sw_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d256_sw_fp8 = {};
 fmha_d64_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_paged = {};
 fmha_d128_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_paged = {};
 fmha_d256_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d256_paged = {};
+fmha_d256_dense_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d256_dense_paged = {};
 fmha_d512_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d512_paged = {};
 fmha_d512_dense_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d512_dense_paged = {};
 fmha_d64_sw_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_sw_paged = {};
@@ -75,6 +76,7 @@ fmha_d512_sw_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d512_sw_paged = {};
 fmha_d64_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_paged_fp8 = {};
 fmha_d128_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_paged_fp8 = {};
 fmha_d256_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d256_paged_fp8 = {};
+fmha_d256_dense_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d256_dense_paged_fp8 = {};
 fmha_d512_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d512_paged_fp8 = {};
 fmha_d512_dense_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d512_dense_paged_fp8 = {};
 fmha_d64_sw_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_sw_paged_fp8 = {};
@@ -122,6 +124,7 @@ bool CuteDslFMHARunner::loadLLMKernelModule()
         fmha_d64_paged_Kernel_Module_Load(&sLLM_d64_paged);
         fmha_d128_paged_Kernel_Module_Load(&sLLM_d128_paged);
         fmha_d256_paged_Kernel_Module_Load(&sLLM_d256_paged);
+        fmha_d256_dense_paged_Kernel_Module_Load(&sLLM_d256_dense_paged);
         fmha_d512_paged_Kernel_Module_Load(&sLLM_d512_paged);
         fmha_d512_dense_paged_Kernel_Module_Load(&sLLM_d512_dense_paged);
         fmha_d64_sw_paged_Kernel_Module_Load(&sLLM_d64_sw_paged);
@@ -131,6 +134,7 @@ bool CuteDslFMHARunner::loadLLMKernelModule()
         fmha_d64_paged_fp8_Kernel_Module_Load(&sLLM_d64_paged_fp8);
         fmha_d128_paged_fp8_Kernel_Module_Load(&sLLM_d128_paged_fp8);
         fmha_d256_paged_fp8_Kernel_Module_Load(&sLLM_d256_paged_fp8);
+        fmha_d256_dense_paged_fp8_Kernel_Module_Load(&sLLM_d256_dense_paged_fp8);
         fmha_d512_paged_fp8_Kernel_Module_Load(&sLLM_d512_paged_fp8);
         fmha_d512_dense_paged_fp8_Kernel_Module_Load(&sLLM_d512_dense_paged_fp8);
         fmha_d64_sw_paged_fp8_Kernel_Module_Load(&sLLM_d64_sw_paged_fp8);
@@ -170,6 +174,7 @@ void CuteDslFMHARunner::unloadLLMKernelModule()
         fmha_d64_paged_Kernel_Module_Unload(&sLLM_d64_paged);
         fmha_d128_paged_Kernel_Module_Unload(&sLLM_d128_paged);
         fmha_d256_paged_Kernel_Module_Unload(&sLLM_d256_paged);
+        fmha_d256_dense_paged_Kernel_Module_Unload(&sLLM_d256_dense_paged);
         fmha_d512_paged_Kernel_Module_Unload(&sLLM_d512_paged);
         fmha_d512_dense_paged_Kernel_Module_Unload(&sLLM_d512_dense_paged);
         fmha_d64_sw_paged_Kernel_Module_Unload(&sLLM_d64_sw_paged);
@@ -179,6 +184,7 @@ void CuteDslFMHARunner::unloadLLMKernelModule()
         fmha_d64_paged_fp8_Kernel_Module_Unload(&sLLM_d64_paged_fp8);
         fmha_d128_paged_fp8_Kernel_Module_Unload(&sLLM_d128_paged_fp8);
         fmha_d256_paged_fp8_Kernel_Module_Unload(&sLLM_d256_paged_fp8);
+        fmha_d256_dense_paged_fp8_Kernel_Module_Unload(&sLLM_d256_dense_paged_fp8);
         fmha_d512_paged_fp8_Kernel_Module_Unload(&sLLM_d512_paged_fp8);
         fmha_d512_dense_paged_fp8_Kernel_Module_Unload(&sLLM_d512_dense_paged_fp8);
         fmha_d64_sw_paged_fp8_Kernel_Module_Unload(&sLLM_d64_sw_paged_fp8);
@@ -434,8 +440,8 @@ void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, i
         "CuTe DSL paged FMHA requires fp8Input to match the paged KV cache dtype.");
     check::check(isCausal || slidingWindowSize == INT_MAX,
         "CuTe DSL dense non-causal paged FMHA does not support sliding-window masking.");
-    check::check(
-        isCausal || mHeadDim == 512, "CuTe DSL dense non-causal paged FMHA currently supports head_dim=512 only.");
+    check::check(isCausal || mHeadDim == 256 || mHeadDim == 512,
+        "CuTe DSL dense non-causal paged FMHA currently supports head_dim=256 or 512 only.");
 
     float const scaleQ = qScale;
     float const scaleK = kScale;
@@ -524,11 +530,25 @@ void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, i
     {
         if (fp8Input)
         {
-            CALL_LLM_FMHA_PAGED(fmha_d512_dense_paged_fp8, sLLM_d512_dense_paged_fp8, windowSizeLeft);
+            if (mHeadDim == 256)
+            {
+                CALL_LLM_FMHA_PAGED(fmha_d256_dense_paged_fp8, sLLM_d256_dense_paged_fp8, windowSizeLeft);
+            }
+            else
+            {
+                CALL_LLM_FMHA_PAGED(fmha_d512_dense_paged_fp8, sLLM_d512_dense_paged_fp8, windowSizeLeft);
+            }
         }
         else
         {
-            CALL_LLM_FMHA_PAGED(fmha_d512_dense_paged, sLLM_d512_dense_paged, windowSizeLeft);
+            if (mHeadDim == 256)
+            {
+                CALL_LLM_FMHA_PAGED(fmha_d256_dense_paged, sLLM_d256_dense_paged, windowSizeLeft);
+            }
+            else
+            {
+                CALL_LLM_FMHA_PAGED(fmha_d512_dense_paged, sLLM_d512_dense_paged, windowSizeLeft);
+            }
         }
     }
     else if (fp8Input)

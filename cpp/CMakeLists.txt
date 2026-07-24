@@ -84,6 +84,10 @@ edgellm_xqa_cubins_setup()
 # Generate Core C++ static library for LLM-SDK
 file(GLOB_RECURSE COMMON_CPP_SRCS "common/*.cpp")
 file(GLOB_RECURSE KERNELS_CPP_SRCS "kernels/*.cpp")
+# Keep the legacy FMHA-v2 cubin sources out of the build while their removal is
+# handled separately from the CuTe DSL migration.
+list(FILTER KERNELS_CPP_SRCS EXCLUDE REGEX
+     "contextAttentionKernels/cubin/fmha_v2_.*\\.cubin\\.cpp$")
 edgellm_xqa_add_generated_sources(KERNELS_CPP_SRCS)
 file(GLOB_RECURSE KERNELS_CU_SRCS "kernels/*.cu")
 # Exclude MoE Marlin ops/instantiations - compiled only via include from

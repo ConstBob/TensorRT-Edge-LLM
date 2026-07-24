@@ -18,6 +18,7 @@
 Kernel groups:
   gdn              — Gated Delta Net decode/prefill
   fmha             — Fused Multi-Head Attention (Blackwell persistent)
+  fmha_v2          — FP16 Context/ViT FMHA (Ampere instruction floor)
   ffpa             — Baseline FMHA forward kernel for large head-size
                      attention (D=512), Ampere instruction floor (sm_80+).
   ssd              — Mamba2 SSM chunk-scan prefill
@@ -122,6 +123,7 @@ class KernelVariant:
 # Groups:
 #   gdn              — Gated Delta Net decode/prefill
 #   fmha             — Fused Multi-Head Attention (Blackwell persistent)
+#   fmha_v2          — FP16 Context/ViT FMHA (Ampere instruction floor)
 #   ffpa             — Baseline FMHA forward kernel for large head-size
 #                      attention (D=512), Ampere instruction floor (sm_80+).
 #   ssd              — Mamba2 SSM chunk-scan prefill
@@ -435,6 +437,13 @@ KERNEL_VARIANTS = [
         script_args=["--q_shape", "1,1024,16,256", "--k_shape", "1,1024,2,256"] + _LLM_PAGED,
     ),
     KernelVariant(
+        name="fmha_d256_dense_paged",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,16,256", "--k_shape", "1,1024,2,256"] + _LLM_DENSE_PAGED,
+    ),
+    KernelVariant(
         name="fmha_d64_sw_paged",
         group="fmha",
         supported_sms=[100, 101, 110],
@@ -479,6 +488,13 @@ KERNEL_VARIANTS = [
         supported_sms=[100, 101, 110],
         script="fmha_cutedsl_blackwell/fmha.py",
         script_args=["--q_shape", "1,1024,16,256", "--k_shape", "1,1024,2,256"] + _LLM_FP8_PAGED,
+    ),
+    KernelVariant(
+        name="fmha_d256_dense_paged_fp8",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,16,256", "--k_shape", "1,1024,2,256"] + _LLM_DENSE_FP8_PAGED,
     ),
     KernelVariant(
         name="fmha_d64_sw_paged_fp8",
@@ -531,6 +547,166 @@ KERNEL_VARIANTS = [
         supported_sms=[100, 101, 110],
         script="fmha_cutedsl_blackwell/fmha.py",
         script_args=["--q_shape", "1,1024,14,128", "--k_shape", "1,1024,14,128"] + _VIT,
+    ),
+    # --- FMHA-v2 CuTe DSL group (SM80/86/87/89/100/101/110/120/121) ---
+    # These variants deliberately use distinct symbols and a distinct group
+    # from the tcgen05/TMEM `fmha` kernels.  Selecting fmha_v2 therefore
+    # never exposes CUTE_DSL_FMHA_ENABLED without the optimized headers.
+    # SM110 still uses the optimized `fmha` backend for normal Context/ViT
+    # attention, but also needs this family for the D256 vision-block mode.
+    # The runner loads the family as one module set, so keep every variant in
+    # the SM110 artifact rather than shipping an incomplete group.
+    # Q/K/V use separate BSND tensors; paged-cache callers gather only when
+    # cache readback is required.
+    KernelVariant(
+        name="fmha_v2_d64",
+        group="fmha_v2",
+        supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+        script="fmha_v2_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "64",
+            "--m_block_size", "128", "--n_block_size", "128", "--num_threads", "128",
+            "--dtype", "Float16", "--is_causal", "--fmha_v2_context", "--skip_rescale", "--export_only",
+        ],
+    ),
+    # Short-context specialization: smaller tiles increase the CTA count and
+    # avoid the occupancy/tail penalty of the 128x128 long-context kernel.
+    KernelVariant(
+        name="fmha_v2_d64_small",
+        group="fmha_v2",
+        supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+        script="fmha_v2_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "64",
+            "--m_block_size", "32", "--n_block_size", "32", "--num_threads", "64",
+            "--dtype", "Float16", "--is_causal", "--fmha_v2_context", "--skip_rescale", "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="fmha_v2_d128",
+        group="fmha_v2",
+        supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+        script="fmha_v2_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "128",
+            "--m_block_size", "64", "--n_block_size", "64", "--num_threads", "128",
+            "--dtype", "Float16", "--is_causal", "--fmha_v2_context", "--skip_rescale", "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="fmha_v2_d256",
+        group="fmha_v2",
+        supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+        script="fmha_v2_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "256",
+            "--m_block_size", "64", "--n_block_size", "32", "--num_threads", "128",
+            "--dtype", "Float16", "--is_causal", "--fmha_v2_context", "--skip_rescale", "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="fmha_v2_d256_padding",
+        group="fmha_v2",
+        supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+        script="fmha_v2_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "256",
+            "--m_block_size", "64", "--n_block_size", "32", "--num_threads", "128",
+            "--dtype", "Float16", "--skip_rescale", "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="fmha_v2_d64_sw",
+        group="fmha_v2",
+        supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+        script="fmha_v2_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "64",
+            "--m_block_size", "64", "--n_block_size", "64", "--num_threads", "128",
+            "--dtype", "Float16", "--is_causal", "--fmha_v2_context", "--window_size_left", "4096",
+            "--skip_rescale", "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="fmha_v2_d128_sw",
+        group="fmha_v2",
+        supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+        script="fmha_v2_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "128",
+            "--m_block_size", "64", "--n_block_size", "64", "--num_threads", "128",
+            "--dtype", "Float16", "--is_causal", "--fmha_v2_context", "--window_size_left", "4096",
+            "--skip_rescale", "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="fmha_v2_d256_sw",
+        group="fmha_v2",
+        supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+        script="fmha_v2_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "256",
+            "--m_block_size", "64", "--n_block_size", "32", "--num_threads", "128",
+            "--dtype", "Float16", "--is_causal", "--fmha_v2_context", "--window_size_left", "4096",
+            "--skip_rescale", "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="fmha_v2_vit_d64",
+        group="fmha_v2",
+        supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+        script="fmha_v2_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "64",
+            "--m_block_size", "128", "--n_block_size", "128", "--num_threads", "128",
+            "--dtype", "Float16", "--fmha_v2_vit", "--skip_rescale", "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="fmha_v2_vit_d72",
+        group="fmha_v2",
+        supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+        script="fmha_v2_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "72",
+            "--m_block_size", "128", "--n_block_size", "64", "--num_threads", "128",
+            "--dtype", "Float16", "--fmha_v2_vit", "--skip_rescale", "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="fmha_v2_vit_d80",
+        group="fmha_v2",
+        supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+        script="fmha_v2_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "80",
+            "--m_block_size", "128", "--n_block_size", "64", "--num_threads", "128",
+            "--dtype", "Float16", "--fmha_v2_vit", "--skip_rescale", "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="fmha_v2_vit_d128",
+        group="fmha_v2",
+        supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+        script="fmha_v2_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "128",
+            "--m_block_size", "64", "--n_block_size", "64", "--num_threads", "128",
+            "--dtype", "Float16", "--fmha_v2_vit", "--skip_rescale", "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="fmha_v2_d256_visionblock",
+        group="fmha_v2",
+        supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+        script="fmha_v2_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "256",
+            "--m_block_size", "64", "--n_block_size", "32", "--num_threads", "128",
+            "--dtype", "Float16", "--is_causal", "--fmha_v2_context", "--vision_block",
+            "--window_size_left", "1024", "--num_head", "16", "--kv_group_size", "2",
+            "--skip_rescale", "--export_only",
+        ],
     ),
     # FFPA group which handles large head size attention.
     KernelVariant(
@@ -2289,7 +2465,7 @@ def main():
         "--kernels",
         default="ALL",
         help="Which kernels to build: ALL (default), a group name "
-             "(fmha | gdn | f16_moe | nvfp4_moe | "
+             "(fmha | fmha_v2 | gdn | f16_moe | nvfp4_moe | "
              "nvfp4_fused_moe | ssd | gemm | int4_fp16_gemm), or a comma-separated list "
              "of group names. Variants whose supported_sms does not include the target SM are skipped.",
     )
