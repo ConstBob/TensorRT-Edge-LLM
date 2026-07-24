@@ -51,6 +51,8 @@ inline std::string const kSPEC_DECODE_DRAFT_PROPOSAL
     = "spec_decode_draft_proposal"; //!< Speculative decode draft proposal
 inline std::string const kSPEC_DECODE_BASE_VERIFICATION
     = "spec_decode_base_verification"; //!< Speculative decode base verification
+inline std::string const kSPEC_DECODE_DRAFT_ACCEPT
+    = "spec_decode_draft_accept"; //!< Speculative decode draft accept-token catch-up
 inline std::string const kBLOCK_DIFFUSION_DENOISE
     = "block_diffusion_denoise"; //!< DiffusionGemma non-causal denoise backbone stage
 inline std::string const kBLOCK_DIFFUSION_COMMIT
