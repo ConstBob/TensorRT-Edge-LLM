@@ -8,7 +8,7 @@
   "shouldUpdateDescription": false,
   "strictness": 2,
   "fixWithAI": false,
-  "ignorePatterns": "3rdParty/**\nbuild/**\ndocs/build/**\ndocs/cpp_docs/html/**\ndocs/cpp_docs/xml/**\nlogs/**\n**/__pycache__/**\n**/.pytest_cache/**\n**/*.pyc\n**/*.egg-info/**\n**/*.engine\n**/*.plan\n**/*.nsys-rep\n**/*.qdrep\n**/*.onnx\n**/*.safetensors\ncpp/kernels/contextAttentionKernels/cubin/**\n",
+  "ignorePatterns": "3rdParty/**\nbuild/**\ndocs/build/**\ndocs/cpp_docs/html/**\ndocs/cpp_docs/xml/**\nlogs/**\n**/__pycache__/**\n**/.pytest_cache/**\n**/*.pyc\n**/*.egg-info/**\n**/*.engine\n**/*.plan\n**/*.nsys-rep\n**/*.qdrep\n**/*.onnx\n**/*.safetensors\n",
   "summarySection": {
     "included": true,
     "collapsible": true,

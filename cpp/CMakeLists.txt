@@ -30,64 +30,12 @@ function(edgellm_set_hidden_visibility target)
                                              VISIBILITY_INLINES_HIDDEN ON)
 endfunction()
 
-# ------------------------------------------------------------------------------
-# FMHA Cubin Conditional Compilation Exclude SM architectures that are not in
-# CMAKE_CUDA_ARCHITECTURES to reduce binary size. Only cubins for the target
-# architectures will be compiled.
-# ------------------------------------------------------------------------------
-set(FMHA_ALL_SM_VERSIONS
-    80
-    86
-    87
-    89
-    100
-    101
-    120
-    121)
-set(FMHA_EXCLUDE_DEFINITIONS "")
-
-# Build a list of required FMHA SM versions based on target architectures. Some
-# SM versions reuse cubins from other SM versions at runtime. Strip the
-# accelerated/virtual/real suffixes (e.g. 100a, 101a, 110a, 90-real) so the
-# IN_LIST checks below compare against plain numeric SM versions.
-set(REQUIRED_FMHA_SM_VERSIONS "")
-foreach(arch ${CMAKE_CUDA_ARCHITECTURES})
-  string(REGEX REPLACE "[^0-9].*$" "" arch_num "${arch}")
-  list(APPEND REQUIRED_FMHA_SM_VERSIONS ${arch_num})
-endforeach()
-list(REMOVE_DUPLICATES REQUIRED_FMHA_SM_VERSIONS)
-
-# SM 110 uses SM 101 FMHA cubins at runtime
-if(110 IN_LIST REQUIRED_FMHA_SM_VERSIONS AND NOT 101 IN_LIST
-                                             REQUIRED_FMHA_SM_VERSIONS)
-  list(APPEND REQUIRED_FMHA_SM_VERSIONS 101)
-endif()
-
-# Exclude SM versions that are not required
-foreach(SM_VER ${FMHA_ALL_SM_VERSIONS})
-  if(NOT SM_VER IN_LIST REQUIRED_FMHA_SM_VERSIONS)
-    list(APPEND FMHA_EXCLUDE_DEFINITIONS "EXCLUDE_SM_${SM_VER}")
-  endif()
-endforeach()
-
-if(FMHA_EXCLUDE_DEFINITIONS)
-  message(
-    STATUS
-      "FMHA Kernels: Excluding SM architectures: ${FMHA_EXCLUDE_DEFINITIONS}")
-else()
-  message(STATUS "FMHA Kernels: Compiling cubins for all SM architectures")
-endif()
-
 include(${CMAKE_SOURCE_DIR}/cmake/XQACubins.cmake)
 edgellm_xqa_cubins_setup()
 
 # Generate Core C++ static library for LLM-SDK
 file(GLOB_RECURSE COMMON_CPP_SRCS "common/*.cpp")
 file(GLOB_RECURSE KERNELS_CPP_SRCS "kernels/*.cpp")
-# Keep the legacy FMHA-v2 cubin sources out of the build while their removal is
-# handled separately from the CuTe DSL migration.
-list(FILTER KERNELS_CPP_SRCS EXCLUDE REGEX
-     "contextAttentionKernels/cubin/fmha_v2_.*\\.cubin\\.cpp$")
 edgellm_xqa_add_generated_sources(KERNELS_CPP_SRCS)
 file(GLOB_RECURSE KERNELS_CU_SRCS "kernels/*.cu")
 # Exclude MoE Marlin ops/instantiations - compiled only via include from
@@ -115,8 +63,6 @@ add_library(edgellmKernels STATIC ${KERNELS_CPP_SRCS} ${KERNELS_CU_SRCS}
                                   ${COMMON_CPP_SRCS})
 target_include_directories(edgellmKernels PRIVATE ${COMMON_INCLUDE_DIRS})
 edgellm_xqa_configure_target(edgellmKernels)
-# Apply FMHA SM exclusion definitions
-target_compile_definitions(edgellmKernels PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
 # Enable separable compilation for MoE Marlin kernel templates
 set_target_properties(edgellmKernels PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 edgellm_set_hidden_visibility(edgellmKernels)
@@ -139,8 +85,6 @@ add_library(
 target_include_directories(edgellmCore PRIVATE ${COMMON_INCLUDE_DIRS})
 edgellm_xqa_configure_target(edgellmCore)
 target_link_libraries(edgellmCore PRIVATE dl)
-# Apply FMHA SM exclusion definitions
-target_compile_definitions(edgellmCore PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
 # Enable separable compilation for MoE Marlin kernel templates
 set_target_properties(edgellmCore PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 edgellm_set_hidden_visibility(edgellmCore)
@@ -161,9 +105,6 @@ set_target_properties(NvInfer_edgellm_plugin PROPERTIES LIBRARY_OUTPUT_DIRECTORY
                                                         ${CMAKE_BINARY_DIR})
 target_include_directories(NvInfer_edgellm_plugin
                            PRIVATE ${COMMON_INCLUDE_DIRS})
-# Apply FMHA SM exclusion definitions
-target_compile_definitions(NvInfer_edgellm_plugin
-                           PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
 target_link_libraries(
   NvInfer_edgellm_plugin PRIVATE commonLibraryExt edgellmKernels
                                  ${CUDA_DRIVER_LINK_LIB} ${CUDART_LIB})

@@ -69,7 +69,7 @@ enum class CuteDslFMHAV2MaskType
     kVISION_BLOCK
 };
 
-//! Runner for the CuTe DSL replacement of the legacy FMHA-v2 kernels.
+//! Runner for the CuTe DSL FMHA-v2 kernels.
 //!
 //! LLM kernels consume separate BSND Q/K/V tensors. ViT kernels consume packed,
 //! separate Q/K/V tensors. The runner is intentionally kept
