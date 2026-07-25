@@ -23,6 +23,7 @@
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
 #include "common/logger.h"
+#include "cuteDslFmhaParams.h"
 #include "cuteDslTensorDescriptors.h"
 
 #include <cmath>
@@ -252,29 +253,6 @@ TensorT makeShTensor(void const* data, int32_t totalSeqLen, int32_t numHeads, in
     return makeStridedTensor<TensorT>(data, {totalSeqLen, numHeads}, {static_cast<int64_t>(numHeads) * headDim});
 }
 
-//! Everything the FMHA-v2 LLM descriptors need, gathered once per run() call.
-struct FmhaV2LlmParams
-{
-    void const* qPtr{};
-    void const* kPtr{};
-    void const* vPtr{};
-    void* oPtr{};
-    int32_t const* cuKVSeqLens{};
-    int32_t batchSize{};
-    int32_t seqLenQ{};
-    int32_t kvSeqLen{};
-    int32_t numQHeads{};
-    int32_t numKVHeads{};
-    int32_t headDim{};
-    int32_t windowSizeLeft{};
-    float attentionScale{};
-    float scaleQ{};
-    float scaleK{};
-    float scaleV{};
-    float invScaleO{};
-    cudaStream_t stream{};
-};
-
 //! Launch an FMHA-v2 LLM variant over separate padded [B, S, H, D] Q/K/V.
 template <auto Wrapper>
 int32_t callFmhaV2Llm(WrapperArgT<0, decltype(Wrapper)>& module, FmhaV2LlmParams const& params)
@@ -297,26 +275,6 @@ int32_t callFmhaV2Llm(WrapperArgT<0, decltype(Wrapper)>& module, FmhaV2LlmParams
         params.attentionScale, params.scaleQ, params.scaleK, params.scaleV, params.invScaleO,
         getDeviceMultiProcessorCount(), params.stream);
 }
-
-//! Everything the FMHA-v2 ViT descriptors need, gathered once per ViT run() call.
-struct FmhaV2VitParams
-{
-    void const* qPtr{};
-    void const* kPtr{};
-    void const* vPtr{};
-    void* oPtr{};
-    int32_t const* cuSeqLens{};
-    int32_t totalSeqLen{};
-    int32_t numQHeads{};
-    int32_t numKVHeads{};
-    int32_t headDim{};
-    int32_t maxSeqLen{};
-    int32_t batchSize{};
-    float scaleSoftmaxLog2{};
-    float attentionScale{};
-    float scaleOutput{};
-    cudaStream_t stream{};
-};
 
 //! Launch an FMHA-v2 ViT variant over packed varlen [total_S, H, D] Q/K/V.
 template <auto Wrapper>

@@ -23,6 +23,7 @@
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
 #include "common/logger.h"
+#include "cuteDslFmhaParams.h"
 #include "cuteDslTensorDescriptors.h"
 
 #include <climits>
@@ -269,28 +270,6 @@ using cutedsl::makeStridedTensor;
 using cutedsl::WrapperArgT;
 using cutedsl::WrapperArity;
 
-//! Everything the dense LLM descriptors need, gathered once per run() call.
-struct LlmFmhaParams
-{
-    void const* qPtr{};
-    void const* kvPtr{};
-    void* oPtr{};
-    int32_t const* cuKVSeqLens{};
-    int32_t batchSize{};
-    int32_t seqLenQ{};
-    int32_t numQHeads{};
-    int32_t numKVHeads{};
-    int32_t headDim{};
-    int32_t kvCacheCapacity{};
-    int32_t windowSizeLeft{};
-    float attentionScale{};
-    float scaleQ{};
-    float scaleK{};
-    float scaleV{};
-    float invScaleO{};
-    cudaStream_t stream{};
-};
-
 //! Launch a dense (combined KV cache) LLM FMHA variant. The exported signature is
 //!   (module, q_tensor, kv_cache, o_tensor, cum_seqlen_k, window_size_left, attention_scale,
 //!    scale_q, scale_k, scale_v, inv_scale_o, sm_count, stream, trailing...)
@@ -314,31 +293,6 @@ int32_t callLlmFmha(WrapperArgT<0, decltype(Wrapper)>& module, LlmFmhaParams con
         params.scaleQ, params.scaleK, params.scaleV, params.invScaleO, getDeviceMultiProcessorCount(), params.stream,
         trailing...);
 }
-
-//! Everything the paged LLM descriptors need, gathered once per runPaged() call.
-struct LlmFmhaPagedParams
-{
-    void const* qPtr{};
-    void const* pagedKVPoolPtr{};
-    int32_t const* kvCachePageList{};
-    void* oPtr{};
-    int32_t const* cuKVSeqLens{};
-    int32_t batchSize{};
-    int32_t seqLenQ{};
-    int32_t numQHeads{};
-    int32_t numKVHeads{};
-    int32_t headDim{};
-    int32_t numPages{};
-    int32_t maxPagesPerSeq{};
-    int32_t tokensPerPage{};
-    int32_t windowSizeLeft{};
-    float attentionScale{};
-    float scaleQ{};
-    float scaleK{};
-    float scaleV{};
-    float invScaleO{};
-    cudaStream_t stream{};
-};
 
 //! Launch a paged LLM FMHA variant. The exported signature matches callLlmFmha() except that
 //! kv_cache is replaced by the (kv_cache_pool, kv_cache_page_list) pair.
@@ -372,25 +326,6 @@ int32_t callLlmFmhaPaged(
         params.attentionScale, params.scaleQ, params.scaleK, params.scaleV, params.invScaleO,
         getDeviceMultiProcessorCount(), params.stream, trailing...);
 }
-
-//! Everything the ViT descriptors need, gathered once per ViT run() call.
-struct VitFmhaParams
-{
-    void const* qPtr{};
-    void const* kPtr{};
-    void const* vPtr{};
-    void* oPtr{};
-    int32_t const* cuSeqLens{};
-    int32_t totalSeqLen{};
-    int32_t numHeads{};
-    int32_t headDim{};
-    int32_t maxSeqLen{};
-    int32_t batchSize{};
-    float scaleSoftmaxLog2{};
-    float attentionScale{};
-    float scaleOutput{};
-    cudaStream_t stream{};
-};
 
 //! Launch a ViT FMHA variant over packed varlen [total_S, H, D] Q/K/V.
 template <auto Wrapper>
