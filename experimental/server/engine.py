@@ -58,6 +58,9 @@ _MAX_LOGIT_BIAS_TOKENS = 1024
 _MAX_LOGIT_BIAS_TOKEN_ID = (1 << 31) - 1
 _MIN_LOGIT_BIAS = -100.0
 _MAX_LOGIT_BIAS = 100.0
+_DEFAULT_MAX_INPUT_LEN = 4096
+_DEFAULT_MAX_BATCH_SIZE = 1
+_DEFAULT_MAX_KV_CACHE_CAPACITY = 8192
 
 _LOGIT_BIAS_SPEC_DECODE_ERROR = (
     "logit_bias is not supported while speculative decoding is enabled; "
@@ -223,6 +226,15 @@ def _read_vision_config(model_dir: str) -> dict:
         return json.load(f).get("vision_config", {})
 
 
+def _read_engine_builder_config(engine_dir: str) -> dict:
+    """Read builder_config from an engine directory."""
+    cfg_path = os.path.join(engine_dir, "config.json")
+    if not os.path.exists(cfg_path):
+        return {}
+    with open(cfg_path) as f:
+        return json.load(f).get("builder_config", {})
+
+
 def _ensure_plugin_path() -> None:
     """Set EDGELLM_PLUGIN_PATH if not already set.
 
@@ -252,6 +264,8 @@ def _import_runtime():
         pass
     project_root = Path(__file__).resolve().parent.parent.parent
     search_dirs = []
+    if os.environ.get("EDGELLM_PYBIND_DIR"):
+        search_dirs.append(Path(os.environ["EDGELLM_PYBIND_DIR"]))
     if os.environ.get("BUILD_DIR"):
         search_dirs.append(Path(os.environ["BUILD_DIR"]) / "pybind")
     search_dirs.extend([
@@ -346,6 +360,22 @@ def _validate_logit_bias_spec_decode(logit_bias: Dict[int, float], *,
         raise ValueError(_LOGIT_BIAS_SPEC_DECODE_ERROR)
 
 
+def _engine_config_value(builder_config: dict, field_name: str,
+                         requested_value: int) -> int:
+    if field_name not in builder_config:
+        return requested_value
+
+    engine_value = int(builder_config[field_name])
+    if engine_value != requested_value:
+        logger.warning(
+            "Using %s=%d from engine builder_config instead of requested %d",
+            field_name,
+            engine_value,
+            requested_value,
+        )
+    return engine_value
+
+
 # ---------------------------------------------------------------------------
 # LLM class
 # ---------------------------------------------------------------------------
@@ -385,9 +415,9 @@ class LLM:
         engine_dir: str = "",
         multimodal_engine_dir: str = "",
         visual_engine_dir: str = "",
-        max_input_len: int = 4096,
-        max_batch_size: int = 1,
-        max_kv_cache_capacity: int = 8192,
+        max_input_len: int = _DEFAULT_MAX_INPUT_LEN,
+        max_batch_size: int = _DEFAULT_MAX_BATCH_SIZE,
+        max_kv_cache_capacity: int = _DEFAULT_MAX_KV_CACHE_CAPACITY,
         eagle_engine_dir: str = "",
         draft_top_k: int = 10,
         draft_step: int = 6,
@@ -398,6 +428,13 @@ class LLM:
             raise ValueError(
                 "Exactly one of 'model', 'onnx_dir', or 'engine_dir' "
                 "must be provided.")
+        if visual_onnx_dir and not onnx_dir:
+            raise ValueError(
+                "'visual_onnx_dir' is only supported with 'onnx_dir'; "
+                "use 'visual_engine_dir' with 'engine_dir'.")
+        if visual_engine_dir and not engine_dir:
+            raise ValueError(
+                "'visual_engine_dir' is only supported with 'engine_dir'.")
 
         # `visual_engine_dir` is the deprecated alias for `multimodal_engine_dir`
         # (the encoder slot now also serves audio).
@@ -409,6 +446,9 @@ class LLM:
         self._draft_top_k = draft_top_k
         self._draft_step = draft_step
         self._verify_tree_size = verify_tree_size
+        self._max_input_len = max_input_len
+        self._max_batch_size = max_batch_size
+        self._max_kv_cache_capacity = max_kv_cache_capacity
         self._tool_template_formatter: Optional[
             ToolChatTemplateFormatter] = None
 
@@ -470,6 +510,17 @@ class LLM:
         self._engine_dir = engine_dir
         self._model_dir = engine_dir
         self._is_multimodal = False
+        builder_config = _read_engine_builder_config(engine_dir)
+        self._max_input_len = _engine_config_value(
+            builder_config, "max_input_len",
+            getattr(self, "_max_input_len", _DEFAULT_MAX_INPUT_LEN))
+        self._max_batch_size = _engine_config_value(
+            builder_config, "max_batch_size",
+            getattr(self, "_max_batch_size", _DEFAULT_MAX_BATCH_SIZE))
+        self._max_kv_cache_capacity = _engine_config_value(
+            builder_config, "max_kv_cache_capacity",
+            getattr(self, "_max_kv_cache_capacity",
+                    _DEFAULT_MAX_KV_CACHE_CAPACITY))
 
         if multimodal_engine_dir:
             if not validate_multimodal_engine_dir(multimodal_engine_dir):
@@ -979,9 +1030,6 @@ class LLM:
     # Inference API (vLLM-style)
     # ------------------------------------------------------------------
 
-    # The C++ runtime shares per-request buffers/CUDA streams and pybind
-    # releases the GIL: handle_request calls must serialize. Locks are per
-    # instance so runtimes on separate GPUs stay parallel.
     _infer_lock_guard = threading.Lock()
 
     def _admission(self):
@@ -1189,16 +1237,32 @@ class LLM:
     # Server API
     # ------------------------------------------------------------------
 
-    def serve(self, host: str = "0.0.0.0", port: int = 8000) -> None:
+    def serve(self,
+              host: str = "0.0.0.0",
+              port: int = 8000,
+              *,
+              enable_batching: bool = False,
+              batch_timeout_ms: float = 10.0,
+              max_queue_batch_size: Optional[int] = None) -> None:
         """Start an OpenAI-compatible HTTP server.
 
         Args:
             host: Bind address.
             port: Bind port.
+            enable_batching: Batch compatible non-streaming HTTP requests.
+            batch_timeout_ms: Maximum time to wait for compatible requests.
+            max_queue_batch_size: Optional cap for queued HTTP micro-batches.
         """
         from .api_server import run_server
 
-        run_server(self, host=host, port=port)
+        run_server(
+            self,
+            host=host,
+            port=port,
+            enable_batching=enable_batching,
+            batch_timeout_ms=batch_timeout_ms,
+            max_queue_batch_size=max_queue_batch_size,
+        )
 
     # ------------------------------------------------------------------
     # Properties
@@ -1213,6 +1277,11 @@ class LLM:
     def engine_dir(self) -> str:
         """Path to the TensorRT engine directory."""
         return self._engine_dir
+
+    @property
+    def max_batch_size(self) -> int:
+        """Maximum batch size supported by the loaded engine."""
+        return self._max_batch_size
 
     @property
     def has_draft_model(self) -> bool:

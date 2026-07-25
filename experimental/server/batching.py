@@ -1,0 +1,224 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Micro-batching for compatible non-streaming server requests."""
+
+import logging
+import threading
+import time
+from concurrent.futures import Future
+from dataclasses import dataclass
+from typing import Any, Callable, List, Optional, Tuple
+
+logger = logging.getLogger("edgellm.batching")
+
+# Requests can share one runtime call only when these generation-level settings
+# match. Per-row inputs live under LLMGenerationRequest.requests and may differ.
+BATCH_COMPATIBILITY_FIELDS = (
+    "temperature",
+    "top_p",
+    "top_k",
+    "max_generate_length",
+    "lora_weights_name",
+    "save_system_prompt_kv_cache",
+    "apply_chat_template",
+    "add_generation_prompt",
+    "enable_thinking",
+    "disable_spec_decode",
+    "num_logprobs",
+)
+
+
+@dataclass
+class BatchResult:
+    """Runtime response slice for one original HTTP request."""
+
+    response: Any
+    index: int
+
+
+@dataclass
+class _QueuedRequest:
+    request: Any
+    future: Future
+
+
+@dataclass
+class _RuntimeResponseSlice:
+    output_texts: List[str]
+    output_ids: List[List[int]]
+    finish_reasons: List[Any]
+    logprobs: List[Any]
+
+
+def resolve_batch_size(engine_max_batch_size: int,
+                       max_queue_batch_size: Optional[int]) -> int:
+    """Return the effective HTTP micro-batch size."""
+    if max_queue_batch_size is not None:
+        if engine_max_batch_size > 0 and max_queue_batch_size > engine_max_batch_size:
+            logger.warning(
+                "Capping max_queue_batch_size=%d to engine max_batch_size=%d",
+                max_queue_batch_size,
+                engine_max_batch_size,
+            )
+            return engine_max_batch_size
+        return max_queue_batch_size
+    return engine_max_batch_size or 1
+
+
+def _batch_key(request) -> Tuple[Any, ...]:
+    return tuple(
+        getattr(request, field) for field in BATCH_COMPATIBILITY_FIELDS)
+
+
+def _copy_batch_settings(source, target) -> None:
+    for field in BATCH_COMPATIBILITY_FIELDS:
+        setattr(target, field, getattr(source, field))
+    target.stream_channels = []
+
+
+def _copy_response_rows(response, start: int,
+                        count: int) -> _RuntimeResponseSlice:
+    end = start + count
+    logprobs = getattr(response, "logprobs", []) or []
+    return _RuntimeResponseSlice(
+        output_texts=list(response.output_texts[start:end]),
+        output_ids=[list(ids) for ids in response.output_ids[start:end]],
+        finish_reasons=list(response.finish_reasons[start:end]),
+        logprobs=list(logprobs[start:end]),
+    )
+
+
+class RequestBatcher:
+    """Batch compatible requests and serialize runtime calls.
+
+    Each submitted request is an LLMGenerationRequest. Batching appends their
+    per-row ``requests`` entries into one new LLMGenerationRequest. The combined
+    runtime response is split back into one response slice per submitted request.
+    """
+
+    def __init__(
+        self,
+        runtime_handler: Callable[[Any], Any],
+        max_batch_size: int,
+        timeout_ms: float,
+    ):
+        if max_batch_size < 1:
+            raise ValueError("max_batch_size must be positive")
+        if timeout_ms < 0:
+            raise ValueError("timeout_ms must be non-negative")
+
+        self._runtime_handler = runtime_handler
+        self._max_batch_size = max_batch_size
+        self._timeout_s = timeout_ms / 1000.0
+        self._cv = threading.Condition()
+        self._queue: List[_QueuedRequest] = []
+        self._closed = False
+        self._worker = threading.Thread(
+            target=self._run,
+            name="edgellm-request-batcher",
+            daemon=True,
+        )
+        self._worker.start()
+
+    @property
+    def max_batch_size(self) -> int:
+        return self._max_batch_size
+
+    @property
+    def timeout_ms(self) -> float:
+        return self._timeout_s * 1000.0
+
+    def submit(self, request) -> BatchResult:
+        future: Future = Future()
+        item = _QueuedRequest(request=request, future=future)
+        with self._cv:
+            if self._closed:
+                raise RuntimeError("Request batcher is closed")
+            self._queue.append(item)
+            self._cv.notify()
+        return future.result()
+
+    def close(self) -> None:
+        with self._cv:
+            self._closed = True
+            self._cv.notify_all()
+        self._worker.join(timeout=5.0)
+
+    def _run(self) -> None:
+        while True:
+            batch = self._take_batch()
+            if batch is None:
+                return
+            self._process_batch(batch)
+
+    def _take_batch(self) -> Optional[List[_QueuedRequest]]:
+        with self._cv:
+            while not self._queue and not self._closed:
+                self._cv.wait()
+            if not self._queue:
+                return None
+
+            first = self._queue.pop(0)
+            key = _batch_key(first.request)
+            batch = [first]
+            deadline = time.monotonic() + self._timeout_s
+
+            while len(batch) < self._max_batch_size:
+                self._move_compatible_locked(batch, key)
+                if len(batch) >= self._max_batch_size or self._closed:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._cv.wait(remaining)
+
+            return batch
+
+    def _move_compatible_locked(self, batch: List[_QueuedRequest],
+                                key: Tuple[Any, ...]) -> None:
+        idx = 0
+        while idx < len(self._queue) and len(batch) < self._max_batch_size:
+            item = self._queue[idx]
+            if _batch_key(item.request) == key:
+                batch.append(self._queue.pop(idx))
+            else:
+                idx += 1
+
+    def _process_batch(self, batch: List[_QueuedRequest]) -> None:
+        try:
+            batched_request = self._make_batched_request(batch)
+            response = self._runtime_handler(batched_request)
+            row_offset = 0
+            for item in batch:
+                row_count = len(item.request.requests)
+                response_slice = _copy_response_rows(response, row_offset,
+                                                     row_count)
+                item.future.set_result(
+                    BatchResult(response=response_slice, index=0))
+                row_offset += row_count
+        except Exception as exc:
+            logger.exception("Batched inference failed")
+            for item in batch:
+                item.future.set_exception(exc)
+
+    def _make_batched_request(self, batch: List[_QueuedRequest]):
+        first_request = batch[0].request
+        batched_request = type(first_request)()
+        _copy_batch_settings(first_request, batched_request)
+        requests = []
+        for item in batch:
+            requests.extend(item.request.requests)
+        batched_request.requests = requests
+        return batched_request

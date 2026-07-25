@@ -61,6 +61,14 @@ python -m experimental.server \
   --port 8000
 ```
 
+Serve an existing engine without exporting or building:
+
+```bash
+python -m experimental.server \
+  --model /path/to/llm_engine \
+  --port 8000
+```
+
 Query:
 
 ```bash
@@ -192,6 +200,26 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 
 Requests with a non-empty `logit_bias` map are rejected while speculative decoding is active. Set
 `disable_spec_decode: true` to explicitly use vanilla decoding for that request batch.
+
+## Server-Side Batching
+
+Non-streaming HTTP requests can be micro-batched before entering the runtime:
+
+```bash
+python -m experimental.server \
+  --model Qwen/Qwen3-1.7B \
+  --max-batch-size 16 \
+  --enable-batching \
+  --max-queue-batch-size 16 \
+  --batch-timeout-ms 10
+```
+
+Batching is off by default. When enabled, the server groups compatible
+non-streaming requests for up to `batch-timeout-ms` milliseconds, then submits
+one runtime batch. Requests are compatible when their runtime generation
+settings match, including `temperature`, `top_p`, `top_k`, `max_tokens`,
+`enable_thinking`, and chat-template settings. Streaming requests bypass the
+batcher.
 
 ## Tool Calls
 
