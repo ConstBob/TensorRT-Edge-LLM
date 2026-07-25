@@ -74,11 +74,16 @@ inline constexpr std::size_t kShapeRank = std::extent_v<decltype(TensorT::dynami
 //!
 //! The descriptors only ever expose a non-const @c void* @c data, and the AOT kernels treat the
 //! input pointers as read-only, so constness is cast away exactly once, here.
-template <class TensorT, std::size_t Rank>
-constexpr TensorT makeStridedTensor(void const* data, int32_t const (&shape)[Rank], int64_t const (&strides)[Rank - 1])
+//! @p StrideRank is deduced from the stride list rather than spelled @c Rank-1, because a computed
+//! bound is a non-deduced context: a caller passing too few strides would otherwise bind to the
+//! larger array and have the missing entries silently value-initialised to zero.
+template <class TensorT, std::size_t Rank, std::size_t StrideRank>
+constexpr TensorT makeStridedTensor(
+    void const* data, int32_t const (&shape)[Rank], int64_t const (&strides)[StrideRank])
 {
     static_assert(Rank >= 2, "Rank-1 descriptors carry no dynamic_strides member; use makeCuSeqLenTensor().");
     static_assert(kShapeRank<TensorT> == Rank, "Extent list length does not match the generated descriptor rank.");
+    static_assert(StrideRank == Rank - 1, "Expected exactly one stride fewer than extents.");
     static_assert(std::extent_v<decltype(TensorT::dynamic_strides)> == Rank - 1,
         "Stride list length does not match the generated descriptor rank.");
     static_assert(std::is_same_v<std::remove_extent_t<decltype(TensorT::dynamic_strides)>, int64_t>,
