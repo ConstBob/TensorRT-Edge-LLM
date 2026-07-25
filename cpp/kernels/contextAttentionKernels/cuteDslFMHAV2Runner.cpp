@@ -23,6 +23,7 @@
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
 #include "common/logger.h"
+#include "cuteDslTensorDescriptors.h"
 
 #include <cmath>
 #include <stdexcept>
@@ -225,51 +226,123 @@ CuteDslFMHAV2Runner::CuteDslFMHAV2Runner(int32_t numQHeads, int32_t numKVHeads, 
 {
 }
 
-// clang-format off
-#define CALL_FMHA_V2_LLM(PREFIX, MODULE, WINDOW_SIZE_LEFT)                                                       \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        PREFIX##_Tensor_q_tensor_t qTensor{};                                                                          \
-        qTensor.data = const_cast<void*>(qPtr);                                                                        \
-        qTensor.dynamic_shapes[0] = mBatchSize;                                                                         \
-        qTensor.dynamic_shapes[1] = mSeqLenQ;                                                                           \
-        qTensor.dynamic_shapes[2] = mNumHeadsQ;                                                                         \
-        qTensor.dynamic_strides[0] = static_cast<int64_t>(mSeqLenQ) * mNumHeadsQ * mHeadDim;                           \
-        qTensor.dynamic_strides[1] = static_cast<int64_t>(mNumHeadsQ) * mHeadDim;                                      \
-                                                                                                                       \
-        PREFIX##_Tensor_k_tensor_t kTensor{};                                                                            \
-        kTensor.data = const_cast<void*>(kPtr);                                                                          \
-        kTensor.dynamic_shapes[0] = mBatchSize;                                                                           \
-        kTensor.dynamic_shapes[1] = mKVSeqLen;                                                                           \
-        kTensor.dynamic_shapes[2] = mNumHeadsKV;                                                                          \
-        kTensor.dynamic_strides[0] = static_cast<int64_t>(mKVSeqLen) * mNumHeadsKV * mHeadDim;                         \
-        kTensor.dynamic_strides[1] = static_cast<int64_t>(mNumHeadsKV) * mHeadDim;                                      \
-                                                                                                                       \
-        PREFIX##_Tensor_v_tensor_t vTensor{};                                                                            \
-        vTensor.data = const_cast<void*>(vPtr);                                                                          \
-        vTensor.dynamic_shapes[0] = mBatchSize;                                                                           \
-        vTensor.dynamic_shapes[1] = mKVSeqLen;                                                                           \
-        vTensor.dynamic_shapes[2] = mNumHeadsKV;                                                                          \
-        vTensor.dynamic_strides[0] = static_cast<int64_t>(mKVSeqLen) * mNumHeadsKV * mHeadDim;                         \
-        vTensor.dynamic_strides[1] = static_cast<int64_t>(mNumHeadsKV) * mHeadDim;                                      \
-                                                                                                                       \
-        PREFIX##_Tensor_o_tensor_t oTensor{};                                                                           \
-        oTensor.data = oPtr;                                                                                            \
-        oTensor.dynamic_shapes[0] = mBatchSize;                                                                          \
-        oTensor.dynamic_shapes[1] = mSeqLenQ;                                                                            \
-        oTensor.dynamic_shapes[2] = mNumHeadsQ;                                                                          \
-        oTensor.dynamic_strides[0] = static_cast<int64_t>(mSeqLenQ) * mNumHeadsQ * mHeadDim;                            \
-        oTensor.dynamic_strides[1] = static_cast<int64_t>(mNumHeadsQ) * mHeadDim;                                       \
-                                                                                                                       \
-        PREFIX##_Tensor_cum_seqlen_k_t cumSeqlenK{};                                                                    \
-        cumSeqlenK.data = const_cast<int32_t*>(cuKVSeqLens);                                                           \
-        cumSeqlenK.dynamic_shapes[0] = mBatchSize + 1;                                                                  \
-                                                                                                                       \
-        ret = cute_dsl_##PREFIX##_wrapper(&(MODULE), &qTensor, &kTensor, &vTensor, &oTensor, &cumSeqlenK,             \
-            (WINDOW_SIZE_LEFT), attentionScale, scaleQ, scaleK, scaleV, invScaleO,                                    \
-            getDeviceMultiProcessorCount(), stream);                                                                   \
-    } while (0)
-// clang-format on
+namespace
+{
+
+using cutedsl::makeCuSeqLenTensor;
+using cutedsl::makePackedTensor;
+using cutedsl::makeStridedTensor;
+using cutedsl::WrapperArgT;
+using cutedsl::WrapperArity;
+
+//! Populate a [B, S, H] descriptor over a contiguous [B, S, H, D] buffer. The FMHA-v2 kernels bake
+//! the head dim in, so D is not one of the extents and these descriptors are never packed over
+//! their own extents — the strides have to be spelled out.
+template <class TensorT>
+TensorT makeBshTensor(void const* data, int32_t batchSize, int32_t seqLen, int32_t numHeads, int32_t headDim)
+{
+    return makeStridedTensor<TensorT>(data, {batchSize, seqLen, numHeads},
+        {static_cast<int64_t>(seqLen) * numHeads * headDim, static_cast<int64_t>(numHeads) * headDim});
+}
+
+//! Packed-varlen counterpart of makeBshTensor(): a [total_S, H] descriptor over [total_S, H, D].
+template <class TensorT>
+TensorT makeShTensor(void const* data, int32_t totalSeqLen, int32_t numHeads, int32_t headDim)
+{
+    return makeStridedTensor<TensorT>(data, {totalSeqLen, numHeads}, {static_cast<int64_t>(numHeads) * headDim});
+}
+
+//! Everything the FMHA-v2 LLM descriptors need, gathered once per run() call.
+struct FmhaV2LlmParams
+{
+    void const* qPtr{};
+    void const* kPtr{};
+    void const* vPtr{};
+    void* oPtr{};
+    int32_t const* cuKVSeqLens{};
+    int32_t batchSize{};
+    int32_t seqLenQ{};
+    int32_t kvSeqLen{};
+    int32_t numQHeads{};
+    int32_t numKVHeads{};
+    int32_t headDim{};
+    int32_t windowSizeLeft{};
+    float attentionScale{};
+    float scaleQ{};
+    float scaleK{};
+    float scaleV{};
+    float invScaleO{};
+    cudaStream_t stream{};
+};
+
+//! Launch an FMHA-v2 LLM variant over separate padded [B, S, H, D] Q/K/V.
+template <auto Wrapper>
+int32_t callFmhaV2Llm(WrapperArgT<0, decltype(Wrapper)>& module, FmhaV2LlmParams const& params)
+{
+    static_assert(WrapperArity<decltype(Wrapper)>::value == 14,
+        "callFmhaV2Llm: not an FMHA-v2 LLM wrapper (module, q_tensor, k_tensor, v_tensor, o_tensor, cum_seqlen_k, "
+        "window_size_left, attention_scale, scale_q, scale_k, scale_v, inv_scale_o, sm_count, stream).");
+
+    auto qTensor = makeBshTensor<WrapperArgT<1, decltype(Wrapper)>>(
+        params.qPtr, params.batchSize, params.seqLenQ, params.numQHeads, params.headDim);
+    auto kTensor = makeBshTensor<WrapperArgT<2, decltype(Wrapper)>>(
+        params.kPtr, params.batchSize, params.kvSeqLen, params.numKVHeads, params.headDim);
+    auto vTensor = makeBshTensor<WrapperArgT<3, decltype(Wrapper)>>(
+        params.vPtr, params.batchSize, params.kvSeqLen, params.numKVHeads, params.headDim);
+    auto oTensor = makeBshTensor<WrapperArgT<4, decltype(Wrapper)>>(
+        params.oPtr, params.batchSize, params.seqLenQ, params.numQHeads, params.headDim);
+    auto cumSeqlenK = makeCuSeqLenTensor<WrapperArgT<5, decltype(Wrapper)>>(params.cuKVSeqLens, params.batchSize + 1);
+
+    return Wrapper(&module, &qTensor, &kTensor, &vTensor, &oTensor, &cumSeqlenK, params.windowSizeLeft,
+        params.attentionScale, params.scaleQ, params.scaleK, params.scaleV, params.invScaleO,
+        getDeviceMultiProcessorCount(), params.stream);
+}
+
+//! Everything the FMHA-v2 ViT descriptors need, gathered once per ViT run() call.
+struct FmhaV2VitParams
+{
+    void const* qPtr{};
+    void const* kPtr{};
+    void const* vPtr{};
+    void* oPtr{};
+    int32_t const* cuSeqLens{};
+    int32_t totalSeqLen{};
+    int32_t numQHeads{};
+    int32_t numKVHeads{};
+    int32_t headDim{};
+    int32_t maxSeqLen{};
+    int32_t batchSize{};
+    float scaleSoftmaxLog2{};
+    float attentionScale{};
+    float scaleOutput{};
+    cudaStream_t stream{};
+};
+
+//! Launch an FMHA-v2 ViT variant over packed varlen [total_S, H, D] Q/K/V.
+template <auto Wrapper>
+int32_t callFmhaV2Vit(WrapperArgT<0, decltype(Wrapper)>& module, FmhaV2VitParams const& params)
+{
+    static_assert(WrapperArity<decltype(Wrapper)>::value == 12,
+        "callFmhaV2Vit: not an FMHA-v2 ViT wrapper (module, q_tensor, k_tensor, v_tensor, o_tensor, cu_seqlens, "
+        "max_seqlen, scale_softmax_log2, scale_softmax, scale_output, sm_count, stream).");
+
+    auto qTensor = makeShTensor<WrapperArgT<1, decltype(Wrapper)>>(
+        params.qPtr, params.totalSeqLen, params.numQHeads, params.headDim);
+    auto kTensor = makeShTensor<WrapperArgT<2, decltype(Wrapper)>>(
+        params.kPtr, params.totalSeqLen, params.numKVHeads, params.headDim);
+    auto vTensor = makeShTensor<WrapperArgT<3, decltype(Wrapper)>>(
+        params.vPtr, params.totalSeqLen, params.numKVHeads, params.headDim);
+    auto oTensor = makeShTensor<WrapperArgT<4, decltype(Wrapper)>>(
+        params.oPtr, params.totalSeqLen, params.numQHeads, params.headDim);
+    auto cuSeqlensTensor
+        = makeCuSeqLenTensor<WrapperArgT<5, decltype(Wrapper)>>(params.cuSeqLens, params.batchSize + 1);
+
+    return Wrapper(&module, &qTensor, &kTensor, &vTensor, &oTensor, &cuSeqlensTensor, params.maxSeqLen,
+        params.scaleSoftmaxLog2, params.attentionScale, params.scaleOutput, getDeviceMultiProcessorCount(),
+        params.stream);
+}
+
+} // namespace
 
 bool CuteDslFMHAV2Runner::run(void const* qPtr, void const* kPtr, void const* vPtr, void* oPtr,
     int32_t const* cuKVSeqLens, cudaStream_t stream, float attentionScale, int32_t slidingWindowSize)
@@ -281,56 +354,56 @@ bool CuteDslFMHAV2Runner::run(void const* qPtr, void const* kPtr, void const* vP
     }
 
     validateAttentionScale(attentionScale);
-    float const scaleQ = 1.0F;
-    float const scaleK = 1.0F;
-    float const scaleV = 1.0F;
-    float const invScaleO = 1.0F;
     int32_t constexpr kNO_LIMIT = 1 << 30;
     bool const useSlidingWindow = slidingWindowSize < INT_MAX;
-    int32_t const windowSizeLeft = useSlidingWindow ? slidingWindowSize : kNO_LIMIT;
+
+    FmhaV2LlmParams params{};
+    params.qPtr = qPtr;
+    params.kPtr = kPtr;
+    params.vPtr = vPtr;
+    params.oPtr = oPtr;
+    params.cuKVSeqLens = cuKVSeqLens;
+    params.batchSize = mBatchSize;
+    params.seqLenQ = mSeqLenQ;
+    params.kvSeqLen = mKVSeqLen;
+    params.numQHeads = mNumHeadsQ;
+    params.numKVHeads = mNumHeadsKV;
+    params.headDim = mHeadDim;
+    params.windowSizeLeft = useSlidingWindow ? slidingWindowSize : kNO_LIMIT;
+    params.attentionScale = attentionScale;
+    params.scaleQ = 1.0F;
+    params.scaleK = 1.0F;
+    params.scaleV = 1.0F;
+    params.invScaleO = 1.0F;
+    params.stream = stream;
+
     int32_t ret = -1;
 
-    if (mHeadDim == 64)
+    switch (mHeadDim)
     {
+    case 64:
         if (useSlidingWindow)
         {
-            CALL_FMHA_V2_LLM(fmha_v2_d64_sw, sLLM_d64Sw, windowSizeLeft);
+            ret = callFmhaV2Llm<cute_dsl_fmha_v2_d64_sw_wrapper>(sLLM_d64Sw, params);
         }
         else if (mUseSmallD64 && mSeqLenQ <= 512)
         {
-            CALL_FMHA_V2_LLM(fmha_v2_d64_small, sLLM_d64Small, windowSizeLeft);
+            ret = callFmhaV2Llm<cute_dsl_fmha_v2_d64_small_wrapper>(sLLM_d64Small, params);
         }
         else
         {
-            CALL_FMHA_V2_LLM(fmha_v2_d64, sLLM_d64, windowSizeLeft);
+            ret = callFmhaV2Llm<cute_dsl_fmha_v2_d64_wrapper>(sLLM_d64, params);
         }
-    }
-    else if (mHeadDim == 128)
-    {
-        if (useSlidingWindow)
-        {
-            CALL_FMHA_V2_LLM(fmha_v2_d128_sw, sLLM_d128Sw, windowSizeLeft);
-        }
-        else
-        {
-            CALL_FMHA_V2_LLM(fmha_v2_d128, sLLM_d128, windowSizeLeft);
-        }
-    }
-    else if (mHeadDim == 256)
-    {
-        if (useSlidingWindow)
-        {
-            CALL_FMHA_V2_LLM(fmha_v2_d256_sw, sLLM_d256Sw, windowSizeLeft);
-        }
-        else
-        {
-            CALL_FMHA_V2_LLM(fmha_v2_d256, sLLM_d256, windowSizeLeft);
-        }
-    }
-    else
-    {
-        LOG_ERROR("FMHA-v2 CuTe DSL LLM FMHA: unsupported head_dim=%d", mHeadDim);
-        return false;
+        break;
+    case 128:
+        ret = useSlidingWindow ? callFmhaV2Llm<cute_dsl_fmha_v2_d128_sw_wrapper>(sLLM_d128Sw, params)
+                               : callFmhaV2Llm<cute_dsl_fmha_v2_d128_wrapper>(sLLM_d128, params);
+        break;
+    case 256:
+        ret = useSlidingWindow ? callFmhaV2Llm<cute_dsl_fmha_v2_d256_sw_wrapper>(sLLM_d256Sw, params)
+                               : callFmhaV2Llm<cute_dsl_fmha_v2_d256_wrapper>(sLLM_d256, params);
+        break;
+    default: LOG_ERROR("FMHA-v2 CuTe DSL LLM FMHA: unsupported head_dim=%d", mHeadDim); return false;
     }
 
     if (ret != 0)
@@ -340,8 +413,6 @@ bool CuteDslFMHAV2Runner::run(void const* qPtr, void const* kPtr, void const* vP
     }
     return ret == 0;
 }
-
-#undef CALL_FMHA_V2_LLM
 
 bool CuteDslFMHAV2Runner::runPadding(void const* qPtr, void const* kPtr, void const* vPtr, void* oPtr,
     int32_t const* cuQSeqLens, int32_t const* cuKVSeqLens, cudaStream_t stream, float attentionScale)
@@ -369,45 +440,18 @@ bool CuteDslFMHAV2Runner::runPadding(void const* qPtr, void const* kPtr, void co
         "FMHA-v2 CuTe DSL padding FMHA requires Q heads to be divisible by KV heads.");
 
     validateAttentionScale(attentionScale);
-    fmha_v2_d256_padding_Tensor_mQ_t qTensor{};
-    qTensor.data = const_cast<void*>(qPtr);
-    qTensor.dynamic_shapes[0] = mBatchSize;
-    qTensor.dynamic_shapes[1] = mSeqLenQ;
-    qTensor.dynamic_shapes[2] = mNumHeadsQ;
-    qTensor.dynamic_strides[0] = static_cast<int64_t>(mSeqLenQ) * mNumHeadsQ * mHeadDim;
-    qTensor.dynamic_strides[1] = static_cast<int64_t>(mNumHeadsQ) * mHeadDim;
 
-    fmha_v2_d256_padding_Tensor_mK_t kTensor{};
-    kTensor.data = const_cast<void*>(kPtr);
-    kTensor.dynamic_shapes[0] = mBatchSize;
-    kTensor.dynamic_shapes[1] = mKVSeqLen;
-    kTensor.dynamic_shapes[2] = mNumHeadsKV;
-    kTensor.dynamic_strides[0] = static_cast<int64_t>(mKVSeqLen) * mNumHeadsKV * mHeadDim;
-    kTensor.dynamic_strides[1] = static_cast<int64_t>(mNumHeadsKV) * mHeadDim;
+    using WrapperFn = decltype(&cute_dsl_fmha_v2_d256_padding_wrapper);
+    static_assert(WrapperArity<WrapperFn>::value == 10,
+        "FMHA-v2 padding wrapper signature changed (module, mQ, mK, mV, mO, mCuSeqLenQ, mCuSeqLenK, attention_scale, "
+        "num_heads_kv, stream).");
 
-    fmha_v2_d256_padding_Tensor_mV_t vTensor{};
-    vTensor.data = const_cast<void*>(vPtr);
-    vTensor.dynamic_shapes[0] = mBatchSize;
-    vTensor.dynamic_shapes[1] = mKVSeqLen;
-    vTensor.dynamic_shapes[2] = mNumHeadsKV;
-    vTensor.dynamic_strides[0] = static_cast<int64_t>(mKVSeqLen) * mNumHeadsKV * mHeadDim;
-    vTensor.dynamic_strides[1] = static_cast<int64_t>(mNumHeadsKV) * mHeadDim;
-
-    fmha_v2_d256_padding_Tensor_mO_t oTensor{};
-    oTensor.data = oPtr;
-    oTensor.dynamic_shapes[0] = mBatchSize;
-    oTensor.dynamic_shapes[1] = mSeqLenQ;
-    oTensor.dynamic_shapes[2] = mNumHeadsQ;
-    oTensor.dynamic_strides[0] = static_cast<int64_t>(mSeqLenQ) * mNumHeadsQ * mHeadDim;
-    oTensor.dynamic_strides[1] = static_cast<int64_t>(mNumHeadsQ) * mHeadDim;
-
-    fmha_v2_d256_padding_Tensor_mCuSeqLenQ_t cumSeqlenQ{};
-    cumSeqlenQ.data = const_cast<int32_t*>(cuQSeqLens);
-    cumSeqlenQ.dynamic_shapes[0] = mBatchSize + 1;
-
-    fmha_v2_d256_padding_Tensor_mCuSeqLenK_t cumSeqlenK{};
-    cumSeqlenK.data = const_cast<int32_t*>(cuKVSeqLens);
-    cumSeqlenK.dynamic_shapes[0] = mBatchSize + 1;
+    auto qTensor = makeBshTensor<WrapperArgT<1, WrapperFn>>(qPtr, mBatchSize, mSeqLenQ, mNumHeadsQ, mHeadDim);
+    auto kTensor = makeBshTensor<WrapperArgT<2, WrapperFn>>(kPtr, mBatchSize, mKVSeqLen, mNumHeadsKV, mHeadDim);
+    auto vTensor = makeBshTensor<WrapperArgT<3, WrapperFn>>(vPtr, mBatchSize, mKVSeqLen, mNumHeadsKV, mHeadDim);
+    auto oTensor = makeBshTensor<WrapperArgT<4, WrapperFn>>(oPtr, mBatchSize, mSeqLenQ, mNumHeadsQ, mHeadDim);
+    auto cumSeqlenQ = makeCuSeqLenTensor<WrapperArgT<5, WrapperFn>>(cuQSeqLens, mBatchSize + 1);
+    auto cumSeqlenK = makeCuSeqLenTensor<WrapperArgT<6, WrapperFn>>(cuKVSeqLens, mBatchSize + 1);
 
     int32_t const ret = cute_dsl_fmha_v2_d256_padding_wrapper(&sLLM_d256Padding, &qTensor, &kTensor, &vTensor, &oTensor,
         &cumSeqlenQ, &cumSeqlenK, attentionScale, mNumHeadsKV, stream);
@@ -439,53 +483,21 @@ bool CuteDslFMHAV2Runner::runVisionBlock(void const* qPtr, void const* kPtr, voi
     float const scaleV = 1.0F;
     float const invScaleO = 1.0F;
 
-    fmha_v2_d256_visionblock_Tensor_q_tensor_t qTensor{};
-    qTensor.data = const_cast<void*>(qPtr);
-    qTensor.dynamic_shapes[0] = mBatchSize;
-    qTensor.dynamic_shapes[1] = mSeqLenQ;
-    qTensor.dynamic_shapes[2] = mNumHeadsQ;
-    qTensor.dynamic_strides[0] = static_cast<int64_t>(mSeqLenQ) * mNumHeadsQ * mHeadDim;
-    qTensor.dynamic_strides[1] = static_cast<int64_t>(mNumHeadsQ) * mHeadDim;
+    using WrapperFn = decltype(&cute_dsl_fmha_v2_d256_visionblock_wrapper);
+    static_assert(WrapperArity<WrapperFn>::value == 16,
+        "FMHA-v2 vision-block wrapper signature changed (module, q_tensor, k_tensor, v_tensor, o_tensor, "
+        "cum_seqlen_k, block_begin, block_end, window_size_left, attention_scale, scale_q, scale_k, scale_v, "
+        "inv_scale_o, sm_count, stream).");
 
-    fmha_v2_d256_visionblock_Tensor_k_tensor_t kTensor{};
-    kTensor.data = const_cast<void*>(kPtr);
-    kTensor.dynamic_shapes[0] = mBatchSize;
-    kTensor.dynamic_shapes[1] = mKVSeqLen;
-    kTensor.dynamic_shapes[2] = mNumHeadsKV;
-    kTensor.dynamic_strides[0] = static_cast<int64_t>(mKVSeqLen) * mNumHeadsKV * mHeadDim;
-    kTensor.dynamic_strides[1] = static_cast<int64_t>(mNumHeadsKV) * mHeadDim;
+    auto qTensor = makeBshTensor<WrapperArgT<1, WrapperFn>>(qPtr, mBatchSize, mSeqLenQ, mNumHeadsQ, mHeadDim);
+    auto kTensor = makeBshTensor<WrapperArgT<2, WrapperFn>>(kPtr, mBatchSize, mKVSeqLen, mNumHeadsKV, mHeadDim);
+    auto vTensor = makeBshTensor<WrapperArgT<3, WrapperFn>>(vPtr, mBatchSize, mKVSeqLen, mNumHeadsKV, mHeadDim);
+    auto oTensor = makeBshTensor<WrapperArgT<4, WrapperFn>>(oPtr, mBatchSize, mSeqLenQ, mNumHeadsQ, mHeadDim);
+    auto cumSeqlenK = makeCuSeqLenTensor<WrapperArgT<5, WrapperFn>>(cuKVSeqLens, mBatchSize + 1);
 
-    fmha_v2_d256_visionblock_Tensor_v_tensor_t vTensor{};
-    vTensor.data = const_cast<void*>(vPtr);
-    vTensor.dynamic_shapes[0] = mBatchSize;
-    vTensor.dynamic_shapes[1] = mKVSeqLen;
-    vTensor.dynamic_shapes[2] = mNumHeadsKV;
-    vTensor.dynamic_strides[0] = static_cast<int64_t>(mKVSeqLen) * mNumHeadsKV * mHeadDim;
-    vTensor.dynamic_strides[1] = static_cast<int64_t>(mNumHeadsKV) * mHeadDim;
-
-    fmha_v2_d256_visionblock_Tensor_o_tensor_t oTensor{};
-    oTensor.data = oPtr;
-    oTensor.dynamic_shapes[0] = mBatchSize;
-    oTensor.dynamic_shapes[1] = mSeqLenQ;
-    oTensor.dynamic_shapes[2] = mNumHeadsQ;
-    oTensor.dynamic_strides[0] = static_cast<int64_t>(mSeqLenQ) * mNumHeadsQ * mHeadDim;
-    oTensor.dynamic_strides[1] = static_cast<int64_t>(mNumHeadsQ) * mHeadDim;
-
-    fmha_v2_d256_visionblock_Tensor_cum_seqlen_k_t cumSeqlenK{};
-    cumSeqlenK.data = const_cast<int32_t*>(cuKVSeqLens);
-    cumSeqlenK.dynamic_shapes[0] = mBatchSize + 1;
-
-    fmha_v2_d256_visionblock_Tensor_block_begin_t blockBeginTensor{};
-    blockBeginTensor.data = const_cast<int32_t*>(blockBegin);
-    blockBeginTensor.dynamic_shapes[0] = mBatchSize;
-    blockBeginTensor.dynamic_shapes[1] = mSeqLenQ;
-    blockBeginTensor.dynamic_strides[0] = mSeqLenQ;
-
-    fmha_v2_d256_visionblock_Tensor_block_end_t blockEndTensor{};
-    blockEndTensor.data = const_cast<int32_t*>(blockEnd);
-    blockEndTensor.dynamic_shapes[0] = mBatchSize;
-    blockEndTensor.dynamic_shapes[1] = mSeqLenQ;
-    blockEndTensor.dynamic_strides[0] = mSeqLenQ;
+    // The per-query block ranges are packed [B, S_q], unlike the Q/K/V/O descriptors above.
+    auto blockBeginTensor = makePackedTensor<WrapperArgT<6, WrapperFn>>(blockBegin, {mBatchSize, mSeqLenQ});
+    auto blockEndTensor = makePackedTensor<WrapperArgT<7, WrapperFn>>(blockEnd, {mBatchSize, mSeqLenQ});
 
     int32_t const ret = cute_dsl_fmha_v2_d256_visionblock_wrapper(&sLLM_d256VisionBlock, &qTensor, &kTensor, &vTensor,
         &oTensor, &cumSeqlenK, &blockBeginTensor, &blockEndTensor, slidingWindowSize, attentionScale, scaleQ, scaleK,
@@ -496,43 +508,6 @@ bool CuteDslFMHAV2Runner::runVisionBlock(void const* qPtr, void const* kPtr, voi
     }
     return ret == 0;
 }
-
-// clang-format off
-#define CALL_FMHA_V2_VIT(PREFIX, MODULE)                                                                         \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        PREFIX##_Tensor_q_tensor_t qTensor{};                                                                          \
-        qTensor.data = const_cast<void*>(qPtr);                                                                        \
-        qTensor.dynamic_shapes[0] = totalSeqLen;                                                                       \
-        qTensor.dynamic_shapes[1] = mNumHeadsQ;                                                                         \
-        qTensor.dynamic_strides[0] = static_cast<int64_t>(mNumHeadsQ) * mHeadDim;                                      \
-                                                                                                                       \
-        PREFIX##_Tensor_k_tensor_t kTensor{};                                                                          \
-        kTensor.data = const_cast<void*>(kPtr);                                                                        \
-        kTensor.dynamic_shapes[0] = totalSeqLen;                                                                       \
-        kTensor.dynamic_shapes[1] = mNumHeadsKV;                                                                        \
-        kTensor.dynamic_strides[0] = static_cast<int64_t>(mNumHeadsKV) * mHeadDim;                                     \
-                                                                                                                       \
-        PREFIX##_Tensor_v_tensor_t vTensor{};                                                                          \
-        vTensor.data = const_cast<void*>(vPtr);                                                                        \
-        vTensor.dynamic_shapes[0] = totalSeqLen;                                                                       \
-        vTensor.dynamic_shapes[1] = mNumHeadsKV;                                                                        \
-        vTensor.dynamic_strides[0] = static_cast<int64_t>(mNumHeadsKV) * mHeadDim;                                     \
-                                                                                                                       \
-        PREFIX##_Tensor_o_tensor_t oTensor{};                                                                          \
-        oTensor.data = oPtr;                                                                                           \
-        oTensor.dynamic_shapes[0] = totalSeqLen;                                                                       \
-        oTensor.dynamic_shapes[1] = mNumHeadsQ;                                                                         \
-        oTensor.dynamic_strides[0] = static_cast<int64_t>(mNumHeadsQ) * mHeadDim;                                      \
-                                                                                                                       \
-        PREFIX##_Tensor_cu_seqlens_t cuSeqlensTensor{};                                                                \
-        cuSeqlensTensor.data = const_cast<int32_t*>(cuSeqLens);                                                       \
-        cuSeqlensTensor.dynamic_shapes[0] = batchSize + 1;                                                             \
-                                                                                                                       \
-        ret = cute_dsl_##PREFIX##_wrapper(&(MODULE), &qTensor, &kTensor, &vTensor, &oTensor, &cuSeqlensTensor,         \
-            maxSeqLen, scaleSoftmaxLog2, attentionScale, scaleOutput, getDeviceMultiProcessorCount(), stream);         \
-    } while (0)
-// clang-format on
 
 bool CuteDslFMHAV2Runner::run(void const* qPtr, void const* kPtr, void const* vPtr, void* oPtr,
     int32_t const* cuSeqLens, int32_t totalSeqLen, int32_t maxSeqLen, int32_t batchSize, cudaStream_t stream,
@@ -545,30 +520,33 @@ bool CuteDslFMHAV2Runner::run(void const* qPtr, void const* kPtr, void const* vP
     }
 
     validateAttentionScale(attentionScale);
-    float const scaleSoftmaxLog2 = attentionScale * static_cast<float>(M_LOG2E);
-    float const scaleOutput = 1.0F;
+
+    FmhaV2VitParams params{};
+    params.qPtr = qPtr;
+    params.kPtr = kPtr;
+    params.vPtr = vPtr;
+    params.oPtr = oPtr;
+    params.cuSeqLens = cuSeqLens;
+    params.totalSeqLen = totalSeqLen;
+    params.numQHeads = mNumHeadsQ;
+    params.numKVHeads = mNumHeadsKV;
+    params.headDim = mHeadDim;
+    params.maxSeqLen = maxSeqLen;
+    params.batchSize = batchSize;
+    params.scaleSoftmaxLog2 = attentionScale * static_cast<float>(M_LOG2E);
+    params.attentionScale = attentionScale;
+    params.scaleOutput = 1.0F;
+    params.stream = stream;
+
     int32_t ret = -1;
 
-    if (mHeadDim == 64)
+    switch (mHeadDim)
     {
-        CALL_FMHA_V2_VIT(fmha_v2_vit_d64, sViT_d64);
-    }
-    else if (mHeadDim == 72)
-    {
-        CALL_FMHA_V2_VIT(fmha_v2_vit_d72, sViT_d72);
-    }
-    else if (mHeadDim == 80)
-    {
-        CALL_FMHA_V2_VIT(fmha_v2_vit_d80, sViT_d80);
-    }
-    else if (mHeadDim == 128)
-    {
-        CALL_FMHA_V2_VIT(fmha_v2_vit_d128, sViT_d128);
-    }
-    else
-    {
-        LOG_ERROR("FMHA-v2 CuTe DSL ViT FMHA: unsupported head_dim=%d", mHeadDim);
-        return false;
+    case 64: ret = callFmhaV2Vit<cute_dsl_fmha_v2_vit_d64_wrapper>(sViT_d64, params); break;
+    case 72: ret = callFmhaV2Vit<cute_dsl_fmha_v2_vit_d72_wrapper>(sViT_d72, params); break;
+    case 80: ret = callFmhaV2Vit<cute_dsl_fmha_v2_vit_d80_wrapper>(sViT_d80, params); break;
+    case 128: ret = callFmhaV2Vit<cute_dsl_fmha_v2_vit_d128_wrapper>(sViT_d128, params); break;
+    default: LOG_ERROR("FMHA-v2 CuTe DSL ViT FMHA: unsupported head_dim=%d", mHeadDim); return false;
     }
 
     if (ret != 0)
@@ -577,8 +555,6 @@ bool CuteDslFMHAV2Runner::run(void const* qPtr, void const* kPtr, void const* vP
     }
     return ret == 0;
 }
-
-#undef CALL_FMHA_V2_VIT
 
 } // namespace trt_edgellm
 
