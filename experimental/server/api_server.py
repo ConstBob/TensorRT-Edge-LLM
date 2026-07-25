@@ -44,8 +44,10 @@ import os
 import re
 import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
+from .batching import RequestBatcher, resolve_batch_size
 from .engine import (SamplingParams, _normalize_logit_bias,
                      _validate_logit_bias_spec_decode, finish_reason_name)
 from .tool_calling import (ToolConfig, parse_assistant_output,
@@ -184,7 +186,17 @@ def _split_reasoning_and_content(text: str):
     return None, text.strip() if text.strip() else None
 
 
-def _create_app(llm_instance):
+def _handle_runtime_request(llm_instance, request):
+    if hasattr(llm_instance, "_handle_request"):
+        return llm_instance._handle_request(request)
+    return llm_instance._runtime.handle_request(request)
+
+
+def _create_app(llm_instance,
+                *,
+                enable_batching: bool = False,
+                max_queue_batch_size: Optional[int] = None,
+                batch_timeout_ms: float = 10.0):
     """Create a FastAPI app backed by the given LLM instance."""
     try:
         from fastapi import FastAPI, File, Form, UploadFile
@@ -193,11 +205,42 @@ def _create_app(llm_instance):
         raise RuntimeError("FastAPI is required for the server. "
                            "Install: pip install fastapi uvicorn") from exc
 
+    batcher: Optional[RequestBatcher] = None
+
+    def runtime_handler(request):
+        return _handle_runtime_request(llm_instance, request)
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        nonlocal batcher
+        if enable_batching:
+            engine_batch_size = int(
+                getattr(llm_instance, "max_batch_size", 0) or 0)
+            batch_size = resolve_batch_size(engine_batch_size,
+                                            max_queue_batch_size)
+            batcher = RequestBatcher(
+                runtime_handler=runtime_handler,
+                max_batch_size=batch_size,
+                timeout_ms=batch_timeout_ms,
+            )
+            logger.info(
+                "HTTP request batching enabled: max_batch_size=%d timeout_ms=%.3f",
+                batcher.max_batch_size,
+                batcher.timeout_ms,
+            )
+        try:
+            yield
+        finally:
+            if batcher is not None:
+                batcher.close()
+                batcher = None
+
     app = FastAPI(
         title="TensorRT Edge-LLM Server",
         version="0.1.0",
         description=
         "OpenAI-compatible inference server powered by TensorRT Edge-LLM",
+        lifespan=lifespan,
     )
 
     @app.middleware("http")
@@ -232,6 +275,11 @@ def _create_app(llm_instance):
             "status": "healthy",
             "model": llm_instance.model_dir,
             "speculative_decoding": llm_instance.has_draft_model,
+            "batching": {
+                "enabled": batcher is not None,
+                "max_batch_size": batcher.max_batch_size if batcher else 1,
+                "timeout_ms": batcher.timeout_ms if batcher else 0.0,
+            },
         }
 
     @app.get("/v1/models")
@@ -376,11 +424,24 @@ def _create_app(llm_instance):
                 },
             )
 
-        sem = llm_instance._admission()
-        if not sem.acquire(blocking=False):
-            return _busy_response()
         try:
-            try:
+            if batcher is None:
+                sem = llm_instance._admission()
+                if not sem.acquire(blocking=False):
+                    return _busy_response()
+                try:
+                    request = llm_instance._make_generation_request(
+                        messages,
+                        params,
+                        tools=tool_config.tools,
+                        tool_choice=tool_config.tool_choice,
+                        tool_config=tool_config,
+                    )
+                    response = _handle_runtime_request(llm_instance, request)
+                    response_idx = 0
+                finally:
+                    sem.release()
+            else:
                 request = llm_instance._make_generation_request(
                     messages,
                     params,
@@ -388,9 +449,9 @@ def _create_app(llm_instance):
                     tool_choice=tool_config.tool_choice,
                     tool_config=tool_config,
                 )
-                response = llm_instance._handle_request(request)
-            finally:
-                sem.release()
+                result = batcher.submit(request)
+                response = result.response
+                response_idx = result.index
         except (ValueError, KeyError) as exc:
             return JSONResponse(
                 status_code=400,
@@ -407,49 +468,15 @@ def _create_app(llm_instance):
             logger.exception("Inference failed")
             return JSONResponse(status_code=500, content={"error": str(exc)})
 
-        raw_text = response.output_texts[0] if response.output_texts else ""
-        output_text = raw_text.replace(IM_END_TOKEN, "")
-        output_ids = response.output_ids[0] if response.output_ids else []
-        completion_tokens = len(output_ids)
-
-        message_body, has_tool_calls = _build_message_body(
-            output_text, tool_config, llm_instance.model_dir)
-
-        finish_reason = (finish_reason_name(llm_instance._rt,
-                                            response.finish_reasons[0])
-                         if response.finish_reasons else "stop")
-        if has_tool_calls:
-            finish_reason = "tool_calls"
-
-        # ``prompt_tokens`` is reported as 0 because the runtime response does
-        # not expose tokenised prompt ids; ``total_tokens`` is then equal to
-        # ``completion_tokens``. SDKs that validate the schema (existence of
-        # the three fields) succeed; consumers that compute cost from
-        # ``prompt_tokens`` will see 0 until the runtime is extended.
-        logprobs_obj = _format_logprobs(
+        return _build_chat_completion_response(
+            llm_instance,
             response,
-            include_top=include_top_logprobs) if num_logprobs > 0 else None
-        return {
-            "id":
+            response_idx,
             response_id,
-            "object":
-            "chat.completion",
-            "created":
-            int(time.time()),
-            "model":
-            os.path.basename(llm_instance.model_dir) or llm_instance.model_dir,
-            "choices": [{
-                "index": 0,
-                "message": message_body,
-                "logprobs": logprobs_obj,
-                "finish_reason": finish_reason,
-            }],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": completion_tokens,
-                "total_tokens": completion_tokens,
-            },
-        }
+            tool_config,
+            include_top_logprobs=include_top_logprobs,
+            include_logprobs=num_logprobs > 0,
+        )
 
     @app.post("/v1/audio/transcriptions")
     async def audio_transcriptions(
@@ -832,6 +859,7 @@ def _entry_to_openai(entry) -> Dict[str, Any]:
 
 
 def _format_logprobs(response,
+                     response_idx: int = 0,
                      include_top: bool = True) -> Optional[Dict[str, Any]]:
     """Format C++ logprobs into an OpenAI-compatible logprobs object, or None.
 
@@ -845,10 +873,12 @@ def _format_logprobs(response,
     ``token``/``bytes`` are empty and ``logprob`` is ``null`` for the chosen
     token; ``top_logprobs`` still lists the candidates. Greedy is unaffected.
     """
-    if not response.logprobs:
+    if not getattr(response, "logprobs", []):
         return None
-    output_ids = response.output_ids[0] if response.output_ids else []
-    step_logprobs = response.logprobs[0]
+    output_ids = (response.output_ids[response_idx]
+                  if len(response.output_ids) > response_idx else [])
+    step_logprobs = (response.logprobs[response_idx]
+                     if len(response.logprobs) > response_idx else [])
     if not step_logprobs:
         return None
 
@@ -889,6 +919,64 @@ def _build_message_body(output_text: str, tool_config: ToolConfig,
     return message_body, bool(tool_calls)
 
 
+def _build_chat_completion_response(llm_instance,
+                                    response,
+                                    response_idx: int,
+                                    response_id: str,
+                                    tool_config: ToolConfig,
+                                    *,
+                                    include_top_logprobs: bool = True,
+                                    include_logprobs: bool = False):
+    raw_text = (response.output_texts[response_idx]
+                if len(response.output_texts) > response_idx else "")
+    output_text = raw_text.replace(IM_END_TOKEN, "")
+    output_ids = (response.output_ids[response_idx]
+                  if len(response.output_ids) > response_idx else [])
+    completion_tokens = len(output_ids)
+
+    message_body, has_tool_calls = _build_message_body(output_text,
+                                                       tool_config,
+                                                       llm_instance.model_dir)
+
+    if len(response.finish_reasons) > response_idx:
+        finish_reason = finish_reason_name(
+            llm_instance._rt, response.finish_reasons[response_idx])
+    else:
+        finish_reason = "stop"
+    if has_tool_calls:
+        finish_reason = "tool_calls"
+
+    # ``prompt_tokens`` is reported as 0 because the runtime response does
+    # not expose tokenised prompt ids; ``total_tokens`` is then equal to
+    # ``completion_tokens``. SDKs that validate the schema (existence of
+    # the three fields) succeed; consumers that compute cost from
+    # ``prompt_tokens`` will see 0 until the runtime is extended.
+    logprobs_obj = (_format_logprobs(
+        response, response_idx=response_idx, include_top=include_top_logprobs)
+                    if include_logprobs else None)
+    return {
+        "id":
+        response_id,
+        "object":
+        "chat.completion",
+        "created":
+        int(time.time()),
+        "model":
+        os.path.basename(llm_instance.model_dir) or llm_instance.model_dir,
+        "choices": [{
+            "index": 0,
+            "message": message_body,
+            "logprobs": logprobs_obj,
+            "finish_reason": finish_reason,
+        }],
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": completion_tokens,
+            "total_tokens": completion_tokens,
+        },
+    }
+
+
 def _sse_chunk(response_id: str,
                delta: dict,
                finish_reason: Optional[str] = None,
@@ -902,7 +990,13 @@ def _sse_chunk(response_id: str,
     return f"data: {json.dumps(payload)}\n\n"
 
 
-def run_server(llm_instance, host: str = "0.0.0.0", port: int = 8000) -> None:
+def run_server(llm_instance,
+               host: str = "0.0.0.0",
+               port: int = 8000,
+               *,
+               enable_batching: bool = False,
+               batch_timeout_ms: float = 10.0,
+               max_queue_batch_size: Optional[int] = None) -> None:
     """Start the OpenAI-compatible server."""
     try:
         import uvicorn
@@ -910,7 +1004,12 @@ def run_server(llm_instance, host: str = "0.0.0.0", port: int = 8000) -> None:
         raise RuntimeError(
             "uvicorn is required. Install: pip install uvicorn") from exc
 
-    app = _create_app(llm_instance)
+    app = _create_app(
+        llm_instance,
+        enable_batching=enable_batching,
+        batch_timeout_ms=batch_timeout_ms,
+        max_queue_batch_size=max_queue_batch_size,
+    )
     logger.info("Starting server on %s:%d ...", host, port)
     uvicorn.run(app, host=host, port=port)
 
@@ -990,6 +1089,24 @@ def main():
                         type=int,
                         default=60,
                         help="Speculative decoding: verification tree size")
+    parser.add_argument(
+        "--enable-batching",
+        action="store_true",
+        help=
+        "Enable server-side batching for compatible non-streaming requests",
+    )
+    parser.add_argument(
+        "--batch-timeout-ms",
+        type=float,
+        default=10.0,
+        help="Maximum wait time for compatible requests when batching",
+    )
+    parser.add_argument(
+        "--max-queue-batch-size",
+        type=int,
+        default=None,
+        help="Maximum HTTP requests to merge into one runtime batch",
+    )
     args = parser.parse_args()
 
     from .engine import LLM
@@ -1021,7 +1138,13 @@ def main():
         draft_step=args.draft_step,
         verify_tree_size=args.verify_tree_size,
     )
-    llm.serve(host=args.host, port=args.port)
+    llm.serve(
+        host=args.host,
+        port=args.port,
+        enable_batching=args.enable_batching,
+        batch_timeout_ms=args.batch_timeout_ms,
+        max_queue_batch_size=args.max_queue_batch_size,
+    )
 
 
 if __name__ == "__main__":

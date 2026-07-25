@@ -32,6 +32,7 @@ for large language models and vision-language models on edge devices.
    user_guide/examples/tts.md
    user_guide/examples/vla.md
    user_guide/examples/experimental-server.md
+   user_guide/examples/nemo-evaluator.md
 
 .. toctree::
    :maxdepth: 2

@@ -30,3 +30,5 @@ End-to-end workflows demonstrating TensorRT Edge-LLM capabilities across differe
 - **[Alpamayo-R1-10B (VLA)](vla.md)** - Vision-language-action workflow with image, text, trajectory history, and action prediction
 - **[Omni (Audio + Vision + Speech I/O)](omni.md)** - End-to-end Qwen3-Omni multimodal pipeline with NVFP4 quantization
 - **[Experimental High-Level Python API and Server](experimental-server.md)** - vLLM-style API and OpenAI-compatible server with spec-decode support
+- **[Local Evaluation with NeMo Evaluator](nemo-evaluator.md)** - Run NeMo Evaluator against a local TensorRT
+  Edge-LLM OpenAI-compatible server
