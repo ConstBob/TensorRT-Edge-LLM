@@ -45,6 +45,9 @@ namespace cutedsl
 template <std::size_t I, class Wrapper>
 struct WrapperArg;
 
+// Compile-time type computation. The specialization pattern-matches the wrapper signature to
+// capture its parameter list, and std::tuple is only a vehicle for indexing that pack -- no tuple
+// is ever created, and nothing here survives into the generated code.
 template <std::size_t I, class Ret, class... Args>
 struct WrapperArg<I, Ret (*)(Args...)>
 {
