@@ -65,16 +65,15 @@ _CONNECTION_TIMEOUT_S = 30
 _TRANSFER_TIMEOUT_S = 1800
 _TEST_TIMEOUT_S = 3600
 _JOBS = 16
-_DEFAULT_ONNX_ROOT = PurePosixPath("/home/edge_llm_cache/trt-ci/onnx")
-# One entry enables checkpoint download, ONNX export, engine build, and inference.
-_ONNX_MODELS = {
+# One entry enables optional checkpoint download, ONNX export, engine build, and inference.
+_MODEL_CHECKPOINTS = {
     "Qwen2.5-0.5B-Instruct":
     ("Qwen/Qwen2.5-0.5B-Instruct", "Qwen2.5-0.5B-Instruct"),
     "Llama-3.2-1B":
     ("meta-llama/Llama-3.2-1B-Instruct", "llama-3.2-models/Llama-3.2-1B"),
 }
 _E2E_MODEL_FAMILIES = tuple(f"{name}-fp16-mxsl4096-mxbs1-mxil2048"
-                            for name in _ONNX_MODELS)
+                            for name in _MODEL_CHECKPOINTS)
 
 
 class FlowError(RuntimeError):
@@ -202,24 +201,23 @@ class Config:
     run_host: HostSSHConfig
     run_id: str
     branch: str
-    onnx_root: PurePosixPath
+    hf_checkpoint_root: PurePosixPath
     jobs: int
     source_root: Path = _SOURCE_ROOT
-    download_onnx: bool = False
+    download_hf_checkpoint: bool = False
     no_trt_containers: bool = False
 
     def validate(self) -> None:
         if self.architecture not in {Arch.X86_64, Arch.D7L}:
             raise ValueError("architecture must be x86/x86_64 or d7l")
-        if self.download_onnx and self.architecture is not Arch.X86_64:
-            raise ValueError("--download_onnx currently supports x86 only")
         if not _safe_path(self.trt_location):
             raise ValueError(
                 "trt_location must be an absolute, non-root PRE_BUILT directory path"
             )
-        if not _safe_path(self.onnx_root):
+        if not _safe_path(self.hf_checkpoint_root):
             raise ValueError(
-                "TRT_CI_ONNX_DIR must be an absolute, non-root run-host path")
+                "TRT_CI_HF_CHECKPOINT_DIR must be an absolute, non-root run-host path"
+            )
         if self.jobs <= 0:
             raise ValueError("TRT_CI_JOBS must be a positive integer")
         if not _RUN_ID_RE.fullmatch(self.run_id):
@@ -539,11 +537,11 @@ def _deploy(config: Config, code: Any, run_host: Host,
                    PurePosixPath(setup))
 
 
-def _download_onnx(config: Config, commands: Any, target: Any) -> None:
-    if not config.download_onnx:
+def _download_hf_checkpoints(config: Config, commands: Any,
+                             target: Any) -> None:
+    if not config.download_hf_checkpoint:
         return
-    checkpoint_root = config.onnx_root / ".checkpoints"
-    for model_name, (repository, checkpoint_dir) in _ONNX_MODELS.items():
+    for model_name, (repository, checkpoint_dir) in _MODEL_CHECKPOINTS.items():
         result = commands.run(
             target,
             CommandSpec(
@@ -551,7 +549,7 @@ def _download_onnx(config: Config, commands: Any, target: Any) -> None:
                 argv=[
                     str(_PYTHON.parent / "hf"), "download", repository,
                     "--local-dir",
-                    str(checkpoint_root / checkpoint_dir)
+                    str(config.hf_checkpoint_root / checkpoint_dir)
                 ],
                 timeout_s=_TRANSFER_TIMEOUT_S,
                 output_mode=OutputMode.PROGRESS,
@@ -560,8 +558,9 @@ def _download_onnx(config: Config, commands: Any, target: Any) -> None:
                 operation_name=f"huggingface-download-{model_name}",
             ))
         if not result.success:
-            raise FlowError(f"HuggingFace download failed for {model_name}",
-                            _status(result))
+            raise FlowError(
+                f"HuggingFace checkpoint download failed for {model_name}",
+                _status(result))
 
 
 def _run_tests(config: Config, code: Any, run_host: Host, run_result: Any,
@@ -590,9 +589,9 @@ def _run_tests(config: Config, code: Any, run_host: Host, run_result: Any,
                       str(config.trt_location),
                       read_only=True))
     mounts.extend((
-        MountSpec(str(config.onnx_root),
-                  str(config.onnx_root),
-                  read_only=not config.download_onnx),
+        MountSpec(str(config.hf_checkpoint_root),
+                  str(config.hf_checkpoint_root),
+                  read_only=not config.download_hf_checkpoint),
         MountSpec(str(_PYTHON_ROOT), str(_PYTHON_ROOT), read_only=True),
     ))
     extra_args = None
@@ -654,43 +653,40 @@ def _collect_results(config: Config, run_host: Host, runtime: Runtime,
 
 def _test_command(config: Config, runtime: Runtime) -> str:
     results = runtime.workspace / "results"
+    onnx_root = runtime.workspace / "onnx"
     tests = runtime.edge / "tests/defs/test_llm_pipeline.py"
+    export_tests = runtime.edge / "tests/defs/test_checkpoint_export.py"
     plugin = runtime.edge / "libNvInfer_edgellm_plugin.so"
     q = shlex.quote
+    export_cases = " ".join(f"--test-param={q(name + '-fp16')}"
+                            for name in _MODEL_CHECKPOINTS)
     build_cases = " ".join(f"--test-param={q(model)}"
                            for model in _E2E_MODEL_FAMILIES)
     inference_cases = " ".join(f"--test-param={q(model + '-llm_basic')}"
                                for model in _E2E_MODEL_FAMILIES)
+    generated_dirs = " ".join(
+        q(str(onnx_root / name / "llm-fp16-fp16"))
+        for name in _MODEL_CHECKPOINTS)
     use_host_python = (config.no_trt_containers
                        or config.architecture is Arch.D7L)
     python = "python3" if use_host_python else str(_PYTHON)
     python_path = "" if use_host_python else f"export PATH={q(str(_PYTHON.parent))}:$PATH\n"
-    export_step = ""
-    if config.download_onnx:
-        export_tests = runtime.edge / "tests/defs/test_checkpoint_export.py"
-        export_cases = " ".join(f"--test-param={q(name + '-fp16')}"
-                                for name in _ONNX_MODELS)
-        generated_dirs = " ".join(
-            q(str(config.onnx_root / name / "llm-fp16-fp16"))
-            for name in _ONNX_MODELS)
-        export_step = f"""export LLM_MODELS_DIR={q(str(config.onnx_root / '.checkpoints'))}
-rm -rf {generated_dirs}
-{q(python)} -m pytest -q {q(str(export_tests))}::test_checkpoint_export \
-  {export_cases} --junitxml={q(str(results / 'e2e-export.xml'))} \
-  2>&1 | tee {q(str(results / 'e2e-export.log'))}
-"""
     return f"""set -euo pipefail
 source {q(str(runtime.env_script))}
 export EDGELLM_PLUGIN_PATH={q(str(plugin))}
 {python_path}export LLM_SDK_DIR={q(str(runtime.edge))}
-export ONNX_DIR={q(str(config.onnx_root))}
+export LLM_MODELS_DIR={q(str(config.hf_checkpoint_root))}
+export ONNX_DIR={q(str(onnx_root))}
 export ENGINE_DIR={q(str(runtime.workspace / 'engines'))}
 export BUILD_DIR={q(str(runtime.edge))}
 export TEST_LOG_DIR={q(str(results / 'logs'))}
 export TRT_PACKAGE_DIR={q(str(runtime.trt))}
-rm -rf {q(str(results))}
-mkdir -p {q(str(results))}
-{export_step}{q(python)} -m pytest -q {q(str(tests))}::TestLLMPipeline::test_engine_build \
+rm -rf {q(str(results))} {generated_dirs}
+mkdir -p {q(str(results))} {q(str(onnx_root))}
+{q(python)} -m pytest -q {q(str(export_tests))}::test_checkpoint_export \
+  {export_cases} --junitxml={q(str(results / 'e2e-export.xml'))} \
+  2>&1 | tee {q(str(results / 'e2e-export.log'))}
+{q(python)} -m pytest -q {q(str(tests))}::TestLLMPipeline::test_engine_build \
   {build_cases} --junitxml={q(str(results / 'e2e-build.xml'))} \
   2>&1 | tee {q(str(results / 'e2e-build.log'))}
 {q(python)} -m pytest -q {q(str(tests))}::TestLLMPipeline::test_inference \
@@ -720,10 +716,9 @@ def _parser() -> argparse.ArgumentParser:
         help="run the EdgeLLM build and E2E tests without TRT containers",
     )
     parser.add_argument(
-        "--download_onnx",
+        "--download_hf_checkpoint",
         action="store_true",
-        help="download checkpoints and export configured ONNX models (x86 only)"
-    )
+        help="download configured HuggingFace checkpoints before ONNX export")
     parser.add_argument("--run-id", help=argparse.SUPPRESS)
     return parser
 
@@ -744,10 +739,9 @@ def _config(args: argparse.Namespace) -> Config:
         run_host=read_ssh_config(args.run_host, "run_host"),
         run_id=args.run_id or uuid.uuid4().hex[:12],
         branch=branch,
-        onnx_root=PurePosixPath(
-            os.environ.get("TRT_CI_ONNX_DIR", str(_DEFAULT_ONNX_ROOT))),
+        hf_checkpoint_root=PurePosixPath(hf_checkpoint_dir),
         jobs=jobs,
-        download_onnx=args.download_onnx,
+        download_hf_checkpoint=args.download_hf_checkpoint,
         no_trt_containers=args.no_trt_containers,
     )
     config.validate()
@@ -808,7 +802,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         run_result = _build(config, code, build_host.target)
         runtime = _deploy(config, code, run_host, run_result)
-        _download_onnx(config, commands, runtime.target)
+        _download_hf_checkpoints(config, commands, runtime.target)
         status = _run_tests(config, code, run_host, run_result, runtime,
                             logger)
     except FlowError as error:

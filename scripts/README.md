@@ -131,7 +131,7 @@ The model-family map is deliberately local and easy to extend in
 `scripts/run_trt_dependency_ci.py`:
 
 ```python
-_ONNX_MODELS = {
+_MODEL_CHECKPOINTS = {
     "Qwen2.5-0.5B-Instruct":
     ("Qwen/Qwen2.5-0.5B-Instruct", "Qwen2.5-0.5B-Instruct"),
     "Llama-3.2-1B":
@@ -141,11 +141,14 @@ _ONNX_MODELS = {
 ```
 
 Each entry supplies the test name, HuggingFace repository, and Edge-LLM source
-checkpoint layout. It schedules ONNX export, engine build, and `llm_basic`
-inference. Pass `--download_onnx` on x86 to download checkpoints on the run host
-and export fresh ONNX in the Edge-LLM test container. The run-host account must
-already have HuggingFace access; Llama requires accepting Meta's license and
-running `hf auth login`. Without the flag, existing ONNX packages are reused.
+checkpoint layout. It schedules checkpoint export, engine build, and `llm_basic` inference. The
+script always runs `tests/defs/test_checkpoint_export.py::test_checkpoint_export`
+first, writes generated ONNX under the per-run workspace, and then points
+`test_engine_build`/`test_inference` at that generated ONNX tree. Pass
+`--download_hf_checkpoint` to download missing HuggingFace checkpoints on
+the run host before export. The run-host account must already have
+HuggingFace access; Llama requires accepting Meta's license and running
+`hf auth login`. Without the flag, existing HF checkpoints are reused.
 C++ unit tests are not built or run by this flow. The controller's active Python environment supplies pytest and the E2E
 dependencies; its prefix must be visible at the same absolute path on the run
 host and is mounted into the x86 test container automatically. D7L runs use
@@ -158,10 +161,11 @@ current CodeManager Edge-LLM remote-build flow does not stage source or sync
 its output back, while deployment reads the controller-visible `RunResult`
 paths.
 
-The run target must expose the ONNX packages required by every configured model
-under `/home/edge_llm_cache/trt-ci/onnx`; `TRT_CI_ONNX_DIR` overrides that
-root. This is the only path override normally
-needed for a local build. `TRT_CI_ARTIFACTS_DIR` is needed only when a remote
+The caller must set `TRT_CI_HF_CHECKPOINT_DIR` to the run-target path that
+contains the HF checkpoints required by every configured model. There is no
+default checkpoint root. The generated ONNX tree is per-run scratch data and
+does not need to be provided by the caller. This checkpoint path is the only
+model path normally needed for a local build. `TRT_CI_ARTIFACTS_DIR` is needed only when a remote
 build requires a caller-supplied shared path. `TRT_CI_JOBS` and
 `TRT_CI_BRANCH` are optional tuning overrides; the script makes git-trt
 noninteractive itself. Python 3 and TRT Dev Toolkit are required on the controller.
