@@ -218,13 +218,14 @@ if(BUILD_UNIT_TESTS)
   target_compile_definitions(unitTest
                              PRIVATE PROJECT_ROOT_DIR="${CMAKE_SOURCE_DIR}")
   target_link_libraries(
-    unitTest PRIVATE gtest gtest_main edgellmCore commonLibraryExt
+    unitTest PRIVATE gtest gtest_main edgellmCore commonLibraryExt exampleUtils
                      ${CUDA_DRIVER_LINK_LIB})
   if(NOT ENABLE_CUTE_DSL STREQUAL "OFF")
     include(${CMAKE_SOURCE_DIR}/cmake/CuteDsl.cmake)
     cute_dsl_setup(LINK_TARGETS unitTest)
   endif()
   add_cross_build_link_options(unitTest)
+  add_subdirectory(unittests)
 endif()
 
 if(BUILD_PYTHON_BINDINGS)
