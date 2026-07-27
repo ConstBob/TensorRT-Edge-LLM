@@ -727,12 +727,35 @@ void TestRopePackedFusedNorm(
 
     // Host reference: RMSNorm (float accumulate, half rounding) then RoPE.
     auto rmsNormHead = [&](half const* src, std::vector<half> const& gamma) {
-        float sumSq = 0.f;
-        for (int32_t d = 0; d < headDim; ++d)
+        // Replicate the kernel's summation order (per-lane fmaf slices + butterfly
+        // combine) so sumSq is bit-equal — a flat sequential sum differs by ~1 ulp
+        // and can flip the pre-gamma half rounding past the test tolerance.
+        int32_t constexpr kVecSize = 8;
+        int32_t const lanes = headDim / kVecSize;
+        int32_t paddedLanes = 1;
+        while (paddedLanes < lanes)
         {
-            float const v = __half2float(src[d]);
-            sumSq += v * v;
+            paddedLanes <<= 1;
         }
+        std::vector<float> partial(paddedLanes, 0.f);
+        for (int32_t l = 0; l < lanes; ++l)
+        {
+            for (int32_t i = 0; i < kVecSize; ++i)
+            {
+                float const v = __half2float(src[l * kVecSize + i]);
+                partial[l] = std::fmaf(v, v, partial[l]);
+            }
+        }
+        for (int32_t off = paddedLanes / 2; off > 0; off >>= 1)
+        {
+            std::vector<float> combined(paddedLanes);
+            for (int32_t l = 0; l < paddedLanes; ++l)
+            {
+                combined[l] = partial[l] + partial[l ^ off];
+            }
+            partial = std::move(combined);
+        }
+        float const sumSq = partial[0];
         float const invRms = 1.f / std::sqrt(sumSq / static_cast<float>(headDim) + rmsEps);
         std::vector<half> normed(headDim);
         for (int32_t d = 0; d < headDim; ++d)
