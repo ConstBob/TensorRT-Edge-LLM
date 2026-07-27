@@ -254,48 +254,53 @@ TensorT makeShTensor(void const* data, int32_t totalSeqLen, int32_t numHeads, in
 }
 
 //! Launch an FMHA-v2 LLM variant over separate padded [B, S, H, D] Q/K/V.
-template <auto Wrapper>
-int32_t callFmhaV2Llm(WrapperArgT<0, decltype(Wrapper)>& module, FmhaV2LlmParams const& params)
+//! @tparam cuteDslKernelWrapper Generated CuTe DSL kernel wrapper function. Its signature supplies the module
+//! and tensor descriptor types at compile time.
+template <auto cuteDslKernelWrapper>
+int32_t callFmhaV2Llm(WrapperArgT<0, decltype(cuteDslKernelWrapper)>& module, FmhaV2LlmParams const& params)
 {
-    static_assert(WrapperArity<decltype(Wrapper)>::value == 14,
+    static_assert(WrapperArity<decltype(cuteDslKernelWrapper)>::value == 14,
         "callFmhaV2Llm: not an FMHA-v2 LLM wrapper (module, q_tensor, k_tensor, v_tensor, o_tensor, cum_seqlen_k, "
         "window_size_left, attention_scale, scale_q, scale_k, scale_v, inv_scale_o, sm_count, stream).");
 
-    auto qTensor = makeBshTensor<WrapperArgT<1, decltype(Wrapper)>>(
+    auto qTensor = makeBshTensor<WrapperArgT<1, decltype(cuteDslKernelWrapper)>>(
         params.qPtr, params.batchSize, params.seqLenQ, params.numQHeads, params.headDim);
-    auto kTensor = makeBshTensor<WrapperArgT<2, decltype(Wrapper)>>(
+    auto kTensor = makeBshTensor<WrapperArgT<2, decltype(cuteDslKernelWrapper)>>(
         params.kPtr, params.batchSize, params.kvSeqLen, params.numKVHeads, params.headDim);
-    auto vTensor = makeBshTensor<WrapperArgT<3, decltype(Wrapper)>>(
+    auto vTensor = makeBshTensor<WrapperArgT<3, decltype(cuteDslKernelWrapper)>>(
         params.vPtr, params.batchSize, params.kvSeqLen, params.numKVHeads, params.headDim);
-    auto oTensor = makeBshTensor<WrapperArgT<4, decltype(Wrapper)>>(
+    auto oTensor = makeBshTensor<WrapperArgT<4, decltype(cuteDslKernelWrapper)>>(
         params.oPtr, params.batchSize, params.seqLenQ, params.numQHeads, params.headDim);
-    auto cumSeqlenK = makeCuSeqLenTensor<WrapperArgT<5, decltype(Wrapper)>>(params.cuKVSeqLens, params.batchSize + 1);
+    auto cumSeqlenK
+        = makeCuSeqLenTensor<WrapperArgT<5, decltype(cuteDslKernelWrapper)>>(params.cuKVSeqLens, params.batchSize + 1);
 
-    return Wrapper(&module, &qTensor, &kTensor, &vTensor, &oTensor, &cumSeqlenK, params.windowSizeLeft,
+    return cuteDslKernelWrapper(&module, &qTensor, &kTensor, &vTensor, &oTensor, &cumSeqlenK, params.windowSizeLeft,
         params.attentionScale, params.scaleQ, params.scaleK, params.scaleV, params.invScaleO,
         getDeviceMultiProcessorCount(), params.stream);
 }
 
 //! Launch an FMHA-v2 ViT variant over packed varlen [total_S, H, D] Q/K/V.
-template <auto Wrapper>
-int32_t callFmhaV2Vit(WrapperArgT<0, decltype(Wrapper)>& module, FmhaV2VitParams const& params)
+//! @tparam cuteDslKernelWrapper Generated CuTe DSL kernel wrapper function. Its signature supplies the module
+//! and tensor descriptor types at compile time.
+template <auto cuteDslKernelWrapper>
+int32_t callFmhaV2Vit(WrapperArgT<0, decltype(cuteDslKernelWrapper)>& module, FmhaV2VitParams const& params)
 {
-    static_assert(WrapperArity<decltype(Wrapper)>::value == 12,
+    static_assert(WrapperArity<decltype(cuteDslKernelWrapper)>::value == 12,
         "callFmhaV2Vit: not an FMHA-v2 ViT wrapper (module, q_tensor, k_tensor, v_tensor, o_tensor, cu_seqlens, "
         "max_seqlen, scale_softmax_log2, scale_softmax, scale_output, sm_count, stream).");
 
-    auto qTensor = makeShTensor<WrapperArgT<1, decltype(Wrapper)>>(
+    auto qTensor = makeShTensor<WrapperArgT<1, decltype(cuteDslKernelWrapper)>>(
         params.qPtr, params.totalSeqLen, params.numQHeads, params.headDim);
-    auto kTensor = makeShTensor<WrapperArgT<2, decltype(Wrapper)>>(
+    auto kTensor = makeShTensor<WrapperArgT<2, decltype(cuteDslKernelWrapper)>>(
         params.kPtr, params.totalSeqLen, params.numKVHeads, params.headDim);
-    auto vTensor = makeShTensor<WrapperArgT<3, decltype(Wrapper)>>(
+    auto vTensor = makeShTensor<WrapperArgT<3, decltype(cuteDslKernelWrapper)>>(
         params.vPtr, params.totalSeqLen, params.numKVHeads, params.headDim);
-    auto oTensor = makeShTensor<WrapperArgT<4, decltype(Wrapper)>>(
+    auto oTensor = makeShTensor<WrapperArgT<4, decltype(cuteDslKernelWrapper)>>(
         params.oPtr, params.totalSeqLen, params.numQHeads, params.headDim);
     auto cuSeqlensTensor
-        = makeCuSeqLenTensor<WrapperArgT<5, decltype(Wrapper)>>(params.cuSeqLens, params.batchSize + 1);
+        = makeCuSeqLenTensor<WrapperArgT<5, decltype(cuteDslKernelWrapper)>>(params.cuSeqLens, params.batchSize + 1);
 
-    return Wrapper(&module, &qTensor, &kTensor, &vTensor, &oTensor, &cuSeqlensTensor, params.maxSeqLen,
+    return cuteDslKernelWrapper(&module, &qTensor, &kTensor, &vTensor, &oTensor, &cuSeqlensTensor, params.maxSeqLen,
         params.scaleSoftmaxLog2, params.attentionScale, params.scaleOutput, getDeviceMultiProcessorCount(),
         params.stream);
 }
