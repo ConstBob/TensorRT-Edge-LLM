@@ -21,7 +21,7 @@
 
 ## Overview
 
-TensorRT Edge-LLM is NVIDIA's high-performance C++ inference runtime for Large Language Models (LLMs) and Vision-Language Models (VLMs) on embedded platforms. It enables efficient deployment of state-of-the-art language models on resource-constrained devices such as NVIDIA Jetson, NVIDIA DRIVE, and NVIDIA DGX Spark platforms. TensorRT Edge-LLM provides convenient Python scripts to convert HuggingFace checkpoints to [ONNX](https://onnx.ai). Engine build and end-to-end inference runs entirely on Edge platforms.
+TensorRT Edge-LLM is NVIDIA's high-performance C++ inference runtime for Large Language Models (LLMs) and Vision-Language Models (VLMs) on embedded platforms. It enables efficient deployment of state-of-the-art language models on resource-constrained devices such as NVIDIA Jetson, NVIDIA DRIVE, and NVIDIA DGX Spark platforms. TensorRT Edge-LLM provides convenient Python scripts to convert HuggingFace checkpoints to [ONNX](https://onnx.ai), plus an experimental ONNX-less engine builder. Engine build and end-to-end inference runs entirely on Edge platforms.
 
 ---
 
@@ -38,6 +38,7 @@ For the supported platforms, models and precisions, see the [**Overview**](https
 - **[Overview](https://nvidia.github.io/TensorRT-Edge-LLM/latest/overview.html)** - What is TensorRT Edge-LLM and key features
 - **[Supported Models](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/supported-models.html)** - Complete model compatibility matrix
 - **[Checkpoint Exporter](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/software-design/checkpoint-export.html)** - Recommended ONNX export pipeline
+- **[Experimental ONNX-less Builder](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/software-design/onnxless-builder.html)** - Build TensorRT engines directly from checkpoints
 
 ### User Guide
 
