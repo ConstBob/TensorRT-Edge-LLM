@@ -27,7 +27,6 @@
 #include "kernels/speculative/mtpStateScatterKernels.h"
 
 #include <cstdlib>
-#include <cstring>
 #include <mma.h>
 
 namespace trt_edgellm
@@ -42,7 +41,7 @@ namespace
 constexpr int32_t kTILE_K{128};                            // head dim (dk = dv); also the h0 state edge (128x128)
 constexpr int32_t kN_MAX{kGDN_TREE_CHUNK_MAX_NODES};       // static tree-size cap: smem M/Attn tiles and the prep
                                                            // block are laid out [kN_MAX][...] so offsets/strides are
-                                                           // N-independent; larger trees fall back to checkpoint
+                                                           // N-independent
 constexpr int32_t kMASK_WORDS{kGDN_TREE_CHUNK_MASK_WORDS}; // uint32 words per ancestor bitmask (kN_MAX / 32)
 
 // Parallelization strategy.
@@ -774,12 +773,7 @@ __global__ void __launch_bounds__(kNUM_THREADS) treeReplayCommitBatchedKernel(Mt
 
 bool gdnTreeChunkVerifyEnabled(int32_t treeSize)
 {
-    // Env toggle, read once: default on; EDGELLM_GDN_TREE_IMPL=checkpoint opts out.
-    static bool const enabled = [] {
-        char const* env = std::getenv("EDGELLM_GDN_TREE_IMPL");
-        return env == nullptr || std::strcmp(env, "checkpoint") != 0;
-    }();
-    return enabled && treeSize <= kGDN_TREE_CHUNK_MAX_NODES;
+    return treeSize <= kGDN_TREE_CHUNK_MAX_NODES;
 }
 
 // Launch error tracer: logs which launch failed and returns the error so the

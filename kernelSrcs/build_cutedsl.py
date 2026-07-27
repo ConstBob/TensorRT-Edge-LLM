@@ -162,28 +162,6 @@ KERNEL_VARIANTS = [
         script="gdn_cutedsl/gdn_decode_mtp.py",
         script_args=["--export_only", "--cache_only"],
     ),
-    # DDTree decode: tree-parent speculative verification with per-node recurrent checkpoints.
-    KernelVariant(
-        name="gdn_decode_tree",
-        group="gdn",
-        supported_sms=[80, 86, 87, 89, 90, 100, 101, 110, 120, 121],
-        script="gdn_cutedsl/gdn_decode_tree.py",
-        script_args=["--export_only"],
-    ),
-    KernelVariant(
-        name="gdn_decode_tree_split_v",
-        group="gdn",
-        supported_sms=[80, 86, 87, 89, 90, 100, 101, 110, 120, 121],
-        script="gdn_cutedsl/gdn_decode_tree.py",
-        script_args=["--export_only", "--split_v"],
-    ),
-    KernelVariant(
-        name="gdn_decode_tree_split_v_precomputed",
-        group="gdn",
-        supported_sms=[80, 86, 87, 89, 90, 100, 101, 110, 120, 121],
-        script="gdn_cutedsl/gdn_decode_tree.py",
-        script_args=["--export_only", "--precomputed"],
-    ),
     # --- SSD group (Mamba2 SSM chunk scan) ---
     # --- SSD SM80 variants (D×N combinations) ---
     KernelVariant(
