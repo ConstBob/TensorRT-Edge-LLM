@@ -23,6 +23,8 @@
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
 #include "common/logger.h"
+#include "cuteDslFmhaParams.h"
+#include "cuteDslTensorDescriptors.h"
 
 #include <climits>
 #include <cmath>
@@ -259,55 +261,100 @@ CuteDslFMHARunner::CuteDslFMHARunner(
 {
 }
 
-// Macro shared by run() and runFp8() — sets up Q/KV/O/cumSeqlenK tensor structs
-// and calls the CuTe DSL wrapper. Relies on local variables: batchSize, seqLenQ,
-// numQHeads, numKVHeads, headDim, capacity, qPtr, kvPtr, oPtr, cuKVSeqLens,
-// attentionScale, scaleQ, scaleK, scaleV, invScaleO, ret.
-// clang-format off
-#define CALL_LLM_FMHA(PREFIX, MODULE, WSL)                                                                             \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        PREFIX##_Tensor_q_tensor_t qTensor{};                                                                          \
-        qTensor.data = const_cast<void*>(qPtr);                                                                        \
-        qTensor.dynamic_shapes[0] = batchSize;                                                                         \
-        qTensor.dynamic_shapes[1] = seqLenQ;                                                                           \
-        qTensor.dynamic_shapes[2] = numQHeads;                                                                         \
-        qTensor.dynamic_shapes[3] = headDim;                                                                           \
-        qTensor.dynamic_strides[0] = static_cast<int64_t>(seqLenQ) * numQHeads * headDim;                             \
-        qTensor.dynamic_strides[1] = static_cast<int64_t>(numQHeads) * headDim;                                       \
-        qTensor.dynamic_strides[2] = static_cast<int64_t>(headDim);                                                    \
-                                                                                                                       \
-        PREFIX##_Tensor_kv_cache_t kvTensor{};                                                                          \
-        kvTensor.data = const_cast<void*>(kvPtr);                                                                       \
-        kvTensor.dynamic_shapes[0] = batchSize;                                                                         \
-        kvTensor.dynamic_shapes[1] = 2;                                                                                 \
-        kvTensor.dynamic_shapes[2] = numKVHeads;                                                                        \
-        kvTensor.dynamic_shapes[3] = capacity;                                                                          \
-        kvTensor.dynamic_shapes[4] = headDim;                                                                           \
-        kvTensor.dynamic_strides[0] = static_cast<int64_t>(2) * numKVHeads * capacity * headDim;                       \
-        kvTensor.dynamic_strides[1] = static_cast<int64_t>(numKVHeads) * capacity * headDim;                           \
-        kvTensor.dynamic_strides[2] = static_cast<int64_t>(capacity) * headDim;                                        \
-        kvTensor.dynamic_strides[3] = static_cast<int64_t>(headDim);                                                    \
-                                                                                                                       \
-        PREFIX##_Tensor_o_tensor_t oTensor{};                                                                           \
-        oTensor.data = oPtr;                                                                                            \
-        oTensor.dynamic_shapes[0] = batchSize;                                                                          \
-        oTensor.dynamic_shapes[1] = seqLenQ;                                                                            \
-        oTensor.dynamic_shapes[2] = numQHeads;                                                                          \
-        oTensor.dynamic_shapes[3] = headDim;                                                                            \
-        oTensor.dynamic_strides[0] = static_cast<int64_t>(seqLenQ) * numQHeads * headDim;                              \
-        oTensor.dynamic_strides[1] = static_cast<int64_t>(numQHeads) * headDim;                                        \
-        oTensor.dynamic_strides[2] = static_cast<int64_t>(headDim);                                                     \
-                                                                                                                       \
-        PREFIX##_Tensor_cum_seqlen_k_t cumSeqlenK{};                                                                     \
-        cumSeqlenK.data = const_cast<void*>(static_cast<void const*>(cuKVSeqLens));                                     \
-        cumSeqlenK.dynamic_shapes[0] = batchSize + 1;                                                                   \
-                                                                                                                       \
-        ret = cute_dsl_##PREFIX##_wrapper(                                                                              \
-            &(MODULE), &qTensor, &kvTensor, &oTensor, &cumSeqlenK, (WSL), attentionScale,                               \
-            scaleQ, scaleK, scaleV, invScaleO, getDeviceMultiProcessorCount(), stream);                                 \
-    } while (0)
-// clang-format on
+namespace
+{
+
+using cutedsl::makeCuSeqLenTensor;
+using cutedsl::makePackedTensor;
+using cutedsl::makeStridedTensor;
+using cutedsl::WrapperArgT;
+using cutedsl::WrapperArity;
+
+//! Launch a dense (combined KV cache) LLM FMHA variant. The exported signature is
+//!   (module, q_tensor, kv_cache, o_tensor, cum_seqlen_k, window_size_left, attention_scale,
+//!    scale_q, scale_k, scale_v, inv_scale_o, sm_count, stream)
+//! @tparam cuteDslKernelWrapper Generated CuTe DSL kernel wrapper function. Its signature supplies the module
+//! and tensor descriptor types at compile time.
+template <auto cuteDslKernelWrapper>
+int32_t callLlmFmha(WrapperArgT<0, decltype(cuteDslKernelWrapper)>& module, LlmFmhaParams const& params)
+{
+    static_assert(WrapperArity<decltype(cuteDslKernelWrapper)>::value == 13,
+        "callLlmFmha: not a dense LLM FMHA wrapper (module, q_tensor, kv_cache, o_tensor, cum_seqlen_k, "
+        "window_size_left, attention_scale, scale_q, scale_k, scale_v, inv_scale_o, sm_count, stream).");
+
+    auto qTensor = makePackedTensor<WrapperArgT<1, decltype(cuteDslKernelWrapper)>>(
+        params.qPtr, {params.batchSize, params.seqLenQ, params.numQHeads, params.headDim});
+    auto kvTensor = makePackedTensor<WrapperArgT<2, decltype(cuteDslKernelWrapper)>>(
+        params.kvPtr, {params.batchSize, 2, params.numKVHeads, params.kvCacheCapacity, params.headDim});
+    auto oTensor = makePackedTensor<WrapperArgT<3, decltype(cuteDslKernelWrapper)>>(
+        params.oPtr, {params.batchSize, params.seqLenQ, params.numQHeads, params.headDim});
+    auto cumSeqlenK
+        = makeCuSeqLenTensor<WrapperArgT<4, decltype(cuteDslKernelWrapper)>>(params.cuKVSeqLens, params.batchSize + 1);
+
+    return cuteDslKernelWrapper(&module, &qTensor, &kvTensor, &oTensor, &cumSeqlenK, params.windowSizeLeft,
+        params.attentionScale, params.scaleQ, params.scaleK, params.scaleV, params.invScaleO,
+        getDeviceMultiProcessorCount(), params.stream);
+}
+
+//! Launch a paged LLM FMHA variant. The exported signature matches callLlmFmha() except that
+//! kv_cache is replaced by the (kv_cache_pool, kv_cache_page_list) pair.
+//! @tparam cuteDslKernelWrapper Generated CuTe DSL kernel wrapper function. Its signature supplies the module
+//! and tensor descriptor types at compile time.
+template <auto cuteDslKernelWrapper>
+int32_t callLlmFmhaPaged(WrapperArgT<0, decltype(cuteDslKernelWrapper)>& module, LlmFmhaPagedParams const& params)
+{
+    static_assert(WrapperArity<decltype(cuteDslKernelWrapper)>::value == 14,
+        "callLlmFmhaPaged: not a paged LLM FMHA wrapper (module, q_tensor, kv_cache_pool, kv_cache_page_list, "
+        "o_tensor, cum_seqlen_k, window_size_left, attention_scale, scale_q, scale_k, scale_v, inv_scale_o, sm_count, "
+        "stream).");
+
+    auto qTensor = makePackedTensor<WrapperArgT<1, decltype(cuteDslKernelWrapper)>>(
+        params.qPtr, {params.batchSize, params.seqLenQ, params.numQHeads, params.headDim});
+
+    // The physical paged KV pool layout is fixed to NHD [numPages, tokensPerPage, H_kv, D]. CuTe DSL still
+    // receives logical shape [numPages, H_kv, tokensPerPage, D], and the permutation lives in these strides,
+    // so this is the one descriptor here that is not packed row-major.
+    auto kvPoolTensor = makeStridedTensor<WrapperArgT<2, decltype(cuteDslKernelWrapper)>>(params.pagedKVPoolPtr,
+        {params.numPages, params.numKVHeads, params.tokensPerPage, params.headDim},
+        {static_cast<int64_t>(params.numKVHeads) * params.tokensPerPage * params.headDim,
+            static_cast<int64_t>(params.headDim), static_cast<int64_t>(params.numKVHeads) * params.headDim});
+
+    auto pageListTensor = makePackedTensor<WrapperArgT<3, decltype(cuteDslKernelWrapper)>>(
+        params.kvCachePageList, {params.batchSize, 2, params.maxPagesPerSeq});
+    auto oTensor = makePackedTensor<WrapperArgT<4, decltype(cuteDslKernelWrapper)>>(
+        params.oPtr, {params.batchSize, params.seqLenQ, params.numQHeads, params.headDim});
+    auto cumSeqlenK
+        = makeCuSeqLenTensor<WrapperArgT<5, decltype(cuteDslKernelWrapper)>>(params.cuKVSeqLens, params.batchSize + 1);
+
+    return cuteDslKernelWrapper(&module, &qTensor, &kvPoolTensor, &pageListTensor, &oTensor, &cumSeqlenK,
+        params.windowSizeLeft, params.attentionScale, params.scaleQ, params.scaleK, params.scaleV, params.invScaleO,
+        getDeviceMultiProcessorCount(), params.stream);
+}
+
+//! Launch a ViT FMHA variant over packed varlen [total_S, H, D] Q/K/V.
+//! @tparam cuteDslKernelWrapper Generated CuTe DSL kernel wrapper function. Its signature supplies the module
+//! and tensor descriptor types at compile time.
+template <auto cuteDslKernelWrapper>
+int32_t callVitFmha(WrapperArgT<0, decltype(cuteDslKernelWrapper)>& module, VitFmhaParams const& params)
+{
+    static_assert(WrapperArity<decltype(cuteDslKernelWrapper)>::value == 12,
+        "callVitFmha: not a ViT FMHA wrapper (module, q_tensor, k_tensor, v_tensor, o_tensor, cu_seqlens, "
+        "max_seqlen, scale_softmax_log2, scale_softmax, scale_output, sm_count, stream).");
+
+    int32_t const shape[] = {params.totalSeqLen, params.numHeads, params.headDim};
+    auto qTensor = makePackedTensor<WrapperArgT<1, decltype(cuteDslKernelWrapper)>>(params.qPtr, shape);
+    auto kTensor = makePackedTensor<WrapperArgT<2, decltype(cuteDslKernelWrapper)>>(params.kPtr, shape);
+    auto vTensor = makePackedTensor<WrapperArgT<3, decltype(cuteDslKernelWrapper)>>(params.vPtr, shape);
+    auto oTensor = makePackedTensor<WrapperArgT<4, decltype(cuteDslKernelWrapper)>>(params.oPtr, shape);
+    auto cuSeqlensTensor
+        = makeCuSeqLenTensor<WrapperArgT<5, decltype(cuteDslKernelWrapper)>>(params.cuSeqLens, params.batchSize + 1);
+
+    return cuteDslKernelWrapper(&module, &qTensor, &kTensor, &vTensor, &oTensor, &cuSeqlensTensor, params.maxSeqLen,
+        params.scaleSoftmaxLog2, params.attentionScale, params.scaleOutput, getDeviceMultiProcessorCount(),
+        params.stream);
+}
+
+} // namespace
 
 // =====================================================================
 // LLM run: batched Q + combined KV cache (FP16 / FP8→FP16 / FP8→FP8)
@@ -324,37 +371,31 @@ void CuteDslFMHARunner::run(void const* qPtr, void const* kvPtr, void* oPtr, int
     }
 
     validateAttentionScale(attentionScale);
-    float const scaleQ = qScale;
-    float const scaleK = kScale;
-    float const scaleV = vScale;
-    float const invScaleO = 1.0f;
 
-    int32_t const batchSize = mBatchSize;
-    int32_t const seqLenQ = mSeqLenQ;
-    int32_t const numQHeads = mNumHeadsQ;
-    int32_t const numKVHeads = mNumHeadsK;
     int32_t const headDim = mHeadDim;
-    int32_t const capacity = mKVCacheCapacity;
-
     bool const useSlidingWindow = (slidingWindowSize < INT_MAX);
+    int32_t constexpr kNoLimit = 1 << 30;
+
+    LlmFmhaParams params{};
+    params.qPtr = qPtr;
+    params.kvPtr = kvPtr;
+    params.oPtr = oPtr;
+    params.cuKVSeqLens = cuKVSeqLens;
+    params.batchSize = mBatchSize;
+    params.seqLenQ = mSeqLenQ;
+    params.numQHeads = mNumHeadsQ;
+    params.numKVHeads = mNumHeadsK;
+    params.headDim = headDim;
+    params.kvCacheCapacity = mKVCacheCapacity;
+    params.windowSizeLeft = useSlidingWindow ? slidingWindowSize : kNoLimit;
+    params.attentionScale = attentionScale;
+    params.scaleQ = qScale;
+    params.scaleK = kScale;
+    params.scaleV = vScale;
+    params.invScaleO = 1.0F;
+    params.stream = stream;
 
     int32_t ret = -1;
-    int32_t constexpr kNoLimit = 1 << 30;
-    int32_t const windowSizeLeft = useSlidingWindow ? slidingWindowSize : kNoLimit;
-
-// Dispatch helper: selects the kernel module pair (non-SW / SW) for a given head dim.
-#define DISPATCH_HEADD(D, NO_SW_PREFIX, NO_SW_MOD, SW_PREFIX, SW_MOD)                                                  \
-    if (headDim == D)                                                                                                  \
-    {                                                                                                                  \
-        if (useSlidingWindow)                                                                                          \
-        {                                                                                                              \
-            CALL_LLM_FMHA(SW_PREFIX, SW_MOD, windowSizeLeft);                                                          \
-        }                                                                                                              \
-        else                                                                                                           \
-        {                                                                                                              \
-            CALL_LLM_FMHA(NO_SW_PREFIX, NO_SW_MOD, windowSizeLeft);                                                    \
-        }                                                                                                              \
-    }
 
     if (enableSkipSoftmax)
     {
@@ -364,50 +405,57 @@ void CuteDslFMHARunner::run(void const* qPtr, void const* kvPtr, void* oPtr, int
                 fp8Input ? "true" : "false", useSlidingWindow ? "true" : "false");
             return;
         }
-        if (headDim == 64)
+        switch (headDim)
         {
-            CALL_LLM_FMHA(fmha_d64_skipsoftmax, sLLM_d64_skipsoftmax, windowSizeLeft);
-        }
-        else if (headDim == 128)
-        {
-            CALL_LLM_FMHA(fmha_d128_skipsoftmax, sLLM_d128_skipsoftmax, windowSizeLeft);
-        }
-        else
-        {
-            LOG_ERROR("CuTe DSL LLM FMHA: unsupported head_dim=%d", headDim);
-            return;
+        case 64: ret = callLlmFmha<cute_dsl_fmha_d64_skipsoftmax_wrapper>(sLLM_d64_skipsoftmax, params); break;
+        case 128: ret = callLlmFmha<cute_dsl_fmha_d128_skipsoftmax_wrapper>(sLLM_d128_skipsoftmax, params); break;
+        default: LOG_ERROR("CuTe DSL LLM FMHA: unsupported head_dim=%d", headDim); return;
         }
     }
     else if (fp8Input)
     {
-        DISPATCH_HEADD(64, fmha_d64_fp8, sLLM_d64_fp8, fmha_d64_sw_fp8, sLLM_d64_sw_fp8)
-        else DISPATCH_HEADD(128, fmha_d128_fp8, sLLM_d128_fp8, fmha_d128_sw_fp8, sLLM_d128_sw_fp8) else DISPATCH_HEADD(
-            256, fmha_d256_fp8, sLLM_d256_fp8, fmha_d256_sw_fp8, sLLM_d256_sw_fp8) else
+        switch (headDim)
         {
-            LOG_ERROR("CuTe DSL LLM FMHA: unsupported head_dim=%d", headDim);
-            return;
+        case 64:
+            ret = useSlidingWindow ? callLlmFmha<cute_dsl_fmha_d64_sw_fp8_wrapper>(sLLM_d64_sw_fp8, params)
+                                   : callLlmFmha<cute_dsl_fmha_d64_fp8_wrapper>(sLLM_d64_fp8, params);
+            break;
+        case 128:
+            ret = useSlidingWindow ? callLlmFmha<cute_dsl_fmha_d128_sw_fp8_wrapper>(sLLM_d128_sw_fp8, params)
+                                   : callLlmFmha<cute_dsl_fmha_d128_fp8_wrapper>(sLLM_d128_fp8, params);
+            break;
+        case 256:
+            ret = useSlidingWindow ? callLlmFmha<cute_dsl_fmha_d256_sw_fp8_wrapper>(sLLM_d256_sw_fp8, params)
+                                   : callLlmFmha<cute_dsl_fmha_d256_fp8_wrapper>(sLLM_d256_fp8, params);
+            break;
+        default: LOG_ERROR("CuTe DSL LLM FMHA: unsupported head_dim=%d", headDim); return;
         }
     }
     else
     {
-        DISPATCH_HEADD(64, fmha_d64, sLLM_d64, fmha_d64_sw, sLLM_d64_sw)
-        else DISPATCH_HEADD(128, fmha_d128, sLLM_d128, fmha_d128_sw, sLLM_d128_sw) else DISPATCH_HEADD(
-            256, fmha_d256, sLLM_d256, fmha_d256_sw, sLLM_d256_sw) else
+        switch (headDim)
         {
-            LOG_ERROR("CuTe DSL LLM FMHA: unsupported head_dim=%d", headDim);
-            return;
+        case 64:
+            ret = useSlidingWindow ? callLlmFmha<cute_dsl_fmha_d64_sw_wrapper>(sLLM_d64_sw, params)
+                                   : callLlmFmha<cute_dsl_fmha_d64_wrapper>(sLLM_d64, params);
+            break;
+        case 128:
+            ret = useSlidingWindow ? callLlmFmha<cute_dsl_fmha_d128_sw_wrapper>(sLLM_d128_sw, params)
+                                   : callLlmFmha<cute_dsl_fmha_d128_wrapper>(sLLM_d128, params);
+            break;
+        case 256:
+            ret = useSlidingWindow ? callLlmFmha<cute_dsl_fmha_d256_sw_wrapper>(sLLM_d256_sw, params)
+                                   : callLlmFmha<cute_dsl_fmha_d256_wrapper>(sLLM_d256, params);
+            break;
+        default: LOG_ERROR("CuTe DSL LLM FMHA: unsupported head_dim=%d", headDim); return;
         }
     }
-
-#undef DISPATCH_HEADD
 
     if (ret != 0)
     {
         LOG_ERROR("CuTe DSL LLM FMHA kernel (d=%d, sw=%s, fp8in=%s) failed with error code: %d", headDim,
             useSlidingWindow ? "true" : "false", fp8Input ? "true" : "false", ret);
     }
-
-#undef CALL_LLM_FMHA
 }
 
 void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, int32_t const* kvCachePageList,
@@ -443,141 +491,100 @@ void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, i
     check::check(isCausal || mHeadDim == 256 || mHeadDim == 512,
         "CuTe DSL dense non-causal paged FMHA currently supports head_dim=256 or 512 only.");
 
-    float const scaleQ = qScale;
-    float const scaleK = kScale;
-    float const scaleV = vScale;
-    float const invScaleO = 1.0f;
-
-    int32_t const batchSize = mBatchSize;
-    int32_t const seqLenQ = mSeqLenQ;
-    int32_t const numQHeads = mNumHeadsQ;
-    int32_t const numKVHeads = mNumHeadsK;
     int32_t const headDim = mHeadDim;
     bool const useSlidingWindow = (slidingWindowSize < INT_MAX);
+    int32_t constexpr kNoLimit = 1 << 30;
+
+    LlmFmhaPagedParams params{};
+    params.qPtr = qPtr;
+    params.pagedKVPoolPtr = pagedKVPoolPtr;
+    params.kvCachePageList = kvCachePageList;
+    params.oPtr = oPtr;
+    params.cuKVSeqLens = cuKVSeqLens;
+    params.batchSize = mBatchSize;
+    params.seqLenQ = mSeqLenQ;
+    params.numQHeads = mNumHeadsQ;
+    params.numKVHeads = mNumHeadsK;
+    params.headDim = headDim;
+    params.numPages = numPages;
+    params.maxPagesPerSeq = maxPagesPerSeq;
+    params.tokensPerPage = tokensPerPage;
+    params.windowSizeLeft = useSlidingWindow ? slidingWindowSize : kNoLimit;
+    params.attentionScale = attentionScale;
+    params.scaleQ = qScale;
+    params.scaleK = kScale;
+    params.scaleV = vScale;
+    params.invScaleO = 1.0F;
+    params.stream = stream;
 
     int32_t ret = -1;
-    int32_t constexpr kNoLimit = 1 << 30;
-    int32_t const windowSizeLeft = useSlidingWindow ? slidingWindowSize : kNoLimit;
-
-    // The physical paged KV pool layout is fixed to NHD [numPages, tokensPerPage, H_kv, D].
-    // CuTe DSL still receives logical shape [numPages, H_kv, tokensPerPage, D], mapped through strides below.
-    // clang-format off
-#define CALL_LLM_FMHA_PAGED(PREFIX, MODULE, WSL)                                                                       \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        PREFIX##_Tensor_q_tensor_t qTensor{};                                                                          \
-        qTensor.data = const_cast<void*>(qPtr);                                                                        \
-        qTensor.dynamic_shapes[0] = batchSize;                                                                         \
-        qTensor.dynamic_shapes[1] = seqLenQ;                                                                           \
-        qTensor.dynamic_shapes[2] = numQHeads;                                                                         \
-        qTensor.dynamic_shapes[3] = headDim;                                                                           \
-        qTensor.dynamic_strides[0] = static_cast<int64_t>(seqLenQ) * numQHeads * headDim;                             \
-        qTensor.dynamic_strides[1] = static_cast<int64_t>(numQHeads) * headDim;                                       \
-        qTensor.dynamic_strides[2] = static_cast<int64_t>(headDim);                                                    \
-                                                                                                                       \
-        PREFIX##_Tensor_kv_cache_pool_t kvPoolTensor{};                                                                \
-        kvPoolTensor.data = const_cast<void*>(pagedKVPoolPtr);                                                         \
-        kvPoolTensor.dynamic_shapes[0] = numPages;                                                                     \
-        kvPoolTensor.dynamic_shapes[1] = numKVHeads;                                                                   \
-        kvPoolTensor.dynamic_shapes[2] = tokensPerPage;                                                                \
-        kvPoolTensor.dynamic_shapes[3] = headDim;                                                                      \
-        kvPoolTensor.dynamic_strides[0] = static_cast<int64_t>(numKVHeads) * tokensPerPage * headDim;                  \
-        kvPoolTensor.dynamic_strides[1] = static_cast<int64_t>(headDim);                                                \
-        kvPoolTensor.dynamic_strides[2] = static_cast<int64_t>(numKVHeads) * headDim;                                  \
-                                                                                                                       \
-        PREFIX##_Tensor_kv_cache_page_list_t pageListTensor{};                                                         \
-        pageListTensor.data = const_cast<int32_t*>(kvCachePageList);                                                   \
-        pageListTensor.dynamic_shapes[0] = batchSize;                                                                  \
-        pageListTensor.dynamic_shapes[1] = 2;                                                                          \
-        pageListTensor.dynamic_shapes[2] = maxPagesPerSeq;                                                             \
-        pageListTensor.dynamic_strides[0] = static_cast<int64_t>(2) * maxPagesPerSeq;                                  \
-        pageListTensor.dynamic_strides[1] = static_cast<int64_t>(maxPagesPerSeq);                                      \
-                                                                                                                       \
-        PREFIX##_Tensor_o_tensor_t oTensor{};                                                                          \
-        oTensor.data = oPtr;                                                                                           \
-        oTensor.dynamic_shapes[0] = batchSize;                                                                         \
-        oTensor.dynamic_shapes[1] = seqLenQ;                                                                           \
-        oTensor.dynamic_shapes[2] = numQHeads;                                                                         \
-        oTensor.dynamic_shapes[3] = headDim;                                                                           \
-        oTensor.dynamic_strides[0] = static_cast<int64_t>(seqLenQ) * numQHeads * headDim;                             \
-        oTensor.dynamic_strides[1] = static_cast<int64_t>(numQHeads) * headDim;                                       \
-        oTensor.dynamic_strides[2] = static_cast<int64_t>(headDim);                                                    \
-                                                                                                                       \
-        PREFIX##_Tensor_cum_seqlen_k_t cumSeqlenK{};                                                                   \
-        cumSeqlenK.data = const_cast<void*>(static_cast<void const*>(cuKVSeqLens));                                    \
-        cumSeqlenK.dynamic_shapes[0] = batchSize + 1;                                                                  \
-                                                                                                                       \
-        ret = cute_dsl_##PREFIX##_wrapper(&(MODULE), &qTensor, &kvPoolTensor, &pageListTensor, &oTensor, &cumSeqlenK,  \
-            (WSL), attentionScale, scaleQ, scaleK, scaleV, invScaleO, getDeviceMultiProcessorCount(), stream);                         \
-    } while (0)
-
-    // clang-format on
-
-#define DISPATCH_PAGED_HEADD(D, NO_SW_PREFIX, NO_SW_MOD, SW_PREFIX, SW_MOD)                                            \
-    if (headDim == D)                                                                                                  \
-    {                                                                                                                  \
-        if (useSlidingWindow)                                                                                          \
-        {                                                                                                              \
-            CALL_LLM_FMHA_PAGED(SW_PREFIX, SW_MOD, windowSizeLeft);                                                    \
-        }                                                                                                              \
-        else                                                                                                           \
-        {                                                                                                              \
-            CALL_LLM_FMHA_PAGED(NO_SW_PREFIX, NO_SW_MOD, windowSizeLeft);                                              \
-        }                                                                                                              \
-    }
 
     if (!isCausal)
     {
+        // The check::check above already narrowed the dense non-causal path to head_dim 256 or 512.
         if (fp8Input)
         {
-            if (mHeadDim == 256)
-            {
-                CALL_LLM_FMHA_PAGED(fmha_d256_dense_paged_fp8, sLLM_d256_dense_paged_fp8, windowSizeLeft);
-            }
-            else
-            {
-                CALL_LLM_FMHA_PAGED(fmha_d512_dense_paged_fp8, sLLM_d512_dense_paged_fp8, windowSizeLeft);
-            }
+            ret = headDim == 256
+                ? callLlmFmhaPaged<cute_dsl_fmha_d256_dense_paged_fp8_wrapper>(sLLM_d256_dense_paged_fp8, params)
+                : callLlmFmhaPaged<cute_dsl_fmha_d512_dense_paged_fp8_wrapper>(sLLM_d512_dense_paged_fp8, params);
         }
         else
         {
-            if (mHeadDim == 256)
-            {
-                CALL_LLM_FMHA_PAGED(fmha_d256_dense_paged, sLLM_d256_dense_paged, windowSizeLeft);
-            }
-            else
-            {
-                CALL_LLM_FMHA_PAGED(fmha_d512_dense_paged, sLLM_d512_dense_paged, windowSizeLeft);
-            }
+            ret = headDim == 256
+                ? callLlmFmhaPaged<cute_dsl_fmha_d256_dense_paged_wrapper>(sLLM_d256_dense_paged, params)
+                : callLlmFmhaPaged<cute_dsl_fmha_d512_dense_paged_wrapper>(sLLM_d512_dense_paged, params);
         }
     }
     else if (fp8Input)
     {
-        DISPATCH_PAGED_HEADD(64, fmha_d64_paged_fp8, sLLM_d64_paged_fp8, fmha_d64_sw_paged_fp8, sLLM_d64_sw_paged_fp8)
-        else DISPATCH_PAGED_HEADD(128, fmha_d128_paged_fp8, sLLM_d128_paged_fp8, fmha_d128_sw_paged_fp8,
-            sLLM_d128_sw_paged_fp8) else DISPATCH_PAGED_HEADD(256, fmha_d256_paged_fp8, sLLM_d256_paged_fp8,
-            fmha_d256_sw_paged_fp8, sLLM_d256_sw_paged_fp8) else DISPATCH_PAGED_HEADD(512, fmha_d512_paged_fp8,
-            sLLM_d512_paged_fp8, fmha_d512_sw_paged_fp8, sLLM_d512_sw_paged_fp8) else
+        switch (headDim)
         {
-            LOG_ERROR("CuTe DSL paged LLM FMHA: unsupported head_dim=%d", headDim);
-            return;
+        case 64:
+            ret = useSlidingWindow
+                ? callLlmFmhaPaged<cute_dsl_fmha_d64_sw_paged_fp8_wrapper>(sLLM_d64_sw_paged_fp8, params)
+                : callLlmFmhaPaged<cute_dsl_fmha_d64_paged_fp8_wrapper>(sLLM_d64_paged_fp8, params);
+            break;
+        case 128:
+            ret = useSlidingWindow
+                ? callLlmFmhaPaged<cute_dsl_fmha_d128_sw_paged_fp8_wrapper>(sLLM_d128_sw_paged_fp8, params)
+                : callLlmFmhaPaged<cute_dsl_fmha_d128_paged_fp8_wrapper>(sLLM_d128_paged_fp8, params);
+            break;
+        case 256:
+            ret = useSlidingWindow
+                ? callLlmFmhaPaged<cute_dsl_fmha_d256_sw_paged_fp8_wrapper>(sLLM_d256_sw_paged_fp8, params)
+                : callLlmFmhaPaged<cute_dsl_fmha_d256_paged_fp8_wrapper>(sLLM_d256_paged_fp8, params);
+            break;
+        case 512:
+            ret = useSlidingWindow
+                ? callLlmFmhaPaged<cute_dsl_fmha_d512_sw_paged_fp8_wrapper>(sLLM_d512_sw_paged_fp8, params)
+                : callLlmFmhaPaged<cute_dsl_fmha_d512_paged_fp8_wrapper>(sLLM_d512_paged_fp8, params);
+            break;
+        default: LOG_ERROR("CuTe DSL paged LLM FMHA: unsupported head_dim=%d", headDim); return;
         }
     }
     else
     {
-        DISPATCH_PAGED_HEADD(64, fmha_d64_paged, sLLM_d64_paged, fmha_d64_sw_paged, sLLM_d64_sw_paged)
-        else DISPATCH_PAGED_HEADD(128, fmha_d128_paged, sLLM_d128_paged, fmha_d128_sw_paged,
-            sLLM_d128_sw_paged) else DISPATCH_PAGED_HEADD(256, fmha_d256_paged, sLLM_d256_paged, fmha_d256_sw_paged,
-            sLLM_d256_sw_paged) else DISPATCH_PAGED_HEADD(512, fmha_d512_paged, sLLM_d512_paged, fmha_d512_sw_paged,
-            sLLM_d512_sw_paged) else
+        switch (headDim)
         {
-            LOG_ERROR("CuTe DSL paged LLM FMHA: unsupported head_dim=%d", headDim);
-            return;
+        case 64:
+            ret = useSlidingWindow ? callLlmFmhaPaged<cute_dsl_fmha_d64_sw_paged_wrapper>(sLLM_d64_sw_paged, params)
+                                   : callLlmFmhaPaged<cute_dsl_fmha_d64_paged_wrapper>(sLLM_d64_paged, params);
+            break;
+        case 128:
+            ret = useSlidingWindow ? callLlmFmhaPaged<cute_dsl_fmha_d128_sw_paged_wrapper>(sLLM_d128_sw_paged, params)
+                                   : callLlmFmhaPaged<cute_dsl_fmha_d128_paged_wrapper>(sLLM_d128_paged, params);
+            break;
+        case 256:
+            ret = useSlidingWindow ? callLlmFmhaPaged<cute_dsl_fmha_d256_sw_paged_wrapper>(sLLM_d256_sw_paged, params)
+                                   : callLlmFmhaPaged<cute_dsl_fmha_d256_paged_wrapper>(sLLM_d256_paged, params);
+            break;
+        case 512:
+            ret = useSlidingWindow ? callLlmFmhaPaged<cute_dsl_fmha_d512_sw_paged_wrapper>(sLLM_d512_sw_paged, params)
+                                   : callLlmFmhaPaged<cute_dsl_fmha_d512_paged_wrapper>(sLLM_d512_paged, params);
+            break;
+        default: LOG_ERROR("CuTe DSL paged LLM FMHA: unsupported head_dim=%d", headDim); return;
         }
     }
-
-#undef DISPATCH_PAGED_HEADD
-#undef CALL_LLM_FMHA_PAGED
 
     if (ret != 0)
     {
@@ -601,83 +608,35 @@ void CuteDslFMHARunner::run(void const* qPtr, void const* kPtr, void const* vPtr
     }
 
     validateAttentionScale(attentionScale);
-    float const scaleSoftmaxLog2 = attentionScale * static_cast<float>(M_LOG2E);
-    float const scaleOutput = 1.0F;
 
-    int32_t const numHeads = mNumHeadsQ;
     int32_t const headDim = mHeadDim;
 
-    // clang-format off
-#define CALL_VIT_FMHA(PREFIX, MODULE)                                                                                  \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        PREFIX##_Tensor_q_tensor_t qTensor{};                                                                          \
-        qTensor.data = const_cast<void*>(qPtr);                                                                        \
-        qTensor.dynamic_shapes[0] = totalSeqLen;                                                                       \
-        qTensor.dynamic_shapes[1] = numHeads;                                                                          \
-        qTensor.dynamic_shapes[2] = headDim;                                                                           \
-        qTensor.dynamic_strides[0] = static_cast<int64_t>(numHeads) * headDim;                                        \
-        qTensor.dynamic_strides[1] = static_cast<int64_t>(headDim);                                                    \
-                                                                                                                       \
-        PREFIX##_Tensor_k_tensor_t kTensor{};                                                                           \
-        kTensor.data = const_cast<void*>(kPtr);                                                                         \
-        kTensor.dynamic_shapes[0] = totalSeqLen;                                                                        \
-        kTensor.dynamic_shapes[1] = numHeads;                                                                           \
-        kTensor.dynamic_shapes[2] = headDim;                                                                            \
-        kTensor.dynamic_strides[0] = static_cast<int64_t>(numHeads) * headDim;                                         \
-        kTensor.dynamic_strides[1] = static_cast<int64_t>(headDim);                                                     \
-                                                                                                                       \
-        PREFIX##_Tensor_v_tensor_t vTensor{};                                                                           \
-        vTensor.data = const_cast<void*>(vPtr);                                                                         \
-        vTensor.dynamic_shapes[0] = totalSeqLen;                                                                        \
-        vTensor.dynamic_shapes[1] = numHeads;                                                                           \
-        vTensor.dynamic_shapes[2] = headDim;                                                                            \
-        vTensor.dynamic_strides[0] = static_cast<int64_t>(numHeads) * headDim;                                         \
-        vTensor.dynamic_strides[1] = static_cast<int64_t>(headDim);                                                     \
-                                                                                                                       \
-        PREFIX##_Tensor_o_tensor_t oTensor{};                                                                           \
-        oTensor.data = oPtr;                                                                                            \
-        oTensor.dynamic_shapes[0] = totalSeqLen;                                                                        \
-        oTensor.dynamic_shapes[1] = numHeads;                                                                           \
-        oTensor.dynamic_shapes[2] = headDim;                                                                            \
-        oTensor.dynamic_strides[0] = static_cast<int64_t>(numHeads) * headDim;                                         \
-        oTensor.dynamic_strides[1] = static_cast<int64_t>(headDim);                                                     \
-                                                                                                                       \
-        PREFIX##_Tensor_cu_seqlens_t cuSeqlensTensor{};                                                                 \
-        cuSeqlensTensor.data = const_cast<void*>(static_cast<void const*>(cuSeqLens));                                  \
-        cuSeqlensTensor.dynamic_shapes[0] = batchSize + 1;                                                              \
-                                                                                                                       \
-        ret = cute_dsl_##PREFIX##_wrapper(                                                                              \
-            &(MODULE), &qTensor, &kTensor, &vTensor, &oTensor, &cuSeqlensTensor, maxSeqLen,                            \
-            scaleSoftmaxLog2, attentionScale, scaleOutput, getDeviceMultiProcessorCount(), stream);                       \
-    } while (0)
-    // clang-format on
+    VitFmhaParams params{};
+    params.qPtr = qPtr;
+    params.kPtr = kPtr;
+    params.vPtr = vPtr;
+    params.oPtr = oPtr;
+    params.cuSeqLens = cuSeqLens;
+    params.totalSeqLen = totalSeqLen;
+    params.numHeads = mNumHeadsQ;
+    params.headDim = headDim;
+    params.maxSeqLen = maxSeqLen;
+    params.batchSize = batchSize;
+    params.scaleSoftmaxLog2 = attentionScale * static_cast<float>(M_LOG2E);
+    params.attentionScale = attentionScale;
+    params.scaleOutput = 1.0F;
+    params.stream = stream;
 
     int32_t ret = -1;
 
-    if (headDim == 64)
+    switch (headDim)
     {
-        CALL_VIT_FMHA(vit_fmha_d64, sViT_d64);
+    case 64: ret = callVitFmha<cute_dsl_vit_fmha_d64_wrapper>(sViT_d64, params); break;
+    case 72: ret = callVitFmha<cute_dsl_vit_fmha_d72_wrapper>(sViT_d72, params); break;
+    case 80: ret = callVitFmha<cute_dsl_vit_fmha_d80_wrapper>(sViT_d80, params); break;
+    case 128: ret = callVitFmha<cute_dsl_vit_fmha_d128_wrapper>(sViT_d128, params); break;
+    default: LOG_ERROR("CuTe DSL ViT FMHA: unsupported head_dim=%d", headDim); return;
     }
-    else if (headDim == 72)
-    {
-        CALL_VIT_FMHA(vit_fmha_d72, sViT_d72);
-    }
-    else if (headDim == 80)
-    {
-        CALL_VIT_FMHA(vit_fmha_d80, sViT_d80);
-    }
-    else if (headDim == 128)
-    {
-        CALL_VIT_FMHA(vit_fmha_d128, sViT_d128);
-    }
-    else
-    {
-        LOG_ERROR("CuTe DSL ViT FMHA: unsupported head_dim=%d", headDim);
-        return;
-    }
-
-#undef CALL_VIT_FMHA
 
     if (ret != 0)
     {
