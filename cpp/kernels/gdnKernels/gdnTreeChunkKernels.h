@@ -17,25 +17,19 @@
 
 #pragma once
 
-// Stateless chunk-form GDN tree verify + replay commit (the default DDTree
-// implementation; EDGELLM_GDN_TREE_IMPL=checkpoint opts back into the
-// checkpoint path).
-//
-// Unlike the checkpoint-based DDTree decode path (gdn_decode_tree), verify
-// computes all tree-node outputs directly from the pre-tree state h0
-// (read-only, no per-node state materialization) in "chunk/attention form";
-// after acceptance, a replay kernel advances the persistent state along the
-// accepted path only, consuming per-node quantities stashed during verify.
+// Stateless chunk-form GDN tree verify + replay commit. Verify computes all
+// tree-node outputs directly from the pre-tree state h0 (read-only, no per-node
+// state materialization) in "chunk/attention form"; after acceptance, a replay
+// kernel advances the persistent state along the accepted path only, consuming
+// per-node quantities stashed during verify.
 //
 // The stash is written into the head of each layer's intermediate-states
-// buffer (already allocated/plumbed for the checkpoint path) so this path
-// needs no new persistent allocations. Layout per (batch, node):
+// buffer, so this path needs no new persistent allocations. Layout per (batch, node):
 //   [ kNorm fp32 h*128 | g fp32 hv | beta fp32 hv | v fp16 hv*128 ]
 // densely packed, gdnTreeStashNodeBytes() apart — ~128x smaller than the
 // [N, hv, 128, 128] fp32 checkpoint buffer it replaces.
 //
-// Limits: dk = dv = 128, verify-tree size N <= 64, accepted path <= 16;
-// oversized trees fall back to the checkpoint kernel.
+// Limits: dk = dv = 128, verify-tree size N <= 64, accepted path <= 16.
 
 #include <cstdint>
 #include <cuda_fp16.h>
@@ -53,13 +47,11 @@ constexpr int32_t kGDN_TREE_CHUNK_MASK_WORDS{kGDN_TREE_CHUNK_MAX_NODES / 32};
 constexpr int32_t kGDN_TREE_CHUNK_MAX_ACCEPT{16};
 
 //! Single source of truth for "is the stateless chunk-form verify used for a
-//! tree of this size?" — the env toggle (default on; EDGELLM_GDN_TREE_IMPL=
-//! checkpoint opts out, read once) AND the size fallback (oversized trees run
-//! the checkpoint kernel). The plugin verify dispatch and the decoder commit
-//! path MUST both gate on this: if they disagreed, one side would write a
-//! replay stash while the other read per-node checkpoints (or vice versa),
-//! silently corrupting the committed recurrent state. Callers add their own
-//! context guards (plugin: DDTree verify phase; decoder: hybrid-state commit).
+//! tree of this size?" The plugin verify dispatch and the decoder commit path
+//! MUST both gate on this: if they disagreed, one side could skip replay while
+//! the other expects replay stash, silently corrupting the committed recurrent
+//! state. Callers add their own context guards (plugin: DDTree verify phase;
+//! decoder: hybrid-state commit).
 bool gdnTreeChunkVerifyEnabled(int32_t treeSize);
 
 //! Per-(batch, hv-head) prep block exported by the verify prep kernel for the

@@ -867,25 +867,12 @@ void DFlashDecoder::commitAcceptedTreePath(
     cacheMgrBase.commitSequenceLength(mAcceptLength, context.stream);
     if (hasHybridStates)
     {
-        // The chunk-form verify (default) is stateless and writes a replay
-        // stash instead of per-node checkpoints, so recurrent states commit by
-        // replaying the accepted path; conv states still scatter. This gates on
-        // the SAME predicate as the plugin's verify dispatch
-        // (gdnTreeChunkVerifyEnabled: env toggle + oversized-tree fallback) —
-        // they must agree, or one side would write a replay stash while the
-        // other reads per-node checkpoints, corrupting the committed state.
-        if (kernel::gdnTreeChunkVerifyEnabled(verifySize))
-        {
-            // Chunk-form verify is stateless: recurrent states commit by replaying the
-            // accepted path; conv states scatter. Must use the same predicate as the plugin.
-            mambaMgr.replayCommitAcceptedTreeStates(mAcceptedTokenIndices, mAcceptLength, context.stream);
-        }
-        else
-        {
-            // DDTree base verify materializes one hybrid state checkpoint per verify node.
-            // Commit only the last accepted node's recurrent/conv states to persistent caches.
-            mambaMgr.scatterAcceptedTreeStates(mAcceptedTokenIndices, mAcceptLength, context.stream);
-        }
+        check::check(kernel::gdnTreeChunkVerifyEnabled(verifySize),
+            "DDTree GDN chunk-form verify supports at most kGDN_TREE_CHUNK_MAX_NODES verify nodes");
+        // Chunk-form verify is stateless: recurrent states commit by replaying
+        // the accepted path; conv states scatter. Must use the same predicate
+        // as the plugin.
+        mambaMgr.replayCommitAcceptedTreeStates(mAcceptedTokenIndices, mAcceptLength, context.stream);
     }
 
     check::check(

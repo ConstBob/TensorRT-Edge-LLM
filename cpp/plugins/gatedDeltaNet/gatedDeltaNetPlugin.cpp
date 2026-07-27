@@ -373,18 +373,11 @@ size_t GatedDeltaNetPlugin::getWorkspaceSize([[maybe_unused]] DynamicPluginTenso
     {
         int32_t const maxN = static_cast<int32_t>(inputs[kIN_Q_IDX].max.d[0]);
         int32_t const maxSeqLen = static_cast<int32_t>(inputs[kIN_Q_IDX].max.d[1]);
-        int32_t const maxH = static_cast<int32_t>(inputs[kIN_Q_IDX].max.d[2]);
-        int32_t const maxHv = static_cast<int32_t>(inputs[kIN_V_IDX].max.d[2]);
 
-        size_t const qkScaleBytes = alignTensorSize(static_cast<size_t>(maxN) * maxSeqLen * maxH * 2U * sizeof(float));
-        size_t const gateValueBytes
-            = alignTensorSize(static_cast<size_t>(maxN) * maxSeqLen * maxHv * 2U * sizeof(float));
-        total = std::max(total, qkScaleBytes + gateValueBytes);
-
-        // Chunk-form verify (the default impl): ancestor masks
-        // only. The KS/QS + prep scratch lives in the intermediate-states
-        // row tail, NOT here — engine plans serialize this size at build
-        // time, so growing it silently overflows on pre-existing engines.
+        // Chunk-form verify uses ancestor masks. The KS/QS + prep scratch
+        // lives in the intermediate-states row tail, NOT here — engine plans
+        // serialize this size at build time, so growing it silently overflows
+        // on pre-existing engines.
         int32_t const chunkNodes = std::min(maxSeqLen, kernel::kGDN_TREE_CHUNK_MAX_NODES);
         size_t const maskBytes = alignTensorSize(
             static_cast<size_t>(maxN) * chunkNodes * kernel::kGDN_TREE_CHUNK_MASK_WORDS * sizeof(uint32_t));
@@ -478,13 +471,16 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
         cudaMemcpyAsync(h0Out, inputs[kIN_H0_SOURCE_IDX], h0Bytes, cudaMemcpyDeviceToDevice, stream);
     }
 
-    // Stateless chunk-form tree verify (the default; gdnTreeChunkVerifyEnabled
-    // encapsulates the env toggle + the oversized-tree fallback, and the
-    // decoder commit path gates on the same predicate). Reads h0 strictly
-    // read-only, writes o + a small replay stash into the head of the
-    // intermediate_states buffer (whose checkpoint contents are then unused;
-    // commit switches to replay in the decoder).
-    if (ddtreeActive && kernel::gdnTreeChunkVerifyEnabled(seq_len))
+    if (ddtreeActive && !kernel::gdnTreeChunkVerifyEnabled(seq_len))
+    {
+        LOG_ERROR("gated_delta_net: DDTree chunk-form verify supports seq_len <= %d, got %d",
+            kernel::kGDN_TREE_CHUNK_MAX_NODES, seq_len);
+        return -1;
+    }
+
+    // Stateless chunk-form tree verify. Reads h0 strictly read-only and writes
+    // o plus replay stash into the head of the intermediate_states buffer.
+    if (ddtreeActive)
     {
         // Workspace: ancestor masks only (reserved by getWorkspaceSize when
         // mUseDDTree). The KS/QS + prep scratch lives in the row tail of the
@@ -499,8 +495,8 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
             return -1;
         }
 
-        // Per-batch stash stride == one checkpoint row of the intermediate
-        // buffer, so batches land in disjoint, engine-compatible regions.
+        // Per-batch stash stride == one intermediate buffer row, so batches
+        // land in disjoint, engine-compatible regions.
         size_t const stashBatchStrideBytes
             = static_cast<size_t>(seq_len) * hv * static_cast<size_t>(k_dim) * v_dim * sizeof(float);
         // Standard scaled dot-product attention scale for the chunk-form verify kernel.
@@ -539,21 +535,7 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
     params.v_dim = v_dim;
     params.smVersion = mSMVersion;
 
-    if (ddtreeActive)
-    {
-        params.use_ddtree = true;
-        params.tree_parent_ids = const_cast<void*>(inputs[kIN_TREE_PARENT_IDS_IDX]);
-        params.tree_depths = const_cast<void*>(inputs[kIN_TREE_DEPTHS_IDX]);
-        params.intermediate_states = outputs[kOUT_INTERMEDIATE_STATES_IDX];
-        if (workspace != nullptr)
-        {
-            size_t const qkScaleBytes = alignTensorSize(static_cast<size_t>(n) * seq_len * h * 2U * sizeof(float));
-            char* workspaceBase = static_cast<char*>(workspace);
-            params.ddtree_qk_scales = workspaceBase;
-            params.ddtree_gate_values = workspaceBase + qkScaleBytes;
-        }
-    }
-    else if (mtpActive)
+    if (mtpActive)
     {
         // MTP decode: process all seq_len draft tokens with per-step state caching.
         params.use_mtp = true;

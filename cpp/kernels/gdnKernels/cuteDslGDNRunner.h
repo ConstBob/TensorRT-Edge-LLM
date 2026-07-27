@@ -62,13 +62,6 @@ struct GDNParams
                                  ///<   Must be non-null when use_mtp == true.
     bool use_mtp{false};         ///< true → MTP decode path (any seq_len).
 
-    // DDTree decode fields — used only when use_ddtree == true.
-    void* tree_parent_ids{};    ///< [N, seq_len] int32 — parent node index per verify token.
-    void* tree_depths{};        ///< [N, seq_len] int32 — depth per verify token.
-    bool use_ddtree{false};     ///< true → DDTree decode path; never falls back to linear MTP.
-    void* ddtree_qk_scales{};   ///< [N, seq_len, H, 2] FP32 — split-v precomputed q/k scales.
-    void* ddtree_gate_values{}; ///< [N, seq_len, HV, 2] FP32 — split-v precomputed g/beta.
-
     int32_t n{};
     int32_t seq_len{};
     int32_t h{};
@@ -81,7 +74,6 @@ struct GDNParams
 /** Loads AOT .o, fills tensor structs from GDNParams, calls generated wrapper.
  *
  *  Dispatch table (evaluated in order):
- *    use_ddtree == true           → runDecodeTree()      (DDTree: parent/depth-driven tree state)
  *    use_mtp == true              → runDecodeMTP()       (MTP: any seq_len)
  *    seq_len == 1                 → runDecode()          (single-token decode)
  *    seq_len > 1 && SM >= 100     → runPrefillBlackwell() (Blackwell prefill)
@@ -106,11 +98,7 @@ public:
     /** Run GDN kernel. See class-level dispatch table. */
     int run(GDNParams const& params, cudaStream_t stream);
 
-    /** Run DDTree decode with parent/depth-driven recurrent state checkpoints. */
-    int runDecodeTree(GDNParams const& params, cudaStream_t stream);
-
 private:
-    int runDecodeTreeSplitVPrecomputed(GDNParams const& params, cudaStream_t stream);
     int runDecode(GDNParams const& params, cudaStream_t stream);
     int runPrefill(GDNParams const& params, cudaStream_t stream);
     int runPrefillBlackwell(GDNParams const& params, cudaStream_t stream);
@@ -122,7 +110,6 @@ private:
     static gdn_prefill_blackwell_Kernel_Module_t sBlackwellPrefillModule;
 #endif
     static gdn_decode_mtp_cache_Kernel_Module_t sMTPDecodeCacheModule;
-    static gdn_decode_tree_split_v_precomputed_Kernel_Module_t sDecodeTreeSplitVPrecomputedModule;
     static bool sLoaded;
 };
 
