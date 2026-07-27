@@ -247,7 +247,7 @@ MTP is a speculative decoding method that proposes a linear chain of draft token
 
 TensorRT Edge-LLM supports two MTP checkpoint layouts:
 
-- **Single-checkpoint MTP:** Qwen3.5 dense checkpoints with `num_draft_layers > 0` carry the MTP draft weights inside the base checkpoint. Export with `--mtp`.
+- **Single-checkpoint MTP:** Qwen3.5 checkpoints with `num_draft_layers > 0` carry the MTP draft weights inside the base checkpoint. Export with `--mtp`.
 - **Paired-assistant MTP:** Gemma4 uses a base checkpoint plus a matched assistant checkpoint. Export with `--mtp --mtp-draft-dir <assistant_checkpoint>`. Do not mix assistant checkpoints across Gemma4 model sizes or families.
 
 ---

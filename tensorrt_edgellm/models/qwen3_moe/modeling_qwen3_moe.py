@@ -64,12 +64,13 @@ from typing import List, Tuple
 import torch
 import torch.nn as nn
 
-from ...config import QUANT_NVFP4, ModelConfig
+from ...config import QUANT_FP16, QUANT_NVFP4, ModelConfig
 from ..default.modeling_default import (MLP, Attention, OnnxSpec, RMSNorm,
                                         _make_flat_wrapper)
 from ..linear import FP16Linear, make_linear
-from ..ops import (KV_PAGE_SIZE, int4_moe_plugin, nvfp4_moe_plugin,
-                   nvfp4_moe_plugin_geforce, use_geforce_nvfp4_moe)
+from ..ops import (KV_PAGE_SIZE, fp16_moe_plugin, int4_moe_plugin,
+                   nvfp4_moe_plugin, nvfp4_moe_plugin_geforce,
+                   use_geforce_nvfp4_moe)
 
 logger = logging.getLogger(__name__)
 
@@ -213,7 +214,7 @@ class Qwen3SparseMoeBlock(nn.Module):
         experts.*     -> Qwen3MoEExperts (per-expert modules for loading)
     """
 
-    def __init__(self, config: ModelConfig) -> None:
+    def __init__(self, config: ModelConfig, module_prefix: str = "") -> None:
         super().__init__()
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
@@ -222,15 +223,15 @@ class Qwen3SparseMoeBlock(nn.Module):
         self.group_size = config.quant.group_size
         self.zero_point_offset = config.quant.gptq_zero_point_offset
         self._use_nvfp4_moe = config.quant.quant_type == QUANT_NVFP4
-        # ``activation_type`` integer is plugin-specific — ints carry
-        # different meanings between Int4MoePlugin (SiLU=0) and
-        # Nvfp4MoePlugin (SwiGLU=2). The per-path constants above
-        # document each mapping; see the corresponding C++ plugin headers
-        # for the source of truth.
-        if not self._use_nvfp4_moe:
-            self.activation_type = _INT4_ACTIVATION_SILU
-        else:
+        self._use_fp16_moe = config.quant.quant_type == QUANT_FP16
+        # All paths compute the same SwiGLU expert FFN; the integer is just
+        # each plugin's own enum for it. Int4MoePlugin names the elementwise
+        # activation ("SiLU"=0), Nvfp4MoePlugin/Fp16MoePlugin name the fused
+        # pattern ("SwiGLU"=2). See the C++ plugin headers.
+        if self._use_nvfp4_moe or self._use_fp16_moe:
             self.activation_type = _NVFP4_ACTIVATION_SWIGLU
+        else:
+            self.activation_type = _INT4_ACTIVATION_SILU
         # Plugin attributes consumed by ``Nvfp4MoePlugin``.
         self.backend = _NVFP4_MOE_BACKEND_AUTO
         self.io_dtype = _NVFP4_MOE_IO_DTYPE_FP16
@@ -250,22 +251,24 @@ class Qwen3SparseMoeBlock(nn.Module):
         shared_inter = config.moe_shared_expert_intermediate_size
         self._has_shared_expert = shared_inter > 0
         if self._has_shared_expert:
+            # Quant lookup keys are layer-prefixed ("layers.0.mlp.shared_expert.*").
+            prefix = module_prefix + "." if module_prefix else ""
             self.shared_expert = nn.Module()
             self.shared_expert.gate_proj = make_linear(
                 config,
                 self.hidden_size,
                 shared_inter,
-                module_name="shared_expert.gate_proj")
+                module_name=f"{prefix}shared_expert.gate_proj")
             self.shared_expert.up_proj = make_linear(
                 config,
                 self.hidden_size,
                 shared_inter,
-                module_name="shared_expert.up_proj")
+                module_name=f"{prefix}shared_expert.up_proj")
             self.shared_expert.down_proj = make_linear(
                 config,
                 shared_inter,
                 self.hidden_size,
-                module_name="shared_expert.down_proj")
+                module_name=f"{prefix}shared_expert.down_proj")
             self.shared_expert_gate = nn.Linear(self.hidden_size,
                                                 1,
                                                 bias=False,
@@ -278,6 +281,9 @@ class Qwen3SparseMoeBlock(nn.Module):
         regular GPTQ repacking.  After extraction, per-expert ``qweight``
         buffers are set to ``None`` so ``_repack_gptq_weights`` skips them.
         """
+        if self._use_fp16_moe:
+            self._prepare_fp16_moe_weights()
+            return
         if self._use_nvfp4_moe:
             self._prepare_nvfp4_moe_weights()
             return
@@ -352,6 +358,60 @@ class Qwen3SparseMoeBlock(nn.Module):
         # Discard per-expert modules — weights are now in the stacked Marlin
         # buffers above.  This also prevents _repack_gptq_weights from seeing
         # the (now-consumed) per-expert qweight buffers.
+        self.experts = nn.ModuleList()
+
+    def _prepare_fp16_moe_weights(self) -> None:
+        """Stack unquantized experts into ``Fp16MoePlugin`` FP16 buffers.
+
+        FC1 uses the same 64-row up/gate interleave as the SM100/101/110
+        ``Nvfp4MoePlugin`` split kernel (see
+        kernelSrcs/f16_moe_cutedsl/README.md, "Fixed plugin contract"):
+        ``[up0:64, gate0:64, up64:128, gate64:128, ...]`` along FC1_N.
+        """
+        self.gate_linear = nn.Linear(self.hidden_size,
+                                     self.num_experts,
+                                     bias=False,
+                                     dtype=torch.float16)
+        self.gate_linear.weight.data = self.gate.weight.data
+
+        inter = self.moe_intermediate_size
+        chunk_rows = 64
+        if inter % chunk_rows != 0:
+            raise ValueError(
+                f"moe_inter_size ({inter}) must be a multiple of {chunk_rows} "
+                "for the Fp16MoePlugin SwiGLU FC1 layout")
+        n_chunks = inter // chunk_rows
+
+        fc1_list = []
+        fc2_list = []
+        for expert in self.experts:
+            gate_w = expert.gate_proj.weight.data.to(torch.float16)
+            up_w = expert.up_proj.weight.data.to(torch.float16)
+            down_w = expert.down_proj.weight.data.to(torch.float16)
+            up_chunks = up_w.reshape(n_chunks, chunk_rows, self.hidden_size)
+            gate_chunks = gate_w.reshape(n_chunks, chunk_rows,
+                                         self.hidden_size)
+            fc1_list.append(
+                torch.stack([up_chunks, gate_chunks],
+                            dim=1).reshape(2 * inter, self.hidden_size))
+            fc2_list.append(down_w)
+
+        device = self.gate.weight.device
+        self.register_buffer(
+            "fc1_weights",
+            torch.stack(fc1_list, dim=0).to(device).contiguous())
+        self.register_buffer(
+            "fc2_weights",
+            torch.stack(fc2_list, dim=0).to(device).contiguous())
+
+        logger.info(
+            "Fp16MoePlugin-packed %d Qwen3 experts (64-row interleave): "
+            "fc1 %s, fc2 %s",
+            self.num_experts,
+            list(self.fc1_weights.shape),
+            list(self.fc2_weights.shape),
+        )
+
         self.experts = nn.ModuleList()
 
     def _prepare_nvfp4_moe_weights(self) -> None:
@@ -448,6 +508,23 @@ class Qwen3SparseMoeBlock(nn.Module):
         batch, seq_len, hidden_dim = hidden_states.shape
         hidden_flat = hidden_states.reshape(-1, hidden_dim)
         router_logits = self.gate_linear(hidden_flat).float()
+        if self._use_fp16_moe:
+            routed = fp16_moe_plugin(
+                router_logits,
+                hidden_states,
+                self.fc1_weights,
+                self.fc2_weights,
+                self.num_experts,
+                self.top_k,
+                self.hidden_size,
+                self.moe_intermediate_size,
+                self.activation_type,
+                1,
+                self.max_routed_rows,
+            )
+            if self._has_shared_expert:
+                routed = routed + self._shared_expert_forward(hidden_states)
+            return routed
         if self._use_nvfp4_moe:
             moe_op = (nvfp4_moe_plugin_geforce
                       if use_geforce_nvfp4_moe() else nvfp4_moe_plugin)
@@ -519,7 +596,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.self_attn = Attention(config, layer_idx=layer_idx)
         if _is_moe_layer(config, layer_idx):
-            self.mlp = Qwen3SparseMoeBlock(config)
+            self.mlp = Qwen3SparseMoeBlock(
+                config, module_prefix=f"layers.{layer_idx}.mlp")
         else:
             self.mlp = MLP(config)
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)

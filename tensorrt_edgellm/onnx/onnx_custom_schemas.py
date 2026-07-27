@@ -1314,6 +1314,46 @@ _nvfp4_moe_plugin_schema = OpSchema(
 )
 
 # ---------------------------------------------------------------------------
+# trt_edgellm::Fp16MoePlugin (unquantized experts, CuTeDSL grouped GEMM)
+# ---------------------------------------------------------------------------
+
+_fp16_moe_plugin_schema = OpSchema(
+    name="Fp16MoePlugin",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc=("FP16 MoE plugin (CuTeDSL grouped GEMM): FP16 hidden states and "
+         "plain FP16 expert weights with 64-row up/gate interleaved FC1. "
+         "No quantization scales."),
+    inputs=[
+        OpSchema.FormalParameter("router_logits", "T_ROUTER",
+                                 "Router logits [B*S, E] FP32"),
+        OpSchema.FormalParameter("hidden_states", "T_HIDDEN",
+                                 "Hidden states [B, S, H] FP16"),
+        OpSchema.FormalParameter("fc1_weights", "T_HIDDEN",
+                                 "FC1 weights [E, N1, H] FP16"),
+        OpSchema.FormalParameter("fc2_weights", "T_HIDDEN",
+                                 "FC2 weights [E, H, I] FP16"),
+    ],
+    outputs=[
+        OpSchema.FormalParameter("output", "T_HIDDEN",
+                                 "Output [B, S, H] FP16"),
+    ],
+    type_constraints=[
+        ("T_ROUTER", ["tensor(float)"], "FP32 tensors"),
+        ("T_HIDDEN", ["tensor(float16)"], "FP16 tensors"),
+    ],
+    attributes=[
+        OpSchema.Attribute("num_experts", OpSchema.AttrType.INT),
+        OpSchema.Attribute("top_k", OpSchema.AttrType.INT),
+        OpSchema.Attribute("hidden_size", OpSchema.AttrType.INT),
+        OpSchema.Attribute("moe_inter_size", OpSchema.AttrType.INT),
+        OpSchema.Attribute("activation_type", OpSchema.AttrType.INT),
+        OpSchema.Attribute("norm_topk_prob", OpSchema.AttrType.INT),
+        OpSchema.Attribute("max_routed_rows", OpSchema.AttrType.INT),
+    ],
+)
+
+# ---------------------------------------------------------------------------
 # trt_edgellm::NvFP4MoEPluginGeforce (SM12x fused, plain [up, gate] concat)
 # ---------------------------------------------------------------------------
 
@@ -1608,6 +1648,7 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _int4_moe_plugin_schema,
     _nvfp4_moe_plugin_schema,
     _nvfp4_moe_plugin_geforce_schema,
+    _fp16_moe_plugin_schema,
     _fused_nvfp4_gemm_allreduce_plugin_schema,
     _dflash_target_kv_cache_update_schema,
     _gemma4_audio_attention_plugin_schema,

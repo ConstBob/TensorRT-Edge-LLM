@@ -59,6 +59,7 @@ _QWEN3_5_MTP_BASE_MODEL_TYPES = frozenset({
 })
 _QWEN3_5_MTP_DRAFT_MODEL_TYPES = frozenset({
     "qwen3_5_text",
+    "qwen3_5_moe_text",
 })
 
 
@@ -344,17 +345,30 @@ class AutoModel:
             # TODO: support other model types
             if not _is_qwen3_5_mtp_draft_supported(config.model_type):
                 raise NotImplementedError(
-                    "MTP draft is only supported for qwen3_5_text checkpoints; "
-                    f"got {config.model_type!r}.")
-            from .models.qwen3_5 import Qwen3_5MtpDraftModel
+                    "MTP draft is only supported for Qwen3.5 text/MoE "
+                    f"checkpoints; got {config.model_type!r}.")
+            is_moe = config.model_type == "qwen3_5_moe_text"
             tie_word_embeddings = config.tie_word_embeddings
             config = make_mtp_draft_config(config)
-            model_class = Qwen3_5MtpDraftModel
+            if is_moe:
+                from .models.qwen3_5_moe import Qwen3_5MoeMtpDraftModel
+                model_class = Qwen3_5MoeMtpDraftModel
+            else:
+                from .models.qwen3_5 import Qwen3_5MtpDraftModel
+                model_class = Qwen3_5MtpDraftModel
             if key_remap is None:
+                # Only borrow the base model's lm_head when the checkpoint
+                # ships no dedicated ``mtp.lm_head.*`` tensors.
+                from .checkpoint.loader import iter_checkpoint_keys
+                share_base_lm_head = not any(
+                    key.startswith("mtp.lm_head.")
+                    for key in iter_checkpoint_keys(model_dir))
 
                 def key_remap(key):
                     return _mtp_key_remap(
-                        key, tie_word_embeddings=tie_word_embeddings)
+                        key,
+                        tie_word_embeddings=tie_word_embeddings,
+                        share_base_lm_head=share_base_lm_head)
 
         elif variant == "dflash_draft":
             if dflash_draft_dir is None:
@@ -900,17 +914,21 @@ def _dspark_key_remap(key: str) -> "str | None":
     return key
 
 
-def _mtp_key_remap(key: str, *, tie_word_embeddings: bool) -> "str | None":
+def _mtp_key_remap(key: str,
+                   *,
+                   tie_word_embeddings: bool,
+                   share_base_lm_head: bool = False) -> "str | None":
     """Remap MTP checkpoint keys for the draft model.
 
-    The embedding table is only a valid LM-head fallback when the source
-    checkpoint ties word embeddings.
+    ``share_base_lm_head`` sources the draft head from the base model
+    (``lm_head.*`` tensors, or the embedding table when tied); enable it only
+    when the checkpoint has no ``mtp.lm_head.*`` of its own.
     """
     if key.startswith("mtp."):
         return key[len("mtp."):]
-    if key == "lm_head.weight":
+    if share_base_lm_head and key.startswith("lm_head."):
         return key
-    if tie_word_embeddings and key in (
+    if share_base_lm_head and tie_word_embeddings and key in (
             "model.embed_tokens.weight",
             "model.language_model.embed_tokens.weight"):
         return "lm_head.weight"
