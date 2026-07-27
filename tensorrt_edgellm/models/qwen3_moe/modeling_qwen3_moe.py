@@ -218,6 +218,7 @@ class Qwen3SparseMoeBlock(nn.Module):
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
         self.moe_intermediate_size = config.moe_intermediate_size
+        self._padded_moe_intermediate_size = self.moe_intermediate_size
         self.hidden_size = config.hidden_size
         self.group_size = config.quant.group_size
         self.zero_point_offset = config.quant.gptq_zero_point_offset
@@ -369,7 +370,10 @@ class Qwen3SparseMoeBlock(nn.Module):
         * SM12x ``NvFP4MoEPluginGeforce`` -- plain ``[up_all, gate_all]``
           concat along the M axis.
         """
-        from ...checkpoint.repacking import repack_nvfp4_qwen3_moe_experts
+        from ...checkpoint.repacking import (
+            NVFP4_MOE_INTERLEAVE_SIZE_ALIGNMENT,
+            NVFP4_MOE_INTERMEDIATE_SIZE_ALIGNMENT,
+            repack_nvfp4_gated_moe_experts)
 
         self.gate_linear = nn.Linear(self.hidden_size,
                                      self.num_experts,
@@ -377,13 +381,20 @@ class Qwen3SparseMoeBlock(nn.Module):
                                      dtype=torch.float16)
         self.gate_linear.weight.data = self.gate.weight.data
 
-        fc1_layout = "concat" if use_geforce_nvfp4_moe() else "interleave"
+        use_geforce_plugin = use_geforce_nvfp4_moe()
+        fc1_layout = "concat" if use_geforce_plugin else "interleave"
+        moe_inter_size_alignment = (NVFP4_MOE_INTERMEDIATE_SIZE_ALIGNMENT
+                                    if use_geforce_plugin else
+                                    NVFP4_MOE_INTERLEAVE_SIZE_ALIGNMENT)
         fc1_qweights, fc1_blocks_scale, fc2_qweights, fc2_blocks_scale = (
-            repack_nvfp4_qwen3_moe_experts(self.experts,
-                                           self.hidden_size,
-                                           self.moe_intermediate_size,
-                                           self.group_size,
-                                           fc1_layout=fc1_layout))
+            repack_nvfp4_gated_moe_experts(
+                self.experts,
+                self.hidden_size,
+                self.moe_intermediate_size,
+                self.group_size,
+                fc1_layout=fc1_layout,
+                moe_inter_size_alignment=moe_inter_size_alignment))
+        self._padded_moe_intermediate_size = int(fc2_qweights.shape[-1]) * 2
 
         device = self.gate.weight.device
         self.register_buffer("fc1_qweights",
@@ -466,7 +477,7 @@ class Qwen3SparseMoeBlock(nn.Module):
                 self.num_experts,
                 self.top_k,
                 self.hidden_size,
-                self.moe_intermediate_size,
+                self._padded_moe_intermediate_size,
                 self.activation_type,
                 _NVFP4_MOE_N_GROUP_FLAT,
                 _NVFP4_MOE_TOPK_GROUP_FLAT,

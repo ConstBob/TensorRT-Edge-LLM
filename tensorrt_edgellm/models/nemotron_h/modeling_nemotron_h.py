@@ -536,7 +536,7 @@ class NemotronHMoEMLP(nn.Module):
 
     def _prepare_for_export_impl(self) -> None:
         """Pack ModelOpt NVFP4 expert tensors for the active NVFP4 MoE plugin."""
-        from ...checkpoint.repacking import repack_nvfp4_nemotron_moe_experts
+        from ...checkpoint.repacking import repack_nvfp4_moe_experts
 
         # SM12x NvFP4MoEPluginGeforce requires H % 256 == 0; the SM100/101/110 path only needs
         # the kernel's regular alignment (the repack helper accepts H as-is
@@ -545,7 +545,7 @@ class NemotronHMoEMLP(nn.Module):
 
         (fc1_qweights, fc1_blocks_scale, fc1_alpha, fc2_qweights,
          fc2_blocks_scale, fc2_alpha, padded_inter_size,
-         padded_hidden_size) = (repack_nvfp4_nemotron_moe_experts(
+         padded_hidden_size) = (repack_nvfp4_moe_experts(
              self.experts,
              self.routed_hidden_size,
              self.moe_intermediate_size,

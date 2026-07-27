@@ -34,12 +34,17 @@ from ..models.ops import int4_gemm_plugin_version
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "NVFP4_MOE_INTERLEAVE_SIZE_ALIGNMENT",
+    "NVFP4_MOE_INTERMEDIATE_SIZE_ALIGNMENT",
     "repack_awq_to_plugin",
     "repack_gptq_to_plugin",
     "decode_modelopt_nvfp4",
-    "repack_nvfp4_qwen3_moe_experts",
-    "repack_nvfp4_nemotron_moe_experts",
+    "repack_nvfp4_gated_moe_experts",
+    "repack_nvfp4_moe_experts",
 ]
+
+NVFP4_MOE_INTERLEAVE_SIZE_ALIGNMENT = 64
+NVFP4_MOE_INTERMEDIATE_SIZE_ALIGNMENT = 128
 
 # ---------------------------------------------------------------------------
 # AWQ weight swizzle
@@ -908,7 +913,7 @@ def _pack_nvfp4_moe_weight(
             torch.from_numpy(blocks_scale.copy()))
 
 
-def _interleave_qwen3_swiglu_fc1(
+def _interleave_gated_moe_fc1(
     gate_dense: np.ndarray,
     up_dense: np.ndarray,
     hidden_size: int,
@@ -929,21 +934,23 @@ def _interleave_qwen3_swiglu_fc1(
         raise ValueError(
             f"gate/up dense shape {gate_dense.shape} != {expected_shape}")
 
-    swiglu_interleave_rows = 64
-    if moe_inter_size % swiglu_interleave_rows != 0:
+    if moe_inter_size % NVFP4_MOE_INTERLEAVE_SIZE_ALIGNMENT != 0:
         raise ValueError(
             f"moe_inter_size ({moe_inter_size}) must be a multiple of "
-            f"{swiglu_interleave_rows} for SwiGLU FC1 layout")
+            f"{NVFP4_MOE_INTERLEAVE_SIZE_ALIGNMENT} for the interleaved gated "
+            "FC1 layout")
 
-    n_chunks = moe_inter_size // swiglu_interleave_rows
-    up_chunks = up_dense.reshape(n_chunks, swiglu_interleave_rows, hidden_size)
-    gate_chunks = gate_dense.reshape(n_chunks, swiglu_interleave_rows,
+    n_chunks = moe_inter_size // NVFP4_MOE_INTERLEAVE_SIZE_ALIGNMENT
+    up_chunks = up_dense.reshape(n_chunks, NVFP4_MOE_INTERLEAVE_SIZE_ALIGNMENT,
+                                 hidden_size)
+    gate_chunks = gate_dense.reshape(n_chunks,
+                                     NVFP4_MOE_INTERLEAVE_SIZE_ALIGNMENT,
                                      hidden_size)
     return np.stack([up_chunks, gate_chunks],
                     axis=1).reshape(2 * moe_inter_size, hidden_size)
 
 
-def _concat_qwen3_swiglu_fc1(
+def _concat_gated_moe_fc1(
     gate_dense: np.ndarray,
     up_dense: np.ndarray,
     hidden_size: int,
@@ -963,18 +970,62 @@ def _concat_qwen3_swiglu_fc1(
     if gate_dense.shape != expected_shape:
         raise ValueError(
             f"gate/up dense shape {gate_dense.shape} != {expected_shape}")
+    if moe_inter_size % NVFP4_MOE_INTERMEDIATE_SIZE_ALIGNMENT != 0:
+        raise ValueError(
+            f"moe_inter_size ({moe_inter_size}) must be a multiple of "
+            f"{NVFP4_MOE_INTERMEDIATE_SIZE_ALIGNMENT} for the concatenated "
+            "gated FC1 layout")
     return np.concatenate([up_dense, gate_dense],
                           axis=0).reshape(2 * moe_inter_size, hidden_size)
 
 
-def repack_nvfp4_qwen3_moe_experts(
+def _pad_nvfp4_gated_moe_dense_weights(
+    gate_dense: np.ndarray,
+    up_dense: np.ndarray,
+    down_dense: np.ndarray,
+    hidden_size: int,
+    moe_inter_size: int,
+    padded_moe_inter_size: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Zero-pad gated MoE dense weights along the intermediate dimension."""
+    if gate_dense.shape != up_dense.shape:
+        raise ValueError(
+            f"gate dense shape {gate_dense.shape} != up dense shape "
+            f"{up_dense.shape}")
+    if gate_dense.shape != (moe_inter_size, hidden_size):
+        raise ValueError(f"gate/up dense shape {gate_dense.shape} != "
+                         f"({moe_inter_size}, {hidden_size})")
+    if down_dense.shape != (hidden_size, moe_inter_size):
+        raise ValueError(f"down dense shape {down_dense.shape} != "
+                         f"({hidden_size}, {moe_inter_size})")
+    if padded_moe_inter_size < moe_inter_size:
+        raise ValueError(
+            f"padded_moe_inter_size ({padded_moe_inter_size}) must be >= "
+            f"moe_inter_size ({moe_inter_size})")
+    if padded_moe_inter_size == moe_inter_size:
+        return gate_dense, up_dense, down_dense
+
+    padded_gate_dense = np.zeros((padded_moe_inter_size, hidden_size),
+                                 dtype=gate_dense.dtype)
+    padded_up_dense = np.zeros((padded_moe_inter_size, hidden_size),
+                               dtype=up_dense.dtype)
+    padded_down_dense = np.zeros((hidden_size, padded_moe_inter_size),
+                                 dtype=down_dense.dtype)
+    padded_gate_dense[:moe_inter_size] = gate_dense
+    padded_up_dense[:moe_inter_size] = up_dense
+    padded_down_dense[:, :moe_inter_size] = down_dense
+    return padded_gate_dense, padded_up_dense, padded_down_dense
+
+
+def repack_nvfp4_gated_moe_experts(
     experts: Iterable[nn.Module],
     hidden_size: int,
     moe_inter_size: int,
     group_size: int = 16,
     fc1_layout: str = "interleave",
+    moe_inter_size_alignment: int = NVFP4_MOE_INTERLEAVE_SIZE_ALIGNMENT,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pack Qwen3 NVFP4 experts for the active NVFP4 MoE plugin.
+    """Pack gated NVFP4 experts for the active NVFP4 MoE plugin.
 
     Each expert is expected to contain ModelOpt NVFP4 gate/up/down
     projection tensors.  Dense weights are decoded, rounded through BF16, and
@@ -986,24 +1037,51 @@ def repack_nvfp4_qwen3_moe_experts(
         hidden_size: model hidden size ``H``.
         moe_inter_size: per-expert intermediate size ``I``.
         group_size: NVFP4 K-axis group size (must be ``16``).
-        fc1_layout: SwiGLU FC1 row layout.
+        fc1_layout: gated FC1 row layout.
             * ``"interleave"`` (default) -- ``Nvfp4MoePlugin`` (SM100/101/110): 64-row
               up/gate interleaved chunks along the M axis.
             * ``"concat"`` -- ``NvFP4MoEPluginGeforce`` (SM12x): plain
               ``[up_all, gate_all]`` concat along the M axis.
+        moe_inter_size_alignment: physical intermediate-size alignment. Use
+            :data:`NVFP4_MOE_INTERLEAVE_SIZE_ALIGNMENT` for
+            ``"interleave"`` and
+            :data:`NVFP4_MOE_INTERMEDIATE_SIZE_ALIGNMENT` for ``"concat"``.
     """
     from ..models.linear import \
         is_nvfp4_linear  # local import to avoid circular dep
 
     if fc1_layout == "interleave":
-        build_fc1_dense = _interleave_qwen3_swiglu_fc1
+        build_fc1_dense = _interleave_gated_moe_fc1
+        layout_alignment = NVFP4_MOE_INTERLEAVE_SIZE_ALIGNMENT
     elif fc1_layout == "concat":
-        build_fc1_dense = _concat_qwen3_swiglu_fc1
+        build_fc1_dense = _concat_gated_moe_fc1
+        layout_alignment = NVFP4_MOE_INTERMEDIATE_SIZE_ALIGNMENT
     else:
         raise ValueError(
             f"fc1_layout={fc1_layout!r} not recognized; use "
             "'interleave' (SM100/101/110 Nvfp4MoePlugin) or 'concat' (SM12x "
             "NvFP4MoEPluginGeforce)")
+
+    if moe_inter_size_alignment <= 0:
+        raise ValueError(
+            f"moe_inter_size_alignment ({moe_inter_size_alignment}) must be "
+            ">= 1")
+    if moe_inter_size_alignment % layout_alignment != 0:
+        raise ValueError(
+            f"moe_inter_size_alignment ({moe_inter_size_alignment}) must be "
+            f"a multiple of {layout_alignment} for "
+            f"fc1_layout={fc1_layout!r}")
+    padded_moe_inter_size = (
+        (moe_inter_size + moe_inter_size_alignment - 1) //
+        moe_inter_size_alignment) * moe_inter_size_alignment
+    if padded_moe_inter_size % layout_alignment != 0:
+        raise ValueError(
+            f"padded_moe_inter_size ({padded_moe_inter_size}) must be a "
+            f"multiple of {layout_alignment} for fc1_layout={fc1_layout!r}")
+    if padded_moe_inter_size % group_size != 0:
+        raise ValueError(
+            f"padded_moe_inter_size ({padded_moe_inter_size}) must be a "
+            f"multiple of group_size ({group_size})")
 
     fc1_qweights = []
     fc1_blocks_scale = []
@@ -1016,7 +1094,7 @@ def repack_nvfp4_qwen3_moe_experts(
         down = expert.down_proj
         if not (is_nvfp4_linear(gate) and is_nvfp4_linear(up)
                 and is_nvfp4_linear(down)):
-            raise TypeError("Qwen3 NVFP4 MoE experts must use NVFP4 quant")
+            raise TypeError("Gated NVFP4 MoE experts must use NVFP4 quant")
 
         gate_dense = decode_modelopt_nvfp4(gate.weight, gate.weight_scale,
                                            gate.weight_scale_2, group_size)
@@ -1025,12 +1103,12 @@ def repack_nvfp4_qwen3_moe_experts(
         down_dense = decode_modelopt_nvfp4(down.weight, down.weight_scale,
                                            down.weight_scale_2, group_size)
 
-        if down_dense.shape != (hidden_size, moe_inter_size):
-            raise ValueError(f"down dense shape {down_dense.shape} != "
-                             f"({hidden_size}, {moe_inter_size})")
+        gate_dense, up_dense, down_dense = _pad_nvfp4_gated_moe_dense_weights(
+            gate_dense, up_dense, down_dense, hidden_size, moe_inter_size,
+            padded_moe_inter_size)
 
         fc1_dense = build_fc1_dense(gate_dense, up_dense, hidden_size,
-                                    moe_inter_size)
+                                    padded_moe_inter_size)
         fc1_qw, fc1_sf = _pack_nvfp4_moe_weight(fc1_dense, group_size)
         fc2_qw, fc2_sf = _pack_nvfp4_moe_weight(down_dense, group_size)
         fc1_qweights.append(fc1_qw)
@@ -1044,7 +1122,7 @@ def repack_nvfp4_qwen3_moe_experts(
                         dim=0), torch.stack(fc2_blocks_scale, dim=0))
 
 
-def repack_nvfp4_nemotron_moe_experts(
+def repack_nvfp4_moe_experts(
     experts: Iterable[nn.Module],
     hidden_size: int,
     moe_inter_size: int,
@@ -1052,32 +1130,11 @@ def repack_nvfp4_nemotron_moe_experts(
     hidden_size_alignment: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor, torch.Tensor, int, int]:
-    """Pack Nemotron-H NVFP4 experts for the active NVFP4 MoE plugin.
+    """Pack pre-quantized, ungated NVFP4 experts.
 
-    Nemotron routed experts are ReLU2 MLPs, so FC1 is the raw ``up_proj``
-    only.  Unlike Qwen3, no gate projection must be concatenated into a SwiGLU
-    FC1 tensor.  The checkpoint's FP4 nibbles and FP8 block-scale bytes already
-    match the plugin weight orientation; this helper only changes the scale
-    layout to CuTeDSL's 6D MMA order and exposes ``weight_scale_2`` as the
-    per-expert alpha.
-
-    Both kernels require the FC1 N axis (``moe_inter_size``) be a multiple of
-    128, so the routed intermediate is always padded to the next 128 boundary.
-    The SM12x ``NvFP4MoEPluginGeforce`` kernel additionally requires the FC1 K
-    axis (``hidden_size``) be a multiple of 256 (``kCuteDslTileK * kStaticAbStage``)
-    to drain the mainloop pipeline cleanly. Pass ``hidden_size_alignment=256``
-    to also zero-pad along the H axis for that target; SM110 keeps
-    ``hidden_size_alignment=1`` so ``H`` is unchanged.
-
-    Math: ``relu2(0) = 0`` makes the zero-padded FC1 N rows produce zero
-    intermediate activations; zero-padded FC1 K columns receive zero hidden
-    activations (the caller is expected to zero-pad ``hidden_states`` to match
-    ``padded_hidden_size`` before the plugin call). Zero-padded FC2 M rows
-    emit zero contributions to the corresponding output channels, which the
-    caller slices away.
-
-    Returns the per-expert FC1/FC2 weights, scales, alphas, plus the resolved
-    ``padded_inter_size`` and ``padded_hidden_size`` (both >= the originals).
+    Preserve checkpoint FP4 weights and global scales while padding the
+    intermediate and optional hidden dimensions and swizzling block scales.
+    Returns packed FC1/FC2 weights, scales, alphas, and the padded sizes.
     """
     from ..models.linear import \
         is_nvfp4_linear  # local import to avoid circular dep
@@ -1088,7 +1145,10 @@ def repack_nvfp4_nemotron_moe_experts(
     fc2_qweights = []
     fc2_blocks_scale = []
     fc2_alpha = []
-    padded_inter_size = ((moe_inter_size + 127) // 128) * 128
+    padded_inter_size = (
+        (moe_inter_size + NVFP4_MOE_INTERMEDIATE_SIZE_ALIGNMENT - 1) //
+        NVFP4_MOE_INTERMEDIATE_SIZE_ALIGNMENT
+    ) * NVFP4_MOE_INTERMEDIATE_SIZE_ALIGNMENT
     if hidden_size_alignment <= 0:
         raise ValueError(
             f"hidden_size_alignment ({hidden_size_alignment}) must be >= 1")
@@ -1105,7 +1165,7 @@ def repack_nvfp4_nemotron_moe_experts(
         up = expert.up_proj
         down = expert.down_proj
         if not (is_nvfp4_linear(up) and is_nvfp4_linear(down)):
-            raise TypeError("Nemotron NVFP4 MoE experts must use NVFP4 quant")
+            raise TypeError("NVFP4 MoE experts must use NVFP4 quant")
 
         if tuple(up.weight.shape) != (moe_inter_size, hidden_size // 2):
             raise ValueError(f"up weight shape {tuple(up.weight.shape)} != "
@@ -1132,7 +1192,7 @@ def repack_nvfp4_nemotron_moe_experts(
         if down_weight.dtype == torch.uint8:
             down_weight = down_weight.view(torch.int8)
         if up_weight.dtype != torch.int8 or down_weight.dtype != torch.int8:
-            raise TypeError("Nemotron NVFP4 weights must be int8/uint8")
+            raise TypeError("NVFP4 MoE weights must be int8/uint8")
 
         needs_pad = (padded_inter_size != moe_inter_size
                      or padded_hidden_size != hidden_size)
