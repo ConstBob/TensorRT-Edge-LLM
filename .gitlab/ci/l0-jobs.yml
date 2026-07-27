@@ -109,6 +109,32 @@ l0_a30_trt11:
     - .l0_environment
   interruptible: true
 
+# Focused coverage for the experimental ONNX-less frontend. This uses
+# the standard L0 build/runtime template but does not consume exported ONNX.
+l0_builder_a30:
+  stage: l0_test
+  variables:
+    CUDA_VERSION: "13.2"
+    TRT_VERSION: "$TRT11_VERSION"
+    TRT_CUDA_VERSION: "13.2"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
+    TEST_CACHE_DIR: "$L0_CACHE_DIR/builder_a30"
+    PRIORITY: l0_builder_a30
+    ONNX_DIR: "$TEST_CACHE_DIR/unused_onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/a30_trt11.csv"
+  tags:
+    - a30-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .x86_test_template
+    - .l0_rules
+    - .l0_environment
+  interruptible: true
+
 l0_rtx3090:
   stage: l0_test
   needs:

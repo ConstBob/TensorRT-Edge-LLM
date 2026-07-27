@@ -56,6 +56,7 @@ dev = []
 [project.scripts]
 tensorrt-edgellm-quantize = "tensorrt_edgellm.scripts.quantize:main"
 tensorrt-edgellm-export = "tensorrt_edgellm.scripts.export:main"
+tensorrt-edgellm-build = "experimental.builder.cli:main"
 tensorrt-edgellm-insert-lora = "tensorrt_edgellm.scripts.insert_lora:main"
 tensorrt-edgellm-process-lora = "tensorrt_edgellm.scripts.process_lora_weights:main"
 tensorrt-edgellm-merge-lora = "tensorrt_edgellm.scripts.merge_lora:main"

@@ -17,6 +17,7 @@ for large language models and vision-language models on edge devices.
    user_guide/getting_started/supported-models.md
    user_guide/getting_started/installation.md
    user_guide/getting_started/quick-start-guide.md
+   user_guide/getting_started/direct-engine-builder.md
    user_guide/getting_started/limitations.md
 
 .. toctree::
@@ -63,6 +64,7 @@ for large language models and vision-language models on edge devices.
    :caption: Software Design
 
    developer_guide/software-design/checkpoint-export.md
+   developer_guide/software-design/onnxless-builder.md
    developer_guide/software-design/quantization-design.md
    developer_guide/software-design/engine-builder.md
    developer_guide/software-design/cpp-runtime-overview.md
