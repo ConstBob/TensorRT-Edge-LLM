@@ -732,6 +732,12 @@ def _config(args: argparse.Namespace) -> Config:
         "CI_COMMIT_REF_NAME") or "main"
     if not branch or any(char in branch for char in "\r\n\0"):
         raise ValueError("invalid TRT_CI_BRANCH")
+    hf_checkpoint_dir = os.environ.get("TRT_CI_HF_CHECKPOINT_DIR")
+    if hf_checkpoint_dir is None:
+        raise ValueError("TRT_CI_HF_CHECKPOINT_DIR must be set")
+    if not hf_checkpoint_dir or any(char in hf_checkpoint_dir
+                                    for char in "\r\n\0"):
+        raise ValueError("invalid TRT_CI_HF_CHECKPOINT_DIR")
     config = Config(
         architecture=args.architecture,
         trt_location=args.trt_location,
