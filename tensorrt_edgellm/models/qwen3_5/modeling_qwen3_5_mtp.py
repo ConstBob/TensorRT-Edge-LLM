@@ -197,14 +197,17 @@ class Qwen3_5MtpDraftModel(nn.Module):
                               hidden_size,
                               bias=False,
                               module_name="fc")
-        self.layers = nn.ModuleList(
-            [Qwen3_5MtpDecoderLayer(config, layer_idx=0)])
+        self.layers = nn.ModuleList([self._make_decoder_layer(config)])
         self.norm = Qwen3_5RMSNorm(hidden_size, config.rms_norm_eps)
         self.lm_head = make_linear(config,
                                    hidden_size,
                                    config.vocab_size,
                                    bias=False,
                                    module_name="lm_head")
+
+    def _make_decoder_layer(self, config: ModelConfig) -> nn.Module:
+        """Decoder-layer factory; subclasses override to swap the layer type."""
+        return Qwen3_5MtpDecoderLayer(config, layer_idx=0)
 
     def forward(
         self,

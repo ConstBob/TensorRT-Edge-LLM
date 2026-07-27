@@ -993,6 +993,36 @@ def _nvfp4_moe_plugin_geforce_translation(
     return output
 
 
+@script()
+def _fp16_moe_plugin_translation(
+    router_logits: onnxscript.FLOAT,
+    hidden_states: onnxscript.FLOAT16,
+    fc1_weights: onnxscript.FLOAT16,
+    fc2_weights: onnxscript.FLOAT16,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    moe_inter_size: int,
+    activation_type: int,
+    norm_topk_prob: int,
+    max_routed_rows: int,
+) -> onnxscript.FLOAT16:
+    output = _trt_edgellm.Fp16MoePlugin(
+        router_logits,
+        hidden_states,
+        fc1_weights,
+        fc2_weights,
+        num_experts=num_experts,
+        top_k=top_k,
+        hidden_size=hidden_size,
+        moe_inter_size=moe_inter_size,
+        activation_type=activation_type,
+        norm_topk_prob=norm_topk_prob,
+        max_routed_rows=max_routed_rows,
+    )
+    return output
+
+
 # ---------------------------------------------------------------------------
 # FusedNvfp4GemmAllReducePlugin (row-parallel NVFP4 GEMM + AllReduce)
 # ---------------------------------------------------------------------------
@@ -1148,6 +1178,8 @@ def build_custom_translation_table() -> dict:
         _nvfp4_moe_plugin_translation,
         torch.ops.trt_edgellm.NvFP4MoEPluginGeforce.default:
         _nvfp4_moe_plugin_geforce_translation,
+        torch.ops.trt_edgellm.Fp16MoePlugin.default:
+        _fp16_moe_plugin_translation,
         torch.ops.trt_edgellm.dflash_target_kv_cache_update.default:
         _dflash_target_kv_cache_update_translation,
         # TRT native attention ops (used by Alpamayo)

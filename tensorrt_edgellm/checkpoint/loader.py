@@ -768,6 +768,42 @@ def _try_split_fused_tensor(model: nn.Module,
                 attr_suffix, prefix)
         return ok
 
+    # --- 6. Fused MoE expert split -------------------------------------------
+    # Fused 3-D expert tensors (gate rows first, then up):
+    #   mlp.experts.gate_up_proj [E, 2*I, H] / mlp.experts.down_proj [E, H, I]
+    # Split into the per-expert Linear weights held by Qwen3MoEExperts.
+    if key.endswith(".mlp.experts.gate_up_proj") and tensor.dim() == 3:
+        prefix = key[:-len("gate_up_proj")]
+        inter = tensor.shape[1] // 2
+        ok = True
+        for expert in range(tensor.shape[0]):
+            ok &= _set_tensor(model,
+                              f"{prefix}{expert}.gate_proj.weight",
+                              tensor[expert, :inter, :],
+                              mapping=mapping)
+            ok &= _set_tensor(model,
+                              f"{prefix}{expert}.up_proj.weight",
+                              tensor[expert, inter:, :],
+                              mapping=mapping)
+        if ok:
+            logger.debug(
+                "Split fused experts.gate_up_proj -> %d gate/up pairs "
+                "for prefix %r", tensor.shape[0], prefix)
+        return ok
+    if key.endswith(".mlp.experts.down_proj") and tensor.dim() == 3:
+        prefix = key[:-len("down_proj")]
+        ok = True
+        for expert in range(tensor.shape[0]):
+            ok &= _set_tensor(model,
+                              f"{prefix}{expert}.down_proj.weight",
+                              tensor[expert],
+                              mapping=mapping)
+        if ok:
+            logger.debug(
+                "Split fused experts.down_proj -> %d down weights "
+                "for prefix %r", tensor.shape[0], prefix)
+        return ok
+
     return False
 
 

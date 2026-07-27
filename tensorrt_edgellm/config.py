@@ -1247,15 +1247,13 @@ def make_mtp_draft_config(base_config: ModelConfig) -> ModelConfig:
             "MTP draft config requires mtp_num_hidden_layers in the base config."
         )
 
-    # MTP modules in the exclude list → unquantized (FP16); otherwise inherit
-    # base quant.  Only *compute linear* modules matter (fc, proj, etc.).
-    # Norms, embeddings, and lm_head always appear in `excluded` when lm_head
-    # is FP16 — their presence does NOT mean the whole draft is unquantized.
-    _MTP_COMPUTE_PREFIXES = ("mtp.fc", "mtp.layers.")
+    # The draft is quantized iff its FFN compute weights are quantized
+    # (routed experts for MoE, dense MLP otherwise) — other modules may be
+    # excluded in any recipe. Excluded entries are exact names or globs.
+    ffn_probe = ("mtp.layers.0.mlp.experts.0.gate_proj" if
+                 base_config.num_experts > 0 else "mtp.layers.0.mlp.gate_proj")
     mtp_is_quantized = not any(
-        any(e.startswith(p) for p in _MTP_COMPUTE_PREFIXES) and
-        ("norm" not in e and "embed" not in e)
-        for e in base_config.quant.excluded)
+        fnmatch.fnmatch(ffn_probe, e) for e in base_config.quant.excluded)
 
     if mtp_is_quantized:
         # MTP draft modules are independently quantized.  Strip base-model
@@ -1284,7 +1282,13 @@ def make_mtp_draft_config(base_config: ModelConfig) -> ModelConfig:
                               layer_overrides=draft_overrides,
                               is_mixed_precision=False)
     else:
-        draft_quant = QuantConfig()
+        # MTP draft lm_head is borrowed from the base model and may itself be quantized.
+        lm_head_overrides = {
+            k: v
+            for k, v in base_config.quant.layer_overrides.items()
+            if k == "lm_head" or k.startswith("lm_head.")
+        }
+        draft_quant = QuantConfig(layer_overrides=lm_head_overrides)
 
     return replace(
         base_config,

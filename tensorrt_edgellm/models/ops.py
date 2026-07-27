@@ -1363,6 +1363,38 @@ def _(router_logits, hidden_states, fc1_qweights, fc1_blocks_scale, fc1_alpha,
 
 
 # ---------------------------------------------------------------------------
+# Custom op: trt_edgellm::Fp16MoePlugin
+#   Unquantized (FP16/BF16) MoE experts via the CuTeDSL FP16 grouped-GEMM
+#   plugin. Same softmax+topk routing and 64-row up/gate FC1 interleave as
+#   Nvfp4MoePlugin, but plain FP16 weights: no scales or alpha tensors.
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt_edgellm::Fp16MoePlugin", mutates_args=())
+def fp16_moe_plugin(
+    router_logits: torch.Tensor,
+    hidden_states: torch.Tensor,
+    fc1_weights: torch.Tensor,
+    fc2_weights: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    moe_inter_size: int,
+    activation_type: int,
+    norm_topk_prob: int,
+    max_routed_rows: int,
+) -> torch.Tensor:
+    return torch.zeros_like(hidden_states)
+
+
+@fp16_moe_plugin.register_fake
+def _(router_logits, hidden_states, fc1_weights, fc2_weights, num_experts,
+      top_k, hidden_size, moe_inter_size, activation_type, norm_topk_prob,
+      max_routed_rows):
+    return torch.empty_like(hidden_states)
+
+
+# ---------------------------------------------------------------------------
 # Custom op: trt_edgellm::fused_nvfp4_gemm_allreduce
 #   NVFP4 row-parallel GEMM fused with AllReduce
 # ---------------------------------------------------------------------------
