@@ -160,6 +160,13 @@ def _build_full_model_quant_cfg(quantization: str,
         "*talker.codec_head*",  # Codec output projection (FP16: feeds
         #   Code2Wav; FP4 noise here materially
         #   hurts audio quality)
+        # ---- Talker GDN mixers (FP16) ----
+        # The gated-delta-net recurrent loop feeds its own state back every
+        # step, so in_proj/out_proj quantization noise self-amplifies across
+        # frames. The pre-quantized reference checkpoints keep these FP16 as
+        # well (their exclude lists carry the fused ``in_proj_qkvz``/
+        # ``in_proj_ba`` names).
+        "*talker.model.layers.*.linear_attn.*",
     ]
     # Only pin the visual encoder / audio_tower to FP16 when the caller did
     # not opt them into quantization via ``visual_quantization`` /
@@ -187,9 +194,13 @@ def _build_full_model_quant_cfg(quantization: str,
         # at the late layers), so the quantization-sensitivity budget is
         # better spent on the routed experts. Add the three globs below to
         # put it back at FP16 if a future model proves more sensitive.
-        # disable_globs.append("*shared_expert.gate_proj.*")
-        # disable_globs.append("*shared_expert.up_proj.*")
-        # disable_globs.append("*shared_expert.down_proj.*")
+        # On Qwen3-Omni Next the bf16-trained activation outliers make the
+        # always-on shared expert quantization-sensitive (unlike the audited
+        # Qwen3-Omni MoE case above) — keep it FP16 there. Cheap: 1/129 of
+        # expert weights.
+        disable_globs.append("*talker*shared_expert.gate_proj.*")
+        disable_globs.append("*talker*shared_expert.up_proj.*")
+        disable_globs.append("*talker*shared_expert.down_proj.*")
     # modelopt's ``quant_cfg`` is an ordered list of rule dicts; append a
     # disable rule per glob at the end so it overrides the earlier
     # ``*weight_quantizer`` / ``*input_quantizer`` enables.
@@ -907,6 +918,140 @@ def quantize_qwen3_omni(
     return output_dir
 
 
+def _export_submodel(model, which: str, full_dir: str) -> None:
+    """``export_hf_checkpoint`` either the Thinker or Talker submodule.
+
+    Detaches the unused sibling encoders, forces ``architectures``, and
+    monkey-patches ``modelopt.torch.export.model_utils.is_multimodal_model``
+    to False so ModelOpt's resmooth dummy-forward walks the plain CausalLM
+    path. For Talker, also wraps ``forward`` with default
+    ``inputs_embeds`` / ``attention_mask`` / ``talker_input_ids`` so the
+    dummy walk does not crash on un-derivable tensors.
+    """
+    sub = getattr(model, which)
+    saved_attrs: dict = {}
+    saved_cfgs: dict = {}
+    saved_forward = None
+    saved_tied_keys = None
+    _tied_keys_was_patched = False
+
+    if which == "thinker":
+        if sub.config.architectures is None:
+            sub.config.architectures = ["Qwen3MoeForCausalLM"]
+        for attr in ("audio_tower", "visual"):
+            if hasattr(sub, attr) and getattr(sub, attr) is not None:
+                saved_attrs[attr] = getattr(sub, attr)
+                setattr(sub, attr, None)
+        for cfg_attr in ("vision_config", "audio_config"):
+            if hasattr(sub.config, cfg_attr) and getattr(sub.config,
+                                                         cfg_attr) is not None:
+                saved_cfgs[cfg_attr] = getattr(sub.config, cfg_attr)
+                delattr(sub.config, cfg_attr)
+    elif which == "talker":
+        if sub.config.architectures is None:
+            sub.config.architectures = ["Qwen3MoeForCausalLM"]
+
+        # HF declares codec_head tied to codec_embedding but never ties them
+        # (tie_weights() early-returns on tie_word_embeddings=False; the
+        # checkpoint stores two independent tensors). ModelOpt's
+        # export_hf_checkpoint trusts the metadata and drops codec_head.weight
+        # from the safetensors -> randomly-initialised codec projection,
+        # garbled audio. Strip the entry for the export; restored in the
+        # ``finally`` block below.
+        orig_tied = getattr(sub, "_tied_weights_keys", None)
+        if isinstance(orig_tied, dict):
+            saved_tied_keys = orig_tied
+            sub._tied_weights_keys = {
+                k: v
+                for k, v in orig_tied.items() if "codec_head" not in k
+            }
+            _tied_keys_was_patched = True
+        elif isinstance(orig_tied, (list, tuple)):
+            saved_tied_keys = orig_tied
+            sub._tied_weights_keys = type(orig_tied)(
+                k for k in orig_tied if "codec_head" not in str(k))
+            _tied_keys_was_patched = True
+        elif orig_tied is not None:
+            # None is expected (no tied-weights metadata); any other type means
+            # a transformers change we should notice rather than silently skip.
+            print(f"[Omni quant] Warning: unexpected _tied_weights_keys type "
+                  f"{type(orig_tied).__name__}; codec_head tie not stripped, "
+                  f"export may drop codec_head.weight.")
+
+        # ModelOpt's resmooth path calls ``model(fake_input_ids)`` with every
+        # other arg None, but the Talker top-forward never derives
+        # ``inputs_embeds`` from ``input_ids`` (the runtime always feeds
+        # ``inputs_embeds`` directly from Thinker hidden states) and dereferences
+        # ``attention_mask`` / ``talker_input_ids`` unguarded. Wrap forward to
+        # synthesize the missing tensors so the dummy walk reaches every
+        # quantizable linear.
+        saved_forward = sub.forward
+        _t_hidden_size = sub.config.text_config.hidden_size
+        _t_device = next(sub.parameters()).device
+        # First parameter can be non-float (the Qwen3-Omni Next Talker leads
+        # with the int64 ``speaker_codec_embeddings`` LUT) — synthesized
+        # inputs_embeds must take the compute dtype instead.
+        _t_dtype = next(p.dtype for p in sub.parameters()
+                        if p.is_floating_point())
+
+        def _talker_forward_with_defaults(*args, **kwargs):
+            if args and "input_ids" not in kwargs:
+                kwargs["input_ids"] = args[0]
+                args = args[1:]
+            input_ids = kwargs.pop("input_ids", None)
+            if input_ids is not None:
+                if input_ids.dim() == 1:
+                    input_ids = input_ids.unsqueeze(0)
+                bsz, seq = input_ids.shape
+                if kwargs.get("inputs_embeds", None) is None:
+                    kwargs["inputs_embeds"] = torch.zeros(bsz,
+                                                          seq,
+                                                          _t_hidden_size,
+                                                          dtype=_t_dtype,
+                                                          device=_t_device)
+                if kwargs.get("attention_mask", None) is None:
+                    kwargs["attention_mask"] = torch.ones(bsz,
+                                                          seq,
+                                                          dtype=torch.long,
+                                                          device=_t_device)
+                if kwargs.get("talker_input_ids", None) is None:
+                    kwargs["talker_input_ids"] = input_ids
+            return saved_forward(*args, **kwargs)
+
+        sub.forward = _talker_forward_with_defaults
+    else:
+        raise ValueError(f"unknown submodule: {which}")
+
+    from modelopt.torch.export import model_utils as _mu
+    _orig_is_mm = _mu.is_multimodal_model
+    _mu.is_multimodal_model = lambda *a, **kw: False
+    try:
+        with torch.inference_mode():
+            export_hf_checkpoint(sub, export_dir=full_dir)
+    finally:
+        _mu.is_multimodal_model = _orig_is_mm
+        for attr, val in saved_attrs.items():
+            setattr(sub, attr, val)
+        for cfg_attr, val in saved_cfgs.items():
+            setattr(sub.config, cfg_attr, val)
+        if saved_forward is not None:
+            sub.forward = saved_forward
+        if _tied_keys_was_patched:
+            sub._tied_weights_keys = saved_tied_keys
+    print(f"[export-{which}] {full_dir}")
+
+
+# ===========================================================================
+#         Auto-dispatch path used by ``tensorrt-edgellm-quantize llm``
+#     for any Qwen3-Omni / Qwen3-Next Omni checkpoint. Separate from the
+#     ``qwen3-omni`` CLI subcommand above (which targets the joint MoE
+#     NVFP4 Thinker+Talker recipe with a per-submodule extraction step).
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# transformers 4.57.0.dev0 workarounds for Qwen3-Next Omni
+# ---------------------------------------------------------------------------
+
 # ---------------------------------------------------------------------------
 # Full-model export workarounds
 # ---------------------------------------------------------------------------
@@ -988,10 +1133,13 @@ def _patch_qwen3_omni_next_transformers() -> None:
        non-gated ``Qwen3OmniNextThinkerTextAttention`` but the checkpoint
        stores a gated ``q_proj`` (2× output).  Swap to the gated
        ``Qwen3OmniNextAttention`` whose forward splits q into query+gate.
-    3. ``Qwen3OmniNextTalkerCodePredictorAttention.q_proj`` is non-gated
-       in source but gated in checkpoint.  CodePredictor is excluded from
-       quantization and never forward-called during calibration, so
-       resizing q_proj to the 2× shape is enough for ``load_state_dict``.
+    3. ``Qwen3OmniNextTalkerCodePredictorAttention`` is non-gated in source
+       but gated in checkpoint: ``q_proj`` stores a 2× (query+gate) weight
+       and the reference forward applies ``attn_output * sigmoid(gate)``
+       before ``o_proj``.  Resize ``q_proj`` for ``load_state_dict`` AND
+       replace ``forward`` with the gated variant — CP FP8 calibration
+       forward-calls the CodePredictor, so a load-only shape fix would
+       silently corrupt its activations.
 
     The patches are guarded with sentinel attributes so multiple calls
     are safe.
@@ -1005,8 +1153,13 @@ def _patch_qwen3_omni_next_transformers() -> None:
     if not hasattr(Qwen3OmniNextCode2WavConfig, "rope_scaling"):
         Qwen3OmniNextCode2WavConfig.rope_scaling = {}
 
-    if not getattr(_mod.Qwen3OmniNextTalkerDecoderLayer,
-                   "_edgellm_gated_patched", False):
+    # Newer internal forks (e.g. transformers-internal-bk-0316, the revision
+    # matching the Qwen3-Omni Next 0315/0324 checkpoints) already ship gated
+    # attention and a GDN-hybrid Talker without these class names — each
+    # patch below applies only where its target class (and the bug) exists.
+    if hasattr(_mod, "Qwen3OmniNextTalkerDecoderLayer") and not getattr(
+            _mod.Qwen3OmniNextTalkerDecoderLayer, "_edgellm_gated_patched",
+            False):
         _orig_tdl_init = _mod.Qwen3OmniNextTalkerDecoderLayer.__init__
 
         def _tdl_init_gated(self, config, layer_idx):
@@ -1016,8 +1169,38 @@ def _patch_qwen3_omni_next_transformers() -> None:
         _mod.Qwen3OmniNextTalkerDecoderLayer.__init__ = _tdl_init_gated
         _mod.Qwen3OmniNextTalkerDecoderLayer._edgellm_gated_patched = True
 
+    # Detect whether the CP attention is already gated (q_proj emits 2x
+    # head_dim) by instantiating it against a minimal config — source-code
+    # heuristics are brittle across fork revisions.
+    def _cp_attn_needs_gating_patch() -> bool:
+        cls = _mod.Qwen3OmniNextTalkerCodePredictorAttention
+        try:
+            import types
+            probe_cfg = types.SimpleNamespace(
+                hidden_size=64,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=16,
+                attention_bias=False,
+                attention_dropout=0.0,
+                rms_norm_eps=1e-6,
+                layer_types=["full_attention"],
+                sliding_window=None,
+                _attn_implementation="eager",
+            )
+            probe = cls.__new__(cls)
+            # Only need __init__ side effects on module shapes.
+            cls.__init__(probe, probe_cfg, 0)
+            q_out = probe.q_proj.out_features
+            return q_out == probe_cfg.num_attention_heads * probe.head_dim
+        except Exception:
+            # Can't probe → assume the historical non-gated layout and patch;
+            # the patched forward is semantically identical to the gated one.
+            return True
+
     if not getattr(_mod.Qwen3OmniNextTalkerCodePredictorAttention,
-                   "_edgellm_gated_q_patched", False):
+                   "_edgellm_gated_q_patched",
+                   False) and _cp_attn_needs_gating_patch():
         _orig_cp_init = \
             _mod.Qwen3OmniNextTalkerCodePredictorAttention.__init__
 
@@ -1029,8 +1212,72 @@ def _patch_qwen3_omni_next_transformers() -> None:
                 bias=config.attention_bias,
             )
 
+        # Gated forward matching the reference checkpoint's CP attention:
+        # q_proj emits [query, gate] interleaved per head; the gate scales
+        # the attention output (``attn * sigmoid(gate)``) before o_proj.
+        # Mirrors the stock forward otherwise (RoPE, KV cache, attention
+        # interface dispatch, per-layer sliding window).
+        def _cp_forward_gated(self,
+                              hidden_states,
+                              position_embeddings,
+                              attention_mask,
+                              past_key_values=None,
+                              cache_position=None,
+                              **kwargs):
+            input_shape = hidden_states.shape[:-1]
+            hidden_shape = (*input_shape, -1, self.head_dim)
+
+            query_states, gate = torch.chunk(self.q_proj(hidden_states).view(
+                *input_shape, -1, self.head_dim * 2),
+                                             2,
+                                             dim=-1)
+            gate = gate.reshape(*input_shape, -1)
+            query_states = self.q_norm(
+                query_states.reshape(hidden_shape)).transpose(1, 2)
+            key_states = self.k_norm(
+                self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+            value_states = self.v_proj(hidden_states).view(
+                hidden_shape).transpose(1, 2)
+
+            cos, sin = position_embeddings
+            query_states, key_states = _mod.apply_rotary_pos_emb(
+                query_states, key_states, cos, sin)
+
+            if past_key_values is not None:
+                cache_kwargs = {
+                    "sin": sin,
+                    "cos": cos,
+                    "cache_position": cache_position
+                }
+                key_states, value_states = past_key_values.update(
+                    key_states, value_states, self.layer_idx, cache_kwargs)
+
+            attention_interface = _mod.eager_attention_forward
+            if self.config._attn_implementation != "eager":
+                attention_interface = _mod.ALL_ATTENTION_FUNCTIONS[
+                    self.config._attn_implementation]
+
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=getattr(self, "sliding_window", None),
+                **kwargs,
+            )
+
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            attn_output = attn_output * torch.sigmoid(gate)
+            attn_output = self.o_proj(attn_output)
+            return attn_output, attn_weights
+
         _mod.Qwen3OmniNextTalkerCodePredictorAttention.__init__ = \
             _cp_init_gated
+        _mod.Qwen3OmniNextTalkerCodePredictorAttention.forward = \
+            _cp_forward_gated
         _mod.Qwen3OmniNextTalkerCodePredictorAttention._edgellm_gated_q_patched = True
 
 
@@ -1060,7 +1307,25 @@ def _read_model_type(model_dir: str) -> str:
 
 
 def _load_omni_model(model_dir: str, dtype: str, device: str):
-    """Instantiate the right ``ForConditionalGeneration`` class + processor."""
+    """Instantiate the right ``ForConditionalGeneration`` class + processor.
+
+    A bf16-declared checkpoint always loads as bf16 regardless of the
+    requested ``dtype``: the Next fork sizes its GDN cache states from the
+    config dtype, and an fp16-loaded model then fails with mixed-dtype
+    matmuls inside the Talker generate chain.
+    """
+    try:
+        with open(os.path.join(model_dir, "config.json")) as f:
+            _root_cfg = json.load(f)
+        _thinker_cfg = _root_cfg.get("thinker_config") or {}
+        _declared = str(
+            _root_cfg.get("dtype") or _root_cfg.get("torch_dtype")
+            or _thinker_cfg.get("dtype") or _thinker_cfg.get("torch_dtype")
+            or "")
+        if "bfloat16" in _declared:
+            dtype = "bf16"
+    except (OSError, json.JSONDecodeError):
+        pass
     torch_dtype = torch.float16 if dtype == "fp16" else torch.bfloat16
     model_type = _read_model_type(model_dir)
 
@@ -1264,21 +1529,26 @@ def quantize_and_export_omni(
     """Load a Qwen3-Next Omni model, quantize it, and export.
 
     Shares the ``tensorrt-edgellm-quantize llm`` flag surface with the
-    Qwen3-Omni driver; sub-encoder quantization flags are rejected until
-    validated on this family. ``num_samples`` is split roughly evenly
+    Qwen3-Omni driver. ``visual_quantization`` / ``audio_quantization``
+    (FP8) ride the same joint multimodal calibration pass as the backbone;
+    ``cp_quantization`` stays rejected here — the CP-only pass in
+    ``quantize.py`` owns it. ``num_samples`` is split roughly evenly
     across the three calibration modalities.
     """
-    for flag, val in (("visual_quantization", visual_quantization),
-                      ("audio_quantization", audio_quantization),
-                      ("cp_quantization", cp_quantization)):
-        if val is not None:
-            raise ValueError(
-                f"--{flag} is not supported for qwen3_omni_next yet.")
+    if cp_quantization is not None:
+        raise ValueError(
+            "--cp_quantization is not supported for qwen3_omni_next in the "
+            "full-model driver; use the CP-only pass instead.")
 
     t0 = time.time()
     model, tokenizer, processor = _load_omni_model(model_dir, dtype, device)
 
     if is_quantized(model):
+        if visual_quantization is not None or audio_quantization is not None:
+            raise ValueError(
+                "--visual_quantization / --audio_quantization need a "
+                "calibration pass, but this checkpoint is pre-quantized "
+                "(calibration is skipped). Start from the bf16 checkpoint.")
         print("Model already quantized — skipping.")
     else:
         if processor is None:
@@ -1302,8 +1572,23 @@ def quantize_and_export_omni(
               f"(accept_hidden_layer={accept_layer}, "
               f"talker={'yes' if has_talker else 'no'})")
 
-        quant_cfg = build_quant_config(quantization, lm_head_quantization,
-                                       kv_cache_quantization)
+        # Reuse the full-model FP16 keep-set (codec_head / projections /
+        # code_predictor / talker GDN mixers / MoE routers): the bare
+        # ``build_quant_config`` would quantize every Linear, and the Talker
+        # sidecar heads plus the GDN recurrent loop are quantization-
+        # sensitive on this family too.
+        tcfg = getattr(model.config, "talker_config", None)
+        n_experts = int(
+            getattr(getattr(tcfg, "text_config", tcfg), "num_experts", 0)
+            or 0) if tcfg is not None else 0
+        quant_cfg = _build_full_model_quant_cfg(
+            quantization,
+            lm_head_quantization,
+            kv_cache_quantization,
+            is_moe=n_experts > 0,
+            visual_quantization=visual_quantization,
+            audio_quantization=audio_quantization,
+        )
         mtq.quantize(
             model,
             quant_cfg,

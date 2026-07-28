@@ -1755,6 +1755,15 @@ bool LLMBuilder::copyTokenizerFiles()
         }
     }
 
+    // Optional (Qwen3-Next Omni TTS): friendly speaker aliases consumed by the runtime.
+    if (std::filesystem::exists(mOnnxDir / "voice_map.json"))
+    {
+        if (file_io::copyFile((mOnnxDir / "voice_map.json").string(), (mEngineDir / "voice_map.json").string()))
+        {
+            LOG_INFO("Copied voice_map.json");
+        }
+    }
+
     return allSuccess;
 }
 

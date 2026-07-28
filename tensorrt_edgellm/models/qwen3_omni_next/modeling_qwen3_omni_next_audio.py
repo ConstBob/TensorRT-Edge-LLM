@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..qwen3_asr import modeling_qwen3_asr_audio as _asr
+from ..qwen3_asr import modeling_qwen3_asr_audio as qwen3_asr_audio
 from ..qwen3_asr.modeling_qwen3_asr_audio import QwenAudioEncoder
 
 if TYPE_CHECKING:
@@ -36,15 +36,16 @@ class Qwen3OmniNextAudioEncoder(QwenAudioEncoder):
 
     def __init__(
         self,
-        num_mel_bins: int = _asr._NUM_MEL_BINS,
-        d_model: int = _asr._D_MODEL,
-        num_layers: int = _asr._NUM_LAYERS,
-        num_heads: int = _asr._NUM_HEADS,
-        ffn_dim: int = _asr._FFN_DIM,
-        max_source_positions: int = _asr._MAX_SOURCE_POSITIONS,
-        output_dim: int = _asr._OUTPUT_DIM,
-        downsample_hidden: int = _asr._DOWNSAMPLE_HIDDEN,
+        num_mel_bins: int = qwen3_asr_audio._NUM_MEL_BINS,
+        d_model: int = qwen3_asr_audio._D_MODEL,
+        num_layers: int = qwen3_asr_audio._NUM_LAYERS,
+        num_heads: int = qwen3_asr_audio._NUM_HEADS,
+        ffn_dim: int = qwen3_asr_audio._FFN_DIM,
+        max_source_positions: int = qwen3_asr_audio._MAX_SOURCE_POSITIONS,
+        output_dim: int = qwen3_asr_audio._OUTPUT_DIM,
+        downsample_hidden: int = qwen3_asr_audio._DOWNSAMPLE_HIDDEN,
         *,
+        attention_scale: float,
         model_config: "ModelConfig",
         name_prefix: str = "audio_tower",
     ) -> None:
@@ -57,6 +58,7 @@ class Qwen3OmniNextAudioEncoder(QwenAudioEncoder):
             max_source_positions=max_source_positions,
             output_dim=output_dim,
             downsample_hidden=downsample_hidden,
+            attention_scale=attention_scale,
             model_config=model_config,
             name_prefix=name_prefix,
         )
@@ -68,9 +70,12 @@ class Qwen3OmniNextAudioEncoder(QwenAudioEncoder):
         # Recompute freq_bins with one extra halving and resize conv_out.
         freq_bins_4 = (((((num_mel_bins + 1) // 2 + 1) // 2 + 1) // 2 + 1) //
                        2)
-        self.conv_out = nn.Linear(downsample_hidden * freq_bins_4,
-                                  d_model,
-                                  bias=False)
+        self.conv_out = qwen3_asr_audio.make_linear(
+            model_config,
+            downsample_hidden * freq_bins_4,
+            d_model,
+            bias=False,
+            module_name=f"{name_prefix}.conv_out" if name_prefix else "")
 
     def get_onnx_export_args(self, config: dict, device: str):
         """Return (dynamo_inputs, onnx_input_names, output_names, dynamic_shapes) for ONNX export.
@@ -150,21 +155,30 @@ def build_qwen3_omni_next_audio(
     def _get(key: str, default):
         return audio_cfg.get(key, config.get(key, default))
 
+    d_model = _get("d_model", qwen3_asr_audio._D_MODEL)
+    num_heads = _get("encoder_attention_heads", qwen3_asr_audio._NUM_HEADS)
+    head_dim = d_model // num_heads
+    attention_scale = qwen3_asr_audio.config_module._get_attention_scaling(
+        audio_cfg, head_dim, 1.0 / (float(head_dim)**0.5))
+
     model = Qwen3OmniNextAudioEncoder(
-        num_mel_bins=_get("num_mel_bins", _asr._NUM_MEL_BINS),
-        d_model=_get("d_model", _asr._D_MODEL),
-        num_layers=_get("encoder_layers", _asr._NUM_LAYERS),
-        num_heads=_get("encoder_attention_heads", _asr._NUM_HEADS),
-        ffn_dim=_get("encoder_ffn_dim", _asr._FFN_DIM),
+        num_mel_bins=_get("num_mel_bins", qwen3_asr_audio._NUM_MEL_BINS),
+        d_model=d_model,
+        num_layers=_get("encoder_layers", qwen3_asr_audio._NUM_LAYERS),
+        num_heads=num_heads,
+        ffn_dim=_get("encoder_ffn_dim", qwen3_asr_audio._FFN_DIM),
         max_source_positions=_get("max_source_positions",
-                                  _asr._MAX_SOURCE_POSITIONS),
-        output_dim=_get("output_dim", _asr._OUTPUT_DIM),
+                                  qwen3_asr_audio._MAX_SOURCE_POSITIONS),
+        output_dim=_get("output_dim", qwen3_asr_audio._OUTPUT_DIM),
         downsample_hidden=_get("downsample_hidden_size",
-                               _asr._DOWNSAMPLE_HIDDEN),
+                               qwen3_asr_audio._DOWNSAMPLE_HIDDEN),
+        attention_scale=attention_scale,
         model_config=model_config,
         name_prefix=name_prefix,
     )
-    _asr._load_audio_weights(model, weights, prefix)
+    # Cast before loading — _set_tensor overwrites buffers in place and
+    # preserves FP8 dtypes; casting after load silently downgrades them.
     model = model.to(dtype=dtype)
+    qwen3_asr_audio._load_audio_weights(model, weights, prefix)
     model.eval()
     return model

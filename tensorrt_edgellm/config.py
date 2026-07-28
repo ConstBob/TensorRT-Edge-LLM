@@ -53,7 +53,7 @@ import json
 import math
 import os
 from dataclasses import asdict, dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     import torch
@@ -1236,6 +1236,7 @@ _QWEN3_5_MTP_CONFIG_MODEL_TYPES = frozenset({
     "qwen3_5_moe",
     "qwen3_5_moe_text",
     "qwen3_omni_next_text",
+    "qwen3_omni_next_text_moe",
 })
 
 
@@ -1896,10 +1897,38 @@ def _detect_unquantized_modules(model_dir: str) -> List[str]:
 _GDN_INPUT_PROJ_MODULES = ("in_proj_qkv", "in_proj_z", "in_proj_b",
                            "in_proj_a")
 
+# Fused HF GDN projection names (as they appear in a ModelOpt ``ignore`` /
+# ``modules_to_not_convert`` list) mapped to the split projections
+# trt-edge-llm actually builds. The checkpoint loader splits
+# ``in_proj_qkvz`` -> ``in_proj_qkv`` / ``in_proj_z`` and ``in_proj_ba`` ->
+# ``in_proj_b`` / ``in_proj_a`` (Qwen3-Next family). Excluding only the fused
+# name would otherwise leave the split Linears at the dominant quant type
+# (e.g. NVFP4) even though their weights are plain FP16, so ``make_linear``
+# would build an NVFP4Linear against an unquantized weight.
+_GDN_FUSED_PROJ_SPLITS: Dict[str, Tuple[str, ...]] = {
+    "in_proj_qkvz": ("in_proj_qkv", "in_proj_z"),
+    "in_proj_ba": ("in_proj_b", "in_proj_a"),
+}
+
 
 def _with_gdn_fused_exclusions(modules: List[str]) -> List[str]:
-    """Add synthetic GDN fused projections when all source projections are FP16."""
+    """Reconcile GDN input-projection exclusions with the split/fused forms.
+
+    Expands fused HF names (``in_proj_qkvz`` / ``in_proj_ba``) present in the
+    ignore list into the split projections the model builds, and adds the
+    synthetic ``in_proj_fused`` when all four split projections are FP16.
+    """
     result = set(modules)
+    # Fused HF name -> split projections (so an excluded ``in_proj_qkvz``
+    # also excludes the ``in_proj_qkv`` / ``in_proj_z`` the model builds).
+    for module in list(result):
+        for fused, splits in _GDN_FUSED_PROJ_SPLITS.items():
+            suffix = f".{fused}"
+            if module.endswith(suffix):
+                prefix = module[:-len(suffix)]
+                for split in splits:
+                    result.add(f"{prefix}.{split}")
+                break
     by_prefix: Dict[str, set] = {}
     for module in result:
         for proj in _GDN_INPUT_PROJ_MODULES:
@@ -2081,10 +2110,19 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
             first_group = next(iter(cg.values()), {})
             group_size = int(
                 first_group.get("weights", {}).get("group_size", 1))
+        elif qc.get("group_size") is not None:
+            group_size = int(qc.get("group_size"))
+        quant_type = _algo_to_quant_type(algo)
+        # NVFP4 uses a fixed FP8-block group size of 16. Minimal ModelOpt
+        # ``quantization_config`` blocks (``quant_algo`` only, no
+        # ``config_groups`` / ``group_size`` — e.g. Qwen3-Omni Next NVFP4)
+        # omit it, so default it here rather than leaving the per-tensor 1.
+        if quant_type == QUANT_NVFP4 and group_size == 1:
+            group_size = 16
         kv = qc.get("kv_cache_scheme")
         kv_str = "fp8" if kv else None
         return QuantConfig(
-            quant_type=_algo_to_quant_type(algo),
+            quant_type=quant_type,
             group_size=group_size,
             kv_cache_quant=kv_str,
             excluded=_effective_excluded_modules(model_dir,

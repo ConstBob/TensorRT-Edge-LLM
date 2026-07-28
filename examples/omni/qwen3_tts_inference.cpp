@@ -48,14 +48,18 @@ struct ParsedInput
     std::vector<std::vector<Message>> requests;
     // Per-request speaker name (parallel to requests). Falls back to top-level "speaker" default.
     std::vector<std::string> requestSpeakers;
-    // Per-request language name (parallel to requests). Falls back to top-level "language" default.
-    // Empty / "auto" keeps the no-language prefill; see TalkerGenerationRequest::languageName.
+    // [Qwen3-TTS] Per-request language name / instruction / voice-clone reference (Base ckpts).
+    // Falls back to top-level "language" / "instruct" defaults.
     std::vector<std::string> requestLanguages;
-    // Per-request instruction text (parallel to requests). Falls back to top-level "instruct".
     std::vector<std::string> requestInstructs;
-    // Per-request voice-clone reference audio/transcript (Base checkpoints).
     std::vector<std::string> requestRefAudios;
     std::vector<std::string> requestRefTexts;
+    // [Qwen3-Omni Next] Per-request custom-voice codec codes / style / language / system instruct.
+    std::vector<std::vector<std::vector<int32_t>>> requestPromptSpeakerCodes;
+    std::vector<std::string> requestAssistantInstructs;
+    std::vector<std::string> requestTalkerLanguages;
+    std::vector<std::string> requestSystemInstructs;
+    // (CodePredictor sampling uses the shared subtalker* fields above.)
     bool applyChatTemplate{true};
     bool addGenerationPrompt{true};
     bool enableThinking{false};
@@ -177,6 +181,32 @@ ParsedInput parseInputFile(std::filesystem::path const& inputFilePath, int32_t b
         result.requestInstructs.push_back(std::move(requestInstruct));
         result.requestRefAudios.push_back(std::move(requestRefAudio));
         result.requestRefTexts.push_back(std::move(requestRefText));
+
+        // [Qwen3-Omni Next] Optional custom voice: "prompt_speaker_codes": [[16 ints] per frame].
+        std::vector<std::vector<int32_t>> promptCodes;
+        if (requestItem.contains("prompt_speaker_codes"))
+        {
+            auto const& codesJson = requestItem["prompt_speaker_codes"];
+            check::check(codesJson.is_array(), "'prompt_speaker_codes' must be an array of per-frame code arrays");
+            for (auto const& frameJson : codesJson)
+            {
+                check::check(frameJson.is_array(), "each prompt_speaker_codes entry must be an array of ints");
+                std::vector<int32_t> frame;
+                frame.reserve(frameJson.size());
+                for (auto const& v : frameJson)
+                {
+                    frame.push_back(v.get<int32_t>());
+                }
+                promptCodes.push_back(std::move(frame));
+            }
+        }
+        result.requestPromptSpeakerCodes.push_back(std::move(promptCodes));
+        result.requestAssistantInstructs.push_back(
+            requestItem.value("assistant_instruct", inputData.value("assistant_instruct", "")));
+        result.requestTalkerLanguages.push_back(
+            requestItem.value("talker_language", inputData.value("talker_language", "")));
+        result.requestSystemInstructs.push_back(
+            requestItem.value("system_instruct", inputData.value("system_instruct", "")));
     }
 
     return result;
@@ -499,6 +529,10 @@ int main(int argc, char** argv)
             talkerReq.instructText = input.requestInstructs[requestIdx];
             talkerReq.refAudioPath = input.requestRefAudios[requestIdx];
             talkerReq.refText = input.requestRefTexts[requestIdx];
+            talkerReq.promptSpeakerCodes = input.requestPromptSpeakerCodes[requestIdx];
+            talkerReq.assistantInstruct = input.requestAssistantInstructs[requestIdx];
+            talkerReq.talkerLanguage = input.requestTalkerLanguages[requestIdx];
+            talkerReq.systemInstruct = input.requestSystemInstructs[requestIdx];
             talkerReq.maxAudioLength = input.maxAudioLength;
             talkerReq.messages = input.requests[requestIdx];
 

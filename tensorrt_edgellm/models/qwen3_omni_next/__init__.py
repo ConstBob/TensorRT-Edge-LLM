@@ -25,6 +25,8 @@ from .modeling_qwen3_omni_next_code2wav import (
     load_code2wav_config)
 from .modeling_qwen3_omni_next_code_predictor import \
     Qwen3OmniNextCodePredictorCausalLM
+from .modeling_qwen3_omni_next_moe_talker import Qwen3OmniNextMoeTalkerCausalLM
+from .modeling_qwen3_omni_next_mtp import Qwen3OmniNextMoeMtpDraftModel
 from .modeling_qwen3_omni_next_talker import Qwen3OmniNextTalkerCausalLM
 from .modeling_qwen3_omni_next_text import Qwen3OmniNextLanguageModel
 from .modeling_qwen3_omni_next_visual import (Qwen3OmniNextVisualModel,
@@ -37,6 +39,8 @@ __all__ = [
     "build_qwen3_omni_next_visual",
     "Qwen3OmniNextLanguageModel",
     "Qwen3OmniNextTalkerCausalLM",
+    "Qwen3OmniNextMoeTalkerCausalLM",
+    "Qwen3OmniNextMoeMtpDraftModel",
     "Qwen3OmniNextCodePredictorCausalLM",
     "Qwen3OmniNextCode2WavModel",
     "build_qwen3_omni_next_code2wav",

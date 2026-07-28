@@ -154,8 +154,11 @@ std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& mu
         multimodalRunner = makeInitializedQwenViTRunner<Qwen3VLViTRunner>(
             multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
     }
-    else if (modelType == multimodal::ModelType::QWEN3_OMNI_AUDIO_ENCODER)
+    else if (modelType == multimodal::ModelType::QWEN3_OMNI_AUDIO_ENCODER
+        || modelType == multimodal::ModelType::QWEN3_OMNI_NEXT_AUDIO_ENCODER)
     {
+        // Qwen3OmniAudioRunner handles both variants (it branches internally on the
+        // config model_type for the Next encoder's 8x-downsample front end).
         multimodalRunner = std::make_unique<Qwen3OmniAudioRunner>(multimodalEngineDir, stream);
     }
     else if (modelType == multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER)
