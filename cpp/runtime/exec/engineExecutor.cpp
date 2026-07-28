@@ -98,6 +98,13 @@ EngineExecutor::EngineExecutor(std::filesystem::path const& enginePath, TensorRe
     registerOptionalTreeMetadata(binding_names::kTreeParentIds);
     registerOptionalTreeMetadata(binding_names::kTreeDepths);
 
+    if (engineHasInputTensor(*mEngine, binding_names::kSkipSoftmaxScale)
+        && !mRegistry.contains(binding_names::kSkipSoftmaxScale))
+    {
+        mRegistry.addTensor({binding_names::kSkipSoftmaxScale, TensorIO::kInput, nvinfer1::DataType::kINT8,
+            {sym(&InferenceDims::skipSoftmaxScaleLen)}});
+    }
+
     LOG_INFO("engine loaded successfully (%d I/O tensors)", mEngine->getNbIOTensors());
 }
 

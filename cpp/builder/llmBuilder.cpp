@@ -599,7 +599,7 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
     }
 
     // Setup common profiles
-    result &= setupCommonProfiles(*contextProfile, *generationProfile);
+    result &= setupCommonProfiles(*contextProfile, *generationProfile, network);
     result &= setupRopeProfiles(*contextProfile, *generationProfile, network);
 
     // Setup model-specific profiles
@@ -654,8 +654,8 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
     return true;
 }
 
-bool LLMBuilder::setupCommonProfiles(
-    nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
+bool LLMBuilder::setupCommonProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+    nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network)
 {
     bool result = true;
 
@@ -683,7 +683,6 @@ bool LLMBuilder::setupCommonProfiles(
     result &= setOptimizationProfile(&generationProfile, binding_names::kKVPageTable,
         createDims({1, 2, maxPagesPerSeq}), createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}),
         createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}));
-
     // KV cache profiles
     LOG_DEBUG("Setting up KV cache profiles for %d layers...", mNbKVCacheInputs);
     result &= setupKVCacheProfiles(contextProfile, generationProfile);
@@ -696,6 +695,17 @@ bool LLMBuilder::setupCommonProfiles(
     // Conv state profiles for recurrent causal conv1d layers
     result &= setupConvStateProfiles(&contextProfile, &generationProfile);
     LOG_DEBUG("Conv state profiles done.");
+
+    // skip_softmax_scale: [S] INT8 shape-only runtime skip-softmax override carrier.
+    // dim0 IS the integer scale factor S; a meaningful S satisfies lambda < 1, i.e.
+    // S < context length <= maxKVCacheCapacity.
+    if (hasInputBinding(network, binding_names::kSkipSoftmaxScale))
+    {
+        result &= setOptimizationProfile(&contextProfile, binding_names::kSkipSoftmaxScale, createDims({0}),
+            createDims({0}), createDims({mBuilderConfig.maxKVCacheCapacity}));
+        result &= setOptimizationProfile(&generationProfile, binding_names::kSkipSoftmaxScale, createDims({0}),
+            createDims({0}), createDims({mBuilderConfig.maxKVCacheCapacity}));
+    }
 
     return result;
 }

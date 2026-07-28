@@ -206,6 +206,10 @@ protected:
     //! Sliding window size for attention (-1 = no sliding window, >0 = window size)
     int32_t mSlidingWindowSize = -1;
 
+    //! Skip-softmax (BLASST) calibrated scale factor S (0 = disabled); see
+    //! computeSkipSoftmaxThreshold.
+    float mSkipSoftmaxScaleFactor{};
+
     ContextFMHABackend mContextFMHABackend{ContextFMHABackend::kNONE};
 
     //! Whether FMHA context kernels are available for this configuration.

@@ -618,6 +618,8 @@ class ModelConfig:
     tie_word_embeddings: bool = False
     # Sliding window attention size; -1 means no sliding window.
     sliding_window_size: int = -1
+    # Skip-softmax (BLASST) calibrated scale factor S; 0.0 disables the feature.
+    skip_softmax_scale_factor: float = 0.0
     # Gemma4 Unified 12B+: image placeholder runs use block-causal
     # attention during prefill (bidirectional inside each contiguous vision
     # run, causal everywhere else).  Audio placeholders remain causal.
@@ -1034,6 +1036,8 @@ class ModelConfig:
             for layer_type in raw_layer_types)
         sw_raw = llm_dict.get("sliding_window") if use_sw else None
         sliding_window_size = int(sw_raw) if sw_raw is not None else -1
+        skip_softmax_scale_factor = float(
+            llm_dict.get("skip_softmax_scale_factor", 0.0))
         use_vision_bidirectional_attention = bool(
             model_type in ("gemma4_unified", "gemma4_unified_text")
             and llm_dict.get("use_bidirectional_attention") == "vision")
@@ -1130,6 +1134,7 @@ class ModelConfig:
                                      llm_dict.get("dtype", "bfloat16")),
             tie_word_embeddings=llm_dict.get("tie_word_embeddings", False),
             sliding_window_size=sliding_window_size,
+            skip_softmax_scale_factor=skip_softmax_scale_factor,
             use_vision_bidirectional_attention=
             use_vision_bidirectional_attention,
             layer_types=layer_types,

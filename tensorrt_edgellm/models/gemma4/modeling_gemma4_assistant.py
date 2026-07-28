@@ -174,6 +174,7 @@ class Gemma4SharedKVAttention(nn.Module):
             attention_scale=self.attention_scale,
             enable_context_mask_selector=False,
             enable_vision_block_attention=False,
+            skip_softmax_scale_factor=0.0,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
             qkv_scales=[1.0, 1.0, 1.0],

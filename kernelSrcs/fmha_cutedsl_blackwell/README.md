@@ -180,26 +180,41 @@ Key adaptations from upstream:
 ## Skip-Softmax (BLASST) Threshold Calibration
 
 The kernel implements BLASST skip-softmax ([arXiv:2512.12087](https://arxiv.org/abs/2512.12087)):
-with `skip_softmax_threshold` (lambda) set at construction, a KV tile whose local
-row max falls below the running max by more than `ln(lambda)` is skipped whole
-(exp / row-sum / P*V elided). `None` (default) compiles the feature out — the
-kernel is bit-identical to the dense build. Restricted to plain causal attention
-(constructor assert; no sliding window, no ViT/bidirectional) and used by the
-prefill/context path only.
+a KV tile whose local row max falls below the running max by more than
+`ln(lambda)` is skipped whole (exp / row-sum / P*V elided). The feature has two
+independent knobs:
 
-`calibrate_skip_softmax.py` covers the full lambda lifecycle with two
-subcommands and staged, verbose output:
+- **compile-time enable** — constructing the kernel with a non-None
+  `skip_softmax_threshold` compiles the skip path in (the `*_skipsoftmax`
+  variants in `build_cutedsl.py` pass a sentinel `1.0` for exactly this);
+  `None` compiles it out, bit-identical to the dense build.
+- **runtime lambda** — the compiled kernel takes `log2(lambda)` as a trailing
+  runtime float. Deployment never bakes a lambda: the calibrated **scale
+  factor S** is an `AttentionPlugin` attribute (`skip_softmax_scale_factor`,
+  set at ONNX export), and at every enqueue the plugin derives
+  `lambda = S / L` with `L` floored at `kvCacheCapacity`: raw per-request
+  `S / seq_k` (ModelOpt's formula) holds the sparsity target on short prompts,
+  where there is no negligible tail to skip — measured MMLU -0.08 on ~1k-token
+  prompts — so every request uses the engine-max, calibration-validated lambda
+  instead. Cross-engine scaling is preserved (bigger-context engine -> bigger
+  capacity -> smaller lambda). `S = 0` (default) dispatches the dense kernel.
+
+Restricted to plain causal FP16 attention (no sliding window, no FP8 input,
+no ViT/bidirectional), prefill/context path only.
+
+`calibrate_skip_softmax.py` covers the full lifecycle with two subcommands and
+staged, verbose output:
 
 ```
-calibrate (default) ── ModelOpt official calibration ──▶ a, b, deploy lambda
+calibrate (default) ── ModelOpt official calibration ──▶ a, b, scale factor S
       │                                                        │
-      │                                    bake lambda into build_cutedsl.py,
-      │                                    rebuild artifact + relink (manual)
+      │                          re-export ONNX with --skip-softmax-scale-factor S,
+      │                          rebuild engine (llm_build) — kernels untouched
       ▼                                                        ▼
-evaluate ── RULER accuracy of the deployed engine ──▶ PASS/FAIL + recommendation
+evaluate ── RULER + MMLU accuracy of the deployed engine ──▶ PASS/FAIL + recommendation
 ```
 
-### `calibrate` — lambda via ModelOpt (official)
+### `calibrate` — scale factor via ModelOpt (official)
 
 A fixed lambda yields wildly different sparsity across context lengths, so the
 threshold follows `lambda = scale_factor / L` with a model-specific scale
@@ -220,76 +235,99 @@ python kernelSrcs/fmha_cutedsl_blackwell/calibrate_skip_softmax.py calibrate \
                                                  # defaults to ~/.cache (quota!)
 # [calibrate 1/3] load model ... [calibrate 2/3] ModelOpt calibration
 #   (library output is dim and '│'-indented, this tool's lines are plain)
-# [calibrate 3/3] fitted parameters and deployment thresholds
-# ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-# ┃ a = 115.037   b = 4.6992   R^2 = 0.733   (278 points)         ┃
-# ┃ observed sparsity range: [10.3%, 74.7%]  (beyond = extrapolated)
-# ┃ target  30%  max_ctx 4096    lambda = 0.115008  (log2 -3.12)  ┃
-# ┃ target  50%  max_ctx 4096    lambda = 0.294372  (log2 -1.76)  ┃
-# ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+# [calibrate 3/3] fitted parameters and deployment scale factors
+# ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+# ┃ a = 115.037   b = 4.6992   R^2 = 0.733   (278 points)                ┃
+# ┃ deployable scale factor S (lambda = S / context_length at runtime):  ┃
+# ┃   target  30%  S = 471.07   (... export --skip-softmax-scale-factor) ┃
+# ┃   target  50%  S = 1205.8                                            ┃
+# ┃ illustration — lambda at L=4096:  0.115008 / 0.294372                ┃
+# ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 ```
 
 ModelOpt's sparsity is a simulated, all-layers-pooled metric — the deployed
 kernel's per-layer skip ratio at the same lambda can differ substantially.
-Treat the calibrated lambda as the ecosystem-consistent starting point and let
+Treat the calibrated S as the ecosystem-consistent starting point and let
 `evaluate` arbitrate which target actually deploys.
 
-### Deploying a candidate lambda
+### Deploying a candidate scale factor
 
-`lambda` is baked at AOT-compile time (there is no runtime knob): add
-`--skip_softmax_threshold <lambda>` to the `fmha_d64`/`fmha_d128` variant args
-in `kernelSrcs/build_cutedsl.py`, rebuild the artifact
-(`build_cutedsl.py --kernels fmha`), and relink with `ENABLE_CUTE_DSL=fmha`.
+The kernel artifacts are lambda-free and built once. Deploying S touches only
+the model artifacts:
 
-### `evaluate` — RULER accuracy verdict for the deployed engine
+```bash
+# S becomes an AttentionPlugin node attribute in the ONNX
+python -m tensorrt_edgellm.scripts.export <quantized_ckpt> <onnx_out> \
+    --skip-softmax-scale-factor <S>
+# rebuild the engine from it
+build/examples/llm/llm_build --onnxDir <onnx_out>/llm --engineDir <engine_dir> ...
+```
+
+(Alternatively persist S as a `skip_softmax_scale_factor` key in the
+checkpoint's `config.json` llm dict — the exporter reads it; the CLI flag
+overrides.)
+
+### `evaluate` — RULER + MMLU accuracy verdict for the deployed engine
 
 The paper's accuracy instrument is RULER (its ~50%-sparsity safe-zone
 conclusions come from it; retrieval-style tasks degrade first). The subcommand
 samples real RULER items (HF `simonjegou/ruler`, tokenizer-filtered to the
-engine's max input length), runs the deployed engine greedily, scores by
-exact-answer matching per task, and — given a baseline — prints a PASS/FAIL
-verdict plus a deployment recommendation (exit code follows, so it can gate
-CI). Pair with `llm_bench --mode prefill` for TTFT.
+engine's max input length), runs the deployed engine greedily, and scores by
+exact-answer matching per task. With `--mmlu-samples N` it additionally scores
+an N-question MMLU subset through the repo's own accuracy tooling
+(`examples/accuracy`: `prepare_dataset.py` prompts + `calculate_correctness.py`
+CI letter-extraction rules). Given a baseline, both deltas are gated
+independently and the final verdict is **RULER AND MMLU** (exit code follows,
+so it can gate CI). Pair with `llm_bench --mode prefill` for TTFT.
 
 ```bash
-# 1) dense baseline: save its scores
+# 1) dense baseline: save its scores (RULER + MMLU)
 python kernelSrcs/fmha_cutedsl_blackwell/calibrate_skip_softmax.py evaluate \
     --model-dir /path/to/Qwen3-1.7B \
     --engine-dir engines/qwen3-1.7b --llm-inference build/examples/llm/llm_inference \
-    --max-context 4096 --save-results ruler_dense.json
+    --max-context 4096 --mmlu-samples 200 --save-results dense.json
 
-# 2) each skip build: compare, get the verdict
+# 2) each deployed S: compare, get the verdict
 python kernelSrcs/fmha_cutedsl_blackwell/calibrate_skip_softmax.py evaluate \
     --model-dir /path/to/Qwen3-1.7B \
     --engine-dir engines/qwen3-1.7b --llm-inference build/examples/llm/llm_inference \
-    --max-context 4096 --baseline ruler_dense.json --label "lambda=0.115"
+    --max-context 4096 --mmlu-samples 200 --baseline dense.json --label "S=471"
 # ...per-task score table with baseline/delta columns...
-# ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓ 
-# ┃ VERDICT: PASS [lambda=0.115]                          ┃
-# ┃ overall  0.7685 -> 0.7653   drop +0.0032  (gate 0.03) ┃
-# ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
-# 
-# ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-# ┃ VERDICT: FAIL [lambda=0.294]                          ┃
-# ┃ overall  0.7685 -> 0.7147   drop +0.0537  (gate 0.03) ┃
-# ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
-# RECOMMENDATION: this build [lambda=0.115] is validated for deployment. ...
+# ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+# ┃ VERDICT: PASS [S=471]  (RULER AND MMLU)                   ┃
+# ┃ RULER:  PASS   0.7685 -> 0.7653   drop +0.0032 (gate 0.03)┃
+# ┃ MMLU:   PASS   0.6150 -> 0.6100   drop +0.0050 (gate 0.03)┃
+# ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+# RECOMMENDATION: this build [S=471] is validated for deployment. ...
 ```
 
-### Reference result (Qwen3-1.7B NVFP4, max_context 4096, B200)
+### Reference results (Qwen3-1.7B NVFP4)
 
-Calibrated `a = 115.0, b = 4.70` (R² 0.73). RULER 200 samples x 10 tasks,
-gate 0.03; TTFT from `llm_bench --mode prefill --inputLen 4096`:
+Perf MUST be measured with real text: the skip predicate barely fires on
+random tensor content or synthetic token ids (`llm_bench` inputs), which
+understates the gain to ~0. Real-text prefill TTFT (32k-capacity engines,
+`lambda_eff = S / kvCacheCapacity`; sparse=x denotes the target tile-skip
+ratio; dense head/tail drift <0.4%):
 
-| build | RULER overall | verdict | TTFT S=4096 |
-|---|---|---|---|
-| dense | 0.7685 | baseline | 12.18 ms |
-| lambda=0.115 (target 30%) | 0.7653 (-0.003) | **PASS** | 11.70 ms (1.04x) |
-| lambda=0.294 (target 50%) | 0.7147 (-0.054, qa/multiquery collapse) | **FAIL** | 11.68 ms (1.04x) |
+| Context | dense | sparse=0.3 (S=68) | sparse=0.5 (S=170) | sparse=1.0 (S=30000, ceiling) |
+|---|---|---|---|---|
+| <=8k (Thor) | — | within noise | within noise | within noise |
+| 16k (Thor) | 459.6 ms | -0.4% | -1.5% | -13.1% |
+| 24k (Thor) | 865.2 ms | -1.8% | -4.3% | -16.6% |
+| 32k (Thor) | 1427.5 ms | **-5.4%** | **-8.1%** | -21.1% |
+| 16k (B200) | 53.7 ms | — | **-2.4%** | — |
 
-Kernel time is threshold-insensitive at these shapes, so deploy the SMALLEST
-lambda that passes the gate — a larger lambda buys no speed and only spends
-accuracy margin.
+Accuracy at the same operating points (platform-independent): RULER@16k and
+MMLU (n=1000) both PASS the 0.03 gate for sparse 0.3/0.5; a 20-needle NIAH
+probe at 32k scores 16-17/20 vs dense 17/20. sparse=1.0 collapses NIAH to
+9/20 — it is a perf upper-bound marker, not a deployable point.
+
+Deployment guidance: real-text prefill gain GROWS with the skip ratio at long
+context, so deploy the LARGEST S that passes the accuracy gates. The 4k
+ModelOpt fit does not extrapolate — for long-context engines pick
+`S = lambda_target * kvCacheCapacity` with `lambda_target` in [0.002, 0.005]
+(or recalibrate with long samples). Below ~8k context the feature is
+accuracy-neutral and perf-neutral; `S = 0` remains the default.
 
 ## File Map
 

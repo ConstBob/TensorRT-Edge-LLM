@@ -64,6 +64,7 @@ def _attention_plugin_translation(
     attention_scale: float,
     enable_context_mask_selector: int,
     enable_vision_block_attention: int,
+    skip_softmax_scale_factor: float,
     context_mask_selector: onnxscript.INT32,
     attention_mask: onnxscript.INT32,
     attention_pos_id: onnxscript.INT32,
@@ -75,6 +76,7 @@ def _attention_plugin_translation(
     rms_norm_eps: float = 1e-6,
     enable_qk_norm: int = 0,
     enable_kv_shared: int = 0,
+    skip_softmax_scale: onnxscript.INT8 = None,
 ) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT16]:
     """Unified attention plugin covering vanilla, FP8-KV, tree, and tree+FP8-KV.
 
@@ -106,6 +108,7 @@ def _attention_plugin_translation(
         context_mask_selector,
         attention_mask,
         attention_pos_id,
+        skip_softmax_scale,
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
         head_size=head_size,
@@ -116,6 +119,7 @@ def _attention_plugin_translation(
         sliding_window_size=sliding_window_size,
         qkv_scales=qkv_scales,
         attention_scale=attention_scale,
+        skip_softmax_scale_factor=skip_softmax_scale_factor,
         rms_norm_eps=rms_norm_eps,
         enable_qk_norm=enable_qk_norm,
         enable_kv_shared=enable_kv_shared,

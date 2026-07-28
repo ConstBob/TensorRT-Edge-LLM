@@ -82,14 +82,15 @@ public:
      * @param qScale Q dequant scale (quant→orig), ignored when fp8Input=false
      * @param kScale K dequant scale (quant→orig), ignored when fp8Input=false
      * @param vScale V dequant scale (quant→orig), applied to the attention output and ignored when fp8Input=false
-     * @param enableSkipSoftmax Dispatch the skip-softmax (BLASST) kernel variant, which skips the P*V GEMM of
-     *        KV tiles whose contribution is negligible (threshold baked at export). Approximate — outputs may
-     *        deviate from dense by up to the calibrated accuracy gate. FP16 causal only: incompatible with
-     *        fp8Input and slidingWindowSize.
+     * @param skipSoftmaxThresholdLog2 Skip-softmax (BLASST) threshold as log2(lambda). A finite negative value
+     *        (lambda in (0,1)) dispatches the skip-softmax kernel variant, which skips the P*V GEMM of KV
+     *        tiles whose contribution is negligible — approximate, FP16 causal only. 0.0 (the default,
+     *        log2 of the degenerate lambda = 1) disables skip, mirroring the slidingWindowSize = INT_MAX
+     *        sentinel convention.
      */
     void run(void const* qPtr, void const* kvPtr, void* oPtr, int32_t const* cuKVSeqLens, cudaStream_t stream,
         float attentionScale, int32_t slidingWindowSize = INT_MAX, bool fp8Input = false, float qScale = 1.0F,
-        float kScale = 1.0F, float vScale = 1.0F, bool enableSkipSoftmax = false);
+        float kScale = 1.0F, float vScale = 1.0F, float skipSoftmaxThresholdLog2 = 0.0F);
 
     /**
      * @brief LLM FMHA over a paged KV cache.
@@ -122,7 +123,8 @@ public:
     void runPaged(void const* qPtr, void const* pagedKVPoolPtr, int32_t const* kvCachePageList, void* oPtr,
         int32_t const* cuKVSeqLens, int32_t numPages, int32_t maxPagesPerSeq, int32_t tokensPerPage,
         nvinfer1::DataType kvDataType, cudaStream_t stream, float attentionScale, int32_t slidingWindowSize = INT_MAX,
-        bool fp8Input = false, float qScale = 1.0f, float kScale = 1.0f, float vScale = 1.0f, bool isCausal = true);
+        bool fp8Input = false, float qScale = 1.0f, float kScale = 1.0f, float vScale = 1.0f, bool isCausal = true,
+        float skipSoftmaxThresholdLog2 = 0.0F);
 
     /**
      * @brief ViT FMHA: packed varlen separate Q/K/V, bidirectional.
@@ -172,6 +174,8 @@ private:
     // LLM paged KV cache kernel modules (FP16)
     static fmha_d64_paged_Kernel_Module_t sLLM_d64_paged;
     static fmha_d128_paged_Kernel_Module_t sLLM_d128_paged;
+    static fmha_d64_skipsoftmax_paged_Kernel_Module_t sLLM_d64_skipsoftmax_paged;
+    static fmha_d128_skipsoftmax_paged_Kernel_Module_t sLLM_d128_skipsoftmax_paged;
     static fmha_d256_paged_Kernel_Module_t sLLM_d256_paged;
     static fmha_d256_dense_paged_Kernel_Module_t sLLM_d256_dense_paged;
     static fmha_d512_paged_Kernel_Module_t sLLM_d512_paged;

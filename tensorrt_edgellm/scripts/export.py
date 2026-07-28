@@ -866,7 +866,8 @@ def _export_llm(model_dir: str,
                 gemma4_mtp_base: bool = False,
                 externalize_weights: "list[str] | None" = None,
                 tp_size: int = 1,
-                num_decoder_layers: "int | None" = None) -> None:
+                num_decoder_layers: "int | None" = None,
+                skip_softmax_scale_factor: "float | None" = None) -> None:
     """Export LLM backbone via the standard tensorrt_edgellm pipeline.
 
     When ``tp_size > 1``, exports ``tp_size`` per-rank ONNX files named
@@ -950,6 +951,25 @@ def _export_llm(model_dir: str,
         except (OSError, ValueError, RuntimeError, ImportError) as exc:
             logger.exception("[LLM] Failed to load checkpoint")
             raise SystemExit(1) from exc
+
+        # CLI override of the skip-softmax (BLASST) scale factor: None = flag not given (keep the config value); an explicit 0.0
+        # disables skip-softmax even when config.json carries a positive S.
+        if skip_softmax_scale_factor is not None:
+            n_patched = 0
+            for module in model.modules():
+                if hasattr(module, "skip_softmax_scale_factor"):
+                    module.skip_softmax_scale_factor = skip_softmax_scale_factor
+                    n_patched += 1
+            if n_patched:
+                logger.info(
+                    "[LLM] skip_softmax_scale_factor=%.6f applied to %d "
+                    "attention modules", skip_softmax_scale_factor, n_patched)
+            else:
+                logger.warning(
+                    "[LLM] --skip-softmax-scale-factor=%.6f had NO effect: no "
+                    "attention module carries the attribute (this model's "
+                    "attention variant is not wired for skip-softmax yet)",
+                    skip_softmax_scale_factor)
 
         # Per-rank runtime config so each rank artifact is self-describing.
         # Single-device exports keep the conventional "config.json".
@@ -3191,6 +3211,22 @@ def main() -> None:
         "Directory containing vocab_map.safetensors for LLM vocabulary reduction.",
     )
     p.add_argument(
+        "--skip-softmax-scale-factor",
+        "--skip_softmax_scale_factor",
+        dest="skip_softmax_scale_factor",
+        type=float,
+        default=None,
+        metavar="S",
+        help=(
+            "Skip-softmax (BLASST) calibrated scale factor S (0 = disabled). "
+            "Baked into the AttentionPlugin nodes; at inference the runtime "
+            "derives lambda = S / context_length per request for the prefill "
+            "FMHA. Obtain S from calibrate_skip_softmax.py. Overrides the "
+            "checkpoint config.json key \"skip_softmax_scale_factor\" — an "
+            "explicit 0 disables skip-softmax even if the config enables it; "
+            "omit the flag to keep the config value."),
+    )
+    p.add_argument(
         "--draft-reduced-vocab-dir",
         dest="draft_reduced_vocab_dir",
         default="",
@@ -3601,25 +3637,27 @@ def main() -> None:
     # drive both the pre-run log and the post-run summary below.
     stages = [
         (_has_llm_component(model_type, "thinker") and not args.skip_llm
-         and not _draft_only and _allow("thinker"), "thinker", lambda out:
-         _export_llm(model_dir,
-                     out,
-                     model_type=model_type,
-                     eagle_base=args.eagle_base,
-                     eagle_draft_dir=args.eagle_draft_dir,
-                     mtp_base=args.mtp and not gemma4_mtp_requested,
-                     mtp_tree_base=args.mtp_tree_base,
-                     dflash_base=args.dflash_base,
-                     dflash_tree_base=args.dflash_tree_base,
-                     dflash_draft_dir=args.dflash_draft_dir,
-                     dspark_base=args.dspark_base,
-                     dspark_draft_dir=args.dspark_draft_dir,
-                     gemma4_mtp_base=gemma4_mtp_requested,
-                     fp8_embedding=args.fp8_embedding,
-                     reduced_vocab_dir=args.reduced_vocab_dir,
-                     externalize_weights=externalize_weights,
-                     tp_size=args.tp_size,
-                     num_decoder_layers=args.num_decoder_layer)),
+         and not _draft_only
+         and _allow("thinker"), "thinker", lambda out: _export_llm(
+             model_dir,
+             out,
+             model_type=model_type,
+             eagle_base=args.eagle_base,
+             eagle_draft_dir=args.eagle_draft_dir,
+             mtp_base=args.mtp and not gemma4_mtp_requested,
+             mtp_tree_base=args.mtp_tree_base,
+             dflash_base=args.dflash_base,
+             dflash_tree_base=args.dflash_tree_base,
+             dflash_draft_dir=args.dflash_draft_dir,
+             dspark_base=args.dspark_base,
+             dspark_draft_dir=args.dspark_draft_dir,
+             gemma4_mtp_base=gemma4_mtp_requested,
+             fp8_embedding=args.fp8_embedding,
+             reduced_vocab_dir=args.reduced_vocab_dir,
+             externalize_weights=externalize_weights,
+             tp_size=args.tp_size,
+             num_decoder_layers=args.num_decoder_layer,
+             skip_softmax_scale_factor=args.skip_softmax_scale_factor)),
         (args.mtp and not gemma4_mtp_requested
          and _allow("mtp_draft"), "mtp_draft", lambda out: _export_mtp_draft(
              model_dir, out, externalize_weights=externalize_weights)),

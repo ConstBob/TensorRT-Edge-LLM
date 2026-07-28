@@ -197,8 +197,8 @@ private:
     //! @param contextProfile Optimization profile for context processing
     //! @param generationProfile Optimization profile for generation processing
     //! @return true if setup was successful, false otherwise
-    bool setupCommonProfiles(
-        nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
+    bool setupCommonProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+        nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network);
 
     //! Set up RoPE optimization profiles for single-RoPE or dual-RoPE model inputs.
     //! Configures only the RoPE cache bindings that are present in the network.

@@ -63,18 +63,19 @@ struct Gemma4MTPKVSharingEntry
 struct LLMEngineConfig
 {
     // --- Core model dimensions ---
-    int32_t hiddenSize{};              //!< Model hidden dimension
-    int32_t outputVocabSize{};         //!< Actual output vocab (reduced if vocab reduction active)
-    int32_t numAttentionLayers{};      //!< Number of attention layers needing KV cache
-    int32_t numKVHeads{};              //!< Number of key-value heads
-    int32_t headDim{};                 //!< Dimension of each attention head
-    int32_t maxSupportedBatchSize{};   //!< Maximum supported batch size
-    int32_t maxSupportedInputLength{}; //!< Maximum supported input length
-    int32_t maxKVCacheCapacity{};      //!< Maximum KV cache capacity (sequence length)
-    int32_t rotaryDim{};               //!< Rotary embedding dimension
-    int32_t numDecoderLayers{};        //!< Total decoder layers (attention + linear)
-    int32_t vocabSize{};               //!< Full vocabulary size
-    int32_t reducedVocabSize{0};       //!< 0 = no vocab reduction
+    int32_t hiddenSize{};                //!< Model hidden dimension
+    int32_t outputVocabSize{};           //!< Actual output vocab (reduced if vocab reduction active)
+    int32_t numAttentionLayers{};        //!< Number of attention layers needing KV cache
+    int32_t numKVHeads{};                //!< Number of key-value heads
+    int32_t headDim{};                   //!< Dimension of each attention head
+    int32_t maxSupportedBatchSize{};     //!< Maximum supported batch size
+    int32_t maxSupportedInputLength{};   //!< Maximum supported input length
+    int32_t maxKVCacheCapacity{};        //!< Maximum KV cache capacity (sequence length)
+    int64_t skipSoftmaxScaleOverride{0}; //!< skip-softmax scale-factor override (0 = disabled)
+    int32_t rotaryDim{};                 //!< Rotary embedding dimension
+    int32_t numDecoderLayers{};          //!< Total decoder layers (attention + linear)
+    int32_t vocabSize{};                 //!< Full vocabulary size
+    int32_t reducedVocabSize{0};         //!< 0 = no vocab reduction
     int32_t diffusionCanvasLength{0};
     int32_t diffusionMaxDenoisingSteps{0};
     int32_t diffusionSelfConditioningSize{0};

@@ -101,6 +101,7 @@ def attention_plugin(
     attention_scale: float,
     enable_context_mask_selector: bool,
     enable_vision_block_attention: bool,
+    skip_softmax_scale_factor: float,
     context_mask_selector: Optional[torch.Tensor] = None,
     attention_mask: Optional[torch.Tensor] = None,
     attention_pos_id: Optional[torch.Tensor] = None,
@@ -115,6 +116,10 @@ def attention_plugin(
     # Whether this layer reads K/V from a donated (shared) cache: the packed input
     # carries Q only. Default 0 so torch.export strips the kwarg for normal layers.
     enable_kv_shared: int = 0,
+    # Runtime skip-softmax override carrier: 1-D INT8 dummy whose LENGTH encodes the
+    # runtime scale-factor override (0 = keep the engine default). Default None so
+    # torch.export strips it for models that do not wire the runtime knob.
+    skip_softmax_scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Unified stub for AttentionPlugin covering all feature combinations.
 
@@ -147,10 +152,13 @@ def attention_plugin(
 
     ``enable_tree_attention``, ``enable_fp8_kv_cache``,
     ``enable_context_mask_selector``, ``enable_vision_block_attention``,
-    and ``attention_scale`` are
-    required (no default) so that ``torch.export`` always includes them
-    in the FX graph — default-matching kwargs get stripped, breaking
-    ONNX translation.
+    ``attention_scale``, and ``skip_softmax_scale_factor`` are required
+    (no default) so that ``torch.export`` always includes them in the FX
+    graph — default-matching kwargs get stripped, breaking ONNX translation.
+
+    ``skip_softmax_scale_factor`` (0.0 = disabled) is the calibrated
+    skip-softmax (BLASST) scale factor S; the runtime derives
+    ``lambda = S / context_length`` per request for the prefill FMHA.
 
     Callers must always pass ``qkv_scales=[1.0, 1.0, 1.0]`` explicitly so
     the FX graph contains a valid FLOATS value for the ONNX translation.
@@ -186,30 +194,34 @@ def attention_plugin(
 
 
 @attention_plugin.register_fake
-def _(qkv,
-      past_key_value,
-      context_lengths,
-      rope_rotary_cos_sin,
-      kvcache_start_index,
-      kv_page_table,
-      num_q_heads,
-      num_kv_heads,
-      head_size,
-      sliding_window_size,
-      enable_tree_attention,
-      enable_fp8_kv_cache,
-      attention_scale,
-      enable_context_mask_selector,
-      enable_vision_block_attention,
-      context_mask_selector=None,
-      attention_mask=None,
-      attention_pos_id=None,
-      qkv_scales=None,
-      q_norm_gamma=None,
-      k_norm_gamma=None,
-      rms_norm_eps=1e-6,
-      enable_qk_norm=0,
-      enable_kv_shared=0):
+def _(
+    qkv,
+    past_key_value,
+    context_lengths,
+    rope_rotary_cos_sin,
+    kvcache_start_index,
+    kv_page_table,
+    num_q_heads,
+    num_kv_heads,
+    head_size,
+    sliding_window_size,
+    enable_tree_attention,
+    enable_fp8_kv_cache,
+    attention_scale,
+    enable_context_mask_selector,
+    enable_vision_block_attention,
+    skip_softmax_scale_factor,
+    context_mask_selector=None,
+    attention_mask=None,
+    attention_pos_id=None,
+    qkv_scales=None,
+    q_norm_gamma=None,
+    k_norm_gamma=None,
+    rms_norm_eps=1e-6,
+    enable_qk_norm=0,
+    enable_kv_shared=0,
+    skip_softmax_scale=None,
+):
     batch_size, seq_len, _ = qkv.shape
     return (torch.empty(batch_size,
                         seq_len,

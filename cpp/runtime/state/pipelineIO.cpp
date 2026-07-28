@@ -296,6 +296,10 @@ static void buildTensorMapImpl(TensorMap& map, PipelineIO& io, SharedResources& 
     {
         map.set(binding_names::kSpecVerifyPhaseMarker, io.specVerifyPhaseMarker);
     }
+    if (!io.skipSoftmaxScale.isEmpty())
+    {
+        map.set(binding_names::kSkipSoftmaxScale, io.skipSoftmaxScale);
+    }
     if (!io.specTreeParentIds.isEmpty())
     {
         map.set(binding_names::kTreeParentIds, io.specTreeParentIds);
@@ -443,6 +447,10 @@ PipelineIO PipelineIO::createForLLM(LLMEngineConfig const& cfg, cudaStream_t str
             cfg.rotaryDim, cfg.maxKVCacheCapacity, cfg.maxSupportedBatchSize, stream);
     }
 
+    // Runtime skip-softmax override carrier (shape-only).
+    io.skipSoftmaxScale = Tensor({1}, DeviceType::kGPU, nvinfer1::DataType::kINT8, "PipelineIO::skipSoftmaxScale");
+    CUDA_CHECK(cudaMemsetAsync(io.skipSoftmaxScale.rawPointer(), 0, io.skipSoftmaxScale.getMemoryCapacity(), stream));
+
     return io;
 }
 
@@ -524,6 +532,9 @@ PipelineIO PipelineIO::createForSpecDecode(
         = Tensor({1}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "PipelineIO::specVerifyPhaseMarker");
     CUDA_CHECK(cudaMemsetAsync(
         io.specVerifyPhaseMarker.rawPointer(), 0, io.specVerifyPhaseMarker.getMemoryCapacity(), stream));
+
+    io.skipSoftmaxScale = Tensor({1}, DeviceType::kGPU, nvinfer1::DataType::kINT8, "PipelineIO::skipSoftmaxScale");
+    CUDA_CHECK(cudaMemsetAsync(io.skipSoftmaxScale.rawPointer(), 0, io.skipSoftmaxScale.getMemoryCapacity(), stream));
 
     bool const useSpecTree
         = (bundle.specDecodeMode() == SpecDecodeMode::kDFlash || bundle.specDecodeMode() == SpecDecodeMode::kMTP)

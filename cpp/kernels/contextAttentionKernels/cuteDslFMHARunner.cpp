@@ -56,6 +56,8 @@ fmha_d256_sw_Kernel_Module_t CuteDslFMHARunner::sLLM_d256_sw = {};
 // LLM skip-softmax (BLASST, FP16 causal)
 fmha_d64_skipsoftmax_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_skipsoftmax = {};
 fmha_d128_skipsoftmax_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_skipsoftmax = {};
+fmha_d64_skipsoftmax_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_skipsoftmax_paged = {};
+fmha_d128_skipsoftmax_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_skipsoftmax_paged = {};
 // LLM (FP8 input, FP16 output)
 fmha_d64_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_fp8 = {};
 fmha_d128_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_fp8 = {};
@@ -117,6 +119,8 @@ bool CuteDslFMHARunner::loadLLMKernelModule()
         fmha_d256_sw_Kernel_Module_Load(&sLLM_d256_sw);
         fmha_d64_skipsoftmax_Kernel_Module_Load(&sLLM_d64_skipsoftmax);
         fmha_d128_skipsoftmax_Kernel_Module_Load(&sLLM_d128_skipsoftmax);
+        fmha_d64_skipsoftmax_paged_Kernel_Module_Load(&sLLM_d64_skipsoftmax_paged);
+        fmha_d128_skipsoftmax_paged_Kernel_Module_Load(&sLLM_d128_skipsoftmax_paged);
         fmha_d64_fp8_Kernel_Module_Load(&sLLM_d64_fp8);
         fmha_d128_fp8_Kernel_Module_Load(&sLLM_d128_fp8);
         fmha_d256_fp8_Kernel_Module_Load(&sLLM_d256_fp8);
@@ -167,6 +171,8 @@ void CuteDslFMHARunner::unloadLLMKernelModule()
         fmha_d256_sw_Kernel_Module_Unload(&sLLM_d256_sw);
         fmha_d64_skipsoftmax_Kernel_Module_Unload(&sLLM_d64_skipsoftmax);
         fmha_d128_skipsoftmax_Kernel_Module_Unload(&sLLM_d128_skipsoftmax);
+        fmha_d64_skipsoftmax_paged_Kernel_Module_Unload(&sLLM_d64_skipsoftmax_paged);
+        fmha_d128_skipsoftmax_paged_Kernel_Module_Unload(&sLLM_d128_skipsoftmax_paged);
         fmha_d64_fp8_Kernel_Module_Unload(&sLLM_d64_fp8);
         fmha_d128_fp8_Kernel_Module_Unload(&sLLM_d128_fp8);
         fmha_d256_fp8_Kernel_Module_Unload(&sLLM_d256_fp8);
@@ -273,14 +279,19 @@ using cutedsl::WrapperArity;
 //! Launch a dense (combined KV cache) LLM FMHA variant. The exported signature is
 //!   (module, q_tensor, kv_cache, o_tensor, cum_seqlen_k, window_size_left, attention_scale,
 //!    scale_q, scale_k, scale_v, inv_scale_o, sm_count, stream)
+//! The skip-softmax (BLASST) variants carry one extra trailing runtime float,
+//! skip_softmax_threshold_log2, placed AFTER stream (mirrors the generated
+//! fmha_d{64,128}_skipsoftmax.h signatures) — selected here by wrapper arity at compile time.
 //! @tparam cuteDslKernelWrapper Generated CuTe DSL kernel wrapper function. Its signature supplies the module
 //! and tensor descriptor types at compile time.
 template <auto cuteDslKernelWrapper>
 int32_t callLlmFmha(WrapperArgT<0, decltype(cuteDslKernelWrapper)>& module, LlmFmhaParams const& params)
 {
-    static_assert(WrapperArity<decltype(cuteDslKernelWrapper)>::value == 13,
+    constexpr size_t kArity = WrapperArity<decltype(cuteDslKernelWrapper)>::value;
+    static_assert(kArity == 13 || kArity == 14,
         "callLlmFmha: not a dense LLM FMHA wrapper (module, q_tensor, kv_cache, o_tensor, cum_seqlen_k, "
-        "window_size_left, attention_scale, scale_q, scale_k, scale_v, inv_scale_o, sm_count, stream).");
+        "window_size_left, attention_scale, scale_q, scale_k, scale_v, inv_scale_o, sm_count, stream "
+        "[, skip_softmax_threshold_log2]).");
 
     auto qTensor = makePackedTensor<WrapperArgT<1, decltype(cuteDslKernelWrapper)>>(
         params.qPtr, {params.batchSize, params.seqLenQ, params.numQHeads, params.headDim});
@@ -291,22 +302,35 @@ int32_t callLlmFmha(WrapperArgT<0, decltype(cuteDslKernelWrapper)>& module, LlmF
     auto cumSeqlenK
         = makeCuSeqLenTensor<WrapperArgT<4, decltype(cuteDslKernelWrapper)>>(params.cuKVSeqLens, params.batchSize + 1);
 
-    return cuteDslKernelWrapper(&module, &qTensor, &kvTensor, &oTensor, &cumSeqlenK, params.windowSizeLeft,
-        params.attentionScale, params.scaleQ, params.scaleK, params.scaleV, params.invScaleO,
-        getDeviceMultiProcessorCount(), params.stream);
+    if constexpr (kArity == 14)
+    {
+        return cuteDslKernelWrapper(&module, &qTensor, &kvTensor, &oTensor, &cumSeqlenK, params.windowSizeLeft,
+            params.attentionScale, params.scaleQ, params.scaleK, params.scaleV, params.invScaleO,
+            getDeviceMultiProcessorCount(), params.stream, params.skipSoftmaxThresholdLog2);
+    }
+    else
+    {
+        return cuteDslKernelWrapper(&module, &qTensor, &kvTensor, &oTensor, &cumSeqlenK, params.windowSizeLeft,
+            params.attentionScale, params.scaleQ, params.scaleK, params.scaleV, params.invScaleO,
+            getDeviceMultiProcessorCount(), params.stream);
+    }
 }
 
 //! Launch a paged LLM FMHA variant. The exported signature matches callLlmFmha() except that
-//! kv_cache is replaced by the (kv_cache_pool, kv_cache_page_list) pair.
+//! kv_cache is replaced by the (kv_cache_pool, kv_cache_page_list) pair. The skip-softmax
+//! (BLASST) variants carry one extra trailing runtime float, skip_softmax_threshold_log2,
+//! placed AFTER stream (mirrors the generated fmha_d{64,128}_skipsoftmax_paged.h signatures)
+//! — selected here by wrapper arity at compile time.
 //! @tparam cuteDslKernelWrapper Generated CuTe DSL kernel wrapper function. Its signature supplies the module
 //! and tensor descriptor types at compile time.
 template <auto cuteDslKernelWrapper>
 int32_t callLlmFmhaPaged(WrapperArgT<0, decltype(cuteDslKernelWrapper)>& module, LlmFmhaPagedParams const& params)
 {
-    static_assert(WrapperArity<decltype(cuteDslKernelWrapper)>::value == 14,
+    constexpr size_t kArity = WrapperArity<decltype(cuteDslKernelWrapper)>::value;
+    static_assert(kArity == 14 || kArity == 15,
         "callLlmFmhaPaged: not a paged LLM FMHA wrapper (module, q_tensor, kv_cache_pool, kv_cache_page_list, "
         "o_tensor, cum_seqlen_k, window_size_left, attention_scale, scale_q, scale_k, scale_v, inv_scale_o, sm_count, "
-        "stream).");
+        "stream [, skip_softmax_threshold_log2]).");
 
     auto qTensor = makePackedTensor<WrapperArgT<1, decltype(cuteDslKernelWrapper)>>(
         params.qPtr, {params.batchSize, params.seqLenQ, params.numQHeads, params.headDim});
@@ -326,9 +350,18 @@ int32_t callLlmFmhaPaged(WrapperArgT<0, decltype(cuteDslKernelWrapper)>& module,
     auto cumSeqlenK
         = makeCuSeqLenTensor<WrapperArgT<5, decltype(cuteDslKernelWrapper)>>(params.cuKVSeqLens, params.batchSize + 1);
 
-    return cuteDslKernelWrapper(&module, &qTensor, &kvPoolTensor, &pageListTensor, &oTensor, &cumSeqlenK,
-        params.windowSizeLeft, params.attentionScale, params.scaleQ, params.scaleK, params.scaleV, params.invScaleO,
-        getDeviceMultiProcessorCount(), params.stream);
+    if constexpr (kArity == 15)
+    {
+        return cuteDslKernelWrapper(&module, &qTensor, &kvPoolTensor, &pageListTensor, &oTensor, &cumSeqlenK,
+            params.windowSizeLeft, params.attentionScale, params.scaleQ, params.scaleK, params.scaleV, params.invScaleO,
+            getDeviceMultiProcessorCount(), params.stream, params.skipSoftmaxThresholdLog2);
+    }
+    else
+    {
+        return cuteDslKernelWrapper(&module, &qTensor, &kvPoolTensor, &pageListTensor, &oTensor, &cumSeqlenK,
+            params.windowSizeLeft, params.attentionScale, params.scaleQ, params.scaleK, params.scaleV, params.invScaleO,
+            getDeviceMultiProcessorCount(), params.stream);
+    }
 }
 
 //! Launch a ViT FMHA variant over packed varlen [total_S, H, D] Q/K/V.
@@ -362,7 +395,7 @@ int32_t callVitFmha(WrapperArgT<0, decltype(cuteDslKernelWrapper)>& module, VitF
 
 void CuteDslFMHARunner::run(void const* qPtr, void const* kvPtr, void* oPtr, int32_t const* cuKVSeqLens,
     cudaStream_t stream, float attentionScale, int32_t slidingWindowSize, bool fp8Input, float qScale, float kScale,
-    float vScale, bool enableSkipSoftmax)
+    float vScale, float skipSoftmaxThresholdLog2)
 {
     if (!sLLMLoaded)
     {
@@ -375,6 +408,18 @@ void CuteDslFMHARunner::run(void const* qPtr, void const* kvPtr, void* oPtr, int
     int32_t const headDim = mHeadDim;
     bool const useSlidingWindow = (slidingWindowSize < INT_MAX);
     int32_t constexpr kNoLimit = 1 << 30;
+
+    // Skip-softmax threshold sentinel: a finite negative log2(lambda) enables the
+    // skip variant; 0.0 (log2 of the degenerate lambda = 1) means disabled. Any
+    // other value is a caller bug — warn and dispatch dense.
+    bool const enableSkipSoftmax = std::isfinite(skipSoftmaxThresholdLog2) && skipSoftmaxThresholdLog2 < 0.0F;
+    if (!enableSkipSoftmax && skipSoftmaxThresholdLog2 != 0.0F)
+    {
+        LOG_WARNING(
+            "CuTe DSL LLM FMHA: invalid skipSoftmaxThresholdLog2=%f (want finite < 0, or 0 to disable); "
+            "dispatching dense kernel instead.",
+            skipSoftmaxThresholdLog2);
+    }
 
     LlmFmhaParams params{};
     params.qPtr = qPtr;
@@ -393,6 +438,7 @@ void CuteDslFMHARunner::run(void const* qPtr, void const* kvPtr, void* oPtr, int
     params.scaleK = kScale;
     params.scaleV = vScale;
     params.invScaleO = 1.0F;
+    params.skipSoftmaxThresholdLog2 = skipSoftmaxThresholdLog2;
     params.stream = stream;
 
     int32_t ret = -1;
@@ -461,7 +507,7 @@ void CuteDslFMHARunner::run(void const* qPtr, void const* kvPtr, void* oPtr, int
 void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, int32_t const* kvCachePageList,
     void* oPtr, int32_t const* cuKVSeqLens, int32_t numPages, int32_t maxPagesPerSeq, int32_t tokensPerPage,
     nvinfer1::DataType kvDataType, cudaStream_t stream, float attentionScale, int32_t slidingWindowSize, bool fp8Input,
-    float qScale, float kScale, float vScale, bool isCausal)
+    float qScale, float kScale, float vScale, bool isCausal, float skipSoftmaxThresholdLog2)
 {
     if (!sLLMLoaded)
     {
@@ -495,6 +541,18 @@ void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, i
     bool const useSlidingWindow = (slidingWindowSize < INT_MAX);
     int32_t constexpr kNoLimit = 1 << 30;
 
+    // Skip-softmax threshold sentinel: a finite negative log2(lambda) enables the
+    // skip variant; 0.0 means disabled.
+    bool const thresholdValid = std::isfinite(skipSoftmaxThresholdLog2) && skipSoftmaxThresholdLog2 < 0.0F;
+    if (!thresholdValid && skipSoftmaxThresholdLog2 != 0.0F)
+    {
+        LOG_WARNING(
+            "CuTe DSL paged LLM FMHA: invalid skipSoftmaxThresholdLog2=%f (want finite < 0, or 0 to disable); "
+            "dispatching dense paged kernel instead.",
+            skipSoftmaxThresholdLog2);
+    }
+    bool const enableSkipSoftmax = thresholdValid && !fp8Input && isCausal && !useSlidingWindow;
+
     LlmFmhaPagedParams params{};
     params.qPtr = qPtr;
     params.pagedKVPoolPtr = pagedKVPoolPtr;
@@ -515,6 +573,7 @@ void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, i
     params.scaleK = kScale;
     params.scaleV = vScale;
     params.invScaleO = 1.0F;
+    params.skipSoftmaxThresholdLog2 = skipSoftmaxThresholdLog2;
     params.stream = stream;
 
     int32_t ret = -1;
@@ -534,6 +593,13 @@ void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, i
                 ? callLlmFmhaPaged<cute_dsl_fmha_d256_dense_paged_wrapper>(sLLM_d256_dense_paged, params)
                 : callLlmFmhaPaged<cute_dsl_fmha_d512_dense_paged_wrapper>(sLLM_d512_dense_paged, params);
         }
+    }
+    else if (enableSkipSoftmax && (headDim == 64 || headDim == 128))
+    {
+        // Skip-softmax paged prefill: causal, FP16, non-sliding, d64/d128 only.
+        ret = headDim == 64
+            ? callLlmFmhaPaged<cute_dsl_fmha_d64_skipsoftmax_paged_wrapper>(sLLM_d64_skipsoftmax_paged, params)
+            : callLlmFmhaPaged<cute_dsl_fmha_d128_skipsoftmax_paged_wrapper>(sLLM_d128_skipsoftmax_paged, params);
     }
     else if (fp8Input)
     {

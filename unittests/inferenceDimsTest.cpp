@@ -38,6 +38,7 @@ InferenceDims makeValid()
         /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/2,
         /*.specVerifyPhaseLen=*/0,
+        /*.skipSoftmaxScaleLen=*/0,
     };
 }
 
@@ -54,6 +55,7 @@ std::vector<int64_t InferenceDims::*> allReferenced()
         &InferenceDims::contextMaskSelectorLen,
         &InferenceDims::startIndexLen,
         &InferenceDims::specVerifyPhaseLen,
+        &InferenceDims::skipSoftmaxScaleLen,
     };
 }
 
@@ -75,6 +77,7 @@ TEST(InferenceDimsTest, DimNameKnownMembers)
     EXPECT_EQ(dimName(&InferenceDims::contextMaskSelectorLen), "context_mask_selector_len");
     EXPECT_EQ(dimName(&InferenceDims::startIndexLen), "start_index_len");
     EXPECT_EQ(dimName(&InferenceDims::specVerifyPhaseLen), "spec_verify_phase_len");
+    EXPECT_EQ(dimName(&InferenceDims::skipSoftmaxScaleLen), "skip_softmax_scale_len");
 }
 
 TEST(InferenceDimsTest, DimNameUnknownReturnsEmpty)

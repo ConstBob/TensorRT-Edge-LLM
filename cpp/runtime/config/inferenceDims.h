@@ -71,6 +71,11 @@ struct InferenceDims
     //! prefill/decode; one means speculative verification. The plugin reads
     //! this shape, not the marker payload.
     int64_t specVerifyPhaseLen;
+    //! Shape length for `skip_softmax_scale`: the runtime skip-softmax
+    //! scale-factor override (integer S). Zero = keep the engine-carried
+    //! calibrated default. Like the phase marker, the plugin reads this
+    //! shape, never the payload.
+    int64_t skipSoftmaxScaleLen;
 };
 
 //! Tripwires: if `InferenceDims` gains, loses, or reorders a field, these asserts fire
@@ -80,7 +85,7 @@ struct InferenceDims
 //! change the meaning of every positional aggregate init). Note: these do NOT catch
 //! "short" aggregate inits (omitting trailing fields) — the policy is that production
 //! construction goes through recipe methods, which always set every field.
-static_assert(sizeof(InferenceDims) == 10 * sizeof(int64_t),
+static_assert(sizeof(InferenceDims) == 11 * sizeof(int64_t),
     "InferenceDims layout changed: update kDimNames, toString(), kZeroAllowedMembers, and every recipe "
     "method in LLMEngineConfig (prefillDims / decodeDims / denoiseDims / diffusionCommitDims / "
     "specVerifyDims / proposalDims / acceptDims / resetDims).");
@@ -97,6 +102,8 @@ static_assert(offsetof(InferenceDims, contextMaskSelectorLen) == 7 * sizeof(int6
 static_assert(offsetof(InferenceDims, startIndexLen) == 8 * sizeof(int64_t), "InferenceDims::startIndexLen reordered");
 static_assert(
     offsetof(InferenceDims, specVerifyPhaseLen) == 9 * sizeof(int64_t), "InferenceDims::specVerifyPhaseLen reordered");
+static_assert(offsetof(InferenceDims, skipSoftmaxScaleLen) == 10 * sizeof(int64_t),
+    "InferenceDims::skipSoftmaxScaleLen reordered");
 
 namespace detail
 {
@@ -121,16 +128,18 @@ inline constexpr std::array<std::pair<int64_t InferenceDims::*, std::string_view
         {&InferenceDims::contextMaskSelectorLen, "context_mask_selector_len"},
         {&InferenceDims::startIndexLen, "start_index_len"},
         {&InferenceDims::specVerifyPhaseLen, "spec_verify_phase_len"},
+        {&InferenceDims::skipSoftmaxScaleLen, "skip_softmax_scale_len"},
     }};
 
 //! Members where `0` is a legitimate engine-meaningful value (not a recipe
 //! bypass). `firstInvalidMember` excludes these from the `> 0` positivity
 //! check. Keep this set as small as possible — default validation should be
 //! strict, and most dims (batch, seqLen, kvLen, etc.) must be > 0.
-inline constexpr std::array<int64_t InferenceDims::*, 3> kZeroAllowedMembers{
+inline constexpr std::array<int64_t InferenceDims::*, 4> kZeroAllowedMembers{
     &InferenceDims::contextMaskSelectorLen,
     &InferenceDims::startIndexLen,
     &InferenceDims::specVerifyPhaseLen,
+    &InferenceDims::skipSoftmaxScaleLen,
 };
 } // namespace detail
 

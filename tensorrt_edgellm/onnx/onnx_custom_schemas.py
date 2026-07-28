@@ -123,6 +123,14 @@ _attention_plugin_schema = OpSchema(
             type_str="tensor(int32)",
             param_option=OpSchema.FormalParameterOption.Optional,
         ),
+        OpSchema.FormalParameter(
+            name="skip_softmax_scale",
+            description="Runtime skip-softmax override carrier (optional): 1-D "
+            "INT8 dummy whose LENGTH is the integer scale-factor override "
+            "(0 = keep the engine default); data never read.",
+            type_str="tensor(int8)",
+            param_option=OpSchema.FormalParameterOption.Optional,
+        ),
     ],
     outputs=[
         OpSchema.FormalParameter(
@@ -215,6 +223,14 @@ _attention_plugin_schema = OpSchema(
             name="attention_scale",
             type=OpSchema.AttrType.FLOAT,
             description="Absolute multiplier applied to QK^T before softmax.",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="skip_softmax_scale_factor",
+            type=OpSchema.AttrType.FLOAT,
+            description="Skip-softmax (BLASST) calibrated scale factor S "
+            "(0 = disabled); runtime derives lambda = S / context_length "
+            "per request for the prefill FMHA.",
             required=False,
         ),
         OpSchema.Attribute(

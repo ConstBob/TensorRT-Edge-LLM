@@ -205,8 +205,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         # if any softmax S-load atom changes.
         self.is_fragment_single_row = True
         # BLASST skip-softmax: None -> disabled (bit-identical dense base kernel).
-        # A float value is the raw lambda; log2 is taken at kernel-build time and
-        # threaded into softmax_step / the MMA-warp P*V skip behind const_expr gates.
+        # Non-None only compiles the skip path in; the runtime lambda is
+        # __call__'s skip_softmax_threshold_log2 argument.
         self.skip_softmax_threshold = skip_softmax_threshold
         self.softmax0_warp_ids = (0, 1, 2, 3)
         self.softmax1_warp_ids = (4, 5, 6, 7)
@@ -309,13 +309,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         else:
             self.rescale_threshold = 0.0
 
-        # skip-softmax (BLASST): log2 of the lambda threshold, or None to
-        # compile-time eliminate the entire skip path (bit-identical dense base).
-        if self.skip_softmax_threshold is not None:
-            self.skip_softmax_threshold_log2 = math.log2(self.skip_softmax_threshold)
-        else:
-            self.skip_softmax_threshold_log2 = None
-
     @cute.jit
     def __call__(
         self,
@@ -334,6 +327,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         skip_softmax_count: Optional[cute.Tensor] = None,   # Int32[1]; verify builds only
         total_softmax_count: Optional[cute.Tensor] = None,  # (perf builds pass None ->
                                                             #  const_expr removes atomics)
+        skip_softmax_threshold_log2: Optional[Float32] = None,  # log2(lambda)
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
@@ -376,6 +370,11 @@ class BlackwellFusedMultiHeadAttentionForward:
         :raises TypeError: If tensor data types don't match or aren't supported
         :raises RuntimeError: If tensor layouts aren't in supported formats
         """
+        # Softmax warps gate on this arg, the MMA warp on the ctor flag —
+        # disagreement would compile inconsistent pipelines.
+        assert (skip_softmax_threshold_log2 is not None) == (
+            self.skip_softmax_threshold is not None
+        ), "pass skip_softmax_threshold_log2 iff the class was built with skip enabled"
         scale_softmax = scale_q * scale_k
         if attention_scale != 1.0:
             scale_softmax *= attention_scale
@@ -665,6 +664,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             self.tile_sched_params,
             skip_softmax_count,
             total_softmax_count,
+            skip_softmax_threshold_log2,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -698,6 +698,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         It controls the grid size and per-sequence tile math. TMA descriptors
         stay bounded by the compact total_S tensor extent.
         """
+        assert self.skip_softmax_threshold is None, (
+            "skip-softmax is not supported on the ViT entry")
         total_s = q_tensor.layout.shape[0]
         s_q = max_seqlen
         h_q = q_tensor.layout.shape[1]
@@ -872,7 +874,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             q_smem_layout_staged, k_smem_layout_staged,
             p_tmem_layout_staged, v_smem_layout_staged,
             o_smem_layout_staged, self.tile_sched_params,
-            None, None,
+            None, None, None,
         ).launch(
             grid=grid, block=[self.threads_per_cta, 1, 1],
             cluster=self.cluster_shape_mnk, stream=stream,
@@ -895,6 +897,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         inv_scale_o: Float32,
         sm_count: Int32,
         stream: cuda.CUstream,
+        skip_softmax_count: Optional[cute.Tensor] = None,   # Int32[1]; verify builds only
+        total_softmax_count: Optional[cute.Tensor] = None,  # (perf builds pass None ->
+                                                            #  const_expr removes atomics)
+        skip_softmax_threshold_log2: Optional[Float32] = None,  # log2(lambda)
     ):
         """LLM FMHA over paged KV cache.
 
@@ -906,6 +912,9 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         attention_scale is the absolute model-defined QK^T multiplier.
         """
+        assert (skip_softmax_threshold_log2 is not None) == (
+            self.skip_softmax_threshold is not None
+        ), "pass skip_softmax_threshold_log2 iff the class was built with skip enabled"
         scale_softmax = scale_q * scale_k
         if attention_scale != 1.0:
             scale_softmax *= attention_scale
@@ -1057,6 +1066,10 @@ class BlackwellFusedMultiHeadAttentionForward:
             mma_corr_mbar_ptr: cute.struct.MemRange[Int64, self.mma_corr_stage * 2]
             tmem_dealloc_mbar_ptr: cute.struct.MemRange[Int64, 1]
             tmem_holding_buf: Int32
+            # skip-softmax (BLASST): per-warp skip votes exchanged across the 4
+            # warps of each softmax warpgroup (Int8 per warp).
+            s0_warp_wants_skip_softmax_exchange: cute.struct.MemRange[Int8, 4]
+            s1_warp_wants_skip_softmax_exchange: cute.struct.MemRange[Int8, 4]
             sO: cute.struct.Align[
                 cute.struct.MemRange[self.o_dtype, cute.cosize(o_smem_layout_staged)],
                 self.buffer_align_bytes]
@@ -1084,7 +1097,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             q_smem_layout_staged, k_smem_layout_staged,
             p_tmem_layout_staged, v_smem_layout_staged,
             o_smem_layout_staged, self.tile_sched_params,
-            None, None,
+            skip_softmax_count, total_softmax_count, skip_softmax_threshold_log2,
         ).launch(
             grid=grid, block=[self.threads_per_cta, 1, 1],
             cluster=self.cluster_shape_mnk, stream=stream,
@@ -1123,6 +1136,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         tile_sched_params: fmha_utils.FmhaStaticTileSchedulerParams,
         skip_softmax_count: Optional[cute.Tensor],
         total_softmax_count: Optional[cute.Tensor],
+        skip_softmax_threshold_log2: Optional[Float32],
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -2127,7 +2141,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 s0_s1_sequence_consumer=s0_s1_sequence_consumer,
                 s0_s1_sequence_producer=s0_s1_sequence_producer,
                 tile_sched_params=tile_sched_params,
-                skip_softmax_threshold_log2=self.skip_softmax_threshold_log2,
+                skip_softmax_threshold_log2=skip_softmax_threshold_log2,
                 warp_wants_skip_softmax_exchange=s0_warp_wants_skip_softmax_exchange,
                 skip_softmax_count=skip_softmax_count,
                 total_softmax_count=total_softmax_count,
@@ -2161,7 +2175,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 s0_s1_sequence_consumer=s0_s1_sequence_consumer,
                 s0_s1_sequence_producer=s0_s1_sequence_producer,
                 tile_sched_params=tile_sched_params,
-                skip_softmax_threshold_log2=self.skip_softmax_threshold_log2,
+                skip_softmax_threshold_log2=skip_softmax_threshold_log2,
                 warp_wants_skip_softmax_exchange=s1_warp_wants_skip_softmax_exchange,
                 skip_softmax_count=skip_softmax_count,
                 total_softmax_count=total_softmax_count,
@@ -7117,6 +7131,9 @@ def run(
     # helper-kernel probe, so it is safe under cross/foreign-arch compiles).
     _sm_count = Int32(utils.HardwareInfo().get_device_multiprocessor_count())
 
+    # Trailing optional args of the LLM __call__ ABI.
+    _trailing = ()
+
     # Compute folded scales for numpy reference and ViT path.
     # The LLM __call__ computes these internally from the raw per-tensor scales.
     if scale_softmax == 0.0:  # default to 1/sqrt(d)
@@ -7219,6 +7236,10 @@ def run(
         cu_kv_seqlens = mark_1d_dynamic(cu_kv_seqlens)
 
         start_time = time.time()
+        # log2(lambda) trailing arg for the skip-softmax variants (paged or not);
+        # None keeps the dense compile bit-identical.
+        _skip_log2 = (Float32(math.log2(skip_softmax_threshold))
+                      if skip_softmax_threshold is not None else None)
         if paged_kv:
             tokens_per_page = mma_tiler_mn[1]
             if tokens_per_page != 128:
@@ -7236,19 +7257,28 @@ def run(
                     mode=0, stride_order=(0, 1, 2)).mark_compact_shape_dynamic(
                         mode=2, stride_order=(0, 1, 2)))
             kv_pool_dyn = mark_kv_pool_dynamic(kv_pool_tensor)
+            # d256 class has no optional skip trailing args; d64/d128 does.
+            _paged_trailing = (() if isinstance(
+                fmha, BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256)
+                else (None, None, _skip_log2))
             compiled_fmha = cute.compile(
                 fmha.__call_paged__,
                 q_dyn, kv_pool_dyn, page_list_tensor, o_dyn,
                 cu_kv_seqlens, _wsl, scale_softmax, scale_q, scale_k,
                 scale_v, inv_scale_o, _sm_count, current_stream,
+                *_paged_trailing,
             )
         else:
             kv_dyn = mark_kv_cache_dynamic(kvcache_tensor)
+            _trailing = (() if isinstance(
+                fmha, BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256)
+                else (None, None, _skip_log2))
             compiled_fmha = cute.compile(
                 fmha,
                 q_dyn, kv_dyn, o_dyn, cu_kv_seqlens, _wsl,
                 scale_softmax, scale_q, scale_k, scale_v, inv_scale_o,
-                _sm_count, current_stream,
+                _sm_count, current_stream, 
+                *_trailing,
             )
 
     compilation_time = time.time() - start_time
@@ -7533,6 +7563,7 @@ def run(
             scale_v,
             inv_scale_o,
             _sm_count, current_stream,
+            *_trailing,
         )
         return args
 
@@ -7706,11 +7737,13 @@ def run_llm_multi_round_prefill_test(
     # kernel compiles the atomics out).
     _skip_cnt_cp = _total_cnt_cp = None
     _skip_cnt_t = _total_cnt_t = None
+    _skip_log2 = None
     if skip_softmax_threshold is not None and skip_softmax_threshold > 0:
         _skip_cnt_cp = cp.zeros(1, dtype=cp.int32)
         _total_cnt_cp = cp.zeros(1, dtype=cp.int32)
         _skip_cnt_t = from_dlpack(_skip_cnt_cp, assumed_align=16)
         _total_cnt_t = from_dlpack(_total_cnt_cp, assumed_align=16)
+        _skip_log2 = Float32(math.log2(skip_softmax_threshold))
 
     # ---- helpers ----
     def _to_cute(arr, element_type):
@@ -7807,7 +7840,7 @@ def run_llm_multi_round_prefill_test(
                     fmha_op, q_t, kv_t, o_t, cu_kv, _wsl,
                     _attention_scale, _scale_q, _scale_k, _scale_v,
                     _inv_scale_o, _sm_count, current_stream,
-                    _skip_cnt_t, _total_cnt_t,
+                    _skip_cnt_t, _total_cnt_t, _skip_log2,
                 )
             print(f"{_tag} Compilation time: "
                   f"{time.time() - start_time:.4f}s")
@@ -7824,7 +7857,7 @@ def run_llm_multi_round_prefill_test(
                 q_t, kv_t, o_t, cu_kv, _wsl,
                 _attention_scale, _scale_q, _scale_k, _scale_v,
                 _inv_scale_o, _sm_count, current_stream,
-                _skip_cnt_t, _total_cnt_t,
+                _skip_cnt_t, _total_cnt_t, _skip_log2,
             )
 
         # ---- read output ----
@@ -7869,7 +7902,8 @@ def run_llm_multi_round_prefill_test(
             max_diff = np.max(np.abs(o_actual - o_ref))
             mean_diff = np.mean(np.abs(o_actual - o_ref))
 
-            if max_diff > tolerance:
+            # NaN-safe: nan > tol is False, compare with the negated <= instead.
+            if not (max_diff <= tolerance):
                 print(f"  batch {bi}: FAIL  max_diff={max_diff:.6f}  "
                       f"mean_diff={mean_diff:.6f}")
                 all_pass = False
@@ -8160,7 +8194,10 @@ if __name__ == "__main__":
         help="Enable skip-softmax (BLASST). lambda in (0,1); the kernel skips "
         "a KV block when exp(scale*(block_max - running_max)) < lambda, and "
         "the gated feature package (per-warp vote, P*V skip) activates "
-        "with it. None/unset = dense, bit-identical.",
+        "with it. None/unset = dense, bit-identical. "
+        "The VALUE only drives the local self-test: the compiled/exported "
+        "kernel takes log2(lambda) as a runtime argument, so deployment sets "
+        "lambda per request (scale_factor / context_length).",
     )
 
     args = parser.parse_args()
