@@ -190,6 +190,7 @@ class Runtime:
     workspace: PurePosixPath
     edge: PurePosixPath
     trt: PurePosixPath
+    onnx_root: PurePosixPath
     env_script: PurePosixPath
 
 
@@ -201,10 +202,12 @@ class Config:
     run_host: HostSSHConfig
     run_id: str
     branch: str
-    hf_checkpoint_root: PurePosixPath
+    onnx_root: PurePosixPath
+    hf_checkpoint_root: PurePosixPath | None
     jobs: int
     source_root: Path = _SOURCE_ROOT
     download_hf_checkpoint: bool = False
+    export_onnx: bool = False
     no_trt_containers: bool = False
 
     def validate(self) -> None:
@@ -214,10 +217,15 @@ class Config:
             raise ValueError(
                 "trt_location must be an absolute, non-root PRE_BUILT directory path"
             )
-        if not _safe_path(self.hf_checkpoint_root):
+        if not _safe_path(self.onnx_root):
             raise ValueError(
-                "TRT_CI_HF_CHECKPOINT_DIR must be an absolute, non-root run-host path"
-            )
+                "TRT_CI_ONNX_DIR must be an absolute, non-root path")
+        if self.download_hf_checkpoint or self.export_onnx:
+            if self.hf_checkpoint_root is None or not _safe_path(
+                    self.hf_checkpoint_root):
+                raise ValueError(
+                    "TRT_CI_HF_CHECKPOINT_DIR must be an absolute, non-root path"
+                )
         if self.jobs <= 0:
             raise ValueError("TRT_CI_JOBS must be a positive integer")
         if not _RUN_ID_RE.fullmatch(self.run_id):
@@ -522,11 +530,14 @@ def _deploy(config: Config, code: Any, run_host: Host,
                             if config.architecture is Arch.X86_64 else None),
         )
         workspace = PurePosixPath(deployment.remote_workspace)
+        onnx_root = (workspace / "onnx"
+                     if config.architecture is Arch.D7L else config.onnx_root)
         return Runtime(
             target=deployment.remote_target,
             workspace=workspace,
             edge=workspace / "edgellm",
             trt=workspace / "trt",
+            onnx_root=onnx_root,
             env_script=PurePosixPath(deployment.env_script_path),
         )
 
@@ -534,13 +545,14 @@ def _deploy(config: Config, code: Any, run_host: Host,
     setup = code.write_environment_setup_script(
         run_result, preferred_component=BuildComponent.EDGELLM)
     return Runtime(run_host.target, edge, edge, config.trt_location,
-                   PurePosixPath(setup))
+                   config.onnx_root, PurePosixPath(setup))
 
 
 def _download_hf_checkpoints(config: Config, commands: Any,
                              target: Any) -> None:
     if not config.download_hf_checkpoint:
         return
+    assert config.hf_checkpoint_root is not None
     for model_name, (repository, checkpoint_dir) in _MODEL_CHECKPOINTS.items():
         result = commands.run(
             target,
@@ -561,6 +573,42 @@ def _download_hf_checkpoints(config: Config, commands: Any,
             raise FlowError(
                 f"HuggingFace checkpoint download failed for {model_name}",
                 _status(result))
+
+
+def _export_onnx(config: Config, code: Any, target: Any,
+                 run_result: Any) -> None:
+    if not config.export_onnx:
+        return
+    assert config.hf_checkpoint_root is not None
+    edge = PurePosixPath(str(config.edgellm_root))
+    setup = code.write_environment_setup_script(
+        run_result, preferred_component=BuildComponent.EDGELLM)
+    result = code.command_manager.run(
+        target,
+        CommandSpec(
+            name="Export Edge-LLM ONNX models",
+            command=_export_onnx_command(config, edge, PurePosixPath(setup)),
+            shell_type=ShellType.BASH,
+            cwd=str(edge),
+            timeout_s=_TEST_TIMEOUT_S,
+            output_mode=OutputMode.PROGRESS,
+            artifact_log_file=str(config.local_root / "export-onnx.log"),
+            operation_name="edgellm-export-onnx",
+        ))
+    if not result.success:
+        raise FlowError("ONNX export failed", _status(result))
+
+
+def _stage_onnx(config: Config, run_host: Host, runtime: Runtime) -> None:
+    if run_host.remote is None or config.architecture is not Arch.D7L:
+        return
+    copied = run_host.remote.copy_local_directory_to_remote(
+        local_path=str(config.onnx_root),
+        remote_path=str(runtime.onnx_root),
+        timeout_s=_TRANSFER_TIMEOUT_S,
+    )
+    if not copied:
+        raise FlowError("Could not stage ONNX models on the D7L run host")
 
 
 def _run_tests(config: Config, code: Any, run_host: Host, run_result: Any,
@@ -589,9 +637,9 @@ def _run_tests(config: Config, code: Any, run_host: Host, run_result: Any,
                       str(config.trt_location),
                       read_only=True))
     mounts.extend((
-        MountSpec(str(config.hf_checkpoint_root),
-                  str(config.hf_checkpoint_root),
-                  read_only=not config.download_hf_checkpoint),
+        MountSpec(str(runtime.onnx_root),
+                  str(runtime.onnx_root),
+                  read_only=True),
         MountSpec(str(_PYTHON_ROOT), str(_PYTHON_ROOT), read_only=True),
     ))
     extra_args = None
@@ -651,22 +699,42 @@ def _collect_results(config: Config, run_host: Host, runtime: Runtime,
     return status
 
 
-def _test_command(config: Config, runtime: Runtime) -> str:
-    results = runtime.workspace / "results"
-    onnx_root = runtime.workspace / "onnx"
-    tests = runtime.edge / "tests/defs/test_llm_pipeline.py"
-    export_tests = runtime.edge / "tests/defs/test_checkpoint_export.py"
-    plugin = runtime.edge / "libNvInfer_edgellm_plugin.so"
+def _export_onnx_command(config: Config, edge: PurePosixPath,
+                         env_script: PurePosixPath) -> str:
+    results = config.local_root / "results"
+    export_tests = edge / "tests/defs/test_checkpoint_export.py"
     q = shlex.quote
+    assert config.hf_checkpoint_root is not None
     export_cases = " ".join(f"--test-param={q(name + '-fp16')}"
                             for name in _MODEL_CHECKPOINTS)
+    generated_dirs = " ".join(
+        q(str(config.onnx_root / name / "llm-fp16-fp16"))
+        for name in _MODEL_CHECKPOINTS)
+    return f"""set -euo pipefail
+source {q(str(env_script))}
+export LLM_SDK_DIR={q(str(edge))}
+export LLM_MODELS_DIR={q(str(config.hf_checkpoint_root))}
+export ONNX_DIR={q(str(config.onnx_root))}
+export BUILD_DIR={q(str(edge))}
+export TEST_LOG_DIR={q(str(results / 'logs'))}
+export TRT_PACKAGE_DIR={q(str(config.trt_location))}
+rm -rf {generated_dirs}
+mkdir -p {q(str(results))} {q(str(config.onnx_root))}
+{q(str(_PYTHON))} -m pytest -q {q(str(export_tests))}::test_checkpoint_export \
+  {export_cases} --junitxml={q(str(results / 'e2e-export.xml'))} \
+  2>&1 | tee {q(str(results / 'e2e-export.log'))}
+"""
+
+
+def _test_command(config: Config, runtime: Runtime) -> str:
+    results = runtime.workspace / "results"
+    tests = runtime.edge / "tests/defs/test_llm_pipeline.py"
+    plugin = runtime.edge / "libNvInfer_edgellm_plugin.so"
+    q = shlex.quote
     build_cases = " ".join(f"--test-param={q(model)}"
                            for model in _E2E_MODEL_FAMILIES)
     inference_cases = " ".join(f"--test-param={q(model + '-llm_basic')}"
                                for model in _E2E_MODEL_FAMILIES)
-    generated_dirs = " ".join(
-        q(str(onnx_root / name / "llm-fp16-fp16"))
-        for name in _MODEL_CHECKPOINTS)
     use_host_python = (config.no_trt_containers
                        or config.architecture is Arch.D7L)
     python = "python3" if use_host_python else str(_PYTHON)
@@ -675,17 +743,13 @@ def _test_command(config: Config, runtime: Runtime) -> str:
 source {q(str(runtime.env_script))}
 export EDGELLM_PLUGIN_PATH={q(str(plugin))}
 {python_path}export LLM_SDK_DIR={q(str(runtime.edge))}
-export LLM_MODELS_DIR={q(str(config.hf_checkpoint_root))}
-export ONNX_DIR={q(str(onnx_root))}
+export ONNX_DIR={q(str(runtime.onnx_root))}
 export ENGINE_DIR={q(str(runtime.workspace / 'engines'))}
 export BUILD_DIR={q(str(runtime.edge))}
 export TEST_LOG_DIR={q(str(results / 'logs'))}
 export TRT_PACKAGE_DIR={q(str(runtime.trt))}
-rm -rf {q(str(results))} {generated_dirs}
-mkdir -p {q(str(results))} {q(str(onnx_root))}
-{q(python)} -m pytest -q {q(str(export_tests))}::test_checkpoint_export \
-  {export_cases} --junitxml={q(str(results / 'e2e-export.xml'))} \
-  2>&1 | tee {q(str(results / 'e2e-export.log'))}
+rm -rf {q(str(results))}
+mkdir -p {q(str(results))}
 {q(python)} -m pytest -q {q(str(tests))}::TestLLMPipeline::test_engine_build \
   {build_cases} --junitxml={q(str(results / 'e2e-build.xml'))} \
   2>&1 | tee {q(str(results / 'e2e-build.log'))}
@@ -719,6 +783,10 @@ def _parser() -> argparse.ArgumentParser:
         "--download_hf_checkpoint",
         action="store_true",
         help="download configured HuggingFace checkpoints before ONNX export")
+    parser.add_argument(
+        "--export_onnx",
+        action="store_true",
+        help="export ONNX models from HF checkpoints on the build host")
     parser.add_argument("--run-id", help=argparse.SUPPRESS)
     return parser
 
@@ -732,12 +800,18 @@ def _config(args: argparse.Namespace) -> Config:
         "CI_COMMIT_REF_NAME") or "main"
     if not branch or any(char in branch for char in "\r\n\0"):
         raise ValueError("invalid TRT_CI_BRANCH")
+    onnx_dir = os.environ.get("TRT_CI_ONNX_DIR")
+    if onnx_dir is None:
+        raise ValueError("TRT_CI_ONNX_DIR must be set")
+    if not onnx_dir or any(char in onnx_dir for char in "\r\n\0"):
+        raise ValueError("invalid TRT_CI_ONNX_DIR")
     hf_checkpoint_dir = os.environ.get("TRT_CI_HF_CHECKPOINT_DIR")
-    if hf_checkpoint_dir is None:
-        raise ValueError("TRT_CI_HF_CHECKPOINT_DIR must be set")
-    if not hf_checkpoint_dir or any(char in hf_checkpoint_dir
-                                    for char in "\r\n\0"):
-        raise ValueError("invalid TRT_CI_HF_CHECKPOINT_DIR")
+    if args.download_hf_checkpoint or args.export_onnx:
+        if hf_checkpoint_dir is None:
+            raise ValueError("TRT_CI_HF_CHECKPOINT_DIR must be set")
+        if not hf_checkpoint_dir or any(char in hf_checkpoint_dir
+                                        for char in "\r\n\0"):
+            raise ValueError("invalid TRT_CI_HF_CHECKPOINT_DIR")
     config = Config(
         architecture=args.architecture,
         trt_location=args.trt_location,
@@ -745,9 +819,12 @@ def _config(args: argparse.Namespace) -> Config:
         run_host=read_ssh_config(args.run_host, "run_host"),
         run_id=args.run_id or uuid.uuid4().hex[:12],
         branch=branch,
-        hf_checkpoint_root=PurePosixPath(hf_checkpoint_dir),
+        onnx_root=PurePosixPath(onnx_dir),
+        hf_checkpoint_root=(PurePosixPath(hf_checkpoint_dir)
+                            if hf_checkpoint_dir is not None else None),
         jobs=jobs,
         download_hf_checkpoint=args.download_hf_checkpoint,
+        export_onnx=args.export_onnx,
         no_trt_containers=args.no_trt_containers,
     )
     config.validate()
@@ -807,8 +884,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         run_result = _build(config, code, build_host.target)
+        _download_hf_checkpoints(config, commands, build_host.target)
+        _export_onnx(config, code, build_host.target, run_result)
         runtime = _deploy(config, code, run_host, run_result)
-        _download_hf_checkpoints(config, commands, runtime.target)
+        _stage_onnx(config, run_host, runtime)
         status = _run_tests(config, code, run_host, run_result, runtime,
                             logger)
     except FlowError as error:
