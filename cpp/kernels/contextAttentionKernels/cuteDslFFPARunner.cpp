@@ -30,15 +30,9 @@ ffpa_d512_causal_Kernel_Module_t CuteDslFFPARunner::sD512CausalModule{};
 #ifdef CUTE_DSL_FFPA_VISIONBLOCK_ENABLED
 ffpa_d512_causal_visionblock_Kernel_Module_t CuteDslFFPARunner::sD512CausalVisionBlockModule{};
 #endif
-#if defined(CUTE_DSL_FFPA_GQA4_ENABLED)
 ffpa_d512_causal_gqa4_Kernel_Module_t CuteDslFFPARunner::sD512CausalGqa4Module{};
-#endif
-#if defined(CUTE_DSL_FFPA_GQA8_ENABLED)
 ffpa_d512_causal_gqa8_Kernel_Module_t CuteDslFFPARunner::sD512CausalGqa8Module{};
-#endif
-#if defined(CUTE_DSL_FFPA_GQA16_ENABLED)
 ffpa_d512_causal_gqa16_Kernel_Module_t CuteDslFFPARunner::sD512CausalGqa16Module{};
-#endif
 bool CuteDslFFPARunner::sLoaded{false};
 std::mutex CuteDslFFPARunner::sMutex;
 
@@ -72,16 +66,10 @@ bool CuteDslFFPARunner::canImplement(int32_t headDim, int32_t smVersion, int32_t
     int32_t const kvGroupSize = numQHeads / numKVHeads;
     switch (kvGroupSize)
     {
-    case 1: return true; // MHA — always supported by base kernel
-#if defined(CUTE_DSL_FFPA_GQA4_ENABLED)
-    case 4: return true;
-#endif
-#if defined(CUTE_DSL_FFPA_GQA8_ENABLED)
-    case 8: return true;
-#endif
-#if defined(CUTE_DSL_FFPA_GQA16_ENABLED)
-    case 16: return true;
-#endif
+    case 1: return true;  // MHA — base kernel
+    case 4: return true;  // GQA-4
+    case 8: return true;  // GQA-8
+    case 16: return true; // GQA-16
     default: return false;
     }
 }
@@ -111,15 +99,9 @@ bool CuteDslFFPARunner::loadKernelModule()
 #ifdef CUTE_DSL_FFPA_VISIONBLOCK_ENABLED
         ffpa_d512_causal_visionblock_Kernel_Module_Load(&sD512CausalVisionBlockModule);
 #endif
-#if defined(CUTE_DSL_FFPA_GQA4_ENABLED)
         ffpa_d512_causal_gqa4_Kernel_Module_Load(&sD512CausalGqa4Module);
-#endif
-#if defined(CUTE_DSL_FFPA_GQA8_ENABLED)
         ffpa_d512_causal_gqa8_Kernel_Module_Load(&sD512CausalGqa8Module);
-#endif
-#if defined(CUTE_DSL_FFPA_GQA16_ENABLED)
         ffpa_d512_causal_gqa16_Kernel_Module_Load(&sD512CausalGqa16Module);
-#endif
         sLoaded = true;
         LOG_DEBUG("CuTe DSL FFPA d512 causal kernel module(s) loaded");
         return true;
@@ -139,18 +121,12 @@ void CuteDslFFPARunner::unloadKernelModule()
         return;
     }
 
-#if defined(CUTE_DSL_FFPA_GQA16_ENABLED)
     ffpa_d512_causal_gqa16_Kernel_Module_Unload(&sD512CausalGqa16Module);
     sD512CausalGqa16Module = {};
-#endif
-#if defined(CUTE_DSL_FFPA_GQA8_ENABLED)
     ffpa_d512_causal_gqa8_Kernel_Module_Unload(&sD512CausalGqa8Module);
     sD512CausalGqa8Module = {};
-#endif
-#if defined(CUTE_DSL_FFPA_GQA4_ENABLED)
     ffpa_d512_causal_gqa4_Kernel_Module_Unload(&sD512CausalGqa4Module);
     sD512CausalGqa4Module = {};
-#endif
     ffpa_d512_causal_Kernel_Module_Unload(&sD512CausalModule);
     sD512CausalModule = {};
 #ifdef CUTE_DSL_FFPA_VISIONBLOCK_ENABLED
@@ -292,7 +268,6 @@ int CuteDslFFPARunner::run(CuteDslFFPAParams const& params, cudaStream_t stream)
 
     int32_t const kvGroupSize = params.numQHeads / params.numKVHeads;
 
-#if defined(CUTE_DSL_FFPA_GQA16_ENABLED)
     if (kvGroupSize == 16)
     {
         ffpa_d512_causal_gqa16_Tensor_mQ_t qTensor{};
@@ -339,9 +314,7 @@ int CuteDslFFPARunner::run(CuteDslFFPAParams const& params, cudaStream_t stream)
         return cute_dsl_ffpa_d512_causal_gqa16_wrapper(&sD512CausalGqa16Module, &qTensor, &kTensor, &vTensor, &oTensor,
             &cuSeqLenQTensor, &cuSeqLenKTensor, softmaxScale, params.numKVHeads, stream);
     }
-#endif
 
-#if defined(CUTE_DSL_FFPA_GQA8_ENABLED)
     if (kvGroupSize == 8)
     {
         ffpa_d512_causal_gqa8_Tensor_mQ_t qTensor{};
@@ -388,9 +361,7 @@ int CuteDslFFPARunner::run(CuteDslFFPAParams const& params, cudaStream_t stream)
         return cute_dsl_ffpa_d512_causal_gqa8_wrapper(&sD512CausalGqa8Module, &qTensor, &kTensor, &vTensor, &oTensor,
             &cuSeqLenQTensor, &cuSeqLenKTensor, softmaxScale, params.numKVHeads, stream);
     }
-#endif
 
-#if defined(CUTE_DSL_FFPA_GQA4_ENABLED)
     if (kvGroupSize == 4)
     {
         ffpa_d512_causal_gqa4_Tensor_mQ_t qTensor{};
@@ -437,34 +408,13 @@ int CuteDslFFPARunner::run(CuteDslFFPAParams const& params, cudaStream_t stream)
         return cute_dsl_ffpa_d512_causal_gqa4_wrapper(&sD512CausalGqa4Module, &qTensor, &kTensor, &vTensor, &oTensor,
             &cuSeqLenQTensor, &cuSeqLenKTensor, softmaxScale, params.numKVHeads, stream);
     }
-#endif
 
     // Only MHA (kvGroupSize == 1) falls through to the base kernel.
     // Other group sizes without a specialized variant are unsupported.
     if (kvGroupSize != 1)
     {
-        LOG_ERROR(
-            "FFPA d512 causal CuTe DSL kernel: GQA group size %d is not supported "
-            "(no compiled variant). Supported: 1 (MHA)%s%s%s.",
-            kvGroupSize,
-#if defined(CUTE_DSL_FFPA_GQA4_ENABLED)
-            ", 4"
-#else
-            ""
-#endif
-            ,
-#if defined(CUTE_DSL_FFPA_GQA8_ENABLED)
-            ", 8"
-#else
-            ""
-#endif
-            ,
-#if defined(CUTE_DSL_FFPA_GQA16_ENABLED)
-            ", 16"
-#else
-            ""
-#endif
-        );
+        LOG_ERROR("FFPA d512 causal CuTe DSL kernel: GQA group size %d is not supported. Supported: 1 (MHA), 4, 8, 16.",
+            kvGroupSize);
         return -1;
     }
 
