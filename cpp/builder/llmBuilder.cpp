@@ -1484,11 +1484,14 @@ bool LLMBuilder::setupIntermediateRecurrentStateProfiles(
     bool result = true;
 
     // Intermediate recurrent state shape: [batch, seq_len, recurrentNumHeads, recurrentHeadDim, recurrentStateSize]
-    nvinfer1::Dims minShape = createDims({1, 1, mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
-    nvinfer1::Dims optCtxShape = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2,
-        mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
-    nvinfer1::Dims maxCtxShape = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen,
-        mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
+    nvinfer1::Dims minCtxShape
+        = createDims({1, 0, mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
+    nvinfer1::Dims optCtxShape = createDims(
+        {mBuilderConfig.maxBatchSize, 0, mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
+    nvinfer1::Dims maxCtxShape = createDims(
+        {mBuilderConfig.maxBatchSize, 0, mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
+    nvinfer1::Dims minGenShape
+        = createDims({1, 0, mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
     nvinfer1::Dims optGenShape
         = createDims({mBuilderConfig.maxBatchSize, effectiveOptTokens(mBuilderConfig.maxVerifyTreeSize),
             mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
@@ -1498,8 +1501,8 @@ bool LLMBuilder::setupIntermediateRecurrentStateProfiles(
     for (int32_t i = 0; i < mNumLinearAttnLayers; ++i)
     {
         std::string const name = binding_names::formatIntermediateRecurrentStateName(i);
-        result &= setOptimizationProfile(&contextProfile, name.c_str(), minShape, optCtxShape, maxCtxShape);
-        result &= setOptimizationProfile(&generationProfile, name.c_str(), minShape, optGenShape, maxGenShape);
+        result &= setOptimizationProfile(&contextProfile, name.c_str(), minCtxShape, optCtxShape, maxCtxShape);
+        result &= setOptimizationProfile(&generationProfile, name.c_str(), minGenShape, optGenShape, maxGenShape);
     }
 
     LOG_DEBUG("Set up intermediate recurrent state profiles for %d recurrent layers (MTP)", mNumLinearAttnLayers);
@@ -1517,11 +1520,10 @@ bool LLMBuilder::setupIntermediateConvStateProfiles(
     bool result = true;
 
     // Intermediate conv state shape: [batch, seq_len, conv_dim, conv_kernel]
-    nvinfer1::Dims minShape = createDims({1, 1, mConvDim, mConvKernel});
-    nvinfer1::Dims optCtxShape
-        = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mConvDim, mConvKernel});
-    nvinfer1::Dims maxCtxShape
-        = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mConvDim, mConvKernel});
+    nvinfer1::Dims minCtxShape = createDims({1, 0, mConvDim, mConvKernel});
+    nvinfer1::Dims optCtxShape = createDims({mBuilderConfig.maxBatchSize, 0, mConvDim, mConvKernel});
+    nvinfer1::Dims maxCtxShape = createDims({mBuilderConfig.maxBatchSize, 0, mConvDim, mConvKernel});
+    nvinfer1::Dims minGenShape = createDims({1, 0, mConvDim, mConvKernel});
     nvinfer1::Dims optGenShape = createDims(
         {mBuilderConfig.maxBatchSize, effectiveOptTokens(mBuilderConfig.maxVerifyTreeSize), mConvDim, mConvKernel});
     nvinfer1::Dims maxGenShape
@@ -1530,8 +1532,8 @@ bool LLMBuilder::setupIntermediateConvStateProfiles(
     for (int32_t i = 0; i < mNumLinearAttnLayers; ++i)
     {
         std::string const name = binding_names::formatIntermediateConvStateName(i);
-        result &= setOptimizationProfile(&contextProfile, name.c_str(), minShape, optCtxShape, maxCtxShape);
-        result &= setOptimizationProfile(&generationProfile, name.c_str(), minShape, optGenShape, maxGenShape);
+        result &= setOptimizationProfile(&contextProfile, name.c_str(), minCtxShape, optCtxShape, maxCtxShape);
+        result &= setOptimizationProfile(&generationProfile, name.c_str(), minGenShape, optGenShape, maxGenShape);
     }
 
     LOG_DEBUG("Set up intermediate conv state profiles for %d recurrent layers (MTP/DFlash)", mNumLinearAttnLayers);
