@@ -536,6 +536,7 @@ class Gemma4Attention(Attention):
             "attention_scale": self.attention_scale,
             "enable_context_mask_selector": context_mask_selector is not None,
             "enable_vision_block_attention": enable_vision_block,
+            "skip_softmax_scale_factor": 0.0,
         }
         if context_mask_selector is not None:
             kwargs["context_mask_selector"] = context_mask_selector

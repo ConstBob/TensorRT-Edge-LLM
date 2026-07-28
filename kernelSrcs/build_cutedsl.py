@@ -249,17 +249,17 @@ KERNEL_VARIANTS = [
         script="fmha_cutedsl_blackwell/fmha.py",
         script_args=["--q_shape", "1,1024,14,128", "--k_shape", "1,1024,1,128"] + _LLM,
     ),
-    # Skip-softmax (BLASST) variants: causal-only, lambda baked at export.
-    # Lambdas are the 4096-context-safe values from the MR calibration table
-    # (kernelSrcs/fmha_cutedsl_blackwell/README.md), so any test seqlen up to
-    # 4096 passes the 0.1 max-abs accuracy gate.
+    # Skip-softmax (BLASST) variants: causal-only. The threshold value here is
+    # a SENTINEL whose only role is to compile the skip path in. Keep it tiny
+    # (not 1.0): it doubles as the self-test lambda when fmha.py runs without
+    # --export_only, and lambda = 1 fails the accuracy gate.
     KernelVariant(
         name="fmha_d64_skipsoftmax",
         group="fmha",
         supported_sms=[100, 101, 110],
         script="fmha_cutedsl_blackwell/fmha.py",
         script_args=["--q_shape", "1,1024,14,64", "--k_shape", "1,1024,1,64"]
-                    + _LLM + ["--skip_softmax_threshold", "0.003"],
+                    + _LLM + ["--skip_softmax_threshold", "1e-6"],
     ),
     KernelVariant(
         name="fmha_d128_skipsoftmax",
@@ -267,7 +267,7 @@ KERNEL_VARIANTS = [
         supported_sms=[100, 101, 110],
         script="fmha_cutedsl_blackwell/fmha.py",
         script_args=["--q_shape", "1,1024,14,128", "--k_shape", "1,1024,1,128"]
-                    + _LLM + ["--skip_softmax_threshold", "0.001"],
+                    + _LLM + ["--skip_softmax_threshold", "1e-6"],
     ),
     KernelVariant(
         name="fmha_d256",
@@ -406,6 +406,25 @@ KERNEL_VARIANTS = [
         supported_sms=[100, 101, 110],
         script="fmha_cutedsl_blackwell/fmha.py",
         script_args=["--q_shape", "1,1024,14,128", "--k_shape", "1,1024,1,128"] + _LLM_PAGED,
+    ),
+    # Skip-softmax (BLASST) paged variants: causal-only, tokens_per_page == 128.
+    # The threshold is the same compile-in SENTINEL as the non-paged skip
+    # variants; the runtime log2(lambda) is a trailing kernel argument.
+    KernelVariant(
+        name="fmha_d64_skipsoftmax_paged",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,14,64", "--k_shape", "1,1024,1,64"]
+                    + _LLM_PAGED + ["--skip_softmax_threshold", "1e-6"],
+    ),
+    KernelVariant(
+        name="fmha_d128_skipsoftmax_paged",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,14,128", "--k_shape", "1,1024,1,128"]
+                    + _LLM_PAGED + ["--skip_softmax_threshold", "1e-6"],
     ),
     KernelVariant(
         name="fmha_d256_paged",

@@ -44,7 +44,9 @@
 #include "kernels/contextAttentionKernels/cuteDslFFPARunner.h"
 #endif
 
+#include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cuda_fp16.h>
@@ -52,6 +54,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <utility>
 #include <vector>
 
 using namespace nvinfer1;
@@ -102,6 +105,7 @@ constexpr int32_t kNUM_QK_NORM_OPTIONAL_INPUTS{2};
 constexpr int32_t kNUM_CONTEXT_MASK_SELECTOR_OPTIONAL_INPUTS{1};
 constexpr int32_t kNUM_TREE_ATTN_OPTIONAL_INPUTS{2};
 constexpr int32_t kNUM_VISION_BLOCK_OPTIONAL_INPUTS{1};
+constexpr int32_t kNUM_SKIP_SCALE_OPTIONAL_INPUTS{1};
 constexpr int32_t kNUM_REQUIRED_OUTPUTS{2};
 
 // Dynamic input-index helpers for the optional inputs (positions depend on which optional
@@ -126,6 +130,13 @@ constexpr int32_t attnMaskInputIdx(bool enableQKNorm, bool enableContextMaskSele
 constexpr int32_t attnPosIdInputIdx(bool enableQKNorm, bool enableContextMaskSelector)
 {
     return attnMaskInputIdx(enableQKNorm, enableContextMaskSelector) + 1;
+}
+constexpr int32_t skipSoftmaxScaleInputIdx(
+    bool enableQKNorm, bool enableContextMaskSelector, bool enableTreeAttention, bool enableVisionBlock)
+{
+    return attnMaskInputIdx(enableQKNorm, enableContextMaskSelector)
+        + (enableTreeAttention ? kNUM_TREE_ATTN_OPTIONAL_INPUTS : 0)
+        + (enableVisionBlock ? kNUM_VISION_BLOCK_OPTIONAL_INPUTS : 0);
 }
 
 // Support Tree Attention decoding schema up to 128 tokens in the draft tree per batch.
@@ -182,6 +193,27 @@ AttentionExecutionMode deduceModeVanilla(rt::Tensor const& packedQKVTensor, rt::
     }
     return AttentionExecutionMode::kVANILLA_DECODING;
 }
+
+#ifdef CUTE_DSL_FMHA_ENABLED
+//! Skip-softmax (BLASST): derive the runtime threshold from the calibrated scale
+//! factor S as lambda = S / L, passed to the kernel as log2(lambda). Returns a
+//! finite negative log2(lambda) when skip applies, or 0.0 — the runner's disable
+//! sentinel (log2 of the degenerate lambda = 1) — when it does not.
+float computeSkipSoftmaxThreshold(float scaleFactor, int32_t slidingWindowSize, int32_t kvCacheCapacity)
+{
+    if (scaleFactor <= 0.F || slidingWindowSize > 0)
+    {
+        return 0.F;
+    }
+    float const lambda = scaleFactor / static_cast<float>(std::max(kvCacheCapacity, 1));
+    if (lambda >= 1.F)
+    {
+        // Degenerate threshold (would mark every tile skippable) — run dense instead.
+        return 0.F;
+    }
+    return std::log2(lambda);
+}
+#endif // CUTE_DSL_FMHA_ENABLED
 
 AttentionExecutionMode deduceModeTreeAttention(
     rt::Tensor const& packedQKVTensor, rt::Tensor const& kvCacheStartIdxTensor, rt::Tensor const& attentionPosIdTensor)
@@ -617,6 +649,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
     , mEnableKVShared(parsePluginScalarField<int32_t>("enable_kv_shared", fc).value_or(0))
     , mEnableFp8KVCache(parsePluginScalarField<int32_t>("enable_fp8_kv_cache", fc).value_or(0))
     , mSlidingWindowSize(parsePluginScalarField<int32_t>("sliding_window_size", fc).value_or(-1))
+    , mSkipSoftmaxScaleFactor(parsePluginScalarField<float>("skip_softmax_scale_factor", fc).value_or(0.f))
 {
     mEnableVisionBlockAttention = parsePluginScalarField<int32_t>("enable_vision_block_attention", fc).value_or(0);
     mEnableContextMaskSelector = parsePluginScalarField<int32_t>("enable_context_mask_selector", fc).value_or(0);
@@ -751,12 +784,20 @@ IPluginV3* AttentionPlugin::clone() noexcept
 {
     try
     {
+        // TODO: every new plugin attribute must be added here by hand (ctor arg or
+        // manual assignment), and a forgotten entry fails silently — the clone
+        // constructs fine and the feature is just off at runtime (TensorRT executes
+        // the clone, not the creator-made instance). If this ever bites, switch to
+        // a memberwise copy (protected `AttentionPlugin(AttentionPlugin const&) =
+        // default` + clear the serialization scratch), which clones future fields
+        // by construction.
         auto* p = new AttentionPlugin(mLayerName, mNumQHeads, mNumKVHeads, mHeadSize, mEnableTreeAttention,
             mEnableFp8KVCache, mEnableVisionBlockAttention, mEnableContextMaskSelector, mSlidingWindowSize, mQkvScales,
             mAttentionScale);
         p->mEnableQKNorm = mEnableQKNorm;
         p->mEnableKVShared = mEnableKVShared;
         p->mRmsNormEps = mRmsNormEps;
+        p->mSkipSoftmaxScaleFactor = mSkipSoftmaxScaleFactor;
         p->setPluginNamespace(mNamespace.c_str());
         return p;
     }
@@ -986,7 +1027,8 @@ bool AttentionPlugin::supportsFormatCombination(
     int32_t const expectedNbInputs = kNUM_REQUIRED_INPUTS + (mEnableQKNorm ? kNUM_QK_NORM_OPTIONAL_INPUTS : 0)
         + (mEnableContextMaskSelector ? kNUM_CONTEXT_MASK_SELECTOR_OPTIONAL_INPUTS : 0)
         + (mEnableTreeAttention ? kNUM_TREE_ATTN_OPTIONAL_INPUTS : 0)
-        + (mEnableVisionBlockAttention ? kNUM_VISION_BLOCK_OPTIONAL_INPUTS : 0);
+        + (mEnableVisionBlockAttention ? kNUM_VISION_BLOCK_OPTIONAL_INPUTS : 0)
+        + (mSkipSoftmaxScaleFactor > 0.F ? kNUM_SKIP_SCALE_OPTIONAL_INPUTS : 0);
     bool const checkNumIOs = nbInputs == expectedNbInputs && nbOutputs == kNUM_REQUIRED_OUTPUTS;
     if (!checkNumIOs)
     {
@@ -1053,6 +1095,14 @@ bool AttentionPlugin::supportsFormatCombination(
                 {
                     result = checkVisionBlockIds(inOut[pos].desc);
                 }
+                currentOptionalInputIdx += kNUM_VISION_BLOCK_OPTIONAL_INPUTS;
+            }
+            if (mSkipSoftmaxScaleFactor > 0.F && pos == currentOptionalInputIdx)
+            {
+                // Shape-only carrier: 1-D INT8 dummy whose length encodes the runtime
+                // skip-softmax scale-factor override. Length is dynamic (>= 0).
+                result = inOut[pos].desc.type == DataType::kINT8 && inOut[pos].desc.format == TensorFormat::kLINEAR
+                    && inOut[pos].desc.dims.nbDims == 1;
             }
         }
     }
@@ -1259,6 +1309,25 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
     int32_t const maxPagesPerSeq = static_cast<int32_t>(kvPageTableInputDesc.dims.d[2]);
     // Padded per-slot token capacity spanned by the page table (each page holds kTOKENS_PER_PAGE).
     int32_t const kvCacheCapacity = maxPagesPerSeq * rt::kTOKENS_PER_PAGE;
+
+#ifdef CUTE_DSL_FMHA_ENABLED
+    // Skip-softmax (BLASST): resolve the effective scale factor S (engine-carried
+    // calibrated default, overridden by the optional skip_softmax_scale input's
+    // SHAPE when present).
+    float skipSoftmaxScaleFactor = mSkipSoftmaxScaleFactor;
+    if (mSkipSoftmaxScaleFactor > 0.F)
+    {
+        int32_t const skipScaleIdx = skipSoftmaxScaleInputIdx(mEnableQKNorm != 0, mEnableContextMaskSelector != 0,
+            mEnableTreeAttention != 0, mEnableVisionBlockAttention != 0);
+        int64_t const overrideS = inputDesc[skipScaleIdx].dims.d[0];
+        if (overrideS > 0)
+        {
+            skipSoftmaxScaleFactor = static_cast<float>(overrideS);
+        }
+    }
+    float const skipSoftmaxThresholdLog2
+        = computeSkipSoftmaxThreshold(skipSoftmaxScaleFactor, mSlidingWindowSize, kvCacheCapacity);
+#endif // CUTE_DSL_FMHA_ENABLED
 
     // Batch-shaped view of the same pool buffer for the paged applyRopeWriteKV* kernels: they validate
     // and index off a `[B, 2, Hkv, capPadded, D]` descriptor (the flat page pool addressed via the page
@@ -1623,7 +1692,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                     attentionOutputTensor.dataPointer<half>(),    // O  [b, s_q, h_q, d]
                     fmhaCuKVSeqLens, 2 * numPages, maxPagesPerSeq, rt::kTOKENS_PER_PAGE, kvCacheTensor.getDataType(),
                     stream, mAttentionScale, slidingWindow, /*fp8Input=*/false, 1.0F, kScale, vScale,
-                    !usePaddingContextMask);
+                    !usePaddingContextMask, skipSoftmaxThresholdLog2);
             }
             else
 #endif
@@ -1794,7 +1863,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                         attentionOutputTensor.dataPointer<half>(),    // O  [b, s_q, h_q, d]
                         fmhaCuKVSeqLens, 2 * numPages, maxPagesPerSeq, rt::kTOKENS_PER_PAGE,
                         kvCacheTensor.getDataType(), stream, mAttentionScale, slidingWindow, /*fp8Input=*/false, 1.0F,
-                        1.0F, 1.0F, !usePaddingContextMask);
+                        1.0F, 1.0F, !usePaddingContextMask, skipSoftmaxThresholdLog2);
                 }
             }
             else
@@ -1992,6 +2061,7 @@ PluginFieldCollection const* AttentionPlugin::getFieldsToSerialize() noexcept
     mDataToSerialize.emplace_back(
         "enable_context_mask_selector", &mEnableContextMaskSelector, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("sliding_window_size", &mSlidingWindowSize, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back("skip_softmax_scale_factor", &mSkipSoftmaxScaleFactor, PluginFieldType::kFLOAT32, 1);
     mDataToSerialize.emplace_back(
         "qkv_scales", mQkvScales.data(), PluginFieldType::kFLOAT32, static_cast<int32_t>(mQkvScales.size()));
     // Serialize the RMSNorm eps for the fused qk_norm path. The gamma WEIGHTS live as
@@ -2027,6 +2097,8 @@ AttentionPluginCreator::AttentionPluginCreator()
     mPluginAttributes.emplace_back(PluginField("enable_context_mask_selector", nullptr, PluginFieldType::kINT32, 0));
     // Sliding window size (-1 = no sliding window, >0 = window size)
     mPluginAttributes.emplace_back(PluginField("sliding_window_size", nullptr, PluginFieldType::kINT32, 0));
+    // Skip-softmax (BLASST) calibrated scale factor S (0 = disabled, the default)
+    mPluginAttributes.emplace_back(PluginField("skip_softmax_scale_factor", nullptr, PluginFieldType::kFLOAT32, 0));
     // Optional QKV dequant scales [q, k, v] for FP8 attention
     mPluginAttributes.emplace_back(PluginField("qkv_scales", nullptr, PluginFieldType::kFLOAT32, 0));
     // Optional per-head RMSNorm gamma weights (length == head_size) and eps. Empty / missing ->

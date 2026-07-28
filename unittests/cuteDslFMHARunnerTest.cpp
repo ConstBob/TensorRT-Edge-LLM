@@ -280,8 +280,9 @@ void runViTAccuracyCase(
 }
 
 void runLlmAccuracyCase(int32_t batchSize, int32_t seqLen, int32_t numQHeads, int32_t numKVHeads, int32_t headDim,
-    float attentionScale, bool enableSkipSoftmax = false)
+    float attentionScale, float skipSoftmaxThresholdLog2 = 0.0F)
 {
+    bool const enableSkipSoftmax = skipSoftmaxThresholdLog2 < 0.0F;
     size_t const qSize = static_cast<size_t>(batchSize) * seqLen * numQHeads * headDim;
     size_t const kvSize = static_cast<size_t>(batchSize) * seqLen * numKVHeads * headDim;
 
@@ -345,7 +346,7 @@ void runLlmAccuracyCase(int32_t batchSize, int32_t seqLen, int32_t numQHeads, in
     CuteDslFMHARunner runner(numQHeads, numKVHeads, headDim, batchSize, seqLen, seqLen);
     runner.run(qCute.dataPointer<half>(), kvCacheCute.dataPointer<half>(), outputCuteDsl.dataPointer<half>(),
         cuKVSeqLens.dataPointer<int32_t>(), stream, attentionScale, INT_MAX, false, 1.0F, 1.0F, 1.0F,
-        enableSkipSoftmax);
+        skipSoftmaxThresholdLog2);
 
     rt::launchFmhaReferenceBshd(qReference, kReference, vReference, outputReference, true, attentionScale, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -858,7 +859,8 @@ void runLlmD512PagedFp8AccuracyCase(int32_t seqLen, int32_t slidingWindowSize)
 template <typename T>
 void runLlmPagedMatchesContiguousCase(int32_t batchSize, int32_t seqLen, int32_t numQHeads, int32_t numKVHeads,
     int32_t headDim, int32_t tokensPerPage, DataType dataType, int32_t slidingWindowSize = INT_MAX,
-    bool fp8Input = false, float qScale = 1.0F, float kScale = 1.0F, float vScale = 1.0F)
+    bool fp8Input = false, float qScale = 1.0F, float kScale = 1.0F, float vScale = 1.0F,
+    float skipSoftmaxThresholdLog2 = 0.0F)
 {
     ASSERT_EQ(seqLen % tokensPerPage, 0);
     int32_t const maxPagesPerSeq = seqLen / tokensPerPage;
@@ -936,11 +938,12 @@ void runLlmPagedMatchesContiguousCase(int32_t batchSize, int32_t seqLen, int32_t
     float const attentionScale = 1.0F / std::sqrt(static_cast<float>(headDim));
     CuteDslFMHARunner runner(numQHeads, numKVHeads, headDim, batchSize, seqLen, seqLen);
     runner.run(qContiguous.rawPointer(), kvContiguousTensor.rawPointer(), outputContiguous.dataPointer<half>(),
-        cuKVSeqLens.dataPointer<int32_t>(), stream, attentionScale, slidingWindowSize, fp8Input, qScale, kScale,
-        vScale);
+        cuKVSeqLens.dataPointer<int32_t>(), stream, attentionScale, slidingWindowSize, fp8Input, qScale, kScale, vScale,
+        skipSoftmaxThresholdLog2);
     runner.runPaged(qPaged.rawPointer(), kvPagedTensor.rawPointer(), pageListTensor.dataPointer<int32_t>(),
         outputPaged.dataPointer<half>(), cuKVSeqLens.dataPointer<int32_t>(), numPages, maxPagesPerSeq, tokensPerPage,
-        dataType, stream, attentionScale, slidingWindowSize, fp8Input, qScale, kScale, vScale);
+        dataType, stream, attentionScale, slidingWindowSize, fp8Input, qScale, kScale, vScale, /*isCausal=*/true,
+        skipSoftmaxThresholdLog2);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
 
@@ -1343,8 +1346,11 @@ TEST(CuteDslFMHARunnerTest, llmSkipSoftmaxAccuracy)
                                           << " numQHeads=" << testCase.numQHeads
                                           << " numKVHeads=" << testCase.numKVHeads << " headDim=" << testCase.headDim);
         float const attentionScale = 1.0F / std::sqrt(static_cast<float>(testCase.headDim));
+        // A defaulted 0.0 threshold trips the runner's validity guard and
+        // silently dispatches dense; pass a real lambda.
+        float const lambda = testCase.headDim == 64 ? 0.003F : 0.001F;
         runLlmAccuracyCase(testCase.batchSize, testCase.seqLen, testCase.numQHeads, testCase.numKVHeads,
-            testCase.headDim, attentionScale, /*enableSkipSoftmax=*/true);
+            testCase.headDim, attentionScale, std::log2(lambda));
     }
 }
 
@@ -1389,6 +1395,52 @@ TEST(CuteDslFMHARunnerTest, llmPagedKVMatchesContiguous)
             << " headDim=" << testCase.headDim << " tokensPerPage=" << testCase.tokensPerPage);
         runLlmPagedMatchesContiguousCase<half>(testCase.batchSize, testCase.seqLen, testCase.numQHeads,
             testCase.numKVHeads, testCase.headDim, testCase.tokensPerPage, DataType::kHALF, testCase.slidingWindowSize);
+    }
+}
+
+// Paged skip-softmax validation by transitivity: contiguous skip is already
+// checked against a numpy reference (llmSkipSoftmaxAccuracy), so if the paged
+// skip kernel skips the same tiles and produces the same output as the
+// contiguous skip kernel, the paged skip integration is correct. Causal,
+// FP16, non-sliding, d64/d128 only; seqLen spans several 128-token tiles so
+// the skip predicate/vote/P*V-skip path is actually exercised.
+TEST(CuteDslFMHARunnerTest, llmPagedKVSkipSoftmaxMatchesContiguous)
+{
+    int32_t const rawSmVersion = getSMVersion();
+    if (!isSupportedCuteDslTestSm(rawSmVersion))
+    {
+        GTEST_SKIP() << "CuTe DSL FMHA unit tests only run on SM100/101/110. Current SM=" << rawSmVersion;
+    }
+
+    if (!CuteDslFMHARunner::loadLLMKernelModule())
+    {
+        FAIL() << "Failed to load CuTe DSL LLM FMHA kernel module";
+    }
+
+    struct LlmPagedSkipCase
+    {
+        int32_t batchSize;
+        int32_t seqLen;
+        int32_t numQHeads;
+        int32_t numKVHeads;
+        int32_t headDim;
+    };
+
+    std::vector<LlmPagedSkipCase> const cases{
+        {2, 1024, 14, 2, 64},
+        {1, 1024, 16, 8, 128},
+    };
+
+    for (auto const& testCase : cases)
+    {
+        SCOPED_TRACE(::testing::Message() << "batchSize=" << testCase.batchSize << " seqLen=" << testCase.seqLen
+                                          << " numQHeads=" << testCase.numQHeads
+                                          << " numKVHeads=" << testCase.numKVHeads << " headDim=" << testCase.headDim);
+        float const lambda = testCase.headDim == 64 ? 0.003F : 0.001F;
+        runLlmPagedMatchesContiguousCase<half>(testCase.batchSize, testCase.seqLen, testCase.numQHeads,
+            testCase.numKVHeads, testCase.headDim, /*tokensPerPage=*/128, DataType::kHALF,
+            /*slidingWindowSize=*/INT_MAX,
+            /*fp8Input=*/false, /*qScale=*/1.0F, /*kScale=*/1.0F, /*vScale=*/1.0F, std::log2(lambda));
     }
 }
 

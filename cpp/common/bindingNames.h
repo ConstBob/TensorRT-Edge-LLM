@@ -381,6 +381,14 @@ inline constexpr char const* kAttentionPosId = "attention_pos_id";
 inline constexpr char const* kSpecVerifyPhaseMarker = "spec_verify_phase_marker";
 
 /*!
+ * @brief Runtime skip-softmax override carrier (optional AttentionPlugin input).
+ *
+ * 1-D INT8 dummy whose SHAPE (dims[0] = integer scale factor S) conveys the
+ * override; 0 keeps the engine-carried calibrated default.
+ */
+inline constexpr char const* kSkipSoftmaxScale = "skip_softmax_scale";
+
+/*!
  * @brief DDTree parent node ids for hybrid DFlash base verification
  *
  * Shape: [batch_size, verify_tree_size] (INT32). Each entry points to the

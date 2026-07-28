@@ -52,6 +52,9 @@ struct LlmFmhaParams
     float scaleK{};
     float scaleV{};
     float invScaleO{};
+    //! Skip-softmax (BLASST) threshold as log2(lambda); 0.0 = disabled. Only the
+    //! *_skipsoftmax launchers forward it — the other wrappers have no such argument.
+    float skipSoftmaxThresholdLog2{};
     cudaStream_t stream{};
 };
 
@@ -77,6 +80,9 @@ struct LlmFmhaPagedParams
     float scaleK{};
     float scaleV{};
     float invScaleO{};
+    //! Skip-softmax (BLASST) threshold as log2(lambda); 0.0 = disabled. Only the
+    //! *_skipsoftmax_paged launchers forward it — the other wrappers have no such argument.
+    float skipSoftmaxThresholdLog2{};
     cudaStream_t stream{};
 };
 

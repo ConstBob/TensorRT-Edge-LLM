@@ -107,6 +107,9 @@ struct PipelineIO
     //! this tensor at shape [0] for normal prefill/decode and [1] for spec
     //! verify; plugins branch on the shape, not the payload.
     Tensor specVerifyPhaseMarker;
+    //! Shape-only runtime skip-softmax override carrier (data never read); bound
+    //! with shape [S] where S comes from LLMEngineConfig::skipSoftmaxScaleOverride.
+    Tensor skipSoftmaxScale;
     //! DDTree parent node ids, [batch, proposalSize] INT32. Runtime-owned
     //! metadata for tree attention and hybrid state plugin bindings.
     Tensor specTreeParentIds;

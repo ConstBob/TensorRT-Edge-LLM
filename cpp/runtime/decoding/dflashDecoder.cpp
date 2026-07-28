@@ -429,6 +429,7 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
         /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/activeBatchSize,
         /*.specVerifyPhaseLen=*/0,
+        /*.skipSoftmaxScaleLen=*/0,
     };
 
     bool draftSuccess = mDraftExecutor->prepare(
@@ -621,6 +622,7 @@ bool DFlashDecoder::captureDraftCudaGraphs(cudaStream_t stream)
                 /*.contextMaskSelectorLen=*/0,
                 /*.startIndexLen=*/batchSize,
                 /*.specVerifyPhaseLen=*/0,
+                /*.skipSoftmaxScaleLen=*/0,
             };
 
             if (mDraftExecutor->prepare(kDecodeProfile, draftDims, mDraftTensorMap, stream))
@@ -1095,6 +1097,7 @@ bool DFlashDecoder::runSystemPromptPrefill(DecodingInferenceContext& context)
         /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/activeBatchSize,
         /*.specVerifyPhaseLen=*/0,
+        /*.skipSoftmaxScaleLen=*/0,
     };
 
     bool ok = mDraftExecutor->prepare(kPrefillProfile, draftDims, mDraftTensorMap, context.stream);

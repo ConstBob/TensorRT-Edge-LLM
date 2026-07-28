@@ -123,6 +123,7 @@ def _make_flat_wrapper(model: nn.Module,
         ] + [f"deepstack_embeds_{i}" for i in range(Nd)])
     if eagle_base:
         param_names += ["attention_pos_id", "attention_mask"]
+    param_names += ["skip_softmax_scale"]
 
     past_kv_tuple = "({},)".format(", ".join(
         f"past_key_values_{i}" for i in range(Na))) if Na else "()"
@@ -132,6 +133,7 @@ def _make_flat_wrapper(model: nn.Module,
     eagle_kwargs = (", attention_mask=attention_mask"
                     ", attention_pos_id=attention_pos_id"
                     if eagle_base else "")
+    skip_kwarg = ", skip_softmax_scale=skip_softmax_scale"
 
     if has_hidden_output:
         body = (
@@ -139,7 +141,7 @@ def _make_flat_wrapper(model: nn.Module,
             f"        inputs_embeds, {past_kv_tuple}, rope_rotary_cos_sin, "
             f"context_lengths, kvcache_start_index, kv_page_table, "
             f"last_token_ids"
-            f"{ds_kwarg}{eagle_kwargs})\n"
+            f"{ds_kwarg}{eagle_kwargs}{skip_kwarg})\n"
             f"    return (logits, hidden_states) + tuple(present_key_values)\n"
         )
     else:
@@ -148,7 +150,7 @@ def _make_flat_wrapper(model: nn.Module,
             f"        inputs_embeds, {past_kv_tuple}, rope_rotary_cos_sin, "
             f"context_lengths, kvcache_start_index, kv_page_table, "
             f"last_token_ids"
-            f"{ds_kwarg})\n"
+            f"{ds_kwarg}{skip_kwarg})\n"
             f"    return (logits,) + tuple(present_key_values)\n")
 
     src = "def _forward(self, {}):\n{}".format(", ".join(param_names), body)
@@ -225,6 +227,8 @@ class Attention(nn.Module):
         self.attention_scale = config.attention_scaling
         self.enable_fp8_kv_cache = config.quant.kv_cache_quant == "fp8"
         self.sliding_window_size = config.sliding_window_size  # -1 means no sliding window
+        # Skip-softmax (BLASST) calibrated scale factor S (0.0 = disabled).
+        self.skip_softmax_scale_factor = config.skip_softmax_scale_factor
         module_prefix = f"layers.{layer_idx}.self_attn"
 
         self.q_proj = make_linear(config,
@@ -309,6 +313,7 @@ class Attention(nn.Module):
         kv_page_table: torch.Tensor,
         attention_mask: "torch.Tensor | None" = None,
         attention_pos_id: "torch.Tensor | None" = None,
+        skip_softmax_scale: "torch.Tensor | None" = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -338,7 +343,12 @@ class Attention(nn.Module):
             "attention_scale": self.attention_scale,
             "enable_context_mask_selector": False,
             "enable_vision_block_attention": False,
+            "skip_softmax_scale_factor": self.skip_softmax_scale_factor,
         }
+        # Wire the runtime override carrier iff skip-softmax is enabled (scale
+        # factor > 0).
+        if skip_softmax_scale is not None and self.skip_softmax_scale_factor > 0.0:
+            kwargs["skip_softmax_scale"] = skip_softmax_scale
         if enable_tree:
             kwargs["attention_mask"] = attention_mask
             kwargs["attention_pos_id"] = attention_pos_id
@@ -589,6 +599,7 @@ class DecoderLayer(nn.Module):
         kv_page_table: torch.Tensor,
         attention_mask: "torch.Tensor | None" = None,
         attention_pos_id: "torch.Tensor | None" = None,
+        skip_softmax_scale: "torch.Tensor | None" = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
         attn_output, present_key_value = self.self_attn(
@@ -600,6 +611,7 @@ class DecoderLayer(nn.Module):
             kv_page_table,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
+            skip_softmax_scale=skip_softmax_scale,
         )
         hidden_states = residual + attn_output
 
@@ -650,6 +662,7 @@ class Transformer(nn.Module):
         deepstack_embeds: Tuple[torch.Tensor, ...] = (),
         attention_mask: "torch.Tensor | None" = None,
         attention_pos_id: "torch.Tensor | None" = None,
+        skip_softmax_scale: "torch.Tensor | None" = None,
         output_hidden_states: bool = False,
         dflash_target_layer_ids: "List[int] | None" = None,
     ) -> Tuple[torch.Tensor, Tuple, "Tuple | None", "torch.Tensor | None"]:
@@ -672,6 +685,7 @@ class Transformer(nn.Module):
                 kv_page_table,
                 attention_mask=attention_mask,
                 attention_pos_id=attention_pos_id,
+                skip_softmax_scale=skip_softmax_scale,
             )
             present_key_values_list.append(next_key_value)
 
@@ -843,6 +857,8 @@ class CausalLM(nn.Module):
                         device=device) for _ in range(Nd)
         ]
 
+        skip_softmax_scale = torch.zeros(1, dtype=torch.int8, device=device)
+
         args = (inputs_embeds, *past_key_values_list, rope_rotary_cos_sin,
                 context_lengths, kvcache_start_index, kv_page_table,
                 last_token_ids, *deepstack_embeds_list)
@@ -914,6 +930,14 @@ class CausalLM(nn.Module):
                 2: mask_kv_len
             })  # attention_mask
 
+        # Trailing runtime skip-softmax override input.
+        skip_dim = torch.export.Dim("skip_softmax_scale_len",
+                                    min=0,
+                                    max=1048576)
+        args = args + (skip_softmax_scale, )
+        input_names = input_names + ["skip_softmax_scale"]
+        all_shapes.append({0: skip_dim})  # skip_softmax_scale
+
         wrapped = _make_flat_wrapper(
             self,
             Na,
@@ -940,6 +964,7 @@ class CausalLM(nn.Module):
         deepstack_embeds: Tuple[torch.Tensor, ...] = (),
         attention_mask: "torch.Tensor | None" = None,
         attention_pos_id: "torch.Tensor | None" = None,
+        skip_softmax_scale: "torch.Tensor | None" = None,
     ) -> Tuple:
         eagle_base = self.config.eagle_base
         dflash_base = getattr(self.config, 'dflash_base', False)
@@ -962,6 +987,7 @@ class CausalLM(nn.Module):
             deepstack_embeds,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
+            skip_softmax_scale=skip_softmax_scale,
             output_hidden_states=eagle_base and not target_hidden_base,
             dflash_target_layer_ids=target_layer_ids
             if target_hidden_base else None,

@@ -378,6 +378,7 @@ void parseCoreFields(Json const& configJson, LLMEngineConfig& cfg)
     cfg.maxSupportedBatchSize = getRequired<int32_t>(bc, "max_batch_size");
     cfg.maxSupportedInputLength = getRequired<int32_t>(bc, "max_input_len");
     cfg.maxKVCacheCapacity = getRequired<int32_t>(bc, "max_kv_cache_capacity");
+    cfg.skipSoftmaxScaleOverride = configJson.value("skip_softmax_scale_override", int64_t{0});
 
     // RoPE configuration (top-level, derived from full config).
     cfg.ropeConfig = collectRopeConfig(configJson);
@@ -920,6 +921,7 @@ InferenceDims LLMEngineConfig::prefillDims(int64_t batch, int64_t seqLen, bool k
         /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/startIndexLen,
         /*.specVerifyPhaseLen=*/0,
+        /*.skipSoftmaxScaleLen=*/skipSoftmaxScaleOverride,
     };
 }
 
@@ -936,6 +938,7 @@ InferenceDims LLMEngineConfig::decodeDims(int64_t batch) const
         /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/batch,
         /*.specVerifyPhaseLen=*/0,
+        /*.skipSoftmaxScaleLen=*/skipSoftmaxScaleOverride,
     };
 }
 
@@ -952,6 +955,7 @@ InferenceDims LLMEngineConfig::denoiseDims(int64_t batch, int64_t canvasLen) con
         /*.contextMaskSelectorLen=*/batch,
         /*.startIndexLen=*/batch,
         /*.specVerifyPhaseLen=*/0,
+        /*.skipSoftmaxScaleLen=*/skipSoftmaxScaleOverride,
     };
 }
 
@@ -968,6 +972,7 @@ InferenceDims LLMEngineConfig::diffusionCommitDims(int64_t batch, int64_t commit
         /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/batch,
         /*.specVerifyPhaseLen=*/0,
+        /*.skipSoftmaxScaleLen=*/skipSoftmaxScaleOverride,
     };
 }
 
@@ -987,6 +992,7 @@ InferenceDims LLMEngineConfig::specVerifyDims(int64_t batch, int64_t verifySize)
         /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/batch,
         /*.specVerifyPhaseLen=*/1,
+        /*.skipSoftmaxScaleLen=*/skipSoftmaxScaleOverride,
     };
 }
 
@@ -1008,6 +1014,7 @@ InferenceDims LLMEngineConfig::proposalDims(int64_t batch, int64_t proposalSize,
         /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/batch,
         /*.specVerifyPhaseLen=*/0,
+        /*.skipSoftmaxScaleLen=*/skipSoftmaxScaleOverride,
     };
 }
 
@@ -1028,6 +1035,7 @@ InferenceDims LLMEngineConfig::acceptDims(int64_t batch, int64_t acceptLen) cons
         /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/batch,
         /*.specVerifyPhaseLen=*/0,
+        /*.skipSoftmaxScaleLen=*/skipSoftmaxScaleOverride,
     };
 }
 
@@ -1277,6 +1285,7 @@ InferenceDims LLMEngineConfig::resetDims() const
         /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/1,
         /*.specVerifyPhaseLen=*/0,
+        /*.skipSoftmaxScaleLen=*/skipSoftmaxScaleOverride,
     };
 }
 

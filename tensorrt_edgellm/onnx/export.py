@@ -239,6 +239,7 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
     _CONTEXT_MASK_SELECTOR_POSITION = 8
     _ATTENTION_MASK_POSITION = 9
     _ATTENTION_POS_ID_POSITION = 10
+    _SKIP_SCALE_POSITION = 11
     model = onnx.load(onnx_path, load_external_data=False)
     changed = 0
     dropped_gamma_tensors: set = set()
@@ -263,11 +264,16 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
             (a.i for a in node.attribute if a.name == "enable_qk_norm"),
             0,
         )
+        skip_scale_factor = next(
+            (a.f
+             for a in node.attribute if a.name == "skip_softmax_scale_factor"),
+            0.0,
+        )
+        inputs = list(node.input)
 
         def get_input(index: int) -> str:
             return inputs[index] if index < len(inputs) else ""
 
-        inputs = list(node.input)
         new_inputs = inputs[:_NUM_REQUIRED]
         if qk_norm:
             new_inputs += [get_input(i) for i in _GAMMA_POSITIONS]
@@ -283,6 +289,13 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
             ])
         elif vision_block_attn:
             new_inputs.append(get_input(_ATTENTION_MASK_POSITION))
+        # Trailing runtime skip-softmax override carrier (shape-only INT8 input),
+        # emitted last by the translation; kept iff skip-softmax is enabled
+        # (scale factor > 0).
+        if skip_scale_factor > 0.0:
+            skip_input = get_input(_SKIP_SCALE_POSITION)
+            if skip_input:
+                new_inputs.append(skip_input)
         if new_inputs == inputs:
             continue
         del node.input[:]
