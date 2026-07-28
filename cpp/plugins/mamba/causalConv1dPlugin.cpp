@@ -211,7 +211,7 @@ int32_t CausalConv1dPlugin::getOutputDataTypes(DataType* outputTypes, [[maybe_un
 
 int32_t CausalConv1dPlugin::getOutputShapes(DimsExprs const* inputs, [[maybe_unused]] int32_t nbInputs,
     DimsExprs const* /* shapeInputs */, int32_t /* nbShapeInputs */, DimsExprs* outputs,
-    [[maybe_unused]] int32_t nbOutputs, IExprBuilder& /* exprBuilder */) noexcept
+    [[maybe_unused]] int32_t nbOutputs, IExprBuilder& exprBuilder) noexcept
 {
     try
     {
@@ -228,10 +228,11 @@ int32_t CausalConv1dPlugin::getOutputShapes(DimsExprs const* inputs, [[maybe_unu
         outputs[kOUT_CONV_STATE_IDX] = inputs[kIN_CONV_STATE_IDX];
         if (mUseSpecVerifyState)
         {
-            // Per-token decode checkpoints: [batch, seq_len, dim, kernel_size].
+            // Only spec-verify produces conv checkpoints; normal prefill uses a zero-length marker.
             outputs[kOUT_INTERMEDIATE_CONV_STATES].nbDims = 4;
             outputs[kOUT_INTERMEDIATE_CONV_STATES].d[0] = inputs[kIN_X_IDX].d[0];
-            outputs[kOUT_INTERMEDIATE_CONV_STATES].d[1] = inputs[kIN_X_IDX].d[1];
+            outputs[kOUT_INTERMEDIATE_CONV_STATES].d[1] = exprBuilder.operation(
+                DimensionOperation::kPROD, *inputs[kIN_X_IDX].d[1], *inputs[kIN_SPEC_VERIFY_PHASE_MARKER_IDX].d[0]);
             outputs[kOUT_INTERMEDIATE_CONV_STATES].d[2] = inputs[kIN_CONV_STATE_IDX].d[1];
             outputs[kOUT_INTERMEDIATE_CONV_STATES].d[3] = inputs[kIN_CONV_STATE_IDX].d[2];
         }

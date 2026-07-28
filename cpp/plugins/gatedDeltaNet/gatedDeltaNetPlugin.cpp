@@ -237,7 +237,7 @@ int32_t GatedDeltaNetPlugin::getOutputDataTypes(DataType* outputTypes, [[maybe_u
 
 int32_t GatedDeltaNetPlugin::getOutputShapes(DimsExprs const* inputs, [[maybe_unused]] int32_t nbInputs,
     DimsExprs const* /* shapeInputs */, int32_t /* nbShapeInputs */, DimsExprs* outputs,
-    [[maybe_unused]] int32_t nbOutputs, IExprBuilder& /* exprBuilder */) noexcept
+    [[maybe_unused]] int32_t nbOutputs, IExprBuilder& exprBuilder) noexcept
 {
     try
     {
@@ -254,10 +254,11 @@ int32_t GatedDeltaNetPlugin::getOutputShapes(DimsExprs const* inputs, [[maybe_un
         outputs[kOUT_H0_SOURCE_IDX] = inputs[kIN_H0_SOURCE_IDX];
         if (mUseSpecVerifyState)
         {
-            // Per-token recurrent checkpoints: [n, seq_len, hv, k, v].
+            // Only spec-verify produces recurrent checkpoints; normal prefill uses a zero-length marker.
             outputs[kOUT_INTERMEDIATE_STATES_IDX].nbDims = 5;
             outputs[kOUT_INTERMEDIATE_STATES_IDX].d[0] = inputs[kIN_Q_IDX].d[0];
-            outputs[kOUT_INTERMEDIATE_STATES_IDX].d[1] = inputs[kIN_Q_IDX].d[1];
+            outputs[kOUT_INTERMEDIATE_STATES_IDX].d[1] = exprBuilder.operation(
+                DimensionOperation::kPROD, *inputs[kIN_Q_IDX].d[1], *inputs[kIN_SPEC_VERIFY_PHASE_MARKER_IDX].d[0]);
             outputs[kOUT_INTERMEDIATE_STATES_IDX].d[2] = inputs[kIN_V_IDX].d[2];
             outputs[kOUT_INTERMEDIATE_STATES_IDX].d[3] = inputs[kIN_Q_IDX].d[3];
             outputs[kOUT_INTERMEDIATE_STATES_IDX].d[4] = inputs[kIN_V_IDX].d[3];
