@@ -111,10 +111,9 @@ private:
     //! \param[in] isThumbnail Whether the image is a thumbnail (or, for video, a follow-on frame:
     //!            appends its tokens to the previous visual item instead of starting a new one)
     //! \param[in] stream CUDA stream for execution
-    //! \param[in] frameIdx Frame index into a multi-frame (video) ImageData; 0 for a still image
     //! \throws std::runtime_error if image size is unexpected, or number of blocks is excessive
     void formatPatch(rt::imageUtils::ImageData const& image, std::vector<int64_t>& imageTokenLengths,
-        int64_t& numImages, int64_t& totalNumBlocks, bool isThumbnail, cudaStream_t stream, int64_t frameIdx = 0);
+        int64_t& numImages, int64_t& totalNumBlocks, bool isThumbnail, cudaStream_t stream);
 
     //! \brief Preprocess all images in the request
     //! \param[in] request LLM generation request containing images
@@ -125,14 +124,14 @@ private:
     void imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths,
         std::vector<int64_t>& numImages, cudaStream_t stream);
 
-    InternViTConfig mConfig;                         //!< InternViT configuration
-    rt::Tensor mVitInput{};                          //!< Vision encoder input tensor
-    rt::Tensor mImageMean{};                         //!< Image mean tensor
-    rt::Tensor mImageStd{};                          //!< Image standard deviation tensor
-    rt::Tensor mImageDevice{};                       //!< Temporary image buffer for preprocessing
-    rt::Tensor mNormalizedImageDevice{};             //!< Temporary normalized image buffer
-    rt::imageUtils::ImageData mResizedImageHost{};   //!< Pre-allocated buffer for image resizing
-    rt::imageUtils::ImageData mThumbnailImageHost{}; //!< Pre-allocated buffer for thumbnail generation
+    InternViTConfig mConfig;             //!< InternViT configuration
+    rt::Tensor mVitInput{};              //!< Vision encoder input tensor
+    rt::Tensor mImageMean{};             //!< Image mean tensor
+    rt::Tensor mImageStd{};              //!< Image standard deviation tensor
+    rt::Tensor mImageDevice{};           //!< Device image buffer (resized image)
+    rt::Tensor mNormalizedImageDevice{}; //!< Temporary normalized image buffer
+    rt::Tensor mRawImageDevice{};        //!< Raw (pre-resize) image device buffer for the GPU resize path
+    rt::Tensor mResizeTmpDevice{};       //!< Float scratch (horizontal pass) for the GPU resize
 };
 
 } // namespace rt

@@ -164,14 +164,14 @@ bool Phi4MMViTRunner::allocateBuffer(cudaStream_t stream)
         {maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "Phi4MMViTRunner::mImageDevice");
     mNormalizedImageDevice = rt::Tensor(
         {maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "Phi4MMViTRunner::mNormalizedImageDevice");
-    // Scratch buffer for resizeImage output (4D placeholder shape; resizeImage reshapes per call).
-    rt::Tensor resizeBuffer({1, 1, maxImagePixels, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8,
-        "Phi4MMViTRunner::resizeBuffer");
-    mResizedImageHost = rt::imageUtils::ImageData(std::move(resizeBuffer));
-    // Thumbnail image has fixed size: 1 x blockImageSizeH x blockImageSizeW x channels (4D, frames=1).
-    rt::Tensor thumbnailBuffer({1, mConfig.blockImageSizeH, mConfig.blockImageSizeW, channels}, rt::DeviceType::kCPU,
-        nvinfer1::DataType::kUINT8, "Phi4MMViTRunner::thumbnailBuffer");
-    mThumbnailImageHost = rt::imageUtils::ImageData(std::move(thumbnailBuffer));
+
+    // GPU image-resize scratch.
+    // Horizontal-pass scratch holds [rawH, outW, C] floats. computeBestBlockGridForResize snaps to a
+    // block grid and does NOT preserve aspect ratio, so bound each dimension independently: rawH by the
+    // raw cap and outW by the widest single-row block grid (maxNumBlocks * blockImageSizeW).
+    int64_t const kMaxResizeTmpElems
+        = kernel::kGpuResizeMaxRawDim * mConfig.maxNumBlocks * mConfig.blockImageSizeW * channels;
+    kernel::allocateResizeScratch(channels, kMaxResizeTmpElems, mRawImageDevice, mResizeTmpDevice);
 
     // Pre-allocate temporary index tensors for Phi4MM postprocess (assign to members)
     mHBlocks = rt::Tensor(
@@ -249,7 +249,6 @@ void Phi4MMViTRunner::formatPatch(imageUtils::ImageData const& image, std::vecto
     int height = image.height;
     int width = image.width;
     int channels = image.channels;
-    unsigned char* imageData = image.data(); // In hwc order
 
     ELLM_CHECK(channels == mConfig.numChannels,
         "Image channels mismatch, got " + std::to_string(channels) + ", expected "
@@ -288,12 +287,8 @@ void Phi4MMViTRunner::formatPatch(imageUtils::ImageData const& image, std::vecto
         imageTokenLengths.back() += subLen;
     }
 
-    // Copy image to device.
-    check::check(mImageDevice.reshape({1, height, width, channels}), "Tensor reshape failed");
-    CUDA_CHECK(cudaMemcpyAsync(
-        mImageDevice.rawPointer(), imageData, height * width * channels, cudaMemcpyHostToDevice, stream));
-
-    // Normalize image
+    // mImageDevice already holds the [1, height, width, channels] image (resized on the GPU by the
+    // caller); normalize and patchify consume it in place.
     check::check(mNormalizedImageDevice.reshape({1, height, width, channels}), "Tensor reshape failed");
     kernel::normalizeImage(mImageDevice, mImageMean, mImageStd, mNormalizedImageDevice, stream);
 
@@ -318,27 +313,34 @@ void Phi4MMViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
         std::vector<std::vector<int64_t>> blockGridHWPerBatch;
         for (auto const& image : req.imageBuffers)
         {
-            // Add thumbnail image by default
-            auto const& thumbnail = imageUtils::resizeImage(image, mThumbnailImageHost, mConfig.blockImageSizeW,
-                mConfig.blockImageSizeH, imageUtils::InterpolationMode::kBICUBIC);
-            formatPatch(thumbnail, imageTokenLengths, numImage, totalNumBlocks, true, stream);
+            // Thumbnail (global) crop: a fixed one-block resize of the original image, independent of
+            // image.doResize.
+            kernel::copyImageToDeviceAndResize(image.data(), 1, image.height, image.width, image.channels,
+                mRawImageDevice, mResizeTmpDevice, mImageDevice, mConfig.blockImageSizeH, mConfig.blockImageSizeW,
+                stream);
+            formatPatch(image.resizedMeta(mConfig.blockImageSizeH, mConfig.blockImageSizeW), imageTokenLengths,
+                numImage, totalNumBlocks, true, stream);
 
             if (image.doResize)
             {
                 auto [resizedHeight, resizedWidth] = imageUtils::computeBestBlockGridForResize(image.height,
                     image.width, mConfig.minImageTokensPerImage, mConfig.maxImageTokensPerImage,
                     mConfig.blockImageSizeH, mConfig.blockImageSizeW);
-                auto const& src = imageUtils::resizeImage(
-                    image, mResizedImageHost, resizedWidth, resizedHeight, imageUtils::InterpolationMode::kBICUBIC);
                 blockGridHWPerBatch.push_back(
                     {resizedHeight / mConfig.blockImageSizeH, resizedWidth / mConfig.blockImageSizeW});
-                formatPatch(src, imageTokenLengths, numImage, totalNumBlocks, false, stream);
+                kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
+                    image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, resizedHeight, resizedWidth,
+                    stream);
+                formatPatch(image.resizedMeta(resizedHeight, resizedWidth), imageTokenLengths, numImage, totalNumBlocks,
+                    false, stream);
             }
             else
             {
                 LOG_DEBUG("Skipping resize for pre-resized image %ldx%ld", image.height, image.width);
                 blockGridHWPerBatch.push_back(
                     {image.height / mConfig.blockImageSizeH, image.width / mConfig.blockImageSizeW});
+                kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
+                    image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, image.height, image.width, stream);
                 formatPatch(image, imageTokenLengths, numImage, totalNumBlocks, false, stream);
             }
         }
@@ -443,6 +445,9 @@ bool Phi4MMViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     catch (std::exception const& e)
     {
         LOG_ERROR("Preprocess failed: %s", e.what());
+        // Drain async H2D copies that may still read the request's image buffers, so the caller can
+        // safely release them after the failure.
+        cudaStreamSynchronize(stream);
         return false;
     }
 

@@ -210,15 +210,14 @@ protected:
         trt_edgellm::tokenizer::Tokenizer const* tokenizer);
     //! @}
 
-    //! \brief Format and process a single image buffer (or video frame stack): append its spans and
-    //!        copy/normalize/transpose its (padded) frames into the ViT input scratch.
-    //! \param[in] image Input media data (still image or video frame stack; isVideo flags the modality)
-    //! \param[in,out] spans Flat global-order span list to append this buffer's spans to
-    //! \param[in,out] patchBase Running ViT patch offset; read as this buffer's base, advanced by its patch count
+    //! \brief Append this buffer's spans, then normalize and patchify its resized frame stack.
+    //!        Source frames are already resized into mImageDevice; the last frame is replicated into the
+    //!        temporal-padding slots before patchify.
+    //! \param[in] image Resized-dimension view of the buffer (post-resize width/height; source frames/fps)
+    //! \param[in,out] spans Vision spans (flattened, global order); this buffer's spans are appended
+    //! \param[in,out] patchBase Running ViT patch offset; advanced by this buffer's patch count
     //! \param[in] stream CUDA stream for execution
-    //! \throws std::runtime_error if image dimensions are incompatible with patch size, or sequence length is out of
-    //! range, or the padded frame stack overflows the device scratch buffer
-    //! \throws std::runtime_error if a CUDA error occurs
+    //! \throws std::runtime_error if the visual token budget is exceeded or a CUDA error occurs
     void formatPatch(rt::imageUtils::ImageData const& image, std::vector<VisionSpan>& spans, int64_t& patchBase,
         cudaStream_t stream);
 
@@ -246,24 +245,26 @@ protected:
     //! \throws std::runtime_error if aspect ratio is invalid
     //! \throws std::runtime_error if image dimensions are incompatible with patch size, or sequence length is out of
     //! range
+    //! \throws std::runtime_error if a raw frame exceeds the GPU-resize scratch budget
     //! \throws std::runtime_error if a CUDA error occurs
     void imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<VisionSpan>& spans, cudaStream_t stream);
 
-    QwenViTConfig mConfig{};             //!< Qwen-VL configuration
-    rt::Tensor mVitInput{};              //!< Vision encoder input tensor
-    rt::Tensor mRotaryPosEmb{};          //!< Rotary position embeddings tensor (multi-dimensional RoPE)
-    rt::Tensor mCuSeqlens{};             //!< Cumulative sequence lengths tensor
-    rt::Tensor mCuSeqlensHost{};         //!< Cumulative sequence lengths host tensor
-    rt::Tensor mKvLengths{};             //!< KV lengths for TRT-native attention (separate copy of cu_seqlens)
-    rt::Tensor mKvLengthsWindow{};       //!< KV lengths for Qwen2.5-VL window attention (TRT-native)
-    rt::Tensor mMaxSeqLenCarrier{};      //!< Shape-only input carrying max sequence length for FMHA launch
-    rt::Tensor mImageMean{};             //!< Image mean tensor
-    rt::Tensor mImageStd{};              //!< Image standard deviation tensor
-    rt::Tensor mImageDevice{};           //!< Temporary image buffer for preprocessing
-    rt::Tensor mNormalizedImageDevice{}; //!< Temporary normalized image buffer for preprocessing
-    rt::imageUtils::ImageData mResizedImageHost{}; //!< Pre-allocated buffer for image resizing
-    rt::Tensor mMropePositionIdsHost{};            //!< MRoPE position IDs host tensor
-    rt::Tensor mMropePositionIdsDevice{};          //!< MRoPE position IDs device tensor
+    QwenViTConfig mConfig{};              //!< Qwen-VL configuration
+    rt::Tensor mVitInput{};               //!< Vision encoder input tensor
+    rt::Tensor mRotaryPosEmb{};           //!< Rotary position embeddings tensor (multi-dimensional RoPE)
+    rt::Tensor mCuSeqlens{};              //!< Cumulative sequence lengths tensor
+    rt::Tensor mCuSeqlensHost{};          //!< Cumulative sequence lengths host tensor
+    rt::Tensor mKvLengths{};              //!< KV lengths for TRT-native attention (separate copy of cu_seqlens)
+    rt::Tensor mKvLengthsWindow{};        //!< KV lengths for Qwen2.5-VL window attention (TRT-native)
+    rt::Tensor mMaxSeqLenCarrier{};       //!< Shape-only input carrying max sequence length for FMHA launch
+    rt::Tensor mImageMean{};              //!< Image mean tensor
+    rt::Tensor mImageStd{};               //!< Image standard deviation tensor
+    rt::Tensor mImageDevice{};            //!< Temporary image buffer for preprocessing
+    rt::Tensor mNormalizedImageDevice{};  //!< Temporary normalized image buffer for preprocessing
+    rt::Tensor mRawImageDevice{};         //!< Raw (pre-resize) image device buffer for the GPU resize path
+    rt::Tensor mResizeTmpDevice{};        //!< Float scratch (horizontal pass) for the GPU resize
+    rt::Tensor mMropePositionIdsHost{};   //!< MRoPE position IDs host tensor
+    rt::Tensor mMropePositionIdsDevice{}; //!< MRoPE position IDs device tensor
     // Model-specific ViT-input tensors live in the per-model subclasses.
 
     std::string mEngineDir;           //!< Visual engine dir (kept for the deferred initialize() config load)

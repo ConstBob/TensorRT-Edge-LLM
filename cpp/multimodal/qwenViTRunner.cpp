@@ -264,15 +264,20 @@ bool QwenViTRunner::allocateBuffer(cudaStream_t stream)
 
     // Pre-allocate temporary image buffers for preprocessing
     int64_t const maxImagePixels = mVitInput.getShape().volume();
-    // Scratch buffer for resizeImage output. Initial shape is a placeholder; resizeImage reshapes to
-    // [T, realH, realW, channels] per call. Lead 1s keep the 4D layout ImageData enforces.
-    rt::Tensor resizeBuffer({1, 1, maxImagePixels, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8,
-        "QwenViTRunner::resizeBuffer");
-    mResizedImageHost = rt::imageUtils::ImageData(std::move(resizeBuffer));
     mImageDevice
         = rt::Tensor({maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "QwenViTRunner::mImageDevice");
     mNormalizedImageDevice = rt::Tensor(
         {maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "QwenViTRunner::mNormalizedImageDevice");
+
+    // GPU image-resize scratch, sized for the actual dimensions per request.
+    int64_t const kMaxRawPixels = kernel::kGpuResizeMaxRawDim * kernel::kGpuResizeMaxRawDim;
+    // Horizontal-pass scratch holds [rawH, outW, C] floats. smart resize preserves aspect ratio, so
+    // rawH * outW <= sqrt(frameBudget * rawH * rawW) <= sqrt(frameBudget * kMaxRawPixels).
+    int64_t const frameBudget = mConfig.maxHW * mConfig.patchSize * mConfig.patchSize;
+    int64_t const kMaxResizeTmpElems = static_cast<int64_t>(std::sqrt(static_cast<double>(frameBudget) * kMaxRawPixels)
+                                           * kernel::kGpuResizeScratchMargin)
+        * channels;
+    kernel::allocateResizeScratch(channels, kMaxResizeTmpElems, mRawImageDevice, mResizeTmpDevice);
 
     // Pre-allocate tensors for MRoPE position IDs
     mMropePositionIdsHost = rt::Tensor({mLLMMaxBatchSize, 3, mLLMMaxSequenceLength}, rt::DeviceType::kCPU,
@@ -317,9 +322,7 @@ void QwenViTRunner::formatPatch(
     int64_t const height = image.height;
     int64_t const width = image.width;
     int64_t const channels = image.channels;
-    unsigned char* imageData = image.data(); // THWC order
 
-    // computeVisionSpans (the one model-aware step) appends this buffer's spans starting at the running patch offset.
     int64_t const prevPatchBase = patchBase;
     auto const [totalSeqLen, totalGridT] = computeVisionSpans(image, prevPatchBase, spans);
 
@@ -333,25 +336,20 @@ void QwenViTRunner::formatPatch(
     int64_t const nSourceFrames = image.frames;
     int64_t const tPadded = totalGridT * mConfig.temporalPatchSize;
 
-    // Reshape pre-allocated temporary buffers to current image dimensions
     check::check(mImageDevice.reshape({tPadded, height, width, channels}), "Tensor reshape failed");
     check::check(mNormalizedImageDevice.reshape({tPadded, height, width, channels}), "Tensor reshape failed");
 
-    // Copy the source frames in one transfer, then replicate the last frame into any padded slots.
-    int64_t const frameBytes = height * width * channels;
-    CUDA_CHECK(cudaMemcpyAsync(
-        mImageDevice.rawPointer(), imageData, nSourceFrames * frameBytes, cudaMemcpyHostToDevice, stream));
-    unsigned char const* lastFrameSrc = imageData + (nSourceFrames - 1) * frameBytes;
+    // imagePreprocess resized the source frames into the leading slots; replicate the last one into the
+    // temporal-padding slots (device-to-device).
+    int64_t const resizedFrameBytes = height * width * channels;
+    auto* const base = static_cast<unsigned char*>(mImageDevice.rawPointer());
     for (int64_t i = nSourceFrames; i < tPadded; ++i)
     {
-        CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(mImageDevice.rawPointer()) + i * frameBytes, lastFrameSrc,
-            frameBytes, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(base + i * resizedFrameBytes, base + (nSourceFrames - 1) * resizedFrameBytes,
+            resizedFrameBytes, cudaMemcpyDeviceToDevice, stream));
     }
 
-    // Normalize image
     kernel::normalizeImage(mImageDevice, mImageMean, mImageStd, mNormalizedImageDevice, stream);
-
-    // Transpose to patch
     kernel::transposeToPatchQwenViT(mNormalizedImageDevice, mVitInput, prevPatchBase * mConfig.inputDim,
         mConfig.temporalPatchSize, mConfig.patchSize, mConfig.mergeSize, stream);
 }
@@ -403,14 +401,17 @@ void QwenViTRunner::imagePreprocess(
             if (image.doResize)
             {
                 auto [resizedHeight, resizedWidth] = getResizedImageSize(image.frames, image.height, image.width);
-                auto const& src = rt::imageUtils::resizeImage(
-                    image, mResizedImageHost, resizedWidth, resizedHeight, rt::imageUtils::InterpolationMode::kBICUBIC);
-                formatPatch(src, spans, totalSeqLength, stream);
+                kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
+                    image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, resizedHeight, resizedWidth,
+                    stream);
+                formatPatch(image.resizedMeta(resizedHeight, resizedWidth), spans, totalSeqLength, stream);
             }
             else
             {
                 LOG_DEBUG("Skipping resize for pre-resized image/video %ldx%ld (frames=%ld)", image.height, image.width,
                     image.frames);
+                kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
+                    image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, image.height, image.width, stream);
                 formatPatch(image, spans, totalSeqLength, stream);
             }
             ++imageCount;
@@ -689,6 +690,9 @@ bool QwenViTRunner::preprocess(rt::LLMGenerationRequest const& request,
             throw; // caller-actionable input error: propagate instead of swallowing to false
         }
         LOG_ERROR("Failed: %s", e.what());
+        // Drain async H2D copies that may still read the request's image buffers, so the caller can
+        // safely release them after the failure.
+        cudaStreamSynchronize(stream);
         return false;
     }
 

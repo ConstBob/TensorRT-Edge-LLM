@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <string>
 
 using namespace nvinfer1;
 
@@ -722,6 +723,179 @@ void initFastPosEmbedQwenViT(rt::Tensor& fastPosEmbedIdx, rt::Tensor& fastPosEmb
             fastPosEmbedWeight.dataPointer<half>(), llmGridH, llmGridW, mergeSize, numGridPerSide, lineSpaceH,
             lineSpaceW, startIdx + t * H * W, totalSeqLength);
     }
+}
+
+// ---------------------------------------------------------------------------
+// GPU bicubic (Catmull-Rom) image resize, anti-aliased for downscaling. For
+// downscaling the filter is widened by the scale factor (fscale) so it
+// low-passes instead of applying a fixed 4-tap cubic.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ float catmullRomWeight(float x)
+{
+    x = fabsf(x);
+    if (x < 1.0f)
+        return 1.5f * x * x * x - 2.5f * x * x + 1.0f;
+    if (x < 2.0f)
+        return -0.5f * x * x * x + 2.5f * x * x - 4.0f * x + 2.0f;
+    return 0.0f;
+}
+
+__global__ void resizeCatmullRomHorizKernel(
+    unsigned char const* in, float* out, int const Hin, int const Win, int const Wout, int const C)
+{
+    int64_t const tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t const total = static_cast<int64_t>(Hin) * Wout * C;
+    if (tid >= total)
+        return;
+    int const c = static_cast<int>(tid % C);
+    int const xo = static_cast<int>((tid / C) % Wout);
+    int const h = static_cast<int>(tid / (static_cast<int64_t>(Wout) * C));
+
+    float const scale = static_cast<float>(Win) / static_cast<float>(Wout);
+    float const fscale = scale > 1.0f ? scale : 1.0f;
+    float const center = (xo + 0.5f) * scale;
+    int const xs = static_cast<int>(ceilf(center - 2.0f * fscale - 0.5f));
+    int const xe = static_cast<int>(floorf(center + 2.0f * fscale - 0.5f));
+
+    float acc = 0.0f;
+    float wsum = 0.0f;
+    int64_t const rowOff = static_cast<int64_t>(h) * Win * C;
+    for (int xin = xs; xin <= xe; ++xin)
+    {
+        float const w = catmullRomWeight((xin + 0.5f - center) / fscale);
+        int const xc = xin < 0 ? 0 : (xin >= Win ? Win - 1 : xin);
+        acc += w * static_cast<float>(in[rowOff + static_cast<int64_t>(xc) * C + c]);
+        wsum += w;
+    }
+    out[tid] = wsum > 0.0f ? acc / wsum : 0.0f;
+}
+
+__global__ void resizeCatmullRomVertKernel(
+    float const* in, unsigned char* out, int const Hin, int const Hout, int const Wout, int const C)
+{
+    int64_t const tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t const total = static_cast<int64_t>(Hout) * Wout * C;
+    if (tid >= total)
+        return;
+    int const c = static_cast<int>(tid % C);
+    int const x = static_cast<int>((tid / C) % Wout);
+    int const yo = static_cast<int>(tid / (static_cast<int64_t>(Wout) * C));
+
+    float const scale = static_cast<float>(Hin) / static_cast<float>(Hout);
+    float const fscale = scale > 1.0f ? scale : 1.0f;
+    float const center = (yo + 0.5f) * scale;
+    int const ys = static_cast<int>(ceilf(center - 2.0f * fscale - 0.5f));
+    int const ye = static_cast<int>(floorf(center + 2.0f * fscale - 0.5f));
+
+    float acc = 0.0f;
+    float wsum = 0.0f;
+    int64_t const colOff = static_cast<int64_t>(x) * C + c;
+    int64_t const stride = static_cast<int64_t>(Wout) * C;
+    for (int yin = ys; yin <= ye; ++yin)
+    {
+        float const w = catmullRomWeight((yin + 0.5f - center) / fscale);
+        int const yc = yin < 0 ? 0 : (yin >= Hin ? Hin - 1 : yin);
+        acc += w * in[static_cast<int64_t>(yc) * stride + colOff];
+        wsum += w;
+    }
+    float v = wsum > 0.0f ? acc / wsum : 0.0f;
+    v = v < 0.0f ? 0.0f : (v > 255.0f ? 255.0f : v);
+    out[tid] = static_cast<unsigned char>(v + 0.5f);
+}
+
+void resizeImage(rt::Tensor const& rawImage, rt::Tensor& tmp, rt::Tensor& resizedImage, int64_t const outHeight,
+    int64_t const outWidth, InterpolationMode const mode, cudaStream_t stream)
+{
+    ELLM_CHECK(mode == InterpolationMode::kBICUBIC,
+        "GPU resizeImage supports only InterpolationMode::kBICUBIC (Catmull-Rom) for now.");
+    ELLM_CHECK(rawImage.getDeviceType() == rt::DeviceType::kGPU && tmp.getDeviceType() == rt::DeviceType::kGPU
+            && resizedImage.getDeviceType() == rt::DeviceType::kGPU,
+        "Device type shall all be GPU for resize tensors.");
+    ELLM_CHECK(rawImage.getDataType() == DataType::kUINT8 && tmp.getDataType() == DataType::kFLOAT
+            && resizedImage.getDataType() == DataType::kUINT8,
+        "Data type check failed for resize tensors (raw u8, tmp f32, out u8).");
+    ELLM_CHECK(rawImage.getShape().getNumDims() == 3 && resizedImage.getShape().getNumDims() == 3,
+        "rawImage and resizedImage shall be [H, W, C].");
+
+    int const Hin = static_cast<int>(rawImage.getShape()[0]);
+    int const Win = static_cast<int>(rawImage.getShape()[1]);
+    int const C = static_cast<int>(rawImage.getShape()[2]);
+    int const Hout = static_cast<int>(outHeight);
+    int const Wout = static_cast<int>(outWidth);
+
+    ELLM_CHECK(tmp.getShape().volume() >= static_cast<int64_t>(Hin) * Wout * C,
+        "tmp scratch smaller than Hin * outWidth * C for resize tensors.");
+    ELLM_CHECK(resizedImage.getShape().volume() >= static_cast<int64_t>(Hout) * Wout * C,
+        "resizedImage smaller than outHeight * outWidth * C for resize tensors.");
+
+    uint32_t const blockSize = 256;
+    int64_t const totalH = static_cast<int64_t>(Hin) * Wout * C;
+    resizeCatmullRomHorizKernel<<<static_cast<uint32_t>((totalH + blockSize - 1) / blockSize), blockSize, 0, stream>>>(
+        rawImage.dataPointer<unsigned char>(), tmp.dataPointer<float>(), Hin, Win, Wout, C);
+    int64_t const totalV = static_cast<int64_t>(Hout) * Wout * C;
+    resizeCatmullRomVertKernel<<<static_cast<uint32_t>((totalV + blockSize - 1) / blockSize), blockSize, 0, stream>>>(
+        tmp.dataPointer<float>(), resizedImage.dataPointer<unsigned char>(), Hin, Hout, Wout, C);
+}
+
+void copyImageToDeviceAndResize(unsigned char const* rawHostImage, int64_t const numFrames, int64_t const rawHeight,
+    int64_t const rawWidth, int64_t const channels, rt::Tensor& rawScratch, rt::Tensor& tmp, rt::Tensor& dstImage,
+    int64_t const outHeight, int64_t const outWidth, cudaStream_t stream)
+{
+    ELLM_CHECK(rawHostImage != nullptr, "copyImageToDeviceAndResize: raw host image pointer is null.");
+    ELLM_CHECK(rawHeight > 0 && rawWidth > 0 && outHeight > 0 && outWidth > 0,
+        "copyImageToDeviceAndResize: raw and output dimensions shall be positive.");
+    ELLM_CHECK(dstImage.getDeviceType() == rt::DeviceType::kGPU,
+        "copyImageToDeviceAndResize: destination image shall be on the GPU.");
+    ELLM_CHECK(
+        dstImage.getDataType() == DataType::kUINT8, "copyImageToDeviceAndResize: destination image shall be UINT8.");
+    ELLM_CHECK(dstImage.reshape({numFrames, outHeight, outWidth, channels}),
+        "copyImageToDeviceAndResize destination too small for " + std::to_string(numFrames) + " frames of "
+            + std::to_string(outHeight) + "x" + std::to_string(outWidth) + "x" + std::to_string(channels) + ".");
+
+    int64_t const rawFrameBytes = rawHeight * rawWidth * channels;
+    int64_t const outFrameBytes = outHeight * outWidth * channels;
+    bool const identity = (rawHeight == outHeight && rawWidth == outWidth);
+
+    if (!identity)
+    {
+        // Each raw side carries its own cap (the engine budget bounds only the resized size); this also
+        // bounds the horizontal-pass scratch [rawHeight, outWidth, channels].
+        ELLM_CHECK(rawHeight <= kGpuResizeMaxRawDim && rawWidth <= kGpuResizeMaxRawDim,
+            "Raw image " + std::to_string(rawHeight) + "x" + std::to_string(rawWidth)
+                + " exceeds the GPU-resize budget of " + std::to_string(kGpuResizeMaxRawDim) + "x"
+                + std::to_string(kGpuResizeMaxRawDim) + " pixels; downscale the input image.");
+        ELLM_CHECK(rawScratch.reshape({rawHeight, rawWidth, channels}),
+            "GPU-resize raw scratch too small for a " + std::to_string(rawHeight) + "x" + std::to_string(rawWidth) + "x"
+                + std::to_string(channels) + " raw image.");
+        ELLM_CHECK(tmp.reshape({rawHeight, outWidth, channels}),
+            "GPU-resize horizontal-pass scratch for raw " + std::to_string(rawHeight) + "x" + std::to_string(rawWidth)
+                + " resized to " + std::to_string(outHeight) + "x" + std::to_string(outWidth) + " exceeds its budget.");
+    }
+
+    auto* const dstBase = static_cast<unsigned char*>(dstImage.rawPointer());
+    for (int64_t t = 0; t < numFrames; ++t)
+    {
+        unsigned char const* srcFrame = rawHostImage + t * rawFrameBytes;
+        unsigned char* dstFrame = dstBase + t * outFrameBytes;
+        if (identity)
+        {
+            CUDA_CHECK(cudaMemcpyAsync(dstFrame, srcFrame, rawFrameBytes, cudaMemcpyHostToDevice, stream));
+            continue;
+        }
+        // rawScratch and tmp are reused per frame on the same stream, so the upload-then-resize chain
+        // serializes safely; the 3-D view aliases this frame's slot of the 4-D dst.
+        CUDA_CHECK(cudaMemcpyAsync(rawScratch.rawPointer(), srcFrame, rawFrameBytes, cudaMemcpyHostToDevice, stream));
+        rt::Tensor dstView(dstFrame, {outHeight, outWidth, channels}, rt::DeviceType::kGPU, DataType::kUINT8,
+            "kernel::copyImageToDeviceAndResize.dstView");
+        resizeImage(rawScratch, tmp, dstView, outHeight, outWidth, InterpolationMode::kBICUBIC, stream);
+    }
+}
+
+void allocateResizeScratch(int64_t const channels, int64_t const tmpElems, rt::Tensor& rawScratch, rt::Tensor& tmp)
+{
+    int64_t const rawElems = kGpuResizeMaxRawDim * kGpuResizeMaxRawDim * channels;
+    rawScratch = rt::Tensor({rawElems}, rt::DeviceType::kGPU, DataType::kUINT8, "kernel::resizeScratch.rawImage");
+    tmp = rt::Tensor({tmpElems}, rt::DeviceType::kGPU, DataType::kFLOAT, "kernel::resizeScratch.tmp");
 }
 
 } // namespace kernel

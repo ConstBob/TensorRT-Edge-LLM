@@ -52,6 +52,17 @@ unsigned char* ImageData::data() const noexcept
     return buffer ? buffer->dataPointer<unsigned char>() : nullptr;
 }
 
+ImageData ImageData::resizedMeta(int64_t newHeight, int64_t newWidth) const
+{
+    ImageData meta{};
+    meta.height = newHeight;
+    meta.width = newWidth;
+    meta.channels = channels;
+    meta.frames = frames;
+    meta.fps = fps;
+    return meta;
+}
+
 ImageData loadImageFromFile(std::string const& path)
 {
     int width{0}, height{0}, channels{0};

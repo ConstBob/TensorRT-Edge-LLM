@@ -147,26 +147,24 @@ bool InternViTRunner::allocateBuffer(cudaStream_t stream)
         {maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "InternViTRunner::mImageDevice");
     mNormalizedImageDevice = rt::Tensor(
         {maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "InternViTRunner::mNormalizedImageDevice");
-    // Scratch buffer for resizeImage output (4D placeholder shape; resizeImage reshapes per call).
-    rt::Tensor resizeBuffer({1, 1, maxImagePixels, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8,
-        "InternViTRunner::resizeBuffer");
-    mResizedImageHost = rt::imageUtils::ImageData(std::move(resizeBuffer));
-    // Thumbnail image has fixed size: 1 x blockImageSizeH x blockImageSizeW x channels (4D, frames=1).
-    rt::Tensor thumbnailBuffer({1, mConfig.blockImageSizeH, mConfig.blockImageSizeW, channels}, rt::DeviceType::kCPU,
-        nvinfer1::DataType::kUINT8, "InternViTRunner::thumbnailBuffer");
-    mThumbnailImageHost = rt::imageUtils::ImageData(std::move(thumbnailBuffer));
+
+    // GPU image-resize scratch.
+    // Horizontal-pass scratch holds [rawH, outW, C] floats. computeBestBlockGridForResize snaps to a
+    // block grid and does NOT preserve aspect ratio, so bound each dimension independently: rawH by the
+    // raw cap and outW by the widest single-row block grid (maxNumBlocks * blockImageSizeW).
+    int64_t const kMaxResizeTmpElems
+        = kernel::kGpuResizeMaxRawDim * mConfig.maxNumBlocks * mConfig.blockImageSizeW * channels;
+    kernel::allocateResizeScratch(channels, kMaxResizeTmpElems, mRawImageDevice, mResizeTmpDevice);
 
     return true;
 }
 
 void InternViTRunner::formatPatch(imageUtils::ImageData const& image, std::vector<int64_t>& imageTokenLengths,
-    int64_t& numImages, int64_t& totalNumBlocks, bool isThumbnail, cudaStream_t stream, int64_t frameIdx)
+    int64_t& numImages, int64_t& totalNumBlocks, bool isThumbnail, cudaStream_t stream)
 {
     int64_t height = image.height;
     int64_t width = image.width;
     int64_t channels = image.channels;
-    // For a multi-frame (video) ImageData, select frame frameIdx; a still image has frameIdx == 0.
-    unsigned char* imageData = image.data() + frameIdx * height * width * channels; // In hwc order
 
     ELLM_CHECK(channels == mConfig.numChannels,
         "Image channels mismatch, got " + std::to_string(channels) + ", expected "
@@ -195,15 +193,9 @@ void InternViTRunner::formatPatch(imageUtils::ImageData const& image, std::vecto
         ++numImages;
     }
 
-    // Reshape pre-allocated temporary buffers to current image dimensions
-    check::check(mImageDevice.reshape({1, height, width, channels}), "Tensor reshape failed");
+    // mImageDevice already holds the [1, height, width, channels] resized image, written by the shared GPU
+    // resize helper.
     check::check(mNormalizedImageDevice.reshape({1, height, width, channels}), "Tensor reshape failed");
-
-    // Copy image to device
-    CUDA_CHECK(cudaMemcpyAsync(
-        mImageDevice.rawPointer(), imageData, height * width * channels, cudaMemcpyHostToDevice, stream));
-
-    // Normalize image
     kernel::normalizeImage(mImageDevice, mImageMean, mImageStd, mNormalizedImageDevice, stream);
 
     // Transpose to patch
@@ -235,19 +227,16 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
                             + std::to_string(mConfig.blockImageSizeW) + "x" + std::to_string(mConfig.blockImageSizeH)
                             + ", got " + std::to_string(image.width) + "x" + std::to_string(image.height));
                 }
-                auto const& src = image.doResize
-                    ? rt::imageUtils::resizeImage(image, mResizedImageHost, mConfig.blockImageSizeW,
-                          mConfig.blockImageSizeH, rt::imageUtils::InterpolationMode::kBICUBIC)
-                    : image;
-                // resizeImage is multi-frame aware (reshapes the destination to {frames, H, W, C}
-                // and resizes every frame); guard the contract formatPatch's frameIdx offsets rely on.
-                ELLM_CHECK(src.frames == image.frames,
-                    "resizeImage must produce one resized tile per source frame, got " + std::to_string(src.frames)
-                        + " for " + std::to_string(image.frames));
+                int64_t const outHeight = image.doResize ? mConfig.blockImageSizeH : image.height;
+                int64_t const outWidth = image.doResize ? mConfig.blockImageSizeW : image.width;
                 for (int64_t t = 0; t < image.frames; ++t)
                 {
-                    formatPatch(src, imageTokenLengths, numImage, totalNumBlocks,
-                        /*isThumbnail=*/t > 0, stream, /*frameIdx=*/t);
+                    // Resize source frame t straight into mImageDevice; formatPatch reads its pixels from there.
+                    kernel::copyImageToDeviceAndResize(image.data() + t * image.bytesPerFrame(), 1, image.height,
+                        image.width, image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, outHeight,
+                        outWidth, stream);
+                    formatPatch(image.resizedMeta(outHeight, outWidth), imageTokenLengths, numImage, totalNumBlocks,
+                        /*isThumbnail=*/t > 0, stream);
                 }
                 continue;
             }
@@ -257,26 +246,34 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
                 auto [resizedHeight, resizedWidth] = imageUtils::computeBestBlockGridForResize(image.height,
                     image.width, mConfig.minImageTokensPerImage, mConfig.maxImageTokensPerImage,
                     mConfig.blockImageSizeH, mConfig.blockImageSizeW);
-                auto const& src = rt::imageUtils::resizeImage(
-                    image, mResizedImageHost, resizedWidth, resizedHeight, rt::imageUtils::InterpolationMode::kBICUBIC);
-                formatPatch(src, imageTokenLengths, numImage, totalNumBlocks, false, stream);
+                kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
+                    image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, resizedHeight, resizedWidth,
+                    stream);
+                formatPatch(image.resizedMeta(resizedHeight, resizedWidth), imageTokenLengths, numImage, totalNumBlocks,
+                    false, stream);
             }
             else
             {
                 LOG_DEBUG("Skipping resize for pre-resized image %ldx%ld", image.height, image.width);
+                kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
+                    image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, image.height, image.width, stream);
                 formatPatch(image, imageTokenLengths, numImage, totalNumBlocks, false, stream);
             }
+
             // Add a thumbnail tile when (a) the image has more than 1 main block (matches
             // HuggingFace behavior) or (b) the engine's MIN-profile demands more than 1 block
             // (engines built with `visual_build --minImageTokens > 256`). Without (b), a
             // single-block image would invoke the engine with totalNumBlocks=1 and the
-            // optimization profile would reject it at runtime.
+            // optimization profile would reject it at runtime. The thumbnail is a one-block resize of
+            // the ORIGINAL image and is not gated by image.doResize.
             int64_t const mainImageBlocks = totalNumBlocks - blocksBeforePatch;
             if (mainImageBlocks > 1 || mConfig.minNumBlocks > 1)
             {
-                auto const& thumbnail = rt::imageUtils::resizeImage(image, mThumbnailImageHost, mConfig.blockImageSizeW,
-                    mConfig.blockImageSizeH, rt::imageUtils::InterpolationMode::kBICUBIC);
-                formatPatch(thumbnail, imageTokenLengths, numImage, totalNumBlocks, true, stream);
+                kernel::copyImageToDeviceAndResize(image.data(), 1, image.height, image.width, image.channels,
+                    mRawImageDevice, mResizeTmpDevice, mImageDevice, mConfig.blockImageSizeH, mConfig.blockImageSizeW,
+                    stream);
+                formatPatch(image.resizedMeta(mConfig.blockImageSizeH, mConfig.blockImageSizeW), imageTokenLengths,
+                    numImage, totalNumBlocks, true, stream);
             }
         }
         numImages.emplace_back(numImage);
@@ -412,6 +409,9 @@ bool InternViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     catch (std::exception const& e)
     {
         LOG_ERROR("Failed: %s", e.what());
+        // Drain async H2D copies that may still read the request's image buffers, so the caller can
+        // safely release them after the failure.
+        cudaStreamSynchronize(stream);
         return false;
     }
 
