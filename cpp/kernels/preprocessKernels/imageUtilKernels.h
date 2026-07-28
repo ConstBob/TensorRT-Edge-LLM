@@ -70,6 +70,44 @@ void transposeToPatchGemma4ViT(rt::Tensor const& originalImage, rt::Tensor& inpu
 void transposeToPatchQwenViT(rt::Tensor const& originalImage, rt::Tensor& inputPatches, int64_t const inputOffset,
     int64_t const temporalPatchSize, int64_t const patchSize, int64_t const mergeSize, cudaStream_t stream);
 
+//! Interpolation filter for kernel::resizeImage.
+enum class InterpolationMode
+{
+    kLINEAR,  //!< Bilinear
+    kBICUBIC, //!< Catmull-Rom cubic
+};
+
+//! GPU bicubic (Catmull-Rom) resize, anti-aliased on downscale and edge-clamped; only kBICUBIC is supported.
+//!     rawImage [GPU, UInt8] [Hin, Win, C]; tmp [GPU, Float] horizontal-pass scratch >= [Hin, outWidth, C];
+//!     resizedImage [GPU, UInt8] [outHeight, outWidth, C]; outHeight/outWidth are height-first.
+//! \throws std::runtime_error on invalid tensor shape, data type or location, or an unimplemented mode.
+void resizeImage(rt::Tensor const& rawImage, rt::Tensor& tmp, rt::Tensor& resizedImage, int64_t const outHeight,
+    int64_t const outWidth, InterpolationMode const mode, cudaStream_t stream);
+
+//! Upper bound on each raw-image side for the GPU resize path; larger inputs are rejected.
+constexpr int64_t kGpuResizeMaxRawDim = 4096;
+
+//! Safety margin on the resize-scratch element count; covers side-alignment rounding of the
+//! resized dimensions.
+constexpr double kGpuResizeScratchMargin = 1.25;
+
+//! Upload numFrames HWC frames to the device, resizing each into dstImage (bicubic; verbatim copy when
+//! the out dims equal the raw dims). rawScratch and tmp are reused per frame on stream.
+//!     rawHostImage [host, UInt8]: numFrames x [rawHeight, rawWidth, channels] (numFrames=1 for a still image);
+//!     rawScratch [GPU, UInt8]: holds one raw frame, each raw side <= kGpuResizeMaxRawDim;
+//!     tmp [GPU, Float]: horizontal-pass scratch >= [rawHeight, outWidth, channels];
+//!     dstImage [GPU, UInt8]: reshaped to [numFrames, outHeight, outWidth, channels]; outHeight/outWidth height-first.
+//! \throws std::runtime_error if a raw or output dimension is non-positive, a raw side exceeds
+//!     kGpuResizeMaxRawDim, a scratch or dstImage is undersized, or a tensor has an invalid data type or location.
+void copyImageToDeviceAndResize(unsigned char const* rawHostImage, int64_t const numFrames, int64_t const rawHeight,
+    int64_t const rawWidth, int64_t const channels, rt::Tensor& rawScratch, rt::Tensor& tmp, rt::Tensor& dstImage,
+    int64_t const outHeight, int64_t const outWidth, cudaStream_t stream);
+
+//! Allocate the scratch pair used by copyImageToDeviceAndResize.
+//!     rawScratch [GPU, UInt8]: raw-upload buffer, capacity kGpuResizeMaxRawDim * kGpuResizeMaxRawDim * channels;
+//!     tmp [GPU, Float]: horizontal-pass buffer, capacity tmpElems.
+void allocateResizeScratch(int64_t const channels, int64_t const tmpElems, rt::Tensor& rawScratch, rt::Tensor& tmp);
+
 //! The kernel will initialize the rotary position embeddings for Qwen2.5-VL VIT
 //! Inputs:
 //!     gridTHW: Image grid dimensions [T, H, W] (Temporal, Height, Width)

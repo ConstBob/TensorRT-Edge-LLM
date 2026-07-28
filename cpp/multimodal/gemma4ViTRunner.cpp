@@ -266,13 +266,20 @@ bool Gemma4ViTRunner::allocateBuffer(cudaStream_t stream)
         cudaMemcpyAsync(mImageStd.rawPointer(), mConfig.imageStd.data(), nbBytes, cudaMemcpyHostToDevice, stream));
 
     int64_t const maxImagePixels = mConfig.maxPatchesPerImage * mConfig.patchSize * mConfig.patchSize;
-    rt::Tensor resizeBuffer({1, maxImagePixels, 1, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8,
-        "Gemma4ViTRunner::resizeBuffer");
-    mResizedImageHost = rt::imageUtils::ImageData(std::move(resizeBuffer));
     mImageDevice = rt::Tensor(
         {maxImagePixels * channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "Gemma4ViTRunner::mImageDevice");
     mNormalizedImageDevice = rt::Tensor({maxImagePixels * channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF,
         "Gemma4ViTRunner::mNormalizedImageDevice");
+
+    // GPU image-resize scratch.
+    int64_t const kMaxRawPixels = kernel::kGpuResizeMaxRawDim * kernel::kGpuResizeMaxRawDim;
+    // Horizontal-pass scratch holds [rawH, outW, C] floats. gemma4ResizeTarget preserves aspect ratio,
+    // so rawH * outW <= sqrt(maxImagePixels * rawH * rawW) <= sqrt(maxImagePixels * kMaxRawPixels).
+    int64_t const kMaxResizeTmpElems
+        = static_cast<int64_t>(
+              std::sqrt(static_cast<double>(maxImagePixels) * kMaxRawPixels) * kernel::kGpuResizeScratchMargin)
+        * channels;
+    kernel::allocateResizeScratch(channels, kMaxResizeTmpElems, mRawImageDevice, mResizeTmpDevice);
 
     return true;
 }
@@ -284,7 +291,6 @@ void Gemma4ViTRunner::formatPatch(rt::imageUtils::ImageData const& image, std::v
     int64_t const height = image.height;
     int64_t const width = image.width;
     int64_t const channels = image.channels;
-    unsigned char* imageData = image.data();
     int64_t const sideMult = mConfig.patchSize * mConfig.poolingKernelSize;
 
     ELLM_CHECK(channels == static_cast<int64_t>(mConfig.imageMean.size()),
@@ -303,11 +309,9 @@ void Gemma4ViTRunner::formatPatch(rt::imageUtils::ImageData const& image, std::v
     imageGrids.push_back(ImageGrid{patchHeight, patchWidth});
     maxSeqLen = std::max(maxSeqLen, curSeqLength);
 
-    check::check(mImageDevice.reshape({1, height, width, channels}), "Tensor reshape failed");
+    // mImageDevice already holds the [1, height, width, channels] image (resized on the GPU by the
+    // caller); normalize and patchify consume it in place.
     check::check(mNormalizedImageDevice.reshape({1, height, width, channels}), "Tensor reshape failed");
-    CUDA_CHECK(cudaMemcpyAsync(
-        mImageDevice.rawPointer(), imageData, height * width * channels, cudaMemcpyHostToDevice, stream));
-
     kernel::normalizeImage(mImageDevice, mImageMean, mImageStd, mNormalizedImageDevice, stream);
     kernel::transposeToPatchGemma4ViT(
         mNormalizedImageDevice, mVitInput, prevCuSeqlen * mConfig.inputDim, mConfig.patchSize, stream);
@@ -366,13 +370,17 @@ void Gemma4ViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
             {
                 auto [resizedHeight, resizedWidth] = rt::imageUtils::gemma4ResizeTarget(image.height, image.width,
                     mConfig.maxImageTokensPerImage, mConfig.poolingKernelSize, mConfig.patchSize);
-                auto const& src = rt::imageUtils::resizeImage(
-                    image, mResizedImageHost, resizedWidth, resizedHeight, rt::imageUtils::InterpolationMode::kBICUBIC);
-                formatPatch(src, imageGrids, imageTokenLengths, cuSeqlensData, cuSeqlensSize, maxSeqLen, stream);
+                kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
+                    image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, resizedHeight, resizedWidth,
+                    stream);
+                formatPatch(image.resizedMeta(resizedHeight, resizedWidth), imageGrids, imageTokenLengths,
+                    cuSeqlensData, cuSeqlensSize, maxSeqLen, stream);
             }
             else
             {
                 LOG_DEBUG("Skipping resize for pre-resized image %ldx%ld", image.height, image.width);
+                kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
+                    image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, image.height, image.width, stream);
                 formatPatch(image, imageGrids, imageTokenLengths, cuSeqlensData, cuSeqlensSize, maxSeqLen, stream);
             }
             ++numImage;
@@ -526,6 +534,9 @@ bool Gemma4ViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     catch (std::exception const& e)
     {
         LOG_ERROR("Failed: %s", e.what());
+        // Drain async H2D copies that may still read the request's image buffers, so the caller can
+        // safely release them after the failure.
+        cudaStreamSynchronize(stream);
         return false;
     }
 

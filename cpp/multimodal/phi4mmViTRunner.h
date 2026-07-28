@@ -119,19 +119,19 @@ private:
         std::vector<int64_t> const& numImages, std::vector<int64_t> const& imageTokenLengths,
         tokenizer::Tokenizer const* tokenizer);
 
-    //! \brief Copy and normalize one image, tile to blocks, and update token-length accounting
+    //! \brief Normalize the GPU-resident image, tile to blocks, and update token-length accounting
     //! \throws std::runtime_error if image not divisible into blocks
     void formatPatch(rt::imageUtils::ImageData const& image, std::vector<int64_t>& imageTokenLengths,
         int64_t& numImages, int64_t& totalNumBlocks, bool isThumbnail, cudaStream_t stream);
 
-    Phi4MMViTConfig mConfig{};                       //!< Phi-4MM visual configuration
-    rt::Tensor mVitInput{};                          //!< Visual engine input tensor
-    rt::Tensor mImageMean{};                         //!< Image mean tensor [C]
-    rt::Tensor mImageStd{};                          //!< Image std tensor [C]
-    rt::Tensor mImageDevice{};                       //!< Temporary image buffer for preprocessing
-    rt::Tensor mNormalizedImageDevice{};             //!< Temporary normalized image buffer
-    rt::imageUtils::ImageData mResizedImageHost{};   //!< Pre-allocated buffer for image resizing
-    rt::imageUtils::ImageData mThumbnailImageHost{}; //!< Pre-allocated buffer for thumbnail generation
+    Phi4MMViTConfig mConfig{};           //!< Phi-4MM visual configuration
+    rt::Tensor mVitInput{};              //!< Visual engine input tensor
+    rt::Tensor mImageMean{};             //!< Image mean tensor [C]
+    rt::Tensor mImageStd{};              //!< Image std tensor [C]
+    rt::Tensor mImageDevice{};           //!< Temporary image buffer (holds the GPU-resized image)
+    rt::Tensor mNormalizedImageDevice{}; //!< Temporary normalized image buffer
+    rt::Tensor mRawImageDevice{};        //!< Raw (pre-resize) image device buffer for the GPU resize path
+    rt::Tensor mResizeTmpDevice{};       //!< Float scratch (horizontal pass) for the GPU resize
     std::vector<std::vector<std::vector<int64_t>>> mImagesBlockGridHW; //!< Per-image block grid sizes [[hb, wb], ...]
 
     // Buffer for raw ViT outputs from the TRT engine before Phi4MM postprocess (HD transform)

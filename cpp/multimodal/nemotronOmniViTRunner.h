@@ -129,15 +129,15 @@ private:
         std::vector<int64_t> const& numImages, std::vector<int64_t> const& imageTokenLengths,
         trt_edgellm::tokenizer::Tokenizer const* tokenizer);
 
-    NemotronOmniViTConfig mConfig;                   //!< Nemotron-Omni RADIO ViT configuration
-    rt::Tensor mVitInput{};                          //!< Vision encoder input tensor
-    rt::Tensor mImageMean{};                         //!< Image mean tensor
-    rt::Tensor mImageStd{};                          //!< Image standard deviation tensor
-    rt::Tensor mImageDevice{};                       //!< Temporary image buffer for preprocessing
-    rt::Tensor mNormalizedImageDevice{};             //!< Temporary normalized image buffer
-    rt::imageUtils::ImageData mResizedImageHost{};   //!< Pre-allocated buffer for image resizing
-    rt::imageUtils::ImageData mThumbnailImageHost{}; //!< Pre-allocated buffer for thumbnail resize
-    int64_t mTotalNumBlocks{0};                      //!< Total blocks preprocessed (for batched infer)
+    NemotronOmniViTConfig mConfig;       //!< Nemotron-Omni RADIO ViT configuration
+    rt::Tensor mVitInput{};              //!< Vision encoder input tensor
+    rt::Tensor mImageMean{};             //!< Image mean tensor
+    rt::Tensor mImageStd{};              //!< Image standard deviation tensor
+    rt::Tensor mImageDevice{};           //!< Temporary image buffer (holds the GPU-resized image)
+    rt::Tensor mNormalizedImageDevice{}; //!< Temporary normalized image buffer
+    rt::Tensor mRawImageDevice{};        //!< Raw (pre-resize) image device buffer for the GPU resize path
+    rt::Tensor mResizeTmpDevice{};       //!< Float scratch (horizontal pass) for the GPU resize
+    int64_t mTotalNumBlocks{0};          //!< Total blocks preprocessed (for batched infer)
 };
 
 } // namespace rt

@@ -238,13 +238,21 @@ bool Gemma4UnifiedVisionRunner::allocateBuffer([[maybe_unused]] cudaStream_t str
         cudaMemcpy(mImageStd.rawPointer(), stddev.data(), stddev.size() * sizeof(float), cudaMemcpyHostToDevice));
 
     int64_t const maxSpatialPixels = mConfig.maxPatchesPerImage * mConfig.modelPatchSize * mConfig.modelPatchSize;
-    rt::Tensor resizeBuffer({1, 1, maxSpatialPixels, 3}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8,
-        "Gemma4UnifiedVisionRunner::resizeBuffer");
-    mResizedImageHost = rt::imageUtils::ImageData(std::move(resizeBuffer));
     mImageDevice = rt::Tensor({maxSpatialPixels * 3}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8,
         "Gemma4UnifiedVisionRunner::mImageDevice");
     mRescaledImageDevice = rt::Tensor({maxSpatialPixels * 3}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF,
         "Gemma4UnifiedVisionRunner::mRescaledImageDevice");
+
+    // GPU image-resize scratch.
+    int64_t const kMaxRawPixels = kernel::kGpuResizeMaxRawDim * kernel::kGpuResizeMaxRawDim;
+    // Horizontal-pass scratch holds [rawH, outW, 3] floats. gemma4UnifiedResizeTarget preserves aspect
+    // ratio, so rawH * outW <= sqrt(maxSpatialPixels * rawH * rawW) <= sqrt(maxSpatialPixels *
+    // kMaxRawPixels).
+    int64_t const kMaxResizeTmpElems
+        = static_cast<int64_t>(
+              std::sqrt(static_cast<double>(maxSpatialPixels) * kMaxRawPixels) * kernel::kGpuResizeScratchMargin)
+        * 3;
+    kernel::allocateResizeScratch(3, kMaxResizeTmpElems, mRawImageDevice, mResizeTmpDevice);
     return true;
 }
 
@@ -264,10 +272,8 @@ void Gemma4UnifiedVisionRunner::formatImage(rt::imageUtils::ImageData const& ima
     ELLM_CHECK(gridHeight <= mConfig.positionEmbeddingSize && gridWidth <= mConfig.positionEmbeddingSize,
         "Gemma4 Unified patch position exceeds mm_posemb_size");
 
-    check::check(mImageDevice.reshape({1, image.height, image.width, 3}), "Tensor reshape failed");
+    // mImageDevice already holds the [1, image.height, image.width, 3] image filled by the caller.
     check::check(mRescaledImageDevice.reshape({1, image.height, image.width, 3}), "Tensor reshape failed");
-    CUDA_CHECK(cudaMemcpyAsync(
-        mImageDevice.rawPointer(), image.data(), image.height * image.width * 3, cudaMemcpyHostToDevice, stream));
     kernel::normalizeImage(mImageDevice, mImageMean, mImageStd, mRescaledImageDevice, stream);
     kernel::transposeToPatchGemma4ViT(
         mRescaledImageDevice, mVisualInput, patchOffset * mConfig.inputDim, mConfig.modelPatchSize, stream);
@@ -301,16 +307,16 @@ void Gemma4UnifiedVisionRunner::imagePreprocess(rt::LLMGenerationRequest const& 
             {
                 auto const [resizedHeight, resizedWidth] = rt::imageUtils::gemma4UnifiedResizeTarget(image.height,
                     image.width, mConfig.maxPatchesPerImage, mConfig.modelPatchSize, mConfig.positionEmbeddingSize);
-                // The resize reuses this pinned host allocation. Wait for any
-                // in-flight asynchronous H2D copy before overwriting it.
-                CUDA_CHECK(cudaStreamSynchronize(stream));
-                auto const& src = rt::imageUtils::resizeImage(
-                    image, mResizedImageHost, resizedWidth, resizedHeight, rt::imageUtils::InterpolationMode::kBICUBIC);
-                formatImage(src, totalPatches, imageTokenLengths, stream);
+                kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
+                    image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, resizedHeight, resizedWidth,
+                    stream);
+                formatImage(image.resizedMeta(resizedHeight, resizedWidth), totalPatches, imageTokenLengths, stream);
             }
             else
             {
                 LOG_DEBUG("Skipping resize for pre-resized image %ldx%ld", image.height, image.width);
+                kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
+                    image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, image.height, image.width, stream);
                 formatImage(image, totalPatches, imageTokenLengths, stream);
             }
         }
@@ -401,6 +407,9 @@ bool Gemma4UnifiedVisionRunner::preprocess(rt::LLMGenerationRequest const& reque
     catch (std::exception const& e)
     {
         LOG_ERROR("Gemma4 Unified vision preprocessing failed: %s", e.what());
+        // Drain async H2D copies that may still read the request's image buffers, so the caller can
+        // safely release them after the failure.
+        cudaStreamSynchronize(stream);
         return false;
     }
 }

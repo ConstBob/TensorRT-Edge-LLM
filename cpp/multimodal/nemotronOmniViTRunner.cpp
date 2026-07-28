@@ -183,14 +183,14 @@ bool NemotronOmniViTRunner::allocateBuffer(cudaStream_t stream)
         {maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "NemotronOmniViTRunner::mImageDevice");
     mNormalizedImageDevice = rt::Tensor({maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF,
         "NemotronOmniViTRunner::mNormalizedImageDevice");
-    // Scratch buffer for resizeImage output (4D placeholder shape; resizeImage reshapes per call).
-    rt::Tensor resizeBuffer({1, 1, maxImagePixels / channels, channels}, rt::DeviceType::kCPU,
-        nvinfer1::DataType::kUINT8, "NemotronOmniViTRunner::resizeBuffer");
-    mResizedImageHost = rt::imageUtils::ImageData(std::move(resizeBuffer));
-    // Thumbnail image has fixed size: 1 x blockImageSizeH x blockImageSizeW x channels (4D, frames=1).
-    rt::Tensor thumbnailBuffer({1, mConfig.blockImageSizeH, mConfig.blockImageSizeW, channels}, rt::DeviceType::kCPU,
-        nvinfer1::DataType::kUINT8, "NemotronOmniViTRunner::thumbnailBuffer");
-    mThumbnailImageHost = rt::imageUtils::ImageData(std::move(thumbnailBuffer));
+
+    // GPU image-resize scratch.
+    // Horizontal-pass scratch holds [rawH, outW, C] floats. computeBestBlockGridForResize snaps to a
+    // block grid and does NOT preserve aspect ratio, so bound each dimension independently: rawH by the
+    // raw cap and outW by the widest single-row block grid (maxNumBlocks * blockImageSizeW).
+    int64_t const kMaxResizeTmpElems
+        = kernel::kGpuResizeMaxRawDim * mConfig.maxNumBlocks * mConfig.blockImageSizeW * channels;
+    kernel::allocateResizeScratch(channels, kMaxResizeTmpElems, mRawImageDevice, mResizeTmpDevice);
 
     return true;
 }
@@ -201,7 +201,6 @@ void NemotronOmniViTRunner::formatPatch(rt::imageUtils::ImageData const& image, 
     int64_t height = image.height;
     int64_t width = image.width;
     int64_t channels = image.channels;
-    unsigned char* imageData = image.data(); // In hwc order
 
     ELLM_CHECK(channels == mConfig.numChannels,
         "Image channels mismatch, got " + std::to_string(channels) + ", expected "
@@ -230,13 +229,8 @@ void NemotronOmniViTRunner::formatPatch(rt::imageUtils::ImageData const& image, 
         ++numImages;
     }
 
-    // Reshape pre-allocated temporary buffers to current image dimensions
-    check::check(mImageDevice.reshape({1, height, width, channels}), "Tensor reshape failed");
+    // mImageDevice already holds the [1, height, width, channels] image, populated by the caller.
     check::check(mNormalizedImageDevice.reshape({1, height, width, channels}), "Tensor reshape failed");
-
-    // Copy image to device
-    CUDA_CHECK(cudaMemcpyAsync(
-        mImageDevice.rawPointer(), imageData, height * width * channels, cudaMemcpyHostToDevice, stream));
 
     // Normalize image
     kernel::normalizeImage(mImageDevice, mImageMean, mImageStd, mNormalizedImageDevice, stream);
@@ -273,30 +267,36 @@ void NemotronOmniViTRunner::imagePreprocess(rt::LLMGenerationRequest const& requ
         for (auto const& image : req.imageBuffers)
         {
             int64_t const blocksBeforePatch = mTotalNumBlocks;
-
             if (image.doResize)
             {
                 // Resize image to the aspect-ratio-matched tile grid within the per-image tile budget
                 auto [resizedHeight, resizedWidth] = imageUtils::computeBestBlockGridForResize(image.height,
                     image.width, mConfig.minImageTokensPerImage, mConfig.maxImageTokensPerImage,
                     mConfig.blockImageSizeH, mConfig.blockImageSizeW);
-                auto const& src = rt::imageUtils::resizeImage(
-                    image, mResizedImageHost, resizedWidth, resizedHeight, rt::imageUtils::InterpolationMode::kBICUBIC);
-                formatPatch(src, imageTokenLengths, numImage, mTotalNumBlocks, false, stream);
+                kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
+                    image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, resizedHeight, resizedWidth,
+                    stream);
+                formatPatch(image.resizedMeta(resizedHeight, resizedWidth), imageTokenLengths, numImage,
+                    mTotalNumBlocks, false, stream);
             }
             else
             {
                 LOG_DEBUG("Skipping resize for pre-resized image %ldx%ld", image.height, image.width);
+                kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
+                    image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, image.height, image.width, stream);
                 formatPatch(image, imageTokenLengths, numImage, mTotalNumBlocks, false, stream);
             }
 
-            // Only add thumbnail when the image has more than 1 block (matches HuggingFace behavior)
+            // Only add thumbnail when the image has more than 1 block (matches HuggingFace behavior). The
+            // thumbnail is a one-block resize of the ORIGINAL image and is not gated by image.doResize.
             int64_t const mainImageBlocks = mTotalNumBlocks - blocksBeforePatch;
             if (mainImageBlocks > 1)
             {
-                auto const& thumbnail = rt::imageUtils::resizeImage(image, mThumbnailImageHost, mConfig.blockImageSizeW,
-                    mConfig.blockImageSizeH, rt::imageUtils::InterpolationMode::kBICUBIC);
-                formatPatch(thumbnail, imageTokenLengths, numImage, mTotalNumBlocks, true, stream);
+                kernel::copyImageToDeviceAndResize(image.data(), 1, image.height, image.width, image.channels,
+                    mRawImageDevice, mResizeTmpDevice, mImageDevice, mConfig.blockImageSizeH, mConfig.blockImageSizeW,
+                    stream);
+                formatPatch(image.resizedMeta(mConfig.blockImageSizeH, mConfig.blockImageSizeW), imageTokenLengths,
+                    numImage, mTotalNumBlocks, true, stream);
             }
         }
         numImages.emplace_back(numImage);
@@ -390,6 +390,9 @@ bool NemotronOmniViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     catch (std::exception const& e)
     {
         LOG_ERROR("Failed: %s", e.what());
+        // Drain async H2D copies that may still read the request's image buffers, so the caller can
+        // safely release them after the failure.
+        cudaStreamSynchronize(stream);
         return false;
     }
 

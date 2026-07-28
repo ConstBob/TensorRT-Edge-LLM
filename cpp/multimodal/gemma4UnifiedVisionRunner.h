@@ -72,7 +72,8 @@ private:
     rt::Tensor mImageStd{};
     rt::Tensor mImageDevice{};
     rt::Tensor mRescaledImageDevice{};
-    rt::imageUtils::ImageData mResizedImageHost{};
+    rt::Tensor mRawImageDevice{};  //!< Raw (pre-resize) image device buffer for the GPU resize path
+    rt::Tensor mResizeTmpDevice{}; //!< Float scratch (horizontal pass) for the GPU resize
 };
 
 } // namespace rt

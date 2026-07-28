@@ -73,6 +73,12 @@ public:
     {
         return height * width * channels;
     }
+
+    //! @brief Metadata-only copy at a new spatial size: keeps channels, frames and fps, replaces
+    //!        height/width, and carries no pixel buffer (the resized pixels live in the caller's device
+    //!        tensor).
+    //! @return ImageData with the new dimensions and this object's channels, frames and fps.
+    ImageData resizedMeta(int64_t newHeight, int64_t newWidth) const;
 };
 
 /*!
