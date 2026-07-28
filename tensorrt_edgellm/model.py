@@ -56,10 +56,12 @@ _QWEN3_5_MTP_BASE_MODEL_TYPES = frozenset({
     "qwen3_5_text",
     "qwen3_5_moe",
     "qwen3_5_moe_text",
+    "qwen3_omni_next_text_moe",
 })
 _QWEN3_5_MTP_DRAFT_MODEL_TYPES = frozenset({
     "qwen3_5_text",
     "qwen3_5_moe_text",
+    "qwen3_omni_next_text_moe",
 })
 
 
@@ -227,6 +229,13 @@ class AutoModel:
         from .models.default.modeling_default import CausalLM
 
         config = load_model_config(model_dir)
+        # Qwen3-Omni Next ships both dense and sparse-MoE thinkers under the
+        # same ``qwen3_omni_next_text`` model_type (the HF config is not
+        # rewritten for the MoE variant). Detect MoE by ``num_experts > 0`` and
+        # re-dispatch to the registered ``_moe`` class variant when one exists.
+        if (getattr(config, "num_experts", 0)
+                and f"{config.model_type}_moe" in _MODEL_REGISTRY):
+            config.model_type = f"{config.model_type}_moe"
         if eagle_base:
             config.eagle_base = True
             if eagle_draft_dir:
@@ -345,12 +354,17 @@ class AutoModel:
             # TODO: support other model types
             if not _is_qwen3_5_mtp_draft_supported(config.model_type):
                 raise NotImplementedError(
-                    "MTP draft is only supported for Qwen3.5 text/MoE "
+                    "MTP draft is only supported for qwen3_5_text / "
+                    "qwen3_5_moe_text / qwen3_omni_next_text_moe "
                     f"checkpoints; got {config.model_type!r}.")
-            is_moe = config.model_type == "qwen3_5_moe_text"
+            draft_model_type = config.model_type
             tie_word_embeddings = config.tie_word_embeddings
             config = make_mtp_draft_config(config)
-            if is_moe:
+            if draft_model_type == "qwen3_omni_next_text_moe":
+                from .models.qwen3_omni_next import \
+                    Qwen3OmniNextMoeMtpDraftModel
+                model_class = Qwen3OmniNextMoeMtpDraftModel
+            elif draft_model_type == "qwen3_5_moe_text":
                 from .models.qwen3_5_moe import Qwen3_5MoeMtpDraftModel
                 model_class = Qwen3_5MoeMtpDraftModel
             else:

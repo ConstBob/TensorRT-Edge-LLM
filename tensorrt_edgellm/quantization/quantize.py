@@ -46,8 +46,11 @@ from .quantization_configs import build_quant_config
 from .qwen3_asr_loader import (asr_calibration_dataloader, is_qwen3_asr_model,
                                load_qwen3_asr_joint_for_calibration,
                                postprocess_qwen3_asr_checkpoint)
-from .qwen3_cp_loader import has_code_predictor, qwen3_cp_calibration_loop
-from .qwen3_omni import is_omni_model_dir, quantize_and_export_omni
+from .qwen3_cp_loader import (has_code_predictor, is_qwen3_next_omni,
+                              qwen3_cp_calibration_loop,
+                              qwen3_next_cp_calibration_loop)
+from .qwen3_omni import (_load_omni_model, is_omni_model_dir,
+                         quantize_and_export_omni)
 
 
 def _text_calib_dataloader(tokenizer,
@@ -649,13 +652,16 @@ def quantize_and_export(
     never fails the run; an unknown name for the modality in use fails out
     with a pointer to the customization guide.
     """
-    from ..chat_template import _is_qwen3_omni_model
+    from ..chat_template import _get_model_type
 
     # Qwen3-Omni needs a joint Thinker+Talker multimodal calibration chain
     # the generic single-model path below can't express; delegate the full
     # quant+export pipeline to the dedicated driver (auto-branches MoE vs
-    # non-MoE from ``config.json``).
-    if _is_qwen3_omni_model(model_dir):
+    # non-MoE from ``config.json``). ``qwen3_omni_next`` is deliberately
+    # excluded: the shared chat-template tuple lumps all three variants,
+    # which would send Next into this driver whose HF classes cannot load
+    # a Next checkpoint — Next dispatches to its orchestrator below.
+    if _get_model_type(model_dir) in ("qwen3_omni", "qwen3_omni_moe"):
         from .qwen3_omni import quantize_qwen3_omni
 
         # Split num_samples across audio/image/text roughly evenly.
@@ -679,10 +685,20 @@ def quantize_and_export(
         )
         return output_dir
 
-    # Qwen3.5-Omni (qwen3_omni_next): dedicated orchestrator (transformers
-    # patch + thinker/talker multimodal calib + amax backfill). Shares the
-    # ``llm`` flag surface; unsupported sub-encoder flags fail loudly there.
-    if is_omni_model_dir(model_dir):
+    # Qwen3-Omni Next: dedicated orchestrator (transformers patch +
+    # thinker/talker multimodal calib + amax backfill). Shares the ``llm``
+    # flag surface; unsupported sub-encoder flags fail loudly there. EXCEPT
+    # CP-only quantization (``--cp_quantization`` without ``--quantization``),
+    # which the orchestrator doesn't support and the generic flow below does.
+    omni_dir = is_omni_model_dir(model_dir)
+    cp_only = cp_quantization is not None and quantization is None
+    if omni_dir and not cp_only:
+        if cp_quantization is not None:
+            raise ValueError(
+                "Joint --quantization + --cp_quantization on a "
+                "Qwen3-Omni Next root is not supported. Run "
+                "`--cp_quantization fp8` alone (CP-only checkpoint), and "
+                "quantize the backbone in a separate pass.")
         kwargs = {}
         if text_dataset is not None:
             kwargs["text_dataset"] = text_dataset
@@ -702,7 +718,15 @@ def quantize_and_export(
         )
 
     t0 = time.time()
-    model, tokenizer, processor = _load_model(model_dir, dtype, device)
+    if omni_dir:
+        # CP-only on an Omni root: the ForConditionalGeneration classes need
+        # the dedicated loader (transformers workarounds + delegating
+        # forward for ModelOpt's dummy walk); it loads bf16-declared
+        # checkpoints as bf16 regardless of the requested dtype.
+        model, tokenizer, processor = _load_omni_model(model_dir, dtype,
+                                                       device)
+    else:
+        model, tokenizer, processor = _load_model(model_dir, dtype, device)
 
     base_already_quantized = is_quantized(model)
     mtp_layers = _mtp_num_hidden_layers(model)
@@ -783,7 +807,23 @@ def quantize_and_export(
                     print(
                         f"[int4] skipping {name}: weight [{module.out_features}, "
                         f"{module.in_features}] not 64-aligned (kept fp16)")
-        if cp_quantization is not None and has_code_predictor(model):
+        if cp_quantization is not None and is_qwen3_next_omni(model):
+            # Qwen3-Omni Next (dense + MoE share the class): the Talker fires
+            # the CP inside its own generate loop, so calibration drives the
+            # checkpoint's reference generation path with ChatML prompts
+            # instead of the hand-built Thinker->Talker chain below.
+            text_ds = resolve_dataset(text_dataset, "text")
+            print(f"Text calibration dataset: {dataset_name(text_ds)}")
+            cp_n = min(num_samples, 64)
+            # 2x margin: samples can be skipped (short thinker replies).
+            texts = list(islice(text_ds(), cp_n * 2))
+            mtq.quantize(
+                model,
+                quant_cfg,
+                forward_loop=lambda m: qwen3_next_cp_calibration_loop(
+                    m, tokenizer, texts, num_cp_samples=cp_n),
+            )
+        elif cp_quantization is not None and has_code_predictor(model):
             # CP is only reached via the Thinker->Talker->CP generation path,
             # so a dedicated loop drives that chain (bs=1: Talker uses 3D
             # RoPE, no batch-mixing). When backbone is co-quantized, prepend
@@ -894,14 +934,40 @@ def quantize_and_export(
     extra_state_dict.update(attention_q_scales)
 
     os.makedirs(output_dir, exist_ok=True)
-    with torch.inference_mode(), _skip_resmooth_for_hybrid(
-            model, quantization or ""):
-        export_hf_checkpoint(model,
-                             export_dir=output_dir,
-                             extra_state_dict=extra_state_dict)
-    if attention_q_scales:
-        print("Exported calibrated Q-BMM scales for "
-              f"{len(attention_q_scales)} attention layer(s).")
+    # MoE wrapper has no top-level ``forward`` → ``export_hf_checkpoint``'s
+    # dummy walk crashes. Route CP-only quantization on such wrappers through
+    # ``qwen3_omni._export_submodel(model, "talker", ...)``.
+    cp_only_moe_wrapper = (cp_quantization is not None and quantization is None
+                           and has_code_predictor(model)
+                           and getattr(model, "thinker", None) is not None
+                           and ("Moe" in type(model).__name__
+                                or is_qwen3_next_omni(model)))
+    if cp_only_moe_wrapper:
+        from .qwen3_omni import _export_submodel
+        _export_submodel(model, "talker", output_dir)
+        # HF Talker configs carry ``model_type=""`` and would fail component
+        # dispatch. Patch in the Talker-root type — deliberately NOT the
+        # full-root ``qwen3_omni_next``, which AutoConfig would default-fill
+        # with the fork's non-JSON-serializable thinker/code2wav sections;
+        # an unregistered type falls back to the raw config.json everywhere.
+        # The CP exporter detects Talker-root via ``code_predictor_config``.
+        if is_qwen3_next_omni(model):
+            cfg_path = os.path.join(output_dir, "config.json")
+            with open(cfg_path) as f:
+                exported_cfg = json.load(f)
+            if not exported_cfg.get("model_type"):
+                exported_cfg["model_type"] = "qwen3_omni_next_talker"
+                with open(cfg_path, "w") as f:
+                    json.dump(exported_cfg, f, indent=2)
+    else:
+        with torch.inference_mode(), _skip_resmooth_for_hybrid(
+                model, quantization or ""):
+            export_hf_checkpoint(model,
+                                 export_dir=output_dir,
+                                 extra_state_dict=extra_state_dict)
+        if attention_q_scales:
+            print("Exported calibrated Q-BMM scales for "
+                  f"{len(attention_q_scales)} attention layer(s).")
     _remove_stale_safetensors_index(output_dir)
     tokenizer.save_pretrained(output_dir)
     if processor is not None:

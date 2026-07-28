@@ -71,9 +71,12 @@ _AUDIO_PATTERNS = tuple(f"*{p}.*" for p in _AUDIO_PREFIXES)
 _CP_PREFIXES = ("code_predictor", )
 _CP_PATTERNS = tuple(f"*{p}.*" for p in _CP_PREFIXES)
 
-# CP Linears kept unquantized: down_proj (silu*up range quantizes poorly) and
-# lm_head[0..14] (each codebook sees too little calibration signal).
-_CP_LINEAR_EXCLUDES = ("lm_head", "down_proj")
+# Linear submodules where FP8 loses precision: down_proj (silu*up ∈
+# [-39, 72] → per-tensor amax quantizes to garbage) and lm_head[0..14]
+# (each codebook sees 1/15 of calib signal, amax undertrained).
+# talker_projection runs as an fp16 sidecar GEMM in the C++ runtime, so
+# quantizing it only adds error without any kernel to use the FP8 weights.
+_CP_LINEAR_EXCLUDES = ("lm_head", "down_proj", "talker_projection")
 
 # CP attention BMM quantizers (mixed-precision KV rejected by ONNX export).
 _CP_BMM_EXCLUDES = ("q_bmm", "k_bmm", "v_bmm")

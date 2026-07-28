@@ -450,7 +450,10 @@ bool AudioBuilder::setupAudioEncoderProfile(
     // Dispatch to model-specific setup based on model type
     switch (mModelType)
     {
-    case multimodal::ModelType::QWEN3_OMNI_AUDIO_ENCODER: result = setupQwen3OmniAudioEncoderProfile(*profile); break;
+    case multimodal::ModelType::QWEN3_OMNI_AUDIO_ENCODER:
+    case multimodal::ModelType::QWEN3_OMNI_NEXT_AUDIO_ENCODER:
+        result = setupQwen3OmniAudioEncoderProfile(*profile);
+        break;
     case multimodal::ModelType::GEMMA4_UNIFIED_AUDIO: result = setupGemma4UnifiedAudioEncoderProfile(*profile); break;
     case multimodal::ModelType::NEMOTRON_OMNI_AUDIO_ENCODER:
         result = setupNemotronOmniAudioEncoderProfile(*profile);

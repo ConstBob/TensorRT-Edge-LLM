@@ -83,6 +83,7 @@ class Qwen3OmniNextCodePredictorCausalLM(Qwen3_5CausalLM):
             rope_rotary_cos_sin: torch.Tensor,
             context_lengths: torch.Tensor,
             kvcache_start_index: torch.Tensor,
+            kv_page_table: torch.Tensor,
             last_token_ids: torch.Tensor,
             conv_states: Tuple[torch.Tensor, ...] = (),
             recurrent_states: Tuple[torch.Tensor, ...] = (),
@@ -92,8 +93,8 @@ class Qwen3OmniNextCodePredictorCausalLM(Qwen3_5CausalLM):
          _intermediate_rec,
          _dflash_hidden) = self.model(inputs_embeds, past_key_values,
                                       rope_rotary_cos_sin, context_lengths,
-                                      kvcache_start_index, conv_states,
-                                      recurrent_states)
+                                      kvcache_start_index, kv_page_table,
+                                      conv_states, recurrent_states)
         self._cp_full_hidden = hidden  # surfaced by the ONNX wrapper
         last_hidden = torch.ops.trt.gather_nd(hidden, last_token_ids)
         self._cp_last_hidden = last_hidden  # used by wrapper for dynamic lm_head

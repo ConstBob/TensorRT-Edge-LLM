@@ -50,6 +50,10 @@ from .models.qwen3_omni.modeling_qwen3_omni_moe_talker import \
 from .models.qwen3_omni.modeling_qwen3_omni_moe_text import \
     Qwen3OmniMoeThinkerCausalLM
 from .models.qwen3_omni.modeling_qwen3_omni_text import Qwen3OmniLanguageModel
+from .models.qwen3_omni_next.modeling_qwen3_omni_next_moe_talker import \
+    Qwen3OmniNextMoeTalkerCausalLM
+from .models.qwen3_omni_next.modeling_qwen3_omni_next_moe_text import \
+    Qwen3OmniNextMoeLanguageModel
 from .models.qwen3_omni_next.modeling_qwen3_omni_next_text import \
     Qwen3OmniNextLanguageModel
 from .onnx.export import export_onnx
@@ -100,6 +104,10 @@ register_model("qwen3_omni_next", Qwen3OmniNextLanguageModel,
 register_model("qwen3_omni_next_thinker", Qwen3OmniNextLanguageModel,
                standard_attention_scale)
 register_model("qwen3_omni_next_text", Qwen3OmniNextLanguageModel,
+               standard_attention_scale)
+register_model("qwen3_omni_next_text_moe", Qwen3OmniNextMoeLanguageModel,
+               standard_attention_scale)
+register_model("qwen3_omni_next_talker_text", Qwen3OmniNextMoeTalkerCausalLM,
                standard_attention_scale)
 register_model("qwen3_asr", Qwen3ASRLanguageModel, standard_attention_scale)
 register_model("qwen3_asr_thinker", Qwen3ASRLanguageModel,

@@ -13,7 +13,8 @@ lives here. This file is excluded from the OSS release tree via
 |-------|--------------|----------|--------|------------------|
 | Qwen3-Omni-30B-A3B-Instruct | `qwen3_omni_moe` | MoE (128 experts) | [HF (public)](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct) | NVFP4, INT4 AWQ (g=128) |
 | Qwen3-Omni-4B-Instruct-multilingual | `qwen3_omni` | Dense | internal snapshot (closed-source — do NOT reference publicly) | NVFP4, INT4 GPTQ (external gptqmodel), FP16 |
-| Qwen3.5-Omni dense (Qwen3-Next Omni) | `qwen3_omni_next` | Dense | internal snapshot (closed-source — do NOT reference publicly) | INT4 AWQ (g=128) |
+| Qwen3-Omni Next dense (3B) | `qwen3_omni_next` | Dense (GDN-hybrid) | internal snapshot (closed-source — do NOT reference publicly) | INT4 AWQ (g=128) |
+| Qwen3-Omni Next MoE (23A2.6B) | `qwen3_omni_next` | MoE (GDN-hybrid, fp16 experts) | internal snapshot (closed-source — do NOT reference publicly) | fp16 MoE plugin (+ MTP draft export) |
 
 All three share the six-engine layout:
 
@@ -41,11 +42,29 @@ to two backends:
 
 | Capability | MoE (`qwen3_omni_moe`) | Dense (`qwen3_omni`) | Next (`qwen3_omni_next`) |
 |------------|------------------------|----------------------|--------------------------|
-| `--quantization nvfp4` | ✅ validated | ✅ validated | ⚠️ untested |
+| `--quantization nvfp4` | ✅ validated | ✅ validated | ⚠️ see note below |
+
+**Next MoE NVFP4 production split** (from the pre-quantized `0422_nvfp4`
+checkpoint, ground-truth from its weight dtypes):
+
+- **Thinker** MoE experts → **NVFP4** (layer-0's 256 experts kept FP16;
+  layers 1–27 NVFP4). Thinker attention, `shared_expert`, `lm_head`,
+  visual/audio towers stay FP16.
+- **Talker** MoE experts → **FP16** (fp16 MoE plugin — audio generation
+  is quantization-sensitive). `code_predictor`, `talker_projection`,
+  `codec_head`, GDN `linear_attn` also FP16.
+
+So the split is Thinker-NVFP4 / Talker-FP16 — the **opposite** of the
+dense/MoE Qwen3-Omni intuition. A naive full-model `--quantization
+nvfp4` on the BF16 root (0315) NVFP4s *both* Thinker and Talker experts
+(the default keep-set only excludes routers/gates/shared_expert/GDN),
+which does **not** match production. To reproduce the production layout,
+exclude Talker experts (`*talker*mlp.experts.*`) and layer-0 Thinker
+experts from the quant config.
 | `--quantization int4_awq` | ✅ validated (AWQ→Marlin MoE repack) | ❌ (use external GPTQ) | ✅ validated |
 | INT4 GPTQ (external gptqmodel) | — | ✅ validated | — |
-| `--visual_quantization fp8` / `--audio_quantization fp8` | ✅ | ✅ | ❌ rejected with explicit error |
-| `--cp_quantization fp8` | ✅ | ✅ | ❌ rejected with explicit error |
+| `--visual_quantization fp8` / `--audio_quantization fp8` | ✅ | ✅ | ✅ validated (rides the joint calib pass; see FP8 encoder note below) |
+| `--cp_quantization fp8` | ✅ | ✅ | ✅ CP-only pass (see Next specifics below) |
 | `--num_samples` / `--text_dataset` | ✅ | ✅ | ✅ |
 | `--lm_head_quantization` / `--kv_cache_quantization` | ✅ | ✅ | ✅ |
 
@@ -116,7 +135,7 @@ tensorrt-edgellm-quantize llm \
 ```
 
 INT4 AWQ is validated on MoE (the AWQ→Marlin repack targets the MoE
-expert plugin) and on Next (dense Marlin path from the Qwen3.5 bring-up).
+expert plugin) and on Next (dense Marlin path from the Qwen3-Omni Next bring-up).
 For the `qwen3_omni` dense variant, INT4 goes through the external GPTQ
 flow below.
 
@@ -149,9 +168,21 @@ route does NOT apply to the external-GPTQ dense checkpoint (already
 quantized ⇒ the ModelOpt pass is skipped); CP FP8 for that flow would
 need the CP-only pass on the original BF16 root.
 
-On `qwen3_omni_next` the flag is rejected (`--cp_quantization is not
-supported for qwen3_omni_next yet`) — its CodePredictor differs
-structurally and the CP calibration drive has not been validated there.
+On `qwen3_omni_next` only the **CP-only pass** is supported
+(`--cp_quantization fp8` without `--quantization`; the joint combination
+is rejected with an explicit error). It runs a dedicated Next drive
+(`qwen3_next_cp_calibration_loop`: Thinker prefill → Talker codec loop →
+`code_predictor` residual steps) and exports a **Talker-root** checkpoint
+whose `model_type` is patched to `qwen3_omni_next_talker`. That value is
+deliberately NOT the full-root `qwen3_omni_next`: AutoConfig would map it
+to the full config class and default-fill the missing thinker/code2wav
+sections, while an unregistered type falls back to the raw `config.json`
+everywhere. `tensorrt-edgellm-export --components code_predictor` accepts
+the Talker-root directly (layout `llm/code_predictor`). The 23A2.6B-only
+`talker_projection` bridge (1280 → 1024) is excluded from quantization —
+the C++ runtime consumes it as an fp16 sidecar GEMM
+(`small_to_mtp_projection.safetensors`), so FP8 there would only add
+error. See "Qwen3-Omni Next specifics" below for the environment.
 
 ### Dense-only extra: INT4 GPTQ via external gptqmodel
 
@@ -436,6 +467,249 @@ Thinker interleaving — only chunked vocoding, configured via CLI
 
 ---
 
+## Qwen3-Omni Next specifics (internal)
+
+Everything in this section is closed-source material — never reference
+the model names, sizes, or checkpoint paths publicly.
+
+### Checkpoints and environment
+
+| Variant | Snapshot | transformers |
+|---------|----------|--------------|
+| dense 3B | `qwen3_5_omni_3b_final_multilingual_0324` | `transformers-internal-bk-0316` fork |
+| MoE 23A2.6B | `qwen3_5_omni_23a2.6b_final_multilingual_0315` | `transformers-internal-bk-0316` fork |
+
+The 0315/0324 checkpoints require the matching internal fork on
+`PYTHONPATH` (known-good venv on scratch: `venv-cp-fp8` — torch 2.9
+cu128 + ModelOpt 0.44). The fork already ships gated attention and the
+GDN-hybrid Talker, so the in-place transformers patches
+(`_patch_qwen3_omni_next_transformers`) detect per-class whether each
+fix is still needed and no-op otherwise. Load the model in the
+checkpoint-declared dtype (bf16): the fork sizes its GDN cache states
+from the config dtype, and an fp16-loaded model fails with mixed-dtype
+matmuls inside the Talker generate chain.
+
+That fork also predates Gemma4 and has no `Gemma4AudioConfig`. Because
+`import tensorrt_edgellm` eagerly loads `models/gemma4/__init__.py` →
+`modeling_gemma4_audio`, whose top-level `from transformers import
+Gemma4AudioConfig` raises ImportError, the package will not import on the
+fork as-is. We keep that import unconditional (no in-code fallback), so
+run export/quantize in an env whose transformers ships Gemma4 — either add
+Gemma4 to the fork, or use a venv that has both the Next patches and an
+upstream transformers.
+
+### MoE Talker: fp16 experts
+
+The 23A2.6B Talker/Thinker MoE keeps routed experts in FP16/BF16 and
+runs them through the C++ `Fp16MoePlugin` (E ∈ {128, 256}); there is no
+weight repack. Export side: `fp16_moe_plugin` op in `models/ops.py` +
+the `_use_fp16_moe` path in `modeling_qwen3_moe.py`; the Next Thinker /
+Talker MoE classes live in
+`models/qwen3_omni_next/modeling_qwen3_omni_next_moe_{text,talker}.py`
+(registered as `qwen3_omni_next_text_moe` — the HF config does not
+distinguish dense vs MoE, so `model.py` re-dispatches on
+`num_experts > 0`). **Do NOT run the 23A2.6B Talker through the fp16
+MoE plugin**: this bf16-trained checkpoint has SwiGLU activation
+outliers past the fp16 max (65504) — one ±inf row poisons every later
+token through attention (all-NaN logits, token 4999+/no-EOS). The same
+overflow reproduces in pure PyTorch fp16 (`torch.multinomial` device
+assert), i.e. the model is not fp16-able; a saturation clamp in
+`activateFc1Kernel` was tried and rejected in review (it silently
+swallows NaNs and alters shared-kernel semantics). The Talker ships
+quantized (NVFP4 experts) instead; the fp16 MoE plugin remains for the
+MTP draft (256 experts, Thinker-side ranges, no overflow observed).
+
+### MTP speculative decoding (E2E validated)
+
+`Qwen3OmniNextMoeMtpDraftModel`
+(`modeling_qwen3_omni_next_mtp.py`) reuses the `qwen3_5` MTP draft
+infrastructure with the 256-expert sparse-MoE FFN; the exporter selects
+it when the checkpoint declares `mtp_num_hidden_layers` under
+`talker_config`. The C++ runtime needs **zero changes** — the stock MTP
+decoder path (`MTPDecoder` / `gdn_decode_mtp` / `scatterMtpStates`)
+drives it as-is. Usage: export `--components thinker,mtp_draft --mtp`
+(the draft lands in `<onnx>/mtp_draft/`, NOT `<onnx>/llm/mtp_draft/`);
+build base with `--specBase --maxVerifyTreeSize 7` and draft with
+`--specDraft` into the same engine dir; run with `--specDecode
+--specDraftTopK 1 --specDraftStep 3 --specVerifySize 4`.
+
+**Base export requires the `spec_verify_phase_marker` input.** On a
+GDN-hybrid backbone the speculative *verify* step re-runs the whole
+drafted window through the GDN mixers, but a GDN layer carries a
+recurrent state that mutates per token, so a verify that ends up
+rejecting tokens must be able to roll that state back. The marker is a
+**shape-only** input (`[0]` = ordinary prefill/decode, `[1]` = spec
+verify; the payload is ignored) that flips `gated_delta_net` /
+`causal_conv1d` into their spec-verify kernels, which additionally emit
+`intermediate_states` — a per-step checkpoint of the recurrent state the
+runtime commits by accepted token id. This is **not** new to this MR or
+to any rebase: the marker and its `--specBase` validation shipped with
+the Qwen3.5 hybrid DFlash/DDTree work (`0b5091a21`, work item #421) and
+the `qwen3_5` MTP base has always wired it. The Next MoE Thinker
+(`modeling_qwen3_omni_next_moe_text.py`) is a new subclass that inherits
+that MTP infrastructure but initially omitted the pass-through, so it
+must thread the marker through its backbone / `forward` / flat-wrapper /
+OnnxSpec the same way `qwen3_5_text.py` does, or `llm_build --specBase`
+fails with *"missing input `spec_verify_phase_marker`"*.
+
+Pitfall worth keeping: the MTP base export must feed the draft the
+**final post-norm** hidden states (the backbone's first return value).
+Returning `emitted_hidden_states` lets the Talker-inherited
+`accept_hidden_layer` (e.g. 18) silently swap in a mid-layer pre-norm
+tensor — acceptance collapses to ~1.44 and E2E runs slower than
+baseline. Teacher-forced hidden→lm_head agreement (~0.93 when healthy)
+is the quick sanity probe.
+
+Measured on B100 (23A2.6B, NVFP4 Thinker). Acceptance rate is strongly
+prompt-dependent — it tracks how predictable the continuation is, not
+the language: on a 4-prompt mix the per-prompt rate ranged 2.02 (an
+open-ended English essay) to 2.88 (structured Chinese Q&A), averaging
+~2.5, for **432.8 vs 358.2 tok/s (+21%)**. An earlier run on a
+predecessor branch logged 2.91 / +33%, but that used a different draft
+implementation (the pre-`moe_text` MTP path) and a different prompt set,
+so it is not a same-conditions comparison. Baseline throughput is
+unchanged (358 vs 355 tok/s), i.e. the backbone did not regress; the
+acceptance delta lives entirely in the prompt spread and the draft
+implementation. Report acceptance as a range with the prompt set, not a
+single number.
+
+### Next MoE recommended pipeline — Thinker read-through, Talker quantized
+
+The Thinker comes straight from the pre-quantized NVFP4 release
+checkpoint (its `config.json` embeds the `quantization_config` +
+per-layer ignore list) — no quantize step, export reads it directly:
+
+```bash
+# Thinker: direct export from the pre-quantized NVFP4 root
+tensorrt-edgellm-export --components thinker $PREQUANT_ROOT $ONNX
+```
+
+The Talker is quantized from the BF16 training root and only the
+`talker` component is extracted (the run also NVFP4s the Thinker, but
+that Thinker is neither exportable — GDN gets quantized — nor needed):
+
+```bash
+# Talker: NVFP4 with mixed-language calibration, extract talker only
+tensorrt-edgellm-quantize llm \
+    --model_dir   $BF16_ROOT \
+    --output_dir  $QUANT_ROOT \
+    --quantization nvfp4 --text_dataset zh_en_mixed --num_samples 128
+
+tensorrt-edgellm-export --components talker $QUANT_ROOT $ONNX
+```
+
+CP FP8 (`--cp_quantization fp8` CP-only pass) and encoder FP8
+(`--visual_quantization/--audio_quantization fp8`) compose per their
+sections; `code2wav`/`visual`/`audio` components export from either
+root.
+
+**Thinker quantization policy**: the Thinker is deliberately NOT
+quantized in-tree — the pre-quantized release checkpoint is the source
+of truth (its ignore list keeps GDN mixers, attention, layer-0 experts
+and the shared expert FP16; only routed experts of layers 1..N-1 are
+NVFP4). Should a future release require in-house Thinker quantization,
+the unified `--quantization` flow applies as-is — mainline already
+supports quantized GDN projections for the Qwen3.5 hybrid family
+(NVFP4 resmooth equalises the shared-input GDN projections so they
+fuse into a single GEMM) — so no preemptive keep-set or code changes
+are made here.
+
+### Talker NVFP4 calibration — mixed-language is mandatory
+
+English-only calibration (the `cnn_dailymail` default) leaves Chinese
+activations outside the calibrated scale envelope and measurably
+destabilizes sampling in BOTH languages: on tts_bench_20, N=3 median
+WER was EN 37% / ZH 8.3% with English-only calibration vs
+**EN 4.8% / ZH 7.5%** with `zh_en_mixed` (zh-wikipedia / CNN-DailyMail
+interleaved; HF bf16 anchor: 4.3/5.8). Also required for correct
+pacing: the runtime emits 4 frames per forced chunk call
+(`framesPerCall=4`); the HF reference discards the (m+1)-th lookahead
+sample and emitting it (the old value 5) rendered one text-starved
+orphan frame per chunk.
+
+Runtime mitigation: an explicit `talker_language` id (instead of the
+default "auto" / codec_nothink) independently recovers most of the ZH
+loss from missing calibration coverage — pooled 3-run ZH WER on
+tts_bench_20: English-only-calibrated Talker 18.3% → 10.3%,
+mixed-calibrated 9.8% → 8.1%; EN unchanged within sampling noise. Set
+it whenever the input language is known, but it is a mitigation, not a
+substitute for mixed-language calibration.
+
+### Talker sampling semantics (HF-aligned)
+
+The runtime mirrors the HF reference generate semantics:
+
+- **Repetition-penalty window resets at every chunk re-prefill** — HF
+  reissues a fresh `generate()` per chunk call, so only the tokens
+  sampled within the current call (<= m+1) are penalized; the post-text
+  final stretch accumulates from zero. A cumulative whole-utterance
+  window over-penalizes common codec tokens and audibly degrades long
+  utterances.
+- **The penalty tracks the freshly-sampled token** (host set and GPU
+  buffer stay coherent; an earlier off-by-one wrote the new token gated
+  on the previous one).
+- **CP (sub-talker) sampling defaults are per-arch**: dense/MoE keep the
+  HF-hardcoded `temperature=1.0, top_k=50, top_p=0.8`; Next follows the
+  HF `subtalker_*` defaults `temperature=0.9, top_k=50, top_p=1.0`.
+- `assistant_instruct` is ignored when `prompt_speaker_codes` is given
+  (HF applies it to built-in speakers only).
+
+**FP8-CP deployment note**: with an FP8 CodePredictor engine, keep the
+old CP sampling via per-request overrides `"subtalker_temperature":
+1.0, "subtalker_top_p": 0.8` (subtalker == CodePredictor). HF's bf16 CP tolerates the full distribution tail
+(top_p=1.0), but on FP8 logits the opened tail admits noisy codes: on
+tts_bench_20 the HF defaults cost SIM (0.48 vs 0.55 mean over N=3) and
+destabilized ZH WER. With the overrides plus the penalty-window fixes,
+ECAPA SIM reached 0.578 (gate 0.577) on the best round vs 0.507 before
+the fixes.
+
+### CodePredictor FP8 (CP-only pass)
+
+```bash
+tensorrt-edgellm-quantize llm \
+    --model_dir  $HF_ROOT \
+    --output_dir $QUANT_ROOT \
+    --cp_quantization fp8 --num_samples 16
+
+tensorrt-edgellm-export --components code_predictor $QUANT_ROOT $ONNX
+```
+
+Details in "Optional: CodePredictor FP8" above. Expected artifacts: 30
+FP8 body weights (q/k/v/o + gate/up × 5 layers) with per-channel
+`weight_scale` + per-tensor `input_scale`; ONNX carries per-channel
+weight `DequantizeLinear` with `axis=0` (restored post-export — plain
+`torch.onnx.export` drops it and TRT then fails with `K == scaleSize`);
+`down_proj` / lm_heads / KV BMMs stay FP16.
+
+### Standalone TTS voice-design support matrix
+
+All HF ``generate_talker_only_prefill`` voice-design controls are wired
+through ``qwen3_tts_inference`` (per-request or top-level JSON fields):
+
+| HF parameter | input JSON field | Validated |
+|---|---|---|
+| ``speaker`` (internal name) | ``speaker`` (accepts voice_map friendly names, e.g. "Ryan") | ✅ every bench run |
+| ``prompt_speaker_codes`` (reference-voice cloning) | ``prompt_speaker_codes`` ``[[16 ints] per frame]`` | ✅ ECAPA triangle (clone-vs-source 0.477 > independent same-speaker 0.229) |
+| ``talker_assistant_instruct`` (21 styles/emotions, e.g. "cheerful") | ``assistant_instruct`` | ✅ injection verified (14-variant A/B vs HF); strong styles (whispering/sluggish/gloomy) match HF direction on duration+loudness; weak styles are inside single-sample sampling noise on BOTH sides |
+| ``talker_language`` (29 languages, "auto" = codec_nothink) | ``talker_language`` | ✅ verified (zh/en explicit ids: WER unchanged-or-better, mismatched id safe). NOTE: benches default to "auto" — set explicitly for known-language input |
+| ``talker_system_instruct_ids`` (free-text system instruction) | ``system_instruct`` (tokenized by runtime) | ✅ injection verified; instruction-following strength is model-dependent (HF equally weak on single samples) |
+| ``talker_text_in_chunk_n`` / ``talker_codec_output_chunk_m`` | fixed 4/4 (``kTextInChunkN`` / ``framesPerCall``), matches HF defaults | ✅ pacing audited frame-level |
+| ``fake_user_mm_hidden_path`` | not exposed (HF training/test hook) | N/A |
+
+### Standalone TTS runtime conditioning
+
+The Next Talker runtime accepts optional conditioning (all resolved from
+the Talker config token tables): `voice_map.json` friendly speaker
+aliases (copied into the engine dir at build), reference-voice codec
+codes (HF `prompt_speaker_codes` semantics — replaces built-in speaker
+rows), a style/emotion instruction name
+(`talker_assistant_prompt_id_mapping`, e.g. "cheerful"), a target
+language (`talker_language_id`; "auto" = codec_nothink path), and a
+free-text system instruction. Standalone TTS builds the OmniNext chunked
+text-feeding prefill (`buildQwen3OmniNextTalkerPrefill`) — the legacy
+`prepareTalkerInput` path produces unconditioned prompts and degenerate
+speech on this arch.
+
 ## Validation status (internal)
 
 | Variant | Backbone | Result |
@@ -444,11 +718,23 @@ Thinker interleaving — only chunked vocoding, configured via CLI
 | MoE | INT4 AWQ g128 | full E2E on B100: TTS WER 6.72%, 0/20 catastrophic (vs 7.80% A100 baseline); quant ~3.3 h with AWQ-Lite alpha_step 0.25 |
 | Dense | NVFP4 | full E2E on B100: TTS WER 3.08%, 0/20 catastrophic |
 | Dense | INT4 GPTQ | external gptqmodel flow; full E2E on B100: TTS WER 1.67% (requires the talker `quantization_config` inheritance fix in this branch); also verified on DRIVE Orin |
-| Next | INT4 AWQ g128 | Qwen3.5 bring-up E2E (text + TTS + audio understanding) |
-| Next | NVFP4 | untested |
+| Next | INT4 AWQ g128 | Qwen3-Omni Next bring-up E2E (text + TTS + audio understanding) |
+| Next | NVFP4 (Talker) | B100 E2E on tts_bench_20: N=3 median TTS WER EN 4.8% / ZH 7.5% (HF bf16 anchor 4.3/5.8) with mixed-language calibration; ECAPA SIM 0.507 vs 0.577 gate — bf16 Talker runtime remains the mainline for production voice quality |
+| Next dense 3B | CP FP8 | PTQ (16 samples) + Talker-root ckpt + ONNX QDQ validated on B100; engine E2E pending |
+| Next MoE 23A2.6B | CP FP8 | PTQ (~21 min B100) + ONNX QDQ + fp16 projection sidecar validated; engine E2E validated — WER parity with fp16 CP within run noise, SIM 0.510 vs 0.507 |
+| Next MoE 23A2.6B | ViT/AuT FP8 | B100 E2E validated. Visual (111 FP8 layers) + audio (199 FP8 layers) towers quantized in the joint calib pass, ONNX carries FP8 QDQ, engines build clean. Audio: LibriSpeech-20 WER 3.29% (FP8) vs 3.05% (FP16), Δ within noise, matches 3.30% FP16 baseline. Visual: shape/color description byte-identical to FP16. Validated against a paged-KV FP16 Thinker rebuilt from the BF16 root on the current branch. |
 
 ## Notes
 
+- **Thinking mode:** the runtime supports it (`enable_thinking` in the
+  request → `<think>`/`</think>` handling, secondary-EOS suppression until
+  the think block closes), but the shipped `0422` checkpoint's
+  `chat_template.jinja` is non-thinking: its generation prompt hard-codes an
+  empty `<think>\n\n</think>` block and has no `enable_thinking` branch, so
+  the flag is a no-op on this checkpoint (`true`/`false` produce byte-identical
+  prompts). The model still reasons step-by-step in-line; it just doesn't emit
+  an explicit think block. A thinking-enabled checkpoint (template with an
+  `enable_thinking` branch) is needed to exercise the runtime's think path.
 - **Calibration quality:** dropping `--num_samples` below ~128 total or
   removing modalities (audio/image) regresses OmniBench and TTS WER.
 - **Talker is the critical path:** Talker MoE is heavier per step than

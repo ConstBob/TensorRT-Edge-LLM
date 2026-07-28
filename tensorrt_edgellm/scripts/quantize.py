@@ -82,11 +82,12 @@ def _add_common_args(parser):
         "--cp_quantization",
         default=None,
         choices=["fp8"],
-        help=("Quantize the Qwen3-Omni Talker CodePredictor "
-              "(talker.code_predictor.*).  Only fp8 is exposed today; "
-              "down_proj is kept unquantized to preserve the FP32 MLP "
-              "WAR (see modeling_code_predictor.py).  When unset CP "
-              "stays at fp16."),
+        help=("Quantize the Talker CodePredictor "
+              "(talker.code_predictor.*) of Qwen3-Omni, Qwen3-TTS, or "
+              "Qwen3-Omni Next (qwen3_omni_next, dense and MoE).  Only fp8 "
+              "is exposed today; down_proj and the per-codebook lm_heads "
+              "are kept unquantized (see FP8_CP in "
+              "quantization_configs.py).  When unset CP stays at fp16."),
     )
     parser.add_argument("--kv_cache_quantization",
                         default=None,
