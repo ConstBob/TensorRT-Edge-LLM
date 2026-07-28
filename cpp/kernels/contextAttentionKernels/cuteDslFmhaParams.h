@@ -65,6 +65,7 @@ struct LlmFmhaPagedParams
     void const* pagedKVPoolPtr{};
     int32_t const* kvCachePageList{};
     void* oPtr{};
+    int32_t const* cuQSeqLens{};
     int32_t const* cuKVSeqLens{};
     int32_t const* bidirectionalBlockBegin{};
     int32_t const* bidirectionalBlockEnd{};
@@ -108,7 +109,7 @@ struct VitFmhaParams
     cudaStream_t stream{};
 };
 
-//! Everything the FMHA-v2 LLM descriptors need, gathered once per CuteDslFMHAV2Runner::run() call.
+//! Everything the FMHA-v2 dense LLM descriptors need, gathered once per CuteDslFMHAV2Runner::run() call.
 struct FmhaV2LlmParams
 {
     void const* qPtr{};

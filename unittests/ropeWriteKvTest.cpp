@@ -18,6 +18,7 @@
 #include <gtest/gtest.h>
 
 #include "common/cudaUtils.h"
+#include "common/pagedKvTypes.h"
 #include "common/tensor.h"
 #include "kernels/posEncoding/applyRopeWriteKV.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
@@ -824,6 +825,85 @@ void TestRopePackedFusedNorm(
     std::cout << "TestRopePackedFusedNorm BatchSize: " << batchSize << " QHeadNum: " << numQHeads
               << " KVHeadNum: " << numKVHeads << " HeadSize: " << headDim << " RotaryDim: " << rotaryDim
               << " qSeqLen: " << qSeqLen << std::endl;
+}
+
+TEST(RopePackedRaggedPrefill, SkipsPaddingBeforePagedWrite)
+{
+    cudaStream_t stream{nullptr};
+    int32_t constexpr batchSize = 2;
+    int32_t constexpr qSeqLen = 128;
+    int32_t constexpr numQHeads = 4;
+    int32_t constexpr numKVHeads = 1;
+    int32_t constexpr headDim = 64;
+    int32_t constexpr combinedHeads = numQHeads + 2 * numKVHeads;
+    int32_t constexpr kvCacheCapacity = 256;
+    int32_t constexpr maxPagesPerSeq = 2;
+    int32_t constexpr numFlatPages = batchSize * 2 * maxPagesPerSeq;
+
+    rt::Tensor cosSinCacheTensor(
+        rt::Coords{1, kvCacheCapacity, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    initializeNormalRopeCosSin(
+        cosSinCacheTensor.dataPointer<float>(), 10000.0F, 1.0F, 1.0F, headDim, kvCacheCapacity, stream);
+
+    std::vector<half> packedInput(static_cast<size_t>(batchSize) * qSeqLen * combinedHeads * headDim);
+    uniformFloatInitialization(packedInput);
+    rt::Tensor packedTensor(
+        rt::Coords{batchSize, qSeqLen, combinedHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    copyHostToDevice(packedTensor, packedInput);
+
+    rt::Tensor qScratchTensor(
+        rt::Coords{batchSize, qSeqLen, numQHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    half const sentinel = __float2half(777.0F);
+    std::vector<half> kvCacheInit(
+        static_cast<size_t>(numFlatPages) * rt::kTOKENS_PER_PAGE * numKVHeads * headDim, sentinel);
+    rt::Tensor kvCacheTensor(rt::Coords{batchSize, 2, numKVHeads, kvCacheCapacity, headDim}, rt::DeviceType::kGPU,
+        nvinfer1::DataType::kHALF);
+    copyHostToDevice(kvCacheTensor, kvCacheInit);
+
+    // Batch 0 has one live token at the final cache slot while batch 1 forces
+    // the physical Q extent to 128. Padding rows would index page-table row 2
+    // and RoPE positions beyond 255 unless cuQSeqLens is applied first.
+    rt::Tensor kvCacheEndLensTensor({batchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice(kvCacheEndLensTensor, std::vector<int32_t>{kvCacheCapacity - 1 + qSeqLen, qSeqLen});
+    rt::Tensor cuQSeqLensTensor({batchSize + 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice(cuQSeqLensTensor, std::vector<int32_t>{0, 1, qSeqLen + 1});
+
+    // Only leased logical pages are mapped. K and V use independent absolute
+    // flattened page IDs; every unused slot is -1.
+    rt::Tensor pageTableTensor(
+        rt::Coords{batchSize, 2, maxPagesPerSeq}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice(pageTableTensor, std::vector<int32_t>{-1, 1, -1, 5, 2, -1, 6, -1});
+
+    launchApplyRopeFromPackedToSplit(cosSinCacheTensor, rt::OptionalInputTensor{kvCacheEndLensTensor},
+        rt::OptionalInputTensor{}, packedTensor, qScratchTensor, kvCacheTensor, 1.0F, 1.0F, stream,
+        pageTableTensor.dataPointer<int32_t>(), maxPagesPerSeq, nullptr, nullptr, nullptr, 1.0F, nullptr, nullptr,
+        1e-6F, rt::OptionalInputTensor{cuQSeqLensTensor});
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaGetLastError());
+
+    auto const qOut = copyDeviceToHost<half>(qScratchTensor);
+    for (int32_t row = 1; row < qSeqLen; ++row)
+    {
+        for (int32_t head = 0; head < numQHeads; ++head)
+        {
+            for (int32_t dim = 0; dim < headDim; ++dim)
+            {
+                size_t const idx = (static_cast<size_t>(row) * numQHeads + static_cast<size_t>(head)) * headDim + dim;
+                EXPECT_EQ(__half2float(qOut[idx]), 0.0F);
+            }
+        }
+    }
+
+    auto const kvOut = copyDeviceToHost<half>(kvCacheTensor);
+    for (int32_t page : {0, 3, 4, 7})
+    {
+        size_t const begin = static_cast<size_t>(page) * rt::kTOKENS_PER_PAGE * numKVHeads * headDim;
+        size_t const end = begin + static_cast<size_t>(rt::kTOKENS_PER_PAGE) * numKVHeads * headDim;
+        for (size_t idx = begin; idx < end; ++idx)
+        {
+            EXPECT_EQ(__half2float(kvOut[idx]), 777.0F) << "Unexpected write to unleased physical page " << page;
+        }
+    }
 }
 
 TEST(RopePackedFusedNorm, Accuracy)

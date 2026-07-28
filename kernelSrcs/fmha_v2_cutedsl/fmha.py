@@ -135,6 +135,11 @@ class FMHAV2Ampere:
         # D80 instead of wasting a full extra 32-element slice at D96.  Keep
         # the established 32-element padding for every other variant.
         self._head_dim_padded = 80 if head_dim == 72 else (head_dim + 31) // 32 * 32
+        # D512 uses two CTAs per logical Q tile. Each CTA repeats QK/softmax
+        # but owns only one 256-column V/O slice, keeping the FP32 output
+        # accumulator small enough to stay in registers.
+        self._output_block_size = 256 if head_dim == 512 else self._head_dim_padded
+        self._num_output_blocks = 2 if head_dim == 512 else 1
         self._num_threads = num_threads
         self._is_causal = is_causal
         self._use_sliding_window = use_sliding_window
@@ -160,11 +165,9 @@ class FMHAV2Ampere:
     ) -> bool:
         """Check whether the (dtype, tile, threads) combo is implementable.
 
-        Relaxed from the upstream FA2 example for D=512 on sm_86: the
-        defensive ``(m_block * 2) % num_threads == 0`` guard is dropped
-        because it rejects valid configs like ``Br=32`` + ``128`` threads
-        where ``tQKV`` partitioning still tiles cleanly.  The SMEM capacity
-        check uses sm_80's 99 KB opt-in floor, which is also the budget on
+        Each warp owns 16 query rows in the current MMA layout, so the CTA's
+        warp count must tile ``m_block_size`` exactly. The SMEM capacity check
+        uses sm_80's 99 KB opt-in floor, which is also the budget on
         sm_86 / sm_87 / sm_89.
         """
         if dtype != cutlass.Float16 and dtype != cutlass.BFloat16:
@@ -172,6 +175,8 @@ class FMHAV2Ampere:
         if head_dim % 8 != 0:
             return False
         if num_threads % 32 != 0:
+            return False
+        if (m_block_size * 2) % num_threads != 0:
             return False
 
         # Q tile (Br * D) + K tile + V tile, all bf16/fp16.
@@ -273,8 +278,19 @@ class FMHAV2Ampere:
             (self._n_block_size, self._head_dim_padded),
             (0, 1),
         )
-
+        sV_layout = sKV_layout
         sO_layout = sQ_layout
+        if cutlass.const_expr(self._num_output_blocks == 2):
+            sV_layout = cute.tile_to_shape(
+                sKV_layout_atom,
+                (self._n_block_size, self._output_block_size),
+                (0, 1),
+            )
+            sO_layout = cute.tile_to_shape(
+                sQ_layout_atom,
+                (self._m_block_size, self._output_block_size),
+                (0, 1),
+            )
 
         @cute.struct
         class SharedStorage:
@@ -285,7 +301,7 @@ class FMHAV2Ampere:
                 cute.struct.MemRange[self._dtype, cute.cosize(sKV_layout)], 1024
             ]
             sV: cute.struct.Align[
-                cute.struct.MemRange[self._dtype, cute.cosize(sKV_layout)], 1024
+                cute.struct.MemRange[self._dtype, cute.cosize(sV_layout)], 1024
             ]
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -340,17 +356,26 @@ class FMHAV2Ampere:
         # their K/V working set can be reused from cache.  This also matches
         # the legacy FMHA-v2 grid ordering.
         # grid_dim: (m_block, num_head, batch_size)
-        grid_dim = (
-            cute.ceil_div(mQ.shape[1], self._m_block_size),
-            cute.size(mQ.shape[2]),
-            cute.size(mQ.shape[0]),
-        )
+        if cutlass.const_expr(self._num_output_blocks == 2):
+            grid_dim = (
+                cute.ceil_div(mQ.shape[1], self._m_block_size) * 2,
+                cute.size(mQ.shape[2]),
+                cute.size(mQ.shape[0]),
+            )
+        else:
+            grid_dim = (
+                cute.ceil_div(mQ.shape[1], self._m_block_size),
+                cute.size(mQ.shape[2]),
+                cute.size(mQ.shape[0]),
+            )
         LOG2_E = 1.4426950408889634074
         softmax_scale_log2 = softmax_scale * LOG2_E
         self.kernel(
             mQ,
             mK,
             mV,
+            None,
+            None,
             None,
             mO,
             mCuSeqLenQ,
@@ -363,6 +388,7 @@ class FMHAV2Ampere:
             None,
             sQ_layout,
             sKV_layout,
+            sV_layout,
             sO_layout,
             gmem_tiled_copy_QKV,
             gmem_tiled_copy_O,
@@ -445,7 +471,19 @@ class FMHAV2Ampere:
             (self._n_block_size, self._head_dim_padded),
             (0, 1),
         )
+        sV_layout = sKV_layout
         sO_layout = sQ_layout
+        if cutlass.const_expr(self._num_output_blocks == 2):
+            sV_layout = cute.tile_to_shape(
+                sQ_layout_atom,
+                (self._n_block_size, self._output_block_size),
+                (0, 1),
+            )
+            sO_layout = cute.tile_to_shape(
+                sQ_layout_atom,
+                (self._m_block_size, self._output_block_size),
+                (0, 1),
+            )
 
         @cute.struct
         class SharedStorage:
@@ -456,7 +494,7 @@ class FMHAV2Ampere:
                 cute.struct.MemRange[self._dtype, cute.cosize(sKV_layout)], 1024
             ]
             sV: cute.struct.Align[
-                cute.struct.MemRange[self._dtype, cute.cosize(sKV_layout)], 1024
+                cute.struct.MemRange[self._dtype, cute.cosize(sV_layout)], 1024
             ]
 
         universal_copy_bits = 128
@@ -489,11 +527,18 @@ class FMHAV2Ampere:
             permutation_mnk=(self._num_threads // 32 * 16, 16, 16),
         )
 
-        grid_dim = (
-            cute.ceil_div(q_tensor.shape[1], self._m_block_size),
-            cute.size(q_tensor.shape[2]),
-            cute.size(q_tensor.shape[0]),
-        )
+        if cutlass.const_expr(self._num_output_blocks == 2):
+            grid_dim = (
+                cute.ceil_div(q_tensor.shape[1], self._m_block_size) * 2,
+                cute.size(q_tensor.shape[2]),
+                cute.size(q_tensor.shape[0]),
+            )
+        else:
+            grid_dim = (
+                cute.ceil_div(q_tensor.shape[1], self._m_block_size),
+                cute.size(q_tensor.shape[2]),
+                cute.size(q_tensor.shape[0]),
+            )
         log2_e = 1.4426950408889634074
         softmax_scale_log2 = attention_scale * scale_q * scale_k * log2_e
         # FP16 Context FMHA callers pass unit V/O scales.  Keep both scalar
@@ -508,6 +553,8 @@ class FMHAV2Ampere:
             k_tensor,
             v_tensor,
             None,
+            None,
+            None,
             o_tensor,
             None,
             cum_seqlen_k,
@@ -519,6 +566,179 @@ class FMHAV2Ampere:
             None,
             sQ_layout,
             sKV_layout,
+            sV_layout,
+            sO_layout,
+            gmem_tiled_copy_QKV,
+            gmem_tiled_copy_O,
+            tiled_mma,
+            SharedStorage,
+        ).launch(
+            grid=grid_dim,
+            block=[self._num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.jit
+    def __call_context_paged__(
+        self,
+        q_tensor: cute.Tensor,
+        kv_cache_pool: cute.Tensor,
+        kv_cache_page_list: cute.Tensor,
+        o_tensor: cute.Tensor,
+        cum_seqlen_q: cute.Tensor,
+        cum_seqlen_k: cute.Tensor,
+        window_size_left: cutlass.Int32,
+        attention_scale: cutlass.Float32,
+        sm_count: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        """Launch FMHA-v2 directly against Edge-LLM's paged NHD KV cache.
+
+        ``kv_cache_pool`` is exposed logically as ``(2P, H_kv, 128, D)``.
+        Its runtime strides map that view onto the physical NHD pool
+        ``(2P, 128, H_kv, D)``. ``kv_cache_page_list`` has shape
+        ``(B, 2, max_pages_per_seq)`` and contains absolute flattened pool
+        page IDs; V IDs are offset by ``P``.
+
+        ``cum_seqlen_q`` and ``cum_seqlen_k`` carry the actual per-batch
+        logical lengths. The page size is fixed at 128 tokens. ``Bc`` must
+        divide 128 so each K/V tile remains within one physical page.
+        """
+        if cutlass.const_expr(
+            q_tensor.element_type != cutlass.Float16
+            or kv_cache_pool.element_type != cutlass.Float16
+            or o_tensor.element_type != cutlass.Float16
+        ):
+            raise TypeError("FMHA-v2 paged attention requires Float16 Q, K/V, and O")
+        if cutlass.const_expr(
+            not self._is_causal
+            or self._packed_varlen
+            or 128 % self._n_block_size != 0
+        ):
+            raise TypeError(
+                "FMHA-v2 paged attention requires causal, non-packed BSND "
+                "Q/O, a 128-token page, and Bc that divides 128"
+            )
+        self._dtype = q_tensor.element_type
+
+        smem_k_block_size = (
+            64
+            if self._head_dim_padded % 64 == 0
+            else 32
+            if self._head_dim_padded % 32 == 0
+            else 16
+        )
+        swizzle_bits = 3 if smem_k_block_size == 64 else 2 if smem_k_block_size == 32 else 1
+        sQ_layout_atom = cute.make_composed_layout(
+            cute.make_swizzle(swizzle_bits, 3, 3),
+            0,
+            cute.make_layout((8, smem_k_block_size), stride=(smem_k_block_size, 1)),
+        )
+        sQ_layout = cute.tile_to_shape(
+            sQ_layout_atom,
+            (self._m_block_size, self._head_dim_padded),
+            (0, 1),
+        )
+        sKV_layout = cute.tile_to_shape(
+            sQ_layout_atom,
+            (self._n_block_size, self._head_dim_padded),
+            (0, 1),
+        )
+        sV_layout = sKV_layout
+        sO_layout = sQ_layout
+        if cutlass.const_expr(self._num_output_blocks == 2):
+            sV_layout = cute.tile_to_shape(
+                sQ_layout_atom,
+                (self._n_block_size, self._output_block_size),
+                (0, 1),
+            )
+            sO_layout = cute.tile_to_shape(
+                sQ_layout_atom,
+                (self._m_block_size, self._output_block_size),
+                (0, 1),
+            )
+
+        @cute.struct
+        class SharedStorage:
+            sQ: cute.struct.Align[
+                cute.struct.MemRange[self._dtype, cute.cosize(sQ_layout)], 1024
+            ]
+            sK: cute.struct.Align[
+                cute.struct.MemRange[self._dtype, cute.cosize(sKV_layout)], 1024
+            ]
+            sV: cute.struct.Align[
+                cute.struct.MemRange[self._dtype, cute.cosize(sV_layout)], 1024
+            ]
+
+        universal_copy_bits = 128
+        async_copy_elems = universal_copy_bits // self._dtype.width
+        atom_async_copy = cute.make_copy_atom(
+            cpasync.CopyG2SOp(cache_mode=self._async_load_cache_mode),
+            self._dtype,
+            num_bits_per_copy=universal_copy_bits,
+        )
+        atom_universal_copy = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            self._dtype,
+            num_bits_per_copy=universal_copy_bits,
+        )
+        tQKV_shape_dim_1 = sQ_layout_atom.outer.shape[1] // async_copy_elems
+        tQKV_layout = cute.make_layout(
+            (self._num_threads // tQKV_shape_dim_1, tQKV_shape_dim_1),
+            stride=(tQKV_shape_dim_1, 1),
+        )
+        vQKV_layout = cute.make_layout((1, async_copy_elems))
+        gmem_tiled_copy_QKV = cute.make_tiled_copy_tv(
+            atom_async_copy, tQKV_layout, vQKV_layout
+        )
+        gmem_tiled_copy_O = cute.make_tiled_copy_tv(
+            atom_universal_copy, tQKV_layout, vQKV_layout
+        )
+        tiled_mma = cute.make_tiled_mma(
+            warp.MmaF16BF16Op(self._dtype, cutlass.Float32, (16, 8, 16)),
+            (self._num_threads // 32, 1, 1),
+            permutation_mnk=(self._num_threads // 32 * 16, 16, 16),
+        )
+
+        if cutlass.const_expr(self._num_output_blocks == 2):
+            grid_dim = (
+                cute.ceil_div(q_tensor.shape[1], self._m_block_size) * 2,
+                cute.size(q_tensor.shape[2]),
+                cute.size(q_tensor.shape[0]),
+            )
+        else:
+            grid_dim = (
+                cute.ceil_div(q_tensor.shape[1], self._m_block_size),
+                cute.size(q_tensor.shape[2]),
+                cute.size(q_tensor.shape[0]),
+            )
+        log2_e = 1.4426950408889634074
+        softmax_scale_log2 = attention_scale * log2_e
+        _ = sm_count
+        runtime_window = (
+            window_size_left
+            if cutlass.const_expr(self._use_sliding_window)
+            else None
+        )
+        self.kernel(
+            q_tensor,
+            None,
+            None,
+            None,
+            kv_cache_pool,
+            kv_cache_page_list,
+            o_tensor,
+            cum_seqlen_q,
+            cum_seqlen_k,
+            None,
+            None,
+            softmax_scale_log2,
+            kv_cache_pool.shape[1],
+            runtime_window,
+            None,
+            sQ_layout,
+            sKV_layout,
+            sV_layout,
             sO_layout,
             gmem_tiled_copy_QKV,
             gmem_tiled_copy_O,
@@ -589,7 +809,19 @@ class FMHAV2Ampere:
             (self._n_block_size, self._head_dim_padded),
             (0, 1),
         )
+        sV_layout = sKV_layout
         sO_layout = sQ_layout
+        if cutlass.const_expr(self._num_output_blocks == 2):
+            sV_layout = cute.tile_to_shape(
+                sQ_layout_atom,
+                (self._n_block_size, self._output_block_size),
+                (0, 1),
+            )
+            sO_layout = cute.tile_to_shape(
+                sQ_layout_atom,
+                (self._m_block_size, self._output_block_size),
+                (0, 1),
+            )
 
         @cute.struct
         class SharedStorage:
@@ -600,7 +832,7 @@ class FMHAV2Ampere:
                 cute.struct.MemRange[self._dtype, cute.cosize(sKV_layout)], 1024
             ]
             sV: cute.struct.Align[
-                cute.struct.MemRange[self._dtype, cute.cosize(sKV_layout)], 1024
+                cute.struct.MemRange[self._dtype, cute.cosize(sV_layout)], 1024
             ]
 
         universal_copy_bits = 128
@@ -634,11 +866,18 @@ class FMHAV2Ampere:
         )
 
         batch_size = cu_seqlens.shape[0] - 1
-        grid_dim = (
-            cute.ceil_div(max_seqlen, self._m_block_size),
-            batch_size,
-            q_tensor.shape[1],
-        )
+        if cutlass.const_expr(self._num_output_blocks == 2):
+            grid_dim = (
+                cute.ceil_div(max_seqlen, self._m_block_size) * 2,
+                batch_size,
+                q_tensor.shape[1],
+            )
+        else:
+            grid_dim = (
+                cute.ceil_div(max_seqlen, self._m_block_size),
+                batch_size,
+                q_tensor.shape[1],
+            )
         # The optimized ABI carries both natural-log and log2 scales.  This kernel's
         # exp2 implementation consumes the pre-folded log2 value directly.
         _ = scale_softmax
@@ -648,6 +887,8 @@ class FMHAV2Ampere:
             q_tensor,
             k_tensor,
             v_tensor,
+            None,
+            None,
             None,
             o_tensor,
             cu_seqlens,
@@ -660,6 +901,7 @@ class FMHAV2Ampere:
             max_seqlen,
             sQ_layout,
             sKV_layout,
+            sV_layout,
             sO_layout,
             gmem_tiled_copy_QKV,
             gmem_tiled_copy_O,
@@ -678,6 +920,8 @@ class FMHAV2Ampere:
         mK: Optional[cute.Tensor],
         mV: Optional[cute.Tensor],
         mKV: Optional[cute.Tensor],
+        mPagedKV: Optional[cute.Tensor],
+        mPageList: Optional[cute.Tensor],
         mO: cute.Tensor,
         mCuSeqLenQ: Optional[cute.Tensor],
         mCuSeqLenK: cute.Tensor,
@@ -689,6 +933,7 @@ class FMHAV2Ampere:
         max_seqlen: Optional[cutlass.Int32],
         sQ_layout: cute.ComposedLayout,
         sKV_layout: cute.ComposedLayout,
+        sV_layout: cute.ComposedLayout,
         sO_layout: cute.ComposedLayout,
         gmem_tiled_copy_QKV: cute.TiledCopy,
         gmem_tiled_copy_O: cute.TiledCopy,
@@ -701,6 +946,11 @@ class FMHAV2Ampere:
         """
         tidx, _, _ = cute.arch.thread_idx()
         m_block, grid_y, grid_z = cute.arch.block_idx()
+        output_block = 0
+        if cutlass.const_expr(self._num_output_blocks == 2):
+            output_block = m_block % 2
+            m_block = m_block // 2
+        output_column_offset = output_block * self._output_block_size
         if cutlass.const_expr(self._packed_varlen):
             batch_size = grid_y
             num_head = grid_z
@@ -855,7 +1105,10 @@ class FMHAV2Ampere:
             )
         kv_capacity = 0
         kv_head_dim = 0
-        if cutlass.const_expr(mKV is not None):
+        if cutlass.const_expr(mPagedKV is not None):
+            kv_capacity = mPageList.shape[2] * 128
+            kv_head_dim = mPagedKV.shape[3]
+        elif cutlass.const_expr(mKV is not None):
             kv_capacity = mKV.shape[3]
             kv_head_dim = mKV.shape[4]
             gK = cute.local_tile(
@@ -865,8 +1118,8 @@ class FMHAV2Ampere:
             )
             gV = cute.local_tile(
                 mKV[batch_size, 1, num_head_kv, None, None],
-                (self._n_block_size, self._head_dim_padded),
-                (None, 0),
+                (self._n_block_size, self._output_block_size),
+                (None, output_block),
             )
         elif cutlass.const_expr(self._packed_varlen):
             kv_capacity = max_seqlen
@@ -912,8 +1165,8 @@ class FMHAV2Ampere:
             )
             gV = cute.local_tile(
                 v_head_view,
-                (self._n_block_size, self._head_dim_padded),
-                (None, 0),
+                (self._n_block_size, self._output_block_size),
+                (None, output_block),
             )
         else:
             kv_capacity = mK.shape[1]
@@ -925,8 +1178,8 @@ class FMHAV2Ampere:
             )
             gV = cute.local_tile(
                 mV[batch_size, None, num_head_kv, None],
-                (self._n_block_size, self._head_dim_padded),
-                (None, 0),
+                (self._n_block_size, self._output_block_size),
+                (None, output_block),
             )
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -937,13 +1190,13 @@ class FMHAV2Ampere:
         storage = smem.allocate(SharedStorage)
         sQ = storage.sQ.get_tensor(sQ_layout)
         sK = storage.sK.get_tensor(sKV_layout)
-        sV = storage.sV.get_tensor(sKV_layout)
+        sV = storage.sV.get_tensor(sV_layout)
 
         # Transposed view of V: (head_dim, n_block_size) for the BMM2 mma.
         sVt = cute.composition(
             sV,
             cute.make_layout(
-                (self._head_dim_padded, self._n_block_size),
+                (self._output_block_size, self._n_block_size),
                 stride=(self._n_block_size, 1),
             ),
         )
@@ -951,9 +1204,13 @@ class FMHAV2Ampere:
         gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_slice(tidx)
         tQgQ = gmem_thr_copy_QKV.partition_S(gQ)
         tQsQ = gmem_thr_copy_QKV.partition_D(sQ)
-        tKgK = gmem_thr_copy_QKV.partition_S(gK)
+        if cutlass.const_expr(mPagedKV is not None):
+            tKgK = None
+            tVgV = None
+        else:
+            tKgK = gmem_thr_copy_QKV.partition_S(gK)
+            tVgV = gmem_thr_copy_QKV.partition_S(gV)
         tKsK = gmem_thr_copy_QKV.partition_D(sK)
-        tVgV = gmem_thr_copy_QKV.partition_S(gV)
         tVsV = gmem_thr_copy_QKV.partition_D(sV)
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -964,7 +1221,7 @@ class FMHAV2Ampere:
         tSrK = thr_mma.make_fragment_B(thr_mma.partition_B(sK))
         tOrVt = thr_mma.make_fragment_B(thr_mma.partition_B(sVt))
         acc_shape_O = thr_mma.partition_shape_C(
-            (self._m_block_size, self._head_dim_padded)
+            (self._m_block_size, self._output_block_size)
         )
         acc_O = cute.make_rmem_tensor(acc_shape_O, cutlass.Float32)
         acc_O.fill(0.0)
@@ -1020,6 +1277,14 @@ class FMHAV2Ampere:
 
         tQcQ = gmem_thr_copy_QKV.partition_S(cQ)
         tKVcKV = gmem_thr_copy_QKV.partition_S(cKV)
+        tVcV = tKVcKV
+        if cutlass.const_expr(self._num_output_blocks == 2):
+            cV = cute.local_tile(
+                mcKV[0, None, 0, None],
+                (self._n_block_size, self._output_block_size),
+                (n_block, output_block),
+            )
+            tVcV = gmem_thr_copy_QKV.partition_S(cV)
         # Only the k-tile of the predicate is materialised; m/n predicates use
         # the first tile inline (-2-3 % perf gain vs. allocating the whole tile).
         tQpQ = cute.make_rmem_tensor(
@@ -1054,6 +1319,24 @@ class FMHAV2Ampere:
                 tKVpKV[rest_v, 0, rest_k] = cute.elem_less(
                     tKVcKV[(0, rest_v), 0, rest_k][3], kv_head_dim
                 )
+        tVpV = tKVpKV
+        if cutlass.const_expr(self._num_output_blocks == 2):
+            tVpV = cute.make_rmem_tensor(
+                cute.make_layout(
+                    (
+                        tVsV.shape[0][1],
+                        cute.size(tVsV, mode=[1]),
+                        cute.size(tVsV, mode=[2]),
+                    ),
+                    stride=(cute.size(tVsV, mode=[2]), 0, 1),
+                ),
+                cutlass.Boolean,
+            )
+            for rest_v in cutlass.range_constexpr(tVpV.shape[0]):
+                for rest_k in cutlass.range_constexpr(tVpV.shape[2]):
+                    tVpV[rest_v, 0, rest_k] = cute.elem_less(
+                        tVcV[(0, rest_v), 0, rest_k][3], kv_head_dim
+                    )
         # ///////////////////////////////////////////////////////////////////////////////
         # Prefetch Prologue — start async loads of the last mn-tile (mn residue handled here).
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1083,16 +1366,37 @@ class FMHAV2Ampere:
         # logical bound is applied here and in the first V load below; interior
         # blocks are entirely below seqlen_k_b and keep the fast full copies.
         if n_block >= 0:
-            for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
-                if cute.elem_less(tKVcKV[0, n, 0][1], seqlen_k_b):
-                    cute.copy(
-                        gmem_tiled_copy_QKV,
-                        tKgK[None, n, None, n_block],
-                        tKsK[None, n, None],
-                        pred=tKVpKV[None, n, None],
-                    )
-                else:
-                    tKsK[None, n, None].fill(0)
+            if cutlass.const_expr(mPagedKV is not None):
+                tPagedK = self._paged_partition(
+                    mPagedKV,
+                    mPageList,
+                    batch_size,
+                    num_head_kv,
+                    0,
+                    n_block,
+                    gmem_thr_copy_QKV,
+                )
+                for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
+                    if cute.elem_less(tKVcKV[0, n, 0][1], seqlen_k_b):
+                        cute.copy(
+                            gmem_tiled_copy_QKV,
+                            tPagedK[None, n, None],
+                            tKsK[None, n, None],
+                            pred=tKVpKV[None, n, None],
+                        )
+                    else:
+                        tKsK[None, n, None].fill(0)
+            else:
+                for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
+                    if cute.elem_less(tKVcKV[0, n, 0][1], seqlen_k_b):
+                        cute.copy(
+                            gmem_tiled_copy_QKV,
+                            tKgK[None, n, None, n_block],
+                            tKsK[None, n, None],
+                            pred=tKVpKV[None, n, None],
+                        )
+                    else:
+                        tKsK[None, n, None].fill(0)
 
         cute.arch.cp_async_commit_group()
 
@@ -1135,12 +1439,20 @@ class FMHAV2Ampere:
         )
         gmem_copy_params = SimpleNamespace(
             gmem_tiled_copy_QKV=gmem_tiled_copy_QKV,
+            gmem_thr_copy_QKV=gmem_thr_copy_QKV,
             tKVcKV=tKVcKV,
             tKgK=tKgK,
             tKsK=tKsK,
             tVgV=tVgV,
             tVsV=tVsV,
             tKVpKV=tKVpKV,
+            tVcV=tVcV,
+            tVpV=tVpV,
+            mPagedKV=mPagedKV,
+            mPageList=mPageList,
+            batch_size=batch_size,
+            num_head_kv=num_head_kv,
+            output_column_offset=output_column_offset,
         )
         smem_copy_params = SimpleNamespace(
             smem_tiled_copy_Q=smem_tiled_copy_Q,
@@ -1174,12 +1486,6 @@ class FMHAV2Ampere:
             mask_steps = cute.ceil_div(self._m_block_size, self._n_block_size) + 1
 
         if cutlass.const_expr(self._use_sliding_window):
-            # Both edges of a sliding window move with the query row.  Keep
-            # every visited tile on the masked path for the FMHA-v2 initial
-            # implementation; the analytic lower/upper bounds below still
-            # skip all disallowed scores and preserve the vision-block OR
-            # overlay.  A later tuning pass may split this into boundary and
-            # interior loops without changing the AOT ABI.
             n_block = n_block_max - 1
             basic_params.n_block = n_block
             if n_block >= 0:
@@ -1192,18 +1498,103 @@ class FMHAV2Ampere:
                     is_first_n_block=True,
                     in_mask_steps=True,
                 )
-            for n_tile in range(1, n_block_max - n_block_min, 1):
-                n_block = n_block_max - n_tile - 1
-                basic_params.n_block = n_block
-                self.compute_one_n_block(
-                    basic_params,
-                    mma_params,
-                    gmem_copy_params,
-                    smem_copy_params,
-                    softmax_params,
-                    is_first_n_block=False,
-                    in_mask_steps=True,
+            if cutlass.const_expr(
+                mPagedKV is not None
+                and mBlockBegin is None
+                and mBlockEnd is None
+            ):
+                # Native-paged sliding attention has no vision-block overlay.
+                # Only tiles crossing either moving window edge need score
+                # predicates; keep the fully valid interior on the fast path.
+                first_q = m_block * self._m_block_size
+                last_q = (
+                    cutlass.min(
+                        first_q + self._m_block_size, seqlen_q_b
+                    )
+                    - 1
                 )
+                lower_last = cutlass.max(
+                    last_q + offset_b - window_size_left, 0
+                )
+                upper_first = cutlass.min(
+                    first_q + offset_b + 1, seqlen_k_b
+                )
+                remaining_end = cutlass.max(
+                    n_block_min, n_block_max - 1
+                )
+                interior_lo = cutlass.min(
+                    remaining_end,
+                    cutlass.max(
+                        n_block_min,
+                        cute.ceil_div(
+                            lower_last, self._n_block_size
+                        ),
+                    ),
+                )
+                interior_end = cutlass.min(
+                    remaining_end,
+                    cutlass.max(
+                        interior_lo,
+                        upper_first // self._n_block_size,
+                    ),
+                )
+                for n_tile in range(
+                    0, remaining_end - interior_end, 1
+                ):
+                    n_block = remaining_end - n_tile - 1
+                    basic_params.n_block = n_block
+                    self.compute_one_n_block(
+                        basic_params,
+                        mma_params,
+                        gmem_copy_params,
+                        smem_copy_params,
+                        softmax_params,
+                        is_first_n_block=False,
+                        in_mask_steps=True,
+                    )
+                for n_tile in range(
+                    0, interior_end - interior_lo, 1
+                ):
+                    n_block = interior_end - n_tile - 1
+                    basic_params.n_block = n_block
+                    self.compute_one_n_block(
+                        basic_params,
+                        mma_params,
+                        gmem_copy_params,
+                        smem_copy_params,
+                        softmax_params,
+                        is_first_n_block=False,
+                        in_mask_steps=False,
+                    )
+                for n_tile in range(
+                    0, interior_lo - n_block_min, 1
+                ):
+                    n_block = interior_lo - n_tile - 1
+                    basic_params.n_block = n_block
+                    self.compute_one_n_block(
+                        basic_params,
+                        mma_params,
+                        gmem_copy_params,
+                        smem_copy_params,
+                        softmax_params,
+                        is_first_n_block=False,
+                        in_mask_steps=True,
+                    )
+            else:
+                for n_tile in range(
+                    1, n_block_max - n_block_min, 1
+                ):
+                    n_block = n_block_max - n_tile - 1
+                    basic_params.n_block = n_block
+                    self.compute_one_n_block(
+                        basic_params,
+                        mma_params,
+                        gmem_copy_params,
+                        smem_copy_params,
+                        softmax_params,
+                        is_first_n_block=False,
+                        in_mask_steps=True,
+                    )
         else:
             for n_tile in cutlass.range_constexpr(mask_steps):
                 n_block = n_block_max - n_tile - 1
@@ -1304,14 +1695,14 @@ class FMHAV2Ampere:
             )
             gO = cute.local_tile(
                 o_head_view,
-                (self._m_block_size, self._head_dim_padded),
-                (m_block, 0),
+                (self._m_block_size, self._output_block_size),
+                (m_block, output_block),
             )
         else:
             gO = cute.local_tile(
                 mO[batch_size, None, num_head, None],
-                (self._m_block_size, self._head_dim_padded),
-                (m_block, 0),
+                (self._m_block_size, self._output_block_size),
+                (m_block, output_block),
             )
 
         gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
@@ -1327,8 +1718,8 @@ class FMHAV2Ampere:
         mcO = cute.make_identity_tensor((1, q_extent, 1, self._head_dim))
         cO = cute.local_tile(
             mcO[0, None, 0, None],
-            (self._m_block_size, self._head_dim_padded),
-            (m_block, 0),
+            (self._m_block_size, self._output_block_size),
+            (m_block, output_block),
         )
         tOcO = gmem_thr_copy_O.partition_D(cO)
         tOpO = cute.make_rmem_tensor(
@@ -1353,6 +1744,166 @@ class FMHAV2Ampere:
                 )
 
     @cute.jit
+    def _paged_tile(
+        self,
+        mPagedKV: cute.Tensor,
+        mPageList: cute.Tensor,
+        batch_size: cutlass.Int32,
+        num_head_kv: cutlass.Int32,
+        kv_plane: cutlass.Constexpr,
+        n_block: cutlass.Int32,
+        column_offset: cutlass.Int32,
+        column_extent: cutlass.Constexpr,
+    ):
+        """Resolve one logical N tile to its physical paged NHD K/V view."""
+        blocks_per_page = 128 // self._n_block_size
+        logical_page = n_block // blocks_per_page
+        physical_page = mPageList[batch_size, kv_plane, logical_page]
+        return self._paged_tile_from_physical_page(
+            mPagedKV,
+            num_head_kv,
+            physical_page,
+            n_block,
+            column_offset,
+            column_extent,
+        )
+
+    @cute.jit
+    def _paged_tile_from_physical_page(
+        self,
+        mPagedKV: cute.Tensor,
+        num_head_kv: cutlass.Int32,
+        physical_page: cutlass.Int32,
+        n_block: cutlass.Int32,
+        column_offset: cutlass.Int32,
+        column_extent: cutlass.Constexpr,
+    ):
+        """Build one logical N tile after its page-table entry is prefetched."""
+        blocks_per_page = 128 // self._n_block_size
+        logical_page = n_block // blocks_per_page
+        block_in_page = n_block - logical_page * blocks_per_page
+        page_stride = mPagedKV.layout.stride[0]
+        head_stride = mPagedKV.layout.stride[1]
+        token_stride = mPagedKV.layout.stride[2]
+        element_offset = (
+            physical_page * page_stride
+            + num_head_kv * head_stride
+            + block_in_page * self._n_block_size * token_stride
+            + column_offset
+        )
+        raw_ptr = mPagedKV.iterator + element_offset
+        aligned_ptr = cute.make_ptr(
+            mPagedKV.element_type,
+            raw_ptr.toint(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        gPagedKV = cute.make_tensor(
+            aligned_ptr,
+            cute.make_layout(
+                (self._n_block_size, column_extent),
+                stride=(token_stride, 1),
+            ),
+        )
+        return cute.make_tensor(gPagedKV.iterator.align(16), gPagedKV.layout)
+
+    @cute.jit
+    def _paged_partition(
+        self,
+        mPagedKV: cute.Tensor,
+        mPageList: cute.Tensor,
+        batch_size: cutlass.Int32,
+        num_head_kv: cutlass.Int32,
+        kv_plane: cutlass.Constexpr,
+        n_block: cutlass.Int32,
+        gmem_thr_copy_QKV: cute.TiledCopy,
+    ):
+        """Return this thread's source partition for one FP16 paged KV tile."""
+        gPagedKV = self._paged_tile(
+            mPagedKV,
+            mPageList,
+            batch_size,
+            num_head_kv,
+            kv_plane,
+            n_block,
+            0,
+            self._head_dim_padded,
+        )
+        tPagedKV = gmem_thr_copy_QKV.partition_S(gPagedKV)
+        # Dynamic page/head/token offsets make partitioning conservatively
+        # drop the ABI's 16-byte alignment. Each thread still begins on one
+        # complete 128-bit copy vector, so restore that fact at the copy edge.
+        return cute.make_tensor(tPagedKV.iterator.align(16), tPagedKV.layout)
+
+    @cute.jit
+    def _paged_partition_from_physical_page(
+        self,
+        mPagedKV: cute.Tensor,
+        num_head_kv: cutlass.Int32,
+        physical_page: cutlass.Int32,
+        n_block: cutlass.Int32,
+        gmem_thr_copy_QKV: cute.TiledCopy,
+    ):
+        """Partition one FP16 KV tile after its page-table entry is prefetched."""
+        gPagedKV = self._paged_tile_from_physical_page(
+            mPagedKV,
+            num_head_kv,
+            physical_page,
+            n_block,
+            0,
+            self._head_dim_padded,
+        )
+        tPagedKV = gmem_thr_copy_QKV.partition_S(gPagedKV)
+        return cute.make_tensor(tPagedKV.iterator.align(16), tPagedKV.layout)
+
+    @cute.jit
+    def _paged_partition_output(
+        self,
+        mPagedKV: cute.Tensor,
+        mPageList: cute.Tensor,
+        batch_size: cutlass.Int32,
+        num_head_kv: cutlass.Int32,
+        n_block: cutlass.Int32,
+        output_column_offset: cutlass.Int32,
+        gmem_thr_copy_QKV: cute.TiledCopy,
+    ):
+        """Return this thread's D512 V partition for one 256-column output slice."""
+        gPagedV = self._paged_tile(
+            mPagedKV,
+            mPageList,
+            batch_size,
+            num_head_kv,
+            1,
+            n_block,
+            output_column_offset,
+            self._output_block_size,
+        )
+        tPagedV = gmem_thr_copy_QKV.partition_S(gPagedV)
+        return cute.make_tensor(tPagedV.iterator.align(16), tPagedV.layout)
+
+    @cute.jit
+    def _paged_partition_output_from_physical_page(
+        self,
+        mPagedKV: cute.Tensor,
+        num_head_kv: cutlass.Int32,
+        physical_page: cutlass.Int32,
+        n_block: cutlass.Int32,
+        output_column_offset: cutlass.Int32,
+        gmem_thr_copy_QKV: cute.TiledCopy,
+    ):
+        """Partition one D512 V slice after its page-table entry is prefetched."""
+        gPagedV = self._paged_tile_from_physical_page(
+            mPagedKV,
+            num_head_kv,
+            physical_page,
+            n_block,
+            output_column_offset,
+            self._output_block_size,
+        )
+        tPagedV = gmem_thr_copy_QKV.partition_S(gPagedV)
+        return cute.make_tensor(tPagedV.iterator.align(16), tPagedV.layout)
+
+    @cute.jit
     def compute_one_n_block(
         self,
         basic_params: SimpleNamespace,
@@ -1370,33 +1921,100 @@ class FMHAV2Ampere:
         acc_S = cute.make_rmem_tensor(acc_shape_S, cutlass.Float32)
         acc_S.fill(0.0)
 
+        # Start both dependent page-table reads before waiting for the current
+        # K tile. Their scalar results stay live in registers while cp.async
+        # and BMM1 make forward progress.
+        current_v_page = cutlass.Int32(0)
+        next_k_page = cutlass.Int32(0)
+        if cutlass.const_expr(gmem_copy_params.mPagedKV is not None):
+            blocks_per_page = 128 // self._n_block_size
+            current_v_logical_page = basic_params.n_block // blocks_per_page
+            current_v_page = gmem_copy_params.mPageList[
+                gmem_copy_params.batch_size, 1, current_v_logical_page
+            ]
+            if basic_params.n_block > basic_params.n_block_min:
+                next_k_logical_page = (
+                    basic_params.n_block - 1
+                ) // blocks_per_page
+                next_k_page = gmem_copy_params.mPageList[
+                    gmem_copy_params.batch_size, 0, next_k_logical_page
+                ]
+
         cute.arch.cp_async_wait_group(0)
         self.cta_sync_barrier.arrive_and_wait()
         # First tile: load V into smem with the n-residue predicate (otherwise
         # a single vectorised copy is enough — the `if` here is a constexpr).
         # First tile == the boundary K/V block: zero-fill V rows at logical
         # positions >= seqlen_k_b (NaN hardening — see the prologue K load).
-        if is_first_n_block:
-            for n in cutlass.range_constexpr(cute.size(gmem_copy_params.tVsV.shape[1])):
-                if cute.elem_less(
-                    gmem_copy_params.tKVcKV[0, n, 0][1],
-                    basic_params.seqlen_k_b,
+        if cutlass.const_expr(gmem_copy_params.mPagedKV is not None):
+            if cutlass.const_expr(self._num_output_blocks == 2):
+                tPagedV = self._paged_partition_output_from_physical_page(
+                    gmem_copy_params.mPagedKV,
+                    gmem_copy_params.num_head_kv,
+                    current_v_page,
+                    basic_params.n_block,
+                    gmem_copy_params.output_column_offset,
+                    gmem_copy_params.gmem_thr_copy_QKV,
+                )
+            else:
+                tPagedV = self._paged_partition_from_physical_page(
+                    gmem_copy_params.mPagedKV,
+                    gmem_copy_params.num_head_kv,
+                    current_v_page,
+                    basic_params.n_block,
+                    gmem_copy_params.gmem_thr_copy_QKV,
+                )
+            if is_first_n_block:
+                for n in cutlass.range_constexpr(
+                    cute.size(gmem_copy_params.tVsV.shape[1])
                 ):
-                    cute.copy(
-                        gmem_copy_params.gmem_tiled_copy_QKV,
-                        gmem_copy_params.tVgV[None, n, None, basic_params.n_block],
-                        gmem_copy_params.tVsV[None, n, None],
-                        pred=gmem_copy_params.tKVpKV[None, n, None],
-                    )
-                else:
-                    gmem_copy_params.tVsV[None, n, None].fill(0.0)
+                    if cute.elem_less(
+                        gmem_copy_params.tVcV[0, n, 0][1],
+                        basic_params.seqlen_k_b,
+                    ):
+                        cute.copy(
+                            gmem_copy_params.gmem_tiled_copy_QKV,
+                            tPagedV[None, n, None],
+                            gmem_copy_params.tVsV[None, n, None],
+                            pred=gmem_copy_params.tVpV[None, n, None],
+                        )
+                    else:
+                        gmem_copy_params.tVsV[None, n, None].fill(0.0)
+            else:
+                cute.copy(
+                    gmem_copy_params.gmem_tiled_copy_QKV,
+                    tPagedV,
+                    gmem_copy_params.tVsV,
+                    pred=gmem_copy_params.tVpV,
+                )
         else:
-            cute.copy(
-                gmem_copy_params.gmem_tiled_copy_QKV,
-                gmem_copy_params.tVgV[None, None, None, basic_params.n_block],
-                gmem_copy_params.tVsV,
-                pred=gmem_copy_params.tKVpKV,
-            )
+            if is_first_n_block:
+                for n in cutlass.range_constexpr(
+                    cute.size(gmem_copy_params.tVsV.shape[1])
+                ):
+                    if cute.elem_less(
+                        gmem_copy_params.tVcV[0, n, 0][1],
+                        basic_params.seqlen_k_b,
+                    ):
+                        cute.copy(
+                            gmem_copy_params.gmem_tiled_copy_QKV,
+                            gmem_copy_params.tVgV[
+                                None, n, None, basic_params.n_block
+                            ],
+                            gmem_copy_params.tVsV[None, n, None],
+                            pred=gmem_copy_params.tVpV[None, n, None],
+                        )
+                    else:
+                        gmem_copy_params.tVsV[None, n, None].fill(0.0)
+            else:
+                cute.copy(
+                    gmem_copy_params.gmem_tiled_copy_QKV,
+                    gmem_copy_params.tVgV[
+                        None, None, None, basic_params.n_block
+                    ],
+                    gmem_copy_params.tVsV,
+                    pred=gmem_copy_params.tVpV,
+                )
 
         cute.arch.cp_async_commit_group()
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1436,12 +2054,29 @@ class FMHAV2Ampere:
         self.cta_sync_barrier.arrive_and_wait()
 
         if basic_params.n_block > basic_params.n_block_min:
-            cute.copy(
-                gmem_copy_params.gmem_tiled_copy_QKV,
-                gmem_copy_params.tKgK[None, None, None, basic_params.n_block - 1],
-                gmem_copy_params.tKsK,
-                pred=gmem_copy_params.tKVpKV,
-            )
+            if cutlass.const_expr(gmem_copy_params.mPagedKV is not None):
+                tPagedKNext = self._paged_partition_from_physical_page(
+                    gmem_copy_params.mPagedKV,
+                    gmem_copy_params.num_head_kv,
+                    next_k_page,
+                    basic_params.n_block - 1,
+                    gmem_copy_params.gmem_thr_copy_QKV,
+                )
+                cute.copy(
+                    gmem_copy_params.gmem_tiled_copy_QKV,
+                    tPagedKNext,
+                    gmem_copy_params.tKsK,
+                    pred=gmem_copy_params.tKVpKV,
+                )
+            else:
+                cute.copy(
+                    gmem_copy_params.gmem_tiled_copy_QKV,
+                    gmem_copy_params.tKgK[
+                        None, None, None, basic_params.n_block - 1
+                    ],
+                    gmem_copy_params.tKsK,
+                    pred=gmem_copy_params.tKVpKV,
+                )
             cute.arch.cp_async_commit_group()
         # ///////////////////////////////////////////////////////////////////////////////
         # Online softmax: rescale row_max/row_sum/acc_O, compute P = softmax(S).
@@ -1784,6 +2419,57 @@ def _create_bsnd_tensor(
     return t, arr
 
 
+def _create_paged_kv_pool_tensor(
+    num_flat_pages: int,
+    tokens_per_page: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype: Type[cutlass.Numeric],
+):
+    """Allocate Edge-LLM's physical NHD paged-pool layout.
+
+    Storage is ``(2P, tokens_per_page, H_kv, D)``. The returned CuTe tensor
+    exposes the logical ``(2P, H_kv, tokens_per_page, D)`` view consumed by
+    ``__call_context_paged__`` while preserving physical NHD strides.
+    """
+    if dtype != cutlass.Float16:
+        raise ValueError("FMHA-v2 paged attention supports Float16 K/V only")
+    if tokens_per_page != 128:
+        raise ValueError("FMHA-v2 paged attention requires 128-token pages")
+
+    physical_shape = (
+        num_flat_pages,
+        tokens_per_page,
+        num_kv_heads,
+        head_dim,
+    )
+    arr = cp.empty(physical_shape, dtype=_cutlass_to_cupy_dtype(dtype))
+    # DLPack preserves the transposed view's strides, presenting logical PHTD
+    # to CuTe while retaining physical PTHD/NHD storage.
+    logical_arr = arr.transpose(0, 2, 1, 3)
+    t = from_dlpack(logical_arr, assumed_align=16)
+    t.element_type = dtype
+    # Logical PHTD is physically PTHD, so the compact stride order is P,T,H,D.
+    stride_order = (0, 2, 1, 3)
+    t = (
+        t.mark_layout_dynamic(leading_dim=3)
+        .mark_compact_shape_dynamic(mode=0, stride_order=stride_order)
+        .mark_compact_shape_dynamic(mode=1, stride_order=stride_order)
+    )
+    return t, arr
+
+
+def _wrap_page_list_tensor(arr: cp.ndarray):
+    """Wrap a contiguous ``(B, 2, max_pages)`` Int32 page table."""
+    t = from_dlpack(arr, assumed_align=16)
+    stride_order = (0, 1, 2)
+    return (
+        t.mark_layout_dynamic(leading_dim=2)
+        .mark_compact_shape_dynamic(mode=0, stride_order=stride_order)
+        .mark_compact_shape_dynamic(mode=2, stride_order=stride_order)
+    )
+
+
 def _create_shd_tensor(
     total_s: int,
     h: int,
@@ -1925,6 +2611,7 @@ def run(
     kv_group_size: int = 1,
     vision_block: bool = False,
     fmha_v2_context: bool = False,
+    paged_kv: bool = False,
     fmha_v2_vit: bool = False,
     vit_seqlens: Optional[Tuple[int, ...]] = None,
     window_size_left: int = -1,
@@ -1943,9 +2630,9 @@ def run(
     """Compile, test, benchmark, or export the FMHA-v2 CuTe DSL kernel.
 
     AOT export uses dummy placeholder shapes; only ``head_dim``, ``is_causal``,
-    ``vision_block`` and the (Br, Bc, threads) tuning are baked at compile
-    time — the rest, including ``num_kv_heads`` (GQA), are runtime-dynamic.
-    ``kv_group_size`` here only selects the dummy
+    ``vision_block``, ``paged_kv`` and the (Br, Bc, threads) tuning are baked
+    at compile time — the rest, including ``num_kv_heads`` (GQA), are
+    runtime-dynamic. ``kv_group_size`` here only selects the dummy
     ``num_kv_heads = num_head // kv_group_size`` used to trace the kernel; it
     is not baked in.  ``vision_block=True`` compiles the Gemma4 vision-block
     overlay variant, which adds the two ``(B, S_q)`` Int32 ``mBlockBegin`` /
@@ -1953,12 +2640,28 @@ def run(
     """
     _tag = f"[{file_name}]"
 
-    if fmha_v2_context and fmha_v2_vit:
-        raise ValueError(f"{_tag} --fmha_v2_context and --fmha_v2_vit are mutually exclusive")
+    if sum((fmha_v2_context, fmha_v2_vit, paged_kv)) > 1:
+        raise ValueError(
+            f"{_tag} --fmha_v2_context, --fmha_v2_vit, and --paged_kv "
+            "are mutually exclusive"
+        )
     if fmha_v2_vit and is_causal:
         raise ValueError(f"{_tag} packed ViT mode is bidirectional; do not pass --is_causal")
     if fmha_v2_vit and vision_block:
         raise ValueError(f"{_tag} vision-block overlay is a Context FMHA mode, not packed ViT")
+    if paged_kv and vision_block:
+        raise ValueError(f"{_tag} --paged_kv does not support the vision-block overlay")
+    if paged_kv and not is_causal:
+        raise ValueError(f"{_tag} --paged_kv requires --is_causal")
+    if paged_kv and (
+        dtype != cutlass.Float16
+        or n_block_size <= 0
+        or 128 % n_block_size != 0
+    ):
+        raise ValueError(
+            f"{_tag} --paged_kv requires Float16 Q/K/V/O and Bc that "
+            "divides the 128-token page size"
+        )
     if vit_seqlens is not None:
         if not fmha_v2_vit:
             raise ValueError(f"{_tag} --vit_seqlens requires --fmha_v2_vit")
@@ -1989,8 +2692,9 @@ def run(
 
     if export_only:
         print(
-            f"{_tag} Compiling FMHA-v2 CuTe DSL: dtype={dtype}, head_dim={head_dim}, "
-            f"is_causal={is_causal}, kv_group={kv_group_size}, "
+            f"{_tag} Compiling FMHA-v2 CuTe DSL: dtype={dtype}, "
+            f"head_dim={head_dim}, is_causal={is_causal}, "
+            f"paged_kv={paged_kv}, kv_group={kv_group_size}, "
             f"Br={m_block_size}, Bc={n_block_size}, threads={num_threads}, "
             f"skip_rescale={skip_rescale}"
         )
@@ -2000,6 +2704,7 @@ def run(
         print(f"{_tag}   B={batch_size}, S_q={seqlen_q}, S_k={seqlen_k}, "
               f"H_q={num_head}, kv_group={kv_group_size}")
         print(f"{_tag}   softmax_scale={softmax_scale}, is_causal={is_causal}")
+        print(f"{_tag}   paged_kv={paged_kv}")
         print(f"{_tag}   Br={m_block_size}, Bc={n_block_size}, threads={num_threads}")
         print(f"{_tag}   skip_rescale={skip_rescale}, hybrid_exp2={hybrid_exp2}")
         print(f"{_tag}   warmup={warmup_iterations}, iterations={iterations}, "
@@ -2007,6 +2712,9 @@ def run(
 
     h_q = num_head
     h_kv = h_q // kv_group_size
+    if not export_only:
+        cp.random.seed(20260723)
+        print(f"{_tag}   CuPy random seed=20260723")
 
     q_dyn, q_arr = _create_bsnd_tensor(
         batch_size, seqlen_q, h_q, head_dim, dtype, fill_random=not export_only
@@ -2027,6 +2735,74 @@ def run(
     if vision_block:
         block_begin_dyn, _ = _create_block_range_tensor(batch_size, seqlen_q)
         block_end_dyn, _ = _create_block_range_tensor(batch_size, seqlen_q)
+
+    kv_pool_dyn = None
+    kv_pool_arr = None
+    page_list_dyn = None
+    page_list_arr = None
+    if paged_kv:
+        tokens_per_page = 128
+        max_pages_per_seq = (seqlen_k + tokens_per_page - 1) // tokens_per_page
+        physical_pages_per_batch = max_pages_per_seq + 1
+        num_pages = batch_size * physical_pages_per_batch
+        num_flat_pages = 2 * num_pages
+        kv_pool_dyn, kv_pool_arr = _create_paged_kv_pool_tensor(
+            num_flat_pages,
+            tokens_per_page,
+            h_kv,
+            head_dim,
+            dtype,
+        )
+        # Unreachable K/V pages and the unused tail of the final live page
+        # remain distinct poisons. Any identity mapping, plane mix-up, or
+        # out-of-range token read therefore fails the FP32 reference check.
+        kv_pool_arr[:num_pages].fill(cp.float16(-127.0))
+        kv_pool_arr[num_pages:].fill(cp.float16(109.0))
+        page_list_host = np.empty(
+            (batch_size, 2, max_pages_per_seq), dtype=np.int32
+        )
+        page_rng = np.random.default_rng(20260723)
+        for batch_idx in range(batch_size):
+            physical_base = batch_idx * physical_pages_per_batch
+            k_pages = (
+                physical_base
+                + 1
+                + page_rng.permutation(max_pages_per_seq)
+            )
+            v_pages = (
+                physical_base
+                + 1
+                + page_rng.permutation(max_pages_per_seq)
+            )
+            for logical_page in range(max_pages_per_seq):
+                # Independent K/V permutations exercise fragmented traversal
+                # while leaving physical_base poisoned.
+                k_page = int(k_pages[logical_page])
+                v_page = int(v_pages[logical_page])
+                page_list_host[batch_idx, 0, logical_page] = k_page
+                page_list_host[batch_idx, 1, logical_page] = (
+                    num_pages + v_page
+                )
+                token_begin = logical_page * tokens_per_page
+                token_end = min(token_begin + tokens_per_page, seqlen_k)
+                live_tokens = token_end - token_begin
+                kv_pool_arr[k_page, :live_tokens, :, :] = k_arr[
+                    batch_idx, token_begin:token_end, :, :
+                ]
+                kv_pool_arr[
+                    num_pages + v_page, :live_tokens, :, :
+                ] = v_arr[batch_idx, token_begin:token_end, :, :]
+        page_list_arr = cp.asarray(page_list_host)
+        page_list_dyn = _wrap_page_list_tensor(page_list_arr)
+        print(
+            f"{_tag}   paged pool physical=NHD, tokens_per_page=128, "
+            f"K_pages={num_pages}, flattened_pages={num_flat_pages}"
+        )
+        if not export_only:
+            print(
+                f"{_tag}   page_pattern=deterministic_fragmented, "
+                f"page table={page_list_host.tolist()}"
+            )
 
     fa2_fwd = FMHAV2Ampere(
         head_dim=head_dim,
@@ -2055,7 +2831,22 @@ def run(
 
     print(f"{_tag} Compiling kernel...")
     t0 = time.time()
-    if fmha_v2_vit:
+    if paged_kv:
+        compiled_fa2 = cute.compile(
+            fa2_fwd.__call_context_paged__,
+            q_dyn,
+            kv_pool_dyn,
+            page_list_dyn,
+            o_dyn,
+            cu_q_dyn,
+            cu_k_dyn,
+            cutlass.Int32(max(window_size_left, 0)),
+            cutlass.Float32(softmax_scale),
+            cutlass.Int32(utils.HardwareInfo().get_device_multiprocessor_count()),
+            current_stream,
+            **compile_options,
+        )
+    elif fmha_v2_vit:
         if vit_seqlens is None and seqlen_q != seqlen_k:
             raise ValueError("FMHA-v2 packed ViT FMHA requires seqlen_q == seqlen_k")
         packed_lengths = vit_seqlens or (seqlen_q,) * batch_size
@@ -2142,7 +2933,20 @@ def run(
     # `unittests/contextAttentionTest.cpp` (compares against a FP32 BSHD
     # reference); this CLI path only smoke-checks that the launch is
     # well-formed when not exporting.
-    if fmha_v2_vit:
+    if paged_kv:
+        compiled_fa2(
+            q_dyn,
+            kv_pool_dyn,
+            page_list_dyn,
+            o_dyn,
+            cu_q_dyn,
+            cu_k_dyn,
+            cutlass.Int32(max(window_size_left, 0)),
+            cutlass.Float32(softmax_scale),
+            cutlass.Int32(utils.HardwareInfo().get_device_multiprocessor_count()),
+            current_stream,
+        )
+    elif fmha_v2_vit:
         compiled_fa2(
             q_vit_dyn,
             k_vit_dyn,
@@ -2181,7 +2985,7 @@ def run(
         )
     cp.cuda.Device().synchronize()
 
-    if not skip_ref_check and fmha_v2_context and not vision_block:
+    if not skip_ref_check and (paged_kv or fmha_v2_context) and not vision_block:
         reference = _fmha_v2_reference(
             q_arr,
             k_arr,
@@ -2208,7 +3012,70 @@ def run(
             start = end
         _report_reference_error(_tag, o_vit_arr, reference)
 
+    if paged_kv and not skip_ref_check:
+        print(
+            f"{_tag} PAGED_KV_PASS: native FMHA-v2 matched the dense FP32 "
+            "reference through a scrambled, poisoned NHD page pool"
+        )
+    elif paged_kv:
+        print(f"{_tag} PAGED_KV_REFERENCE_SKIPPED")
+
     def generate_tensors():
+        if paged_kv:
+            q_w, _ = _create_bsnd_tensor(
+                batch_size, seqlen_q, h_q, head_dim, dtype, fill_random=True
+            )
+            k_w, k_w_arr = _create_bsnd_tensor(
+                batch_size, seqlen_k, h_kv, head_dim, dtype, fill_random=True
+            )
+            v_w, v_w_arr = _create_bsnd_tensor(
+                batch_size, seqlen_k, h_kv, head_dim, dtype, fill_random=True
+            )
+            o_w, _ = _create_bsnd_tensor(
+                batch_size, seqlen_q, h_q, head_dim, dtype, fill_random=False
+            )
+            cu_q_w, _ = _create_cu_seqlens_tensor(batch_size, seqlen_q)
+            cu_k_w, _ = _create_cu_seqlens_tensor(batch_size, seqlen_k)
+            kv_pool_w, kv_pool_w_arr = _create_paged_kv_pool_tensor(
+                num_flat_pages,
+                tokens_per_page,
+                h_kv,
+                head_dim,
+                dtype,
+            )
+            kv_pool_w_arr[:num_pages].fill(cp.float16(-127.0))
+            kv_pool_w_arr[num_pages:].fill(cp.float16(109.0))
+            for batch_idx in range(batch_size):
+                for logical_page in range(max_pages_per_seq):
+                    k_page = int(
+                        page_list_host[batch_idx, 0, logical_page]
+                    )
+                    v_page = int(
+                        page_list_host[batch_idx, 1, logical_page]
+                        - num_pages
+                    )
+                    token_begin = logical_page * tokens_per_page
+                    token_end = min(token_begin + tokens_per_page, seqlen_k)
+                    live_tokens = token_end - token_begin
+                    kv_pool_w_arr[k_page, :live_tokens, :, :] = k_w_arr[
+                        batch_idx, token_begin:token_end, :, :
+                    ]
+                    kv_pool_w_arr[
+                        num_pages + v_page, :live_tokens, :, :
+                    ] = v_w_arr[batch_idx, token_begin:token_end, :, :]
+            page_list_w = _wrap_page_list_tensor(cp.asarray(page_list_host))
+            return testing.JitArguments(
+                q_w,
+                kv_pool_w,
+                page_list_w,
+                o_w,
+                cu_q_w,
+                cu_k_w,
+                cutlass.Int32(max(window_size_left, 0)),
+                cutlass.Float32(softmax_scale),
+                cutlass.Int32(utils.HardwareInfo().get_device_multiprocessor_count()),
+                current_stream,
+            )
         if fmha_v2_vit:
             total_s = sum(packed_lengths)
             q_w, _ = _create_shd_tensor(
@@ -2299,7 +3166,15 @@ def run(
 
     workspace_count = 1
     if use_cold_l2:
-        if fmha_v2_vit:
+        if paged_kv:
+            workspace_arrays = (
+                q_arr,
+                kv_pool_arr,
+                page_list_arr,
+                o_arr,
+                cu_k_arr,
+            )
+        elif fmha_v2_vit:
             workspace_arrays = (q_vit_arr, k_vit_arr, v_vit_arr, o_vit_arr)
         elif fmha_v2_context:
             workspace_arrays = (q_arr, k_arr, v_arr, o_arr)
@@ -2367,6 +3242,11 @@ def _parse_args(argv=None):
         help="Export the FMHA-v2 Context ABI with separate BSND K/V.",
     )
     p.add_argument(
+        "--paged_kv",
+        action="store_true",
+        help="Run/export FP16 FMHA-v2 directly against a 128-token paged NHD KV cache.",
+    )
+    p.add_argument(
         "--fmha_v2_vit",
         action="store_true",
         help="Export packed-varlen bidirectional ViT FMHA with the optimized-compatible ABI.",
@@ -2423,6 +3303,7 @@ def main():
         kv_group_size=args.kv_group_size,
         vision_block=args.vision_block,
         fmha_v2_context=args.fmha_v2_context,
+        paged_kv=args.paged_kv,
         fmha_v2_vit=args.fmha_v2_vit,
         vit_seqlens=vit_seqlens,
         window_size_left=args.window_size_left,

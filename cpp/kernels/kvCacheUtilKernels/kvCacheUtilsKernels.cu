@@ -389,7 +389,7 @@ void instantiateKVCacheBatched(KVLayerInfo const* dstLayerInfos, KVLayerInfo con
 }
 
 //=============================================================================
-// Paged KV gather: page pools -> dense split K/V (for FMHA_v2-style consumers)
+// Paged KV gather: page pools -> dense split K/V (for FMHA-v2 FP8/padding/vision and FFPA consumers)
 //=============================================================================
 
 //! Resolves the K/V page ids for slot `batch`'s logical page and classifies it against the slot's live

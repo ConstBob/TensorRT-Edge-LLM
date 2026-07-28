@@ -24,6 +24,7 @@ tests:
   - tests/python-unittests/test_attention_plugin.py::test_head512_vision_prefill_route_rejections
   - tests/python-unittests/test_attention_plugin.py::test_prefill_head256_vision_fmha_v2_bidirectional
   - tests/python-unittests/test_attention_plugin.py::test_head512_sliding_vision_rejected_on_non_blackwell
+  - tests/python-unittests/test_attention_plugin.py::test_fp8_kv_cache_rejected_on_unsupported_sm
   - tests/python-unittests/test_attention_plugin.py::test_fp8_kv_cache_decode
   - tests/python-unittests/test_attention_plugin.py::test_fp8_kv_cache_prefill
   - tests/python-unittests/test_attention_plugin.py::test_fp8_shared_kv_prefill_rejected
