@@ -38,11 +38,10 @@ release. Use FP16, INT8, or INT4 checkpoints for Orin.
 
 - Edge device deployments normally use the TensorRT package bundled with the
   target JetPack, DriveOS SDK, or DGX Spark software stack.
-- Internal CI also validates selected platform combinations with cached TensorRT
-  packages, including TensorRT 10.16.0.72 for current JetPack 7 / DriveOS 7
-  paths and TensorRT 10.13.3.9 for selected compatibility jobs.
-- TensorRT 11 jobs are present in CI as forward-looking validation. TensorRT 11
-  is not the default public deployment target for TensorRT Edge-LLM 0.9.1.
+- x86 developer builds require a user-provided TensorRT 10.x or newer package
+  that is compatible with the selected CUDA Toolkit version.
+- TensorRT 11 is not the default public deployment target for TensorRT Edge-LLM
+  0.9.1.
 
 ## Update Policy
 
@@ -53,8 +52,7 @@ Update this matrix whenever a release changes any of the following:
 - Platform support level.
 - Precision constraints for a platform.
 
-DriveOS rows must stay aligned with the DriveOS documentation repository:
-`sw-docs/drive/driveos-docs/driveos-guides`. If TensorRT Edge-LLM compatibility
-also needs to be advertised in DriveOS documentation, create a separate DriveOS
-documentation update after the DriveOS documentation owners approve the public
-wording and exact version claims.
+DriveOS rows must stay aligned with the DriveOS documentation. If TensorRT
+Edge-LLM compatibility also needs to be advertised in DriveOS documentation,
+create a separate DriveOS documentation update after the DriveOS documentation
+owners approve the public wording and exact version claims.
