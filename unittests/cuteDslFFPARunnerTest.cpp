@@ -1206,31 +1206,16 @@ TEST(CuteDslFFPARunnerStaticTest, CanImplementGQAGroupSizes)
     EXPECT_TRUE(CuteDslFFPARunner::canImplement(512, kSM, 1, 1));
 
     // GQA4: Hq=8, Hkv=2 (Gemma4 E4B)
-#if defined(CUTE_DSL_FFPA_GQA4_ENABLED)
     EXPECT_TRUE(CuteDslFFPARunner::canImplement(512, kSM, 8, 2));
     EXPECT_TRUE(CuteDslFFPARunner::canImplement(512, kSM, 4, 1));
-#else
-    EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, kSM, 8, 2));
-    EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, kSM, 4, 1));
-#endif
 
     // GQA8: Hq=8, Hkv=1 (Gemma4 E2B)
-#if defined(CUTE_DSL_FFPA_GQA8_ENABLED)
     EXPECT_TRUE(CuteDslFFPARunner::canImplement(512, kSM, 8, 1));
     EXPECT_TRUE(CuteDslFFPARunner::canImplement(512, kSM, 16, 2));
-#else
-    EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, kSM, 8, 1));
-    EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, kSM, 16, 2));
-#endif
 
     // GQA16: Hq=16, Hkv=1 (Gemma4 Unified 12B global attention)
-#if defined(CUTE_DSL_FFPA_GQA16_ENABLED)
     EXPECT_TRUE(CuteDslFFPARunner::canImplement(512, kSM, 16, 1));
     EXPECT_TRUE(CuteDslFFPARunner::canImplement(512, kSM, 32, 2));
-#else
-    EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, kSM, 16, 1));
-    EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, kSM, 32, 2));
-#endif
 
     // Unsupported group sizes (2, 3)
     EXPECT_FALSE(CuteDslFFPARunner::canImplement(512, kSM, 8, 4));  // group=2

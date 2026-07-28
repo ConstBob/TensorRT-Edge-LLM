@@ -459,41 +459,6 @@ function(cute_dsl_setup)
     endforeach()
   endforeach()
 
-  # Per-variant defines for FFPA GQA kernels (native grouped-query attention
-  # without K/V head expansion). Each GQA group size is a separate AOT cubin.
-  list(FIND _variants "ffpa_d512_causal_gqa4" _ffpa_gqa4_idx)
-  if(NOT ${_ffpa_gqa4_idx} EQUAL -1)
-    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
-      target_compile_definitions(${_tgt} PRIVATE "CUTE_DSL_FFPA_GQA4_ENABLED")
-    endforeach()
-    message(
-      STATUS
-        "CuTe DSL: ffpa_d512_causal_gqa4 variant found — CUTE_DSL_FFPA_GQA4_ENABLED set"
-    )
-  endif()
-
-  list(FIND _variants "ffpa_d512_causal_gqa8" _ffpa_gqa8_idx)
-  if(NOT ${_ffpa_gqa8_idx} EQUAL -1)
-    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
-      target_compile_definitions(${_tgt} PRIVATE "CUTE_DSL_FFPA_GQA8_ENABLED")
-    endforeach()
-    message(
-      STATUS
-        "CuTe DSL: ffpa_d512_causal_gqa8 variant found — CUTE_DSL_FFPA_GQA8_ENABLED set"
-    )
-  endif()
-
-  list(FIND _variants "ffpa_d512_causal_gqa16" _ffpa_gqa16_idx)
-  if(NOT ${_ffpa_gqa16_idx} EQUAL -1)
-    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
-      target_compile_definitions(${_tgt} PRIVATE "CUTE_DSL_FFPA_GQA16_ENABLED")
-    endforeach()
-    message(
-      STATUS
-        "CuTe DSL: ffpa_d512_causal_gqa16 variant found - CUTE_DSL_FFPA_GQA16_ENABLED set"
-    )
-  endif()
-
   # FFPA vision-block overlay variant.
   list(FIND _variants "ffpa_d512_causal_visionblock" _ffpa_visionblock_idx)
   if(NOT ${_ffpa_visionblock_idx} EQUAL -1)
