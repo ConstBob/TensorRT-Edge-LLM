@@ -14,6 +14,7 @@ for large language models and vision-language models on edge devices.
    :caption: Getting Started
 
    overview.md
+   user_guide/getting_started/support-matrix.md
    user_guide/getting_started/supported-models.md
    user_guide/getting_started/installation.md
    user_guide/getting_started/quick-start-guide.md

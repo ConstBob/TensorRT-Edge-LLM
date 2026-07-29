@@ -171,17 +171,10 @@ hf auth login
 
 ## Part 2: C++ Runtime (Edge Device)
 
-The C++ runtime builds TensorRT engines and runs inference on the target. Start
-from the platform row that matches the device or SDK image.
-
-| Platform | Software Release | `CUDA_CTK_VERSION` | Build Location | Precision Support |
-|:---------|:-----------------|:-------------------|:---------------|:------------------|
-| Jetson Thor | JetPack 7.0/7.1 | `13.0` | Jetson device | See [Supported Models](supported-models.md) |
-| Jetson Thor | JetPack 7.2 | `13.2` | Jetson device | See [Supported Models](supported-models.md) |
-| DRIVE Thor | DriveOS 7.2 | `13.3` | DriveOS SDK Docker image, then copy `build/` to the DRIVE system | See [Supported Models](supported-models.md) |
-| DGX Spark (GB10) | DGX Spark software stack | `13.0` | DGX Spark system | See [Supported Models](supported-models.md) |
-| Jetson Orin | JetPack 7.2 | `13.2` | Jetson device | FP16, INT8, and INT4 |
-| Jetson Orin | JetPack 6.2+ | `12.6` | Jetson device | FP16, INT8, and INT4 |
+The C++ runtime builds TensorRT engines and runs inference on the target. For
+the authoritative JetPack, DriveOS, CUDA, TensorRT, and TensorRT Edge-LLM
+compatibility table, see the [Official Support Matrix](support-matrix.md).
+Then use the matching platform command below for your device or SDK image.
 
 Jetson Orin does not support FP8, MXFP8, FP4, or NVFP4 runtime precision in
 this release. Use FP16, INT8, or INT4 checkpoints for Orin.

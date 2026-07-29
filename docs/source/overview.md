@@ -8,31 +8,17 @@ TensorRT Edge-LLM is NVIDIA's high-performance C++ inference runtime for Large L
 
 ## Supported Platforms
 
-### Hardware Platforms
-
-**Officially Supported Platforms:**
-
-| Platform | Software Release | Link |
-|----------|------------------|------|
-| NVIDIA Jetson Thor | JetPack 7.x | [JetPack Website](https://developer.nvidia.com/embedded/jetpack) |
-| NVIDIA DRIVE Thor | NVIDIA DriveOS 7.2 | [NVIDIA DRIVE Developer](https://developer.nvidia.com/drive) |
-| NVIDIA DGX Spark (GB10) | DGX Spark software stack | [NVIDIA DGX Spark Developer](https://developer.nvidia.com/topics/ai/dgx-spark) |
-| NVIDIA Jetson Orin | JetPack 7.2 | [JetPack Website](https://developer.nvidia.com/embedded/jetpack) |
-
-> **Note:** The platforms listed above are officially supported and tested. Jetson Orin supports FP16, INT8, and INT4 model precisions. For exact build flags by platform and JetPack release, see the [Installation Guide](user_guide/getting_started/installation.md).
-
-**Compatible Platforms:**
-
-| Platform | Software Release |
-|----------|------------------|
-| NVIDIA Jetson Orin | JetPack 6.2+ |
-
-> **Note:** JetPack 7.2 is the supported Jetson Orin path. JetPack 6.2+ remains compatible for FP16, INT8, and INT4 workflows.
-
+TensorRT Edge-LLM officially supports NVIDIA Jetson Thor, NVIDIA DRIVE Thor,
+NVIDIA DGX Spark (GB10), and NVIDIA Jetson Orin release targets. Jetson Orin
+supports FP16, INT8, and INT4 runtime precisions only.
 
 ### Supported Model Families
 
-TensorRT Edge-LLM supports the deployment of a wide selection of LLM/VLM/Omni/VLA checkpoints with speculative decoding draft support, including Qwen, Llama, InternVL, Phi, Gemma, Nemotron, Alpamayo, Cosmos, etc. For the complete support matrix, see **[Supported Models](user_guide/getting_started/supported-models.md)**.
+For exact JetPack, DriveOS, CUDA, TensorRT, and TensorRT Edge-LLM version
+compatibility, see the [Official Support Matrix](user_guide/getting_started/support-matrix.md).
+For model and precision coverage, see [Supported Models](user_guide/getting_started/supported-models.md).
+
+TensorRT Edge-LLM supports the deployment of a wide selection of LLM/VLM/Omni/VLA checkpoints with speculative decoding draft support, including Qwen, Llama, InternVL, Phi, Gemma, Nemotron, Alpamayo, Cosmos, etc.
 
 ---
 
