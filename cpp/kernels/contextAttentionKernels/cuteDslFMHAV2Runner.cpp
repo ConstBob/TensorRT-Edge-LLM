@@ -40,7 +40,7 @@ fmha_v2_d256_padding_Kernel_Module_t CuteDslFMHAV2Runner::sLLM_d256Padding{};
 fmha_v2_d64_sw_Kernel_Module_t CuteDslFMHAV2Runner::sLLM_d64Sw{};
 fmha_v2_d128_sw_Kernel_Module_t CuteDslFMHAV2Runner::sLLM_d128Sw{};
 fmha_v2_d256_sw_Kernel_Module_t CuteDslFMHAV2Runner::sLLM_d256Sw{};
-fmha_v2_d256_visionblock_Kernel_Module_t CuteDslFMHAV2Runner::sLLM_d256VisionBlock{};
+fmha_v2_d256_bidirectional_Kernel_Module_t CuteDslFMHAV2Runner::sLLM_d256Bidirectional{};
 bool CuteDslFMHAV2Runner::sLLMLoaded{false};
 std::mutex CuteDslFMHAV2Runner::sLLMMutex;
 
@@ -130,7 +130,7 @@ bool CuteDslFMHAV2Runner::loadLLMKernelModule()
         loadModule(sLLM_d64Sw, fmha_v2_d64_sw_Kernel_Module_Load, "fmha_v2_d64_sw");
         loadModule(sLLM_d128Sw, fmha_v2_d128_sw_Kernel_Module_Load, "fmha_v2_d128_sw");
         loadModule(sLLM_d256Sw, fmha_v2_d256_sw_Kernel_Module_Load, "fmha_v2_d256_sw");
-        loadModule(sLLM_d256VisionBlock, fmha_v2_d256_visionblock_Kernel_Module_Load, "fmha_v2_d256_visionblock");
+        loadModule(sLLM_d256Bidirectional, fmha_v2_d256_bidirectional_Kernel_Module_Load, "fmha_v2_d256_bidirectional");
         sLLMLoaded = true;
         LOG_DEBUG("FMHA-v2 CuTe DSL LLM FMHA kernel modules loaded");
         return true;
@@ -145,7 +145,7 @@ bool CuteDslFMHAV2Runner::loadLLMKernelModule()
         unloadModule(sLLM_d64Sw, "fmha_v2_d64_sw");
         unloadModule(sLLM_d128Sw, "fmha_v2_d128_sw");
         unloadModule(sLLM_d256Sw, "fmha_v2_d256_sw");
-        unloadModule(sLLM_d256VisionBlock, "fmha_v2_d256_visionblock");
+        unloadModule(sLLM_d256Bidirectional, "fmha_v2_d256_bidirectional");
         LOG_ERROR("Failed to load FMHA-v2 CuTe DSL LLM FMHA kernel modules");
         return false;
     }
@@ -167,7 +167,7 @@ void CuteDslFMHAV2Runner::unloadLLMKernelModule()
     unloadModule(sLLM_d64Sw, "fmha_v2_d64_sw");
     unloadModule(sLLM_d128Sw, "fmha_v2_d128_sw");
     unloadModule(sLLM_d256Sw, "fmha_v2_d256_sw");
-    unloadModule(sLLM_d256VisionBlock, "fmha_v2_d256_visionblock");
+    unloadModule(sLLM_d256Bidirectional, "fmha_v2_d256_bidirectional");
     sLLMLoaded = false;
 }
 
@@ -431,12 +431,12 @@ bool CuteDslFMHAV2Runner::runVisionBlock(void const* qPtr, void const* kPtr, voi
 {
     if (!sLLMLoaded)
     {
-        LOG_ERROR("FMHA-v2 CuTe DSL vision-block FMHA kernel module not loaded.");
+        LOG_ERROR("FMHA-v2 CuTe DSL bidirectional FMHA kernel module not loaded.");
         return false;
     }
     if (mHeadDim != 256 || slidingWindowSize < 0)
     {
-        LOG_ERROR("FMHA-v2 CuTe DSL vision-block FMHA requires head_dim=256 and a non-negative left window.");
+        LOG_ERROR("FMHA-v2 CuTe DSL bidirectional FMHA requires head_dim=256 and a non-negative left window.");
         return false;
     }
 
@@ -446,9 +446,9 @@ bool CuteDslFMHAV2Runner::runVisionBlock(void const* qPtr, void const* kPtr, voi
     float const scaleV = 1.0F;
     float const invScaleO = 1.0F;
 
-    using WrapperFn = decltype(&cute_dsl_fmha_v2_d256_visionblock_wrapper);
+    using WrapperFn = decltype(&cute_dsl_fmha_v2_d256_bidirectional_wrapper);
     static_assert(WrapperArity<WrapperFn>::value == 16,
-        "FMHA-v2 vision-block wrapper signature changed (module, q_tensor, k_tensor, v_tensor, o_tensor, "
+        "FMHA-v2 bidirectional wrapper signature changed (module, q_tensor, k_tensor, v_tensor, o_tensor, "
         "cum_seqlen_k, block_begin, block_end, window_size_left, attention_scale, scale_q, scale_k, scale_v, "
         "inv_scale_o, sm_count, stream).");
 
@@ -462,12 +462,12 @@ bool CuteDslFMHAV2Runner::runVisionBlock(void const* qPtr, void const* kPtr, voi
     auto blockBeginTensor = makePackedTensor<WrapperArgT<6, WrapperFn>>(blockBegin, {mBatchSize, mSeqLenQ});
     auto blockEndTensor = makePackedTensor<WrapperArgT<7, WrapperFn>>(blockEnd, {mBatchSize, mSeqLenQ});
 
-    int32_t const ret = cute_dsl_fmha_v2_d256_visionblock_wrapper(&sLLM_d256VisionBlock, &qTensor, &kTensor, &vTensor,
-        &oTensor, &cumSeqlenK, &blockBeginTensor, &blockEndTensor, slidingWindowSize, attentionScale, scaleQ, scaleK,
-        scaleV, invScaleO, getDeviceMultiProcessorCount(), stream);
+    int32_t const ret = cute_dsl_fmha_v2_d256_bidirectional_wrapper(&sLLM_d256Bidirectional, &qTensor, &kTensor,
+        &vTensor, &oTensor, &cumSeqlenK, &blockBeginTensor, &blockEndTensor, slidingWindowSize, attentionScale, scaleQ,
+        scaleK, scaleV, invScaleO, getDeviceMultiProcessorCount(), stream);
     if (ret != 0)
     {
-        LOG_ERROR("FMHA-v2 CuTe DSL vision-block FMHA kernel failed with error code: %d", ret);
+        LOG_ERROR("FMHA-v2 CuTe DSL bidirectional FMHA kernel failed with error code: %d", ret);
     }
     return ret == 0;
 }

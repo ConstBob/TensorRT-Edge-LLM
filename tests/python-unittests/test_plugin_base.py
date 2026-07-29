@@ -352,9 +352,14 @@ DEFAULT_RTOL = 1e-2
 
 
 def cosine_sim(expected: "torch.Tensor", actual: "torch.Tensor") -> float:
-    """Cosine similarity between two tensors (flattened, fp32)."""
-    e = expected.float().flatten().cpu()
-    a = actual.float().flatten().cpu()
+    """Cosine similarity between two tensors (flattened, fp64).
+
+    fp64 is required, not a luxury: an fp32 dot over ~64k elements
+    accumulates ~1e-5 of error -- larger than the margin the 0.99999
+    threshold leaves -- and the error depends on the platform's reduction
+    order (aarch64 torch builds crossed the bar while x86 stayed under)."""
+    e = expected.double().flatten().cpu()
+    a = actual.double().flatten().cpu()
     denom = (e.norm() * a.norm()).clamp_min(1e-12)
     return float(torch.dot(e, a) / denom)
 

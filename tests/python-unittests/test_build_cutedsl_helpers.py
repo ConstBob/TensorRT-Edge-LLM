@@ -256,7 +256,7 @@ def test_fmha_v2_registry_is_complete_for_supported_sms(sm):
                 "fmha_v2_vit_d72",
                 "fmha_v2_vit_d80",
                 "fmha_v2_vit_d128",
-                "fmha_v2_d256_visionblock",
+                "fmha_v2_d256_bidirectional",
             }
     assert all(variant.script == "fmha_v2_cutedsl/fmha.py"
                for variant in variants)
@@ -265,6 +265,22 @@ def test_fmha_v2_registry_is_complete_for_supported_sms(sm):
                            if variant.name == "fmha_v2_d256_padding")
     assert "--is_causal" not in padding_variant.script_args
     assert "--fmha_v2_context" not in padding_variant.script_args
+
+
+@pytest.mark.parametrize("sm", [100, 101, 110])
+def test_fmha_registry_has_one_d512_bidirectional_variant(sm):
+    variants = build_cutedsl.select_variants(sm, "fmha")
+    bidirectional_variants = [
+        variant for variant in variants if variant.name.startswith("fmha_d512")
+        and "bidirectional" in variant.name
+    ]
+
+    assert [variant.name for variant in bidirectional_variants
+            ] == ["fmha_d512_paged_bidirectional"]
+    assert "--bidirectional" in bidirectional_variants[0].script_args
+    assert "--window_size" in bidirectional_variants[0].script_args
+    assert all("visionblock" not in variant.name for variant in variants
+               if variant.name.startswith("fmha_d512"))
 
 
 # SM110 uses the FA4-based `fmha` kernels for normal attention, but retains

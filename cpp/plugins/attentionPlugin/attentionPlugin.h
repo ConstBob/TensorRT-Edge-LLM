@@ -143,18 +143,13 @@ private:
     void dispatchFFPAKernel(half const* q, half const* k, half const* v, half* o, int32_t const* cuSeqLenQ,
         int32_t const* cuSeqLenK, int32_t batchSize, int32_t seqlenQ, int32_t seqlenK, cudaStream_t stream);
 
-    //! Prefill routing under vision-block attention: the FFPA d512
-    //! vision-block overlay kernel serves full-causal headSize=512 layers;
-    //! sliding d256 layers use FMHA-v2 CuTe DSL. There is no fallback:
-    //! enforceVisionBlockKernelSupport() makes the required kernel explicit.
+    //! Whether the paged CuTe DSL D512 bidirectional-mask prefill kernel is available.
+    bool canUseCuteDslBidirectionalForPrefill() const noexcept;
+
+    //! Whether the FFPA d512 vision-block fallback is available.
     bool canUseFFPAOverlayForVisionPrefill() const noexcept;
 
-    //! Hard construction-time validation of the vision-block kernel set:
-    //! FFPA d512 vision-block overlay (full-causal d512 prefill), FMHA-v2
-    //! CuTe DSL d256, plus XQA decode.
-    //! Throws (via ELLM_CHECK) naming the missing kernel/artifact and the SM
-    //! — vision-block attention has no fallback path, so a clear build/
-    //! load-time error beats a silently wrong deployment.
+    //! Validate that a vision-block prefill backend and XQA decode backend are available.
     void enforceVisionBlockKernelSupport() const;
 
     //! Resolve one qk_norm gamma engine-weight input to a device pointer
@@ -215,7 +210,10 @@ protected:
     //! Whether FMHA context kernels are available for this configuration.
     bool mCanImplementFMHA{true};
 
-    //! Whether FFPA d512 causal kernel is available for headSize=512 context attention.
+    //! Whether the FP16 D512 paged CuTe DSL bidirectional-mask kernel is available.
+    bool mCanImplementCuteDslBidirectionalFMHA{false};
+
+    //! Whether the FFPA d512 kernel is available for headSize=512 prefill.
     bool mCanImplementFFPA{false};
 
     //! Whether the FMHA-v2 CuTe DSL d256 vision-block context variant is active.

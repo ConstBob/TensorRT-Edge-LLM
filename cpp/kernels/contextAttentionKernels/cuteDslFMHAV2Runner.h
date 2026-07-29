@@ -131,7 +131,7 @@ private:
     static fmha_v2_d64_sw_Kernel_Module_t sLLM_d64Sw;
     static fmha_v2_d128_sw_Kernel_Module_t sLLM_d128Sw;
     static fmha_v2_d256_sw_Kernel_Module_t sLLM_d256Sw;
-    static fmha_v2_d256_visionblock_Kernel_Module_t sLLM_d256VisionBlock;
+    static fmha_v2_d256_bidirectional_Kernel_Module_t sLLM_d256Bidirectional;
     static bool sLLMLoaded;
     static std::mutex sLLMMutex;
 

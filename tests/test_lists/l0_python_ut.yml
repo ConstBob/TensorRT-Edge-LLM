@@ -17,6 +17,9 @@ tests:
   - tests/python-unittests/test_attention_plugin.py::test_gqa_prefill
   - tests/python-unittests/test_attention_plugin.py::test_prefill_head512
   - tests/python-unittests/test_attention_plugin.py::test_prefill_head512_cutedsl_gqa_2
+  - tests/python-unittests/test_attention_plugin.py::test_prefill_head512_vision_cutedsl
+  - tests/python-unittests/test_attention_plugin.py::test_head512_vision_rejections
+  - tests/python-unittests/test_attention_plugin.py::test_head512_vision_prefill_route_rejections
   - tests/python-unittests/test_attention_plugin.py::test_fp8_kv_cache_decode
   - tests/python-unittests/test_attention_plugin.py::test_fp8_kv_cache_prefill
   - tests/python-unittests/test_attention_plugin.py::test_fp8_shared_kv_prefill_rejected

@@ -286,6 +286,14 @@ KERNEL_VARIANTS = [
         script_args=["--q_shape", "1,1024,8,512", "--k_shape", "1,1024,1,512"] + _LLM_PAGED,
     ),
     KernelVariant(
+        name="fmha_d512_paged_bidirectional",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,8,512", "--k_shape", "1,1024,1,512"]
+                    + _LLM_PAGED + ["--window_size", "4096,-1", "--bidirectional"],
+    ),
+    KernelVariant(
         name="fmha_d512_sw_paged",
         group="fmha",
         supported_sms=[100, 101, 110],
@@ -693,7 +701,7 @@ KERNEL_VARIANTS = [
         ],
     ),
     KernelVariant(
-        name="fmha_v2_d256_visionblock",
+        name="fmha_v2_d256_bidirectional",
         group="fmha_v2",
         supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
         script="fmha_v2_cutedsl/fmha.py",

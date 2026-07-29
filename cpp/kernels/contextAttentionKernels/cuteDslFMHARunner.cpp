@@ -28,6 +28,7 @@
 
 #include <climits>
 #include <cmath>
+#include <tuple>
 
 namespace trt_edgellm
 {
@@ -76,6 +77,7 @@ fmha_d64_sw_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_sw_paged = {};
 fmha_d128_sw_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_sw_paged = {};
 fmha_d256_sw_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d256_sw_paged = {};
 fmha_d512_sw_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d512_sw_paged = {};
+fmha_d512_paged_bidirectional_Kernel_Module_t CuteDslFMHARunner::sLLM_d512_paged_bidirectional = {};
 // LLM paged KV cache (FP8 input, FP16 output)
 fmha_d64_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_paged_fp8 = {};
 fmha_d128_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_paged_fp8 = {};
@@ -137,6 +139,7 @@ bool CuteDslFMHARunner::loadLLMKernelModule()
         fmha_d128_sw_paged_Kernel_Module_Load(&sLLM_d128_sw_paged);
         fmha_d256_sw_paged_Kernel_Module_Load(&sLLM_d256_sw_paged);
         fmha_d512_sw_paged_Kernel_Module_Load(&sLLM_d512_sw_paged);
+        fmha_d512_paged_bidirectional_Kernel_Module_Load(&sLLM_d512_paged_bidirectional);
         fmha_d64_paged_fp8_Kernel_Module_Load(&sLLM_d64_paged_fp8);
         fmha_d128_paged_fp8_Kernel_Module_Load(&sLLM_d128_paged_fp8);
         fmha_d256_paged_fp8_Kernel_Module_Load(&sLLM_d256_paged_fp8);
@@ -189,6 +192,7 @@ void CuteDslFMHARunner::unloadLLMKernelModule()
         fmha_d128_sw_paged_Kernel_Module_Unload(&sLLM_d128_sw_paged);
         fmha_d256_sw_paged_Kernel_Module_Unload(&sLLM_d256_sw_paged);
         fmha_d512_sw_paged_Kernel_Module_Unload(&sLLM_d512_sw_paged);
+        fmha_d512_paged_bidirectional_Kernel_Module_Unload(&sLLM_d512_paged_bidirectional);
         fmha_d64_paged_fp8_Kernel_Module_Unload(&sLLM_d64_paged_fp8);
         fmha_d128_paged_fp8_Kernel_Module_Unload(&sLLM_d128_paged_fp8);
         fmha_d256_paged_fp8_Kernel_Module_Unload(&sLLM_d256_paged_fp8);
@@ -317,21 +321,21 @@ int32_t callLlmFmha(WrapperArgT<0, decltype(cuteDslKernelWrapper)>& module, LlmF
 }
 
 //! Launch a paged LLM FMHA variant. The exported signature matches callLlmFmha() except that
-//! kv_cache is replaced by the (kv_cache_pool, kv_cache_page_list) pair. The skip-softmax
-//! (BLASST) variants carry one extra trailing runtime float, skip_softmax_threshold_log2,
-//! placed AFTER stream (mirrors the generated fmha_d{64,128}_skipsoftmax_paged.h signatures)
-//! — selected here by wrapper arity at compile time.
+//! kv_cache is replaced by the (kv_cache_pool, kv_cache_page_list) pair. The bidirectional-mask
+//! specialization appends block_begin and block_end descriptors after cum_seqlen_k. The skip-softmax
+//! (BLASST) variants carry one extra trailing runtime float, skip_softmax_threshold_log2, after stream.
 //! @tparam cuteDslKernelWrapper Generated CuTe DSL kernel wrapper function. Its signature supplies the module
 //! and tensor descriptor types at compile time.
 template <auto cuteDslKernelWrapper>
 int32_t callLlmFmhaPaged(WrapperArgT<0, decltype(cuteDslKernelWrapper)>& module, LlmFmhaPagedParams const& params)
 {
-    constexpr size_t kArity = WrapperArity<decltype(cuteDslKernelWrapper)>::value;
-    static_assert(kArity == 14 || kArity == 15,
+    constexpr std::size_t kWrapperArity = WrapperArity<decltype(cuteDslKernelWrapper)>::value;
+    static_assert(kWrapperArity == 14 || kWrapperArity == 15 || kWrapperArity == 16,
         "callLlmFmhaPaged: not a paged LLM FMHA wrapper (module, q_tensor, kv_cache_pool, kv_cache_page_list, "
-        "o_tensor, cum_seqlen_k, window_size_left, attention_scale, scale_q, scale_k, scale_v, inv_scale_o, sm_count, "
-        "stream [, skip_softmax_threshold_log2]).");
+        "o_tensor, cum_seqlen_k, [block_begin, block_end,] window_size_left, attention_scale, scale_q, scale_k, "
+        "scale_v, inv_scale_o, sm_count, stream [, skip_softmax_threshold_log2]).");
 
+    // WrapperArgT supplies the generated ABI descriptor type. All runtime pointers and shapes come from params.
     auto qTensor = makePackedTensor<WrapperArgT<1, decltype(cuteDslKernelWrapper)>>(
         params.qPtr, {params.batchSize, params.seqLenQ, params.numQHeads, params.headDim});
 
@@ -350,17 +354,35 @@ int32_t callLlmFmhaPaged(WrapperArgT<0, decltype(cuteDslKernelWrapper)>& module,
     auto cumSeqlenK
         = makeCuSeqLenTensor<WrapperArgT<5, decltype(cuteDslKernelWrapper)>>(params.cuKVSeqLens, params.batchSize + 1);
 
-    if constexpr (kArity == 15)
+    auto const tensorArgs = std::make_tuple(&module, &qTensor, &kvPoolTensor, &pageListTensor, &oTensor, &cumSeqlenK);
+    auto const runtimeArgs = std::make_tuple(params.windowSizeLeft, params.attentionScale, params.scaleQ, params.scaleK,
+        params.scaleV, params.invScaleO, getDeviceMultiProcessorCount(), params.stream);
+
+    if constexpr (kWrapperArity == 16)
     {
-        return cuteDslKernelWrapper(&module, &qTensor, &kvPoolTensor, &pageListTensor, &oTensor, &cumSeqlenK,
-            params.windowSizeLeft, params.attentionScale, params.scaleQ, params.scaleK, params.scaleV, params.invScaleO,
-            getDeviceMultiProcessorCount(), params.stream, params.skipSoftmaxThresholdLog2);
+        check::check(params.bidirectionalBlockBegin != nullptr && params.bidirectionalBlockEnd != nullptr,
+            "Bidirectional paged LLM FMHA requires bidirectionalBlockBegin and bidirectionalBlockEnd.");
+        auto bidirectionalBlockBeginTensor = makePackedTensor<WrapperArgT<6, decltype(cuteDslKernelWrapper)>>(
+            params.bidirectionalBlockBegin, {params.batchSize, params.seqLenQ});
+        auto bidirectionalBlockEndTensor = makePackedTensor<WrapperArgT<7, decltype(cuteDslKernelWrapper)>>(
+            params.bidirectionalBlockEnd, {params.batchSize, params.seqLenQ});
+        auto const args = std::tuple_cat(
+            tensorArgs, std::make_tuple(&bidirectionalBlockBeginTensor, &bidirectionalBlockEndTensor), runtimeArgs);
+        return std::apply(cuteDslKernelWrapper, args);
+    }
+    else if constexpr (kWrapperArity == 15)
+    {
+        check::check(params.bidirectionalBlockBegin == nullptr && params.bidirectionalBlockEnd == nullptr,
+            "Standard paged LLM FMHA does not accept bidirectional block ranges.");
+        auto const args = std::tuple_cat(tensorArgs, runtimeArgs, std::make_tuple(params.skipSoftmaxThresholdLog2));
+        return std::apply(cuteDslKernelWrapper, args);
     }
     else
     {
-        return cuteDslKernelWrapper(&module, &qTensor, &kvPoolTensor, &pageListTensor, &oTensor, &cumSeqlenK,
-            params.windowSizeLeft, params.attentionScale, params.scaleQ, params.scaleK, params.scaleV, params.invScaleO,
-            getDeviceMultiProcessorCount(), params.stream);
+        check::check(params.bidirectionalBlockBegin == nullptr && params.bidirectionalBlockEnd == nullptr,
+            "Standard paged LLM FMHA does not accept bidirectional block ranges.");
+        auto const args = std::tuple_cat(tensorArgs, runtimeArgs);
+        return std::apply(cuteDslKernelWrapper, args);
     }
 }
 
@@ -507,7 +529,8 @@ void CuteDslFMHARunner::run(void const* qPtr, void const* kvPtr, void* oPtr, int
 void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, int32_t const* kvCachePageList,
     void* oPtr, int32_t const* cuKVSeqLens, int32_t numPages, int32_t maxPagesPerSeq, int32_t tokensPerPage,
     nvinfer1::DataType kvDataType, cudaStream_t stream, float attentionScale, int32_t slidingWindowSize, bool fp8Input,
-    float qScale, float kScale, float vScale, bool isCausal, float skipSoftmaxThresholdLog2)
+    float qScale, float kScale, float vScale, bool isCausal, float skipSoftmaxThresholdLog2,
+    int32_t const* bidirectionalBlockBegin, int32_t const* bidirectionalBlockEnd)
 {
     if (!sLLMLoaded)
     {
@@ -532,13 +555,22 @@ void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, i
         "CuTe DSL paged FMHA supports FP16 or FP8 KV cache.");
     check::check((kvDataType == nvinfer1::DataType::kFP8) == fp8Input,
         "CuTe DSL paged FMHA requires fp8Input to match the paged KV cache dtype.");
+    bool const useBidirectional = bidirectionalBlockBegin != nullptr || bidirectionalBlockEnd != nullptr;
+    check::check((bidirectionalBlockBegin == nullptr) == (bidirectionalBlockEnd == nullptr),
+        "CuTe DSL paged FMHA requires bidirectionalBlockBegin and bidirectionalBlockEnd to be both set or both null.");
+    bool const useSlidingWindow = (slidingWindowSize < INT_MAX);
+    check::check(!useBidirectional || isCausal, "CuTe DSL paged BIDIRECTIONAL FMHA requires causal attention.");
     check::check(isCausal || slidingWindowSize == INT_MAX,
         "CuTe DSL dense non-causal paged FMHA does not support sliding-window masking.");
     check::check(isCausal || mHeadDim == 256 || mHeadDim == 512,
         "CuTe DSL dense non-causal paged FMHA currently supports head_dim=256 or 512 only.");
+    if (useBidirectional)
+    {
+        check::check(kvDataType == nvinfer1::DataType::kHALF && !fp8Input,
+            "CuTe DSL paged BIDIRECTIONAL FMHA supports only FP16.");
+    }
 
     int32_t const headDim = mHeadDim;
-    bool const useSlidingWindow = (slidingWindowSize < INT_MAX);
     int32_t constexpr kNoLimit = 1 << 30;
 
     // Skip-softmax threshold sentinel: a finite negative log2(lambda) enables the
@@ -559,6 +591,8 @@ void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, i
     params.kvCachePageList = kvCachePageList;
     params.oPtr = oPtr;
     params.cuKVSeqLens = cuKVSeqLens;
+    params.bidirectionalBlockBegin = bidirectionalBlockBegin;
+    params.bidirectionalBlockEnd = bidirectionalBlockEnd;
     params.batchSize = mBatchSize;
     params.seqLenQ = mSeqLenQ;
     params.numQHeads = mNumHeadsQ;
@@ -578,7 +612,12 @@ void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, i
 
     int32_t ret = -1;
 
-    if (!isCausal)
+    if (useBidirectional)
+    {
+        check::check(headDim == 512, "CuTe DSL paged BIDIRECTIONAL FMHA dispatch requires head dimension 512.");
+        ret = callLlmFmhaPaged<cute_dsl_fmha_d512_paged_bidirectional_wrapper>(sLLM_d512_paged_bidirectional, params);
+    }
+    else if (!isCausal)
     {
         // The check::check above already narrowed the dense non-causal path to head_dim 256 or 512.
         if (fp8Input)
@@ -654,9 +693,11 @@ void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, i
 
     if (ret != 0)
     {
-        LOG_ERROR("CuTe DSL paged LLM FMHA kernel (d=%d, causal=%s, sw=%s, fp8in=%s) failed with error code: %d",
+        LOG_ERROR(
+            "CuTe DSL paged LLM FMHA kernel (d=%d, causal=%s, sw=%s, fp8in=%s, bidirectional=%s) failed with error "
+            "code: %d",
             headDim, isCausal ? "true" : "false", useSlidingWindow ? "true" : "false", fp8Input ? "true" : "false",
-            ret);
+            useBidirectional ? "true" : "false", ret);
     }
 }
 

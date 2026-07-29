@@ -469,6 +469,16 @@ void AttentionPlugin::dispatchFFPAKernel(half const* q, half const* k, half cons
 }
 #endif
 
+bool AttentionPlugin::canUseCuteDslBidirectionalForPrefill() const noexcept
+{
+#ifdef CUTE_DSL_FMHA_ENABLED
+    return mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL && mCanImplementFMHA
+        && mCanImplementCuteDslBidirectionalFMHA;
+#else
+    return false;
+#endif
+}
+
 bool AttentionPlugin::canUseFFPAOverlayForVisionPrefill() const noexcept
 {
 #ifdef CUTE_DSL_FFPA_ENABLED
@@ -483,25 +493,11 @@ bool AttentionPlugin::canUseFFPAOverlayForVisionPrefill() const noexcept
 
 void AttentionPlugin::enforceVisionBlockKernelSupport() const
 {
-    // Vision-block attention has no fallback path: every layer must have a
-    // production kernel, otherwise fail loudly at plugin construction (a
-    // clear build/load-time error beats a silently wrong deployment).
-    if (mHeadSize == 512 && mSlidingWindowSize <= 0)
-    {
-        ELLM_CHECK(canUseFFPAOverlayForVisionPrefill(),
-            "AttentionPlugin: vision-block prefill (headSize=512, full-causal) requires the CuTe DSL FFPA d512 "
-            "vision-block overlay kernel, which is unavailable on SM"
-                + std::to_string(mSMVersion)
-                + " in this build. Rebuild with a CuTe DSL FFPA artifact (ffpa_d512_causal_visionblock variant) "
-                  "matching this SM.");
-    }
-    else
-    {
-        ELLM_CHECK(mUseFMHAV2VisionBlockFMHA,
-            "AttentionPlugin: vision-block prefill requires the FMHA-v2 CuTe DSL d256 vision-block variant for "
-            "headSize="
-                + std::to_string(mHeadSize) + " on SM" + std::to_string(mSMVersion) + ".");
-    }
+    ELLM_CHECK(
+        mUseFMHAV2VisionBlockFMHA || canUseFFPAOverlayForVisionPrefill() || canUseCuteDslBidirectionalForPrefill(),
+        "AttentionPlugin: vision-block prefill requires a supported FMHA-v2, FFPA overlay, or paged CuTe DSL "
+        "bidirectional kernel for headSize="
+            + std::to_string(mHeadSize) + " on SM" + std::to_string(mSMVersion) + "; none is available.");
     ELLM_CHECK(mCanImplementXQA,
         "AttentionPlugin: vision-block decode requires XQA decode kernels for Hq=" + std::to_string(mNumQHeads)
             + ", Hkv=" + std::to_string(mNumKVHeads) + ", headSize=" + std::to_string(mHeadSize) + " on SM"
@@ -533,7 +529,8 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
         "no fused-norm kernel.");
     ELLM_CHECK(!(mEnableTreeAttention && mEnableVisionBlockAttention),
         "Tree attention and vision block attention are mutually exclusive.");
-    ELLM_CHECK(!mEnableVisionBlockAttention || !mEnableFp8KVCache, "Vision block attention requires an FP16 KV cache.");
+    ELLM_CHECK(!mEnableVisionBlockAttention || selectKvCacheDataType(mEnableFp8KVCache) == DataType::kHALF,
+        "Vision block attention does not support an FP8 KV cache.");
     ELLM_CHECK(!mEnableFp8KVCache || mQkvScales.size() == 3,
         "FP8 KV cache enabled but qkv_scales has "
             + std::to_string(mQkvScales.size()) + " elements (expected 3). "
@@ -542,17 +539,17 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
 
-    FMHAKernelSelection fmhaSelection{};
-    // Vision-block D512 retains its specialized FFPA prefill path rather than the common CuTe DSL FMHA backend.
-    if (!(mHeadSize == 512 && mEnableVisionBlockAttention))
-    {
-        fmhaSelection
-            = loadFMHAKernels(mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType, mSlidingWindowSize > 0);
-    }
+    FMHAKernelSelection const fmhaSelection
+        = loadFMHAKernels(mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType, mSlidingWindowSize > 0);
     mContextFMHABackend = fmhaSelection.backend;
     mCanImplementFMHA = fmhaSelection.canImplement;
     LOG_DEBUG("AttentionPlugin FMHA backend: %d, sliding_window: %s", static_cast<int32_t>(mContextFMHABackend),
         mSlidingWindowSize > 0 ? std::to_string(mSlidingWindowSize).c_str() : "disabled");
+
+#ifdef CUTE_DSL_FMHA_ENABLED
+    mCanImplementCuteDslBidirectionalFMHA = mEnableVisionBlockAttention && mHeadSize == 512
+        && mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL && mCanImplementFMHA;
+#endif
 
     // XQA decode kernels are needed for decode path when available. Decode always reads the paged
     // pool (identity page table while cross-request reuse is off), so load the paged KV cache kernels.
@@ -569,9 +566,8 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
         "fallback.");
 
     // Kernel selection priority for prefill and decode:
-    //   1. Vision-block attention        — per-layer routing: FFPA d512 vision-block overlay
-    //      (full-causal d512 prefill) or FMHA-v2 CuTe DSL (sliding d256-class prefill); XQA
-    //      decode.  All three are hard requirements (no fallback; construction fails loudly).
+    //   1. Vision-block attention        — paged CuTe DSL d512, FFPA d512 fallback,
+    //      or FMHA-v2 CuTe DSL vision-block; XQA decode.
     //   2. FMHA (prefill) + XQA (decode) — common paged path, including
     //      full-causal FP16 D512 normal/chunked/shared prefill.
     //   3. FFPA (prefill) + XQA (decode) — fallback for unsupported D512 prefill modes.
@@ -579,8 +575,10 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     //   5. XQA (decode) only             — prefill unsupported for this head size.
     //   6. None                          — fatal, cannot serve this configuration.
 
-    // Load FFPA only when common FMHA selection did not find a causal prefill path.
-    if (!mCanImplementFMHA)
+    bool const needsFFPAVisionFallback = mEnableVisionBlockAttention && !mCanImplementCuteDslBidirectionalFMHA
+        && mHeadSize == 512 && mSlidingWindowSize <= 0;
+    // Keep the existing !mCanImplementFMHA case for ordinary D512 prefill on platforms where only FFPA is available.
+    if (!mCanImplementFMHA || needsFFPAVisionFallback)
     {
 #ifdef CUTE_DSL_FFPA_ENABLED
         if (mHeadSize == 512 && CuteDslFFPARunner::canImplement(mHeadSize, mSMVersion, mNumQHeads, mNumKVHeads))
@@ -618,8 +616,10 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
             "AttentionPlugin: vision-block attention (headSize=%d, Hq=%d, Hkv=%d, window=%d) — prefill via %s, "
             "decode via XQA.",
             mHeadSize, mNumQHeads, mNumKVHeads, mSlidingWindowSize,
-            canUseFFPAOverlayForVisionPrefill() ? "FFPA d512 vision-block overlay"
-                                                : "FMHA-v2 CuTe DSL d256 vision-block");
+            canUseCuteDslBidirectionalForPrefill()
+                ? "paged CuTe DSL d512 bidirectional mask"
+                : (canUseFFPAOverlayForVisionPrefill() ? "FFPA d512 vision-block overlay"
+                                                       : "FMHA-v2 CuTe DSL vision-block"));
     }
     else if (!mCanImplementFMHA && !mCanImplementFFPA && !mCanImplementXQA)
     {
@@ -666,7 +666,8 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
         "no fused-norm kernel.");
     ELLM_CHECK(!(mEnableTreeAttention && mEnableVisionBlockAttention),
         "Tree attention and vision block attention are mutually exclusive.");
-    ELLM_CHECK(!mEnableVisionBlockAttention || !mEnableFp8KVCache, "Vision block attention requires an FP16 KV cache.");
+    ELLM_CHECK(!mEnableVisionBlockAttention || selectKvCacheDataType(mEnableFp8KVCache) == DataType::kHALF,
+        "Vision block attention does not support an FP8 KV cache.");
 
     // Parse qkv_scales float array
     for (int32_t i = 0; i < fc->nbFields; ++i)
@@ -704,15 +705,16 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
 
-    FMHAKernelSelection fmhaSelection{};
-    if (!(mHeadSize == 512 && mEnableVisionBlockAttention))
-    {
-        fmhaSelection
-            = loadFMHAKernels(mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType, mSlidingWindowSize > 0);
-    }
+    FMHAKernelSelection const fmhaSelection
+        = loadFMHAKernels(mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType, mSlidingWindowSize > 0);
     mContextFMHABackend = fmhaSelection.backend;
     mCanImplementFMHA = fmhaSelection.canImplement;
     LOG_DEBUG("AttentionPlugin FMHA backend: %d", static_cast<int32_t>(mContextFMHABackend));
+
+#ifdef CUTE_DSL_FMHA_ENABLED
+    mCanImplementCuteDslBidirectionalFMHA = mEnableVisionBlockAttention && mHeadSize == 512
+        && mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL && mCanImplementFMHA;
+#endif
 
     // XQA decode kernels. Decode always reads the paged pool, so load the paged KV cache kernels.
     mCanImplementXQA = DecoderXQARunner::canImplement(mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType,
@@ -726,7 +728,10 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
         "D512 sliding-window prefill requires the CuTe DSL paged FMHA kernel; full-causal FFPA is not a valid "
         "fallback.");
 
-    if (!mCanImplementFMHA)
+    bool const needsFFPAVisionFallback = mEnableVisionBlockAttention && !mCanImplementCuteDslBidirectionalFMHA
+        && mHeadSize == 512 && mSlidingWindowSize <= 0;
+    // Keep the existing !mCanImplementFMHA case for ordinary D512 prefill on platforms where only FFPA is available.
+    if (!mCanImplementFMHA || needsFFPAVisionFallback)
     {
 #ifdef CUTE_DSL_FFPA_ENABLED
         if (mHeadSize == 512 && CuteDslFFPARunner::canImplement(mHeadSize, mSMVersion, mNumQHeads, mNumKVHeads))
@@ -1418,8 +1423,8 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
     float const rmsNormEpsVal = mRmsNormEps;
 
     // ==================== Prefill path ====================
-    // Dispatch order: vision-block attention first (FFPA d512 overlay or FMHA-v2
-    // CuTe DSL, early return), then sharedKV (early return), then own-KV.
+    // Dispatch order: vision-block attention first (paged CuTe DSL, FFPA, or
+    // FMHA-v2 CuTe DSL), then sharedKV, then own-KV.
     // Within each: FMHA (standard), FFPA (headSize=512), or reject the
     // prefill when neither kernel serves the head size.
     if (executionMode == AttentionExecutionMode::kNORMAL_PREFILL
@@ -1469,7 +1474,6 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
             }
 
             // Unpack packed QKV: roped Q to qScratch, roped K + V to the paged pool.
-            // Both vision prefill paths read K/V back from the pool.
             qInputTensor = assignTensorFromWorkspace(
                 alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
             kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor, rt::OptionalInputTensor{},
@@ -1477,36 +1481,66 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                 pageTable, maxPagesPerSeq, nullptr /* kScratchOut */, nullptr /* vScratchOut */, nullptr /* fp8QOut */,
                 1.0f /* qScale */, qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal);
 
-#ifdef CUTE_DSL_FFPA_ENABLED
-            if (canUseFFPAOverlayForVisionPrefill())
+            rt::Tensor cuQSeqLensTensor
+                = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize + 1}, DataType::kINT32);
+            rt::Tensor cuKVSeqLensTensor
+                = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize + 1}, DataType::kINT32);
+            rt::Tensor kvCacheEndIdxsTensor
+                = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize}, DataType::kINT32);
+            rt::Tensor paddedCuKVSeqLensTensor
+                = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize + 1}, DataType::kINT32);
+            kernel::calCuQCuKVSeqLensAndKVEndIdxs(contextLengthTensor, kvCacheStartIdxTensor, cuQSeqLensTensor,
+                cuKVSeqLensTensor, kvCacheEndIdxsTensor, paddedCuKVSeqLensTensor, runtimeSeqLen, stream);
+
+            rt::Tensor blockBeginTensor{};
+            rt::Tensor blockEndTensor{};
+            bool const useVisionRanges = canUseCuteDslBidirectionalForPrefill() || canUseFFPAOverlayForVisionPrefill()
+                || mUseFMHAV2VisionBlockFMHA;
+            if (useVisionRanges)
             {
-                // Production path for the full-causal d512 global layers: the
-                // FFPA vision-block overlay kernel with per-row [blockBegin,
-                // blockEnd] intervals expanded from vision_block_ids.
-                LOG_DEBUG(
-                    "AttentionPlugin: vision-block prefill via FFPA d512 overlay (B=%d, S=%d, Hq=%d, Hkv=%d, cap=%d)",
-                    runtimeBatchSize, runtimeSeqLen, mNumQHeads, mNumKVHeads, kvCacheCapacity);
-
-                rt::Tensor cuQSeqLensTensor
-                    = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize + 1}, DataType::kINT32);
-                rt::Tensor cuKVSeqLensTensor
-                    = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize + 1}, DataType::kINT32);
-                rt::Tensor kvCacheEndIdxsTensor
-                    = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize}, DataType::kINT32);
-                rt::Tensor paddedCuKVSeqLensTensor
-                    = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize + 1}, DataType::kINT32);
-                kernel::calCuQCuKVSeqLensAndKVEndIdxs(contextLengthTensor, kvCacheStartIdxTensor, cuQSeqLensTensor,
-                    cuKVSeqLensTensor, kvCacheEndIdxsTensor, paddedCuKVSeqLensTensor, runtimeSeqLen, stream);
-
-                // Expand vision_block_ids into per-position block intervals
-                // (-1/-1 sentinel for text and padding positions).
-                rt::Tensor blockBeginTensor = assignTensorFromWorkspace(
+                blockBeginTensor = assignTensorFromWorkspace(
                     alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen}, DataType::kINT32);
-                rt::Tensor blockEndTensor = assignTensorFromWorkspace(
+                blockEndTensor = assignTensorFromWorkspace(
                     alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen}, DataType::kINT32);
                 kernel::launchBuildVisionBlockRanges(visionBlockIdsTensor.dataPointer<int32_t>(),
                     contextLengthTensor.dataPointer<int32_t>(), blockBeginTensor.dataPointer<int32_t>(),
                     blockEndTensor.dataPointer<int32_t>(), runtimeBatchSize, runtimeSeqLen, stream);
+            }
+
+#ifdef CUTE_DSL_FMHA_ENABLED
+            if (canUseCuteDslBidirectionalForPrefill())
+            {
+                if (!validatePagedKVCacheShape())
+                {
+                    return 1;
+                }
+
+                LOG_DEBUG(
+                    "AttentionPlugin: vision-block prefill via paged CuTe DSL d512 bidirectional mask "
+                    "(B=%d, S=%d, Hq=%d, Hkv=%d, "
+                    "window=%d)",
+                    runtimeBatchSize, runtimeSeqLen, mNumQHeads, mNumKVHeads, mSlidingWindowSize);
+
+                int32_t const slidingWindow = mSlidingWindowSize > 0 ? mSlidingWindowSize - 1 : INT_MAX;
+                CuteDslFMHARunner runner(
+                    mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen, kvCacheCapacity);
+                runner.runPaged(qInputTensor.dataPointer<half>(), kvCacheTensor.rawPointer(), pageTable,
+                    attentionOutputTensor.dataPointer<half>(), paddedCuKVSeqLensTensor.dataPointer<int32_t>(),
+                    2 * numPages, maxPagesPerSeq, rt::kTOKENS_PER_PAGE, kvCacheTensor.getDataType(), stream,
+                    mAttentionScale, slidingWindow, /*fp8Input=*/false, 1.0F, 1.0F, 1.0F,
+                    /*isCausal=*/true, /*skipSoftmaxThresholdLog2=*/0.0F, blockBeginTensor.dataPointer<int32_t>(),
+                    blockEndTensor.dataPointer<int32_t>());
+                return 0;
+            }
+#endif
+
+#ifdef CUTE_DSL_FFPA_ENABLED
+            if (canUseFFPAOverlayForVisionPrefill())
+            {
+                // Full-causal D512 fallback with per-row block intervals.
+                LOG_DEBUG(
+                    "AttentionPlugin: vision-block prefill via FFPA d512 overlay (B=%d, S=%d, Hq=%d, Hkv=%d, cap=%d)",
+                    runtimeBatchSize, runtimeSeqLen, mNumQHeads, mNumKVHeads, kvCacheCapacity);
 
                 // Read K/V back from the just-updated paged pool (roped K,
                 // original V — required because V may alias K on the K=V
@@ -1547,25 +1581,6 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                     "AttentionPlugin: vision-block prefill via FMHA-v2 CuTe DSL d256 (B=%d, S=%d, Hq=%d, "
                     "Hkv=%d, window=%d)",
                     runtimeBatchSize, runtimeSeqLen, mNumQHeads, mNumKVHeads, mSlidingWindowSize);
-
-                rt::Tensor cuQSeqLensTensor
-                    = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize + 1}, DataType::kINT32);
-                rt::Tensor cuKVSeqLensTensor
-                    = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize + 1}, DataType::kINT32);
-                rt::Tensor kvCacheEndIdxsTensor
-                    = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize}, DataType::kINT32);
-                rt::Tensor paddedCuKVSeqLensTensor
-                    = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize + 1}, DataType::kINT32);
-                kernel::calCuQCuKVSeqLensAndKVEndIdxs(contextLengthTensor, kvCacheStartIdxTensor, cuQSeqLensTensor,
-                    cuKVSeqLensTensor, kvCacheEndIdxsTensor, paddedCuKVSeqLensTensor, runtimeSeqLen, stream);
-
-                rt::Tensor blockBeginTensor = assignTensorFromWorkspace(
-                    alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen}, DataType::kINT32);
-                rt::Tensor blockEndTensor = assignTensorFromWorkspace(
-                    alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen}, DataType::kINT32);
-                kernel::launchBuildVisionBlockRanges(visionBlockIdsTensor.dataPointer<int32_t>(),
-                    contextLengthTensor.dataPointer<int32_t>(), blockBeginTensor.dataPointer<int32_t>(),
-                    blockEndTensor.dataPointer<int32_t>(), runtimeBatchSize, runtimeSeqLen, stream);
 
                 auto [kSplit, vSplit]
                     = splitPagedKV(kvCacheTensor, pageTable, kvCacheEndIdxsTensor.dataPointer<int32_t>(),
