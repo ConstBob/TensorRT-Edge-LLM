@@ -59,21 +59,55 @@ _SOURCE_ROOT = Path(__file__).resolve().parents[1]
 _PYTHON = Path(sys.executable)
 _PYTHON_ROOT = Path(sys.prefix)
 _RUN_WORKSPACE = PurePosixPath("/tmp/edgellm-trt-ci")
-_D7L_RUN_WORKSPACE = PurePosixPath("/dev/shm/edgellm-trt-ci")
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 _CONNECTION_TIMEOUT_S = 30
 _TRANSFER_TIMEOUT_S = 1800
 _TEST_TIMEOUT_S = 3600
 _JOBS = 16
+
+
+@dataclasses.dataclass(frozen=True)
+class ModelCase:
+    name: str
+    repository: str
+    checkpoint_dir: str
+    pipeline_param: str
+
+    @classmethod
+    def from_mapping(cls, payload: dict[str, Any], context: str) -> ModelCase:
+        allowed = {"name", "repository", "checkpoint_dir", "pipeline_param"}
+        unknown = sorted(set(payload) - allowed)
+        if unknown:
+            raise ValueError(
+                f"{context} has unknown fields: {', '.join(unknown)}")
+        values: dict[str, str] = {}
+        for field in sorted(allowed):
+            value = payload.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"{context}.{field} must be a non-empty string")
+            if any(char in value for char in "\r\n\0"):
+                raise ValueError(
+                    f"{context}.{field} contains an invalid character")
+            values[field] = value.strip()
+        return cls(**values)
+
+
 # One entry enables optional checkpoint download, ONNX export, engine build, and inference.
-_MODEL_CHECKPOINTS = {
-    "Qwen2.5-0.5B-Instruct":
-    ("Qwen/Qwen2.5-0.5B-Instruct", "Qwen2.5-0.5B-Instruct"),
-    "Llama-3.2-1B":
-    ("meta-llama/Llama-3.2-1B-Instruct", "llama-3.2-models/Llama-3.2-1B"),
-}
-_E2E_MODEL_FAMILIES = tuple(f"{name}-fp16-mxsl4096-mxbs1-mxil2048"
-                            for name in _MODEL_CHECKPOINTS)
+_DEFAULT_MODEL_CASES = (
+    ModelCase(
+        name="Qwen3-0.6B",
+        repository="Qwen/Qwen3-0.6B",
+        checkpoint_dir="Qwen3/Qwen3-0.6B",
+        pipeline_param="Qwen3-0.6B-fp16-mxsl4096-mxbs1-mxil2048",
+    ),
+    ModelCase(
+        name="Qwen3.5-0.8B",
+        repository="Qwen/Qwen3.5-0.8B",
+        checkpoint_dir="Qwen3.5-0.8B",
+        pipeline_param="Qwen3.5-0.8B-fp16-mxsl2048-mxbs1-mxil1024",
+    ),
+)
 
 
 class FlowError(RuntimeError):
@@ -174,6 +208,33 @@ def read_ssh_config(value: str, context: str) -> HostSSHConfig:
                                       context)
 
 
+def read_additional_model_cases(value: str) -> tuple[ModelCase, ...]:
+    candidate = value.strip()
+    if not candidate.startswith("["):
+        try:
+            candidate = Path(candidate).expanduser().read_text()
+        except OSError as error:
+            raise ValueError(
+                "additional model cases must be a JSON array or readable JSON file"
+            ) from error
+    try:
+        payload = json.loads(candidate)
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"additional model cases contain invalid JSON: {error.msg}"
+        ) from error
+    if not isinstance(payload, list):
+        raise ValueError("additional model cases must contain a JSON array")
+    cases = []
+    for index, entry in enumerate(payload):
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"additional model cases[{index}] must be a JSON object")
+        cases.append(
+            ModelCase.from_mapping(entry, f"additional model cases[{index}]"))
+    return tuple(cases)
+
+
 @dataclasses.dataclass(frozen=True)
 class Host:
     target: Any
@@ -192,6 +253,9 @@ class Runtime:
     trt: PurePosixPath
     onnx_root: PurePosixPath
     env_script: PurePosixPath
+    local_workspace: Path | None = None
+    deployment_mode: DeploymentMode | None = None
+    nfs_export_path: PurePosixPath | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -209,6 +273,8 @@ class Config:
     download_hf_checkpoint: bool = False
     export_onnx: bool = False
     no_trt_containers: bool = False
+    run_workspace_root: PurePosixPath | None = None
+    model_cases: tuple[ModelCase, ...] = _DEFAULT_MODEL_CASES
 
     def validate(self) -> None:
         if self.architecture not in {Arch.X86_64, Arch.D7L}:
@@ -226,6 +292,10 @@ class Config:
                 raise ValueError(
                     "TRT_CI_HF_CHECKPOINT_DIR must be an absolute, non-root path"
                 )
+        if self.run_workspace_root is not None and not _safe_path(
+                self.run_workspace_root):
+            raise ValueError(
+                "TRT_CI_RUN_WORKSPACE_ROOT must be an absolute, non-root path")
         if self.jobs <= 0:
             raise ValueError("TRT_CI_JOBS must be a positive integer")
         if not _RUN_ID_RE.fullmatch(self.run_id):
@@ -233,14 +303,27 @@ class Config:
         if not self.source_root.is_dir():
             raise ValueError(
                 f"Edge-LLM source root does not exist: {self.source_root}")
+        if not self.model_cases:
+            raise ValueError("at least one model case must be configured")
+        duplicate_names = sorted({
+            model.name
+            for model in self.model_cases
+            if sum(case.name == model.name for case in self.model_cases) > 1
+        })
+        if duplicate_names:
+            raise ValueError(
+                f"duplicate model case names: {', '.join(duplicate_names)}")
         self.build_host.validate("build_host")
         self.run_host.validate("run_host")
 
     @property
     def run_root(self) -> PurePosixPath:
-        root = (_D7L_RUN_WORKSPACE
-                if self.architecture is Arch.D7L else _RUN_WORKSPACE)
-        return root / f"run-{self.run_id}"
+        if self.run_workspace_root is not None:
+            return self.run_workspace_root / f"run-{self.run_id}"
+        if self.architecture is Arch.D7L and self.run_host.user:
+            return (PurePosixPath("/home") / self.run_host.user /
+                    "edgellm-trt-ci" / f"run-{self.run_id}")
+        return _RUN_WORKSPACE / f"run-{self.run_id}"
 
     @property
     def runtime_root(self) -> PurePosixPath:
@@ -324,6 +407,18 @@ def resolve_host(connection: HostSSHConfig,
     return Host(remote.target, remote)
 
 
+def _cute_dsl_cmake_args(architecture: Arch) -> list[str]:
+    if architecture is Arch.D7L:
+        return [
+            "-DENABLE_CUTE_DSL=fmha;fmha_v2;ffpa;gdn;gemm;ssd",
+            "-DCUTE_DSL_ARTIFACT_TAG=sm_110",
+        ]
+    return [
+        "-DENABLE_CUTE_DSL=ffpa;fmha_v2;gdn;gemm;int4_fp16_gemm;ssd",
+        "-DCUTE_DSL_ARTIFACT_TAG=sm_86",
+    ]
+
+
 def build_targets(config: Config) -> list[ArtifactTarget]:
     platform = PlatformConfig(arch=config.architecture)
     platform_cmake_args = ([
@@ -359,7 +454,8 @@ def build_targets(config: Config) -> list[ArtifactTarget]:
                 trt_package_dir=str(config.trt_location),
                 cmake_args=[
                     "--fresh", "-DBUILD_UNIT_TESTS=OFF",
-                    "-DENABLE_CUTE_DSL=OFF", *platform_cmake_args
+                    *_cute_dsl_cmake_args(config.architecture),
+                    *platform_cmake_args
                 ],
             ),
         ),
@@ -539,6 +635,11 @@ def _deploy(config: Config, code: Any, run_host: Host,
             trt=workspace / "trt",
             onnx_root=onnx_root,
             env_script=PurePosixPath(deployment.env_script_path),
+            local_workspace=Path(deployment.metadata["local_workspace"]),
+            deployment_mode=deployment.deployment_mode,
+            nfs_export_path=(
+                PurePosixPath(deployment.metadata["jump_host_export_path"])
+                if "jump_host_export_path" in deployment.metadata else None),
         )
 
     edge = PurePosixPath(str(config.edgellm_root))
@@ -553,25 +654,25 @@ def _download_hf_checkpoints(config: Config, commands: Any,
     if not config.download_hf_checkpoint:
         return
     assert config.hf_checkpoint_root is not None
-    for model_name, (repository, checkpoint_dir) in _MODEL_CHECKPOINTS.items():
+    for model in config.model_cases:
         result = commands.run(
             target,
             CommandSpec(
-                name=f"Download {model_name} checkpoint",
+                name=f"Download {model.name} checkpoint",
                 argv=[
-                    str(_PYTHON.parent / "hf"), "download", repository,
+                    str(_PYTHON.parent / "hf"), "download", model.repository,
                     "--local-dir",
-                    str(config.hf_checkpoint_root / checkpoint_dir)
+                    str(config.hf_checkpoint_root / model.checkpoint_dir)
                 ],
                 timeout_s=_TRANSFER_TIMEOUT_S,
                 output_mode=OutputMode.PROGRESS,
                 artifact_log_file=str(config.local_root /
-                                      f"download-{model_name}.log"),
-                operation_name=f"huggingface-download-{model_name}",
+                                      f"download-{model.name}.log"),
+                operation_name=f"huggingface-download-{model.name}",
             ))
         if not result.success:
             raise FlowError(
-                f"HuggingFace checkpoint download failed for {model_name}",
+                f"HuggingFace checkpoint download failed for {model.name}",
                 _status(result))
 
 
@@ -599,16 +700,92 @@ def _export_onnx(config: Config, code: Any, target: Any,
         raise FlowError("ONNX export failed", _status(result))
 
 
-def _stage_onnx(config: Config, run_host: Host, runtime: Runtime) -> None:
+def _copy_onnx_cases(commands: Any, source_root: Path, destination_root: Path,
+                     log_root: Path, model_cases: tuple[ModelCase,
+                                                        ...]) -> None:
+    for model in model_cases:
+        result = commands.run(
+            LocalTarget(),
+            CommandSpec(
+                name=f"Stage {model.name} ONNX model",
+                argv=[
+                    "rsync", "-a", "--delete", f"{source_root / model.name}/",
+                    f"{destination_root / model.name}/"
+                ],
+                timeout_s=_TRANSFER_TIMEOUT_S,
+                output_mode=OutputMode.PROGRESS,
+                artifact_log_file=str(log_root /
+                                      f"stage-onnx-{model.name}.log"),
+                operation_name=f"stage-onnx-{model.name}",
+            ))
+        if not result.success:
+            raise FlowError(f"Could not stage {model.name} ONNX model",
+                            _status(result))
+
+
+def _copy_onnx_cases_to_remote(remote: Any, source_root: Path,
+                               destination_root: PurePosixPath,
+                               model_cases: tuple[ModelCase, ...]) -> None:
+    for model in model_cases:
+        copied = remote.copy_local_directory_to_remote(
+            local_path=str(source_root / model.name),
+            remote_path=str(destination_root / model.name),
+            timeout_s=_TRANSFER_TIMEOUT_S,
+        )
+        if not copied:
+            raise FlowError(
+                f"Could not stage {model.name} ONNX model on the D7L run host")
+
+
+def _jump_host_remote_manager(commands: Any, run_host: Host, local_path: Path,
+                              remote_path: PurePosixPath) -> Any | None:
+    if run_host.remote is None or run_host.remote.config.jump_host is None:
+        return None
+    jump = run_host.remote.config.jump_host
+    config = RemoteConfig(
+        target=SSHTargetInfo(
+            target_type=TargetType.LINUX,
+            arch=Arch.X86_64,
+            address=jump.host,
+            port=jump.port,
+            username=jump.username,
+            password=jump.password,
+        ),
+        ssh=jump.ssh,
+        paths=RemotePaths(local_path=str(local_path),
+                          remote_path=str(remote_path)),
+    )
+    return RemoteConnectionManager(config, command_manager=commands)
+
+
+def _stage_onnx(config: Config, code: Any, run_host: Host,
+                runtime: Runtime) -> None:
     if run_host.remote is None or config.architecture is not Arch.D7L:
         return
-    copied = run_host.remote.copy_local_directory_to_remote(
-        local_path=str(config.onnx_root),
-        remote_path=str(runtime.onnx_root),
-        timeout_s=_TRANSFER_TIMEOUT_S,
-    )
-    if not copied:
-        raise FlowError("Could not stage ONNX models on the D7L run host")
+    source_root = Path(str(config.onnx_root))
+    if runtime.deployment_mode is DeploymentMode.NFS:
+        if runtime.nfs_export_path is not None:
+            jump_host_workspace = _jump_host_remote_manager(
+                code.command_manager, run_host, source_root,
+                runtime.nfs_export_path / "onnx")
+            if jump_host_workspace is not None:
+                _copy_onnx_cases_to_remote(jump_host_workspace, source_root,
+                                           runtime.nfs_export_path / "onnx",
+                                           config.model_cases)
+                return
+        if runtime.local_workspace is not None:
+            destination_root = runtime.local_workspace / "onnx"
+            _copy_onnx_cases(code.command_manager, source_root,
+                             destination_root, config.local_root,
+                             config.model_cases)
+            return
+    run_host.remote.filesystem.remove_dir(str(runtime.onnx_root),
+                                          timeout_s=_TRANSFER_TIMEOUT_S)
+    if not run_host.remote.filesystem.ensure_dir(
+            str(runtime.onnx_root), timeout_s=_TRANSFER_TIMEOUT_S):
+        raise FlowError("Could not create the D7L ONNX staging directory")
+    _copy_onnx_cases_to_remote(run_host.remote, source_root, runtime.onnx_root,
+                               config.model_cases)
 
 
 def _run_tests(config: Config, code: Any, run_host: Host, run_result: Any,
@@ -705,11 +882,11 @@ def _export_onnx_command(config: Config, edge: PurePosixPath,
     export_tests = edge / "tests/defs/test_checkpoint_export.py"
     q = shlex.quote
     assert config.hf_checkpoint_root is not None
-    export_cases = " ".join(f"--test-param={q(name + '-fp16')}"
-                            for name in _MODEL_CHECKPOINTS)
+    export_cases = " ".join(f"--test-param={q(model.name + '-fp16')}"
+                            for model in config.model_cases)
     generated_dirs = " ".join(
-        q(str(config.onnx_root / name / "llm-fp16-fp16"))
-        for name in _MODEL_CHECKPOINTS)
+        q(str(config.onnx_root / model.name / "llm-fp16-fp16"))
+        for model in config.model_cases)
     return f"""set -euo pipefail
 source {q(str(env_script))}
 export LLM_SDK_DIR={q(str(edge))}
@@ -731,10 +908,11 @@ def _test_command(config: Config, runtime: Runtime) -> str:
     tests = runtime.edge / "tests/defs/test_llm_pipeline.py"
     plugin = runtime.edge / "libNvInfer_edgellm_plugin.so"
     q = shlex.quote
-    build_cases = " ".join(f"--test-param={q(model)}"
-                           for model in _E2E_MODEL_FAMILIES)
-    inference_cases = " ".join(f"--test-param={q(model + '-llm_basic')}"
-                               for model in _E2E_MODEL_FAMILIES)
+    build_cases = " ".join(f"--test-param={q(model.pipeline_param)}"
+                           for model in config.model_cases)
+    inference_cases = " ".join(
+        f"--test-param={q(model.pipeline_param + '-llm_basic')}"
+        for model in config.model_cases)
     use_host_python = (config.no_trt_containers
                        or config.architecture is Arch.D7L)
     python = "python3" if use_host_python else str(_PYTHON)
@@ -787,6 +965,12 @@ def _parser() -> argparse.ArgumentParser:
         "--export_onnx",
         action="store_true",
         help="export ONNX models from HF checkpoints on the build host")
+    parser.add_argument(
+        "--additional-model-cases",
+        default="[]",
+        help=("JSON array, or JSON file path, of extra model cases with "
+              "name, repository, checkpoint_dir, and pipeline_param"),
+    )
     parser.add_argument("--run-id", help=argparse.SUPPRESS)
     return parser
 
@@ -806,12 +990,19 @@ def _config(args: argparse.Namespace) -> Config:
     if not onnx_dir or any(char in onnx_dir for char in "\r\n\0"):
         raise ValueError("invalid TRT_CI_ONNX_DIR")
     hf_checkpoint_dir = os.environ.get("TRT_CI_HF_CHECKPOINT_DIR")
+    workspace_root = os.environ.get("TRT_CI_RUN_WORKSPACE_ROOT")
+    if workspace_root is not None:
+        if not workspace_root or any(char in workspace_root
+                                     for char in "\r\n\0"):
+            raise ValueError("invalid TRT_CI_RUN_WORKSPACE_ROOT")
     if args.download_hf_checkpoint or args.export_onnx:
         if hf_checkpoint_dir is None:
             raise ValueError("TRT_CI_HF_CHECKPOINT_DIR must be set")
         if not hf_checkpoint_dir or any(char in hf_checkpoint_dir
                                         for char in "\r\n\0"):
             raise ValueError("invalid TRT_CI_HF_CHECKPOINT_DIR")
+    model_cases = _DEFAULT_MODEL_CASES + read_additional_model_cases(
+        args.additional_model_cases)
     config = Config(
         architecture=args.architecture,
         trt_location=args.trt_location,
@@ -826,6 +1017,9 @@ def _config(args: argparse.Namespace) -> Config:
         download_hf_checkpoint=args.download_hf_checkpoint,
         export_onnx=args.export_onnx,
         no_trt_containers=args.no_trt_containers,
+        run_workspace_root=(PurePosixPath(workspace_root)
+                            if workspace_root is not None else None),
+        model_cases=model_cases,
     )
     config.validate()
     return config
@@ -887,7 +1081,7 @@ def main(argv: list[str] | None = None) -> int:
         _download_hf_checkpoints(config, commands, build_host.target)
         _export_onnx(config, code, build_host.target, run_result)
         runtime = _deploy(config, code, run_host, run_result)
-        _stage_onnx(config, run_host, runtime)
+        _stage_onnx(config, code, run_host, runtime)
         status = _run_tests(config, code, run_host, run_result, runtime,
                             logger)
     except FlowError as error:

@@ -118,8 +118,10 @@ self-invocation:
    CodeManager's deployment transport. A remote run uses
    `CodeManager.deploy_runtime()`; x86 requests direct rsync, while D7L lets
    the toolkit try NFS before its direct-copy fallbacks. D7L first derives a
-   runtime `RunResult` that omits build-only TRT static archives. A local run
-   uses `CodeManager.write_environment_setup_script()` without a copy.
+   runtime `RunResult` that omits build-only TRT static archives. If NFS is
+   selected, D7L ONNX staging writes into the mounted export rather than
+   copying ONNX directly to the board. A local run uses
+   `CodeManager.write_environment_setup_script()` without a copy.
 4. By default, x86 uses a CodeManager-owned runtime container; D7L runs the
    Python E2E cases directly on the deployed board runtime. `--no-trt-containers`
    makes x86 use that same direct `CommandManager` execution path.
@@ -127,31 +129,34 @@ self-invocation:
    artifact directory. Engines remain in the remote run workspace and all
    script-owned remote workspaces are then removed best-effort.
 
-The model-family map is deliberately local and easy to extend in
-`scripts/run_trt_dependency_ci.py`:
+The script always runs the built-in smoke set and accepts additional model
+cases with `--additional-model-cases`. The argument is a JSON array, or a path
+to a JSON file containing that array. Each object maps directly to `ModelCase`:
 
-```python
-_MODEL_CHECKPOINTS = {
-    "Qwen2.5-0.5B-Instruct":
-    ("Qwen/Qwen2.5-0.5B-Instruct", "Qwen2.5-0.5B-Instruct"),
-    "Llama-3.2-1B":
-    ("meta-llama/Llama-3.2-1B-Instruct",
-     "llama-3.2-models/Llama-3.2-1B"),
-}
+```json
+[
+  {
+    "name": "MyModel",
+    "repository": "org/my-model",
+    "checkpoint_dir": "MyModel",
+    "pipeline_param": "MyModel-fp16-mxsl2048-mxbs1-mxil1024"
+  }
+]
 ```
 
-Each entry supplies the test name, HuggingFace repository, and Edge-LLM source
-checkpoint layout. It schedules optional checkpoint download, optional ONNX
-export, engine build, and `llm_basic` inference. `TRT_CI_ONNX_DIR` is always
+Each entry supplies the test name, HuggingFace repository, Edge-LLM source
+checkpoint layout, and pipeline test parameter. It schedules optional
+checkpoint download, optional ONNX export, engine build, and `llm_basic`
+inference. `TRT_CI_ONNX_DIR` is always
 required: without `--export_onnx` it must point at existing ONNX packages, and
 with `--export_onnx` it is the build-host output directory populated by
 `tests/defs/test_checkpoint_export.py::test_checkpoint_export`. Pass
 `--download_hf_checkpoint` to download missing HuggingFace checkpoints on the
 build host before export. `TRT_CI_HF_CHECKPOINT_DIR` is required when either
 `--download_hf_checkpoint` or `--export_onnx` is used. The build-host account
-must already have HuggingFace access; Llama requires accepting Meta's license
-and running `hf auth login`. Without `--download_hf_checkpoint`, existing HF
-checkpoints are reused.
+must already have HuggingFace access. Some checkpoints may require prior
+repository access approval and `hf auth login`. Without
+`--download_hf_checkpoint`, existing HF checkpoints are reused.
 C++ unit tests are not built or run by this flow. The controller's active Python environment supplies pytest and the E2E
 dependencies; its prefix must be visible at the same absolute path on the run
 host and is mounted into the x86 test container automatically. D7L runs use
@@ -165,8 +170,8 @@ its output back, while deployment reads the controller-visible `RunResult`
 paths.
 
 The caller must set `TRT_CI_ONNX_DIR` to the ONNX root used by
-`test_engine_build` and `test_inference`. For D7L, the script stages this ONNX
-root to the board runtime workspace. The caller must also set
+`test_engine_build` and `test_inference`. For D7L, the script stages only the
+configured model ONNX subdirectories to the board runtime workspace. The caller must also set
 `TRT_CI_HF_CHECKPOINT_DIR` when downloading checkpoints or exporting ONNX.
 `TRT_CI_ARTIFACTS_DIR` is needed only when a remote build requires a
 caller-supplied shared path. `TRT_CI_JOBS` and
@@ -180,6 +185,9 @@ does not require Docker or git-trt.
 The last console line reports `TRT CI validation PASSED` or
 `TRT CI validation FAILED`, together with the run ID and local artifact path.
 Build artifacts and logs remain under `artifacts/trt-ci/run-<id>` or
-`TRT_CI_ARTIFACTS_DIR`. An x86 remote run uses `/tmp/edgellm-trt-ci/run-<id>`; D7L uses
-`/dev/shm/edgellm-trt-ci/run-<id>` so engines do not exhaust the board root
-filesystem. Remote run workspaces are removed best-effort after either outcome.
+`TRT_CI_ARTIFACTS_DIR`. An x86 remote run uses `/tmp/edgellm-trt-ci/run-<id>`.
+A D7L remote run uses `/home/<run-user>/edgellm-trt-ci/run-<id>` by default to
+avoid placing large ONNX and engine artifacts in tmpfs. Set
+`TRT_CI_RUN_WORKSPACE_ROOT` to override the run-host root, for example
+`/dev/shm/edgellm-trt-ci` on lab boards whose root filesystem is full. Remote
+run workspaces are removed best-effort after either outcome.
