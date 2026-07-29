@@ -312,6 +312,19 @@ def _load_config(model_dir: str) -> dict:
         return json.load(f)
 
 
+def _is_cosmos3_checkpoint(model_dir: str) -> bool:
+    """Detect a Cosmos3 diffusers checkpoint via ``model_index.json``."""
+    index_path = os.path.join(model_dir, "model_index.json")
+    if not os.path.exists(index_path):
+        return False
+    try:
+        with open(index_path) as f:
+            class_name = json.load(f).get("_class_name", "")
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(class_name, str) and class_name.startswith("Cosmos3")
+
+
 def _get_llm_text_config(config: dict) -> dict:
     """Return the promoted text/LLM config dict when present."""
     for key in ("text_config", "llm_config", "language_config"):
@@ -864,6 +877,29 @@ def _alpamayo_llm_key_remap(key: str) -> "Optional[str]":
     return key
 
 
+def _cosmos3_edge_llm_key_remap(key: str) -> "Optional[str]":
+    """Map the Cosmos3-Edge native reasoner schema onto the default ``CausalLM``.
+
+    The root ``model.safetensors`` stores the text tower flat (``layers.N.*``,
+    ``embed_tokens.weight``, ``norm.weight``, ``lm_head.weight``) with Qwen-VL
+    style attention names (``to_q/to_k/to_v/to_out``); the vision tower
+    (``model.visual.*`` / ``model.projector.*``) is exported separately, and the
+    per-layer ``k_norm_und_for_gen`` belongs only to the GEN diffusion tower.
+    """
+    if "visual." in key or "projector." in key or "k_norm_und_for_gen" in key:
+        return None
+    for src, dst in ((".self_attn.to_q.", ".self_attn.q_proj."),
+                     (".self_attn.to_k.", ".self_attn.k_proj."),
+                     (".self_attn.to_v.", ".self_attn.v_proj."),
+                     (".self_attn.to_out.", ".self_attn.o_proj.")):
+        key = key.replace(src, dst)
+    # The native schema stores the text tower unprefixed; the CausalLM module
+    # tree lives under ``model.`` (except lm_head).
+    if key.startswith(("layers.", "embed_tokens.", "norm.")):
+        return "model." + key
+    return key
+
+
 def _export_llm(model_dir: str,
                 llm_out_dir: str,
                 model_type: str = "",
@@ -892,8 +928,11 @@ def _export_llm(model_dir: str,
     """
     os.makedirs(llm_out_dir, exist_ok=True)
 
-    key_remap = (_alpamayo_llm_key_remap
-                 if model_type == "alpamayo_r1" else None)
+    key_remap = None
+    if model_type == "alpamayo_r1":
+        key_remap = _alpamayo_llm_key_remap
+    elif model_type == "cosmos3_edge":
+        key_remap = _cosmos3_edge_llm_key_remap
 
     # ModelOpt-quantized Qwen3-MoE / Qwen3-Omni-MoE checkpoints store per-expert
     # weights under ``mlp.experts.{j}.`` (modelopt's fused-expert export, for
@@ -1540,6 +1579,9 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
         "gemma4": "gemma4_vision",
         "qwen3_omni_next": "qwen3_omni_next_vision_encoder",
         "gemma4_unified": "gemma4_unified_vision",
+        # Cosmos3-Edge reasoner SigLIP2 ViT (the bare "cosmos3_edge" maps to
+        # the text decoder in C++; the visual engine registers its own enum).
+        "cosmos3_edge": "cosmos3_edge_vision",
     }
     top_level_model_type = _VISUAL_MODEL_TYPE_MAP.get(model_type, model_type)
     vis_cfg_out: dict = {
@@ -1562,7 +1604,8 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
         vis_cfg_out["vision_config"][
             "model_type"] = "qwen3_omni_vision_encoder"
     if model_type in ("qwen2_5_vl", "qwen3_vl", "qwen3_omni", "qwen3_omni_moe",
-                      "qwen3_omni_next", "qwen3_5", "qwen3_5_moe"):
+                      "qwen3_omni_next", "qwen3_5", "qwen3_5_moe",
+                      "cosmos3_edge"):
         # C++ QwenViTRunner reads these token IDs and rope_theta from config.json.
         # For Qwen3-VL the token IDs are at the root level, but vocab_size and
         # rope_theta live inside text_config.  Fall back to text_config for any
@@ -3303,8 +3346,49 @@ def main() -> None:
         ("Comma-separated allow-list of components to export. Default (empty) "
          "exports every component the checkpoint supports. Recognized values: "
          "thinker, mtp_draft, talker, code_predictor, visual, audio, "
-         "code2wav, action. Useful for re-running a single stage, e.g. "
+         "code2wav, action; for Cosmos3 checkpoints: und_prefill, gen, "
+         "vae_encoder. Useful for re-running a single stage, e.g. "
          "``--components code_predictor`` to refresh only the CodePredictor."),
+    )
+    p.add_argument(
+        "--task",
+        choices=("policy", "reasoning", "all"),
+        default="all",
+        help=
+        ("Cosmos3-Edge checkpoints only: which task's artifacts to export. "
+         "'policy' exports the und_prefill/gen/vae_encoder action-generation "
+         "components, 'reasoning' exports the llm/ + visual/ backbones for "
+         "the standard autoregressive VLM flow, 'all' (default) exports "
+         "both."),
+    )
+    p.add_argument(
+        "--action-chunk-size",
+        "--action_chunk_size",
+        dest="action_chunk_size",
+        type=int,
+        default=None,
+        help=("Cosmos3 policy only: number of future action timesteps the GEN "
+              "expert emits per request (action chunk length). Default "
+              "(None) uses the checkpoint's canonical value (16)."),
+    )
+    p.add_argument(
+        "--num-frames",
+        "--num_frames",
+        dest="num_frames",
+        type=int,
+        default=None,
+        help=("Cosmos3 policy only: number of rollout frames the GEN/VAE "
+              "components are shaped for (sets the VAE latent time axis). "
+              "Default (None) uses the checkpoint's canonical value (17)."),
+    )
+    p.add_argument(
+        "--fps",
+        dest="fps",
+        type=float,
+        default=None,
+        help=("Cosmos3 policy only: frames-per-second stamped into the GEN "
+              "runtime config (controls the diffusion time schedule). Default "
+              "(None) uses the checkpoint's canonical value (5)."),
     )
     p.add_argument(
         "--eagle-base",
@@ -3511,6 +3595,68 @@ def main() -> None:
     config = _load_config(model_dir)
     model_type: str = config.get("model_type", "unknown")
     dtype = _dtype_from_str(args.dtype)
+
+    # Cosmos3-Edge checkpoints carry two model families that run on DIFFERENT
+    # runtime paths; ``--task`` selects which artifact set this invocation
+    # exports (both by default):
+    #   * policy    -> und_prefill/gen/vae_encoder components for the
+    #     experimental component runtime, and
+    #   * reasoning -> a regular llm/ backbone + visual/ SigLIP2 encoder for
+    #     the standard llm_build + visual_build + llm_inference VLM flow.
+    # Both the root ``model_type`` and the diffusers ``model_index.json``
+    # identify them.
+    if model_type in ("cosmos3_edge",
+                      "cosmos3_omni") or _is_cosmos3_checkpoint(model_dir):
+        has_reasoner = model_type == "cosmos3_edge"
+        if args.task == "reasoning" and not has_reasoner:
+            p.error("--task reasoning requires a cosmos3_edge checkpoint "
+                    "(this checkpoint carries no reasoner tower)")
+
+        if args.task in ("policy", "all"):
+            from ..models.cosmos3.export import export_cosmos3_components
+            requested = [c for c in args.components.split(",") if c] or None
+            # Forward only the variables the user set; leaving one unset keeps
+            # the module's canonical default (chunk=16, num_frames=17, fps=5).
+            policy_overrides = {
+                k: v
+                for k, v in (("action_chunk_size", args.action_chunk_size),
+                             ("num_frames", args.num_frames), ("fps",
+                                                               args.fps))
+                if v is not None
+            }
+            export_cosmos3_components(model_dir,
+                                      args.output_dir,
+                                      components=requested,
+                                      dtype=dtype,
+                                      **policy_overrides)
+
+        if args.task in ("reasoning", "all") and has_reasoner:
+            # Text decoder -> regular llm/ backbone (KV-cache autoregressive
+            # decode via the standard runtime). Cosmos3ReasonerCausalLM is
+            # registered for "cosmos3_edge"/"cosmos3_edge_text" in the package
+            # __init__ like every other model family.
+            if not args.skip_llm:
+                _export_llm(model_dir,
+                            os.path.join(args.output_dir, "llm"),
+                            model_type="cosmos3_edge")
+            # SigLIP2 ViT + PatchMerger -> visual/ for the standard
+            # visual_build + multimodal runtime. The vision tower is read
+            # directly from its checkpoint shards (the root index maps it to
+            # per-component files, so there is no flat *.safetensors set).
+            if not args.skip_visual:
+                from ..model import load_model_config
+                from ..models.cosmos3_reasoner import \
+                    load_cosmos3_reasoner_visual_checkpoint
+                _export_visual(
+                    model_dir,
+                    os.path.join(args.output_dir, "visual"),
+                    load_cosmos3_reasoner_visual_checkpoint(model_dir),
+                    config,
+                    "cosmos3_edge",
+                    dtype,
+                    model_config=load_model_config(model_dir))
+        return
+
     has_mtp_draft = _has_mtp(config)
     is_gemma4_target = model_type in _GEMMA4_MODEL_TYPES
     mtp_draft_dir_arg = args.mtp_draft_dir or args.gemma4_mtp_assistant_dir

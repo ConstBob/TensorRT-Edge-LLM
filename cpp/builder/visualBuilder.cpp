@@ -49,6 +49,15 @@ bool VisualBuilder::build()
         return false;
     }
 
+    // Without these workarounds, fusing the separate Q/K/V projections that
+    // feed ViTAttentionPlugin yields an engine that faults at execution
+    // context creation.
+    std::string const lunowudFlags = applyCompileWorkarounds(/*maxBatchSize=*/1);
+    if (!lunowudFlags.empty())
+    {
+        LOG_INFO("Using __LUNOWUD=%s", lunowudFlags.c_str());
+    }
+
     // Create builder and network
     auto [builder, network] = createBuilderAndNetwork();
     if (!builder || !network)
@@ -260,7 +269,8 @@ bool VisualBuilder::setupVisualOptimizationProfile(
     case multimodal::ModelType::QWEN2_5_VL:
     case multimodal::ModelType::QWEN3_VL:
     case multimodal::ModelType::QWEN3_5:
-    case multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER: result = setupQwenViTProfile(*visualProfile, network); break;
+    case multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER:
+    case multimodal::ModelType::COSMOS3_EDGE: result = setupQwenViTProfile(*visualProfile, network); break;
 
     case multimodal::ModelType::INTERNVL:
     case multimodal::ModelType::PHI4MM: result = setupInternPhi4ViTProfile(*visualProfile); break;
@@ -323,7 +333,9 @@ bool VisualBuilder::setupQwenViTProfile(
         return false;
     }
 
-    if (ropeEmbedSize == 0)
+    // Cosmos3-Edge (SigLIP2) has no rotary embeddings, so its graph has no rotary_pos_emb input;
+    // every other Qwen-family ViT requires it.
+    if (ropeEmbedSize == 0 && mModelType != multimodal::ModelType::COSMOS3_EDGE)
     {
         LOG_ERROR("Cannot infer ropeEmbedSize. Do you have proper ONNX input: %s?", binding_names::kRotaryPosEmb);
         return false;
@@ -332,8 +344,11 @@ bool VisualBuilder::setupQwenViTProfile(
     // Base inputs
     result &= setOptimizationProfile(&profile, binding_names::kVisualInput, createDims({minHW, inputDim}),
         createDims({optHW, inputDim}), createDims({maxHW, inputDim}));
-    result &= setOptimizationProfile(&profile, binding_names::kRotaryPosEmb, createDims({minHW, ropeEmbedSize}),
-        createDims({optHW, ropeEmbedSize}), createDims({maxHW, ropeEmbedSize}));
+    if (ropeEmbedSize > 0)
+    {
+        result &= setOptimizationProfile(&profile, binding_names::kRotaryPosEmb, createDims({minHW, ropeEmbedSize}),
+            createDims({optHW, ropeEmbedSize}), createDims({maxHW, ropeEmbedSize}));
+    }
     int64_t maxNumImages = std::max<int64_t>(1, mBuilderConfig.maxImageTokens / mBuilderConfig.minImageTokens);
     result &= setOptimizationProfile(&profile, binding_names::kCuSeqlens, createDims({2}),
         createDims({maxNumImages + 1}), createDims({maxNumImages + 1}));
@@ -394,7 +409,8 @@ bool VisualBuilder::setupQwenViTProfile(
             createDims({optHW / 4}), createDims({maxHW / 4}));
     }
     else if (mModelType == multimodal::ModelType::QWEN3_VL || mModelType == multimodal::ModelType::QWEN3_5
-        || mModelType == multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER)
+        || mModelType == multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER
+        || mModelType == multimodal::ModelType::COSMOS3_EDGE)
     {
         result &= setOptimizationProfile(&profile, binding_names::kFastPosEmbIdx, createDims({4, minHW}),
             createDims({4, optHW}), createDims({4, maxHW}));

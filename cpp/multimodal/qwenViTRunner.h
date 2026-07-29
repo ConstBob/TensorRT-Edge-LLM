@@ -170,6 +170,11 @@ protected:
     //! \return false on missing required fields.
     virtual bool validateExtraConfig(nlohmann::json const& jsonConfig);
 
+    //! \brief Whether this ViT consumes a rotary_pos_emb engine input — a fixed per-model property. Qwen ViTs
+    //!        do; subclasses whose engine uses a learned pos-emb (e.g. SigLIP2) override this to false. The base
+    //!        validates the loaded engine's inputs agree with this.
+    virtual bool usesRotaryPosEmb() const;
+
     //! \brief Allocate model-specific I/O buffers beyond the shared ones.
     //! \return false on failure.
     virtual bool allocateExtraBuffers(int64_t maxImageTokens);
@@ -274,6 +279,8 @@ protected:
     bool mUseTrtNativeVitAttn{false}; //!< Use TRT IAttentionV2 (from config); requires kv_lengths binding in engine
     bool mHasKvLengthsWindow{false};  //!< Whether the visual engine has kv_lengths_window binding
     bool mHasMaxSeqLenCarrier{false}; //!< Whether the visual engine has the max_seqlen_carrier binding
+    bool mHasRotaryPosEmb{false};     //!< Whether the ViT consumes a rotary_pos_emb input; set from the
+                                      //!< usesRotaryPosEmb() hook and validated against the engine
 
     std::vector<VisionSpan> mLastSpans; //!< Last round's spans; ViT-input tensors are reused when vit geometry matches.
     std::vector<int64_t> mMropeRopeDeltasPerBatch{}; //!< Used by downstream runners like Alpamayo1ActionRunner to set

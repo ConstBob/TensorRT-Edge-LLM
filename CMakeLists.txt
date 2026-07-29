@@ -177,6 +177,15 @@ add_subdirectory(cpp)
 # Build C++ examples to showcase the usage
 add_subdirectory(examples)
 
+# Experimental models (opt-in). These are not first-class models; they live in a
+# separate tree and link against the core edgellm libraries. Cosmos3 is the
+# first.
+option(BUILD_EXPERIMENTAL_MODELS
+       "Enable building experimental models (e.g. cosmos3)" OFF)
+if(BUILD_EXPERIMENTAL_MODELS)
+  add_subdirectory(experimental_models)
+endif()
+
 option(BUILD_UNIT_TESTS "Enable building unit tests" OFF)
 option(BUILD_PYTHON_BINDINGS "Enable building Python pybind11 bindings" OFF)
 
