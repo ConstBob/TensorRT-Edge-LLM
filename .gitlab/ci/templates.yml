@@ -12,6 +12,10 @@
       when: never
     - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
       when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TITLE =~ /\[skip tests\]/
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)\[skip tests\](,|$)/
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
 .l0_manual_rules:
@@ -19,6 +23,10 @@
     - if: $L1 == "true"
       when: never
     - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TITLE =~ /\[skip tests\]/
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)\[skip tests\](,|$)/
       when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       when: manual
