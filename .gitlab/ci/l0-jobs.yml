@@ -1,13 +1,20 @@
 # ==============================================================================
-# L0 TESTS - Merge Request Triggered
-# Per-pipeline cache:  /scratch.edge_llm_cache/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}/
-#                      (engines, logs, per-runner caches; pruned by l0_cache_cleanup,
-#                       which keeps only the newest NUMERIC pipeline dir per MR.)
-# Reusable ONNX cache: /scratch.edge_llm_cache/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/
-#                      Deliberately NON-numeric so it survives the pipeline-dir cleanup,
-#                      letting later pipelines of the same MR reuse exported ONNX. The
-#                      export jobs set ONNX_REUSE=1 and skip re-export unless the commit
-#                      has [Reexport] or changes tensorrt_edgellm Python (see templates.yml).
+# L0 TESTS - Merge requests and tagged stability schedules
+#
+# Merge request caches:
+#   Per-pipeline: /scratch.edge_llm_cache/L0/MR_<iid>/<pipeline_id>/
+#   Reusable ONNX: /scratch.edge_llm_cache/L0/MR_<iid>/onnx_cache/
+#   l0_cache_cleanup keeps the newest numeric pipeline directory per MR. The
+#   non-numeric ONNX cache survives so later pipelines can reuse exports unless
+#   [Reexport] is requested or exporter inputs change.
+#
+# Stability caches (scheduled with L0_STABILITY=true):
+#   Per-pipeline: /scratch.edge_llm_cache/L0/STABILITY/<pipeline_id>/
+#   ONNX exports stay inside the pipeline cache and are regenerated every run.
+#   l0_cache_cleanup removes stability pipeline caches older than three days.
+#
+# .l0_rules selects the context and supplies its cache/environment variables.
+# cleanup_l0_cache removes that context when its environment is stopped.
 # ==============================================================================
 
 include:
@@ -19,11 +26,10 @@ l0_checkpoint_export:
   variables:
     CUDA_VERSION: "13.2"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/checkpoint_export"
     PRIORITY: l0_checkpoint_export
-    ONNX_REUSE: "1"
-    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export/onnx"
+    ONNX_REUSE: "$L0_ONNX_REUSE"
+    ONNX_DIR: "$L0_ONNX_CACHE_DIR/checkpoint_export/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
   tags:
     - a30-edgellm-nvks
@@ -39,11 +45,10 @@ l0_checkpoint_export_ampere:
   variables:
     CUDA_VERSION: "13.2"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/checkpoint_export_ampere"
     PRIORITY: l0_checkpoint_export_ampere
-    ONNX_REUSE: "1"
-    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export_ampere/onnx"
+    ONNX_REUSE: "$L0_ONNX_REUSE"
+    ONNX_DIR: "$L0_ONNX_CACHE_DIR/checkpoint_export_ampere/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
   tags:
     - a30-edgellm-nvks
@@ -64,10 +69,9 @@ l0_a30:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/a30"
     PRIORITY: l0_pipeline_a30
-    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export_ampere/onnx"
+    ONNX_DIR: "$L0_ONNX_CACHE_DIR/checkpoint_export_ampere/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
@@ -83,6 +87,7 @@ l0_a30:
 
 l0_nemo_eval_a30:
   stage: l0_test
+  when: manual
   needs:
     - l0_checkpoint_export_ampere
     - job: build_cutedsl_docker_matrix
@@ -91,7 +96,6 @@ l0_nemo_eval_a30:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/nemo_eval_a30"
     PRIORITY: l0_nemo_eval_qwen2_5_0_5b
     NEMO_EVAL_ONNX_CACHE_NAME: checkpoint_export_ampere
@@ -103,19 +107,8 @@ l0_nemo_eval_a30:
   image: "$IMAGE"
   extends:
     - .nemo_eval_x86_template
+    - .l0_rules
     - .l0_environment
-  rules:
-    - if: $L1 == "true"
-      when: never
-    - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
-      when: never
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TITLE =~ /\[skip tests\]/
-      when: never
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)\[skip tests\](,|$)/
-      when: never
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-      when: manual
-      allow_failure: true
   allow_failure: true
   interruptible: true
 
@@ -130,10 +123,9 @@ l0_a30_trt11:
     TRT_VERSION: "$TRT11_VERSION"
     TRT_CUDA_VERSION: "13.2"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/a30_trt11"
     PRIORITY: l0_pipeline_a30
-    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export_ampere/onnx"
+    ONNX_DIR: "$L0_ONNX_CACHE_DIR/checkpoint_export_ampere/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
@@ -156,7 +148,6 @@ l0_builder_a30:
     TRT_VERSION: "$TRT11_VERSION"
     TRT_CUDA_VERSION: "13.2"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/builder_a30"
     PRIORITY: l0_builder_a30
     ONNX_DIR: "$TEST_CACHE_DIR/unused_onnx"
@@ -183,10 +174,9 @@ l0_rtx3090:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/rtx3090"
     PRIORITY: l0_pipeline_rtx3090
-    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export_ampere/onnx"
+    ONNX_DIR: "$L0_ONNX_CACHE_DIR/checkpoint_export_ampere/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
@@ -213,10 +203,9 @@ l0_rtx5080:
       TRT_CUDA_VERSION: "12.9"
       TRT_VERSION: "10.13.3.9"
       IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-      L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
       TEST_CACHE_DIR: "$L0_CACHE_DIR/rtx5080"
       PRIORITY: l0_pipeline_rtx5080
-      ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export/onnx"
+      ONNX_DIR: "$L0_ONNX_CACHE_DIR/checkpoint_export/onnx"
       TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
       ENGINE_DIR: "$TEST_CACHE_DIR/engines"
       TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
@@ -242,10 +231,9 @@ l0_b100:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/b100"
     PRIORITY: l0_pipeline_b100
-    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export/onnx"
+    ONNX_DIR: "$L0_ONNX_CACHE_DIR/checkpoint_export/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
@@ -270,10 +258,9 @@ l0_rtx5090:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/rtx5090"
     PRIORITY: l0_pipeline_rtx5090
-    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export/onnx"
+    ONNX_DIR: "$L0_ONNX_CACHE_DIR/checkpoint_export/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
@@ -289,6 +276,7 @@ l0_rtx5090:
 
 l0_nemo_eval_rtx5090:
   stage: l0_test
+  when: manual
   needs:
     - l0_checkpoint_export
     - job: build_cutedsl_docker_matrix
@@ -297,7 +285,6 @@ l0_nemo_eval_rtx5090:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/nemo_eval_rtx5090"
     PRIORITY: l0_nemo_eval_nemotron_3_nano_4b
     NEMO_EVAL_ONNX_CACHE_NAME: checkpoint_export
@@ -309,19 +296,8 @@ l0_nemo_eval_rtx5090:
   image: "$IMAGE"
   extends:
     - .nemo_eval_x86_template
+    - .l0_rules
     - .l0_environment
-  rules:
-    - if: $L1 == "true"
-      when: never
-    - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
-      when: never
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TITLE =~ /\[skip tests\]/
-      when: never
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)\[skip tests\](,|$)/
-      when: never
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-      when: manual
-      allow_failure: true
   allow_failure: true
   interruptible: true
 
@@ -335,7 +311,7 @@ l0_unit_tests_x86:
     CUDA_VERSION: "13.2"
     TRT_VERSION: "$TRT10_X86_VERSION"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/unit_tests_x86"
+    TEST_CACHE_DIR: "$L0_CACHE_DIR/unit_tests_x86"
     PRIORITY: l0_python_ut
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
@@ -367,7 +343,7 @@ l0_unit_tests_x86_trt11:
     TRT_VERSION: "$TRT11_VERSION"
     TRT_CUDA_VERSION: "13.2"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/unit_tests_x86_trt11"
+    TEST_CACHE_DIR: "$L0_CACHE_DIR/unit_tests_x86_trt11"
     PRIORITY: l0_python_ut
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
@@ -398,7 +374,7 @@ l0_unit_tests_x86_b100:
     CUDA_VERSION: "13.2"
     TRT_VERSION: "$TRT10_X86_VERSION"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/unit_tests_x86_b100"
+    TEST_CACHE_DIR: "$L0_CACHE_DIR/unit_tests_x86_b100"
     PRIORITY: l0_python_ut
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
@@ -425,7 +401,7 @@ l0_unit_tests_x86_trt11_b100:
     TRT_VERSION: "$TRT11_VERSION"
     TRT_CUDA_VERSION: "13.2"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/unit_tests_x86_trt11_b100"
+    TEST_CACHE_DIR: "$L0_CACHE_DIR/unit_tests_x86_trt11_b100"
     PRIORITY: l0_python_ut
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
@@ -454,7 +430,7 @@ l0_unit_tests_thor:
     CUDA_VERSION: "13.0"
     TRT_VERSION: "10.16.0.72"
     TRT_CUDA_VERSION: "13.2"
-    TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/unit_tests_thor"
+    TEST_CACHE_DIR: "$L0_CACHE_DIR/unit_tests_thor"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$TRT_CUDA_VERSION"
     PRIORITY: l0_python_ut
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
@@ -480,7 +456,7 @@ l0_unit_tests_orin:
     CUDA_VERSION: "13.2"
     # TRT_VERSION comes from the global default, same as l0_jetson_orin.
     TRT_CUDA_VERSION: "13.2"
-    TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/unit_tests_orin"
+    TEST_CACHE_DIR: "$L0_CACHE_DIR/unit_tests_orin"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.aarch64.cuda-$TRT_CUDA_VERSION"
     PRIORITY: l0_python_ut
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
@@ -504,11 +480,10 @@ l0_jetson_orin:
     BOARD_USER: "tensorrt_user"
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/jetson_orin"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.aarch64.cuda-$TRT_CUDA_VERSION"
     PRIORITY: l0_pipeline_orin
-    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export_ampere/onnx"
+    ONNX_DIR: "$L0_ONNX_CACHE_DIR/checkpoint_export_ampere/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/jetson_orin.csv"
   tags:
@@ -532,11 +507,10 @@ l0_drive_thor_1:
     CUDA_VERSION: "13.0"
     TRT_VERSION: "10.16.0.72"
     TRT_CUDA_VERSION: "13.2"
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/drive_thor_1"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$TRT_CUDA_VERSION"
     PRIORITY: l0_pipeline_thor_1
-    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export/onnx"
+    ONNX_DIR: "$L0_ONNX_CACHE_DIR/checkpoint_export/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/drive_thor_1.csv"
     BOARD_IP: "192.168.55.1"
@@ -560,11 +534,10 @@ l0_drive_thor_1_trt11:
     CUDA_VERSION: "13.0"
     TRT_VERSION: "$TRT11_VERSION"
     TRT_CUDA_VERSION: "13.2"
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/drive_thor_1_trt11"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$TRT_CUDA_VERSION"
     PRIORITY: l0_pipeline_thor_1_trt11
-    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export/onnx"
+    ONNX_DIR: "$L0_ONNX_CACHE_DIR/checkpoint_export/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/drive_thor_1_trt11.csv"
     BOARD_IP: "192.168.55.1"
@@ -589,11 +562,10 @@ l0_drive_thor_2:
     CUDA_VERSION: "13.0"
     TRT_VERSION: "10.16.0.72"
     TRT_CUDA_VERSION: "13.2"
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/drive_thor_2"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$TRT_CUDA_VERSION"
     PRIORITY: l0_pipeline_thor_2
-    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export/onnx"
+    ONNX_DIR: "$L0_ONNX_CACHE_DIR/checkpoint_export/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/drive_thor_2.csv"
     BOARD_IP: "192.168.55.1"
@@ -617,11 +589,10 @@ l0_drive_thor_2_trt11:
     CUDA_VERSION: "13.0"
     TRT_VERSION: "$TRT11_VERSION"
     TRT_CUDA_VERSION: "13.2"
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/drive_thor_2_trt11"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$TRT_CUDA_VERSION"
     PRIORITY: l0_pipeline_thor_2_trt11
-    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export/onnx"
+    ONNX_DIR: "$L0_ONNX_CACHE_DIR/checkpoint_export/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/drive_thor_2_trt11.csv"
     BOARD_IP: "192.168.55.1"
@@ -646,11 +617,10 @@ l0_jedha:
     CUDA_VERSION: "12.8"
     TRT_VERSION: "10.16.0.72"
     TRT_CUDA_VERSION: "13.2"
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/jedha"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.aarch64.cuda-$TRT_CUDA_VERSION"
     PRIORITY: l0_pipeline_jedha
-    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export/onnx"
+    ONNX_DIR: "$L0_ONNX_CACHE_DIR/checkpoint_export/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/jedha.csv"
   tags:
@@ -739,37 +709,38 @@ l0_jedha:
     - .l0_environment
   interruptible: true
 
-# Cleanup job - Triggered when MR environment is stopped (merged/closed)
-cleanup_l0_mr_cache:
+# Cleanup job - Triggered when an L0 environment is stopped
+cleanup_l0_cache:
   stage: .post
+  when: manual
   dependencies: []
   variables:
     GIT_STRATEGY: none
   tags:
     - a30-edgellm-nvks
   script:
-    - echo "Cleaning up L0 cache for MR ${CI_MERGE_REQUEST_IID}"
-    # Safety check: ensure CI_MERGE_REQUEST_IID is set
     - |
-      if [ -z "$CI_MERGE_REQUEST_IID" ]; then
-        echo "ERROR: CI_MERGE_REQUEST_IID is not set!"
-        echo "This cleanup job requires a merge request context."
+      if [ -n "$CI_MERGE_REQUEST_IID" ]; then
+        CACHE_ROOT="${EDGE_LLM_CACHE_DIR}/L0/MR_${CI_MERGE_REQUEST_IID}"
+      elif [ "$CI_PIPELINE_SOURCE" = "schedule" ]; then
+        CACHE_ROOT="${EDGE_LLM_CACHE_DIR}/L0/STABILITY/${CI_PIPELINE_ID}"
+      else
+        echo "ERROR: L0 cleanup requires a merge request or schedule context"
         exit 1
       fi
-    - MR_CACHE_DIR="${EDGE_LLM_CACHE_DIR}/L0/MR_${CI_MERGE_REQUEST_IID}"
-    - |
-      if [ -d "$MR_CACHE_DIR" ]; then
-        echo "Found MR cache directory: $MR_CACHE_DIR"
+      echo "Cleaning up L0 cache at $CACHE_ROOT"
+      if [ -d "$CACHE_ROOT" ]; then
+        echo "Found L0 cache directory: $CACHE_ROOT"
         echo "Disk usage before cleanup:"
-        du -sh "$MR_CACHE_DIR" || true
-        echo "Removing $MR_CACHE_DIR..."
-        rm -rf "$MR_CACHE_DIR"
-        echo "✅ Cleanup completed successfully for MR ${CI_MERGE_REQUEST_IID}"
+        du -sh "$CACHE_ROOT" || true
+        echo "Removing $CACHE_ROOT..."
+        rm -rf "$CACHE_ROOT"
+        echo "✅ Cleanup completed successfully"
       else
-        echo "ℹ️  No cache directory found at $MR_CACHE_DIR (already cleaned or no cache created)"
+        echo "ℹ️  No cache directory found at $CACHE_ROOT (already cleaned or no cache created)"
       fi
   environment:
-    name: l0_cache/mr_$CI_MERGE_REQUEST_IID
+    name: $L0_ENVIRONMENT_NAME
     action: stop
-  when: manual
+  extends: .l0_rules
   allow_failure: true

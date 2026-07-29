@@ -16,12 +16,23 @@
       when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)\[skip tests\](,|$)/
       when: never
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $L0_STABILITY == "true"
+      variables:
+        L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/STABILITY/${CI_PIPELINE_ID}"
+        L0_ONNX_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/STABILITY/${CI_PIPELINE_ID}/onnx_cache"
+        L0_ENVIRONMENT_NAME: "l0_cache/stability"
+        L0_ONNX_REUSE: "0"
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      variables:
+        L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
+        L0_ONNX_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache"
+        L0_ENVIRONMENT_NAME: "l0_cache/mr_${CI_MERGE_REQUEST_IID}"
+        L0_ONNX_REUSE: "1"
 
 .l0_environment:
   environment:
-    name: l0_cache/mr_$CI_MERGE_REQUEST_IID
-    on_stop: cleanup_l0_mr_cache
+    name: $L0_ENVIRONMENT_NAME
+    on_stop: cleanup_l0_cache
     auto_stop_in: 30 days
 
 .l1_environment:
@@ -37,6 +48,7 @@
 .setup_common_rules:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $L0_STABILITY == "true"
     - if: $L1 == "true"
 
 # ==============================================================================
@@ -183,10 +195,9 @@
       mkdir -p "$ONNX_DIR" "$TEST_LOG_DIR"
     - |
       # ── Smart ONNX reuse decision ─────────────────────────────────────────
-      # Opt-in via ONNX_REUSE=1 (set only on L0 export jobs, which point ONNX_DIR
-      # at a stable per-MR cache that survives the numeric-pipeline-dir cleanup).
-      # Callers that leave ONNX_REUSE unset (e.g. L1 export) always re-export, so
-      # their behavior is unchanged.
+      # MR L0 jobs opt in via ONNX_REUSE=1 and point ONNX_DIR at a stable cache.
+      # Scheduled stability and L1 exports leave reuse disabled so every run
+      # exercises the exporter.
       # Re-export only when: [reexport] in the commit message, OR exporter/cache
       # contract inputs changed since the commit that produced the cached ONNX.
       # Runtime-only tests/CI/C++ changes never trigger it.
@@ -295,10 +306,9 @@
     - |
       : "${TEST_LOG_DIR:?TEST_LOG_DIR must be set}"
       : "${ENGINE_DIR:?ENGINE_DIR must be set}"
-      : "${EDGE_LLM_CACHE_DIR:?EDGE_LLM_CACHE_DIR must be set}"
-      : "${CI_MERGE_REQUEST_IID:?CI_MERGE_REQUEST_IID must be set}"
+      : "${L0_ONNX_CACHE_DIR:?L0_ONNX_CACHE_DIR must be set}"
       : "${NEMO_EVAL_ONNX_CACHE_NAME:?NEMO_EVAL_ONNX_CACHE_NAME must be set}"
-      export ONNX_DIR="$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/$NEMO_EVAL_ONNX_CACHE_NAME/onnx"
+      export ONNX_DIR="$L0_ONNX_CACHE_DIR/$NEMO_EVAL_ONNX_CACHE_NAME/onnx"
       echo "Using ONNX cache: $ONNX_DIR"
       if [ ! -d "$ONNX_DIR" ]; then
         echo "ONNX cache not found at $ONNX_DIR"
