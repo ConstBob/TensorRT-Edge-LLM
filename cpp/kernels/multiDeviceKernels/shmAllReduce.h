@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -26,12 +27,15 @@ namespace trt_edgellm
 namespace kernels
 {
 
+constexpr int64_t kShmSingleCtaMaxElements{8192};
+inline constexpr int32_t kShmAllReduceWorldSize{2};
 constexpr int64_t kDefaultShmFp8SmallPathElementThreshold{8192};
 
 /// Opaque state for SHM-based AllReduce on Thor unified memory.
 /// Bypasses NCCL by using managed memory buffers + device-side barriers.
-/// Designed for CUDA Graph compatibility: the kernel is self-synchronizing
-/// via monotonic barrier counters that work correctly across graph replays.
+/// The single-CTA paths are CUDA Graph compatible: their monotonic device
+/// barrier counters remain correct across graph replays. Multi-CTA paths are
+/// not graph safe and must only be selected outside CUDA Graph capture.
 struct ShmAllReduceState
 {
     half* shmBuf;                         //!< Rank 0's SHM slot [maxElements], NUMA node 0
@@ -51,10 +55,20 @@ struct ShmAllReduceState
     char const* shmName{nullptr}; //!< POSIX shm name (rank 0 unlinks on destroy)
     int32_t shmRank{-1};          //!< Which mpirun rank this process is
     // Host-side barrier for cross-process sync (lives in POSIX shm, not process-local).
-    // With mpirun, process-local std::atomic barriers deadlock because each process
-    // has its own copy. These counters live in the shared mmap'd region instead.
-    uint64_t volatile* hostBarrierArrived{nullptr}; //!< [2] arrived counters for rank 0 and 1
+    // The high bit is a terminal failure marker; lower bits are arrival tickets.
+    uint64_t volatile* hostBarrierState{nullptr}; //!< Shared, aligned atomic ticket/failure state
 };
+
+/// Bound the host-only pre-enqueue SHM rendezvous.
+///
+/// This runs during normal host enqueue and graph capture, but not graph replay;
+/// replay synchronization is provided by the monotonic device barriers. A timeout
+/// marks the shared SHM state failed so both ranks reject subsequent SHM work.
+/// @param state Initialized SHM state
+/// @param rank This GPU's rank (0 or 1)
+/// @param timeout Maximum time to wait for the peer rank
+bool syncShmHostBarrier(ShmAllReduceState* state, int32_t rank,
+    std::chrono::milliseconds timeout = std::chrono::milliseconds{30000}) noexcept;
 
 /// Allocate shared buffers for 2-GPU AllReduce.
 /// @param tpSize Must be 2
@@ -67,15 +81,16 @@ ShmAllReduceState* shmAllReduceInit(int32_t tpSize, int64_t maxElements, int64_t
     int64_t fp8SmallPathElementThreshold, char const* sessionName);
 
 /// Launch the SHM AllReduce kernel on the given stream.
-/// Safe for CUDA Graph capture — the kernel uses pre-allocated buffers
-/// and self-synchronizes via atomic barriers.
+/// Payloads up to kShmSingleCtaMaxElements use the graph-safe single-CTA path.
+/// Larger payloads use a multi-CTA path and must not be launched during capture.
 /// @param state Initialized SHM state
 /// @param input Device pointer to this rank's input (FP16)
 /// @param output Device pointer for result (may equal input for in-place)
 /// @param numElements Number of FP16 elements. Must be <= state->maxElements.
 /// @param rank This GPU's rank (0 or 1)
 /// @param stream CUDA stream
-void shmAllReduceExec(
+/// @return cudaSuccess, or the first CUDA launch/submission error
+cudaError_t shmAllReduceExec(
     ShmAllReduceState* state, void const* input, void* output, int64_t numElements, int32_t rank, cudaStream_t stream);
 
 /// Launch the fused SHM AllReduce (reduce-only, no copy phase).
@@ -87,12 +102,14 @@ void shmAllReduceExec(
 /// @param numElements Number of FP16 elements written to shmBuf[rank]
 /// @param rank This GPU's rank (0 or 1)
 /// @param stream CUDA stream
-void shmAllReduceExecFused(
+/// @return cudaSuccess, or the CUDA kernel launch error
+cudaError_t shmAllReduceExecFused(
     ShmAllReduceState* state, void* output, int64_t numElements, int32_t rank, cudaStream_t stream);
 
 /// Wait until the peer has finished reading this rank's previous SHM slot contents.
 /// Call before an external writer, such as a GEMM kernel, overwrites shmBuf[rank].
-void shmAllReduceWaitRead(ShmAllReduceState* state, int32_t rank, cudaStream_t stream);
+/// @return cudaSuccess, or the CUDA kernel launch error
+cudaError_t shmAllReduceWaitRead(ShmAllReduceState* state, int32_t rank, cudaStream_t stream);
 
 /// Launch the fused SHM AllReduce for FP8 data (reduce-only, no copy phase).
 /// The caller has already written FP8 E4M3 data to shmBuf[rank * maxElements * sizeof(half)]
@@ -103,19 +120,22 @@ void shmAllReduceWaitRead(ShmAllReduceState* state, int32_t rank, cudaStream_t s
 /// @param numElements Number of FP8 elements written per rank to shmBuf
 /// @param rank This GPU's rank (0 or 1)
 /// @param stream CUDA stream
-void shmAllReduceExecFusedFp8(
+/// @return cudaSuccess, or the CUDA kernel launch error
+cudaError_t shmAllReduceExecFusedFp8(
     ShmAllReduceState* state, void* output, int64_t numElements, int32_t rank, cudaStream_t stream);
 
 /// Multi-CTA FP8 AllReduce for large payloads.
 /// Two-kernel approach: barrier kernel (1 CTA) + grid-stride reduce (N CTAs).
 /// NOT graph-safe. Use only for non-captured paths.
-void shmAllReduceMultiCtaFp8(
+/// @return cudaSuccess, or the first CUDA kernel launch error
+cudaError_t shmAllReduceMultiCtaFp8(
     ShmAllReduceState* state, void* output, int64_t numElements, int32_t rank, cudaStream_t stream);
 
 /// Multi-CTA FP16 AllReduce for large payloads.
 /// Same two-kernel approach as FP8 but operates on FP16 data in shmBuf.
 /// NOT graph-safe. Use only for non-captured paths.
-void shmAllReduceMultiCtaFp16(
+/// @return cudaSuccess, or the first CUDA kernel launch error
+cudaError_t shmAllReduceMultiCtaFp16(
     ShmAllReduceState* state, void* output, int64_t numElements, int32_t rank, cudaStream_t stream);
 
 /// Free shared buffers.

@@ -217,6 +217,8 @@ if(BUILD_UNIT_TESTS)
   # Define project root path for tests to access resources
   target_compile_definitions(unitTest
                              PRIVATE PROJECT_ROOT_DIR="${CMAKE_SOURCE_DIR}")
+  # Resource-registration tests resolve the plugin's exported lifecycle ABI.
+  add_dependencies(unitTest NvInfer_edgellm_plugin)
   target_link_libraries(
     unitTest PRIVATE gtest gtest_main edgellmCore commonLibraryExt exampleUtils
                      ${CUDA_DRIVER_LINK_LIB})

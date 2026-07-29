@@ -17,6 +17,7 @@
 
 #include "shmAllReduce.h"
 
+#include "common/checkMacros.h"
 #include "common/cudaMacros.h"
 #include "common/logger.h"
 
@@ -37,6 +38,7 @@ namespace kernels
 
 namespace
 {
+constexpr uint64_t kShmHostBarrierFailureBit{uint64_t{1} << 63};
 
 bool mapDevicePointer(void** devicePtr, void* hostPtr, char const* label) noexcept
 {
@@ -75,6 +77,87 @@ int64_t normalizeShmFp8SmallPathElementThreshold(int64_t threshold)
 }
 
 } // namespace
+
+bool syncShmHostBarrier(ShmAllReduceState* state, int32_t rank, std::chrono::milliseconds timeout) noexcept
+{
+    if (rank < 0 || rank >= kShmAllReduceWorldSize || state == nullptr || state->hostBarrierState == nullptr
+        || timeout <= std::chrono::milliseconds::zero())
+    {
+        LOG_ERROR("Cannot synchronize SHM pre-enqueue rendezvous: invalid state, rank %d, or timeout %lld ms.", rank,
+            static_cast<long long>(timeout.count()));
+        return false;
+    }
+
+    uint64_t volatile* barrierState = state->hostBarrierState;
+
+    uint64_t const initialState = __atomic_load_n(barrierState, __ATOMIC_ACQUIRE);
+    if ((initialState & kShmHostBarrierFailureBit) != 0)
+    {
+        LOG_ERROR("SHM pre-enqueue rendezvous is already in a failed state on rank %d.", rank);
+        return false;
+    }
+
+    uint64_t const previousState = __atomic_fetch_add(barrierState, uint64_t{1}, __ATOMIC_ACQ_REL);
+    if ((previousState & kShmHostBarrierFailureBit) != 0)
+    {
+        LOG_ERROR("SHM pre-enqueue rendezvous failed while rank %d was arriving.", rank);
+        return false;
+    }
+
+    uint64_t const ticket = previousState + 1;
+    uint64_t const round = (ticket + 1) / 2;
+    if ((ticket & uint64_t{1}) == 0)
+    {
+        return true;
+    }
+
+    uint64_t const completionTicket = ticket + 1;
+    auto const deadline = std::chrono::steady_clock::now() + timeout;
+    while (true)
+    {
+        uint64_t const observedState = __atomic_load_n(barrierState, __ATOMIC_ACQUIRE);
+        if ((observedState & kShmHostBarrierFailureBit) != 0)
+        {
+            LOG_ERROR("SHM pre-enqueue rendezvous failed while rank %d waited for round %llu.", rank,
+                static_cast<unsigned long long>(round));
+            return false;
+        }
+        if (observedState >= completionTicket)
+        {
+            return true;
+        }
+        if (std::chrono::steady_clock::now() >= deadline)
+        {
+            uint64_t expectedState = ticket;
+            uint64_t const failedState = kShmHostBarrierFailureBit | ticket;
+            if (__atomic_compare_exchange_n(
+                    barrierState, &expectedState, failedState, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            {
+                LOG_ERROR(
+                    "Timed out after %lld ms waiting for SHM peer before enqueue on rank %d "
+                    "(round %llu, barrier state %llu). The SHM state is now failed.",
+                    static_cast<long long>(timeout.count()), rank, static_cast<unsigned long long>(round),
+                    static_cast<unsigned long long>(ticket));
+                return false;
+            }
+            if ((expectedState & kShmHostBarrierFailureBit) != 0)
+            {
+                LOG_ERROR("SHM pre-enqueue rendezvous failed while rank %d waited for round %llu.", rank,
+                    static_cast<unsigned long long>(round));
+                return false;
+            }
+            if (expectedState >= completionTicket)
+            {
+                return true;
+            }
+        }
+#if defined(__aarch64__)
+        __asm__ volatile("yield");
+#elif defined(__x86_64__)
+        __asm__ volatile("pause");
+#endif
+    }
+}
 
 // ---------------------------------------------------------------------------
 // System-scope memory operations via PTX inline assembly.
@@ -457,9 +540,9 @@ __global__ void shmReduceMultiCtaFp16Kernel(half* __restrict__ output, half cons
 ShmAllReduceState* shmAllReduceInit(int32_t tpSize, int64_t maxElements, int64_t allReduceElementThreshold,
     int64_t fp8SmallPathElementThreshold, char const* sessionName)
 {
-    if (tpSize != 2)
+    if (tpSize != kShmAllReduceWorldSize)
     {
-        LOG_ERROR("ShmAllReduce: only tpSize=2 is supported, got %d", tpSize);
+        LOG_ERROR("ShmAllReduce: only tpSize=%d is supported, got %d", kShmAllReduceWorldSize, tpSize);
         return nullptr;
     }
     if (sessionName == nullptr || sessionName[0] == 0 || sessionName[0] != '/')
@@ -510,13 +593,15 @@ ShmAllReduceState* shmAllReduceInit(int32_t tpSize, int64_t maxElements, int64_t
     size_t perRankBytes = static_cast<size_t>(maxElements) * sizeof(half);
     size_t barrierBytes = 4 * sizeof(unsigned int);
     size_t tileBarBytes = static_cast<size_t>(state->maxTiles) * 2 * sizeof(unsigned int);
-    size_t hostBarrierBytes = 2 * sizeof(uint64_t); // hostBarrierArrived[2]
-    size_t totalBytes = 2 * perRankBytes            // shmBuf (rank 0) + shmBuf1 (rank 1)
-        + barrierBytes                              // barriers[4]
-        + tileBarBytes                              // tileBarriers
-        + tileBarBytes                              // readBarriers
-        + 2 * sizeof(unsigned int)                  // completionCounter[2]
-        + hostBarrierBytes;                         // hostBarrierArrived[2]
+    size_t hostBarrierBytes = sizeof(uint64_t);                // hostBarrierState
+    size_t const hostBarrierUnalignedOffset = 2 * perRankBytes // shmBuf (rank 0) + shmBuf1 (rank 1)
+        + barrierBytes                                         // barriers[4]
+        + tileBarBytes                                         // tileBarriers
+        + tileBarBytes                                         // readBarriers
+        + 2 * sizeof(unsigned int);                            // completionCounter[2]
+    size_t const hostBarrierPadding
+        = (alignof(uint64_t) - hostBarrierUnalignedOffset % alignof(uint64_t)) % alignof(uint64_t);
+    size_t const totalBytes = hostBarrierUnalignedOffset + hostBarrierPadding + hostBarrierBytes;
 
     char const* shmName = strdup(sessionName);
     if (shmName == nullptr)
@@ -621,6 +706,7 @@ ShmAllReduceState* shmAllReduceInit(int32_t tpSize, int64_t maxElements, int64_t
     cursor += tileBarBytes;
     unsigned int* compCtr = reinterpret_cast<unsigned int*>(cursor);
     cursor += 2 * sizeof(unsigned int);
+    cursor += hostBarrierPadding;
     uint64_t volatile* hostBarr = reinterpret_cast<uint64_t volatile*>(cursor);
     cursor += hostBarrierBytes;
 
@@ -645,7 +731,7 @@ ShmAllReduceState* shmAllReduceInit(int32_t tpSize, int64_t maxElements, int64_t
     }
 
     // Host barrier lives in the mmap'd region (CPU-only, no device pointer needed).
-    state->hostBarrierArrived = hostBarr;
+    state->hostBarrierState = hostBarr;
 
     // Store bookkeeping for destroy().
     state->mmapPtr = ptr;
@@ -662,7 +748,7 @@ ShmAllReduceState* shmAllReduceInit(int32_t tpSize, int64_t maxElements, int64_t
     return state;
 }
 
-void shmAllReduceExec(
+cudaError_t shmAllReduceExec(
     ShmAllReduceState* state, void const* input, void* output, int64_t numElements, int32_t rank, cudaStream_t stream)
 {
     constexpr int kBlockSize = 256;
@@ -671,39 +757,46 @@ void shmAllReduceExec(
     int const elementCount = checkedShmElementCount(numElements, "shmAllReduceExec");
     if (elementCount == 0)
     {
-        return;
+        return numElements == 0 ? cudaSuccess : cudaErrorInvalidValue;
     }
 
-    if (elementCount <= 8192)
+    if (elementCount <= kShmSingleCtaMaxElements)
     {
         // Small payload: single-kernel copy plus reduce.
         shmAllReduceKernel<<<1, kBlockSize, 0, stream>>>(static_cast<half const*>(input), static_cast<half*>(output),
             mySlot, otherSlot, state->barriers, rank, 1 - rank, elementCount);
+        return cudaGetLastError();
     }
-    else
-    {
-        // Large payload (prefill): Phase1 wait → DMA copy → Phase3 signal → multi-CTA reduce.
-        // Phase 1: wait for peer to finish reading previous slot data
-        shmWaitReadKernel<<<1, 1, 0, stream>>>(state->barriers, rank, 1 - rank);
-        // DMA copy: device → host-pinned SHM slot (safe — peer finished reading)
-        cudaMemcpyAsync(mySlot, input, static_cast<size_t>(elementCount) * sizeof(half), cudaMemcpyDefault, stream);
-        // Phase 3: signal write done + wait for peer's write
-        shmSignalWriteKernel<<<1, 1, 0, stream>>>(state->barriers, rank, 1 - rank);
 
-        // Phase 4+5: multi-CTA reduce.
-        constexpr int kMaxBlocks = 8;
-        int numHalf2 = elementCount >> 1;
-        int numBlocks = (numHalf2 + kBlockSize - 1) / kBlockSize;
-        if (numBlocks > kMaxBlocks)
-            numBlocks = kMaxBlocks;
-        if (numBlocks < 1)
-            numBlocks = 1;
-        shmReduceMultiCtaFp16Kernel<<<numBlocks, kBlockSize, 0, stream>>>(static_cast<half*>(output), mySlot, otherSlot,
-            state->barriers, &state->completionCounter[rank], rank, elementCount, numBlocks);
+    // Large payload (prefill): Phase1 wait → DMA copy → Phase3 signal → multi-CTA reduce.
+    // Phase 1: wait for peer to finish reading previous slot data.
+    shmWaitReadKernel<<<1, 1, 0, stream>>>(state->barriers, rank, 1 - rank);
+    CUDA_CHECK(cudaGetLastError());
+    // DMA copy: device → host-pinned SHM slot (safe — peer finished reading).
+    cudaError_t error
+        = cudaMemcpyAsync(mySlot, input, static_cast<size_t>(elementCount) * sizeof(half), cudaMemcpyDefault, stream);
+    if (error != cudaSuccess)
+    {
+        return error;
     }
+    // Phase 3: signal write done + wait for peer's write.
+    shmSignalWriteKernel<<<1, 1, 0, stream>>>(state->barriers, rank, 1 - rank);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Phase 4+5: multi-CTA reduce.
+    constexpr int kMaxBlocks = 8;
+    int numHalf2 = elementCount >> 1;
+    int numBlocks = (numHalf2 + kBlockSize - 1) / kBlockSize;
+    if (numBlocks > kMaxBlocks)
+        numBlocks = kMaxBlocks;
+    if (numBlocks < 1)
+        numBlocks = 1;
+    shmReduceMultiCtaFp16Kernel<<<numBlocks, kBlockSize, 0, stream>>>(static_cast<half*>(output), mySlot, otherSlot,
+        state->barriers, &state->completionCounter[rank], rank, elementCount, numBlocks);
+    return cudaGetLastError();
 }
 
-void shmAllReduceExecFused(
+cudaError_t shmAllReduceExecFused(
     ShmAllReduceState* state, void* output, int64_t numElements, int32_t rank, cudaStream_t stream)
 {
     constexpr int kBlockSize = 256;
@@ -712,19 +805,21 @@ void shmAllReduceExecFused(
     int const elementCount = checkedShmElementCount(numElements, "shmAllReduceExecFused");
     if (elementCount == 0)
     {
-        return;
+        return numElements == 0 ? cudaSuccess : cudaErrorInvalidValue;
     }
 
     shmReduceOnlyKernel<<<1, kBlockSize, 0, stream>>>(
         static_cast<half*>(output), mySlot, otherSlot, state->barriers, rank, 1 - rank, elementCount);
+    return cudaGetLastError();
 }
 
-void shmAllReduceWaitRead(ShmAllReduceState* state, int32_t rank, cudaStream_t stream)
+cudaError_t shmAllReduceWaitRead(ShmAllReduceState* state, int32_t rank, cudaStream_t stream)
 {
     shmWaitReadKernel<<<1, 1, 0, stream>>>(state->barriers, rank, 1 - rank);
+    return cudaGetLastError();
 }
 
-void shmAllReduceExecFusedFp8(
+cudaError_t shmAllReduceExecFusedFp8(
     ShmAllReduceState* state, void* output, int64_t numElements, int32_t rank, cudaStream_t stream)
 {
 #if SUPPORTS_FP8
@@ -732,13 +827,14 @@ void shmAllReduceExecFusedFp8(
     int const elementCount = checkedShmElementCount(numElements, "shmAllReduceExecFusedFp8");
     if (elementCount == 0)
     {
-        return;
+        return numElements == 0 ? cudaSuccess : cudaErrorInvalidValue;
     }
     uint8_t const* mySlotFp8 = reinterpret_cast<uint8_t const*>((rank == 0) ? state->shmBuf : state->shmBuf1);
     uint8_t const* otherSlotFp8 = reinterpret_cast<uint8_t const*>((rank == 0) ? state->shmBuf1 : state->shmBuf);
 
     shmReduceOnlyFp8Kernel<<<1, kBlockSize, 0, stream>>>(
         static_cast<half*>(output), mySlotFp8, otherSlotFp8, state->barriers, rank, 1 - rank, elementCount);
+    return cudaGetLastError();
 #else
     (void) state;
     (void) output;
@@ -746,10 +842,11 @@ void shmAllReduceExecFusedFp8(
     (void) rank;
     (void) stream;
     LOG_ERROR("ShmAllReduce: FP8 SHM AllReduce requires CUDA_VERSION >= 11080 (cuda_fp8.h unavailable).");
+    return cudaErrorNotSupported;
 #endif
 }
 
-void shmAllReduceMultiCtaFp8(
+cudaError_t shmAllReduceMultiCtaFp8(
     ShmAllReduceState* state, void* output, int64_t numElements, int32_t rank, cudaStream_t stream)
 {
 #if SUPPORTS_FP8
@@ -758,7 +855,7 @@ void shmAllReduceMultiCtaFp8(
     int const elementCount = checkedShmElementCount(numElements, "shmAllReduceMultiCtaFp8");
     if (elementCount == 0)
     {
-        return;
+        return numElements == 0 ? cudaSuccess : cudaErrorInvalidValue;
     }
     int numVec4 = (elementCount + 3) >> 2;
     int numBlocks = (numVec4 + kBlockSize - 1) / kBlockSize;
@@ -768,12 +865,14 @@ void shmAllReduceMultiCtaFp8(
         numBlocks = 1;
 
     shmBarrierKernel<<<1, kBlockSize, 0, stream>>>(state->barriers, rank, 1 - rank);
+    CUDA_CHECK(cudaGetLastError());
 
     uint8_t const* mySlotFp8 = reinterpret_cast<uint8_t const*>((rank == 0) ? state->shmBuf : state->shmBuf1);
     uint8_t const* otherSlotFp8 = reinterpret_cast<uint8_t const*>((rank == 0) ? state->shmBuf1 : state->shmBuf);
 
     shmReduceMultiCtaFp8Kernel<<<numBlocks, kBlockSize, 0, stream>>>(static_cast<half*>(output), mySlotFp8,
         otherSlotFp8, state->barriers, &state->completionCounter[rank], rank, elementCount, numBlocks);
+    return cudaGetLastError();
 #else
     (void) state;
     (void) output;
@@ -781,10 +880,11 @@ void shmAllReduceMultiCtaFp8(
     (void) rank;
     (void) stream;
     LOG_ERROR("ShmAllReduce: FP8 SHM AllReduce requires CUDA_VERSION >= 11080 (cuda_fp8.h unavailable).");
+    return cudaErrorNotSupported;
 #endif
 }
 
-void shmAllReduceMultiCtaFp16(
+cudaError_t shmAllReduceMultiCtaFp16(
     ShmAllReduceState* state, void* output, int64_t numElements, int32_t rank, cudaStream_t stream)
 {
     constexpr int kBlockSize = 256;
@@ -792,7 +892,7 @@ void shmAllReduceMultiCtaFp16(
     int const elementCount = checkedShmElementCount(numElements, "shmAllReduceMultiCtaFp16");
     if (elementCount == 0)
     {
-        return;
+        return numElements == 0 ? cudaSuccess : cudaErrorInvalidValue;
     }
     int numHalf2 = elementCount >> 1;
     int numBlocks = (numHalf2 + kBlockSize - 1) / kBlockSize;
@@ -805,9 +905,11 @@ void shmAllReduceMultiCtaFp16(
     half const* otherSlot = (rank == 0) ? state->shmBuf1 : state->shmBuf;
 
     shmBarrierKernel<<<1, kBlockSize, 0, stream>>>(state->barriers, rank, 1 - rank);
+    CUDA_CHECK(cudaGetLastError());
 
     shmReduceMultiCtaFp16Kernel<<<numBlocks, kBlockSize, 0, stream>>>(static_cast<half*>(output), mySlot, otherSlot,
         state->barriers, &state->completionCounter[rank], rank, elementCount, numBlocks);
+    return cudaGetLastError();
 }
 
 void shmAllReduceDestroy(ShmAllReduceState* state)
