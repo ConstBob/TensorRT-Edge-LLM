@@ -17,6 +17,9 @@
 
 #pragma once
 
+#include "common/allReducePath.h"
+#include "plugins/utils/pluginUtils.h"
+
 #include <NvInferRuntime.h>
 #include <cstdint>
 #include <string>
@@ -35,15 +38,57 @@ struct ShmAllReduceState;
 namespace plugins
 {
 
-//! \brief TensorRT plugin for NCCL all-reduce in tensor parallel inference
+//! \brief One device's NCCL resources used by plugin execution paths.
+struct NcclAllReducePathRegistration
+{
+    void* communicator{nullptr};
+    void* allReduceFunction{nullptr};
+};
+
+// {$edge-llm-internal-release begin}
+//! \brief One device's optional SHM resources used by plugin execution paths.
+struct ShmAllReducePathRegistration
+{
+    kernels::ShmAllReduceState* state{nullptr};
+    int32_t rank{-1};
+};
+
+// {$edge-llm-internal-release end}
+//! \brief Consistent snapshot of every registered execution path for one device.
+struct AllReducePathRegistrations
+{
+    NcclAllReducePathRegistration nccl{};
+    // {$edge-llm-internal-release begin}
+    ShmAllReducePathRegistration shm{};
+    // {$edge-llm-internal-release end}
+};
+
+//! \brief Register NCCL resources for one CUDA device.
+bool registerNcclAllReducePath(int32_t deviceId, void* ncclComm, void* ncclAllReduceFunction) noexcept;
+
+//! \brief Remove NCCL resources only if the expected communicator is still registered.
+bool unregisterNcclAllReducePath(int32_t deviceId, void* expectedNcclComm) noexcept;
+
+// {$edge-llm-internal-release begin}
+//! \brief Register optional SHM resources for one CUDA device and TP rank.
+bool registerShmAllReducePath(void* state, int32_t deviceId, int32_t rank) noexcept;
+
+//! \brief Remove SHM resources only if the expected state and rank are still registered.
+bool unregisterShmAllReducePath(void* expectedState, int32_t deviceId, int32_t rank) noexcept;
+
+// {$edge-llm-internal-release end}
+//! \brief Snapshot all available path registrations while holding the registry lock once.
+AllReducePathRegistrations snapshotAllReducePathRegistrationsForDevice(int32_t deviceId) noexcept;
+
+//! \brief TensorRT plugin for tensor-parallel all-reduce
 //!
-//! This plugin performs NCCL all-reduce (sum) on intermediate activations during
-//! TensorRT engine execution. It is inserted after row-parallel linear layers
-//! (attention output projection and MLP down projection) to combine partial
-//! results from different tensor parallel ranks.
+//! This plugin sums intermediate activations during TensorRT engine execution.
+//! It is inserted after row-parallel linear layers (attention output projection
+//! and MLP down projection) to combine partial results from tensor-parallel ranks.
 //!
 //! The plugin is a passthrough when tpSize=1 (no tensor parallelism).
-//! It uses communicator handles registered by the runtime plugin communication registry.
+//! For TP, it uses an optional accelerated execution path when supported and
+//! otherwise falls back to the required NCCL path registered by the runtime.
 class AllReducePlugin : public nvinfer1::IPluginV3,
                         public nvinfer1::IPluginV3OneCore,
                         public nvinfer1::IPluginV3OneBuild,
@@ -136,93 +181,19 @@ private:
     std::string mNamespace;
 };
 
-/*!
- * @brief Register NCCL communicator for use by AllReducePlugin instances.
- *
- * Must be called by the runtime after NCCL initialization and before any TRT
- * engine execution that contains AllReducePlugin nodes.
- * This avoids linking the plugin shared library against the runtime library.
- *
- * @param deviceId CUDA device ID this communicator is for
- * @param ncclComm NCCL communicator handle (ncclComm_t)
- * @param ncclAllReduceFunc Pointer to ncclAllReduce function
- */
-void registerNcclCommForAllReducePlugin(int deviceId, void* ncclComm, void* ncclAllReduceFunc) noexcept;
-
-// {$edge-llm-internal-release begin}
-/*!
- * @brief Register a pre-initialized SHM AllReduce state for the plugin.
- *
- * When registered, AllReducePlugin::enqueue() uses the SHM kernel instead of
- * NCCL for FP16 payloads within maxElements. Falls back to NCCL for unsupported
- * types or oversized payloads.
- *
- * @param state Pointer to ShmAllReduceState (from shmAllReduceInit)
- * @param deviceId CUDA device ID
- * @param rank TP rank for this device (0 or 1)
- */
-void registerShmAllReduceForPlugin(void* state, int deviceId, int rank) noexcept;
-
-// {$edge-llm-internal-release end}
-// {$edge-llm-internal-release begin}
-/*!
- * @brief Synchronize the SHM host-side barrier for a given rank.
- * Must be called before SHM kernel launches during CUDA graph capture
- * to keep both TP ranks' capture threads in lockstep.
- * @param state SHM state to synchronize
- * @param rank TP rank (0 or 1)
- */
-void syncShmHostBarrier(kernels::ShmAllReduceState* state, int rank) noexcept;
-
-/*!
- * @brief Synchronize the SHM host-side barrier using the currently registered state.
- * Prefer the state-explicit overload when enqueue has already snapshotted plugin resources.
- * @param rank TP rank (0 or 1)
- */
-void syncShmHostBarrier(int rank) noexcept;
-
-/*!
- * @brief Snapshot the registered SHM state and rank for one CUDA device.
- */
-void getShmAllReduceRegistrationForDevice(int deviceId, kernels::ShmAllReduceState** state, int32_t* rank) noexcept;
-
-/*!
- * @brief Get the registered SHM AllReduce state.
- * Used by FusedNvfp4GemmAllReducePlugin to share the SHM buffers.
- */
-kernels::ShmAllReduceState* getShmAllReduceState() noexcept;
-
-/*!
- * @brief Get the TP rank for a given CUDA device.
- * @return rank (0 or 1), or -1 if not registered
- */
-int32_t getShmRankForDevice(int deviceId) noexcept;
-
-// {$edge-llm-internal-release end}
-/*!
- * @brief Snapshot the NCCL communicator and AllReduce function for one CUDA device.
- */
-void getNcclRegistrationForDevice(int deviceId, void** ncclComm, void** ncclAllReduceFunc) noexcept;
-
-/*!
- * @brief Get the NCCL communicator for a given CUDA device.
- * @return ncclComm_t handle, or nullptr if not registered
- */
-void* getNcclCommForDevice(int deviceId) noexcept;
-
-/*!
- * @brief Get the registered NCCL AllReduce function pointer.
- */
-void* getNcclAllReduceFunc() noexcept;
-
 } // namespace plugins
 } // namespace trt_edgellm
 
-// Stable C ABI entry points for runtime dlsym callers. Keep these names
+// Status-returning lifecycle C ABI used by the runtime. Keep these names
 // unmangled so runtime/plugin decoupling does not depend on the C++ ABI.
-extern "C" void edgellmRegisterNcclCommForAllReducePlugin(
-    int deviceId, void* ncclComm, void* ncclAllReduceFunc) noexcept;
+extern "C" EDGELLM_PLUGIN_EXPORT bool edgellmRegisterNcclCommForAllReducePlugin(
+    int deviceId, void* ncclComm, void* ncclAllReduceFunction) noexcept;
+extern "C" EDGELLM_PLUGIN_EXPORT bool edgellmUnregisterNcclCommForAllReducePlugin(
+    int deviceId, void* ncclComm) noexcept;
 
 // {$edge-llm-internal-release begin}
-extern "C" void edgellmRegisterShmAllReduceForPlugin(void* state, int deviceId, int rank) noexcept;
+extern "C" EDGELLM_PLUGIN_EXPORT bool edgellmRegisterShmAllReduceForPlugin(
+    void* state, int deviceId, int rank) noexcept;
+extern "C" EDGELLM_PLUGIN_EXPORT bool edgellmUnregisterShmAllReduceForPlugin(
+    void* state, int deviceId, int rank) noexcept;
 // {$edge-llm-internal-release end}

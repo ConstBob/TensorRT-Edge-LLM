@@ -292,20 +292,17 @@ def _get_has_value_norm(llm_dict: Dict[str, Any], model_type: str) -> bool:
 
 @dataclass
 class Mapping:
-    """Parallel-execution placement (tensor/pipeline/expert ranks).
+    """Tensor-parallel placement for one exported or loaded rank.
 
-    Single source of truth for "which rank am I, out of how many" across
-    the loader and exporter. Pipeline / expert fields are reserved for
-    future use; only ``world_size``, ``tp_size``, and ``tp_rank`` are
-    consumed today.
+    ``tp_size`` / ``tp_rank`` are the only supported model-sharding
+    coordinates in the current Edge-LLM multi-device flow. Future CP/EP/PP/DP
+    work should add its own mapping fields together with matching export,
+    runtime, and validation support.
     """
     world_size: int = 1
+    rank: int = 0
     tp_size: int = 1
     tp_rank: int = 0
-    pp_size: int = 1
-    pp_rank: int = 0
-    ep_size: int = 1
-    ep_rank: int = 0
 
 
 @dataclass
@@ -824,7 +821,10 @@ class ModelConfig:
                     f"TP world={world}: {name}={v} is not divisible by {world}"
                 )
         c = copy.deepcopy(self)
-        c.mapping = Mapping(world_size=world, tp_size=world, tp_rank=rank)
+        c.mapping = Mapping(world_size=world,
+                            rank=rank,
+                            tp_size=world,
+                            tp_rank=rank)
         c.num_attention_heads //= world
         c.num_key_value_heads //= world
         c.intermediate_size //= world

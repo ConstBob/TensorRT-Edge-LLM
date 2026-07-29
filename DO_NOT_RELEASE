@@ -21,9 +21,10 @@ scripts/README.md
 scripts/check_oss_release_sanitizer.py
 scripts/strip_internal_release.py
 
-# Internal multi-rank communication implementation and validation.
+# Internal SHM/SuperThor implementation and validation.
 cpp/kernels/multiDeviceKernels/shmAllReduce.cu
 cpp/kernels/multiDeviceKernels/shmAllReduce.h
+cpp/runtime/multiDevice/backends/shm/
 unittests/shmAllReduceTests.cu
 
 # Local/generated artifacts that must not leak into release staging.

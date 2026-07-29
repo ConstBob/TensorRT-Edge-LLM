@@ -38,8 +38,26 @@ def _repo_root() -> Path:
     return Path(result.stdout.strip()).resolve()
 
 
-def _git_ls_files(repo_root: Path) -> list[str]:
-    result = subprocess.run(["git", "ls-files", "-z"],
+def _require_initialized_submodules(repo_root: Path) -> None:
+    result = _run(["git", "submodule", "status", "--recursive"], cwd=repo_root)
+    invalid = [
+        line for line in result.stdout.splitlines()
+        if line and not line.startswith(" ")
+    ]
+    if invalid:
+        details = "\n".join(invalid)
+        raise RuntimeError(
+            "Submodules must be initialized at their pinned revisions before "
+            f"staging the OSS tree:\n{details}")
+
+
+def _git_ls_files(repo_root: Path, include_submodules: bool) -> list[str]:
+    args = ["git", "ls-files"]
+    if include_submodules:
+        _require_initialized_submodules(repo_root)
+        args.append("--recurse-submodules")
+    args.append("-z")
+    result = subprocess.run(args,
                             cwd=repo_root,
                             check=True,
                             stdout=subprocess.PIPE)
@@ -48,16 +66,18 @@ def _git_ls_files(repo_root: Path) -> list[str]:
 
 def _copy_file(src: Path, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
+    shutil.copy2(src, dst, follow_symlinks=False)
 
 
-def _copy_tracked_worktree(repo_root: Path, export_root: Path) -> None:
-    for rel_path in _git_ls_files(repo_root):
+def _copy_tracked_worktree(repo_root: Path, export_root: Path,
+                           include_submodules: bool) -> None:
+    for rel_path in _git_ls_files(repo_root, include_submodules):
         src = repo_root / rel_path
         if src.is_file() or src.is_symlink():
             _copy_file(src, export_root / rel_path)
 
-    # During local MR development these files may be untracked before commit.
+    # Keep local validation useful while release-policy changes are being
+    # developed before their first commit.
     for rel_path in [
             "oss_release_manifest.json",
             "scripts/check_oss_release_sanitizer.py",
@@ -69,11 +89,11 @@ def _copy_tracked_worktree(repo_root: Path, export_root: Path) -> None:
             _copy_file(src, export_root / rel_path)
 
 
-def check_oss_release_sanitizer(repo_root: Path,
-                                keep_temp: bool) -> Path | None:
+def check_oss_release_sanitizer(repo_root: Path, keep_temp: bool,
+                                include_submodules: bool) -> Path | None:
     temp_dir = Path(tempfile.mkdtemp(prefix="edgellm-oss-release-check."))
     try:
-        _copy_tracked_worktree(repo_root, temp_dir)
+        _copy_tracked_worktree(repo_root, temp_dir, include_submodules)
         subprocess.run([
             sys.executable,
             str(repo_root / "scripts/strip_internal_release.py"),
@@ -105,9 +125,14 @@ def main() -> None:
         "--keep-temp",
         action="store_true",
         help="Keep the temporary sanitized tree for inspection.")
+    parser.add_argument(
+        "--include-submodules",
+        action="store_true",
+        help="Include initialized submodule contents in the sanitized tree.")
     args = parser.parse_args()
 
-    temp_dir = check_oss_release_sanitizer(_repo_root(), args.keep_temp)
+    temp_dir = check_oss_release_sanitizer(_repo_root(), args.keep_temp,
+                                           args.include_submodules)
     if temp_dir is not None:
         print(f"OSS release sanitizer check passed: {temp_dir}")
     else:
