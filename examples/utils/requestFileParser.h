@@ -48,6 +48,9 @@ namespace exampleUtils
  *     "apply_chat_template": bool,            // optional, default true
  *     "add_generation_prompt": bool,          // optional, default true
  *     "enable_thinking": bool,                // optional, default false
+ *     "context_cache_lookup_policy": str,     // optional: "use_cache" (default) or "bypass"
+ *     "context_cache_commit_policy": str,     // optional: "including_generated_tokens" (default) or
+ *                                              //           "prefill_state_only"
  *     "available_lora_weights": {name: path}, // optional
  *     "requests": [
  *       {

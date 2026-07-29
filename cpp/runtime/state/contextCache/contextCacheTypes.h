@@ -99,18 +99,6 @@ struct ResourceDemand
     }
 };
 
-enum class CommitPolicy : uint8_t
-{
-    kIncludingGeneratedTokens,
-    kPrefillStateOnly,
-};
-
-enum class PublicationPoint : uint8_t
-{
-    kPrefillEnd,
-    kDecodeEnd,
-};
-
 } // namespace rt
 } // namespace trt_edgellm
 

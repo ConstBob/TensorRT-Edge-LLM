@@ -502,6 +502,38 @@ TEST(HybridCacheManagerTests, CompactBatchSharedLengthsCarriesPerSlotValues)
     EXPECT_EQ(lens[1], 14);
 }
 
+TEST(HybridCacheManagerTests, CompactBatchSlotStateLeavesGlobalKVPagesInPlace)
+{
+    cudaStream_t stream{nullptr};
+    int32_t const maxBatch = 2;
+    int32_t const maxSeqLen = 32;
+
+    rt::HybridCacheManager::Config cfg{};
+    cfg.layerTypes.assign(1, rt::HybridCacheManager::LayerType::kAttention);
+    cfg.kvConfig = makeUniformKVConfig(1, maxBatch, maxSeqLen, 2, 64);
+    cfg.mambaConfig = makeMambaConfig(0, maxBatch);
+    cfg.maxBatchSize = maxBatch;
+    rt::HybridCacheManager mgr(cfg, stream);
+
+    fillSlotTokenRangeNhd(mgr, 0, 0, 0, maxSeqLen, 10.0F);
+    fillSlotTokenRangeNhd(mgr, 0, 1, 0, maxSeqLen, 20.0F);
+    std::vector<int32_t> hostLens{5, 7};
+    rt::Tensor reuseLens({maxBatch}, rt::DeviceType::kCPU, DataType::kINT32);
+    std::memcpy(reuseLens.rawPointer(), hostLens.data(), hostLens.size() * sizeof(int32_t));
+    mgr.resetForNewSequences(reuseLens, stream);
+
+    auto mapping = uploadMapping({-1, 0});
+    mgr.compactBatchSlotState(mapping, maxBatch, /*newBatch=*/1, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    expectSlotTokenRangeEqNhd(mgr, 0, 0, 0, maxSeqLen, 10.0F, "global page row 0");
+    expectSlotTokenRangeEqNhd(mgr, 0, 1, 0, maxSeqLen, 20.0F, "global page row 1");
+    mgr.setActiveBatchSize(1);
+    auto const lens = copyDeviceToHost<int32_t>(mgr.getKVCacheLengths());
+    ASSERT_EQ(lens.size(), 1U);
+    EXPECT_EQ(lens.front(), 7);
+}
+
 TEST(HybridCacheManagerTests, CompactBatchHeterogeneousHeadDim)
 {
     cudaStream_t stream{nullptr};
@@ -714,6 +746,74 @@ TEST(HybridCacheManagerTests, CaptureRestoreRoundTripUniform)
             }
         }
     }
+}
+
+TEST(HybridCacheManagerTests, CaptureRestoreWithExtraRetainedPages)
+{
+    cudaStream_t stream{nullptr};
+    int32_t const maxBatch = 2;
+    int32_t const maxSeq = 32;
+    int32_t const capturedSeq = 16;
+    int64_t const computedMinimumActivePages = rt::computeMinimumKvPoolPages(maxBatch, maxSeq);
+    ASSERT_LE(computedMinimumActivePages, rt::kMAX_KV_POOL_PAGES);
+    int32_t const minimumActivePages = static_cast<int32_t>(computedMinimumActivePages);
+
+    rt::HybridCacheManager::Config cfg{};
+    cfg.layerTypes.assign(1, rt::HybridCacheManager::LayerType::kAttention);
+    cfg.kvConfig = makeUniformKVConfig(/*numLayers=*/1, maxBatch, maxSeq, /*numKVHeads=*/2, /*headDim=*/64);
+    cfg.kvConfig.numPages = minimumActivePages + 3;
+    cfg.mambaConfig = makeMambaConfig(/*numLayers=*/0, maxBatch);
+    cfg.maxBatchSize = maxBatch;
+
+    rt::HybridCacheManager mgr(cfg, stream);
+    int32_t const captureSlot = 1;
+    fillSlotNhd(mgr, /*absLayer=*/0, captureSlot, 7.0F);
+
+    auto const saved = mgr.captureKVCache(captureSlot, capturedSeq, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    fillSlotNhd(mgr, /*absLayer=*/0, captureSlot, 0.0F);
+    mgr.restoreKVCache(saved, captureSlot, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    expectSlotTokenRangeEqNhd(mgr, /*absLayer=*/0, captureSlot, /*startTok=*/0, capturedSeq, 7.0F,
+        "capture/restore with extra retained pages");
+}
+
+TEST(HybridCacheManagerTests, CompactBatchWithExtraRetainedPagesUsesPhysicalVHalfOffset)
+{
+    cudaStream_t stream{nullptr};
+    int32_t const maxBatch = 3;
+    int32_t const oldBatch = 3;
+    int32_t const newBatch = 2;
+    int32_t const maxSeq = 32;
+    int64_t const computedMinimumActivePages = rt::computeMinimumKvPoolPages(maxBatch, maxSeq);
+    ASSERT_LE(computedMinimumActivePages, rt::kMAX_KV_POOL_PAGES);
+    int32_t const minimumActivePages = static_cast<int32_t>(computedMinimumActivePages);
+
+    rt::HybridCacheManager::Config cfg{};
+    cfg.layerTypes.assign(1, rt::HybridCacheManager::LayerType::kAttention);
+    cfg.kvConfig = makeUniformKVConfig(/*numLayers=*/1, maxBatch, maxSeq, /*numKVHeads=*/2, /*headDim=*/64);
+    cfg.kvConfig.numPages = minimumActivePages + 4;
+    cfg.mambaConfig = makeMambaConfig(/*numLayers=*/0, maxBatch);
+    cfg.maxBatchSize = maxBatch;
+
+    rt::HybridCacheManager mgr(cfg, stream);
+    fillSlotNhd(mgr, /*absLayer=*/0, /*slot=*/0, 10.0F);
+    fillSlotNhd(mgr, /*absLayer=*/0, /*slot=*/1, 20.0F);
+    fillSlotNhd(mgr, /*absLayer=*/0, /*slot=*/2, 30.0F);
+    std::vector<int32_t> const hostLengths(oldBatch, maxSeq);
+    rt::Tensor lengths({oldBatch}, rt::DeviceType::kCPU, DataType::kINT32);
+    std::memcpy(lengths.rawPointer(), hostLengths.data(), hostLengths.size() * sizeof(int32_t));
+    mgr.resetForNewSequences(lengths, stream);
+
+    auto const mapping = uploadMapping({-1, 0, 1});
+    mgr.compactBatch(mapping, oldBatch, newBatch, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    expectSlotTokenRangeEqNhd(
+        mgr, /*absLayer=*/0, /*slot=*/0, /*startTok=*/0, maxSeq, 20.0F, "compact slot 0 with extra retained pages");
+    expectSlotTokenRangeEqNhd(
+        mgr, /*absLayer=*/0, /*slot=*/1, /*startTok=*/0, maxSeq, 30.0F, "compact slot 1 with extra retained pages");
 }
 
 // --- Parametrized headDim coverage -----------------------------------------

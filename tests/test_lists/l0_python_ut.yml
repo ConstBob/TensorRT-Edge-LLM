@@ -233,3 +233,10 @@ tests:
   - tests/python-unittests/test_experimental_server_engine_dir_routing.py::test_init_from_engine_spec_decode_missing_draft_engine
   - tests/python-unittests/test_experimental_server_engine_dir_routing.py::test_init_from_engine_vanilla_llm_still_works
   - tests/python-unittests/test_experimental_server_engine_dir_routing.py::test_init_from_engine_unknown_dir_raises
+
+  # Context-reuse pipeline configuration tests
+  - tests/python-unittests/test_pipeline_context_reuse.py::test_context_reuse_build_and_inference_commands_share_engine
+  - tests/python-unittests/test_pipeline_context_reuse.py::test_context_reuse_snapshot_budgets_require_enable_token
+  - tests/python-unittests/test_pipeline_context_reuse.py::test_context_reuse_profile_requires_positive_reused_tokens
+  - tests/python-unittests/test_pipeline_context_reuse.py::test_context_reuse_fixture_has_strict_prefix_seed
+  - tests/python-unittests/test_pipeline_context_reuse.py::test_context_reuse_cold_and_hit_outputs_are_token_identical

@@ -75,8 +75,7 @@ void allocateZeroBuffer(SharedResources& res, int64_t bytes)
     CUDA_CHECK(cudaMemset(res.zeroBuffer.rawPointer(), 0, res.zeroBuffer.getMemoryCapacity()));
 }
 
-//! Build a static-identity page table sized from `kv` (reuse-off: fully static — see
-//! `SharedResources::kvPageTables`).
+//! Build the initially identity-mapped page table sized from `kv`.
 std::unique_ptr<KVPageTable> makeIdentityPageTable(KVCacheManager const& kv, cudaStream_t stream)
 {
     auto table
@@ -100,7 +99,7 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
         /*.maxSequenceLength=*/cfg.maxKVCacheCapacity,
         /*.layerConfigs=*/cfg.kvLayerConfigs,
         /*.kvCacheType=*/cfg.kvCacheDtype,
-        /*.numPages=*/rt::computeKvPoolFloorPages(cfg.maxSupportedBatchSize, cfg.maxKVCacheCapacity),
+        /*.numPages=*/cfg.kvPoolPages,
     };
     rt::MambaCacheManager::Config mambaCfg{
         /*.numRecurrentLayers=*/cfg.numLinearAttnLayers,
@@ -206,8 +205,7 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.maxSequenceLength=*/bundle.base.maxKVCacheCapacity,
             /*.layerConfigs=*/bundle.base.kvLayerConfigs,
             /*.kvCacheType=*/bundle.base.kvCacheDtype,
-            /*.numPages=*/
-            rt::computeKvPoolFloorPages(bundle.base.maxSupportedBatchSize, bundle.base.maxKVCacheCapacity),
+            /*.numPages=*/bundle.base.kvPoolPages,
         };
         rt::MambaCacheManager::Config mambaCfg{
             /*.numRecurrentLayers=*/bundle.base.numLinearAttnLayers,
@@ -247,8 +245,7 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.maxSequenceLength=*/bundle.draft->maxKVCacheCapacity,
             /*.layerConfigs=*/bundle.draft->kvLayerConfigs,
             /*.kvCacheType=*/bundle.draft->kvCacheDtype,
-            /*.numPages=*/
-            rt::computeKvPoolFloorPages(bundle.draft->maxSupportedBatchSize, bundle.draft->maxKVCacheCapacity),
+            /*.numPages=*/bundle.draft->kvPoolPages,
         };
         rt::MambaCacheManager::Config mambaCfg{
             /*.numRecurrentLayers=*/0,

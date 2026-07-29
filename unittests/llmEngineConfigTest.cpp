@@ -17,12 +17,15 @@
 
 #include "runtime/config/llmEngineConfig.h"
 
+#include "common/pagedKvTypes.h"
 #include "testUtils.h"
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
+
+#include <limits>
 
 using namespace trt_edgellm;
 using namespace trt_edgellm::rt;
@@ -48,6 +51,7 @@ Json makeMinimalConfig()
     bc["max_batch_size"] = 2;
     bc["max_input_len"] = 128;
     bc["max_kv_cache_capacity"] = 256;
+    bc["max_kv_pool_pages"] = 4;
     bc["max_lora_rank"] = 0;
     bc["spec_base"] = false;
     config["builder_config"] = bc;
@@ -119,11 +123,83 @@ TEST_F(LLMEngineConfigTest, ParseMinimalConfig)
     EXPECT_EQ(cfg.maxSupportedBatchSize, 2);
     EXPECT_EQ(cfg.maxSupportedInputLength, 128);
     EXPECT_EQ(cfg.maxKVCacheCapacity, 256);
+    EXPECT_EQ(cfg.kvPoolPages, 4);
     EXPECT_EQ(cfg.maxSupportedLoraRank, 0);
     EXPECT_FALSE(cfg.isSpecDecodeBase);
     EXPECT_EQ(cfg.maxVerifyTreeSize, 0);
     EXPECT_EQ(cfg.maxDraftTreeSize, 0);
     EXPECT_EQ(cfg.kvCacheDtype, nvinfer1::DataType::kHALF);
+}
+
+TEST_F(LLMEngineConfigTest, ParseEagleBaseConditioningMetadata)
+{
+    Json json = makeMinimalConfig();
+    json["spec_decode_type"] = "eagle3";
+    json["engine_role"] = "base";
+    json["eagle_hidden_state_layers"] = {0, 5, 11};
+    json["builder_config"]["spec_base"] = true;
+    json["builder_config"]["max_verify_tree_size"] = 8;
+    auto const path = writeJsonToTempFile(json);
+
+    LLMEngineConfig const config = parseEngineConfig(path);
+    EXPECT_EQ(config.specTargetLayerIds, std::vector<int32_t>({0, 5, 11}));
+}
+
+TEST_F(LLMEngineConfigTest, MissingKVPoolPagesThrows)
+{
+    Json json = makeMinimalConfig();
+    json["builder_config"].erase("max_kv_pool_pages");
+    auto const path = writeJsonToTempFile(json);
+
+    EXPECT_THROW(parseEngineConfig(path), std::runtime_error);
+}
+
+TEST_F(LLMEngineConfigTest, KVPoolPagesUsesSerializedValue)
+{
+    Json json = makeMinimalConfig();
+    json["builder_config"]["max_kv_pool_pages"] = 9;
+    auto const path = writeJsonToTempFile(json);
+
+    EXPECT_EQ(parseEngineConfig(path).kvPoolPages, 9);
+}
+
+TEST_F(LLMEngineConfigTest, KVPoolPagesBelowMinimumActivePagesAreRejected)
+{
+    Json json = makeMinimalConfig();
+    json["builder_config"]["max_kv_pool_pages"] = 3;
+    auto const path = writeJsonToTempFile(json);
+
+    EXPECT_THROW(parseEngineConfig(path), std::runtime_error);
+}
+
+TEST_F(LLMEngineConfigTest, KVPoolPagesRejectDerivedVIdOverflow)
+{
+    Json json = makeMinimalConfig();
+    json["builder_config"]["max_kv_pool_pages"] = kMAX_KV_POOL_PAGES + 1;
+    auto const path = writeJsonToTempFile(json);
+
+    EXPECT_THROW(parseEngineConfig(path), std::runtime_error);
+}
+
+TEST_F(LLMEngineConfigTest, MinimumKVPoolPagesRejectNarrowingOverflow)
+{
+    Json json = makeMinimalConfig();
+    json["builder_config"]["max_batch_size"] = std::numeric_limits<int32_t>::max();
+    json["builder_config"]["max_input_len"] = kMAX_KV_CACHE_CAPACITY;
+    json["builder_config"]["max_kv_cache_capacity"] = kMAX_KV_CACHE_CAPACITY;
+    auto const path = writeJsonToTempFile(json);
+
+    EXPECT_THROW(parseEngineConfig(path), std::runtime_error);
+}
+
+TEST_F(LLMEngineConfigTest, KVCapacityRejectsPageAlignmentOverflow)
+{
+    Json json = makeMinimalConfig();
+    json["builder_config"]["max_input_len"] = static_cast<int64_t>(kMAX_KV_CACHE_CAPACITY) + 1;
+    json["builder_config"]["max_kv_cache_capacity"] = static_cast<int64_t>(kMAX_KV_CACHE_CAPACITY) + 1;
+    auto const path = writeJsonToTempFile(json);
+
+    EXPECT_THROW(parseEngineConfig(path), std::runtime_error);
 }
 
 TEST_F(LLMEngineConfigTest, ReducedVocabSize)
@@ -431,7 +507,8 @@ TEST_F(LLMEngineConfigTest, ParsesCanonicalLayerTypes)
         "builder_config": {
             "max_batch_size": 1,
             "max_input_len": 64,
-            "max_kv_cache_capacity": 128
+            "max_kv_cache_capacity": 128,
+            "max_kv_pool_pages": 1
         }
     })");
 
@@ -460,7 +537,8 @@ TEST_F(LLMEngineConfigTest, FallbackBuildsLayerTypesFromScalarsPureAttention)
         "builder_config": {
             "max_batch_size": 1,
             "max_input_len": 64,
-            "max_kv_cache_capacity": 128
+            "max_kv_cache_capacity": 128,
+            "max_kv_pool_pages": 1
         }
     })");
 
@@ -498,7 +576,8 @@ TEST_F(LLMEngineConfigTest, FallbackHybridBuildsAttentionFirstThenMamba)
         "builder_config": {
             "max_batch_size": 1,
             "max_input_len": 64,
-            "max_kv_cache_capacity": 128
+            "max_kv_cache_capacity": 128,
+            "max_kv_pool_pages": 1
         }
     })");
 
@@ -790,4 +869,16 @@ TEST_F(LLMEngineConfigTest, ParseDraftEngineConfigPartialRotaryFactor)
     LLMEngineConfig cfg = parseDraftEngineConfig(path);
     EXPECT_EQ(cfg.headDim, 256);
     EXPECT_EQ(cfg.rotaryDim, 64); // 256 * 0.25
+}
+
+TEST_F(LLMEngineConfigTest, ParseDraftEngineConfigDoesNotRequireEagleTargetLayerIds)
+{
+    Json json = makeMinimalDraftConfig();
+    json["spec_decode_type"] = "eagle3";
+    json["base_model_hidden_size"] = 2304;
+    json["eagle3_config"] = {{"target_layer_ids", Json::array()}, {"num_target_layers", 3}};
+    auto const path = writeJsonToTempFile(json);
+
+    auto const config = parseDraftEngineConfig(path);
+    EXPECT_TRUE(config.specTargetLayerIds.empty());
 }

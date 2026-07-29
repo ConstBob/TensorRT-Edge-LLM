@@ -32,18 +32,17 @@ namespace rt
 
 //! Page count for paged-pool KV-cache bindings
 //! [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim]. A single fixed value per engine
-//! (not resized per inference step): the active-capacity floor, matching the builder profile
-//! and KVCacheManager::numPages() (see sharedResources.cpp).
+//! (not resized per inference step), matching the serialized builder profile and
+//! KVCacheManager::numPages() (see sharedResources.cpp).
 constexpr int32_t kTokensPerPage = rt::kTOKENS_PER_PAGE;
 
 static int32_t computeNumPages(LLMEngineConfig const& cfg)
 {
-    return rt::computeKvPoolFloorPages(cfg.maxSupportedBatchSize, cfg.maxKVCacheCapacity);
-}
-
-static int32_t computeFloorNumPages(int32_t maxBatchSize, int32_t maxKVCacheCapacity)
-{
-    return rt::computeKvPoolFloorPages(maxBatchSize, maxKVCacheCapacity);
+    int64_t const minimumActivePages = rt::computeMinimumKvPoolPages(cfg.maxSupportedBatchSize, cfg.maxKVCacheCapacity);
+    ELLM_CHECK(cfg.kvPoolPages >= minimumActivePages && cfg.kvPoolPages <= rt::kMAX_KV_POOL_PAGES,
+        "KV pool page count (" + std::to_string(cfg.kvPoolPages) + ") is outside [" + std::to_string(minimumActivePages)
+            + ", " + std::to_string(rt::kMAX_KV_POOL_PAGES) + "].");
+    return cfg.kvPoolPages;
 }
 
 void addRopeTensorSpecs(TensorRegistry& reg, LLMEngineConfig const& cfg)
@@ -459,14 +458,11 @@ TensorRegistry buildRegistryForDFlashDraft(DeploymentConfig const& bundle)
                 continue;
             }
             auto const& lc = cfg.kvLayerConfigs[localAttnIdx];
-            // DFlash's own combined draft cache: unified on the paged-pool contract shared with
-            // the main model and EAGLE/MTP drafts — [2, numPages, kTOKENS_PER_PAGE, numKVHeads,
-            // headDim] — but NOT extended by the pool-capacity profile range:
-            // DFlashTargetKVCacheUpdatePlugin recovers maxBatch/cap at enqueue time by dividing
-            // numPages by the builder-configured pages_per_slot attribute, so this binding always
-            // stays at the active-capacity floor (see computeFloorNumPages). This cache still has
-            // no page table of its own (identity-contiguous, reuse opt-out).
-            int32_t const numPages = computeFloorNumPages(cfg.maxSupportedBatchSize, cfg.maxKVCacheCapacity);
+            // DFlash's own combined draft cache uses the same paged-pool contract and the exact
+            // serialized engine page count. Deployment validation separately requires this mode
+            // to use only its minimum active pages because its update plugin recovers maxBatch/cap by
+            // dividing numPages by the builder-configured pages_per_slot.
+            int32_t const numPages = cfg.kvPoolPages;
             std::vector<ShapeDim> const shape{
                 fixed(2), fixed(numPages), fixed(kTokensPerPage), fixed(lc.numKVHeads), fixed(lc.headDim)};
             auto addKVCacheTensor = [&](char const* tmpl, TensorIO io) {
@@ -603,10 +599,10 @@ TensorRegistry buildRegistryForDSparkDraft(DeploymentConfig const& bundle)
                 continue;
             }
             auto const& lc = cfg.kvLayerConfigs[localAttnIdx];
-            // DSpark's own combined draft cache uses the same paged-pool contract as DFlash:
-            // [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim]. The update plugin maps
-            // this fixed page count back to (maxBatch, cap) using pages_per_slot from build time.
-            int32_t const numPages = computeFloorNumPages(cfg.maxSupportedBatchSize, cfg.maxKVCacheCapacity);
+            // DSpark uses the exact serialized engine page count. Deployment validation separately
+            // requires the minimum active pages because the update plugin derives (maxBatch, cap) from
+            // this count and the build-time pages_per_slot.
+            int32_t const numPages = cfg.kvPoolPages;
             std::vector<ShapeDim> const shape{
                 fixed(2), fixed(numPages), fixed(kTokensPerPage), fixed(lc.numKVHeads), fixed(lc.headDim)};
             auto addKVCacheTensor = [&](char const* tmpl, TensorIO io) {

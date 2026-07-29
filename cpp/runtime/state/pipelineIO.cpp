@@ -253,8 +253,8 @@ static void buildTensorMapImpl(TensorMap& map, PipelineIO& io, SharedResources& 
     // per-step rebind.
     map.set(binding_names::kKVCacheStartIndex, cacheMgr.getKVCacheLengths());
 
-    // kv_page_table: static identity mapping (cross-request reuse is off), one table per cache
-    // manager, uploaded once at SharedResources construction — see SharedResources::kvPageTables.
+    // kv_page_table: one stable-address table per cache manager. It remains identity-mapped on the legacy path and is
+    // updated in place by the context-cache coordinator.
     map.set(binding_names::kKVPageTable, res.kvPageTables[kvCacheIndex]->kernelView());
 
     // Deepstack: initial bind is the shared zero buffer (sized large enough

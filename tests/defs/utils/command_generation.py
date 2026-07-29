@@ -49,6 +49,22 @@ def _uses_spec_decode(config: TestConfig) -> bool:
                 or config.is_dspark)
 
 
+def _append_context_reuse_options(cmd: List[str], config: TestConfig) -> None:
+    if not config.context_reuse:
+        return
+
+    cmd.extend([
+        "--enableContextReuse",
+        f"--profileOutputFile={config.get_profile_json_file()}",
+    ])
+    if config.context_cache_recurrent_snapshot_pool_bytes is not None:
+        cmd.append("--contextCacheRecurrentSnapshotPoolBytes="
+                   f"{config.context_cache_recurrent_snapshot_pool_bytes}")
+    if config.context_cache_partial_kv_snapshot_pool_bytes is not None:
+        cmd.append("--contextCachePartialKVSnapshotPoolBytes="
+                   f"{config.context_cache_partial_kv_snapshot_pool_bytes}")
+
+
 def _tensorrt_edgellm_module_shell(module: str, args: List[str]) -> str:
     edgellm_root = get_tensorrt_edgellm_root()
     if not edgellm_root:
@@ -414,6 +430,9 @@ def generate_build_commands(
             f"--maxBatchSize={config.max_batch_size}"
         ])
 
+        if config.max_kv_pool_pages is not None:
+            cmd.append(f"--maxKVPoolPages={config.max_kv_pool_pages}")
+
         if _uses_spec_decode(config):
             cmd.append("--specBase")
             cmd.append(f"--maxVerifyTreeSize={config.max_verify_tree_size}")
@@ -670,6 +689,7 @@ def generate_inference_commands(
         f"--inputFile={config.get_test_case_file()}",
         f"--outputFile={config.get_output_json_file()}", f"--dumpProfile"
     ])
+    _append_context_reuse_options(cmd, config)
 
     # Add speculative decoding parameters.
     if _uses_spec_decode(config):
@@ -746,6 +766,7 @@ def generate_e2e_bench_commands(
         f"--inputFile={config.get_test_case_file()}",
         f"--outputFile={config.get_output_json_file()}", f"--dumpProfile"
     ])
+    _append_context_reuse_options(cmd, config)
 
     # Add speculative decoding parameters.
     if _uses_spec_decode(config):

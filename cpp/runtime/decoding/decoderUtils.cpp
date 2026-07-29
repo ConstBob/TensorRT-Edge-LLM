@@ -33,7 +33,8 @@ namespace rt
 {
 namespace decoder_utils
 {
-std::unique_ptr<EngineExecutor> loadDraftEngine(std::filesystem::path const& engineDir, DeploymentConfig& deployment)
+std::unique_ptr<EngineExecutor> loadDraftEngine(
+    std::filesystem::path const& engineDir, DeploymentConfig const& deployment)
 {
     std::filesystem::path const draftEnginePath = engineDir / "spec_draft.engine";
     std::unique_ptr<EngineExecutor> draftExecutor;

@@ -819,6 +819,11 @@ _update_ssm_state_schema = OpSchema(
         OpSchema.FormalParameter(name="context_lengths",
                                  description="Context lengths per batch",
                                  type_str="T_CL"),
+        OpSchema.FormalParameter(
+            name="state_start_index",
+            description=
+            "[0] initial-prefill sentinel or [batch] restored-state marker",
+            type_str="T_CL"),
     ],
     outputs=[
         OpSchema.FormalParameter(name="output",

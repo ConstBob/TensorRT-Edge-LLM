@@ -584,6 +584,12 @@ class TestConfig:
 
     max_kv_cache_capacity: Optional[int] = None
 
+    # Context-reuse options
+    max_kv_pool_pages: Optional[int] = None
+    context_reuse: Optional[bool] = None
+    context_cache_recurrent_snapshot_pool_bytes: Optional[int] = None
+    context_cache_partial_kv_snapshot_pool_bytes: Optional[int] = None
+
     # Inference parameters
     test_case: Optional[str] = None
 
@@ -795,6 +801,11 @@ class TestConfig:
                           TaskType.INFERENCE
                       }, {ModelType.VLA},
                       is_required=False),
+        ParameterSpec("max_kv_pool_pages",
+                      "mxkvp",
+                      {TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE},
+                      {ModelType.LLM},
+                      is_required=False),
         ParameterSpec("audio_precision",
                       "aud", {
                           TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
@@ -820,6 +831,18 @@ class TestConfig:
                           ModelType.LLM, ModelType.VLM, ModelType.TTS,
                           ModelType.ASR, ModelType.OMNI, ModelType.VLA
                       },
+                      is_required=False),
+        ParameterSpec("context_reuse",
+                      "ctxreuse", {TaskType.E2E_BENCH, TaskType.INFERENCE},
+                      {ModelType.LLM},
+                      is_required=False),
+        ParameterSpec("context_cache_recurrent_snapshot_pool_bytes",
+                      "ccrsb", {TaskType.E2E_BENCH, TaskType.INFERENCE},
+                      {ModelType.LLM},
+                      is_required=False),
+        ParameterSpec("context_cache_partial_kv_snapshot_pool_bytes",
+                      "ccpkvsb", {TaskType.E2E_BENCH, TaskType.INFERENCE},
+                      {ModelType.LLM},
                       is_required=False),
 
         # Vocabulary reduction parameters
@@ -1052,6 +1075,8 @@ class TestConfig:
                 parsed_params['max_image_tokens_per_image'] = int(part[6:])
             elif part.startswith('mxkvc'):
                 parsed_params['max_kv_cache_capacity'] = int(part[5:])
+            elif part.startswith('mxkvp'):
+                parsed_params['max_kv_pool_pages'] = int(part[5:])
             elif part.startswith('mxlr'):
                 parsed_params['max_lora_rank'] = int(part[4:])
             # For benchmark parameters
@@ -1088,6 +1113,16 @@ class TestConfig:
                 parsed_params['eagle_draft_top_k'] = int(part[4:])
             elif part.startswith('edst'):
                 parsed_params['eagle_draft_step'] = int(part[4:])
+            elif part == 'ctxreuse':
+                parsed_params['context_reuse'] = True
+            elif part.startswith('ccrsb'):
+                parsed_params[
+                    'context_cache_recurrent_snapshot_pool_bytes'] = int(
+                        part[5:])
+            elif part.startswith('ccpkvsb'):
+                parsed_params[
+                    'context_cache_partial_kv_snapshot_pool_bytes'] = int(
+                        part[7:])
             # For vocabulary reduction parameters
             elif part.startswith('extw_'):
                 parsed_params['externalize_weights'] = part[len('extw_'):]
@@ -1313,6 +1348,20 @@ class TestConfig:
         if self.nvfp4_moe_target and self.llm_precision != "nvfp4":
             raise ValueError(
                 "nvfp4_moe_target is only valid for nvfp4 LLM precision.")
+        if self.max_kv_pool_pages is not None and self.max_kv_pool_pages <= 0:
+            raise ValueError("max_kv_pool_pages must be positive when set.")
+        snapshot_budgets = (
+            self.context_cache_recurrent_snapshot_pool_bytes,
+            self.context_cache_partial_kv_snapshot_pool_bytes,
+        )
+        if any(value is not None and value <= 0 for value in snapshot_budgets):
+            raise ValueError(
+                "Context-cache snapshot pool byte budgets must be positive when set."
+            )
+        if (any(value is not None for value in snapshot_budgets)
+                and not self.context_reuse):
+            raise ValueError(
+                "Context-cache snapshot pool budgets require ctxreuse.")
 
         # Set defaults after validation
         set_defaults()
@@ -1392,6 +1441,8 @@ class TestConfig:
                 llm_engine_id += f"-mvts{self.max_verify_tree_size}"
             if self.max_draft_tree_size is not None:
                 llm_engine_id += f"-mdts{self.max_draft_tree_size}"
+        if self.max_kv_pool_pages is not None:
+            llm_engine_id += f"-mxkvp{self.max_kv_pool_pages}"
         return llm_engine_id
 
     @staticmethod
@@ -2140,6 +2191,8 @@ class TestConfig:
             "tests/test_cases/llm_basic.json",
             "llm_lora":
             "tests/test_cases/llm_lora.json",
+            "llm_context_reuse":
+            "tests/test_cases/llm_context_reuse.json",
             "asr_basic":
             "tests/test_cases/asr_basic.json",
             "librispeech_clean_test":
@@ -2238,6 +2291,11 @@ class TestConfig:
         Always stored on host in log directory for subsequent processing.
         """
         return os.path.join(self.test_log_dir, f"{self.param_str}.json")
+
+    def get_profile_json_file(self) -> str:
+        """Get the per-configuration JSON profile output path."""
+        return os.path.join(self.test_log_dir,
+                            f"{self.param_str}_profile.json")
 
     def get_output_audio_dir(self) -> str:
         """

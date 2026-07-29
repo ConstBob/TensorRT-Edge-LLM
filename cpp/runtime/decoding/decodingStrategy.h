@@ -57,6 +57,13 @@ enum class DecodingStrategyKind : int32_t
     kBlockDiffusion,
 };
 
+//! Selects whether decoder-owned cache state is physically compacted or only its slot metadata is moved.
+enum class BatchCompactionMode : uint8_t
+{
+    kLegacyPhysicalKv,
+    kManagedPageRows,
+};
+
 struct SamplingBuffers
 {
     Tensor& workspace;
@@ -131,6 +138,21 @@ public:
     virtual bool decodeStep(DecodingInferenceContext& context) = 0;
     virtual bool captureCudaGraphs(cudaStream_t stream) = 0;
 
+    //! Initialize decoder-private generation state after base prefill. Non-speculative strategies are no-ops.
+    virtual bool initializeForGeneration(DecodingInferenceContext&)
+    {
+        return true;
+    }
+
+    //! Greatest per-slot logical prefix whose continuation state is materialized by every model in this strategy.
+    //! Physical model-state tails may extend beyond this boundary. This reports decoding progress only;
+    //! context-cache policy decides whether that prefix can be published.
+    virtual std::vector<int32_t> const& commonMaterializedStateLengths() const noexcept
+    {
+        static std::vector<int32_t> const kEMPTY;
+        return kEMPTY;
+    }
+
     virtual int64_t getRequiredContextMemorySize() const noexcept = 0;
     virtual void setContextMemory(Tensor&) = 0;
 
@@ -144,7 +166,8 @@ public:
         std::vector<tokenizer::Rank> const&, int32_t, cudaStream_t) = 0;
 
     virtual void resetForNewSequences(Tensor&, cudaStream_t) = 0;
-    virtual void onBatchEvict(std::vector<int32_t> const&, int32_t, int32_t, Tensor&, cudaStream_t) = 0;
+    virtual void onBatchEvict(std::vector<int32_t> const&, int32_t, int32_t, Tensor&, cudaStream_t, BatchCompactionMode)
+        = 0;
 };
 
 } // namespace rt

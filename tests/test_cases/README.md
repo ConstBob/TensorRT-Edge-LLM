@@ -10,6 +10,12 @@ Small JSON request sets for `llm_inference` smoke and runtime-sanity runs.
 - `llm_lora.json`
   Text-only LoRA coverage.
   Recommended engine: LLM engine built with the matching LoRA support, `maxBatchSize >= 1`, `maxInputLen >= 1024`.
+- `llm_context_reuse.json`
+  Three sequential prompts: cold `P+Q`, shorter prefix `P`, then `P+Q` again. The final request must reuse `P` and remain token-identical to the cold request.
+  Recommended engine: any context-reuse-supported text LLM, `maxBatchSize >= 1`, `maxInputLen >= 1024`,
+  and extra retained base-KV pages for cross-request reuse.
+  Hybrid engines additionally require at least one recurrent snapshot slot and, when they contain attention, at least one partial-KV snapshot slot.
+  EAGLE engines additionally require extra retained draft-KV pages and greedy sampling; this fixture sets `top_k: 1`.
 - `llm_runtime_sanity_check.json`
   Text-runtime sanity coverage for chat templating, system-prompt KV cache, `disable_spec_decode`, and same-process reuse.
   Recommended engine: vanilla or EAGLE LLM, `maxBatchSize >= 1`, `maxInputLen >= 1024`, `maxKVCacheCapacity >= 4096`.

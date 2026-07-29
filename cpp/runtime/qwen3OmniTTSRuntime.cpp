@@ -323,6 +323,7 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
     {
         mTalkerLLMConfig = rt::parseEngineConfig(talkerConfigPath);
         mTalkerExec = rt::EngineExecutor::createForLLM(talkerEnginePath, mTalkerLLMConfig);
+        rt::validateAgainstEngine(mTalkerLLMConfig, *mTalkerExec, "qwen3_omni_talker");
         std::unordered_map<std::string, std::string> emptyLoraMap;
         mTalkerSharedRes = rt::SharedResources::createForLLM(mTalkerLLMConfig, emptyLoraMap, mStream);
         mTalkerPipelineIO = std::make_unique<rt::PipelineIO>(rt::PipelineIO::createForLLM(mTalkerLLMConfig, mStream));
@@ -353,6 +354,7 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
     {
         mCodePredictorConfig = rt::parseEngineConfig(codePredictorConfigPath);
         mCodePredictorExec = rt::EngineExecutor::createForLLM(codePredictorEnginePath, mCodePredictorConfig);
+        rt::validateAgainstEngine(mCodePredictorConfig, *mCodePredictorExec, "qwen3_omni_code_predictor");
         std::unordered_map<std::string, std::string> emptyLoraMap;
         mCodePredictorSharedRes = rt::SharedResources::createForLLM(mCodePredictorConfig, emptyLoraMap, mStream);
         mCodePredictorPipelineIO
@@ -4272,13 +4274,13 @@ bool Qwen3OmniTTSRuntime::handleStreamingGeneration(LLMInferenceRuntime& thinker
                 auto& talkerKVManager = talkerCacheManager.getKVCacheManager();
                 for (int32_t i = 0; i < talkerKVManager.numLayers(); ++i)
                 {
-                    rt::Tensor& layerKV = talkerKVManager.getCombinedKVCache(i);
+                    rt::Tensor& layerKV = talkerKVManager.getCombinedKVCachePoolView(i);
                     CUDA_CHECK(cudaMemsetAsync(layerKV.rawPointer(), 0, layerKV.getMemoryCapacity(), stream));
                 }
                 auto& cpKVManager = cpCacheManager.getKVCacheManager();
                 for (int32_t i = 0; i < cpKVManager.numLayers(); ++i)
                 {
-                    rt::Tensor& layerKV = cpKVManager.getCombinedKVCache(i);
+                    rt::Tensor& layerKV = cpKVManager.getCombinedKVCachePoolView(i);
                     CUDA_CHECK(cudaMemsetAsync(layerKV.rawPointer(), 0, layerKV.getMemoryCapacity(), stream));
                 }
             }

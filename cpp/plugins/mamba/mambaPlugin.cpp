@@ -48,22 +48,23 @@ constexpr char const* kMAMBA_PLUGIN_NAME{"update_ssm_state"};
 // Input indices – matches the trt_edgellm::update_ssm_state ONNX op.
 // x, dt, B, C may carry an optional seq_len dimension (4D instead of 3D).
 // When seq_len > 1, the plugin loops over the single-step kernel.
-constexpr int32_t kIN_X_IDX{0};               // [batch, (seq_len,) nheads, dim]
-constexpr int32_t kIN_A_IDX{1};               // [nheads]
-constexpr int32_t kIN_B_IDX{2};               // [batch, (seq_len,) ngroups, dstate]
-constexpr int32_t kIN_C_IDX{3};               // [batch, (seq_len,) ngroups, dstate]
-constexpr int32_t kIN_D_IDX{4};               // [nheads]
-constexpr int32_t kIN_DT_IDX{5};              // [batch, (seq_len,) nheads]
-constexpr int32_t kIN_DT_BIAS_IDX{6};         // [nheads]
-constexpr int32_t kIN_STATE_IDX{7};           // [batch, nheads, dim, dstate]
-constexpr int32_t kIN_CONTEXT_LENGTHS_IDX{8}; // [batch]
+constexpr int32_t kIN_X_IDX{0};                 // [batch, (seq_len,) nheads, dim]
+constexpr int32_t kIN_A_IDX{1};                 // [nheads]
+constexpr int32_t kIN_B_IDX{2};                 // [batch, (seq_len,) ngroups, dstate]
+constexpr int32_t kIN_C_IDX{3};                 // [batch, (seq_len,) ngroups, dstate]
+constexpr int32_t kIN_D_IDX{4};                 // [nheads]
+constexpr int32_t kIN_DT_IDX{5};                // [batch, (seq_len,) nheads]
+constexpr int32_t kIN_DT_BIAS_IDX{6};           // [nheads]
+constexpr int32_t kIN_STATE_IDX{7};             // [batch, nheads, dim, dstate]
+constexpr int32_t kIN_CONTEXT_LENGTHS_IDX{8};   // [batch]
+constexpr int32_t kIN_STATE_START_INDEX_IDX{9}; // [0] for cold prefill, [batch] for restored state
 
 // Output indices
 constexpr int32_t kOUT_OUTPUT_IDX{0}; // [batch, (seq_len,) nheads, dim]
 constexpr int32_t kOUT_STATE_IDX{1};  // [batch, nheads, dim, dstate]
 
 // Number of inputs/outputs
-constexpr int32_t kNUM_INPUTS{9};
+constexpr int32_t kNUM_INPUTS{10};
 constexpr int32_t kNUM_OUTPUTS{2};
 
 } // namespace
@@ -167,6 +168,10 @@ bool MambaPlugin::supportsFormatCombination(
     auto const& desc = inOut[pos].desc;
     if (desc.format != TensorFormat::kLINEAR)
         return false;
+    if (pos >= nbInputs)
+    {
+        return desc.type == inOut[kIN_X_IDX].desc.type;
+    }
     switch (pos)
     {
     case kIN_X_IDX:
@@ -177,14 +182,21 @@ bool MambaPlugin::supportsFormatCombination(
     case kIN_DT_BIAS_IDX:
     case kIN_STATE_IDX: return desc.type == DataType::kHALF;
     case kIN_A_IDX: return desc.type == DataType::kFLOAT;
-    case kIN_CONTEXT_LENGTHS_IDX: return desc.type == DataType::kINT32;
-    default: return desc.type == inOut[kIN_X_IDX].desc.type;
+    case kIN_CONTEXT_LENGTHS_IDX:
+    case kIN_STATE_START_INDEX_IDX: return desc.type == DataType::kINT32;
+    default: return false;
     }
 }
 
-int32_t MambaPlugin::configurePlugin(DynamicPluginTensorDesc const* in, [[maybe_unused]] int32_t nbInputs,
+int32_t MambaPlugin::configurePlugin(DynamicPluginTensorDesc const* in, int32_t nbInputs,
     [[maybe_unused]] DynamicPluginTensorDesc const* out, [[maybe_unused]] int32_t nbOutputs) noexcept
 {
+    if (nbInputs != kNUM_INPUTS)
+    {
+        LOG_ERROR("update_ssm_state: expected %d inputs, got %d", kNUM_INPUTS, nbInputs);
+        return -1;
+    }
+
     // Derive dim/dstate/nheads/ngroups from input shapes if not provided as attributes.
     // x: [batch, (seq_len,) nheads, dim]  -> last two dims
     // B: [batch, (seq_len,) ngroups, dstate] -> last two dims
@@ -219,7 +231,7 @@ int32_t MambaPlugin::configurePlugin(DynamicPluginTensorDesc const* in, [[maybe_
     return 0;
 }
 
-size_t MambaPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, int32_t /* nbInputs */,
+size_t MambaPlugin::getWorkspaceSize([[maybe_unused]] DynamicPluginTensorDesc const* inputs, int32_t /* nbInputs */,
     DynamicPluginTensorDesc const* /* outputs */, int32_t /* nbOutputs */) const noexcept
 {
 #ifdef CUTE_DSL_SSD_ENABLED
@@ -244,6 +256,13 @@ int32_t MambaPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
     size_t const elemSize = sizeof(half);
 
     int32_t const batch = static_cast<int32_t>(xDesc.dims.d[0]);
+    if (inputDesc[kIN_STATE_START_INDEX_IDX].dims.nbDims != 1
+        || (inputDesc[kIN_STATE_START_INDEX_IDX].dims.d[0] != 0
+            && inputDesc[kIN_STATE_START_INDEX_IDX].dims.d[0] != batch))
+    {
+        LOG_ERROR("update_ssm_state: state_start_index must have shape [0] or [batch]");
+        return -1;
+    }
 
     // Determine seq_len: x is [batch, nheads, dim] (3D) or [batch, seq_len, nheads, dim] (4D)
     bool const hasSeqLen = (xDesc.dims.nbDims == 4);
@@ -329,9 +348,9 @@ int32_t MambaPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
                 ssdParams.has_D = (inputs[kIN_D_IDX] != nullptr);
                 ssdParams.has_z = false;
                 ssdParams.context_lengths = inputs[kIN_CONTEXT_LENGTHS_IDX];
-                // Fresh-prefill contract: state arrives zeroed. Chunked prefill needs a
-                // builder attribute to flip this on per-call.
-                ssdParams.has_init_states = false;
+                // [0] is the runtime's initial-prefill sentinel. A non-empty start-index binding means at least one
+                // sequence carries restored recurrent state; the init-state kernel safely handles zero-state peers.
+                ssdParams.has_init_states = inputDesc[kIN_STATE_START_INDEX_IDX].dims.d[0] > 0;
                 int const rc = runner.run(ssdParams, stream);
                 if (rc != 0)
                 {

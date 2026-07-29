@@ -58,10 +58,9 @@ public:
         int32_t maxSequenceLength{};             //!< Maximum sequence length
         std::vector<KVLayerConfig> layerConfigs; //!< Per-layer head config (size == numAttentionLayers)
         nvinfer1::DataType kvCacheType{};        //!< Storage dtype for KV cache (kHALF or kFP8)
-        //! Optional override of the pool's total page count. 0 (default) means "use the
-        //! active-capacity floor" (`maxBatchSize * ceil(maxSequenceLength / kTOKENS_PER_PAGE)`,
-        //! today's fixed behavior). A non-zero value must be >= that floor; the extra pages are
-        //! allocated as unused retention headroom (see numPages()/getCombinedKVCache()).
+        //! Optional override of the pool's total page count. 0 (default) selects the minimum active pages
+        //! (`maxBatchSize * ceil(maxSequenceLength / kTOKENS_PER_PAGE)`). A non-zero value must be at least
+        //! that count; any extra pages are retained for cross-request reuse (see numPages()/getCombinedKVCache()).
         int32_t numPages{0};
     };
     //! \endcond
@@ -99,15 +98,12 @@ public:
     KVCacheManager& operator=(KVCacheManager&&) noexcept;
 
     //! Get the combined KVCache for the given attention layer.
-    //! @note This slot-shaped view is only a valid reinterpretation of the pool when
-    //!       numPages() == the active-capacity floor (i.e. Config::numPages was left at its
-    //!       default 0, or explicitly set to the floor). When retention headroom is configured
-    //!       (numPages() > floor), the K-half and V-half are no longer back-to-back at this
-    //!       tensor's declared stride; use getSeparateKVCache()/kPoolPtr()/vPoolPtr() instead,
-    //!       which are correct for any numPages().
+    //! @note This slot-shaped view is available only when numPages() equals the minimum active pages.
+    //!       With extra retained pages, its declared V-half stride would point into the K pool;
+    //!       use getCombinedKVCachePoolView(), getSeparateKVCache(), kPoolPtr(), or vPoolPtr().
     //! @param attnLayerIdx The index of the attention layer.
     //! @return A reference to the tensor with shape [2, maxBatchSize, capPadded, numKVHeads_i, headDim_i].
-    rt::Tensor& getCombinedKVCache(int32_t attnLayerIdx) noexcept;
+    rt::Tensor& getCombinedKVCache(int32_t attnLayerIdx);
 
     //! Get the pool-shaped view of the given attention layer's combined KVCache — same device
     //! allocation as getCombinedKVCache(), reinterpreted as the AttentionPlugin's paged-pool
@@ -128,7 +124,7 @@ public:
     int32_t maxCapPadded() const noexcept;
 
     //! @brief Get the total number of pages spanned by the pool.
-    //! @return Config::numPages if non-zero, else the active-capacity floor
+    //! @return Config::numPages if non-zero, else the minimum active pages
     //!         (maxBatchSize * maxCapPadded() / kTOKENS_PER_PAGE).
     int32_t numPages() const noexcept;
 
@@ -169,7 +165,7 @@ private:
     std::vector<rt::Tensor> mLayerCachesPoolView;
     bool mIsUniform{true}; //!< True if all layers share the same numKVHeads and headDim
     int32_t mCapPadded{};  //!< maxSequenceLength padded up to a multiple of kTOKENS_PER_PAGE
-    int32_t mNumPages{};   //!< Resolved total page count (Config::numPages, or the floor if 0)
+    int32_t mNumPages{};   //!< Resolved total page count (Config::numPages, or minimum active pages if 0)
 };
 
 } // namespace rt

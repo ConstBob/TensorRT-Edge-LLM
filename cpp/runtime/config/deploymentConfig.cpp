@@ -24,6 +24,7 @@
 #include "common/trtUtils.h"
 
 #include <algorithm>
+#include <limits>
 #include <string>
 
 namespace trt_edgellm
@@ -84,6 +85,41 @@ void validateCachedDraftTargetLayerIds(LLMEngineConfig const& base, LLMEngineCon
     }
 }
 
+void requireMinimumActiveKVPool(LLMEngineConfig const& config, char const* engineLabel)
+{
+    int64_t const computedMinimumActivePages
+        = computeMinimumKvPoolPages(config.maxSupportedBatchSize, config.maxKVCacheCapacity);
+    ELLM_CHECK(computedMinimumActivePages <= kMAX_KV_POOL_PAGES,
+        std::string(engineLabel) + " minimum active pages exceed the largest int32-addressable paged-KV pool.");
+    int32_t const minimumActivePages = static_cast<int32_t>(computedMinimumActivePages);
+    ELLM_CHECK(config.kvPoolPages == minimumActivePages,
+        std::string(engineLabel)
+            + " does not support cross-request retention and requires max_kv_pool_pages to equal the "
+              "minimum active pages ("
+            + std::to_string(minimumActivePages) + "); got " + std::to_string(config.kvPoolPages) + ".");
+}
+
+void validateKVPoolMode(DeploymentConfig const& deployment)
+{
+    SpecDecodeMode const mode = deployment.base.specDecodeType;
+    bool const nonHybridEagle = mode == SpecDecodeMode::kEAGLE && deployment.base.numLinearAttnLayers == 0;
+    bool const baseSupportsCrossRequestRetention
+        = !deployment.base.kvLayerConfigs.empty() && (mode == SpecDecodeMode::kNONE || nonHybridEagle);
+    if (!baseSupportsCrossRequestRetention)
+    {
+        requireMinimumActiveKVPool(deployment.base, "base engine");
+    }
+
+    if (deployment.draft.has_value())
+    {
+        bool const draftSupportsCrossRequestRetention = !deployment.draft->kvLayerConfigs.empty() && nonHybridEagle;
+        if (!draftSupportsCrossRequestRetention)
+        {
+            requireMinimumActiveKVPool(*deployment.draft, "draft engine");
+        }
+    }
+}
+
 void validateGemma4MTPConfig(LLMEngineConfig const& base, LLMEngineConfig& draft)
 {
     ELLM_CHECK(
@@ -110,19 +146,17 @@ void validateGemma4MTPConfig(LLMEngineConfig const& base, LLMEngineConfig& draft
     // binds the TARGET's pool and page table to those bindings. Unequal build limits therefore
     // cannot be reconciled at runtime (there is no min() escape hatch as there is for batch size),
     // so reject them here with the numbers instead of failing deep inside TensorRT shape checks.
-    int32_t const basePoolPages = rt::computeKvPoolFloorPages(base.maxSupportedBatchSize, base.maxKVCacheCapacity);
-    int32_t const draftPoolPages = rt::computeKvPoolFloorPages(draft.maxSupportedBatchSize, draft.maxKVCacheCapacity);
     int32_t const basePagesPerSeq = rt::computeMaxPagesPerSeq(base.maxKVCacheCapacity);
     int32_t const draftPagesPerSeq = rt::computeMaxPagesPerSeq(draft.maxKVCacheCapacity);
-    ELLM_CHECK(basePoolPages == draftPoolPages && basePagesPerSeq == draftPagesPerSeq,
+    ELLM_CHECK(base.kvPoolPages == draft.kvPoolPages && basePagesPerSeq == draftPagesPerSeq,
         "Gemma4 MTP shared-KV pool geometry mismatch: base engine (maxBatchSize="
             + std::to_string(base.maxSupportedBatchSize) + ", maxKVCacheCapacity="
-            + std::to_string(base.maxKVCacheCapacity) + ") implies numPages=" + std::to_string(basePoolPages)
+            + std::to_string(base.maxKVCacheCapacity) + ") has numPages=" + std::to_string(base.kvPoolPages)
             + "/maxPagesPerSeq=" + std::to_string(basePagesPerSeq)
             + ", assistant engine (maxBatchSize=" + std::to_string(draft.maxSupportedBatchSize)
-            + ", maxKVCacheCapacity=" + std::to_string(draft.maxKVCacheCapacity) + ") implies numPages="
-            + std::to_string(draftPoolPages) + "/maxPagesPerSeq=" + std::to_string(draftPagesPerSeq)
-            + ". Rebuild the assistant engine with the target's --maxBatchSize/--maxKVCacheCapacity.");
+            + ", maxKVCacheCapacity=" + std::to_string(draft.maxKVCacheCapacity) + ") has numPages="
+            + std::to_string(draft.kvPoolPages) + "/maxPagesPerSeq=" + std::to_string(draftPagesPerSeq)
+            + ". Rebuild the assistant engine with matching pool pages and page-table width.");
     ELLM_CHECK(static_cast<int32_t>(draft.gemma4MTPKVSharingMap.size()) == draft.numAttentionLayers,
         "Gemma4 MTP kv_sharing_map size (" + std::to_string(draft.gemma4MTPKVSharingMap.size())
             + ") must equal draft attention layer count (" + std::to_string(draft.numAttentionLayers) + ").");
@@ -272,6 +306,8 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
         cfg.draft = parseDraftEngineConfig(*draftConfigPath);
     }
 
+    validateKVPoolMode(cfg);
+
     if (cfg.base.specDecodeType == SpecDecodeMode::kDFlash && cfg.draft.has_value())
     {
         validateCachedDraftTargetLayerIds(cfg.base, *cfg.draft, "DFlash");
@@ -285,12 +321,9 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
         validateCachedDraftTargetLayerIds(cfg.base, *cfg.draft, "DSpark");
     }
 
-    // No cross-engine consistency check needed: each engine's builder_config
-    // carries only its own sequence budget. The base emits
+    // No cross-engine consistency check is needed for speculative tree budgets: the base emits
     // `max_verify_tree_size` (its verification budget); the draft emits
-    // `max_draft_tree_size` (its proposal budget). There are no capacity
-    // fields shared across the two configs, so there is nothing to
-    // cross-check. Consumers read each field from the owning side.
+    // `max_draft_tree_size` (its proposal budget). Consumers read each field from the owning side.
 
     // --- Build consolidated SpecDecodeConfig and validate drafting limits ---
     if (draftingConfig.has_value())
@@ -309,6 +342,8 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
         };
         requirePositiveField(draftingConfig->draftingTopK, "draftingTopK");
         requirePositiveField(draftingConfig->draftingStep, "draftingStep");
+        ELLM_CHECK(static_cast<int64_t>(draftingConfig->draftingStep) + 1 <= std::numeric_limits<int32_t>::max(),
+            "drafting.draftingStep is too large to represent the accepted-token depth draftingStep+1.");
         bool const isLinearDFlash
             = cfg.base.specDecodeType == SpecDecodeMode::kDFlash && draftingConfig->draftingTopK == 1;
         if (!isLinearDFlash || draftingConfig->verifySize < 0)
@@ -407,13 +442,10 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
         }
         else
         {
-            // In practice both `draftingStep` and `draftingTopK` are <= ~64 (bounded
-            // downstream by `maxDraftProposalSize`, which is tens, not millions), so
-            // int32 multiplication is overflow-safe; keeping it in int32 avoids
-            // widening noise.
             bool const mtpTree = cfg.base.specDecodeType == SpecDecodeMode::kMTP && specConfig.draftingTopK > 1;
-            int32_t const requiredDraftInputSize
-                = mtpTree ? specConfig.draftingStep : specConfig.draftingStep * specConfig.draftingTopK;
+            int64_t const requiredDraftInputSize = mtpTree
+                ? static_cast<int64_t>(specConfig.draftingStep)
+                : static_cast<int64_t>(specConfig.draftingStep) * static_cast<int64_t>(specConfig.draftingTopK);
 
             ELLM_CHECK(requiredDraftInputSize <= specConfig.maxDraftProposalSize,
                 "drafting.draftingStep=" + std::to_string(specConfig.draftingStep) + " * drafting.draftingTopK="

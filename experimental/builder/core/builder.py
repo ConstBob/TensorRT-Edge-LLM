@@ -30,6 +30,7 @@ import numpy as np
 import tensorrt as trt
 
 from ..ops.backend import Net
+from ..ops.functional.attention import KV_PAGE_SIZE
 from . import contracts, quantization
 from .config import BundleConfig, DeviceConfig
 from .weights import Weights
@@ -346,7 +347,7 @@ def _setup_llm_profiles(builder, config, network, cfg: DeviceConfig,
     maxB = args.max_batch_size
     maxIn = args.max_input_len
     maxKV = args.max_kv_cache_capacity
-    page_size = 128
+    page_size = KV_PAGE_SIZE
     pages_per_sequence = (maxKV + page_size - 1) // page_size
     pool_pages = maxB * pages_per_sequence
     H = cfg.hidden_size

@@ -35,22 +35,29 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
     check::check(mConfig.numAttentionLayers >= 0, "numAttentionLayers must be non-negative.");
     check::check(mConfig.maxBatchSize > 0, "maxBatchSize must be positive.");
     check::check(mConfig.maxSequenceLength > 0, "maxSequenceLength must be positive.");
+    check::check(mConfig.maxSequenceLength <= kMAX_KV_CACHE_CAPACITY,
+        "maxSequenceLength exceeds the largest value that remains int32 after page alignment.");
     check::check(static_cast<int32_t>(mConfig.layerConfigs.size()) == mConfig.numAttentionLayers,
         "layerConfigs size must equal numAttentionLayers.");
 
     // Token capacity per slot, padded up to a whole number of kTOKENS_PER_PAGE-token pages. This
     // is the substrate for paged kernels: a [2, maxBatch, capPadded, H, D] buffer is byte-identical
     // to a [2, numPages, kTOKENS_PER_PAGE, H, D] page pool (numPages = maxBatch * capPadded / kTOKENS_PER_PAGE).
-    mCapPadded = ((mConfig.maxSequenceLength + kTOKENS_PER_PAGE - 1) / kTOKENS_PER_PAGE) * kTOKENS_PER_PAGE;
+    mCapPadded = static_cast<int32_t>(
+        ((static_cast<int64_t>(mConfig.maxSequenceLength) + kTOKENS_PER_PAGE - 1) / kTOKENS_PER_PAGE)
+        * kTOKENS_PER_PAGE);
 
-    // numPages defaults to the active-capacity floor (today's fixed behavior, bit-identical). A
-    // non-zero Config::numPages requests retention headroom beyond the floor; the extra pages are
-    // allocated but unused by the identity-mapped slot math (see getCombinedKVCache()).
-    int32_t const floorPages = computeKvPoolFloorPages(mConfig.maxBatchSize, mConfig.maxSequenceLength);
-    check::check(mConfig.numPages == 0 || mConfig.numPages >= floorPages,
+    // numPages defaults to the minimum active pages. A larger override adds pages retained across
+    // requests; identity-mapped slot math still covers only the minimum active pages.
+    int64_t const minimumActivePages = computeMinimumKvPoolPages(mConfig.maxBatchSize, mConfig.maxSequenceLength);
+    check::check(minimumActivePages <= kMAX_KV_POOL_PAGES,
+        "KVCacheManager: minimum active pages exceed the largest int32-addressable paged-KV pool.");
+    check::check(mConfig.numPages == 0 || static_cast<int64_t>(mConfig.numPages) >= minimumActivePages,
         "KVCacheManager: Config::numPages (" + std::to_string(mConfig.numPages)
-            + ") must be >= the active-capacity floor (" + std::to_string(floorPages) + ") when non-zero.");
-    mNumPages = (mConfig.numPages == 0) ? floorPages : mConfig.numPages;
+            + ") must be >= the minimum active pages (" + std::to_string(minimumActivePages) + ") when non-zero.");
+    check::check(mConfig.numPages <= kMAX_KV_POOL_PAGES,
+        "KVCacheManager: Config::numPages exceeds the largest supported paged-KV pool.");
+    mNumPages = (mConfig.numPages == 0) ? static_cast<int32_t>(minimumActivePages) : mConfig.numPages;
 
     // Pure-Mamba / pure-recurrent models legitimately have zero attention layers.
     // Leave mLayerCaches empty and skip uniformity detection.
@@ -79,8 +86,8 @@ KVCacheManager::KVCacheManager(Config const& config, cudaStream_t stream)
     // (K-half and V-half each a contiguous numPages*kTOKENS_PER_PAGE*H*D pool, required by paged
     // XQA layout-1 / CuTe DSL TMA paging). getCombinedKVCache()'s slot-shaped [2, maxBatch,
     // capPadded, H, D] view is a non-owning alias over the SAME memory: this is only a valid
-    // reinterpretation when numPages == the floor (K-half == maxBatch*capPadded elements exactly);
-    // with retention headroom (numPages > floor) the V-half starts later than that alias implies,
+    // reinterpretation when numPages equals the minimum active pages (K-half == maxBatch*capPadded
+    // elements exactly); extra retained pages move the V-half beyond that alias's declared stride,
     // so getCombinedKVCache() must not be used in that case (see its doc comment).
     size_t totalBytes = 0;
     mLayerCaches.reserve(mConfig.numAttentionLayers);
@@ -145,8 +152,12 @@ KVCacheManager& KVCacheManager::operator=(KVCacheManager&& other) noexcept
     return *this;
 }
 
-rt::Tensor& KVCacheManager::getCombinedKVCache(int32_t attnLayerIdx) noexcept
+rt::Tensor& KVCacheManager::getCombinedKVCache(int32_t attnLayerIdx)
 {
+    int64_t const minimumActivePages = computeMinimumKvPoolPages(mConfig.maxBatchSize, mConfig.maxSequenceLength);
+    ELLM_CHECK(mNumPages == minimumActivePages,
+        "KVCacheManager::getCombinedKVCache: slot-shaped combined view is invalid with extra retained pages; use a "
+        "pool-shaped or separate K/V view.");
     return mLayerCaches[attnLayerIdx];
 }
 

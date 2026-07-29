@@ -19,6 +19,7 @@
 
 #include "runtime/state/contextCache/blockHash.h"
 #include "runtime/state/contextCache/cacheRecord.h"
+#include "runtime/state/contextCache/contextCacheConfig.h"
 #include "runtime/state/contextCache/contextCacheTypes.h"
 
 #include <cstdint>
@@ -32,7 +33,6 @@ namespace rt
 
 class BaseBlockIndex;
 class DraftPathIndex;
-enum class SpecDecodeMode : int32_t;
 
 //! Classification of a valid reuse plan; no value represents acquisition failure.
 enum class ReusePlanKind : uint8_t
@@ -42,15 +42,6 @@ enum class ReusePlanKind : uint8_t
     kFullInputRewind,
 };
 
-//! Whether planning may consult reusable-state indices.
-enum class LookupPolicy : uint8_t
-{
-    kUseCache,
-    //! Build an explicit cold demand without reading lookup indices. Acquisition may still evict retained records to
-    //! make that active demand feasible.
-    kBypass,
-};
-
 //! Decoder path whose state and replay invariants produced a reuse plan.
 enum class ReusePlanMode : uint8_t
 {
@@ -58,7 +49,7 @@ enum class ReusePlanMode : uint8_t
     //! Exact atomic recurrent/conv and optional partial-KV checkpoint reuse.
     kHybrid,
     //! Initial speculative implementation: greedy, non-hybrid EAGLE.
-    kSpecEagle,
+    kSpec,
 };
 
 //! Exact digest computed by the runtime for one stored hybrid candidate length.
@@ -72,14 +63,14 @@ struct HybridCheckpointCandidate
 enum class SpecReplayMode : uint8_t
 {
     kNone,
-    kOneToken,
     kFullPage,
 };
 
 //! Original coherent draft boundary required by EAGLE full-page replay.
 //!
 //! Full-page replay binds one fewer page than the original draft match, but the last retained draft slot still
-//! depends on the first token in this boundary. The dependency is revalidated without binding or pinning its page.
+//! depends on the first token in this boundary. Publication checks this boundary hash before retaining the replayed
+//! path.
 struct SpecReplayDependency
 {
     BlockHash terminalHash{};
@@ -88,28 +79,22 @@ struct SpecReplayDependency
 
 //! Side-effect-free proposal for binding cached pages and allocating request-private state.
 //!
-//! Planning reads the base and optional draft indices but does not pin pages, touch LRU state, or evict records.
-//! Planning and acquisition are separate phases, so ContextCacheManager revalidates every matched binding during
-//! acquire() before it performs any mutation. This is a transactional stale-plan check, not thread synchronization;
-//! callers must still serialize access to the manager. The demand contains only resources that still need private
-//! allocation.
+//! The free planning helpers expose deterministic metadata decisions for focused tests. ContextCacheManager builds
+//! and consumes each plan inside one serialized acquire call, so runtime callers never retain a mutable plan across
+//! metadata operations. The demand contains only resources that still need private allocation.
 struct ReusePlan
 {
     ReusePlanMode mode{ReusePlanMode::kVanilla};
-    LookupPolicy lookupPolicy{LookupPolicy::kUseCache};
-    CacheDomainId domain{};
-    int32_t inputTokenCount{};
+    //! Longest coherent cache match before any decoder-required rewind/replay adjustment.
+    int32_t matchedTokenLength{};
+    //! Materialized state boundary from which this request will actually execute.
     int32_t reuseTokenLength{};
     std::vector<BlockHash> matchedBlockHashes;
     std::vector<PageId> basePageBindings;
-    std::vector<PageId> baseCowSources;
-    std::optional<DraftEngineSignature> draftSignature;
     std::optional<RecordId> draftRecord;
     std::vector<PageId> draftPageBindings;
-    std::vector<PageId> draftCowSources;
     std::optional<SpecReplayDependency> specReplayDependency;
     bool hybridHasAttention{false};
-    std::optional<RecurrentStateSchemaId> recurrentStateSchema;
     std::optional<HybridCheckpointKey> hybridCheckpoint;
     std::optional<RecordId> hybridRecord;
     std::optional<int32_t> recurrentSnapshotBinding;
@@ -122,26 +107,23 @@ struct ReusePlan
 //! Build a base-model KV reuse plan for vanilla autoregressive decoding without mutating cache metadata.
 //!
 //! An exact block-aligned full-input match rewinds one full page so the caller can recompute the final token boundary.
-ReusePlan makeVanillaReusePlan(CacheDomainId domain, std::vector<BlockHash> const& inputFullBlockHashes,
-    int32_t inputTokenCount, int32_t pageSize, BaseBlockIndex const& index,
-    LookupPolicy lookupPolicy = LookupPolicy::kUseCache);
+ReusePlan makeVanillaReusePlan(std::vector<BlockHash> const& inputFullBlockHashes, int32_t inputTokenCount,
+    int32_t pageSize, BaseBlockIndex const& index,
+    ContextCacheLookupPolicy lookupPolicy = ContextCacheLookupPolicy::kUseCache);
 
 //! Build an exact hybrid/pure-recurrent reuse plan. Candidates may be unordered; the longest coherent checkpoint
 //! strictly shorter than the input wins. A missing snapshot member makes that candidate a complete miss.
-ReusePlan makeHybridReusePlan(CacheDomainId domain, RecurrentStateSchemaId schema,
-    std::vector<HybridCheckpointCandidate> const& candidates, std::vector<BlockHash> const& inputFullBlockHashes,
-    int32_t inputTokenCount, int32_t pageSize, bool hasAttention, CacheRecordStore const& records,
-    LookupPolicy lookupPolicy = LookupPolicy::kUseCache);
+ReusePlan makeHybridReusePlan(std::vector<HybridCheckpointCandidate> const& candidates,
+    std::vector<BlockHash> const& inputFullBlockHashes, int32_t inputTokenCount, int32_t pageSize, bool hasAttention,
+    CacheRecordStore const& records, ContextCacheLookupPolicy lookupPolicy = ContextCacheLookupPolicy::kUseCache);
 
 //! Build a speculative reuse plan without mutating cache metadata.
 //!
-//! The initial implementation accepts only SpecDecodeMode::kEAGLE. The caller must reject non-greedy or hybrid EAGLE
-//! before planning. A hit requires one coherent draft record path; base-only state is intentionally ignored because it
-//! cannot reconstruct historical EAGLE draft KV.
-ReusePlan makeSpecReusePlan(SpecDecodeMode mode, CacheDomainId domain, DraftEngineSignature draftSignature,
-    std::vector<BlockHash> const& inputFullBlockHashes, int32_t inputTokenCount, int32_t pageSize,
-    bool supportsOneTokenReplay, BaseBlockIndex const& baseIndex, DraftPathIndex const& draftIndex,
-    CacheRecordStore const& records, LookupPolicy lookupPolicy = LookupPolicy::kUseCache);
+//! Build plans for greedy, non-hybrid EAGLE. A hit requires one coherent draft record path; base-only state is
+//! intentionally ignored because it cannot reconstruct historical EAGLE draft KV.
+ReusePlan makeSpecReusePlan(std::vector<BlockHash> const& inputFullBlockHashes, int32_t inputTokenCount,
+    int32_t pageSize, BaseBlockIndex const& baseIndex, DraftPathIndex const& draftIndex,
+    CacheRecordStore const& records, ContextCacheLookupPolicy lookupPolicy = ContextCacheLookupPolicy::kUseCache);
 
 } // namespace rt
 } // namespace trt_edgellm

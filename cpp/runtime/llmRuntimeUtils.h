@@ -21,6 +21,7 @@
 #include "common/tensor.h"
 #include "runtime/audioUtils.h"
 #include "runtime/imageUtils.h"
+#include "runtime/state/contextCache/contextCacheConfig.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -165,6 +166,12 @@ struct LLMGenerationRequest
     //! Called after cudaStreamSynchronize inside the decode loop.
     //! When nullopt (default), zero overhead — no callback is invoked.
     std::optional<TokenCallback> onTokenGenerated;
+
+    //! Per-request context-cache lookup behavior. This is effective only when the runtime cache is enabled.
+    ContextCacheLookupPolicy contextCacheLookupPolicy{ContextCacheLookupPolicy::kUseCache};
+
+    //! Ready endpoints to retain when the context cache is enabled.
+    ContextCacheCommitPolicy contextCacheCommitPolicy{ContextCacheCommitPolicy::kIncludingGeneratedTokens};
 };
 
 /*! \brief LLM Generation Response structure

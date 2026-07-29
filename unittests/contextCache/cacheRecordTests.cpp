@@ -38,23 +38,17 @@ static_assert(!std::is_move_assignable_v<CacheRecordStore>, "CacheRecordStore mu
 namespace
 {
 
-constexpr CacheDomainId kDOMAIN{0x1010101010101010ULL, 0x2020202020202020ULL};
-constexpr CacheDomainId kOTHER_DOMAIN{0x3030303030303030ULL, 0x4040404040404040ULL};
-constexpr DraftEngineSignature kDRAFT_SIGNATURE{0x5050505050505050ULL, 0x6060606060606060ULL};
-constexpr DraftEngineSignature kOTHER_DRAFT_SIGNATURE{0x7070707070707070ULL, 0x8080808080808080ULL};
 constexpr BlockHash kHASH_A{0x1111111111111111ULL, 0xAAAAAAAAAAAAAAAAULL};
 constexpr BlockHash kHASH_B{0x2222222222222222ULL, 0xBBBBBBBBBBBBBBBBULL};
 constexpr BlockHash kHASH_C{0x3333333333333333ULL, 0xCCCCCCCCCCCCCCCCULL};
 constexpr BlockHash kHASH_D{0x4444444444444444ULL, 0xDDDDDDDDDDDDDDDDULL};
 
-CacheRecord makeRecord(
-    CacheDomainId domain, std::vector<BlockHash> logicalBlockHashes, std::vector<PageId> basePagePath)
+CacheRecord makeRecord(std::vector<BlockHash> logicalBlockHashes, std::vector<PageId> basePagePath)
 {
     CacheRecord record;
-    record.key = CacheRecordKey{domain, logicalBlockHashes.back(), static_cast<int32_t>(logicalBlockHashes.size())};
+    record.key = CacheRecordKey{logicalBlockHashes.back(), static_cast<int32_t>(logicalBlockHashes.size())};
     record.logicalBlockHashes = std::move(logicalBlockHashes);
     record.basePagePath = std::move(basePagePath);
-    record.baseFullBlockCount = static_cast<int32_t>(record.basePagePath.size());
     return record;
 }
 
@@ -67,15 +61,12 @@ TEST(ContextCacheRecordStoreTests, RecordOwnsItsCompleteBasePath)
     CacheRecordStore store(0);
     EXPECT_EQ(store.maxRecords(), 0);
 
-    CacheRecord record = makeRecord(kDOMAIN, {kHASH_A, kHASH_B, kHASH_C}, {10, 11, 12});
+    CacheRecord record = makeRecord({kHASH_A, kHASH_B, kHASH_C}, {10, 11, 12});
     constexpr RecordId kCALLER_RECORD_ID = 91;
     record.id = kCALLER_RECORD_ID;
-    record.draftSignature = kDRAFT_SIGNATURE;
-    record.draftPagePath = {20, 21};
+    record.draftPagePath = {20, 21, 22};
     record.recurrentSnapshotSlot = 30;
     record.partialKvSnapshotSlot = 40;
-    record.baseFullBlockCount = 2;
-    record.pairedDraftFullBlockCount = 1;
     record.exactCheckpointLength = 96;
     CacheRecordKey const key = record.key;
 
@@ -98,14 +89,14 @@ TEST(ContextCacheRecordStoreTests, RecordOwnsItsCompleteBasePath)
     EXPECT_EQ(stored.id, inserted.id);
     EXPECT_EQ(stored.logicalBlockHashes, std::vector<BlockHash>({kHASH_A, kHASH_B, kHASH_C}));
     EXPECT_EQ(stored.basePagePath, std::vector<PageId>({10, 11, 12}));
-    EXPECT_EQ(stored.draftSignature, std::optional<DraftEngineSignature>{kDRAFT_SIGNATURE});
-    EXPECT_EQ(stored.draftPagePath, std::vector<PageId>({20, 21}));
+    EXPECT_EQ(stored.draftPagePath, std::vector<PageId>({20, 21, 22}));
     EXPECT_EQ(stored.recurrentSnapshotSlot, std::optional<int32_t>{30});
     EXPECT_EQ(stored.partialKvSnapshotSlot, std::optional<int32_t>{40});
     EXPECT_EQ(stored.exactCheckpointLength, std::optional<int32_t>{96});
     std::vector<ResourceId> const expectedResources{{ResourceType::kBaseKvPage, 10}, {ResourceType::kBaseKvPage, 11},
         {ResourceType::kBaseKvPage, 12}, {ResourceType::kDraftKvPage, 20}, {ResourceType::kDraftKvPage, 21},
-        {ResourceType::kRecurrentSnapshot, 30}, {ResourceType::kPartialKvSnapshot, 40}};
+        {ResourceType::kDraftKvPage, 22}, {ResourceType::kRecurrentSnapshot, 30},
+        {ResourceType::kPartialKvSnapshot, 40}};
     EXPECT_EQ(stored.resources(), expectedResources);
 
     auto expectInvalid = [&](CacheRecord invalid) {
@@ -124,36 +115,20 @@ TEST(ContextCacheRecordStoreTests, RecordOwnsItsCompleteBasePath)
     invalid.logicalBlockHashes.pop_back();
     expectInvalid(std::move(invalid));
 
-    invalid = valid;
+    invalid = makeRecord({kHASH_A, kHASH_B, kHASH_C}, {10, 11, 12});
     invalid.key.terminalHash = kHASH_D;
     expectInvalid(std::move(invalid));
 
     invalid = valid;
-    invalid.baseFullBlockCount = -1;
-    expectInvalid(std::move(invalid));
-
-    invalid = valid;
-    invalid.pairedDraftFullBlockCount = -1;
-    expectInvalid(std::move(invalid));
-
-    invalid = valid;
-    invalid.basePagePath = {10};
-    invalid.baseFullBlockCount = 2;
-    expectInvalid(std::move(invalid));
-
-    invalid = valid;
     invalid.basePagePath = {10, 11, 12, 13};
-    invalid.baseFullBlockCount = 4;
     expectInvalid(std::move(invalid));
 
     invalid = valid;
-    invalid.draftPagePath = {20};
-    invalid.pairedDraftFullBlockCount = 2;
+    invalid.draftPagePath.pop_back();
     expectInvalid(std::move(invalid));
 
     invalid = valid;
     invalid.draftPagePath = {20, 21, 22, 23};
-    invalid.pairedDraftFullBlockCount = 4;
     expectInvalid(std::move(invalid));
 
     invalid = valid;
@@ -180,23 +155,22 @@ TEST(ContextCacheRecordStoreTests, RecordOwnsItsCompleteBasePath)
 TEST(ContextCacheRecordStoreTests, ExactDuplicateReturnsExistingRecord)
 {
     CacheRecordStore store(2);
-    CacheRecord first = makeRecord(kDOMAIN, {kHASH_A, kHASH_B}, {10, 11});
+    CacheRecord first = makeRecord({kHASH_A, kHASH_B}, {10, 11});
     first.recurrentSnapshotSlot = 12;
     RecordInsertResult const firstInsert = store.insert(first);
     ASSERT_TRUE(firstInsert.inserted);
 
-    CacheRecord other = makeRecord(kOTHER_DOMAIN, {kHASH_D}, {20});
+    CacheRecord other = makeRecord({kHASH_D}, {20});
     RecordInsertResult const otherInsert = store.insert(other);
     ASSERT_TRUE(otherInsert.inserted);
     EXPECT_EQ(store.lruToMru(), std::vector<RecordId>({firstInsert.id, otherInsert.id}));
 
-    CacheRecord duplicate = makeRecord(kDOMAIN, {kHASH_A, kHASH_B}, {90, 91});
+    CacheRecord duplicate = makeRecord({kHASH_A, kHASH_B}, {90, 91});
     duplicate.id = 999;
-    duplicate.draftSignature = kDRAFT_SIGNATURE;
-    duplicate.draftPagePath = {92};
-    duplicate.pairedDraftFullBlockCount = 1;
-    duplicate.partialKvSnapshotSlot = 93;
-    duplicate.exactCheckpointLength = 94;
+    duplicate.draftPagePath = {92, 93};
+    duplicate.partialKvSnapshotSlot = 94;
+    duplicate.recurrentSnapshotSlot = 95;
+    duplicate.exactCheckpointLength = 96;
 
     RecordInsertResult const duplicateInsert = store.insert(std::move(duplicate));
 
@@ -206,72 +180,60 @@ TEST(ContextCacheRecordStoreTests, ExactDuplicateReturnsExistingRecord)
     EXPECT_EQ(store.lruToMru(), std::vector<RecordId>({otherInsert.id, firstInsert.id}));
     CacheRecord const& stored = store.get(firstInsert.id);
     EXPECT_EQ(stored.basePagePath, std::vector<PageId>({10, 11}));
-    EXPECT_FALSE(stored.draftSignature.has_value());
     EXPECT_TRUE(stored.draftPagePath.empty());
     EXPECT_EQ(stored.recurrentSnapshotSlot, std::optional<int32_t>{12});
     EXPECT_FALSE(stored.partialKvSnapshotSlot.has_value());
     EXPECT_FALSE(stored.exactCheckpointLength.has_value());
     EXPECT_EQ(store.find(first.key), std::optional<RecordId>{firstInsert.id});
-    EXPECT_FALSE(store.find(CacheRecordKey{kOTHER_DOMAIN, kHASH_C, 1}).has_value());
+    EXPECT_FALSE(store.find(CacheRecordKey{kHASH_C, 1}).has_value());
 
-    CacheRecordKey const changedDomain{kOTHER_DOMAIN, first.key.terminalHash, first.key.fullBlockCount};
-    CacheRecordKey const changedTerminal{first.key.domain, kHASH_C, first.key.fullBlockCount};
-    CacheRecordKey const changedCount{first.key.domain, first.key.terminalHash, first.key.fullBlockCount + 1};
+    CacheRecordKey const changedTerminal{kHASH_C, first.key.fullBlockCount};
+    CacheRecordKey const changedCount{first.key.terminalHash, first.key.fullBlockCount + 1};
     CacheRecordKey const equalKey = first.key;
     EXPECT_TRUE(first.key == equalKey);
-    EXPECT_FALSE(first.key == changedDomain);
     EXPECT_FALSE(first.key == changedTerminal);
     EXPECT_FALSE(first.key == changedCount);
     EXPECT_EQ(std::hash<CacheRecordKey>{}(first.key), std::hash<CacheRecordKey>{}(equalKey));
 
     std::unordered_map<CacheRecordKey, int32_t> keyedValues;
     EXPECT_TRUE(keyedValues.emplace(first.key, 1).second);
-    EXPECT_TRUE(keyedValues.emplace(changedDomain, 2).second);
-    EXPECT_TRUE(keyedValues.emplace(changedTerminal, 3).second);
-    EXPECT_TRUE(keyedValues.emplace(changedCount, 4).second);
-    EXPECT_EQ(keyedValues.size(), 4U);
+    EXPECT_TRUE(keyedValues.emplace(changedTerminal, 2).second);
+    EXPECT_TRUE(keyedValues.emplace(changedCount, 3).second);
+    EXPECT_EQ(keyedValues.size(), 3U);
     ASSERT_NE(keyedValues.find(first.key), keyedValues.end());
     EXPECT_EQ(keyedValues.find(first.key)->second, 1);
-    ASSERT_NE(keyedValues.find(changedDomain), keyedValues.end());
-    EXPECT_EQ(keyedValues.find(changedDomain)->second, 2);
     ASSERT_NE(keyedValues.find(changedTerminal), keyedValues.end());
-    EXPECT_EQ(keyedValues.find(changedTerminal)->second, 3);
+    EXPECT_EQ(keyedValues.find(changedTerminal)->second, 2);
     ASSERT_NE(keyedValues.find(changedCount), keyedValues.end());
-    EXPECT_EQ(keyedValues.find(changedCount)->second, 4);
+    EXPECT_EQ(keyedValues.find(changedCount)->second, 3);
 }
 
-TEST(ContextCacheRecordStoreTests, HybridIndexUsesExactDigestLengthAndSchema)
+TEST(ContextCacheRecordStoreTests, HybridIndexUsesExactDigestAndLength)
 {
-    constexpr RecurrentStateSchemaId kSCHEMA{0x9090909090909090ULL, 0xA0A0A0A0A0A0A0A0ULL};
-    constexpr RecurrentStateSchemaId kOTHER_SCHEMA{0xB0B0B0B0B0B0B0B0ULL, 0xC0C0C0C0C0C0C0C0ULL};
     constexpr BlockHash kEXACT_DIGEST{0xD0D0D0D0D0D0D0D0ULL, 0xE0E0E0E0E0E0E0E0ULL};
 
-    CacheRecord partial = makeRecord(kDOMAIN, {kHASH_A}, {10});
+    CacheRecord partial = makeRecord({kHASH_A}, {10});
     partial.key.terminalHash = kEXACT_DIGEST;
     partial.recurrentSnapshotSlot = 20;
     partial.partialKvSnapshotSlot = 21;
     partial.exactCheckpointLength = 6;
-    partial.exactCheckpointDigest = kEXACT_DIGEST;
-    partial.recurrentStateSchema = kSCHEMA;
 
     CacheRecordStore store(4);
     RecordInsertResult const inserted = store.insert(partial);
     ASSERT_TRUE(inserted.inserted);
-    HybridCheckpointKey const key{kDOMAIN, kEXACT_DIGEST, 6, kSCHEMA};
+    HybridCheckpointKey const key{kEXACT_DIGEST, 6};
     EXPECT_EQ(store.findHybrid(key), std::optional<RecordId>{inserted.id});
-    EXPECT_FALSE(store.findHybrid(HybridCheckpointKey{kDOMAIN, kEXACT_DIGEST, 6, kOTHER_SCHEMA}).has_value());
-    EXPECT_EQ(store.hybridCandidateLengths(kDOMAIN, kSCHEMA, 7), std::vector<int32_t>{6});
-    EXPECT_TRUE(store.hybridCandidateLengths(kDOMAIN, kSCHEMA, 6).empty());
+    EXPECT_FALSE(store.findHybrid(HybridCheckpointKey{kEXACT_DIGEST, 7}).has_value());
+    EXPECT_EQ(store.hybridCandidateLengths(7), std::vector<int32_t>{6});
+    EXPECT_TRUE(store.hybridCandidateLengths(6).empty());
 
     CacheRecord pureRecurrent;
-    pureRecurrent.key = CacheRecordKey{kDOMAIN, kHASH_B, 0};
+    pureRecurrent.key = CacheRecordKey{kHASH_B, 0};
     pureRecurrent.recurrentSnapshotSlot = 22;
     pureRecurrent.exactCheckpointLength = 3;
-    pureRecurrent.exactCheckpointDigest = kHASH_B;
-    pureRecurrent.recurrentStateSchema = kSCHEMA;
     RecordInsertResult const pureInserted = store.insert(pureRecurrent);
     ASSERT_TRUE(pureInserted.inserted);
-    EXPECT_EQ(store.hybridCandidateLengths(kDOMAIN, kSCHEMA, 8), std::vector<int32_t>({6, 3}));
+    EXPECT_EQ(store.hybridCandidateLengths(8), std::vector<int32_t>({6, 3}));
 
     CacheRecord const erased = store.erase(inserted.id);
     EXPECT_EQ(erased.hybridKey(), std::optional<HybridCheckpointKey>{key});
@@ -281,9 +243,9 @@ TEST(ContextCacheRecordStoreTests, HybridIndexUsesExactDigestLengthAndSchema)
 TEST(ContextCacheRecordStoreTests, InsertAndExplicitTouchMoveOnlyThatRecordToMru)
 {
     CacheRecordStore store(2);
-    RecordInsertResult const first = store.insert(makeRecord(kDOMAIN, {kHASH_A}, {10}));
-    RecordInsertResult const second = store.insert(makeRecord(kDOMAIN, {kHASH_B}, {11}));
-    RecordInsertResult const third = store.insert(makeRecord(kDOMAIN, {kHASH_C}, {12}));
+    RecordInsertResult const first = store.insert(makeRecord({kHASH_A}, {10}));
+    RecordInsertResult const second = store.insert(makeRecord({kHASH_B}, {11}));
+    RecordInsertResult const third = store.insert(makeRecord({kHASH_C}, {12}));
     ASSERT_TRUE(first.inserted);
     ASSERT_TRUE(second.inserted);
     ASSERT_TRUE(third.inserted);
@@ -312,17 +274,15 @@ TEST(ContextCacheRecordStoreTests, InsertAndExplicitTouchMoveOnlyThatRecordToMru
 TEST(ContextCacheRecordStoreTests, EraseRemovesExactKeyAndLruEntry)
 {
     CacheRecordStore store(3);
-    RecordInsertResult const first = store.insert(makeRecord(kDOMAIN, {kHASH_A}, {10}));
-    CacheRecord middleRecord = makeRecord(kDOMAIN, {kHASH_A, kHASH_B}, {10, 11});
-    middleRecord.draftSignature = kDRAFT_SIGNATURE;
+    RecordInsertResult const first = store.insert(makeRecord({kHASH_A}, {10}));
+    CacheRecord middleRecord = makeRecord({kHASH_A, kHASH_B}, {10, 11});
     middleRecord.draftPagePath = {20, 21};
-    middleRecord.pairedDraftFullBlockCount = 2;
     middleRecord.recurrentSnapshotSlot = 30;
     middleRecord.partialKvSnapshotSlot = 40;
     middleRecord.exactCheckpointLength = 64;
     CacheRecordKey const middleKey = middleRecord.key;
     RecordInsertResult const middle = store.insert(middleRecord);
-    RecordInsertResult const last = store.insert(makeRecord(kDOMAIN, {kHASH_C}, {12}));
+    RecordInsertResult const last = store.insert(makeRecord({kHASH_C}, {12}));
     ASSERT_TRUE(first.inserted);
     ASSERT_TRUE(middle.inserted);
     ASSERT_TRUE(last.inserted);
@@ -333,7 +293,6 @@ TEST(ContextCacheRecordStoreTests, EraseRemovesExactKeyAndLruEntry)
     EXPECT_TRUE(erased.key == middleKey);
     EXPECT_EQ(erased.logicalBlockHashes, std::vector<BlockHash>({kHASH_A, kHASH_B}));
     EXPECT_EQ(erased.basePagePath, std::vector<PageId>({10, 11}));
-    EXPECT_EQ(erased.draftSignature, std::optional<DraftEngineSignature>{kDRAFT_SIGNATURE});
     EXPECT_EQ(erased.draftPagePath, std::vector<PageId>({20, 21}));
     EXPECT_EQ(erased.recurrentSnapshotSlot, std::optional<int32_t>{30});
     EXPECT_EQ(erased.partialKvSnapshotSlot, std::optional<int32_t>{40});
@@ -355,8 +314,8 @@ TEST(ContextCacheRecordStoreTests, EraseRemovesExactKeyAndLruEntry)
 TEST(ContextCacheRecordStoreTests, BranchRecordsRetainSharedAncestorsIndependently)
 {
     CacheRecordStore store(2);
-    CacheRecord firstBranchRecord = makeRecord(kDOMAIN, {kHASH_A, kHASH_B, kHASH_C}, {10, 11, 12});
-    CacheRecord secondBranchRecord = makeRecord(kDOMAIN, {kHASH_A, kHASH_B, kHASH_D}, {10, 11, 13});
+    CacheRecord firstBranchRecord = makeRecord({kHASH_A, kHASH_B, kHASH_C}, {10, 11, 12});
+    CacheRecord secondBranchRecord = makeRecord({kHASH_A, kHASH_B, kHASH_D}, {10, 11, 13});
     CacheRecordKey const firstBranchKey = firstBranchRecord.key;
     CacheRecordKey const secondBranchKey = secondBranchRecord.key;
 
@@ -384,33 +343,29 @@ TEST(ContextCacheRecordStoreTests, BranchRecordsRetainSharedAncestorsIndependent
     EXPECT_EQ(store.size(), 1U);
 }
 
-TEST(ContextCacheRecordStoreTests, ReplacingDraftStatePreservesBaseIdentityAndPromotesRecord)
+TEST(ContextCacheRecordStoreTests, AddingDraftStatePreservesBaseIdentityAndPromotesRecord)
 {
     CacheRecordStore store(2);
-    RecordInsertResult const first = store.insert(makeRecord(kDOMAIN, {kHASH_A, kHASH_B}, {10, 11}));
-    RecordInsertResult const second = store.insert(makeRecord(kDOMAIN, {kHASH_C}, {12}));
+    RecordInsertResult const first = store.insert(makeRecord({kHASH_A, kHASH_B}, {10, 11}));
+    RecordInsertResult const second = store.insert(makeRecord({kHASH_C}, {12}));
     ASSERT_TRUE(first.inserted);
     ASSERT_TRUE(second.inserted);
     ASSERT_EQ(store.lruToMru(), std::vector<RecordId>({first.id, second.id}));
 
-    store.setDraftState(first.id, kDRAFT_SIGNATURE, {20, 21}, 2);
+    EXPECT_THROW(store.setDraftState(first.id, {20}), std::runtime_error);
+    EXPECT_THROW(store.setDraftState(first.id, {20, -1}), std::runtime_error);
+    EXPECT_TRUE(store.get(first.id).draftPagePath.empty());
+
+    store.setDraftState(first.id, {20, 21});
 
     CacheRecord const& upgraded = store.get(first.id);
-    EXPECT_EQ(upgraded.key, (CacheRecordKey{kDOMAIN, kHASH_B, 2}));
+    EXPECT_EQ(upgraded.key, (CacheRecordKey{kHASH_B, 2}));
     EXPECT_EQ(upgraded.logicalBlockHashes, std::vector<BlockHash>({kHASH_A, kHASH_B}));
     EXPECT_EQ(upgraded.basePagePath, std::vector<PageId>({10, 11}));
-    EXPECT_EQ(upgraded.draftSignature, std::optional<DraftEngineSignature>{kDRAFT_SIGNATURE});
     EXPECT_EQ(upgraded.draftPagePath, std::vector<PageId>({20, 21}));
-    EXPECT_EQ(upgraded.pairedDraftFullBlockCount, 2);
     EXPECT_EQ(store.lruToMru(), std::vector<RecordId>({second.id, first.id}));
 
-    EXPECT_THROW(store.setDraftState(first.id, kOTHER_DRAFT_SIGNATURE, {30, -1}, 2), std::runtime_error);
-    EXPECT_EQ(store.get(first.id).draftSignature, std::optional<DraftEngineSignature>{kDRAFT_SIGNATURE});
+    EXPECT_THROW(store.setDraftState(first.id, {30, 31}), std::runtime_error);
     EXPECT_EQ(store.get(first.id).draftPagePath, std::vector<PageId>({20, 21}));
-
-    store.setDraftState(first.id, kOTHER_DRAFT_SIGNATURE, {30, 31}, 2);
-
-    EXPECT_EQ(store.get(first.id).draftSignature, std::optional<DraftEngineSignature>{kOTHER_DRAFT_SIGNATURE});
-    EXPECT_EQ(store.get(first.id).draftPagePath, std::vector<PageId>({30, 31}));
     EXPECT_EQ(store.get(first.id).basePagePath, std::vector<PageId>({10, 11}));
 }
