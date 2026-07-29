@@ -186,6 +186,114 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
        {\"type\":\"text\",\"text\":\"Transcribe.\"}]}],\"max_tokens\":128}"
 ```
 
+## Audio Output (Qwen3-Omni)
+
+For Qwen3-Omni models the server can stream synthesized speech alongside the
+text response, following the OpenAI chat-completions audio schema. It requires
+the Omni audio-output engines (Talker, CodePredictor, Code2Wav) placed as
+siblings of the Thinker engine directory — they are auto-detected at startup:
+
+```
+{engine_root}/
+    thinker/          # engine_dir passed to LLM (llm.engine)
+    talker/           # llm.engine
+    code_predictor/   # llm.engine
+    code2wav/         # code2wav.engine
+```
+
+The dirs can also be passed explicitly via `LLM(talker_engine_dir=...,
+code_predictor_engine_dir=..., code2wav_engine_dir=...)`.
+
+> **Build requirement:** the Python bindings must be built with the CuTe DSL
+> GEMM enabled, or the Talker MLP fails and no audio is produced. Generate the
+> AOT artifact first, then build with `ENABLE_CUTE_DSL=gemm`:
+>
+> ```bash
+> python kernelSrcs/build_cutedsl.py --kernels gemm --gpu_arch <sm>
+> TRT_PACKAGE_DIR=... ENABLE_CUTE_DSL=gemm \
+>     python experimental/server/setup_pybind.py build_ext --inplace
+> ```
+
+Request audio by adding `modalities` (and optionally an `audio` object):
+
+```bash
+curl -N http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "local", "stream": true,
+       "modalities": ["text", "audio"],
+       "audio": {"format": "pcm16", "voice": ""},
+       "messages": [{"role": "user", "content": "Introduce yourself."}]}'
+```
+
+Streaming responses interleave text and audio deltas in one SSE stream.
+Audio arrives as base64 int16 mono PCM at 24 kHz:
+
+```json
+{"choices": [{"delta": {"content": "Hello"}, "index": 0}]}
+{"choices": [{"delta": {"audio": {"id": "audio-...", "data": "<base64 pcm16>",
+                                  "format": "pcm16", "sample_rate": 24000}}, "index": 0}]}
+```
+
+Generation is truly streaming: the Thinker and Talker run interleaved, so the
+first audio chunk is emitted after roughly `talker_prefill_threshold` text
+tokens rather than after the full text completes. With `stream: false` the
+server aggregates the chunks and returns one `message.audio.data` blob plus
+`message.audio.transcript`.
+
+Talker knobs live inside the `audio` object (they are namespaced there to
+avoid colliding with text sampling fields):
+
+| Field | Default | Description |
+|---|---:|---|
+| `voice` | `""` | Speaker name; empty selects the model default |
+| `format` | `"pcm16"` | Output encoding; only `pcm16` is supported |
+| `codec_chunk_frames` | `10` | Vocode every N codec frames (1 frame ≈ 80 ms of audio). Smaller values lower chunk latency at the cost of more Code2Wav invocations |
+| `talker_prefill_threshold` | `4` | Thinker tokens accumulated before Talker prefill starts |
+| `talker_temperature` | `0.9` | Talker sampling temperature (must be > 0; greedy Talker sampling never emits EOS) |
+| `talker_top_k` | `50` | Talker top-K |
+| `talker_top_p` | `1.0` | Talker top-P |
+| `repetition_penalty` | `1.05` | Talker codec repetition penalty |
+| `max_audio_length` | `4096` | Maximum codec frames per response |
+
+`tools` and `logprobs` are rejected (400) in combination with audio output.
+
+## Text-to-Speech (`/v1/audio/speech`)
+
+Any server with the audio-output engines loaded also exposes an OpenAI-style
+TTS endpoint. Unlike chat with `modalities: ["audio"]`, the input text goes
+straight to the Talker — no Thinker generation pass:
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"model": "local", "input": "今天天气真不错。", "voice": ""}' \
+  --output speech.pcm
+```
+
+`response_format: "pcm"` (default) streams raw int16 mono 24 kHz PCM as
+chunks are vocoded (headers carry `X-Sample-Rate` / `X-Channels` /
+`X-Sample-Format`); `"wav"` aggregates and returns a complete WAV file. The
+Talker knobs from the table above sit at the top level of the body
+(`talker_temperature`, `codec_chunk_frames`, ...). `input` is capped at 4096
+characters.
+
+For Qwen3-TTS-style engine sets (Talker + CodePredictor + Code2Wav, no text
+model), serve TTS-only — chat endpoints then return 400:
+
+```python
+from experimental.server import TTS
+
+tts = TTS(talker_engine_dir="/engines/qwen3-tts/talker")
+tts.serve(port=8000)
+```
+
+`code_predictor_engine_dir` / `code2wav_engine_dir` default to the talker
+directory's siblings; `tokenizer_dir` defaults to the talker directory itself
+(Qwen3-TTS exports carry the tokenizer and `text_embedding.safetensors`
+there). On a Qwen3-Omni server, pass the thinker engine dir as
+`tokenizer_dir` — the text embedding lives there.
+
+
 ## Sampling Parameters
 
 | Parameter | Default | Description |
@@ -378,6 +486,8 @@ outputs = llm.generate(
 | `POST` | `/v1/chat/completions` | Chat completions with optional SSE streaming |
 | `POST` | `/v1/messages` | Anthropic Messages API with optional SSE streaming |
 | `POST` | `/v1/messages/count_tokens` | Anthropic input-token estimate |
+| `POST` | `/v1/audio/speech` | Text-to-speech (streamed PCM or WAV) |
+| `GET` | `/v1/voices` | Speaker names accepted as `voice` |
 
 ## Notes
 

@@ -137,8 +137,9 @@ set_target_properties(
              PREFIX ""
              OUTPUT_NAME "_edgellm_runtime")
 
-# Place the .so next to the core libraries in subdirectory mode.
-if(NOT _PYBIND_STANDALONE)
+# Place the .so next to the core libraries in subdirectory mode, unless the
+# caller (e.g. setup_pybind.py) already pinned CMAKE_LIBRARY_OUTPUT_DIRECTORY.
+if(NOT _PYBIND_STANDALONE AND NOT CMAKE_LIBRARY_OUTPUT_DIRECTORY)
   set_target_properties(
     _edgellm_runtime PROPERTIES LIBRARY_OUTPUT_DIRECTORY
                                 "${CMAKE_BINARY_DIR}/pybind")
