@@ -46,7 +46,7 @@ inline void checkCuteDslCudaError(cudaError_t error)
 #if defined(CUTE_DSL_CUDA_ERROR_CHECK)
 #undef CUTE_DSL_CUDA_ERROR_CHECK
 #endif
-#define CUTE_DSL_CUDA_ERROR_CHECK(error) ::trt_edgellm::detail::checkCuteDslCudaError(error)
+#define CUTE_DSL_CUDA_ERROR_CHECK(error) ::trt_edgellm::detail::checkCuteDslCudaError(static_cast<cudaError_t>(error))
 #include "cutedsl_all.h"
 #undef CUTE_DSL_CUDA_ERROR_CHECK
 

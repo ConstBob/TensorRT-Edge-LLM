@@ -374,10 +374,12 @@ function(cute_dsl_setup)
                   "Set -DCUDA_CTK_VERSION to the toolkit used for this build.")
   endif()
 
-  if(_cute_dsl_cuda_ver VERSION_LESS 12.0)
+  # 11.4 is buildable from a prebuilt artifact only: upstream nvidia-cutlass-dsl
+  # ships cu12/cu13 wheels, so kernels cannot be generated there.
+  if(_cute_dsl_cuda_ver VERSION_LESS 11.4)
     message(
       FATAL_ERROR
-        "CuTe DSL requires CUDA Toolkit 12.0+ (detected ${_cute_dsl_cuda_ver}). "
+        "CuTe DSL requires CUDA Toolkit 11.4+ (detected ${_cute_dsl_cuda_ver}). "
         "Use -DENABLE_CUTE_DSL=OFF or set -DCUDA_CTK_VERSION to a supported toolkit."
     )
   endif()
@@ -385,12 +387,16 @@ function(cute_dsl_setup)
   # Shim: cudaLibrary* → cu* when libcudart omits exports (e.g. some 12.0–12.6
   # embedded). From CUDA 12.8 onward, cuda_runtime_api.h declares these APIs
   # with runtime types; compiling the weak shim conflicts with those
-  # declarations. Use INTERFACE only (no .c) for 12.8+.
+  # declarations. Below 12.0 the cuLibrary*/cuKernel* entry points it forwards
+  # to do not exist, and the 11.4 artifact resolves modules through cuModule*
+  # instead, so it is not needed there either. Use INTERFACE only (no .c)
+  # outside 12.0–12.6.
   set(_cutedsl_cudart_shim_src
       "${CMAKE_SOURCE_DIR}/cpp/kernels/gdnKernels/cutedsl_cuda_runtime_library_shim.c"
   )
   if(NOT TARGET trt_edgellm_cutedsl_cudart_shim)
-    if(_cute_dsl_cuda_ver VERSION_GREATER_EQUAL 12.8)
+    if(_cute_dsl_cuda_ver VERSION_LESS 12.0 OR _cute_dsl_cuda_ver
+                                               VERSION_GREATER_EQUAL 12.8)
       add_library(trt_edgellm_cutedsl_cudart_shim INTERFACE)
     else()
       if(NOT EXISTS "${_cutedsl_cudart_shim_src}")
@@ -1028,10 +1034,11 @@ function(cute_dsl_setup)
   # edgellmKernels also inherit the CuTe DSL archive. Otherwise unresolved AOT
   # wrapper symbols only show up at the final executable link step.
   set(_link_libs "${_static_lib}")
-  # The libcudart shim only exists below CUDA 12.8; at 12.8+ the target is an
-  # empty INTERFACE library.
+  # The libcudart shim only exists for CUDA 12.0–12.6; outside that range the
+  # target is an empty INTERFACE library.
   set(_cudart_shim_lib)
-  if(_cute_dsl_cuda_ver VERSION_LESS 12.8)
+  if(_cute_dsl_cuda_ver VERSION_GREATER_EQUAL 12.0 AND _cute_dsl_cuda_ver
+                                                       VERSION_LESS 12.8)
     set(_cudart_shim_lib trt_edgellm_cutedsl_cudart_shim)
   endif()
   foreach(_tgt ${ARG_LINK_TARGETS})
@@ -1048,9 +1055,11 @@ function(cute_dsl_setup)
         add_cross_build_link_options(${_tgt})
       endif()
     endif()
-    # CUDA < 12.8: wrap _cudaLaunchKernelEx (cudaKernel_t → CUfunction, e.g.
-    # JetPack 6).
-    if(_cute_dsl_cuda_ver VERSION_LESS 12.8)
+    # CUDA 12.0–12.6: wrap _cudaLaunchKernelEx (cudaKernel_t → CUfunction, e.g.
+    # JetPack 6). cudaLaunchKernelEx is 11.8+, so there is nothing to wrap at
+    # 11.4.
+    if(_cute_dsl_cuda_ver VERSION_GREATER_EQUAL 12.0 AND _cute_dsl_cuda_ver
+                                                         VERSION_LESS 12.8)
       target_link_options(${_tgt} PRIVATE "-Wl,--wrap=_cudaLaunchKernelEx")
     endif()
   endforeach()
