@@ -35,7 +35,8 @@ namespace decoder_utils
 {
 
 //! @brief Load the draft engine from disk and return an EngineExecutor.
-std::unique_ptr<EngineExecutor> loadDraftEngine(std::filesystem::path const& engineDir, DeploymentConfig& deployment);
+std::unique_ptr<EngineExecutor> loadDraftEngine(
+    std::filesystem::path const& engineDir, DeploymentConfig const& deployment);
 
 //! @brief Copy accepted tokens from device buffers into the host-side context token lists.
 //! On return, hostAcceptLengths holds the number of tokens actually appended per slot.

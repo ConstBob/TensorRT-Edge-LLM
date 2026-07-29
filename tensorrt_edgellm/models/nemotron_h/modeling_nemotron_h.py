@@ -263,6 +263,7 @@ class MambaMixer(nn.Module):
         conv_state: torch.Tensor,
         ssm_state: torch.Tensor,
         context_lengths: torch.Tensor,
+        state_start_index: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = hidden_states.shape
         d_inner = self.num_heads * self.head_dim
@@ -309,6 +310,7 @@ class MambaMixer(nn.Module):
             self.dt_bias,
             ssm_state,
             context_lengths,
+            state_start_index,
             dt_softplus=1,
             ngroups=self.n_groups,
         )
@@ -791,7 +793,8 @@ class NemotronHDecoderLayer(nn.Module):
         normed = self.norm(hidden_states)
         if self.layer_type == LAYER_MAMBA:
             mixer_out, conv_state_out, ssm_state_out = self.mixer(
-                normed, conv_state, ssm_state, context_lengths)
+                normed, conv_state, ssm_state, context_lengths,
+                kvcache_start_index)
             return residual + mixer_out, conv_state_out, ssm_state_out
         elif self.layer_type in (LAYER_MLP, LAYER_MOE):
             return residual + self.mixer(normed)
@@ -852,6 +855,7 @@ class NemotronHBackbone(nn.Module):
                 hidden_states, conv_out, ssm_out = layer(
                     hidden_states,
                     context_lengths=context_lengths,
+                    kvcache_start_index=kvcache_start_index,
                     conv_state=conv_states[mamba_idx],
                     ssm_state=ssm_states[mamba_idx],
                 )

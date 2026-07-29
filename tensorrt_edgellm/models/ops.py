@@ -1023,6 +1023,8 @@ def update_ssm_state(
     dt_bias: torch.Tensor,  # [num_heads] float16
     state: torch.Tensor,  # [batch, num_heads, head_dim, ssm_state_size]
     context_lengths: torch.Tensor,  # [batch] int32
+    # [0] for cold prefill, [batch] for restored state
+    state_start_index: torch.Tensor,
     dt_softplus: int,
     ngroups: int,
     chunk_size: int = 0,
@@ -1041,6 +1043,7 @@ def _(hidden_states,
       dt_bias,
       state,
       context_lengths,
+      state_start_index,
       dt_softplus,
       ngroups,
       chunk_size=0):

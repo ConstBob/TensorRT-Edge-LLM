@@ -138,6 +138,23 @@ bool LLMBuilder::build()
         return false;
     }
 
+    int64_t const minimumActivePages
+        = rt::computeMinimumKvPoolPages(mBuilderConfig.maxBatchSize, mBuilderConfig.maxKVCacheCapacity);
+    int64_t const kvPoolPages = mBuilderConfig.resolvedKVPoolPages();
+    bool const hasExtraRetainedPages = kvPoolPages > minimumActivePages;
+    std::string const mode = specDecodeType(mModelConfig);
+    bool const supportsCrossRequestRetention
+        = mNbKVCacheInputs > 0 && (mode == "none" || (mode == "eagle3" && mNumLinearAttnLayers == 0));
+    if (hasExtraRetainedPages && !supportsCrossRequestRetention)
+    {
+        LOG_ERROR(
+            "maxKVPoolPages=%ld adds extra retained pages for cross-request retention, but the engine configuration "
+            "(engine_role=%s, spec_decode_type=%s, num_linear_attn_layers=%d) does not support cross-request "
+            "retention. Use maxKVPoolPages=0 (resolved minimum active pages=%ld).",
+            kvPoolPages, engineRole(mModelConfig).c_str(), mode.c_str(), mNumLinearAttnLayers, minimumActivePages);
+        return false;
+    }
+
     // Create builder and network
     auto [builder, network] = createBuilderAndNetwork();
     if (!builder || !network)
@@ -918,8 +935,7 @@ bool LLMBuilder::setupDFlashDraftProfiles(
         // DFlashTargetKVCacheUpdatePlugin recovers maxBatch/cap at enqueue time from numPages and
         // the pages_per_slot attribute the builder configures via edgellm_dflash_configure_pages_per_slot
         // (see build()); this cache still has no page table of its own.
-        int64_t const numPages = rt::computeKvPoolFloorPages(
-            static_cast<int32_t>(mBuilderConfig.maxBatchSize), static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
+        int64_t const numPages = mBuilderConfig.resolvedKVPoolPages();
         for (int32_t i = 0; i < mNbKVCacheInputs; ++i)
         {
             int64_t layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
@@ -988,8 +1004,7 @@ bool LLMBuilder::setupGemma4MTPDraftProfiles(nvinfer1::IOptimizationProfile& con
         // KV cache per-layer: the assistant binds the TARGET model's paged pool tensors
         // directly ([2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim]), so the profile
         // uses the same fixed page count as the target's setupKVCacheProfiles.
-        int64_t const numPages = rt::computeKvPoolFloorPages(
-            static_cast<int32_t>(mBuilderConfig.maxBatchSize), static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
+        int64_t const numPages = mBuilderConfig.resolvedKVPoolPages();
         for (int i = 0; i < mNbKVCacheInputs; ++i)
         {
             int64_t const layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
@@ -1072,8 +1087,7 @@ bool LLMBuilder::setupDSparkDraftProfiles(
         // DFlashTargetKVCacheUpdatePlugin recovers maxBatch/cap at enqueue time from numPages
         // and the pages_per_slot attribute configured above; this cache still has no page table
         // of its own.
-        int64_t const numPages = rt::computeKvPoolFloorPages(
-            static_cast<int32_t>(mBuilderConfig.maxBatchSize), static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
+        int64_t const numPages = mBuilderConfig.resolvedKVPoolPages();
         for (int32_t i = 0; i < mNbKVCacheInputs; ++i)
         {
             int64_t layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
@@ -1340,14 +1354,13 @@ bool LLMBuilder::setupKVCacheProfiles(
 {
     bool result = true;
     // Plugin path: paged pool binding [2, numPages, kTOKENS_PER_PAGE, num_kv_heads, head_dim].
-    // numPages is fixed at the active-capacity floor (maxBatchSize * ceil(maxKVCacheCapacity /
-    // kTOKENS_PER_PAGE)) for the life of the engine — it is not resized per inference step.
+    // numPages is the exact engine-authoritative pool count for the life of the engine.
+    // maxKVPoolPages=0 resolves to the minimum active pages; a larger supported value adds pages retained
+    // across requests.
     // "Empty vs non-empty" cache is conveyed by kvcache_start_index's own profile, not by this
     // tensor's shape (the plugin reads numPages from dims.d[1], so the binding must always be
-    // pool-shaped). Retention headroom beyond the floor is a follow-up that accepts a full
-    // engine rebuild (owner decision, 2026-07-05).
-    int64_t const numPages = rt::computeKvPoolFloorPages(
-        static_cast<int32_t>(mBuilderConfig.maxBatchSize), static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
+    // pool-shaped).
+    int64_t const numPages = mBuilderConfig.resolvedKVPoolPages();
     for (int i = 0; i < mNbKVCacheInputs; ++i)
     {
         // Per-layer dims mirror the runtime registry (kv_layer_configs): head size varies on

@@ -17,6 +17,8 @@
 
 #include "runtime/exec/registryBuilder.h"
 #include "common/bindingNames.h"
+#include "common/checkMacros.h"
+#include "common/pagedKvTypes.h"
 #include "runtime/hybridCacheManager.h"
 #include "runtime/kvCacheManager.h"
 #include <algorithm>
@@ -71,6 +73,9 @@ LLMEngineConfig makeBasicLLMConfig()
     cfg.maxSupportedBatchSize = 4;
     cfg.maxSupportedInputLength = 2048;
     cfg.maxKVCacheCapacity = 4096;
+    int64_t const minimumActivePages = computeMinimumKvPoolPages(cfg.maxSupportedBatchSize, cfg.maxKVCacheCapacity);
+    ELLM_CHECK(minimumActivePages <= kMAX_KV_POOL_PAGES, "Test KV pool page count must fit int32.");
+    cfg.kvPoolPages = static_cast<int32_t>(minimumActivePages);
     populateHybridFieldsFromScalars(cfg);
     return cfg;
 }
@@ -188,6 +193,20 @@ TEST(RegistryBuilderTest, DiffusionBackboneUnifiedConditioningAddsInputs)
     EXPECT_EQ(nextFeedback->shape[0].symbol, &InferenceDims::batch);
     EXPECT_EQ(nextFeedback->shape[1].symbol, &InferenceDims::selectLen);
     EXPECT_EQ(nextFeedback->shape[2].value, cfg.hiddenSize);
+}
+
+TEST(RegistryBuilderTest, KVCacheBindingUsesEnginePoolPages)
+{
+    LLMEngineConfig cfg = makeBasicLLMConfig();
+    cfg.kvPoolPages += 7;
+
+    auto const specs = buildRegistryForLLM(cfg).allExpandedSpecs();
+    auto const it = std::find_if(
+        specs.begin(), specs.end(), [](TensorSpec const& spec) { return spec.name == "past_key_values_0"; });
+
+    ASSERT_NE(it, specs.end());
+    ASSERT_EQ(it->shape.size(), 5U);
+    EXPECT_EQ(it->shape[1].value, cfg.kvPoolPages);
 }
 
 TEST(RegistryBuilderTest, StandardLLMHasCorrectSpecAttributes)

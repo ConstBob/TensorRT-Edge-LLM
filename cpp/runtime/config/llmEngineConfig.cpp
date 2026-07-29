@@ -391,6 +391,22 @@ void parseCoreFields(Json const& configJson, LLMEngineConfig& cfg)
     requirePositive(cfg.maxSupportedBatchSize, "max_batch_size");
     requirePositive(cfg.maxSupportedInputLength, "max_input_len");
     requirePositive(cfg.maxKVCacheCapacity, "max_kv_cache_capacity");
+    ELLM_CHECK(cfg.maxKVCacheCapacity <= kMAX_KV_CACHE_CAPACITY,
+        "parseEngineConfig: max_kv_cache_capacity (" + std::to_string(cfg.maxKVCacheCapacity)
+            + ") exceeds the largest value that remains int32 after page alignment ("
+            + std::to_string(kMAX_KV_CACHE_CAPACITY) + ")");
+    int64_t const minimumActivePages = computeMinimumKvPoolPages(cfg.maxSupportedBatchSize, cfg.maxKVCacheCapacity);
+    int64_t const serializedKvPoolPages = getRequired<int64_t>(bc, "max_kv_pool_pages");
+    ELLM_CHECK(minimumActivePages <= kMAX_KV_POOL_PAGES,
+        "parseEngineConfig: minimum active pages (" + std::to_string(minimumActivePages) + ")"
+            + " exceeds the largest int32-addressable paged-KV pool " + std::to_string(kMAX_KV_POOL_PAGES) + ".");
+    ELLM_CHECK(serializedKvPoolPages >= minimumActivePages,
+        "parseEngineConfig: max_kv_pool_pages (" + std::to_string(serializedKvPoolPages)
+            + ") cannot be smaller than the minimum active pages (" + std::to_string(minimumActivePages) + ")");
+    ELLM_CHECK(serializedKvPoolPages <= kMAX_KV_POOL_PAGES,
+        "parseEngineConfig: max_kv_pool_pages (" + std::to_string(serializedKvPoolPages)
+            + ") exceeds the largest int32-addressable paged-KV pool (" + std::to_string(kMAX_KV_POOL_PAGES) + ")");
+    cfg.kvPoolPages = static_cast<int32_t>(serializedKvPoolPages);
     ELLM_CHECK(cfg.maxSupportedInputLength <= cfg.maxKVCacheCapacity,
         "parseEngineConfig: max_input_len (" + std::to_string(cfg.maxSupportedInputLength)
             + ") cannot be greater than max_kv_cache_capacity (" + std::to_string(cfg.maxKVCacheCapacity) + ")");
@@ -607,6 +623,16 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     cfg.convKernel = configJson.value("conv_kernel", 0);
     parseDFlashFields(configJson, cfg, cfg.numDecoderLayers);
     parseDSparkFields(configJson, cfg, cfg.numDecoderLayers);
+    if (cfg.isSpecDecodeBase && cfg.specDecodeType == SpecDecodeMode::kEAGLE
+        && configJson.contains("eagle_hidden_state_layers"))
+    {
+        Json const& layerIds = configJson["eagle_hidden_state_layers"];
+        ELLM_CHECK(layerIds.is_array(), "parseEngineConfig: eagle_hidden_state_layers must be an array when present.");
+        for (auto const& layerId : layerIds)
+        {
+            cfg.specTargetLayerIds.push_back(layerId.get<int32_t>());
+        }
+    }
 
     auto const& bc = configJson["builder_config"];
     cfg.maxSupportedLoraRank = bc.value("max_lora_rank", 0);
@@ -815,7 +841,7 @@ std::string formatEngineConfig(LLMEngineConfig const& cfg)
        << " numAttentionLayers=" << cfg.numAttentionLayers << " numKVHeads=" << cfg.numKVHeads
        << " headDim=" << cfg.headDim << " rotaryDim=" << cfg.rotaryDim << " maxBatch=" << cfg.maxSupportedBatchSize
        << " maxInputLen=" << cfg.maxSupportedInputLength << " maxKVCapacity=" << cfg.maxKVCacheCapacity
-       << " pleEnabled=" << cfg.pleEnabled << " numPleInputs=" << cfg.numPleInputs
+       << " kvPoolPages=" << cfg.kvPoolPages << " pleEnabled=" << cfg.pleEnabled << " numPleInputs=" << cfg.numPleInputs
        << " pleHiddenSize=" << cfg.pleHiddenSize << " isSpecDecodeBase=" << cfg.isSpecDecodeBase
        << " specDecodeType=" << static_cast<int>(cfg.specDecodeType) << " loraRank=" << cfg.maxSupportedLoraRank;
     if (cfg.useDualRope)
@@ -1039,8 +1065,97 @@ InferenceDims LLMEngineConfig::acceptDims(int64_t batch, int64_t acceptLen) cons
     };
 }
 
+void validatePagedKVBindings(LLMEngineConfig const& config, EngineExecutor const& executor, char const* engineLabel)
+{
+    if (config.numAttentionLayers == 0)
+    {
+        return;
+    }
+
+    ELLM_CHECK(static_cast<int32_t>(config.kvLayerConfigs.size()) == config.numAttentionLayers,
+        std::string("KV layer metadata mismatch (") + engineLabel + "): expected "
+            + std::to_string(config.numAttentionLayers) + " entries, got "
+            + std::to_string(config.kvLayerConfigs.size()) + ".");
+    int32_t const numProfiles = executor.getEngine().getNbOptimizationProfiles();
+    ELLM_CHECK(numProfiles > 0, std::string("Engine has no optimization profiles (") + engineLabel + ").");
+
+    for (int32_t layerIdx = 0; layerIdx < config.numAttentionLayers; ++layerIdx)
+    {
+        std::string const bindingName = binding_names::formatKVCacheName(layerIdx, /*isPast=*/true);
+        ELLM_CHECK(executor.hasIOTensor(bindingName.c_str()),
+            std::string("Missing KV cache binding (") + engineLabel + "): expected '" + bindingName + "'.");
+        nvinfer1::DataType const engineDtype = executor.getBindingDataType(bindingName.c_str());
+        ELLM_CHECK(engineDtype == config.kvCacheDtype,
+            std::string("KV cache dtype mismatch (") + engineLabel + "): config says "
+                + getDataTypeString(config.kvCacheDtype) + ", engine reports " + getDataTypeString(engineDtype)
+                + " for binding '" + bindingName + "'.");
+
+        KVLayerConfig const& layer = config.kvLayerConfigs[layerIdx];
+        for (int32_t profileIdx = 0; profileIdx < numProfiles; ++profileIdx)
+        {
+            for (nvinfer1::OptProfileSelector const selector : {nvinfer1::OptProfileSelector::kMIN,
+                     nvinfer1::OptProfileSelector::kOPT, nvinfer1::OptProfileSelector::kMAX})
+            {
+                nvinfer1::Dims const shape = executor.getProfileShape(bindingName.c_str(), profileIdx, selector);
+                ELLM_CHECK(shape.nbDims == 5 && shape.d[0] == 2 && shape.d[1] == config.kvPoolPages
+                        && shape.d[2] == kTOKENS_PER_PAGE && shape.d[3] == layer.numKVHeads
+                        && shape.d[4] == layer.headDim,
+                    std::string("Paged KV profile mismatch (") + engineLabel + ") for binding '" + bindingName
+                        + "': expected [2," + std::to_string(config.kvPoolPages) + ","
+                        + std::to_string(kTOKENS_PER_PAGE) + "," + std::to_string(layer.numKVHeads) + ","
+                        + std::to_string(layer.headDim) + "] for every profile selector.");
+            }
+        }
+    }
+}
+
+namespace
+{
+
+//! Validate the current mutable page-table engine ABI.
+void validatePageTableBinding(LLMEngineConfig const& config, EngineExecutor const& executor, char const* engineLabel)
+{
+    if (config.numAttentionLayers == 0)
+    {
+        return;
+    }
+
+    char const* const bindingName = binding_names::kKVPageTable;
+    ELLM_CHECK(executor.hasIOTensor(bindingName),
+        std::string("Missing page-table binding (") + engineLabel + "): expected '" + bindingName
+            + "' from the current engine toolchain.");
+    ELLM_CHECK(executor.getEngine().getTensorIOMode(bindingName) == nvinfer1::TensorIOMode::kINPUT,
+        std::string("Page-table binding (") + engineLabel + ") must be an input.");
+    ELLM_CHECK(executor.getBindingDataType(bindingName) == nvinfer1::DataType::kINT32,
+        std::string("Page-table binding (") + engineLabel + ") must have INT32 dtype.");
+
+    int32_t const numProfiles = executor.getEngine().getNbOptimizationProfiles();
+    ELLM_CHECK(numProfiles > 0, std::string("Engine has no optimization profiles (") + engineLabel + ").");
+    int32_t const maxPagesPerSequence = computeMaxPagesPerSeq(config.maxKVCacheCapacity);
+    for (int32_t profileIdx = 0; profileIdx < numProfiles; ++profileIdx)
+    {
+        for (nvinfer1::OptProfileSelector const selector : {nvinfer1::OptProfileSelector::kMIN,
+                 nvinfer1::OptProfileSelector::kOPT, nvinfer1::OptProfileSelector::kMAX})
+        {
+            int32_t const expectedBatch
+                = selector == nvinfer1::OptProfileSelector::kMIN ? 1 : config.maxSupportedBatchSize;
+            nvinfer1::Dims const shape = executor.getProfileShape(bindingName, profileIdx, selector);
+            ELLM_CHECK(shape.nbDims == 3 && shape.d[0] == expectedBatch && shape.d[1] == 2
+                    && shape.d[2] == maxPagesPerSequence,
+                std::string("Page-table profile mismatch (") + engineLabel + ") for binding '" + bindingName
+                    + "': expected [" + std::to_string(expectedBatch) + ",2," + std::to_string(maxPagesPerSequence)
+                    + "]. Re-export and rebuild the engine.");
+        }
+    }
+}
+
+} // namespace
+
 void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& executor, char const* engineLabel)
 {
+    validatePagedKVBindings(config, executor, engineLabel);
+    validatePageTableBinding(config, executor, engineLabel);
+
     if (isDFlashDraftConfig(config))
     {
         // DFlash cached draft engines require KV cache bindings (cached-KV path).
@@ -1158,11 +1273,12 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
                         std::string("Gemma4 MTP shared KV binding '") + kvPastName + "' must be rank-5.");
                     // Paged pool binding [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim];
                     // numPages (dim 1) is engine-specific.
-                    ELLM_CHECK(shape.d[0] == 2 && shape.d[2] == kTOKENS_PER_PAGE && shape.d[3] == kvConfig.numKVHeads
-                            && shape.d[4] == kvConfig.headDim,
+                    ELLM_CHECK(shape.d[0] == 2 && shape.d[1] == config.kvPoolPages && shape.d[2] == kTOKENS_PER_PAGE
+                            && shape.d[3] == kvConfig.numKVHeads && shape.d[4] == kvConfig.headDim,
                         std::string("Gemma4 MTP shared KV profile shape mismatch for binding '") + kvPastName
-                            + "': expected static dims [2,*," + std::to_string(kTOKENS_PER_PAGE) + ","
-                            + std::to_string(kvConfig.numKVHeads) + "," + std::to_string(kvConfig.headDim) + "].");
+                            + "': expected static dims [2," + std::to_string(config.kvPoolPages) + ","
+                            + std::to_string(kTOKENS_PER_PAGE) + "," + std::to_string(kvConfig.numKVHeads) + ","
+                            + std::to_string(kvConfig.headDim) + "].");
                 }
             }
         }

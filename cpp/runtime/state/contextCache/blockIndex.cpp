@@ -29,14 +29,14 @@ namespace trt_edgellm
 namespace rt
 {
 
-BaseLookupResult BaseBlockIndex::lookupPrefix(CacheDomainId domain, std::vector<BlockHash> const& hashes) const
+BaseLookupResult BaseBlockIndex::lookupPrefix(std::vector<BlockHash> const& hashes) const
 {
     BaseLookupResult result;
     result.pageIds.reserve(hashes.size());
     result.matchedHashes.reserve(hashes.size());
     for (BlockHash const& hash : hashes)
     {
-        auto const iter = mForward.find(BaseBlockKey{domain, hash});
+        auto const iter = mForward.find(hash);
         if (iter == mForward.end())
         {
             break;
@@ -47,9 +47,9 @@ BaseLookupResult BaseBlockIndex::lookupPrefix(CacheDomainId domain, std::vector<
     return result;
 }
 
-std::optional<PageId> BaseBlockIndex::lookup(BaseBlockKey const& key) const
+std::optional<PageId> BaseBlockIndex::lookup(BlockHash const& hash) const
 {
-    auto const iter = mForward.find(key);
+    auto const iter = mForward.find(hash);
     if (iter == mForward.end())
     {
         return std::nullopt;
@@ -57,9 +57,9 @@ std::optional<PageId> BaseBlockIndex::lookup(BaseBlockKey const& key) const
     return iter->second;
 }
 
-BaseInsertResult BaseBlockIndex::insert(BaseBlockKey key, PageId proposedPage)
+BaseInsertResult BaseBlockIndex::insert(BlockHash hash, PageId proposedPage)
 {
-    auto const existing = mForward.find(key);
+    auto const existing = mForward.find(hash);
     if (existing != mForward.end())
     {
         return BaseInsertResult{existing->second, false};
@@ -69,14 +69,14 @@ BaseInsertResult BaseBlockIndex::insert(BaseBlockKey key, PageId proposedPage)
 
     // Updating the forward and reverse maps is one transaction. If the reverse insertion allocates and throws, the
     // catch below removes the forward entry so readers never observe a one-sided mapping.
-    auto const [forwardIter, inserted] = mForward.emplace(key, proposedPage);
+    auto const [forwardIter, inserted] = mForward.emplace(hash, proposedPage);
     if (!inserted)
     {
         return BaseInsertResult{forwardIter->second, false};
     }
     try
     {
-        auto const [reverseIter, reverseInserted] = mReverse.emplace(proposedPage, key);
+        auto const [reverseIter, reverseInserted] = mReverse.emplace(proposedPage, hash);
         (void) reverseIter;
         ELLM_CHECK(reverseInserted, "Context cache page is already indexed by another block");
     }
@@ -112,50 +112,32 @@ size_t BaseBlockIndex::size() const noexcept
 
 void DraftPathIndex::insert(CacheRecord const& record)
 {
-    insertFrom(record, 1);
-}
-
-void DraftPathIndex::insertFrom(CacheRecord const& record, int32_t firstBlockCount)
-{
     ELLM_CHECK(record.id != 0, "Cannot index draft state without a context cache record ID");
-    ELLM_CHECK(record.draftSignature.has_value() && record.pairedDraftFullBlockCount > 0,
-        "Cannot index a context cache record without paired draft state");
-    ELLM_CHECK(firstBlockCount > 0 && firstBlockCount <= record.pairedDraftFullBlockCount,
-        "Context cache draft path insertion start is outside the paired path");
-    ELLM_CHECK(static_cast<size_t>(record.pairedDraftFullBlockCount) <= record.logicalBlockHashes.size()
-            && static_cast<size_t>(record.pairedDraftFullBlockCount) <= record.draftPagePath.size(),
-        "Context cache draft path count exceeds its record paths");
-    for (int32_t blockCount = 1; blockCount < firstBlockCount; ++blockCount)
-    {
-        DraftPathKey const key{
-            *record.draftSignature, record.key.domain, record.logicalBlockHashes[static_cast<size_t>(blockCount - 1)]};
-        ELLM_CHECK(contains(key, DraftPathMatch{record.id, blockCount}),
-            "Context cache draft path extension is missing an existing boundary");
-    }
+    ELLM_CHECK(!record.draftPagePath.empty(), "Cannot index a context cache record without paired draft state");
+    ELLM_CHECK(record.draftPagePath.size() == record.logicalBlockHashes.size(),
+        "Context cache draft path must cover its full logical path");
 
-    size_t const pathCount = static_cast<size_t>(record.pairedDraftFullBlockCount);
-    size_t const firstIndex = static_cast<size_t>(firstBlockCount - 1);
-    size_t const insertionCount = pathCount - firstIndex;
-    mForward.reserve(mForward.size() + insertionCount);
-    std::vector<DraftPathKey> createdKeys;
-    std::vector<std::pair<DraftPathKey, DraftPathMatch>> insertedMatches;
-    createdKeys.reserve(insertionCount);
-    insertedMatches.reserve(insertionCount);
+    size_t const pathCount = record.draftPagePath.size();
+    mForward.reserve(mForward.size() + pathCount);
+    std::vector<BlockHash> createdKeys;
+    std::vector<std::pair<BlockHash, DraftPathMatch>> insertedMatches;
+    createdKeys.reserve(pathCount);
+    insertedMatches.reserve(pathCount);
     try
     {
-        for (size_t index = firstIndex; index < pathCount; ++index)
+        for (size_t index = 0; index < pathCount; ++index)
         {
-            DraftPathKey const key{*record.draftSignature, record.key.domain, record.logicalBlockHashes[index]};
+            BlockHash const terminalHash = record.logicalBlockHashes[index];
             DraftPathMatch const match{record.id, static_cast<int32_t>(index + 1)};
-            auto const [entry, inserted] = mForward.try_emplace(key);
+            auto const [entry, inserted] = mForward.try_emplace(terminalHash);
             ELLM_CHECK(std::find(entry->second.begin(), entry->second.end(), match) == entry->second.end(),
                 "Context cache draft path record is already indexed");
             if (inserted)
             {
-                createdKeys.push_back(key);
+                createdKeys.push_back(terminalHash);
             }
             entry->second.push_back(match);
-            insertedMatches.emplace_back(key, match);
+            insertedMatches.emplace_back(terminalHash, match);
         }
     }
     catch (...)
@@ -187,41 +169,44 @@ void DraftPathIndex::insertFrom(CacheRecord const& record, int32_t firstBlockCou
     }
 }
 
-std::optional<DraftPathMatch> DraftPathIndex::lookupLongest(DraftEngineSignature signature, CacheDomainId domain,
+std::optional<DraftPathMatch> DraftPathIndex::lookupLongest(
     std::vector<BlockHash> const& hashes, int32_t maxBlockCount) const
 {
     ELLM_CHECK(maxBlockCount >= 0 && static_cast<size_t>(maxBlockCount) <= hashes.size(),
         "Context cache draft lookup block count exceeds its hash path");
     for (int32_t blockCount = maxBlockCount; blockCount > 0; --blockCount)
     {
-        DraftPathKey const key{signature, domain, hashes[static_cast<size_t>(blockCount - 1)]};
-        auto const entry = mForward.find(key);
+        auto const entry = mForward.find(hashes[static_cast<size_t>(blockCount - 1)]);
         if (entry != mForward.end() && !entry->second.empty())
         {
-            return entry->second.back();
+            auto const match = std::find_if(entry->second.rbegin(), entry->second.rend(),
+                [blockCount](DraftPathMatch const& candidate) { return candidate.pathBlockCount == blockCount; });
+            if (match != entry->second.rend())
+            {
+                return *match;
+            }
         }
     }
     return std::nullopt;
 }
 
-bool DraftPathIndex::contains(DraftPathKey const& key, DraftPathMatch const& match) const
+bool DraftPathIndex::contains(BlockHash const& terminalHash, DraftPathMatch const& match) const
 {
-    auto const entry = mForward.find(key);
+    auto const entry = mForward.find(terminalHash);
     return entry != mForward.end()
         && std::find(entry->second.begin(), entry->second.end(), match) != entry->second.end();
 }
 
 void DraftPathIndex::erase(CacheRecord const& record)
 {
-    if (!record.draftSignature.has_value())
+    if (record.draftPagePath.empty())
     {
         return;
     }
-    for (int32_t blockCount = 1; blockCount <= record.pairedDraftFullBlockCount; ++blockCount)
+    for (int32_t blockCount = 1; blockCount <= static_cast<int32_t>(record.draftPagePath.size()); ++blockCount)
     {
-        DraftPathKey const key{
-            *record.draftSignature, record.key.domain, record.logicalBlockHashes[static_cast<size_t>(blockCount - 1)]};
-        auto entry = mForward.find(key);
+        BlockHash const terminalHash = record.logicalBlockHashes[static_cast<size_t>(blockCount - 1)];
+        auto entry = mForward.find(terminalHash);
         ELLM_CHECK(entry != mForward.end(), "Context cache draft path index is missing a record boundary");
         DraftPathMatch const match{record.id, blockCount};
         auto const candidate = std::find(entry->second.begin(), entry->second.end(), match);

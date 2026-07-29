@@ -53,6 +53,21 @@ rt::KVCacheManager::Config makeHeteroConfig(
 
 } // namespace
 
+TEST(KvCacheManagerPagedPoolTest, RejectsOverflowGeometryBeforeAllocation)
+{
+    rt::KVCacheManager::Config config;
+    config.numAttentionLayers = 0;
+    config.maxBatchSize = std::numeric_limits<int32_t>::max();
+    config.maxSequenceLength = rt::kMAX_KV_CACHE_CAPACITY;
+    config.kvCacheType = DataType::kHALF;
+    EXPECT_THROW(rt::KVCacheManager(config, /*stream=*/nullptr), std::runtime_error);
+
+    config.maxBatchSize = 1;
+    config.maxSequenceLength = rt::kTOKENS_PER_PAGE;
+    config.numPages = static_cast<int32_t>(rt::kMAX_KV_POOL_PAGES + 1);
+    EXPECT_THROW(rt::KVCacheManager(config, /*stream=*/nullptr), std::runtime_error);
+}
+
 // The combined per-layer buffer is slot-shaped NHD [2, maxBatch, capPadded, H_i, D_i]. maxSeq
 // below (200) is deliberately NOT a multiple of 128 so the padding (-> 256) is exercised.
 TEST(KvCacheManagerPagedPoolTest, CombinedCacheIsSlotShapedWithPaddedCapacity)
@@ -151,22 +166,21 @@ TEST(KvCacheManagerPagedPoolTest, Fp8PoolHasSameShapeAndCorrectByteOffset)
     EXPECT_EQ(mgr.vPoolPtr(0), static_cast<void const*>(expectedV));
 }
 
-// Robustness: Config::numPages may request a pool larger than the
-// active-capacity floor. numPages()/getCombinedKVCachePoolView() must reflect the configured
-// (larger) value; the "live" slot-shaped view (getSeparateKVCache/kPoolPtr/vPoolPtr) stays
-// correctly addressed (V-half starts at the real numPages, not the floor).
-TEST(KvCacheManagerPagedPoolTest, RetentionPagesAllocateBeyondFloorAndStayConsistent)
+// Config::numPages may include extra retained pages beyond the minimum active pages.
+// numPages()/getCombinedKVCachePoolView() expose the configured count, while the active
+// slot-shaped views stay correctly addressed from the physical K/V pool bases.
+TEST(KvCacheManagerPagedPoolTest, ExtraRetainedPagesAllocateAndStayConsistent)
 {
     cudaStream_t stream{nullptr};
 
     int32_t const maxBatch = 2;
-    int32_t const maxSeq = 200; // -> capPadded == 256, floor == maxBatch * 2 == 4
+    int32_t const maxSeq = 200; // -> capPadded == 256, minimum active pages == maxBatch * 2 == 4
     int32_t const h = 4, d = 64;
 
-    int32_t const floorPages = maxBatch * padToPage(maxSeq) / rt::kTOKENS_PER_PAGE;
-    ASSERT_EQ(floorPages, 4);
-    int32_t const extraRetentionPages = 6;
-    int32_t const requestedPages = floorPages + extraRetentionPages;
+    int32_t const minimumActivePages = maxBatch * padToPage(maxSeq) / rt::kTOKENS_PER_PAGE;
+    ASSERT_EQ(minimumActivePages, 4);
+    int32_t const extraRetainedPages = 6;
+    int32_t const requestedPages = minimumActivePages + extraRetainedPages;
 
     rt::KVCacheManager::Config config = makeHeteroConfig(maxBatch, maxSeq, h, d, h, d, DataType::kHALF);
     config.numPages = requestedPages;
@@ -174,6 +188,7 @@ TEST(KvCacheManagerPagedPoolTest, RetentionPagesAllocateBeyondFloorAndStayConsis
 
     EXPECT_EQ(mgr.numPages(), requestedPages);
     EXPECT_EQ(mgr.maxCapPadded(), padToPage(maxSeq));
+    EXPECT_THROW((void) mgr.getCombinedKVCache(0), std::runtime_error);
 
     for (int32_t i = 0; i < 2; ++i)
     {
@@ -186,15 +201,15 @@ TEST(KvCacheManagerPagedPoolTest, RetentionPagesAllocateBeyondFloorAndStayConsis
         EXPECT_EQ(poolShape[3], h) << "layer " << i;
         EXPECT_EQ(poolShape[4], d) << "layer " << i;
 
-        // vPoolPtr is offset by the REAL numPages (not the floor) from kPoolPtr.
+        // vPoolPtr is offset from kPoolPtr by the configured numPages, including extra retained pages.
         size_t const elemSize = rt::utils::getTypeSize(DataType::kHALF);
         int64_t const kCacheElems = static_cast<int64_t>(requestedPages) * rt::kTOKENS_PER_PAGE * h * d;
         auto const* expectedV
             = static_cast<char const*>(mgr.kPoolPtr(i)) + kCacheElems * static_cast<int64_t>(elemSize);
         EXPECT_EQ(mgr.vPoolPtr(i), static_cast<void const*>(expectedV)) << "layer " << i;
 
-        // getSeparateKVCache still returns the floor-sized "live" slot view, correctly based at the
-        // (offset) kPoolPtr/vPoolPtr rather than a floor-based V offset.
+        // getSeparateKVCache still returns the slot view sized to the minimum active pages and based
+        // at the physical kPoolPtr/vPoolPtr bases.
         auto [kView, vView] = mgr.getSeparateKVCache(i);
         EXPECT_EQ(kView.rawPointer(), mgr.kPoolPtr(i)) << "layer " << i;
         EXPECT_EQ(vView.rawPointer(), mgr.vPoolPtr(i)) << "layer " << i;
@@ -205,13 +220,13 @@ TEST(KvCacheManagerPagedPoolTest, RetentionPagesAllocateBeyondFloorAndStayConsis
     }
 }
 
-TEST(KvCacheManagerPagedPoolTest, NumPagesOverrideBelowFloorRejected)
+TEST(KvCacheManagerPagedPoolTest, NumPagesOverrideBelowMinimumActivePagesRejected)
 {
     cudaStream_t stream{nullptr};
 
     int32_t const maxBatch = 2;
-    int32_t const maxSeq = 200; // floor == 4
+    int32_t const maxSeq = 200; // minimum active pages == 4
     rt::KVCacheManager::Config config = makeHeteroConfig(maxBatch, maxSeq, 4, 64, 4, 64, DataType::kHALF);
-    config.numPages = 1; // below the floor of 4
+    config.numPages = 1; // below the minimum active page count of 4
     EXPECT_THROW(rt::KVCacheManager mgr(config, stream), std::exception);
 }

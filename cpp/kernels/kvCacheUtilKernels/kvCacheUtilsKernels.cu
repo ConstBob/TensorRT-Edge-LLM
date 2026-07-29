@@ -260,7 +260,7 @@ void saveKVCacheLayerIntoTensor(
 ///   - cacheInfo.maxSeqLen carries the cache row's token capacity (capPadded).
 template <typename T, int32_t HEAD_DIM, bool TENSOR_TO_CACHE>
 __global__ void batchedKVCacheCopyKernel(KVLayerInfo const* __restrict__ cacheLayerInfos,
-    KVLayerInfo const* __restrict__ tensorLayerInfos, int64_t kvCacheMaxBatch, int64_t batchIdx, int64_t sequenceLength)
+    KVLayerInfo const* __restrict__ tensorLayerInfos, int64_t kvPoolPages, int64_t batchIdx, int64_t sequenceLength)
 {
     static_assert(HEAD_DIM == 64 || HEAD_DIM == 128 || HEAD_DIM == 256 || HEAD_DIM == 512,
         "Only HEAD_DIM = 64, 128, 256, or 512 is supported.");
@@ -283,7 +283,7 @@ __global__ void batchedKVCacheCopyKernel(KVLayerInfo const* __restrict__ cacheLa
     int64_t const blockElems = sequenceLength * static_cast<int64_t>(numKVHeads) * HEAD_DIM;
 
     // Cache half base: K-half starts at element 0, V-half one full half-pool later.
-    int64_t const halfStride = static_cast<int64_t>(kvCacheMaxBatch) * capPadded * numKVHeads * HEAD_DIM;
+    int64_t const halfStride = kvPoolPages * static_cast<int64_t>(rt::kTOKENS_PER_PAGE) * numKVHeads * HEAD_DIM;
     int64_t const cacheOffset
         = static_cast<int64_t>(kvIdx) * halfStride + batchIdx * static_cast<int64_t>(capPadded) * numKVHeads * HEAD_DIM;
 
@@ -315,7 +315,7 @@ __global__ void batchedKVCacheCopyKernel(KVLayerInfo const* __restrict__ cacheLa
 }
 
 void saveKVCacheBatched(KVLayerInfo const* srcLayerInfos, KVLayerInfo const* dstLayerInfos, int32_t numLayers,
-    int32_t headDim, int32_t maxBatchSize, int32_t batchIdx, int32_t sequenceLength, cudaStream_t stream)
+    int32_t headDim, int32_t kvPoolPages, int32_t batchIdx, int32_t sequenceLength, cudaStream_t stream)
 {
     if (numLayers == 0 || sequenceLength == 0)
     {
@@ -330,19 +330,19 @@ void saveKVCacheBatched(KVLayerInfo const* srcLayerInfos, KVLayerInfo const* dst
     {
     case 64:
         batchedKVCacheCopyKernel<half, 64, false>
-            <<<grid, block, 0, stream>>>(srcLayerInfos, dstLayerInfos, maxBatchSize, batchIdx, sequenceLength);
+            <<<grid, block, 0, stream>>>(srcLayerInfos, dstLayerInfos, kvPoolPages, batchIdx, sequenceLength);
         break;
     case 128:
         batchedKVCacheCopyKernel<half, 128, false>
-            <<<grid, block, 0, stream>>>(srcLayerInfos, dstLayerInfos, maxBatchSize, batchIdx, sequenceLength);
+            <<<grid, block, 0, stream>>>(srcLayerInfos, dstLayerInfos, kvPoolPages, batchIdx, sequenceLength);
         break;
     case 256:
         batchedKVCacheCopyKernel<half, 256, false>
-            <<<grid, block, 0, stream>>>(srcLayerInfos, dstLayerInfos, maxBatchSize, batchIdx, sequenceLength);
+            <<<grid, block, 0, stream>>>(srcLayerInfos, dstLayerInfos, kvPoolPages, batchIdx, sequenceLength);
         break;
     case 512:
         batchedKVCacheCopyKernel<half, 512, false>
-            <<<grid, block, 0, stream>>>(srcLayerInfos, dstLayerInfos, maxBatchSize, batchIdx, sequenceLength);
+            <<<grid, block, 0, stream>>>(srcLayerInfos, dstLayerInfos, kvPoolPages, batchIdx, sequenceLength);
         break;
     default:
         throw std::invalid_argument(
@@ -352,7 +352,7 @@ void saveKVCacheBatched(KVLayerInfo const* srcLayerInfos, KVLayerInfo const* dst
 }
 
 void instantiateKVCacheBatched(KVLayerInfo const* dstLayerInfos, KVLayerInfo const* srcLayerInfos, int32_t numLayers,
-    int32_t headDim, int32_t maxBatchSize, int32_t batchIdx, int32_t sequenceLength, cudaStream_t stream)
+    int32_t headDim, int32_t kvPoolPages, int32_t batchIdx, int32_t sequenceLength, cudaStream_t stream)
 {
     if (numLayers == 0 || sequenceLength == 0)
     {
@@ -367,19 +367,19 @@ void instantiateKVCacheBatched(KVLayerInfo const* dstLayerInfos, KVLayerInfo con
     {
     case 64:
         batchedKVCacheCopyKernel<half, 64, true>
-            <<<grid, block, 0, stream>>>(dstLayerInfos, srcLayerInfos, maxBatchSize, batchIdx, sequenceLength);
+            <<<grid, block, 0, stream>>>(dstLayerInfos, srcLayerInfos, kvPoolPages, batchIdx, sequenceLength);
         break;
     case 128:
         batchedKVCacheCopyKernel<half, 128, true>
-            <<<grid, block, 0, stream>>>(dstLayerInfos, srcLayerInfos, maxBatchSize, batchIdx, sequenceLength);
+            <<<grid, block, 0, stream>>>(dstLayerInfos, srcLayerInfos, kvPoolPages, batchIdx, sequenceLength);
         break;
     case 256:
         batchedKVCacheCopyKernel<half, 256, true>
-            <<<grid, block, 0, stream>>>(dstLayerInfos, srcLayerInfos, maxBatchSize, batchIdx, sequenceLength);
+            <<<grid, block, 0, stream>>>(dstLayerInfos, srcLayerInfos, kvPoolPages, batchIdx, sequenceLength);
         break;
     case 512:
         batchedKVCacheCopyKernel<half, 512, true>
-            <<<grid, block, 0, stream>>>(dstLayerInfos, srcLayerInfos, maxBatchSize, batchIdx, sequenceLength);
+            <<<grid, block, 0, stream>>>(dstLayerInfos, srcLayerInfos, kvPoolPages, batchIdx, sequenceLength);
         break;
     default:
         throw std::invalid_argument(

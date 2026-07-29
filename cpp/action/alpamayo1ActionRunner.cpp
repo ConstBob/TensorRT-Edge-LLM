@@ -220,7 +220,7 @@ std::pair<rt::Tensor&, rt::Tensor&> Alpamayo1ActionRunner::getSeparateKVCacheFor
     // of D elements: source row pitch = H*D (NHD token stride), dest row pitch = D (contiguous).
     // K-half/V-half base pointers come from getSeparateKVCache() rather than a fixed
     // maxBatch*capPadded*H*D offset from a single combined pointer, so this stays correct if the
-    // pool has retention pages beyond the active-capacity floor (see KVCacheManager::numPages()).
+    // pool has extra retained pages beyond the minimum active pages (see KVCacheManager::numPages()).
     size_t const srcSlotStride = static_cast<size_t>(capPadded) * H * D * elemSize; // per request, within a half
     size_t const srcRowPitch = static_cast<size_t>(H) * D * elemSize;               // NHD token stride
     size_t const dstRowPitch = static_cast<size_t>(D) * elemSize;

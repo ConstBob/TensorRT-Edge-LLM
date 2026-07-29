@@ -47,9 +47,7 @@ bool hasNegativePage(std::vector<PageId> const& pages) noexcept
 
 void validateRecord(CacheRecord const& record)
 {
-    bool const hasHybridIdentity = record.exactCheckpointDigest.has_value() || record.recurrentStateSchema.has_value();
-    ELLM_CHECK(record.exactCheckpointDigest.has_value() == record.recurrentStateSchema.has_value(),
-        "Context cache hybrid checkpoint digest and recurrent schema must be present together");
+    bool const hasHybridIdentity = record.exactCheckpointLength.has_value();
     ELLM_CHECK(record.key.fullBlockCount >= 0, "Context cache record full block count must be non-negative");
     ELLM_CHECK(record.key.fullBlockCount > 0 || hasHybridIdentity,
         "Context cache record must contain a full block or an exact hybrid checkpoint");
@@ -57,33 +55,19 @@ void validateRecord(CacheRecord const& record)
         "Context cache record logical block count does not match its key");
     if (hasHybridIdentity)
     {
-        ELLM_CHECK(record.exactCheckpointLength.has_value() && *record.exactCheckpointLength > 0
-                && record.recurrentSnapshotSlot.has_value(),
+        ELLM_CHECK(*record.exactCheckpointLength > 0 && record.recurrentSnapshotSlot.has_value(),
             "Context cache hybrid checkpoint requires a positive exact length and recurrent snapshot");
-        ELLM_CHECK(record.key.terminalHash == *record.exactCheckpointDigest,
-            "Context cache hybrid record key does not match its exact prefix digest");
     }
     else
     {
         ELLM_CHECK(record.key.terminalHash == record.logicalBlockHashes.back(),
             "Context cache record terminal hash does not match its logical path");
     }
-    ELLM_CHECK(record.baseFullBlockCount >= 0 && record.pairedDraftFullBlockCount >= 0,
-        "Context cache record full block counts must be non-negative");
-
-    size_t const baseFullBlockCount = static_cast<size_t>(record.baseFullBlockCount);
-    ELLM_CHECK(
-        baseFullBlockCount <= record.basePagePath.size() && baseFullBlockCount <= record.logicalBlockHashes.size(),
-        "Context cache record base full block count exceeds its paths");
-
-    size_t const pairedDraftFullBlockCount = static_cast<size_t>(record.pairedDraftFullBlockCount);
-    ELLM_CHECK(pairedDraftFullBlockCount <= record.draftPagePath.size()
-            && pairedDraftFullBlockCount <= record.logicalBlockHashes.size()
-            && pairedDraftFullBlockCount <= baseFullBlockCount,
-        "Context cache record paired draft full block count exceeds its paths");
-    ELLM_CHECK(record.draftSignature.has_value() == !record.draftPagePath.empty()
-            && record.draftSignature.has_value() == (record.pairedDraftFullBlockCount > 0),
-        "Context cache record draft signature, pages, and paired count must be present together");
+    ELLM_CHECK((hasHybridIdentity && record.basePagePath.empty())
+            || record.basePagePath.size() == record.logicalBlockHashes.size(),
+        "Context cache record base page path must cover its logical path");
+    ELLM_CHECK(record.draftPagePath.empty() || record.draftPagePath.size() == record.basePagePath.size(),
+        "Context cache record draft page path must be absent or cover its full base path");
     ELLM_CHECK(!hasNegativePage(record.basePagePath) && !hasNegativePage(record.draftPagePath),
         "Context cache record page IDs must be non-negative");
     ELLM_CHECK((!record.recurrentSnapshotSlot.has_value() || *record.recurrentSnapshotSlot >= 0)
@@ -122,11 +106,11 @@ std::vector<ResourceId> CacheRecord::resources() const
 
 std::optional<HybridCheckpointKey> CacheRecord::hybridKey() const
 {
-    if (!exactCheckpointLength.has_value() || !exactCheckpointDigest.has_value() || !recurrentStateSchema.has_value())
+    if (!exactCheckpointLength.has_value())
     {
         return std::nullopt;
     }
-    return HybridCheckpointKey{key.domain, *exactCheckpointDigest, *exactCheckpointLength, *recurrentStateSchema};
+    return HybridCheckpointKey{key.terminalHash, *exactCheckpointLength};
 }
 
 CacheRecordStore::CacheRecordStore(int32_t maxRecords)
@@ -227,15 +211,14 @@ std::optional<RecordId> CacheRecordStore::findHybrid(HybridCheckpointKey const& 
     return record->second;
 }
 
-std::vector<int32_t> CacheRecordStore::hybridCandidateLengths(
-    CacheDomainId domain, RecurrentStateSchemaId schema, int32_t inputTokenCount) const
+std::vector<int32_t> CacheRecordStore::hybridCandidateLengths(int32_t inputTokenCount) const
 {
     ELLM_CHECK(inputTokenCount >= 0, "Context cache hybrid input token count must be non-negative");
     std::vector<int32_t> lengths;
     for (auto const& [key, record] : mHybridIndex)
     {
         (void) record;
-        if (key.domain == domain && key.schema == schema && key.exactLength < inputTokenCount)
+        if (key.exactLength < inputTokenCount)
         {
             lengths.push_back(key.exactLength);
         }
@@ -257,21 +240,16 @@ bool CacheRecordStore::contains(RecordId id) const noexcept
     return mRecords.find(id) != mRecords.end();
 }
 
-void CacheRecordStore::setDraftState(
-    RecordId id, DraftEngineSignature signature, std::vector<PageId> draftPagePath, int32_t pairedFullBlockCount)
+void CacheRecordStore::setDraftState(RecordId id, std::vector<PageId> draftPagePath)
 {
     auto const record = mRecords.find(id);
     ELLM_CHECK(record != mRecords.end(), "Context cache record ID does not exist");
-    ELLM_CHECK(pairedFullBlockCount > 0, "Context cache draft state must contain a paired full block");
-    ELLM_CHECK(static_cast<size_t>(pairedFullBlockCount) <= draftPagePath.size()
-            && static_cast<size_t>(pairedFullBlockCount) <= record->second.record.logicalBlockHashes.size()
-            && pairedFullBlockCount <= record->second.record.baseFullBlockCount,
-        "Context cache draft state paired block count exceeds its paths");
+    ELLM_CHECK(record->second.record.draftPagePath.empty(), "Context cache record already has paired draft state");
+    ELLM_CHECK(!draftPagePath.empty() && draftPagePath.size() == record->second.record.basePagePath.size(),
+        "Context cache draft state must cover the full base path");
     ELLM_CHECK(!hasNegativePage(draftPagePath), "Context cache draft state page IDs must be non-negative");
 
-    record->second.record.draftSignature = signature;
     record->second.record.draftPagePath = std::move(draftPagePath);
-    record->second.record.pairedDraftFullBlockCount = pairedFullBlockCount;
     touch(id);
 }
 

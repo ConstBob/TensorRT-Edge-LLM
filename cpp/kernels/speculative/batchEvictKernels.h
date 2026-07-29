@@ -28,7 +28,7 @@ namespace kernel
 /// Per-layer KV cache metadata for batched kernel operations.
 struct KVLayerInfo
 {
-    void* data;         //!< Pointer to this layer's two-pool NHD KV buffer [2, maxB, capPadded, H, D]
+    void* data;         //!< Base of this layer's physical K-then-V page-pool allocation
     int32_t numKVHeads; //!< Number of KV heads for this layer
     int32_t maxSeqLen;  //!< Per-row token capacity of this layer's pool (capPadded)
     int32_t maxBatch;   //!< Allocation batch (outer dim of each K/V half); needed to compute the
@@ -88,6 +88,7 @@ void compactTensorBatch(rt::Tensor const& src, rt::Tensor const& batchMapping, r
  * @param liveLengths       [oldActiveBatch] GPU INT32 tensor (const input), live token length per old batch slot
  * @param numLayers         Number of layers in this group
  * @param headDim           Head dimension shared by all layers in this group
+ * @param kvPoolPages       Physical K-page count; determines the V-half offset
  * @param kvCacheType       KV pool dtype (kHALF or kFP8); selects the copy element type
  * @param oldActiveBatch    Number of batches before eviction
  * @param newActiveBatch    Number of batches after eviction
@@ -96,8 +97,8 @@ void compactTensorBatch(rt::Tensor const& src, rt::Tensor const& batchMapping, r
  * @throws std::invalid_argument for unsupported kvCacheType
  */
 void compactKVCacheBatched(KVLayerInfo const* layerInfos, rt::Tensor const& batchMapping, rt::Tensor const& liveLengths,
-    int32_t numLayers, int32_t headDim, nvinfer1::DataType kvCacheType, int32_t oldActiveBatch, int32_t newActiveBatch,
-    cudaStream_t stream);
+    int32_t numLayers, int32_t headDim, int32_t kvPoolPages, nvinfer1::DataType kvCacheType, int32_t oldActiveBatch,
+    int32_t newActiveBatch, cudaStream_t stream);
 
 } // namespace kernel
 } // namespace trt_edgellm

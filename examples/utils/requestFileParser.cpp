@@ -78,6 +78,37 @@ std::unordered_map<int32_t, float> parseLogitBias(Json const& logitBiasJson, std
     return logitBias;
 }
 
+rt::ContextCacheLookupPolicy parseContextCacheLookupPolicy(Json const& input)
+{
+    std::string const value = input.value("context_cache_lookup_policy", "use_cache");
+    if (value == "use_cache")
+    {
+        return rt::ContextCacheLookupPolicy::kUseCache;
+    }
+    if (value == "bypass")
+    {
+        return rt::ContextCacheLookupPolicy::kBypass;
+    }
+    throw std::runtime_error("context_cache_lookup_policy must be either 'use_cache' or 'bypass', got '" + value + "'");
+}
+
+rt::ContextCacheCommitPolicy parseContextCacheCommitPolicy(Json const& input)
+{
+    std::string const value = input.value("context_cache_commit_policy", "including_generated_tokens");
+    if (value == "including_generated_tokens")
+    {
+        return rt::ContextCacheCommitPolicy::kIncludingGeneratedTokens;
+    }
+    if (value == "prefill_state_only")
+    {
+        return rt::ContextCacheCommitPolicy::kPrefillStateOnly;
+    }
+    throw std::runtime_error(
+        "context_cache_commit_policy must be either 'including_generated_tokens' or "
+        "'prefill_state_only', got '"
+        + value + "'");
+}
+
 } // namespace
 
 std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGenerationRequest>> parseRequestFile(
@@ -128,6 +159,8 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
     check::check(diffusionMaxDenoisingSteps >= 0,
         format::fmtstr(
             "Invalid diffusion max_denoising_steps value: %d (must be non-negative)", diffusionMaxDenoisingSteps));
+    rt::ContextCacheLookupPolicy const contextCacheLookupPolicy = parseContextCacheLookupPolicy(inputData);
+    rt::ContextCacheCommitPolicy const contextCacheCommitPolicy = parseContextCacheCommitPolicy(inputData);
     std::unordered_map<int32_t, float> defaultLogitBias;
     if (inputData.contains("logit_bias") && !inputData["logit_bias"].is_null())
     {
@@ -175,6 +208,8 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
         batchRequest.addGenerationPrompt = addGenerationPrompt;
         batchRequest.enableThinking = enableThinking;
         batchRequest.numLogprobs = defaultNumLogprobs;
+        batchRequest.contextCacheLookupPolicy = contextCacheLookupPolicy;
+        batchRequest.contextCacheCommitPolicy = contextCacheCommitPolicy;
 
         std::string batchLoraWeightsName;
         bool firstInBatch = true;

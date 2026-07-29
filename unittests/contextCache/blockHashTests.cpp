@@ -267,66 +267,52 @@ TEST(ContextCacheBlockHashTests, ExactPrefixDigestIncludesPartialTail)
         std::runtime_error);
 }
 
-TEST(ContextCacheBlockIndexTests, DomainSeparatesIdenticalLogicalBlocks)
+TEST(ContextCacheBlockIndexTests, FirstCommitterOwnsCanonicalPage)
 {
     BaseBlockIndex index;
-    CacheDomainId const firstDomain{0x1000000000000001ULL, 0x2000000000000002ULL};
-    CacheDomainId const secondDomain{0x3000000000000003ULL, 0x4000000000000004ULL};
     BlockHash const hash{0x5000000000000005ULL, 0x6000000000000006ULL};
-    BaseBlockKey const firstKey{firstDomain, hash};
-    BaseBlockKey const secondKey{secondDomain, hash};
-    BaseBlockKey const changedHashKey{firstDomain, Hash128{0x7000000000000007ULL, 0x8000000000000008ULL}};
 
-    BaseInsertResult const first = index.insert(firstKey, 7);
-    BaseInsertResult const second = index.insert(secondKey, 8);
+    BaseInsertResult const first = index.insert(hash, 7);
+    BaseInsertResult const second = index.insert(hash, 8);
 
     EXPECT_TRUE(first.inserted);
-    EXPECT_TRUE(second.inserted);
+    EXPECT_FALSE(second.inserted);
     EXPECT_EQ(first.canonicalPage, 7);
-    EXPECT_EQ(second.canonicalPage, 8);
-    EXPECT_FALSE(firstKey == secondKey);
-    size_t const foldedKey = std::hash<BaseBlockKey>{}(firstKey);
-    EXPECT_NE(foldedKey, std::hash<BaseBlockKey>{}(secondKey));
-    EXPECT_NE(foldedKey, std::hash<BaseBlockKey>{}(changedHashKey));
-    EXPECT_EQ(index.lookup(firstKey), std::optional<PageId>{7});
-    EXPECT_EQ(index.lookup(secondKey), std::optional<PageId>{8});
-    EXPECT_EQ(index.size(), 2U);
+    EXPECT_EQ(second.canonicalPage, 7);
+    EXPECT_EQ(index.lookup(hash), std::optional<PageId>{7});
+    EXPECT_EQ(index.size(), 1U);
 }
 
 TEST(ContextCacheBlockIndexTests, LookupStopsAtFirstMissingBlock)
 {
     BaseBlockIndex index;
-    CacheDomainId const domain{0x1111111111111111ULL, 0x2222222222222222ULL};
     BlockHash const firstHash{0x3333333333333333ULL, 0x4444444444444444ULL};
     BlockHash const missingHash{0x5555555555555555ULL, 0x6666666666666666ULL};
     BlockHash const laterHash{0x7777777777777777ULL, 0x8888888888888888ULL};
-    EXPECT_TRUE(index.insert(BaseBlockKey{domain, firstHash}, 13).inserted);
-    EXPECT_TRUE(index.insert(BaseBlockKey{domain, laterHash}, 17).inserted);
+    EXPECT_TRUE(index.insert(firstHash, 13).inserted);
+    EXPECT_TRUE(index.insert(laterHash, 17).inserted);
 
-    BaseLookupResult const result = index.lookupPrefix(domain, {firstHash, missingHash, laterHash});
+    BaseLookupResult const result = index.lookupPrefix({firstHash, missingHash, laterHash});
 
     EXPECT_EQ(result.pageIds, std::vector<PageId>{13});
     EXPECT_EQ(result.matchedHashes, std::vector<BlockHash>{firstHash});
-    EXPECT_FALSE(index.lookup(BaseBlockKey{domain, missingHash}).has_value());
-    EXPECT_EQ(index.lookup(BaseBlockKey{domain, laterHash}), std::optional<PageId>{17});
+    EXPECT_FALSE(index.lookup(missingHash).has_value());
+    EXPECT_EQ(index.lookup(laterHash), std::optional<PageId>{17});
 }
 
 TEST(ContextCacheBlockIndexTests, LookupHasNoReferenceOrRecencySideEffects)
 {
     BaseBlockIndex index;
-    CacheDomainId const domain{0x1212121212121212ULL, 0x3434343434343434ULL};
     BlockHash const firstHash{0x5656565656565656ULL, 0x7878787878787878ULL};
     BlockHash const secondHash{0x9090909090909090ULL, 0xABABABABABABABABULL};
-    BaseBlockKey const firstKey{domain, firstHash};
-    BaseBlockKey const secondKey{domain, secondHash};
-    EXPECT_TRUE(index.insert(firstKey, 19).inserted);
-    EXPECT_TRUE(index.insert(secondKey, 23).inserted);
+    EXPECT_TRUE(index.insert(firstHash, 19).inserted);
+    EXPECT_TRUE(index.insert(secondHash, 23).inserted);
     size_t const originalSize = index.size();
 
-    BaseLookupResult const firstLookup = index.lookupPrefix(domain, {firstHash, secondHash});
-    EXPECT_EQ(index.lookup(firstKey), std::optional<PageId>{19});
-    EXPECT_FALSE(index.lookup(BaseBlockKey{domain, Hash128{0xCDCDCDCDCDCDCDCDULL, 0xEFEFEFEFEFEFEFEFULL}}).has_value());
-    BaseLookupResult const secondLookup = index.lookupPrefix(domain, {firstHash, secondHash});
+    BaseLookupResult const firstLookup = index.lookupPrefix({firstHash, secondHash});
+    EXPECT_EQ(index.lookup(firstHash), std::optional<PageId>{19});
+    EXPECT_FALSE(index.lookup(Hash128{0xCDCDCDCDCDCDCDCDULL, 0xEFEFEFEFEFEFEFEFULL}).has_value());
+    BaseLookupResult const secondLookup = index.lookupPrefix({firstHash, secondHash});
 
     EXPECT_EQ(firstLookup.pageIds, std::vector<PageId>({19, 23}));
     EXPECT_EQ(firstLookup.matchedHashes, std::vector<BlockHash>({firstHash, secondHash}));
@@ -334,74 +320,70 @@ TEST(ContextCacheBlockIndexTests, LookupHasNoReferenceOrRecencySideEffects)
     EXPECT_EQ(secondLookup.matchedHashes, firstLookup.matchedHashes);
     EXPECT_EQ(index.size(), originalSize);
 
-    BaseInsertResult const duplicate = index.insert(firstKey, 29);
+    BaseInsertResult const duplicate = index.insert(firstHash, 29);
     EXPECT_FALSE(duplicate.inserted);
     EXPECT_EQ(duplicate.canonicalPage, 19);
-    EXPECT_EQ(index.lookup(secondKey), std::optional<PageId>{23});
+    EXPECT_EQ(index.lookup(secondHash), std::optional<PageId>{23});
 }
 
 TEST(ContextCacheBlockIndexTests, FirstCommitterWinsAndReverseEraseIsExact)
 {
     BaseBlockIndex index;
-    CacheDomainId const domain{0x13579BDF2468ACE0ULL, 0x02468ACE13579BDFULL};
-    BaseBlockKey const firstKey{domain, Hash128{0x1111222233334444ULL, 0x5555666677778888ULL}};
-    BaseBlockKey const secondKey{domain, Hash128{0x9999AAAABBBBCCCCULL, 0xDDDDEEEEFFFF0000ULL}};
-    BaseBlockKey const thirdKey{domain, Hash128{0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL}};
+    BlockHash const firstHash{0x1111222233334444ULL, 0x5555666677778888ULL};
+    BlockHash const secondHash{0x9999AAAABBBBCCCCULL, 0xDDDDEEEEFFFF0000ULL};
+    BlockHash const thirdHash{0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL};
 
-    BaseInsertResult const first = index.insert(firstKey, 31);
-    BaseInsertResult const second = index.insert(secondKey, 37);
+    BaseInsertResult const first = index.insert(firstHash, 31);
+    BaseInsertResult const second = index.insert(secondHash, 37);
     EXPECT_TRUE(first.inserted);
     EXPECT_TRUE(second.inserted);
     EXPECT_EQ(first.canonicalPage, 31);
     EXPECT_EQ(second.canonicalPage, 37);
 
-    BaseInsertResult const duplicate = index.insert(firstKey, 41);
+    BaseInsertResult const duplicate = index.insert(firstHash, 41);
     EXPECT_FALSE(duplicate.inserted);
     EXPECT_EQ(duplicate.canonicalPage, 31);
 
-    BaseInsertResult const duplicateProposalPage = index.insert(thirdKey, 41);
+    BaseInsertResult const duplicateProposalPage = index.insert(thirdHash, 41);
     EXPECT_TRUE(duplicateProposalPage.inserted);
     EXPECT_EQ(duplicateProposalPage.canonicalPage, 41);
-    EXPECT_EQ(index.lookup(firstKey), std::optional<PageId>{31});
-    EXPECT_EQ(index.lookup(thirdKey), std::optional<PageId>{41});
+    EXPECT_EQ(index.lookup(firstHash), std::optional<PageId>{31});
+    EXPECT_EQ(index.lookup(thirdHash), std::optional<PageId>{41});
     index.erasePage(41);
-    EXPECT_EQ(index.lookup(firstKey), std::optional<PageId>{31});
-    EXPECT_FALSE(index.lookup(thirdKey).has_value());
+    EXPECT_EQ(index.lookup(firstHash), std::optional<PageId>{31});
+    EXPECT_FALSE(index.lookup(thirdHash).has_value());
     EXPECT_EQ(index.size(), 2U);
 
-    BaseInsertResult const duplicateWithInvalidProposal = index.insert(firstKey, -1);
+    BaseInsertResult const duplicateWithInvalidProposal = index.insert(firstHash, -1);
     EXPECT_FALSE(duplicateWithInvalidProposal.inserted);
     EXPECT_EQ(duplicateWithInvalidProposal.canonicalPage, 31);
 
-    EXPECT_THROW((void) index.insert(thirdKey, 37), std::runtime_error);
-    EXPECT_THROW((void) index.insert(thirdKey, -1), std::runtime_error);
-    EXPECT_EQ(index.lookup(firstKey), std::optional<PageId>{31});
-    EXPECT_EQ(index.lookup(secondKey), std::optional<PageId>{37});
-    EXPECT_FALSE(index.lookup(thirdKey).has_value());
+    EXPECT_THROW((void) index.insert(thirdHash, 37), std::runtime_error);
+    EXPECT_THROW((void) index.insert(thirdHash, -1), std::runtime_error);
+    EXPECT_EQ(index.lookup(firstHash), std::optional<PageId>{31});
+    EXPECT_EQ(index.lookup(secondHash), std::optional<PageId>{37});
+    EXPECT_FALSE(index.lookup(thirdHash).has_value());
 
     index.erasePage(41);
-    EXPECT_EQ(index.lookup(firstKey), std::optional<PageId>{31});
-    EXPECT_EQ(index.lookup(secondKey), std::optional<PageId>{37});
+    EXPECT_EQ(index.lookup(firstHash), std::optional<PageId>{31});
+    EXPECT_EQ(index.lookup(secondHash), std::optional<PageId>{37});
 
     index.erasePage(31);
-    EXPECT_FALSE(index.lookup(firstKey).has_value());
-    EXPECT_EQ(index.lookup(secondKey), std::optional<PageId>{37});
+    EXPECT_FALSE(index.lookup(firstHash).has_value());
+    EXPECT_EQ(index.lookup(secondHash), std::optional<PageId>{37});
     EXPECT_EQ(index.size(), 1U);
 
-    BaseInsertResult const reusedPage = index.insert(thirdKey, 31);
+    BaseInsertResult const reusedPage = index.insert(thirdHash, 31);
     EXPECT_TRUE(reusedPage.inserted);
     EXPECT_EQ(reusedPage.canonicalPage, 31);
     index.erasePage(37);
-    EXPECT_FALSE(index.lookup(secondKey).has_value());
-    EXPECT_EQ(index.lookup(thirdKey), std::optional<PageId>{31});
+    EXPECT_FALSE(index.lookup(secondHash).has_value());
+    EXPECT_EQ(index.lookup(thirdHash), std::optional<PageId>{31});
     EXPECT_EQ(index.size(), 1U);
 }
 
 TEST(ContextCacheBlockIndexTests, DraftLookupSelectsOneCoherentRecordPath)
 {
-    CacheDomainId const domain{0x13579BDF13579BDFULL, 0x2468ACE02468ACE0ULL};
-    DraftEngineSignature const signature{0x1111222233334444ULL, 0x5555666677778888ULL};
-    DraftEngineSignature const otherSignature{0x9999AAAABBBBCCCCULL, 0xDDDDEEEEFFFF0000ULL};
     BlockHash const firstHash{0x0101010101010101ULL, 0x0202020202020202ULL};
     BlockHash const secondHash{0x0303030303030303ULL, 0x0404040404040404ULL};
     BlockHash const firstLeafHash{0x0505050505050505ULL, 0x0606060606060606ULL};
@@ -409,77 +391,67 @@ TEST(ContextCacheBlockIndexTests, DraftLookupSelectsOneCoherentRecordPath)
 
     CacheRecord firstRecord;
     firstRecord.id = 11;
-    firstRecord.key = CacheRecordKey{domain, firstLeafHash, 3};
+    firstRecord.key = CacheRecordKey{firstLeafHash, 3};
     firstRecord.logicalBlockHashes = {firstHash, secondHash, firstLeafHash};
     firstRecord.basePagePath = {1, 2, 3};
-    firstRecord.draftSignature = signature;
     firstRecord.draftPagePath = {4, 5, 6};
-    firstRecord.baseFullBlockCount = 3;
-    firstRecord.pairedDraftFullBlockCount = 3;
 
     CacheRecord secondRecord = firstRecord;
     secondRecord.id = 12;
-    secondRecord.key = CacheRecordKey{domain, secondLeafHash, 3};
+    secondRecord.key = CacheRecordKey{secondLeafHash, 3};
     secondRecord.logicalBlockHashes.back() = secondLeafHash;
     secondRecord.basePagePath = {1, 2, 7};
     secondRecord.draftPagePath = {8, 9, 10};
 
     DraftPathIndex index;
+    CacheRecord incompleteRecord = firstRecord;
+    incompleteRecord.id = 13;
+    incompleteRecord.draftPagePath.pop_back();
+    EXPECT_THROW(index.insert(incompleteRecord), std::runtime_error);
     index.insert(firstRecord);
     index.insert(secondRecord);
 
     DraftPathMatch const firstLeaf{firstRecord.id, 3};
     DraftPathMatch const secondLeaf{secondRecord.id, 3};
-    EXPECT_EQ(index.lookupLongest(signature, domain, firstRecord.logicalBlockHashes, 3),
-        std::optional<DraftPathMatch>{firstLeaf});
-    EXPECT_EQ(index.lookupLongest(signature, domain, secondRecord.logicalBlockHashes, 3),
-        std::optional<DraftPathMatch>{secondLeaf});
-    EXPECT_FALSE(index.lookupLongest(otherSignature, domain, firstRecord.logicalBlockHashes, 3).has_value());
+    EXPECT_EQ(index.lookupLongest(firstRecord.logicalBlockHashes, 3), std::optional<DraftPathMatch>{firstLeaf});
+    EXPECT_EQ(index.lookupLongest(secondRecord.logicalBlockHashes, 3), std::optional<DraftPathMatch>{secondLeaf});
 
-    std::optional<DraftPathMatch> const sharedPrefix
-        = index.lookupLongest(signature, domain, {firstHash, secondHash, Hash128{}}, 3);
+    std::optional<DraftPathMatch> const sharedPrefix = index.lookupLongest({firstHash, secondHash, Hash128{}}, 3);
     ASSERT_TRUE(sharedPrefix.has_value());
     EXPECT_EQ(sharedPrefix->pathBlockCount, 2);
     EXPECT_TRUE(sharedPrefix->record == firstRecord.id || sharedPrefix->record == secondRecord.id);
-    EXPECT_TRUE(index.contains(DraftPathKey{signature, domain, secondHash}, *sharedPrefix));
+    EXPECT_TRUE(index.contains(secondHash, *sharedPrefix));
 
     index.erase(secondRecord);
 
-    EXPECT_FALSE(index.contains(DraftPathKey{signature, domain, secondLeafHash}, secondLeaf));
-    EXPECT_EQ(index.lookupLongest(signature, domain, {firstHash, secondHash}, 2),
+    EXPECT_FALSE(index.contains(secondLeafHash, secondLeaf));
+    EXPECT_EQ(index.lookupLongest({firstHash, secondHash}, 2),
         (std::optional<DraftPathMatch>{DraftPathMatch{firstRecord.id, 2}}));
-    EXPECT_EQ(index.lookupLongest(signature, domain, firstRecord.logicalBlockHashes, 3),
-        std::optional<DraftPathMatch>{firstLeaf});
+    EXPECT_EQ(index.lookupLongest(firstRecord.logicalBlockHashes, 3), std::optional<DraftPathMatch>{firstLeaf});
 
     index.erase(firstRecord);
-    EXPECT_FALSE(index.lookupLongest(signature, domain, firstRecord.logicalBlockHashes, 3).has_value());
+    EXPECT_FALSE(index.lookupLongest(firstRecord.logicalBlockHashes, 3).has_value());
 }
 
 TEST(ContextCacheBlockIndexTests, DraftIndexKeepsRepeatedHashesAsDistinctBoundaries)
 {
-    CacheDomainId const domain{0x13579BDF13579BDFULL, 0x2468ACE02468ACE0ULL};
-    DraftEngineSignature const signature{0x1111222233334444ULL, 0x5555666677778888ULL};
     BlockHash const repeatedHash{0x0101010101010101ULL, 0x0202020202020202ULL};
     CacheRecord record;
     record.id = 11;
-    record.key = CacheRecordKey{domain, repeatedHash, 3};
+    record.key = CacheRecordKey{repeatedHash, 3};
     record.logicalBlockHashes = {repeatedHash, repeatedHash, repeatedHash};
     record.basePagePath = {1, 2, 3};
-    record.draftSignature = signature;
     record.draftPagePath = {4, 5, 6};
-    record.baseFullBlockCount = 3;
-    record.pairedDraftFullBlockCount = 3;
 
     DraftPathIndex index;
     index.insert(record);
 
-    DraftPathKey const key{signature, domain, repeatedHash};
-    EXPECT_TRUE(index.contains(key, DraftPathMatch{record.id, 1}));
-    EXPECT_TRUE(index.contains(key, DraftPathMatch{record.id, 2}));
-    EXPECT_TRUE(index.contains(key, DraftPathMatch{record.id, 3}));
-    EXPECT_EQ(index.lookupLongest(signature, domain, record.logicalBlockHashes, 3),
+    EXPECT_TRUE(index.contains(repeatedHash, DraftPathMatch{record.id, 1}));
+    EXPECT_TRUE(index.contains(repeatedHash, DraftPathMatch{record.id, 2}));
+    EXPECT_TRUE(index.contains(repeatedHash, DraftPathMatch{record.id, 3}));
+    EXPECT_EQ(index.lookupLongest(record.logicalBlockHashes, 3),
         (std::optional<DraftPathMatch>{DraftPathMatch{record.id, 3}}));
 
     index.erase(record);
-    EXPECT_FALSE(index.lookupLongest(signature, domain, record.logicalBlockHashes, 3).has_value());
+    EXPECT_FALSE(index.lookupLongest(record.logicalBlockHashes, 3).has_value());
 }

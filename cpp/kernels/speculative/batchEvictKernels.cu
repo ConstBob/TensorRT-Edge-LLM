@@ -18,6 +18,7 @@
 #include "batchEvictKernels.h"
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
+#include "common/pagedKvTypes.h"
 #include "common/stringUtils.h"
 #include "kernels/common/vectorizedTypes.cuh"
 #include <cstdint>
@@ -312,7 +313,7 @@ void compactTensorBatch(rt::Tensor const& src, rt::Tensor const& batchMapping, r
 template <typename T>
 __global__ void compactKVCacheBatchedKernel(KVLayerInfo const* __restrict__ layerInfos,
     int32_t const* __restrict__ batchMapping, int32_t const* __restrict__ liveLengths, int32_t headDim,
-    int32_t oldActiveBatch)
+    int32_t kvPoolPages, int32_t oldActiveBatch)
 {
     KVLayerInfo const info = layerInfos[blockIdx.y >> 1];
     int64_t const elemsPerToken = static_cast<int64_t>(info.numKVHeads) * headDim;
@@ -320,7 +321,7 @@ __global__ void compactKVCacheBatchedKernel(KVLayerInfo const* __restrict__ laye
     T* base = static_cast<T*>(info.data);
     if ((blockIdx.y & 1) != 0)
     {
-        base += static_cast<int64_t>(info.maxBatch) * rowElems; // V half
+        base += static_cast<int64_t>(kvPoolPages) * rt::kTOKENS_PER_PAGE * elemsPerToken; // V half
     }
 
     using Vec = DVec<T>;
@@ -363,11 +364,12 @@ __global__ void compactKVCacheBatchedKernel(KVLayerInfo const* __restrict__ laye
 }
 
 void compactKVCacheBatched(KVLayerInfo const* layerInfos, rt::Tensor const& batchMapping, rt::Tensor const& liveLengths,
-    int32_t numLayers, int32_t headDim, nvinfer1::DataType kvCacheType, int32_t oldActiveBatch, int32_t newActiveBatch,
-    cudaStream_t stream)
+    int32_t numLayers, int32_t headDim, int32_t kvPoolPages, nvinfer1::DataType kvCacheType, int32_t oldActiveBatch,
+    int32_t newActiveBatch, cudaStream_t stream)
 {
     check::check(batchMapping.getDeviceType() == rt::DeviceType::kGPU, "Batch mapping must be on GPU");
     check::check(liveLengths.getDeviceType() == rt::DeviceType::kGPU, "Live lengths must be on GPU");
+    check::check(kvPoolPages > 0, "KV pool page count must be positive");
 
     // Identity (nothing finished) and all-evicted (nothing survives) both move zero rows.
     if (numLayers == 0 || oldActiveBatch == newActiveBatch || newActiveBatch <= 0)
@@ -386,13 +388,13 @@ void compactKVCacheBatched(KVLayerInfo const* layerInfos, rt::Tensor const& batc
     switch (kvCacheType)
     {
     case nvinfer1::DataType::kHALF:
-        compactKVCacheBatchedKernel<half>
-            <<<gridDim, blockDim, 0, stream>>>(layerInfos, batchMappingPtr, liveLengthsPtr, headDim, oldActiveBatch);
+        compactKVCacheBatchedKernel<half><<<gridDim, blockDim, 0, stream>>>(
+            layerInfos, batchMappingPtr, liveLengthsPtr, headDim, kvPoolPages, oldActiveBatch);
         break;
     // FP8 is 1-byte POD storage; copy it byte-wise via uint8_t.
     case nvinfer1::DataType::kFP8:
-        compactKVCacheBatchedKernel<uint8_t>
-            <<<gridDim, blockDim, 0, stream>>>(layerInfos, batchMappingPtr, liveLengthsPtr, headDim, oldActiveBatch);
+        compactKVCacheBatchedKernel<uint8_t><<<gridDim, blockDim, 0, stream>>>(
+            layerInfos, batchMappingPtr, liveLengthsPtr, headDim, kvPoolPages, oldActiveBatch);
         break;
     default:
         throw std::invalid_argument(

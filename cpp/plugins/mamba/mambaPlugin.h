@@ -55,6 +55,12 @@ namespace plugins
 //!   [5] dt         [batch, (seq_len,) nheads]            FP16 or FP32
 //!   [6] dt_bias    [nheads]                              FP16 or FP32
 //!   [7] state      [batch, nheads, dim, dstate]          FP16 or FP32
+//!   [8] context_lengths [batch]                          INT32
+//!   [9] state_start_index [0] or [batch]                 INT32
+//!
+//! `state_start_index` shares the runtime's `kvcache_start_index` sentinel
+//! contract: shape [0] selects the faster zero-state prefill kernel, while
+//! shape [batch] means restored recurrent state must seed prefill.
 //!
 //! All data tensors (everything except A) must use the same type.
 //! TRT selects FP32 when the ONNX graph declares FP32, and may optimize to

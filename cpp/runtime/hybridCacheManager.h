@@ -222,6 +222,10 @@ public:
     //! @param stream CUDA stream.
     void compactBatch(rt::Tensor const& batchMapping, int32_t oldBatch, int32_t newBatch, cudaStream_t stream);
 
+    //! Compact only slot-addressed sequence lengths and recurrent/conv state. Global paged KV remains in place;
+    //! callers using non-identity page tables compact those table rows separately.
+    void compactBatchSlotState(rt::Tensor const& batchMapping, int32_t oldBatch, int32_t newBatch, cudaStream_t stream);
+
     // ------------------------------------------------------------------
     // System prompt cache
     // ------------------------------------------------------------------

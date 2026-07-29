@@ -73,9 +73,11 @@ void setPackedAncestorBit(
 } // namespace
 
 DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::path const& engineDir,
-    SpecDecodeDraftingConfig const& /* draftingConfig */, cudaStream_t stream)
+    SpecDecodeDraftingConfig const& /* draftingConfig */, std::unique_ptr<EngineExecutor> draftExecutor,
+    cudaStream_t stream)
     : mRuntime(runtime)
     , mDraftCacheManager(*runtime.base.sharedResources.cacheManagers[1])
+    , mDraftExecutor(std::move(draftExecutor))
 {
     auto const& deployment = runtime.deployment;
     auto const& baseCfg = deployment.base;
@@ -120,10 +122,7 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
 
     int32_t const maxBatch = deployment.maxRuntimeBatchSize();
 
-    auto const draftEnginePath = engineDir / "spec_draft.engine";
-    LOG_INFO("DFlashDecoder: loading draft engine from %s", draftEnginePath.string().c_str());
-    mDraftExecutor = EngineExecutor::createForDraft(draftEnginePath, deployment);
-    validateAgainstEngine(*deployment.draft, *mDraftExecutor, "dflash_draft");
+    ELLM_CHECK(mDraftExecutor != nullptr, "DFlash decoding requires a validated draft engine.");
 
     mDraftInputsEmbeds = Tensor({maxBatch, mBlockSize, mDraftHiddenSize}, DeviceType::kGPU, nvinfer1::DataType::kHALF,
         "DFlashDraft::inputsEmbeds");
@@ -1140,8 +1139,11 @@ void DFlashDecoder::resetForNewSequences(Tensor& reuseLengths, cudaStream_t stre
 }
 
 void DFlashDecoder::onBatchEvict(std::vector<int32_t> const& /* batchMapping */, int32_t oldActiveBatch,
-    int32_t newActiveBatch, Tensor& deviceBatchMapping, cudaStream_t stream)
+    int32_t newActiveBatch, Tensor& deviceBatchMapping, cudaStream_t stream, BatchCompactionMode mode)
 {
+    ELLM_CHECK(mode == BatchCompactionMode::kLegacyPhysicalKv,
+        "DFlash does not support managed context-cache batch compaction.");
+
     mDraftCacheManager.compactBatch(deviceBatchMapping, oldActiveBatch, newActiveBatch, stream);
     mDraftCacheManager.setActiveBatchSize(newActiveBatch);
 }

@@ -18,6 +18,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 
 namespace trt_edgellm::rt
 {
@@ -28,6 +29,13 @@ constexpr int32_t kTOKENS_PER_PAGE{128};
 //! Sentinel value for an unallocated page-table entry.
 constexpr int32_t kUNUSED_PAGE_ENTRY{-1};
 
+//! Largest K-page count for which both the derived V ids and the CuTe FMHA combined
+//! K/V page count (`2 * numPages`) fit a positive int32.
+constexpr int64_t kMAX_KV_POOL_PAGES{std::numeric_limits<int32_t>::max() / 2};
+
+//! Largest token capacity whose page-aligned padded value still fits int32.
+constexpr int32_t kMAX_KV_CACHE_CAPACITY = (std::numeric_limits<int32_t>::max() / kTOKENS_PER_PAGE) * kTOKENS_PER_PAGE;
+
 //! Number of pages a single slot's padded token capacity spans.
 inline int32_t pagesPerSlot(int32_t maxCapPadded)
 {
@@ -37,19 +45,19 @@ inline int32_t pagesPerSlot(int32_t maxCapPadded)
 //! Maximum number of pages one sequence's KV capacity spans (the page table's last dim).
 inline int32_t computeMaxPagesPerSeq(int32_t maxKVCacheCapacity)
 {
-    return (maxKVCacheCapacity + kTOKENS_PER_PAGE - 1) / kTOKENS_PER_PAGE;
+    return static_cast<int32_t>((static_cast<int64_t>(maxKVCacheCapacity) + kTOKENS_PER_PAGE - 1) / kTOKENS_PER_PAGE);
 }
 
-//! The active-capacity floor: the total page count of the paged-KV pool, i.e.
-//! `maxBatchSize * ceil(maxKVCacheCapacity / kTOKENS_PER_PAGE)`. This is the single formula
-//! shared by the builder's optimization-profile setup, the runtime registry's binding-shape
-//! spec, and `KVCacheManager`'s allocation size. All pool sizing is floor-only: the engine's
-//! paged-KV optimization profile has min == opt == max == this value, and identity-mapped slots
-//! occupy exactly these pages (see `KVPageTable`). Retention capacity beyond the floor is a
-//! follow-up that accepts a full engine rebuild.
-inline int32_t computeKvPoolFloorPages(int32_t maxBatchSize, int32_t maxKVCacheCapacity)
+//! Computes the paged-KV pool's minimum active pages:
+//! `maxBatchSize * ceil(maxKVCacheCapacity / kTOKENS_PER_PAGE)`.
+//! Identity-mapped active slots occupy these first pages. A build may serialize extra retained pages for
+//! cross-request reuse, but its engine profile, runtime registry, allocation, and page table must all use that same
+//! count. Callers validate positive inputs and validate against `kMAX_KV_POOL_PAGES` before narrowing to int32.
+inline int64_t computeMinimumKvPoolPages(int64_t maxBatchSize, int64_t maxKVCacheCapacity)
 {
-    return maxBatchSize * computeMaxPagesPerSeq(maxKVCacheCapacity);
+    int64_t const pagesPerSequence
+        = (maxKVCacheCapacity + static_cast<int64_t>(kTOKENS_PER_PAGE) - 1) / kTOKENS_PER_PAGE;
+    return maxBatchSize * pagesPerSequence;
 }
 
 } // namespace trt_edgellm::rt

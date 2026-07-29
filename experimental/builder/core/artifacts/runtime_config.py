@@ -18,6 +18,7 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any, Dict
 
+from ...ops.functional.attention import KV_PAGE_SIZE
 from .. import contracts
 from ..config import LAYER_ATTN, LAYER_GDN, LAYER_MAMBA, DeviceConfig
 
@@ -218,6 +219,8 @@ def build_runtime_config(cfg: DeviceConfig, args) -> Dict[str, Any]:
             2, cfg.num_hidden_layers // 2, cfg.num_hidden_layers - 4
         ]
 
+    max_kv_pool_pages = args.max_batch_size * (
+        (args.max_kv_cache_capacity + KV_PAGE_SIZE - 1) // KV_PAGE_SIZE)
     out["builder_config"] = {
         "max_input_len": args.max_input_len,
         "spec_draft": args.resolved_spec_role == contracts.SpecRole.DRAFT,
@@ -225,6 +228,7 @@ def build_runtime_config(cfg: DeviceConfig, args) -> Dict[str, Any]:
         "max_batch_size": args.max_batch_size,
         "max_lora_rank": args.max_lora_rank,
         "max_kv_cache_capacity": args.max_kv_cache_capacity,
+        "max_kv_pool_pages": max_kv_pool_pages,
         "max_verify_tree_size": args.max_verify_tree_size,
         "max_draft_tree_size": args.max_draft_tree_size,
     }

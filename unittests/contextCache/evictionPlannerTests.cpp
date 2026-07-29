@@ -22,7 +22,6 @@
 
 #include <gtest/gtest.h>
 
-#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -39,8 +38,6 @@ namespace
 
 constexpr std::array<ResourceType, 4> kRESOURCE_TYPES{ResourceType::kBaseKvPage, ResourceType::kDraftKvPage,
     ResourceType::kRecurrentSnapshot, ResourceType::kPartialKvSnapshot};
-constexpr CacheDomainId kDOMAIN{0x1010101010101010ULL, 0x2020202020202020ULL};
-constexpr DraftEngineSignature kDRAFT_SIGNATURE{0x3030303030303030ULL, 0x4040404040404040ULL};
 constexpr BlockHash kHASH_A{0x1111111111111111ULL, 0xAAAAAAAAAAAAAAAAULL};
 constexpr BlockHash kHASH_B{0x2222222222222222ULL, 0xBBBBBBBBBBBBBBBBULL};
 constexpr BlockHash kHASH_C{0x3333333333333333ULL, 0xCCCCCCCCCCCCCCCCULL};
@@ -51,12 +48,9 @@ struct RecordState
     CacheRecordKey key{};
     std::vector<BlockHash> logicalBlockHashes;
     std::vector<PageId> basePagePath;
-    std::optional<DraftEngineSignature> draftSignature;
     std::vector<PageId> draftPagePath;
     std::optional<int32_t> recurrentSnapshotSlot;
     std::optional<int32_t> partialKvSnapshotSlot;
-    int32_t baseFullBlockCount{};
-    int32_t pairedDraftFullBlockCount{};
     std::optional<int32_t> exactCheckpointLength;
     std::vector<ResourceId> resources;
     std::optional<RecordId> exactKeyLookup;
@@ -65,10 +59,9 @@ struct RecordState
 bool operator==(RecordState const& lhs, RecordState const& rhs)
 {
     return lhs.id == rhs.id && lhs.key == rhs.key && lhs.logicalBlockHashes == rhs.logicalBlockHashes
-        && lhs.basePagePath == rhs.basePagePath && lhs.draftSignature == rhs.draftSignature
-        && lhs.draftPagePath == rhs.draftPagePath && lhs.recurrentSnapshotSlot == rhs.recurrentSnapshotSlot
-        && lhs.partialKvSnapshotSlot == rhs.partialKvSnapshotSlot && lhs.baseFullBlockCount == rhs.baseFullBlockCount
-        && lhs.pairedDraftFullBlockCount == rhs.pairedDraftFullBlockCount
+        && lhs.basePagePath == rhs.basePagePath && lhs.draftPagePath == rhs.draftPagePath
+        && lhs.recurrentSnapshotSlot == rhs.recurrentSnapshotSlot
+        && lhs.partialKvSnapshotSlot == rhs.partialKvSnapshotSlot
         && lhs.exactCheckpointLength == rhs.exactCheckpointLength && lhs.resources == rhs.resources
         && lhs.exactKeyLookup == rhs.exactKeyLookup;
 }
@@ -93,8 +86,6 @@ bool operator==(PlannerState const& lhs, PlannerState const& rhs)
 CacheRecord makeRecord(BlockHash logicalHash, std::vector<ResourceId> const& resources)
 {
     CacheRecord record;
-    record.key = CacheRecordKey{kDOMAIN, logicalHash, 1};
-    record.logicalBlockHashes = {logicalHash};
     for (ResourceId const& resource : resources)
     {
         switch (resource.type)
@@ -105,13 +96,12 @@ CacheRecord makeRecord(BlockHash logicalHash, std::vector<ResourceId> const& res
         case ResourceType::kPartialKvSnapshot: record.partialKvSnapshotSlot = resource.index; break;
         }
     }
-    record.baseFullBlockCount
-        = static_cast<int32_t>(std::min(record.basePagePath.size(), record.logicalBlockHashes.size()));
-    if (!record.draftPagePath.empty())
+    size_t const logicalBlockCount = record.basePagePath.size();
+    record.key = CacheRecordKey{logicalHash, static_cast<int32_t>(logicalBlockCount)};
+    record.logicalBlockHashes.assign(logicalBlockCount, logicalHash);
+    if (logicalBlockCount == 0 && record.recurrentSnapshotSlot.has_value())
     {
-        record.draftSignature = kDRAFT_SIGNATURE;
-        record.pairedDraftFullBlockCount = static_cast<int32_t>(
-            std::min(record.draftPagePath.size(), static_cast<size_t>(record.baseFullBlockCount)));
+        record.exactCheckpointLength = 1;
     }
     return record;
 }
@@ -179,8 +169,7 @@ PlannerState captureState(ResourcePools const& pools, CacheRecordStore const& re
     {
         CacheRecord const& record = records.get(id);
         state.recordsInLruOrder.push_back(RecordState{record.id, record.key, record.logicalBlockHashes,
-            record.basePagePath, record.draftSignature, record.draftPagePath, record.recurrentSnapshotSlot,
-            record.partialKvSnapshotSlot, record.baseFullBlockCount, record.pairedDraftFullBlockCount,
+            record.basePagePath, record.draftPagePath, record.recurrentSnapshotSlot, record.partialKvSnapshotSlot,
             record.exactCheckpointLength, record.resources(), records.find(record.key)});
     }
     return state;

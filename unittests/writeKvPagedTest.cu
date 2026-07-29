@@ -453,15 +453,10 @@ TEST(WriteKvPaged, PaddingTokenWithNegativePageEntryIsSkipped)
     }
 }
 
-TEST(WriteKvPaged, RetentionPagesBeyondFloorKeepWriteAndGatherCorrect)
+TEST(WriteKvPaged, ExtraRetainedPagesKeepWriteAndGatherCorrect)
 {
-    // Robustness: the pool may be allocated with pages beyond the
-    // active-capacity floor (poolNumPages = floor + extra). Identity slots still occupy the FIRST
-    // floor pages of each half; the V-half of the (now larger) pool starts at poolNumPages, not at
-    // the floor -- exactly what KVPageTable::setIdentity()/deriveV() compute when constructed with
-    // the real (possibly-larger) numPages (see sharedResources.cpp::makeIdentityPageTable). This is
-    // a smoke test that a write followed by a gather (read back) round-trips correctly on such a
-    // pool: the write path is page-id-driven and must not assume poolNumPages == floor.
+    // Identity slots occupy the minimum active pages, while the physical V-half begins at
+    // poolNumPages after any extra retained pages. Page-table-driven writes must honor that offset.
     cudaStream_t stream{nullptr};
 
     int32_t const batchSize = 1;
@@ -473,9 +468,9 @@ TEST(WriteKvPaged, RetentionPagesBeyondFloorKeepWriteAndGatherCorrect)
     int32_t const maxSeq = 128;
     int32_t const capPadded = padToPage(maxSeq);
     int32_t const maxPagesPerSeq = capPadded / kPageSize;
-    int32_t const floorPages = batchSize * maxPagesPerSeq;
-    int32_t const extraRetentionPages = 3;
-    int32_t const poolNumPages = floorPages + extraRetentionPages; // > floor
+    int32_t const minimumActivePages = batchSize * maxPagesPerSeq;
+    int32_t const extraRetainedPages = 3;
+    int32_t const poolNumPages = minimumActivePages + extraRetainedPages;
     ASSERT_EQ(maxPagesPerSeq, 1);
 
     float const ropeTheta = 10000.0f;
@@ -517,17 +512,15 @@ TEST(WriteKvPaged, RetentionPagesBeyondFloorKeepWriteAndGatherCorrect)
 
     // Pool declared as [batchSize, 2, Hkv, poolNumPages*P, D] (launchApplyRopeWriteKV validates
     // dims[0] == batchSize even in page-table mode) with exactly 2 * poolNumPages * P * Hkv * D
-    // elements -- poolNumPages pages per half, extraRetentionPages of which are unused tail pages
-    // beyond the identity-mapped floor (matches KVCacheManager::getCombinedKVCachePoolView() when
-    // Config::numPages > the floor).
+    // elements -- poolNumPages pages per half, extraRetainedPages of which are tail pages beyond
+    // the identity-mapped minimum active pages.
     rt::Tensor kvPoolTensor(rt::Coords{batchSize, 2, numKVHeads, poolNumPages * kPageSize, headDim},
         rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
     int64_t const poolVolume = kvPoolTensor.getShape().volume();
     std::vector<half> canaryFill(static_cast<size_t>(poolVolume), kCanary);
     copyHostToDevice(kvPoolTensor, canaryFill);
 
-    // Identity page table, but V ids derived from poolNumPages (the real pool size), not floorPages
-    // -- exactly KVPageTable::deriveV(k, numPages=poolNumPages).
+    // Identity page-table V ids use the configured poolNumPages offset.
     std::vector<int32_t> const pageTableHost{/*K=*/0, /*V=*/0 + poolNumPages};
     rt::Tensor pageTableTensor(
         rt::Coords{batchSize, 2, maxPagesPerSeq}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
@@ -538,8 +531,8 @@ TEST(WriteKvPaged, RetentionPagesBeyondFloorKeepWriteAndGatherCorrect)
         stream, /*writeKInPlace=*/true, pageTable, maxPagesPerSeq);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    // Gather (read back) and verify the write landed at page 0 (K) / page poolNumPages (V) -- NOT
-    // at page floorPages, which is where a floor-only V-offset formula would incorrectly place it.
+    // Verify the write landed at page 0 (K) and page poolNumPages (V), not at an offset based only
+    // on the minimum active pages.
     auto const poolOut = copyDeviceToHost<half>(kvPoolTensor);
     for (int32_t s = 0; s < qSeqLen; ++s)
     {
@@ -558,9 +551,8 @@ TEST(WriteKvPaged, RetentionPagesBeyondFloorKeepWriteAndGatherCorrect)
         }
     }
 
-    // The unused retention pages (indices [floorPages, poolNumPages) in EACH half) must be
-    // untouched -- writes only ever target identity-mapped floor pages.
-    for (int32_t page = floorPages; page < poolNumPages; ++page)
+    // The extra retained pages [minimumActivePages, poolNumPages) are untouched by identity writes.
+    for (int32_t page = minimumActivePages; page < poolNumPages; ++page)
     {
         for (int32_t inPage = 0; inPage < kPageSize; ++inPage)
         {
@@ -571,9 +563,9 @@ TEST(WriteKvPaged, RetentionPagesBeyondFloorKeepWriteAndGatherCorrect)
                     int64_t const kIdx = pagedPoolIndex(page, inPage, h, d, numKVHeads, headDim);
                     int64_t const vIdx = pagedPoolIndex(poolNumPages + page, inPage, h, d, numKVHeads, headDim);
                     EXPECT_TRUE(isclose(poolOut[kIdx], kCanary, 1e-6, 1e-6))
-                        << "K retention page clobbered page=" << page << " inPage=" << inPage;
+                        << "extra retained K page clobbered page=" << page << " inPage=" << inPage;
                     EXPECT_TRUE(isclose(poolOut[vIdx], kCanary, 1e-6, 1e-6))
-                        << "V retention page clobbered page=" << page << " inPage=" << inPage;
+                        << "extra retained V page clobbered page=" << page << " inPage=" << inPage;
                 }
             }
         }

@@ -33,6 +33,7 @@
 #include "runtime/streaming.h"
 #include "tokenizer/tokenizer.h"
 #include <algorithm>
+#include <charconv>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -41,7 +42,9 @@
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <string>
+#include <string_view>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -78,7 +81,11 @@ enum LLMInferenceOptionId : int
     DSPARK_SCHEDULER = 923,
     DSPARK_CONFIDENCE_THRESHOLD = 924,
     DSPARK_MIN_PROPOSAL_LEN = 925,
-    DSPARK_MAX_PROPOSAL_LEN = 926
+    DSPARK_MAX_PROPOSAL_LEN = 926,
+    ENABLE_CONTEXT_REUSE = 927,
+    CONTEXT_CACHE_MAX_RECORDS = 928,
+    CONTEXT_CACHE_RECURRENT_SNAPSHOT_POOL_BYTES = 929,
+    CONTEXT_CACHE_PARTIAL_KV_SNAPSHOT_POOL_BYTES = 930
 };
 
 // Struct to hold speculative decoding arguments (used by both EAGLE and MTP)
@@ -125,6 +132,7 @@ struct LLMInferenceArgs
     int64_t maxGenerateLength{-1}; // -1 means use value from input file
     int32_t numLogprobs{-1};       // -1 means use value from input file
     SpecDecodeArgs specDecodeArgs;
+    rt::ContextCacheConfig contextCacheConfig;
 
     // Qwen3-Omni audio output options
     bool enableAudioOutput{false};
@@ -197,12 +205,44 @@ void printUsage(char const* programName)
               << std::endl;
     std::cerr << "  --dflashBlockSize         DFlash proposal block size; 0 means infer from engine config"
               << std::endl;
+    std::cerr << "\nContext Reuse Options:" << std::endl;
+    std::cerr << "  --enableContextReuse      Enable process-local content-addressed context reuse" << std::endl;
+    std::cerr << "  --contextCacheMaxRecords  Maximum retained context records (default: 1024)" << std::endl;
+    std::cerr << "  --contextCacheRecurrentSnapshotPoolBytes" << std::endl;
+    std::cerr << "                            Device byte budget for recurrent/conv snapshots (default: 0;"
+              << " required for hybrid reuse)" << std::endl;
+    std::cerr << "  --contextCachePartialKVSnapshotPoolBytes" << std::endl;
+    std::cerr << "                            Device byte budget for partial-KV snapshots (default: 0;"
+              << " required for hybrid attention reuse)" << std::endl;
+    std::cerr << "                            KV retention capacity is configured at build time with"
+              << " --maxKVPoolPages" << std::endl;
     std::cerr << "\nQwen3-Omni Audio Output Options:" << std::endl;
     std::cerr << "  --enableAudioOutput       Enable audio output from Thinker hidden states" << std::endl;
     std::cerr << "  --talkerEngineDir         Path to Talker engine directory" << std::endl;
     std::cerr << "  --code2wavEngineDir       Path to Code2Wav engine directory (optional)" << std::endl;
     std::cerr << "  --outputAudioDir          Directory to save generated audio (.wav) files" << std::endl;
 }
+
+namespace
+{
+
+template <typename IntegerType>
+bool parseNonNegativeIntegerOption(char const* optionName, char const* value, IntegerType& output)
+{
+    static_assert(std::is_integral_v<IntegerType> && std::is_signed_v<IntegerType>);
+    std::string_view const text{value == nullptr ? "" : value};
+    IntegerType parsed{};
+    auto const [end, error] = std::from_chars(text.data(), text.data() + text.size(), parsed);
+    if (error != std::errc{} || end != text.data() + text.size() || parsed < 0)
+    {
+        LOG_ERROR("Invalid --%s value: %s (must be a non-negative integer)", optionName, text.data());
+        return false;
+    }
+    output = parsed;
+    return true;
+}
+
+} // namespace
 
 bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
 {
@@ -237,7 +277,14 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"dsparkScheduler", required_argument, 0, LLMInferenceOptionId::DSPARK_SCHEDULER},
         {"dsparkConfidenceThreshold", required_argument, 0, LLMInferenceOptionId::DSPARK_CONFIDENCE_THRESHOLD},
         {"dsparkMinProposalLen", required_argument, 0, LLMInferenceOptionId::DSPARK_MIN_PROPOSAL_LEN},
-        {"dsparkMaxProposalLen", required_argument, 0, LLMInferenceOptionId::DSPARK_MAX_PROPOSAL_LEN}, {0, 0, 0, 0}};
+        {"dsparkMaxProposalLen", required_argument, 0, LLMInferenceOptionId::DSPARK_MAX_PROPOSAL_LEN},
+        {"enableContextReuse", no_argument, 0, LLMInferenceOptionId::ENABLE_CONTEXT_REUSE},
+        {"contextCacheMaxRecords", required_argument, 0, LLMInferenceOptionId::CONTEXT_CACHE_MAX_RECORDS},
+        {"contextCacheRecurrentSnapshotPoolBytes", required_argument, 0,
+            LLMInferenceOptionId::CONTEXT_CACHE_RECURRENT_SNAPSHOT_POOL_BYTES},
+        {"contextCachePartialKVSnapshotPoolBytes", required_argument, 0,
+            LLMInferenceOptionId::CONTEXT_CACHE_PARTIAL_KV_SNAPSHOT_POOL_BYTES},
+        {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", inferenceOptions, nullptr)) != -1)
@@ -458,6 +505,27 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
+        case LLMInferenceOptionId::ENABLE_CONTEXT_REUSE: args.contextCacheConfig.enabled = true; break;
+        case LLMInferenceOptionId::CONTEXT_CACHE_MAX_RECORDS:
+            if (!parseNonNegativeIntegerOption("contextCacheMaxRecords", optarg, args.contextCacheConfig.maxRecords))
+            {
+                return false;
+            }
+            break;
+        case LLMInferenceOptionId::CONTEXT_CACHE_RECURRENT_SNAPSHOT_POOL_BYTES:
+            if (!parseNonNegativeIntegerOption("contextCacheRecurrentSnapshotPoolBytes", optarg,
+                    args.contextCacheConfig.recurrentSnapshotPoolBytes))
+            {
+                return false;
+            }
+            break;
+        case LLMInferenceOptionId::CONTEXT_CACHE_PARTIAL_KV_SNAPSHOT_POOL_BYTES:
+            if (!parseNonNegativeIntegerOption("contextCachePartialKVSnapshotPoolBytes", optarg,
+                    args.contextCacheConfig.partialKvSnapshotPoolBytes))
+            {
+                return false;
+            }
+            break;
         default: return false;
         }
     }
@@ -517,6 +585,15 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         LOG_INFO("DSpark confidence threshold: %.4f", args.specDecodeArgs.dsparkConfidenceThreshold);
         LOG_INFO("DSpark proposal length range: [%d, %d]", args.specDecodeArgs.dsparkMinProposalLen,
             args.specDecodeArgs.dsparkMaxProposalLen);
+    }
+
+    if (args.contextCacheConfig.enabled)
+    {
+        LOG_INFO("Context reuse enabled");
+        LOG_INFO("Context cache config: maxRecords=%d recurrentSnapshotPoolBytes=%lld partialKVSnapshotPoolBytes=%lld",
+            args.contextCacheConfig.maxRecords,
+            static_cast<long long>(args.contextCacheConfig.recurrentSnapshotPoolBytes),
+            static_cast<long long>(args.contextCacheConfig.partialKvSnapshotPoolBytes));
     }
 
     if (args.enableAudioOutput)
@@ -672,8 +749,8 @@ int main(int argc, char* argv[])
         draftingConfig.dsparkMaxProposalLen = args.specDecodeArgs.dsparkMaxProposalLen;
         try
         {
-            runtime = std::make_unique<rt::LLMInferenceRuntime>(
-                args.engineDir, args.multimodalEngineDir, loraWeightsMap, draftingConfig, stream);
+            runtime = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir, args.multimodalEngineDir,
+                loraWeightsMap, draftingConfig, stream, args.contextCacheConfig);
         }
         catch (std::exception const& e)
         {
@@ -687,7 +764,7 @@ int main(int argc, char* argv[])
         try
         {
             runtime = std::make_unique<rt::LLMInferenceRuntime>(
-                args.engineDir, args.multimodalEngineDir, loraWeightsMap, stream);
+                args.engineDir, args.multimodalEngineDir, loraWeightsMap, stream, args.contextCacheConfig);
         }
         catch (std::exception const& e)
         {
@@ -755,6 +832,11 @@ int main(int argc, char* argv[])
         setProfilingEnabled(false);
         LOG_INFO("Starting warmup with %d runs using the first request...", args.warmup);
         auto& firstRequest = batchedRequests[0];
+        rt::ContextCacheLookupPolicy const originalLookupPolicy = firstRequest.contextCacheLookupPolicy;
+        if (args.contextCacheConfig.enabled)
+        {
+            firstRequest.contextCacheLookupPolicy = rt::ContextCacheLookupPolicy::kBypass;
+        }
 
         for (int32_t warmupRun = 0; warmupRun < args.warmup; ++warmupRun)
         {
@@ -763,10 +845,12 @@ int main(int argc, char* argv[])
 
             if (!requestStatus)
             {
+                firstRequest.contextCacheLookupPolicy = originalLookupPolicy;
                 LOG_ERROR("Warmup run %d/%d failed", warmupRun + 1, args.warmup);
                 return EXIT_FAILURE;
             }
         }
+        firstRequest.contextCacheLookupPolicy = originalLookupPolicy;
         LOG_INFO("Warmup of %d runs completed. Starting actual benchmark runs...", args.warmup);
     }
 
@@ -1186,6 +1270,10 @@ int main(int argc, char* argv[])
         auto prefillMetrics = runtime->getPrefillMetrics();
         auto multimodalMetrics = runtime->getMultimodalMetrics();
         outputPrefillProfile(profileOutput, prefillMetrics);
+        if (auto const contextCacheMetrics = runtime->getContextCacheMetrics(); contextCacheMetrics.has_value())
+        {
+            outputContextCacheProfile(profileOutput, *contextCacheMetrics);
+        }
         if (args.specDecodeArgs.enabled)
         {
             auto specDecodeGenerationMetrics = runtime->getSpecDecodeGenerationMetrics();
@@ -1216,6 +1304,10 @@ int main(int argc, char* argv[])
 
             // Add high-level metrics from unified runtime
             addJsonPrefillSummary(profileJson, runtime->getPrefillMetrics());
+            if (auto const contextCacheMetrics = runtime->getContextCacheMetrics(); contextCacheMetrics.has_value())
+            {
+                addJsonContextCacheSummary(profileJson, *contextCacheMetrics);
+            }
             if (args.specDecodeArgs.enabled)
             {
                 addJsonSpecDecodeGenerationSummary(profileJson, runtime->getSpecDecodeGenerationMetrics(),

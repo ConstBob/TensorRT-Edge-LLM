@@ -72,6 +72,7 @@ struct LLMEngineConfig
     int32_t maxSupportedInputLength{};   //!< Maximum supported input length
     int32_t maxKVCacheCapacity{};        //!< Maximum KV cache capacity (sequence length)
     int64_t skipSoftmaxScaleOverride{0}; //!< skip-softmax scale-factor override (0 = disabled)
+    int32_t kvPoolPages{};               //!< Exact physical K-page count serialized in KV binding shapes
     int32_t rotaryDim{};                 //!< Rotary embedding dimension
     int32_t numDecoderLayers{};          //!< Total decoder layers (attention + linear)
     int32_t vocabSize{};                 //!< Full vocabulary size
@@ -172,6 +173,9 @@ struct LLMEngineConfig
     int32_t specDraftMaskTokenId{0};
 
     //! Target decoder-layer IDs whose hidden states are concatenated for cached drafts.
+    //! EAGLE base engines own this contract through `eagle_hidden_state_layers`;
+    //! DFlash/DSpark keep their mode-specific target-layer metadata on the engine
+    //! that exports it.
     std::vector<int32_t> specTargetLayerIds{};
 
     // --- Gemma4 MTP shared-target-KV metadata ---

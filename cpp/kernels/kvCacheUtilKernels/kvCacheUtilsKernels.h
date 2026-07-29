@@ -73,12 +73,12 @@ void saveKVCacheLayerIntoTensor(
 /// @param dstLayerInfos  [numLayers] GPU array — destination saved tensors
 /// @param numLayers      Number of layers in this batch
 /// @param headDim        Head dimension (same for all layers)
-/// @param maxBatchSize   Allocation batch of the source cache (V-half offset = maxBatchSize*capPadded*H*D)
+/// @param kvPoolPages    Physical K-page count of the source cache (V-half offset = kvPoolPages*128*H*D)
 /// @param batchIdx       Batch index to save from
 /// @param sequenceLength Number of tokens to copy
 /// @param stream         CUDA stream
 void saveKVCacheBatched(KVLayerInfo const* srcLayerInfos, KVLayerInfo const* dstLayerInfos, int32_t numLayers,
-    int32_t headDim, int32_t maxBatchSize, int32_t batchIdx, int32_t sequenceLength, cudaStream_t stream);
+    int32_t headDim, int32_t kvPoolPages, int32_t batchIdx, int32_t sequenceLength, cudaStream_t stream);
 
 /// @brief Batched restore: load multiple layers' KV cache from per-layer tensors in a single launch.
 /// All layers must share the same headDim. srcLayerInfos[i].data points to a [2, seqLen, numKVHeads_i,
@@ -88,12 +88,12 @@ void saveKVCacheBatched(KVLayerInfo const* srcLayerInfos, KVLayerInfo const* dst
 /// @param srcLayerInfos  [numLayers] GPU array — source saved tensors
 /// @param numLayers      Number of layers in this batch
 /// @param headDim        Head dimension (same for all layers)
-/// @param maxBatchSize   Allocation batch of the destination cache (V-half offset = maxBatchSize*capPadded*H*D)
+/// @param kvPoolPages    Physical K-page count of the destination cache (V-half offset = kvPoolPages*128*H*D)
 /// @param batchIdx       Batch index to restore into
 /// @param sequenceLength Number of tokens to copy
 /// @param stream         CUDA stream
 void instantiateKVCacheBatched(KVLayerInfo const* dstLayerInfos, KVLayerInfo const* srcLayerInfos, int32_t numLayers,
-    int32_t headDim, int32_t maxBatchSize, int32_t batchIdx, int32_t sequenceLength, cudaStream_t stream);
+    int32_t headDim, int32_t kvPoolPages, int32_t batchIdx, int32_t sequenceLength, cudaStream_t stream);
 
 //! \brief Gathers logical pages 0..ceil(seqLen/128) of every slot from a paged K/V page pool into dense
 //! split K/V workspaces, for FMHA_v2-style / FFPA consumers that require a contiguous [B, seqLen, H, D]

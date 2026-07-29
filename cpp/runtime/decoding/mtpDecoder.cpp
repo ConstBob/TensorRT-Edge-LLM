@@ -54,9 +54,10 @@ constexpr int32_t kDecodeProfile{1};
 } // namespace
 
 MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, std::filesystem::path const& engineDir,
-    SpecDecodeDraftingConfig const& draftingConfig, cudaStream_t stream)
+    SpecDecodeDraftingConfig const& draftingConfig, std::unique_ptr<EngineExecutor> draftExecutor, cudaStream_t stream)
     : mRuntime(runtime)
     , mDraftCacheManager(*runtime.base.sharedResources.cacheManagers[1])
+    , mDraftExecutor(std::move(draftExecutor))
 {
     check::check(mRuntime.deployment.draft.has_value(), "SpecDecode drafting strategy requires a draft model config.");
     check::check(
@@ -64,7 +65,7 @@ MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, std::filesystem::path co
     check::check(runtime.deployment.base.specDecodeType == SpecDecodeMode::kMTP,
         "MTP decoding requires a base engine exported with spec_decode_type=mtp and engine_role=base.");
 
-    mDraftExecutor = decoder_utils::loadDraftEngine(engineDir, mRuntime.deployment);
+    ELLM_CHECK(mDraftExecutor != nullptr, "MTP decoding requires a validated draft engine.");
 
     int32_t const maxRuntimeBatchSize = mRuntime.maxRuntimeBatchSize;
     int32_t const effectiveMaxDraftProposalSize = mRuntime.deployment.effectiveMaxDraftProposalSize();
@@ -1026,8 +1027,11 @@ void MTPDecoder::resetForNewSequences(Tensor& reuseLengths, cudaStream_t stream)
 }
 
 void MTPDecoder::onBatchEvict(std::vector<int32_t> const&, int32_t oldActiveBatch, int32_t newActiveBatch,
-    Tensor& deviceBatchMapping, cudaStream_t stream)
+    Tensor& deviceBatchMapping, cudaStream_t stream, BatchCompactionMode mode)
 {
+    ELLM_CHECK(
+        mode == BatchCompactionMode::kLegacyPhysicalKv, "MTP does not support managed context-cache batch compaction.");
+
     mDraftCacheManager.compactBatch(deviceBatchMapping, oldActiveBatch, newActiveBatch, stream);
     mDraftCacheManager.setActiveBatchSize(newActiveBatch);
 

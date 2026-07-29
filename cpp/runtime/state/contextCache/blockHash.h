@@ -52,15 +52,6 @@ inline bool operator!=(Hash128 const& lhs, Hash128 const& rhs) noexcept
 //! equal tokens in the current block. Production chains contain complete blocks; hashFullBlocks() leaves a partial tail
 //! private to its request.
 using BlockHash = Hash128;
-//! Compatibility namespace for every model/configuration property that changes the produced reusable state.
-using CacheDomainId = Hash128;
-//! Identity of every draft-specific input that can change stored speculative KV state.
-//!
-//! The producer must change this digest when draft weights, engine/configuration, KV schema/layout/dtype, adapter
-//! state, or the EAGLE conditioning contract changes. It is stable across requests and excludes sampling-only policy.
-using DraftEngineSignature = Hash128;
-//! Identity of the recurrent/conv tensor layout and dtype captured in one exact checkpoint.
-using RecurrentStateSchemaId = Hash128;
 
 struct AdapterKey
 {
@@ -89,7 +80,7 @@ struct BlockKeyExtras
 
 inline constexpr BlockHash kCHAIN_ROOT{0x9E3779B97F4A7C15ULL, 0xC2B2AE3D27D4EB4FULL};
 
-//! Deterministically hash exact opaque bytes for adapter, deployment, media, or isolation identity.
+//! Deterministically hash exact opaque bytes for adapter, media, or isolation identity.
 //! This uses the same non-cryptographic 128-bit FNV-1a primitive as block chaining.
 Hash128 hashOpaqueIdentity(std::string_view bytes);
 

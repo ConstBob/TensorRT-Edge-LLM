@@ -22,6 +22,7 @@
 #include "common/inputLimits.h"
 #include "common/logger.h"
 #include "common/mathUtils.h"
+#include "common/pagedKvTypes.h"
 #include "common/safetensorsUtils.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
 #include "kernels/posEncoding/applyRopeWriteKV.h"
@@ -31,12 +32,15 @@
 #include "multimodal/qwenViTRunner.h"
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
+#include "runtime/contextCacheRequest.h"
 #include "runtime/debug/layerDebugger.h"
 #include "runtime/decoding/decoderRegistry.h"
 #include "runtime/decoding/decoderUtils.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "runtime/state/contextCache/contextCacheCoordinator.h"
 #include "sampler/sampling.h"
 #include <algorithm>
+#include <cinttypes>
 #include <cmath>
 #include <cstdlib>
 #include <exception>
@@ -108,24 +112,36 @@ void validateDFlashTreeMetadataBindings(DeploymentConfig const& deployment, Engi
             + binding_names::kTreeParentIds + "' and '" + binding_names::kTreeDepths
             + "'. Re-export the base model with --dflash-tree-base, then rebuild spec_base.engine.");
 }
+
 } // namespace
 
 LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
     std::unordered_map<std::string, std::string> const& loraWeightsMap, SpecDecodeDraftingConfig const& draftingConfig,
-    cudaStream_t stream)
+    cudaStream_t stream, ContextCacheConfig const& contextCacheConfig)
 {
-    initializeCommon(engineDir, multimodalEngineDir, loraWeightsMap, draftingConfig, stream);
+    initializeCommon(engineDir, multimodalEngineDir, loraWeightsMap, draftingConfig, stream, contextCacheConfig);
 }
 
 LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
-    std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream)
+    std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream,
+    ContextCacheConfig const& contextCacheConfig)
 {
-    initializeCommon(engineDir, multimodalEngineDir, loraWeightsMap, std::nullopt, stream);
+    initializeCommon(engineDir, multimodalEngineDir, loraWeightsMap, std::nullopt, stream, contextCacheConfig);
+}
+
+LLMInferenceRuntime::~LLMInferenceRuntime() noexcept
+{
+    if (mContextCache != nullptr && mContextCache->shutdown() != ContextCacheCoordinatorStatus::kOk)
+    {
+        LOG_ERROR("Context-cache shutdown could not prove stream quiescence.");
+        std::terminate();
+    }
 }
 
 void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::string const& multimodalEngineDir,
     std::unordered_map<std::string, std::string> const& loraWeightsMap,
-    std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream)
+    std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream,
+    ContextCacheConfig const& contextCacheConfig)
 {
     // -----------------------------------------------------------------------
     // 1. Load shared embedding table (shared between base and draft models).
@@ -145,6 +161,11 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
         : std::nullopt;
 
     mDeployment = createDeploymentConfig(baseConfigPath, draftConfigPath, draftingConfig);
+    std::optional<ContextCacheDeploymentKind> contextCacheDeploymentKind;
+    if (contextCacheConfig.enabled)
+    {
+        contextCacheDeploymentKind = validateContextCacheDeployment(mDeployment);
+    }
 
     std::filesystem::path const baseEnginePath = draftingConfig.has_value()
         ? engineDirPath / "spec_base.engine"
@@ -177,6 +198,13 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     validateAgainstEngine(mDeployment.base, *mBaseExecutor, "base");
     validateDFlashTreeMetadataBindings(mDeployment, *mBaseExecutor);
 
+    // Validate the draft engine ABI before its sidecar geometry is used to allocate
+    // physical cache resources. Ownership is transferred to the selected decoder.
+    std::unique_ptr<EngineExecutor> draftExecutor;
+    if (draftingConfig.has_value())
+    {
+        draftExecutor = decoder_utils::loadDraftEngine(engineDirPath, mDeployment);
+    }
     // -----------------------------------------------------------------------
     // 5. Set runtime batch size.
     // -----------------------------------------------------------------------
@@ -394,8 +422,8 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     // 13. Decoding strategies.
     // -----------------------------------------------------------------------
     buildDecodingRuntimeContext();
-    mDecoderRegistry = std::make_unique<DecoderRegistry>(
-        *mDecodingRuntimeContext, DecoderRegistryConfig{std::filesystem::path(engineDir), draftingConfig, stream});
+    mDecoderRegistry = std::make_unique<DecoderRegistry>(*mDecodingRuntimeContext,
+        DecoderRegistryInit{std::filesystem::path(engineDir), draftingConfig, std::move(draftExecutor), stream});
 
     // -----------------------------------------------------------------------
     // 14. Optional multimodal runners.
@@ -454,6 +482,25 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
                     "Re-export and rebuild the action engine with --max_kv_cache_capacity=%d to match the LLM engine.",
                     actionMaxKVCacheCapacity, llmMaxKVCacheCapacity, llmMaxKVCacheCapacity));
         }
+    }
+
+    if (contextCacheConfig.enabled)
+    {
+        ELLM_CHECK(mActionRunner == nullptr && mAudioRunner == nullptr && mVisionRunner == nullptr,
+            "Context reuse is text-only and cannot be enabled with multimodal or action runners.");
+        ELLM_CHECK(!mSharedResources->cacheManagers.empty()
+                && mSharedResources->cacheManagers.size() == mSharedResources->kvPageTables.size()
+                && mSharedResources->cacheManagers.size() <= 2,
+            "Context reuse requires one base cache and at most one draft cache.");
+        HybridCacheManager* const draftCache
+            = mSharedResources->cacheManagers.size() == 2 ? mSharedResources->cacheManagers[1].get() : nullptr;
+        KVPageTable* const draftPageTable
+            = mSharedResources->kvPageTables.size() == 2 ? mSharedResources->kvPageTables[1].get() : nullptr;
+        ContextCachePhysicalResources cacheResources{
+            *mSharedResources->cacheManagers[0], *mSharedResources->kvPageTables[0], draftCache, draftPageTable};
+        ELLM_CHECK(contextCacheDeploymentKind.has_value(), "Context-cache deployment was not validated");
+        mContextCache = std::make_unique<ContextCacheCoordinator>(
+            contextCacheConfig, mDeployment, *contextCacheDeploymentKind, cacheResources, stream);
     }
 
     // -----------------------------------------------------------------------
@@ -565,9 +612,41 @@ void LLMInferenceRuntime::setActionNoiseSeed(int32_t seed) noexcept
     }
 }
 
+std::optional<ContextCacheMetrics> LLMInferenceRuntime::getContextCacheMetrics() const noexcept
+{
+    if (mContextCache == nullptr)
+    {
+        return std::nullopt;
+    }
+    return mContextCache->metrics();
+}
+
 bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response,
     cudaStream_t stream, bool outputThinkerEmbeddings)
 {
+    bool expected = false;
+    if (!mHandleRequestInProgress.compare_exchange_strong(
+            expected, true, std::memory_order_acquire, std::memory_order_relaxed))
+    {
+        LOG_ERROR("Overlapping handleRequest() calls on one runtime are not supported.");
+        return false;
+    }
+    struct HandleRequestGuard
+    {
+        explicit HandleRequestGuard(std::atomic<bool>& active) noexcept
+            : mActive(active)
+        {
+        }
+
+        ~HandleRequestGuard() noexcept
+        {
+            mActive.store(false, std::memory_order_release);
+        }
+
+        std::atomic<bool>& mActive;
+    };
+    HandleRequestGuard const handleRequestGuard{mHandleRequestInProgress};
+
     // Clear per-request portal state. Buffers themselves stay allocated and are
     // reshaped/overwritten when populated below — see getBaseModelHiddenStates() contract.
     mHiddenStatesRegistry.clear();
@@ -589,6 +668,12 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
         return false;
     }
 
+    if (mContextCache != nullptr && request.saveSystemPromptKVCache)
+    {
+        LOG_ERROR("Legacy system-prompt KV-cache capture cannot be combined with the context-cache manager.");
+        return false;
+    }
+
     if (!validateStreamingSubmission(request))
     {
         return false;
@@ -596,6 +681,13 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
 
     DecodingStrategy& decodingStrategy = mDecoderRegistry->select(request);
     bool const enableSpecDecode = decodingStrategy.isSpeculative();
+    if (shouldRejectLogitBiasWithSpecDecode(request, enableSpecDecode))
+    {
+        LOG_ERROR(
+            "logit_bias is not supported while speculative decoding is enabled; set disable_spec_decode=true or use "
+            "a vanilla decoding strategy.");
+        return false;
+    }
 
     // DSpark implements the paper-equivalent probabilistic verifier and can keep non-greedy sampling params.
     // Other speculative decoders still run greedy-compatible verification.
@@ -604,6 +696,15 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     if (enableSpecDecode && hasNonGreedySampling && !dsparkSpecDecode)
     {
         LOG_WARNING("Spec-decode active: overriding sampling params to greedy (ignoring temp/topK/topP).");
+    }
+    if (mDeployment.specDecodeMode() == SpecDecodeMode::kEAGLE
+        && decodingStrategy.kind() == DecodingStrategyKind::kVanilla && !request.disableSpecDecode
+        && hasNonGreedySampling)
+    {
+        LOG_WARNING(
+            "Decoder fallback: reason=non_greedy_eagle_unsupported, selected=vanilla, "
+            "temperature=%.3f, topK=%" PRId64 ", topP=%.3f.",
+            request.temperature, request.topK, request.topP);
     }
 
     int32_t maxGenerateLength = request.maxGenerateLength;
@@ -715,12 +816,27 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
         context.slotStreams[i].maxStopLen = maxLen;
     }
 
-    // The spec-decode path needs extra KV reserve for draft tokens during verification.
-    constexpr int32_t kDRAFT_KVCACHE_RESERVE_LENGTH{100};
     int32_t const kvCacheCapacity = enableSpecDecode
         ? std::min(mDeployment.base.maxKVCacheCapacity, mDeployment.draft->maxKVCacheCapacity)
         : mDeployment.base.maxKVCacheCapacity;
-    int32_t const kvcReserve = enableSpecDecode ? kDRAFT_KVCACHE_RESERVE_LENGTH : 0;
+    int32_t kvcReserve = 0;
+    if (enableSpecDecode)
+    {
+        // Preserve the historical reserve for unmanaged speculative strategies. Managed EAGLE preflights exact
+        // base-verification and draft-proposal working sets, so its admission clamp must use the same geometry.
+        constexpr int32_t kLEGACY_SPEC_KV_CACHE_RESERVE{100};
+        kvcReserve = kLEGACY_SPEC_KV_CACHE_RESERVE;
+        if (mContextCache != nullptr && decodingStrategy.kind() == DecodingStrategyKind::kEAGLE)
+        {
+            ELLM_CHECK(mDeployment.specConfig.has_value(), "EAGLE decoding requires speculative configuration");
+            int64_t const draftWorkingTokens = static_cast<int64_t>(mDeployment.specConfig->draftingStep)
+                * static_cast<int64_t>(mDeployment.specConfig->draftingTopK);
+            int64_t const reserve = std::max<int64_t>(mDeployment.specConfig->verifySize, draftWorkingTokens);
+            ELLM_CHECK(reserve > 0 && reserve <= static_cast<int64_t>(std::numeric_limits<int32_t>::max()),
+                "EAGLE KV-cache working-set reserve exceeds int32");
+            kvcReserve = static_cast<int32_t>(reserve);
+        }
+    }
 
     // In production, the system-prompt KV cache is saved during warm-up.
     // We disable profiling here to make benchmarking closer to production inference result.
@@ -751,11 +867,30 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
         setProfilingEnabled(true);
     }
 
+    std::optional<ContextCacheRequest> contextCacheRequest;
+    if (mContextCache != nullptr)
+    {
+        std::optional<ContextCacheRequest> admitted
+            = ContextCacheRequest::begin(*mContextCache, request, context, decodingStrategy.kind());
+        if (!admitted.has_value())
+        {
+            return false;
+        }
+        contextCacheRequest.emplace(std::move(*admitted));
+    }
+    ContextCacheRequest* const managedRequest = contextCacheRequest.has_value() ? &*contextCacheRequest : nullptr;
+
     // Conduct the preparation work to handle a new set of sequences, including inputIds packing, input/output tensor
     // preparation, reset the KVCache state, and apply reused prefix KVCache if available.
-    if (!setUpForPrefillExecution(context, decodingStrategy))
+    std::vector<int32_t> const* const contextCachePrefillStarts
+        = managedRequest != nullptr ? &managedRequest->prefillStarts() : nullptr;
+    if (!setUpForPrefillExecution(context, decodingStrategy, contextCachePrefillStarts))
     {
         LOG_ERROR("Prefill execution setup failed. This request cannot be handled.");
+        return false;
+    }
+    if (managedRequest != nullptr && !managedRequest->preparePrefill())
+    {
         return false;
     }
 
@@ -781,8 +916,19 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     }
     StreamChannelFinalizer streamFinalizer(context, *mTokenizer);
 
+    std::vector<int32_t> contextCacheResidentInputLengths;
+    std::vector<int32_t> const* capacityInputLengths = &context.effectivePrefillLengths;
+    if (managedRequest != nullptr)
+    {
+        contextCacheResidentInputLengths.reserve(context.rawBatchedInputIds.size());
+        for (std::vector<int32_t> const& tokenIds : context.rawBatchedInputIds)
+        {
+            contextCacheResidentInputLengths.push_back(static_cast<int32_t>(tokenIds.size()));
+        }
+        capacityInputLengths = &contextCacheResidentInputLengths;
+    }
     int32_t const clampedMaxGenerateLength = clampMaxGenerateLengthForKVCapacity(
-        context.effectivePrefillLengths, request.maxGenerateLength, kvCacheCapacity, kvcReserve);
+        *capacityInputLengths, request.maxGenerateLength, kvCacheCapacity, kvcReserve);
     if (clampedMaxGenerateLength != context.maxGenerateLength)
     {
         context.maxGenerateLength = clampedMaxGenerateLength;
@@ -795,10 +941,22 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     }
 
     // Prefill from the base model; subsequent iterations are delegated to the selected strategy.
-    bool const prefillStatus = runBaseModelPrefill(context);
+    bool const prefillStatus = runBaseModelPrefill(context, managedRequest);
     if (!prefillStatus)
     {
         LOG_ERROR("Failed to execute prefill step for base model.");
+        return false;
+    }
+
+    if (managedRequest != nullptr && !decodingStrategy.initializeForGeneration(context))
+    {
+        LOG_ERROR("Failed to initialize generation state for %s decoding strategy.", decodingStrategy.name());
+        return false;
+    }
+
+    std::vector<int32_t> const& commonMaterializedStateLengths = decodingStrategy.commonMaterializedStateLengths();
+    if (managedRequest != nullptr && !managedRequest->completePrefill(context, commonMaterializedStateLengths))
+    {
         return false;
     }
 
@@ -919,7 +1077,7 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
             }
             auto& s = context.slotStreams[i];
             // terminalReason is set for all slots; non-streaming slots surface it via
-            // BatchResult.terminalReason → response.finishReasons.
+            // BatchResult.terminalReason -> response.finishReasons.
             if (mActionRunner && mActionRunner->getModelType() == action::ActionModelType::ALPAMAYO1)
             {
                 if (context.tokenIds[i].size() > 1 && trajFutureStartId >= 0
@@ -987,14 +1145,21 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     {
         applyCancellationToFinishStates(context);
         decodePerSlot(context, *mTokenizer);
+
         updateThinkingDone();
+
         updateFinishStates();
         emitChunks(context, *mTokenizer);
 
-        // If everything finished during prefill, evict once so activeBatchSize reaches 0
-        if (checkAllFinished() && context.activeBatchSize > 0)
+        // Managed vanilla and EAGLE requests may remove individual slots that finished on the prefill token before
+        // decoding starts. Unmanaged requests and other speculative strategies retain the legacy all-finished-only
+        // path; their first-round state is outside this integration's partial-compaction contract.
+        bool const supportsPartialPrefillEviction = managedRequest != nullptr
+            && (decodingStrategy.kind() == DecodingStrategyKind::kVanilla
+                || decodingStrategy.kind() == DecodingStrategyKind::kEAGLE);
+        if (context.activeBatchSize > 0 && (supportsPartialPrefillEviction || checkAllFinished()))
         {
-            bool const batchEvictStatus = performBatchEvict(context, decodingStrategy);
+            bool const batchEvictStatus = performBatchEvict(context, decodingStrategy, thinkingDone, managedRequest);
             if (!batchEvictStatus)
             {
                 LOG_ERROR("Failed to perform batch eviction.");
@@ -1009,13 +1174,18 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
         // first in the per-slot terminalReason latch.
         applyCancellationToFinishStates(context);
 
+        if (managedRequest != nullptr && !managedRequest->prepareDecodeStep(context))
+        {
+            return false;
+        }
+
         if (!decodingStrategy.decodeStep(context))
         {
             LOG_ERROR("Failed to decode tokens with %s decoding strategy.", decodingStrategy.name());
             return false;
         }
 
-        // Per-iter pipeline: decode → finalize finish state → emit chunks.
+        // Per-iter pipeline: decode -> finalize finish state -> emit chunks.
         decodePerSlot(context, *mTokenizer);
 
         // Update thinking-done state: check if the last generated token is an
@@ -1023,13 +1193,19 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
         updateThinkingDone();
 
         updateFinishStates();
+
+        std::vector<int32_t> const& commonMaterializedStateLengths = decodingStrategy.commonMaterializedStateLengths();
+        if (managedRequest != nullptr && !managedRequest->completeDecodeStep(context, commonMaterializedStateLengths))
+        {
+            return false;
+        }
         emitChunks(context, *mTokenizer);
 
         emitTokenCallbacks(context);
         context.generationRound += 1;
 
-        // Perform batch eviction if needed (after verification, before updating finish states)
-        bool const batchEvictStatus = performBatchEvict(context, decodingStrategy);
+        // Perform batch eviction after all old-slot progress and terminal publication are complete.
+        bool const batchEvictStatus = performBatchEvict(context, decodingStrategy, thinkingDone, managedRequest);
         if (!batchEvictStatus)
         {
             LOG_ERROR("Failed to perform batch eviction.");
@@ -1047,6 +1223,11 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     {
         LOG_ERROR("Eviction failure, there should be no active batch at the end of the inference. activeBatchSize: %d",
             context.activeBatchSize);
+        return false;
+    }
+
+    if (managedRequest != nullptr && !managedRequest->finish())
+    {
         return false;
     }
 
@@ -1234,14 +1415,6 @@ bool LLMInferenceRuntime::validateRequestConfig(LLMGenerationRequest const& requ
             }
         }
     }
-    bool const speculativeDecoderAvailable = mDecoderRegistry && mDecoderRegistry->hasSpeculativeDecoder();
-    if (shouldRejectLogitBiasWithSpecDecode(request, speculativeDecoderAvailable))
-    {
-        LOG_ERROR(
-            "logit_bias is not supported while speculative decoding is enabled; set disable_spec_decode=true or use "
-            "a vanilla engine.");
-        return false;
-    }
     if (hasAudio && !mAudioRunner)
     {
         LOG_ERROR("Request contains audio input, but this runtime does not have an audio runner.");
@@ -1388,7 +1561,8 @@ bool LLMInferenceRuntime::multiModalRuntimePreprocess(
     return true;
 }
 
-bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context)
+bool LLMInferenceRuntime::runBaseModelPrefill(
+    DecodingInferenceContext& context, ContextCacheRequest* contextCacheRequest)
 {
     TIME_STAGE(metrics::StageNames::kLLM_PREFILL, context.stream);
     NVTX_SCOPED_RANGE(nvtx_base_prefill,
@@ -1458,7 +1632,10 @@ bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context)
 
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
-        hostCtxLenData[i] = context.effectivePrefillLengths[i];
+        int32_t const requestedSeqLen = context.effectivePrefillLengths[i];
+        ELLM_CHECK(requestedSeqLen >= 0 && requestedSeqLen <= inputIdsLength,
+            "Effective prefill length must be within the current input sequence");
+        hostCtxLenData[i] = requestedSeqLen;
         std::copy(context.tokenIds[i].begin(), context.tokenIds[i].end(), hostPackedTokenIdsData + i * inputIdsLength);
     }
 
@@ -1512,6 +1689,10 @@ bool LLMInferenceRuntime::runBaseModelPrefill(DecodingInferenceContext& context)
         "Failed to prepare base model for prefill step.");
     check::check(mBaseExecutor->execute(context.stream), "Failed to execute base model for prefill step.");
     mSharedResources->cacheManagers[0]->commitSequenceLength(mPipelineIO->contextLengths, context.stream);
+    if (contextCacheRequest != nullptr && !contextCacheRequest->enqueuePrefillCaptures())
+    {
+        return false;
+    }
 
     if (mDeployment.base.isDiffusionBackbone)
     {
@@ -1717,7 +1898,8 @@ void LLMInferenceRuntime::zeroRecurrentStates(int32_t batchIdx, cudaStream_t str
     }
 }
 
-bool LLMInferenceRuntime::setUpForPrefillExecution(DecodingInferenceContext& context, DecodingStrategy& strategy)
+bool LLMInferenceRuntime::setUpForPrefillExecution(DecodingInferenceContext& context, DecodingStrategy& strategy,
+    std::vector<int32_t> const* contextCachePrefillStarts)
 {
     NVTX_SCOPED_RANGE(nvtx_setup, "SETUP_PREFILL_EXECUTION", nvtx_colors::PALE_GREEN);
 
@@ -1748,64 +1930,83 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(DecodingInferenceContext& con
     bool const needsStrategyKVCache = strategy.isSpeculative();
     auto& cacheMgrBase = *mSharedResources->cacheManagers[0];
 
-    // Record the length of the reused KVCache for each sequence.
-    check::check(mHostReuseKVCacheLengths.reshape({activeBatchSize}), "Tensor reshape failed");
-    int32_t* reuseKVCacheLengthsData = mHostReuseKVCacheLengths.dataPointer<int32_t>();
-    std::fill(reuseKVCacheLengthsData, reuseKVCacheLengthsData + activeBatchSize, 0);
-
     context.tokenIds.clear();
     context.tokenIds.resize(activeBatchSize);
 
-    for (int32_t i = 0; i < activeBatchSize; ++i)
+    if (contextCachePrefillStarts != nullptr)
     {
-        auto const& prompt = context.systemPrompts[i];
-        auto const promptKey = keySystemPromptWithLoraWeights(prompt, context.loraWeightsName);
-        if (mSystemPromptKVCacheBase.count(promptKey) > 0)
+        ELLM_CHECK(
+            mContextCache != nullptr && (!needsStrategyKVCache || strategy.kind() == DecodingStrategyKind::kEAGLE),
+            "Managed context-cache prefill supports only vanilla or EAGLE decoding strategies");
+        ELLM_CHECK(static_cast<int32_t>(contextCachePrefillStarts->size()) == activeBatchSize,
+            "Managed context-cache execution recipe must describe every active sequence");
+        for (int32_t i = 0; i < activeBatchSize; ++i)
         {
-            auto& precachedKVCacheBase = mSystemPromptKVCacheBase[promptKey];
-            auto const& kvCacheLayersBase = precachedKVCacheBase.kvCacheLayers;
-            cacheMgrBase.restoreKVCache(kvCacheLayersBase, i, context.stream);
-
-            if (needsStrategyKVCache)
-            {
-                check::check(strategy.hasSystemPromptKVCache(promptKey),
-                    "System prompt cache inconsistency between base and active decoding strategy");
-                strategy.restoreSystemPromptKVCache(promptKey, i, context.stream);
-            }
-
-            // Restore recurrent/conv states for hybrid models (vanilla path only — spec decode handles this in
-            // decoder).
-            if (mDeployment.base.numLinearAttnLayers > 0)
-            {
-                restoreRecurrentStates(i, precachedKVCacheBase, context.stream);
-            }
-
-            // Cached token length comes from the tokenized prompt that was actually captured, not from
-            // any KV-tensor's physical shape (see computeSystemPromptReuse) — this also covers
-            // pure-recurrent models, whose kvCacheLayersBase is empty.
-            auto reuse = computeSystemPromptReuse(precachedKVCacheBase, batchedInputIds[i]);
-            reuseKVCacheLengthsData[i] = reuse.reuseKVCacheLength;
-            context.tokenIds[i] = std::move(reuse.tokenIds);
-            context.effectivePrefillLengths[i] = reuse.effectivePrefillLength;
-
-            bool const matchIds = std::equal(precachedKVCacheBase.tokenizedPrompt.begin(),
-                precachedKVCacheBase.tokenizedPrompt.end(), batchedInputIds[i].begin());
-            if (!matchIds)
-            {
-                LOG_WARNING(
-                    "Though system prompt strings are matched, token_ids are not perfectly aligned."
-                    "This may generate incorrect result, please check your system prompt design.");
-            }
+            int32_t const prefillStart = (*contextCachePrefillStarts)[static_cast<size_t>(i)];
+            ELLM_CHECK(prefillStart >= 0 && prefillStart < static_cast<int32_t>(batchedInputIds[i].size()),
+                "Managed context-cache prefill boundary is outside the input sequence");
+            context.tokenIds[i].assign(batchedInputIds[i].begin() + prefillStart, batchedInputIds[i].end());
+            context.effectivePrefillLengths[i] = static_cast<int32_t>(context.tokenIds[i].size());
         }
-        else
-        {
-            context.tokenIds[i] = batchedInputIds[i];
-            context.effectivePrefillLengths[i] = static_cast<int32_t>(batchedInputIds[i].size());
-            reuseKVCacheLengthsData[i] = 0;
+    }
+    else
+    {
+        // Record the length of the reused legacy system-prompt KV cache for each sequence.
+        check::check(mHostReuseKVCacheLengths.reshape({activeBatchSize}), "Tensor reshape failed");
+        int32_t* reuseKVCacheLengthsData = mHostReuseKVCacheLengths.dataPointer<int32_t>();
+        std::fill(reuseKVCacheLengthsData, reuseKVCacheLengthsData + activeBatchSize, 0);
 
-            if (mDeployment.base.numLinearAttnLayers > 0)
+        for (int32_t i = 0; i < activeBatchSize; ++i)
+        {
+            auto const& prompt = context.systemPrompts[i];
+            auto const promptKey = keySystemPromptWithLoraWeights(prompt, context.loraWeightsName);
+            if (mSystemPromptKVCacheBase.count(promptKey) > 0)
             {
-                zeroRecurrentStates(i, context.stream);
+                auto& precachedKVCacheBase = mSystemPromptKVCacheBase[promptKey];
+                auto const& kvCacheLayersBase = precachedKVCacheBase.kvCacheLayers;
+                cacheMgrBase.restoreKVCache(kvCacheLayersBase, i, context.stream);
+
+                if (needsStrategyKVCache)
+                {
+                    check::check(strategy.hasSystemPromptKVCache(promptKey),
+                        "System prompt cache inconsistency between base and active decoding strategy");
+                    strategy.restoreSystemPromptKVCache(promptKey, i, context.stream);
+                }
+
+                // Restore recurrent/conv states for hybrid models (vanilla path only — spec decode handles this in
+                // decoder).
+                if (mDeployment.base.numLinearAttnLayers > 0)
+                {
+                    restoreRecurrentStates(i, precachedKVCacheBase, context.stream);
+                }
+
+                // Cached token length comes from the tokenized prompt that was actually captured, not from
+                // any KV-tensor's physical shape (see computeSystemPromptReuse) — this also covers
+                // pure-recurrent models, whose kvCacheLayersBase is empty.
+                auto reuse = computeSystemPromptReuse(precachedKVCacheBase, batchedInputIds[i]);
+                reuseKVCacheLengthsData[i] = reuse.reuseKVCacheLength;
+                context.tokenIds[i] = std::move(reuse.tokenIds);
+                context.effectivePrefillLengths[i] = reuse.effectivePrefillLength;
+
+                bool const matchIds = std::equal(precachedKVCacheBase.tokenizedPrompt.begin(),
+                    precachedKVCacheBase.tokenizedPrompt.end(), batchedInputIds[i].begin());
+                if (!matchIds)
+                {
+                    LOG_WARNING(
+                        "Though system prompt strings are matched, token_ids are not perfectly aligned."
+                        "This may generate incorrect result, please check your system prompt design.");
+                }
+            }
+            else
+            {
+                context.tokenIds[i] = batchedInputIds[i];
+                context.effectivePrefillLengths[i] = static_cast<int32_t>(batchedInputIds[i].size());
+                reuseKVCacheLengthsData[i] = 0;
+
+                if (mDeployment.base.numLinearAttnLayers > 0)
+                {
+                    zeroRecurrentStates(i, context.stream);
+                }
             }
         }
     }
@@ -1819,16 +2020,24 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(DecodingInferenceContext& con
         return false;
     }
 
-    mSharedResources->cacheManagers[0]->resetForNewSequences(mHostReuseKVCacheLengths, context.stream);
-    if (needsStrategyKVCache)
+    if (contextCachePrefillStarts == nullptr)
     {
-        strategy.resetForNewSequences(mHostReuseKVCacheLengths, context.stream);
+        mSharedResources->cacheManagers[0]->resetForNewSequences(mHostReuseKVCacheLengths, context.stream);
+        if (needsStrategyKVCache)
+        {
+            strategy.resetForNewSequences(mHostReuseKVCacheLengths, context.stream);
+        }
     }
     return true;
 }
 
 bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(DecodingInferenceContext& context, int32_t genAndSaveBatchIdx)
 {
+    if (mContextCache != nullptr)
+    {
+        LOG_ERROR("Legacy system-prompt KV-cache capture cannot be combined with the context-cache manager.");
+        return false;
+    }
     if (mDeployment.base.useVisionBidirectionalAttention)
     {
         LOG_ERROR("System-prompt KV-cache reuse is not supported with Gemma4 vision bidirectional attention.");
@@ -1976,7 +2185,8 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     return genAndSaveSystemPromptKVCache(tempContext, 0);
 }
 
-bool LLMInferenceRuntime::performBatchEvict(DecodingInferenceContext& context, DecodingStrategy& strategy)
+bool LLMInferenceRuntime::performBatchEvict(DecodingInferenceContext& context, DecodingStrategy& strategy,
+    std::vector<int8_t>& thinkingDone, ContextCacheRequest* contextCacheRequest)
 {
     // Check if any batch has finished
     bool hasFinishedBatch = false;
@@ -2034,15 +2244,24 @@ bool LLMInferenceRuntime::performBatchEvict(DecodingInferenceContext& context, D
         }()
             .c_str());
 
-    // Upload batch mapping to GPU
-    check::check(mDeviceBatchMapping.reshape({oldActiveBatch}), "Tensor reshape failed");
-    CUDA_CHECK(cudaMemcpyAsync(mDeviceBatchMapping.rawPointer(), batchMapping.data(), oldActiveBatch * sizeof(int32_t),
-        cudaMemcpyHostToDevice, context.stream));
-
-    // Compact base model caches (KV + Mamba) via the HybridCacheManager single-call API.
-    mSharedResources->cacheManagers[0]->compactBatch(
-        mDeviceBatchMapping, oldActiveBatch, newActiveBatch, context.stream);
-    mSharedResources->cacheManagers[0]->setActiveBatchSize(newActiveBatch);
+    bool const managedContextCache = contextCacheRequest != nullptr;
+    if (managedContextCache)
+    {
+        if (!contextCacheRequest->beginBatchCompaction(batchMapping, newActiveBatch, mDeviceBatchMapping))
+        {
+            return false;
+        }
+    }
+    else
+    {
+        // The legacy identity path owns its mapping upload and physical KV-row copy.
+        check::check(mDeviceBatchMapping.reshape({oldActiveBatch}), "Tensor reshape failed");
+        CUDA_CHECK(cudaMemcpyAsync(mDeviceBatchMapping.rawPointer(), batchMapping.data(),
+            static_cast<size_t>(oldActiveBatch) * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
+        mSharedResources->cacheManagers[0]->compactBatch(
+            mDeviceBatchMapping, oldActiveBatch, newActiveBatch, context.stream);
+        mSharedResources->cacheManagers[0]->setActiveBatchSize(newActiveBatch);
+    }
 
     // Compact base model's RoPE cache (stored per-batch for MRope on mPipelineIO->mropeCosSin).
     if (mDeployment.base.ropeConfig.type == RopeType::kMRope && newActiveBatch > 0)
@@ -2058,10 +2277,24 @@ bool LLMInferenceRuntime::performBatchEvict(DecodingInferenceContext& context, D
         }
     }
 
-    strategy.onBatchEvict(batchMapping, oldActiveBatch, newActiveBatch, mDeviceBatchMapping, context.stream);
+    BatchCompactionMode const compactionMode
+        = managedContextCache ? BatchCompactionMode::kManagedPageRows : BatchCompactionMode::kLegacyPhysicalKv;
+    strategy.onBatchEvict(
+        batchMapping, oldActiveBatch, newActiveBatch, mDeviceBatchMapping, context.stream, compactionMode);
 
-    // Compact CPU context
-    CUDA_CHECK(cudaStreamSynchronize(context.stream));
+    // Consume the existing eviction synchronization. Managed paging moves page-table rows and slot state only;
+    // physical KV pages remain in place.
+    if (managedContextCache)
+    {
+        if (!contextCacheRequest->completeBatchCompaction())
+        {
+            return false;
+        }
+    }
+    else
+    {
+        CUDA_CHECK(cudaStreamSynchronize(context.stream));
+    }
 
     // Save evicted batches' results before compacting (using original batch index)
     for (size_t i = 0; i < batchMapping.size(); ++i)
@@ -2079,7 +2312,7 @@ bool LLMInferenceRuntime::performBatchEvict(DecodingInferenceContext& context, D
             result.rawBatchedInputIds = std::move(context.rawBatchedInputIds[i]);
             result.effectivePrefillLength = context.effectivePrefillLengths[i];
             result.terminalReason = context.slotStreams[i].terminalReason;
-            // Convert flat LogprobsSlot → nested vector for BatchResult (once per completed request).
+            // Convert flat LogprobsSlot -> nested vector for BatchResult (once per completed request).
             // Enrich each (token_id, logprob) with the raw token piece so consumers can render the
             // token string / bytes without needing a tokenizer (see LogprobEntry).
             rt::LogprobsSlot const& slot = context.stepLogprobs[i];
@@ -2100,6 +2333,12 @@ bool LLMInferenceRuntime::performBatchEvict(DecodingInferenceContext& context, D
     }
 
     rt::compactVector(batchMapping, context.finishedStates);
+    if (managedContextCache)
+    {
+        // Scope this MR's additional host-state compaction to coordinator-managed requests so disabling context reuse
+        // preserves the legacy path.
+        rt::compactVector(batchMapping, thinkingDone);
+    }
     rt::compactVector(batchMapping, context.currentGenerateLengths);
     rt::compactVector(batchMapping, context.tokenIds);
     rt::compactVector(batchMapping, context.systemPrompts);
