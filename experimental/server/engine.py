@@ -165,6 +165,20 @@ def _resolve_model_dir(model: str) -> str:
     return snapshot_download(model)
 
 
+def _derive_model_id(model: str, onnx_dir: str, engine_dir: str) -> str:
+    """Return a clean id to advertise via /v1/models and echo in responses.
+
+    A local checkpoint/ONNX/engine path (e.g. ``--model /path/to/Qwen3-8B-FP8``)
+    would otherwise leak the full filesystem path as the model id; use its
+    directory name. A HuggingFace id (``Qwen/Qwen3-1.7B``) is already clean and
+    is kept as-is.
+    """
+    src = model or onnx_dir or engine_dir or ""
+    if src and (os.path.isabs(src) or os.path.isdir(src)):
+        return os.path.basename(os.path.normpath(src))
+    return src
+
+
 def _artifacts_dir_for_model(model_dir: str) -> str:
     """Return a deterministic directory for ONNX/engine artifacts.
 
@@ -440,8 +454,7 @@ class LLM:
         # (the encoder slot now also serves audio).
         multimodal_engine_dir = multimodal_engine_dir or visual_engine_dir
 
-        self._model_id = (model or os.path.basename(onnx_dir)
-                          or os.path.basename(engine_dir))
+        self._model_id = _derive_model_id(model, onnx_dir, engine_dir)
         self._eagle_engine_dir = eagle_engine_dir
         self._draft_top_k = draft_top_k
         self._draft_step = draft_step
@@ -954,6 +967,42 @@ class LLM:
         cpp_messages = _convert_messages_to_cpp(self._rt, messages)
         return cpp_messages, image_buffers, True, True
 
+    def count_prompt_tokens(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        tools: Optional[Sequence[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        tool_config: Optional[ToolConfig] = None,
+        enable_thinking: bool = False,
+    ) -> Optional[int]:
+        """Best-effort prompt token count via the HF tokenizer: exact for
+        tool-templated requests, within a few tokens for plain ones (HF vs
+        C++ template). Multimodal placeholders are counted once, not expanded,
+        so multimodal prompts are undercounted. None when counting is
+        unavailable."""
+        try:
+            tool_config = tool_config or validate_tool_request(
+                messages, tools, tool_choice)
+            template_tools = (tool_config.tools
+                              if tool_config.tool_choice != "none" else [])
+            template_tool_choice = None
+            if template_tools and tool_config.tool_choice != "none":
+                template_tool_choice = self._tool_choice_for_template(
+                    tool_config)
+            formatter = self._get_tool_template_formatter()
+            prompt = formatter.format(
+                messages,
+                tools=template_tools,
+                tool_choice=template_tool_choice,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+            return formatter.count_tokens(prompt)
+        except Exception:
+            logger.debug("Prompt token counting unavailable", exc_info=True)
+            return None
+
     def _make_generation_request(
         self,
         messages: List[Dict[str, Any]],
@@ -1243,7 +1292,8 @@ class LLM:
               *,
               enable_batching: bool = False,
               batch_timeout_ms: float = 10.0,
-              max_queue_batch_size: Optional[int] = None) -> None:
+              max_queue_batch_size: Optional[int] = None,
+              request_queue_size: Optional[int] = None) -> None:
         """Start an OpenAI-compatible HTTP server.
 
         Args:
@@ -1252,8 +1302,11 @@ class LLM:
             enable_batching: Batch compatible non-streaming HTTP requests.
             batch_timeout_ms: Maximum time to wait for compatible requests.
             max_queue_batch_size: Optional cap for queued HTTP micro-batches.
+            request_queue_size: Max concurrently admitted requests (queued +
+                running) before the server returns backpressure. None uses the
+                server default.
         """
-        from .api_server import run_server
+        from .api_server import _DEFAULT_REQUEST_QUEUE_SIZE, run_server
 
         run_server(
             self,
@@ -1262,6 +1315,8 @@ class LLM:
             enable_batching=enable_batching,
             batch_timeout_ms=batch_timeout_ms,
             max_queue_batch_size=max_queue_batch_size,
+            request_queue_size=(request_queue_size if request_queue_size
+                                is not None else _DEFAULT_REQUEST_QUEUE_SIZE),
         )
 
     # ------------------------------------------------------------------

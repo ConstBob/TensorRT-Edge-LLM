@@ -23,6 +23,15 @@ from typing import Any, Callable, List, Optional, Tuple
 
 logger = logging.getLogger("edgellm.batching")
 
+
+class BatcherOverflow(RuntimeError):
+    """Raised by ``submit`` when the pending queue is at capacity.
+
+    Lets the upstream admission layer translate backpressure into a retryable
+    503 instead of letting requests pile up unboundedly behind the runtime.
+    """
+
+
 # Requests can share one runtime call only when these generation-level settings
 # match. Per-row inputs live under LLMGenerationRequest.requests and may differ.
 BATCH_COMPATIBILITY_FIELDS = (
@@ -113,15 +122,19 @@ class RequestBatcher:
         runtime_handler: Callable[[Any], Any],
         max_batch_size: int,
         timeout_ms: float,
+        max_pending: Optional[int] = None,
     ):
         if max_batch_size < 1:
             raise ValueError("max_batch_size must be positive")
         if timeout_ms < 0:
             raise ValueError("timeout_ms must be non-negative")
+        if max_pending is not None and max_pending < 1:
+            raise ValueError("max_pending must be positive")
 
         self._runtime_handler = runtime_handler
         self._max_batch_size = max_batch_size
         self._timeout_s = timeout_ms / 1000.0
+        self._max_pending = max_pending
         self._cv = threading.Condition()
         self._queue: List[_QueuedRequest] = []
         self._closed = False
@@ -140,12 +153,21 @@ class RequestBatcher:
     def timeout_ms(self) -> float:
         return self._timeout_s * 1000.0
 
+    @property
+    def pending(self) -> int:
+        with self._cv:
+            return len(self._queue)
+
     def submit(self, request) -> BatchResult:
         future: Future = Future()
         item = _QueuedRequest(request=request, future=future)
         with self._cv:
             if self._closed:
                 raise RuntimeError("Request batcher is closed")
+            if (self._max_pending is not None
+                    and len(self._queue) >= self._max_pending):
+                raise BatcherOverflow(
+                    f"batcher queue full ({self._max_pending} pending)")
             self._queue.append(item)
             self._cv.notify()
         return future.result()
@@ -158,9 +180,18 @@ class RequestBatcher:
 
     def _run(self) -> None:
         while True:
-            batch = self._take_batch()
+            # The worker must never die: a dead worker blocks every pending
+            # submit()'s Future -- and the admission slot each caller holds --
+            # forever. Failed items get their exception set instead.
+            try:
+                batch = self._take_batch()
+            except Exception:
+                logger.exception("Batcher batch selection failed; continuing")
+                continue
             if batch is None:
                 return
+            if not batch:
+                continue
             self._process_batch(batch)
 
     def _take_batch(self) -> Optional[List[_QueuedRequest]]:
@@ -171,7 +202,13 @@ class RequestBatcher:
                 return None
 
             first = self._queue.pop(0)
-            key = _batch_key(first.request)
+            try:
+                key = _batch_key(first.request)
+            except Exception as exc:
+                # A request missing a compatibility field must not strand the
+                # whole worker: fail just this one and move on.
+                first.future.set_exception(exc)
+                return []
             batch = [first]
             deadline = time.monotonic() + self._timeout_s
 
@@ -191,7 +228,13 @@ class RequestBatcher:
         idx = 0
         while idx < len(self._queue) and len(batch) < self._max_batch_size:
             item = self._queue[idx]
-            if _batch_key(item.request) == key:
+            try:
+                compatible = _batch_key(item.request) == key
+            except Exception:
+                # Treat an unkeyable request as incompatible; it will be
+                # popped first on a later round and fail cleanly there.
+                compatible = False
+            if compatible:
                 batch.append(self._queue.pop(idx))
             else:
                 idx += 1
