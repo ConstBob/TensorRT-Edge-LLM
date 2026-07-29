@@ -1071,16 +1071,15 @@ class FFPAFmhaAmpere:
             if cutlass.const_expr(not is_first_n_block):
                 row_max_prev_row = row_max_prev[r]
                 row_max_cur_row = cute.arch.fmax(row_max_prev_row, row_max_cur_row)
-            # Snap a fully-masked row's -inf max to 0 so exp2 yields 0 (not
-            # NaN).  Hits the causal diagonal tail and varlen-masked padding
-            # rows (which non-causal masking can now also fully mask).
-            row_max_cur_row = (
+            # Use a finite max for exponent arithmetic on fully-masked rows,
+            # but preserve -inf in the running max until a valid score arrives.
+            row_max_safe_row = (
                 0.0 if row_max_cur_row == -cutlass.Float32.inf else row_max_cur_row
             )
 
             acc_S_row_exp = cute.math.exp2(
                 acc_S_row * softmax_params.softmax_scale_log2
-                - row_max_cur_row * softmax_params.softmax_scale_log2,
+                - row_max_safe_row * softmax_params.softmax_scale_log2,
                 fastmath=True,
             )
             acc_S_row_sum = acc_S_row_exp.reduce(
@@ -1089,7 +1088,7 @@ class FFPAFmhaAmpere:
             if cutlass.const_expr(not is_first_n_block):
                 prev_minus_cur_exp = cute.math.exp2(
                     row_max_prev_row * softmax_params.softmax_scale_log2
-                    - row_max_cur_row * softmax_params.softmax_scale_log2,
+                    - row_max_safe_row * softmax_params.softmax_scale_log2,
                     fastmath=True,
                 )
                 # skip_rescale: snap a near-unity rescale factor (within 2^-8)
