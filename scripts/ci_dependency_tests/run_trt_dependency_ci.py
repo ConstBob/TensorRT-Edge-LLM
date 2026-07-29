@@ -65,10 +65,20 @@ _PYTHON = Path(sys.executable)
 _PYTHON_ROOT = Path(sys.prefix)
 _RUN_WORKSPACE = PurePosixPath("/tmp/edgellm-trt-ci")
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+_CUDA_VERSION_RE = re.compile(r"[0-9]+\.[0-9]+")
+_NATIVE_BUILD_ENV_KEYS = (
+    "CMAKE_PREFIX_PATH",
+    "CPATH",
+    "LD_LIBRARY_PATH",
+    "LIBRARY_PATH",
+    "PKG_CONFIG_PATH",
+)
 _CONNECTION_TIMEOUT_S = 30
 _TRANSFER_TIMEOUT_S = 1800
 _TEST_TIMEOUT_S = 3600
 _JOBS = 16
+_DEFAULT_D7L_CUDA_TARGET_DIR = PurePosixPath(
+    "/usr/local/cuda-13.2/targets/sbsa-linux")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -301,12 +311,35 @@ class Config:
     edge_llm_cache_root: Path | None = None
     run_workspace_root: PurePosixPath | None = None
     model_cases: tuple[ModelCase, ...] = _DEFAULT_MODEL_CASES
+    cuda_root: PurePosixPath | None = None
+    cuda_version: str | None = None
+    cuda_target_dir: PurePosixPath | None = None
+    run_python: PurePosixPath | None = None
 
     def validate(self) -> None:
         if self.architecture not in {Arch.X86_64, Arch.D7L}:
             raise ValueError("architecture must be x86/x86_64 or d7l")
         if not _valid_compute_capability(self.compute_capability):
             raise ValueError("compute capability must use major.minor format")
+        native_x86 = (self.no_trt_containers
+                      and self.architecture is Arch.X86_64)
+        if native_x86 and self.cuda_root is None:
+            raise ValueError(
+                "--cuda-root is required for x86 --no-trt-containers")
+        if native_x86 and self.cuda_version is None:
+            raise ValueError(
+                "--cuda-version is required for x86 --no-trt-containers")
+        if self.cuda_root is not None and not _safe_path(self.cuda_root):
+            raise ValueError("cuda_root must be an absolute, non-root path")
+        if (self.cuda_target_dir is not None
+                and not _safe_path(self.cuda_target_dir)):
+            raise ValueError(
+                "cuda_target_dir must be an absolute, non-root path")
+        if (self.cuda_version is not None
+                and not _CUDA_VERSION_RE.fullmatch(self.cuda_version)):
+            raise ValueError("cuda_version must use major.minor format")
+        if self.run_python is not None and not _safe_path(self.run_python):
+            raise ValueError("run_python must be an absolute, non-root path")
         if not _safe_path(self.trt_location):
             raise ValueError(
                 "trt_location must be an absolute, non-root PRE_BUILT directory path"
@@ -454,15 +487,27 @@ def _cute_dsl_cmake_args(architecture: Arch) -> list[str]:
 
 
 def build_targets(config: Config) -> list[ArtifactTarget]:
-    platform = PlatformConfig(arch=config.architecture)
+    native_x86 = (config.no_trt_containers
+                  and config.architecture is Arch.X86_64)
+    d7l_cuda_target_dir = (config.cuda_target_dir
+                           or _DEFAULT_D7L_CUDA_TARGET_DIR)
+    platform = PlatformConfig(
+        arch=config.architecture,
+        cuda_version=config.cuda_version if native_x86 else None,
+    )
     platform_cmake_args = ([
         f"-DCMAKE_TOOLCHAIN_FILE={config.source_root}/cmake/aarch64_linux_toolchain.cmake",
         "-DEMBEDDED_TARGET=auto-thor",
-        "-DCUDA_DIR=/usr/local/cuda/targets/sbsa-linux",
-        "-DCUDA_TARGET_DIR=/usr/local/cuda/targets/sbsa-linux",
-    ] if config.architecture is Arch.D7L else [
-        "-DCUDA_TARGET_DIR=/usr/local/cuda/targets/x86_64-linux"
-    ])
+        f"-DCUDA_DIR={d7l_cuda_target_dir}",
+        f"-DCUDA_TARGET_DIR={d7l_cuda_target_dir}",
+    ] if config.architecture is Arch.D7L else (
+        [
+            f"-DCMAKE_CUDA_COMPILER={config.cuda_root}/bin/nvcc",
+            f"-DCUDAToolkit_ROOT={config.cuda_root}",
+            f"-DCUDA_DIR={config.cuda_root}",
+            f"-DCUDA_TARGET_DIR={config.cuda_root}",
+        ] if native_x86 else
+        ["-DCUDA_TARGET_DIR=/usr/local/cuda/targets/x86_64-linux"]))
     trt = ArtifactTarget(
         component=TRT_COMPONENT,
         mode=BuildMode.RELEASE,
@@ -535,12 +580,36 @@ def _cleanup(remote: Any, path: PurePosixPath, logger: Any) -> None:
 # TODO(devtoolkit): add a CodeManager no_container option that builds source
 # artifacts through CommandManager, exposes each component build command, runs
 # E2E commands on the host, and emits the same runtime setup environment.
-def _native_build_command(target: ArtifactTarget) -> str:
+def _native_build_command(config: Config, target: ArtifactTarget) -> str:
     build = target.build
     if not build.repo_path or not build.build_dir or not build.trt_package_dir:
         raise FlowError("Native EdgeLLM build target is incomplete")
     arch = parse_arch(target.platform.arch)
-    cuda_version = target.platform.cuda_version or arch.default_cuda_version
+    if arch is Arch.X86_64:
+        if config.cuda_root is None or config.cuda_version is None:
+            raise FlowError("Native x86 CUDA configuration is incomplete")
+        cuda_version = config.cuda_version
+        cuda_root = shlex.quote(str(config.cuda_root))
+        cuda_compiler = shlex.quote(str(config.cuda_root / "bin/nvcc"))
+        cuda_setup = [
+            f"cuda_root={cuda_root}",
+            f"export CUDACXX={cuda_compiler}",
+            'test -d "$cuda_root" || { echo "CUDA root does not exist: '
+            '${cuda_root}" >&2; exit 2; }',
+            'test -x "$CUDACXX" || { echo "CUDA compiler is not executable: '
+            '${CUDACXX}" >&2; exit 2; }',
+            'cuda_release="$("$CUDACXX" --version | sed -n '
+            "'s/.*release \\([0-9][0-9]*\\.[0-9][0-9]*\\).*/\\1/p')\"",
+            f'test "$cuda_release" = {shlex.quote(cuda_version)} || {{ '
+            f'echo "CUDA version mismatch: expected {cuda_version}, got '
+            '${cuda_release:-unknown}" >&2; exit 2; }',
+            'export CUDA_HOME="$cuda_root"',
+            'export CUDA_PATH="$cuda_root"',
+            f"export CUDA_CTK_VERSION={shlex.quote(cuda_version)}",
+        ]
+    else:
+        cuda_version = target.platform.cuda_version or arch.default_cuda_version
+        cuda_setup = []
     configure = [
         "cmake",
         build.repo_path,
@@ -555,30 +624,38 @@ def _native_build_command(target: ArtifactTarget) -> str:
         *build.make_args
     ]
     return "\n".join([
-        "set -euo pipefail", f"mkdir -p {shlex.quote(build.build_dir)}",
+        "set -euo pipefail", *cuda_setup,
+        f"mkdir -p {shlex.quote(build.build_dir)}",
         f"cd {shlex.quote(build.build_dir)}",
         shlex.join(configure),
         shlex.join(make)
     ])
 
 
-def _build_on_host(commands: Any, target: Any, edge: ArtifactTarget,
-                   run_result: Any) -> Any:
+def _native_build_environment() -> dict[str, str]:
+    return {
+        key: os.environ[key]
+        for key in _NATIVE_BUILD_ENV_KEYS if os.environ.get(key)
+    }
+
+
+def _build_on_host(config: Config, commands: Any, target: Any,
+                   edge: ArtifactTarget, run_result: Any) -> Any:
+    platform = edge.platform
+    if config.architecture is Arch.D7L:
+        platform = dataclasses.replace(
+            platform, cuda_version=platform.arch.default_cuda_version)
     edge = dataclasses.replace(
-        edge,
-        platform=dataclasses.replace(
-            edge.platform,
-            cuda_version=edge.platform.arch.default_cuda_version,
-            ubuntu_version="24.04",
-        ),
-    )
+        edge, platform=dataclasses.replace(platform, ubuntu_version="24.04"))
     result = commands.run(
         target,
         CommandSpec(
             name="Build EdgeLLM on host",
-            command=_native_build_command(edge),
+            command=_native_build_command(config, edge),
             shell_type=ShellType.BASH,
             cwd=edge.build.repo_path,
+            env=(_native_build_environment()
+                 if config.architecture is Arch.X86_64 else {}),
             timeout_s=_TEST_TIMEOUT_S,
             output_mode=OutputMode.PROGRESS,
             artifact_log_file=edge.build.log_file,
@@ -605,7 +682,6 @@ def _build_on_host(commands: Any, target: Any, edge: ArtifactTarget,
     )
     return dataclasses.replace(run_result, step_artifacts=artifacts, plan=plan)
 
-
 def _build(config: Config, code: Any, build_target: Any) -> Any:
     targets = build_targets(config)
     run_result = code.plan_and_execute(
@@ -614,8 +690,8 @@ def _build(config: Config, code: Any, build_target: Any) -> Any:
         raise FlowError("CodeManager build failed: " +
                         "; ".join(run_result.error_messages))
     if config.no_trt_containers:
-        return _build_on_host(code.command_manager, build_target, targets[1],
-                              run_result)
+        return _build_on_host(config, code.command_manager, build_target,
+                              targets[1], run_result)
     return run_result
 
 
@@ -986,7 +1062,8 @@ def _test_command(config: Config, runtime: Runtime) -> str:
         for model in config.model_cases)
     use_host_python = (config.no_trt_containers
                        or config.architecture is Arch.D7L)
-    python = "python3" if use_host_python else str(_PYTHON)
+    python = (str(config.run_python) if use_host_python and config.run_python
+              is not None else ("python3" if use_host_python else str(_PYTHON)))
     python_path = "" if use_host_python else f"export PATH={q(str(_PYTHON.parent))}:$PATH\n"
     return f"""set -euo pipefail
 source {q(str(runtime.env_script))}
@@ -1036,6 +1113,23 @@ def _parser() -> argparse.ArgumentParser:
         help="run the EdgeLLM build and E2E tests without TRT containers",
     )
     parser.add_argument(
+        "--cuda-root",
+        type=PurePosixPath,
+        help=("CUDA toolkit root on the build host; required for x86 "
+              "--no-trt-containers (env: TRT_CI_CUDA_ROOT)"),
+    )
+    parser.add_argument(
+        "--cuda-version",
+        help=("CUDA toolkit major.minor version; required for x86 "
+              "--no-trt-containers (env: TRT_CI_CUDA_VERSION)"),
+    )
+    parser.add_argument(
+        "--cuda-target-dir",
+        type=PurePosixPath,
+        help=("CUDA target directory for D7L cross-builds "
+              "(env: TRT_CI_CUDA_TARGET_DIR)"),
+    )
+    parser.add_argument(
         "--download_hf_checkpoint",
         action="store_true",
         help="download configured HuggingFace checkpoints before ONNX export")
@@ -1048,6 +1142,11 @@ def _parser() -> argparse.ArgumentParser:
         default="[]",
         help=("JSON array, or JSON file path, of extra model cases with "
               "name, repository, checkpoint_dir, and pipeline_param"),
+    )
+    parser.add_argument(
+        "--run-python",
+        type=PurePosixPath,
+        help="absolute Python executable on the run host for no-container runs",
     )
     parser.add_argument("--run-id", help=argparse.SUPPRESS)
     return parser
@@ -1070,6 +1169,13 @@ def _config(args: argparse.Namespace) -> Config:
                  or os.environ.get("EDGE_LLM_CACHE_DIR"))
     if cache_dir is None and Path("/home/edge_llm_cache/rouge/rouge.py").is_file():
         cache_dir = "/home/edge_llm_cache"
+    cuda_root = args.cuda_root
+    if cuda_root is None and os.environ.get("TRT_CI_CUDA_ROOT"):
+        cuda_root = PurePosixPath(os.environ["TRT_CI_CUDA_ROOT"])
+    cuda_target_dir = args.cuda_target_dir
+    if cuda_target_dir is None and os.environ.get("TRT_CI_CUDA_TARGET_DIR"):
+        cuda_target_dir = PurePosixPath(os.environ[
+            "TRT_CI_CUDA_TARGET_DIR"])
     onnx_dir = os.environ.get("TRT_CI_ONNX_DIR")
     if onnx_dir is None:
         raise ValueError("TRT_CI_ONNX_DIR must be set")
@@ -1111,6 +1217,11 @@ def _config(args: argparse.Namespace) -> Config:
         run_workspace_root=(PurePosixPath(workspace_root)
                             if workspace_root is not None else None),
         model_cases=model_cases,
+        cuda_root=cuda_root,
+        cuda_version=(args.cuda_version
+                      or os.environ.get("TRT_CI_CUDA_VERSION")),
+        cuda_target_dir=cuda_target_dir,
+        run_python=args.run_python,
     )
     config.validate()
     return config

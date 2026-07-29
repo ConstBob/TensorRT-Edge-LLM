@@ -45,6 +45,28 @@ python3 scripts/ci_dependency_tests/run_trt_dependency_ci.py \
 
 Append `--no-trt-containers` to build Edge-LLM and run its Python E2E tests natively on their selected hosts.
 
+Native x86 builds must receive the Conan CUDA toolkit selected by TensorRT CI:
+
+```bash
+python3 scripts/ci_dependency_tests/run_trt_dependency_ci.py \
+  x86 /absolute/trt/prebuilt/on-build-host \
+  /path/to/build-host.json /path/to/run-host.json \
+  --no-trt-containers \
+  --cuda-root /absolute/conan/cuda/package/root \
+  --cuda-version 13.3
+```
+
+`TRT_CI_CUDA_ROOT` and `TRT_CI_CUDA_VERSION` are equivalent environment
+inputs. The runner validates `bin/nvcc`, pins CMake to that toolkit, and
+forwards its activated library and include paths to the native build host.
+`--run-python /absolute/python` selects the interpreter used for native E2E
+tests when CI provides one with Edge-LLM's Python dependencies.
+
+D7L cross-builds default to the existing
+`/usr/local/cuda-13.2/targets/sbsa-linux` CUDA target directory. Override it
+for a provisioned target with `--cuda-target-dir /absolute/cuda-target-dir` or
+`TRT_CI_CUDA_TARGET_DIR`.
+
 Each host argument may be an inline JSON object or a JSON file.
 
 Local host:
