@@ -30,14 +30,12 @@
 #include "plugins/utils/pluginUtils.h"
 
 // CuTe DSL FMHA kernel (Blackwell SM100+)
-#ifdef CUTE_DSL_FMHA_ENABLED
+#ifdef CUTE_DSL_FMHA_BLACKWELL_ENABLED
 #include "kernels/contextAttentionKernels/cuteDslFMHARunner.h"
 #endif
 
 // FMHA-v2 CuTe DSL FMHA kernels.
-#ifdef CUTE_DSL_FMHA_V2_ENABLED
 #include "kernels/contextAttentionKernels/cuteDslFMHAV2Runner.h"
-#endif
 
 // CuTe DSL FFPA kernel (headSize=512 fallback)
 #ifdef CUTE_DSL_FFPA_ENABLED
@@ -194,7 +192,7 @@ AttentionExecutionMode deduceModeVanilla(rt::Tensor const& packedQKVTensor, rt::
     return AttentionExecutionMode::kVANILLA_DECODING;
 }
 
-#ifdef CUTE_DSL_FMHA_ENABLED
+#ifdef CUTE_DSL_FMHA_BLACKWELL_ENABLED
 //! Skip-softmax (BLASST): derive the runtime threshold from the calibrated scale
 //! factor S as lambda = S / L, passed to the kernel as log2(lambda). Returns a
 //! finite negative log2(lambda) when skip applies, or 0.0 — the runner's disable
@@ -213,7 +211,7 @@ float computeSkipSoftmaxThreshold(float scaleFactor, int32_t slidingWindowSize, 
     }
     return std::log2(lambda);
 }
-#endif // CUTE_DSL_FMHA_ENABLED
+#endif // CUTE_DSL_FMHA_BLACKWELL_ENABLED
 
 AttentionExecutionMode deduceModeTreeAttention(
     rt::Tensor const& packedQKVTensor, rt::Tensor const& kvCacheStartIdxTensor, rt::Tensor const& attentionPosIdTensor)
@@ -264,7 +262,7 @@ FMHAKernelSelection loadFMHAKernels(int32_t numQHeads, int32_t numKVHeads, int32
     // is required when running with TRT-RTX.
     cudaFree(nullptr);
 
-#ifdef CUTE_DSL_FMHA_ENABLED
+#ifdef CUTE_DSL_FMHA_BLACKWELL_ENABLED
     if (CuteDslFMHARunner::canImplement(headSize, smVersion) && CuteDslFMHARunner::loadLLMKernelModule())
     {
         LOG_DEBUG("CuTe DSL FMHA kernel loaded for SM%d", smVersion);
@@ -272,7 +270,6 @@ FMHAKernelSelection loadFMHAKernels(int32_t numQHeads, int32_t numKVHeads, int32
     }
 #endif
 
-#ifdef CUTE_DSL_FMHA_V2_ENABLED
     CuteDslFMHAV2MaskType const fmhaV2Mask
         = useSlidingWindow ? CuteDslFMHAV2MaskType::kSLIDING_CAUSAL : CuteDslFMHAV2MaskType::kCAUSAL;
     if (CuteDslFMHAV2Runner::canImplement(numQHeads, numKVHeads, headSize, smVersion, dataType, fmhaV2Mask)
@@ -281,7 +278,6 @@ FMHAKernelSelection loadFMHAKernels(int32_t numQHeads, int32_t numKVHeads, int32
         LOG_DEBUG("FMHA-v2 CuTe DSL FMHA kernel loaded for SM%d", smVersion);
         return {ContextFMHABackend::kCUTE_DSL_FMHA_V2, true};
     }
-#endif
 
     return {};
 }
@@ -289,14 +285,13 @@ FMHAKernelSelection loadFMHAKernels(int32_t numQHeads, int32_t numKVHeads, int32
 bool loadPaddingFMHAKernels(ContextFMHABackend backend, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
     int32_t smVersion, nvinfer1::DataType dataType)
 {
-#ifdef CUTE_DSL_FMHA_ENABLED
+#ifdef CUTE_DSL_FMHA_BLACKWELL_ENABLED
     if (backend == ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL && (headSize == 256 || headSize == 512)
         && CuteDslFMHARunner::canImplement(headSize, smVersion) && CuteDslFMHARunner::loadLLMKernelModule())
     {
         return true;
     }
 #endif
-#ifdef CUTE_DSL_FMHA_V2_ENABLED
     if (backend == ContextFMHABackend::kCUTE_DSL_FMHA_V2
         && CuteDslFMHAV2Runner::canImplement(
             numQHeads, numKVHeads, headSize, smVersion, dataType, CuteDslFMHAV2MaskType::kPADDING)
@@ -304,7 +299,6 @@ bool loadPaddingFMHAKernels(ContextFMHABackend backend, int32_t numQHeads, int32
     {
         return true;
     }
-#endif
     return false;
 }
 
@@ -471,7 +465,7 @@ void AttentionPlugin::dispatchFFPAKernel(half const* q, half const* k, half cons
 
 bool AttentionPlugin::canUseCuteDslBidirectionalForPrefill() const noexcept
 {
-#ifdef CUTE_DSL_FMHA_ENABLED
+#ifdef CUTE_DSL_FMHA_BLACKWELL_ENABLED
     return mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL && mCanImplementFMHA
         && mCanImplementCuteDslBidirectionalFMHA;
 #else
@@ -546,7 +540,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     LOG_DEBUG("AttentionPlugin FMHA backend: %d, sliding_window: %s", static_cast<int32_t>(mContextFMHABackend),
         mSlidingWindowSize > 0 ? std::to_string(mSlidingWindowSize).c_str() : "disabled");
 
-#ifdef CUTE_DSL_FMHA_ENABLED
+#ifdef CUTE_DSL_FMHA_BLACKWELL_ENABLED
     mCanImplementCuteDslBidirectionalFMHA = mEnableVisionBlockAttention && mHeadSize == 512
         && mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL && mCanImplementFMHA;
 #endif
@@ -604,12 +598,10 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     if (mEnableVisionBlockAttention)
     {
         // Use the FMHA-v2 split-K/V d256 vision-block kernel for sliding layers.
-#ifdef CUTE_DSL_FMHA_V2_ENABLED
         mUseFMHAV2VisionBlockFMHA = mSlidingWindowSize > 0
             && CuteDslFMHAV2Runner::canImplement(
                 mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType, CuteDslFMHAV2MaskType::kVISION_BLOCK)
             && CuteDslFMHAV2Runner::loadLLMKernelModule();
-#endif
         enforceVisionBlockKernelSupport();
 
         LOG_INFO(
@@ -711,7 +703,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
     mCanImplementFMHA = fmhaSelection.canImplement;
     LOG_DEBUG("AttentionPlugin FMHA backend: %d", static_cast<int32_t>(mContextFMHABackend));
 
-#ifdef CUTE_DSL_FMHA_ENABLED
+#ifdef CUTE_DSL_FMHA_BLACKWELL_ENABLED
     mCanImplementCuteDslBidirectionalFMHA = mEnableVisionBlockAttention && mHeadSize == 512
         && mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL && mCanImplementFMHA;
 #endif
@@ -753,12 +745,10 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
     // Sliding d256-class vision prefill production path: FMHA-v2 CuTe DSL.
     if (mEnableVisionBlockAttention)
     {
-#ifdef CUTE_DSL_FMHA_V2_ENABLED
         mUseFMHAV2VisionBlockFMHA = mSlidingWindowSize > 0
             && CuteDslFMHAV2Runner::canImplement(
                 mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType, CuteDslFMHAV2MaskType::kVISION_BLOCK)
             && CuteDslFMHAV2Runner::loadLLMKernelModule();
-#endif
         enforceVisionBlockKernelSupport();
     }
 }
@@ -1282,7 +1272,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
     rt::Tensor presentKVCacheTensor(
         outputs[kOUT_KV_CACHE_IDX], rt::Coords{kvCacheInputDesc.dims}, rt::DeviceType::kGPU, kvCacheInputDesc.type);
     rt::Tensor& kvCacheTensor = sharedKV ? pastKVCacheTensor : presentKVCacheTensor;
-#ifdef CUTE_DSL_FMHA_ENABLED
+#ifdef CUTE_DSL_FMHA_BLACKWELL_ENABLED
     // numPages feeds runPaged; only the CuTe DSL prefill reads it (writes and XQA decode derive
     // capacity from the page table), so it lives behind the same #ifdef as its call sites.
     int32_t const numPages = static_cast<int32_t>(kvCacheInputDesc.dims.d[1]);
@@ -1319,7 +1309,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
     // Padded per-slot token capacity spanned by the page table (each page holds kTOKENS_PER_PAGE).
     int32_t const kvCacheCapacity = maxPagesPerSeq * rt::kTOKENS_PER_PAGE;
 
-#ifdef CUTE_DSL_FMHA_ENABLED
+#ifdef CUTE_DSL_FMHA_BLACKWELL_ENABLED
     // Skip-softmax (BLASST): resolve the effective scale factor S (engine-carried
     // calibrated default, overridden by the optional skip_softmax_scale input's
     // SHAPE when present).
@@ -1336,7 +1326,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
     }
     float const skipSoftmaxThresholdLog2
         = computeSkipSoftmaxThreshold(skipSoftmaxScaleFactor, mSlidingWindowSize, kvCacheCapacity);
-#endif // CUTE_DSL_FMHA_ENABLED
+#endif // CUTE_DSL_FMHA_BLACKWELL_ENABLED
 
     // Batch-shaped view of the same pool buffer for the paged applyRopeWriteKV* kernels: they validate
     // and index off a `[B, 2, Hkv, capPadded, D]` descriptor (the flat page pool addressed via the page
@@ -1507,7 +1497,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                     blockEndTensor.dataPointer<int32_t>(), runtimeBatchSize, runtimeSeqLen, stream);
             }
 
-#ifdef CUTE_DSL_FMHA_ENABLED
+#ifdef CUTE_DSL_FMHA_BLACKWELL_ENABLED
             if (canUseCuteDslBidirectionalForPrefill())
             {
                 if (!validatePagedKVCacheShape())
@@ -1574,7 +1564,6 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
             }
 #endif
 
-#ifdef CUTE_DSL_FMHA_V2_ENABLED
             if (mUseFMHAV2VisionBlockFMHA)
             {
                 LOG_DEBUG(
@@ -1598,7 +1587,6 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                 }
                 return 0;
             }
-#endif
 
             LOG_ERROR("AttentionPlugin: selected vision-block prefill kernel is unavailable.");
             return -1;
@@ -1686,7 +1674,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
             }
 
             // Run FMHA reading from the donor's KV cache (bound to this layer's KV cache input).
-#ifdef CUTE_DSL_FMHA_ENABLED
+#ifdef CUTE_DSL_FMHA_BLACKWELL_ENABLED
             if (mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL
                 && (!usePaddingContextMask || mCanImplementPaddingFMHA))
             {
@@ -1715,7 +1703,6 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
             }
             else
 #endif
-#ifdef CUTE_DSL_FMHA_V2_ENABLED
                 if (mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_V2
                     && (!usePaddingContextMask || mCanImplementPaddingFMHA))
             {
@@ -1741,7 +1728,6 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                 }
             }
             else
-#endif
             {
                 LOG_ERROR(
                     "AttentionPlugin: selected shared-KV prefill kernel is unavailable (paddingMask=%d, D=%d, SM=%d).",
@@ -1818,7 +1804,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
         }
         else
         {
-#ifdef CUTE_DSL_FMHA_ENABLED
+#ifdef CUTE_DSL_FMHA_BLACKWELL_ENABLED
             if (mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL
                 && (!usePaddingContextMask || mCanImplementPaddingFMHA))
             {
@@ -1887,7 +1873,6 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
             }
             else
 #endif
-#ifdef CUTE_DSL_FMHA_V2_ENABLED
                 if (mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_V2
                     && (!usePaddingContextMask || mCanImplementPaddingFMHA))
             {
@@ -1955,7 +1940,6 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                 }
             }
             else
-#endif
             {
                 LOG_ERROR(
                     "AttentionPlugin: selected own-KV prefill kernel is unavailable (paddingMask=%d, D=%d, SM=%d).",

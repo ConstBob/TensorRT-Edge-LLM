@@ -17,8 +17,8 @@
 
 Kernel groups:
   gdn              — Gated Delta Net decode/prefill
-  fmha             — Fused Multi-Head Attention (Blackwell persistent)
-  fmha_v2          — FP16 Context/ViT FMHA (Ampere instruction floor)
+  fmha             — FP16 Context/ViT FMHA, plus optimized Blackwell
+                     FP16/FP8 variants on SM100/101/110
   ffpa             — Baseline FMHA forward kernel for large head-size
                      attention (D=512), Ampere instruction floor (sm_80+).
   ssd              — Mamba2 SSM chunk-scan prefill
@@ -122,8 +122,8 @@ class KernelVariant:
 #
 # Groups:
 #   gdn              — Gated Delta Net decode/prefill
-#   fmha             — Fused Multi-Head Attention (Blackwell persistent)
-#   fmha_v2          — FP16 Context/ViT FMHA (Ampere instruction floor)
+#   fmha             — FP16 Context/ViT FMHA, plus optimized Blackwell
+#                      persistent variants on SM100/101/110.
 #   ffpa             — Baseline FMHA forward kernel for large head-size
 #                      attention (D=512), Ampere instruction floor (sm_80+).
 #   ssd              — Mamba2 SSM chunk-scan prefill
@@ -234,7 +234,7 @@ KERNEL_VARIANTS = [
                      "--file_name", "ssd_prefill_blackwell_d64_n64_init_states",
                      "--function_prefix", "ssd_prefill_blackwell_d64_n64_init_states"],
     ),
-    # --- FMHA group ---
+    # --- FMHA optimized Blackwell overlay ---
     KernelVariant(
         name="fmha_d64",
         group="fmha",
@@ -553,19 +553,21 @@ KERNEL_VARIANTS = [
         script="fmha_cutedsl_blackwell/fmha.py",
         script_args=["--q_shape", "1,1024,14,128", "--k_shape", "1,1024,14,128"] + _VIT,
     ),
-    # --- FMHA-v2 CuTe DSL group (SM80/86/87/89/100/101/110/120/121) ---
-    # These variants deliberately use distinct symbols and a distinct group
-    # from the tcgen05/TMEM `fmha` kernels.  Selecting fmha_v2 therefore
-    # never exposes CUTE_DSL_FMHA_ENABLED without the optimized headers.
-    # SM110 still uses the optimized `fmha` backend for normal Context/ViT
-    # attention, but also needs this family for the D256 vision-block mode.
-    # The runner loads the family as one module set, so keep every variant in
-    # the SM110 artifact rather than shipping an incomplete group.
+    # --- FMHA baseline (SM80/86/87/89/100/101/110/120/121) ---
+    # These variants keep their fmha_v2 symbol names to preserve the generated
+    # ABI, but belong to the canonical fmha artifact group. SM100/101/110 also
+    # include the optimized variants above. The runner loads this family as
+    # one module set, so keep every variant in every supported artifact.
+    #
+    # The runner links this family unconditionally and loads it as one module
+    # set, so an artifact missing any one of these fails at link rather than
+    # falling back. tests/python-unittests/test_build_cutedsl_helpers.py
+    # asserts the full set per supported SM.
     # Q/K/V use separate BSND tensors; paged-cache callers gather only when
     # cache readback is required.
     KernelVariant(
         name="fmha_v2_d64",
-        group="fmha_v2",
+        group="fmha",
         supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
         script="fmha_v2_cutedsl/fmha.py",
         script_args=[
@@ -578,7 +580,7 @@ KERNEL_VARIANTS = [
     # avoid the occupancy/tail penalty of the 128x128 long-context kernel.
     KernelVariant(
         name="fmha_v2_d64_small",
-        group="fmha_v2",
+        group="fmha",
         supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
         script="fmha_v2_cutedsl/fmha.py",
         script_args=[
@@ -589,7 +591,7 @@ KERNEL_VARIANTS = [
     ),
     KernelVariant(
         name="fmha_v2_d128",
-        group="fmha_v2",
+        group="fmha",
         supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
         script="fmha_v2_cutedsl/fmha.py",
         script_args=[
@@ -600,7 +602,7 @@ KERNEL_VARIANTS = [
     ),
     KernelVariant(
         name="fmha_v2_d256",
-        group="fmha_v2",
+        group="fmha",
         supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
         script="fmha_v2_cutedsl/fmha.py",
         script_args=[
@@ -611,7 +613,7 @@ KERNEL_VARIANTS = [
     ),
     KernelVariant(
         name="fmha_v2_d256_padding",
-        group="fmha_v2",
+        group="fmha",
         supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
         script="fmha_v2_cutedsl/fmha.py",
         script_args=[
@@ -622,7 +624,7 @@ KERNEL_VARIANTS = [
     ),
     KernelVariant(
         name="fmha_v2_d64_sw",
-        group="fmha_v2",
+        group="fmha",
         supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
         script="fmha_v2_cutedsl/fmha.py",
         script_args=[
@@ -634,7 +636,7 @@ KERNEL_VARIANTS = [
     ),
     KernelVariant(
         name="fmha_v2_d128_sw",
-        group="fmha_v2",
+        group="fmha",
         supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
         script="fmha_v2_cutedsl/fmha.py",
         script_args=[
@@ -646,7 +648,7 @@ KERNEL_VARIANTS = [
     ),
     KernelVariant(
         name="fmha_v2_d256_sw",
-        group="fmha_v2",
+        group="fmha",
         supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
         script="fmha_v2_cutedsl/fmha.py",
         script_args=[
@@ -658,7 +660,7 @@ KERNEL_VARIANTS = [
     ),
     KernelVariant(
         name="fmha_v2_vit_d64",
-        group="fmha_v2",
+        group="fmha",
         supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
         script="fmha_v2_cutedsl/fmha.py",
         script_args=[
@@ -669,7 +671,7 @@ KERNEL_VARIANTS = [
     ),
     KernelVariant(
         name="fmha_v2_vit_d72",
-        group="fmha_v2",
+        group="fmha",
         supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
         script="fmha_v2_cutedsl/fmha.py",
         script_args=[
@@ -680,7 +682,7 @@ KERNEL_VARIANTS = [
     ),
     KernelVariant(
         name="fmha_v2_vit_d80",
-        group="fmha_v2",
+        group="fmha",
         supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
         script="fmha_v2_cutedsl/fmha.py",
         script_args=[
@@ -691,7 +693,7 @@ KERNEL_VARIANTS = [
     ),
     KernelVariant(
         name="fmha_v2_vit_d128",
-        group="fmha_v2",
+        group="fmha",
         supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
         script="fmha_v2_cutedsl/fmha.py",
         script_args=[
@@ -702,7 +704,7 @@ KERNEL_VARIANTS = [
     ),
     KernelVariant(
         name="fmha_v2_d256_bidirectional",
-        group="fmha_v2",
+        group="fmha",
         supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
         script="fmha_v2_cutedsl/fmha.py",
         script_args=[
@@ -1548,7 +1550,8 @@ for _m in range(1, _INT4_FP16_GEMV_MAX_M + 1):
         )
     )
 
-# All known group names (set for O(1) membership check — no manual maintenance needed).
+# All known group names (set for O(1) membership check — no manual maintenance
+# needed).
 _ALL_GROUPS: set[str] = {v.group for v in KERNEL_VARIANTS}
 
 
@@ -2478,9 +2481,10 @@ def main():
         "--kernels",
         default="ALL",
         help="Which kernels to build: ALL (default), a group name "
-             "(fmha | fmha_v2 | gdn | f16_moe | nvfp4_moe | "
+             "(fmha | gdn | f16_moe | nvfp4_moe | "
              "nvfp4_fused_moe | ssd | gemm | int4_fp16_gemm), or a comma-separated list "
-             "of group names. Variants whose supported_sms does not include the target SM are skipped.",
+             "of group names. "
+             "Variants whose supported_sms does not include the target SM are skipped.",
     )
     p.add_argument(
         "--output_dir",

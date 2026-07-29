@@ -170,6 +170,29 @@ target_link_libraries(
 target_link_options(commonLibraryExt INTERFACE
                     "-Wl,--unresolved-symbols=ignore-in-shared-libs")
 
+# CuTe DSL unified kernel option — declare here so it is always defined before
+# any subdirectory or include references it.
+# cmake-format: off
+# Choices:
+#   fmha             -- FP16 Context/ViT FMHA, plus the optimized Blackwell
+#                       variants when the artifact has them
+#   ALL              -- enable every kernel group below
+#   gdn              -- gated delta net (Mamba2-style hybrid SSM)
+#   f16_moe          -- target-specific FP16 grouped MoE for Ampere,
+#                       Blackwell DC, and Blackwell GeForce
+#   nvfp4_moe        -- SM110 (Thor) split FC1/FC2 NVFP4 MoE; consumed by the
+#                       SM110-only ``Nvfp4MoePlugin``
+#   nvfp4_fused_moe  -- SM12x (consumer Blackwell / Spark GB10) fused NVFP4
+#                       MoE; consumed by ``NvFP4MoEPluginGeforce``
+#   semicolon-separated group list (e.g. -DENABLE_CUTE_DSL=fmha;gdn)
+# cmake-format: on
+set(ENABLE_CUTE_DSL
+    "fmha"
+    CACHE
+      STRING
+      "CuTe DSL kernels: fmha (default), ALL, or semicolon-separated group list (fmha;gdn;f16_moe)"
+)
+
 # Build Core libraries of the project. attentionPlugin shared library and
 # edgellmCore/edgellmBuilder static library will be generated.
 add_subdirectory(cpp)
@@ -189,30 +212,6 @@ endif()
 option(BUILD_UNIT_TESTS "Enable building unit tests" OFF)
 option(BUILD_PYTHON_BINDINGS "Enable building Python pybind11 bindings" OFF)
 
-# CuTe DSL unified kernel option — declare here so it is always defined before
-# any subdirectory or include references it.
-# cmake-format: off
-# Choices:
-#   OFF              -- no CuTe DSL kernels
-#   ALL              -- enable every kernel group below
-#   fmha             -- FMHA Blackwell attention
-#   fmha_v2          -- portable FP16 Context/ViT FMHA
-#   gdn              -- gated delta net (Mamba2-style hybrid SSM)
-#   f16_moe          -- target-specific FP16 grouped MoE for Ampere,
-#                       Blackwell DC, and Blackwell GeForce
-#   nvfp4_moe        -- SM110 (Thor) split FC1/FC2 NVFP4 MoE; consumed by the
-#                       SM110-only ``Nvfp4MoePlugin``
-#   nvfp4_fused_moe  -- SM12x (consumer Blackwell / Spark GB10) fused NVFP4
-#                       MoE; consumed by ``NvFP4MoEPluginGeforce``
-#   semicolon-separated group list (e.g. -DENABLE_CUTE_DSL=fmha;gdn)
-# cmake-format: on
-set(ENABLE_CUTE_DSL
-    "OFF"
-    CACHE
-      STRING
-      "CuTe DSL kernels: OFF (default), ALL, or semicolon-separated group list (fmha;fmha_v2;gdn;f16_moe)"
-)
-
 if(BUILD_UNIT_TESTS)
   set(BUILD_GMOCK
       OFF
@@ -231,10 +230,8 @@ if(BUILD_UNIT_TESTS)
   target_link_libraries(
     unitTest PRIVATE gtest gtest_main edgellmCore commonLibraryExt exampleUtils
                      ${CUDA_DRIVER_LINK_LIB})
-  if(NOT ENABLE_CUTE_DSL STREQUAL "OFF")
-    include(${CMAKE_SOURCE_DIR}/cmake/CuteDsl.cmake)
-    cute_dsl_setup(LINK_TARGETS unitTest)
-  endif()
+  include(${CMAKE_SOURCE_DIR}/cmake/CuteDsl.cmake)
+  cute_dsl_setup(LINK_TARGETS unitTest)
   add_cross_build_link_options(unitTest)
   add_subdirectory(unittests)
 endif()

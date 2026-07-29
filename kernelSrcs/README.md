@@ -123,8 +123,9 @@ Normal builds skip it entirely: CMake extracts the matching prebuilt tarball fro
 `kernelSrcs/cuteDSLPrebuilt/` automatically. A prebuilt tarball does not contain
 your source changes, so it is never a valid way to test them.
 
-Pick one of the two manual build environments below, generate the affected group
-into `cpp/kernels/cuteDSLArtifact/<arch>/<sm>/`, then configure CMake and run the
+Pick one of the two manual build environments below. For a new or clean
+artifact, generate `fmha` together with the affected group into
+`cpp/kernels/cuteDSLArtifact/<arch>/<sm>/`, then configure CMake and run the
 relevant build and runtime tests. The remaining pieces of the workflow live in
 dedicated sections:
 
@@ -167,10 +168,13 @@ docker run --rm --gpus all \
     --output_dir /artifacts
 ```
 
-Change `--kernels` to the affected group. Selection is currently group-level,
-not individual-variant-level. For a CUDA 12 artifact, use the `cu12` interpreter,
-pass `--cuda-version 12`, and configure CMake with the matching CUDA 12
-toolchain before rebuilding the group.
+For a non-FMHA change in a new or clean output, use
+`--kernels fmha,<affected-group>` so the artifact remains runnable. If the
+expanded artifact already contains the complete FMHA baseline, an incremental
+build may select only the affected group and omit `--clean`; metadata is merged.
+Selection is group-level, not individual-variant-level. For a CUDA 12 artifact,
+use the `cu12` interpreter, pass `--cuda-version 12`, and configure CMake with
+the matching CUDA 12 toolchain before rebuilding the group.
 
 ### Option B: Incremental Build in a Local Virtual Environment
 
@@ -220,7 +224,7 @@ a clean full-matrix rebuild so stale archive members cannot be retained.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--kernels GROUPS` | `ALL` | A registered group such as `f16_moe`, `ffpa`, `fmha`, `gdn`, `gemm`, `gemm_nvfp4`, `int4_fp16_gemm`, `nvfp4_moe`, `nvfp4_fused_moe`, or `ssd`; a comma-separated list; or `ALL`. Variants whose `supported_sms` excludes the target SM are skipped. |
+| `--kernels GROUPS` | `ALL` | A registered group such as `f16_moe`, `ffpa`, `fmha`, `gdn`, `gemm`, `gemm_nvfp4`, `int4_fp16_gemm`, `nvfp4_moe`, `nvfp4_fused_moe`, or `ssd`; a comma-separated list; or `ALL`. `fmha` is the attention family: the FMHA-v2 kernels plus the optimized Blackwell kernels on SM100/SM101/SM110. Variants whose `supported_sms` excludes the target SM are skipped. |
 | `--gpu_arch SM` | auto-detected | Target GPU SM (e.g. `sm_100`); auto-detected via cupy / nvidia-smi when omitted. The CuTe DSL compile architecture is derived automatically, including the required Blackwell `a` suffix. |
 | `--arch ARCH` | auto-detected | Target CPU arch `x86_64` or `aarch64`. If it differs from the build host, kernels are cross-compiled (target host objects). |
 | `--cuda-version VERSION` | host CUDA | Artifact CUDA flavor used to select `cu12` or `cu13` runtime objects. |
@@ -241,13 +245,18 @@ cmake .. -DENABLE_CUTE_DSL=gemm
 cmake .. -DENABLE_CUTE_DSL="fmha;gdn;gemm"
 ```
 
-`ENABLE_CUTE_DSL` defaults to `OFF`. `cmake/CuteDsl.cmake` then:
+`ENABLE_CUTE_DSL` defaults to `fmha`, the Context/ViT attention kernels. On
+SM100/SM101/SM110 the same family also activates the optimized Blackwell
+kernels when its variants are present. Every selection implicitly includes
+`fmha`, because the attention runner is compiled unconditionally.
+
+`cmake/CuteDsl.cmake` then:
 
 1. Detects the host/target CPU architecture.
 2. Resolves the artifact tag from `CUTE_DSL_ARTIFACT_TAG` or the target platform
    when unambiguous.
 3. Reads `metadata.json` to determine which groups/variants are available and
-   sets the matching `CUTE_DSL_<GROUP>_ENABLED` compile definitions.
+   sets the matching compile definitions.
 4. Validates `libcutedsl_{arch}.a` and `include/cutedsl_all.h` exist, then links
    the self-contained kernel archive. The CuTe DSL static runtime shim objects
    are already embedded in that archive, so CMake does not link
@@ -309,7 +318,7 @@ cmake .. \
 
 See the group-specific READMEs for kernel coverage and standalone testing:
 
-- `kernelSrcs/fmha_cutedsl_blackwell/README.md` — Blackwell/Thor fused multi-head attention (LLM + ViT)
+- `kernelSrcs/fmha_cutedsl_blackwell/README.md` — optimized Blackwell/Thor fused multi-head attention (LLM + ViT)
 - `kernelSrcs/ffpa_cutedsl/README.md` — Ampere-floor FFPA-style FMHA forward
 - `kernelSrcs/f16_moe_cutedsl/README.md` — Cross-platform FP16 grouped MoE GEMM
 - `kernelSrcs/gdn_cutedsl/README.md` — Gated Delta Net decode/prefill

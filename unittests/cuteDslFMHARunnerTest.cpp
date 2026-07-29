@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#ifdef CUTE_DSL_FMHA_ENABLED
+#ifdef CUTE_DSL_FMHA_BLACKWELL_ENABLED
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>

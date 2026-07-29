@@ -112,8 +112,6 @@ TEST(VisionBlockRangeBuilderTest, ExpandsContiguousBlocksAndMasksPadding)
     EXPECT_EQ(copyDeviceToHost<int32_t>(blockEndTensor), expectedEnd);
 }
 
-#if defined(CUTE_DSL_FMHA_V2_ENABLED)
-
 std::vector<half> visionBlockReference(std::vector<half> const& q, std::vector<half> const& k,
     std::vector<half> const& v, std::vector<int32_t> const& blockIds, int32_t seqLen, int32_t numQHeads,
     int32_t numKVHeads, int32_t headDim, int32_t slidingWindow)
@@ -243,7 +241,5 @@ TEST(VisionBlockFMHAV2Test, MatchesReference)
             << " expected=" << __half2float(expected[i]);
     }
 }
-
-#endif // defined(CUTE_DSL_FMHA_V2_ENABLED)
 
 } // namespace

@@ -15,8 +15,6 @@
  * limitations under the License.
  */
 
-#if defined(CUTE_DSL_FMHA_V2_ENABLED)
-
 #include "cuteDslFMHAV2Runner.h"
 
 #include "attentionScaleUtils.h"
@@ -70,17 +68,24 @@ void loadModule(Module& module, Loader loader, char const* name)
     }
 }
 
-template <typename Module>
-void unloadModule(Module& module, char const* name) noexcept
+//! Unload through the generated helper: it is emitted per artifact flavour and
+//! calls cuModuleUnload or cudaLibraryUnload to match. The helper reports errors
+//! through CUTE_DSL_CUDA_ERROR_CHECK, which throws here, so contain it -- callers
+//! include the partial-load cleanup path.
+template <typename Module, typename Unloader>
+void unloadModule(Module& module, Unloader unloader, char const* name) noexcept
 {
     if (module.module == nullptr)
     {
         return;
     }
-    cudaError_t const status = cudaLibraryUnload(module.module);
-    if (status != cudaSuccess)
+    try
     {
-        LOG_ERROR("Failed to unload CuTe DSL module %s: %s", name, cudaGetErrorString(status));
+        unloader(&module);
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("Failed to unload CuTe DSL module %s: %s", name, e.what());
     }
     module.module = nullptr;
 }
@@ -137,15 +142,16 @@ bool CuteDslFMHAV2Runner::loadLLMKernelModule()
     }
     catch (...)
     {
-        unloadModule(sLLM_d64, "fmha_v2_d64");
-        unloadModule(sLLM_d64Small, "fmha_v2_d64_small");
-        unloadModule(sLLM_d128, "fmha_v2_d128");
-        unloadModule(sLLM_d256, "fmha_v2_d256");
-        unloadModule(sLLM_d256Padding, "fmha_v2_d256_padding");
-        unloadModule(sLLM_d64Sw, "fmha_v2_d64_sw");
-        unloadModule(sLLM_d128Sw, "fmha_v2_d128_sw");
-        unloadModule(sLLM_d256Sw, "fmha_v2_d256_sw");
-        unloadModule(sLLM_d256Bidirectional, "fmha_v2_d256_bidirectional");
+        unloadModule(sLLM_d64, fmha_v2_d64_Kernel_Module_Unload, "fmha_v2_d64");
+        unloadModule(sLLM_d64Small, fmha_v2_d64_small_Kernel_Module_Unload, "fmha_v2_d64_small");
+        unloadModule(sLLM_d128, fmha_v2_d128_Kernel_Module_Unload, "fmha_v2_d128");
+        unloadModule(sLLM_d256, fmha_v2_d256_Kernel_Module_Unload, "fmha_v2_d256");
+        unloadModule(sLLM_d256Padding, fmha_v2_d256_padding_Kernel_Module_Unload, "fmha_v2_d256_padding");
+        unloadModule(sLLM_d64Sw, fmha_v2_d64_sw_Kernel_Module_Unload, "fmha_v2_d64_sw");
+        unloadModule(sLLM_d128Sw, fmha_v2_d128_sw_Kernel_Module_Unload, "fmha_v2_d128_sw");
+        unloadModule(sLLM_d256Sw, fmha_v2_d256_sw_Kernel_Module_Unload, "fmha_v2_d256_sw");
+        unloadModule(
+            sLLM_d256Bidirectional, fmha_v2_d256_bidirectional_Kernel_Module_Unload, "fmha_v2_d256_bidirectional");
         LOG_ERROR("Failed to load FMHA-v2 CuTe DSL LLM FMHA kernel modules");
         return false;
     }
@@ -159,15 +165,15 @@ void CuteDslFMHAV2Runner::unloadLLMKernelModule()
         return;
     }
 
-    unloadModule(sLLM_d64, "fmha_v2_d64");
-    unloadModule(sLLM_d64Small, "fmha_v2_d64_small");
-    unloadModule(sLLM_d128, "fmha_v2_d128");
-    unloadModule(sLLM_d256, "fmha_v2_d256");
-    unloadModule(sLLM_d256Padding, "fmha_v2_d256_padding");
-    unloadModule(sLLM_d64Sw, "fmha_v2_d64_sw");
-    unloadModule(sLLM_d128Sw, "fmha_v2_d128_sw");
-    unloadModule(sLLM_d256Sw, "fmha_v2_d256_sw");
-    unloadModule(sLLM_d256Bidirectional, "fmha_v2_d256_bidirectional");
+    unloadModule(sLLM_d64, fmha_v2_d64_Kernel_Module_Unload, "fmha_v2_d64");
+    unloadModule(sLLM_d64Small, fmha_v2_d64_small_Kernel_Module_Unload, "fmha_v2_d64_small");
+    unloadModule(sLLM_d128, fmha_v2_d128_Kernel_Module_Unload, "fmha_v2_d128");
+    unloadModule(sLLM_d256, fmha_v2_d256_Kernel_Module_Unload, "fmha_v2_d256");
+    unloadModule(sLLM_d256Padding, fmha_v2_d256_padding_Kernel_Module_Unload, "fmha_v2_d256_padding");
+    unloadModule(sLLM_d64Sw, fmha_v2_d64_sw_Kernel_Module_Unload, "fmha_v2_d64_sw");
+    unloadModule(sLLM_d128Sw, fmha_v2_d128_sw_Kernel_Module_Unload, "fmha_v2_d128_sw");
+    unloadModule(sLLM_d256Sw, fmha_v2_d256_sw_Kernel_Module_Unload, "fmha_v2_d256_sw");
+    unloadModule(sLLM_d256Bidirectional, fmha_v2_d256_bidirectional_Kernel_Module_Unload, "fmha_v2_d256_bidirectional");
     sLLMLoaded = false;
 }
 
@@ -191,10 +197,10 @@ bool CuteDslFMHAV2Runner::loadViTKernelModule()
     }
     catch (...)
     {
-        unloadModule(sViT_d64, "fmha_v2_vit_d64");
-        unloadModule(sViT_d72, "fmha_v2_vit_d72");
-        unloadModule(sViT_d80, "fmha_v2_vit_d80");
-        unloadModule(sViT_d128, "fmha_v2_vit_d128");
+        unloadModule(sViT_d64, fmha_v2_vit_d64_Kernel_Module_Unload, "fmha_v2_vit_d64");
+        unloadModule(sViT_d72, fmha_v2_vit_d72_Kernel_Module_Unload, "fmha_v2_vit_d72");
+        unloadModule(sViT_d80, fmha_v2_vit_d80_Kernel_Module_Unload, "fmha_v2_vit_d80");
+        unloadModule(sViT_d128, fmha_v2_vit_d128_Kernel_Module_Unload, "fmha_v2_vit_d128");
         LOG_ERROR("Failed to load FMHA-v2 CuTe DSL ViT FMHA kernel modules");
         return false;
     }
@@ -208,10 +214,10 @@ void CuteDslFMHAV2Runner::unloadViTKernelModule()
         return;
     }
 
-    unloadModule(sViT_d64, "fmha_v2_vit_d64");
-    unloadModule(sViT_d72, "fmha_v2_vit_d72");
-    unloadModule(sViT_d80, "fmha_v2_vit_d80");
-    unloadModule(sViT_d128, "fmha_v2_vit_d128");
+    unloadModule(sViT_d64, fmha_v2_vit_d64_Kernel_Module_Unload, "fmha_v2_vit_d64");
+    unloadModule(sViT_d72, fmha_v2_vit_d72_Kernel_Module_Unload, "fmha_v2_vit_d72");
+    unloadModule(sViT_d80, fmha_v2_vit_d80_Kernel_Module_Unload, "fmha_v2_vit_d80");
+    unloadModule(sViT_d128, fmha_v2_vit_d128_Kernel_Module_Unload, "fmha_v2_vit_d128");
     sViTLoaded = false;
 }
 
@@ -520,5 +526,3 @@ bool CuteDslFMHAV2Runner::run(void const* qPtr, void const* kPtr, void const* vP
 }
 
 } // namespace trt_edgellm
-
-#endif // defined(CUTE_DSL_FMHA_V2_ENABLED)

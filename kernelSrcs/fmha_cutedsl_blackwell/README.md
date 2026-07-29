@@ -1,8 +1,9 @@
-# CuTe DSL FMHA Kernels (Blackwell SM10X/SM110)
+# CuTe DSL FMHA Kernels (Blackwell SM100/SM101/SM110)
 
-Fused multi-head attention kernels compiled ahead-of-time from CuTe DSL Python
-source. Kernel artifacts (static library + headers) are generated locally by
-`kernelSrcs/build_cutedsl.py`. CMake simply links those local artifacts — no
+The `fmha` group always contains the FMHA-v2 Context/ViT kernels. On SM100,
+SM101, and SM110 it also contains these optimized multi-head attention kernels
+compiled ahead-of-time from CuTe DSL Python source. Kernel artifacts (static
+library + headers) are generated locally by `kernelSrcs/build_cutedsl.py`. CMake simply links those local artifacts — no
 Python, CUTLASS DSL, CuPy, or Blackwell GPU is needed at CMake build time.
 
 > **Dependencies, `build_cutedsl.py` options, CMake integration, and
@@ -80,8 +81,8 @@ tarball by default. Follow the shared
 for the supported Docker and local-venv commands, dependency versions,
 cross-compilation, artifact layout, and CMake configuration.
 
-CMake defines `CUTE_DSL_FMHA_ENABLED` when the generated metadata contains this
-group.
+CMake defines `CUTE_DSL_FMHA_BLACKWELL_ENABLED` only when the artifact
+carries these optimized variants.
 
 ## Standalone Test / Export
 

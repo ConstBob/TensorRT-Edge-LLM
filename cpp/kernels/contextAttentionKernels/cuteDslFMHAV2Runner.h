@@ -17,8 +17,6 @@
 
 #pragma once
 
-#if defined(CUTE_DSL_FMHA_V2_ENABLED)
-
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <stdexcept>
@@ -48,7 +46,7 @@ inline void checkCuteDslCudaError(cudaError_t error)
 #if defined(CUTE_DSL_CUDA_ERROR_CHECK)
 #undef CUTE_DSL_CUDA_ERROR_CHECK
 #endif
-#define CUTE_DSL_CUDA_ERROR_CHECK(error) ::trt_edgellm::detail::checkCuteDslCudaError(error)
+#define CUTE_DSL_CUDA_ERROR_CHECK(error) ::trt_edgellm::detail::checkCuteDslCudaError(static_cast<cudaError_t>(error))
 #include "cutedsl_all.h"
 #undef CUTE_DSL_CUDA_ERROR_CHECK
 
@@ -72,9 +70,9 @@ enum class CuteDslFMHAV2MaskType
 //! Runner for the CuTe DSL FMHA-v2 kernels.
 //!
 //! LLM kernels consume separate BSND Q/K/V tensors. ViT kernels consume packed,
-//! separate Q/K/V tensors. The runner is intentionally kept
-//! separate from CuteDslFMHARunner because target-specific AOT packs contain
-//! either the optimized SM100/101/110 family or this FMHA-v2 family.
+//! separate Q/K/V tensors. The runner remains separate from CuteDslFMHARunner
+//! because the FMHA-v2 kernels and the optimized SM100/101/110 kernels have
+//! different tensor contracts and generated ABIs.
 class CuteDslFMHAV2Runner
 {
 public:
@@ -144,5 +142,3 @@ private:
 };
 
 } // namespace trt_edgellm
-
-#endif // defined(CUTE_DSL_FMHA_V2_ENABLED)

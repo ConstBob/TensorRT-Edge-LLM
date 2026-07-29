@@ -524,7 +524,7 @@
         -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake 
         -DEMBEDDED_TARGET=$EMBEDDED_TARGET
         -DCUDA_CTK_VERSION=$CUDA_VERSION
-        -DENABLE_CUTE_DSL=${ENABLE_CUTE_DSL:-OFF}
+        -DENABLE_CUTE_DSL=${ENABLE_CUTE_DSL:-fmha}
     - echo "Building the project"
     - make -j$(nproc)
     - echo "Cross-build completed successfully"

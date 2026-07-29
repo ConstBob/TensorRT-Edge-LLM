@@ -664,7 +664,7 @@ l0_jedha:
     - .l0_environment
   interruptible: true
 
-# JetPack 6 cross-build (CUDA 12.6, no CuTeDSL artifacts yet)
+# JetPack 6 cross-build (CUDA 12.6)
 "l0_cross_build_jp6_cuda12.6":
   stage: l0_test
   variables:
@@ -674,7 +674,6 @@ l0_jedha:
     IMAGE: "urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:rel-10.3-cross-aarch64-l4t-cuda12.6"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.aarch64.cuda-$TRT_CUDA_VERSION"
     EMBEDDED_TARGET: jetson-orin
-    ENABLE_CUTE_DSL: "OFF"
   tags:
     - a30-edgellm-nvks
   image: "$IMAGE"
@@ -684,7 +683,12 @@ l0_jedha:
     - .l0_environment
   interruptible: true
 
-# DriveOS 6 Linux cross-build (CUDA 11.4, no CuTeDSL artifacts yet)
+# DriveOS 6 Linux cross-build (CUDA 11.4)
+#
+# Upstream nvidia-cutlass-dsl ships only cu12/cu13 wheels, so this job cannot
+# generate CuTe DSL kernels. It pulls a prebuilt sm_87/cuda11 artifact from the
+# project's generic package registry instead. Regenerate and re-publish whenever
+# kernelSrcs/fmha_v2_cutedsl/fmha.py or kernelSrcs/gdn_cutedsl/*.py changes.
 "l0_cross_build_d6l_cuda11.4":
   stage: l0_test
   variables:
@@ -694,17 +698,31 @@ l0_jedha:
     IMAGE: "urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:rel-10.10-cross-aarch64-d6l-cuda11.4"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d6l.cuda-$TRT_CUDA_VERSION"
     EMBEDDED_TARGET: jetson-orin
-    ENABLE_CUTE_DSL: "OFF"
+    ENABLE_CUTE_DSL: "fmha;gdn"
+    CUTEDSL_PREBUILT_VERSION: "1.0.0-sm87-cuda11"
   tags:
     - a30-edgellm-nvks
   image: "$IMAGE"
+  before_script:
+    # EMBEDDED_TARGET=jetson-orin infers sm_87 and CUDA_VERSION=11.4 gives cuda
+    # major 11, so cute_dsl_setup() looks for exactly this filename under
+    # kernelSrcs/cuteDSLPrebuilt/ and extracts it instead of generating kernels.
+    - mkdir -p kernelSrcs/cuteDSLPrebuilt
+    - |
+      base="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/cutedsl-prebuilt/$CUTEDSL_PREBUILT_VERSION"
+      tarball="kernelSrcs/cuteDSLPrebuilt/cutedsl_aarch64_sm_87_cuda11.tar.gz"
+      curl --fail --silent --show-error --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+        "$base/cutedsl_aarch64_sm_87_cuda11.tar.gz" -o "$tarball"
+      curl --fail --silent --show-error --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+        "$base/cutedsl_aarch64_sm_87_cuda11.tar.gz.sha256" -o "$tarball.sha256"
+      (cd kernelSrcs/cuteDSLPrebuilt && sha256sum -c cutedsl_aarch64_sm_87_cuda11.tar.gz.sha256)
   extends:
     - .cross_build_template
     - .l0_rules
     - .l0_environment
   interruptible: true
 
-# DriveOS 7 Linux cross-build (CUDA 12.8, no CuTeDSL artifacts yet)
+# DriveOS 7 Linux cross-build (CUDA 12.8)
 "l0_cross_build_d7l_cuda12.8":
   stage: l0_test
   variables:
@@ -714,7 +732,6 @@ l0_jedha:
     IMAGE: "urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:rel-10.10-cross-aarch64-d7l-cuda12.8"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$TRT_CUDA_VERSION"
     EMBEDDED_TARGET: auto-thor
-    ENABLE_CUTE_DSL: "OFF"
   tags:
     - a30-edgellm-nvks
   image: "$IMAGE"
