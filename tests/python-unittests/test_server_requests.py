@@ -148,6 +148,9 @@ def _make_stub_llm():
             self.captured = messages
             return object()
 
+        def count_prompt_tokens(self, messages, **kw):
+            return 7
+
     return _LLM()
 
 
@@ -575,27 +578,27 @@ def test_stream_disconnect_before_first_byte_releases_admission(
     llm._admission().release()
 
 
-def test_admission_busy_returns_429(client_and_llm):
-    # A held admission gate must fail fast (429 + Retry-After), never park a
-    # server pool thread on acquire: a parked thread starves the sync SSE
-    # generator that has to release the gate.
+def test_admission_busy_returns_503(client_and_llm):
+    # A held runtime slot must fail fast (503 overloaded + Retry-After), never
+    # park a server pool thread on acquire: a parked thread starves the sync
+    # SSE generator that has to release the slot.
     client, llm = client_and_llm
     assert llm._admission().acquire(blocking=False)
     try:
         body = {"messages": [{"role": "user", "content": "hi"}]}
         resp = client.post("/v1/chat/completions", json=body)
-        assert resp.status_code == 429
+        assert resp.status_code == 503
         assert resp.headers.get("retry-after") == "1"
         resp = client.post("/v1/chat/completions",
                            json={
                                **body, "stream": True
                            })
-        assert resp.status_code == 429
+        assert resp.status_code == 503
         resp = client.post(
             "/v1/audio/transcriptions",
             files={"file": ("c.wav", b"RIFF0000WAVEfmt ", "audio/wav")},
             data={"model": "asr"})
-        assert resp.status_code == 429
+        assert resp.status_code == 503
     finally:
         llm._admission().release()
     # Gate released: the same request now succeeds.

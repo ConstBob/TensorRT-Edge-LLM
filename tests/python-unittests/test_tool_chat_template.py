@@ -146,3 +146,73 @@ def test_normalize_converts_video_url_spelling():
     assert "video_url" not in item
     # the original request dict must not be mutated
     assert messages[0]["content"][1]["type"] == "video_url"
+
+
+def test_flatten_content_blocks():
+    """Pure-text block arrays collapse to a plain string (else the template
+    renders an empty turn); media, raw-string lists, empty lists, and JSON
+    tool-result lists pass through to role-specific handling instead."""
+    from experimental.server.tool_chat_template import \
+        normalize_messages_for_tools
+
+    media = [{
+        "type": "text",
+        "text": "hello"
+    }, {
+        "type": "image",
+        "image": "x.png"
+    }]
+    messages = [
+        {
+            "role":
+            "system",
+            "content": [{
+                "type": "text",
+                "text": "sys A"
+            }, {
+                "type": "text",
+                "text": "sys B"
+            }]
+        },
+        {
+            "role": "user",
+            "content": media
+        },
+        {
+            "role": "assistant",
+            "content": "plain string untouched"
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "c1",
+            "content": [{
+                "type": "text",
+                "text": "result 42"
+            }]
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "c2",
+            "content": [{
+                "temperature": 22
+            }]
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "c3",
+            "content": ["x", "y"]
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "c4",
+            "content": []
+        },
+    ]
+    out = normalize_messages_for_tools(messages)
+    assert out[0]["content"] == "sys A\nsys B"  # pure-text -> joined
+    assert out[1]["content"] == media  # media list untouched
+    assert out[2]["content"] == "plain string untouched"
+    assert out[3]["content"] == "result 42"
+    assert out[4]["content"] == '{"temperature": 22}'.join(["[", "]"])  # json
+    assert out[5]["content"] == '["x", "y"]'  # raw-string list serialized
+    assert out[6]["content"] == "[]"  # empty list serialized

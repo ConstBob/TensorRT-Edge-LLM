@@ -42,12 +42,14 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
-from .batching import RequestBatcher, resolve_batch_size
+from . import anthropic_compat as _anthropic
+from .batching import BatcherOverflow, RequestBatcher, resolve_batch_size
 from .engine import (SamplingParams, _normalize_logit_bias,
                      _validate_logit_bias_spec_decode, finish_reason_name)
 from .tool_calling import (ToolConfig, parse_assistant_output,
@@ -92,34 +94,75 @@ def _parse_content_length(value):
 
 
 class _ServerBusy(Exception):
-    """Admission gate unavailable; mapped to HTTP 429."""
+    """Admission full: mapped to backpressure (503 for OpenAI paths, 529 for
+    the Anthropic path) so the client retries rather than failing."""
 
 
-def _release_once(sem):
-    """Idempotent release: the gate is handed to both the SSE generator's
-    finally and the response's ASGI-call finally; only one may fire it."""
-    import threading
-    lock = threading.Lock()
-    fired = [False]
+# Bound requests in flight so a client burst gets a fast 503 instead of piling
+# up. Admission and the runtime slot are acquired non-blocking: a parked pool
+# thread would starve the sync SSE generator that releases the slot. Non-stream
+# requests still queue -- in the batcher's own worker, not on a pool thread.
+_DEFAULT_REQUEST_QUEUE_SIZE = 32
+# With batching, each admitted non-stream request parks a pool thread on the
+# batcher; if the depth nears the ASGI pool (default 40) none are left to run
+# the streaming generators that release the slot. Warn above this.
+_POOL_STARVATION_QUEUE_THRESHOLD = 40
 
-    def _release():
-        with lock:
-            if fired[0]:
-                return
-            fired[0] = True
-        sem.release()
 
-    return _release
+class _AdmissionQueue:
+    """Bounds admitted requests (queued + running). ``try_acquire`` is the
+    upstream gate; overflow -> the caller returns 503. Execution downstream is
+    the batcher (non-stream) or the single runtime slot (stream)."""
+
+    def __init__(self, max_depth: int):
+        self._max_depth = max(1, int(max_depth))
+        self._lock = threading.Lock()
+        self._depth = 0
+
+    def try_acquire(self) -> bool:
+        with self._lock:
+            if self._depth >= self._max_depth:
+                return False
+            self._depth += 1
+            return True
+
+    def release(self) -> None:
+        with self._lock:
+            if self._depth > 0:
+                self._depth -= 1
+
+    @property
+    def depth(self) -> int:
+        with self._lock:
+            return self._depth
+
+    @property
+    def max_depth(self) -> int:
+        return self._max_depth
 
 
 class _AdmissionHandoff:
-    """Gate ownership for streams: HTTP releases only while no worker has
-    started; once the worker starts, only its exit releases (a join timeout
-    must not free the gate while the C++ call still runs)."""
+    """Releases the runtime slot -- and, if given, the admission slot -- once,
+    when the worker exits if it started (a join timeout must not free the slot
+    mid-call), else when the ASGI response exits. Fired from both the SSE
+    generator's finally and the ASGI-call finally; the once-guard keeps only
+    the first."""
 
-    def __init__(self, sem):
-        self._fire = _release_once(sem)
+    def __init__(self, sem, on_release=None):
+        self._sem = sem
+        self._on_release = on_release
+        self._lock = threading.Lock()
+        self._fired = False
         self._started = False
+
+    def _fire(self):
+        with self._lock:
+            if self._fired:
+                return
+            self._fired = True
+        self._sem.release()
+        if self._on_release is not None:
+            self._on_release()
 
     def worker_started(self):
         self._started = True
@@ -149,11 +192,13 @@ def _releasing_streaming_response(content, release, **kw):
     return _Resp(content, **kw)
 
 
-def _busy_response():
+def _overloaded_response():
+    """OpenAI-path backpressure (503, not 429): the server is saturated, not
+    rate-limiting the client -- retry."""
     from fastapi.responses import JSONResponse
     return JSONResponse(
-        status_code=429,
-        content={"error": "server busy: another request is in progress"},
+        status_code=503,
+        content={"error": "server overloaded: request queue is full"},
         headers={"Retry-After": "1"})
 
 
@@ -174,6 +219,11 @@ THINK_OPEN_TAG = "<think>"
 THINK_CLOSE_TAG = "</think>"
 IM_END_TOKEN = "<|im_end|>"
 
+# Upper bound on requested output length: the runtime narrows to int32 and,
+# with logprobs, allocates from the requested length before KV clamping, so an
+# unbounded value can OOM. No real chat request needs more than this.
+_MAX_COMPLETION_TOKENS = 1 << 17
+
 
 def _split_reasoning_and_content(text: str):
     """Split model output into (reasoning_content, content) around <think> tags."""
@@ -192,11 +242,47 @@ def _handle_runtime_request(llm_instance, request):
     return llm_instance._runtime.handle_request(request)
 
 
+def _run_nonstream(llm_instance, batcher, admission, build_request):
+    """Admit and execute one non-streaming request; return (response, index).
+
+    Admission is the upstream bound (raises ``_ServerBusy`` on overflow).
+    Execution is the batcher when enabled, else the single runtime slot.
+    ``build_request`` is deferred until after admission so a rejected request
+    does no work; its errors propagate to the caller for status mapping.
+    """
+    if not admission.try_acquire():
+        raise _ServerBusy()
+    try:
+        if batcher is not None:
+            # The batcher merges compatible requests, so their inputs decode
+            # concurrently by design (bounded by the admission depth).
+            request = build_request()
+            try:
+                result = batcher.submit(request)
+            except BatcherOverflow as exc:
+                raise _ServerBusy() from exc
+            return result.response, result.index
+        # Non-batching: hold the runtime slot across build *and* inference so
+        # media decode happens under the gate (concurrent requests must not
+        # stack decoded buffers while queued behind the runtime lock).
+        sem = llm_instance._admission()
+        if not sem.acquire(blocking=False):
+            raise _ServerBusy()
+        try:
+            request = build_request()
+            return _handle_runtime_request(llm_instance, request), 0
+        finally:
+            sem.release()
+    finally:
+        admission.release()
+
+
 def _create_app(llm_instance,
                 *,
                 enable_batching: bool = False,
                 max_queue_batch_size: Optional[int] = None,
-                batch_timeout_ms: float = 10.0):
+                batch_timeout_ms: float = 10.0,
+                request_queue_size: int = _DEFAULT_REQUEST_QUEUE_SIZE):
     """Create a FastAPI app backed by the given LLM instance."""
     try:
         from fastapi import FastAPI, File, Form, UploadFile
@@ -206,6 +292,7 @@ def _create_app(llm_instance,
                            "Install: pip install fastapi uvicorn") from exc
 
     batcher: Optional[RequestBatcher] = None
+    admission = _AdmissionQueue(request_queue_size)
 
     def runtime_handler(request):
         return _handle_runtime_request(llm_instance, request)
@@ -222,12 +309,27 @@ def _create_app(llm_instance,
                 runtime_handler=runtime_handler,
                 max_batch_size=batch_size,
                 timeout_ms=batch_timeout_ms,
+                # Bounds the *pending* (not-yet-selected) queue; the in-flight
+                # batch is separate. Admission caps queued+running upstream, so
+                # this is mainly defense-in-depth for direct-driver use.
+                max_pending=admission.max_depth,
             )
             logger.info(
-                "HTTP request batching enabled: max_batch_size=%d timeout_ms=%.3f",
+                "HTTP request batching enabled: max_batch_size=%d timeout_ms=%.3f "
+                "request_queue_size=%d",
                 batcher.max_batch_size,
                 batcher.timeout_ms,
+                admission.max_depth,
             )
+            # See _POOL_STARVATION_QUEUE_THRESHOLD: a queue near the ASGI pool
+            # size lets parked batcher threads starve streaming responses.
+            if admission.max_depth >= _POOL_STARVATION_QUEUE_THRESHOLD:
+                logger.warning(
+                    "request_queue_size=%d is large relative to the server "
+                    "thread pool; with batching this risks starving streaming "
+                    "responses. Consider a smaller --request-queue-size.",
+                    admission.max_depth,
+                )
         try:
             yield
         finally:
@@ -280,7 +382,175 @@ def _create_app(llm_instance,
                 "max_batch_size": batcher.max_batch_size if batcher else 1,
                 "timeout_ms": batcher.timeout_ms if batcher else 0.0,
             },
+            "admission": {
+                "queue_size": admission.max_depth,
+                "in_flight": admission.depth,
+            },
         }
+
+    @app.post("/v1/messages")
+    def anthropic_messages(body: Dict[str, Any]):
+        """Anthropic Messages API adapter -- a thin translation over the
+        OpenAI pipeline so Claude-Code-class agents target the server
+        directly via ANTHROPIC_BASE_URL with no proxy. Text-only."""
+
+        def _err(status, message):
+            code, payload = _anthropic.error_response(status, message)
+            return JSONResponse(status_code=code, content=payload)
+
+        def _overloaded():
+            # 529 overloaded_error is the Anthropic-native backpressure signal
+            # Claude Code retries; the admission queue is full.
+            code, payload = _anthropic.error_response(
+                529, "server overloaded: request queue is full")
+            return JSONResponse(status_code=code,
+                                content=payload,
+                                headers={"Retry-After": "1"})
+
+        if not body.get("messages"):
+            return _err(400, "messages: field required")
+        max_tokens = body.get("max_tokens")
+        if (not isinstance(max_tokens, int) or isinstance(max_tokens, bool)
+                or not 1 <= max_tokens <= _MAX_COMPLETION_TOKENS):
+            return _err(
+                400, "max_tokens: must be an integer in "
+                f"[1, {_MAX_COMPLETION_TOKENS}]")
+
+        try:
+            messages, tools, tool_choice, sampling = (
+                _anthropic.convert_request(body))
+            tool_config = validate_tool_request(messages, tools, tool_choice)
+        except ValueError as exc:
+            return _err(400, str(exc))
+
+        params = SamplingParams(
+            temperature=sampling["temperature"],
+            top_p=sampling["top_p"],
+            top_k=sampling["top_k"],
+            max_tokens=max_tokens,
+            stop=sampling["stop"],
+        )
+        prompt_tokens = llm_instance.count_prompt_tokens(
+            messages, tool_config=tool_config)
+        message_id = f"msg_{uuid.uuid4().hex[:24]}"
+        model_name = body.get("model") or llm_instance._model_id
+
+        if body.get("stream"):
+            # Streams can't batch: admit + take the runtime slot, both
+            # non-blocking (see the queue-size note); contention -> 529.
+            if not admission.try_acquire():
+                return _overloaded()
+            sem = llm_instance._admission()
+            if not sem.acquire(blocking=False):
+                admission.release()
+                return _overloaded()
+            try:
+                prebuilt = llm_instance._make_generation_request(
+                    messages,
+                    params,
+                    tools=tool_config.tools,
+                    tool_choice=tool_config.tool_choice,
+                    tool_config=tool_config)
+            except (ValueError, KeyError) as exc:
+                sem.release()
+                admission.release()
+                return _err(400, str(exc))
+            except BaseException:
+                sem.release()
+                admission.release()
+                raise
+            handoff = _AdmissionHandoff(sem, on_release=admission.release)
+            return _releasing_streaming_response(
+                _anthropic.stream_run(llm_instance, messages, params,
+                                      tool_config, message_id, model_name,
+                                      prompt_tokens, prebuilt, handoff),
+                handoff.release_if_unstarted,
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                })
+
+        def _build():
+            return llm_instance._make_generation_request(
+                messages,
+                params,
+                tools=tool_config.tools,
+                tool_choice=tool_config.tool_choice,
+                tool_config=tool_config)
+
+        try:
+            response, response_idx = _run_nonstream(llm_instance, batcher,
+                                                    admission, _build)
+        except _ServerBusy:
+            return _overloaded()
+        except (ValueError, KeyError) as exc:
+            return _err(400, f"Invalid messages: {exc}")
+        except Exception as exc:
+            if "EDGELLM_INPUT_TOO_LONG" in str(exc):
+                return _err(413, str(exc))
+            logger.exception("Inference failed")
+            return _err(500, str(exc))
+
+        raw_text = (response.output_texts[response_idx]
+                    if len(response.output_texts) > response_idx else "")
+        output_text = raw_text.replace(IM_END_TOKEN, "")
+        output_ids = (response.output_ids[response_idx]
+                      if len(response.output_ids) > response_idx else [])
+        completion_tokens = len(output_ids)
+        try:
+            # Tool post-processing (parsing/serializing generated calls) can
+            # raise; keep it inside the Anthropic error body rather than
+            # surfacing a generic framework 500.
+            message_body, has_tool_calls = _build_message_body(
+                output_text, tool_config, llm_instance.model_dir)
+        except Exception as exc:
+            logger.exception("Anthropic tool post-processing failed")
+            return _err(500, str(exc))
+        finish_reason = (finish_reason_name(
+            llm_instance._rt, response.finish_reasons[response_idx]) if len(
+                response.finish_reasons) > response_idx else "stop")
+        # Truncation/cancellation wins over tool_use so clients do not execute
+        # potentially half-emitted calls.
+        if has_tool_calls and finish_reason == "stop":
+            finish_reason = "tool_calls"
+        stop_reason = _anthropic.convert_stop_reason(finish_reason)
+        blocks = _anthropic.build_content_blocks(
+            message_body.get("content"),
+            message_body.get("tool_calls") or [])
+        return {
+            "id": message_id,
+            "type": "message",
+            "role": "assistant",
+            "model": model_name,
+            "content": blocks,
+            "stop_reason": stop_reason,
+            "stop_sequence": None,
+            "usage": _anthropic._usage(prompt_tokens, completion_tokens),
+        }
+
+    @app.post("/v1/messages/count_tokens")
+    def anthropic_count_tokens(body: Dict[str, Any]):
+        """Claude Code polls this for context management; a 404 here has
+        destabilized other servers under the request flood."""
+        if not body.get("messages"):
+            code, payload = _anthropic.error_response(
+                400, "messages: field required")
+            return JSONResponse(status_code=code, content=payload)
+        try:
+            messages, tools, tool_choice, _ = _anthropic.convert_request(body)
+            tool_config = validate_tool_request(messages, tools, tool_choice)
+        except ValueError as exc:
+            code, payload = _anthropic.error_response(400, str(exc))
+            return JSONResponse(status_code=code, content=payload)
+        count = llm_instance.count_prompt_tokens(messages,
+                                                 tool_config=tool_config)
+        if count is None:
+            # Rough estimate rather than an authoritative 0, which would break
+            # client-side context budgeting.
+            chars = sum(len(str(m.get("content") or "")) for m in messages)
+            count = max(1, chars // 4)
+        return {"input_tokens": count}
 
     @app.get("/v1/models")
     def list_models():
@@ -304,7 +574,22 @@ def _create_app(llm_instance,
         temperature = body.get("temperature", 0.7)
         top_p = body.get("top_p", 0.9)
         top_k = body.get("top_k", 50)
-        max_tokens = body.get("max_tokens", 2048)
+        # OpenAI renamed "max_tokens" to "max_completion_tokens"; the modern
+        # field takes precedence when both are present.
+        max_tokens = body.get("max_completion_tokens")
+        if max_tokens is None:
+            max_tokens = body.get("max_tokens")
+        if max_tokens is None:
+            max_tokens = 2048
+        if (not isinstance(max_tokens, int) or isinstance(max_tokens, bool)
+                or not 1 <= max_tokens <= _MAX_COMPLETION_TOKENS):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error":
+                    "'max_tokens'/'max_completion_tokens' must be an integer "
+                    f"in [1, {_MAX_COMPLETION_TOKENS}]"
+                })
         stream = body.get("stream", False)
         enable_thinking = body.get("enable_thinking", False)
         disable_spec_decode = body.get("disable_spec_decode", False)
@@ -366,6 +651,24 @@ def _create_app(llm_instance,
                 content={"error": str(exc)},
             )
 
+        # OpenAI "stream_options": {"include_usage": bool} → final usage chunk.
+        stream_options = body.get("stream_options")
+        if stream_options is not None and not isinstance(stream_options, dict):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "'stream_options' must be an object"})
+        include_usage = bool(stream) and (stream_options
+                                          or {}).get("include_usage") is True
+
+        # HF-tokenizer prompt count; None (unavailable) degrades to 0.
+        prompt_tokens: Optional[int] = None
+        if not stream or include_usage:
+            prompt_tokens = llm_instance.count_prompt_tokens(
+                messages,
+                tool_config=tool_config,
+                enable_thinking=enable_thinking,
+            )
+
         response_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         params = SamplingParams(
             temperature=temperature,
@@ -384,12 +687,15 @@ def _create_app(llm_instance,
         include_top_logprobs = req_top_logprobs is not None
 
         if stream:
-            # Prebuild before the SSE response (bad input stays a 400; media
-            # decodes once). Non-blocking acquire: a parked pool thread would
-            # starve the SSE generator that releases the gate (busy -> 429).
+            # Streams can't batch: admit + take the runtime slot, both
+            # non-blocking (see the queue-size note). Prebuild here so bad
+            # input stays a 400 and media decodes once.
+            if not admission.try_acquire():
+                return _overloaded_response()
             sem = llm_instance._admission()
             if not sem.acquire(blocking=False):
-                return _busy_response()
+                admission.release()
+                return _overloaded_response()
             try:
                 prebuilt_request = llm_instance._make_generation_request(
                     messages,
@@ -398,12 +704,14 @@ def _create_app(llm_instance,
                     tool_choice=tool_config.tool_choice)
             except (ValueError, KeyError) as exc:
                 sem.release()
+                admission.release()
                 return JSONResponse(status_code=400,
                                     content={"error": str(exc)})
             except BaseException:
                 sem.release()
+                admission.release()
                 raise
-            handoff = _AdmissionHandoff(sem)
+            handoff = _AdmissionHandoff(sem, on_release=admission.release)
             return _releasing_streaming_response(
                 _generate_stream_sse(
                     llm_instance,
@@ -413,6 +721,8 @@ def _create_app(llm_instance,
                     enable_thinking,
                     tool_config=tool_config,
                     include_top_logprobs=include_top_logprobs,
+                    include_usage=include_usage,
+                    prompt_tokens=prompt_tokens,
                     prebuilt_request=prebuilt_request,
                     handoff=handoff,
                 ),
@@ -424,34 +734,20 @@ def _create_app(llm_instance,
                 },
             )
 
+        def _build():
+            return llm_instance._make_generation_request(
+                messages,
+                params,
+                tools=tool_config.tools,
+                tool_choice=tool_config.tool_choice,
+                tool_config=tool_config,
+            )
+
         try:
-            if batcher is None:
-                sem = llm_instance._admission()
-                if not sem.acquire(blocking=False):
-                    return _busy_response()
-                try:
-                    request = llm_instance._make_generation_request(
-                        messages,
-                        params,
-                        tools=tool_config.tools,
-                        tool_choice=tool_config.tool_choice,
-                        tool_config=tool_config,
-                    )
-                    response = _handle_runtime_request(llm_instance, request)
-                    response_idx = 0
-                finally:
-                    sem.release()
-            else:
-                request = llm_instance._make_generation_request(
-                    messages,
-                    params,
-                    tools=tool_config.tools,
-                    tool_choice=tool_config.tool_choice,
-                    tool_config=tool_config,
-                )
-                result = batcher.submit(request)
-                response = result.response
-                response_idx = result.index
+            response, response_idx = _run_nonstream(llm_instance, batcher,
+                                                    admission, _build)
+        except _ServerBusy:
+            return _overloaded_response()
         except (ValueError, KeyError) as exc:
             return JSONResponse(
                 status_code=400,
@@ -476,6 +772,7 @@ def _create_app(llm_instance,
             tool_config,
             include_top_logprobs=include_top_logprobs,
             include_logprobs=num_logprobs > 0,
+            prompt_tokens=prompt_tokens,
         )
 
     @app.post("/v1/audio/transcriptions")
@@ -557,15 +854,22 @@ def _create_app(llm_instance,
                                 max_tokens=4096)
 
         def _prepare_and_infer():
-            sem = llm_instance._admission()
-            if not sem.acquire(blocking=False):
+            # Count audio against the same admission bound as chat (the upload
+            # read is already capped by the content-length middleware).
+            if not admission.try_acquire():
                 raise _ServerBusy()
             try:
-                request = llm_instance._make_generation_request(
-                    messages, params)
-                return llm_instance._handle_request(request)
+                sem = llm_instance._admission()
+                if not sem.acquire(blocking=False):
+                    raise _ServerBusy()
+                try:
+                    request = llm_instance._make_generation_request(
+                        messages, params)
+                    return llm_instance._handle_request(request)
+                finally:
+                    sem.release()
             finally:
-                sem.release()
+                admission.release()
 
         try:
             # Request construction includes the C++ audio decode; run the
@@ -573,7 +877,7 @@ def _create_app(llm_instance,
             response = await asyncio.get_running_loop().run_in_executor(
                 None, _prepare_and_infer)
         except _ServerBusy:
-            return _busy_response()
+            return _overloaded_response()
         except (ValueError, KeyError, RuntimeError) as exc:
             # ValueError/KeyError: malformed request; RuntimeError from
             # the C++ audio loader: undecodable or over-long audio.
@@ -676,6 +980,8 @@ def _generate_stream_sse(llm_instance,
                          enable_thinking,
                          tool_config: Optional[ToolConfig] = None,
                          include_top_logprobs: bool = True,
+                         include_usage: bool = False,
+                         prompt_tokens: Optional[int] = None,
                          prebuilt_request=None,
                          handoff=None):
     """Yield SSE chunks via StreamChannel streaming. ``handoff`` carries the
@@ -685,6 +991,7 @@ def _generate_stream_sse(llm_instance,
                                               response_id, enable_thinking,
                                               tool_config,
                                               include_top_logprobs,
+                                              include_usage, prompt_tokens,
                                               prebuilt_request, handoff)
     finally:
         if handoff is not None:
@@ -698,20 +1005,40 @@ def _generate_stream_sse_inner(llm_instance,
                                enable_thinking,
                                tool_config: Optional[ToolConfig] = None,
                                include_top_logprobs: bool = True,
+                               include_usage: bool = False,
+                               prompt_tokens: Optional[int] = None,
                                prebuilt_request=None,
                                handoff=None):
     """Yield SSE chunks via StreamChannel streaming."""
-    yield _sse_chunk(response_id, {"role": "assistant"})
+    model_name = llm_instance._model_id
+    created = int(time.time())
+
+    def emit(delta, **kw):
+        return _sse_chunk(response_id,
+                          delta,
+                          model=model_name,
+                          created=created,
+                          null_usage=include_usage,
+                          **kw)
+
+    yield emit({"role": "assistant"})
 
     if tool_config is not None and tool_config.parse_output:
-        yield from _generate_tool_stream_sse(llm_instance, messages, params,
-                                             response_id, tool_config,
-                                             prebuilt_request, handoff)
+        yield from _generate_tool_stream_sse(llm_instance,
+                                             messages,
+                                             params,
+                                             response_id,
+                                             tool_config,
+                                             prebuilt_request,
+                                             handoff,
+                                             include_usage=include_usage,
+                                             prompt_tokens=prompt_tokens)
         return
 
     sm = _ThinkingStateMachine(enable_thinking)
     finish_reason: Optional[str] = None
     error_message: Optional[str] = None
+    completion_tokens = 0
     stream_tools = tool_config.tools if tool_config else None
     stream_tool_choice = tool_config.tool_choice if tool_config else None
 
@@ -723,6 +1050,7 @@ def _generate_stream_sse_inner(llm_instance,
                 tool_choice=stream_tool_choice,
                 prebuilt_request=prebuilt_request,
                 admission_handoff=handoff):
+            completion_tokens += len(delta.token_ids or [])
             lp_obj: Optional[Dict[str, Any]] = None
             if delta.logprobs:
                 # OpenAI streaming schema: choices[0].logprobs = {"content": [...]},
@@ -752,11 +1080,10 @@ def _generate_stream_sse_inner(llm_instance,
                 lp_obj = {"content": content}
             if delta.text:
                 for field, text in sm.feed(delta.text):
-                    yield _sse_chunk(response_id, {field: text},
-                                     logprobs=lp_obj)
+                    yield emit({field: text}, logprobs=lp_obj)
                     lp_obj = None  # logprobs only on the first chunk per delta
             if lp_obj is not None:
-                yield _sse_chunk(response_id, {}, logprobs=lp_obj)
+                yield emit({}, logprobs=lp_obj)
             if delta.finished:
                 finish_reason = delta.finish_reason or "stop"
     except Exception as exc:
@@ -765,11 +1092,17 @@ def _generate_stream_sse_inner(llm_instance,
         error_message = str(exc)
 
     for field, text in sm.flush():
-        yield _sse_chunk(response_id, {field: text})
+        yield emit({field: text})
 
     if error_message and "EDGELLM_INPUT_TOO_LONG" in error_message:
         yield _sse_error(error_message)
-    yield _sse_chunk(response_id, {}, finish_reason=finish_reason or "stop")
+    yield emit({}, finish_reason=finish_reason or "stop")
+    if include_usage:
+        yield _sse_usage_chunk(response_id,
+                               prompt_tokens,
+                               completion_tokens,
+                               model=model_name,
+                               created=created)
     yield "data: [DONE]\n\n"
 
 
@@ -779,10 +1112,24 @@ def _generate_tool_stream_sse(llm_instance,
                               response_id,
                               tool_config: ToolConfig,
                               prebuilt_request=None,
-                              handoff=None):
+                              handoff=None,
+                              include_usage: bool = False,
+                              prompt_tokens: Optional[int] = None):
+    model_name = llm_instance._model_id
+    created = int(time.time())
+
+    def emit(delta, **kw):
+        return _sse_chunk(response_id,
+                          delta,
+                          model=model_name,
+                          created=created,
+                          null_usage=include_usage,
+                          **kw)
+
     text_parts: List[str] = []
     finish_reason: Optional[str] = None
     error_message: Optional[str] = None
+    completion_tokens = 0
     try:
         for delta in llm_instance.generate_stream(
                 messages,
@@ -791,6 +1138,7 @@ def _generate_tool_stream_sse(llm_instance,
                 admission_handoff=handoff,
                 tools=tool_config.tools,
                 tool_choice=tool_config.tool_choice):
+            completion_tokens += len(delta.token_ids or [])
             if delta.text:
                 text_parts.append(delta.text)
             if delta.finished:
@@ -806,39 +1154,43 @@ def _generate_tool_stream_sse(llm_instance,
     tool_index = 0
     for event in parsed.events:
         if event["type"] == "reasoning" and event["text"]:
-            yield _sse_chunk(response_id, {"reasoning": event["text"]})
+            yield emit({"reasoning": event["text"]})
         elif event["type"] == "content" and event["text"]:
-            yield _sse_chunk(response_id, {"content": event["text"]})
+            yield emit({"content": event["text"]})
         elif event["type"] == "tool_call":
             call = event["tool_call"]
-            yield _sse_chunk(
-                response_id, {
+            yield emit({
+                "tool_calls": [{
+                    "index": tool_index,
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": "",
+                    },
+                }]
+            })
+            if call.arguments:
+                yield emit({
                     "tool_calls": [{
                         "index": tool_index,
-                        "id": call.id,
-                        "type": "function",
                         "function": {
-                            "name": call.name,
-                            "arguments": "",
+                            "arguments": call.arguments,
                         },
                     }]
                 })
-            if call.arguments:
-                yield _sse_chunk(
-                    response_id, {
-                        "tool_calls": [{
-                            "index": tool_index,
-                            "function": {
-                                "arguments": call.arguments,
-                            },
-                        }]
-                    })
             tool_index += 1
 
     finish = "tool_calls" if tool_index else finish_reason or "stop"
     if error_message and "EDGELLM_INPUT_TOO_LONG" in error_message:
         yield _sse_error(error_message)
-    yield _sse_chunk(response_id, {}, finish_reason=finish)
+    yield emit({}, finish_reason=finish)
+    if include_usage:
+        yield _sse_usage_chunk(response_id,
+                               prompt_tokens,
+                               completion_tokens,
+                               model=model_name,
+                               created=created)
     yield "data: [DONE]\n\n"
 
 
@@ -926,7 +1278,8 @@ def _build_chat_completion_response(llm_instance,
                                     tool_config: ToolConfig,
                                     *,
                                     include_top_logprobs: bool = True,
-                                    include_logprobs: bool = False):
+                                    include_logprobs: bool = False,
+                                    prompt_tokens: Optional[int] = None):
     raw_text = (response.output_texts[response_idx]
                 if len(response.output_texts) > response_idx else "")
     output_text = raw_text.replace(IM_END_TOKEN, "")
@@ -946,11 +1299,6 @@ def _build_chat_completion_response(llm_instance,
     if has_tool_calls:
         finish_reason = "tool_calls"
 
-    # ``prompt_tokens`` is reported as 0 because the runtime response does
-    # not expose tokenised prompt ids; ``total_tokens`` is then equal to
-    # ``completion_tokens``. SDKs that validate the schema (existence of
-    # the three fields) succeed; consumers that compute cost from
-    # ``prompt_tokens`` will see 0 until the runtime is extended.
     logprobs_obj = (_format_logprobs(
         response, response_idx=response_idx, include_top=include_top_logprobs)
                     if include_logprobs else None)
@@ -962,31 +1310,71 @@ def _build_chat_completion_response(llm_instance,
         "created":
         int(time.time()),
         "model":
-        os.path.basename(llm_instance.model_dir) or llm_instance.model_dir,
+        llm_instance._model_id,
         "choices": [{
             "index": 0,
             "message": message_body,
             "logprobs": logprobs_obj,
             "finish_reason": finish_reason,
         }],
-        "usage": {
-            "prompt_tokens": 0,
-            "completion_tokens": completion_tokens,
-            "total_tokens": completion_tokens,
-        },
+        "usage":
+        _usage_body(prompt_tokens, completion_tokens),
     }
+
+
+def _usage_body(prompt_tokens: Optional[int],
+                completion_tokens: int) -> Dict[str, int]:
+    """OpenAI usage object; None prompt_tokens (counting unavailable) -> 0."""
+    pt = prompt_tokens or 0
+    return {
+        "prompt_tokens": pt,
+        "completion_tokens": completion_tokens,
+        "total_tokens": pt + completion_tokens,
+    }
+
+
+def _sse_usage_chunk(response_id: str,
+                     prompt_tokens: Optional[int],
+                     completion_tokens: int,
+                     model: str = "",
+                     created: Optional[int] = None) -> str:
+    """include_usage final chunk: empty choices + usage, right before [DONE]."""
+    payload = {
+        "id": response_id,
+        "object": "chat.completion.chunk",
+        "created": created if created is not None else int(time.time()),
+        "model": model,
+        "choices": [],
+        "usage": _usage_body(prompt_tokens, completion_tokens),
+    }
+    return f"data: {json.dumps(payload)}\n\n"
 
 
 def _sse_chunk(response_id: str,
                delta: dict,
                finish_reason: Optional[str] = None,
-               logprobs: Optional[Dict[str, Any]] = None):
-    choice: Dict[str, Any] = {"delta": delta, "index": 0}
-    if finish_reason:
-        choice["finish_reason"] = finish_reason
+               logprobs: Optional[Dict[str, Any]] = None,
+               model: str = "",
+               created: Optional[int] = None,
+               null_usage: bool = False):
+    # OpenAI streaming spec: every chunk carries finish_reason (null until the
+    # terminal chunk); some clients detect termination by a non-null value.
+    choice: Dict[str, Any] = {
+        "delta": delta,
+        "index": 0,
+        "finish_reason": finish_reason or None,
+    }
     if logprobs:
         choice["logprobs"] = logprobs
-    payload = {"id": response_id, "choices": [choice]}
+    payload: Dict[str, Any] = {
+        "id": response_id,
+        "object": "chat.completion.chunk",
+        "created": created if created is not None else int(time.time()),
+        "model": model,
+        "choices": [choice],
+    }
+    if null_usage:
+        payload["usage"] = None
     return f"data: {json.dumps(payload)}\n\n"
 
 
@@ -996,7 +1384,8 @@ def run_server(llm_instance,
                *,
                enable_batching: bool = False,
                batch_timeout_ms: float = 10.0,
-               max_queue_batch_size: Optional[int] = None) -> None:
+               max_queue_batch_size: Optional[int] = None,
+               request_queue_size: int = _DEFAULT_REQUEST_QUEUE_SIZE) -> None:
     """Start the OpenAI-compatible server."""
     try:
         import uvicorn
@@ -1009,6 +1398,7 @@ def run_server(llm_instance,
         enable_batching=enable_batching,
         batch_timeout_ms=batch_timeout_ms,
         max_queue_batch_size=max_queue_batch_size,
+        request_queue_size=request_queue_size,
     )
     logger.info("Starting server on %s:%d ...", host, port)
     uvicorn.run(app, host=host, port=port)
@@ -1107,6 +1497,13 @@ def main():
         default=None,
         help="Maximum HTTP requests to merge into one runtime batch",
     )
+    parser.add_argument(
+        "--request-queue-size",
+        type=int,
+        default=_DEFAULT_REQUEST_QUEUE_SIZE,
+        help="Maximum concurrently admitted requests (queued + running) before "
+        "the server returns backpressure (503 / Anthropic 529)",
+    )
     args = parser.parse_args()
 
     from .engine import LLM
@@ -1144,6 +1541,7 @@ def main():
         enable_batching=args.enable_batching,
         batch_timeout_ms=args.batch_timeout_ms,
         max_queue_batch_size=args.max_queue_batch_size,
+        request_queue_size=args.request_queue_size,
     )
 
 

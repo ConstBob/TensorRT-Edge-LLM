@@ -68,6 +68,25 @@ def _normalize_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
     return normalized
 
 
+def _flatten_content_blocks(content: Any) -> Any:
+    """Collapse a non-empty array of typed text blocks into the plain string
+    HF chat templates expect. Anything else -- empty lists, media blocks, raw
+    strings, JSON tool-result lists -- passes through unchanged so the later
+    role-specific handling (json.dumps of tool results, video normalization)
+    still applies."""
+    if not isinstance(content, list) or not content:
+        return content
+    parts: List[str] = []
+    for item in content:
+        if (isinstance(item, dict)
+                and item.get("type") in ("text", "input_text")
+                and isinstance(item.get("text"), str)):
+            parts.append(item["text"])
+        else:
+            return content
+    return "\n".join(p for p in parts if p)
+
+
 def normalize_messages_for_tools(
         messages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Return a template-friendly copy of OpenAI-style messages."""
@@ -75,6 +94,12 @@ def normalize_messages_for_tools(
 
     for raw_msg in messages:
         msg = copy.deepcopy(raw_msg)
+        # Agentic clients (Claude Code, OpenClaw) send content as
+        # [{"type":"text",...}] arrays; collapse pure-text arrays to a string
+        # (media/JSON-list content passes through) or the template renders an
+        # empty turn and the model never sees the message.
+        if isinstance(msg.get("content"), list):
+            msg["content"] = _flatten_content_blocks(msg["content"])
 
         # HF templates only know {"type": "video"}: normalize the OpenAI
         # "video_url" alias here or the template emits no placeholder and the
@@ -215,3 +240,16 @@ class ToolChatTemplateFormatter:
                 "Tool-aware chat template returned non-string prompt. "
                 "Use tokenize=False-compatible tokenizer/processor templates.")
         return prompt
+
+    def count_tokens(self, text: str) -> Optional[int]:
+        """Count tokens of a rendered prompt (no special-token wrapper — the
+        rendered text already carries them). None if encoding unavailable."""
+        owner = self._load_template_owner()
+        tokenizer = getattr(owner, "tokenizer", owner)
+        encode = getattr(tokenizer, "encode", None)
+        if not callable(encode):
+            return None
+        try:
+            return len(encode(text, add_special_tokens=False))
+        except TypeError:
+            return len(encode(text))

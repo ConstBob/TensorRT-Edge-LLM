@@ -103,9 +103,20 @@ tests:
   - tests/python-unittests/test_tool_chat_template.py::test_needs_tool_template
   - tests/python-unittests/test_tool_chat_template.py::test_formats_tool_template
   - tests/python-unittests/test_tool_chat_template.py::test_normalize_converts_video_url_spelling
+  - tests/python-unittests/test_tool_chat_template.py::test_flatten_content_blocks
+  - tests/python-unittests/test_anthropic_compat.py::test_converts_request
+  - tests/python-unittests/test_anthropic_compat.py::test_flags_tool_result_error
+  - tests/python-unittests/test_anthropic_compat.py::test_maps_stop_reasons
+  - tests/python-unittests/test_anthropic_compat.py::test_builds_content_blocks
+  - tests/python-unittests/test_anthropic_compat.py::test_stream_event_grammar
+  - tests/python-unittests/test_batching.py::test_overflow_and_pending
+  - tests/python-unittests/test_batching.py::test_worker_survives_bad_request
+  - tests/python-unittests/test_batching.py::test_admission_queue
   - tests/python-unittests/test_tool_calling.py::test_validates_tool_request
   - tests/python-unittests/test_tool_calling.py::test_parses_tool_calls
   - tests/python-unittests/test_tool_calling.py::test_builds_tool_response_shapes
+  - tests/python-unittests/test_tool_calling.py::test_stream_usage_chunk
+  - tests/python-unittests/test_tool_calling.py::test_tool_stream_usage_chunk
 
   # Experimental Server Logit Bias Validation Tests
   - tests/python-unittests/test_experimental_server_logit_bias.py::test_normalize_logit_bias_accepts_integer_like_keys_and_boundaries
@@ -205,7 +216,7 @@ tests:
   - tests/python-unittests/test_server_requests.py::test_content_length_parsing
   - tests/python-unittests/test_server_requests.py::test_audio_transcriptions_requires_audio_engine
   - tests/python-unittests/test_server_requests.py::test_stream_disconnect_before_first_byte_releases_admission
-  - tests/python-unittests/test_server_requests.py::test_admission_busy_returns_429
+  - tests/python-unittests/test_server_requests.py::test_admission_busy_returns_503
   - tests/python-unittests/test_server_requests.py::test_admission_spans_decode_and_infer
   - tests/python-unittests/test_server_requests.py::test_stream_disconnect_keeps_gate_until_worker_exits
   - tests/python-unittests/test_server_requests.py::test_stream_close_cancels_channel
