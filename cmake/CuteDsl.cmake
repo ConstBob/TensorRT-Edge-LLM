@@ -26,10 +26,10 @@
 #   python kernelSrcs/build_cutedsl.py --gpu_arch <sm_NN>
 #
 # ENABLE_CUTE_DSL cache variable controls which kernel groups are linked:
-#   OFF      — disable entirely (default)
+#   OFF      — disable entirely
 #   ALL      — enable all groups found in metadata.json
-#   fmha     — enable only the Blackwell FMHA group
-#   fmha_v2  — enable only the portable FP16 Context/ViT FMHA group
+#   fmha     — enable the FP16 Context/ViT FMHA baseline, plus the optimized
+#              Blackwell overlay when the artifact has it (default)
 #   ffpa     — enable only the Ampere FFPA FMHA group
 #   gdn      — enable only the GDN group
 #   f16_moe  — enable the target-specific homogeneous-FP16 MoE group
@@ -44,7 +44,8 @@
 #
 # Per-group compile definitions set on each target:
 #   CUTE_DSL_FMHA_ENABLED  — set when the fmha group is active
-#   CUTE_DSL_FMHA_V2_ENABLED — set when the fmha_v2 group is active
+#   CUTE_DSL_FMHA_BLACKWELL_ENABLED — set when the artifact carries the
+#                            optimized Blackwell FMHA variants
 #   CUTE_DSL_FFPA_ENABLED  — set when the ffpa group is active
 #   CUTE_DSL_GDN_ENABLED   — set when the gdn group is active
 #   CUTE_DSL_F16_MOE_ENABLED — set when the f16_moe group is active
@@ -54,10 +55,10 @@
 # cmake-format: on
 
 set(ENABLE_CUTE_DSL
-    "OFF"
+    "fmha"
     CACHE
       STRING
-      "CuTe DSL kernels: OFF, ALL, or semicolon-separated group list (fmha;fmha_v2;gdn)"
+      "CuTe DSL kernels: OFF, ALL, or semicolon-separated group list (fmha;gdn)"
 )
 
 set(CUTE_DSL_ARTIFACT_TAG
@@ -120,6 +121,9 @@ function(_cute_dsl_infer_artifact_tag OUT_VAR ARCH)
     string(REPLACE "-" "_" _embedded_target "${_embedded_target}")
     if(_embedded_target STREQUAL "gb10")
       set(_default_tag "sm_121")
+    elseif(_embedded_target STREQUAL "auto_thor" AND CUDA_CTK_VERSION
+                                                     VERSION_LESS 13.0)
+      set(_default_tag "sm_101")
     elseif(_embedded_target STREQUAL "auto_thor" OR _embedded_target STREQUAL
                                                     "jetson_thor")
       set(_default_tag "sm_110")
@@ -458,6 +462,15 @@ function(cute_dsl_setup)
       target_compile_definitions(${_tgt} PRIVATE "CUTE_DSL_${_gu}_ENABLED")
     endforeach()
   endforeach()
+
+  # The optimized Blackwell FMHA kernels are generated for SM100, SM101 and
+  # SM110 only.
+  if(NOT _meta_gpu_arch_err AND _meta_gpu_arch MATCHES "^sm_(100|101|110)$")
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(${_tgt}
+                                 PRIVATE "CUTE_DSL_FMHA_BLACKWELL_ENABLED")
+    endforeach()
+  endif()
 
   # FFPA vision-block overlay variant.
   list(FIND _variants "ffpa_d512_causal_visionblock" _ffpa_visionblock_idx)
@@ -1015,13 +1028,18 @@ function(cute_dsl_setup)
   # edgellmKernels also inherit the CuTe DSL archive. Otherwise unresolved AOT
   # wrapper symbols only show up at the final executable link step.
   set(_link_libs "${_static_lib}")
+  # The libcudart shim only exists below CUDA 12.8; at 12.8+ the target is an
+  # empty INTERFACE library.
+  set(_cudart_shim_lib)
+  if(_cute_dsl_cuda_ver VERSION_LESS 12.8)
+    set(_cudart_shim_lib trt_edgellm_cutedsl_cudart_shim)
+  endif()
   foreach(_tgt ${ARG_LINK_TARGETS})
     get_target_property(_tgt_type ${_tgt} TYPE)
     if(_tgt_type STREQUAL "STATIC_LIBRARY")
-      target_link_libraries(${_tgt} PUBLIC ${_link_libs})
+      target_link_libraries(${_tgt} PUBLIC ${_link_libs} ${_cudart_shim_lib})
     else()
-      target_link_libraries(${_tgt} PRIVATE ${_link_libs}
-                                            trt_edgellm_cutedsl_cudart_shim)
+      target_link_libraries(${_tgt} PRIVATE ${_link_libs} ${_cudart_shim_lib})
     endif()
     if(CUDA_DRIVER_LINK_LIB AND NOT CUDA_DRIVER_LINK_LIB MATCHES "-NOTFOUND$")
       target_link_libraries(${_tgt} PRIVATE "${CUDA_DRIVER_LINK_LIB}")

@@ -339,10 +339,13 @@ cmake .. \
     -DCMAKE_BUILD_TYPE=Release \
     -DTRT_PACKAGE_DIR=/usr/local/TensorRT-10.x.x \
     -DCUDA_CTK_VERSION=<YOUR_CUDA_VERSION> \
+    -DCUTE_DSL_ARTIFACT_TAG=<YOUR_SM> \
     -DENABLE_CUTE_DSL=ALL
 ```
 
 > **Note:** Replace `/usr/local/TensorRT-10.x.x` with your actual TensorRT installation path. Use `dpkg -l | grep tensorrt` to find it, or download from [NVIDIA TensorRT downloads](https://developer.nvidia.com/tensorrt). Replace `<YOUR_CUDA_VERSION>` with your actual CUDA version (e.g., `13.0`). Use `nvcc --version` to check your CUDA version.
+> Replace `<YOUR_SM>` with the generated CuTe DSL artifact tag, for example
+> `sm_80`, `sm_100`, or `sm_120`.
 
 **CMake Options:**
 
@@ -354,16 +357,21 @@ cmake .. \
 | `CUDA_CTK_VERSION` | CUDA Toolkit version. Use the platform command above to select `13.3`, `13.2`, `13.0`, or `12.6`. Do not pass `-DCUDA_VERSION`; CMake reserves that name for CUDA headers and rejects it. | target default |
 | `BUILD_UNIT_TESTS` | Build unit tests | OFF |
 | `ENABLE_COVERAGE` | Enable gcov code coverage instrumentation (see [Code Coverage](../../developer_guide/testing/code-coverage.md)) | OFF |
-| `ENABLE_CUTE_DSL` | Enable generated CuTe DSL kernels: `OFF`, `ALL`, or a group list such as `gdn`, `fmha`, `gemm`, or `ssd`. Set this to `ALL` for customer builds. | OFF |
-| `CUTE_DSL_ARTIFACT_TAG` | Optional artifact tag under `cpp/kernels/cuteDSLArtifact/<arch>/`, for example `sm_87`, `sm_110`, or `sm_121`. Required when multiple local artifact tags exist for the same CPU architecture. | auto |
+| `ENABLE_CUTE_DSL` | Select generated CuTe DSL kernels: `fmha`, `ALL`, or a group list such as `gdn`, `gemm`, or `ssd`. Any selection also links `fmha`, which the attention plugins require. Use `ALL` for customer builds. | fmha |
+| `CUTE_DSL_ARTIFACT_TAG` | Artifact tag under `cpp/kernels/cuteDSLArtifact/<arch>/`, for example `sm_87`, `sm_110`, or `sm_121`. Edge targets infer it from `EMBEDDED_TARGET`; pass it explicitly for x86 prebuilt artifacts or when multiple local tags exist for one CPU architecture. | auto |
 
 **CuTe DSL Kernel Artifacts**
 
 CuTe DSL binaries are generated with `kernelSrcs/build_cutedsl.py` before
-configuring CMake. The platform commands above pass `-DENABLE_CUTE_DSL=ALL`
-because Qwen3.5 and several other model paths require them. If you select groups
-manually, Qwen3.5 GDN requires `-DENABLE_CUTE_DSL=gdn` or
-`-DENABLE_CUTE_DSL=ALL`.
+configuring CMake. A normal build defaults to the canonical `fmha` family and
+therefore requires a matching artifact. This family provides Context/ViT
+attention on supported GPUs and adds the optimized Blackwell implementation
+on SM100/SM101/SM110 when available.
+
+The platform commands above pass `-DENABLE_CUTE_DSL=ALL` because Qwen3.5 and
+several other model paths require optional groups. Selecting a narrower group
+still includes the `fmha` baseline; for example, `-DENABLE_CUTE_DSL=gdn`
+enables both GDN and FMHA.
 
 If you have multiple local artifact tags for the same CPU architecture, also
 pass `-DCUTE_DSL_ARTIFACT_TAG=<tag>`.

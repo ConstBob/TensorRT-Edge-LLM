@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#ifdef CUTE_DSL_FMHA_ENABLED
+#ifdef CUTE_DSL_FMHA_BLACKWELL_ENABLED
 
 #include "cuteDslFMHARunner.h"
 
@@ -753,4 +753,4 @@ void CuteDslFMHARunner::run(void const* qPtr, void const* kPtr, void const* vPtr
 
 } // namespace trt_edgellm
 
-#endif // CUTE_DSL_FMHA_ENABLED
+#endif // CUTE_DSL_FMHA_BLACKWELL_ENABLED

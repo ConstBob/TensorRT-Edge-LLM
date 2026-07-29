@@ -107,7 +107,7 @@ def _build_project(env_config: EnvironmentConfig,
     # do not enable that group without a native SM86 artifact.
     x86_cutedsl_selections = {
         80: ('sm_80', 'ALL'),
-        86: ('sm_80', r'ffpa\;fmha_v2\;gdn\;gemm\;int4_fp16_gemm\;ssd'),
+        86: ('sm_80', r'ffpa\;fmha\;gdn\;gemm\;int4_fp16_gemm\;ssd'),
         100: ('sm_100', 'ALL'),
         120: ('sm_120', 'ALL'),
     }

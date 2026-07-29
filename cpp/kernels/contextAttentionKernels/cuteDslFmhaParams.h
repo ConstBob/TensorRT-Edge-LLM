@@ -27,9 +27,9 @@
 //! than a single superset: a superset would let a field that matters on one path (kvCacheCapacity on
 //! the dense path, tokensPerPage on the paged one) sit silently at zero on another.
 //!
-//! These carry no generated types, so this header is safe to include from a translation unit where
-//! only one of CUTE_DSL_FMHA_ENABLED / CUTE_DSL_FMHA_V2_ENABLED is defined. The descriptor-filling
-//! machinery itself lives in cuteDslTensorDescriptors.h, which stays free of any FMHA concept.
+//! These carry no generated types, so this header is safe to include from translation units that use the required
+//! FMHA-v2 runner, the optional CUTE_DSL_FMHA_BLACKWELL_ENABLED runner, or both. The descriptor-filling machinery
+//! itself lives in cuteDslTensorDescriptors.h, which stays free of any FMHA concept.
 namespace trt_edgellm
 {
 

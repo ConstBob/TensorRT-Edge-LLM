@@ -25,13 +25,11 @@
 #include "kernels/contextAttentionKernels/utilKernels.h"
 #include "plugins/utils/pluginUtils.h"
 
-#ifdef CUTE_DSL_FMHA_ENABLED
+#ifdef CUTE_DSL_FMHA_BLACKWELL_ENABLED
 #include "kernels/contextAttentionKernels/cuteDslFMHARunner.h"
 #endif
 
-#ifdef CUTE_DSL_FMHA_V2_ENABLED
 #include "kernels/contextAttentionKernels/cuteDslFMHAV2Runner.h"
-#endif
 
 #include <cassert>
 #include <cstdint>
@@ -73,7 +71,7 @@ struct ViTFMHAKernelSelection
 
 ViTFMHAKernelSelection loadViTFMHAKernels(int32_t headSize, int32_t smVersion, nvinfer1::DataType dataType)
 {
-#ifdef CUTE_DSL_FMHA_ENABLED
+#ifdef CUTE_DSL_FMHA_BLACKWELL_ENABLED
     if (CuteDslFMHARunner::canImplementViT(headSize, smVersion) && CuteDslFMHARunner::loadViTKernelModule())
     {
         LOG_DEBUG("CuTe DSL ViT FMHA kernel loaded for SM%d", smVersion);
@@ -81,14 +79,12 @@ ViTFMHAKernelSelection loadViTFMHAKernels(int32_t headSize, int32_t smVersion, n
     }
 #endif
 
-#ifdef CUTE_DSL_FMHA_V2_ENABLED
     if (CuteDslFMHAV2Runner::canImplementViT(headSize, smVersion, dataType)
         && CuteDslFMHAV2Runner::loadViTKernelModule())
     {
         LOG_DEBUG("FMHA-v2 CuTe DSL ViT FMHA kernel loaded for SM%d", smVersion);
         return {ViTFMHABackend::kCUTE_DSL_FMHA_V2, true};
     }
-#endif
 
     return {};
 }
@@ -369,13 +365,11 @@ int32_t ViTAttentionPlugin::enqueue(PluginTensorDesc const* inputDesc,
     rt::Tensor attentionOutputTensor(outputs[kOUT_ATTENTION_IDX], rt::Coords{attentionOutputDesc.dims},
         rt::DeviceType::kGPU, attentionOutputDesc.type);
 
-#if defined(CUTE_DSL_FMHA_ENABLED) || defined(CUTE_DSL_FMHA_V2_ENABLED)
     PluginTensorDesc const& maxSeqLenCarrierDesc = inputDesc[kIN_MAX_SEQLEN_CARRIER_IDX];
     int32_t runtimeMaxSeqLen = static_cast<int32_t>(maxSeqLenCarrierDesc.dims.d[0]);
     int32_t runtimeBatchSize = static_cast<int32_t>(cuSeqLensInputDesc.dims.d[0]) - 1;
-#endif
 
-#ifdef CUTE_DSL_FMHA_ENABLED
+#ifdef CUTE_DSL_FMHA_BLACKWELL_ENABLED
     if (mFMHABackend == ViTFMHABackend::kCUTE_DSL_FMHA_BLACKWELL)
     {
         int32_t totalSeqLen = static_cast<int32_t>(qInputDesc.dims.d[0]);
@@ -386,7 +380,6 @@ int32_t ViTAttentionPlugin::enqueue(PluginTensorDesc const* inputDesc,
         return 0;
     }
 #endif
-#ifdef CUTE_DSL_FMHA_V2_ENABLED
     if (mFMHABackend == ViTFMHABackend::kCUTE_DSL_FMHA_V2)
     {
         int32_t const totalSeqLen = static_cast<int32_t>(qInputDesc.dims.d[0]);
@@ -400,7 +393,6 @@ int32_t ViTAttentionPlugin::enqueue(PluginTensorDesc const* inputDesc,
         }
         return 0;
     }
-#endif
     LOG_ERROR("No ViT FMHA backend is available for plugin '%s'.", mLayerName.c_str());
     return -1;
 }

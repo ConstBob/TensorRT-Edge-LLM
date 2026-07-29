@@ -59,8 +59,11 @@ TensorRT plugins are user-defined layers that implement the `IPluginV2DynamicExt
 Attention kernels are compiled into CUDA binaries. We provide the methods to produce CUDA binaries in `kernelSrcs/`.
 
 **Kernel Libraries**:
-- `fmha_v2`: Context and ViT attention CuTe DSL AOT kernels implemented in
-  `kernelSrcs/fmha_v2_cutedsl/fmha.py` and built with `kernelSrcs/build_cutedsl.py`.
+- `fmha`: Canonical Context and ViT attention CuTe DSL AOT family built with
+  `kernelSrcs/build_cutedsl.py`. It includes the FP16 FMHA-v2 kernels from
+  `kernelSrcs/fmha_v2_cutedsl/fmha.py` on supported GPUs and the optimized
+  Blackwell overlay from `kernelSrcs/fmha_cutedsl_blackwell/fmha.py` on
+  SM100/SM101/SM110.
 - `xqa`: Performant decoding attention kernels developed by NVIDIA. Implements normal decoding and tree-attention decoding.
 
 

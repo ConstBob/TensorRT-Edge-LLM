@@ -239,11 +239,15 @@ def test_default_compile_gpu_arch_is_derived_from_target_sm(sm, expected):
 
 
 @pytest.mark.parametrize("sm", [80, 86, 87, 89, 100, 101, 110, 120, 121])
-def test_fmha_v2_registry_is_complete_for_supported_sms(sm):
-    variants = build_cutedsl.select_variants(sm, "fmha_v2")
+def test_fmha_registry_contains_complete_fmha_v2_set(sm):
+    variants = build_cutedsl.select_variants(sm, "fmha")
+    fmha_v2_variants = [
+        variant for variant in variants
+        if variant.script == "fmha_v2_cutedsl/fmha.py"
+    ]
 
     assert {variant.name
-            for variant in variants} == {
+            for variant in fmha_v2_variants} == {
                 "fmha_v2_d64",
                 "fmha_v2_d64_small",
                 "fmha_v2_d128",
@@ -258,13 +262,18 @@ def test_fmha_v2_registry_is_complete_for_supported_sms(sm):
                 "fmha_v2_vit_d128",
                 "fmha_v2_d256_bidirectional",
             }
-    assert all(variant.script == "fmha_v2_cutedsl/fmha.py"
-               for variant in variants)
-    assert all("--export_only" in variant.script_args for variant in variants)
-    padding_variant = next(variant for variant in variants
+    assert all(variant.group == "fmha" for variant in variants)
+    assert all("--export_only" in variant.script_args
+               for variant in fmha_v2_variants)
+    padding_variant = next(variant for variant in fmha_v2_variants
                            if variant.name == "fmha_v2_d256_padding")
     assert "--is_causal" not in padding_variant.script_args
     assert "--fmha_v2_context" not in padding_variant.script_args
+    optimized_variants = [
+        variant for variant in variants
+        if variant.script == "fmha_cutedsl_blackwell/fmha.py"
+    ]
+    assert bool(optimized_variants) == (sm in [100, 101, 110])
 
 
 @pytest.mark.parametrize("sm", [100, 101, 110])
@@ -283,12 +292,10 @@ def test_fmha_registry_has_one_d512_bidirectional_variant(sm):
                if variant.name.startswith("fmha_d512"))
 
 
-# SM110 uses the FA4-based `fmha` kernels for normal attention, but retains
-# `fmha_v2` for the D256 vision-block mode.
 @pytest.mark.parametrize("sm", [90, 103])
-def test_fmha_v2_registry_rejects_unsupported_sms(sm):
+def test_fmha_registry_rejects_unsupported_sms(sm):
     with pytest.raises(ValueError, match="No variants"):
-        build_cutedsl.select_variants(sm, "fmha_v2")
+        build_cutedsl.select_variants(sm, "fmha")
 
 
 def test_build_allows_f16_moe_for_foreign_target_sm(tmp_path, monkeypatch):

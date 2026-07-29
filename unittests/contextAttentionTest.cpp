@@ -36,8 +36,6 @@
 using namespace nvinfer1;
 using namespace trt_edgellm;
 
-#if defined(CUTE_DSL_FMHA_V2_ENABLED)
-
 void TestContextAttentionAccuracy(std::vector<int32_t> const& cuSeqlens, int32_t numQHeads, int32_t numKVHeads,
     int32_t headSize, int32_t maxSeqLen, bool isPackedViT = false, bool causal = true,
     std::optional<float> attentionScale = std::nullopt)
@@ -463,4 +461,3 @@ TEST(ContextAttentionTest, diffusionGemmaDenoisePaddingVarlen)
     TestContextAttentionDenoisePaddingVarlen({4}, {24});
     TestContextAttentionDenoisePaddingVarlen({4, 3}, {24, 11});
 }
-#endif // defined(CUTE_DSL_FMHA_V2_ENABLED)

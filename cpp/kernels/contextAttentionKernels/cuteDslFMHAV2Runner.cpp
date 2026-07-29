@@ -15,8 +15,6 @@
  * limitations under the License.
  */
 
-#if defined(CUTE_DSL_FMHA_V2_ENABLED)
-
 #include "cuteDslFMHAV2Runner.h"
 
 #include "attentionScaleUtils.h"
@@ -520,5 +518,3 @@ bool CuteDslFMHAV2Runner::run(void const* qPtr, void const* kPtr, void const* vP
 }
 
 } // namespace trt_edgellm
-
-#endif // defined(CUTE_DSL_FMHA_V2_ENABLED)
