@@ -14,7 +14,7 @@
 # limitations under the License.
 """Qwen3-Next Omni CodePredictor — dense decoder head.
 
-- ``lm_head_weight`` is an ONNX input (selected per code group by the runtime).
+- ``lm_heads`` + ``lm_head_idx`` are ONNX inputs (head gathered in-graph).
 - Forward returns ``hidden_states`` for the residual connection.
 """
 import dataclasses
@@ -31,7 +31,7 @@ __all__ = ["Qwen3OmniNextCodePredictorCausalLM"]
 
 
 def _wrap_with_dynamic_lm_head(base: nn.Module) -> nn.Module:
-    """Wrap *base* so its forward takes an extra ``lm_head_weight`` input
+    """Wrap *base* so its forward takes ``lm_heads`` + ``lm_head_idx`` inputs
     and returns ``(logits, hidden_states, *present_kv)``.
 
     ``self._base._model`` is the Qwen3_5CausalLM instance; its forward stashed
@@ -43,16 +43,18 @@ def _wrap_with_dynamic_lm_head(base: nn.Module) -> nn.Module:
         n for n, p in sig.parameters.items()
         if p.kind is p.POSITIONAL_OR_KEYWORD
     ]
-    # Append lm_head_weight as the trailing positional input.
-    new_names = names + ["lm_head_weight"]
+    # Append the stacked heads + device index as trailing positional inputs.
+    new_names = names + ["lm_heads", "lm_head_idx"]
     base_call = ", ".join(names)
     src = (f"def _forward(self, {', '.join(new_names)}):\n"
            f"    out = self._base({base_call})\n"
            f"    m = self._base._model\n"
            f"    last_hidden = m._cp_last_hidden\n"
            f"    full_hidden = m._cp_full_hidden\n"
+           f"    head = lm_heads.index_select(0, "
+           f"lm_head_idx.to(torch.long)).squeeze(0)\n"
            f"    logits = torch.matmul(last_hidden, "
-           f"lm_head_weight.T).to(torch.float32)\n"
+           f"head.T).to(torch.float32)\n"
            f"    return (logits, full_hidden) + tuple(out[1:])\n")
     globs: dict = {"torch": torch}
     exec(src, globs)  # noqa: S102
@@ -68,7 +70,7 @@ def _wrap_with_dynamic_lm_head(base: nn.Module) -> nn.Module:
 
 
 class Qwen3OmniNextCodePredictorCausalLM(Qwen3_5CausalLM):
-    """CodePredictor with dynamic lm_head_weight input + hidden_states output."""
+    """CodePredictor with lm_heads/lm_head_idx inputs + hidden_states output."""
 
     # Keep down_proj.weight in FP32 so the silu*up intermediate stays FP32
     # through the down-projection matmul. Without this the generic dtype-fix
@@ -98,30 +100,35 @@ class Qwen3OmniNextCodePredictorCausalLM(Qwen3_5CausalLM):
         self._cp_full_hidden = hidden  # surfaced by the ONNX wrapper
         last_hidden = torch.ops.trt.gather_nd(hidden, last_token_ids)
         self._cp_last_hidden = last_hidden  # used by wrapper for dynamic lm_head
-        # The base's static lm_head is unused at runtime (replaced by
-        # lm_head_weight input), but we still produce logits here so the
-        # parent spec stays type-consistent - ONNX optimisation drops it.
+        # The base's static lm_head is unused at runtime (replaced by the
+        # gathered head), but we still produce logits here so the parent
+        # spec stays type-consistent - ONNX optimisation drops it.
         logits = self.lm_head(last_hidden).to(torch.float32)
         return (logits, present_kv, present_conv, present_rec)
 
     def onnx_export_spec(self) -> OnnxSpec:
         spec = super().onnx_export_spec()
-        # Add lm_head_weight input + re-signature the wrapper; replace output
-        # list with (logits, hidden_states, *present_key_values).  present_conv
-        # / present_rec are omitted because Ng=0 for the 5-layer dense CP.
+        # Add lm_heads/lm_head_idx inputs + re-signature the wrapper; replace
+        # output list with (logits, hidden_states, *present_key_values).
+        # present_conv / present_rec are omitted because Ng=0 for the dense CP.
         config = self.config
-        lm_head_weight = torch.zeros(config.vocab_size,
-                                     config.hidden_size,
-                                     dtype=torch.float16,
-                                     device=next(self.parameters()).device)
+        num_heads = config.num_code_groups - 1
+        assert num_heads > 0, "num_code_groups missing from CP config"
+        device = next(self.parameters()).device
+        lm_heads = torch.zeros(num_heads,
+                               config.vocab_size,
+                               config.hidden_size,
+                               dtype=torch.float16,
+                               device=device)
+        lm_head_idx = torch.zeros(1, dtype=torch.int32, device=device)
         Na = config.num_attn_layers
         output_names = (["logits", "hidden_states"] +
                         [f"present_key_values_{i}" for i in range(Na)])
         return dataclasses.replace(
             spec,
             wrapped=_wrap_with_dynamic_lm_head(spec.wrapped),
-            args=spec.args + (lm_head_weight, ),
-            input_names=list(spec.input_names) + ["lm_head_weight"],
+            args=spec.args + (lm_heads, lm_head_idx),
+            input_names=list(spec.input_names) + ["lm_heads", "lm_head_idx"],
             output_names=output_names,
-            dynamic_shapes=list(spec.dynamic_shapes) + [{}],
+            dynamic_shapes=list(spec.dynamic_shapes) + [{}, {}],
         )

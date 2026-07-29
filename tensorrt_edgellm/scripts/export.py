@@ -2771,6 +2771,7 @@ def _export_omni_next_code_predictor(model_dir: str, out_dir: str) -> None:
         sys.exit(1)
     key_prefix = ("code_predictor."
                   if talker_is_root else "talker.code_predictor.")
+    cp_cfg["num_code_groups"] = talker.get("num_code_groups", 16)
 
     _export_sub_llm(
         model_dir,
@@ -2878,7 +2879,7 @@ def _export_code_predictor(model_dir: str, cp_out_dir: str,
     differs (used by the C++ runtime for identification).
 
     The CodePredictor has:
-    - ``lm_head_weight`` as an ONNX input (dynamic, 15 different heads)
+    - ``lm_heads`` + ``lm_head_idx`` as ONNX inputs (head gathered in-graph)
     - ``hidden_states`` as an additional output (for residual connection)
     - MLP FP16 overflow WAR applied to all layers
 
@@ -2914,6 +2915,9 @@ def _export_code_predictor(model_dir: str, cp_out_dir: str,
                        if talker_is_root else "talker.code_predictor.")
 
     from ..models.qwen3_tts import CodePredictorCausalLM
+
+    # onnx_export_spec needs the head count for the stacked lm_heads input.
+    cp_cfg["num_code_groups"] = talker_cfg.get("num_code_groups", 16)
 
     _export_sub_llm(
         model_dir,

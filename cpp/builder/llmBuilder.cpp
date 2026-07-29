@@ -1268,7 +1268,7 @@ bool LLMBuilder::setupLmHeadWeightProfiles(nvinfer1::IOptimizationProfile& conte
 {
     bool result = true;
 
-    // Detect if lm_head_weight input exists (CodePredictor model)
+    // Detect if lm_head_weight input exists (gemma4 assistant)
     bool hasLmHeadWeight = false;
     for (int32_t idx = 0; idx < network.getNbInputs(); idx++)
     {
