@@ -22,10 +22,14 @@ workflow:
     # Skip draft MRs completely
     - if: $CI_MERGE_REQUEST_TITLE =~ /^(\[Draft\]|\(Draft\)|Draft:)/
       when: never
-    # Run for non-draft MRs (L0 tests)
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    # Run for L1 tests (manual trigger with L1=true)
+    # Run explicitly selected L1 pipelines, including existing schedules.
     - if: $L1 == "true"
+    # Run scheduled L0 stability pipelines only when explicitly selected.
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $L0_STABILITY == "true"
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    # Run for non-draft MRs (L0 tests).
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     # Run for main/release branches
     - if: $CI_COMMIT_BRANCH == "main"
     - if: $CI_COMMIT_BRANCH =~ /^release/

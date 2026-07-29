@@ -1,6 +1,6 @@
 # ==============================================================================
 # LOCAL BOARD JOBS - Native build and unit tests on physical boards
-# Shell executor (no container), triggered on MRs
+# Shell executor, triggered on MRs and L0_STABILITY=true schedules
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
