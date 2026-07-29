@@ -255,7 +255,7 @@ l0_b100:
   image: "$IMAGE"
   extends:
     - .x86_test_template
-    - .l0_manual_rules
+    - .l0_rules
     - .l0_environment
   interruptible: true
 
@@ -325,9 +325,7 @@ l0_nemo_eval_rtx5090:
   allow_failure: true
   interruptible: true
 
-# Unit tests for low-level components (attention kernels, etc.). Automatic x86
-# SKUs stage sm_80 and sm_120 artifacts; B100/sm_100 stays available as manual
-# jobs below while the B100 runner is unstable.
+# Unit tests for low-level components (attention kernels, etc.).
 l0_unit_tests_x86:
   stage: l0_test
   needs:
@@ -412,7 +410,7 @@ l0_unit_tests_x86_b100:
   image: "$IMAGE"
   extends:
     - .x86_unit_test_template
-    - .l0_manual_rules
+    - .l0_rules
     - .l0_environment
   interruptible: true
 
@@ -438,7 +436,7 @@ l0_unit_tests_x86_trt11_b100:
   image: "$IMAGE"
   extends:
     - .x86_unit_test_template
-    - .l0_manual_rules
+    - .l0_rules
     - .l0_environment
   interruptible: true
 
