@@ -38,6 +38,7 @@ Usage (from LLM object)::
 import argparse
 import asyncio
 import base64
+import io
 import json
 import logging
 import os
@@ -45,13 +46,15 @@ import re
 import threading
 import time
 import uuid
+import wave
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import anthropic_compat as _anthropic
 from .batching import BatcherOverflow, RequestBatcher, resolve_batch_size
-from .engine import (SamplingParams, _normalize_logit_bias,
-                     _validate_logit_bias_spec_decode, finish_reason_name)
+from .engine import (OMNI_AUDIO_SAMPLE_RATE, AudioParams, SamplingParams,
+                     _normalize_logit_bias, _validate_logit_bias_spec_decode,
+                     finish_reason_name)
 from .tool_calling import (ToolConfig, parse_assistant_output,
                            validate_tool_request)
 
@@ -277,6 +280,145 @@ def _run_nonstream(llm_instance, batcher, admission, build_request):
         admission.release()
 
 
+def _parse_audio_request(body: Dict[str, Any], llm_instance):
+    """Parse OpenAI-style ``modalities`` / ``audio`` request fields.
+
+    Talker knobs are namespaced inside the ``audio`` object (they must not
+    collide with text sampling fields like ``repetition_penalty``). Returns
+    ``(AudioParams | None, error_message | None)``; AudioParams is non-None
+    only when the request asks for audio output.
+    """
+    modalities = body.get("modalities")
+    if modalities is None:
+        return None, None
+    if (not isinstance(modalities, list)
+            or any(m not in ("text", "audio") for m in modalities)):
+        return None, ("'modalities' must be a list containing only "
+                      "'text' and/or 'audio'")
+    if "audio" not in modalities:
+        return None, None
+    if not llm_instance.omni_capable:
+        return None, ("audio output requested but no Omni audio engines "
+                      "(talker/code_predictor/code2wav) are loaded")
+    audio_cfg = body.get("audio") or {}
+    if not isinstance(audio_cfg, dict):
+        return None, "'audio' must be an object"
+    fmt = audio_cfg.get("format", "pcm16")
+    if fmt != "pcm16":
+        return None, "only audio format 'pcm16' is supported"
+    voice = audio_cfg.get("voice", "")
+    voice_error = _validate_voice(llm_instance, voice)
+    if voice_error:
+        return None, voice_error
+
+    params = AudioParams(voice=voice)
+    error = _apply_talker_knobs(audio_cfg, params, field_prefix="audio.")
+    if error:
+        return None, error
+    return params, None
+
+
+def _validate_voice(llm_instance, voice) -> Optional[str]:
+    """Reject unknown voice names instead of silently using the default.
+
+    Empty voice selects the model default; an empty speaker map (model
+    exposes none) skips validation. Returns an error message or None.
+    """
+    if not isinstance(voice, str):
+        return "'voice' must be a string"
+    if not voice:
+        return None
+    voices = llm_instance.list_voices()
+    if voices and voice not in voices:
+        return f"unknown voice '{voice}'; available: {', '.join(voices)}"
+    return None
+
+
+def _json_error(message: str, status_code: int = 400):
+    """JSON error response in the OpenAI-style ``{"error": ...}`` shape."""
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=status_code, content={"error": message})
+
+
+def _inference_error_response(exc: Exception):
+    """Map an inference exception to the shared 400/413/500 JSON response.
+
+    Input longer than the engine's built max_input_len raises with an
+    EDGELLM_INPUT_TOO_LONG marker -> 413 (rebuild the engine with a larger
+    --maxInputLen to accept longer prompts / larger tool lists).
+    """
+    if isinstance(exc, (ValueError, KeyError)):
+        return _json_error(f"Invalid messages: {exc}")
+    if "EDGELLM_INPUT_TOO_LONG" in str(exc):
+        return _json_error(str(exc), status_code=413)
+    logger.exception("Inference failed")
+    return _json_error(str(exc), status_code=500)
+
+
+def _completion_response(llm_instance,
+                         response_id,
+                         message,
+                         finish_reason,
+                         completion_tokens,
+                         logprobs=None,
+                         prompt_tokens: Optional[int] = None):
+    """chat.completion envelope for responses assembled outside the runtime
+    response object (the audio path aggregates streamed deltas)."""
+    return {
+        "id":
+        response_id,
+        "object":
+        "chat.completion",
+        "created":
+        int(time.time()),
+        "model":
+        llm_instance._model_id,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "logprobs": logprobs,
+            "finish_reason": finish_reason,
+        }],
+        "usage":
+        _usage_body(prompt_tokens, completion_tokens),
+    }
+
+
+#: Talker knob -> (type, minimum). Keys match AudioParams attribute names.
+_TALKER_KNOBS = {
+    "talker_temperature": (float, 0),
+    "talker_top_p": (float, 0),
+    "repetition_penalty": (float, 0),
+    "talker_top_k": (int, 0),
+    "max_audio_length": (int, 1),
+    "codec_chunk_frames": (int, 1),
+    "talker_prefill_threshold": (int, 1),
+}
+
+
+def _apply_talker_knobs(cfg: Dict[str, Any], params: AudioParams,
+                        field_prefix: str) -> Optional[str]:
+    """Validate and apply Talker sampling / chunking knobs from ``cfg``.
+
+    Shared by the chat-completions ``audio`` object and the
+    ``/v1/audio/speech`` body. Returns an error message, or None on success.
+    """
+    for name, (typ, minimum) in _TALKER_KNOBS.items():
+        if name not in cfg:
+            continue
+        value = cfg[name]
+        if isinstance(
+                value,
+                bool) or not isinstance(value, int if typ is int else
+                                        (int, float)):
+            kind = "an integer" if typ is int else "a number"
+            return f"'{field_prefix}{name}' must be {kind}"
+        if value < minimum:
+            return f"'{field_prefix}{name}' must be >= {minimum}"
+        setattr(params, name, typ(value))
+    return None
+
+
 def _create_app(llm_instance,
                 *,
                 enable_batching: bool = False,
@@ -286,7 +428,7 @@ def _create_app(llm_instance,
     """Create a FastAPI app backed by the given LLM instance."""
     try:
         from fastapi import FastAPI, File, Form, UploadFile
-        from fastapi.responses import JSONResponse, PlainTextResponse
+        from fastapi.responses import JSONResponse, PlainTextResponse, Response
     except ImportError as exc:
         raise RuntimeError("FastAPI is required for the server. "
                            "Install: pip install fastapi uvicorn") from exc
@@ -407,6 +549,9 @@ def _create_app(llm_instance,
                                 content=payload,
                                 headers={"Retry-After": "1"})
 
+        if not getattr(llm_instance, "text_capable", True):
+            return _err(400, "this is a TTS-only server; "
+                        "use /v1/audio/speech")
         if not body.get("messages"):
             return _err(400, "messages: field required")
         max_tokens = body.get("max_tokens")
@@ -533,6 +678,10 @@ def _create_app(llm_instance,
     def anthropic_count_tokens(body: Dict[str, Any]):
         """Claude Code polls this for context management; a 404 here has
         destabilized other servers under the request flood."""
+        if not getattr(llm_instance, "text_capable", True):
+            code, payload = _anthropic.error_response(
+                400, "this is a TTS-only server; use /v1/audio/speech")
+            return JSONResponse(status_code=code, content=payload)
         if not body.get("messages"):
             code, payload = _anthropic.error_response(
                 400, "messages: field required")
@@ -552,6 +701,20 @@ def _create_app(llm_instance,
             count = max(1, chars // 4)
         return {"input_tokens": count}
 
+    @app.get("/v1/voices")
+    def list_voices():
+        """Speaker names accepted as ``voice`` in audio requests."""
+        if not getattr(llm_instance, "omni_capable", False):
+            return _json_error("no TTS engines loaded on this server")
+        return {
+            "object":
+            "list",
+            "data": [{
+                "id": name,
+                "object": "voice"
+            } for name in llm_instance.list_voices()],
+        }
+
     @app.get("/v1/models")
     def list_models():
         return {
@@ -567,6 +730,9 @@ def _create_app(llm_instance,
     @app.post("/v1/chat/completions")
     def chat_completions(body: Dict[str, Any]):
         messages = body.get("messages", [])
+        if not getattr(llm_instance, "text_capable", True):
+            return _json_error(
+                "this is a TTS-only server; use /v1/audio/speech")
         if not messages:
             return JSONResponse(status_code=400,
                                 content={"error": "messages required"})
@@ -669,6 +835,14 @@ def _create_app(llm_instance,
                 enable_thinking=enable_thinking,
             )
 
+        audio_params, audio_error = _parse_audio_request(body, llm_instance)
+        if audio_error:
+            return _json_error(audio_error)
+        if audio_params is not None and tools:
+            return _json_error("tools with audio output not supported")
+        if audio_params is not None and num_logprobs > 0:
+            return _json_error("logprobs with audio output not supported")
+
         response_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         params = SamplingParams(
             temperature=temperature,
@@ -685,6 +859,11 @@ def _create_app(llm_instance,
         # OpenAI: "logprobs": true without "top_logprobs" returns the chosen
         # token's logprob with an empty top_logprobs list.
         include_top_logprobs = req_top_logprobs is not None
+
+        if not stream and audio_params is not None:
+            return _omni_completion(llm_instance, messages, params,
+                                    audio_params, response_id, admission,
+                                    prompt_tokens)
 
         if stream:
             # Streams can't batch: admit + take the runtime slot, both
@@ -725,6 +904,7 @@ def _create_app(llm_instance,
                     prompt_tokens=prompt_tokens,
                     prebuilt_request=prebuilt_request,
                     handoff=handoff,
+                    audio_params=audio_params,
                 ),
                 handoff.release_if_unstarted,
                 media_type="text/event-stream",
@@ -754,15 +934,7 @@ def _create_app(llm_instance,
                 content={"error": f"Invalid messages: {exc}"},
             )
         except Exception as exc:
-            # Input longer than the engine's built max_input_len: the C++ runtime
-            # raises with an EDGELLM_INPUT_TOO_LONG marker. Surface it as 413 with a
-            # clear message instead of an opaque 500 (rebuild engine with larger
-            # --maxInputLen to accept longer prompts / larger tool lists).
-            if "EDGELLM_INPUT_TOO_LONG" in str(exc):
-                return JSONResponse(status_code=413,
-                                    content={"error": str(exc)})
-            logger.exception("Inference failed")
-            return JSONResponse(status_code=500, content={"error": str(exc)})
+            return _inference_error_response(exc)
 
         return _build_chat_completion_response(
             llm_instance,
@@ -773,6 +945,77 @@ def _create_app(llm_instance,
             include_top_logprobs=include_top_logprobs,
             include_logprobs=num_logprobs > 0,
             prompt_tokens=prompt_tokens,
+        )
+
+    @app.post("/v1/audio/speech")
+    def audio_speech(body: Dict[str, Any]):
+        """OpenAI-style TTS endpoint (Qwen3-TTS / Qwen3-Omni Talker).
+
+        ``response_format: "pcm"`` (default) streams raw int16 mono PCM at
+        24 kHz as chunks are vocoded; ``"wav"`` aggregates and returns one
+        WAV file. Talker knobs (``talker_temperature`` etc.) sit at the top
+        level of the body.
+        """
+        if not getattr(llm_instance, "omni_capable", False):
+            return _json_error("no TTS engines loaded on this server")
+        text = body.get("input")
+        if not isinstance(text, str) or not text.strip():
+            return _json_error("'input' must be a non-empty string")
+        if len(text) > 4096:
+            return _json_error("'input' must be at most 4096 characters")
+        voice = body.get("voice", "")
+        voice_error = _validate_voice(llm_instance, voice)
+        if voice_error:
+            return _json_error(voice_error)
+        response_format = body.get("response_format", "pcm")
+        if response_format not in ("pcm", "wav"):
+            return _json_error("only response_format 'pcm' (streamed) and "
+                               "'wav' are supported")
+        params = AudioParams(voice=voice)
+        error = _apply_talker_knobs(body, params, field_prefix="")
+        if error:
+            return _json_error(error)
+
+        # Synthesis is admitted like chat and takes the single runtime slot;
+        # both non-blocking, then handed to the worker (see the queue-size
+        # note) so a join timeout cannot free them mid-call.
+        if not admission.try_acquire():
+            return _overloaded_response()
+        sem = llm_instance._admission()
+        if not sem.acquire(blocking=False):
+            admission.release()
+            return _overloaded_response()
+        handoff = _AdmissionHandoff(sem, on_release=admission.release)
+
+        def _pcm_chunks():
+            for delta in llm_instance.generate_speech_stream(
+                    text, params, admission_handoff=handoff):
+                if delta.audio_bytes:
+                    yield delta.audio_bytes
+
+        if response_format == "wav":
+            try:
+                buf = io.BytesIO()
+                with wave.open(buf, "wb") as wav:
+                    wav.setnchannels(1)
+                    wav.setsampwidth(2)
+                    wav.setframerate(OMNI_AUDIO_SAMPLE_RATE)
+                    wav.writeframes(b"".join(_pcm_chunks()))
+            except Exception as exc:
+                return _inference_error_response(exc)
+            finally:
+                handoff.release_if_unstarted()
+            return Response(content=buf.getvalue(), media_type="audio/wav")
+
+        return _releasing_streaming_response(
+            _pcm_chunks(),
+            handoff.release_if_unstarted,
+            media_type="audio/pcm",
+            headers={
+                "X-Sample-Rate": str(OMNI_AUDIO_SAMPLE_RATE),
+                "X-Channels": "1",
+                "X-Sample-Format": "s16le",
+            },
         )
 
     @app.post("/v1/audio/transcriptions")
@@ -973,6 +1216,64 @@ def _sse_error(message: str) -> str:
     return "data: " + json.dumps({"error": {"message": message}}) + "\n\n"
 
 
+def _omni_completion(llm_instance, messages, params, audio_params, response_id,
+                     admission, prompt_tokens):
+    """Non-streaming Omni completion: run the streaming pipeline internally
+    and return the aggregated text plus one base64 PCM audio blob.
+
+    Admitted like any other request; both gates are taken non-blocking here
+    (a parked pool thread would starve the streaming generators that release
+    them) and handed to the worker.
+    """
+    if not admission.try_acquire():
+        return _overloaded_response()
+    sem = llm_instance._admission()
+    if not sem.acquire(blocking=False):
+        admission.release()
+        return _overloaded_response()
+    handoff = _AdmissionHandoff(sem, on_release=admission.release)
+    text_parts: List[str] = []
+    pcm_parts: List[bytes] = []
+    token_count = 0
+    finish_reason: Optional[str] = None
+    try:
+        for delta in llm_instance.generate_stream_with_audio(
+                messages,
+                params,
+                audio_params=audio_params,
+                admission_handoff=handoff):
+            if delta.text:
+                text_parts.append(delta.text)
+            token_count += len(delta.token_ids)
+            if delta.audio_bytes:
+                pcm_parts.append(delta.audio_bytes)
+            if delta.finished:
+                finish_reason = delta.finish_reason
+    except Exception as exc:
+        return _inference_error_response(exc)
+    finally:
+        handoff.release_if_unstarted()
+
+    full_text = "".join(text_parts).replace(IM_END_TOKEN, "")
+    reasoning, content = _split_reasoning_and_content(full_text)
+    message: Dict[str, Any] = {"role": "assistant", "content": content}
+    if reasoning:
+        message["reasoning"] = reasoning
+    message["audio"] = {
+        "id": f"audio-{response_id}",
+        "data": base64.b64encode(b"".join(pcm_parts)).decode(),
+        "format": "pcm16",
+        "sample_rate": OMNI_AUDIO_SAMPLE_RATE,
+        "transcript": content or "",
+    }
+    return _completion_response(llm_instance,
+                                response_id,
+                                message,
+                                finish_reason or "stop",
+                                token_count,
+                                prompt_tokens=prompt_tokens)
+
+
 def _generate_stream_sse(llm_instance,
                          messages,
                          params,
@@ -983,16 +1284,15 @@ def _generate_stream_sse(llm_instance,
                          include_usage: bool = False,
                          prompt_tokens: Optional[int] = None,
                          prebuilt_request=None,
-                         handoff=None):
+                         handoff=None,
+                         audio_params: Optional[AudioParams] = None):
     """Yield SSE chunks via StreamChannel streaming. ``handoff`` carries the
     admission gate; it is only released here while no worker owns it."""
     try:
-        yield from _generate_stream_sse_inner(llm_instance, messages, params,
-                                              response_id, enable_thinking,
-                                              tool_config,
-                                              include_top_logprobs,
-                                              include_usage, prompt_tokens,
-                                              prebuilt_request, handoff)
+        yield from _generate_stream_sse_inner(
+            llm_instance, messages, params, response_id, enable_thinking,
+            tool_config, include_top_logprobs, include_usage, prompt_tokens,
+            prebuilt_request, handoff, audio_params)
     finally:
         if handoff is not None:
             handoff.release_if_unstarted()
@@ -1008,8 +1308,14 @@ def _generate_stream_sse_inner(llm_instance,
                                include_usage: bool = False,
                                prompt_tokens: Optional[int] = None,
                                prebuilt_request=None,
-                               handoff=None):
-    """Yield SSE chunks via StreamChannel streaming."""
+                               handoff=None,
+                               audio_params: Optional[AudioParams] = None):
+    """Yield SSE chunks via StreamChannel streaming.
+
+    With ``audio_params`` set (mutually exclusive with tools/logprobs), the
+    Omni dual-stream pipeline runs instead and PCM chunks are interleaved as
+    ``delta.audio`` per the OpenAI chat-completions audio schema.
+    """
     model_name = llm_instance._model_id
     created = int(time.time())
 
@@ -1036,20 +1342,30 @@ def _generate_stream_sse_inner(llm_instance,
         return
 
     sm = _ThinkingStateMachine(enable_thinking)
+    audio_id = f"audio-{response_id}"
     finish_reason: Optional[str] = None
     error_message: Optional[str] = None
     completion_tokens = 0
     stream_tools = tool_config.tools if tool_config else None
     stream_tool_choice = tool_config.tool_choice if tool_config else None
 
+    if audio_params is not None:
+        deltas = llm_instance.generate_stream_with_audio(
+            messages,
+            params,
+            audio_params=audio_params,
+            prebuilt_request=prebuilt_request,
+            admission_handoff=handoff)
+    else:
+        deltas = llm_instance.generate_stream(
+            messages,
+            params,
+            tools=stream_tools,
+            tool_choice=stream_tool_choice,
+            prebuilt_request=prebuilt_request,
+            admission_handoff=handoff)
     try:
-        for delta in llm_instance.generate_stream(
-                messages,
-                params,
-                tools=stream_tools,
-                tool_choice=stream_tool_choice,
-                prebuilt_request=prebuilt_request,
-                admission_handoff=handoff):
+        for delta in deltas:
             completion_tokens += len(delta.token_ids or [])
             lp_obj: Optional[Dict[str, Any]] = None
             if delta.logprobs:
@@ -1084,6 +1400,15 @@ def _generate_stream_sse_inner(llm_instance,
                     lp_obj = None  # logprobs only on the first chunk per delta
             if lp_obj is not None:
                 yield emit({}, logprobs=lp_obj)
+            if delta.audio_bytes:
+                yield emit({
+                    "audio": {
+                        "id": audio_id,
+                        "data": base64.b64encode(delta.audio_bytes).decode(),
+                        "format": "pcm16",
+                        "sample_rate": OMNI_AUDIO_SAMPLE_RATE,
+                    }
+                })
             if delta.finished:
                 finish_reason = delta.finish_reason or "stop"
     except Exception as exc:
@@ -1094,7 +1419,10 @@ def _generate_stream_sse_inner(llm_instance,
     for field, text in sm.flush():
         yield emit({field: text})
 
-    if error_message and "EDGELLM_INPUT_TOO_LONG" in error_message:
+    # Audio requests surface every mid-stream failure (talker/vocode errors
+    # must not truncate silently); the text path keeps its narrower contract.
+    if error_message and (audio_params is not None
+                          or "EDGELLM_INPUT_TOO_LONG" in error_message):
         yield _sse_error(error_message)
     yield emit({}, finish_reason=finish_reason or "stop")
     if include_usage:

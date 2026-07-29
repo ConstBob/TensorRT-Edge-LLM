@@ -42,7 +42,7 @@ import math
 import os
 import sys
 import threading
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Sequence, Union
 
@@ -137,13 +137,172 @@ class CompletionOutput:
 
 @dataclass
 class StreamDelta:
-    """Single delta from a streaming generation."""
+    """Single delta from a streaming generation.
+
+    Text deltas carry ``text``/``token_ids``; audio deltas (Omni streaming)
+    carry ``audio_bytes`` (int16 LE mono PCM) instead. ``finished`` marks the
+    end of the text stream; generator exhaustion ends the audio stream.
+    """
 
     text: str = ""
     token_ids: List[int] = field(default_factory=list)
     finished: bool = False
     finish_reason: Optional[str] = None
     logprobs: List[List[LogprobEntry]] = field(default_factory=list)
+    audio_bytes: Optional[bytes] = None
+
+
+@dataclass
+class AudioParams:
+    """Talker / vocoder knobs for one Omni audio-output request."""
+
+    voice: str = ""
+    talker_temperature: float = 0.9
+    talker_top_k: int = 50
+    talker_top_p: float = 1.0
+    repetition_penalty: float = 1.05
+    max_audio_length: int = 4096
+    codec_chunk_frames: int = 10
+    talker_prefill_threshold: int = 4
+
+
+#: Sample rate of Omni Code2Wav PCM output.
+OMNI_AUDIO_SAMPLE_RATE = 24000
+
+
+def _native_audio_params(rt, audio: "AudioParams"):
+    """Convert the AudioParams dataclass to the pybind OmniAudioParams."""
+    omni_params = rt.OmniAudioParams()
+    omni_params.speaker_name = audio.voice
+    for name, value in asdict(audio).items():
+        if name != "voice":
+            setattr(omni_params, name, value)
+    return omni_params
+
+
+def _pump_channels(rt,
+                   run,
+                   text_channel,
+                   audio_channel,
+                   sem=None,
+                   admission_handoff=None):
+    """Drive one generation in a worker thread, yielding StreamDeltas.
+
+    Shared by the Omni dual-stream path (both channels) and the standalone
+    TTS path (``text_channel=None``). The drain-once retry after
+    is_finished()/is_cancelled() closes the race where the producer finishes
+    between an empty pop and the check. ``sem``/``admission_handoff`` follow
+    the generate_stream contract: the worker owns the admission gate and
+    releases it when the C++ call returns.
+    """
+    error_holder = [None]
+
+    def _run():
+        try:
+            run()
+        except Exception as error:  # noqa: BLE001 - re-raised below
+            error_holder[0] = error
+            if text_channel is not None:
+                text_channel.cancel()
+            audio_channel.cancel()
+        finally:
+            if sem is not None:
+                sem.release()
+            if admission_handoff is not None:
+                admission_handoff.release()
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    if admission_handoff is not None:
+        # The worker owns the gate now: a join timeout below must not
+        # release it while the C++ call is still running.
+        admission_handoff.worker_started()
+
+    text_done = text_channel is None
+    audio_done = False
+    try:
+        while not (text_done and audio_done):
+            if not text_done:
+                chunk = text_channel.wait_pop(timeout_ms=20)
+                if chunk is None and (text_channel.is_finished()
+                                      or text_channel.is_cancelled()):
+                    chunk = text_channel.try_pop()
+                    if chunk is None:
+                        text_done = True
+                if chunk is not None:
+                    reason = finish_reason_name(
+                        rt, chunk.reason) if chunk.finished else None
+                    yield StreamDelta(
+                        text=chunk.text,
+                        token_ids=list(chunk.token_ids),
+                        finished=chunk.finished,
+                        finish_reason=reason,
+                        logprobs=_convert_logprobs(chunk.logprobs),
+                    )
+                    text_done = chunk.finished
+
+            if not audio_done:
+                # Text drives pacing while it flows (non-blocking audio poll);
+                # once text ends, block on audio instead.
+                audio_chunk = audio_channel.wait_pop(
+                    timeout_ms=100 if text_done else 0)
+                if audio_chunk is None and (audio_channel.is_finished()
+                                            or audio_channel.is_cancelled()):
+                    audio_chunk = audio_channel.try_pop()
+                    if audio_chunk is None:
+                        audio_done = True
+                if audio_chunk is not None:
+                    if audio_chunk.pcm16:
+                        yield StreamDelta(audio_bytes=audio_chunk.pcm16)
+                    audio_done = audio_chunk.is_final
+    finally:
+        # Reached normally or via generator close (client disconnect).
+        # Cancelling the text channel stops the Thinker decode loop; the
+        # audio cancel stops vocoding.
+        if not (text_done and audio_done):
+            if text_channel is not None:
+                text_channel.cancel()
+            audio_channel.cancel()
+        worker.join(timeout=30.0)
+    if error_holder[0] is not None:
+        raise error_holder[0]
+
+
+def _stream_tts(rt,
+                runtime,
+                text: str,
+                audio: "AudioParams",
+                sem,
+                admission_handoff=None,
+                infer_guard=None) -> Generator["StreamDelta", None, None]:
+    """Run one standalone TTS request; yields audio-only StreamDeltas.
+
+    ``runtime`` is any pybind object exposing ``handle_request_tts``
+    (LLMRuntime with the Omni stack loaded, or the TTS-only TTSRuntime).
+    Gate ownership follows generate_stream: ``sem`` is acquired here for
+    direct Python callers, while the HTTP layer instead takes it
+    non-blocking and hands it over as ``admission_handoff``. ``infer_guard``
+    serializes against text inference sharing the same CUDA stream (unused
+    by the TTS-only runtime, which serves no text).
+    """
+    omni_params = _native_audio_params(rt, audio)
+    audio_channel = rt.AudioStreamChannel()
+    if sem is not None:
+        sem.acquire()
+
+    def _run():
+        if infer_guard is None:
+            runtime.handle_request_tts(text, omni_params, audio_channel)
+            return
+        with infer_guard:
+            runtime.handle_request_tts(text, omni_params, audio_channel)
+
+    yield from _pump_channels(rt,
+                              _run,
+                              None,
+                              audio_channel,
+                              sem=sem,
+                              admission_handoff=admission_handoff)
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +579,9 @@ class LLM:
     directory layouts.
     """
 
+    #: Distinguishes full LLM servers from TTS-only ones in the API layer.
+    text_capable = True
+
     def __init__(
         self,
         model: str = "",
@@ -436,6 +598,9 @@ class LLM:
         draft_top_k: int = 10,
         draft_step: int = 6,
         verify_tree_size: int = 60,
+        talker_engine_dir: str = "",
+        code_predictor_engine_dir: str = "",
+        code2wav_engine_dir: str = "",
     ):
         sources = sum(bool(s) for s in (model, onnx_dir, engine_dir))
         if sources != 1:
@@ -455,6 +620,10 @@ class LLM:
         multimodal_engine_dir = multimodal_engine_dir or visual_engine_dir
 
         self._model_id = _derive_model_id(model, onnx_dir, engine_dir)
+        self._omni_capable = False
+        self._talker_engine_dir = talker_engine_dir
+        self._code_predictor_engine_dir = code_predictor_engine_dir
+        self._code2wav_engine_dir = code2wav_engine_dir
         self._eagle_engine_dir = eagle_engine_dir
         self._draft_top_k = draft_top_k
         self._draft_step = draft_step
@@ -670,7 +839,35 @@ class LLM:
                 {},
             )
         self._runtime.capture_decoding_cuda_graph()
+        self._load_omni_runtime()
         logger.info("Engine loaded and ready.")
+
+    def _load_omni_runtime(self) -> None:
+        """Load the Qwen3-Omni audio-output stack when its engines exist."""
+        from .engine_layout import find_omni_engine_dirs
+
+        dirs = {
+            "talker": self._talker_engine_dir,
+            "code_predictor": self._code_predictor_engine_dir,
+            "code2wav": self._code2wav_engine_dir,
+        }
+        explicit = any(dirs.values())
+        if not all(dirs.values()):
+            auto = find_omni_engine_dirs(self._engine_dir) or {}
+            dirs = {k: v or auto.get(k, "") for k, v in dirs.items()}
+            if not all(dirs.values()):
+                if explicit:
+                    raise ValueError(
+                        "Omni engine dirs partially specified and the rest "
+                        f"could not be auto-detected: {dirs}")
+                return
+            logger.info("Auto-detected Omni engines: talker=%s",
+                        dirs["talker"])
+
+        self._runtime.load_omni(dirs["talker"], dirs["code_predictor"],
+                                dirs["code2wav"], self._engine_dir)
+        self._omni_capable = True
+        logger.info("Omni audio output ready.")
 
     # ------------------------------------------------------------------
     # Pipeline stages
@@ -1092,14 +1289,25 @@ class LLM:
                                                threading.Semaphore(1))
         return sem
 
-    def _handle_request(self, request):
-        """Serialized entry to the C++ runtime."""
+    def _infer_guard(self):
+        """Lock serializing every entry into the C++ runtime.
+
+        The batcher runs on its own worker and takes only this lock, never
+        the admission semaphore, so the audio paths — which call the runtime
+        directly rather than through _handle_request — must take it too.
+        """
         lock = self.__dict__.get("_infer_lock")
         if lock is None:
             with LLM._infer_lock_guard:
                 lock = self.__dict__.setdefault("_infer_lock",
                                                 threading.Lock())
-        with lock:
+        return lock
+
+    def _handle_request(self, request):
+        """Serialized entry to the C++ runtime."""
+        # Called unbound on duck-typed objects too, so reach the guard
+        # through the class rather than the instance.
+        with LLM._infer_guard(self):
             return self._runtime.handle_request(request)
 
     def generate(
@@ -1282,9 +1490,102 @@ class LLM:
         if error_holder[0] is not None:
             raise error_holder[0]
 
+    def generate_stream_with_audio(
+        self,
+        messages: List[Dict[str, Any]],
+        sampling_params: Optional[SamplingParams] = None,
+        *,
+        audio_params: Optional[AudioParams] = None,
+        prebuilt_request: Optional[Any] = None,
+        admission_handoff: Optional[Any] = None,
+    ) -> Generator[StreamDelta, None, None]:
+        """Stream text and audio deltas for a single Omni request.
+
+        Runs the Thinker-Talker streaming pipeline in a background thread.
+        Text deltas arrive through a ``StreamChannel`` and PCM chunks through
+        an ``AudioStreamChannel``; the two are interleaved into one generator.
+        Admission follows generate_stream: the HTTP layer owns the gate when
+        it passes ``prebuilt_request``; otherwise it is acquired here.
+        """
+        if not self.omni_capable:
+            raise ValueError("Omni audio output not available: talker / "
+                             "code_predictor / code2wav engines not loaded.")
+        params = sampling_params or SamplingParams()
+
+        channel = self._rt.StreamChannel.create()
+        channel.set_skip_special_tokens(True)
+        audio_channel = self._rt.AudioStreamChannel()
+        omni_params = _native_audio_params(self._rt, audio_params
+                                           or AudioParams())
+        # The HTTP layer takes the slot non-blocking and hands it over (with
+        # or without a prebuilt request); direct Python callers acquire here.
+        owns_gate = (prebuilt_request is not None
+                     or admission_handoff is not None)
+        sem = None if owns_gate else self._admission()
+        if sem is not None:
+            sem.acquire()
+        try:
+            if prebuilt_request is not None:
+                request = prebuilt_request
+                request.stream_channels = [channel]
+            else:
+                request = self._make_generation_request(
+                    messages,
+                    params,
+                    stream_channel=channel,
+                )
+        except BaseException:
+            if sem is not None:
+                sem.release()
+            raise
+
+        def _run():
+            # Same serialization as _handle_request: the batcher holds only
+            # this lock, so without it batched text would run concurrently.
+            with self._infer_guard():
+                self._runtime.handle_request_streaming_audio(
+                    request, audio_channel, omni_params)
+
+        yield from _pump_channels(self._rt,
+                                  _run,
+                                  channel,
+                                  audio_channel,
+                                  sem=sem,
+                                  admission_handoff=admission_handoff)
+
     # ------------------------------------------------------------------
     # Server API
     # ------------------------------------------------------------------
+
+    def generate_speech_stream(
+        self,
+        text: str,
+        audio_params: Optional[AudioParams] = None,
+        *,
+        admission_handoff: Optional[Any] = None,
+    ) -> Generator[StreamDelta, None, None]:
+        """Standalone TTS on the Omni stack: synthesize ``text`` directly.
+
+        No Thinker generation pass — the input text goes straight to the
+        Talker. Yields audio-only StreamDeltas.
+        """
+        if not self.omni_capable:
+            raise ValueError("TTS not available: Omni audio engines "
+                             "(talker/code_predictor/code2wav) not loaded")
+        sem = None if admission_handoff is not None else self._admission()
+        yield from _stream_tts(self._rt,
+                               self._runtime,
+                               text,
+                               audio_params or AudioParams(),
+                               sem,
+                               admission_handoff=admission_handoff,
+                               infer_guard=self._infer_guard())
+
+    def list_voices(self) -> List[str]:
+        """Speaker names accepted as ``voice``; empty when not Omni-capable."""
+        if not self.omni_capable:
+            return []
+        return sorted(self._runtime.get_speaker_names())
 
     def serve(self,
               host: str = "0.0.0.0",
@@ -1342,6 +1643,97 @@ class LLM:
     def has_draft_model(self) -> bool:
         """Whether Eagle speculative decoding is active."""
         return self._runtime.has_draft_model()
+
+    @property
+    def omni_capable(self) -> bool:
+        """Whether the Omni audio-output stack is loaded."""
+        return self._omni_capable
+
+
+class TTS:
+    """TTS-only serving for Qwen3-TTS-style engine sets.
+
+    Loads Talker + CodePredictor + Code2Wav without a Thinker/text engine.
+    ``serve()`` exposes ``/v1/audio/speech``; chat endpoints return 400.
+
+    Example::
+
+        from experimental.server import TTS
+
+        tts = TTS(talker_engine_dir="/engines/qwen3-tts/talker")
+        tts.serve(port=8000)
+
+    ``code_predictor_engine_dir`` / ``code2wav_engine_dir`` default to the
+    talker directory's siblings; ``tokenizer_dir`` defaults to the talker
+    directory itself (the standard export layout ships tokenizer files there).
+    """
+
+    text_capable = False
+    omni_capable = True
+    has_draft_model = False
+
+    def __init__(
+        self,
+        talker_engine_dir: str,
+        code_predictor_engine_dir: Optional[str] = None,
+        code2wav_engine_dir: Optional[str] = None,
+        tokenizer_dir: str = "",
+        model: Optional[str] = None,
+    ) -> None:
+        talker_engine_dir = os.path.abspath(talker_engine_dir)
+        base = os.path.dirname(talker_engine_dir)
+        code_predictor_engine_dir = (code_predictor_engine_dir
+                                     or os.path.join(base, "code_predictor"))
+        code2wav_engine_dir = (code2wav_engine_dir
+                               or os.path.join(base, "code2wav"))
+        for name, path in (("talker", talker_engine_dir),
+                           ("code_predictor", code_predictor_engine_dir),
+                           ("code2wav", code2wav_engine_dir)):
+            if not os.path.isdir(path):
+                raise ValueError(f"{name} engine dir not found: {path}")
+
+        self.model_dir = talker_engine_dir
+        self._model_id = model or os.path.basename(base) or "tts"
+        self._rt = _import_runtime()
+        logger.info("Loading TTS engines (talker=%s) ...", talker_engine_dir)
+        self._runtime = self._rt.TTSRuntime(
+            talker_engine_dir=talker_engine_dir,
+            code_predictor_engine_dir=code_predictor_engine_dir,
+            code2wav_engine_dir=code2wav_engine_dir,
+            tokenizer_dir=tokenizer_dir,
+        )
+        logger.info("TTS runtime ready")
+        self._admission_sem = threading.Semaphore(1)
+
+    def _admission(self):
+        """Per-instance admission gate (mirrors LLM._admission)."""
+        return self._admission_sem
+
+    def generate_speech_stream(
+        self,
+        text: str,
+        audio_params: Optional[AudioParams] = None,
+        *,
+        admission_handoff: Optional[Any] = None,
+    ) -> Generator[StreamDelta, None, None]:
+        """Synthesize ``text``; yields audio-only StreamDeltas."""
+        sem = None if admission_handoff is not None else self._admission()
+        yield from _stream_tts(self._rt,
+                               self._runtime,
+                               text,
+                               audio_params or AudioParams(),
+                               sem,
+                               admission_handoff=admission_handoff)
+
+    def list_voices(self) -> List[str]:
+        """Speaker names accepted as ``voice``."""
+        return sorted(self._runtime.get_speaker_names())
+
+    def serve(self, host: str = "0.0.0.0", port: int = 8000) -> None:
+        """Start the HTTP server (speech endpoint only)."""
+        from .api_server import run_server
+
+        run_server(self, host=host, port=port)
 
 
 # ---------------------------------------------------------------------------

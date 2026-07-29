@@ -69,6 +69,7 @@ ONNX_MODEL_FILE = "model.onnx"
 LLM_ENGINE_FILE = "llm.engine"
 VISUAL_ENGINE_FILE = "visual.engine"
 AUDIO_ENGINE_FILE = "audio_encoder.engine"
+CODE2WAV_ENGINE_FILE = "code2wav.engine"
 SPEC_BASE_ENGINE_FILE = "spec_base.engine"
 SPEC_DRAFT_ENGINE_FILE = "spec_draft.engine"
 CONFIG_FILE = "config.json"
@@ -133,6 +134,36 @@ def classify_model_source(path: str) -> str:
         if validate_onnx_dir(path):
             return "onnx_dir"
     return "model"
+
+
+def find_omni_engine_dirs(llm_engine_dir: str) -> Optional[dict]:
+    """Auto-detect Qwen3-Omni audio-output engine dirs.
+
+    Expects Talker / CodePredictor / Code2Wav as siblings of the Thinker
+    (LLM) engine directory::
+
+        {root}/
+            thinker/          # llm_engine_dir (llm.engine)
+            talker/           # llm.engine
+            code_predictor/   # llm.engine
+            code2wav/         # code2wav.engine
+
+    Returns a dict with keys ``talker``, ``code_predictor``, ``code2wav``
+    when all three are present, else None.
+    """
+    parent = os.path.dirname(os.path.abspath(llm_engine_dir))
+    talker = os.path.join(parent, "talker")
+    code_predictor = os.path.join(parent, "code_predictor")
+    code2wav = os.path.join(parent, "code2wav")
+    if (os.path.isfile(os.path.join(talker, LLM_ENGINE_FILE))
+            and os.path.isfile(os.path.join(code_predictor, LLM_ENGINE_FILE))
+            and os.path.isfile(os.path.join(code2wav, CODE2WAV_ENGINE_FILE))):
+        return {
+            "talker": talker,
+            "code_predictor": code_predictor,
+            "code2wav": code2wav,
+        }
+    return None
 
 
 def find_multimodal_engine_dir(llm_engine_dir: str) -> Optional[str]:

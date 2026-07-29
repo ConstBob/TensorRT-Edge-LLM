@@ -459,6 +459,18 @@ public:
      */
     int32_t resolveLanguageId(std::string const& languageName, std::string const& speakerName) const;
 
+    //! Speaker names accepted by TalkerGenerationRequest::speakerName.
+    std::vector<std::string> getSpeakerNames() const
+    {
+        std::vector<std::string> names;
+        names.reserve(mSpeakerIdMap.size());
+        for (auto const& entry : mSpeakerIdMap)
+        {
+            names.push_back(entry.first);
+        }
+        return names;
+    }
+
 private:
     // ========== Internal Methods ==========
 

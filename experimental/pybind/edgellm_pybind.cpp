@@ -28,6 +28,7 @@
 #include "common/logger.h"
 #include "common/tensor.h"
 #include "common/trtUtils.h"
+#include "multimodal/code2WavRunner.h"
 #include "profiling/metrics.h"
 #include "runtime/audioLoader.h"
 #include "runtime/audioUtils.h"
@@ -35,9 +36,13 @@
 #include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/melSpectrogram.h"
+#include "runtime/qwen3OmniTTSRuntime.h"
+#include "runtime/streaming.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <memory>
 #include <string>
@@ -101,6 +106,130 @@ private:
     cudaStream_t mStream{nullptr};
 };
 
+//! Talker / streaming knobs for one Omni audio request. Defaults match
+//! examples/llm/llm_inference.cpp.
+struct OmniAudioParams
+{
+    float talkerTemperature{0.9f};
+    int32_t talkerTopK{50};
+    float talkerTopP{1.0f};
+    float repetitionPenalty{1.05f};
+    int32_t maxAudioLength{4096};
+    std::string speakerName{""};
+    int32_t codecChunkFrames{10};      //!< Vocode every N Talker frames.
+    int32_t talkerPrefillThreshold{4}; //!< Thinker tokens before Talker prefill.
+};
+
+//! Convert a CPU-resident FP16/FP32 waveform tensor ([-1, 1]) to int16 PCM bytes.
+std::string waveformToPcm16(rt::Tensor const& waveform)
+{
+    constexpr float kPcm16MaxAmplitude = 32767.0f;
+    ELLM_CHECK(waveform.getDeviceType() == rt::DeviceType::kCPU, "waveform must be CPU-resident");
+    int64_t const numDims = waveform.getShape().getNumDims();
+    int64_t const numSamples = waveform.getShape()[numDims - 1];
+    bool const isFP32 = (waveform.getDataType() == nvinfer1::DataType::kFLOAT);
+    float const* fp32Data = isFP32 ? static_cast<float const*>(waveform.rawPointer()) : nullptr;
+    __half const* fp16Data = isFP32 ? nullptr : static_cast<__half const*>(waveform.rawPointer());
+
+    std::string out(static_cast<size_t>(numSamples) * sizeof(int16_t), '\0');
+    auto* dst = reinterpret_cast<int16_t*>(out.data());
+    for (int64_t i = 0; i < numSamples; ++i)
+    {
+        float const sample = isFP32 ? fp32Data[i] : __half2float(fp16Data[i]);
+        float const clamped = std::max(-1.0f, std::min(1.0f, sample));
+        dst[i] = static_cast<int16_t>(clamped * kPcm16MaxAmplitude);
+    }
+    return out;
+}
+
+//! Build the RVQ-chunk callback shared by the Omni streaming and standalone
+//! TTS paths: transpose to layer-major, vocode, push PCM. `vocodeFailed` must
+//! outlive the generation call; once set, later chunks are skipped and the
+//! caller raises after generation returns.
+Qwen3OmniTTSRuntime::AudioChunkCallback makeChunkVocodeCallback(Code2WavRunner& code2wav, cudaStream_t stream,
+    std::shared_ptr<AudioStreamChannel> const& audioChannel, bool& vocodeFailed)
+{
+    return [&code2wav, stream, audioChannel, &vocodeFailed](
+               std::vector<std::vector<int32_t>> const& chunkCodes, bool isFinal) {
+        AudioChunk chunk;
+        chunk.isFinal = isFinal;
+        bool const skip = audioChannel->isCancelled() || vocodeFailed;
+        if (!skip && !chunkCodes.empty() && !chunkCodes[0].empty())
+        {
+            size_t const numFrames = chunkCodes.size();
+            size_t const numLayers = chunkCodes[0].size();
+            std::vector<std::vector<int32_t>> transposed(numLayers, std::vector<int32_t>(numFrames));
+            for (size_t f = 0; f < numFrames; ++f)
+            {
+                for (size_t l = 0; l < numLayers; ++l)
+                {
+                    transposed[l][f] = chunkCodes[f][l];
+                }
+            }
+            audioUtils::AudioData chunkAudio;
+            if (code2wav.generateWaveform(transposed, chunkAudio, stream) && chunkAudio.hasWaveform)
+            {
+                chunk.pcm16 = waveformToPcm16(*chunkAudio.waveform);
+                chunk.numFrames = static_cast<int32_t>(numFrames);
+            }
+            else
+            {
+                LOG_ERROR("Code2Wav vocoding failed on a %zu-frame chunk; aborting audio stream", numFrames);
+                vocodeFailed = true;
+            }
+        }
+        audioChannel->push(std::move(chunk));
+        if (isFinal)
+        {
+            audioChannel->finish();
+        }
+    };
+}
+
+//! Run one standalone TTS request (Qwen3-TTS-style: text → Talker →
+//! CodePredictor → Code2Wav → channel, no Thinker pass). Returns the number
+//! of codec frames generated. Shared by PyLLMRuntime and PyTTSRuntime.
+int32_t runStandaloneTTS(Qwen3OmniTTSRuntime& ttsRuntime, Code2WavRunner& code2wav, cudaStream_t stream,
+    std::string const& text, OmniAudioParams const& params, std::shared_ptr<AudioStreamChannel> const& audioChannel)
+{
+    ELLM_CHECK(audioChannel != nullptr, "audio_channel must not be null");
+    ELLM_CHECK(!audioChannel->isFinished(), "audio_channel is already finished");
+    ELLM_CHECK(params.codecChunkFrames > 0, "codec_chunk_frames must be > 0");
+
+    Qwen3OmniTTSRuntime::TalkerGenerationRequest talkerReq;
+    talkerReq.maxAudioLength = params.maxAudioLength;
+    talkerReq.talkerTemperature = params.talkerTemperature;
+    talkerReq.talkerTopK = params.talkerTopK;
+    talkerReq.talkerTopP = params.talkerTopP;
+    talkerReq.repetitionPenalty = params.repetitionPenalty;
+    talkerReq.speakerName = params.speakerName;
+    // TTS reads the text as assistant speech (see docs/…/tts.md input format).
+    Message message;
+    message.role = "assistant";
+    message.contents.push_back({"text", text});
+    talkerReq.messages.push_back(std::move(message));
+    talkerReq.streamingChunkFrames = params.codecChunkFrames;
+    bool vocodeFailed = false;
+    talkerReq.onChunkReady = makeChunkVocodeCallback(code2wav, stream, audioChannel, vocodeFailed);
+
+    Qwen3OmniTTSRuntime::TalkerGenerationResponse talkerResponse;
+    bool success = false;
+    try
+    {
+        success = ttsRuntime.handleAudioGeneration(talkerReq, talkerResponse, stream);
+    }
+    catch (...)
+    {
+        audioChannel->finish();
+        throw;
+    }
+    // Covers failure paths where the isFinal callback never fired.
+    audioChannel->finish();
+    ELLM_CHECK(success, "TTS generation failed");
+    ELLM_CHECK(!vocodeFailed, "Code2Wav vocoding failed mid-stream; audio output is incomplete");
+    return talkerResponse.batchRvqCodes.empty() ? 0 : static_cast<int32_t>(talkerResponse.batchRvqCodes[0].size());
+}
+
 //! Unified Python wrapper for LLMInferenceRuntime.
 //! Supports both vanilla decoding (no draft model) and Eagle speculative decoding
 //! through constructor overloading — mirrors the C++ unified runtime.
@@ -132,6 +261,92 @@ public:
         bool const success = mRuntime->handleRequest(request, response, mStream.get());
         ELLM_CHECK(success, "Failed to handle generation request");
         return response;
+    }
+
+    //! Load the Qwen3-Omni audio-output stack (Talker + CodePredictor + Code2Wav).
+    //! tokenizerDir is normally the Thinker engine dir.
+    void loadOmni(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
+        std::string const& code2wavEngineDir, std::string const& tokenizerDir)
+    {
+        // Voice-clone reference encoders are not wired into the server yet.
+        mTtsRuntime = std::make_unique<Qwen3OmniTTSRuntime>(
+            talkerEngineDir, codePredictorEngineDir, tokenizerDir, /*cloneEncoderDir=*/"", mStream.get());
+        mCode2wavRunner = std::make_unique<Code2WavRunner>(code2wavEngineDir, mStream.get());
+        if (!mTtsRuntime->captureDecodingCUDAGraph(mStream.get()))
+        {
+            LOG_WARNING("CUDA graph capture failed for TTS decoding, proceeding without.");
+        }
+    }
+
+    //! Thinker-Talker streaming generation. Text streams through the request's
+    //! stream_channels as usual; vocoded PCM chunks stream through audioChannel.
+    //! Runs synchronously — call from a worker thread and pop both channels.
+    LLMGenerationResponse handleRequestStreamingAudio(LLMGenerationRequest& request,
+        std::shared_ptr<AudioStreamChannel> const& audioChannel, OmniAudioParams const& params)
+    {
+        ELLM_CHECK(
+            mTtsRuntime != nullptr && mCode2wavRunner != nullptr, "Omni runtime not loaded. Call load_omni() first.");
+        ELLM_CHECK(audioChannel != nullptr, "audio_channel must not be null");
+        ELLM_CHECK(!audioChannel->isFinished(), "audio_channel is already finished");
+
+        request.generateAudio = true;
+
+        Qwen3OmniTTSRuntime::OmniGenerationRequest omniReq;
+        omniReq.talkerTemperature = params.talkerTemperature;
+        omniReq.talkerTopK = params.talkerTopK;
+        omniReq.talkerTopP = params.talkerTopP;
+        omniReq.repetitionPenalty = params.repetitionPenalty;
+        omniReq.maxAudioLength = params.maxAudioLength;
+        omniReq.speakerName = params.speakerName;
+
+        Qwen3OmniTTSRuntime::ThinkerTalkerStreamingConfig streamCfg;
+        streamCfg.talkerPrefillThreshold = params.talkerPrefillThreshold;
+        streamCfg.codecChunkFrames = params.codecChunkFrames;
+        bool vocodeFailed = false;
+        streamCfg.onAudioChunkReady
+            = makeChunkVocodeCallback(*mCode2wavRunner, mStream.get(), audioChannel, vocodeFailed);
+
+        LLMGenerationResponse thinkerResponse;
+        Qwen3OmniTTSRuntime::TalkerGenerationResponse talkerResponse;
+        bool success = false;
+        try
+        {
+            success = mTtsRuntime->handleStreamingGeneration(
+                *mRuntime, request, thinkerResponse, streamCfg, omniReq, talkerResponse, mStream.get());
+        }
+        catch (...)
+        {
+            audioChannel->finish();
+            throw;
+        }
+        // Covers failure paths where the isFinal callback never fired.
+        audioChannel->finish();
+        ELLM_CHECK(success, "Streaming Omni generation failed");
+        ELLM_CHECK(!vocodeFailed, "Code2Wav vocoding failed mid-stream; audio output is incomplete");
+        // success=false with zero frames is the legit degenerate case (thinker
+        // reply shorter than the prefill threshold) — deliver text with empty
+        // audio. With frames already emitted it means the Talker errored and
+        // the audio is truncated, which must not pass silently.
+        bool const talkerTruncated = !talkerResponse.success && !talkerResponse.numFramesPerSample.empty()
+            && talkerResponse.numFramesPerSample[0] > 0;
+        ELLM_CHECK(!talkerTruncated, "Talker generation failed mid-stream; audio output is truncated");
+        return thinkerResponse;
+    }
+
+    //! Standalone TTS on the loaded Omni stack: synthesize speech for `text`
+    //! directly, without a Thinker generation pass.
+    int32_t handleRequestTTS(
+        std::string const& text, OmniAudioParams const& params, std::shared_ptr<AudioStreamChannel> const& audioChannel)
+    {
+        ELLM_CHECK(
+            mTtsRuntime != nullptr && mCode2wavRunner != nullptr, "Omni runtime not loaded. Call load_omni() first.");
+        return runStandaloneTTS(*mTtsRuntime, *mCode2wavRunner, mStream.get(), text, params, audioChannel);
+    }
+
+    std::vector<std::string> getSpeakerNames() const
+    {
+        ELLM_CHECK(mTtsRuntime != nullptr, "Omni runtime not loaded. Call load_omni() first.");
+        return mTtsRuntime->getSpeakerNames();
     }
 
     bool captureDecodingCudaGraph()
@@ -173,6 +388,47 @@ private:
     CudaStreamWrapper mStream;
     std::unique_ptr<void, DlDeleter> mPluginHandle;
     std::unique_ptr<LLMInferenceRuntime> mRuntime;
+    std::unique_ptr<Qwen3OmniTTSRuntime> mTtsRuntime;
+    std::unique_ptr<Code2WavRunner> mCode2wavRunner;
+};
+
+//! TTS-only runtime for Qwen3-TTS-style deployments: Talker + CodePredictor +
+//! Code2Wav, no Thinker engine. An empty tokenizer_dir falls back to the
+//! talker dir, which carries the tokenizer files in the standard export
+//! layout.
+class PyTTSRuntime
+{
+public:
+    PyTTSRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
+        std::string const& code2wavEngineDir, std::string const& tokenizerDir)
+    {
+        mPluginHandle = loadEdgellmPluginLib();
+        std::string const& tokenizer = tokenizerDir.empty() ? talkerEngineDir : tokenizerDir;
+        mTtsRuntime = std::make_unique<Qwen3OmniTTSRuntime>(
+            talkerEngineDir, codePredictorEngineDir, tokenizer, /*cloneEncoderDir=*/"", mStream.get());
+        mCode2wavRunner = std::make_unique<Code2WavRunner>(code2wavEngineDir, mStream.get());
+        if (!mTtsRuntime->captureDecodingCUDAGraph(mStream.get()))
+        {
+            LOG_WARNING("CUDA graph capture failed for TTS decoding, proceeding without.");
+        }
+    }
+
+    int32_t handleRequestTTS(
+        std::string const& text, OmniAudioParams const& params, std::shared_ptr<AudioStreamChannel> const& audioChannel)
+    {
+        return runStandaloneTTS(*mTtsRuntime, *mCode2wavRunner, mStream.get(), text, params, audioChannel);
+    }
+
+    std::vector<std::string> getSpeakerNames() const
+    {
+        return mTtsRuntime->getSpeakerNames();
+    }
+
+private:
+    CudaStreamWrapper mStream;
+    std::unique_ptr<void, DlDeleter> mPluginHandle;
+    std::unique_ptr<Qwen3OmniTTSRuntime> mTtsRuntime;
+    std::unique_ptr<Code2WavRunner> mCode2wavRunner;
 };
 
 imageUtils::ImageData loadImageFromPath(std::string const& path)
@@ -461,6 +717,39 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def("get_skip_special_tokens", &StreamChannel::getSkipSpecialTokens);
 
     // ========================================================================
+    // Omni audio streaming
+    // ========================================================================
+    py::class_<AudioChunk>(m, "AudioChunk")
+        .def_property_readonly(
+            "pcm16", [](AudioChunk const& c) { return py::bytes(c.pcm16); }, "Little-endian int16 mono PCM samples")
+        .def_readonly("is_final", &AudioChunk::isFinal)
+        .def_readonly("num_frames", &AudioChunk::numFrames);
+
+    py::class_<AudioStreamChannel, std::shared_ptr<AudioStreamChannel>>(m, "AudioStreamChannel")
+        .def(py::init<>())
+        .def("try_pop", [](AudioStreamChannel& self) { return self.waitPop(std::chrono::milliseconds{0}); })
+        .def(
+            "wait_pop",
+            [](AudioStreamChannel& self, int64_t timeoutMs) {
+                return self.waitPop(std::chrono::milliseconds{timeoutMs});
+            },
+            py::arg("timeout_ms"), py::call_guard<py::gil_scoped_release>())
+        .def("is_finished", &AudioStreamChannel::isFinished)
+        .def("is_cancelled", &AudioStreamChannel::isCancelled)
+        .def("cancel", &AudioStreamChannel::cancel);
+
+    py::class_<OmniAudioParams>(m, "OmniAudioParams")
+        .def(py::init<>())
+        .def_readwrite("talker_temperature", &OmniAudioParams::talkerTemperature)
+        .def_readwrite("talker_top_k", &OmniAudioParams::talkerTopK)
+        .def_readwrite("talker_top_p", &OmniAudioParams::talkerTopP)
+        .def_readwrite("repetition_penalty", &OmniAudioParams::repetitionPenalty)
+        .def_readwrite("max_audio_length", &OmniAudioParams::maxAudioLength)
+        .def_readwrite("speaker_name", &OmniAudioParams::speakerName)
+        .def_readwrite("codec_chunk_frames", &OmniAudioParams::codecChunkFrames)
+        .def_readwrite("talker_prefill_threshold", &OmniAudioParams::talkerPrefillThreshold);
+
+    // ========================================================================
     // Request / Response (continued)
     // ========================================================================
     py::class_<LLMGenerationRequest>(m, "LLMGenerationRequest")
@@ -503,6 +792,16 @@ PYBIND11_MODULE(_edgellm_runtime, m)
             "Construct for Eagle speculative decoding")
         .def("handle_request", &PyLLMRuntime::handleRequest, py::arg("request"),
             py::call_guard<py::gil_scoped_release>(), "Process a generation request and return the response")
+        .def("load_omni", &PyLLMRuntime::loadOmni, py::arg("talker_engine_dir"), py::arg("code_predictor_engine_dir"),
+            py::arg("code2wav_engine_dir"), py::arg("tokenizer_dir"),
+            "Load the Qwen3-Omni audio-output stack (Talker + CodePredictor + Code2Wav)")
+        .def("handle_request_streaming_audio", &PyLLMRuntime::handleRequestStreamingAudio, py::arg("request"),
+            py::arg("audio_channel"), py::arg("params"), py::call_guard<py::gil_scoped_release>(),
+            "Thinker-Talker streaming generation with PCM chunks pushed to audio_channel")
+        .def("handle_request_tts", &PyLLMRuntime::handleRequestTTS, py::arg("text"), py::arg("params"),
+            py::arg("audio_channel"), py::call_guard<py::gil_scoped_release>(),
+            "Standalone TTS on the loaded Omni stack; returns the number of codec frames generated")
+        .def("get_speaker_names", &PyLLMRuntime::getSpeakerNames)
         .def("capture_decoding_cuda_graph", &PyLLMRuntime::captureDecodingCudaGraph,
             "Capture CUDA graphs for optimized decoding")
         .def("save_system_prompt_kv_cache", &PyLLMRuntime::saveSystemPromptKVCache, py::arg("prompt"),
@@ -515,6 +814,16 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def("get_eagle_generation_metrics", &PyLLMRuntime::getSpecDecodeGenerationMetrics,
             py::return_value_policy::reference_internal) // deprecated alias
         .def("get_multimodal_metrics", &PyLLMRuntime::getMultimodalMetrics);
+
+    py::class_<PyTTSRuntime>(
+        m, "TTSRuntime", "TTS-only runtime (Qwen3-TTS-style): Talker + CodePredictor + Code2Wav, no Thinker engine")
+        .def(py::init<std::string const&, std::string const&, std::string const&, std::string const&>(),
+            py::arg("talker_engine_dir"), py::arg("code_predictor_engine_dir"), py::arg("code2wav_engine_dir"),
+            py::arg("tokenizer_dir") = "", py::call_guard<py::gil_scoped_release>())
+        .def("handle_request_tts", &PyTTSRuntime::handleRequestTTS, py::arg("text"), py::arg("params"),
+            py::arg("audio_channel"), py::call_guard<py::gil_scoped_release>(),
+            "Synthesize speech for text; PCM chunks stream to audio_channel; returns codec frame count")
+        .def("get_speaker_names", &PyTTSRuntime::getSpeakerNames);
 
     // ========================================================================
     // Builder: LLM
