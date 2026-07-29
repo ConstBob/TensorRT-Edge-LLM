@@ -228,6 +228,10 @@ struct FMHAKernelSelection
 FMHAKernelSelection loadFMHAKernels(int32_t numQHeads, int32_t numKVHeads, int32_t headSize, int32_t smVersion,
     nvinfer1::DataType dataType, bool useSlidingWindow)
 {
+    // Call cudaFree(nullptr) to ensure a CUDA context is initialized, so a later cuModuleLoadData() can succeed. This
+    // is required when running with TRT-RTX.
+    cudaFree(nullptr);
+
 #ifdef CUTE_DSL_FMHA_ENABLED
     if (CuteDslFMHARunner::canImplement(headSize, smVersion) && CuteDslFMHARunner::loadLLMKernelModule())
     {
