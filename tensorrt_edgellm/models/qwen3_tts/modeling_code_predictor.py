@@ -20,8 +20,8 @@ audio codes to complement the coarse code from the Talker.  It has 15 separate
 lm_heads (one per residual codebook layer) and 15 codec embedding tables.
 
 Key differences from a standard CausalLM:
-- ``lm_head_weight`` is an ONNX **input** tensor (not a fixed weight) to enable
-  dynamic lm_head selection at runtime via 15 CUDA Graphs.
+- ``lm_heads`` (all heads stacked) and ``lm_head_idx`` are ONNX **inputs**; the
+  head is gathered inside the graph, so one CUDA graph serves every step.
 - The forward pass returns both ``logits`` and ``hidden_states`` (for residual
   connection in the multi-token prediction loop).
 - ``embed_tokens`` is a ModuleList of 15 codec embeddings (embedding lookup
@@ -106,13 +106,13 @@ def _make_code_predictor_flat_wrapper(model: nn.Module, Na: int) -> nn.Module:
     """Build a flat-signature wrapper for CodePredictor ONNX export.
 
     Unlike the standard CausalLM wrapper, this includes:
-    - ``lm_head_weight`` as an input (dynamic lm_head for 15 CUDA graphs)
+    - ``lm_heads`` + ``lm_head_idx`` as inputs (head gathered in-graph)
     - ``hidden_states`` as an output (for residual connection)
     """
     param_names: List[str] = (
         ["inputs_embeds"] + [f"past_key_values_{i}" for i in range(Na)] + [
             "rope_rotary_cos_sin", "context_lengths", "kvcache_start_index",
-            "kv_page_table", "last_token_ids", "lm_head_weight"
+            "kv_page_table", "last_token_ids", "lm_heads", "lm_head_idx"
         ])
 
     past_kv_tuple = "({},)".format(", ".join(
@@ -122,7 +122,7 @@ def _make_code_predictor_flat_wrapper(model: nn.Module, Na: int) -> nn.Module:
         f"    logits, hidden_states, present_key_values = self._model(\n"
         f"        inputs_embeds, {past_kv_tuple}, rope_rotary_cos_sin, "
         f"context_lengths, kvcache_start_index, kv_page_table, "
-        f"last_token_ids, lm_head_weight)\n"
+        f"last_token_ids, lm_heads, lm_head_idx)\n"
         f"    return (logits, hidden_states) + tuple(present_key_values)\n")
 
     src = "def _forward(self, {}):\n{}".format(", ".join(param_names), body)
@@ -145,8 +145,8 @@ def _make_code_predictor_flat_wrapper(model: nn.Module, Na: int) -> nn.Module:
 
 
 class CodePredictorCausalLM(CausalLM):
-    """CP CausalLM: dynamic ``lm_head_weight`` input (15 heads switched
-    per runtime step) + ``hidden_states`` output for the residual loop.
+    """CP CausalLM: stacked ``lm_heads`` + device ``lm_head_idx`` inputs
+    (head gathered in-graph) + ``hidden_states`` output for the residual loop.
     """
 
     match_fp32_matmul_initializers = True
@@ -165,7 +165,8 @@ class CodePredictorCausalLM(CausalLM):
         kvcache_start_index: torch.Tensor,
         kv_page_table: torch.Tensor,
         last_token_ids: torch.Tensor,
-        lm_head_weight: torch.Tensor,
+        lm_heads: torch.Tensor,
+        lm_head_idx: torch.Tensor,
     ) -> Tuple:
         hidden_states, present_key_values, _ = self.model(
             inputs_embeds,
@@ -177,12 +178,13 @@ class CodePredictorCausalLM(CausalLM):
         )
         # Select last token hidden states via GatherND
         last_hidden = torch.ops.trt.gather_nd(hidden_states, last_token_ids)
-        # Dynamic lm_head: logits = last_hidden @ lm_head_weight.T
-        logits = torch.matmul(last_hidden, lm_head_weight.T).to(torch.float32)
+        # Gather the head by device index: logits = last_hidden @ lm_heads[idx].T
+        head = lm_heads.index_select(0, lm_head_idx.to(torch.long)).squeeze(0)
+        logits = torch.matmul(last_hidden, head.T).to(torch.float32)
         return logits, hidden_states, present_key_values
 
     def onnx_export_spec(self) -> OnnxSpec:
-        """ONNX export spec with lm_head_weight input and hidden_states output."""
+        """ONNX export spec with lm_heads/lm_head_idx inputs and hidden_states output."""
         config = self.config
         Na = config.num_hidden_layers
         device = next(itertools.chain(self.parameters(),
@@ -229,20 +231,24 @@ class CodePredictorCausalLM(CausalLM):
                                      1,
                                      dtype=torch.int64,
                                      device=device)
-        lm_head_weight = torch.zeros(config.vocab_size,
-                                     config.hidden_size,
-                                     dtype=dtype16,
-                                     device=device)
+        num_heads = config.num_code_groups - 1
+        assert num_heads > 0, "num_code_groups missing from CP config"
+        lm_heads = torch.zeros(num_heads,
+                               config.vocab_size,
+                               config.hidden_size,
+                               dtype=dtype16,
+                               device=device)
+        lm_head_idx = torch.zeros(1, dtype=torch.int32, device=device)
 
         args = (inputs_embeds, *past_key_values_list, rope_rotary_cos_sin,
                 context_lengths, kvcache_start_index, kv_page_table,
-                last_token_ids, lm_head_weight)
+                last_token_ids, lm_heads, lm_head_idx)
 
         input_names = (["inputs_embeds"] +
                        [f"past_key_values_{i}" for i in range(Na)] + [
                            "rope_rotary_cos_sin", "context_lengths",
                            "kvcache_start_index", "kv_page_table",
-                           "last_token_ids", "lm_head_weight"
+                           "last_token_ids", "lm_heads", "lm_head_idx"
                        ])
         output_names = (["logits", "hidden_states"] +
                         [f"present_key_values_{i}" for i in range(Na)])
@@ -265,7 +271,8 @@ class CodePredictorCausalLM(CausalLM):
         all_shapes.append({0: kv_batch})  # kvcache_start_index
         all_shapes.append({0: page_batch, 2: max_pages})  # kv_page_table
         all_shapes.append({0: batch})  # last_token_ids
-        all_shapes.append({})  # lm_head_weight (fixed shape)
+        all_shapes.append({})  # lm_heads (fixed shape)
+        all_shapes.append({})  # lm_head_idx (fixed shape)
 
         wrapped = _make_code_predictor_flat_wrapper(self, Na)
         wrapped.eval()

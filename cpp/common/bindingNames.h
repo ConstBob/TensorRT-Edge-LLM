@@ -618,6 +618,16 @@ inline constexpr char const* kAudioOutput = "last_hidden_state";
  */
 inline constexpr char const* kLmHeadWeight = "lm_head_weight";
 
+/*!
+ * @brief Stacked CodePredictor lm_heads + device-selected head index
+ *
+ * lm_heads: [num_heads, vocab_size, hidden_size] (FLOAT16), lm_head_idx: [1] (INT32).
+ * The head is gathered inside the engine, so bindings stay step-invariant and one
+ * CUDA graph serves every decode step.
+ */
+inline constexpr char const* kLmHeads = "lm_heads";
+inline constexpr char const* kLmHeadIdx = "lm_head_idx";
+
 /*! @} */
 
 /*! @name Code2Wav Vocoder Bindings (Qwen3-Omni)

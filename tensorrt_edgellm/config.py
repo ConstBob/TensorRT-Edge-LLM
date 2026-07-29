@@ -576,6 +576,8 @@ class ModelConfig:
     num_global_key_value_heads: int = 0
     # Hidden activation name used by architecture-specific auxiliary modules.
     hidden_activation: str = "silu"
+    # CodePredictor: RVQ code groups (lm_heads count = num_code_groups - 1).
+    num_code_groups: int = 0
     # Optional explicit RoPE configs for mixed sliding/full attention stacks.
     sliding_rope_config: Optional[dict] = None
     full_rope_config: Optional[dict] = None
@@ -1111,6 +1113,7 @@ class ModelConfig:
             partial_rotary_factor=_get_partial_rotary_factor(llm_dict),
             hidden_activation=llm_dict.get("hidden_activation",
                                            llm_dict.get("hidden_act", "silu")),
+            num_code_groups=int(llm_dict.get("num_code_groups", 0) or 0),
             sliding_rope_config=dual_rope_configs.get("sliding_rope_config"),
             full_rope_config=dual_rope_configs.get("full_rope_config"),
             has_qk_norm=has_qk_norm,
