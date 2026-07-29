@@ -38,6 +38,8 @@ from .config import ModelConfig, QuantConfig
 from .model import (AutoModel, register_attention_scale_default,
                     register_model, standard_attention_scale)
 # Register model-type-specific implementations
+from .models.cosmos3_reasoner.modeling_cosmos3_reasoner_text import \
+    Cosmos3ReasonerCausalLM
 from .models.diffusion_gemma import DiffusionGemmaBackbone
 from .models.gemma4.modeling_gemma4_text import Gemma4ForCausalLM
 from .models.nemotron_h.modeling_nemotron_h import NemotronHCausalLM
@@ -77,6 +79,12 @@ register_model("diffusiongemma", DiffusionGemmaBackbone,
                _identity_attention_scale)
 register_attention_scale_default("gemma4_assistant", _identity_attention_scale)
 register_model("nemotron_h", NemotronHCausalLM, standard_attention_scale)
+# Cosmos3-Edge reasoner text decoder ("cosmos3_edge_text" is the promoted
+# text_config model_type).
+register_model("cosmos3_edge", Cosmos3ReasonerCausalLM,
+               standard_attention_scale)
+register_model("cosmos3_edge_text", Cosmos3ReasonerCausalLM,
+               standard_attention_scale)
 register_model("qwen3_5_text", Qwen3_5CausalLM, standard_attention_scale)
 register_model("qwen3_5_moe_text", Qwen3_5MoeCausalLM,
                standard_attention_scale)

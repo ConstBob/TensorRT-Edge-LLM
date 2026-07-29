@@ -74,6 +74,12 @@ for large language models and vision-language models on edge devices.
 
 .. toctree::
    :maxdepth: 2
+   :caption: Models
+
+   developer_guide/models/cosmos3.md
+
+.. toctree::
+   :maxdepth: 2
    :caption: Customization
 
    developer_guide/customization/customization-guide.md

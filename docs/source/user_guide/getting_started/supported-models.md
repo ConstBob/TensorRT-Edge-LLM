@@ -235,6 +235,7 @@ the NVFP4 MoE plugin path. The shared expert path remains separate.
 | Qwen3.5/3.6 VLM | [`Qwen3_5ForConditionalGeneration`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5/modeling_qwen3_5.py) | `qwen3_5` -> `Qwen3_5CausalLM` + `Qwen3_5VLVisualModel` | VLM original checkpoints only |
 | InternVL3 / InternVL3.5 HF format | [`InternVLForConditionalGeneration`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/internvl/modeling_internvl.py) | `internvl_chat` / `internvl` + InternVL visual models | Dense precision set for LLM backbone |
 | Phi-4-Multimodal | [`Phi4MultimodalForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/phi4_multimodal/modeling_phi4_multimodal.py) | `phi4mm` / `phi4_multimodal` + `Phi4MMVisualModel` | Merge vision LoRA, then dense precision set for the LLM backbone |
+| Cosmos3-Edge reasoner | Root `model_type` `cosmos3_edge` (native flat text-tower schema; SigLIP2 vision encoder) | `Cosmos3ReasonerCausalLM` + `Cosmos3ReasonerVisualModel` -> regular `visual_build` + `llm_build` + `llm_inference` VLM path (image + prompt -> reasoning text) | FP16 |
 
 <details>
 <summary><b>Qwen2.5-VL</b> checkpoints</summary>
@@ -317,6 +318,7 @@ Qwen3.5 and Qwen3.6 checkpoints are unified text+VLM models. The same checkpoint
 | Model Series | Transformers Class | `tensorrt_edgellm` Handling | Supported Precisions |
 |--------------|--------------------|-----------------------|----------------------|
 | Alpamayo R1 | Checkpoint architecture `alpamayo_r1`; VLM backbone compatible with [`Qwen3VLForConditionalGeneration`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py) | `qwen3_vl` + `Qwen3VLVisualModel` + `AlpamayoAction` | FP16 |
+| Cosmos3-Edge policy (experimental) | Diffusers `Cosmos3OmniPipeline` (`Cosmos3OmniTransformer` + `AutoencoderKLWan`); root `model_type` `cosmos3_edge`/`cosmos3_omni` | `tensorrt_edgellm.models.cosmos3` -> `und_prefill` + `gen` + `vae_encoder` components, run by the experimental `cosmos3_policy_inference` runtime (image + instruction -> action chunk) | FP16 |
 
 <details>
 <summary><b>Alpamayo R1</b> checkpoints</summary>
@@ -324,6 +326,21 @@ Qwen3.5 and Qwen3.6 checkpoints are unified text+VLM models. The same checkpoint
 - [nvidia/Alpamayo-R1-10B](https://huggingface.co/nvidia/Alpamayo-R1-10B)
 
 </details>
+
+<details>
+<summary><b>Cosmos3-Edge</b> checkpoints</summary>
+
+- [nvidia/Cosmos3-Edge](https://huggingface.co/nvidia/Cosmos3-Edge)
+- [nvidia/Cosmos3-Edge-Policy-DROID](https://huggingface.co/nvidia/Cosmos3-Edge-Policy-DROID)
+
+</details>
+
+> **Scope:** Supported Cosmos3-Edge coverage is the policy/action-generation
+> path plus reasoner multimodal reasoning (see the
+> [Cosmos3 developer guide](../../developer_guide/models/cosmos3.md)). The two
+> run on different paths, selected at export time with `--task`: policy
+> generation uses the experimental component runtime; the reasoner exports as
+> regular `llm/` + `visual/` backbones and runs on the standard VLM runtime.
 
 ---
 

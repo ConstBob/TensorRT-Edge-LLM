@@ -19,6 +19,7 @@
 #include "common/checkMacros.h"
 #include "common/trtUtils.h"
 #include "multimodal/audioRunner.h"
+#include "multimodal/cosmos3EdgeViTRunner.h"
 #include "multimodal/gemma4AudioRunner.h"
 #include "multimodal/gemma4UnifiedAudioRunner.h"
 #include "multimodal/gemma4UnifiedVisionRunner.h"
@@ -152,6 +153,11 @@ std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& mu
     else if (modelType == multimodal::ModelType::QWEN3_VL || modelType == multimodal::ModelType::QWEN3_5)
     {
         multimodalRunner = makeInitializedQwenViTRunner<Qwen3VLViTRunner>(
+            multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
+    }
+    else if (modelType == multimodal::ModelType::COSMOS3_EDGE)
+    {
+        multimodalRunner = makeInitializedQwenViTRunner<Cosmos3EdgeViTRunner>(
             multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
     }
     else if (modelType == multimodal::ModelType::QWEN3_OMNI_AUDIO_ENCODER

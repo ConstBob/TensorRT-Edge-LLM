@@ -580,11 +580,16 @@ class DecoderLayer(nn.Module):
         self_attn, mlp, input_layernorm, post_attention_layernorm
     """
 
+    #: Subclasses override to swap the per-layer feed-forward implementation
+    #: (e.g. Cosmos3-Edge's non-gated squared-ReLU MLP) without rebuilding or
+    #: patching modules after construction.
+    mlp_cls = MLP
+
     def __init__(self, config: ModelConfig, layer_idx: int) -> None:
         super().__init__()
         self.layer_idx = layer_idx
         self.self_attn = Attention(config, layer_idx=layer_idx)
-        self.mlp = MLP(config, layer_idx=layer_idx)
+        self.mlp = type(self).mlp_cls(config, layer_idx=layer_idx)
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 config.rms_norm_eps)
@@ -640,11 +645,14 @@ class Transformer(nn.Module):
     them as an extra ONNX output (see :class:`CausalLM.emit_hidden_states`).
     """
 
+    #: Subclasses override to swap the decoder-layer implementation.
+    decoder_layer_cls = DecoderLayer
+
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([
-            DecoderLayer(config, layer_idx=i)
+            type(self).decoder_layer_cls(config, layer_idx=i)
             for i in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -743,11 +751,14 @@ class CausalLM(nn.Module):
     #: as an ONNX output in addition to ``logits``.
     emit_hidden_states: bool = False
 
+    #: Subclasses override to swap the transformer stack implementation.
+    transformer_cls = Transformer
+
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
         self.config = config
 
-        self.model = Transformer(config)
+        self.model = type(self).transformer_cls(config)
 
         self.lm_head = make_linear(config,
                                    config.hidden_size,

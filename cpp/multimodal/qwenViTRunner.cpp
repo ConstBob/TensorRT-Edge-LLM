@@ -90,7 +90,8 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
     mModelType = multimodal::stringToModelType(modelTypeStr);
     if (mModelType != multimodal::ModelType::QWEN2_5_VL && mModelType != multimodal::ModelType::QWEN2_VL
         && mModelType != multimodal::ModelType::QWEN3_VL && mModelType != multimodal::ModelType::QWEN3_5
-        && mModelType != multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER)
+        && mModelType != multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER
+        && mModelType != multimodal::ModelType::COSMOS3_EDGE)
     {
         LOG_ERROR("Invalid model type: %s", modelTypeStr.c_str());
         return false;
@@ -168,7 +169,8 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
         ? preprocessorConfig["image_processor"]
         : preprocessorConfig;
     mConfig.patchSize = imageProcessorConfig["patch_size"].get<int64_t>();
-    mConfig.temporalPatchSize = imageProcessorConfig["temporal_patch_size"].get<int64_t>();
+    // Default to 1 for processors without temporal patching (which omit the key).
+    mConfig.temporalPatchSize = imageProcessorConfig.value("temporal_patch_size", int64_t{1});
     mConfig.mergeSize = imageProcessorConfig["merge_size"].get<int64_t>();
     mConfig.imageMean = imageProcessorConfig["image_mean"].get<std::vector<float>>();
     mConfig.imageStd = imageProcessorConfig["image_std"].get<std::vector<float>>();
@@ -185,7 +187,20 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
     // bounds the number of per-frame cu_seqlens entries (one per frame block), not just the image count.
     mConfig.maxNumImages = maxImageTokens / mConfig.minImageTokensPerImage;
     mConfig.inputDim = mVisualContext->getTensorShape(binding_names::kVisualInput).d[1];
-    mConfig.vitPosEmbDim = mVisualContext->getTensorShape(binding_names::kRotaryPosEmb).d[1];
+    // Whether the ViT consumes a rotary_pos_emb input is a fixed per-model property (see usesRotaryPosEmb),
+    // not something to read off the engine. Take it from that hook and validate the loaded engine agrees.
+    mHasRotaryPosEmb = usesRotaryPosEmb();
+    bool const engineHasRotary = isEngineInput(*mVisualEngine, binding_names::kRotaryPosEmb);
+    if (engineHasRotary != mHasRotaryPosEmb)
+    {
+        LOG_ERROR(
+            "rotary_pos_emb config/engine mismatch for model_type %s: config expects the input to be %s but "
+            "the visual engine %s it",
+            modelTypeStr.c_str(), mHasRotaryPosEmb ? "present" : "absent", engineHasRotary ? "has" : "lacks");
+        return false;
+    }
+    mConfig.vitPosEmbDim
+        = mHasRotaryPosEmb ? mVisualContext->getTensorShape(binding_names::kRotaryPosEmb).d[1] : int64_t{0};
     mConfig.outHiddenSize = mVisualEngine->getTensorShape(binding_names::kVisualOutput).d[1];
 
     return true;
@@ -198,10 +213,13 @@ bool QwenViTRunner::allocateBuffer(cudaStream_t stream)
         {mConfig.maxHW, mConfig.inputDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "QwenViTRunner::mVitInput");
     setTensorAddressStatus &= mVisualContext->setTensorAddress(binding_names::kVisualInput, mVitInput.rawPointer());
 
-    mRotaryPosEmb = rt::Tensor({mConfig.maxHW, mConfig.vitPosEmbDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT,
-        "QwenViTRunner::mRotaryPosEmb");
-    setTensorAddressStatus
-        &= mVisualContext->setTensorAddress(binding_names::kRotaryPosEmb, mRotaryPosEmb.rawPointer());
+    if (mHasRotaryPosEmb)
+    {
+        mRotaryPosEmb = rt::Tensor({mConfig.maxHW, mConfig.vitPosEmbDim}, rt::DeviceType::kGPU,
+            nvinfer1::DataType::kFLOAT, "QwenViTRunner::mRotaryPosEmb");
+        setTensorAddressStatus
+            &= mVisualContext->setTensorAddress(binding_names::kRotaryPosEmb, mRotaryPosEmb.rawPointer());
+    }
 
     // The size of the tensor is maxNumImages + 1 because the first element is 0.
     mCuSeqlens = rt::Tensor(
@@ -467,11 +485,14 @@ void QwenViTRunner::imagePreprocess(
         }
 
         // Build rotary position embeddings
-        check::check(mRotaryPosEmb.reshape({totalSeqLength, mConfig.vitPosEmbDim}), "Tensor reshape failed");
-        for (auto const& s : spans)
+        if (mHasRotaryPosEmb)
         {
-            kernel::initRotaryPosEmbQwenViT(mRotaryPosEmb, {s.vit.gridT, s.vit.gridH, s.vit.gridW}, mConfig.mergeSize,
-                s.vit.patchStart, 10000.0f, 1.0f, stream);
+            check::check(mRotaryPosEmb.reshape({totalSeqLength, mConfig.vitPosEmbDim}), "Tensor reshape failed");
+            for (auto const& s : spans)
+            {
+                kernel::initRotaryPosEmbQwenViT(mRotaryPosEmb, {s.vit.gridT, s.vit.gridH, s.vit.gridW},
+                    mConfig.mergeSize, s.vit.patchStart, 10000.0f, 1.0f, stream);
+            }
         }
 
         // Build model-specific ViT inputs.
@@ -752,8 +773,11 @@ bool QwenViTRunner::infer(cudaStream_t stream) noexcept
         bool setEngineIOStatus{true};
         setEngineIOStatus
             &= mVisualContext->setInputShape(binding_names::kVisualInput, mVitInput.getShape().getTRTDims());
-        setEngineIOStatus
-            &= mVisualContext->setInputShape(binding_names::kRotaryPosEmb, mRotaryPosEmb.getShape().getTRTDims());
+        if (mHasRotaryPosEmb)
+        {
+            setEngineIOStatus
+                &= mVisualContext->setInputShape(binding_names::kRotaryPosEmb, mRotaryPosEmb.getShape().getTRTDims());
+        }
         setEngineIOStatus
             &= mVisualContext->setInputShape(binding_names::kCuSeqlens, mCuSeqlens.getShape().getTRTDims());
         if (mUseTrtNativeVitAttn)
@@ -789,6 +813,11 @@ bool QwenViTRunner::infer(cudaStream_t stream) noexcept
 // ---- Per-model strategy hooks: base implementations = Qwen2-VL. Subclasses override what they add. ----
 
 bool QwenViTRunner::validateExtraConfig(nlohmann::json const& /*jsonConfig*/)
+{
+    return true;
+}
+
+bool QwenViTRunner::usesRotaryPosEmb() const
 {
     return true;
 }

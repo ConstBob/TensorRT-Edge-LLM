@@ -43,6 +43,7 @@ enum class ModelType
     NEMOTRON_OMNI_VISION_ENCODER,  //!< Nemotron-Omni vision encoder
     NEMOTRON_OMNI_AUDIO_ENCODER,   //!< Nemotron-Omni audio encoder
     GEMMA4_AUDIO_ENCODER,          //!< Gemma4 audio encoder
+    COSMOS3_EDGE,                  //!< Cosmos3-Edge reasoner vision encoder (SigLIP2 + PatchMerger)
     UNKNOWN                        //!< Unknown or unsupported model type
 };
 
@@ -85,6 +86,8 @@ inline ModelType stringToModelType(std::string const& modelTypeStr)
         return ModelType::NEMOTRON_OMNI_AUDIO_ENCODER;
     if (modelTypeStr == "gemma4_audio")
         return ModelType::GEMMA4_AUDIO_ENCODER;
+    if (modelTypeStr == "cosmos3_edge" || modelTypeStr == "cosmos3_edge_vision")
+        return ModelType::COSMOS3_EDGE;
     return ModelType::UNKNOWN;
 }
 

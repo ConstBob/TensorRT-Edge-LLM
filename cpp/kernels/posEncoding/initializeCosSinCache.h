@@ -81,6 +81,16 @@ void initializeMRopeCosSin(float* cosSinCache, int64_t* mropePositionIds, float 
     cudaStream_t stream);
 
 /*!
+ * @brief Float-position overload of initializeMRopeCosSin.
+ *
+ * Identical math and layouts, but takes FLOAT position IDs for models whose temporal
+ * positions are fractional (e.g. fps-modulated diffusion streams such as Cosmos3-Edge GEN).
+ */
+void initializeMRopeCosSin(float* cosSinCache, float* mropePositionIds, float rotaryBaseFrequency, int64_t rotaryDim,
+    int64_t rotaryEmbeddingMaxPositions, int64_t batchSize, bool interleaved, int32_t sectionH, int32_t sectionW,
+    cudaStream_t stream);
+
+/*!
  * @brief Initialize MRoPE cos/sin cache for text-only inputs with sequential positions.
  *
  * Initializes the MRoPE cache using sequential position IDs (pos[i] = i) for all 3
