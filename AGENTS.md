@@ -108,6 +108,29 @@ The pipeline is: `HuggingFace Model → Python Export (quantize + ONNX) → C++ 
   explain obvious control flow. A useful comment should shorten future debugging by stating intent, constraints, or
   non-obvious behavior. Comments should not describe how the code changed relative to an older implementation.
 
+### CUDA / GPU
+
+- **Pageable memory with `cudaMemcpyAsync`** — pageable host buffers (`std::vector`, stack
+  arrays) cause CUDA to fall back to a synchronous internal copy. Use pinned member buffers
+  (`cudaMallocHost` / `cudaHostAlloc`) for async H2D/D2H transfers.
+- **Hot-path buffer allocation** — prefer preallocating buffers at init/`allocateBuffer` time over allocating per-step or per-frame.
+- **Synchronous CUDA APIs** — avoid APIs without an `Async` suffix (`cudaMemcpy`, `cudaMemset`,
+  etc.) and `cudaDeviceSynchronize`/`cudaThreadSynchronize` in library and hot-path code; they
+  block the CPU and may serialize the entire device. Prefer async variants with an explicit stream
+  argument.
+- **Redundant `cudaStreamSynchronize`** — operations on the same stream are serialized
+  automatically. Sync is only justified when (1) the CPU must read a D2H result, or
+  (2) immediately before CUDA graph capture.
+- **Cross-stream dependencies** — operations with data dependencies must either share the same
+  stream or use `cudaStreamWaitEvent` for explicit inter-stream sync. Never assume ordering
+  between different streams.
+- **Default stream (stream 0)** — never use the default/NULL stream in library code; it has
+  implicit device-wide synchronization semantics (all other streams wait for it and vice versa),
+  equivalent to `cudaDeviceSynchronize`. Always pass an explicit `cudaStream_t` argument.
+- **Unified memory** — avoid `cudaMallocManaged`; on Tegra/edge SoCs the driver manages
+  coherence non-deterministically, adding unpredictable overhead. Use pinned memory
+  (`cudaMallocHost`) for H2D/D2H transfers and device memory (`cudaMalloc`) otherwise.
+
 ## Development Workflow
 
 1. Clone and init submodules: `git clone --recurse-submodules <repo-url>`
