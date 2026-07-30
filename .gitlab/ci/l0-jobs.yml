@@ -334,7 +334,7 @@ l0_unit_tests_x86:
     CUDA_VERSION: "13.2"
     TRT_VERSION: "$TRT10_X86_VERSION"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    TEST_CACHE_DIR: "$L0_CACHE_DIR/unit_tests_x86"
+    TEST_CACHE_DIR: "$L0_CACHE_DIR/unit_tests_x86/$RUNNER_TAG/$CI_JOB_ID"
     PRIORITY: l0_python_ut
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
@@ -366,7 +366,7 @@ l0_unit_tests_x86_trt11:
     TRT_VERSION: "$TRT11_VERSION"
     TRT_CUDA_VERSION: "13.2"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    TEST_CACHE_DIR: "$L0_CACHE_DIR/unit_tests_x86_trt11"
+    TEST_CACHE_DIR: "$L0_CACHE_DIR/unit_tests_x86_trt11/$RUNNER_TAG/$CI_JOB_ID"
     PRIORITY: l0_python_ut
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
