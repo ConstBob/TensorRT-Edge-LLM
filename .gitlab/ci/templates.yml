@@ -195,7 +195,7 @@
     - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
     - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
     - echo "Installing TensorRT Edge-LLM in editable mode for sanity check"
-    - pip3 install -e .
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install Edge LLM editable package" -- pip3 install -e .
     - echo "✅ TensorRT Edge-LLM installation successful!"
     - echo "Verifying installation..."
     - python3 -c 'import tensorrt_edgellm; print(tensorrt_edgellm.__version__)'
@@ -265,20 +265,21 @@
         echo "Pipeline end time:$(date)"
         exit 0
       fi
-    - echo "Installing dependencies"
-    - export DEBIAN_FRONTEND=noninteractive
-    - apt update -qq >/dev/null 2>&1
-    - apt install -y -qq python3 python3-pip git curl >/dev/null 2>&1
+    - echo "Verifying CI image dependencies"
+    - python3 --version
+    - pip3 --version
+    - git --version
+    - curl --version
     - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
     - echo "Installing package dependencies"
     - cd $LLM_SDK_DIR
-    - pip3 install -q build
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install Python build tooling" -- pip3 install build
     - python3 -m build --wheel --outdir dist .
     - export EDGE_LLM_WHEEL=$(python3 -c 'import glob; print(glob.glob("dist/*.whl")[0])')
-    - pip3 install "${EDGE_LLM_WHEEL}[tools]"
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install Edge LLM tool dependencies" -- pip3 install "${EDGE_LLM_WHEEL}[tools]"
     - python3 -c 'import torchvision; print(f"torchvision {torchvision.__version__}")'
     - echo "Installing pytest dependencies"
-    - pip3 install -q -r tests/requirements.txt
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install pytest dependencies" -- pip3 install -r tests/requirements.txt
     - echo "Checkpoint exporter dependencies are provided by the package wheel"
     - export PYTHONPATH=$LLM_SDK_DIR:$PYTHONPATH
     # Re-export from a clean cache so models dropped from the test list don't linger.
@@ -309,25 +310,25 @@
     - mkdir -p $TEST_LOG_DIR $ENGINE_DIR "$CI_PROJECT_DIR/.ci-reports"
     - rm -rf $TEST_LOG_DIR/* $ENGINE_DIR/*
     - chmod -R 777 $TEST_LOG_DIR
-    - echo "Installing dependencies"
-    - export DEBIAN_FRONTEND=noninteractive
-    - apt update -qq >/dev/null 2>&1
-    - apt install -y -qq python3 python3-pip git >/dev/null 2>&1
+    - echo "Verifying CI image dependencies"
+    - python3 --version
+    - pip3 --version
+    - git --version
     - echo "Checking TRT x86_64 package"
     - if [ ! -d "$TRT_PACKAGE_DIR" ]; then echo "TensorRT x86_64 cache not found at $TRT_PACKAGE_DIR"; exit 1; fi
     - echo "Using TensorRT x86_64 package directly from cache"
     - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
     # clone googletest and nlohmannJson from internal mirror to avoid git submodule network issues
-    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
-    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_GIT_TIMEOUT_SECONDS" "Clone GoogleTest" -- git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_GIT_TIMEOUT_SECONDS" "Clone nlohmann JSON" -- git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
     - echo "Installing pytest dependencies"
-    - pip3 install -q -r tests/requirements.txt
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install pytest dependencies" -- pip3 install -r tests/requirements.txt
     - echo "Installing accuracy dependencies"
-    - pip3 install -q -r examples/accuracy/requirements.txt
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install accuracy dependencies" -- pip3 install -r examples/accuracy/requirements.txt
     - echo "Installing TensorRT Python package from cache"
-    - pip3 install -q $TRT_PACKAGE_DIR/python/tensorrt-$TRT_VERSION*-cp312*.whl
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install TensorRT Python package" -- pip3 install $TRT_PACKAGE_DIR/python/tensorrt-$TRT_VERSION*-cp312*.whl
     - echo "Installing python cuda dependencies"
-    - pip3 install -q pycuda
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install PyCUDA" -- pip3 install pycuda
     - export LD_LIBRARY_PATH=$TRT_PACKAGE_DIR/lib:$LD_LIBRARY_PATH
     - echo "Setting up test environment"
     - if [ -n "$BASELINE_CSV" ]; then mkdir -p "$(dirname "$BASELINE_CSV")"; fi
@@ -434,21 +435,21 @@
     - mkdir -p $TEST_LOG_DIR $ENGINE_DIR $ONNX_DIR "$CI_PROJECT_DIR/.ci-reports"
     - rm -rf $TEST_LOG_DIR/* $ENGINE_DIR/* $ONNX_DIR/*
     - chmod -R 777 $TEST_LOG_DIR
-    - echo "Installing dependencies"
-    - export DEBIAN_FRONTEND=noninteractive
-    - apt update -qq >/dev/null 2>&1
-    - apt install -y -qq python3 python3-pip git >/dev/null 2>&1
+    - echo "Verifying CI image dependencies"
+    - python3 --version
+    - pip3 --version
+    - git --version
     - echo "Checking TRT x86_64 package"
     - if [ ! -d "$TRT_PACKAGE_DIR" ]; then echo "TensorRT x86_64 cache not found at $TRT_PACKAGE_DIR"; exit 1; fi
     - echo "Using TensorRT x86_64 package directly from cache"
     - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
     # clone googletest and nlohmannJson from internal mirror to avoid git submodule network issues
-    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
-    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_GIT_TIMEOUT_SECONDS" "Clone GoogleTest" -- git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_GIT_TIMEOUT_SECONDS" "Clone nlohmann JSON" -- git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
     - echo "Installing test dependencies"
-    - pip3 install -q -r tests/requirements.txt -r tests/requirements-ut.txt
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install unit-test dependencies" -- pip3 install -r tests/requirements.txt -r tests/requirements-ut.txt
     - echo "Installing TensorRT Python package from cache"
-    - pip3 install -q $TRT_PACKAGE_DIR/python/tensorrt-$TRT_VERSION*-cp312*.whl
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install TensorRT Python package" -- pip3 install $TRT_PACKAGE_DIR/python/tensorrt-$TRT_VERSION*-cp312*.whl
     - export LD_LIBRARY_PATH=$TRT_PACKAGE_DIR/lib:$LD_LIBRARY_PATH
     # test_build_project_with_pybind (l0_python_ut list) builds _edgellm_runtime.
     - export PYTHONPATH="$PWD/build/pybind${PYTHONPATH:+:$PYTHONPATH}"
@@ -464,6 +465,8 @@
     - .gitlab_junit_report
   variables:
     REMOTE_WORKSPACE: "/home/${BOARD_USER}/tensorrt-edge-llm-${CI_JOB_ID}"
+    # Cold installs pull roughly 3 GB of CUDA-enabled Python wheels.
+    CI_PIP_INSTALL_TIMEOUT_SECONDS: "2400"
   script:
     - ': "${BOARD_USER:?Device jobs must define BOARD_USER}"'
     - echo "Pipeline start time:$(date)"
@@ -474,34 +477,35 @@
     - rm -rf $TEST_LOG_DIR/*
     - chmod -R 777 $TEST_LOG_DIR
     - echo "Installing dependencies"
-    - export DEBIAN_FRONTEND=noninteractive
-    - apt update -qq >/dev/null 2>&1
-    - apt install -y -qq git openssh-client sshpass rsync python3 python3-pip python3-venv >/dev/null 2>&1
+    - bash .gitlab/ci/scripts/ci_apt.sh install git openssh-client sshpass rsync python3 python3-pip python3-venv
     - echo "Copying password to device scripts"
     - sed -i -e "s/{BOARDPASSWORD}/${BOARD_PASSWORD_NVKS}/g" .gitlab/ci/scripts/device_init.sh
-    # clean up the packages in the board
-    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP 'bash -s' < .gitlab/ci/scripts/device_init.sh
-    - if [ $? -ne 0 ]; then echo "Error occurred during initializing"; exit 1; fi
-    - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
-    # clone googletest and nlohmannJson from internal mirror to avoid git submodule network issues
-    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
-    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
     - export ENGINE_DIR=${ENGINE_DIR:-$REMOTE_WORKSPACE/engines}
     - |
       case "$REMOTE_WORKSPACE" in
         /home/$BOARD_USER/tensorrt-edge-llm*) ;;
         *) echo "Unsafe REMOTE_WORKSPACE=$REMOTE_WORKSPACE"; exit 1 ;;
       esac
-    - echo "Creating isolated remote workspace $REMOTE_WORKSPACE and syncing repo from host to board"
-    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "rm -rf '$REMOTE_WORKSPACE' && mkdir -p '$REMOTE_WORKSPACE' '$ENGINE_DIR'"
+    - export REMOTE_CI_SCRIPT_DIR="$REMOTE_WORKSPACE/.gitlab/ci/scripts"
+    - echo "Creating isolated remote workspace $REMOTE_WORKSPACE"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "rm -rf -- '$REMOTE_WORKSPACE' && mkdir -p '$REMOTE_CI_SCRIPT_DIR' '$ENGINE_DIR'"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" scp -o StrictHostKeyChecking=no .gitlab/ci/scripts/ci_apt.sh .gitlab/ci/scripts/ci_run.sh "$BOARD_USER@$BOARD_IP:$REMOTE_CI_SCRIPT_DIR/"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "chmod 755 '$REMOTE_CI_SCRIPT_DIR/ci_apt.sh' '$REMOTE_CI_SCRIPT_DIR/ci_run.sh'"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "REMOTE_WORKSPACE='$REMOTE_WORKSPACE' CI_APT_SCRIPT='$REMOTE_CI_SCRIPT_DIR/ci_apt.sh' bash -s" < .gitlab/ci/scripts/device_init.sh
+    - if [ $? -ne 0 ]; then echo "Error occurred during initializing"; exit 1; fi
+    - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
+    # clone googletest and nlohmannJson from internal mirror to avoid git submodule network issues
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_GIT_TIMEOUT_SECONDS" "Clone GoogleTest" -- git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_GIT_TIMEOUT_SECONDS" "Clone nlohmann JSON" -- git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
+    - echo "Syncing repo from host to $REMOTE_WORKSPACE"
     - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -av -e "ssh -o StrictHostKeyChecking=no" $LLM_SDK_DIR/ $BOARD_USER@$BOARD_IP:$REMOTE_WORKSPACE/
     - echo "Setting file permissions to 755 to prevent permission issues"
     - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "chmod -R 755 $REMOTE_WORKSPACE"
     - echo "Installing pytest dependencies in a virtual environment"
     - python3 -m venv venv && source venv/bin/activate
-    - pip3 install -q -r tests/requirements.txt
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install pytest dependencies" -- pip3 install -r tests/requirements.txt
     - echo "Installing accuracy dependencies"
-    - pip3 install -q -r examples/accuracy/requirements.txt
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install accuracy dependencies" -- pip3 install -r examples/accuracy/requirements.txt
     - if [ -n "$BASELINE_CSV" ]; then mkdir -p "$(dirname "$BASELINE_CSV")"; fi
     - echo "Setup complete. Running pipeline tests on device with pytest. Time:$(date)"
     - python3 -m pytest tests/ --priority=$PRIORITY --execution-mode=remote --remote-host=$BOARD_IP --remote-user=$BOARD_USER --remote-password="$BOARD_PASSWORD_NVKS" --remote-workspace=$REMOTE_WORKSPACE -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml="$CI_PROJECT_DIR/.ci-reports/test_report_$PRIORITY.xml"
@@ -532,13 +536,11 @@
     - rm -rf $TEST_LOG_DIR/*
     - chmod -R 777 $TEST_LOG_DIR
     - echo "Installing dependencies"
-    - export DEBIAN_FRONTEND=noninteractive
-    - apt update -qq >/dev/null 2>&1
-    - apt install -y -qq git openssh-client sshpass rsync python3 >/dev/null 2>&1
+    - bash .gitlab/ci/scripts/ci_apt.sh install git openssh-client sshpass rsync python3
     - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
     # clone googletest and nlohmannJson from internal mirror to avoid git submodule network issues
-    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
-    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_GIT_TIMEOUT_SECONDS" "Clone GoogleTest" -- git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_GIT_TIMEOUT_SECONDS" "Clone nlohmann JSON" -- git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
     - |
       case "$REMOTE_WORKSPACE" in
         /home/$BOARD_USER/tensorrt-edge-llm*) ;;
@@ -549,7 +551,11 @@
     - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -a -e "ssh -o StrictHostKeyChecking=no" $LLM_SDK_DIR/ $BOARD_USER@$BOARD_IP:$REMOTE_WORKSPACE/
     - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "chmod -R 755 $REMOTE_WORKSPACE"
     - echo "Running plugin unit tests on the board. Time:$(date)"
-    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "REMOTE_WORKSPACE='$REMOTE_WORKSPACE' TRT_PACKAGE_DIR='$TRT_PACKAGE_DIR' PRIORITY='$PRIORITY' JUNIT_PREFIX='$CI_JOB_NAME_SLUG' bash -s" < .gitlab/ci/scripts/device_unit_tests.sh
+    - |
+      sshpass -p "$BOARD_PASSWORD_NVKS" \
+        ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP \
+        "REMOTE_WORKSPACE='$REMOTE_WORKSPACE' TRT_PACKAGE_DIR='$TRT_PACKAGE_DIR' PRIORITY='$PRIORITY' JUNIT_PREFIX='$CI_JOB_NAME_SLUG' CI_PIP_INSTALL_TIMEOUT_SECONDS='$CI_PIP_INSTALL_TIMEOUT_SECONDS' bash -s" \
+        < .gitlab/ci/scripts/device_unit_tests.sh
   after_script:
     - python3 .gitlab/ci/scripts/device_job_finalize.py --fetch-reports || true
     - !reference [.record_runner_usage, after_script]
@@ -563,7 +569,7 @@
     - if [ ! -d "$TRT_PACKAGE_DIR" ]; then echo "TensorRT package not found at $TRT_PACKAGE_DIR"; exit 1; fi
     - echo "Using TensorRT package from cache at $TRT_PACKAGE_DIR"
     - echo "Updating git submodules"
-    - git submodule update --init --recursive
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_GIT_TIMEOUT_SECONDS" "Update Git submodules" -- git submodule update --init --recursive
     - echo "Creating build directory"
     - mkdir -p build
     - cd build

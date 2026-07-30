@@ -316,7 +316,7 @@ quantization_sanity:
     - nvidia-smi -L
     - export LLM_SDK_DIR=$(pwd)
     - export PYTHONPATH=$LLM_SDK_DIR:$PYTHONPATH
-    - pip3 install -q -r tests/requirements.txt torch
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install quantization test dependencies" -- pip3 install -r tests/requirements.txt torch
     # conftest.from_environment requires these paths; the unit tests do not use them.
     - export ONNX_DIR=$(pwd)/.ci_qc_onnx LLM_MODELS_DIR=$(pwd)/.ci_qc_models EDGELLM_DATA_DIR=$(pwd)/.ci_qc_data
     - mkdir -p "$ONNX_DIR" "$LLM_MODELS_DIR" "$EDGELLM_DATA_DIR"
