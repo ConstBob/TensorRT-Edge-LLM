@@ -490,6 +490,17 @@ def _fix_generation_config_for_strict_validate(model) -> None:
         gc.do_sample = True
 
 
+def _is_moe_model(model):
+    """Return True if the model has MoE (mixture-of-experts) layers."""
+    config = model.config
+    if hasattr(config, "text_config"):
+        config = config.text_config
+    if getattr(config, "num_experts", None) or getattr(
+            config, "num_local_experts", None):
+        return True
+    return any("experts" in n for n, _ in model.named_modules())
+
+
 def _is_hybrid_model(model):
     """Return True if the model has hybrid Mamba+Attention layers.
 
@@ -520,6 +531,16 @@ def _skip_resmooth_for_hybrid(model, quantization: str = ""):
     incorrectly fused, corrupting the int4 weights.  For Phi-4 multimodal,
     the dummy forward is incompatible with the required ``input_mode``.
 
+    For dense INT4-AWQ models resmoothing is lossy: replacing each linear's
+    calibrated pre_quant_scale with the q/k/v (and gate/up) average and
+    re-quantizing the int4 weights against it deviates from the calibrated
+    model enough to collapse small-model accuracy (Qwen3-0.6B answers
+    English prompts in Chinese; ROUGE-1 0.09 vs 0.42 without resmoothing).
+    The exported checkpoint keeps each linear's own pre_quant_scale, which
+    the Edge-LLM export/runtime path fully supports.  MoE INT4-AWQ models
+    are exempt: expert weight stacking at export requires the shared scales
+    that resmoothing produces.
+
     NVFP4 is exempt: resmoothing works correctly for NVFP4 and is required
     to equalise per-tensor scales across GDN input projections that share
     the same input activation, enabling fusion into a single GEMM.
@@ -530,15 +551,18 @@ def _skip_resmooth_for_hybrid(model, quantization: str = ""):
     TODO: Remove once ModelOpt fixes these model paths upstream.
     """
     model_type = getattr(getattr(model, "config", None), "model_type", "")
+    quantization = quantization.lower()
     # NVFP4 on hybrid models: resmoothing is safe and required for GDN
     # input projection fusion — do NOT skip.
-    is_nvfp4 = quantization.lower() in ("nvfp4", "fp4")
+    is_nvfp4 = quantization in ("nvfp4", "fp4")
+    is_int4_awq = quantization == "int4_awq"
     # Multimodal wrappers have no top-level ``forward``; resmooth's dummy
     # ``model(fake_input)`` crashes on them. Resmooth is a no-op without
     # AWQ pre_quant_scales, so skipping is safe here.
     should_skip = ((_is_hybrid_model(model) and not is_nvfp4)
                    or model_type in ("phi4mm", "phi4_multimodal", "qwen3_omni",
-                                     "qwen3_omni_moe", "qwen3_omni_next"))
+                                     "qwen3_omni_moe", "qwen3_omni_next")
+                   or (is_int4_awq and not _is_moe_model(model)))
     if not should_skip:
         yield
         return
