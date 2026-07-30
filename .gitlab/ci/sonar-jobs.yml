@@ -3,7 +3,7 @@
 # ==============================================================================
 
 get-binaries:
-  stage: get-binaries
+  stage: l0_test
   image: gcc
   
   cache:
@@ -37,11 +37,11 @@ get-binaries:
     - if: $L1 == "true"
 
 build-coverage:
-  stage: get-binaries
+  stage: l0_test
   timeout: 10 minutes
   variables:
     CUDA_VERSION: "13.0"
-    TRT_CUDA_VERSION: "13.1"
+    TRT_CUDA_VERSION: "13.2"
     CI_APT_INSTALL_TIMEOUT_SECONDS: "300"
     CI_PIP_INSTALL_TIMEOUT_SECONDS: "300"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
@@ -99,6 +99,8 @@ build-sonar:
 
 sonarqube-vulnerability-report:
   stage: sonarqube-vulnerability-report
+  needs:
+    - build-sonar
   image: gcc
   script:
     - |

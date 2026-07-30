@@ -453,6 +453,9 @@
     - export LD_LIBRARY_PATH=$TRT_PACKAGE_DIR/lib:$LD_LIBRARY_PATH
     # test_build_project_with_pybind (l0_python_ut list) builds _edgellm_runtime.
     - export PYTHONPATH="$PWD/build/pybind${PYTHONPATH:+:$PYTHONPATH}"
+    # Fail loudly if the runner env is broken (no torch/TRT/GPU); otherwise the
+    # harness skips every test at the module level and the job goes green empty.
+    - python3 -c "import tensorrt, torch; assert torch.cuda.is_available(), 'CUDA not available'"
     - echo "Running unit tests with pytest. Time:$(date)"
     # Test selection is driven by the tests/test_lists/$PRIORITY.yml list.
     - python3 -m pytest tests/ --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml="$CI_PROJECT_DIR/.ci-reports/test_report_$PRIORITY.xml"
