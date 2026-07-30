@@ -146,7 +146,8 @@ as producer/smoke coverage for downstream pipeline jobs.
 
 | Stage | Purpose |
 |-------|---------|
-| `setup` | Pre-commit validation, cache cleanup |
+| `precheck` | Fatal source validation before setup or test resources are allocated |
+| `setup` | Cache cleanup and test artifact preparation |
 | `l0_test` | MR-triggered — export, pipeline, unit tests per GPU/device |
 | `l1_test` | Manual (`L1=true`) — extended coverage |
 | `build-sonar` | SonarQube static analysis |

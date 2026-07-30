@@ -46,7 +46,7 @@
   interruptible: true
 
 build_cutedsl_docker_image:
-  stage: precheck
+  stage: setup
   extends:
     - .cutedsl_artifact_rules
     - .cutedsl_builder_version

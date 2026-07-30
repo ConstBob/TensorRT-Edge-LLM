@@ -2,66 +2,6 @@
 # SETUP JOBS
 # ==============================================================================
 
-# Pre-commit code quality checks
-pre_commit_checks:
-  stage: precheck
-  variables:
-    CUDA_VERSION: "12.9"
-  tags:
-    - cpu-k8s
-  script:
-    - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
-    - echo "Installing dependencies"
-    - export DEBIAN_FRONTEND=noninteractive
-    - apt update -qq >/dev/null 2>&1
-    - apt install -y -qq python3 python3-pip python3-venv git >/dev/null 2>&1
-    - echo "Installing pre-commit hooks"
-    - python3 -m venv venv && source venv/bin/activate
-    - pip3 install -q pre-commit
-    - pre-commit install
-    - echo "Running pre-commit checks on all files"
-    - pre-commit run --all-files --show-diff-on-failure || (echo "❌ Pre-commit checks failed!" && echo "💡 To fix this locally, run:" && echo "   pip install pre-commit" && echo "   pre-commit install" && echo "   pre-commit run --all-files" && exit 1)
-    - echo "✅ Pre-commit checks passed!"
-    - deactivate
-    - echo "Pipeline end time:$(date)"
-  extends: .setup_common_rules
-  interruptible: true
-
-# Quantization sanity (GPU / A30): run the quantization unit tests (which
-# actually quantize small real models) in the py3.12 TensorRT base image.
-# `needs: []` so it is independent of the CuTe-DSL builder / setup stage.
-quantization_sanity:
-  stage: l0_test
-  needs: []
-  tags:
-    - a30-edgellm-nvks
-  variables:
-    CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-  image: "$IMAGE"
-  script:
-    - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
-    - nvidia-smi -L
-    - export LLM_SDK_DIR=$(pwd)
-    - export PYTHONPATH=$LLM_SDK_DIR:$PYTHONPATH
-    - pip3 install -q -r tests/requirements.txt torch
-    # conftest.from_environment requires these paths; the unit tests do not use them.
-    - export ONNX_DIR=$(pwd)/.ci_qc_onnx LLM_MODELS_DIR=$(pwd)/.ci_qc_models EDGELLM_DATA_DIR=$(pwd)/.ci_qc_data
-    - mkdir -p "$ONNX_DIR" "$LLM_MODELS_DIR" "$EDGELLM_DATA_DIR"
-    - python3 -m pytest tests/python-unittests/test_quantize.py -v --color=yes
-  extends: .setup_common_rules
-  rules:
-    - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
-      when: never
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TITLE =~ /\[skip tests\]/
-      when: never
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)\[skip tests\](,|$)/
-      when: never
-    - if: $CI_PIPELINE_SOURCE == "schedule" && $L0_STABILITY == "true"
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $L1 == "true"
-  interruptible: true
-
 # Cache cleanup for L0 directories
 l0_cache_cleanup:
   stage: setup

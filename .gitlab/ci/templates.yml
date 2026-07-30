@@ -45,8 +45,14 @@
   rules:
     - if: $L1 == "true"
 
-.setup_common_rules:
+.mr_and_l1_rules:
   rules:
+    - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TITLE =~ /\[skip tests\]/
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)\[skip tests\](,|$)/
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_PIPELINE_SOURCE == "schedule" && $L0_STABILITY == "true"
     - if: $L1 == "true"
@@ -174,6 +180,15 @@
 
       echo "Runner usage written to $out_file"
 
+.gitlab_junit_report:
+  artifacts:
+    when: always
+    expire_in: 14 days
+    paths:
+      - .ci-reports/
+    reports:
+      junit: .ci-reports/*.xml
+
 .sanity_python_check_template:
   script:
     - echo "Pipeline start time:$(date)"
@@ -187,12 +202,16 @@
     - echo "Pipeline end time:$(date)"
 
 .checkpoint_export_template:
+  extends:
+    - .gitlab_junit_report
   script:
     - |
       echo "Pipeline start time:$(date)"
       echo "Node name: ${NODE_NAME:-$(hostname)}"
       export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
-      mkdir -p "$ONNX_DIR" "$TEST_LOG_DIR"
+      export JUNIT_REPORT="$CI_PROJECT_DIR/.ci-reports/test_report_$PRIORITY.xml"
+      mkdir -p "$ONNX_DIR" "$TEST_LOG_DIR" "$CI_PROJECT_DIR/.ci-reports"
+      rm -f "$JUNIT_REPORT"
     - |
       # ── Smart ONNX reuse decision ─────────────────────────────────────────
       # MR L0 jobs opt in via ONNX_REUSE=1 and point ONNX_DIR at a stable cache.
@@ -228,6 +247,21 @@
       if [ "$NEED_EXPORT" = "0" ]; then
         echo "Reusing cached ONNX at $ONNX_DIR:"
         ls -la "$ONNX_DIR"
+        {
+          printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
+          printf '%s\n' \
+            '<testsuites name="checkpoint export" tests="1" failures="0" errors="0" skipped="1">'
+          printf '  <testsuite name="%s" tests="1" failures="0" errors="0" skipped="1" time="0">\n' \
+            "$PRIORITY"
+          printf '%s\n' '    <testcase classname="checkpoint_export" name="cache_reuse" time="0">'
+          SKIP_REASON="Export tests were not executed; ONNX from commit $PREV_SHA"
+          SKIP_REASON="$SKIP_REASON was reused for commit $CI_COMMIT_SHA."
+          printf '      <skipped message="Cached ONNX reused">%s</skipped>\n' "$SKIP_REASON"
+          printf '%s\n' '    </testcase>'
+          printf '%s\n' '  </testsuite>'
+          printf '%s\n' '</testsuites>'
+        } > "$JUNIT_REPORT"
+        echo "Recorded checkpoint export as skipped in $JUNIT_REPORT (cached commit: $PREV_SHA)."
         echo "Pipeline end time:$(date)"
         exit 0
       fi
@@ -250,7 +284,15 @@
     # Re-export from a clean cache so models dropped from the test list don't linger.
     - if [ "${ONNX_REUSE:-0}" = "1" ]; then echo "Cleaning stale ONNX before re-export"; rm -rf "$ONNX_DIR"/*; mkdir -p "$ONNX_DIR"; fi
     - echo "Running checkpoint export tests with pytest. Time:$(date)"
-    - python3 -m pytest tests --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
+    - |
+      python3 -m pytest tests \
+        --priority="$PRIORITY" \
+        -v \
+        --color=yes \
+        --html="$TEST_LOG_DIR/test_report_$PRIORITY.html" \
+        --self-contained-html \
+        --junitxml="$JUNIT_REPORT"
+    - echo "HTML report saved to $TEST_LOG_DIR; JUnit report saved to $CI_PROJECT_DIR/.ci-reports"
     - echo "Models exported to cache directory $ONNX_DIR"
     - ls -la $ONNX_DIR
     # Record the commit that produced this ONNX so later pipelines can decide reuse.
@@ -259,10 +301,12 @@
   interruptible: true
 
 .x86_test_template:
+  extends:
+    - .gitlab_junit_report
   script:
     - echo "Pipeline start time:$(date)"
     - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
-    - mkdir -p $TEST_LOG_DIR $ENGINE_DIR
+    - mkdir -p $TEST_LOG_DIR $ENGINE_DIR "$CI_PROJECT_DIR/.ci-reports"
     - rm -rf $TEST_LOG_DIR/* $ENGINE_DIR/*
     - chmod -R 777 $TEST_LOG_DIR
     - echo "Installing dependencies"
@@ -288,8 +332,8 @@
     - echo "Setting up test environment"
     - if [ -n "$BASELINE_CSV" ]; then mkdir -p "$(dirname "$BASELINE_CSV")"; fi
     - echo "Running pipeline tests with pytest. Time:$(date)"
-    - python3 -m pytest tests/ --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
-    - echo "Command execution logs and pytest reports saved to $TEST_LOG_DIR"
+    - python3 -m pytest tests/ --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml="$CI_PROJECT_DIR/.ci-reports/test_report_$PRIORITY.xml"
+    - echo "HTML report saved to $TEST_LOG_DIR; JUnit report saved to $CI_PROJECT_DIR/.ci-reports"
     - ls -la $TEST_LOG_DIR
     - echo "Pipeline end time:$(date)"
 
@@ -382,10 +426,12 @@
     - echo "Pipeline end time:$(date)"
 
 .x86_unit_test_template:
+  extends:
+    - .gitlab_junit_report
   script:
     - echo "Pipeline start time:$(date)"
     - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
-    - mkdir -p $TEST_LOG_DIR $ENGINE_DIR $ONNX_DIR
+    - mkdir -p $TEST_LOG_DIR $ENGINE_DIR $ONNX_DIR "$CI_PROJECT_DIR/.ci-reports"
     - rm -rf $TEST_LOG_DIR/* $ENGINE_DIR/* $ONNX_DIR/*
     - chmod -R 777 $TEST_LOG_DIR
     - echo "Installing dependencies"
@@ -408,18 +454,23 @@
     - export PYTHONPATH="$PWD/build/pybind${PYTHONPATH:+:$PYTHONPATH}"
     - echo "Running unit tests with pytest. Time:$(date)"
     # Test selection is driven by the tests/test_lists/$PRIORITY.yml list.
-    - python3 -m pytest tests/ --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
-    - echo "Command execution logs and pytest reports saved to $TEST_LOG_DIR"
+    - python3 -m pytest tests/ --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml="$CI_PROJECT_DIR/.ci-reports/test_report_$PRIORITY.xml"
+    - echo "HTML report saved to $TEST_LOG_DIR; JUnit report saved to $CI_PROJECT_DIR/.ci-reports"
     - ls -la $TEST_LOG_DIR
     - echo "Pipeline end time:$(date)"
   
 .device_test_template:
+  extends:
+    - .gitlab_junit_report
+  variables:
+    REMOTE_WORKSPACE: "/home/${BOARD_USER}/tensorrt-edge-llm-${CI_JOB_ID}"
   script:
+    - ': "${BOARD_USER:?Device jobs must define BOARD_USER}"'
     - echo "Pipeline start time:$(date)"
     - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
     - export BOARD_IP=${BOARD_IP:-192.168.55.1}
     - echo "Board IP:$BOARD_IP"
-    - mkdir -p $TEST_LOG_DIR
+    - mkdir -p $TEST_LOG_DIR "$CI_PROJECT_DIR/.ci-reports"
     - rm -rf $TEST_LOG_DIR/*
     - chmod -R 777 $TEST_LOG_DIR
     - echo "Installing dependencies"
@@ -435,7 +486,6 @@
     # clone googletest and nlohmannJson from internal mirror to avoid git submodule network issues
     - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
     - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
-    - export REMOTE_WORKSPACE=${REMOTE_WORKSPACE:-/home/$BOARD_USER/tensorrt-edge-llm-${CI_JOB_ID:-manual}}
     - export ENGINE_DIR=${ENGINE_DIR:-$REMOTE_WORKSPACE/engines}
     - |
       case "$REMOTE_WORKSPACE" in
@@ -454,36 +504,41 @@
     - pip3 install -q -r examples/accuracy/requirements.txt
     - if [ -n "$BASELINE_CSV" ]; then mkdir -p "$(dirname "$BASELINE_CSV")"; fi
     - echo "Setup complete. Running pipeline tests on device with pytest. Time:$(date)"
-    - python3 -m pytest tests/ --priority=$PRIORITY --execution-mode=remote --remote-host=$BOARD_IP --remote-user=$BOARD_USER --remote-password="$BOARD_PASSWORD_NVKS" --remote-workspace=$REMOTE_WORKSPACE -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
-    - if [ $? -ne 0 ]; then echo "Error occurred during testing"; exit 1; fi
-    - echo "Command execution logs and pytest reports saved to $TEST_LOG_DIR. Cleaning up remote workspace."
-    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "rm -rf $REMOTE_WORKSPACE"
+    - python3 -m pytest tests/ --priority=$PRIORITY --execution-mode=remote --remote-host=$BOARD_IP --remote-user=$BOARD_USER --remote-password="$BOARD_PASSWORD_NVKS" --remote-workspace=$REMOTE_WORKSPACE -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml="$CI_PROJECT_DIR/.ci-reports/test_report_$PRIORITY.xml"
+    - echo "HTML report saved to $TEST_LOG_DIR; JUnit report saved to $CI_PROJECT_DIR/.ci-reports"
     - ls -la $TEST_LOG_DIR
     - deactivate
     - echo "Pipeline end time:$(date)"
+  after_script:
+    - python3 .gitlab/ci/scripts/device_job_finalize.py || true
+    - !reference [.record_runner_usage, after_script]
 
 # Plugin python unit tests on an aarch64 board. Unlike .device_test_template
 # (pytest on the host driving the board over ssh), the unit tests call the
 # TensorRT Python API and torch CUDA directly, so pytest itself runs on the
 # board (see .gitlab/ci/scripts/device_unit_tests.sh).
 .device_unit_test_template:
+  extends:
+    - .gitlab_junit_report
+  variables:
+    REMOTE_WORKSPACE: "/home/${BOARD_USER}/tensorrt-edge-llm-ut-${CI_JOB_ID}"
   script:
+    - ': "${BOARD_USER:?Device jobs must define BOARD_USER}"'
     - echo "Pipeline start time:$(date)"
     - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
     - export BOARD_IP=${BOARD_IP:-192.168.55.1}
     - echo "Board IP:$BOARD_IP"
-    - mkdir -p $TEST_LOG_DIR
+    - mkdir -p $TEST_LOG_DIR "$CI_PROJECT_DIR/.ci-reports"
     - rm -rf $TEST_LOG_DIR/*
     - chmod -R 777 $TEST_LOG_DIR
     - echo "Installing dependencies"
     - export DEBIAN_FRONTEND=noninteractive
     - apt update -qq >/dev/null 2>&1
-    - apt install -y -qq git openssh-client sshpass rsync >/dev/null 2>&1
+    - apt install -y -qq git openssh-client sshpass rsync python3 >/dev/null 2>&1
     - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
     # clone googletest and nlohmannJson from internal mirror to avoid git submodule network issues
     - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
     - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
-    - export REMOTE_WORKSPACE=${REMOTE_WORKSPACE:-/home/$BOARD_USER/tensorrt-edge-llm-ut-${CI_JOB_ID:-manual}}
     - |
       case "$REMOTE_WORKSPACE" in
         /home/$BOARD_USER/tensorrt-edge-llm*) ;;
@@ -494,12 +549,10 @@
     - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -a -e "ssh -o StrictHostKeyChecking=no" $LLM_SDK_DIR/ $BOARD_USER@$BOARD_IP:$REMOTE_WORKSPACE/
     - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "chmod -R 755 $REMOTE_WORKSPACE"
     - echo "Running plugin unit tests on the board. Time:$(date)"
-    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "REMOTE_WORKSPACE='$REMOTE_WORKSPACE' TRT_PACKAGE_DIR='$TRT_PACKAGE_DIR' PRIORITY='$PRIORITY' bash -s" < .gitlab/ci/scripts/device_unit_tests.sh
-    - echo "Fetching pytest reports from the board"
-    - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -a -e "ssh -o StrictHostKeyChecking=no" $BOARD_USER@$BOARD_IP:$REMOTE_WORKSPACE/logs/ $TEST_LOG_DIR/
-    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "rm -rf '$REMOTE_WORKSPACE'"
-    - ls -la $TEST_LOG_DIR
-    - echo "Pipeline end time:$(date)"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "REMOTE_WORKSPACE='$REMOTE_WORKSPACE' TRT_PACKAGE_DIR='$TRT_PACKAGE_DIR' PRIORITY='$PRIORITY' JUNIT_PREFIX='$CI_JOB_NAME_SLUG' bash -s" < .gitlab/ci/scripts/device_unit_tests.sh
+  after_script:
+    - python3 .gitlab/ci/scripts/device_job_finalize.py --fetch-reports || true
+    - !reference [.record_runner_usage, after_script]
 
 .cross_build_template:
   script:

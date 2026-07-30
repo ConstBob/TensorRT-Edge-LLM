@@ -673,7 +673,7 @@ l1_spark:
     - export LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH
     - echo "CUDA version:$(nvcc --version | grep release)"
     - echo "TRT version:$(dpkg -l | grep tensorrt-libs | awk '{print $3}')"
-    - mkdir -p "$TEST_LOG_DIR" "$ENGINE_DIR"
+    - mkdir -p "$TEST_LOG_DIR" "$ENGINE_DIR" "$CI_PROJECT_DIR/.ci-reports"
     - rm -rf "$TEST_LOG_DIR"/* "$ENGINE_DIR"/*
     - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
     - rm -rf 3rdParty/googletest 3rdParty/nlohmannJson venv/l1-spark
@@ -684,11 +684,12 @@ l1_spark:
     - pip3 install -q -r tests/requirements.txt
     - pip3 install -q -r examples/accuracy/requirements.txt
     - if [ -n "$BASELINE_CSV" ]; then mkdir -p "$(dirname "$BASELINE_CSV")"; fi
-    - python3 -m pytest tests/ --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
+    - python3 -m pytest tests/ --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml="$CI_PROJECT_DIR/.ci-reports/test_report_$PRIORITY.xml"
     - ls -la "$TEST_LOG_DIR"
     - deactivate
     - echo "Pipeline end time:$(date)"
   extends:
+    - .gitlab_junit_report
     - .l1_rules
     - .l1_environment
   interruptible: false
