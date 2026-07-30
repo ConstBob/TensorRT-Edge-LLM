@@ -22,6 +22,7 @@
 #include "common/mathUtils.h"
 #include "common/safetensorsUtils.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
+#include "kernels/gdnKernels/gdnTreeChunkKernels.h"
 #include "kernels/posEncoding/applyRopeWriteKV.h"
 #include "kernels/speculative/batchEvictKernels.h"
 #include "kernels/speculative/ddtreeKernels.h"
@@ -673,11 +674,15 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
     auto& mambaMgr = mRuntime.base.cacheManager.getMambaCacheManager();
     if (mUseTree)
     {
-        // Tree verify materializes one hybrid state checkpoint per verify node; commit
-        // only the last accepted node's recurrent/conv states.
         if (mambaMgr.hasIntermediateRecurrentStates() || mambaMgr.hasIntermediateConvStates())
         {
-            mambaMgr.scatterAcceptedTreeStates(mAcceptedTokenIndices, mAcceptLength, context.stream);
+            int32_t const verifySize = mRuntime.deployment.specConfig->verifySize;
+            check::check(kernel::gdnTreeChunkVerifyEnabled(verifySize),
+                "MTP DDTree GDN chunk-form verify supports at most kGDN_TREE_CHUNK_MAX_NODES verify nodes");
+            // Chunk-form verify is stateless: recurrent states commit by replaying
+            // the accepted path; conv states scatter. Must use the same predicate
+            // as the plugin.
+            mambaMgr.replayCommitAcceptedTreeStates(mAcceptedTokenIndices, mAcceptLength, context.stream);
         }
     }
     else
