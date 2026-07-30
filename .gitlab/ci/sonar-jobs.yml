@@ -19,10 +19,15 @@ get-binaries:
       
   script:
     # Download sonar-scanner
-    - if [ ! -d sonar-scanner ]; then
-        curl -sSLo ./sonar-scanner.zip 'https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-6.2.0.4584-linux-x64.zip' &&
-        unzip -o sonar-scanner.zip &&
-        mv sonar-scanner-6.2.0.4584-linux-x64 sonar-scanner;
+    - |
+      if [ ! -d sonar-scanner ]; then
+        bash .gitlab/ci/scripts/ci_run.sh \
+          "$CI_DOWNLOAD_TIMEOUT_SECONDS" "Download Sonar scanner" -- \
+          curl --fail --location --show-error \
+            --output ./sonar-scanner.zip \
+            'https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-6.2.0.4584-linux-x64.zip'
+        unzip -o sonar-scanner.zip
+        mv sonar-scanner-6.2.0.4584-linux-x64 sonar-scanner
       fi
     
   rules:
@@ -37,6 +42,8 @@ build-coverage:
   variables:
     CUDA_VERSION: "13.0"
     TRT_CUDA_VERSION: "13.1"
+    CI_APT_INSTALL_TIMEOUT_SECONDS: "300"
+    CI_PIP_INSTALL_TIMEOUT_SECONDS: "300"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
   tags:
@@ -48,12 +55,10 @@ build-coverage:
       - build_coverage/compile_commands.json
     expire_in: 1 hour
   script:
-    - export DEBIAN_FRONTEND=noninteractive
-    - apt update -qq >/dev/null 2>&1
-    - apt install -y -qq python3 python3-pip cmake git unzip >/dev/null 2>&1
-    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
-    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
-    - pip3 install gcovr
+    - bash .gitlab/ci/scripts/ci_apt.sh install python3 python3-pip cmake git unzip
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_GIT_TIMEOUT_SECONDS" "Clone GoogleTest" -- git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_GIT_TIMEOUT_SECONDS" "Clone nlohmann JSON" -- git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install gcovr" -- pip3 install gcovr
     - scripts/run_coverage.sh --trt-package-dir "$TRT_PACKAGE_DIR" --cuda-version "$CUDA_VERSION"
   allow_failure: true
   rules:
@@ -67,6 +72,7 @@ build-sonar:
   timeout: 10 minutes
   variables:
     CUDA_VERSION: "13.0"
+    CI_APT_INSTALL_TIMEOUT_SECONDS: "300"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
   image: "$IMAGE"
   needs:
@@ -75,8 +81,7 @@ build-sonar:
       artifacts: true
 
   before_script:
-    - export DEBIAN_FRONTEND=noninteractive
-    - apt-get update -qq && apt-get install -y -qq git g++ >/dev/null 2>&1
+    - bash .gitlab/ci/scripts/ci_apt.sh install git g++
 
   cache:
     policy: pull-push
@@ -96,7 +101,14 @@ sonarqube-vulnerability-report:
   stage: sonarqube-vulnerability-report
   image: gcc
   script:
-    - 'curl -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/issues/gitlab_sast_export?projectKey=${SONARQUBE_PROJECT_KEY}&branch=${CI_COMMIT_BRANCH}&pullRequest=${CI_MERGE_REQUEST_IID}" -o gl-sast-sonar-report.json'
+    - |
+      bash .gitlab/ci/scripts/ci_run.sh \
+        "$CI_DOWNLOAD_TIMEOUT_SECONDS" \
+        "Download SonarQube vulnerability report" -- \
+        curl --fail --show-error \
+          -u "${SONAR_TOKEN}:" \
+          "${SONAR_HOST_URL}/api/issues/gitlab_sast_export?projectKey=${SONARQUBE_PROJECT_KEY}&branch=${CI_COMMIT_BRANCH}&pullRequest=${CI_MERGE_REQUEST_IID}" \
+          -o gl-sast-sonar-report.json
   allow_failure: true
   rules:
     - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
@@ -107,4 +119,3 @@ sonarqube-vulnerability-report:
     expire_in: 4 days
     reports:
       sast: gl-sast-sonar-report.json
-

@@ -26,13 +26,15 @@ set -euo pipefail
 : "${JUNIT_PREFIX:?JUNIT_PREFIX must be set}"
 
 cd "$REMOTE_WORKSPACE"
+ci_run="$REMOTE_WORKSPACE/.gitlab/ci/scripts/ci_run.sh"
+pip_timeout_seconds="${CI_PIP_INSTALL_TIMEOUT_SECONDS:-1200}"
 
 echo "Setting up python environment on $(hostname)"
 python3 -m venv ut_venv
 # shellcheck disable=SC1091
 source ut_venv/bin/activate
-pip3 install -q --upgrade pip
-pip3 install -q \
+bash "$ci_run" "$pip_timeout_seconds" "Upgrade pip" -- pip3 install --upgrade pip
+bash "$ci_run" "$pip_timeout_seconds" "Install unit-test dependencies" -- pip3 install \
     -r tests/requirements.txt \
     -r tests/requirements-ut.txt
 
@@ -46,7 +48,7 @@ if [ -z "$TRT_WHL" ]; then
     ls "$TRT_PACKAGE_DIR"/python/
     TRT_WHL=$(ls "$TRT_PACKAGE_DIR"/python/tensorrt-*aarch64*.whl | head -n 1)
 fi
-pip3 install -q "$TRT_WHL"
+bash "$ci_run" "$pip_timeout_seconds" "Install TensorRT Python package" -- pip3 install "$TRT_WHL"
 
 python3 -c "import torch; assert torch.cuda.is_available(), 'torch has no CUDA support on this board'"
 

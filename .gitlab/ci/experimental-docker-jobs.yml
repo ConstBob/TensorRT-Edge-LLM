@@ -16,8 +16,7 @@ l0_experimental_docker_jedha:
     REMOTE_WORKSPACE: "/home/tensorrt_user/tensorrt-edge-llm-docker-${CI_PIPELINE_ID}-${CI_JOB_ID}"
     EXPERIMENTAL_DOCKER_IMAGE: "tensorrt-edge-llm:experimental-${CI_COMMIT_SHORT_SHA}"
   before_script:
-    - apt-get update -qq
-    - apt-get install -y -qq --no-install-recommends openssh-client sshpass rsync
+    - bash .gitlab/ci/scripts/ci_apt.sh install openssh-client sshpass rsync
   script:
     - echo "Pipeline start time:$(date)"
     - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'

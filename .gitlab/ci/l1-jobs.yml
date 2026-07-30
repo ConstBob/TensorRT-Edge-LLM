@@ -38,8 +38,8 @@ l1_dataset_prep:
     - export DATA="$EDGELLM_DATA_DIR/updated_datasets"
     - mkdir -p "$DATA" "$TEST_LOG_DIR"
     - cd $LLM_SDK_DIR
-    - pip install -r tests/requirements.txt
-    - pip install -r examples/accuracy/requirements.txt
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install dataset test dependencies" -- pip install -r tests/requirements.txt
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install dataset accuracy dependencies" -- pip install -r examples/accuracy/requirements.txt
     - cd examples/accuracy/scripts
     # Text / multiple choice (LLM accuracy)
     - python prepare_dataset.py --dataset MMLU --output_dir "$DATA/MMLU_five_shot" --num_shot 5 2>&1 | tee "$TEST_LOG_DIR/mmlu_5.log"
@@ -567,11 +567,22 @@ l1_rtx5090_eagle:
       if [ ! -d "$VLMEVALKIT_DIR/.git" ]; then
         echo "Cloning VLMEvalKit into $VLMEVALKIT_DIR"
         mkdir -p "$(dirname "$VLMEVALKIT_DIR")"
-        git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/VLMEvalKit-mirror.git "$VLMEVALKIT_DIR" \
-          || git clone https://github.com/open-compass/VLMEvalKit.git "$VLMEVALKIT_DIR"
+        bash "$CI_PROJECT_DIR/.gitlab/ci/scripts/ci_run.sh" \
+          "$CI_GIT_TIMEOUT_SECONDS" "Clone VLMEvalKit mirror" -- \
+          git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/VLMEvalKit-mirror.git "$VLMEVALKIT_DIR" \
+          || bash "$CI_PROJECT_DIR/.gitlab/ci/scripts/ci_run.sh" \
+            "$CI_GIT_TIMEOUT_SECONDS" "Clone VLMEvalKit fallback" -- \
+            git clone https://github.com/open-compass/VLMEvalKit.git "$VLMEVALKIT_DIR"
       fi
-    - cd "$VLMEVALKIT_DIR" && git fetch --all -q && git checkout "$VLMEVALKIT_COMMIT" && cd -
-    - pip3 install -q -r "$VLMEVALKIT_DIR/requirements.txt"
+    - |
+      (
+        cd "$VLMEVALKIT_DIR"
+        bash "$CI_PROJECT_DIR/.gitlab/ci/scripts/ci_run.sh" \
+          "$CI_GIT_TIMEOUT_SECONDS" "Fetch VLMEvalKit revisions" -- \
+          git fetch --all
+        git checkout "$VLMEVALKIT_COMMIT"
+      )
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install VLMEvalKit dependencies" -- pip3 install -r "$VLMEVALKIT_DIR/requirements.txt"
 
 l1_b100_qwen:
   stage: l1_test
@@ -677,12 +688,12 @@ l1_spark:
     - rm -rf "$TEST_LOG_DIR"/* "$ENGINE_DIR"/*
     - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
     - rm -rf 3rdParty/googletest 3rdParty/nlohmannJson venv/l1-spark
-    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
-    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_GIT_TIMEOUT_SECONDS" "Clone GoogleTest" -- git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_GIT_TIMEOUT_SECONDS" "Clone nlohmann JSON" -- git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
     - python3 -m venv --system-site-packages venv/l1-spark
     - source venv/l1-spark/bin/activate
-    - pip3 install -q -r tests/requirements.txt
-    - pip3 install -q -r examples/accuracy/requirements.txt
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install pytest dependencies" -- pip3 install -r tests/requirements.txt
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install accuracy dependencies" -- pip3 install -r examples/accuracy/requirements.txt
     - if [ -n "$BASELINE_CSV" ]; then mkdir -p "$(dirname "$BASELINE_CSV")"; fi
     - python3 -m pytest tests/ --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml="$CI_PROJECT_DIR/.ci-reports/test_report_$PRIORITY.xml"
     - ls -la "$TEST_LOG_DIR"
