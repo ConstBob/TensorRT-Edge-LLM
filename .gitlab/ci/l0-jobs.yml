@@ -440,11 +440,9 @@ l0_unit_tests_x86_trt11_b100:
   interruptible: true
 
 # Plugin unit tests on Jetson/Drive Thor (SM110). pytest runs on the board
-# itself (TensorRT Python API + torch CUDA need the GPU); allow_failure until
-# the board python environment is proven out in CI.
+# itself (TensorRT Python API + torch CUDA need the GPU).
 l0_unit_tests_thor:
   stage: l0_test
-  allow_failure: true
   needs:
     - job: build_cutedsl_docker_matrix
       artifacts: true
@@ -470,7 +468,6 @@ l0_unit_tests_thor:
 # Plugin unit tests on Jetson Orin (SM87), same board-side pytest flow.
 l0_unit_tests_orin:
   stage: l0_test
-  allow_failure: true
   needs:
     - job: build_cutedsl_docker_matrix
       artifacts: true

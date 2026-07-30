@@ -42,15 +42,14 @@ echo "Installing TensorRT python package from $TRT_PACKAGE_DIR"
 # Pick the wheel matching this board's python ABI (the package ships several
 # cp3XX wheels); fall back to whatever is there so the error names the wheel.
 PY_TAG="cp$(python3 -c 'import sys; print(f"{sys.version_info[0]}{sys.version_info[1]}")')"
-TRT_WHL=$(ls "$TRT_PACKAGE_DIR"/python/tensorrt-*"$PY_TAG"*aarch64*.whl 2>/dev/null | head -n 1)
+TRT_WHL=$(ls "$TRT_PACKAGE_DIR"/python/tensorrt-*"$PY_TAG"*aarch64*.whl 2>/dev/null | head -n 1 || true)
 if [ -z "$TRT_WHL" ]; then
     echo "No $PY_TAG TensorRT wheel found, available wheels:"
     ls "$TRT_PACKAGE_DIR"/python/
-    TRT_WHL=$(ls "$TRT_PACKAGE_DIR"/python/tensorrt-*aarch64*.whl | head -n 1)
+    TRT_WHL=$(ls "$TRT_PACKAGE_DIR"/python/tensorrt-*aarch64*.whl | head -n 1 || true)
+    [ -n "$TRT_WHL" ] || { echo "No TensorRT aarch64 wheel found at all"; exit 1; }
 fi
 bash "$ci_run" "$pip_timeout_seconds" "Install TensorRT Python package" -- pip3 install "$TRT_WHL"
-
-python3 -c "import torch; assert torch.cuda.is_available(), 'torch has no CUDA support on this board'"
 
 export LLM_SDK_DIR="$REMOTE_WORKSPACE"
 export ONNX_DIR="$REMOTE_WORKSPACE/onnx"
@@ -59,6 +58,10 @@ mkdir -p "$ONNX_DIR" logs
 
 # test_build_project_with_pybind (l0_python_ut list) builds _edgellm_runtime.
 export PYTHONPATH="$REMOTE_WORKSPACE/build/pybind${PYTHONPATH:+:$PYTHONPATH}"
+
+# Fail loudly if the board env is broken (no torch/TRT/GPU); otherwise the
+# harness skips every test at the module level and the job goes green empty.
+python3 -c "import tensorrt, torch; assert torch.cuda.is_available(), 'CUDA not available'"
 
 echo "Running unit tests with pytest. Time:$(date)"
 # Test selection is driven by the tests/test_lists/$PRIORITY.yml list.

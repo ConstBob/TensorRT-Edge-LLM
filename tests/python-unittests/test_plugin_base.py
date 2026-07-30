@@ -61,6 +61,30 @@ except ImportError as e:  # pragma: no cover - exercised only without deps
     trt = _DummyModule()
     torch = _DummyModule()
 
+
+def _device_sm() -> int:
+    """Compute capability as major*10+minor (0 without a CUDA device)."""
+    if not (DEPENDENCIES_AVAILABLE and torch.cuda.is_available()):
+        return 0
+    major, minor = torch.cuda.get_device_capability()
+    return major * 10 + minor
+
+
+class PluginUnsupportedError(RuntimeError):
+    """The plugin/engine cannot serve this config on this device (build-time).
+
+    The graceful-failure tests pass ``expect_unsupported`` to treat a clean
+    build-time rejection as a valid outcome instead of a failure."""
+
+
+def _fail_unsupported(msg: str):
+    """A config the device cannot serve must be gated by an explicit SM/feature
+    skipif (or an expect_unsupported graceful test). Reaching this fallback means
+    a missing gate or a broken build/env -- fail loudly rather than skip green."""
+    pytest.fail(msg + " (gate this config with an explicit SM/feature skipif, "
+                "or it is a real build/environment failure)")
+
+
 # --------------------------------------------------------------------------- #
 # Plugin library discovery / registration
 # --------------------------------------------------------------------------- #
@@ -215,6 +239,7 @@ class PluginRunner:
         plugin_input_order: Optional[Sequence[str]] = None,
         plugin_namespace: str = "",
         workspace_bytes: int = 1 << 30,
+        expect_unsupported: bool = False,
     ):
         """Construct the engine.
 
@@ -285,9 +310,14 @@ class PluginRunner:
         plugin = creator.create_plugin(plugin_name, fc,
                                        trt.TensorRTPhase.BUILD)
         if plugin is None:
-            # The plugin is not built for this architecture (e.g. a CuTe DSL
-            # plugin compiled only for newer SMs); skip rather than fail.
-            pytest.skip(f"{plugin_name} plugin not available in this build")
+            # Not built for this architecture (e.g. a CuTe DSL plugin
+            # compiled only for newer SMs) -- expected only when the caller
+            # opts in; otherwise a missing gate or a broken build.
+            if expect_unsupported:
+                raise PluginUnsupportedError(
+                    f"{plugin_name} plugin not available in this build")
+            _fail_unsupported(
+                f"{plugin_name} plugin not available in this build")
 
         layer = network.add_plugin_v3(inputs, [], plugin)
         for i, oname in enumerate(output_names):
@@ -301,9 +331,14 @@ class PluginRunner:
 
         serialized = builder.build_serialized_network(network, config)
         if serialized is None:
-            # The engine could not be built for this config on this device
-            # (e.g. FP8 KV cache on an SM without FP8 tensor cores); skip.
-            pytest.skip(
+            # Unbuildable on this device (e.g. FP8 KV cache without FP8
+            # tensor cores) -- expected only when the caller opts in;
+            # otherwise a missing gate or a broken build.
+            if expect_unsupported:
+                raise PluginUnsupportedError(
+                    f"engine build unsupported for {plugin_name} on this device"
+                )
+            _fail_unsupported(
                 f"engine build unsupported for {plugin_name} on this device")
         runtime = trt.Runtime(self.logger)
         self.engine = runtime.deserialize_cuda_engine(serialized)
@@ -360,8 +395,12 @@ def cosine_sim(expected: "torch.Tensor", actual: "torch.Tensor") -> float:
     order (aarch64 torch builds crossed the bar while x86 stayed under)."""
     e = expected.double().flatten().cpu()
     a = actual.double().flatten().cpu()
-    denom = (e.norm() * a.norm()).clamp_min(1e-12)
-    return float(torch.dot(e, a) / denom)
+    en, an = float(e.norm()), float(a.norm())
+    if en == 0.0 and an == 0.0:
+        return 1.0  # identical all-zero tensors
+    if en == 0.0 or an == 0.0:
+        return 0.0
+    return float(torch.dot(e, a) / (en * an))
 
 
 def assert_close(name: str,
@@ -380,6 +419,11 @@ def assert_close(name: str,
     """
     e = expected.float()
     a = actual.float()
+    for label, t in (("expected", e), ("actual", a)):
+        if not torch.isfinite(t).all():
+            n_bad = int((~torch.isfinite(t)).sum())
+            raise AssertionError(
+                f"{name}: {label} has {n_bad}/{t.numel()} non-finite values")
     cos = cosine_sim(e, a)
     diff = (e - a).abs()
     n_viol = int((diff > atol + rtol * e.abs()).sum())

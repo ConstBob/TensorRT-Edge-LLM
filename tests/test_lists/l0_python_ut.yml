@@ -18,17 +18,31 @@ tests:
   - tests/python-unittests/test_attention_plugin.py::test_prefill_head512
   - tests/python-unittests/test_attention_plugin.py::test_prefill_head512_cutedsl_gqa_2
   - tests/python-unittests/test_attention_plugin.py::test_prefill_head512_vision_cutedsl
+  - tests/python-unittests/test_attention_plugin.py::test_prefill_head512_vision_scaled
+  - tests/python-unittests/test_attention_plugin.py::test_vision_block_prefill_then_decode
   - tests/python-unittests/test_attention_plugin.py::test_head512_vision_rejections
   - tests/python-unittests/test_attention_plugin.py::test_head512_vision_prefill_route_rejections
+  - tests/python-unittests/test_attention_plugin.py::test_prefill_head256_vision_fmha_v2_bidirectional
+  - tests/python-unittests/test_attention_plugin.py::test_head512_sliding_vision_rejected_on_non_blackwell
   - tests/python-unittests/test_attention_plugin.py::test_fp8_kv_cache_decode
   - tests/python-unittests/test_attention_plugin.py::test_fp8_kv_cache_prefill
   - tests/python-unittests/test_attention_plugin.py::test_fp8_shared_kv_prefill_rejected
+  - tests/python-unittests/test_attention_plugin.py::test_fp8_kv_cache_prefill_head512
+  - tests/python-unittests/test_attention_plugin.py::test_normal_prefill
+  - tests/python-unittests/test_attention_plugin.py::test_fp8_kv_cache_normal_prefill
+  - tests/python-unittests/test_attention_plugin.py::test_fp8_kv_cache_decode_fails_without_fp8_xqa
+  - tests/python-unittests/test_attention_plugin.py::test_decode_head256_no_gqa_fails_gracefully
+  - tests/python-unittests/test_attention_plugin.py::test_configurable_softmax_scale
+  - tests/python-unittests/test_attention_plugin.py::test_configurable_softmax_scale_head512
   - tests/python-unittests/test_attention_plugin.py::test_decode_head32
   - tests/python-unittests/test_attention_plugin.py::test_shared_kv_prefill
+  - tests/python-unittests/test_attention_plugin.py::test_shared_kv_prefill_scaled
   - tests/python-unittests/test_attention_plugin.py::test_shared_kv_chunked_prefill
   - tests/python-unittests/test_attention_plugin.py::test_shared_kv_decode
   - tests/python-unittests/test_attention_plugin.py::test_shared_kv_tree_decode
   - tests/python-unittests/test_attention_plugin.py::test_prefill_successive_chunks
+  - tests/python-unittests/test_attention_plugin.py::test_paged_kv_shuffled_page_table
+  - tests/python-unittests/test_attention_plugin.py::test_paged_kv_shuffled_page_table_decode
   - tests/python-unittests/test_attention_plugin.py::test_ragged_context_lengths_decode
   - tests/python-unittests/test_attention_plugin.py::test_ragged_prefill
   - tests/python-unittests/test_attention_plugin.py::test_ragged_prefill_head512_cutedsl
@@ -36,6 +50,7 @@ tests:
   - tests/python-unittests/test_attention_plugin.py::test_ragged_prefill_batch_invariance
   - tests/python-unittests/test_attention_plugin.py::test_batch_permutation_invariance_decode
   - tests/python-unittests/test_attention_plugin.py::test_tree_attention
+  - tests/python-unittests/test_attention_plugin.py::test_tree_attention_head512_prefill_then_decode
   - tests/python-unittests/test_attention_plugin.py::test_tree_attention_topology
   - tests/python-unittests/test_attention_plugin.py::test_prefill_decode_handoff
   - tests/python-unittests/test_attention_plugin.py::test_prefill_qknorm
@@ -48,6 +63,7 @@ tests:
   # Sliding-window attention tests
   - tests/python-unittests/test_sliding_window_attention_plugin.py::test_sliding_window_prefill
   - tests/python-unittests/test_sliding_window_attention_plugin.py::test_sliding_window_prefill_head256
+  - tests/python-unittests/test_sliding_window_attention_plugin.py::test_sliding_window_prefill_head512
   - tests/python-unittests/test_sliding_window_attention_plugin.py::test_sliding_window_decode
 
   # Mamba selective-state-update (update_ssm_state) plugin tests
@@ -95,9 +111,12 @@ tests:
   - tests/python-unittests/test_vit_attention_plugin.py::test_head_sweep
   - tests/python-unittests/test_vit_attention_plugin.py::test_batch_invariance
 
-  # Configurable Attention Scaling Tests
-  - tests/python-unittests/test_shared_kv.py::TestSharedKVAttention::test_shared_kv_attention_correctness
-  - tests/python-unittests/test_shared_kv.py::TestSharedKVAttention::test_shared_kv_decode_correctness
+
+  # Gemma4 audio attention plugin tests
+  - tests/python-unittests/test_gemma4_audio_attention_plugin.py::test_prefill
+  - tests/python-unittests/test_gemma4_audio_attention_plugin.py::test_dtype
+  - tests/python-unittests/test_gemma4_audio_attention_plugin.py::test_batch
+  - tests/python-unittests/test_gemma4_audio_attention_plugin.py::test_ragged_padding_poison
 
   # Experimental Server Tool Calling Tests
   - tests/python-unittests/test_tool_chat_template.py::test_needs_tool_template
