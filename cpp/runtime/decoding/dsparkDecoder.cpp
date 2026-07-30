@@ -34,6 +34,7 @@
 #include "profiling/timer.h"
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/decoding/decoderUtils.h"
+#include "runtime/decoding/logitBias.h"
 #include "sampler/sampling.h"
 
 #include <algorithm>
@@ -370,6 +371,27 @@ bool DSparkDecoder::decodeStep(DecodingInferenceContext& context)
     return true;
 }
 
+// Keep this orchestration helper in the decoder layer because logit-bias application
+// consumes DecodingInferenceContext and runtime-owned sparse bias buffers; the kernel
+// layer remains independent of request-local bias state.
+void DSparkDecoder::dsparkBiasMarkovSample(
+    DecodingInferenceContext& context, int32_t activeBatchSize, int32_t proposalLen)
+{
+    check::check(mDraftStepProbabilities.reshape({activeBatchSize, mDraftVocabSize}), "Tensor reshape failed");
+    for (int32_t step = 0; step < proposalLen; ++step)
+    {
+        kernel::dsparkBuildMarkovLogits(mDraftOutputLogits, mMarkovW1, mMarkovW2, mLastAcceptedTokens, mDraftTokenIds,
+            mDraftStepLogits, activeBatchSize, step, proposalLen, mDraftVocabSize, mMarkovRank, context.stream);
+        applyLogitBias(mRuntime.logitBias, mDraftStepLogits, context, context.stream);
+        kernel::dsparkLogitsToProbabilities(mDraftStepLogits, mDraftStepProbabilities, activeBatchSize, mDraftVocabSize,
+            context.temperature, static_cast<int32_t>(context.topK), context.topP, context.stream);
+        kernel::dsparkSampleProbabilityRows(mDraftStepProbabilities, mDraftUniforms, mDraftTokenIds, activeBatchSize,
+            step, proposalLen, mDraftVocabSize, context.stream);
+        kernel::dsparkStoreDraftStepProbabilities(mDraftStepProbabilities, mDraftProbabilities, activeBatchSize, step,
+            proposalLen, mDraftVocabSize, context.stream);
+    }
+}
+
 bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
 {
     TIME_STAGE(metrics::StageNames::kSPEC_DECODE_DRAFT_PROPOSAL, context.stream);
@@ -540,6 +562,10 @@ bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
                 kernel::dsparkBuildMarkovLogits(mDraftOutputLogits, mMarkovW1, mMarkovW2, mLastAcceptedTokens,
                     mDraftTokenIds, mDraftStepLogits, activeBatchSize, step, proposalLen, mDraftVocabSize, mMarkovRank,
                     context.stream);
+                if (context.hasLogitBias)
+                {
+                    applyLogitBias(mRuntime.logitBias, mDraftStepLogits, context, context.stream);
+                }
                 selectAllTopK(mDraftStepLogits, std::ref(mDraftStepTopKValues), mDraftStepTopKIndices, samplingTopK,
                     mRuntime.sampling.workspace, context.stream);
                 kernel::dsparkSampleTopKRowsAndStore(mDraftStepTopKValues, mDraftStepTopKIndices, mDraftUniforms,
@@ -549,10 +575,17 @@ bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
         }
         else
         {
-            kernel::dsparkVanillaMarkovSample(mDraftOutputLogits, mMarkovW1, mMarkovW2, mLastAcceptedTokens,
-                mDraftUniforms, mDraftTokenIds, mDraftProbabilities, mDraftStepLogits, mDraftStepProbabilities,
-                activeBatchSize, proposalLen, mDraftVocabSize, mMarkovRank, context.temperature,
-                static_cast<int32_t>(context.topK), context.topP, context.stream);
+            if (context.hasLogitBias)
+            {
+                dsparkBiasMarkovSample(context, activeBatchSize, proposalLen);
+            }
+            else
+            {
+                kernel::dsparkVanillaMarkovSample(mDraftOutputLogits, mMarkovW1, mMarkovW2, mLastAcceptedTokens,
+                    mDraftUniforms, mDraftTokenIds, mDraftProbabilities, mDraftStepLogits, mDraftStepProbabilities,
+                    activeBatchSize, proposalLen, mDraftVocabSize, mMarkovRank, context.temperature,
+                    static_cast<int32_t>(context.topK), context.topP, context.stream);
+            }
         }
     }
     else
@@ -766,6 +799,11 @@ bool DSparkDecoder::runBaseVerification(DecodingInferenceContext& context)
     int32_t const baseVocabSize = mRuntime.deployment.base.outputVocabSize;
     check::check(mRuntime.base.pipelineIO.outputLogits.reshape({activeBatchSize, verifyLen, baseVocabSize}),
         "Tensor reshape failed");
+    if (context.hasLogitBias)
+    {
+        applyLogitBiasRepeatedRows(
+            mRuntime.logitBias, mRuntime.base.pipelineIO.outputLogits, context, verifyLen, context.stream);
+    }
 
     if (mUseTree)
     {

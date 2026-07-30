@@ -72,6 +72,7 @@ private:
     bool runBaseVerification(DecodingInferenceContext& context);
     bool buildTreeVerifyInputs(int32_t activeBatchSize, cudaStream_t stream, bool useConfidence);
     void commitAcceptedTreePath(DecodingInferenceContext& context, int32_t verifySize, int32_t maxAcceptLength);
+    void dsparkBiasMarkovSample(DecodingInferenceContext& context, int32_t activeBatchSize, int32_t proposalLen);
     void loadHeadSidecars(std::filesystem::path const& engineDir, cudaStream_t stream);
 
     DecodingRuntimeContext& mRuntime;

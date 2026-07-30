@@ -735,14 +735,6 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
 
     DecodingStrategy& decodingStrategy = mDecoderRegistry->select(request);
     bool const enableSpecDecode = decodingStrategy.isSpeculative();
-    if (shouldRejectLogitBiasWithSpecDecode(request, enableSpecDecode))
-    {
-        LOG_ERROR(
-            "logit_bias is not supported while speculative decoding is enabled; set disable_spec_decode=true or use "
-            "a vanilla decoding strategy.");
-        return false;
-    }
-
     // DSpark implements the paper-equivalent probabilistic verifier and can keep non-greedy sampling params.
     // Other speculative decoders still run greedy-compatible verification.
     bool const hasNonGreedySampling = shouldUseNonGreedySampling(request.temperature, request.topK, request.topP);
@@ -1768,7 +1760,10 @@ bool LLMInferenceRuntime::runBaseModelPrefill(
         return true;
     }
 
-    applyLogitBias(mLogitBias, mPipelineIO->outputLogits, context, context.stream);
+    if (context.hasLogitBias)
+    {
+        applyLogitBias(mLogitBias, mPipelineIO->outputLogits, context, context.stream);
+    }
 
     // Sampling from the prefill stage logits follows the same policy as vanilla decoding.
     // DSpark keeps non-greedy params; other speculative decoders are normalized to greedy

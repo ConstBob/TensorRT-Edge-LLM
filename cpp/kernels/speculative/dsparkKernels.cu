@@ -1260,6 +1260,7 @@ void dsparkVanillaMarkovSample(rt::Tensor const& backboneLogits, rt::Tensor cons
     int32_t batchSize, int32_t proposalLen, int32_t vocabSize, int32_t markovRank, float temperature, int32_t topK,
     float topP, cudaStream_t stream)
 {
+    check::check(probabilityScratch.reshape({batchSize, vocabSize}), "Tensor reshape failed");
     int32_t const numVocabBlocks = dsparkMarkovPartialCount(vocabSize);
     dim3 const markovGrid(numVocabBlocks, batchSize);
     int32_t const totalProbabilityElements = batchSize * vocabSize;

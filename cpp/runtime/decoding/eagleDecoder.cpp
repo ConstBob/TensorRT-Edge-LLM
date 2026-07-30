@@ -31,6 +31,7 @@
 #include "profiling/timer.h"
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/decoding/decoderUtils.h"
+#include "runtime/decoding/logitBias.h"
 #include "runtime/preprocess/embeddingPreprocessor.h"
 #include "sampler/sampling.h"
 
@@ -605,6 +606,12 @@ bool EagleDecoder::runBaseModelVerification(DecodingInferenceContext& context)
     {
         LOG_ERROR("Failed to execute base verification step for base model.");
         return false;
+    }
+
+    if (context.hasLogitBias)
+    {
+        applyLogitBiasRepeatedRows(mRuntime.logitBias, mRuntime.base.pipelineIO.outputLogits, context,
+            mRuntime.deployment.specConfig->verifySize, context.stream);
     }
 
     int32_t const maxAcceptDepth = mRuntime.deployment.specConfig->draftingStep + 1;
