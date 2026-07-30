@@ -17,12 +17,13 @@
 # Runs the plugin Python unit tests ON an aarch64 board (Thor/Orin). Unlike the
 # pipeline tests, these drive the TensorRT Python API + torch CUDA directly, so
 # the pytest process must run where the GPU is. Executed over ssh with:
-#   REMOTE_WORKSPACE=... TRT_PACKAGE_DIR=... PRIORITY=... bash -s < this-script
+#   REMOTE_WORKSPACE=... TRT_PACKAGE_DIR=... PRIORITY=... JUNIT_PREFIX=... bash -s
 set -euo pipefail
 
 : "${REMOTE_WORKSPACE:?REMOTE_WORKSPACE must be set}"
 : "${TRT_PACKAGE_DIR:?TRT_PACKAGE_DIR must be set}"
 : "${PRIORITY:?PRIORITY must be set}"
+: "${JUNIT_PREFIX:?JUNIT_PREFIX must be set}"
 
 cd "$REMOTE_WORKSPACE"
 
@@ -61,4 +62,5 @@ echo "Running unit tests with pytest. Time:$(date)"
 # Test selection is driven by the tests/test_lists/$PRIORITY.yml list.
 python3 -m pytest tests/ --priority="$PRIORITY" -v --color=yes \
     --html="logs/test_report_$PRIORITY.html" --self-contained-html \
+    --junit-prefix="$JUNIT_PREFIX" \
     --junitxml="logs/test_report_$PRIORITY.xml"

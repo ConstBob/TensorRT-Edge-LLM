@@ -37,6 +37,7 @@ workflow:
 
 include:
   - local: '.gitlab/ci/templates.yml'
+  - local: '.gitlab/ci/precheck-jobs.yml'
   - local: '.gitlab/ci/setup-jobs.yml'
   - local: '.gitlab/ci/cutedsl-jobs.yml'
   - local: '.gitlab/ci/l0-jobs.yml'
@@ -47,6 +48,8 @@ include:
   - local: '.gitlab/ci/local-board-jobs.yml'
   - local: '.gitlab/ci/experimental-docker-jobs.yml'
 
+# `precheck` is a hard gate. Later `needs` chains must remain rooted in a job
+# that waits for this stage to complete successfully.
 stages:
 - precheck
 - setup
