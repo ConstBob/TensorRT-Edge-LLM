@@ -371,12 +371,47 @@ bool DSparkDecoder::decodeStep(DecodingInferenceContext& context)
     return true;
 }
 
-// Keep this orchestration helper in the decoder layer because logit-bias application
+// Keep these orchestration helpers in the decoder layer because logit-bias application
 // consumes DecodingInferenceContext and runtime-owned sparse bias buffers; the kernel
 // layer remains independent of request-local bias state.
+
+void DSparkDecoder::dsparkBiasMarkovGreedy(
+    DecodingInferenceContext& context, int32_t activeBatchSize, int32_t proposalLen)
+{
+    int32_t constexpr topK = 1;
+    int32_t const proposalDepthSize = proposalLen + 1;
+    check::check(mDraftStepLogits.reshape({activeBatchSize, mDraftVocabSize}), "Tensor reshape failed");
+    check::check(mDraftStepTopKValues.reshape({activeBatchSize, topK}), "Tensor reshape failed");
+    check::check(mDraftStepTopKIndices.reshape({activeBatchSize, topK}), "Tensor reshape failed");
+    if (mUseTree)
+    {
+        check::check(mStackedMarkovLogits.reshape({activeBatchSize, proposalDepthSize, mDraftVocabSize}),
+            "Tensor reshape failed");
+    }
+    size_t const rowBytes = static_cast<size_t>(mDraftVocabSize) * sizeof(float);
+    for (int32_t step = 0; step < proposalLen; ++step)
+    {
+        kernel::dsparkBuildMarkovLogits(mDraftOutputLogits, mMarkovW1, mMarkovW2, mLastAcceptedTokens, mDraftTokenIds,
+            mDraftStepLogits, activeBatchSize, step, proposalLen, mDraftVocabSize, mMarkovRank, context.stream);
+        applyLogitBias(mRuntime.logitBias, mDraftStepLogits, context, context.stream);
+        if (mUseTree)
+        {
+            CUDA_CHECK(cudaMemcpy2DAsync(
+                static_cast<char*>(mStackedMarkovLogits.rawPointer()) + static_cast<size_t>(step + 1) * rowBytes,
+                static_cast<size_t>(proposalDepthSize) * rowBytes, mDraftStepLogits.rawPointer(), rowBytes, rowBytes,
+                activeBatchSize, cudaMemcpyDeviceToDevice, context.stream));
+        }
+        selectAllTopK(mDraftStepLogits, std::ref(mDraftStepTopKValues), mDraftStepTopKIndices, topK,
+            mRuntime.sampling.workspace, context.stream);
+        kernel::dsparkStoreDraftStepTop1(
+            mDraftStepTopKIndices, mDraftTokenIds, activeBatchSize, step, proposalLen, context.stream);
+    }
+}
+
 void DSparkDecoder::dsparkBiasMarkovSample(
     DecodingInferenceContext& context, int32_t activeBatchSize, int32_t proposalLen)
 {
+    check::check(mDraftStepLogits.reshape({activeBatchSize, mDraftVocabSize}), "Tensor reshape failed");
     check::check(mDraftStepProbabilities.reshape({activeBatchSize, mDraftVocabSize}), "Tensor reshape failed");
     for (int32_t step = 0; step < proposalLen; ++step)
     {
@@ -590,38 +625,45 @@ bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
     }
     else
     {
-        // Greedy, chain and tree alike: per-step Markov-corrected row + top-1. Shared
-        // code makes tree candidateTopK=1 reproduce the chain structurally, and this
-        // path outruns the old fused batch-tile argmax kernel at every batch size.
-        int32_t const proposalDepthSize = proposalLen + 1;
-        check::check(mDraftStepLogits.reshape({activeBatchSize, mDraftVocabSize}), "Tensor reshape failed");
-        check::check(mDraftStepTopKValues.reshape({activeBatchSize, 1}), "Tensor reshape failed");
-        check::check(mDraftStepTopKIndices.reshape({activeBatchSize, 1}), "Tensor reshape failed");
-        if (mUseTree)
+        if (context.hasLogitBias)
         {
-            check::check(mStackedMarkovLogits.reshape({activeBatchSize, proposalDepthSize, mDraftVocabSize}),
-                "Tensor reshape failed");
+            dsparkBiasMarkovGreedy(context, activeBatchSize, proposalLen);
         }
-        size_t const rowBytes = static_cast<size_t>(mDraftVocabSize) * sizeof(float);
-        for (int32_t step = 0; step < proposalLen; ++step)
+        else
         {
-            kernel::dsparkBuildMarkovLogits(mDraftOutputLogits, mMarkovW1, mMarkovW2, mLastAcceptedTokens,
-                mDraftTokenIds, mDraftStepLogits, activeBatchSize, step, proposalLen, mDraftVocabSize, mMarkovRank,
-                context.stream);
+            // Greedy, chain and tree alike: per-step Markov-corrected row + top-1. Shared
+            // code makes tree candidateTopK=1 reproduce the chain structurally, and this
+            // path outruns the old fused batch-tile argmax kernel at every batch size.
+            int32_t const proposalDepthSize = proposalLen + 1;
+            check::check(mDraftStepLogits.reshape({activeBatchSize, mDraftVocabSize}), "Tensor reshape failed");
+            check::check(mDraftStepTopKValues.reshape({activeBatchSize, 1}), "Tensor reshape failed");
+            check::check(mDraftStepTopKIndices.reshape({activeBatchSize, 1}), "Tensor reshape failed");
             if (mUseTree)
             {
-                // Step logits become the depth-(step+1) candidate row (row 0 is the root placeholder).
-                CUDA_CHECK(cudaMemcpy2DAsync(
-                    static_cast<char*>(mStackedMarkovLogits.rawPointer()) + static_cast<size_t>(step + 1) * rowBytes,
-                    static_cast<size_t>(proposalDepthSize) * rowBytes, mDraftStepLogits.rawPointer(), rowBytes,
-                    rowBytes, activeBatchSize, cudaMemcpyDeviceToDevice, context.stream));
+                check::check(mStackedMarkovLogits.reshape({activeBatchSize, proposalDepthSize, mDraftVocabSize}),
+                    "Tensor reshape failed");
             }
-            selectAllTopK(mDraftStepLogits, std::ref(mDraftStepTopKValues), mDraftStepTopKIndices, /*topK=*/1,
-                mRuntime.sampling.workspace, context.stream);
-            CUDA_CHECK(cudaMemcpy2DAsync(
-                static_cast<char*>(mDraftTokenIds.rawPointer()) + static_cast<size_t>(step) * sizeof(int32_t),
-                static_cast<size_t>(proposalLen) * sizeof(int32_t), mDraftStepTopKIndices.rawPointer(), sizeof(int32_t),
-                sizeof(int32_t), activeBatchSize, cudaMemcpyDeviceToDevice, context.stream));
+            size_t const rowBytes = static_cast<size_t>(mDraftVocabSize) * sizeof(float);
+            for (int32_t step = 0; step < proposalLen; ++step)
+            {
+                kernel::dsparkBuildMarkovLogits(mDraftOutputLogits, mMarkovW1, mMarkovW2, mLastAcceptedTokens,
+                    mDraftTokenIds, mDraftStepLogits, activeBatchSize, step, proposalLen, mDraftVocabSize, mMarkovRank,
+                    context.stream);
+                if (mUseTree)
+                {
+                    // Step logits become the depth-(step+1) candidate row (row 0 is the root placeholder).
+                    CUDA_CHECK(cudaMemcpy2DAsync(
+                        static_cast<char*>(mStackedMarkovLogits.rawPointer()) + static_cast<size_t>(step + 1) * rowBytes,
+                        static_cast<size_t>(proposalDepthSize) * rowBytes, mDraftStepLogits.rawPointer(), rowBytes,
+                        rowBytes, activeBatchSize, cudaMemcpyDeviceToDevice, context.stream));
+                }
+                selectAllTopK(mDraftStepLogits, std::ref(mDraftStepTopKValues), mDraftStepTopKIndices, /*topK=*/1,
+                    mRuntime.sampling.workspace, context.stream);
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    static_cast<char*>(mDraftTokenIds.rawPointer()) + static_cast<size_t>(step) * sizeof(int32_t),
+                    static_cast<size_t>(proposalLen) * sizeof(int32_t), mDraftStepTopKIndices.rawPointer(),
+                    sizeof(int32_t), sizeof(int32_t), activeBatchSize, cudaMemcpyDeviceToDevice, context.stream));
+            }
         }
     }
 

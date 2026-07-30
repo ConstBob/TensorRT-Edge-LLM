@@ -158,7 +158,7 @@ def test_api_accepts_logit_bias_with_active_spec_decode(stream):
         },
     )
 
-    assert response.status_code != 400
+    assert response.status_code == 200
 
 
 @pytest.mark.parametrize("stream", [False, True])

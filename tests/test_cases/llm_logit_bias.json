@@ -5,7 +5,7 @@
     "top_k": 50,
     "max_generate_length": 128,
     "logit_bias": {
-        "0": 0.0
+        "0": -100.0
     },
     "requests": [
         {
