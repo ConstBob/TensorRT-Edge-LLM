@@ -24,7 +24,9 @@ from . import first_present, load_hf_split, register
 @register("text", "cnn_dailymail")
 def cnn_dailymail():
     """CNN/DailyMail news articles -- the default text dataset."""
-    ds = load_hf_split("cnn_dailymail",
+    # Use the canonical namespaced Hub id: recent huggingface_hub rejects the
+    # bare "cnn_dailymail" ("Repository id must be 'namespace/name'").
+    ds = load_hf_split("abisee/cnn_dailymail",
                        name="cnn_dailymail",
                        config="3.0.0",
                        split="train")
