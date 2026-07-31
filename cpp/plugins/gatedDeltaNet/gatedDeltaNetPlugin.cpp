@@ -98,15 +98,6 @@ GatedDeltaNetPlugin::GatedDeltaNetPlugin(
             mKDim, mVDim, mSMVersion);
         throw std::runtime_error("Cannot implement the GatedDeltaNetPlugin configuration (CuTe DSL GDN).");
     }
-
-    if (!CuteDslGDNRunner::loadKernelModules())
-    {
-        LOG_ERROR(
-            "Failed to load CuTe DSL GDN kernel modules (gdn_decode / gdn_prefill AOT). "
-            "Check that the engine was built with ENABLE_CUTE_DSL=gdn (or ALL), AOT .o/.h are present and match the "
-            "exported API, and the CUDA driver is compatible.");
-        throw std::runtime_error("Cannot load CuTe DSL GDN kernel modules for GatedDeltaNetPlugin.");
-    }
 }
 #else
 GatedDeltaNetPlugin::GatedDeltaNetPlugin(
@@ -133,7 +124,6 @@ GatedDeltaNetPlugin::GatedDeltaNetPlugin(std::string const& name, PluginFieldCol
 
 #ifdef CUTE_DSL_GDN_ENABLED
     mSMVersion = getSMVersion();
-    CuteDslGDNRunner::loadKernelModules();
 #else
     LOG_ERROR("GatedDeltaNet plugin is not available: build with CUTE_DSL_GDN_ENABLED to enable it.");
     throw std::runtime_error("GatedDeltaNet plugin is not available: build with CUTE_DSL_GDN_ENABLED to enable it.");
@@ -407,8 +397,6 @@ int32_t GatedDeltaNetPlugin::getAliasedInput(int32_t outputIndex) noexcept
 int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* /* outputDesc */,
     void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
 {
-    CuteDslGDNRunner::loadKernelModules();
-
     int64_t const* qDims = inputDesc[kIN_Q_IDX].dims.d;
     int32_t const n = static_cast<int32_t>(qDims[0]);
     int32_t const seq_len = static_cast<int32_t>(qDims[1]);
@@ -454,6 +442,16 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
                 depthDesc.dims.nbDims > 1 ? static_cast<long long>(depthDesc.dims.d[1]) : -1LL);
             return -1;
         }
+    }
+
+    GDNParams params{};
+    params.seq_len = seq_len;
+    params.smVersion = mSMVersion;
+    params.use_mtp = mtpActive;
+    if (!ddtreeActive && !CuteDslGDNRunner::ensureKernelModules(params, stream))
+    {
+        LOG_ERROR("gated_delta_net: failed to load the selected CuTe DSL GDN module");
+        return -1;
     }
 
     // h0 is batch-dense [n, hv, k, v]
@@ -517,7 +515,6 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
         return 0;
     }
 
-    GDNParams params{};
     params.q = const_cast<void*>(inputs[kIN_Q_IDX]);
     params.k = const_cast<void*>(inputs[kIN_K_IDX]);
     params.v = const_cast<void*>(inputs[kIN_V_IDX]);

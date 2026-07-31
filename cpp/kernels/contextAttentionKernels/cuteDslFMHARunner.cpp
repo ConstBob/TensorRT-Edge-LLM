@@ -41,6 +41,12 @@ bool isSupportedBlackwellFmha(int32_t smVersion)
     return smVersion == 100 || smVersion == 101 || smVersion == 110;
 }
 
+template <auto moduleLoader, auto moduleUnloader, typename Module>
+bool preflightVariant(detail::LazyKernelModule<Module>& state, char const* moduleName, cudaStream_t stream)
+{
+    return detail::ensureModuleLoaded<moduleLoader, moduleUnloader>(state, moduleName, stream);
+}
+
 } // namespace
 
 // =====================================================================
@@ -48,201 +54,54 @@ bool isSupportedBlackwellFmha(int32_t smVersion)
 // =====================================================================
 
 // LLM (FP16)
-fmha_d64_Kernel_Module_t CuteDslFMHARunner::sLLM_d64 = {};
-fmha_d128_Kernel_Module_t CuteDslFMHARunner::sLLM_d128 = {};
-fmha_d256_Kernel_Module_t CuteDslFMHARunner::sLLM_d256 = {};
-fmha_d64_sw_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_sw = {};
-fmha_d128_sw_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_sw = {};
-fmha_d256_sw_Kernel_Module_t CuteDslFMHARunner::sLLM_d256_sw = {};
+detail::LazyKernelModule<fmha_d64_Kernel_Module_t> CuteDslFMHARunner::sLLM_d64{};
+detail::LazyKernelModule<fmha_d128_Kernel_Module_t> CuteDslFMHARunner::sLLM_d128{};
+detail::LazyKernelModule<fmha_d256_Kernel_Module_t> CuteDslFMHARunner::sLLM_d256{};
+detail::LazyKernelModule<fmha_d64_sw_Kernel_Module_t> CuteDslFMHARunner::sLLM_d64_sw{};
+detail::LazyKernelModule<fmha_d128_sw_Kernel_Module_t> CuteDslFMHARunner::sLLM_d128_sw{};
+detail::LazyKernelModule<fmha_d256_sw_Kernel_Module_t> CuteDslFMHARunner::sLLM_d256_sw{};
 // LLM skip-softmax (BLASST, FP16 causal)
-fmha_d64_skipsoftmax_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_skipsoftmax = {};
-fmha_d128_skipsoftmax_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_skipsoftmax = {};
-fmha_d64_skipsoftmax_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_skipsoftmax_paged = {};
-fmha_d128_skipsoftmax_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_skipsoftmax_paged = {};
+detail::LazyKernelModule<fmha_d64_skipsoftmax_Kernel_Module_t> CuteDslFMHARunner::sLLM_d64_skipsoftmax{};
+detail::LazyKernelModule<fmha_d128_skipsoftmax_Kernel_Module_t> CuteDslFMHARunner::sLLM_d128_skipsoftmax{};
+detail::LazyKernelModule<fmha_d64_skipsoftmax_paged_Kernel_Module_t> CuteDslFMHARunner::sLLM_d64_skipsoftmax_paged{};
+detail::LazyKernelModule<fmha_d128_skipsoftmax_paged_Kernel_Module_t> CuteDslFMHARunner::sLLM_d128_skipsoftmax_paged{};
 // LLM (FP8 input, FP16 output)
-fmha_d64_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_fp8 = {};
-fmha_d128_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_fp8 = {};
-fmha_d256_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d256_fp8 = {};
-fmha_d64_sw_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_sw_fp8 = {};
-fmha_d128_sw_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_sw_fp8 = {};
-fmha_d256_sw_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d256_sw_fp8 = {};
+detail::LazyKernelModule<fmha_d64_fp8_Kernel_Module_t> CuteDslFMHARunner::sLLM_d64_fp8{};
+detail::LazyKernelModule<fmha_d128_fp8_Kernel_Module_t> CuteDslFMHARunner::sLLM_d128_fp8{};
+detail::LazyKernelModule<fmha_d256_fp8_Kernel_Module_t> CuteDslFMHARunner::sLLM_d256_fp8{};
+detail::LazyKernelModule<fmha_d64_sw_fp8_Kernel_Module_t> CuteDslFMHARunner::sLLM_d64_sw_fp8{};
+detail::LazyKernelModule<fmha_d128_sw_fp8_Kernel_Module_t> CuteDslFMHARunner::sLLM_d128_sw_fp8{};
+detail::LazyKernelModule<fmha_d256_sw_fp8_Kernel_Module_t> CuteDslFMHARunner::sLLM_d256_sw_fp8{};
 // LLM paged KV cache (FP16)
-fmha_d64_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_paged = {};
-fmha_d128_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_paged = {};
-fmha_d256_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d256_paged = {};
-fmha_d256_dense_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d256_dense_paged = {};
-fmha_d512_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d512_paged = {};
-fmha_d512_dense_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d512_dense_paged = {};
-fmha_d64_sw_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_sw_paged = {};
-fmha_d128_sw_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_sw_paged = {};
-fmha_d256_sw_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d256_sw_paged = {};
-fmha_d512_sw_paged_Kernel_Module_t CuteDslFMHARunner::sLLM_d512_sw_paged = {};
-fmha_d512_paged_bidirectional_Kernel_Module_t CuteDslFMHARunner::sLLM_d512_paged_bidirectional = {};
+detail::LazyKernelModule<fmha_d64_paged_Kernel_Module_t> CuteDslFMHARunner::sLLM_d64_paged{};
+detail::LazyKernelModule<fmha_d128_paged_Kernel_Module_t> CuteDslFMHARunner::sLLM_d128_paged{};
+detail::LazyKernelModule<fmha_d256_paged_Kernel_Module_t> CuteDslFMHARunner::sLLM_d256_paged{};
+detail::LazyKernelModule<fmha_d256_dense_paged_Kernel_Module_t> CuteDslFMHARunner::sLLM_d256_dense_paged{};
+detail::LazyKernelModule<fmha_d512_paged_Kernel_Module_t> CuteDslFMHARunner::sLLM_d512_paged{};
+detail::LazyKernelModule<fmha_d512_dense_paged_Kernel_Module_t> CuteDslFMHARunner::sLLM_d512_dense_paged{};
+detail::LazyKernelModule<fmha_d64_sw_paged_Kernel_Module_t> CuteDslFMHARunner::sLLM_d64_sw_paged{};
+detail::LazyKernelModule<fmha_d128_sw_paged_Kernel_Module_t> CuteDslFMHARunner::sLLM_d128_sw_paged{};
+detail::LazyKernelModule<fmha_d256_sw_paged_Kernel_Module_t> CuteDslFMHARunner::sLLM_d256_sw_paged{};
+detail::LazyKernelModule<fmha_d512_sw_paged_Kernel_Module_t> CuteDslFMHARunner::sLLM_d512_sw_paged{};
+detail::LazyKernelModule<fmha_d512_paged_bidirectional_Kernel_Module_t>
+    CuteDslFMHARunner::sLLM_d512_paged_bidirectional{};
 // LLM paged KV cache (FP8 input, FP16 output)
-fmha_d64_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_paged_fp8 = {};
-fmha_d128_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_paged_fp8 = {};
-fmha_d256_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d256_paged_fp8 = {};
-fmha_d256_dense_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d256_dense_paged_fp8 = {};
-fmha_d512_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d512_paged_fp8 = {};
-fmha_d512_dense_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d512_dense_paged_fp8 = {};
-fmha_d64_sw_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_sw_paged_fp8 = {};
-fmha_d128_sw_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_sw_paged_fp8 = {};
-fmha_d256_sw_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d256_sw_paged_fp8 = {};
-fmha_d512_sw_paged_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d512_sw_paged_fp8 = {};
-bool CuteDslFMHARunner::sLLMLoaded = false;
-std::mutex CuteDslFMHARunner::sLLMMutex;
+detail::LazyKernelModule<fmha_d64_paged_fp8_Kernel_Module_t> CuteDslFMHARunner::sLLM_d64_paged_fp8{};
+detail::LazyKernelModule<fmha_d128_paged_fp8_Kernel_Module_t> CuteDslFMHARunner::sLLM_d128_paged_fp8{};
+detail::LazyKernelModule<fmha_d256_paged_fp8_Kernel_Module_t> CuteDslFMHARunner::sLLM_d256_paged_fp8{};
+detail::LazyKernelModule<fmha_d256_dense_paged_fp8_Kernel_Module_t> CuteDslFMHARunner::sLLM_d256_dense_paged_fp8{};
+detail::LazyKernelModule<fmha_d512_paged_fp8_Kernel_Module_t> CuteDslFMHARunner::sLLM_d512_paged_fp8{};
+detail::LazyKernelModule<fmha_d512_dense_paged_fp8_Kernel_Module_t> CuteDslFMHARunner::sLLM_d512_dense_paged_fp8{};
+detail::LazyKernelModule<fmha_d64_sw_paged_fp8_Kernel_Module_t> CuteDslFMHARunner::sLLM_d64_sw_paged_fp8{};
+detail::LazyKernelModule<fmha_d128_sw_paged_fp8_Kernel_Module_t> CuteDslFMHARunner::sLLM_d128_sw_paged_fp8{};
+detail::LazyKernelModule<fmha_d256_sw_paged_fp8_Kernel_Module_t> CuteDslFMHARunner::sLLM_d256_sw_paged_fp8{};
+detail::LazyKernelModule<fmha_d512_sw_paged_fp8_Kernel_Module_t> CuteDslFMHARunner::sLLM_d512_sw_paged_fp8{};
 
 // ViT
-vit_fmha_d64_Kernel_Module_t CuteDslFMHARunner::sViT_d64 = {};
-vit_fmha_d72_Kernel_Module_t CuteDslFMHARunner::sViT_d72 = {};
-vit_fmha_d80_Kernel_Module_t CuteDslFMHARunner::sViT_d80 = {};
-vit_fmha_d128_Kernel_Module_t CuteDslFMHARunner::sViT_d128 = {};
-bool CuteDslFMHARunner::sViTLoaded = false;
-std::mutex CuteDslFMHARunner::sViTMutex;
-
-// =====================================================================
-// Kernel module loading
-// =====================================================================
-
-bool CuteDslFMHARunner::loadLLMKernelModule()
-{
-    std::lock_guard<std::mutex> lock(sLLMMutex);
-    if (sLLMLoaded)
-    {
-        return true;
-    }
-    try
-    {
-        fmha_d64_Kernel_Module_Load(&sLLM_d64);
-        fmha_d128_Kernel_Module_Load(&sLLM_d128);
-        fmha_d256_Kernel_Module_Load(&sLLM_d256);
-        fmha_d64_sw_Kernel_Module_Load(&sLLM_d64_sw);
-        fmha_d128_sw_Kernel_Module_Load(&sLLM_d128_sw);
-        fmha_d256_sw_Kernel_Module_Load(&sLLM_d256_sw);
-        fmha_d64_skipsoftmax_Kernel_Module_Load(&sLLM_d64_skipsoftmax);
-        fmha_d128_skipsoftmax_Kernel_Module_Load(&sLLM_d128_skipsoftmax);
-        fmha_d64_skipsoftmax_paged_Kernel_Module_Load(&sLLM_d64_skipsoftmax_paged);
-        fmha_d128_skipsoftmax_paged_Kernel_Module_Load(&sLLM_d128_skipsoftmax_paged);
-        fmha_d64_fp8_Kernel_Module_Load(&sLLM_d64_fp8);
-        fmha_d128_fp8_Kernel_Module_Load(&sLLM_d128_fp8);
-        fmha_d256_fp8_Kernel_Module_Load(&sLLM_d256_fp8);
-        fmha_d64_sw_fp8_Kernel_Module_Load(&sLLM_d64_sw_fp8);
-        fmha_d128_sw_fp8_Kernel_Module_Load(&sLLM_d128_sw_fp8);
-        fmha_d256_sw_fp8_Kernel_Module_Load(&sLLM_d256_sw_fp8);
-        fmha_d64_paged_Kernel_Module_Load(&sLLM_d64_paged);
-        fmha_d128_paged_Kernel_Module_Load(&sLLM_d128_paged);
-        fmha_d256_paged_Kernel_Module_Load(&sLLM_d256_paged);
-        fmha_d256_dense_paged_Kernel_Module_Load(&sLLM_d256_dense_paged);
-        fmha_d512_paged_Kernel_Module_Load(&sLLM_d512_paged);
-        fmha_d512_dense_paged_Kernel_Module_Load(&sLLM_d512_dense_paged);
-        fmha_d64_sw_paged_Kernel_Module_Load(&sLLM_d64_sw_paged);
-        fmha_d128_sw_paged_Kernel_Module_Load(&sLLM_d128_sw_paged);
-        fmha_d256_sw_paged_Kernel_Module_Load(&sLLM_d256_sw_paged);
-        fmha_d512_sw_paged_Kernel_Module_Load(&sLLM_d512_sw_paged);
-        fmha_d512_paged_bidirectional_Kernel_Module_Load(&sLLM_d512_paged_bidirectional);
-        fmha_d64_paged_fp8_Kernel_Module_Load(&sLLM_d64_paged_fp8);
-        fmha_d128_paged_fp8_Kernel_Module_Load(&sLLM_d128_paged_fp8);
-        fmha_d256_paged_fp8_Kernel_Module_Load(&sLLM_d256_paged_fp8);
-        fmha_d256_dense_paged_fp8_Kernel_Module_Load(&sLLM_d256_dense_paged_fp8);
-        fmha_d512_paged_fp8_Kernel_Module_Load(&sLLM_d512_paged_fp8);
-        fmha_d512_dense_paged_fp8_Kernel_Module_Load(&sLLM_d512_dense_paged_fp8);
-        fmha_d64_sw_paged_fp8_Kernel_Module_Load(&sLLM_d64_sw_paged_fp8);
-        fmha_d128_sw_paged_fp8_Kernel_Module_Load(&sLLM_d128_sw_paged_fp8);
-        fmha_d256_sw_paged_fp8_Kernel_Module_Load(&sLLM_d256_sw_paged_fp8);
-        fmha_d512_sw_paged_fp8_Kernel_Module_Load(&sLLM_d512_sw_paged_fp8);
-        sLLMLoaded = true;
-        LOG_DEBUG("CuTe DSL LLM FMHA kernel modules loaded (FP16 + FP8 + paged)");
-        return true;
-    }
-    catch (...)
-    {
-        LOG_ERROR("Failed to load CuTe DSL LLM FMHA kernel modules");
-        return false;
-    }
-}
-
-void CuteDslFMHARunner::unloadLLMKernelModule()
-{
-    std::lock_guard<std::mutex> lock(sLLMMutex);
-    if (sLLMLoaded)
-    {
-        fmha_d64_Kernel_Module_Unload(&sLLM_d64);
-        fmha_d128_Kernel_Module_Unload(&sLLM_d128);
-        fmha_d256_Kernel_Module_Unload(&sLLM_d256);
-        fmha_d64_sw_Kernel_Module_Unload(&sLLM_d64_sw);
-        fmha_d128_sw_Kernel_Module_Unload(&sLLM_d128_sw);
-        fmha_d256_sw_Kernel_Module_Unload(&sLLM_d256_sw);
-        fmha_d64_skipsoftmax_Kernel_Module_Unload(&sLLM_d64_skipsoftmax);
-        fmha_d128_skipsoftmax_Kernel_Module_Unload(&sLLM_d128_skipsoftmax);
-        fmha_d64_skipsoftmax_paged_Kernel_Module_Unload(&sLLM_d64_skipsoftmax_paged);
-        fmha_d128_skipsoftmax_paged_Kernel_Module_Unload(&sLLM_d128_skipsoftmax_paged);
-        fmha_d64_fp8_Kernel_Module_Unload(&sLLM_d64_fp8);
-        fmha_d128_fp8_Kernel_Module_Unload(&sLLM_d128_fp8);
-        fmha_d256_fp8_Kernel_Module_Unload(&sLLM_d256_fp8);
-        fmha_d64_sw_fp8_Kernel_Module_Unload(&sLLM_d64_sw_fp8);
-        fmha_d128_sw_fp8_Kernel_Module_Unload(&sLLM_d128_sw_fp8);
-        fmha_d256_sw_fp8_Kernel_Module_Unload(&sLLM_d256_sw_fp8);
-        fmha_d64_paged_Kernel_Module_Unload(&sLLM_d64_paged);
-        fmha_d128_paged_Kernel_Module_Unload(&sLLM_d128_paged);
-        fmha_d256_paged_Kernel_Module_Unload(&sLLM_d256_paged);
-        fmha_d256_dense_paged_Kernel_Module_Unload(&sLLM_d256_dense_paged);
-        fmha_d512_paged_Kernel_Module_Unload(&sLLM_d512_paged);
-        fmha_d512_dense_paged_Kernel_Module_Unload(&sLLM_d512_dense_paged);
-        fmha_d64_sw_paged_Kernel_Module_Unload(&sLLM_d64_sw_paged);
-        fmha_d128_sw_paged_Kernel_Module_Unload(&sLLM_d128_sw_paged);
-        fmha_d256_sw_paged_Kernel_Module_Unload(&sLLM_d256_sw_paged);
-        fmha_d512_sw_paged_Kernel_Module_Unload(&sLLM_d512_sw_paged);
-        fmha_d512_paged_bidirectional_Kernel_Module_Unload(&sLLM_d512_paged_bidirectional);
-        fmha_d64_paged_fp8_Kernel_Module_Unload(&sLLM_d64_paged_fp8);
-        fmha_d128_paged_fp8_Kernel_Module_Unload(&sLLM_d128_paged_fp8);
-        fmha_d256_paged_fp8_Kernel_Module_Unload(&sLLM_d256_paged_fp8);
-        fmha_d256_dense_paged_fp8_Kernel_Module_Unload(&sLLM_d256_dense_paged_fp8);
-        fmha_d512_paged_fp8_Kernel_Module_Unload(&sLLM_d512_paged_fp8);
-        fmha_d512_dense_paged_fp8_Kernel_Module_Unload(&sLLM_d512_dense_paged_fp8);
-        fmha_d64_sw_paged_fp8_Kernel_Module_Unload(&sLLM_d64_sw_paged_fp8);
-        fmha_d128_sw_paged_fp8_Kernel_Module_Unload(&sLLM_d128_sw_paged_fp8);
-        fmha_d256_sw_paged_fp8_Kernel_Module_Unload(&sLLM_d256_sw_paged_fp8);
-        fmha_d512_sw_paged_fp8_Kernel_Module_Unload(&sLLM_d512_sw_paged_fp8);
-        sLLMLoaded = false;
-    }
-}
-
-bool CuteDslFMHARunner::loadViTKernelModule()
-{
-    std::lock_guard<std::mutex> lock(sViTMutex);
-    if (sViTLoaded)
-    {
-        return true;
-    }
-    try
-    {
-        vit_fmha_d64_Kernel_Module_Load(&sViT_d64);
-        vit_fmha_d72_Kernel_Module_Load(&sViT_d72);
-        vit_fmha_d80_Kernel_Module_Load(&sViT_d80);
-        vit_fmha_d128_Kernel_Module_Load(&sViT_d128);
-        sViTLoaded = true;
-        LOG_DEBUG("CuTe DSL ViT FMHA kernel modules loaded");
-        return true;
-    }
-    catch (...)
-    {
-        LOG_ERROR("Failed to load CuTe DSL ViT FMHA kernel modules");
-        return false;
-    }
-}
-
-void CuteDslFMHARunner::unloadViTKernelModule()
-{
-    std::lock_guard<std::mutex> lock(sViTMutex);
-    if (sViTLoaded)
-    {
-        vit_fmha_d64_Kernel_Module_Unload(&sViT_d64);
-        vit_fmha_d72_Kernel_Module_Unload(&sViT_d72);
-        vit_fmha_d80_Kernel_Module_Unload(&sViT_d80);
-        vit_fmha_d128_Kernel_Module_Unload(&sViT_d128);
-        sViTLoaded = false;
-    }
-}
+detail::LazyKernelModule<vit_fmha_d64_Kernel_Module_t> CuteDslFMHARunner::sViT_d64{};
+detail::LazyKernelModule<vit_fmha_d72_Kernel_Module_t> CuteDslFMHARunner::sViT_d72{};
+detail::LazyKernelModule<vit_fmha_d80_Kernel_Module_t> CuteDslFMHARunner::sViT_d80{};
+detail::LazyKernelModule<vit_fmha_d128_Kernel_Module_t> CuteDslFMHARunner::sViT_d128{};
 
 bool CuteDslFMHARunner::canImplement(int32_t headSize, int32_t smVersion)
 {
@@ -254,6 +113,217 @@ bool CuteDslFMHARunner::canImplementViT(int32_t headSize, int32_t smVersion)
 {
     return isSupportedBlackwellFmha(smVersion)
         && (headSize == 64 || headSize == 72 || headSize == 80 || headSize == 128);
+}
+
+bool CuteDslFMHARunner::preflightLlm(
+    cudaStream_t stream, int32_t slidingWindowSize, bool fp8Input, float skipSoftmaxThresholdLog2)
+{
+    bool const useSlidingWindow = slidingWindowSize < INT_MAX;
+    bool const enableSkipSoftmax = std::isfinite(skipSoftmaxThresholdLog2) && skipSoftmaxThresholdLog2 < 0.0F;
+
+    if (enableSkipSoftmax)
+    {
+        if (fp8Input || useSlidingWindow)
+        {
+            LOG_ERROR("CuTe DSL LLM FMHA: skip-softmax variant is FP16 causal only (fp8Input=%s, sw=%s)",
+                fp8Input ? "true" : "false", useSlidingWindow ? "true" : "false");
+            return false;
+        }
+        switch (mHeadDim)
+        {
+        case 64:
+            return preflightVariant<fmha_d64_skipsoftmax_Kernel_Module_Load, fmha_d64_skipsoftmax_Kernel_Module_Unload>(
+                sLLM_d64_skipsoftmax, "fmha_d64_skipsoftmax", stream);
+        case 128:
+            return preflightVariant<fmha_d128_skipsoftmax_Kernel_Module_Load,
+                fmha_d128_skipsoftmax_Kernel_Module_Unload>(sLLM_d128_skipsoftmax, "fmha_d128_skipsoftmax", stream);
+        default: LOG_ERROR("CuTe DSL LLM FMHA: unsupported head_dim=%d", mHeadDim); return false;
+        }
+    }
+
+    if (fp8Input)
+    {
+        switch (mHeadDim)
+        {
+        case 64:
+            return useSlidingWindow
+                ? preflightVariant<fmha_d64_sw_fp8_Kernel_Module_Load, fmha_d64_sw_fp8_Kernel_Module_Unload>(
+                      sLLM_d64_sw_fp8, "fmha_d64_sw_fp8", stream)
+                : preflightVariant<fmha_d64_fp8_Kernel_Module_Load, fmha_d64_fp8_Kernel_Module_Unload>(
+                      sLLM_d64_fp8, "fmha_d64_fp8", stream);
+        case 128:
+            return useSlidingWindow
+                ? preflightVariant<fmha_d128_sw_fp8_Kernel_Module_Load, fmha_d128_sw_fp8_Kernel_Module_Unload>(
+                      sLLM_d128_sw_fp8, "fmha_d128_sw_fp8", stream)
+                : preflightVariant<fmha_d128_fp8_Kernel_Module_Load, fmha_d128_fp8_Kernel_Module_Unload>(
+                      sLLM_d128_fp8, "fmha_d128_fp8", stream);
+        case 256:
+            return useSlidingWindow
+                ? preflightVariant<fmha_d256_sw_fp8_Kernel_Module_Load, fmha_d256_sw_fp8_Kernel_Module_Unload>(
+                      sLLM_d256_sw_fp8, "fmha_d256_sw_fp8", stream)
+                : preflightVariant<fmha_d256_fp8_Kernel_Module_Load, fmha_d256_fp8_Kernel_Module_Unload>(
+                      sLLM_d256_fp8, "fmha_d256_fp8", stream);
+        default: LOG_ERROR("CuTe DSL LLM FMHA: unsupported head_dim=%d", mHeadDim); return false;
+        }
+    }
+
+    switch (mHeadDim)
+    {
+    case 64:
+        return useSlidingWindow ? preflightVariant<fmha_d64_sw_Kernel_Module_Load, fmha_d64_sw_Kernel_Module_Unload>(
+                                      sLLM_d64_sw, "fmha_d64_sw", stream)
+                                : preflightVariant<fmha_d64_Kernel_Module_Load, fmha_d64_Kernel_Module_Unload>(
+                                      sLLM_d64, "fmha_d64", stream);
+    case 128:
+        return useSlidingWindow ? preflightVariant<fmha_d128_sw_Kernel_Module_Load, fmha_d128_sw_Kernel_Module_Unload>(
+                                      sLLM_d128_sw, "fmha_d128_sw", stream)
+                                : preflightVariant<fmha_d128_Kernel_Module_Load, fmha_d128_Kernel_Module_Unload>(
+                                      sLLM_d128, "fmha_d128", stream);
+    case 256:
+        return useSlidingWindow ? preflightVariant<fmha_d256_sw_Kernel_Module_Load, fmha_d256_sw_Kernel_Module_Unload>(
+                                      sLLM_d256_sw, "fmha_d256_sw", stream)
+                                : preflightVariant<fmha_d256_Kernel_Module_Load, fmha_d256_Kernel_Module_Unload>(
+                                      sLLM_d256, "fmha_d256", stream);
+    default: LOG_ERROR("CuTe DSL LLM FMHA: unsupported head_dim=%d", mHeadDim); return false;
+    }
+}
+
+bool CuteDslFMHARunner::preflightPaged(cudaStream_t stream, int32_t slidingWindowSize, bool fp8Input, bool isCausal,
+    float skipSoftmaxThresholdLog2, bool useBidirectional)
+{
+    bool const useSlidingWindow = slidingWindowSize < INT_MAX;
+
+    if (useBidirectional)
+    {
+        if (mHeadDim != 512 || !isCausal || fp8Input)
+        {
+            LOG_ERROR("CuTe DSL paged BIDIRECTIONAL FMHA requires causal FP16 with head_dim=512.");
+            return false;
+        }
+        return preflightVariant<fmha_d512_paged_bidirectional_Kernel_Module_Load,
+            fmha_d512_paged_bidirectional_Kernel_Module_Unload>(
+            sLLM_d512_paged_bidirectional, "fmha_d512_paged_bidirectional", stream);
+    }
+
+    if (!isCausal)
+    {
+        if (useSlidingWindow || (mHeadDim != 256 && mHeadDim != 512))
+        {
+            LOG_ERROR("CuTe DSL dense non-causal paged FMHA requires no sliding window and head_dim=256 or 512.");
+            return false;
+        }
+        if (fp8Input)
+        {
+            return mHeadDim == 256 ? preflightVariant<fmha_d256_dense_paged_fp8_Kernel_Module_Load,
+                                         fmha_d256_dense_paged_fp8_Kernel_Module_Unload>(
+                                         sLLM_d256_dense_paged_fp8, "fmha_d256_dense_paged_fp8", stream)
+                                   : preflightVariant<fmha_d512_dense_paged_fp8_Kernel_Module_Load,
+                                         fmha_d512_dense_paged_fp8_Kernel_Module_Unload>(
+                                         sLLM_d512_dense_paged_fp8, "fmha_d512_dense_paged_fp8", stream);
+        }
+        return mHeadDim == 256
+            ? preflightVariant<fmha_d256_dense_paged_Kernel_Module_Load, fmha_d256_dense_paged_Kernel_Module_Unload>(
+                  sLLM_d256_dense_paged, "fmha_d256_dense_paged", stream)
+            : preflightVariant<fmha_d512_dense_paged_Kernel_Module_Load, fmha_d512_dense_paged_Kernel_Module_Unload>(
+                  sLLM_d512_dense_paged, "fmha_d512_dense_paged", stream);
+    }
+
+    bool const enableSkipSoftmax
+        = std::isfinite(skipSoftmaxThresholdLog2) && skipSoftmaxThresholdLog2 < 0.0F && !fp8Input && !useSlidingWindow;
+    if (enableSkipSoftmax && (mHeadDim == 64 || mHeadDim == 128))
+    {
+        return mHeadDim == 64 ? preflightVariant<fmha_d64_skipsoftmax_paged_Kernel_Module_Load,
+                                    fmha_d64_skipsoftmax_paged_Kernel_Module_Unload>(
+                                    sLLM_d64_skipsoftmax_paged, "fmha_d64_skipsoftmax_paged", stream)
+                              : preflightVariant<fmha_d128_skipsoftmax_paged_Kernel_Module_Load,
+                                    fmha_d128_skipsoftmax_paged_Kernel_Module_Unload>(
+                                    sLLM_d128_skipsoftmax_paged, "fmha_d128_skipsoftmax_paged", stream);
+    }
+
+    if (fp8Input)
+    {
+        switch (mHeadDim)
+        {
+        case 64:
+            return useSlidingWindow
+                ? preflightVariant<fmha_d64_sw_paged_fp8_Kernel_Module_Load,
+                      fmha_d64_sw_paged_fp8_Kernel_Module_Unload>(
+                      sLLM_d64_sw_paged_fp8, "fmha_d64_sw_paged_fp8", stream)
+                : preflightVariant<fmha_d64_paged_fp8_Kernel_Module_Load, fmha_d64_paged_fp8_Kernel_Module_Unload>(
+                      sLLM_d64_paged_fp8, "fmha_d64_paged_fp8", stream);
+        case 128:
+            return useSlidingWindow
+                ? preflightVariant<fmha_d128_sw_paged_fp8_Kernel_Module_Load,
+                      fmha_d128_sw_paged_fp8_Kernel_Module_Unload>(
+                      sLLM_d128_sw_paged_fp8, "fmha_d128_sw_paged_fp8", stream)
+                : preflightVariant<fmha_d128_paged_fp8_Kernel_Module_Load, fmha_d128_paged_fp8_Kernel_Module_Unload>(
+                      sLLM_d128_paged_fp8, "fmha_d128_paged_fp8", stream);
+        case 256:
+            return useSlidingWindow
+                ? preflightVariant<fmha_d256_sw_paged_fp8_Kernel_Module_Load,
+                      fmha_d256_sw_paged_fp8_Kernel_Module_Unload>(
+                      sLLM_d256_sw_paged_fp8, "fmha_d256_sw_paged_fp8", stream)
+                : preflightVariant<fmha_d256_paged_fp8_Kernel_Module_Load, fmha_d256_paged_fp8_Kernel_Module_Unload>(
+                      sLLM_d256_paged_fp8, "fmha_d256_paged_fp8", stream);
+        case 512:
+            return useSlidingWindow
+                ? preflightVariant<fmha_d512_sw_paged_fp8_Kernel_Module_Load,
+                      fmha_d512_sw_paged_fp8_Kernel_Module_Unload>(
+                      sLLM_d512_sw_paged_fp8, "fmha_d512_sw_paged_fp8", stream)
+                : preflightVariant<fmha_d512_paged_fp8_Kernel_Module_Load, fmha_d512_paged_fp8_Kernel_Module_Unload>(
+                      sLLM_d512_paged_fp8, "fmha_d512_paged_fp8", stream);
+        default: LOG_ERROR("CuTe DSL paged LLM FMHA: unsupported head_dim=%d", mHeadDim); return false;
+        }
+    }
+
+    switch (mHeadDim)
+    {
+    case 64:
+        return useSlidingWindow
+            ? preflightVariant<fmha_d64_sw_paged_Kernel_Module_Load, fmha_d64_sw_paged_Kernel_Module_Unload>(
+                  sLLM_d64_sw_paged, "fmha_d64_sw_paged", stream)
+            : preflightVariant<fmha_d64_paged_Kernel_Module_Load, fmha_d64_paged_Kernel_Module_Unload>(
+                  sLLM_d64_paged, "fmha_d64_paged", stream);
+    case 128:
+        return useSlidingWindow
+            ? preflightVariant<fmha_d128_sw_paged_Kernel_Module_Load, fmha_d128_sw_paged_Kernel_Module_Unload>(
+                  sLLM_d128_sw_paged, "fmha_d128_sw_paged", stream)
+            : preflightVariant<fmha_d128_paged_Kernel_Module_Load, fmha_d128_paged_Kernel_Module_Unload>(
+                  sLLM_d128_paged, "fmha_d128_paged", stream);
+    case 256:
+        return useSlidingWindow
+            ? preflightVariant<fmha_d256_sw_paged_Kernel_Module_Load, fmha_d256_sw_paged_Kernel_Module_Unload>(
+                  sLLM_d256_sw_paged, "fmha_d256_sw_paged", stream)
+            : preflightVariant<fmha_d256_paged_Kernel_Module_Load, fmha_d256_paged_Kernel_Module_Unload>(
+                  sLLM_d256_paged, "fmha_d256_paged", stream);
+    case 512:
+        return useSlidingWindow
+            ? preflightVariant<fmha_d512_sw_paged_Kernel_Module_Load, fmha_d512_sw_paged_Kernel_Module_Unload>(
+                  sLLM_d512_sw_paged, "fmha_d512_sw_paged", stream)
+            : preflightVariant<fmha_d512_paged_Kernel_Module_Load, fmha_d512_paged_Kernel_Module_Unload>(
+                  sLLM_d512_paged, "fmha_d512_paged", stream);
+    default: LOG_ERROR("CuTe DSL paged LLM FMHA: unsupported head_dim=%d", mHeadDim); return false;
+    }
+}
+
+bool CuteDslFMHARunner::preflightViT(cudaStream_t stream)
+{
+    switch (mHeadDim)
+    {
+    case 64:
+        return preflightVariant<vit_fmha_d64_Kernel_Module_Load, vit_fmha_d64_Kernel_Module_Unload>(
+            sViT_d64, "vit_fmha_d64", stream);
+    case 72:
+        return preflightVariant<vit_fmha_d72_Kernel_Module_Load, vit_fmha_d72_Kernel_Module_Unload>(
+            sViT_d72, "vit_fmha_d72", stream);
+    case 80:
+        return preflightVariant<vit_fmha_d80_Kernel_Module_Load, vit_fmha_d80_Kernel_Module_Unload>(
+            sViT_d80, "vit_fmha_d80", stream);
+    case 128:
+        return preflightVariant<vit_fmha_d128_Kernel_Module_Load, vit_fmha_d128_Kernel_Module_Unload>(
+            sViT_d128, "vit_fmha_d128", stream);
+    default: LOG_ERROR("CuTe DSL ViT FMHA: unsupported head_dim=%d", mHeadDim); return false;
+    }
 }
 
 // =====================================================================
@@ -288,14 +358,21 @@ using cutedsl::WrapperArity;
 //! fmha_d{64,128}_skipsoftmax.h signatures) — selected here by wrapper arity at compile time.
 //! @tparam cuteDslKernelWrapper Generated CuTe DSL kernel wrapper function. Its signature supplies the module
 //! and tensor descriptor types at compile time.
-template <auto cuteDslKernelWrapper>
-int32_t callLlmFmha(WrapperArgT<0, decltype(cuteDslKernelWrapper)>& module, LlmFmhaParams const& params)
+template <auto cuteDslKernelWrapper, auto moduleLoader, auto moduleUnloader>
+int32_t callLlmFmha(detail::LazyKernelModule<WrapperArgT<0, decltype(cuteDslKernelWrapper)>>& state,
+    char const* moduleName, LlmFmhaParams const& params)
 {
     constexpr size_t kArity = WrapperArity<decltype(cuteDslKernelWrapper)>::value;
     static_assert(kArity == 13 || kArity == 14,
         "callLlmFmha: not a dense LLM FMHA wrapper (module, q_tensor, kv_cache, o_tensor, cum_seqlen_k, "
         "window_size_left, attention_scale, scale_q, scale_k, scale_v, inv_scale_o, sm_count, stream "
         "[, skip_softmax_threshold_log2]).");
+
+    if (!detail::ensureModuleLoaded<moduleLoader, moduleUnloader>(state, moduleName, params.stream))
+    {
+        return -1;
+    }
+    auto& module = state.module;
 
     auto qTensor = makePackedTensor<WrapperArgT<1, decltype(cuteDslKernelWrapper)>>(
         params.qPtr, {params.batchSize, params.seqLenQ, params.numQHeads, params.headDim});
@@ -326,14 +403,21 @@ int32_t callLlmFmha(WrapperArgT<0, decltype(cuteDslKernelWrapper)>& module, LlmF
 //! (BLASST) variants carry one extra trailing runtime float, skip_softmax_threshold_log2, after stream.
 //! @tparam cuteDslKernelWrapper Generated CuTe DSL kernel wrapper function. Its signature supplies the module
 //! and tensor descriptor types at compile time.
-template <auto cuteDslKernelWrapper>
-int32_t callLlmFmhaPaged(WrapperArgT<0, decltype(cuteDslKernelWrapper)>& module, LlmFmhaPagedParams const& params)
+template <auto cuteDslKernelWrapper, auto moduleLoader, auto moduleUnloader>
+int32_t callLlmFmhaPaged(detail::LazyKernelModule<WrapperArgT<0, decltype(cuteDslKernelWrapper)>>& state,
+    char const* moduleName, LlmFmhaPagedParams const& params)
 {
     constexpr std::size_t kWrapperArity = WrapperArity<decltype(cuteDslKernelWrapper)>::value;
     static_assert(kWrapperArity == 14 || kWrapperArity == 15 || kWrapperArity == 16,
         "callLlmFmhaPaged: not a paged LLM FMHA wrapper (module, q_tensor, kv_cache_pool, kv_cache_page_list, "
         "o_tensor, cum_seqlen_k, [block_begin, block_end,] window_size_left, attention_scale, scale_q, scale_k, "
         "scale_v, inv_scale_o, sm_count, stream [, skip_softmax_threshold_log2]).");
+
+    if (!detail::ensureModuleLoaded<moduleLoader, moduleUnloader>(state, moduleName, params.stream))
+    {
+        return -1;
+    }
+    auto& module = state.module;
 
     // WrapperArgT supplies the generated ABI descriptor type. All runtime pointers and shapes come from params.
     auto qTensor = makePackedTensor<WrapperArgT<1, decltype(cuteDslKernelWrapper)>>(
@@ -389,12 +473,19 @@ int32_t callLlmFmhaPaged(WrapperArgT<0, decltype(cuteDslKernelWrapper)>& module,
 //! Launch a ViT FMHA variant over packed varlen [total_S, H, D] Q/K/V.
 //! @tparam cuteDslKernelWrapper Generated CuTe DSL kernel wrapper function. Its signature supplies the module
 //! and tensor descriptor types at compile time.
-template <auto cuteDslKernelWrapper>
-int32_t callVitFmha(WrapperArgT<0, decltype(cuteDslKernelWrapper)>& module, VitFmhaParams const& params)
+template <auto cuteDslKernelWrapper, auto moduleLoader, auto moduleUnloader>
+int32_t callVitFmha(detail::LazyKernelModule<WrapperArgT<0, decltype(cuteDslKernelWrapper)>>& state,
+    char const* moduleName, VitFmhaParams const& params)
 {
     static_assert(WrapperArity<decltype(cuteDslKernelWrapper)>::value == 12,
         "callVitFmha: not a ViT FMHA wrapper (module, q_tensor, k_tensor, v_tensor, o_tensor, cu_seqlens, "
         "max_seqlen, scale_softmax_log2, scale_softmax, scale_output, sm_count, stream).");
+
+    if (!detail::ensureModuleLoaded<moduleLoader, moduleUnloader>(state, moduleName, params.stream))
+    {
+        return -1;
+    }
+    auto& module = state.module;
 
     int32_t const shape[] = {params.totalSeqLen, params.numHeads, params.headDim};
     auto qTensor = makePackedTensor<WrapperArgT<1, decltype(cuteDslKernelWrapper)>>(params.qPtr, shape);
@@ -415,16 +506,10 @@ int32_t callVitFmha(WrapperArgT<0, decltype(cuteDslKernelWrapper)>& module, VitF
 // LLM run: batched Q + combined KV cache (FP16 / FP8→FP16 / FP8→FP8)
 // =====================================================================
 
-void CuteDslFMHARunner::run(void const* qPtr, void const* kvPtr, void* oPtr, int32_t const* cuKVSeqLens,
+bool CuteDslFMHARunner::run(void const* qPtr, void const* kvPtr, void* oPtr, int32_t const* cuKVSeqLens,
     cudaStream_t stream, float attentionScale, int32_t slidingWindowSize, bool fp8Input, float qScale, float kScale,
     float vScale, float skipSoftmaxThresholdLog2)
 {
-    if (!sLLMLoaded)
-    {
-        LOG_ERROR("CuTe DSL LLM FMHA kernel module not loaded.");
-        return;
-    }
-
     validateAttentionScale(attentionScale);
 
     int32_t const headDim = mHeadDim;
@@ -471,13 +556,19 @@ void CuteDslFMHARunner::run(void const* qPtr, void const* kvPtr, void* oPtr, int
         {
             LOG_ERROR("CuTe DSL LLM FMHA: skip-softmax variant is FP16 causal only (fp8Input=%s, sw=%s)",
                 fp8Input ? "true" : "false", useSlidingWindow ? "true" : "false");
-            return;
+            return false;
         }
         switch (headDim)
         {
-        case 64: ret = callLlmFmha<cute_dsl_fmha_d64_skipsoftmax_wrapper>(sLLM_d64_skipsoftmax, params); break;
-        case 128: ret = callLlmFmha<cute_dsl_fmha_d128_skipsoftmax_wrapper>(sLLM_d128_skipsoftmax, params); break;
-        default: LOG_ERROR("CuTe DSL LLM FMHA: unsupported head_dim=%d", headDim); return;
+        case 64:
+            ret = callLlmFmha<cute_dsl_fmha_d64_skipsoftmax_wrapper, fmha_d64_skipsoftmax_Kernel_Module_Load,
+                fmha_d64_skipsoftmax_Kernel_Module_Unload>(sLLM_d64_skipsoftmax, "fmha_d64_skipsoftmax", params);
+            break;
+        case 128:
+            ret = callLlmFmha<cute_dsl_fmha_d128_skipsoftmax_wrapper, fmha_d128_skipsoftmax_Kernel_Module_Load,
+                fmha_d128_skipsoftmax_Kernel_Module_Unload>(sLLM_d128_skipsoftmax, "fmha_d128_skipsoftmax", params);
+            break;
+        default: LOG_ERROR("CuTe DSL LLM FMHA: unsupported head_dim=%d", headDim); return false;
         }
     }
     else if (fp8Input)
@@ -485,18 +576,27 @@ void CuteDslFMHARunner::run(void const* qPtr, void const* kvPtr, void* oPtr, int
         switch (headDim)
         {
         case 64:
-            ret = useSlidingWindow ? callLlmFmha<cute_dsl_fmha_d64_sw_fp8_wrapper>(sLLM_d64_sw_fp8, params)
-                                   : callLlmFmha<cute_dsl_fmha_d64_fp8_wrapper>(sLLM_d64_fp8, params);
+            ret = useSlidingWindow
+                ? callLlmFmha<cute_dsl_fmha_d64_sw_fp8_wrapper, fmha_d64_sw_fp8_Kernel_Module_Load,
+                      fmha_d64_sw_fp8_Kernel_Module_Unload>(sLLM_d64_sw_fp8, "fmha_d64_sw_fp8", params)
+                : callLlmFmha<cute_dsl_fmha_d64_fp8_wrapper, fmha_d64_fp8_Kernel_Module_Load,
+                      fmha_d64_fp8_Kernel_Module_Unload>(sLLM_d64_fp8, "fmha_d64_fp8", params);
             break;
         case 128:
-            ret = useSlidingWindow ? callLlmFmha<cute_dsl_fmha_d128_sw_fp8_wrapper>(sLLM_d128_sw_fp8, params)
-                                   : callLlmFmha<cute_dsl_fmha_d128_fp8_wrapper>(sLLM_d128_fp8, params);
+            ret = useSlidingWindow
+                ? callLlmFmha<cute_dsl_fmha_d128_sw_fp8_wrapper, fmha_d128_sw_fp8_Kernel_Module_Load,
+                      fmha_d128_sw_fp8_Kernel_Module_Unload>(sLLM_d128_sw_fp8, "fmha_d128_sw_fp8", params)
+                : callLlmFmha<cute_dsl_fmha_d128_fp8_wrapper, fmha_d128_fp8_Kernel_Module_Load,
+                      fmha_d128_fp8_Kernel_Module_Unload>(sLLM_d128_fp8, "fmha_d128_fp8", params);
             break;
         case 256:
-            ret = useSlidingWindow ? callLlmFmha<cute_dsl_fmha_d256_sw_fp8_wrapper>(sLLM_d256_sw_fp8, params)
-                                   : callLlmFmha<cute_dsl_fmha_d256_fp8_wrapper>(sLLM_d256_fp8, params);
+            ret = useSlidingWindow
+                ? callLlmFmha<cute_dsl_fmha_d256_sw_fp8_wrapper, fmha_d256_sw_fp8_Kernel_Module_Load,
+                      fmha_d256_sw_fp8_Kernel_Module_Unload>(sLLM_d256_sw_fp8, "fmha_d256_sw_fp8", params)
+                : callLlmFmha<cute_dsl_fmha_d256_fp8_wrapper, fmha_d256_fp8_Kernel_Module_Load,
+                      fmha_d256_fp8_Kernel_Module_Unload>(sLLM_d256_fp8, "fmha_d256_fp8", params);
             break;
-        default: LOG_ERROR("CuTe DSL LLM FMHA: unsupported head_dim=%d", headDim); return;
+        default: LOG_ERROR("CuTe DSL LLM FMHA: unsupported head_dim=%d", headDim); return false;
         }
     }
     else
@@ -504,18 +604,27 @@ void CuteDslFMHARunner::run(void const* qPtr, void const* kvPtr, void* oPtr, int
         switch (headDim)
         {
         case 64:
-            ret = useSlidingWindow ? callLlmFmha<cute_dsl_fmha_d64_sw_wrapper>(sLLM_d64_sw, params)
-                                   : callLlmFmha<cute_dsl_fmha_d64_wrapper>(sLLM_d64, params);
+            ret = useSlidingWindow
+                ? callLlmFmha<cute_dsl_fmha_d64_sw_wrapper, fmha_d64_sw_Kernel_Module_Load,
+                      fmha_d64_sw_Kernel_Module_Unload>(sLLM_d64_sw, "fmha_d64_sw", params)
+                : callLlmFmha<cute_dsl_fmha_d64_wrapper, fmha_d64_Kernel_Module_Load, fmha_d64_Kernel_Module_Unload>(
+                      sLLM_d64, "fmha_d64", params);
             break;
         case 128:
-            ret = useSlidingWindow ? callLlmFmha<cute_dsl_fmha_d128_sw_wrapper>(sLLM_d128_sw, params)
-                                   : callLlmFmha<cute_dsl_fmha_d128_wrapper>(sLLM_d128, params);
+            ret = useSlidingWindow
+                ? callLlmFmha<cute_dsl_fmha_d128_sw_wrapper, fmha_d128_sw_Kernel_Module_Load,
+                      fmha_d128_sw_Kernel_Module_Unload>(sLLM_d128_sw, "fmha_d128_sw", params)
+                : callLlmFmha<cute_dsl_fmha_d128_wrapper, fmha_d128_Kernel_Module_Load, fmha_d128_Kernel_Module_Unload>(
+                      sLLM_d128, "fmha_d128", params);
             break;
         case 256:
-            ret = useSlidingWindow ? callLlmFmha<cute_dsl_fmha_d256_sw_wrapper>(sLLM_d256_sw, params)
-                                   : callLlmFmha<cute_dsl_fmha_d256_wrapper>(sLLM_d256, params);
+            ret = useSlidingWindow
+                ? callLlmFmha<cute_dsl_fmha_d256_sw_wrapper, fmha_d256_sw_Kernel_Module_Load,
+                      fmha_d256_sw_Kernel_Module_Unload>(sLLM_d256_sw, "fmha_d256_sw", params)
+                : callLlmFmha<cute_dsl_fmha_d256_wrapper, fmha_d256_Kernel_Module_Load, fmha_d256_Kernel_Module_Unload>(
+                      sLLM_d256, "fmha_d256", params);
             break;
-        default: LOG_ERROR("CuTe DSL LLM FMHA: unsupported head_dim=%d", headDim); return;
+        default: LOG_ERROR("CuTe DSL LLM FMHA: unsupported head_dim=%d", headDim); return false;
         }
     }
 
@@ -524,20 +633,15 @@ void CuteDslFMHARunner::run(void const* qPtr, void const* kvPtr, void* oPtr, int
         LOG_ERROR("CuTe DSL LLM FMHA kernel (d=%d, sw=%s, fp8in=%s) failed with error code: %d", headDim,
             useSlidingWindow ? "true" : "false", fp8Input ? "true" : "false", ret);
     }
+    return ret == 0;
 }
 
-void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, int32_t const* kvCachePageList,
+bool CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, int32_t const* kvCachePageList,
     void* oPtr, int32_t const* cuKVSeqLens, int32_t numPages, int32_t maxPagesPerSeq, int32_t tokensPerPage,
     nvinfer1::DataType kvDataType, cudaStream_t stream, float attentionScale, int32_t slidingWindowSize, bool fp8Input,
     float qScale, float kScale, float vScale, bool isCausal, float skipSoftmaxThresholdLog2,
     int32_t const* bidirectionalBlockBegin, int32_t const* bidirectionalBlockEnd)
 {
-    if (!sLLMLoaded)
-    {
-        LOG_ERROR("CuTe DSL LLM FMHA kernel module not loaded.");
-        return;
-    }
-
     check::check(qPtr != nullptr, "CuTe DSL paged FMHA qPtr must not be null.");
     check::check(pagedKVPoolPtr != nullptr, "CuTe DSL paged FMHA KV pool must not be null.");
     check::check(kvCachePageList != nullptr, "CuTe DSL paged FMHA page list must not be null.");
@@ -615,7 +719,9 @@ void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, i
     if (useBidirectional)
     {
         check::check(headDim == 512, "CuTe DSL paged BIDIRECTIONAL FMHA dispatch requires head dimension 512.");
-        ret = callLlmFmhaPaged<cute_dsl_fmha_d512_paged_bidirectional_wrapper>(sLLM_d512_paged_bidirectional, params);
+        ret = callLlmFmhaPaged<cute_dsl_fmha_d512_paged_bidirectional_wrapper,
+            fmha_d512_paged_bidirectional_Kernel_Module_Load, fmha_d512_paged_bidirectional_Kernel_Module_Unload>(
+            sLLM_d512_paged_bidirectional, "fmha_d512_paged_bidirectional", params);
     }
     else if (!isCausal)
     {
@@ -623,22 +729,34 @@ void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, i
         if (fp8Input)
         {
             ret = headDim == 256
-                ? callLlmFmhaPaged<cute_dsl_fmha_d256_dense_paged_fp8_wrapper>(sLLM_d256_dense_paged_fp8, params)
-                : callLlmFmhaPaged<cute_dsl_fmha_d512_dense_paged_fp8_wrapper>(sLLM_d512_dense_paged_fp8, params);
+                ? callLlmFmhaPaged<cute_dsl_fmha_d256_dense_paged_fp8_wrapper,
+                      fmha_d256_dense_paged_fp8_Kernel_Module_Load, fmha_d256_dense_paged_fp8_Kernel_Module_Unload>(
+                      sLLM_d256_dense_paged_fp8, "fmha_d256_dense_paged_fp8", params)
+                : callLlmFmhaPaged<cute_dsl_fmha_d512_dense_paged_fp8_wrapper,
+                      fmha_d512_dense_paged_fp8_Kernel_Module_Load, fmha_d512_dense_paged_fp8_Kernel_Module_Unload>(
+                      sLLM_d512_dense_paged_fp8, "fmha_d512_dense_paged_fp8", params);
         }
         else
         {
             ret = headDim == 256
-                ? callLlmFmhaPaged<cute_dsl_fmha_d256_dense_paged_wrapper>(sLLM_d256_dense_paged, params)
-                : callLlmFmhaPaged<cute_dsl_fmha_d512_dense_paged_wrapper>(sLLM_d512_dense_paged, params);
+                ? callLlmFmhaPaged<cute_dsl_fmha_d256_dense_paged_wrapper, fmha_d256_dense_paged_Kernel_Module_Load,
+                      fmha_d256_dense_paged_Kernel_Module_Unload>(
+                      sLLM_d256_dense_paged, "fmha_d256_dense_paged", params)
+                : callLlmFmhaPaged<cute_dsl_fmha_d512_dense_paged_wrapper, fmha_d512_dense_paged_Kernel_Module_Load,
+                      fmha_d512_dense_paged_Kernel_Module_Unload>(
+                      sLLM_d512_dense_paged, "fmha_d512_dense_paged", params);
         }
     }
     else if (enableSkipSoftmax && (headDim == 64 || headDim == 128))
     {
         // Skip-softmax paged prefill: causal, FP16, non-sliding, d64/d128 only.
         ret = headDim == 64
-            ? callLlmFmhaPaged<cute_dsl_fmha_d64_skipsoftmax_paged_wrapper>(sLLM_d64_skipsoftmax_paged, params)
-            : callLlmFmhaPaged<cute_dsl_fmha_d128_skipsoftmax_paged_wrapper>(sLLM_d128_skipsoftmax_paged, params);
+            ? callLlmFmhaPaged<cute_dsl_fmha_d64_skipsoftmax_paged_wrapper,
+                  fmha_d64_skipsoftmax_paged_Kernel_Module_Load, fmha_d64_skipsoftmax_paged_Kernel_Module_Unload>(
+                  sLLM_d64_skipsoftmax_paged, "fmha_d64_skipsoftmax_paged", params)
+            : callLlmFmhaPaged<cute_dsl_fmha_d128_skipsoftmax_paged_wrapper,
+                  fmha_d128_skipsoftmax_paged_Kernel_Module_Load, fmha_d128_skipsoftmax_paged_Kernel_Module_Unload>(
+                  sLLM_d128_skipsoftmax_paged, "fmha_d128_skipsoftmax_paged", params);
     }
     else if (fp8Input)
     {
@@ -646,25 +764,37 @@ void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, i
         {
         case 64:
             ret = useSlidingWindow
-                ? callLlmFmhaPaged<cute_dsl_fmha_d64_sw_paged_fp8_wrapper>(sLLM_d64_sw_paged_fp8, params)
-                : callLlmFmhaPaged<cute_dsl_fmha_d64_paged_fp8_wrapper>(sLLM_d64_paged_fp8, params);
+                ? callLlmFmhaPaged<cute_dsl_fmha_d64_sw_paged_fp8_wrapper, fmha_d64_sw_paged_fp8_Kernel_Module_Load,
+                      fmha_d64_sw_paged_fp8_Kernel_Module_Unload>(
+                      sLLM_d64_sw_paged_fp8, "fmha_d64_sw_paged_fp8", params)
+                : callLlmFmhaPaged<cute_dsl_fmha_d64_paged_fp8_wrapper, fmha_d64_paged_fp8_Kernel_Module_Load,
+                      fmha_d64_paged_fp8_Kernel_Module_Unload>(sLLM_d64_paged_fp8, "fmha_d64_paged_fp8", params);
             break;
         case 128:
             ret = useSlidingWindow
-                ? callLlmFmhaPaged<cute_dsl_fmha_d128_sw_paged_fp8_wrapper>(sLLM_d128_sw_paged_fp8, params)
-                : callLlmFmhaPaged<cute_dsl_fmha_d128_paged_fp8_wrapper>(sLLM_d128_paged_fp8, params);
+                ? callLlmFmhaPaged<cute_dsl_fmha_d128_sw_paged_fp8_wrapper, fmha_d128_sw_paged_fp8_Kernel_Module_Load,
+                      fmha_d128_sw_paged_fp8_Kernel_Module_Unload>(
+                      sLLM_d128_sw_paged_fp8, "fmha_d128_sw_paged_fp8", params)
+                : callLlmFmhaPaged<cute_dsl_fmha_d128_paged_fp8_wrapper, fmha_d128_paged_fp8_Kernel_Module_Load,
+                      fmha_d128_paged_fp8_Kernel_Module_Unload>(sLLM_d128_paged_fp8, "fmha_d128_paged_fp8", params);
             break;
         case 256:
             ret = useSlidingWindow
-                ? callLlmFmhaPaged<cute_dsl_fmha_d256_sw_paged_fp8_wrapper>(sLLM_d256_sw_paged_fp8, params)
-                : callLlmFmhaPaged<cute_dsl_fmha_d256_paged_fp8_wrapper>(sLLM_d256_paged_fp8, params);
+                ? callLlmFmhaPaged<cute_dsl_fmha_d256_sw_paged_fp8_wrapper, fmha_d256_sw_paged_fp8_Kernel_Module_Load,
+                      fmha_d256_sw_paged_fp8_Kernel_Module_Unload>(
+                      sLLM_d256_sw_paged_fp8, "fmha_d256_sw_paged_fp8", params)
+                : callLlmFmhaPaged<cute_dsl_fmha_d256_paged_fp8_wrapper, fmha_d256_paged_fp8_Kernel_Module_Load,
+                      fmha_d256_paged_fp8_Kernel_Module_Unload>(sLLM_d256_paged_fp8, "fmha_d256_paged_fp8", params);
             break;
         case 512:
             ret = useSlidingWindow
-                ? callLlmFmhaPaged<cute_dsl_fmha_d512_sw_paged_fp8_wrapper>(sLLM_d512_sw_paged_fp8, params)
-                : callLlmFmhaPaged<cute_dsl_fmha_d512_paged_fp8_wrapper>(sLLM_d512_paged_fp8, params);
+                ? callLlmFmhaPaged<cute_dsl_fmha_d512_sw_paged_fp8_wrapper, fmha_d512_sw_paged_fp8_Kernel_Module_Load,
+                      fmha_d512_sw_paged_fp8_Kernel_Module_Unload>(
+                      sLLM_d512_sw_paged_fp8, "fmha_d512_sw_paged_fp8", params)
+                : callLlmFmhaPaged<cute_dsl_fmha_d512_paged_fp8_wrapper, fmha_d512_paged_fp8_Kernel_Module_Load,
+                      fmha_d512_paged_fp8_Kernel_Module_Unload>(sLLM_d512_paged_fp8, "fmha_d512_paged_fp8", params);
             break;
-        default: LOG_ERROR("CuTe DSL paged LLM FMHA: unsupported head_dim=%d", headDim); return;
+        default: LOG_ERROR("CuTe DSL paged LLM FMHA: unsupported head_dim=%d", headDim); return false;
         }
     }
     else
@@ -672,22 +802,34 @@ void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, i
         switch (headDim)
         {
         case 64:
-            ret = useSlidingWindow ? callLlmFmhaPaged<cute_dsl_fmha_d64_sw_paged_wrapper>(sLLM_d64_sw_paged, params)
-                                   : callLlmFmhaPaged<cute_dsl_fmha_d64_paged_wrapper>(sLLM_d64_paged, params);
+            ret = useSlidingWindow
+                ? callLlmFmhaPaged<cute_dsl_fmha_d64_sw_paged_wrapper, fmha_d64_sw_paged_Kernel_Module_Load,
+                      fmha_d64_sw_paged_Kernel_Module_Unload>(sLLM_d64_sw_paged, "fmha_d64_sw_paged", params)
+                : callLlmFmhaPaged<cute_dsl_fmha_d64_paged_wrapper, fmha_d64_paged_Kernel_Module_Load,
+                      fmha_d64_paged_Kernel_Module_Unload>(sLLM_d64_paged, "fmha_d64_paged", params);
             break;
         case 128:
-            ret = useSlidingWindow ? callLlmFmhaPaged<cute_dsl_fmha_d128_sw_paged_wrapper>(sLLM_d128_sw_paged, params)
-                                   : callLlmFmhaPaged<cute_dsl_fmha_d128_paged_wrapper>(sLLM_d128_paged, params);
+            ret = useSlidingWindow
+                ? callLlmFmhaPaged<cute_dsl_fmha_d128_sw_paged_wrapper, fmha_d128_sw_paged_Kernel_Module_Load,
+                      fmha_d128_sw_paged_Kernel_Module_Unload>(sLLM_d128_sw_paged, "fmha_d128_sw_paged", params)
+                : callLlmFmhaPaged<cute_dsl_fmha_d128_paged_wrapper, fmha_d128_paged_Kernel_Module_Load,
+                      fmha_d128_paged_Kernel_Module_Unload>(sLLM_d128_paged, "fmha_d128_paged", params);
             break;
         case 256:
-            ret = useSlidingWindow ? callLlmFmhaPaged<cute_dsl_fmha_d256_sw_paged_wrapper>(sLLM_d256_sw_paged, params)
-                                   : callLlmFmhaPaged<cute_dsl_fmha_d256_paged_wrapper>(sLLM_d256_paged, params);
+            ret = useSlidingWindow
+                ? callLlmFmhaPaged<cute_dsl_fmha_d256_sw_paged_wrapper, fmha_d256_sw_paged_Kernel_Module_Load,
+                      fmha_d256_sw_paged_Kernel_Module_Unload>(sLLM_d256_sw_paged, "fmha_d256_sw_paged", params)
+                : callLlmFmhaPaged<cute_dsl_fmha_d256_paged_wrapper, fmha_d256_paged_Kernel_Module_Load,
+                      fmha_d256_paged_Kernel_Module_Unload>(sLLM_d256_paged, "fmha_d256_paged", params);
             break;
         case 512:
-            ret = useSlidingWindow ? callLlmFmhaPaged<cute_dsl_fmha_d512_sw_paged_wrapper>(sLLM_d512_sw_paged, params)
-                                   : callLlmFmhaPaged<cute_dsl_fmha_d512_paged_wrapper>(sLLM_d512_paged, params);
+            ret = useSlidingWindow
+                ? callLlmFmhaPaged<cute_dsl_fmha_d512_sw_paged_wrapper, fmha_d512_sw_paged_Kernel_Module_Load,
+                      fmha_d512_sw_paged_Kernel_Module_Unload>(sLLM_d512_sw_paged, "fmha_d512_sw_paged", params)
+                : callLlmFmhaPaged<cute_dsl_fmha_d512_paged_wrapper, fmha_d512_paged_Kernel_Module_Load,
+                      fmha_d512_paged_Kernel_Module_Unload>(sLLM_d512_paged, "fmha_d512_paged", params);
             break;
-        default: LOG_ERROR("CuTe DSL paged LLM FMHA: unsupported head_dim=%d", headDim); return;
+        default: LOG_ERROR("CuTe DSL paged LLM FMHA: unsupported head_dim=%d", headDim); return false;
         }
     }
 
@@ -699,21 +841,16 @@ void CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, i
             headDim, isCausal ? "true" : "false", useSlidingWindow ? "true" : "false", fp8Input ? "true" : "false",
             useBidirectional ? "true" : "false", ret);
     }
+    return ret == 0;
 }
 
 // =====================================================================
 // ViT run: packed varlen separate Q/K/V
 // =====================================================================
 
-void CuteDslFMHARunner::run(void const* qPtr, void const* kPtr, void const* vPtr, void* oPtr, int32_t const* cuSeqLens,
+bool CuteDslFMHARunner::run(void const* qPtr, void const* kPtr, void const* vPtr, void* oPtr, int32_t const* cuSeqLens,
     int32_t totalSeqLen, int32_t maxSeqLen, int32_t batchSize, cudaStream_t stream, float attentionScale)
 {
-    if (!sViTLoaded)
-    {
-        LOG_ERROR("CuTe DSL ViT FMHA kernel module not loaded.");
-        return;
-    }
-
     validateAttentionScale(attentionScale);
 
     int32_t const headDim = mHeadDim;
@@ -738,17 +875,30 @@ void CuteDslFMHARunner::run(void const* qPtr, void const* kPtr, void const* vPtr
 
     switch (headDim)
     {
-    case 64: ret = callVitFmha<cute_dsl_vit_fmha_d64_wrapper>(sViT_d64, params); break;
-    case 72: ret = callVitFmha<cute_dsl_vit_fmha_d72_wrapper>(sViT_d72, params); break;
-    case 80: ret = callVitFmha<cute_dsl_vit_fmha_d80_wrapper>(sViT_d80, params); break;
-    case 128: ret = callVitFmha<cute_dsl_vit_fmha_d128_wrapper>(sViT_d128, params); break;
-    default: LOG_ERROR("CuTe DSL ViT FMHA: unsupported head_dim=%d", headDim); return;
+    case 64:
+        ret = callVitFmha<cute_dsl_vit_fmha_d64_wrapper, vit_fmha_d64_Kernel_Module_Load,
+            vit_fmha_d64_Kernel_Module_Unload>(sViT_d64, "vit_fmha_d64", params);
+        break;
+    case 72:
+        ret = callVitFmha<cute_dsl_vit_fmha_d72_wrapper, vit_fmha_d72_Kernel_Module_Load,
+            vit_fmha_d72_Kernel_Module_Unload>(sViT_d72, "vit_fmha_d72", params);
+        break;
+    case 80:
+        ret = callVitFmha<cute_dsl_vit_fmha_d80_wrapper, vit_fmha_d80_Kernel_Module_Load,
+            vit_fmha_d80_Kernel_Module_Unload>(sViT_d80, "vit_fmha_d80", params);
+        break;
+    case 128:
+        ret = callVitFmha<cute_dsl_vit_fmha_d128_wrapper, vit_fmha_d128_Kernel_Module_Load,
+            vit_fmha_d128_Kernel_Module_Unload>(sViT_d128, "vit_fmha_d128", params);
+        break;
+    default: LOG_ERROR("CuTe DSL ViT FMHA: unsupported head_dim=%d", headDim); return false;
     }
 
     if (ret != 0)
     {
         LOG_ERROR("CuTe DSL ViT FMHA kernel (d=%d) failed with error code: %d", headDim, ret);
     }
+    return ret == 0;
 }
 
 } // namespace trt_edgellm

@@ -497,6 +497,11 @@ int32_t Fp16MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
             return -1;
         }
         int32_t const numTokens = static_cast<int32_t>(numTokens64);
+        if (!CuteDslF16MoeRunner::ensureKernelModules(getSMVersion(), stream))
+        {
+            LOG_ERROR("Fp16MoePlugin: failed to load the selected f16_moe CuTe DSL module");
+            return -1;
+        }
 
         size_t const softmaxBytes = kernel::getMoeTopkSoftmaxWorkspaceSize(numTokens, mNumExperts);
         std::byte* next = static_cast<std::byte*>(workspace);

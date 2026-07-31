@@ -637,7 +637,7 @@ bool isSupportedSm()
     return sm == 120 || sm == 121;
 }
 
-bool checkRequirementsAndLoad()
+bool checkRequirements()
 {
     if (!isSupportedSm())
     {
@@ -649,7 +649,7 @@ bool checkRequirementsAndLoad()
     {
         return false;
     }
-    return CuteDslNvfp4MoeRunner::loadKernelModules();
+    return true;
 }
 
 std::vector<MoeCase> defaultCases()
@@ -691,9 +691,9 @@ TEST(CuteDslNvfp4MoeSm12xTest, smoke)
     {
         GTEST_SKIP() << "SM12x NVFP4 fused MoE CuTeDSL runner test requires Spark/GB10 (SM120/SM121), got SM=" << sm;
     }
-    if (!checkRequirementsAndLoad())
+    if (!checkRequirements())
     {
-        GTEST_SKIP() << "Failed to load SM12x NVFP4 fused MoE CuTeDSL kernel modules or canImplement returned false";
+        GTEST_SKIP() << "SM12x NVFP4 fused MoE CuTeDSL canImplement returned false";
     }
 
     for (auto const& cfg : defaultCases())
@@ -723,9 +723,9 @@ TEST(CuteDslNvfp4MoeSm12xTest, accuracy)
     {
         GTEST_SKIP() << "SM12x NVFP4 fused MoE CuTeDSL runner test requires Spark/GB10 (SM120/SM121), got SM=" << sm;
     }
-    if (!checkRequirementsAndLoad())
+    if (!checkRequirements())
     {
-        GTEST_SKIP() << "Failed to load SM12x NVFP4 fused MoE CuTeDSL kernel modules or canImplement returned false";
+        GTEST_SKIP() << "SM12x NVFP4 fused MoE CuTeDSL canImplement returned false";
     }
 
     // Median cosine is the correctness gate (validated == 1.0 on real GB10):

@@ -32,7 +32,14 @@ static inline cudaError_t cudaLibraryUnload(cudaLibrary_t lib)
 #endif // CUDA_VERSION >= 12000 && CUDA_VERSION < 12080
 #endif // TRT_EDGELLM_CUDA_LIBRARY_T_COMPAT
 
+#include "kernels/cuteDslModuleLoader.h"
+
+#if defined(CUTE_DSL_CUDA_ERROR_CHECK)
+#undef CUTE_DSL_CUDA_ERROR_CHECK
+#endif
+#define CUTE_DSL_CUDA_ERROR_CHECK(error) ::trt_edgellm::detail::recordCuteDslCudaError(static_cast<cudaError_t>(error))
 #include "cutedsl_all.h"
+#undef CUTE_DSL_CUDA_ERROR_CHECK
 
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -71,7 +78,7 @@ struct GDNParams
     int32_t smVersion{}; // GPU SM version for dispatch (e.g. 87, 110)
 };
 
-/** Loads AOT .o, fills tensor structs from GDNParams, calls generated wrapper.
+/** Lazily loads the selected AOT module, fills tensor structs from GDNParams, and calls its generated wrapper.
  *
  *  Dispatch table (evaluated in order):
  *    use_mtp == true              → runDecodeMTP()       (MTP: any seq_len)
@@ -92,8 +99,9 @@ public:
 
     static bool canImplement(int32_t kDim, int32_t vDim, int32_t smVersion);
 
-    static bool loadKernelModules();
-    static void unloadKernelModules();
+    //! Load only the module selected by \p params. This is exposed so the plugin can
+    //! fail before enqueue-side preprocessing mutates device buffers.
+    static bool ensureKernelModules(GDNParams const& params, cudaStream_t stream);
 
     /** Run GDN kernel. See class-level dispatch table. */
     int run(GDNParams const& params, cudaStream_t stream);
@@ -104,13 +112,12 @@ private:
     int runPrefillBlackwell(GDNParams const& params, cudaStream_t stream);
     int runDecodeMTP(GDNParams const& params, cudaStream_t stream);
 
-    static gdn_decode_Kernel_Module_t sDecodeModule;
-    static gdn_prefill_Kernel_Module_t sPrefillModule;
+    static detail::LazyKernelModule<gdn_decode_Kernel_Module_t> sDecodeModule;
+    static detail::LazyKernelModule<gdn_prefill_Kernel_Module_t> sPrefillModule;
 #ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
-    static gdn_prefill_blackwell_Kernel_Module_t sBlackwellPrefillModule;
+    static detail::LazyKernelModule<gdn_prefill_blackwell_Kernel_Module_t> sBlackwellPrefillModule;
 #endif
-    static gdn_decode_mtp_cache_Kernel_Module_t sMTPDecodeCacheModule;
-    static bool sLoaded;
+    static detail::LazyKernelModule<gdn_decode_mtp_cache_Kernel_Module_t> sMTPDecodeCacheModule;
 };
 
 } // namespace trt_edgellm

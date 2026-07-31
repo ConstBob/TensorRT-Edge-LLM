@@ -25,38 +25,33 @@
 #include "cuteDslTensorDescriptors.h"
 
 #include <cmath>
-#include <stdexcept>
 
 namespace trt_edgellm
 {
 
-fmha_v2_d64_Kernel_Module_t CuteDslFMHAV2Runner::sLLM_d64{};
-fmha_v2_d64_small_Kernel_Module_t CuteDslFMHAV2Runner::sLLM_d64Small{};
-fmha_v2_d128_Kernel_Module_t CuteDslFMHAV2Runner::sLLM_d128{};
-fmha_v2_d256_Kernel_Module_t CuteDslFMHAV2Runner::sLLM_d256{};
-fmha_v2_d256_padding_Kernel_Module_t CuteDslFMHAV2Runner::sLLM_d256Padding{};
-fmha_v2_d64_sw_Kernel_Module_t CuteDslFMHAV2Runner::sLLM_d64Sw{};
-fmha_v2_d128_sw_Kernel_Module_t CuteDslFMHAV2Runner::sLLM_d128Sw{};
-fmha_v2_d256_sw_Kernel_Module_t CuteDslFMHAV2Runner::sLLM_d256Sw{};
-fmha_v2_d256_bidirectional_Kernel_Module_t CuteDslFMHAV2Runner::sLLM_d256Bidirectional{};
-fmha_v2_d64_paged_Kernel_Module_t CuteDslFMHAV2Runner::sLLM_d64Paged{};
-fmha_v2_d64_small_paged_Kernel_Module_t CuteDslFMHAV2Runner::sLLM_d64SmallPaged{};
-fmha_v2_d128_paged_Kernel_Module_t CuteDslFMHAV2Runner::sLLM_d128Paged{};
-fmha_v2_d256_paged_Kernel_Module_t CuteDslFMHAV2Runner::sLLM_d256Paged{};
-fmha_v2_d512_paged_Kernel_Module_t CuteDslFMHAV2Runner::sLLM_d512Paged{};
-fmha_v2_d64_sw_paged_Kernel_Module_t CuteDslFMHAV2Runner::sLLM_d64SwPaged{};
-fmha_v2_d128_sw_paged_Kernel_Module_t CuteDslFMHAV2Runner::sLLM_d128SwPaged{};
-fmha_v2_d256_sw_paged_Kernel_Module_t CuteDslFMHAV2Runner::sLLM_d256SwPaged{};
-fmha_v2_d512_sw_paged_Kernel_Module_t CuteDslFMHAV2Runner::sLLM_d512SwPaged{};
-bool CuteDslFMHAV2Runner::sLLMLoaded{false};
-std::mutex CuteDslFMHAV2Runner::sLLMMutex;
+detail::LazyKernelModule<fmha_v2_d64_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d64{};
+detail::LazyKernelModule<fmha_v2_d64_small_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d64Small{};
+detail::LazyKernelModule<fmha_v2_d128_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d128{};
+detail::LazyKernelModule<fmha_v2_d256_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d256{};
+detail::LazyKernelModule<fmha_v2_d256_padding_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d256Padding{};
+detail::LazyKernelModule<fmha_v2_d64_sw_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d64Sw{};
+detail::LazyKernelModule<fmha_v2_d128_sw_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d128Sw{};
+detail::LazyKernelModule<fmha_v2_d256_sw_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d256Sw{};
+detail::LazyKernelModule<fmha_v2_d256_bidirectional_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d256Bidirectional{};
+detail::LazyKernelModule<fmha_v2_d64_paged_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d64Paged{};
+detail::LazyKernelModule<fmha_v2_d64_small_paged_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d64SmallPaged{};
+detail::LazyKernelModule<fmha_v2_d128_paged_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d128Paged{};
+detail::LazyKernelModule<fmha_v2_d256_paged_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d256Paged{};
+detail::LazyKernelModule<fmha_v2_d512_paged_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d512Paged{};
+detail::LazyKernelModule<fmha_v2_d64_sw_paged_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d64SwPaged{};
+detail::LazyKernelModule<fmha_v2_d128_sw_paged_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d128SwPaged{};
+detail::LazyKernelModule<fmha_v2_d256_sw_paged_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d256SwPaged{};
+detail::LazyKernelModule<fmha_v2_d512_sw_paged_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d512SwPaged{};
 
-fmha_v2_vit_d64_Kernel_Module_t CuteDslFMHAV2Runner::sViT_d64{};
-fmha_v2_vit_d72_Kernel_Module_t CuteDslFMHAV2Runner::sViT_d72{};
-fmha_v2_vit_d80_Kernel_Module_t CuteDslFMHAV2Runner::sViT_d80{};
-fmha_v2_vit_d128_Kernel_Module_t CuteDslFMHAV2Runner::sViT_d128{};
-bool CuteDslFMHAV2Runner::sViTLoaded{false};
-std::mutex CuteDslFMHAV2Runner::sViTMutex;
+detail::LazyKernelModule<fmha_v2_vit_d64_Kernel_Module_t> CuteDslFMHAV2Runner::sViT_d64{};
+detail::LazyKernelModule<fmha_v2_vit_d72_Kernel_Module_t> CuteDslFMHAV2Runner::sViT_d72{};
+detail::LazyKernelModule<fmha_v2_vit_d80_Kernel_Module_t> CuteDslFMHAV2Runner::sViT_d80{};
+detail::LazyKernelModule<fmha_v2_vit_d128_Kernel_Module_t> CuteDslFMHAV2Runner::sViT_d128{};
 
 namespace
 {
@@ -79,36 +74,10 @@ bool isFMHAV2PagedLlmHeadSize(int32_t headSize)
     }
 }
 
-template <typename Module, typename Loader>
-void loadModule(Module& module, Loader loader, char const* name)
+template <auto moduleLoader, auto moduleUnloader, typename Module>
+bool preflightVariant(detail::LazyKernelModule<Module>& state, char const* moduleName, cudaStream_t stream)
 {
-    loader(&module);
-    if (module.module == nullptr)
-    {
-        throw std::runtime_error(std::string("CuTe DSL module loader returned a null handle for ") + name);
-    }
-}
-
-//! Unload through the generated helper: it is emitted per artifact flavour and
-//! calls cuModuleUnload or cudaLibraryUnload to match. The helper reports errors
-//! through CUTE_DSL_CUDA_ERROR_CHECK, which throws here, so contain it -- callers
-//! include the partial-load cleanup path.
-template <typename Module, typename Unloader>
-void unloadModule(Module& module, Unloader unloader, char const* name) noexcept
-{
-    if (module.module == nullptr)
-    {
-        return;
-    }
-    try
-    {
-        unloader(&module);
-    }
-    catch (std::exception const& e)
-    {
-        LOG_ERROR("Failed to unload CuTe DSL module %s: %s", name, e.what());
-    }
-    module.module = nullptr;
+    return detail::ensureModuleLoaded<moduleLoader, moduleUnloader>(state, moduleName, stream);
 }
 
 } // namespace
@@ -157,135 +126,122 @@ bool CuteDslFMHAV2Runner::canImplementViT(int32_t headSize, int32_t smVersion, n
         && (headSize == 64 || headSize == 72 || headSize == 80 || headSize == 128);
 }
 
-bool CuteDslFMHAV2Runner::loadLLMKernelModule()
+bool CuteDslFMHAV2Runner::preflightLlm(cudaStream_t stream, int32_t slidingWindowSize)
 {
-    std::lock_guard<std::mutex> lock{sLLMMutex};
-    if (sLLMLoaded)
-    {
-        return true;
-    }
+    bool const useSlidingWindow = slidingWindowSize < INT_MAX;
 
-    try
+    switch (mHeadDim)
     {
-        loadModule(sLLM_d64, fmha_v2_d64_Kernel_Module_Load, "fmha_v2_d64");
-        loadModule(sLLM_d64Small, fmha_v2_d64_small_Kernel_Module_Load, "fmha_v2_d64_small");
-        loadModule(sLLM_d128, fmha_v2_d128_Kernel_Module_Load, "fmha_v2_d128");
-        loadModule(sLLM_d256, fmha_v2_d256_Kernel_Module_Load, "fmha_v2_d256");
-        loadModule(sLLM_d256Padding, fmha_v2_d256_padding_Kernel_Module_Load, "fmha_v2_d256_padding");
-        loadModule(sLLM_d64Sw, fmha_v2_d64_sw_Kernel_Module_Load, "fmha_v2_d64_sw");
-        loadModule(sLLM_d128Sw, fmha_v2_d128_sw_Kernel_Module_Load, "fmha_v2_d128_sw");
-        loadModule(sLLM_d256Sw, fmha_v2_d256_sw_Kernel_Module_Load, "fmha_v2_d256_sw");
-        loadModule(sLLM_d256Bidirectional, fmha_v2_d256_bidirectional_Kernel_Module_Load, "fmha_v2_d256_bidirectional");
-        loadModule(sLLM_d64Paged, fmha_v2_d64_paged_Kernel_Module_Load, "fmha_v2_d64_paged");
-        loadModule(sLLM_d64SmallPaged, fmha_v2_d64_small_paged_Kernel_Module_Load, "fmha_v2_d64_small_paged");
-        loadModule(sLLM_d128Paged, fmha_v2_d128_paged_Kernel_Module_Load, "fmha_v2_d128_paged");
-        loadModule(sLLM_d256Paged, fmha_v2_d256_paged_Kernel_Module_Load, "fmha_v2_d256_paged");
-        loadModule(sLLM_d512Paged, fmha_v2_d512_paged_Kernel_Module_Load, "fmha_v2_d512_paged");
-        loadModule(sLLM_d64SwPaged, fmha_v2_d64_sw_paged_Kernel_Module_Load, "fmha_v2_d64_sw_paged");
-        loadModule(sLLM_d128SwPaged, fmha_v2_d128_sw_paged_Kernel_Module_Load, "fmha_v2_d128_sw_paged");
-        loadModule(sLLM_d256SwPaged, fmha_v2_d256_sw_paged_Kernel_Module_Load, "fmha_v2_d256_sw_paged");
-        loadModule(sLLM_d512SwPaged, fmha_v2_d512_sw_paged_Kernel_Module_Load, "fmha_v2_d512_sw_paged");
-        sLLMLoaded = true;
-        LOG_DEBUG("FMHA-v2 CuTe DSL LLM FMHA kernel modules loaded");
-        return true;
+    case 64:
+        if (useSlidingWindow)
+        {
+            return preflightVariant<fmha_v2_d64_sw_Kernel_Module_Load, fmha_v2_d64_sw_Kernel_Module_Unload>(
+                sLLM_d64Sw, "fmha_v2_d64_sw", stream);
+        }
+        if (mUseSmallD64 && mSeqLenQ <= 512)
+        {
+            return preflightVariant<fmha_v2_d64_small_Kernel_Module_Load, fmha_v2_d64_small_Kernel_Module_Unload>(
+                sLLM_d64Small, "fmha_v2_d64_small", stream);
+        }
+        return preflightVariant<fmha_v2_d64_Kernel_Module_Load, fmha_v2_d64_Kernel_Module_Unload>(
+            sLLM_d64, "fmha_v2_d64", stream);
+    case 128:
+        return useSlidingWindow
+            ? preflightVariant<fmha_v2_d128_sw_Kernel_Module_Load, fmha_v2_d128_sw_Kernel_Module_Unload>(
+                  sLLM_d128Sw, "fmha_v2_d128_sw", stream)
+            : preflightVariant<fmha_v2_d128_Kernel_Module_Load, fmha_v2_d128_Kernel_Module_Unload>(
+                  sLLM_d128, "fmha_v2_d128", stream);
+    case 256:
+        return useSlidingWindow
+            ? preflightVariant<fmha_v2_d256_sw_Kernel_Module_Load, fmha_v2_d256_sw_Kernel_Module_Unload>(
+                  sLLM_d256Sw, "fmha_v2_d256_sw", stream)
+            : preflightVariant<fmha_v2_d256_Kernel_Module_Load, fmha_v2_d256_Kernel_Module_Unload>(
+                  sLLM_d256, "fmha_v2_d256", stream);
+    default: LOG_ERROR("FMHA-v2 CuTe DSL LLM FMHA: unsupported head_dim=%d", mHeadDim); return false;
     }
-    catch (...)
+}
+
+bool CuteDslFMHAV2Runner::preflightPaged(cudaStream_t stream, int32_t slidingWindowSize)
+{
+    bool const useSlidingWindow = slidingWindowSize < INT_MAX;
+
+    switch (mHeadDim)
     {
-        unloadModule(sLLM_d64, fmha_v2_d64_Kernel_Module_Unload, "fmha_v2_d64");
-        unloadModule(sLLM_d64Small, fmha_v2_d64_small_Kernel_Module_Unload, "fmha_v2_d64_small");
-        unloadModule(sLLM_d128, fmha_v2_d128_Kernel_Module_Unload, "fmha_v2_d128");
-        unloadModule(sLLM_d256, fmha_v2_d256_Kernel_Module_Unload, "fmha_v2_d256");
-        unloadModule(sLLM_d256Padding, fmha_v2_d256_padding_Kernel_Module_Unload, "fmha_v2_d256_padding");
-        unloadModule(sLLM_d64Sw, fmha_v2_d64_sw_Kernel_Module_Unload, "fmha_v2_d64_sw");
-        unloadModule(sLLM_d128Sw, fmha_v2_d128_sw_Kernel_Module_Unload, "fmha_v2_d128_sw");
-        unloadModule(sLLM_d256Sw, fmha_v2_d256_sw_Kernel_Module_Unload, "fmha_v2_d256_sw");
-        unloadModule(
-            sLLM_d256Bidirectional, fmha_v2_d256_bidirectional_Kernel_Module_Unload, "fmha_v2_d256_bidirectional");
-        unloadModule(sLLM_d64Paged, fmha_v2_d64_paged_Kernel_Module_Unload, "fmha_v2_d64_paged");
-        unloadModule(sLLM_d64SmallPaged, fmha_v2_d64_small_paged_Kernel_Module_Unload, "fmha_v2_d64_small_paged");
-        unloadModule(sLLM_d128Paged, fmha_v2_d128_paged_Kernel_Module_Unload, "fmha_v2_d128_paged");
-        unloadModule(sLLM_d256Paged, fmha_v2_d256_paged_Kernel_Module_Unload, "fmha_v2_d256_paged");
-        unloadModule(sLLM_d512Paged, fmha_v2_d512_paged_Kernel_Module_Unload, "fmha_v2_d512_paged");
-        unloadModule(sLLM_d64SwPaged, fmha_v2_d64_sw_paged_Kernel_Module_Unload, "fmha_v2_d64_sw_paged");
-        unloadModule(sLLM_d128SwPaged, fmha_v2_d128_sw_paged_Kernel_Module_Unload, "fmha_v2_d128_sw_paged");
-        unloadModule(sLLM_d256SwPaged, fmha_v2_d256_sw_paged_Kernel_Module_Unload, "fmha_v2_d256_sw_paged");
-        unloadModule(sLLM_d512SwPaged, fmha_v2_d512_sw_paged_Kernel_Module_Unload, "fmha_v2_d512_sw_paged");
-        LOG_ERROR("Failed to load FMHA-v2 CuTe DSL LLM FMHA kernel modules");
+    case 64:
+        if (useSlidingWindow)
+        {
+            return preflightVariant<fmha_v2_d64_sw_paged_Kernel_Module_Load, fmha_v2_d64_sw_paged_Kernel_Module_Unload>(
+                sLLM_d64SwPaged, "fmha_v2_d64_sw_paged", stream);
+        }
+        if (mSeqLenQ <= 512)
+        {
+            return preflightVariant<fmha_v2_d64_small_paged_Kernel_Module_Load,
+                fmha_v2_d64_small_paged_Kernel_Module_Unload>(sLLM_d64SmallPaged, "fmha_v2_d64_small_paged", stream);
+        }
+        return preflightVariant<fmha_v2_d64_paged_Kernel_Module_Load, fmha_v2_d64_paged_Kernel_Module_Unload>(
+            sLLM_d64Paged, "fmha_v2_d64_paged", stream);
+    case 128:
+        return useSlidingWindow
+            ? preflightVariant<fmha_v2_d128_sw_paged_Kernel_Module_Load, fmha_v2_d128_sw_paged_Kernel_Module_Unload>(
+                  sLLM_d128SwPaged, "fmha_v2_d128_sw_paged", stream)
+            : preflightVariant<fmha_v2_d128_paged_Kernel_Module_Load, fmha_v2_d128_paged_Kernel_Module_Unload>(
+                  sLLM_d128Paged, "fmha_v2_d128_paged", stream);
+    case 256:
+        return useSlidingWindow
+            ? preflightVariant<fmha_v2_d256_sw_paged_Kernel_Module_Load, fmha_v2_d256_sw_paged_Kernel_Module_Unload>(
+                  sLLM_d256SwPaged, "fmha_v2_d256_sw_paged", stream)
+            : preflightVariant<fmha_v2_d256_paged_Kernel_Module_Load, fmha_v2_d256_paged_Kernel_Module_Unload>(
+                  sLLM_d256Paged, "fmha_v2_d256_paged", stream);
+    case 512:
+        return useSlidingWindow
+            ? preflightVariant<fmha_v2_d512_sw_paged_Kernel_Module_Load, fmha_v2_d512_sw_paged_Kernel_Module_Unload>(
+                  sLLM_d512SwPaged, "fmha_v2_d512_sw_paged", stream)
+            : preflightVariant<fmha_v2_d512_paged_Kernel_Module_Load, fmha_v2_d512_paged_Kernel_Module_Unload>(
+                  sLLM_d512Paged, "fmha_v2_d512_paged", stream);
+    default: LOG_ERROR("FMHA-v2 native paged FMHA: unsupported head_dim=%d.", mHeadDim); return false;
+    }
+}
+
+bool CuteDslFMHAV2Runner::preflightPadding(cudaStream_t stream)
+{
+    if (mHeadDim != 256)
+    {
+        LOG_ERROR("FMHA-v2 CuTe DSL padding FMHA requires head_dim=256.");
         return false;
     }
+    return preflightVariant<fmha_v2_d256_padding_Kernel_Module_Load, fmha_v2_d256_padding_Kernel_Module_Unload>(
+        sLLM_d256Padding, "fmha_v2_d256_padding", stream);
 }
 
-void CuteDslFMHAV2Runner::unloadLLMKernelModule()
+bool CuteDslFMHAV2Runner::preflightVisionBlock(cudaStream_t stream)
 {
-    std::lock_guard<std::mutex> lock{sLLMMutex};
-    if (!sLLMLoaded)
+    if (mHeadDim != 256)
     {
-        return;
-    }
-
-    unloadModule(sLLM_d64, fmha_v2_d64_Kernel_Module_Unload, "fmha_v2_d64");
-    unloadModule(sLLM_d64Small, fmha_v2_d64_small_Kernel_Module_Unload, "fmha_v2_d64_small");
-    unloadModule(sLLM_d128, fmha_v2_d128_Kernel_Module_Unload, "fmha_v2_d128");
-    unloadModule(sLLM_d256, fmha_v2_d256_Kernel_Module_Unload, "fmha_v2_d256");
-    unloadModule(sLLM_d256Padding, fmha_v2_d256_padding_Kernel_Module_Unload, "fmha_v2_d256_padding");
-    unloadModule(sLLM_d64Sw, fmha_v2_d64_sw_Kernel_Module_Unload, "fmha_v2_d64_sw");
-    unloadModule(sLLM_d128Sw, fmha_v2_d128_sw_Kernel_Module_Unload, "fmha_v2_d128_sw");
-    unloadModule(sLLM_d256Sw, fmha_v2_d256_sw_Kernel_Module_Unload, "fmha_v2_d256_sw");
-    unloadModule(sLLM_d256Bidirectional, fmha_v2_d256_bidirectional_Kernel_Module_Unload, "fmha_v2_d256_bidirectional");
-    unloadModule(sLLM_d64Paged, fmha_v2_d64_paged_Kernel_Module_Unload, "fmha_v2_d64_paged");
-    unloadModule(sLLM_d64SmallPaged, fmha_v2_d64_small_paged_Kernel_Module_Unload, "fmha_v2_d64_small_paged");
-    unloadModule(sLLM_d128Paged, fmha_v2_d128_paged_Kernel_Module_Unload, "fmha_v2_d128_paged");
-    unloadModule(sLLM_d256Paged, fmha_v2_d256_paged_Kernel_Module_Unload, "fmha_v2_d256_paged");
-    unloadModule(sLLM_d512Paged, fmha_v2_d512_paged_Kernel_Module_Unload, "fmha_v2_d512_paged");
-    unloadModule(sLLM_d64SwPaged, fmha_v2_d64_sw_paged_Kernel_Module_Unload, "fmha_v2_d64_sw_paged");
-    unloadModule(sLLM_d128SwPaged, fmha_v2_d128_sw_paged_Kernel_Module_Unload, "fmha_v2_d128_sw_paged");
-    unloadModule(sLLM_d256SwPaged, fmha_v2_d256_sw_paged_Kernel_Module_Unload, "fmha_v2_d256_sw_paged");
-    unloadModule(sLLM_d512SwPaged, fmha_v2_d512_sw_paged_Kernel_Module_Unload, "fmha_v2_d512_sw_paged");
-    sLLMLoaded = false;
-}
-
-bool CuteDslFMHAV2Runner::loadViTKernelModule()
-{
-    std::lock_guard<std::mutex> lock{sViTMutex};
-    if (sViTLoaded)
-    {
-        return true;
-    }
-
-    try
-    {
-        loadModule(sViT_d64, fmha_v2_vit_d64_Kernel_Module_Load, "fmha_v2_vit_d64");
-        loadModule(sViT_d72, fmha_v2_vit_d72_Kernel_Module_Load, "fmha_v2_vit_d72");
-        loadModule(sViT_d80, fmha_v2_vit_d80_Kernel_Module_Load, "fmha_v2_vit_d80");
-        loadModule(sViT_d128, fmha_v2_vit_d128_Kernel_Module_Load, "fmha_v2_vit_d128");
-        sViTLoaded = true;
-        LOG_DEBUG("FMHA-v2 CuTe DSL ViT FMHA kernel modules loaded");
-        return true;
-    }
-    catch (...)
-    {
-        unloadModule(sViT_d64, fmha_v2_vit_d64_Kernel_Module_Unload, "fmha_v2_vit_d64");
-        unloadModule(sViT_d72, fmha_v2_vit_d72_Kernel_Module_Unload, "fmha_v2_vit_d72");
-        unloadModule(sViT_d80, fmha_v2_vit_d80_Kernel_Module_Unload, "fmha_v2_vit_d80");
-        unloadModule(sViT_d128, fmha_v2_vit_d128_Kernel_Module_Unload, "fmha_v2_vit_d128");
-        LOG_ERROR("Failed to load FMHA-v2 CuTe DSL ViT FMHA kernel modules");
+        LOG_ERROR("FMHA-v2 CuTe DSL bidirectional FMHA requires head_dim=256.");
         return false;
     }
+    return preflightVariant<fmha_v2_d256_bidirectional_Kernel_Module_Load,
+        fmha_v2_d256_bidirectional_Kernel_Module_Unload>(sLLM_d256Bidirectional, "fmha_v2_d256_bidirectional", stream);
 }
 
-void CuteDslFMHAV2Runner::unloadViTKernelModule()
+bool CuteDslFMHAV2Runner::preflightViT(cudaStream_t stream)
 {
-    std::lock_guard<std::mutex> lock{sViTMutex};
-    if (!sViTLoaded)
+    switch (mHeadDim)
     {
-        return;
+    case 64:
+        return preflightVariant<fmha_v2_vit_d64_Kernel_Module_Load, fmha_v2_vit_d64_Kernel_Module_Unload>(
+            sViT_d64, "fmha_v2_vit_d64", stream);
+    case 72:
+        return preflightVariant<fmha_v2_vit_d72_Kernel_Module_Load, fmha_v2_vit_d72_Kernel_Module_Unload>(
+            sViT_d72, "fmha_v2_vit_d72", stream);
+    case 80:
+        return preflightVariant<fmha_v2_vit_d80_Kernel_Module_Load, fmha_v2_vit_d80_Kernel_Module_Unload>(
+            sViT_d80, "fmha_v2_vit_d80", stream);
+    case 128:
+        return preflightVariant<fmha_v2_vit_d128_Kernel_Module_Load, fmha_v2_vit_d128_Kernel_Module_Unload>(
+            sViT_d128, "fmha_v2_vit_d128", stream);
+    default: LOG_ERROR("FMHA-v2 CuTe DSL ViT FMHA: unsupported head_dim=%d", mHeadDim); return false;
     }
-
-    unloadModule(sViT_d64, fmha_v2_vit_d64_Kernel_Module_Unload, "fmha_v2_vit_d64");
-    unloadModule(sViT_d72, fmha_v2_vit_d72_Kernel_Module_Unload, "fmha_v2_vit_d72");
-    unloadModule(sViT_d80, fmha_v2_vit_d80_Kernel_Module_Unload, "fmha_v2_vit_d80");
-    unloadModule(sViT_d128, fmha_v2_vit_d128_Kernel_Module_Unload, "fmha_v2_vit_d128");
-    sViTLoaded = false;
 }
 
 CuteDslFMHAV2Runner::CuteDslFMHAV2Runner(int32_t numQHeads, int32_t numKVHeads, int32_t headDim, int32_t batchSize,
@@ -346,12 +302,19 @@ TensorT makeShTensor(void const* data, int32_t totalSeqLen, int32_t numHeads, in
 //! Launch an FMHA-v2 LLM variant over separate padded [B, S, H, D] Q/K/V.
 //! @tparam cuteDslKernelWrapper Generated CuTe DSL kernel wrapper function. Its signature supplies the module
 //! and tensor descriptor types at compile time.
-template <auto cuteDslKernelWrapper>
-int32_t callFmhaV2Llm(WrapperArgT<0, decltype(cuteDslKernelWrapper)>& module, FmhaV2LlmParams const& params)
+template <auto cuteDslKernelWrapper, auto moduleLoader, auto moduleUnloader>
+int32_t callFmhaV2Llm(detail::LazyKernelModule<WrapperArgT<0, decltype(cuteDslKernelWrapper)>>& state,
+    char const* moduleName, FmhaV2LlmParams const& params)
 {
     static_assert(WrapperArity<decltype(cuteDslKernelWrapper)>::value == 14,
         "callFmhaV2Llm: not an FMHA-v2 LLM wrapper (module, q_tensor, k_tensor, v_tensor, o_tensor, cum_seqlen_k, "
         "window_size_left, attention_scale, scale_q, scale_k, scale_v, inv_scale_o, sm_count, stream).");
+
+    if (!detail::ensureModuleLoaded<moduleLoader, moduleUnloader>(state, moduleName, params.stream))
+    {
+        return -1;
+    }
+    auto& module = state.module;
 
     auto qTensor = makeBshTensor<WrapperArgT<1, decltype(cuteDslKernelWrapper)>>(
         params.qPtr, params.batchSize, params.seqLenQ, params.numQHeads, params.headDim);
@@ -372,13 +335,20 @@ int32_t callFmhaV2Llm(WrapperArgT<0, decltype(cuteDslKernelWrapper)>& module, Fm
 //! Launch an FMHA-v2 LLM variant directly against the Edge-LLM NHD paged KV pool.
 //! @tparam cuteDslKernelWrapper Generated CuTe DSL kernel wrapper function. Its signature supplies the module
 //! and tensor descriptor types at compile time.
-template <auto cuteDslKernelWrapper>
-int32_t callFmhaV2Paged(WrapperArgT<0, decltype(cuteDslKernelWrapper)>& module, LlmFmhaPagedParams const& params)
+template <auto cuteDslKernelWrapper, auto moduleLoader, auto moduleUnloader>
+int32_t callFmhaV2Paged(detail::LazyKernelModule<WrapperArgT<0, decltype(cuteDslKernelWrapper)>>& state,
+    char const* moduleName, LlmFmhaPagedParams const& params)
 {
     static_assert(WrapperArity<decltype(cuteDslKernelWrapper)>::value == 11,
         "callFmhaV2Paged: not an FMHA-v2 paged LLM wrapper (module, q_tensor, kv_cache_pool, "
         "kv_cache_page_list, o_tensor, cum_seqlen_q, cum_seqlen_k, window_size_left, attention_scale, sm_count, "
         "stream).");
+
+    if (!detail::ensureModuleLoaded<moduleLoader, moduleUnloader>(state, moduleName, params.stream))
+    {
+        return -1;
+    }
+    auto& module = state.module;
 
     auto qTensor = makeBsndTensor<WrapperArgT<1, decltype(cuteDslKernelWrapper)>>(
         params.qPtr, params.batchSize, params.seqLenQ, params.numQHeads, params.headDim);
@@ -406,12 +376,19 @@ int32_t callFmhaV2Paged(WrapperArgT<0, decltype(cuteDslKernelWrapper)>& module, 
 //! Launch an FMHA-v2 ViT variant over packed varlen [total_S, H, D] Q/K/V.
 //! @tparam cuteDslKernelWrapper Generated CuTe DSL kernel wrapper function. Its signature supplies the module
 //! and tensor descriptor types at compile time.
-template <auto cuteDslKernelWrapper>
-int32_t callFmhaV2Vit(WrapperArgT<0, decltype(cuteDslKernelWrapper)>& module, FmhaV2VitParams const& params)
+template <auto cuteDslKernelWrapper, auto moduleLoader, auto moduleUnloader>
+int32_t callFmhaV2Vit(detail::LazyKernelModule<WrapperArgT<0, decltype(cuteDslKernelWrapper)>>& state,
+    char const* moduleName, FmhaV2VitParams const& params)
 {
     static_assert(WrapperArity<decltype(cuteDslKernelWrapper)>::value == 12,
         "callFmhaV2Vit: not an FMHA-v2 ViT wrapper (module, q_tensor, k_tensor, v_tensor, o_tensor, cu_seqlens, "
         "max_seqlen, scale_softmax_log2, scale_softmax, scale_output, sm_count, stream).");
+
+    if (!detail::ensureModuleLoaded<moduleLoader, moduleUnloader>(state, moduleName, params.stream))
+    {
+        return -1;
+    }
+    auto& module = state.module;
 
     auto qTensor = makeShTensor<WrapperArgT<1, decltype(cuteDslKernelWrapper)>>(
         params.qPtr, params.totalSeqLen, params.numQHeads, params.headDim);
@@ -434,12 +411,6 @@ int32_t callFmhaV2Vit(WrapperArgT<0, decltype(cuteDslKernelWrapper)>& module, Fm
 bool CuteDslFMHAV2Runner::run(void const* qPtr, void const* kPtr, void const* vPtr, void* oPtr,
     int32_t const* cuKVSeqLens, cudaStream_t stream, float attentionScale, int32_t slidingWindowSize)
 {
-    if (!sLLMLoaded)
-    {
-        LOG_ERROR("FMHA-v2 CuTe DSL LLM FMHA kernel module not loaded.");
-        return false;
-    }
-
     validateAttentionScale(attentionScale);
     int32_t constexpr kNO_LIMIT = 1 << 30;
     bool const useSlidingWindow = slidingWindowSize < INT_MAX;
@@ -471,24 +442,31 @@ bool CuteDslFMHAV2Runner::run(void const* qPtr, void const* kPtr, void const* vP
     case 64:
         if (useSlidingWindow)
         {
-            ret = callFmhaV2Llm<cute_dsl_fmha_v2_d64_sw_wrapper>(sLLM_d64Sw, params);
+            ret = callFmhaV2Llm<cute_dsl_fmha_v2_d64_sw_wrapper, fmha_v2_d64_sw_Kernel_Module_Load,
+                fmha_v2_d64_sw_Kernel_Module_Unload>(sLLM_d64Sw, "fmha_v2_d64_sw", params);
         }
         else if (mUseSmallD64 && mSeqLenQ <= 512)
         {
-            ret = callFmhaV2Llm<cute_dsl_fmha_v2_d64_small_wrapper>(sLLM_d64Small, params);
+            ret = callFmhaV2Llm<cute_dsl_fmha_v2_d64_small_wrapper, fmha_v2_d64_small_Kernel_Module_Load,
+                fmha_v2_d64_small_Kernel_Module_Unload>(sLLM_d64Small, "fmha_v2_d64_small", params);
         }
         else
         {
-            ret = callFmhaV2Llm<cute_dsl_fmha_v2_d64_wrapper>(sLLM_d64, params);
+            ret = callFmhaV2Llm<cute_dsl_fmha_v2_d64_wrapper, fmha_v2_d64_Kernel_Module_Load,
+                fmha_v2_d64_Kernel_Module_Unload>(sLLM_d64, "fmha_v2_d64", params);
         }
         break;
     case 128:
-        ret = useSlidingWindow ? callFmhaV2Llm<cute_dsl_fmha_v2_d128_sw_wrapper>(sLLM_d128Sw, params)
-                               : callFmhaV2Llm<cute_dsl_fmha_v2_d128_wrapper>(sLLM_d128, params);
+        ret = useSlidingWindow ? callFmhaV2Llm<cute_dsl_fmha_v2_d128_sw_wrapper, fmha_v2_d128_sw_Kernel_Module_Load,
+                                     fmha_v2_d128_sw_Kernel_Module_Unload>(sLLM_d128Sw, "fmha_v2_d128_sw", params)
+                               : callFmhaV2Llm<cute_dsl_fmha_v2_d128_wrapper, fmha_v2_d128_Kernel_Module_Load,
+                                     fmha_v2_d128_Kernel_Module_Unload>(sLLM_d128, "fmha_v2_d128", params);
         break;
     case 256:
-        ret = useSlidingWindow ? callFmhaV2Llm<cute_dsl_fmha_v2_d256_sw_wrapper>(sLLM_d256Sw, params)
-                               : callFmhaV2Llm<cute_dsl_fmha_v2_d256_wrapper>(sLLM_d256, params);
+        ret = useSlidingWindow ? callFmhaV2Llm<cute_dsl_fmha_v2_d256_sw_wrapper, fmha_v2_d256_sw_Kernel_Module_Load,
+                                     fmha_v2_d256_sw_Kernel_Module_Unload>(sLLM_d256Sw, "fmha_v2_d256_sw", params)
+                               : callFmhaV2Llm<cute_dsl_fmha_v2_d256_wrapper, fmha_v2_d256_Kernel_Module_Load,
+                                     fmha_v2_d256_Kernel_Module_Unload>(sLLM_d256, "fmha_v2_d256", params);
         break;
     default: LOG_ERROR("FMHA-v2 CuTe DSL LLM FMHA: unsupported head_dim=%d", mHeadDim); return false;
     }
@@ -505,12 +483,6 @@ bool CuteDslFMHAV2Runner::runPaged(void const* qPtr, void const* pagedKVPoolPtr,
     void* oPtr, int32_t const* cuQSeqLens, int32_t const* cuKVSeqLens, int32_t numFlatPages, int32_t maxPagesPerSeq,
     int32_t tokensPerPage, cudaStream_t stream, float attentionScale, int32_t slidingWindowSize)
 {
-    if (!sLLMLoaded)
-    {
-        LOG_ERROR("FMHA-v2 CuTe DSL LLM FMHA kernel module not loaded.");
-        return false;
-    }
-
     check::check(qPtr != nullptr, "FMHA-v2 native paged FMHA qPtr must not be null.");
     check::check(pagedKVPoolPtr != nullptr, "FMHA-v2 native paged FMHA KV pool must not be null.");
     check::check(kvCachePageList != nullptr, "FMHA-v2 native paged FMHA page list must not be null.");
@@ -558,21 +530,35 @@ bool CuteDslFMHAV2Runner::runPaged(void const* qPtr, void const* pagedKVPoolPtr,
     {
     case 64:
         ret = useSlidingWindow
-            ? callFmhaV2Paged<cute_dsl_fmha_v2_d64_sw_paged_wrapper>(sLLM_d64SwPaged, params)
-            : (mSeqLenQ <= 512 ? callFmhaV2Paged<cute_dsl_fmha_v2_d64_small_paged_wrapper>(sLLM_d64SmallPaged, params)
-                               : callFmhaV2Paged<cute_dsl_fmha_v2_d64_paged_wrapper>(sLLM_d64Paged, params));
+            ? callFmhaV2Paged<cute_dsl_fmha_v2_d64_sw_paged_wrapper, fmha_v2_d64_sw_paged_Kernel_Module_Load,
+                  fmha_v2_d64_sw_paged_Kernel_Module_Unload>(sLLM_d64SwPaged, "fmha_v2_d64_sw_paged", params)
+            : (mSeqLenQ <= 512
+                      ? callFmhaV2Paged<cute_dsl_fmha_v2_d64_small_paged_wrapper,
+                            fmha_v2_d64_small_paged_Kernel_Module_Load, fmha_v2_d64_small_paged_Kernel_Module_Unload>(
+                            sLLM_d64SmallPaged, "fmha_v2_d64_small_paged", params)
+                      : callFmhaV2Paged<cute_dsl_fmha_v2_d64_paged_wrapper, fmha_v2_d64_paged_Kernel_Module_Load,
+                            fmha_v2_d64_paged_Kernel_Module_Unload>(sLLM_d64Paged, "fmha_v2_d64_paged", params));
         break;
     case 128:
-        ret = useSlidingWindow ? callFmhaV2Paged<cute_dsl_fmha_v2_d128_sw_paged_wrapper>(sLLM_d128SwPaged, params)
-                               : callFmhaV2Paged<cute_dsl_fmha_v2_d128_paged_wrapper>(sLLM_d128Paged, params);
+        ret = useSlidingWindow
+            ? callFmhaV2Paged<cute_dsl_fmha_v2_d128_sw_paged_wrapper, fmha_v2_d128_sw_paged_Kernel_Module_Load,
+                  fmha_v2_d128_sw_paged_Kernel_Module_Unload>(sLLM_d128SwPaged, "fmha_v2_d128_sw_paged", params)
+            : callFmhaV2Paged<cute_dsl_fmha_v2_d128_paged_wrapper, fmha_v2_d128_paged_Kernel_Module_Load,
+                  fmha_v2_d128_paged_Kernel_Module_Unload>(sLLM_d128Paged, "fmha_v2_d128_paged", params);
         break;
     case 256:
-        ret = useSlidingWindow ? callFmhaV2Paged<cute_dsl_fmha_v2_d256_sw_paged_wrapper>(sLLM_d256SwPaged, params)
-                               : callFmhaV2Paged<cute_dsl_fmha_v2_d256_paged_wrapper>(sLLM_d256Paged, params);
+        ret = useSlidingWindow
+            ? callFmhaV2Paged<cute_dsl_fmha_v2_d256_sw_paged_wrapper, fmha_v2_d256_sw_paged_Kernel_Module_Load,
+                  fmha_v2_d256_sw_paged_Kernel_Module_Unload>(sLLM_d256SwPaged, "fmha_v2_d256_sw_paged", params)
+            : callFmhaV2Paged<cute_dsl_fmha_v2_d256_paged_wrapper, fmha_v2_d256_paged_Kernel_Module_Load,
+                  fmha_v2_d256_paged_Kernel_Module_Unload>(sLLM_d256Paged, "fmha_v2_d256_paged", params);
         break;
     case 512:
-        ret = useSlidingWindow ? callFmhaV2Paged<cute_dsl_fmha_v2_d512_sw_paged_wrapper>(sLLM_d512SwPaged, params)
-                               : callFmhaV2Paged<cute_dsl_fmha_v2_d512_paged_wrapper>(sLLM_d512Paged, params);
+        ret = useSlidingWindow
+            ? callFmhaV2Paged<cute_dsl_fmha_v2_d512_sw_paged_wrapper, fmha_v2_d512_sw_paged_Kernel_Module_Load,
+                  fmha_v2_d512_sw_paged_Kernel_Module_Unload>(sLLM_d512SwPaged, "fmha_v2_d512_sw_paged", params)
+            : callFmhaV2Paged<cute_dsl_fmha_v2_d512_paged_wrapper, fmha_v2_d512_paged_Kernel_Module_Load,
+                  fmha_v2_d512_paged_Kernel_Module_Unload>(sLLM_d512Paged, "fmha_v2_d512_paged", params);
         break;
     default: LOG_ERROR("FMHA-v2 native paged FMHA: unsupported head_dim=%d.", mHeadDim); return false;
     }
@@ -588,11 +574,6 @@ bool CuteDslFMHAV2Runner::runPaged(void const* qPtr, void const* pagedKVPoolPtr,
 bool CuteDslFMHAV2Runner::runPadding(void const* qPtr, void const* kPtr, void const* vPtr, void* oPtr,
     int32_t const* cuQSeqLens, int32_t const* cuKVSeqLens, cudaStream_t stream, float attentionScale)
 {
-    if (!sLLMLoaded)
-    {
-        LOG_ERROR("FMHA-v2 CuTe DSL padding FMHA kernel module not loaded.");
-        return false;
-    }
     if (mHeadDim != 256)
     {
         LOG_ERROR("FMHA-v2 CuTe DSL padding FMHA requires head_dim=256.");
@@ -624,8 +605,13 @@ bool CuteDslFMHAV2Runner::runPadding(void const* qPtr, void const* kPtr, void co
     auto cumSeqlenQ = makeCuSeqLenTensor<WrapperArgT<5, WrapperFn>>(cuQSeqLens, mBatchSize + 1);
     auto cumSeqlenK = makeCuSeqLenTensor<WrapperArgT<6, WrapperFn>>(cuKVSeqLens, mBatchSize + 1);
 
-    int32_t const ret = cute_dsl_fmha_v2_d256_padding_wrapper(&sLLM_d256Padding, &qTensor, &kTensor, &vTensor, &oTensor,
-        &cumSeqlenQ, &cumSeqlenK, attentionScale, mNumHeadsKV, stream);
+    if (!detail::ensureModuleLoaded<fmha_v2_d256_padding_Kernel_Module_Load, fmha_v2_d256_padding_Kernel_Module_Unload>(
+            sLLM_d256Padding, "fmha_v2_d256_padding", stream))
+    {
+        return false;
+    }
+    int32_t const ret = cute_dsl_fmha_v2_d256_padding_wrapper(&sLLM_d256Padding.module, &qTensor, &kTensor, &vTensor,
+        &oTensor, &cumSeqlenQ, &cumSeqlenK, attentionScale, mNumHeadsKV, stream);
     if (ret != 0)
     {
         LOG_ERROR("FMHA-v2 CuTe DSL padding FMHA kernel failed with error code: %d", ret);
@@ -637,11 +623,6 @@ bool CuteDslFMHAV2Runner::runVisionBlock(void const* qPtr, void const* kPtr, voi
     int32_t const* cuKVSeqLens, int32_t const* blockBegin, int32_t const* blockEnd, cudaStream_t stream,
     float attentionScale, int32_t slidingWindowSize)
 {
-    if (!sLLMLoaded)
-    {
-        LOG_ERROR("FMHA-v2 CuTe DSL bidirectional FMHA kernel module not loaded.");
-        return false;
-    }
     if (mHeadDim != 256 || slidingWindowSize < 0)
     {
         LOG_ERROR("FMHA-v2 CuTe DSL bidirectional FMHA requires head_dim=256 and a non-negative left window.");
@@ -670,7 +651,13 @@ bool CuteDslFMHAV2Runner::runVisionBlock(void const* qPtr, void const* kPtr, voi
     auto blockBeginTensor = makePackedTensor<WrapperArgT<6, WrapperFn>>(blockBegin, {mBatchSize, mSeqLenQ});
     auto blockEndTensor = makePackedTensor<WrapperArgT<7, WrapperFn>>(blockEnd, {mBatchSize, mSeqLenQ});
 
-    int32_t const ret = cute_dsl_fmha_v2_d256_bidirectional_wrapper(&sLLM_d256Bidirectional, &qTensor, &kTensor,
+    if (!detail::ensureModuleLoaded<fmha_v2_d256_bidirectional_Kernel_Module_Load,
+            fmha_v2_d256_bidirectional_Kernel_Module_Unload>(
+            sLLM_d256Bidirectional, "fmha_v2_d256_bidirectional", stream))
+    {
+        return false;
+    }
+    int32_t const ret = cute_dsl_fmha_v2_d256_bidirectional_wrapper(&sLLM_d256Bidirectional.module, &qTensor, &kTensor,
         &vTensor, &oTensor, &cumSeqlenK, &blockBeginTensor, &blockEndTensor, slidingWindowSize, attentionScale, scaleQ,
         scaleK, scaleV, invScaleO, getDeviceMultiProcessorCount(), stream);
     if (ret != 0)
@@ -684,12 +671,6 @@ bool CuteDslFMHAV2Runner::run(void const* qPtr, void const* kPtr, void const* vP
     int32_t const* cuSeqLens, int32_t totalSeqLen, int32_t maxSeqLen, int32_t batchSize, cudaStream_t stream,
     float attentionScale)
 {
-    if (!sViTLoaded)
-    {
-        LOG_ERROR("FMHA-v2 CuTe DSL ViT FMHA kernel module not loaded.");
-        return false;
-    }
-
     validateAttentionScale(attentionScale);
 
     FmhaV2VitParams params{};
@@ -713,10 +694,22 @@ bool CuteDslFMHAV2Runner::run(void const* qPtr, void const* kPtr, void const* vP
 
     switch (mHeadDim)
     {
-    case 64: ret = callFmhaV2Vit<cute_dsl_fmha_v2_vit_d64_wrapper>(sViT_d64, params); break;
-    case 72: ret = callFmhaV2Vit<cute_dsl_fmha_v2_vit_d72_wrapper>(sViT_d72, params); break;
-    case 80: ret = callFmhaV2Vit<cute_dsl_fmha_v2_vit_d80_wrapper>(sViT_d80, params); break;
-    case 128: ret = callFmhaV2Vit<cute_dsl_fmha_v2_vit_d128_wrapper>(sViT_d128, params); break;
+    case 64:
+        ret = callFmhaV2Vit<cute_dsl_fmha_v2_vit_d64_wrapper, fmha_v2_vit_d64_Kernel_Module_Load,
+            fmha_v2_vit_d64_Kernel_Module_Unload>(sViT_d64, "fmha_v2_vit_d64", params);
+        break;
+    case 72:
+        ret = callFmhaV2Vit<cute_dsl_fmha_v2_vit_d72_wrapper, fmha_v2_vit_d72_Kernel_Module_Load,
+            fmha_v2_vit_d72_Kernel_Module_Unload>(sViT_d72, "fmha_v2_vit_d72", params);
+        break;
+    case 80:
+        ret = callFmhaV2Vit<cute_dsl_fmha_v2_vit_d80_wrapper, fmha_v2_vit_d80_Kernel_Module_Load,
+            fmha_v2_vit_d80_Kernel_Module_Unload>(sViT_d80, "fmha_v2_vit_d80", params);
+        break;
+    case 128:
+        ret = callFmhaV2Vit<cute_dsl_fmha_v2_vit_d128_wrapper, fmha_v2_vit_d128_Kernel_Module_Load,
+            fmha_v2_vit_d128_Kernel_Module_Unload>(sViT_d128, "fmha_v2_vit_d128", params);
+        break;
     default: LOG_ERROR("FMHA-v2 CuTe DSL ViT FMHA: unsupported head_dim=%d", mHeadDim); return false;
     }
 

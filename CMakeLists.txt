@@ -37,6 +37,16 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--no-undefined")
 option(ENABLE_COVERAGE "Enable gcov code coverage instrumentation" OFF)
 include(${CMAKE_SOURCE_DIR}/cmake/CodeCoverage.cmake)
 
+# Declare unit-test options before cpp/ so its library targets can enable
+# test-only instrumentation when requested.
+option(BUILD_UNIT_TESTS "Enable building unit tests" OFF)
+option(ENABLE_CUTEDSL_MODULE_TEST_HOOK
+       "Enable deterministic CuTe DSL module-load failure injection" OFF)
+if(ENABLE_CUTEDSL_MODULE_TEST_HOOK AND NOT BUILD_UNIT_TESTS)
+  message(
+    FATAL_ERROR "ENABLE_CUTEDSL_MODULE_TEST_HOOK requires BUILD_UNIT_TESTS=ON")
+endif()
+
 macro(set_ifndef var val)
   if(NOT DEFINED ${var})
     set(${var} ${val})
@@ -209,7 +219,6 @@ if(BUILD_EXPERIMENTAL_MODELS)
   add_subdirectory(experimental_models)
 endif()
 
-option(BUILD_UNIT_TESTS "Enable building unit tests" OFF)
 option(BUILD_PYTHON_BINDINGS "Enable building Python pybind11 bindings" OFF)
 
 if(BUILD_UNIT_TESTS)
@@ -225,6 +234,9 @@ if(BUILD_UNIT_TESTS)
   # Define project root path for tests to access resources
   target_compile_definitions(unitTest
                              PRIVATE PROJECT_ROOT_DIR="${CMAKE_SOURCE_DIR}")
+  if(ENABLE_CUTEDSL_MODULE_TEST_HOOK)
+    target_compile_definitions(unitTest PRIVATE ENABLE_CUTEDSL_MODULE_TEST_HOOK)
+  endif()
   # Resource-registration tests resolve the plugin's exported lifecycle ABI.
   add_dependencies(unitTest NvInfer_edgellm_plugin)
   target_link_libraries(

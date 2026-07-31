@@ -62,6 +62,10 @@ set_source_files_properties(${MOE_MARLIN_CU_SRCS} PROPERTIES COMPILE_FLAGS
 add_library(edgellmKernels STATIC ${KERNELS_CPP_SRCS} ${KERNELS_CU_SRCS}
                                   ${COMMON_CPP_SRCS})
 target_include_directories(edgellmKernels PRIVATE ${COMMON_INCLUDE_DIRS})
+if(ENABLE_CUTEDSL_MODULE_TEST_HOOK)
+  target_compile_definitions(edgellmKernels
+                             PRIVATE ENABLE_CUTEDSL_MODULE_TEST_HOOK)
+endif()
 edgellm_xqa_configure_target(edgellmKernels)
 # Enable separable compilation for MoE Marlin kernel templates
 set_target_properties(edgellmKernels PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
@@ -83,6 +87,10 @@ add_library(
   ${PROFILER_CPP_SRCS}
   ${TOKENIZER_CPP_SRCS})
 target_include_directories(edgellmCore PRIVATE ${COMMON_INCLUDE_DIRS})
+if(ENABLE_CUTEDSL_MODULE_TEST_HOOK)
+  target_compile_definitions(edgellmCore
+                             PRIVATE ENABLE_CUTEDSL_MODULE_TEST_HOOK)
+endif()
 edgellm_xqa_configure_target(edgellmCore)
 target_link_libraries(edgellmCore PRIVATE dl)
 # Enable separable compilation for MoE Marlin kernel templates

@@ -141,14 +141,12 @@ void TestContextAttentionAccuracy(std::vector<int32_t> const& cuSeqlens, int32_t
     bool ranKernel = false;
     if (isPackedViT)
     {
-        ASSERT_TRUE(CuteDslFMHAV2Runner::loadViTKernelModule());
         ranKernel = runner.run(qTensor.rawPointer(), kTensor.rawPointer(), vTensor.rawPointer(),
             oTensorKernel.rawPointer(), cuSeqLensTensor.dataPointer<int32_t>(), totalTokens, maxSeqLen, batchSize,
             stream, resolvedAttentionScale);
     }
     else
     {
-        ASSERT_TRUE(CuteDslFMHAV2Runner::loadLLMKernelModule());
         ranKernel = runner.run(qTensor.rawPointer(), kTensor.rawPointer(), vTensor.rawPointer(),
             oTensorKernel.rawPointer(), paddedCuKVSeqLensTensor.dataPointer<int32_t>(), stream, resolvedAttentionScale);
     }
@@ -440,7 +438,6 @@ void TestContextAttentionPagedAccuracy(int32_t headDim, int32_t numQHeads, int32
     copyHostToDevice(cuQSeqLensTensor, cuQSeqLens);
     copyHostToDevice(cuKVSeqLensTensor, cuKVSeqLens);
 
-    ASSERT_TRUE(CuteDslFMHAV2Runner::loadLLMKernelModule());
     CuteDslFMHAV2Runner runner(numQHeads, numKVHeads, headDim, batchSize, seqLenQ, capacity);
     ASSERT_TRUE(runner.runPaged(qTensor.rawPointer(), poolTensor.rawPointer(), pageListTensor.dataPointer<int32_t>(),
         outputPaged.rawPointer(), cuQSeqLensTensor.dataPointer<int32_t>(), cuKVSeqLensTensor.dataPointer<int32_t>(),
@@ -801,7 +798,6 @@ void TestContextAttentionDenoisePaddingVarlen(std::vector<int32_t> const& qLens,
     CUDA_CHECK(cudaMemcpy(cuKVTensor.rawPointer(), cuKV.data(), static_cast<size_t>(batchSize + 1) * sizeof(int32_t),
         cudaMemcpyHostToDevice));
 
-    ASSERT_TRUE(CuteDslFMHAV2Runner::loadLLMKernelModule());
     CuteDslFMHAV2Runner runner(numQHeads, numKVHeads, headSize, batchSize, seqLenQ, seqLenK);
     ASSERT_TRUE(runner.runPadding(qTensor.rawPointer(), kTensor.rawPointer(), vTensor.rawPointer(),
         oTensor.rawPointer(), cuQTensor.dataPointer<int32_t>(), cuKVTensor.dataPointer<int32_t>(), nullptr,

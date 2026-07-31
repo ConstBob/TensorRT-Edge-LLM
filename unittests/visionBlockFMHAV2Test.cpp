@@ -224,7 +224,6 @@ TEST(VisionBlockFMHAV2Test, MatchesReference)
         contextLengthsTensor.dataPointer<int32_t>(), blockBeginTensor.dataPointer<int32_t>(),
         blockEndTensor.dataPointer<int32_t>(), batchSize, seqLen, stream);
     CUDA_CHECK(cudaFree(nullptr));
-    ASSERT_TRUE(CuteDslFMHAV2Runner::loadLLMKernelModule());
     CuteDslFMHAV2Runner runner(numQHeads, numKVHeads, headDim, batchSize, seqLen, seqLen);
     ASSERT_TRUE(runner.runVisionBlock(qTensor.rawPointer(), kTensor.rawPointer(), vTensor.rawPointer(),
         outputTensor.rawPointer(), cuSeqLensTensor.dataPointer<int32_t>(), blockBeginTensor.dataPointer<int32_t>(),

@@ -123,9 +123,13 @@ python3 ssd_prefill.py --export_only --dim 64 --dstate 128 \
 ## C++ Integration
 
 `CuteDslSSDRunner` (`cpp/kernels/mamba/cuteDslSSDRunner.{h,cpp}`): call
-`loadKernelModules()` once, then `runPrefill(SSDParams, stream)`. Dispatches
-to the correct D×N variant at runtime. On SM100+, D=64 uses the Blackwell
-native kernel; all other configs fall back to non-Blackwell.
+`run(SSDParams, stream)`. The runner loads only the selected D×N,
+architecture, and initial-state AOT variant on its first use and keeps it
+resident for process lifetime. The plugin calls
+`ensureKernelModules(SSDParams, stream)` before its output-state copy; `run()`
+repeats that guard defensively. On SM100 through SM110, D=64 uses the
+Blackwell native kernel; all other configurations use the non-Blackwell
+implementation.
 
 Plugin (`cpp/plugins/mamba/mambaPlugin.cpp`): integrates via the SSD runner.
 

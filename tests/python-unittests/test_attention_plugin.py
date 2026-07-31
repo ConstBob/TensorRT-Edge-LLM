@@ -36,14 +36,19 @@ Run:
 
 from __future__ import annotations
 
+import mmap
+import multiprocessing
+import os
 import random
+import traceback
 from dataclasses import dataclass, field, replace
 
 import pytest
 from test_plugin_base import (DEPENDENCIES_AVAILABLE, IMPORT_ERROR,
                               RAGGED_CASES, PluginRunner,
                               PluginUnsupportedError, _device_sm, assert_close,
-                              pf_float32, pf_int32, poison_padding)
+                              find_plugin_library, pf_float32, pf_int32,
+                              poison_padding)
 
 if DEPENDENCIES_AVAILABLE:
     import tensorrt as trt
@@ -65,6 +70,37 @@ CUTEDSL_FFPA_D512_SMS = frozenset({80, 86, 87, 89, 100, 101, 110, 120, 121})
 CUTEDSL_D512_FP8_SMS = frozenset({100, 101, 110})
 # FP8 KV-cache support is constrained by the bundled XQA decode kernels.
 FP8_KV_CACHE_SMS = frozenset({89, 100, 101, 110, 120, 121})
+_CUTEDSL_MODULE_FAILURE_HOOK = "TRT_EDGELLM_TEST_FAIL_CUTEDSL_MODULE"
+_CUTEDSL_LAZY_ATTENTION_MODULE_BY_SM = {
+    80: "fmha_v2_d128_paged",
+    86: "fmha_v2_d128_paged",
+    87: "fmha_v2_d128_paged",
+    89: "fmha_v2_d128_paged",
+    100: "fmha_d128_paged",
+    101: "fmha_d128_paged",
+    110: "fmha_d128_paged",
+    120: "fmha_v2_d128_paged",
+    121: "fmha_v2_d128_paged",
+}
+
+
+def _cutedsl_module_failure_hook_built() -> bool:
+    """Return whether the hook and this SM's target module exist in the plugin."""
+    plugin_path = find_plugin_library()
+    module_name = _CUTEDSL_LAZY_ATTENTION_MODULE_BY_SM.get(_device_sm())
+    if plugin_path is None or module_name is None:
+        return False
+    try:
+        with open(plugin_path, "rb") as plugin_file:
+            if os.fstat(plugin_file.fileno()).st_size == 0:
+                return False
+            with mmap.mmap(plugin_file.fileno(), 0,
+                           access=mmap.ACCESS_READ) as plugin_image:
+                return (plugin_image.find(
+                    _CUTEDSL_MODULE_FAILURE_HOOK.encode()) >= 0
+                        and plugin_image.find(module_name.encode()) >= 0)
+    except OSError:
+        return False
 
 
 @dataclass
@@ -571,7 +607,8 @@ class AttentionPluginRunner:
             position_ids=None,
             vision_block_ids=None,
             input_shapes=None,
-            context_mask_selector=None):
+            context_mask_selector=None,
+            attention_output=None):
         """Execute; returns (attn_output fp16, kv_cache after update).
 
         ``qkv`` is the packed [B, S, (Hq+2*Hkv)*D] input, or a Q-only
@@ -586,6 +623,9 @@ class AttentionPluginRunner:
         ``input_shapes`` optionally overrides runtime input shapes (see
         PluginRunner.execute). kv_page_table always binds its full runtime
         shape (taken from the tensor itself).
+
+        ``attention_output`` optionally supplies the output buffer so failure
+        tests can verify that enqueue returned before any output write.
         """
         p = self.p
         batch, cap = kv_cache.shape[0], p.kv_cache_capacity
@@ -597,9 +637,11 @@ class AttentionPluginRunner:
             # slot-major NHD view (identity page table).
             pool_k[:batch, :cap] = kv_cache[:, 0].permute(0, 2, 1, 3)
             pool_v[:batch, :cap] = kv_cache[:, 1].permute(0, 2, 1, 3)
-        attn_out = torch.empty((qkv.shape[0], qkv.shape[1], p.q_hidden),
-                               dtype=torch.float16,
-                               device=DEV)
+        attn_out = attention_output
+        if attn_out is None:
+            attn_out = torch.empty((qkv.shape[0], qkv.shape[1], p.q_hidden),
+                                   dtype=torch.float16,
+                                   device=DEV)
         tensors = {
             "qkv": qkv,
             "kv_cache": pool,
@@ -828,6 +870,138 @@ BASE = dict(num_q_heads=8,
             max_batch_size=8,
             max_seq_len=8,
             max_position_embeddings=64)
+
+
+def _exercise_cutedsl_lazy_module_failure_hook():
+    """Exercise one exact attention module through a real plugin enqueue."""
+    sm_version = _device_sm()
+    module_name = _CUTEDSL_LAZY_ATTENTION_MODULE_BY_SM[sm_version]
+    os.environ[_CUTEDSL_MODULE_FAILURE_HOOK] = module_name
+    try:
+        p = AttentionParams(batch_size=1, seq_len=8, is_prefill=True, **BASE)
+        generator = torch.Generator().manual_seed(314159)
+        runner = AttentionPluginRunner(p)
+        cos, sin, combined = _make_rope(p, generator)
+        ref_k, ref_v, plugin_kv = _empty_caches(p)
+        qkv = torch.randn((p.batch_size, p.seq_len, p.qkv_hidden_size),
+                          generator=generator,
+                          dtype=torch.float32).to(DEV).to(torch.float16)
+        context_lengths = torch.full((p.batch_size, ),
+                                     p.seq_len,
+                                     dtype=torch.int32,
+                                     device=DEV)
+        cache_indices = torch.zeros(p.batch_size,
+                                    dtype=torch.int32,
+                                    device=DEV)
+        prefill_shapes = {"kv_cache_indices": (0, )}
+
+        pool, pool_k, pool_v = runner._pool_views(plugin_kv.dtype)
+        pool_k[:p.batch_size, :p.kv_cache_capacity] = plugin_kv[:, 0].permute(
+            0, 2, 1, 3)
+        pool_v[:p.batch_size, :p.kv_cache_capacity] = plugin_kv[:, 1].permute(
+            0, 2, 1, 3)
+        failed_output = torch.full((p.batch_size, p.seq_len, p.q_hidden),
+                                   -123.0,
+                                   dtype=torch.float16,
+                                   device=DEV)
+        torch.cuda.synchronize()
+        qkv_before = qkv.clone()
+        pool_before = pool.clone()
+        output_before = failed_output.clone()
+
+        with pytest.raises(RuntimeError,
+                           match="execute_async_v3 returned False"):
+            runner.run(qkv,
+                       plugin_kv,
+                       context_lengths,
+                       combined,
+                       cache_indices,
+                       input_shapes=prefill_shapes,
+                       attention_output=failed_output)
+
+        assert torch.equal(qkv_before.view(torch.int16),
+                           qkv.view(torch.int16)), \
+            "lazy-load failure must precede AttentionPlugin QKV preprocessing"
+        assert torch.equal(pool_before.view(torch.int16),
+                           pool.view(torch.int16)), \
+            "lazy-load failure must precede AttentionPlugin KV-cache writes"
+        assert torch.equal(output_before.view(torch.int16),
+                           failed_output.view(torch.int16)), \
+            "lazy-load failure must precede AttentionPlugin output writes"
+
+        del os.environ[_CUTEDSL_MODULE_FAILURE_HOOK]
+        failed_context = runner.runner.context
+        runner.runner.context = runner.runner.engine.create_execution_context()
+        assert runner.runner.context is not None
+        del failed_context
+
+        position_ids = torch.arange(p.seq_len, dtype=torch.int32,
+                                    device=DEV)[None]
+        causal_mask = sliding_window_mask(p.seq_len, p.seq_len,
+                                          p.sliding_window_size, DEV)
+        ref_out, ref_k, ref_v = compute_attention(qkv.float(), ref_k, ref_v,
+                                                  cos, sin, position_ids,
+                                                  cache_indices, p,
+                                                  causal_mask)
+        retry_output = torch.full_like(failed_output, -123.0)
+        actual_out, actual_kv = runner.run(qkv.clone(),
+                                           plugin_kv,
+                                           context_lengths,
+                                           combined,
+                                           cache_indices,
+                                           input_shapes=prefill_shapes,
+                                           attention_output=retry_output)
+        actual_k, actual_v = _plugin_kv_to_ref(actual_kv, p)
+        assert_close("lazy-module-retry-attention", ref_out, actual_out)
+        assert_close("lazy-module-retry-k-cache", ref_k, actual_k)
+        assert_close("lazy-module-retry-v-cache", ref_v, actual_v)
+    finally:
+        os.environ.pop(_CUTEDSL_MODULE_FAILURE_HOOK, None)
+
+
+def _cutedsl_lazy_module_failure_hook_child(connection):
+    try:
+        _exercise_cutedsl_lazy_module_failure_hook()
+    except BaseException:
+        connection.send(traceback.format_exc())
+        raise
+    else:
+        connection.send("")
+    finally:
+        connection.close()
+
+
+@pytest.mark.skipif(
+    _device_sm() not in _CUTEDSL_LAZY_ATTENTION_MODULE_BY_SM,
+    reason="representative CuTe DSL attention module is unsupported on this SM"
+)
+def test_cutedsl_lazy_module_failure_propagates_before_attention_mutation(
+        request):
+    """A failed first load is non-mutating and retryable on a fresh context."""
+    if not _cutedsl_module_failure_hook_built():
+        message = ("plugin lacks the CuTe DSL test hook or target attention "
+                   "module")
+        if request.config.getoption("--priority") == "l0_python_ut":
+            pytest.fail(message)
+        pytest.skip(message)
+
+    spawn_context = multiprocessing.get_context("spawn")
+    receiver, sender = spawn_context.Pipe(duplex=False)
+    process = spawn_context.Process(
+        target=_cutedsl_lazy_module_failure_hook_child, args=(sender, ))
+    process.start()
+    sender.close()
+    process.join(timeout=300)
+    if process.is_alive():
+        process.terminate()
+        process.join()
+        pytest.fail("spawned CuTe DSL lazy-module plugin test timed out")
+
+    child_error = receiver.recv() if receiver.poll() else ""
+    receiver.close()
+    assert process.exitcode == 0, \
+        child_error or f"spawned plugin test exited with code {process.exitcode}"
+
 
 # --------------------------------------------------------------------------- #
 # (head_size, num_q_heads, num_kv_heads) sweep for the GQA prefill+decode tests.

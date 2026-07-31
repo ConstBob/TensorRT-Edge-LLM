@@ -61,7 +61,10 @@ def _build_project(env_config: EnvironmentConfig,
     build_dir = env_config.build_dir
 
     # Build cmake command with required components only
-    cmake_cmd = ['cmake', '..', '-DBUILD_UNIT_TESTS=ON']
+    cmake_cmd = [
+        'cmake', '..', '-DBUILD_UNIT_TESTS=ON',
+        '-DENABLE_CUTEDSL_MODULE_TEST_HOOK=ON'
+    ]
 
     # Opt-in for jobs whose test lists import the pybind runtime (the
     # preprocessing suites); resolved from the pytest interpreter's pybind11.

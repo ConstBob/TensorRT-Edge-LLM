@@ -233,17 +233,10 @@ protected:
         }
         CUDA_CHECK(cudaSetDevice(0));
         CUDA_CHECK(cudaStreamCreate(&mStream));
-        if (!CuteDslFFPARunner::loadKernelModule())
-        {
-            CUDA_CHECK(cudaStreamDestroy(mStream));
-            mStream = nullptr;
-            GTEST_SKIP() << "Failed to load FFPA d512 causal CuTe DSL kernel module";
-        }
     }
 
     void TearDown() override
     {
-        CuteDslFFPARunner::unloadKernelModule();
         if (mStream != nullptr)
         {
             CUDA_CHECK(cudaStreamDestroy(mStream));
