@@ -179,12 +179,15 @@ void launchApplyRopeQOnlyTreeDecoding(
 //! @param[in]  kNormGamma   Optional FP16 device pointer [headDim] for per-head RMSNorm gamma applied to K
 //!             BEFORE RoPE. Same conventions as @p qNormGamma. V is never RMSNormed.
 //! @param[in]  rmsNormEps   Epsilon for the RMSNorm formula. Ignored when both gamma pointers are null.
+//! @param[in]  cuQSeqLens   Optional INT32 tensor [batchSize + 1] carrying actual cumulative Q lengths for
+//!             ragged prefill. Rows at or beyond the actual per-batch length have Q zeroed and skip all K/V writes.
 //! @throws std::runtime_error if tensor shape or data type is incorrect.
 void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::OptionalInputTensor kvCacheEndLens,
     rt::OptionalInputTensor tokenPosIds, rt::Tensor const& packedQKV, rt::Tensor& qScratch, rt::Tensor& kvCache,
     float kScale, float vScale, cudaStream_t stream, int32_t const* pageTable, int32_t maxPagesPerSeq,
     void* kScratchOut = nullptr, void* vScratchOut = nullptr, void* fp8QOut = nullptr, float qScale = 1.0f,
-    half const* qNormGamma = nullptr, half const* kNormGamma = nullptr, float rmsNormEps = 1e-6f);
+    half const* qNormGamma = nullptr, half const* kNormGamma = nullptr, float rmsNormEps = 1e-6f,
+    rt::OptionalInputTensor cuQSeqLens = std::nullopt);
 
 } // namespace kernel
 } // namespace trt_edgellm

@@ -116,8 +116,8 @@ public:
     void setPluginNamespace(char const* pluginNamespace) noexcept;
 
 private:
-    //! Produce split K/V FP16 for prefill consumers that cannot read the paged pool directly
-    //! (FMHA-v2 CuTe DSL cache-readback paths and FFPA d512). Always device-gathers the page table into
+    //! Produce split K/V FP16 for independent prefill consumers that cannot read the paged pool directly
+    //! (FMHA-v2 FP8/padding/vision and FFPA d512). Always device-gathers the page table into
     //! @p workspacePtr
     //! (no in-place alias): the gather follows any page table (identity or scrambled) correctly
     //! and identically in debug and release, and dequantizes an FP8 pool to FP16 using @p kScale /

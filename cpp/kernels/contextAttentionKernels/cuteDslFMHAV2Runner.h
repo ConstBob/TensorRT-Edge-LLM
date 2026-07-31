@@ -69,10 +69,11 @@ enum class CuteDslFMHAV2MaskType
 
 //! Runner for the CuTe DSL FMHA-v2 kernels.
 //!
-//! LLM kernels consume separate BSND Q/K/V tensors. ViT kernels consume packed,
-//! separate Q/K/V tensors. The runner remains separate from CuteDslFMHARunner
-//! because the FMHA-v2 kernels and the optimized SM100/101/110 kernels have
-//! different tensor contracts and generated ABIs.
+//! Dense LLM kernels consume separate BSND Q/K/V tensors, while native-paged LLM kernels consume
+//! BSND Q/O and the Edge-LLM NHD paged KV pool. The special padding and vision-block kernels consume
+//! dense, separate Q/K/V tensors, while ViT kernels consume packed, separate Q/K/V tensors. The
+//! runner remains separate from CuteDslFMHARunner because the optimized SM100/101/110 family has a
+//! distinct ABI.
 class CuteDslFMHAV2Runner
 {
 public:
@@ -83,8 +84,12 @@ public:
     CuteDslFMHAV2Runner(CuteDslFMHAV2Runner const&) = delete;
     CuteDslFMHAV2Runner& operator=(CuteDslFMHAV2Runner const&) = delete;
 
-    //! Returns whether the target AOT family covers this LLM context shape.
+    //! Returns whether the target AOT family covers this dense context shape.
     static bool canImplement(int32_t numQHeads, int32_t numKVHeads, int32_t headSize, int32_t smVersion,
+        nvinfer1::DataType dataType, CuteDslFMHAV2MaskType maskType);
+
+    //! Returns whether the target AOT family covers native FP16 Edge-LLM paged KV for this context shape.
+    static bool canImplementPaged(int32_t numQHeads, int32_t numKVHeads, int32_t headSize, int32_t smVersion,
         nvinfer1::DataType dataType, CuteDslFMHAV2MaskType maskType);
 
     //! Returns whether the target AOT family covers this packed ViT shape.
@@ -95,9 +100,14 @@ public:
     static bool loadViTKernelModule();
     static void unloadViTKernelModule();
 
-    //! Runs causal or sliding-causal LLM context attention.
+    //! Runs causal or sliding-causal LLM context attention over dense FP16 K/V.
     bool run(void const* qPtr, void const* kPtr, void const* vPtr, void* oPtr, int32_t const* cuKVSeqLens,
         cudaStream_t stream, float attentionScale, int32_t slidingWindowSize = INT_MAX);
+
+    //! Runs FP16 causal or sliding-causal attention directly against an FP16 NHD paged KV pool.
+    bool runPaged(void const* qPtr, void const* pagedKVPoolPtr, int32_t const* kvCachePageList, void* oPtr,
+        int32_t const* cuQSeqLens, int32_t const* cuKVSeqLens, int32_t numFlatPages, int32_t maxPagesPerSeq,
+        int32_t tokensPerPage, cudaStream_t stream, float attentionScale, int32_t slidingWindowSize = INT_MAX);
 
     //! Runs dense non-causal padded context attention with independent logical Q/KV lengths.
     bool runPadding(void const* qPtr, void const* kPtr, void const* vPtr, void* oPtr, int32_t const* cuQSeqLens,
@@ -130,6 +140,15 @@ private:
     static fmha_v2_d128_sw_Kernel_Module_t sLLM_d128Sw;
     static fmha_v2_d256_sw_Kernel_Module_t sLLM_d256Sw;
     static fmha_v2_d256_bidirectional_Kernel_Module_t sLLM_d256Bidirectional;
+    static fmha_v2_d64_paged_Kernel_Module_t sLLM_d64Paged;
+    static fmha_v2_d64_small_paged_Kernel_Module_t sLLM_d64SmallPaged;
+    static fmha_v2_d128_paged_Kernel_Module_t sLLM_d128Paged;
+    static fmha_v2_d256_paged_Kernel_Module_t sLLM_d256Paged;
+    static fmha_v2_d512_paged_Kernel_Module_t sLLM_d512Paged;
+    static fmha_v2_d64_sw_paged_Kernel_Module_t sLLM_d64SwPaged;
+    static fmha_v2_d128_sw_paged_Kernel_Module_t sLLM_d128SwPaged;
+    static fmha_v2_d256_sw_paged_Kernel_Module_t sLLM_d256SwPaged;
+    static fmha_v2_d512_sw_paged_Kernel_Module_t sLLM_d512SwPaged;
     static bool sLLMLoaded;
     static std::mutex sLLMMutex;
 

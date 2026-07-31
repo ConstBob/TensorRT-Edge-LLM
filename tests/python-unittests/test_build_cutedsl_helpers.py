@@ -17,6 +17,7 @@
 import argparse
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 import zipfile
@@ -33,6 +34,38 @@ assert _SPEC is not None and _SPEC.loader is not None
 build_cutedsl = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = build_cutedsl
 _SPEC.loader.exec_module(build_cutedsl)
+
+_FMHA_V2_SUPPORTED_SMS = [80, 86, 87, 89, 100, 101, 110, 120, 121]
+_FMHA_V2_DENSE_VARIANTS = {
+    "fmha_v2_d64",
+    "fmha_v2_d64_small",
+    "fmha_v2_d128",
+    "fmha_v2_d256",
+    "fmha_v2_d64_sw",
+    "fmha_v2_d128_sw",
+    "fmha_v2_d256_sw",
+}
+_FMHA_V2_PAGED_VARIANTS = {
+    "fmha_v2_d64_paged",
+    "fmha_v2_d64_small_paged",
+    "fmha_v2_d128_paged",
+    "fmha_v2_d256_paged",
+    "fmha_v2_d512_paged",
+    "fmha_v2_d64_sw_paged",
+    "fmha_v2_d128_sw_paged",
+    "fmha_v2_d256_sw_paged",
+    "fmha_v2_d512_sw_paged",
+}
+_FMHA_V2_SPECIAL_VARIANTS = {
+    "fmha_v2_d256_padding",
+    "fmha_v2_vit_d64",
+    "fmha_v2_vit_d72",
+    "fmha_v2_vit_d80",
+    "fmha_v2_vit_d128",
+    "fmha_v2_d256_bidirectional",
+}
+_FMHA_V2_VARIANTS = (_FMHA_V2_DENSE_VARIANTS | _FMHA_V2_PAGED_VARIANTS
+                     | _FMHA_V2_SPECIAL_VARIANTS)
 
 
 def _write_fake_elf(path: Path, machine: int) -> None:
@@ -238,37 +271,61 @@ def test_default_compile_gpu_arch_is_derived_from_target_sm(sm, expected):
     assert build_cutedsl.default_compile_gpu_arch(sm) == expected
 
 
-@pytest.mark.parametrize("sm", [80, 86, 87, 89, 100, 101, 110, 120, 121])
-def test_fmha_registry_contains_complete_fmha_v2_set(sm):
+@pytest.mark.parametrize("sm", _FMHA_V2_SUPPORTED_SMS)
+def test_fmha_v2_registry_is_complete_for_supported_sms(sm):
     variants = build_cutedsl.select_variants(sm, "fmha")
     fmha_v2_variants = [
         variant for variant in variants
         if variant.script == "fmha_v2_cutedsl/fmha.py"
     ]
 
-    assert {variant.name
-            for variant in fmha_v2_variants} == {
-                "fmha_v2_d64",
-                "fmha_v2_d64_small",
-                "fmha_v2_d128",
-                "fmha_v2_d256",
-                "fmha_v2_d256_padding",
-                "fmha_v2_d64_sw",
-                "fmha_v2_d128_sw",
-                "fmha_v2_d256_sw",
-                "fmha_v2_vit_d64",
-                "fmha_v2_vit_d72",
-                "fmha_v2_vit_d80",
-                "fmha_v2_vit_d128",
-                "fmha_v2_d256_bidirectional",
-            }
-    assert all(variant.group == "fmha" for variant in variants)
+    assert {variant.name for variant in fmha_v2_variants} == _FMHA_V2_VARIANTS
+    assert all(variant.group == "fmha" for variant in fmha_v2_variants)
     assert all("--export_only" in variant.script_args
                for variant in fmha_v2_variants)
+
+    dense_variants = [
+        variant for variant in fmha_v2_variants
+        if variant.name in _FMHA_V2_DENSE_VARIANTS
+    ]
+    assert {variant.name
+            for variant in dense_variants} == _FMHA_V2_DENSE_VARIANTS
+    assert all("--fmha_v2_context" in variant.script_args
+               for variant in dense_variants)
+    assert all("--paged_kv" not in variant.script_args
+               for variant in dense_variants)
+
+    paged_variants = [
+        variant for variant in fmha_v2_variants
+        if variant.name in _FMHA_V2_PAGED_VARIANTS
+    ]
+    assert {variant.name
+            for variant in paged_variants} == _FMHA_V2_PAGED_VARIANTS
+    assert all("--paged_kv" in variant.script_args
+               for variant in paged_variants)
+    assert all("--fmha_v2_context" not in variant.script_args
+               for variant in paged_variants)
+    sliding_paged_variants = {
+        variant.name
+        for variant in paged_variants
+        if "--window_size_left" in variant.script_args
+    }
+    assert sliding_paged_variants == {
+        "fmha_v2_d64_sw_paged",
+        "fmha_v2_d128_sw_paged",
+        "fmha_v2_d256_sw_paged",
+        "fmha_v2_d512_sw_paged",
+    }
+
     padding_variant = next(variant for variant in fmha_v2_variants
                            if variant.name == "fmha_v2_d256_padding")
     assert "--is_causal" not in padding_variant.script_args
     assert "--fmha_v2_context" not in padding_variant.script_args
+
+    assert not any("_fp8" in variant.name for variant in fmha_v2_variants)
+    assert not any("--kv_dtype" in variant.script_args
+                   for variant in fmha_v2_variants)
+
     optimized_variants = [
         variant for variant in variants
         if variant.script == "fmha_cutedsl_blackwell/fmha.py"
@@ -292,10 +349,54 @@ def test_fmha_registry_has_one_d512_bidirectional_variant(sm):
                if variant.name.startswith("fmha_d512"))
 
 
+def test_fmha_v2_paged_d512_registry_uses_32x32_tiles_and_two_warps():
+    d512_variants = [
+        variant for variant in build_cutedsl.KERNEL_VARIANTS if
+        variant.script == "fmha_v2_cutedsl/fmha.py" and "d512" in variant.name
+    ]
+
+    assert {variant.name
+            for variant in d512_variants} == {
+                "fmha_v2_d512_paged",
+                "fmha_v2_d512_sw_paged",
+            }
+    assert all(variant.supported_sms == _FMHA_V2_SUPPORTED_SMS
+               for variant in d512_variants)
+    for variant in d512_variants:
+        assert variant.script_args[variant.script_args.index("--head_dim") +
+                                   1] == "512"
+        assert variant.script_args[variant.script_args.index("--m_block_size")
+                                   + 1] == "32"
+        assert variant.script_args[variant.script_args.index("--n_block_size")
+                                   + 1] == "32"
+        assert variant.script_args[variant.script_args.index("--num_threads") +
+                                   1] == "64"
+
+
 @pytest.mark.parametrize("sm", [90, 103])
 def test_fmha_registry_rejects_unsupported_sms(sm):
     with pytest.raises(ValueError, match="No variants"):
         build_cutedsl.select_variants(sm, "fmha")
+
+
+def test_fmha_v2_per_variant_compile_definitions_are_absent():
+    pattern = re.compile(r"\bCUTE_DSL_FMHA_V2_[A-Z0-9_]+\b")
+    offenders = []
+    candidate_paths = [_REPO_ROOT / "CMakeLists.txt"]
+    for root in ("cmake", "cpp", "kernelSrcs"):
+        for path in (_REPO_ROOT / root).rglob("*"):
+            if path.suffix not in {
+                    ".cmake", ".txt", ".cpp", ".cu", ".cuh", ".h", ".hpp",
+                    ".py"
+            }:
+                continue
+            candidate_paths.append(path)
+
+    for path in candidate_paths:
+        if pattern.search(path.read_text(encoding="utf-8", errors="ignore")):
+            offenders.append(path.relative_to(_REPO_ROOT).as_posix())
+
+    assert offenders == []
 
 
 def test_build_allows_f16_moe_for_foreign_target_sm(tmp_path, monkeypatch):

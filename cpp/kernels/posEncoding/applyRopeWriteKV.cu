@@ -738,11 +738,11 @@ template <typename T, typename TCache>
 __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV, T* __restrict__ qScratch,
     T* __restrict__ kScratch, T* __restrict__ vScratch, TCache* __restrict__ kvCache, void* __restrict__ fp8QOut,
     float const* __restrict__ cosSinCache, int32_t const* __restrict__ kvCacheEndLens,
-    int32_t const* __restrict__ tokenPosIds, T const* __restrict__ qNormGamma, T const* __restrict__ kNormGamma,
-    float rmsNormEps, float qScaleQuantOrig, float kScaleQuantOrig, float vScaleQuantOrig, int32_t qSeqLen,
-    int32_t totalNumTokens, int32_t kvCacheCapacity, uint32_t numQHead, uint32_t numKVHead, uint32_t headDim,
-    uint32_t rotaryDim, int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen, int32_t const* __restrict__ pageTable,
-    int32_t maxPagesPerSeq)
+    int32_t const* __restrict__ tokenPosIds, int32_t const* __restrict__ cuQSeqLens, T const* __restrict__ qNormGamma,
+    T const* __restrict__ kNormGamma, float rmsNormEps, float qScaleQuantOrig, float kScaleQuantOrig,
+    float vScaleQuantOrig, int32_t qSeqLen, int32_t totalNumTokens, int32_t kvCacheCapacity, uint32_t numQHead,
+    uint32_t numKVHead, uint32_t headDim, uint32_t rotaryDim, int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen,
+    int32_t const* __restrict__ pageTable, int32_t maxPagesPerSeq)
 {
     // Thread mapping (same as existing kernels for proven memory coalescing):
     //   blockDim.x = headDim / vec_size  (threads per token, cover head vector)
@@ -768,8 +768,17 @@ __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV
 
     // RoPE position: prefill (kvCacheEndLens - qSeqLen + offset), decode
     // (kvCacheEndLens[b] - 1), or tree (tokenPosIds; -1 = padding token, zeroed).
+    // Ragged prefill padding must be identified before page-table or RoPE-cache
+    // indexing. It cannot early-return because fused qk_norm uses warp collectives.
+    int32_t const rowInBatch = static_cast<int32_t>(clampedTokenIdx % qSeqLen);
+    int32_t actualQSeqLen = qSeqLen;
+    if (cuQSeqLens != nullptr)
+    {
+        actualQSeqLen = cuQSeqLens[batchIdx + 1] - cuQSeqLens[batchIdx];
+    }
     int32_t sinCosCachePos{};
-    bool const isPaddingToken = (tokenPosIds != nullptr && tokenPosIds[clampedTokenIdx] == -1);
+    bool const isPaddingToken = (tokenPosIds != nullptr && tokenPosIds[clampedTokenIdx] == -1)
+        || (cuQSeqLens != nullptr && rowInBatch >= actualQSeqLen);
     if (tokenPosIds != nullptr)
     {
         sinCosCachePos = tokenPosIds[clampedTokenIdx];
@@ -781,7 +790,9 @@ __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV
     else
     {
         int32_t const posStartId = kvCacheEndLens != nullptr ? kvCacheEndLens[batchIdx] - qSeqLen : 0;
-        sinCosCachePos = posStartId + clampedTokenIdx % qSeqLen;
+        int32_t const maxActualRow = actualQSeqLen > 0 ? actualQSeqLen - 1 : 0;
+        int32_t const ropeRow = isPaddingToken && rowInBatch > maxActualRow ? maxActualRow : rowInBatch;
+        sinCosCachePos = posStartId + ropeRow;
     }
 
     // Vectorized load cos/sin for this token's RoPE position.
@@ -949,7 +960,7 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
     rt::OptionalInputTensor tokenPosIds, rt::Tensor const& packedQKV, rt::Tensor& qScratch, rt::Tensor& kvCache,
     float kScale, float vScale, cudaStream_t stream, int32_t const* pageTable, int32_t maxPagesPerSeq,
     void* kScratchOut, void* vScratchOut, void* fp8QOut, float qScale, half const* qNormGamma, half const* kNormGamma,
-    float rmsNormEps)
+    float rmsNormEps, rt::OptionalInputTensor cuQSeqLens)
 {
     auto const dt = kvCache.getDataType();
     constexpr uint32_t kVEC_SIZE = DVec<half>::vec_size;
@@ -990,6 +1001,12 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
                 && tokenPosIds.value().get().getShape()[1] == runtimeSeqLen,
             "tokenPosIds shape shall be [B, S].");
     }
+    if (cuQSeqLens.has_value())
+    {
+        check::check(cuQSeqLens.value().get().getShape()[0] == batchSize + 1, "cuQSeqLens shape shall be [B + 1].");
+        check::check(cuQSeqLens.value().get().getDataType() == nvinfer1::DataType::kINT32,
+            "cuQSeqLens shall have INT32 data type.");
+    }
 
     half const* packedPtr = packedQKV.dataPointer<half>();
     half* qScratchPtr = qScratch.dataPointer<half>();
@@ -1000,6 +1017,7 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
         = kvCacheEndLens.has_value() ? kvCacheEndLens.value().get().dataPointer<int32_t>() : nullptr;
     int32_t const* tokenPosIdsPtr
         = tokenPosIds.has_value() ? tokenPosIds.value().get().dataPointer<int32_t>() : nullptr;
+    int32_t const* cuQSeqLensPtr = cuQSeqLens.has_value() ? cuQSeqLens.value().get().dataPointer<int32_t>() : nullptr;
 
     // Fused RMSNorm needs a power-of-2 lane count for the warp-shuffle butterfly: pad
     // blockDim.x to nextPowerOf2(headDim / vec_size); ghost lanes only join the shfl.
@@ -1027,7 +1045,7 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
         half* kvCachePtr = kvCache.dataPointer<half>();
         applyRopeFromPackedToSplitKernel<half, half><<<grid, block, 0, stream>>>(packedPtr, qScratchPtr, kScratchPtr,
             vScratchPtr, kvCachePtr, nullptr /* fp8QOut */, cosSinCachePtr, kvCacheEndLensPtr, tokenPosIdsPtr,
-            qNormGamma, kNormGamma, rmsNormEps, 1.0f /* qScaleQuantOrig */, kScale, vScale,
+            cuQSeqLensPtr, qNormGamma, kNormGamma, rmsNormEps, 1.0f /* qScaleQuantOrig */, kScale, vScale,
             static_cast<int32_t>(runtimeSeqLen), static_cast<int32_t>(totalNumTokens),
             static_cast<int32_t>(kvCacheCapacity), static_cast<uint32_t>(numQHeads), static_cast<uint32_t>(numKVHeads),
             static_cast<uint32_t>(headDim), static_cast<uint32_t>(rotaryDim),
@@ -1040,11 +1058,12 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
         __nv_fp8_e4m3* kvCachePtr = kvCache.dataPointer<__nv_fp8_e4m3>();
         applyRopeFromPackedToSplitKernel<half, __nv_fp8_e4m3><<<grid, block, 0, stream>>>(packedPtr, qScratchPtr,
             kScratchPtr, vScratchPtr, kvCachePtr, fp8QOut, cosSinCachePtr, kvCacheEndLensPtr, tokenPosIdsPtr,
-            qNormGamma, kNormGamma, rmsNormEps, qScale, kScale, vScale, static_cast<int32_t>(runtimeSeqLen),
-            static_cast<int32_t>(totalNumTokens), static_cast<int32_t>(kvCacheCapacity),
-            static_cast<uint32_t>(numQHeads), static_cast<uint32_t>(numKVHeads), static_cast<uint32_t>(headDim),
-            static_cast<uint32_t>(rotaryDim), static_cast<int32_t>(cosSinCacheBatchSize),
-            static_cast<int32_t>(cosSinCacheSeqLen), pageTable, maxPagesPerSeq);
+            cuQSeqLensPtr, qNormGamma, kNormGamma, rmsNormEps, qScale, kScale, vScale,
+            static_cast<int32_t>(runtimeSeqLen), static_cast<int32_t>(totalNumTokens),
+            static_cast<int32_t>(kvCacheCapacity), static_cast<uint32_t>(numQHeads), static_cast<uint32_t>(numKVHeads),
+            static_cast<uint32_t>(headDim), static_cast<uint32_t>(rotaryDim),
+            static_cast<int32_t>(cosSinCacheBatchSize), static_cast<int32_t>(cosSinCacheSeqLen), pageTable,
+            maxPagesPerSeq);
     }
 #endif
     else
