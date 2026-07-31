@@ -566,6 +566,9 @@
     - !reference [.record_runner_usage, after_script]
 
 .cross_build_template:
+  artifacts:
+    reports:
+      metrics: ci-artifacts/lib-size/lib_size_metrics.txt
   script:
     - echo "Pipeline start time:$(date)"
     - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
@@ -588,4 +591,11 @@
     - echo "Building the project"
     - make -j$(nproc)
     - echo "Cross-build completed successfully"
+    - echo "Reporting library size"
+    - python3 ../scripts/report_library_size.py
+        --build-dir .
+        --source-dir ..
+        --label $EMBEDDED_TARGET
+        --output-dir ../ci-artifacts/lib-size
+        || echo "WARNING - library size report failed"
     - echo "Pipeline end time:$(date)"

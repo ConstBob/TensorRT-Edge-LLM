@@ -12,6 +12,9 @@ l0_local_spark_build_and_test:
     - local-spark
   variables:
     TRT_PACKAGE_DIR: "/usr"
+  artifacts:
+    reports:
+      metrics: ci-artifacts/lib-size/lib_size_metrics.txt
   script:
     - echo "Pipeline start time:$(date)"
     - echo "Node name:$(hostname)"
@@ -35,6 +38,13 @@ l0_local_spark_build_and_test:
         -DEMBEDDED_TARGET=gb10
         -DCUDA_CTK_VERSION=13.0
     - make -j$(nproc)
+    - echo "Reporting library size"
+    - python3 ../scripts/report_library_size.py
+        --build-dir .
+        --source-dir ..
+        --label gb10
+        --output-dir ../ci-artifacts/lib-size
+        || echo "WARNING - library size report failed"
     - echo "Build completed. Running unit tests"
     - ./unitTest
     - echo "Pipeline end time:$(date)"
