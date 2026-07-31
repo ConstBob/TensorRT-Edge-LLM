@@ -46,6 +46,21 @@ def _format_command_for_display(
     return f"{env_display} {cmd_display}"
 
 
+# Library size reports collected during the run. Pytest's fd capture hides
+# everything a passing test prints, so conftest replays these in the terminal
+# summary, which is where a CI job log can show them. This lives here rather
+# than in conftest.py because pytest registers conftest as its own plugin
+# module instance -- a test importing `conftest` gets a different object and
+# would append to a list the hook never sees.
+library_size_reports: List[str] = []
+
+
+def record_library_size_report(text: str) -> None:
+    """Queue a library size report for the end-of-run terminal summary."""
+    if text:
+        library_size_reports.append(text)
+
+
 def _tee_line_to_process_stdout(text: str) -> None:
     """Send one line to the real OS stdout (fd 1) so the outer edge-llm-qa
     runner (run_cmd_direct) sees it. Pytest's output capture replaces sys.stdout;

@@ -300,6 +300,15 @@ def test_logger(request, env_config):
         logger.removeHandler(handler)
 
 
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    """Replay library size reports so they reach the CI job log."""
+    del exitstatus, config
+    from pytest_helpers import library_size_reports
+
+    for report in library_size_reports:
+        terminalreporter.write_line(report)
+
+
 def pytest_addoption(parser):
     """Add custom command line options"""
     parser.addoption("--priority",
