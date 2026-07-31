@@ -36,6 +36,13 @@ namespace rt
 namespace
 {
 
+void applySamplerLogitBiasRepeatedRows(
+    LogitBias const& logitBias, Tensor& logits, int32_t rowsPerSlot, cudaStream_t stream)
+{
+    ::trt_edgellm::applyLogitBiasRepeatedRows(
+        logits, logitBias.tokenIds, logitBias.values, logitBias.offsets, rowsPerSlot, stream);
+}
+
 void uploadLogitBias(LogitBias& logitBias, DecodingInferenceContext& context, cudaStream_t stream)
 {
     if (!context.hasLogitBias || !context.logitBiasGpuDirty)
@@ -198,14 +205,12 @@ void applyLogitBiasRepeatedRows(
         check::check(originalShape[0] == context.activeBatchSize, "Spec logit bias batch size mismatch");
         check::check(originalShape[1] == rowsPerSlot, "Spec logit bias rowsPerSlot shape mismatch");
         check::check(logits.reshape({originalShape[0] * originalShape[1], originalShape[2]}), "Tensor reshape failed");
-        ::trt_edgellm::applyLogitBiasRepeatedRows(
-            logits, logitBias.tokenIds, logitBias.values, logitBias.offsets, rowsPerSlot, stream);
+        applySamplerLogitBiasRepeatedRows(logitBias, logits, rowsPerSlot, stream);
         check::check(logits.reshape(originalShape), "Tensor reshape failed");
         return;
     }
 
-    ::trt_edgellm::applyLogitBiasRepeatedRows(
-        logits, logitBias.tokenIds, logitBias.values, logitBias.offsets, rowsPerSlot, stream);
+    applySamplerLogitBiasRepeatedRows(logitBias, logits, rowsPerSlot, stream);
 }
 
 } // namespace rt

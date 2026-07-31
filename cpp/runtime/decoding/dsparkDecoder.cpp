@@ -408,6 +408,9 @@ void DSparkDecoder::dsparkBiasMarkovGreedy(
     }
 }
 
+// DSpark stochastic verification consumes the proposal distribution q(y). With bias b,
+// q_b(y) = softmax(logits(y) + b_y), so adding b after sampling would use the wrong
+// acceptance distribution. Materialize the biased q_b rows before sampling and storage.
 void DSparkDecoder::dsparkBiasMarkovSample(
     DecodingInferenceContext& context, int32_t activeBatchSize, int32_t proposalLen)
 {

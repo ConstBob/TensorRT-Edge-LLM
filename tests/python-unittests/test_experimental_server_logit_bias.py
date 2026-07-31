@@ -141,6 +141,10 @@ def test_api_accepts_logit_bias_with_active_spec_decode(stream):
             return object()
 
         @staticmethod
+        def count_prompt_tokens(*args, **kwargs):
+            return 1
+
+        @staticmethod
         def generate_stream(*args, **kwargs):
             return iter(())
 
