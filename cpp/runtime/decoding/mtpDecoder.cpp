@@ -665,6 +665,7 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
 
     auto const& basePageTable = *mRuntime.base.sharedResources.kvPageTables[0];
     int32_t const* basePageTablePtr = basePageTable.kernelView().dataPointer<int32_t>();
+    int32_t const baseNumPages = kvMgrBase.numPages();
     int32_t const baseMaxPagesPerSeq = basePageTable.maxPagesPerSeq();
 
     decoder_utils::clampAcceptLengthsToRemainingGeneration(context, mHostAcceptLengths, mAcceptLength, context.stream);
@@ -673,7 +674,7 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
     {
         kernel::eagleBaseCommitKVCache(mAcceptedTokenIndices, mAcceptLength, kvCacheLengths, group.deviceLayerInfos,
             group.numLayers, group.headDim, group.maxKVHeads, activeBatchSize, maxAcceptDepth, kvCacheType,
-            context.stream, basePageTablePtr, baseMaxPagesPerSeq);
+            context.stream, basePageTablePtr, baseNumPages, baseMaxPagesPerSeq);
     }
     kernel::eagleBaseAssembleHiddenState(
         mAcceptedTokenIndices, mAcceptLength, mRuntime.base.pipelineIO.baseHiddenStates, context.stream);

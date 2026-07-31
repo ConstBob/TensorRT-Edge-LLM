@@ -1116,7 +1116,7 @@ TEST(EagleKernels, EagleBaseCommitKVCacheHeterogeneousLayers)
 
         eagleBaseCommitKVCache(acceptedIndicesDevice, acceptLengthsDevice, kvCacheLengthsDevice,
             static_cast<KVLayerInfo const*>(deviceInfos.rawPointer()), numLayers, headDim, maxKVHeads, activeBatchSize,
-            maxDepth, DataType::kHALF, stream, pageTable.kernelView().dataPointer<int32_t>(), maxPagesPerSeq);
+            maxDepth, DataType::kHALF, stream, pageTable.kernelView().dataPointer<int32_t>(), numPages, maxPagesPerSeq);
 
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
@@ -1240,7 +1240,7 @@ TEST(EagleKernels, EagleBaseCommitKVCacheNonIdentityPageTableRemapsPhysicalPages
 
     eagleBaseCommitKVCache(acceptedIndicesDevice, acceptLengthsDevice, kvCacheLengthsDevice,
         static_cast<KVLayerInfo const*>(deviceInfos.rawPointer()), numLayers, headDim, maxKVHeads, activeBatchSize,
-        maxDepth, DataType::kHALF, stream, pageTable.kernelView().dataPointer<int32_t>(), maxPagesPerSeq);
+        maxDepth, DataType::kHALF, stream, pageTable.kernelView().dataPointer<int32_t>(), numPages, maxPagesPerSeq);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     auto const host = copyDeviceToHost<half>(layerCache);
@@ -1266,6 +1266,69 @@ TEST(EagleKernels, EagleBaseCommitKVCacheNonIdentityPageTableRemapsPhysicalPages
         // The remapped commit must leave slot 0's identity-mapped physical location untouched.
         EXPECT_TRUE(isclose(valueAt(kv, 0, 127), kvAt(kv, 0, 0, 127), 1e-3f, 1e-3f))
             << "kv=" << kv << " raw batch0 pos127 was wrongly touched";
+    }
+}
+
+TEST(EagleKernels, EagleBaseCommitKVCacheSkipsWrongPlanePageIds)
+{
+    cudaStream_t stream = nullptr;
+
+    int32_t const headDim = 64;
+    int32_t const numKVHeads = 1;
+    int32_t const activeBatchSize = 2;
+    int32_t const maxDepth = 3;
+    int32_t const maxPagesPerSeq = 2;
+    int32_t const numPages = 4;
+    int32_t const maxSeqLen = maxPagesPerSeq * rt::kTOKENS_PER_PAGE;
+
+    rt::Tensor layerCache(
+        {2, numPages, rt::kTOKENS_PER_PAGE, numKVHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    std::vector<half> hostInit(
+        static_cast<size_t>(2) * numPages * rt::kTOKENS_PER_PAGE * numKVHeads * headDim, __float2half(0.0F));
+    auto const flatIndex = [&](int32_t pageId, int32_t inPage, int32_t dim) {
+        return (static_cast<int64_t>(pageId) * rt::kTOKENS_PER_PAGE + inPage) * numKVHeads * headDim + dim;
+    };
+    auto const seedToken = [&](int32_t pageId, int32_t inPage, float value) {
+        for (int32_t dim = 0; dim < headDim; ++dim)
+        {
+            hostInit[flatIndex(pageId, inPage, dim)] = __float2half(value);
+        }
+    };
+
+    seedToken(/*pageId=*/1, /*inPage=*/0, 11.0F);
+    seedToken(/*pageId=*/4, /*inPage=*/126, 55.0F);
+    seedToken(/*pageId=*/4, /*inPage=*/127, 44.0F);
+    seedToken(/*pageId=*/6, /*inPage=*/0, 22.0F);
+    seedToken(/*pageId=*/0, /*inPage=*/126, 66.0F);
+    seedToken(/*pageId=*/0, /*inPage=*/127, 77.0F);
+    copyHostToDevice<half>(layerCache, hostInit);
+
+    std::vector<KVLayerInfo> const hostInfos{KVLayerInfo{layerCache.rawPointer(), numKVHeads, maxSeqLen}};
+    rt::Tensor deviceInfos = uploadLayerInfos(hostInfos, stream);
+
+    rt::Tensor acceptedIndicesDevice({activeBatchSize, maxDepth}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor acceptLengthsDevice({activeBatchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor kvCacheLengthsDevice({activeBatchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice<int32_t>(acceptedIndicesDevice, {0, 2, 0, 0, 2, 0});
+    copyHostToDevice<int32_t>(acceptLengthsDevice, {3, 3});
+    copyHostToDevice<int32_t>(kvCacheLengthsDevice, {126, 126});
+
+    rt::Tensor pageTable({activeBatchSize, 2, maxPagesPerSeq}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice<int32_t>(pageTable,
+        {4, 1, rt::kUNUSED_PAGE_ENTRY, rt::kUNUSED_PAGE_ENTRY, rt::kUNUSED_PAGE_ENTRY, rt::kUNUSED_PAGE_ENTRY, 0, 6});
+
+    eagleBaseCommitKVCache(acceptedIndicesDevice, acceptLengthsDevice, kvCacheLengthsDevice,
+        static_cast<KVLayerInfo const*>(deviceInfos.rawPointer()), /*numLayers=*/1, headDim, numKVHeads,
+        activeBatchSize, maxDepth, DataType::kHALF, stream, pageTable.dataPointer<int32_t>(), numPages, maxPagesPerSeq);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    auto const host = copyDeviceToHost<half>(layerCache);
+    for (int32_t dim = 0; dim < headDim; ++dim)
+    {
+        EXPECT_FLOAT_EQ(__half2float(host[flatIndex(/*pageId=*/4, /*inPage=*/127, dim)]), 44.0F);
+        EXPECT_FLOAT_EQ(__half2float(host[flatIndex(/*pageId=*/1, /*inPage=*/0, dim)]), 0.0F);
+        EXPECT_FLOAT_EQ(__half2float(host[flatIndex(/*pageId=*/0, /*inPage=*/127, dim)]), 77.0F);
+        EXPECT_FLOAT_EQ(__half2float(host[flatIndex(/*pageId=*/6, /*inPage=*/0, dim)]), 0.0F);
     }
 }
 
@@ -1345,7 +1408,7 @@ TEST(EagleKernels, EagleBaseCommitKVCacheAcceptRollbackTreeNodes)
 
     eagleBaseCommitKVCache(acceptedIndicesDevice, acceptLengthsDevice, kvCacheLengthsDevice,
         static_cast<KVLayerInfo const*>(deviceInfos.rawPointer()), numLayers, headDim, maxKVHeads, activeBatchSize,
-        maxDepth, DataType::kHALF, stream, pageTable.kernelView().dataPointer<int32_t>(), maxPagesPerSeq);
+        maxDepth, DataType::kHALF, stream, pageTable.kernelView().dataPointer<int32_t>(), numPages, maxPagesPerSeq);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     auto const host = copyDeviceToHost<half>(layerCache);

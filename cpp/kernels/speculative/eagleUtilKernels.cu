@@ -647,16 +647,19 @@ void prepareEagleBaseTreeDecodingInputs(rt::Tensor const& baseTreeDecodingMask, 
 
 // Resolves logical token position `pos` through the required page table to a flat element
 // offset in the layer's [2, numPages, kTOKENS_PER_PAGE, numKVHeads, HEAD_DIM] pool.
-// `kvSel` is 0 for K and 1 for V. A negative page id is unmapped and returns -1.
+// `kvSel` is 0 for K and 1 for V. Unmapped or out-of-plane page ids return -1.
 template <int32_t HEAD_DIM>
 __device__ __forceinline__ int64_t eagleResolveKVOffset(int32_t kvSel, int32_t headInKv, int32_t numKVHeads,
-    int32_t kvBatchIdx, int32_t pos, int32_t const* pageTable, int32_t maxPagesPerSeq, int32_t vecElemOffset)
+    int32_t kvBatchIdx, int32_t pos, int32_t const* pageTable, int32_t numPages, int32_t maxPagesPerSeq,
+    int32_t vecElemOffset)
 {
     int64_t const tokenStride = static_cast<int64_t>(numKVHeads) * HEAD_DIM;
     int32_t const pageRow = pos / rt::kTOKENS_PER_PAGE;
     int32_t const inPage = pos % rt::kTOKENS_PER_PAGE;
     int32_t const pageId = pageTable[(static_cast<int64_t>(kvBatchIdx) * 2 + kvSel) * maxPagesPerSeq + pageRow];
-    if (pageId < 0)
+    int64_t const planeBegin = static_cast<int64_t>(kvSel) * numPages;
+    int64_t const planeEnd = planeBegin + numPages;
+    if (pageId < planeBegin || static_cast<int64_t>(pageId) >= planeEnd)
     {
         return -1;
     }
@@ -668,7 +671,7 @@ template <int32_t HEAD_DIM, int32_t MAX_PATH, typename KV_T>
 __global__ void eagleBaseCommitKVCacheBatchedKernel(int32_t const* __restrict__ acceptedIndices,
     int32_t const* __restrict__ acceptLengths, int32_t const* __restrict__ kvCacheLengths,
     KVLayerInfo const* __restrict__ layerInfos, int32_t const activeBatchSize, int32_t const maxDepth,
-    int32_t const* __restrict__ pageTable, int32_t const maxPagesPerSeq)
+    int32_t const* __restrict__ pageTable, int32_t const numPages, int32_t const maxPagesPerSeq)
 {
     static_assert(HEAD_DIM == 64 || HEAD_DIM == 128 || HEAD_DIM == 256 || HEAD_DIM == 512,
         "Only HEAD_DIM = 64, 128, 256 or 512 are supported");
@@ -720,16 +723,14 @@ __global__ void eagleBaseCommitKVCacheBatchedKernel(int32_t const* __restrict__ 
         if (acceptedIdx >= 0 && acceptedIdx + pastKvCacheLength < maxSeqLen)
         {
             int64_t const srcOffset = eagleResolveKVOffset<HEAD_DIM>(kvSel, headInKv, numKVHeads, kvBatchIdx,
-                pastKvCacheLength + acceptedIdx, pageTable, maxPagesPerSeq, tIdx * DVec<half>::vec_size);
+                pastKvCacheLength + acceptedIdx, pageTable, numPages, maxPagesPerSeq, tIdx * DVec<half>::vec_size);
             if (srcOffset >= 0)
             {
                 tempBuffer[i].load(kvCacheBuffer + srcOffset);
             }
             else
             {
-                // Unmapped source page -- skip the load (no wild-address read). The runtime
-                // guarantees mapped coverage for live positions, so this only fires on an
-                // upstream table bug; store deterministic zeros instead of uninitialised bytes.
+                // An unmapped or out-of-plane source resolves to deterministic zeros.
                 tempBuffer[i] = DVec<KV_T>{};
             }
         }
@@ -745,13 +746,12 @@ __global__ void eagleBaseCommitKVCacheBatchedKernel(int32_t const* __restrict__ 
     for (int32_t i = 1; i < actualAcceptLength; ++i)
     {
         int64_t const dstOffset = eagleResolveKVOffset<HEAD_DIM>(kvSel, headInKv, numKVHeads, kvBatchIdx,
-            pastKvCacheLength + i, pageTable, maxPagesPerSeq, tIdx * DVec<half>::vec_size);
+            pastKvCacheLength + i, pageTable, numPages, maxPagesPerSeq, tIdx * DVec<half>::vec_size);
         if (dstOffset >= 0)
         {
             tempBuffer[i].store(kvCacheBuffer + dstOffset);
         }
-        // else: unmapped destination page -- skip the write (the runtime guarantees mapped
-        // coverage for live positions; an unmapped page here is an upstream table bug).
+        // An unmapped or out-of-plane destination skips the write.
     }
 }
 
@@ -817,7 +817,7 @@ __global__ void eagleBaseAssembleHiddenStateKernel(int32_t const* acceptedIndice
 void eagleBaseCommitKVCache(rt::Tensor const& acceptedIndices, rt::Tensor const& acceptLengths,
     rt::Tensor const& kvCacheLengths, KVLayerInfo const* deviceLayerInfos, int32_t numLayers, int32_t headDim,
     int32_t maxKVHeads, int32_t activeBatchSize, int32_t maxDepth, nvinfer1::DataType kvCacheType, cudaStream_t stream,
-    int32_t const* pageTable, int32_t maxPagesPerSeq)
+    int32_t const* pageTable, int32_t numPages, int32_t maxPagesPerSeq)
 {
     check::check(acceptedIndices.getDeviceType() == rt::DeviceType::kGPU
             && acceptLengths.getDeviceType() == rt::DeviceType::kGPU
@@ -829,6 +829,8 @@ void eagleBaseCommitKVCache(rt::Tensor const& acceptedIndices, rt::Tensor const&
     check::check(kvCacheType == DataType::kHALF || kvCacheType == DataType::kFP8, "kvCacheType should be HALF or FP8.");
     check::check(deviceLayerInfos != nullptr, "deviceLayerInfos must not be null.");
     check::check(pageTable != nullptr, "pageTable must not be null.");
+    check::check(numPages > 0, "numPages must be positive.");
+    check::check(numPages <= rt::kMAX_KV_POOL_PAGES, "numPages exceeds the supported paged-KV pool limit.");
     check::check(maxPagesPerSeq > 0, "maxPagesPerSeq must be positive.");
 
     if (numLayers == 0 || activeBatchSize == 0)
@@ -871,14 +873,14 @@ void eagleBaseCommitKVCache(rt::Tensor const& acceptedIndices, rt::Tensor const&
         {
             eagleBaseCommitKVCacheBatchedKernel<64, kEagleMaxAcceptedPathLength, half>
                 <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndicesPtr, acceptLengthsPtr, kvCacheLengthsPtr,
-                    deviceLayerInfos, activeBatchSize, maxDepth, pageTable, maxPagesPerSeq);
+                    deviceLayerInfos, activeBatchSize, maxDepth, pageTable, numPages, maxPagesPerSeq);
         }
         else
         {
 #if SUPPORTS_FP8
             eagleBaseCommitKVCacheBatchedKernel<64, kEagleMaxAcceptedPathLength, __nv_fp8_e4m3>
                 <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndicesPtr, acceptLengthsPtr, kvCacheLengthsPtr,
-                    deviceLayerInfos, activeBatchSize, maxDepth, pageTable, maxPagesPerSeq);
+                    deviceLayerInfos, activeBatchSize, maxDepth, pageTable, numPages, maxPagesPerSeq);
 #else
             throw std::runtime_error("FP8 KV cache requested but CUDA_VERSION < 11080 (cuda_fp8.h unavailable).");
 #endif
@@ -889,14 +891,14 @@ void eagleBaseCommitKVCache(rt::Tensor const& acceptedIndices, rt::Tensor const&
         {
             eagleBaseCommitKVCacheBatchedKernel<128, kEagleMaxAcceptedPathLength, half>
                 <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndicesPtr, acceptLengthsPtr, kvCacheLengthsPtr,
-                    deviceLayerInfos, activeBatchSize, maxDepth, pageTable, maxPagesPerSeq);
+                    deviceLayerInfos, activeBatchSize, maxDepth, pageTable, numPages, maxPagesPerSeq);
         }
         else
         {
 #if SUPPORTS_FP8
             eagleBaseCommitKVCacheBatchedKernel<128, kEagleMaxAcceptedPathLength, __nv_fp8_e4m3>
                 <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndicesPtr, acceptLengthsPtr, kvCacheLengthsPtr,
-                    deviceLayerInfos, activeBatchSize, maxDepth, pageTable, maxPagesPerSeq);
+                    deviceLayerInfos, activeBatchSize, maxDepth, pageTable, numPages, maxPagesPerSeq);
 #else
             throw std::runtime_error("FP8 KV cache requested but CUDA_VERSION < 11080 (cuda_fp8.h unavailable).");
 #endif
@@ -907,14 +909,14 @@ void eagleBaseCommitKVCache(rt::Tensor const& acceptedIndices, rt::Tensor const&
         {
             eagleBaseCommitKVCacheBatchedKernel<256, kEagleMaxAcceptedPathLength, half>
                 <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndicesPtr, acceptLengthsPtr, kvCacheLengthsPtr,
-                    deviceLayerInfos, activeBatchSize, maxDepth, pageTable, maxPagesPerSeq);
+                    deviceLayerInfos, activeBatchSize, maxDepth, pageTable, numPages, maxPagesPerSeq);
         }
         else
         {
 #if SUPPORTS_FP8
             eagleBaseCommitKVCacheBatchedKernel<256, kEagleMaxAcceptedPathLength, __nv_fp8_e4m3>
                 <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndicesPtr, acceptLengthsPtr, kvCacheLengthsPtr,
-                    deviceLayerInfos, activeBatchSize, maxDepth, pageTable, maxPagesPerSeq);
+                    deviceLayerInfos, activeBatchSize, maxDepth, pageTable, numPages, maxPagesPerSeq);
 #else
             throw std::runtime_error("FP8 KV cache requested but CUDA_VERSION < 11080 (cuda_fp8.h unavailable).");
 #endif
@@ -925,14 +927,14 @@ void eagleBaseCommitKVCache(rt::Tensor const& acceptedIndices, rt::Tensor const&
         {
             eagleBaseCommitKVCacheBatchedKernel<512, kEagleMaxAcceptedPathLength, half>
                 <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndicesPtr, acceptLengthsPtr, kvCacheLengthsPtr,
-                    deviceLayerInfos, activeBatchSize, maxDepth, pageTable, maxPagesPerSeq);
+                    deviceLayerInfos, activeBatchSize, maxDepth, pageTable, numPages, maxPagesPerSeq);
         }
         else
         {
 #if SUPPORTS_FP8
             eagleBaseCommitKVCacheBatchedKernel<512, kEagleMaxAcceptedPathLength, __nv_fp8_e4m3>
                 <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndicesPtr, acceptLengthsPtr, kvCacheLengthsPtr,
-                    deviceLayerInfos, activeBatchSize, maxDepth, pageTable, maxPagesPerSeq);
+                    deviceLayerInfos, activeBatchSize, maxDepth, pageTable, numPages, maxPagesPerSeq);
 #else
             throw std::runtime_error("FP8 KV cache requested but CUDA_VERSION < 11080 (cuda_fp8.h unavailable).");
 #endif
