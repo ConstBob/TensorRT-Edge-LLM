@@ -16,6 +16,7 @@
  */
 
 #include "builderUtils.h"
+#include "common/cudaUtils.h"
 #include "common/logger.h"
 #include "common/trtUtils.h"
 
@@ -58,6 +59,13 @@ std::string applyCompileWorkarounds([[maybe_unused]] int32_t maxBatchSize)
     }
 #if NV_TENSORRT_MAJOR == 10 && (NV_TENSORRT_MINOR == 13 || NV_TENSORRT_MINOR == 14)
     appendLunowudFlag(lunowudFlags, "-peep:match_dual_gemm=off");
+#endif
+#if NV_TENSORRT_MAJOR >= 11
+    // TRT dual-GEMM fusion miscompiles NVFP4 graphs; no known-good 11.x on sm12x
+    if (getSMVersion() / 10 == 12)
+    {
+        appendLunowudFlag(lunowudFlags, "-peep:match_dual_gemm=off");
+    }
 #endif
 #if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 15)
     appendLunowudFlag(lunowudFlags, "-mlir:autotune:num_threads=1");
