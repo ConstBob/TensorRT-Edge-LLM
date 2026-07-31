@@ -19,6 +19,7 @@ fallback for VLMs), runs ModelOpt quantization, and writes a unified safetensors
 checkpoint consumable by the checkpoint-based ``tensorrt_edgellm`` exporter.
 """
 
+import gc
 import json
 import os
 import shutil
@@ -256,7 +257,10 @@ def _load_model(model_dir, dtype="fp16", device="cuda"):
                     model_dir,
                     torch_dtype=torch_dtype,
                     trust_remote_code=True,
+                    low_cpu_mem_usage=True,
                 ).to(device)
+                gc.collect(
+                )  # release safetensor mmap handles after GPU transfer
                 break
             except (ValueError, KeyError) as e:
                 last_err = e

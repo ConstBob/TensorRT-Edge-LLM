@@ -816,8 +816,10 @@ def quantize_qwen3_omni(
             ) from error
         _model_cls = Qwen3OmniForConditionalGeneration
     model = _model_cls.from_pretrained(
-        model_dir, dtype=torch_dtype,
-        trust_remote_code=True).to(device).eval()
+        model_dir,
+        torch_dtype=torch_dtype,
+        trust_remote_code=True,
+        low_cpu_mem_usage=True).to(device).eval()
     if talker_accept_hidden_layer is None or talker_accept_hidden_layer < 0:
         talker_accept_hidden_layer = int(
             getattr(model.config.talker_config, "accept_hidden_layer"))
@@ -1343,13 +1345,17 @@ def _load_omni_model(model_dir: str, dtype: str, device: str):
         _patch_qwen3_omni_next_transformers()
         from transformers import Qwen3OmniNextForConditionalGeneration
         model = Qwen3OmniNextForConditionalGeneration.from_pretrained(
-            model_dir, torch_dtype=torch_dtype,
-            trust_remote_code=True).to(device)
+            model_dir,
+            torch_dtype=torch_dtype,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True).to(device)
     else:
         from transformers import Qwen3OmniForConditionalGeneration
         model = Qwen3OmniForConditionalGeneration.from_pretrained(
-            model_dir, torch_dtype=torch_dtype,
-            trust_remote_code=True).to(device)
+            model_dir,
+            torch_dtype=torch_dtype,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True).to(device)
 
     # Qwen3-Omni / Qwen3-Next Omni ForConditionalGeneration classes are
     # generation-only — they don't define forward(). ModelOpt's

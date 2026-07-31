@@ -36,6 +36,7 @@ The calibration forward drives all Linear modules with realistic
 activations produced from the unquantized base model's hidden states.
 """
 
+import gc
 import json
 import logging
 import os
@@ -523,7 +524,11 @@ def _load_base_for_calib(model_dir, dtype, device):
     torch_dtype = torch.float16 if dtype == "fp16" else torch.bfloat16
     tok = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
-        model_dir, torch_dtype=torch_dtype, trust_remote_code=True).to(device)
+        model_dir,
+        torch_dtype=torch_dtype,
+        trust_remote_code=True,
+        low_cpu_mem_usage=True).to(device)
+    gc.collect()  # release safetensor mmap handles after GPU transfer
     model.eval()
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
