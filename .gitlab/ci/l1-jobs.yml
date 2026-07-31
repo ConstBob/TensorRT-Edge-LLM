@@ -1113,6 +1113,7 @@ l1_jetson_orin_eagle:
 
 cleanup_l1_pipeline_cache:
   stage: .post
+  extends: .l1_rules
   dependencies: []
   variables:
     GIT_STRATEGY: none

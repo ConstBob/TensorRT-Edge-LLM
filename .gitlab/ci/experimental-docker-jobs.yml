@@ -28,13 +28,14 @@ l0_experimental_docker_jedha:
   rules:
     - if: $L1 == "true"
       when: never
+    # Stability must test TOT even when the merge commit has [skip tests].
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $L0_STABILITY == "true"
     - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
       when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TITLE =~ /\[skip tests\]/
       when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)\[skip tests\](,|$)/
       when: never
-    - if: $CI_PIPELINE_SOURCE == "schedule" && $L0_STABILITY == "true"
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       changes:
         - .dockerignore

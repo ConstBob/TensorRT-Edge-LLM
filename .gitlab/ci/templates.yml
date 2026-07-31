@@ -10,18 +10,19 @@
   rules:
     - if: $L1 == "true"
       when: never
-    - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
-      when: never
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TITLE =~ /\[skip tests\]/
-      when: never
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)\[skip tests\](,|$)/
-      when: never
+    # Stability must test TOT even when the merge commit has [skip tests].
     - if: $CI_PIPELINE_SOURCE == "schedule" && $L0_STABILITY == "true"
       variables:
         L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/STABILITY/${CI_PIPELINE_ID}"
         L0_ONNX_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/STABILITY/${CI_PIPELINE_ID}/onnx_cache"
         L0_ENVIRONMENT_NAME: "l0_cache/stability"
         L0_ONNX_REUSE: "0"
+    - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TITLE =~ /\[skip tests\]/
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)\[skip tests\](,|$)/
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       variables:
         L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
@@ -47,6 +48,9 @@
 
 .mr_and_l1_rules:
   rules:
+    # Explicit suites run even when the commit has [skip tests].
+    - if: $L1 == "true"
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $L0_STABILITY == "true"
     - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
       when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TITLE =~ /\[skip tests\]/
@@ -54,8 +58,6 @@
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)\[skip tests\](,|$)/
       when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_PIPELINE_SOURCE == "schedule" && $L0_STABILITY == "true"
-    - if: $L1 == "true"
 
 # ==============================================================================
 # SCRIPT TEMPLATES
