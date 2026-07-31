@@ -19,15 +19,16 @@
 
 .cutedsl_artifact_rules:
   rules:
+    # Explicit suites need these artifacts even when the commit has [skip tests].
+    - if: $L1 == "true"
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $L0_STABILITY == "true"
     - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
       when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TITLE =~ /\[skip tests\]/
       when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)\[skip tests\](,|$)/
       when: never
-    - if: $L1 == "true"
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == "main"
     - if: $CI_COMMIT_BRANCH =~ /^release/
 
 .cutedsl_builder_version:
