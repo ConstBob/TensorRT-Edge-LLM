@@ -638,11 +638,7 @@ bool EagleDecoder::runBaseModelVerification(DecodingInferenceContext& context)
                      {activeBatchSize, mRuntime.deployment.specConfig->verifySize, baseOutputHiddenDim}),
         "Tensor reshape failed");
 
-    // Pass the base cache manager's real page table (same source as the AttentionPlugin binding,
-    // see pipelineIO.cpp's kKVPageTable set) rather than the nullptr/identity default. Every base
-    // table is identity-mapped today (SharedResources::kvPageTables), so this is currently
-    // byte-equivalent to the old nullptr call, but wires the production path for future non-identity
-    // EAGLE reuse instead of silently mis-addressing accepted-KV writes once reuse lands.
+    // Accepted-KV writes must follow the same page table as the base AttentionPlugin binding.
     auto const& basePageTable = *mRuntime.base.sharedResources.kvPageTables[0];
     int32_t const* basePageTablePtr = basePageTable.kernelView().dataPointer<int32_t>();
     int32_t const baseMaxPagesPerSeq = basePageTable.maxPagesPerSeq();

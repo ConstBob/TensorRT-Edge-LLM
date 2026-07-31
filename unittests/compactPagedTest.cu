@@ -15,10 +15,8 @@
  * limitations under the License.
  */
 
-// Paged-pool compaction round-trip: HybridCacheManager::compactBatch must move each survivor's LIVE
-// PREFIX (not the full capPadded*H*D row) in BOTH the K-half and the V-half of the NHD pool
-// [2, maxBatch, capPadded, H, D], keeping row == physical slot (Phase-1 compaction discipline,
-// identity page table unchanged — the remap step arrives with reuse in MR 3).
+// Paged-pool compaction round-trip: HybridCacheManager::compactBatch moves each survivor's live
+// prefix in both active-slot K/V views while preserving row == physical slot.
 
 #include "common/cudaUtils.h"
 #include "runtime/hybridCacheManager.h"
@@ -110,12 +108,12 @@ TEST(CompactPagedTest, CompactMovesLivePrefixInBothHalves)
 
     rt::HybridCacheManager mgr(makeUniformAttnConfig(numLayers, maxBatch, maxSeq, numKVHeads, headDim), stream);
 
-    // Sentinel shape check: NHD [2, maxBatch, capPadded, H, D].
+    // Sentinel shape check: [2, numPages, kTOKENS_PER_PAGE, H, D].
     {
         auto const& shape = mgr.getCombinedKVCache(0).getShape();
         ASSERT_EQ(shape[0], 2);
-        ASSERT_EQ(shape[1], maxBatch);
-        ASSERT_EQ(shape[2], 128); // capPadded
+        ASSERT_EQ(shape[1], mgr.getKVCacheManager().numPages());
+        ASSERT_EQ(shape[2], rt::kTOKENS_PER_PAGE);
         ASSERT_EQ(shape[3], numKVHeads);
         ASSERT_EQ(shape[4], headDim);
     }

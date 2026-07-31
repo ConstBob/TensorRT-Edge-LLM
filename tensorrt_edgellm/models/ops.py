@@ -138,17 +138,14 @@ def attention_plugin(
     +-----------------------+--------------------+----------------------------+
 
     ``kv_page_table`` is a required ``[batch, 2, max_pages_per_seq]`` int32
-    per-request page table (K page ids then derived V page ids); the runtime
-    feeds an identity table by default (bit-equivalent to the non-paged path).
+    per-request page table (K page ids then derived V page ids).
 
     ``past_key_value`` / ``present_key_value`` are the same paged-pool
     allocation, in-place aliased by the TRT plugin (no growth per call —
     the pool is a fixed-size allocation and writes land at page-table
     positions). ``present_key_value`` therefore always has the exact same
-    shape as ``past_key_value``, whatever that is (all models — including
-    DFlash's combined draft cache — declare the pool shape ``[2, num_pages,
-    kTOKENS_PER_PAGE, num_kv_heads, head_size]``; DFlash recovers its logical
-    ``[2, max_batch, cap_padded, num_kv_heads, head_size]`` view at enqueue).
+    shape as ``past_key_value``. All models declare the pool shape
+    ``[2, num_pages, kTOKENS_PER_PAGE, num_kv_heads, head_size]``.
 
     ``enable_tree_attention``, ``enable_fp8_kv_cache``,
     ``enable_context_mask_selector``, ``enable_vision_block_attention``,
@@ -351,6 +348,7 @@ def dflash_target_kv_cache_update(
     rope_cos_sin: torch.Tensor,
     delta_start_positions: torch.Tensor,
     delta_lengths: torch.Tensor,
+    kv_page_table: torch.Tensor,
 ) -> torch.Tensor:
     """Update the draft combined KV cache with target-hidden-derived K/V delta.
 
@@ -358,13 +356,12 @@ def dflash_target_kv_cache_update(
     v_delta: [B, L, numKVHeads, headDim] FP16.
     past_key_value: [2, num_pages, KV_PAGE_SIZE, numKVHeads, headDim] FP16 —
         the paged KV pool (same contract as the AttentionPlugin kv_cache
-        binding). maxBatch/capPadded are recovered at enqueue time from
-        num_pages and the builder-configured pages_per_slot attribute (see
-        DFlashTargetKVCacheUpdatePlugin::setPagesPerSlot); this cache has no
-        page table of its own.
+        binding).
     rope_cos_sin: [ropeBatch, cosSinSeqLen, rotaryDim] FP32, cosSinSeqLen <= capPadded.
     delta_start_positions: [B] INT32, old committed draft target cache length.
     delta_lengths: [B] INT32, per-batch delta lengths.
+    kv_page_table: [B, 2, maxPagesPerSeq] INT32 with canonical K page ids in
+        [0, num_pages) and V page ids in [num_pages, 2 * num_pages).
 
     Applies RoPE to k_delta and writes k_rope + v_delta into the KV cache at
     positions [delta_start, delta_start + t) for each batch element, where
@@ -376,7 +373,7 @@ def dflash_target_kv_cache_update(
 
 @dflash_target_kv_cache_update.register_fake
 def _(k_delta, v_delta, past_key_value, rope_cos_sin, delta_start_positions,
-      delta_lengths):
+      delta_lengths, kv_page_table):
     return torch.empty_like(past_key_value)
 
 

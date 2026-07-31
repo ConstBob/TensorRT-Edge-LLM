@@ -17,7 +17,6 @@
 
 #include "common/cudaUtils.h"
 #include "common/pagedKvTypes.h"
-#include "kernels/contextAttentionKernels/utilKernels.h"
 #include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
 #include "runtime/state/kvPageTable.h"
 #include "testUtils.h"
@@ -28,125 +27,6 @@
 
 using namespace trt_edgellm;
 using namespace nvinfer1;
-
-struct KVCacheParameters
-{
-    int32_t numDecoderLayers;
-    int32_t maxBatchSize;
-    int32_t maxSequenceLength;
-    int32_t numKVHead;
-    int32_t headDim;
-};
-
-void TestKVCacheCopyWithTensor(KVCacheParameters const& cacheParams, int32_t copyBatchIdx, int32_t copySequenceLen)
-{
-    cudaStream_t stream{nullptr};
-
-    // The single-layer copy kernels operate on a classic HND single-layer buffer
-    // [maxBatchSize, 2, numKVHeads, maxSequenceLength, headDim]. The production NHD pool
-    // [2, maxBatch, capPadded, H, D] is exercised by the *batched* path (HybridCacheManager
-    // capture/restore) in hybridCacheManagerTests / sysPromptCachePagedTest; here we allocate a
-    // standalone HND buffer so this test stays a self-consistent unit test of the single-layer HND
-    // kernels (which have no production caller).
-    // Test each layer independently using single-layer kernel variants
-    for (int32_t idxL = 0; idxL < cacheParams.numDecoderLayers; idxL++)
-    {
-        rt::Tensor cacheTensor = rt::Tensor(
-            {2, cacheParams.numKVHead, copySequenceLen, cacheParams.headDim}, rt::DeviceType::kGPU, DataType::kHALF);
-        rt::Tensor kvCacheLayer = rt::Tensor(
-            {cacheParams.maxBatchSize, 2, cacheParams.numKVHead, cacheParams.maxSequenceLength, cacheParams.headDim},
-            rt::DeviceType::kGPU, DataType::kHALF);
-
-        // Instantiate the cache tensor with random data
-        std::vector<half> cacheDataHost(cacheTensor.getShape().volume(), 0.0f);
-        uniformFloatInitialization(cacheDataHost);
-
-        // Copy the cache tensor to the KVCache layer
-        CUDA_CHECK(cudaMemcpy(
-            cacheTensor.rawPointer(), cacheDataHost.data(), cacheTensor.getMemoryCapacity(), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemset(kvCacheLayer.rawPointer(), 0, kvCacheLayer.getMemoryCapacity()));
-
-        // Perform the copy from tensor to Cache and pull the data back to host.
-        std::vector<half> kvCacheLayerHost(kvCacheLayer.getShape().volume(), 0.0f);
-        kernel::instantiateKVCacheLayerFromTensor(kvCacheLayer, cacheTensor, copyBatchIdx, stream);
-        CUDA_CHECK(cudaMemcpyAsync(kvCacheLayerHost.data(), kvCacheLayer.rawPointer(), kvCacheLayer.getMemoryCapacity(),
-            cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-
-        // Verify the data in the KVCache layer
-        auto compareCacheAndTensorData = [&]() {
-            KvCacheIndexer indexer(
-                cacheParams.maxBatchSize, cacheParams.numKVHead, cacheParams.maxSequenceLength, cacheParams.headDim);
-            // tensorLayerOffset is 0 since the saved tensor is now per-layer [2, numKVHead, seqLen, headDim]
-            for (int32_t idxS = 0; idxS < copySequenceLen; idxS++)
-            {
-                for (int32_t idxKV = 0; idxKV < cacheParams.numKVHead; idxKV++)
-                {
-                    for (int32_t idxD = 0; idxD < cacheParams.headDim; idxD++)
-                    {
-                        // First compare K then V.
-                        // Saved tensor layout: [2, numKVHead, sequenceLength, headDim]
-                        int64_t srcKOffset
-                            = idxKV * copySequenceLen * cacheParams.headDim + idxS * cacheParams.headDim + idxD;
-                        int64_t dstKOffset = indexer.indexK(copyBatchIdx, idxKV, idxS, idxD);
-                        if (!isclose(kvCacheLayerHost[dstKOffset], cacheDataHost[srcKOffset], 1e-5, 1e-5))
-                        {
-                            std::cout << "Mismatch at layer " << idxL << ", sequence " << idxS << ", KV head " << idxKV
-                                      << ", dim " << idxD << std::endl;
-                            std::cout << "kvCacheLayerHost[dstKOffset]: " << __half2float(kvCacheLayerHost[dstKOffset])
-                                      << ", cacheDataHost[srcKOffset]: " << __half2float(cacheDataHost[srcKOffset])
-                                      << std::endl;
-                        }
-                        ASSERT_TRUE(isclose(kvCacheLayerHost[dstKOffset], cacheDataHost[srcKOffset], 1e-5, 1e-5));
-
-                        int64_t srcVOffset = (cacheParams.numKVHead + idxKV) * copySequenceLen * cacheParams.headDim
-                            + idxS * cacheParams.headDim + idxD;
-                        int64_t dstVOffset = indexer.indexV(copyBatchIdx, idxKV, idxS, idxD);
-                        ASSERT_TRUE(isclose(kvCacheLayerHost[dstVOffset], cacheDataHost[srcVOffset], 1e-5, 1e-5));
-                    }
-                }
-            }
-        };
-
-        compareCacheAndTensorData();
-        std::cout << "Tested copy from tensor to cache layer " << idxL << " with batchIdx " << copyBatchIdx
-                  << ", sequence length " << copySequenceLen
-                  << ", KVCacheLayer shape ([maxBatchSize, 2, numKVHeads, maxSequenceLength, headDim]): "
-                  << kvCacheLayer.getShape().formatString() << std::endl;
-
-        // cudaMemset the cache tensor and test from the other direction.
-        CUDA_CHECK(cudaMemsetAsync(cacheTensor.rawPointer(), 0, cacheTensor.getMemoryCapacity(), stream));
-        kernel::saveKVCacheLayerIntoTensor(cacheTensor, kvCacheLayer, copyBatchIdx, stream);
-        CUDA_CHECK(cudaMemcpyAsync(cacheDataHost.data(), cacheTensor.rawPointer(), cacheTensor.getMemoryCapacity(),
-            cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        compareCacheAndTensorData();
-
-        std::cout << "Tested copy from cache to tensor layer " << idxL << " with batchIdx " << copyBatchIdx
-                  << ", sequence length " << copySequenceLen
-                  << ", saved kvCacheTensor shape ([2, numKVHeads, sequenceLength, headDim]): "
-                  << cacheTensor.getShape().formatString() << std::endl;
-    }
-}
-
-TEST(KVCacheUtilKernelTests, TestKVCacheCopyWithTensor)
-{
-    // KVCache: 3 decoder layers, 8 max batch size, 1024 max sequence length, 4 KV heads, 128 head dim.
-    // Copy to batchIdx 0 with sequence length 128.
-    TestKVCacheCopyWithTensor({3, 8, 1024, 4, 128}, 0, 128);
-    // KVCache: 3 decoder layers, 8 max batch size, 1024 max sequence length, 4 KV heads, 128 head dim.
-    // Copy to batchIdx 1 with sequence length 97, which is not divisible by 2
-    TestKVCacheCopyWithTensor({3, 8, 1024, 4, 128}, 1, 97);
-    // KVCache: 3 decoder layers, 4 max batch size, 512 max sequence length, 7 KV heads, 64 head dim.
-    // Copy to batchIdx 0 with sequence length 96.
-    TestKVCacheCopyWithTensor({3, 4, 512, 7, 64}, 0, 96);
-    // KVCache: 3 decoder layers, 4 max batch size, 512 max sequence length, 7 KV heads, 64 head dim.
-    // Copy to batchIdx 1 with sequence length 47, which is not divisible by 4.
-    TestKVCacheCopyWithTensor({3, 4, 512, 7, 64}, 1, 47);
-    // KVCache: 28 decoder layers, 4 max batch size, 2048 max sequence length, 4 KV heads, 128 head dim.
-    // Copy to batchIdx 0 with sequence length 1010, simulate the Qwen2-VL config..
-    TestKVCacheCopyWithTensor({28, 1, 1024, 4, 128}, 0, 255);
-}
 
 //=============================================================================
 // gatherPagedKVToSplit tests
@@ -204,9 +84,7 @@ rt::Tensor makeKvSeqLens(std::vector<int32_t> const& lens)
 
 } // namespace
 
-// Identity page table: gatherPagedKVToSplit's output must match the existing
-// cvtKVLayoutBHSDToSplitKV kernel's output (FP16, no dtype conversion involved).
-TEST(GatherPagedKVToSplitTest, IdentityMatchesCvtKVLayoutBHSDToSplitKV)
+TEST(GatherPagedKVToSplitTest, IdentityMatchesHostReference)
 {
     cudaStream_t stream{nullptr};
     int32_t const B = 2, H = 3, D = 64, S = 257; // S spans 3 logical pages (2*128 + 1).
@@ -217,27 +95,6 @@ TEST(GatherPagedKVToSplitTest, IdentityMatchesCvtKVLayoutBHSDToSplitKV)
     std::vector<half> refK(splitVol), refV(splitVol);
     uniformFloatInitialization(refK, -4.f, 4.f);
     uniformFloatInitialization(refV, -4.f, 4.f);
-
-    // Reference: build a [B, 2, H, S, D] source and run the existing conversion kernel.
-    std::vector<half> bhsdSrc((size_t) B * 2 * H * S * D);
-    for (int32_t b = 0; b < B; ++b)
-        for (int32_t s = 0; s < S; ++s)
-            for (int32_t h = 0; h < H; ++h)
-                for (int32_t d = 0; d < D; ++d)
-                {
-                    size_t const kOff = (((((size_t) b * 2 + 0) * H + h) * S + s) * D + d);
-                    size_t const vOff = (((((size_t) b * 2 + 1) * H + h) * S + s) * D + d);
-                    bhsdSrc[kOff] = refK[splitIdx(b, s, h, d, S, H, D)];
-                    bhsdSrc[vOff] = refV[splitIdx(b, s, h, d, S, H, D)];
-                }
-    rt::Tensor srcTensor({B, 2, H, S, D}, rt::DeviceType::kGPU, DataType::kHALF);
-    copyHostToDevice(srcTensor, bhsdSrc);
-    rt::Tensor kRefTensor({B, S, H, D}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor vRefTensor({B, S, H, D}, rt::DeviceType::kGPU, DataType::kHALF);
-    kernel::cvtKVLayoutBHSDToSplitKV(srcTensor, kRefTensor, vRefTensor, rt::Tensor{}, S, stream);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    std::vector<half> const kRefHost = copyDeviceToHost<half>(kRefTensor);
-    std::vector<half> const vRefHost = copyDeviceToHost<half>(vRefTensor);
 
     // Paged pool + identity table (via KVPageTable) for gatherPagedKVToSplit.
     std::vector<half> const poolHost = buildIdentityFlatPool(refK, refV, B, S, H, D, pagesPerBatch);
@@ -258,18 +115,17 @@ TEST(GatherPagedKVToSplitTest, IdentityMatchesCvtKVLayoutBHSDToSplitKV)
     std::vector<half> const kOutHost = copyDeviceToHost<half>(kDstTensor);
     std::vector<half> const vOutHost = copyDeviceToHost<half>(vDstTensor);
 
-    ASSERT_EQ(kOutHost.size(), kRefHost.size());
+    ASSERT_EQ(kOutHost.size(), refK.size());
     for (size_t i = 0; i < kOutHost.size(); ++i)
     {
-        ASSERT_EQ(__half_as_ushort(kOutHost[i]), __half_as_ushort(kRefHost[i])) << "K byte mismatch at flat idx " << i;
-        ASSERT_EQ(__half_as_ushort(vOutHost[i]), __half_as_ushort(vRefHost[i])) << "V byte mismatch at flat idx " << i;
+        ASSERT_EQ(__half_as_ushort(kOutHost[i]), __half_as_ushort(refK[i])) << "K byte mismatch at flat idx " << i;
+        ASSERT_EQ(__half_as_ushort(vOutHost[i]), __half_as_ushort(refV[i])) << "V byte mismatch at flat idx " << i;
     }
 }
 
 // Dtype-agnostic byte-wise copy: a 1-byte element type (uint8_t, standing in for FP8's width) with an
 // identity page table must reproduce the source bytes exactly. gatherPagedKVToSplit never interprets
-// element values (unlike cvtKVLayoutBHSDToSplitKV's FP8 dequant path), so this is checked against a
-// host-computed reference rather than the existing conversion kernel.
+// element values, so this is checked against a host-computed reference.
 TEST(GatherPagedKVToSplitTest, IdentityByteCopyIsDtypeAgnostic)
 {
     cudaStream_t stream{nullptr};

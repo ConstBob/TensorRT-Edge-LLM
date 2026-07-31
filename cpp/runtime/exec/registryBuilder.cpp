@@ -459,9 +459,7 @@ TensorRegistry buildRegistryForDFlashDraft(DeploymentConfig const& bundle)
             }
             auto const& lc = cfg.kvLayerConfigs[localAttnIdx];
             // DFlash's own combined draft cache uses the same paged-pool contract and the exact
-            // serialized engine page count. Deployment validation separately requires this mode
-            // to use only its minimum active pages because its update plugin recovers maxBatch/cap by
-            // dividing numPages by the builder-configured pages_per_slot.
+            // serialized engine page count.
             int32_t const numPages = cfg.kvPoolPages;
             std::vector<ShapeDim> const shape{
                 fixed(2), fixed(numPages), fixed(kTokensPerPage), fixed(lc.numKVHeads), fixed(lc.headDim)};
@@ -599,9 +597,7 @@ TensorRegistry buildRegistryForDSparkDraft(DeploymentConfig const& bundle)
                 continue;
             }
             auto const& lc = cfg.kvLayerConfigs[localAttnIdx];
-            // DSpark uses the exact serialized engine page count. Deployment validation separately
-            // requires the minimum active pages because the update plugin derives (maxBatch, cap) from
-            // this count and the build-time pages_per_slot.
+            // DSpark uses the exact serialized engine page count.
             int32_t const numPages = cfg.kvPoolPages;
             std::vector<ShapeDim> const shape{
                 fixed(2), fixed(numPages), fixed(kTokensPerPage), fixed(lc.numKVHeads), fixed(lc.headDim)};

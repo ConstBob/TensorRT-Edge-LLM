@@ -645,39 +645,22 @@ void prepareEagleBaseTreeDecodingInputs(rt::Tensor const& baseTreeDecodingMask, 
         selectTokenIndices.dataPointer<int64_t>(), treeSize, treeSize);
 }
 
-// Resolves absolute token position `pos` of slot `kvBatchIdx` to a flat element offset into
-// `layerInfo.data`, which is a two-pool NHD buffer [2, maxBatch, capPadded(=maxSeqLen), numKVHeads,
-// HEAD_DIM] (K-half then V-half split OUTERMOST). `kvSel` is 0 for K, 1 for V.
-//
-// Identity-contiguous path (pageTable == nullptr): row `kvBatchIdx` of the
-// selected half, token `pos` — i.e. the NHD equivalent of the pre-paged-KV addressing.
-//
-// Paged path (pageTable != nullptr): `pos` is resolved to (page, offset) via pageTable's K row
-// (kvSel==0) or V row (kvSel==1), i.e. `pageTable[(kvBatchIdx*2+kvSel)*maxPagesPerSeq + pos/128]`.
-// Under an identity table this produces the exact same offset as the contiguous path (byte-identical
-// results), since a layer's own two-pool buffer IS the flat [2*numPages_layer, 128, H, D] pool the
-// page ids index into; a negative table entry means "unallocated" and the caller
-// should not be committing to that position (guarded defensively by returning -1).
+// Resolves logical token position `pos` through the required page table to a flat element
+// offset in the layer's [2, numPages, kTOKENS_PER_PAGE, numKVHeads, HEAD_DIM] pool.
+// `kvSel` is 0 for K and 1 for V. A negative page id is unmapped and returns -1.
 template <int32_t HEAD_DIM>
 __device__ __forceinline__ int64_t eagleResolveKVOffset(int32_t kvSel, int32_t headInKv, int32_t numKVHeads,
-    int32_t maxBatch, int32_t capPadded, int32_t kvBatchIdx, int32_t pos, int32_t const* pageTable,
-    int32_t maxPagesPerSeq, int32_t vecElemOffset)
+    int32_t kvBatchIdx, int32_t pos, int32_t const* pageTable, int32_t maxPagesPerSeq, int32_t vecElemOffset)
 {
     int64_t const tokenStride = static_cast<int64_t>(numKVHeads) * HEAD_DIM;
-    if (pageTable != nullptr)
+    int32_t const pageRow = pos / rt::kTOKENS_PER_PAGE;
+    int32_t const inPage = pos % rt::kTOKENS_PER_PAGE;
+    int32_t const pageId = pageTable[(static_cast<int64_t>(kvBatchIdx) * 2 + kvSel) * maxPagesPerSeq + pageRow];
+    if (pageId < 0)
     {
-        int32_t const pageRow = pos / rt::kTOKENS_PER_PAGE;
-        int32_t const inPage = pos % rt::kTOKENS_PER_PAGE;
-        int32_t const pageId = pageTable[(static_cast<int64_t>(kvBatchIdx) * 2 + kvSel) * maxPagesPerSeq + pageRow];
-        if (pageId < 0)
-        {
-            return -1; // unallocated page: caller must skip, so the sentinel must not be perturbed further
-        }
-        return (static_cast<int64_t>(pageId) * rt::kTOKENS_PER_PAGE + inPage) * tokenStride
-            + static_cast<int64_t>(headInKv) * HEAD_DIM + vecElemOffset;
+        return -1;
     }
-    return static_cast<int64_t>(kvSel) * maxBatch * capPadded * tokenStride
-        + static_cast<int64_t>(kvBatchIdx) * capPadded * tokenStride + static_cast<int64_t>(pos) * tokenStride
+    return (static_cast<int64_t>(pageId) * rt::kTOKENS_PER_PAGE + inPage) * tokenStride
         + static_cast<int64_t>(headInKv) * HEAD_DIM + vecElemOffset;
 }
 
@@ -702,14 +685,12 @@ __global__ void eagleBaseCommitKVCacheBatchedKernel(int32_t const* __restrict__ 
     //          group's maxKVHeads, so layers with fewer KV heads early-exit on extra CTAs.
     // Block: (HEAD_DIM / DVec<half>::vec_size, headPerBlock) — same as the original kernel.
     //
-    // Each layer's buffer is a two-pool NHD pool [2, maxBatch_i, capPadded_i(=maxSeqLen_i),
-    // numKVHeads_i, HEAD_DIM]. The kernel addresses through `layerInfos[layerIdx].data`.
+    // Each layer's buffer is a paged pool addressed through `layerInfos[layerIdx].data`.
 
     int32_t const layerIdx = blockIdx.y;
     KVLayerInfo const info = layerInfos[layerIdx];
     int32_t const numKVHeads = info.numKVHeads;
     int32_t const maxSeqLen = info.maxSeqLen; // capPadded
-    int32_t const maxBatch = info.maxBatch;
 
     int32_t const tIdx = threadIdx.x;
     int32_t const tIdy = threadIdx.y;
@@ -738,8 +719,8 @@ __global__ void eagleBaseCommitKVCacheBatchedKernel(int32_t const* __restrict__ 
         int32_t const acceptedIdx = acceptedIndices[kvBatchIdx * maxDepth + i];
         if (acceptedIdx >= 0 && acceptedIdx + pastKvCacheLength < maxSeqLen)
         {
-            int64_t const srcOffset = eagleResolveKVOffset<HEAD_DIM>(kvSel, headInKv, numKVHeads, maxBatch, maxSeqLen,
-                kvBatchIdx, pastKvCacheLength + acceptedIdx, pageTable, maxPagesPerSeq, tIdx * DVec<half>::vec_size);
+            int64_t const srcOffset = eagleResolveKVOffset<HEAD_DIM>(kvSel, headInKv, numKVHeads, kvBatchIdx,
+                pastKvCacheLength + acceptedIdx, pageTable, maxPagesPerSeq, tIdx * DVec<half>::vec_size);
             if (srcOffset >= 0)
             {
                 tempBuffer[i].load(kvCacheBuffer + srcOffset);
@@ -763,8 +744,8 @@ __global__ void eagleBaseCommitKVCacheBatchedKernel(int32_t const* __restrict__ 
     // PHASE 2: Write from local temp buffer to final positions
     for (int32_t i = 1; i < actualAcceptLength; ++i)
     {
-        int64_t const dstOffset = eagleResolveKVOffset<HEAD_DIM>(kvSel, headInKv, numKVHeads, maxBatch, maxSeqLen,
-            kvBatchIdx, pastKvCacheLength + i, pageTable, maxPagesPerSeq, tIdx * DVec<half>::vec_size);
+        int64_t const dstOffset = eagleResolveKVOffset<HEAD_DIM>(kvSel, headInKv, numKVHeads, kvBatchIdx,
+            pastKvCacheLength + i, pageTable, maxPagesPerSeq, tIdx * DVec<half>::vec_size);
         if (dstOffset >= 0)
         {
             tempBuffer[i].store(kvCacheBuffer + dstOffset);
@@ -847,6 +828,8 @@ void eagleBaseCommitKVCache(rt::Tensor const& acceptedIndices, rt::Tensor const&
         "acceptedIndices, acceptLengths, and kvCacheLengths should be INT32.");
     check::check(kvCacheType == DataType::kHALF || kvCacheType == DataType::kFP8, "kvCacheType should be HALF or FP8.");
     check::check(deviceLayerInfos != nullptr, "deviceLayerInfos must not be null.");
+    check::check(pageTable != nullptr, "pageTable must not be null.");
+    check::check(maxPagesPerSeq > 0, "maxPagesPerSeq must be positive.");
 
     if (numLayers == 0 || activeBatchSize == 0)
     {

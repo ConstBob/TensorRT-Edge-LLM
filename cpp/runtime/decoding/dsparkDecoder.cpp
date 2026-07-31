@@ -181,9 +181,7 @@ DSparkDecoder::DSparkDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
     mDraftTensorMap.set(binding_names::kContextLengths, mDraftContextLengths);
     mDraftTensorMap.set(binding_names::kDFlashDeltaLengths, mDraftDeltaLens);
 
-    // KV cache bindings: bind to draft cache manager's combined KV cache (index 1). DSpark
-    // uses the same cached-draft path as DFlash, so the engine expects the paged-pool view
-    // [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim], not the legacy slot-shaped alias.
+    // KV cache bindings: DSpark uses the same paged-pool contract as DFlash.
     {
         auto& kvMgr = mDraftCacheManager.getKVCacheManager();
         int32_t localAttnIdx = 0;
@@ -193,7 +191,7 @@ DSparkDecoder::DSparkDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
             {
                 continue;
             }
-            auto& combinedKV = kvMgr.getCombinedKVCachePoolView(localAttnIdx);
+            auto& combinedKV = kvMgr.getCombinedKVCache(localAttnIdx);
             mDraftTensorMap.set(binding_names::formatKVCacheName(localAttnIdx, /*isPast=*/true), combinedKV);
             mDraftTensorMap.set(binding_names::formatKVCacheName(localAttnIdx, /*isPast=*/false), combinedKV);
             ++localAttnIdx;
@@ -202,8 +200,7 @@ DSparkDecoder::DSparkDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
 
     mDraftTensorMap.set(binding_names::kKVCacheStartIndex, mDraftCacheManager.getKVCacheLengths());
 
-    // kv_page_table: static identity mapping for the draft's proposal self-attention
-    // (shared resource index 1), matching the draft paged-pool binding above.
+    // Draft page table (shared resource index 1).
     mDraftTensorMap.set(binding_names::kKVPageTable, mRuntime.base.sharedResources.kvPageTables[1]->kernelView());
 
     if (draftCfg.ropeConfig.type == RopeType::kMRope)

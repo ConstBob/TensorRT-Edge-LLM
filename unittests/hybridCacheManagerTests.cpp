@@ -72,9 +72,8 @@ void expectSlotEqHalf(rt::Tensor const& tensor, int32_t batchIdx, float expected
 
 // --- NHD-aware slot helpers --------------------------------------------------
 //
-// The per-layer KV pool is NHD [2, maxBatch, capPadded, H, D] with the K/V split OUTERMOST,
-// so a "batch slot" is NOT a single contiguous block of the combined tensor: it is row `b`
-// of the K-half pool PLUS row `b` of the V-half pool, which live one full half-pool apart.
+// A batch slot spans row `b` of the K half and row `b` of the V half, which live one full
+// half-pool apart.
 // getSeparateKVCache returns the K-half and V-half as [maxBatch, capPadded, H, D] views whose
 // dim 0 IS batch, so the plain fill/read/expect helpers above work directly on each view.
 
@@ -209,16 +208,15 @@ TEST(HybridCacheManagerTests, RoutingUniformKV)
 
     rt::HybridCacheManager mgr(cfg, stream);
 
-    // NHD pool layout [2, maxBatch, capPadded, H, D] with the K/V split OUTERMOST.
-    // maxSeq=128 -> capPadded = ceil(128/128)*128 = 128.
+    // Paged-pool layout [2, numPages, kTOKENS_PER_PAGE, H, D] with the K/V split outermost.
     for (int32_t i = 0; i < numLayers; ++i)
     {
         auto& t = mgr.getCombinedKVCache(i);
-        EXPECT_EQ(t.getShape()[0], 2);        // K/V split outermost
-        EXPECT_EQ(t.getShape()[1], maxBatch); // batch
-        EXPECT_EQ(t.getShape()[2], 128);      // capPadded
-        EXPECT_EQ(t.getShape()[3], 4);        // numKVHeads
-        EXPECT_EQ(t.getShape()[4], 64);       // headDim
+        EXPECT_EQ(t.getShape()[0], 2); // K/V split outermost
+        EXPECT_EQ(t.getShape()[1], mgr.getKVCacheManager().numPages());
+        EXPECT_EQ(t.getShape()[2], rt::kTOKENS_PER_PAGE);
+        EXPECT_EQ(t.getShape()[3], 4);  // numKVHeads
+        EXPECT_EQ(t.getShape()[4], 64); // headDim
     }
     EXPECT_THROW((void) mgr.getCombinedKVCache(-1), std::runtime_error);
     EXPECT_THROW((void) mgr.getCombinedKVCache(numLayers), std::runtime_error);

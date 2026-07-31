@@ -663,9 +663,9 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
                      {activeBatchSize, mRuntime.deployment.specConfig->verifySize, baseOutputHiddenDim}),
         "Tensor reshape failed");
 
-    // MTP intentionally still uses the identity-only default (no page table passed) here -- unlike
-    // eagleDecoder.cpp, MTP reuse is deferred so this call is not wired to the real
-    // base page table yet. Revisit together with EAGLE if/when MTP gains non-identity reuse support.
+    auto const& basePageTable = *mRuntime.base.sharedResources.kvPageTables[0];
+    int32_t const* basePageTablePtr = basePageTable.kernelView().dataPointer<int32_t>();
+    int32_t const baseMaxPagesPerSeq = basePageTable.maxPagesPerSeq();
 
     decoder_utils::clampAcceptLengthsToRemainingGeneration(context, mHostAcceptLengths, mAcceptLength, context.stream);
 
@@ -673,7 +673,7 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
     {
         kernel::eagleBaseCommitKVCache(mAcceptedTokenIndices, mAcceptLength, kvCacheLengths, group.deviceLayerInfos,
             group.numLayers, group.headDim, group.maxKVHeads, activeBatchSize, maxAcceptDepth, kvCacheType,
-            context.stream);
+            context.stream, basePageTablePtr, baseMaxPagesPerSeq);
     }
     kernel::eagleBaseAssembleHiddenState(
         mAcceptedTokenIndices, mAcceptLength, mRuntime.base.pipelineIO.baseHiddenStates, context.stream);

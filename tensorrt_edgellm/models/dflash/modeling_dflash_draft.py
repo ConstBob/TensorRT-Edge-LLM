@@ -24,18 +24,12 @@ tree attention enabled.
 Engine bindings (cached path):
     inputs_embeds        [B, BS, H]     Embedding of [y0, mask, mask, ..., mask]
     target_hidden_concat [B, L, Nl*H]   Target hidden DELTA from base
-    past_key_values_i    [2, num_pages, KV_PAGE_SIZE, Hkv, D]  Draft combined KV cache —
-                         the paged pool (same contract as the AttentionPlugin kv_cache
-                         binding). maxBatch/capPadded are recovered at enqueue time from
-                         numPages and the builder-configured pages_per_slot attribute
-                         (see DFlashTargetKVCacheUpdatePlugin::setPagesPerSlot); this cache
-                         has no page table of its own (identity-contiguous, reuse opt-out).
+    past_key_values_i    [2, num_pages, KV_PAGE_SIZE, Hkv, D]  Draft KV pool.
     rope_rotary_cos_sin  [1, capacity, rotaryDim]   Shared RoPE cache
     context_lengths      [B]            Total context length (target + proposal)
     kvcache_start_index  [B]            Draft cache start index (for delta write)
-    kv_page_table        [B, 2, max_pages_per_seq]  int32 page table (proposal
-                         self-attention only; the draft KV cache above has no
-                         page table of its own)
+    kv_page_table        [B, 2, max_pages_per_seq]  INT32 canonical page table for
+                         target-KV updates and proposal self-attention.
     attention_mask       [B, BS, divUp(BS,32)]  Packed proposal mask
     attention_pos_id     [B, BS]        Position IDs for proposal tokens
     logits               [B, BS, V]     Full vocab logits
@@ -188,7 +182,8 @@ class DFlashCachedAttention(nn.Module):
         """Forward with cached target K/V + proposal self-attention.
 
         Returns:
-            (attn_output [B, BS, H], present_key_value [B, 2, Hkv, capacity, D])
+            (attn_output [B, BS, H],
+             present_key_value [2, num_pages, KV_PAGE_SIZE, Hkv, D])
         """
         B, BS, _ = hidden_states.shape
         L = h_delta.shape[1]
@@ -203,11 +198,9 @@ class DFlashCachedAttention(nn.Module):
         if self.v_norm is not None:
             v_delta = self.v_norm(v_delta)
 
-        updated_kv = dflash_target_kv_cache_update(k_delta, v_delta,
-                                                   past_key_value,
-                                                   rope_cos_sin,
-                                                   kvcache_start_index,
-                                                   delta_lengths)
+        updated_kv = dflash_target_kv_cache_update(
+            k_delta, v_delta, past_key_value, rope_cos_sin,
+            kvcache_start_index, delta_lengths, kv_page_table)
 
         # --- Proposal self Q/K/V ---
         q = self.q_proj(hidden_states)  # [B, BS, Hq*D]
@@ -431,8 +424,8 @@ class DFlashDraftModel(nn.Module):
         delta_lengths: torch.Tensor,  # [B] INT32, per-batch delta lengths
         attention_mask: torch.Tensor,  # [B, BS, packedMaskLen] INT32
         attention_pos_id: torch.Tensor,  # [B, BS] INT32
-        past_key_values: List[
-            torch.Tensor],  # list of [B, 2, Hkv, capacity, D]
+        # Per-layer paged pools [2, num_pages, KV_PAGE_SIZE, Hkv, D].
+        past_key_values: List[torch.Tensor],
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """Forward pass.
 
@@ -538,9 +531,7 @@ class DFlashDraftModel(nn.Module):
                                        device=device)
 
         # Paged KV pool binding — same contract as the AttentionPlugin's kv_cache input:
-        # [2, num_pages, KV_PAGE_SIZE, numKVHeads, headDim]. See
-        # DFlashTargetKVCacheUpdatePlugin's input 2 doc; maxBatch/cap are recovered at
-        # enqueue time from the builder-configured pages_per_slot attribute.
+        # [2, num_pages, KV_PAGE_SIZE, numKVHeads, headDim].
         past_key_values = [
             torch.zeros(2,
                         1,

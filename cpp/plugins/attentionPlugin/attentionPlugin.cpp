@@ -111,6 +111,16 @@ constexpr int32_t kNUM_VISION_BLOCK_OPTIONAL_INPUTS{1};
 constexpr int32_t kNUM_SKIP_SCALE_OPTIONAL_INPUTS{1};
 constexpr int32_t kNUM_REQUIRED_OUTPUTS{2};
 
+int32_t getExpectedNbInputs(int32_t enableQKNorm, int32_t enableContextMaskSelector, int32_t enableTreeAttention,
+    int32_t enableVisionBlockAttention, float skipSoftmaxScaleFactor)
+{
+    return kNUM_REQUIRED_INPUTS + (enableQKNorm ? kNUM_QK_NORM_OPTIONAL_INPUTS : 0)
+        + (enableContextMaskSelector ? kNUM_CONTEXT_MASK_SELECTOR_OPTIONAL_INPUTS : 0)
+        + (enableTreeAttention ? kNUM_TREE_ATTN_OPTIONAL_INPUTS : 0)
+        + (enableVisionBlockAttention ? kNUM_VISION_BLOCK_OPTIONAL_INPUTS : 0)
+        + (skipSoftmaxScaleFactor > 0.F ? kNUM_SKIP_SCALE_OPTIONAL_INPUTS : 0);
+}
+
 // Dynamic input-index helpers for the optional inputs (positions depend on which optional
 // groups are enabled; qk_norm gammas always precede the tree-attention inputs).
 constexpr int32_t qNormGammaInputIdx()
@@ -379,12 +389,66 @@ size_t getAttentionWorkspaceSize(int64_t batchSize, int64_t seqLen, int64_t kvCa
     return workspaceSize;
 }
 
-// Shape check for splitPagedKV's getShape()[1] read: the kv_cache binding must be the paged-pool contract
-// [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim].
+bool isPagedPoolShape(Dims const& shape, int32_t numKVHeads, int32_t headSize, bool allowUnknownNumPages)
+{
+    if (shape.nbDims != 5)
+    {
+        return false;
+    }
+    bool const validNumPages = allowUnknownNumPages ? (shape.d[1] == -1 || shape.d[1] > 0) : shape.d[1] > 0;
+    return shape.d[0] == 2 && validNumPages && shape.d[2] == rt::kTOKENS_PER_PAGE && shape.d[3] == numKVHeads
+        && shape.d[4] == headSize;
+}
+
 bool isPagedPoolShape(rt::Coords const& shape, int32_t numKVHeads, int32_t headSize)
 {
     return shape.getNumDims() == 5 && shape[0] == 2 && shape[2] == rt::kTOKENS_PER_PAGE && shape[3] == numKVHeads
-        && shape[4] == headSize;
+        && shape[4] == headSize && shape[1] > 0;
+}
+
+bool isKVCacheDescriptor(PluginTensorDesc const& tensorDesc, bool enableFp8KVCache)
+{
+    return tensorDesc.type == (enableFp8KVCache ? DataType::kFP8 : DataType::kHALF)
+        && tensorDesc.format == TensorFormat::kLINEAR;
+}
+
+bool isKVPageTableDescriptor(PluginTensorDesc const& tensorDesc)
+{
+    return tensorDesc.type == DataType::kINT32 && tensorDesc.format == TensorFormat::kLINEAR;
+}
+
+bool haveSameShape(Dims const& lhs, Dims const& rhs)
+{
+    if (lhs.nbDims != rhs.nbDims)
+    {
+        return false;
+    }
+    for (int32_t dimIdx = 0; dimIdx < lhs.nbDims; ++dimIdx)
+    {
+        if (lhs.d[dimIdx] != rhs.d[dimIdx])
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool hasConcretePagedKVContract(Dims const& qkv, Dims const& kvCacheInput, Dims const& kvCacheOutput,
+    Dims const& kvPageTable, int32_t numKVHeads, int32_t headSize)
+{
+    return qkv.nbDims == 3 && qkv.d[0] > 0 && isPagedPoolShape(kvCacheInput, numKVHeads, headSize, false)
+        && haveSameShape(kvCacheInput, kvCacheOutput) && kvPageTable.nbDims == 3 && kvPageTable.d[0] == qkv.d[0]
+        && kvPageTable.d[1] == 2 && kvPageTable.d[2] > 0 && kvCacheInput.d[1] >= kvPageTable.d[2];
+}
+
+bool hasConcretePagedKVContract(PluginTensorDesc const* in, PluginTensorDesc const* out, int32_t numKVHeads,
+    int32_t headSize, bool enableFp8KVCache)
+{
+    return isKVCacheDescriptor(in[kIN_KV_CACHE_IDX], enableFp8KVCache)
+        && isKVCacheDescriptor(out[kOUT_KV_CACHE_IDX], enableFp8KVCache)
+        && isKVPageTableDescriptor(in[kIN_KV_PAGE_TABLE_IDX])
+        && hasConcretePagedKVContract(in[kIN_QKV_IDX].dims, in[kIN_KV_CACHE_IDX].dims, out[kOUT_KV_CACHE_IDX].dims,
+            in[kIN_KV_PAGE_TABLE_IDX].dims, numKVHeads, headSize);
 }
 
 } // namespace
@@ -395,26 +459,15 @@ std::vector<PluginField> AttentionPluginCreator::mPluginAttributes;
 
 REGISTER_TENSORRT_PLUGIN(AttentionPluginCreator);
 
-// WAR for independent split-KV prefill consumers (FMHA-v2 FP8, padding, and vision-block) that cannot read the
-// paged pool [2, numPages, 128, Hkv, D] directly and consume FP16 via dataPointer<half>().
-//
-// Design: ALWAYS device-gather the page table into an FP16 workspace -- never alias the pool in
-// place. Aliasing was only valid under a hardcoded identity-table guarantee whose release build silently
-// aliased the wrong pages for a non-identity table; selecting alias-vs-gather correctly requires knowing
-// the table's contiguity on the host, which needs a per-enqueue D2H stream sync on this path. Instead we
-// unconditionally gather: the gather follows any table (identity or scrambled) correctly and identically
-// in debug and release, and its cost is a single live-length copy for paths that require separate K/V. The gather also
-// dequantizes an FP8 pool to FP16 with the K/V scales, so consumers never reinterpret FP8 bytes as half,
+// FMHA-v2 fallback paths consume separate FP16 K/V tensors, so gather logical pages from the pool into workspace.
+// The gather follows the page table and dequantizes FP8 pools.
 std::pair<rt::Tensor, rt::Tensor> AttentionPlugin::splitPagedKV(rt::Tensor const& poolTensor, int32_t const* pageTable,
     int32_t const* kvSeqLens, int32_t maxPagesPerSeq, std::byte*& workspacePtr, int32_t batchSize, int32_t numKVHeads,
     int32_t capPadded, int32_t headSize, int32_t seqLen, float kScale, float vScale, cudaStream_t stream)
 {
-    // Single chokepoint for every splitPagedKV caller (FMHA-v2 FP8, padding, and vision-block):
-    // the pool binding must be [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim] before dim 1
-    // is trusted as numPages below.
+    // The pool binding is [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim].
     check::check(isPagedPoolShape(poolTensor.getShape(), numKVHeads, headSize),
-        "splitPagedKV: kv_cache binding is not the paged-pool contract [2, numPages, kTOKENS_PER_PAGE, "
-        "numKVHeads, headDim]; the export/builder KV-cache binding is not pool-shaped.");
+        "splitPagedKV requires kv_cache paged-pool contract [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim].");
 
     DataType const dtype = poolTensor.getDataType();
     // Split-K/V consumers read FP16. FP16 pools byte-copy; FP8 pools dequantize.
@@ -923,21 +976,8 @@ bool AttentionPlugin::supportsFormatCombination(
     };
 
     auto checkKVCache = [this](PluginTensorDesc const& tensorDesc) {
-        bool status{true};
-        // Support FP16 or FP8 storage;
-        if (mEnableFp8KVCache)
-        {
-            status &= (tensorDesc.type == DataType::kFP8);
-        }
-        else
-        {
-            status &= (tensorDesc.type == DataType::kHALF);
-        }
-        status &= tensorDesc.format == TensorFormat::kLINEAR;
-        // Paged pool [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim]: numPages is not known
-        // here, so only the rank is checked.
-        status &= tensorDesc.dims.nbDims == 5;
-        return status;
+        return isKVCacheDescriptor(tensorDesc, mEnableFp8KVCache)
+            && isPagedPoolShape(tensorDesc.dims, mNumKVHeads, mHeadSize, true);
     };
 
     auto checkSequenceLen = [](PluginTensorDesc const& tensorDesc) {
@@ -1024,18 +1064,15 @@ bool AttentionPlugin::supportsFormatCombination(
         return status;
     };
 
-    int32_t const expectedNbInputs = kNUM_REQUIRED_INPUTS + (mEnableQKNorm ? kNUM_QK_NORM_OPTIONAL_INPUTS : 0)
-        + (mEnableContextMaskSelector ? kNUM_CONTEXT_MASK_SELECTOR_OPTIONAL_INPUTS : 0)
-        + (mEnableTreeAttention ? kNUM_TREE_ATTN_OPTIONAL_INPUTS : 0)
-        + (mEnableVisionBlockAttention ? kNUM_VISION_BLOCK_OPTIONAL_INPUTS : 0)
-        + (mSkipSoftmaxScaleFactor > 0.F ? kNUM_SKIP_SCALE_OPTIONAL_INPUTS : 0);
+    int32_t const expectedNbInputs = getExpectedNbInputs(mEnableQKNorm, mEnableContextMaskSelector,
+        mEnableTreeAttention, mEnableVisionBlockAttention, mSkipSoftmaxScaleFactor);
     bool const checkNumIOs = nbInputs == expectedNbInputs && nbOutputs == kNUM_REQUIRED_OUTPUTS;
-    if (!checkNumIOs)
+    if (inOut == nullptr || !checkNumIOs || pos < 0 || pos >= nbInputs + nbOutputs)
     {
         LOG_ERROR(
-            "Invalid number of inputs or outputs for the AttentionPlugin '%s'. Expected %d inputs and %d outputs, but "
-            "got %d inputs and %d outputs.",
-            mLayerName.c_str(), expectedNbInputs, kNUM_REQUIRED_OUTPUTS, nbInputs, nbOutputs);
+            "Invalid format query for AttentionPlugin '%s': expected %d inputs and %d outputs, got %d inputs "
+            "and %d outputs at position %d.",
+            mLayerName.c_str(), expectedNbInputs, kNUM_REQUIRED_OUTPUTS, nbInputs, nbOutputs, pos);
         return false;
     }
 
@@ -1120,27 +1157,50 @@ bool AttentionPlugin::supportsFormatCombination(
     return result;
 }
 
-int32_t AttentionPlugin::configurePlugin([[maybe_unused]] DynamicPluginTensorDesc const* in,
-    [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] DynamicPluginTensorDesc const* out,
-    [[maybe_unused]] int32_t nbOutputs) noexcept
+int32_t AttentionPlugin::configurePlugin(
+    DynamicPluginTensorDesc const* in, int32_t nbInputs, DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept
 {
-    return 0; // No need to configure anything since we will only use the runtime tensor shapes.
+    int32_t const expectedNbInputs = getExpectedNbInputs(mEnableQKNorm, mEnableContextMaskSelector,
+        mEnableTreeAttention, mEnableVisionBlockAttention, mSkipSoftmaxScaleFactor);
+    if (in == nullptr || out == nullptr || nbInputs != expectedNbInputs || nbOutputs != kNUM_REQUIRED_OUTPUTS)
+    {
+        LOG_ERROR("AttentionPlugin: expected %d inputs and %d outputs, but got %d inputs and %d outputs.",
+            expectedNbInputs, kNUM_REQUIRED_OUTPUTS, nbInputs, nbOutputs);
+        return -1;
+    }
+
+    bool const matchingDescriptors = isKVCacheDescriptor(in[kIN_KV_CACHE_IDX].desc, mEnableFp8KVCache)
+        && isKVCacheDescriptor(out[kOUT_KV_CACHE_IDX].desc, mEnableFp8KVCache)
+        && isKVPageTableDescriptor(in[kIN_KV_PAGE_TABLE_IDX].desc);
+    bool const validProfiles = matchingDescriptors
+        && hasConcretePagedKVContract(in[kIN_QKV_IDX].min, in[kIN_KV_CACHE_IDX].min, out[kOUT_KV_CACHE_IDX].min,
+            in[kIN_KV_PAGE_TABLE_IDX].min, mNumKVHeads, mHeadSize)
+        && hasConcretePagedKVContract(in[kIN_QKV_IDX].opt, in[kIN_KV_CACHE_IDX].opt, out[kOUT_KV_CACHE_IDX].opt,
+            in[kIN_KV_PAGE_TABLE_IDX].opt, mNumKVHeads, mHeadSize)
+        && hasConcretePagedKVContract(in[kIN_QKV_IDX].max, in[kIN_KV_CACHE_IDX].max, out[kOUT_KV_CACHE_IDX].max,
+            in[kIN_KV_PAGE_TABLE_IDX].max, mNumKVHeads, mHeadSize);
+    if (!validProfiles)
+    {
+        LOG_ERROR(
+            "AttentionPlugin: KV cache profiles must use pool shape [2, N, %d, %d, %d], preserve the KV output "
+            "shape, and use INT32 LINEAR kv_page_table [B, 2, M] with B matching packed QKV and M <= N.",
+            rt::kTOKENS_PER_PAGE, mNumKVHeads, mHeadSize);
+        return -1;
+    }
+    return 0;
 }
 
 size_t AttentionPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
-    [[maybe_unused]] DynamicPluginTensorDesc const* outputs, [[maybe_unused]] int32_t nbOutputs) const noexcept
+    DynamicPluginTensorDesc const* outputs, int32_t nbOutputs) const noexcept
 {
-    // Guard against a stale pre-kv_page_table engine deserialized against this newer .so:
-    // that path skips supportsFormatCombination() and would index inputs out of bounds
-    // below. This method is noexcept with no failure sentinel, so log and return 0 instead of
-    // throwing (TRT calls it at context creation, surfacing the failure at load time).
-    if (nbInputs <= kIN_KV_PAGE_TABLE_IDX)
+    int32_t const expectedNbInputs = getExpectedNbInputs(mEnableQKNorm, mEnableContextMaskSelector,
+        mEnableTreeAttention, mEnableVisionBlockAttention, mSkipSoftmaxScaleFactor);
+    if (inputs == nullptr || outputs == nullptr || nbInputs != expectedNbInputs || nbOutputs != kNUM_REQUIRED_OUTPUTS)
     {
         LOG_ERROR(
-            "AttentionPlugin::getWorkspaceSize: nbInputs (%d) is too small for kv_page_table input index %d -- "
-            "this engine was likely serialized by an older, incompatible build of this plugin; re-export and "
-            "rebuild.",
-            nbInputs, kIN_KV_PAGE_TABLE_IDX);
+            "AttentionPlugin::getWorkspaceSize: expected %d inputs and %d outputs, but got %d inputs and %d "
+            "outputs.",
+            expectedNbInputs, kNUM_REQUIRED_OUTPUTS, nbInputs, nbOutputs);
         return 0;
     }
 
@@ -1206,10 +1266,18 @@ half const* AttentionPlugin::resolveNormGammaInput(
     return static_cast<half const*>(inputs[inputIdx]);
 }
 
-int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
-    [[maybe_unused]] PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs,
-    void* workspace, cudaStream_t stream)
+int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTensorDesc const* outputDesc,
+    void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream)
 {
+    check::check(inputDesc != nullptr && outputDesc != nullptr && inputs != nullptr && outputs != nullptr,
+        "AttentionPlugin received null enqueue descriptors or bindings.");
+    check::check(hasConcretePagedKVContract(inputDesc, outputDesc, mNumKVHeads, mHeadSize, mEnableFp8KVCache),
+        "AttentionPlugin requires kv_cache pool [2, N, kTOKENS_PER_PAGE, numKVHeads, headDim], identical KV input "
+        "and output shapes, and INT32 LINEAR kv_page_table [B, 2, M] with B matching packed QKV and M <= N.");
+    check::check(inputs[kIN_KV_CACHE_IDX] != nullptr && inputs[kIN_KV_PAGE_TABLE_IDX] != nullptr
+            && outputs[kOUT_KV_CACHE_IDX] != nullptr,
+        "AttentionPlugin requires non-null KV pool and page-table bindings.");
+
     // Packed QKV input, layout selected by the enable_kv_shared field:
     //   0: [B, S, (Hq+2*Hkv)*D] — Q+K+V; K/V are written to the KV cache.
     //   1: [B, S, Hq*D] — Q only; K/V come from a donated cache and are not written.
@@ -1260,7 +1328,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
 
     // Construct the KV cache tensors from the past-KV input descriptor. The buffer is the paged
     // pool [2, numPages, 128, Hkv, D] (K page array then V page array); the present-KV output
-    // in-place aliases it (output 1 aliases input 3). Shared-KV draft layers are read-only views
+    // in-place aliases it (output 1 aliases input 1). Shared-KV draft layers are read-only views
     // of the target/base cache, so they must read the input binding rather than the plugin's
     // present-KV output; the present-KV output is not consumed in shared-KV mode and must remain
     // unwritten by every shared-KV path below.
@@ -1273,27 +1341,6 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
     // numPages feeds native paged CuTe DSL prefill; writes and XQA decode derive
     // capacity from the page table.
     int32_t const numPages = static_cast<int32_t>(kvCacheInputDesc.dims.d[1]);
-
-#ifdef CUTE_DSL_FMHA_BLACKWELL_ENABLED
-    // Guard against a non-pool-shaped kv_cache binding reaching runPaged (CuTe DSL prefill): that
-    // kernel trusts dims.d[1] as numPages, so a legacy/mismatched binding (e.g. the pre-relayout
-    // [batch, 2, Hkv, capacity, D] shape) silently misreads numPages and corrupts prefill instead of
-    // failing loudly.
-    auto validatePagedKVCacheShape = [&]() -> bool {
-        bool const ok = isPagedPoolShape(rt::Coords{kvCacheInputDesc.dims}, mNumKVHeads, mHeadSize);
-        if (!ok)
-        {
-            LOG_ERROR(
-                "AttentionPlugin: kv_cache binding shape [%ld,%ld,%ld,%ld,%ld] does not match the required "
-                "paged-pool contract [2, numPages, %d, %d, %d] (runPaged reads numPages from dim 1); the "
-                "export/builder KV-cache binding is not pool-shaped.",
-                static_cast<long>(kvCacheInputDesc.dims.d[0]), static_cast<long>(kvCacheInputDesc.dims.d[1]),
-                static_cast<long>(kvCacheInputDesc.dims.d[2]), static_cast<long>(kvCacheInputDesc.dims.d[3]),
-                static_cast<long>(kvCacheInputDesc.dims.d[4]), rt::kTOKENS_PER_PAGE, mNumKVHeads, mHeadSize);
-        }
-        return ok;
-    };
-#endif
 
     // The runtime-supplied page table [batch, 2, maxPagesPerSeq] carries the K-then-V kernel view
     // (KVPageTable convention: V page id = K page id + numPages). It is a required input with no
@@ -1325,13 +1372,6 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
     float const skipSoftmaxThresholdLog2
         = computeSkipSoftmaxThreshold(skipSoftmaxScaleFactor, mSlidingWindowSize, kvCacheCapacity);
 #endif // CUTE_DSL_FMHA_BLACKWELL_ENABLED
-
-    // Batch-shaped view of the same pool buffer for the paged applyRopeWriteKV* kernels: they validate
-    // and index off a `[B, 2, Hkv, capPadded, D]` descriptor (the flat page pool addressed via the page
-    // table) rather than the raw pool binding `[2, numPages, 128, Hkv, D]`. Same base pointer.
-    rt::Tensor kvCacheWriteView(outputs[kOUT_KV_CACHE_IDX],
-        rt::Coords{runtimeBatchSize, 2, mNumKVHeads, kvCacheCapacity, mHeadSize}, rt::DeviceType::kGPU,
-        kvCacheInputDesc.type);
 
     // Optional inputs use the same compact dynamic ordering as supportsFormatCombination().
     bool const enableQKNorm = mEnableQKNorm != 0;
@@ -1460,10 +1500,6 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
 #ifdef CUTE_DSL_FMHA_BLACKWELL_ENABLED
             if (canUseCuteDslBidirectionalForPrefill())
             {
-                if (!validatePagedKVCacheShape())
-                {
-                    return 1;
-                }
                 int32_t const slidingWindow = mSlidingWindowSize > 0 ? mSlidingWindowSize - 1 : INT_MAX;
                 CuteDslFMHARunner runner(
                     mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen, kvCacheCapacity);
@@ -1495,7 +1531,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
             qInputTensor = assignTensorFromWorkspace(
                 alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
             kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor, rt::OptionalInputTensor{},
-                rt::OptionalInputTensor{}, packedQKVTensor, qInputTensor, kvCacheWriteView, kScale, vScale, stream,
+                rt::OptionalInputTensor{}, packedQKVTensor, qInputTensor, kvCacheTensor, kScale, vScale, stream,
                 pageTable, maxPagesPerSeq, nullptr /* kScratchOut */, nullptr /* vScratchOut */, nullptr /* fp8QOut */,
                 1.0f /* qScale */, qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal);
 
@@ -1584,11 +1620,6 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
         if (mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL
             && (!usePaddingContextMask || mCanImplementPaddingFMHA))
         {
-            if (!validatePagedKVCacheShape())
-            {
-                return 1;
-            }
-
             int32_t const slidingWindow
                 = (mSlidingWindowSize > 0 && !usePaddingContextMask) ? mSlidingWindowSize - 1 : INT_MAX;
             bool const fp8Input = !sharedKV && mEnableFp8KVCache;
@@ -1781,7 +1812,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                 // paged pool. The CuTe DSL runner reads K/V from the pool only.
                 kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor,
                     rt::OptionalInputTensor{kvCacheEndIdxsTensor}, rt::OptionalInputTensor{}, packedQKVTensor,
-                    qInputTensor, kvCacheWriteView, kScale, vScale, stream, pageTable, maxPagesPerSeq,
+                    qInputTensor, kvCacheTensor, kScale, vScale, stream, pageTable, maxPagesPerSeq,
                     nullptr /* kScratch */, nullptr /* vScratch */, fp8QTensor.rawPointer(), qScale,
                     qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal);
 
@@ -1802,7 +1833,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                 // The CuTe DSL runner reads K/V from the pool only.
                 kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor,
                     rt::OptionalInputTensor{kvCacheEndIdxsTensor}, rt::OptionalInputTensor{}, packedQKVTensor,
-                    qInputTensor, kvCacheWriteView, kScale, vScale, stream, pageTable, maxPagesPerSeq,
+                    qInputTensor, kvCacheTensor, kScale, vScale, stream, pageTable, maxPagesPerSeq,
                     nullptr /* kScratch */, nullptr /* vScratch */, nullptr /* fp8QOut */, 1.0f /* qScale */,
                     qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal);
 
@@ -1834,7 +1865,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                 // FP16 causal/sliding prefill writes K/V to the cache and reads that paged pool directly.
                 kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor,
                     rt::OptionalInputTensor{kvCacheEndIdxsTensor}, rt::OptionalInputTensor{}, packedQKVTensor,
-                    qInputTensor, kvCacheWriteView, kScale, vScale, stream, pageTable, maxPagesPerSeq,
+                    qInputTensor, kvCacheTensor, kScale, vScale, stream, pageTable, maxPagesPerSeq,
                     nullptr /* kScratch */, nullptr /* vScratch */, nullptr /* fp8QOut */, 1.0f /* qScale */,
                     qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal, rt::OptionalInputTensor{cuQSeqLensTensor});
 
@@ -1862,7 +1893,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                 {
                     kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor,
                         rt::OptionalInputTensor{kvCacheEndIdxsTensor}, rt::OptionalInputTensor{}, packedQKVTensor,
-                        qInputTensor, kvCacheWriteView, kScale, vScale, stream, pageTable, maxPagesPerSeq,
+                        qInputTensor, kvCacheTensor, kScale, vScale, stream, pageTable, maxPagesPerSeq,
                         nullptr /* kScratch */, nullptr /* vScratch */, nullptr /* fp8QOut */, 1.0f /* qScale */,
                         qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal);
 
@@ -1893,8 +1924,8 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                     vInputTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
                         {runtimeBatchSize, runtimeSeqLen, mNumKVHeads, mHeadSize}, DataType::kHALF);
                     kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor, rt::OptionalInputTensor{},
-                        rt::OptionalInputTensor{}, packedQKVTensor, qInputTensor, kvCacheWriteView, kScale, vScale,
-                        stream, pageTable, maxPagesPerSeq, kInputTensor.rawPointer(), vInputTensor.rawPointer(),
+                        rt::OptionalInputTensor{}, packedQKVTensor, qInputTensor, kvCacheTensor, kScale, vScale, stream,
+                        pageTable, maxPagesPerSeq, kInputTensor.rawPointer(), vInputTensor.rawPointer(),
                         nullptr /* fp8QOut */, 1.0f /* qScale */, qNormGammaDevicePtr, kNormGammaDevicePtr,
                         rmsNormEpsVal);
 
@@ -1944,7 +1975,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
             qInputTensor = assignTensorFromWorkspace(
                 alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
             kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor, rt::OptionalInputTensor{contextLengthTensor},
-                rt::OptionalInputTensor{attentionPosIdTensor}, packedQKVTensor, qInputTensor, kvCacheWriteView, kScale,
+                rt::OptionalInputTensor{attentionPosIdTensor}, packedQKVTensor, qInputTensor, kvCacheTensor, kScale,
                 vScale, stream, pageTable, maxPagesPerSeq, nullptr /* kScratch */, nullptr /* vScratch */,
                 nullptr /* fp8QOut */, 1.0f /* qScale */, qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal);
         }
@@ -1955,7 +1986,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
             qInputTensor = assignTensorFromWorkspace(
                 alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
             kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor, rt::OptionalInputTensor{contextLengthTensor},
-                rt::OptionalInputTensor{}, packedQKVTensor, qInputTensor, kvCacheWriteView, kScale, vScale, stream,
+                rt::OptionalInputTensor{}, packedQKVTensor, qInputTensor, kvCacheTensor, kScale, vScale, stream,
                 pageTable, maxPagesPerSeq, nullptr /* kScratch */, nullptr /* vScratch */, nullptr /* fp8QOut */,
                 1.0f /* qScale */, qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal);
         }
@@ -1964,8 +1995,8 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
         // requirement): newly generated tokens are text, so decode is pure
         // causal/sliding — identical masking to the non-vision path.
         // Cache-state parity: the vision prefill paths write the cache with
-        // launchApplyRopeWriteKV (roped K + original V into the paged pool
-        // via the batch-shaped write view) and the decode RoPE above appended the
+        // launchApplyRopeWriteKV (roped K + original V into the paged pool)
+        // and the decode RoPE above appended the
         // new token the same way as the non-vision path, so XQA reads exactly
         // the cache state it would see without vision.
 
@@ -2005,9 +2036,25 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
     return 0;
 }
 
-int32_t AttentionPlugin::onShapeChange([[maybe_unused]] PluginTensorDesc const* in, [[maybe_unused]] int32_t nbInputs,
-    [[maybe_unused]] PluginTensorDesc const* out, [[maybe_unused]] int32_t nbOutputs) noexcept
+int32_t AttentionPlugin::onShapeChange(
+    PluginTensorDesc const* in, int32_t nbInputs, PluginTensorDesc const* out, int32_t nbOutputs) noexcept
 {
+    int32_t const expectedNbInputs = getExpectedNbInputs(mEnableQKNorm, mEnableContextMaskSelector,
+        mEnableTreeAttention, mEnableVisionBlockAttention, mSkipSoftmaxScaleFactor);
+    if (in == nullptr || out == nullptr || nbInputs != expectedNbInputs || nbOutputs != kNUM_REQUIRED_OUTPUTS)
+    {
+        LOG_ERROR("AttentionPlugin: expected %d inputs and %d outputs, but got %d inputs and %d outputs.",
+            expectedNbInputs, kNUM_REQUIRED_OUTPUTS, nbInputs, nbOutputs);
+        return -1;
+    }
+    if (!hasConcretePagedKVContract(in, out, mNumKVHeads, mHeadSize, mEnableFp8KVCache))
+    {
+        LOG_ERROR(
+            "AttentionPlugin: kv_cache must use pool shape [2, N, %d, %d, %d], preserve its output shape, and "
+            "use INT32 LINEAR kv_page_table [B, 2, M] with B matching packed QKV and M <= N.",
+            rt::kTOKENS_PER_PAGE, mNumKVHeads, mHeadSize);
+        return -1;
+    }
     return 0;
 }
 

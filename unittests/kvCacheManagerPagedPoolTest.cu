@@ -15,17 +15,10 @@
  * limitations under the License.
  */
 
-// Unit tests for the paged-KV pool relayout of KVCacheManager.
+// Unit tests for KVCacheManager's paged-KV pools.
 //
-// Each attention layer's combined KV buffer is allocated slot-shaped as
-//     [2, maxBatchSize, capPadded, numKVHeads_i, headDim_i]
-// (token-major NHD within a slot, K/V split outermost), where
-//     capPadded = ceil(maxSequenceLength / kTOKENS_PER_PAGE) * kTOKENS_PER_PAGE.
-//
-// The same buffer is a bind-time reinterpretation of a page pool
-//     [2, numPages, kTOKENS_PER_PAGE, numKVHeads_i, headDim_i]   (numPages = maxBatchSize * capPadded /
-//     kTOKENS_PER_PAGE)
-// with kPoolPtr/vPoolPtr the two contiguous halves.
+// Each attention layer owns a page pool [2, numPages, kTOKENS_PER_PAGE,
+// numKVHeads_i, headDim_i] with kPoolPtr/vPoolPtr as the two contiguous halves.
 
 #include "common/pagedKvTypes.h"
 #include "common/tensor.h"
@@ -68,9 +61,8 @@ TEST(KvCacheManagerPagedPoolTest, RejectsOverflowGeometryBeforeAllocation)
     EXPECT_THROW(rt::KVCacheManager(config, /*stream=*/nullptr), std::runtime_error);
 }
 
-// The combined per-layer buffer is slot-shaped NHD [2, maxBatch, capPadded, H_i, D_i]. maxSeq
-// below (200) is deliberately NOT a multiple of 128 so the padding (-> 256) is exercised.
-TEST(KvCacheManagerPagedPoolTest, CombinedCacheIsSlotShapedWithPaddedCapacity)
+// maxSeq below (200) is deliberately NOT a multiple of 128 so the page count accounts for padding (-> 256).
+TEST(KvCacheManagerPagedPoolTest, CombinedCacheIsPoolShapedWithPaddedCapacity)
 {
     cudaStream_t stream{nullptr};
 
@@ -92,11 +84,11 @@ TEST(KvCacheManagerPagedPoolTest, CombinedCacheIsSlotShapedWithPaddedCapacity)
     {
         auto const& shape = mgr.getCombinedKVCache(i).getShape();
         ASSERT_EQ(shape.getNumDims(), 5) << "layer " << i;
-        EXPECT_EQ(shape[0], 2) << "layer " << i;         // K/V split outermost
-        EXPECT_EQ(shape[1], maxBatch) << "layer " << i;  // batch
-        EXPECT_EQ(shape[2], capPadded) << "layer " << i; // padded capacity (token-major)
-        EXPECT_EQ(shape[3], heads[i]) << "layer " << i;  // numKVHeads
-        EXPECT_EQ(shape[4], dims[i]) << "layer " << i;   // headDim
+        EXPECT_EQ(shape[0], 2) << "layer " << i;
+        EXPECT_EQ(shape[1], mgr.numPages()) << "layer " << i;
+        EXPECT_EQ(shape[2], rt::kTOKENS_PER_PAGE) << "layer " << i;
+        EXPECT_EQ(shape[3], heads[i]) << "layer " << i;
+        EXPECT_EQ(shape[4], dims[i]) << "layer " << i;
     }
 }
 
@@ -153,8 +145,8 @@ TEST(KvCacheManagerPagedPoolTest, Fp8PoolHasSameShapeAndCorrectByteOffset)
     auto const& shape = combined.getShape();
     ASSERT_EQ(shape.getNumDims(), 5);
     EXPECT_EQ(shape[0], 2);
-    EXPECT_EQ(shape[1], maxBatch);
-    EXPECT_EQ(shape[2], capPadded);
+    EXPECT_EQ(shape[1], mgr.numPages());
+    EXPECT_EQ(shape[2], rt::kTOKENS_PER_PAGE);
     EXPECT_EQ(shape[3], h);
     EXPECT_EQ(shape[4], d);
 
@@ -167,8 +159,6 @@ TEST(KvCacheManagerPagedPoolTest, Fp8PoolHasSameShapeAndCorrectByteOffset)
 }
 
 // Config::numPages may include extra retained pages beyond the minimum active pages.
-// numPages()/getCombinedKVCachePoolView() expose the configured count, while the active
-// slot-shaped views stay correctly addressed from the physical K/V pool bases.
 TEST(KvCacheManagerPagedPoolTest, ExtraRetainedPagesAllocateAndStayConsistent)
 {
     cudaStream_t stream{nullptr};
@@ -188,12 +178,9 @@ TEST(KvCacheManagerPagedPoolTest, ExtraRetainedPagesAllocateAndStayConsistent)
 
     EXPECT_EQ(mgr.numPages(), requestedPages);
     EXPECT_EQ(mgr.maxCapPadded(), padToPage(maxSeq));
-    EXPECT_THROW((void) mgr.getCombinedKVCache(0), std::runtime_error);
-
     for (int32_t i = 0; i < 2; ++i)
     {
-        // Pool-view binding dims reflect the requested (larger) page count.
-        auto const& poolShape = mgr.getCombinedKVCachePoolView(i).getShape();
+        auto const& poolShape = mgr.getCombinedKVCache(i).getShape();
         ASSERT_EQ(poolShape.getNumDims(), 5) << "layer " << i;
         EXPECT_EQ(poolShape[0], 2) << "layer " << i;
         EXPECT_EQ(poolShape[1], requestedPages) << "layer " << i;
@@ -208,8 +195,6 @@ TEST(KvCacheManagerPagedPoolTest, ExtraRetainedPagesAllocateAndStayConsistent)
             = static_cast<char const*>(mgr.kPoolPtr(i)) + kCacheElems * static_cast<int64_t>(elemSize);
         EXPECT_EQ(mgr.vPoolPtr(i), static_cast<void const*>(expectedV)) << "layer " << i;
 
-        // getSeparateKVCache still returns the slot view sized to the minimum active pages and based
-        // at the physical kPoolPtr/vPoolPtr bases.
         auto [kView, vView] = mgr.getSeparateKVCache(i);
         EXPECT_EQ(kView.rawPointer(), mgr.kPoolPtr(i)) << "layer " << i;
         EXPECT_EQ(vView.rawPointer(), mgr.vPoolPtr(i)) << "layer " << i;
