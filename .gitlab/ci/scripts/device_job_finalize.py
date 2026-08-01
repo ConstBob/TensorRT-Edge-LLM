@@ -149,6 +149,8 @@ def _collect_reports(target: str, workspace: str, password: str) -> None:
             "-e",
             "rsync",
             "-a",
+            "--no-owner",
+            "--no-group",
             "--delete",
             "--safe-links",
             "--timeout=60",

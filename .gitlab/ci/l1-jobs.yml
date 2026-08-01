@@ -1108,12 +1108,13 @@ l1_jetson_orin_eagle:
 # ==============================================================================
 # CLEANUP — Triggered when L1 pipeline environment is stopped
 # (auto-stop after 6 days per .l1_environment, or manually from GitLab UI).
-# Mirrors the L0 cleanup pattern in cleanup_l0_cache.
+# Mirrors the L0 environment-stop pattern in delete_l0_storage.
 # ==============================================================================
 
 cleanup_l1_pipeline_cache:
   stage: .post
   extends: .l1_rules
+  interruptible: false
   dependencies: []
   variables:
     GIT_STRATEGY: none
