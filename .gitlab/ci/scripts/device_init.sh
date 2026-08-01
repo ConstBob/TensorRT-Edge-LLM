@@ -47,8 +47,7 @@ for dir in $HOME/tensorrt-edge-llm*; do
     age_check=$(find "$dir" -maxdepth 0 -mmin +120 2>/dev/null || true)
     if [ -n "$age_check" ]; then
       echo "  removing stale: $dir"
-      printf '%s\n' "$board_password" | sudo -S chmod -R 777 "$dir" 2>/dev/null || true
-      printf '%s\n' "$board_password" | sudo -S rm -rf "$dir"
+      printf '%s\n' "$board_password" | sudo -S rm -rf -- "$dir"
     else
       echo "  keeping (recent): $dir"
     fi

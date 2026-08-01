@@ -13,9 +13,9 @@
     # Stability must test TOT even when the merge commit has [skip tests].
     - if: $CI_PIPELINE_SOURCE == "schedule" && $L0_STABILITY == "true"
       variables:
-        L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/STABILITY/${CI_PIPELINE_ID}"
-        L0_ONNX_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/STABILITY/${CI_PIPELINE_ID}/onnx_cache"
-        L0_ENVIRONMENT_NAME: "l0_cache/stability"
+        L0_STORAGE_KIND: "stability"
+        L0_ENVIRONMENT_NAME: "l0/stability_${CI_PIPELINE_ID}"
+        L0_STORAGE_RESOURCE_GROUP: "l0-stability-${CI_PIPELINE_ID}"
         L0_ONNX_REUSE: "0"
     - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
       when: never
@@ -25,16 +25,10 @@
       when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       variables:
-        L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
-        L0_ONNX_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache"
-        L0_ENVIRONMENT_NAME: "l0_cache/mr_${CI_MERGE_REQUEST_IID}"
+        L0_STORAGE_KIND: "mr"
+        L0_ENVIRONMENT_NAME: "l0/mr_${CI_MERGE_REQUEST_IID}"
+        L0_STORAGE_RESOURCE_GROUP: "l0-mr-${CI_MERGE_REQUEST_IID}"
         L0_ONNX_REUSE: "1"
-
-.l0_environment:
-  environment:
-    name: $L0_ENVIRONMENT_NAME
-    on_stop: cleanup_l0_cache
-    auto_stop_in: 30 days
 
 .l1_environment:
   environment:
@@ -62,6 +56,42 @@
 # ==============================================================================
 # SCRIPT TEMPLATES
 # ==============================================================================
+
+.l0_storage_paths:
+  variables:
+    L0_STORAGE_ENV_FILE: "$CI_PROJECT_DIR/.ci-l0-storage-${CI_JOB_ID}.env"
+  before_script:
+    - |
+      if ! command -v python3 >/dev/null 2>&1; then
+        bash .gitlab/ci/scripts/ci_apt.sh install python3
+      fi
+      python3 .gitlab/ci/scripts/ci_storage.py prepare-job \
+        --environment-file "$L0_STORAGE_ENV_FILE"
+      . "$L0_STORAGE_ENV_FILE"
+
+.l0_blackwell_exports:
+  variables:
+    L0_ONNX_CACHE_RELATIVE_PATH: "checkpoint_export/onnx"
+
+.l0_ampere_exports:
+  variables:
+    L0_ONNX_CACHE_RELATIVE_PATH: "checkpoint_export_ampere/onnx"
+
+.l0_storage_lifecycle:
+  image:
+    name: "$L0_STORAGE_IMAGE"
+    entrypoint: [""]
+  tags:
+    - cpu-k8s
+  variables:
+    GIT_STRATEGY: none
+  before_script:
+    - apk add --no-cache git
+    - git init
+    - git remote add origin "$CI_REPOSITORY_URL"
+    - git fetch --depth=1 --no-tags origin "$CI_COMMIT_SHA"
+    - git sparse-checkout set .gitlab/ci/scripts
+    - git checkout --detach FETCH_HEAD
 
 .record_runner_usage:
   after_script:
@@ -216,7 +246,7 @@
       rm -f "$JUNIT_REPORT"
     - |
       # ── Smart ONNX reuse decision ─────────────────────────────────────────
-      # MR L0 jobs opt in via ONNX_REUSE=1 and point ONNX_DIR at a stable cache.
+      # MR L0 jobs opt into reuse and share a cache throughout the MR lifecycle.
       # Scheduled stability and L1 exports leave reuse disabled so every run
       # exercises the exporter.
       # Re-export only when: [reexport] in the commit message, OR exporter/cache
@@ -284,8 +314,14 @@
     - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install pytest dependencies" -- pip3 install -r tests/requirements.txt
     - echo "Checkpoint exporter dependencies are provided by the package wheel"
     - export PYTHONPATH=$LLM_SDK_DIR:$PYTHONPATH
-    # Re-export from a clean cache so models dropped from the test list don't linger.
-    - if [ "${ONNX_REUSE:-0}" = "1" ]; then echo "Cleaning stale ONNX before re-export"; rm -rf "$ONNX_DIR"/*; mkdir -p "$ONNX_DIR"; fi
+    # Invalidate before mutating the cache so cancellation cannot publish partial output as reusable.
+    - |
+      if [ "${ONNX_REUSE:-0}" = "1" ]; then
+        echo "Invalidating cached ONNX before re-export"
+        rm -f "$META" "$META.tmp"
+        rm -rf "$ONNX_DIR"/*
+        mkdir -p "$ONNX_DIR"
+      fi
     - echo "Running checkpoint export tests with pytest. Time:$(date)"
     - |
       python3 -m pytest tests \
@@ -298,8 +334,13 @@
     - echo "HTML report saved to $TEST_LOG_DIR; JUnit report saved to $CI_PROJECT_DIR/.ci-reports"
     - echo "Models exported to cache directory $ONNX_DIR"
     - ls -la $ONNX_DIR
-    # Record the commit that produced this ONNX so later pipelines can decide reuse.
-    - if [ "${ONNX_REUSE:-0}" = "1" ]; then echo "$CI_COMMIT_SHA" > "$ONNX_DIR/.export_meta"; echo "Recorded export commit $CI_COMMIT_SHA in $ONNX_DIR/.export_meta"; fi
+    # Publish cache validity only after the complete export succeeds.
+    - |
+      if [ "${ONNX_REUSE:-0}" = "1" ]; then
+        printf '%s\n' "$CI_COMMIT_SHA" > "$META.tmp"
+        mv -f "$META.tmp" "$META"
+        echo "Recorded export commit $CI_COMMIT_SHA in $META"
+      fi
     - echo "Pipeline end time:$(date)"
   interruptible: true
 
@@ -353,17 +394,12 @@
     - |
       : "${TEST_LOG_DIR:?TEST_LOG_DIR must be set}"
       : "${ENGINE_DIR:?ENGINE_DIR must be set}"
-      : "${L0_ONNX_CACHE_DIR:?L0_ONNX_CACHE_DIR must be set}"
-      : "${NEMO_EVAL_ONNX_CACHE_NAME:?NEMO_EVAL_ONNX_CACHE_NAME must be set}"
-      export ONNX_DIR="$L0_ONNX_CACHE_DIR/$NEMO_EVAL_ONNX_CACHE_NAME/onnx"
+      : "${ONNX_DIR:?ONNX_DIR must be set}"
       echo "Using ONNX cache: $ONNX_DIR"
       if [ ! -d "$ONNX_DIR" ]; then
         echo "ONNX cache not found at $ONNX_DIR"
         exit 1
       fi
-    - mkdir -p "$TEST_LOG_DIR" "$ENGINE_DIR"
-    - rm -rf "${TEST_LOG_DIR:?}"/* "${ENGINE_DIR:?}"/*
-    - chmod -R 777 "$TEST_LOG_DIR"
     - echo "Installing dependencies"
     - export DEBIAN_FRONTEND=noninteractive
     - apt update -qq >/dev/null 2>&1
@@ -493,7 +529,7 @@
       esac
     - export REMOTE_CI_SCRIPT_DIR="$REMOTE_WORKSPACE/.gitlab/ci/scripts"
     - echo "Creating isolated remote workspace $REMOTE_WORKSPACE"
-    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "rm -rf -- '$REMOTE_WORKSPACE' && mkdir -p '$REMOTE_CI_SCRIPT_DIR' '$ENGINE_DIR'"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "umask 0000 && rm -rf -- '$REMOTE_WORKSPACE' && mkdir -p '$REMOTE_CI_SCRIPT_DIR' '$ENGINE_DIR'"
     - sshpass -p "$BOARD_PASSWORD_NVKS" scp -o StrictHostKeyChecking=no .gitlab/ci/scripts/ci_apt.sh .gitlab/ci/scripts/ci_run.sh "$BOARD_USER@$BOARD_IP:$REMOTE_CI_SCRIPT_DIR/"
     - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "chmod 755 '$REMOTE_CI_SCRIPT_DIR/ci_apt.sh' '$REMOTE_CI_SCRIPT_DIR/ci_run.sh'"
     - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "REMOTE_WORKSPACE='$REMOTE_WORKSPACE' CI_APT_SCRIPT='$REMOTE_CI_SCRIPT_DIR/ci_apt.sh' bash -s" < .gitlab/ci/scripts/device_init.sh
@@ -519,6 +555,7 @@
     - deactivate
     - echo "Pipeline end time:$(date)"
   after_script:
+    - if [ -f "$L0_STORAGE_ENV_FILE" ]; then . "$L0_STORAGE_ENV_FILE"; fi
     - python3 .gitlab/ci/scripts/device_job_finalize.py || true
     - !reference [.record_runner_usage, after_script]
 
@@ -562,6 +599,7 @@
         "REMOTE_WORKSPACE='$REMOTE_WORKSPACE' TRT_PACKAGE_DIR='$TRT_PACKAGE_DIR' PRIORITY='$PRIORITY' JUNIT_PREFIX='$CI_JOB_NAME_SLUG' CI_PIP_INSTALL_TIMEOUT_SECONDS='$CI_PIP_INSTALL_TIMEOUT_SECONDS' bash -s" \
         < .gitlab/ci/scripts/device_unit_tests.sh
   after_script:
+    - if [ -f "$L0_STORAGE_ENV_FILE" ]; then . "$L0_STORAGE_ENV_FILE"; fi
     - python3 .gitlab/ci/scripts/device_job_finalize.py --fetch-reports || true
     - !reference [.record_runner_usage, after_script]
 

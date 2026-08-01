@@ -2,42 +2,43 @@
 # SETUP JOBS
 # ==============================================================================
 
-# Cache cleanup for L0 directories
-l0_cache_cleanup:
+init_l0_storage:
+  stage: setup
+  script:
+    - python3 .gitlab/ci/scripts/ci_storage.py prepare-storage
+  resource_group: "$L0_STORAGE_RESOURCE_GROUP"
+  environment:
+    name: "$L0_ENVIRONMENT_NAME"
+    action: start
+    on_stop: delete_l0_storage
+    auto_stop_in: 30 days
+  extends:
+    - .l0_storage_lifecycle
+    - .l0_rules
+
+delete_l0_storage:
+  stage: setup
+  when: manual
+  allow_failure: true
+  interruptible: false
+  dependencies: []
+  script:
+    - python3 .gitlab/ci/scripts/ci_storage.py delete-storage
+  resource_group: "$L0_STORAGE_RESOURCE_GROUP"
+  environment:
+    name: "$L0_ENVIRONMENT_NAME"
+    action: stop
+  extends:
+    - .l0_storage_lifecycle
+    - .l0_rules
+
+prune_github_pr_storage:
   stage: setup
   tags:
     - a30-edgellm-nvks
   script:
-    - echo "Pipeline start time:$(date)"
-    - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
-    - echo "Starting cleanup for old L0 pipeline directories in $EDGE_LLM_CACHE_DIR/L0"
-    - echo "Current contents in $EDGE_LLM_CACHE_DIR/L0:"
-    - ls -la "$EDGE_LLM_CACHE_DIR/L0" || echo "Directory is empty or inaccessible"
-    - echo "Removing old pipeline directories and keeping only the latest pipeline per MR..."
-    - |
-      for MR_CACHE_DIR in "$EDGE_LLM_CACHE_DIR/L0"/MR_*; do
-        [ -d "$MR_CACHE_DIR" ] || continue
-        # Only consider numeric (pipeline ID) directories; skip any non-numeric dirs.
-        LATEST_PIPELINE=$(find "$MR_CACHE_DIR" -mindepth 1 -maxdepth 1 -type d -printf "%f\n" | awk '/^[0-9]+$/ { print }' | sort -n | tail -1)
-        [ -n "$LATEST_PIPELINE" ] || continue
-        echo "Keeping latest pipeline cache $MR_CACHE_DIR/$LATEST_PIPELINE"
-        find "$MR_CACHE_DIR" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended -regex '.*/[0-9]+' ! -name "$LATEST_PIPELINE" -exec rm -rf {} \; -print || true
-      done
-    - echo "Removing scheduled stability pipeline caches older than 3 days..."
-    - |
-      STABILITY_CACHE_DIR="$EDGE_LLM_CACHE_DIR/L0/STABILITY"
-      if [ -d "$STABILITY_CACHE_DIR" ]; then
-        find "$STABILITY_CACHE_DIR" -mindepth 1 -maxdepth 1 -type d -mtime +3 \
-          -exec rm -rf {} \; -print || true
-      fi
     - echo "Removing GitHub PR cache directories older than 3 days..."
     - find "$EDGE_LLM_CACHE_DIR/L0" -maxdepth 1 -type d -name "github_pr_*" -mtime +3 -exec rm -rf {} \; -print || true
-    - echo "Removing old CuTeDSL artifact directories older than 3 days..."
-    - CUTE_DSL_LATEST=$(basename "$(readlink "$EDGE_LLM_CACHE_DIR/L0/cutedsl_artifacts/main/latest" 2>/dev/null)" 2>/dev/null || true)
-    - if [ -n "$CUTE_DSL_LATEST" ]; then find "$EDGE_LLM_CACHE_DIR/L0/cutedsl_artifacts" -mindepth 2 -maxdepth 2 -type d -mtime +3 ! -name "$CUTE_DSL_LATEST" -exec rm -rf {} \; -print || true; else echo "No CuTeDSL latest symlink found; skipping CuTeDSL artifact cleanup"; fi
-    - echo "Cleanup completed. Remaining contents in $EDGE_LLM_CACHE_DIR/L0:"
-    - ls -la "$EDGE_LLM_CACHE_DIR/L0" || echo "Directory is empty or inaccessible"
-    - echo "Pipeline end time:$(date)"
   extends: .l0_rules
   interruptible: true
   allow_failure: true

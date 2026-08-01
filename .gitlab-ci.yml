@@ -10,6 +10,7 @@ variables:
   TRT10_X86_VERSION: "10.16.0.72"
   TRT10_THOR_VERSION: "10.16.0.72"
   TRT11_VERSION: "11.0.0.114"
+  L0_STORAGE_IMAGE: "python:3.12-alpine"
   SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar" # Defines the location of the analysis task cache
   GIT_DEPTH: "0" # Tells git to fetch all the branches of the project, required by the analysis task
   CI_PIP_INSTALL_TIMEOUT_SECONDS: "1200"
@@ -17,10 +18,13 @@ variables:
   CI_GIT_TIMEOUT_SECONDS: "300"
 
 default:
+  interruptible: true
   after_script:
     - !reference [.record_runner_usage, after_script]
 
 workflow:
+  auto_cancel:
+    on_new_commit: none
   rules:
     # Skip draft MRs completely
     - if: $CI_MERGE_REQUEST_TITLE =~ /^(\[Draft\]|\(Draft\)|Draft:)/
@@ -33,6 +37,8 @@ workflow:
       when: never
     # Run for non-draft MRs (L0 tests).
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      auto_cancel:
+        on_new_commit: interruptible
     # Run for main/release branches
     - if: $CI_COMMIT_BRANCH == "main"
     - if: $CI_COMMIT_BRANCH =~ /^release/
