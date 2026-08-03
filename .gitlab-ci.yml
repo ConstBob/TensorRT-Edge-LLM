@@ -17,6 +17,7 @@ variables:
   CI_PIP_INSTALL_TIMEOUT_SECONDS: "1200"
   CI_DOWNLOAD_TIMEOUT_SECONDS: "300"
   CI_GIT_TIMEOUT_SECONDS: "300"
+  EDGE_LLM_PIPELINE_NAME: ""
 
 default:
   interruptible: true
@@ -24,6 +25,7 @@ default:
     - !reference [.record_runner_usage, after_script]
 
 workflow:
+  name: "$EDGE_LLM_PIPELINE_NAME"
   auto_cancel:
     on_new_commit: none
   rules:
@@ -32,8 +34,12 @@ workflow:
       when: never
     # Run explicitly selected L1 pipelines, including existing schedules.
     - if: $L1 == "true"
+      variables:
+        EDGE_LLM_PIPELINE_NAME: "L1"
     # Run scheduled L0 stability pipelines only when explicitly selected.
     - if: $CI_PIPELINE_SOURCE == "schedule" && $L0_STABILITY == "true"
+      variables:
+        EDGE_LLM_PIPELINE_NAME: "L0 Stability"
     - if: $CI_PIPELINE_SOURCE == "schedule"
       when: never
     # Run for non-draft MRs (L0 tests).
