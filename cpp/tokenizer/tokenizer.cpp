@@ -77,7 +77,7 @@ Tokenizer::Tokenizer() noexcept
 {
 }
 
-bool Tokenizer::loadFromHF(std::filesystem::path const& modelDir)
+bool Tokenizer::loadFromHF(std::filesystem::path const& modelDir, bool requireChatTemplate)
 {
     if (!std::filesystem::exists(modelDir) || !std::filesystem::is_directory(modelDir))
     {
@@ -148,9 +148,14 @@ bool Tokenizer::loadFromHF(std::filesystem::path const& modelDir)
     // Pre-initialize Unicode lookup tables to avoid first-call latency during encode
     unicodeCptFlags(0);
 
-    // Load chat template (required)
+    // Load chat template (required unless the caller opts out, e.g. for
+    // decode-only ASR pipelines with no chat structure).
     std::filesystem::path const chatTemplatePath = modelDir / "processed_chat_template.json";
-    if (!loadChatTemplate(chatTemplatePath))
+    if (!requireChatTemplate && !std::filesystem::exists(chatTemplatePath))
+    {
+        LOG_INFO("No processed_chat_template.json (optional for this pipeline); chat template disabled.");
+    }
+    else if (!loadChatTemplate(chatTemplatePath))
     {
         LOG_ERROR(
             "Please ensure processed_chat_template.json exists in the model/engine directory, and it follows the "
@@ -279,6 +284,16 @@ bool Tokenizer::parseTokenizerConfig(
         else if (decType == "ByteFallback")
         {
             mByteFallbackDecode = true;
+        }
+        else if (decType == "Metaspace")
+        {
+            // SentencePiece-style decoder: word-boundary marker (default
+            // U+2581 "▁") becomes a space; with prepend_scheme != "never"
+            // the marker prepended to the first word yields a leading space
+            // that decode() must strip.
+            std::string replacement = decConfig.value("replacement", "\xE2\x96\x81");
+            mDecoderReplacements.emplace_back(std::move(replacement), " ");
+            mMetaspaceStripLeading = decConfig.value("prepend_scheme", "always") != "never";
         }
     }
 
@@ -871,6 +886,13 @@ std::string Tokenizer::decode(std::vector<Rank> const& tokens, bool skipSpecialT
             raw.replace(pos, pattern.size(), replacement);
             pos += replacement.size();
         }
+    }
+
+    // Metaspace prepend_scheme: the marker prepended to the first word
+    // becomes a leading space that HF's decoder strips.
+    if (mMetaspaceStripLeading && !raw.empty() && raw.front() == ' ')
+    {
+        raw.erase(0, 1);
     }
 
     // Route through the UTF-8 sanitizer to guarantee well-formed output. This

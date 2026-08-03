@@ -18,6 +18,7 @@
 #include "common/checkMacros.h"
 #include "common/stringUtils.h"
 #include "eagleAcceptKernels.h"
+#include "kernels/common/argmaxKernel.h"
 #include "speculativeKernelsUtils.h"
 #include <algorithm>
 #include <cassert>
@@ -121,80 +122,6 @@ struct top1MaxOpFunctor
 __forceinline__ size_t alignSharedMem(size_t size)
 {
     return ((size + 15) / 16) * 16; // Align to 16 bytes
-}
-
-static constexpr int32_t kSequentialArgmaxBlockSize = 256;
-
-__global__ void sequentialAcceptArgmaxKernel(
-    float const* __restrict__ logits, int32_t* __restrict__ argmaxResults, int32_t totalPositions, int32_t vocabSize)
-{
-    int32_t const posIdx = blockIdx.x;
-    if (posIdx >= totalPositions)
-    {
-        return;
-    }
-
-    float const* posLogits = logits + static_cast<int64_t>(posIdx) * vocabSize;
-
-    float localMax = -FLT_MAX;
-    int32_t localIdx = 0;
-
-    for (int32_t vocabIdx = threadIdx.x; vocabIdx < vocabSize; vocabIdx += blockDim.x)
-    {
-        float const value = posLogits[vocabIdx];
-        if (value > localMax || (value == localMax && vocabIdx < localIdx))
-        {
-            localMax = value;
-            localIdx = vocabIdx;
-        }
-    }
-
-    for (int32_t offset = 16; offset > 0; offset >>= 1)
-    {
-        float const otherMax = __shfl_down_sync(0xFFFFFFFF, localMax, offset);
-        int32_t const otherIdx = __shfl_down_sync(0xFFFFFFFF, localIdx, offset);
-        if (otherMax > localMax || (otherMax == localMax && otherIdx < localIdx))
-        {
-            localMax = otherMax;
-            localIdx = otherIdx;
-        }
-    }
-
-    __shared__ float sharedMaxValues[32];
-    __shared__ int32_t sharedMaxIndices[32];
-
-    int32_t const warpId = threadIdx.x / 32;
-    int32_t const laneId = threadIdx.x % 32;
-    int32_t const numWarps = (blockDim.x + 31) / 32;
-
-    if (laneId == 0)
-    {
-        sharedMaxValues[warpId] = localMax;
-        sharedMaxIndices[warpId] = localIdx;
-    }
-    __syncthreads();
-
-    if (warpId == 0)
-    {
-        float warpMax = (laneId < numWarps) ? sharedMaxValues[laneId] : -FLT_MAX;
-        int32_t warpIdx = (laneId < numWarps) ? sharedMaxIndices[laneId] : 0;
-
-        for (int32_t offset = 16; offset > 0; offset >>= 1)
-        {
-            float const otherMax = __shfl_down_sync(0xFFFFFFFF, warpMax, offset);
-            int32_t const otherIdx = __shfl_down_sync(0xFFFFFFFF, warpIdx, offset);
-            if (otherMax > warpMax || (otherMax == warpMax && otherIdx < warpIdx))
-            {
-                warpMax = otherMax;
-                warpIdx = otherIdx;
-            }
-        }
-
-        if (laneId == 0)
-        {
-            argmaxResults[posIdx] = warpIdx;
-        }
-    }
 }
 
 __global__ void sequentialAcceptWalkKernel(int32_t const* __restrict__ argmaxResults,
@@ -434,8 +361,8 @@ void sequentialAccept(rt::Tensor const& logits, rt::Tensor const& draftTokenIds,
     int32_t const totalPositions = batchSize * verifyLen;
     int32_t* argmaxResults = static_cast<int32_t*>(argmaxScratch.rawPointer());
 
-    sequentialAcceptArgmaxKernel<<<totalPositions, kSequentialArgmaxBlockSize, 0, stream>>>(
-        static_cast<float const*>(logits.rawPointer()), argmaxResults, totalPositions, vocabSize);
+    invokeRowwiseArgmax<float>(
+        static_cast<float const*>(logits.rawPointer()), totalPositions, vocabSize, argmaxResults, stream);
     CUDA_CHECK(cudaGetLastError());
 
     sequentialAcceptWalkKernel<<<batchSize, 1, 0, stream>>>(argmaxResults,

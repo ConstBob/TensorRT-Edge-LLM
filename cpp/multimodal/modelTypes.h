@@ -42,6 +42,7 @@ enum class ModelType
     GEMMA4_UNIFIED_AUDIO,          //!< Encoder-free Gemma4 Unified audio embedder
     NEMOTRON_OMNI_VISION_ENCODER,  //!< Nemotron-Omni vision encoder
     NEMOTRON_OMNI_AUDIO_ENCODER,   //!< Nemotron-Omni audio encoder
+    NEMOTRON3_5_ASR_AUDIO_ENCODER, //!< Nemotron-3.5-ASR FastConformer encoder (RNN-T)
     GEMMA4_AUDIO_ENCODER,          //!< Gemma4 audio encoder
     COSMOS3_EDGE,                  //!< Cosmos3-Edge reasoner vision encoder (SigLIP2 + PatchMerger)
     UNKNOWN                        //!< Unknown or unsupported model type
@@ -84,6 +85,8 @@ inline ModelType stringToModelType(std::string const& modelTypeStr)
         return ModelType::NEMOTRON_OMNI_VISION_ENCODER;
     if (modelTypeStr == "parakeet")
         return ModelType::NEMOTRON_OMNI_AUDIO_ENCODER;
+    if (modelTypeStr == "nemotron3_5_asr")
+        return ModelType::NEMOTRON3_5_ASR_AUDIO_ENCODER;
     if (modelTypeStr == "gemma4_audio")
         return ModelType::GEMMA4_AUDIO_ENCODER;
     if (modelTypeStr == "cosmos3_edge" || modelTypeStr == "cosmos3_edge_vision")

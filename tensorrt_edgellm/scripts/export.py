@@ -118,6 +118,7 @@ _VLM_MODEL_TYPES = frozenset([
 ])
 
 _AUDIO_MODEL_TYPES = frozenset([
+    "nemotron3_5_asr",
     "gemma4",
     "qwen3_asr",
     "qwen3_omni",
@@ -137,8 +138,11 @@ _AUDIO_MODEL_TYPES = frozenset([
 # Excludes Nemotron-Omni, which has its own field names
 # (``img_context_token_id`` / ``sound_context_token_id``) at the source-config
 # root and is handled by ``_collect_tokens_from_nemotron_root``.
+# ``nemotron3_5_asr`` is subtracted too: it is a pure RNN-T ASR model with no
+# LLM decoder at all (no ``thinker_config``, no ``user_token_id``), so the
+# Qwen-style multimodal-token patching does not apply.
 _ASR_LLM_MODEL_TYPES = (_AUDIO_MODEL_TYPES - _NEMOTRON_OMNI_MODEL_TYPES -
-                        {"gemma4_unified"})
+                        {"gemma4_unified", "nemotron3_5_asr"})
 
 _CODE2WAV_MODEL_TYPES = frozenset([
     "qwen3_omni",
@@ -162,6 +166,7 @@ _LLM_COMPONENTS: dict[str, frozenset[str]] = {
     # (``--cp_quantization fp8``); only the CodePredictor is re-exported
     # from it — thinker/talker/encoders come from the original HF root.
     "qwen3_omni_next_talker": frozenset(["code_predictor"]),
+    "nemotron3_5_asr": frozenset(),  # pure RNN-T transducer
 }
 _DEFAULT_LLM_COMPONENTS = frozenset(["thinker"])
 
@@ -174,17 +179,24 @@ def _has_audio(model_type: str) -> bool:
     return model_type in _AUDIO_MODEL_TYPES
 
 
+def _has_rnnt_decoder(model_type: str) -> bool:
+    """Whether ``model_type`` has an RNN-T (transducer) decoder-step engine
+    exported alongside its encoder — currently only Nemotron-3.5-ASR."""
+    return model_type == "nemotron3_5_asr"
+
+
 def _checkpoint_audio_config(config: dict) -> "dict | None":
     """Locate the audio-encoder config wherever the checkpoint stores it.
 
     Gemma4 / Gemma4-Unified keep ``audio_config`` at the root; Qwen3-ASR /
     Qwen3-Omni nest it under ``thinker_config``; Nemotron-Omni names it
-    ``sound_config``. Returns ``None`` when the checkpoint genuinely has no
-    audio encoder (e.g. Gemma4 dense with ``"audio_config": null``).
+    ``sound_config``; Nemotron-3.5-ASR names it ``encoder_config``. Returns
+    ``None`` when the checkpoint genuinely has no audio encoder (e.g. Gemma4
+    dense with ``"audio_config": null``).
     """
     return (config.get("audio_config")
             or (config.get("thinker_config") or {}).get("audio_config")
-            or config.get("sound_config"))
+            or config.get("sound_config") or config.get("encoder_config"))
 
 
 def _has_action(model_type: str) -> bool:
@@ -221,6 +233,7 @@ _DEFAULT_LAYOUT: dict[str, str] = {
     "talker": "talker",
     "code_predictor": "code_predictor",
     "audio": "audio",
+    "rnnt_decoder": "rnnt_decoder",
     "code2wav": "code2wav",
     "visual": "visual",
     "action": "action",
@@ -1860,6 +1873,19 @@ def _export_audio(model_dir: str,
     logger.info("[Audio] Done: %s", output_path)
 
     # Write config.json for the C++ runtime
+    if model_type == "nemotron3_5_asr":
+        # Nemotron-3.5-ASR keeps everything the encoder builder AND the RNN-T
+        # runtime need (``encoder_config``, ``decoder_hidden_size``,
+        # ``blank_token_id``, ``vocab_size``, ``num_decoder_layers``,
+        # ``default_prompt_id``, ...) at the config root, so pass it through
+        # verbatim. Both the encoder and the RNN-T step share this one file.
+        audio_cfg_out = dict(config)
+        cfg_out_path = os.path.join(audio_out_dir, "config.json")
+        with open(cfg_out_path, "w") as f:
+            json.dump(audio_cfg_out, f, indent=2)
+        logger.info("[Audio] Wrote config.json: %s", cfg_out_path)
+        _copy_asr_tokenizer(model_dir, audio_out_dir)
+        return
     if model_type == "gemma4_unified":
         audio_cfg = dict(config.get("audio_config") or {})
         audio_cfg["model_type"] = "gemma4_unified_audio"
@@ -1982,6 +2008,75 @@ def _export_audio(model_dir: str,
     with open(cfg_out_path, "w") as f:
         json.dump(audio_cfg_out, f, indent=2)
     logger.info("[Audio] Wrote config.json: %s", cfg_out_path)
+
+
+def _copy_asr_tokenizer(model_dir: str, out_dir: str) -> None:
+    """Copy the RNN-T tokenizer sidecar into the engine dir.
+
+    ``NemotronAsrRuntime`` detokenizes emitted RNN-T tokens with
+    ``tokenizer.json`` (``tokenizer_config.json`` is optional — special-token
+    config). Copying them here keeps the exported engine dir self-contained.
+    """
+    import shutil
+    for name in ("tokenizer.json", "tokenizer_config.json"):
+        src = os.path.join(model_dir, name)
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(out_dir, name))
+            logger.info("[Audio] Copied %s", name)
+        elif name == "tokenizer.json":
+            logger.warning(
+                "[Audio] %s not found in checkpoint — the RNN-T runtime "
+                "needs it to detokenize.", name)
+
+
+# ---------------------------------------------------------------------------
+# RNN-T decoder-step export (Nemotron-3.5-ASR)
+# ---------------------------------------------------------------------------
+
+
+def _export_rnnt_decoder(model_dir: str, out_dir: str, weights: dict,
+                         config: dict, dtype: "torch.dtype") -> None:
+    """Export the fused RNN-T step (LSTM prediction network + joint) to ONNX.
+
+    One decode step: ``(decoder_input_ids, hidden_state, cell_state,
+    encoder_frame) -> (logits, present_hidden_state, present_cell_state)``.
+    All-static shapes (the greedy loop lives in the C++ runtime).
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, "model.onnx")
+    logger.info("[RNN-T] Exporting decoder step to %s", output_path)
+    try:
+        from ..models.nemotron3_5_asr import build_nemotron3_5_asr_decoder
+        from ..onnx.export_encoder import _run_dynamo_export
+        step = build_nemotron3_5_asr_decoder(config, weights, dtype=dtype)
+        step = step.to("cpu").eval()
+        args_, input_names, output_names, dynamic_shapes = (
+            step.get_onnx_export_args(config, "cpu"))
+        _run_dynamo_export(step, args_, output_path, input_names, output_names,
+                           dynamic_shapes)
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.exception("[RNN-T] ONNX export failed")
+        raise SystemExit(1) from exc
+    logger.info("[RNN-T] Done: %s", output_path)
+
+    # Build-type marker sidecar: the C++ audioBuilder auto-detects the RNN-T
+    # step build from the ``rnnt_decoder_config`` key (the engine itself is
+    # fully static-shape). The runtime reads the full config from the encoder
+    # dir; the fields here are informational.
+    step_cfg = {
+        "model_type": "nemotron3_5_asr",
+        "rnnt_decoder_config": {
+            "blank_token_id": config.get("blank_token_id"),
+            "vocab_size": config.get("vocab_size"),
+            "decoder_hidden_size": config.get("decoder_hidden_size"),
+            "num_decoder_layers": config.get("num_decoder_layers", 2),
+            "max_symbols_per_step": config.get("max_symbols_per_step", 10),
+        },
+    }
+    cfg_out_path = os.path.join(out_dir, "config.json")
+    with open(cfg_out_path, "w") as f:
+        json.dump(step_cfg, f, indent=2)
+    logger.info("[RNN-T] Wrote config.json: %s", cfg_out_path)
 
 
 # ---------------------------------------------------------------------------
@@ -3955,15 +4050,27 @@ def main() -> None:
          lambda out: _export_code_predictor(model_dir, out, model_type)),
         (_has_visual(model_type) and not args.skip_visual and not _draft_only
          and _allow("visual"), "visual", _export_visual_component),
-        (_has_audio(model_type) and not args.skip_audio and not _draft_only
-         and _checkpoint_audio_config(config) is not None and _allow("audio"),
-         "audio", lambda out: _export_audio(model_dir,
-                                            out,
-                                            _get_weights(),
-                                            config,
-                                            model_type,
-                                            dtype,
-                                            model_config=_get_model_config())),
+        (
+            _has_audio(model_type) and not args.skip_audio and not _draft_only
+            and _checkpoint_audio_config(config) is not None
+            and _allow("audio"),
+            "audio",
+            lambda out: _export_audio(
+                model_dir,
+                out,
+                _get_weights(),
+                config,
+                model_type,
+                dtype,
+                # Nemotron-3.5-ASR has no LLM backbone, so the LLM-oriented
+                # ModelConfig (which requires a top-level ``hidden_size``) does
+                # not apply; its fp16 encoder does not need it.
+                model_config=(None if model_type == "nemotron3_5_asr" else
+                              _get_model_config()))),
+        (_has_rnnt_decoder(model_type) and not args.skip_audio
+         and not _draft_only and _checkpoint_audio_config(config) is not None
+         and _allow("rnnt_decoder"), "rnnt_decoder", lambda out:
+         _export_rnnt_decoder(model_dir, out, _get_weights(), config, dtype)),
         (_has_code2wav(model_type) and not args.skip_code2wav
          and not _draft_only and _allow("code2wav"), "code2wav",
          lambda out: _export_code2wav(model_dir, out, _get_code2wav_weights(),
