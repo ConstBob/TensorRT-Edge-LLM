@@ -102,6 +102,36 @@ def _is_phi4mm_model(model_dir: str) -> bool:
         return False
 
 
+def _pre_register_phi4mm_attention_for_kv_quant(
+        model: torch.nn.Module) -> None:
+    # ModelOpt's register_hf_attentions_on_the_fly short-circuits when ANY
+    # attention in the model uses the new ALL_ATTENTION_FUNCTIONS interface
+    # (SiglipAttention in the visual encoder), so Phi4MMAttention (text
+    # decoder, older-style trust_remote_code module) is never registered for
+    # KV-cache BMM quantization.  Pre-register it explicitly before mtq.quantize.
+    import logging
+
+    from modelopt.torch.quantization.conversion import QuantModuleRegistry
+    from modelopt.torch.quantization.plugins.attention import \
+        register_attention_for_kv_quant
+    logger = logging.getLogger(__name__)
+    registered: set[type] = set()
+    for _, module in model.named_modules():
+        attn_type = type(module)
+        # trust_remote_code classes are loaded under 'transformers_modules';
+        # match on __module__ so this survives class renames.
+        if (getattr(attn_type, "__module__",
+                    "").startswith("transformers_modules")
+                and hasattr(module, "k_proj") and attn_type not in registered
+                and QuantModuleRegistry.get(attn_type) is None):
+            register_attention_for_kv_quant(attn_type)
+            registered.add(attn_type)
+    if not registered:
+        logger.warning(
+            "_pre_register_phi4mm_attention_for_kv_quant: no trust_remote_code "
+            "attention modules found; KV-cache pre-registration skipped")
+
+
 def _copy_phi4mm_processor_files(model_dir: str, output_dir: str) -> None:
     for name in ("preprocessor_config.json", "processor_config.json",
                  "processing_phi4mm.py"):
@@ -831,6 +861,8 @@ def quantize_and_export(
                     print(
                         f"[int4] skipping {name}: weight [{module.out_features}, "
                         f"{module.in_features}] not 64-aligned (kept fp16)")
+        if kv_cache_quantization is not None and _is_phi4mm_model(model_dir):
+            _pre_register_phi4mm_attention_for_kv_quant(model)
         if cp_quantization is not None and is_qwen3_next_omni(model):
             # Qwen3-Omni Next (dense + MoE share the class): the Talker fires
             # the CP inside its own generate loop, so calibration drives the
