@@ -62,10 +62,11 @@ forwards its activated library and include paths to the native build host.
 `--run-python /absolute/python` selects the interpreter used for native E2E
 tests when CI provides one with Edge-LLM's Python dependencies.
 
-D7L cross-builds default to the existing
-`/usr/local/cuda-13.2/targets/sbsa-linux` CUDA target directory. Override it
-for a provisioned target with `--cuda-target-dir /absolute/cuda-target-dir` or
-`TRT_CI_CUDA_TARGET_DIR`.
+D7L cross-builds use separate generic CUDA and Thor target directories. They
+default to `/usr/local/cuda/targets/aarch64-linux` and
+`/usr/local/cuda/thor/targets/aarch64-linux`, respectively. Override them with
+`--cuda-dir` and `--cuda-target-dir`, or with the equivalent
+`TRT_CI_CUDA_DIR` and `TRT_CI_CUDA_TARGET_DIR` environment variables.
 
 Each host argument may be an inline JSON object or a JSON file.
 

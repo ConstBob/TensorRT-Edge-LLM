@@ -77,8 +77,9 @@ _CONNECTION_TIMEOUT_S = 30
 _TRANSFER_TIMEOUT_S = 1800
 _TEST_TIMEOUT_S = 3600
 _JOBS = 16
+_DEFAULT_D7L_CUDA_DIR = PurePosixPath("/usr/local/cuda/targets/aarch64-linux")
 _DEFAULT_D7L_CUDA_TARGET_DIR = PurePosixPath(
-    "/usr/local/cuda-13.2/targets/sbsa-linux")
+    "/usr/local/cuda/thor/targets/aarch64-linux")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -314,6 +315,7 @@ class Config:
     cuda_root: PurePosixPath | None = None
     cuda_version: str | None = None
 
+    cuda_dir: PurePosixPath | None = None
     cuda_target_dir: PurePosixPath | None = None
     run_python: PurePosixPath | None = None
 
@@ -333,6 +335,8 @@ class Config:
         if self.cuda_root is not None and not _safe_path(self.cuda_root):
             raise ValueError("cuda_root must be an absolute, non-root path")
 
+        if self.cuda_dir is not None and not _safe_path(self.cuda_dir):
+            raise ValueError("cuda_dir must be an absolute, non-root path")
         if (self.cuda_target_dir is not None
                 and not _safe_path(self.cuda_target_dir)):
             raise ValueError(
@@ -492,6 +496,7 @@ def build_targets(config: Config) -> list[ArtifactTarget]:
     native_x86 = (config.no_trt_containers
                   and config.architecture is Arch.X86_64)
 
+    d7l_cuda_dir = config.cuda_dir or _DEFAULT_D7L_CUDA_DIR
     d7l_cuda_target_dir = (config.cuda_target_dir
                            or _DEFAULT_D7L_CUDA_TARGET_DIR)
     platform = PlatformConfig(
@@ -502,7 +507,7 @@ def build_targets(config: Config) -> list[ArtifactTarget]:
         f"-DCMAKE_TOOLCHAIN_FILE={config.source_root}/cmake/aarch64_linux_toolchain.cmake",
         "-DEMBEDDED_TARGET=auto-thor",
 
-        f"-DCUDA_DIR={d7l_cuda_target_dir}",
+        f"-DCUDA_DIR={d7l_cuda_dir}",
         f"-DCUDA_TARGET_DIR={d7l_cuda_target_dir}",
     ] if config.architecture is Arch.D7L else (
         [
@@ -651,8 +656,9 @@ def _build_on_host(config: Config, commands: Any, target: Any,
     if config.architecture is Arch.D7L:
         platform = dataclasses.replace(
             platform, cuda_version=platform.arch.default_cuda_version)
-    edge = dataclasses.replace(
-        edge, platform=dataclasses.replace(platform, ubuntu_version="24.04"))
+    edge = dataclasses.replace(edge,
+                               platform=dataclasses.replace(
+                                   platform, ubuntu_version="24.04"))
     result = commands.run(
         target,
         CommandSpec(
@@ -1068,8 +1074,9 @@ def _test_command(config: Config, runtime: Runtime) -> str:
         for model in config.model_cases)
     use_host_python = (config.no_trt_containers
                        or config.architecture is Arch.D7L)
-    python = (str(config.run_python) if use_host_python and config.run_python
-              is not None else ("python3" if use_host_python else str(_PYTHON)))
+    python = (str(config.run_python)
+              if use_host_python and config.run_python is not None else
+              ("python3" if use_host_python else str(_PYTHON)))
     python_path = "" if use_host_python else f"export PATH={q(str(_PYTHON.parent))}:$PATH\n"
     return f"""set -euo pipefail
 source {q(str(runtime.env_script))}
@@ -1131,9 +1138,15 @@ def _parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--cuda-dir",
+        type=PurePosixPath,
+        help=("CUDA toolkit directory for D7L cross-builds "
+              "(env: TRT_CI_CUDA_DIR)"),
+    )
+    parser.add_argument(
         "--cuda-target-dir",
         type=PurePosixPath,
-        help=("CUDA target directory for D7L cross-builds "
+        help=("CUDA platform target directory for D7L cross-builds "
               "(env: TRT_CI_CUDA_TARGET_DIR)"),
     )
     parser.add_argument(
@@ -1180,10 +1193,12 @@ def _config(args: argparse.Namespace) -> Config:
     if cuda_root is None and os.environ.get("TRT_CI_CUDA_ROOT"):
         cuda_root = PurePosixPath(os.environ["TRT_CI_CUDA_ROOT"])
 
+    cuda_dir = args.cuda_dir
+    if cuda_dir is None and os.environ.get("TRT_CI_CUDA_DIR"):
+        cuda_dir = PurePosixPath(os.environ["TRT_CI_CUDA_DIR"])
     cuda_target_dir = args.cuda_target_dir
     if cuda_target_dir is None and os.environ.get("TRT_CI_CUDA_TARGET_DIR"):
-        cuda_target_dir = PurePosixPath(os.environ[
-            "TRT_CI_CUDA_TARGET_DIR"])
+        cuda_target_dir = PurePosixPath(os.environ["TRT_CI_CUDA_TARGET_DIR"])
     onnx_dir = os.environ.get("TRT_CI_ONNX_DIR")
     if onnx_dir is None:
         raise ValueError("TRT_CI_ONNX_DIR must be set")
@@ -1229,6 +1244,7 @@ def _config(args: argparse.Namespace) -> Config:
         cuda_version=(args.cuda_version
                       or os.environ.get("TRT_CI_CUDA_VERSION")),
 
+        cuda_dir=cuda_dir,
         cuda_target_dir=cuda_target_dir,
         run_python=args.run_python,
     )
