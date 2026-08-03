@@ -71,6 +71,8 @@ std::string applyCompileWorkarounds([[maybe_unused]] int32_t maxBatchSize)
     appendLunowudFlag(lunowudFlags, "-mlir:autotune:num_threads=1");
     appendLunowudFlag(lunowudFlags, "-mlir:collective:fp4=off");
     appendLunowudFlag(lunowudFlags, "-cask_fusion:async_policy=1");
+#endif
+#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 13)
     if (maxBatchSize == 1)
     {
         appendLunowudFlag(lunowudFlags, "-peep:fc_h_fusion=off");
