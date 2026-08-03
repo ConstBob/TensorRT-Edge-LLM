@@ -369,7 +369,7 @@
     - echo "Installing accuracy dependencies"
     - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install accuracy dependencies" -- pip3 install -r examples/accuracy/requirements.txt
     - echo "Installing TensorRT Python package from cache"
-    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install TensorRT Python package" -- pip3 install $TRT_PACKAGE_DIR/python/tensorrt-$TRT_VERSION*-cp312*.whl
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install TensorRT Python package" -- pip3 install $TRT_PACKAGE_DIR/python/${TRT_WHEEL_GLOB}.whl
     - echo "Installing python cuda dependencies"
     - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install PyCUDA" -- pip3 install pycuda
     - export LD_LIBRARY_PATH=$TRT_PACKAGE_DIR/lib:$LD_LIBRARY_PATH
@@ -487,7 +487,7 @@
     - echo "Installing test dependencies"
     - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install unit-test dependencies" -- pip3 install -r tests/requirements.txt -r tests/requirements-ut.txt
     - echo "Installing TensorRT Python package from cache"
-    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install TensorRT Python package" -- pip3 install $TRT_PACKAGE_DIR/python/tensorrt-$TRT_VERSION*-cp312*.whl
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install TensorRT Python package" -- pip3 install $TRT_PACKAGE_DIR/python/${TRT_WHEEL_GLOB}.whl
     - export LD_LIBRARY_PATH=$TRT_PACKAGE_DIR/lib:$LD_LIBRARY_PATH
     # test_build_project_with_pybind (l0_python_ut list) builds _edgellm_runtime.
     - export PYTHONPATH="$PWD/build/pybind${PYTHONPATH:+:$PYTHONPATH}"

@@ -36,8 +36,11 @@ find_library(
 
 find_path(TensorRT_OnnxParser_INCLUDE_DIR NvOnnxParser.h
           HINTS ${TensorRT_INCLUDE_DIR})
+# TRT-RTX ships the parser as tensorrt_onnxparser_rtx; Enterprise as
+# nvonnxparser.
 find_library(
-  TensorRT_OnnxParser_LIBRARY nvonnxparser
+  TensorRT_OnnxParser_LIBRARY
+  NAMES nvonnxparser tensorrt_onnxparser_rtx
   HINTS ${_trt_hints}
   PATH_SUFFIXES ${_trt_lib_suffixes})
 
