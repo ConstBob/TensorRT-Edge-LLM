@@ -1077,7 +1077,12 @@ def _test_command(config: Config, runtime: Runtime) -> str:
     python = (str(config.run_python)
               if use_host_python and config.run_python is not None else
               ("python3" if use_host_python else str(_PYTHON)))
-    python_path = "" if use_host_python else f"export PATH={q(str(_PYTHON.parent))}:$PATH\n"
+    if use_host_python and config.run_python is not None:
+        python_path = f"export PATH={q(str(config.run_python.parent))}:$PATH\n"
+    elif use_host_python:
+        python_path = ""
+    else:
+        python_path = f"export PATH={q(str(_PYTHON.parent))}:$PATH\n"
     return f"""set -euo pipefail
 source {q(str(runtime.env_script))}
 export EDGELLM_PLUGIN_PATH={q(str(plugin))}
