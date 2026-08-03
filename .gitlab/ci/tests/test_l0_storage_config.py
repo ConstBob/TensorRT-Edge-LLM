@@ -78,7 +78,6 @@ EXPECTED_EXPORT_JOBS = {
     },
     "l0_checkpoint_export_a30_trtrtx": {
         "l0_checkpoint_export_a30_trtrtx",
-        "l0_a30_trtrtx",
     },
 }
 
