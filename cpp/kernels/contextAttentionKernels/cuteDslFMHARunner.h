@@ -17,14 +17,20 @@
 
 #pragma once
 
+#include "kernels/cuteDslModuleLoader.h"
+
+#if defined(CUTE_DSL_CUDA_ERROR_CHECK)
+#undef CUTE_DSL_CUDA_ERROR_CHECK
+#endif
+#define CUTE_DSL_CUDA_ERROR_CHECK(error) ::trt_edgellm::detail::recordCuteDslCudaError(static_cast<cudaError_t>(error))
 #include "cutedsl_all.h"
+#undef CUTE_DSL_CUDA_ERROR_CHECK
 
 #include <NvInferRuntime.h>
 #include <climits>
 #include <cstdint>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <mutex>
 
 namespace trt_edgellm
 {
@@ -55,13 +61,16 @@ public:
     static bool canImplement(int32_t headSize, int32_t smVersion);
     static bool canImplementViT(int32_t headSize, int32_t smVersion);
 
-    // ---- LLM kernel loading ----
-    static bool loadLLMKernelModule();
-    static void unloadLLMKernelModule();
+    //! Ensures the exact dense LLM variant selected by run() is loaded.
+    bool preflightLlm(cudaStream_t stream, int32_t slidingWindowSize = INT_MAX, bool fp8Input = false,
+        float skipSoftmaxThresholdLog2 = 0.0F);
 
-    // ---- ViT kernel loading ----
-    static bool loadViTKernelModule();
-    static void unloadViTKernelModule();
+    //! Ensures the exact paged LLM variant selected by runPaged() is loaded.
+    bool preflightPaged(cudaStream_t stream, int32_t slidingWindowSize = INT_MAX, bool fp8Input = false,
+        bool isCausal = true, float skipSoftmaxThresholdLog2 = 0.0F, bool useBidirectional = false);
+
+    //! Ensures the exact packed ViT variant selected by run() is loaded.
+    bool preflightViT(cudaStream_t stream);
 
     /**
      * @brief LLM FMHA: batched Q + combined KV cache with causal masking.
@@ -88,7 +97,7 @@ public:
      *        log2 of the degenerate lambda = 1) disables skip, mirroring the slidingWindowSize = INT_MAX
      *        sentinel convention.
      */
-    void run(void const* qPtr, void const* kvPtr, void* oPtr, int32_t const* cuKVSeqLens, cudaStream_t stream,
+    bool run(void const* qPtr, void const* kvPtr, void* oPtr, int32_t const* cuKVSeqLens, cudaStream_t stream,
         float attentionScale, int32_t slidingWindowSize = INT_MAX, bool fp8Input = false, float qScale = 1.0F,
         float kScale = 1.0F, float vScale = 1.0F, float skipSoftmaxThresholdLog2 = 0.0F);
 
@@ -129,7 +138,7 @@ public:
      * Text/padding rows use -1; every row in a disjoint contiguous vision run
      * must repeat that run's end position.
      */
-    void runPaged(void const* qPtr, void const* pagedKVPoolPtr, int32_t const* kvCachePageList, void* oPtr,
+    bool runPaged(void const* qPtr, void const* pagedKVPoolPtr, int32_t const* kvCachePageList, void* oPtr,
         int32_t const* cuKVSeqLens, int32_t numPages, int32_t maxPagesPerSeq, int32_t tokensPerPage,
         nvinfer1::DataType kvDataType, cudaStream_t stream, float attentionScale, int32_t slidingWindowSize = INT_MAX,
         bool fp8Input = false, float qScale = 1.0F, float kScale = 1.0F, float vScale = 1.0F, bool isCausal = true,
@@ -150,7 +159,7 @@ public:
      * @param stream CUDA stream
      * @param attentionScale Absolute multiplier applied to QK^T before softmax
      */
-    void run(void const* qPtr, void const* kPtr, void const* vPtr, void* oPtr, int32_t const* cuSeqLens,
+    bool run(void const* qPtr, void const* kPtr, void const* vPtr, void* oPtr, int32_t const* cuSeqLens,
         int32_t totalSeqLen, int32_t maxSeqLen, int32_t batchSize, cudaStream_t stream, float attentionScale);
 
 private:
@@ -162,64 +171,59 @@ private:
     int32_t mHeadDim{};
 
     // LLM kernel modules (FP16)
-    static fmha_d64_Kernel_Module_t sLLM_d64;
-    static fmha_d128_Kernel_Module_t sLLM_d128;
-    static fmha_d256_Kernel_Module_t sLLM_d256;
-    static fmha_d64_sw_Kernel_Module_t sLLM_d64_sw;
-    static fmha_d128_sw_Kernel_Module_t sLLM_d128_sw;
-    static fmha_d256_sw_Kernel_Module_t sLLM_d256_sw;
+    static detail::LazyKernelModule<fmha_d64_Kernel_Module_t> sLLM_d64;
+    static detail::LazyKernelModule<fmha_d128_Kernel_Module_t> sLLM_d128;
+    static detail::LazyKernelModule<fmha_d256_Kernel_Module_t> sLLM_d256;
+    static detail::LazyKernelModule<fmha_d64_sw_Kernel_Module_t> sLLM_d64_sw;
+    static detail::LazyKernelModule<fmha_d128_sw_Kernel_Module_t> sLLM_d128_sw;
+    static detail::LazyKernelModule<fmha_d256_sw_Kernel_Module_t> sLLM_d256_sw;
 
     // LLM skip-softmax (BLASST) kernel modules (FP16, causal, no sliding window)
-    static fmha_d64_skipsoftmax_Kernel_Module_t sLLM_d64_skipsoftmax;
-    static fmha_d128_skipsoftmax_Kernel_Module_t sLLM_d128_skipsoftmax;
+    static detail::LazyKernelModule<fmha_d64_skipsoftmax_Kernel_Module_t> sLLM_d64_skipsoftmax;
+    static detail::LazyKernelModule<fmha_d128_skipsoftmax_Kernel_Module_t> sLLM_d128_skipsoftmax;
 
     // LLM kernel modules (FP8 input, FP16 output)
-    static fmha_d64_fp8_Kernel_Module_t sLLM_d64_fp8;
-    static fmha_d128_fp8_Kernel_Module_t sLLM_d128_fp8;
-    static fmha_d256_fp8_Kernel_Module_t sLLM_d256_fp8;
-    static fmha_d64_sw_fp8_Kernel_Module_t sLLM_d64_sw_fp8;
-    static fmha_d128_sw_fp8_Kernel_Module_t sLLM_d128_sw_fp8;
-    static fmha_d256_sw_fp8_Kernel_Module_t sLLM_d256_sw_fp8;
+    static detail::LazyKernelModule<fmha_d64_fp8_Kernel_Module_t> sLLM_d64_fp8;
+    static detail::LazyKernelModule<fmha_d128_fp8_Kernel_Module_t> sLLM_d128_fp8;
+    static detail::LazyKernelModule<fmha_d256_fp8_Kernel_Module_t> sLLM_d256_fp8;
+    static detail::LazyKernelModule<fmha_d64_sw_fp8_Kernel_Module_t> sLLM_d64_sw_fp8;
+    static detail::LazyKernelModule<fmha_d128_sw_fp8_Kernel_Module_t> sLLM_d128_sw_fp8;
+    static detail::LazyKernelModule<fmha_d256_sw_fp8_Kernel_Module_t> sLLM_d256_sw_fp8;
 
     // LLM paged KV cache kernel modules (FP16)
-    static fmha_d64_paged_Kernel_Module_t sLLM_d64_paged;
-    static fmha_d128_paged_Kernel_Module_t sLLM_d128_paged;
-    static fmha_d64_skipsoftmax_paged_Kernel_Module_t sLLM_d64_skipsoftmax_paged;
-    static fmha_d128_skipsoftmax_paged_Kernel_Module_t sLLM_d128_skipsoftmax_paged;
-    static fmha_d256_paged_Kernel_Module_t sLLM_d256_paged;
-    static fmha_d256_dense_paged_Kernel_Module_t sLLM_d256_dense_paged;
-    static fmha_d512_paged_Kernel_Module_t sLLM_d512_paged;
-    static fmha_d512_dense_paged_Kernel_Module_t sLLM_d512_dense_paged;
-    static fmha_d64_sw_paged_Kernel_Module_t sLLM_d64_sw_paged;
-    static fmha_d128_sw_paged_Kernel_Module_t sLLM_d128_sw_paged;
-    static fmha_d256_sw_paged_Kernel_Module_t sLLM_d256_sw_paged;
-    static fmha_d512_sw_paged_Kernel_Module_t sLLM_d512_sw_paged;
+    static detail::LazyKernelModule<fmha_d64_paged_Kernel_Module_t> sLLM_d64_paged;
+    static detail::LazyKernelModule<fmha_d128_paged_Kernel_Module_t> sLLM_d128_paged;
+    static detail::LazyKernelModule<fmha_d64_skipsoftmax_paged_Kernel_Module_t> sLLM_d64_skipsoftmax_paged;
+    static detail::LazyKernelModule<fmha_d128_skipsoftmax_paged_Kernel_Module_t> sLLM_d128_skipsoftmax_paged;
+    static detail::LazyKernelModule<fmha_d256_paged_Kernel_Module_t> sLLM_d256_paged;
+    static detail::LazyKernelModule<fmha_d256_dense_paged_Kernel_Module_t> sLLM_d256_dense_paged;
+    static detail::LazyKernelModule<fmha_d512_paged_Kernel_Module_t> sLLM_d512_paged;
+    static detail::LazyKernelModule<fmha_d512_dense_paged_Kernel_Module_t> sLLM_d512_dense_paged;
+    static detail::LazyKernelModule<fmha_d64_sw_paged_Kernel_Module_t> sLLM_d64_sw_paged;
+    static detail::LazyKernelModule<fmha_d128_sw_paged_Kernel_Module_t> sLLM_d128_sw_paged;
+    static detail::LazyKernelModule<fmha_d256_sw_paged_Kernel_Module_t> sLLM_d256_sw_paged;
+    static detail::LazyKernelModule<fmha_d512_sw_paged_Kernel_Module_t> sLLM_d512_sw_paged;
 
     // D512 paged bidirectional-mask kernel module (FP16, runtime sliding window)
-    static fmha_d512_paged_bidirectional_Kernel_Module_t sLLM_d512_paged_bidirectional;
+    static detail::LazyKernelModule<fmha_d512_paged_bidirectional_Kernel_Module_t> sLLM_d512_paged_bidirectional;
 
     // LLM paged KV cache kernel modules (FP8 input, FP16 output)
-    static fmha_d64_paged_fp8_Kernel_Module_t sLLM_d64_paged_fp8;
-    static fmha_d128_paged_fp8_Kernel_Module_t sLLM_d128_paged_fp8;
-    static fmha_d256_paged_fp8_Kernel_Module_t sLLM_d256_paged_fp8;
-    static fmha_d256_dense_paged_fp8_Kernel_Module_t sLLM_d256_dense_paged_fp8;
-    static fmha_d512_paged_fp8_Kernel_Module_t sLLM_d512_paged_fp8;
-    static fmha_d512_dense_paged_fp8_Kernel_Module_t sLLM_d512_dense_paged_fp8;
-    static fmha_d64_sw_paged_fp8_Kernel_Module_t sLLM_d64_sw_paged_fp8;
-    static fmha_d128_sw_paged_fp8_Kernel_Module_t sLLM_d128_sw_paged_fp8;
-    static fmha_d256_sw_paged_fp8_Kernel_Module_t sLLM_d256_sw_paged_fp8;
-    static fmha_d512_sw_paged_fp8_Kernel_Module_t sLLM_d512_sw_paged_fp8;
-
-    static bool sLLMLoaded;
-    static std::mutex sLLMMutex;
+    static detail::LazyKernelModule<fmha_d64_paged_fp8_Kernel_Module_t> sLLM_d64_paged_fp8;
+    static detail::LazyKernelModule<fmha_d128_paged_fp8_Kernel_Module_t> sLLM_d128_paged_fp8;
+    static detail::LazyKernelModule<fmha_d256_paged_fp8_Kernel_Module_t> sLLM_d256_paged_fp8;
+    static detail::LazyKernelModule<fmha_d256_dense_paged_fp8_Kernel_Module_t> sLLM_d256_dense_paged_fp8;
+    static detail::LazyKernelModule<fmha_d512_paged_fp8_Kernel_Module_t> sLLM_d512_paged_fp8;
+    static detail::LazyKernelModule<fmha_d512_dense_paged_fp8_Kernel_Module_t> sLLM_d512_dense_paged_fp8;
+    static detail::LazyKernelModule<fmha_d64_sw_paged_fp8_Kernel_Module_t> sLLM_d64_sw_paged_fp8;
+    static detail::LazyKernelModule<fmha_d128_sw_paged_fp8_Kernel_Module_t> sLLM_d128_sw_paged_fp8;
+    static detail::LazyKernelModule<fmha_d256_sw_paged_fp8_Kernel_Module_t> sLLM_d256_sw_paged_fp8;
+    static detail::LazyKernelModule<fmha_d512_sw_paged_fp8_Kernel_Module_t> sLLM_d512_sw_paged_fp8;
 
     // ViT kernel modules
-    static vit_fmha_d64_Kernel_Module_t sViT_d64;
-    static vit_fmha_d72_Kernel_Module_t sViT_d72;
-    static vit_fmha_d80_Kernel_Module_t sViT_d80;
-    static vit_fmha_d128_Kernel_Module_t sViT_d128;
-    static bool sViTLoaded;
-    static std::mutex sViTMutex;
+    static detail::LazyKernelModule<vit_fmha_d64_Kernel_Module_t> sViT_d64;
+    static detail::LazyKernelModule<vit_fmha_d72_Kernel_Module_t> sViT_d72;
+    static detail::LazyKernelModule<vit_fmha_d80_Kernel_Module_t> sViT_d80;
+    static detail::LazyKernelModule<vit_fmha_d128_Kernel_Module_t> sViT_d128;
 };
 
 } // namespace trt_edgellm

@@ -150,8 +150,11 @@ above through `kernelSrcs/cutedsl_utils/cutedsl_compile_wrapper.py` (see the sha
 `CuteDslFMHARunner` (`cpp/kernels/contextAttentionKernels/cuteDslFMHARunner.{h,cpp}`)
 provides the C++ interface:
 
-- **Module loading**: `loadLLMKernelModule()` / `loadViTKernelModule()` — loads
-  the AOT-compiled CUDA libraries. Thread-safe (static, guarded by mutex).
+- **Module loading**: the exact AOT variant selected for an LLM or ViT dispatch
+  is loaded lazily on first use. Plugins preflight that variant before launching
+  preprocessing kernels, and the runner repeats the guard before its generated
+  wrapper call. Loaded modules are shared and remain resident for process
+  lifetime; unused variants are never loaded.
 - **Dispatch**: `canImplement(headSize, smVersion)` — returns `true` for
   SM100/101/110 and head dim 64, 128, 256, or 512.
 - **LLM run**: `run(qPtr, kvPtr, oPtr, cuKVSeqLens, stream, slidingWindowSize)`

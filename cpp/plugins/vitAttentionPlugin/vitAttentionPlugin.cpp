@@ -69,20 +69,17 @@ struct ViTFMHAKernelSelection
     bool canImplement{false};
 };
 
-ViTFMHAKernelSelection loadViTFMHAKernels(int32_t headSize, int32_t smVersion, nvinfer1::DataType dataType)
+ViTFMHAKernelSelection selectViTFMHAKernels(int32_t headSize, int32_t smVersion, nvinfer1::DataType dataType)
 {
 #ifdef CUTE_DSL_FMHA_BLACKWELL_ENABLED
-    if (CuteDslFMHARunner::canImplementViT(headSize, smVersion) && CuteDslFMHARunner::loadViTKernelModule())
+    if (CuteDslFMHARunner::canImplementViT(headSize, smVersion))
     {
-        LOG_DEBUG("CuTe DSL ViT FMHA kernel loaded for SM%d", smVersion);
         return {ViTFMHABackend::kCUTE_DSL_FMHA_BLACKWELL, true};
     }
 #endif
 
-    if (CuteDslFMHAV2Runner::canImplementViT(headSize, smVersion, dataType)
-        && CuteDslFMHAV2Runner::loadViTKernelModule())
+    if (CuteDslFMHAV2Runner::canImplementViT(headSize, smVersion, dataType))
     {
-        LOG_DEBUG("FMHA-v2 CuTe DSL ViT FMHA kernel loaded for SM%d", smVersion);
         return {ViTFMHABackend::kCUTE_DSL_FMHA_V2, true};
     }
 
@@ -106,7 +103,7 @@ ViTAttentionPlugin::ViTAttentionPlugin(
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
 
-    ViTFMHAKernelSelection const fmhaSelection = loadViTFMHAKernels(mHeadSize, mSMVersion, mDataType);
+    ViTFMHAKernelSelection const fmhaSelection = selectViTFMHAKernels(mHeadSize, mSMVersion, mDataType);
     mFMHABackend = fmhaSelection.backend;
 
     if (!fmhaSelection.canImplement)
@@ -128,7 +125,7 @@ ViTAttentionPlugin::ViTAttentionPlugin(std::string const& name, PluginFieldColle
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
 
-    ViTFMHAKernelSelection const fmhaSelection = loadViTFMHAKernels(mHeadSize, mSMVersion, mDataType);
+    ViTFMHAKernelSelection const fmhaSelection = selectViTFMHAKernels(mHeadSize, mSMVersion, mDataType);
     mFMHABackend = fmhaSelection.backend;
     if (!fmhaSelection.canImplement)
     {
@@ -374,16 +371,26 @@ int32_t ViTAttentionPlugin::enqueue(PluginTensorDesc const* inputDesc,
     {
         int32_t totalSeqLen = static_cast<int32_t>(qInputDesc.dims.d[0]);
         CuteDslFMHARunner runner(mNumHeads, mNumHeads, mHeadSize);
-        runner.run(qInputTensor.dataPointer<half>(), kInputTensor.dataPointer<half>(), vInputTensor.dataPointer<half>(),
-            attentionOutputTensor.dataPointer<half>(), cuSeqLensTensor.dataPointer<int32_t>(), totalSeqLen,
-            runtimeMaxSeqLen, runtimeBatchSize, stream, mAttentionScale);
-        return 0;
+        if (!runner.preflightViT(stream))
+        {
+            return -1;
+        }
+        return runner.run(qInputTensor.dataPointer<half>(), kInputTensor.dataPointer<half>(),
+                   vInputTensor.dataPointer<half>(), attentionOutputTensor.dataPointer<half>(),
+                   cuSeqLensTensor.dataPointer<int32_t>(), totalSeqLen, runtimeMaxSeqLen, runtimeBatchSize, stream,
+                   mAttentionScale)
+            ? 0
+            : -1;
     }
 #endif
     if (mFMHABackend == ViTFMHABackend::kCUTE_DSL_FMHA_V2)
     {
         int32_t const totalSeqLen = static_cast<int32_t>(qInputDesc.dims.d[0]);
         CuteDslFMHAV2Runner runner(mNumHeads, mNumHeads, mHeadSize);
+        if (!runner.preflightViT(stream))
+        {
+            return -1;
+        }
         if (!runner.run(qInputTensor.dataPointer<half>(), kInputTensor.dataPointer<half>(),
                 vInputTensor.dataPointer<half>(), attentionOutputTensor.dataPointer<half>(),
                 cuSeqLensTensor.dataPointer<int32_t>(), totalSeqLen, runtimeMaxSeqLen, runtimeBatchSize, stream,

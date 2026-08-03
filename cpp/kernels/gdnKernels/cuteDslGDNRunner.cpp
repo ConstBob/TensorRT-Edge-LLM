@@ -25,20 +25,16 @@
 
 #include <cmath>
 #include <cstring>
-#include <mutex>
 
 namespace trt_edgellm
 {
 
-gdn_decode_Kernel_Module_t CuteDslGDNRunner::sDecodeModule = {};
-gdn_prefill_Kernel_Module_t CuteDslGDNRunner::sPrefillModule = {};
+detail::LazyKernelModule<gdn_decode_Kernel_Module_t> CuteDslGDNRunner::sDecodeModule{};
+detail::LazyKernelModule<gdn_prefill_Kernel_Module_t> CuteDslGDNRunner::sPrefillModule{};
 #ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
-gdn_prefill_blackwell_Kernel_Module_t CuteDslGDNRunner::sBlackwellPrefillModule = {};
+detail::LazyKernelModule<gdn_prefill_blackwell_Kernel_Module_t> CuteDslGDNRunner::sBlackwellPrefillModule{};
 #endif
-gdn_decode_mtp_cache_Kernel_Module_t CuteDslGDNRunner::sMTPDecodeCacheModule = {};
-bool CuteDslGDNRunner::sLoaded = false;
-
-static std::mutex sGDNMutex;
+detail::LazyKernelModule<gdn_decode_mtp_cache_Kernel_Module_t> CuteDslGDNRunner::sMTPDecodeCacheModule{};
 
 #define SET_4D_TENSOR(tensor, data_ptr, dim0, dim1, dim2, dim3)                                                        \
     do                                                                                                                 \
@@ -85,54 +81,36 @@ bool CuteDslGDNRunner::canImplement(int32_t kDim, int32_t vDim, int32_t smVersio
     return (smVersion >= 80) && (kDim == 128) && (vDim == 128);
 }
 
-bool CuteDslGDNRunner::loadKernelModules()
+bool CuteDslGDNRunner::ensureKernelModules(GDNParams const& params, cudaStream_t stream)
 {
-    std::lock_guard<std::mutex> lock(sGDNMutex);
-    if (sLoaded)
+    if (params.use_mtp)
     {
-        return true;
+        return detail::ensureModuleLoaded<gdn_decode_mtp_cache_Kernel_Module_Load,
+            gdn_decode_mtp_cache_Kernel_Module_Unload>(sMTPDecodeCacheModule, "gdn_decode_mtp_cache", stream);
     }
-    try
+    if (params.seq_len == 1)
     {
-        gdn_decode_Kernel_Module_Load(&sDecodeModule);
-        gdn_prefill_Kernel_Module_Load(&sPrefillModule);
+        return detail::ensureModuleLoaded<gdn_decode_Kernel_Module_Load, gdn_decode_Kernel_Module_Unload>(
+            sDecodeModule, "gdn_decode", stream);
+    }
 #ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
-        gdn_prefill_blackwell_Kernel_Module_Load(&sBlackwellPrefillModule);
-#endif
-        gdn_decode_mtp_cache_Kernel_Module_Load(&sMTPDecodeCacheModule);
-        LOG_DEBUG(
-            "CuTe DSL GDN kernel modules loaded (decode + prefill + MTP"
-#ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
-            " + blackwell"
-#endif
-            ")");
-        sLoaded = true;
-        return true;
-    }
-    catch (...)
+    if (params.smVersion >= 100)
     {
-        LOG_ERROR("Failed to load CuTe DSL GDN kernel modules");
-        return false;
+        return detail::ensureModuleLoaded<gdn_prefill_blackwell_Kernel_Module_Load,
+            gdn_prefill_blackwell_Kernel_Module_Unload>(sBlackwellPrefillModule, "gdn_prefill_blackwell", stream);
     }
-}
-
-void CuteDslGDNRunner::unloadKernelModules()
-{
-    std::lock_guard<std::mutex> lock(sGDNMutex);
-    if (sLoaded)
-    {
-        gdn_decode_Kernel_Module_Unload(&sDecodeModule);
-        gdn_prefill_Kernel_Module_Unload(&sPrefillModule);
-#ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
-        gdn_prefill_blackwell_Kernel_Module_Unload(&sBlackwellPrefillModule);
 #endif
-        gdn_decode_mtp_cache_Kernel_Module_Unload(&sMTPDecodeCacheModule);
-        sLoaded = false;
-    }
+    return detail::ensureModuleLoaded<gdn_prefill_Kernel_Module_Load, gdn_prefill_Kernel_Module_Unload>(
+        sPrefillModule, "gdn_prefill", stream);
 }
 
 int CuteDslGDNRunner::run(GDNParams const& params, cudaStream_t stream)
 {
+    if (!ensureKernelModules(params, stream))
+    {
+        return -1;
+    }
+
     // MTP decode takes priority: handles any seq_len for speculative-decoding verification.
     if (params.use_mtp)
     {
@@ -153,11 +131,6 @@ int CuteDslGDNRunner::run(GDNParams const& params, cudaStream_t stream)
 
 int CuteDslGDNRunner::runDecode(GDNParams const& params, cudaStream_t stream)
 {
-    if (!sLoaded)
-    {
-        LOG_ERROR("CuTe DSL GDN decode kernel module not loaded.");
-        return -1;
-    }
     int32_t const n = params.n;
     int32_t const h = params.h;
     int32_t const hv = params.hv;
@@ -203,19 +176,12 @@ int CuteDslGDNRunner::runDecode(GDNParams const& params, cudaStream_t stream)
     gdn_decode_Tensor_o_t oTensor{};
     SET_4D_TENSOR(oTensor, params.o, n, 1, hv, v);
 
-    cute_dsl_gdn_decode_wrapper(&sDecodeModule, &qTensor, &kTensor, &vTensor, &aTensor, &bTensor, &A_logTensor,
-        &dt_biasTensor, &h0_sourceTensor, &contextLengthsTensor, &oTensor, stream);
-
-    return 0;
+    return cute_dsl_gdn_decode_wrapper(&sDecodeModule.module, &qTensor, &kTensor, &vTensor, &aTensor, &bTensor,
+        &A_logTensor, &dt_biasTensor, &h0_sourceTensor, &contextLengthsTensor, &oTensor, stream);
 }
 
 int CuteDslGDNRunner::runPrefill(GDNParams const& params, cudaStream_t stream)
 {
-    if (!sLoaded)
-    {
-        LOG_ERROR("CuTe DSL GDN prefill kernel module not loaded.");
-        return -1;
-    }
     int32_t const n = params.n;
     int32_t const seq_len = params.seq_len;
     int32_t const h = params.h;
@@ -256,20 +222,13 @@ int CuteDslGDNRunner::runPrefill(GDNParams const& params, cudaStream_t stream)
     gdn_prefill_Tensor_o_t oTensor{};
     SET_4D_TENSOR(oTensor, params.o, n, seq_len, hv, v);
 
-    cute_dsl_gdn_prefill_wrapper(&sPrefillModule, &qTensor, &kTensor, &vTensor, &aTensor, &bTensor, &A_logTensor,
-        &dt_biasTensor, &h0_sourceTensor, &contextLengthsTensor, &oTensor, seq_len, stream);
-
-    return 0;
+    return cute_dsl_gdn_prefill_wrapper(&sPrefillModule.module, &qTensor, &kTensor, &vTensor, &aTensor, &bTensor,
+        &A_logTensor, &dt_biasTensor, &h0_sourceTensor, &contextLengthsTensor, &oTensor, seq_len, stream);
 }
 
 int CuteDslGDNRunner::runPrefillBlackwell(GDNParams const& params, cudaStream_t stream)
 {
 #ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
-    if (!sLoaded)
-    {
-        LOG_ERROR("CuTe DSL GDN Blackwell prefill kernel module not loaded.");
-        return -1;
-    }
     int32_t const n = params.n;
     int32_t const seq_len = params.seq_len;
     int32_t const h = params.h;
@@ -343,9 +302,13 @@ int CuteDslGDNRunner::runPrefillBlackwell(GDNParams const& params, cudaStream_t 
     SET_4D_TENSOR(oTensor, params.o, n, seq_len, hv, v);
 
     // Step 2: Run the Blackwell prefill kernel.
-    cute_dsl_gdn_prefill_blackwell_wrapper(&sBlackwellPrefillModule, &qTensor, &kTensor, &vTensor, &aTensor, &bTensor,
-        &A_logTensor, &dt_biasTensor, &h0InTensor, &h0OutTensor, &oTensor, &cuSeqLensTensor,
-        getDeviceMultiProcessorCount(), stream);
+    int32_t const result = cute_dsl_gdn_prefill_blackwell_wrapper(&sBlackwellPrefillModule.module, &qTensor, &kTensor,
+        &vTensor, &aTensor, &bTensor, &A_logTensor, &dt_biasTensor, &h0InTensor, &h0OutTensor, &oTensor,
+        &cuSeqLensTensor, getDeviceMultiProcessorCount(), stream);
+    if (result != 0)
+    {
+        return result;
+    }
 
     // Step 3: Transpose V-major output state back to K-major into scratch.
     launchGdnStateTranspose(params.h0_source, params.h0_scratch, numStateBlocks, k, stream);
@@ -361,12 +324,6 @@ int CuteDslGDNRunner::runPrefillBlackwell(GDNParams const& params, cudaStream_t 
 
 int CuteDslGDNRunner::runDecodeMTP(GDNParams const& params, cudaStream_t stream)
 {
-    if (!sLoaded)
-    {
-        LOG_ERROR("CuTe DSL GDN MTP decode kernel module not loaded.");
-        return -1;
-    }
-
     int32_t const n = params.n;
     int32_t const seq_len = params.seq_len;
     int32_t const h = params.h;
@@ -441,10 +398,8 @@ int CuteDslGDNRunner::runDecodeMTP(GDNParams const& params, cudaStream_t stream)
     intermTensor.dynamic_strides[2] = static_cast<int64_t>(k) * v;
     intermTensor.dynamic_strides[3] = static_cast<int64_t>(v);
 
-    cute_dsl_gdn_decode_mtp_cache_wrapper(&sMTPDecodeCacheModule, &h0Tensor, &qTensor, &kTensor, &vTensor, &aTensor,
-        &bTensor, &A_logTensor, &dt_biasTensor, &oTensor, &intermTensor, seq_len, stream);
-
-    return 0;
+    return cute_dsl_gdn_decode_mtp_cache_wrapper(&sMTPDecodeCacheModule.module, &h0Tensor, &qTensor, &kTensor, &vTensor,
+        &aTensor, &bTensor, &A_logTensor, &dt_biasTensor, &oTensor, &intermTensor, seq_len, stream);
 }
 
 } // namespace trt_edgellm

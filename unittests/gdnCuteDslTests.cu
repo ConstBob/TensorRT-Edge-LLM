@@ -366,9 +366,6 @@ void runGDNDecodeTest()
     params.k_dim = k;
     params.v_dim = v;
 
-    bool loaded = CuteDslGDNRunner::loadKernelModules();
-    ASSERT_TRUE(loaded) << "Failed to load GDN kernel modules";
-
     CuteDslGDNRunner runner;
     int ret = runner.run(params, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -576,9 +573,6 @@ void runGDNPrefillTest()
     params.v_dim = v;
     params.smVersion = smVersion;
 
-    bool loaded = CuteDslGDNRunner::loadKernelModules();
-    ASSERT_TRUE(loaded) << "Failed to load GDN kernel modules";
-
     CuteDslGDNRunner runner;
     int ret = runner.run(params, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -768,9 +762,6 @@ void runGDNPrefillPaddingTest()
     params.k_dim = k;
     params.v_dim = v;
     params.smVersion = smVersion;
-
-    bool loaded = CuteDslGDNRunner::loadKernelModules();
-    ASSERT_TRUE(loaded) << "Failed to load GDN kernel modules";
 
     CuteDslGDNRunner runner;
     int ret = runner.run(params, nullptr);
@@ -1074,9 +1065,6 @@ static void runGDNDecodeMTPTestConfig(int32_t seq_len, bool with_cache)
     params.v_dim = v;
     params.smVersion = getSMVersion();
 
-    bool loaded = CuteDslGDNRunner::loadKernelModules();
-    ASSERT_TRUE(loaded) << "Failed to load GDN kernel modules";
-
     CuteDslGDNRunner runner;
     int32_t const ret = runner.run(params, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -1271,9 +1259,6 @@ void runGDNPrefillQwen35Test()
     params.v_dim = v;
     params.smVersion = smVersion;
 
-    bool loaded = CuteDslGDNRunner::loadKernelModules();
-    ASSERT_TRUE(loaded) << "Failed to load GDN kernel modules";
-
     CuteDslGDNRunner runner;
     int ret = runner.run(params, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -1463,8 +1448,6 @@ void runGDNBlackwellVsSequentialTest()
     bwParams.v_dim = v;
     bwParams.smVersion = smVersion;
 
-    bool loaded = CuteDslGDNRunner::loadKernelModules();
-    ASSERT_TRUE(loaded);
     CuteDslGDNRunner runner;
     int ret = runner.run(bwParams, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());

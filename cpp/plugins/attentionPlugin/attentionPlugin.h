@@ -140,7 +140,7 @@ private:
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream);
 
     //! Launch the CuTe DSL FFPA d512 causal attention kernel with per-batch varlen masking.
-    void dispatchFFPAKernel(half const* q, half const* k, half const* v, half* o, int32_t const* cuSeqLenQ,
+    bool dispatchFFPAKernel(half const* q, half const* k, half const* v, half* o, int32_t const* cuSeqLenQ,
         int32_t const* cuSeqLenK, int32_t batchSize, int32_t seqlenQ, int32_t seqlenK, cudaStream_t stream);
 
     //! Whether the paged CuTe DSL D512 bidirectional-mask prefill kernel is available.
@@ -219,7 +219,7 @@ protected:
     //! Whether the FMHA-v2 CuTe DSL d256 vision-block context variant is active.
     bool mUseFMHAV2VisionBlockFMHA{false};
 
-    //! Whether the selected CuTe DSL backend has loaded a dense PADDING context
+    //! Whether the selected CuTe DSL backend supports a dense PADDING context
     //! kernel for runtime-selected non-causal DiffusionGemma denoise attention.
     bool mCanImplementPaddingFMHA{false};
 

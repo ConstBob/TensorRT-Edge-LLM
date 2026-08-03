@@ -267,6 +267,27 @@ int32_t MambaPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
     // Determine seq_len: x is [batch, nheads, dim] (3D) or [batch, seq_len, nheads, dim] (4D)
     bool const hasSeqLen = (xDesc.dims.nbDims == 4);
 
+#ifdef CUTE_DSL_SSD_ENABLED
+    if (hasSeqLen)
+    {
+        int32_t const seqLen = static_cast<int32_t>(xDesc.dims.d[1]);
+        int32_t const smVersion = getSMVersion();
+        if (trt_edgellm::CuteDslSSDRunner::canImplement(mDim, mDstate, smVersion) && seqLen >= 128)
+        {
+            trt_edgellm::SSDParams moduleParams{};
+            moduleParams.dim = mDim;
+            moduleParams.dstate = mDstate;
+            moduleParams.smVersion = smVersion;
+            moduleParams.has_init_states = inputDesc[kIN_STATE_START_INDEX_IDX].dims.d[0] > 0;
+            if (!trt_edgellm::CuteDslSSDRunner::ensureKernelModules(moduleParams, stream))
+            {
+                LOG_ERROR("Failed to load the selected CuTe DSL SSD kernel module");
+                return -1;
+            }
+        }
+    }
+#endif
+
     // Copy input state to output state so the kernel can update in-place across steps.
     void* outputState = outputs[kOUT_STATE_IDX];
     if (outputState != inputs[kIN_STATE_IDX])
@@ -319,11 +340,6 @@ int32_t MambaPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
             int32_t const smVersion = getSMVersion();
             if (trt_edgellm::CuteDslSSDRunner::canImplement(mDim, mDstate, smVersion) && seqLen >= 128)
             {
-                if (!trt_edgellm::CuteDslSSDRunner::loadKernelModules())
-                {
-                    LOG_ERROR("Failed to load CuTe DSL SSD kernel modules");
-                    return -1;
-                }
                 trt_edgellm::CuteDslSSDRunner runner;
                 trt_edgellm::SSDParams ssdParams{};
                 ssdParams.x = const_cast<void*>(inputs[kIN_X_IDX]);

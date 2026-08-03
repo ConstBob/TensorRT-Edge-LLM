@@ -50,8 +50,9 @@ rules, emitting a clear error when they are violated.
 
 - [`nvfp4MoePlugin.h`](nvfp4MoePlugin.h) / [`nvfp4MoePlugin.cpp`](nvfp4MoePlugin.cpp) — the `IPluginV3` implementation.
 - [`../../kernels/moe/nvfp4_cutedsl/cuteDslNvfp4MoeSm110Runner.{h,cpp}`](../../kernels/moe/nvfp4_cutedsl/)
-  — the SM100/101/110 AOT-module owner: module load/unload,
-  shape-check, workspace layout, and split FC1 / FC2 dispatch.
+  — the SM100/101/110 AOT-module owner: per-variant lazy loading,
+  shape checks, workspace layout, and split FC1 / FC2 dispatch. Loaded
+  modules remain resident for process lifetime.
 - [`../../../kernelSrcs/nvfp4_moe_cutedsl/README.md`](../../../kernelSrcs/nvfp4_moe_cutedsl/README.md)
   — split FC1/FC2 kernel variants, AOT build flow, and data-layout notes.
 

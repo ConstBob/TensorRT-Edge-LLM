@@ -34,11 +34,17 @@ typedef CUlibrary cudaLibrary_t;
 extern "C" cudaError_t cudaLibraryUnload(cudaLibrary_t library);
 #endif
 
+#include "kernels/cuteDslModuleLoader.h"
+
+#if defined(CUTE_DSL_CUDA_ERROR_CHECK)
+#undef CUTE_DSL_CUDA_ERROR_CHECK
+#endif
+#define CUTE_DSL_CUDA_ERROR_CHECK(error) ::trt_edgellm::detail::recordCuteDslCudaError(static_cast<cudaError_t>(error))
 #include "cutedsl_all.h"
+#undef CUTE_DSL_CUDA_ERROR_CHECK
 
 #include <cstdint>
 #include <cuda_runtime.h>
-#include <mutex>
 
 namespace trt_edgellm
 {
@@ -92,22 +98,19 @@ public:
     //! (requires the ffpa_d512_causal_visionblock AOT artifact).
     static bool canImplementVisionBlock(int32_t headDim, int32_t smVersion);
 
-    static bool loadKernelModule();
-
-    static void unloadKernelModule();
+    //! Ensures the exact MHA/GQA or vision-block variant selected by run() is loaded.
+    static bool preflight(int32_t numQHeads, int32_t numKVHeads, bool useVisionBlock, cudaStream_t stream);
 
     static int run(CuteDslFFPAParams const& params, cudaStream_t stream);
 
 private:
-    static ffpa_d512_causal_Kernel_Module_t sD512CausalModule;
+    static detail::LazyKernelModule<ffpa_d512_causal_Kernel_Module_t> sD512CausalModule;
 #ifdef CUTE_DSL_FFPA_VISIONBLOCK_ENABLED
-    static ffpa_d512_causal_visionblock_Kernel_Module_t sD512CausalVisionBlockModule;
+    static detail::LazyKernelModule<ffpa_d512_causal_visionblock_Kernel_Module_t> sD512CausalVisionBlockModule;
 #endif
-    static ffpa_d512_causal_gqa4_Kernel_Module_t sD512CausalGqa4Module;
-    static ffpa_d512_causal_gqa8_Kernel_Module_t sD512CausalGqa8Module;
-    static ffpa_d512_causal_gqa16_Kernel_Module_t sD512CausalGqa16Module;
-    static bool sLoaded;
-    static std::mutex sMutex;
+    static detail::LazyKernelModule<ffpa_d512_causal_gqa4_Kernel_Module_t> sD512CausalGqa4Module;
+    static detail::LazyKernelModule<ffpa_d512_causal_gqa8_Kernel_Module_t> sD512CausalGqa8Module;
+    static detail::LazyKernelModule<ffpa_d512_causal_gqa16_Kernel_Module_t> sD512CausalGqa16Module;
 };
 
 } // namespace trt_edgellm

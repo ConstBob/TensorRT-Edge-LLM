@@ -80,11 +80,13 @@ leaves h0 unchanged).
 
 ## C++ Integration
 
-`CuteDslGDNRunner` (`cpp/kernels/gdnKernels/`): call `loadKernelModules()` once,
-then `run(GDNParams, stream)` — dispatches decode vs sequential prefill vs
-Blackwell prefill (when `CUTE_DSL_GDN_BLACKWELL_ENABLED` and `smVersion >= 100`),
-MTP cache decode, or DDTree decode. `canImplement(kDim, vDim, smVersion)` guards
-SM80+, K=V=128.
+`CuteDslGDNRunner` (`cpp/kernels/gdnKernels/`): call `run(GDNParams, stream)`.
+The runner loads only the selected decode, prefill, Blackwell prefill, or MTP
+cache AOT module on its first use and keeps it resident for process lifetime.
+The plugin calls `ensureKernelModules(GDNParams, stream)` before enqueue-side
+state copies; `run()` repeats that guard defensively. DDTree uses its C++/CUDA
+implementation and does not load a CuTe DSL AOT module.
+`canImplement(kDim, vDim, smVersion)` guards SM80+, K=V=128.
 
 Plugin (`cpp/plugins/gatedDeltaNet/`): 9 inputs — `q, k, v, a, b, A_log,
 dt_bias, h0_source, context_lengths`.

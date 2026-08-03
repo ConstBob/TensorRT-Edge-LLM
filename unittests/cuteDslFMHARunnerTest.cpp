@@ -271,9 +271,9 @@ void runViTAccuracyCase(
     CUDA_CHECK(cudaGetLastError());
 
     CuteDslFMHARunner runner(numHeads, numHeads, headDim);
-    runner.run(qTensor.dataPointer<half>(), kTensor.dataPointer<half>(), vTensor.dataPointer<half>(),
+    ASSERT_TRUE(runner.run(qTensor.dataPointer<half>(), kTensor.dataPointer<half>(), vTensor.dataPointer<half>(),
         outputCuteDsl.dataPointer<half>(), cuSeqLensTensor.dataPointer<int32_t>(), totalSeqLen, maxSeqLen, batchSize,
-        stream, attentionScale);
+        stream, attentionScale));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
 
@@ -346,9 +346,9 @@ void runLlmAccuracyCase(int32_t batchSize, int32_t seqLen, int32_t numQHeads, in
     CUDA_CHECK(cudaGetLastError());
 
     CuteDslFMHARunner runner(numQHeads, numKVHeads, headDim, batchSize, seqLen, seqLen);
-    runner.run(qCute.dataPointer<half>(), kvCacheCute.dataPointer<half>(), outputCuteDsl.dataPointer<half>(),
-        cuKVSeqLens.dataPointer<int32_t>(), stream, attentionScale, INT_MAX, false, 1.0F, 1.0F, 1.0F,
-        skipSoftmaxThresholdLog2);
+    ASSERT_TRUE(runner.run(qCute.dataPointer<half>(), kvCacheCute.dataPointer<half>(),
+        outputCuteDsl.dataPointer<half>(), cuKVSeqLens.dataPointer<int32_t>(), stream, attentionScale, INT_MAX, false,
+        1.0F, 1.0F, 1.0F, skipSoftmaxThresholdLog2));
 
     rt::launchFmhaReferenceBshd(qReference, kReference, vReference, outputReference, true, attentionScale, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -681,9 +681,10 @@ void runLlmPagedNonCausalAccuracyCase(int32_t physicalSeqLenQ, int32_t numQHeads
 
     cudaStream_t stream = nullptr;
     CuteDslFMHARunner runner(numQHeads, numKVHeads, headDim, batchSize, physicalSeqLenQ, kCapacity);
-    runner.runPaged(qHalfTensor.rawPointer(), kvHalfTensor.rawPointer(), pageListTensor.dataPointer<int32_t>(),
-        outputFp16.rawPointer(), cuKVSeqLensTensor.dataPointer<int32_t>(), numPages, kMaxPagesPerSeq, kTokensPerPage,
-        DataType::kHALF, stream, attentionScale, INT_MAX, /*fp8Input=*/false, 1.0F, 1.0F, 1.0F, /*isCausal=*/false);
+    ASSERT_TRUE(runner.runPaged(qHalfTensor.rawPointer(), kvHalfTensor.rawPointer(),
+        pageListTensor.dataPointer<int32_t>(), outputFp16.rawPointer(), cuKVSeqLensTensor.dataPointer<int32_t>(),
+        numPages, kMaxPagesPerSeq, kTokensPerPage, DataType::kHALF, stream, attentionScale, INT_MAX, /*fp8Input=*/false,
+        1.0F, 1.0F, 1.0F, /*isCausal=*/false));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
 
@@ -702,10 +703,11 @@ void runLlmPagedNonCausalAccuracyCase(int32_t physicalSeqLenQ, int32_t numQHeads
     copyHostToDevice(qFp8Tensor, qFp8);
     copyHostToDevice(kvFp8Tensor, kvPagedFp8);
 
-    runner.runPaged(qFp8Tensor.rawPointer(), kvFp8Tensor.rawPointer(), pageListTensor.dataPointer<int32_t>(),
-        outputFp8.rawPointer(), cuKVSeqLensTensor.dataPointer<int32_t>(), numPages, kMaxPagesPerSeq, kTokensPerPage,
-        DataType::kFP8, stream, attentionScale, INT_MAX, /*fp8Input=*/true, kQScale, kKScale, kVScale,
-        /*isCausal=*/false);
+    ASSERT_TRUE(
+        runner.runPaged(qFp8Tensor.rawPointer(), kvFp8Tensor.rawPointer(), pageListTensor.dataPointer<int32_t>(),
+            outputFp8.rawPointer(), cuKVSeqLensTensor.dataPointer<int32_t>(), numPages, kMaxPagesPerSeq, kTokensPerPage,
+            DataType::kFP8, stream, attentionScale, INT_MAX, /*fp8Input=*/true, kQScale, kKScale, kVScale,
+            /*isCausal=*/false));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
 
@@ -889,10 +891,10 @@ void runLlmD512PagedAccuracyCase(int32_t physicalSeqLen, int32_t numQHeads, int3
                 /*isCausal=*/true, /*skipSoftmaxThresholdLog2=*/0.0F, nullptr, blockEnd),
             std::runtime_error);
     }
-    runner.runPaged(qTensor.rawPointer(), kvPagedTensor.rawPointer(), pageListTensor.dataPointer<int32_t>(),
+    ASSERT_TRUE(runner.runPaged(qTensor.rawPointer(), kvPagedTensor.rawPointer(), pageListTensor.dataPointer<int32_t>(),
         outputCuteDsl.rawPointer(), paddedCuKVSeqLens.dataPointer<int32_t>(), numPages, maxPagesPerSeq, kTokensPerPage,
         DataType::kHALF, stream, attentionScale, slidingWindowSize, false, 1.0F, 1.0F, 1.0F,
-        /*isCausal=*/true, /*skipSoftmaxThresholdLog2=*/0.0F, blockBegin, blockEnd);
+        /*isCausal=*/true, /*skipSoftmaxThresholdLog2=*/0.0F, blockBegin, blockEnd));
     if (useBidirectional)
     {
         auto const reference
@@ -991,12 +993,13 @@ void runLlmD512PagedFp8AccuracyCase(int32_t seqLen, int32_t slidingWindowSize)
     cudaStream_t stream = nullptr;
     float const attentionScale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
     CuteDslFMHARunner runner(kNumQHeads, kNumKVHeads, kHeadDim, kBatchSize, seqLen, seqLen);
-    runner.runPaged(qFp16Tensor.rawPointer(), kvFp16Tensor.rawPointer(), pageListTensor.dataPointer<int32_t>(),
-        outputFp16.rawPointer(), cuKVSeqLens.dataPointer<int32_t>(), numPages, maxPagesPerSeq, kTokensPerPage,
-        DataType::kHALF, stream, attentionScale, slidingWindowSize);
-    runner.runPaged(qFp8Tensor.rawPointer(), kvFp8Tensor.rawPointer(), pageListTensor.dataPointer<int32_t>(),
-        outputFp8.rawPointer(), cuKVSeqLens.dataPointer<int32_t>(), numPages, maxPagesPerSeq, kTokensPerPage,
-        DataType::kFP8, stream, attentionScale, slidingWindowSize, true, kQScale, kKScale, kVScale);
+    ASSERT_TRUE(runner.runPaged(qFp16Tensor.rawPointer(), kvFp16Tensor.rawPointer(),
+        pageListTensor.dataPointer<int32_t>(), outputFp16.rawPointer(), cuKVSeqLens.dataPointer<int32_t>(), numPages,
+        maxPagesPerSeq, kTokensPerPage, DataType::kHALF, stream, attentionScale, slidingWindowSize));
+    ASSERT_TRUE(
+        runner.runPaged(qFp8Tensor.rawPointer(), kvFp8Tensor.rawPointer(), pageListTensor.dataPointer<int32_t>(),
+            outputFp8.rawPointer(), cuKVSeqLens.dataPointer<int32_t>(), numPages, maxPagesPerSeq, kTokensPerPage,
+            DataType::kFP8, stream, attentionScale, slidingWindowSize, true, kQScale, kKScale, kVScale));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
 
@@ -1086,13 +1089,13 @@ void runLlmPagedMatchesContiguousCase(int32_t batchSize, int32_t seqLen, int32_t
     cudaStream_t stream = nullptr;
     float const attentionScale = 1.0F / std::sqrt(static_cast<float>(headDim));
     CuteDslFMHARunner runner(numQHeads, numKVHeads, headDim, batchSize, seqLen, seqLen);
-    runner.run(qContiguous.rawPointer(), kvContiguousTensor.rawPointer(), outputContiguous.dataPointer<half>(),
-        cuKVSeqLens.dataPointer<int32_t>(), stream, attentionScale, slidingWindowSize, fp8Input, qScale, kScale, vScale,
-        skipSoftmaxThresholdLog2);
-    runner.runPaged(qPaged.rawPointer(), kvPagedTensor.rawPointer(), pageListTensor.dataPointer<int32_t>(),
+    ASSERT_TRUE(runner.run(qContiguous.rawPointer(), kvContiguousTensor.rawPointer(),
+        outputContiguous.dataPointer<half>(), cuKVSeqLens.dataPointer<int32_t>(), stream, attentionScale,
+        slidingWindowSize, fp8Input, qScale, kScale, vScale, skipSoftmaxThresholdLog2));
+    ASSERT_TRUE(runner.runPaged(qPaged.rawPointer(), kvPagedTensor.rawPointer(), pageListTensor.dataPointer<int32_t>(),
         outputPaged.dataPointer<half>(), cuKVSeqLens.dataPointer<int32_t>(), numPages, maxPagesPerSeq, tokensPerPage,
         dataType, stream, attentionScale, slidingWindowSize, fp8Input, qScale, kScale, vScale, /*isCausal=*/true,
-        skipSoftmaxThresholdLog2);
+        skipSoftmaxThresholdLog2));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
 
@@ -1172,8 +1175,8 @@ void runLlmFp8LongSequenceAccuracyCase(int32_t numQHeads, int32_t numKVHeads, in
     cudaStream_t stream = nullptr;
     float const attentionScale = 1.0F / std::sqrt(static_cast<float>(headDim));
     CuteDslFMHARunner runner(numQHeads, numKVHeads, headDim, batchSize, seqLen, seqLen);
-    runner.run(qFp8.rawPointer(), kvCacheFp8.rawPointer(), outputCuteDsl.rawPointer(),
-        cuKVSeqLens.dataPointer<int32_t>(), stream, attentionScale, INT_MAX, true, qScale, kScale, vScale);
+    ASSERT_TRUE(runner.run(qFp8.rawPointer(), kvCacheFp8.rawPointer(), outputCuteDsl.rawPointer(),
+        cuKVSeqLens.dataPointer<int32_t>(), stream, attentionScale, INT_MAX, true, qScale, kScale, vScale));
     rt::launchFmhaReferenceBshd(qReference, kReference, vReference, outputReference, true, attentionScale, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
@@ -1235,11 +1238,6 @@ TEST(CuteDslFMHARunnerTest, llmD512PagedAccuracy)
         GTEST_SKIP() << "D512 CuTe DSL FMHA unit tests only run on SM100/101/110. Current SM=" << rawSmVersion;
     }
 
-    if (!CuteDslFMHARunner::loadLLMKernelModule())
-    {
-        FAIL() << "Failed to load CuTe DSL LLM FMHA kernel modules";
-    }
-
     struct LlmD512Case
     {
         int32_t seqLen;
@@ -1276,11 +1274,6 @@ TEST(CuteDslFMHARunnerTest, llmD512PagedRaggedAccuracy)
         GTEST_SKIP() << "D512 CuTe DSL FMHA unit tests only run on SM100/101/110. Current SM=" << rawSmVersion;
     }
 
-    if (!CuteDslFMHARunner::loadLLMKernelModule())
-    {
-        FAIL() << "Failed to load CuTe DSL LLM FMHA kernel modules";
-    }
-
     std::vector<int32_t> const validSeqLens{1, 128, 257};
     runLlmD512PagedAccuracyCase(257, 8, 2, validSeqLens, 1.0F / std::sqrt(static_cast<float>(512)));
 }
@@ -1292,11 +1285,6 @@ TEST(CuteDslFMHARunnerTest, llmD512PagedNonCausalAccuracy)
     {
         GTEST_SKIP() << "D512 CuTe DSL FMHA unit tests only run on SM100/101/110. Current SM=" << rawSmVersion;
     }
-    if (!CuteDslFMHARunner::loadLLMKernelModule())
-    {
-        FAIL() << "Failed to load CuTe DSL LLM FMHA kernel modules";
-    }
-
     runLlmPagedNonCausalAccuracyCase(32, 8, 1, 512, /*qSeqLens=*/{17, 9}, /*kvSeqLens=*/{96, 37}, /*fp8Input=*/false);
 }
 
@@ -1306,11 +1294,6 @@ TEST(CuteDslFMHARunnerTest, llmD256PagedNonCausalAccuracy)
     if (!isSupportedCuteDslTestSm(rawSmVersion))
     {
         GTEST_SKIP() << "D256 CuTe DSL FMHA unit tests only run on SM100/101/110. Current SM=" << rawSmVersion;
-    }
-
-    if (!CuteDslFMHARunner::loadLLMKernelModule())
-    {
-        FAIL() << "Failed to load CuTe DSL LLM FMHA kernel modules";
     }
 
     runLlmPagedNonCausalAccuracyCase(4, 16, 8, 256, /*qSeqLens=*/{4, 3}, /*kvSeqLens=*/{24, 11}, /*fp8Input=*/false);
@@ -1323,11 +1306,6 @@ TEST(CuteDslFMHARunnerTest, llmD512PagedBidirectionalAccuracy)
     {
         GTEST_SKIP() << "D512 CuTe DSL FMHA unit tests only run on SM100/101/110. Current SM=" << rawSmVersion;
     }
-    if (!CuteDslFMHARunner::loadLLMKernelModule())
-    {
-        FAIL() << "Failed to load CuTe DSL LLM FMHA kernel modules";
-    }
-
     constexpr int32_t kNumQHeads = 4;
     constexpr int32_t kNumKVHeads = 2;
     float const attentionScale = 1.0F / std::sqrt(512.0F);
@@ -1395,11 +1373,6 @@ TEST(CuteDslFMHARunnerTest, llmD512PagedFp8Accuracy)
     {
         GTEST_SKIP() << "D512 CuTe DSL FMHA unit tests only run on SM100/101/110. Current SM=" << rawSmVersion;
     }
-    if (!CuteDslFMHARunner::loadLLMKernelModule())
-    {
-        FAIL() << "Failed to load CuTe DSL LLM FMHA kernel modules";
-    }
-
     runLlmD512PagedFp8AccuracyCase(128, INT_MAX);
     runLlmD512PagedFp8AccuracyCase(128, 63);
     runLlmD512PagedFp8AccuracyCase(1024, INT_MAX);
@@ -1412,11 +1385,6 @@ TEST(CuteDslFMHARunnerTest, llmD512PagedFp8NonCausalAccuracy)
     {
         GTEST_SKIP() << "D512 CuTe DSL FMHA unit tests only run on SM100/101/110. Current SM=" << rawSmVersion;
     }
-    if (!CuteDslFMHARunner::loadLLMKernelModule())
-    {
-        FAIL() << "Failed to load CuTe DSL LLM FMHA kernel modules";
-    }
-
     runLlmPagedNonCausalAccuracyCase(32, 8, 1, 512, /*qSeqLens=*/{17, 9}, /*kvSeqLens=*/{96, 37}, /*fp8Input=*/true);
 }
 
@@ -1427,11 +1395,6 @@ TEST(CuteDslFMHARunnerTest, llmD256PagedFp8NonCausalAccuracy)
     {
         GTEST_SKIP() << "D256 CuTe DSL FMHA unit tests only run on SM100/101/110. Current SM=" << rawSmVersion;
     }
-    if (!CuteDslFMHARunner::loadLLMKernelModule())
-    {
-        FAIL() << "Failed to load CuTe DSL LLM FMHA kernel modules";
-    }
-
     runLlmPagedNonCausalAccuracyCase(4, 16, 8, 256, /*qSeqLens=*/{4, 3}, /*kvSeqLens=*/{24, 11}, /*fp8Input=*/true);
 }
 
@@ -1441,11 +1404,6 @@ TEST(CuteDslFMHARunnerTest, vitAccuracy)
     if (!isSupportedCuteDslTestSm(rawSmVersion))
     {
         GTEST_SKIP() << "CuTe DSL FMHA unit tests only run on SM100/101/110. Current SM=" << rawSmVersion;
-    }
-
-    if (!CuteDslFMHARunner::loadViTKernelModule())
-    {
-        GTEST_SKIP() << "Failed to load CuTe DSL ViT FMHA kernel module";
     }
 
     struct ViTCase
@@ -1492,11 +1450,6 @@ TEST(CuteDslFMHARunnerTest, llmAccuracy)
         GTEST_SKIP() << "CuTe DSL FMHA unit tests only run on SM100/101/110. Current SM=" << rawSmVersion;
     }
 
-    if (!CuteDslFMHARunner::loadLLMKernelModule())
-    {
-        GTEST_SKIP() << "Failed to load CuTe DSL LLM FMHA kernel module";
-    }
-
     struct LlmCase
     {
         int32_t batchSize;
@@ -1538,11 +1491,6 @@ TEST(CuteDslFMHARunnerTest, llmSkipSoftmaxAccuracy)
         GTEST_SKIP() << "CuTe DSL FMHA unit tests only run on SM100/101/110. Current SM=" << rawSmVersion;
     }
 
-    if (!CuteDslFMHARunner::loadLLMKernelModule())
-    {
-        GTEST_SKIP() << "Failed to load CuTe DSL LLM FMHA kernel module";
-    }
-
     struct LlmCase
     {
         int32_t batchSize;
@@ -1580,11 +1528,6 @@ TEST(CuteDslFMHARunnerTest, llmPagedKVMatchesContiguous)
     if (!isSupportedCuteDslTestSm(rawSmVersion))
     {
         GTEST_SKIP() << "CuTe DSL FMHA unit tests only run on SM100/101/110. Current SM=" << rawSmVersion;
-    }
-
-    if (!CuteDslFMHARunner::loadLLMKernelModule())
-    {
-        FAIL() << "Failed to load CuTe DSL LLM FMHA kernel module";
     }
 
     struct LlmPagedCase
@@ -1632,11 +1575,6 @@ TEST(CuteDslFMHARunnerTest, llmPagedKVSkipSoftmaxMatchesContiguous)
         GTEST_SKIP() << "CuTe DSL FMHA unit tests only run on SM100/101/110. Current SM=" << rawSmVersion;
     }
 
-    if (!CuteDslFMHARunner::loadLLMKernelModule())
-    {
-        FAIL() << "Failed to load CuTe DSL LLM FMHA kernel module";
-    }
-
     struct LlmPagedSkipCase
     {
         int32_t batchSize;
@@ -1672,11 +1610,6 @@ TEST(CuteDslFMHARunnerTest, llmPagedKVFp8MatchesContiguous)
         GTEST_SKIP() << "CuTe DSL FMHA unit tests only run on SM100/101/110. Current SM=" << rawSmVersion;
     }
 
-    if (!CuteDslFMHARunner::loadLLMKernelModule())
-    {
-        FAIL() << "Failed to load CuTe DSL LLM FMHA kernel module";
-    }
-
     constexpr float qScale = 0.01429094560444355F;
     constexpr float kScale = 0.021F;
     constexpr float vScale = 0.017F;
@@ -1694,11 +1627,6 @@ TEST(CuteDslFMHARunnerTest, llmFp8LongSequenceAccuracy)
     if (!isSupportedCuteDslTestSm(rawSmVersion))
     {
         GTEST_SKIP() << "CuTe DSL FMHA unit tests only run on SM100/101/110. Current SM=" << rawSmVersion;
-    }
-
-    if (!CuteDslFMHARunner::loadLLMKernelModule())
-    {
-        FAIL() << "Failed to load CuTe DSL LLM FMHA kernel module";
     }
 
     runLlmFp8LongSequenceAccuracyCase(32, 2, 128);
