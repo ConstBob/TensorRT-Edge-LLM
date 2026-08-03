@@ -182,11 +182,18 @@ public:
     /**
      * @brief Load tokenizer from HuggingFace model directory
      * @param modelDir Path to the model directory containing tokenizer files
+     * @param requireChatTemplate When true (default), a missing
+     *        processed_chat_template.json fails the load. Pipelines that only
+     *        decode token ids and never build a chat prompt pass false; the
+     *        sole current caller is the Nemotron-3.5-ASR RNN-T runtime, whose
+     *        checkpoint ships no chat template. (Chat-templated models,
+     *        including thinker-based ASR such as Qwen3-ASR, keep the default.)
+     *        An existing template is still loaded when present.
      * @return true if directory exists, tokenizer.json is found and parsed successfully,
      *         pretokenizer and encoder are created successfully; false if directory doesn't exist,
      *         tokenizer.json is missing/corrupt, or initialization fails
      */
-    bool loadFromHF(std::filesystem::path const& modelDir);
+    bool loadFromHF(std::filesystem::path const& modelDir, bool requireChatTemplate = true);
 
     /*!
      * @brief Get total vocabulary size
@@ -455,6 +462,10 @@ protected:
 
     // Decoder replacements: list of (pattern, replacement) pairs applied after decoding (reverse of normalizer).
     std::vector<std::pair<std::string, std::string>> mDecoderReplacements;
+
+    //! Metaspace decoder with prepend_scheme != "never": strip the single
+    //! leading space produced by the prepended word-boundary marker.
+    bool mMetaspaceStripLeading{false};
 
     // ByteFallback: whether to convert <0xNN> pieces back to raw bytes during decode.
     // Set when tokenizer.json decoder contains a "ByteFallback" step (SentencePiece-style).

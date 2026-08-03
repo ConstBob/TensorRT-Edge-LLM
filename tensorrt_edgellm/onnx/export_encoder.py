@@ -152,6 +152,7 @@ _VISUAL_FAMILY_BUILD_FN: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 _AUDIO_MODEL_TYPES: frozenset[str] = frozenset([
+    "nemotron3_5_asr",
     "qwen3_asr",
     "qwen3_omni",
     "qwen3_omni_thinker",
@@ -415,7 +416,15 @@ def export_audio_onnx(
 
     build_fn = None
     extra_kwargs = {}
-    if model_type in _NEMOTRON_OMNI_MODEL_TYPES:
+    if model_type == "nemotron3_5_asr":
+        # FastConformer encoder for the RNN-T ASR model. Output frames feed
+        # the RNN-T joint network (see modeling_nemotron3_5_asr_decoder.py),
+        # not LLM prompt embeddings.
+        from ..models.nemotron3_5_asr.modeling_nemotron3_5_asr_audio import \
+            build_nemotron3_5_asr_audio
+        logger.info("Building Nemotron-3.5-ASR FastConformer encoder ...")
+        build_fn = build_nemotron3_5_asr_audio
+    elif model_type in _NEMOTRON_OMNI_MODEL_TYPES:
         from ..models.nemotron_omni.modeling_nemotron_omni_audio import \
             build_nemotron_omni_audio
         logger.info("Building Nemotron-Omni audio encoder ...")

@@ -78,6 +78,7 @@ for large language models and vision-language models on edge devices.
    :caption: Models
 
    developer_guide/models/cosmos3.md
+   developer_guide/models/nemotron3_5_asr.md
 
 .. toctree::
    :maxdepth: 2

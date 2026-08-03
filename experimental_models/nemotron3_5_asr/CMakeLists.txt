@@ -13,8 +13,16 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-# Experimental models. Each subdirectory is a self-contained model that links
-# the core edgellm libraries (edgellmCore, edgellmBuilder, edgellmKernels, ...).
+message(STATUS "Configuring experimental model: nemotron3_5_asr")
 
-add_subdirectory(cosmos3)
-add_subdirectory(nemotron3_5_asr)
+# Standalone RNN-T transcription runtime (FastConformer encoder + LSTM
+# prediction-network greedy decode) and its example CLI. They link the core
+# libraries: edgellmCore, exampleUtils, commonLibraryExt. The Python export and
+# the shared audio engine builder (audio_build) stay in the main tree; only the
+# model-specific inference runtime lives here.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/cpp/CMakeLists.txt)
+  add_subdirectory(cpp)
+endif()
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/examples/CMakeLists.txt)
+  add_subdirectory(examples)
+endif()

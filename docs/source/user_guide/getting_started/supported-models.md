@@ -349,12 +349,20 @@ Qwen3.5 and Qwen3.6 checkpoints are unified text+VLM models. The same checkpoint
 | Model Series | Transformers Class | `tensorrt_edgellm` Handling | Supported Precisions |
 |--------------|--------------------|-----------------------|----------------------|
 | Qwen3-ASR | Checkpoint architecture `Qwen3ASRForConditionalGeneration`; text backbone compatible with [`Qwen3ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3/modeling_qwen3.py) | `Qwen3ASRLanguageModel` + `QwenAudioEncoder` | FP16; FP8 LLM (optional FP8 audio); NVFP4 LLM (optional FP8 audio; see [ASR example](../examples/asr.md)) |
+| Nemotron-3.5-ASR (experimental) | Root `model_type` `nemotron3_5_asr`; RNN-T transducer (FastConformer encoder + LSTM prediction network), from the transformers `nemotron_asr_streaming` family | `tensorrt_edgellm.models.nemotron3_5_asr` -> `audio/` encoder + `rnnt_decoder/` step ONNX (built with the shared `audio_build`), run by the experimental `nemotron_asr_inference` runtime (audio -> transcript; no LLM backbone) | FP16 |
 
 <details>
 <summary><b>Qwen3-ASR</b> checkpoints</summary>
 
 - [Qwen/Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B)
 - [Qwen/Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B)
+
+</details>
+
+<details>
+<summary><b>Nemotron-3.5-ASR</b> checkpoints</summary>
+
+- [nvidia/nemotron-3.5-asr-streaming-0.6b](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b)
 
 </details>
 
