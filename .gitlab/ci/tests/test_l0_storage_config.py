@@ -53,6 +53,7 @@ L0_STORAGE_GATE = "init_l0_storage"
 EXPORT_PRODUCER_LANES = {
     "l0_checkpoint_export": "checkpoint_export/onnx",
     "l0_checkpoint_export_ampere": "checkpoint_export_ampere/onnx",
+    "l0_checkpoint_export_a30_trtrtx": "checkpoint_export_a30_trtrtx/onnx",
 }
 EXPECTED_EXPORT_JOBS = {
     "l0_checkpoint_export": {
@@ -74,6 +75,10 @@ EXPECTED_EXPORT_JOBS = {
         "l0_a30_trt11",
         "l0_rtx3090",
         "l0_jetson_orin",
+    },
+    "l0_checkpoint_export_a30_trtrtx": {
+        "l0_checkpoint_export_a30_trtrtx",
+        "l0_a30_trtrtx",
     },
 }
 

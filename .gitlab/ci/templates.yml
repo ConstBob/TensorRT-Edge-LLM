@@ -77,6 +77,10 @@
   variables:
     L0_ONNX_CACHE_RELATIVE_PATH: "checkpoint_export_ampere/onnx"
 
+.l0_a30_trtrtx_exports:
+  variables:
+    L0_ONNX_CACHE_RELATIVE_PATH: "checkpoint_export_a30_trtrtx/onnx"
+
 .l0_storage_lifecycle:
   image:
     name: "$L0_STORAGE_IMAGE"

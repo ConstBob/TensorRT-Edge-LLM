@@ -69,21 +69,23 @@ l0_checkpoint_export_ampere:
 # its own cache rather than shared with l0_checkpoint_export_ampere.
 l0_checkpoint_export_a30_trtrtx:
   stage: l0_test
+  resource_group: "${L0_STORAGE_RESOURCE_GROUP}-onnx-a30-trtrtx"
+  needs:
+    - job: init_l0_storage
+      artifacts: false
   variables:
     CUDA_VERSION: "13.2"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    TEST_CACHE_DIR: "$L0_CACHE_DIR/checkpoint_export_a30_trtrtx"
     PRIORITY: l0_checkpoint_export_a30_trtrtx
     ONNX_REUSE: "$L0_ONNX_REUSE"
-    ONNX_DIR: "$L0_ONNX_CACHE_DIR/checkpoint_export_a30_trtrtx/onnx"
-    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
   tags:
     - a30-edgellm-nvks
   image: "$IMAGE"
   extends:
+    - .l0_storage_paths
+    - .l0_a30_trtrtx_exports
     - .checkpoint_export_template
     - .l0_rules
-    - .l0_environment
 
 # Building and testing with A30 Linux
 l0_a30:
@@ -185,8 +187,7 @@ l0_builder_a30:
   interruptible: true
 
 # Building and testing with A30 Linux against TRT-RTX instead of Enterprise TRT.
-# Reuses the ONNX from l0_checkpoint_export_ampere: export is TRT-independent,
-# so only the build and runtime differ.
+# Consumes the TRT-RTX-specific ONNX produced by l0_checkpoint_export_a30_trtrtx.
 l0_a30_trtrtx:
   stage: l0_test
   needs:
@@ -197,20 +198,17 @@ l0_a30_trtrtx:
     CUDA_VERSION: "13.2"
     TRT_RTX_VERSION: "1.7.0.28"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    TEST_CACHE_DIR: "$L0_CACHE_DIR/a30_trtrtx"
     PRIORITY: l0_pipeline_a30_trtrtx
-    ONNX_DIR: "$L0_ONNX_CACHE_DIR/checkpoint_export_a30_trtrtx/onnx"
-    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
-    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/TensorRT-RTX/$TRT_RTX_VERSION/TensorRT-RTX-$TRT_RTX_VERSION-x86_64_rocky8_cuda13.4"
     TRT_WHEEL_GLOB: "tensorrt_rtx-$TRT_RTX_VERSION*-cp312*"
   tags:
     - a30-edgellm-nvks
   image: "$IMAGE"
   extends:
+    - .l0_storage_paths
+    - .l0_a30_trtrtx_exports
     - .x86_test_template
     - .l0_rules
-    - .l0_environment
   interruptible: true
 
 l0_rtx3090:
