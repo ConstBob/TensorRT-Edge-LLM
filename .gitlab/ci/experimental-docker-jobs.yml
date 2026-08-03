@@ -4,6 +4,8 @@
 
 l0_experimental_docker_jedha:
   stage: l0_test
+  extends:
+    - .ci_internal_submodules
   needs:
     - job: build_cutedsl_docker_matrix
       artifacts: true

@@ -48,7 +48,7 @@ esac
 
 require_tool() {
     if ! command -v "$1" >/dev/null 2>&1; then
-        echo "$1 is required to prepare the CuteDSL artifact." >&2
+        echo "$1 is required to build the experimental image." >&2
         exit 1
     fi
 }
@@ -74,6 +74,9 @@ build_cutedsl_tarball() {
 }
 
 cd "${repo_root}"
+
+require_tool git
+git submodule update --init --recursive
 
 if [[ ! -f "${tarball_path}" ]]; then
     build_cutedsl_tarball

@@ -17,6 +17,9 @@ Use the wrapper script from the repository root:
 experimental/docker/build_container.sh
 ```
 
+The wrapper initializes the repository submodules before creating the Docker
+build context.
+
 To customize the image name, set `EXPERIMENTAL_DOCKER_IMAGE` before running the
 wrapper.
 
