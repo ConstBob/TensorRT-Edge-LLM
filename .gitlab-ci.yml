@@ -7,6 +7,7 @@ variables:
   # Bump the modelopt version here to roll all L1 export jobs forward at once.
   QUANT_CHECKPOINT_DIR: "/scratch.edge_llm_data/modelopt-0.45.0/quantization_checkpoint"
   TRT_VERSION: "10.16.0.72"
+  TRT_WHEEL_GLOB: "tensorrt-$TRT_VERSION*-cp312*"
   TRT10_X86_VERSION: "10.16.0.72"
   TRT10_THOR_VERSION: "10.16.0.72"
   TRT11_VERSION: "11.0.0.114"

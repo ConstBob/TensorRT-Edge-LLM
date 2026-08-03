@@ -154,6 +154,9 @@ def test_checkpoint_export(test_param: str, test_logger,
         if extw_kinds:
             export_cmd += ["--externalize-weights", *extw_kinds]
 
+        if config.int4_gemm_plugin_v1:
+            export_cmd += ["--int4-gemm-plugin-version", "1"]
+
         env_vars = {}
         if config.trt_native_attn:
             env_vars["USE_TRT_NATIVE_ATTN"] = "1"

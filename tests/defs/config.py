@@ -637,6 +637,11 @@ class TestConfig:
     # Export NVFP4 MoE graph for a specific plugin target (for example sm12x).
     nvfp4_moe_target: Optional[str] = None
 
+    # Export INT4 GEMM with the legacy AWQ-swizzled Int4GroupwiseGemmPlugin (V1)
+    # instead of the default cuteDSL Int4GroupwiseGemmPluginV2. TRT-RTX's ONNX
+    # parser only imports V1.
+    int4_gemm_plugin_v1: Optional[bool] = None
+
     # Debug flag for verbose output
     debug: Optional[bool] = None
 
@@ -874,6 +879,10 @@ class TestConfig:
                           TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
                           TaskType.INFERENCE
                       }, {ModelType.LLM, ModelType.VLM, ModelType.OMNI},
+                      is_required=False),
+        ParameterSpec("int4_gemm_plugin_v1",
+                      "gemmv1", {TaskType.EXPORT},
+                      {ModelType.LLM, ModelType.VLM, ModelType.OMNI},
                       is_required=False),
         # kernel_bench parameters
         ParameterSpec("bench_mode",
@@ -1141,6 +1150,8 @@ class TestConfig:
                 parsed_params['past_kv_len'] = int(part[3:])
             elif part == 'trt11':
                 parsed_params['trt_native_attn'] = True
+            elif part == 'gemmv1':
+                parsed_params['int4_gemm_plugin_v1'] = True
             elif part.lower() in _NVFP4_MOE_TARGET_TOKENS:
                 parsed_params['nvfp4_moe_target'] = (
                     _normalize_nvfp4_moe_target(part))

@@ -34,7 +34,7 @@ namespace builder
 namespace
 {
 
-void appendLunowudFlag(std::string& flags, std::string const& flag)
+[[maybe_unused]] void appendLunowudFlag(std::string& flags, std::string const& flag)
 {
     if (flags.find(flag) != std::string::npos)
     {
