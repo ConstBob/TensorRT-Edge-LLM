@@ -35,6 +35,7 @@ Usage
 import json
 import logging
 import os
+import pathlib
 from typing import Callable, Dict, Iterator, Optional, Tuple
 
 import torch
@@ -277,6 +278,19 @@ def _detect_key_prefix(keys: list) -> Tuple[str, str]:
     return "", ""
 
 
+def _resolve_shard(model_dir: str, shard: str) -> str:
+    """Return the absolute shard path, asserting it stays inside model_dir."""
+    base = pathlib.Path(model_dir).resolve()
+    resolved = (base / shard).resolve()
+    try:
+        resolved.relative_to(base)
+    except ValueError:
+        raise ValueError(
+            f"Shard path {shard!r} in checkpoint index escapes model_dir "
+            f"{model_dir!r}. This may indicate a malformed checkpoint.")
+    return str(resolved)
+
+
 def _build_shard_map(model_dir: str) -> Dict[str, str]:
     """Return a mapping of weight-key -> absolute shard file path.
 
@@ -297,7 +311,7 @@ def _build_shard_map(model_dir: str) -> Dict[str, str]:
         missing_shards = {
             shard
             for shard in set(weight_map.values())
-            if not os.path.exists(os.path.join(model_dir, shard))
+            if not os.path.exists(_resolve_shard(model_dir, shard))
         }
         if missing_shards and os.path.exists(single_path):
             logger.warning(
@@ -308,7 +322,7 @@ def _build_shard_map(model_dir: str) -> Dict[str, str]:
             )
         else:
             return {
-                key: os.path.join(model_dir, shard)
+                key: _resolve_shard(model_dir, shard)
                 for key, shard in weight_map.items()
             }
 
@@ -321,7 +335,7 @@ def _build_shard_map(model_dir: str) -> Dict[str, str]:
 
     if os.path.exists(index_path):
         return {
-            key: os.path.join(model_dir, shard)
+            key: _resolve_shard(model_dir, shard)
             for key, shard in weight_map.items()
         }
 
@@ -334,7 +348,7 @@ def _build_shard_map(model_dir: str) -> Dict[str, str]:
             index = json.load(f)
         weight_map = index["weight_map"]
         return {
-            key: os.path.join(model_dir, shard)
+            key: _resolve_shard(model_dir, shard)
             for key, shard in weight_map.items()
         }
 
