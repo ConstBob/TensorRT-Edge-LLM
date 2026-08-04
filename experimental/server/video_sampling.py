@@ -232,7 +232,17 @@ def _raw_video_frame_tokens(family: str, count: int, width: int, height: int,
             f"got {width}x{height}")
     tps = max(1, limits.get("temporal_patch_size", 2))
     t_bar = -(-count // tps) * tps
-    return max(1, t_bar * height * width // (tps * factor * factor))
+    # Each temporal group is one entry of the C++ TRT carrier, so its
+    # spatial tokens must fit the engine's per-image profile even when the
+    # request total does.
+    group_tokens = height * width // (factor * factor)
+    per_image = limits.get("max_image_tokens_per_image", 0)
+    if per_image and group_tokens > per_image:
+        raise ValueError(
+            f"do_resize=false video frames yield {group_tokens} tokens per "
+            f"temporal group, over the engine's per-image capacity "
+            f"{per_image}; lower the resolution")
+    return max(1, t_bar // tps * group_tokens)
 
 
 def _check_cu_budget(frames: int, family: str, limits: dict,
@@ -358,30 +368,52 @@ def estimate_image_tokens(path: str,
             raise ValueError(
                 f"do_resize=false images must be {factor}-aligned, "
                 f"got {width}x{height}")
-        return max(1, width * height // (factor * factor))
+        tokens = max(1, width * height // (factor * factor))
+        # A raw image is one TRT carrier entry: it must fit the per-image
+        # profile on its own, not just the request total.
+        if per_image and tokens > per_image:
+            raise ValueError(
+                f"do_resize=false image yields {tokens} visual tokens, over "
+                f"the engine's per-image capacity {per_image}; lower the "
+                "resolution")
+        return tokens
     _check_aspect_ratio(width, height)
-    # Still images use the 2D estimate for every Qwen family (a 3D family's
-    # temporal factor is 1 for stills, which reduces to the same formula).
+    model_type = limits.get("model_type", "")
+    if "qwen3_vl" in model_type or "qwen3_5" in model_type:
+        # Still image on a 3D family: the C++ resize routes stills through
+        # qwenSmartResize3D with isVideo=false (temporal factor 1), which
+        # includes the factor-grid fallback the 2D estimate lacks.
+        return _estimate_qwen3d_video_tokens(1,
+                                             width,
+                                             height,
+                                             limits,
+                                             is_video=False)
     return _estimate_qwen2d_frame_tokens(width, height, limits)
 
 
-def _estimate_qwen3d_video_tokens(nframes: int, width: int, height: int,
-                                  limits: dict) -> int:
-    """Whole-video visual tokens after the Qwen3-VL 3D smart resize
-    (temporal budget folded in), so multi-video accounting uses the tokens
-    the C++ resize actually produces rather than the per-media cap."""
+def _estimate_qwen3d_video_tokens(nframes: int,
+                                  width: int,
+                                  height: int,
+                                  limits: dict,
+                                  is_video: bool = True) -> int:
+    """Visual tokens after the Qwen3-VL 3D smart resize (temporal budget
+    folded in; ``is_video=False`` is the still-image form with a temporal
+    factor of 1), so budget accounting uses the tokens the C++ resize
+    actually produces rather than the per-media cap."""
     patch = limits.get("patch_size", 0)
     merge = limits.get("merge_size", 0)
     if patch <= 0 or merge <= 0 or width <= 0 or height <= 0 or nframes <= 0:
         return 0
     factor = patch * merge
     tps = max(1, limits.get("temporal_patch_size", 2))
-    min_px = limits.get("min_image_tokens", 0) * tps * factor * factor
-    max_px = limits.get("max_image_tokens_per_image", 0) * tps * factor \
+    temporal_factor = tps if is_video else 1
+    min_px = limits.get("min_image_tokens", 0) * temporal_factor * factor \
         * factor
+    max_px = limits.get("max_image_tokens_per_image", 0) * temporal_factor \
+        * factor * factor
     h_bar = max(factor, _round_by_factor(height, factor))
     w_bar = max(factor, _round_by_factor(width, factor))
-    t_bar = _ceil_by_factor(nframes, tps)
+    t_bar = _ceil_by_factor(nframes, tps) if is_video else 1
     budget = t_bar * h_bar * w_bar
     if max_px > 0 and budget > max_px:
         beta = math.sqrt((nframes * height * width) / max_px)
@@ -402,6 +434,13 @@ def _estimate_qwen3d_video_tokens(nframes: int, width: int, height: int,
         unit = t_bar * factor * factor
         pq_min = max(1, -(-min_px // unit)) if min_px > 0 else 1
         pq_max = max_px // unit if max_px > 0 else 0
+        if max_px > 0 and (pq_max < 1 or pq_min > pq_max):
+            # Mirrors the C++ resize: no factor-grid shape fits the profile.
+            raise ValueError(
+                f"no resized visual shape fits the engine profile "
+                f"(frames={nframes}, {height}x{width}); reduce the frame "
+                "count/resolution or rebuild the visual engine with wider "
+                "--minImageTokens/--maxImageTokens bounds")
         if pq_max >= 1 and pq_min <= pq_max:
             target = height / width
             pq_target = pq_min if t_bar * h_bar * w_bar < min_px else pq_max
@@ -418,7 +457,8 @@ def _estimate_qwen3d_video_tokens(nframes: int, width: int, height: int,
                         abs(dist - best[0]) <= 1e-12 and gap < best[1]):
                     best = (dist, gap, pp, qq)
             h_bar, w_bar = best[2] * factor, best[3] * factor
-    return max(1, (t_bar * h_bar * w_bar) // (tps * factor * factor))
+    return max(1,
+               (t_bar * h_bar * w_bar) // (temporal_factor * factor * factor))
 
 
 def clamp_nframes_to_profile(
@@ -464,11 +504,12 @@ def clamp_nframes_to_profile(
         # charge the tokens the resize actually produces.
         tps = max(1, limits.get("temporal_patch_size", 2))
         media_cap = min(per_image, cap) if per_image > 0 else cap
-        # The cu_seqlens profile holds one entry per temporal group (capacity =
-        # maxImageTokens / minImageTokens), shared request-wide: consume the
-        # remaining group budget, not full capacity each.
-        cu_groups = cu_budget if cu_budget is not None else \
-            max_total // max(1, limits.get("min_image_tokens", 1))
+        # The cu_seqlens profile holds one entry per temporal group, shared
+        # request-wide: consume the remaining group budget. Prefer the
+        # builder-recorded capacity; fall back to the pre-recording formula.
+        cu_groups = cu_budget if cu_budget is not None else (
+            limits.get("max_cu_seqlen_groups")
+            or max_total // max(1, limits.get("min_image_tokens", 1)))
         if cu_groups <= 0:
             raise ValueError(
                 "the request's other media already consume the visual "

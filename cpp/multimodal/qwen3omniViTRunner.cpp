@@ -37,10 +37,10 @@ std::tuple<int64_t, int64_t> Qwen3OmniViTRunner::computeVisionSpans(
 }
 
 std::tuple<int64_t, int64_t> Qwen3OmniViTRunner::getResizedImageSize(
-    int64_t numFrames, int64_t height, int64_t width, int64_t maxRatio)
+    int64_t numFrames, bool isVideo, int64_t height, int64_t width, int64_t maxRatio)
 {
     // Omni uses the base 2D per-frame budget, NOT Qwen3-VL's 3D.
-    return QwenViTRunner::getResizedImageSize(numFrames, height, width, maxRatio);
+    return QwenViTRunner::getResizedImageSize(numFrames, isVideo, height, width, maxRatio);
 }
 
 bool Qwen3OmniViTRunner::validateExtraConfig(nlohmann::json const& jsonConfig)
@@ -68,8 +68,8 @@ bool Qwen3OmniViTRunner::validateExtraConfig(nlohmann::json const& jsonConfig)
     return true;
 }
 
-void Qwen3OmniViTRunner::getMRopePositionIds(
-    std::vector<std::vector<int32_t>> const& batchInputIds, std::vector<VisionSpan> const& spans) noexcept
+void Qwen3OmniViTRunner::getMRopePositionIds(std::vector<std::vector<int32_t>> const& batchInputIds,
+    std::vector<VisionSpan> const& spans, std::vector<int64_t> const& spansPerRequest) noexcept
 {
     // Mirrors HF Qwen3-Omni get_rope_index: per-frame temporal step = secondPerGrid * position_id_per_seconds;
     // span advance = st_idx = max(all span positions)+1.
@@ -79,8 +79,11 @@ void Qwen3OmniViTRunner::getMRopePositionIds(
     int64_t batchOffset = 0;
 
     mMropeRopeDeltasPerBatch.clear();
-    for (auto const& inputIds : batchInputIds)
+    for (size_t r = 0; r < batchInputIds.size(); ++r)
     {
+        auto const& inputIds = batchInputIds[r];
+        // Per-request span window: a visual block may only consume this request's own spans.
+        int64_t const spanEnd = totalImageIdx + (r < spansPerRequest.size() ? spansPerRequest[r] : 0);
         auto start = inputIds.begin();
         auto end = inputIds.end();
         auto it = inputIds.begin();
@@ -91,10 +94,9 @@ void Qwen3OmniViTRunner::getMRopePositionIds(
         while ((it = std::find(searchFrom, end, mConfig.visionStartTokenId)) != end)
         {
             // A visual block is <|vision_start|> immediately followed by pads (see textPreprocess below);
-            // a stray start token, or more starts than media spans, must not consume/overrun the span
-            // list.
+            // a stray start token, or one beyond this request's span window, must not consume a span.
             if (it + 1 == end || (*(it + 1) != mConfig.imageTokenId && *(it + 1) != mConfig.videoTokenId)
-                || totalImageIdx >= static_cast<int64_t>(spans.size()))
+                || totalImageIdx >= spanEnd)
             {
                 searchFrom = it + 1;
                 continue;
@@ -155,17 +157,21 @@ void Qwen3OmniViTRunner::getMRopePositionIds(
             }
         }
 
+        totalImageIdx = spanEnd; // seal the window: unconsumed spans never leak forward
         batchOffset += 3 * maxPositionEmbeddings;
     }
 }
 
 void Qwen3OmniViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchInputIds, std::vector<VisionSpan> const& spans,
-    trt_edgellm::tokenizer::Tokenizer const* tokenizer)
+    std::vector<int64_t> const& spansPerRequest, trt_edgellm::tokenizer::Tokenizer const* tokenizer)
 {
     // Qwen3-Omni: flat-only (computeVisionSpans delegates to the base flat layout, so spans never carry timestamps)
     // and every visual pad is filled with a CONSTANT imageTokenId — embeddingLookup inserts the visual
     // features at those positions. No incrementing IDs, no <X.X s> markers, no video-triplet expansion.
+    ELLM_CHECK(spansPerRequest.size() == request.requests.size(),
+        "spansPerRequest.size() != request.requests.size(), " + std::to_string(spansPerRequest.size())
+            + " != " + std::to_string(request.requests.size()));
     size_t spanIdx = 0;
     for (size_t i = 0; i < request.requests.size(); ++i)
     {
@@ -179,13 +185,17 @@ void Qwen3OmniViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
             ids = tokenizer->encode(request.formattedRequests[i].formattedCompleteRequest);
         }
 
+        // Per-request span window: a pad may only consume this request's own spans (batch isolation).
+        size_t const spanEnd = spanIdx + static_cast<size_t>(spansPerRequest[i]);
+
         std::vector<int32_t> newIds;
         for (size_t j = 0; j < ids.size(); ++j)
         {
             if (ids[j] == mConfig.imageTokenId || ids[j] == mConfig.videoTokenId)
             {
-                ELLM_CHECK(spanIdx < spans.size(),
-                    "Pad token found but no matching vision span at index " + std::to_string(spanIdx));
+                ELLM_CHECK(spanIdx < spanEnd,
+                    "EDGELLM_BAD_MEDIA_COUNT: Qwen3OmniViTRunner::textPreprocess() pad count exceeds this request's "
+                    "media count");
                 LlmVisionBlock const& block = spans[spanIdx++].llm;
                 for (int64_t k = 0; k < block.numTokens; ++k)
                 {
@@ -197,6 +207,9 @@ void Qwen3OmniViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
                 newIds.push_back(ids[j]);
             }
         }
+        ELLM_CHECK(spanIdx == spanEnd,
+            "EDGELLM_BAD_MEDIA_COUNT: Qwen3OmniViTRunner::textPreprocess() pad count is smaller than this request's "
+            "media count");
 
         if (i < batchInputIds.size())
         {

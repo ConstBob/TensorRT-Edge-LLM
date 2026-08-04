@@ -356,7 +356,8 @@ void Gemma4UnifiedVisionRunner::textPreprocess(rt::LLMGenerationRequest const& r
             int32_t const token = ids[tokenIndex];
             if (token == mConfig.imageTokenId)
             {
-                ELLM_CHECK(imageIndex < expectedEnd, "Too many image placeholders in Gemma4 Unified prompt");
+                ELLM_CHECK(imageIndex < expectedEnd,
+                    "EDGELLM_BAD_MEDIA_COUNT: too many image placeholders in Gemma4 Unified prompt");
                 bool const alreadyHasBegin = tokenIndex > 0 && ids[tokenIndex - 1] == mConfig.beginImageTokenId;
                 bool const alreadyHasEnd
                     = tokenIndex + 1 < ids.size() && ids[tokenIndex + 1] == mConfig.endImageTokenId;
@@ -376,7 +377,8 @@ void Gemma4UnifiedVisionRunner::textPreprocess(rt::LLMGenerationRequest const& r
                 expanded.push_back(token);
             }
         }
-        ELLM_CHECK(imageIndex == expectedEnd, "Image placeholder count does not match Gemma4 Unified image count");
+        ELLM_CHECK(imageIndex == expectedEnd,
+            "EDGELLM_BAD_MEDIA_COUNT: image placeholder count does not match Gemma4 Unified image count");
         if (requestIndex < batchedInputIds.size())
         {
             batchedInputIds[requestIndex] = std::move(expanded);
@@ -391,7 +393,7 @@ void Gemma4UnifiedVisionRunner::textPreprocess(rt::LLMGenerationRequest const& r
 
 bool Gemma4UnifiedVisionRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly) noexcept
+    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly)
 {
     try
     {
@@ -406,10 +408,18 @@ bool Gemma4UnifiedVisionRunner::preprocess(rt::LLMGenerationRequest const& reque
     }
     catch (std::exception const& e)
     {
-        LOG_ERROR("Gemma4 Unified vision preprocessing failed: %s", e.what());
+        bool const actionable = isCallerActionable(e);
+        if (!actionable)
+        {
+            LOG_ERROR("Gemma4 Unified vision preprocessing failed: %s", e.what());
+        }
         // Drain async H2D copies that may still read the request's image buffers, so the caller can
-        // safely release them after the failure.
+        // safely release them after the failure -- including when the error propagates.
         cudaStreamSynchronize(stream);
+        if (actionable)
+        {
+            throw;
+        }
         return false;
     }
 }

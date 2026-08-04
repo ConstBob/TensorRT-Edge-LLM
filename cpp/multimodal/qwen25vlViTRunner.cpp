@@ -198,8 +198,8 @@ std::tuple<int64_t, int64_t> Qwen25VLViTRunner::computeVisionSpans(
     return extent;
 }
 
-void Qwen25VLViTRunner::getMRopePositionIds(
-    std::vector<std::vector<int32_t>> const& batchInputIds, std::vector<VisionSpan> const& spans) noexcept
+void Qwen25VLViTRunner::getMRopePositionIds(std::vector<std::vector<int32_t>> const& batchInputIds,
+    std::vector<VisionSpan> const& spans, std::vector<int64_t> const& spansPerRequest) noexcept
 {
     // Mirrors HF Qwen2_5_VLModel.get_rope_index: per-frame temporal step = secondPerGrid * tokens_per_second
     // (fps-aware); span advance is spatial max(llmGridH, llmGridW).
@@ -211,8 +211,11 @@ void Qwen25VLViTRunner::getMRopePositionIds(
     int64_t batchOffset = 0;
 
     mMropeRopeDeltasPerBatch.clear();
-    for (auto const& inputIds : batchInputIds)
+    for (size_t r = 0; r < batchInputIds.size(); ++r)
     {
+        auto const& inputIds = batchInputIds[r];
+        // Per-request span window: a visual block may only consume this request's own spans.
+        int64_t const spanEnd = totalImageIdx + (r < spansPerRequest.size() ? spansPerRequest[r] : 0);
         auto start = inputIds.begin();
         auto end = inputIds.end();
         auto it = inputIds.begin();
@@ -223,10 +226,9 @@ void Qwen25VLViTRunner::getMRopePositionIds(
         while ((it = std::find(searchFrom, end, mConfig.visionStartTokenId)) != end)
         {
             // A visual block is <|vision_start|> immediately followed by pads (textPreprocess fills the
-            // constant imageTokenId); a stray start token, or more starts than media spans, must not
-            // consume/overrun the span list.
-            if (it + 1 == end || *(it + 1) != mConfig.imageTokenId
-                || totalImageIdx >= static_cast<int64_t>(spans.size()))
+            // constant imageTokenId); a stray start token, or one beyond this request's span window,
+            // must not consume a span.
+            if (it + 1 == end || *(it + 1) != mConfig.imageTokenId || totalImageIdx >= spanEnd)
             {
                 searchFrom = it + 1;
                 continue;
@@ -285,6 +287,7 @@ void Qwen25VLViTRunner::getMRopePositionIds(
             }
         }
 
+        totalImageIdx = spanEnd; // seal the window: unconsumed spans never leak forward
         batchOffset += 3 * maxPositionEmbeddings;
     }
 }

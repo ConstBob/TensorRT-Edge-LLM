@@ -1211,3 +1211,114 @@ def test_pybind_video_rejects_non_finite_time_values():
     # before any file access, so a placeholder path suffices).
     with pytest.raises(Exception, match="finite"):
         rt.load_video_from_paths(["/nonexistent.png"], float("inf"))
+
+
+def test_qwen3d_infeasible_profile_raises():
+    # min=max=256 tokens with 400 frames of
+    # 1280x720 leaves no feasible factor-grid shape — the C++ resize raises,
+    # so the estimator must too instead of returning an out-of-profile size.
+    limits = dict(_QWEN3VL_LIMITS,
+                  min_image_tokens=256,
+                  max_image_tokens=256,
+                  max_image_tokens_per_image=256)
+    with pytest.raises(ValueError, match="no resized visual shape"):
+        vs._estimate_qwen3d_video_tokens(400, 1280, 720, limits)
+
+
+def test_qwen3_still_image_uses_3d_exact_shape(tmp_path):
+    # Still images route through qwenSmartResize3D(isVideo=false) whose
+    # factor-grid fallback finds the exact in-profile shape; the plain 2D
+    # estimate would land outside a fixed narrow profile.
+    pytest.importorskip("av")
+    pytest.importorskip("numpy")
+    limits = dict(_QWEN3VL_LIMITS,
+                  min_image_tokens=4,
+                  max_image_tokens=4,
+                  max_image_tokens_per_image=4)
+    assert vs._estimate_qwen3d_video_tokens(1,
+                                            1024,
+                                            1024,
+                                            limits,
+                                            is_video=False) == 4
+    img = tmp_path / "still.mp4"
+    _write_synthetic_clip(img, n_frames=1, size=1024, fps=1)
+    assert vs.estimate_image_tokens(str(img), "qwen", limits) == 4
+
+
+def test_cu_capacity_from_builder_recording():
+    # An engine that records max_cu_seqlen_groups=512 must allow 66 frames
+    # (33 temporal groups); the pre-recording formula (8192/4096 = 2 groups)
+    # would truncate the same request to 4 frames.
+    limits = dict(_QWEN3VL_LIMITS,
+                  min_image_tokens=4096,
+                  max_image_tokens=8192,
+                  max_image_tokens_per_image=8192,
+                  max_cu_seqlen_groups=512)
+    n, _ = vs.clamp_nframes_to_profile(66,
+                                       "qwen",
+                                       640,
+                                       360,
+                                       limits,
+                                       budget=8192)
+    assert n == 66
+    legacy = dict(limits)
+    legacy.pop("max_cu_seqlen_groups")
+    n_legacy, _ = vs.clamp_nframes_to_profile(66,
+                                              "qwen",
+                                              640,
+                                              360,
+                                              legacy,
+                                              budget=8192)
+    assert n_legacy == 4
+
+
+def test_raw_per_group_token_cap(tmp_path):
+    # do_resize=false media bypass the resize clamp but each temporal group
+    # (or single raw image) is still one TRT carrier entry, so its spatial
+    # tokens must fit max_image_tokens_per_image on all three raw intakes.
+    pytest.importorskip("av")
+    pytest.importorskip("numpy")
+    limits = {
+        "model_type": "qwen2_5_vl",
+        "min_image_tokens": 4,
+        "max_image_tokens": 8192,
+        "max_image_tokens_per_image": 512,
+        "patch_size": 14,
+        "merge_size": 2,
+        "temporal_patch_size": 2,
+    }
+    over = tmp_path / "over.mp4"  # 532x756 -> 19*27 = 513 tokens/group
+    _write_synthetic_clip_hw(over, n_frames=2, width=532, height=756, fps=1)
+    ok = tmp_path / "ok.mp4"  # 504x756 -> 18*27 = 486 tokens/group
+    _write_synthetic_clip_hw(ok, n_frames=2, width=504, height=756, fps=1)
+    # Raw clip intake.
+    with pytest.raises(ValueError, match="per-image"):
+        vs.sample_video(str(over), frame_limits=limits, do_resize=False)
+    _, _, _, est, _ = vs.sample_video(str(ok),
+                                      frame_limits=limits,
+                                      do_resize=False)
+    assert est == 486
+    # Raw pre-sampled frames intake.
+    with pytest.raises(ValueError, match="per-image"):
+        vs.load_video_buffer(_FakeRt(), {
+            "type": "video",
+            "frames": [str(over)] * 2,
+            "fps": 1.0,
+            "do_resize": False
+        },
+                             "qwen",
+                             frame_limits=limits)
+    buffer, est, _, _ = vs.load_video_buffer(_FakeRt(), {
+        "type": "video",
+        "frames": [str(ok)] * 2,
+        "fps": 1.0,
+        "do_resize": False
+    },
+                                             "qwen",
+                                             frame_limits=limits)
+    assert est == 486
+    # Raw still image intake (group = the image itself).
+    with pytest.raises(ValueError, match="per-image"):
+        vs.estimate_image_tokens(str(over), "qwen", limits, do_resize=False)
+    assert vs.estimate_image_tokens(str(ok), "qwen", limits,
+                                    do_resize=False) == 486

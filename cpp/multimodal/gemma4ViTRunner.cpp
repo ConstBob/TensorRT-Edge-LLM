@@ -461,6 +461,10 @@ void Gemma4ViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
         }
 
         bool const wrapImages = mConfig.beginImageTokenId >= 0 && mConfig.endImageTokenId >= 0;
+        // Per-request media window (numImages[i]): a placeholder may only consume this request's own media (batch
+        // isolation).
+        int64_t const mediaEnd = imageIndex + numImages[i];
+
         std::vector<int32_t> newIds;
         // Compute expanded size: non-image tokens + sum of image token lengths
         // (+2 boundary tokens per image when wrapping).
@@ -468,8 +472,9 @@ void Gemma4ViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
         int64_t imgIdx = imageIndex;
         for (auto tokenId : ids)
         {
-            expandedSize
-                += (tokenId == mConfig.imageTokenId) ? imageTokenLengths.at(imgIdx++) + (wrapImages ? 2 : 0) : 1;
+            expandedSize += (tokenId == mConfig.imageTokenId && imgIdx < mediaEnd)
+                ? imageTokenLengths.at(imgIdx++) + (wrapImages ? 2 : 0)
+                : 1;
         }
         newIds.reserve(expandedSize);
         for (size_t tokenIndex = 0; tokenIndex < ids.size(); ++tokenIndex)
@@ -477,6 +482,9 @@ void Gemma4ViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
             int32_t const tokenId = ids[tokenIndex];
             if (tokenId == mConfig.imageTokenId)
             {
+                ELLM_CHECK(imageIndex < mediaEnd,
+                    "EDGELLM_BAD_MEDIA_COUNT: Gemma4ViTRunner::textPreprocess() placeholder count exceeds this "
+                    "request's image count");
                 bool const alreadyHasBegin
                     = wrapImages && tokenIndex > 0 && ids[tokenIndex - 1] == mConfig.beginImageTokenId;
                 bool const alreadyHasEnd
@@ -510,14 +518,15 @@ void Gemma4ViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
         {
             batchInputIds.emplace_back(std::move(newIds));
         }
+        ELLM_CHECK(imageIndex == mediaEnd,
+            "EDGELLM_BAD_MEDIA_COUNT: Gemma4ViTRunner::textPreprocess() placeholder count is smaller than this "
+            "request's image count");
     }
-    check::check(imageIndex == static_cast<int64_t>(imageTokenLengths.size()),
-        "Gemma4ViTRunner::textPreprocess() placeholder count does not match image count");
 }
 
 bool Gemma4ViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly) noexcept
+    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly)
 {
     std::vector<ImageGrid> imageGrids;
     std::vector<int64_t> imageTokenLengths;
@@ -533,10 +542,18 @@ bool Gemma4ViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     }
     catch (std::exception const& e)
     {
-        LOG_ERROR("Failed: %s", e.what());
+        bool const actionable = isCallerActionable(e);
+        if (!actionable)
+        {
+            LOG_ERROR("Failed: %s", e.what());
+        }
         // Drain async H2D copies that may still read the request's image buffers, so the caller can
-        // safely release them after the failure.
+        // safely release them after the failure -- including when the error propagates.
         cudaStreamSynchronize(stream);
+        if (actionable)
+        {
+            throw;
+        }
         return false;
     }
 

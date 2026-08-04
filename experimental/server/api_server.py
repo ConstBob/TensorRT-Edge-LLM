@@ -19,6 +19,7 @@ Endpoints:
     GET  /health                  - Health check
     GET  /v1/models               - List available models
     POST /v1/chat/completions     - Chat completion (OpenAI-compatible)
+    POST /v1/completions          - Legacy text completion (OpenAI-compatible)
 
 Usage (standalone)::
 
@@ -41,48 +42,105 @@ import base64
 import io
 import json
 import logging
+import math
 import os
-import re
 import threading
 import time
 import uuid
 import wave
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import anthropic_compat as _anthropic
+from .audio_preprocess import MAX_AUDIO_UPLOAD_BYTES
 from .batching import BatcherOverflow, RequestBatcher, resolve_batch_size
 from .engine import (OMNI_AUDIO_SAMPLE_RATE, AudioParams, SamplingParams,
                      _normalize_logit_bias, _validate_logit_bias_spec_decode,
                      finish_reason_name)
 from .tool_calling import (ToolConfig, parse_assistant_output,
                            validate_tool_request)
+from .video_sampling import MAX_SOURCE_BYTES as MAX_VIDEO_SOURCE_BYTES
 
 logger = logging.getLogger("edgellm.api_server")
 
-# Whole-file uploads are buffered in memory (and copied again as base64),
-# and compressed audio expands further when decoded (the C++ loader also
-# caps the decoded duration); 25 MiB matches the OpenAI/vLLM limit.
-MAX_AUDIO_UPLOAD_BYTES = 25 * 1024 * 1024
-
 # Qwen3-ASR language normalization (mirrors the HF processor's
 # resolve_language): ISO codes or full names -> the canonical full name the
-# model expects in its system turn.
+# model expects in its system turn. Full official 30-language set.
 _ASR_LANGUAGES = {
     "zh": "Chinese",
     "en": "English",
     "yue": "Cantonese",
     "ar": "Arabic",
     "de": "German",
-    "es": "Spanish",
     "fr": "French",
-    "it": "Italian",
-    "ja": "Japanese",
-    "ko": "Korean",
+    "es": "Spanish",
     "pt": "Portuguese",
+    "id": "Indonesian",
+    "it": "Italian",
+    "ko": "Korean",
     "ru": "Russian",
+    "th": "Thai",
+    "vi": "Vietnamese",
+    "ja": "Japanese",
+    "tr": "Turkish",
+    "hi": "Hindi",
+    "ms": "Malay",
+    "nl": "Dutch",
+    "sv": "Swedish",
+    "da": "Danish",
+    "fi": "Finnish",
+    "pl": "Polish",
+    "cs": "Czech",
+    "fil": "Filipino",
+    "fa": "Persian",
+    "el": "Greek",
+    "hu": "Hungarian",
+    "mk": "Macedonian",
+    "ro": "Romanian",
 }
 _ASR_LANGUAGES.update({v.lower(): v for v in list(_ASR_LANGUAGES.values())})
+
+# Fallback clip-length cap when the audio engine config carries no
+# max_time_steps (same value as vLLM's max_audio_clip_s default).
+DEFAULT_MAX_AUDIO_CLIP_S = 30.0
+
+
+class _PrepareError(Exception):
+    """Request construction failed (bad input / C++ media decode) -> 400, so
+    an infer-stage failure can still surface as 500."""
+
+
+class _AudioTooLongError(Exception):
+    """Decoded audio exceeds the engine's time-step profile -> 413."""
+
+
+def _audio_duration_limit_s(audio_dir: str) -> float:
+    """Longest admissible clip in seconds: the builder's max_time_steps are
+    mel frames at a 10 ms hop, so the cap is max_time_steps / 100."""
+    try:
+        with open(os.path.join(audio_dir, "config.json"),
+                  encoding="utf-8") as f:
+            steps = json.load(f).get("builder_config",
+                                     {}).get("max_time_steps", 0)
+        if isinstance(steps, (int, float)) and steps > 0:
+            return float(steps) / 100.0
+    except (OSError, ValueError, AttributeError):
+        pass
+    return DEFAULT_MAX_AUDIO_CLIP_S
+
+
+def _check_audio_durations(request, limit_s: float) -> None:
+    """Reject decoded audio longer than the engine profile admits before it
+    reaches the C++ audio runner; buffers without PCM metadata are skipped."""
+    for req in getattr(request, "requests", None) or []:
+        for buf in getattr(req, "audio_buffers", None) or []:
+            n = getattr(buf, "num_samples", 0) or 0
+            sr = getattr(buf, "sample_rate", 0) or 0
+            if n and sr and n / sr > limit_s:
+                raise _AudioTooLongError(
+                    f"audio is {n / sr:.1f}s long but the loaded engine "
+                    f"supports at most {limit_s:.1f}s")
 
 
 def _parse_content_length(value):
@@ -94,6 +152,116 @@ def _parse_content_length(value):
         return int(value)
     except ValueError:
         return -1
+
+
+def _iter_media_refs(messages):
+    """Yield every media reference in an OpenAI message list, through the same
+    parser the loaders use so no accepted spelling escapes the policy."""
+    from .media_source import iter_item_media_refs
+
+    for message in messages or []:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            yield from iter_item_media_refs(item)
+
+
+def enforce_local_media_policy(messages, allowed_root):
+    """Server-local media is off unless --allowed-local-media-path is set, and
+    then only inside that directory: the server binds 0.0.0.0 without auth, so a
+    bare path would let any client read arbitrary local files.
+
+    Raises PermissionError, which the routes map to 403."""
+    from .media_source import resolve_file_url
+
+    root = Path(allowed_root).resolve() if allowed_root else None
+    for ref in _iter_media_refs(messages):
+        ref = (ref or "").strip()
+        if not ref or ref.startswith(("data:", "http://", "https://")):
+            continue
+        if root is None:
+            raise PermissionError(
+                "local media paths are disabled; pass base64/data URLs or "
+                "start the server with --allowed-local-media-path")
+        path = resolve_file_url(ref) if ref.startswith("file:") else ref
+        # resolve() first so that .. and symlinks cannot escape the root.
+        if not Path(path).resolve().is_relative_to(root):
+            raise PermissionError(
+                f"local media path is outside --allowed-local-media-path: {ref}"
+            )
+
+
+def _runtime_prompt_tokens(response, response_idx, fallback):
+    """The runtime's templated, media-expanded prompt length; the HF-template
+    estimate undercounts multimodal placeholders, so prefer this when present."""
+    counts = getattr(response, "prompt_token_counts", None) or []
+    if response_idx < len(counts) and counts[response_idx]:
+        return int(counts[response_idx])
+    return fallback
+
+
+def _num_field(body, name, default, *, kind, low=None, high=None):
+    """Range-checked numeric field: rejects strings, bools and non-finite values
+    that would otherwise reach the runtime and surface as a 500."""
+    value = body.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"'{name}' must be a number")
+    if kind is int and not float(value).is_integer():
+        raise ValueError(f"'{name}' must be an integer")
+    value = kind(value)
+    if kind is float and not math.isfinite(value):
+        raise ValueError(f"'{name}' must be finite")
+    if (low is not None and value < low) or (high is not None
+                                             and value > high):
+        raise ValueError(f"'{name}' out of range")
+    return value
+
+
+def _bool_field(body, name, default):
+    value = body.get(name, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"'{name}' must be a boolean")
+    return value
+
+
+# Whole-request cap for JSON endpoints. Derived from the per-video cap so one
+# maximum-size video still fits: base64 inflates it by 4/3, plus JSON framing.
+MAX_REQUEST_BODY_BYTES = -(-MAX_VIDEO_SOURCE_BYTES // 3) * 4 + 1024 * 1024
+
+
+def parse_stop(body):
+    """OpenAI-compatible ``stop``: null | str | list[str]."""
+    stop_raw = body.get("stop")
+    if stop_raw is None:
+        return []
+    if isinstance(stop_raw, str):
+        return [stop_raw]
+    if isinstance(stop_raw, list) and all(
+            isinstance(s, str) for s in stop_raw):
+        return list(stop_raw)
+    raise ValueError("'stop' must be a string or array of strings")
+
+
+def parse_sampling_params(body, *, default_max_tokens):
+    """Shared validation for the chat and completions bodies. Raises
+    ``ValueError`` so both routes answer 400 instead of failing in the runtime."""
+    # OpenAI renamed "max_tokens" to "max_completion_tokens"; the modern
+    # field takes precedence when both are present.
+    max_tokens_key = ("max_completion_tokens"
+                      if body.get("max_completion_tokens") is not None else
+                      "max_tokens")
+    return dict(
+        temperature=_num_field(body, "temperature", 0.7, kind=float, low=0.0),
+        top_p=_num_field(body, "top_p", 0.9, kind=float, low=0.0, high=1.0),
+        top_k=_num_field(body, "top_k", 50, kind=int, low=0),
+        max_tokens=_num_field(body,
+                              max_tokens_key,
+                              default_max_tokens,
+                              kind=int,
+                              low=1,
+                              high=_MAX_COMPLETION_TOKENS),
+    )
 
 
 class _ServerBusy(Exception):
@@ -168,13 +336,20 @@ class _AdmissionHandoff:
             self._on_release()
 
     def worker_started(self):
-        self._started = True
+        with self._lock:
+            self._started = True
+
+    def worker_start_failed(self):
+        with self._lock:
+            self._started = False
 
     def release(self):
         self._fire()
 
     def release_if_unstarted(self):
-        if not self._started:
+        with self._lock:
+            started = self._started
+        if not started:
             self._fire()
 
 
@@ -345,12 +520,17 @@ def _inference_error_response(exc: Exception):
 
     Input longer than the engine's built max_input_len raises with an
     EDGELLM_INPUT_TOO_LONG marker -> 413 (rebuild the engine with a larger
-    --maxInputLen to accept longer prompts / larger tool lists).
+    --maxInputLen to accept longer prompts / larger tool lists); a
+    EDGELLM_BAD_MEDIA_COUNT marker is malformed input -> 400.
     """
     if isinstance(exc, (ValueError, KeyError)):
         return _json_error(f"Invalid messages: {exc}")
     if "EDGELLM_INPUT_TOO_LONG" in str(exc):
         return _json_error(str(exc), status_code=413)
+    # Placeholder/media count mismatch is malformed client input, not a server
+    # fault; keep the runner's diagnostic so the caller can see which one.
+    if "EDGELLM_BAD_MEDIA_COUNT" in str(exc):
+        return _json_error(str(exc))
     logger.exception("Inference failed")
     return _json_error(str(exc), status_code=500)
 
@@ -424,7 +604,8 @@ def _create_app(llm_instance,
                 enable_batching: bool = False,
                 max_queue_batch_size: Optional[int] = None,
                 batch_timeout_ms: float = 10.0,
-                request_queue_size: int = _DEFAULT_REQUEST_QUEUE_SIZE):
+                request_queue_size: int = _DEFAULT_REQUEST_QUEUE_SIZE,
+                allowed_local_media_path: Optional[str] = None):
     """Create a FastAPI app backed by the given LLM instance."""
     try:
         from fastapi import FastAPI, File, Form, UploadFile
@@ -511,6 +692,22 @@ def _create_app(llm_instance,
                         f"audio upload exceeds the supported "
                         f"maximum of {MAX_AUDIO_UPLOAD_BYTES} bytes"
                     })
+        elif request.method == "POST":
+            # A JSON body is parsed whole before the handler runs, so count the
+            # bytes actually received rather than trusting Content-Length.
+            body = bytearray()
+            async for chunk in request.stream():
+                body.extend(chunk)
+                if len(body) > MAX_REQUEST_BODY_BYTES:
+                    return JSONResponse(
+                        status_code=413,
+                        content={
+                            "error":
+                            f"request body exceeds the supported maximum of "
+                            f"{MAX_REQUEST_BODY_BYTES} bytes"
+                        })
+            request._body = bytes(
+                body)  # hand the buffered body to the handler
         return await call_next(request)
 
     @app.get("/health")
@@ -737,28 +934,23 @@ def _create_app(llm_instance,
             return JSONResponse(status_code=400,
                                 content={"error": "messages required"})
 
-        temperature = body.get("temperature", 0.7)
-        top_p = body.get("top_p", 0.9)
-        top_k = body.get("top_k", 50)
-        # OpenAI renamed "max_tokens" to "max_completion_tokens"; the modern
-        # field takes precedence when both are present.
-        max_tokens = body.get("max_completion_tokens")
-        if max_tokens is None:
-            max_tokens = body.get("max_tokens")
-        if max_tokens is None:
-            max_tokens = 2048
-        if (not isinstance(max_tokens, int) or isinstance(max_tokens, bool)
-                or not 1 <= max_tokens <= _MAX_COMPLETION_TOKENS):
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error":
-                    "'max_tokens'/'max_completion_tokens' must be an integer "
-                    f"in [1, {_MAX_COMPLETION_TOKENS}]"
-                })
-        stream = body.get("stream", False)
-        enable_thinking = body.get("enable_thinking", False)
-        disable_spec_decode = body.get("disable_spec_decode", False)
+        try:
+            enforce_local_media_policy(messages, allowed_local_media_path)
+        except PermissionError as exc:
+            return JSONResponse(status_code=403, content={"error": str(exc)})
+
+        try:
+            sampling = parse_sampling_params(body, default_max_tokens=2048)
+            stream = _bool_field(body, "stream", False)
+            enable_thinking = _bool_field(body, "enable_thinking", False)
+            disable_spec_decode = _bool_field(body, "disable_spec_decode",
+                                              False)
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
+        temperature = sampling["temperature"]
+        top_p = sampling["top_p"]
+        top_k = sampling["top_k"]
+        max_tokens = sampling["max_tokens"]
         tools = body.get("tools")
         tool_choice = body.get("tool_choice")
         try:
@@ -792,22 +984,10 @@ def _create_app(llm_instance,
             else:
                 num_logprobs = max(1, req_top_logprobs)
 
-        # OpenAI-compatible "stop": null | str | list[str]. Reject other types with 400.
-        stop_raw = body.get("stop")
-        stop: List[str] = []
-        if stop_raw is None:
-            pass
-        elif isinstance(stop_raw, str):
-            stop = [stop_raw]
-        elif isinstance(stop_raw, list) and all(
-                isinstance(s, str) for s in stop_raw):
-            stop = stop_raw
-        else:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": "'stop' must be a string or array of strings"
-                })
+        try:
+            stop = parse_stop(body)
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
 
         try:
             tool_config = validate_tool_request(messages, tools, tool_choice)
@@ -823,8 +1003,11 @@ def _create_app(llm_instance,
             return JSONResponse(
                 status_code=400,
                 content={"error": "'stream_options' must be an object"})
-        include_usage = bool(stream) and (stream_options
-                                          or {}).get("include_usage") is True
+        try:
+            include_usage = bool(stream) and _bool_field(
+                stream_options or {}, "include_usage", False)
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
 
         # HF-tokenizer prompt count; None (unavailable) degrades to 0.
         prompt_tokens: Optional[int] = None
@@ -1018,6 +1201,133 @@ def _create_app(llm_instance,
             },
         )
 
+    @app.post("/v1/completions")
+    async def completions(body: Dict[str, Any]):
+        """OpenAI legacy text-completions: the prompt is tokenized verbatim
+        (no chat template), mirroring the pre-templated tool-prompt path."""
+        prompt = body.get("prompt")
+        if isinstance(prompt, list):
+            if len(prompt) != 1:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "batch prompts unsupported"})
+            prompt = prompt[0]
+        if not isinstance(prompt, str) or not prompt:
+            return JSONResponse(status_code=400,
+                                content={"error": "prompt required"})
+        if body.get("echo"):
+            return JSONResponse(status_code=400,
+                                content={"error": "'echo' is not supported"})
+        if body.get("n") not in (None, 1):
+            return JSONResponse(status_code=400,
+                                content={"error": "'n' must be 1"})
+        if body.get("logprobs") is not None:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "'logprobs' is not supported"})
+
+        try:
+            stop = parse_stop(body)
+            sampling = parse_sampling_params(body, default_max_tokens=16)
+            stream = _bool_field(body, "stream", False)
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
+
+        params = SamplingParams(**sampling, stop=stop)
+        response_id = f"cmpl-{uuid.uuid4().hex[:12]}"
+        created = int(time.time())
+        model_name = llm_instance._model_id
+        messages = [{"role": "user", "content": prompt}]
+
+        def _build_request():
+            # Reuse the chat request builder, then disable templating so the
+            # runtime tokenizes the prompt text verbatim.
+            request = llm_instance._make_generation_request(messages, params)
+            request.apply_chat_template = False
+            request.add_generation_prompt = False
+            return request
+
+        loop = asyncio.get_running_loop()
+        if stream:
+            # Admission: non-blocking (503 when busy; a parked pool thread
+            # would starve the SSE generator that releases the gate), then
+            # built before the SSE response so bad input stays a 400.
+            def _admit_and_build():
+                sem = llm_instance._admission()
+                if not sem.acquire(blocking=False):
+                    raise _ServerBusy()
+                try:
+                    return sem, _build_request()
+                except BaseException:
+                    sem.release()
+                    raise
+
+            try:
+                sem, prebuilt_request = await loop.run_in_executor(
+                    None, _admit_and_build)
+            except _ServerBusy:
+                return _overloaded_response()
+            except (ValueError, KeyError) as exc:
+                return JSONResponse(status_code=400,
+                                    content={"error": str(exc)})
+            handoff = _AdmissionHandoff(sem)
+            return _releasing_streaming_response(
+                _completion_stream_sse(llm_instance, messages, params,
+                                       response_id, created, model_name,
+                                       prebuilt_request, handoff),
+                handoff.release_if_unstarted,
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                },
+            )
+
+        def _prepare_and_infer():
+            sem = llm_instance._admission()
+            if not sem.acquire(blocking=False):
+                raise _ServerBusy()
+            try:
+                return llm_instance._handle_request(_build_request())
+            finally:
+                sem.release()
+
+        try:
+            response = await loop.run_in_executor(None, _prepare_and_infer)
+        except _ServerBusy:
+            return _overloaded_response()
+        except (ValueError, KeyError) as exc:
+            return JSONResponse(status_code=400,
+                                content={"error": f"Invalid prompt: {exc}"})
+        except Exception as exc:  # noqa: BLE001
+            return _inference_error_response(exc)
+
+        output_text = (response.output_texts[0] if response.output_texts else
+                       "").replace(IM_END_TOKEN, "")
+        output_ids = response.output_ids[0] if response.output_ids else []
+        finish_reason = (finish_reason_name(llm_instance._rt,
+                                            response.finish_reasons[0])
+                         if response.finish_reasons else "stop")
+        return {
+            "id":
+            response_id,
+            "object":
+            "text_completion",
+            "created":
+            created,
+            "model":
+            model_name,
+            "choices": [{
+                "index": 0,
+                "text": output_text,
+                "logprobs": None,
+                "finish_reason": finish_reason,
+            }],
+            "usage":
+            _usage_body(_runtime_prompt_tokens(response, 0, None),
+                        len(output_ids)),
+        }
+
     @app.post("/v1/audio/transcriptions")
     async def audio_transcriptions(
             file: UploadFile = File(...),
@@ -1096,6 +1406,8 @@ def _create_app(llm_instance,
                                 top_k=1,
                                 max_tokens=4096)
 
+        max_audio_s = _audio_duration_limit_s(audio_dir)
+
         def _prepare_and_infer():
             # Count audio against the same admission bound as chat (the upload
             # read is already capped by the content-length middleware).
@@ -1106,8 +1418,12 @@ def _create_app(llm_instance,
                 if not sem.acquire(blocking=False):
                     raise _ServerBusy()
                 try:
-                    request = llm_instance._make_generation_request(
-                        messages, params)
+                    try:
+                        request = llm_instance._make_generation_request(
+                            messages, params)
+                    except (ValueError, KeyError, RuntimeError) as exc:
+                        raise _PrepareError(str(exc)) from exc
+                    _check_audio_durations(request, max_audio_s)
                     return llm_instance._handle_request(request)
                 finally:
                     sem.release()
@@ -1115,34 +1431,46 @@ def _create_app(llm_instance,
                 admission.release()
 
         try:
-            # Request construction includes the C++ audio decode; run the
-            # whole prepare+infer off the event loop.
             response = await asyncio.get_running_loop().run_in_executor(
                 None, _prepare_and_infer)
         except _ServerBusy:
             return _overloaded_response()
-        except (ValueError, KeyError, RuntimeError) as exc:
-            # ValueError/KeyError: malformed request; RuntimeError from
-            # the C++ audio loader: undecodable or over-long audio.
+        except _AudioTooLongError as exc:
+            return JSONResponse(status_code=413, content={"error": str(exc)})
+        except _PrepareError as exc:
             if "EDGELLM_INPUT_TOO_LONG" in str(exc):
                 return JSONResponse(status_code=413,
                                     content={"error": str(exc)})
             return JSONResponse(status_code=400,
                                 content={"error": f"Invalid audio: {exc}"})
         except Exception as exc:  # noqa: BLE001
+            if "EDGELLM_INPUT_TOO_LONG" in str(exc):
+                return JSONResponse(status_code=413,
+                                    content={"error": str(exc)})
             logger.exception("Transcription failed")
             return JSONResponse(status_code=500, content={"error": str(exc)})
         text = (response.output_texts[0] if response.output_texts else
                 "").replace(IM_END_TOKEN, "").strip()
         # Qwen3-ASR output protocol: "language <LANG><asr_text><text>";
-        # split on the delimiter (HF _parse_single_output semantics).
+        # split on the delimiter (HF _parse_single_output semantics; the HF
+        # _detect_and_fix_repetitions pass is a known gap).
         detected = ""
         if "<asr_text>" in text:
             prefix, text = text.split("<asr_text>", 1)
             text = text.strip()
-            m = re.search(r"language[ :]*([A-Za-z_\- ]+)", prefix)
-            if m:
-                detected = m.group(1).strip()
+            # First non-empty prefix line is the language ("language X" or a
+            # bare name); "language None" is HF's empty-audio sentinel.
+            for line in prefix.strip().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                if line.lower() == "language none":
+                    break
+                if line.lower().startswith("language "):
+                    detected = line[len("language "):].strip()
+                else:
+                    detected = line
+                break
         if response_format == "text":
             return PlainTextResponse(text)
         body = {"text": text}
@@ -1346,6 +1674,7 @@ def _generate_stream_sse_inner(llm_instance,
     finish_reason: Optional[str] = None
     error_message: Optional[str] = None
     completion_tokens = 0
+
     stream_tools = tool_config.tools if tool_config else None
     stream_tool_choice = tool_config.tool_choice if tool_config else None
 
@@ -1458,6 +1787,7 @@ def _generate_tool_stream_sse(llm_instance,
     finish_reason: Optional[str] = None
     error_message: Optional[str] = None
     completion_tokens = 0
+
     try:
         for delta in llm_instance.generate_stream(
                 messages,
@@ -1520,6 +1850,64 @@ def _generate_tool_stream_sse(llm_instance,
                                model=model_name,
                                created=created)
     yield "data: [DONE]\n\n"
+
+
+def _completion_sse_chunk(response_id: str,
+                          created: int,
+                          model: str,
+                          text: str,
+                          finish_reason: Optional[str] = None) -> str:
+    """Legacy-completions SSE chunk: incremental ``text``, no chat delta."""
+    payload = {
+        "id":
+        response_id,
+        "object":
+        "text_completion",
+        "created":
+        created,
+        "model":
+        model,
+        "choices": [{
+            "index": 0,
+            "text": text,
+            "logprobs": None,
+            "finish_reason": finish_reason,
+        }],
+    }
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+def _completion_stream_sse(llm_instance, messages, params, response_id,
+                           created, model, prebuilt_request, handoff):
+    """Yield legacy-completions SSE chunks, then a finish_reason chunk and
+    ``[DONE]``. ``handoff`` carries the admission gate (worker-owned once
+    started)."""
+    try:
+        finish_reason: Optional[str] = None
+        error_message: Optional[str] = None
+        try:
+            for delta in llm_instance.generate_stream(
+                    messages,
+                    params,
+                    prebuilt_request=prebuilt_request,
+                    admission_handoff=handoff):
+                if delta.text:
+                    yield _completion_sse_chunk(response_id, created, model,
+                                                delta.text)
+                if delta.finished:
+                    finish_reason = delta.finish_reason or "stop"
+        except Exception as exc:
+            logger.exception("Streaming inference failed")
+            finish_reason = "error"
+            error_message = str(exc)
+        if error_message and "EDGELLM_INPUT_TOO_LONG" in error_message:
+            yield _sse_error(error_message)
+        yield _completion_sse_chunk(response_id, created, model, "",
+                                    finish_reason or "stop")
+        yield "data: [DONE]\n\n"
+    finally:
+        if handoff is not None:
+            handoff.release_if_unstarted()
 
 
 def _entry_to_openai(entry) -> Dict[str, Any]:
@@ -1646,7 +2034,9 @@ def _build_chat_completion_response(llm_instance,
             "finish_reason": finish_reason,
         }],
         "usage":
-        _usage_body(prompt_tokens, completion_tokens),
+        _usage_body(
+            _runtime_prompt_tokens(response, response_idx, prompt_tokens),
+            completion_tokens),
     }
 
 
@@ -1713,7 +2103,8 @@ def run_server(llm_instance,
                enable_batching: bool = False,
                batch_timeout_ms: float = 10.0,
                max_queue_batch_size: Optional[int] = None,
-               request_queue_size: int = _DEFAULT_REQUEST_QUEUE_SIZE) -> None:
+               request_queue_size: int = _DEFAULT_REQUEST_QUEUE_SIZE,
+               allowed_local_media_path: Optional[str] = None) -> None:
     """Start the OpenAI-compatible server."""
     try:
         import uvicorn
@@ -1727,6 +2118,7 @@ def run_server(llm_instance,
         batch_timeout_ms=batch_timeout_ms,
         max_queue_batch_size=max_queue_batch_size,
         request_queue_size=request_queue_size,
+        allowed_local_media_path=allowed_local_media_path,
     )
     logger.info("Starting server on %s:%d ...", host, port)
     uvicorn.run(app, host=host, port=port)
@@ -1768,6 +2160,13 @@ def main():
         dest="visual_onnx_dir",
         default="",
         help="Pre-built visual ONNX directory for a VLM "
+        "(use when --model is a prebuilt ONNX dir)",
+    )
+    parser.add_argument(
+        "--audio-onnx-dir",
+        dest="audio_onnx_dir",
+        default="",
+        help="Pre-built audio encoder ONNX directory "
         "(use when --model is a prebuilt ONNX dir)",
     )
     parser.add_argument("--host", default="0.0.0.0", help="Bind address")
@@ -1814,6 +2213,12 @@ def main():
         "Enable server-side batching for compatible non-streaming requests",
     )
     parser.add_argument(
+        "--allowed-local-media-path",
+        default=None,
+        help="Directory the server may read local media from. Unset (default) "
+        "rejects bare paths and file:// URLs over HTTP.",
+    )
+    parser.add_argument(
         "--batch-timeout-ms",
         type=float,
         default=10.0,
@@ -1853,6 +2258,7 @@ def main():
         model=model_arg,
         onnx_dir=onnx_dir,
         visual_onnx_dir=args.visual_onnx_dir,
+        audio_onnx_dir=args.audio_onnx_dir,
         engine_dir=engine_dir,
         multimodal_engine_dir=args.multimodal_engine_dir,
         max_input_len=args.max_input_len,
@@ -1870,6 +2276,7 @@ def main():
         batch_timeout_ms=args.batch_timeout_ms,
         max_queue_batch_size=args.max_queue_batch_size,
         request_queue_size=args.request_queue_size,
+        allowed_local_media_path=args.allowed_local_media_path,
     )
 
 

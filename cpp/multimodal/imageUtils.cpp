@@ -17,6 +17,7 @@
 
 #include "multimodal/imageUtils.h"
 #include "common/checkMacros.h"
+#include "common/logger.h"
 
 #include <algorithm>
 #include <cmath>
@@ -56,6 +57,13 @@ int64_t floorByFactor(int64_t value, int64_t factor)
 int64_t ceilByFactor(int64_t value, int64_t factor)
 {
     return std::ceil(static_cast<double>(value) / factor) * factor;
+}
+
+// Takes double: the min-pixels branches pass the fractional product h*beta directly
+// (HF: ceil(h*beta/f)*f — truncating to int first under-sizes ~3% of upscaled inputs).
+int64_t ceilByFactorF(double value, int64_t factor)
+{
+    return static_cast<int64_t>(std::ceil(value / factor)) * factor;
 }
 
 } // namespace
@@ -141,9 +149,11 @@ std::tuple<int64_t, int64_t> qwenSmartResize(int64_t height, int64_t width, int6
     int64_t const minPixels = minImageTokensPerImage * factor * factor;
     int64_t const maxPixels = maxImageTokensPerImage * factor * factor;
 
-    ELLM_CHECK(std::max(height, width) / std::min(height, width) <= maxRatio,
+    // Floating-point ratio: integer division truncates (2001/10 -> 200) and would accept ratios the
+    // HF reference rejects.
+    ELLM_CHECK(static_cast<double>(std::max(height, width)) / std::min(height, width) <= maxRatio,
         "absolute aspect ratio must be smaller than " + std::to_string(maxRatio) + ", got "
-            + std::to_string(std::max(height, width) / std::min(height, width)));
+            + std::to_string(static_cast<double>(std::max(height, width)) / std::min(height, width)));
 
     int64_t hBar = std::max(factor, roundByFactor(height, factor));
     int64_t wBar = std::max(factor, roundByFactor(width, factor));
@@ -158,47 +168,111 @@ std::tuple<int64_t, int64_t> qwenSmartResize(int64_t height, int64_t width, int6
     else if (hBar * wBar < minPixels)
     {
         double beta = std::sqrt(static_cast<double>(minPixels) / (height * width));
-        hBar = ceilByFactor(static_cast<int64_t>(height * beta), factor);
-        wBar = ceilByFactor(static_cast<int64_t>(width * beta), factor);
+        hBar = ceilByFactorF(height * beta, factor);
+        wBar = ceilByFactorF(width * beta, factor);
     }
 
     return {hBar, wBar};
 }
 
-std::tuple<int64_t, int64_t> qwenSmartResize3D(int64_t numFrames, int64_t height, int64_t width, int64_t patchSize,
-    int64_t mergeSize, int64_t minImageTokensPerImage, int64_t maxImageTokensPerImage, int64_t temporalPatchSize,
-    int64_t maxRatio)
+std::tuple<int64_t, int64_t> qwenSmartResize3D(int64_t numFrames, bool isVideo, int64_t height, int64_t width,
+    int64_t patchSize, int64_t mergeSize, int64_t minImageTokensPerImage, int64_t maxImageTokensPerImage,
+    int64_t temporalPatchSize, int64_t maxRatio)
 {
     // Mirrors HF Qwen3-VL smart_resize: 3D temporal-aware budget (t_bar = ceil(N/TPS)*TPS) — the base 2D body plus
-    // numFrames counted into the budget. NOTE (HF parity): beta is derived from the raw numFrames*height*width (not
-    // tBar), and the minPixels branch intentionally has no >= factor clamp, matching the reference implementation.
+    // numFrames counted into the budget — then constrains the result to the engine token profile (HF has no hard
+    // cap; the engine does).
     int64_t const factor = patchSize * mergeSize;
-    int64_t const minPixels = minImageTokensPerImage * factor * factor;
-    int64_t const maxPixels = maxImageTokensPerImage * factor * factor;
+    // The budget below is 3D (tBar*h*w) and tokens = budget / (temporalFactor * factor^2), so translating the
+    // per-media token bounds into a pixel budget must include the temporal factor (1 for still images).
+    int64_t const temporalFactor = isVideo ? temporalPatchSize : 1;
+    int64_t const minPixels = minImageTokensPerImage * temporalFactor * factor * factor;
+    int64_t const maxPixels = maxImageTokensPerImage * temporalFactor * factor * factor;
 
-    ELLM_CHECK(std::max(height, width) / std::min(height, width) <= maxRatio,
+    // Floating-point ratio: integer division truncates (2001/10 -> 200) and would accept ratios the
+    // HF reference rejects.
+    ELLM_CHECK(static_cast<double>(std::max(height, width)) / std::min(height, width) <= maxRatio,
         "absolute aspect ratio must be smaller than " + std::to_string(maxRatio) + ", got "
-            + std::to_string(std::max(height, width) / std::min(height, width)));
+            + std::to_string(static_cast<double>(std::max(height, width)) / std::min(height, width)));
 
     int64_t hBar = std::max(factor, roundByFactor(height, factor));
     int64_t wBar = std::max(factor, roundByFactor(width, factor));
 
-    int64_t tBar = (numFrames > 1) ? ceilByFactor(numFrames, temporalPatchSize) : 1;
+    // HF video smart_resize applies the temporal budget unconditionally (a 1-frame video still gets
+    // t_bar = temporalPatchSize); only still images use t_bar = 1.
+    int64_t const tBar = isVideo ? ceilByFactor(numFrames, temporalPatchSize) : 1;
 
     int64_t const budget = tBar * hBar * wBar;
     if (budget > maxPixels)
     {
-        double beta = std::sqrt(static_cast<double>(numFrames * height * width) / maxPixels);
+        double const beta = std::sqrt(static_cast<double>(numFrames * height * width) / maxPixels);
         hBar = std::max(factor, floorByFactor(static_cast<int64_t>(height / beta), factor));
         wBar = std::max(factor, floorByFactor(static_cast<int64_t>(width / beta), factor));
     }
     else if (budget < minPixels)
     {
-        double beta = std::sqrt(static_cast<double>(minPixels) / (numFrames * height * width));
-        hBar = ceilByFactor(static_cast<int64_t>(height * beta), factor);
-        wBar = ceilByFactor(static_cast<int64_t>(width * beta), factor);
+        double const beta = std::sqrt(static_cast<double>(minPixels) / (numFrames * height * width));
+        hBar = ceilByFactorF(height * beta, factor);
+        wBar = ceilByFactorF(width * beta, factor);
+    }
+    // HF sizes by the raw frame count and has no hard cap; with a padded tBar > numFrames (odd frame counts)
+    // either branch can exceed the engine's token profile, so re-shrink against tBar.
+    bool engineForcedResize = false;
+    if (tBar * hBar * wBar > maxPixels)
+    {
+        engineForcedResize = true;
+        double const beta = std::sqrt(static_cast<double>(tBar * height * width) / maxPixels);
+        hBar = std::max(factor, floorByFactor(static_cast<int64_t>(height / beta), factor));
+        wBar = std::max(factor, floorByFactor(static_cast<int64_t>(width / beta), factor));
+    }
+    // Quantization (factor alignment, the max(factor, ...) clamps) can still land outside the profile: one
+    // factor step moves the budget by whole multiples of tBar*factor^2, which can straddle the entire
+    // [minPixels, maxPixels] window. Fall back to the factor-grid shape (hBar = p*factor, wBar = q*factor)
+    // closest in aspect ratio that fits; ties prefer the budget closest to the violated bound.
+    if (tBar * hBar * wBar > maxPixels || tBar * hBar * wBar < minPixels)
+    {
+        engineForcedResize = true;
+        int64_t const unit = tBar * factor * factor;
+        int64_t const pqMin = std::max<int64_t>(1, (minPixels + unit - 1) / unit);
+        int64_t const pqMax = maxPixels / unit;
+        ELLM_CHECK(pqMax >= 1 && pqMin <= pqMax,
+            "no resized visual shape fits the engine profile (frames=" + std::to_string(numFrames) + ", "
+                + std::to_string(height) + "x" + std::to_string(width) + "); reduce the frame count/resolution or "
+                  "rebuild the visual engine with wider --minImageTokens/--maxImageTokens bounds.");
+        int64_t const pqTarget = (tBar * hBar * wBar < minPixels) ? pqMin : pqMax;
+        double const targetRatio = static_cast<double>(height) / static_cast<double>(width);
+        double bestDist = 0.0;
+        int64_t bestGap = 0;
+        bool found = false;
+        for (int64_t p = 1; p <= pqMax; ++p)
+        {
+            int64_t const qLo = std::max<int64_t>(1, (pqMin + p - 1) / p);
+            int64_t const qHi = pqMax / p;
+            if (qLo > qHi)
+            {
+                continue;
+            }
+            int64_t const q = std::clamp(static_cast<int64_t>(std::llround(p / targetRatio)), qLo, qHi);
+            double const dist = std::abs(std::log(static_cast<double>(p) / static_cast<double>(q) / targetRatio));
+            int64_t const gap = std::abs(p * q - pqTarget);
+            if (!found || dist < bestDist - 1e-12 || (std::abs(dist - bestDist) <= 1e-12 && gap < bestGap))
+            {
+                found = true;
+                bestDist = dist;
+                bestGap = gap;
+                hBar = p * factor;
+                wBar = q * factor;
+            }
+        }
     }
 
+    // The engine token profile is a hard cap HF's smart_resize lacks; when it forces a smaller/regridded
+    // shape than HF would pick, the ViT sees different patches so output can drift from HF.
+    LOG_WARNING_IF(engineForcedResize,
+        "qwenSmartResize3D resized to %ldx%ld to fit the engine token profile (frames=%ld, src %ldx%ld); "
+        "differs from HF smart_resize, output may drift. Rebuild the visual engine with wider "
+        "--maxImageTokens to match HF.",
+        hBar, wBar, numFrames, height, width);
     return {hBar, wBar};
 }
 

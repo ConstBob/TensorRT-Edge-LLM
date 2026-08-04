@@ -334,7 +334,7 @@ void NemotronOmniViTRunner::textPreprocess(rt::LLMGenerationRequest const& reque
     // otherwise tokenize from scratch. Each image placeholder is then repeated to match
     // the image's token count so the runtime injects one visual feature per copy.
     bool const alreadyTokenized = batchInputIds.size() == request.requests.size();
-    int imageIndex = 0;
+    int64_t imageIndex = 0;
 
     for (size_t i = 0; i < request.requests.size(); ++i)
     {
@@ -343,12 +343,19 @@ void NemotronOmniViTRunner::textPreprocess(rt::LLMGenerationRequest const& reque
             : tokenizer->encode(request.formattedRequests[i].formattedCompleteRequest);
         check::check(!ids.empty(), "Failed to encode text");
 
+        // Per-request media window (numImages[i]): a placeholder may only consume this request's own media (batch
+        // isolation).
+        int64_t const mediaEnd = imageIndex + numImages[i];
+
         std::vector<int32_t> newIds;
         newIds.reserve(ids.size());
         for (auto const& id : ids)
         {
             if (id == mConfig.imgContextTokenId)
             {
+                ELLM_CHECK(imageIndex < mediaEnd,
+                    "EDGELLM_BAD_MEDIA_COUNT: NemotronOmniViTRunner::textPreprocess() placeholder count exceeds this "
+                    "request's image count");
                 int64_t const numImageTokens = imageTokenLengths.at(imageIndex);
                 for (int64_t k = 0; k < numImageTokens; ++k)
                 {
@@ -369,12 +376,15 @@ void NemotronOmniViTRunner::textPreprocess(rt::LLMGenerationRequest const& reque
         {
             batchInputIds.emplace_back(std::move(newIds));
         }
+        ELLM_CHECK(imageIndex == mediaEnd,
+            "EDGELLM_BAD_MEDIA_COUNT: NemotronOmniViTRunner::textPreprocess() placeholder count is smaller than this "
+            "request's image count");
     }
 }
 
 bool NemotronOmniViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly) noexcept
+    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly)
 {
     std::vector<int64_t> imageTokenLengths;
     std::vector<int64_t> numImages;
@@ -389,10 +399,18 @@ bool NemotronOmniViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     }
     catch (std::exception const& e)
     {
-        LOG_ERROR("Failed: %s", e.what());
+        bool const actionable = isCallerActionable(e);
+        if (!actionable)
+        {
+            LOG_ERROR("Failed: %s", e.what());
+        }
         // Drain async H2D copies that may still read the request's image buffers, so the caller can
-        // safely release them after the failure.
+        // safely release them after the failure -- including when the error propagates.
         cudaStreamSynchronize(stream);
+        if (actionable)
+        {
+            throw;
+        }
         return false;
     }
 

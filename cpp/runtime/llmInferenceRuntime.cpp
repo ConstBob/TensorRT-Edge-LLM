@@ -1316,6 +1316,7 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     response.logprobs.resize(context.completedBatches.size());
     response.outputTrajectories.resize(context.completedBatches.size());
     response.finishReasons.resize(context.completedBatches.size(), FinishReason::kNotFinished);
+    response.inputTokenCounts.assign(context.completedBatches.size(), 0);
 
     // Add outputs from completed batches (using saved original indices)
     for (auto const& [originalIdx, batchResult] : context.completedBatches)
@@ -1344,6 +1345,8 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
         response.outputTexts[originalIdx] = mTokenizer->decode(response.outputIds[originalIdx], true);
         response.finishReasons[originalIdx] = batchResult.terminalReason;
         response.logprobs[originalIdx] = batchResult.logprobs;
+        // Prompt length after chat templating and media expansion (OpenAI usage).
+        response.inputTokenCounts[originalIdx] = static_cast<int32_t>(batchResult.rawBatchedInputIds.size());
 
         // Trim this slot's own stop strings from its output text by delegating
         // to applyStopStringMatch with isFinal=true — single source of truth

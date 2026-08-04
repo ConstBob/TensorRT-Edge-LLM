@@ -17,6 +17,7 @@
 
 #include "runtime/imageUtils.h"
 #include "common/checkMacros.h"
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
 
@@ -118,7 +119,8 @@ ImageData loadImageFromMemory(unsigned char const* data, size_t size)
 ImageData loadVideoFromFrames(std::vector<std::string> const& framePaths, double const fps)
 {
     ELLM_CHECK(!framePaths.empty(), "loadVideoFromFrames: framePaths is empty");
-    ELLM_CHECK(fps > 0.0, "loadVideoFromFrames: fps must be positive, got " + std::to_string(fps));
+    ELLM_CHECK(std::isfinite(fps) && fps > 0.0,
+        "loadVideoFromFrames: fps must be a positive finite number, got " + std::to_string(fps));
 
     // Load the first frame to determine the common (H, W, C).
     ImageData firstFrame = loadImageFromFile(framePaths[0]);

@@ -25,11 +25,27 @@ import json
 import os
 import tempfile
 import time
+import types
 
 import pytest
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
                                          ".."))
+
+# Only genuinely optional external dependencies may turn an ImportError into
+# a skip; a project-internal import failure must fail the test, not go green.
+_OPTIONAL_TOP_MODULES = {
+    "fastapi", "httpx", "av", "torch", "_edgellm_runtime", "python_multipart",
+    "multipart", "librosa", "numpy", "soundfile", "uvicorn"
+}
+
+
+def _skip_or_raise(exc: ImportError, what: str):
+    top = (getattr(exc, "name", None) or "").split(".")[0]
+    if top in _OPTIONAL_TOP_MODULES:
+        pytest.skip(f"{what} unavailable: {exc}")
+    raise exc
+
 
 # ---------------------------------------------------------------------------
 # Stub runtime module (no C++): only what engine.py's message/buffer helpers use
@@ -79,8 +95,8 @@ class _StubRt:
 def _engine():
     try:
         from experimental.server import engine
-    except ImportError as exc:  # optional deps (pybind runtime chain)
-        pytest.skip(f"engine import unavailable: {exc}")
+    except ImportError as exc:  # skip only for missing external deps
+        _skip_or_raise(exc, "engine import")
     return engine
 
 
@@ -113,6 +129,7 @@ def _make_stub_llm():
         _model_id = "qwen3-vl"
         _rt = None
         has_draft_model = False
+        _audio_buffers = ()  # tests may inject decoded-audio stubs
 
         def __init__(self):
             self._runtime = _RT()
@@ -146,10 +163,19 @@ def _make_stub_llm():
                                      tool_choice=None,
                                      tool_config=None):
             self.captured = messages
-            return object()
+            req = types.SimpleNamespace(
+                audio_buffers=list(self._audio_buffers))
+            return types.SimpleNamespace(requests=[req])
 
         def count_prompt_tokens(self, messages, **kw):
             return 7
+
+        def generate_stream(self, messages, params, **kw):
+            from experimental.server.engine import StreamDelta
+            yield StreamDelta(text="hi",
+                              token_ids=[1, 2],
+                              finished=True,
+                              finish_reason="stop")
 
     return _LLM()
 
@@ -162,10 +188,11 @@ def client_and_llm():
         from fastapi.testclient import TestClient
 
         from experimental.server.api_server import _create_app
-    except ImportError as exc:  # optional deps / pybind runtime chain
-        pytest.skip(f"api_server / fastapi TestClient unavailable: {exc}")
+    except ImportError as exc:  # skip only for missing external deps
+        _skip_or_raise(exc, "api_server / fastapi TestClient")
     llm = _make_stub_llm()
-    return TestClient(_create_app(llm)), llm
+    # Local media is opt-in; these cases exercise the media pipeline itself.
+    return TestClient(_create_app(llm, allowed_local_media_path="/")), llm
 
 
 @pytest.mark.parametrize("response_format,expect_json", [("json", True),
@@ -198,9 +225,9 @@ def test_audio_transcriptions_rejects_empty(client_and_llm):
 
 
 def test_audio_transcriptions_protocol(client_and_llm):
-    # Qwen3-ASR protocol: normalized language ("en" -> "English") goes into a
-    # system turn, and the "language <LANG><asr_text><text>" output splits on
-    # the delimiter.
+    # Qwen3-ASR protocol: `language` becomes a system turn, the user turn
+    # carries the audio, and the "language <LANG><asr_text><text>" output
+    # splits on the delimiter.
     client, llm = client_and_llm
     llm._runtime._resp_text = "language English<asr_text>Hello world"
     resp = client.post(
@@ -214,8 +241,25 @@ def test_audio_transcriptions_protocol(client_and_llm):
     body = resp.json()
     assert body["text"] == "Hello world"
     assert body["language"] == "English"
-    assert llm.captured[0]["role"] == "system"
-    assert llm.captured[0]["content"] == "English"
+    assert [m["role"] for m in llm.captured] == ["system", "user"]
+    # HF empty-audio sentinel: "language None" prefix yields no language key.
+    llm._runtime._resp_text = "language None<asr_text>"
+    resp = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("clip.wav", b"RIFF0000WAVEfmt ", "audio/wav")},
+        data={"model": "asr"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["text"] == ""
+    assert "language" not in body
+    # No <asr_text> tag: the whole string is the transcription (HF semantics).
+    llm._runtime._resp_text = "language None"
+    resp = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("clip.wav", b"RIFF0000WAVEfmt ", "audio/wav")},
+        data={"model": "asr"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["text"] == "language None"
     resp = client.post(
         "/v1/audio/transcriptions",
         files={"file": ("clip.wav", b"RIFF0000WAVEfmt ", "audio/wav")},
@@ -224,6 +268,146 @@ def test_audio_transcriptions_protocol(client_and_llm):
             "language": "klingon"
         })
     assert resp.status_code == 400
+    # Languages beyond the original short list validate too (official set).
+    for code in ("tr", "vi", "hi"):
+        resp = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("clip.wav", b"RIFF0000WAVEfmt ", "audio/wav")},
+            data={
+                "model": "asr",
+                "language": code
+            })
+        assert resp.status_code == 200, resp.text
+        assert [m["role"] for m in llm.captured] == ["system", "user"]
+
+
+def test_audio_transcriptions_prompt_is_user_context(client_and_llm):
+    # Qwen3-ASR semantics: `language` is the system turn, and the user turn
+    # carries the audio followed by the context prompt.
+    client, llm = client_and_llm
+    resp = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("clip.wav", b"RIFF0000WAVEfmt ", "audio/wav")},
+        data={
+            "model": "asr",
+            "prompt": "NVIDIA TensorRT jargon",
+            "language": "en"
+        })
+    assert resp.status_code == 200, resp.text
+    roles = [m["role"] for m in llm.captured]
+    assert roles == ["system", "user"]
+    assert llm.captured[0]["content"] == "English"
+    user_types = [c.get("type") for c in llm.captured[1]["content"]]
+    assert user_types == ["input_audio", "text"]
+
+
+def test_audio_transcriptions_duration_limit(client_and_llm):
+    # Decoded PCM longer than the engine's audio profile (builder
+    # max_time_steps / 100 s; default 30 s without a config) is a 413 before
+    # inference, carrying the actual duration and the cap.
+    client, llm = client_and_llm
+    llm._audio_buffers = [
+        types.SimpleNamespace(num_samples=31 * 16000, sample_rate=16000)
+    ]
+    resp = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("clip.wav", b"RIFF0000WAVEfmt ", "audio/wav")},
+        data={"model": "asr"})
+    assert resp.status_code == 413, resp.text
+    assert "31.0" in resp.json()["error"]
+    assert "30.0" in resp.json()["error"]
+    llm._audio_buffers = [
+        types.SimpleNamespace(num_samples=29 * 16000, sample_rate=16000)
+    ]
+    resp = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("clip.wav", b"RIFF0000WAVEfmt ", "audio/wav")},
+        data={"model": "asr"})
+    assert resp.status_code == 200, resp.text
+    # A recorded builder profile overrides the default cap (1000 steps = 10s).
+    audio_dir = os.path.join(llm._multimodal_engine_dir, "audio")
+    with open(os.path.join(audio_dir, "config.json"), "w",
+              encoding="utf-8") as f:
+        f.write('{"model_type": "qwen3_asr", '
+                '"builder_config": {"max_time_steps": 1000}}')
+    llm._audio_buffers = [
+        types.SimpleNamespace(num_samples=11 * 16000, sample_rate=16000)
+    ]
+    resp = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("clip.wav", b"RIFF0000WAVEfmt ", "audio/wav")},
+        data={"model": "asr"})
+    assert resp.status_code == 413, resp.text
+    assert "10.0" in resp.json()["error"]
+
+
+def test_audio_transcriptions_error_stage_mapping(client_and_llm):
+    # Prepare failures (incl. C++ decode RuntimeError) are client errors;
+    # infer-stage failures are 500 except the input-too-long marker (413).
+    client, llm = client_and_llm
+
+    def _post():
+        return client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("clip.wav", b"RIFF0000WAVEfmt ", "audio/wav")},
+            data={"model": "asr"})
+
+    def _prepare_boom(*args, **kwargs):
+        raise RuntimeError("Audio decode failed (corrupt bytes)")
+
+    orig_prepare = llm._make_generation_request
+    llm._make_generation_request = _prepare_boom
+    resp = _post()
+    assert resp.status_code == 400
+    assert "Invalid audio" in resp.json()["error"]
+    llm._make_generation_request = orig_prepare
+
+    def _infer_oom(request):
+        raise RuntimeError("CUDA error: out of memory")
+
+    llm._handle_request = _infer_oom
+    resp = _post()
+    assert resp.status_code == 500
+
+    def _infer_too_long(request):
+        raise RuntimeError("EDGELLM_INPUT_TOO_LONG: rebuild with larger "
+                           "--maxInputLen")
+
+    llm._handle_request = _infer_too_long
+    resp = _post()
+    assert resp.status_code == 413
+
+
+def test_media_count_mismatch_is_client_error():
+    """A placeholder/media count mismatch is malformed input, so it must stay a
+    400 with the runner's diagnostic rather than a generic 500."""
+    from experimental.server.api_server import _inference_error_response
+    exc = RuntimeError(
+        "EDGELLM_BAD_MEDIA_COUNT: QwenViTRunner::textPreprocess()"
+        " pad count exceeds this request's media count")
+    resp = _inference_error_response(exc)
+    assert resp.status_code == 400
+    assert b"EDGELLM_BAD_MEDIA_COUNT" in resp.body
+
+
+def test_media_count_mismatch_returns_400_over_http(client_and_llm):
+    """The marker reaches the client as a 400 through the route, not just
+    through the mapper. The C++ -> pybind hop is not covered here."""
+    client, llm = client_and_llm
+
+    def _boom(request):
+        raise RuntimeError(
+            "EDGELLM_BAD_MEDIA_COUNT: QwenViTRunner::textPreprocess() pad count"
+            " exceeds this request's media count")
+
+    llm._handle_request = _boom
+    resp = client.post("/v1/chat/completions",
+                       json={"messages": [{
+                           "role": "user",
+                           "content": "hi"
+                       }]})
+    assert resp.status_code == 400, resp.text
+    assert "EDGELLM_BAD_MEDIA_COUNT" in resp.text
 
 
 def test_content_length_parsing():
@@ -816,13 +1000,13 @@ def test_video_frame_limits_carry_recorded_cu_capacity(tmp_path):
     (tmp_path / "visual" / "config.json").write_text(
         '{"model_type": "qwen3_vl", "builder_config": '
         '{"min_image_tokens": 4096, "max_image_tokens": 8192, '
-        '"max_cu_seqlen_entries": 512}}')
+        '"max_cu_seqlen_groups": 512}}')
     (tmp_path / "visual" / "preprocessor_config.json").write_text(
         '{"patch_size": 16, "merge_size": 2, "temporal_patch_size": 2}')
     llm = eng.LLM.__new__(eng.LLM)
     llm._multimodal_engine_dir = str(tmp_path)
     limits = llm._video_frame_limits()
-    assert limits["max_cu_seqlen_entries"] == 512
+    assert limits["max_cu_seqlen_groups"] == 512
 
 
 def test_chat_streaming_invalid_video_returns_400(chain_client):
@@ -906,8 +1090,8 @@ def chain_client(tmp_path):
 
         from experimental.server.api_server import _create_app
         from experimental.server.engine import LLM
-    except ImportError as exc:  # optional deps / pybind runtime chain
-        pytest.skip(f"server imports unavailable: {exc}")
+    except ImportError as exc:  # skip only for missing external deps
+        _skip_or_raise(exc, "server imports")
 
     captured = {}
 
@@ -937,7 +1121,7 @@ def chain_client(tmp_path):
     (visual_dir / "config.json").write_text('{"model_type": "qwen3_vl"}')
     llm._multimodal_engine_dir = str(tmp_path / "mm")
     llm._tool_template_formatter = None
-    return TestClient(_create_app(llm)), captured
+    return TestClient(_create_app(llm, allowed_local_media_path="/")), captured
 
 
 def test_chat_text_request_parses(chain_client):
@@ -1116,4 +1300,504 @@ def test_chat_audio_request_parses_to_bytes(chain_client):
     assert resp.status_code == 200, resp.text
     req = captured["request"].requests[0]
     assert req.audio_buffers == [("audio_bytes", raw)]
-    assert [c.type for c in req.messages[0].contents] == ["audio"]
+
+
+def test_chat_audio_data_url_over_cap_returns_400(chain_client, monkeypatch):
+    # Chat audio shares the transcription upload cap: an oversized data: URL
+    # is rejected as a 400 before it is buffered/decoded.
+    import base64
+    client, _ = chain_client
+    from experimental.server import audio_preprocess
+    monkeypatch.setattr(audio_preprocess, "MAX_AUDIO_UPLOAD_BYTES", 16)
+    payload = base64.b64encode(b"x" * 17).decode()
+    resp = client.post("/v1/chat/completions",
+                       json={
+                           "messages": [{
+                               "role":
+                               "user",
+                               "content": [{
+                                   "type": "audio_url",
+                                   "audio_url": {
+                                       "url":
+                                       "data:audio/wav;base64," + payload
+                                   },
+                               }],
+                           }],
+                           "max_tokens":
+                           8,
+                       })
+    assert resp.status_code == 400, resp.text
+    assert "exceeds" in resp.json()["error"]
+
+
+# ---------------------------------------------------------------------------
+# /v1/completions: OpenAI legacy text-completions endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_completions_non_stream(client_and_llm):
+    client, llm = client_and_llm
+    llm._runtime._resp_text = "a completion"
+    resp = client.post("/v1/completions",
+                       json={
+                           "prompt": "Once upon a time",
+                           "max_tokens": 8
+                       })
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["object"] == "text_completion"
+    assert body["id"].startswith("cmpl-")
+    choice = body["choices"][0]
+    assert choice["text"] == "a completion"
+    assert choice["finish_reason"] == "stop"
+    assert choice["logprobs"] is None
+    assert body["usage"]["completion_tokens"] == 3
+    # The prompt reaches the request builder as a single verbatim user turn.
+    assert llm.captured == [{"role": "user", "content": "Once upon a time"}]
+
+
+def test_completions_raw_prompt_chain(chain_client):
+    # Legacy completions must NOT apply the chat template: the prompt text
+    # reaches the C++ request verbatim with templating disabled.
+    client, captured = chain_client
+    resp = client.post("/v1/completions",
+                       json={
+                           "prompt": "2+2=",
+                           "max_tokens": 8
+                       })
+    assert resp.status_code == 200, resp.text
+    request = captured["request"]
+    assert request.apply_chat_template is False
+    assert request.add_generation_prompt is False
+    contents = request.requests[0].messages[0].contents
+    assert [c.type for c in contents] == ["text"]
+    assert contents[0].data == "2+2="
+
+
+def test_completions_stream(client_and_llm):
+    import json
+
+    client, llm = client_and_llm
+    deltas = [
+        types.SimpleNamespace(text="Hello", finished=False,
+                              finish_reason=None),
+        types.SimpleNamespace(text=" world",
+                              finished=True,
+                              finish_reason="stop"),
+    ]
+
+    def fake_stream(messages, params, prebuilt_request=None, **kw):
+        assert prebuilt_request is not None
+        yield from deltas
+
+    llm.generate_stream = fake_stream
+    resp = client.post("/v1/completions",
+                       json={
+                           "prompt": "Hi",
+                           "stream": True,
+                           "max_tokens": 8
+                       })
+    assert resp.status_code == 200, resp.text
+    lines = [l for l in resp.text.splitlines() if l.startswith("data: ")]
+    assert lines[-1] == "data: [DONE]"
+    chunks = [json.loads(l[len("data: "):]) for l in lines[:-1]]
+    assert all(c["object"] == "text_completion" for c in chunks)
+    assert [c["choices"][0]["text"] for c in chunks] == ["Hello", " world", ""]
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+    # Admission released once the stream drains.
+    assert llm._admission().acquire(blocking=False)
+    llm._admission().release()
+
+
+def test_completions_rejects_bad_prompt(client_and_llm):
+    client, _ = client_and_llm
+    resp = client.post("/v1/completions", json={"max_tokens": 8})
+    assert resp.status_code == 400
+    assert "error" in resp.json()
+    resp = client.post("/v1/completions", json={"prompt": ["a", "b"]})
+    assert resp.status_code == 400
+    assert "batch" in resp.json()["error"]
+
+
+# ---------------------------------------------------------------------------
+# Local-media policy, sampling validation, usage
+# ---------------------------------------------------------------------------
+
+
+def _msgs(ref):
+    return [{"role": "user", "content": [{"type": "audio", "audio": ref}]}]
+
+
+def test_local_media_rejected_when_unset():
+    from experimental.server.api_server import enforce_local_media_policy
+    with pytest.raises(PermissionError):
+        enforce_local_media_policy(_msgs("/etc/passwd"), None)
+    with pytest.raises(PermissionError):
+        enforce_local_media_policy(_msgs("file:///etc/passwd"), None)
+
+
+def test_local_media_every_accepted_spelling_is_policed():
+    """The policy reads every media key in both spellings, so no form the
+    loaders accept -- notably video's {"url": ...} -- can slip past it."""
+    from experimental.server.api_server import enforce_local_media_policy
+    items = [
+        {
+            "type": "video",
+            "video": "/etc/passwd.mp4"
+        },
+        {
+            "type": "video",
+            "video": {
+                "url": "/etc/passwd.mp4"
+            }
+        },
+        {
+            "type": "video_url",
+            "video_url": {
+                "url": "/etc/passwd.mp4"
+            }
+        },
+        {
+            "type": "video",
+            "frames": ["/etc/passwd.png"]
+        },
+        {
+            "type": "image",
+            "image": {
+                "url": "/etc/passwd.png"
+            }
+        },
+        {
+            "type": "audio",
+            "audio": {
+                "url": "/etc/passwd.wav"
+            }
+        },
+    ]
+    for item in items:
+        messages = [{"role": "user", "content": [item]}]
+        with pytest.raises(PermissionError):
+            enforce_local_media_policy(messages, None)
+
+
+def test_local_media_allowed_inside_root(tmp_path):
+    from experimental.server.api_server import enforce_local_media_policy
+    media = tmp_path / "clip.wav"
+    media.write_bytes(b"")
+    enforce_local_media_policy(_msgs(str(media)), str(tmp_path))
+
+
+def test_local_media_escape_rejected(tmp_path):
+    from experimental.server.api_server import enforce_local_media_policy
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside.wav"
+    outside.write_bytes(b"")
+    with pytest.raises(PermissionError):
+        enforce_local_media_policy(_msgs(str(root / ".." / "outside.wav")),
+                                   str(root))
+
+
+def test_data_and_http_refs_bypass_local_policy():
+    from experimental.server.api_server import enforce_local_media_policy
+    enforce_local_media_policy(_msgs("data:audio/wav;base64,AAAA"), None)
+    enforce_local_media_policy(_msgs("https://example.com/a.wav"), None)
+
+
+@pytest.mark.parametrize("body", [
+    {
+        "temperature": "hot"
+    },
+    {
+        "max_tokens": 0
+    },
+    {
+        "top_p": 2.0
+    },
+    {
+        "top_k": -1
+    },
+    {
+        "temperature": float("inf")
+    },
+])
+def test_sampling_params_rejected(body):
+    from experimental.server.api_server import parse_sampling_params
+    with pytest.raises(ValueError):
+        parse_sampling_params(body, default_max_tokens=16)
+
+
+def test_sampling_params_defaults():
+    from experimental.server.api_server import parse_sampling_params
+    out = parse_sampling_params({}, default_max_tokens=16)
+    assert out["max_tokens"] == 16 and out["top_k"] == 50
+
+
+def test_usage_uses_runtime_prompt_token_counts():
+    """The runtime count wins over the HF-template estimate, which undercounts
+    multimodal placeholders; the estimate is the fallback when it is absent."""
+    from experimental.server.api_server import _runtime_prompt_tokens
+
+    class _Resp:
+        prompt_token_counts = [7, 9]
+
+    assert _runtime_prompt_tokens(_Resp(), 1, 4) == 9
+    assert _runtime_prompt_tokens(object(), 0, 4) == 4
+
+
+def test_stream_usage_chunk_when_requested(client_and_llm):
+    """stream_options.include_usage adds a final choices-less usage chunk."""
+
+    client, llm = client_and_llm
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{
+                "role": "user",
+                "content": "hi"
+            }],
+            "stream": True,
+            "stream_options": {
+                "include_usage": True
+            },
+        },
+    )
+    assert resp.status_code == 200
+    chunks = [
+        json.loads(line[len("data: "):]) for line in resp.text.splitlines()
+        if line.startswith("data: ") and "[DONE]" not in line
+    ]
+    usage_chunks = [c for c in chunks if c.get("usage")]
+    assert len(usage_chunks) == 1
+    assert usage_chunks[0]["choices"] == []
+    assert usage_chunks[0]["usage"]["prompt_tokens"] == 7
+
+
+def test_stream_usage_absent_by_default(client_and_llm):
+    client, _ = client_and_llm
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{
+                "role": "user",
+                "content": "hi"
+            }],
+            "stream": True
+        },
+    )
+    assert resp.status_code == 200
+    assert '"usage"' not in resp.text
+
+
+def test_serve_forwards_allowed_local_media_path(monkeypatch):
+    """LLM.serve must accept and forward every run_server kwarg the CLI passes."""
+    import inspect
+
+    from experimental.server import api_server
+    from experimental.server.engine import LLM
+
+    serve_params = inspect.signature(LLM.serve).parameters
+    run_params = inspect.signature(api_server.run_server).parameters
+    for name in run_params:
+        if name in ("llm_instance", "host", "port"):
+            continue
+        assert name in serve_params, f"LLM.serve is missing {name}"
+
+
+def test_batch_slice_carries_prompt_token_counts():
+    """Batched rows must keep their own prompt length, or usage reports 0."""
+    from experimental.server.batching import _copy_response_rows
+
+    class _Resp:
+        output_texts = ["a", "b", "c"]
+        output_ids = [[1], [2, 3], [4]]
+        finish_reasons = ["stop"] * 3
+        logprobs = [[], [], []]
+        prompt_token_counts = [10, 615, 59]
+
+    sliced = _copy_response_rows(_Resp(), 1, 2)
+    assert sliced.prompt_token_counts == [615, 59]
+
+
+def test_cli_main_wires_through_to_app(monkeypatch):
+    """Chain test for the CLI layer: argv -> main() -> LLM.serve() ->
+    run_server() -> _create_app(). The other tests enter at _create_app, so
+    only this one catches a kwarg dropped in an intermediate layer."""
+    import sys
+
+    from experimental.server import api_server
+    from experimental.server.engine import LLM
+
+    captured = {}
+
+    def _fake_llm_init(self, **kwargs):
+        self._eagle_engine_dir = ""
+        self._tool_template_formatter = None
+        self._model_id = "test"
+        self._multimodal_engine_dir = ""
+        self._runtime = None
+        self._rt = None
+        captured["llm"] = kwargs
+
+    def _fake_uvicorn_run(app, **kwargs):
+        captured["served"] = kwargs
+
+    monkeypatch.setattr(LLM, "__init__", _fake_llm_init)
+    monkeypatch.setattr(api_server, "_create_app",
+                        lambda llm, **kw: captured.setdefault("app", kw))
+    fake_uvicorn = type("_U", (), {"run": staticmethod(_fake_uvicorn_run)})
+    monkeypatch.setitem(sys.modules, "uvicorn", fake_uvicorn)
+    monkeypatch.setattr(sys, "argv", [
+        "prog", "--model", "hf/model", "--port", "9",
+        "--allowed-local-media-path", "/srv/media"
+    ])
+
+    api_server.main()
+
+    # The flag survived every layer down to the app factory.
+    assert captured["app"]["allowed_local_media_path"] == "/srv/media"
+    assert captured["served"]["port"] == 9
+
+
+def test_oversized_json_body_rejected(client_and_llm, monkeypatch):
+    """Chat bodies are capped by bytes received, not by Content-Length."""
+    from experimental.server import api_server
+
+    client, _ = client_and_llm
+    monkeypatch.setattr(api_server, "MAX_REQUEST_BODY_BYTES", 512)
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{
+            "role": "user",
+            "content": "x" * 4096
+        }]},
+    )
+    assert resp.status_code == 413
+
+
+def test_normal_body_still_accepted(client_and_llm):
+    client, _ = client_and_llm
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{
+            "role": "user",
+            "content": "hi"
+        }]},
+    )
+    assert resp.status_code == 200
+
+
+def test_tool_stream_usage_chunk_when_requested(client_and_llm):
+    """The tool-calling stream is a separate generator; it must emit usage too."""
+
+    from experimental.server.engine import StreamDelta
+
+    client, llm = client_and_llm
+
+    def fake_stream(messages, params, **kw):
+        yield StreamDelta(text="ok",
+                          token_ids=[1],
+                          finished=True,
+                          finish_reason="stop")
+
+    llm.generate_stream = fake_stream
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{
+                "role": "user",
+                "content": "hi"
+            }],
+            "stream":
+            True,
+            "stream_options": {
+                "include_usage": True
+            },
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "f",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                }
+            }],
+        },
+    )
+    assert resp.status_code == 200
+    chunks = [
+        json.loads(line[len("data: "):]) for line in resp.text.splitlines()
+        if line.startswith("data: ") and "[DONE]" not in line
+    ]
+    usage_chunks = [c for c in chunks if c.get("usage")]
+    assert len(usage_chunks) == 1
+    assert usage_chunks[0]["usage"]["prompt_tokens"] == 7
+
+
+def test_local_media_frames_rejected_when_unset(tmp_path):
+    """`{"type": "video", "frames": [...]}` is a local-path entry point too."""
+    from experimental.server.api_server import enforce_local_media_policy
+
+    msgs = [{
+        "role":
+        "user",
+        "content": [{
+            "type": "video",
+            "frames": ["/etc/passwd", "/etc/hosts"],
+            "fps": 1.0
+        }]
+    }]
+    with pytest.raises(PermissionError):
+        enforce_local_media_policy(msgs, None)
+
+    root = tmp_path / "root"
+    root.mkdir()
+    inside = root / "f0.png"
+    inside.write_bytes(b"")
+    enforce_local_media_policy(
+        [{
+            "role": "user",
+            "content": [{
+                "type": "video",
+                "frames": [str(inside)]
+            }]
+        }], str(root))
+
+    outside = tmp_path / "out.png"
+    outside.write_bytes(b"")
+    with pytest.raises(PermissionError):
+        enforce_local_media_policy(
+            [{
+                "role": "user",
+                "content": [{
+                    "type": "video",
+                    "frames": [str(outside)]
+                }]
+            }], str(root))
+
+
+@pytest.mark.parametrize("body", [{"top_k": 1.9}, {"max_tokens": 2.9}])
+def test_integer_params_reject_floats(body):
+    from experimental.server.api_server import parse_sampling_params
+    with pytest.raises(ValueError):
+        parse_sampling_params(body, default_max_tokens=16)
+
+
+def test_include_usage_rejects_non_bool(client_and_llm):
+    client, _ = client_and_llm
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{
+                "role": "user",
+                "content": "hi"
+            }],
+            "stream": True,
+            "stream_options": {
+                "include_usage": "false"
+            },
+        },
+    )
+    assert resp.status_code == 400

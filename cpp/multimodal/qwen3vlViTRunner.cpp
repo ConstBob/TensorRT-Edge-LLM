@@ -95,9 +95,9 @@ bool Qwen3VLViTRunner::bindExtraInputShapes()
 }
 
 std::tuple<int64_t, int64_t> Qwen3VLViTRunner::getResizedImageSize(
-    int64_t numFrames, int64_t height, int64_t width, int64_t maxRatio)
+    int64_t numFrames, bool isVideo, int64_t height, int64_t width, int64_t maxRatio)
 {
-    return rt::imageUtils::qwenSmartResize3D(numFrames, height, width, mConfig.patchSize, mConfig.mergeSize,
+    return rt::imageUtils::qwenSmartResize3D(numFrames, isVideo, height, width, mConfig.patchSize, mConfig.mergeSize,
         mConfig.minImageTokensPerImage, mConfig.maxImageTokensPerImage, mConfig.temporalPatchSize, maxRatio);
 }
 
@@ -163,12 +163,15 @@ rt::OptionalInputTensors Qwen3VLViTRunner::getDeepstackFeatures()
 
 void Qwen3VLViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchInputIds, std::vector<VisionSpan> const& spans,
-    trt_edgellm::tokenizer::Tokenizer const* tokenizer)
+    std::vector<int64_t> const& spansPerRequest, trt_edgellm::tokenizer::Tokenizer const* tokenizer)
 {
     // Pads expand to copies of mConfig.imageTokenId (embeddingLookup fills them in order). Two paths:
     //   (a) VIDEO: the <|vision_start|><|video_pad|><|vision_end|> triplet -> one timestamped (<X.X s> + vision_start
     //       + pads + vision_end) group per per-frame sub-span. Detected by the token triplet itself.
     //   (b) IMAGE (and any non-video pad): one flat pad run.
+    ELLM_CHECK(spansPerRequest.size() == request.requests.size(),
+        "spansPerRequest.size() != request.requests.size(), " + std::to_string(spansPerRequest.size())
+            + " != " + std::to_string(request.requests.size()));
     size_t spanIdx = 0;
 
     for (size_t i = 0; i < request.requests.size(); ++i)
@@ -183,6 +186,9 @@ void Qwen3VLViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
             ids = tokenizer->encode(request.formattedRequests[i].formattedCompleteRequest);
         }
 
+        // Per-request span window: a pad/triplet may only consume this request's own spans (batch isolation).
+        size_t const spanEnd = spanIdx + static_cast<size_t>(spansPerRequest[i]);
+
         auto const& imgBuffers = request.requests[i].imageBuffers;
         size_t bufferIdx = 0; // per-request image-buffer cursor (for the video sub-span count)
         std::vector<int32_t> newIds;
@@ -190,7 +196,7 @@ void Qwen3VLViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
         {
             bool const findVideoTriplet = j + 2 < ids.size() && ids[j] == mConfig.visionStartTokenId
                 && ids[j + 1] == mConfig.videoTokenId && ids[j + 2] == mConfig.visionEndTokenId;
-            if (findVideoTriplet)
+            if (findVideoTriplet && spanIdx < spanEnd)
             {
                 int64_t const tps = mConfig.temporalPatchSize;
                 ELLM_CHECK(bufferIdx < imgBuffers.size(),
@@ -201,7 +207,7 @@ void Qwen3VLViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
                 // HF replaces the whole triplet: each timestamped frame group carries its own start/end.
                 for (int64_t t = 0; t < gridT; ++t)
                 {
-                    ELLM_CHECK(spanIdx < spans.size(),
+                    ELLM_CHECK(spanIdx < spanEnd,
                         "Pad token found but no matching vision span at index " + std::to_string(spanIdx));
                     LlmVisionBlock const& block = spans[spanIdx++].llm;
                     // HF _calculate_timestamps: midpoint of the group's first/last source timestamps.
@@ -229,8 +235,9 @@ void Qwen3VLViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
             }
             else if (ids[j] == mConfig.imageTokenId || ids[j] == mConfig.videoTokenId)
             {
-                ELLM_CHECK(spanIdx < spans.size(),
-                    "Pad token found but no matching vision span at index " + std::to_string(spanIdx));
+                ELLM_CHECK(spanIdx < spanEnd,
+                    "EDGELLM_BAD_MEDIA_COUNT: Qwen3VLViTRunner::textPreprocess() pad count exceeds this request's "
+                    "media count");
                 LlmVisionBlock const& block = spans[spanIdx++].llm;
                 for (int64_t k = 0; k < block.numTokens; ++k)
                 {
@@ -243,6 +250,9 @@ void Qwen3VLViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
                 newIds.push_back(ids[j]);
             }
         }
+        ELLM_CHECK(spanIdx == spanEnd,
+            "EDGELLM_BAD_MEDIA_COUNT: Qwen3VLViTRunner::textPreprocess() pad count is smaller than this request's "
+            "media count");
 
         if (i < batchInputIds.size())
         {
