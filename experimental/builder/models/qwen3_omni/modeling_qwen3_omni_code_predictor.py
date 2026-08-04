@@ -18,9 +18,13 @@ from typing import Dict
 
 import tensorrt as trt
 
-from ...ops import (DecoderLayer, DecoderModel, DynamicLinear, NetworkModule,
-                    QKNormDecoderAttention)
+from ...ops import (DecoderLayer, DecoderModel, DynamicLinear, FP32GatedMLP,
+                    NetworkModule, QKNormDecoderAttention)
 from ...ops import functional as F
+
+
+class Qwen3OmniCodePredictorMLP(FP32GatedMLP):
+    """Qwen3-Omni CodePredictor precision-preserving MLP."""
 
 
 class Qwen3OmniCodePredictorAttention(QKNormDecoderAttention):
@@ -31,6 +35,7 @@ class Qwen3OmniCodePredictorDecoderLayer(DecoderLayer):
     """Qwen3-Omni code-predictor decoder layer."""
 
     attention_class = Qwen3OmniCodePredictorAttention
+    mlp_class = Qwen3OmniCodePredictorMLP
 
 
 class Qwen3OmniCodePredictorModel(DecoderModel):
@@ -51,6 +56,13 @@ class Qwen3OmniCodePredictor(NetworkModule):
         cfg = self.cfg
         kv_dtype = (trt.DataType.FP8
                     if cfg.kv_cache_quant == "fp8" else trt.float16)
+        num_heads = int(
+            cfg.raw_component.get("num_code_groups",
+                                  (cfg.raw_root.get("talker_config")
+                                   or {}).get("num_code_groups", 16))) - 1
+        if num_heads < 1:
+            raise ValueError(
+                "Qwen3-Omni CodePredictor requires num_code_groups > 1")
         return {
             "inputs_embeds":
             self.add_input("inputs_embeds", trt.float16,
@@ -72,19 +84,24 @@ class Qwen3OmniCodePredictor(NetworkModule):
             self.add_input("kv_page_table", trt.int32, (-1, 2, -1)),
             "last_token_ids":
             self.add_input("last_token_ids", trt.int64, (-1, 1)),
-            "lm_head_weight":
-            self.add_input("lm_head_weight", trt.float16,
-                           (-1, cfg.hidden_size)),
+            "lm_heads":
+            self.add_input("lm_heads", trt.float16,
+                           (num_heads, cfg.vocab_size, cfg.hidden_size)),
+            "lm_head_idx":
+            self.add_input("lm_head_idx", trt.int32, (1, )),
         }
 
     def forward(self, inputs_embeds, past_key_values, rope, context_lengths,
-                cache_start, kv_page_table, last_token_ids, lm_head_weight):
+                cache_start, kv_page_table, last_token_ids, lm_heads,
+                lm_head_idx):
         hidden, present, _ = self.model(inputs_embeds, past_key_values, rope,
                                         context_lengths, cache_start,
                                         kv_page_table, [])
         selected = F.gather_last_tokens(hidden, last_token_ids)
+        head = lm_heads.gather(lm_head_idx.cast(trt.int64), 0).reshape(
+            (self.cfg.vocab_size, self.cfg.hidden_size))
         outputs = {
-            "logits": self.lm_head(selected, lm_head_weight).cast(trt.float32),
+            "logits": self.lm_head(selected, head).cast(trt.float32),
             "hidden_states": hidden,
         }
         for index, tensor in enumerate(present):

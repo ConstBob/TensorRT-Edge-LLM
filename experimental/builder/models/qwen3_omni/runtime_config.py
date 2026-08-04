@@ -33,7 +33,7 @@ def update_talker_config(config: Dict[str, Any], root: Dict[str, Any], cfg,
                 "codec_nothink_id", "codec_think_bos_id", "codec_think_eos_id",
                 "codec_pad_id", "codec_bos_id", "codec_eos_token_id",
                 "codec_think_id", "accept_hidden_layer", "num_code_groups",
-                "tts_model_type"):
+                "tts_model_type", "codec_language_id"):
         if key in talker:
             config[key] = talker[key]
         elif key in root:

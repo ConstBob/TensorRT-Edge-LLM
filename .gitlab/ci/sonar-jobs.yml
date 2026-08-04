@@ -44,6 +44,7 @@ build-coverage:
     TRT_CUDA_VERSION: "13.2"
     CI_APT_INSTALL_TIMEOUT_SECONDS: "300"
     CI_PIP_INSTALL_TIMEOUT_SECONDS: "300"
+    CUTE_DSL_ARTIFACT_TAG: "sm_120"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
   tags:

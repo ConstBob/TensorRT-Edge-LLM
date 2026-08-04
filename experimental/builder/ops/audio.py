@@ -27,8 +27,8 @@ class AudioConv2d(Module):
 
     def forward(self, hidden_states):
         return F.convolution(hidden_states,
-                             self.weights.f16(self.key("weight")),
-                             self.weights.opt_f16(self.key("bias")),
+                             self.weights.fp16_parameter(self.key("weight")),
+                             self.weights.opt_fp16_parameter(self.key("bias")),
                              stride=(2, 2),
                              padding=(1, 1)).gelu()
 

@@ -210,6 +210,11 @@ DSparkDecoder::DSparkDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
                 draftCfg.ropeConfig, draftCfg.rotaryDim, baseCfg.maxKVCacheCapacity, nullptr));
     }
 
+    mDraftExternalWeightManager.load(
+        engineDir, engineDir / "draft_config.json", stream, mRuntime.draftCheckpointDir, mRuntime.checkpointDir);
+    mDraftExternalWeightManager.validateAgainstEngine(*mDraftExecutor, "dspark_draft");
+    mDraftExternalWeightManager.registerTensorMapEntries(mDraftTensorMap);
+
     mDraftTokenIds
         = Tensor({maxBatch, mProposalLen}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "DSpark::draftTokenIds");
     mVerifyTokenIds

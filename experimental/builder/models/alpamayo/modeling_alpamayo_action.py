@@ -224,9 +224,9 @@ class AlpamayoActionModel(NetworkModule):
             self.add_input("noise_trajectory", trt.float32,
                            (-1, self.diffusion_tokens, 2)),
             "time0":
-            self.add_input("time_steps_t0", trt.float32, (-1, )),
+            self.add_input("time_steps_t0", trt.float32, (1, )),
             "time1":
-            self.add_input("time_steps_t1", trt.float32, (-1, )),
+            self.add_input("time_steps_t1", trt.float32, (1, )),
             "cache_start":
             self.add_input("kvcache_start_index", trt.int32, (-1, )),
             "rope":

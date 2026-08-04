@@ -72,10 +72,11 @@ class Gemma4VisionPatchEmbedder(Module):
 class Gemma4VisionAttention(Module):
     """Gemma4 ViT attention block with q/k RMSNorm and rotary embedding."""
 
-    def __init__(self, ctx, prefix: str, num_heads: int, head_dim: int,
-                 eps: float) -> None:
+    def __init__(self, ctx, prefix: str, num_heads: int, num_kv_heads: int,
+                 head_dim: int, eps: float) -> None:
         super().__init__(ctx, prefix)
         self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.q_proj = Linear(ctx,
                              self.key("q_proj.linear"),
@@ -97,18 +98,32 @@ class Gemma4VisionAttention(Module):
         self.k_norm = Gemma4VisionNorm(ctx, self.key("k_norm"), eps, 3)
         self.v_norm = Gemma4VisionUnitRMSNorm(ctx, head_dim, eps, 3)
 
+    def _repeat_kv(self, hidden):
+        if self.num_heads == self.num_kv_heads:
+            return hidden
+        if self.num_heads % self.num_kv_heads:
+            raise ValueError("vision KV heads must divide query heads")
+        groups = self.num_heads // self.num_kv_heads
+        heads = []
+        for index in range(self.num_kv_heads):
+            head = hidden.slice_axis(1, index, 1, 3)
+            heads.extend([head] * groups)
+        return F.concatenate(heads, 1)
+
     def forward(self, hidden, rotary, cu_seqlens, max_seqlen):
         query = self.q_proj(hidden)
         key = self.k_proj(hidden)
         value = self.v_proj(hidden)
         query = query.reshape((0, self.num_heads, self.head_dim))
-        key = key.reshape((0, self.num_heads, self.head_dim))
-        value = value.reshape((0, self.num_heads, self.head_dim))
+        key = key.reshape((0, self.num_kv_heads, self.head_dim))
+        value = value.reshape((0, self.num_kv_heads, self.head_dim))
         query = self.q_norm(query)
         key = self.k_norm(key)
         value = self.v_norm(value)
         query, key = F.apply_multidimensional_rope(query, key, rotary,
                                                    self.head_dim, 2)
+        key = self._repeat_kv(key)
+        value = self._repeat_kv(value)
         query = query * np.float16(np.sqrt(self.head_dim))
         attention = F.vit_attention(query, key, value, cu_seqlens, max_seqlen,
                                     self.num_heads, self.head_dim)
@@ -122,6 +137,8 @@ class Gemma4VisionMLP(Module):
     def __init__(self, ctx, prefix: str, hidden_activation: str) -> None:
         super().__init__(ctx, prefix)
         self.hidden_activation = hidden_activation
+        self.compute_fp32 = bool(
+            ctx.bundle.root.get("vision_config", {}).get("standardize", False))
         self.gate_proj = Linear(ctx,
                                 self.key("gate_proj.linear"),
                                 rank=2,
@@ -135,19 +152,30 @@ class Gemma4VisionMLP(Module):
                                 rank=2,
                                 tensor_parallel=False)
 
+    def project(self, projection: Linear, hidden):
+        if not self.compute_fp32:
+            return projection(hidden)
+        return F.linear_f32_from_weights(hidden,
+                                         projection.weight_descriptor(),
+                                         projection.prefix,
+                                         rank=2)
+
     def forward(self, hidden):
-        gate = self.gate_proj(hidden).activation(self.hidden_activation)
-        return self.down_proj(gate * self.up_proj(hidden))
+        gate = self.project(self.gate_proj,
+                            hidden).activation(self.hidden_activation)
+        up = self.project(self.up_proj, hidden)
+        return self.project(self.down_proj, gate * up)
 
 
 class Gemma4VisionEncoderLayer(Module):
     """One Gemma4 vision encoder layer."""
 
-    def __init__(self, ctx, prefix: str, num_heads: int, head_dim: int,
-                 eps: float, hidden_activation: str) -> None:
+    def __init__(self, ctx, prefix: str, num_heads: int, num_kv_heads: int,
+                 head_dim: int, eps: float, hidden_activation: str) -> None:
         super().__init__(ctx, prefix)
         self.self_attn = Gemma4VisionAttention(ctx, self.key("self_attn"),
-                                               num_heads, head_dim, eps)
+                                               num_heads, num_kv_heads,
+                                               head_dim, eps)
         self.mlp = Gemma4VisionMLP(ctx, self.key("mlp"), hidden_activation)
         self.input_layernorm = Gemma4VisionNorm(ctx,
                                                 self.key("input_layernorm"),
@@ -187,12 +215,13 @@ class Gemma4VisionPooler(Module):
     def forward(self, hidden, pooling):
         pooled = pooling.cast(trt.float32).matmul(hidden.cast(trt.float32))
         pooled = pooled * np.float32(np.sqrt(self.hidden_size))
-        pooled = pooled.cast(trt.float16)
         if self.weights.has(self.key("std_bias")):
             pooled = ((pooled - F.constant(
-                self.weights.f16(self.key("std_bias")), "std_bias")) *
-                      F.constant(self.weights.f16(self.key("std_scale")),
-                                 "std_scale"))
+                self.weights.f32(self.key("std_bias")).reshape(1, -1),
+                "std_bias")) * F.constant(
+                    self.weights.f32(self.key("std_scale")).reshape(1, -1),
+                    "std_scale"))
+        pooled = pooled.cast(trt.float16)
         return self.projection(self.norm(pooled))
 
 
@@ -208,6 +237,8 @@ class Gemma4VisionModel(NetworkModule):
         self.visual = bundle.component_dict(contracts.Component.VISUAL)
         self.hidden_size = int(self.visual["hidden_size"])
         self.num_heads = int(self.visual["num_attention_heads"])
+        self.num_kv_heads = int(
+            self.visual.get("num_key_value_heads", self.num_heads))
         self.head_dim = int(
             self.visual.get("head_dim", self.hidden_size // self.num_heads))
         self.patch_size = int(self.visual["patch_size"])
@@ -217,8 +248,8 @@ class Gemma4VisionModel(NetworkModule):
         self.patch_embedder = Gemma4VisionPatchEmbedder(ctx)
         self.layers = [
             Gemma4VisionEncoderLayer(ctx, prefix, self.num_heads,
-                                     self.head_dim, self.eps,
-                                     hidden_activation)
+                                     self.num_kv_heads, self.head_dim,
+                                     self.eps, hidden_activation)
             for prefix in self.weights.layer_prefixes((
                 r"(.+vision_tower\.encoder\.layers\.\d+)\.input_layernorm\.weight$",
             ))

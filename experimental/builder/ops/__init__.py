@@ -25,9 +25,10 @@ import tensorrt as trt
 from . import functional
 from .audio import (AudioConvSubsampler, AudioPositionEmbedding,
                     AudioTransformer)
+from .embedding import Embedding
 from .gated_delta_net import GatedDeltaNet
 from .linear import DynamicLinear, Linear
-from .mlp import GatedMLP
+from .mlp import FP32GatedMLP, GatedMLP
 from .module import BuildContext, BuildOptions, Module, NetworkModule
 from .moe import (GatedExperts, GroupedSigmoidRouter, NonGatedNvfp4Experts,
                   TopKRouter, prepare_gated_int4_weights,
@@ -36,7 +37,7 @@ from .normalization import LayerNorm, RMSNorm
 from .tensor import Tensor
 from .transformer import (DecoderAttention, DecoderLayer, DecoderModel,
                           GatedDecoderAttention, QKNormDecoderAttention,
-                          TreeAttention)
+                          TreeAttention, pack_qkv)
 from .vision import (FastPositionEmbedding, PackedVisionAttention,
                      PatchEmbedding, VisionMLP, VisionPatchMerger,
                      VisionTransformerBlock)
@@ -55,6 +56,8 @@ __all__ = [
     "DecoderLayer",
     "DecoderModel",
     "DynamicLinear",
+    "Embedding",
+    "FP32GatedMLP",
     "GatedMLP",
     "GatedExperts",
     "GatedDeltaNet",
@@ -82,6 +85,7 @@ __all__ = [
     "int64",
     "PackedVisionAttention",
     "PatchEmbedding",
+    "pack_qkv",
     "prepare_gated_int4_weights",
     "prepare_gated_nvfp4_weights",
     "RMSNorm",

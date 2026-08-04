@@ -101,7 +101,7 @@ def _build_command(config: TestConfig, model_dir: str, engine_dir: str,
     return command
 
 
-def _runtime_command(config: TestConfig, engine_dir: str,
+def _runtime_command(config: TestConfig, model_dir: str, engine_dir: str,
                      executables: Dict[str, str]) -> List[str]:
     common = [
         f"--inputFile={config.get_test_case_file()}",
@@ -114,6 +114,7 @@ def _runtime_command(config: TestConfig, engine_dir: str,
             f"--talkerEngineDir={os.path.join(engine_dir, 'talker')}",
             f"--code2wavEngineDir={os.path.join(engine_dir, 'code2wav')}",
             f"--tokenizerDir={os.path.join(engine_dir, 'talker')}",
+            f"--checkpointDir={model_dir}",
             f"--outputAudioDir={config.get_output_audio_dir()}",
             *common,
         ]
@@ -122,12 +123,14 @@ def _runtime_command(config: TestConfig, engine_dir: str,
             executables["action_inference"],
             f"--engineDir={engine_dir}",
             f"--multimodalEngineDir={engine_dir}",
+            f"--checkpointDir={model_dir}",
             *common,
         ]
 
     command = [
         executables["llm_inference"],
         f"--engineDir={engine_dir}",
+        f"--checkpointDir={model_dir}",
         *common,
     ]
     if config.model_type in (ModelType.VLM, ModelType.ASR, ModelType.OMNI):
@@ -264,7 +267,7 @@ def test_build_and_run(test_param: str, executable_files: Dict[str, str],
              7200, env_config, test_logger)
         _assert_component_engines(model_dir, engine_dir, config)
 
-        _run(_runtime_command(config, engine_dir, executable_files),
+        _run(_runtime_command(config, model_dir, engine_dir, executable_files),
              "single end-to-end runtime execution", 6000, env_config,
              test_logger)
 

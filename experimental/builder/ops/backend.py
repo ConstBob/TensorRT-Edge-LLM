@@ -26,6 +26,8 @@ import numpy as np
 import tensorrt as trt
 
 from ..core import quantization
+from ..core.weight_policy import WeightPolicy
+from ..core.weights import CheckpointParameter, ParameterSpec
 
 __all__ = ["Net"]
 
@@ -39,12 +41,25 @@ _NP_TO_TRT = {
     np.dtype(np.bool_): trt.bool,
 }
 
+# Tags the runtime's safetensors reader understands, for binding metadata.
+_SAFETENSORS_DTYPE = {
+    np.dtype(np.float16): "F16",
+    np.dtype(np.float32): "F32",
+    np.dtype(np.int8): "I8",
+    np.dtype(np.int32): "I32",
+    np.dtype(np.int64): "I64",
+    np.dtype(np.uint8): "U8",
+    np.dtype(np.bool_): "BOOL",
+}
+
 _OPERATION_CREATORS = {
     "all_reduce": "AllReducePlugin",
     "attention": "AttentionPlugin",
     "dflash_target_cache_update": "DFlashTargetKVCacheUpdate",
     "gemma4_attention": "Gemma4AudioAttentionPlugin",
+    "fp16_moe": "Fp16MoePlugin",
     "int4_groupwise_gemm": "Int4GroupwiseGemmPlugin",
+    "int4_groupwise_gemm_v2": "Int4GroupwiseGemmPluginV2",
     "int4_moe": "Int4MoePlugin",
     "nvfp4_moe": "Nvfp4MoePlugin",
     "nvfp4_moe_sm12x": "NvFP4MoEPluginGeforce",
@@ -52,16 +67,31 @@ _OPERATION_CREATORS = {
 }
 
 
+def _e8m0_dtype():
+    """Return TensorRT's E8M0 scale type across Python API spellings."""
+    for name in ("E8M0", "UE8M0"):
+        if hasattr(trt.DataType, name):
+            return getattr(trt.DataType, name)
+    raise RuntimeError("MXFP8 requires TensorRT E8M0 support")
+
+
 class Net:
     """Lower symbolic operations into one ``INetworkDefinition``."""
 
-    def __init__(self, builder: "trt.Builder",
-                 network: "trt.INetworkDefinition") -> None:
+    def __init__(self,
+                 builder: "trt.Builder",
+                 network: "trt.INetworkDefinition",
+                 policy: Optional[WeightPolicy] = None,
+                 int4_gemm_plugin_version: int = 2) -> None:
         self.builder = builder
         self.network = network
+        self.policy = policy or WeightPolicy()
+        if int4_gemm_plugin_version not in (1, 2):
+            raise ValueError("int4_gemm_plugin_version must be 1 or 2")
+        self.int4_gemm_plugin_version = int4_gemm_plugin_version
         self._weight_refs: List[np.ndarray] = []  # keep numpy alive for TRT
         self._inputs = {}
-        self._external_weights: Dict[str, Dict[str, np.ndarray]] = {}
+        self._weight_bindings: Dict[str, Dict[str, object]] = {}
         self._n = 0
 
     # -- low level ----------------------------------------------------------
@@ -96,26 +126,95 @@ class Net:
         self._inputs[name] = tensor
         return tensor
 
-    def weight_input(self, name: str, value: np.ndarray,
-                     kind: str) -> "trt.ITensor":
-        """Declare one static engine input backed by a runtime weight file."""
-        value = np.ascontiguousarray(value)
-        dtype = _NP_TO_TRT.get(value.dtype)
-        if dtype is None:
-            raise TypeError(f"unsupported external weight dtype {value.dtype}")
-        tensors = self._external_weights.setdefault(kind, {})
-        previous = tensors.get(name)
-        if previous is not None and (previous.dtype != value.dtype
-                                     or previous.shape != value.shape):
-            raise ValueError(f"conflicting external weight input {name!r}")
-        tensors.setdefault(name, value)
-        return self.add_input(name, dtype, value.shape)
+    def weight_input(
+            self,
+            name: str,
+            value,
+            kind: str,
+            *,
+            recipe: Optional[Mapping[str, object]] = None) -> "trt.ITensor":
+        """Declare one static engine input the runtime fills at load time.
 
-    def take_external_weights(self) -> Mapping[str, Mapping[str, np.ndarray]]:
-        """Transfer registered external weights to the artifact writer."""
-        weights = self._external_weights
-        self._external_weights = {}
-        return weights
+        The payload is represented by final TensorRT metadata and a checkpoint
+        transform recipe; it is never read while the engine is built.
+        """
+        metadata_only = isinstance(value, ParameterSpec)
+        if self.policy.externalizes_parameter(kind,
+                                              name) and not metadata_only:
+            raise ValueError(
+                f"external parameter {name!r} was materialized during engine "
+                "build; model weight loading must return ParameterSpec")
+        if metadata_only:
+            shape = value.shape
+            numpy_dtype = value.dtype
+        else:
+            value = np.ascontiguousarray(value)
+            shape = value.shape
+            numpy_dtype = value.dtype
+        dtype = _NP_TO_TRT.get(numpy_dtype)
+        if dtype is None:
+            raise TypeError(f"unsupported external weight dtype {numpy_dtype}")
+        if recipe is None:
+            raise ValueError(
+                f"checkpoint-backed input {name!r} has no load recipe")
+        self._record_binding(name, shape, numpy_dtype, recipe)
+        return self.add_input(name, dtype, shape)
+
+    def parameter(
+            self,
+            name: str,
+            value,
+            kind: str,
+            recipe: Optional[Mapping[str, object]] = None) -> "trt.ITensor":
+        """Create a runtime weight input, or bake unreproducible layouts."""
+        if not self.policy.externalizes_parameter(kind, name):
+            if isinstance(value, ParameterSpec):
+                raise ValueError(
+                    f"constant parameter {name!r} has metadata but no payload")
+            return self.const(value, name.rsplit(".", 1)[-1])
+        if recipe is None:
+            if isinstance(value, ParameterSpec):
+                raise ValueError(
+                    f"external parameter {name!r} has no transform recipe")
+            return self.const(value, name.rsplit(".", 1)[-1])
+        return self.weight_input(name, value, kind, recipe=recipe)
+
+    def _record_binding(self, name: str, shape: Sequence[int], dtype: np.dtype,
+                        recipe: Mapping[str, object]) -> None:
+        checkpoint_keys = recipe.get("checkpoint_keys")
+        assemble = recipe.get("assemble")
+        if not checkpoint_keys and not assemble:
+            raise ValueError(
+                f"engine input {name!r} has no checkpoint keys, so the runtime "
+                "could not fill it; give it a recipe or emit it as a constant")
+        unknown = set(recipe).difference(
+            ("checkpoint_keys", "source_layout", "assemble", "extra"))
+        if unknown:
+            raise ValueError(f"unknown checkpoint recipe fields: {unknown}")
+        binding: Dict[str, object] = {
+            "engine_name": name,
+            "checkpoint_keys": list(checkpoint_keys or ()),
+            "source_layout": recipe.get("source_layout", "plugin"),
+            "dtype": _SAFETENSORS_DTYPE[np.dtype(dtype)],
+            "shape": [int(dim) for dim in shape],
+        }
+        if assemble:
+            binding["assemble"] = assemble
+        extra = recipe.get("extra")
+        if extra:
+            if not isinstance(extra, Mapping):
+                raise TypeError("checkpoint recipe extra must be a mapping")
+            binding.update(extra)
+        previous = self._weight_bindings.get(name)
+        if previous is not None and previous != binding:
+            raise ValueError(f"conflicting checkpoint binding {name!r}")
+        self._weight_bindings.setdefault(name, binding)
+
+    def take_weight_bindings(self) -> List[dict]:
+        """Transfer checkpoint weight bindings to the artifact writer."""
+        bindings = list(self._weight_bindings.values())
+        self._weight_bindings = {}
+        return bindings
 
     def mark_output(self,
                     tensor: "trt.ITensor",
@@ -474,8 +573,9 @@ class Net:
         mask: Optional["trt.ITensor"] = None,
         key_value_lengths: Optional["trt.ITensor"] = None,
         scale: Optional[float] = None,
+        is_causal: bool = False,
     ) -> "trt.ITensor":
-        """Apply non-causal TensorRT scaled dot-product attention."""
+        """Apply TensorRT scaled dot-product attention."""
         query = self._unwrap(query)
         if scale is None:
             head_size = int(query.shape[-1])
@@ -492,14 +592,48 @@ class Net:
                     (1, ) * len(query.shape)), "attention_scale")
             query = self.elementwise(query, scalar,
                                      trt.ElementWiseOperation.PROD)
-        layer = self.network.add_attention_v2(
-            query, self._unwrap(key), self._unwrap(value),
-            trt.AttentionNormalizationOp.SOFTMAX, trt.CausalMaskKind.NONE)
+        key = self._unwrap(key)
+        value = self._unwrap(value)
+        if hasattr(self.network, "add_attention_v2"):
+            causal_mask = (trt.CausalMaskKind.UPPER_LEFT
+                           if is_causal else trt.CausalMaskKind.NONE)
+            layer = self.network.add_attention_v2(
+                query, key, value, trt.AttentionNormalizationOp.SOFTMAX,
+                causal_mask)
+        else:
+            layer = self.network.add_attention(
+                query, key, value, trt.AttentionNormalizationOp.SOFTMAX,
+                is_causal)
         layer.decomposable = True
         if mask is not None:
             layer.mask = self._unwrap(mask)
         if key_value_lengths is not None:
-            layer.key_value_lengths = self._unwrap(key_value_lengths)
+            key_value_lengths = self._unwrap(key_value_lengths)
+            if hasattr(layer, "key_value_lengths"):
+                layer.key_value_lengths = key_value_lengths
+            else:
+                if mask is not None:
+                    raise ValueError(
+                        "this variable-length attention lowering cannot also "
+                        "accept an explicit mask")
+                capacity = int(key.shape[-2])
+                if capacity <= 0:
+                    raise ValueError(
+                        "this variable-length attention lowering requires a "
+                        "static key/value capacity")
+                positions = self.const(
+                    np.arange(capacity,
+                              dtype=np.int32).reshape(1, 1, 1, capacity),
+                    "attention_positions")
+                lengths = self.reshape(key_value_lengths, (-1, 1, 1, 1))
+                valid = self.elementwise(positions, lengths,
+                                         trt.ElementWiseOperation.LESS)
+                allowed = self.const(np.zeros((1, 1, 1, 1), dtype=np.float16),
+                                     "attention_allowed")
+                blocked = self.const(
+                    np.full((1, 1, 1, 1), -65504.0, dtype=np.float16),
+                    "attention_blocked")
+                layer.mask = self.select(valid, allowed, blocked)
         return layer.get_output(0)
 
     # -- linear / matmul ----------------------------------------------------
@@ -527,6 +661,27 @@ class Net:
             out = self.elementwise(out, b, trt.ElementWiseOperation.SUM)
         return out
 
+    def external_fp16_linear(self,
+                             x: "trt.ITensor",
+                             linear_weights,
+                             name: str,
+                             rank: int = 3) -> "trt.ITensor":
+        """FP16 linear whose ``[out, in]`` weight is a runtime engine input."""
+        tensor = self.weight_input(name + ".weight",
+                                   linear_weights.weight,
+                                   "fp16",
+                                   recipe=linear_weights.weight_recipe)
+        if rank > 2:
+            tensor = self.reshape(tensor, [1] * (rank - 2) +
+                                  list(linear_weights.weight.shape))
+        output = self.matmul(x, tensor, trt.MatrixOperation.NONE,
+                             trt.MatrixOperation.TRANSPOSE)
+        return self._add_bias(output,
+                              linear_weights.bias,
+                              rank,
+                              name=name,
+                              recipe=linear_weights.bias_recipe)
+
     def linear_f32(self,
                    x: "trt.ITensor",
                    weight: np.ndarray,
@@ -549,6 +704,48 @@ class Net:
                                       trt.ElementWiseOperation.SUM)
         return output
 
+    def linear_f32_from_weights(self,
+                                x: "trt.ITensor",
+                                linear_weights,
+                                name: str,
+                                rank: int = 3) -> "trt.ITensor":
+        """FP32 accumulation with an FP16 checkpoint-backed parameter."""
+        if linear_weights.quant_type != quantization.QUANT_FP16:
+            raise ValueError("FP32 accumulation requires an FP16 projection")
+        x32 = self.cast(self._unwrap(x), trt.float32)
+        if linear_weights.weight_recipe and self.policy.externalizes_fp16(
+                name):
+            weight = self.weight_input(name + ".weight",
+                                       linear_weights.weight,
+                                       "fp16",
+                                       recipe=linear_weights.weight_recipe)
+            weight = self.cast(weight, trt.float32)
+            if rank > 2:
+                weight = self.reshape(weight, [1] * (rank - 2) +
+                                      list(linear_weights.weight.shape))
+        else:
+            value = np.ascontiguousarray(linear_weights.weight,
+                                         dtype=np.float32)
+            weight = self.const(
+                value.reshape([1] * (rank - 2) + list(value.shape)), "w32")
+        output = self.matmul(x32, weight, trt.MatrixOperation.NONE,
+                             trt.MatrixOperation.TRANSPOSE)
+        if linear_weights.bias is not None:
+            bias_shape = [1] * (rank - 1) + [int(linear_weights.bias.shape[0])]
+            if isinstance(linear_weights.bias, ParameterSpec):
+                bias = self.weight_input(name + ".bias",
+                                         linear_weights.bias,
+                                         "fp16",
+                                         recipe=linear_weights.bias_recipe)
+                bias = self.cast(self.reshape(bias, bias_shape), trt.float32)
+            else:
+                bias = self.const(
+                    np.asarray(linear_weights.bias,
+                               dtype=np.float32).reshape(bias_shape), "b32")
+            output = self.elementwise(output, bias,
+                                      trt.ElementWiseOperation.SUM)
+        return output
+
     def dynamic_lora(self, x: "trt.ITensor", base: "trt.ITensor", prefix: str,
                      in_features: int, out_features: int) -> "trt.ITensor":
         """Add runtime LoRA A/B matrices to a linear's base output."""
@@ -568,24 +765,22 @@ class Net:
     def convolution(
             self,
             x: "trt.ITensor",
-            weight: np.ndarray,
-            bias: Optional[np.ndarray] = None,
+            weight,
+            bias=None,
             stride: Sequence[int] = (1, ),
             padding: Sequence[int] = (0, ),
             dilation: Sequence[int] = (1, ),
             groups: int = 1,
             pre_padding: Optional[Sequence[int]] = None,
             post_padding: Optional[Sequence[int]] = None) -> "trt.ITensor":
-        """Add an N-D convolution with checkpoint NumPy weights."""
+        """Add an N-D convolution with baked or checkpoint-backed weights."""
         x = self._unwrap(x)
-        weight = np.ascontiguousarray(weight.astype(np.float16))
-        bias_array = (None if bias is None or bias.size == 0 else
-                      np.ascontiguousarray(bias.astype(np.float16)))
-        promoted_1d = weight.ndim == 3
+        weight_shape = tuple(int(dimension) for dimension in weight.shape)
+        promoted_1d = len(weight_shape) == 3
         if promoted_1d:
             x = self.unsqueeze(x, -1, 3)
-            weight = np.expand_dims(weight, -1)
-        spatial_rank = weight.ndim - 2
+            weight_shape += (1, )
+        spatial_rank = len(weight_shape) - 2
 
         def spatial(values: Sequence[int], name: str,
                     promoted_value: int) -> tuple:
@@ -600,15 +795,41 @@ class Net:
                     f"spatial rank {spatial_rank}")
             return result
 
-        self._weight_refs.append(weight)
+        kernel_tensor = None
+        if isinstance(weight, CheckpointParameter):
+            kernel_tensor = self.parameter(weight.name, weight.value, "fp16",
+                                           weight.recipe)
+            if promoted_1d:
+                kernel_tensor = self.reshape(kernel_tensor, weight_shape)
+            kernel_weights = trt.Weights()
+        else:
+            weight = np.ascontiguousarray(np.asarray(weight, dtype=np.float16))
+            if promoted_1d:
+                weight = np.expand_dims(weight, -1)
+            self._weight_refs.append(weight)
+            kernel_weights = trt.Weights(weight)
+
+        bias_tensor = None
         bias_weights = trt.Weights()
-        if bias_array is not None:
+        if isinstance(bias, CheckpointParameter):
+            bias_tensor = self.parameter(bias.name, bias.value, "fp16",
+                                         bias.recipe)
+        elif bias is not None and np.asarray(bias).size:
+            bias_array = np.ascontiguousarray(
+                np.asarray(bias, dtype=np.float16))
             self._weight_refs.append(bias_array)
             bias_weights = trt.Weights(bias_array)
         layer = self.network.add_convolution_nd(
             x,
-            int(weight.shape[0]), tuple(int(dim) for dim in weight.shape[2:]),
-            trt.Weights(weight), bias_weights)
+            weight_shape[0],
+            weight_shape[2:],
+            kernel_weights,
+            bias_weights,
+        )
+        if kernel_tensor is not None:
+            layer.set_input(1, kernel_tensor)
+        if bias_tensor is not None:
+            layer.set_input(2, bias_tensor)
         layer.stride_nd = spatial(stride, "stride", 1)
         layer.dilation_nd = spatial(dilation, "dilation", 1)
         if pre_padding is None and post_padding is None:
@@ -682,9 +903,17 @@ class Net:
                             linear_weights,
                             rank: int = 3,
                             name: str = "") -> "trt.ITensor":
-        """Emit a linear using its checkpoint quantization."""
+        """Emit a linear using its checkpoint quantization.
+
+        FP8 and MXFP8 weights are always folded into the engine: their Q/DQ
+        constants have no checkpoint-equivalent layout for the runtime to
+        rebuild.
+        """
         quant_type = linear_weights.quant_type
         if quant_type == quantization.QUANT_FP16:
+            if (name and linear_weights.weight_recipe
+                    and self.policy.externalizes_fp16(name)):
+                return self.external_fp16_linear(x, linear_weights, name, rank)
             return self.linear(x, linear_weights.weight, linear_weights.bias,
                                rank)
         if quant_type == quantization.QUANT_NVFP4:
@@ -698,6 +927,8 @@ class Net:
             return self.nvfp4_linear(x, raw, rank)
         if quant_type == quantization.QUANT_FP8:
             return self.fp8_linear(x, linear_weights, rank)
+        if quant_type == quantization.QUANT_FP8_BLOCK:
+            return self.fp8_block_linear(x, linear_weights, rank)
         if quant_type == quantization.QUANT_MXFP8:
             return self.mxfp8_linear(x, linear_weights, rank)
         if quant_type in (quantization.QUANT_INT4_AWQ,
@@ -712,7 +943,7 @@ class Net:
 
     def rmsnorm(self,
                 x: "trt.ITensor",
-                weight: np.ndarray,
+                weight,
                 eps: float,
                 rank: int = 3,
                 weight_before_cast: bool = False) -> "trt.ITensor":
@@ -728,17 +959,28 @@ class Net:
         std = self.unary(var, trt.UnaryOperation.SQRT)
         normed = self.elementwise(x32, std, trt.ElementWiseOperation.DIV)
         wshape = [1] * (rank - 1) + [int(weight.shape[0])]
+        if isinstance(weight, CheckpointParameter):
+            w = self.parameter(weight.name, weight.value, "fp16",
+                               weight.recipe)
+            w = self.reshape(w, wshape)
+        else:
+            w = None
         if weight_before_cast:
-            w = self.const(weight.astype(np.float32).reshape(wshape), "rmsw")
+            if w is not None:
+                w = self.cast(w, trt.float32)
+            else:
+                w = self.const(
+                    weight.astype(np.float32).reshape(wshape), "rmsw")
             weighted = self.elementwise(normed, w,
                                         trt.ElementWiseOperation.PROD)
             return self.cast(weighted, trt.float16)
         normed16 = self.cast(normed, trt.float16)
-        w = self.const(weight.astype(np.float16).reshape(wshape), "rmsw")
+        if w is None:
+            w = self.const(weight.astype(np.float16).reshape(wshape), "rmsw")
         return self.elementwise(normed16, w, trt.ElementWiseOperation.PROD)
 
-    def layernorm(self, x: "trt.ITensor", weight: np.ndarray, bias: np.ndarray,
-                  eps: float, rank: int) -> "trt.ITensor":
+    def layernorm(self, x: "trt.ITensor", weight, bias, eps: float,
+                  rank: int) -> "trt.ITensor":
         """Apply LayerNorm over the last tensor axis."""
         axis = rank - 1
         x32 = self.cast(x, trt.float32)
@@ -757,8 +999,18 @@ class Net:
             self.elementwise(centered, deviation,
                              trt.ElementWiseOperation.DIV), trt.float16)
         shape = [1] * (rank - 1) + [int(weight.shape[0])]
-        scale = self.const(weight.astype(np.float16).reshape(shape), "ln_w")
-        shift = self.const(bias.astype(np.float16).reshape(shape), "ln_b")
+        if isinstance(weight, CheckpointParameter):
+            scale = self.parameter(weight.name, weight.value, "fp16",
+                                   weight.recipe)
+            scale = self.reshape(scale, shape)
+        else:
+            scale = self.const(
+                weight.astype(np.float16).reshape(shape), "ln_w")
+        if isinstance(bias, CheckpointParameter):
+            shift = self.parameter(bias.name, bias.value, "fp16", bias.recipe)
+            shift = self.reshape(shift, shape)
+        else:
+            shift = self.const(bias.astype(np.float16).reshape(shape), "ln_b")
         normalized = self.elementwise(normalized, scale,
                                       trt.ElementWiseOperation.PROD)
         return self.elementwise(normalized, shift,
@@ -873,26 +1125,38 @@ class Net:
                     raw_bytes: np.ndarray,
                     shape,
                     name: str = "scale_ue8m0") -> "trt.ITensor":
-        """UE8M0 constant used as an MXFP8 block scale."""
-        if not hasattr(trt.DataType, "UE8M0"):
-            raise RuntimeError("MXFP8 requires a TensorRT build with UE8M0")
+        """E8M0 constant used as an MXFP8 block scale."""
         raw_bytes = np.ascontiguousarray(raw_bytes, dtype=np.uint8)
         self._weight_refs.append(raw_bytes)
         count = int(np.prod(shape))
-        weights = trt.Weights(trt.DataType.UE8M0, raw_bytes.ctypes.data, count)
+        weights = trt.Weights(_e8m0_dtype(), raw_bytes.ctypes.data, count)
         layer = self.network.add_constant(tuple(int(dim) for dim in shape),
                                           weights)
         layer.name = self._name(name)
         return layer.get_output(0)
 
-    def _add_bias(self, x: "trt.ITensor", bias: Optional[np.ndarray],
-                  rank: int) -> "trt.ITensor":
+    def _add_bias(self,
+                  x: "trt.ITensor",
+                  bias,
+                  rank: int,
+                  *,
+                  name: str = "",
+                  recipe=None) -> "trt.ITensor":
         x = self._unwrap(x)
         if bias is None:
             return x
         shape = [1] * (rank - 1) + [int(bias.shape[0])]
-        constant = self.const(bias.astype(np.float16).reshape(shape), "b")
-        return self.elementwise(x, constant, trt.ElementWiseOperation.SUM)
+        if isinstance(bias, ParameterSpec):
+            if not name or recipe is None:
+                raise ValueError("external FP16 bias has no checkpoint recipe")
+            tensor = self.weight_input(name + ".bias",
+                                       bias,
+                                       "fp16",
+                                       recipe=recipe)
+            tensor = self.reshape(tensor, shape)
+        else:
+            tensor = self.const(bias.astype(np.float16).reshape(shape), "b")
+        return self.elementwise(x, tensor, trt.ElementWiseOperation.SUM)
 
     def fp8_linear(self,
                    x: "trt.ITensor",
@@ -928,15 +1192,13 @@ class Net:
                      x: "trt.ITensor",
                      linear_weights,
                      rank: int = 3) -> "trt.ITensor":
-        """MXFP8 dynamic-activation Q/DQ and UE8M0 block-weight DQ."""
+        """MXFP8 dynamic-activation Q/DQ and E8M0 block-weight DQ."""
         x = self._unwrap(x)
-        if not hasattr(trt.DataType, "UE8M0"):
-            raise RuntimeError("MXFP8 requires TensorRT UE8M0 support")
         axis = rank - 1
         dynamic = self.network.add_dynamic_quantize(x, axis,
                                                     linear_weights.group_size,
                                                     trt.DataType.FP8,
-                                                    trt.DataType.UE8M0)
+                                                    _e8m0_dtype())
         activation_scale = dynamic.get_output(1)
         dequantized_x = self.network.add_dequantize(dynamic.get_output(0),
                                                     activation_scale,
@@ -959,6 +1221,53 @@ class Net:
             trt.MatrixOperation.TRANSPOSE).get_output(0)
         return self._add_bias(output, linear_weights.bias, rank)
 
+    def fp8_block_linear(self,
+                         x: "trt.ITensor",
+                         linear_weights,
+                         rank: int = 3) -> "trt.ITensor":
+        """FP8 weight-only MatMul with FP32 two-dimensional block scales."""
+        x = self._unwrap(x)
+        out_features, in_features = linear_weights.weight.shape
+        scale_shape = tuple(
+            int(dim) for dim in linear_weights.weight_scale.shape)
+        if (len(scale_shape) != 4 or scale_shape[1] != 1
+                or scale_shape[3] != 1):
+            raise ValueError("FP8 block scale must have shape [out_blocks, 1, "
+                             f"in_blocks, 1], got {scale_shape}")
+        out_blocks, _, in_blocks, _ = scale_shape
+        if out_features % out_blocks or in_features % in_blocks:
+            raise ValueError(
+                f"FP8 weight shape {(out_features, in_features)} is not "
+                f"divisible by block scale shape {scale_shape}")
+        out_block = out_features // out_blocks
+        weight = self.const_fp8(linear_weights.weight,
+                                (out_features, in_features), "w_fp8_block")
+        scale = self.const(
+            np.ascontiguousarray(linear_weights.weight_scale,
+                                 dtype=np.float32).reshape(
+                                     (out_blocks, in_blocks)),
+            "w_block_scale",
+        )
+        dequantized_weight = self.network.add_dequantize(
+            weight, scale, trt.float16)
+        dequantized_weight.block_shape = (out_block, in_features // in_blocks)
+        weight = dequantized_weight.get_output(0)
+        input_shape = None
+        if rank > 2:
+            input_shape = self.shape_of(x)
+            x = self.reshape(x, (-1, in_features))
+        output = self.network.add_matrix_multiply(
+            x, trt.MatrixOperation.NONE, weight,
+            trt.MatrixOperation.TRANSPOSE).get_output(0)
+        if input_shape is not None:
+            leading = self.network.add_slice(input_shape, (0, ), (rank - 1, ),
+                                             (1, )).get_output(0)
+            output_shape = self.concat(
+                (leading, self.const(np.array([out_features],
+                                              dtype=np.int32))), 0)
+            output = self.dynamic_reshape(output, output_shape)
+        return self._add_bias(output, linear_weights.bias, rank)
+
     def int4_linear(self,
                     x: "trt.ITensor",
                     linear_weights,
@@ -969,27 +1278,72 @@ class Net:
             raise ValueError("INT4 linear requires a stable module name")
         if linear_weights.pre_quant_scale is not None:
             shape = [1] * (rank - 1) + [linear_weights.in_features]
-            smoother = self.const(
-                linear_weights.pre_quant_scale.astype(
-                    np.float16).reshape(shape), "pre_quant_scale")
+            pre_quant = linear_weights.pre_quant_scale
+            if not isinstance(pre_quant, ParameterSpec):
+                pre_quant = np.ascontiguousarray(pre_quant, dtype=np.float16)
+            if (linear_weights.pre_quant_recipe and
+                    self.policy.externalizes_fp16(name + ".pre_quant_scale")):
+                smoother = self.weight_input(
+                    name + ".pre_quant_scale",
+                    pre_quant,
+                    "fp16",
+                    recipe=linear_weights.pre_quant_recipe,
+                )
+                smoother = self.reshape(smoother, shape)
+            else:
+                smoother = self.const(pre_quant.reshape(shape),
+                                      "pre_quant_scale")
             x = self.elementwise(x, smoother, trt.ElementWiseOperation.PROD)
-        if linear_weights.activation_permutation is not None:
-            x = self.gather(x, linear_weights.activation_permutation, rank - 1)
-        weight = self.weight_input(
-            name + ".qweight", linear_weights.weight.astype(np.int8,
-                                                            copy=False),
-            "int4_gemm")
-        scales = self.weight_input(
-            name + ".scales",
-            np.asarray(linear_weights.weight_scale, dtype=np.float16),
-            "int4_gemm")
+        weight_recipe = linear_weights.weight_recipe
+        permutation = linear_weights.activation_permutation
+        if isinstance(permutation, ParameterSpec):
+            permutation_name = name + ".activation_permutation"
+            permutation_tensor = self.weight_input(
+                permutation_name,
+                permutation,
+                "int4_ffn",
+                recipe=linear_weights.activation_permutation_recipe,
+            )
+            x = self.gather_tensor(x, permutation_tensor, rank - 1)
+            if weight_recipe is not None:
+                weight_recipe = dict(weight_recipe)
+                extra = dict(weight_recipe.get("extra") or {})
+                extra["activation_permutation_engine_name"] = permutation_name
+                weight_recipe["extra"] = extra
+        elif permutation is not None:
+            x = self.gather(x, permutation, rank - 1)
+        weight_value = linear_weights.weight
+        if not isinstance(weight_value, ParameterSpec):
+            weight_value = weight_value.astype(np.int8, copy=False)
+        weight = self.parameter(name + ".qweight", weight_value, "int4_ffn",
+                                weight_recipe)
+        scale_value = linear_weights.weight_scale
+        if not isinstance(scale_value, ParameterSpec):
+            scale_value = np.asarray(scale_value, dtype=np.float16)
+        scales = self.parameter(name + ".scales", scale_value, "int4_ffn",
+                                linear_weights.scale_recipe)
+        operation_name = ("int4_groupwise_gemm_v2"
+                          if self.int4_gemm_plugin_version == 2 else
+                          "int4_groupwise_gemm")
+        plugin_input = x
+        if rank == 2:
+            plugin_input = self.unsqueeze(x, 0, rank)
+        elif rank != 3:
+            raise ValueError(
+                f"INT4 linear supports rank 2 or 3, received rank {rank}")
         output = self.operation(
-            "int4_groupwise_gemm", {
+            operation_name, {
                 "gemm_n": linear_weights.out_features,
                 "gemm_k": linear_weights.in_features,
                 "group_size": linear_weights.group_size,
-            }, [x, weight, scales]).get_output(0)
-        return self._add_bias(output, linear_weights.bias, rank)
+            }, [plugin_input, weight, scales]).get_output(0)
+        if rank == 2:
+            output = self.squeeze(output, 0, 3)
+        return self._add_bias(output,
+                              linear_weights.bias,
+                              rank,
+                              name=name,
+                              recipe=linear_weights.bias_recipe)
 
     def int8_sq_linear(self,
                        x: "trt.ITensor",

@@ -22,8 +22,79 @@ import numpy as np
 from .. import contracts, numpy_dtypes
 from ..config import DeviceConfig
 from ..safetensors_np import load_safetensors_tensor
+from ..weight_policy import (CHECKPOINT_BINDING_ENGINE_EMBEDDING,
+                             CHECKPOINT_BINDING_ENGINE_PLE,
+                             CHECKPOINT_BINDING_ROLE_EMBEDDING,
+                             CHECKPOINT_BINDING_ROLE_PLE, EXTERNAL_WEIGHT_FP16)
 from ..weights import Weights
 from .tensors import save_safetensors
+
+EMBEDDING_KEY = "model.embed_tokens.weight"
+
+
+def externalizes_embedding(args, weight_conversion) -> bool:
+    """Whether the runtime owns this component's embedding artifact.
+
+    Components that pull embeddings from a second checkpoint keep their
+    sidecar: the runtime only opens one ``--checkpointDir``.
+    """
+    if not args.weight_policy.externalizes_embedding:
+        return False
+    if getattr(weight_conversion, "runtime_embedding_model_dir",
+               None) is not None:
+        return False
+    writes_embedding = getattr(weight_conversion, "writes_runtime_embedding",
+                               None)
+    return writes_embedding is None or writes_embedding(args)
+
+
+def embedding_binding(weights: Weights, cfg: DeviceConfig) -> dict:
+    """Checkpoint binding standing in for ``embedding.safetensors``."""
+    key = weights.find(EMBEDDING_KEY)
+    binding = {
+        "engine_name": CHECKPOINT_BINDING_ENGINE_EMBEDDING,
+        "role": CHECKPOINT_BINDING_ROLE_EMBEDDING,
+        "checkpoint_keys": [key],
+        "source_layout": "fp16",
+        # This describes the runtime tensor, not the provider payload. The
+        # checkpoint reader converts BF16/F32 embeddings to FP16 while loading.
+        "dtype": "F16",
+        "shape": [int(dim) for dim in weights.store.shape(key)],
+        "embedding_scale": float(np.float16(cfg.embedding_scale)),
+    }
+    locations = weights.checkpoint_locations([key])
+    if locations:
+        binding["checkpoint_locations"] = locations
+    return binding
+
+
+def externalizes_ple(args, cfg: DeviceConfig) -> bool:
+    """Whether Gemma4 PLE stays in the provider checkpoint."""
+    return (cfg.hidden_size_per_layer_input > 0
+            and args.weight_policy.wants(EXTERNAL_WEIGHT_FP16))
+
+
+def ple_embedding_binding(weights: Weights, cfg: DeviceConfig) -> dict:
+    """Checkpoint binding standing in for ``ple_embedding.safetensors``."""
+    key = weights.find("model.embed_tokens_per_layer.weight")
+    binding = {
+        "engine_name":
+        CHECKPOINT_BINDING_ENGINE_PLE,
+        "role":
+        CHECKPOINT_BINDING_ROLE_PLE,
+        "checkpoint_keys": [key],
+        "source_layout":
+        "fp16",
+        "dtype":
+        "F16",
+        "shape": [int(dim) for dim in weights.store.shape(key)],
+        "embedding_scale":
+        float(np.float16(np.sqrt(cfg.hidden_size_per_layer_input))),
+    }
+    locations = weights.checkpoint_locations([key])
+    if locations:
+        binding["checkpoint_locations"] = locations
+    return binding
 
 
 def write_embedding(weights: Weights, cfg: DeviceConfig, args,

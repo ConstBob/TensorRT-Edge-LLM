@@ -40,9 +40,10 @@ def prepare_text_config(config: dict, root: dict,
     return config
 
 
-def configure_base(config, **kwargs) -> None:
+def configure_base(config, *, build_args=None, **kwargs) -> None:
     """Enable the checkpoint's model-owned MTP feedback contract."""
     config.mtp_base = True
+    config.mtp_tree_base = bool(build_args and build_args.tree_base)
 
 
 def configure_draft(config, **kwargs) -> None:

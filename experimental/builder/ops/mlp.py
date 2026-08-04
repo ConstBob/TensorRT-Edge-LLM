@@ -16,6 +16,8 @@
 
 from typing import Optional
 
+import tensorrt as trt
+
 from .linear import Linear
 from .module import BuildContext, Module
 
@@ -36,3 +38,13 @@ class GatedMLP(Module):
     def forward(self, hidden_states):
         gate = self.gate_proj(hidden_states).activation(self.activation)
         return self.down_proj(gate * self.up_proj(hidden_states))
+
+
+class FP32GatedMLP(GatedMLP):
+    """SwiGLU with an FP32 product and FP32 down-projection accumulation."""
+
+    def forward(self, hidden_states):
+        gate = self.gate_proj(hidden_states).cast(trt.float32).activation(
+            self.activation)
+        up = self.up_proj(hidden_states).cast(trt.float32)
+        return self.down_proj.forward_f32(gate * up).cast(hidden_states.dtype)

@@ -27,7 +27,11 @@ def _validate_dimensions(draft, target) -> None:
                          f"{target.vocab_size} != {draft.vocab_size}")
 
 
-def configure_base(config, *, paired_draft_dir: str = "", **kwargs) -> None:
+def configure_base(config,
+                   *,
+                   paired_draft_dir: str = "",
+                   build_args=None,
+                   **kwargs) -> None:
     """Read the draft contract required by a DFlash target graph."""
     config.dflash_base = True
     if not paired_draft_dir:
@@ -62,6 +66,7 @@ def configure_base(config, *, paired_draft_dir: str = "", **kwargs) -> None:
     config.dflash_block_size = int(
         dflash.get("block_size", draft.get("block_size", 16)))
     config.dflash_mask_token_id = int(dflash.get("mask_token_id", 248070))
+    config.dflash_tree_base = bool(build_args and build_args.tree_base)
 
 
 def configure_draft(config, *, paired_target=None, **kwargs) -> None:

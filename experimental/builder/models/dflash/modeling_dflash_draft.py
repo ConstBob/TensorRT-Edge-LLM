@@ -19,10 +19,11 @@ from typing import Dict
 import tensorrt as trt
 
 from ...core import config as core_config
-from ...core import weights as core_weights
+from ...core import quantization
 from ...ops import (GatedMLP, Linear, Module, NetworkModule, RMSNorm,
                     TreeAttention)
 from ...ops import functional as F
+from ...ops import pack_qkv
 from .. import registry as model_registry
 
 
@@ -57,7 +58,7 @@ class DFlashProposalAttention(TreeAttention):
         key = self.k_norm(key, 4).reshape(
             (0, 0, cfg.num_key_value_heads * cfg.head_dim))
         value = self.v_proj(hidden)
-        qkv = F.concatenate((query, key, value), 2)
+        qkv = pack_qkv(query, key, value, self.v_proj)
         attention, present = F.attention(
             qkv,
             updated,
@@ -104,8 +105,9 @@ class DFlashTargetProjection(Module):
     """Project concatenated target states before proposal decoding."""
 
     def forward(self, hidden):
-        weight, bias = self.weights.linear_fp16(self.prefix)
-        return F.linear_f32(hidden, weight, bias)
+        descriptor = self.weights.linear_descriptor(self.prefix,
+                                                    quantization.QUANT_FP16)
+        return F.linear_f32_from_weights(hidden, descriptor, self.prefix)
 
 
 class DFlashDraftModel(NetworkModule):
@@ -114,7 +116,8 @@ class DFlashDraftModel(NetworkModule):
     @classmethod
     def from_config(cls, ctx):
         args = ctx.args
-        if ctx.weights.has("lm_head.weight"):
+        if (ctx.weights.has("lm_head.weight")
+                or ctx.weights.has("lm_head.qweight")):
             return cls(ctx)
 
         base_cfg = core_config.DeviceConfig.from_pretrained(
@@ -124,15 +127,21 @@ class DFlashDraftModel(NetworkModule):
         conversion = model_registry.weight_conversion_for(
             target_bundle.root_model_type)
 
-        base_weights = core_weights.Weights(args.target_model_dir,
-                                            group_size=base_cfg.group_size,
-                                            quant=base_cfg.quant,
-                                            component="llm",
-                                            vocab_map=ctx.weights.vocab_map,
-                                            conversion=conversion)
+        base_weights = ctx.open_weights(
+            args.target_model_dir,
+            group_size=base_cfg.group_size,
+            quant=base_cfg.quant,
+            component="llm",
+            vocab_map=ctx.weights.vocab_map,
+            conversion=conversion,
+            int4_gemm_plugin_version=(args.int4_gemm_plugin_version),
+            checkpoint_source="target",
+            tie_word_embeddings=base_cfg.tie_word_embeddings)
         try:
             base_context = ctx.with_checkpoint(base_cfg, base_weights)
-            model = cls(ctx, lm_head=Linear(base_context, "lm_head"))
+            model = cls(ctx,
+                        lm_head=Linear(base_context,
+                                       base_weights.causal_lm_head_prefix()))
         except Exception:
             base_weights.close()
             raise

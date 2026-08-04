@@ -45,7 +45,7 @@ The implementation is under `experimental/builder`:
 | Layer | Main files | Responsibility |
 |---|---|---|
 | CLI orchestration | `cli.py` | Resolve components, expand speculative base/draft builds, load the plugin once, and build components in runtime order. |
-| Build driver | `core/builder.py` | Create a strongly typed TensorRT network, bind checkpoint state, configure profiles, serialize the engine, and write external weight files. |
+| Build driver | `core/builder.py` | Create a strongly typed TensorRT network, bind checkpoint metadata, configure profiles, serialize the engine, and publish runtime weight metadata. |
 | Checkpoint contract | `core/config.py`, `core/quantization.py`, `core/weights.py` | Parse model/quantization metadata and provide streaming safetensors access. |
 | Component contract | `core/contracts.py` | Define component names, output paths, profile limits, and deterministic build order. |
 | Model registry | `models/registry.py` | Map an exact checkpoint `model_type` and component to a concrete `NetworkModule`, configuration module, weight converter, and artifact writer. |
@@ -80,8 +80,9 @@ One command follows this sequence:
    the model's `forward`, and marks only its explicitly returned outputs.
 7. `core.builder` creates the component-specific optimization profiles and
    calls `builder.build_serialized_network`.
-8. The model-owned artifact writer emits the runtime config and sidecars.
-   Externalized quantized weights are then added to that component's manifest.
+8. The model-owned artifact writer emits the runtime config. Checkpoint
+   bindings or validated transformed-sidecar references are then added to that
+   component's manifest.
 
 Each loop iteration creates one independent TensorRT network. A VLM therefore
 has one `NetworkModule` and `INetworkDefinition` for its LLM and another for its
@@ -277,9 +278,10 @@ Large quantized extension weights can be static TensorRT network inputs:
 
 They remain parameters owned by `Linear` or the model-specific expert module;
 they do not appear in model `forward` signatures. `Net.weight_input` records
-the binding and tensor data, `core/artifacts/external_weights.py` writes a
-component-local safetensors file, and the artifact manifest lets the C++
-`ExternalWeightManager` bind it when loading the engine.
+only final tensor metadata and the provider-checkpoint conversion recipe.
+`core/artifacts/external_weights.py` publishes those bindings in the component
+config, and the C++ `ExternalWeightManager` maps, transforms, and binds the
+original checkpoint once when loading the engine.
 
 ## Profiles And Runtime Artifacts
 

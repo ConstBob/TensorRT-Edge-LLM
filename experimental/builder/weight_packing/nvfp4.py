@@ -24,6 +24,7 @@ __all__ = [
     "decode_modelopt_nvfp4",
     "swizzle_nvfp4_mma_scales",
     "pack_nvfp4_moe_weight",
+    "pack_gated_nvfp4_experts",
 ]
 
 # Midpoints between consecutive E2M1 levels (for searchsorted quantization).
@@ -111,6 +112,111 @@ def pack_nvfp4_moe_weight(dense_w_mk: np.ndarray, group_size: int = 16):
     sf_bytes = f32_to_fp8_e4m3_bytes(block_scales)
     blocks_scale = swizzle_nvfp4_mma_scales(sf_bytes, m_dim, k_sf_dim)
     return np.ascontiguousarray(qweights), np.ascontiguousarray(blocks_scale)
+
+
+def _gated_fc1_rows(up: np.ndarray, gate: np.ndarray,
+                    layout: str) -> np.ndarray:
+    """Arrange matching UP/GATE rows for one gated MoE FC1 input."""
+    if up.shape != gate.shape:
+        raise ValueError(f"UP/GATE shape mismatch: {up.shape} vs {gate.shape}")
+    if layout == "concat":
+        return np.ascontiguousarray(np.concatenate((up, gate), axis=0))
+    if layout != "interleave":
+        raise ValueError(f"unsupported gated FC1 layout {layout!r}")
+    intermediate, width = up.shape
+    if intermediate % 64:
+        raise ValueError(
+            "interleaved NVFP4 FC1 requires intermediate_size % 64 == 0")
+    chunks = intermediate // 64
+    return np.ascontiguousarray(
+        np.stack(
+            (up.reshape(chunks, 64, width), gate.reshape(chunks, 64, width)),
+            axis=1).reshape(2 * intermediate, width))
+
+
+def pack_gated_nvfp4_experts(load_expert,
+                             num_experts: int,
+                             hidden_size: int,
+                             intermediate_size: int,
+                             group_size: int,
+                             fc1_layout: str,
+                             plugin_intermediate_size: int | None = None):
+    """Normalize and arrange provider-packed NVFP4 gated experts.
+
+    ``load_expert(index)`` returns raw ModelOpt FP4 bytes, FP8 scale bytes,
+    and scalar weight scales for gate/up/down. Requantization absorbs those
+    per-projection scales into the plugin block scales and emits unit alphas.
+    """
+    if group_size != 16:
+        raise NotImplementedError("Nvfp4MoePlugin requires group_size=16")
+    plugin_intermediate_size = (intermediate_size if plugin_intermediate_size
+                                is None else plugin_intermediate_size)
+    if (plugin_intermediate_size < intermediate_size
+            or plugin_intermediate_size % 64):
+        raise ValueError(
+            "plugin intermediate size must be at least the checkpoint size "
+            "and divisible by 64")
+
+    fc1_weights = []
+    fc1_scales = []
+    fc1_alpha = []
+    fc2_weights = []
+    fc2_scales = []
+    fc2_alpha = []
+    for expert_index in range(num_experts):
+        expert = load_expert(expert_index)
+        gate = expert["gate"]
+        up = expert["up"]
+        down = expert["down"]
+        expected_fc1_weight = (intermediate_size, hidden_size // 2)
+        expected_fc1_scale = (intermediate_size, hidden_size // group_size)
+        expected_fc2_weight = (hidden_size, intermediate_size // 2)
+        expected_fc2_scale = (hidden_size, intermediate_size // group_size)
+        for projection, expected_weight, expected_scale in (
+            (gate, expected_fc1_weight, expected_fc1_scale),
+            (up, expected_fc1_weight, expected_fc1_scale),
+            (down, expected_fc2_weight, expected_fc2_scale),
+        ):
+            if projection["packed"].shape != expected_weight:
+                raise ValueError(
+                    f"NVFP4 weight shape {projection['packed'].shape} != "
+                    f"{expected_weight}")
+            if projection["sf"].shape != expected_scale:
+                raise ValueError(
+                    f"NVFP4 scale shape {projection['sf'].shape} != "
+                    f"{expected_scale}")
+        padding = plugin_intermediate_size - intermediate_size
+        up_dense = decode_modelopt_nvfp4(up["packed"], up["sf"], up["alpha"],
+                                         group_size)
+        gate_dense = decode_modelopt_nvfp4(gate["packed"], gate["sf"],
+                                           gate["alpha"], group_size)
+        up_dense = np.pad(up_dense, ((0, padding), (0, 0)))
+        gate_dense = np.pad(gate_dense, ((0, padding), (0, 0)))
+        fc1_dense = _gated_fc1_rows(up_dense, gate_dense, fc1_layout)
+        fc1_weight, fc1_scale = pack_nvfp4_moe_weight(fc1_dense, group_size)
+        fc1_weights.append(fc1_weight)
+        fc1_scales.append(fc1_scale)
+        fc1_alpha.append(np.float32(1.0))
+
+        down_dense = decode_modelopt_nvfp4(down["packed"], down["sf"],
+                                           down["alpha"], group_size)
+        down_dense = np.pad(
+            down_dense,
+            ((0, 0), (0, padding)),
+        )
+        fc2_weight, fc2_scale = pack_nvfp4_moe_weight(down_dense, group_size)
+        fc2_weights.append(fc2_weight)
+        fc2_scales.append(fc2_scale)
+        fc2_alpha.append(np.float32(1.0))
+
+    return (
+        np.stack(fc1_weights),
+        np.stack(fc1_scales),
+        np.asarray(fc1_alpha, dtype=np.float32),
+        np.stack(fc2_weights),
+        np.stack(fc2_scales),
+        np.asarray(fc2_alpha, dtype=np.float32),
+    )
 
 
 # Re-expose decoders used elsewhere.

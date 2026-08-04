@@ -83,7 +83,8 @@ Qwen3OmniAudioRunner::Qwen3OmniAudioRunner(std::string const& engineDir, cudaStr
         {
             mAudioEngine = deserializeCudaEngineFromFile(*mRuntime, audioEnginePath);
 
-            mAudioContext = std::unique_ptr<nvinfer1::IExecutionContext>(mAudioEngine->createExecutionContext());
+            mAudioContext = std::unique_ptr<nvinfer1::IExecutionContext>(
+                mAudioEngine->createExecutionContext(nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED));
             ELLM_CHECK(mAudioContext, "Failed to create audio encoder context");
 
             bool const profileSet = mAudioContext->setOptimizationProfileAsync(0, stream);

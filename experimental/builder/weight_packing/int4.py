@@ -12,11 +12,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""NumPy-only conversion of AWQ/GPTQ weights to the INT4 plugin layout."""
+"""NumPy-only conversion of AWQ/GPTQ weights to INT4 plugin layouts."""
 
 from typing import Optional, Tuple
 
 import numpy as np
+
+
+def _pack_for_gemm(unpacked: np.ndarray, plugin_version: int) -> np.ndarray:
+    """Pack biased ``[N,K]`` nibbles for one dense INT4 plugin contract."""
+    if plugin_version == 1:
+        return pack_intweights(unpacked)
+    if plugin_version == 2:
+        return pack_cutedsl_fragment(unpacked)
+    raise ValueError(f"unsupported INT4 GEMM plugin version {plugin_version}")
 
 
 def select_column_packed(values: np.ndarray, indices: np.ndarray,
@@ -57,7 +66,7 @@ def select_pair_packed_rows(values: np.ndarray,
 
 
 def pack_intweights(unpacked: np.ndarray) -> np.ndarray:
-    """Pack unsigned nibbles ``[N,K]`` into the INT4 GEMM byte layout."""
+    """Pack nibbles into legacy ``Int4GroupwiseGemmPlugin`` layout."""
     n_dim, k_dim = unpacked.shape
     if n_dim % 4 or k_dim % 64:
         raise ValueError(
@@ -77,7 +86,55 @@ def pack_intweights(unpacked: np.ndarray) -> np.ndarray:
     return packed16.view(np.int8).reshape(n_dim // 2, k_dim)
 
 
-def repack_awq(qweight: np.ndarray, qzeros: np.ndarray) -> np.ndarray:
+def pack_cutedsl_fragment(unpacked: np.ndarray) -> np.ndarray:
+    """Pack biased nibbles for ``Int4GroupwiseGemmPluginV2``.
+
+    The V2 plugin consumes an INT8 view of fragment-ordered uint32 words with
+    shape ``[ceil(N/128) * ceil(K/64) * 8, 512]``. N is padded to 128 with
+    nibble 8 (quantized zero); K must already be 64-aligned.
+    """
+    n_dim, k_dim = unpacked.shape
+    if k_dim % 64:
+        raise ValueError(
+            f"INT4 V2 fragment packing requires K%64=0, got {(n_dim, k_dim)}")
+
+    n_blocks = (n_dim + 127) // 128
+    k_tiles = k_dim // 64
+    source = np.asarray(unpacked, dtype=np.uint8) & np.uint8(0xF)
+    words = np.empty((n_blocks * k_tiles * 8, 128), dtype=np.uint32)
+
+    for n_block in range(n_blocks):
+        for k_tile in range(k_tiles):
+            for fragment in range(8):
+                k_block, n_pair = divmod(fragment, 2)
+                row = (n_block * k_tiles + k_tile) * 8 + fragment
+                for thread in range(128):
+                    n_lo = n_block * 128 + thread // 4 + 64 * n_pair
+                    n_hi = n_lo + 32
+                    k0 = k_tile * 64 + 16 * k_block + 2 * (thread % 4)
+                    coordinates = (
+                        (n_lo, k0),
+                        (n_lo, k0 + 8),
+                        (n_hi, k0),
+                        (n_hi, k0 + 8),
+                        (n_lo, k0 + 1),
+                        (n_lo, k0 + 9),
+                        (n_hi, k0 + 1),
+                        (n_hi, k0 + 9),
+                    )
+                    word = 0
+                    for shift, (n_index, k_index) in enumerate(coordinates):
+                        value = (source[n_index, k_index]
+                                 if n_index < n_dim else np.uint8(8))
+                        word |= int(value) << (4 * shift)
+                    words[row, thread] = word
+
+    return np.ascontiguousarray(words).view(np.int8).reshape(-1, 512)
+
+
+def repack_awq(qweight: np.ndarray,
+               qzeros: np.ndarray,
+               plugin_version: int = 1) -> np.ndarray:
     """Convert column-packed AWQ int32 weights to the plugin byte layout."""
     in_features, out_div8 = qweight.shape
     out_features = out_div8 * 8
@@ -93,7 +150,7 @@ def repack_awq(qweight: np.ndarray, qzeros: np.ndarray) -> np.ndarray:
         zero_nibbles[:, channel::8] = (qzeros >> (4 * bit)) & 0xF
     expanded_zeros = np.repeat(zero_nibbles, group_size, axis=0)
     adjusted = np.clip(weight_nibbles - expanded_zeros + 8, 0, 15)
-    return pack_intweights(np.ascontiguousarray(adjusted.T))
+    return _pack_for_gemm(np.ascontiguousarray(adjusted.T), plugin_version)
 
 
 def repack_gptq(
@@ -101,6 +158,7 @@ def repack_gptq(
     qzeros: np.ndarray,
     g_idx: Optional[np.ndarray] = None,
     zero_point_offset: int = 1,
+    plugin_version: int = 1,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Convert row-packed GPTQ int32 weights to plugin bytes and K permutation."""
     in_div8, out_features = qweight.shape
@@ -140,11 +198,12 @@ def repack_gptq(
     permutation = np.concatenate(
         [np.flatnonzero(g_idx == group) for group in range(num_groups)])
     adjusted = adjusted[permutation]
-    return (pack_intweights(np.ascontiguousarray(adjusted.T)),
-            permutation.astype(np.int64))
+    return (_pack_for_gemm(np.ascontiguousarray(adjusted.T),
+                           plugin_version), permutation.astype(np.int64))
 
 
-def repack_modelopt_awq(weight: np.ndarray) -> np.ndarray:
+def repack_modelopt_awq(weight: np.ndarray,
+                        plugin_version: int = 1) -> np.ndarray:
     """Convert ModelOpt packed uint8 W4A16 weights to plugin bytes."""
     out_half, in_features = weight.shape
     out_features = out_half * 2
@@ -153,7 +212,7 @@ def repack_modelopt_awq(weight: np.ndarray) -> np.ndarray:
     nibbles[0::2] = weight16 & 0xF
     nibbles[1::2] = (weight16 >> 4) & 0xF
     nibbles = (nibbles + 8) % 16
-    return pack_intweights(nibbles)
+    return _pack_for_gemm(nibbles, plugin_version)
 
 
 def _unpack_gptq_rows(qweight: np.ndarray) -> np.ndarray:

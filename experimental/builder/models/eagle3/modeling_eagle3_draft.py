@@ -18,9 +18,11 @@ from typing import Dict
 
 import tensorrt as trt
 
+from ...core import config as core_config
 from ...ops import (GatedMLP, Linear, Module, NetworkModule, RMSNorm,
                     TreeAttention)
 from ...ops import functional as F
+from .. import registry as model_registry
 
 
 class Eagle3DecoderLayer(Module):
@@ -53,21 +55,58 @@ class Eagle3DecoderLayer(Module):
 class Eagle3DraftModel(NetworkModule):
     """EAGLE3 draft model with runtime tree-attention metadata."""
 
-    def __init__(self, ctx) -> None:
+    @classmethod
+    def from_config(cls, ctx):
+        if (ctx.weights.has("lm_head.weight")
+                or ctx.weights.has("lm_head.qweight")):
+            return cls(ctx)
+
+        args = ctx.args
+        target_cfg = core_config.DeviceConfig.from_pretrained(
+            args.target_model_dir, tp_size=args.tp_size, tp_rank=args.tp_rank)
+        target_bundle = core_config.BundleConfig.from_pretrained(
+            args.target_model_dir)
+        conversion = model_registry.weight_conversion_for(
+            target_bundle.root_model_type)
+        target_weights = ctx.open_weights(
+            args.target_model_dir,
+            group_size=target_cfg.group_size,
+            quant=target_cfg.quant,
+            component="llm",
+            vocab_map=ctx.weights.vocab_map,
+            conversion=conversion,
+            int4_gemm_plugin_version=args.int4_gemm_plugin_version,
+            checkpoint_source="target",
+            tie_word_embeddings=target_cfg.tie_word_embeddings)
+        try:
+            target_context = ctx.with_checkpoint(target_cfg, target_weights)
+            model = cls(ctx,
+                        lm_head=Linear(target_context,
+                                       target_weights.causal_lm_head_prefix()))
+        except Exception:
+            target_weights.close()
+            raise
+        model._target_weights = target_weights
+        return model
+
+    def __init__(self, ctx, lm_head=None) -> None:
         super().__init__(ctx)
+        self._target_weights = None
         self.fc = Linear(ctx, "fc")
         self.layers = [
             Eagle3DecoderLayer(ctx, f"layers.{index}")
             for index in range(ctx.cfg.num_hidden_layers)
         ]
         self.norm = RMSNorm(ctx, "norm", ctx.cfg.rms_norm_eps)
-        self.lm_head = Linear(ctx, "lm_head")
+        self.lm_head = lm_head or Linear(ctx, "lm_head")
 
     def input_tensors(self) -> Dict[str, object]:
         cfg = self.cfg
-        target_hidden = int(
-            cfg.raw_component.get("eagle3_target_hidden_size",
-                                  cfg.hidden_size))
+        target_hidden = int(cfg.target_hidden_size or cfg.raw_component.get(
+            "eagle3_target_hidden_size", cfg.hidden_size))
+        target_layers = len(cfg.eagle3_target_layer_ids)
+        if target_layers <= 0:
+            raise ValueError("EAGLE3 draft requires target-layer metadata")
         return {
             "inputs_embeds":
             self.add_input("inputs_embeds", trt.float16,
@@ -89,7 +128,7 @@ class Eagle3DraftModel(NetworkModule):
             self.add_input("kv_page_table", trt.int32, (-1, 2, -1)),
             "base_hidden":
             self.add_input("hidden_states_input", trt.float16,
-                           (-1, -1, target_hidden * 3)),
+                           (-1, -1, target_hidden * target_layers)),
             "draft_hidden":
             self.add_input("hidden_states_from_draft", trt.float16,
                            (-1, -1, cfg.hidden_size)),
@@ -120,3 +159,8 @@ class Eagle3DraftModel(NetworkModule):
         for index, tensor in enumerate(present):
             outputs[f"present_key_values_{index}"] = tensor
         return outputs
+
+    def close(self) -> None:
+        if self._target_weights is not None:
+            self._target_weights.close()
+            self._target_weights = None

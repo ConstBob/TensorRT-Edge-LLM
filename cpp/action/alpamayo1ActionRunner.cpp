@@ -134,8 +134,8 @@ bool Alpamayo1ActionRunner::preprocess(LLMGenerationRequest const& request,
     return true;
 }
 
-Alpamayo1ActionRunner::Alpamayo1ActionRunner(std::string const& engineDir, cudaStream_t stream,
-    KVCacheManager::Config const& kvCacheConfig, bool basePageTableIsIdentity)
+Alpamayo1ActionRunner::Alpamayo1ActionRunner(std::string const& engineDir, std::string const& checkpointDir,
+    cudaStream_t stream, KVCacheManager::Config const& kvCacheConfig, bool basePageTableIsIdentity)
     : mStream(stream)
 {
     // Identity-only opt-out: getSeparateKVCacheForDecoderLayer() reads physical slot
@@ -168,6 +168,13 @@ Alpamayo1ActionRunner::Alpamayo1ActionRunner(std::string const& engineDir, cudaS
 
     bool const configParsed = parseModelConfig(engineDir + "/config.json");
     ELLM_CHECK(configParsed, "Failed to parse model config");
+
+    mExternalWeights = std::make_unique<ExternalWeightManager>();
+    mExternalWeights->load(engineDir, engineDir + "/config.json", stream, checkpointDir);
+    if (mExternalWeights->size() > 0)
+    {
+        mExternalWeights->bindToContext(*mEngine, *mContext, "action");
+    }
 
     try
     {

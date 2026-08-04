@@ -20,6 +20,7 @@ expert, per-head Q/K normalization, and DeepStack visual inputs.
 """
 
 import logging
+from functools import partial
 from typing import Dict, List, Tuple
 
 import tensorrt as trt
@@ -29,7 +30,8 @@ from ...core.config import DeviceConfig
 from ...ops import (BuildContext, GatedExperts, GatedMLP, Linear, Module,
                     NetworkModule, RMSNorm, Tensor, TopKRouter)
 from ...ops import functional as F
-from ...ops import prepare_gated_int4_weights, prepare_gated_nvfp4_weights
+from ...ops import (pack_qkv, prepare_gated_int4_weights,
+                    prepare_gated_nvfp4_weights)
 from . import weights as weight_conversion
 
 LOGGER = logging.getLogger("builder.qwen3_omni_moe.thinker")
@@ -87,7 +89,7 @@ class Qwen3OmniMoeThinkerTextAttention(Module):
                           rank=4).reshape(
                               (0, 0, cfg.num_key_value_heads * cfg.head_dim))
 
-        qkv = F.concatenate((query, key, value), 2)
+        qkv = pack_qkv(query, key, value, self.v_proj)
         attention, present_key_value = F.attention(
             qkv,
             past_key_value,
@@ -118,12 +120,50 @@ class Qwen3OmniMoeThinkerTextSparseMoeBlock(Module):
     def forward(self, hidden_states: Tensor) -> Tensor:
         cfg = self.cfg
         router_logits = self.gate(hidden_states)
+        if cfg.quant_type == quantization.QUANT_FP16:
+            moe_weights = self.weights.parameter_value(
+                "fp16",
+                self.experts.prefix,
+                lambda: weight_conversion.fp16_expert_specs(
+                    self.weights, self.experts.prefix, cfg.num_experts),
+                lambda: weight_conversion.prepare_fp16_experts(
+                    self.weights,
+                    self.experts.prefix,
+                    cfg.num_experts,
+                    cfg.hidden_size,
+                    cfg.moe_intermediate_size,
+                ),
+            )
+            bindings = weight_conversion.fp16_expert_bindings(
+                self.weights, self.experts.prefix, cfg.num_experts)
+            return F.fp16_moe(
+                router_logits,
+                hidden_states,
+                moe_weights,
+                cfg.num_experts,
+                cfg.num_experts_per_tok,
+                cfg.hidden_size,
+                cfg.moe_intermediate_size,
+                weight_prefix=self.experts.prefix,
+                weight_bindings=bindings,
+                norm_topk_prob=int(cfg.norm_topk_prob),
+            )
         if cfg.quant_type == quantization.QUANT_NVFP4:
+            moe_weights = self.weights.parameter_value(
+                "nvfp4_moe",
+                self.experts.prefix,
+                lambda: weight_conversion.nvfp4_expert_specs(
+                    self.weights, self.experts.prefix, cfg.num_experts),
+                lambda: prepare_gated_nvfp4_weights(
+                    self.ctx, self.experts, weight_conversion.
+                    repack_nvfp4_experts),
+            )
+            bindings = weight_conversion.nvfp4_expert_bindings(
+                self.weights, self.experts.prefix, cfg.num_experts,
+                self.ctx.options.sm12x)
             return F.nvfp4_moe(router_logits,
                                hidden_states,
-                               prepare_gated_nvfp4_weights(
-                                   self.ctx, self.experts,
-                                   weight_conversion.repack_nvfp4_experts),
+                               moe_weights,
                                cfg.num_experts,
                                cfg.num_experts_per_tok,
                                cfg.hidden_size,
@@ -135,20 +175,41 @@ class Qwen3OmniMoeThinkerTextSparseMoeBlock(Module):
                                cfg.routed_scaling_factor,
                                F.MoeRouting.SOFTMAX_TOPK,
                                self.ctx.options.sm12x,
-                               weight_prefix=self.experts.prefix)
+                               weight_prefix=self.experts.prefix,
+                               weight_bindings=bindings)
         if cfg.quant_type == quantization.QUANT_INT4_GPTQ:
-            return F.int4_moe(router_logits,
-                              hidden_states,
-                              prepare_gated_int4_weights(
-                                  self.ctx, self.prefix),
-                              cfg.num_experts,
-                              cfg.num_experts_per_tok,
-                              cfg.hidden_size,
-                              cfg.moe_intermediate_size,
-                              cfg.group_size,
-                              weight_prefix=self.experts.prefix)
-        raise ValueError("Qwen3-Omni-MoE experts require NVFP4 or INT4 GPTQ; "
-                         f"got {cfg.quant_type!r}")
+
+            def materialize_int4():
+                load_projection = partial(
+                    weight_conversion.load_gptq_expert_projection,
+                    self.weights, self.experts.prefix)
+                return prepare_gated_int4_weights(self.ctx, load_projection)
+
+            moe_weights = self.weights.parameter_value(
+                "int4_moe",
+                self.experts.prefix,
+                lambda: weight_conversion.int4_expert_specs(
+                    self.weights, self.experts.prefix, cfg.num_experts),
+                materialize_int4,
+            )
+            bindings = weight_conversion.int4_expert_bindings(
+                self.weights, self.experts.prefix, cfg.num_experts,
+                cfg.group_size, cfg.quant.gptq_zero_point_offset)
+            return F.int4_moe(
+                router_logits,
+                hidden_states,
+                moe_weights,
+                cfg.num_experts,
+                cfg.num_experts_per_tok,
+                cfg.hidden_size,
+                cfg.moe_intermediate_size,
+                cfg.group_size,
+                weight_prefix=self.experts.prefix,
+                weight_bindings=bindings,
+                zero_point_offset=cfg.quant.gptq_zero_point_offset)
+        raise ValueError(
+            "Qwen3-Omni-MoE experts require FP16, NVFP4, or INT4 GPTQ; "
+            f"got {cfg.quant_type!r}")
 
 
 class Qwen3OmniMoeThinkerTextDecoderLayer(Module):

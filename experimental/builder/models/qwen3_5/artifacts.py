@@ -16,7 +16,7 @@
 
 from ...core.artifacts.runtime_artifacts import (write_component_artifacts,
                                                  write_runtime_artifacts)
-from . import weights
+from . import tokenizer, weights
 
 
 def write_artifacts(bundle, config, args, engine_dir: str) -> None:
@@ -24,6 +24,7 @@ def write_artifacts(bundle, config, args, engine_dir: str) -> None:
         write_runtime_artifacts(config,
                                 args,
                                 engine_dir,
-                                weight_conversion=weights)
+                                weight_conversion=weights,
+                                tokenizer_module=tokenizer)
         return
     write_component_artifacts(bundle, args, engine_dir)

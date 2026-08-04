@@ -82,6 +82,8 @@ bool InternViTRunner::validateAndFillConfig(std::string const& engineDir)
     }
 
     mConfig.imageTokenId = jsonConfig["image_token_id"].get<int32_t>();
+    mConfig.imgStartTokenId = jsonConfig.value("img_start_token_id", mConfig.imgStartTokenId);
+    mConfig.imgEndTokenId = jsonConfig.value("img_end_token_id", mConfig.imgEndTokenId);
     auto textConfig = jsonConfig["text_config"];
     mConfig.vocabSize = textConfig["vocab_size"].get<int32_t>();
 

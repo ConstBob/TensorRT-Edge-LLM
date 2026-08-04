@@ -23,6 +23,7 @@ import ctypes
 import functools
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -31,8 +32,10 @@ import tensorrt as trt
 
 from ..ops.backend import Net
 from ..ops.functional.attention import KV_PAGE_SIZE
-from . import contracts, quantization
-from .config import BundleConfig, DeviceConfig
+from . import contracts, quantization, weight_policy
+from .bundle import LLM_COMPONENTS, BundleConfig
+from .config import DeviceConfig
+from .weight_policy import WeightPolicy
 from .weights import Weights
 
 logger = logging.getLogger(__name__)
@@ -75,6 +78,7 @@ class BuildArgs:
     max_lora_rank: int = 0
     max_verify_tree_size: int = 60
     max_draft_tree_size: int = 60
+    tree_base: bool = False
     min_image_tokens: int = 4
     max_image_tokens: int = 1024
     max_image_tokens_per_image: int = 512
@@ -93,6 +97,39 @@ class BuildArgs:
     plugin_path: Optional[str] = None
     profiling_detailed: bool = False
     dense_quant: str = "auto"  # auto | nvfp4-qdq | fp16
+    int4_gemm_plugin_version: int = 2
+    externalize_weights: Tuple[str, ...] = ()
+
+    @functools.cached_property
+    def weight_policy(self) -> WeightPolicy:
+        """Externalization kinds this build can actually reproduce.
+
+        Kinds are on by default, so an incompatible build setting narrows the
+        policy and logs it. Explicitly requested kinds raise instead.
+        """
+        strict = bool(self.externalize_weights)
+        requested = WeightPolicy.from_request(self.externalize_weights)
+        policy = requested
+        spec = contracts.component_spec(self.resolved_component)
+        unsupported = tuple(kind for kind in policy.kinds
+                            if kind not in spec.external_weight_kinds)
+        # Component capabilities are model workflow properties. Ignore an
+        # unsupported kind here so one command can still build every component.
+        policy = policy.without(unsupported)
+        if self.tp_size > 1:
+            # The runtime reads whole checkpoint tensors, not rank shards.
+            policy = policy.without(weight_policy.EXTERNAL_WEIGHT_KINDS,
+                                    strict=strict)
+        if self.fp8_embedding:
+            policy = policy.without(
+                (weight_policy.EXTERNAL_WEIGHT_EMBEDDING, ), strict=strict)
+        vocab_dir = (self.draft_reduced_vocab_dir if self.resolved_spec_role
+                     == contracts.SpecRole.DRAFT else self.reduced_vocab_dir)
+        if vocab_dir:
+            # A reduced vocabulary rewrites the head; the checkpoint has the
+            # full one. Other FP16 projections are unaffected.
+            policy = policy.baking_lm_head(strict=strict)
+        return policy
 
     @functools.cached_property
     def sm12x(self) -> bool:
@@ -132,6 +169,8 @@ class BuildArgs:
         self.profile_limits.validate()
         if self.tp_size <= 0 or not 0 <= self.tp_rank < self.tp_size:
             raise ValueError("tp_rank must be in [0, tp_size)")
+        if self.int4_gemm_plugin_version not in (1, 2):
+            raise ValueError("int4_gemm_plugin_version must be 1 or 2")
         if self.resolved_spec_role != contracts.SpecRole.NONE:
             if self.resolved_component != contracts.Component.LLM:
                 raise ValueError("speculative roles require --component llm")
@@ -139,22 +178,26 @@ class BuildArgs:
                 raise ValueError("speculative roles require --spec-type")
         elif self.spec_type != "none":
             raise ValueError("--spec-type requires --spec-role base or draft")
+        if self.tree_base and not (self.resolved_spec_role
+                                   == contracts.SpecRole.BASE
+                                   and self.spec_type in ("mtp", "dflash")):
+            raise ValueError(
+                "--tree-base is only valid for an MTP or DFlash base engine")
         if self.draft_reduced_vocab_dir and not (
                 self.resolved_spec_role == contracts.SpecRole.DRAFT
                 and self.spec_type == "dflash"):
             raise ValueError(
                 "--draft-reduced-vocab-dir is only valid for a DFlash draft")
         paired_base = (self.resolved_spec_role == contracts.SpecRole.BASE
-                       and self.spec_type == "dflash")
+                       and self.spec_type in ("eagle3", "dflash", "dspark"))
         if paired_base and not self.draft_model_dir:
             raise ValueError(
-                "DFlash base requires --draft-model-dir for target-layer pairing"
+                f"{self.spec_type} base requires --draft-model-dir for pairing"
             )
         if self.draft_model_dir and not paired_base:
             raise ValueError(
                 "--draft-model-dir is only valid for a paired base engine")
-        paired_draft = (self.resolved_spec_role == contracts.SpecRole.DRAFT
-                        and self.spec_type in ("dflash", "gemma4_mtp"))
+        paired_draft = self.resolved_spec_role == contracts.SpecRole.DRAFT
         if paired_draft and not self.target_model_dir:
             raise ValueError(f"{self.spec_type} draft requires "
                              "--target-model-dir")
@@ -163,7 +206,7 @@ class BuildArgs:
                 "--target-model-dir is only valid for a paired draft engine")
         if (self.reduced_vocab_dir
                 and self.resolved_spec_role == contracts.SpecRole.BASE
-                and self.spec_type in ("dflash", "gemma4_mtp")):
+                and self.spec_type in ("dflash", "dspark", "gemma4_mtp")):
             raise ValueError(
                 f"{self.spec_type} base engines require the full vocabulary")
         if self.fp8_embedding and self.resolved_spec_role == contracts.SpecRole.DRAFT:
@@ -175,7 +218,11 @@ class BuildResult:
     """Serialized engine path and its static runtime weight inputs."""
 
     engine_path: str
-    external_weight_files: tuple
+    checkpoint_weight_bindings: tuple
+    # Set when the bindings resolve against a checkpoint other than the one
+    # passed to the runtime, e.g. a component stored in its own subdirectory.
+    checkpoint_dir: str
+    checkpoint_identity: dict
 
 
 class _TrtLogger(trt.ILogger):
@@ -209,6 +256,7 @@ def build_engine(args: BuildArgs,
                  bundle: Optional[BundleConfig] = None,
                  plugin_handle: Optional[ctypes.CDLL] = None) -> BuildResult:
     """Build an engine and return its runtime artifacts."""
+    build_start = time.perf_counter()
     args.validate()
     plugin_handle = plugin_handle or load_plugin_library(args.plugin_path)
 
@@ -219,9 +267,7 @@ def build_engine(args: BuildArgs,
         raise ValueError(
             f"{bundle.root_model_type!r} has no {args.component!r} component; "
             f"available components: {available}")
-    if args.resolved_component in (contracts.Component.LLM,
-                                   contracts.Component.TALKER,
-                                   contracts.Component.CODE_PREDICTOR):
+    if args.resolved_component in LLM_COMPONENTS:
         if cfg is None:
             cfg = load_device_config(args)
         logger.info("model_type=%s layers=%d hidden=%d experts=%d quant=%s",
@@ -267,6 +313,22 @@ def build_engine(args: BuildArgs,
         if np.unique(vocab_map).size != vocab_map.size:
             raise ValueError("vocab_map contains duplicate token IDs")
         cfg.reduced_vocab_size = int(vocab_map.size)
+    policy = args.weight_policy
+    configuration = model_registry.configuration_module_for(
+        bundle.root_model_type)
+    component_weight_policy = getattr(configuration, "component_weight_policy",
+                                      None)
+    if component_weight_policy is not None:
+        policy = component_weight_policy(args, policy)
+    requested_policy = WeightPolicy.from_request(args.externalize_weights)
+    kept = tuple(kind for kind in requested_policy.kinds
+                 if kind not in policy.kinds)
+    logger.info("Externalizing %s%s", ", ".join(policy.kinds) or "nothing",
+                ("; keeping " + ", ".join(kept) +
+                 " in the engine") if kept else "")
+    if policy.bake_lm_head and requested_policy.externalizes_fp16("lm_head"):
+        logger.info("Keeping the LM head in the engine; a reduced vocabulary "
+                    "rewrites it")
     weights = Weights(args.model_dir,
                       group_size=component_quant.group_size,
                       quant=component_quant,
@@ -274,21 +336,39 @@ def build_engine(args: BuildArgs,
                       spec_type=args.spec_type,
                       spec_role=args.spec_role,
                       vocab_map=vocab_map,
-                      conversion=weight_conversion)
-    net = Net(builder, network)
+                      conversion=weight_conversion,
+                      int4_gemm_plugin_version=args.int4_gemm_plugin_version,
+                      tie_word_embeddings=bool(cfg
+                                               and cfg.tie_word_embeddings),
+                      policy=policy)
+    net = Net(builder,
+              network,
+              policy=policy,
+              int4_gemm_plugin_version=args.int4_gemm_plugin_version)
     try:
         build_model(net, bundle, cfg, weights, args)
-        from .artifacts import write_external_weight_files
-        external_weight_files = write_external_weight_files(
-            args, net.take_external_weights())
+        from .artifacts import checkpoint_identity, checkpoint_weight_bindings
+        bindings = checkpoint_weight_bindings(args, cfg,
+                                              net.take_weight_bindings(),
+                                              weights)
+        weights_dir = os.path.abspath(weights.source_dir)
+        identity_start = time.perf_counter()
+        identity = checkpoint_identity(bindings, weights.source_dir,
+                                       args.target_model_dir)
+        identity_seconds = time.perf_counter() - identity_start
     finally:
         weights.close()
+    runtime_checkpoint_dir = args.target_model_dir or args.model_dir
+    binding_dir = ("" if weights_dir == os.path.abspath(runtime_checkpoint_dir)
+                   else weights_dir)
 
-    _setup_profiles(builder, config, network, cfg, args)
+    _setup_profiles(builder, config, network, cfg, args, bundle)
 
     logger.info(
         "Building serialized engine (this may take several minutes)...")
+    trt_build_start = time.perf_counter()
     serialized = builder.build_serialized_network(network, config)
+    trt_build_seconds = time.perf_counter() - trt_build_start
     if serialized is None:
         raise RuntimeError("build_serialized_network returned None")
 
@@ -299,7 +379,18 @@ def build_engine(args: BuildArgs,
         f.write(bytes(serialized))  # IHostMemory -> buffer
     logger.info("Engine written to %s (%d bytes)", engine_path,
                 int(serialized.nbytes))
-    return BuildResult(engine_path, tuple(external_weight_files))
+    total_seconds = time.perf_counter() - build_start
+    logger.info(
+        "Build completed in %.3f s (checkpoint identity %.3f s, TensorRT "
+        "%.3f s, frontend and serialization %.3f s)", total_seconds,
+        identity_seconds, trt_build_seconds,
+        total_seconds - identity_seconds - trt_build_seconds)
+    return BuildResult(
+        engine_path=engine_path,
+        checkpoint_weight_bindings=tuple(bindings),
+        checkpoint_dir=binding_dir,
+        checkpoint_identity=identity,
+    )
 
 
 def load_device_config(args: BuildArgs) -> DeviceConfig:
@@ -319,7 +410,8 @@ def load_device_config(args: BuildArgs) -> DeviceConfig:
         args.resolved_spec_role,
         args.spec_type,
         paired_target=paired_target,
-        paired_draft_dir=args.draft_model_dir)
+        paired_draft_dir=args.draft_model_dir,
+        build_args=args)
 
 
 # ---------------------------------------------------------------------------
@@ -328,15 +420,105 @@ def load_device_config(args: BuildArgs) -> DeviceConfig:
 
 
 def _setup_profiles(builder, config, network, cfg: Optional[DeviceConfig],
-                    args: BuildArgs) -> None:
-    if args.resolved_component in (contracts.Component.LLM,
-                                   contracts.Component.TALKER,
-                                   contracts.Component.CODE_PREDICTOR):
+                    args: BuildArgs, bundle: BundleConfig) -> None:
+    from ..models import registry as model_registry
+
+    configuration = model_registry.configuration_module_for(
+        bundle.root_model_type)
+    model_profiles = getattr(configuration, "setup_profiles", None)
+    if (model_profiles is not None
+            and model_profiles(builder, config, network, args, bundle)):
+        return
+    if args.resolved_component == contracts.Component.DLLM:
+        if cfg is None:
+            raise ValueError("DLLM components require DeviceConfig")
+        _setup_diffusion_profiles(builder, config, network, cfg, args)
+        return
+    if args.resolved_component in LLM_COMPONENTS:
         if cfg is None:
             raise ValueError("LLM components require DeviceConfig")
         _setup_llm_profiles(builder, config, network, cfg, args)
         return
     _setup_component_profile(builder, config, network, args)
+
+
+def _setup_diffusion_profiles(builder, config, network, cfg: DeviceConfig,
+                              args: BuildArgs) -> None:
+    """Create prefill and denoise/commit profiles for one DLLM backbone."""
+    prefill = builder.create_optimization_profile()
+    diffusion = builder.create_optimization_profile()
+
+    max_batch = args.max_batch_size
+    max_input = args.max_input_len
+    max_kv = args.max_kv_cache_capacity
+    canvas = int(cfg.raw_root.get("canvas_length", 256))
+    pages_per_sequence = (max_kv + KV_PAGE_SIZE - 1) // KV_PAGE_SIZE
+    pool_pages = max_batch * pages_per_sequence
+    inputs = {
+        network.get_input(index).name: network.get_input(index)
+        for index in range(network.num_inputs)
+    }
+
+    def fixed_dim(name, axis, fallback):
+        tensor = inputs.get(name)
+        if tensor is None:
+            return fallback
+        value = int(tensor.shape[axis])
+        return fallback if value < 0 else value
+
+    def set_shapes(name, prefill_shapes, diffusion_shapes):
+        if name not in inputs:
+            return
+        prefill.set_shape(name, *prefill_shapes)
+        diffusion.set_shape(name, *diffusion_shapes)
+
+    hidden = fixed_dim("inputs_embeds", -1, cfg.hidden_size)
+    prefill_sequence = ((1, 1, hidden), (max_batch, max(1, max_input // 2),
+                                         hidden), (max_batch, max_input,
+                                                   hidden))
+    diffusion_sequence = ((1, 1, hidden), (max_batch, canvas, hidden),
+                          (max_batch, canvas, hidden))
+    for name in ("inputs_embeds", "prev_self_conditioning_embeds"):
+        set_shapes(name, prefill_sequence, diffusion_sequence)
+
+    prefill_tokens = ((1, 1), (max_batch, max(1, max_input // 2)), (max_batch,
+                                                                    max_input))
+    diffusion_tokens = ((1, 1), (max_batch, canvas), (max_batch, canvas))
+    set_shapes("canvas_ids", prefill_tokens, diffusion_tokens)
+
+    batch_vector = ((1, ), (max_batch, ), (max_batch, ))
+    for name in ("phase_is_encoder", "context_lengths", "kvcache_start_index"):
+        set_shapes(name, batch_vector, batch_vector)
+
+    set_shapes("select_token_indices",
+               ((1, 1), (max_batch, 1), (max_batch, 1)),
+               ((1, 1), (max_batch, canvas), (max_batch, canvas)))
+    set_shapes("context_mask_selector", ((0, ), (0, ), (0, )),
+               ((0, ), (max_batch, ), (max_batch, )))
+
+    for rope_name in ("rope_rotary_cos_sin", "rope_rotary_cos_sin_sliding",
+                      "rope_rotary_cos_sin_full"):
+        rotary_dim = fixed_dim(rope_name, -1, cfg.rotary_dim)
+        rope_shapes = ((1, max_kv, rotary_dim),
+                       (max_batch, max_kv, rotary_dim), (max_batch, max_kv,
+                                                         rotary_dim))
+        set_shapes(rope_name, rope_shapes, rope_shapes)
+
+    for index in range(cfg.num_hidden_layers):
+        name = f"past_key_values_{index}"
+        heads = fixed_dim(name, 3, cfg.layer_num_kv_heads(index))
+        head_dim = fixed_dim(name, 4, cfg.layer_head_dim(index))
+        pool_shape = (2, pool_pages, KV_PAGE_SIZE, heads, head_dim)
+        pool_shapes = (pool_shape, pool_shape, pool_shape)
+        set_shapes(name, pool_shapes, pool_shapes)
+
+    page_shapes = ((1, 2, pages_per_sequence),
+                   (max_batch, 2, pages_per_sequence), (max_batch, 2,
+                                                        pages_per_sequence))
+    set_shapes("kv_page_table", page_shapes, page_shapes)
+
+    config.add_optimization_profile(prefill)
+    config.add_optimization_profile(diffusion)
 
 
 def _setup_llm_profiles(builder, config, network, cfg: DeviceConfig,
@@ -385,7 +567,7 @@ def _setup_llm_profiles(builder, config, network, cfg: DeviceConfig,
     generation_sequence_max = args.profile_limits.generation_sequence_max(
         args.resolved_spec_role)
     if (args.resolved_spec_role == contracts.SpecRole.DRAFT
-            and args.spec_type == "dflash"):
+            and args.spec_type in ("dflash", "dspark")):
         draft = args.max_draft_tree_size
         set_profile_shapes("inputs_embeds", (1, 1, embed_width),
                            (maxB, draft, embed_width),
@@ -477,7 +659,7 @@ def _setup_llm_profiles(builder, config, network, cfg: DeviceConfig,
                            (maxB, max(1, maxIn // 2), H), (maxB, maxIn, H),
                            generation_min=(1, 1, H),
                            generation_opt=(maxB, 1, H),
-                           generation_max=(maxB, 1, H))
+                           generation_max=(maxB, generation_sequence_max, H))
 
     verify = args.max_verify_tree_size
     tree_size = (args.max_draft_tree_size if args.resolved_spec_role
@@ -485,7 +667,7 @@ def _setup_llm_profiles(builder, config, network, cfg: DeviceConfig,
     set_profile_shapes("attention_pos_id", (1, 1), (maxB, 1),
                        (maxB, tree_size))
     if (args.resolved_spec_role == contracts.SpecRole.DRAFT
-            and args.spec_type == "dflash"):
+            and args.spec_type in ("dflash", "dspark")):
         draft = args.max_draft_tree_size
         set_profile_shapes(
             "attention_mask", (1, 1, 1),
@@ -517,14 +699,18 @@ def _setup_llm_profiles(builder, config, network, cfg: DeviceConfig,
     set_profile_shapes("dflash_delta_lengths", (1, ), (maxB, ), (maxB, ))
     dflash_width = fixed_dim("dflash_target_hidden_concat", -1, H)
     if (args.resolved_spec_role == contracts.SpecRole.DRAFT
-            and args.spec_type == "dflash"):
-        draft = args.max_draft_tree_size
+            and args.spec_type in ("dflash", "dspark")):
+        generation_hidden = args.max_draft_tree_size
+        if args.spec_type == "dspark":
+            generation_hidden = args.max_verify_tree_size
         set_profile_shapes("dflash_target_hidden_concat", (1, 1, dflash_width),
                            (maxB, max(1, maxIn // 2), dflash_width),
                            (maxB, maxIn, dflash_width),
                            generation_min=(1, 1, dflash_width),
-                           generation_opt=(maxB, draft, dflash_width),
-                           generation_max=(maxB, draft, dflash_width))
+                           generation_opt=(maxB, generation_hidden,
+                                           dflash_width),
+                           generation_max=(maxB, generation_hidden,
+                                           dflash_width))
     else:
         set_profile_shapes("dflash_target_hidden_concat", (1, 1, dflash_width),
                            (maxB, 1, dflash_width),
@@ -588,6 +774,7 @@ def _setup_component_profile(builder, config, network,
     def dynamic_extent(name: str, axis: int) -> tuple:
         if component == contracts.Component.VISUAL:
             gemma_visual = "pooling_weights" in input_shapes
+            gemma_unified = "pixel_position_ids" in input_shapes
             visual_input = input_shapes.get("input", ())
             if gemma_visual:
                 patches_per_token = 9
@@ -612,6 +799,11 @@ def _setup_component_profile(builder, config, network,
                 return (args.min_image_tokens * patches_per_token,
                         soft_opt * patches_per_token,
                         args.max_image_tokens * patches_per_token)
+            if gemma_unified:
+                return (args.min_image_tokens,
+                        max(args.min_image_tokens,
+                            (args.min_image_tokens + args.max_image_tokens) //
+                            2), args.max_image_tokens)
             if len(visual_input) == 4:
                 minimum = max(1, args.min_image_tokens // 256)
                 maximum = max(1, args.max_image_tokens // 256)
@@ -664,6 +856,10 @@ def _setup_component_profile(builder, config, network,
                 maximum = (args.max_time_steps + 3) // 4
                 return minimum, (minimum + maximum) // 2, maximum
             if name == "input_features" and axis == 1:
+                if input_shapes[name][-1] == 640:
+                    return (args.min_time_steps,
+                            (args.min_time_steps + args.max_time_steps) // 2,
+                            args.max_time_steps)
                 alignment = 4 if "valid" in input_shapes else 8
 
                 def align(value):

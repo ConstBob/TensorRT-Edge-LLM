@@ -85,7 +85,9 @@ enum LLMInferenceOptionId : int
     ENABLE_CONTEXT_REUSE = 927,
     CONTEXT_CACHE_MAX_RECORDS = 928,
     CONTEXT_CACHE_RECURRENT_SNAPSHOT_POOL_BYTES = 929,
-    CONTEXT_CACHE_PARTIAL_KV_SNAPSHOT_POOL_BYTES = 930
+    CONTEXT_CACHE_PARTIAL_KV_SNAPSHOT_POOL_BYTES = 930,
+    CHECKPOINT_DIR = 931,
+    DRAFT_CHECKPOINT_DIR = 932
 };
 
 // Struct to hold speculative decoding arguments (used by both EAGLE and MTP)
@@ -119,6 +121,8 @@ struct LLMInferenceArgs
     bool help{false};
     std::string engineDir;
     std::string multimodalEngineDir{""};
+    std::string checkpointDir{""};
+    std::string draftCheckpointDir{""};
     std::string inputFile;
     std::string outputFile{""};
     std::string profileOutputFile{""};
@@ -174,6 +178,9 @@ void printUsage(char const* programName)
     std::cerr << "  --inputFile               Path to input JSON file with requests" << std::endl;
     std::cerr << "  --engineDir               Path to engine directory" << std::endl;
     std::cerr << "  --multimodalEngineDir     Path to multimodal engine directory (optional)" << std::endl;
+    std::cerr << "  --checkpointDir           HF/ModelOpt checkpoint dir (required for runtime weight loading)"
+              << std::endl;
+    std::cerr << "  --draftCheckpointDir      Separate checkpoint for paired speculative drafts" << std::endl;
     std::cerr << "  --outputFile              Path to output JSON file (optional)" << std::endl;
     std::cerr << "  --dumpProfile             Dump profiling summary to console" << std::endl;
     std::cerr << "  --profileOutputFile       Path to profile JSON output file (optional)" << std::endl;
@@ -250,6 +257,8 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"inputFile", required_argument, 0, LLMInferenceOptionId::INPUT_FILE},
         {"engineDir", required_argument, 0, LLMInferenceOptionId::ENGINE_DIR},
         {"multimodalEngineDir", required_argument, 0, LLMInferenceOptionId::MULTIMODAL_ENGINE_DIR},
+        {"checkpointDir", required_argument, 0, LLMInferenceOptionId::CHECKPOINT_DIR},
+        {"draftCheckpointDir", required_argument, 0, LLMInferenceOptionId::DRAFT_CHECKPOINT_DIR},
         {"outputFile", required_argument, 0, LLMInferenceOptionId::OUTPUT_FILE},
         {"debug", no_argument, 0, LLMInferenceOptionId::DEBUG},
         {"dumpProfile", no_argument, 0, LLMInferenceOptionId::DUMP_PROFILE},
@@ -295,6 +304,8 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         case LLMInferenceOptionId::INPUT_FILE: args.inputFile = optarg; break;
         case LLMInferenceOptionId::ENGINE_DIR: args.engineDir = optarg; break;
         case LLMInferenceOptionId::MULTIMODAL_ENGINE_DIR: args.multimodalEngineDir = optarg; break;
+        case LLMInferenceOptionId::CHECKPOINT_DIR: args.checkpointDir = optarg; break;
+        case LLMInferenceOptionId::DRAFT_CHECKPOINT_DIR: args.draftCheckpointDir = optarg; break;
         case LLMInferenceOptionId::OUTPUT_FILE: args.outputFile = optarg; break;
         case LLMInferenceOptionId::DEBUG: args.debug = true; break;
         case LLMInferenceOptionId::DUMP_PROFILE: args.dumpProfile = true; break;
@@ -586,6 +597,11 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         LOG_INFO("DSpark proposal length range: [%d, %d]", args.specDecodeArgs.dsparkMinProposalLen,
             args.specDecodeArgs.dsparkMaxProposalLen);
     }
+    else if (!args.draftCheckpointDir.empty())
+    {
+        LOG_ERROR("--draftCheckpointDir requires --specDecode");
+        return false;
+    }
 
     if (args.contextCacheConfig.enabled)
     {
@@ -749,8 +765,9 @@ int main(int argc, char* argv[])
         draftingConfig.dsparkMaxProposalLen = args.specDecodeArgs.dsparkMaxProposalLen;
         try
         {
-            runtime = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir, args.multimodalEngineDir,
-                loraWeightsMap, draftingConfig, stream, args.contextCacheConfig);
+            runtime
+                = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir, args.multimodalEngineDir, loraWeightsMap,
+                    draftingConfig, stream, args.contextCacheConfig, args.checkpointDir, args.draftCheckpointDir);
         }
         catch (std::exception const& e)
         {
@@ -763,8 +780,8 @@ int main(int argc, char* argv[])
         // Standard vanilla-only mode (no draft model)
         try
         {
-            runtime = std::make_unique<rt::LLMInferenceRuntime>(
-                args.engineDir, args.multimodalEngineDir, loraWeightsMap, stream, args.contextCacheConfig);
+            runtime = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir, args.multimodalEngineDir,
+                loraWeightsMap, stream, args.contextCacheConfig, args.checkpointDir);
         }
         catch (std::exception const& e)
         {
@@ -787,8 +804,8 @@ int main(int argc, char* argv[])
         {
             std::filesystem::path const codePredictorDir
                 = std::filesystem::path(args.talkerEngineDir).parent_path() / "code_predictor";
-            ttsRuntime = std::make_unique<rt::Qwen3OmniTTSRuntime>(
-                args.talkerEngineDir, codePredictorDir.string(), args.engineDir, /*cloneEncoderDir=*/"", stream);
+            ttsRuntime = std::make_unique<rt::Qwen3OmniTTSRuntime>(args.talkerEngineDir, codePredictorDir.string(),
+                args.engineDir, /*cloneEncoderDir=*/"", stream, args.checkpointDir);
             LOG_INFO("TTS runtime initialized for audio output");
         }
         catch (std::exception const& e)
@@ -805,7 +822,7 @@ int main(int argc, char* argv[])
         {
             try
             {
-                code2wavRunner = std::make_unique<rt::Code2WavRunner>(code2wavDir.string(), stream);
+                code2wavRunner = std::make_unique<rt::Code2WavRunner>(code2wavDir.string(), stream, args.checkpointDir);
                 LOG_INFO("Code2Wav runner initialized");
             }
             catch (std::exception const& e)

@@ -35,9 +35,14 @@ def supports_operation_attribute(name: str, attribute: str) -> bool:
     return attribute in operation_attributes(name)
 
 
-def parameter(name: str, value, consumer: str) -> Tensor:
-    """Create an externalized parameter input for one operation."""
-    return Tensor(current_net().weight_input(name, value, consumer))
+def parameter(name: str, value, consumer: str, *, recipe=None) -> Tensor:
+    """Create an externalized parameter input for one operation.
+
+    Without a recipe the runtime has no way to rebuild the
+    tensor, so a checkpoint-backed build keeps it in the engine as a constant instead
+    of declaring an input nothing can fill.
+    """
+    return Tensor(current_net().parameter(name, value, consumer, recipe))
 
 
 def operation(name: str,

@@ -38,3 +38,21 @@ def prepare_text_config(config: dict, root: dict,
             for index in range(int(config["num_hidden_layers"]))
         ]
     return config
+
+
+def configure_base(config, *, build_args=None, **kwargs) -> None:
+    """Enable the checkpoint's model-owned MTP feedback contract."""
+    config.mtp_base = True
+    config.mtp_tree_base = bool(build_args and build_args.tree_base)
+
+
+def configure_draft(config, **kwargs) -> None:
+    """Select the sparse MTP layers embedded in a Qwen3.5-MoE checkpoint."""
+    if config.mtp_num_hidden_layers is None:
+        raise ValueError(
+            "Qwen3.5-MoE MTP requires mtp_num_hidden_layers in config.json")
+    config.num_hidden_layers = config.mtp_num_hidden_layers
+    config.layer_types = ["attention"] * config.num_hidden_layers
+    config.attention_layer_types = ["full_attention"
+                                    ] * config.num_hidden_layers
+    config.gdn_cfg = None

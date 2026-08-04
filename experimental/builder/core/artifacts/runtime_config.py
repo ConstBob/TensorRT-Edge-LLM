@@ -170,13 +170,21 @@ def build_runtime_config(cfg: DeviceConfig, args) -> Dict[str, Any]:
                                    or cfg.draft_vocab_size or cfg.vocab_size)
         if args.spec_type == "eagle3":
             target_hidden = cfg.target_hidden_size or cfg.hidden_size
-            out["base_model_hidden_size"] = target_hidden * 3
+            target_layers = cfg.eagle3_target_layer_ids
+            if not target_layers:
+                raise ValueError(
+                    "EAGLE3 draft runtime config requires target-layer IDs")
+            out["base_model_hidden_size"] = target_hidden * len(target_layers)
         elif args.spec_type == "mtp":
             out["base_model_hidden_size"] = cfg.hidden_size
         elif args.spec_type == "dflash":
             targets = cfg.dflash_target_layer_ids or [1, 8, 15, 22, 29]
             out["base_model_hidden_size"] = len(targets) * cfg.hidden_size
             out["block_size"] = cfg.dflash_block_size
+        elif args.spec_type == "dspark":
+            out["base_model_hidden_size"] = (len(cfg.dspark_target_layer_ids) *
+                                             cfg.hidden_size)
+            out["block_size"] = cfg.dspark_block_size
         elif args.spec_type == "gemma4_mtp":
             out.update({
                 "model":
@@ -214,10 +222,24 @@ def build_runtime_config(cfg: DeviceConfig, args) -> Dict[str, Any]:
             "block_size": cfg.dflash_block_size,
             "mask_token_id": cfg.dflash_mask_token_id,
         }
+        out["dflash_tree_base"] = cfg.dflash_tree_base
+    if args.spec_type == "mtp":
+        out["mtp_tree_base"] = cfg.mtp_tree_base
+    if args.spec_type == "dspark":
+        out["dspark_config"] = {
+            "target_layer_ids": cfg.dspark_target_layer_ids,
+            "block_size": cfg.dspark_block_size,
+            "mask_token_id": cfg.dspark_mask_token_id,
+            "enable_confidence_head": cfg.dspark_enable_confidence_head,
+            "confidence_head_with_markov":
+            cfg.dspark_confidence_head_with_markov,
+            "markov_head_type": cfg.dspark_markov_head_type,
+            "markov_rank": cfg.dspark_markov_rank,
+            "heads_file": "dspark_heads.safetensors",
+            "heads_info_file": "dspark_heads_info.json",
+        }
     if cfg.eagle_base:
-        out["eagle_hidden_state_layers"] = [
-            2, cfg.num_hidden_layers // 2, cfg.num_hidden_layers - 4
-        ]
+        out["eagle_hidden_state_layers"] = list(cfg.eagle3_target_layer_ids)
 
     max_kv_pool_pages = args.max_batch_size * (
         (args.max_kv_cache_capacity + KV_PAGE_SIZE - 1) // KV_PAGE_SIZE)

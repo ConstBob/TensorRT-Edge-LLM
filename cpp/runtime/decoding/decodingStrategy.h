@@ -35,6 +35,7 @@
 #include "tokenizer/tokenizer.h"
 
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <string>
 #include <vector>
@@ -117,6 +118,8 @@ struct DecodingRuntimeContext
 {
     DeploymentConfig& deployment;
     int32_t maxRuntimeBatchSize;
+    std::filesystem::path const& checkpointDir;
+    std::filesystem::path const& draftCheckpointDir;
 
     BaseEngineResources base;
     PreprocessResources preprocess;

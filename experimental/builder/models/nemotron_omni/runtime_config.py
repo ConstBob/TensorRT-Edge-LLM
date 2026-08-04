@@ -47,7 +47,10 @@ def component_runtime_config(bundle, component: contracts.Component, args):
                 "max_image_tokens_per_image": args.max_image_tokens_per_image,
             },
         }
-        for key in ("llm_config", "img_context_token_id", "img_start_token_id",
+        llm_config = root.get("llm_config", {})
+        if "vocab_size" in llm_config:
+            result["llm_config"] = {"vocab_size": llm_config["vocab_size"]}
+        for key in ("img_context_token_id", "img_start_token_id",
                     "img_end_token_id", "force_image_size", "norm_mean",
                     "norm_std", "patch_size", "downsample_ratio"):
             if key in root:

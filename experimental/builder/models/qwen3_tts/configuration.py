@@ -29,6 +29,35 @@ def prepare_root(model_dir: str, root: dict) -> dict:
     return root
 
 
+def available_components(root: dict, registered):
+    """Expose voice-clone encoders only for Base checkpoints."""
+    available = set(registered)
+    has_speaker_encoder = isinstance(root.get("speaker_encoder_config"), dict)
+    if not has_speaker_encoder:
+        available.discard(contracts.Component.SPEAKER_ENCODER)
+        available.discard(contracts.Component.SPEECH_TOKENIZER_ENCODER)
+    speech = root.get("_speech_tokenizer_config") or {}
+    if (has_speaker_encoder
+            and not isinstance(speech.get("encoder_config"), dict)):
+        available.discard(contracts.Component.SPEECH_TOKENIZER_ENCODER)
+    return frozenset(available)
+
+
+def setup_profiles(builder, builder_config, network, args, bundle) -> bool:
+    """Install the raw-waveform profile consumed by CloneEncoderRunner."""
+    if args.resolved_component != contracts.Component.SPEAKER_ENCODER:
+        return False
+    sample_rate = int(
+        bundle.root.get("speaker_encoder_config",
+                        {}).get("sample_rate", 24000))
+    maximum = sample_rate * 40
+    optimum = sample_rate * 10
+    profile = builder.create_optimization_profile()
+    profile.set_shape("wav", (1, 1024), (1, optimum), (1, maximum))
+    builder_config.add_optimization_profile(profile)
+    return True
+
+
 def component_config(root: dict, component: contracts.Component) -> dict:
     root_type = str(root.get("model_type", ""))
     if component == contracts.Component.TALKER:
@@ -51,4 +80,8 @@ def component_config(root: dict, component: contracts.Component) -> dict:
         speech = root.get("_speech_tokenizer_config") or {}
         return (root.get("code2wav_config") or talker.get("code2wav_config")
                 or speech.get("decoder_config") or root)
+    if component == contracts.Component.SPEAKER_ENCODER:
+        return dict(root["speaker_encoder_config"])
+    if component == contracts.Component.SPEECH_TOKENIZER_ENCODER:
+        return dict(root["_speech_tokenizer_config"]["encoder_config"])
     raise ValueError(f"Qwen3-TTS has no {component.value} configuration")

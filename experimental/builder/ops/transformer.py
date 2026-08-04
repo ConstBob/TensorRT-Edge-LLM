@@ -17,6 +17,7 @@
 import logging
 from typing import List, Optional, Sequence, Tuple, Type
 
+from ..core import quantization
 from . import functional as F
 from .linear import Linear
 from .mlp import GatedMLP
@@ -25,6 +26,28 @@ from .normalization import RMSNorm
 from .tensor import Tensor
 
 LOGGER = logging.getLogger("builder.ops.transformer")
+
+_INT4_PLUGIN_TYPES = frozenset((
+    quantization.QUANT_INT4_AWQ,
+    quantization.QUANT_INT4_AWQ_MODELOPT,
+    quantization.QUANT_INT4_GPTQ,
+))
+
+
+def pack_qkv(query: Tensor, key: Tensor, value: Tensor,
+             value_projection: Linear) -> Tensor:
+    """Pack attention projections while preserving V2 INT4 value storage."""
+    needs_kv_boundary = (
+        value_projection.ctx.backend == "edgellm"
+        and value_projection.ctx.options.int4_gemm_plugin_version == 2
+        and value_projection.quant_type() in _INT4_PLUGIN_TYPES)
+    if needs_kv_boundary:
+        # A direct three-way concat can let the optimizer reuse the value
+        # plugin's transient storage before AttentionPlugin consumes every
+        # prefill row. Materializing K/V first preserves the dependency without
+        # changing the engine I/O contract.
+        return F.concatenate((query, F.concatenate((key, value), 2)), 2)
+    return F.concatenate((query, key, value), 2)
 
 
 class DecoderAttention(Module):
@@ -54,6 +77,15 @@ class DecoderAttention(Module):
         return (self.q_proj(hidden_states), self.k_proj(hidden_states),
                 self.v_proj(hidden_states))
 
+    def packed_qkv(self, hidden_states: Tensor) -> Tensor:
+        """Return the packed projection consumed by decoder attention."""
+        query, key, value = self.project_qkv(hidden_states)
+        return pack_qkv(query, key, value, self.v_proj)
+
+    def attention_kwargs(self) -> dict:
+        """Return optional parameters owned by this attention family."""
+        return {}
+
     def forward(
         self,
         hidden_states: Tensor,
@@ -66,9 +98,7 @@ class DecoderAttention(Module):
         attention_pos_id: Tensor = None,
     ) -> Tuple[Tensor, Tensor]:
         cfg = self.cfg
-        query, key, value = self.project_qkv(hidden_states)
-
-        qkv = F.concatenate((query, key, value), 2)
+        qkv = self.packed_qkv(hidden_states)
         output, present_key_value = F.attention(
             qkv,
             past_key_value,
@@ -84,6 +114,7 @@ class DecoderAttention(Module):
             qkv_scales=self.weights.qkv_scales(self.prefix),
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
+            **self.attention_kwargs(),
         )
         return self.o_proj(output), present_key_value
 
@@ -100,19 +131,24 @@ class QKNormDecoderAttention(DecoderAttention):
         self.q_norm = RMSNorm(ctx, self.key("q_norm"), ctx.cfg.rms_norm_eps)
         self.k_norm = RMSNorm(ctx, self.key("k_norm"), ctx.cfg.rms_norm_eps)
 
-    def project_qkv(self,
-                    hidden_states: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
-        query, key, value = super().project_qkv(hidden_states)
-        cfg = self.cfg
-        query = self.q_norm(query.reshape(
-            (0, 0, cfg.num_attention_heads, cfg.head_dim)),
-                            rank=4).reshape(
-                                (0, 0, cfg.num_attention_heads * cfg.head_dim))
-        key = self.k_norm(key.reshape(
-            (0, 0, cfg.num_key_value_heads, cfg.head_dim)),
-                          rank=4).reshape(
-                              (0, 0, cfg.num_key_value_heads * cfg.head_dim))
-        return query, key, value
+    def attention_kwargs(self) -> dict:
+        """Fuse the provider's per-head Q/K normalization into attention."""
+        q_norm = self.weights.fp16_parameter(self.q_norm.key("weight"))
+        k_norm = self.weights.fp16_parameter(self.k_norm.key("weight"))
+        return {
+            "q_norm_gamma":
+            F.parameter(q_norm.name,
+                        q_norm.value,
+                        "fp16",
+                        recipe=q_norm.recipe),
+            "k_norm_gamma":
+            F.parameter(k_norm.name,
+                        k_norm.value,
+                        "fp16",
+                        recipe=k_norm.recipe),
+            "rms_norm_eps":
+            self.cfg.rms_norm_eps,
+        }
 
 
 class GatedDecoderAttention(Module):
@@ -154,7 +190,7 @@ class GatedDecoderAttention(Module):
             (0, 0, cfg.num_attention_heads * cfg.head_dim))
         key = self.k_norm(key, 4).reshape(
             (0, 0, cfg.num_key_value_heads * cfg.head_dim))
-        qkv = F.concatenate((query, key, value), 2)
+        qkv = pack_qkv(query, key, value, self.v_proj)
         output, present = F.attention(
             qkv,
             past_key_value,
@@ -207,7 +243,7 @@ class TreeAttention(Module):
             key = self.k_norm(
                 key.reshape((0, 0, cfg.num_key_value_heads, cfg.head_dim)),
                 4).reshape((0, 0, cfg.num_key_value_heads * cfg.head_dim))
-        qkv = F.concatenate((query, key, value), 2)
+        qkv = pack_qkv(query, key, value, self.v_proj)
         output, present = F.attention(
             qkv,
             past,

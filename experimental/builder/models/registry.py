@@ -271,11 +271,62 @@ FAMILIES: Tuple[ModelFamily, ...] = (
         weight_conversion="qwen3_omni.weights",
     ),
     ModelFamily(
+        "qwen3_omni_next",
+        {
+            "qwen3_omni_next":
+            _set(Component.LLM, Component.VISUAL, Component.AUDIO,
+                 Component.TALKER, Component.CODE_PREDICTOR,
+                 Component.CODE2WAV),
+            "qwen3_omni_next_thinker":
+            _set(Component.LLM, Component.VISUAL, Component.AUDIO),
+            "qwen3_omni_next_text":
+            _set(Component.LLM),
+            "qwen3_omni_next_text_moe":
+            _set(Component.LLM),
+            "qwen3_omni_next_talker":
+            _set(Component.TALKER, Component.CODE_PREDICTOR),
+            "qwen3_omni_next_talker_text":
+            _set(Component.TALKER),
+            "qwen3_omni_next_code_predictor":
+            _set(Component.CODE_PREDICTOR),
+            "qwen3_omni_next_talker_code_predictor":
+            _set(Component.CODE_PREDICTOR),
+            "qwen3_omni_next_vision_encoder":
+            _set(Component.VISUAL),
+            "qwen3_omni_next_audio_encoder":
+            _set(Component.AUDIO),
+            "qwen3_omni_next_code2wav":
+            _set(Component.CODE2WAV),
+        },
+        {
+            Component.LLM:
+            _component("qwen3_omni_next.modeling_qwen3_omni_next_text",
+                       "Qwen3OmniNextThinker"),
+            Component.VISUAL:
+            _component("qwen3_omni_next.modeling_qwen3_omni_next_visual",
+                       "Qwen3OmniNextVisualEncoder"),
+            Component.AUDIO:
+            _component("qwen3_omni_next.modeling_qwen3_omni_next_audio",
+                       "Qwen3OmniNextAudioEncoder"),
+            Component.TALKER:
+            _component("qwen3_omni_next.modeling_qwen3_omni_next_talker",
+                       "Qwen3OmniNextTalker"),
+            Component.CODE_PREDICTOR:
+            _component(
+                "qwen3_omni_next.modeling_qwen3_omni_next_code_predictor",
+                "Qwen3OmniNextCodePredictor"),
+            Component.CODE2WAV:
+            _component("qwen3_omni_next.modeling_qwen3_omni_next_code2wav",
+                       "Qwen3OmniNextCode2WavModel"),
+        },
+    ),
+    ModelFamily(
         "qwen3_tts",
         {
             "qwen3_tts":
             _set(Component.TALKER, Component.CODE_PREDICTOR,
-                 Component.CODE2WAV),
+                 Component.CODE2WAV, Component.SPEAKER_ENCODER,
+                 Component.SPEECH_TOKENIZER_ENCODER),
             "qwen3_tts_talker":
             _set(Component.TALKER),
             "qwen3_tts_code_predictor":
@@ -293,6 +344,13 @@ FAMILIES: Tuple[ModelFamily, ...] = (
             Component.CODE2WAV:
             _component("qwen3_tts.modeling_qwen3_tts_code2wav",
                        "Qwen3TTSCode2WavModel"),
+            Component.SPEAKER_ENCODER:
+            _component("qwen3_tts.modeling_qwen3_tts_speaker_clone_encoder",
+                       "Qwen3TTSSpeakerCloneEncoder"),
+            Component.SPEECH_TOKENIZER_ENCODER:
+            _component(
+                "qwen3_tts.modeling_qwen3_tts_speech_tokenizer_clone_encoder",
+                "Qwen3TTSSpeechTokenizerCloneEncoder"),
         },
     ),
     ModelFamily(
@@ -347,7 +405,7 @@ FAMILIES: Tuple[ModelFamily, ...] = (
         "nemotron_omni",
         {
             "NemotronH_Nano_VL_V2":
-            _set(Component.LLM, Component.VISUAL, Component.AUDIO),
+            _set(Component.LLM, Component.VISUAL),
             "NemotronH_Nano_Omni_Reasoning_V3":
             _set(Component.LLM, Component.VISUAL, Component.AUDIO),
             "nemotron_omni_vision_encoder":
@@ -382,6 +440,73 @@ FAMILIES: Tuple[ModelFamily, ...] = (
             _component("gemma4.modeling_gemma4_visual", "Gemma4VisionModel"),
             Component.AUDIO:
             _component("gemma4.modeling_gemma4_audio", "Gemma4AudioModel"),
+        },
+    ),
+    ModelFamily(
+        "gemma4_unified",
+        {
+            "gemma4_unified":
+            _set(Component.LLM, Component.VISUAL, Component.AUDIO),
+            "gemma4_unified_text":
+            _set(Component.LLM),
+            "gemma4_unified_vision":
+            _set(Component.VISUAL),
+            "gemma4_unified_audio":
+            _set(Component.AUDIO),
+        },
+        {
+            Component.LLM:
+            _component("gemma4.modeling_gemma4_text", "Gemma4ForCausalLM"),
+            Component.VISUAL:
+            _component("gemma4.modeling_gemma4_unified_visual",
+                       "Gemma4UnifiedVisualModel"),
+            Component.AUDIO:
+            _component("gemma4.modeling_gemma4_unified_audio",
+                       "Gemma4UnifiedAudioModel"),
+        },
+        configuration="gemma4.configuration",
+        artifact_writer="gemma4.artifacts",
+        weight_conversion="gemma4.weights",
+    ),
+    ModelFamily(
+        "diffusion_gemma",
+        {
+            "diffusion_gemma": _set(Component.DLLM, Component.VISUAL),
+            "diffusiongemma": _set(Component.DLLM, Component.VISUAL),
+            "diffusion_gemma_text": _set(Component.DLLM),
+        },
+        {
+            Component.DLLM:
+            _component("diffusion_gemma.modeling_diffusion_gemma",
+                       "DiffusionGemmaForBlockDiffusion"),
+            Component.VISUAL:
+            _component("diffusion_gemma.modeling_diffusion_gemma_visual",
+                       "DiffusionGemmaVisionModel"),
+        },
+    ),
+    ModelFamily(
+        "cosmos3",
+        {
+            model_type:
+            _set(Component.LLM, Component.VISUAL, Component.UND_PREFILL,
+                 Component.GEN, Component.VAE_ENCODER)
+            for model_type in ("cosmos3_omni", "cosmos3_edge", "cosmos3")
+        } | {"cosmos3_edge_text": _set(Component.LLM)},
+        {
+            Component.LLM:
+            _component("cosmos3.modeling_cosmos3_reasoner_text",
+                       "Cosmos3ReasonerForCausalLM"),
+            Component.VISUAL:
+            _component("cosmos3.modeling_cosmos3_reasoner_visual",
+                       "Cosmos3ReasonerVisualModel"),
+            Component.UND_PREFILL:
+            _component("cosmos3.modeling_cosmos3_und_prefill",
+                       "Cosmos3UndPrefillModel"),
+            Component.GEN:
+            _component("cosmos3.modeling_cosmos3_gen", "Cosmos3GenModel"),
+            Component.VAE_ENCODER:
+            _component("cosmos3.modeling_cosmos3_vae_encoder",
+                       "Cosmos3VaeEncoder"),
         },
     ),
     ModelFamily(
@@ -436,6 +561,8 @@ SPECULATIVE_DRAFTS = {
     _component("qwen3_5.modeling_qwen3_5_mtp", "Qwen35MtpDraftModel"),
     "dflash":
     _component("dflash.modeling_dflash_draft", "DFlashDraftModel"),
+    "dspark":
+    _component("dspark.modeling_dspark_draft", "DSparkDraftModel"),
     "gemma4_mtp":
     _component("gemma4.modeling_gemma4_assistant",
                "Gemma4AssistantForCausalLM"),
@@ -445,6 +572,7 @@ SPECULATIVE_WEIGHT_CONVERSIONS = {
     "eagle3": "eagle3.weights",
     "mtp": "qwen3_5.weights",
     "dflash": "dflash.weights",
+    "dspark": "dspark.weights",
     "gemma4_mtp": "gemma4.weights",
 }
 
@@ -452,7 +580,35 @@ SPECULATIVE_CONFIGURATIONS = {
     "eagle3": "eagle3.configuration",
     "mtp": "qwen3_5.configuration",
     "dflash": "dflash.configuration",
+    "dspark": "dspark.configuration",
     "gemma4_mtp": "gemma4.configuration",
+}
+
+SPECULATIVE_ARTIFACT_WRITERS = {
+    "dspark": "dspark.artifacts",
+}
+
+FAMILY_SPECULATIVE_DRAFTS = {
+    ("qwen3_5_moe", "mtp"):
+    _component("qwen3_5_moe.modeling_qwen3_5_moe_mtp",
+               "Qwen3_5MoeMtpDraftModel"),
+    ("qwen3_omni_moe", "mtp"):
+    _component("qwen3_omni.modeling_qwen3_omni_mtp", "Qwen3OmniMtpDraftModel"),
+    ("qwen3_omni_next", "mtp"):
+    _component("qwen3_omni_next.modeling_qwen3_omni_next_mtp",
+               "Qwen3OmniNextMtpDraftModel"),
+}
+
+FAMILY_SPECULATIVE_WEIGHT_CONVERSIONS = {
+    ("qwen3_5_moe", "mtp"): "qwen3_5_moe.weights",
+    ("qwen3_omni_moe", "mtp"): "qwen3_omni.weights",
+    ("qwen3_omni_next", "mtp"): "qwen3_omni_next.weights",
+}
+
+FAMILY_SPECULATIVE_CONFIGURATIONS = {
+    ("qwen3_5_moe", "mtp"): "qwen3_5_moe.configuration",
+    ("qwen3_omni_moe", "mtp"): "qwen3_omni.configuration",
+    ("qwen3_omni_next", "mtp"): "qwen3_omni_next.configuration",
 }
 
 
@@ -482,8 +638,10 @@ def definition_for(root_model_type: str, component: Component, spec_type: str,
         if component != Component.LLM:
             raise ValueError(
                 "speculative draft builds require --component llm")
+        family = family_for(root_model_type)
         try:
-            return SPECULATIVE_DRAFTS[spec_type]
+            return FAMILY_SPECULATIVE_DRAFTS.get((family.name, spec_type),
+                                                 SPECULATIVE_DRAFTS[spec_type])
         except KeyError as error:
             raise ValueError(
                 f"unsupported speculative draft type {spec_type!r}") from error
@@ -507,8 +665,15 @@ def configuration_module_for(root_model_type: str):
     return importlib.import_module(f".{module_name}", __package__)
 
 
-def artifact_writer_for(root_model_type: str):
+def artifact_writer_for(
+        root_model_type: str,
+        spec_type: str = "none",
+        spec_role: contracts.SpecRole = contracts.SpecRole.NONE):
     """Import the runtime artifact writer owned by one model family."""
+    if spec_role == contracts.SpecRole.DRAFT:
+        module_name = SPECULATIVE_ARTIFACT_WRITERS.get(spec_type)
+        if module_name is not None:
+            return importlib.import_module(f".{module_name}", __package__)
     family = family_for(root_model_type)
     module_name = family.artifact_writer or f"{family.name}.artifacts"
     return importlib.import_module(f".{module_name}", __package__)
@@ -520,8 +685,11 @@ def weight_conversion_for(
         spec_role: contracts.SpecRole = contracts.SpecRole.NONE):
     """Import checkpoint conversion rules owned by a model family."""
     if spec_role == contracts.SpecRole.DRAFT:
+        family = family_for(root_model_type)
         try:
-            module_name = SPECULATIVE_WEIGHT_CONVERSIONS[spec_type]
+            module_name = FAMILY_SPECULATIVE_WEIGHT_CONVERSIONS.get(
+                (family.name, spec_type),
+                SPECULATIVE_WEIGHT_CONVERSIONS[spec_type])
         except KeyError as error:
             raise ValueError(
                 f"unsupported speculative draft type {spec_type!r}") from error
@@ -536,17 +704,21 @@ def configure_for_build(cfg,
                         spec_type: str,
                         *,
                         paired_target=None,
-                        paired_draft_dir: str = ""):
+                        paired_draft_dir: str = "",
+                        build_args=None):
     """Apply graph-role details through the selected model strategy."""
     role = (spec_role if isinstance(spec_role, contracts.SpecRole) else
             contracts.SpecRole(spec_role))
-    cfg.engine_role = ("llm"
+    cfg.engine_role = ((
+        "dllm" if cfg.component == contracts.Component.DLLM.value else "llm")
                        if role == contracts.SpecRole.NONE else role.value)
     cfg.spec_decode_type = spec_type
     if role == contracts.SpecRole.NONE:
         return cfg
+    family = family_for(cfg.root_model_type)
     try:
-        module_name = SPECULATIVE_CONFIGURATIONS[spec_type]
+        module_name = FAMILY_SPECULATIVE_CONFIGURATIONS.get(
+            (family.name, spec_type), SPECULATIVE_CONFIGURATIONS[spec_type])
     except KeyError as error:
         raise ValueError(
             f"unsupported speculative configuration {spec_type!r}") from error
@@ -557,5 +729,6 @@ def configure_for_build(cfg,
     if configure is not None:
         configure(cfg,
                   paired_target=paired_target,
-                  paired_draft_dir=paired_draft_dir)
+                  paired_draft_dir=paired_draft_dir,
+                  build_args=build_args)
     return cfg

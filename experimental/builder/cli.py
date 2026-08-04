@@ -22,6 +22,10 @@ from typing import Iterable, Optional, Sequence, Tuple, Union
 LOGGER = logging.getLogger("experimental.builder")
 
 
+def _value_or_default(value, default):
+    return default if value is None else value
+
+
 def _build_args(args: argparse.Namespace, component: str):
     from .core.builder import BuildArgs
 
@@ -35,8 +39,9 @@ def _build_args(args: argparse.Namespace, component: str):
         max_kv_cache_capacity=args.max_kv_cache_capacity,
         max_batch_size=args.max_batch_size,
         max_lora_rank=args.max_lora_rank,
-        max_verify_tree_size=args.max_verify_tree_size,
-        max_draft_tree_size=args.max_draft_tree_size,
+        max_verify_tree_size=_value_or_default(args.max_verify_tree_size, 60),
+        max_draft_tree_size=_value_or_default(args.max_draft_tree_size, 60),
+        tree_base=args.tree_base,
         min_image_tokens=args.min_image_tokens,
         max_image_tokens=args.max_image_tokens,
         max_image_tokens_per_image=args.max_image_tokens_per_image,
@@ -55,6 +60,8 @@ def _build_args(args: argparse.Namespace, component: str):
         plugin_path=args.plugin_path,
         profiling_detailed=args.profiling_detailed,
         dense_quant=args.dense,
+        int4_gemm_plugin_version=args.int4_gemm_plugin_version,
+        externalize_weights=tuple(args.externalize_weights or ()),
     )
 
 
@@ -81,7 +88,8 @@ def _resolve_build_selection(args: argparse.Namespace) -> Tuple[object, Tuple]:
     bundle = BundleConfig.from_pretrained(args.model_dir)
     requested = _component_tokens(args.components)
     components = contracts.resolve_components(bundle.root_model_type,
-                                              requested)
+                                              requested,
+                                              available=bundle.components)
     if not components:
         raise ValueError(f"{bundle.root_model_type!r} has no buildable "
                          "components")
@@ -109,11 +117,23 @@ def _speculative_build_plan(args: argparse.Namespace, bundle, components):
 
     draft_model_dir = args.draft_model_dir or args.model_dir
     draft_bundle = BundleConfig.from_pretrained(draft_model_dir)
+    if args.spec_type == "dspark":
+        draft = draft_bundle.component_dict(contracts.Component.LLM)
+        dspark = draft.get("dspark_config") or {}
+        block_size = int(dspark.get("block_size", draft.get("block_size", 7)))
+        draft_tree_size = _value_or_default(args.max_draft_tree_size,
+                                            block_size)
+        verify_tree_size = _value_or_default(args.max_verify_tree_size,
+                                             draft_tree_size + 1)
+        args = _copy_args(args,
+                          max_verify_tree_size=verify_tree_size,
+                          max_draft_tree_size=draft_tree_size)
     plan = []
     for component in components:
         if component != contracts.Component.LLM:
             component_args = _copy_args(args,
                                         spec_type="none",
+                                        tree_base=False,
                                         draft_model_dir=None,
                                         target_model_dir=None)
             plan.append((component.value, component_args, bundle, component))
@@ -122,17 +142,17 @@ def _speculative_build_plan(args: argparse.Namespace, bundle, components):
         base_args = _copy_args(
             args,
             spec_role=contracts.SpecRole.BASE.value,
-            draft_model_dir=(draft_model_dir
-                             if args.spec_type == "dflash" else None),
+            draft_model_dir=(draft_model_dir if args.spec_type
+                             in ("eagle3", "dflash", "dspark") else None),
             target_model_dir=None,
         )
         draft_args = _copy_args(
             args,
             model_dir=draft_model_dir,
             spec_role=contracts.SpecRole.DRAFT.value,
+            tree_base=False,
             draft_model_dir=None,
-            target_model_dir=(args.model_dir if args.spec_type
-                              in ("dflash", "gemma4_mtp") else None),
+            target_model_dir=args.model_dir,
         )
         plan.extend((
             ("spec-base", base_args, bundle, component),
@@ -155,26 +175,31 @@ def _build_one(args: argparse.Namespace, bundle, component,
                plugin_handle) -> str:
     from .core import contracts
     from .core.builder import build_engine, load_device_config
+    from .core.bundle import LLM_COMPONENTS
     from .models import registry as model_registry
 
     build_args = _build_args(args, component.value)
     cfg = None
-    if component in (contracts.Component.LLM, contracts.Component.TALKER,
-                     contracts.Component.CODE_PREDICTOR):
+    if component in LLM_COMPONENTS:
         cfg = load_device_config(build_args)
     result = build_engine(build_args,
                           cfg,
                           bundle=bundle,
                           plugin_handle=plugin_handle)
     artifact_writer = model_registry.artifact_writer_for(
-        bundle.root_model_type)
+        bundle.root_model_type, build_args.spec_type,
+        build_args.resolved_spec_role)
     artifact_writer.write_artifacts(bundle, cfg, build_args, args.engine_dir)
-    if result.external_weight_files:
-        from .core.artifacts import patch_external_weight_manifest
+    if result.checkpoint_weight_bindings:
+        from .core.artifacts import patch_external_weight_config
         config_path = contracts.component_spec(component).config_path(
             args.engine_dir, build_args.resolved_spec_role)
-        patch_external_weight_manifest(config_path,
-                                       result.external_weight_files)
+        patch_external_weight_config(
+            config_path,
+            result.checkpoint_weight_bindings,
+            result.checkpoint_identity,
+            checkpoint_dir=result.checkpoint_dir,
+        )
     return result.engine_path
 
 
@@ -206,7 +231,7 @@ def _add_common_engine_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_build_args(parser: argparse.ArgumentParser) -> None:
-    from .core import contracts
+    from .core import contracts, weight_policy
 
     parser.add_argument("--model-dir", required=True)
     parser.add_argument(
@@ -215,22 +240,34 @@ def _add_build_args(parser: argparse.ArgumentParser) -> None:
         help=("Comma-separated component list or 'all'. Default builds every "
               "component available in the checkpoint. Build order: " +
               ", ".join(contracts.component_build_order()) + "."))
-    parser.add_argument("--spec-type",
-                        choices=("none", "eagle3", "mtp", "dflash",
-                                 "gemma4_mtp"),
-                        default="none",
-                        help=("Build both speculative engines in this single "
-                              "invocation. EAGLE3, DFlash, and Gemma4 MTP "
-                              "also require --draft-model-dir."))
+    parser.add_argument(
+        "--spec-type",
+        choices=("none", "eagle3", "mtp", "dflash", "dspark", "gemma4_mtp"),
+        default="none",
+        help=("Build both speculative engines in this single invocation. "
+              "EAGLE3, DFlash, dSpark, and Gemma4 MTP also require "
+              "--draft-model-dir."))
     parser.add_argument("--dense",
                         choices=("auto", "nvfp4-qdq", "fp16"),
                         default="auto")
+    parser.add_argument(
+        "--int4-gemm-plugin-version",
+        type=int,
+        choices=(1, 2),
+        default=2,
+        help=("Dense INT4 implementation. V2 is the default CuTeDSL fragment "
+              "layout; V1 is the legacy plugin-packed fallback."))
     parser.add_argument("--max-input-len", type=int, default=32)
     parser.add_argument("--max-kv-cache-capacity", type=int, default=96)
     parser.add_argument("--max-batch-size", type=int, default=1)
     parser.add_argument("--max-lora-rank", type=int, default=0)
-    parser.add_argument("--max-verify-tree-size", type=int, default=60)
-    parser.add_argument("--max-draft-tree-size", type=int, default=60)
+    parser.add_argument("--max-verify-tree-size", type=int)
+    parser.add_argument("--max-draft-tree-size", type=int)
+    parser.add_argument(
+        "--tree-base",
+        action="store_true",
+        help=("Build an MTP or DFlash base with DDTree parent/depth metadata "
+              "for hybrid recurrent-state verification."))
     parser.add_argument("--min-image-tokens", type=int, default=4)
     parser.add_argument("--max-image-tokens", type=int, default=1024)
     parser.add_argument("--max-image-tokens-per-image", type=int, default=512)
@@ -245,6 +282,12 @@ def _add_build_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--draft-reduced-vocab-dir")
     parser.add_argument("--draft-model-dir")
     parser.add_argument("--fp8-embedding", action="store_true")
+    parser.add_argument(
+        "--externalize-weights",
+        action="append",
+        choices=weight_policy.EXTERNAL_WEIGHT_CHOICES,
+        help=("Limit which weights leave the engine, repeatable. Defaults to "
+              "every kind. FP8 and MXFP8 weights are always baked in."))
     parser.add_argument("--profiling-detailed", action="store_true")
     parser.set_defaults(spec_role=contracts.SpecRole.NONE.value,
                         target_model_dir=None)

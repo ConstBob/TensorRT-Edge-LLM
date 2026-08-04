@@ -354,7 +354,7 @@ class ConvNextUpsample(Module):
         self.deconv = CausalDeconv1d(ctx, self.key("0.conv"), 2,
                                      symmetric_padding)
         dwconv = self.key("1.dwconv.conv")
-        groups = int(self.weights.f16(dwconv + ".weight").shape[0])
+        groups = int(self.weights.parameter_spec(dwconv + ".weight").shape[0])
         self.dwconv = CausalConv1d(ctx, dwconv, groups=groups)
         self.norm = QwenCode2WavNorm(ctx, self.key("1.norm"), 1e-6)
         self.pwconv1 = Linear(ctx,

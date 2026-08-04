@@ -14,6 +14,10 @@
 # limitations under the License.
 """Qwen3-TTS runtime artifact writing."""
 
+import json
+import os
+
+from ...core import contracts
 from ...core.artifacts.runtime_artifacts import (write_component_artifacts,
                                                  write_runtime_artifacts)
 from . import embeddings, runtime_config, tokenizer, weights
@@ -28,6 +32,18 @@ def write_artifacts(bundle, config, args, engine_dir: str) -> None:
                                 runtime_config_module=runtime_config,
                                 tokenizer_module=tokenizer,
                                 embedding_module=embeddings)
+        return
+    if args.resolved_component in (
+            contracts.Component.SPEAKER_ENCODER,
+            contracts.Component.SPEECH_TOKENIZER_ENCODER):
+        output_dir = contracts.component_spec(
+            args.resolved_component).output_dir(engine_dir)
+        os.makedirs(output_dir, exist_ok=True)
+        name = args.resolved_component.value.replace("-", "_") + "_config.json"
+        payload = runtime_config.component_runtime_config(
+            bundle, args.resolved_component, args)
+        with open(os.path.join(output_dir, name), "w") as config_file:
+            json.dump(payload, config_file, indent=2)
         return
     write_component_artifacts(bundle,
                               args,

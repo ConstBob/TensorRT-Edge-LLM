@@ -20,6 +20,18 @@ from ...core import contracts
 from ...core.artifacts.tokenizer import find_token_id
 
 
+def update_llm_config(config: Dict[str, Any], root: Dict[str, Any], cfg,
+                      args) -> None:
+    """Add the InternVL image placeholder contract to the LLM runtime."""
+    del cfg
+    image_token_id = root.get("image_token_id")
+    if not isinstance(image_token_id, int):
+        image_token_id = find_token_id(args.model_dir, "<IMG_CONTEXT>")
+    if image_token_id is None:
+        raise ValueError("InternVL tokenizer does not define <IMG_CONTEXT>")
+    config["image_token_id"] = image_token_id
+
+
 def component_runtime_config(bundle, component: contracts.Component, args):
     """Return InternVL3.5 visual runtime config."""
     if component != contracts.Component.VISUAL:
@@ -44,6 +56,12 @@ def component_runtime_config(bundle, component: contracts.Component, args):
         image_token_id = find_token_id(bundle.model_dir, "<IMG_CONTEXT>")
     if image_token_id is not None:
         result["image_token_id"] = image_token_id
+    img_start_token_id = find_token_id(bundle.model_dir, "<img>")
+    if img_start_token_id is not None:
+        result["img_start_token_id"] = img_start_token_id
+    img_end_token_id = find_token_id(bundle.model_dir, "</img>")
+    if img_end_token_id is not None:
+        result["img_end_token_id"] = img_end_token_id
     for key in ("patch_size", "image_size"):
         if isinstance(visual.get(key), int):
             visual[key] = [visual[key], visual[key]]

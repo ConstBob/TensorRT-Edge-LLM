@@ -42,8 +42,8 @@
 #include "runtime/state/systemPromptKVCache.h"
 #include "runtime/streaming.h"
 #include "tokenizer/tokenizer.h"
-
 #include <atomic>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <tuple>
@@ -80,12 +80,15 @@ public:
      * @param draftingConfig Speculative decoding drafting configuration
      * @param stream CUDA stream for operations
      * @param contextCacheConfig Context-cache configuration
+     * @param checkpointDir HF/ModelOpt checkpoint directory for runtime weight loading
+     * @param draftCheckpointDir Separate draft checkpoint directory for paired speculative models
      * @throws std::runtime_error if directories do not contain expected data, or runner initialization fails
      */
     LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap,
         SpecDecodeDraftingConfig const& draftingConfig, cudaStream_t stream,
-        ContextCacheConfig const& contextCacheConfig = {});
+        ContextCacheConfig const& contextCacheConfig = {}, std::string const& checkpointDir = "",
+        std::string const& draftCheckpointDir = "");
 
     /*!
      * @brief Construct runtime for vanilla-only decoding (no draft model)
@@ -94,11 +97,12 @@ public:
      * @param loraWeightsMap Map of LoRA weight names to file paths
      * @param stream CUDA stream for operations
      * @param contextCacheConfig Context-cache configuration
+     * @param checkpointDir HF/ModelOpt checkpoint directory for runtime weight loading
      * @throws std::runtime_error if directories do not contain expected data, or runner initialization fails
      */
     LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream,
-        ContextCacheConfig const& contextCacheConfig = {});
+        ContextCacheConfig const& contextCacheConfig = {}, std::string const& checkpointDir = "");
 
     //! @brief Destructor
     ~LLMInferenceRuntime() noexcept;
@@ -235,7 +239,8 @@ private:
     void initializeCommon(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap,
         std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream,
-        ContextCacheConfig const& contextCacheConfig);
+        ContextCacheConfig const& contextCacheConfig, std::string const& checkpointDir,
+        std::string const& draftCheckpointDir);
 
     //! @brief Capture a CUDA graph on the base executor for the default (no-adapter)
     //! state, then one additional graph per registered LoRA adapter. Returns the
@@ -255,9 +260,11 @@ private:
     std::unique_ptr<SharedResources> mSharedResources; //!< KV caches / RoPE / LoRA / context memory
     //! Declared after SharedResources so shutdown and destruction release cache ownership before physical buffers.
     std::unique_ptr<ContextCacheCoordinator> mContextCache;
-    std::unique_ptr<PipelineIO> mPipelineIO; //!< Per-pipeline I/O tensors
-    TensorMap mBaseTensorMap;                //!< Base engine binding map
-    LogitBias mLogitBias;                    //!< Runtime-owned resources that outlive decoding objects borrowing them
+    std::unique_ptr<PipelineIO> mPipelineIO;   //!< Per-pipeline I/O tensors
+    TensorMap mBaseTensorMap;                  //!< Base engine binding map
+    std::filesystem::path mCheckpointDir;      //!< Provider checkpoint used during startup weight loading
+    std::filesystem::path mDraftCheckpointDir; //!< Separate provider draft checkpoint, empty for integrated drafts
+    LogitBias mLogitBias;                      //!< Runtime-owned resources that outlive decoding objects borrowing them
     std::unique_ptr<DecodingRuntimeContext> mDecodingRuntimeContext;
     std::unique_ptr<DecoderRegistry> mDecoderRegistry;
     std::unique_ptr<StepPreparer> mStepPreparer;             //!< Per-step sequence preprocessor

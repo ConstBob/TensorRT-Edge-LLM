@@ -156,10 +156,8 @@ private:
     bool initializeSequentialMRopeCache(
         int64_t activeBatchSize, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream);
 
-    AudioConfig mConfig{};                               //!< Audio encoder configuration
-    rt::audio::MelExtractor mFeMel;                      //!< FE for PCM→mel; family bound by validateAndFillConfig
-    std::unique_ptr<nvinfer1::ICudaEngine> mAudioEngine; //!< Audio encoder TensorRT engine
-    std::unique_ptr<nvinfer1::IExecutionContext> mAudioContext; //!< Audio encoder execution context
+    AudioConfig mConfig{};            //!< Audio encoder configuration
+    rt::audio::MelExtractor mFeMel;   //!< FE for PCM→mel; family bound by validateAndFillConfig
     rt::Tensor mPaddedFeature{};      //!< [num_chunks, mel_bins, max_chunk_len] Padded audio chunks
     rt::Tensor mPaddedMaskAfterCNN{}; //!< [num_chunks, max_len_after_cnn] Mask for valid tokens
     rt::Tensor mPaddedMaskIndices{};  //!< [num_valid_elements, 2] Nonzero indices from mask

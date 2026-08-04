@@ -12,16 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Runtime artifact emission for checkpoint-direct builds."""
+"""Checkpoint metadata helpers that do not require a TensorRT runtime."""
 
-from .external_weights import (patch_external_weight_manifest,
-                               write_external_weight_files)
-from .runtime_artifacts import (write_component_artifacts,
-                                write_runtime_artifacts)
+from .external_weights import (checkpoint_identity, checkpoint_weight_bindings,
+                               patch_external_weight_config)
 
 __all__ = [
-    "patch_external_weight_manifest",
-    "write_external_weight_files",
-    "write_component_artifacts",
-    "write_runtime_artifacts",
+    "checkpoint_identity",
+    "checkpoint_weight_bindings",
+    "patch_external_weight_config",
 ]

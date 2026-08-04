@@ -32,7 +32,7 @@ def update_talker_config(config: Dict[str, Any], root: Dict[str, Any], cfg,
                 "codec_nothink_id", "codec_think_bos_id", "codec_think_eos_id",
                 "codec_pad_id", "codec_bos_id", "codec_eos_token_id",
                 "codec_think_id", "accept_hidden_layer", "num_code_groups",
-                "tts_model_type"):
+                "tts_model_type", "codec_language_id"):
         if key in talker:
             config[key] = talker[key]
         elif key in root:
@@ -69,6 +69,47 @@ def update_code_predictor_config(config: Dict[str, Any], root: Dict[str, Any],
 
 def component_runtime_config(bundle, component: contracts.Component, args):
     """Return Qwen3-TTS component runtime config."""
+    if component == contracts.Component.SPEAKER_ENCODER:
+        speaker = dict(bundle.component_dict(component))
+        return {
+            "model_type": "qwen3_tts_speaker_encoder",
+            "sample_rate": int(speaker.get("sample_rate", 24000)),
+            "speaker_encoder_config": speaker,
+            "tensor_contract": {
+                "inputs": {
+                    "wav": [1, "samples"],
+                },
+                "outputs": {
+                    "speaker_embedding": [
+                        1,
+                        int(speaker.get("enc_dim", 1024)),
+                    ],
+                },
+            },
+            "builder_config": {
+                "max_reference_samples": 960000,
+            },
+        }
+    if component == contracts.Component.SPEECH_TOKENIZER_ENCODER:
+        speech = bundle.root["_speech_tokenizer_config"]
+        return {
+            "model_type": "qwen3_tts_speech_tokenizer_encoder",
+            "sample_rate": int(speech["input_sample_rate"]),
+            "bucket_samples": int(speech["input_sample_rate"]) * 40,
+            "num_quantizers": int(speech["encoder_valid_num_quantizers"]),
+            "tensor_contract": {
+                "inputs": {
+                    "wav": [1, int(speech["input_sample_rate"]) * 40],
+                },
+                "outputs": {
+                    "codes": [
+                        int(speech["input_sample_rate"]) * 40 //
+                        int(speech["encode_downsample_rate"]),
+                        int(speech["encoder_valid_num_quantizers"]),
+                    ],
+                },
+            },
+        }
     if component != contracts.Component.CODE2WAV:
         return None
     code2wav = dict(bundle.component_dict(component))

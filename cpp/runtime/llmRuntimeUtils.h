@@ -142,7 +142,7 @@ struct LLMGenerationRequest
     bool addGenerationPrompt{true};
     // Whether to enable thinking mode for models that support it. Default is disabled.
     bool enableThinking{false};
-    // Always disable speculative decoding for this request even if Eagle Draft engine is loaded.
+    // Disable speculative decoding for this request when the loaded engine contract supports vanilla fallback.
     bool disableSpecDecode{false};
 
     //! Number of top log-probabilities to return per generated token (0 = disabled, max = kMaxLogprobsK).

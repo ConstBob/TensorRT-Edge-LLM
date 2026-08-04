@@ -72,7 +72,8 @@ class Qwen35MtpDraftModel(NetworkModule):
             for index in range(ctx.cfg.num_hidden_layers)
         ]
         self.norm = RMSNorm(ctx, "norm", eps, unit_offset=True)
-        self.lm_head = Linear(ctx, "lm_head")
+        self.lm_head = Linear(ctx,
+                              ctx.weights.causal_lm_head_prefix("mtp.lm_head"))
 
     def input_tensors(self) -> Dict[str, object]:
         cfg = self.cfg

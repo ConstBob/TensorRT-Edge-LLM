@@ -24,7 +24,8 @@ from .. import contracts
 from ..config import DeviceConfig
 from ..weights import Weights
 from .chat_template import write_processed_chat_template
-from .embeddings import (copy_vocab_artifacts, write_embedding,
+from .embeddings import (copy_vocab_artifacts, externalizes_embedding,
+                         externalizes_ple, write_embedding,
                          write_ple_embedding)
 from .runtime_config import (build_runtime_config,
                              default_component_runtime_config)
@@ -175,6 +176,7 @@ def write_runtime_artifacts(cfg: DeviceConfig,
                       component=cfg.component,
                       spec_type=args.spec_type,
                       spec_role=args.spec_role,
+                      tie_word_embeddings=embedding_cfg.tie_word_embeddings,
                       conversion=embedding_conversion)
     try:
         if cfg.component == contracts.Component.CODE_PREDICTOR.value:
@@ -186,7 +188,10 @@ def write_runtime_artifacts(cfg: DeviceConfig,
         else:
             writes_embedding = getattr(weight_conversion,
                                        "writes_runtime_embedding", None)
-            if writes_embedding is None or writes_embedding(args):
+            if externalizes_embedding(args, weight_conversion):
+                logger.info("Embedding stays in the checkpoint; the runtime "
+                            "loads it through its checkpoint binding")
+            elif writes_embedding is None or writes_embedding(args):
                 write_embedding(weights, embedding_cfg, args, output_dir)
             if cfg.component == contracts.Component.TALKER.value:
                 writer = _require_artifact_hook(embedding_module,
@@ -196,7 +201,12 @@ def write_runtime_artifacts(cfg: DeviceConfig,
                                                 cfg.component)
                 writer(weights, root, output_dir)
             if cfg.hidden_size_per_layer_input > 0:
-                write_ple_embedding(weights, cfg, output_dir)
+                if externalizes_ple(args, cfg):
+                    logger.info("PLE table stays in the checkpoint; the "
+                                "runtime loads it through its checkpoint "
+                                "binding")
+                else:
+                    write_ple_embedding(weights, cfg, output_dir)
             extra_artifacts = getattr(weight_conversion,
                                       "runtime_weight_artifacts", None)
             if extra_artifacts is not None:

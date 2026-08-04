@@ -23,6 +23,7 @@
 #include "profiling/metrics.h"
 #include "runtime/imageUtils.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "runtime/state/externalWeightManager.h"
 #include "tokenizer/tokenizer.h"
 #include <cuda_fp16.h>
 #include <filesystem>
@@ -87,11 +88,12 @@ public:
      * @param llmMaxBatchSize Maximum batch size from LLM engine
      * @param llmMaxPositionEmbeddings Maximum position embeddings from LLM engine
      * @param stream CUDA stream for operations
+     * @param checkpointDir HF checkpoint directory used by runtime weight loading
      * @return Unique pointer to created runner
      * @throws std::runtime_error If model type is unknown or runner creation fails
      */
     static std::unique_ptr<MultimodalRunner> create(std::string const& multimodalEngineDir, int32_t llmMaxBatchSize,
-        int64_t llmMaxPositionEmbeddings, cudaStream_t stream);
+        int64_t llmMaxPositionEmbeddings, cudaStream_t stream, std::string const& checkpointDir = "");
 
     /*!
      * @brief Preprocess request with images and text
@@ -167,6 +169,22 @@ public:
         return mMultimodalMetrics;
     }
 
+    /*!
+     * @brief Load this encoder's externalized weights and bind them to its context
+     *
+     * A no-op when the encoder config lists neither ``external_weight_files``
+     * nor ``checkpoint_weight_bindings``, which is the case for engines that
+     * carry their weights inline. Call before the first infer(), and before
+     * initialize() on runners that have one, since it may enqueue the engine.
+     *
+     * @param engineDir Directory holding the encoder engine and its config.json
+     * @param checkpointDir HF checkpoint directory, empty when not supplied
+     * @param stream CUDA stream used during startup weight preparation
+     * @throws std::runtime_error If the weights cannot be loaded or do not
+     *         match the engine's input signature
+     */
+    void loadExternalWeights(std::string const& engineDir, std::string const& checkpointDir, cudaStream_t stream);
+
 protected:
     multimodal::ModelType mModelType; //!< Model type identifier
     AuxStreamSet mAuxStreams{};
@@ -177,6 +195,9 @@ protected:
     std::unique_ptr<nvinfer1::IExecutionContext> mAudioContext; //!< Audio execution context
     rt::Tensor mOutputEmbedding;                                //!< Output embeddings
     metrics::MultimodalMetrics mMultimodalMetrics;              //!< Performance metrics
+    //! Owns the encoder's externalized weights; the context points into them.
+    std::unique_ptr<ExternalWeightManager> mExternalWeights;
+    bool mExternalWeightsLoaded{false}; //!< Guards the idempotent load
 };
 
 } // namespace rt
