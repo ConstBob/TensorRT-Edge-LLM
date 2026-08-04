@@ -29,10 +29,33 @@
 namespace trt_edgellm
 {
 
+namespace
+{
+
+#ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
+bool isBlackwellSm(int32_t smVersion)
+{
+    return smVersion == 100 || smVersion == 101 || smVersion == 110;
+}
+#endif
+
+#ifdef CUTE_DSL_GDN_BLACKWELL_GEFORCE_ENABLED
+bool isBlackwellGeforceSm(int32_t smVersion)
+{
+    return smVersion == 120 || smVersion == 121;
+}
+#endif
+
+} // namespace
+
 detail::LazyKernelModule<gdn_decode_Kernel_Module_t> CuteDslGDNRunner::sDecodeModule{};
 detail::LazyKernelModule<gdn_prefill_Kernel_Module_t> CuteDslGDNRunner::sPrefillModule{};
 #ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
 detail::LazyKernelModule<gdn_prefill_blackwell_Kernel_Module_t> CuteDslGDNRunner::sBlackwellPrefillModule{};
+#endif
+#ifdef CUTE_DSL_GDN_BLACKWELL_GEFORCE_ENABLED
+detail::LazyKernelModule<gdn_prefill_blackwell_geforce_Kernel_Module_t>
+    CuteDslGDNRunner::sBlackwellGeforcePrefillModule{};
 #endif
 detail::LazyKernelModule<gdn_decode_mtp_cache_Kernel_Module_t> CuteDslGDNRunner::sMTPDecodeCacheModule{};
 
@@ -93,8 +116,16 @@ bool CuteDslGDNRunner::ensureKernelModules(GDNParams const& params, cudaStream_t
         return detail::ensureModuleLoaded<gdn_decode_Kernel_Module_Load, gdn_decode_Kernel_Module_Unload>(
             sDecodeModule, "gdn_decode", stream);
     }
+#ifdef CUTE_DSL_GDN_BLACKWELL_GEFORCE_ENABLED
+    if (isBlackwellGeforceSm(params.smVersion) && params.h > 0 && params.hv % params.h == 0)
+    {
+        return detail::ensureModuleLoaded<gdn_prefill_blackwell_geforce_Kernel_Module_Load,
+            gdn_prefill_blackwell_geforce_Kernel_Module_Unload>(
+            sBlackwellGeforcePrefillModule, "gdn_prefill_blackwell_geforce", stream);
+    }
+#endif
 #ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
-    if (params.smVersion >= 100)
+    if (isBlackwellSm(params.smVersion))
     {
         return detail::ensureModuleLoaded<gdn_prefill_blackwell_Kernel_Module_Load,
             gdn_prefill_blackwell_Kernel_Module_Unload>(sBlackwellPrefillModule, "gdn_prefill_blackwell", stream);
@@ -120,8 +151,14 @@ int CuteDslGDNRunner::run(GDNParams const& params, cudaStream_t stream)
     {
         return runDecode(params, stream);
     }
+#ifdef CUTE_DSL_GDN_BLACKWELL_GEFORCE_ENABLED
+    if (isBlackwellGeforceSm(params.smVersion) && params.h > 0 && params.hv % params.h == 0)
+    {
+        return runPrefillBlackwellGeforce(params, stream);
+    }
+#endif
 #ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
-    if (params.smVersion >= 100)
+    if (isBlackwellSm(params.smVersion))
     {
         return runPrefillBlackwell(params, stream);
     }
@@ -318,6 +355,82 @@ int CuteDslGDNRunner::runPrefillBlackwell(GDNParams const& params, cudaStream_t 
     return 0;
 #else
     LOG_ERROR("Blackwell GDN prefill not compiled in this build.");
+    return -1;
+#endif
+}
+
+int CuteDslGDNRunner::runPrefillBlackwellGeforce(GDNParams const& params, cudaStream_t stream)
+{
+#ifdef CUTE_DSL_GDN_BLACKWELL_GEFORCE_ENABLED
+    if (params.tensormap_scratch == nullptr)
+    {
+        LOG_ERROR("GDN Blackwell GeForce prefill requires tensor-map scratch.");
+        return -1;
+    }
+
+    int32_t const n = params.n;
+    int32_t const seqLen = params.seq_len;
+    int32_t const h = params.h;
+    int32_t const hv = params.hv;
+    int32_t const k = params.k_dim;
+    int32_t const v = params.v_dim;
+    int32_t const smCount = getDeviceMultiProcessorCount();
+    if (smCount > kBlackwellGeforceMaxSMCount)
+    {
+        LOG_ERROR(
+            "GDN Blackwell GeForce prefill supports at most %d SMs, got %d.", kBlackwellGeforceMaxSMCount, smCount);
+        return -1;
+    }
+
+    // Match the existing optimized Blackwell path: all consumers must observe
+    // the same normalized Q/K values.
+    launchGdnL2NormQK(params.q, params.k, n, seqLen, h, k, stream);
+
+    gdn_prefill_blackwell_geforce_Tensor_q_t qTensor{};
+    SET_4D_TENSOR(qTensor, params.q, n, seqLen, h, k);
+    gdn_prefill_blackwell_geforce_Tensor_k_t kTensor{};
+    SET_4D_TENSOR(kTensor, params.k, n, seqLen, h, k);
+    gdn_prefill_blackwell_geforce_Tensor_v_t vTensor{};
+    SET_4D_TENSOR(vTensor, params.v, n, seqLen, hv, v);
+    gdn_prefill_blackwell_geforce_Tensor_a_t aTensor{};
+    SET_3D_TENSOR(aTensor, params.a, n, seqLen, hv);
+    gdn_prefill_blackwell_geforce_Tensor_b_t bTensor{};
+    SET_3D_TENSOR(bTensor, params.b, n, seqLen, hv);
+
+    gdn_prefill_blackwell_geforce_Tensor_A_log_t ALogTensor{};
+    SET_1D_TENSOR(ALogTensor, params.A_log, hv);
+    gdn_prefill_blackwell_geforce_Tensor_dt_bias_t dtBiasTensor{};
+    SET_1D_TENSOR(dtBiasTensor, params.dt_bias, hv);
+
+    // This kernel is in-place safe: each CTA exclusively owns one [n, hv]
+    // state slice, loads it into registers, and writes it back only after
+    // processing all sequence blocks.
+    gdn_prefill_blackwell_geforce_Tensor_h0_in_t h0InTensor{};
+    h0InTensor.data = params.h0_source;
+    h0InTensor.dynamic_shapes[0] = n;
+    h0InTensor.dynamic_shapes[1] = hv;
+    h0InTensor.dynamic_strides[0] = static_cast<int64_t>(hv) * k * v;
+
+    gdn_prefill_blackwell_geforce_Tensor_h0_out_t h0OutTensor{};
+    h0OutTensor.data = params.h0_source;
+    h0OutTensor.dynamic_shapes[0] = n;
+    h0OutTensor.dynamic_shapes[1] = hv;
+    h0OutTensor.dynamic_strides[0] = static_cast<int64_t>(hv) * k * v;
+
+    gdn_prefill_blackwell_geforce_Tensor_context_lengths_t contextLengthsTensor{};
+    SET_1D_TENSOR(contextLengthsTensor, params.context_lengths, n);
+    gdn_prefill_blackwell_geforce_Tensor_o_t oTensor{};
+    SET_4D_TENSOR(oTensor, params.o, n, seqLen, hv, v);
+
+    gdn_prefill_blackwell_geforce_Tensor_tensormap_scratch_t tensormapScratchTensor{};
+    SET_1D_TENSOR(tensormapScratchTensor, params.tensormap_scratch,
+        kBlackwellGeforceMaxSMCount * kBlackwellGeforceTensorMapDescriptorBytes);
+
+    return cute_dsl_gdn_prefill_blackwell_geforce_wrapper(&sBlackwellGeforcePrefillModule.module, &qTensor, &kTensor,
+        &vTensor, &aTensor, &bTensor, &ALogTensor, &dtBiasTensor, &h0InTensor, &h0OutTensor, &contextLengthsTensor,
+        &oTensor, &tensormapScratchTensor, stream);
+#else
+    LOG_ERROR("Blackwell GeForce GDN prefill not compiled in this build.");
     return -1;
 #endif
 }

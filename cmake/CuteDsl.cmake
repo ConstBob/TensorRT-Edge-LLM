@@ -504,6 +504,20 @@ function(cute_dsl_setup)
     )
   endif()
 
+  # Check for the Blackwell GeForce GDN prefill variant.
+  list(FIND _variants "gdn_prefill_blackwell_geforce"
+       _gdn_blackwell_geforce_idx)
+  if(NOT ${_gdn_blackwell_geforce_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GDN_BLACKWELL_GEFORCE_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: Blackwell GeForce GDN prefill variant found — CUTE_DSL_GDN_BLACKWELL_GEFORCE_ENABLED set"
+    )
+  endif()
+
   # Check for Blackwell SSD variants and set a clean define.
   set(_ssd_bw_found FALSE)
   foreach(_ssd_bw_name "ssd_prefill_blackwell_d64_n128"

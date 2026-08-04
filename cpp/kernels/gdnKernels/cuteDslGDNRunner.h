@@ -58,10 +58,11 @@ struct GDNParams
     void* A_log{};
     void* dt_bias{};
     void* h0_source{};
-    void* context_lengths{}; ///< [N] int32 — valid length per batch (decode / prefill; unused in MTP)
-    void* cu_seqlens{};      ///< [N+1] int32 — prefix-sum of context_lengths (Blackwell prefill)
-    void* h0_scratch{};      ///< [N, hv, k, v] f32 — pre-allocated scratch for h0_out (Blackwell prefill);
-                             ///<   must be provided by caller (e.g. plugin workspace).
+    void* context_lengths{};   ///< [N] int32 — valid length per batch (decode / prefill; unused in MTP)
+    void* cu_seqlens{};        ///< [N+1] int32 — prefix-sum of context_lengths (Blackwell prefill)
+    void* h0_scratch{};        ///< [N, hv, k, v] f32 — pre-allocated scratch for h0_out (Blackwell prefill);
+                               ///<   must be provided by caller (e.g. plugin workspace).
+    void* tensormap_scratch{}; ///< Tail-store TMA descriptors (Blackwell GeForce prefill).
     void* o{};
 
     // MTP (multi-token) decode fields — used only when use_mtp == true.
@@ -83,7 +84,8 @@ struct GDNParams
  *  Dispatch table (evaluated in order):
  *    use_mtp == true              → runDecodeMTP()       (MTP: any seq_len)
  *    seq_len == 1                 → runDecode()          (single-token decode)
- *    seq_len > 1 && SM >= 100     → runPrefillBlackwell() (Blackwell prefill)
+ *    seq_len > 1 && SM120/121     → runPrefillBlackwellGeforce() (Blackwell GeForce warp-MMA prefill)
+ *    seq_len > 1 && SM100/101/110  → runPrefillBlackwell() (Blackwell prefill)
  *    seq_len > 1                  → runPrefill()          (sequential prefill)
  *
  *  MTP note: all batch items process seq_len (T) draft tokens uniformly.
@@ -92,6 +94,10 @@ struct GDNParams
 class CuteDslGDNRunner
 {
 public:
+    // Blackwell GeForce only; must match TENSOR_MAP_DESCRIPTOR_BYTES in gdn_prefill_sm12x_helpers.py.
+    static constexpr int32_t kBlackwellGeforceTensorMapDescriptorBytes = 128;
+    static constexpr int32_t kBlackwellGeforceMaxSMCount = 256;
+
     CuteDslGDNRunner() = default;
     ~CuteDslGDNRunner() = default;
     CuteDslGDNRunner(CuteDslGDNRunner const&) = delete;
@@ -110,12 +116,16 @@ private:
     int runDecode(GDNParams const& params, cudaStream_t stream);
     int runPrefill(GDNParams const& params, cudaStream_t stream);
     int runPrefillBlackwell(GDNParams const& params, cudaStream_t stream);
+    int runPrefillBlackwellGeforce(GDNParams const& params, cudaStream_t stream);
     int runDecodeMTP(GDNParams const& params, cudaStream_t stream);
 
     static detail::LazyKernelModule<gdn_decode_Kernel_Module_t> sDecodeModule;
     static detail::LazyKernelModule<gdn_prefill_Kernel_Module_t> sPrefillModule;
 #ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
     static detail::LazyKernelModule<gdn_prefill_blackwell_Kernel_Module_t> sBlackwellPrefillModule;
+#endif
+#ifdef CUTE_DSL_GDN_BLACKWELL_GEFORCE_ENABLED
+    static detail::LazyKernelModule<gdn_prefill_blackwell_geforce_Kernel_Module_t> sBlackwellGeforcePrefillModule;
 #endif
     static detail::LazyKernelModule<gdn_decode_mtp_cache_Kernel_Module_t> sMTPDecodeCacheModule;
 };
