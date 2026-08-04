@@ -32,11 +32,11 @@ python3 scripts/check_oss_release_sanitizer.py
 
 ## TensorRT CI Edge-LLM validation
 
-`run_trt_dependency_ci.py` is the internal x86/D7L TRT downstream check. It takes
+`ci_dependency_tests/run_trt_dependency_ci.py` is the internal x86/D7L TRT downstream check. It takes
 architecture, TRT location, build-host JSON, and run-host JSON:
 
 ```bash
-python3 scripts/run_trt_dependency_ci.py \
+python3 scripts/ci_dependency_tests/run_trt_dependency_ci.py \
   x86 \
   /absolute/trt/prebuilt/on-build-host \
   /path/to/build-host.json \

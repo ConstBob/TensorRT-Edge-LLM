@@ -28,8 +28,14 @@ import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from trt_dev_toolkit.code_manager import (ArtifactSource, ArtifactTarget,
-                                          BuildComponent, BuildMode,
+_SOURCE_ROOT = Path(__file__).resolve().parents[2]
+_SCRIPTS_ROOT = _SOURCE_ROOT / "scripts"
+if str(_SCRIPTS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_ROOT))
+
+from developer_toolkit_extensions import edgellm_code_manager, gpu
+from trt_dev_toolkit.code_manager import (TRT_COMPONENT, ArtifactSource,
+                                          ArtifactTarget, BuildMode,
                                           CodeManager, DeploymentMode)
 from trt_dev_toolkit.code_manager.models import (ArtifactResult, BuildConfig,
                                                  PlanStep, PlatformConfig)
@@ -55,7 +61,6 @@ from trt_dev_toolkit.remote_connection_manager.remote_connection_manager import 
 from trt_dev_toolkit.remote_connection_manager.types.target_types import \
     SSHTargetInfo
 
-_SOURCE_ROOT = Path(__file__).resolve().parents[1]
 _PYTHON = Path(sys.executable)
 _PYTHON_ROOT = Path(sys.prefix)
 _RUN_WORKSPACE = PurePosixPath("/tmp/edgellm-trt-ci")
@@ -108,6 +113,24 @@ _DEFAULT_MODEL_CASES = (
         pipeline_param="Qwen3.5-0.8B-fp16-mxsl2048-mxbs1-mxil1024",
     ),
 )
+
+
+def _component_id(component: Any) -> str:
+    return str(getattr(component, "value", component))
+
+
+def _gpu_selection_for_arch(architecture: Arch,
+                            compute_capability: str) -> gpu.GPUSelection:
+    name = "D7L" if architecture is Arch.D7L else "x86 build GPU"
+    return gpu.GPUSelection(
+        index=0,
+        name=name,
+        uuid="0",
+        free_memory_mib=0,
+        total_memory_mib=0,
+        utilization_percent=0,
+        compute_capability=compute_capability,
+    )
 
 
 class FlowError(RuntimeError):
@@ -256,6 +279,7 @@ class Runtime:
     local_workspace: Path | None = None
     deployment_mode: DeploymentMode | None = None
     nfs_export_path: PurePosixPath | None = None
+    edge_llm_cache_root: PurePosixPath | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -266,6 +290,7 @@ class Config:
     run_host: HostSSHConfig
     run_id: str
     branch: str
+    compute_capability: str
     onnx_root: PurePosixPath
     hf_checkpoint_root: PurePosixPath | None
     jobs: int
@@ -273,12 +298,15 @@ class Config:
     download_hf_checkpoint: bool = False
     export_onnx: bool = False
     no_trt_containers: bool = False
+    edge_llm_cache_root: Path | None = None
     run_workspace_root: PurePosixPath | None = None
     model_cases: tuple[ModelCase, ...] = _DEFAULT_MODEL_CASES
 
     def validate(self) -> None:
         if self.architecture not in {Arch.X86_64, Arch.D7L}:
             raise ValueError("architecture must be x86/x86_64 or d7l")
+        if not _valid_compute_capability(self.compute_capability):
+            raise ValueError("compute capability must use major.minor format")
         if not _safe_path(self.trt_location):
             raise ValueError(
                 "trt_location must be an absolute, non-root PRE_BUILT directory path"
@@ -292,6 +320,10 @@ class Config:
                 raise ValueError(
                     "TRT_CI_HF_CHECKPOINT_DIR must be an absolute, non-root path"
                 )
+        if self.edge_llm_cache_root is not None and not _safe_path(
+                PurePosixPath(self.edge_llm_cache_root)):
+            raise ValueError(
+                "TRT_CI_EDGE_LLM_CACHE_DIR must be an absolute, non-root path")
         if self.run_workspace_root is not None and not _safe_path(
                 self.run_workspace_root):
             raise ValueError(
@@ -337,6 +369,11 @@ class Config:
     @property
     def edgellm_root(self) -> Path:
         return self.source_root
+
+
+def _valid_compute_capability(value: str) -> bool:
+    major, separator, minor = value.partition(".")
+    return bool(separator and major.isdigit() and minor.isdigit())
 
 
 def _safe_path(path: PurePosixPath) -> bool:
@@ -413,10 +450,7 @@ def _cute_dsl_cmake_args(architecture: Arch) -> list[str]:
             "-DENABLE_CUTE_DSL=fmha;fmha_v2;ffpa;gdn;gemm;ssd",
             "-DCUTE_DSL_ARTIFACT_TAG=sm_110",
         ]
-    return [
-        "-DENABLE_CUTE_DSL=ffpa;fmha_v2;gdn;gemm;int4_fp16_gemm;ssd",
-        "-DCUTE_DSL_ARTIFACT_TAG=sm_86",
-    ]
+    return ["-DENABLE_CUTE_DSL=ffpa;fmha_v2;gdn;gemm;int4_fp16_gemm;ssd"]
 
 
 def build_targets(config: Config) -> list[ArtifactTarget]:
@@ -424,13 +458,13 @@ def build_targets(config: Config) -> list[ArtifactTarget]:
     platform_cmake_args = ([
         f"-DCMAKE_TOOLCHAIN_FILE={config.source_root}/cmake/aarch64_linux_toolchain.cmake",
         "-DEMBEDDED_TARGET=auto-thor",
-        "-DCUDA_DIR=/usr/local/cuda-13.2/targets/sbsa-linux",
-        "-DCUDA_TARGET_DIR=/usr/local/cuda-13.2/targets/sbsa-linux",
+        "-DCUDA_DIR=/usr/local/cuda/targets/sbsa-linux",
+        "-DCUDA_TARGET_DIR=/usr/local/cuda/targets/sbsa-linux",
     ] if config.architecture is Arch.D7L else [
         "-DCUDA_TARGET_DIR=/usr/local/cuda/targets/x86_64-linux"
     ])
     trt = ArtifactTarget(
-        component=BuildComponent.TRT,
+        component=TRT_COMPONENT,
         mode=BuildMode.RELEASE,
         branch=config.branch,
         source=ArtifactSource.PRE_BUILT,
@@ -440,7 +474,7 @@ def build_targets(config: Config) -> list[ArtifactTarget]:
     return [
         trt,
         ArtifactTarget(
-            component=BuildComponent.EDGELLM,
+            component=edgellm_code_manager.EDGELLM_COMPONENT,
             mode=BuildMode.RELEASE,
             branch=config.branch,
             source=ArtifactSource.BUILD,
@@ -465,8 +499,9 @@ def build_targets(config: Config) -> list[ArtifactTarget]:
 def _test_container_pattern(run_result: Any) -> ContainerPattern:
     if run_result.plan is None:
         raise FlowError("CodeManager result is missing its execution plan")
-    target = next((step.target for step in run_result.plan.steps
-                   if step.component is BuildComponent.EDGELLM), None)
+    target = next(
+        (step.target for step in run_result.plan.steps if _component_id(
+            step.component) == edgellm_code_manager.EDGELLM_COMPONENT), None)
     if target is None:
         raise FlowError("CodeManager result has no Edge-LLM build step")
     platform = target.platform
@@ -557,7 +592,7 @@ def _build_on_host(commands: Any, target: Any, edge: ArtifactTarget,
     artifacts = dict(run_result.step_artifacts)
     artifacts[step_id] = ArtifactResult(
         success=True,
-        component=BuildComponent.EDGELLM.value,
+        component=edgellm_code_manager.EDGELLM_COMPONENT,
         output_dir=edge.build.build_dir,
         log_file=edge.build.log_file,
     )
@@ -565,7 +600,7 @@ def _build_on_host(commands: Any, target: Any, edge: ArtifactTarget,
         run_result.plan,
         steps=[
             *run_result.plan.steps,
-            PlanStep(step_id, edge, BuildComponent.EDGELLM),
+            PlanStep(step_id, edge, edgellm_code_manager.EDGELLM_COMPONENT),
         ],
     )
     return dataclasses.replace(run_result, step_artifacts=artifacts, plan=plan)
@@ -590,7 +625,7 @@ def _runtime_artifacts(config: Config, commands: Any, run_result: Any) -> Any:
         return run_result
     artifacts = dict(run_result.step_artifacts)
     for step_id, artifact in artifacts.items():
-        if artifact.component != BuildComponent.TRT.value:
+        if _component_id(artifact.component) != TRT_COMPONENT:
             continue
         runtime_trt = config.local_root / "runtime-trt"
         result = commands.run(
@@ -601,6 +636,7 @@ def _runtime_artifacts(config: Config, commands: Any, run_result: Any) -> Any:
                     "rsync", "-a", "--delete", "--exclude=*.a",
                     f"{artifact.output_dir}/", f"{runtime_trt}/"
                 ],
+                cwd=str(config.edgellm_root),
                 timeout_s=_TRANSFER_TIMEOUT_S,
                 output_mode=OutputMode.PROGRESS,
                 artifact_log_file=str(config.local_root /
@@ -640,13 +676,18 @@ def _deploy(config: Config, code: Any, run_host: Host,
             nfs_export_path=(
                 PurePosixPath(deployment.metadata["jump_host_export_path"])
                 if "jump_host_export_path" in deployment.metadata else None),
+            edge_llm_cache_root=((workspace / "edge_llm_cache")
+                                 if config.edge_llm_cache_root is not None else None),
         )
 
     edge = PurePosixPath(str(config.edgellm_root))
     setup = code.write_environment_setup_script(
-        run_result, preferred_component=BuildComponent.EDGELLM)
+        run_result, preferred_component=edgellm_code_manager.EDGELLM_COMPONENT)
+    cache_root = (PurePosixPath(config.edge_llm_cache_root)
+                  if config.edge_llm_cache_root is not None else None)
     return Runtime(run_host.target, edge, edge, config.trt_location,
-                   config.onnx_root, PurePosixPath(setup))
+                   config.onnx_root, PurePosixPath(setup),
+                   edge_llm_cache_root=cache_root)
 
 
 def _download_hf_checkpoints(config: Config, commands: Any,
@@ -664,6 +705,7 @@ def _download_hf_checkpoints(config: Config, commands: Any,
                     "--local-dir",
                     str(config.hf_checkpoint_root / model.checkpoint_dir)
                 ],
+                cwd=str(config.edgellm_root),
                 timeout_s=_TRANSFER_TIMEOUT_S,
                 output_mode=OutputMode.PROGRESS,
                 artifact_log_file=str(config.local_root /
@@ -683,7 +725,7 @@ def _export_onnx(config: Config, code: Any, target: Any,
     assert config.hf_checkpoint_root is not None
     edge = PurePosixPath(str(config.edgellm_root))
     setup = code.write_environment_setup_script(
-        run_result, preferred_component=BuildComponent.EDGELLM)
+        run_result, preferred_component=edgellm_code_manager.EDGELLM_COMPONENT)
     result = code.command_manager.run(
         target,
         CommandSpec(
@@ -712,6 +754,7 @@ def _copy_onnx_cases(commands: Any, source_root: Path, destination_root: Path,
                     "rsync", "-a", "--delete", f"{source_root / model.name}/",
                     f"{destination_root / model.name}/"
                 ],
+                cwd=str(_SOURCE_ROOT),
                 timeout_s=_TRANSFER_TIMEOUT_S,
                 output_mode=OutputMode.PROGRESS,
                 artifact_log_file=str(log_root /
@@ -758,6 +801,23 @@ def _jump_host_remote_manager(commands: Any, run_host: Host, local_path: Path,
     return RemoteConnectionManager(config, command_manager=commands)
 
 
+def _stage_edge_llm_cache(config: Config, run_host: Host,
+                          runtime: Runtime) -> None:
+    if (run_host.remote is None or config.edge_llm_cache_root is None
+            or runtime.edge_llm_cache_root is None):
+        return
+    rouge_cache = config.edge_llm_cache_root / "rouge"
+    if not (rouge_cache / "rouge.py").is_file():
+        return
+    copied = run_host.remote.copy_local_directory_to_remote(
+        local_path=str(rouge_cache),
+        remote_path=str(runtime.edge_llm_cache_root / "rouge"),
+        timeout_s=_TRANSFER_TIMEOUT_S,
+    )
+    if not copied:
+        raise FlowError("Could not stage the EdgeLLM ROUGE cache")
+
+
 def _stage_onnx(config: Config, code: Any, run_host: Host,
                 runtime: Runtime) -> None:
     if run_host.remote is None or config.architecture is not Arch.D7L:
@@ -786,6 +846,12 @@ def _stage_onnx(config: Config, code: Any, run_host: Host,
         raise FlowError("Could not create the D7L ONNX staging directory")
     _copy_onnx_cases_to_remote(run_host.remote, source_root, runtime.onnx_root,
                                config.model_cases)
+
+
+def _edge_llm_cache_export(runtime: Runtime) -> str:
+    if runtime.edge_llm_cache_root is None:
+        return ""
+    return f"export EDGE_LLM_CACHE_DIR={shlex.quote(str(runtime.edge_llm_cache_root))}\n"
 
 
 def _run_tests(config: Config, code: Any, run_host: Host, run_result: Any,
@@ -819,6 +885,11 @@ def _run_tests(config: Config, code: Any, run_host: Host, run_result: Any,
                   read_only=True),
         MountSpec(str(_PYTHON_ROOT), str(_PYTHON_ROOT), read_only=True),
     ))
+    if runtime.edge_llm_cache_root is not None:
+        mounts.append(
+            MountSpec(str(runtime.edge_llm_cache_root),
+                      str(runtime.edge_llm_cache_root),
+                      read_only=True))
     extra_args = None
     if run_host.remote is not None:
         remote_mounts = [
@@ -920,6 +991,8 @@ def _test_command(config: Config, runtime: Runtime) -> str:
     return f"""set -euo pipefail
 source {q(str(runtime.env_script))}
 export EDGELLM_PLUGIN_PATH={q(str(plugin))}
+{_edge_llm_cache_export(runtime)}export HF_HOME={q(str(results / 'hf_home'))}
+export HF_MODULES_CACHE={q(str(results / 'hf_modules'))}
 {python_path}export LLM_SDK_DIR={q(str(runtime.edge))}
 export ONNX_DIR={q(str(runtime.onnx_root))}
 export ENGINE_DIR={q(str(runtime.workspace / 'engines'))}
@@ -953,6 +1026,11 @@ def _parser() -> argparse.ArgumentParser:
         "run_host",
         help="inline JSON object or JSON file path for the run host")
     parser.add_argument(
+        "--compute-capability",
+        help=("GPU compute capability used for CuTeDSL artifact selection, "
+              "for example 8.0, 8.9, or 11.0"),
+    )
+    parser.add_argument(
         "--no-trt-containers",
         action="store_true",
         help="run the EdgeLLM build and E2E tests without TRT containers",
@@ -984,6 +1062,14 @@ def _config(args: argparse.Namespace) -> Config:
         "CI_COMMIT_REF_NAME") or "main"
     if not branch or any(char in branch for char in "\r\n\0"):
         raise ValueError("invalid TRT_CI_BRANCH")
+    compute_capability = (args.compute_capability
+                          or ("11.0" if args.architecture is Arch.D7L else "8.0"))
+    if not _valid_compute_capability(compute_capability):
+        raise ValueError("compute capability must use major.minor format")
+    cache_dir = (os.environ.get("TRT_CI_EDGE_LLM_CACHE_DIR")
+                 or os.environ.get("EDGE_LLM_CACHE_DIR"))
+    if cache_dir is None and Path("/home/edge_llm_cache/rouge/rouge.py").is_file():
+        cache_dir = "/home/edge_llm_cache"
     onnx_dir = os.environ.get("TRT_CI_ONNX_DIR")
     if onnx_dir is None:
         raise ValueError("TRT_CI_ONNX_DIR must be set")
@@ -991,6 +1077,9 @@ def _config(args: argparse.Namespace) -> Config:
         raise ValueError("invalid TRT_CI_ONNX_DIR")
     hf_checkpoint_dir = os.environ.get("TRT_CI_HF_CHECKPOINT_DIR")
     workspace_root = os.environ.get("TRT_CI_RUN_WORKSPACE_ROOT")
+    if cache_dir is not None:
+        if not cache_dir or any(char in cache_dir for char in "\r\n\0"):
+            raise ValueError("invalid TRT_CI_EDGE_LLM_CACHE_DIR")
     if workspace_root is not None:
         if not workspace_root or any(char in workspace_root
                                      for char in "\r\n\0"):
@@ -1010,6 +1099,7 @@ def _config(args: argparse.Namespace) -> Config:
         run_host=read_ssh_config(args.run_host, "run_host"),
         run_id=args.run_id or uuid.uuid4().hex[:12],
         branch=branch,
+        compute_capability=compute_capability,
         onnx_root=PurePosixPath(onnx_dir),
         hf_checkpoint_root=(PurePosixPath(hf_checkpoint_dir)
                             if hf_checkpoint_dir is not None else None),
@@ -1017,6 +1107,7 @@ def _config(args: argparse.Namespace) -> Config:
         download_hf_checkpoint=args.download_hf_checkpoint,
         export_onnx=args.export_onnx,
         no_trt_containers=args.no_trt_containers,
+        edge_llm_cache_root=(Path(cache_dir) if cache_dir else None),
         run_workspace_root=(PurePosixPath(workspace_root)
                             if workspace_root is not None else None),
         model_cases=model_cases,
@@ -1076,12 +1167,20 @@ def main(argv: list[str] | None = None) -> int:
         remote_connection_manager=run_host.remote,
         enable_high_core_auto=False,
     )
+    edgellm_code_manager.EdgeLlmArtifactGenerator.register_with_code_manager(
+        code,
+        container_manager=containers,
+        default_exec_target=build_host.target,
+        gpu_selection=_gpu_selection_for_arch(config.architecture,
+                                               config.compute_capability),
+    )
     try:
         run_result = _build(config, code, build_host.target)
         _download_hf_checkpoints(config, commands, build_host.target)
         _export_onnx(config, code, build_host.target, run_result)
         runtime = _deploy(config, code, run_host, run_result)
         _stage_onnx(config, code, run_host, runtime)
+        _stage_edge_llm_cache(config, run_host, runtime)
         status = _run_tests(config, code, run_host, run_result, runtime,
                             logger)
     except FlowError as error:
