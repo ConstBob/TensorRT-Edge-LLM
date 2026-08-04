@@ -321,6 +321,26 @@ def _int4_groupwise_gemm_v2_translation(
 
 
 @script()
+def _nvfp4_a16_gemm_translation(
+    activation: onnxscript.FLOAT16,
+    qweights: onnxscript.INT8,
+    block_scales: onnxscript.INT8,
+    global_scale: onnxscript.FLOAT16,
+    gemm_n: int,
+    gemm_k: int,
+) -> onnxscript.FLOAT16:
+    return _trt_edgellm.Nvfp4A16GemmPlugin(
+        activation,
+        qweights,
+        block_scales,
+        global_scale,
+        gemm_n=gemm_n,
+        gemm_k=gemm_k,
+        max_m=0,
+    )
+
+
+@script()
 def _int8_sq_act_qdq_translation(
     hidden_states: onnxscript.FLOAT16,
     scale: onnxscript.FLOAT,
@@ -685,6 +705,47 @@ def _update_ssm_state_translation(
         _outputs=2,
     )
     return output, state_out
+
+
+@script()
+def _update_ssm_state_with_intermediate_translation(
+    hidden_states: onnxscript.FLOAT16,
+    ssm_a: onnxscript.FLOAT,
+    ssm_b: onnxscript.FLOAT16,
+    ssm_c: onnxscript.FLOAT16,
+    ssm_d: onnxscript.FLOAT16,
+    dt: onnxscript.FLOAT16,
+    dt_bias: onnxscript.FLOAT16,
+    state: onnxscript.FLOAT16,
+    context_lengths: onnxscript.INT32,
+    state_start_index: onnxscript.INT32,
+    spec_verify_phase_marker: onnxscript.INT32,
+    dt_softplus: int,
+    ngroups: int,
+    chunk_size: int = 0,
+) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT16, onnxscript.FLOAT,
+           onnxscript.FLOAT, onnxscript.FLOAT]:
+    # Spec-verify replay stash (dA / u / B) is FP32; the token output and state
+    # output follow the FP16 x/state types.
+    output, state_out, replay_da, replay_u, replay_b = _trt_edgellm.update_ssm_state(
+        hidden_states,
+        ssm_a,
+        ssm_b,
+        ssm_c,
+        ssm_d,
+        dt,
+        dt_bias,
+        state,
+        context_lengths,
+        state_start_index,
+        spec_verify_phase_marker,
+        dt_softplus=dt_softplus,
+        ngroups=ngroups,
+        chunk_size=chunk_size,
+        use_spec_verify_state=1,
+        _outputs=5,
+    )
+    return output, state_out, replay_da, replay_u, replay_b
 
 
 # ---------------------------------------------------------------------------
@@ -1158,6 +1219,8 @@ def build_custom_translation_table() -> dict:
         _int4_groupwise_gemm_translation,
         torch.ops.trt.int4_groupwise_gemm_v2.default:
         _int4_groupwise_gemm_v2_translation,
+        torch.ops.trt.nvfp4_a16_gemm.default:
+        _nvfp4_a16_gemm_translation,
         torch.ops.trt.int8_sq_act_qdq.default:
         _int8_sq_act_qdq_translation,
         torch.ops.trt.int8_sq_weight_dq.default:

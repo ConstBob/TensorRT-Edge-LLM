@@ -75,8 +75,8 @@ class MambaPlugin : public nvinfer1::IPluginV3,
                     public nvinfer1::IPluginV3OneRuntime
 {
 public:
-    MambaPlugin(
-        std::string const& name, int32_t dim, int32_t dstate, int32_t nheads, int32_t ngroups, int32_t dtSoftplus);
+    MambaPlugin(std::string const& name, int32_t dim, int32_t dstate, int32_t nheads, int32_t ngroups,
+        int32_t dtSoftplus, int32_t useSpecVerifyState = 0);
 
     MambaPlugin() = delete;
     MambaPlugin(MambaPlugin const&) = delete;
@@ -114,6 +114,11 @@ public:
     void setPluginNamespace(char const* pluginNamespace) noexcept;
 
 protected:
+    //! Plugin input/output counts depend on the spec-verify mode: it adds a trailing
+    //! ``spec_verify_phase_marker`` input and an ``intermediate_recurrent_states`` output.
+    int32_t numInputs() const noexcept;
+    int32_t numOutputs() const noexcept;
+
     std::string mLayerName;
     std::string mNamespace;
 
@@ -122,6 +127,8 @@ protected:
     int32_t mNheads{};
     int32_t mNgroups{};
     int32_t mDtSoftplus{};
+    //! MTP spec-verify: emit per-token intermediate recurrent states for accepted-token rollback.
+    int32_t mUseSpecVerifyState{};
 
     std::vector<nvinfer1::PluginField> mDataToSerialize;
     nvinfer1::PluginFieldCollection mFCToSerialize;

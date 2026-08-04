@@ -68,6 +68,10 @@ QUANT_FP16 = "fp16"
 QUANT_FP8 = "fp8"
 QUANT_MXFP8 = "mxfp8"
 QUANT_NVFP4 = "nvfp4"
+# Weight-only NVFP4 (W4A16): ModelOpt ``W4A16_NVFP4`` — 4-bit float weights,
+# FP16 activations. Distinct from QUANT_NVFP4 (W4A4); routed to the dense/MoE
+# Marlin FP16xE2M1 kernels.
+QUANT_NVFP4_A16 = "nvfp4_a16"
 QUANT_INT4_AWQ = "int4_awq"
 QUANT_INT4_AWQ_MODELOPT = "int4_awq_modelopt"
 QUANT_INT4_GPTQ = "int4_gptq"
