@@ -166,7 +166,7 @@ class Qwen3_5MoeForCausalLM(NetworkModule):
             result["spec_verify_phase_marker"] = (self.add_input(
                 "spec_verify_phase_marker", trt.int32,
                 (-1, )) if modern_hybrid_abi else None)
-            if cfg.dflash_tree_base:
+            if cfg.dflash_tree_base or cfg.mtp_tree_base:
                 if not modern_hybrid_abi:
                     raise RuntimeError(
                         "loaded hybrid operations do not support DDTree inputs"

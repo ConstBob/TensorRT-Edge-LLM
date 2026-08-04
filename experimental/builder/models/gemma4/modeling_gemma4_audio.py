@@ -104,10 +104,10 @@ class Gemma4AudioDepthwiseConv1d(Module):
     """Depthwise convolution used by the Gemma4 local-convolution block."""
 
     def forward(self, hidden):
-        kernel = self.weights.f16(self.key("weight"))
+        kernel = self.weights.fp16_parameter(self.key("weight"))
         return F.convolution(hidden,
                              kernel,
-                             self.weights.opt_f16(self.key("bias")),
+                             self.weights.opt_fp16_parameter(self.key("bias")),
                              groups=int(kernel.shape[0]))
 
 
@@ -116,8 +116,8 @@ class Gemma4AudioConv2d(Module):
 
     def forward(self, hidden):
         return F.convolution(hidden,
-                             self.weights.f16(self.key("weight")),
-                             self.weights.opt_f16(self.key("bias")),
+                             self.weights.fp16_parameter(self.key("weight")),
+                             self.weights.opt_fp16_parameter(self.key("bias")),
                              stride=(2, 2),
                              padding=(1, 1))
 
@@ -178,7 +178,8 @@ class Gemma4AudioLightConv1d(Module):
         first = hidden.slice_last_dim(0, width, 3)
         second = hidden.slice_last_dim(width, width, 3)
         hidden = (first * second.sigmoid()).transpose((0, 2, 1))
-        kernel = self.weights.f16(self.key("depthwise_conv1d.weight"))
+        kernel = self.weights.parameter_spec(
+            self.key("depthwise_conv1d.weight"))
         zero = hidden.slice_axis(2, 0, 1, 3) * np.float16(0.0)
         hidden = F.concatenate(
             tuple([zero] * (kernel.shape[-1] - 1)) + (hidden, ), 2)

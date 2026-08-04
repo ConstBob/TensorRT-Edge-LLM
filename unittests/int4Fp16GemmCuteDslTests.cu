@@ -341,7 +341,7 @@ std::vector<Int4GemmTestConfig> buildConfigs()
     INT4_FP16_GEMM_VARIANTS(ADD_VARIANT)
 #undef ADD_VARIANT
     // Extra edge-case shapes on the 16x128x64 tile.
-    v.push_back(Int4GemmTestConfig{200, 192, 256, 16, 128, 64, 4, 1, 1}); // M-residue (200 % 16 != 0), N=192
+    v.push_back(Int4GemmTestConfig{200, 160, 256, 16, 128, 64, 4, 1, 1}); // M and N residues; N % 64 != 0
     v.push_back(Int4GemmTestConfig{512, 256, 512, 16, 128, 64, 4, 1, 4}); // grouped-M swizzle = 4
     v.push_back(Int4GemmTestConfig{64, 128, 256, 16, 128, 64, 4, 2, 1});  // small low-M split-K shape
     return v;
@@ -367,10 +367,10 @@ TEST_P(Int4Fp16GemmCuteDslTest, CorrectnessVsFp32Reference)
     ASSERT_CUDA_OK(cudaDeviceGetAttribute(&smMinor, cudaDevAttrComputeCapabilityMinor, 0));
     int32_t const smVersion = smMajor * 10 + smMinor;
 
-    // N%64==0, K%64==0; a baked split_k is correct only when it divides
-    // ceil(K/bK) (split_k=1 always works); runs on Ampere or newer.
+    // N is predicated; K%64==0. A baked split_k is correct only when it
+    // divides ceil(K/bK) (split_k=1 always works); runs on Ampere or newer.
     bool const ok
-        = smVersion >= 80 && N % 64 == 0 && K % 64 == 0 && (cfg.splitK == 1 || ceilDiv(K, cfg.bK) % cfg.splitK == 0);
+        = smVersion >= 80 && N > 0 && K % 64 == 0 && (cfg.splitK == 1 || ceilDiv(K, cfg.bK) % cfg.splitK == 0);
     if (!ok)
     {
         GTEST_SKIP() << "Unsupported config";

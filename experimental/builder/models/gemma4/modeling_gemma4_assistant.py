@@ -19,8 +19,10 @@ from typing import Dict
 import numpy as np
 import tensorrt as trt
 
+from ...core import config as core_config
 from ...ops import Module, NetworkModule
 from ...ops import functional as F
+from .. import registry as model_registry
 from . import modeling_gemma4_layers as layers
 from . import modeling_gemma4_text
 
@@ -42,11 +44,8 @@ class Gemma4AssistantMaskedEmbedder(Module):
             )
         self.centroids = layers.Linear(ctx, self.key("centroids"))
 
-    def forward(self, hidden_states, lm_head_weight):
+    def forward(self, hidden_states, full_logits):
         cfg = self.cfg
-        full_logits = F.linear_with_weights(hidden_states,
-                                            lm_head_weight,
-                                            rank=3)
         ordering = self.weights.array(self.key("token_ordering"))
         cluster_ids = np.arange(cfg.num_centroids, dtype=np.int32).repeat(
             cfg.vocab_size // cfg.num_centroids)
@@ -77,24 +76,64 @@ class Gemma4AssistantMaskedEmbedder(Module):
 class Gemma4AssistantLMHead(Module):
     """Provider assistant output head with optional ordered-vocabulary mask."""
 
-    def __init__(self, ctx) -> None:
+    def __init__(self, ctx, projection=None) -> None:
         super().__init__(ctx, "model.embed_tokens")
-        self.weight = self.weights.f16(self.key("weight"))
+        self.projection = projection or layers.Linear(
+            ctx, ctx.weights.causal_lm_head_prefix())
         self.masked_embedding = (Gemma4AssistantMaskedEmbedder(
             ctx, "masked_embedding")
                                  if self.cfg.use_ordered_embeddings else None)
 
     def forward(self, hidden_states):
+        full_logits = self.projection(hidden_states)
         if self.masked_embedding is None:
-            return F.linear_with_weights(hidden_states, self.weight, rank=3)
-        return self.masked_embedding(hidden_states, self.weight)
+            return full_logits
+        return self.masked_embedding(hidden_states, full_logits)
 
 
 class Gemma4AssistantForCausalLM(NetworkModule):
     """Paired assistant that attends to the target model's KV cache."""
 
-    def __init__(self, ctx) -> None:
+    @classmethod
+    def from_config(cls, ctx):
+        try:
+            ctx.weights.causal_lm_head_prefix()
+        except KeyError:
+            pass
+        else:
+            return cls(ctx)
+
+        args = ctx.args
+        target_cfg = core_config.DeviceConfig.from_pretrained(
+            args.target_model_dir, tp_size=args.tp_size, tp_rank=args.tp_rank)
+        target_bundle = core_config.BundleConfig.from_pretrained(
+            args.target_model_dir)
+        conversion = model_registry.weight_conversion_for(
+            target_bundle.root_model_type)
+        target_weights = ctx.open_weights(
+            args.target_model_dir,
+            group_size=target_cfg.group_size,
+            quant=target_cfg.quant,
+            component="llm",
+            vocab_map=ctx.weights.vocab_map,
+            conversion=conversion,
+            int4_gemm_plugin_version=args.int4_gemm_plugin_version,
+            checkpoint_source="target",
+            tie_word_embeddings=target_cfg.tie_word_embeddings)
+        try:
+            target_context = ctx.with_checkpoint(target_cfg, target_weights)
+            projection = layers.Linear(target_context,
+                                       target_weights.causal_lm_head_prefix())
+            model = cls(ctx, lm_head=Gemma4AssistantLMHead(ctx, projection))
+        except Exception:
+            target_weights.close()
+            raise
+        model._target_weights = target_weights
+        return model
+
+    def __init__(self, ctx, lm_head=None) -> None:
         super().__init__(ctx)
+        self._target_weights = None
         cfg = ctx.cfg
         if cfg.backbone_hidden_size <= 0:
             raise ValueError("Gemma4 assistant requires backbone_hidden_size")
@@ -106,7 +145,7 @@ class Gemma4AssistantForCausalLM(NetworkModule):
         self.norm = modeling_gemma4_text.Gemma4RMSNorm(ctx, "model.norm",
                                                        cfg.rms_norm_eps)
         self.post_projection = layers.Linear(ctx, "post_projection")
-        self.lm_head = Gemma4AssistantLMHead(ctx)
+        self.lm_head = lm_head or Gemma4AssistantLMHead(ctx)
 
     def input_tensors(self) -> Dict[str, object]:
         cfg = self.cfg
@@ -156,6 +195,11 @@ class Gemma4AssistantForCausalLM(NetworkModule):
         logits = logits.reshape((-1, self.cfg.vocab_size))
         feedback = self.post_projection(hidden_states)
         return {"logits": logits, "hidden_states": feedback}
+
+    def close(self) -> None:
+        if self._target_weights is not None:
+            self._target_weights.close()
+            self._target_weights = None
 
 
 class Gemma4AssistantSharedKVAttention(modeling_gemma4_text.Gemma4TextAttention

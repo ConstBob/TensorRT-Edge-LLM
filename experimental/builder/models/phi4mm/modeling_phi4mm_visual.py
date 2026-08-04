@@ -222,7 +222,7 @@ class Phi4MultimodalVisionModel(NetworkModule):
         self.layers = [
             Phi4MultimodalVisionEncoderLayer(ctx, prefix, self.hidden_size,
                                              self.num_heads, eps, hidden_act)
-            for prefix in layers
+            for prefix in layers[:self.feature_index]
         ]
         self.projector = Phi4MultimodalImageProjection(ctx,
                                                        self.embeddings.side,
@@ -238,10 +238,7 @@ class Phi4MultimodalVisionModel(NetworkModule):
 
     def forward(self, pixels):
         hidden = self.embeddings(pixels)
-        feature = hidden if self.feature_index == 0 else None
-        for index, layer in enumerate(self.layers, 1):
+        for layer in self.layers:
             hidden = layer(hidden)
-            if index == self.feature_index:
-                feature = hidden
-        output = self.projector(feature)
+        output = self.projector(hidden)
         return {"output": output.reshape((-1, int(output.shape[-1])))}

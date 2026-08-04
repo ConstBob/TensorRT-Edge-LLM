@@ -51,8 +51,8 @@ int32_t cuteDslInt4NumVariants();
 //! Variant at table index [0, cuteDslInt4NumVariants()).
 CuteDslInt4Variant const& cuteDslInt4VariantAt(int32_t index);
 
-//! True if this variant can serve a (N, K) problem: N%64==0, K%64==0, and splitK
-//! divides ceil(K/bK). (bN is always 128.)
+//! True if this variant can serve a positive (N, K) problem where K%64==0 and
+//! splitK divides ceil(K/bK). (bN is always 128; N residue is predicated.)
 bool cuteDslInt4VariantValid(CuteDslInt4Variant const& v, int32_t N, int32_t K);
 
 //! Load all cuteDSL kernel modules once (handle-checked). Returns false on any

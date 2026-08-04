@@ -25,6 +25,7 @@ from . import safetensors_np
 
 QUANT_FP16 = "fp16"
 QUANT_FP8 = "fp8"
+QUANT_FP8_BLOCK = "fp8_block"
 QUANT_MXFP8 = "mxfp8"
 QUANT_NVFP4 = "nvfp4"
 QUANT_INT4_AWQ = "int4_awq"
@@ -36,6 +37,7 @@ QUANT_MIXED = "mixed_precision"
 QUANT_TYPES = frozenset((
     QUANT_FP16,
     QUANT_FP8,
+    QUANT_FP8_BLOCK,
     QUANT_MXFP8,
     QUANT_NVFP4,
     QUANT_INT4_AWQ,
@@ -181,9 +183,15 @@ def parse_quantization(model_dir: str,
                                 if embedded.get("kv_cache_scheme") else None),
                 excluded=tuple(sorted(set(excluded))),
             )
+        raise ValueError(
+            "unsupported compressed-tensors checkpoint format: "
+            f"{', '.join(value or '<missing>' for value in formats)}")
 
     algorithm = str(embedded.get("quant_algo") or "").upper()
     if not algorithm:
+        if method:
+            raise ValueError(
+                f"unsupported checkpoint quantization method {method!r}")
         return QuantConfig()
     quant_type = algorithm_to_type(algorithm)
     group_size = int(embedded.get("group_size", 1))
@@ -196,6 +204,9 @@ def parse_quantization(model_dir: str,
         group_size = 16
     if quant_type == QUANT_MXFP8 and group_size == 1:
         group_size = 32
+    if quant_type in (QUANT_INT4_AWQ,
+                      QUANT_INT4_AWQ_MODELOPT) and group_size == 1:
+        group_size = 128
     return QuantConfig(
         quant_type=quant_type,
         group_size=group_size,
@@ -209,12 +220,22 @@ def parse_quantization(model_dir: str,
 def algorithm_to_type(algorithm: str) -> str:
     """Map checkpoint algorithm names to direct-builder precision names."""
     algorithm = str(algorithm).upper()
-    if "FP8_PB" in algorithm or "MXFP8" in algorithm:
+    if "FP8_PB" in algorithm:
+        return QUANT_FP8_BLOCK
+    if "MXFP4" in algorithm:
+        raise ValueError(
+            f"unsupported checkpoint quantization algorithm {algorithm!r}: "
+            "MXFP4 weight layouts are not implemented")
+    if "NVFP4" in algorithm:
+        return QUANT_NVFP4
+    if "MXFP8" in algorithm:
         return QUANT_MXFP8
     if "FP8" in algorithm:
         return QUANT_FP8
-    if "FP4" in algorithm or "NVFP4" in algorithm:
-        return QUANT_NVFP4
+    if "FP4" in algorithm:
+        raise ValueError(
+            f"unsupported checkpoint quantization algorithm {algorithm!r}: "
+            "only NVFP4 weight layouts are implemented")
     if "W4A16" in algorithm and "AWQ" in algorithm:
         return QUANT_INT4_AWQ_MODELOPT
     if "AWQ" in algorithm or "INT4_AWQ" in algorithm:
@@ -223,7 +244,10 @@ def algorithm_to_type(algorithm: str) -> str:
         return QUANT_INT4_GPTQ
     if "W8A8" in algorithm or "INT8" in algorithm:
         return QUANT_INT8_SQ
-    return QUANT_FP16
+    if not algorithm:
+        return QUANT_FP16
+    raise ValueError(
+        f"unsupported checkpoint quantization algorithm {algorithm!r}")
 
 
 def _parse_mixed_precision(

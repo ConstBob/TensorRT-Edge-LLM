@@ -22,6 +22,7 @@ from . import contracts
 
 LLM_COMPONENTS = frozenset((
     contracts.Component.LLM,
+    contracts.Component.DLLM,
     contracts.Component.TALKER,
     contracts.Component.CODE_PREDICTOR,
 ))
@@ -58,7 +59,22 @@ class BundleConfig:
     @property
     def components(self) -> FrozenSet[contracts.Component]:
         """Return engine components present in the checkpoint."""
-        return contracts.available_components(self.root_model_type)
+        registered = contracts.available_components(self.root_model_type)
+        from ..models import registry as model_registry
+        configuration = model_registry.configuration_module_for(
+            self.root_model_type)
+        resolve = getattr(configuration, "available_components", None)
+        if resolve is None:
+            return registered
+        available = frozenset(resolve(self.root, registered))
+        unexpected = available - registered
+        if unexpected:
+            names = ", ".join(
+                sorted(component.value for component in unexpected))
+            raise ValueError(
+                f"{self.root_model_type} declared unregistered components: "
+                f"{names}")
+        return available
 
     def component_dict(self, component: contracts.Component) -> Dict[str, Any]:
         """Return the configuration dictionary for one component."""

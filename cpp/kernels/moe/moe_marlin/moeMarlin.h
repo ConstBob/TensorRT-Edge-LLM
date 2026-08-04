@@ -26,7 +26,7 @@
  * - Dequantization: weight_fp16 = (weight_int4 - 8) * scale
  *
  * Note: Weight repacking (AWQ -> Marlin format) should be done in Python
- * using the awq_marlin_repack utility. This interface expects pre-swizzled
+ * using the awq_marlin_repack utility. This interface expects Marlin-packed
  * weights in Marlin format.
  */
 
@@ -49,7 +49,7 @@ namespace kernel
  *
  * Dequantization: weight_fp16 = (weight_int4 - 8) * scale
  *
- * Note: Weights must be pre-swizzled into Marlin format using awq_marlin_repack.
+ * Note: Weights must be transformed into Marlin format using awq_marlin_repack.
  *
  * Internally uses FP32 reduction for numerical accuracy. The workspace buffer
  * must be sized using getMoeMarlinWorkspaceSize() which includes space for both

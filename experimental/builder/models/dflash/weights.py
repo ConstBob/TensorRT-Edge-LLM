@@ -15,9 +15,10 @@
 """DFlash draft checkpoint weight mapping."""
 
 
-def runtime_embedding_model_dir(args) -> str:
-    """Use the paired target checkpoint for the shared embedding sidecar."""
-    return args.target_model_dir
+def writes_runtime_embedding(args) -> bool:
+    """DFlash reuses the base model's runtime embedding table."""
+    del args
+    return False
 
 
 def resolve_candidates(name: str, *, component: str, spec_type: str,

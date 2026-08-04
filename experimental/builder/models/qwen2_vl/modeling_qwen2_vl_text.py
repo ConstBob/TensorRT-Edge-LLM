@@ -21,6 +21,7 @@ import tensorrt as trt
 
 from ...ops import BuildContext, Linear, Module, NetworkModule
 from ...ops import functional as F
+from ...ops import pack_qkv
 
 LOGGER = logging.getLogger("builder.qwen2_vl.text")
 
@@ -75,9 +76,10 @@ class Qwen2VLAttention(Module):
         sliding_window = (-1 if self.cfg.attention_type(
             self.layer_index) != "sliding_attention" else
                           self.cfg.sliding_window_size)
-        qkv = F.concatenate(
-            (self.q_proj(hidden_states), self.k_proj(hidden_states),
-             self.v_proj(hidden_states)), 2)
+        query = self.q_proj(hidden_states)
+        key = self.k_proj(hidden_states)
+        value = self.v_proj(hidden_states)
+        qkv = pack_qkv(query, key, value, self.v_proj)
         attention, present = F.attention(
             qkv,
             past_key_value,

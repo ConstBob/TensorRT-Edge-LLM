@@ -113,20 +113,51 @@ void validateDFlashTreeMetadataBindings(DeploymentConfig const& deployment, Engi
             + "'. Re-export the base model with --dflash-tree-base, then rebuild spec_base.engine.");
 }
 
+void validateMtpTreeMetadataBindings(DeploymentConfig const& deployment, EngineExecutor const& baseExecutor)
+{
+    if (!deployment.specConfig.has_value() || deployment.specDecodeMode() != SpecDecodeMode::kMTP
+        || deployment.base.numLinearAttnLayers == 0)
+    {
+        return;
+    }
+
+    bool const hasTreeParentIds = baseExecutor.hasIOTensor(binding_names::kTreeParentIds);
+    bool const hasTreeDepths = baseExecutor.hasIOTensor(binding_names::kTreeDepths);
+    bool const usesDDTree = deployment.specConfig->draftingTopK > 1;
+    ELLM_CHECK(hasTreeParentIds == hasTreeDepths,
+        std::string("MTP tree-base engine must expose both INT32 tree metadata bindings '")
+            + binding_names::kTreeParentIds + "' and '" + binding_names::kTreeDepths + "'.");
+    if (hasTreeParentIds)
+    {
+        ELLM_CHECK(baseExecutor.getBindingDataType(binding_names::kTreeParentIds) == DataType::kINT32
+                && baseExecutor.getBindingDataType(binding_names::kTreeDepths) == DataType::kINT32,
+            std::string("MTP tree-base engine tree metadata bindings must be INT32: '") + binding_names::kTreeParentIds
+                + "' and '" + binding_names::kTreeDepths + "'.");
+    }
+    ELLM_CHECK(usesDDTree == hasTreeParentIds,
+        usesDDTree ? "Hybrid MTP DDTree requires a tree-base engine. Rebuild with --tree-base before using "
+                     "--specDraftTopK > 1."
+                   : "Hybrid MTP base engine was built with --tree-base, but runtime is configured for linear MTP. "
+                     "Use --specDraftTopK > 1, or rebuild without --tree-base.");
+}
+
 } // namespace
 
 LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
     std::unordered_map<std::string, std::string> const& loraWeightsMap, SpecDecodeDraftingConfig const& draftingConfig,
-    cudaStream_t stream, ContextCacheConfig const& contextCacheConfig)
+    cudaStream_t stream, ContextCacheConfig const& contextCacheConfig, std::string const& checkpointDir,
+    std::string const& draftCheckpointDir)
 {
-    initializeCommon(engineDir, multimodalEngineDir, loraWeightsMap, draftingConfig, stream, contextCacheConfig);
+    initializeCommon(engineDir, multimodalEngineDir, loraWeightsMap, draftingConfig, stream, contextCacheConfig,
+        checkpointDir, draftCheckpointDir);
 }
 
 LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
     std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream,
-    ContextCacheConfig const& contextCacheConfig)
+    ContextCacheConfig const& contextCacheConfig, std::string const& checkpointDir)
 {
-    initializeCommon(engineDir, multimodalEngineDir, loraWeightsMap, std::nullopt, stream, contextCacheConfig);
+    initializeCommon(
+        engineDir, multimodalEngineDir, loraWeightsMap, std::nullopt, stream, contextCacheConfig, checkpointDir, "");
 }
 
 LLMInferenceRuntime::~LLMInferenceRuntime() noexcept
@@ -141,26 +172,43 @@ LLMInferenceRuntime::~LLMInferenceRuntime() noexcept
 void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::string const& multimodalEngineDir,
     std::unordered_map<std::string, std::string> const& loraWeightsMap,
     std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream,
-    ContextCacheConfig const& contextCacheConfig)
+    ContextCacheConfig const& contextCacheConfig, std::string const& checkpointDir,
+    std::string const& draftCheckpointDir)
 {
-    // -----------------------------------------------------------------------
-    // 1. Load shared embedding table (shared between base and draft models).
-    // -----------------------------------------------------------------------
-    std::filesystem::path const embeddingPath = std::filesystem::path(engineDir) / "embedding.safetensors";
-    mEmbedding = loadEmbeddingTable(embeddingPath, stream);
-
-    // -----------------------------------------------------------------------
-    // 2. Parse engine configurations and attach user drafting (bundle factory
-    //    performs cross-engine consistency and drafting-vs-capacity checks).
-    // -----------------------------------------------------------------------
     std::filesystem::path const engineDirPath{engineDir};
     std::filesystem::path const baseConfigPath
         = draftingConfig.has_value() ? engineDirPath / "base_config.json" : engineDirPath / "config.json";
+    mCheckpointDir = checkpointDir;
+    mDraftCheckpointDir = draftCheckpointDir;
+
+    // Finish checkpoint reads and weight conversion before any engine can run.
+    ExternalWeightManager preparedWeights;
+    preparedWeights.load(engineDirPath, baseConfigPath, stream, mCheckpointDir);
+    if (auto embedding = preparedWeights.takeEmbedding())
+    {
+        mEmbedding.table = std::move(*embedding);
+    }
+    else
+    {
+        mEmbedding = loadEmbeddingTable(engineDirPath / "embedding.safetensors", stream);
+    }
+    auto pleEmbedding = preparedWeights.takePleEmbedding();
+
+    // -----------------------------------------------------------------------
+    // 3. Parse engine configurations and attach user drafting (bundle factory
+    //    performs cross-engine consistency and drafting-vs-capacity checks).
+    // -----------------------------------------------------------------------
     std::optional<std::filesystem::path> const draftConfigPath = draftingConfig.has_value()
         ? std::optional<std::filesystem::path>{engineDirPath / "draft_config.json"}
         : std::nullopt;
 
     mDeployment = createDeploymentConfig(baseConfigPath, draftConfigPath, draftingConfig);
+    if (draftingConfig.has_value() && mDeployment.specDecodeMode() == SpecDecodeMode::kMTP)
+    {
+        ELLM_CHECK(mDraftCheckpointDir.empty(),
+            "Native MTP draft weights are part of --checkpointDir; do not pass --draftCheckpointDir.");
+        mDraftCheckpointDir = mCheckpointDir;
+    }
     std::optional<ContextCacheDeploymentKind> contextCacheDeploymentKind;
     if (contextCacheConfig.enabled)
     {
@@ -197,6 +245,7 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     // -----------------------------------------------------------------------
     validateAgainstEngine(mDeployment.base, *mBaseExecutor, "base");
     validateDFlashTreeMetadataBindings(mDeployment, *mBaseExecutor);
+    validateMtpTreeMetadataBindings(mDeployment, *mBaseExecutor);
 
     // Validate the draft engine ABI before its sidecar geometry is used to allocate
     // physical cache resources. Ownership is transferred to the selected decoder.
@@ -229,11 +278,7 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
         mSharedResources = SharedResources::createForLLM(mDeployment.base, loraWeightsMap, stream);
         mPipelineIO = std::make_unique<PipelineIO>(PipelineIO::createForLLM(mDeployment.base, stream));
     }
-    // Externalized model weights: the SharedResources factory only allocates an
-    // empty manager. Load external weights and validate against engine inputs.
-    // This handles the base engine; the spec-decode draft engine loads its own
-    // external weights from draft_config.json inside the EAGLE/MTP decoder.
-    mSharedResources->externalWeightManager->load(std::filesystem::path(engineDir), baseConfigPath, stream);
+    *mSharedResources->externalWeightManager = std::move(preparedWeights);
     mSharedResources->externalWeightManager->validateAgainstEngine(*mBaseExecutor, "base");
 
     // -----------------------------------------------------------------------
@@ -372,7 +417,7 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     {
         int32_t const maxPleSeqLen = std::max(maxInputLength, std::max(1, mDeployment.base.maxVerifyTreeSize));
         mGemma4Ple = std::make_unique<Gemma4EmbeddingPreprocessor>(std::filesystem::path(engineDir), mDeployment.base,
-            mMaxRuntimeBatchSize, maxPleSeqLen, mBaseTensorMap, stream);
+            mMaxRuntimeBatchSize, maxPleSeqLen, mBaseTensorMap, stream, std::move(pleEmbedding));
     }
     LOG_INFO("Runtime tensors successfully allocated.");
 
@@ -430,27 +475,28 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     // -----------------------------------------------------------------------
     if (!multimodalEngineDir.empty())
     {
-        auto tryLoadRunner = [&](std::string const& dir, std::string const& name) -> std::unique_ptr<MultimodalRunner> {
-            try
+        // A missing engine file means the deployment simply has no such
+        // encoder. One that is present but fails to load is fatal: continuing
+        // would answer image and audio prompts from the text tokens alone.
+        auto loadRunner = [&](std::string const& dir, std::string const& engineFile,
+                              std::string const& name) -> std::unique_ptr<MultimodalRunner> {
+            if (!std::filesystem::exists(std::filesystem::path(dir) / engineFile))
             {
-                LOG_DEBUG("Attempting to load %s runner from %s", name.c_str(), dir.c_str());
-                auto runner = MultimodalRunner::create(
-                    dir, mDeployment.base.maxSupportedBatchSize, mDeployment.base.maxKVCacheCapacity, stream);
-                LOG_INFO("%s runner successfully initialized", name.c_str());
-                return runner;
-            }
-            catch (std::exception const& e)
-            {
-                LOG_WARNING("Failed to load %s runner from %s: %s", name.c_str(), dir.c_str(), e.what());
+                LOG_DEBUG("No %s engine at %s/%s", name.c_str(), dir.c_str(), engineFile.c_str());
                 return nullptr;
             }
+            LOG_DEBUG("Attempting to load %s runner from %s", name.c_str(), dir.c_str());
+            auto runner = MultimodalRunner::create(dir, mDeployment.base.maxSupportedBatchSize,
+                mDeployment.base.maxKVCacheCapacity, stream, checkpointDir);
+            LOG_INFO("%s runner successfully initialized", name.c_str());
+            return runner;
         };
 
-        mAudioRunner = tryLoadRunner(multimodalEngineDir + "/audio", "Audio");
-        mVisionRunner = tryLoadRunner(multimodalEngineDir + "/visual", "Visual");
+        mAudioRunner = loadRunner(multimodalEngineDir + "/audio", "audio_encoder.engine", "Audio");
+        mVisionRunner = loadRunner(multimodalEngineDir + "/visual", "visual.engine", "Visual");
         if (!mVisionRunner)
         {
-            mVisionRunner = tryLoadRunner(multimodalEngineDir, "Vision");
+            mVisionRunner = loadRunner(multimodalEngineDir, "visual.engine", "Vision");
         }
 
         // At least one multimodal runner must be available
@@ -461,7 +507,7 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
         {
             std::string actionDir = multimodalEngineDir + "/action";
             LOG_INFO("Attempting to load Action runner from %s", actionDir.c_str());
-            mActionRunner = std::make_unique<Alpamayo1ActionRunner>(actionDir, stream,
+            mActionRunner = std::make_unique<Alpamayo1ActionRunner>(actionDir, checkpointDir, stream,
                 mSharedResources->cacheManagers[0]->getKVCacheManager().getConfig(),
                 mSharedResources->kvPageTables[0]->isIdentity());
             LOG_INFO("Alpamayo 1 action expert loaded.");
@@ -600,8 +646,8 @@ void LLMInferenceRuntime::buildDecodingRuntimeContext()
         mHostPackedTokenIds, mHostSelectedTokenIds};
     LogprobsBuffers logprobs{
         mDeviceLogprobsValues, mDeviceLogprobsIndices, mHostLogprobsValues, mHostLogprobsIndices, mGatheredLogits};
-    mDecodingRuntimeContext.reset(new DecodingRuntimeContext{mDeployment, mMaxRuntimeBatchSize, baseResources,
-        preprocessResources, *mTokenizer, mLogitBias, sampling, logprobs});
+    mDecodingRuntimeContext.reset(new DecodingRuntimeContext{mDeployment, mMaxRuntimeBatchSize, mCheckpointDir,
+        mDraftCheckpointDir, baseResources, preprocessResources, *mTokenizer, mLogitBias, sampling, logprobs});
 }
 
 void LLMInferenceRuntime::setActionNoiseSeed(int32_t seed) noexcept
@@ -835,6 +881,11 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
             ELLM_CHECK(reserve > 0 && reserve <= static_cast<int64_t>(std::numeric_limits<int32_t>::max()),
                 "EAGLE KV-cache working-set reserve exceeds int32");
             kvcReserve = static_cast<int32_t>(reserve);
+        }
+        else if (decodingStrategy.kind() == DecodingStrategyKind::kDSpark)
+        {
+            ELLM_CHECK(mDeployment.specConfig.has_value(), "DSpark decoding requires speculative configuration");
+            kvcReserve = mDeployment.specConfig->verifySize;
         }
     }
 
@@ -1382,6 +1433,13 @@ bool LLMInferenceRuntime::validateRequestConfig(LLMGenerationRequest const& requ
     {
         LOG_ERROR(
             "Requested batch size %d exceeds maximum supported batch size %d", activeBatchSize, mMaxRuntimeBatchSize);
+        return false;
+    }
+    if (request.disableSpecDecode && mDeployment.specDecodeMode() == SpecDecodeMode::kGemma4MTP)
+    {
+        LOG_ERROR(
+            "disable_spec_decode is not supported by a Gemma4 MTP verification engine. Use the matched assistant, or "
+            "build a standalone target engine for target-only inference.");
         return false;
     }
     for (int32_t i = 0; i < activeBatchSize; ++i)

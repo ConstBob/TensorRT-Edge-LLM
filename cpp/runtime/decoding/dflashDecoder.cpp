@@ -184,6 +184,10 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
             mRuntime.base.sharedResources.ropePool.getOrCreate(
                 draftCfg.ropeConfig, draftCfg.rotaryDim, baseCfg.maxKVCacheCapacity, nullptr));
     }
+    mDraftExternalWeightManager.load(
+        engineDir, engineDir / "draft_config.json", stream, mRuntime.draftCheckpointDir, mRuntime.checkpointDir);
+    mDraftExternalWeightManager.validateAgainstEngine(*mDraftExecutor, "dflash_draft");
+    mDraftExternalWeightManager.registerTensorMapEntries(mDraftTensorMap);
 
     mDraftTokenIds
         = Tensor({maxBatch, mBlockSize}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "DFlashDraft::tokenIds");

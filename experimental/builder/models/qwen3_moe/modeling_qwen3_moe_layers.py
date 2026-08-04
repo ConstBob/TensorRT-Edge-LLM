@@ -19,6 +19,7 @@ from typing import Tuple
 from ...core import quantization
 from ...ops import BuildContext, Linear, Module, RMSNorm, Tensor
 from ...ops import functional as F
+from ...ops import pack_qkv
 from . import weights as weight_conversion
 
 __all__ = [
@@ -45,24 +46,28 @@ class Qwen3MoeAttention(Module):
                     hidden_states: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """Apply the three Transformers projections or their GPTQ fusion."""
         projections = (self.q_proj, self.k_proj, self.v_proj)
-        can_fuse = (self.ctx.backend == "edgellm" and all(
-            projection.quant_type() == quantization.QUANT_INT4_GPTQ
-            for projection in projections)
-                    and not any(projection.has_adapter()
-                                for projection in projections))
-        if not can_fuse:
-            return tuple(
-                projection(hidden_states) for projection in projections)
-
-        descriptor = weight_conversion.fuse_gptq_qkv(
-            tuple(projection.weight_descriptor()
-                  for projection in projections))
-        packed = F.linear_from_weights(hidden_states,
-                                       descriptor,
-                                       name=self.key("qkv_proj"))
+        plugin_version = self.ctx.options.int4_gemm_plugin_version
         cfg = self.cfg
         query_size = cfg.num_attention_heads * cfg.head_dim
         key_value_size = cfg.num_key_value_heads * cfg.head_dim
+        can_attempt_fusion = (
+            self.ctx.backend == "edgellm"
+            and all(projection.quant_type() == quantization.QUANT_INT4_GPTQ
+                    for projection in projections)
+            and not any(projection.has_adapter() for projection in projections)
+            and (plugin_version == 1 or
+                 (query_size % 128 == 0 and key_value_size % 128 == 0)))
+        if not can_attempt_fusion:
+            return tuple(
+                projection(hidden_states) for projection in projections)
+
+        descriptors = tuple(projection.weight_descriptor()
+                            for projection in projections)
+        descriptor = weight_conversion.fuse_gptq_qkv(descriptors,
+                                                     plugin_version)
+        packed = F.linear_from_weights(hidden_states,
+                                       descriptor,
+                                       name=self.key("qkv_proj"))
         return (packed[..., :query_size],
                 packed[..., query_size:query_size + key_value_size],
                 packed[..., query_size + key_value_size:query_size +
@@ -89,7 +94,7 @@ class Qwen3MoeAttention(Module):
         k = self.k_norm(k4, rank=4).reshape(
             (0, 0, cfg.num_key_value_heads * cfg.head_dim))
 
-        qkv = F.concatenate((q, k, v), 2)
+        qkv = pack_qkv(q, k, v, self.v_proj)
         attn, present_key_value = F.attention(
             qkv,
             past_key_value,

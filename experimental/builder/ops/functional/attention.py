@@ -37,8 +37,12 @@ def attention(
     sliding_window_size: int = -1,
     enable_fp8_kv_cache: bool = False,
     qkv_scales: Sequence[float] = (1.0, 1.0, 1.0),
+    q_norm_gamma: Optional[Tensor] = None,
+    k_norm_gamma: Optional[Tensor] = None,
+    rms_norm_eps: float = 1e-6,
     attention_scale: Optional[float] = None,
     enable_kv_shared: bool = False,
+    context_mask_selector: Optional[Tensor] = None,
     vision_block_ids: Optional[Tensor] = None,
     attention_mask: Optional[Tensor] = None,
     attention_pos_id: Optional[Tensor] = None,
@@ -52,6 +56,12 @@ def attention(
     if (attention_mask is None) != (attention_pos_id is None):
         raise ValueError(
             "attention_mask and attention_pos_id must be supplied together")
+    if (q_norm_gamma is None) != (k_norm_gamma is None):
+        raise ValueError(
+            "q_norm_gamma and k_norm_gamma must be supplied together")
+    enable_qk_norm = q_norm_gamma is not None
+    if enable_qk_norm and enable_kv_shared:
+        raise ValueError("QK normalization is not supported with shared KV")
     if vision_block_ids is not None and attention_mask is not None:
         raise ValueError(
             "vision-block attention and tree attention are mutually exclusive")
@@ -61,8 +71,9 @@ def attention(
         "num_kv_heads": num_kv_heads,
         "head_size": head_size,
         "enable_tree_attention": int(attention_mask is not None),
-        "enable_qk_norm": 0,
+        "enable_qk_norm": int(enable_qk_norm),
         "enable_kv_shared": int(enable_kv_shared),
+        "enable_context_mask_selector": int(context_mask_selector is not None),
         "enable_fp8_kv_cache": int(enable_fp8_kv_cache),
         "enable_vision_block_attention": int(vision_block_ids is not None),
         "sliding_window_size": sliding_window_size,
@@ -70,10 +81,16 @@ def attention(
     }
     if attention_scale is not None:
         attributes["attention_scale"] = attention_scale
+    if enable_qk_norm:
+        attributes["rms_norm_eps"] = rms_norm_eps
     inputs = [
         qkv, past_kv, context_lengths, rope_cos_sin, kvcache_start_index,
         kv_page_table
     ]
+    if enable_qk_norm:
+        inputs.extend((q_norm_gamma, k_norm_gamma))
+    if context_mask_selector is not None:
+        inputs.append(context_mask_selector)
     if attention_mask is not None:
         inputs.extend((attention_mask, attention_pos_id))
     if vision_block_ids is not None:

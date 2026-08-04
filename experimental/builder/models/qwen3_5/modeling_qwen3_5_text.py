@@ -101,7 +101,7 @@ class Qwen3_5ForCausalLM(NetworkModule):
                             "model.norm",
                             ctx.cfg.rms_norm_eps,
                             unit_offset=True)
-        self.lm_head = Linear(ctx, "lm_head")
+        self.lm_head = Linear(ctx, ctx.weights.causal_lm_head_prefix())
 
     def input_tensors(self) -> Dict[str, object]:
         cfg = self.cfg
@@ -165,7 +165,7 @@ class Qwen3_5ForCausalLM(NetworkModule):
             result["spec_verify_phase_marker"] = (self.add_input(
                 "spec_verify_phase_marker", trt.int32,
                 (-1, )) if modern_hybrid_abi else None)
-            if cfg.dflash_tree_base:
+            if cfg.dflash_tree_base or cfg.mtp_tree_base:
                 if not modern_hybrid_abi:
                     raise RuntimeError(
                         "loaded hybrid operations do not support DDTree inputs"

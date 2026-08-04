@@ -22,6 +22,7 @@ import tensorrt as trt
 
 from ...ops import Module, NetworkModule
 from ...ops import functional as F
+from ...ops import pack_qkv
 from . import modeling_gemma4_layers as layers
 from . import weights as weight_conversion
 
@@ -110,8 +111,8 @@ class Gemma4TextAttention(Module):
                     (0, 0, self.num_kv_heads * self.head_dim))
         sliding_window = (cfg.sliding_window_size if self.attention_type
                           == "sliding_attention" else -1)
-        qkv = (query if self.is_kv_shared else F.concatenate(
-            (query, key, value), 2))
+        qkv = (query if self.is_kv_shared else pack_qkv(
+            query, key, value, self.v_proj or self.k_proj))
         attention, present = F.attention(
             qkv,
             past_key_value,
@@ -136,6 +137,14 @@ class Gemma4TextAttention(Module):
 class Gemma4TextExperts(Module):
     """Gemma expert weights in HF-stacked or quantizer-split layout."""
 
+    def _has_packed_nvfp4(self) -> bool:
+        return self.weights.is_nvfp4(self.key("0.up_proj"))
+
+    def plugin_intermediate_size(self) -> int:
+        alignment = 128 if self.ctx.options.sm12x else 64
+        size = self.cfg.moe_intermediate_size
+        return ((size + alignment - 1) // alignment) * alignment
+
     def load_expert_dense(self, expert_index: int) -> dict:
         gate_up_key = self.key("gate_up_proj")
         down_key = self.key("down_proj")
@@ -158,28 +167,72 @@ class Gemma4TextExperts(Module):
             self.weights.expert_dense_f32(f"{expert_prefix}.down_proj"),
         }
 
-    def packed_weights(self) -> dict:
+    def load_expert_raw_nvfp4(self, expert_index: int) -> dict:
+        """Load one provider-packed Gemma expert without decoding it."""
+        expert_prefix = self.key(str(expert_index))
+        return {
+            projection:
+            self.weights.expert_raw_nvfp4(f"{expert_prefix}.{projection}_proj")
+            for projection in ("gate", "up", "down")
+        }
+
+    def parameters(self, correction_key: str):
         cfg = self.cfg
         layout = "concat" if self.ctx.options.sm12x else "interleave"
-        (fc1, fc1_scale, fc1_alpha, fc2, fc2_scale,
-         fc2_alpha) = weight_conversion.repack_nvfp4_experts(
-             self.load_expert_dense,
-             cfg.num_experts,
-             cfg.hidden_size,
-             cfg.moe_intermediate_size,
-             cfg.group_size,
-             fc1_layout=layout,
-         )
-        return {
-            "fc1_qweights": fc1,
-            "fc1_blocks_scale": fc1_scale,
-            "fc1_alpha": fc1_alpha,
-            "fc2_qweights": fc2,
-            "fc2_blocks_scale": fc2_scale,
-            "fc2_alpha": fc2_alpha,
-            "input_global_scale": np.ones(cfg.num_experts, np.float32),
-            "down_input_scale": np.ones(cfg.num_experts, np.float32),
-        }
+        plugin_intermediate_size = self.plugin_intermediate_size()
+
+        def materialize():
+            pack = (weight_conversion.repack_nvfp4_experts
+                    if self._has_packed_nvfp4() else
+                    weight_conversion.pack_dense_nvfp4_experts)
+            load = (self.load_expert_raw_nvfp4
+                    if self._has_packed_nvfp4() else self.load_expert_dense)
+            (fc1, fc1_scale, fc1_alpha, fc2, fc2_scale, fc2_alpha) = pack(
+                load,
+                cfg.num_experts,
+                cfg.hidden_size,
+                cfg.moe_intermediate_size,
+                cfg.group_size,
+                fc1_layout=layout,
+                plugin_intermediate_size=plugin_intermediate_size)
+            correction = (self.weights.f32(correction_key)
+                          if self.weights.has(correction_key) else np.ones(
+                              cfg.num_experts, dtype=np.float32))
+            return {
+                "fc1_qweights":
+                fc1,
+                "fc1_blocks_scale":
+                fc1_scale,
+                "fc1_alpha":
+                fc1_alpha,
+                "fc2_qweights":
+                fc2,
+                "fc2_blocks_scale":
+                fc2_scale,
+                "fc2_alpha":
+                fc2_alpha,
+                "input_global_scale":
+                np.ones(cfg.num_experts, np.float32),
+                "down_input_scale":
+                np.ones(cfg.num_experts, np.float32),
+                "e_score_correction_bias":
+                np.ascontiguousarray(correction, np.float32),
+            }
+
+        if not self._has_packed_nvfp4():
+            return materialize(), None
+        parameters = self.weights.parameter_value(
+            "nvfp4_moe",
+            self.prefix,
+            lambda: weight_conversion.nvfp4_expert_specs(
+                self.weights, self.prefix, cfg.num_experts,
+                plugin_intermediate_size),
+            materialize,
+        )
+        bindings = weight_conversion.nvfp4_expert_bindings(
+            self.weights, self.prefix, correction_key, cfg.num_experts,
+            self.ctx.options.sm12x)
+        return parameters, bindings
 
 
 class Gemma4TextRouter(Module):
@@ -214,19 +267,15 @@ class Gemma4TextMoE(Module):
     def forward(self, expert_input, router_input):
         cfg = self.cfg
         router_logits = self.router(router_input)
-        packed_weights = self.experts.packed_weights()
-        per_expert = (self.weights.f32(self.key("router.per_expert_scale"))
-                      if self.weights.has(self.key("router.per_expert_scale"))
-                      else np.ones(cfg.num_experts, dtype=np.float32))
-        packed_weights["e_score_correction_bias"] = np.ascontiguousarray(
-            per_expert, np.float32)
+        packed_weights, bindings = self.experts.parameters(
+            self.key("router.per_expert_scale"))
         return F.nvfp4_moe(router_logits,
                            expert_input,
                            packed_weights,
                            cfg.num_experts,
                            cfg.num_experts_per_tok,
                            cfg.hidden_size,
-                           cfg.moe_intermediate_size,
+                           self.experts.plugin_intermediate_size(),
                            F.MoeActivation.GEGLU,
                            1,
                            1,
@@ -234,7 +283,8 @@ class Gemma4TextMoE(Module):
                            1.0,
                            F.MoeRouting.SOFTMAX_TOPK_POST_SCALE,
                            self.ctx.options.sm12x,
-                           weight_prefix=self.experts.prefix)
+                           weight_prefix=self.experts.prefix,
+                           weight_bindings=bindings)
 
 
 class Gemma4TextDecoderLayer(Module):
@@ -404,9 +454,10 @@ class Gemma4ForCausalLM(NetworkModule):
         outputs = {}
         hidden_states = io["inputs_embeds"]
         present = []
-        all_hidden = []
+        pre_layer_hidden = []
+        post_layer_hidden = []
         for index, layer in enumerate(self.layers):
-            all_hidden.append(hidden_states)
+            pre_layer_hidden.append(hidden_states)
             if self.cfg.uses_dual_rope:
                 rope = (io["rope_full"] if self.cfg.attention_type(index)
                         == "full_attention" else io["rope_sliding"])
@@ -418,6 +469,7 @@ class Gemma4ForCausalLM(NetworkModule):
                 io["cache_start"], io["kv_page_table"], io["attention_mask"],
                 io["attention_pos_id"], ple)
             present.append(layer_present)
+            post_layer_hidden.append(hidden_states)
         pre_norm_hidden = hidden_states
         hidden_states = self.norm(hidden_states)
         selected = F.gather_last_tokens(hidden_states, io["last_token_ids"])
@@ -428,10 +480,26 @@ class Gemma4ForCausalLM(NetworkModule):
                       np.float32(cap_value))
         outputs["logits"] = logits
         if self.cfg.engine_role == "base":
-            if self.cfg.spec_decode_type == "eagle3" and len(all_hidden) >= 4:
-                indices = (2, len(all_hidden) // 2, len(all_hidden) - 4)
+            if (self.cfg.spec_decode_type == "eagle3"
+                    and self.cfg.eagle3_target_layer_ids):
+                indices = self.cfg.eagle3_target_layer_ids
                 feedback = F.concatenate(
-                    tuple(all_hidden[index] for index in indices), 2)
+                    tuple(post_layer_hidden[index] for index in indices), 2)
+            elif (self.cfg.spec_decode_type == "eagle3"
+                  and len(pre_layer_hidden) >= 4):
+                indices = (2, len(pre_layer_hidden) // 2,
+                           len(pre_layer_hidden) - 4)
+                feedback = F.concatenate(
+                    tuple(pre_layer_hidden[index] for index in indices), 2)
+            elif self.cfg.spec_decode_type in ("dflash", "dspark"):
+                feedback = F.hidden_state_feedback(
+                    hidden_states,
+                    post_layer_hidden,
+                    self.cfg,
+                    allow_eagle3=False,
+                )
+            elif self.cfg.spec_decode_type == "gemma4_mtp":
+                feedback = pre_norm_hidden
             else:
                 feedback = hidden_states
             outputs["hidden_states"] = feedback

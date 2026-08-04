@@ -30,13 +30,17 @@ import glob
 import json
 import mmap
 import os
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from .numpy_dtypes import bf16_bytes_to_f32, fp8_e4m3_bytes_to_f32
 
-__all__ = ["SafetensorsStore", "load_safetensors_tensor"]
+__all__ = [
+    "SafetensorsStore",
+    "load_safetensors_tensor",
+    "read_safetensors_metadata",
+]
 
 # safetensors dtype string -> (numpy dtype for raw view, element byte size).
 # Sub-byte / exotic dtypes are read as raw uint8 and decoded by helpers.
@@ -81,6 +85,20 @@ class _ShardFile:
         begin, end = meta["data_offsets"]
         return self._mm[self._data_start + begin:self._data_start + end]
 
+    def raw_size(self, name: str) -> int:
+        begin, end = self._header[name]["data_offsets"]
+        return int(end) - int(begin)
+
+    def raw_slice(self, name: str, offset: int, length: int) -> bytes:
+        begin, end = self._header[name]["data_offsets"]
+        size = int(end) - int(begin)
+        if offset < 0 or length < 0 or offset > size - length:
+            raise ValueError(
+                f"{name}: byte range [{offset}, {offset + length}) exceeds "
+                f"tensor storage ({size} bytes)")
+        start = self._data_start + int(begin) + offset
+        return self._mm[start:start + length]
+
     def close(self) -> None:
         try:
             self._mm.close()
@@ -100,7 +118,9 @@ class SafetensorsStore:
         self.model_dir = model_dir
         self._weight_map: Dict[str, str] = {}
         self._shards: Dict[str, _ShardFile] = {}
+        self._torch_metadata_shards: Dict[str, Dict[str, Any]] = {}
         self._torch_shards: Dict[str, Dict[str, Any]] = {}
+        self._raw_files: Dict[str, Any] = {}
 
         index_path = os.path.join(model_dir, "model.safetensors.index.json")
         single_path = os.path.join(model_dir, "model.safetensors")
@@ -122,6 +142,7 @@ class SafetensorsStore:
             self._weight_map = dict(index.get("weight_map", {}))
         elif os.path.exists(torch_single_path):
             metadata = self._load_torch_shard(torch_single_path, "meta")
+            self._torch_metadata_shards["pytorch_model.bin"] = metadata
             for key in metadata:
                 self._weight_map[key] = "pytorch_model.bin"
         else:
@@ -170,6 +191,15 @@ class SafetensorsStore:
             self._torch_shards[shard_name] = state
         return state[name]
 
+    def _torch_metadata(self, name: str):
+        shard_name = self._weight_map[name]
+        state = self._torch_metadata_shards.get(shard_name)
+        if state is None:
+            state = self._load_torch_shard(
+                os.path.join(self.model_dir, shard_name), "meta")
+            self._torch_metadata_shards[shard_name] = state
+        return state[name]
+
     @staticmethod
     def _torch_dtype_name(dtype) -> str:
         import torch
@@ -213,13 +243,128 @@ class SafetensorsStore:
 
     def dtype(self, name: str) -> str:
         if self._weight_map[name].endswith(".bin"):
-            return self._torch_dtype_name(self._torch_tensor(name).dtype)
+            return self._torch_dtype_name(self._torch_metadata(name).dtype)
         return self._shard(name).info(name)["dtype"]
 
     def shape(self, name: str) -> Tuple[int, ...]:
         if self._weight_map[name].endswith(".bin"):
-            return tuple(self._torch_tensor(name).shape)
+            return tuple(self._torch_metadata(name).shape)
         return tuple(self._shard(name).info(name)["shape"])
+
+    def checkpoint_location(self, name: str) -> Optional[dict]:
+        """Describe one tensor's byte range in a PyTorch ZIP checkpoint.
+
+        ``torch.load(..., map_location="meta")`` parses only the restricted
+        weights metadata and records the archive offset on each fake storage.
+        The C++ runtime can therefore mmap the original ``.bin`` directly,
+        without materializing the externalized tensor during engine build.
+        """
+        if not self.has(name):
+            return None
+        shard_name = self._weight_map[name]
+        if not shard_name.endswith(".bin"):
+            return None
+
+        tensor = self._torch_metadata(name)
+        if not tensor.is_contiguous():
+            raise ValueError(
+                f"{name}: external PyTorch checkpoint tensor must be contiguous"
+            )
+        storage_offset = getattr(tensor.untyped_storage(),
+                                 "_checkpoint_offset", None)
+        if storage_offset is None:
+            raise RuntimeError(
+                "The installed PyTorch package does not expose checkpoint byte "
+                f"offsets required to externalize {name!r} from {shard_name}")
+        byte_offset = (int(storage_offset) +
+                       int(tensor.storage_offset()) * tensor.element_size())
+        byte_count = int(tensor.numel()) * tensor.element_size()
+        return {
+            "file": shard_name,
+            "offset": byte_offset,
+            "bytes": byte_count,
+            "dtype": self._torch_dtype_name(tensor.dtype),
+            "shape": [int(dimension) for dimension in tensor.shape],
+        }
+
+    def checkpoint_files(self, names: List[str]) -> dict:
+        """Return a cheap manifest for checkpoint shards owning ``names``."""
+        files = {self._weight_map[name] for name in names if self.has(name)}
+        for index_name in ("model.safetensors.index.json",
+                           "pytorch_model.bin.index.json"):
+            if os.path.isfile(os.path.join(self.model_dir, index_name)):
+                files.add(index_name)
+        manifest = {}
+        for filename in sorted(files):
+            stat = os.stat(os.path.join(self.model_dir, filename))
+            manifest[filename] = {
+                "bytes": int(stat.st_size),
+                "mtime_ns": int(stat.st_mtime_ns),
+            }
+        return manifest
+
+    def tensor_identity(self, name: str, sample_bytes: int = 16) -> dict:
+        """Return a bounded content identity for one checkpoint tensor.
+
+        Positive ``sample_bytes`` reads at most three ranges regardless of
+        tensor size. Zero records only structural metadata without touching
+        payload pages.
+        """
+        if sample_bytes < 0:
+            raise ValueError("sample_bytes must be nonnegative")
+        if not self.has(name):
+            raise KeyError(name)
+
+        shard_name = self._weight_map[name]
+        if shard_name.endswith(".bin"):
+            location = self.checkpoint_location(name)
+            if location is None:
+                raise RuntimeError(
+                    f"missing checkpoint location for tensor {name!r}")
+            total_bytes = int(location["bytes"])
+
+        else:
+            shard = self._shard(name)
+            total_bytes = shard.raw_size(name)
+
+        identity = {
+            "dtype": self.dtype(name),
+            "shape": [int(dimension) for dimension in self.shape(name)],
+            "bytes": total_bytes,
+            "samples": [],
+        }
+        if sample_bytes == 0 or total_bytes == 0:
+            return identity
+
+        if shard_name.endswith(".bin"):
+            raw_file = self._raw_files.get(shard_name)
+            if raw_file is None:
+                raw_file = open(os.path.join(self.model_dir, shard_name), "rb")
+                self._raw_files[shard_name] = raw_file
+
+            def read_sample(offset: int, length: int) -> bytes:
+                raw_file.seek(int(location["offset"]) + offset)
+                data = raw_file.read(length)
+                if len(data) != length:
+                    raise OSError(
+                        f"short read while sampling {name!r} from {shard_name}"
+                    )
+                return data
+
+        else:
+
+            def read_sample(offset: int, length: int) -> bytes:
+                return shard.raw_slice(name, offset, length)
+
+        width = min(sample_bytes, total_bytes)
+        offsets = sorted(
+            set((0, max(0, (total_bytes - width) // 2),
+                 max(0, total_bytes - width))))
+        identity["samples"] = [{
+            "offset": offset,
+            "data": read_sample(offset, width).hex(),
+        } for offset in offsets]
+        return identity
 
     # -- typed accessors ----------------------------------------------------
 
@@ -314,6 +459,10 @@ class SafetensorsStore:
         for shard in self._shards.values():
             shard.close()
         self._shards.clear()
+        for raw_file in self._raw_files.values():
+            raw_file.close()
+        self._raw_files.clear()
+        self._torch_metadata_shards.clear()
         self._torch_shards.clear()
 
     def __enter__(self) -> "SafetensorsStore":
@@ -341,5 +490,20 @@ def load_safetensors_tensor(path: str, name: str) -> np.ndarray:
         if dtype not in _NP_DTYPE:
             raise TypeError(f"{name}: unsupported safetensors dtype {dtype!r}")
         return raw.view(_NP_DTYPE[dtype]).reshape(shape)
+    finally:
+        shard.close()
+
+
+def read_safetensors_metadata(path: str) -> Dict[str, dict]:
+    """Read tensor dtype and shape headers without touching payload bytes."""
+    shard = _ShardFile(path)
+    try:
+        return {
+            name: {
+                "dtype": shard.info(name)["dtype"],
+                "shape": tuple(int(dim) for dim in shard.info(name)["shape"]),
+            }
+            for name in shard.keys()
+        }
     finally:
         shard.close()

@@ -259,7 +259,7 @@ size_t Int4GroupwiseGemmPluginV2::getWorkspaceSize([[maybe_unused]] DynamicPlugi
     // Serial split-K needs an int32 lock buffer sized for the launch grid. The
     // tactic isn't known here (queried tactic-agnostically), so size for the worst
     // case over valid tactics: smallest bM=16 (most M-tiles), bN=128, at max M.
-    if (mGemmN % 64 == 0 && mGemmK % 64 == 0)
+    if (mGemmN > 0 && mGemmK > 0 && mGemmK % 64 == 0)
     {
         auto const& mx = inputs[0].max;
         if (mx.nbDims >= 2)
@@ -285,10 +285,10 @@ int32_t Int4GroupwiseGemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, Pl
         [[maybe_unused]] int32_t const M = inputDesc0.dims.d[0] * inputDesc0.dims.d[1];
 
 #ifdef CUTE_DSL_INT4_FP16_GEMM_ENABLED
-        // Fragment-layout contract for BOTH the GEMV and GEMM paths: input[1] is the
-        // repacked weight buffer, which the export repack only emits when
-        // N%64==0 && K%64==0. Both kernels consume it.
-        if (mGemmN % 64 != 0 || mGemmK % 64 != 0)
+        // Fragment-layout contract for BOTH the GEMV and GEMM paths: input[1]
+        // stores ceil(N/128) N tiles and K/64 K tiles. Both kernels predicate
+        // the final N tile and require a complete K tile.
+        if (mGemmN <= 0 || mGemmK <= 0 || mGemmK % 64 != 0)
         {
             return -1;
         }
@@ -312,7 +312,7 @@ int32_t Int4GroupwiseGemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, Pl
             return -1;
         }
         // Tactic id = variant index + 1; tactic 0 (default) maps to variant 0,
-        // which is always valid for a cuteDSL-eligible (N%64==0, K%64==0) problem.
+        // which is always valid for an eligible positive-N, K%64==0 problem.
         int32_t const idx = (mTactic > 0) ? (mTactic - 1) : 0;
         if (idx < 0 || idx >= cuteDslInt4NumVariants())
         {
@@ -363,7 +363,7 @@ namespace
 {
 // Combined per-shape tactic filter shared by getNbTactics()/getValidTactics() so the
 // two always agree on the same set. A variant is autotuned iff:
-//  (1) it can serve this (N, K): N%64==0, K%64==0, splitK | ceil(K/bK)  [validity], AND
+//  (1) it can serve this (N, K): N>0, K%64==0, splitK | ceil(K/bK)  [validity], AND
 //  (2) its CTA tile passes the 16-variant subset per-M pruning
 //      derived by set-cover analysis.
 inline bool tacticSelectable(CuteDslInt4Variant const& v, int32_t N, int32_t K, int32_t autotuneM)

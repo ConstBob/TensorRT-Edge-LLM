@@ -18,13 +18,36 @@ from typing import Dict
 
 import tensorrt as trt
 
+from ...core import quantization
 from ...ops import (BuildContext, DecoderLayer, DecoderModel, Linear,
                     NetworkModule, QKNormDecoderAttention)
 from ...ops import functional as F
+from . import weights as weight_conversion
 
 
 class Qwen3Attention(QKNormDecoderAttention):
     """Qwen3 attention extension point with Q/K normalization."""
+
+    def packed_qkv(self, hidden_states):
+        """Use the provider's fused NVFP4 QKV projection when compatible."""
+        projections = (self.q_proj, self.k_proj, self.v_proj)
+        can_fuse = (self.ctx.backend == "edgellm" and self.cfg.tp_size == 1
+                    and self.cfg.kv_cache_quant != "fp8"
+                    and all(projection.quant_type() == quantization.QUANT_NVFP4
+                            for projection in projections)
+                    and not any(projection.has_adapter()
+                                for projection in projections))
+        if not can_fuse:
+            return super().packed_qkv(hidden_states)
+
+        descriptor = weight_conversion.fuse_nvfp4_qkv(
+            tuple(projection.weight_descriptor()
+                  for projection in projections))
+        if descriptor is None:
+            return super().packed_qkv(hidden_states)
+        return F.linear_from_weights(hidden_states,
+                                     descriptor,
+                                     name=self.key("qkv_proj_fused"))
 
 
 class Qwen3DecoderLayer(DecoderLayer):

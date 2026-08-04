@@ -83,7 +83,8 @@ EagleDecoder::EagleDecoder(DecodingRuntimeContext& runtime, std::filesystem::pat
     // Publish externalized draft-engine weights into the draft tensor map,
     // mirroring the base engine. Loaded from draft_config.json; a
     // no-op when the draft model has no externalized weights.
-    mDraftExternalWeightManager.load(engineDir, engineDir / "draft_config.json", stream);
+    mDraftExternalWeightManager.load(
+        engineDir, engineDir / "draft_config.json", stream, mRuntime.draftCheckpointDir, mRuntime.checkpointDir);
     mDraftExternalWeightManager.validateAgainstEngine(*mDraftExecutor, "draft");
     mDraftExternalWeightManager.registerTensorMapEntries(mDraftTensorMap);
 

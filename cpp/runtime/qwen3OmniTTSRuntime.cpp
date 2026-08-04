@@ -41,8 +41,6 @@
 #include <cctype>
 #include <chrono>
 #include <cuda_runtime.h>
-#include <filesystem>
-#include <fstream>
 #include <nlohmann/json.hpp>
 #include <unordered_set>
 
@@ -140,7 +138,8 @@ struct ChunkEmitter
 } // anonymous namespace
 
 Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
-    std::string const& tokenizerDir, std::string const& cloneEncoderDir, cudaStream_t stream)
+    std::string const& tokenizerDir, std::string const& cloneEncoderDir, cudaStream_t stream,
+    std::string const& checkpointDir)
     : mStream(stream)
 {
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::init", nvtx_colors::YELLOW);
@@ -160,7 +159,7 @@ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std
     bool const configValid = validateAndFillConfig(talkerEngineDir);
     ELLM_CHECK(configValid, "Failed to validate and fill config");
 
-    bool const runnersInitialized = initializeEngineRunners(talkerEngineDir, codePredictorEngineDir);
+    bool const runnersInitialized = initializeEngineRunners(talkerEngineDir, codePredictorEngineDir, checkpointDir);
     ELLM_CHECK(runnersInitialized, "Failed to initialize engine runners");
 
     // Setup shared execution context memory for Talker and CodePredictor engines.
@@ -308,7 +307,7 @@ Qwen3OmniTTSRuntime::~Qwen3OmniTTSRuntime()
 }
 
 bool Qwen3OmniTTSRuntime::initializeEngineRunners(
-    std::string const& talkerEngineDir, std::string const& codePredictorEngineDir)
+    std::string const& talkerEngineDir, std::string const& codePredictorEngineDir, std::string const& checkpointDir)
 {
     // Load Talker LLM engine via EngineExecutor (migrated from LLMEngineRunner)
     std::filesystem::path talkerEnginePath = std::filesystem::path(talkerEngineDir) / "llm.engine";
@@ -327,6 +326,9 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
         mTalkerStepPreparer = std::make_unique<rt::StepPreparer>(mTalkerLLMConfig);
         rt::buildTensorMap(
             mTalkerTensorMap, *mTalkerPipelineIO, *mTalkerSharedRes, mTalkerLLMConfig, /*kvCacheIndex=*/0);
+        mTalkerSharedRes->externalWeightManager->load(talkerEngineDir, talkerConfigPath, mStream, checkpointDir);
+        mTalkerSharedRes->externalWeightManager->validateAgainstEngine(*mTalkerExec, "talker");
+        mTalkerSharedRes->externalWeightManager->registerTensorMapEntries(mTalkerTensorMap);
 
         LOG_INFO("Talker LLM engine loaded: vocabSize=%d, hiddenSize=%d", mTalkerLLMConfig.vocabSize,
             mTalkerLLMConfig.hiddenSize);
@@ -359,6 +361,10 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
         mCodePredictorStepPreparer = std::make_unique<rt::StepPreparer>(mCodePredictorConfig);
         rt::buildTensorMap(mCodePredictorTensorMap, *mCodePredictorPipelineIO, *mCodePredictorSharedRes,
             mCodePredictorConfig, /*kvCacheIndex=*/0);
+        mCodePredictorSharedRes->externalWeightManager->load(
+            codePredictorEngineDir, codePredictorConfigPath, mStream, checkpointDir);
+        mCodePredictorSharedRes->externalWeightManager->validateAgainstEngine(*mCodePredictorExec, "code predictor");
+        mCodePredictorSharedRes->externalWeightManager->registerTensorMapEntries(mCodePredictorTensorMap);
 
         // CodePredictor ONNX outputs FP32 logits directly (the active lm_head is gathered
         // in-engine from the stacked lm_heads input by the device lm_head_idx).
@@ -2839,12 +2845,10 @@ bool Qwen3OmniTTSRuntime::extractTalkerLastHidden(
             "extractTalkerLastHidden: non-owning output has wrong shape");
     }
 
-    // Talker engine emits the last-position hidden at row 0 regardless of seqLen — reading
-    // seqLen-1 yields zeros and starves the CodePredictor.
     size_t const copySize = hiddenSize * sizeof(__half);
     for (int64_t b = 0; b < batchSize; ++b)
     {
-        size_t const srcOffset = b * seqLen * hiddenSize * sizeof(__half); // row 0 per batch
+        size_t const srcOffset = ((b + 1) * seqLen - 1) * hiddenSize * sizeof(__half);
         size_t const dstOffset = b * hiddenSize * sizeof(__half);
         CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(outputLastHidden.rawPointer()) + dstOffset,
             static_cast<char const*>(talkerHiddenStates.rawPointer()) + srcOffset, copySize, cudaMemcpyDeviceToDevice,

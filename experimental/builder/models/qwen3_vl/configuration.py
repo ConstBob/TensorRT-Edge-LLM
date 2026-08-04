@@ -17,6 +17,14 @@
 from ...core import contracts
 
 
+def available_components(root: dict, registered):
+    """Honor standalone Qwen3-VL component checkpoints."""
+    architectures = set(root.get("architectures") or ())
+    if "Qwen3VLVisionModel" in architectures:
+        return frozenset((contracts.Component.VISUAL, ))
+    return registered
+
+
 def component_config(root: dict, component: contracts.Component) -> dict:
     if component == contracts.Component.LLM:
         return root

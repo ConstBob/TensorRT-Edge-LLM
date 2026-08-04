@@ -22,6 +22,16 @@ from typing import List
 from ...core import contracts
 
 
+def available_components(root: dict, registered):
+    """Return only encoder components represented by this checkpoint."""
+    available = set(registered)
+    if not isinstance(root.get("vision_config"), dict):
+        available.discard(contracts.Component.VISUAL)
+    if not isinstance(root.get("audio_config"), dict):
+        available.discard(contracts.Component.AUDIO)
+    return frozenset(available)
+
+
 def component_config(root: dict, component: contracts.Component) -> dict:
     if component == contracts.Component.LLM:
         return root
@@ -159,7 +169,8 @@ def configure_draft(config, *, paired_target=None, **kwargs) -> None:
         raise ValueError("Gemma4 MTP draft requires a target config")
     target = paired_target
     if target.model_type not in ("gemma4", "gemma4_text"):
-        raise ValueError("Gemma4 MTP target must use gemma4/gemma4_text")
+        raise ValueError(
+            "Gemma4 MTP target must use a standard Gemma4 model type")
     if config.root_model_type != "gemma4_assistant":
         raise ValueError(
             "Gemma4 MTP draft must use a gemma4_assistant checkpoint")

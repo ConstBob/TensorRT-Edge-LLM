@@ -21,6 +21,7 @@ architecture-selected NVFP4 MoE implementation.
 """
 
 import logging
+from functools import partial
 from typing import Dict, List, Tuple
 
 import tensorrt as trt
@@ -73,8 +74,18 @@ class Qwen3MoeSparseMoeBlock(Module):
         cfg = self.cfg
         router_logits = self.gate(hidden_states)
         if cfg.quant_type == quantization.QUANT_NVFP4:
-            moe_weights = prepare_gated_nvfp4_weights(
-                self.ctx, self.experts, weight_conversion.repack_nvfp4_experts)
+            moe_weights = self.weights.parameter_value(
+                "nvfp4_moe",
+                self.experts.prefix,
+                lambda: weight_conversion.nvfp4_expert_specs(
+                    self.weights, self.experts.prefix, cfg.num_experts),
+                lambda: prepare_gated_nvfp4_weights(
+                    self.ctx, self.experts, weight_conversion.
+                    repack_nvfp4_experts),
+            )
+            bindings = weight_conversion.nvfp4_expert_bindings(
+                self.weights, self.experts.prefix, cfg.num_experts,
+                self.ctx.options.sm12x)
             routed = F.nvfp4_moe(router_logits,
                                  hidden_states,
                                  moe_weights,
@@ -89,18 +100,38 @@ class Qwen3MoeSparseMoeBlock(Module):
                                  self.routed_scaling_factor,
                                  self.routing_mode,
                                  self.ctx.options.sm12x,
-                                 weight_prefix=self.experts.prefix)
+                                 weight_prefix=self.experts.prefix,
+                                 weight_bindings=bindings)
         elif cfg.quant_type == quantization.QUANT_INT4_GPTQ:
-            moe_weights = prepare_gated_int4_weights(self.ctx, self.prefix)
-            routed = F.int4_moe(router_logits,
-                                hidden_states,
-                                moe_weights,
-                                cfg.num_experts,
-                                cfg.num_experts_per_tok,
-                                cfg.hidden_size,
-                                cfg.moe_intermediate_size,
-                                cfg.group_size,
-                                weight_prefix=self.experts.prefix)
+
+            def materialize_int4():
+                load_projection = partial(
+                    weight_conversion.load_gptq_expert_projection,
+                    self.weights, self.experts.prefix)
+                return prepare_gated_int4_weights(self.ctx, load_projection)
+
+            moe_weights = self.weights.parameter_value(
+                "int4_moe",
+                self.experts.prefix,
+                lambda: weight_conversion.int4_expert_specs(
+                    self.weights, self.experts.prefix, cfg.num_experts),
+                materialize_int4,
+            )
+            bindings = weight_conversion.int4_expert_bindings(
+                self.weights, self.experts.prefix, cfg.num_experts,
+                cfg.group_size, cfg.quant.gptq_zero_point_offset)
+            routed = F.int4_moe(
+                router_logits,
+                hidden_states,
+                moe_weights,
+                cfg.num_experts,
+                cfg.num_experts_per_tok,
+                cfg.hidden_size,
+                cfg.moe_intermediate_size,
+                cfg.group_size,
+                weight_prefix=self.experts.prefix,
+                weight_bindings=bindings,
+                zero_point_offset=cfg.quant.gptq_zero_point_offset)
         else:
             raise ValueError("Qwen MoE experts require NVFP4 or INT4 GPTQ; "
                              f"got {cfg.quant_type!r}")

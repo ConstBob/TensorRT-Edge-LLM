@@ -85,12 +85,14 @@ enum ProfileBenchOptionId : int
     PROFILE = 834,
     BLOCK_SIZE = 835,
     CANDIDATE_TOPK = 837,
+    CHECKPOINT_DIR = 838,
 };
 
 struct ProfileBenchArgs
 {
     bool help{false};
     std::string engineDir;
+    std::string checkpointDir;
     bool debug{false};
     int32_t batchSize{1};
     int32_t inputLen{-1}; // Input sequence length per batch (required for prefill modes)
@@ -206,6 +208,7 @@ void printUsage(char const* programName)
     std::cerr << std::endl;
     std::cerr << "Common Options:" << std::endl;
     std::cerr << "  --help                    Display this help message" << std::endl;
+    std::cerr << "  --checkpointDir           HF/ModelOpt checkpoint directory for runtime weight loading" << std::endl;
     std::cerr << "  --debug                   Use debug mode (verbose logging)" << std::endl;
     std::cerr << "  --batchSize               Batch size. Default = 1" << std::endl;
     std::cerr << "  --iterations              Number of profiling iterations (after warmup). Default = 10" << std::endl;
@@ -266,6 +269,7 @@ bool parseArgs(ProfileBenchArgs& args, int argc, char* argv[])
 {
     static struct option options[] = {{"help", no_argument, 0, ProfileBenchOptionId::HELP},
         {"engineDir", required_argument, 0, ProfileBenchOptionId::ENGINE_DIR},
+        {"checkpointDir", required_argument, 0, ProfileBenchOptionId::CHECKPOINT_DIR},
         {"debug", no_argument, 0, ProfileBenchOptionId::DEBUG},
         {"batchSize", required_argument, 0, ProfileBenchOptionId::BATCH_SIZE},
         {"inputLen", required_argument, 0, ProfileBenchOptionId::INPUT_LEN},
@@ -297,6 +301,7 @@ bool parseArgs(ProfileBenchArgs& args, int argc, char* argv[])
             {
             case ProfileBenchOptionId::HELP: args.help = true; return true;
             case ProfileBenchOptionId::ENGINE_DIR: args.engineDir = optarg; break;
+            case ProfileBenchOptionId::CHECKPOINT_DIR: args.checkpointDir = optarg; break;
             case ProfileBenchOptionId::DEBUG: args.debug = true; break;
             case ProfileBenchOptionId::BATCH_SIZE:
                 args.batchSize = std::stoi(optarg);
@@ -790,7 +795,8 @@ int main(int argc, char** argv)
                     break;
                 }
             }
-            visualRunner = rt::MultimodalRunner::create(args.engineDir, args.batchSize, maxSeqLen, stream);
+            visualRunner
+                = rt::MultimodalRunner::create(args.engineDir, args.batchSize, maxSeqLen, stream, args.checkpointDir);
         }
         catch (std::exception const& e)
         {
@@ -807,7 +813,7 @@ int main(int argc, char** argv)
         for (int32_t b = 0; b < args.batchSize; ++b)
         {
             rt::LLMGenerationRequest::Request req;
-            rt::Tensor fakeImage({static_cast<int64_t>(args.imageHeight), static_cast<int64_t>(args.imageWidth), 3},
+            rt::Tensor fakeImage({1, static_cast<int64_t>(args.imageHeight), static_cast<int64_t>(args.imageWidth), 3},
                 rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8, "fake");
             std::memset(fakeImage.rawPointer(), 128, static_cast<size_t>(args.imageHeight) * args.imageWidth * 3);
             req.imageBuffers.emplace_back(std::move(fakeImage));
@@ -1096,7 +1102,7 @@ int main(int argc, char** argv)
 
             // --- Load externalized model weights ---
             std::filesystem::path const& activeConfigPath = useDraftEngine ? *draftConfigPath : baseConfigPath;
-            resources->externalWeightManager->load(dir, activeConfigPath, stream);
+            resources->externalWeightManager->load(dir, activeConfigPath, stream, args.checkpointDir);
             resources->externalWeightManager->validateAgainstEngine(*executor, useDraftEngine ? "draft" : "base");
             resources->externalWeightManager->registerTensorMapEntries(tensorMap);
 

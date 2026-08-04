@@ -114,14 +114,16 @@ def update_ssm_state(
     dt_bias: Tensor,
     state: Tensor,
     context_lengths: Tensor,
+    state_start_index: Tensor,
     dim: int,
     dstate: int,
     nheads: int,
     ngroups: int,
 ) -> Tuple[Tensor, Tensor]:
     """Run selective state update."""
-    return operation("update_ssm_state",
-                     [x, a, b, c, d, dt, dt_bias, state, context_lengths],
+    return operation("update_ssm_state", [
+        x, a, b, c, d, dt, dt_bias, state, context_lengths, state_start_index
+    ],
                      output_count=2,
                      dim=dim,
                      dstate=dstate,

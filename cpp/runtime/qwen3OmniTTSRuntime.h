@@ -131,6 +131,7 @@ public:
      * @param talkerEngineDir Directory containing talker engine, MLP weights, embedding table, etc.
      * @param codePredictorEngineDir Directory containing code_predictor engine and codec embeddings
      * @param tokenizerDir Directory containing tokenizer files. If empty, defaults to talkerEngineDir/../
+     * @param checkpointDir HF/ModelOpt checkpoint used by checkpoint-backed Talker weights
      * @param stream CUDA stream for operations
      * @throws std::runtime_error on any initialization failure
      */
@@ -138,7 +139,8 @@ public:
     //!        engines (speaker_encoder.engine / speech_tokenizer_encoder.engine, Base
     //!        checkpoints). Empty disables voice cloning.
     Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
-        std::string const& tokenizerDir, std::string const& cloneEncoderDir, cudaStream_t stream);
+        std::string const& tokenizerDir, std::string const& cloneEncoderDir, cudaStream_t stream,
+        std::string const& checkpointDir = "");
 
     //! @brief Destructor
     ~Qwen3OmniTTSRuntime();
@@ -771,7 +773,8 @@ private:
      * @param codePredictorEngineDir Directory containing code predictor engine files
      * @return True on success, false on failure
      */
-    bool initializeEngineRunners(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir);
+    bool initializeEngineRunners(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
+        std::string const& checkpointDir);
 
     /*!
      * @brief Load CodePredictor lm_head weights and small_to_mtp_projection

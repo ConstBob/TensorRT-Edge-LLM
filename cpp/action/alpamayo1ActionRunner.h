@@ -22,6 +22,7 @@
 #include "common/trtUtils.h"
 #include "runtime/hybridCacheManager.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "runtime/state/externalWeightManager.h"
 #include "tokenizer/tokenizer.h"
 
 #include <NvInfer.h>
@@ -60,6 +61,7 @@ class Alpamayo1ActionRunner
 public:
     //! \brief Load action engine, config, and allocate tensors
     //! \param engineDir Path to directory containing action.engine and config.json
+    //! \param checkpointDir Original model checkpoint used for runtime weights
     //! \param stream CUDA stream for operations
     //! \param kvCacheConfig KV cache layout from the LLM (from KVCacheManager::Config())
     //! \param basePageTableIsIdentity Whether the base cache manager's KV page table is (and is
@@ -71,7 +73,7 @@ public:
     //!         if `basePageTableIsIdentity` is false.
     //!
     //! config.json must include rope_theta and num_hidden_layers (decoder layer count)
-    Alpamayo1ActionRunner(std::string const& engineDir, cudaStream_t stream,
+    Alpamayo1ActionRunner(std::string const& engineDir, std::string const& checkpointDir, cudaStream_t stream,
         KVCacheManager::Config const& kvCacheConfig, bool basePageTableIsIdentity);
 
     ~Alpamayo1ActionRunner() noexcept = default;
@@ -182,6 +184,7 @@ private:
     std::unique_ptr<nvinfer1::IRuntime> mRuntime{nullptr};
     std::unique_ptr<nvinfer1::ICudaEngine> mEngine{nullptr};
     std::unique_ptr<nvinfer1::IExecutionContext> mContext{nullptr};
+    std::unique_ptr<ExternalWeightManager> mExternalWeights{nullptr};
 
     rt::Tensor mNoiseTrajectoryDevice;
     rt::Tensor mNoiseTrajectoryHost;

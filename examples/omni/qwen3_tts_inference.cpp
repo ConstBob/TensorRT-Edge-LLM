@@ -228,7 +228,8 @@ enum Qwen3TTSOptionId : int
     TOKENIZER_DIR = 915,
     STREAMING = 916,
     CHUNK_FRAMES = 917,
-    CLONE_ENCODER_DIR = 918
+    CLONE_ENCODER_DIR = 918,
+    CHECKPOINT_DIR = 919
 };
 
 struct Qwen3TTSInferenceArgs
@@ -238,6 +239,7 @@ struct Qwen3TTSInferenceArgs
     std::string code2wavEngineDir{""};
     std::string cloneEncoderDir{""};
     std::string tokenizerDir{""};
+    std::string checkpointDir{""};
     std::string inputFile;
     std::string outputFile{""};
     std::string outputAudioDir{""};
@@ -261,6 +263,7 @@ void printUsage(char const* programName)
               << "  --cloneEncoderDir=<path>     Voice-clone reference encoder engines (Base checkpoints)\n"
               << "  --tokenizerDir=<path>        Path to tokenizer directory\n"
               << "                               Defaults to --talkerEngineDir/../\n"
+              << "  --checkpointDir=<path>       HF/ModelOpt checkpoint for external model weights\n"
               << "  --outputFile=<path>          Path to output JSON file\n"
               << "  --outputAudioDir=<path>      Directory to save generated audio (.wav) files\n\n"
               << "Performance Options:\n"
@@ -283,6 +286,7 @@ bool parseArgs(Qwen3TTSInferenceArgs& args, int argc, char* argv[])
         {"code2wavEngineDir", required_argument, 0, Qwen3TTSOptionId::CODE2WAV_ENGINE_DIR},
         {"tokenizerDir", required_argument, 0, Qwen3TTSOptionId::TOKENIZER_DIR},
         {"cloneEncoderDir", required_argument, 0, Qwen3TTSOptionId::CLONE_ENCODER_DIR},
+        {"checkpointDir", required_argument, 0, Qwen3TTSOptionId::CHECKPOINT_DIR},
         {"outputFile", required_argument, 0, Qwen3TTSOptionId::OUTPUT_FILE},
         {"outputAudioDir", required_argument, 0, Qwen3TTSOptionId::OUTPUT_AUDIO_DIR},
         {"debug", no_argument, 0, Qwen3TTSOptionId::DEBUG},
@@ -304,6 +308,7 @@ bool parseArgs(Qwen3TTSInferenceArgs& args, int argc, char* argv[])
         case Qwen3TTSOptionId::CODE2WAV_ENGINE_DIR: args.code2wavEngineDir = optarg; break;
         case Qwen3TTSOptionId::CLONE_ENCODER_DIR: args.cloneEncoderDir = optarg; break;
         case Qwen3TTSOptionId::TOKENIZER_DIR: args.tokenizerDir = optarg; break;
+        case Qwen3TTSOptionId::CHECKPOINT_DIR: args.checkpointDir = optarg; break;
         case Qwen3TTSOptionId::OUTPUT_FILE: args.outputFile = optarg; break;
         case Qwen3TTSOptionId::OUTPUT_AUDIO_DIR: args.outputAudioDir = optarg; break;
         case Qwen3TTSOptionId::DEBUG: args.debug = true; break;
@@ -404,8 +409,8 @@ int main(int argc, char** argv)
     {
         std::filesystem::path const codePredictorDir
             = std::filesystem::path(args.talkerEngineDir).parent_path() / "code_predictor";
-        ttsRuntime = std::make_unique<rt::Qwen3OmniTTSRuntime>(
-            args.talkerEngineDir, codePredictorDir.string(), args.tokenizerDir, args.cloneEncoderDir, stream);
+        ttsRuntime = std::make_unique<rt::Qwen3OmniTTSRuntime>(args.talkerEngineDir, codePredictorDir.string(),
+            args.tokenizerDir, args.cloneEncoderDir, stream, args.checkpointDir);
         LOG_INFO("TTS runtime initialized");
     }
     catch (std::exception const& e)
@@ -425,7 +430,7 @@ int main(int argc, char** argv)
         LOG_INFO("Initializing Code2Wav Runner from %s...", code2wavDir.string().c_str());
         try
         {
-            code2wavRunner = std::make_unique<Code2WavRunner>(code2wavDir.string(), stream);
+            code2wavRunner = std::make_unique<Code2WavRunner>(code2wavDir.string(), stream, args.checkpointDir);
             LOG_INFO("Code2Wav Runner initialized");
         }
         catch (std::exception const& e)

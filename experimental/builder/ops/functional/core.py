@@ -96,9 +96,10 @@ def pixel_unshuffle(input: Tensor, side: int, scale: int,
         _pixel_unshuffle(current_net(), input, side, scale, hidden_size))
 
 
-def embedding_lookup(table: np.ndarray,
-                     indices: Tensor,
-                     axis: int = 0) -> Tensor:
+def embedding_lookup(table, indices: Tensor, axis: int = 0) -> Tensor:
+    """Gather rows from a constant or checkpoint-backed embedding table."""
+    if isinstance(table, Tensor):
+        return table.gather(indices, axis)
     return tensor(_embedding_lookup(current_net(), table, indices, axis))
 
 
@@ -132,6 +133,14 @@ def linear_f32(input: Tensor,
     return tensor(current_net().linear_f32(input, weight, bias, rank))
 
 
+def linear_f32_from_weights(input: Tensor,
+                            weights,
+                            name: str,
+                            rank: int = 3) -> Tensor:
+    return tensor(current_net().linear_f32_from_weights(
+        input, weights, name, rank))
+
+
 def dynamic_lora(input: Tensor, output: Tensor, prefix: str, in_features: int,
                  out_features: int) -> Tensor:
     return tensor(current_net().dynamic_lora(input, output, prefix,
@@ -139,7 +148,7 @@ def dynamic_lora(input: Tensor, output: Tensor, prefix: str, in_features: int,
 
 
 def rms_norm(input: Tensor,
-             weight: np.ndarray,
+             weight,
              eps: float,
              rank: int = 3,
              weight_before_cast: bool = False) -> Tensor:
@@ -156,8 +165,8 @@ def layer_norm(input: Tensor, weight: np.ndarray, bias: np.ndarray, eps: float,
 
 
 def convolution(input: Tensor,
-                weight: np.ndarray,
-                bias: Optional[np.ndarray] = None,
+                weight,
+                bias=None,
                 stride: Sequence[int] = (1, ),
                 padding: Sequence[int] = (0, ),
                 dilation: Sequence[int] = (1, ),
@@ -263,10 +272,11 @@ def scaled_dot_product_attention(query: Tensor,
                                  value: Tensor,
                                  mask: Optional[Tensor] = None,
                                  key_value_lengths: Optional[Tensor] = None,
-                                 scale: Optional[float] = None) -> Tensor:
-    """Apply non-causal scaled dot-product attention."""
+                                 scale: Optional[float] = None,
+                                 is_causal: bool = False) -> Tensor:
+    """Apply scaled dot-product attention."""
     return tensor(current_net().scaled_dot_product_attention(
-        query, key, value, mask, key_value_lengths, scale))
+        query, key, value, mask, key_value_lengths, scale, is_causal))
 
 
 def matmul(lhs: Tensor,
@@ -322,6 +332,10 @@ def _linear_precision(weights, prefix: str) -> str:
         if dtype.startswith("F8") and scale_dtype == "U8":
             return quantization.QUANT_MXFP8
         if dtype.startswith("F8"):
+            scale_shape = weights.store.shape(
+                weights._resolve(prefix + ".weight_scale"))
+            if len(scale_shape) == 4:
+                return quantization.QUANT_FP8_BLOCK
             return quantization.QUANT_FP8
         if dtype == "I8":
             return quantization.QUANT_INT8_SQ
@@ -331,7 +345,8 @@ def _linear_precision(weights, prefix: str) -> str:
 
 
 def _linear(net, weights, hidden, prefix: str, rank: int):
-    descriptor = weights.linear(prefix, _linear_precision(weights, prefix))
+    descriptor = weights.linear_descriptor(prefix,
+                                           _linear_precision(weights, prefix))
     return net.linear_from_weights(hidden, descriptor, rank, name=prefix)
 
 
@@ -352,10 +367,11 @@ def _linear_eager(weights, hidden, prefix: str):
 
 
 def _normalization(net, weights, hidden, prefix: str, eps: float, rank: int):
-    weight = weights.f16(prefix + ".weight")
+    weight = weights.fp16_parameter(prefix + ".weight")
     if weights.has(prefix + ".bias"):
-        return net.layernorm(hidden, weight, weights.f16(prefix + ".bias"),
-                             eps, rank)
+        return net.layernorm(hidden, weight,
+                             weights.fp16_parameter(prefix + ".bias"), eps,
+                             rank)
     return net.rmsnorm(hidden, weight, eps, rank)
 
 

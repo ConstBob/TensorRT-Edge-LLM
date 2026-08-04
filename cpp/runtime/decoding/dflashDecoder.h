@@ -19,6 +19,7 @@
 
 #include "common/hashUtils.h"
 #include "runtime/decoding/decodingStrategy.h"
+#include "runtime/state/externalWeightManager.h"
 
 #include <filesystem>
 #include <memory>
@@ -89,6 +90,7 @@ private:
 
     std::unique_ptr<EngineExecutor> mDraftExecutor;
     TensorMap mDraftTensorMap;
+    ExternalWeightManager mDraftExternalWeightManager;
 
     Tensor mDraftInputsEmbeds;        //!< [B, blockSize, draftHiddenSize] FP16
     Tensor mDraftTargetHidden;        //!< Compact scratch for [B, <= blockSize, baseOutputHiddenDim] FP16

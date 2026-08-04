@@ -46,6 +46,7 @@ class BuildOptions:
 
     backend: str = "edgellm"  # edgellm | eager
     dense_quant: str = "auto"  # auto | fp16 | nvfp4-qdq
+    int4_gemm_plugin_version: int = 2
     sm12x: bool = False
     max_lora_rank: int = 0
 
@@ -69,6 +70,10 @@ class BuildContext:
                         weights: Weights) -> "BuildContext":
         """Bind alternate checkpoint state without exposing graph ownership."""
         return replace(self, cfg=cfg, weights=weights)
+
+    def open_weights(self, model_dir: str, **kwargs) -> Weights:
+        """Open related checkpoint weights under the active storage policy."""
+        return Weights(model_dir, policy=self.net.policy, **kwargs)
 
 
 class Module:

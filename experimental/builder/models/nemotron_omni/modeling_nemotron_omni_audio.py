@@ -44,12 +44,12 @@ class NemotronAudioConv1d(Module):
         self.depthwise = depthwise
 
     def forward(self, hidden):
-        kernel = self.weights.f16(self.key("weight"))
+        kernel = self.weights.fp16_parameter(self.key("weight"))
         groups = int(kernel.shape[0]) if self.depthwise else 1
         padding = (int(kernel.shape[-1]) // 2, ) if self.depthwise else (0, )
         return F.convolution(hidden,
                              kernel,
-                             self.weights.opt_f16(self.key("bias")),
+                             self.weights.opt_fp16_parameter(self.key("bias")),
                              padding=padding,
                              groups=groups)
 
@@ -59,7 +59,7 @@ class NemotronAudioSubsamplingLayer(Module):
 
     def __init__(self, ctx, prefix: str, index: int) -> None:
         super().__init__(ctx, prefix)
-        kernel = self.weights.f16(self.key("weight"))
+        kernel = self.weights.parameter_spec(self.key("weight"))
         self.groups = int(
             kernel.shape[0]) if kernel.shape[1] == 1 and index else 1
         self.stride = (2, 2) if kernel.shape[-1] == 3 else (1, 1)
@@ -68,8 +68,9 @@ class NemotronAudioSubsamplingLayer(Module):
 
     def forward(self, hidden):
         hidden = F.convolution(hidden,
-                               self.weights.f16(self.key("weight")),
-                               self.weights.opt_f16(self.key("bias")),
+                               self.weights.fp16_parameter(self.key("weight")),
+                               self.weights.opt_fp16_parameter(
+                                   self.key("bias")),
                                stride=self.stride,
                                padding=self.padding,
                                groups=self.groups)

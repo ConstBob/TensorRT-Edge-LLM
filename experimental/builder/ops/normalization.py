@@ -38,7 +38,9 @@ class RMSNorm(Module):
         self.unit_offset = unit_offset
 
     def forward(self, hidden_states, rank: Optional[int] = None):
-        weight = self.weights.f16(self.key("weight"))
+        weight = (self.weights.fp16_parameter(self.key("weight"))
+                  if self.ctx.backend == "edgellm" and not self.unit_offset
+                  else self.weights.f16(self.key("weight")))
         if self.unit_offset:
             weight = weight + np.float16(1.0)
         return F.rms_norm(hidden_states,
