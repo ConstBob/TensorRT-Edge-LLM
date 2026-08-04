@@ -193,6 +193,31 @@ Json makeDFlashDraftConfig(int32_t maxDraftTreeSize, int32_t maxBatchSize = 2)
     return config;
 }
 
+Json makeDSparkConfigSection(int32_t blockSize)
+{
+    return Json{{"block_size", blockSize}, {"mask_token_id", 31999}, {"markov_head_type", "vanilla"},
+        {"markov_rank", 256}, {"enable_confidence_head", true}, {"confidence_head_with_markov", true},
+        {"target_layer_ids", Json::array({1, 8})}};
+}
+
+Json makeDSparkBaseConfig(int32_t maxVerifyTreeSize, int32_t blockSize = 7, int32_t maxBatchSize = 2)
+{
+    Json config = makeBaseConfig(maxVerifyTreeSize, /*maxDraft=*/0, maxBatchSize);
+    config["spec_decode_type"] = "dspark";
+    config["engine_role"] = "base";
+    config["dspark_config"] = makeDSparkConfigSection(blockSize);
+    return config;
+}
+
+Json makeDSparkDraftConfig(int32_t maxDraftTreeSize, int32_t blockSize = 7, int32_t maxBatchSize = 2)
+{
+    Json config = makeDraftConfig(/*maxVerify=*/0, maxDraftTreeSize, maxBatchSize);
+    config["spec_decode_type"] = "dspark";
+    config["engine_role"] = "draft";
+    config["dspark_config"] = makeDSparkConfigSection(blockSize);
+    return config;
+}
+
 //! Gemma4-MTP base config: gemma4_mtp spec type, engine_role=base.
 Json makeGemma4MTPBaseConfig(int32_t maxBatchSize = 2, int32_t maxKVCacheCapacity = 256)
 {
@@ -1179,4 +1204,222 @@ TEST_F(DeploymentConfigTest, Gemma4MTPMismatchedKVCapacityThrows)
             }
         },
         std::exception);
+}
+
+TEST_F(DeploymentConfigTest, DSparkChainValidatesOk)
+{
+    auto const basePath = writeJsonToTempFile(makeDSparkBaseConfig(/*maxVerify=*/8), "base");
+    auto const draftPath = writeJsonToTempFile(makeDSparkDraftConfig(/*maxDraft=*/7), "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 1;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 8;
+
+    DeploymentConfig bundle = createDeploymentConfig(
+        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<SpecDecodeDraftingConfig>{drafting});
+
+    EXPECT_EQ(bundle.specDecodeMode(), SpecDecodeMode::kDSpark);
+    ASSERT_TRUE(bundle.specConfig.has_value());
+    EXPECT_EQ(bundle.specConfig->verifySize, 8);
+    EXPECT_EQ(bundle.specConfig->draftingTopK, 1);
+}
+
+TEST_F(DeploymentConfigTest, DSparkCandidateTopKGreaterThanOneSelectsTree)
+{
+    // Tree decouples verifySize (node budget) from block_size + 1.
+    auto const basePath = writeJsonToTempFile(makeDSparkBaseConfig(/*maxVerify=*/16), "base");
+    auto const draftPath = writeJsonToTempFile(makeDSparkDraftConfig(/*maxDraft=*/7), "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 4;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 16;
+
+    DeploymentConfig bundle = createDeploymentConfig(
+        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<SpecDecodeDraftingConfig>{drafting});
+
+    EXPECT_EQ(bundle.specDecodeMode(), SpecDecodeMode::kDSpark);
+    ASSERT_TRUE(bundle.specConfig.has_value());
+    EXPECT_EQ(bundle.specConfig->verifySize, 16);
+    EXPECT_EQ(bundle.specConfig->draftingTopK, 4);
+}
+
+TEST_F(DeploymentConfigTest, DSparkTreeRejectsTopKNotLessThanVerifySize)
+{
+    auto const basePath = writeJsonToTempFile(makeDSparkBaseConfig(/*maxVerify=*/8), "base");
+    auto const draftPath = writeJsonToTempFile(makeDSparkDraftConfig(/*maxDraft=*/7), "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 8;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 8;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
+}
+
+TEST_F(DeploymentConfigTest, DSparkTreeRejectsFanoutAboveLimit)
+{
+    auto const basePath = writeJsonToTempFile(makeDSparkBaseConfig(/*maxVerify=*/32), "base");
+    auto const draftPath = writeJsonToTempFile(makeDSparkDraftConfig(/*maxDraft=*/9), "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 9;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 32;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
+}
+
+TEST_F(DeploymentConfigTest, DSparkTreeVerifySizeAboveNodeBudgetThrows)
+{
+    auto const basePath = writeJsonToTempFile(makeDSparkBaseConfig(/*maxVerify=*/256), "base");
+    auto const draftPath = writeJsonToTempFile(makeDSparkDraftConfig(/*maxDraft=*/7), "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 4;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 129;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
+}
+
+TEST_F(DeploymentConfigTest, DSparkTreeAllowsScheduler)
+{
+    // Tree mode supports confidence scheduling: scheduled depths shrink the DDTree
+    // verify budget (dynamic window), so threshold/sps both validate.
+    auto const basePath = writeJsonToTempFile(makeDSparkBaseConfig(/*maxVerify=*/16), "base");
+    auto const draftPath = writeJsonToTempFile(makeDSparkDraftConfig(/*maxDraft=*/7), "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 4;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 16;
+    drafting.dsparkSchedulerMode = DSparkSchedulerMode::kThreshold;
+    drafting.dsparkConfidenceThreshold = 0.5F;
+
+    DeploymentConfig bundle = createDeploymentConfig(
+        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<SpecDecodeDraftingConfig>{drafting});
+    ASSERT_TRUE(bundle.specConfig.has_value());
+    EXPECT_EQ(bundle.specConfig->dsparkSchedulerMode, DSparkSchedulerMode::kThreshold);
+}
+
+TEST_F(DeploymentConfigTest, DSparkTreeRejectsSPS)
+{
+    // Fixed tree budget has no verify cost for SPS to trade; only threshold applies.
+    auto const basePath = writeJsonToTempFile(makeDSparkBaseConfig(/*maxVerify=*/16), "base");
+    auto const draftPath = writeJsonToTempFile(makeDSparkDraftConfig(/*maxDraft=*/7), "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 4;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 16;
+    drafting.dsparkSchedulerMode = DSparkSchedulerMode::kSPS;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
+}
+
+TEST_F(DeploymentConfigTest, DSparkTreeAcceptedPathAboveCommitLimitThrows)
+{
+    // block_size 16 -> accepted path min(16 + 1, 32) = 17 > 16.
+    auto const basePath = writeJsonToTempFile(makeDSparkBaseConfig(/*maxVerify=*/32, /*blockSize=*/16), "base");
+    auto const draftPath = writeJsonToTempFile(makeDSparkDraftConfig(/*maxDraft=*/16, /*blockSize=*/16), "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 4;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 32;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
+}
+
+TEST_F(DeploymentConfigTest, DSparkTreeLargeBlockWithBoundedVerifySizeValidatesOk)
+{
+    // Same block_size 16, but verifySize 16 caps the accepted path at 16.
+    auto const basePath = writeJsonToTempFile(makeDSparkBaseConfig(/*maxVerify=*/16, /*blockSize=*/16), "base");
+    auto const draftPath = writeJsonToTempFile(makeDSparkDraftConfig(/*maxDraft=*/16, /*blockSize=*/16), "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 4;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 16;
+
+    DeploymentConfig bundle = createDeploymentConfig(
+        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<SpecDecodeDraftingConfig>{drafting});
+
+    ASSERT_TRUE(bundle.specConfig.has_value());
+    EXPECT_EQ(bundle.specConfig->verifySize, 16);
+}
+
+TEST_F(DeploymentConfigTest, DSparkTreeBlockAboveDraftCapacityThrows)
+{
+    // Tree drafts the full block (7), which must fit the draft engine profile (6).
+    auto const basePath = writeJsonToTempFile(makeDSparkBaseConfig(/*maxVerify=*/16), "base");
+    auto const draftPath = writeJsonToTempFile(makeDSparkDraftConfig(/*maxDraft=*/6), "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 4;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 16;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
+}
+
+TEST_F(DeploymentConfigTest, DSparkRejectsMultiStep)
+{
+    auto const basePath = writeJsonToTempFile(makeDSparkBaseConfig(/*maxVerify=*/8), "base");
+    auto const draftPath = writeJsonToTempFile(makeDSparkDraftConfig(/*maxDraft=*/7), "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 1;
+    drafting.draftingStep = 2;
+    drafting.verifySize = 8;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
+}
+
+TEST_F(DeploymentConfigTest, DSparkChainVerifySizeAboveUtilityKernelLimitThrows)
+{
+    auto const basePath = writeJsonToTempFile(makeDSparkBaseConfig(/*maxVerify=*/32, /*blockSize=*/32), "base");
+    auto const draftPath = writeJsonToTempFile(makeDSparkDraftConfig(/*maxDraft=*/32, /*blockSize=*/32), "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 1;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 18;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
+}
+
+TEST_F(DeploymentConfigTest, DSparkTreeSurvivalThresholdOfOneThrows)
+{
+    auto const basePath = writeJsonToTempFile(makeDSparkBaseConfig(/*maxVerify=*/16), "base");
+    auto const draftPath = writeJsonToTempFile(makeDSparkDraftConfig(/*maxDraft=*/7), "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 4;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 16;
+    drafting.dsparkSchedulerMode = DSparkSchedulerMode::kThreshold;
+    drafting.dsparkConfidenceThreshold = 1.0F;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
 }
