@@ -396,7 +396,7 @@ void Phi4MMViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
         throw std::runtime_error(errorMsg);
     }
 
-    int imageIndex = 0;
+    int64_t imageIndex = 0;
 
     for (size_t i = 0; i < request.requests.size(); ++i)
     {
@@ -404,12 +404,19 @@ void Phi4MMViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
         std::vector<int32_t> ids = tokenizer->encode(request.formattedRequests[i].formattedCompleteRequest);
         check::check(!ids.empty(), "Phi4MMViTRunner::textPreprocess() Failed to encode text");
 
+        // Per-request media window (numImages[i]): a placeholder may only consume this request's own media (batch
+        // isolation).
+        int64_t const mediaEnd = imageIndex + numImages[i];
+
         // Replace each image placeholder with copies of the image token id (matches HF)
         std::vector<int32_t> newIds;
         for (size_t j = 0; j < ids.size(); ++j)
         {
             if (ids[j] == mConfig.imageTokenId)
             {
+                ELLM_CHECK(imageIndex < mediaEnd,
+                    "EDGELLM_BAD_MEDIA_COUNT: Phi4MMViTRunner::textPreprocess() placeholder count exceeds this "
+                    "request's image count");
                 // Expand to actual number of image tokens
                 int64_t numImageTokens = imageTokenLengths.at(imageIndex);
                 for (int k = 0; k < numImageTokens; ++k)
@@ -424,12 +431,15 @@ void Phi4MMViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
             }
         }
         batchedInputIds.emplace_back(std::move(newIds));
+        ELLM_CHECK(imageIndex == mediaEnd,
+            "EDGELLM_BAD_MEDIA_COUNT: Phi4MMViTRunner::textPreprocess() placeholder count is smaller than this "
+            "request's image count");
     }
 }
 
 bool Phi4MMViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly) noexcept
+    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly)
 {
     std::vector<int64_t> imageTokenLengths;
     std::vector<int64_t> numImages;
@@ -444,10 +454,18 @@ bool Phi4MMViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     }
     catch (std::exception const& e)
     {
-        LOG_ERROR("Preprocess failed: %s", e.what());
+        bool const actionable = isCallerActionable(e);
+        if (!actionable)
+        {
+            LOG_ERROR("Preprocess failed: %s", e.what());
+        }
         // Drain async H2D copies that may still read the request's image buffers, so the caller can
-        // safely release them after the failure.
+        // safely release them after the failure -- including when the error propagates.
         cudaStreamSynchronize(stream);
+        if (actionable)
+        {
+            throw;
+        }
         return false;
     }
 

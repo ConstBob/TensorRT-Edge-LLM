@@ -329,12 +329,19 @@ void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
         std::vector<int32_t> ids = tokenizer->encode(request.formattedRequests[i].formattedCompleteRequest);
         check::check(!ids.empty(), "InternViTRunner::textPreprocess() Failed to encode text");
 
+        // Per-request media window (numImages[i]): a placeholder may only consume this request's own media (batch
+        // isolation).
+        int64_t const mediaEnd = imageIndex + numImages[i];
+
         // replace vis tokens
         std::vector<int32_t> newIds;
         for (size_t j = 0; j < ids.size(); ++j)
         {
             if (ids[j] == mConfig.imageTokenId)
             {
+                ELLM_CHECK(imageIndex < mediaEnd,
+                    "EDGELLM_BAD_MEDIA_COUNT: InternViTRunner::textPreprocess() placeholder count exceeds this "
+                    "request's media count");
                 // Image: <img> + N IMG_CONTEXT + </img>
                 newIds.push_back(mConfig.imgStartTokenId);
                 int64_t const numImageTokens = imageTokenLengths.at(imageIndex);
@@ -347,6 +354,9 @@ void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
             }
             else if (videoTokenId >= 0 && ids[j] == videoTokenId)
             {
+                ELLM_CHECK(imageIndex < mediaEnd,
+                    "EDGELLM_BAD_MEDIA_COUNT: InternViTRunner::textPreprocess() placeholder count exceeds this "
+                    "request's media count");
                 // Video: per-frame groups (format above); IMG_CONTEXT positions across
                 // all frames still total N, matching the ViT output.
                 int64_t const numImageTokens = imageTokenLengths.at(imageIndex);
@@ -388,12 +398,15 @@ void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
             }
         }
         batchInputIds.emplace_back(std::move(newIds));
+        ELLM_CHECK(imageIndex == mediaEnd,
+            "EDGELLM_BAD_MEDIA_COUNT: InternViTRunner::textPreprocess() placeholder count is smaller than this "
+            "request's media count");
     }
 }
 
 bool InternViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly) noexcept
+    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly)
 {
     std::vector<int64_t> imageTokenLengths;
     std::vector<int64_t> numImages;
@@ -408,10 +421,18 @@ bool InternViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     }
     catch (std::exception const& e)
     {
-        LOG_ERROR("Failed: %s", e.what());
+        bool const actionable = isCallerActionable(e);
+        if (!actionable)
+        {
+            LOG_ERROR("Failed: %s", e.what());
+        }
         // Drain async H2D copies that may still read the request's image buffers, so the caller can
-        // safely release them after the failure.
+        // safely release them after the failure -- including when the error propagates.
         cudaStreamSynchronize(stream);
+        if (actionable)
+        {
+            throw;
+        }
         return false;
     }
 

@@ -24,28 +24,41 @@ from typing import Optional
 from urllib.parse import unquote, urlparse
 
 
-def decode_base64_data_url(url: str,
-                           kind: str,
-                           *,
-                           strict: bool = False,
-                           max_bytes: Optional[int] = None) -> bytes:
-    """Decode a ``data:<kind>/...;base64,<payload>`` URL to bytes. ``max_bytes``
-    is enforced exactly on the decoded size; an encoded-length pre-check rejects
-    clearly oversized payloads first (sized so base64 padding never mis-rejects)."""
-    head, _, payload = url.partition(",")
-    if ";base64" not in head:
-        raise ValueError(f"data: {kind} URLs must use base64 encoding")
+def decode_base64_payload(payload: str,
+                          kind: str,
+                          *,
+                          strict: bool = False,
+                          max_bytes: Optional[int] = None) -> bytes:
+    """Decode a raw base64 payload to bytes. ``max_bytes`` is enforced exactly
+    on the decoded size; an encoded-length pre-check rejects clearly oversized
+    payloads first (sized so base64 padding never mis-rejects)."""
     if max_bytes is not None and len(payload) > -(-max_bytes // 3) * 4:
-        raise ValueError(f"data: {kind} payload exceeds the supported "
+        raise ValueError(f"{kind} payload exceeds the supported "
                          f"maximum of {max_bytes} bytes")
     try:
         data = base64.b64decode(payload, validate=strict)
     except (binascii.Error, ValueError) as exc:
         raise ValueError(f"invalid base64 {kind} payload: {exc}") from exc
     if max_bytes is not None and len(data) > max_bytes:
-        raise ValueError(f"data: {kind} payload exceeds the supported "
+        raise ValueError(f"{kind} payload exceeds the supported "
                          f"maximum of {max_bytes} bytes")
     return data
+
+
+def decode_base64_data_url(url: str,
+                           kind: str,
+                           *,
+                           strict: bool = False,
+                           max_bytes: Optional[int] = None) -> bytes:
+    """Decode a ``data:<kind>/...;base64,<payload>`` URL to bytes (size policy
+    per :func:`decode_base64_payload`)."""
+    head, _, payload = url.partition(",")
+    if ";base64" not in head:
+        raise ValueError(f"data: {kind} URLs must use base64 encoding")
+    return decode_base64_payload(payload,
+                                 f"data: {kind}",
+                                 strict=strict,
+                                 max_bytes=max_bytes)
 
 
 def resolve_file_url(url: str) -> str:
@@ -60,3 +73,25 @@ def resolve_file_url(url: str) -> str:
     if not path:
         raise ValueError("file:// URL has empty path")
     return path
+
+
+#: Content-item keys carrying a media reference. Which spelling each loader
+#: accepts differs (only ``video`` takes both a bare string and ``{"url": ...}``),
+#: so the policy reads every key both ways rather than tracking the difference.
+MEDIA_REF_KEYS = ("image", "video", "audio", "image_url", "video_url",
+                  "audio_url")
+
+
+def iter_item_media_refs(item: dict):
+    """Yield every media URL/path in one content item, in either spelling."""
+    if not isinstance(item, dict):
+        return
+    for key in MEDIA_REF_KEYS:
+        ref = item.get(key)
+        url = ref.get("url") if isinstance(ref, dict) else ref
+        if isinstance(url, str):
+            yield url
+    # {"type": "video", "frames": [path, ...]} feeds video_sampling directly.
+    for frame in item.get("frames") or []:
+        if isinstance(frame, str):
+            yield frame

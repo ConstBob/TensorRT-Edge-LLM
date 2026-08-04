@@ -30,6 +30,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <variant>
 #include <vector>
@@ -38,6 +39,15 @@ namespace trt_edgellm
 {
 namespace rt
 {
+
+//! @brief Client input errors, which preprocess catch blocks rethrow: collapsing them to
+//!        `return false` leaves the pybind layer nothing to report but a generic 500.
+inline bool isCallerActionable(std::exception const& e) noexcept
+{
+    std::string_view const message{e.what()};
+    return message.find("EDGELLM_INPUT_TOO_LONG") != std::string_view::npos
+        || message.find("EDGELLM_BAD_MEDIA_COUNT") != std::string_view::npos;
+}
 
 /*!
  * @brief Base class for multimodal vision-language model runners

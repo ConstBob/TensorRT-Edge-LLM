@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <tuple>
 #include <utility>
@@ -48,13 +49,22 @@ std::tuple<int64_t, int64_t> qwenSmartResize(int64_t height, int64_t width, int6
 /*!
  * @brief Compute the Qwen3-VL / Qwen3.5 resize target with the 3D temporal-aware pixel budget: same as
  *        :func:`qwenSmartResize` except `tBar = ceilByFactor(numFrames, temporalPatchSize)` is folded into
- *        the budget (still images use tBar = 1).
+ *        the budget. `isVideo` selects the modality explicitly (HF applies the temporal budget to any video;
+ *        a 1-frame video still gets tBar = temporalPatchSize; only still images use tBar = 1), and the result
+ *        is constrained to the engine token profile — infeasible inputs throw.
  * @return Tuple of (resizedHeight, resizedWidth)
  * @throws std::runtime_error if the aspect ratio exceeds `maxRatio`
  */
-std::tuple<int64_t, int64_t> qwenSmartResize3D(int64_t numFrames, int64_t height, int64_t width, int64_t patchSize,
-    int64_t mergeSize, int64_t minImageTokensPerImage, int64_t maxImageTokensPerImage, int64_t temporalPatchSize,
-    int64_t maxRatio = 200);
+std::tuple<int64_t, int64_t> qwenSmartResize3D(int64_t numFrames, bool isVideo, int64_t height, int64_t width,
+    int64_t patchSize, int64_t mergeSize, int64_t minImageTokensPerImage, int64_t maxImageTokensPerImage,
+    int64_t temporalPatchSize, int64_t maxRatio = 200);
+
+//! Upper bound of visual segments (one per image or Qwen3-VL video temporal group). cu_seqlens holds
+//! one more entry than this (the leading 0). Header-only: visual_build links this without edgellmCore.
+inline int64_t maxCuSeqlenGroups(int64_t maxImageTokens)
+{
+    return std::max<int64_t>(1, maxImageTokens);
+}
 
 /*!
  * @brief Compute the Gemma4 resize target: rescale (up or down) so the pixel count fills the per-image

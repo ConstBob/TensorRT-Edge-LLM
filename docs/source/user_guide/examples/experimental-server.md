@@ -69,6 +69,13 @@ python -m experimental.server \
   --port 8000
 ```
 
+For a multimodal model, point the server at the encoders explicitly:
+
+- `--multimodal-engine-dir` (alias `--visual-engine-dir`): prebuilt visual
+  and/or audio encoder engines for a prebuilt `--model` engine dir.
+- `--visual-onnx-dir` / `--audio-onnx-dir`: prebuilt encoder ONNX dirs when
+  `--model` is a prebuilt ONNX dir.
+
 Query:
 
 ```bash
@@ -83,6 +90,14 @@ Streaming query:
 curl -sN http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 128, "stream": true}'
+```
+
+Legacy raw-prompt completion (no chat template applied):
+
+```bash
+curl -sN http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Once upon a time", "max_tokens": 128}'
 ```
 
 Tool-aware query:
@@ -153,7 +168,9 @@ Tool response follow-up:
 | `onnx_dir` | Existing ONNX directory; build then load |
 | `engine_dir` | Existing engine directory; load only |
 
-For VLMs and models that support audio (Qwen3-Omni, Qwen3-ASR, Nemotron-Omni), also pass `visual_onnx_dir` or `visual_engine_dir`.
+Encoders are passed alongside: `visual_onnx_dir` / `audio_onnx_dir` with
+`onnx_dir`, and `multimodal_engine_dir` (alias `visual_engine_dir`) with
+`engine_dir`. Models that support audio: Qwen3-Omni, Qwen3-ASR, Nemotron-Omni.
 
 ## Audio Input
 
@@ -166,8 +183,10 @@ messages for models that support audio (Qwen3-Omni, Qwen3-ASR, Nemotron-Omni):
 {"type": "audio", "audio": "<local path>"}
 ```
 
-`http(s)://` URLs are rejected by design — host the audio locally and use
-`file://`, or inline the bytes as base64 via `input_audio`. Supported
+`http(s)://` URLs are rejected by design — inline the bytes as base64 via
+`input_audio`, or pass a local path with the server started as
+`--allowed-local-media-path <dir>` (local paths and `file://` are refused over
+HTTP otherwise, and are confined to that directory when it is set). Supported
 containers: `.wav`, `.mp3`, `.flac`. The server decodes the container
 in-process via vendored miniaudio and the audio runner extracts the
 mel-spectrogram in C++ (no HF `transformers` feature extractor or Python
@@ -293,6 +312,31 @@ directory's siblings; `tokenizer_dir` defaults to the talker directory itself
 there). On a Qwen3-Omni server, pass the thinker engine dir as
 `tokenizer_dir` — the text embedding lives there.
 
+### Transcription endpoint (`/v1/audio/transcriptions`)
+
+For ASR models the OpenAI transcription route accepts a multipart audio
+upload and returns `{"text": ...}`. Clip duration is bounded by the engine
+audio profile (~30 s, matching vLLM); errors are staged `400` (bad request)
+/ `413` (too long) / `503` (busy) / `500`.
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/audio/transcriptions \
+  -F model=local -F file=@sample.wav
+```
+
+## Video Input
+
+Video content accepts a source URL or pre-extracted frames:
+
+```json
+{"type": "video_url", "video_url": {"url": "file:///abs/path | data:video/...;base64,..."}}
+{"type": "video", "video": "<local path>"}
+{"type": "video", "frames": ["<frame path>", "..."], "fps": 1.0}
+```
+
+Sampling is controlled per request with `fps`, `nframes`, `min_frames` and
+`max_frames`. Local paths follow the same `--allowed-local-media-path` rule as
+audio; `http(s)://` is rejected.
 
 ## Sampling Parameters
 
@@ -488,6 +532,8 @@ outputs = llm.generate(
 | `POST` | `/v1/messages/count_tokens` | Anthropic input-token estimate |
 | `POST` | `/v1/audio/speech` | Text-to-speech (streamed PCM or WAV) |
 | `GET` | `/v1/voices` | Speaker names accepted as `voice` |
+| `POST` | `/v1/completions` | Legacy raw-prompt completion (no chat template); streaming or non-stream |
+| `POST` | `/v1/audio/transcriptions` | ASR transcription (audio upload); staged errors `400/413/503/500` |
 
 ## Notes
 
@@ -500,5 +546,6 @@ outputs = llm.generate(
   length is capped at `131072` (a larger value returns a 400).
 - On a streaming request, set `stream_options.include_usage: true` to receive a
   final chunk carrying `usage` (empty `choices`) just before `[DONE]`.
-- Reported `usage` token counts come from the Hugging Face tokenizer; they are
-  best-effort and may be `0` when a tokenizer is unavailable.
+- `usage.prompt_tokens` is the runtime's templated, media-expanded prompt
+  length when available; otherwise it falls back to the Hugging Face tokenizer
+  estimate, which counts each media placeholder once.

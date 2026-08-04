@@ -69,6 +69,7 @@ class _RuntimeResponseSlice:
     output_ids: List[List[int]]
     finish_reasons: List[Any]
     logprobs: List[Any]
+    prompt_token_counts: List[int]
 
 
 def resolve_batch_size(engine_max_batch_size: int,
@@ -101,11 +102,13 @@ def _copy_response_rows(response, start: int,
                         count: int) -> _RuntimeResponseSlice:
     end = start + count
     logprobs = getattr(response, "logprobs", []) or []
+    prompt_tokens = getattr(response, "prompt_token_counts", []) or []
     return _RuntimeResponseSlice(
         output_texts=list(response.output_texts[start:end]),
         output_ids=[list(ids) for ids in response.output_ids[start:end]],
         finish_reasons=list(response.finish_reasons[start:end]),
         logprobs=list(logprobs[start:end]),
+        prompt_token_counts=list(prompt_tokens[start:end]),
     )
 
 

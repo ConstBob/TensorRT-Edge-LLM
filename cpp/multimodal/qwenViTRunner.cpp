@@ -182,10 +182,10 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
         = mVisualEngine->getProfileShape(binding_names::kVisualInput, 0, nvinfer1::OptProfileSelector::kMIN);
     mConfig.maxHW = inputShapeMax.d[0];
     mConfig.minHW = inputShapeMin.d[0];
-    auto maxImageTokens = mConfig.maxHW / (mConfig.mergeSize * mConfig.mergeSize);
-    // Mirrors the visual engine's cu_seqlens profile max (maxImageTokens / minImageTokens). For video this also
-    // bounds the number of per-frame cu_seqlens entries (one per frame block), not just the image count.
-    mConfig.maxNumImages = maxImageTokens / mConfig.minImageTokensPerImage;
+    // One cu_seqlens entry per image, or per video temporal group. Read the capacity from the engine's own
+    // cu_seqlens profile so the runtime bound always matches the built engine.
+    mConfig.maxNumImages
+        = mVisualEngine->getProfileShape(binding_names::kCuSeqlens, 0, nvinfer1::OptProfileSelector::kMAX).d[0] - 1;
     mConfig.inputDim = mVisualContext->getTensorShape(binding_names::kVisualInput).d[1];
     // Whether the ViT consumes a rotary_pos_emb input is a fixed per-model property (see usesRotaryPosEmb),
     // not something to read off the engine. Take it from that hook and validate the loaded engine agrees.
@@ -398,15 +398,15 @@ void QwenViTRunner::buildCuSeqlens(
     }
 }
 
-std::tuple<int64_t, int64_t> QwenViTRunner::getResizedImageSize(
-    int64_t const /*numFrames*/, int64_t const height, int64_t const width, int64_t const maxRatio)
+std::tuple<int64_t, int64_t> QwenViTRunner::getResizedImageSize(int64_t const /*numFrames*/, bool const /*isVideo*/,
+    int64_t const height, int64_t const width, int64_t const maxRatio)
 {
     return rt::imageUtils::qwenSmartResize(height, width, mConfig.patchSize, mConfig.mergeSize,
         mConfig.minImageTokensPerImage, mConfig.maxImageTokensPerImage, maxRatio);
 }
 
-void QwenViTRunner::imagePreprocess(
-    rt::LLMGenerationRequest const& request, std::vector<VisionSpan>& spans, cudaStream_t stream)
+void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<VisionSpan>& spans,
+    std::vector<int64_t>& spansPerRequest, cudaStream_t stream)
 {
     // Marshal each buffer's frames into the ViT scratch and append its spans. totalSeqLength doubles as the running
     // patch offset threaded across buffers, so after the loop it is the total ViT patch count.
@@ -414,11 +414,13 @@ void QwenViTRunner::imagePreprocess(
     int64_t imageCount = 0;
     for (auto const& req : request.requests)
     {
+        size_t const spansBefore = spans.size();
         for (auto const& image : req.imageBuffers)
         {
             if (image.doResize)
             {
-                auto [resizedHeight, resizedWidth] = getResizedImageSize(image.frames, image.height, image.width);
+                auto [resizedHeight, resizedWidth]
+                    = getResizedImageSize(image.frames, image.isVideo, image.height, image.width);
                 kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
                     image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, resizedHeight, resizedWidth,
                     stream);
@@ -434,6 +436,7 @@ void QwenViTRunner::imagePreprocess(
             }
             ++imageCount;
         }
+        spansPerRequest.push_back(static_cast<int64_t>(spans.size() - spansBefore));
     }
 
     if (totalSeqLength == 0)
@@ -502,8 +505,8 @@ void QwenViTRunner::imagePreprocess(
     }
 }
 
-void QwenViTRunner::getMRopePositionIds(
-    std::vector<std::vector<int32_t>> const& batchInputIds, std::vector<VisionSpan> const& spans) noexcept
+void QwenViTRunner::getMRopePositionIds(std::vector<std::vector<int32_t>> const& batchInputIds,
+    std::vector<VisionSpan> const& spans, std::vector<int64_t> const& spansPerRequest) noexcept
 {
     // Mirrors HF Qwen2VLModel.get_rope_index (base = Qwen2-VL; also serves Qwen3-VL, whose sub-spans are llmGridT==1).
     // Temporal step is 1 (HF t_index = arange(grid_t)); span advance is spatial max(llmGridH, llmGridW).
@@ -515,8 +518,11 @@ void QwenViTRunner::getMRopePositionIds(
     int64_t batchOffset = 0;
 
     mMropeRopeDeltasPerBatch.clear();
-    for (auto const& inputIds : batchInputIds)
+    for (size_t r = 0; r < batchInputIds.size(); ++r)
     {
+        auto const& inputIds = batchInputIds[r];
+        // Per-request span window: a visual block may only consume this request's own spans.
+        int64_t const spanEnd = totalImageIdx + (r < spansPerRequest.size() ? spansPerRequest[r] : 0);
         auto start = inputIds.begin();
         auto end = inputIds.end();
         auto it = inputIds.begin();
@@ -528,8 +534,9 @@ void QwenViTRunner::getMRopePositionIds(
         {
             // A visual block is a <|vision_start|> immediately followed by visual placeholders
             // (textPreprocess fills pads with the constant imageTokenId). Defensive: a start token
-            // followed by anything else (e.g. plain text) is not a span and must not consume one.
-            if (it + 1 == end || *(it + 1) != mConfig.imageTokenId)
+            // followed by anything else (e.g. plain text), or one beyond this request's span
+            // window, is not a span and must not consume one.
+            if (it + 1 == end || *(it + 1) != mConfig.imageTokenId || totalImageIdx >= spanEnd)
             {
                 searchFrom = it + 1;
                 continue;
@@ -585,12 +592,14 @@ void QwenViTRunner::getMRopePositionIds(
             }
         }
 
+        totalImageIdx = spanEnd; // seal the window: unconsumed spans never leak forward
         batchOffset += 3 * maxPositionEmbeddings;
     }
 }
 
 void QwenViTRunner::generateMropeParams(std::vector<std::vector<int32_t>> const& batchInputIds,
-    std::vector<VisionSpan> const& spans, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
+    std::vector<VisionSpan> const& spans, std::vector<int64_t> const& spansPerRequest,
+    rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
 {
     int64_t const activeBatchSize = batchInputIds.size();
     auto ropeRotaryCosSinDim = ropeRotaryCosSinDevice.getShape();
@@ -620,7 +629,7 @@ void QwenViTRunner::generateMropeParams(std::vector<std::vector<int32_t>> const&
                 + " exceeds the engine's maxPositionEmbeddings " + std::to_string(maxPositionEmbeddings)
                 + "; shorten the prompt or reduce the media");
     }
-    getMRopePositionIds(batchInputIds, spans);
+    getMRopePositionIds(batchInputIds, spans, spansPerRequest);
     CUDA_CHECK(cudaMemcpyAsync(mMropePositionIdsDevice.rawPointer(), mMropePositionIdsHost.rawPointer(),
         activeBatchSize * 3 * maxPositionEmbeddings * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
 
@@ -635,10 +644,13 @@ void QwenViTRunner::generateMropeParams(std::vector<std::vector<int32_t>> const&
 
 void QwenViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchInputIds, std::vector<VisionSpan> const& spans,
-    trt_edgellm::tokenizer::Tokenizer const* tokenizer)
+    std::vector<int64_t> const& spansPerRequest, trt_edgellm::tokenizer::Tokenizer const* tokenizer)
 {
     // Flat visual-pad expansion: each vision pad (<|image_pad|>/<|video_pad|>) -> its span's numTokens copies of
     // mConfig.imageTokenId (matches HF); embeddingLookup fills those positions from the visual embeds.
+    ELLM_CHECK(spansPerRequest.size() == request.requests.size(),
+        "spansPerRequest.size() != request.requests.size(), " + std::to_string(spansPerRequest.size())
+            + " != " + std::to_string(request.requests.size()));
     size_t spanIdx = 0;
 
     for (size_t i = 0; i < request.requests.size(); ++i)
@@ -654,13 +666,17 @@ void QwenViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
             ids = tokenizer->encode(request.formattedRequests[i].formattedCompleteRequest);
         }
 
+        // Per-request span window: a pad may only consume this request's own spans (batch isolation).
+        size_t const spanEnd = spanIdx + static_cast<size_t>(spansPerRequest[i]);
+
         std::vector<int32_t> newIds;
         for (size_t j = 0; j < ids.size(); ++j)
         {
             if (ids[j] == mConfig.imageTokenId || ids[j] == mConfig.videoTokenId)
             {
-                ELLM_CHECK(spanIdx < spans.size(),
-                    "Pad token found but no matching vision span at index " + std::to_string(spanIdx));
+                ELLM_CHECK(spanIdx < spanEnd,
+                    "EDGELLM_BAD_MEDIA_COUNT: QwenViTRunner::textPreprocess() pad count exceeds this request's media "
+                    "count");
                 LlmVisionBlock const& block = spans[spanIdx++].llm;
                 for (int64_t k = 0; k < block.numTokens; ++k)
                 {
@@ -672,6 +688,9 @@ void QwenViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
                 newIds.push_back(ids[j]);
             }
         }
+        ELLM_CHECK(spanIdx == spanEnd,
+            "EDGELLM_BAD_MEDIA_COUNT: QwenViTRunner::textPreprocess() pad count is smaller than this request's media "
+            "count");
 
         if (i < batchInputIds.size())
         {
@@ -689,10 +708,11 @@ bool QwenViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly)
 {
     std::vector<VisionSpan> spans; // per-request vision layout; lives only across this call
+    std::vector<int64_t> spansPerRequest;
 
     try
     {
-        imagePreprocess(request, spans, stream);
+        imagePreprocess(request, spans, spansPerRequest, stream);
         if (!imageOnly)
         {
             if (!mropeCosSinOut.has_value())
@@ -700,20 +720,24 @@ bool QwenViTRunner::preprocess(rt::LLMGenerationRequest const& request,
                 LOG_ERROR("mropeCosSinOut is required when imageOnly=false.");
                 return false;
             }
-            textPreprocess(request, batchedInputIds, spans, tokenizer);
-            generateMropeParams(batchedInputIds, spans, mropeCosSinOut.value().get(), stream);
+            textPreprocess(request, batchedInputIds, spans, spansPerRequest, tokenizer);
+            generateMropeParams(batchedInputIds, spans, spansPerRequest, mropeCosSinOut.value().get(), stream);
         }
     }
     catch (std::exception const& e)
     {
-        if (std::string(e.what()).find("EDGELLM_INPUT_TOO_LONG") != std::string::npos)
+        bool const actionable = isCallerActionable(e);
+        if (!actionable)
         {
-            throw; // caller-actionable input error: propagate instead of swallowing to false
+            LOG_ERROR("Failed: %s", e.what());
         }
-        LOG_ERROR("Failed: %s", e.what());
         // Drain async H2D copies that may still read the request's image buffers, so the caller can
-        // safely release them after the failure.
+        // safely release them after the failure -- including when the error propagates.
         cudaStreamSynchronize(stream);
+        if (actionable)
+        {
+            throw;
+        }
         return false;
     }
 
@@ -746,7 +770,7 @@ bool QwenViTRunner::preprocessSystemPrompt(std::string const& systemPrompt, toke
 
     try
     {
-        generateMropeParams(batchedInputIds, {}, mropeCosSinOut.value().get(), stream);
+        generateMropeParams(batchedInputIds, {}, {}, mropeCosSinOut.value().get(), stream);
     }
     catch (std::exception const& e)
     {

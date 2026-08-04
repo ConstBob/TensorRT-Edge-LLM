@@ -22,6 +22,7 @@
 #include <pybind11/stl.h>
 #include <pybind11/stl/filesystem.h>
 
+#include "builder/audioBuilder.h"
 #include "builder/llmBuilder.h"
 #include "builder/visualBuilder.h"
 #include "common/checkMacros.h"
@@ -446,10 +447,11 @@ imageUtils::ImageData loadImageFromBytes(py::bytes const& data)
 //! Decodes via vendored miniaudio (16 kHz mono FP32) and hands raw PCM off to
 //! the runner; mel extraction happens inside the audio runner per its
 //! ``audio/config.json``.
-audioUtils::AudioData loadAudioBufferFromBytes(py::bytes data)
+//! Takes std::string (not py::bytes) so the argument caster copies the bytes
+//! while the GIL is held; the pure-C++ body then runs under gil_scoped_release.
+audioUtils::AudioData loadAudioBufferFromBytes(std::string const& dataStr)
 {
     constexpr int32_t kTargetSampleRate = 16000;
-    std::string dataStr = data;
     audioUtils::AudioData audio;
     if (!audioUtils::loadAudioDataFromBytes(
             reinterpret_cast<uint8_t const*>(dataStr.data()), dataStr.size(), kTargetSampleRate, audio))
@@ -588,8 +590,10 @@ PYBIND11_MODULE(_edgellm_runtime, m)
             check::check(std::isfinite(fps) && fps > 0.0, "fps must be a positive finite number");
             return imageUtils::loadVideoFromFrames(framePaths, fps);
         },
-        py::arg("frame_paths"), py::arg("fps") = 1.0,
+        py::arg("frame_paths"), py::arg("fps") = 1.0, py::call_guard<py::gil_scoped_release>(),
         "Load a video by stacking identically-sized image files into one (T, H, W, 3) ImageData");
+    // No gil_scoped_release for load_video_from_array: its body reads the
+    // py::array buffer, which requires the GIL.
     m.def("load_video_from_array", &loadVideoFromArray, py::arg("array"), py::arg("fps") = 1.0,
         py::arg("timestamps") = std::vector<double>{}, "Build a video ImageData from a (T, H, W, 3) uint8 numpy array");
 
@@ -598,9 +602,16 @@ PYBIND11_MODULE(_edgellm_runtime, m)
     // ========================================================================
     py::class_<audioUtils::AudioData>(m, "AudioData")
         .def(py::init<>())
-        .def_readwrite("sample_rate", &audioUtils::AudioData::sampleRate);
+        .def_readwrite("sample_rate", &audioUtils::AudioData::sampleRate)
+        .def_property_readonly(
+            "num_samples",
+            [](audioUtils::AudioData const& audio) {
+                return audio.pcm ? static_cast<int64_t>(audio.pcm->samples.size()) : int64_t{0};
+            },
+            "Number of decoded PCM samples (0 when no PCM is attached)");
 
     m.def("load_audio_buffer_from_bytes", &loadAudioBufferFromBytes, py::arg("data"),
+        py::call_guard<py::gil_scoped_release>(),
         "Build an AudioData from raw encoded audio bytes (wav/mp3/flac). "
         "Decodes to mono FP32 PCM @ 16 kHz via miniaudio; the audio runner "
         "extracts mel internally per its audio/config.json.");
@@ -774,7 +785,8 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readwrite("output_ids", &LLMGenerationResponse::outputIds)
         .def_readwrite("output_texts", &LLMGenerationResponse::outputTexts)
         .def_readwrite("logprobs", &LLMGenerationResponse::logprobs)
-        .def_readonly("finish_reasons", &LLMGenerationResponse::finishReasons);
+        .def_readonly("finish_reasons", &LLMGenerationResponse::finishReasons)
+        .def_readonly("prompt_token_counts", &LLMGenerationResponse::inputTokenCounts);
 
     // ========================================================================
     // Runtime: unified (vanilla + Eagle speculative decoding)
@@ -865,6 +877,23 @@ PYBIND11_MODULE(_edgellm_runtime, m)
             py::init<std::filesystem::path const&, std::filesystem::path const&, builder::VisualBuilderConfig const&>(),
             py::arg("onnx_dir"), py::arg("engine_dir"), py::arg("config"))
         .def("build", &builder::VisualBuilder::build, "Build the TensorRT visual engine. Returns True on success.");
+
+    // ========================================================================
+    // Builder: Audio
+    // ========================================================================
+    py::class_<builder::AudioBuilderConfig>(
+        m, "AudioBuilderConfig", "Configuration for building TensorRT audio encoder engines from ONNX.")
+        .def(py::init<>())
+        .def_readwrite("min_time_steps", &builder::AudioBuilderConfig::minTimeSteps)
+        .def_readwrite("max_time_steps", &builder::AudioBuilderConfig::maxTimeSteps)
+        .def_readwrite("use_trt_native_audio_attn", &builder::AudioBuilderConfig::useTrtNativeAudioAttn)
+        .def("__repr__", &builder::AudioBuilderConfig::toString);
+
+    py::class_<builder::AudioBuilder>(
+        m, "AudioBuilder", "Build a TensorRT engine for an audio encoder from an ONNX directory.")
+        .def(py::init<std::filesystem::path const&, std::filesystem::path const&, builder::AudioBuilderConfig const&>(),
+            py::arg("onnx_dir"), py::arg("engine_dir"), py::arg("config"))
+        .def("build", &builder::AudioBuilder::build, "Build the TensorRT audio engine. Returns True on success.");
 
     // ========================================================================
     // Convenience: create_generation_request

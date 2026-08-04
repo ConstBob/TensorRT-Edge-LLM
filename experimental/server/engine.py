@@ -66,16 +66,14 @@ _LOGIT_BIAS_SPEC_DECODE_ERROR = (
     "logit_bias is not supported while speculative decoding is enabled; "
     "set disable_spec_decode=true or use a vanilla engine")
 
-_VLM_MODEL_TYPES = frozenset([
-    "qwen3_vl",
-    "qwen3_omni",
-    "qwen3_5",
-    "qwen2_5_vl",
-    "internvl",
-    "internvl_chat",
-    "phi4mm",
-    "phi4_multimodal",
-])
+
+def _exporter_model_types():
+    """Visual/audio classification read from the exporter, so the server cannot
+    drift behind it. The sets are orthogonal: an Omni checkpoint is in both."""
+    from tensorrt_edgellm.scripts import export as _export
+
+    return _export._VLM_MODEL_TYPES, _export._AUDIO_MODEL_TYPES
+
 
 # ---------------------------------------------------------------------------
 # Public data classes
@@ -372,13 +370,13 @@ def _engine_config_tag(
 
 def _is_multimodal(model_dir: str) -> bool:
     """Visual-encoder model_type in config.json (audio model types are
-    detected separately via _AUDIO_MODEL_TYPES)."""
+    detected separately via the exporter audio set)."""
     cfg_path = os.path.join(model_dir, "config.json")
     if not os.path.exists(cfg_path):
         return False
     with open(cfg_path) as f:
         cfg = json.load(f)
-    return cfg.get("model_type", "") in _VLM_MODEL_TYPES
+    return cfg.get("model_type", "") in _exporter_model_types()[0]
 
 
 def _read_model_type(model_dir: str) -> str:
@@ -588,6 +586,7 @@ class LLM:
         *,
         onnx_dir: str = "",
         visual_onnx_dir: str = "",
+        audio_onnx_dir: str = "",
         engine_dir: str = "",
         multimodal_engine_dir: str = "",
         visual_engine_dir: str = "",
@@ -611,6 +610,10 @@ class LLM:
             raise ValueError(
                 "'visual_onnx_dir' is only supported with 'onnx_dir'; "
                 "use 'visual_engine_dir' with 'engine_dir'.")
+        if audio_onnx_dir and not onnx_dir:
+            raise ValueError(
+                "'audio_onnx_dir' is only supported with 'onnx_dir'; "
+                "use 'multimodal_engine_dir' with 'engine_dir'.")
         if visual_engine_dir and not engine_dir:
             raise ValueError(
                 "'visual_engine_dir' is only supported with 'engine_dir'.")
@@ -640,6 +643,8 @@ class LLM:
             self._init_from_onnx(
                 onnx_dir,
                 visual_onnx_dir=visual_onnx_dir,
+                audio_onnx_dir=audio_onnx_dir,
+                multimodal_engine_dir=multimodal_engine_dir,
                 max_input_len=max_input_len,
                 max_batch_size=max_batch_size,
                 max_kv_cache_capacity=max_kv_cache_capacity,
@@ -647,6 +652,7 @@ class LLM:
         else:
             self._init_from_model(
                 model,
+                multimodal_engine_dir=multimodal_engine_dir,
                 max_input_len=max_input_len,
                 max_batch_size=max_batch_size,
                 max_kv_cache_capacity=max_kv_cache_capacity,
@@ -706,8 +712,8 @@ class LLM:
 
         if multimodal_engine_dir:
             if not validate_multimodal_engine_dir(multimodal_engine_dir):
-                raise ValueError(
-                    f"visual.engine not found in: {multimodal_engine_dir}")
+                raise ValueError(f"no visual or audio encoder engine "
+                                 f"found in: {multimodal_engine_dir}")
             self._multimodal_engine_dir = multimodal_engine_dir
             self._is_multimodal = True
         else:
@@ -724,18 +730,30 @@ class LLM:
         onnx_dir: str,
         *,
         visual_onnx_dir: str,
+        audio_onnx_dir: str = "",
+        multimodal_engine_dir: str = "",
         max_input_len: int,
         max_batch_size: int,
         max_kv_cache_capacity: int,
     ) -> None:
         """Build engine from ONNX directories (no export)."""
+        from .engine_layout import validate_multimodal_engine_dir
         self._max_input_len = max_input_len
         self._max_batch_size = max_batch_size
         self._max_kv_cache_capacity = max_kv_cache_capacity
         self._onnx_dir = onnx_dir
         self._visual_onnx_dir = visual_onnx_dir
+        self._audio_onnx_dir = audio_onnx_dir
         self._model_dir = onnx_dir
-        self._is_multimodal = bool(visual_onnx_dir)
+        self._is_multimodal = bool(visual_onnx_dir or audio_onnx_dir
+                                   or multimodal_engine_dir)
+
+        # Validated up front: a typo must not surface only after the LLM engine
+        # build, which can take tens of minutes.
+        if multimodal_engine_dir and not validate_multimodal_engine_dir(
+                multimodal_engine_dir):
+            raise ValueError(f"no visual or audio encoder engine "
+                             f"found in: {multimodal_engine_dir}")
 
         cfg_tag = _engine_config_tag(max_input_len, max_batch_size,
                                      max_kv_cache_capacity)
@@ -752,26 +770,50 @@ class LLM:
             logger.info("Using cached engine: %s", self._engine_dir)
 
         self._multimodal_engine_dir = ""
-        if self._is_multimodal:
+        if multimodal_engine_dir:
+            # A user-supplied prebuilt encoder wins over auto-built artifacts.
+            self._multimodal_engine_dir = multimodal_engine_dir
+        elif visual_onnx_dir or audio_onnx_dir:
+            # One shared root: the C++ runtime reads visual.engine from it and
+            # the audio encoder from its audio/ subdirectory.
             self._multimodal_engine_dir = os.path.join(artifacts, "engine",
-                                                       cfg_tag, "visual")
-            if not os.path.exists(
-                    os.path.join(self._multimodal_engine_dir,
-                                 "visual.engine")):
-                self._build_visual_engine()
-            else:
-                logger.info("Using cached visual engine: %s",
-                            self._multimodal_engine_dir)
+                                                       cfg_tag, "multimodal")
+            if visual_onnx_dir:
+                if not os.path.exists(
+                        os.path.join(self._multimodal_engine_dir,
+                                     "visual.engine")):
+                    self._build_visual_engine()
+                else:
+                    logger.info("Using cached visual engine: %s",
+                                self._multimodal_engine_dir)
+            if audio_onnx_dir:
+                if not os.path.exists(
+                        os.path.join(self._multimodal_engine_dir, "audio",
+                                     "audio_encoder.engine")):
+                    self._build_audio_engine()
+                else:
+                    logger.info("Using cached audio engine: %s",
+                                self._multimodal_engine_dir)
 
     def _init_from_model(
         self,
         model: str,
         *,
+        multimodal_engine_dir: str = "",
         max_input_len: int,
         max_batch_size: int,
         max_kv_cache_capacity: int,
     ) -> None:
         """Export ONNX + build engine from HuggingFace checkpoint."""
+        from .engine_layout import validate_multimodal_engine_dir
+
+        # Validated before the LLM ONNX export below, which can take tens of
+        # minutes; _init_from_onnx re-checks for its own direct callers.
+        if multimodal_engine_dir and not validate_multimodal_engine_dir(
+                multimodal_engine_dir):
+            raise ValueError(f"no visual or audio encoder engine "
+                             f"found in: {multimodal_engine_dir}")
+
         self._max_input_len = max_input_len
         self._max_batch_size = max_batch_size
         self._max_kv_cache_capacity = max_kv_cache_capacity
@@ -781,17 +823,23 @@ class LLM:
         artifacts = _artifacts_dir_for_model(self._model_dir)
         self._is_multimodal = _is_multimodal(self._model_dir)
         self._model_type = _read_model_type(self._model_dir)
+        self._is_audio_model = self._model_type in _exporter_model_types()[1]
         if self._is_multimodal:
             logger.info("Detected VLM model (type=%s)", self._model_type)
+        elif self._is_audio_model:
+            logger.info("Detected audio model (type=%s)", self._model_type)
 
         self._onnx_dir = os.path.join(artifacts, "onnx", "llm")
         if not os.path.exists(os.path.join(self._onnx_dir, "model.onnx")):
             self._export_onnx()
         else:
             logger.info("Using cached ONNX: %s", self._onnx_dir)
+            self._patch_multimodal_token_ids()
 
+        # A prebuilt multimodal engine dir wins, so exporting encoder ONNX would
+        # only be discarded by _init_from_onnx.
         self._visual_onnx_dir = ""
-        if self._is_multimodal:
+        if self._is_multimodal and not multimodal_engine_dir:
             self._visual_onnx_dir = os.path.join(artifacts, "onnx", "visual")
             if not os.path.exists(
                     os.path.join(self._visual_onnx_dir, "model.onnx")):
@@ -800,10 +848,22 @@ class LLM:
                 logger.info("Using cached visual ONNX: %s",
                             self._visual_onnx_dir)
 
+        self._audio_onnx_dir = ""
+        if self._is_audio_model and not multimodal_engine_dir:
+            self._audio_onnx_dir = os.path.join(artifacts, "onnx", "audio")
+            if not os.path.exists(
+                    os.path.join(self._audio_onnx_dir, "model.onnx")):
+                self._export_audio_onnx()
+            else:
+                logger.info("Using cached audio ONNX: %s",
+                            self._audio_onnx_dir)
+
         # Delegate to _init_from_onnx for the build step
         self._init_from_onnx(
             self._onnx_dir,
             visual_onnx_dir=self._visual_onnx_dir,
+            audio_onnx_dir=self._audio_onnx_dir,
+            multimodal_engine_dir=multimodal_engine_dir,
             max_input_len=max_input_len,
             max_batch_size=max_batch_size,
             max_kv_cache_capacity=max_kv_cache_capacity,
@@ -885,25 +945,34 @@ class LLM:
         output_path = os.path.join(self._onnx_dir, "model.onnx")
         export_onnx(model, output_path, model_dir=self._model_dir)
 
-        # Patch image_token_id for VLM models
+        self._patch_multimodal_token_ids()
+        logger.info("ONNX export complete: %s", output_path)
+
+    def _patch_multimodal_token_ids(self) -> None:
+        """Write the media placeholder ids into the LLM config. Idempotent, and
+        re-run on a cached ONNX: a config predating the encoder carries no id,
+        which the runtime reads as -1 and silently drops the embeddings."""
         if self._is_multimodal:
             _ensure_export_package()
             from tensorrt_edgellm.scripts.export import _find_token_id
             image_token_id = _find_token_id(self._model_dir, "<|image_pad|>")
-            if image_token_id is not None:
-                cfg_path = os.path.join(self._onnx_dir, "config.json")
-                if os.path.exists(cfg_path):
-                    with open(cfg_path) as f:
-                        cfg = json.load(f)
+            cfg_path = os.path.join(self._onnx_dir, "config.json")
+            if image_token_id is not None and os.path.exists(cfg_path):
+                with open(cfg_path) as f:
+                    cfg = json.load(f)
+                if cfg.get("image_token_id") != image_token_id:
                     cfg["image_token_id"] = image_token_id
                     with open(cfg_path, "w") as f:
                         json.dump(cfg, f, indent=2)
-                    logger.info(
-                        "Patched image_token_id=%d into LLM config",
-                        image_token_id,
-                    )
+                    logger.info("Patched image_token_id=%d into LLM config",
+                                image_token_id)
 
-        logger.info("ONNX export complete: %s", output_path)
+        if getattr(self, "_is_audio_model", False):
+            _ensure_export_package()
+            from tensorrt_edgellm.scripts.export import \
+                _patch_multimodal_token_ids
+            _patch_multimodal_token_ids(self._model_dir, self._onnx_dir,
+                                        self._model_type)
 
     def _export_visual_onnx(self) -> None:
         """Export the visual encoder to ONNX via tensorrt_edgellm."""
@@ -916,6 +985,7 @@ class LLM:
         import torch
 
         _ensure_export_package()
+        from tensorrt_edgellm.model import load_model_config
         from tensorrt_edgellm.scripts.export import (_export_visual,
                                                      _load_all_weights,
                                                      _load_config)
@@ -929,10 +999,45 @@ class LLM:
             config,
             self._model_type,
             torch.float16,
+            load_model_config(self._model_dir),
         )
         logger.info(
             "Visual ONNX export complete: %s",
             self._visual_onnx_dir,
+        )
+
+    def _export_audio_onnx(self) -> None:
+        """Export the audio encoder to ONNX via tensorrt_edgellm."""
+        logger.info(
+            "Exporting audio ONNX to %s ...",
+            self._audio_onnx_dir,
+        )
+        os.makedirs(self._audio_onnx_dir, exist_ok=True)
+
+        import torch
+
+        _ensure_export_package()
+        from tensorrt_edgellm.model import load_model_config
+        from tensorrt_edgellm.scripts.export import (_export_audio,
+                                                     _load_all_weights,
+                                                     _load_config)
+
+        config = _load_config(self._model_dir)
+        weights = _load_all_weights(self._model_dir)
+        # Passing the ModelConfig lets _export_audio subset it to the audio
+        # tower, so an NVFP4 backbone still exports an FP16 encoder.
+        _export_audio(
+            self._model_dir,
+            self._audio_onnx_dir,
+            weights,
+            config,
+            self._model_type,
+            torch.float16,
+            load_model_config(self._model_dir),
+        )
+        logger.info(
+            "Audio ONNX export complete: %s",
+            self._audio_onnx_dir,
         )
 
     def _build_engine(self) -> None:
@@ -994,6 +1099,36 @@ class LLM:
                                f"engine dir: {self._multimodal_engine_dir}")
         logger.info(
             "Visual engine build complete: %s",
+            self._multimodal_engine_dir,
+        )
+
+    def _build_audio_engine(self) -> None:
+        """Build a TensorRT engine for the audio encoder.
+
+        The engine and its config.json land in the audio/ subdirectory the
+        C++ runtime expects under the multimodal engine dir.
+        """
+        audio_engine_dir = os.path.join(self._multimodal_engine_dir, "audio")
+        logger.info(
+            "Building audio TensorRT engine: %s -> %s",
+            self._audio_onnx_dir,
+            audio_engine_dir,
+        )
+        os.makedirs(audio_engine_dir, exist_ok=True)
+
+        rt = _import_runtime()
+        config = rt.AudioBuilderConfig()
+        builder = rt.AudioBuilder(
+            self._audio_onnx_dir,
+            self._multimodal_engine_dir,  # AudioBuilder appends audio/ itself
+            config,
+        )
+        if not builder.build():
+            raise RuntimeError(f"Audio TensorRT engine build failed. "
+                               f"ONNX dir: {self._audio_onnx_dir}, "
+                               f"engine dir: {audio_engine_dir}")
+        logger.info(
+            "Audio engine build complete: %s",
             self._multimodal_engine_dir,
         )
 
@@ -1109,8 +1244,8 @@ class LLM:
                 int(builder["max_image_tokens"]),
                 "max_image_tokens_per_image":
                 int(builder.get("max_image_tokens_per_image", 0)),
-                "max_cu_seqlen_entries":
-                int(builder.get("max_cu_seqlen_entries", 0)),
+                "max_cu_seqlen_groups":
+                int(builder.get("max_cu_seqlen_groups", 0)),
                 "patch_size":
                 int(pre.get("patch_size", 0)),
                 "merge_size":
@@ -1455,11 +1590,17 @@ class LLM:
                     admission_handoff.release()
 
         worker = threading.Thread(target=_run, daemon=True)
-        worker.start()
+        # Transfer gate ownership before start(): the worker owns it the moment
+        # it may run (a join timeout below must not release it while the C++
+        # call still runs); a start() failure hands it back to the HTTP layer.
         if admission_handoff is not None:
-            # The worker owns the gate now: a join timeout below must not
-            # release it while the C++ call is still running.
             admission_handoff.worker_started()
+        try:
+            worker.start()
+        except BaseException:
+            if admission_handoff is not None:
+                admission_handoff.worker_start_failed()
+            raise
 
         try:
             while True:
@@ -1594,7 +1735,8 @@ class LLM:
               enable_batching: bool = False,
               batch_timeout_ms: float = 10.0,
               max_queue_batch_size: Optional[int] = None,
-              request_queue_size: Optional[int] = None) -> None:
+              request_queue_size: Optional[int] = None,
+              allowed_local_media_path: Optional[str] = None) -> None:
         """Start an OpenAI-compatible HTTP server.
 
         Args:
@@ -1606,6 +1748,8 @@ class LLM:
             request_queue_size: Max concurrently admitted requests (queued +
                 running) before the server returns backpressure. None uses the
                 server default.
+            allowed_local_media_path: Directory HTTP clients may reference local
+                media from. Unset rejects bare paths and ``file://`` URLs.
         """
         from .api_server import _DEFAULT_REQUEST_QUEUE_SIZE, run_server
 
@@ -1618,6 +1762,7 @@ class LLM:
             max_queue_batch_size=max_queue_batch_size,
             request_queue_size=(request_queue_size if request_queue_size
                                 is not None else _DEFAULT_REQUEST_QUEUE_SIZE),
+            allowed_local_media_path=allowed_local_media_path,
         )
 
     # ------------------------------------------------------------------
@@ -1840,7 +1985,7 @@ def _load_image_buffers(rt_module,
     # cu_seqlens binding): builder-recorded capacity, else the legacy formula.
     cu_budget = None
     if limits and family != "internvl":
-        cu_budget = (limits.get("max_cu_seqlen_entries")
+        cu_budget = (limits.get("max_cu_seqlen_groups")
                      or limits["max_image_tokens"] //
                      max(1, limits.get("min_image_tokens", 1)))
     image_upper = 0

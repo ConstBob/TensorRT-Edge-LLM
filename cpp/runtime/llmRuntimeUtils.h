@@ -190,6 +190,9 @@ struct LLMGenerationResponse
 
     //! Why each request halted (EOS, length, stop string, cancel, error); see `runtime/streaming.h`.
     std::vector<FinishReason> finishReasons;
+
+    //! Prompt length per request, counted after chat templating and media expansion.
+    std::vector<int32_t> inputTokenCounts;
 };
 
 /*! \brief RoPE (Rotary Position Embedding) type enumeration

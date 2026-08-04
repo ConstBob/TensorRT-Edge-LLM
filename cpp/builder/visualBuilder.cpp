@@ -22,6 +22,7 @@
 #include "common/logger.h"
 #include "common/trtUtils.h"
 #include "common/version.h"
+#include "multimodal/imageUtils.h"
 
 using namespace trt_edgellm;
 
@@ -349,9 +350,12 @@ bool VisualBuilder::setupQwenViTProfile(
         result &= setOptimizationProfile(&profile, binding_names::kRotaryPosEmb, createDims({minHW, ropeEmbedSize}),
             createDims({optHW, ropeEmbedSize}), createDims({maxHW, ropeEmbedSize}));
     }
-    int64_t maxNumImages = std::max<int64_t>(1, mBuilderConfig.maxImageTokens / mBuilderConfig.minImageTokens);
+    // OPT is the image-shaped group count -- TRT picks tactics from it, so widening MAX for
+    // per-frame video groups must not drag it along.
+    int64_t const optCuGroups = std::max<int64_t>(1, mBuilderConfig.maxImageTokens / mBuilderConfig.minImageTokens);
+    int64_t const maxCuGroups = rt::imageUtils::maxCuSeqlenGroups(mBuilderConfig.maxImageTokens);
     result &= setOptimizationProfile(&profile, binding_names::kCuSeqlens, createDims({2}),
-        createDims({maxNumImages + 1}), createDims({maxNumImages + 1}));
+        createDims({optCuGroups + 1}), createDims({maxCuGroups + 1}));
 
     // kv_lengths is required when using TRT-native attention (TRT >= 11).
     // Read the flag from the exporter's config.json.
@@ -359,7 +363,7 @@ bool VisualBuilder::setupQwenViTProfile(
     if (mBuilderConfig.useTrtNativeVitAttn)
     {
         result &= setOptimizationProfile(&profile, binding_names::kKvLengths, createDims({2}),
-            createDims({maxNumImages + 1}), createDims({maxNumImages + 1}));
+            createDims({optCuGroups + 1}), createDims({maxCuGroups + 1}));
     }
 
     // max_seqlen_carrier is only present when using the ViTAttentionPlugin path (TRT 10).
