@@ -929,7 +929,7 @@ TEST(RopePackedRaggedPrefill, SkipsPaddingBeforePagedWrite)
     int32_t constexpr combinedHeads = numQHeads + 2 * numKVHeads;
     int32_t constexpr kvCacheCapacity = 256;
     int32_t constexpr maxPagesPerSeq = 2;
-    int32_t constexpr numFlatPages = batchSize * 2 * maxPagesPerSeq;
+    int32_t constexpr numPages = batchSize * maxPagesPerSeq;
 
     rt::Tensor cosSinCacheTensor(
         rt::Coords{1, kvCacheCapacity, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
@@ -946,8 +946,8 @@ TEST(RopePackedRaggedPrefill, SkipsPaddingBeforePagedWrite)
         rt::Coords{batchSize, qSeqLen, numQHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
     half const sentinel = __float2half(777.0F);
     std::vector<half> kvCacheInit(
-        static_cast<size_t>(numFlatPages) * rt::kTOKENS_PER_PAGE * numKVHeads * headDim, sentinel);
-    rt::Tensor kvCacheTensor(rt::Coords{batchSize, 2, numKVHeads, kvCacheCapacity, headDim}, rt::DeviceType::kGPU,
+        static_cast<size_t>(2 * numPages) * rt::kTOKENS_PER_PAGE * numKVHeads * headDim, sentinel);
+    rt::Tensor kvCacheTensor(rt::Coords{2, numPages, rt::kTOKENS_PER_PAGE, numKVHeads, headDim}, rt::DeviceType::kGPU,
         nvinfer1::DataType::kHALF);
     copyHostToDevice(kvCacheTensor, kvCacheInit);
 
