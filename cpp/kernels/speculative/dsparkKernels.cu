@@ -30,12 +30,10 @@ namespace kernel
 namespace
 {
 
-static constexpr int32_t kArgmaxBlockSize = 512;
 static constexpr int32_t kProbabilityBlockSize = 256;
 static constexpr int32_t kMaxParallelTopK = 128;
 static constexpr int32_t kMarkovWarpsPerBlock = 16;
 static constexpr int32_t kMarkovBlockSize = kMarkovWarpsPerBlock * 32;
-static constexpr int32_t kMarkovBatchTileSize = 4;
 static constexpr float kSPSDraftCost = 0.50F;
 static constexpr float kSPSVerifyBaseCost = 1.00F;
 static constexpr float kSPSVerifyTokenCost = 0.45F;
@@ -406,151 +404,6 @@ __device__ float dsparkReduceSum(float localSum)
     }
     __syncthreads();
     return sSum[0];
-}
-
-__global__ void dsparkMarkovFinalizeArgmaxKernel(float const* __restrict__ partialValues, // [B, numVocabBlocks]
-    int32_t const* __restrict__ partialIndices,                                           // [B, numVocabBlocks]
-    int32_t* __restrict__ draftTokenIds,                                                  // [B, P]
-    int32_t step, int32_t proposalLen, int32_t numVocabBlocks)
-{
-    int32_t const batchIdx = blockIdx.x;
-    float localMax = -FLT_MAX;
-    int32_t localIdx = 0;
-    int32_t const partialBase = batchIdx * numVocabBlocks;
-
-    for (int32_t partialIdx = threadIdx.x; partialIdx < numVocabBlocks; partialIdx += blockDim.x)
-    {
-        float const val = partialValues[partialBase + partialIdx];
-        int32_t const idx = partialIndices[partialBase + partialIdx];
-        if (val > localMax || (val == localMax && idx < localIdx))
-        {
-            localMax = val;
-            localIdx = idx;
-        }
-    }
-
-    reduceMaxPair(localMax, localIdx);
-    if (threadIdx.x == 0)
-    {
-        draftTokenIds[batchIdx * proposalLen + step] = localIdx;
-    }
-}
-
-template <int32_t kBatchTileSize>
-__global__ void dsparkMarkovBatchTilePartialArgmaxKernel(float const* __restrict__ backboneLogits, // [B, P, V]
-    half const* __restrict__ markovW1,                                                             // [V, R]
-    half const* __restrict__ markovW2,                                                             // [V, R]
-    int32_t const* __restrict__ firstPrevTokens,                                                   // [B]
-    int32_t const* __restrict__ draftTokenIds,                                                     // [B, P]
-    float* __restrict__ partialValues,    // [B, numVocabBlocks]
-    int32_t* __restrict__ partialIndices, // [B, numVocabBlocks]
-    int32_t step, int32_t batchSize, int32_t proposalLen, int32_t vocabSize, int32_t markovRank, int32_t numVocabBlocks)
-{
-    static_assert(kBatchTileSize > 0);
-
-    int32_t const vocabBlockIdx = blockIdx.x;
-    int32_t const batchBase = blockIdx.y * kBatchTileSize;
-    int32_t const remainingBatchRows = batchSize - batchBase;
-    int32_t const rowsInTile = (remainingBatchRows < kBatchTileSize) ? remainingBatchRows : kBatchTileSize;
-    int32_t const warpId = threadIdx.x / 32;
-    int32_t const laneId = threadIdx.x % 32;
-    int32_t const vocabIdx = vocabBlockIdx * kMarkovWarpsPerBlock + warpId;
-
-    half const* prevMarkov[kBatchTileSize];
-    float const* stepLogits[kBatchTileSize];
-    float bias[kBatchTileSize];
-    float localMax[kBatchTileSize];
-    int32_t localIdx[kBatchTileSize];
-
-#pragma unroll
-    for (int32_t tileIdx = 0; tileIdx < kBatchTileSize; ++tileIdx)
-    {
-        if (tileIdx < rowsInTile)
-        {
-            int32_t const batchIdx = batchBase + tileIdx;
-            int32_t const prevToken
-                = (step == 0) ? firstPrevTokens[batchIdx] : draftTokenIds[batchIdx * proposalLen + step - 1];
-            prevMarkov[tileIdx] = markovW1 + static_cast<int64_t>(prevToken) * markovRank;
-            stepLogits[tileIdx] = backboneLogits + (static_cast<int64_t>(batchIdx) * proposalLen + step) * vocabSize;
-        }
-        bias[tileIdx] = 0.0F;
-        localMax[tileIdx] = -FLT_MAX;
-        localIdx[tileIdx] = 0;
-    }
-
-    if (vocabIdx < vocabSize)
-    {
-        half const* vocabMarkov = markovW2 + static_cast<int64_t>(vocabIdx) * markovRank;
-        if ((markovRank & 1) == 0)
-        {
-            int32_t const markovRank2 = markovRank / 2;
-            half2 const* vocabMarkov2 = reinterpret_cast<half2 const*>(vocabMarkov);
-            for (int32_t r2 = laneId; r2 < markovRank2; r2 += 32)
-            {
-                float2 const vocabValue = __half22float2(vocabMarkov2[r2]);
-#pragma unroll
-                for (int32_t tileIdx = 0; tileIdx < kBatchTileSize; ++tileIdx)
-                {
-                    if (tileIdx < rowsInTile)
-                    {
-                        half2 const* prevMarkov2 = reinterpret_cast<half2 const*>(prevMarkov[tileIdx]);
-                        float2 const prevValue = __half22float2(prevMarkov2[r2]);
-                        bias[tileIdx] += prevValue.x * vocabValue.x + prevValue.y * vocabValue.y;
-                    }
-                }
-            }
-        }
-        else
-        {
-            for (int32_t r = laneId; r < markovRank; r += 32)
-            {
-                float const vocabValue = __half2float(vocabMarkov[r]);
-#pragma unroll
-                for (int32_t tileIdx = 0; tileIdx < kBatchTileSize; ++tileIdx)
-                {
-                    if (tileIdx < rowsInTile)
-                    {
-                        bias[tileIdx] += __half2float(prevMarkov[tileIdx][r]) * vocabValue;
-                    }
-                }
-            }
-        }
-        for (int32_t offset = 16; offset > 0; offset >>= 1)
-        {
-#pragma unroll
-            for (int32_t tileIdx = 0; tileIdx < kBatchTileSize; ++tileIdx)
-            {
-                if (tileIdx < rowsInTile)
-                {
-                    bias[tileIdx] += __shfl_down_sync(0xFFFFFFFF, bias[tileIdx], offset);
-                }
-            }
-        }
-        if (laneId == 0)
-        {
-#pragma unroll
-            for (int32_t tileIdx = 0; tileIdx < kBatchTileSize; ++tileIdx)
-            {
-                if (tileIdx < rowsInTile)
-                {
-                    localMax[tileIdx] = stepLogits[tileIdx][vocabIdx] + bias[tileIdx];
-                    localIdx[tileIdx] = vocabIdx;
-                }
-            }
-        }
-    }
-
-    for (int32_t tileIdx = 0; tileIdx < rowsInTile; ++tileIdx)
-    {
-        reduceMaxPair(localMax[tileIdx], localIdx[tileIdx]);
-        if (threadIdx.x == 0)
-        {
-            int32_t const batchIdx = batchBase + tileIdx;
-            int32_t const partialOffset = batchIdx * numVocabBlocks + vocabBlockIdx;
-            partialValues[partialOffset] = localMax[tileIdx];
-            partialIndices[partialOffset] = localIdx[tileIdx];
-        }
-    }
 }
 
 __global__ void dsparkBuildVerifyTokensKernel(int32_t const* __restrict__ lastAcceptedTokens, // [B]
@@ -1281,32 +1134,6 @@ int32_t dsparkMarkovPartialCount(int32_t vocabSize)
     return (vocabSize + kMarkovWarpsPerBlock - 1) / kMarkovWarpsPerBlock;
 }
 
-void dsparkVanillaMarkovGreedy(rt::Tensor const& backboneLogits, rt::Tensor const& markovW1, rt::Tensor const& markovW2,
-    rt::Tensor const& firstPrevTokens, rt::Tensor& draftTokenIds, rt::Tensor& partialValues, rt::Tensor& partialIndices,
-    int32_t batchSize, int32_t proposalLen, int32_t vocabSize, int32_t markovRank, cudaStream_t stream)
-{
-    int32_t const numVocabBlocks = dsparkMarkovPartialCount(vocabSize);
-
-    for (int32_t step = 0; step < proposalLen; ++step)
-    {
-        int32_t const numBatchTiles = (batchSize + kMarkovBatchTileSize - 1) / kMarkovBatchTileSize;
-        dim3 const partialGrid(numVocabBlocks, numBatchTiles);
-        dsparkMarkovBatchTilePartialArgmaxKernel<kMarkovBatchTileSize><<<partialGrid, kMarkovBlockSize, 0, stream>>>(
-            static_cast<float const*>(backboneLogits.rawPointer()), static_cast<half const*>(markovW1.rawPointer()),
-            static_cast<half const*>(markovW2.rawPointer()), static_cast<int32_t const*>(firstPrevTokens.rawPointer()),
-            static_cast<int32_t const*>(draftTokenIds.rawPointer()), static_cast<float*>(partialValues.rawPointer()),
-            static_cast<int32_t*>(partialIndices.rawPointer()), step, batchSize, proposalLen, vocabSize, markovRank,
-            numVocabBlocks);
-        CUDA_CHECK(cudaGetLastError());
-
-        dsparkMarkovFinalizeArgmaxKernel<<<batchSize, kArgmaxBlockSize, 0, stream>>>(
-            static_cast<float const*>(partialValues.rawPointer()),
-            static_cast<int32_t const*>(partialIndices.rawPointer()), static_cast<int32_t*>(draftTokenIds.rawPointer()),
-            step, proposalLen, numVocabBlocks);
-        CUDA_CHECK(cudaGetLastError());
-    }
-}
-
 void dsparkBuildVerifyTokens(rt::Tensor const& lastAcceptedTokens, rt::Tensor const& draftTokenIds,
     rt::Tensor& verifyTokenIds, int32_t batchSize, int32_t draftStride, int32_t verifyProposalLen, cudaStream_t stream)
 {
@@ -1390,6 +1217,21 @@ void dsparkComputeConfidenceAndSPSProposalLengths(rt::Tensor const& draftHiddenS
     dsparkSPSProposalLengthsKernel<<<batchSize, 1, 0, stream>>>(
         static_cast<float const*>(confidenceScores.rawPointer()), static_cast<int32_t*>(proposalLengths.rawPointer()),
         batchSize, proposalLen, survivalFloor, minProposalLen, maxProposalLen);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void dsparkComputeConfidenceScores(rt::Tensor const& draftHiddenStates, rt::Tensor const& markovW1,
+    rt::Tensor const& confidenceWeight, rt::Tensor const& confidenceBias, rt::Tensor const& firstPrevTokens,
+    rt::Tensor const& draftTokenIds, rt::Tensor& confidenceScores, int32_t batchSize, int32_t proposalLen,
+    int32_t hiddenSize, int32_t markovRank, bool confidenceWithMarkov, cudaStream_t stream)
+{
+    dim3 const confidenceGrid(proposalLen, batchSize);
+    dsparkConfidenceKernel<<<confidenceGrid, kProbabilityBlockSize, 0, stream>>>(
+        static_cast<half const*>(draftHiddenStates.rawPointer()), static_cast<half const*>(markovW1.rawPointer()),
+        static_cast<half const*>(confidenceWeight.rawPointer()), static_cast<half const*>(confidenceBias.rawPointer()),
+        static_cast<int32_t const*>(firstPrevTokens.rawPointer()),
+        static_cast<int32_t const*>(draftTokenIds.rawPointer()), static_cast<float*>(confidenceScores.rawPointer()),
+        proposalLen, hiddenSize, markovRank, confidenceWithMarkov);
     CUDA_CHECK(cudaGetLastError());
 }
 

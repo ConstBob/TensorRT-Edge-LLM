@@ -442,8 +442,12 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
         }
         else
         {
-            bool const mtpTree = cfg.base.specDecodeType == SpecDecodeMode::kMTP && specConfig.draftingTopK > 1;
-            int64_t const requiredDraftInputSize = mtpTree
+            // For MTP/DSpark tree drafting, draftingTopK is the DDTree candidate fanout
+            // applied after drafting, not a draft-input multiplier.
+            bool const fanoutTree = (cfg.base.specDecodeType == SpecDecodeMode::kMTP
+                                        || cfg.base.specDecodeType == SpecDecodeMode::kDSpark)
+                && specConfig.draftingTopK > 1;
+            int64_t const requiredDraftInputSize = fanoutTree
                 ? static_cast<int64_t>(specConfig.draftingStep)
                 : static_cast<int64_t>(specConfig.draftingStep) * static_cast<int64_t>(specConfig.draftingTopK);
 
@@ -543,22 +547,66 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
         if (cfg.base.specDecodeType == SpecDecodeMode::kDSpark)
         {
             static constexpr int32_t kDSparkMaxVerifySizeForCurrentUtilityKernels = 17;
-            int32_t const proposalLen = specConfig.verifySize - 1;
-            ELLM_CHECK(specConfig.draftingTopK == 1 && specConfig.draftingStep == 1,
-                "DSpark Phase 1 supports draftingTopK=1 and draftingStep=1 only.");
-            ELLM_CHECK(proposalLen > 0,
-                "DSpark verifySize must be at least 2 because base verification is [anchor] + draft tokens.");
+            // Tree-mode limits come from the shared DDTree build kernel (ddtreeKernels.h).
+            static constexpr int32_t kDSparkTreeMaxVerifySize = 128;
+            static constexpr int32_t kDSparkTreeMaxCandidateFanout = 8;
+            static constexpr int32_t kDSparkTreeMaxAcceptedPathLength = 16;
+
+            ELLM_CHECK(
+                specConfig.draftingStep == 1, "DSpark drafts one full block per iteration; draftingStep must be 1.");
+            ELLM_CHECK(cfg.draft.has_value(), "DSpark requires a draft engine.");
+
+            bool const useTree = specConfig.draftingTopK > 1;
+            // Tree decouples the proposal from the verify window: the draft always
+            // emits the full block and verifySize is the tree node budget.
+            int32_t const proposalLen = useTree ? cfg.draft->specDraftBlockSize : specConfig.verifySize - 1;
+
+            if (!useTree)
+            {
+                ELLM_CHECK(proposalLen > 0,
+                    "DSpark verifySize must be at least 2 because base verification is [anchor] + draft tokens.");
+                ELLM_CHECK(proposalLen <= cfg.draft->specDraftBlockSize,
+                    "DSpark proposalLen=" + std::to_string(proposalLen)
+                        + " exceeds dspark_config.block_size=" + std::to_string(cfg.draft->specDraftBlockSize) + ".");
+                ELLM_CHECK(specConfig.verifySize <= kDSparkMaxVerifySizeForCurrentUtilityKernels,
+                    "DSpark verifySize=" + std::to_string(specConfig.verifySize)
+                        + " exceeds current DSpark utility kernel max depth of "
+                        + std::to_string(kDSparkMaxVerifySizeForCurrentUtilityKernels) + ".");
+            }
+            else
+            {
+                ELLM_CHECK(specConfig.draftingTopK < specConfig.verifySize,
+                    "DSpark DDTree candidateTopK=" + std::to_string(specConfig.draftingTopK)
+                        + " must be less than verifySize=" + std::to_string(specConfig.verifySize)
+                        + " because the root consumes one verification node.");
+                ELLM_CHECK(specConfig.draftingTopK <= kDSparkTreeMaxCandidateFanout,
+                    "DSpark DDTree candidateTopK=" + std::to_string(specConfig.draftingTopK)
+                        + " exceeds the current DDTree candidateTopK limit of "
+                        + std::to_string(kDSparkTreeMaxCandidateFanout) + ".");
+                ELLM_CHECK(specConfig.draftingTopK <= cfg.draft->outputVocabSize,
+                    "DSpark DDTree candidateTopK=" + std::to_string(specConfig.draftingTopK)
+                        + " exceeds draft output vocabulary size=" + std::to_string(cfg.draft->outputVocabSize) + ".");
+                ELLM_CHECK(specConfig.verifySize <= kDSparkTreeMaxVerifySize,
+                    "DSpark DDTree verifySize=" + std::to_string(specConfig.verifySize)
+                        + " exceeds node budget limit of " + std::to_string(kDSparkTreeMaxVerifySize) + ".");
+                int32_t const maxAcceptedPathLength = std::min(proposalLen + 1, specConfig.verifySize);
+                ELLM_CHECK(maxAcceptedPathLength <= kDSparkTreeMaxAcceptedPathLength,
+                    "DSpark DDTree max accepted path length=" + std::to_string(maxAcceptedPathLength)
+                        + " exceeds indexed commit path limit of " + std::to_string(kDSparkTreeMaxAcceptedPathLength)
+                        + ".");
+                // threshold enables confidence-guided growth; SPS schedules verify
+                // cost, which a fixed node budget cannot trade.
+                ELLM_CHECK(specConfig.dsparkSchedulerMode != DSparkSchedulerMode::kSPS,
+                    "DSpark DDTree has a fixed verify budget; SPS does not apply. Use threshold to enable "
+                    "confidence-guided growth, or off.");
+                ELLM_CHECK(specConfig.dsparkConfidenceThreshold < 1.0F,
+                    "DSpark DDTree survival threshold must be in [0, 1): the root always survives, so a "
+                    "floor of 1 would forbid all growth.");
+            }
             ELLM_CHECK(proposalLen <= specConfig.maxDraftProposalSize,
                 "DSpark proposalLen=" + std::to_string(proposalLen)
                     + " exceeds draft.maxDraftTreeSize=" + std::to_string(specConfig.maxDraftProposalSize)
-                    + ". DSpark drafts verifySize-1 tokens per iteration.");
-            ELLM_CHECK(cfg.draft.has_value() && proposalLen <= cfg.draft->specDraftBlockSize,
-                "DSpark proposalLen=" + std::to_string(proposalLen)
-                    + " exceeds dspark_config.block_size=" + std::to_string(cfg.draft->specDraftBlockSize) + ".");
-            ELLM_CHECK(specConfig.verifySize <= kDSparkMaxVerifySizeForCurrentUtilityKernels,
-                "DSpark verifySize=" + std::to_string(specConfig.verifySize)
-                    + " exceeds current DSpark utility kernel max depth of "
-                    + std::to_string(kDSparkMaxVerifySizeForCurrentUtilityKernels) + ".");
+                    + ". The draft engine profile must cover the drafted block.");
 
             if (specConfig.dsparkSchedulerMode != DSparkSchedulerMode::kOff)
             {

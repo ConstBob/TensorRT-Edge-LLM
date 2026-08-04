@@ -46,7 +46,8 @@ struct SpecDecodeDraftingConfig
 {
     //! Tokens to select from one predecessor during draft expansion:
     //! draftingTopK = 1 selects chain mode, draftingTopK > 1 selects tree
-    //! drafting with this candidate fanout.
+    //! drafting with this candidate fanout. DSpark tree mode drafts the full
+    //! block and verifySize becomes the DDTree node budget.
     int32_t draftingTopK{0};
     int32_t draftingStep{0}; //!< Number of drafting steps with draft model
     int32_t verifySize{0};   //!< Number of tokens in the base verification input
