@@ -124,6 +124,7 @@ cleanup_cutedsl_docker_image:
   script:
     - test -n "$CI_REGISTRY_USER" && test -n "$CI_REGISTRY_PASSWORD"
     - crane auth login "$CI_REGISTRY" --username "$CI_REGISTRY_USER" --password "$CI_REGISTRY_PASSWORD"
-    - crane delete "$CUTE_DSL_BUILDER_IMAGE"
+    - |
+      crane delete "$CUTE_DSL_BUILDER_IMAGE" || echo "CuTeDSL builder image was already absent: $CUTE_DSL_BUILDER_IMAGE"
   when: always
   interruptible: false
