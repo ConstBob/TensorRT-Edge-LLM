@@ -157,7 +157,10 @@ def _normalize_rope_scaling_for_config(
         return None
     normalized = dict(rope_params)
     rope_type = normalized.get("rope_type", normalized.get("type"))
-    if rope_type is not None:
+    if normalized.get("mrope_section") is not None:
+        normalized["rope_type"] = "mrope"
+        normalized["type"] = "mrope"
+    elif rope_type is not None:
         normalized.setdefault("rope_type", rope_type)
         normalized.setdefault("type", rope_type)
     return normalized

@@ -21,6 +21,7 @@
 #include "common/cudaMacros.h"
 #include "common/logger.h"
 #include "common/tensor.h"
+#include "common/trtUtils.h"
 // {$edge-llm-internal-release begin}
 #include "kernels/multiDeviceKernels/shmAllReduce.h"
 // {$edge-llm-internal-release end}
@@ -388,13 +389,13 @@ bool FusedNvfp4GemmAllReducePlugin::supportsFormatCombination(
     {
         return desc.type == DataType::kHALF;
     }
-    if (pos == kFP4_ACT_IDX)
+    if (pos == kFP4_ACT_IDX || pos == kFP4_WEIGHT_IDX)
     {
-        return desc.type == DataType::kFP4 || desc.type == DataType::kINT8 || desc.type == DataType::kFP8;
-    }
-    if (pos == kFP4_WEIGHT_IDX)
-    {
-        return desc.type == DataType::kFP4 || desc.type == DataType::kINT8 || desc.type == DataType::kFP8;
+        return desc.type == DataType::kINT8 || desc.type == DataType::kFP8
+#if IS_TRT_RTX || NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 8)
+            || desc.type == DataType::kFP4
+#endif
+            ;
     }
     if (pos == kFP4_ACT_SCALE_IDX)
     {

@@ -661,6 +661,24 @@ l0_jedha:
     - .l0_rules
   interruptible: true
 
+# JetPack 6 cross-build against the TensorRT 10.3 that JP6 ships (CUDA 12.6)
+"l0_cross_build_jp6_trt10.3_cuda12.6":
+  stage: l0_test
+  variables:
+    CUDA_VERSION: "12.6"
+    TRT_VERSION: "10.3.0.31"
+    TRT_CUDA_VERSION: "12.5"
+    IMAGE: "urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:rel-10.3-cross-aarch64-l4t-cuda12.6"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-10.3.0.31/TensorRT-10.3.0.31-aarch64-cuda-12.5"
+    EMBEDDED_TARGET: jetson-orin
+  tags:
+    - a30-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .cross_build_template
+    - .l0_rules
+  interruptible: true
+
 # DriveOS 6 Linux cross-build (CUDA 11.4)
 #
 # Upstream nvidia-cutlass-dsl ships only cu12/cu13 wheels, so this job cannot
