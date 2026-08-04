@@ -21,13 +21,14 @@ tests:
   - tests/python-unittests/test_attention_plugin.py::test_gqa_prefill
   - tests/python-unittests/test_attention_plugin.py::test_prefill_head512
   - tests/python-unittests/test_attention_plugin.py::test_prefill_head512_cutedsl_gqa_2
+  - tests/python-unittests/test_attention_plugin.py::test_prefill_head256_vision_fmha_v2_bidirectional
   - tests/python-unittests/test_attention_plugin.py::test_prefill_head512_vision_cutedsl
   - tests/python-unittests/test_attention_plugin.py::test_prefill_head512_vision_scaled
   - tests/python-unittests/test_attention_plugin.py::test_vision_block_prefill_then_decode
   - tests/python-unittests/test_attention_plugin.py::test_head512_vision_rejections
+  - tests/python-unittests/test_attention_plugin.py::test_head512_sliding_vision_accepted_off_blackwell
   - tests/python-unittests/test_attention_plugin.py::test_head512_vision_prefill_route_rejections
-  - tests/python-unittests/test_attention_plugin.py::test_prefill_head256_vision_fmha_v2_bidirectional
-  - tests/python-unittests/test_attention_plugin.py::test_head512_sliding_vision_rejected_on_non_blackwell
+  - tests/python-unittests/test_attention_plugin.py::test_head512_shared_fp8_prefill_rejected
   - tests/python-unittests/test_attention_plugin.py::test_fp8_kv_cache_rejected_on_unsupported_sm
   - tests/python-unittests/test_attention_plugin.py::test_fp8_kv_cache_decode
   - tests/python-unittests/test_attention_plugin.py::test_fp8_kv_cache_prefill

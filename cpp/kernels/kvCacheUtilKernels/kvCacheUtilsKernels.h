@@ -96,7 +96,7 @@ void instantiateKVCacheBatched(KVLayerInfo const* dstLayerInfos, KVLayerInfo con
     int32_t headDim, int32_t kvPoolPages, int32_t batchIdx, int32_t sequenceLength, cudaStream_t stream);
 
 //! \brief Gathers logical pages 0..ceil(seqLen/128) of every slot from a paged K/V page pool into dense
-//! split K/V workspaces, for FMHA-v2 FP8/padding/vision and FFPA consumers that require a contiguous
+//! split K/V workspaces, for FMHA-v2 FP8, padding, and vision-block consumers that require a contiguous
 //! [B, seqLen, H, D] FP16 view. The destination is ALWAYS FP16 (half): an FP8 pool is dequantized with the
 //! K/V scales, so downstream `dataPointer<half>()` consumers never reinterpret FP8 bytes as half.
 //!

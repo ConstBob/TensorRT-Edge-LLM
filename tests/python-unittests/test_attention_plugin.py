@@ -64,9 +64,10 @@ DEV = "cuda"
 # (cpp/common/pagedKvTypes.h).
 PAGE_SIZE = 128
 
-# CuTe DSL SM-support contract, hand-maintained (not read from
-# build_cutedsl.py) so a dropped kernel on a supported SM fails, not skips green.
-CUTEDSL_FFPA_D512_SMS = frozenset({80, 86, 87, 89, 100, 101, 110, 120, 121})
+# D512 native-paged CuTe DSL SM-support contract, hand-maintained (not read
+# from build_cutedsl.py) so a dropped kernel on a supported SM fails, not skips
+# green.
+NATIVE_SMS = frozenset({80, 86, 87, 89, 100, 101, 110, 120, 121})
 CUTEDSL_D512_FP8_SMS = frozenset({100, 101, 110})
 # FP8 KV-cache support is constrained by the bundled XQA decode kernels.
 FP8_KV_CACHE_SMS = frozenset({89, 100, 101, 110, 120, 121})
@@ -391,7 +392,7 @@ def _fp8_supported() -> bool:
 
 # Cache-reading prefill works on every supported FP8 KV-cache SKU: native FP8
 # on Blackwell, else the split-KV gather dequantizes FP8->FP16 for the
-# FMHA-v2/FFPA consumers.
+# FMHA-v2 consumers.
 def _fp8_available() -> bool:
     return _fp8_supported() and _device_sm() in FP8_KV_CACHE_SMS
 
@@ -1004,11 +1005,16 @@ def test_cutedsl_lazy_module_failure_propagates_before_attention_mutation(
 
 
 # --------------------------------------------------------------------------- #
-# (head_size, num_q_heads, num_kv_heads) sweep for the GQA prefill+decode tests.
-# A config needs BOTH a prefill path (FMHA/FFPA) and the decode XQA path:
-#   head 64/128 -> ratio 1..8 (128 also 16); head 256 -> ratio 2/4/6/8 (XQA);
-#   head 512 -> ratio 2 (D512 CuTe DSL paged), 4/8 also FFPA + XQA-512.
-# head 32 is excluded: no prefill FMHA kernel (decode-only, see test_decode_head32).
+# (head_size, num_q_heads, num_kv_heads) sweep, shared by the GQA prefill and
+# decode tests. The plugin requires BOTH a prefill FMHA path and the decode XQA
+# path to support a config. Supported space:
+#   head 64/128 -> GQA ratio 1..8 (head 128 also supports ratio 16, Nemotron-H);
+#   head 256    -> GQA ratio 2/4/6/8 only (XQA constraint; Qwen3.5 family);
+#   head 512    -> any GQA ratio through D512 CuTe DSL paged prefill, with
+#                  XQA-512 decode (Gemma4 E4B/E2B global attention layers).
+# head 32 is excluded from this sweep: the prefill FMHA has no head-32 kernel,
+# so the plugin runs in the degraded XQA-only mode (decode works, covered by
+# test_decode_head32 below; prefill has no kernel and enqueue fails).
 # --------------------------------------------------------------------------- #
 ATTN_CONFIGS = [
     (64, 8, 8),
@@ -1072,12 +1078,11 @@ def test_gqa_prefill(head_size, num_q_heads, num_kv_heads):
 # --------------------------------------------------------------------------- #
 # head 512 prefill routing. On SM100/101/110, normal and chunked prefill use
 # optimized common FMHA's native-paged ABI. On the remaining CuTe DSL targets,
-# both modes use FMHA-v2's native-paged ABI. Other builds retain FFPA where
-# supported. kv1/kv2 are the Gemma4 E2B / E4B global-attention-layer configs.
+# both modes use FMHA-v2's native-paged ABI.
+# kv1/kv2 are the Gemma4 E2B / E4B global-attention-layer configs.
 # --------------------------------------------------------------------------- #
-@pytest.mark.skipif(
-    _device_sm() not in CUTEDSL_FFPA_D512_SMS,
-    reason="head-512 prefill (FFPA / D512 FMHA) unsupported on this SM")
+@pytest.mark.skipif(_device_sm() not in NATIVE_SMS,
+                    reason="D512 CuTe DSL FMHA is unavailable on this SM")
 @pytest.mark.parametrize("num_q_heads,num_kv_heads", [(8, 1), (8, 2), (16, 1)],
                          ids=["q8_kv1", "q8_kv2", "q16_kv1"])
 def test_prefill_head512(num_q_heads, num_kv_heads):
@@ -1089,10 +1094,10 @@ def test_prefill_head512(num_q_heads, num_kv_heads):
     _run_rounds(p, num_rounds=2, atol=1e-2, rtol=1e-2)
 
 
-# FFPA does not support GQA ratio 2 for D512. Numerical success covers the
-# optimized path on SM100/101/110 and the FMHA-v2 D512 implementation elsewhere;
-# Nsight route validation separately distinguishes native-paged from gather.
-@pytest.mark.skipif(_device_sm() not in CUTEDSL_FFPA_D512_SMS,
+# Numerical success covers the optimized path on SM100/101/110 and the FMHA-v2
+# D512 implementation elsewhere; Nsight route validation separately
+# distinguishes native-paged from gather.
+@pytest.mark.skipif(_device_sm() not in NATIVE_SMS,
                     reason="D512 CuTe DSL FMHA is unavailable on this SM")
 @pytest.mark.parametrize("sliding_window", [-1, 4], ids=["causal", "sliding"])
 def test_prefill_head512_cutedsl_gqa_2(sliding_window):
@@ -1212,17 +1217,21 @@ def test_prefill_head256_vision_fmha_v2_bidirectional(case):
                              vision_ranges=vision_ranges)
 
 
-@pytest.mark.skipif(_device_sm() not in (100, 101, 110),
-                    reason="D512 CuTe DSL FMHA requires SM100/101/110")
+@pytest.mark.skipif(_device_sm() not in NATIVE_SMS,
+                    reason="D512 CuTe DSL FMHA is unavailable on this SM")
 @pytest.mark.parametrize(
     "case", ["all_text", "blocks", "blocks_sliding", "gemma4_blocks"])
 def test_prefill_head512_vision_cutedsl(case):
-    """Prove all D512 vision modes route through paged CuTe DSL FMHA."""
+    """Prove all D512 vision modes route through a CuTe DSL FMHA kernel.
+
+    SM100/101/110 take the paged bidirectional kernel; the remaining supported
+    SMs take the FMHA-v2 D512 vision-block kernel.
+    """
     _run_head512_vision_prefill_case(case)
 
 
-@pytest.mark.skipif(_device_sm() not in (100, 101, 110),
-                    reason="D512 CuTe DSL FMHA requires SM100/101/110")
+@pytest.mark.skipif(_device_sm() not in NATIVE_SMS,
+                    reason="D512 CuTe DSL FMHA is unavailable on this SM")
 def test_prefill_head512_vision_scaled():
     """A non-default attention scale must reach the D512 vision kernel."""
     _run_vision_prefill_case(label="vision-d512-scaled",
@@ -1327,8 +1336,8 @@ def _run_vision_prefill_then_decode(*,
                  -1,
                  id="global_d512_16q1kv",
                  marks=pytest.mark.skipif(
-                     _device_sm() not in (100, 101, 110),
-                     reason="D512 CuTe DSL FMHA requires SM100/101/110")),
+                     _device_sm() not in NATIVE_SMS,
+                     reason="D512 CuTe DSL FMHA is unavailable on this SM")),
     pytest.param(256, 16, 8, 1024, id="sliding_d256_16q8kv"),
 ])
 def test_vision_block_prefill_then_decode(head, num_q, num_kv, window):
@@ -1364,8 +1373,12 @@ def test_head512_vision_rejections(case):
 
 @pytest.mark.skipif(_device_sm() == 0 or _device_sm() >= 100,
                     reason="requires a non-Blackwell CUDA device")
-def test_head512_sliding_vision_rejected_on_non_blackwell():
-    """Full-causal FFPA must not serve sliding vision-block attention."""
+def test_head512_sliding_vision_accepted_off_blackwell():
+    """The FMHA-v2 D512 vision-block kernel serves sliding layers off Blackwell.
+
+    The window is a runtime argument of that kernel, so the same variant covers
+    both the sliding and the full-causal Gemma4 global layers.
+    """
     PluginRunner()
     creator = trt.get_plugin_registry().get_creator("AttentionPlugin", "1", "")
     assert creator is not None
@@ -1378,11 +1391,11 @@ def test_head512_sliding_vision_rejected_on_non_blackwell():
             pf_int32("enable_vision_block_attention", 1),
             pf_int32("sliding_window_size", 1024),
         ]), trt.TensorRTPhase.BUILD)
-    assert plugin is None
+    assert plugin is not None
 
 
-@pytest.mark.skipif(_device_sm() not in (100, 101, 110),
-                    reason="D512 CuTe DSL FMHA requires SM100/101/110")
+@pytest.mark.skipif(_device_sm() not in NATIVE_SMS,
+                    reason="D512 CuTe DSL FMHA is unavailable on this SM")
 @pytest.mark.parametrize("route", ["chunked", "shared"])
 def test_head512_vision_prefill_route_rejections(route):
     """Vision blocks are supported only for normal prefill with owned KV."""
@@ -1429,6 +1442,37 @@ def test_head512_vision_prefill_route_rejections(route):
                    cache_idx,
                    vision_block_ids=vision_block_ids,
                    input_shapes=input_shapes)
+
+
+@pytest.mark.skipif(not _fp8_available(),
+                    reason="FP8 KV cache not supported on this device")
+def test_head512_shared_fp8_prefill_rejected():
+    cfg = dict(BASE)
+    cfg.update(head_size=512,
+               num_q_heads=4,
+               num_kv_heads=2,
+               enable_fp8_kv_cache=True,
+               qkv_scales=[0.5, 0.25, 0.125])
+    p = AttentionParams(batch_size=2, seq_len=8, is_prefill=True, **cfg)
+    runner = AttentionPluginRunner(p, enable_kv_shared=1)
+    gen = torch.Generator().manual_seed(5152)
+    _, _, combined = _make_rope(p, gen)
+    _, _, plugin_kv = _empty_caches(p)
+    q = torch.randn((p.batch_size, p.seq_len, p.q_hidden),
+                    generator=gen,
+                    dtype=torch.float32).to(DEV)
+    ctx_len = torch.full((p.batch_size, ),
+                         p.seq_len,
+                         dtype=torch.int32,
+                         device=DEV)
+    cache_idx = torch.zeros(p.batch_size, dtype=torch.int32, device=DEV)
+    with pytest.raises(RuntimeError, match="execute_async_v3 returned False"):
+        runner.run(q.to(torch.float16),
+                   plugin_kv,
+                   ctx_len,
+                   combined,
+                   cache_idx,
+                   input_shapes={"kv_cache_indices": (0, )})
 
 
 # --------------------------------------------------------------------------- #
@@ -1495,8 +1539,8 @@ def test_fp8_kv_cache_prefill(scales, head_size):
     _run_rounds(p, num_rounds=2, atol=2e-1, rtol=2e-1, cos_threshold=0.999)
 
 
-# FP8 D512: ratio 2 forces the CuTe DSL d512 FP8 FMHA (FFPA has no ratio-2
-# D512); round 2 reads back round 1's FP8 KV.
+# FP8 D512 exercises the CuTe DSL D512 FP8 FMHA; round 2 reads back round 1's
+# FP8 KV.
 @pytest.mark.skipif(_device_sm() not in CUTEDSL_D512_FP8_SMS,
                     reason="D512 FP8 FMHA only on SM100/101/110")
 @pytest.mark.parametrize("scales", [[1.0, 1.0, 1.0], [0.5, 0.5, 0.5]],
@@ -1698,11 +1742,9 @@ def test_configurable_softmax_scale(is_prefill):
                 attention_scale=desired_scale)
 
 
-# Custom attention scale on the D512 FFPA prefill path (ratio 4, Gemma4 E4B):
-# the plugin routes attention_scale to ffpaParams.softmaxScale, so this pins
-# that the FFPA overlay honors a non-default scale.
-@pytest.mark.skipif(_device_sm() not in CUTEDSL_FFPA_D512_SMS,
-                    reason="D512 FFPA prefill unsupported on this SM")
+# Custom attention scale on a D512 CuTe DSL prefill path (ratio 4, Gemma4 E4B).
+@pytest.mark.skipif(_device_sm() not in NATIVE_SMS,
+                    reason="D512 CuTe DSL FMHA is unavailable on this SM")
 def test_configurable_softmax_scale_head512():
     desired_scale = 0.37
     cfg = dict(BASE)
@@ -1952,7 +1994,7 @@ def test_tree_attention_qknorm():
     _tree_attention_rounds(q_norm_gamma=qg, k_norm_gamma=kg)
 
 
-@pytest.mark.skipif(_device_sm() not in CUTEDSL_FFPA_D512_SMS,
+@pytest.mark.skipif(_device_sm() not in NATIVE_SMS,
                     reason="D512 CuTe DSL FMHA is unavailable on this SM")
 @pytest.mark.parametrize("sliding_window", [-1, 4], ids=["causal", "sliding"])
 def test_tree_attention_head512_prefill_then_decode(sliding_window):
@@ -2367,7 +2409,7 @@ def _ragged_qkv(seqlens, p, gen):
 # native-paged common FMHA; elsewhere it exercises native-paged FMHA-v2. The
 # physical S=257 tensor crosses both 128-token CTA boundaries, while poisoned
 # padding and valid-row checks catch reads outside each request's logical prefix.
-@pytest.mark.skipif(_device_sm() not in CUTEDSL_FFPA_D512_SMS,
+@pytest.mark.skipif(_device_sm() not in NATIVE_SMS,
                     reason="D512 CuTe DSL FMHA is unavailable on this SM")
 def test_ragged_prefill_head512_cutedsl():
     seqlens = [1, 128, 257]
@@ -2611,8 +2653,8 @@ def _assert_cache_untouched(name: str, before: "torch.Tensor",
 # Shared-KV prefill. head 128 runs the CuTe DSL FMHA path where available
 # (SM100+) and FMHA-v2 elsewhere; head 256 uses native-paged FMHA-v2 where
 # supported. FP16 head 512 runs native-paged common FMHA on SM100/101/110 and
-# native-paged FMHA-v2 on the remaining CuTe DSL targets. The q4/kv2 cases
-# exclude FFPA; Nsight route validation separately excludes the gather fallback.
+# native-paged FMHA-v2 on the remaining CuTe DSL targets. Nsight route
+# validation separately excludes the gather fallback.
 @pytest.mark.parametrize("head_size,num_q_heads,num_kv_heads,sliding_window", [
     pytest.param(128, 8, 4, -1, id="head128_q8_kv4"),
     pytest.param(256, 16, 8, -1, id="head256_q16_kv8"),
@@ -2622,7 +2664,7 @@ def _assert_cache_untouched(name: str, before: "torch.Tensor",
                  -1,
                  id="head512_q4_kv2",
                  marks=pytest.mark.skipif(
-                     _device_sm() not in CUTEDSL_FFPA_D512_SMS,
+                     _device_sm() not in NATIVE_SMS,
                      reason="D512 CuTe DSL FMHA is unavailable on this SM")),
     pytest.param(512,
                  4,
@@ -2630,26 +2672,24 @@ def _assert_cache_untouched(name: str, before: "torch.Tensor",
                  4,
                  id="head512_q4_kv2_sliding",
                  marks=pytest.mark.skipif(
-                     _device_sm() not in CUTEDSL_FFPA_D512_SMS,
+                     _device_sm() not in NATIVE_SMS,
                      reason="D512 CuTe DSL FMHA is unavailable on this SM")),
-    pytest.param(
-        512,
-        8,
-        1,
-        -1,
-        id="head512_q8_kv1",
-        marks=pytest.mark.skipif(
-            _device_sm() not in CUTEDSL_FFPA_D512_SMS,
-            reason="head-512 (FFPA/D512 FMHA) unsupported on this SM")),
-    pytest.param(
-        512,
-        8,
-        2,
-        -1,
-        id="head512_q8_kv2",
-        marks=pytest.mark.skipif(
-            _device_sm() not in CUTEDSL_FFPA_D512_SMS,
-            reason="head-512 (FFPA/D512 FMHA) unsupported on this SM")),
+    pytest.param(512,
+                 8,
+                 1,
+                 -1,
+                 id="head512_q8_kv1",
+                 marks=pytest.mark.skipif(
+                     _device_sm() not in NATIVE_SMS,
+                     reason="D512 CuTe DSL FMHA is unavailable on this SM")),
+    pytest.param(512,
+                 8,
+                 2,
+                 -1,
+                 id="head512_q8_kv2",
+                 marks=pytest.mark.skipif(
+                     _device_sm() not in NATIVE_SMS,
+                     reason="D512 CuTe DSL FMHA is unavailable on this SM")),
 ])
 def test_shared_kv_prefill(head_size, num_q_heads, num_kv_heads,
                            sliding_window):
@@ -2851,8 +2891,8 @@ def test_shared_kv_decode(attention_scale):
 # Shared-KV chunked prefill: the second chunk's Q must also attend the donor
 # cache prefix, driving the chunked shared-KV kernel variants. D512 uses
 # native-paged common FMHA on SM100/101/110 and native-paged FMHA-v2 elsewhere.
-# The head512 q4/kv2 cases exclude FFPA; Nsight route validation separately
-# proves that shared chunked prefill does not use the gather fallback.
+# Nsight route validation separately proves that shared chunked prefill does
+# not use the gather fallback.
 @pytest.mark.parametrize("head_size,num_q_heads,num_kv_heads,sliding_window", [
     pytest.param(128, 8, 4, -1, id="head128_q8_kv4"),
     pytest.param(256, 16, 8, -1, id="head256_q16_kv8"),
@@ -2862,7 +2902,7 @@ def test_shared_kv_decode(attention_scale):
                  -1,
                  id="head512_q4_kv2",
                  marks=pytest.mark.skipif(
-                     _device_sm() not in CUTEDSL_FFPA_D512_SMS,
+                     _device_sm() not in NATIVE_SMS,
                      reason="D512 CuTe DSL FMHA is unavailable on this SM")),
     pytest.param(512,
                  4,
@@ -2870,17 +2910,16 @@ def test_shared_kv_decode(attention_scale):
                  4,
                  id="head512_q4_kv2_sliding",
                  marks=pytest.mark.skipif(
-                     _device_sm() not in CUTEDSL_FFPA_D512_SMS,
+                     _device_sm() not in NATIVE_SMS,
                      reason="D512 CuTe DSL FMHA is unavailable on this SM")),
-    pytest.param(
-        512,
-        8,
-        2,
-        -1,
-        id="head512_q8_kv2",
-        marks=pytest.mark.skipif(
-            _device_sm() not in CUTEDSL_FFPA_D512_SMS,
-            reason="head-512 (FFPA/D512 FMHA) unsupported on this SM")),
+    pytest.param(512,
+                 8,
+                 2,
+                 -1,
+                 id="head512_q8_kv2",
+                 marks=pytest.mark.skipif(
+                     _device_sm() not in NATIVE_SMS,
+                     reason="D512 CuTe DSL FMHA is unavailable on this SM")),
 ])
 def test_shared_kv_chunked_prefill(head_size, num_q_heads, num_kv_heads,
                                    sliding_window):

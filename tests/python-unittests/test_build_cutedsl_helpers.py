@@ -44,6 +44,8 @@ _FMHA_V2_DENSE_VARIANTS = {
     "fmha_v2_d64_sw",
     "fmha_v2_d128_sw",
     "fmha_v2_d256_sw",
+    "fmha_v2_d512",
+    "fmha_v2_d512_sw",
 }
 _FMHA_V2_PAGED_VARIANTS = {
     "fmha_v2_d64_paged",
@@ -63,6 +65,7 @@ _FMHA_V2_SPECIAL_VARIANTS = {
     "fmha_v2_vit_d80",
     "fmha_v2_vit_d128",
     "fmha_v2_d256_bidirectional",
+    "fmha_v2_d512_bidirectional",
 }
 _FMHA_V2_VARIANTS = (_FMHA_V2_DENSE_VARIANTS | _FMHA_V2_PAGED_VARIANTS
                      | _FMHA_V2_SPECIAL_VARIANTS)
@@ -349,7 +352,7 @@ def test_fmha_registry_has_one_d512_bidirectional_variant(sm):
                if variant.name.startswith("fmha_d512"))
 
 
-def test_fmha_v2_paged_d512_registry_uses_32x32_tiles_and_two_warps():
+def test_fmha_v2_d512_registry_uses_32x32_tiles_and_two_warps():
     d512_variants = [
         variant for variant in build_cutedsl.KERNEL_VARIANTS if
         variant.script == "fmha_v2_cutedsl/fmha.py" and "d512" in variant.name
@@ -357,6 +360,9 @@ def test_fmha_v2_paged_d512_registry_uses_32x32_tiles_and_two_warps():
 
     assert {variant.name
             for variant in d512_variants} == {
+                "fmha_v2_d512",
+                "fmha_v2_d512_sw",
+                "fmha_v2_d512_bidirectional",
                 "fmha_v2_d512_paged",
                 "fmha_v2_d512_sw_paged",
             }

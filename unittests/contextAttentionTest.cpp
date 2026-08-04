@@ -299,7 +299,7 @@ std::vector<float> computePagedV2Reference(std::vector<half> const& q, std::vect
 void TestContextAttentionPagedAccuracy(int32_t headDim, int32_t numQHeads, int32_t numKVHeads, int32_t seqLenQ,
     int32_t seqLenKCapacity, int32_t windowSizeLeft = INT_MAX,
     std::optional<float> requestedAttentionScale = std::nullopt, std::vector<int32_t> seqLensQ = {},
-    std::vector<int32_t> seqLensK = {})
+    std::vector<int32_t> seqLensK = {}, bool nanPoison = false)
 {
     int32_t constexpr kTOKENS_PER_PAGE = 128;
     int32_t const batchSize = seqLensQ.empty() ? (seqLensK.empty() ? 1 : static_cast<int32_t>(seqLensK.size()))
@@ -348,7 +348,9 @@ void TestContextAttentionPagedAccuracy(int32_t headDim, int32_t numQHeads, int32
     uniformFloatInitialization(kHost, -1.0F, 1.0F);
     uniformFloatInitialization(vHost, -1.0F, 1.0F);
 
-    half const qPoison = __float2half(120.0F);
+    // Padding embeddings can overflow FP16 and turn NaN from the first layer on, so the padded
+    // rows/keys must not reach a valid row even as NaN/Inf.
+    half const qPoison = nanPoison ? __float2half(std::numeric_limits<float>::quiet_NaN()) : __float2half(120.0F);
     for (int32_t batch = 0; batch < batchSize; ++batch)
     {
         for (int32_t seq = seqLensQ[static_cast<size_t>(batch)]; seq < seqLenQ; ++seq)
@@ -363,8 +365,8 @@ void TestContextAttentionPagedAccuracy(int32_t headDim, int32_t numQHeads, int32
         }
     }
 
-    half const kPoison = __float2half(-120.0F);
-    half const vPoison = __float2half(112.0F);
+    half const kPoison = nanPoison ? __float2half(-std::numeric_limits<float>::infinity()) : __float2half(-120.0F);
+    half const vPoison = nanPoison ? __float2half(std::numeric_limits<float>::quiet_NaN()) : __float2half(112.0F);
     std::vector<half> poolHost(poolSize, kPoison);
     for (int32_t page = pagesPerPlane; page < numFlatPages; ++page)
     {
@@ -468,6 +470,7 @@ void TestContextAttentionPagedAccuracy(int32_t headDim, int32_t numQHeads, int32
                         << " expected=" << expected[idx] << " actual=" << actualValue;
                     closeWithin1e3 += isclose(actualValue, expected[idx], 1e-3F, 1e-3F);
                     ASSERT_FALSE(std::isnan(actualValue));
+                    ASSERT_FALSE(std::isinf(actualValue));
                     ++validElements;
                 }
             }
@@ -499,23 +502,27 @@ TEST(ContextAttentionTest, fmhaV2CapabilityContract)
                 8, 2, headDim, smVersion, DataType::kHALF, CuteDslFMHAV2MaskType::kCAUSAL));
             EXPECT_TRUE(CuteDslFMHAV2Runner::canImplementPaged(
                 8, 2, headDim, smVersion, DataType::kHALF, CuteDslFMHAV2MaskType::kSLIDING_CAUSAL));
-            bool const denseShipped = headDim != 512;
-            EXPECT_EQ(CuteDslFMHAV2Runner::canImplement(
-                          8, 2, headDim, smVersion, DataType::kHALF, CuteDslFMHAV2MaskType::kCAUSAL),
-                denseShipped);
-            EXPECT_EQ(CuteDslFMHAV2Runner::canImplement(
-                          8, 2, headDim, smVersion, DataType::kHALF, CuteDslFMHAV2MaskType::kSLIDING_CAUSAL),
-                denseShipped);
+            EXPECT_TRUE(CuteDslFMHAV2Runner::canImplement(
+                8, 2, headDim, smVersion, DataType::kHALF, CuteDslFMHAV2MaskType::kCAUSAL));
+            EXPECT_TRUE(CuteDslFMHAV2Runner::canImplement(
+                8, 2, headDim, smVersion, DataType::kHALF, CuteDslFMHAV2MaskType::kSLIDING_CAUSAL));
         }
 
         EXPECT_TRUE(
             CuteDslFMHAV2Runner::canImplement(8, 2, 256, smVersion, DataType::kHALF, CuteDslFMHAV2MaskType::kPADDING));
-        EXPECT_TRUE(CuteDslFMHAV2Runner::canImplement(
-            8, 2, 256, smVersion, DataType::kHALF, CuteDslFMHAV2MaskType::kVISION_BLOCK));
+        // The vision-block overlay is a dense contract at both shipped head dims; the paged
+        // kernels never carry it.
+        for (int32_t const visionHeadDim : {256, 512})
+        {
+            EXPECT_TRUE(CuteDslFMHAV2Runner::canImplement(
+                8, 2, visionHeadDim, smVersion, DataType::kHALF, CuteDslFMHAV2MaskType::kVISION_BLOCK));
+            EXPECT_FALSE(CuteDslFMHAV2Runner::canImplementPaged(
+                8, 2, visionHeadDim, smVersion, DataType::kHALF, CuteDslFMHAV2MaskType::kVISION_BLOCK));
+        }
+        EXPECT_FALSE(
+            CuteDslFMHAV2Runner::canImplement(8, 2, 512, smVersion, DataType::kHALF, CuteDslFMHAV2MaskType::kPADDING));
         EXPECT_FALSE(CuteDslFMHAV2Runner::canImplementPaged(
             8, 2, 256, smVersion, DataType::kHALF, CuteDslFMHAV2MaskType::kPADDING));
-        EXPECT_FALSE(CuteDslFMHAV2Runner::canImplementPaged(
-            8, 2, 256, smVersion, DataType::kHALF, CuteDslFMHAV2MaskType::kVISION_BLOCK));
     }
 
     EXPECT_FALSE(CuteDslFMHAV2Runner::canImplementPaged(8, 2, 64, 90, DataType::kHALF, CuteDslFMHAV2MaskType::kCAUSAL));
@@ -541,6 +548,9 @@ TEST(ContextAttentionTest, pagedAllHeadDimsCausal)
 
     assertPagedCapability(512, CuteDslFMHAV2MaskType::kCAUSAL);
     TestContextAttentionPagedAccuracy(512, 4, 2, 33, 129);
+    // D512 GQA breadth and unaligned tails, matching the Gemma4 global-layer ratios.
+    TestContextAttentionPagedAccuracy(512, 8, 1, 45, 45);
+    TestContextAttentionPagedAccuracy(512, 16, 1, 283, 283);
 }
 
 TEST(ContextAttentionTest, pagedD128PageBoundariesAndScale)
@@ -562,6 +572,18 @@ TEST(ContextAttentionTest, pagedD128RaggedScrambledPoisonedPageTables)
     // reference because padded rows are outside the kernel contract.
     TestContextAttentionPagedAccuracy(
         128, 8, 2, 65, 257, INT_MAX, std::nullopt, std::vector<int32_t>{33, 65}, std::vector<int32_t>{129, 257});
+}
+
+TEST(ContextAttentionTest, pagedNaNPoisonedPaddingDoesNotLeak)
+{
+    // NaN/Inf in the padded rows, the padded key tail, and the unmapped pages must be masked out
+    // rather than propagated through P(0) x V(NaN).
+    for (int32_t const headDim : {128, 512})
+    {
+        SCOPED_TRACE(::testing::Message() << "D=" << headDim);
+        TestContextAttentionPagedAccuracy(headDim, 8, 1, 200, 257, INT_MAX, std::nullopt, std::vector<int32_t>{200, 77},
+            std::vector<int32_t>{200, 77}, /*nanPoison=*/true);
+    }
 }
 
 TEST(ContextAttentionTest, pagedD128RaggedSlidingScrambledPoisonedPageTables)

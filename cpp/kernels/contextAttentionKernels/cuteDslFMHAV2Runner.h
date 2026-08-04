@@ -128,11 +128,14 @@ private:
     static detail::LazyKernelModule<fmha_v2_d64_small_Kernel_Module_t> sLLM_d64Small;
     static detail::LazyKernelModule<fmha_v2_d128_Kernel_Module_t> sLLM_d128;
     static detail::LazyKernelModule<fmha_v2_d256_Kernel_Module_t> sLLM_d256;
+    static detail::LazyKernelModule<fmha_v2_d512_Kernel_Module_t> sLLM_d512;
     static detail::LazyKernelModule<fmha_v2_d256_padding_Kernel_Module_t> sLLM_d256Padding;
     static detail::LazyKernelModule<fmha_v2_d64_sw_Kernel_Module_t> sLLM_d64Sw;
     static detail::LazyKernelModule<fmha_v2_d128_sw_Kernel_Module_t> sLLM_d128Sw;
     static detail::LazyKernelModule<fmha_v2_d256_sw_Kernel_Module_t> sLLM_d256Sw;
+    static detail::LazyKernelModule<fmha_v2_d512_sw_Kernel_Module_t> sLLM_d512Sw;
     static detail::LazyKernelModule<fmha_v2_d256_bidirectional_Kernel_Module_t> sLLM_d256Bidirectional;
+    static detail::LazyKernelModule<fmha_v2_d512_bidirectional_Kernel_Module_t> sLLM_d512Bidirectional;
     static detail::LazyKernelModule<fmha_v2_d64_paged_Kernel_Module_t> sLLM_d64Paged;
     static detail::LazyKernelModule<fmha_v2_d64_small_paged_Kernel_Module_t> sLLM_d64SmallPaged;
     static detail::LazyKernelModule<fmha_v2_d128_paged_Kernel_Module_t> sLLM_d128Paged;

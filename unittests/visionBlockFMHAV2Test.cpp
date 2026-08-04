@@ -174,14 +174,14 @@ std::vector<half> visionBlockReference(std::vector<half> const& q, std::vector<h
     return output;
 }
 
-TEST(VisionBlockFMHAV2Test, MatchesReference)
+//! @param slidingWindow Left window in the sliding_window_size convention (counts the query itself).
+//! Pass a value >= seqLen to exercise the full-causal Gemma4 global-layer configuration, which
+//! reaches the kernel as an unbounded runtime window.
+void RunVisionBlockCase(int32_t headDim, int32_t numQHeads, int32_t numKVHeads, int32_t slidingWindow)
 {
     int32_t constexpr batchSize = 1;
     int32_t constexpr seqLen = 64;
-    int32_t constexpr numQHeads = 4;
-    int32_t constexpr numKVHeads = 2;
-    int32_t constexpr headDim = 256;
-    int32_t constexpr slidingWindow = 16;
+    bool const unboundedWindow = slidingWindow >= seqLen;
 
     int32_t smVersion = getSMVersion();
     applyThorSMRenumberWAR(smVersion);
@@ -228,7 +228,7 @@ TEST(VisionBlockFMHAV2Test, MatchesReference)
     ASSERT_TRUE(runner.runVisionBlock(qTensor.rawPointer(), kTensor.rawPointer(), vTensor.rawPointer(),
         outputTensor.rawPointer(), cuSeqLensTensor.dataPointer<int32_t>(), blockBeginTensor.dataPointer<int32_t>(),
         blockEndTensor.dataPointer<int32_t>(), stream, 1.0F / std::sqrt(static_cast<float>(headDim)),
-        slidingWindow - 1));
+        unboundedWindow ? -1 : slidingWindow - 1));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     auto const actual = copyDeviceToHost<half>(outputTensor);
@@ -236,9 +236,22 @@ TEST(VisionBlockFMHAV2Test, MatchesReference)
     for (size_t i = 0; i < actual.size(); ++i)
     {
         ASSERT_TRUE(isclose(actual[i], expected[i], 2e-2F, 2e-2F))
-            << "FMHA-v2 vision-block mismatch at " << i << ": actual=" << __half2float(actual[i])
-            << " expected=" << __half2float(expected[i]);
+            << "FMHA-v2 vision-block mismatch at D=" << headDim << " window=" << slidingWindow << " index " << i
+            << ": actual=" << __half2float(actual[i]) << " expected=" << __half2float(expected[i]);
     }
+}
+
+TEST(VisionBlockFMHAV2Test, MatchesReference)
+{
+    RunVisionBlockCase(/*headDim=*/256, /*numQHeads=*/4, /*numKVHeads=*/2, /*slidingWindow=*/16);
+    RunVisionBlockCase(/*headDim=*/256, /*numQHeads=*/4, /*numKVHeads=*/2, /*slidingWindow=*/64);
+}
+
+// Gemma4 Unified global layers: D512, Hq=16, Hkv=1, full-causal (no window).
+TEST(VisionBlockFMHAV2Test, MatchesReferenceD512)
+{
+    RunVisionBlockCase(/*headDim=*/512, /*numQHeads=*/16, /*numKVHeads=*/1, /*slidingWindow=*/16);
+    RunVisionBlockCase(/*headDim=*/512, /*numQHeads=*/16, /*numKVHeads=*/1, /*slidingWindow=*/64);
 }
 
 } // namespace
