@@ -33,11 +33,14 @@ detail::LazyKernelModule<fmha_v2_d64_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_
 detail::LazyKernelModule<fmha_v2_d64_small_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d64Small{};
 detail::LazyKernelModule<fmha_v2_d128_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d128{};
 detail::LazyKernelModule<fmha_v2_d256_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d256{};
+detail::LazyKernelModule<fmha_v2_d512_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d512{};
 detail::LazyKernelModule<fmha_v2_d256_padding_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d256Padding{};
 detail::LazyKernelModule<fmha_v2_d64_sw_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d64Sw{};
 detail::LazyKernelModule<fmha_v2_d128_sw_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d128Sw{};
 detail::LazyKernelModule<fmha_v2_d256_sw_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d256Sw{};
+detail::LazyKernelModule<fmha_v2_d512_sw_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d512Sw{};
 detail::LazyKernelModule<fmha_v2_d256_bidirectional_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d256Bidirectional{};
+detail::LazyKernelModule<fmha_v2_d512_bidirectional_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d512Bidirectional{};
 detail::LazyKernelModule<fmha_v2_d64_paged_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d64Paged{};
 detail::LazyKernelModule<fmha_v2_d64_small_paged_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d64SmallPaged{};
 detail::LazyKernelModule<fmha_v2_d128_paged_Kernel_Module_t> CuteDslFMHAV2Runner::sLLM_d128Paged{};
@@ -94,8 +97,9 @@ bool CuteDslFMHAV2Runner::canImplement(int32_t numQHeads, int32_t numKVHeads, in
     switch (maskType)
     {
     case CuteDslFMHAV2MaskType::kCAUSAL:
-    case CuteDslFMHAV2MaskType::kSLIDING_CAUSAL: return headSize == 64 || headSize == 128 || headSize == 256;
-    case CuteDslFMHAV2MaskType::kVISION_BLOCK: return headSize == 256;
+    case CuteDslFMHAV2MaskType::kSLIDING_CAUSAL:
+        return headSize == 64 || headSize == 128 || headSize == 256 || headSize == 512;
+    case CuteDslFMHAV2MaskType::kVISION_BLOCK: return headSize == 256 || headSize == 512;
     case CuteDslFMHAV2MaskType::kPADDING: return headSize == 256;
     }
     return false;
@@ -157,6 +161,12 @@ bool CuteDslFMHAV2Runner::preflightLlm(cudaStream_t stream, int32_t slidingWindo
                   sLLM_d256Sw, "fmha_v2_d256_sw", stream)
             : preflightVariant<fmha_v2_d256_Kernel_Module_Load, fmha_v2_d256_Kernel_Module_Unload>(
                   sLLM_d256, "fmha_v2_d256", stream);
+    case 512:
+        return useSlidingWindow
+            ? preflightVariant<fmha_v2_d512_sw_Kernel_Module_Load, fmha_v2_d512_sw_Kernel_Module_Unload>(
+                  sLLM_d512Sw, "fmha_v2_d512_sw", stream)
+            : preflightVariant<fmha_v2_d512_Kernel_Module_Load, fmha_v2_d512_Kernel_Module_Unload>(
+                  sLLM_d512, "fmha_v2_d512", stream);
     default: LOG_ERROR("FMHA-v2 CuTe DSL LLM FMHA: unsupported head_dim=%d", mHeadDim); return false;
     }
 }
@@ -215,13 +225,17 @@ bool CuteDslFMHAV2Runner::preflightPadding(cudaStream_t stream)
 
 bool CuteDslFMHAV2Runner::preflightVisionBlock(cudaStream_t stream)
 {
-    if (mHeadDim != 256)
+    if (mHeadDim != 256 && mHeadDim != 512)
     {
-        LOG_ERROR("FMHA-v2 CuTe DSL bidirectional FMHA requires head_dim=256.");
+        LOG_ERROR("FMHA-v2 CuTe DSL bidirectional FMHA requires head_dim=256 or head_dim=512.");
         return false;
     }
-    return preflightVariant<fmha_v2_d256_bidirectional_Kernel_Module_Load,
-        fmha_v2_d256_bidirectional_Kernel_Module_Unload>(sLLM_d256Bidirectional, "fmha_v2_d256_bidirectional", stream);
+    return mHeadDim == 512 ? preflightVariant<fmha_v2_d512_bidirectional_Kernel_Module_Load,
+                                 fmha_v2_d512_bidirectional_Kernel_Module_Unload>(
+                                 sLLM_d512Bidirectional, "fmha_v2_d512_bidirectional", stream)
+                           : preflightVariant<fmha_v2_d256_bidirectional_Kernel_Module_Load,
+                                 fmha_v2_d256_bidirectional_Kernel_Module_Unload>(
+                                 sLLM_d256Bidirectional, "fmha_v2_d256_bidirectional", stream);
 }
 
 bool CuteDslFMHAV2Runner::preflightViT(cudaStream_t stream)
@@ -330,6 +344,46 @@ int32_t callFmhaV2Llm(detail::LazyKernelModule<WrapperArgT<0, decltype(cuteDslKe
     return cuteDslKernelWrapper(&module, &qTensor, &kTensor, &vTensor, &oTensor, &cumSeqlenK, params.windowSizeLeft,
         params.attentionScale, params.scaleQ, params.scaleK, params.scaleV, params.invScaleO,
         getDeviceMultiProcessorCount(), params.stream);
+}
+
+//! Launch an FMHA-v2 bidirectional variant over separate padded [B, S, H, D] Q/K/V.
+//! @tparam cuteDslKernelWrapper Generated CuTe DSL kernel wrapper function. Its signature supplies the module
+//! and tensor descriptor types at compile time.
+template <auto cuteDslKernelWrapper, auto moduleLoader, auto moduleUnloader>
+int32_t callFmhaV2Bidirectional(detail::LazyKernelModule<WrapperArgT<0, decltype(cuteDslKernelWrapper)>>& state,
+    char const* moduleName, FmhaV2LlmParams const& params)
+{
+    static_assert(WrapperArity<decltype(cuteDslKernelWrapper)>::value == 16,
+        "callFmhaV2Bidirectional: not an FMHA-v2 bidirectional wrapper (module, q_tensor, k_tensor, v_tensor, "
+        "o_tensor, cum_seqlen_k, block_begin, block_end, window_size_left, attention_scale, scale_q, scale_k, scale_v, "
+        "inv_scale_o, sm_count, stream).");
+
+    if (!detail::ensureModuleLoaded<moduleLoader, moduleUnloader>(state, moduleName, params.stream))
+    {
+        return -1;
+    }
+    auto& module = state.module;
+
+    auto qTensor = makeBshTensor<WrapperArgT<1, decltype(cuteDslKernelWrapper)>>(
+        params.qPtr, params.batchSize, params.seqLenQ, params.numQHeads, params.headDim);
+    auto kTensor = makeBshTensor<WrapperArgT<2, decltype(cuteDslKernelWrapper)>>(
+        params.kPtr, params.batchSize, params.kvSeqLen, params.numKVHeads, params.headDim);
+    auto vTensor = makeBshTensor<WrapperArgT<3, decltype(cuteDslKernelWrapper)>>(
+        params.vPtr, params.batchSize, params.kvSeqLen, params.numKVHeads, params.headDim);
+    auto oTensor = makeBshTensor<WrapperArgT<4, decltype(cuteDslKernelWrapper)>>(
+        params.oPtr, params.batchSize, params.seqLenQ, params.numQHeads, params.headDim);
+    auto cumSeqlenK
+        = makeCuSeqLenTensor<WrapperArgT<5, decltype(cuteDslKernelWrapper)>>(params.cuKVSeqLens, params.batchSize + 1);
+
+    // The per-query block ranges are packed [B, S_q], unlike the Q/K/V/O descriptors above.
+    auto blockBeginTensor = makePackedTensor<WrapperArgT<6, decltype(cuteDslKernelWrapper)>>(
+        params.blockBegin, {params.batchSize, params.seqLenQ});
+    auto blockEndTensor = makePackedTensor<WrapperArgT<7, decltype(cuteDslKernelWrapper)>>(
+        params.blockEnd, {params.batchSize, params.seqLenQ});
+
+    return cuteDslKernelWrapper(&module, &qTensor, &kTensor, &vTensor, &oTensor, &cumSeqlenK, &blockBeginTensor,
+        &blockEndTensor, params.windowSizeLeft, params.attentionScale, params.scaleQ, params.scaleK, params.scaleV,
+        params.invScaleO, getDeviceMultiProcessorCount(), params.stream);
 }
 
 //! Launch an FMHA-v2 LLM variant directly against the Edge-LLM NHD paged KV pool.
@@ -467,6 +521,12 @@ bool CuteDslFMHAV2Runner::run(void const* qPtr, void const* kPtr, void const* vP
                                      fmha_v2_d256_sw_Kernel_Module_Unload>(sLLM_d256Sw, "fmha_v2_d256_sw", params)
                                : callFmhaV2Llm<cute_dsl_fmha_v2_d256_wrapper, fmha_v2_d256_Kernel_Module_Load,
                                      fmha_v2_d256_Kernel_Module_Unload>(sLLM_d256, "fmha_v2_d256", params);
+        break;
+    case 512:
+        ret = useSlidingWindow ? callFmhaV2Llm<cute_dsl_fmha_v2_d512_sw_wrapper, fmha_v2_d512_sw_Kernel_Module_Load,
+                                     fmha_v2_d512_sw_Kernel_Module_Unload>(sLLM_d512Sw, "fmha_v2_d512_sw", params)
+                               : callFmhaV2Llm<cute_dsl_fmha_v2_d512_wrapper, fmha_v2_d512_Kernel_Module_Load,
+                                     fmha_v2_d512_Kernel_Module_Unload>(sLLM_d512, "fmha_v2_d512", params);
         break;
     default: LOG_ERROR("FMHA-v2 CuTe DSL LLM FMHA: unsupported head_dim=%d", mHeadDim); return false;
     }
@@ -623,46 +683,55 @@ bool CuteDslFMHAV2Runner::runVisionBlock(void const* qPtr, void const* kPtr, voi
     int32_t const* cuKVSeqLens, int32_t const* blockBegin, int32_t const* blockEnd, cudaStream_t stream,
     float attentionScale, int32_t slidingWindowSize)
 {
-    if (mHeadDim != 256 || slidingWindowSize < 0)
+    if (mHeadDim != 256 && mHeadDim != 512)
     {
-        LOG_ERROR("FMHA-v2 CuTe DSL bidirectional FMHA requires head_dim=256 and a non-negative left window.");
+        LOG_ERROR("FMHA-v2 CuTe DSL bidirectional FMHA requires head_dim=256 or head_dim=512; got %d.", mHeadDim);
+        return false;
+    }
+    if (blockBegin == nullptr || blockEnd == nullptr)
+    {
+        LOG_ERROR("FMHA-v2 CuTe DSL bidirectional FMHA requires both blockBegin and blockEnd.");
         return false;
     }
 
     validateAttentionScale(attentionScale);
-    float const scaleQ = 1.0F;
-    float const scaleK = 1.0F;
-    float const scaleV = 1.0F;
-    float const invScaleO = 1.0F;
+    // Both bidirectional variants bake in the sliding-window branch and take the window as a runtime
+    // argument, so the Gemma4 global layers (no window) pass an unreachable bound instead of a
+    // negative sentinel the kernel would clamp to zero.
+    int32_t constexpr kNO_LIMIT = 1 << 30;
 
-    using WrapperFn = decltype(&cute_dsl_fmha_v2_d256_bidirectional_wrapper);
-    static_assert(WrapperArity<WrapperFn>::value == 16,
-        "FMHA-v2 bidirectional wrapper signature changed (module, q_tensor, k_tensor, v_tensor, o_tensor, "
-        "cum_seqlen_k, block_begin, block_end, window_size_left, attention_scale, scale_q, scale_k, scale_v, "
-        "inv_scale_o, sm_count, stream).");
+    FmhaV2LlmParams params{};
+    params.qPtr = qPtr;
+    params.kPtr = kPtr;
+    params.vPtr = vPtr;
+    params.oPtr = oPtr;
+    params.cuKVSeqLens = cuKVSeqLens;
+    params.batchSize = mBatchSize;
+    params.seqLenQ = mSeqLenQ;
+    params.kvSeqLen = mKVSeqLen;
+    params.numQHeads = mNumHeadsQ;
+    params.numKVHeads = mNumHeadsKV;
+    params.headDim = mHeadDim;
+    params.windowSizeLeft = slidingWindowSize >= 0 ? slidingWindowSize : kNO_LIMIT;
+    params.attentionScale = attentionScale;
+    params.scaleQ = 1.0F;
+    params.scaleK = 1.0F;
+    params.scaleV = 1.0F;
+    params.invScaleO = 1.0F;
+    params.stream = stream;
+    params.blockBegin = blockBegin;
+    params.blockEnd = blockEnd;
 
-    auto qTensor = makeBshTensor<WrapperArgT<1, WrapperFn>>(qPtr, mBatchSize, mSeqLenQ, mNumHeadsQ, mHeadDim);
-    auto kTensor = makeBshTensor<WrapperArgT<2, WrapperFn>>(kPtr, mBatchSize, mKVSeqLen, mNumHeadsKV, mHeadDim);
-    auto vTensor = makeBshTensor<WrapperArgT<3, WrapperFn>>(vPtr, mBatchSize, mKVSeqLen, mNumHeadsKV, mHeadDim);
-    auto oTensor = makeBshTensor<WrapperArgT<4, WrapperFn>>(oPtr, mBatchSize, mSeqLenQ, mNumHeadsQ, mHeadDim);
-    auto cumSeqlenK = makeCuSeqLenTensor<WrapperArgT<5, WrapperFn>>(cuKVSeqLens, mBatchSize + 1);
-
-    // The per-query block ranges are packed [B, S_q], unlike the Q/K/V/O descriptors above.
-    auto blockBeginTensor = makePackedTensor<WrapperArgT<6, WrapperFn>>(blockBegin, {mBatchSize, mSeqLenQ});
-    auto blockEndTensor = makePackedTensor<WrapperArgT<7, WrapperFn>>(blockEnd, {mBatchSize, mSeqLenQ});
-
-    if (!detail::ensureModuleLoaded<fmha_v2_d256_bidirectional_Kernel_Module_Load,
-            fmha_v2_d256_bidirectional_Kernel_Module_Unload>(
-            sLLM_d256Bidirectional, "fmha_v2_d256_bidirectional", stream))
-    {
-        return false;
-    }
-    int32_t const ret = cute_dsl_fmha_v2_d256_bidirectional_wrapper(&sLLM_d256Bidirectional.module, &qTensor, &kTensor,
-        &vTensor, &oTensor, &cumSeqlenK, &blockBeginTensor, &blockEndTensor, slidingWindowSize, attentionScale, scaleQ,
-        scaleK, scaleV, invScaleO, getDeviceMultiProcessorCount(), stream);
+    int32_t const ret = mHeadDim == 512
+        ? callFmhaV2Bidirectional<cute_dsl_fmha_v2_d512_bidirectional_wrapper,
+              fmha_v2_d512_bidirectional_Kernel_Module_Load, fmha_v2_d512_bidirectional_Kernel_Module_Unload>(
+              sLLM_d512Bidirectional, "fmha_v2_d512_bidirectional", params)
+        : callFmhaV2Bidirectional<cute_dsl_fmha_v2_d256_bidirectional_wrapper,
+              fmha_v2_d256_bidirectional_Kernel_Module_Load, fmha_v2_d256_bidirectional_Kernel_Module_Unload>(
+              sLLM_d256Bidirectional, "fmha_v2_d256_bidirectional", params);
     if (ret != 0)
     {
-        LOG_ERROR("FMHA-v2 CuTe DSL bidirectional FMHA kernel failed with error code: %d", ret);
+        LOG_ERROR("FMHA-v2 CuTe DSL bidirectional FMHA kernel (d=%d) failed with error code: %d", mHeadDim, ret);
     }
     return ret == 0;
 }

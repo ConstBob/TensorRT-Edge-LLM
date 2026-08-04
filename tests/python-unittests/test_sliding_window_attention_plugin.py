@@ -62,9 +62,8 @@ def test_sliding_window_prefill_head256(num_kv_heads):
     _run_rounds(p, num_rounds=2, atol=1e-2, rtol=1e-2)
 
 
-# Head 512 sliding-window prefill routes to the D512 CuTe DSL FMHA sliding
-# variant (fmha_d512_sw_paged), SM100/101/110 only. Ratio 2 has no FFPA
-# fallback, so success proves the D512 SW module ran.
+# Head 512 sliding-window prefill routes to the optimized D512 CuTe DSL FMHA
+# sliding variant (fmha_d512_sw_paged) on SM100/101/110.
 @pytest.mark.skipif(_device_sm() not in (100, 101, 110),
                     reason="D512 CuTe DSL sliding FMHA requires SM100/101/110")
 def test_sliding_window_prefill_head512():

@@ -224,7 +224,7 @@ a clean full-matrix rebuild so stale archive members cannot be retained.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--kernels GROUPS` | `ALL` | A registered group such as `f16_moe`, `ffpa`, `fmha`, `gdn`, `gemm`, `gemm_nvfp4`, `int4_fp16_gemm`, `nvfp4_moe`, `nvfp4_fused_moe`, or `ssd`; a comma-separated list; or `ALL`. `fmha` is the attention family: the FMHA-v2 kernels plus the optimized Blackwell kernels on SM100/SM101/SM110. Variants whose `supported_sms` excludes the target SM are skipped. |
+| `--kernels GROUPS` | `ALL` | A registered group such as `f16_moe`, `fmha`, `gdn`, `gemm`, `gemm_nvfp4`, `int4_fp16_gemm`, `nvfp4_moe`, `nvfp4_fused_moe`, or `ssd`; a comma-separated list; or `ALL`. `fmha` is the attention family: the FMHA-v2 kernels plus the optimized Blackwell kernels on SM100/SM101/SM110. Variants whose `supported_sms` excludes the target SM are skipped. |
 | `--gpu_arch SM` | auto-detected | Target GPU SM (e.g. `sm_100`); auto-detected via cupy / nvidia-smi when omitted. The CuTe DSL compile architecture is derived automatically, including the required Blackwell `a` suffix. |
 | `--arch ARCH` | auto-detected | Target CPU arch `x86_64` or `aarch64`. If it differs from the build host, kernels are cross-compiled (target host objects). |
 | `--cuda-version VERSION` | host CUDA | Artifact CUDA flavor used to select `cu12` or `cu13` runtime objects. |
@@ -319,7 +319,6 @@ cmake .. \
 See the group-specific READMEs for kernel coverage and standalone testing:
 
 - `kernelSrcs/fmha_cutedsl_blackwell/README.md` — optimized Blackwell/Thor fused multi-head attention (LLM + ViT)
-- `kernelSrcs/ffpa_cutedsl/README.md` — Ampere-floor FFPA-style FMHA forward
 - `kernelSrcs/f16_moe_cutedsl/README.md` — Cross-platform FP16 grouped MoE GEMM
 - `kernelSrcs/gdn_cutedsl/README.md` — Gated Delta Net decode/prefill
 - `kernelSrcs/ssd_cutedsl/README.md` — Mamba2 SSD prefill

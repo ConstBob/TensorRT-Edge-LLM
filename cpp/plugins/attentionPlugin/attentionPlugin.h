@@ -117,7 +117,7 @@ public:
 
 private:
     //! Produce split K/V FP16 for independent prefill consumers that cannot read the paged pool directly
-    //! (FMHA-v2 FP8/padding/vision and FFPA d512). Always device-gathers the page table into
+    //! (FMHA-v2 FP8, padding, and vision-block). Always device-gathers the page table into
     //! @p workspacePtr
     //! (no in-place alias): the gather follows any page table (identity or scrambled) correctly
     //! and identically in debug and release, and dequantizes an FP8 pool to FP16 using @p kScale /
@@ -139,15 +139,8 @@ private:
     int32_t enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream);
 
-    //! Launch the CuTe DSL FFPA d512 causal attention kernel with per-batch varlen masking.
-    bool dispatchFFPAKernel(half const* q, half const* k, half const* v, half* o, int32_t const* cuSeqLenQ,
-        int32_t const* cuSeqLenK, int32_t batchSize, int32_t seqlenQ, int32_t seqlenK, cudaStream_t stream);
-
     //! Whether the paged CuTe DSL D512 bidirectional-mask prefill kernel is available.
     bool canUseCuteDslBidirectionalForPrefill() const noexcept;
-
-    //! Whether the FFPA d512 vision-block fallback is available.
-    bool canUseFFPAOverlayForVisionPrefill() const noexcept;
 
     //! Validate that a vision-block prefill backend and XQA decode backend are available.
     void enforceVisionBlockKernelSupport() const;
@@ -213,10 +206,7 @@ protected:
     //! Whether the FP16 D512 paged CuTe DSL bidirectional-mask kernel is available.
     bool mCanImplementCuteDslBidirectionalFMHA{false};
 
-    //! Whether the FFPA d512 kernel is available for headSize=512 prefill.
-    bool mCanImplementFFPA{false};
-
-    //! Whether the FMHA-v2 CuTe DSL d256 vision-block context variant is active.
+    //! Whether the FMHA-v2 CuTe DSL d256/d512 vision-block context variant is active.
     bool mUseFMHAV2VisionBlockFMHA{false};
 
     //! Whether the selected CuTe DSL backend supports a dense PADDING context

@@ -677,7 +677,7 @@ l0_jedha:
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d6l.cuda-$TRT_CUDA_VERSION"
     EMBEDDED_TARGET: jetson-orin
     ENABLE_CUTE_DSL: "fmha;gdn"
-    CUTEDSL_PREBUILT_VERSION: "1.3.0-sm87-cuda11"
+    CUTEDSL_PREBUILT_VERSION: "1.4.0-sm87-cuda11"
   tags:
     - a30-edgellm-nvks
   image: "$IMAGE"

@@ -30,7 +30,6 @@
 #   ALL      — enable all groups found in metadata.json
 #   fmha     — enable the FP16 Context/ViT FMHA baseline, plus the optimized
 #              Blackwell overlay when the artifact has it (default)
-#   ffpa     — enable only the Ampere FFPA FMHA group
 #   gdn      — enable only the GDN group
 #   f16_moe  — enable the target-specific homogeneous-FP16 MoE group
 #   fmha;gdn — semicolon-separated list of groups (CMake list syntax)
@@ -46,7 +45,6 @@
 #   CUTE_DSL_FMHA_ENABLED  — set when the fmha group is active
 #   CUTE_DSL_FMHA_BLACKWELL_ENABLED — set when the artifact carries the
 #                            optimized Blackwell FMHA variants
-#   CUTE_DSL_FFPA_ENABLED  — set when the ffpa group is active
 #   CUTE_DSL_GDN_ENABLED   — set when the gdn group is active
 #   CUTE_DSL_F16_MOE_ENABLED — set when the f16_moe group is active
 #   CUTE_DSL_SSD_ENABLED   — set when the ssd group is active
@@ -476,19 +474,6 @@ function(cute_dsl_setup)
       target_compile_definitions(${_tgt}
                                  PRIVATE "CUTE_DSL_FMHA_BLACKWELL_ENABLED")
     endforeach()
-  endif()
-
-  # FFPA vision-block overlay variant.
-  list(FIND _variants "ffpa_d512_causal_visionblock" _ffpa_visionblock_idx)
-  if(NOT ${_ffpa_visionblock_idx} EQUAL -1)
-    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
-      target_compile_definitions(${_tgt}
-                                 PRIVATE "CUTE_DSL_FFPA_VISIONBLOCK_ENABLED")
-    endforeach()
-    message(
-      STATUS
-        "CuTe DSL: ffpa_d512_causal_visionblock variant found — CUTE_DSL_FFPA_VISIONBLOCK_ENABLED set"
-    )
   endif()
 
   # Check for Blackwell GDN variant specifically and set a clean define.

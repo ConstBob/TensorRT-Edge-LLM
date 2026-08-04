@@ -106,7 +106,7 @@ void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor con
 namespace
 {
 //! One thread per (batch, position): expand vision-block IDs into per-position
-//! [blockBegin, blockEnd] intervals for the FFPA vision-block overlay prefill.
+//! [blockBegin, blockEnd] intervals for the vision-block overlay prefill.
 __global__ void buildVisionBlockRangesKernel(int32_t const* visionBlockIds, int32_t const* contextLengths,
     int32_t* blockBegin, int32_t* blockEnd, int32_t seqLen)
 {

@@ -130,6 +130,10 @@ struct FmhaV2LlmParams
     float scaleV{};
     float invScaleO{};
     cudaStream_t stream{};
+    //! Per-query-row [begin, end) block intervals, packed [B, S_q]. Both null for the plain
+    //! causal/sliding variants; both set for the bidirectional variants.
+    int32_t const* blockBegin{};
+    int32_t const* blockEnd{};
 };
 
 //! Everything the FMHA-v2 ViT descriptors need, gathered once per CuteDslFMHAV2Runner ViT run()

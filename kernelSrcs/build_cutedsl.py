@@ -19,8 +19,6 @@ Kernel groups:
   gdn              — Gated Delta Net decode/prefill
   fmha             — FP16 Context/ViT FMHA, plus optimized Blackwell
                      FP16/FP8 variants on SM100/101/110
-  ffpa             — Baseline FMHA forward kernel for large head-size
-                     attention (D=512), Ampere instruction floor (sm_80+).
   ssd              — Mamba2 SSM chunk-scan prefill
   gemm             — Talker MLP GEMM (Ampere / Blackwell / BW GeForce)
   int4_fp16_gemm   — W4A16 INT4-weight FP16 GEMM (Ampere; 60-config sweep, bN=128) +
@@ -124,8 +122,6 @@ class KernelVariant:
 #   gdn              — Gated Delta Net decode/prefill
 #   fmha             — FP16 Context/ViT FMHA, plus optimized Blackwell
 #                      persistent variants on SM100/101/110.
-#   ffpa             — Baseline FMHA forward kernel for large head-size
-#                      attention (D=512), Ampere instruction floor (sm_80+).
 #   ssd              — Mamba2 SSM chunk-scan prefill
 #   gemm             — Talker MLP cuBLAS replacement (Ampere/Blackwell/BW GeForce)
 #   f16_moe          — FP16 grouped FC1/FC2 MoE (Ampere/Blackwell/SM12x)
@@ -812,90 +808,52 @@ KERNEL_VARIANTS = [
             "--skip_rescale", "--export_only",
         ],
     ),
-    # FFPA group which handles large head size attention.
+    # Dense D512 variants. The native-paged D512 kernels serve FP16 prefill;
+    # these cover the two contracts that cannot read the paged pool directly:
+    # the FP8-KV fallback (gather + dequantize to FP16) and the vision-block
+    # overlay. D512 splits its output columns across two CTAs, so Br must stay
+    # at 32 to keep Q/K/V within the sm_80 SMEM budget.
     KernelVariant(
-        name="ffpa_d512_causal",
-        group="ffpa",
+        name="fmha_v2_d512",
+        group="fmha",
         supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
-        script="ffpa_cutedsl/fmha.py",
+        script="fmha_v2_cutedsl/fmha.py",
         script_args=[
             "--head_dim", "512",
-            "--m_block_size", "64", "--n_block_size", "16", "--num_threads", "128",
-            "--dtype", "Float16",
-            "--is_causal",
-            "--skip_rescale",
-            "--export_only",
-        ],
-    ),
-    # FFPA GQA variants for Gemma4 (D=512, kv_group_size > 1)
-    KernelVariant(
-        name="ffpa_d512_causal_gqa4",
-        group="ffpa",
-        supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
-        script="ffpa_cutedsl/fmha.py",
-        script_args=[
-            "--head_dim", "512",
-            "--m_block_size", "64", "--n_block_size", "16", "--num_threads", "128",
-            "--dtype", "Float16",
-            "--is_causal",
-            "--skip_rescale",
-            "--kv_group_size", "4",
-            "--num_head", "4",
-            "--export_only",
+            "--m_block_size", "32", "--n_block_size", "32", "--num_threads", "64",
+            "--dtype", "Float16", "--is_causal", "--fmha_v2_context",
+            "--skip_rescale", "--export_only",
         ],
     ),
     KernelVariant(
-        name="ffpa_d512_causal_gqa8",
-        group="ffpa",
+        name="fmha_v2_d512_sw",
+        group="fmha",
         supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
-        script="ffpa_cutedsl/fmha.py",
+        script="fmha_v2_cutedsl/fmha.py",
         script_args=[
             "--head_dim", "512",
-            "--m_block_size", "64", "--n_block_size", "16", "--num_threads", "128",
-            "--dtype", "Float16",
-            "--is_causal",
-            "--skip_rescale",
-            "--kv_group_size", "8",
-            "--num_head", "8",
-            "--export_only",
+            "--m_block_size", "32", "--n_block_size", "32", "--num_threads", "64",
+            "--dtype", "Float16", "--is_causal", "--fmha_v2_context",
+            "--window_size_left", "4096",
+            "--skip_rescale", "--export_only",
         ],
     ),
+    # Gemma4 Unified global d512 layers. The window is a runtime argument, so
+    # this one variant serves both the sliding and the full-causal layers; the
+    # runner passes an unbounded window for the latter. Traced with the
+    # Gemma4-12B global-layer GQA shape (Hq=16, Hkv=1) — GQA stays
+    # runtime-dynamic.
     KernelVariant(
-        name="ffpa_d512_causal_gqa16",
-        group="ffpa",
+        name="fmha_v2_d512_bidirectional",
+        group="fmha",
         supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
-        script="ffpa_cutedsl/fmha.py",
+        script="fmha_v2_cutedsl/fmha.py",
         script_args=[
             "--head_dim", "512",
-            "--m_block_size", "64", "--n_block_size", "16", "--num_threads", "128",
-            "--dtype", "Float16",
-            "--is_causal",
-            "--skip_rescale",
-            "--kv_group_size", "16",
-            "--num_head", "16",
-            "--export_only",
-        ],
-    ),
-    # FFPA vision-block overlay variant (Gemma4 Unified prefill, global d512
-    # layers): the causal kernel plus two (B, S) Int32 mBlockBegin/mBlockEnd
-    # tensors carrying a per-query-row extra allowed KV interval so image
-    # blocks attend bidirectionally.  Traced with the Gemma4-12B
-    # global-layer GQA shape (Hq=16, Hkv=1) — GQA remains runtime-dynamic.
-    KernelVariant(
-        name="ffpa_d512_causal_visionblock",
-        group="ffpa",
-        supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
-        script="ffpa_cutedsl/fmha.py",
-        script_args=[
-            "--head_dim", "512",
-            "--m_block_size", "64", "--n_block_size", "16", "--num_threads", "128",
-            "--dtype", "Float16",
-            "--is_causal",
-            "--vision_block",
-            "--skip_rescale",
-            "--kv_group_size", "16",
-            "--num_head", "16",
-            "--export_only",
+            "--m_block_size", "32", "--n_block_size", "32", "--num_threads", "64",
+            "--dtype", "Float16", "--is_causal", "--fmha_v2_context", "--vision_block",
+            "--window_size_left", "4096", "--num_head", "16", "--kv_group_size", "16",
+            "--skip_rescale", "--export_only",
         ],
     ),
     # --- NvFP4 MoE group (decomposed FC1/FC2; SM110/Thor today) ---

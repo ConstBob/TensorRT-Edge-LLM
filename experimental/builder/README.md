@@ -33,9 +33,8 @@ Build Edge-LLM before invoking the frontend. The default plugin path is
 `build/libNvInfer_edgellm_plugin.so`.
 
 The plugin must include the kernels required by the selected model. In
-particular, Qwen3.5 hybrid models require Gated DeltaNet, and Gemma4 can require
-FFPA for its larger attention head dimensions. Configure both when those
-families are needed:
+particular, Qwen3.5 hybrid models require Gated DeltaNet. Configure the needed
+groups when those families are used:
 
 ```bash
 cmake -S . -B build \

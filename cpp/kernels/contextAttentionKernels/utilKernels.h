@@ -30,7 +30,7 @@ namespace kernel
 {
 
 //! Expand [B, S] vision-block IDs into per-position [blockBegin, blockEnd]
-//! interval tensors for the FFPA vision-block overlay prefill kernel.
+//! interval tensors for the vision-block overlay prefill kernels.
 //!
 //! Each contiguous run of an identical non-negative ID inside the per-batch
 //! valid prefix (contextLengths[b], clamped to seqLen) yields
