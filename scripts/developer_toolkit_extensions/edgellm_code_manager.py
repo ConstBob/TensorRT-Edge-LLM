@@ -19,9 +19,9 @@ from __future__ import annotations
 import dataclasses
 import shlex
 from collections.abc import Mapping
-from typing import Any
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 from trt_dev_toolkit.code_manager import models as code_manager_models
 from trt_dev_toolkit.code_manager.generators.artifact_generator import \
@@ -536,7 +536,10 @@ class EdgeLlmArtifactGenerator(SourceBuildArtifactGeneratorBase):
             raise OrchestrationError(
                 f"CuTeDSL artifact generation failed; see {log_file}")
 
-    def _run_required_host_command(self, *, name: str, argv: list[str],
+    def _run_required_host_command(self,
+                                   *,
+                                   name: str,
+                                   argv: list[str],
                                    cwd: str | None = None) -> None:
         """Run a required host command with DevToolkit CommandManager."""
         result = self._command_manager.run(

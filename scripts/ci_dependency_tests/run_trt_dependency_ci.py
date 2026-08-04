@@ -765,7 +765,8 @@ def _deploy(config: Config, code: Any, run_host: Host,
                 PurePosixPath(deployment.metadata["jump_host_export_path"])
                 if "jump_host_export_path" in deployment.metadata else None),
             edge_llm_cache_root=((workspace / "edge_llm_cache")
-                                 if config.edge_llm_cache_root is not None else None),
+                                 if config.edge_llm_cache_root is not None else
+                                 None),
         )
 
     edge = PurePosixPath(str(config.edgellm_root))
@@ -773,8 +774,12 @@ def _deploy(config: Config, code: Any, run_host: Host,
         run_result, preferred_component=edgellm_code_manager.EDGELLM_COMPONENT)
     cache_root = (PurePosixPath(config.edge_llm_cache_root)
                   if config.edge_llm_cache_root is not None else None)
-    return Runtime(run_host.target, edge, edge, config.trt_location,
-                   config.onnx_root, PurePosixPath(setup),
+    return Runtime(run_host.target,
+                   edge,
+                   edge,
+                   config.trt_location,
+                   config.onnx_root,
+                   PurePosixPath(setup),
                    edge_llm_cache_root=cache_root)
 
 
@@ -1186,13 +1191,14 @@ def _config(args: argparse.Namespace) -> Config:
         "CI_COMMIT_REF_NAME") or "main"
     if not branch or any(char in branch for char in "\r\n\0"):
         raise ValueError("invalid TRT_CI_BRANCH")
-    compute_capability = (args.compute_capability
-                          or ("11.0" if args.architecture is Arch.D7L else "8.0"))
+    compute_capability = (args.compute_capability or
+                          ("11.0" if args.architecture is Arch.D7L else "8.0"))
     if not _valid_compute_capability(compute_capability):
         raise ValueError("compute capability must use major.minor format")
     cache_dir = (os.environ.get("TRT_CI_EDGE_LLM_CACHE_DIR")
                  or os.environ.get("EDGE_LLM_CACHE_DIR"))
-    if cache_dir is None and Path("/home/edge_llm_cache/rouge/rouge.py").is_file():
+    if cache_dir is None and Path(
+            "/home/edge_llm_cache/rouge/rouge.py").is_file():
         cache_dir = "/home/edge_llm_cache"
     cuda_root = args.cuda_root
     if cuda_root is None and os.environ.get("TRT_CI_CUDA_ROOT"):
@@ -1313,7 +1319,7 @@ def main(argv: list[str] | None = None) -> int:
         container_manager=containers,
         default_exec_target=build_host.target,
         gpu_selection=_gpu_selection_for_arch(config.architecture,
-                                               config.compute_capability),
+                                              config.compute_capability),
     )
     try:
         run_result = _build(config, code, build_host.target)
