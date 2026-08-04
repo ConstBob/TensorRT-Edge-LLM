@@ -480,25 +480,13 @@ void outputOmniProfile(std::ostream& output, metrics::OmniTalkerMetrics const& t
 void outputMemoryProfile(std::ostream& output, MemoryMonitor const& memoryMonitor)
 {
     output << "=== Memory Usage ===" << std::endl;
-
-    if (memoryMonitor.isIntegratedGPU())
-    {
-        // iGPU: Only show unified memory
-        size_t peakUnifiedMemoryBytes = memoryMonitor.getPeakUnifiedMemory();
-        output << "Peak Unified Memory: " << std::fixed << std::setprecision(2)
-               << rt::utils::toMB(peakUnifiedMemoryBytes) << " MB (" << peakUnifiedMemoryBytes << " bytes)"
-               << std::endl;
-    }
-    else
-    {
-        // dGPU: Show both GPU and CPU memory
-        size_t peakGpuMemoryBytes = memoryMonitor.getPeakGpuMemory();
-        size_t peakCpuMemoryBytes = memoryMonitor.getPeakCpuMemory();
-        output << "Peak GPU Memory: " << std::fixed << std::setprecision(2) << rt::utils::toMB(peakGpuMemoryBytes)
-               << " MB (" << peakGpuMemoryBytes << " bytes)" << std::endl;
-        output << "Peak CPU Memory: " << std::fixed << std::setprecision(2) << rt::utils::toMB(peakCpuMemoryBytes)
-               << " MB (" << peakCpuMemoryBytes << " bytes)" << std::endl;
-    }
+    size_t const peakGpuMemoryBytes = memoryMonitor.getPeakGpuMemory();
+    size_t const peakCpuMemoryBytes = memoryMonitor.getPeakCpuMemory();
+    output << "Peak GPU Memory: " << std::fixed << std::setprecision(2) << rt::utils::toMB(peakGpuMemoryBytes)
+           << " MB (" << peakGpuMemoryBytes << " bytes)" << std::endl;
+    output << "Peak CPU Memory: " << std::fixed << std::setprecision(2) << rt::utils::toMB(peakCpuMemoryBytes)
+           << " MB (" << peakCpuMemoryBytes << " bytes)" << std::endl;
+    output << "GPU Memory Metric: " << memoryMonitor.getGpuMemoryMetric() << std::endl;
 }
 
 void addJsonPrefillSummary(nlohmann::json& summary, metrics::LLMPrefillMetrics const& prefillMetrics)
@@ -698,23 +686,13 @@ void addJsonTimingStages(nlohmann::json& summary)
 
 void addJsonMemorySummary(nlohmann::json& summary, MemoryMonitor const& memoryMonitor)
 {
-    if (memoryMonitor.isIntegratedGPU())
-    {
-        // iGPU: Only add unified memory
-        size_t peakUnifiedMemoryBytes = memoryMonitor.getPeakUnifiedMemory();
-        summary["peak_unified_memory_bytes"] = peakUnifiedMemoryBytes;
-        summary["peak_unified_memory_mb"] = rt::utils::toMB(peakUnifiedMemoryBytes);
-    }
-    else
-    {
-        // dGPU: Add both GPU and CPU memory
-        size_t peakGpuMemoryBytes = memoryMonitor.getPeakGpuMemory();
-        size_t peakCpuMemoryBytes = memoryMonitor.getPeakCpuMemory();
-        summary["peak_gpu_memory_bytes"] = peakGpuMemoryBytes;
-        summary["peak_gpu_memory_mb"] = rt::utils::toMB(peakGpuMemoryBytes);
-        summary["peak_cpu_memory_bytes"] = peakCpuMemoryBytes;
-        summary["peak_cpu_memory_mb"] = rt::utils::toMB(peakCpuMemoryBytes);
-    }
+    size_t const peakGpuMemoryBytes = memoryMonitor.getPeakGpuMemory();
+    size_t const peakCpuMemoryBytes = memoryMonitor.getPeakCpuMemory();
+    summary["peak_gpu_memory_bytes"] = peakGpuMemoryBytes;
+    summary["peak_gpu_memory_mb"] = rt::utils::toMB(peakGpuMemoryBytes);
+    summary["peak_cpu_memory_bytes"] = peakCpuMemoryBytes;
+    summary["peak_cpu_memory_mb"] = rt::utils::toMB(peakCpuMemoryBytes);
+    summary["gpu_memory_metric"] = memoryMonitor.getGpuMemoryMetric();
 }
 
 /**
