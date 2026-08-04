@@ -707,6 +707,69 @@ _int4_groupwise_gemm_v2_schema = OpSchema(
 )
 
 # ---------------------------------------------------------------------------
+# trt_edgellm::Nvfp4A16GemmPlugin (dense FP16-A / NVFP4-W4 Marlin GEMM)
+# ---------------------------------------------------------------------------
+
+_nvfp4_a16_gemm_schema = OpSchema(
+    name="Nvfp4A16GemmPlugin",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc="TensorRT dense NVFP4 (W4A16) Marlin GEMM plugin.",
+    inputs=[
+        OpSchema.FormalParameter(
+            name="activation",
+            description="FP16 activation [B, S, gemm_k]",
+            type_str="tensor(float16)",
+        ),
+        OpSchema.FormalParameter(
+            name="qweights",
+            description=
+            "Marlin-packed E2M1 codes, INT8 view [1, gemm_k/16, 8*gemm_n]",
+            type_str="tensor(int8)",
+        ),
+        OpSchema.FormalParameter(
+            name="block_scales",
+            description=
+            "Marlin-permuted E4M3 block-scale bytes [1, gemm_k/16, gemm_n]",
+            type_str="tensor(int8)",
+        ),
+        OpSchema.FormalParameter(
+            name="global_scale",
+            description="Per-tensor FP16 global scale (pre-scaled by 2**7) [1]",
+            type_str="tensor(float16)",
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="output",
+            description="FP16 output [B, S, gemm_n]",
+            type_str="tensor(float16)",
+        ),
+    ],
+    attributes=[
+        OpSchema.Attribute(
+            name="gemm_n",
+            type=OpSchema.AttrType.INT,
+            description="Marlin-padded output feature dimension",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="gemm_k",
+            type=OpSchema.AttrType.INT,
+            description="Input feature dimension",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="max_m",
+            type=OpSchema.AttrType.INT,
+            description=
+            "Profile token capacity for workspace sizing (0 == auto)",
+            required=False,
+        ),
+    ],
+)
+
+# ---------------------------------------------------------------------------
 # trt_edgellm::causal_conv1d, update_ssm_state
 # ---------------------------------------------------------------------------
 
@@ -832,11 +895,30 @@ _update_ssm_state_schema = OpSchema(
         OpSchema.FormalParameter(name="state_out",
                                  description="Updated SSM state",
                                  type_str="T"),
+        OpSchema.FormalParameter(
+            name="replay_da",
+            description="Optional spec-verify replay stash: per-token decay "
+            "dA [batch, seq, nheads] FP32",
+            type_str="T_F32",
+            param_option=OpSchema.FormalParameterOption.Optional),
+        OpSchema.FormalParameter(
+            name="replay_u",
+            description="Optional spec-verify replay stash: per-token input "
+            "factor u=dt*x [batch, seq, nheads, dim] FP32",
+            type_str="T_F32",
+            param_option=OpSchema.FormalParameterOption.Optional),
+        OpSchema.FormalParameter(
+            name="replay_b",
+            description="Optional spec-verify replay stash: per-token key "
+            "B [batch, seq, ngroups, dstate] FP32",
+            type_str="T_F32",
+            param_option=OpSchema.FormalParameterOption.Optional),
     ],
     type_constraints=[
         ("T", ["tensor(float16)", "tensor(bfloat16)", "tensor(float)"], ""),
         ("T_A", ["tensor(float)", "tensor(float16)", "tensor(bfloat16)"], ""),
         ("T_CL", ["tensor(int32)"], ""),
+        ("T_F32", ["tensor(float)"], ""),
     ],
     attributes=[
         OpSchema.Attribute(name="dt_softplus",
@@ -1659,6 +1741,7 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _trt_mxfp8_dequantize_linear_schema,
     _int4_groupwise_gemm_schema,
     _int4_groupwise_gemm_v2_schema,
+    _nvfp4_a16_gemm_schema,
     _causal_conv1d_schema,
     _update_ssm_state_schema,
     _rotary_embedding_schema,

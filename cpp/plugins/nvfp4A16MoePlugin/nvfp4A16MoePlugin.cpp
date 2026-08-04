@@ -359,9 +359,9 @@ void Nvfp4A16MoePlugin::validateAttributes() const
     {
         throw std::invalid_argument("Nvfp4A16MoePlugin: norm_topk_prob must be 0 or 1");
     }
-    if (mMaxRoutedRows <= 0)
+    if (mMaxRoutedRows < 0)
     {
-        throw std::invalid_argument("Nvfp4A16MoePlugin: max_routed_rows must be positive");
+        throw std::invalid_argument("Nvfp4A16MoePlugin: max_routed_rows must be non-negative (0 == auto)");
     }
     if (mRoutingMode == kRoutingSigmoidGroupTopk)
     {
@@ -616,7 +616,17 @@ int32_t Nvfp4A16MoePlugin::configurePlugin(
             LOG_ERROR("Nvfp4A16MoePlugin: optimization profile padded-row count overflows int64");
             return -1;
         }
-        if (requiredRows > mMaxRoutedRows)
+        if (mMaxRoutedRows == 0)
+        {
+            // Auto: size the routing/Marlin workspace for the profile maximum.
+            if (requiredRows > std::numeric_limits<int32_t>::max())
+            {
+                LOG_ERROR("Nvfp4A16MoePlugin: auto max_routed_rows overflows int32");
+                return -1;
+            }
+            mMaxRoutedRows = static_cast<int32_t>(requiredRows);
+        }
+        else if (requiredRows > mMaxRoutedRows)
         {
             LOG_ERROR("Nvfp4A16MoePlugin: max_routed_rows=%d is insufficient for the profile; requires at least %lld",
                 mMaxRoutedRows, static_cast<long long>(requiredRows));
@@ -665,8 +675,22 @@ size_t Nvfp4A16MoePlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs
         LOG_ERROR("Nvfp4A16MoePlugin: profile token count is too large for Marlin indexing");
         return 0;
     }
-    return computeWorkspaceSize(static_cast<int32_t>(maxTokens), mMaxRoutedRows, mNumExperts, mTopK, mHiddenSize,
-        mMoeInterSize, mActivationType, mRoutingMode, inputs[kInHiddenStates].desc.type);
+    int32_t effectiveMaxRoutedRows = mMaxRoutedRows;
+    if (effectiveMaxRoutedRows <= 0)
+    {
+        // configurePlugin normally resolves auto max_routed_rows; recompute here for robustness.
+        int64_t requiredRows = 0;
+        int32_t const blockSize = getMoeBlockSize(maxSeqLen);
+        if (!getConservativePaddedRows(maxTokens, mTopK, mNumExperts, blockSize, requiredRows)
+            || requiredRows > std::numeric_limits<int32_t>::max())
+        {
+            LOG_ERROR("Nvfp4A16MoePlugin: could not resolve auto max_routed_rows for workspace sizing");
+            return 0;
+        }
+        effectiveMaxRoutedRows = static_cast<int32_t>(requiredRows);
+    }
+    return computeWorkspaceSize(static_cast<int32_t>(maxTokens), effectiveMaxRoutedRows, mNumExperts, mTopK,
+        mHiddenSize, mMoeInterSize, mActivationType, mRoutingMode, inputs[kInHiddenStates].desc.type);
 }
 
 int32_t Nvfp4A16MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* outputDesc,

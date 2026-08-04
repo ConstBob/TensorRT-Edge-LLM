@@ -111,6 +111,14 @@ tests:
   - tests/python-unittests/test_nvfp4_a16_moe_plugin.py::test_build_rejects_nonpositive_sigmoid_routed_scaling_factor
   - tests/python-unittests/test_nvfp4_a16_moe_plugin.py::test_build_rejects_misaligned_dimensions
 
+  # Marlin dense NVFP4 (W4A16) GEMM plugin tests
+  - tests/python-unittests/test_nvfp4_a16_gemm_plugin.py::test_dense_nvfp4_a16_gemm_decode_and_prefill
+  - tests/python-unittests/test_nvfp4_a16_gemm_plugin.py::test_dense_nvfp4_a16_gemm_auto_max_m
+  - tests/python-unittests/test_nvfp4_a16_gemm_plugin.py::test_build_rejects_misaligned_dimensions
+
+  # FP16 MoE plugin tests (softmax + sigmoid-group-topk routing)
+  - tests/python-unittests/test_fp16_moe_plugin.py::test_fp16_moe_decode_and_prefill_dynamic_engine
+
   # ViT attention plugin tests
   - tests/python-unittests/test_vit_attention_plugin.py::test_ragged_prefill_batch_sizes
   - tests/python-unittests/test_vit_attention_plugin.py::test_window_partition

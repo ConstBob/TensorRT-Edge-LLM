@@ -17,10 +17,8 @@
 
 #pragma once
 
-#include <NvInfer.h>
 #include <NvInferRuntime.h>
 
-#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -30,20 +28,30 @@ namespace trt_edgellm
 namespace plugins
 {
 
-//! TensorRT V3 plugin for the portable FP16 MoE CuTeDSL kernels.
-class Fp16MoePlugin : public nvinfer1::IPluginV3,
-                      public nvinfer1::IPluginV3OneCore,
-                      public nvinfer1::IPluginV3OneBuild,
-                      public nvinfer1::IPluginV3OneRuntime
+/*!
+ * @brief TensorRT V3 plugin for a dense FP16-activation / Marlin-packed NVFP4 (W4A16) GEMM.
+ *
+ * This is a thin wrapper over the MoE Marlin FP16xE2M1 kernel (moeNvfp4A16MarlinGemm): it drives the kernel with a
+ * single expert and top_k = 1 so that every input row maps to expert 0. The weights, block scales, and global scale
+ * carry a leading expert dimension of 1 to reuse the MoE kernel's shape contract unchanged.
+ *
+ * gemm_n is the Marlin-padded output dimension (a multiple of 128); the caller slices the logical width downstream.
+ * max_m is the optimization-profile token capacity (batch * sequence) used to size the routing/Marlin workspace.
+ */
+class Nvfp4A16GemmPlugin : public nvinfer1::IPluginV3,
+                           public nvinfer1::IPluginV3OneCore,
+                           public nvinfer1::IPluginV3OneBuild,
+                           public nvinfer1::IPluginV3OneRuntime
 {
 public:
-    Fp16MoePlugin(std::string const& name, int32_t numExperts, int32_t topK, int32_t hiddenSize, int32_t moeInterSize,
-        int32_t activationType, int32_t nGroup, int32_t topkGroup, int32_t normTopkProb, float routedScalingFactor,
-        int32_t routingMode, int32_t maxRoutedRows);
-    Fp16MoePlugin(std::string const& name, nvinfer1::PluginFieldCollection const* fields);
-    Fp16MoePlugin() = delete;
-    Fp16MoePlugin(Fp16MoePlugin const&) = delete;
-    ~Fp16MoePlugin() noexcept override = default;
+    Nvfp4A16GemmPlugin(std::string const& name, int32_t gemmN, int32_t gemmK, int32_t maxM);
+
+    Nvfp4A16GemmPlugin(std::string const& name, nvinfer1::PluginFieldCollection const* fc);
+
+    Nvfp4A16GemmPlugin() = delete;
+    Nvfp4A16GemmPlugin(Nvfp4A16GemmPlugin const&) = delete;
+    Nvfp4A16GemmPlugin& operator=(Nvfp4A16GemmPlugin const&) = delete;
+    ~Nvfp4A16GemmPlugin() noexcept override;
 
     nvinfer1::IPluginCapability* getCapabilityInterface(nvinfer1::PluginCapabilityType type) noexcept override;
     nvinfer1::IPluginV3* clone() noexcept override;
@@ -51,67 +59,64 @@ public:
     char const* getPluginName() const noexcept override;
     char const* getPluginVersion() const noexcept override;
     char const* getPluginNamespace() const noexcept override;
-    void setPluginNamespace(char const* pluginNamespace) noexcept;
-
     int32_t getNbOutputs() const noexcept override;
+
     int32_t getOutputDataTypes(nvinfer1::DataType* outputTypes, int32_t nbOutputs, nvinfer1::DataType const* inputTypes,
         int32_t nbInputs) const noexcept override;
+
     int32_t getOutputShapes(nvinfer1::DimsExprs const* inputs, int32_t nbInputs, nvinfer1::DimsExprs const* shapeInputs,
         int32_t nbShapeInputs, nvinfer1::DimsExprs* outputs, int32_t nbOutputs,
         nvinfer1::IExprBuilder& exprBuilder) noexcept override;
+
     bool supportsFormatCombination(int32_t pos, nvinfer1::DynamicPluginTensorDesc const* inOut, int32_t nbInputs,
         int32_t nbOutputs) noexcept override;
-    int32_t configurePlugin(nvinfer1::DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
-        nvinfer1::DynamicPluginTensorDesc const* outputs, int32_t nbOutputs) noexcept override;
+
+    int32_t configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int32_t nbInputs,
+        nvinfer1::DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept override;
+
     size_t getWorkspaceSize(nvinfer1::DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
         nvinfer1::DynamicPluginTensorDesc const* outputs, int32_t nbOutputs) const noexcept override;
 
     int32_t enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept override;
-    int32_t onShapeChange(nvinfer1::PluginTensorDesc const* inputs, int32_t nbInputs,
-        nvinfer1::PluginTensorDesc const* outputs, int32_t nbOutputs) noexcept override;
+
+    int32_t onShapeChange(nvinfer1::PluginTensorDesc const* in, int32_t nbInputs, nvinfer1::PluginTensorDesc const* out,
+        int32_t nbOutputs) noexcept override;
+
     nvinfer1::IPluginV3* attachToContext(nvinfer1::IPluginResourceContext* context) noexcept override;
     nvinfer1::PluginFieldCollection const* getFieldsToSerialize() noexcept override;
 
+    void setPluginNamespace(char const* pluginNamespace) noexcept;
+
 private:
-    //! Number of plugin inputs, which depends on the routing mode: the sigmoid group-topk path adds a trailing
-    //! e_score_correction_bias input, the softmax path does not.
-    int32_t numInputs() const noexcept;
+    void validateAttributes() const;
+    bool validateTensorDesc(int32_t pos, nvinfer1::PluginTensorDesc const& desc) const noexcept;
 
     std::string mLayerName;
     std::string mNamespace;
-    int32_t mNumExperts{};
-    int32_t mTopK{};
-    int32_t mHiddenSize{};
-    int32_t mMoeInterSize{};
-    int32_t mActivationType{};
-    int32_t mNGroup{};
-    int32_t mTopkGroup{};
-    int32_t mNormTopkProb{};
-    float mRoutedScalingFactor{1.0F};
-    int32_t mRoutingMode{};
-    int32_t mMaxRoutedRows{};
-    int32_t mPersistentBlockCount{};
-    bool mAutoMaxRoutedRows{};
+    int32_t mGemmN{}; //!< Marlin-padded output dimension N (multiple of 128).
+    int32_t mGemmK{}; //!< Input dimension K.
+    int32_t mMaxM{};  //!< Profile token capacity (batch * sequence) for workspace sizing.
 
     std::vector<nvinfer1::PluginField> mDataToSerialize;
-    nvinfer1::PluginFieldCollection mFieldsToSerialize{};
+    nvinfer1::PluginFieldCollection mFCToSerialize{};
 };
 
-//! Creator for Fp16MoePlugin version 1.
-class Fp16MoePluginCreator : public nvinfer1::IPluginCreatorV3One
+//! Creator for Nvfp4A16GemmPlugin.
+class Nvfp4A16GemmPluginCreator : public nvinfer1::IPluginCreatorV3One
 {
 public:
-    Fp16MoePluginCreator();
-    ~Fp16MoePluginCreator() override = default;
+    Nvfp4A16GemmPluginCreator();
+    ~Nvfp4A16GemmPluginCreator() override = default;
 
     char const* getPluginName() const noexcept override;
     char const* getPluginVersion() const noexcept override;
     nvinfer1::PluginFieldCollection const* getFieldNames() noexcept override;
     char const* getPluginNamespace() const noexcept override;
     void setPluginNamespace(char const* pluginNamespace) noexcept;
-    nvinfer1::IPluginV3* createPlugin(char const* name, nvinfer1::PluginFieldCollection const* fields,
-        nvinfer1::TensorRTPhase phase) noexcept override;
+
+    nvinfer1::IPluginV3* createPlugin(
+        char const* name, nvinfer1::PluginFieldCollection const* fc, nvinfer1::TensorRTPhase phase) noexcept override;
 
 private:
     static nvinfer1::PluginFieldCollection mFieldCollection;

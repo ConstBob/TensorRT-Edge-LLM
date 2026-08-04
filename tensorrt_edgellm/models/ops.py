@@ -844,6 +844,45 @@ def _(hidden_states, qweight, scales, gemm_n, gemm_k, group_size):
 
 
 # ---------------------------------------------------------------------------
+# Custom op: trt::nvfp4_a16_gemm  (dense FP16-A / NVFP4-W4 Marlin GEMM)
+#
+# Inputs are already in Marlin-packed layout (see
+# ``repacking.repack_nvfp4_a16_marlin_linear``): ``qweights`` are the INT8 view
+# of the Marlin-permuted E2M1 codes, ``block_scales`` are the Marlin-permuted
+# raw E4M3 bytes, and ``global_scale`` is the FP16 per-tensor scale pre-scaled
+# by 2**7. ``gemm_n`` is the Marlin-padded output width; the caller slices the
+# logical width. Export-only (zero eager stub); numeric validation is the
+# golden checkpoint test, mirroring ``int4_groupwise_gemm``.
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt::nvfp4_a16_gemm", mutates_args=())
+def nvfp4_a16_gemm(
+    activation: torch.Tensor,  # [*, gemm_k] float16
+    qweights: torch.Tensor,  # [1, gemm_k//16, 8*gemm_n] int8
+    block_scales: torch.Tensor,  # [1, gemm_k//16, gemm_n] int8
+    global_scale: torch.Tensor,  # [1] float16
+    gemm_n: int,
+    gemm_k: int,
+) -> torch.Tensor:
+    """Stub: dense NVFP4 W4A16 Marlin GEMM - returns zero tensor of output shape."""
+    *leading, _ = activation.shape
+    return torch.zeros(*leading,
+                       gemm_n,
+                       dtype=activation.dtype,
+                       device=activation.device)
+
+
+@nvfp4_a16_gemm.register_fake
+def _(activation, qweights, block_scales, global_scale, gemm_n, gemm_k):
+    *leading, _ = activation.shape
+    return torch.empty(*leading,
+                       gemm_n,
+                       dtype=activation.dtype,
+                       device=activation.device)
+
+
+# ---------------------------------------------------------------------------
 # INT8 SmoothQuant fake-quant eager helpers (numeric-validation golden)
 #
 # W8A8: symmetric per-tensor INT8 activation, symmetric per-channel INT8 weight.
@@ -1048,6 +1087,90 @@ def _(hidden_states,
       ngroups,
       chunk_size=0):
     return torch.empty_like(hidden_states), state.clone()
+
+
+# ---------------------------------------------------------------------------
+# Custom op: trt_edgellm::update_ssm_state_with_intermediate
+#   Mamba2 SSM update that also emits the per-token replay stash for MTP
+#   spec-verify. Adds a shape-only spec_verify_phase_marker input (length 0 =
+#   ordinary, 1 = verify). During verify the committed state is left read-only
+#   and the recurrent state is reconstructed from the replay stash after accept.
+#   Emits three FP32 replay outputs (dA / u / B) instead of a full-state snapshot.
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt_edgellm::update_ssm_state_with_intermediate",
+                         mutates_args=())
+def update_ssm_state_with_intermediate(
+    hidden_states: torch.Tensor,  # [batch, seq_len, num_heads, head_dim]
+    ssm_a: torch.Tensor,  # [num_heads] float32
+    ssm_b: torch.Tensor,  # [batch, seq_len, n_groups, ssm_state_size]
+    ssm_c: torch.Tensor,  # [batch, seq_len, n_groups, ssm_state_size]
+    ssm_d: torch.Tensor,  # [num_heads] float16
+    dt: torch.Tensor,  # [batch, seq_len, num_heads]
+    dt_bias: torch.Tensor,  # [num_heads] float16
+    state: torch.Tensor,  # [batch, num_heads, head_dim, ssm_state_size]
+    context_lengths: torch.Tensor,  # [batch] int32
+    state_start_index: torch.
+    Tensor,  # [0] cold / [batch] restored (unused in verify)
+    spec_verify_phase_marker: torch.Tensor,  # [0 or 1] int32 (shape-only)
+    dt_softplus: int,
+    ngroups: int,
+    chunk_size: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+           torch.Tensor]:
+    """Stub: SSM update with the per-token replay stash (dA / u / B, FP32)."""
+    b, s, nh, hd = hidden_states.shape
+    ds = state.shape[3]
+    replay_da = torch.zeros(b, s, nh, dtype=torch.float32, device=state.device)
+    replay_u = torch.zeros(b,
+                           s,
+                           nh,
+                           hd,
+                           dtype=torch.float32,
+                           device=state.device)
+    replay_b = torch.zeros(b,
+                           s,
+                           ngroups,
+                           ds,
+                           dtype=torch.float32,
+                           device=state.device)
+    return (torch.zeros_like(hidden_states), state.clone(), replay_da,
+            replay_u, replay_b)
+
+
+@update_ssm_state_with_intermediate.register_fake
+def _(hidden_states,
+      ssm_a,
+      ssm_b,
+      ssm_c,
+      ssm_d,
+      dt,
+      dt_bias,
+      state,
+      context_lengths,
+      state_start_index,
+      spec_verify_phase_marker,
+      dt_softplus,
+      ngroups,
+      chunk_size=0):
+    b, s, nh, hd = hidden_states.shape
+    ds = state.shape[3]
+    replay_da = torch.empty(b, s, nh, dtype=torch.float32, device=state.device)
+    replay_u = torch.empty(b,
+                           s,
+                           nh,
+                           hd,
+                           dtype=torch.float32,
+                           device=state.device)
+    replay_b = torch.empty(b,
+                           s,
+                           ngroups,
+                           ds,
+                           dtype=torch.float32,
+                           device=state.device)
+    return (torch.empty_like(hidden_states), state.clone(), replay_da,
+            replay_u, replay_b)
 
 
 # ---------------------------------------------------------------------------
