@@ -448,6 +448,9 @@ MODEL_NAME_TO_DRAFT_MODELS_MAP = {
     "Qwen3-VL-8B-Instruct": {
         "v0": "qwen3-vl-8b-eagle3-v0",
     },
+    "gemma-4-12B-it": {
+        "ttt7": "eagle3_gemma4_12b_ttt7",
+    },
 }
 
 # Base model + DFlash ``draft_model_id`` -> draft checkpoint folder name.
@@ -486,6 +489,10 @@ MODEL_NAME_TO_DFLASH_DRAFT_MODELS_MAP = {
     },
     "gemma-4-26B-A4B-it": {
         "zlab": "gemma-4-26B-A4B-it-DFlash",
+    },
+    "gemma-4-12B-it": {
+        "block7": "dflash_gemma4_12b_block7",
+        "zlab": "gemma4-12B-it-DFlash",
     },
 }
 
