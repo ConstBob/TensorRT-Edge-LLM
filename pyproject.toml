@@ -27,7 +27,7 @@ dependencies = [
     "onnx==1.19.0",
     "onnxscript==0.7.1",
     "safetensors==0.8.0",
-    "numpy==2.4.6",
+    "numpy==2.2.6",
     "onnx-graphsurgeon==0.6.1",
 ]
 
