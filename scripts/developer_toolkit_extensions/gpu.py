@@ -17,6 +17,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
+
+from trt_dev_toolkit.command_manager.command_manager import CommandManager
+from trt_dev_toolkit.command_manager.data_structures import CommandSpec, OutputMode
+from trt_dev_toolkit.command_manager.targets import LocalTarget
 
 from .errors import OrchestrationError
 
@@ -80,6 +85,48 @@ def nvidia_smi_discovery_argv() -> list[str]:
         f"--query-gpu={','.join(NVIDIA_SMI_QUERY_FIELDS)}",
         "--format=csv,noheader,nounits",
     ]
+
+
+def select_gpu_on_target(
+    *,
+    command_manager: CommandManager | None = None,
+    target: Any | None = None,
+    descriptor: GPUDescriptor | None = None,
+    cwd: str = ".",
+) -> GPUSelection:
+    """Discover GPUs on a DevToolkit target and return one selection.
+
+    Args:
+        command_manager: DevToolkit command manager. Defaults to a new one.
+        target: DevToolkit execution target. Defaults to local execution.
+        descriptor: Selection criteria. Defaults to GPU index 0.
+        cwd: Working directory for the discovery command.
+
+    Returns:
+        Selected GPU inventory.
+
+    Raises:
+        OrchestrationError: If nvidia-smi cannot run or no GPU matches.
+    """
+    manager = command_manager or CommandManager()
+    result = manager.run(
+        target or LocalTarget(),
+        CommandSpec(
+            argv=nvidia_smi_discovery_argv(),
+            cwd=cwd,
+            output_mode=OutputMode.CAPTURE,
+            operation_name="gpu-discovery",
+        ),
+    )
+    if not result.success:
+        raise OrchestrationError(result.error_message
+                                 or "Could not discover GPUs with nvidia-smi")
+    return select_gpu(result.stdout, descriptor or GPUDescriptor(index=0))
+
+
+def select_local_gpu(descriptor: GPUDescriptor | None = None) -> GPUSelection:
+    """Discover local GPUs with nvidia-smi and return one selection."""
+    return select_gpu_on_target(descriptor=descriptor)
 
 
 def cuda_runtime_discovery_command() -> str:
