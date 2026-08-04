@@ -155,6 +155,13 @@ KERNEL_VARIANTS = [
         script="gdn_cutedsl/gdn_prefill_blackwell.py",
         script_args=["--export_only"],
     ),
+    KernelVariant(
+        name="gdn_prefill_blackwell_geforce",
+        group="gdn",
+        supported_sms=[120, 121],
+        script="gdn_cutedsl/gdn_prefill_sm12x.py",
+        script_args=["--export_only"],
+    ),
     # MTP decode: multi-token speculative-decoding verification (Ampere SM80+).
     # Only the cache variant is exported (per-step intermediate state checkpointing for rollback).
     KernelVariant(

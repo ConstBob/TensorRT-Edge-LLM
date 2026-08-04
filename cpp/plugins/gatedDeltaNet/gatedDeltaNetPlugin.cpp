@@ -360,6 +360,14 @@ size_t GatedDeltaNetPlugin::getWorkspaceSize([[maybe_unused]] DynamicPluginTenso
     total = cuSeqPadded + h0ScratchBytes;
 #endif
 
+#ifdef CUTE_DSL_GDN_BLACKWELL_GEFORCE_ENABLED
+    // Workspace sizes are serialized with the engine, so reserve a fixed
+    // architecture-wide upper bound rather than the build GPU's SM count.
+    size_t const blackwellGeforceTensorMapBytes = static_cast<size_t>(CuteDslGDNRunner::kBlackwellGeforceMaxSMCount)
+        * CuteDslGDNRunner::kBlackwellGeforceTensorMapDescriptorBytes;
+    total = std::max(total, blackwellGeforceTensorMapBytes);
+#endif
+
     if (mUseDDTree)
     {
         int32_t const maxN = static_cast<int32_t>(inputs[kIN_Q_IDX].max.d[0]);
@@ -446,6 +454,8 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
 
     GDNParams params{};
     params.seq_len = seq_len;
+    params.h = h;
+    params.hv = hv;
     params.smVersion = mSMVersion;
     params.use_mtp = mtpActive;
     if (!ddtreeActive && !CuteDslGDNRunner::ensureKernelModules(params, stream))
@@ -544,7 +554,7 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
 #ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
         // Blackwell prefill: carve cu_seqlens and h0 scratch out of the pre-allocated workspace.
         //   workspace layout: [cu_seqlens: (n+1)*int32, pad to 128B] [h0_scratch: n*hv*k*v*f32]
-        if (seq_len > 1 && mSMVersion >= 100)
+        if (seq_len > 1 && (mSMVersion == 100 || mSMVersion == 101 || mSMVersion == 110))
         {
             size_t const cuSeqBytes = static_cast<size_t>(n + 1) * sizeof(int32_t);
             size_t const cuSeqPadded = (cuSeqBytes + 127u) & ~static_cast<size_t>(127u);
@@ -553,6 +563,12 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
             launchGdnCalCuSeqLens(inputs[kIN_CONTEXT_LENGTHS_IDX], bwBase, n, stream);
             params.cu_seqlens = bwBase;
             params.h0_scratch = bwBase + cuSeqPadded;
+        }
+#endif
+#ifdef CUTE_DSL_GDN_BLACKWELL_GEFORCE_ENABLED
+        if (seq_len > 1 && (mSMVersion == 120 || mSMVersion == 121))
+        {
+            params.tensormap_scratch = workspace;
         }
 #endif
     }
