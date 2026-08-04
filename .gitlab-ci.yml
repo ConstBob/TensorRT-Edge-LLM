@@ -71,7 +71,5 @@ stages:
 - setup
 - l0_test
 - l1_test
-- get-binaries
-- build-sonar
-- sonarqube-vulnerability-report
+- sonar
 - publish
