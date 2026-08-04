@@ -655,8 +655,8 @@ bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
                 if (mUseTree)
                 {
                     // Step logits become the depth-(step+1) candidate row (row 0 is the root placeholder).
-                    CUDA_CHECK(cudaMemcpy2DAsync(
-                        static_cast<char*>(mStackedMarkovLogits.rawPointer()) + static_cast<size_t>(step + 1) * rowBytes,
+                    CUDA_CHECK(cudaMemcpy2DAsync(static_cast<char*>(mStackedMarkovLogits.rawPointer())
+                            + static_cast<size_t>(step + 1) * rowBytes,
                         static_cast<size_t>(proposalDepthSize) * rowBytes, mDraftStepLogits.rawPointer(), rowBytes,
                         rowBytes, activeBatchSize, cudaMemcpyDeviceToDevice, context.stream));
                 }

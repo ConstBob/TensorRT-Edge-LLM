@@ -62,12 +62,14 @@ _DEFAULT_MAX_INPUT_LEN = 4096
 _DEFAULT_MAX_BATCH_SIZE = 1
 _DEFAULT_MAX_KV_CACHE_CAPACITY = 8192
 
+
 def _exporter_model_types():
     """Visual/audio classification read from the exporter, so the server cannot
     drift behind it. The sets are orthogonal: an Omni checkpoint is in both."""
     from tensorrt_edgellm.scripts import export as _export
 
     return _export._VLM_MODEL_TYPES, _export._AUDIO_MODEL_TYPES
+
 
 # ---------------------------------------------------------------------------
 # Public data classes
