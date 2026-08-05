@@ -42,6 +42,9 @@ protected:
         int64_t numFrames, bool isVideo, int64_t height, int64_t width, int64_t maxRatio = 200) override;
     bool validateExtraConfig(nlohmann::json const& jsonConfig) override;
 
+    //! HF keeps this family's temporal positions in float (`(arange(t) * spg).float() * pips`).
+    bool usesFractionalMRopePositions() const override;
+
     //! Mirrors HF Qwen3-Omni get_rope_index: temporal step = secondPerGrid * position_id_per_seconds; the span
     //! advance also counts the temporal extent (its large position_id_per_seconds can make T dominate).
     void getMRopePositionIds(std::vector<std::vector<int32_t>> const& batchInputIds,

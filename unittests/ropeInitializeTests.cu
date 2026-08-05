@@ -296,6 +296,77 @@ void BenchmarkMRopeCosSin(int32_t rotaryDim, int32_t rotaryEmbeddingMaxPositions
     cudaEventDestroy(stop);
 }
 
+//! Fractional temporal positions (Qwen3-Omni fps-modulated MRoPE). The shared
+//! reference indexes a precomputed integer-position table, so the expectation is
+//! recomputed here with the kernel's own formula.
+void TestMRopeCosSinFractional(int32_t rotaryDim, int32_t rotaryEmbeddingMaxPositions, int32_t batchSize,
+    float rotaryBaseFrequency, bool interleaved, int32_t sectionH, int32_t sectionW, float temporalStep)
+{
+    int32_t const halfDim = rotaryDim / 2;
+    int32_t const numTemporalPairs = halfDim - sectionH - sectionW;
+
+    std::vector<float> mropePositionIds(batchSize * 3 * rotaryEmbeddingMaxPositions);
+    for (int32_t b = 0; b < batchSize; ++b)
+    {
+        for (int32_t i = 0; i < rotaryEmbeddingMaxPositions; ++i)
+        {
+            int32_t const base = b * 3 * rotaryEmbeddingMaxPositions;
+            mropePositionIds[base + 0 * rotaryEmbeddingMaxPositions + i] = i * temporalStep;
+            mropePositionIds[base + 1 * rotaryEmbeddingMaxPositions + i] = static_cast<float>(i);
+            mropePositionIds[base + 2 * rotaryEmbeddingMaxPositions + i] = static_cast<float>(i);
+        }
+    }
+
+    std::vector<float> ropeConstants(halfDim);
+    for (int32_t j = 0; j < halfDim; ++j)
+    {
+        ropeConstants[j] = std::pow(rotaryBaseFrequency, 2 * j / static_cast<float>(rotaryDim));
+    }
+
+    std::vector<float> reference(batchSize * rotaryEmbeddingMaxPositions * rotaryDim);
+    for (int32_t b = 0; b < batchSize; ++b)
+    {
+        for (int32_t i = 0; i < rotaryEmbeddingMaxPositions; ++i)
+        {
+            for (int32_t j = 0; j < halfDim; ++j)
+            {
+                int32_t sec;
+                if (interleaved)
+                {
+                    int32_t const mod3 = j % 3;
+                    sec = (mod3 == 1 && j < sectionH * 3) ? 1 : ((mod3 == 2 && j < sectionW * 3) ? 2 : 0);
+                }
+                else
+                {
+                    sec = (j < numTemporalPairs) ? 0 : ((j < numTemporalPairs + sectionH) ? 1 : 2);
+                }
+                float const pos
+                    = mropePositionIds[b * 3 * rotaryEmbeddingMaxPositions + sec * rotaryEmbeddingMaxPositions + i];
+                int32_t const dst = b * rotaryEmbeddingMaxPositions * rotaryDim + i * rotaryDim + j;
+                reference[dst] = std::cos(pos / ropeConstants[j]);
+                reference[dst + halfDim] = std::sin(pos / ropeConstants[j]);
+            }
+        }
+    }
+
+    thrust::device_vector<float> cosSinCacheDevice(batchSize * rotaryEmbeddingMaxPositions * rotaryDim);
+    thrust::device_vector<float> mropePositionIdsDevice(mropePositionIds);
+
+    cudaStream_t stream{nullptr};
+    initializeMRopeCosSin(thrust::raw_pointer_cast(cosSinCacheDevice.data()),
+        thrust::raw_pointer_cast(mropePositionIdsDevice.data()), rotaryBaseFrequency, rotaryDim,
+        rotaryEmbeddingMaxPositions, batchSize, interleaved, sectionH, sectionW, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    thrust::host_vector<float> cosSinCacheHost(cosSinCacheDevice);
+    for (int32_t i = 0; i < batchSize * rotaryEmbeddingMaxPositions * rotaryDim; ++i)
+    {
+        ASSERT_TRUE(isclose(cosSinCacheHost[i], reference[i], 1e-3, 1e-3))
+            << "MRope fractional cache mismatch at index " << i << ": got " << cosSinCacheHost[i] << ", expected "
+            << reference[i];
+    }
+}
+
 TEST(InitializeMRopeCosSin, Accuracy)
 {
     // Qwen2-VL: rotaryDim=128, non-interleaved, section [16,24,24]
@@ -307,6 +378,15 @@ TEST(InitializeMRopeCosSin, Accuracy)
     // Qwen3.5: rotaryDim=64, interleaved, section [11,11,10]
     TestMRopeCosSin(64, 4096, 2, 10000000.0f, true, 11, 10);
     TestMRopeCosSin(64, 500, 1, 10000000.0f, true, 11, 10);
+}
+
+TEST(InitializeMRopeCosSin, FractionalTemporalPositions)
+{
+    // Qwen3-Omni step = (temporalPatchSize / fps) * positionIdPerSecond; at
+    // temporalPatchSize=2, positionIdPerSecond=13 that is 13 (fps=2) and 6.5 (fps=4).
+    TestMRopeCosSinFractional(128, 512, 2, 5000000.0f, true, 20, 20, 6.5f);
+    TestMRopeCosSinFractional(128, 512, 1, 5000000.0f, true, 20, 20, 3.25f);
+    TestMRopeCosSinFractional(128, 512, 1, 10000.0f, false, 24, 24, 6.5f);
 }
 
 TEST(InitializeMRopeCosSin, Benchmark)
