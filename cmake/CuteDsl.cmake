@@ -476,9 +476,12 @@ function(cute_dsl_setup)
     endforeach()
   endif()
 
-  # Check for Blackwell GDN variant specifically and set a clean define.
+  # Check for Blackwell GDN variant specifically and set a clean define. The
+  # per-variant GDN defines guard code that also needs CUTE_DSL_GDN_ENABLED for
+  # the runner declaration, so an artifact carrying the variant is not enough:
+  # 'gdn' has to be an active group too.
   list(FIND _variants "gdn_prefill_blackwell" _bw_idx)
-  if(NOT ${_bw_idx} EQUAL -1)
+  if(NOT ${_bw_idx} EQUAL -1 AND "gdn" IN_LIST _active_groups)
     foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
       target_compile_definitions(${_tgt}
                                  PRIVATE "CUTE_DSL_GDN_BLACKWELL_ENABLED")
@@ -492,7 +495,8 @@ function(cute_dsl_setup)
   # Check for the Blackwell GeForce GDN prefill variant.
   list(FIND _variants "gdn_prefill_blackwell_geforce"
        _gdn_blackwell_geforce_idx)
-  if(NOT ${_gdn_blackwell_geforce_idx} EQUAL -1)
+  if(NOT ${_gdn_blackwell_geforce_idx} EQUAL -1 AND "gdn" IN_LIST
+                                                    _active_groups)
     foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
       target_compile_definitions(
         ${_tgt} PRIVATE "CUTE_DSL_GDN_BLACKWELL_GEFORCE_ENABLED")
