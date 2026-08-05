@@ -33,6 +33,17 @@ install_timeout_seconds="${CI_APT_INSTALL_TIMEOUT_SECONDS:-600}"
 network_timeout_seconds="${CI_APT_NETWORK_TIMEOUT_SECONDS:-30}"
 lock_timeout_seconds="${CI_APT_LOCK_TIMEOUT_SECONDS:-60}"
 retries="${CI_APT_RETRIES:-2}"
+update_attempts="${CI_APT_UPDATE_ATTEMPTS:-2}"
+update_retry_delay_seconds="${CI_APT_UPDATE_RETRY_DELAY_SECONDS:-10}"
+
+if ! [[ "$update_attempts" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: CI_APT_UPDATE_ATTEMPTS must be a positive integer" >&2
+    exit 2
+fi
+if ! [[ "$update_retry_delay_seconds" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: CI_APT_UPDATE_RETRY_DELAY_SECONDS must be a non-negative integer" >&2
+    exit 2
+fi
 
 apt_options=(
     -q
@@ -43,8 +54,29 @@ apt_options=(
     -o Dpkg::Use-Pty=0
 )
 
+update_package_index() {
+    local attempt
+    local status
+
+    for ((attempt = 1; attempt <= update_attempts; ++attempt)); do
+        if "$run_command" "$update_timeout_seconds" \
+            "APT package index update (attempt $attempt/$update_attempts)" -- \
+            env DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" update; then
+            return 0
+        else
+            status=$?
+        fi
+
+        if [ "$attempt" -eq "$update_attempts" ]; then
+            return "$status"
+        fi
+
+        echo "Retrying APT package index update in ${update_retry_delay_seconds}s" >&2
+        sleep "$update_retry_delay_seconds"
+    done
+}
+
 echo "APT packages: $*"
-"$run_command" "$update_timeout_seconds" "APT package index update" -- \
-    env DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" update
+update_package_index
 "$run_command" "$install_timeout_seconds" "APT package installation" -- \
     env DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" install -y "$@"
