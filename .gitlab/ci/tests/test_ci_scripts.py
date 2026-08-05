@@ -186,6 +186,29 @@ def test_ci_apt_keeps_package_manager_output_visible(tmp_path):
     assert "apt-stderr-marker" in result.stderr
 
 
+def test_ci_apt_retries_a_transient_update_before_installing(tmp_path):
+    marker = tmp_path / "first-update-failed"
+    body = """printf "%s\\n" "$*" >> "$APT_CALL_LOG"
+if [[ " $* " == *" update "* ]] && [ ! -e "$APT_FAILURE_MARKER" ]; then
+    touch "$APT_FAILURE_MARKER"
+    exit 42
+fi
+"""
+    env, call_log = install_fake_apt(tmp_path, body)
+    env["APT_FAILURE_MARKER"] = str(marker)
+    env["CI_APT_UPDATE_RETRY_DELAY_SECONDS"] = "0"
+
+    result = run_script("ci_apt.sh", "install", "git", env=env)
+
+    assert result.returncode == 0
+    calls = read_apt_calls(call_log)
+    update_calls = [call for call in calls if "update" in call]
+    install_calls = [call for call in calls if "install" in call]
+    assert len(update_calls) >= 2
+    assert install_calls
+    assert calls.index(update_calls[-1]) < calls.index(install_calls[0])
+
+
 def test_ci_apt_does_not_install_after_update_failure(tmp_path):
     body = """printf "%s\\n" "$*" >> "$APT_CALL_LOG"
 if [[ " $* " == *" update "* ]]; then
@@ -193,6 +216,7 @@ if [[ " $* " == *" update "* ]]; then
 fi
 """
     env, call_log = install_fake_apt(tmp_path, body)
+    env["CI_APT_UPDATE_RETRY_DELAY_SECONDS"] = "0"
 
     result = run_script("ci_apt.sh", "install", "git", env=env)
 
@@ -211,6 +235,7 @@ fi
 """
     env, call_log = install_fake_apt(tmp_path, body)
     env["CI_APT_UPDATE_TIMEOUT_SECONDS"] = "1"
+    env["CI_APT_UPDATE_ATTEMPTS"] = "1"
     env["CI_COMMAND_KILL_AFTER_SECONDS"] = "1"
 
     result = run_script("ci_apt.sh",

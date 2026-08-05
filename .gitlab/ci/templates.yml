@@ -510,7 +510,7 @@
     - .gitlab_junit_report
   variables:
     REMOTE_WORKSPACE: "/home/${BOARD_USER}/tensorrt-edge-llm-${CI_JOB_ID}"
-    # Cold installs pull roughly 3 GB of CUDA-enabled Python wheels.
+    CI_APT_INSTALL_TIMEOUT_SECONDS: "1200"
     CI_PIP_INSTALL_TIMEOUT_SECONDS: "2400"
   script:
     - ': "${BOARD_USER:?Device jobs must define BOARD_USER}"'
