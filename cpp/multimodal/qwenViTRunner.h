@@ -192,6 +192,11 @@ protected:
     virtual std::tuple<int64_t, int64_t> computeVisionSpans(
         rt::imageUtils::ImageData const& image, int64_t patchBase, std::vector<VisionSpan>& spans);
 
+    //! \brief Whether MRoPE temporal positions can be fractional. HF keeps Qwen3-Omni's
+    //!        second_per_grid * position_id_per_seconds in float; the other Qwen families
+    //!        truncate to integers, so their position buffer stays int64.
+    virtual bool usesFractionalMRopePositions() const;
+
     //! \brief Fill MRoPE position ids — one standalone implementation per model, mirroring each HF get_rope_index.
     //!        spansPerRequest bounds span consumption per batch row (batch isolation; empty = no media anywhere).
     virtual void getMRopePositionIds(std::vector<std::vector<int32_t>> const& batchInputIds,

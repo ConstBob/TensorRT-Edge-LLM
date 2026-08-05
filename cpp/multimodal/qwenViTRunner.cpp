@@ -298,10 +298,11 @@ bool QwenViTRunner::allocateBuffer(cudaStream_t stream)
     kernel::allocateResizeScratch(channels, kMaxResizeTmpElems, mRawImageDevice, mResizeTmpDevice);
 
     // Pre-allocate tensors for MRoPE position IDs
-    mMropePositionIdsHost = rt::Tensor({mLLMMaxBatchSize, 3, mLLMMaxSequenceLength}, rt::DeviceType::kCPU,
-        nvinfer1::DataType::kINT64, "QwenViTRunner::mMropePositionIdsHost");
+    auto const mropePosType = usesFractionalMRopePositions() ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kINT64;
+    mMropePositionIdsHost = rt::Tensor({mLLMMaxBatchSize, 3, mLLMMaxSequenceLength}, rt::DeviceType::kCPU, mropePosType,
+        "QwenViTRunner::mMropePositionIdsHost");
     mMropePositionIdsDevice = rt::Tensor({mLLMMaxBatchSize, 3, mLLMMaxSequenceLength}, rt::DeviceType::kGPU,
-        nvinfer1::DataType::kINT64, "QwenViTRunner::mMropePositionIdsDevice");
+        mropePosType, "QwenViTRunner::mMropePositionIdsDevice");
 
     return true;
 }
@@ -630,16 +631,28 @@ void QwenViTRunner::generateMropeParams(std::vector<std::vector<int32_t>> const&
                 + "; shorten the prompt or reduce the media");
     }
     getMRopePositionIds(batchInputIds, spans, spansPerRequest);
+    bool const fractional = usesFractionalMRopePositions();
+    int64_t const posSize = fractional ? sizeof(float) : sizeof(int64_t);
     CUDA_CHECK(cudaMemcpyAsync(mMropePositionIdsDevice.rawPointer(), mMropePositionIdsHost.rawPointer(),
-        activeBatchSize * 3 * maxPositionEmbeddings * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
+        activeBatchSize * 3 * maxPositionEmbeddings * posSize, cudaMemcpyHostToDevice, stream));
 
     // Initialize mrope cosSinCacheDevice
     check::check(
         ropeRotaryCosSinDevice.reshape({activeBatchSize, maxPositionEmbeddings, rotaryDim}), "Tensor reshape failed");
     bool interleaved = mConfig.mropeInterleaved;
-    kernel::initializeMRopeCosSin(ropeRotaryCosSinDevice.dataPointer<float>(),
-        mMropePositionIdsDevice.dataPointer<int64_t>(), mConfig.mropeTheta, rotaryDim, maxPositionEmbeddings,
-        activeBatchSize, interleaved, mConfig.mropeSectionH, mConfig.mropeSectionW, stream);
+    auto launch = [&](auto* positions) {
+        kernel::initializeMRopeCosSin(ropeRotaryCosSinDevice.dataPointer<float>(), positions, mConfig.mropeTheta,
+            rotaryDim, maxPositionEmbeddings, activeBatchSize, interleaved, mConfig.mropeSectionH,
+            mConfig.mropeSectionW, stream);
+    };
+    if (fractional)
+    {
+        launch(mMropePositionIdsDevice.dataPointer<float>());
+    }
+    else
+    {
+        launch(mMropePositionIdsDevice.dataPointer<int64_t>());
+    }
 }
 
 void QwenViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
@@ -844,6 +857,11 @@ bool QwenViTRunner::validateExtraConfig(nlohmann::json const& /*jsonConfig*/)
 bool QwenViTRunner::usesRotaryPosEmb() const
 {
     return true;
+}
+
+bool QwenViTRunner::usesFractionalMRopePositions() const
+{
+    return false;
 }
 
 bool QwenViTRunner::allocateExtraBuffers(int64_t /*maxImageTokens*/)
