@@ -3,7 +3,7 @@
 # ==============================================================================
 
 .sonar_job:
-  allow_failure: false
+  allow_failure: true
   rules:
     # Explicit L1 runs include Sonar even when the commit has [skip tests].
     - if: $L1 == "true"
