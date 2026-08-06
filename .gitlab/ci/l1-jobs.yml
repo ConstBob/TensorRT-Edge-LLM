@@ -569,10 +569,7 @@ l1_rtx5090_eagle:
         mkdir -p "$(dirname "$VLMEVALKIT_DIR")"
         bash "$CI_PROJECT_DIR/.gitlab/ci/scripts/ci_run.sh" \
           "$CI_GIT_TIMEOUT_SECONDS" "Clone VLMEvalKit mirror" -- \
-          git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/VLMEvalKit-mirror.git "$VLMEVALKIT_DIR" \
-          || bash "$CI_PROJECT_DIR/.gitlab/ci/scripts/ci_run.sh" \
-            "$CI_GIT_TIMEOUT_SECONDS" "Clone VLMEvalKit fallback" -- \
-            git clone https://github.com/open-compass/VLMEvalKit.git "$VLMEVALKIT_DIR"
+          git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/VLMEvalKit-mirror.git "$VLMEVALKIT_DIR"
       fi
     - |
       (
@@ -687,9 +684,7 @@ l1_spark:
     - mkdir -p "$TEST_LOG_DIR" "$ENGINE_DIR" "$CI_PROJECT_DIR/.ci-reports"
     - rm -rf "$TEST_LOG_DIR"/* "$ENGINE_DIR"/*
     - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
-    - rm -rf 3rdParty/googletest 3rdParty/nlohmannJson venv/l1-spark
-    - bash .gitlab/ci/scripts/ci_run.sh "$CI_GIT_TIMEOUT_SECONDS" "Clone GoogleTest" -- git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
-    - bash .gitlab/ci/scripts/ci_run.sh "$CI_GIT_TIMEOUT_SECONDS" "Clone nlohmann JSON" -- git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
+    - rm -rf venv/l1-spark
     - python3 -m venv --system-site-packages venv/l1-spark
     - source venv/l1-spark/bin/activate
     - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install pytest dependencies" -- pip3 install -r tests/requirements.txt
@@ -700,6 +695,7 @@ l1_spark:
     - deactivate
     - echo "Pipeline end time:$(date)"
   extends:
+    - .ci_test_submodules
     - .gitlab_junit_report
     - .l1_rules
     - .l1_environment
