@@ -709,6 +709,17 @@ class ModelConfig:
     dflash_target_layer_ids: List[int] = field(default_factory=list)
     dflash_block_size: int = 16
     dflash_mask_token_id: int = 248070
+    # ------------------------------------------ JetSpec config
+    # JetSpec uses the DFlash/DDTree cached-draft contract with causal proposal
+    # attention inside the draft block. The DFlash-prefixed fields are still
+    # populated for the shared DFlashDraftModel ONNX implementation.
+    jetspec_base: bool = False
+    jetspec_tree_base: bool = False
+    is_jetspec_draft_flag: bool = False
+    jetspec_target_layer_ids: List[int] = field(default_factory=list)
+    jetspec_block_size: int = 16
+    jetspec_mask_token_id: int = 151669
+    jetspec_causal_head: bool = False
     # ------------------------------------------ DSpark config
     # DSpark uses the DFlash-like target-hidden feedback path, then applies
     # a sequential Markov/confidence head outside the draft backbone engine.
@@ -814,7 +825,7 @@ class ModelConfig:
         return bool(self.mtp_num_hidden_layers is not None
                     and self.gdn_cfg is None and not self.mtp_base
                     and not self.is_eagle3_draft and not self.is_dflash_draft
-                    and not self.is_dspark_draft)
+                    and not self.is_jetspec_draft and not self.is_dspark_draft)
 
     @property
     def is_gemma4_mtp_draft(self) -> bool:
@@ -829,6 +840,10 @@ class ModelConfig:
     @property
     def is_dflash_draft(self) -> bool:
         return self.is_dflash_draft_flag
+
+    @property
+    def is_jetspec_draft(self) -> bool:
+        return self.is_jetspec_draft_flag
 
     @property
     def is_dspark_draft(self) -> bool:
@@ -1047,6 +1062,20 @@ class ModelConfig:
             model_type in ("gemma4_unified", "gemma4_unified_text")
             and llm_dict.get("use_bidirectional_attention") == "vision")
 
+        jetspec_config = (llm_dict.get("jetspec_config")
+                          or llm_dict.get("dflash_config") or {})
+        jetspec_target_layer_ids = list(
+            jetspec_config.get("target_layer_ids",
+                               llm_dict.get("target_layer_ids", [])) or [])
+        jetspec_block_size = int(
+            jetspec_config.get("block_size", llm_dict.get("block_size", 16)))
+        jetspec_mask_token_id = int(
+            jetspec_config.get("mask_token_id",
+                               llm_dict.get("mask_token_id", 151669)))
+        jetspec_causal_head = bool(
+            jetspec_config.get("causal_head",
+                               llm_dict.get("causal_head", True)))
+
         # Sparse MoE fields.  HF uses "num_local_experts" as the internal key
         # and maps "num_experts" → "num_local_experts" via attribute_map.
         num_experts = int(
@@ -1171,6 +1200,12 @@ class ModelConfig:
             mtp_tree_base=bool(llm_dict.get("mtp_tree_base", False)),
             dflash_base=bool(llm_dict.get("dflash_base", False)),
             dflash_tree_base=bool(llm_dict.get("dflash_tree_base", False)),
+            jetspec_base=bool(llm_dict.get("jetspec_base", False)),
+            jetspec_tree_base=bool(llm_dict.get("jetspec_tree_base", False)),
+            jetspec_target_layer_ids=jetspec_target_layer_ids,
+            jetspec_block_size=jetspec_block_size,
+            jetspec_mask_token_id=jetspec_mask_token_id,
+            jetspec_causal_head=jetspec_causal_head,
             dspark_base=bool(llm_dict.get("dspark_base", False)),
             num_deepstack_features=_parse_num_deepstack_features(
                 llm_dict, model_type, root_config=root),
@@ -1509,6 +1544,54 @@ def make_dflash_draft_config(
                 "mask_token_id",
                 llm_dict.get("mask_token_id", default_mask_token_id))),
         quant=quant,
+    )
+
+
+def make_jetspec_draft_config(
+        draft_dir: str,
+        default_attention_scale: Callable[[int], float]) -> ModelConfig:
+    """Build a JetSpec draft config from an official JetSpec checkpoint.
+
+    The public JetSpec Qwen3 checkpoint stores its metadata in ``dflash_config``
+    because JetSpec reuses the DFlash draft-head implementation. Persist the
+    exported runtime config under ``jetspec_config`` while also filling the
+    DFlash fields consumed by :class:`DFlashDraftModel`.
+    """
+    _, llm_dict = load_checkpoint_config_dicts(draft_dir)
+    base = make_dflash_draft_config(draft_dir, default_attention_scale)
+    jetspec_config = (llm_dict.get("jetspec_config")
+                      or llm_dict.get("dflash_config") or {})
+    target_layer_ids = list(
+        jetspec_config.get("target_layer_ids",
+                           llm_dict.get("target_layer_ids", [])) or [])
+    if not target_layer_ids:
+        raise ValueError(
+            "JetSpec draft config requires target_layer_ids in config.json.")
+
+    block_size = int(
+        jetspec_config.get("block_size",
+                           llm_dict.get("block_size", base.dflash_block_size)))
+    mask_token_id = int(
+        jetspec_config.get("mask_token_id",
+                           llm_dict.get("mask_token_id", 151669)))
+    causal_head = bool(
+        jetspec_config.get("causal_head", llm_dict.get("causal_head", True)))
+    if not causal_head:
+        raise ValueError(
+            "JetSpec draft config requires causal_head=true; use DFlash for non-causal block drafts."
+        )
+
+    return replace(
+        base,
+        is_dflash_draft_flag=False,
+        is_jetspec_draft_flag=True,
+        jetspec_target_layer_ids=target_layer_ids,
+        jetspec_block_size=block_size,
+        jetspec_mask_token_id=mask_token_id,
+        jetspec_causal_head=causal_head,
+        dflash_target_layer_ids=target_layer_ids,
+        dflash_block_size=block_size,
+        dflash_mask_token_id=mask_token_id,
     )
 
 

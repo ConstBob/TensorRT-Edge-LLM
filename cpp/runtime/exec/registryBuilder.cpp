@@ -205,13 +205,13 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
             addMambaTensor(binding_names::kConvStateTemplate, TensorIO::kInput, cfg.convStateDtype, convShape);
             addMambaTensor(binding_names::kPresentConvStateTemplate, TensorIO::kOutput, cfg.convStateDtype, convShape);
 
-            // Hybrid MTP/DFlash base only: per-layer intermediate state outputs
+            // Hybrid MTP/DFlash/JetSpec base only: per-layer intermediate state outputs
             // written during prefill/verification so accepted recurrent/conv
             // state snapshots can be committed after speculative verification.
             //
             // intermediate_recurrent_state_%d: [batch, seqLen, recurrentNumHeads, recurrentHeadDim, recurrentStateSize]
             // intermediate_conv_state_%d:      [batch, seqLen, convDim, convKernel]
-            if (cfg.specDecodeType == SpecDecodeMode::kMTP || cfg.specDecodeType == SpecDecodeMode::kDFlash
+            if (cfg.specDecodeType == SpecDecodeMode::kMTP || isCachedBlockDraftMode(cfg.specDecodeType)
                 || cfg.specDecodeType == SpecDecodeMode::kDSpark)
             {
                 std::vector<ShapeDim> const interRecShape{sym(&InferenceDims::batch), sym(&InferenceDims::seqLen),
@@ -268,7 +268,7 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
         reg.addTensor({binding_names::kAttentionPosId, TensorIO::kInput, nvinfer1::DataType::kINT32,
             {sym(&InferenceDims::batch), sym(&InferenceDims::attnMaskSeqLen)}});
 
-        if ((cfg.specDecodeType == SpecDecodeMode::kMTP || cfg.specDecodeType == SpecDecodeMode::kDFlash)
+        if ((cfg.specDecodeType == SpecDecodeMode::kMTP || isCachedBlockDraftMode(cfg.specDecodeType))
             && cfg.numLinearAttnLayers > 0)
         {
             reg.addTensor({binding_names::kSpecVerifyPhaseMarker, TensorIO::kInput, nvinfer1::DataType::kINT32,

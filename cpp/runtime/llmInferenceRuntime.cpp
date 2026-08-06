@@ -70,18 +70,25 @@ namespace rt
 {
 namespace
 {
-bool needsDFlashDDTreeHybridBindings(DeploymentConfig const& deployment)
+bool needsCachedBlockDraftDDTreeHybridBindings(DeploymentConfig const& deployment)
 {
-    return deployment.specConfig.has_value() && deployment.specDecodeMode() == SpecDecodeMode::kDFlash
+    return deployment.specConfig.has_value() && isCachedBlockDraftMode(deployment.specDecodeMode())
         && deployment.specConfig->draftingTopK > 1 && deployment.base.numLinearAttnLayers > 0;
 }
 
-void validateDFlashTreeMetadataBindings(DeploymentConfig const& deployment, EngineExecutor const& baseExecutor)
+void validateCachedBlockDraftTreeMetadataBindings(
+    DeploymentConfig const& deployment, EngineExecutor const& baseExecutor)
 {
-    if (!deployment.specConfig.has_value() || deployment.specDecodeMode() != SpecDecodeMode::kDFlash)
+    if (!deployment.specConfig.has_value() || !isCachedBlockDraftMode(deployment.specDecodeMode()))
     {
         return;
     }
+
+    char const* modeName = deployment.specDecodeMode() == SpecDecodeMode::kJetSpec ? "JetSpec" : "DFlash";
+    char const* treeBaseFlag
+        = deployment.specDecodeMode() == SpecDecodeMode::kJetSpec ? "--jetspec-tree-base" : "--dflash-tree-base";
+    char const* linearBaseFlag
+        = deployment.specDecodeMode() == SpecDecodeMode::kJetSpec ? "--jetspec-base" : "--dflash-base";
 
     bool const hasTreeParentIds = baseExecutor.hasIOTensor(binding_names::kTreeParentIds);
     bool const hasTreeDepths = baseExecutor.hasIOTensor(binding_names::kTreeDepths);
@@ -90,27 +97,28 @@ void validateDFlashTreeMetadataBindings(DeploymentConfig const& deployment, Engi
     if (hasTreeMetadata)
     {
         ELLM_CHECK(hasTreeParentIds && hasTreeDepths,
-            std::string("DFlash tree-base engine must expose both INT32 tree metadata bindings '")
+            std::string(modeName) + " tree-base engine must expose both INT32 tree metadata bindings '"
                 + binding_names::kTreeParentIds + "' and '" + binding_names::kTreeDepths + "'.");
         ELLM_CHECK(baseExecutor.getBindingDataType(binding_names::kTreeParentIds) == DataType::kINT32
                 && baseExecutor.getBindingDataType(binding_names::kTreeDepths) == DataType::kINT32,
-            std::string("DFlash tree-base engine tree metadata bindings must be INT32: '")
+            std::string(modeName) + " tree-base engine tree metadata bindings must be INT32: '"
                 + binding_names::kTreeParentIds + "' and '" + binding_names::kTreeDepths + "'.");
         ELLM_CHECK(usesDDTree,
-            std::string("DFlash base engine was exported with --dflash-tree-base, but runtime is configured for "
-                        "linear DFlash because specDraftTopK=1. Use --specDraftTopK > 1 for DDTree, or re-export "
-                        "the base model with --dflash-base for linear DFlash."));
+            std::string(modeName) + " base engine was exported with " + treeBaseFlag
+                + ", but runtime is configured for linear mode because specDraftTopK=1. "
+                  "Use --specDraftTopK > 1 for DDTree, or re-export the base model with "
+                + linearBaseFlag + ".");
     }
 
-    if (!needsDFlashDDTreeHybridBindings(deployment))
+    if (!needsCachedBlockDraftDDTreeHybridBindings(deployment))
     {
         return;
     }
 
     ELLM_CHECK(hasTreeParentIds && hasTreeDepths,
-        std::string("DFlash DDTree hybrid base engine requires INT32 tree metadata bindings '")
+        std::string(modeName) + " DDTree hybrid base engine requires INT32 tree metadata bindings '"
             + binding_names::kTreeParentIds + "' and '" + binding_names::kTreeDepths
-            + "'. Re-export the base model with --dflash-tree-base, then rebuild spec_base.engine.");
+            + "'. Re-export the base model with " + treeBaseFlag + ", then rebuild spec_base.engine.");
 }
 
 void validateMtpTreeMetadataBindings(DeploymentConfig const& deployment, EngineExecutor const& baseExecutor)
@@ -244,7 +252,7 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     // 4. Validate engine binding dtypes against the parsed configs.
     // -----------------------------------------------------------------------
     validateAgainstEngine(mDeployment.base, *mBaseExecutor, "base");
-    validateDFlashTreeMetadataBindings(mDeployment, *mBaseExecutor);
+    validateCachedBlockDraftTreeMetadataBindings(mDeployment, *mBaseExecutor);
     validateMtpTreeMetadataBindings(mDeployment, *mBaseExecutor);
 
     // Validate the draft engine ABI before its sidecar geometry is used to allocate
@@ -348,7 +356,7 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     bool const isDSparkDraft = hasDraft && mDeployment.specDecodeMode() == SpecDecodeMode::kDSpark;
     constexpr int32_t kDSparkMaxSparseTopK = 128;
     bool const isLinearBlockDraft = hasDraft
-        && (mDeployment.specDecodeMode() == SpecDecodeMode::kDFlash
+        && (isCachedBlockDraftMode(mDeployment.specDecodeMode())
             || mDeployment.specDecodeMode() == SpecDecodeMode::kDSpark);
     int32_t const draftSamplingRows = isLinearBlockDraft ? mMaxRuntimeBatchSize * mDeployment.specConfig->verifySize
                                                          : mMaxRuntimeBatchSize * effectiveDraftTopK;

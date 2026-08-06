@@ -89,7 +89,7 @@ void checkDFlashRopeCapacity(int32_t cosSinSeqLen, int32_t kvCapacity);
 /// Computes target_len_after_delta = oldDraftCacheLengths[b] + deltaLen, then sets:
 ///   attention_pos_id[b, i] = target_len_after_delta + i
 ///   context_lengths[b] = target_len_after_delta + blockSize
-///   packed_attention_mask: full non-causal within proposal block
+///   packed_attention_mask: full non-causal within proposal block, or causal rows when requested
 ///
 /// @param oldDraftCacheLengths [B] INT32 — draft cache lengths BEFORE delta (GPU)
 /// @param deltaLengths [B] INT32 — per-batch delta token count (GPU)
@@ -97,11 +97,12 @@ void checkDFlashRopeCapacity(int32_t cosSinSeqLen, int32_t kvCapacity);
 /// @param packedAttentionMask [B, BS, divUp(BS,32)] INT32 — output
 /// @param attentionPosId      [B, BS] INT32 — output
 /// @param contextLengths      [B] INT32 — output
+/// @param causalProposalMask  true => row i attends only to proposal positions [0, i]
 /// @param batchSize    batch size
 /// @param stream       CUDA stream
 void launchDFlashPrepareProposalInputs(int32_t const* oldDraftCacheLengths, int32_t const* deltaLengths,
     int32_t blockSize, int32_t* packedAttentionMask, int32_t* attentionPosId, int32_t* contextLengths,
-    int32_t batchSize, cudaStream_t stream);
+    bool causalProposalMask, int32_t batchSize, cudaStream_t stream);
 
 /// Launch kernel to prepare DFlash base verification attention inputs.
 ///

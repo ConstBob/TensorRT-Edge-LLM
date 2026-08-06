@@ -127,6 +127,7 @@ std::unique_ptr<EngineExecutor> EngineExecutor::createForDraft(
         return std::unique_ptr<EngineExecutor>(new EngineExecutor(enginePath, std::move(registry)));
     }
     case SpecDecodeMode::kDFlash:
+    case SpecDecodeMode::kJetSpec:
     {
         auto registry = buildRegistryForDFlashDraft(bundle);
         return std::unique_ptr<EngineExecutor>(new EngineExecutor(enginePath, std::move(registry)));

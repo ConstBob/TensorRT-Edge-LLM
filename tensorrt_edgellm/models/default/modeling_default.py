@@ -793,10 +793,10 @@ class CausalLM(nn.Module):
         Builds dummy inputs, I/O name lists, and dynamic shape descriptors
         matching the flat wrapper signature produced by :func:`_make_flat_wrapper`.
 
-        When ``config.eagle_base``, ``config.dflash_base``, or
-        ``config.dspark_base`` is True, extra inputs (``attention_pos_id``,
+        When ``config.eagle_base``, ``config.dflash_base``,
+        ``config.jetspec_base``, or ``config.dspark_base`` is True, extra inputs (``attention_pos_id``,
         ``attention_mask``) and an extra output (``hidden_states``) are added.
-        For DFlash/DSpark base, hidden_states is the concatenated target-layer
+        For DFlash/JetSpec/DSpark base, hidden_states is the concatenated target-layer
         hidden (shape: [B, S, len(target_layer_ids)*H]).
 
         When ``config.eagle_base`` is True, extra inputs (``attention_pos_id``,
@@ -807,9 +807,10 @@ class CausalLM(nn.Module):
         Na = config.num_hidden_layers
         Nd = config.num_deepstack_features
         dflash_base = getattr(config, 'dflash_base', False)
+        jetspec_base = getattr(config, 'jetspec_base', False)
         dspark_base = getattr(config, 'dspark_base', False)
-        target_hidden_base = dflash_base or dspark_base
-        # DFlash/DSpark base uses the same export structure as Eagle base
+        target_hidden_base = dflash_base or jetspec_base or dspark_base
+        # DFlash/JetSpec/DSpark base uses the same export structure as Eagle base
         # (tree-attention inputs + hidden_states output), so we treat it as
         # eagle_base for the wrapper.
         eagle_base = config.eagle_base or target_hidden_base
@@ -979,14 +980,21 @@ class CausalLM(nn.Module):
     ) -> Tuple:
         eagle_base = self.config.eagle_base
         dflash_base = getattr(self.config, 'dflash_base', False)
+        jetspec_base = getattr(self.config, 'jetspec_base', False)
         dspark_base = getattr(self.config, 'dspark_base', False)
-        target_hidden_base = dflash_base or dspark_base
+        target_hidden_base = dflash_base or jetspec_base or dspark_base
         dflash_target_layer_ids = getattr(self.config,
                                           'dflash_target_layer_ids', None)
+        jetspec_target_layer_ids = getattr(self.config,
+                                           'jetspec_target_layer_ids', None)
         dspark_target_layer_ids = getattr(self.config,
                                           'dspark_target_layer_ids', None)
-        target_layer_ids = (dspark_target_layer_ids
-                            if dspark_base else dflash_target_layer_ids)
+        if jetspec_base:
+            target_layer_ids = jetspec_target_layer_ids
+        elif dspark_base:
+            target_layer_ids = dspark_target_layer_ids
+        else:
+            target_layer_ids = dflash_target_layer_ids
 
         hidden_states, present_key_values, all_hidden_states = self.model(
             inputs_embeds,
@@ -1016,7 +1024,7 @@ class CausalLM(nn.Module):
         logits = self.lm_head(selected_hidden_states).to(torch.float32)
 
         if target_hidden_base and target_hidden_concat is not None:
-            # DFlash/DSpark base: concatenate hidden states from target layers.
+            # DFlash/JetSpec/DSpark base: concatenate hidden states from target layers.
             # Output the full-sequence hidden states (NOT gathered) — the C++
             # runtime passes these to the draft engine per round.
             return logits, target_hidden_concat, present_key_values

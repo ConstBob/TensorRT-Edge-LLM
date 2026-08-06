@@ -129,7 +129,7 @@ def main():
     _add_common_args(llm_parser)
 
     draft_parser = sub.add_parser(
-        "draft", help="Quantize an Eagle3 or DFlash draft model")
+        "draft", help="Quantize an Eagle3, DFlash, or JetSpec draft model")
     draft_parser.add_argument("--base_model_dir", required=True)
     draft_parser.add_argument("--draft_model_dir", required=True)
     _add_common_args(draft_parser)
@@ -155,7 +155,7 @@ def main():
             num_samples=args.num_samples,
         )
     elif args.command == "draft":
-        if _is_dflash_draft(args.draft_model_dir):
+        if _is_dflash_or_jetspec_draft(args.draft_model_dir):
             _validate_dflash_quant_args(parser, args)
             from ..quantization.models.dflash_draft import \
                 quantize_and_export_dflash_draft
@@ -188,18 +188,19 @@ def main():
             )
 
 
-def _is_dflash_draft(draft_model_dir: str) -> bool:
+def _is_dflash_or_jetspec_draft(draft_model_dir: str) -> bool:
     cfg_path = os.path.join(draft_model_dir, "config.json")
     if not os.path.isfile(cfg_path):
         return False
     with open(cfg_path, encoding="utf-8") as f:
-        return bool(json.load(f).get("dflash_config"))
+        cfg = json.load(f)
+    return bool(cfg.get("dflash_config") or cfg.get("jetspec_config"))
 
 
 def _validate_dflash_quant_args(parser, args) -> None:
     if args.kv_cache_quantization is not None:
         parser.error(
-            "DFlash draft KV-cache quantization is not validated yet.")
+            "DFlash/JetSpec draft KV-cache quantization is not validated yet.")
 
 
 if __name__ == "__main__":

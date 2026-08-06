@@ -239,6 +239,7 @@ _DEFAULT_LAYOUT: dict[str, str] = {
     "action": "action",
     "mtp_draft": "mtp_draft",
     "dflash_draft": "dflash_draft",
+    "jetspec_draft": "jetspec_draft",
     "dspark_draft": "dspark_draft",
 }
 
@@ -925,6 +926,9 @@ def _export_llm(model_dir: str,
                 dflash_base: bool = False,
                 dflash_tree_base: bool = False,
                 dflash_draft_dir: str = "",
+                jetspec_base: bool = False,
+                jetspec_tree_base: bool = False,
+                jetspec_draft_dir: str = "",
                 dspark_base: bool = False,
                 dspark_draft_dir: str = "",
                 gemma4_mtp_base: bool = False,
@@ -1008,6 +1012,9 @@ def _export_llm(model_dir: str,
                 dflash_base=dflash_base,
                 dflash_tree_base=dflash_tree_base,
                 dflash_draft_dir=dflash_draft_dir or None,
+                jetspec_base=jetspec_base,
+                jetspec_tree_base=jetspec_tree_base,
+                jetspec_draft_dir=jetspec_draft_dir or None,
                 dspark_base=dspark_base,
                 dspark_draft_dir=dspark_draft_dir or None,
                 gemma4_mtp_base=gemma4_mtp_base,
@@ -1367,6 +1374,76 @@ def _export_dflash_draft(model_dir: str,
                 indent=2)
 
     logger.info("[DFlash Draft] Done: %s", output_path)
+
+
+def _export_jetspec_draft(model_dir: str,
+                          draft_out_dir: str,
+                          jetspec_draft_dir: str,
+                          draft_reduced_vocab_dir: str = "") -> None:
+    """Export the JetSpec draft model, optionally with reduced vocabulary."""
+    os.makedirs(draft_out_dir, exist_ok=True)
+    output_path = os.path.join(draft_out_dir, "model.onnx")
+
+    logger.info("[JetSpec Draft] Loading checkpoint from %s",
+                jetspec_draft_dir)
+    try:
+        from ..model import AutoModel
+        model = AutoModel.from_pretrained(model_dir,
+                                          device="cpu",
+                                          jetspec_draft=True,
+                                          jetspec_draft_dir=jetspec_draft_dir)
+    except (OSError, ValueError, RuntimeError, ImportError) as exc:
+        logger.exception("[JetSpec Draft] Failed to load checkpoint")
+        raise SystemExit(1) from exc
+
+    full_size = model.config.vocab_size
+    reduced_size = None
+    if draft_reduced_vocab_dir:
+        logger.info("[JetSpec Draft] Applying vocab reduction from %s",
+                    draft_reduced_vocab_dir)
+        try:
+            from ..vocab_reduction.onnx_export import \
+                apply_reduced_vocab_from_dir
+            apply_reduced_vocab_from_dir(model, draft_reduced_vocab_dir)
+            reduced_size = model.config.reduced_vocab_size
+            logger.info("[JetSpec Draft] lm_head reduced: %d -> %d", full_size,
+                        reduced_size)
+        except (OSError, ValueError, RuntimeError, ImportError) as exc:
+            logger.exception("[JetSpec Draft] Vocab reduction failed")
+            raise SystemExit(1) from exc
+
+    logger.info("[JetSpec Draft] Exporting to %s", output_path)
+    try:
+        from ..onnx.export import export_onnx
+        export_onnx(model, output_path, model_dir=jetspec_draft_dir)
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.exception("[JetSpec Draft] ONNX export failed")
+        raise SystemExit(1) from exc
+
+    if draft_reduced_vocab_dir:
+        from tensorrt_edgellm._safetensors_io import \
+            save_file as _save_safetensors
+
+        from ..vocab_reduction.constants import (DRAFT_VOCAB_INFO_NAME,
+                                                 DRAFT_VOCAB_MAP_NAME)
+        vocab_map = model._reduced_vocab_map_for_runtime
+        map_path = os.path.join(draft_out_dir, DRAFT_VOCAB_MAP_NAME)
+        _save_safetensors({"vocab_map": vocab_map.cpu().to(torch.int32)},
+                          map_path)
+        logger.info("[JetSpec Draft] Wrote draft vocab map: %s (%d tokens)",
+                    map_path, vocab_map.numel())
+        with open(os.path.join(draft_out_dir, DRAFT_VOCAB_INFO_NAME),
+                  "w") as fh:
+            json.dump(
+                {
+                    "vocab_size": full_size,
+                    "reduced_vocab_size": reduced_size,
+                    "source": draft_reduced_vocab_dir
+                },
+                fh,
+                indent=2)
+
+    logger.info("[JetSpec Draft] Done: %s", output_path)
 
 
 _DSPARK_HEAD_TENSOR_KEYS = {
@@ -3600,6 +3677,26 @@ def main() -> None:
         help="Path to the DFlash draft checkpoint directory.",
     )
     p.add_argument(
+        "--jetspec-base",
+        action="store_true",
+        help="Export as JetSpec base model (adds target hidden-state output).",
+    )
+    p.add_argument(
+        "--jetspec-tree-base",
+        action="store_true",
+        help="Export JetSpec base with DDTree hybrid state metadata inputs.",
+    )
+    p.add_argument(
+        "--jetspec-draft",
+        action="store_true",
+        help="Export JetSpec draft model.",
+    )
+    p.add_argument(
+        "--jetspec-draft-dir",
+        default="",
+        help="Path to the JetSpec draft checkpoint directory.",
+    )
+    p.add_argument(
         "--dspark-base",
         action="store_true",
         help="Export as DSpark base model (adds target hidden-state output).",
@@ -3670,7 +3767,7 @@ def main() -> None:
             "of the LLM backbone. The runtime config.json and the ONNX KV "
             "in/out count follow N automatically. Supported for the plain "
             "default model path (e.g. Qwen3) and hybrid base models (e.g. "
-            "Qwen3.5, Nemotron-H); not for eagle/mtp/dflash "
+            "Qwen3.5, Nemotron-H); not for eagle/mtp/dflash/jetspec "
             "speculative-decoding variants."),
     )
     p.add_argument(
@@ -3784,26 +3881,53 @@ def main() -> None:
         p.error("--mtp-draft-dir cannot be combined with --eagle-base")
     if args.dflash_tree_base:
         args.dflash_base = True
+    if args.jetspec_tree_base:
+        args.jetspec_base = True
     if mtp_draft_dir_arg and (args.dflash_base or args.dflash_draft
+                              or args.jetspec_base or args.jetspec_draft
                               or args.dspark_base or args.dspark_draft):
-        p.error("--mtp-draft-dir cannot be combined with DFlash/DSpark export")
-    if args.dflash_base and (args.eagle_base or args.mtp):
-        p.error("--dflash-base cannot be combined with --eagle-base or --mtp")
-    if args.dflash_draft and (args.eagle_base or args.mtp):
-        p.error("--dflash-draft cannot be combined with --eagle-base or --mtp")
+        p.error("--mtp-draft-dir cannot be combined with "
+                "DFlash/JetSpec/DSpark export")
+    if args.dflash_base and (args.eagle_base or args.mtp or args.jetspec_base
+                             or args.jetspec_draft or args.dspark_base
+                             or args.dspark_draft):
+        p.error("--dflash-base cannot be combined with "
+                "EAGLE/MTP/JetSpec/DSpark modes")
+    if args.dflash_draft and (args.eagle_base or args.mtp or args.jetspec_base
+                              or args.jetspec_draft or args.dspark_base
+                              or args.dspark_draft):
+        p.error("--dflash-draft cannot be combined with "
+                "EAGLE/MTP/JetSpec/DSpark modes")
     if args.dflash_draft and not args.dflash_draft_dir:
         p.error("--dflash-draft requires --dflash-draft-dir")
+    if args.jetspec_base and (args.eagle_base or args.mtp or args.dflash_base
+                              or args.dflash_draft or args.dspark_base
+                              or args.dspark_draft):
+        p.error("--jetspec-base cannot be combined with "
+                "EAGLE/MTP/DFlash/DSpark modes")
+    if args.jetspec_draft and (args.eagle_base or args.mtp or args.dflash_base
+                               or args.dflash_draft or args.dspark_base
+                               or args.dspark_draft):
+        p.error("--jetspec-draft cannot be combined with "
+                "EAGLE/MTP/DFlash/DSpark modes")
+    if args.jetspec_base and not args.jetspec_draft_dir:
+        p.error("--jetspec-base requires --jetspec-draft-dir "
+                "for target layer metadata")
+    if args.jetspec_draft and not args.jetspec_draft_dir:
+        p.error("--jetspec-draft requires --jetspec-draft-dir")
     if args.dspark_base and (args.eagle_base or args.mtp or args.dflash_base
-                             or args.dflash_draft):
-        p.error("--dspark-base cannot be combined with EAGLE/MTP/DFlash modes")
+                             or args.dflash_draft or args.jetspec_base
+                             or args.jetspec_draft):
+        p.error("--dspark-base cannot be combined with "
+                "EAGLE/MTP/DFlash/JetSpec modes")
     if args.dspark_draft and (args.eagle_base or args.mtp or args.dflash_base
-                              or args.dflash_draft):
-        p.error(
-            "--dspark-draft cannot be combined with EAGLE/MTP/DFlash modes")
+                              or args.dflash_draft or args.jetspec_base
+                              or args.jetspec_draft):
+        p.error("--dspark-draft cannot be combined with "
+                "EAGLE/MTP/DFlash/JetSpec modes")
     if args.dspark_base and not args.dspark_draft_dir:
-        p.error(
-            "--dspark-base requires --dspark-draft-dir for target layer metadata"
-        )
+        p.error("--dspark-base requires --dspark-draft-dir "
+                "for target layer metadata")
     if args.dspark_draft and not args.dspark_draft_dir:
         p.error("--dspark-draft requires --dspark-draft-dir")
     if args.mtp and args.skip_llm:
@@ -3812,11 +3936,16 @@ def main() -> None:
         p.error("--mtp-draft-dir requires LLM export; remove --skip-llm")
     if args.dflash_base and args.skip_llm:
         p.error("--dflash-base requires LLM export; remove --skip-llm")
+    if args.jetspec_base and args.skip_llm:
+        p.error("--jetspec-base requires LLM export; remove --skip-llm")
     if args.dspark_base and args.skip_llm:
         p.error("--dspark-base requires LLM export; remove --skip-llm")
     if args.dflash_draft and args.skip_llm:
         logger.info(
             "--dflash-draft implies --skip-llm (draft export is independent)")
+    if args.jetspec_draft and args.skip_llm:
+        logger.info(
+            "--jetspec-draft implies --skip-llm (draft export is independent)")
     if args.dspark_draft and args.skip_llm:
         logger.info(
             "--dspark-draft implies --skip-llm (draft export is independent)")
@@ -3844,13 +3973,16 @@ def main() -> None:
         if args.num_decoder_layer < 1:
             p.error("--num-decoder-layer must be >= 1")
         if (args.eagle_base or args.mtp or args.dflash_base
-                or args.dflash_draft or args.dspark_base or args.dspark_draft):
+                or args.dflash_draft or args.jetspec_base or args.jetspec_draft
+                or args.dspark_base or args.dspark_draft):
             p.error("--num-decoder-layer cannot be combined with "
                     "--eagle-base / --mtp / --dflash-base / --dflash-draft / "
+                    "--jetspec-base / --jetspec-draft / "
                     "--dspark-base / --dspark-draft")
 
     _VALID_COMPONENTS = {
-        "thinker", "mtp_draft", "talker", "code_predictor", "visual", "audio",
+        "thinker", "mtp_draft", "dflash_draft", "jetspec_draft",
+        "dspark_draft", "talker", "code_predictor", "visual", "audio",
         "code2wav", "action", "dllm"
     }
     requested_components = {
@@ -3888,7 +4020,9 @@ def main() -> None:
                     "the visual component.")
         if not wants_diffusion_engines and not wants_visual:
             p.error("No DiffusionGemma components selected for export.")
-        if args.mtp or args.eagle_base or args.dflash_base or args.dflash_draft:
+        if (args.mtp or args.eagle_base or args.dflash_base
+                or args.dflash_draft or args.jetspec_base or args.jetspec_draft
+                or args.dspark_base or args.dspark_draft):
             p.error("DiffusionGemma cannot be combined with speculative "
                     "decode export flags")
         if args.reduced_vocab_dir:
@@ -3979,6 +4113,7 @@ def main() -> None:
     # When only a standalone draft flag is set, run just that draft stage.
     # If a matching base flag is also set, export both base and draft artifacts.
     _draft_only = ((args.dflash_draft and not args.dflash_base)
+                   or (args.jetspec_draft and not args.jetspec_base)
                    or (args.dspark_draft and not args.dspark_base))
 
     def _export_visual_component(out: str) -> None:
@@ -4020,6 +4155,9 @@ def main() -> None:
              dflash_base=args.dflash_base,
              dflash_tree_base=args.dflash_tree_base,
              dflash_draft_dir=args.dflash_draft_dir,
+             jetspec_base=args.jetspec_base,
+             jetspec_tree_base=args.jetspec_tree_base,
+             jetspec_draft_dir=args.jetspec_draft_dir,
              dspark_base=args.dspark_base,
              dspark_draft_dir=args.dspark_draft_dir,
              gemma4_mtp_base=gemma4_mtp_requested,
@@ -4040,6 +4178,12 @@ def main() -> None:
             out,
             args.dflash_draft_dir,
             draft_reduced_vocab_dir=args.draft_reduced_vocab_dir)),
+        (args.jetspec_draft, "jetspec_draft",
+         lambda out: _export_jetspec_draft(model_dir,
+                                           out,
+                                           args.jetspec_draft_dir,
+                                           draft_reduced_vocab_dir=args.
+                                           draft_reduced_vocab_dir)),
         (args.dspark_draft, "dspark_draft", lambda out: _export_dspark_draft(
             model_dir, out, args.dspark_draft_dir)),
         (_has_llm_component(model_type, "talker") and not args.skip_llm
@@ -4099,6 +4243,8 @@ def main() -> None:
                 gemma4_mtp_assistant_dir if gemma4_mtp_assistant_dir else "no")
     logger.info("DFlash base   : %s", "yes" if args.dflash_base else "no")
     logger.info("DFlash draft  : %s", "yes" if args.dflash_draft else "no")
+    logger.info("JetSpec base  : %s", "yes" if args.jetspec_base else "no")
+    logger.info("JetSpec draft : %s", "yes" if args.jetspec_draft else "no")
     logger.info("DSpark base   : %s", "yes" if args.dspark_base else "no")
     logger.info("DSpark draft  : %s", "yes" if args.dspark_draft else "no")
     logger.info("Reduced vocab : %s",

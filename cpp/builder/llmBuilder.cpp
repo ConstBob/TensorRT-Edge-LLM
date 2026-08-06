@@ -65,8 +65,8 @@ bool isSpecDecodeDraft(Json const& config, char const* type)
 
 bool isValidSpecDecodeType(std::string const& type)
 {
-    return type == "none" || type == "mtp" || type == "eagle3" || type == "dflash" || type == "dspark"
-        || type == "gemma4_mtp";
+    return type == "none" || type == "mtp" || type == "eagle3" || type == "dflash" || type == "jetspec"
+        || type == "dspark" || type == "gemma4_mtp";
 }
 
 bool isValidEngineRole(std::string const& role)
@@ -182,7 +182,7 @@ bool LLMBuilder::build()
         return false;
     }
 
-    // DFlash/DSpark drafts use DFlashTargetKVCacheUpdate, which needs pages_per_slot
+    // DFlash/JetSpec/DSpark drafts use DFlashTargetKVCacheUpdate, which needs pages_per_slot
     // (capPadded / kTOKENS_PER_PAGE) to split its pool-shaped past_key_value binding's
     // numPages back into (maxBatch, cap). That fact is builder-only
     // (mBuilderConfig.maxKVCacheCapacity), unavailable at ONNX-export time, and this
@@ -190,7 +190,8 @@ bool LLMBuilder::build()
     // opaque .so modules, loaded via EDGELLM_PLUGIN_PATH -- see common/trtUtils.h).
     // Resolve the plugin's exported configuration hook via dlsym on the already-loaded
     // handle instead of adding a new link dependency.
-    if (isSpecDecodeDraft(mModelConfig, "dflash") || isSpecDecodeDraft(mModelConfig, "dspark"))
+    if (isSpecDecodeDraft(mModelConfig, "dflash") || isSpecDecodeDraft(mModelConfig, "jetspec")
+        || isSpecDecodeDraft(mModelConfig, "dspark"))
     {
         using ConfigurePagesPerSlotFn = bool (*)(nvinfer1::INetworkDefinition*, int32_t);
         auto* configureFn = reinterpret_cast<ConfigurePagesPerSlotFn>(
@@ -343,7 +344,8 @@ bool LLMBuilder::parseConfig()
     std::string const role = engineRole(mModelConfig);
     if (!isValidSpecDecodeType(specType))
     {
-        LOG_ERROR("Invalid spec_decode_type='%s'. Expected one of: none, mtp, eagle3, dflash, dspark, gemma4_mtp.",
+        LOG_ERROR(
+            "Invalid spec_decode_type='%s'. Expected one of: none, mtp, eagle3, dflash, jetspec, dspark, gemma4_mtp.",
             specType.c_str());
         return false;
     }
@@ -391,7 +393,8 @@ bool LLMBuilder::parseConfig()
         mTargetModelOutputHiddenDim = mHiddenSize;
     }
     else if ((isSpecDecodeDraft(mModelConfig, "eagle3") || isSpecDecodeDraft(mModelConfig, "dflash")
-                 || isSpecDecodeDraft(mModelConfig, "dspark") || isSpecDecodeDraft(mModelConfig, "gemma4_mtp"))
+                 || isSpecDecodeDraft(mModelConfig, "jetspec") || isSpecDecodeDraft(mModelConfig, "dspark")
+                 || isSpecDecodeDraft(mModelConfig, "gemma4_mtp"))
         && mModelConfig.contains("base_model_hidden_size"))
     {
         mTargetModelOutputHiddenDim = mModelConfig["base_model_hidden_size"].get<int32_t>();
@@ -521,12 +524,12 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
 
     bool result = true;
 
-    if (isSpecDecodeDraft(mModelConfig, "dflash"))
+    if (isSpecDecodeDraft(mModelConfig, "dflash") || isSpecDecodeDraft(mModelConfig, "jetspec"))
     {
         result &= setupDFlashDraftProfiles(*contextProfile, *generationProfile);
         if (!result)
         {
-            LOG_ERROR("Failed to setup DFlash draft optimization profiles");
+            LOG_ERROR("Failed to setup DFlash/JetSpec draft optimization profiles");
             return false;
         }
         LOG_DEBUG("%s", printOptimizationProfile(contextProfile, "context_profile", &network).c_str());
@@ -584,9 +587,9 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
         result &= setupVanillaProfiles(*contextProfile, *generationProfile);
     }
 
-    // Setup hybrid state profiles for MTP/DFlash/DSpark base models.
+    // Setup hybrid state profiles for MTP/DFlash/JetSpec/DSpark base models.
     if (isSpecDecodeBase(mModelConfig, "mtp") || isSpecDecodeBase(mModelConfig, "dflash")
-        || isSpecDecodeBase(mModelConfig, "dspark"))
+        || isSpecDecodeBase(mModelConfig, "jetspec") || isSpecDecodeBase(mModelConfig, "dspark"))
     {
         result &= setupIntermediateRecurrentStateProfiles(*contextProfile, *generationProfile);
         result &= setupIntermediateConvStateProfiles(*contextProfile, *generationProfile);
@@ -1500,7 +1503,8 @@ bool LLMBuilder::setupIntermediateConvStateProfiles(
         result &= setOptimizationProfile(&generationProfile, name.c_str(), minGenShape, optGenShape, maxGenShape);
     }
 
-    LOG_DEBUG("Set up intermediate conv state profiles for %d recurrent layers (MTP/DFlash)", mNumLinearAttnLayers);
+    LOG_DEBUG(
+        "Set up intermediate conv state profiles for %d recurrent layers (MTP/DFlash/JetSpec)", mNumLinearAttnLayers);
     return result;
 }
 
@@ -1514,7 +1518,7 @@ bool LLMBuilder::setupLinearAttentionSpecVerifyProfiles(nvinfer1::IOptimizationP
 
     if (!hasInputBinding(network, binding_names::kSpecVerifyPhaseMarker))
     {
-        LOG_ERROR("Hybrid MTP/DFlash base engine is missing input '%s'. Re-export the ONNX model.",
+        LOG_ERROR("Hybrid MTP/DFlash/JetSpec base engine is missing input '%s'. Re-export the ONNX model.",
             binding_names::kSpecVerifyPhaseMarker);
         return false;
     }
@@ -1733,7 +1737,8 @@ bool LLMBuilder::copyTokenizerFiles()
 
 bool LLMBuilder::copyEagleFiles()
 {
-    // Copy d2t.safetensors for Eagle3 draft models only. MTP/DFlash drafts share vocab with base and have no d2t.
+    // Copy d2t.safetensors for Eagle3 draft models only. MTP/DFlash/JetSpec drafts share vocab with base and have no
+    // d2t.
     if (isSpecDecodeDraft(mModelConfig, "eagle3"))
     {
         std::string const d2tPath = (mOnnxDir / "d2t.safetensors").string();

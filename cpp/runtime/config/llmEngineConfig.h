@@ -43,9 +43,13 @@ enum class SpecDecodeMode : int32_t
     kEAGLE,
     kMTP,
     kDFlash,
+    kJetSpec,
     kGemma4MTP,
     kDSpark,
 };
+
+char const* specDecodeModeName(SpecDecodeMode mode) noexcept;
+bool isCachedBlockDraftMode(SpecDecodeMode mode) noexcept;
 
 //! Gemma4 MTP assistant-layer to target-layer shared-KV mapping.
 struct Gemma4MTPKVSharingEntry
@@ -165,12 +169,15 @@ struct LLMEngineConfig
     //! `DeploymentConfig::specDecode->baseOutputHiddenDim`.
     int32_t baseModelHiddenSize{0};
 
-    //! Cached draft proposal block size for DFlash/DSpark. Parsed from the
-    //! mode-specific config object (`dflash_config` or `dspark_config`).
+    //! Cached draft proposal block size for DFlash/JetSpec/DSpark. Parsed from the
+    //! mode-specific config object (`dflash_config`, `jetspec_config`, or `dspark_config`).
     int32_t specDraftBlockSize{0};
 
-    //! Mask token ID used to seed cached draft input blocks for DFlash/DSpark.
+    //! Mask token ID used to seed cached draft input blocks for DFlash/JetSpec/DSpark.
     int32_t specDraftMaskTokenId{0};
+
+    //! Whether cached draft proposal self-attention is causal. JetSpec uses causal rows.
+    bool specDraftCausalHead{false};
 
     //! Target decoder-layer IDs whose hidden states are concatenated for cached drafts.
     //! EAGLE base engines own this contract through `eagle_hidden_state_layers`;
@@ -299,6 +306,9 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath);
 
 //! Format the config as a human-readable string (for logging).
 std::string formatEngineConfig(LLMEngineConfig const& config);
+
+bool isCachedBlockDraftBase(LLMEngineConfig const& config) noexcept;
+bool isCachedBlockDraftDraft(LLMEngineConfig const& config) noexcept;
 
 //! Cross-check an engine's KV / recurrent / conv binding dtypes against their
 //! parsed-config counterparts. The parsed config is the source of truth; this

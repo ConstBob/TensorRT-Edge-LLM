@@ -22,6 +22,8 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
+
 using namespace trt_edgellm::rt;
 
 namespace
@@ -151,10 +153,20 @@ TEST(ContextCacheDeploymentTests, RejectsUnsafeKvDonorGraphsAndLayouts)
 
 TEST(ContextCacheDeploymentTests, RejectsUnmanagedSpecModesAndHybridEagle)
 {
-    DeploymentConfig mtp = makeEagleDeployment();
-    mtp.base.specDecodeType = SpecDecodeMode::kMTP;
-    mtp.draft->specDecodeType = SpecDecodeMode::kMTP;
-    EXPECT_THROW(validateContextCacheDeployment(mtp), std::runtime_error);
+    std::array<SpecDecodeMode, 5> const unsupportedModes{
+        SpecDecodeMode::kMTP,
+        SpecDecodeMode::kDFlash,
+        SpecDecodeMode::kJetSpec,
+        SpecDecodeMode::kGemma4MTP,
+        SpecDecodeMode::kDSpark,
+    };
+    for (SpecDecodeMode const mode : unsupportedModes)
+    {
+        DeploymentConfig deployment = makeEagleDeployment();
+        deployment.base.specDecodeType = mode;
+        deployment.draft->specDecodeType = mode;
+        EXPECT_THROW(validateContextCacheDeployment(deployment), std::runtime_error);
+    }
 
     DeploymentConfig hybridEagle = makeEagleDeployment();
     hybridEagle.base = makeHybridConfig();

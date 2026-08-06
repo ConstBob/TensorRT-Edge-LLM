@@ -370,7 +370,7 @@ private:
 
     //! Set up optimization profiles for MTP intermediate recurrent state output tensors.
     //! These are per-step checkpoints of GDN recurrent states during tree verification.
-    //! Only needed for hybrid MTP/DFlash/DSpark base verification engines.
+    //! Only needed for hybrid MTP/DFlash/JetSpec/DSpark base verification engines.
     //! @param contextProfile Optimization profile for context processing
     //! @param generationProfile Optimization profile for generation processing
     //! @return true if setup was successful, false otherwise
@@ -379,7 +379,7 @@ private:
 
     //! Set up optimization profiles for MTP intermediate conv state output tensors.
     //! These are per-step checkpoints of conv1d states during tree verification.
-    //! Only needed for hybrid MTP/DFlash/DSpark base verification engines.
+    //! Only needed for hybrid MTP/DFlash/JetSpec/DSpark base verification engines.
     //! @param contextProfile Optimization profile for context processing
     //! @param generationProfile Optimization profile for generation processing
     //! @return true if setup was successful, false otherwise

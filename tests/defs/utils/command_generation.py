@@ -46,7 +46,7 @@ def resolve_lora_model_name(model_name: str) -> Optional[str]:
 
 def _uses_spec_decode(config: TestConfig) -> bool:
     return bool(config.is_eagle or config.is_mtp or config.is_dflash
-                or config.is_dspark)
+                or config.is_jetspec or config.is_dspark)
 
 
 def _append_context_reuse_options(cmd: List[str], config: TestConfig) -> None:
@@ -205,6 +205,8 @@ def _draft_quant_shell(config: TestConfig) -> str:
     base_model_dir = config.get_base_torch_model_dir()
     if config.is_dflash:
         draft_model_dir = config.get_dflash_draft_model_dir()
+    elif config.is_jetspec:
+        draft_model_dir = config.get_jetspec_draft_model_dir()
     else:
         draft_model_dir = config.get_draft_torch_model_dir()
     quantized_draft_dir = config.get_quantized_draft_model_dir()
@@ -234,7 +236,7 @@ def _draft_quant_shell(config: TestConfig) -> str:
 
 def _generate_draft_quantization_commands(
         config: TestConfig) -> List[Tuple[List[str], int]]:
-    """Generate draft model quantization commands for EAGLE / DFlash.
+    """Generate draft model quantization commands for EAGLE / DFlash / JetSpec.
 
     Uses ``tensorrt-edgellm-quantize``. Output is a unified ModelOpt
     ``export_hf_checkpoint`` tree consumable by ``tensorrt_edgellm.scripts.export``.
@@ -242,7 +244,7 @@ def _generate_draft_quantization_commands(
     commands = []
     if config.is_mtp:
         return commands
-    if not (config.is_eagle or config.is_dflash):
+    if not (config.is_eagle or config.is_dflash or config.is_jetspec):
         return commands
 
     if config.draft_llm_precision is None:

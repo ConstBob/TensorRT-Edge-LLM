@@ -79,6 +79,45 @@ TEST(DFlashRuntimeKernels, CheckRopeCapacityRejectsSeqLenExceedingCap)
     EXPECT_THROW(kernel::checkDFlashRopeCapacity(/*cosSinSeqLen=*/5000, /*kvCapacity=*/4096), std::runtime_error);
 }
 
+TEST(DFlashRuntimeKernels, PrepareProposalInputsSupportsCausalMask)
+{
+    cudaStream_t stream = nullptr;
+    constexpr int32_t batchSize = 2;
+    constexpr int32_t blockSize = 5;
+    constexpr int32_t packedMaskLen = 1;
+
+    auto oldDraftCacheLengths = rt::Tensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto deltaLengths = rt::Tensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto packedAttentionMask
+        = rt::Tensor({batchSize, blockSize, packedMaskLen}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto attentionPosId = rt::Tensor({batchSize, blockSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto contextLengths = rt::Tensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+
+    copyHostToDevice<int32_t>(oldDraftCacheLengths, {10, 20});
+    copyHostToDevice<int32_t>(deltaLengths, {2, 3});
+
+    kernel::launchDFlashPrepareProposalInputs(oldDraftCacheLengths.dataPointer<int32_t>(),
+        deltaLengths.dataPointer<int32_t>(), blockSize, packedAttentionMask.dataPointer<int32_t>(),
+        attentionPosId.dataPointer<int32_t>(), contextLengths.dataPointer<int32_t>(), false, batchSize, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    EXPECT_EQ(
+        copyDeviceToHost<int32_t>(packedAttentionMask), (std::vector<int32_t>{31, 31, 31, 31, 31, 31, 31, 31, 31, 31}));
+    EXPECT_EQ(
+        copyDeviceToHost<int32_t>(attentionPosId), (std::vector<int32_t>{12, 13, 14, 15, 16, 23, 24, 25, 26, 27}));
+    EXPECT_EQ(copyDeviceToHost<int32_t>(contextLengths), (std::vector<int32_t>{17, 28}));
+
+    kernel::launchDFlashPrepareProposalInputs(oldDraftCacheLengths.dataPointer<int32_t>(),
+        deltaLengths.dataPointer<int32_t>(), blockSize, packedAttentionMask.dataPointer<int32_t>(),
+        attentionPosId.dataPointer<int32_t>(), contextLengths.dataPointer<int32_t>(), true, batchSize, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    EXPECT_EQ(copyDeviceToHost<int32_t>(packedAttentionMask), (std::vector<int32_t>{1, 3, 7, 15, 31, 1, 3, 7, 15, 31}));
+    EXPECT_EQ(
+        copyDeviceToHost<int32_t>(attentionPosId), (std::vector<int32_t>{12, 13, 14, 15, 16, 23, 24, 25, 26, 27}));
+    EXPECT_EQ(copyDeviceToHost<int32_t>(contextLengths), (std::vector<int32_t>{17, 28}));
+}
+
 TEST(DFlashRuntimeKernels, BuildLinearVerifyInputsUsesDraftStrideForBatchRows)
 {
     cudaStream_t stream = nullptr;

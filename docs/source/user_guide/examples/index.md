@@ -22,7 +22,7 @@ End-to-end workflows demonstrating TensorRT Edge-LLM capabilities across differe
 ## Available Examples
 
 - **[VLM (Vision-Language Model)](vlm.md)** - Complete workflow for vision-language models with image understanding capabilities
-- **[Speculative Decoding](speculative-decoding.md)** - EAGLE3, MTP, and DFlash speculative decoding for faster inference
+- **[Speculative Decoding](speculative-decoding.md)** - EAGLE3, MTP, DFlash, and JetSpec speculative decoding for faster inference
 - **[Phi-4 Multimodal](phi4.md)** - Phi-4-Multimodal deployment with LoRA merge
 - **[ASR (Automatic Speech Recognition)](asr.md)** - Speech-to-text with Qwen3-ASR models, including optional FP8 / NVFP4 quantization recipes
 - **[MoE (Mixture of Experts)](moe.md)** - Mixture of Experts model deployment

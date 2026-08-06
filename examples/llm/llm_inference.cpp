@@ -27,6 +27,7 @@
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
 #include "requestFileParser.h"
+#include "runtime/config/llmEngineConfig.h"
 #include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/qwen3OmniTTSRuntime.h"
@@ -41,6 +42,7 @@
 #include <iomanip>
 #include <iostream>
 #include <nlohmann/json.hpp>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -99,13 +101,16 @@ struct SpecDecodeArgs
     // For tree-based strategies this is the branching factor; for chain-style
     // strategies it is the number of candidates retained per draft step.
     int32_t draftTopK{10};
+    bool draftTopKSet{false};
 
     // Number of drafting steps to perform with the draft model.
     // Each step extends the current draft proposal.
     int32_t draftStep{6};
+    bool draftStepSet{false};
 
     // Number of tokens in the base verification input.
     int32_t verifySize{60};
+    bool verifySizeSet{false};
 
     // DFlash-only draft horizon. 0 means infer from the engine config.
     int32_t dflashBlockSize{0};
@@ -160,6 +165,143 @@ struct LLMInferenceArgs
     int32_t talkerPrefillThreshold{4}; //!< Start Talker prefill after this many Thinker assistant tokens
 };
 
+namespace
+{
+
+std::filesystem::path getBaseConfigPath(std::string const& engineDir)
+{
+    std::filesystem::path const dir{engineDir};
+    std::filesystem::path const configPath = dir / "config.json";
+    if (std::filesystem::is_regular_file(configPath))
+    {
+        return configPath;
+    }
+    return dir / "base_config.json";
+}
+
+std::filesystem::path getDraftConfigPath(std::string const& engineDir)
+{
+    return std::filesystem::path{engineDir} / "draft_config.json";
+}
+
+int32_t maxVerifySizeOrDefault(rt::LLMEngineConfig const& config, int32_t fallback)
+{
+    return config.maxVerifyTreeSize > 0 ? config.maxVerifyTreeSize : fallback;
+}
+
+int32_t dsparkVerifySizeOrDefault(std::string const& engineDir)
+{
+    std::filesystem::path const draftConfigPath = getDraftConfigPath(engineDir);
+    if (!std::filesystem::is_regular_file(draftConfigPath))
+    {
+        return 8;
+    }
+
+    rt::LLMEngineConfig const draftConfig = rt::parseDraftEngineConfig(draftConfigPath);
+    return draftConfig.specDraftBlockSize > 0 ? draftConfig.specDraftBlockSize + 1 : 8;
+}
+
+int32_t cachedBlockDraftBlockSizeOrThrow(
+    std::string const& engineDir, rt::LLMEngineConfig const& baseConfig, int32_t explicitBlockSize)
+{
+    if (explicitBlockSize > 0)
+    {
+        return explicitBlockSize;
+    }
+
+    std::filesystem::path const draftConfigPath = getDraftConfigPath(engineDir);
+    if (std::filesystem::is_regular_file(draftConfigPath))
+    {
+        rt::LLMEngineConfig const draftConfig = rt::parseDraftEngineConfig(draftConfigPath);
+        if (draftConfig.specDraftBlockSize > 0)
+        {
+            return draftConfig.specDraftBlockSize;
+        }
+    }
+    if (baseConfig.specDraftBlockSize > 0)
+    {
+        return baseConfig.specDraftBlockSize;
+    }
+
+    throw std::runtime_error(
+        "unable to resolve DFlash/JetSpec block size from CLI, draft_config.json, or base config.");
+}
+
+bool applyEngineSpecDecodeDefaults(LLMInferenceArgs& args)
+{
+    if (!args.specDecodeArgs.enabled)
+    {
+        return true;
+    }
+
+    try
+    {
+        rt::LLMEngineConfig const baseConfig = rt::parseEngineConfig(getBaseConfigPath(args.engineDir));
+        SpecDecodeArgs& specArgs = args.specDecodeArgs;
+        switch (baseConfig.specDecodeType)
+        {
+        case rt::SpecDecodeMode::kDFlash:
+        case rt::SpecDecodeMode::kJetSpec:
+        {
+            if (!specArgs.draftTopKSet)
+            {
+                specArgs.draftTopK = 1;
+            }
+            if (!specArgs.draftStepSet)
+            {
+                specArgs.draftStep = 1;
+            }
+            int32_t const blockSize
+                = cachedBlockDraftBlockSizeOrThrow(args.engineDir, baseConfig, specArgs.dflashBlockSize);
+            if (specArgs.dflashBlockSize == 0)
+            {
+                specArgs.dflashBlockSize = blockSize;
+            }
+            if (!specArgs.verifySizeSet)
+            {
+                specArgs.verifySize = specArgs.draftTopK > 1 ? maxVerifySizeOrDefault(baseConfig, 128) : blockSize;
+            }
+            break;
+        }
+        case rt::SpecDecodeMode::kDSpark:
+            if (!specArgs.draftTopKSet)
+            {
+                specArgs.draftTopK = 1;
+            }
+            if (!specArgs.draftStepSet)
+            {
+                specArgs.draftStep = 1;
+            }
+            if (!specArgs.verifySizeSet)
+            {
+                specArgs.verifySize = dsparkVerifySizeOrDefault(args.engineDir);
+            }
+            break;
+        default: break;
+        }
+
+        bool const isCachedBlockDraft = baseConfig.specDecodeType == rt::SpecDecodeMode::kDFlash
+            || baseConfig.specDecodeType == rt::SpecDecodeMode::kJetSpec;
+        LOG_INFO("Spec decode engine mode: %s", rt::specDecodeModeName(baseConfig.specDecodeType));
+        LOG_INFO("Resolved spec draft topK: %d", specArgs.draftTopK);
+        LOG_INFO("Resolved spec draft step: %d", specArgs.draftStep);
+        LOG_INFO("Resolved spec verify size: %d", specArgs.verifySize);
+        if (isCachedBlockDraft)
+        {
+            LOG_INFO("Resolved DFlash/JetSpec block size: %d", specArgs.dflashBlockSize);
+        }
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("Failed to resolve speculative decoding defaults from engine config: %s", e.what());
+        return false;
+    }
+
+    return true;
+}
+
+} // namespace
+
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
@@ -168,7 +310,7 @@ void printUsage(char const* programName)
                  "[--dumpProfile] [--profileOutputFile=<path to profile output file>] [--warmup=<number>] [--debug] "
                  "[--dumpOutput] [--batchSize=<number>] [--maxGenerateLength=<number>] [--specDecode] "
                  "[--specDraftTopK=<number>] [--specDraftStep=<number>] "
-                 "[--specVerifySize=<number>] [--dflashBlockSize=<number>] "
+                 "[--specVerifySize=<number>] [--dflashBlockSize=<number>|--jetspecBlockSize=<number>] "
                  "[--dsparkScheduler=off|threshold|sps] "
                  "[--dsparkConfidenceThreshold=<float>] "
                  "[--dsparkMinProposalLen=<number>] [--dsparkMaxProposalLen=<number>]"
@@ -194,23 +336,29 @@ void printUsage(char const* programName)
     std::cerr
         << "  --numLogprobs             Number of top log-probabilities to return per token (0 = disabled, max 50)"
         << std::endl;
-    std::cerr << "  --specDecode              Enable speculative decoding (EAGLE, MTP, or DFlash)" << std::endl;
-    std::cerr << "  --specDraftTopK           Number of tokens selected per drafting step (default: 10)" << std::endl;
-    std::cerr << "                            For DFlash: candidateTopK; 1 is linear, >1 enables branching DDTree"
+    std::cerr << "  --specDecode              Enable speculative decoding (EAGLE, MTP, DFlash, JetSpec, or DSpark)"
               << std::endl;
-    std::cerr << "  --specDraftStep           Number of drafting steps to perform (default: 6)" << std::endl;
+    std::cerr << "  --specDraftTopK           Number of tokens selected per drafting step (default: 10)" << std::endl;
+    std::cerr << "                            DFlash/JetSpec/DSpark default to 1 when omitted" << std::endl;
     std::cerr
-        << "                            Each step extends the current draft proposal; DFlash requires this to be 1"
+        << "                            For DFlash/JetSpec: candidateTopK; 1 is linear, >1 enables branching DDTree"
         << std::endl;
+    std::cerr << "  --specDraftStep           Number of drafting steps to perform (default: 6)" << std::endl;
+    std::cerr << "                            Each step extends the current draft proposal; DFlash/JetSpec/DSpark "
+                 "require this to be 1"
+              << std::endl;
     std::cerr << "  --specVerifySize          Number of tokens in the base verification input (default: 60)"
               << std::endl;
+    std::cerr
+        << "                            DFlash/JetSpec linear default to block size; DDTree defaults to base budget"
+        << std::endl;
     std::cerr << "  --dsparkScheduler         DSpark scheduler mode: off, threshold, or sps (default: off)"
               << std::endl;
     std::cerr << "  --dsparkConfidenceThreshold  DSpark threshold scheduler survival threshold in [0,1]" << std::endl;
     std::cerr << "  --dsparkMinProposalLen    DSpark scheduler minimum proposal length (default: 1)" << std::endl;
     std::cerr << "  --dsparkMaxProposalLen    DSpark scheduler maximum proposal length (default: full block)"
               << std::endl;
-    std::cerr << "  --dflashBlockSize         DFlash proposal block size; 0 means infer from engine config"
+    std::cerr << "  --dflashBlockSize         DFlash/JetSpec proposal block size; 0 means infer from engine config"
               << std::endl;
     std::cerr << "\nContext Reuse Options:" << std::endl;
     std::cerr << "  --enableContextReuse      Enable process-local content-addressed context reuse" << std::endl;
@@ -275,6 +423,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"specVerifyTreeSize", required_argument, 0, LLMInferenceOptionId::SPEC_VERIFY_SIZE},
         {"eagleVerifyTreeSize", required_argument, 0, LLMInferenceOptionId::SPEC_VERIFY_SIZE}, // deprecated alias
         {"dflashBlockSize", required_argument, 0, LLMInferenceOptionId::DFLASH_BLOCK_SIZE},
+        {"jetspecBlockSize", required_argument, 0, LLMInferenceOptionId::DFLASH_BLOCK_SIZE},
         {"batchSize", required_argument, 0, LLMInferenceOptionId::BATCH_SIZE},
         {"maxGenerateLength", required_argument, 0, LLMInferenceOptionId::MAX_GENERATE_LENGTH},
         {"numLogprobs", required_argument, 0, LLMInferenceOptionId::NUM_LOGPROBS},
@@ -332,6 +481,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
             try
             {
                 args.specDecodeArgs.draftTopK = std::stoi(optarg);
+                args.specDecodeArgs.draftTopKSet = true;
                 if (args.specDecodeArgs.draftTopK <= 0)
                 {
                     LOG_ERROR("Invalid specDraftTopK value: %s (must be positive)", optarg);
@@ -348,6 +498,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
             try
             {
                 args.specDecodeArgs.draftStep = std::stoi(optarg);
+                args.specDecodeArgs.draftStepSet = true;
                 if (args.specDecodeArgs.draftStep <= 0)
                 {
                     LOG_ERROR("Invalid specDraftStep value: %s (must be positive)", optarg);
@@ -364,9 +515,10 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
             try
             {
                 args.specDecodeArgs.verifySize = std::stoi(optarg);
-                if (args.specDecodeArgs.verifySize <= 0)
+                args.specDecodeArgs.verifySizeSet = true;
+                if (args.specDecodeArgs.verifySize < 0)
                 {
-                    LOG_ERROR("Invalid specVerifySize value: %s (must be positive)", optarg);
+                    LOG_ERROR("Invalid specVerifySize value: %s (must be non-negative)", optarg);
                     return false;
                 }
             }
@@ -382,13 +534,13 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
                 args.specDecodeArgs.dflashBlockSize = std::stoi(optarg);
                 if (args.specDecodeArgs.dflashBlockSize < 0)
                 {
-                    LOG_ERROR("Invalid dflashBlockSize value: %s (must be non-negative)", optarg);
+                    LOG_ERROR("Invalid dflashBlockSize/jetspecBlockSize value: %s (must be non-negative)", optarg);
                     return false;
                 }
             }
             catch (std::exception const& e)
             {
-                LOG_ERROR("Invalid dflashBlockSize value: %s", optarg);
+                LOG_ERROR("Invalid dflashBlockSize/jetspecBlockSize value: %s", optarg);
                 return false;
             }
             break;
@@ -588,10 +740,6 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
     if (args.specDecodeArgs.enabled)
     {
         LOG_INFO("Speculative decoding enabled");
-        LOG_INFO("Spec draft topK: %d", args.specDecodeArgs.draftTopK);
-        LOG_INFO("Spec draft step: %d", args.specDecodeArgs.draftStep);
-        LOG_INFO("Spec verify size: %d", args.specDecodeArgs.verifySize);
-        LOG_INFO("DFlash block size: %d", args.specDecodeArgs.dflashBlockSize);
         LOG_INFO("DSpark scheduler mode: %d", static_cast<int32_t>(args.specDecodeArgs.dsparkSchedulerMode));
         LOG_INFO("DSpark confidence threshold: %.4f", args.specDecodeArgs.dsparkConfidenceThreshold);
         LOG_INFO("DSpark proposal length range: [%d, %d]", args.specDecodeArgs.dsparkMinProposalLen,
@@ -715,6 +863,10 @@ int main(int argc, char* argv[])
     {
         printUsage(argv[0]);
         return EXIT_SUCCESS;
+    }
+    if (!applyEngineSpecDecodeDefaults(args))
+    {
+        return EXIT_FAILURE;
     }
     bool profilerEnabled = args.dumpProfile;
     MemoryMonitor memoryMonitor;
