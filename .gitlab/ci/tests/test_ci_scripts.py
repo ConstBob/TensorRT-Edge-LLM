@@ -74,7 +74,31 @@ def install_side_effect_script(script_path):
     script_path.chmod(0o755)
 
 
-def read_apt_calls(call_log):
+def install_fake_pre_commit(tmp_path, body):
+    fake_bin = tmp_path / "pre-commit-bin"
+    fake_bin.mkdir()
+    command = fake_bin / "pre-commit"
+    command.write_text("#!/usr/bin/env bash\n" + body, encoding="utf-8")
+    command.chmod(0o755)
+    sleep_command = fake_bin / "sleep"
+    sleep_command.write_text(
+        '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$SLEEP_CALL_LOG"\n',
+        encoding="utf-8",
+    )
+    sleep_command.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    env["PRE_COMMIT_CALL_LOG"] = str(tmp_path / "pre-commit.log")
+    env["SLEEP_CALL_LOG"] = str(tmp_path / "sleep.log")
+    env["CI_PRE_COMMIT_BOOTSTRAP_ATTEMPTS"] = "2"
+    env["CI_PRE_COMMIT_BOOTSTRAP_TIMEOUT_SECONDS"] = "5"
+    env["CI_PRE_COMMIT_CHECK_TIMEOUT_SECONDS"] = "5"
+    env["CI_PRE_COMMIT_RETRY_DELAY_SECONDS"] = "0"
+    return env, pathlib.Path(env["PRE_COMMIT_CALL_LOG"])
+
+
+def read_command_calls(call_log):
     return [
         line.split()
         for line in call_log.read_text(encoding="utf-8").splitlines()
@@ -159,6 +183,65 @@ def test_ci_run_fails_before_execution_without_timeout(tmp_path):
     assert "missing timeout command" in result.stdout + result.stderr
 
 
+def test_ci_pre_commit_retries_bootstrap_then_checks_once(tmp_path):
+    marker = tmp_path / "first-bootstrap-failed"
+    body = """printf "%s\\n" "$*" >> "$PRE_COMMIT_CALL_LOG"
+if [ "$1" = "install-hooks" ] && [ ! -e "$PRE_COMMIT_FAILURE_MARKER" ]; then
+    touch "$PRE_COMMIT_FAILURE_MARKER"
+    exit 42
+fi
+"""
+    env, call_log = install_fake_pre_commit(tmp_path, body)
+    env["PRE_COMMIT_FAILURE_MARKER"] = str(marker)
+
+    result = run_script("ci_pre_commit.sh", env=env)
+
+    assert result.returncode == 0
+    calls = read_command_calls(call_log)
+    bootstrap_calls = [call for call in calls if call[0] == "install-hooks"]
+    check_calls = [call for call in calls if call[0] == "run"]
+    assert len(bootstrap_calls) == 2
+    assert len(check_calls) == 1
+    assert "--all-files" in check_calls[0]
+    assert calls.index(bootstrap_calls[-1]) < calls.index(check_calls[0])
+
+
+def test_ci_pre_commit_backs_off_then_stops_after_bootstrap_failure(tmp_path):
+    body = """printf "%s\\n" "$*" >> "$PRE_COMMIT_CALL_LOG"
+if [ "$1" = "install-hooks" ]; then
+    exit 42
+fi
+"""
+    env, call_log = install_fake_pre_commit(tmp_path, body)
+    env["CI_PRE_COMMIT_BOOTSTRAP_ATTEMPTS"] = "3"
+    env["CI_PRE_COMMIT_RETRY_DELAY_SECONDS"] = "15"
+
+    result = run_script("ci_pre_commit.sh", env=env)
+
+    assert result.returncode == 42
+    calls = read_command_calls(call_log)
+    assert len(calls) == 3
+    assert all(call[0] == "install-hooks" for call in calls)
+    sleep_calls = read_command_calls(pathlib.Path(env["SLEEP_CALL_LOG"]))
+    assert sleep_calls == [["15"], ["30"]]
+
+
+def test_ci_pre_commit_does_not_retry_failed_checks(tmp_path):
+    body = """printf "%s\\n" "$*" >> "$PRE_COMMIT_CALL_LOG"
+if [ "$1" = "run" ]; then
+    exit 17
+fi
+"""
+    env, call_log = install_fake_pre_commit(tmp_path, body)
+
+    result = run_script("ci_pre_commit.sh", env=env)
+
+    assert result.returncode == 17
+    calls = read_command_calls(call_log)
+    assert [call[0] for call in calls] == ["install-hooks", "run"]
+    assert "--all-files" in calls[-1]
+
+
 def test_ci_apt_updates_then_installs_requested_packages(tmp_path):
     env, call_log = install_fake_apt(
         tmp_path, 'printf "%s\\n" "$*" >> "$APT_CALL_LOG"\n')
@@ -166,7 +249,7 @@ def test_ci_apt_updates_then_installs_requested_packages(tmp_path):
     result = run_script("ci_apt.sh", "install", "python3", "git", env=env)
 
     assert result.returncode == 0
-    calls = read_apt_calls(call_log)
+    calls = read_command_calls(call_log)
     update_calls = [call for call in calls if "update" in call]
     install_calls = [call for call in calls if "install" in call]
     assert update_calls
@@ -201,7 +284,7 @@ fi
     result = run_script("ci_apt.sh", "install", "git", env=env)
 
     assert result.returncode == 0
-    calls = read_apt_calls(call_log)
+    calls = read_command_calls(call_log)
     update_calls = [call for call in calls if "update" in call]
     install_calls = [call for call in calls if "install" in call]
     assert len(update_calls) >= 2
@@ -221,7 +304,7 @@ fi
     result = run_script("ci_apt.sh", "install", "git", env=env)
 
     assert result.returncode == 42
-    calls = read_apt_calls(call_log)
+    calls = read_command_calls(call_log)
     assert any("update" in call for call in calls)
     assert not any("install" in call for call in calls)
     assert result.stderr
@@ -245,7 +328,7 @@ fi
                         harness_timeout=5)
 
     assert result.returncode != 0
-    calls = read_apt_calls(call_log)
+    calls = read_command_calls(call_log)
     assert any("update" in call for call in calls)
     assert not any("install" in call for call in calls)
     assert result.stderr
