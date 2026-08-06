@@ -476,10 +476,8 @@ function(cute_dsl_setup)
     endforeach()
   endif()
 
-  # Check for Blackwell GDN variant specifically and set a clean define. The
-  # per-variant GDN defines guard code that also needs CUTE_DSL_GDN_ENABLED for
-  # the runner declaration, so an artifact carrying the variant is not enough:
-  # 'gdn' has to be an active group too.
+  # Variant-specific GDN paths require the runner enabled by the gdn group;
+  # artifact availability alone must not activate them.
   list(FIND _variants "gdn_prefill_blackwell" _bw_idx)
   if(NOT ${_bw_idx} EQUAL -1 AND "gdn" IN_LIST _active_groups)
     foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})

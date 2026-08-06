@@ -3,7 +3,7 @@
 # ==============================================================================
 
 .sonar_job:
-  allow_failure: true
+  allow_failure: false
   rules:
     # Explicit L1 runs include Sonar even when the commit has [skip tests].
     - if: $L1 == "true"
@@ -76,7 +76,6 @@ build-sonar:
     CUTE_DSL_ARTIFACT_TAG: "sm_120"
     CI_APT_INSTALL_TIMEOUT_SECONDS: "300"
     CI_PIP_INSTALL_TIMEOUT_SECONDS: "300"
-    CUTE_DSL_ARTIFACT_TAG: "sm_120"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
   tags:
