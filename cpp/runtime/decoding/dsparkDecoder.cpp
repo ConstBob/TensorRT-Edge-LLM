@@ -963,12 +963,16 @@ void DSparkDecoder::commitAcceptedTreePath(
 
     check::check(mRuntime.base.pipelineIO.baseHiddenStates.reshape({activeBatchSize, verifySize, mBaseOutputHiddenDim}),
         "Tensor reshape failed");
+    auto const& basePageTable = *mRuntime.base.sharedResources.kvPageTables[0];
+    int32_t const* basePageTablePtr = basePageTable.kernelView().dataPointer<int32_t>();
+    int32_t const baseNumPages = kvMgrBase.numPages();
+    int32_t const baseMaxPagesPerSeq = basePageTable.maxPagesPerSeq();
     // Branching-tree accept can skip nodes, so commit compacts accepted KV rows using accepted verify indices.
     for (auto const& group : kvHeadDimGroups)
     {
         kernel::eagleBaseCommitKVCache(mAcceptedTokenIndices, mAcceptLength, kvCacheLengths, group.deviceLayerInfos,
             group.numLayers, group.headDim, group.maxKVHeads, activeBatchSize, maxAcceptLength, kvCacheType,
-            context.stream);
+            context.stream, basePageTablePtr, baseNumPages, baseMaxPagesPerSeq);
     }
     kernel::eagleBaseAssembleHiddenState(
         mAcceptedTokenIndices, mAcceptLength, mRuntime.base.pipelineIO.baseHiddenStates, context.stream);
