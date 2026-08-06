@@ -27,6 +27,8 @@ namespace trt_edgellm
 namespace kernel
 {
 
+constexpr int32_t kEagleMaxAcceptedPathLength{32};
+
 // Disable clang-format to explicitly format the documentation.
 // clang-format off
 

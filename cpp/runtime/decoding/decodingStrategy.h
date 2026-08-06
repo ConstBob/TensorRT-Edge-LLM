@@ -65,6 +65,11 @@ enum class BatchCompactionMode : uint8_t
     kManagedPageRows,
 };
 
+struct DecodingStrategyCapabilities
+{
+    bool ownsBaseVerificationCudaGraphs{false};
+};
+
 struct SamplingBuffers
 {
     Tensor& workspace;
@@ -87,7 +92,7 @@ struct LogprobsBuffers
     Tensor& hostLogprobsIndices;   //!< CPU pinned [logprobsMaxBatch, kMaxLogprobsK]
     //! GPU [maxBatch * maxAcceptDepth, vocab] accepted verify rows gathered before extraction.
     //! Used by the spec-decode verify paths whose accepted rows are non-contiguous in the
-    //! output logits (EAGLE / MTP / DFlash); Gemma4 MTP's sequential chain reads logits directly.
+    //! output logits (EAGLE / MTP / DFlash / JetSpec); Gemma4 MTP's sequential chain reads logits directly.
     Tensor& gatheredLogits;
 };
 
@@ -137,6 +142,10 @@ public:
     virtual DecodingStrategyKind kind() const noexcept = 0;
     virtual char const* name() const noexcept = 0;
     virtual bool isSpeculative() const noexcept = 0;
+    virtual DecodingStrategyCapabilities capabilities() const noexcept
+    {
+        return {};
+    }
 
     virtual bool decodeStep(DecodingInferenceContext& context) = 0;
     virtual bool captureCudaGraphs(cudaStream_t stream) = 0;

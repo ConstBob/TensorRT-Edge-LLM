@@ -19,6 +19,7 @@
 
 #include "common/logger.h"
 #include "runtime/decoding/blockDiffusionDecoder.h"
+#include "runtime/decoding/dflashDecodeUtils.h"
 #include "runtime/decoding/dflashDecoder.h"
 #include "runtime/decoding/dsparkDecoder.h"
 #include "runtime/decoding/eagleDecoder.h"
@@ -29,6 +30,7 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <utility>
 
 namespace trt_edgellm
 {
@@ -70,9 +72,13 @@ DecoderRegistry::DecoderRegistry(DecodingRuntimeContext& runtime, DecoderRegistr
                 runtime, init.engineDir, *init.draftingConfig, std::move(init.draftExecutor), init.stream);
             break;
         case SpecDecodeMode::kDFlash:
+        case SpecDecodeMode::kJetSpec:
+        {
+            auto blockDraftConfig = dflash_utils::makeCachedBlockDraftRuntimeConfig(runtime.deployment);
             mSpeculativeDecoder = std::make_unique<DFlashDecoder>(
-                runtime, init.engineDir, *init.draftingConfig, std::move(init.draftExecutor), init.stream);
+                runtime, init.engineDir, std::move(blockDraftConfig), std::move(init.draftExecutor), init.stream);
             break;
+        }
         case SpecDecodeMode::kGemma4MTP:
             mSpeculativeDecoder = std::make_unique<Gemma4MTPDecoder>(
                 runtime, init.engineDir, *init.draftingConfig, std::move(init.draftExecutor), init.stream);
@@ -105,10 +111,11 @@ DecodingStrategy& DecoderRegistry::cachePrimingStrategy() const noexcept
 
 bool DecoderRegistry::captureCudaGraphs(cudaStream_t stream) const
 {
-    bool const skipDefaultCapture = mSpeculativeDecoder && mSpeculativeDecoder->kind() == DecodingStrategyKind::kDFlash;
+    bool const skipDefaultCapture
+        = mSpeculativeDecoder && mSpeculativeDecoder->capabilities().ownsBaseVerificationCudaGraphs;
     if (skipDefaultCapture)
     {
-        LOG_INFO("Skipping vanilla CUDA graph capture for DFlash speculative runtime.");
+        LOG_INFO("Skipping vanilla CUDA graph capture for %s speculative runtime.", mSpeculativeDecoder->name());
     }
     bool const defaultCaptureStatus
         = (!skipDefaultCapture && mDefaultDecoder) ? mDefaultDecoder->captureCudaGraphs(stream) : true;

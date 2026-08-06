@@ -314,6 +314,8 @@ def _determine_spec_decode_type(config) -> str:
         return "eagle3"
     if config.is_dflash_draft or config.dflash_base:
         return "dflash"
+    if config.is_jetspec_draft or config.jetspec_base:
+        return "jetspec"
     if config.is_dspark_draft or config.dspark_base:
         return "dspark"
     if config.is_mtp_draft or config.mtp_base:
@@ -324,11 +326,12 @@ def _determine_spec_decode_type(config) -> str:
 def _determine_engine_role(config) -> str:
     """Return the engine role within the speculative decoding deployment."""
     if (config.is_eagle3_draft or config.is_dflash_draft
-            or config.is_dspark_draft or config.is_mtp_draft
-            or config.gemma4_mtp_draft):
+            or config.is_jetspec_draft or config.is_dspark_draft
+            or config.is_mtp_draft or config.gemma4_mtp_draft):
         return "draft"
-    if (config.eagle_base or config.dflash_base or config.dspark_base
-            or config.mtp_base or config.gemma4_mtp_base):
+    if (config.eagle_base or config.dflash_base or config.jetspec_base
+            or config.dspark_base or config.mtp_base
+            or config.gemma4_mtp_base):
         return "base"
     return "llm"
 
@@ -387,9 +390,10 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
         "use_vision_bidirectional_attention":
         bool(config.use_vision_bidirectional_attention
              and not (config.eagle_base or config.dflash_base
-                      or config.dspark_base or config.mtp_base
-                      or config.gemma4_mtp_base or config.is_eagle3_draft
-                      or config.is_dflash_draft or config.is_dspark_draft
+                      or config.jetspec_base or config.dspark_base
+                      or config.mtp_base or config.gemma4_mtp_base
+                      or config.is_eagle3_draft or config.is_dflash_draft
+                      or config.is_jetspec_draft or config.is_dspark_draft
                       or config.is_mtp_draft or config.gemma4_mtp_draft)),
         "rms_norm_eps":
         float(config.rms_norm_eps),
@@ -703,6 +707,30 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
                 "target_layer_ids": list(config.dflash_target_layer_ids),
                 "block_size": config.dflash_block_size,
                 "mask_token_id": config.dflash_mask_token_id,
+            },
+        })
+
+    if config.is_jetspec_draft:
+        out.update({
+            "draft_vocab_size":
+            config.vocab_size,
+            "base_model_hidden_size":
+            len(config.jetspec_target_layer_ids) * config.hidden_size,
+            "jetspec_config": {
+                "target_layer_ids": list(config.jetspec_target_layer_ids),
+                "block_size": config.jetspec_block_size,
+                "mask_token_id": config.jetspec_mask_token_id,
+                "causal_head": bool(config.jetspec_causal_head),
+            },
+        })
+
+    if config.jetspec_base:
+        out.update({
+            "jetspec_config": {
+                "target_layer_ids": list(config.jetspec_target_layer_ids),
+                "block_size": config.jetspec_block_size,
+                "mask_token_id": config.jetspec_mask_token_id,
+                "causal_head": bool(config.jetspec_causal_head),
             },
         })
 

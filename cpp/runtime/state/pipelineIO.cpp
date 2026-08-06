@@ -486,11 +486,11 @@ PipelineIO PipelineIO::createForSpecDecode(
     io.outputLogits = rt::Tensor(
         {maxLogitsSize, maxVocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "PipelineIO::outputLogits");
 
-    // Allocate hidden states for SpecDecode. DFlash binds the draft target-hidden
-    // input directly to baseHiddenStates, so it does not need the generic
-    // EAGLE/MTP draft hidden-state ping-pong buffers.
+    // Allocate hidden states for SpecDecode. Cached block-draft modes bind the
+    // draft target-hidden input to compact base hidden states, so they do not
+    // need the generic EAGLE/MTP draft hidden-state ping-pong buffers.
     allocateSpecDecodeHiddenStates(io, maxRuntimeBatchSize, maxTensorSeqLen, baseOutputHiddenDim,
-        draftRuntimeHiddenSize, nvinfer1::DataType::kHALF, bundle.specDecodeMode() != SpecDecodeMode::kDFlash);
+        draftRuntimeHiddenSize, nvinfer1::DataType::kHALF, !isCachedBlockDraftMode(bundle.specDecodeMode()));
 
     if (hasDeepstackFeatures(bundle.base))
     {
@@ -537,7 +537,7 @@ PipelineIO PipelineIO::createForSpecDecode(
     CUDA_CHECK(cudaMemsetAsync(io.skipSoftmaxScale.rawPointer(), 0, io.skipSoftmaxScale.getMemoryCapacity(), stream));
 
     bool const useSpecTree
-        = (bundle.specDecodeMode() == SpecDecodeMode::kDFlash || bundle.specDecodeMode() == SpecDecodeMode::kMTP)
+        = (isCachedBlockDraftMode(bundle.specDecodeMode()) || bundle.specDecodeMode() == SpecDecodeMode::kMTP)
         && bundle.specConfig->draftingTopK > 1;
     if (useSpecTree)
     {

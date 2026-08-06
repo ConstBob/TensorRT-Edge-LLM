@@ -17,6 +17,7 @@
 | **GPU memory** | Peak GPU memory usage during inference (MB) |
 | **MTP** | Multi-token prediction speculative decoding |
 | **DFlash** | z-lab paired-draft speculative decoding with a dedicated external draft checkpoint |
+| **JetSpec** | JetSpec paired-draft speculative decoding with causal proposal attention and branching tree verification |
 
 ### Precision Key
 
@@ -38,7 +39,7 @@ basic inference:
 - [VLM Inference](../examples/vlm.md) for visual encoder export/build and
   `--multimodalEngineDir`.
 - [Speculative Decoding](../examples/speculative-decoding.md) for EAGLE3, MTP,
-  and DFlash export/build layouts.
+  DFlash, and JetSpec export/build layouts.
 - [Input Format Guide](../format/input-format.md) for the Edge-LLM JSON request
   format and chat-template behavior.
 
@@ -98,6 +99,8 @@ and decoding mode. Use these benchmark-specific build parameters:
 | MTP draft engine | Vanilla LLM parameters plus `--specDraft --maxDraftTreeSize 4` |
 | DFlash base engine | Vanilla LLM parameters plus `--specBase --maxVerifyTreeSize 16` |
 | DFlash draft engine | Vanilla LLM parameters plus `--specDraft --maxDraftTreeSize 16` |
+| JetSpec tree base engine | Vanilla LLM parameters plus `--specBase --maxVerifyTreeSize 128` |
+| JetSpec draft engine | Vanilla LLM parameters plus `--specDraft --maxDraftTreeSize 128` |
 
 Use the batch size shown in the benchmark row. Thor and Jetson AGX Orin rows may
 use batch `1` or `8`; Jetson Orin NX and Orin Nano rows are generally batch `1`.
@@ -108,8 +111,10 @@ For INT4 runs on Orin, follow the export docs but use externalized INT4 weights:
 For speculative decoding, follow the exact export layouts in
 [Speculative Decoding](../examples/speculative-decoding.md): EAGLE3 uses a base
 and draft export, MTP uses the MTP base and `mtp_draft` export, and DFlash uses
-the paired DFlash base and draft export. For DFlash, use the linear DFlash base
-export for `--specDraftTopK 1`; use the tree-base export only for DDTree runs.
+the paired DFlash base and draft export. JetSpec uses the paired JetSpec
+tree-base and draft export. For DFlash, use the linear DFlash base export for
+`--specDraftTopK 1`; use the tree-base export only for DDTree runs. For JetSpec,
+use the tree-base export with `--specDraftTopK > 1`.
 
 ### 3. Runtime Benchmark Specs
 
@@ -126,10 +131,12 @@ the profile JSON. Use these common runtime settings:
 | MTP runtime | Common settings plus `--specDecode --specDraftTopK 1 --specDraftStep 3 --specVerifySize 4` |
 | DFlash linear runtime | Common settings plus `--specDecode --specDraftTopK 1 --specDraftStep 1 --specVerifySize 16` |
 | DFlash DDTree runtime | Follow the DFlash guide; use `--specDraftTopK > 1` with the tree-base export |
+| JetSpec tree runtime | Common settings plus `--specDecode --specDraftTopK 7 --specDraftStep 1 --specVerifySize 128 --jetspecBlockSize 16` |
 
-For Qwen3.5 DFlash inputs, set `"enable_thinking": true`; for Qwen3 DFlash
-inputs, set `"enable_thinking": false`. These settings match the paired
-HuggingFace generation behavior used for DFlash validation.
+For Qwen3.5 DFlash inputs, set `"enable_thinking": true`; for Qwen3 DFlash and
+Qwen3 JetSpec inputs, set `"enable_thinking": false`. These settings match the
+paired HuggingFace generation behavior used for speculative decoding
+validation.
 
 For synthetic component timing, run `llm_bench` on the same engines:
 
@@ -143,7 +150,7 @@ For synthetic component timing, run `llm_bench` on the same engines:
 | Spec verify | `--mode spec_verify --batchSize <batch> --verifyTreeSize <verify_tree_size> --pastKVLen 2048 --warmup 3 --iterations 10 --profile` |
 
 Use `draftTreeSize` / `verifyTreeSize` values of `60` for EAGLE3, `4` for MTP,
-and `16` for linear DFlash.
+`16` for linear DFlash, and `128` for JetSpec tree runs.
 
 ## v0.9.0 Results
 

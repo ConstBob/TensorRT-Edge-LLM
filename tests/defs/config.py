@@ -496,6 +496,13 @@ MODEL_NAME_TO_DFLASH_DRAFT_MODELS_MAP = {
     },
 }
 
+# Base model + JetSpec ``draft_model_id`` -> draft checkpoint folder name.
+MODEL_NAME_TO_JETSPEC_DRAFT_MODELS_MAP = {
+    "Qwen3-8B": {
+        "hf": "JetSpec/jetspec-qwen3-8b",
+    },
+}
+
 # Paired Gemma4 MTP uses a separate assistant checkpoint. The test parameter
 # remains ``...-mtp`` so runtime naming is shared with Qwen-style MTP; only
 # export needs this model-family-specific assistant lookup.
@@ -552,6 +559,8 @@ class TestConfig:
     is_mtp: Optional[bool] = None
     is_dflash: Optional[bool] = None
     is_dflash_tree: Optional[bool] = None
+    is_jetspec: Optional[bool] = None
+    is_jetspec_tree: Optional[bool] = None
     is_dspark: Optional[bool] = None
 
     # Directory paths
@@ -730,6 +739,18 @@ class TestConfig:
                       }, {ModelType.LLM},
                       is_required=False),
         ParameterSpec("is_dflash_tree",
+                      "ddtree", {
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
+                          TaskType.INFERENCE
+                      }, {ModelType.LLM},
+                      is_required=False),
+        ParameterSpec("is_jetspec",
+                      "jetspec", {
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
+                          TaskType.INFERENCE
+                      }, {ModelType.LLM},
+                      is_required=False),
+        ParameterSpec("is_jetspec_tree",
                       "ddtree", {
                           TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
                           TaskType.INFERENCE
@@ -1011,6 +1032,33 @@ class TestConfig:
                             'draft_lm_head_precision'] = draft_lm_precision
                 else:
                     parsed_params['draft_llm_precision'] = llm_precision
+            elif part == "jetspec":
+                parsed_params['is_jetspec'] = True
+                # Parse jetspec-{draft_id}[-{draft_precision}[-lm{draft_lm_head}]].
+                if i + 1 >= len(remaining_parts):
+                    raise ValueError(
+                        f"Missing draft model id after jetspec in: {param_str}"
+                    )
+                i += 1
+                parsed_params['draft_model_id'] = remaining_parts[i]
+
+                if (i + 1 < len(remaining_parts)
+                        and remaining_parts[i + 1] in VALID_LLM_PRECISIONS):
+                    i += 1
+                    parsed_params['draft_llm_precision'] = remaining_parts[i]
+
+                    if (i + 1 < len(remaining_parts)
+                            and remaining_parts[i + 1].startswith('lm')):
+                        i += 1
+                        draft_lm_precision = remaining_parts[i][2:]
+                        if draft_lm_precision not in VALID_LM_HEAD_PRECISIONS:
+                            raise ValueError(
+                                f"Invalid draft LM head precision: {draft_lm_precision}"
+                            )
+                        parsed_params[
+                            'draft_lm_head_precision'] = draft_lm_precision
+                else:
+                    parsed_params['draft_llm_precision'] = llm_precision
             elif part == "dspark":
                 parsed_params['is_dspark'] = True
                 # Parse dspark-{draft_id}[-{draft_precision}[-lm{draft_lm_head}]].
@@ -1202,7 +1250,7 @@ class TestConfig:
     @classmethod
     def resolve_quantized_draft_checkpoint_dir_name(
             cls, param_str: str, model_type: ModelType) -> Optional[str]:
-        """Hub folder name for EAGLE draft from test_param only (no real paths)."""
+        """Hub folder name for a spec draft from test_param only (no real paths)."""
         env_stub = EnvironmentConfig(
             llm_sdk_dir=".",
             llm_models_dir=".",
@@ -1259,6 +1307,10 @@ class TestConfig:
                     self.is_dflash = False
                 if self.is_dflash_tree is None:
                     self.is_dflash_tree = False
+                if self.is_jetspec is None:
+                    self.is_jetspec = False
+                if self.is_jetspec_tree is None:
+                    self.is_jetspec_tree = False
                 if self.is_dspark is None:
                     self.is_dspark = False
                 if self.draft_llm_precision is not None and self.draft_lm_head_precision is None:
@@ -1293,22 +1345,30 @@ class TestConfig:
                     self.is_dflash = False
                 if self.is_dflash_tree is None:
                     self.is_dflash_tree = False
+                if self.is_jetspec is None:
+                    self.is_jetspec = False
+                if self.is_jetspec_tree is None:
+                    self.is_jetspec_tree = False
+                if self.is_dspark is None:
+                    self.is_dspark = False
                 if self.draft_llm_precision is not None and self.draft_lm_head_precision is None:
                     self.draft_lm_head_precision = "fp16"
                 if self.eagle_draft_top_k is None:
-                    self.eagle_draft_top_k = 1 if (self.is_mtp
-                                                   or self.is_dflash
-                                                   or self.is_dspark) else 10
+                    self.eagle_draft_top_k = 1 if (
+                        self.is_mtp or self.is_dflash or self.is_jetspec
+                        or self.is_dspark) else 10
                 if self.eagle_draft_step is None:
-                    self.eagle_draft_step = 1 if (self.is_dflash
-                                                  or self.is_dspark) else (
-                                                      3 if self.is_mtp else 6)
+                    self.eagle_draft_step = 1 if (
+                        self.is_dflash or self.is_jetspec
+                        or self.is_dspark) else (3 if self.is_mtp else 6)
                 if self.max_verify_tree_size is None:
                     self.max_verify_tree_size = 8 if self.is_dspark else (
-                        16 if self.is_dflash else (4 if self.is_mtp else 60))
+                        16 if (self.is_dflash or self.is_jetspec) else
+                        (4 if self.is_mtp else 60))
                 if self.max_draft_tree_size is None:
                     self.max_draft_tree_size = 7 if self.is_dspark else (
-                        16 if self.is_dflash else (4 if self.is_mtp else 60))
+                        16 if (self.is_dflash or self.is_jetspec) else
+                        (4 if self.is_mtp else 60))
 
         warmup_env = os.environ.get('WARMUP')
         if warmup_env is not None and self.warmup is None:
@@ -1384,13 +1444,20 @@ class TestConfig:
         # Set defaults after validation
         set_defaults()
 
+        if self.is_jetspec and self.is_dflash_tree:
+            self.is_jetspec_tree = True
+            self.is_dflash_tree = False
+
         if self.is_dflash_tree and not self.is_dflash:
             raise ValueError("ddtree can only be used with DFlash tests")
-        if (self.is_dflash_tree
+        if self.is_jetspec_tree and not self.is_jetspec:
+            raise ValueError("ddtree can only be used with JetSpec tests")
+        if ((self.is_dflash_tree or self.is_jetspec_tree)
                 and self.task_type in (TaskType.E2E_BENCH, TaskType.INFERENCE)
                 and self.eagle_draft_top_k <= 1):
-            raise ValueError("DFlash DDTree runtime tests require edtk > 1; "
-                             "use linear DFlash without ddtree for edtk=1")
+            raise ValueError(
+                "DFlash/JetSpec DDTree runtime tests require edtk > 1; "
+                "use linear mode without ddtree for edtk=1")
 
     def check_trt_native_attn(self) -> None:
         """Skip -trt11 tests when TRT < 11.
@@ -1454,7 +1521,8 @@ class TestConfig:
             llm_engine_id += (
                 f"-mnit{self.min_image_tokens}-mxit{self.max_image_tokens}"
                 f"-mnts{self.min_time_steps}-mxts{self.max_time_steps}")
-        if self.is_eagle or self.is_mtp or self.is_dflash or self.is_dspark:
+        if (self.is_eagle or self.is_mtp or self.is_dflash or self.is_jetspec
+                or self.is_dspark):
             if self.max_verify_tree_size is not None:
                 llm_engine_id += f"-mvts{self.max_verify_tree_size}"
             if self.max_draft_tree_size is not None:
@@ -1516,12 +1584,13 @@ class TestConfig:
             return self.model_name
 
         parts = self.param_str.split('-')
-        eagle_idx = -1
+        spec_idx = -1
+        spec_tokens = {"dflash", "dspark", "eagle", "jetspec", "mtp"}
         for i, part in enumerate(parts):
-            if part.lower() == "eagle":
-                eagle_idx = i
+            if part.lower() in spec_tokens:
+                spec_idx = i
                 break
-        scan_end = eagle_idx if eagle_idx > 0 else len(parts)
+        scan_end = spec_idx if spec_idx > 0 else len(parts)
 
         precision_idx = -1
         for i in range(scan_end):
@@ -1555,9 +1624,9 @@ class TestConfig:
         return f"{base_model_name}-{'-'.join(pieces)}"
 
     def get_quantized_draft_checkpoint_dir_name(self) -> Optional[str]:
-        """Hub folder name for a pre-quantized EAGLE or DFlash draft checkpoint."""
+        """Hub folder name for a pre-quantized EAGLE/DFlash/JetSpec draft checkpoint."""
         if (self.is_mtp or self.draft_llm_precision == "fp16"
-                or not (self.is_eagle or self.is_dflash)):
+                or not (self.is_eagle or self.is_dflash or self.is_jetspec)):
             return None
         if self.draft_model_id is None or self.draft_llm_precision is None:
             return None
@@ -1566,16 +1635,19 @@ class TestConfig:
         draft_dir_name = None
         draft_modifiers: list = []
 
-        if self.is_dflash:
-            dflash_idx = -1
+        if self.is_dflash or self.is_jetspec:
+            spec_token = "jetspec" if self.is_jetspec else "dflash"
+            spec_idx = -1
             for i, part in enumerate(parts):
-                if part.lower() == "dflash":
-                    dflash_idx = i
+                if part.lower() == spec_token:
+                    spec_idx = i
                     break
-            if dflash_idx < 0:
+            if spec_idx < 0:
                 return None
-            draft_modifiers = parts[dflash_idx + 3:]
-            draft_models = self._dflash_draft_models_for_base()
+            draft_modifiers = parts[spec_idx + 3:]
+            draft_models = (self._jetspec_draft_models_for_base()
+                            if self.is_jetspec else
+                            self._dflash_draft_models_for_base())
             if not draft_models or self.draft_model_id not in draft_models:
                 return None
             draft_dir_name = draft_models[self.draft_model_id]
@@ -1767,6 +1839,52 @@ class TestConfig:
                 f"(requiring config.json + *.safetensors)")
         return model_dir
 
+    def _jetspec_draft_models_for_base(self) -> Optional[dict]:
+        """Resolve JetSpec draft map for fp16 or pre-quant base model names."""
+        draft_models = MODEL_NAME_TO_JETSPEC_DRAFT_MODELS_MAP.get(
+            self.model_name)
+        if draft_models is not None:
+            return draft_models
+        base_name = self._strip_model_quant_suffixes(self.model_name)
+        return MODEL_NAME_TO_JETSPEC_DRAFT_MODELS_MAP.get(base_name)
+
+    def get_jetspec_draft_model_dir(self) -> str:
+        """Resolve the JetSpec draft checkpoint directory using draft_model_id."""
+        draft_models = self._jetspec_draft_models_for_base()
+        if not draft_models:
+            raise ValueError(
+                f"Unsupported base model for JetSpec: '{self.model_name}'. "
+                f"Supported models: {', '.join(MODEL_NAME_TO_JETSPEC_DRAFT_MODELS_MAP.keys())}"
+            )
+
+        lookup_name = (self.model_name if self.model_name
+                       in MODEL_NAME_TO_JETSPEC_DRAFT_MODELS_MAP else
+                       self._strip_model_quant_suffixes(self.model_name))
+
+        if not self.draft_model_id:
+            raise ValueError(
+                f"draft_model_id not set. Available JetSpec drafts for {lookup_name}: "
+                f"{', '.join(draft_models.keys())}")
+
+        if self.draft_model_id not in draft_models:
+            raise ValueError(
+                f"Unsupported JetSpec draft_model_id '{self.draft_model_id}' for {lookup_name}. "
+                f"Available: {', '.join(draft_models.keys())}")
+
+        model_dir_name = draft_models[self.draft_model_id]
+        candidates = list(
+            dict.fromkeys([
+                f"source_models/{model_dir_name}",
+                model_dir_name,
+                os.path.basename(model_dir_name),
+            ]))
+        search_roots = []
+        if self.edgellm_data_dir:
+            search_roots.append(self.edgellm_data_dir)
+        if self.llm_models_dir and self.llm_models_dir not in search_roots:
+            search_roots.append(self.llm_models_dir)
+        return self._resolve_draft_model_dir(candidates, search_roots)
+
     def get_dspark_draft_model_dir(self) -> str:
         """Resolve the DSpark draft checkpoint directory using draft_model_id."""
         base_model_name = self._strip_model_quant_suffixes(self.model_name)
@@ -1948,6 +2066,9 @@ class TestConfig:
         elif self.is_dflash:
             mode = "ddtree" if self.is_dflash_tree else "linear"
             prefix = f"llm-base-dflash-{mode}"
+        elif self.is_jetspec:
+            mode = "ddtree" if self.is_jetspec_tree else "linear"
+            prefix = f"llm-base-jetspec-{mode}"
         elif self.is_dspark:
             prefix = "llm-base-dspark"
         elif self.is_eagle:
@@ -2027,6 +2148,10 @@ class TestConfig:
             return os.path.join(
                 self.get_onnx_base_dir(),
                 f"dflash-draft-{self.get_draft_onnx_model_id()}")
+        if self.is_jetspec:
+            return os.path.join(
+                self.get_onnx_base_dir(),
+                f"jetspec-draft-{self.get_draft_onnx_model_id()}")
         if self.is_dspark:
             return os.path.join(
                 self.get_onnx_base_dir(),
@@ -2035,10 +2160,12 @@ class TestConfig:
                             f"draft-{self.get_draft_onnx_model_id()}")
 
     def get_quantized_draft_model_dir(self) -> str:
-        """Local output dir for a quantized EAGLE/DFlash draft (hub folder name)."""
+        """Local output dir for a quantized EAGLE/DFlash/JetSpec draft."""
         if self.draft_llm_precision == "fp16":
             if self.is_dflash:
                 return self.get_dflash_draft_model_dir()
+            if self.is_jetspec:
+                return self.get_jetspec_draft_model_dir()
             if self.is_dspark:
                 return self.get_dspark_draft_model_dir()
             return self.get_draft_torch_model_dir()
@@ -2116,6 +2243,16 @@ class TestConfig:
             mode = "ddtree" if self.is_dflash_tree else "linear"
             prefix = (
                 f"llm-dflash-{mode}-{self.draft_model_id}-{self.draft_llm_precision}"
+            )
+        elif self.is_jetspec:
+            if self.draft_model_id is None:
+                raise ValueError("draft_model_id not set for JetSpec engine")
+            if self.draft_llm_precision is None:
+                raise ValueError(
+                    "draft_llm_precision not set for JetSpec engine")
+            mode = "ddtree" if self.is_jetspec_tree else "linear"
+            prefix = (
+                f"llm-jetspec-{mode}-{self.draft_model_id}-{self.draft_llm_precision}"
             )
         elif self.is_dspark:
             if self.draft_model_id is None:
@@ -2379,7 +2516,8 @@ class TestConfig:
             return os.path.join(self.onnx_dir, hub_name)
         if self.llm_precision == "fp16":
             return self.get_base_torch_model_dir()
-        if (self.is_eagle or self.is_dflash) and not self.is_mtp:
+        if (self.is_eagle or self.is_dflash
+                or self.is_jetspec) and not self.is_mtp:
             prefix = "quantized-base"
         else:
             prefix = "quantized"

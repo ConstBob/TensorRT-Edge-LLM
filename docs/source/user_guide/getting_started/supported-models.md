@@ -6,7 +6,7 @@
 
 ## Support Policy
 
-TensorRT Edge-LLM supports the checkpoint IDs listed below. Dense LLM families include official dense checkpoints below 30B parameters. Larger dense checkpoints and non-dense variants require case-by-case validation. MoE, multimodal, audio, TTS, omni, EAGLE3, and DFlash support is limited to the listed rows.
+TensorRT Edge-LLM supports the checkpoint IDs listed below. Dense LLM families include official dense checkpoints below 30B parameters. Larger dense checkpoints and non-dense variants require case-by-case validation. MoE, multimodal, audio, TTS, omni, EAGLE3, DFlash, and JetSpec support is limited to the listed rows.
 
 The model coverage list is not comprehensive, and not every listed checkpoint has been fully verified on every supported platform and precision. If a listed model does not export, build, or run correctly, please report an issue with the checkpoint ID, precision, platform, and command line used.
 
@@ -468,3 +468,21 @@ So far DFlash support in TensorRT Edge-LLM is validated for Qwen3 and Qwen3.5 on
 | [z-lab/Qwen3.5-9B-DFlash](https://huggingface.co/z-lab/Qwen3.5-9B-DFlash) | [Qwen/Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B) | `DFlashDraftModel` |
 | [z-lab/Qwen3.5-27B-DFlash](https://huggingface.co/z-lab/Qwen3.5-27B-DFlash) | [Qwen/Qwen3.5-27B](https://huggingface.co/Qwen/Qwen3.5-27B) | `DFlashDraftModel` |
 | [z-lab/Qwen3.5-35B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3.5-35B-A3B-DFlash) | [Qwen/Qwen3.5-35B-A3B-GPTQ-Int4](https://huggingface.co/Qwen/Qwen3.5-35B-A3B-GPTQ-Int4) | `DFlashDraftModel` |
+
+## JetSpec Draft Models
+
+JetSpec draft checkpoints are detected by `jetspec_config` in `config.json` and
+exported with `DFlashDraftModel` using causal proposal attention. The validated
+runtime path is branching tree verification: export the base with
+`--jetspec-tree-base --jetspec-draft-dir <draft_checkpoint>`, export the draft
+with `--jetspec-draft --jetspec-draft-dir <draft_checkpoint>`, and run with
+`--specDraftTopK > 1`. `--jetspecBlockSize` and `--dflashBlockSize` configure
+the same cached-draft proposal block size; the JetSpec spelling is provided for
+clarity in JetSpec command lines.
+
+For the listed Qwen3 pair, disable thinking mode in the input JSON when
+evaluating accuracy, acceptance rate, or throughput.
+
+| Draft checkpoint | Base model | Draft config class |
+|------------------|------------|--------------------|
+| [JetSpec/jetspec-qwen3-8b](https://huggingface.co/JetSpec/jetspec-qwen3-8b) | [Qwen/Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) | `DFlashDraftModel` with `jetspec_config` |

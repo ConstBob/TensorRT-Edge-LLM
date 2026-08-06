@@ -459,8 +459,8 @@ bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
     Tensor const& draftCacheLengths = mDraftCacheManager.getKVCacheLengths();
     kernel::launchDFlashPrepareProposalInputs(draftCacheLengths.dataPointer<int32_t>(),
         mDraftDeltaLens.dataPointer<int32_t>(), proposalLen, mDraftPackedAttentionMask.dataPointer<int32_t>(),
-        mDraftAttentionPosId.dataPointer<int32_t>(), mDraftContextLengths.dataPointer<int32_t>(), activeBatchSize,
-        context.stream);
+        mDraftAttentionPosId.dataPointer<int32_t>(), mDraftContextLengths.dataPointer<int32_t>(), false,
+        activeBatchSize, context.stream);
 
     check::check(mDraftOutputLogits.reshape({activeBatchSize, proposalLen, mDraftVocabSize}), "Tensor reshape failed");
     check::check(mDraftHiddenStates.reshape({activeBatchSize, proposalLen, mDraftHiddenSize}), "Tensor reshape failed");
@@ -970,8 +970,8 @@ bool DSparkDecoder::captureCudaGraphs(cudaStream_t stream)
             Tensor const& draftCacheLengths = mDraftCacheManager.getKVCacheLengths();
             kernel::launchDFlashPrepareProposalInputs(draftCacheLengths.dataPointer<int32_t>(),
                 mDraftDeltaLens.dataPointer<int32_t>(), proposalLen, mDraftPackedAttentionMask.dataPointer<int32_t>(),
-                mDraftAttentionPosId.dataPointer<int32_t>(), mDraftContextLengths.dataPointer<int32_t>(), batchSize,
-                stream);
+                mDraftAttentionPosId.dataPointer<int32_t>(), mDraftContextLengths.dataPointer<int32_t>(), false,
+                batchSize, stream);
 
             InferenceDims const draftDims{
                 /*.batch=*/batchSize,
@@ -1125,8 +1125,8 @@ bool DSparkDecoder::runSystemPromptPrefill(DecodingInferenceContext& context)
     Tensor const& draftCacheLengths = mDraftCacheManager.getKVCacheLengths();
     kernel::launchDFlashPrepareProposalInputs(draftCacheLengths.dataPointer<int32_t>(),
         mDraftDeltaLens.dataPointer<int32_t>(), proposalLen, mDraftPackedAttentionMask.dataPointer<int32_t>(),
-        mDraftAttentionPosId.dataPointer<int32_t>(), mDraftContextLengths.dataPointer<int32_t>(), activeBatchSize,
-        context.stream);
+        mDraftAttentionPosId.dataPointer<int32_t>(), mDraftContextLengths.dataPointer<int32_t>(), false,
+        activeBatchSize, context.stream);
 
     check::check(mDraftOutputLogits.reshape({activeBatchSize, proposalLen, mDraftVocabSize}), "Tensor reshape failed");
     check::check(mDraftHiddenStates.reshape({activeBatchSize, proposalLen, mDraftHiddenSize}), "Tensor reshape failed");

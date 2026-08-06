@@ -48,6 +48,11 @@ def _speculative_build_args(config: TestConfig) -> List[str]:
             "--spec-type", "dflash", "--draft-model-dir",
             config.get_dflash_draft_model_dir()
         ]
+    if config.is_jetspec:
+        return [
+            "--spec-type", "jetspec", "--draft-model-dir",
+            config.get_jetspec_draft_model_dir()
+        ]
     if config.is_eagle:
         return [
             "--spec-type", "eagle3", "--draft-model-dir",
@@ -135,7 +140,7 @@ def _runtime_command(config: TestConfig, model_dir: str, engine_dir: str,
     ]
     if config.model_type in (ModelType.VLM, ModelType.ASR, ModelType.OMNI):
         command.append(f"--multimodalEngineDir={engine_dir}")
-    if config.is_eagle or config.is_mtp or config.is_dflash:
+    if config.is_eagle or config.is_mtp or config.is_dflash or config.is_jetspec:
         command.extend([
             "--specDecode",
             f"--specDraftTopK={config.eagle_draft_top_k}",
@@ -164,7 +169,8 @@ def _assert_component_engines(model_dir: str, engine_dir: str,
     from experimental.builder.core.config import BundleConfig
 
     bundle = BundleConfig.from_pretrained(model_dir)
-    speculative = bool(config.is_eagle or config.is_mtp or config.is_dflash)
+    speculative = bool(config.is_eagle or config.is_mtp or config.is_dflash
+                       or config.is_jetspec)
     expected = []
     for component in bundle.components:
         spec = contracts.component_spec(component)

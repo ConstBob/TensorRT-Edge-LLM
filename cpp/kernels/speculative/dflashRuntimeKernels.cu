@@ -219,7 +219,7 @@ void checkDFlashRopeCapacity(int32_t cosSinSeqLen, int32_t kvCapacity)
 
 __global__ void dflashPrepareProposalInputsKernel(int32_t const* __restrict__ oldDraftCacheLengths,
     int32_t const* __restrict__ deltaLengths, int32_t blockSize, int32_t* __restrict__ packedAttentionMask,
-    int32_t* __restrict__ attentionPosId, int32_t* __restrict__ contextLengths)
+    int32_t* __restrict__ attentionPosId, int32_t* __restrict__ contextLengths, bool causalProposalMask)
 {
     int32_t const b = blockIdx.x;
     int32_t const i = threadIdx.x; // position within the block [0, blockSize)
@@ -241,9 +241,9 @@ __global__ void dflashPrepareProposalInputsKernel(int32_t const* __restrict__ ol
         contextLengths[b] = targetLen + blockSize;
     }
 
-    // Packed attention mask: all proposal tokens attend to all other proposal tokens
-    // Layout: [B, BS, divUp(BS, 32)]
-    // For DFlash non-causal proposal: every row has all BS bits set
+    // Packed attention mask layout: [B, BS, divUp(BS, 32)]. DFlash uses full
+    // non-causal rows; JetSpec uses causal proposal rows because the public
+    // draft checkpoint was trained with causal_head=true.
     int32_t const packedMaskLen = (blockSize + 31) / 32;
     for (int32_t w = 0; w < packedMaskLen; ++w)
     {
@@ -252,7 +252,10 @@ __global__ void dflashPrepareProposalInputsKernel(int32_t const* __restrict__ ol
         int32_t const bitEnd = min(bitStart + 32, blockSize);
         for (int32_t bit = bitStart; bit < bitEnd; ++bit)
         {
-            mask |= (1 << (bit - bitStart));
+            if (!causalProposalMask || bit <= i)
+            {
+                mask |= (1 << (bit - bitStart));
+            }
         }
         packedAttentionMask[b * blockSize * packedMaskLen + i * packedMaskLen + w] = mask;
     }
@@ -260,7 +263,7 @@ __global__ void dflashPrepareProposalInputsKernel(int32_t const* __restrict__ ol
 
 void launchDFlashPrepareProposalInputs(int32_t const* oldDraftCacheLengths, int32_t const* deltaLengths,
     int32_t blockSize, int32_t* packedAttentionMask, int32_t* attentionPosId, int32_t* contextLengths,
-    int32_t batchSize, cudaStream_t stream)
+    bool causalProposalMask, int32_t batchSize, cudaStream_t stream)
 {
     if (batchSize == 0 || blockSize == 0)
     {
@@ -271,8 +274,8 @@ void launchDFlashPrepareProposalInputs(int32_t const* oldDraftCacheLengths, int3
     dim3 const grid(batchSize);
     dim3 const block(blockSize);
 
-    dflashPrepareProposalInputsKernel<<<grid, block, 0, stream>>>(
-        oldDraftCacheLengths, deltaLengths, blockSize, packedAttentionMask, attentionPosId, contextLengths);
+    dflashPrepareProposalInputsKernel<<<grid, block, 0, stream>>>(oldDraftCacheLengths, deltaLengths, blockSize,
+        packedAttentionMask, attentionPosId, contextLengths, causalProposalMask);
     CUDA_CHECK(cudaGetLastError());
 }
 

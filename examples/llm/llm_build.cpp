@@ -91,9 +91,12 @@ void printUsage(char const* programName)
     std::cerr << "  --debug                   Use debug mode, which outputs more logs." << std::endl;
     std::cerr << "  --maxLoraRank             Maximum LoRA rank for dynamic LoRA adaptation. Default = 0 (no LoRA)"
               << std::endl;
-    std::cerr << "  --specDraft               Build as speculative decoding draft model (EAGLE/MTP/DFlash)"
-              << std::endl;
-    std::cerr << "  --specBase                Build as speculative decoding base model (EAGLE/MTP/DFlash)" << std::endl;
+    std::cerr
+        << "  --specDraft               Build as speculative decoding draft model (EAGLE/MTP/DFlash/JetSpec/DSpark)"
+        << std::endl;
+    std::cerr
+        << "  --specBase                Build as speculative decoding base model (EAGLE/MTP/DFlash/JetSpec/DSpark)"
+        << std::endl;
     std::cerr << "  --maxVerifyTreeSize       Maximum input_ids tokens for base model verification. Default = 60"
               << std::endl;
     std::cerr << "  --maxDraftTreeSize        Maximum input_ids tokens for draft model generation. Default = 60"

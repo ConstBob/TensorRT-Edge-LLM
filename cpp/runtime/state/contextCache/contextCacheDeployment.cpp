@@ -146,9 +146,10 @@ ContextCacheDeploymentKind validateContextCacheDeployment(DeploymentConfig const
 
     case SpecDecodeMode::kMTP:
     case SpecDecodeMode::kDFlash:
+    case SpecDecodeMode::kJetSpec:
     case SpecDecodeMode::kGemma4MTP:
     case SpecDecodeMode::kDSpark:
-        ELLM_CHECK(false, "Context reuse does not support MTP, DFlash, DSpark, or Gemma4 MTP deployments.");
+        ELLM_CHECK(false, "Context reuse does not support MTP, DFlash, JetSpec, DSpark, or Gemma4 MTP deployments.");
     }
     ELLM_CHECK(false, "Unknown speculative decoding mode in context-cache deployment validation.");
 }

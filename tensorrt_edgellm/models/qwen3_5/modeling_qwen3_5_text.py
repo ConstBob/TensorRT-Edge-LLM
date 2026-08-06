@@ -653,11 +653,12 @@ def _is_dflash_base_export(config: ModelConfig) -> bool:
 def _is_spec_tree_base_export(config: ModelConfig) -> bool:
     """Return True when exporting DDTree metadata for Qwen3.5 hybrid state.
 
-    Both the DFlash DDTree base and the MTP tree base consume the same
+    DFlash, JetSpec, and MTP tree bases consume the same
     ``tree_parent_ids`` / ``tree_depths`` verify inputs.
     """
-    return bool(getattr(config, "dflash_tree_base", False)) or bool(
-        getattr(config, "mtp_tree_base", False))
+    return (bool(getattr(config, "dflash_tree_base", False))
+            or bool(getattr(config, "jetspec_tree_base", False))
+            or bool(getattr(config, "mtp_tree_base", False)))
 
 
 def _make_flat_wrapper_hybrid(model: nn.Module,

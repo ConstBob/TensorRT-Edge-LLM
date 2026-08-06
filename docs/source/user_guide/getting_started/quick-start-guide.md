@@ -298,7 +298,7 @@ To collect layer-level profiling in addition to the benchmark summary, add `--pr
 
 **For more advanced workflows, see the example guides:**
 - **[VLM Inference](../examples/vlm.md)** - Vision-language models with image understanding
-- **[Speculative Decoding](../examples/speculative-decoding.md)** - EAGLE3, MTP, and DFlash speculative decoding workflows
+- **[Speculative Decoding](../examples/speculative-decoding.md)** - EAGLE3, MTP, DFlash, and JetSpec speculative decoding workflows
 - **[Phi-4-Multimodal](../examples/phi4.md)** - Phi-4 Multimodal
 - **[ASR](../examples/asr.md)** - Automatic speech recognition
 - **[MoE](../examples/moe.md)** - Mixture of Experts models (CPU-only export, Qwen3-30B-A3B-GPTQ-Int4/NVFP4)

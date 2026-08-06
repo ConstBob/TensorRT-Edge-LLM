@@ -861,8 +861,7 @@ void eagleBaseCommitKVCache(rt::Tensor const& acceptedIndices, rt::Tensor const&
     check::check(
         static_cast<int32_t>(acceptIndicesShape[1]) == maxDepth, "acceptedIndices second dim must match maxDepth.");
 
-    constexpr int32_t MAX_PATH{16};
-    check::check(maxDepth <= MAX_PATH, "maxDepth > 16 is not supported by the kernel.");
+    check::check(maxDepth <= kEagleMaxAcceptedPathLength, "maxDepth > 32 is not supported by the kernel.");
 
     // Each CTA has 128 threads, each thread copies vecSize elements (DVec<half> = 8 elements;
     // DVec<__nv_fp8_e4m3> is also 8 elements wide, so the block-dim math is dtype-agnostic).
@@ -886,14 +885,14 @@ void eagleBaseCommitKVCache(rt::Tensor const& acceptedIndices, rt::Tensor const&
     case 64:
         if (kvCacheType == DataType::kHALF)
         {
-            eagleBaseCommitKVCacheBatchedKernel<64, MAX_PATH, half>
+            eagleBaseCommitKVCacheBatchedKernel<64, kEagleMaxAcceptedPathLength, half>
                 <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndicesPtr, acceptLengthsPtr, kvCacheLengthsPtr,
                     deviceLayerInfos, activeBatchSize, maxDepth, pageTable, maxPagesPerSeq);
         }
         else
         {
 #if SUPPORTS_FP8
-            eagleBaseCommitKVCacheBatchedKernel<64, MAX_PATH, __nv_fp8_e4m3>
+            eagleBaseCommitKVCacheBatchedKernel<64, kEagleMaxAcceptedPathLength, __nv_fp8_e4m3>
                 <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndicesPtr, acceptLengthsPtr, kvCacheLengthsPtr,
                     deviceLayerInfos, activeBatchSize, maxDepth, pageTable, maxPagesPerSeq);
 #else
@@ -904,14 +903,14 @@ void eagleBaseCommitKVCache(rt::Tensor const& acceptedIndices, rt::Tensor const&
     case 128:
         if (kvCacheType == DataType::kHALF)
         {
-            eagleBaseCommitKVCacheBatchedKernel<128, MAX_PATH, half>
+            eagleBaseCommitKVCacheBatchedKernel<128, kEagleMaxAcceptedPathLength, half>
                 <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndicesPtr, acceptLengthsPtr, kvCacheLengthsPtr,
                     deviceLayerInfos, activeBatchSize, maxDepth, pageTable, maxPagesPerSeq);
         }
         else
         {
 #if SUPPORTS_FP8
-            eagleBaseCommitKVCacheBatchedKernel<128, MAX_PATH, __nv_fp8_e4m3>
+            eagleBaseCommitKVCacheBatchedKernel<128, kEagleMaxAcceptedPathLength, __nv_fp8_e4m3>
                 <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndicesPtr, acceptLengthsPtr, kvCacheLengthsPtr,
                     deviceLayerInfos, activeBatchSize, maxDepth, pageTable, maxPagesPerSeq);
 #else
@@ -922,14 +921,14 @@ void eagleBaseCommitKVCache(rt::Tensor const& acceptedIndices, rt::Tensor const&
     case 256:
         if (kvCacheType == DataType::kHALF)
         {
-            eagleBaseCommitKVCacheBatchedKernel<256, MAX_PATH, half>
+            eagleBaseCommitKVCacheBatchedKernel<256, kEagleMaxAcceptedPathLength, half>
                 <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndicesPtr, acceptLengthsPtr, kvCacheLengthsPtr,
                     deviceLayerInfos, activeBatchSize, maxDepth, pageTable, maxPagesPerSeq);
         }
         else
         {
 #if SUPPORTS_FP8
-            eagleBaseCommitKVCacheBatchedKernel<256, MAX_PATH, __nv_fp8_e4m3>
+            eagleBaseCommitKVCacheBatchedKernel<256, kEagleMaxAcceptedPathLength, __nv_fp8_e4m3>
                 <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndicesPtr, acceptLengthsPtr, kvCacheLengthsPtr,
                     deviceLayerInfos, activeBatchSize, maxDepth, pageTable, maxPagesPerSeq);
 #else
@@ -940,14 +939,14 @@ void eagleBaseCommitKVCache(rt::Tensor const& acceptedIndices, rt::Tensor const&
     case 512:
         if (kvCacheType == DataType::kHALF)
         {
-            eagleBaseCommitKVCacheBatchedKernel<512, MAX_PATH, half>
+            eagleBaseCommitKVCacheBatchedKernel<512, kEagleMaxAcceptedPathLength, half>
                 <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndicesPtr, acceptLengthsPtr, kvCacheLengthsPtr,
                     deviceLayerInfos, activeBatchSize, maxDepth, pageTable, maxPagesPerSeq);
         }
         else
         {
 #if SUPPORTS_FP8
-            eagleBaseCommitKVCacheBatchedKernel<512, MAX_PATH, __nv_fp8_e4m3>
+            eagleBaseCommitKVCacheBatchedKernel<512, kEagleMaxAcceptedPathLength, __nv_fp8_e4m3>
                 <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndicesPtr, acceptLengthsPtr, kvCacheLengthsPtr,
                     deviceLayerInfos, activeBatchSize, maxDepth, pageTable, maxPagesPerSeq);
 #else
@@ -988,8 +987,7 @@ void eagleBaseAssembleHiddenState(
     check::check(acceptLengthsShape[0] == batchSize, "acceptLengths should have same batch size as acceptedIndices.");
     check::check(hiddenStateShape[0] == batchSize, "hiddenState batch size should match acceptedIndices.");
 
-    constexpr int32_t MAX_PATH{16};
-    check::check(maxDepth <= MAX_PATH, "maxDepth > 16 is not supported by the kernel.");
+    check::check(maxDepth <= kEagleMaxAcceptedPathLength, "maxDepth > 32 is not supported by the kernel.");
 
     constexpr uint32_t vecSize = DVec<half>::vec_size;
     constexpr uint32_t threadsPerBlock = 128;
@@ -1002,7 +1000,7 @@ void eagleBaseAssembleHiddenState(
     dim3 const blockDim2(threadsPerBlock);
     dim3 const gridDim2{batchSize, gridY};
 
-    eagleBaseAssembleHiddenStateKernel<MAX_PATH><<<gridDim2, blockDim2, 0, stream>>>(
+    eagleBaseAssembleHiddenStateKernel<kEagleMaxAcceptedPathLength><<<gridDim2, blockDim2, 0, stream>>>(
         acceptedIndices.dataPointer<int32_t>(), acceptLengths.dataPointer<int32_t>(), hiddenState.dataPointer<half>(),
         batchSize, maxDepth, numTokens, hiddenDim);
     CUDA_CHECK(cudaGetLastError());
