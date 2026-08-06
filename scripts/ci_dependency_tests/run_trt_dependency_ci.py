@@ -483,13 +483,30 @@ def resolve_host(connection: HostSSHConfig,
     return Host(remote.target, remote)
 
 
-def _cute_dsl_cmake_args(architecture: Arch) -> list[str]:
+def _cute_dsl_cmake_args(architecture: Arch, compute_capability: str,
+                         native_x86: bool) -> list[str]:
+    """Return CuTeDSL configuration for the requested build target.
+
+    Args:
+        architecture: Architecture of the Edge LLM build target.
+        compute_capability: Target GPU capability in ``major.minor`` form.
+        native_x86: Whether the build bypasses the DevToolkit artifact
+            generator and runs directly on the host.
+
+    Returns:
+        CMake arguments selecting the supported CuTeDSL kernel groups and
+        matching prebuilt artifact.
+    """
     if architecture is Arch.D7L:
         return [
             "-DENABLE_CUTE_DSL=fmha;fmha_v2;ffpa;gdn;gemm;ssd",
             "-DCUTE_DSL_ARTIFACT_TAG=sm_110",
         ]
-    return ["-DENABLE_CUTE_DSL=ffpa;fmha_v2;gdn;gemm;int4_fp16_gemm;ssd"]
+    cmake_args = ["-DENABLE_CUTE_DSL=ffpa;fmha_v2;gdn;gemm;int4_fp16_gemm;ssd"]
+    if native_x86:
+        artifact_tag = f"sm_{compute_capability.replace('.', '')}"
+        cmake_args.append(f"-DCUTE_DSL_ARTIFACT_TAG={artifact_tag}")
+    return cmake_args
 
 
 def build_targets(config: Config) -> list[ArtifactTarget]:
@@ -541,9 +558,9 @@ def build_targets(config: Config) -> list[ArtifactTarget]:
                 no_nvidia_runtime=True,
                 trt_package_dir=str(config.trt_location),
                 cmake_args=[
-                    "--fresh", "-DBUILD_UNIT_TESTS=OFF",
-                    *_cute_dsl_cmake_args(config.architecture),
-                    *platform_cmake_args
+                    "--fresh", "-DBUILD_UNIT_TESTS=OFF", *_cute_dsl_cmake_args(
+                        config.architecture, config.compute_capability,
+                        native_x86), *platform_cmake_args
                 ],
             ),
         ),
