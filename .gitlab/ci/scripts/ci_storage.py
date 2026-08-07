@@ -30,6 +30,7 @@ JOB_MODE = 0o777
 
 DECIMAL_PATTERN = re.compile(r"^[0-9]+$")
 SLUG_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+PIPELINE_DIRECTORY_PATTERN = re.compile(r"^pipeline_([0-9]+)$")
 
 
 class StorageContractError(RuntimeError):
@@ -259,21 +260,20 @@ def _job_environment(layout: StorageLayout, pipeline_id: str, job_id: str,
         "PIPELINE_WORKSPACE_ROOT": str(layout.pipeline_root(pipeline_id)),
         "JOB_WORKSPACE_ROOT": str(job_root),
         "TEST_LOG_DIR": str(job_root / "logs"),
-        "ENGINE_DIR": str(job_root / "engines"),
     }
+
+    writes_engines = environ.get("L0_JOB_WRITES_ENGINES", "")
+    if writes_engines == "1":
+        variables["ENGINE_DIR"] = str(job_root / "engines")
+    elif writes_engines:
+        raise StorageContractError(
+            "L0_JOB_WRITES_ENGINES must be '1' when set")
 
     cache_relative_path = _optional_relative_path(
         environ, "L0_ONNX_CACHE_RELATIVE_PATH")
-    job_relative_path = _optional_relative_path(environ,
-                                                "L0_JOB_ONNX_RELATIVE_PATH")
-    if cache_relative_path is not None and job_relative_path is not None:
-        raise StorageContractError(
-            "only one L0 ONNX relative path may be configured")
     if cache_relative_path is not None:
         variables["ONNX_DIR"] = str(layout.onnx_cache_root /
                                     cache_relative_path)
-    elif job_relative_path is not None:
-        variables["ONNX_DIR"] = str(job_root / job_relative_path)
     return variables
 
 
@@ -295,13 +295,7 @@ def _prepare_job(environ: Mapping[str, str],
     _prepare_protected_paths(layout, pipeline_id)
 
     job_root = layout.job_root(pipeline_id, job_id, job_slug)
-    for path, purpose in (
-        (job_root, "job workspace root"),
-        (job_root / "engines", "job engine directory"),
-        (job_root / "logs", "job log directory"),
-        (job_root / "tmp", "job temporary directory"),
-    ):
-        _ensure_directory(path, JOB_MODE, purpose, "runner")
+    _ensure_directory(job_root, JOB_MODE, "job workspace root", "runner")
 
     if environment_file is not None:
         _write_environment_file(environment_file, job_environment)
@@ -334,6 +328,41 @@ def _remove_tree(path: Path, parent: Path, purpose: str) -> None:
             f"{purpose} still exists after cleanup: {path}")
 
 
+def _prune_pipeline_workspaces(environ: Mapping[str, str]) -> None:
+    layout = _storage_layout(environ)
+    if layout.storage_kind != "mr":
+        print(f"Pipeline workspace pruning does not apply to "
+              f"storage kind={layout.storage_kind}")
+        return
+
+    current_pipeline_id = int(_required_decimal(environ, "CI_PIPELINE_ID"))
+    try:
+        layout.workspace_root.lstat()
+    except FileNotFoundError:
+        print(f"No L0 pipeline workspaces to prune beneath "
+              f"{layout.workspace_root}")
+        return
+    _assert_directory(layout.workspace_root, "workspace root")
+
+    candidates: List[Tuple[int, Path]] = []
+    for path in layout.workspace_root.iterdir():
+        match = PIPELINE_DIRECTORY_PATTERN.fullmatch(path.name)
+        if match is None:
+            print(f"Skipping unrecognized L0 workspace entry: {path}",
+                  file=sys.stderr)
+            continue
+        _assert_directory(path, "pipeline workspace")
+        candidates.append((int(match.group(1)), path))
+
+    for pipeline_id, path in candidates:
+        if pipeline_id >= current_pipeline_id:
+            print(f"Preserving current or newer L0 pipeline workspace: "
+                  f"pipeline_id={pipeline_id}")
+            continue
+        _remove_tree(path, layout.workspace_root, "pipeline workspace")
+        print(f"Pruned L0 pipeline workspace: {path}")
+
+
 def _delete_storage(environ: Mapping[str, str]) -> None:
     layout = _storage_layout(environ)
     _assert_directory(layout.scratch_root, "scratch root")
@@ -355,6 +384,7 @@ def _parser() -> argparse.ArgumentParser:
     subparsers.add_parser("prepare-storage")
     prepare_job_parser = subparsers.add_parser("prepare-job")
     prepare_job_parser.add_argument("--environment-file", type=Path)
+    subparsers.add_parser("prune-pipeline-workspaces")
     subparsers.add_parser("delete-storage")
     return parser
 
@@ -367,6 +397,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _prepare_storage(os.environ)
         elif args.operation == "prepare-job":
             _prepare_job(os.environ, args.environment_file)
+        elif args.operation == "prune-pipeline-workspaces":
+            _prune_pipeline_workspaces(os.environ)
         elif args.operation == "delete-storage":
             _delete_storage(os.environ)
         else:

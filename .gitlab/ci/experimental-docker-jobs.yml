@@ -24,6 +24,7 @@ l0_experimental_docker_jedha:
   after_script:
     - bash .gitlab/ci/scripts/experimental_docker_board.sh cleanup || true
     - echo "Pipeline end time:$(date)"
+    - !reference [.cleanup_engine_storage, after_script]
     - !reference [.record_runner_usage, after_script]
   rules:
     - if: $L1 == "true"

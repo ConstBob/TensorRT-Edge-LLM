@@ -32,6 +32,7 @@
         L0_STORAGE_KIND: "stability"
         L0_ENVIRONMENT_NAME: "l0/stability_${CI_PIPELINE_ID}"
         L0_STORAGE_RESOURCE_GROUP: "l0-stability-${CI_PIPELINE_ID}"
+        L0_STORAGE_RETENTION: "2 days"
         L0_ONNX_REUSE: "0"
     - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
       when: never
@@ -44,6 +45,7 @@
         L0_STORAGE_KIND: "mr"
         L0_ENVIRONMENT_NAME: "l0/mr_${CI_MERGE_REQUEST_IID}"
         L0_STORAGE_RESOURCE_GROUP: "l0-mr-${CI_MERGE_REQUEST_IID}"
+        L0_STORAGE_RETENTION: "30 days"
         L0_ONNX_REUSE: "1"
 
 .l1_environment:
@@ -89,6 +91,22 @@
 .l0_ampere_exports:
   variables:
     L0_ONNX_CACHE_RELATIVE_PATH: "checkpoint_export_ampere/onnx"
+
+.cleanup_engine_storage:
+  # Add [retain engines] to the commit message to preserve engine output.
+  after_script:
+    - |
+      set +e
+      if [ -n "${L0_STORAGE_ENV_FILE:-}" ] && [ -f "$L0_STORAGE_ENV_FILE" ]; then
+        . "$L0_STORAGE_ENV_FILE"
+      fi
+      if [ -n "${ENGINE_DIR:-}" ]; then
+        if command -v python3 >/dev/null 2>&1; then
+          python3 "$CI_PROJECT_DIR/.gitlab/ci/scripts/ci_engine_storage.py" || true
+        else
+          echo "WARNING: Cannot apply engine cleanup policy because python3 is unavailable" >&2
+        fi
+      fi
 
 .l0_a30_trtrtx_exports:
   variables:
@@ -365,6 +383,8 @@
   extends:
     - .ci_test_submodules
     - .gitlab_junit_report
+  variables:
+    L0_JOB_WRITES_ENGINES: "1"
   script:
     - echo "Pipeline start time:$(date)"
     - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
@@ -399,6 +419,8 @@
 .nemo_eval_x86_template:
   extends:
     - .ci_test_submodules
+  variables:
+    L0_JOB_WRITES_ENGINES: "1"
   artifacts:
     when: always
     expire_in: 14 days
@@ -480,8 +502,8 @@
   script:
     - echo "Pipeline start time:$(date)"
     - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
-    - mkdir -p $TEST_LOG_DIR $ENGINE_DIR $ONNX_DIR "$CI_PROJECT_DIR/.ci-reports"
-    - rm -rf $TEST_LOG_DIR/* $ENGINE_DIR/* $ONNX_DIR/*
+    - mkdir -p $TEST_LOG_DIR "$CI_PROJECT_DIR/.ci-reports"
+    - rm -rf $TEST_LOG_DIR/*
     - chmod -R 777 $TEST_LOG_DIR
     - echo "Verifying CI image dependencies"
     - python3 --version
@@ -522,6 +544,8 @@
     - .gitlab_junit_report
   variables:
     REMOTE_WORKSPACE: "/home/${BOARD_USER}/tensorrt-edge-llm-${CI_JOB_ID}"
+    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
+    L0_JOB_WRITES_ENGINES: "1"
     CI_APT_INSTALL_TIMEOUT_SECONDS: "1200"
     CI_PIP_INSTALL_TIMEOUT_SECONDS: "2400"
   script:
@@ -535,7 +559,7 @@
     - chmod -R 777 $TEST_LOG_DIR
     - echo "Copying password to device scripts"
     - sed -i -e "s/{BOARDPASSWORD}/${BOARD_PASSWORD_NVKS}/g" .gitlab/ci/scripts/device_init.sh
-    - export ENGINE_DIR=${ENGINE_DIR:-$REMOTE_WORKSPACE/engines}
+    - ': "${ENGINE_DIR:?Device pipeline jobs must define ENGINE_DIR}"'
     - |
       case "$REMOTE_WORKSPACE" in
         /home/$BOARD_USER/tensorrt-edge-llm*) ;;
@@ -568,6 +592,7 @@
   after_script:
     - if [ -f "$L0_STORAGE_ENV_FILE" ]; then . "$L0_STORAGE_ENV_FILE"; fi
     - python3 .gitlab/ci/scripts/device_job_finalize.py || true
+    - !reference [.cleanup_engine_storage, after_script]
     - !reference [.record_runner_usage, after_script]
 
 # Plugin python unit tests on an aarch64 board. Unlike .device_test_template
@@ -609,6 +634,7 @@
   after_script:
     - if [ -f "$L0_STORAGE_ENV_FILE" ]; then . "$L0_STORAGE_ENV_FILE"; fi
     - python3 .gitlab/ci/scripts/device_job_finalize.py --fetch-reports || true
+    - !reference [.cleanup_engine_storage, after_script]
     - !reference [.record_runner_usage, after_script]
 
 .cross_build_template:

@@ -11,10 +11,21 @@ init_l0_storage:
     name: "$L0_ENVIRONMENT_NAME"
     action: start
     on_stop: delete_l0_storage
-    auto_stop_in: 30 days
+    auto_stop_in: "$L0_STORAGE_RETENTION"
   extends:
     - .l0_storage_lifecycle
     - .l0_rules
+
+prune_l0_pipeline_workspaces:
+  stage: setup
+  script:
+    - python3 .gitlab/ci/scripts/ci_storage.py prune-pipeline-workspaces
+  resource_group: "${L0_STORAGE_RESOURCE_GROUP}-prune"
+  extends:
+    - .l0_storage_lifecycle
+    - .l0_rules
+  interruptible: true
+  allow_failure: true
 
 delete_l0_storage:
   stage: setup

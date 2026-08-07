@@ -52,9 +52,8 @@ fi
 bash "$ci_run" "$pip_timeout_seconds" "Install TensorRT Python package" -- pip3 install "$TRT_WHL"
 
 export LLM_SDK_DIR="$REMOTE_WORKSPACE"
-export ONNX_DIR="$REMOTE_WORKSPACE/onnx"
 export LD_LIBRARY_PATH="$TRT_PACKAGE_DIR/lib:${LD_LIBRARY_PATH:-}"
-mkdir -p "$ONNX_DIR" logs
+mkdir -p logs
 
 # test_build_project_with_pybind (l0_python_ut list) builds _edgellm_runtime.
 export PYTHONPATH="$REMOTE_WORKSPACE/build/pybind${PYTHONPATH:+:$PYTHONPATH}"

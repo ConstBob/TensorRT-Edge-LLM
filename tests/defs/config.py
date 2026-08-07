@@ -226,6 +226,7 @@ class TaskType(enum.Enum):
     """Supported task types"""
     EXPORT = "export"
     BUILD = "build"
+    CHECKPOINT_BUILD = "checkpoint_build"
     E2E_BENCH = "e2e_bench"
     INFERENCE = "inference"
     KERNEL_BENCH = "kernel_bench"
@@ -243,7 +244,7 @@ class ParameterSpec:
 
     @staticmethod
     def _effective_task_type(task_type: TaskType) -> TaskType:
-        if task_type == TaskType.VLMEVALKIT:
+        if task_type in (TaskType.CHECKPOINT_BUILD, TaskType.VLMEVALKIT):
             return TaskType.INFERENCE
         return task_type
 
@@ -942,6 +943,8 @@ class TestConfig:
         if validate_environment:
             if task_type == TaskType.EXPORT:
                 env_config.validate_for_export_tests()
+            elif task_type == TaskType.CHECKPOINT_BUILD:
+                env_config.validate_for_checkpoint_builder_tests()
             else:
                 env_config.validate_for_pipeline_tests()
                 if task_type == TaskType.VLMEVALKIT:
@@ -1229,8 +1232,8 @@ class TestConfig:
                      task_type=task_type,
                      llm_precision=llm_precision,
                      lm_head_precision=lm_head_precision,
-                     llm_models_dir=env_config.llm_models_dir
-                     if task_type == TaskType.EXPORT else None,
+                     llm_models_dir=env_config.llm_models_dir if task_type
+                     in (TaskType.EXPORT, TaskType.CHECKPOINT_BUILD) else None,
                      edgellm_data_dir=env_config.edgellm_data_dir,
                      vlmevalkit_data_dir=env_config.vlmevalkit_data_dir,
                      onnx_dir=env_config.onnx_dir,
@@ -1453,7 +1456,8 @@ class TestConfig:
         if self.is_jetspec_tree and not self.is_jetspec:
             raise ValueError("ddtree can only be used with JetSpec tests")
         if ((self.is_dflash_tree or self.is_jetspec_tree)
-                and self.task_type in (TaskType.E2E_BENCH, TaskType.INFERENCE)
+                and self.task_type in (TaskType.CHECKPOINT_BUILD,
+                                       TaskType.E2E_BENCH, TaskType.INFERENCE)
                 and self.eagle_draft_top_k <= 1):
             raise ValueError(
                 "DFlash/JetSpec DDTree runtime tests require edtk > 1; "

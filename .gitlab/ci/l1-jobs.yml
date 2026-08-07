@@ -669,7 +669,7 @@ l1_spark:
     PRIORITY: l1_pipeline_spark
     ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
-    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
+    ENGINE_DIR: "$L1_CACHE_DIR/l1_spark/engines"
     TRT_PACKAGE_DIR: "/usr"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_spark.csv"
   tags:
