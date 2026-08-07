@@ -532,8 +532,7 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
 
     if (contextCacheConfig.enabled)
     {
-        ELLM_CHECK(mActionRunner == nullptr && mAudioRunner == nullptr && mVisionRunner == nullptr,
-            "Context reuse is text-only and cannot be enabled with multimodal or action runners.");
+        ELLM_CHECK(mActionRunner == nullptr, "Context reuse cannot be enabled with action runners.");
         ELLM_CHECK(!mSharedResources->cacheManagers.empty()
                 && mSharedResources->cacheManagers.size() == mSharedResources->kvPageTables.size()
                 && mSharedResources->cacheManagers.size() <= 2,
@@ -918,11 +917,22 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
         setProfilingEnabled(true);
     }
 
+    // Collect valid media placeholder token IDs for content-addressed cache hashing.
+    std::vector<int32_t> mediaTokenIds;
+    if (mDeployment.base.imageTokenId >= 0)
+    {
+        mediaTokenIds.push_back(mDeployment.base.imageTokenId);
+    }
+    if (mDeployment.base.audioTokenId >= 0)
+    {
+        mediaTokenIds.push_back(mDeployment.base.audioTokenId);
+    }
+
     std::optional<ContextCacheRequest> contextCacheRequest;
     if (mContextCache != nullptr)
     {
         std::optional<ContextCacheRequest> admitted
-            = ContextCacheRequest::begin(*mContextCache, request, context, decodingStrategy.kind());
+            = ContextCacheRequest::begin(*mContextCache, request, context, decodingStrategy.kind(), mediaTokenIds);
         if (!admitted.has_value())
         {
             return false;
