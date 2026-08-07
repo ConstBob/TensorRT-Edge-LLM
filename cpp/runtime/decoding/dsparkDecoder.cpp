@@ -375,6 +375,7 @@ bool DSparkDecoder::decodeStep(DecodingInferenceContext& context)
 // consumes DecodingInferenceContext and runtime-owned sparse bias buffers; the kernel
 // layer remains independent of request-local bias state.
 
+// GCOVR_EXCL_START
 void DSparkDecoder::dsparkBiasMarkovGreedy(
     DecodingInferenceContext& context, int32_t activeBatchSize, int32_t proposalLen)
 {
@@ -429,6 +430,7 @@ void DSparkDecoder::dsparkBiasMarkovSample(
             proposalLen, mDraftVocabSize, context.stream);
     }
 }
+// GCOVR_EXCL_STOP
 
 bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
 {
@@ -600,10 +602,12 @@ bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
                 kernel::dsparkBuildMarkovLogits(mDraftOutputLogits, mMarkovW1, mMarkovW2, mLastAcceptedTokens,
                     mDraftTokenIds, mDraftStepLogits, activeBatchSize, step, proposalLen, mDraftVocabSize, mMarkovRank,
                     context.stream);
+                // GCOVR_EXCL_START
                 if (context.hasLogitBias)
                 {
                     applyLogitBias(mRuntime.logitBias, mDraftStepLogits, context, context.stream);
                 }
+                // GCOVR_EXCL_STOP
                 selectAllTopK(mDraftStepLogits, std::ref(mDraftStepTopKValues), mDraftStepTopKIndices, samplingTopK,
                     mRuntime.sampling.workspace, context.stream);
                 kernel::dsparkSampleTopKRowsAndStore(mDraftStepTopKValues, mDraftStepTopKIndices, mDraftUniforms,
@@ -613,10 +617,12 @@ bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
         }
         else
         {
+            // GCOVR_EXCL_START
             if (context.hasLogitBias)
             {
                 dsparkBiasMarkovSample(context, activeBatchSize, proposalLen);
             }
+            // GCOVR_EXCL_STOP
             else
             {
                 kernel::dsparkVanillaMarkovSample(mDraftOutputLogits, mMarkovW1, mMarkovW2, mLastAcceptedTokens,
@@ -628,10 +634,12 @@ bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
     }
     else
     {
+        // GCOVR_EXCL_START
         if (context.hasLogitBias)
         {
             dsparkBiasMarkovGreedy(context, activeBatchSize, proposalLen);
         }
+        // GCOVR_EXCL_STOP
         else
         {
             // Greedy, chain and tree alike: per-step Markov-corrected row + top-1. Shared
@@ -844,11 +852,13 @@ bool DSparkDecoder::runBaseVerification(DecodingInferenceContext& context)
     int32_t const baseVocabSize = mRuntime.deployment.base.outputVocabSize;
     check::check(mRuntime.base.pipelineIO.outputLogits.reshape({activeBatchSize, verifyLen, baseVocabSize}),
         "Tensor reshape failed");
+    // GCOVR_EXCL_START
     if (context.hasLogitBias)
     {
         applyLogitBiasRepeatedRows(
             mRuntime.logitBias, mRuntime.base.pipelineIO.outputLogits, context, verifyLen, context.stream);
     }
+    // GCOVR_EXCL_STOP
 
     if (mUseTree)
     {

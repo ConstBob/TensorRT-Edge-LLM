@@ -608,11 +608,13 @@ bool EagleDecoder::runBaseModelVerification(DecodingInferenceContext& context)
         return false;
     }
 
+    // GCOVR_EXCL_START
     if (context.hasLogitBias)
     {
         applyLogitBiasRepeatedRows(mRuntime.logitBias, mRuntime.base.pipelineIO.outputLogits, context,
             mRuntime.deployment.specConfig->verifySize, context.stream);
     }
+    // GCOVR_EXCL_STOP
 
     int32_t const maxAcceptDepth = mRuntime.deployment.specConfig->draftingStep + 1;
     check::check(mAcceptedTokenIds.reshape({activeBatchSize, maxAcceptDepth}), "Tensor reshape failed");

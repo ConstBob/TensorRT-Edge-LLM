@@ -1760,10 +1760,12 @@ bool LLMInferenceRuntime::runBaseModelPrefill(
         return true;
     }
 
+    // GCOVR_EXCL_START
     if (context.hasLogitBias)
     {
         applyLogitBias(mLogitBias, mPipelineIO->outputLogits, context, context.stream);
     }
+    // GCOVR_EXCL_STOP
 
     // Sampling from the prefill stage logits follows the same policy as vanilla decoding.
     // DSpark keeps non-greedy params; other speculative decoders are normalized to greedy

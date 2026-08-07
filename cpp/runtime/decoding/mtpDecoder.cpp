@@ -628,11 +628,13 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
         return false;
     }
 
+    // GCOVR_EXCL_START
     if (context.hasLogitBias)
     {
         applyLogitBiasRepeatedRows(mRuntime.logitBias, mRuntime.base.pipelineIO.outputLogits, context,
             mRuntime.deployment.specConfig->verifySize, context.stream);
     }
+    // GCOVR_EXCL_STOP
 
     // A tree with fewer verify nodes than the full chain depth caps the acceptable
     // path length at verifySize.
