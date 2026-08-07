@@ -97,17 +97,6 @@ TEST(LogitBiasPolicyTest, DetectsBiasInAnyRequestSlot)
     EXPECT_FALSE(rt::hasLogitBias(rt::LLMGenerationRequest{}));
 }
 
-TEST(LogitBiasPolicyTest, RejectsOnlyWhenSpecDecodeIsSelected)
-{
-    auto request = makeRequest({{}, {{17, 1.0F}}});
-
-    EXPECT_FALSE(rt::shouldRejectLogitBiasWithSpecDecode(request, false));
-    EXPECT_TRUE(rt::shouldRejectLogitBiasWithSpecDecode(request, true));
-
-    request.requests[1].logitBias.clear();
-    EXPECT_FALSE(rt::shouldRejectLogitBiasWithSpecDecode(request, true));
-}
-
 TEST_F(LogitBiasTest, EmptySlotsClearPriorUploadAndAreANoop)
 {
     auto context = makeContext(2, mStream);
@@ -168,6 +157,43 @@ TEST_F(LogitBiasTest, AppliesFullVocabBiasesAcrossMixedSlotsAndReusesUpload)
     CUDA_CHECK(cudaStreamSynchronize(mStream));
     EXPECT_FALSE(context.logitBiasGpuDirty);
     expectDeviceFloats(decodeLogits, expected);
+}
+
+TEST_F(LogitBiasTest, AppliesBiasToEverySpecVerificationRowPerSlot)
+{
+    // Two slots, one with a bias on row 0, the other with biases on rows 1 and 2.
+    auto request = makeRequest({{{1, 2.0F}}, {{0, -1.0F}, {3, 4.0F}}});
+    auto context = makeContext(2, mStream);
+    rt::prepareLogitBias(mLogitBias, request, context);
+
+    constexpr int32_t kROWS_PER_SLOT = 3;
+    rt::Tensor logits({2, kROWS_PER_SLOT, 4}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "specRowsLogits");
+    copyHostToDevice<float>(logits, std::vector<float>(24, 0.0F));
+
+    rt::applyLogitBiasRepeatedRows(mLogitBias, logits, context, kROWS_PER_SLOT, mStream);
+    CUDA_CHECK(cudaStreamSynchronize(mStream));
+
+    // clang-format off
+    std::vector<float> const expected{
+        // slot 0, verify row 0
+        0.0F, 2.0F, 0.0F, 0.0F,
+        // slot 0, verify row 1
+        0.0F, 2.0F, 0.0F, 0.0F,
+        // slot 0, verify row 2
+        0.0F, 2.0F, 0.0F, 0.0F,
+        // slot 1, verify row 0
+        -1.0F, 0.0F, 0.0F, 4.0F,
+        // slot 1, verify row 1
+        -1.0F, 0.0F, 0.0F, 4.0F,
+        // slot 1, verify row 2
+        -1.0F, 0.0F, 0.0F, 4.0F,
+    };
+    // clang-format on
+    EXPECT_EQ(logits.getShape().getNumDims(), 3);
+    EXPECT_EQ(logits.getShape()[0], 2);
+    EXPECT_EQ(logits.getShape()[1], kROWS_PER_SLOT);
+    EXPECT_EQ(logits.getShape()[2], 4);
+    expectDeviceFloats(logits, expected);
 }
 
 TEST_F(LogitBiasTest, MapsFullVocabIdsIntoReducedVocabAndSkipsMissingTokens)

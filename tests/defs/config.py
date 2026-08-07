@@ -2344,6 +2344,8 @@ class TestConfig:
             # Add test case mappings here, for example:
             "llm_basic":
             "tests/test_cases/llm_basic.json",
+            "llm_logit_bias":
+            "tests/test_cases/llm_logit_bias.json",
             "llm_lora":
             "tests/test_cases/llm_lora.json",
             "llm_context_reuse":

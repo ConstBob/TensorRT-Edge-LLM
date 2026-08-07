@@ -15,12 +15,12 @@
 """Tests for OpenAI-compatible logit_bias request validation."""
 
 import math
+from types import SimpleNamespace
 
 import pytest
 
 from experimental.server.engine import (_MAX_LOGIT_BIAS_TOKENS, LLM,
-                                        SamplingParams, _normalize_logit_bias,
-                                        _validate_logit_bias_spec_decode)
+                                        SamplingParams, _normalize_logit_bias)
 
 _INT32_MAX = 2**31 - 1
 
@@ -71,60 +71,82 @@ def test_normalize_logit_bias_rejects_invalid_bias_values(bias):
         _normalize_logit_bias({"1": bias})
 
 
-@pytest.mark.parametrize(
-    "logit_bias,disable_spec_decode,has_draft_model",
-    [
-        ({
-            1: 1.0
-        }, False, False),
-        ({
-            1: 1.0
-        }, True, True),
-        ({}, False, True),
-    ],
-)
-def test_validate_logit_bias_spec_decode_accepts_compatible_states(
-        logit_bias, disable_spec_decode, has_draft_model):
-    _validate_logit_bias_spec_decode(
-        logit_bias,
-        disable_spec_decode=disable_spec_decode,
-        has_draft_model=has_draft_model,
-    )
+def test_hlapi_generate_accepts_logit_bias_with_active_spec_decode():
+
+    class FakeAdmission:
+
+        @staticmethod
+        def __enter__():
+            return None
+
+        @staticmethod
+        def __exit__(*args):
+            return False
+
+    llm = object.__new__(LLM)
+    llm._rt = object()
+    llm._runtime = SimpleNamespace(has_draft_model=lambda: True)
+    llm._admission = lambda: FakeAdmission()
+    llm._make_generation_request = lambda *args, **kwargs: object()
+    llm._handle_request = lambda request: SimpleNamespace(
+        output_texts=[""], output_ids=[[]], finish_reasons=[], logprobs=[])
+
+    outputs = llm.generate("hello", SamplingParams(logit_bias={1: 1.0}))
+
+    assert len(outputs) == 1
 
 
-def test_validate_logit_bias_spec_decode_rejects_active_spec_decode():
-    with pytest.raises(ValueError, match="disable_spec_decode"):
-        _validate_logit_bias_spec_decode(
-            {1: 1.0},
-            disable_spec_decode=False,
-            has_draft_model=True,
-        )
+@pytest.mark.parametrize("stream", [False, True])
+def test_api_accepts_logit_bias_with_active_spec_decode(stream):
+    TestClient = pytest.importorskip("fastapi.testclient").TestClient
 
-
-def test_hlapi_generate_rejects_logit_bias_with_active_spec_decode():
+    from experimental.server.api_server import _create_app
 
     class FakeRuntime:
 
         @staticmethod
-        def has_draft_model():
+        def handle_request(_request):
+
+            class Response:
+                output_texts = [""]
+                output_ids = [[]]
+                finish_reasons = []
+                logprobs = []
+
+            return Response()
+
+    class FakeAdmission:
+
+        @staticmethod
+        def acquire(blocking=True):
             return True
 
-    llm = object.__new__(LLM)
-    llm._runtime = FakeRuntime()
-
-    with pytest.raises(ValueError, match="disable_spec_decode"):
-        llm.generate("hello", SamplingParams(logit_bias={1: 1.0}))
-
-
-@pytest.mark.parametrize("stream", [False, True])
-def test_api_rejects_logit_bias_with_active_spec_decode(stream):
-    from fastapi.testclient import TestClient
-
-    from experimental.server.api_server import _create_app
+        @staticmethod
+        def release():
+            pass
 
     class FakeLLM:
         _model_id = "test-model"
         has_draft_model = True
+        model_dir = ""
+        _rt = object()
+        _runtime = FakeRuntime()
+
+        @staticmethod
+        def _admission():
+            return FakeAdmission()
+
+        @staticmethod
+        def _make_generation_request(*args, **kwargs):
+            return object()
+
+        @staticmethod
+        def count_prompt_tokens(*args, **kwargs):
+            return 1
+
+        @staticmethod
+        def generate_stream(*args, **kwargs):
+            return iter(())
 
     response = TestClient(_create_app(FakeLLM())).post(
         "/v1/chat/completions",
@@ -140,13 +162,12 @@ def test_api_rejects_logit_bias_with_active_spec_decode(stream):
         },
     )
 
-    assert response.status_code == 400
-    assert "disable_spec_decode" in response.json()["error"]
+    assert response.status_code == 200
 
 
 @pytest.mark.parametrize("stream", [False, True])
 def test_api_rejects_overflowing_logit_bias(stream):
-    from fastapi.testclient import TestClient
+    TestClient = pytest.importorskip("fastapi.testclient").TestClient
 
     from experimental.server.api_server import _create_app
 

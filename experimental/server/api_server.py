@@ -56,8 +56,7 @@ from . import anthropic_compat as _anthropic
 from .audio_preprocess import MAX_AUDIO_UPLOAD_BYTES
 from .batching import BatcherOverflow, RequestBatcher, resolve_batch_size
 from .engine import (OMNI_AUDIO_SAMPLE_RATE, AudioParams, SamplingParams,
-                     _normalize_logit_bias, _validate_logit_bias_spec_decode,
-                     finish_reason_name)
+                     _normalize_logit_bias, finish_reason_name)
 from .tool_calling import (ToolConfig, parse_assistant_output,
                            validate_tool_request)
 from .video_sampling import MAX_SOURCE_BYTES as MAX_VIDEO_SOURCE_BYTES
@@ -955,11 +954,6 @@ def _create_app(llm_instance,
         tool_choice = body.get("tool_choice")
         try:
             logit_bias = _normalize_logit_bias(body.get("logit_bias"))
-            _validate_logit_bias_spec_decode(
-                logit_bias,
-                disable_spec_decode=disable_spec_decode,
-                has_draft_model=llm_instance.has_draft_model,
-            )
         except ValueError as exc:
             return JSONResponse(status_code=400, content={"error": str(exc)})
 

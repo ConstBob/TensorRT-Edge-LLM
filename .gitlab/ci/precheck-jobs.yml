@@ -37,6 +37,7 @@ pre_commit_checks:
   variables:
     CUDA_VERSION: "12.9"
     PRE_COMMIT_HOME: "$CI_PROJECT_DIR/.cache/pre-commit"
+    CI_APT_UPDATE_TIMEOUT_SECONDS: "600"
   tags:
     - cpu-k8s
   cache:

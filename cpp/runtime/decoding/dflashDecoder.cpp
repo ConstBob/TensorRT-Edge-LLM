@@ -35,6 +35,7 @@
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/decoding/decoderUtils.h"
 #include "runtime/decoding/dflashDecodeUtils.h"
+#include "runtime/decoding/logitBias.h"
 #include "sampler/sampling.h"
 
 #include <algorithm>
@@ -595,6 +596,13 @@ bool DFlashDecoder::runBaseVerification(DecodingInferenceContext& context)
     check::check(mRuntime.base.pipelineIO.outputLogits.reshape(
                      {activeBatchSize * verifySize, mRuntime.deployment.base.outputVocabSize}),
         "Tensor reshape failed");
+    // GCOVR_EXCL_START
+    if (context.hasLogitBias)
+    {
+        applyLogitBiasRepeatedRows(
+            mRuntime.logitBias, mRuntime.base.pipelineIO.outputLogits, context, verifySize, context.stream);
+    }
+    // GCOVR_EXCL_STOP
 
     Tensor const& acceptTokenIds = useDDTree() ? mTreeTokenIds : mVerifyTokenIds;
     // DFlash reuses the EAGLE accept utility for both linear-tree and branching-tree verification:

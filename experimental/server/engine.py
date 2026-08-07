@@ -62,10 +62,6 @@ _DEFAULT_MAX_INPUT_LEN = 4096
 _DEFAULT_MAX_BATCH_SIZE = 1
 _DEFAULT_MAX_KV_CACHE_CAPACITY = 8192
 
-_LOGIT_BIAS_SPEC_DECODE_ERROR = (
-    "logit_bias is not supported while speculative decoding is enabled; "
-    "set disable_spec_decode=true or use a vanilla engine")
-
 
 def _exporter_model_types():
     """Visual/audio classification read from the exporter, so the server cannot
@@ -521,14 +517,6 @@ def _normalize_logit_bias(
                 f"[{_MIN_LOGIT_BIAS}, {_MAX_LOGIT_BIAS}], got {bias_value}")
         normalized[token_id] = bias_value
     return normalized
-
-
-def _validate_logit_bias_spec_decode(logit_bias: Dict[int, float], *,
-                                     disable_spec_decode: bool,
-                                     has_draft_model: bool) -> None:
-    """Reject logit bias unless speculative decoding is absent or explicitly disabled."""
-    if logit_bias and has_draft_model and not disable_spec_decode:
-        raise ValueError(_LOGIT_BIAS_SPEC_DECODE_ERROR)
 
 
 def _engine_config_value(builder_config: dict, field_name: str,
@@ -1346,11 +1334,6 @@ class LLM:
         stream_channel: Optional[Any] = None,
     ):
         normalized_logit_bias = _normalize_logit_bias(params.logit_bias)
-        _validate_logit_bias_spec_decode(
-            normalized_logit_bias,
-            disable_spec_decode=params.disable_spec_decode,
-            has_draft_model=self.has_draft_model,
-        )
 
         tool_config = tool_config or validate_tool_request(
             messages, tools, tool_choice)
