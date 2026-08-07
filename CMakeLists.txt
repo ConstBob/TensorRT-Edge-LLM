@@ -128,6 +128,8 @@ set(CUDA_INCLUDE_DIR ${CUDA_RUNTIME_API_INCLUDE_DIR}
 
 set(CUDA_USE_STATIC_CUDA_RUNTIME OFF)
 
+include(${CMAKE_SOURCE_DIR}/cmake/FindNVRTC.cmake)
+
 # NVTX profiling support option (default: OFF)
 option(ENABLE_NVTX_PROFILING "Enable NVTX profiling support" OFF)
 
@@ -239,9 +241,18 @@ if(BUILD_UNIT_TESTS)
   endif()
   # Resource-registration tests resolve the plugin's exported lifecycle ABI.
   add_dependencies(unitTest NvInfer_edgellm_plugin)
+  # edgellmXqaJit is not part of edgellmCore: the XQA JIT lives in the plugin.
+  # unitTest links it explicitly because xqaJitTestUtils.cpp JITs kernels
+  # directly for the decoder-runner tests.
   target_link_libraries(
-    unitTest PRIVATE gtest gtest_main edgellmCore commonLibraryExt exampleUtils
-                     ${CUDA_DRIVER_LINK_LIB})
+    unitTest
+    PRIVATE gtest
+            gtest_main
+            edgellmCore
+            edgellmXqaJit
+            commonLibraryExt
+            exampleUtils
+            ${CUDA_DRIVER_LINK_LIB})
   include(${CMAKE_SOURCE_DIR}/cmake/CuteDsl.cmake)
   cute_dsl_setup(LINK_TARGETS unitTest)
   add_cross_build_link_options(unitTest)

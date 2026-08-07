@@ -17,8 +17,11 @@
 
 #pragma once
 
+#include "kernels/decodeAttentionKernels/decoderXQAJitCompiler.h"
+
 #include <NvInferRuntime.h>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <optional>
 #include <string>
@@ -115,6 +118,20 @@ public:
 
     void setPluginNamespace(char const* pluginNamespace) noexcept;
 
+    //! \brief NVRTC-compile the XQA decode kernels this layer needs and stage them for serialization.
+    //! \note No-op when the configuration has no XQA decode kernel; the layer may still be
+    //!       served by a prefill-only backend.
+    void compileXQAJitKernelForBuild();
+
+    //! \brief Register every serialized XQA kernel under the key it was compiled for.
+    void loadSerializedXQAJitKernel();
+
+    //! \brief Whether the engine carried any serialized XQA JIT kernel for this layer.
+    bool hasSerializedXQAJitKernels() const noexcept
+    {
+        return !mXqaJitKernels.empty();
+    }
+
 private:
     //! Produce split K/V FP16 for independent prefill consumers that cannot read the paged pool directly
     //! (FMHA-v2 FP8, padding, and vision-block). Always device-gathers the page table into
@@ -151,6 +168,9 @@ private:
         nvinfer1::PluginTensorDesc const* inputDesc, void const* const* inputs, int32_t inputIdx) const;
 
 protected:
+    trt_edgellm::XQAJitKey getXQAJitKey() const noexcept;
+    bool canCompileXQAJitKernel() const noexcept;
+
     std::string mLayerName; //!< Plugin layer name
     std::string mNamespace; //!< Plugin namespace
 
@@ -200,6 +220,13 @@ protected:
 
     ContextFMHABackend mContextFMHABackend{ContextFMHABackend::kNONE};
 
+    //! NVRTC-compiled XQA decode kernels, each paired with the key it was compiled for.
+    //! One entry for a plain decode layer, two when tree attention also needs a spec-decode kernel.
+    std::vector<trt_edgellm::XQAJitKernel> mXqaJitKernels;
+    //! Serialized form of mXqaJitKernels. Held as a member because getFieldsToSerialize
+    //! hands TensorRT a pointer into it.
+    std::vector<uint8_t> mXqaJitBlob;
+
     //! Whether FMHA context kernels are available for this configuration.
     bool mCanImplementFMHA{true};
 
@@ -212,9 +239,6 @@ protected:
     //! Whether the selected CuTe DSL backend supports a dense PADDING context
     //! kernel for runtime-selected non-causal DiffusionGemma denoise attention.
     bool mCanImplementPaddingFMHA{false};
-
-    //! Whether XQA decode kernels are available.
-    bool mCanImplementXQA{false};
 
     std::vector<nvinfer1::PluginField> mDataToSerialize;
     nvinfer1::PluginFieldCollection mFCToSerialize{};

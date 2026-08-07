@@ -47,6 +47,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -61,6 +62,8 @@ namespace
 {
 constexpr char const* kATTENTION_PLUGIN_VERSION{"1"};
 constexpr char const* kATTENTION_PLUGIN_NAME{"AttentionPlugin"};
+//! Self-describing blob of (XQAJitKey, cubin) pairs; see serializeXQAJitKernels.
+constexpr char const* kXQA_JIT_KERNELS_FIELD{"xqa_jit_kernels"};
 
 // Select KV cache storage datatype based on FP8 enablement
 static inline DataType selectKvCacheDataType(bool enableFp8KVCache)
@@ -301,6 +304,22 @@ bool canImplementPaddingFMHA(ContextFMHABackend backend, int32_t numQHeads, int3
     return false;
 }
 
+std::vector<uint8_t> parsePluginBytesField(char const* fieldName, PluginFieldCollection const* fc)
+{
+    for (int32_t i = 0; i < fc->nbFields; ++i)
+    {
+        if (std::string(fieldName) == fc->fields[i].name && fc->fields[i].length > 0)
+        {
+            ELLM_CHECK(fc->fields[i].type == PluginFieldType::kCHAR,
+                std::string(fieldName) + " must use PluginFieldType::kCHAR.");
+            ELLM_CHECK(fc->fields[i].data != nullptr, std::string(fieldName) + " data must not be null.");
+            auto const* data = static_cast<uint8_t const*>(fc->fields[i].data);
+            return std::vector<uint8_t>(data, data + fc->fields[i].length);
+        }
+    }
+    return {};
+}
+
 // Workspace layout (cumulative, worst-case across all execution paths):
 //
 //   Slot  | Shape                            | Type  | Used by
@@ -442,11 +461,12 @@ bool AttentionPlugin::canUseCuteDslBidirectionalForPrefill() const noexcept
 
 void AttentionPlugin::enforceVisionBlockKernelSupport() const
 {
+    bool const canImplementXQA = canCompileXQAJitKernel();
     ELLM_CHECK(mUseFMHAV2VisionBlockFMHA || canUseCuteDslBidirectionalForPrefill(),
         "AttentionPlugin: vision-block prefill requires a supported FMHA-v2 or paged CuTe DSL "
         "bidirectional kernel for headSize="
             + std::to_string(mHeadSize) + " on SM" + std::to_string(mSMVersion) + "; none is available.");
-    ELLM_CHECK(mCanImplementXQA,
+    ELLM_CHECK(canImplementXQA,
         "AttentionPlugin: vision-block decode requires XQA decode kernels for Hq=" + std::to_string(mNumQHeads)
             + ", Hkv=" + std::to_string(mNumKVHeads) + ", headSize=" + std::to_string(mHeadSize) + " on SM"
             + std::to_string(mSMVersion) + ", which are not available.");
@@ -502,16 +522,6 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
         && mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL && mCanImplementFMHA;
 #endif
 
-    // XQA decode kernels are needed for decode path when available. Decode always reads the paged
-    // pool (identity page table while cross-request reuse is off), so load the paged KV cache kernels.
-    bool const useSpecDecode = true;
-    mCanImplementXQA = DecoderXQARunner::canImplement(mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType,
-        selectKvCacheDataType(mEnableFp8KVCache), /*usePagedKVCache=*/true);
-    if (mCanImplementXQA)
-    {
-        DecoderXQARunner::loadDecodeXQAKernels(
-            mSMVersion, mDataType, selectKvCacheDataType(mEnableFp8KVCache), useSpecDecode, /*usePagedKVCache=*/true);
-    }
     ELLM_CHECK(!(mHeadSize == 512 && mSlidingWindowSize > 0 && !mEnableVisionBlockAttention) || mCanImplementFMHA,
         "D512 sliding-window prefill requires the CuTe DSL paged FMHA kernel.");
 
@@ -544,13 +554,14 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
             canUseCuteDslBidirectionalForPrefill() ? "paged CuTe DSL d512 bidirectional mask"
                                                    : "FMHA-v2 CuTe DSL vision-block");
     }
-    else if (!mCanImplementFMHA && !mCanImplementXQA)
+    bool const canImplementXQA = canCompileXQAJitKernel();
+    if (!mEnableVisionBlockAttention && !mCanImplementFMHA && !canImplementXQA)
     {
         LOG_ERROR("Cannot implement AttentionPlugin configuration. SM: %d, HeadSize: %d, NumQHeads: %d, NumKVHeads: %d",
             mSMVersion, mHeadSize, mNumQHeads, mNumKVHeads);
         throw std::runtime_error("Cannot implement the AttentionPlugin configuration.");
     }
-    else if (!mCanImplementFMHA)
+    else if (!mEnableVisionBlockAttention && !mCanImplementFMHA)
     {
         LOG_WARNING("AttentionPlugin: no prefill kernel for headSize=%d; only decode (XQA) is supported.", mHeadSize);
     }
@@ -578,6 +589,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
     ELLM_CHECK(!(mEnableQKNorm && mEnableKVShared),
         "enable_qk_norm with a shared-KV (Q-only) layer is not supported: the Q-only path has "
         "no fused-norm kernel.");
+
     ELLM_CHECK(!(mEnableTreeAttention && mEnableVisionBlockAttention),
         "Tree attention and vision block attention are mutually exclusive.");
     ELLM_CHECK(!mEnableVisionBlockAttention || selectKvCacheDataType(mEnableFp8KVCache) == DataType::kHALF,
@@ -592,6 +604,11 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
             mQkvScales.assign(data, data + fc->fields[i].length);
             break;
         }
+    }
+    mXqaJitBlob = parsePluginBytesField(kXQA_JIT_KERNELS_FIELD, fc);
+    if (!mXqaJitBlob.empty())
+    {
+        mXqaJitKernels = deserializeXQAJitKernels(mXqaJitBlob.data(), mXqaJitBlob.size());
     }
 
     // The q/k gamma weights are not plugin fields — they arrive as optional engine-weight
@@ -633,14 +650,6 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
         && mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL && mCanImplementFMHA;
 #endif
 
-    // XQA decode kernels. Decode always reads the paged pool, so load the paged KV cache kernels.
-    mCanImplementXQA = DecoderXQARunner::canImplement(mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType,
-        selectKvCacheDataType(mEnableFp8KVCache), /*usePagedKVCache=*/true);
-    if (mCanImplementXQA)
-    {
-        DecoderXQARunner::loadDecodeXQAKernels(mSMVersion, mDataType, selectKvCacheDataType(mEnableFp8KVCache),
-            /*useSpecDecodeKernels=*/true, /*usePagedKVCache=*/true);
-    }
     ELLM_CHECK(!(mHeadSize == 512 && mSlidingWindowSize > 0 && !mEnableVisionBlockAttention) || mCanImplementFMHA,
         "D512 sliding-window prefill requires the CuTe DSL paged FMHA kernel.");
 
@@ -660,6 +669,85 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
 }
 
 AttentionPlugin::~AttentionPlugin() = default;
+
+XQAJitKey AttentionPlugin::getXQAJitKey() const noexcept
+{
+    XQAJitKey key{};
+    key.sm = mSMVersion;
+    key.dataType = mDataType;
+    key.kvDataType = selectKvCacheDataType(mEnableFp8KVCache);
+    key.headSize = mHeadSize;
+    key.qHeadsPerKv = mNumKVHeads > 0 ? mNumQHeads / mNumKVHeads : 0;
+    key.tokensPerPage = rt::kTOKENS_PER_PAGE;
+    key.slidingWindow = mSlidingWindowSize > 0;
+    key.specDecode = static_cast<bool>(mEnableTreeAttention);
+    return key;
+}
+
+bool AttentionPlugin::canCompileXQAJitKernel() const noexcept
+{
+    return canCompileXQAKernel(
+        mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType, selectKvCacheDataType(mEnableFp8KVCache));
+}
+
+void AttentionPlugin::compileXQAJitKernelForBuild()
+{
+    // A layer with no XQA decode kernel is not fatal on its own: the prefill
+    // path may still be served by FMHA, and the constructor already rejects
+    // the case where no backend at all can implement the layer.
+    if (!canCompileXQAJitKernel())
+    {
+        LOG_INFO("AttentionPlugin: no XQA decode kernel for Hq=%d, Hkv=%d, headSize=%d on SM%d; skipping XQA JIT.",
+            mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion);
+        return;
+    }
+
+    auto compileAndLoad = [](XQAJitKey const& jitKey) -> std::vector<uint8_t> {
+        XQAJitResult result = compileXQAKernel(jitKey);
+        ELLM_CHECK(!result.cubin.empty(), "NVRTC returned an empty XQA cubin.");
+        bool const loaded
+            = DecoderXQARunner::loadDecodeXQAKernelFromCubin(jitKey, result.cubin.data(), result.cubin.size());
+        ELLM_CHECK(loaded, "Failed to load the NVRTC-compiled XQA kernel.");
+        return std::move(result.cubin);
+    };
+
+    XQAJitKey const key = getXQAJitKey();
+    mXqaJitKernels.clear();
+
+    // Vanilla decode is always needed: tree-attention engines still execute it
+    // for single-token steps and fallback requests.
+    XQAJitKey vanillaKey = key;
+    vanillaKey.specDecode = false;
+    mXqaJitKernels.push_back({vanillaKey, compileAndLoad(vanillaKey)});
+
+    // Only tree-attention engines need a second, distinct spec-decode kernel.
+    // Emitting one entry per distinct key (rather than a fixed pair of slots)
+    // is what keeps a non-tree layer from serializing the same cubin twice.
+    if (key.specDecode)
+    {
+        mXqaJitKernels.push_back({key, compileAndLoad(key)});
+    }
+
+    mXqaJitBlob = serializeXQAJitKernels(mXqaJitKernels);
+}
+
+void AttentionPlugin::loadSerializedXQAJitKernel()
+{
+    ELLM_CHECK(!mXqaJitKernels.empty(), "Serialized XQA JIT kernel field is empty.");
+
+    for (XQAJitKernel const& kernel : mXqaJitKernels)
+    {
+        ELLM_CHECK(kernel.key.sm == mSMVersion,
+            format::fmtstr(
+                "Serialized XQA JIT cubin targets SM%d, but runtime GPU is SM%d.", kernel.key.sm, mSMVersion));
+        // Register under the key the kernel was compiled for, which travels in
+        // the blob. Recomputing it from live plugin fields would silently bind
+        // the cubin to the wrong slot if any contributing field changed.
+        bool const loaded
+            = DecoderXQARunner::loadDecodeXQAKernelFromCubin(kernel.key, kernel.cubin.data(), kernel.cubin.size());
+        ELLM_CHECK(loaded, "Failed to load serialized XQA JIT cubin.");
+    }
+}
 
 // ---------------------------------------------------------------------------
 // IPluginV3
@@ -696,15 +784,23 @@ IPluginV3* AttentionPlugin::clone() noexcept
         // a memberwise copy (protected `AttentionPlugin(AttentionPlugin const&) =
         // default` + clear the serialization scratch), which clones future fields
         // by construction.
-        auto* p = new AttentionPlugin(mLayerName, mNumQHeads, mNumKVHeads, mHeadSize, mEnableTreeAttention,
+        auto p = std::make_unique<AttentionPlugin>(mLayerName, mNumQHeads, mNumKVHeads, mHeadSize, mEnableTreeAttention,
             mEnableFp8KVCache, mEnableVisionBlockAttention, mEnableContextMaskSelector, mSlidingWindowSize, mQkvScales,
             mAttentionScale);
         p->mEnableQKNorm = mEnableQKNorm;
         p->mEnableKVShared = mEnableKVShared;
         p->mRmsNormEps = mRmsNormEps;
         p->mSkipSoftmaxScaleFactor = mSkipSoftmaxScaleFactor;
+        p->mXqaJitKernels = mXqaJitKernels;
+        p->mXqaJitBlob = mXqaJitBlob;
+        if (!p->mXqaJitKernels.empty())
+        {
+            // Registration is keyed and idempotent, so re-running it on a clone
+            // of an already-registered plugin is a cache hit, not a reload.
+            p->loadSerializedXQAJitKernel();
+        }
         p->setPluginNamespace(mNamespace.c_str());
-        return p;
+        return p.release();
     }
     catch (...)
     {
@@ -1064,13 +1160,10 @@ size_t AttentionPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, 
 
 int32_t AttentionPlugin::getAliasedInput(int32_t outputIndex) noexcept
 {
-    // WAR:this is not the correct plugin API usage. The
-    // plugin updates the KV cache in place, so the correct return is
-    // kIN_KV_CACHE_IDX (output kOUT_KV_CACHE_IDX aliases that input). We return -1
-    // to drop the alias because declaring it makes Myelin keep a redundant
-    // per-layer KV copy (the perf regression). In-place read-write still works
-    // because the runtime binds past and present KV to the same address. TODO:
-    // restore the alias declaration once the Myelin issue is fixed.
+    if (outputIndex == kOUT_KV_CACHE_IDX)
+    {
+        return kIN_KV_CACHE_IDX;
+    }
     return -1;
 }
 
@@ -1271,7 +1364,6 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
     }
     bool const useExplicitPositionIds = mEnableTreeAttention && !attentionPosIdTensor.isEmpty()
         && attentionPosIdTensor.getShape().getNumDims() == 2 && attentionPosIdTensor.getShape()[1] == runtimeSeqLen;
-
     float const kScale = mQkvScales[1];
     float const vScale = mQkvScales[2];
 
@@ -1946,6 +2038,8 @@ PluginFieldCollection const* AttentionPlugin::getFieldsToSerialize() noexcept
     // Serialize the RMSNorm eps for the fused qk_norm path. The gamma WEIGHTS live as
     // engine-weight constant inputs (baked at build time), not plugin fields.
     mDataToSerialize.emplace_back("rms_norm_eps", &mRmsNormEps, PluginFieldType::kFLOAT32, 1);
+    mDataToSerialize.emplace_back(kXQA_JIT_KERNELS_FIELD, mXqaJitBlob.empty() ? nullptr : mXqaJitBlob.data(),
+        PluginFieldType::kCHAR, static_cast<int32_t>(mXqaJitBlob.size()));
     mFCToSerialize.nbFields = static_cast<int32_t>(mDataToSerialize.size());
     mFCToSerialize.fields = mDataToSerialize.data();
     return &mFCToSerialize;
@@ -1983,6 +2077,7 @@ AttentionPluginCreator::AttentionPluginCreator()
     // Optional per-head RMSNorm gamma weights (length == head_size) and eps. Empty / missing ->
     // qk_norm disabled. When supplied, the plugin fuses RMSNorm into the RoPE+KVWrite kernel.
     mPluginAttributes.emplace_back(PluginField("rms_norm_eps", nullptr, PluginFieldType::kFLOAT32, 1));
+    mPluginAttributes.emplace_back(PluginField(kXQA_JIT_KERNELS_FIELD, nullptr, PluginFieldType::kCHAR, 0));
     // Enforce Core parameters are specified.
     mFieldCollection.nbFields = mPluginAttributes.size();
     mFieldCollection.fields = mPluginAttributes.data();
@@ -2014,13 +2109,24 @@ char const* AttentionPluginCreator::getPluginVersion() const noexcept
 }
 
 IPluginV3* AttentionPluginCreator::createPlugin(
-    char const* name, PluginFieldCollection const* fc, [[maybe_unused]] TensorRTPhase phase) noexcept
+    char const* name, PluginFieldCollection const* fc, TensorRTPhase phase) noexcept
 {
     try
     {
-        auto* plugin = new AttentionPlugin(std::string(name), fc);
+        auto plugin = std::make_unique<AttentionPlugin>(std::string(name), fc);
+        if (phase == TensorRTPhase::kBUILD)
+        {
+            plugin->compileXQAJitKernelForBuild();
+        }
+        // An engine built for a config with no XQA decode kernel carries an
+        // empty blob; that is a valid engine as long as some other backend
+        // implements the layer, so only load when there is something to load.
+        if (phase == TensorRTPhase::kRUNTIME && plugin->hasSerializedXQAJitKernels())
+        {
+            plugin->loadSerializedXQAJitKernel();
+        }
         plugin->setPluginNamespace(mNamespace.c_str());
-        return plugin;
+        return plugin.release();
     }
     catch (std::exception const& e)
     {
