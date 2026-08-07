@@ -27,6 +27,7 @@
 #include "kernels/decodeAttentionKernels/decoderXQARunner.h"
 #include "references.h"
 #include "testUtils.h"
+#include "unittests/xqaJitTestUtils.h"
 
 #include <algorithm>
 #include <cmath>
@@ -127,9 +128,10 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
     thrust::device_vector<half> outDevice(outReference.size(), 0.0F);
     thrust::device_vector<int32_t> kvCacheLengthDevice(kvCacheLengths);
 
-    constexpr bool kUsePagedKVCache = false;
-    EXPECT_TRUE(trt_edgellm::DecoderXQARunner::canImplement(
-        numQHeads, numKVHeads, headSize, smVersion, DataType::kHALF, DataType::kHALF, kUsePagedKVCache));
+    EXPECT_TRUE(
+        trt_edgellm::canCompileXQAKernel(numQHeads, numKVHeads, headSize, smVersion, DataType::kHALF, DataType::kHALF));
+    ASSERT_TRUE(trt_edgellm::loadXQAJitKernelForTest(
+        smVersion, DataType::kHALF, DataType::kHALF, headSize, numQHeads, numKVHeads, slidingWindowSize > 0, false));
     trt_edgellm::DecoderXQARunner runner(
         DataType::kHALF, DataType::kHALF, batchSize, numQHeads, numKVHeads, headSize, smVersion);
     auto params = runner.initXQAParams();
@@ -259,8 +261,10 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
 
         thrust::device_vector<__nv_fp8_e4m3> kvInputFp8Device(kvInputFp8);
         thrust::device_vector<half> outFp8Device(batchSize * numQHeads * headSize, __float2half(0.0F));
-        EXPECT_TRUE(trt_edgellm::DecoderXQARunner::canImplement(
-            numQHeads, numKVHeads, headSize, smVersion, DataType::kHALF, DataType::kFP8, kUsePagedKVCache));
+        EXPECT_TRUE(trt_edgellm::canCompileXQAKernel(
+            numQHeads, numKVHeads, headSize, smVersion, DataType::kHALF, DataType::kFP8));
+        ASSERT_TRUE(trt_edgellm::loadXQAJitKernelForTest(
+            smVersion, DataType::kHALF, DataType::kFP8, headSize, numQHeads, numKVHeads, slidingWindowSize > 0, false));
         trt_edgellm::DecoderXQARunner runnerFp8(
             DataType::kHALF, DataType::kFP8, batchSize, numQHeads, numKVHeads, headSize, smVersion);
         auto paramsFp8 = runnerFp8.initXQAParams();

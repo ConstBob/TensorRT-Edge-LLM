@@ -35,9 +35,11 @@
 #include "common/checkMacros.h"
 #include "common/cudaMacros.h"
 #include "common/cudaUtils.h"
+#include "kernels/decodeAttentionKernels/decoderXQAJitCompiler.h"
 #include "kernels/decodeAttentionKernels/decoderXQARunner.h"
 #include "references.h"
 #include "testUtils.h"
+#include "unittests/xqaJitTestUtils.h"
 
 using namespace nvinfer1;
 using namespace trt_edgellm;
@@ -70,22 +72,19 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
         GTEST_SKIP() << "Skipping FP8 KV cache tests: requires SM >= 89, but got SM " << smVersion;
     }
     bool const usePagedKVCache = tokensPerPage > 0;
-    bool const canImplementFp16 = trt_edgellm::DecoderXQARunner::canImplement(
-        numQHeads, numKVHeads, headSize, smVersion, DataType::kHALF, DataType::kHALF, usePagedKVCache);
-    ASSERT_TRUE(canImplementFp16) << "No compatible FP16 XQA kernel for SM " << smVersion
-                                  << " paged_kv=" << usePagedKVCache;
+    ASSERT_TRUE(
+        trt_edgellm::canCompileXQAKernel(numQHeads, numKVHeads, headSize, smVersion, DataType::kHALF, DataType::kHALF))
+        << "No compatible FP16 XQA kernel for SM " << smVersion << " paged_kv=" << usePagedKVCache;
+    ASSERT_TRUE(trt_edgellm::loadXQAJitKernelForTest(smVersion, DataType::kHALF, DataType::kHALF, headSize, numQHeads,
+        numKVHeads, slidingWindowSize > 0, /*specDecode=*/true, tokensPerPage));
     if (usePagedKVCache)
     {
         ASSERT_EQ(kvSequenceLength % tokensPerPage, 0);
-        bool const loadedPagedFp16 = trt_edgellm::DecoderXQARunner::loadDecodeXQAKernels(
-            smVersion, DataType::kHALF, DataType::kHALF, true, true);
-        ASSERT_TRUE(loadedPagedFp16) << "No compatible paged FP16 XQA kernel for SM " << smVersion;
 #if SUPPORTS_FP8
         if (useFp8Cache)
         {
-            bool const loadedPagedFp8 = trt_edgellm::DecoderXQARunner::loadDecodeXQAKernels(
-                smVersion, DataType::kHALF, DataType::kFP8, true, true);
-            ASSERT_TRUE(loadedPagedFp8) << "No compatible paged FP8 XQA kernel for SM " << smVersion;
+            ASSERT_TRUE(trt_edgellm::loadXQAJitKernelForTest(smVersion, DataType::kHALF, DataType::kFP8, headSize,
+                numQHeads, numKVHeads, slidingWindowSize > 0, /*specDecode=*/true, tokensPerPage));
         }
 #endif
     }
@@ -409,8 +408,10 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
         thrust::device_vector<half> outFp8Device(
             batchSize * qSequenceLength * numQHeads * headSize, __float2half(0.0F));
 
-        EXPECT_TRUE(trt_edgellm::DecoderXQARunner::canImplement(
-            numQHeads, numKVHeads, headSize, smVersion, DataType::kHALF, DataType::kFP8, usePagedKVCache));
+        EXPECT_TRUE(trt_edgellm::canCompileXQAKernel(
+            numQHeads, numKVHeads, headSize, smVersion, DataType::kHALF, DataType::kFP8));
+        ASSERT_TRUE(trt_edgellm::loadXQAJitKernelForTest(smVersion, DataType::kHALF, DataType::kFP8, headSize,
+            numQHeads, numKVHeads, slidingWindowSize > 0, /*specDecode=*/true, tokensPerPage));
         trt_edgellm::DecoderXQARunner runnerFp8(
             DataType::kHALF, DataType::kFP8, batchSize, numQHeads, numKVHeads, headSize, smVersion);
         auto paramsFp8 = runnerFp8.initXQAParams();
@@ -482,9 +483,10 @@ void TestXQATreeAttentionDecodingWithPaddedCapacity(int32_t batchSize, int32_t n
     float const attentionScale = 1.0F / std::sqrt(static_cast<float>(headSize));
     int32_t smVersion = getSMVersion();
     applyThorSMRenumberWAR(smVersion);
-    constexpr bool kUsePagedKVCache = false;
-    ASSERT_TRUE(trt_edgellm::DecoderXQARunner::canImplement(
-        numQHeads, numKVHeads, headSize, smVersion, DataType::kHALF, DataType::kHALF, kUsePagedKVCache));
+    ASSERT_TRUE(
+        trt_edgellm::canCompileXQAKernel(numQHeads, numKVHeads, headSize, smVersion, DataType::kHALF, DataType::kHALF));
+    ASSERT_TRUE(trt_edgellm::loadXQAJitKernelForTest(smVersion, DataType::kHALF, DataType::kHALF, headSize, numQHeads,
+        numKVHeads, /*slidingWindow=*/false, /*specDecode=*/true));
 
     std::vector<int32_t> kvCacheLength(batchSize, kvSequenceLength);
     std::vector<half> qInput;
@@ -1101,15 +1103,11 @@ void runXQATreeAttentionBenchmark(nvinfer1::DataType kvDataType, char const* kvL
     {
         GTEST_SKIP() << "Skipping FP8 XQA tree attention benchmark: requires SM >= 89, but got SM " << smVersion;
     }
-    bool const canImplement = trt_edgellm::DecoderXQARunner::canImplement(
-        shape.numQHeads, shape.numKVHeads, shape.headSize, smVersion, DataType::kHALF, kvDataType, usePagedKVCache);
-    ASSERT_TRUE(canImplement) << "No compatible XQA kernel for SM " << smVersion << " paged_kv=" << usePagedKVCache;
-    if (usePagedKVCache)
-    {
-        bool const loadedPagedKernel
-            = trt_edgellm::DecoderXQARunner::loadDecodeXQAKernels(smVersion, DataType::kHALF, kvDataType, true, true);
-        ASSERT_TRUE(loadedPagedKernel) << "No compatible paged XQA kernel for SM " << smVersion;
-    }
+    ASSERT_TRUE(trt_edgellm::canCompileXQAKernel(
+        shape.numQHeads, shape.numKVHeads, shape.headSize, smVersion, DataType::kHALF, kvDataType))
+        << "No compatible XQA kernel for SM " << smVersion << " paged_kv=" << usePagedKVCache;
+    ASSERT_TRUE(trt_edgellm::loadXQAJitKernelForTest(smVersion, DataType::kHALF, kvDataType, shape.headSize,
+        shape.numQHeads, shape.numKVHeads, shape.slidingWindowSize > 0, /*specDecode=*/true, tokensPerPage));
 
     int32_t deviceId{0};
     CUDA_CHECK(cudaGetDevice(&deviceId));
@@ -1310,6 +1308,10 @@ void TestXQAPaddingConsistency(int32_t batchSize, int32_t numQHeads, int32_t num
 
     int32_t smVersion = getSMVersion();
     applyThorSMRenumberWAR(smVersion);
+    ASSERT_TRUE(
+        trt_edgellm::canCompileXQAKernel(numQHeads, numKVHeads, headSize, smVersion, DataType::kHALF, DataType::kHALF));
+    ASSERT_TRUE(trt_edgellm::loadXQAJitKernelForTest(smVersion, DataType::kHALF, DataType::kHALF, headSize, numQHeads,
+        numKVHeads, /*slidingWindow=*/false, /*specDecode=*/true));
     float const attentionScale = 1.0F / std::sqrt(static_cast<float>(headSize));
 
     // Generate random Q, K, V data for actual sequence length
@@ -1384,6 +1386,9 @@ void TestXQAPaddingConsistency(int32_t batchSize, int32_t numQHeads, int32_t num
     thrust::device_vector<half> outNoPaddingDevice(actualQSeqLen * numQHeads * headSize, __float2half(0.0f));
     thrust::device_vector<int32_t> kvCacheLengthDevice(kvCacheLength);
     thrust::device_vector<int32_t> packedMaskNoPaddingDevice(packedMaskNoPadding);
+
+    ASSERT_TRUE(trt_edgellm::loadXQAJitKernelForTest(smVersion, DataType::kHALF, DataType::kHALF, headSize, numQHeads,
+        numKVHeads, /*slidingWindow=*/false, /*specDecode=*/true));
 
     trt_edgellm::DecoderXQARunner runnerNoPad(
         DataType::kHALF, DataType::kHALF, 1, numQHeads, numKVHeads, headSize, smVersion);
