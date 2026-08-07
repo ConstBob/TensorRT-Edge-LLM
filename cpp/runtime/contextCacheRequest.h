@@ -40,9 +40,11 @@ class ContextCacheRequest final
 public:
     //! Admit one tokenized request and bind its cache resources.
     //! A disengaged result means admission failed.
+    //! @param mediaTokenIds Placeholder token IDs for media modalities (e.g. image, audio).
+    //!        Positions matching any of these IDs are content-hashed for cache differentiation.
     static std::optional<ContextCacheRequest> begin(ContextCacheCoordinator& coordinator,
-        LLMGenerationRequest const& request, DecodingInferenceContext const& context,
-        DecodingStrategyKind strategyKind);
+        LLMGenerationRequest const& request, DecodingInferenceContext const& context, DecodingStrategyKind strategyKind,
+        std::vector<int32_t> const& mediaTokenIds = {});
 
     ContextCacheRequest(ContextCacheRequest&&) noexcept = default;
     ContextCacheRequest& operator=(ContextCacheRequest&&) = delete;

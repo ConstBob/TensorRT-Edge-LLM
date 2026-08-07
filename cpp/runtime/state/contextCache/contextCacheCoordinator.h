@@ -55,6 +55,9 @@ struct ContextCacheSequenceAdmission
     std::vector<int32_t> tokenIds;
     //! Request-wide non-token identity; LoRA/isolation identity is constant for the sequence.
     BlockKeyExtras keyExtras;
+    //! Per-position media content hash. Empty means text-only. When non-empty, must have tokenIds.size() entries.
+    //! A non-zero Hash128 at position i causes the block hash to consume that 128-bit digest instead of the token ID.
+    std::vector<Hash128> perPositionMediaHash;
 };
 
 //! Decoder mode selected before cache lookup. A deployment with EAGLE engines may execute either mode per request;
