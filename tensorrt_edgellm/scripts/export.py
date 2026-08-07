@@ -3490,6 +3490,43 @@ def main() -> None:
               "(None) uses the checkpoint's canonical value (5)."),
     )
     p.add_argument(
+        "--max-video-subsample-factor",
+        "--max_video_subsample_factor",
+        dest="max_video_subsample_factor",
+        type=int,
+        default=None,
+        help=(
+            "Cosmos3 policy only: largest video-subsample factor the GEN "
+            "engine's DYNAMIC video-token profile must admit. The profile "
+            "spans [latent_t(max_vsf) .. latent_t(1)]; a larger value widens "
+            "the flexible range (e.g. 8 for finer subsampling) at the cost of "
+            "a looser optimization profile. Default (None) uses 4."),
+    )
+    p.add_argument(
+        "--min-action-chunk",
+        "--min_action_chunk",
+        dest="min_action_chunk",
+        type=int,
+        default=None,
+        help=(
+            "Cosmos3 policy only: smallest action-chunk length the GEN "
+            "engine's DYNAMIC action-token axis must admit. Default (None) = "
+            "the canonical chunk (action axis fixed). Set below the chunk to "
+            "serve shorter action requests from one engine (e.g. 16)."),
+    )
+    p.add_argument(
+        "--max-action-chunk",
+        "--max_action_chunk",
+        dest="max_action_chunk",
+        type=int,
+        default=None,
+        help=(
+            "Cosmos3 policy only: largest action-chunk length the GEN engine's "
+            "DYNAMIC action-token axis must admit. Default (None) = the "
+            "canonical chunk. Widen to serve longer action requests without a "
+            "rebuild (keep it sane, e.g. <= 48, to bound tactic search)."),
+    )
+    p.add_argument(
         "--eagle-base",
         action="store_true",
         help=
@@ -3720,7 +3757,11 @@ def main() -> None:
                 k: v
                 for k, v in (("action_chunk_size", args.action_chunk_size),
                              ("num_frames", args.num_frames), ("fps",
-                                                               args.fps))
+                                                               args.fps),
+                             ("max_video_subsample_factor",
+                              args.max_video_subsample_factor),
+                             ("min_action_chunk", args.min_action_chunk),
+                             ("max_action_chunk", args.max_action_chunk))
                 if v is not None
             }
             export_cosmos3_components(model_dir,

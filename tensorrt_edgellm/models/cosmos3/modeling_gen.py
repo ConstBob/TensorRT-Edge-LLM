@@ -609,6 +609,12 @@ def build_cosmos3_gen(cfg: Cosmos3GenConfig, weights: dict,
 ACTION_CHUNK_SIZE = 16
 DEFAULT_NUM_FRAMES = 17
 DEFAULT_FPS = 5.0
+# Wan VAE temporal compression (one leading conditioning frame, then 4x).
+TEMPORAL_COMPRESSION_FACTOR = 4
+# Largest video-subsample factor the GEN engine's dynamic profile must admit. The
+# regular request (vsf=1) is the profile opt/max; the vsf-reduced request is the
+# profile min. See _latent_t_for_subsample.
+DEFAULT_MAX_VIDEO_SUBSAMPLE_FACTOR = 4
 # droid_lerobot raw action head: 3 position + 6D rotation + gripper = 10 dims
 # (the 8-value DROID control action is derived downstream by converting the 6D
 # rotation to Euler angles). Dims >= raw_action_dim are zeroed padding.
@@ -658,38 +664,91 @@ def gen_config_from_transformer(
     )
 
 
-def make_gen_config(cfg: Cosmos3GenConfig,
-                    tcfg: dict,
-                    max_und_len: int,
-                    fps: float = DEFAULT_FPS) -> dict:
+def _latent_t_for_subsample(
+        action_chunk_size: int,
+        video_subsample_factor: int,
+        temporal_compression: int = TEMPORAL_COMPRESSION_FACTOR) -> int:
+    """Latent temporal planes for a video-subsample factor.
+
+    ``t_frames = action_chunk_size // vsf + 1`` generated frames, compressed 4x
+    by the Wan VAE with a single leading conditioning frame:
+    ``latent_t = (t_frames - 1) // 4 + 1`` (regular vsf=1, optimized vsf=4).
+    """
+    t_frames = action_chunk_size // video_subsample_factor + 1
+    return (t_frames - 1) // temporal_compression + 1
+
+
+def make_gen_config(
+        cfg: Cosmos3GenConfig,
+        tcfg: dict,
+        max_und_len: int,
+        fps: float = DEFAULT_FPS,
+        max_video_subsample_factor: int = DEFAULT_MAX_VIDEO_SUBSAMPLE_FACTOR,
+        min_action_chunk: "int | None" = None,
+        max_action_chunk: "int | None" = None) -> dict:
     """Return the GEN component ``config.json`` payload."""
     rope_scaling = tcfg.get("rope_scaling", {}) or {}
     v_tok = cfg.num_video_tokens
     g_tok = cfg.num_gen_tokens
     n_kv = cfg.num_key_value_heads
     hd = cfg.head_dim
+    mad = cfg.max_action_dim
+    # Action-token axis is DYNAMIC over [min_action .. max_action]; the canonical
+    # chunk (cfg.action_chunk_size) is the opt point, so the regular request stays
+    # the optimization target. Defaults keep min == opt == max = the canonical
+    # chunk (action axis fixed, behavior identical) unless the caller widens it.
     action_len = cfg.action_chunk_size
+    max_action = max(
+        action_len,
+        max_action_chunk if max_action_chunk is not None else action_len)
+    min_action = min(
+        action_len,
+        min_action_chunk if min_action_chunk is not None else action_len)
     opt_und = min(32, max_und_len)
+
+    # The video-token sequence axis is DYNAMIC: the regular request (vsf=1,
+    # cfg.latent_t) is the profile opt/max, and the largest supported subsample
+    # (vsf=max_video_subsample_factor, fewer frames) is the profile min. One
+    # engine then serves any request whose video-token count lies in [min, max];
+    # the runtime binds the per-request temporal extent (Cosmos3PolicyRunner).
+    min_latent_t = min(
+        _latent_t_for_subsample(action_len, max_video_subsample_factor),
+        cfg.latent_t)
+    min_v_tok = min_latent_t * cfg.hp * cfg.wp
+    # GEN sequence = video tokens + action tokens; both axes vary, so the gen-len
+    # profile spans (min video + min action) .. (max video + max action) with the
+    # regular request (v_tok + canonical chunk) as opt.
+    min_g_tok = min_v_tok + min_action
+    opt_g_tok = v_tok + action_len
+    max_g_tok = v_tok + max_action
 
     def _fix(shape: list) -> dict:
         return {"min": shape, "opt": shape, "max": shape}
 
+    def _dyn(min_shape: list, opt_shape: list) -> dict:
+        return {"min": min_shape, "opt": opt_shape, "max": opt_shape}
+
+    def _range(min_shape: list, opt_shape: list, max_shape: list) -> dict:
+        return {"min": min_shape, "opt": opt_shape, "max": max_shape}
+
     profile = {
         "video_latent":
-        _fix([1, cfg.latent_channel, cfg.latent_t, cfg.latent_h,
-              cfg.latent_w]),
+        _dyn(
+            [1, cfg.latent_channel, min_latent_t, cfg.latent_h, cfg.latent_w],
+            [1, cfg.latent_channel, cfg.latent_t, cfg.latent_h, cfg.latent_w]),
         "action_latent":
-        _fix([1, action_len, cfg.max_action_dim]),
+        _range([1, min_action, mad], [1, action_len, mad],
+               [1, max_action, mad]),
         "timestep":
         _fix([1]),
         "token_noisy_mask":
-        _fix([1, v_tok, 1]),
+        _dyn([1, min_v_tok, 1], [1, v_tok, 1]),
         "action_noisy_mask":
-        _fix([1, action_len, 1]),
+        _range([1, min_action, 1], [1, action_len, 1], [1, max_action, 1]),
         "rope_rotary_cos_sin":
-        _fix([1, g_tok, hd]),
+        _range([1, min_g_tok, hd], [1, opt_g_tok, hd], [1, max_g_tok, hd]),
         "attention_pos_id":
-        _fix([1, g_tok]),
+        _range([1, min_g_tok], [1, opt_g_tok], [1, max_g_tok]),
     }
     for i in range(cfg.num_hidden_layers):
         und = {
@@ -754,6 +813,10 @@ def make_gen_config(cfg: Cosmos3GenConfig,
         "num_inference_steps": DEFAULT_NUM_INFERENCE_STEPS,
         "flow_shift": DEFAULT_FLOW_SHIFT,
         "video_latent_frames": cfg.latent_t,
+        "min_video_latent_frames": min_latent_t,
+        "max_video_subsample_factor": max_video_subsample_factor,
+        "min_action_chunk_size": min_action,
+        "max_action_chunk_size": max_action,
         "fps": float(fps),
         "base_fps": 24.0,
         "temporal_compression_factor": 4,
