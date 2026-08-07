@@ -42,6 +42,7 @@ def storage_environment(tmp_path, monkeypatch):
         "CI_PIPELINE_CREATED_AT": "2026-07-30T10:39:11-07:00",
         "CI_JOB_ID": "200",
         "CI_JOB_NAME_SLUG": "l0-drive-thor-1",
+        "L0_JOB_WRITES_ENGINES": "1",
     }
     for name, value in values.items():
         monkeypatch.setenv(name, value)
@@ -80,9 +81,9 @@ def test_prepare_job_creates_cross_identity_boundary(storage_environment):
     job_root = pipeline_root / "job_200_l0-drive-thor-1"
 
     assert _mode(pipeline_root) == 0o755
-    for path in (job_root, job_root / "engines", job_root / "logs",
-                 job_root / "tmp"):
-        assert _mode(path) == 0o777
+    assert _mode(job_root) == 0o777
+    for path in (job_root / "engines", job_root / "logs", job_root / "tmp"):
+        assert not path.exists()
 
 
 def test_prepare_job_publishes_resolved_paths(storage_environment,
@@ -108,30 +109,32 @@ def test_prepare_job_publishes_resolved_paths(storage_environment,
     assert _source_environment(environment_file, expected) == expected
 
 
-def test_prepare_job_can_publish_job_local_onnx_path(storage_environment,
-                                                     monkeypatch):
+def test_prepare_job_omits_engine_path_for_non_engine_job(
+        storage_environment, monkeypatch):
     environment_file = storage_environment.parent / "job.env"
-    monkeypatch.setenv("L0_JOB_ONNX_RELATIVE_PATH", "tmp/onnx")
+    monkeypatch.delenv("L0_JOB_WRITES_ENGINES")
 
     assert ci_storage.main(
         ["prepare-job", "--environment-file",
          str(environment_file)]) == 0
 
-    job_root = (storage_environment / "L0" / "MR_42" / "workspace" /
-                "pipeline_100" / "job_200_l0-drive-thor-1")
-    assert _source_environment(environment_file,
-                               ["ONNX_DIR"])["ONNX_DIR"] == str(job_root /
-                                                                "tmp" / "onnx")
+    result = subprocess.run(
+        [
+            "sh", "-c", '. "$1"\ntest -z "${ENGINE_DIR+x}"', "sh",
+            str(environment_file)
+        ],
+        check=False,
+    )
+    assert result.returncode == 0
 
 
-def test_prepare_job_rejects_conflicting_onnx_locations(
+def test_prepare_job_rejects_invalid_engine_writer_declaration(
         storage_environment, monkeypatch, capsys):
-    monkeypatch.setenv("L0_ONNX_CACHE_RELATIVE_PATH", "checkpoint_export/onnx")
-    monkeypatch.setenv("L0_JOB_ONNX_RELATIVE_PATH", "tmp/onnx")
+    monkeypatch.setenv("L0_JOB_WRITES_ENGINES", "true")
 
     assert ci_storage.main(["prepare-job"]) == 1
     assert not (storage_environment / "L0" / "MR_42").exists()
-    assert "only one L0 ONNX relative path" in capsys.readouterr().err
+    assert "L0_JOB_WRITES_ENGINES" in capsys.readouterr().err
 
 
 def test_prepare_job_rejects_onnx_path_traversal(storage_environment,
@@ -165,6 +168,84 @@ def test_prepare_job_rejects_malformed_slug(storage_environment, monkeypatch,
     assert "CI_JOB_NAME_SLUG" in capsys.readouterr().err
 
 
+def test_prune_skips_missing_mr_layout(storage_environment, capsys):
+    assert ci_storage.main(["prune-pipeline-workspaces"]) == 0
+
+    assert not (storage_environment / "L0" / "MR_42").exists()
+    assert "No L0 pipeline workspaces to prune" in capsys.readouterr().out
+
+
+def test_prune_preserves_cache_and_removes_older_mr_pipeline(
+        storage_environment, monkeypatch):
+    assert ci_storage.main(["prepare-job"]) == 0
+    mr_root = storage_environment / "L0" / "MR_42"
+    cache_marker = mr_root / "onnx_cache" / "cache-marker"
+    cache_marker.touch()
+
+    monkeypatch.setenv("CI_PIPELINE_ID", "101")
+    assert ci_storage.main(["prune-pipeline-workspaces"]) == 0
+
+    assert cache_marker.exists()
+    assert not (mr_root / "workspace" / "pipeline_100").exists()
+    assert not (mr_root / "workspace" / "pipeline_101").exists()
+
+
+def test_prune_preserves_pipeline_newer_than_current(storage_environment,
+                                                     monkeypatch):
+    assert ci_storage.main(["prepare-job"]) == 0
+    workspace_root = storage_environment / "L0" / "MR_42" / "workspace"
+
+    monkeypatch.setenv("CI_PIPELINE_ID", "102")
+    monkeypatch.setenv("CI_JOB_ID", "202")
+    assert ci_storage.main(["prepare-job"]) == 0
+
+    monkeypatch.setenv("CI_PIPELINE_ID", "101")
+    assert ci_storage.main(["prune-pipeline-workspaces"]) == 0
+
+    assert not (workspace_root / "pipeline_100").exists()
+    assert not (workspace_root / "pipeline_101").exists()
+    assert (workspace_root / "pipeline_102").is_dir()
+
+
+def test_prune_preserves_unknown_entry_and_removes_older_pipeline(
+        storage_environment, monkeypatch):
+    assert ci_storage.main(["prepare-job"]) == 0
+    workspace_root = (storage_environment / "L0" / "MR_42" / "workspace")
+    unmanaged = workspace_root / "manual-output"
+    unmanaged.mkdir()
+
+    monkeypatch.setenv("CI_PIPELINE_ID", "101")
+    assert ci_storage.main(["prune-pipeline-workspaces"]) == 0
+
+    assert not (workspace_root / "pipeline_100").exists()
+    assert unmanaged.is_dir()
+
+
+def test_prune_rejects_managed_pipeline_file_before_deleting(
+        storage_environment, monkeypatch):
+    assert ci_storage.main(["prepare-job"]) == 0
+    workspace_root = (storage_environment / "L0" / "MR_42" / "workspace")
+    invalid_pipeline = workspace_root / "pipeline_99"
+    invalid_pipeline.touch()
+
+    monkeypatch.setenv("CI_PIPELINE_ID", "101")
+    assert ci_storage.main(["prune-pipeline-workspaces"]) == 1
+
+    assert (workspace_root / "pipeline_100").is_dir()
+    assert invalid_pipeline.is_file()
+
+
+def test_prune_leaves_stability_to_environment_lifecycle(
+        storage_environment, monkeypatch):
+    monkeypatch.setenv("L0_STORAGE_KIND", "stability")
+    assert ci_storage.main(["prepare-job"]) == 0
+    stability_root = (storage_environment / "L0" / "STABILITY" /
+                      "2026-07-30T17-39-11Z_pipeline_100")
+
+    assert ci_storage.main(["prune-pipeline-workspaces"]) == 0
+    assert stability_root.is_dir()
+
+
 def test_delete_rejects_malformed_mr_id_without_writing(
         storage_environment, monkeypatch, capsys):
     monkeypatch.setenv("CI_MERGE_REQUEST_IID", "../43")
@@ -179,7 +260,7 @@ def test_delete_removes_only_selected_mr(storage_environment, monkeypatch):
     board_output = (storage_environment / "L0" / "MR_42" / "workspace" /
                     "pipeline_100" / "job_200_l0-drive-thor-1" / "logs" /
                     "board-output")
-    board_output.mkdir()
+    board_output.mkdir(parents=True)
     board_output.chmod(0o777)
     read_only_file = board_output / "audio.wav"
     read_only_file.touch()

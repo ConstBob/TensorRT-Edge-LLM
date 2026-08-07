@@ -26,6 +26,7 @@
 
 .github_pr_cleanup:
   after_script:
+    - !reference [.cleanup_engine_storage, after_script]
     - echo "Cleaning up GitHub PR clone directory"
     - rm -rf /tmp/github_pr_${CI_PIPELINE_ID}
     - echo "Cleanup complete"

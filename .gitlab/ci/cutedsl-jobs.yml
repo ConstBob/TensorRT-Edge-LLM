@@ -73,6 +73,7 @@ build_cutedsl_docker_image:
         --cache=false \
         --destination "$CUTE_DSL_BUILDER_IMAGE"
   after_script:
+    - !reference [.cleanup_engine_storage, after_script]
     - !reference [.record_runner_usage, after_script]
   interruptible: true
 
@@ -100,6 +101,7 @@ build_cutedsl_docker_matrix:
     - ls -lh "$CUTE_DSL_PREBUILT_DIR"/cutedsl_*.tar.gz*
     - echo "Pipeline end time:$(date)"
   after_script:
+    - !reference [.cleanup_engine_storage, after_script]
     - !reference [.record_runner_usage, after_script]
   artifacts:
     name: "cutedsl-matrix-${CI_COMMIT_SHORT_SHA}"

@@ -23,6 +23,7 @@ variables:
 default:
   interruptible: true
   after_script:
+    - !reference [.cleanup_engine_storage, after_script]
     - !reference [.record_runner_usage, after_script]
 
 workflow:

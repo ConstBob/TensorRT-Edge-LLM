@@ -51,6 +51,7 @@ STORAGE_EXEMPT_JOBS = {
     "l0_cross_build_d7l_cuda12.8",
 }
 L0_STORAGE_GATE = "init_l0_storage"
+L0_PRUNE_JOB = "prune_l0_pipeline_workspaces"
 EXPORT_PRODUCER_LANES = {
     "l0_checkpoint_export": "checkpoint_export/onnx",
     "l0_checkpoint_export_ampere": "checkpoint_export_ampere/onnx",
@@ -81,6 +82,19 @@ EXPECTED_EXPORT_JOBS = {
         "l0_checkpoint_export_a30_trtrtx",
     },
 }
+ENGINE_BUILDING_JOB_TEMPLATES = {
+    ".x86_test_template",
+    ".nemo_eval_x86_template",
+    ".device_test_template",
+}
+UNIT_TEST_JOB_TEMPLATES = {
+    ".x86_unit_test_template",
+    ".device_unit_test_template",
+}
+NON_ENGINE_BUILDING_JOB_TEMPLATES = ({".checkpoint_export_template"}
+                                     | UNIT_TEST_JOB_TEMPLATES)
+L0_JOB_TEMPLATES = (ENGINE_BUILDING_JOB_TEMPLATES
+                    | NON_ENGINE_BUILDING_JOB_TEMPLATES)
 
 
 def _extends(config):
@@ -140,6 +154,20 @@ def _configuration_hierarchy(config):
     return list(visit(config))
 
 
+def _inherited_config_names(config):
+    pending = _extends(config)
+    inherited = set()
+    while pending:
+        name = pending.pop()
+        if name in inherited:
+            continue
+        inherited.add(name)
+        parent = INHERITABLE_CONFIGS.get(name)
+        if isinstance(parent, dict):
+            pending.extend(_extends(parent))
+    return inherited
+
+
 def _rules(config):
     declared = [
         item["rules"] for item in _configuration_hierarchy(config)
@@ -188,6 +216,8 @@ def test_storage_rules_select_context():
         "L0_ONNX_REUSE": "1",
     }
     assert expected_mr_variables.items() <= mr_variables.items()
+    retention = start["environment"]["auto_stop_in"]
+    assert string.Template(retention).substitute(mr_variables) == "30 days"
 
     stability_variables = rules[
         '$CI_PIPELINE_SOURCE == "schedule" && $L0_STABILITY == "true"'][
@@ -199,6 +229,8 @@ def test_storage_rules_select_context():
         "L0_ONNX_REUSE": "0",
     }
     assert expected_stability_variables.items() <= stability_variables.items()
+    assert string.Template(retention).substitute(
+        stability_variables) == "2 days"
 
 
 def test_l0_scratch_jobs_reach_one_non_artifact_storage_gate():
@@ -212,6 +244,7 @@ def test_l0_scratch_jobs_reach_one_non_artifact_storage_gate():
             assert L0_STORAGE_GATE not in _upstream_jobs(name, graph)
         else:
             assert L0_STORAGE_GATE in _upstream_jobs(name, graph)
+        assert L0_PRUNE_JOB not in _upstream_jobs(name, graph)
         assert not _declared_environments(config)
 
     storage_roots = {
@@ -233,6 +266,44 @@ def test_l0_builder_receives_cutedsl_artifacts():
 
     assert "build_cutedsl_docker_matrix" in _needed_jobs(config)
     assert "build_cutedsl_docker_matrix" in _artifact_source_jobs(config)
+
+
+def test_only_engine_writers_receive_l0_engine_storage():
+    for name, config in _visible_l0_jobs().items():
+        if name in STORAGE_EXEMPT_JOBS:
+            continue
+        job_templates = _inherited_config_names(config) & L0_JOB_TEMPLATES
+        assert len(job_templates) == 1, name
+
+        hierarchy = _configuration_hierarchy(config)
+        declarations = {
+            item["variables"]["L0_JOB_WRITES_ENGINES"]
+            for item in hierarchy
+            if "L0_JOB_WRITES_ENGINES" in item.get("variables", {})
+        }
+        writes_engines = bool(job_templates & ENGINE_BUILDING_JOB_TEMPLATES)
+        expected = {"1"} if writes_engines else set()
+        assert declarations == expected, name
+
+
+def test_unit_and_checkpoint_builder_jobs_have_no_onnx_storage():
+    onnx_free_jobs = set()
+    unit_jobs = set()
+    for name, config in _visible_l0_jobs().items():
+        inherited = _inherited_config_names(config)
+        is_unit_job = not UNIT_TEST_JOB_TEMPLATES.isdisjoint(inherited)
+        if is_unit_job:
+            unit_jobs.add(name)
+        if name != "l0_builder_a30" and not is_unit_job:
+            continue
+        onnx_free_jobs.add(name)
+        hierarchy = _configuration_hierarchy(config)
+        assert all(not ({"ONNX_DIR", "L0_ONNX_CACHE_RELATIVE_PATH"}
+                        & set(item.get("variables", {})))
+                   for item in hierarchy), name
+
+    assert "l0_builder_a30" in onnx_free_jobs
+    assert unit_jobs
 
 
 def test_cache_lanes_match_their_producer_dependencies():
@@ -312,6 +383,17 @@ def test_l0_storage_lifecycle_is_single_and_serialized():
     assert _rules(start) == _rules(stop)
     assert stop["when"] == "manual"
     assert stop["allow_failure"] is True
+
+
+def test_l0_pipeline_pruning_is_independent_and_best_effort():
+    lifecycle_start = SETUP_JOBS[L0_STORAGE_GATE]
+    prune = SETUP_JOBS[L0_PRUNE_JOB]
+
+    assert prune["stage"] == lifecycle_start["stage"]
+    assert not _needed_jobs(prune)
+    assert prune["resource_group"] != lifecycle_start["resource_group"]
+    assert prune["interruptible"] is True
+    assert prune["allow_failure"] is True
 
 
 def test_only_superseded_mr_work_is_automatically_cancelled():

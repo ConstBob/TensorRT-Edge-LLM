@@ -13,9 +13,11 @@
 #   Jobs write directly beneath workspace/ because each stability root belongs
 #   to exactly one pipeline.
 #   ONNX exports are regenerated for every stability pipeline.
+#   Each root is deleted by its environment lifecycle after two days.
 #
 # Every non-exempt job receives an isolated job_<id>_<slug> directory beneath
-# its pipeline workspace. .l0_rules selects the storage context.
+# its pipeline workspace. Initialization gates storage users, while an
+# independent best-effort job prunes superseded MR pipeline workspaces.
 # ==============================================================================
 
 include:
@@ -174,7 +176,6 @@ l0_builder_a30:
     TRT_CUDA_VERSION: "13.2"
     IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     PRIORITY: l0_builder_a30
-    L0_JOB_ONNX_RELATIVE_PATH: "tmp/unused_onnx"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/a30_trt11.csv"
   tags:
@@ -344,7 +345,6 @@ l0_unit_tests_x86:
     TRT_VERSION: "$TRT10_X86_VERSION"
     IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     PRIORITY: l0_python_ut
-    L0_JOB_ONNX_RELATIVE_PATH: "tmp/onnx"
     TRT_CUDA_VERSION: "13.2"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
   parallel:
@@ -375,7 +375,6 @@ l0_unit_tests_x86_trt11:
     TRT_CUDA_VERSION: "13.2"
     IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     PRIORITY: l0_python_ut
-    L0_JOB_ONNX_RELATIVE_PATH: "tmp/onnx"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
   parallel:
     matrix:
@@ -405,7 +404,6 @@ l0_unit_tests_x86_b100:
     TRT_VERSION: "$TRT10_X86_VERSION"
     IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     PRIORITY: l0_python_ut
-    L0_JOB_ONNX_RELATIVE_PATH: "tmp/onnx"
     TRT_CUDA_VERSION: "13.2"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
   tags:
@@ -431,7 +429,6 @@ l0_unit_tests_x86_trt11_b100:
     TRT_CUDA_VERSION: "13.2"
     IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     PRIORITY: l0_python_ut
-    L0_JOB_ONNX_RELATIVE_PATH: "tmp/onnx"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
   tags:
     - b100-edgellm-nvks

@@ -256,8 +256,8 @@ def test_build_and_run(test_param: str, executable_files: Dict[str, str],
     """Build every checkpoint component once, then execute its runtime once."""
     model_type = infer_checkpoint_export_model_type(test_param)
     config = TestConfig.from_param_string(test_param, model_type,
-                                          TaskType.INFERENCE, env_config)
-    config.llm_models_dir = env_config.llm_models_dir
+                                          TaskType.CHECKPOINT_BUILD,
+                                          env_config)
     config.check_trt_native_attn()
     model_dir = config.get_torch_model_dir()
     engine_dir = _engine_dir(config)
