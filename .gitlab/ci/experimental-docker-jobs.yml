@@ -5,20 +5,18 @@
 l0_experimental_docker_jedha:
   stage: l0_test
   extends:
+    - .device_controller_environment
     - .ci_internal_submodules
   needs:
     - job: build_cutedsl_docker_matrix
       artifacts: true
   tags:
     - jedha-edgellm-nvks
-  image: "ubuntu:24.04"
   variables:
     BOARD_USER: "tensorrt_user"
     BOARD_IP: "192.168.55.1"
     REMOTE_WORKSPACE: "/home/tensorrt_user/tensorrt-edge-llm-docker-${CI_PIPELINE_ID}-${CI_JOB_ID}"
     EXPERIMENTAL_DOCKER_IMAGE: "tensorrt-edge-llm:experimental-${CI_COMMIT_SHORT_SHA}"
-  before_script:
-    - bash .gitlab/ci/scripts/ci_apt.sh install openssh-client sshpass rsync
   script:
     - echo "Pipeline start time:$(date)"
     - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'

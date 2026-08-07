@@ -78,9 +78,6 @@
     L0_STORAGE_ENV_FILE: "$CI_PROJECT_DIR/.ci-l0-storage-${CI_JOB_ID}.env"
   before_script:
     - |
-      if ! command -v python3 >/dev/null 2>&1; then
-        bash .gitlab/ci/scripts/ci_apt.sh install python3
-      fi
       python3 .gitlab/ci/scripts/ci_storage.py prepare-job \
         --environment-file "$L0_STORAGE_ENV_FILE"
       . "$L0_STORAGE_ENV_FILE"
@@ -420,10 +417,6 @@
         echo "ONNX cache not found at $ONNX_DIR"
         exit 1
       fi
-    - echo "Installing dependencies"
-    - export DEBIAN_FRONTEND=noninteractive
-    - apt update -qq >/dev/null 2>&1
-    - apt install -y -qq python3 python3-pip python3-venv git curl >/dev/null 2>&1
     - echo "Checking TRT x86_64 package"
     - if [ ! -d "$TRT_PACKAGE_DIR" ]; then echo "TensorRT x86_64 cache not found at $TRT_PACKAGE_DIR"; exit 1; fi
     - echo "Using TensorRT x86_64 package directly from cache"
@@ -514,9 +507,17 @@
     - echo "HTML report saved to $TEST_LOG_DIR; JUnit report saved to $CI_PROJECT_DIR/.ci-reports"
     - ls -la $TEST_LOG_DIR
     - echo "Pipeline end time:$(date)"
-  
+
+.device_controller_environment:
+  image: "$DEVICE_CONTROLLER_IMAGE"
+  variables:
+    # Prevent SSH from forwarding an unsupported locale to device boards.
+    LANG: "C"
+    LC_ALL: "C"
+
 .device_test_template:
   extends:
+    - .device_controller_environment
     - .ci_test_submodules
     - .gitlab_junit_report
   variables:
@@ -532,8 +533,6 @@
     - mkdir -p $TEST_LOG_DIR "$CI_PROJECT_DIR/.ci-reports"
     - rm -rf $TEST_LOG_DIR/*
     - chmod -R 777 $TEST_LOG_DIR
-    - echo "Installing dependencies"
-    - bash .gitlab/ci/scripts/ci_apt.sh install git openssh-client sshpass rsync python3 python3-pip python3-venv
     - echo "Copying password to device scripts"
     - sed -i -e "s/{BOARDPASSWORD}/${BOARD_PASSWORD_NVKS}/g" .gitlab/ci/scripts/device_init.sh
     - export ENGINE_DIR=${ENGINE_DIR:-$REMOTE_WORKSPACE/engines}
@@ -577,6 +576,7 @@
 # board (see .gitlab/ci/scripts/device_unit_tests.sh).
 .device_unit_test_template:
   extends:
+    - .device_controller_environment
     - .ci_test_submodules
     - .gitlab_junit_report
   variables:
@@ -590,8 +590,6 @@
     - mkdir -p $TEST_LOG_DIR "$CI_PROJECT_DIR/.ci-reports"
     - rm -rf $TEST_LOG_DIR/*
     - chmod -R 777 $TEST_LOG_DIR
-    - echo "Installing dependencies"
-    - bash .gitlab/ci/scripts/ci_apt.sh install git openssh-client sshpass rsync python3
     - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
     - |
       case "$REMOTE_WORKSPACE" in

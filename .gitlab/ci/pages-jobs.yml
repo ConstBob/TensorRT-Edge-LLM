@@ -5,13 +5,12 @@
 # Main pages job for main and release branches
 pages:
   image: 
-    name: python:3.10-slim
+    name: python:3.12-bookworm
     entrypoint: ['/bin/bash']
   stage: setup
   tags:
     - cpu-k8s
   before_script:
-  - bash .gitlab/ci/scripts/ci_apt.sh install wget make
   - bash "$CI_PROJECT_DIR/.gitlab/ci/scripts/ci_run.sh" "$CI_DOWNLOAD_TIMEOUT_SECONDS" "Download Doxygen" -- wget https://www.doxygen.nl/files/doxygen-1.14.0.linux.bin.tar.gz
   - tar -xzf doxygen-1.14.0.linux.bin.tar.gz
   - cd doxygen-1.14.0
