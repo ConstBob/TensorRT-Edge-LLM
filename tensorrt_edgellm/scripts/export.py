@@ -358,7 +358,13 @@ def _has_mtp(config: dict) -> bool:
                       dict) and sub.get("mtp_num_hidden_layers") is not None:
             return True
     text_cfg = _get_llm_text_config(config)
-    return bool(text_cfg.get("mtp_num_hidden_layers") is not None)
+    if text_cfg.get("mtp_num_hidden_layers") is not None:
+        return True
+    # Nemotron-H (DeepSeek-V3 naming): one or more MTP prediction modules whose
+    # layer stack is given by ``mtp_hybrid_override_pattern``.
+    return bool(
+        int(text_cfg.get("num_nextn_predict_layers", 0) or 0) > 0
+        and text_cfg.get("mtp_hybrid_override_pattern"))
 
 
 def _normalize_gemma4_layer_type(layer_type: str) -> str:

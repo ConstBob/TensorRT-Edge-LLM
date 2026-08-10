@@ -87,14 +87,18 @@ void invokeSelectiveStateUpdatePrefill(trt_edgellm::rt::Tensor const& x, trt_edg
  * replay stash produced by the prefill kernel, in place on the read-only committed ``state``. A batch
  * whose accepted count is 0 is left untouched.
  *
- * state:           [batch, nheads, dim, dstate], updated in-place (half or float)
- * replayDA:        [batch, seq_len, nheads] FP32
- * replayU:         [batch, seq_len, nheads, dim] FP32
- * replayB:         [batch, seq_len, ngroups, dstate] FP32
- * acceptedLengths: [batch] INT32 — accepted draft-token count per sequence
+ * state:           [maxBatch, nheads, dim, dstate], updated in-place (half or float)
+ * replayDA:        [maxBatch, seq_len, nheads] FP32
+ * replayU:         [maxBatch, seq_len, nheads, dim] FP32
+ * replayB:         [maxBatch, seq_len, ngroups, dstate] FP32
+ * acceptedLengths: [activeBatch] INT32 — accepted draft-token count per sequence
+ * activeBatchSize: number of active sequences; padded batches beyond it are left
+ *                  untouched (the state pools are sized to maxBatch, so the loop
+ *                  must be bounded by activeBatchSize to avoid reading past
+ *                  acceptedLengths).
  */
 void invokeMambaReplayReconstruct(trt_edgellm::rt::Tensor& state, trt_edgellm::rt::Tensor const& replayDA,
     trt_edgellm::rt::Tensor const& replayU, trt_edgellm::rt::Tensor const& replayB,
-    trt_edgellm::rt::Tensor const& acceptedLengths, cudaStream_t stream);
+    trt_edgellm::rt::Tensor const& acceptedLengths, int32_t activeBatchSize, cudaStream_t stream);
 
 } // namespace mamba_ssm

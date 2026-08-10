@@ -460,8 +460,22 @@ bool LLMBuilder::parseConfig()
     mConvDim = mModelConfig.value("conv_dim", 0);
     mConvKernel = mModelConfig.value("conv_kernel", 0);
 
-    // For hybrid models, only attention layers have KV caches
-    if (mNumLinearAttnLayers > 0)
+    // Only attention layers own a KV cache. Prefer the authoritative
+    // per-attention-layer kv_layer_configs count; it is the only signal that is
+    // correct for hybrid drafts whose non-attention layers are neither mamba nor
+    // linear-attention (e.g. the MTP attention+MoE draft, num_linear_attn == 0).
+    if (mModelConfig.contains("kv_layer_configs") && mModelConfig["kv_layer_configs"].is_array())
+    {
+        mNbKVCacheInputs = 0;
+        for (auto const& layerConfig : mModelConfig["kv_layer_configs"])
+        {
+            if (layerConfig.is_object())
+            {
+                ++mNbKVCacheInputs;
+            }
+        }
+    }
+    else if (mNumLinearAttnLayers > 0)
     {
         mNbKVCacheInputs = mModelConfig.value("num_attention_layers", mModelConfig["num_hidden_layers"].get<int32_t>());
     }

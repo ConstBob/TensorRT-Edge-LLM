@@ -1453,6 +1453,47 @@ def _(router_logits, hidden_states, fc1_qweights, fc1_blocks_scale, fc1_alpha,
 
 
 # ---------------------------------------------------------------------------
+# Custom op: trt_edgellm::Nvfp4A16MoePlugin
+#   Marlin FP16-A / NVFP4-W4 MoE (weight-only).
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt_edgellm::Nvfp4A16MoePlugin", mutates_args=())
+def nvfp4_a16_moe_plugin(
+    router_logits: torch.Tensor,  # [numTokens, num_experts] float32
+    hidden_states: torch.Tensor,  # [B, S, hidden_size] float16
+    fc1_qweights: torch.Tensor,  # [E, hidden/16, 8*fc1_out] int8
+    fc1_block_scales: torch.Tensor,  # [E, hidden/16, fc1_out] int8
+    fc1_global_scales: torch.Tensor,  # [E] float16
+    fc2_qweights: torch.Tensor,  # [E, moe_inter/16, 8*hidden] int8
+    fc2_block_scales: torch.Tensor,  # [E, moe_inter/16, hidden] int8
+    fc2_global_scales: torch.Tensor,  # [E] float16
+    e_score_correction_bias: torch.Tensor,  # [E] float32
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    moe_inter_size: int,
+    activation_type: int,
+    n_group: int,
+    topk_group: int,
+    norm_topk_prob: int,
+    routed_scaling_factor: float,
+    routing_mode: int,
+    max_routed_rows: int,
+) -> torch.Tensor:
+    return torch.zeros_like(hidden_states)
+
+
+@nvfp4_a16_moe_plugin.register_fake
+def _(router_logits, hidden_states, fc1_qweights, fc1_block_scales,
+      fc1_global_scales, fc2_qweights, fc2_block_scales, fc2_global_scales,
+      e_score_correction_bias, num_experts, top_k, hidden_size, moe_inter_size,
+      activation_type, n_group, topk_group, norm_topk_prob,
+      routed_scaling_factor, routing_mode, max_routed_rows):
+    return torch.empty_like(hidden_states)
+
+
+# ---------------------------------------------------------------------------
 # Custom op: trt_edgellm::NvFP4MoEPluginGeforce
 #   SM12x (consumer Blackwell) fused NVFP4 MoE. Same signature as
 #   ``nvfp4_moe_plugin``; FC1 weights must be in the plain ``[up, gate]``
@@ -1529,6 +1570,45 @@ def fp16_moe_plugin(
 def _(router_logits, hidden_states, fc1_weights, fc2_weights, num_experts,
       top_k, hidden_size, moe_inter_size, activation_type, norm_topk_prob,
       max_routed_rows):
+    return torch.empty_like(hidden_states)
+
+
+# ---------------------------------------------------------------------------
+# Custom op: trt_edgellm::Fp16MoePluginSigmoid
+#   Same FP16 grouped-GEMM plugin (Fp16MoePlugin) as ``fp16_moe_plugin`` but
+#   with DeepSeek/Nemotron-H sigmoid-group-topk routing: adds the
+#   ``e_score_correction_bias`` input and the n_group / topk_group /
+#   routed_scaling_factor attributes.
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt_edgellm::Fp16MoePluginSigmoid", mutates_args=())
+def fp16_moe_plugin_sigmoid(
+    router_logits: torch.Tensor,  # [numTokens, num_experts] float32
+    hidden_states: torch.Tensor,  # [B, S, hidden_size] float16
+    fc1_weights: torch.
+    Tensor,  # [E, moe_inter, hidden] float16 (ReLU2, ungated)
+    fc2_weights: torch.Tensor,  # [E, hidden, moe_inter] float16
+    e_score_correction_bias: torch.Tensor,  # [E] float32
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    moe_inter_size: int,
+    activation_type: int,
+    n_group: int,
+    topk_group: int,
+    norm_topk_prob: int,
+    routed_scaling_factor: float,
+    max_routed_rows: int,
+) -> torch.Tensor:
+    return torch.zeros_like(hidden_states)
+
+
+@fp16_moe_plugin_sigmoid.register_fake
+def _(router_logits, hidden_states, fc1_weights, fc2_weights,
+      e_score_correction_bias, num_experts, top_k, hidden_size, moe_inter_size,
+      activation_type, n_group, topk_group, norm_topk_prob,
+      routed_scaling_factor, max_routed_rows):
     return torch.empty_like(hidden_states)
 
 

@@ -112,6 +112,8 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
         /*.maxIntermediateSeqLen=*/0,
         /*.recurrentStateType=*/cfg.recurrentStateDtype,
         /*.convStateType=*/cfg.convStateDtype,
+        /*.recurrentStateNumGroups=*/cfg.recurrentStateNumGroups,
+        /*.specVerifyUsesReplay=*/cfg.recurrentSpecVerifyUsesReplay,
     };
     rt::HybridCacheManager::Config hybridCfg{
         /*.layerTypes=*/cfg.layerTypes,
@@ -218,6 +220,8 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.maxIntermediateSeqLen=*/baseMaxIntermediateSeqLen,
             /*.recurrentStateType=*/bundle.base.recurrentStateDtype,
             /*.convStateType=*/bundle.base.convStateDtype,
+            /*.recurrentStateNumGroups=*/bundle.base.recurrentStateNumGroups,
+            /*.specVerifyUsesReplay=*/bundle.base.recurrentSpecVerifyUsesReplay,
         };
         rt::HybridCacheManager::Config hybridCfg{
             /*.layerTypes=*/bundle.base.layerTypes,

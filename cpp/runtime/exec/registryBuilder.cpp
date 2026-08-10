@@ -205,19 +205,36 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
             addMambaTensor(binding_names::kConvStateTemplate, TensorIO::kInput, cfg.convStateDtype, convShape);
             addMambaTensor(binding_names::kPresentConvStateTemplate, TensorIO::kOutput, cfg.convStateDtype, convShape);
 
-            // Hybrid MTP/DFlash base only: per-layer intermediate state outputs
-            // written during prefill/verification so accepted recurrent/conv
-            // state snapshots can be committed after speculative verification.
-            //
-            // intermediate_recurrent_state_%d: [batch, seqLen, recurrentNumHeads, recurrentHeadDim, recurrentStateSize]
-            // intermediate_conv_state_%d:      [batch, seqLen, convDim, convKernel]
+            // Hybrid MTP/DFlash/DSpark base: declare the per-layer spec-verify recurrent-state
+            // outputs. recurrentSpecVerifyUsesReplay selects which output set the engine declares
+            // (replay stash vs full-state snapshot).
             if (cfg.specDecodeType == SpecDecodeMode::kMTP || cfg.specDecodeType == SpecDecodeMode::kDFlash
                 || cfg.specDecodeType == SpecDecodeMode::kDSpark)
             {
-                std::vector<ShapeDim> const interRecShape{sym(&InferenceDims::batch), sym(&InferenceDims::seqLen),
-                    fixed(cfg.recurrentStateNumHeads), fixed(cfg.recurrentStateHeadDim), fixed(cfg.recurrentStateSize)};
-                addMambaTensor(binding_names::kIntermediateRecurrentStateTemplate, TensorIO::kOutput,
-                    cfg.recurrentStateDtype, interRecShape);
+                bool const useReplay = cfg.recurrentSpecVerifyUsesReplay;
+                if (useReplay)
+                {
+                    // replay_da_state_%d: [batch, seqLen, recurrentNumHeads]
+                    addMambaTensor(binding_names::kReplayDaStateTemplate, TensorIO::kOutput, nvinfer1::DataType::kFLOAT,
+                        {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(cfg.recurrentStateNumHeads)});
+                    // replay_u_state_%d: [batch, seqLen, recurrentNumHeads, recurrentHeadDim]
+                    addMambaTensor(binding_names::kReplayUStateTemplate, TensorIO::kOutput, nvinfer1::DataType::kFLOAT,
+                        {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(cfg.recurrentStateNumHeads),
+                            fixed(cfg.recurrentStateHeadDim)});
+                    // replay_b_state_%d: [batch, seqLen, recurrentNumGroups, recurrentStateSize]
+                    addMambaTensor(binding_names::kReplayBStateTemplate, TensorIO::kOutput, nvinfer1::DataType::kFLOAT,
+                        {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(cfg.recurrentStateNumGroups),
+                            fixed(cfg.recurrentStateSize)});
+                }
+                else
+                {
+                    // intermediate_recurrent_state_%d: [batch, seqLen, recurrentNumHeads, recurrentHeadDim, dstate]
+                    std::vector<ShapeDim> const interRecShape{sym(&InferenceDims::batch), sym(&InferenceDims::seqLen),
+                        fixed(cfg.recurrentStateNumHeads), fixed(cfg.recurrentStateHeadDim),
+                        fixed(cfg.recurrentStateSize)};
+                    addMambaTensor(binding_names::kIntermediateRecurrentStateTemplate, TensorIO::kOutput,
+                        cfg.recurrentStateDtype, interRecShape);
+                }
                 if (cfg.convDim > 0 && cfg.convKernel > 0)
                 {
                     std::vector<ShapeDim> const interConvShape{sym(&InferenceDims::batch), sym(&InferenceDims::seqLen),
