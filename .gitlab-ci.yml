@@ -44,6 +44,18 @@ workflow:
         EDGE_LLM_PIPELINE_NAME: "L0 Stability"
     - if: $CI_PIPELINE_SOURCE == "schedule"
       when: never
+    # Keep the MR pipeline and prechecks, but let job rules omit L0 work.
+    # The label is the primary opt-out; the MR title remains a compatibility fallback.
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)\[skip tests\](,|$)/
+      variables:
+        EDGE_LLM_SKIP_TESTS: "true"
+      auto_cancel:
+        on_new_commit: interruptible
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TITLE =~ /\[skip tests\]/
+      variables:
+        EDGE_LLM_SKIP_TESTS: "true"
+      auto_cancel:
+        on_new_commit: interruptible
     # Run for non-draft MRs (L0 tests).
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       auto_cancel:
