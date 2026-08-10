@@ -19,7 +19,7 @@ CMake commands.
 | Compatible | Expected to work with the listed constraints, but not the primary release target. |
 | Developer-only | Useful for development or CI coverage; not an edge deployment support target. |
 
-## TensorRT Edge-LLM 0.9.1
+## TensorRT Edge-LLM 0.10.0
 
 | Platform | Support Level | OS / SDK Release | CUDA Toolkit | TensorRT | Build Location | Precision Notes |
 |----------|---------------|------------------|--------------|----------|----------------|-----------------|
