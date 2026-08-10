@@ -931,7 +931,8 @@ def _export_llm(model_dir: str,
                 externalize_weights: "list[str] | None" = None,
                 tp_size: int = 1,
                 num_decoder_layers: "int | None" = None,
-                skip_softmax_scale_factor: "float | None" = None) -> None:
+                skip_softmax_scale_factor: "float | None" = None,
+                quantization_override: "str | None" = None) -> None:
     """Export LLM backbone via the standard tensorrt_edgellm pipeline.
 
     When ``tp_size > 1``, exports ``tp_size`` per-rank ONNX files named
@@ -961,20 +962,27 @@ def _export_llm(model_dir: str,
         from ..models.qwen3_moe import MODELOPT_KEY_REMAP
         key_remap = MODELOPT_KEY_REMAP
 
-    # Gemma4 NVFP4 MoE: checkpoint stores router/experts at layer level but
+    # Gemma4 MoE: checkpoint stores router/experts at layer level but
     # model tree nests them under moe_block with _experts indirection.
-    # Only activate when the checkpoint is NVFP4-quantized (otherwise the
-    # FP16 dense path uses router/experts directly on the layer).
+    # Activate when the checkpoint has MoE (quantized or BF16 QAT).
+    _needs_moe_quantization = False
     if key_remap is None and model_type in _GEMMA4_MODEL_TYPES:
-        if _is_nvfp4_checkpoint(model_dir):
-            config_path = os.path.join(model_dir, "config.json")
-            with open(config_path) as f:
-                _cfg = json.load(f)
-            _llm = _cfg.get("text_config", _cfg)
-            # Only MoE checkpoints (e.g. 26B-A4B) nest router/experts under
-            # moe_block and need the remap; dense NVFP4 checkpoints (E2B/E4B/
-            # 31B) have enable_moe_block=False and export directly.
-            if _llm.get("enable_moe_block", False):
+        config_path = os.path.join(model_dir, "config.json")
+        with open(config_path) as f:
+            _cfg = json.load(f)
+        _llm = _cfg.get("text_config", _cfg)
+        if _llm.get("enable_moe_block", False):
+            _is_nvfp4 = _is_nvfp4_checkpoint(model_dir)
+            _has_int4_cfg = os.path.isfile(
+                os.path.join(model_dir, "hf_quant_config.json"))
+            _needs_moe_quantization = (not _is_nvfp4 and not _has_int4_cfg)
+            if _needs_moe_quantization:
+                # BF16 QAT-unquantized: fused expert tensors
+                from ..models.gemma4.modeling_gemma4_text import \
+                    GEMMA4_FUSED_BF16_KEY_REMAP
+                key_remap = GEMMA4_FUSED_BF16_KEY_REMAP
+            else:
+                # NVFP4 or INT4 AWQ: per-expert quantized weights
                 from ..models.gemma4.modeling_gemma4_text import \
                     GEMMA4_NVFP4_KEY_REMAP
                 key_remap = GEMMA4_NVFP4_KEY_REMAP
@@ -996,6 +1004,16 @@ def _export_llm(model_dir: str,
         logger.info("[LLM] Loading checkpoint from %s", model_dir)
         try:
             from ..model import AutoModel
+
+            # Build config overrides for on-the-fly quantization of BF16 MoE
+            # checkpoints (e.g. --quantization int4_awq on a QAT-unquantized ckpt).
+            _extra_configs = None
+            if quantization_override == "int4_awq" and _needs_moe_quantization:
+                _extra_configs = {
+                    "_needs_moe_quantization": True,
+                    "_use_int4_moe_plugin": True,
+                }
+
             model = AutoModel.from_pretrained(
                 model_dir,
                 device="cpu",
@@ -1014,6 +1032,7 @@ def _export_llm(model_dir: str,
                 tp_size=world,
                 tp_rank=rank,
                 num_decoder_layers=num_decoder_layers,
+                extra_configs=_extra_configs,
             )
         except (OSError, ValueError, RuntimeError, ImportError) as exc:
             logger.exception("[LLM] Failed to load checkpoint")
@@ -3717,10 +3736,18 @@ def main() -> None:
         type=int,
         choices=[1, 2],
         default=2,
-        help=("INT4 groupwise GEMM plugin backend to export with."
+        help=("INT4 groupwise GEMM plugin backend to export with. "
               "2 (default) targets the cuteDSL Int4GroupwiseGemmPluginV2 with "
               "fragment-layout weights; 1 targets the legacy "
               "Int4GroupwiseGemmPlugin with AWQ-swizzled weights."),
+    )
+    p.add_argument(
+        "--quantization",
+        default=None,
+        choices=["int4_awq", "nvfp4"],
+        help=("Override quantization type for BF16/FP16 checkpoints. "
+              "Applies on-the-fly quantization during export (e.g. INT4 RTN "
+              "for QAT models stored in BF16)."),
     )
     args = p.parse_args()
 
@@ -4069,7 +4096,8 @@ def main() -> None:
              externalize_weights=externalize_weights,
              tp_size=args.tp_size,
              num_decoder_layers=args.num_decoder_layer,
-             skip_softmax_scale_factor=args.skip_softmax_scale_factor)),
+             skip_softmax_scale_factor=args.skip_softmax_scale_factor,
+             quantization_override=getattr(args, 'quantization', None))),
         (args.mtp and not gemma4_mtp_requested
          and _allow("mtp_draft"), "mtp_draft", lambda out: _export_mtp_draft(
              model_dir, out, externalize_weights=externalize_weights)),

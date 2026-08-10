@@ -156,7 +156,8 @@ class AutoModel:
                         gemma4_mtp_draft: bool = False,
                         gemma4_kv_sharing_map: "list[dict] | None" = None,
                         gemma4_target_kv_cache_quant: "str | None" = None,
-                        num_decoder_layers: "int | None" = None) -> nn.Module:
+                        num_decoder_layers: "int | None" = None,
+                        extra_configs: "dict | None" = None) -> nn.Module:
         """Construct and load a model from *model_dir*.
 
         Reads ``config.json`` via :class:`~config.ModelConfig`, looks up the
@@ -229,6 +230,9 @@ class AutoModel:
         from .models.default.modeling_default import CausalLM
 
         config = load_model_config(model_dir)
+        if extra_configs:
+            for key, value in extra_configs.items():
+                setattr(config, key, value)
         # Qwen3-Omni Next ships both dense and sparse-MoE thinkers under the
         # same ``qwen3_omni_next_text`` model_type (the HF config is not
         # rewritten for the MoE variant). Detect MoE by ``num_experts > 0`` and
