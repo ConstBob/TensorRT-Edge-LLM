@@ -136,12 +136,16 @@ struct LLMEngineConfig
     bool useVisionBidirectionalAttention{false};
 
     // --- Hybrid model (Mamba/GDN) state dimensions ---
-    int32_t numLinearAttnLayers{0};    //!< Number of linear attention / recurrent layers
-    int32_t recurrentStateNumHeads{0}; //!< Recurrent state heads (hv for GDN, mamba_num_heads for Mamba)
-    int32_t recurrentStateHeadDim{0};  //!< Recurrent state head dimension
-    int32_t recurrentStateSize{0};     //!< Recurrent state dimension (v for GDN, dstate for Mamba)
-    int32_t convDim{0};                //!< Conv1d channel dimension
-    int32_t convKernel{0};             //!< Conv1d kernel width
+    int32_t numLinearAttnLayers{0};     //!< Number of linear attention / recurrent layers
+    int32_t recurrentStateNumHeads{0};  //!< Recurrent state heads (hv for GDN, mamba_num_heads for Mamba)
+    int32_t recurrentStateHeadDim{0};   //!< Recurrent state head dimension
+    int32_t recurrentStateSize{0};      //!< Recurrent state dimension (v for GDN, dstate for Mamba)
+    int32_t recurrentStateNumGroups{0}; //!< Mamba B/C group count (spec-verify replay-B extent; 0 for GDN)
+    //! MTP spec-verify recurrent-state commit mode, parsed from `recurrent_spec_verify_mode`
+    //! ("replay" → true, "snapshot"/absent → false).
+    bool recurrentSpecVerifyUsesReplay{false};
+    int32_t convDim{0};    //!< Conv1d channel dimension
+    int32_t convKernel{0}; //!< Conv1d kernel width
 
     // --- SpecDecode engine limits (per-engine) ---
     //! Max seq_len the base engine accepts for proposal verification. Parsed from

@@ -617,6 +617,13 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     cfg.numLinearAttnLayers = configJson.value("num_linear_attn_layers", 0);
     cfg.numAttentionLayers = configJson.value("num_attention_layers", cfg.numDecoderLayers);
     cfg.recurrentStateNumHeads = configJson.value("recurrent_state_num_heads", 0);
+    cfg.recurrentStateNumGroups = configJson.value("recurrent_state_num_groups", 0);
+    // Explicit MTP spec-verify commit mode: "replay" (Mamba SSM) vs "snapshot" (GDN/DDTree).
+    std::string const recurrentSpecVerifyMode = configJson.value("recurrent_spec_verify_mode", std::string{"snapshot"});
+    ELLM_CHECK(recurrentSpecVerifyMode == "replay" || recurrentSpecVerifyMode == "snapshot",
+        "parseEngineConfig: invalid recurrent_spec_verify_mode '" + recurrentSpecVerifyMode
+            + "'; expected \"replay\" or \"snapshot\".");
+    cfg.recurrentSpecVerifyUsesReplay = (recurrentSpecVerifyMode == "replay");
     cfg.recurrentStateHeadDim = configJson.value("recurrent_state_head_dim", 0);
     cfg.recurrentStateSize = configJson.value("recurrent_state_size", 0);
     cfg.convDim = configJson.value("conv_dim", 0);
@@ -768,7 +775,11 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath)
     parseGemma4MTPFields(configJson, cfg);
 
     // --- Draft-specific ---
-    cfg.numAttentionLayers = cfg.numDecoderLayers;
+    // A hybrid draft (e.g. Nemotron-H MTP: attention + MoE) has fewer KV-bearing
+    // attention layers than total layers, so honor an explicit
+    // ``num_attention_layers`` (matches parseEngineConfig); default to the
+    // decoder-layer count for single-type drafts that omit it.
+    cfg.numAttentionLayers = configJson.value("num_attention_layers", cfg.numDecoderLayers);
     // Match the engine's `rope_rotary_cos_sin` binding shape. Most partial
     // rotary models expose a smaller binding via `partial_rotary_factor`, while
     // proportional RoPE keeps a headDim-sized binding and treats the non-rotated

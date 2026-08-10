@@ -944,6 +944,53 @@ def _int4_moe_plugin_translation(
 
 
 @script()
+def _nvfp4_a16_moe_plugin_translation(
+    router_logits: onnxscript.FLOAT,
+    hidden_states: onnxscript.FLOAT16,
+    fc1_qweights: onnxscript.INT8,
+    fc1_block_scales: onnxscript.INT8,
+    fc1_global_scales: onnxscript.FLOAT16,
+    fc2_qweights: onnxscript.INT8,
+    fc2_block_scales: onnxscript.INT8,
+    fc2_global_scales: onnxscript.FLOAT16,
+    e_score_correction_bias: onnxscript.FLOAT,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    moe_inter_size: int,
+    activation_type: int,
+    n_group: int,
+    topk_group: int,
+    norm_topk_prob: int,
+    routed_scaling_factor: float,
+    routing_mode: int,
+    max_routed_rows: int,
+) -> onnxscript.FLOAT16:
+    return _trt_edgellm.Nvfp4A16MoePlugin(
+        router_logits,
+        hidden_states,
+        fc1_qweights,
+        fc1_block_scales,
+        fc1_global_scales,
+        fc2_qweights,
+        fc2_block_scales,
+        fc2_global_scales,
+        e_score_correction_bias,
+        num_experts=num_experts,
+        top_k=top_k,
+        hidden_size=hidden_size,
+        moe_inter_size=moe_inter_size,
+        activation_type=activation_type,
+        n_group=n_group,
+        topk_group=topk_group,
+        norm_topk_prob=norm_topk_prob,
+        routed_scaling_factor=routed_scaling_factor,
+        routing_mode=routing_mode,
+        max_routed_rows=max_routed_rows,
+    )
+
+
+@script()
 def _nvfp4_moe_plugin_translation(
     router_logits: onnxscript.FLOAT,
     hidden_states: onnxscript.FLOAT16,
@@ -1090,6 +1137,45 @@ def _fp16_moe_plugin_translation(
     return output
 
 
+@script()
+def _fp16_moe_plugin_sigmoid_translation(
+    router_logits: onnxscript.FLOAT,
+    hidden_states: onnxscript.FLOAT16,
+    fc1_weights: onnxscript.FLOAT16,
+    fc2_weights: onnxscript.FLOAT16,
+    e_score_correction_bias: onnxscript.FLOAT,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    moe_inter_size: int,
+    activation_type: int,
+    n_group: int,
+    topk_group: int,
+    norm_topk_prob: int,
+    routed_scaling_factor: float,
+    max_routed_rows: int,
+) -> onnxscript.FLOAT16:
+    output = _trt_edgellm.Fp16MoePlugin(
+        router_logits,
+        hidden_states,
+        fc1_weights,
+        fc2_weights,
+        e_score_correction_bias,
+        num_experts=num_experts,
+        top_k=top_k,
+        hidden_size=hidden_size,
+        moe_inter_size=moe_inter_size,
+        activation_type=activation_type,
+        norm_topk_prob=norm_topk_prob,
+        max_routed_rows=max_routed_rows,
+        n_group=n_group,
+        topk_group=topk_group,
+        routed_scaling_factor=routed_scaling_factor,
+        routing_mode=1,
+    )
+    return output
+
+
 # ---------------------------------------------------------------------------
 # FusedNvfp4GemmAllReducePlugin (row-parallel NVFP4 GEMM + AllReduce)
 # ---------------------------------------------------------------------------
@@ -1231,6 +1317,8 @@ def build_custom_translation_table() -> dict:
         _causal_conv1d_intermediate_dispatch,
         torch.ops.trt_edgellm.update_ssm_state.default:
         _update_ssm_state_translation,
+        torch.ops.trt_edgellm.update_ssm_state_with_intermediate.default:
+        _update_ssm_state_with_intermediate_translation,
         torch.ops.trt_edgellm.gated_delta_net.default:
         _gated_delta_net_dispatch,
         torch.ops.trt_edgellm.gated_delta_net_with_intermediate.default:
@@ -1245,10 +1333,14 @@ def build_custom_translation_table() -> dict:
         _int4_moe_plugin_translation,
         torch.ops.trt_edgellm.Nvfp4MoePlugin.default:
         _nvfp4_moe_plugin_translation,
+        torch.ops.trt_edgellm.Nvfp4A16MoePlugin.default:
+        _nvfp4_a16_moe_plugin_translation,
         torch.ops.trt_edgellm.NvFP4MoEPluginGeforce.default:
         _nvfp4_moe_plugin_geforce_translation,
         torch.ops.trt_edgellm.Fp16MoePlugin.default:
         _fp16_moe_plugin_translation,
+        torch.ops.trt_edgellm.Fp16MoePluginSigmoid.default:
+        _fp16_moe_plugin_sigmoid_translation,
         torch.ops.trt_edgellm.dflash_target_kv_cache_update.default:
         _dflash_target_kv_cache_update_translation,
         # TRT native attention ops (used by Alpamayo)

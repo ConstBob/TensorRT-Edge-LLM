@@ -736,10 +736,21 @@ void invokeSelectiveStateUpdatePrefill(trt_edgellm::rt::Tensor const& x, trt_edg
 // Public non-templated API (MTP spec-verify replay reconstruction).
 void invokeMambaReplayReconstruct(trt_edgellm::rt::Tensor& state, trt_edgellm::rt::Tensor const& replayDA,
     trt_edgellm::rt::Tensor const& replayU, trt_edgellm::rt::Tensor const& replayB,
-    trt_edgellm::rt::Tensor const& acceptedLengths, cudaStream_t stream)
+    trt_edgellm::rt::Tensor const& acceptedLengths, int32_t activeBatchSize, cudaStream_t stream)
 {
+    if (activeBatchSize <= 0)
+    {
+        return;
+    }
+    if (activeBatchSize > static_cast<int32_t>(state.getShape()[0]))
+    {
+        throw std::runtime_error("invokeMambaReplayReconstruct: activeBatchSize exceeds the state pool batch size.");
+    }
+
     SelectiveStateUpdateParams params{};
-    params.batch = static_cast<uint32_t>(state.getShape()[0]);
+    // State pools are sized to maxBatch; bound the reconstruction to the active
+    // sequences so the kernel does not read past acceptedLengths[activeBatch).
+    params.batch = static_cast<uint32_t>(activeBatchSize);
     params.nheads = static_cast<uint32_t>(state.getShape()[1]);
     params.dim = static_cast<uint32_t>(state.getShape()[2]);
     params.dstate = static_cast<uint32_t>(state.getShape()[3]);

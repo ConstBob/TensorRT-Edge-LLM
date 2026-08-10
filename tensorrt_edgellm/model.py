@@ -355,16 +355,21 @@ class AutoModel:
             if key_remap is None:
                 key_remap = _eagle3_key_remap
         elif variant == "mtp_draft":
+            is_nemotron_h_mtp = config.is_nemotron_h
             # TODO: support other model types
-            if not _is_qwen3_5_mtp_draft_supported(config.model_type):
+            if not (is_nemotron_h_mtp
+                    or _is_qwen3_5_mtp_draft_supported(config.model_type)):
                 raise NotImplementedError(
                     "MTP draft is only supported for qwen3_5_text / "
-                    "qwen3_5_moe_text / qwen3_omni_next_text_moe "
-                    f"checkpoints; got {config.model_type!r}.")
+                    "qwen3_5_moe_text / qwen3_omni_next_text_moe / "
+                    f"Nemotron-H checkpoints; got {config.model_type!r}.")
             draft_model_type = config.model_type
             tie_word_embeddings = config.tie_word_embeddings
             config = make_mtp_draft_config(config)
-            if draft_model_type == "qwen3_omni_next_text_moe":
+            if is_nemotron_h_mtp:
+                from .models.nemotron_h import NemotronHMtpDraftModel
+                model_class = NemotronHMtpDraftModel
+            elif draft_model_type == "qwen3_omni_next_text_moe":
                 from .models.qwen3_omni_next import \
                     Qwen3OmniNextMoeMtpDraftModel
                 model_class = Qwen3OmniNextMoeMtpDraftModel
@@ -435,12 +440,11 @@ class AutoModel:
             if key_remap is None:
                 key_remap = _dspark_key_remap
         else:
-            if (variant == "mtp_base"
+            if (variant == "mtp_base" and not config.is_nemotron_h
                     and not _is_qwen3_5_mtp_base_supported(config.model_type)):
                 raise NotImplementedError(
-                    "Qwen3.5 MTP base is only supported for qwen3_5_text "
-                    "qwen3_5_moe, or qwen3_5_moe_text checkpoints; "
-                    f"got {config.model_type!r}.")
+                    "MTP base is only supported for Qwen3.5 (text/MoE) and "
+                    f"Nemotron-H checkpoints; got {config.model_type!r}.")
             if variant == "gemma4_mtp_base":
                 if config.model_type not in ("gemma4", "gemma4_text"):
                     raise ValueError(

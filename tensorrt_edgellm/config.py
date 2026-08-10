@@ -668,6 +668,11 @@ class ModelConfig:
     # ------------------------------------------ MTP config
     mtp_num_hidden_layers: Optional[int] = None
     mtp_use_dedicated_embeddings: bool = False
+    # Nemotron-H MTP: the draft module is a hybrid stack whose layer types come
+    # from this pattern (e.g. "*E" -> [attention, MoE]); ``mtp_num_hidden_layers``
+    # is then its length. ``num_nextn_predict_layers`` (the count of MTP prediction
+    # modules) is folded in during parsing.
+    mtp_hybrid_override_pattern: Optional[str] = None
     # When True, the standard CausalLM is exported as the MTP base model variant
     # with tree-attention inputs (attention_mask, attention_pos_id) and
     # an extra hidden_states output.
@@ -816,9 +821,9 @@ class ModelConfig:
     def is_mtp_draft(self) -> bool:
         """True for a derived MTP draft config built from a base checkpoint."""
         return bool(self.mtp_num_hidden_layers is not None
-                    and self.gdn_cfg is None and not self.mtp_base
-                    and not self.is_eagle3_draft and not self.is_dflash_draft
-                    and not self.is_dspark_draft)
+                    and self.gdn_cfg is None and self.mamba_cfg is None
+                    and not self.mtp_base and not self.is_eagle3_draft
+                    and not self.is_dflash_draft and not self.is_dspark_draft)
 
     @property
     def is_gemma4_mtp_draft(self) -> bool:
@@ -1017,6 +1022,13 @@ class ModelConfig:
         mtp_num_hidden_layers = llm_dict.get("mtp_num_hidden_layers")
         if mtp_num_hidden_layers is not None:
             mtp_num_hidden_layers = int(mtp_num_hidden_layers)
+        mtp_hybrid_override_pattern = llm_dict.get(
+            "mtp_hybrid_override_pattern")
+        num_nextn_predict_layers = int(
+            llm_dict.get("num_nextn_predict_layers", 0) or 0)
+        if (mtp_num_hidden_layers is None and num_nextn_predict_layers > 0
+                and mtp_hybrid_override_pattern):
+            mtp_num_hidden_layers = len(mtp_hybrid_override_pattern)
         mtp_use_dedicated_embeddings = bool(
             llm_dict.get("mtp_use_dedicated_embeddings", False))
         _validate_mtp_constraints(
@@ -1155,6 +1167,7 @@ class ModelConfig:
             attn_output_gate=bool(llm_dict.get("attn_output_gate", False)),
             mtp_num_hidden_layers=mtp_num_hidden_layers,
             mtp_use_dedicated_embeddings=mtp_use_dedicated_embeddings,
+            mtp_hybrid_override_pattern=mtp_hybrid_override_pattern,
             mtp_base=bool(llm_dict.get("mtp_base", False)),
             root_model_type=root_model_type,
             raw_layer_types=raw_layer_types,
@@ -1261,6 +1274,39 @@ def make_mtp_draft_config(base_config: ModelConfig) -> ModelConfig:
     if mtp_num_hidden_layers is None:
         raise ValueError(
             "MTP draft config requires mtp_num_hidden_layers in the base config."
+        )
+
+    # Nemotron-H: Exclude all draft ``layers.*`` modules from quantization;
+    # the untouched lm_head keeps the base quant type.
+    if (base_config.model_type or "").lower().startswith("nemotron_h"):
+        pattern = base_config.mtp_hybrid_override_pattern or ""
+        _MTP_PATTERN_MAP = {
+            "M": LAYER_MAMBA,
+            "-": LAYER_MLP,
+            "*": LAYER_ATTN,
+            "E": LAYER_MOE,
+        }
+        draft_layer_types = [
+            _MTP_PATTERN_MAP[ch] for ch in pattern if ch in _MTP_PATTERN_MAP
+        ]
+        if len(draft_layer_types) != mtp_num_hidden_layers:
+            raise ValueError(
+                f"mtp_hybrid_override_pattern {pattern!r} yields "
+                f"{len(draft_layer_types)} layers != mtp_num_hidden_layers "
+                f"{mtp_num_hidden_layers}")
+        draft_quant = replace(
+            base_config.quant,
+            excluded=list(base_config.quant.excluded) + ["layers.*"],
+        )
+        return replace(
+            base_config,
+            num_hidden_layers=mtp_num_hidden_layers,
+            layer_types=draft_layer_types,
+            mamba_cfg=None,
+            gdn_cfg=None,
+            mtp_base=False,
+            quant=draft_quant,
+            tie_word_embeddings=False,
         )
 
     # The draft is quantized iff its FFN compute weights are quantized
@@ -1595,9 +1641,16 @@ def _validate_mtp_constraints(
     """Validate the currently supported MTP config subset."""
     if mtp_num_hidden_layers is None and not mtp_use_dedicated_embeddings:
         return
+    if (model_type or "").lower().startswith("nemotron_h"):
+        if mtp_use_dedicated_embeddings:
+            raise NotImplementedError(
+                "Dedicated MTP embeddings are not supported for Nemotron-H MTP."
+            )
+        return
     if model_type not in _QWEN3_5_MTP_CONFIG_MODEL_TYPES:
         raise NotImplementedError(
-            "MTP config parsing is only supported for Qwen3.5 checkpoints.")
+            "MTP config parsing is only supported for Qwen3.5 and Nemotron-H "
+            "checkpoints.")
     if mtp_num_hidden_layers != 1:
         raise NotImplementedError(
             "Only mtp_num_hidden_layers == 1 is supported for Qwen3.5 MTP.")
@@ -2251,8 +2304,18 @@ def _parse_mixed_precision(quantized_layers: dict) -> "tuple[str, int, dict]":
             algo_group_size[algo] = int(layer_cfg.get("group_size", 1))
     if not algo_count:
         return QUANT_FP16, 1, {}
+
+    def _mixed_quant_type(algo: str) -> str:
+        # ModelOpt tags weight-only NVFP4 as ``W4A16_NVFP4``; the generic mapper
+        # collapses it to plain (W4A4) ``nvfp4``. Preserve the A16 distinction so
+        # weight-only experts/lm_head route to the NVFP4-A16 Marlin path.
+        qt = _algo_to_quant_type(algo)
+        if qt == QUANT_NVFP4 and "W4A16" in algo.upper():
+            return QUANT_NVFP4_A16
+        return qt
+
     dominant_algo = algo_count.most_common(1)[0][0]
-    dominant_type = _algo_to_quant_type(dominant_algo)
+    dominant_type = _mixed_quant_type(dominant_algo)
     dominant_group_size = algo_group_size.get(dominant_algo, 1)
     # Expand fused projection keys (``self_attn.qkv_proj``,
     # ``mlp.gate_up_proj``) into the split names ``make_linear`` looks up
@@ -2261,7 +2324,7 @@ def _parse_mixed_precision(quantized_layers: dict) -> "tuple[str, int, dict]":
     for name, layer_cfg in quantized_layers.items():
         algo = layer_cfg.get("quant_algo", "").upper()
         short_name = _normalize_module_name(name)
-        quant_type = _algo_to_quant_type(algo)
+        quant_type = _mixed_quant_type(algo)
         if short_name.endswith(".self_attn.qkv_proj"):
             prefix = short_name[:-len("qkv_proj")]
             for proj in ("q_proj", "k_proj", "v_proj"):
