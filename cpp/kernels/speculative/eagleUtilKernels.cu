@@ -439,9 +439,10 @@ __global__ void constructVerificationDraftTreeKernel(int32_t const* draftIdFullT
         return;
     }
 
-    // 10 Should be sufficient since we don't have too many levels of drafting.
+    // Sized for kMTPMaxAcceptDepthForCurrentEagleUtilityKernels + 1 (see deploymentConfig.cpp), so the
+    // deepest accept path allowed by config validation always fits with one level of headroom.
     // We don't use shared memory since the data tables are small and can automatically fit into L1.
-    constexpr int32_t kMAX_DEPTH{10};
+    constexpr int32_t kMAX_DEPTH{17};
     int32_t parentIndices[kMAX_DEPTH] = {-1};
     int32_t attendedIndices[kMAX_DEPTH + 1] = {-1};
 

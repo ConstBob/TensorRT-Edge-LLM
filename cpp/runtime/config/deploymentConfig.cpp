@@ -469,10 +469,10 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
             if (cfg.base.specDecodeType == SpecDecodeMode::kMTP)
             {
                 // MTP base verification currently reuses EAGLE utility kernels for accept, KV commit,
-                // and hidden-state compaction. Those kernels support maxDepth <= 9. Each round
+                // and hidden-state compaction. Those kernels support maxDepth <= 16. Each round
                 // accepts at most draftingStep matched proposals plus one bonus token, for both
                 // the linear chain and tree drafting, so the same depth bound applies to either mode.
-                static constexpr int32_t kMTPMaxAcceptDepthForCurrentEagleUtilityKernels = 9;
+                static constexpr int32_t kMTPMaxAcceptDepthForCurrentEagleUtilityKernels = 16;
                 int32_t const maxAcceptDepth = specConfig.draftingStep + 1;
                 ELLM_CHECK(maxAcceptDepth <= kMTPMaxAcceptDepthForCurrentEagleUtilityKernels,
                     "MTP max accept depth (draftingStep+1)=" + std::to_string(maxAcceptDepth)
