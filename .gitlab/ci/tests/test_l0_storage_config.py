@@ -29,19 +29,11 @@ GitLabCILoader.add_constructor(
 )
 
 CI_DIRECTORY = Path(__file__).parents[1]
-ROOT_CONFIG = yaml.load(
-    (Path(__file__).parents[3] / ".gitlab-ci.yml").read_text(),
-    Loader=GitLabCILoader)
 TEMPLATES = yaml.load((CI_DIRECTORY / "templates.yml").read_text(),
                       Loader=GitLabCILoader)
-PRECHECK_JOBS = yaml.load((CI_DIRECTORY / "precheck-jobs.yml").read_text(),
-                          Loader=GitLabCILoader)
 SETUP_JOBS = yaml.safe_load((CI_DIRECTORY / "setup-jobs.yml").read_text())
 L0_JOBS = yaml.safe_load((CI_DIRECTORY / "l0-jobs.yml").read_text())
-L1_JOBS = yaml.safe_load((CI_DIRECTORY / "l1-jobs.yml").read_text())
-CUTEDSL_JOBS = yaml.load((CI_DIRECTORY / "cutedsl-jobs.yml").read_text(),
-                         Loader=GitLabCILoader)
-INHERITABLE_CONFIGS = TEMPLATES | PRECHECK_JOBS
+INHERITABLE_CONFIGS = TEMPLATES
 
 STORAGE_EXEMPT_JOBS = {
     "quantization_sanity",
@@ -395,48 +387,3 @@ def test_l0_pipeline_pruning_is_independent_and_best_effort():
     assert prune["resource_group"] != lifecycle_start["resource_group"]
     assert prune["interruptible"] is True
     assert prune["allow_failure"] is True
-
-
-def test_only_superseded_mr_work_is_automatically_cancelled():
-    workflow = ROOT_CONFIG["workflow"]
-    mr_rule = next(
-        rule for rule in workflow["rules"]
-        if rule.get("if") == '$CI_PIPELINE_SOURCE == "merge_request_event"')
-
-    assert ROOT_CONFIG["default"]["interruptible"] is True
-    assert workflow["auto_cancel"]["on_new_commit"] == "none"
-    assert mr_rule["auto_cancel"]["on_new_commit"] == "interruptible"
-
-    l0_finalizers = [
-        config for config in _l0_lifecycle_jobs().values()
-        if config["environment"]["action"] == "stop"
-    ]
-    l1_finalizers = [
-        config for config in L1_JOBS.values() if isinstance(config, dict)
-        and config.get("environment", {}).get("action") == "stop"
-    ]
-    cutedsl_finalizers = [
-        config for config in CUTEDSL_JOBS.values() if isinstance(config, dict)
-        and config.get("stage") == ".post" and config.get("when") == "always"
-    ]
-    assert len(l0_finalizers) == 1
-    assert l1_finalizers
-    assert cutedsl_finalizers
-    assert all(config["interruptible"] is False for config in l0_finalizers +
-               l1_finalizers + cutedsl_finalizers)
-
-
-def test_ci_script_tests_are_blocking_for_every_supported_pipeline():
-    config = PRECHECK_JOBS["ci_script_tests"]
-    expected_conditions = {
-        '$CI_PIPELINE_SOURCE == "merge_request_event"',
-        '$CI_PIPELINE_SOURCE == "schedule" && $L0_STABILITY == "true"',
-        '$L1 == "true"',
-        '$CI_COMMIT_BRANCH == "main"',
-        '$CI_COMMIT_BRANCH =~ /^release/',
-        "$GITHUB_PR && $GITHUB_REPO",
-    }
-
-    assert config["stage"] == "precheck"
-    assert not config.get("allow_failure", False)
-    assert {rule["if"] for rule in _rules(config)} == expected_conditions

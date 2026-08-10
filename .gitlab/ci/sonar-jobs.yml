@@ -5,13 +5,9 @@
 .sonar_job:
   allow_failure: false
   rules:
-    # Explicit L1 runs include Sonar even when the commit has [skip tests].
+    # Explicit L1 runs include Sonar even when an MR requests [skip tests].
     - if: $L1 == "true"
-    - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
-      when: never
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TITLE =~ /\[skip tests\]/
-      when: never
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)\[skip tests\](,|$)/
+    - if: $EDGE_LLM_SKIP_TESTS == "true"
       when: never
     - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
     - if: $CI_COMMIT_BRANCH =~ /^release/

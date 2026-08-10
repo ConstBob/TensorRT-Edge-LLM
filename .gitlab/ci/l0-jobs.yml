@@ -4,8 +4,8 @@
 # Merge request storage:
 #   Workspace: /scratch.edge_llm_cache/L0/MR_<iid>/workspace/pipeline_<id>/
 #   ONNX:      /scratch.edge_llm_cache/L0/MR_<iid>/onnx_cache/
-#   ONNX exports are reused unless [reexport] is requested or exporter inputs
-#   change.
+#   ONNX exports are reused unless the ci:force-checkpoint-export MR label is
+#   present or exporter inputs change.
 #
 # Stability storage (scheduled with L0_STABILITY=true):
 #   Root: /scratch.edge_llm_cache/L0/STABILITY/
