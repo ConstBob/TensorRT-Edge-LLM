@@ -695,8 +695,8 @@ TEST_F(DeploymentConfigTest, MTPTreeRejectsDraftStepAboveDepthLimit)
 
     SpecDecodeDraftingConfig drafting{};
     drafting.draftingTopK = 2;
-    drafting.draftingStep = 9; // depth = 9 + 1 = 10 > 9 (EAGLE utility kernel limit)
-    drafting.verifySize = 12;
+    drafting.draftingStep = 16; // depth = 16 + 1 = 17 > kMTPMaxAcceptDepthForCurrentEagleUtilityKernels (16)
+    drafting.verifySize = 17;
 
     EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
                      std::optional<SpecDecodeDraftingConfig>{drafting}),
@@ -722,6 +722,26 @@ TEST_F(DeploymentConfigTest, MTPRejectsVerifySizeNotDraftStepPlusOne)
 
 TEST_F(DeploymentConfigTest, MTPRejectsVerifySizeAboveCurrentEagleUtilityKernelLimit)
 {
+    // Engine capacities of 32 keep every other constraint satisfied so the depth check is the
+    // only violation: chain verifySize = draftingStep + 1 = 17 implies accept depth 17 > 16.
+    Json const baseJson = makeMTPBaseConfig(/*maxVerify=*/32);
+    Json const draftJson = makeMTPDraftConfig(/*maxDraft=*/32);
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto const draftPath = writeJsonToTempFile(draftJson, "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 1;
+    drafting.draftingStep = 16;
+    drafting.verifySize = 17;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
+}
+
+TEST_F(DeploymentConfigTest, MTPAcceptsDepthAtCurrentEagleUtilityKernelLimit)
+{
+    // Boundary case: accept depth = draftingStep + 1 = 16 is exactly at the kernel limit.
     Json const baseJson = makeMTPBaseConfig(/*maxVerify=*/16);
     Json const draftJson = makeMTPDraftConfig(/*maxDraft=*/16);
     auto const basePath = writeJsonToTempFile(baseJson, "base");
@@ -732,9 +752,13 @@ TEST_F(DeploymentConfigTest, MTPRejectsVerifySizeAboveCurrentEagleUtilityKernelL
     drafting.draftingStep = 15;
     drafting.verifySize = 16;
 
-    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
-                     std::optional<SpecDecodeDraftingConfig>{drafting}),
-        std::runtime_error);
+    auto const bundle = createDeploymentConfig(
+        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<SpecDecodeDraftingConfig>{drafting});
+
+    EXPECT_EQ(bundle.specDecodeMode(), SpecDecodeMode::kMTP);
+    ASSERT_TRUE(bundle.specConfig.has_value());
+    EXPECT_EQ(bundle.specConfig->draftingStep, 15);
+    EXPECT_EQ(bundle.specConfig->verifySize, 16);
 }
 
 TEST_F(DeploymentConfigTest, DFlashLinearInfersVerifySizeFromBlockSize)
