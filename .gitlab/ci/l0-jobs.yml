@@ -187,6 +187,31 @@ l0_builder_a30:
     - .l0_rules
   interruptible: true
 
+# Building and testing with A30 Linux against TRT-RTX instead of Enterprise TRT.
+# Consumes the TRT-RTX-specific ONNX produced by l0_checkpoint_export_a30_trtrtx.
+l0_a30_trtrtx:
+  stage: l0_test
+  needs:
+    - l0_checkpoint_export_a30_trtrtx
+    - job: build_cutedsl_docker_matrix
+      artifacts: true
+  variables:
+    CUDA_VERSION: "13.2"
+    TRT_RTX_VERSION: "1.7.0.28"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    PRIORITY: l0_pipeline_a30_trtrtx
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/TensorRT-RTX/$TRT_RTX_VERSION/TensorRT-RTX-$TRT_RTX_VERSION-x86_64_rocky8_cuda13.4"
+    TRT_WHEEL_GLOB: "tensorrt_rtx-$TRT_RTX_VERSION*-cp312*"
+  tags:
+    - a30-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .l0_storage_paths
+    - .l0_a30_trtrtx_exports
+    - .x86_test_template
+    - .l0_rules
+  interruptible: true
+
 l0_rtx3090:
   stage: l0_test
   needs:
