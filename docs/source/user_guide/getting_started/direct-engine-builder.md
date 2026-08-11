@@ -25,7 +25,7 @@ python3 -m venv --system-site-packages .venv
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install \
   /path/to/TensorRT/python/tensorrt-<version>-cp312-none-linux_x86_64.whl
-.venv/bin/python -m pip install .
+.venv/bin/python -m pip install ".[builder]"
 ```
 
 Build Edge-LLM and its plugin library before compiling an engine:

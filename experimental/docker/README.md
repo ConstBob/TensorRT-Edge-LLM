@@ -29,7 +29,7 @@ Run the OpenAI-compatible experimental server:
 docker run --runtime nvidia --rm -it --network host \
   -v /data:/data \
   tensorrt-edge-llm:experimental \
-  python3 -m experimental.server --model Qwen/Qwen3-1.7B
+  tensorrt-edgellm-serve Qwen/Qwen3-1.7B --cache-dir /data/cache
 ```
 
-Model downloads and generated artifacts are cached under `/data`.
+Model downloads and complete runtime bundles are cached under `/data/cache`.

@@ -14,7 +14,8 @@
 # limitations under the License.
 """
 Unit coverage for the server-side video frame sampler
-(``experimental/server/video_sampling.py``): sampling math vs the HF pipelines,
+(``experimental/server/media/video_sampling.py``): sampling math vs the HF
+pipelines,
 source resolution, PyAV decode on synthetic clips, and request-budget/estimator
 checks. Loaded standalone; only the pybind-marked tests need the C++ runtime.
 
@@ -27,7 +28,7 @@ import base64
 
 import pytest
 
-import experimental.server.video_sampling as vs
+import experimental.server.media.video_sampling as vs
 
 # --- smart_nframes (frame-count selection) ---------------------------------
 
@@ -55,13 +56,18 @@ def test_resolve_video_source(tmp_path):
     assert vs.resolve_video_source(str(f)) == (str(f), None)
     for url in (
             "data:video/mp4,rawbytes",  # non-base64 data URL
-            "http://h/v.mp4",  # remote (host locally instead)
-            "https://h/v.mp4",
             "/no/such/clip.mp4",  # missing file (ValueError -> 400, not 500)
             "   ",  # empty
     ):
         with pytest.raises(ValueError):
             vs.resolve_video_source(url)
+
+
+@pytest.mark.parametrize("url", ["http://h/v.mp4", "https://h/v.mp4"])
+def test_resolve_video_source_fetches_remote(url, monkeypatch):
+    monkeypatch.setattr(vs, "fetch_remote_media",
+                        lambda source, kind, limit: b"video")
+    assert vs.resolve_video_source(url) == ("", b"video")
 
 
 # --- parameter validation & profile clamping --------------------------------

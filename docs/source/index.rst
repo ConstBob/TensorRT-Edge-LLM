@@ -73,6 +73,7 @@ for large language models and vision-language models on edge devices.
    developer_guide/software-design/llm-inference-runtime.md
    developer_guide/software-design/llm-streaming.md
    developer_guide/software-design/memory-monitoring.md
+   developer_guide/software-design/openai-server.md
 
 .. toctree::
    :maxdepth: 2

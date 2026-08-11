@@ -14,8 +14,7 @@
 # limitations under the License.
 """OpenAI-compatible tool request validation and output parsing.
 
-References the OpenAI-compatible tool-calling API shape documented by vLLM:
-https://docs.vllm.ai/en/stable/features/tool_calling/
+The public data structures follow the OpenAI tool-calling API shape.
 """
 
 import ast
@@ -26,12 +25,15 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
+from .reasoning import REASONING_PARSERS
+
 
 @dataclass
 class ToolConfig:
     tools: List[Dict[str, Any]] = field(default_factory=list)
     tool_choice: str = "none"
     forced_name: Optional[str] = None
+    parallel_tool_calls: bool = True
 
     @property
     def parse_output(self) -> bool:
@@ -88,6 +90,7 @@ def validate_tool_request(
     messages: Sequence[Dict[str, Any]],
     tools: Optional[Sequence[Dict[str, Any]]] = None,
     tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+    parallel_tool_calls: bool = True,
 ) -> ToolConfig:
     """Validate OpenAI-style tool fields and message links."""
     if tools is None:
@@ -100,23 +103,38 @@ def validate_tool_request(
     names = _validate_tools(tool_list)
     choice, forced_name = _validate_tool_choice(tool_choice, names, tool_list)
     _validate_tool_messages(messages)
+    if not isinstance(parallel_tool_calls, bool):
+        raise ValueError("'parallel_tool_calls' must be a boolean")
     return ToolConfig(tools=tool_list,
                       tool_choice=choice,
-                      forced_name=forced_name)
+                      forced_name=forced_name,
+                      parallel_tool_calls=parallel_tool_calls)
 
 
-def parse_assistant_output(text: str, tool_config: ToolConfig,
-                           model_dir: str) -> ParsedAssistantOutput:
+def parse_assistant_output(
+        text: str,
+        tool_config: ToolConfig,
+        model_dir: str,
+        tool_parser: str = "auto",
+        reasoning_parser: str = "none") -> ParsedAssistantOutput:
     """Parse model text into ordered content, reasoning, and tool-call events."""
     if not tool_config.parse_output:
-        return ParsedAssistantOutput(_split_reasoning_events(text))
+        return ParsedAssistantOutput(
+            _split_reasoning_events(text,
+                                    reasoning_parser,
+                                    model_dir,
+                                    allow_implicit=True))
 
-    parser = _select_parser(model_dir)
+    parser = _select_parser(model_dir, tool_parser)
     events, malformed = parser.parse(text, tool_config)
     expanded: List[Dict[str, Any]] = []
     for event in events:
         if event["type"] == "content":
-            expanded.extend(_split_reasoning_events(event["text"]))
+            expanded.extend(
+                _split_reasoning_events(event["text"],
+                                        reasoning_parser,
+                                        model_dir,
+                                        allow_implicit=False))
         else:
             expanded.append(event)
     return ParsedAssistantOutput(expanded, malformed=malformed)
@@ -226,18 +244,20 @@ def _validate_tool_messages(messages: Sequence[Dict[str, Any]]) -> None:
                     f"messages[{idx}].content must be text or JSON")
 
 
-def _split_reasoning_events(text: str) -> List[Dict[str, Any]]:
+def _split_reasoning_events(text: str, parser_name: str, model_dir: str, *,
+                            allow_implicit: bool) -> List[Dict[str, Any]]:
+    parser = REASONING_PARSERS.resolve(parser_name, model_dir)
+    if parser is None:
+        return [{"type": "content", "text": text}]
+    if (not allow_implicit and parser.start_token not in text
+            and parser.end_token not in text):
+        return [{"type": "content", "text": text}]
+    reasoning, content = parser.extract(text)
     events: List[Dict[str, Any]] = []
-    pos = 0
-    for match in re.finditer(r"<think>(.*?)</think>", text, flags=re.S):
-        if match.start() > pos:
-            events.append({"type": "content", "text": text[pos:match.start()]})
-        events.append({"type": "reasoning", "text": match.group(1).strip()})
-        pos = match.end()
-    if pos < len(text):
-        tail = text[pos:]
-        if tail:
-            events.append({"type": "content", "text": tail})
+    if reasoning:
+        events.append({"type": "reasoning", "text": reasoning})
+    if content:
+        events.append({"type": "content", "text": content})
     return events or [{"type": "content", "text": ""}]
 
 
@@ -302,16 +322,28 @@ class _ToolParserRegistry:
             "openai": parser,
         }
 
-    def get(self, model_dir: str):
-        return self._parsers.get(_parser_name_for_model(model_dir),
-                                 self._parsers["generic"])
+    def names(self) -> List[str]:
+        return ["auto"] + sorted(self._parsers)
+
+    def get(self, model_dir: str, parser_name: str = "auto"):
+        if parser_name == "auto":
+            parser_name = _parser_name_for_model(model_dir)
+        if parser_name not in self._parsers:
+            available = ", ".join(self.names())
+            raise KeyError(
+                f"unknown tool parser {parser_name!r}; available: {available}")
+        return self._parsers[parser_name]
 
 
 _PARSERS = _ToolParserRegistry()
 
 
-def _select_parser(model_dir: str):
-    return _PARSERS.get(model_dir)
+def _select_parser(model_dir: str, parser_name: str = "auto"):
+    return _PARSERS.get(model_dir, parser_name)
+
+
+def list_tool_parsers() -> List[str]:
+    return _PARSERS.names()
 
 
 def _parser_name_for_model(model_dir: str) -> str:
