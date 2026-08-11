@@ -110,7 +110,8 @@ class RMSNorm(nn.Module):
 def _make_flat_wrapper_mamba(model: nn.Module,
                              Na: int,
                              Nm: int,
-                             mtp_base: bool = False) -> nn.Module:
+                             mtp_base: bool = False,
+                             dflash_base: bool = False) -> nn.Module:
     """Build an explicit flat forward wrapper for hybrid Mamba+Attention models.
 
     Extends the transformer wrapper with ``conv_state_i`` and ``ssm_state_i``
@@ -132,7 +133,8 @@ def _make_flat_wrapper_mamba(model: nn.Module,
             "kv_page_table", "last_token_ids"
         ] + [f"conv_state_{i}"
              for i in range(Nm)] + [f"recurrent_state_{i}" for i in range(Nm)])
-    if mtp_base:
+    spec_base = mtp_base or dflash_base
+    if spec_base:
         param_names += [
             "attention_pos_id", "attention_mask", "spec_verify_phase_marker"
         ]
@@ -144,9 +146,10 @@ def _make_flat_wrapper_mamba(model: nn.Module,
     ssm_tuple = "({},)".format(", ".join(f"recurrent_state_{i}"
                                          for i in range(Nm))) if Nm else "()"
 
-    if mtp_base:
+    if spec_base:
+        second = "dflash_hidden_concat" if dflash_base else "hidden_states"
         body = (
-            f"    (logits, hidden_states, present_key_values, "
+            f"    (logits, {second}, present_key_values, "
             f"present_conv_states, present_ssm_states, "
             f"intermediate_conv_states, replay_da_states, replay_u_states, "
             f"replay_b_states) = self._model(\n"
@@ -157,7 +160,7 @@ def _make_flat_wrapper_mamba(model: nn.Module,
             f"        attention_pos_id=attention_pos_id, "
             f"attention_mask=attention_mask, "
             f"spec_verify_phase_marker=spec_verify_phase_marker)\n"
-            f"    return ((logits, hidden_states) + tuple(present_key_values)\n"
+            f"    return ((logits, {second}) + tuple(present_key_values)\n"
             f"            + tuple(present_conv_states) "
             f"+ tuple(present_ssm_states)\n"
             f"            + tuple(intermediate_conv_states) "
@@ -1043,6 +1046,7 @@ class NemotronHBackbone(nn.Module):
         spec_verify_phase_marker: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         attention_pos_id: Optional[torch.Tensor] = None,
+        dflash_target_layer_ids: Optional[List[int]] = None,
     ):
         hidden_states = inputs_embeds
         present_key_values_list: List[torch.Tensor] = []
@@ -1052,6 +1056,9 @@ class NemotronHBackbone(nn.Module):
         replay_da_states_list: List[torch.Tensor] = []
         replay_u_states_list: List[torch.Tensor] = []
         replay_b_states_list: List[torch.Tensor] = []
+        dflash_hidden_list: List[torch.Tensor] = []
+        dflash_target_set = set(dflash_target_layer_ids or [])
+        last_layer_idx = len(self.layers) - 1
         attn_idx = 0
         mamba_idx = 0
 
@@ -1100,17 +1107,26 @@ class NemotronHBackbone(nn.Module):
                 present_key_values_list.append(present_kv)
                 attn_idx += 1
 
+            # The final layer's DFlash aux feature is the post-norm_f hidden.
+            # Earlier target layers use the raw residual stream.
+            if layer_idx in dflash_target_set and layer_idx != last_layer_idx:
+                dflash_hidden_list.append(hidden_states)
+
         normed = self.norm_f(hidden_states)
+        if last_layer_idx in dflash_target_set:
+            dflash_hidden_list.append(normed)
+        dflash_hidden_concat = (torch.cat(dflash_hidden_list, dim=-1)
+                                if dflash_hidden_list else None)
         if collect_intermediate_states:
             return (normed, tuple(present_key_values_list),
                     tuple(present_conv_states_list),
                     tuple(present_ssm_states_list),
                     tuple(intermediate_conv_states_list),
                     tuple(replay_da_states_list), tuple(replay_u_states_list),
-                    tuple(replay_b_states_list))
+                    tuple(replay_b_states_list), dflash_hidden_concat)
         return (normed, tuple(present_key_values_list),
                 tuple(present_conv_states_list),
-                tuple(present_ssm_states_list))
+                tuple(present_ssm_states_list), dflash_hidden_concat)
 
 
 # ---------------------------------------------------------------------------
@@ -1234,6 +1250,8 @@ class NemotronHCausalLM(nn.Module):
         ]
 
         mtp_base = bool(getattr(config, "mtp_base", False))
+        dflash_base = bool(getattr(config, "dflash_base", False))
+        spec = mtp_base or dflash_base
 
         batch = torch.export.Dim("batch", min=1, max=256)
         seq = torch.export.Dim("seq_len", min=1, max=32768)
@@ -1244,8 +1262,8 @@ class NemotronHCausalLM(nn.Module):
         max_pages = torch.export.Dim("max_pages_per_seq", min=1, max=32768)
         num_pages = torch.export.Dim("num_pages", min=1, max=1048576)
 
-        # mtp_base widens last_token_ids to select multiple verify positions.
-        if mtp_base:
+        # Spec-verify bases widen last_token_ids to select multiple positions.
+        if spec:
             last_token_ids = torch.zeros(batch_size,
                                          2,
                                          dtype=torch.int64,
@@ -1274,7 +1292,7 @@ class NemotronHCausalLM(nn.Module):
         all_shapes.append({0: batch})  # context_lengths
         all_shapes.append({0: kv_batch})  # kvcache_start_index
         all_shapes.append({0: page_batch, 2: max_pages})  # kv_page_table
-        if mtp_base:
+        if spec:
             num_selected = torch.export.Dim("num_selected", min=1, max=256)
             all_shapes.append({0: batch, 1: num_selected})  # last_token_ids
         else:
@@ -1284,7 +1302,7 @@ class NemotronHCausalLM(nn.Module):
         for _ in range(Nm):
             all_shapes.append({0: batch})  # recurrent_state_i
 
-        if mtp_base:
+        if spec:
             # Tree-attention + spec-verify inputs.
             attn_seq = torch.export.Dim("attn_seq_len", min=1, max=32768)
             mask_kv_len = torch.export.Dim("mask_kv_len", min=1, max=65536)
@@ -1321,7 +1339,11 @@ class NemotronHCausalLM(nn.Module):
                 [f"replay_u_state_{i}" for i in range(Nm)] +
                 [f"replay_b_state_{i}" for i in range(Nm)])
 
-        wrapped = _make_flat_wrapper_mamba(self, Na, Nm, mtp_base=mtp_base)
+        wrapped = _make_flat_wrapper_mamba(self,
+                                           Na,
+                                           Nm,
+                                           mtp_base=mtp_base,
+                                           dflash_base=dflash_base)
         wrapped.eval()
 
         return OnnxSpec(wrapped=wrapped,
@@ -1346,10 +1368,15 @@ class NemotronHCausalLM(nn.Module):
         spec_verify_phase_marker: Optional[torch.Tensor] = None,
     ) -> Tuple:
         mtp_base = bool(getattr(self.config, "mtp_base", False))
-        if mtp_base:
+        dflash_base = bool(getattr(self.config, "dflash_base", False))
+        dflash_target_ids = (self.config.dflash_target_layer_ids
+                             if dflash_base else None)
+        spec = mtp_base or dflash_base
+        if spec:
             (hidden_states, present_key_values, present_conv_states,
              present_ssm_states, intermediate_conv_states, replay_da_states,
-             replay_u_states, replay_b_states) = self.backbone(
+             replay_u_states, replay_b_states,
+             dflash_hidden_concat) = self.backbone(
                  inputs_embeds,
                  past_key_values,
                  rope_rotary_cos_sin,
@@ -1362,18 +1389,24 @@ class NemotronHCausalLM(nn.Module):
                  spec_verify_phase_marker=spec_verify_phase_marker,
                  attention_mask=attention_mask,
                  attention_pos_id=attention_pos_id,
+                 dflash_target_layer_ids=dflash_target_ids,
              )
             # Draft consumes the full pre-lm_head hidden; logits use the
             # gathered predicted-token positions.
             selected = torch.ops.trt.gather_nd(hidden_states, last_token_ids)
             logits = self.lm_head(selected).to(torch.float32)
+            if dflash_base:
+                return (logits, dflash_hidden_concat, present_key_values,
+                        present_conv_states, present_ssm_states,
+                        intermediate_conv_states, replay_da_states,
+                        replay_u_states, replay_b_states)
             return (logits, hidden_states, present_key_values,
                     present_conv_states, present_ssm_states,
                     intermediate_conv_states, replay_da_states,
                     replay_u_states, replay_b_states)
 
         (hidden_states, present_key_values, present_conv_states,
-         present_ssm_states) = self.backbone(
+         present_ssm_states, _dflash_hidden_concat) = self.backbone(
              inputs_embeds,
              past_key_values,
              rope_rotary_cos_sin,
