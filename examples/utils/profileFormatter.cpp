@@ -299,6 +299,10 @@ void outputPrefillProfile(std::ostream& output, metrics::LLMPrefillMetrics const
         output << "=== LLM Prefill ===" << std::endl;
         output << "Reused Tokens: " << prefillMetrics.reusedTokens << std::endl;
         output << "Computed Tokens: " << prefillMetrics.computedTokens << std::endl;
+        if (prefillMetrics.prunedTokens > 0)
+        {
+            output << "Pruned Tokens (visual-token pruning): " << prefillMetrics.prunedTokens << std::endl;
+        }
         output << "Average Tokens per Run: " << std::fixed << std::setprecision(2)
                << getPrefillAverageTokensPerRun(prefillMetrics) << std::endl;
         output << "Average Time per Run: " << std::fixed << std::setprecision(4)
@@ -493,12 +497,13 @@ void addJsonPrefillSummary(nlohmann::json& summary, metrics::LLMPrefillMetrics c
 {
     if (prefillMetrics.getTotalRuns() > 0)
     {
-        summary["prefill"] = {{"total_runs", prefillMetrics.getTotalRuns()},
-            {"reused_tokens", prefillMetrics.reusedTokens}, {"computed_tokens", prefillMetrics.computedTokens},
-            {"average_tokens_per_run", getPrefillAverageTokensPerRun(prefillMetrics)},
-            {"average_time_per_run_ms", getPrefillAverageTimePerRun(prefillMetrics)},
-            {"tokens_per_second", getPrefillTokensPerSecond(prefillMetrics)},
-            {"average_time_per_token_ms", getPrefillAverageTimePerToken(prefillMetrics)}};
+        summary["prefill"]
+            = {{"total_runs", prefillMetrics.getTotalRuns()}, {"reused_tokens", prefillMetrics.reusedTokens},
+                {"computed_tokens", prefillMetrics.computedTokens}, {"pruned_tokens", prefillMetrics.prunedTokens},
+                {"average_tokens_per_run", getPrefillAverageTokensPerRun(prefillMetrics)},
+                {"average_time_per_run_ms", getPrefillAverageTimePerRun(prefillMetrics)},
+                {"tokens_per_second", getPrefillTokensPerSecond(prefillMetrics)},
+                {"average_time_per_token_ms", getPrefillAverageTimePerToken(prefillMetrics)}};
     }
 }
 

@@ -47,6 +47,7 @@ for large language models and vision-language models on edge devices.
    user_guide/features/fp8-embedding.md
    user_guide/features/streaming.md
    user_guide/features/system-prompt-cache.md
+   user_guide/features/visual-token-pruning.md
 
 .. toctree::
    :maxdepth: 2

@@ -28,7 +28,7 @@ TensorRT Edge-LLM supports the deployment of a wide selection of LLM/VLM/Omni/VL
 - **💾 Memory Efficient**: Supporting 4-bit quantization for reduced memory footprint, with [FP8 KV cache](user_guide/features/FP8KV.md) support for additional memory savings
 - **🔄 Production Ready**: C++-only runtime with no Python dependencies, designed for deployment on edge devices
 - **🎯 Edge Optimized**: Built specifically for NVIDIA Jetson, DRIVE, and DGX Spark platforms with platform-specific optimizations
-- **🔧 Rich Feature Set**: Supports [LoRA adapters](user_guide/features/lora.md), EAGLE3, MTP, and DFlash speculative decoding, [system prompt caching](user_guide/features/system-prompt-cache.md), vision-language models, and an [experimental high-level Python API/server](user_guide/examples/experimental-server.md)
+- **🔧 Rich Feature Set**: Supports [LoRA adapters](user_guide/features/lora.md), EAGLE3, MTP, and DFlash speculative decoding, [system prompt caching](user_guide/features/system-prompt-cache.md), vision-language models with [visual-token pruning](user_guide/features/visual-token-pruning.md), and an [experimental high-level Python API/server](user_guide/examples/experimental-server.md)
 - **📊 Complete Toolkit**: End-to-end workflow from checkpoint export to C++ runtime, with engine builder and examples
 
 ## Key Components

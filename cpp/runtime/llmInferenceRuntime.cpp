@@ -675,6 +675,33 @@ std::optional<ContextCacheMetrics> LLMInferenceRuntime::getContextCacheMetrics()
     return mContextCache->metrics();
 }
 
+void LLMInferenceRuntime::setVisualPrunerConfig(VisualPrunerConfig const& config)
+{
+    mVisualPruner.reset();
+    if (!config.enabled)
+    {
+        return;
+    }
+    if (mDeployment.base.ropeConfig.type != RopeType::kMRope || mDeployment.base.imageTokenId < 0)
+    {
+        LOG_WARNING("Visual-token pruning requires an mRoPE VLM engine (image token id present); leaving it disabled.");
+        return;
+    }
+    if (mDeployment.specConfig.has_value())
+    {
+        LOG_WARNING("Visual-token pruning is not supported together with speculative decoding; leaving it disabled.");
+        return;
+    }
+    if (mActionRunner)
+    {
+        LOG_WARNING("Visual-token pruning is not supported together with an action runner; leaving it disabled.");
+        return;
+    }
+    mVisualPruner = createVisualTokenPruner(config, mDeployment.base);
+    LOG_INFO("Visual-token pruning enabled: algorithm=%s, reductionRatio=%.3f, minVisualTokens=%d",
+        mVisualPruner->name(), config.reductionRatio, config.minVisualTokens);
+}
+
 bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response,
     cudaStream_t stream, bool outputThinkerEmbeddings)
 {
@@ -1285,6 +1312,7 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     // Record metrics - accumulate across all batches (active + evicted)
     int32_t totalReusedTokens = 0;
     int32_t totalComputedTokens = 0;
+    int32_t totalPrunedTokens = 0;
     int32_t totalGeneratedTokens = 0;
     int32_t totalIterations = 0;
 
@@ -1293,13 +1321,16 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     {
         int32_t rawPromptLength = static_cast<int32_t>(batchResult.rawBatchedInputIds.size());
         int32_t computedLength = batchResult.effectivePrefillLength;
-        totalReusedTokens += (rawPromptLength - computedLength);
+        // Visual-token pruning shortens the effective prefill without reusing anything from
+        // the KV cache — account for it separately so it is not reported as cache reuse.
+        totalReusedTokens += (rawPromptLength - computedLength - batchResult.prunedPrefillTokens);
         totalComputedTokens += computedLength;
+        totalPrunedTokens += batchResult.prunedPrefillTokens;
         totalGeneratedTokens += batchResult.generateLength;
         totalIterations += batchResult.actualIterations;
     }
 
-    mPrefillMetrics.recordRun(totalReusedTokens, totalComputedTokens);
+    mPrefillMetrics.recordRun(totalReusedTokens, totalComputedTokens, totalPrunedTokens);
     if (enableSpecDecode)
     {
         mSpecDecodeGenerationMetrics.recordRun(totalIterations, totalGeneratedTokens);
@@ -1630,7 +1661,8 @@ bool LLMInferenceRuntime::runBaseModelPrefill(
         ("SPEC_DECODE_BASE_PREFILL[" + std::to_string(context.activeBatchSize) + "]").c_str(), nvtx_colors::BLUE);
 
     int32_t const activeBatchSize = context.activeBatchSize;
-    int32_t const inputIdsLength
+    // Non-const: DART pruning may shorten the effective prefill length at the pre-engine seam below.
+    int32_t inputIdsLength
         = *std::max_element(context.effectivePrefillLengths.begin(), context.effectivePrefillLengths.end());
     int32_t const baseOutputHiddenDim
         = mDeployment.specConfig.has_value() ? mDeployment.specConfig->baseOutputHiddenDim : 0;
@@ -1730,6 +1762,30 @@ bool LLMInferenceRuntime::runBaseModelPrefill(
     if (mGemma4Ple)
     {
         mGemma4Ple->embed(mIdsInput, context.stream);
+    }
+
+    // Visual-token pruning: compact the assembled embeddings (and deepstack/rope rows) to the
+    // selector-chosen visual subset before the engine runs. Gated to the simple path — batch 1,
+    // fresh KV cache (no system-prompt reuse: restored rope rows must not be gathered), no
+    // Talker streaming, and no layer debugger (its buffers assume the unpruned token count).
+    // setVisualPrunerConfig already excluded spec decode / action / non-mRoPE engines.
+    if (mVisualPruner && activeBatchSize == 1 && baseKVAllEmpty && !mDeployment.base.isDiffusionBackbone
+        && !context.outputThinkerEmbeddings && context.layerDebugger == nullptr)
+    {
+        int32_t const prunedLen
+            = mVisualPruner->pruneForPrefill(context.tokenIds[0], *mPipelineIO, inputIdsLength, context.stream);
+        if (prunedLen < inputIdsLength)
+        {
+            LOG_DEBUG("Visual-token pruning (%s) shortened prefill from %d to %d tokens.", mVisualPruner->name(),
+                inputIdsLength, prunedLen);
+            // Track the removed count so prefill metrics don't mislabel pruned tokens as
+            // KV-cache reuse (reused = raw - computed - pruned).
+            context.prunedPrefillTokens.assign(context.effectivePrefillLengths.size(), 0);
+            context.prunedPrefillTokens[0] = inputIdsLength - prunedLen;
+            context.effectivePrefillLengths[0] = prunedLen;
+            hostCtxLenData[0] = prunedLen;
+            inputIdsLength = prunedLen;
+        }
     }
 
     // Dispatch per-step sequence prep (context lengths H2D, selectTokenIndices).
@@ -2377,6 +2433,7 @@ bool LLMInferenceRuntime::performBatchEvict(DecodingInferenceContext& context, D
             result.actualIterations = context.generationRound;
             result.rawBatchedInputIds = std::move(context.rawBatchedInputIds[i]);
             result.effectivePrefillLength = context.effectivePrefillLengths[i];
+            result.prunedPrefillTokens = i < context.prunedPrefillTokens.size() ? context.prunedPrefillTokens[i] : 0;
             result.terminalReason = context.slotStreams[i].terminalReason;
             // Convert flat LogprobsSlot -> nested vector for BatchResult (once per completed request).
             // Enrich each (token_id, logprob) with the raw token piece so consumers can render the
