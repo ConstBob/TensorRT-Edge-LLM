@@ -78,7 +78,7 @@ TEST(HybridSnapshotStorageTests, RejectsLiveKvPageGeometryDrift)
     HybridCacheManager cacheManager(config, stream);
     KVCacheManager& kv = cacheManager.getKVCacheManager();
     KVLayerConfig const& layerConfig = kv.getLayerConfig(0);
-    Tensor& pool = kv.getCombinedKVCachePoolView(0);
+    Tensor& pool = kv.getCombinedKVCache(0);
     ASSERT_TRUE(pool.reshape({2, kv.numPages(), kTOKENS_PER_PAGE / 2, layerConfig.numKVHeads, layerConfig.headDim}));
 
     EXPECT_THROW((void) HybridSnapshotStorage(cacheManager, 2, 2), std::runtime_error);

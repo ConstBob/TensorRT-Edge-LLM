@@ -153,10 +153,8 @@ private:
     //! \return Pointer to the host buffer containing the KV cache lengths
     int32_t const* getActualKVLengths(cudaStream_t stream, int32_t activeBatchSize);
 
-    //! \brief Deinterleave combined [maxBatchSize, 2, H, S, D] (KV Cache layout from attention plugin) for one layer
-    //! into owned buffers and return refs to them. The Alpamayo action expert's exported graph consumes separate K/V
-    //! caches of shape [2, maxBatchSize, H, S, D] (the TRT native attention op layout), so this runner repacks the
-    //! plugin-path combined buffer into that layout.
+    //! \brief Copy one layer's physical active-slot K/V views into owned head-major buffers.
+    //! The Alpamayo action expert's exported graph consumes separate K/V caches in the TRT native attention layout.
     //!
     //! CONTRACT: this reads KV from physical slot row `b` of the combined pool
     //! directly -- it does not receive or consult the base cache manager's KVPageTable. It is

@@ -1542,6 +1542,14 @@ _dflash_target_kv_cache_update_schema = OpSchema(
             "Per-batch delta lengths [B] INT32 for multi-batch guard",
             type_str="tensor(int32)",
         ),
+        OpSchema.FormalParameter(
+            name="kv_page_table",
+            description=
+            ("Canonical KV page table [B, 2, M] INT32: K page IDs are "
+             "in [0, num_pages), V page IDs are in [num_pages, 2 * num_pages)"
+             ),
+            type_str="tensor(int32)",
+        ),
     ],
     outputs=[
         OpSchema.FormalParameter(

@@ -1076,6 +1076,7 @@ def _dflash_target_kv_cache_update_translation(
     rope_cos_sin: onnxscript.FLOAT,
     delta_start_positions: onnxscript.INT32,
     delta_lengths: onnxscript.INT32,
+    kv_page_table: onnxscript.INT32,
 ) -> onnxscript.FLOAT16:
     """DFlash target KV cache update: apply RoPE to k_delta, write k+v into cache."""
     present_kv = _trt_edgellm.DFlashTargetKVCacheUpdate(
@@ -1085,6 +1086,7 @@ def _dflash_target_kv_cache_update_translation(
         rope_cos_sin,
         delta_start_positions,
         delta_lengths,
+        kv_page_table,
     )
     return present_kv
 

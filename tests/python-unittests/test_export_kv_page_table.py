@@ -17,13 +17,10 @@
 Exports a tiny default-arch (attention-only) model and checks that the
 exported graph carries the paged-KV plugin contract: a required
 ``kv_page_table`` graph input of shape ``[batch, 2, max_pages_per_seq]``,
-AttentionPlugin nodes with 8 inputs (no stray tree-attention optionals for a
-non-tree-attention model), and — a previously-shipped regression — that the
-``past_key_values_i`` KV-cache binding is declared as the AttentionPlugin's
-paged-pool contract ``[2, num_pages, KV_PAGE_SIZE, num_kv_heads, head_dim]``,
-not the legacy per-slot ``[batch, 2, num_kv_heads, capacity, head_dim]``
-shape (a legacy-shaped binding makes the paged CuTe DSL prefill kernel
-misread ``numPages`` from ``dims.d[1]`` and corrupts prefill).
+AttentionPlugin nodes with six required inputs (no tree-attention optionals for a
+non-tree-attention model), and that the ``past_key_values_i`` KV-cache
+binding is declared as the AttentionPlugin's paged-pool contract
+``[2, num_pages, KV_PAGE_SIZE, num_kv_heads, head_dim]``.
 """
 
 import ast
@@ -116,15 +113,7 @@ def test_attention_plugin_nodes_have_required_inputs(tmp_path):
 
 
 def test_kv_cache_graph_input_is_pool_shaped(tmp_path):
-    """Regression test: past_key_values_i must be the paged-pool contract.
-
-    A binding declared with the legacy per-slot shape (rank 5 but
-    [batch, 2, num_kv_heads, capacity, head_dim]) passes a naive rank check
-    but makes the CuTe DSL prefill kernel misread numPages from dim 1.
-    Assert the actual per-dim contract: dim 0 == 2
-    (fixed K/V split), dim 1 dynamic (num_pages), dim 2 == KV_PAGE_SIZE
-    (fixed), dims 3/4 fixed (num_kv_heads, head_dim).
-    """
+    """Assert every past_key_values_i input uses the paged-pool contract."""
     output_path = _export_tiny_model(tmp_path)
     model = onnx.load(output_path, load_external_data=False)
 
@@ -143,8 +132,7 @@ def test_kv_cache_graph_input_is_pool_shaped(tmp_path):
             f"{dims[0]}")
         assert dims[1].dim_param, (
             f"{graph_input.name} dim 1 (num_pages) must be dynamic, got "
-            f"{dims[1]} — a static/legacy-ordered dim here means the "
-            "binding is not pool-shaped")
+            f"{dims[1]}")
         assert dims[2].dim_value == KV_PAGE_SIZE, (
             f"{graph_input.name} dim 2 must be the fixed page size "
             f"({KV_PAGE_SIZE}), got {dims[2]}")

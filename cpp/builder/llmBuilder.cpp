@@ -182,34 +182,6 @@ bool LLMBuilder::build()
         return false;
     }
 
-    // DFlash/JetSpec/DSpark drafts use DFlashTargetKVCacheUpdate, which needs pages_per_slot
-    // (capPadded / kTOKENS_PER_PAGE) to split its pool-shaped past_key_value binding's
-    // numPages back into (maxBatch, cap). That fact is builder-only
-    // (mBuilderConfig.maxKVCacheCapacity), unavailable at ONNX-export time, and this
-    // plugin's concrete class is intentionally not linked into the builder (plugins are
-    // opaque .so modules, loaded via EDGELLM_PLUGIN_PATH -- see common/trtUtils.h).
-    // Resolve the plugin's exported configuration hook via dlsym on the already-loaded
-    // handle instead of adding a new link dependency.
-    if (isSpecDecodeDraft(mModelConfig, "dflash") || isSpecDecodeDraft(mModelConfig, "jetspec")
-        || isSpecDecodeDraft(mModelConfig, "dspark"))
-    {
-        using ConfigurePagesPerSlotFn = bool (*)(nvinfer1::INetworkDefinition*, int32_t);
-        auto* configureFn = reinterpret_cast<ConfigurePagesPerSlotFn>(
-            dlsym(pluginHandles.get(), "edgellm_dflash_configure_pages_per_slot"));
-        if (configureFn == nullptr)
-        {
-            LOG_ERROR(
-                "Failed to resolve edgellm_dflash_configure_pages_per_slot from the plugin library: %s", dlerror());
-            return false;
-        }
-        int32_t const pagesPerSlot = rt::computeMaxPagesPerSeq(static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
-        if (!configureFn(network.get(), pagesPerSlot))
-        {
-            LOG_ERROR("Failed to configure DFlashTargetKVCacheUpdate plugin pages_per_slot=%d", pagesPerSlot);
-            return false;
-        }
-    }
-
     // Print network information
     LOG_DEBUG("%s", printNetworkInfo(network.get(), "LLM").c_str());
 
@@ -914,8 +886,7 @@ bool LLMBuilder::setupDFlashDraftProfiles(
         // kvcache_start_index: [batch]
         ok &= setOptimizationProfile(&profile, binding_names::kKVCacheStartIndex, createDims({1}),
             createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
-        // kv_page_table: [batch, 2, maxPagesPerSeq] int32. Proposal self-attention's page
-        // table (default identity); the draft's own KV cache above has no page table.
+        // kv_page_table: [batch, 2, maxPagesPerSeq] int32 for proposal self-attention and target-KV updates.
         int32_t const maxPagesPerSeq
             = rt::computeMaxPagesPerSeq(static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
         ok &= setOptimizationProfile(&profile, binding_names::kKVPageTable, createDims({1, 2, maxPagesPerSeq}),
@@ -932,12 +903,9 @@ bool LLMBuilder::setupDFlashDraftProfiles(
         ok &= setOptimizationProfile(&profile, binding_names::kAttentionPosId, createDims({1, 1}),
             createDims({mBuilderConfig.maxBatchSize, optDraftTokens}),
             createDims({mBuilderConfig.maxBatchSize, maxDraftTokens}));
-        // KV cache per-layer: DFlash's own combined draft cache, now unified on the paged-pool
-        // contract shared with the AttentionPlugin binding: [2, numPages, kTOKENS_PER_PAGE,
+        // DFlash draft KV cache uses the paged-pool contract shared with the AttentionPlugin binding:
+        // [2, numPages, kTOKENS_PER_PAGE,
         // numKVHeads, headDim] (single fixed numPages value, same as setupKVCacheProfiles).
-        // DFlashTargetKVCacheUpdatePlugin recovers maxBatch/cap at enqueue time from numPages and
-        // the pages_per_slot attribute the builder configures via edgellm_dflash_configure_pages_per_slot
-        // (see build()); this cache still has no page table of its own.
         int64_t const numPages = mBuilderConfig.resolvedKVPoolPages();
         for (int32_t i = 0; i < mNbKVCacheInputs; ++i)
         {
@@ -1068,7 +1036,7 @@ bool LLMBuilder::setupDSparkDraftProfiles(
         ok &= setOptimizationProfile(&profile, binding_names::kKVCacheStartIndex, createDims({1}),
             createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
         // kv_page_table: [batch, 2, maxPagesPerSeq] int32. Proposal self-attention's page
-        // table (default identity); the draft's own KV cache above has no page table.
+        // table for proposal self-attention and target-KV updates.
         int32_t const maxPagesPerSeq
             = rt::computeMaxPagesPerSeq(static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
         ok &= setOptimizationProfile(&profile, binding_names::kKVPageTable, createDims({1, 2, maxPagesPerSeq}),
@@ -1087,9 +1055,6 @@ bool LLMBuilder::setupDSparkDraftProfiles(
             createDims({mBuilderConfig.maxBatchSize, maxDraftTokens}));
         // KV cache per-layer: DSpark's own combined draft cache uses the same paged-pool
         // contract as AttentionPlugin: [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim].
-        // DFlashTargetKVCacheUpdatePlugin recovers maxBatch/cap at enqueue time from numPages
-        // and the pages_per_slot attribute configured above; this cache still has no page table
-        // of its own.
         int64_t const numPages = mBuilderConfig.resolvedKVPoolPages();
         for (int32_t i = 0; i < mNbKVCacheInputs; ++i)
         {

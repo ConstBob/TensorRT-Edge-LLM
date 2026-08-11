@@ -54,6 +54,10 @@ _EXTW_FILE_BY_KIND = {
     "lm_head": "external_lm_head_weight.safetensors",
 }
 
+_DFLASH_TARGET_KV_UPDATE_OP = "DFlashTargetKVCacheUpdate"
+_DFLASH_TARGET_KV_UPDATE_INPUT_COUNT = 7
+_DFLASH_TARGET_KV_PAGE_TABLE_INPUT_INDEX = 6
+
 
 def _extw_cli_kinds(extw_token):
     """Resolve a test_param ``extw_<value>`` token to CLI kinds."""
@@ -144,6 +148,32 @@ def _verify_tree_base_inputs(mode, onnx_path, model_dir):
         pytest.fail(
             f"{mode} hybrid tree-base ONNX missing inputs {sorted(missing)}: {onnx_path}"
         )
+
+
+def _assert_dflash_target_kv_update_contract(onnx_path):
+    import onnx
+
+    model = onnx.load(onnx_path, load_external_data=False)
+    nodes = [
+        node for node in model.graph.node
+        if node.op_type == _DFLASH_TARGET_KV_UPDATE_OP
+    ]
+    if not nodes:
+        pytest.fail(
+            f"{onnx_path} contains no {_DFLASH_TARGET_KV_UPDATE_OP} nodes")
+
+    for node in nodes:
+        if len(node.input) != _DFLASH_TARGET_KV_UPDATE_INPUT_COUNT:
+            pytest.fail(
+                f"{_DFLASH_TARGET_KV_UPDATE_OP} node {node.name!r} has "
+                f"{len(node.input)} inputs; expected "
+                f"{_DFLASH_TARGET_KV_UPDATE_INPUT_COUNT}")
+        page_table_input = node.input[_DFLASH_TARGET_KV_PAGE_TABLE_INPUT_INDEX]
+        if page_table_input != "kv_page_table":
+            pytest.fail(
+                f"{_DFLASH_TARGET_KV_UPDATE_OP} node {node.name!r} input "
+                f"{_DFLASH_TARGET_KV_PAGE_TABLE_INPUT_INDEX} must be "
+                f"'kv_page_table', got {page_table_input!r}")
 
 
 def test_checkpoint_export(test_param: str, test_logger,
@@ -514,6 +544,7 @@ def test_checkpoint_dflash_export(test_param: str, test_logger,
     draft_onnx = os.path.join(draft_onnx_dir, "model.onnx")
     if not os.path.exists(draft_onnx):
         pytest.fail(f"DFlash draft ONNX not found: {draft_onnx}")
+    _assert_dflash_target_kv_update_contract(draft_onnx)
 
 
 def test_checkpoint_jetspec_export(test_param: str, test_logger,
@@ -608,6 +639,7 @@ def test_checkpoint_jetspec_export(test_param: str, test_logger,
     draft_onnx = os.path.join(draft_onnx_dir, "model.onnx")
     if not os.path.exists(draft_onnx):
         pytest.fail(f"JetSpec draft ONNX not found: {draft_onnx}")
+    _assert_dflash_target_kv_update_contract(draft_onnx)
 
 
 def test_checkpoint_dspark_export(test_param: str, test_logger,
@@ -695,6 +727,7 @@ def test_checkpoint_dspark_export(test_param: str, test_logger,
     draft_onnx = os.path.join(draft_onnx_dir, "model.onnx")
     if not os.path.exists(draft_onnx):
         pytest.fail(f"DSpark draft ONNX not found: {draft_onnx}")
+    _assert_dflash_target_kv_update_contract(draft_onnx)
 
     heads_path = os.path.join(draft_onnx_dir, "dspark_heads.safetensors")
     if not os.path.exists(heads_path):

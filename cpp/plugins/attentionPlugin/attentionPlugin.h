@@ -47,13 +47,6 @@ enum class ContextFMHABackend
 //!
 //! This plugin implements efficient attention mechanisms including context attention (prefill)
 //! and decode attention with KV cache support.
-//!
-//! BREAKING ABI NOTE (paged-KV substrate): this plugin's required input count changed from 7 to 8
-//! (added `kv_page_table`, see kIN_KV_PAGE_TABLE_IDX) and the tree-attention optional inputs shifted
-//! accordingly. The plugin version string was deliberately NOT bumped -- this project always
-//! regenerates ONNX and rebuilds engines together with the runtime, so an ABI break here is
-//! accepted rather than versioned. Any ONNX/engine older than this change must be re-exported and
-//! rebuilt; it will not load correctly against this plugin.
 class AttentionPlugin : public nvinfer1::IPluginV3,
                         public nvinfer1::IPluginV3OneCore,
                         public nvinfer1::IPluginV3OneBuildV2,

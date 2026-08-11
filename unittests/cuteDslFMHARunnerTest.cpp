@@ -24,7 +24,6 @@
 #include <climits>
 #include <cmath>
 #include <limits>
-#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -34,7 +33,6 @@
 #include "common/cudaUtils.h"
 #include "contextAttnReference.h"
 #include "kernels/contextAttentionKernels/cuteDslFMHARunner.h"
-#include "kernels/posEncoding/applyRopeWriteKV.h"
 #include "testUtils.h"
 
 using namespace nvinfer1;
@@ -297,53 +295,58 @@ void runLlmAccuracyCase(int32_t batchSize, int32_t seqLen, int32_t numQHeads, in
     uniformFloatInitialization(vInput, -1.0f, 1.0f);
 
     rt::Tensor qCute({batchSize, seqLen, numQHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor kCute({batchSize, seqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor vCute({batchSize, seqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
     rt::Tensor qReference({batchSize, seqLen, numQHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
     rt::Tensor kReference({batchSize, seqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
     rt::Tensor vReference({batchSize, seqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
 
     copyHostToDevice(qCute, qInput);
-    copyHostToDevice(kCute, kInput);
-    copyHostToDevice(vCute, vInput);
     copyHostToDevice(qReference, qInput);
     copyHostToDevice(kReference, kInput);
     copyHostToDevice(vReference, vInput);
 
+    std::vector<half> kvContiguousInput(static_cast<size_t>(batchSize) * 2 * numKVHeads * seqLen * headDim);
+    for (int32_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+    {
+        for (int32_t tokenIdx = 0; tokenIdx < seqLen; ++tokenIdx)
+        {
+            for (int32_t headIdx = 0; headIdx < numKVHeads; ++headIdx)
+            {
+                for (int32_t dimIdx = 0; dimIdx < headDim; ++dimIdx)
+                {
+                    size_t const srcOffset
+                        = (((static_cast<size_t>(batchIdx) * seqLen + tokenIdx) * numKVHeads + headIdx) * headDim)
+                        + dimIdx;
+                    size_t const kOffset
+                        = ((((static_cast<size_t>(batchIdx) * 2) * numKVHeads + headIdx) * seqLen + tokenIdx) * headDim)
+                        + dimIdx;
+                    size_t const vOffset
+                        = (((((static_cast<size_t>(batchIdx) * 2 + 1) * numKVHeads + headIdx) * seqLen + tokenIdx)
+                               * headDim)
+                            + dimIdx);
+                    kvContiguousInput[kOffset] = kInput[srcOffset];
+                    kvContiguousInput[vOffset] = vInput[srcOffset];
+                }
+            }
+        }
+    }
     rt::Tensor kvCacheCute({batchSize, 2, numKVHeads, seqLen, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor kvCacheReference({batchSize, 2, numKVHeads, seqLen, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
     rt::Tensor outputReference({batchSize, seqLen, numQHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
     rt::Tensor outputCuteDsl({batchSize, seqLen, numQHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor cosSinCache({1, seqLen, headDim}, rt::DeviceType::kGPU, DataType::kFLOAT);
-    rt::Tensor kvCacheEndLens({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
     rt::Tensor cuKVSeqLens({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
 
-    CUDA_CHECK(cudaMemset(kvCacheCute.rawPointer(), 0, kvCacheCute.getShape().volume() * sizeof(half)));
-    CUDA_CHECK(cudaMemset(kvCacheReference.rawPointer(), 0, kvCacheReference.getShape().volume() * sizeof(half)));
+    copyHostToDevice(kvCacheCute, kvContiguousInput);
     CUDA_CHECK(cudaMemset(outputReference.rawPointer(), 0, outputReference.getShape().volume() * sizeof(half)));
     CUDA_CHECK(cudaMemset(outputCuteDsl.rawPointer(), 0, outputCuteDsl.getShape().volume() * sizeof(half)));
 
-    std::vector<int32_t> kvCacheEndLensHost(static_cast<size_t>(batchSize), seqLen);
     std::vector<int32_t> cuKVSeqLensHost(static_cast<size_t>(batchSize + 1));
     for (int32_t idx = 0; idx <= batchSize; ++idx)
     {
         cuKVSeqLensHost[static_cast<size_t>(idx)] = idx * seqLen;
     }
 
-    copyHostToDevice(kvCacheEndLens, kvCacheEndLensHost);
     copyHostToDevice(cuKVSeqLens, cuKVSeqLensHost);
 
     cudaStream_t stream = nullptr;
-    std::vector<float> cosSinCacheHost(static_cast<size_t>(cosSinCache.getShape().volume()));
-    uniformFloatInitialization(cosSinCacheHost, -1.0f, 1.0f);
-    copyHostToDevice(cosSinCache, cosSinCacheHost);
-
-    kernel::launchApplyRopeWriteKVSplitQKV(cosSinCache, kvCacheEndLens, qCute, kCute, vCute, kvCacheCute, 1.0f, 1.0f,
-        stream, /*pageTable=*/nullptr, /*maxPagesPerSeq=*/0);
-    kernel::launchApplyRopeWriteKV(cosSinCache, std::nullopt, qReference, kReference, vReference, kvCacheReference,
-        1.0f, 1.0f, stream, true, /*pageTable=*/nullptr, /*maxPagesPerSeq=*/0);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaGetLastError());
 
     CuteDslFMHARunner runner(numQHeads, numKVHeads, headDim, batchSize, seqLen, seqLen);
     ASSERT_TRUE(runner.run(qCute.dataPointer<half>(), kvCacheCute.dataPointer<half>(),

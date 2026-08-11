@@ -127,7 +127,7 @@ HybridSnapshotStorage::HybridSnapshotStorage(
             = checkedMultiply(pageElements, utils::getTypeSize(kvConfig.kvCacheType), "live KV page dtype");
         size_t const poolHalfBytes
             = checkedMultiply(pageBytes, static_cast<size_t>(kv.numPages()), "live KV pool half");
-        Tensor const& pool = kv.getCombinedKVCachePoolView(layer);
+        Tensor const& pool = kv.getCombinedKVCache(layer);
         std::string const description = "Live KV pool layer " + std::to_string(layer);
         validateGpuTensorLayout(pool, {2, kv.numPages(), kTOKENS_PER_PAGE, layerConfig.numKVHeads, layerConfig.headDim},
             kvConfig.kvCacheType, poolHalfBytes, description);

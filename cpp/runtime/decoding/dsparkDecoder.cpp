@@ -181,9 +181,7 @@ DSparkDecoder::DSparkDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
     mDraftTensorMap.set(binding_names::kContextLengths, mDraftContextLengths);
     mDraftTensorMap.set(binding_names::kDFlashDeltaLengths, mDraftDeltaLens);
 
-    // KV cache bindings: bind to draft cache manager's combined KV cache (index 1). DSpark
-    // uses the same cached-draft path as DFlash, so the engine expects the paged-pool view
-    // [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim], not the legacy slot-shaped alias.
+    // KV cache bindings: DSpark uses the same paged-pool contract as DFlash.
     {
         auto& kvMgr = mDraftCacheManager.getKVCacheManager();
         int32_t localAttnIdx = 0;
@@ -193,7 +191,7 @@ DSparkDecoder::DSparkDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
             {
                 continue;
             }
-            auto& combinedKV = kvMgr.getCombinedKVCachePoolView(localAttnIdx);
+            auto& combinedKV = kvMgr.getCombinedKVCache(localAttnIdx);
             mDraftTensorMap.set(binding_names::formatKVCacheName(localAttnIdx, /*isPast=*/true), combinedKV);
             mDraftTensorMap.set(binding_names::formatKVCacheName(localAttnIdx, /*isPast=*/false), combinedKV);
             ++localAttnIdx;
@@ -202,8 +200,7 @@ DSparkDecoder::DSparkDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
 
     mDraftTensorMap.set(binding_names::kKVCacheStartIndex, mDraftCacheManager.getKVCacheLengths());
 
-    // kv_page_table: static identity mapping for the draft's proposal self-attention
-    // (shared resource index 1), matching the draft paged-pool binding above.
+    // Draft page table (shared resource index 1).
     mDraftTensorMap.set(binding_names::kKVPageTable, mRuntime.base.sharedResources.kvPageTables[1]->kernelView());
 
     if (draftCfg.ropeConfig.type == RopeType::kMRope)
@@ -966,12 +963,16 @@ void DSparkDecoder::commitAcceptedTreePath(
 
     check::check(mRuntime.base.pipelineIO.baseHiddenStates.reshape({activeBatchSize, verifySize, mBaseOutputHiddenDim}),
         "Tensor reshape failed");
+    auto const& basePageTable = *mRuntime.base.sharedResources.kvPageTables[0];
+    int32_t const* basePageTablePtr = basePageTable.kernelView().dataPointer<int32_t>();
+    int32_t const baseNumPages = kvMgrBase.numPages();
+    int32_t const baseMaxPagesPerSeq = basePageTable.maxPagesPerSeq();
     // Branching-tree accept can skip nodes, so commit compacts accepted KV rows using accepted verify indices.
     for (auto const& group : kvHeadDimGroups)
     {
         kernel::eagleBaseCommitKVCache(mAcceptedTokenIndices, mAcceptLength, kvCacheLengths, group.deviceLayerInfos,
             group.numLayers, group.headDim, group.maxKVHeads, activeBatchSize, maxAcceptLength, kvCacheType,
-            context.stream);
+            context.stream, basePageTablePtr, baseNumPages, baseMaxPagesPerSeq);
     }
     kernel::eagleBaseAssembleHiddenState(
         mAcceptedTokenIndices, mAcceptLength, mRuntime.base.pipelineIO.baseHiddenStates, context.stream);

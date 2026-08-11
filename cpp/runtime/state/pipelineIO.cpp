@@ -205,12 +205,9 @@ static void buildTensorMapImpl(TensorMap& map, PipelineIO& io, SharedResources& 
                 ? cfg.kvSharingDonors[localAttnIdx]
                 : -1;
 
-            // Plugin (combined KV): bind to donor's tensor if shared, else own tensor. Bind the
-            // pool-shaped view — the AttentionPlugin engine binding contract is the paged pool
-            // [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim], not the internal slot-shaped
-            // allocation (see KVCacheManager::getCombinedKVCachePoolView()).
-            auto& combinedKV = (donorIdx >= 0) ? kvMgr.getCombinedKVCachePoolView(donorIdx)
-                                               : kvMgr.getCombinedKVCachePoolView(localAttnIdx);
+            // Plugin (combined KV): bind to donor's pool if shared, else own pool.
+            auto& combinedKV
+                = (donorIdx >= 0) ? kvMgr.getCombinedKVCache(donorIdx) : kvMgr.getCombinedKVCache(localAttnIdx);
             map.set(binding_names::formatKVCacheName(localAttnIdx, /*isPast=*/true), combinedKV);
             map.set(binding_names::formatKVCacheName(localAttnIdx, /*isPast=*/false), combinedKV); // alias: in-place
             ++localAttnIdx;
@@ -393,7 +390,7 @@ void buildTensorMapForGemma4MTPDraft(
     map.set(binding_names::kKVPageTable, res.kvPageTables[0]->kernelView());
     for (auto const& entry : draftCfg.gemma4MTPKVSharingMap)
     {
-        rt::Tensor& targetKV = baseCacheManager.getCombinedKVCachePoolView(entry.targetAbsoluteLayerIdx);
+        rt::Tensor& targetKV = baseCacheManager.getCombinedKVCache(entry.targetAbsoluteLayerIdx);
         map.set(binding_names::formatKVCacheName(entry.assistantLayerIdx, /*isPast=*/true), targetKV);
     }
 }

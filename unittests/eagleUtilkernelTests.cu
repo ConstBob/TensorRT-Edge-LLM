@@ -17,12 +17,10 @@
 
 #include "common/cudaUtils.h"
 #include "common/pagedKvTypes.h"
-#include "kernels/common/vectorizedTypes.cuh"
 #include "kernels/speculative/eagleUtilKernels.h"
 #include "runtime/state/kvPageTable.h"
 #include "testUtils.h"
 #include <cmath>
-#include <cstdio>
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 #include <vector>
@@ -961,16 +959,12 @@ TEST(EagleKernels, EagleBaseAssembleHiddenState)
         SCOPED_TRACE("headDim=" + std::to_string(headDim));
 
         cudaStream_t stream = nullptr;
-        int32_t numLayers = 2;
-        int32_t numKVHead = 4;
-        int32_t maxSeqLen = 2048;
         int32_t maxDepth = 6;       // After compaction, stride will be maxDepth
         int32_t draftTreeSize = 10; // Input stride is draftTreeSize
         int32_t baseHiddenDim = 512;
 
         // Test with 2 batches to verify compaction with stride change
         int32_t batchSize = 2;
-        int32_t maxBatchSize = 2;
 
         // Batch 0: accept positions [0, 3, 7] (length=3)
         // Batch 1: accept positions [0, 2, 5] (length=3)
@@ -979,7 +973,6 @@ TEST(EagleKernels, EagleBaseAssembleHiddenState)
             0, 2, 5, -1, -1, -1  // Batch 1
         };
         std::vector<int32_t> inputAcceptLengths = {3, 3};
-        std::vector<int32_t> inputKvCacheLengths = {256, 256};
 
         // Setup input hidden states with unique markers for each batch and position
         // Use simple pattern: batch_id * 1000 + position_id * 100
@@ -1002,22 +995,15 @@ TEST(EagleKernels, EagleBaseAssembleHiddenState)
         // Create device tensors
         auto acceptedIndicesDevice = rt::Tensor({batchSize, maxDepth}, rt::DeviceType::kGPU, DataType::kINT32);
         auto acceptLengthsDevice = rt::Tensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
-        auto kvCacheLengthsDevice = rt::Tensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
-        auto kvCacheDevice = rt::Tensor(
-            {numLayers, maxBatchSize, 2, numKVHead, maxSeqLen, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
         auto hiddenStateDevice
             = rt::Tensor({batchSize, draftTreeSize, baseHiddenDim}, rt::DeviceType::kGPU, DataType::kHALF);
-
-        std::vector<half> kvCache(numLayers * maxBatchSize * 2 * numKVHead * maxSeqLen * headDim, __float2half(1.0f));
 
         // Copy data to device
         copyHostToDevice<int32_t>(acceptedIndicesDevice, inputAcceptedIndices);
         copyHostToDevice<int32_t>(acceptLengthsDevice, inputAcceptLengths);
-        copyHostToDevice<int32_t>(kvCacheLengthsDevice, inputKvCacheLengths);
-        copyHostToDevice<half>(kvCacheDevice, kvCache);
         copyHostToDevice<half>(hiddenStateDevice, inputHiddenState);
 
-        // Execute kernels (split API: KV cache commit + hidden state assembly)
+        // Execute hidden state assembly.
         eagleBaseAssembleHiddenState(acceptedIndicesDevice, acceptLengthsDevice, hiddenStateDevice, stream);
 
         // Read back results
@@ -1062,12 +1048,14 @@ TEST(EagleKernels, EagleBaseCommitKVCacheHeterogeneousLayers)
     {
         // Two attention layers in the same head-dim group, with different numKVHeads.
         int32_t const maxBatchSize = 1;
-        int32_t const maxSeqLen = 64;
+        int32_t const maxSeqLen = rt::kTOKENS_PER_PAGE;
         int32_t const numLayers = 2;
         std::vector<int32_t> const numKVHeadsPerLayer = {4, 2}; // heterogeneous; group maxKVHeads = 4
         int32_t const maxKVHeads = 4;
         int32_t const activeBatchSize = 1;
         int32_t const maxDepth = 4;
+        int32_t const maxPagesPerSeq = maxSeqLen / rt::kTOKENS_PER_PAGE;
+        int32_t const numPages = maxBatchSize * maxPagesPerSeq;
 
         // Single batch with pastKvCacheLength=4 and accepted indices [0, 3, 5] (length=3).
         // Kernel writes to positions {pastKv+i for i in 1..acceptLen-1} reading from
@@ -1086,10 +1074,9 @@ TEST(EagleKernels, EagleBaseCommitKVCacheHeterogeneousLayers)
         for (int32_t L = 0; L < numLayers; ++L)
         {
             int32_t const numKVHeads = numKVHeadsPerLayer[L];
-            // Two-pool NHD layout [2, maxBatch, maxSeqLen, numKVHeads, headDim].
             rt::Tensor layerCache(
-                {2, maxBatchSize, maxSeqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
-            std::vector<half> hostInit(static_cast<size_t>(maxBatchSize) * 2 * numKVHeads * maxSeqLen * headDim);
+                {2, numPages, rt::kTOKENS_PER_PAGE, numKVHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+            std::vector<half> hostInit(static_cast<size_t>(2) * numPages * rt::kTOKENS_PER_PAGE * numKVHeads * headDim);
             for (int32_t kv = 0; kv < 2; ++kv)
             {
                 for (int32_t h = 0; h < numKVHeads; ++h)
@@ -1097,8 +1084,12 @@ TEST(EagleKernels, EagleBaseCommitKVCacheHeterogeneousLayers)
                     for (int32_t pos = 0; pos < maxSeqLen; ++pos)
                     {
                         half const v = __float2half(kvAt(L, kv, h, pos));
-                        int64_t const base = static_cast<int64_t>(kv) * maxBatchSize * maxSeqLen * numKVHeads * headDim
-                            + (static_cast<int64_t>(pos) * numKVHeads + h) * headDim;
+                        int64_t const base = (((static_cast<int64_t>(kv) * numPages + pos / rt::kTOKENS_PER_PAGE)
+                                                      * rt::kTOKENS_PER_PAGE
+                                                  + pos % rt::kTOKENS_PER_PAGE)
+                                                     * numKVHeads
+                                                 + h)
+                            * headDim;
                         for (int32_t d = 0; d < headDim; ++d)
                         {
                             hostInit[base + d] = v;
@@ -1107,7 +1098,7 @@ TEST(EagleKernels, EagleBaseCommitKVCacheHeterogeneousLayers)
                 }
             }
             copyHostToDevice<half>(layerCache, hostInit);
-            hostInfos[L] = KVLayerInfo{layerCache.rawPointer(), numKVHeads, maxSeqLen, maxBatchSize};
+            hostInfos[L] = KVLayerInfo{layerCache.rawPointer(), numKVHeads, maxSeqLen};
             kvCachePerLayer.push_back(std::move(layerCache));
         }
         rt::Tensor deviceInfos = uploadLayerInfos(hostInfos, stream);
@@ -1119,9 +1110,13 @@ TEST(EagleKernels, EagleBaseCommitKVCacheHeterogeneousLayers)
         copyHostToDevice<int32_t>(acceptLengthsDevice, inputAcceptLengths);
         copyHostToDevice<int32_t>(kvCacheLengthsDevice, inputKvCacheLengths);
 
+        rt::KVPageTable pageTable(maxBatchSize, maxPagesPerSeq, maxBatchSize * maxPagesPerSeq);
+        pageTable.setIdentity();
+        pageTable.upload(stream);
+
         eagleBaseCommitKVCache(acceptedIndicesDevice, acceptLengthsDevice, kvCacheLengthsDevice,
             static_cast<KVLayerInfo const*>(deviceInfos.rawPointer()), numLayers, headDim, maxKVHeads, activeBatchSize,
-            maxDepth, DataType::kHALF, stream);
+            maxDepth, DataType::kHALF, stream, pageTable.kernelView().dataPointer<int32_t>(), numPages, maxPagesPerSeq);
 
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
@@ -1135,7 +1130,8 @@ TEST(EagleKernels, EagleBaseCommitKVCacheHeterogeneousLayers)
             {
                 for (int32_t h = 0; h < numKVHeads; ++h)
                 {
-                    int64_t const headBase = static_cast<int64_t>(kv) * maxBatchSize * maxSeqLen * numKVHeads * headDim
+                    int64_t const headBase
+                        = static_cast<int64_t>(kv) * numPages * rt::kTOKENS_PER_PAGE * numKVHeads * headDim
                         + static_cast<int64_t>(h) * headDim;
                     int64_t const tokenStride = static_cast<int64_t>(numKVHeads) * headDim;
 
@@ -1164,118 +1160,10 @@ TEST(EagleKernels, EagleBaseCommitKVCacheHeterogeneousLayers)
 }
 
 // ============================================================================
-// Test 8d: eagleBaseCommitKVCache with an identity page table
-// Description: paged-KV addition. `eagleBaseCommitKVCache` gains optional
-// (pageTable, maxPagesPerSeq) parameters that resolve the committed token's absolute position
-// through the page table's K/V rows instead of the identity-contiguous NHD stride. Under a
-// static identity table (KVPageTable::setIdentity), the two addressing paths must be
-// byte-identical: run the SAME commit on two independently-seeded-but-equal buffers, once with
-// pageTable == nullptr and once with an identity KVPageTable, and diff the results.
-// ============================================================================
-TEST(EagleKernels, EagleBaseCommitKVCacheIdentityPageTableMatchesContiguous)
-{
-    cudaStream_t stream = nullptr;
-
-    int32_t const headDim = 64;
-    int32_t const numKVHeads = 2;
-    int32_t const maxBatchSize = 2;
-    int32_t const maxSeqLen = 256; // capPadded; 2 pages of 128 tokens per slot.
-    int32_t const numLayers = 1;
-    int32_t const maxKVHeads = numKVHeads;
-    int32_t const activeBatchSize = 2;
-    int32_t const maxDepth = 4;
-    int32_t const maxPagesPerSeq = maxSeqLen / rt::kTOKENS_PER_PAGE;
-
-    // Slot 0: pastKv=100 (still page 0), accept [0, 3, 5] -> writes land at pos 101, 102 (page 0).
-    // Slot 1: pastKv=126, accept [0, 5, 9] -> writes land at pos 131, 135, straddling the page-1
-    // boundary (page 0 has tokens [0,128), page 1 has [128,256)), which is the case most likely to
-    // expose an addressing bug in the paged path.
-    std::vector<int32_t> const inputAcceptedIndices = {0, 3, 5, -1, 0, 5, 9, -1};
-    std::vector<int32_t> const inputAcceptLengths = {3, 3};
-    std::vector<int32_t> const inputKvCacheLengths = {100, 126};
-
-    auto kvAt = [&](int32_t kv, int32_t b, int32_t h, int32_t pos) {
-        return static_cast<float>(kv * 10000 + b * 1000 + h * 100 + pos % 97);
-    };
-
-    auto buildLayerCache = [&]() {
-        rt::Tensor layerCache({2, maxBatchSize, maxSeqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
-        std::vector<half> hostInit(static_cast<size_t>(2) * maxBatchSize * maxSeqLen * numKVHeads * headDim);
-        for (int32_t kv = 0; kv < 2; ++kv)
-        {
-            for (int32_t b = 0; b < maxBatchSize; ++b)
-            {
-                for (int32_t h = 0; h < numKVHeads; ++h)
-                {
-                    for (int32_t p = 0; p < maxSeqLen; ++p)
-                    {
-                        half const v = __float2half(kvAt(kv, b, h, p));
-                        int64_t const base = static_cast<int64_t>(kv) * maxBatchSize * maxSeqLen * numKVHeads * headDim
-                            + static_cast<int64_t>(b) * maxSeqLen * numKVHeads * headDim
-                            + (static_cast<int64_t>(p) * numKVHeads + h) * headDim;
-                        for (int32_t d = 0; d < headDim; ++d)
-                        {
-                            hostInit[base + d] = v;
-                        }
-                    }
-                }
-            }
-        }
-        copyHostToDevice<half>(layerCache, hostInit);
-        return layerCache;
-    };
-
-    rt::Tensor contiguousCache = buildLayerCache();
-    rt::Tensor pagedCache = buildLayerCache();
-
-    std::vector<KVLayerInfo> hostInfosContig{
-        KVLayerInfo{contiguousCache.rawPointer(), numKVHeads, maxSeqLen, maxBatchSize}};
-    std::vector<KVLayerInfo> hostInfosPaged{KVLayerInfo{pagedCache.rawPointer(), numKVHeads, maxSeqLen, maxBatchSize}};
-    rt::Tensor deviceInfosContig = uploadLayerInfos(hostInfosContig, stream);
-    rt::Tensor deviceInfosPaged = uploadLayerInfos(hostInfosPaged, stream);
-
-    auto acceptedIndicesDevice = rt::Tensor({activeBatchSize, maxDepth}, rt::DeviceType::kGPU, DataType::kINT32);
-    auto acceptLengthsDevice = rt::Tensor({activeBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
-    auto kvCacheLengthsDevice = rt::Tensor({activeBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
-    copyHostToDevice<int32_t>(acceptedIndicesDevice, inputAcceptedIndices);
-    copyHostToDevice<int32_t>(acceptLengthsDevice, inputAcceptLengths);
-    copyHostToDevice<int32_t>(kvCacheLengthsDevice, inputKvCacheLengths);
-
-    // Identity page table: numPages = maxBatch * maxPagesPerSeq (one layer's own [2, maxBatch,
-    // maxSeqLen, H, D] buffer, treated as a flat [2*numPages, 128, H, D] pool, matches this exactly).
-    rt::KVPageTable pageTable(maxBatchSize, maxPagesPerSeq, maxBatchSize * maxPagesPerSeq);
-    pageTable.setIdentity();
-    pageTable.upload(stream);
-
-    eagleBaseCommitKVCache(acceptedIndicesDevice, acceptLengthsDevice, kvCacheLengthsDevice,
-        static_cast<KVLayerInfo const*>(deviceInfosContig.rawPointer()), numLayers, headDim, maxKVHeads,
-        activeBatchSize, maxDepth, DataType::kHALF, stream);
-    eagleBaseCommitKVCache(acceptedIndicesDevice, acceptLengthsDevice, kvCacheLengthsDevice,
-        static_cast<KVLayerInfo const*>(deviceInfosPaged.rawPointer()), numLayers, headDim, maxKVHeads, activeBatchSize,
-        maxDepth, DataType::kHALF, stream, pageTable.kernelView().dataPointer<int32_t>(), maxPagesPerSeq);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    auto const contigHost = copyDeviceToHost<half>(contiguousCache);
-    auto const pagedHost = copyDeviceToHost<half>(pagedCache);
-    ASSERT_EQ(contigHost.size(), pagedHost.size());
-    for (size_t i = 0; i < contigHost.size(); ++i)
-    {
-        ASSERT_EQ(__half_as_ushort(contigHost[i]), __half_as_ushort(pagedHost[i]))
-            << "byte mismatch at flat idx " << i << ": contiguous=" << __half2float(contigHost[i])
-            << " paged=" << __half2float(pagedHost[i]);
-    }
-}
-
-// ============================================================================
 // Test 8e: eagleBaseCommitKVCache with a non-identity (scrambled) page table
-// Description: Review item B5 requires coverage beyond the identity-matches-contiguous check:
-// a real permutation must route each slot's accepted-KV writes/reads through the physical pages
-// the table actually names, not through the position the OLD nullptr/identity-only call site would
-// have used. This test swaps slot 0 and slot 1's physical K/V pages (a full derangement -- neither
-// slot maps to its own identity range) and additionally straddles a page boundary on slot 0, so it
-// covers both "non-identity table" and "commit spanning a page boundary" in one kernel-level test.
-// It also asserts the position an identity/nullptr call would have (wrongly) written to is left
-// untouched, which is the exact regression `eagleDecoder.cpp` passing `nullptr` would reintroduce.
+// Description: a real permutation must route each slot's accepted-KV writes/reads through the
+// physical pages named by the table. This swaps the two slots' physical K/V pages and straddles
+// a page boundary on slot 0.
 // ============================================================================
 TEST(EagleKernels, EagleBaseCommitKVCacheNonIdentityPageTableRemapsPhysicalPages)
 {
@@ -1304,12 +1192,14 @@ TEST(EagleKernels, EagleBaseCommitKVCacheNonIdentityPageTableRemapsPhysicalPages
         return static_cast<float>(kv * 10000 + b * 1000 + h * 100 + pos % 97);
     };
 
-    rt::Tensor layerCache({2, maxBatchSize, maxSeqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    std::vector<half> hostInit(static_cast<size_t>(2) * maxBatchSize * maxSeqLen * numKVHeads * headDim);
+    rt::Tensor layerCache(
+        {2, numPages, rt::kTOKENS_PER_PAGE, numKVHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    std::vector<half> hostInit(static_cast<size_t>(2) * numPages * rt::kTOKENS_PER_PAGE * numKVHeads * headDim);
     auto rawIndex = [&](int32_t kv, int32_t b, int32_t h, int32_t pos) {
-        return static_cast<int64_t>(kv) * maxBatchSize * maxSeqLen * numKVHeads * headDim
-            + static_cast<int64_t>(b) * maxSeqLen * numKVHeads * headDim
-            + (static_cast<int64_t>(pos) * numKVHeads + h) * headDim;
+        int32_t const physicalPage = b * maxPagesPerSeq + pos / rt::kTOKENS_PER_PAGE;
+        int32_t const inPage = pos % rt::kTOKENS_PER_PAGE;
+        return (((static_cast<int64_t>(kv) * numPages + physicalPage) * rt::kTOKENS_PER_PAGE + inPage) * numKVHeads + h)
+            * headDim;
     };
     for (int32_t kv = 0; kv < 2; ++kv)
     {
@@ -1328,7 +1218,7 @@ TEST(EagleKernels, EagleBaseCommitKVCacheNonIdentityPageTableRemapsPhysicalPages
     }
     copyHostToDevice<half>(layerCache, hostInit);
 
-    std::vector<KVLayerInfo> hostInfos{KVLayerInfo{layerCache.rawPointer(), numKVHeads, maxSeqLen, maxBatchSize}};
+    std::vector<KVLayerInfo> hostInfos{KVLayerInfo{layerCache.rawPointer(), numKVHeads, maxSeqLen}};
     rt::Tensor deviceInfos = uploadLayerInfos(hostInfos, stream);
 
     auto acceptedIndicesDevice = rt::Tensor({activeBatchSize, maxDepth}, rt::DeviceType::kGPU, DataType::kINT32);
@@ -1350,7 +1240,7 @@ TEST(EagleKernels, EagleBaseCommitKVCacheNonIdentityPageTableRemapsPhysicalPages
 
     eagleBaseCommitKVCache(acceptedIndicesDevice, acceptLengthsDevice, kvCacheLengthsDevice,
         static_cast<KVLayerInfo const*>(deviceInfos.rawPointer()), numLayers, headDim, maxKVHeads, activeBatchSize,
-        maxDepth, DataType::kHALF, stream, pageTable.kernelView().dataPointer<int32_t>(), maxPagesPerSeq);
+        maxDepth, DataType::kHALF, stream, pageTable.kernelView().dataPointer<int32_t>(), numPages, maxPagesPerSeq);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     auto const host = copyDeviceToHost<half>(layerCache);
@@ -1373,11 +1263,72 @@ TEST(EagleKernels, EagleBaseCommitKVCacheNonIdentityPageTableRemapsPhysicalPages
         EXPECT_TRUE(isclose(valueAt(kv, 0, 12), kvAt(kv, 0, 0, 15), 1e-3f, 1e-3f))
             << "kv=" << kv << " slot1->phys pos12 mismatch";
 
-        // Regression guard: an identity/nullptr addressing bug would have written slot 0's commit
-        // into raw batch 0 (its own identity range) instead of raw batch 1. Position 127 there must
-        // therefore be left completely untouched by this non-identity commit.
+        // The remapped commit must leave slot 0's identity-mapped physical location untouched.
         EXPECT_TRUE(isclose(valueAt(kv, 0, 127), kvAt(kv, 0, 0, 127), 1e-3f, 1e-3f))
-            << "kv=" << kv << " raw batch0 pos127 was wrongly touched (identity-addressing regression)";
+            << "kv=" << kv << " raw batch0 pos127 was wrongly touched";
+    }
+}
+
+TEST(EagleKernels, EagleBaseCommitKVCacheSkipsWrongPlanePageIds)
+{
+    cudaStream_t stream = nullptr;
+
+    int32_t const headDim = 64;
+    int32_t const numKVHeads = 1;
+    int32_t const activeBatchSize = 2;
+    int32_t const maxDepth = 3;
+    int32_t const maxPagesPerSeq = 2;
+    int32_t const numPages = 4;
+    int32_t const maxSeqLen = maxPagesPerSeq * rt::kTOKENS_PER_PAGE;
+
+    rt::Tensor layerCache(
+        {2, numPages, rt::kTOKENS_PER_PAGE, numKVHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    std::vector<half> hostInit(
+        static_cast<size_t>(2) * numPages * rt::kTOKENS_PER_PAGE * numKVHeads * headDim, __float2half(0.0F));
+    auto const flatIndex = [&](int32_t pageId, int32_t inPage, int32_t dim) {
+        return (static_cast<int64_t>(pageId) * rt::kTOKENS_PER_PAGE + inPage) * numKVHeads * headDim + dim;
+    };
+    auto const seedToken = [&](int32_t pageId, int32_t inPage, float value) {
+        for (int32_t dim = 0; dim < headDim; ++dim)
+        {
+            hostInit[flatIndex(pageId, inPage, dim)] = __float2half(value);
+        }
+    };
+
+    seedToken(/*pageId=*/1, /*inPage=*/0, 11.0F);
+    seedToken(/*pageId=*/4, /*inPage=*/126, 55.0F);
+    seedToken(/*pageId=*/4, /*inPage=*/127, 44.0F);
+    seedToken(/*pageId=*/6, /*inPage=*/0, 22.0F);
+    seedToken(/*pageId=*/0, /*inPage=*/126, 66.0F);
+    seedToken(/*pageId=*/0, /*inPage=*/127, 77.0F);
+    copyHostToDevice<half>(layerCache, hostInit);
+
+    std::vector<KVLayerInfo> const hostInfos{KVLayerInfo{layerCache.rawPointer(), numKVHeads, maxSeqLen}};
+    rt::Tensor deviceInfos = uploadLayerInfos(hostInfos, stream);
+
+    rt::Tensor acceptedIndicesDevice({activeBatchSize, maxDepth}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor acceptLengthsDevice({activeBatchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor kvCacheLengthsDevice({activeBatchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice<int32_t>(acceptedIndicesDevice, {0, 2, 0, 0, 2, 0});
+    copyHostToDevice<int32_t>(acceptLengthsDevice, {3, 3});
+    copyHostToDevice<int32_t>(kvCacheLengthsDevice, {126, 126});
+
+    rt::Tensor pageTable({activeBatchSize, 2, maxPagesPerSeq}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice<int32_t>(pageTable,
+        {4, 1, rt::kUNUSED_PAGE_ENTRY, rt::kUNUSED_PAGE_ENTRY, rt::kUNUSED_PAGE_ENTRY, rt::kUNUSED_PAGE_ENTRY, 0, 6});
+
+    eagleBaseCommitKVCache(acceptedIndicesDevice, acceptLengthsDevice, kvCacheLengthsDevice,
+        static_cast<KVLayerInfo const*>(deviceInfos.rawPointer()), /*numLayers=*/1, headDim, numKVHeads,
+        activeBatchSize, maxDepth, DataType::kHALF, stream, pageTable.dataPointer<int32_t>(), numPages, maxPagesPerSeq);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    auto const host = copyDeviceToHost<half>(layerCache);
+    for (int32_t dim = 0; dim < headDim; ++dim)
+    {
+        EXPECT_FLOAT_EQ(__half2float(host[flatIndex(/*pageId=*/4, /*inPage=*/127, dim)]), 44.0F);
+        EXPECT_FLOAT_EQ(__half2float(host[flatIndex(/*pageId=*/1, /*inPage=*/0, dim)]), 0.0F);
+        EXPECT_FLOAT_EQ(__half2float(host[flatIndex(/*pageId=*/0, /*inPage=*/127, dim)]), 77.0F);
+        EXPECT_FLOAT_EQ(__half2float(host[flatIndex(/*pageId=*/6, /*inPage=*/0, dim)]), 0.0F);
     }
 }
 
@@ -1396,11 +1347,13 @@ TEST(EagleKernels, EagleBaseCommitKVCacheAcceptRollbackTreeNodes)
     int32_t const headDim = 64;
     int32_t const numKVHeads = 1;
     int32_t const maxBatchSize = 2;
-    int32_t const maxSeqLen = 64;
+    int32_t const maxSeqLen = rt::kTOKENS_PER_PAGE;
     int32_t const numLayers = 1;
     int32_t const maxKVHeads = numKVHeads;
     int32_t const activeBatchSize = 2;
     int32_t const maxDepth = 5;
+    int32_t const maxPagesPerSeq = maxSeqLen / rt::kTOKENS_PER_PAGE;
+    int32_t const numPages = maxBatchSize * maxPagesPerSeq;
 
     // Batch 0: pastKv=20, tree nodes drafted at i=1..4; accept path keeps i=1,2 (accepted from
     // source offsets 2 and 5) and rejects tree nodes at i=3,4 (never written -> rollback).
@@ -1413,12 +1366,14 @@ TEST(EagleKernels, EagleBaseCommitKVCacheAcceptRollbackTreeNodes)
         return static_cast<float>(kv * 10000 + b * 1000 + h * 100 + pos % 97);
     };
 
-    rt::Tensor layerCache({2, maxBatchSize, maxSeqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
-    std::vector<half> hostInit(static_cast<size_t>(2) * maxBatchSize * maxSeqLen * numKVHeads * headDim);
+    rt::Tensor layerCache(
+        {2, numPages, rt::kTOKENS_PER_PAGE, numKVHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    std::vector<half> hostInit(static_cast<size_t>(2) * numPages * rt::kTOKENS_PER_PAGE * numKVHeads * headDim);
     auto rawIndex = [&](int32_t kv, int32_t b, int32_t h, int32_t pos) {
-        return static_cast<int64_t>(kv) * maxBatchSize * maxSeqLen * numKVHeads * headDim
-            + static_cast<int64_t>(b) * maxSeqLen * numKVHeads * headDim
-            + (static_cast<int64_t>(pos) * numKVHeads + h) * headDim;
+        int32_t const physicalPage = b * maxPagesPerSeq + pos / rt::kTOKENS_PER_PAGE;
+        int32_t const inPage = pos % rt::kTOKENS_PER_PAGE;
+        return (((static_cast<int64_t>(kv) * numPages + physicalPage) * rt::kTOKENS_PER_PAGE + inPage) * numKVHeads + h)
+            * headDim;
     };
     for (int32_t kv = 0; kv < 2; ++kv)
     {
@@ -1437,7 +1392,7 @@ TEST(EagleKernels, EagleBaseCommitKVCacheAcceptRollbackTreeNodes)
     }
     copyHostToDevice<half>(layerCache, hostInit);
 
-    std::vector<KVLayerInfo> hostInfos{KVLayerInfo{layerCache.rawPointer(), numKVHeads, maxSeqLen, maxBatchSize}};
+    std::vector<KVLayerInfo> hostInfos{KVLayerInfo{layerCache.rawPointer(), numKVHeads, maxSeqLen}};
     rt::Tensor deviceInfos = uploadLayerInfos(hostInfos, stream);
 
     auto acceptedIndicesDevice = rt::Tensor({activeBatchSize, maxDepth}, rt::DeviceType::kGPU, DataType::kINT32);
@@ -1447,9 +1402,13 @@ TEST(EagleKernels, EagleBaseCommitKVCacheAcceptRollbackTreeNodes)
     copyHostToDevice<int32_t>(acceptLengthsDevice, inputAcceptLengths);
     copyHostToDevice<int32_t>(kvCacheLengthsDevice, inputKvCacheLengths);
 
+    rt::KVPageTable pageTable(maxBatchSize, maxPagesPerSeq, maxBatchSize * maxPagesPerSeq);
+    pageTable.setIdentity();
+    pageTable.upload(stream);
+
     eagleBaseCommitKVCache(acceptedIndicesDevice, acceptLengthsDevice, kvCacheLengthsDevice,
         static_cast<KVLayerInfo const*>(deviceInfos.rawPointer()), numLayers, headDim, maxKVHeads, activeBatchSize,
-        maxDepth, DataType::kHALF, stream);
+        maxDepth, DataType::kHALF, stream, pageTable.kernelView().dataPointer<int32_t>(), numPages, maxPagesPerSeq);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     auto const host = copyDeviceToHost<half>(layerCache);
@@ -1970,185 +1929,4 @@ TEST(EagleKernels, PrepareEagleBaseTreeDecodingInputs)
             EXPECT_EQ(actualSelectIndices[i], i);
         }
     }
-}
-
-// ============================================================================
-// Benchmark: legacy monolithic-6D commit kernel vs new per-layer batched kernel
-//
-// Restores the pre-refactor `eagleBaseCommitKVCacheKernel` as a file-local helper
-// (anonymous namespace, not exposed) and runs both kernels back-to-back on
-// Qwen3-8B-shaped data with cudaEvent timing. The two kernels do exactly the same
-// work; the only difference is addressing (single base + L stride vs per-layer
-// pointers via KVLayerInfo). This confirms the new kernel has no per-call
-// throughput regression.
-//
-// Test name starts with "Benchmark*" so it can be filtered separately:
-//   ./build/unitTest --gtest_filter="EagleKernels.Benchmark*"
-// ============================================================================
-
-namespace legacy_bench
-{
-// Exact pre-refactor copy of `eagleBaseCommitKVCacheKernel`. Kept here ONLY for the
-// A/B microbenchmark below — production code no longer references it.
-template <int32_t HEAD_DIM, int32_t MAX_PATH, typename KV_T>
-__global__ void eagleBaseCommitKVCacheKernelLegacy(int32_t const* acceptedIndices, int32_t const* acceptLengths,
-    int32_t const* kvCacheLengths, KV_T* kvCacheBuffer, int32_t const activeBatchSize, int32_t const maxDepth,
-    int32_t const numLayers, int32_t const maxBatchSize, int32_t const numHeads, int32_t const maxSeqLen)
-{
-    static_assert(HEAD_DIM == 64 || HEAD_DIM == 128, "Only HEAD_DIM = 64 or 128 are supported");
-    DVec<KV_T> tempBuffer[MAX_PATH];
-
-    int32_t const tIdx = threadIdx.x;
-    int32_t const tIdy = threadIdx.y;
-    int32_t const bIdx = blockIdx.x;
-    int32_t const headIdx = bIdx * blockDim.y + tIdy;
-
-    int32_t const kvLayerIdx = headIdx / (activeBatchSize * 2 * numHeads);
-    int32_t const kvBatchIdx = (headIdx % (activeBatchSize * 2 * numHeads)) / (2 * numHeads);
-    int32_t const kvHeadIdx = headIdx % (2 * numHeads);
-
-    int32_t const actualAcceptLength = acceptLengths[kvBatchIdx];
-    int32_t const pastKvCacheLength = kvCacheLengths[kvBatchIdx];
-    int64_t const kvCacheOffset = static_cast<int64_t>(kvLayerIdx) * maxBatchSize * 2 * numHeads * maxSeqLen * HEAD_DIM
-        + static_cast<int64_t>(kvBatchIdx) * 2 * numHeads * maxSeqLen * HEAD_DIM
-        + static_cast<int64_t>(kvHeadIdx) * maxSeqLen * HEAD_DIM + static_cast<int64_t>(pastKvCacheLength) * HEAD_DIM;
-
-    for (int32_t i = 1; i < actualAcceptLength; ++i)
-    {
-        int32_t const acceptedIdx = acceptedIndices[kvBatchIdx * maxDepth + i];
-        if (acceptedIdx >= 0 && acceptedIdx + pastKvCacheLength < maxSeqLen)
-        {
-            int64_t const srcOffset
-                = kvCacheOffset + static_cast<int64_t>(acceptedIdx) * HEAD_DIM + tIdx * DVec<half>::vec_size;
-            tempBuffer[i].load(kvCacheBuffer + srcOffset);
-        }
-    }
-
-    for (int32_t i = 1; i < actualAcceptLength; ++i)
-    {
-        int64_t const dstOffset = kvCacheOffset + static_cast<int64_t>(i) * HEAD_DIM + tIdx * DVec<half>::vec_size;
-        tempBuffer[i].store(kvCacheBuffer + dstOffset);
-    }
-}
-} // namespace legacy_bench
-
-TEST(EagleKernels, BenchmarkCommitKVCacheLegacyVsBatched)
-{
-#if !SUPPORTS_FP8
-    GTEST_SKIP() << "FP8 KV cache benchmark requires CUDA >= 11.8 (SUPPORTS_FP8=0).";
-#endif
-    cudaStream_t stream = nullptr;
-
-    // Realistic Qwen3-8B FP8-KV configuration on a single-batch decode iter.
-    constexpr int32_t numLayers = 36;
-    constexpr int32_t maxBatchSize = 1;
-    constexpr int32_t numKVHeads = 8;
-    constexpr int32_t maxSeqLen = 4096;
-    constexpr int32_t headDim = 128;
-    constexpr int32_t activeBatchSize = 1;
-    constexpr int32_t maxDepth = 7;
-    constexpr int32_t actualAcceptLength = 5; // typical EAGLE3 accept on Qwen3-8B
-    constexpr int32_t pastKvCacheLength = 1024;
-    constexpr int32_t kIters = 200;
-    constexpr int32_t kWarmup = 10;
-
-    // Common metadata
-    std::vector<int32_t> acceptedIndices(activeBatchSize * maxDepth, 0);
-    for (int32_t i = 1; i < actualAcceptLength; ++i)
-    {
-        acceptedIndices[i] = i; // accept positions [_, 1, 2, 3, 4, _, _]; root at 0 untouched
-    }
-    std::vector<int32_t> acceptLengths{actualAcceptLength};
-    std::vector<int32_t> kvCacheLengths{pastKvCacheLength};
-
-    auto acceptedIndicesDevice = rt::Tensor({activeBatchSize, maxDepth}, rt::DeviceType::kGPU, DataType::kINT32);
-    auto acceptLengthsDevice = rt::Tensor({activeBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
-    auto kvCacheLengthsDevice = rt::Tensor({activeBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
-    copyHostToDevice<int32_t>(acceptedIndicesDevice, acceptedIndices);
-    copyHostToDevice<int32_t>(acceptLengthsDevice, acceptLengths);
-    copyHostToDevice<int32_t>(kvCacheLengthsDevice, kvCacheLengths);
-
-    // Path A storage: one monolithic 6D FP8 KV tensor, addressed by global L stride.
-    rt::Tensor monolithicCache(
-        {numLayers, maxBatchSize, 2, numKVHeads, maxSeqLen, headDim}, rt::DeviceType::kGPU, DataType::kFP8);
-
-    // Path B storage: per-layer FP8 KV tensors + KVLayerInfo array on device.
-    std::vector<rt::Tensor> perLayerCache;
-    perLayerCache.reserve(numLayers);
-    std::vector<KVLayerInfo> hostInfos(numLayers);
-    for (int32_t L = 0; L < numLayers; ++L)
-    {
-        // NHD two-pool [2, maxBatch, maxSeqLen, H, D] — the layout the batched kernel addresses.
-        rt::Tensor layer({2, maxBatchSize, maxSeqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, DataType::kFP8);
-        hostInfos[L] = KVLayerInfo{layer.rawPointer(), numKVHeads, maxSeqLen, maxBatchSize};
-        perLayerCache.push_back(std::move(layer));
-    }
-    rt::Tensor deviceInfos = uploadLayerInfos(hostInfos, stream);
-
-    // Grid layouts
-    constexpr uint32_t vecSize = DVec<half>::vec_size; // 8, dtype-agnostic per the kernel design
-    constexpr uint32_t threadsPerBlock = 128;
-    uint32_t const bDimX = headDim / vecSize;
-    uint32_t const headPerBlock = threadsPerBlock * vecSize / headDim;
-    dim3 const blockDim(bDimX, headPerBlock);
-
-    uint32_t const totalNumHeadsLegacy = numLayers * activeBatchSize * 2 * numKVHeads;
-    uint32_t const totalNumBlocksLegacy = (totalNumHeadsLegacy + headPerBlock - 1) / headPerBlock;
-    dim3 const gridLegacy(totalNumBlocksLegacy);
-
-    auto launchLegacy = [&]() {
-#if SUPPORTS_FP8
-        legacy_bench::eagleBaseCommitKVCacheKernelLegacy<128, 8, __nv_fp8_e4m3><<<gridLegacy, blockDim, 0, stream>>>(
-            acceptedIndicesDevice.dataPointer<int32_t>(), acceptLengthsDevice.dataPointer<int32_t>(),
-            kvCacheLengthsDevice.dataPointer<int32_t>(), monolithicCache.dataPointer<__nv_fp8_e4m3>(), activeBatchSize,
-            maxDepth, numLayers, maxBatchSize, numKVHeads, maxSeqLen);
-#endif
-    };
-    auto launchBatched = [&]() {
-        eagleBaseCommitKVCache(acceptedIndicesDevice, acceptLengthsDevice, kvCacheLengthsDevice,
-            static_cast<KVLayerInfo const*>(deviceInfos.rawPointer()), numLayers, headDim, numKVHeads, activeBatchSize,
-            maxDepth, DataType::kFP8, stream);
-    };
-
-    // Warmup interleaved so both paths get the same caches state.
-    for (int32_t i = 0; i < kWarmup; ++i)
-    {
-        launchLegacy();
-        launchBatched();
-    }
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    cudaEvent_t start;
-    cudaEvent_t stop;
-    CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&stop));
-
-    auto bench = [&](auto&& launchFn) {
-        CUDA_CHECK(cudaEventRecord(start, stream));
-        for (int32_t i = 0; i < kIters; ++i)
-        {
-            launchFn();
-        }
-        CUDA_CHECK(cudaEventRecord(stop, stream));
-        CUDA_CHECK(cudaEventSynchronize(stop));
-        float ms = 0.f;
-        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
-        return ms / static_cast<float>(kIters);
-    };
-
-    float const legacyMs = bench(launchLegacy);
-    float const batchedMs = bench(launchBatched);
-
-    CUDA_CHECK(cudaEventDestroy(start));
-    CUDA_CHECK(cudaEventDestroy(stop));
-
-    std::printf("[EagleCommitKVCache bench, %d layers × B=%d × 2 × H=%d × S=%d × D=%d FP8]\n", numLayers,
-        activeBatchSize, numKVHeads, maxSeqLen, headDim);
-    std::printf("[BENCH] Legacy  (monolithic 6D)  per call: %8.4f ms\n", legacyMs);
-    std::printf("[BENCH] Batched (per-layer info) per call: %8.4f ms\n", batchedMs);
-    std::printf("[BENCH] Ratio (legacy / batched):          %6.3fx\n", legacyMs / batchedMs);
-
-    // Sanity guard: the new kernel is allowed to be slightly slower (one extra memory
-    // indirection through KVLayerInfo) but should not regress by more than 50%.
-    EXPECT_LT(batchedMs, legacyMs * 1.5f) << "Batched kernel is >1.5× slower than legacy";
 }

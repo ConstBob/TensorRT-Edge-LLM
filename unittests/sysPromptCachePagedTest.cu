@@ -15,11 +15,9 @@
  * limitations under the License.
  */
 
-// System-prompt cache capture/restore paged-pool round-trip. captureKVCache must read a sequence
-// out of row `b` of the NHD pool [2, maxBatch, capPadded, H, D] (K from the K-half, V from the
-// V-half) into a saved tensor [2, seqLen, H, D]; restoreKVCache must write it back to the same NHD
-// positions. We assert the NHD addressing explicitly: a per-token, per-(head,dim) value pattern
-// survives the round-trip in BOTH halves, and tokens beyond the captured prefix are left untouched.
+// System-prompt cache capture/restore reads a sequence from each active-slot K/V view into a saved
+// tensor [2, seqLen, H, D] and restores it to the same views. A per-token, per-(head,dim) value
+// pattern must survive the round-trip in both halves, while tokens past the prefix remain untouched.
 
 #include "common/cudaUtils.h"
 #include "runtime/hybridCacheManager.h"
@@ -127,7 +125,7 @@ TEST(SysPromptCachePagedTest, CaptureRestoreRoundTripNhdAddressing)
 
     int32_t const headsTimesDim = numKVHeads * headDim;
 
-    // Seed the NHD pool with a per-token/per-elem pattern in both halves.
+    // Seed both active-slot K/V views with a per-token/per-element pattern.
     for (int32_t L = 0; L < numLayers; ++L)
     {
         auto [k, v] = mgr.getSeparateKVCache(L);
