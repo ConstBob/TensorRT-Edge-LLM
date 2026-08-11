@@ -74,8 +74,8 @@ static inline DataType selectKvCacheDataType(bool enableFp8KVCache)
 bool isFp8KVCacheSupportedSM(int32_t smVersion)
 {
     // FP8 KV cache needs an FP8 XQA decode kernel, which is available only for these SMs.
-    return smVersion == 89 || smVersion == 100 || smVersion == 101 || smVersion == 110 || smVersion == 120
-        || smVersion == 121;
+    return smVersion == 89 || smVersion == 90 || smVersion == 100 || smVersion == 101 || smVersion == 110
+        || smVersion == 120 || smVersion == 121;
 }
 
 // Define the mapping of input and output indices of the AttentionPlugin.
@@ -559,7 +559,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
 
     mSMVersion = getSMVersion();
     ELLM_CHECK(!mEnableFp8KVCache || isFp8KVCacheSupportedSM(mSMVersion),
-        "FP8 KV cache is supported only on SM89, SM100, SM101, SM110, SM120, and SM121; got SM"
+        "FP8 KV cache is supported only on SM89, SM90, SM100, SM101, SM110, SM120, and SM121; got SM"
             + std::to_string(mSMVersion) + ".");
     applyThorSMRenumberWAR(mSMVersion);
 
@@ -688,7 +688,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
 
     mSMVersion = getSMVersion();
     ELLM_CHECK(!mEnableFp8KVCache || isFp8KVCacheSupportedSM(mSMVersion),
-        "FP8 KV cache is supported only on SM89, SM100, SM101, SM110, SM120, and SM121; got SM"
+        "FP8 KV cache is supported only on SM89, SM90, SM100, SM101, SM110, SM120, and SM121; got SM"
             + std::to_string(mSMVersion) + ".");
     applyThorSMRenumberWAR(mSMVersion);
 
