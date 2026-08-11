@@ -1178,8 +1178,8 @@ class LLM:
         return cfg
 
     def _video_model_family(self) -> str:
-        """Frame-sampling family ("qwen" / "internvl") from the visual engine's
-        model_type. Types without a video path (phi4mm, gemma, ...) are
+        """Frame-sampling family ("qwen" / "internvl" / "nemotron") from the
+        visual engine's model_type. Types without a video path (phi4mm, ...) are
         rejected: their runners read only the first frame."""
         cached = getattr(self, "_video_family_cache", None)
         if cached is not None:
@@ -1197,6 +1197,8 @@ class LLM:
                       or os.path.isfile(os.path.join(root, "visual.engine")))
         if "internvl" in model_type and has_visual:
             family = "internvl"
+        elif "nemotron" in model_type and not is_audio_type and has_visual:
+            family = "nemotron"
         elif (model_type.startswith(qwen_video_types) and not is_audio_type
               and has_visual):
             family = "qwen"
@@ -1206,8 +1208,8 @@ class LLM:
             raise ValueError(
                 f"video input is not supported for model_type={model_type!r}"
                 " on this multimodal engine; supported families: Qwen-VL "
-                "(qwen2_vl/qwen2_5_vl/qwen3_vl/qwen3_5/qwen3_omni) and "
-                "InternVL")
+                "(qwen2_vl/qwen2_5_vl/qwen3_vl/qwen3_5/qwen3_omni), InternVL, "
+                "and Nemotron-Omni")
         self._video_family_cache = family
         return family
 
@@ -1252,6 +1254,15 @@ class LLM:
                 int(pre.get("merge_size", 0)),
                 "temporal_patch_size":
                 int(pre.get("temporal_patch_size", 2)),
+                # Nemotron-Omni video geometry (top-level visual config.json).
+                "video_pruning_rate":
+                float(cfg.get("video_pruning_rate", 0.0)),
+                "video_temporal_patch_size":
+                int(cfg.get("video_temporal_patch_size", 2)),
+                "video_target_num_patches":
+                int(cfg.get("video_target_num_patches", 1024)),
+                "downsample_ratio":
+                float(cfg.get("downsample_ratio", 0.5)),
             }
         self._video_limits_cache = limits
         return limits
@@ -1975,9 +1986,25 @@ def _load_image_buffers(rt_module,
     has_video = any(
         item.get("type") in ("video", "video_url") for item in items)
     family = video_family_fn() if has_video else "qwen"
+    if has_video and family == "nemotron":
+        # The C++ Nemotron video path handles exactly one video and no mixed-in
+        # images per request (batch of one); reject other layouts here rather
+        # than letting them fail inside the runner.
+        n_videos = sum(1 for it in items
+                       if it.get("type") in ("video", "video_url"))
+        n_images = sum(1 for it in items
+                       if it.get("type") in ("image", "image_url"))
+        if n_videos > 1 or n_images > 0:
+            raise ValueError(
+                "Nemotron-Omni video requests support exactly one video and no "
+                f"images (got {n_videos} videos, {n_images} images)")
     limits = video_frame_limits_fn() if has_video else {}
     budget = limits.get("max_image_tokens") if limits else None
     video_tokens = 0
+    # Pre-pruning token count for the engine-minimum check: the ViT processes
+    # every tubelet, so Nemotron's EVS-pruned estimate would understate what the
+    # min-profile actually receives. Non-EVS families track the same value.
+    video_raw_tokens = 0
     # Request-wide decoded-pixel budget: several videos each under the
     # per-video ceiling must not jointly exhaust host memory.
     pixel_budget = None
@@ -2033,6 +2060,15 @@ def _load_image_buffers(rt_module,
                 cu_budget=cu_budget)
             images.append(buffer)
             video_tokens += est_tokens
+            raw_tokens = est_tokens
+            if family == "nemotron":
+                from .video_sampling import _nemotron_tubelet_geometry
+                geom = _nemotron_tubelet_geometry(limits)
+                if geom:
+                    t_frames, tokens_per_tubelet, _q = geom
+                    raw_tokens = (-(-buffer.frames // t_frames)) \
+                        * tokens_per_tubelet
+            video_raw_tokens += raw_tokens
             pixel_budget -= used_px
             if cu_budget is not None:
                 cu_budget -= used_groups
@@ -2050,12 +2086,12 @@ def _load_image_buffers(rt_module,
             "request media need more visual tokens than the engine's "
             f"budget of {limits['max_image_tokens']}; reduce the media in "
             "the request")
-    if (video_tokens or image_upper) and limits and \
+    if (video_raw_tokens or image_upper) and limits and \
             limits.get("min_image_tokens"):
-        # The engine minimum is request-wide; reject only when the upper estimate
-        # falls short -- only do_resize=false media can genuinely undershoot
-        # (resized media are floored per item).
-        upper_tokens = video_tokens + image_upper
+        # The engine minimum is request-wide; the upper estimate is pre-EVS
+        # (raw tubelets for Nemotron). It can fall short for a too-short clip or
+        # do_resize=false media; resized per-item images are floored above this.
+        upper_tokens = video_raw_tokens + image_upper
         if upper_tokens < limits["min_image_tokens"]:
             raise ValueError(
                 f"request media yield ~{upper_tokens} visual tokens but the "

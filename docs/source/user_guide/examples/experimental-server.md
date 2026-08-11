@@ -338,6 +338,18 @@ Sampling is controlled per request with `fps`, `nframes`, `min_frames` and
 `max_frames`. Local paths follow the same `--allowed-local-media-path` rule as
 audio; `http(s)://` is rejected.
 
+Nemotron-Omni video has extra constraints: a request may carry at most one
+video and no images alongside it, and it always runs as a batch of one (video
+requests are never micro-batched). `do_resize: false` is rejected because the
+runner always resizes frames to the target patch grid. Frames are resized with
+UINT8 bicubic interpolation, a close but not bit-exact match to the HF FP32
+antialiased resize.
+
+> **Build requirement:** the Nemotron-Omni patch embedder runs a CuTe DSL FP16
+> GEMM in the runtime for both image and video, so serving any Nemotron-Omni
+> visual input needs the same CuTe DSL GEMM build as the Talker MLP above — a
+> default build compiles but the visual runner fails to load without it.
+
 ## Sampling Parameters
 
 | Parameter | Default | Description |

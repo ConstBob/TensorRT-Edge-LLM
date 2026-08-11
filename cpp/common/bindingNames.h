@@ -430,6 +430,14 @@ inline constexpr char const* kTreeDepths = "tree_depths";
 inline constexpr char const* kVisualInput = "input";
 
 /*!
+ * @brief Pixel-shuffle gather indices for the Nemotron-Omni visual engine
+ *
+ * Shape: [num_out_tokens, scale^2] (INT64). Grid-dependent, computed by the
+ * runtime so one engine serves square image tiles and non-square video grids.
+ */
+inline constexpr char const* kVisualShuffleIndices = "shuffle_indices";
+
+/*!
  * @brief Visual output tensor from vision transformers
  *
  * Shape: [num_image_tokens, hidden_size] (FLOAT16)

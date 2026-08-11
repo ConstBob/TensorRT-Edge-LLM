@@ -143,3 +143,62 @@ def test_admission_queue():
     # Depth is floored at 1.
     assert _AdmissionQueue(0).max_depth == 1
     assert _AdmissionQueue(-5).max_depth == 1
+
+
+class _FakeBuffer:
+
+    def __init__(self, is_video, frames=1):
+        self.is_video = is_video
+        self.frames = frames
+
+
+class _FakeMediaRequest(_FakeRequest):
+    """Request whose single row carries image buffers."""
+
+    def __init__(self, buffers=None):
+        super().__init__()
+        self.requests = [type("Row", (), {"image_buffers": buffers or []})()]
+
+
+@pytest.mark.parametrize("frames", [1, 8])
+def test_video_request_is_unbatchable(frames):
+    from experimental.server.batching import _is_batchable
+
+    # With the Nemotron singleton capability on, a single-frame clip is still a
+    # video, so both frame counts run alone.
+    assert _is_batchable(_FakeMediaRequest([_FakeBuffer(True, frames)]),
+                         True) is False
+    # A multi-tile image (frames > 1 but not a video) stays batchable.
+    assert _is_batchable(_FakeMediaRequest([_FakeBuffer(False, frames)]),
+                         True) is True
+    # Without the capability (non-Nemotron), video requests batch like any other.
+    assert _is_batchable(_FakeMediaRequest([_FakeBuffer(True, frames)]),
+                         False) is True
+
+
+def test_batcher_runs_video_requests_alone():
+    sizes = []
+
+    def handler(request):
+        sizes.append(len(request.requests))
+        return _FakeResponse(len(request.requests))
+
+    batcher = RequestBatcher(handler,
+                             max_batch_size=4,
+                             timeout_ms=100.0,
+                             video_requires_singleton=True)
+    try:
+        threads = [
+            threading.Thread(target=batcher.submit,
+                             args=(_FakeMediaRequest([_FakeBuffer(True,
+                                                                  1)]), ))
+            for _ in range(2)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(5.0)
+    finally:
+        batcher.close()
+    # Two compatible video requests never merge: each runs in its own call.
+    assert sizes == [1, 1]
