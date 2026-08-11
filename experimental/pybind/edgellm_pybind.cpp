@@ -579,6 +579,8 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readonly("height", &imageUtils::ImageData::height)
         .def_readonly("channels", &imageUtils::ImageData::channels)
         .def_readonly("frames", &imageUtils::ImageData::frames)
+        .def_readonly("is_video", &imageUtils::ImageData::isVideo)
+        .def_readonly("timestamps", &imageUtils::ImageData::timestamps)
         .def_readwrite("fps", &imageUtils::ImageData::fps)
         .def_readwrite("do_resize", &imageUtils::ImageData::doResize);
 
@@ -586,11 +588,20 @@ PYBIND11_MODULE(_edgellm_runtime, m)
     m.def("load_image_from_bytes", &loadImageFromBytes, py::arg("data"), "Load image from bytes");
     m.def(
         "load_video_from_paths",
-        [](std::vector<std::string> const& framePaths, double fps) {
+        [](std::vector<std::string> const& framePaths, double fps, std::vector<double> const& timestamps) {
             check::check(std::isfinite(fps) && fps > 0.0, "fps must be a positive finite number");
-            return imageUtils::loadVideoFromFrames(framePaths, fps);
+            check::check(timestamps.empty() || timestamps.size() == framePaths.size(),
+                "timestamps must be empty or have one entry per frame");
+            for (double const ts : timestamps)
+            {
+                check::check(std::isfinite(ts), "timestamps must be finite");
+            }
+            imageUtils::ImageData video = imageUtils::loadVideoFromFrames(framePaths, fps);
+            video.timestamps = timestamps;
+            return video;
         },
-        py::arg("frame_paths"), py::arg("fps") = 1.0, py::call_guard<py::gil_scoped_release>(),
+        py::arg("frame_paths"), py::arg("fps") = 1.0, py::arg("timestamps") = std::vector<double>{},
+        py::call_guard<py::gil_scoped_release>(),
         "Load a video by stacking identically-sized image files into one (T, H, W, 3) ImageData");
     // No gil_scoped_release for load_video_from_array: its body reads the
     // py::array buffer, which requires the GIL.

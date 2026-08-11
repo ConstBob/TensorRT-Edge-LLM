@@ -149,6 +149,8 @@ tests:
   - tests/python-unittests/test_batching.py::test_overflow_and_pending
   - tests/python-unittests/test_batching.py::test_worker_survives_bad_request
   - tests/python-unittests/test_batching.py::test_admission_queue
+  - tests/python-unittests/test_batching.py::test_video_request_is_unbatchable
+  - tests/python-unittests/test_batching.py::test_batcher_runs_video_requests_alone
   - tests/python-unittests/test_tool_calling.py::test_validates_tool_request
   - tests/python-unittests/test_tool_calling.py::test_parses_tool_calls
   - tests/python-unittests/test_tool_calling.py::test_builds_tool_response_shapes
@@ -200,11 +202,13 @@ tests:
   - tests/python-unittests/test_preprocess_video.py::test_clamp_qwen3d_estimate_matches_cpp_fallback
   - tests/python-unittests/test_preprocess_video.py::test_sample_video_single_frame_est_uses_actual_count
   - tests/python-unittests/test_preprocess_video.py::test_load_video_buffer_sets_do_resize
+  - tests/python-unittests/test_preprocess_video.py::test_load_video_buffer_nemotron_rejects_do_resize_false
   - tests/python-unittests/test_preprocess_video.py::test_estimate_qwen_rejects_extreme_aspect_ratio
   - tests/python-unittests/test_preprocess_video.py::test_internvl_ratio_not_limited
   - tests/python-unittests/test_preprocess_video.py::test_estimate_image_tokens_raw_input
   - tests/python-unittests/test_preprocess_video.py::test_raw_clip_not_resize_clamped
   - tests/python-unittests/test_preprocess_video.py::test_raw_frames_path_matrix
+  - tests/python-unittests/test_preprocess_video.py::test_frames_path_fills_timestamps
   - tests/python-unittests/test_preprocess_video.py::test_frames_path_rejects_mismatched_sizes
   - tests/python-unittests/test_preprocess_video.py::test_frames_path_qwen3d_respects_per_media_frame_cap
   - tests/python-unittests/test_preprocess_video.py::test_frames_path_pixel_ceiling
@@ -226,6 +230,12 @@ tests:
   - tests/python-unittests/test_preprocess_video.py::test_content_item_source_validation
   - tests/python-unittests/test_preprocess_video.py::test_estimate_image_tokens_internvl_golden
   - tests/python-unittests/test_preprocess_video.py::test_sample_indices_internvl_matches_hf
+  - tests/python-unittests/test_preprocess_video.py::test_sample_indices_nemotron_matches_hf
+  - tests/python-unittests/test_preprocess_video.py::test_sample_indices_nemotron_dedup_cap_and_explicit
+  - tests/python-unittests/test_preprocess_video.py::test_clamp_nemotron_video_budget
+  - tests/python-unittests/test_preprocess_video.py::test_clamp_nemotron_missing_video_keys
+  - tests/python-unittests/test_preprocess_video.py::test_nemotron_ratio_not_limited
+  - tests/python-unittests/test_preprocess_video.py::test_sample_video_nemotron_timestamps
   - tests/python-unittests/test_preprocess_video.py::test_actual_decoded_size_reestimates_tokens
   - tests/python-unittests/test_preprocess_video.py::test_actual_decoded_size_rechecks_raw_alignment
   - tests/python-unittests/test_preprocess_video.py::test_mid_stream_resolution_change_rejected
@@ -238,6 +248,7 @@ tests:
   - tests/python-unittests/test_preprocess_video.py::test_qwen3_still_image_uses_3d_exact_shape
   - tests/python-unittests/test_preprocess_video.py::test_cu_capacity_from_builder_recording
   - tests/python-unittests/test_preprocess_video.py::test_raw_per_group_token_cap
+  - tests/python-unittests/test_preprocess_video.py::test_resolve_video_cfg_precedence
 
   # Server request-parsing chains + audio endpoints (real HTTP endpoint ->
   # real engine conversion/resolution; stubs only at the C++-binding and
@@ -252,7 +263,10 @@ tests:
   - tests/python-unittests/test_server_requests.py::test_audio_transcriptions_rejects_empty
   - tests/python-unittests/test_server_requests.py::test_audio_transcriptions_protocol
   - tests/python-unittests/test_server_requests.py::test_video_model_family_resolution
+  - tests/python-unittests/test_server_requests.py::test_video_model_family_nemotron
   - tests/python-unittests/test_server_requests.py::test_load_image_buffers_request_wide_internvl_minimum
+  - tests/python-unittests/test_server_requests.py::test_load_image_buffers_nemotron_minimum
+  - tests/python-unittests/test_server_requests.py::test_load_image_buffers_nemotron_minimum_uses_raw_tubelets
   - tests/python-unittests/test_server_requests.py::test_load_image_buffers_request_wide_qwen_minimum
   - tests/python-unittests/test_server_requests.py::test_audio_transcriptions_limits
   - tests/python-unittests/test_server_requests.py::test_content_length_parsing
@@ -264,6 +278,7 @@ tests:
   - tests/python-unittests/test_server_requests.py::test_stream_close_cancels_channel
   - tests/python-unittests/test_server_requests.py::test_video_frame_limits_carry_recorded_cu_capacity
   - tests/python-unittests/test_server_requests.py::test_load_image_buffers_budget_order_independent
+  - tests/python-unittests/test_server_requests.py::test_load_image_buffers_nemotron_rejects_multiple_and_mixed
   - tests/python-unittests/test_server_requests.py::test_cli_parser_builds
   - tests/python-unittests/test_server_requests.py::test_video_frame_limits_from_engine_config
   - tests/python-unittests/test_server_requests.py::test_chat_streaming_invalid_video_returns_400

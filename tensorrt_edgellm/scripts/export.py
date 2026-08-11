@@ -1842,12 +1842,25 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
         vis_cfg_out["vision_config"][
             "model_type"] = "nemotron_omni_vision_encoder"
         # NemotronOmniViTRunner reads these top-level fields; visualBuilder
-        # additionally reads patch_size and downsample_ratio.
+        # additionally reads patch_size, downsample_ratio and vit_hidden_size.
         for key in ("llm_config", "img_context_token_id", "img_start_token_id",
                     "img_end_token_id", "force_image_size", "norm_mean",
-                    "norm_std", "patch_size", "downsample_ratio"):
+                    "norm_std", "patch_size", "downsample_ratio",
+                    "vit_hidden_size", "video_pruning_rate"):
             if key in config:
                 vis_cfg_out[key] = config[key]
+        # Video sizing lives under vision_config in the official checkpoint (and
+        # in vLLM); resolve_video_cfg falls back to top level for older
+        # artifacts, then the HF defaults (temporal_patch_size omitted -> 2).
+        # Shared with the runtime model build so both agree on T.
+        from ..models.nemotron_omni.modeling_nemotron_omni_visual import \
+            resolve_video_cfg
+        vis_cfg_out["video_temporal_patch_size"] = (resolve_video_cfg(
+            config, "video_temporal_patch_size", None) or 2)
+        vis_cfg_out["video_target_num_patches"] = resolve_video_cfg(
+            config, "video_target_num_patches", 1024)
+        vis_cfg_out["video_maintain_aspect_ratio"] = resolve_video_cfg(
+            config, "video_maintain_aspect_ratio", True)
     if os.environ.get("USE_TRT_NATIVE_ATTN") == "1":
         vis_cfg_out["use_trt_native_vit_attn"] = True
     cfg_out_path = os.path.join(visual_out_dir, "config.json")

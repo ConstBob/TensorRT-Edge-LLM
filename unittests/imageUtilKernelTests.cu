@@ -1405,3 +1405,181 @@ TEST(CopyImageToDeviceAndResize, MultiFrameAccuracy)
     std::cout << "CopyImageToDeviceAndResize MultiFrameAccuracy: " << numFrames << " frames resized + identity OK."
               << std::endl;
 }
+
+// ---------------------------------------------------------------------------
+// Nemotron-Omni patch-embedder input kernels (no TRT engine needed)
+// ---------------------------------------------------------------------------
+namespace
+{
+void checkNemotronTranspose(int64_t T)
+{
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+    int64_t const C = 2, H = 4, W = 6, P = 2;
+    int64_t const numFrames = 2 * T; // two temporal groups
+    int64_t const gridH = H / P, gridW = W / P, numPatches = gridH * gridW;
+    int64_t const numGroups = numFrames / T, rowWidth = T * C * P * P, rows = numGroups * numPatches;
+
+    std::vector<half> src(static_cast<size_t>(numFrames * C * H * W));
+    for (size_t i = 0; i < src.size(); ++i)
+    {
+        src[i] = __float2half(static_cast<float>(i));
+    }
+    rt::Tensor blockPixels({numFrames, C, H, W}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor inputPatches({rows, rowWidth}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    CUDA_CHECK(cudaMemcpyAsync(
+        blockPixels.rawPointer(), src.data(), src.size() * sizeof(half), cudaMemcpyHostToDevice, stream));
+    kernel::transposeToPatchNemotronViT(blockPixels, inputPatches, T, P, stream);
+    std::vector<half> out(static_cast<size_t>(rows * rowWidth));
+    CUDA_CHECK(cudaMemcpyAsync(
+        out.data(), inputPatches.rawPointer(), out.size() * sizeof(half), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    // (t, c, py, px) C-major patch layout; row = group*numPatches + (pi*gridW + pj).
+    for (int64_t group = 0; group < numGroups; ++group)
+    {
+        for (int64_t pi = 0; pi < gridH; ++pi)
+        {
+            for (int64_t pj = 0; pj < gridW; ++pj)
+            {
+                for (int64_t t = 0; t < T; ++t)
+                {
+                    for (int64_t c = 0; c < C; ++c)
+                    {
+                        for (int64_t py = 0; py < P; ++py)
+                        {
+                            for (int64_t px = 0; px < P; ++px)
+                            {
+                                int64_t const row = group * numPatches + (pi * gridW + pj);
+                                int64_t const col = ((t * C + c) * P + py) * P + px;
+                                int64_t const srcIdx = (((group * T + t) * C + c) * H + pi * P + py) * W + pj * P + px;
+                                ASSERT_EQ(__half2float(out[row * rowWidth + col]), __half2float(src[srcIdx]))
+                                    << "T=" << T << " mismatch at row " << row << " col " << col;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}
+} // namespace
+
+TEST(TransposeToPatchNemotron, ImageTileT1)
+{
+    checkNemotronTranspose(1);
+}
+
+TEST(TransposeToPatchNemotron, VideoTubeletT2)
+{
+    checkNemotronTranspose(2);
+}
+
+TEST(TransposeToPatchNemotron, RejectsNonPositiveDivisors)
+{
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+    rt::Tensor blockPixels({2, 2, 4, 6}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor inputPatches({6, 8}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    EXPECT_ANY_THROW(kernel::transposeToPatchNemotronViT(blockPixels, inputPatches, 0, 2, stream));
+    EXPECT_ANY_THROW(kernel::transposeToPatchNemotronViT(blockPixels, inputPatches, 2, 0, stream));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}
+
+TEST(AddPosEmbedNemotron, BroadcastOverBlocks)
+{
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+    int64_t const numBlocks = 3, numPatches = 4, hidden = 5;
+    std::vector<half> embeds(static_cast<size_t>(numBlocks * numPatches * hidden));
+    std::vector<half> pos(static_cast<size_t>(numPatches * hidden));
+    for (size_t i = 0; i < embeds.size(); ++i)
+    {
+        embeds[i] = __float2half(static_cast<float>(i) * 0.5F);
+    }
+    for (size_t i = 0; i < pos.size(); ++i)
+    {
+        pos[i] = __float2half(static_cast<float>(i) + 1.0F);
+    }
+    rt::Tensor patchEmbeds({numBlocks, numPatches, hidden}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor posEmbed({numPatches, hidden}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    CUDA_CHECK(cudaMemcpyAsync(
+        patchEmbeds.rawPointer(), embeds.data(), embeds.size() * sizeof(half), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(posEmbed.rawPointer(), pos.data(), pos.size() * sizeof(half), cudaMemcpyHostToDevice, stream));
+    kernel::addPosEmbedNemotronViT(patchEmbeds, posEmbed, stream);
+    std::vector<half> out(embeds.size());
+    CUDA_CHECK(cudaMemcpyAsync(
+        out.data(), patchEmbeds.rawPointer(), out.size() * sizeof(half), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    for (int64_t b = 0; b < numBlocks; ++b)
+    {
+        for (int64_t p = 0; p < numPatches; ++p)
+        {
+            for (int64_t h = 0; h < hidden; ++h)
+            {
+                int64_t const idx = (b * numPatches + p) * hidden + h;
+                float const expected = __half2float(embeds[idx]) + __half2float(pos[p * hidden + h]);
+                ASSERT_NEAR(__half2float(out[idx]), expected, 1e-2F) << "pos-embed add mismatch at " << idx;
+            }
+        }
+    }
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}
+
+TEST(EvsScoresNemotron, SentinelAndCosineDissimilarity)
+{
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+    int64_t const numGroups = 3, tokensPerGroup = 2, hidden = 4;
+    int64_t const numTokens = numGroups * tokensPerGroup;
+    std::vector<half> embeds(static_cast<size_t>(numTokens * hidden));
+    for (size_t i = 0; i < embeds.size(); ++i)
+    {
+        embeds[i] = __float2half(static_cast<float>((i * 7) % 5) + 0.25F);
+    }
+    rt::Tensor embedsDev({numTokens, hidden}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor scoresDev({numTokens}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    CUDA_CHECK(cudaMemcpyAsync(
+        embedsDev.rawPointer(), embeds.data(), embeds.size() * sizeof(half), cudaMemcpyHostToDevice, stream));
+    kernel::evsScoresNemotronViT(embedsDev, scoresDev, tokensPerGroup, stream);
+    std::vector<float> scores(static_cast<size_t>(numTokens));
+    CUDA_CHECK(cudaMemcpyAsync(
+        scores.data(), scoresDev.rawPointer(), scores.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    for (int64_t g = 0; g < numGroups; ++g)
+    {
+        for (int64_t s = 0; s < tokensPerGroup; ++s)
+        {
+            int64_t const token = g * tokensPerGroup + s;
+            if (g == 0)
+            {
+                // First tubelet is always kept via the 255 sentinel.
+                ASSERT_FLOAT_EQ(scores[token], 255.0F) << "group-0 sentinel missing at " << token;
+                continue;
+            }
+            double dot = 0.0, nc = 0.0, np = 0.0;
+            for (int64_t h = 0; h < hidden; ++h)
+            {
+                double const a = __half2float(embeds[token * hidden + h]);
+                double const b = __half2float(embeds[(token - tokensPerGroup) * hidden + h]);
+                dot += a * b;
+                nc += a * a;
+                np += b * b;
+            }
+            float const expected = static_cast<float>(1.0 - dot / (std::sqrt(nc) * std::sqrt(np)));
+            ASSERT_NEAR(scores[token], expected, 1e-3F) << "EVS score mismatch at token " << token;
+        }
+    }
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}
+
+TEST(EvsScoresNemotron, RejectsNonPositiveTokensPerGroup)
+{
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+    rt::Tensor embedsDev({4, 4}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor scoresDev({4}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    EXPECT_ANY_THROW(kernel::evsScoresNemotronViT(embedsDev, scoresDev, 0, stream));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}

@@ -628,6 +628,13 @@ def _create_app(llm_instance,
                 getattr(llm_instance, "max_batch_size", 0) or 0)
             batch_size = resolve_batch_size(engine_batch_size,
                                             max_queue_batch_size)
+            # Only the Nemotron video runner requires batch-1; other families'
+            # video requests stay batchable.
+            try:
+                video_singleton = (
+                    llm_instance._video_model_family() == "nemotron")
+            except Exception:
+                video_singleton = False
             batcher = RequestBatcher(
                 runtime_handler=runtime_handler,
                 max_batch_size=batch_size,
@@ -636,6 +643,7 @@ def _create_app(llm_instance,
                 # batch is separate. Admission caps queued+running upstream, so
                 # this is mainly defense-in-depth for direct-driver use.
                 max_pending=admission.max_depth,
+                video_requires_singleton=video_singleton,
             )
             logger.info(
                 "HTTP request batching enabled: max_batch_size=%d timeout_ms=%.3f "
