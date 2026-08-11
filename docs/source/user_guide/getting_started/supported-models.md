@@ -393,7 +393,7 @@ Qwen3.5 and Qwen3.6 checkpoints are unified text+VLM models. The same checkpoint
 | Gemma4 E2B/E4B (text + image + audio) | [`Gemma4ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma4/modeling_gemma4.py) | `gemma4` / `gemma4_text` -> text decoder (PLE, dual-RoPE) with paired-assistant MTP, plus `Gemma4VisualModel` (image) and `Gemma4AudioModel` (audio) | BF16/FP16 source checkpoints; paired-assistant MTP via a matched Gemma4 assistant checkpoint (released for both sizes); text + image + audio input |
 | Gemma4 31B (text + image) | [`Gemma4ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma4/modeling_gemma4.py) | `gemma4` / `gemma4_text` -> text decoder (PLE, dual-RoPE) with paired-assistant MTP, plus `Gemma4VisualModel` for image input | BF16/FP16 source plus NVFP4; paired-assistant MTP via a matched Gemma4 assistant checkpoint; text + image input |
 | Gemma4 26B-A4B MoE (text + image) | [`Gemma4ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma4/modeling_gemma4.py) | `gemma4` / `gemma4_text` -> text decoder (PLE, dual-RoPE) with GeGLU sparse-MoE FFN and paired-assistant MTP, plus `Gemma4VisualModel` for image input | NVFP4; paired-assistant MTP via a matched Gemma4 assistant checkpoint; text + image input |
-| Gemma4 Unified 12B | Checkpoint architecture `Gemma4UnifiedForConditionalGeneration`; text backbone compatible with [`Gemma4ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma4/modeling_gemma4.py) | `gemma4_unified` -> Gemma4 text decoder (dual-RoPE, per-layer heterogeneous KV, decoder-side vision-block bidirectional attention) + `Gemma4UnifiedVisualModel` + `Gemma4UnifiedAudioModel` (encoder-free patch/PCM embedders) | FP16 LLM backbone; FP32 multimodal embedders; image and audio input |
+| Gemma4 Unified 12B | Checkpoint architecture `Gemma4UnifiedForConditionalGeneration`; text backbone compatible with [`Gemma4ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma4/modeling_gemma4.py) | `gemma4_unified` -> Gemma4 text decoder (dual-RoPE, per-layer heterogeneous KV, decoder-side vision-block bidirectional attention) with paired-assistant MTP + `Gemma4UnifiedVisualModel` + `Gemma4UnifiedAudioModel` (encoder-free patch/PCM embedders) | FP16 LLM backbone; FP32 multimodal embedders; paired-assistant MTP; image and audio input |
 
 <details>
 <summary><b>Nemotron-Omni</b> checkpoints</summary>
@@ -407,7 +407,7 @@ Qwen3.5 and Qwen3.6 checkpoints are unified text+VLM models. The same checkpoint
 <details>
 <summary><b>Gemma4 E2B/E4B/12B/31B</b> checkpoints</summary>
 
-**Modality:** E2B, E4B, and the Unified 12B accept **text + image + audio**; 31B accepts **text + image**. E2B/E4B/31B support paired-assistant MTP.
+**Modality:** E2B, E4B, and the Unified 12B accept **text + image + audio**; 31B accepts **text + image**. All listed sizes support paired-assistant MTP.
 
 **Original (BF16/FP16):**
 - [google/gemma-4-E2B-it](https://huggingface.co/google/gemma-4-E2B-it)
@@ -421,6 +421,7 @@ Qwen3.5 and Qwen3.6 checkpoints are unified text+VLM models. The same checkpoint
 **Paired MTP assistant checkpoints** (one per base; pair with the matching size — released for every size):
 - [google/gemma-4-E2B-it-assistant](https://huggingface.co/google/gemma-4-E2B-it-assistant)
 - [google/gemma-4-E4B-it-assistant](https://huggingface.co/google/gemma-4-E4B-it-assistant)
+- [google/gemma-4-12B-it-assistant](https://huggingface.co/google/gemma-4-12B-it-assistant)
 - [google/gemma-4-31B-it-assistant](https://huggingface.co/google/gemma-4-31B-it-assistant)
 
 </details>

@@ -99,6 +99,11 @@ _GEMMA4_MODEL_TYPES = frozenset([
     "gemma4_unified_text",
 ])
 
+_GEMMA4_ASSISTANT_MODEL_TYPES = frozenset([
+    "gemma4_assistant",
+    "gemma4_unified_assistant",
+])
+
 _VLM_MODEL_TYPES = frozenset([
     "qwen3_vl",
     "qwen3_omni",
@@ -548,13 +553,13 @@ def _validate_gemma4_mtp_pair(target_dir: str,
     target_text = _get_llm_text_config(target_config)
     assistant_text = _get_llm_text_config(assistant_config)
 
-    if target_text.get("model_type") not in ("gemma4", "gemma4_text"):
+    if target_text.get("model_type") not in _GEMMA4_MODEL_TYPES:
         raise ValueError(
-            "Gemma4 MTP target must have model_type gemma4/gemma4_text in text_config."
+            "Gemma4 MTP target must have a Gemma4 model_type in text_config.")
+    if assistant_config.get("model_type") not in _GEMMA4_ASSISTANT_MODEL_TYPES:
+        raise ValueError(
+            "Gemma4 MTP assistant must have a Gemma4 assistant root model_type."
         )
-    if assistant_config.get("model_type") != "gemma4_assistant":
-        raise ValueError(
-            "Gemma4 MTP assistant must have root model_type gemma4_assistant.")
     if int(target_text.get("hidden_size", 0)) != int(
             assistant_config.get("backbone_hidden_size", 0)):
         raise ValueError(
