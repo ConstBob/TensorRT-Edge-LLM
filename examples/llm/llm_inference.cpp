@@ -21,7 +21,7 @@
 #include "common/trtUtils.h"
 #include "common/utf8.h"
 #include "memoryMonitor.h"
-#include "multimodal/code2WavRunner.h"
+#include "multimodal/qwen3_omni/code2WavRunner.h"
 #include "profileFormatter.h"
 #include "profiling/metrics.h"
 #include "profiling/nvtx_wrapper.h"

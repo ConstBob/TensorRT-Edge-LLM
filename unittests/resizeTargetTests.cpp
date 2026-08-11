@@ -19,7 +19,7 @@
 //! Regenerate the tables with unittests/resources/gen_resize_target_golden.py (see its docstring for
 //! which values are HF-reference goldens and which are regression pins).
 
-#include "multimodal/imageUtils.h"
+#include "multimodal/common/imageUtils.h"
 
 #include <gtest/gtest.h>
 

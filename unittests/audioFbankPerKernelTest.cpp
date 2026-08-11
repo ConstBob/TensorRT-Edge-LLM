@@ -42,7 +42,7 @@
 #ifdef CUTE_DSL_GEMM_ENABLED
 #include "kernels/talkerMLPKernels/cuteDslGemmRunner.h"
 #endif
-#include "multimodal/audioUtils.h"
+#include "multimodal/common/audioUtils.h"
 
 #include <cmath>
 #include <cstddef>

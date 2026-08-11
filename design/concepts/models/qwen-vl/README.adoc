@@ -54,8 +54,8 @@ Do not duplicate that table here.
 | link:../../../../tensorrt_edgellm/models/qwen3_vl/modeling_qwen3_vl_text.py[modeling_qwen3_vl_text.py] | Qwen3-VL text wrapper.
 | link:../../../../tensorrt_edgellm/models/qwen3_5/modeling_qwen3_5_visual.py[modeling_qwen3_5_visual.py] | Qwen3.5 visual encoder wrapper; same Qwen3-VL visual architecture with deepstack disabled.
 | link:../../../../tensorrt_edgellm/models/qwen3_5/modeling_qwen3_5_text.py[modeling_qwen3_5_text.py] | Qwen3.5 hybrid text decoder wrapper.
-| link:../../../../cpp/multimodal/qwenViTRunner.h[qwenViTRunner.h] | Qwen-family visual runtime runner.
-| link:../../../../cpp/multimodal/multimodalRunner.h[multimodalRunner.h] | Generic multimodal runtime dispatch.
+| link:../../../../cpp/multimodal/qwen2/qwenViTRunner.h[qwenViTRunner.h] | Qwen-family visual runtime runner.
+| link:../../../../cpp/multimodal/common/multimodalRunner.h[multimodalRunner.h] | Generic multimodal runtime dispatch.
 |===
 
 == Related Components
