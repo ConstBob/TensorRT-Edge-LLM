@@ -48,7 +48,8 @@ import math
 import os
 from typing import List, Optional, Tuple
 
-from .media_source import decode_base64_data_url, resolve_file_url
+from .media_source import (decode_base64_data_url, fetch_remote_media,
+                           resolve_file_url)
 
 # qwen_vl_utils defaults (kept in sync with the HF reference).
 FRAME_FACTOR = 2  # frames rounded to a multiple of temporal_patch_size
@@ -539,15 +540,12 @@ def clamp_nframes_to_profile(
 
 def resolve_video_source(url: str) -> Tuple[str, Optional[bytes]]:
     """Resolve an OpenAI video reference: ``(path, None)`` for ``file://`` /
-    bare paths, ``("", bytes)`` for ``data:`` URLs. ``http(s)://`` is
-    rejected (no remote fetch, same policy as audio/image)."""
+    bare paths, ``("", bytes)`` for HTTP(S) and ``data:`` URLs."""
     url = (url or "").strip()
     if not url:
         raise ValueError("video content has empty url")
     if url.startswith(("http://", "https://")):
-        raise ValueError(
-            "Remote video URLs (http/https) are not supported; "
-            "host locally (file://) or pass data:video/...;base64,")
+        return "", fetch_remote_media(url, "video", MAX_SOURCE_BYTES)
     if url.startswith("data:"):
         return "", decode_base64_data_url(url,
                                           "video",

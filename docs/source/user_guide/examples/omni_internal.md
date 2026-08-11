@@ -489,14 +489,14 @@ checkpoint-declared dtype (bf16): the fork sizes its GDN cache states
 from the config dtype, and an fp16-loaded model fails with mixed-dtype
 matmuls inside the Talker generate chain.
 
-That fork also predates Gemma4 and has no `Gemma4AudioConfig`. Because
-`import tensorrt_edgellm` eagerly loads `models/gemma4/__init__.py` →
-`modeling_gemma4_audio`, whose top-level `from transformers import
-Gemma4AudioConfig` raises ImportError, the package will not import on the
-fork as-is. We keep that import unconditional (no in-code fallback), so
-run export/quantize in an env whose transformers ships Gemma4 — either add
-Gemma4 to the fork, or use a venv that has both the Next patches and an
-upstream transformers.
+That fork also predates Gemma4 and has no `Gemma4AudioConfig`. The lightweight
+`import tensorrt_edgellm` package surface does not load exporter models, but
+accessing the export API or running the exporter loads
+`models/gemma4/__init__.py` → `modeling_gemma4_audio`, whose top-level `from
+transformers import Gemma4AudioConfig` raises ImportError. We keep that import
+unconditional (no in-code fallback), so run export/quantize in an env whose
+transformers ships Gemma4 — either add Gemma4 to the fork, or use a venv that
+has both the Next patches and an upstream transformers.
 
 ### MoE Talker: fp16 experts
 

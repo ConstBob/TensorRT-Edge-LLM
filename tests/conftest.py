@@ -520,6 +520,18 @@ def pytest_collection_modifyitems(config, items):
     for test_case in test_list_file.get('tests', []):
         if not isinstance(test_case, str):
             continue
+        if '::' not in test_case:
+            test_path = Path(test_case)
+            if not test_path.is_absolute():
+                test_path = repo_root / test_path
+            test_path = test_path.resolve()
+            for item in items:
+                if (Path(str(item.path)).resolve() == test_path
+                        and id(item) not in seen):
+                    ordered.append(item)
+                    seen.add(id(item))
+            continue
+
         test_name = test_case.split('::')[-1]
 
         for item in item_by_name.get(test_name, []):

@@ -15,7 +15,7 @@
 
 import json
 
-from experimental.server.tool_chat_template import (
+from experimental.server.parsing.tool_chat_template import (
     ToolChatTemplateFormatter, needs_tool_chat_template,
     normalize_messages_for_tools)
 
@@ -152,7 +152,7 @@ def test_flatten_content_blocks():
     """Pure-text block arrays collapse to a plain string (else the template
     renders an empty turn); media, raw-string lists, empty lists, and JSON
     tool-result lists pass through to role-specific handling instead."""
-    from experimental.server.tool_chat_template import \
+    from experimental.server.parsing.tool_chat_template import \
         normalize_messages_for_tools
 
     media = [{
@@ -214,5 +214,5 @@ def test_flatten_content_blocks():
     assert out[2]["content"] == "plain string untouched"
     assert out[3]["content"] == "result 42"
     assert out[4]["content"] == '{"temperature": 22}'.join(["[", "]"])  # json
-    assert out[5]["content"] == '["x", "y"]'  # raw-string list serialized
+    assert out[5]["content"] == "x\ny"  # pure-text list -> joined
     assert out[6]["content"] == "[]"  # empty list serialized

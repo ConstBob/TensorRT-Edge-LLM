@@ -69,6 +69,9 @@ import torch
 if TYPE_CHECKING:
     from ..config import ModelConfig
 
+# Importing the CLI module no longer eagerly loads the package export API.
+# Register model-family implementations before AutoModel dispatch below.
+from .. import _export_api as _registered_export_api  # noqa: F401
 from ..checkpoint.checkpoint_utils import normalize_rope_scaling_for_runtime
 from ..config import _is_diffusion_gemma_model_type
 from ..external_weights import (EXTERNAL_WEIGHT_CHOICES,

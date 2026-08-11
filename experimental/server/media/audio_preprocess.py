@@ -15,16 +15,15 @@
 """
 Server-side audio content resolution.
 
-The HTTP server accepts three OpenAI-compatible audio content forms in chat
+The HTTP server accepts two OpenAI-compatible audio content forms in chat
 messages:
 
   - ``{"type": "input_audio", "input_audio": {"data": "<base64>", "format": "wav"}}``
-  - ``{"type": "audio_url", "audio_url": {"url": "file:///abs/path | data:audio/...;base64,..."}}``
-  - ``{"type": "audio", "audio": "<local path>"}``  (legacy shorthand)
+  - ``{"type": "audio_url", "audio_url": {"url": "https://... | file:///abs/path | data:audio/...;base64,..."}}``
 
-``http(s)://`` audio URLs are rejected by design; there is no remote-fetch on
-the server. Local paths and ``file://`` are only accepted over HTTP when the
-server runs with ``--allowed-local-media-path``, and then only inside it.
+HTTP(S) downloads and decoded payloads are bounded to the upload limit. Local
+paths and ``file://`` are only accepted over HTTP when the server runs with
+``--allowed-local-media-path``, and then only inside it.
 
 This module resolves each accepted form to raw audio bytes and hands them
 to the C++ runtime via ``_edgellm_runtime.load_audio_buffer_from_bytes``.
@@ -39,13 +38,13 @@ import logging
 from typing import Any, Dict, List
 
 from .media_source import (decode_base64_data_url, decode_base64_payload,
-                           resolve_file_url)
+                           fetch_remote_media, resolve_file_url)
 
 logger = logging.getLogger("edgellm.audio")
 
 # Audio bytes are buffered in memory (and copied again as base64), and
 # compressed audio expands further when decoded (the C++ loader also caps the
-# decoded duration); 25 MiB matches the OpenAI/vLLM limit, shared by the chat
+# decoded duration); 25 MiB matches the OpenAI upload limit, shared by the chat
 # and transcription paths.
 MAX_AUDIO_UPLOAD_BYTES = 25 * 1024 * 1024
 
@@ -66,10 +65,7 @@ def resolve_audio_message(item: Dict[str, Any]):
       * ``str`` — a local filesystem path (caller will open it)
       * ``bytes`` — already-decoded audio bytes (wav/mp3/flac container)
 
-    Raises ``ValueError`` for anything we don't accept:
-      * ``http(s)://`` URLs (no remote fetch)
-      * non-base64 ``data:`` URLs
-      * Missing required fields
+    Raises ``ValueError`` for malformed, oversized, or unsupported sources.
     """
     content_type = item.get("type")
 
@@ -90,31 +86,14 @@ def resolve_audio_message(item: Dict[str, Any]):
         if not url:
             raise ValueError("audio_url.url is required")
         if url.startswith("http://") or url.startswith("https://"):
-            # Hard rejection — see module docstring.
-            raise ValueError(
-                "Remote audio URLs (http/https) are not supported. "
-                "Host the file locally and use file:// or pass input_audio.data."
-            )
+            return fetch_remote_media(url, "audio", MAX_AUDIO_UPLOAD_BYTES)
         if url.startswith("data:"):
             return _decode_data_url(url)
         if url.startswith("file:"):
             return resolve_file_url(url)
-        # Bare path tolerated for ergonomics — same as shorthand `audio`.
+        # Bare paths remain valid audio_url values and are confined by the
+        # configured local-media root at load time.
         return url
-
-    if content_type == "audio":
-        # Legacy shorthand: just a local path string.
-        path = (item.get("audio") or "").strip()
-        if not path:
-            raise ValueError("audio field is required")
-        if path.startswith("http://") or path.startswith("https://"):
-            raise ValueError(
-                "Remote audio URLs (http/https) are not supported.")
-        if path.startswith("file:"):
-            return resolve_file_url(path)
-        if path.startswith("data:"):
-            return _decode_data_url(path)
-        return path
 
     raise ValueError(f"Unsupported audio content type: {content_type!r}")
 
@@ -138,7 +117,7 @@ def load_audio_buffers(
         for item in content:
             if not isinstance(item, dict):
                 continue
-            if item.get("type") not in ("input_audio", "audio_url", "audio"):
+            if item.get("type") not in ("input_audio", "audio_url"):
                 continue
             source = resolve_audio_message(item)
             # ``resolve_audio_message`` returns either a path (str) or already

@@ -135,6 +135,14 @@ public:
     bool handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream,
         bool outputThinkerEmbeddings = false);
 
+    /*! \brief Return the input size for an explicit text token-count request.
+     *
+     * Generation paths report the input IDs they already produced and do not
+     * call this method. Multimodal token counts require encoder preprocessing
+     * and are therefore unavailable through this tokenizer-only operation.
+     */
+    std::vector<int32_t> countPromptTokens(LLMGenerationRequest const& request) const;
+
     /*!
      * @brief Generate and save system prompt KV cache (public API matching standard runtime signature)
      * @param prompt The system prompt to generate the KVCache

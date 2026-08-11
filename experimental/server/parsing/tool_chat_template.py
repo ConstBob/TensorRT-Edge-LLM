@@ -78,9 +78,11 @@ def _flatten_content_blocks(content: Any) -> Any:
         return content
     parts: List[str] = []
     for item in content:
-        if (isinstance(item, dict)
-                and item.get("type") in ("text", "input_text")
-                and isinstance(item.get("text"), str)):
+        if isinstance(item, str):
+            parts.append(item)
+        elif (isinstance(item, dict)
+              and item.get("type") in ("text", "input_text")
+              and isinstance(item.get("text"), str)):
             parts.append(item["text"])
         else:
             return content
@@ -101,16 +103,23 @@ def normalize_messages_for_tools(
         if isinstance(msg.get("content"), list):
             msg["content"] = _flatten_content_blocks(msg["content"])
 
-        # HF templates only know {"type": "video"}: normalize the OpenAI
-        # "video_url" alias here or the template emits no placeholder and the
-        # loaded ViT buffer is silently dropped.
+        # Normalize OpenAI URL blocks to the HF processor content contract.
         if isinstance(msg.get("content"), list):
             for item in msg["content"]:
-                if isinstance(item, dict) and item.get("type") == "video_url":
-                    ref = item.pop("video_url", None)
-                    item["type"] = "video"
-                    item["video"] = (ref.get("url", "") if isinstance(
-                        ref, dict) else ref)
+                if not isinstance(item, dict):
+                    continue
+                content_type = item.get("type")
+                if content_type not in ("image_url", "video_url", "audio_url"):
+                    if content_type == "input_audio":
+                        payload = item.pop("input_audio", {})
+                        item["type"] = "audio"
+                        item["audio"] = payload.get("data", "")
+                    continue
+                ref = item.pop(content_type, None)
+                media_type = content_type.removesuffix("_url")
+                item["type"] = media_type
+                item[media_type] = (ref.get("url", "") if isinstance(
+                    ref, dict) else ref)
 
         if msg.get("function_call") and not msg.get("tool_calls"):
             function_call = msg.pop("function_call")
@@ -167,11 +176,10 @@ class ToolChatTemplateFormatter:
                                       PreTrainedTokenizerFast)
         except ImportError as exc:
             raise ToolChatTemplateError(
-                "transformers is required for tool-aware chat templates."
-            ) from exc
+                "transformers is required for tool-aware chat templates; "
+                "install tensorrt-edgellm[server-tools].") from exc
 
-        # PreTrainedTokenizerFast fallback ignores config.json (an EdgeLLM engine
-        # config in engine-dir mode) that AutoProcessor/AutoTokenizer reject.
+        # Some checkpoints expose a fast tokenizer without an AutoProcessor.
         loaders = (AutoProcessor, AutoTokenizer, PreTrainedTokenizerFast)
 
         errors = []
@@ -179,7 +187,7 @@ class ToolChatTemplateFormatter:
             for loader in loaders:
                 try:
                     owner = loader.from_pretrained(template_dir,
-                                                   trust_remote_code=True)
+                                                   trust_remote_code=False)
                 except Exception as exc:
                     errors.append(f"{loader.__name__}({template_dir}): {exc}")
                     continue
@@ -198,6 +206,7 @@ class ToolChatTemplateFormatter:
         *,
         tools: Optional[Sequence[Dict[str, Any]]] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        parallel_tool_calls: bool = True,
         add_generation_prompt: bool = True,
         enable_thinking: Optional[bool] = None,
     ) -> str:
@@ -214,19 +223,22 @@ class ToolChatTemplateFormatter:
             kwargs["enable_thinking"] = enable_thinking
         if tool_choice is not None:
             kwargs["tool_choice"] = tool_choice
+        kwargs["parallel_tool_calls"] = parallel_tool_calls
 
         try:
             prompt = owner.apply_chat_template(normalized_messages, **kwargs)
         except TypeError as exc:
-            if "enable_thinking" not in kwargs:
+            retry_kwargs = dict(kwargs)
+            retry_kwargs.pop("enable_thinking", None)
+            if parallel_tool_calls:
+                retry_kwargs.pop("parallel_tool_calls", None)
+            if retry_kwargs == kwargs:
                 raise ToolChatTemplateError(
                     f"Failed to apply tool-aware chat template: {exc}"
                 ) from exc
-            # Older tokenizers may reject Qwen-style enable_thinking.
-            kwargs.pop("enable_thinking", None)
             try:
                 prompt = owner.apply_chat_template(normalized_messages,
-                                                   **kwargs)
+                                                   **retry_kwargs)
             except Exception as retry_exc:
                 raise ToolChatTemplateError(
                     "Failed to apply tool-aware chat template: "
@@ -240,16 +252,3 @@ class ToolChatTemplateFormatter:
                 "Tool-aware chat template returned non-string prompt. "
                 "Use tokenize=False-compatible tokenizer/processor templates.")
         return prompt
-
-    def count_tokens(self, text: str) -> Optional[int]:
-        """Count tokens of a rendered prompt (no special-token wrapper — the
-        rendered text already carries them). None if encoding unavailable."""
-        owner = self._load_template_owner()
-        tokenizer = getattr(owner, "tokenizer", owner)
-        encode = getattr(tokenizer, "encode", None)
-        if not callable(encode):
-            return None
-        try:
-            return len(encode(text, add_special_tokens=False))
-        except TypeError:
-            return len(encode(text))

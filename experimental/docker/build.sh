@@ -120,39 +120,8 @@ else
     PIP_INSTALL=(python3 -m pip install --break-system-packages)
 fi
 
-"${PIP_INSTALL[@]}" --upgrade 'setuptools<82' wheel pybind11
-
-python3 - <<'PY'
-from pathlib import Path
-
-source_files = [
-    Path("requirements.txt"),
-    Path("requirements-server.txt"),
-]
-skip_prefixes = (
-    "torch",
-    "numpy",
-)
-seen = set()
-lines = []
-
-for source in source_files:
-    for raw in source.read_text().splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        normalized = line.split(";", 1)[0].strip().lower()
-        if normalized.startswith(skip_prefixes):
-            continue
-        if line not in seen:
-            lines.append(line)
-            seen.add(line)
-
-Path("/tmp/tensorrt_edge_llm_requirements.txt").write_text("\n".join(lines) + "\n")
-PY
-
-"${PIP_INSTALL[@]}" -r /tmp/tensorrt_edge_llm_requirements.txt
-"${PIP_INSTALL[@]}" --no-deps -e .
+"${PIP_INSTALL[@]}" --upgrade 'setuptools<82' wheel
+"${PIP_INSTALL[@]}" -e ".[server,server-tools,native-build]"
 
 pybind11_dir="$(python3 -m pybind11 --cmakedir)"
 cmake_args=(

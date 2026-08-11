@@ -111,7 +111,7 @@ flowchart TD
 | `tensorrt_edgellm/chat_template.py`
 | Chat-template extraction, template validation, and processed-template generation.
 
-| `experimental/server/tool_chat_template.py`
+| `experimental/server/parsing/tool_chat_template.py`
 | Tool-aware server request formatting for agentic workloads.
 
 | `tensorrt_edgellm/chat_templates/`

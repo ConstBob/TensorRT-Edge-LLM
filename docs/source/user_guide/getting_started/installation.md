@@ -91,34 +91,41 @@ python3 -m venv venv
 source venv/bin/activate
 ```
 
-Install the package and its dependencies. The base install registers the CLI
-entry points (`tensorrt-edgellm-export`, `tensorrt-edgellm-quantize`, etc.) and
-pulls the core checkpoint export dependencies. Optional tool dependencies stay
-out of the base environment so export-only and server images do not pull
-quantization, audio, and LoRA-merge packages unnecessarily.
+Install only the dependency set for the workflow you run. The base package
+registers the CLI entry points without installing a model framework. The
+checkpoint-direct builder, PyTorch/ONNX exporter, server, and source-build
+tooling are separate extras so a serving environment does not pull export
+dependencies.
 
 ```bash
-# Install the package (registers CLI entry points and core export dependencies)
+# Register CLI entry points only
 pip3 install -e .
 
-# Required for quantization, LoRA merge, vocabulary reduction, audio preprocessing,
-# and tokenizer helpers (re-installs with the tools extra)
+# Checkpoint-direct, ONNX-less builder
+pip3 install -e ".[builder]"
+
+# PyTorch/ONNX checkpoint exporter
+pip3 install -e ".[export]"
+
+# Export plus quantization, LoRA, vocabulary, and audio tools
 pip3 install -e ".[tools]"
 
-# Required only for the experimental high-level Python API and server
-pip3 install -r requirements-server.txt
+# Experimental Python API and HTTP server using an existing native build
+pip3 install -e ".[server]"
+
+# Add Hugging Face tool-aware chat formatting for Claude Code and other agents
+pip3 install -e ".[server,server-tools]"
+
+# Feature-complete server while compiling Python bindings from this checkout
+pip3 install -e ".[server,server-tools,native-build]"
 ```
 
-The base install includes:
-- PyTorch
-- Transformers
-- ONNX
-- ONNX Script and ONNX GraphSurgeon
-
-The optional `tools` extra adds NVIDIA Model Optimizer, calibration datasets,
-audio preprocessing dependencies, LoRA merge dependencies, and tokenizer helpers.
-The server requirements file adds FastAPI, Uvicorn, and pybind11 for the
-experimental high-level Python API and OpenAI-compatible server.
+The `server` extra includes the HTTP stack, media decoding, and checkpoint
+download. `server-tools` adds Transformers only for model-native tool chat
+templates. Neither installs PyTorch or the ONNX toolchain. `pybind11` is
+confined to `native-build` because it is not a server runtime dependency. The
+`tools` extra remains a superset of `export` so existing quantization and
+export environments retain the full toolchain.
 
 > **Note:** Accuracy evaluation dependencies live under `examples/accuracy/requirements.txt`.
 

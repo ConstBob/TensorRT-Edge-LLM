@@ -68,6 +68,29 @@ constexpr int32_t kDecodeProfile{1};
 
 namespace rt
 {
+
+std::vector<int32_t> LLMInferenceRuntime::countPromptTokens(LLMGenerationRequest const& request) const
+{
+    std::vector<int32_t> counts;
+    counts.reserve(request.requests.size());
+    for (auto const& item : request.requests)
+    {
+        ELLM_CHECK(item.imageBuffers.empty() && item.audioBuffers.empty() && !item.pastTrajectory.has_value(),
+            "Prompt token counting is only available for text requests");
+
+        LLMGenerationRequest::FormattedRequest formatted;
+        ELLM_CHECK(mTokenizer->applyChatTemplate(
+                       item, formatted, request.applyChatTemplate, request.addGenerationPrompt, request.enableThinking),
+            "Failed to apply chat template while counting prompt tokens");
+        // A count-only request has no generation tokenization to reuse; template application and encoding are the
+        // requested operation. Normal generation reports the token count from its existing input IDs instead.
+        auto const tokenIds = mTokenizer->encode(formatted.formattedCompleteRequest, false);
+        ELLM_CHECK(!tokenIds.empty(), "Failed to tokenize prompt while counting prompt tokens");
+        counts.push_back(static_cast<int32_t>(tokenIds.size()));
+    }
+    return counts;
+}
+
 namespace
 {
 bool needsCachedBlockDraftDDTreeHybridBindings(DeploymentConfig const& deployment)

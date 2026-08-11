@@ -19,10 +19,30 @@ from types import SimpleNamespace
 
 import pytest
 
-from experimental.server.engine import (_MAX_LOGIT_BIAS_TOKENS, LLM,
-                                        SamplingParams, _normalize_logit_bias)
+from experimental.server.runtime.engine import (_MAX_LOGIT_BIAS_TOKENS, LLM,
+                                                CompletionOutput,
+                                                SamplingParams,
+                                                _normalize_logit_bias)
+from experimental.server.runtime.engine_layout import BundleLayout, EngineType
 
 _INT32_MAX = 2**31 - 1
+
+
+def _create_app(llm):
+    from experimental.server.api.app import create_app
+    from experimental.server.runtime.engine_client import EngineClient
+
+    return create_app(EngineClient(llm))
+
+
+class _FakeServerModel:
+    model_id = "test-model"
+    model_dir = ""
+    bundle_dir = "/nonexistent"
+    bundle_layout = BundleLayout(bundle_dir, EngineType.LLM)
+    runtime_kind = "chat"
+    video_capable = False
+    has_draft_model = False
 
 
 def test_normalize_logit_bias_accepts_integer_like_keys_and_boundaries():
@@ -87,9 +107,9 @@ def test_hlapi_generate_accepts_logit_bias_with_active_spec_decode():
     llm._rt = object()
     llm._runtime = SimpleNamespace(has_draft_model=lambda: True)
     llm._admission = lambda: FakeAdmission()
+    llm._ensure_open = lambda: None
     llm._make_generation_request = lambda *args, **kwargs: object()
-    llm._handle_request = lambda request: SimpleNamespace(
-        output_texts=[""], output_ids=[[]], finish_reasons=[], logprobs=[])
+    llm._complete_prepared_request = lambda *args, **kwargs: SimpleNamespace()
 
     outputs = llm.generate("hello", SamplingParams(logit_bias={1: 1.0}))
 
@@ -100,53 +120,21 @@ def test_hlapi_generate_accepts_logit_bias_with_active_spec_decode():
 def test_api_accepts_logit_bias_with_active_spec_decode(stream):
     TestClient = pytest.importorskip("fastapi.testclient").TestClient
 
-    from experimental.server.api_server import _create_app
-
-    class FakeRuntime:
-
-        @staticmethod
-        def handle_request(_request):
-
-            class Response:
-                output_texts = [""]
-                output_ids = [[]]
-                finish_reasons = []
-                logprobs = []
-
-            return Response()
-
-    class FakeAdmission:
-
-        @staticmethod
-        def acquire(blocking=True):
-            return True
-
-        @staticmethod
-        def release():
-            pass
-
-    class FakeLLM:
-        _model_id = "test-model"
+    class FakeLLM(_FakeServerModel):
         has_draft_model = True
-        model_dir = ""
-        _rt = object()
-        _runtime = FakeRuntime()
-
-        @staticmethod
-        def _admission():
-            return FakeAdmission()
 
         @staticmethod
         def _make_generation_request(*args, **kwargs):
             return object()
 
         @staticmethod
-        def count_prompt_tokens(*args, **kwargs):
-            return 1
+        def _complete_prepared_request(*args, **kwargs):
+            return CompletionOutput()
 
         @staticmethod
         def generate_stream(*args, **kwargs):
-            return iter(())
+            if False:
+                yield None
 
     response = TestClient(_create_app(FakeLLM())).post(
         "/v1/chat/completions",
@@ -169,13 +157,7 @@ def test_api_accepts_logit_bias_with_active_spec_decode(stream):
 def test_api_rejects_overflowing_logit_bias(stream):
     TestClient = pytest.importorskip("fastapi.testclient").TestClient
 
-    from experimental.server.api_server import _create_app
-
-    class FakeLLM:
-        _model_id = "test-model"
-        has_draft_model = False
-
-    response = TestClient(_create_app(FakeLLM())).post(
+    response = TestClient(_create_app(_FakeServerModel())).post(
         "/v1/chat/completions",
         json={
             "messages": [{
@@ -190,4 +172,4 @@ def test_api_rejects_overflowing_logit_bias(stream):
     )
 
     assert response.status_code == 400
-    assert "logit_bias" in response.json()["error"]
+    assert response.json()["error"]["param"].startswith("logit_bias")

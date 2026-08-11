@@ -10,13 +10,14 @@ This quick start guide will get you up and running with TensorRT Edge-LLM in ~15
 
 ## Recommended: High-Level API or Server
 
-For Jetson Thor, DGX Spark, and x86 development, use the high-level Python API or the OpenAI-compatible server. Build the project once with Python bindings enabled, then let the high-level Python API export, build, load, and run the model from a HuggingFace checkpoint.
+For Jetson Thor, DGX Spark, and x86 development, use the high-level Python API or the OpenAI-compatible server. Build the project once with Python bindings enabled, then let the high-level Python API build a complete engine bundle directly from a Hugging Face checkpoint, load it, and run the model.
 
-Install the server dependencies before configuring CMake with Python bindings:
+Install the package with server dependencies before configuring CMake with
+Python bindings:
 
 ```bash
 cd /path/to/TensorRT-Edge-LLM
-pip install -r requirements-server.txt
+pip install -e ".[server,server-tools,native-build]"
 ```
 
 For x86 development:
@@ -97,9 +98,7 @@ PY
 Or launch an OpenAI-compatible server:
 
 ```bash
-python -m experimental.server \
-  --model Qwen/Qwen3-0.6B \
-  --port 8000
+tensorrt-edgellm-serve Qwen/Qwen3-0.6B --port 8000
 ```
 
 Query the server from another terminal:
@@ -110,7 +109,8 @@ curl -sN http://localhost:8000/v1/chat/completions \
   -d '{"messages": [{"role": "user", "content": "What is the capital of the United States?"}], "max_tokens": 128}'
 ```
 
-For more options, including loading existing ONNX or engine directories, see [Experimental High-Level Python API and Server](../examples/experimental-server.md).
+For build profiles, checkpoint-backed engine loading, multimodal input, and
+speculative decoding, see [Experimental High-Level Python API and Server](../examples/experimental-server.md).
 
 ---
 
@@ -309,6 +309,6 @@ To collect layer-level profiling in addition to the benchmark summary, add `--pr
 
 **Quantization:** To create quantized checkpoints for `tensorrt_edgellm`, see [Quantization](../features/quantization.md).
 
-**Experimental Python API and Server:** To use the vLLM-style high-level Python API or an OpenAI-compatible chat server, see [Experimental High-Level Python API and Server](../examples/experimental-server.md).
+**Experimental Python API and Server:** To build directly from a checkpoint and use the high-level Python API or OpenAI-compatible chat server, see [Experimental High-Level Python API and Server](../examples/experimental-server.md).
 
 **Input Format:** Our format matches closely with the OpenAI API format. See [Input Format Guide](../format/input-format.md) for detailed specifications. Example input files are available in `tests/test_cases/` (e.g., `llm_basic.json`, `vlm_basic.json`).
