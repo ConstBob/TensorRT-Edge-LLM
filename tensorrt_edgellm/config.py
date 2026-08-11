@@ -93,6 +93,14 @@ LAYER_MOE = "moe"
 
 _VALID_ATTENTION_LAYER_TYPES = ("sliding_attention", "full_attention")
 
+# NemotronH ``hybrid_override_pattern`` / ``mtp_hybrid_override_pattern`` chars.
+_HYBRID_PATTERN_MAP = {
+    "M": LAYER_MAMBA,
+    "-": LAYER_MLP,
+    "*": LAYER_ATTN,
+    "E": LAYER_MOE,
+}
+
 _DIFFUSION_GEMMA_MODEL_TYPES = frozenset({
     "diffusion_gemma",
     "diffusion_gemma_text",
@@ -677,6 +685,9 @@ class ModelConfig:
     # is then its length. ``num_nextn_predict_layers`` (the count of MTP prediction
     # modules) is folded in during parsing.
     mtp_hybrid_override_pattern: Optional[str] = None
+    # The same draft stack, resolved from either the pattern above or the
+    # ``mtp_layers_block_type`` list.
+    mtp_layer_types: List[str] = field(default_factory=list)
     # When True, the standard CausalLM is exported as the MTP base model variant
     # with tree-attention inputs (attention_mask, attention_pos_id) and
     # an extra hidden_states output.
@@ -1029,11 +1040,12 @@ class ModelConfig:
             mtp_num_hidden_layers = int(mtp_num_hidden_layers)
         mtp_hybrid_override_pattern = llm_dict.get(
             "mtp_hybrid_override_pattern")
+        mtp_layer_types = _parse_mtp_layer_types(llm_dict)
         num_nextn_predict_layers = int(
             llm_dict.get("num_nextn_predict_layers", 0) or 0)
         if (mtp_num_hidden_layers is None and num_nextn_predict_layers > 0
-                and mtp_hybrid_override_pattern):
-            mtp_num_hidden_layers = len(mtp_hybrid_override_pattern)
+                and mtp_layer_types):
+            mtp_num_hidden_layers = len(mtp_layer_types)
         mtp_use_dedicated_embeddings = bool(
             llm_dict.get("mtp_use_dedicated_embeddings", False))
         _validate_mtp_constraints(
@@ -1173,6 +1185,7 @@ class ModelConfig:
             mtp_num_hidden_layers=mtp_num_hidden_layers,
             mtp_use_dedicated_embeddings=mtp_use_dedicated_embeddings,
             mtp_hybrid_override_pattern=mtp_hybrid_override_pattern,
+            mtp_layer_types=mtp_layer_types,
             mtp_base=bool(llm_dict.get("mtp_base", False)),
             root_model_type=root_model_type,
             raw_layer_types=raw_layer_types,
@@ -1283,19 +1296,12 @@ def make_mtp_draft_config(base_config: ModelConfig) -> ModelConfig:
     # Nemotron-H: Exclude all draft ``layers.*`` modules from quantization;
     # the untouched lm_head keeps the base quant type.
     if (base_config.model_type or "").lower().startswith("nemotron_h"):
-        pattern = base_config.mtp_hybrid_override_pattern or ""
-        _MTP_PATTERN_MAP = {
-            "M": LAYER_MAMBA,
-            "-": LAYER_MLP,
-            "*": LAYER_ATTN,
-            "E": LAYER_MOE,
-        }
-        draft_layer_types = [
-            _MTP_PATTERN_MAP[ch] for ch in pattern if ch in _MTP_PATTERN_MAP
-        ]
+        draft_layer_types = list(base_config.mtp_layer_types)
         if len(draft_layer_types) != mtp_num_hidden_layers:
+            declared = (base_config.mtp_hybrid_override_pattern
+                        or base_config.mtp_layer_types)
             raise ValueError(
-                f"mtp_hybrid_override_pattern {pattern!r} yields "
+                f"MTP draft stack {declared!r} yields "
                 f"{len(draft_layer_types)} layers != mtp_num_hidden_layers "
                 f"{mtp_num_hidden_layers}")
         draft_quant = replace(
@@ -1671,45 +1677,69 @@ def _parse_raw_layer_types(config: dict) -> List[str]:
     return [str(layer_type) for layer_type in raw]
 
 
+def _is_nemotron_h_config(config: dict) -> bool:
+    return (config.get("model_type") or "").lower().startswith("nemotron_h")
+
+
+def _canonical_layer_type(block_type: str, is_nemotron_h: bool) -> str:
+    """Map one checkpoint block-type name onto a canonical layer label.
+
+    ``"linear_attention"`` is ambiguous: it covers any sub-quadratic mixer, so
+    it denotes Mamba2 for NemotronH and GatedDeltaNet for Qwen3.5. The model
+    family therefore resolves it, along with ``"full_attention"``, which Gemma4
+    keeps verbatim for per-layer head_dim dispatch.
+    """
+    bt = str(block_type).lower()
+    if bt == "linear_attention":
+        return LAYER_MAMBA if is_nemotron_h else LAYER_GDN
+    if "mamba" in bt:
+        return LAYER_MAMBA
+    if bt == "moe":
+        return LAYER_MOE
+    if "mlp" in bt:
+        return LAYER_MLP
+    if bt in _VALID_ATTENTION_LAYER_TYPES:
+        return LAYER_ATTN if is_nemotron_h else bt
+    return LAYER_ATTN
+
+
+def _parse_mtp_layer_types(config: dict) -> List[str]:
+    """Return the MTP draft stack's per-layer block types.
+
+    NemotronH declares the stack either as ``mtp_layers_block_type`` (a list,
+    which transformers >= 5.14 rewrites into the ``linear_attention`` /
+    ``full_attention`` spelling) or as the legacy ``mtp_hybrid_override_pattern``
+    string (e.g. ``"*E"``).
+    """
+    raw = config.get("mtp_layers_block_type")
+    if raw:
+        is_nemotron_h = _is_nemotron_h_config(config)
+        return [_canonical_layer_type(bt, is_nemotron_h) for bt in raw]
+    pattern = config.get("mtp_hybrid_override_pattern") or ""
+    return [
+        _HYBRID_PATTERN_MAP[ch] for ch in pattern if ch in _HYBRID_PATTERN_MAP
+    ]
+
+
 def _parse_layer_types(config: dict) -> List[str]:
     """Return per-layer block type list from config.
 
-    Reads ``layers_block_type`` or ``layer_types`` directly if present.
-    For models using ``hybrid_override_pattern`` (e.g. NemotronH), parses the
-    pattern string where ``M`` = mamba, ``-`` = mlp, ``*`` = attention.
-    Falls back to all attention layers.
-
-    Qwen3.5 uses ``layer_types`` with values ``"linear_attention"`` (GDN)
-    and ``"full_attention"``.
+    Reads ``layers_block_type`` or ``layer_types`` directly if present, each
+    entry resolved by :func:`_canonical_layer_type`. For models using
+    ``hybrid_override_pattern`` (e.g. NemotronH), parses the pattern string
+    where ``M`` = mamba, ``-`` = mlp, ``*`` = attention. Falls back to all
+    attention layers.
     """
     raw = config.get("layers_block_type") or config.get("layer_types")
     if raw is not None:
-        result = []
-        for bt in raw:
-            bt_lower = str(bt).lower()
-            if bt_lower == "linear_attention":
-                result.append(LAYER_GDN)
-            elif "mamba" in bt_lower:
-                result.append(LAYER_MAMBA)
-            elif bt_lower == "moe":
-                result.append(LAYER_MOE)
-            elif "mlp" in bt_lower:
-                result.append(LAYER_MLP)
-            elif bt_lower in ("sliding_attention", "full_attention"):
-                # Gemma4: preserve raw string for per-layer head_dim dispatch
-                result.append(bt_lower)
-            else:
-                result.append(LAYER_ATTN)
-        return result
+        is_nemotron_h = _is_nemotron_h_config(config)
+        return [_canonical_layer_type(bt, is_nemotron_h) for bt in raw]
     pattern = config.get("hybrid_override_pattern")
     if pattern is not None:
-        _PATTERN_MAP = {
-            "M": LAYER_MAMBA,
-            "-": LAYER_MLP,
-            "*": LAYER_ATTN,
-            "E": LAYER_MOE,
-        }
-        return [_PATTERN_MAP[ch] for ch in pattern if ch in _PATTERN_MAP]
+        return [
+            _HYBRID_PATTERN_MAP[ch] for ch in pattern
+            if ch in _HYBRID_PATTERN_MAP
+        ]
     n = config["num_hidden_layers"]
     return [LAYER_ATTN] * n
 
