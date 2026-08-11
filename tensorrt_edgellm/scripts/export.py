@@ -1089,6 +1089,16 @@ def _export_llm(model_dir: str,
             logger.exception("[LLM] ONNX export failed")
             raise SystemExit(1) from exc
 
+        # DFlash: the draft's proposal query embeds the mask token via this base
+        # engine's shared embedding table, so fold the draft's trained mask row
+        # into it (no-op when the row is shared with the base).
+        if dflash_draft_dir and world == 1:
+            from ..checkpoint.checkpoint_utils import _runtime_embedding_scale
+            _patch_dflash_mask_embedding(
+                llm_out_dir,
+                dflash_draft_dir,
+                embedding_scale=_runtime_embedding_scale(model))
+
         # Free this rank's model before building the next one
         del model
 
@@ -1399,6 +1409,90 @@ def _export_dflash_draft(model_dir: str,
                 indent=2)
 
     logger.info("[DFlash Draft] Done: %s", output_path)
+
+
+def _patch_dflash_mask_embedding(llm_out_dir: str,
+                                 dflash_draft_dir: str,
+                                 embedding_scale: float = 1.0) -> None:
+    """Fold the DFlash draft's trained mask-token embedding into the base sidecar.
+
+    The runtime embeds the draft proposal query ``[anchor, mask, ...]`` by
+    looking ``mask_token_id`` up in the base engine's shared
+    ``embedding.safetensors`` (``dflashDecoder.cpp`` ``runDraftForward``). Some
+    DFlash checkpoints (e.g. Nemotron-3.5) ship a distinct trained embedding for
+    that reserved token in the draft's own ``embed_tokens`` — typically the only
+    row that differs from the base table. Patch only that single row; when the
+    draft's mask row is shared with the base (the common Qwen-style case) this is
+    a no-op.
+    """
+    import glob
+
+    from safetensors import safe_open
+
+    from tensorrt_edgellm._safetensors_io import save_file
+
+    emb_path = os.path.join(llm_out_dir, "embedding.safetensors")
+    if not os.path.exists(emb_path):
+        logger.warning("[DFlash] %s missing; cannot fold draft mask embedding",
+                       emb_path)
+        return
+
+    draft_cfg = _load_config(dflash_draft_dir)
+    dcfg = draft_cfg.get("dflash_config", {}) or {}
+    mask_id = dcfg.get("mask_token_id", draft_cfg.get("mask_token_id"))
+    if mask_id is None:
+        logger.warning("[DFlash] draft config has no mask_token_id; skipping "
+                       "mask embedding fold")
+        return
+    mask_id = int(mask_id)
+
+    # embed_tokens is excluded from draft quantization, so the row is dense.
+    draft_vec = None
+    for shard in sorted(
+            glob.glob(os.path.join(dflash_draft_dir, "*.safetensors"))):
+        with safe_open(shard, framework="pt", device="cpu") as f:
+            keys = set(f.keys())
+            for key in ("embed_tokens.weight", "model.embed_tokens.weight"):
+                if key in keys:
+                    draft_vec = f.get_slice(key)[mask_id:mask_id +
+                                                 1].squeeze(0).to(
+                                                     torch.float32)
+                    break
+        if draft_vec is not None:
+            break
+    if draft_vec is None:
+        logger.info("[DFlash] draft checkpoint has no embed_tokens; mask "
+                    "embedding is shared with the base (no fold needed)")
+        return
+
+    with safe_open(emb_path, framework="pt", device="cpu") as f:
+        if "embedding_scale" in set(f.keys()):
+            raise ValueError(
+                "DFlash mask-embedding fold does not support FP8 "
+                "embedding.safetensors; re-export the base without "
+                "--fp8-embedding.")
+        weight = f.get_tensor("embedding")
+
+    patched_row = (draft_vec * embedding_scale).to(weight.dtype)
+    if torch.allclose(weight[mask_id].to(torch.float32),
+                      patched_row.to(torch.float32),
+                      atol=1e-3,
+                      rtol=0.0):
+        logger.info(
+            "[DFlash] draft mask embedding (id=%d) matches base; no fold needed",
+            mask_id)
+        return
+
+    weight[mask_id] = patched_row
+    # Write to a temp file and atomically rename so an interrupted patch never
+    # leaves the base engine's embedding sidecar half-written; a re-run then
+    # recovers without re-exporting the base.
+    tmp_path = emb_path + ".tmp"
+    save_file({"embedding": weight.contiguous()}, tmp_path)
+    os.replace(tmp_path, emb_path)
+    logger.info(
+        "[DFlash] Folded draft mask embedding (id=%d) into base "
+        "embedding.safetensors", mask_id)
 
 
 _DSPARK_HEAD_TENSOR_KEYS = {

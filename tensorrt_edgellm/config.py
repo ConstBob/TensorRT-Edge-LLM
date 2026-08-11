@@ -733,6 +733,11 @@ class ModelConfig:
     dflash_target_layer_ids: List[int] = field(default_factory=list)
     dflash_block_size: int = 16
     dflash_mask_token_id: int = 248070
+    # Run the fc feature projector at the checkpoint's native precision (e.g.
+    # NVFP4) instead of the default dense-FP16 + FP32 projection. Enabled only
+    # for targets measured to keep target-hidden well inside FP16 range
+    # (Nemotron-3.5). Qwen3-8B keeps the FP32 guard (target-hidden ~abs 2e4).
+    dflash_fc_native_precision: bool = False
     # ------------------------------------------ DSpark config
     # DSpark uses the DFlash-like target-hidden feedback path, then applies
     # a sequential Markov/confidence head outside the draft backbone engine.
@@ -1205,6 +1210,10 @@ class ModelConfig:
             mtp_tree_base=bool(llm_dict.get("mtp_tree_base", False)),
             dflash_base=bool(llm_dict.get("dflash_base", False)),
             dflash_tree_base=bool(llm_dict.get("dflash_tree_base", False)),
+            dflash_target_layer_ids=list(
+                (llm_dict.get("dflash_config", {})
+                 or {}).get("target_layer_ids")
+                or llm_dict.get("eagle_aux_hidden_state_layer_ids") or []),
             dspark_base=bool(llm_dict.get("dspark_base", False)),
             num_deepstack_features=_parse_num_deepstack_features(
                 llm_dict, model_type, root_config=root),
@@ -1492,6 +1501,12 @@ def make_dflash_draft_config(
     # Parse quantization config from the draft checkpoint directory.
     # For FP16 draft checkpoints this returns QuantConfig() (no quant).
     quant = _parse_quant(draft_dir, llm_dict)
+    # The fc feature projector must stay dense FP16 (the draft model asserts
+    # this). Finalized NVFP4 drafts ship a packed fc; excluding it here keeps
+    # ``make_linear`` producing FP16Linear, and the loader dequantizes the
+    # packed checkpoint tensors into it (see ``model.py``).
+    if "fc" not in quant.excluded:
+        quant.excluded = list(quant.excluded) + ["fc"]
 
     model_type = llm_dict.get("model_type", "qwen3")
     _check_num_attention_heads(llm_dict["num_attention_heads"])

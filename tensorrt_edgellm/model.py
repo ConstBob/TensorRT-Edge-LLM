@@ -407,6 +407,14 @@ class AutoModel:
             config = make_dflash_draft_config(
                 dflash_draft_dir,
                 _default_attention_scale_for_model_dir(dflash_draft_dir))
+            if base_config.model_type == "nemotron_h":
+                # Nemotron-3.5 target-hidden stays far inside FP16; run fc at the
+                # checkpoint's native NVFP4 rather than the dense-FP16 + FP32
+                # projection that guards Qwen3-8B (target-hidden ~abs 2e4).
+                config.dflash_fc_native_precision = True
+                config.quant.excluded = [
+                    e for e in config.quant.excluded if e != "fc"
+                ]
             if not draft_has_lm_head:
                 config = _inherit_dflash_lm_head_quant(config, base_config)
             model_class = DFlashDraftModel

@@ -211,6 +211,74 @@ TEST(InitializeLongRopeCosSin, Benchmark)
     BenchmarkLongRopeCosSin(128, 4096);
 }
 
+// YaRN: the kernel only does the position sweep on a precomputed per-dim inverse
+// frequency, so the reference recomputes the same NTK-by-parts inv_freq (matching
+// computeYarnInvFreq in the runtime) and fills cos(pos*invFreq)*mscale.
+void TestYarnRopeCosSin(int32_t rotaryDim, int32_t maxPositions, float rotaryBaseFrequency = 10000.0F,
+    float factor = 32.0F, int32_t originalMaxPositionEmbeddings = 8192, float betaFast = 32.0F, float betaSlow = 1.0F)
+{
+    int32_t const halfDim = rotaryDim / 2;
+    float const kPi = 3.14159265358979323846F;
+    auto correctionDim = [&](float numRotations) {
+        return (static_cast<float>(rotaryDim)
+                   * std::log(static_cast<float>(originalMaxPositionEmbeddings) / (numRotations * 2.0F * kPi)))
+            / (2.0F * std::log(rotaryBaseFrequency));
+    };
+    float low = std::max(std::floor(correctionDim(betaFast)), 0.0F);
+    float high = std::min(std::ceil(correctionDim(betaSlow)), static_cast<float>(rotaryDim - 1));
+    float denom = high - low;
+    if (denom == 0.0F)
+    {
+        denom = 0.001F;
+    }
+    std::vector<float> invFreq(halfDim);
+    for (int32_t d = 0; d < halfDim; ++d)
+    {
+        float const posFreq
+            = std::pow(rotaryBaseFrequency, 2.0F * static_cast<float>(d) / static_cast<float>(rotaryDim));
+        float const extrap = 1.0F / posFreq;
+        float const interp = 1.0F / (factor * posFreq);
+        float const ramp = std::clamp((static_cast<float>(d) - low) / denom, 0.0F, 1.0F);
+        float const extrapFactor = 1.0F - ramp;
+        invFreq[d] = interp * (1.0F - extrapFactor) + extrap * extrapFactor;
+    }
+    float const mscale = factor > 1.0F ? 0.1F * std::log(factor) + 1.0F : 1.0F;
+
+    std::vector<float> reference(maxPositions * rotaryDim);
+    for (int32_t pos = 0; pos < maxPositions; ++pos)
+    {
+        for (int32_t d = 0; d < halfDim; ++d)
+        {
+            float const angle = static_cast<float>(pos) * invFreq[d];
+            reference[pos * rotaryDim + d] = std::cos(angle) * mscale;
+            reference[pos * rotaryDim + d + halfDim] = std::sin(angle) * mscale;
+        }
+    }
+
+    thrust::device_vector<float> cosSinCacheDevice(maxPositions * rotaryDim);
+    thrust::device_vector<float> invFreqDevice(invFreq);
+    cudaStream_t stream{nullptr};
+    initializeYarnCosSin(thrust::raw_pointer_cast(cosSinCacheDevice.data()),
+        thrust::raw_pointer_cast(invFreqDevice.data()), mscale, rotaryDim, maxPositions, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    thrust::host_vector<float> cosSinCacheHost(cosSinCacheDevice);
+    for (int32_t i = 0; i < maxPositions * rotaryDim; ++i)
+    {
+        ASSERT_TRUE(isclose(cosSinCacheHost[i], reference[i], 1e-3, 1e-3))
+            << "YaRN RoPE cache mismatch at index " << i << ": got " << cosSinCacheHost[i] << ", expected "
+            << reference[i];
+    }
+    std::cout << "TestYarnRopeCosSin passed: rotaryDim=" << rotaryDim << ", maxPositions=" << maxPositions << std::endl;
+}
+
+TEST(InitializeYarnRopeCosSin, Accuracy)
+{
+    TestYarnRopeCosSin(64, 256);
+    TestYarnRopeCosSin(128, 4096);
+    TestYarnRopeCosSin(128, 16384); // beyond originalMaxPositionEmbeddings=8192
+}
+
 void TestMRopeCosSin(int32_t rotaryDim, int32_t rotaryEmbeddingMaxPositions, int32_t batchSize,
     float rotaryBaseFrequency = 10000.0f, bool interleaved = false, int32_t sectionH = 20, int32_t sectionW = 20)
 {
