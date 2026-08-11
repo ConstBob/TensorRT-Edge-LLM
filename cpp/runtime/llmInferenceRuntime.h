@@ -34,6 +34,7 @@
 #include "runtime/preprocess/embeddingPreprocessor.h"
 #include "runtime/preprocess/gemma4EmbeddingPreprocessor.h"
 #include "runtime/preprocess/stepPreparer.h"
+#include "runtime/preprocess/visualTokenPruner.h"
 #include "runtime/state/contextCache/contextCacheConfig.h"
 #include "runtime/state/contextCache/contextCacheMetrics.h"
 #include "runtime/state/decodingInferenceContext.h"
@@ -149,6 +150,19 @@ public:
      *  \param seed Random seed value; has no effect if no action runner is loaded
      */
     void setActionNoiseSeed(int32_t seed) noexcept;
+
+    /*! \brief Enable visual-token pruning (embedding-level, prefill only).
+     *
+     *  Must be called before the first request. Constructs the pruner — with the selection
+     *  algorithm named by `config.algorithm` ("dart" by default; see registerTokenSelector
+     *  for plugging in custom algorithms) — when the config is enabled and the base engine
+     *  is an mRoPE VLM (image token id present); otherwise logs a warning and leaves pruning
+     *  disabled. Runtime gates (batch 1, fresh KV cache, no spec decode, ...) are applied per
+     *  request in runBaseModelPrefill.
+     *
+     *  \param config Pruning parameters (algorithm, reduction ratio, guards, DART pivots)
+     */
+    void setVisualPrunerConfig(VisualPrunerConfig const& config);
 
     //! Get LLM prefill stage metrics
     metrics::LLMPrefillMetrics const& getPrefillMetrics() const noexcept
@@ -269,6 +283,7 @@ private:
     std::unique_ptr<DecoderRegistry> mDecoderRegistry;
     std::unique_ptr<StepPreparer> mStepPreparer;             //!< Per-step sequence preprocessor
     std::unique_ptr<EmbeddingPreprocessor> mEmbeddingPre;    //!< Embedding-lookup preprocessor
+    std::unique_ptr<VisualTokenPruner> mVisualPruner;        //!< Visual-token pruner (optional)
     std::unique_ptr<Gemma4EmbeddingPreprocessor> mGemma4Ple; //!< Gemma4 PLE token-identity preprocessor
     //! Base-engine deepstack binding (nullptr when the base engine was built
     //! without deepstack features). Swaps between `io.deepstackEmbeds[i]`

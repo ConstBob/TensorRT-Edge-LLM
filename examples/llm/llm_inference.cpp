@@ -89,7 +89,12 @@ enum LLMInferenceOptionId : int
     CONTEXT_CACHE_RECURRENT_SNAPSHOT_POOL_BYTES = 929,
     CONTEXT_CACHE_PARTIAL_KV_SNAPSHOT_POOL_BYTES = 930,
     CHECKPOINT_DIR = 931,
-    DRAFT_CHECKPOINT_DIR = 932
+    DRAFT_CHECKPOINT_DIR = 932,
+    VISUAL_PRUNE = 933,
+    DART_REDUCTION_RATIO = 934,
+    DART_PIVOT_IMAGE_TOKENS = 935,
+    DART_PIVOT_TEXT_TOKENS = 936,
+    VISUAL_PRUNE_ALGO = 937
 };
 
 // Struct to hold speculative decoding arguments (used by both EAGLE and MTP)
@@ -154,6 +159,10 @@ struct LLMInferenceArgs
     int32_t talkerTopK{50};
     float talkerTopP{1.0f};
     float talkerRepetitionPenalty{1.05f};
+
+    // Visual-token pruning (embedding-level, VLM prefill only; disabled by default).
+    // Selection algorithm defaults to "dart"; see --visualPruneAlgo.
+    rt::VisualPrunerConfig visualPrunerConfig;
 
     // Thinker-Talker streaming mode (single CUDA stream interleaved).
     // All fields below can be set either via CLI flag or the top-level
@@ -313,7 +322,9 @@ void printUsage(char const* programName)
                  "[--specVerifySize=<number>] [--dflashBlockSize=<number>|--jetspecBlockSize=<number>] "
                  "[--dsparkScheduler=off|threshold|sps] "
                  "[--dsparkConfidenceThreshold=<float>] "
-                 "[--dsparkMinProposalLen=<number>] [--dsparkMaxProposalLen=<number>]"
+                 "[--dsparkMinProposalLen=<number>] [--dsparkMaxProposalLen=<number>] "
+                 "[--visualPrune] [--dartReductionRatio=<float>] "
+                 "[--dartPivotImageTokens=<number>] [--dartPivotTextTokens=<number>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --help                    Display this help message" << std::endl;
@@ -371,6 +382,16 @@ void printUsage(char const* programName)
               << " required for hybrid attention reuse)" << std::endl;
     std::cerr << "                            KV retention capacity is configured at build time with"
               << " --maxKVPoolPages" << std::endl;
+    std::cerr << "\nVisual-Token Pruning Options:" << std::endl;
+    std::cerr << "  --visualPrune             Enable visual-token pruning (mRoPE VLM prefill, batch 1)" << std::endl;
+    std::cerr << "  --visualPruneAlgo         Prune selection algorithm (default: dart); custom algorithms"
+              << std::endl;
+    std::cerr << "                            can be added via rt::registerVisualPruner()" << std::endl;
+    std::cerr << "  --dartReductionRatio      Fraction of visual tokens to remove, in (0, 1) (default: 0.25)"
+              << std::endl;
+    std::cerr << "  --dartPivotImageTokens    Number of image pivot tokens for DART selection (default: 4)"
+              << std::endl;
+    std::cerr << "  --dartPivotTextTokens     Number of text pivot tokens for DART selection (default: 4)" << std::endl;
     std::cerr << "\nQwen3-Omni Audio Output Options:" << std::endl;
     std::cerr << "  --enableAudioOutput       Enable audio output from Thinker hidden states" << std::endl;
     std::cerr << "  --talkerEngineDir         Path to Talker engine directory" << std::endl;
@@ -442,7 +463,11 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
             LLMInferenceOptionId::CONTEXT_CACHE_RECURRENT_SNAPSHOT_POOL_BYTES},
         {"contextCachePartialKVSnapshotPoolBytes", required_argument, 0,
             LLMInferenceOptionId::CONTEXT_CACHE_PARTIAL_KV_SNAPSHOT_POOL_BYTES},
-        {0, 0, 0, 0}};
+        {"visualPrune", no_argument, 0, LLMInferenceOptionId::VISUAL_PRUNE},
+        {"visualPruneAlgo", required_argument, 0, LLMInferenceOptionId::VISUAL_PRUNE_ALGO},
+        {"dartReductionRatio", required_argument, 0, LLMInferenceOptionId::DART_REDUCTION_RATIO},
+        {"dartPivotImageTokens", required_argument, 0, LLMInferenceOptionId::DART_PIVOT_IMAGE_TOKENS},
+        {"dartPivotTextTokens", required_argument, 0, LLMInferenceOptionId::DART_PIVOT_TEXT_TOKENS}, {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", inferenceOptions, nullptr)) != -1)
@@ -645,6 +670,56 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
             catch (std::exception const& e)
             {
                 LOG_ERROR("Invalid dsparkMaxProposalLen value: %s", optarg);
+                return false;
+            }
+            break;
+        case LLMInferenceOptionId::VISUAL_PRUNE: args.visualPrunerConfig.enabled = true; break;
+        case LLMInferenceOptionId::VISUAL_PRUNE_ALGO: args.visualPrunerConfig.algorithm = optarg; break;
+        case LLMInferenceOptionId::DART_REDUCTION_RATIO:
+            try
+            {
+                args.visualPrunerConfig.reductionRatio = std::stof(optarg);
+                if (args.visualPrunerConfig.reductionRatio <= 0.0F || args.visualPrunerConfig.reductionRatio >= 1.0F)
+                {
+                    LOG_ERROR("Invalid dartReductionRatio value: %s (must be in (0, 1))", optarg);
+                    return false;
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Invalid dartReductionRatio value: %s", optarg);
+                return false;
+            }
+            break;
+        case LLMInferenceOptionId::DART_PIVOT_IMAGE_TOKENS:
+            try
+            {
+                args.visualPrunerConfig.pivotImageTokens = std::stoi(optarg);
+                if (args.visualPrunerConfig.pivotImageTokens < 0)
+                {
+                    LOG_ERROR("Invalid dartPivotImageTokens value: %s (must be non-negative)", optarg);
+                    return false;
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Invalid dartPivotImageTokens value: %s", optarg);
+                return false;
+            }
+            break;
+        case LLMInferenceOptionId::DART_PIVOT_TEXT_TOKENS:
+            try
+            {
+                args.visualPrunerConfig.pivotTextTokens = std::stoi(optarg);
+                if (args.visualPrunerConfig.pivotTextTokens < 0)
+                {
+                    LOG_ERROR("Invalid dartPivotTextTokens value: %s (must be non-negative)", optarg);
+                    return false;
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Invalid dartPivotTextTokens value: %s", optarg);
                 return false;
             }
             break;
@@ -938,6 +1013,19 @@ int main(int argc, char* argv[])
         catch (std::exception const& e)
         {
             LOG_ERROR("Failed to initialize runtime: %s", e.what());
+            return EXIT_FAILURE;
+        }
+    }
+
+    if (args.visualPrunerConfig.enabled)
+    {
+        try
+        {
+            runtime->setVisualPrunerConfig(args.visualPrunerConfig);
+        }
+        catch (std::exception const& e)
+        {
+            LOG_ERROR("Failed to enable visual-token pruning: %s", e.what());
             return EXIT_FAILURE;
         }
     }

@@ -13,6 +13,15 @@ add_cross_build_link_options(dflashBenchDDTree)
 
 add_test(NAME dflashBenchDDTree COMMAND dflashBenchDDTree)
 
+add_executable(dartPrunerTest dartPrunerTest.cpp)
+target_include_directories(dartPrunerTest PRIVATE ${COMMON_INCLUDE_DIRS}
+                                                  ${CMAKE_SOURCE_DIR})
+target_link_libraries(dartPrunerTest PRIVATE gtest gtest_main edgellmCore
+                                             commonLibraryExt)
+add_cross_build_link_options(dartPrunerTest)
+
+add_test(NAME dartPrunerTest COMMAND dartPrunerTest)
+
 add_executable(benchLoggerTest benchLoggerTest.cpp)
 target_include_directories(
   benchLoggerTest PRIVATE ${COMMON_INCLUDE_DIRS} ${CMAKE_SOURCE_DIR}

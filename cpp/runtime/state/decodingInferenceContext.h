@@ -61,6 +61,7 @@ struct BatchResult
     int32_t generateLength{0};               //!< Number of tokens generated
     int32_t actualIterations{0};             //!< Number of iterations executed
     int32_t effectivePrefillLength{0};       //!< Effective prefill length after system prompt cache reuse
+    int32_t prunedPrefillTokens{0};          //!< Prompt tokens removed by visual-token pruning
     //! Per-step top log-probabilities: logprobs[step] = [LogprobEntry, ...], sorted descending.
     //! Populated only when numLogprobs > 0 in the original request.
     std::vector<std::vector<LogprobEntry>> logprobs;
@@ -81,7 +82,10 @@ struct DecodingInferenceContext
     std::vector<std::vector<int32_t>> tokenIds;           //!< Token IDs for each sequence: [batch_size][seq_length]
     std::vector<int32_t> currentGenerateLengths;          //!< Current generation length for each sequence
     std::vector<int32_t> effectivePrefillLengths;         //!< Prefill length after system prompt cache reuse
-    std::vector<int8_t> finishedStates;                   //!< Finished state for each sequence
+    //! Per-slot prompt tokens removed by visual-token pruning (empty when pruning is off —
+    //! treat a missing entry as 0).
+    std::vector<int32_t> prunedPrefillTokens;
+    std::vector<int8_t> finishedStates; //!< Finished state for each sequence
 
     std::unordered_map<int32_t, BatchResult> completedBatches; //!< Results of completed batches
     std::vector<int32_t> batchIndexMapping;                    //!< Maps current batch index to original index
