@@ -34,8 +34,9 @@ from .checkpoint.checkpoint_utils import load_checkpoint_config_dicts
 from .checkpoint.loader import load_weights
 from .config import (QUANT_FP16, QUANT_INT4_AWQ, QUANT_INT4_AWQ_MODELOPT,
                      QUANT_INT4_GPTQ, QUANT_MXFP8, QUANT_NVFP4, ModelConfig,
-                     make_dflash_draft_config, make_dspark_draft_config,
-                     make_mtp_draft_config, module_quant_type)
+                     _is_gemma4_assistant_model_type, make_dflash_draft_config,
+                     make_dspark_draft_config, make_mtp_draft_config,
+                     module_quant_type)
 
 __all__ = [
     "AutoModel", "load_model_config", "register_attention_scale_default",
@@ -408,9 +409,9 @@ class AutoModel:
             if key_remap is None:
                 key_remap = _dflash_key_remap
         elif variant == "gemma4_mtp_draft":
-            if config.root_model_type != "gemma4_assistant":
+            if not _is_gemma4_assistant_model_type(config.root_model_type):
                 raise ValueError(
-                    "Gemma4 MTP draft requires a gemma4_assistant checkpoint.")
+                    "Gemma4 MTP draft requires a Gemma4 assistant checkpoint.")
             from .models.gemma4 import Gemma4AssistantForCausalLM
             config.gemma4_mtp_draft = True
             config.shares_target_kv = True
@@ -442,10 +443,11 @@ class AutoModel:
                     "qwen3_5_moe, or qwen3_5_moe_text checkpoints; "
                     f"got {config.model_type!r}.")
             if variant == "gemma4_mtp_base":
-                if config.model_type not in ("gemma4", "gemma4_text"):
+                if config.model_type not in ("gemma4", "gemma4_text",
+                                             "gemma4_unified",
+                                             "gemma4_unified_text"):
                     raise ValueError(
-                        "Gemma4 MTP base requires a gemma4/gemma4_text target checkpoint."
-                    )
+                        "Gemma4 MTP base requires a Gemma4 target checkpoint.")
                 from .models.gemma4 import Gemma4ForCausalLM
                 config.gemma4_mtp_base = True
                 model_class = Gemma4ForCausalLM

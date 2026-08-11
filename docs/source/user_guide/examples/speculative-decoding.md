@@ -281,16 +281,17 @@ For Gemma4 paired-assistant MTP, download or stage both the base checkpoint and 
 
 ```bash
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
-export MODEL_NAME=gemma-4-E2B-it
-export ASSISTANT_MODEL_NAME=gemma-4-E2B-it-assistant
+export MODEL_ID=google/gemma-4-12B-it
+export ASSISTANT_MODEL_ID=google/gemma-4-12B-it-assistant
+export MODEL_NAME=gemma-4-12B-it
 mkdir -p $WORKSPACE_DIR
 cd $WORKSPACE_DIR
 
 tensorrt-edgellm-export \
-  $WORKSPACE_DIR/$MODEL_NAME \
+  $MODEL_ID \
   $WORKSPACE_DIR/$MODEL_NAME/onnx \
   --mtp \
-  --mtp-draft-dir $WORKSPACE_DIR/$ASSISTANT_MODEL_NAME
+  --mtp-draft-dir $ASSISTANT_MODEL_ID
 ```
 
 This produces the same `llm/` and `mtp_draft/` layout used by the build and inference steps below.

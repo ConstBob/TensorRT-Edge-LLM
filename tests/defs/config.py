@@ -500,6 +500,11 @@ MODEL_NAME_TO_DFLASH_DRAFT_MODELS_MAP = {
 # remains ``...-mtp`` so runtime naming is shared with Qwen-style MTP; only
 # export needs this model-family-specific assistant lookup.
 GEMMA4_MTP_ASSISTANT_MODELS_MAP = {
+    "gemma-4-12B-it": [
+        "gemma-4-12B-it-assistant",
+        "google/gemma-4-12B-it-assistant",
+        "gemma/gemma-4-12B-it-assistant",
+    ],
     "gemma-4-E2B-it": [
         "source_models/gemma-4-E2B-it-assistant",
         "gemma-4-E2B-it-assistant",

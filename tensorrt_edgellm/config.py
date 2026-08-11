@@ -125,6 +125,10 @@ def _is_gemma4_model_type(model_type: str) -> bool:
             or _is_diffusion_gemma_model_type(model_type))
 
 
+def _is_gemma4_assistant_model_type(model_type: str) -> bool:
+    return str(model_type) in ("gemma4_assistant", "gemma4_unified_assistant")
+
+
 def _check_num_attention_heads(num_attn_heads: int) -> None:
     if num_attn_heads <= 0:
         raise ValueError("num_attention_heads must be a positive integer, "
@@ -959,8 +963,9 @@ class ModelConfig:
         root_model_type = root.get("model_type", "")
         model_type = llm_dict.get("model_type", "llama")
         is_diffusion_gemma = _is_diffusion_gemma_config(root, llm_dict)
-        if root_model_type == "gemma4_assistant":
-            model_type = root_model_type
+        is_gemma4_assistant = _is_gemma4_assistant_model_type(root_model_type)
+        if is_gemma4_assistant:
+            model_type = "gemma4_assistant"
         elif is_diffusion_gemma:
             model_type = "diffusion_gemma"
         hidden_size = llm_dict["hidden_size"]
@@ -1161,12 +1166,11 @@ class ModelConfig:
             rope_parameters=llm_dict.get("rope_parameters", None),
             backbone_hidden_size=int(
                 llm_dict.get("backbone_hidden_size", 0) or 0),
-            assistant_hidden_size=(hidden_size if root_model_type
-                                   == "gemma4_assistant" else 0),
-            shares_target_kv=(root_model_type == "gemma4_assistant"),
-            has_own_kv_cache=(root_model_type != "gemma4_assistant"),
-            constant_draft_positions=(root_model_type == "gemma4_assistant"),
-            returns_feedback_hidden=(root_model_type == "gemma4_assistant"),
+            assistant_hidden_size=(hidden_size if is_gemma4_assistant else 0),
+            shares_target_kv=is_gemma4_assistant,
+            has_own_kv_cache=not is_gemma4_assistant,
+            constant_draft_positions=is_gemma4_assistant,
+            returns_feedback_hidden=is_gemma4_assistant,
             use_ordered_embeddings=bool(
                 llm_dict.get("use_ordered_embeddings", False)),
             num_centroids=int(llm_dict.get("num_centroids", 0) or 0),

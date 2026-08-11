@@ -687,8 +687,9 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
         requirePositive(cfg.maxVerifyTreeSize, "max_verify_tree_size");
         if (cfg.specDecodeType == SpecDecodeMode::kGemma4MTP)
         {
-            ELLM_CHECK(cfg.modelType == "gemma4" || cfg.modelType == "gemma4_text",
-                "parseEngineConfig: gemma4_mtp base config must set model to gemma4 or gemma4_text.");
+            ELLM_CHECK(cfg.modelType == "gemma4" || cfg.modelType == "gemma4_text" || cfg.modelType == "gemma4_unified"
+                    || cfg.modelType == "gemma4_unified_text",
+                "parseEngineConfig: gemma4_mtp base config must identify a Gemma4 target model.");
             ELLM_CHECK(cfg.baseModelHiddenSize == 0 || cfg.baseModelHiddenSize == cfg.hiddenSize,
                 "parseEngineConfig: gemma4_mtp base_model_hidden_size must match hidden_size.");
         }
