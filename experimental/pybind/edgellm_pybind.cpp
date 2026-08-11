@@ -29,7 +29,7 @@
 #include "common/logger.h"
 #include "common/tensor.h"
 #include "common/trtUtils.h"
-#include "multimodal/code2WavRunner.h"
+#include "multimodal/qwen3_omni/code2WavRunner.h"
 #include "profiling/metrics.h"
 #include "runtime/audioLoader.h"
 #include "runtime/audioUtils.h"

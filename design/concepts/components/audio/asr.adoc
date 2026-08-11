@@ -81,11 +81,11 @@ flowchart LR
 | Audio encoder export and dummy input names: `padded_feature`,
   `padded_mask_after_cnn_indices`, `attention_mask`.
 
-| `cpp/multimodal/audioRunner.{h,cpp}`
+| `cpp/multimodal/qwen3_omni/audioRunner.{h,cpp}`
 | Audio preprocessing, audio engine execution, audio token insertion, and output
   embedding handoff.
 
-| `cpp/multimodal/audioUtils.{h,cpp}`
+| `cpp/multimodal/common/audioUtils.{h,cpp}`
 | Chunking, padding, mask/index generation, and chunkwise attention-mask helpers.
 
 | `cpp/kernels/embeddingKernels/embeddingKernels.{h,cu}`

@@ -20,7 +20,7 @@
 #include "action/alpamayo1ActionRunner.h"
 #include "common/hashUtils.h"
 #include "common/tensor.h"
-#include "multimodal/multimodalRunner.h"
+#include "multimodal/common/multimodalRunner.h"
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
 #include "runtime/config/deploymentConfig.h"

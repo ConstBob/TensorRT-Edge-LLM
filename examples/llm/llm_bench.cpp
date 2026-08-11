@@ -24,7 +24,7 @@
 #include "common/logger.h"
 #include "common/tensor.h"
 #include "common/trtUtils.h"
-#include "multimodal/multimodalRunner.h"
+#include "multimodal/common/multimodalRunner.h"
 #include "profiling/layerProfiler.h"
 #include "runtime/config/deploymentConfig.h"
 #include "runtime/config/inferenceDims.h"

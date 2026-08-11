@@ -47,8 +47,8 @@ Edge-LLM:
 | link:../../../../tensorrt_edgellm/models/internvl3/modeling_internvl3_visual.py[modeling_internvl3_visual.py] | InternVL3 visual encoder and projector export wrapper.
 | link:../../../../tensorrt_edgellm/models/internvl3/modeling_internvl3_text.py[modeling_internvl3_text.py] | InternVL3 language-model wrapper.
 | link:../../../../tensorrt_edgellm/models/internvl3_5/[internvl3_5/] | InternVL3.5 text/visual wrappers when that config is enabled.
-| link:../../../../cpp/multimodal/internViTRunner.h[internViTRunner.h] | InternVL visual runtime runner.
-| link:../../../../cpp/multimodal/multimodalRunner.h[multimodalRunner.h] | Generic multimodal runtime dispatch.
+| link:../../../../cpp/multimodal/internvl/internViTRunner.h[internViTRunner.h] | InternVL visual runtime runner.
+| link:../../../../cpp/multimodal/common/multimodalRunner.h[multimodalRunner.h] | Generic multimodal runtime dispatch.
 |===
 
 == Related Components

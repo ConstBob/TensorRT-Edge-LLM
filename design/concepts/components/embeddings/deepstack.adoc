@@ -71,7 +71,7 @@ The visual model decides whether deepstack exists from
   builds one `Qwen3VLPatchMerger` per configured visual block index.
 * During visual forward, after each selected visual block, the corresponding
   merger produces a `deepstack_features_<idx>` output.
-* `cpp/multimodal/qwenViTRunner.{h,cpp}` reads the configured index count,
+* `cpp/multimodal/qwen2/qwenViTRunner.{h,cpp}` reads the configured index count,
   allocates `mDeepstackFeatures`, binds each visual-engine output, and exposes
   those tensors through `getDeepstackFeatures()`.
 

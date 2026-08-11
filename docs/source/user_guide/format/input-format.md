@@ -140,7 +140,7 @@ The same field is available on the video content item, on the Python `ImageData`
 **Contract for pre-resized inputs:**
 
 - Supply raw **uint8 RGB** pixels. Do **not** rescale or normalize the pixel values yourself — mean/std normalization always runs inside the runtime.
-- Dimensions must exactly match the model's resize target. The per-model target formulas are exposed as stateless C++ functions in `cpp/multimodal/imageUtils.h`. For example, for the Qwen family:
+- Dimensions must exactly match the model's resize target. The per-model target formulas are exposed as stateless C++ functions in `cpp/multimodal/common/imageUtils.h`. For example, for the Qwen family:
 
   ```cpp
   auto [targetHeight, targetWidth] = rt::imageUtils::qwenSmartResize(

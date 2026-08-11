@@ -83,13 +83,13 @@ flowchart LR
 | Audio encoder export entry point. Qwen3-TTS is intentionally excluded from
   audio-encoder export because it has no audio encoder.
 
-| `cpp/multimodal/audioRunner.{h,cpp}`
+| `cpp/multimodal/qwen3_omni/audioRunner.{h,cpp}`
 | ASR/Omni audio preprocessing and encoder runtime.
 
-| `cpp/multimodal/code2WavRunner.{h,cpp}`
+| `cpp/multimodal/qwen3_omni/code2WavRunner.{h,cpp}`
 | TTS/Omni speech-code to waveform runtime.
 
-| `cpp/multimodal/audioUtils.{h,cpp}`
+| `cpp/multimodal/common/audioUtils.{h,cpp}`
 | Audio preprocessing helpers shared by ASR/Omni input-side paths.
 |===
 

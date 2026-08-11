@@ -43,7 +43,7 @@ Do not duplicate that table here.
 | link:../../../../tensorrt_edgellm/models/phi4mm/modeling_phi4mm_visual.py[modeling_phi4mm_visual.py] | Phi-4 multimodal visual encoder export wrapper.
 | link:../../../../tensorrt_edgellm/models/phi4mm/modeling_phi4mm_text.py[modeling_phi4mm_text.py] | Phi-4 multimodal text wrapper.
 | link:../../../../tensorrt_edgellm/chat_templates/phi4mm.json[phi4mm.json] | Explicit chat template used during export.
-| link:../../../../cpp/multimodal/multimodalRunner.h[multimodalRunner.h] | Generic multimodal runtime dispatch.
+| link:../../../../cpp/multimodal/common/multimodalRunner.h[multimodalRunner.h] | Generic multimodal runtime dispatch.
 |===
 
 == Related Components

@@ -26,7 +26,7 @@
 #include "kernels/embeddingKernels/embeddingKernels.h"
 #include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
 #include "kernels/talkerMLPKernels/talkerMLPKernels.h"
-#include "multimodal/cloneEncoderRunner.h"
+#include "multimodal/qwen3_omni/cloneEncoderRunner.h"
 #include "runtime/audioLoader.h"
 
 #ifdef CUTE_DSL_GEMM_ENABLED
