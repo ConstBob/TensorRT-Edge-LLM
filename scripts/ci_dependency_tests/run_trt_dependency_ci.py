@@ -314,7 +314,6 @@ class Config:
     model_cases: tuple[ModelCase, ...] = _DEFAULT_MODEL_CASES
     cuda_root: PurePosixPath | None = None
     cuda_version: str | None = None
-
     cuda_dir: PurePosixPath | None = None
     cuda_target_dir: PurePosixPath | None = None
     run_python: PurePosixPath | None = None
@@ -334,7 +333,6 @@ class Config:
                 "--cuda-version is required for x86 --no-trt-containers")
         if self.cuda_root is not None and not _safe_path(self.cuda_root):
             raise ValueError("cuda_root must be an absolute, non-root path")
-
         if self.cuda_dir is not None and not _safe_path(self.cuda_dir):
             raise ValueError("cuda_dir must be an absolute, non-root path")
         if (self.cuda_target_dir is not None
@@ -512,7 +510,6 @@ def _cute_dsl_cmake_args(architecture: Arch, compute_capability: str,
 def build_targets(config: Config) -> list[ArtifactTarget]:
     native_x86 = (config.no_trt_containers
                   and config.architecture is Arch.X86_64)
-
     d7l_cuda_dir = config.cuda_dir or _DEFAULT_D7L_CUDA_DIR
     d7l_cuda_target_dir = (config.cuda_target_dir
                            or _DEFAULT_D7L_CUDA_TARGET_DIR)
@@ -523,7 +520,6 @@ def build_targets(config: Config) -> list[ArtifactTarget]:
     platform_cmake_args = ([
         f"-DCMAKE_TOOLCHAIN_FILE={config.source_root}/cmake/aarch64_linux_toolchain.cmake",
         "-DEMBEDDED_TARGET=auto-thor",
-
         f"-DCUDA_DIR={d7l_cuda_dir}",
         f"-DCUDA_TARGET_DIR={d7l_cuda_target_dir}",
     ] if config.architecture is Arch.D7L else (
@@ -658,7 +654,6 @@ def _native_build_command(config: Config, target: ArtifactTarget) -> str:
     ])
 
 
-
 def _native_build_environment() -> dict[str, str]:
     """Return activated toolchain paths that must reach the build host."""
     return {
@@ -710,6 +705,7 @@ def _build_on_host(config: Config, commands: Any, target: Any,
         ],
     )
     return dataclasses.replace(run_result, step_artifacts=artifacts, plan=plan)
+
 
 def _build(config: Config, code: Any, build_target: Any) -> Any:
     targets = build_targets(config)
@@ -1163,7 +1159,6 @@ def _parser() -> argparse.ArgumentParser:
         help=("CUDA toolkit major.minor version; required for x86 "
               "--no-trt-containers (env: TRT_CI_CUDA_VERSION)"),
     )
-
     parser.add_argument(
         "--cuda-dir",
         type=PurePosixPath,
@@ -1220,7 +1215,6 @@ def _config(args: argparse.Namespace) -> Config:
     cuda_root = args.cuda_root
     if cuda_root is None and os.environ.get("TRT_CI_CUDA_ROOT"):
         cuda_root = PurePosixPath(os.environ["TRT_CI_CUDA_ROOT"])
-
     cuda_dir = args.cuda_dir
     if cuda_dir is None and os.environ.get("TRT_CI_CUDA_DIR"):
         cuda_dir = PurePosixPath(os.environ["TRT_CI_CUDA_DIR"])
@@ -1271,7 +1265,6 @@ def _config(args: argparse.Namespace) -> Config:
         cuda_root=cuda_root,
         cuda_version=(args.cuda_version
                       or os.environ.get("TRT_CI_CUDA_VERSION")),
-
         cuda_dir=cuda_dir,
         cuda_target_dir=cuda_target_dir,
         run_python=args.run_python,
