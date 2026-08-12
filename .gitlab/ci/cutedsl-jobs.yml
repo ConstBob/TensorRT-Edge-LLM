@@ -30,12 +30,13 @@
 
 .cutedsl_builder_version:
   variables:
-    # Developers bump the component version manually when needed. Each pipeline
-    # appends its unique ID so concurrent pipelines cannot overwrite or consume
-    # one another's builder image.
+    # Developers bump the component version manually. The explicit prefix
+    # scopes project-wide registry cleanup to these ephemeral images, while the
+    # pipeline ID isolates concurrent pipelines.
     CUTE_DSL_BUILDER_VERSION: "4.6.1"
-    CUTE_DSL_BUILDER_TAG: "$CUTE_DSL_BUILDER_VERSION-$CI_PIPELINE_ID"
+    CUTE_DSL_BUILDER_TAG: "cutedsl-$CUTE_DSL_BUILDER_VERSION-pipeline-$CI_PIPELINE_ID"
     CUTE_DSL_BUILDER_IMAGE: "$CI_REGISTRY_IMAGE/cutedsl-kernel-builder:$CUTE_DSL_BUILDER_TAG"
+    CUTE_DSL_BUILDER_CACHE_IMAGE: "$CI_REGISTRY_IMAGE/cutedsl-kernel-builder-cache:buildkit"
 
 .cutedsl_artifact_base:
   stage: setup
@@ -49,25 +50,30 @@ build_cutedsl_docker_image:
     - .cutedsl_artifact_rules
     - .cutedsl_builder_version
   tags:
-    - cpu-k8s
+    - cpu-general-k8s
   image:
-    name: "gcr.io/kaniko-project/executor:debug"
+    name: "moby/buildkit:rootless"
     entrypoint: [""]
+  variables:
+    BUILDKITD_FLAGS: "--oci-worker-no-process-sandbox"
   script:
     - test "$CI_REGISTRY" = "gitlab-master.nvidia.com:5005"
     - test -n "$CI_REGISTRY_USER" && test -n "$CI_REGISTRY_PASSWORD"
     - |
       registry_auth="$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')"
-      mkdir -p /kaniko/.docker
+      mkdir -p "$HOME/.docker"
       printf '{"auths":{"%s":{"auth":"%s"}}}' \
-        "$CI_REGISTRY" "$registry_auth" > /kaniko/.docker/config.json
+        "$CI_REGISTRY" "$registry_auth" > "$HOME/.docker/config.json"
     - |
-      /kaniko/executor \
-        --context "$CI_PROJECT_DIR/kernelSrcs" \
-        --dockerfile "$CI_PROJECT_DIR/kernelSrcs/Dockerfile.cutedsl" \
-        --build-arg "CUTE_DSL_BUILDER_VERSION=$CUTE_DSL_BUILDER_VERSION" \
-        --cache=false \
-        --destination "$CUTE_DSL_BUILDER_IMAGE"
+      buildctl-daemonless.sh build \
+        --frontend dockerfile.v0 \
+        --local "context=$CI_PROJECT_DIR/kernelSrcs" \
+        --local "dockerfile=$CI_PROJECT_DIR/kernelSrcs" \
+        --opt "filename=Dockerfile.cutedsl" \
+        --opt "build-arg:CUTE_DSL_BUILDER_VERSION=$CUTE_DSL_BUILDER_VERSION" \
+        --import-cache "type=registry,ref=$CUTE_DSL_BUILDER_CACHE_IMAGE" \
+        --export-cache "type=registry,ref=$CUTE_DSL_BUILDER_CACHE_IMAGE,mode=max" \
+        --output "type=image,name=$CUTE_DSL_BUILDER_IMAGE,push=true"
   after_script:
     - !reference [.cleanup_engine_storage, after_script]
     - !reference [.record_runner_usage, after_script]
@@ -105,24 +111,3 @@ build_cutedsl_docker_matrix:
     paths:
       - kernelSrcs/cuteDSLPrebuilt/*.tar.gz
       - kernelSrcs/cuteDSLPrebuilt/*.tar.gz.sha256
-
-cleanup_cutedsl_docker_image:
-  stage: .post
-  extends:
-    - .cutedsl_artifact_rules
-    - .cutedsl_builder_version
-  needs:
-    - job: build_cutedsl_docker_matrix
-      artifacts: false
-  tags:
-    - cpu-k8s
-  image:
-    name: "gcr.io/go-containerregistry/crane:debug"
-    entrypoint: [""]
-  script:
-    - test -n "$CI_REGISTRY_USER" && test -n "$CI_REGISTRY_PASSWORD"
-    - crane auth login "$CI_REGISTRY" --username "$CI_REGISTRY_USER" --password "$CI_REGISTRY_PASSWORD"
-    - |
-      crane delete "$CUTE_DSL_BUILDER_IMAGE" || echo "CuTeDSL builder image was already absent: $CUTE_DSL_BUILDER_IMAGE"
-  when: always
-  interruptible: false

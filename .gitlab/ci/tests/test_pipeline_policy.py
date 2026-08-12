@@ -217,6 +217,8 @@ def test_only_superseded_mr_work_is_automatically_cancelled():
     assert all(rule["auto_cancel"]["on_new_commit"] == "interruptible"
                for rule in mr_rules)
 
+
+def test_environment_finalizers_are_non_interruptible():
     l0_finalizers = [
         job for job in _visible_jobs(SETUP_JOBS).values()
         if job.get("environment", {}).get("action") == "stop"
@@ -225,15 +227,10 @@ def test_only_superseded_mr_work_is_automatically_cancelled():
         job for job in _visible_jobs(L1_JOBS).values()
         if job.get("environment", {}).get("action") == "stop"
     ]
-    cutedsl_finalizers = [
-        job for job in _visible_jobs(CUTEDSL_JOBS).values()
-        if job.get("stage") == ".post" and job.get("when") == "always"
-    ]
     assert len(l0_finalizers) == 1
     assert l1_finalizers
-    assert cutedsl_finalizers
     assert all(job["interruptible"] is False
-               for job in l0_finalizers + l1_finalizers + cutedsl_finalizers)
+               for job in l0_finalizers + l1_finalizers)
 
 
 def test_ci_script_tests_are_blocking_for_every_supported_pipeline():
