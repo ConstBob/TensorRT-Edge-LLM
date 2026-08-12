@@ -29,6 +29,12 @@ from valid_precisions import (VALID_AUDIO_PRECISIONS, VALID_LLM_PRECISIONS,
                               VALID_LM_HEAD_PRECISIONS,
                               VALID_VISUAL_PRECISIONS)
 
+from .checkpoint_resolver import (is_direct_checkpoint_alias,
+                                  is_hf_checkpoint_id,
+                                  is_quantized_checkpoint_alias,
+                                  is_registered_checkpoint_alias,
+                                  resolve_checkpoint, resolve_checkpoint_alias)
+
 # Global configuration constants
 DEFAULT_SEARCH_DEPTH = 3
 
@@ -41,7 +47,17 @@ PRE_QUANTIZED_MODELS: frozenset = frozenset({
     "nvidia-Qwen3-30B-A3B-NVFP4",
     "nvidia-Gemma-4-31B-IT-NVFP4",
     "nvidia-Gemma-4-26B-A4B-NVFP4",
+    "Phi-4-multimodal-instruct-FP8",
 })
+
+
+def _hf_download_settings(
+        data_root: Optional[str]) -> tuple[bool, Optional[str]]:
+    allow_download = os.environ.get("EDGE_LLM_ALLOW_HF_DOWNLOAD", "1") != "0"
+    download_root = os.environ.get("HF_CHECKPOINT_DOWNLOAD_DIR")
+    if not download_root and data_root:
+        download_root = os.path.join(data_root, "checkpoints", "huggingface")
+    return allow_download, download_root
 
 
 def _find_directory(
@@ -261,162 +277,8 @@ class ParameterSpec:
             task_type, model_type) and self.is_required
 
 
-LLM_MODELS_DIR_MAP = {
-    "Qwen2.5-0.5B-Instruct":
-    "Qwen2.5-0.5B-Instruct",
-    "Qwen2.5-1.5B-Instruct":
-    "Qwen2.5-1.5B-Instruct",
-    "Qwen2.5-3B-Instruct":
-    "Qwen2.5-3B-Instruct",
-    "Qwen2.5-7B-Instruct":
-    "Qwen2.5-7B-Instruct",
-    "Qwen2.5-VL-3B-Instruct":
-    "Qwen2.5-VL-3B-Instruct",
-    "Qwen2.5-VL-7B-Instruct":
-    "Qwen2.5-VL-7B-Instruct",
-    "Qwen2-VL-2B-Instruct":
-    "Qwen2-VL-2B-Instruct",
-    "InternVL3-1B":
-    "InternVL3-1B-hf",
-    "InternVL3-2B":
-    "InternVL3-2B-hf",
-    "Llama-3.1-8B-Instruct":
-    "llama-3.1-model/Llama-3.1-8B-Instruct",
-    "Llama-3.2-1B":
-    "llama-3.2-models/Llama-3.2-1B",
-    "Llama-3.2-3B":
-    "llama-3.2-models/Llama-3.2-3B",
-    "Qwen3-0.6B":
-    "Qwen3/Qwen3-0.6B",
-    "Qwen3-1.7B":
-    "Qwen3/Qwen3-1.7B",
-    "Qwen3-4B": [
-        "Qwen/Qwen3-4B",
-        "Qwen3/Qwen3-4B",
-    ],
-    "Qwen3-8B":
-    "Qwen3/Qwen3-8B",
-    "Qwen3-4B-Instruct-2507":
-    "Qwen3/Qwen3-4B-Instruct-2507",
-    "Qwen3-VL-2B-Instruct":
-    "Qwen3/Qwen3-VL-2B-Instruct",
-    "Qwen3-VL-4B-Instruct":
-    "Qwen3/Qwen3-VL-4B-Instruct",
-    "Qwen3-VL-8B-Instruct":
-    "Qwen3/Qwen3-VL-8B-Instruct",
-    "Qwen3.5-0.8B":
-    "Qwen3.5-0.8B",
-    "Qwen3.5-2B":
-    "Qwen3.5-2B",
-    "Qwen3.5-4B":
-    "Qwen3.5-4B",
-    "Qwen3.5-9B":
-    "Qwen3.5-9B",
-    "Qwen3.5-27B":
-    "Qwen3.5-27B",
-    "Qwen3.6-27B":
-    "Qwen3.6-27B",
-    "Qwen3.8-27B":
-    "Qwen3.8-27B",
-    # Gemma4 E-models. CI runners may see the public base checkpoint under
-    # /scratch.trt_llm_data/llm-models/gemma, while paired MTP assistant
-    # checkpoints are usually staged under /scratch.edge_llm_cache/source_models.
-    "gemma-4-E2B-it": [
-        "gemma/gemma-4-E2B-it",
-        "source_models/gemma-4-E2B-it",
-        "gemma-4-E2B-it",
-    ],
-    "gemma-4-E4B-it":
-    "gemma/gemma-4-E4B-it",
-    "gemma-4-12B-it":
-    "gemma/gemma-4-12B-it",
-    "gemma-4-31B-it":
-    "gemma/gemma-4-31B-it",
-    "gemma-4-26B-A4B-it":
-    "gemma/gemma-4-26B-A4B-it",
-    "Phi-4-multimodal-instruct":
-    "Phi-4-multimodal-instruct",
-    "Alpamayo-R1-10B":
-    "Alpamayo-R1-10B",
-    # Pre-quantized models in llm_models_dir
-    "Llama-3.2-1B-FP8":
-    "llama-3.2-models/Llama-3.2-1B-FP8",
-    "Phi-4-FP8":
-    "Phi-4-FP8",
-    "Phi-4-multimodal-instruct-FP8":
-    "Phi-4-multimodal-instruct-FP8",
-    # ASR and TTS models
-    "Qwen3-ASR-0.6B":
-    "Qwen3/Qwen3-ASR-0.6B",
-    "Qwen3-TTS-12Hz-0.6B-CustomVoice":
-    "Qwen3/Qwen3-TTS-12Hz-0.6B-CustomVoice",
-    # Nemotron-H 30B (BF16 base + pre-quantized NVFP4)
-    "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16":
-    "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
-    # Pre-quantized NVFP4 model: exported directly without quantization step
-    "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4":
-    "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
-    "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4":
-    "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
-    "NVIDIA-Nemotron-3-Nano-4B-BF16":
-    "NVIDIA-Nemotron-3-Nano-4B-BF16",
-    "NVIDIA-Nemotron-3-Nano-4B-FP8":
-    "NVIDIA-Nemotron-3-Nano-4B-FP8",
-    # Nemotron-Nano 9B v2 family (BF16 base + FP8/NVFP4 pre-quantized
-    # variants all live under llm_models_dir/, not edge_llm_cache/).
-    "NVIDIA-Nemotron-Nano-9B-v2":
-    "NVIDIA-Nemotron-Nano-9B-v2",
-    "NVIDIA-Nemotron-Nano-9B-v2-FP8":
-    "NVIDIA-Nemotron-Nano-9B-v2-FP8",
-    "NVIDIA-Nemotron-Nano-9B-v2-NVFP4":
-    "NVIDIA-Nemotron-Nano-9B-v2-NVFP4",
-    # Cosmos VLM
-    "Cosmos-Reason2-8B":
-    "Cosmos-Reason2-8B",
-    # Qwen3.5/3.6 35B-A3B (BF16 base; GPTQ-Int4 / NVFP4 variants in GPTQ map)
-    "Qwen3.5-35B-A3B":
-    "Qwen3.5-35B-A3B",
-    "Qwen3.6-35B-A3B":
-    "Qwen3.6-35B-A3B",
-    # ASR / TTS larger variants (1.7B family)
-    "Qwen3-ASR-1.7B":
-    "Qwen3/Qwen3-ASR-1.7B",
-    "Qwen3-TTS-12Hz-1.7B-CustomVoice":
-    "Qwen3/Qwen3-TTS-12Hz-1.7B-CustomVoice",
-}
-
-GPTQ_MODELS_DIR_MAP = {
-    "Qwen2.5-7B-Instruct-GPTQ-Int4": "Qwen2.5-7B-Instruct-GPTQ-Int4",
-    "InternVL3-1B-GPTQ-Int4": "InternVL3-1B-hf-GPTQ-Int4",
-    # GPTQ-Int4 large MoE variants
-    "Qwen3-30B-A3B-GPTQ-Int4": "Qwen3-30B-A3B-GPTQ-Int4",
-    # NVFP4 MoE (pre-quantized, no quantization step needed)
-    "Qwen3-30B-A3B-NVFP4": "Qwen3-30B-A3B-NVFP4",
-    "nvidia-Qwen3-30B-A3B-NVFP4": "Qwen3/nvidia-Qwen3-30B-A3B-NVFP4",
-    "Qwen3.5-35B-A3B-GPTQ-Int4": "Qwen3.5-35B-A3B-GPTQ-Int4",
-    "Qwen3.6-35B-A3B-NVFP4": "Qwen3.6-35B-A3B-NVFP4",
-    "nvidia-Gemma-4-31B-IT-NVFP4": "nvidia-Gemma-4-31B-IT-NVFP4",
-    "nvidia-Gemma-4-26B-A4B-NVFP4": "nvidia-Gemma-4-26B-A4B-NVFP4",
-    # Multimodal pre-quantized NVFP4 (LLM + visual + audio).  Test list
-    # uses ``Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4`` as the
-    # canonical name; verify the on-disk dir matches before running.
-    "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4":
-    "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4",
-    "NVIDIA-Nemotron-3-Nano-4B-NVFP4": "NVIDIA-Nemotron-3-Nano-4B-NVFP4",
-    # Pre-quantized unified checkpoints (edge_llm_cache/quantized_models/)
-    "Qwen2.5-0.5B-Instruct-FP8": "Qwen2.5-0.5B-Instruct-FP8",
-    "Qwen2.5-0.5B-Instruct-FP8-KV": "Qwen2.5-0.5B-Instruct-FP8-KV",
-    "Qwen2.5-0.5B-Instruct-NVFP4": "Qwen2.5-0.5B-Instruct-NVFP4",
-    "Qwen3-0.6B-FP8": "Qwen3-0.6B-FP8",
-    "Qwen3-0.6B-INT8-SQ": "Qwen3-0.6B-INT8-SQ",
-    "Qwen3-1.7B-FP8": "Qwen3-1.7B-FP8",
-    "Qwen3-1.7B-NVFP4": "Qwen3-1.7B-NVFP4",
-    "Qwen3.5-4B-NVFP4": "Qwen3.5-4B-NVFP4",
-    "Qwen3-VL-4B-Instruct-NVFP4": "Qwen3-VL-4B-Instruct-NVFP4",
-    "Qwen3-VL-2B-Instruct-INT4-AWQ": "Qwen3-VL-2B-Instruct-INT4-AWQ",
-}
-
 # Base model + EAGLE ``draft_model_id`` -> draft checkpoint folder name.
+
 # Single source of truth shared by ``_draft_model_dir_name`` (torch dir lookup)
 # and ``get_quantized_draft_checkpoint_dir_name`` (hub pre-quant folder name) so
 # the two cannot diverge.
@@ -533,6 +395,17 @@ GEMMA4_MTP_ASSISTANT_MODELS_MAP = {
 MODEL_NAME_TO_DSPARK_DRAFT_MODELS_MAP = {
     "Qwen3-4B": {
         "block7": "deepseek-ai/dspark_qwen3_4b_block7",
+    },
+    "Qwen3-8B": {
+        "block7": "deepseek-ai/dspark_qwen3_8b_block7",
+    },
+    # The 2507 checkpoint keeps the Qwen3-4B architecture contract used by
+    # the public block7 draft and is available pre-quantized in CI.
+    "Qwen3-4B-Instruct-2507": {
+        "block7": "deepseek-ai/dspark_qwen3_4b_block7",
+    },
+    "gemma-4-12B-it": {
+        "block7": "deepseek-ai/dspark_gemma4_12b_block7",
     },
 }
 
@@ -1718,105 +1591,51 @@ class TestConfig:
 
     def get_torch_model_dir(self) -> str:
         """Resolve torch/hub checkpoint; prefers hub pre-quantized when present."""
-        return self._resolve_torch_model_dir(prefer_hub_quant=True)
+        return self._resolve_torch_model_dir(prefer_quantized=True)
 
     def get_base_torch_model_dir(self) -> str:
         """FP16 (or GPTQ) torch checkpoint used as quantization input."""
-        return self._resolve_torch_model_dir(prefer_hub_quant=False)
+        return self._resolve_torch_model_dir(prefer_quantized=False)
 
-    def _resolve_torch_model_dir(self, *, prefer_hub_quant: bool) -> str:
-        """
-        Get torch model directory path using dynamic search.
-        
-        Searches for the model directory under llm_models_dir.
-        
-        Raises:
-            ValueError: If llm_models_dir is not set or model directory is not found
-        """
-
-        # Determine search directory and model path. A map entry may be either
-        # a single directory name (str) or a list of candidates — useful when
-        # the same model ships under multiple folder names (e.g. ``InternVL3-1B``
-        # as ``InternVL3-1B-hf`` or ``InternVL3-1B``).
+    def _resolve_torch_model_dir(self, *, prefer_quantized: bool) -> str:
+        """Resolve a checkpoint through the CI provenance inventory."""
+        allow_download, download_root = _hf_download_settings(
+            self.edgellm_data_dir)
         base_model_name = self._strip_model_quant_suffixes(self.model_name)
-        use_torch_base = (not prefer_hub_quant
-                          and base_model_name != self.model_name
-                          and base_model_name in LLM_MODELS_DIR_MAP)
-        use_torch_gptq = (not prefer_hub_quant
-                          and self.llm_precision == "int4_gptq"
-                          and base_model_name in GPTQ_MODELS_DIR_MAP)
+        alias = base_model_name
+        quantized_variant = None
 
-        if use_torch_base:
-            search_dir = self.llm_models_dir
-            entry = LLM_MODELS_DIR_MAP[base_model_name]
-            candidates = [entry] if isinstance(entry, str) else list(entry)
-        elif use_torch_gptq:
-            search_dir = self.edgellm_data_dir
-            entry = GPTQ_MODELS_DIR_MAP[base_model_name]
-            candidates = [entry] if isinstance(entry, str) else list(entry)
-        elif self.model_name in GPTQ_MODELS_DIR_MAP:
-            search_dir = self.edgellm_data_dir
-            entry = GPTQ_MODELS_DIR_MAP[self.model_name]
-            candidates = [entry] if isinstance(entry, str) else list(entry)
-        elif self.model_name in LLM_MODELS_DIR_MAP:
-            search_dir = self.llm_models_dir
-            entry = LLM_MODELS_DIR_MAP[self.model_name]
-            candidates = [entry] if isinstance(entry, str) else list(entry)
-        else:
-            # Map by base model name, not precision suffixes.
-            # For a pre-quantized variant the precision suffix MUST be matched
-            # in the dir name — otherwise we'd silently fall back to the
-            # unquantized base model and produce an ONNX whose contents
-            # contradict its dir name (e.g. ``llm-fp8-lmfp8/`` with FP16
-            # weights). Restrict candidates to the exact model_name so a
-            # missing pre-quant checkpoint fails loud here instead of being
-            # papered over by the fp16 base.
-            base_model_name = self._strip_model_quant_suffixes(self.model_name)
-            if base_model_name in LLM_MODELS_DIR_MAP:
-                search_dir = self.llm_models_dir
-                candidates = [self.model_name]
-            elif base_model_name in GPTQ_MODELS_DIR_MAP:
-                search_dir = self.edgellm_data_dir
-                candidates = [self.model_name]
+        if not prefer_quantized:
+            if (self.llm_precision == "int4_gptq"
+                    or not is_registered_checkpoint_alias(base_model_name)):
+                alias = self.model_name
+        elif self.model_name != base_model_name:
+            direct_prequantized = (
+                self.model_name in PRE_QUANTIZED_MODELS
+                or (is_direct_checkpoint_alias(self.model_name)
+                    and not is_quantized_checkpoint_alias(self.model_name)))
+            if direct_prequantized:
+                alias = self.model_name
             else:
-                all_models = list(LLM_MODELS_DIR_MAP.keys()) + list(
-                    GPTQ_MODELS_DIR_MAP.keys())
-                raise ValueError(
-                    f"Unsupported model name: '{self.model_name}'. "
-                    f"Supported models: {', '.join(all_models)}")
+                quantized_variant = self.get_quantized_checkpoint_dir_name()
+        else:
+            quantized_variant = self.get_quantized_checkpoint_dir_name()
 
-        # Keep candidate order but remove duplicates.
-        candidates = list(dict.fromkeys(candidates))
+        if (quantized_variant and is_direct_checkpoint_alias(quantized_variant)
+                and not is_quantized_checkpoint_alias(quantized_variant)):
+            alias = quantized_variant
+            quantized_variant = None
 
-        if prefer_hub_quant:
-            checkpoint_dir_name = self.get_quantized_checkpoint_dir_name()
-            if checkpoint_dir_name:
-                if self.model_name == base_model_name:
-                    candidates = [checkpoint_dir_name]
-                elif checkpoint_dir_name not in candidates:
-                    candidates.insert(0, checkpoint_dir_name)
-
-        # Resolve across both model roots to tolerate environment differences
-        # (some setups map pre-quantized checkpoints under llm_models_dir, some
-        # under edgellm_data_dir).
-        search_roots = [search_dir]
-        for fallback_root in (self.llm_models_dir, self.edgellm_data_dir):
-            if fallback_root and fallback_root not in search_roots:
-                search_roots.append(fallback_root)
-
-        for root in search_roots:
-            for model_dir_name in candidates:
-                model_dir = _find_directory(root,
-                                            model_dir_name,
-                                            DEFAULT_SEARCH_DEPTH,
-                                            require_files=_HF_CHECKPOINT_FILES)
-                if model_dir:
-                    return model_dir
-
-        raise ValueError(
-            f"Model directory not found: none of {candidates} under any of "
-            f"{search_roots} (search depth {DEFAULT_SEARCH_DEPTH}, "
-            f"requiring config.json + *.safetensors)")
+        return resolve_checkpoint(
+            alias,
+            torch_roots=tuple(filter(None, (self.llm_models_dir, ))),
+            quantized_root=(os.environ.get("QUANT_CHECKPOINT_DIR")
+                            or self.edgellm_data_dir),
+            managed_roots=tuple(filter(None, (self.edgellm_data_dir, ))),
+            quantized_variant=quantized_variant,
+            allow_download=allow_download,
+            download_root=download_root,
+        )
 
     def is_prequantized(self) -> bool:
         """Model is pre-quantized if its name contains the precision suffix."""
@@ -1958,6 +1777,28 @@ class TestConfig:
 
     def _resolve_draft_model_dir(self, candidates: list[str],
                                  search_roots: list[str]) -> str:
+        registered_error = None
+        allow_download, download_root = _hf_download_settings(
+            self.edgellm_data_dir)
+        for candidate in candidates:
+            try:
+                resolved = resolve_checkpoint_alias(
+                    candidate,
+                    torch_roots=search_roots,
+                    quantized_root=(os.environ.get("QUANT_CHECKPOINT_DIR")
+                                    or self.edgellm_data_dir),
+                    managed_roots=tuple(filter(None,
+                                               (self.edgellm_data_dir, ))),
+                    allow_download=allow_download,
+                    download_root=download_root,
+                )
+                if resolved:
+                    return resolved
+            except ValueError as error:
+                registered_error = error
+
+        # Protected draft checkpoints have no public inventory entry. Keep
+        # their existing local-only lookup without exposing their provenance.
         for root in search_roots:
             for candidate in candidates:
                 model_dir = _find_directory(
@@ -1968,6 +1809,8 @@ class TestConfig:
                 )
                 if model_dir:
                     return model_dir
+        if registered_error:
+            raise registered_error
         raise ValueError(
             f"Draft model directory not found: none of {candidates} under "
             f"{search_roots} (requiring config.json + *.safetensors)")
@@ -2064,19 +1907,17 @@ class TestConfig:
     def get_onnx_base_dir(self) -> str:
         """Get ONNX model base directory.
 
-        A pre-quantized variant registered under its own name in
-        LLM_MODELS_DIR_MAP / GPTQ_MODELS_DIR_MAP keeps that full name
-        (precision suffix included) so the ONNX dir matches the registered
-        source checkpoint folder and get_engine_base_dir. A variant resolved
-        only via the base-model fallback (model_name is not a registered key)
-        uses the stripped base name; its precision lives in the llm-<prec>
-        subdir.
+        A registered pre-quantized variant keeps its full name so the ONNX
+        directory matches the source checkpoint and engine directory. Other
+        variants use the stripped base name; their precision lives in the
+        ``llm-<precision>`` subdirectory.
         """
         if not self.onnx_dir:
             raise ValueError("onnx_dir not set")
-        if (self.model_name in LLM_MODELS_DIR_MAP
-                or self.model_name in GPTQ_MODELS_DIR_MAP):
+        if is_registered_checkpoint_alias(self.model_name):
             name = self.model_name
+        elif is_hf_checkpoint_id(self.model_name):
+            name = self.model_name.rsplit("/", maxsplit=1)[-1]
         else:
             name = self._strip_model_quant_suffixes(self.model_name)
         return os.path.join(self.onnx_dir, name)

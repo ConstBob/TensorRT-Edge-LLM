@@ -3,9 +3,12 @@ variables:
   EDGE_LLM_CACHE_DIR: "/scratch.edge_llm_cache"
   RUNNER_USAGE_DIR: "$EDGE_LLM_CACHE_DIR/runner_usage"
   TORCH_DIR: "/scratch.trt_llm_data/llm-models"
+  HF_CHECKPOINT_DOWNLOAD_DIR: "$EDGE_LLM_CACHE_DIR/checkpoints/huggingface"
+  HF_HOME: "$HF_CHECKPOINT_DOWNLOAD_DIR/.cache"
+  EDGE_LLM_ALLOW_HF_DOWNLOAD: "1"
   # Pre-quantized checkpoint store (export jobs read pre-quant models from here).
   # Bump the modelopt version here to roll all L1 export jobs forward at once.
-  QUANT_CHECKPOINT_DIR: "/scratch.edge_llm_data/modelopt-0.45.0/quantization_checkpoint"
+  QUANT_CHECKPOINT_DIR: "/scratch.edge_llm_data/onnx_models/modelopt-0.45.0/quantization_checkpoint"
   TRT_VERSION: "10.16.0.72"
   TRT_WHEEL_GLOB: "tensorrt-$TRT_VERSION*-cp312*"
   TRT10_X86_VERSION: "10.16.0.72"
