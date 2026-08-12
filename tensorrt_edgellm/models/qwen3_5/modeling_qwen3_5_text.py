@@ -216,6 +216,11 @@ class GdnMixer(nn.Module):
         if hasattr(self, "in_proj_fused"):
             fused_out = self.in_proj_fused(hidden_states)
             mixed_qkv, z, b, a = fused_out.split(self._fused_splits, dim=-1)
+        elif hasattr(self, "in_proj_qkvz"):
+            qkvz_out = self.in_proj_qkvz(hidden_states)
+            mixed_qkv, z = qkvz_out.split(self._fused_splits[:2], dim=-1)
+            ba_out = self.in_proj_ba(hidden_states)
+            b, a = ba_out.split(self._fused_splits[2:], dim=-1)
         else:
             mixed_qkv = self.in_proj_qkv(hidden_states)
             z = self.in_proj_z(hidden_states)
@@ -796,6 +801,45 @@ def fuse_gdn_input_projections(model: nn.Module) -> int:
             pass  # always fusible
         elif is_nvfp4_linear(first_proj):
             if not _can_fuse_nvfp4_scales(mixer):
+                # Mixed layout (NVFP4 qkv/z + unquantized FP16 b/a): fuse
+                # same-dtype pairs only — qkv+z into one NVFP4 GEMM, b+a
+                # into one FP16 GEMM.  Pure concatenation, no re-quantization.
+                qkv, zp = mixer.in_proj_qkv, mixer.in_proj_z
+                bp, ap = mixer.in_proj_b, mixer.in_proj_a
+                pairable = (is_nvfp4_linear(zp) and isinstance(bp, FP16Linear)
+                            and isinstance(ap, FP16Linear) and all(
+                                torch.equal(getattr(qkv, s), getattr(zp, s))
+                                for s in _NVFP4_SCALAR_SCALE_SUFFIXES))
+                if pairable:
+                    splits = mixer._fused_splits
+                    method = NVFP4LinearMethod(
+                        group_size=qkv.quant_method.group_size)
+                    qkvz = ReplicatedLinear(qkv.in_features,
+                                            splits[0] + splits[1],
+                                            bias=False,
+                                            dtype=torch.float16,
+                                            mapping=qkv.mapping,
+                                            quant_method=method)
+                    qkvz._buffers["weight"] = torch.cat(
+                        [qkv.weight, zp.weight], dim=0)
+                    qkvz._buffers["weight_scale"] = torch.cat(
+                        [qkv.weight_scale, zp.weight_scale], dim=0)
+                    qkvz._buffers["weight_scale_2"] = \
+                        qkv.weight_scale_2.clone()
+                    qkvz._buffers["input_scale"] = qkv.input_scale.clone()
+                    ba = FP16Linear(qkv.in_features, splits[2] + splits[3])
+                    ba.weight = nn.Parameter(torch.cat(
+                        [bp.weight.data, ap.weight.data], dim=0),
+                                             requires_grad=False)
+                    mixer.in_proj_qkvz = qkvz
+                    mixer.in_proj_ba = ba
+                    for proj_name in _GDN_PROJ_NAMES:
+                        delattr(mixer, proj_name)
+                    fused_count += 1
+                    logger.debug(
+                        "Pair-fused GDN projections (NVFP4 qkvz + FP16 ba) "
+                        "for %s", name)
+                    continue
                 logger.warning(
                     "GDN fusion skipped for %s: NVFP4 scalar scales "
                     "differ across projections. Re-quantize with "

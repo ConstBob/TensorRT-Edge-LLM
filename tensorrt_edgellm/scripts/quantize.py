@@ -126,6 +126,13 @@ def main():
 
     llm_parser = sub.add_parser("llm", help="Quantize an LLM")
     llm_parser.add_argument("--model_dir", required=True)
+    llm_parser.add_argument(
+        "--fuse_gdn_qkvzba_scales",
+        action="store_true",
+        help=("NVFP4 hybrid-GDN models only: also quantize the small GDN "
+              "in_proj_b/in_proj_a projections (disabled by stock ModelOpt "
+              ">=0.45 configs) and share in_proj_qkv's per-tensor scales so "
+              "export fuses qkv/z/b/a into a single NVFP4 GEMM."))
     _add_common_args(llm_parser)
 
     draft_parser = sub.add_parser(
@@ -153,6 +160,7 @@ def main():
             image_dataset=args.image_dataset,
             audio_dataset=args.audio_dataset,
             num_samples=args.num_samples,
+            fuse_gdn_qkvzba_scales=args.fuse_gdn_qkvzba_scales,
         )
     elif args.command == "draft":
         if _is_dflash_or_jetspec_draft(args.draft_model_dir):
