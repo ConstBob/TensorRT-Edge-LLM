@@ -15,10 +15,22 @@
 
 cmake_minimum_required(VERSION 3.20 FATAL_ERROR)
 
+option(EDGELLM_PYTHON_ONLY_WHEEL
+       "Configure only the Python sources for the wheel fan-in base" OFF)
+if(EDGELLM_PYTHON_ONLY_WHEEL)
+  set(_EDGELLM_PROJECT_LANGUAGES NONE)
+else()
+  set(_EDGELLM_PROJECT_LANGUAGES C CXX CUDA)
+endif()
+
 project(
   tensorrt_edgellm_sdk
   VERSION 0.10.0
-  LANGUAGES C CXX CUDA)
+  LANGUAGES ${_EDGELLM_PROJECT_LANGUAGES})
+
+if(EDGELLM_PYTHON_ONLY_WHEEL)
+  return()
+endif()
 
 # Specify the C++ standard and flags
 set(CMAKE_CXX_STANDARD 17)

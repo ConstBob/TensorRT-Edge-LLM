@@ -261,6 +261,7 @@ def test_tarball_builder_docker_matrix_matches_ci_targets():
 
     assert matrix.split(",") == [
         "x86_64:sm_80:13",
+        "x86_64:sm_86:13",
         "x86_64:sm_90:13",
         "x86_64:sm_100:13",
         "x86_64:sm_120:13",
