@@ -1220,10 +1220,13 @@ size_t AttentionPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, 
 
 int32_t AttentionPlugin::getAliasedInput(int32_t outputIndex) noexcept
 {
-    if (outputIndex == kOUT_KV_CACHE_IDX)
-    {
-        return kIN_KV_CACHE_IDX;
-    }
+    // WAR:this is not the correct plugin API usage. The
+    // plugin updates the KV cache in place, so the correct return is
+    // kIN_KV_CACHE_IDX (output kOUT_KV_CACHE_IDX aliases that input). We return -1
+    // to drop the alias because declaring it makes Myelin keep a redundant
+    // per-layer KV copy (the perf regression). In-place read-write still works
+    // because the runtime binds past and present KV to the same address. TODO:
+    // restore the alias declaration once the Myelin issue is fixed.
     return -1;
 }
 
