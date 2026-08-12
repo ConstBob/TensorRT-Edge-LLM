@@ -59,11 +59,12 @@ import torch.nn.functional as F
 
 from ...config import LAYER_GDN, GdnConfig, ModelConfig
 from ..default.modeling_default import MLP, OnnxSpec, RMSNorm
-from ..linear import (FP16Linear, NVFP4LinearMethod, ReplicatedLinear,
-                      is_nvfp4_linear, make_linear)
+from ..linear import (AWQLinear, FP16Linear, GPTQLinear,
+                      ModelOptAWQPrepackedLinear, NVFP4LinearMethod,
+                      ReplicatedLinear, is_nvfp4_linear, make_linear)
 from ..ops import (KV_PAGE_SIZE, attention_plugin, causal_conv1d,
                    causal_conv1d_with_intermediate, gated_delta_net,
-                   gated_delta_net_with_intermediate)
+                   gated_delta_net_with_intermediate, int4_gemm_plugin_version)
 
 __all__ = ["Qwen3_5CausalLM"]
 
@@ -362,6 +363,9 @@ class GatedAttention(nn.Module):
                                   num_kv_heads * head_dim,
                                   bias=config.attention_bias,
                                   module_name=f"{module_prefix}.v_proj")
+        self._materialize_int4_v = (isinstance(
+            self.v_proj, (AWQLinear, GPTQLinear, ModelOptAWQPrepackedLinear))
+                                    and int4_gemm_plugin_version() == 2)
 
         if self.enable_fp8_kv_cache:
             self.q_proj.register_buffer("q_scale", torch.ones(1))
@@ -399,6 +403,14 @@ class GatedAttention(nn.Module):
 
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
+
+        if self._materialize_int4_v:
+            # A direct V2 plugin -> Concat edge lets TRT virtualize the plugin
+            # output as a strided slice, although the plugin's LINEAR output is
+            # contiguous.  This live-row mask is exactly one for valid requests
+            # and gives TRT a native producer that can honor the Concat stride.
+            active_rows = (context_lengths > 0).to(value_states.dtype)
+            value_states = value_states * active_rows.reshape(batch_size, 1, 1)
 
         # QK norm (on reshaped per-head tensors)
         query_states = self.q_norm(query_states)
