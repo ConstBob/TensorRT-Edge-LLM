@@ -74,7 +74,7 @@ from pathlib import Path
 
 _SCRIPT_DIR = Path(__file__).parent.resolve()
 _DEFAULT_OUTPUT_DIR = (_SCRIPT_DIR / "../cpp/kernels/cuteDSLArtifact").resolve()
-_CUTLASS_DSL_VERSION = os.environ.get("CUTE_DSL_VERSION", "4.6.1")
+_CUTLASS_DSL_VERSION = os.environ.get("CUTE_DSL_VERSION", "4.7.0")
 _CUPY_VERSIONS = {12: ("cupy-cuda12x", "12.3.0"), 13: ("cupy-cuda13x", "13.6.0")}
 # Common flag sets for FMHA variants
 _LLM = ["--is_causal", "--is_persistent", "--export_only", "--bottom_right_align"]
@@ -1898,7 +1898,7 @@ def check_dependencies(sm=None, selected_groups=None, cuda_ver=None):
         lib_dir, ver = None, "unknown"
 
     # Verify that the package loader selected the requested compiler backend.
-    # CuTe DSL 4.6 can contain both cu12 and cu13 binaries, but it otherwise
+    # CuTe DSL can contain both cu12 and cu13 binaries, but it otherwise
     # chooses the newest flavor supported by the driver. Probe in a child
     # process so importing the MLIR runtime does not affect later process-pool
     # workers.
