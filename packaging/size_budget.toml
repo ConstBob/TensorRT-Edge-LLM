@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version = 1
+
+# Initial conservative gates. Maintainers must replace them with
+# measured, reviewed values after the full first matrix build.
+[wheel]
+compressed_bytes = 4294967296
+unpacked_bytes = 8589934592
+
+[payload]
+unpacked_bytes = 1073741824

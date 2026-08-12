@@ -276,4 +276,8 @@ endif()
 
 if(BUILD_PYTHON_BINDINGS)
   add_subdirectory(experimental/pybind)
+  if(DEFINED EDGELLM_WHEEL_PAYLOAD_DIR AND NOT EDGELLM_WHEEL_PAYLOAD_DIR
+                                           STREQUAL "")
+    include(${CMAKE_SOURCE_DIR}/packaging/cmake/InstallWheel.cmake)
+  endif()
 endif()

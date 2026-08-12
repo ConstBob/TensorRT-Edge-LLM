@@ -286,6 +286,7 @@ function(cute_dsl_setup)
         "Artifacts are generated locally under:\n"
         "  cpp/kernels/cuteDSLArtifact/<arch>/<artifact_tag>/")
   endif()
+  set_property(GLOBAL PROPERTY EDGELLM_CUTE_DSL_STATIC_LIBRARY "${_static_lib}")
 
   if(NOT EXISTS "${_metadata}")
     message(FATAL_ERROR "metadata.json not found in ${_artifact_dir}/\n"

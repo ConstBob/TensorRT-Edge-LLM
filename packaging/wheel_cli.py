@@ -21,7 +21,7 @@ import subprocess
 import sys
 from typing import Callable, Dict, Optional, Sequence
 
-from wheellib import base, source
+from wheellib import base, cutedsl, payload, source, verify
 from wheellib.config import REPO_ROOT, load_matrix
 
 
@@ -36,6 +36,9 @@ def main(values: Optional[Sequence[str]] = None) -> int:
         "validate-source": source.main,
         "validate-matrix": _validate_matrix,
         "build-base": base.main,
+        "prepare-cutedsl": cutedsl.main,
+        "build-payload": payload.main,
+        "verify-payload": verify.main,
     }
     if not arguments or arguments[0] not in commands:
         available = ", ".join(sorted(commands))
