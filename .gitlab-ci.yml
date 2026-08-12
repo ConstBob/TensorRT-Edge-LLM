@@ -70,6 +70,8 @@ include:
   - local: '.gitlab/ci/precheck-jobs.yml'
   - local: '.gitlab/ci/setup-jobs.yml'
   - local: '.gitlab/ci/cutedsl-jobs.yml'
+  - local: '.gitlab/ci/wheel-jobs.yml'
+  - local: '.gitlab/ci/wheel-generated.yml'
   - local: '.gitlab/ci/l0-jobs.yml'
   - local: '.gitlab/ci/l1-jobs.yml'
   - local: '.gitlab/ci/sonar-jobs.yml'
@@ -83,6 +85,8 @@ include:
 stages:
 - precheck
 - setup
+- wheel-build
+- wheel-assemble
 - l0_test
 - l1_test
 - sonar

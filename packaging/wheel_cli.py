@@ -17,11 +17,12 @@
 
 from __future__ import annotations
 
+import argparse
 import subprocess
 import sys
 from typing import Callable, Dict, Optional, Sequence
 
-from wheellib import assemble, base, cutedsl, payload, source, verify
+from wheellib import assemble, base, ci, cutedsl, payload, source, verify
 from wheellib.config import REPO_ROOT, load_matrix
 
 
@@ -29,17 +30,53 @@ def _validate_matrix(_: Sequence[str]) -> None:
     load_matrix(REPO_ROOT / "packaging" / "variants.toml")
 
 
+def _generate_ci(values: Sequence[str]) -> None:
+    parser = argparse.ArgumentParser(prog="wheel_cli.py generate-ci")
+    parser.add_argument("--check", action="store_true")
+    args = parser.parse_args(values)
+    ci.generate_ci(check=args.check)
+
+
+def _no_arguments(function: Callable[[], None], values: Sequence[str]) -> None:
+    if values:
+        raise RuntimeError(f"This command takes no arguments: {values}.")
+    function()
+
+
 def main(values: Optional[Sequence[str]] = None) -> int:
     """Dispatch one supported packaging or CI command."""
     arguments = list(values if values is not None else sys.argv[1:])
     commands: Dict[str, Callable[[Sequence[str]], None]] = {
-        "validate-source": source.main,
-        "validate-matrix": _validate_matrix,
-        "build-base": base.main,
-        "prepare-cutedsl": cutedsl.main,
-        "build-payload": payload.main,
-        "verify-payload": verify.main,
-        "assemble": assemble.main,
+        "validate-source":
+        source.main,
+        "validate-matrix":
+        _validate_matrix,
+        "generate-ci":
+        _generate_ci,
+        "build-base":
+        base.main,
+        "prepare-cutedsl":
+        cutedsl.main,
+        "build-payload":
+        payload.main,
+        "verify-payload":
+        verify.main,
+        "assemble":
+        assemble.main,
+        "ci-precheck":
+        lambda args: _no_arguments(ci.precheck, args),
+        "ci-build-base":
+        lambda args: _no_arguments(ci.build_base_ci, args),
+        "ci-build-payload":
+        lambda args: _no_arguments(ci.build_payload_ci, args),
+        "ci-assemble":
+        lambda args: _no_arguments(ci.assemble_ci, args),
+        "ci-integration":
+        lambda args: _no_arguments(ci.integration_ci, args),
+        "ci-heterogeneous-boundary":
+        lambda args: _no_arguments(ci.heterogeneous_boundary_ci, args),
+        "ci-integration-gate":
+        lambda args: _no_arguments(ci.integration_gate, args),
     }
     if not arguments or arguments[0] not in commands:
         available = ", ".join(sorted(commands))
