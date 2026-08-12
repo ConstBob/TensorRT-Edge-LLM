@@ -1,5 +1,77 @@
 # Installation
 
+## CI-built wheel installation
+
+TensorRT Edge-LLM CI assembles one x86_64 and one aarch64 wheel for each
+supported CPython minor version. Each wheel contains the checkpoint/export
+frontend, the `tensorrt-edgellm-build` engine builder, the Python runtime API,
+and every qualified native payload for that CPU architecture. Payload selection
+happens at runtime; users do not choose an SM during installation.
+
+CUDA, the NVIDIA driver, a compatible TensorRT runtime and TensorRT Python
+binding, and model checkpoints remain platform prerequisites and are not copied
+into the EdgeLLM wheel. See the
+[wheel qualification table](support-matrix.md#wheel-qualification) for exact
+platform rows.
+
+### Install a wheel artifact
+
+After `wheel_integration_gate` succeeds, download the matching wheel from the
+`wheel_assemble` job artifacts and install it into a clean environment:
+
+```bash
+python -m pip install --extra-index-url https://pypi.nvidia.com \
+    /path/to/tensorrt_edgellm-<version>-cp312-cp312-<platform>.whl
+```
+
+The local path supplies TensorRT Edge-LLM; the NVIDIA index supplies compatible
+external dependencies. No model, GPU, SDK, architecture, or SM option is passed
+to pip. Pip validates the wheel against the host CPU architecture and CPython
+ABI.
+
+### Build an engine and run a prompt
+
+The repository provides a standalone first-user test that imports only the
+installed packages, builds a TensorRT engine through the installed CLI, and
+runs one prompt through the installed runtime:
+
+```bash
+python examples/python/installed_wheel_build_and_infer.py \
+    /path/to/Qwen2.5-0.5B-Instruct /tmp/edgellm-engine \
+    --prompt "Please introduce NVIDIA."
+```
+
+Users who installed without cloning the repository can copy this script from
+the matching source revision or call the same `tensorrt-edgellm-build` and
+`tensorrt_edgellm.runtime` interfaces directly. Keep the model checkpoint at
+its build-time path while using the engine; checkpoint-backed weights remain
+external to reduce engine duplication.
+
+### Hosts with different GPU architectures
+
+If visible GPUs have different SMs, EdgeLLM fails before loading native code
+rather than selecting an ambiguous payload. Run one process per selected GPU,
+using the stable UUID reported by `nvidia-smi`:
+
+```bash
+nvidia-smi --query-gpu=uuid,name,compute_cap --format=csv,noheader
+
+CUDA_VISIBLE_DEVICES="GPU-<SM86-UUID>" \
+    python examples/python/installed_wheel_build_and_infer.py \
+    /path/to/model /tmp/engine-sm86
+CUDA_VISIBLE_DEVICES="GPU-<SM120-UUID>" \
+    python examples/python/installed_wheel_build_and_infer.py \
+    /path/to/model /tmp/engine-sm120
+```
+
+`CUDA_VISIBLE_DEVICES` remaps the selected physical GPU to CUDA device `0`
+inside the process. A numeric ordinal can refer to a different physical GPU
+than the index printed by `nvidia-smi` on heterogeneous hosts, so UUIDs are the
+reliable choice. The same installed x86_64 wheel serves both processes; each
+process builds and uses an engine for its selected GPU.
+
+---
+
 TensorRT Edge-LLM has two separate components that need to be installed on different systems:
 
 1. **Export and quantization** (runs on an x86 host; only quantization requires a GPU)
