@@ -76,7 +76,7 @@ cu_k[b]`` and the causal mask is bottom-right aligned with offset
 ``seqlen_k_b - seqlen_q_b`` (0 for plain right-padded prefill, the KV-cache
 prefix length for chunked prefill).  Padding K/V positions are never
 attended by valid rows, and padding Q rows are residual-masked in the masked
-steps — fixing the Gemma4 BS>1 NaN corruption (nvbug 6384817) at the source.
+steps so padding NaNs cannot corrupt valid rows.
 
 Vision-block overlay (Gemma4 Unified): two optional ``(B, S_q)`` Int32
 tensors ``mBlockBegin`` / ``mBlockEnd`` carry, per query row, an extra
@@ -1354,7 +1354,7 @@ class FMHAV2Ampere:
         # skip the K prefetch entirely — the KV loop below runs zero steps and
         # the epilogue stores the zero-initialised acc_O.
         #
-        # NaN hardening (bug 6384817 forensics): rows of the boundary K/V tile
+        # NaN hardening: rows of the boundary K/V tile
         # at logical positions >= seqlen_k_b are ZERO-FILLED, not just score
         # masked.  Score masking alone zeroes the softmax weight, but BMM2
         # still multiplies P(=0) x V, and IEEE 0 x NaN = NaN — padding rows can
@@ -2178,7 +2178,7 @@ class FMHAV2Ampere:
 
         for r in cutlass.range_constexpr(cute.size(softmax_params.row_max)):
             if cutlass.const_expr(in_mask_steps):
-                # Per-batch varlen masking (bug 6384817):
+                # Per-batch variable-length masking:
                 #   residual K: mask index_k >= seqlen_k_b (padding keys)
                 #   causal:     bottom-right aligned, limit = qi + offset_b + 1
                 #   residual Q: padding rows (qi >= seqlen_q_b) fully masked

@@ -21,13 +21,13 @@
 
 ## Overview
 
-TensorRT Edge-LLM is NVIDIA's high-performance C++ inference runtime for Large Language Models (LLMs) and Vision-Language Models (VLMs) on embedded platforms. It enables efficient deployment of state-of-the-art language models on resource-constrained devices such as NVIDIA Jetson, NVIDIA DRIVE, and NVIDIA DGX Spark platforms. TensorRT Edge-LLM provides convenient Python scripts to convert HuggingFace checkpoints to [ONNX](https://onnx.ai), plus an experimental ONNX-less engine builder. Engine build and end-to-end inference runs entirely on Edge platforms.
+TensorRT Edge-LLM is NVIDIA's C++ inference runtime for text, vision, audio, speech, and action models on NVIDIA Jetson, NVIDIA DRIVE, and NVIDIA DGX Spark. The supported frontend exports Hugging Face checkpoints to [ONNX](https://onnx.ai) for C++ engine building; an experimental direct frontend builds engines from checkpoints without ONNX. Both paths use the same C++ deployment runtimes.
 
 ---
 
 ## Getting Started
 
-For supported platforms and software stacks, see the [**Official Support Matrix**](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/support-matrix.html). For supported models and precisions, see [**Supported Models**](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/supported-models.html). Get started with TensorRT Edge-LLM in <15 minutes. For complete installation and usage instructions, see the [**Quick Start Guide**](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/quick-start-guide.html).
+Check the [**Official Support Matrix**](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/support-matrix.html), then follow the [**Quick Start Guide**](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/quick-start-guide.html). Checkpoint IDs are listed in [**Supported Models**](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/supported-models.html).
 
 ---
 
@@ -39,7 +39,7 @@ For supported platforms and software stacks, see the [**Official Support Matrix*
 - **[Official Support Matrix](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/support-matrix.html)** - Platform, JetPack, DriveOS, CUDA, TensorRT, and TensorRT Edge-LLM compatibility
 - **[Supported Models](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/supported-models.html)** - Complete model compatibility matrix
 - **[Checkpoint Exporter](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/software-design/checkpoint-export.html)** - Recommended ONNX export pipeline
-- **[Experimental ONNX-less Builder](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/software-design/onnxless-builder.html)** - Build TensorRT engines directly from checkpoints
+- **[Experimental Direct Engine Builder](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/direct-engine-builder.html)** - Build all model components directly from a checkpoint
 
 ### User Guide
 

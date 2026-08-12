@@ -6,8 +6,8 @@
 TensorRT Edge-LLM Documentation
 ================================
 
-Welcome to the TensorRT Edge-LLM documentation. This library provides optimized inference capabilities
-for large language models and vision-language models on edge devices.
+TensorRT Edge-LLM provides optimized inference for text, vision, audio, speech,
+and action models on NVIDIA edge platforms.
 
 .. toctree::
    :maxdepth: 2
@@ -26,13 +26,12 @@ for large language models and vision-language models on edge devices.
    :caption: Examples
 
    user_guide/examples/index.md
-   user_guide/examples/vlm.md
    user_guide/examples/speculative-decoding.md
    user_guide/examples/phi4.md
    user_guide/examples/asr.md
-   user_guide/examples/moe.md
    user_guide/examples/tts.md
-   user_guide/examples/vla.md
+   user_guide/examples/vla/index.md
+   user_guide/examples/omni.md
    user_guide/examples/experimental-server.md
    user_guide/examples/nemo-evaluator.md
 
@@ -46,7 +45,7 @@ for large language models and vision-language models on edge devices.
    user_guide/features/FP8KV.md
    user_guide/features/fp8-embedding.md
    user_guide/features/streaming.md
-   user_guide/features/system-prompt-cache.md
+   user_guide/features/kv-cache-reuse.md
 
 .. toctree::
    :maxdepth: 2

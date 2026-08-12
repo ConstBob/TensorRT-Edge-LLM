@@ -12,7 +12,7 @@ If the active environment was installed with base export dependencies only, inst
 
 ```bash
 cd /path/to/TensorRT-Edge-LLM
-pip install -r requirements-server.txt
+python -m pip install -e ".[server]"
 ```
 
 ## Python API

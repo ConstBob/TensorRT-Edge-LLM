@@ -20,11 +20,6 @@ Pipeline produced by the AOT pack:
    per-token router weight, and scatter-reduces the result back to the original
    token layout, emitting `[T, H]` FP16.
 
-The legacy `nvfp4_moe` prefill / decode N-major sources that lived in this
-directory on `main` were removed when [MR
-!902](https://gitlab-master.nvidia.com/TensorRT/tensorrt-edge-llm/tensorrt-edge-llm/-/merge_requests/902)
-dropped the legacy `Nvfp4MoePlugin` Marlin path.
-
 ## Supported Hardware
 
 | GPU | SM | Status |
@@ -221,9 +216,9 @@ for SM110.
 
 ## Validation
 
-No standalone reference probe is shipped. The SM110 NVFP4 MoE contract is
-validated end-to-end through
-[`tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py`](../../tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py).
+The SM110 NVFP4 MoE contract is validated by the
+[`CuteDslNvfp4MoeSm110Test`](../../unittests/nvfp4MoeCuteDslSm110Tests.cu)
+smoke and accuracy tests.
 
 ## File Map
 

@@ -33,10 +33,8 @@
 Use the public TensorRT Edge-LLM user guides for model export, engine build, and
 basic inference:
 
-- [Quick Start Guide](../getting_started/quick-start-guide.md) for text-only
-  LLM export, `llm_build`, `llm_inference`, and `llm_bench`.
-- [VLM Inference](../examples/vlm.md) for visual encoder export/build and
-  `--multimodalEngineDir`.
+- [Quick Start Guide](../getting_started/quick-start-guide.md) for LLM and VLM
+  export, component engine builds, `llm_inference`, and `llm_bench`.
 - [Speculative Decoding](../examples/speculative-decoding.md) for EAGLE3, MTP,
   and DFlash export/build layouts.
 - [Input Format Guide](../format/input-format.md) for the Edge-LLM JSON request
