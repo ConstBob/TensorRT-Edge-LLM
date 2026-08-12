@@ -2,9 +2,10 @@
 
 Complete workflow for running [nvidia/Alpamayo-R1-10B](https://huggingface.co/nvidia/Alpamayo-R1-10B), a Vision-Language-Action (VLA) model that combines a VLM backbone with an action expert.
 
-**Currently supported model:** [nvidia/Alpamayo-R1-10B](https://huggingface.co/nvidia/Alpamayo-R1-10B)
-
-> **Prerequisites:** Complete the [Installation Guide](../getting_started/installation.md) for both x86 host and edge device before proceeding. The Alpamayo 1 checkpoint may require Hugging Face login and license access before downloading.
+> **Prerequisites:** Complete the
+> [Installation Guide](../../getting_started/installation.md) for both x86
+> host and edge device. The checkpoint may require Hugging Face login and
+> license access before downloading.
 
 ---
 
@@ -44,7 +45,7 @@ tensorrt-edgellm-export \
 
 This creates `onnx/llm`, `onnx/visual`, and `onnx/action`.
 
-> **Note:** Only FP16 is supported for Alpamayo export in this release. The `--max-kv-cache-capacity` value must match the `--maxKVCacheCapacity` used when building the LLM engine in Step 3.
+> **Note:** Only FP16 is supported for Alpamayo export. The `--max-kv-cache-capacity` value must match the `--maxKVCacheCapacity` used when building the LLM engine in Step 3.
 
 ## Step 2: Transfer to Device
 
