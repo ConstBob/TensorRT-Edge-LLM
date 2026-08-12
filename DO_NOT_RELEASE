@@ -15,6 +15,11 @@ AGENTS.local.md
 design/
 docs/source/user_guide/examples/omni_internal.md
 
+# Internal TRT dependency CI validation tooling.
+scripts/ci_dependency_tests/
+scripts/developer_toolkit_extensions/
+kernelSrcs/cuteDSLPrebuilt/
+
 # Internal release sanitizer policy and helpers.
 oss_release_manifest.json
 scripts/README.md
