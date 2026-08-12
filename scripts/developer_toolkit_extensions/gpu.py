@@ -130,55 +130,53 @@ def select_local_gpu(descriptor: GPUDescriptor | None = None) -> GPUSelection:
 
 
 def cuda_runtime_discovery_command() -> str:
-    """Return a Python command that discovers one or more CUDA devices.
-    This is needed because on some devices (such as Thor), nvidia-smi is 
-    not present.
+    """Return a Python command that discovers CUDA devices without nvidia-smi.
 
     Returns:
         A shell command that prints rows in the same CSV schema as
-        ``nvidia_smi_discovery_argv``. The command is useful on Tegra devices
-        where ``nvidia-smi`` is not present.
+        ``nvidia_smi_discovery_argv``.
     """
     return r"""python3 - <<'PY'
 import ctypes
+import ctypes.util
 
-class cudaDeviceProp(ctypes.Structure):
-    _fields_ = [
-        ("name", ctypes.c_char * 256),
-        ("uuid", ctypes.c_ubyte * 16),
-        ("luid", ctypes.c_char * 8),
-        ("luidDeviceNodeMask", ctypes.c_uint),
-        ("totalGlobalMem", ctypes.c_size_t),
-        ("sharedMemPerBlock", ctypes.c_size_t),
-        ("regsPerBlock", ctypes.c_int),
-        ("warpSize", ctypes.c_int),
-        ("memPitch", ctypes.c_size_t),
-        ("maxThreadsPerBlock", ctypes.c_int),
-        ("maxThreadsDim", ctypes.c_int * 3),
-        ("maxGridSize", ctypes.c_int * 3),
-        ("clockRate", ctypes.c_int),
-        ("totalConstMem", ctypes.c_size_t),
-        ("major", ctypes.c_int),
-        ("minor", ctypes.c_int),
-    ]
+cuda_path = ctypes.util.find_library("cudart") or "libcudart.so"
+cuda = ctypes.CDLL(cuda_path)
 
-cuda = ctypes.CDLL("/usr/local/cuda/lib64/libcudart.so")
 cuda.cudaGetDeviceCount.argtypes = [ctypes.POINTER(ctypes.c_int)]
 cuda.cudaGetDeviceCount.restype = ctypes.c_int
-cuda.cudaGetDeviceProperties.argtypes = [ctypes.POINTER(cudaDeviceProp), ctypes.c_int]
-cuda.cudaGetDeviceProperties.restype = ctypes.c_int
+cuda.cudaSetDevice.argtypes = [ctypes.c_int]
+cuda.cudaSetDevice.restype = ctypes.c_int
+cuda.cudaDeviceGetAttribute.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int]
+cuda.cudaDeviceGetAttribute.restype = ctypes.c_int
+cuda.cudaMemGetInfo.argtypes = [ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)]
+cuda.cudaMemGetInfo.restype = ctypes.c_int
+
+cuda_dev_attr_compute_capability_major = 75
+cuda_dev_attr_compute_capability_minor = 76
+
+def check(status):
+    if status != 0:
+        raise SystemExit(1)
+
+def device_attribute(attribute, index):
+    value = ctypes.c_int()
+    check(cuda.cudaDeviceGetAttribute(ctypes.byref(value), attribute, index))
+    return value.value
 
 device_count = ctypes.c_int()
-if cuda.cudaGetDeviceCount(ctypes.byref(device_count)) != 0:
-    raise SystemExit(1)
+check(cuda.cudaGetDeviceCount(ctypes.byref(device_count)))
 
 for index in range(device_count.value):
-    prop = cudaDeviceProp()
-    if cuda.cudaGetDeviceProperties(ctypes.byref(prop), index) != 0:
-        raise SystemExit(1)
-    name = prop.name.decode(errors="replace").strip("\x00") or "CUDA GPU"
-    memory_mib = int(prop.totalGlobalMem // (1024 * 1024))
-    print(f"{index}, {name}, {index}, {memory_mib}, {memory_mib}, 0, {prop.major}.{prop.minor}")
+    check(cuda.cudaSetDevice(index))
+    free_mem = ctypes.c_size_t()
+    total_mem = ctypes.c_size_t()
+    check(cuda.cudaMemGetInfo(ctypes.byref(free_mem), ctypes.byref(total_mem)))
+    major = device_attribute(cuda_dev_attr_compute_capability_major, index)
+    minor = device_attribute(cuda_dev_attr_compute_capability_minor, index)
+    free_mib = int(free_mem.value // (1024 * 1024))
+    total_mib = int(total_mem.value // (1024 * 1024))
+    print(f"{index}, CUDA GPU, {index}, {free_mib}, {total_mib}, 0, {major}.{minor}")
 PY"""
 
 
