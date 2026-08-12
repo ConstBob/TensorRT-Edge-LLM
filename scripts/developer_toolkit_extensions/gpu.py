@@ -20,7 +20,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from trt_dev_toolkit.command_manager.command_manager import CommandManager
-from trt_dev_toolkit.command_manager.data_structures import CommandSpec, OutputMode
+from trt_dev_toolkit.command_manager.data_structures import (CommandSpec,
+                                                             OutputMode)
 from trt_dev_toolkit.command_manager.targets import LocalTarget
 
 from .errors import OrchestrationError
