@@ -491,7 +491,7 @@ void assertPagedCapability(int32_t headDim, CuteDslFMHAV2MaskType maskType)
 
 TEST(ContextAttentionTest, fmhaV2CapabilityContract)
 {
-    std::vector<int32_t> const supportedSMs{80, 86, 87, 89, 100, 101, 110, 120, 121};
+    std::vector<int32_t> const supportedSMs{80, 86, 87, 89, 90, 100, 101, 110, 120, 121};
     std::vector<int32_t> const supportedHeadDims{64, 128, 256, 512};
 
     for (int32_t const smVersion : supportedSMs)
@@ -525,7 +525,8 @@ TEST(ContextAttentionTest, fmhaV2CapabilityContract)
             8, 2, 256, smVersion, DataType::kHALF, CuteDslFMHAV2MaskType::kPADDING));
     }
 
-    EXPECT_FALSE(CuteDslFMHAV2Runner::canImplementPaged(8, 2, 64, 90, DataType::kHALF, CuteDslFMHAV2MaskType::kCAUSAL));
+    EXPECT_FALSE(
+        CuteDslFMHAV2Runner::canImplementPaged(8, 2, 64, 103, DataType::kHALF, CuteDslFMHAV2MaskType::kCAUSAL));
     EXPECT_FALSE(
         CuteDslFMHAV2Runner::canImplementPaged(8, 2, 72, 121, DataType::kHALF, CuteDslFMHAV2MaskType::kCAUSAL));
     EXPECT_FALSE(

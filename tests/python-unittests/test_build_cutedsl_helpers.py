@@ -35,7 +35,7 @@ build_cutedsl = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = build_cutedsl
 _SPEC.loader.exec_module(build_cutedsl)
 
-_FMHA_V2_SUPPORTED_SMS = [80, 86, 87, 89, 100, 101, 110, 120, 121]
+_FMHA_V2_SUPPORTED_SMS = [80, 86, 87, 89, 90, 100, 101, 110, 120, 121]
 _FMHA_V2_DENSE_VARIANTS = {
     "fmha_v2_d64",
     "fmha_v2_d64_small",
@@ -228,7 +228,7 @@ def test_tarball_builder_lists_mixed_cuda_matrix():
 
 
 @pytest.mark.parametrize("cuda_major", ["12", "13"])
-def test_tarball_builder_default_matrix_includes_a30(cuda_major):
+def test_tarball_builder_default_matrix_includes_expected_targets(cuda_major):
     script = _REPO_ROOT / "kernelSrcs" / "build_cutedsl_tarballs.sh"
     env = os.environ.copy()
     env.pop("CUTE_DSL_MATRIX", None)
@@ -241,8 +241,10 @@ def test_tarball_builder_default_matrix_includes_a30(cuda_major):
                             text=True,
                             env=env)
 
-    assert f"cutedsl_x86_64_sm_80_cuda{cuda_major}.tar.gz" in (
-        result.stdout.splitlines())
+    tarballs = result.stdout.splitlines()
+    assert f"cutedsl_x86_64_sm_80_cuda{cuda_major}.tar.gz" in tarballs
+    if cuda_major == "13":
+        assert "cutedsl_aarch64_sm_90_cuda13.tar.gz" in tarballs
 
 
 def test_tarball_builder_docker_matrix_matches_ci_targets():
@@ -255,11 +257,13 @@ def test_tarball_builder_docker_matrix_matches_ci_targets():
 
     assert matrix.split(",") == [
         "x86_64:sm_80:13",
+        "x86_64:sm_90:13",
         "x86_64:sm_100:13",
         "x86_64:sm_120:13",
         "x86_64:sm_120:12",
         "aarch64:sm_87:13",
         "aarch64:sm_87:12",
+        "aarch64:sm_90:13",
         "aarch64:sm_101:12",
         "aarch64:sm_110:13",
         "aarch64:sm_121:12",
@@ -267,9 +271,10 @@ def test_tarball_builder_docker_matrix_matches_ci_targets():
     ]
 
 
-@pytest.mark.parametrize(
-    ("sm", "expected"), [(80, "sm_80"), (87, "sm_87"), (100, "sm_100a"),
-                         (110, "sm_110a"), (120, "sm_120a"), (121, "sm_121a")])
+@pytest.mark.parametrize(("sm", "expected"),
+                         [(80, "sm_80"), (87, "sm_87"), (90, "sm_90"),
+                          (100, "sm_100a"), (110, "sm_110a"), (120, "sm_120a"),
+                          (121, "sm_121a")])
 def test_default_compile_gpu_arch_is_derived_from_target_sm(sm, expected):
     assert build_cutedsl.default_compile_gpu_arch(sm) == expected
 
@@ -379,7 +384,7 @@ def test_fmha_v2_d512_registry_uses_32x32_tiles_and_two_warps():
                                    1] == "64"
 
 
-@pytest.mark.parametrize("sm", [90, 103])
+@pytest.mark.parametrize("sm", [103])
 def test_fmha_registry_rejects_unsupported_sms(sm):
     with pytest.raises(ValueError, match="No variants"):
         build_cutedsl.select_variants(sm, "fmha")

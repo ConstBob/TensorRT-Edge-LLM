@@ -26,10 +26,17 @@
 namespace
 {
 
+using trt_edgellm::canCompileXQAKernel;
 using trt_edgellm::deserializeXQAJitKernels;
 using trt_edgellm::serializeXQAJitKernels;
 using trt_edgellm::XQAJitKernel;
 using trt_edgellm::XQAJitKey;
+
+TEST(XQAJitCapabilityTest, SupportsSm90Qwen25)
+{
+    EXPECT_TRUE(canCompileXQAKernel(14, 2, 64, 90, nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF));
+    EXPECT_TRUE(canCompileXQAKernel(14, 2, 64, 90, nvinfer1::DataType::kHALF, nvinfer1::DataType::kFP8));
+}
 
 XQAJitKey makeKey(bool specDecode)
 {
