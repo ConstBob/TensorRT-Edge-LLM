@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import http.server
+import importlib.util
 import json
 import os
 import pathlib
@@ -26,6 +27,13 @@ import yaml
 
 G_REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 G_SCRIPT = G_REPO_ROOT / ".gitlab" / "ci" / "scripts" / "sonar_results.py"
+G_SCAN_SCRIPT = (G_REPO_ROOT / ".gitlab" / "ci" / "scripts" /
+                 "ci_sonar_scan.py")
+G_SCAN_MODULE_SPEC = importlib.util.spec_from_file_location(
+    "ci_sonar_scan", G_SCAN_SCRIPT)
+assert G_SCAN_MODULE_SPEC is not None and G_SCAN_MODULE_SPEC.loader is not None
+G_SCAN_MODULE = importlib.util.module_from_spec(G_SCAN_MODULE_SPEC)
+G_SCAN_MODULE_SPEC.loader.exec_module(G_SCAN_MODULE)
 G_SAST_REPORT = {
     "version": "15.0.0",
     "vulnerabilities": [],
@@ -41,6 +49,7 @@ def sonar_server():
         "requests": [],
         "task_responses": [],
         "gate_status": "OK",
+        "probe_status": 200,
     }
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -62,6 +71,17 @@ def sonar_server():
                 payload = G_SAST_REPORT
             elif request_path == "/api/qualitygates/project_status":
                 payload = {"projectStatus": {"status": state["gate_status"]}}
+            elif state["probe_status"] is not None:
+                status = state["probe_status"]
+                if callable(status):
+                    status = status()
+                response = b"2026.1"
+                self.send_response(status)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(response)))
+                self.end_headers()
+                self.wfile.write(response)
+                return
             else:
                 self.send_error(404)
                 return
@@ -126,6 +146,22 @@ def run_sonar_results(tmp_path, server_url):
     return result, output_file
 
 
+def run_sonar_scan(monkeypatch, tmp_path, server_url, scanner_exit_code=0):
+    scanner = tmp_path / "sonar-scanner"
+    scanner.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf "ran\\n" >> "$SONAR_SCAN_LOG"\n'
+        f"exit {scanner_exit_code}\n",
+        encoding="utf-8",
+    )
+    scanner.chmod(0o755)
+
+    scan_log = tmp_path / "scan.log"
+    monkeypatch.setenv("SONAR_SCAN_LOG", str(scan_log))
+    exit_code = G_SCAN_MODULE.main([server_url, str(scanner)])
+    return exit_code, scan_log
+
+
 def test_successful_analysis_publishes_sast_and_passes(sonar_server, tmp_path):
     state, server_url = sonar_server
     state["task_responses"] = [{
@@ -178,6 +214,66 @@ def test_failed_processing_does_not_publish_stale_sast(sonar_server, tmp_path):
         for request in state["requests"]
     ]
     assert "/api/issues/gitlab_sast_export" not in requested_paths
+
+
+def test_sonar_scan_runs_once_when_service_is_available(
+        sonar_server, monkeypatch, tmp_path):
+    _, server_url = sonar_server
+    exit_code, scan_log = run_sonar_scan(monkeypatch, tmp_path, server_url)
+
+    assert exit_code == 0
+    assert scan_log.read_text(encoding="utf-8").splitlines() == ["ran"]
+
+
+def test_sonar_scan_marks_a_service_outage_as_temporary(
+        sonar_server, monkeypatch, tmp_path):
+    state, server_url = sonar_server
+    state["probe_status"] = 503
+    exit_code, scan_log = run_sonar_scan(monkeypatch, tmp_path, server_url)
+
+    assert exit_code == os.EX_TEMPFAIL
+    assert not scan_log.exists()
+
+
+def test_sonar_scan_preserves_scanner_failures(sonar_server, monkeypatch,
+                                               tmp_path):
+    _, server_url = sonar_server
+    exit_code, scan_log = run_sonar_scan(monkeypatch,
+                                         tmp_path,
+                                         server_url,
+                                         scanner_exit_code=17)
+
+    assert exit_code == 17
+    assert scan_log.read_text(encoding="utf-8").splitlines() == ["ran"]
+
+
+def test_sonar_scan_marks_an_outage_during_analysis_as_temporary(
+        sonar_server, monkeypatch, tmp_path):
+    state, server_url = sonar_server
+    scan_log = tmp_path / "scan.log"
+    state["probe_status"] = lambda: 503 if scan_log.exists() else 200
+    exit_code, scan_log = run_sonar_scan(monkeypatch,
+                                         tmp_path,
+                                         server_url,
+                                         scanner_exit_code=17)
+
+    assert exit_code == os.EX_TEMPFAIL
+    assert scan_log.read_text(encoding="utf-8").splitlines() == ["ran"]
+
+
+def test_sonar_scan_rejects_invalid_server_configuration():
+    with pytest.raises(SystemExit) as raised_error:
+        G_SCAN_MODULE.main(["not-a-url", "sonar-scanner"])
+
+    assert raised_error.value.code != os.EX_TEMPFAIL
+
+
+def test_sonar_build_only_allows_temporary_dependency_failures():
+    sonar_jobs = yaml.safe_load((G_REPO_ROOT / ".gitlab" / "ci" /
+                                 "sonar-jobs.yml").read_text(encoding="utf-8"))
+
+    assert sonar_jobs["build-sonar"]["allow_failure"] == {"exit_codes": 75}
+    assert sonar_jobs["build-sonar"]["artifacts"]["when"] == "always"
 
 
 def test_sonar_pipeline_preserves_results_handoff_contract():
