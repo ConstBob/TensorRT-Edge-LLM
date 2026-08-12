@@ -381,7 +381,7 @@ the CuTe DSL package expected by `kernelSrcs/build_cutedsl.py`, then generate th
 artifact before running CMake:
 
 ```bash
-pip install 'nvidia-cutlass-dsl==4.6.1'
+pip install 'nvidia-cutlass-dsl==4.7.0'
 python kernelSrcs/build_cutedsl.py --gpu_arch sm_100
 ```
 

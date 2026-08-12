@@ -33,7 +33,7 @@
     # Developers bump the component version manually. The explicit prefix
     # scopes project-wide registry cleanup to these ephemeral images, while the
     # pipeline ID isolates concurrent pipelines.
-    CUTE_DSL_BUILDER_VERSION: "4.6.1"
+    CUTE_DSL_BUILDER_VERSION: "4.7.0"
     CUTE_DSL_BUILDER_TAG: "cutedsl-$CUTE_DSL_BUILDER_VERSION-pipeline-$CI_PIPELINE_ID"
     CUTE_DSL_BUILDER_IMAGE: "$CI_REGISTRY_IMAGE/cutedsl-kernel-builder:$CUTE_DSL_BUILDER_TAG"
     CUTE_DSL_BUILDER_CACHE_IMAGE: "$CI_REGISTRY_IMAGE/cutedsl-kernel-builder-cache:buildkit"
