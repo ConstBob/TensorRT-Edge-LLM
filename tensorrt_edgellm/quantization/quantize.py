@@ -894,9 +894,10 @@ def quantize_and_export(
                         module,
                         torch.nn.Linear) and (module.out_features % 64 != 0
                                               or module.in_features % 64 != 0):
-                    quant_cfg["quant_cfg"][f"*{name}.weight_quantizer"] = {
-                        "enable": False
-                    }
+                    quant_cfg["quant_cfg"].append({
+                        "quantizer_name": f"*{name}.weight_quantizer",
+                        "enable": False,
+                    })
                     print(
                         f"[int4] skipping {name}: weight [{module.out_features}, "
                         f"{module.in_features}] not 64-aligned (kept fp16)")

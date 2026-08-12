@@ -44,6 +44,7 @@ from safetensors import safe_open
 
 from ..config import Mapping
 from ..models.linear import LinearBase, TPMode
+from .fused_weights import split_fused_moe_experts
 from .repacking import apply_all_repacking
 
 logger = logging.getLogger(__name__)
@@ -783,39 +784,14 @@ def _try_split_fused_tensor(model: nn.Module,
         return ok
 
     # --- 6. Fused MoE expert split -------------------------------------------
-    # Fused 3-D expert tensors (gate rows first, then up):
-    #   mlp.experts.gate_up_proj [E, 2*I, H] / mlp.experts.down_proj [E, H, I]
-    # Split into the per-expert Linear weights held by Qwen3MoEExperts.
-    if key.endswith(".mlp.experts.gate_up_proj") and tensor.dim() == 3:
-        prefix = key[:-len("gate_up_proj")]
-        inter = tensor.shape[1] // 2
+    expert_weights = split_fused_moe_experts(key, tensor)
+    if expert_weights is not None:
         ok = True
-        for expert in range(tensor.shape[0]):
-            ok &= _set_tensor(model,
-                              f"{prefix}{expert}.gate_proj.weight",
-                              tensor[expert, :inter, :],
-                              mapping=mapping)
-            ok &= _set_tensor(model,
-                              f"{prefix}{expert}.up_proj.weight",
-                              tensor[expert, inter:, :],
-                              mapping=mapping)
+        for split_key, split_tensor in expert_weights:
+            ok &= _set_tensor(model, split_key, split_tensor, mapping=mapping)
         if ok:
-            logger.debug(
-                "Split fused experts.gate_up_proj -> %d gate/up pairs "
-                "for prefix %r", tensor.shape[0], prefix)
-        return ok
-    if key.endswith(".mlp.experts.down_proj") and tensor.dim() == 3:
-        prefix = key[:-len("down_proj")]
-        ok = True
-        for expert in range(tensor.shape[0]):
-            ok &= _set_tensor(model,
-                              f"{prefix}{expert}.down_proj.weight",
-                              tensor[expert],
-                              mapping=mapping)
-        if ok:
-            logger.debug(
-                "Split fused experts.down_proj -> %d down weights "
-                "for prefix %r", tensor.shape[0], prefix)
+            logger.debug("Split fused %r into %d per-expert weights", key,
+                         len(expert_weights))
         return ok
 
     return False
