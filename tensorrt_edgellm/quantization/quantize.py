@@ -553,6 +553,39 @@ def _is_hybrid_model(model):
     return False
 
 
+def _share_gdn_qkvzba_scales(model) -> int:
+    """Unify per-tensor scales across the 4 GDN input projections.
+
+    Groups ``in_proj_qkv``/``z``/``b``/``a`` of every GDN mixer and runs
+    ModelOpt's :func:`preprocess_linear_fusion` on the group — the same
+    scale-unification ModelOpt export applies to fused layers (input and
+    weight amax each unified to the group max).  Identical per-tensor
+    scales are the precondition for the exporter to concatenate the four
+    projections into a single NVFP4 GEMM.  ModelOpt's own shared-input
+    detection cannot be used here: its dummy forward misgroups projections
+    on hybrid Mamba/GDN models (see ``_skip_resmooth_for_hybrid``), so the
+    groups are formed explicitly by module structure.  Returns the number
+    of mixers updated.
+    """
+    from modelopt.torch.export.quant_utils import preprocess_linear_fusion
+
+    shared = 0
+    for _, module in model.named_modules():
+        projs = [
+            getattr(module, n, None)
+            for n in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
+        ]
+        if any(p is None for p in projs):
+            continue
+        if not all(
+                getattr(getattr(p, "weight_quantizer", None), "is_enabled",
+                        False) for p in projs):
+            continue
+        preprocess_linear_fusion(projs)
+        shared += 1
+    return shared
+
+
 @contextmanager
 def _skip_resmooth_for_hybrid(model, quantization: str = ""):
     """WAR for ModelOpt resmoothing bugs on selected custom models.
@@ -693,6 +726,7 @@ def quantize_and_export(
     image_dataset: Union[str, ImageDataset, None] = None,
     audio_dataset: Union[str, AudioDataset, None] = None,
     num_samples: int = 512,
+    fuse_gdn_qkvzba_scales: bool = False,
 ) -> str:
     """Load a HuggingFace model, quantize it, and export a unified checkpoint.
 
@@ -847,6 +881,7 @@ def quantize_and_export(
             visual_quantization=visual_quantization,
             audio_quantization=audio_quantization,
             cp_quantization=cp_quantization,
+            fuse_gdn_qkvzba_scales=fuse_gdn_qkvzba_scales,
         )
         # When INT4 is exported to the cuteDSL GEMM kernel's fragment layout, repack
         # requires N%64==0 && K%64==0. Small hybrid/GDN projections (e.g. Qwen3.5
@@ -976,6 +1011,9 @@ def quantize_and_export(
             mtq.quantize(model,
                          quant_cfg,
                          forward_loop=lambda m: _calibrate(m, loader))
+        if fuse_gdn_qkvzba_scales:
+            n_shared = _share_gdn_qkvzba_scales(model)
+            print(f"GDN qkvzba scale sharing: {n_shared} layer(s)")
         mtq.print_quant_summary(model)
 
     print(f"Quantization: {time.time() - t0:.1f}s")
