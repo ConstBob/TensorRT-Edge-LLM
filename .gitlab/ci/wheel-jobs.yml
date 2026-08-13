@@ -25,7 +25,7 @@ wheel_packaging_precheck:
   stage: precheck
   extends: [.wheel_rules]
   tags: [cpu-k8s]
-  image: $WHEEL_PRECHECK_IMAGE
+  image: python:3.12-bookworm
   script:
     - python packaging/wheel_cli.py ci-precheck
   artifacts:
@@ -76,7 +76,7 @@ wheel_assemble:
   stage: wheel-assemble
   extends: [.wheel_rules]
   tags: [cpu-k8s]
-  image: $WHEEL_ASSEMBLY_IMAGE
+  image: python:3.12-bookworm
   needs:
     - job: wheel_python_base
       artifacts: true
@@ -129,7 +129,7 @@ wheel_integration_gate:
   stage: l0_test
   extends: [.wheel_rules]
   tags: [cpu-k8s]
-  image: $WHEEL_PRECHECK_IMAGE
+  image: python:3.12-bookworm
   needs:
     - job: wheel_assemble
       artifacts: true

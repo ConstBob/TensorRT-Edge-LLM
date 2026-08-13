@@ -20,6 +20,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
 from packaging.requirements import Requirement
 
 try:
