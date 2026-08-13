@@ -20,6 +20,9 @@
 #include <cmath>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#if SUPPORTS_FP8
+#include <cuda_fp8.h>
+#endif
 #include <cuda_runtime.h>
 #include <functional>
 #include <gtest/gtest.h>
@@ -191,3 +194,27 @@ inline std::string formatTensorIndex(trt_edgellm::rt::Coords const& shape, int64
     oss << "]";
     return oss.str();
 }
+
+#if SUPPORTS_FP8
+// Per-tensor quantize FP16 → FP8 E4M3: fp8 ≈ fp16 / scale (saturating cast).
+inline std::vector<__nv_fp8_e4m3> quantizeHalfToFp8(std::vector<half> const& src, float scale)
+{
+    std::vector<__nv_fp8_e4m3> dst(src.size());
+    for (size_t i = 0; i < src.size(); ++i)
+    {
+        dst[i] = static_cast<__nv_fp8_e4m3>(__half2float(src[i]) / scale);
+    }
+    return dst;
+}
+
+// Per-tensor dequantize FP8 → FP16: fp16 = fp8 * scale.
+inline std::vector<half> dequantizeFp8ToHalf(std::vector<__nv_fp8_e4m3> const& src, float scale)
+{
+    std::vector<half> dst(src.size());
+    for (size_t i = 0; i < src.size(); ++i)
+    {
+        dst[i] = __float2half(static_cast<float>(src[i]) * scale);
+    }
+    return dst;
+}
+#endif // SUPPORTS_FP8
