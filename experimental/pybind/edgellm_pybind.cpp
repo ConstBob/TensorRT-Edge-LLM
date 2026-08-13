@@ -238,7 +238,9 @@ int32_t runStandaloneTTS(Qwen3OmniTTSRuntime& ttsRuntime, Code2WavRunner& code2w
 class PyLLMRuntime
 {
 public:
-    //! Vanilla constructor (no speculative decoding).
+    //! Vanilla constructor (no speculative decoding). The trailing
+    //! contextCacheConfig defaults to a disabled config, leaving the existing
+    //! identity-page runtime path unchanged when callers omit it.
     PyLLMRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, std::string const& checkpointDir,
         ContextCacheConfig const& contextCacheConfig)
@@ -842,10 +844,12 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readwrite("add_generation_prompt", &LLMGenerationRequest::addGenerationPrompt)
         .def_readwrite("enable_thinking", &LLMGenerationRequest::enableThinking)
         .def_readwrite("disable_spec_decode", &LLMGenerationRequest::disableSpecDecode)
+        .def_readwrite("recurrent_capture_interval", &LLMGenerationRequest::recurrentCaptureInterval)
         .def_readwrite("stream_channels", &LLMGenerationRequest::streamChannels)
         .def_readwrite("num_logprobs", &LLMGenerationRequest::numLogprobs)
         .def_readwrite("context_cache_lookup_policy", &LLMGenerationRequest::contextCacheLookupPolicy)
-        .def_readwrite("context_cache_commit_policy", &LLMGenerationRequest::contextCacheCommitPolicy);
+        .def_readwrite("context_cache_commit_policy", &LLMGenerationRequest::contextCacheCommitPolicy)
+        .def_readwrite("context_cache_replay_tail_length", &LLMGenerationRequest::contextCacheReplayTailLength);
 
     py::class_<LLMGenerationResponse>(m, "LLMGenerationResponse")
         .def(py::init<>())

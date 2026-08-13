@@ -165,6 +165,82 @@ ReusePlan makeHybridReusePlan(std::vector<HybridCheckpointCandidate> const& cand
     return makeCold();
 }
 
+ReusePlan makeHybridMtpReusePlan(std::vector<HybridCheckpointCandidate> const& candidates,
+    std::vector<BlockHash> const& inputFullBlockHashes, int32_t inputTokenCount, int32_t pageSize,
+    CacheRecordStore const& records, ContextCacheLookupPolicy lookupPolicy)
+{
+    ELLM_CHECK(lookupPolicy == ContextCacheLookupPolicy::kUseCache || lookupPolicy == ContextCacheLookupPolicy::kBypass,
+        "Context cache plan has an invalid lookup policy");
+    int64_t const totalInputPages = validateAndCountInputPages(inputFullBlockHashes, inputTokenCount, pageSize);
+
+    ReusePlan plan;
+    plan.mode = ReusePlanMode::kHybridMtp;
+    plan.hybridHasAttention = true;
+
+    auto makeCold = [&]() {
+        plan.kind = inputTokenCount == 0 ? ReusePlanKind::kStandard : ReusePlanKind::kNoReusablePrefix;
+        // MTP is a speculative deployment: a cold request still runs the draft engine over the full input, so the draft
+        // pool needs the same full-input reservation as the base pool (mirrors makeSpecReusePlan's cold demand).
+        plan.demand.baseKvPages = static_cast<int32_t>(totalInputPages);
+        plan.demand.draftKvPages = static_cast<int32_t>(totalInputPages);
+        return plan;
+    };
+    if (inputTokenCount == 0 || lookupPolicy == ContextCacheLookupPolicy::kBypass)
+    {
+        return makeCold();
+    }
+
+    std::vector<HybridCheckpointCandidate> ordered = candidates;
+    std::sort(ordered.begin(), ordered.end(),
+        [](auto const& lhs, auto const& rhs) { return lhs.exactLength > rhs.exactLength; });
+    for (HybridCheckpointCandidate const& candidate : ordered)
+    {
+        if (candidate.exactLength <= 0 || candidate.exactLength >= inputTokenCount)
+        {
+            continue;
+        }
+        HybridCheckpointKey const key{candidate.exactPrefixDigest, candidate.exactLength};
+        std::optional<RecordId> const recordId = records.findHybrid(key);
+        if (!recordId.has_value())
+        {
+            continue;
+        }
+
+        CacheRecord const& record = records.get(*recordId);
+        // The boundary token (exactLength - 1) is always retained in a private partial page, so reserve one fewer full
+        // block than exactLength/pageSize; page-aligned checkpoints keep their boundary private too.
+        size_t const fullBlockCount = static_cast<size_t>((candidate.exactLength - 1) / pageSize);
+        bool const logicalPrefixMatches = record.logicalBlockHashes.size() == fullBlockCount
+            && fullBlockCount <= inputFullBlockHashes.size()
+            && std::equal(
+                record.logicalBlockHashes.begin(), record.logicalBlockHashes.end(), inputFullBlockHashes.begin());
+        // MTP always publishes a partial page, so both snapshots must be present.
+        bool const snapshotSetComplete
+            = record.recurrentSnapshotSlot.has_value() && record.partialKvSnapshotSlot.has_value();
+        bool const basePathComplete = record.basePagePath.size() == fullBlockCount;
+        bool const draftPathComplete = record.draftPagePath.size() == fullBlockCount;
+        if (!logicalPrefixMatches || !snapshotSetComplete || !basePathComplete || !draftPathComplete)
+        {
+            continue;
+        }
+
+        plan.hybridCheckpoint = key;
+        plan.hybridRecord = *recordId;
+        plan.recurrentSnapshotBinding = record.recurrentSnapshotSlot;
+        plan.partialKvSnapshotBinding = record.partialKvSnapshotSlot;
+        plan.matchedBlockHashes = record.logicalBlockHashes;
+        plan.basePageBindings = record.basePagePath;
+        plan.draftPageBindings = record.draftPagePath;
+        plan.reuseTokenLength = candidate.exactLength;
+        plan.matchedTokenLength = candidate.exactLength;
+        int32_t const privatePageCount = static_cast<int32_t>(totalInputPages - static_cast<int64_t>(fullBlockCount));
+        plan.demand.baseKvPages = privatePageCount;
+        plan.demand.draftKvPages = privatePageCount;
+        return plan;
+    }
+    return makeCold();
+}
+
 ReusePlan makeSpecReusePlan(std::vector<BlockHash> const& inputFullBlockHashes, int32_t inputTokenCount,
     int32_t pageSize, BaseBlockIndex const& baseIndex, DraftPathIndex const& draftIndex,
     CacheRecordStore const& records, ContextCacheLookupPolicy lookupPolicy)

@@ -184,3 +184,144 @@ TEST(HybridSnapshotStorageTests, CaptureAndRestoreAreByteExactWithExtraRetainedP
         }
     }
 }
+
+TEST(HybridSnapshotStorageTests, BoundaryHiddenCaptureAndRestoreIsByteExact)
+{
+    cudaStream_t stream{};
+    HybridCacheManager::Config const config = makeHybridConfig();
+    HybridCacheManager cacheManager(config, stream);
+    int32_t constexpr kBoundaryHiddenDim{8};
+    int32_t constexpr kBatch{2};
+    int32_t constexpr kSeq{3};
+    HybridSnapshotStorage storage(
+        cacheManager, 2, 2, /*draftCacheManager=*/nullptr, kBoundaryHiddenDim, DataType::kHALF);
+    ASSERT_EQ(storage.boundaryHiddenDim(), kBoundaryHiddenDim);
+
+    size_t const rowBytes = static_cast<size_t>(kBoundaryHiddenDim) * sizeof(half);
+    Tensor source(
+        {kBatch, kSeq, kBoundaryHiddenDim}, trt_edgellm::rt::DeviceType::kGPU, DataType::kHALF, "boundaryHiddenSource");
+    Tensor destination(
+        {kBatch, kSeq, kBoundaryHiddenDim}, trt_edgellm::rt::DeviceType::kGPU, DataType::kHALF, "boundaryHiddenDest");
+
+    int32_t constexpr kSourceBatch{1};
+    int32_t constexpr kSourcePosition{2};
+    int32_t constexpr kSnapshotSlot{1};
+    int32_t constexpr kDestBatch{0};
+    int32_t constexpr kDestPosition{1};
+    size_t const sourceRow = (static_cast<size_t>(kSourceBatch) * kSeq + kSourcePosition) * rowBytes;
+    size_t const destRow = (static_cast<size_t>(kDestBatch) * kSeq + kDestPosition) * rowBytes;
+
+    CUDA_CHECK(cudaMemsetAsync(source.rawPointer(), 0, static_cast<size_t>(kBatch * kSeq) * rowBytes, stream));
+    CUDA_CHECK(cudaMemsetAsync(static_cast<uint8_t*>(source.rawPointer()) + sourceRow, 0x5A, rowBytes, stream));
+    CUDA_CHECK(cudaMemsetAsync(destination.rawPointer(), 0, static_cast<size_t>(kBatch * kSeq) * rowBytes, stream));
+
+    storage.captureBoundaryHidden(kSnapshotSlot, source, kSourceBatch, kSourcePosition, stream);
+    CUDA_CHECK(cudaMemsetAsync(source.rawPointer(), 0, static_cast<size_t>(kBatch * kSeq) * rowBytes, stream));
+    storage.restoreBoundaryHidden(kSnapshotSlot, destination, kDestBatch, kDestPosition, stream);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    std::vector<uint8_t> destHost(static_cast<size_t>(kBatch * kSeq) * rowBytes);
+    ASSERT_EQ(
+        cudaMemcpy(destHost.data(), destination.rawPointer(), destHost.size(), cudaMemcpyDeviceToHost), cudaSuccess);
+    for (size_t byte = 0; byte < destHost.size(); ++byte)
+    {
+        bool const inRestoredRow = byte >= destRow && byte < destRow + rowBytes;
+        EXPECT_EQ(destHost[byte], inRestoredRow ? 0x5AU : 0U);
+    }
+}
+
+TEST(HybridSnapshotStorageTests, DisabledBoundaryAndDraftMethodsThrow)
+{
+    cudaStream_t stream{};
+    HybridCacheManager::Config const config = makeHybridConfig();
+    HybridCacheManager cacheManager(config, stream);
+    HybridSnapshotStorage storage(cacheManager, 2, 2);
+    EXPECT_EQ(storage.boundaryHiddenDim(), 0);
+
+    Tensor hidden({2, 3, 8}, trt_edgellm::rt::DeviceType::kGPU, DataType::kHALF, "hidden");
+    EXPECT_THROW(storage.captureBoundaryHidden(0, hidden, 0, 0, stream), std::runtime_error);
+    EXPECT_THROW(storage.restoreBoundaryHidden(0, hidden, 0, 0, stream), std::runtime_error);
+    EXPECT_THROW(storage.capturePartialKv(0, /*base=*/0, /*draft=*/0, 4, stream), std::runtime_error);
+    EXPECT_THROW(storage.restorePartialKv(0, /*base=*/0, /*draft=*/0, 4, stream), std::runtime_error);
+}
+
+TEST(HybridSnapshotStorageTests, PairedBaseAndDraftPartialKvRoundTrip)
+{
+    cudaStream_t stream{};
+    HybridCacheManager::Config const config = makeHybridConfig();
+    HybridCacheManager baseCache(config, stream);
+    HybridCacheManager draftCache(config, stream);
+    HybridSnapshotStorage storage(baseCache, 2, 2, &draftCache);
+
+    int32_t constexpr kSnapshotSlot{1};
+    int32_t constexpr kSourcePage{7};
+    int32_t constexpr kDestinationPage{0};
+    int32_t constexpr kValidTokens{17};
+
+    auto fillPools = [&](HybridCacheManager& cache, uint8_t keyBase, uint8_t valueBase) {
+        KVCacheManager& kv = cache.getKVCacheManager();
+        for (int32_t layer = 0; layer < kv.numLayers(); ++layer)
+        {
+            KVLayerConfig const& layerConfig = kv.getLayerConfig(layer);
+            size_t const pageBytes = static_cast<size_t>(layerConfig.numKVHeads * layerConfig.headDim) * sizeof(half)
+                * static_cast<size_t>(kTOKENS_PER_PAGE);
+            auto* keys = static_cast<uint8_t*>(kv.kPoolPtr(layer));
+            auto* values = static_cast<uint8_t*>(kv.vPoolPtr(layer));
+            CUDA_CHECK(cudaMemsetAsync(
+                keys + kSourcePage * pageBytes, static_cast<uint8_t>(keyBase + layer), pageBytes, stream));
+            CUDA_CHECK(cudaMemsetAsync(
+                values + kSourcePage * pageBytes, static_cast<uint8_t>(valueBase + layer), pageBytes, stream));
+            CUDA_CHECK(cudaMemsetAsync(keys + kDestinationPage * pageBytes, 0, pageBytes, stream));
+            CUDA_CHECK(cudaMemsetAsync(values + kDestinationPage * pageBytes, 0, pageBytes, stream));
+        }
+    };
+    fillPools(baseCache, 0x21, 0x71);
+    fillPools(draftCache, 0x31, 0x81);
+
+    storage.capturePartialKv(kSnapshotSlot, kSourcePage, kSourcePage, kValidTokens, stream);
+    auto zeroSource = [&](HybridCacheManager& cache) {
+        KVCacheManager& kv = cache.getKVCacheManager();
+        for (int32_t layer = 0; layer < kv.numLayers(); ++layer)
+        {
+            KVLayerConfig const& layerConfig = kv.getLayerConfig(layer);
+            size_t const pageBytes = static_cast<size_t>(layerConfig.numKVHeads * layerConfig.headDim) * sizeof(half)
+                * static_cast<size_t>(kTOKENS_PER_PAGE);
+            CUDA_CHECK(cudaMemsetAsync(
+                static_cast<uint8_t*>(kv.kPoolPtr(layer)) + kSourcePage * pageBytes, 0, pageBytes, stream));
+            CUDA_CHECK(cudaMemsetAsync(
+                static_cast<uint8_t*>(kv.vPoolPtr(layer)) + kSourcePage * pageBytes, 0, pageBytes, stream));
+        }
+    };
+    zeroSource(baseCache);
+    zeroSource(draftCache);
+    storage.restorePartialKv(kSnapshotSlot, kDestinationPage, kDestinationPage, kValidTokens, stream);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    auto verify = [&](HybridCacheManager& cache, uint8_t keyBase, uint8_t valueBase) {
+        KVCacheManager& kv = cache.getKVCacheManager();
+        for (int32_t layer = 0; layer < kv.numLayers(); ++layer)
+        {
+            KVLayerConfig const& layerConfig = kv.getLayerConfig(layer);
+            size_t const tokenBytes = static_cast<size_t>(layerConfig.numKVHeads * layerConfig.headDim) * sizeof(half);
+            size_t const pageBytes = tokenBytes * static_cast<size_t>(kTOKENS_PER_PAGE);
+            size_t const copiedBytes = tokenBytes * static_cast<size_t>(kValidTokens);
+            std::vector<uint8_t> keyHost(pageBytes);
+            std::vector<uint8_t> valueHost(pageBytes);
+            ASSERT_EQ(cudaMemcpy(keyHost.data(),
+                          static_cast<uint8_t const*>(kv.kPoolPtr(layer)) + kDestinationPage * pageBytes, pageBytes,
+                          cudaMemcpyDeviceToHost),
+                cudaSuccess);
+            ASSERT_EQ(cudaMemcpy(valueHost.data(),
+                          static_cast<uint8_t const*>(kv.vPoolPtr(layer)) + kDestinationPage * pageBytes, pageBytes,
+                          cudaMemcpyDeviceToHost),
+                cudaSuccess);
+            for (size_t byte = 0; byte < pageBytes; ++byte)
+            {
+                EXPECT_EQ(keyHost[byte], byte < copiedBytes ? static_cast<uint8_t>(keyBase + layer) : 0U);
+                EXPECT_EQ(valueHost[byte], byte < copiedBytes ? static_cast<uint8_t>(valueBase + layer) : 0U);
+            }
+        }
+    };
+    verify(baseCache, 0x21, 0x71);
+    verify(draftCache, 0x31, 0x81);
+}

@@ -174,6 +174,13 @@ struct LLMGenerationRequest
 
     //! Ready endpoints to retain when the context cache is enabled.
     ContextCacheCommitPolicy contextCacheCommitPolicy{ContextCacheCommitPolicy::kIncludingGeneratedTokens};
+
+    //! Hybrid+MTP boundary-replay tail length carried into the context cache. Not consumed yet.
+    int32_t contextCacheReplayTailLength{0};
+
+    //! Periodic recurrent-state capture interval (0 disables). Hybrid+MTP endpoint reuse requires this to be 0 so the
+    //! recurrent snapshot lands only at the stable predecessor boundary (mirrors reference request validation).
+    int32_t recurrentCaptureInterval{0};
 };
 
 /*! \brief LLM Generation Response structure

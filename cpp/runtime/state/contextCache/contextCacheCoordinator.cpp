@@ -39,14 +39,19 @@ namespace rt
 namespace
 {
 
+//! The boundary hidden snapshot holds one base-model hidden vector; the base hidden-states tensor is FP16 in this
+//! runtime, so kHALF matches its element type. Pool sizing and slab allocation must agree on it.
+constexpr nvinfer1::DataType kBOUNDARY_HIDDEN_TYPE{nvinfer1::DataType::kHALF};
+
 bool isHybridKind(ContextCacheDeploymentKind kind) noexcept
 {
-    return kind == ContextCacheDeploymentKind::kHybrid || kind == ContextCacheDeploymentKind::kPureRecurrent;
+    return kind == ContextCacheDeploymentKind::kHybrid || kind == ContextCacheDeploymentKind::kPureRecurrent
+        || kind == ContextCacheDeploymentKind::kHybridMtp;
 }
 
 bool isSpecKind(ContextCacheDeploymentKind kind) noexcept
 {
-    return kind == ContextCacheDeploymentKind::kEAGLE;
+    return kind == ContextCacheDeploymentKind::kEAGLE || kind == ContextCacheDeploymentKind::kHybridMtp;
 }
 
 bool hasAttention(ContextCacheDeploymentKind kind) noexcept
@@ -70,24 +75,41 @@ int32_t snapshotSlotCount(int64_t budgetBytes, size_t bytesPerSlot, char const* 
 }
 
 ResourceDemand makeResourceCapacities(ContextCachePhysicalResources const& resources,
-    ContextCacheDeploymentKind deploymentKind, ContextCacheConfig const& config)
+    ContextCacheDeploymentKind deploymentKind, DeploymentConfig const& deployment, ContextCacheConfig const& config)
 {
     ELLM_CHECK(config.recurrentSnapshotPoolBytes >= 0 && config.partialKvSnapshotPoolBytes >= 0,
         "Context cache snapshot budgets must be non-negative");
     int32_t const draftPages = resources.draftPageTable == nullptr ? 0 : resources.draftPageTable->numPages();
     bool const hybrid = isHybridKind(deploymentKind);
+    bool const hybridMtp = deploymentKind == ContextCacheDeploymentKind::kHybridMtp;
     int32_t recurrentSlots{};
     int32_t partialKvSlots{};
     if (hybrid)
     {
-        recurrentSlots = snapshotSlotCount(config.recurrentSnapshotPoolBytes,
-            HybridSnapshotStorage::recurrentBytesPerSlot(resources.baseCache.getMambaCacheManager().getConfig()),
-            "recurrent snapshot pool");
-        if (deploymentKind == ContextCacheDeploymentKind::kHybrid)
+        // Every slab HybridSnapshotStorage allocates per slot has to be charged to the budget that derives the slot
+        // count, or the pool overshoots the caller's declared device-memory ceiling by the unpriced slabs.
+        size_t recurrentBytes
+            = HybridSnapshotStorage::recurrentBytesPerSlot(resources.baseCache.getMambaCacheManager().getConfig());
+        if (hybridMtp)
         {
-            partialKvSlots = snapshotSlotCount(config.partialKvSnapshotPoolBytes,
-                HybridSnapshotStorage::partialKvBytesPerSlot(resources.baseCache.getKVCacheManager().getConfig()),
-                "partial-KV snapshot pool");
+            recurrentBytes
+                += HybridSnapshotStorage::boundaryHiddenBytesPerSlot(deployment.base.hiddenSize, kBOUNDARY_HIDDEN_TYPE);
+        }
+        recurrentSlots
+            = snapshotSlotCount(config.recurrentSnapshotPoolBytes, recurrentBytes, "recurrent snapshot pool");
+        if (deploymentKind == ContextCacheDeploymentKind::kHybrid || hybridMtp)
+        {
+            size_t partialKvBytes
+                = HybridSnapshotStorage::partialKvBytesPerSlot(resources.baseCache.getKVCacheManager().getConfig());
+            if (hybridMtp)
+            {
+                ELLM_CHECK(resources.draftCache != nullptr,
+                    "Hybrid+MTP context reuse requires draft cache resources to size the partial-KV snapshot pool");
+                partialKvBytes += HybridSnapshotStorage::partialKvBytesPerSlot(
+                    resources.draftCache->getKVCacheManager().getConfig());
+            }
+            partialKvSlots
+                = snapshotSlotCount(config.partialKvSnapshotPoolBytes, partialKvBytes, "partial-KV snapshot pool");
         }
     }
     return ResourceDemand{hasAttention(deploymentKind) ? resources.basePageTable.numPages() : 0, draftPages,
@@ -261,6 +283,7 @@ struct ContextCacheCoordinator::RequestHandle::Impl
         int32_t reuseTokenLength{};
         ContextCacheLookupPolicy lookupPolicy{ContextCacheLookupPolicy::kUseCache};
         ContextCacheCommitPolicy commitPolicy{ContextCacheCommitPolicy::kIncludingGeneratedTokens};
+        int32_t replayTailLength{};
         int32_t committedStateLength{};
         int32_t publishedFullBlockCount{};
         int32_t publishedExactLength{};
@@ -281,13 +304,81 @@ struct ContextCacheCoordinator::RequestHandle::Impl
     ContextCacheCoordinator* owner{};
     cudaStream_t stream{};
     ContextCacheExecutionMode executionMode{ContextCacheExecutionMode::kVanilla};
-    Phase phase{Phase::kAdmitted};
-    bool deviceWorkPending{};
-    bool specAwaitingFirstCompletion{};
     std::vector<int32_t> pendingCompactionMapping;
     int32_t pendingCompactionBatchSize{-1};
     Tensor const* pendingDeviceBatchMapping{};
     std::vector<SequenceState> sequences;
+
+    // --- Request lifecycle state --------------------------------------------------------------------------------
+    // Every lifecycle method reads/advances the (phase, deviceWorkPending, specAwaitingFirstCompletion) triple only
+    // through the named accessors below -- never the raw fields -- so the legal state graph lives in one place and a
+    // mid-method synchronize cannot silently leave the pending flag stale (the bug behind the deviceWorkPending
+    // checks: publishHybridMtpEndpoint synchronizes mid-prefill, then re-enqueues the fold and must re-mark pending).
+    //
+    // Legal (phase, deviceWorkPending, specAwaitingFirstCompletion) tuples:
+    //   (kAdmitted,  false, false)  freshly admitted, before prefill
+    //   (kExecuting, true,  false)  prefill/decode work enqueued on impl.stream
+    //   (kExecuting, true,  true)   EAGLE draft-init enqueued, awaiting first verification round
+    //   (kExecuting, false, true)   EAGLE draft-init synchronized, frozen-prefill publication pending (transient)
+    //   (kExecuting, false, false)  settled between model steps
+    //   (kFinishing, *,     *)      terminal
+    bool admitted() const noexcept
+    {
+        return phase == Phase::kAdmitted;
+    }
+    bool executing() const noexcept
+    {
+        return phase == Phase::kExecuting;
+    }
+    bool hasPendingDeviceWork() const noexcept
+    {
+        return deviceWorkPending;
+    }
+    bool awaitingFirstSpecCompletion() const noexcept
+    {
+        return specAwaitingFirstCompletion;
+    }
+
+    //! kAdmitted -> kExecuting with the prefill work enqueued on the stream.
+    void beginPrefill() noexcept
+    {
+        phase = Phase::kExecuting;
+        deviceWorkPending = true;
+    }
+    //! Fresh GPU work was enqueued on impl.stream (prefill grow, decode grow, fold, compaction copy).
+    void markDeviceWorkEnqueued() noexcept
+    {
+        deviceWorkPending = true;
+    }
+    //! impl.stream was explicitly synchronized (or a verification round already synchronized it).
+    void markDeviceWorkSynchronized() noexcept
+    {
+        deviceWorkPending = false;
+    }
+    //! The enqueued work is provably terminal without a coordinator synchronize (no async publish work remains).
+    void markDeviceWorkResolvedWithoutSync() noexcept
+    {
+        deviceWorkPending = false;
+    }
+    //! EAGLE only: the ordered draft initialization awaits its first verification round before publishing.
+    void beginSpecDraftInit() noexcept
+    {
+        specAwaitingFirstCompletion = true;
+    }
+    void endSpecDraftInit() noexcept
+    {
+        specAwaitingFirstCompletion = false;
+    }
+    //! Enter the terminal phase (normal completion at empty batch, or an unrecoverable capacity/growth failure).
+    void markFinishing() noexcept
+    {
+        phase = Phase::kFinishing;
+    }
+
+private:
+    Phase phase{Phase::kAdmitted};
+    bool deviceWorkPending{};
+    bool specAwaitingFirstCompletion{};
 };
 
 struct ContextCacheCoordinator::AcquireSequenceResult
@@ -297,6 +388,379 @@ struct ContextCacheCoordinator::AcquireSequenceResult
     ReusePlan plan;
     bool forcedCold{};
 };
+
+// ================================================================================================================
+// Publication policies. The coordinator drives the shared request lifecycle (admission, working-set growth,
+// compaction, synchronization) and delegates every flavor-specific endpoint/snapshot publication to the policy
+// selected once per request in beginRequest (makePublicationPolicy). This replaces the deployment/execution-mode
+// branching that previously threaded through finalizePrefillPublication / completeDecodeStep / terminalize:
+//   - BaseEndpointPolicy    vanilla request in an attention deployment -> publish ready full-block base endpoints
+//   - HybridSnapshotPolicy  request in a recurrent/hybrid deployment  -> stage + publish recurrent snapshots
+//   - HybridMtpPolicy       MTP request in a Hybrid+MTP deployment     -> adds the successor-boundary MTP checkpoint
+//   - EagleSpecPolicy       EAGLE request                              -> two-phase frozen-prefill publication
+// Policies are nested in the coordinator, so they reach its private state, primitives (publishReadyEndpoint,
+// reserveHybridCapture, ...) and predicates directly. They never name the private RequestHandle::Impl type: each
+// re-derives `auto& impl = mCoordinator.checkedImpl(request)`. The shared advance validation stays on the
+// coordinator (validateEagleDecodeAdvances / validateVanillaDecodeAdvances / validateMtpDecodeAdvances /
+// assertUniqueCompletedSlots) so the
+// subtle committed-plus-lookahead invariant lives in exactly one place.
+// ================================================================================================================
+class ContextCacheCoordinator::PublicationPolicy
+{
+public:
+    explicit PublicationPolicy(ContextCacheCoordinator& coordinator) noexcept
+        : mCoordinator(coordinator)
+    {
+    }
+    virtual ~PublicationPolicy() noexcept = default;
+    virtual char const* name() const noexcept = 0;
+
+    //! Apply the post-prefill advance and publish (or arm) every ready endpoint for this flavor.
+    virtual void onPrefillFinalized(RequestHandle& request, std::vector<ContextCacheSequenceAdvance> const& advances,
+        std::vector<int32_t> const* commonStateLengths) = 0;
+    //! Apply the post-decode advance and publish endpoints for the completed slots.
+    virtual ContextCacheCoordinatorStatus onDecodeCompleted(RequestHandle& request,
+        std::vector<ContextCacheSequenceAdvance> const& advances, std::vector<int32_t> const& publishableCompletedSlots,
+        std::vector<int32_t> const* commonStateLengths) = 0;
+    //! EAGLE-only: publish the frozen prefill once the first verification round terminalizes. Default no-op.
+    virtual ContextCacheCoordinatorStatus onTerminalize(RequestHandle& /*request*/)
+    {
+        return ContextCacheCoordinatorStatus::kOk;
+    }
+    //! Hybrid+MTP-only: publish the successor-boundary checkpoint. Unreachable for other flavors.
+    virtual ContextCacheCoordinatorStatus publishMtpBoundary(RequestHandle& /*request*/, int32_t /*slot*/,
+        int32_t /*residentStateLength*/, Tensor const& /*hidden*/, int32_t /*row*/)
+    {
+        ELLM_CHECK(false, "Hybrid+MTP endpoint publication requires a Hybrid+MTP request");
+        return ContextCacheCoordinatorStatus::kRequestFailed;
+    }
+    //! Hybrid+MTP-only: restore the checkpoint's saved boundary hidden row. Unreachable for other flavors.
+    virtual ContextCacheCoordinatorStatus restoreMtpBoundary(
+        RequestHandle& /*request*/, int32_t /*slot*/, Tensor& /*hidden*/, int32_t /*row*/)
+    {
+        ELLM_CHECK(false, "Hybrid+MTP boundary-hidden restore requires a Hybrid+MTP request");
+        return ContextCacheCoordinatorStatus::kRequestFailed;
+    }
+
+protected:
+    ContextCacheCoordinator& mCoordinator;
+};
+
+class ContextCacheCoordinator::BaseEndpointPolicy : public ContextCacheCoordinator::PublicationPolicy
+{
+public:
+    using PublicationPolicy::PublicationPolicy;
+    char const* name() const noexcept override
+    {
+        return "base-endpoint";
+    }
+
+    void onPrefillFinalized(RequestHandle& request, std::vector<ContextCacheSequenceAdvance> const& advances,
+        std::vector<int32_t> const* commonStateLengths) override
+    {
+        auto& impl = mCoordinator.checkedImpl(request);
+        ELLM_CHECK(commonStateLengths == nullptr || commonStateLengths->empty(),
+            "Non-speculative prefill supplied speculative common-state lengths");
+        impl.markDeviceWorkResolvedWithoutSync();
+        mCoordinator.applyAdvances(impl, advances);
+        for (int32_t slot = 0; slot < static_cast<int32_t>(impl.sequences.size()); ++slot)
+        {
+            mCoordinator.publishReadyEndpoint(impl, slot, PublicationPoint::kPrefillEnd);
+        }
+    }
+
+    ContextCacheCoordinatorStatus onDecodeCompleted(RequestHandle& request,
+        std::vector<ContextCacheSequenceAdvance> const& advances, std::vector<int32_t> const& publishableCompletedSlots,
+        std::vector<int32_t> const* commonStateLengths) override
+    {
+        auto& impl = mCoordinator.checkedImpl(request);
+        mCoordinator.validateVanillaDecodeAdvances(impl, advances, commonStateLengths);
+        mCoordinator.applyAdvances(impl, advances);
+        mCoordinator.assertUniqueCompletedSlots(impl, publishableCompletedSlots);
+        impl.markDeviceWorkResolvedWithoutSync();
+        for (int32_t const slot : publishableCompletedSlots)
+        {
+            mCoordinator.publishReadyEndpoint(impl, slot, PublicationPoint::kDecodeEnd);
+        }
+        return ContextCacheCoordinatorStatus::kOk;
+    }
+};
+
+class ContextCacheCoordinator::HybridSnapshotPolicy : public ContextCacheCoordinator::PublicationPolicy
+{
+public:
+    using PublicationPolicy::PublicationPolicy;
+    char const* name() const noexcept override
+    {
+        return "hybrid-snapshot";
+    }
+
+    void onPrefillFinalized(RequestHandle& request, std::vector<ContextCacheSequenceAdvance> const& advances,
+        std::vector<int32_t> const* commonStateLengths) override
+    {
+        auto& impl = mCoordinator.checkedImpl(request);
+        ELLM_CHECK(commonStateLengths == nullptr || commonStateLengths->empty(),
+            "Non-speculative prefill supplied speculative common-state lengths");
+        impl.markDeviceWorkResolvedWithoutSync();
+        mCoordinator.applyAdvances(impl, advances);
+        for (auto& sequence : impl.sequences)
+        {
+            mCoordinator.mManager.releaseRestoredHybridSnapshots(sequence.lease);
+        }
+        mCoordinator.publishReadyHybridEndpoints(impl);
+    }
+
+    ContextCacheCoordinatorStatus onDecodeCompleted(RequestHandle& request,
+        std::vector<ContextCacheSequenceAdvance> const& advances, std::vector<int32_t> const& publishableCompletedSlots,
+        std::vector<int32_t> const* commonStateLengths) override
+    {
+        auto& impl = mCoordinator.checkedImpl(request);
+        validateDecodeAdvances(impl, advances, commonStateLengths);
+        mCoordinator.applyAdvances(impl, advances);
+        mCoordinator.assertUniqueCompletedSlots(impl, publishableCompletedSlots);
+        for (int32_t const slot : publishableCompletedSlots)
+        {
+            int32_t const exactLength = impl.sequences[static_cast<size_t>(slot)].committedStateLength;
+            mCoordinator.reserveHybridCapture(impl, slot, exactLength, PublicationPoint::kDecodeEnd);
+        }
+        bool const hasCaptures = std::any_of(impl.sequences.begin(), impl.sequences.end(),
+            [](auto const& sequence) { return sequence.stagedHybridPublication.has_value(); });
+        if (hasCaptures)
+        {
+            mCoordinator.enqueueHybridCaptures(impl);
+            ++mCoordinator.mMetrics.hybridCaptureSynchronizations;
+            ContextCacheCoordinatorStatus const syncStatus = mCoordinator.synchronizeRequest(request);
+            if (syncStatus != ContextCacheCoordinatorStatus::kOk)
+            {
+                return syncStatus;
+            }
+            mCoordinator.publishReadyHybridEndpoints(impl);
+        }
+        else
+        {
+            impl.markDeviceWorkResolvedWithoutSync();
+        }
+        return ContextCacheCoordinatorStatus::kOk;
+    }
+
+protected:
+    //! The snapshot publication flow is identical for vanilla hybrid and Hybrid+MTP, but their decode-advance
+    //! invariants are not: MTP commits everything a verification round accepted. Subclasses that decode
+    //! speculatively override this instead of duplicating onDecodeCompleted.
+    virtual void validateDecodeAdvances(RequestHandle::Impl const& request,
+        std::vector<ContextCacheSequenceAdvance> const& advances, std::vector<int32_t> const* commonStateLengths) const
+    {
+        mCoordinator.validateVanillaDecodeAdvances(request, advances, commonStateLengths);
+    }
+};
+
+class ContextCacheCoordinator::HybridMtpPolicy : public ContextCacheCoordinator::HybridSnapshotPolicy
+{
+public:
+    using HybridSnapshotPolicy::HybridSnapshotPolicy;
+    char const* name() const noexcept override
+    {
+        return "hybrid-mtp";
+    }
+
+protected:
+    void validateDecodeAdvances(RequestHandle::Impl const& request,
+        std::vector<ContextCacheSequenceAdvance> const& advances,
+        std::vector<int32_t> const* commonStateLengths) const override
+    {
+        mCoordinator.validateMtpDecodeAdvances(request, advances, commonStateLengths);
+    }
+
+public:
+    ContextCacheCoordinatorStatus publishMtpBoundary(RequestHandle& request, int32_t slot, int32_t residentStateLength,
+        Tensor const& baseHiddenStates, int32_t boundaryHiddenRow) override
+    {
+        auto& impl = mCoordinator.checkedImpl(request);
+        ELLM_CHECK(slot >= 0 && slot < static_cast<int32_t>(impl.sequences.size()),
+            "Hybrid+MTP endpoint publication slot is outside the active batch");
+        auto& sequence = impl.sequences[static_cast<size_t>(slot)];
+
+        // Guard/skip mirrors publishHybridMtpContextCacheBoundary (ref llmInferenceRuntime.cpp :3308) and
+        // publishReadyHybridEndpoints: a bypass request never publishes, an already-published boundary is idempotent,
+        // and an empty prefix has nothing to snapshot.
+        if (sequence.lookupPolicy == ContextCacheLookupPolicy::kBypass || residentStateLength <= 0
+            || residentStateLength <= sequence.publishedExactLength)
+        {
+            return ContextCacheCoordinatorStatus::kOk;
+        }
+        ELLM_CHECK(static_cast<size_t>(residentStateLength) <= sequence.tokenIds.size(),
+            "Hybrid+MTP endpoint length exceeds the logical token history");
+        ELLM_CHECK(boundaryHiddenRow >= 0, "Hybrid+MTP publication has an empty prefill chunk for its boundary hidden");
+
+        // Release any hit-restore snapshot pins before reserving producer storage (ref :3336), then reserve the paired
+        // recurrent + partial-KV slots. Retention pressure is a soft skip, exactly like reserveHybridCapture.
+        mCoordinator.mManager.releaseRestoredHybridSnapshots(sequence.lease);
+        std::optional<HybridSnapshotReservation> const reservation
+            = mCoordinator.mManager.reserveHybridSnapshots(sequence.lease, /*needsPartialKvSnapshot=*/true);
+        if (!reservation.has_value())
+        {
+            ++mCoordinator.mMetrics.hybridSnapshotPressureSkips;
+            if (shouldLogDegradation(mCoordinator.mMetrics.hybridSnapshotPressureSkips))
+            {
+                LOG_WARNING("Context cache hybrid snapshot-pressure skip count reached %llu",
+                    static_cast<unsigned long long>(mCoordinator.mMetrics.hybridSnapshotPressureSkips));
+            }
+            return ContextCacheCoordinatorStatus::kOk;
+        }
+
+        // The successor-dependent boundary token (residentStateLength - 1) always lives in a private partial page so
+        // its draft KV can be rewritten on restore: reserve one fewer full block (ref :3324). partialTokenCount is in
+        // [1, kTOKENS_PER_PAGE]; a page-aligned length yields a full-page partial snapshot.
+        size_t const fullBlockCount = static_cast<size_t>((residentStateLength - 1) / kTOKENS_PER_PAGE);
+        int32_t const partialTokenCount = residentStateLength - static_cast<int32_t>(fullBlockCount) * kTOKENS_PER_PAGE;
+        ELLM_CHECK(reservation->partialKvSnapshotSlot.has_value() && fullBlockCount < sequence.lease.basePages().size()
+                && fullBlockCount < sequence.lease.draftPages().size(),
+            "Hybrid+MTP endpoint has no live paired partial pages");
+
+        mCoordinator.mHybridSnapshots->captureRecurrent(reservation->recurrentSnapshotSlot, slot, impl.stream);
+        mCoordinator.mHybridSnapshots->capturePartialKv(*reservation->partialKvSnapshotSlot,
+            sequence.lease.basePages()[fullBlockCount], sequence.lease.draftPages()[fullBlockCount], partialTokenCount,
+            impl.stream);
+        mCoordinator.mHybridSnapshots->captureBoundaryHidden(
+            reservation->recurrentSnapshotSlot, baseHiddenStates, slot, boundaryHiddenRow, impl.stream);
+        impl.markDeviceWorkEnqueued();
+
+        size_t const fullTokenCount = fullBlockCount * static_cast<size_t>(kTOKENS_PER_PAGE);
+        std::vector<BlockHash> hashes
+            = hashRequestFullBlocks(sequence.tokenIds.data(), fullTokenCount, sequence.keyExtras);
+        HybridCheckpointKey const checkpoint{hashRequestExactPrefix(sequence.tokenIds.data(),
+                                                 static_cast<size_t>(residentStateLength), sequence.keyExtras),
+            residentStateLength};
+
+        // The snapshot writes must be terminal before the host commit. Sync via the coordinator's synchronizer, which
+        // quarantines the request (taking ownership of the lease and its reservation pins) on a failed drain.
+        ++mCoordinator.mMetrics.hybridCaptureSynchronizations;
+        ContextCacheCoordinatorStatus const syncStatus = mCoordinator.synchronizeRequest(request);
+        if (syncStatus != ContextCacheCoordinatorStatus::kOk)
+        {
+            return syncStatus;
+        }
+
+        PublishResult const result = mCoordinator.mManager.publishHybridMtp(
+            sequence.lease, HybridPublishRequest{std::move(hashes), checkpoint, *reservation});
+        mCoordinator.recordPublication(result.status);
+        mCoordinator.mManager.retireHybridSnapshotReservation(sequence.lease, *reservation);
+        sequence.publishedExactLength = residentStateLength;
+        sequence.publishedFullBlockCount = result.publishedBaseFullBlockCount;
+        // This endpoint is published mid-prefill: the capture sync above cleared the request's pending-prefill flag,
+        // but the prefill lifecycle is not finalized yet. finalizePrefillPublication still runs to apply the
+        // post-prefill advance, and the two-chunk (volatile-tail) paths enqueue more base-prefill work after this call.
+        // Restore the invariant so the runtime's completePrefill -> finalizePrefillPublication step is satisfied.
+        impl.markDeviceWorkEnqueued();
+        return ContextCacheCoordinatorStatus::kOk;
+    }
+
+    ContextCacheCoordinatorStatus restoreMtpBoundary(
+        RequestHandle& request, int32_t slot, Tensor& baseHiddenStates, int32_t destinationRow) override
+    {
+        auto& impl = mCoordinator.checkedImpl(request);
+        ELLM_CHECK(slot >= 0 && slot < static_cast<int32_t>(impl.sequences.size()),
+            "Hybrid+MTP boundary-hidden restore slot is outside the active batch");
+        ELLM_CHECK(destinationRow >= 0, "Hybrid+MTP boundary-hidden restore has a negative destination row");
+        auto& sequence = impl.sequences[static_cast<size_t>(slot)];
+        std::optional<int32_t> const recurrentSnapshot = sequence.lease.recurrentSnapshotSlot();
+        ELLM_CHECK(recurrentSnapshot.has_value(),
+            "Hybrid+MTP boundary-hidden restore requires a bound recurrent snapshot from the cache hit");
+        mCoordinator.mHybridSnapshots->restoreBoundaryHidden(
+            *recurrentSnapshot, baseHiddenStates, slot, destinationRow, impl.stream);
+        return ContextCacheCoordinatorStatus::kOk;
+    }
+};
+
+class ContextCacheCoordinator::EagleSpecPolicy : public ContextCacheCoordinator::PublicationPolicy
+{
+public:
+    using PublicationPolicy::PublicationPolicy;
+    char const* name() const noexcept override
+    {
+        return "eagle-spec";
+    }
+
+    void onPrefillFinalized(RequestHandle& request, std::vector<ContextCacheSequenceAdvance> const& advances,
+        std::vector<int32_t> const* commonStateLengths) override
+    {
+        auto& impl = mCoordinator.checkedImpl(request);
+        ELLM_CHECK(commonStateLengths != nullptr && commonStateLengths->size() == impl.sequences.size(),
+            "EAGLE prefill finalization requires one common state length per sequence");
+        mCoordinator.applyAdvances(impl, advances);
+        for (size_t slot = 0; slot < impl.sequences.size(); ++slot)
+        {
+            auto& sequence = impl.sequences[slot];
+            int32_t const commonLength = (*commonStateLengths)[slot];
+            ELLM_CHECK(commonLength == sequence.committedStateLength,
+                "EAGLE draft initialization did not materialize the complete prompt boundary");
+            sequence.commonStateLength = commonLength;
+            sequence.frozenSpecPrefillLength = sequence.committedStateLength;
+        }
+        impl.beginSpecDraftInit();
+    }
+
+    ContextCacheCoordinatorStatus onDecodeCompleted(RequestHandle& request,
+        std::vector<ContextCacheSequenceAdvance> const& advances, std::vector<int32_t> const& publishableCompletedSlots,
+        std::vector<int32_t> const* commonStateLengths) override
+    {
+        auto& impl = mCoordinator.checkedImpl(request);
+        mCoordinator.validateEagleDecodeAdvances(impl, advances, commonStateLengths);
+        mCoordinator.applyAdvances(impl, advances);
+        for (size_t slot = 0; slot < impl.sequences.size(); ++slot)
+        {
+            impl.sequences[slot].commonStateLength = (*commonStateLengths)[slot];
+        }
+        // EAGLE verification already performs the round synchronization. It also proves the ordered draft
+        // initialization and any page-table uploads that preceded the first verification.
+        impl.markDeviceWorkSynchronized();
+        impl.endSpecDraftInit();
+        mCoordinator.publishFrozenSpecPrefill(impl);
+        mCoordinator.assertUniqueCompletedSlots(impl, publishableCompletedSlots);
+        for (int32_t const slot : publishableCompletedSlots)
+        {
+            auto const& sequence = impl.sequences[static_cast<size_t>(slot)];
+            mCoordinator.publishSpecEndpoint(impl, slot, sequence.commonStateLength, PublicationPoint::kDecodeEnd);
+        }
+        return ContextCacheCoordinatorStatus::kOk;
+    }
+
+    ContextCacheCoordinatorStatus onTerminalize(RequestHandle& request) override
+    {
+        auto& impl = mCoordinator.checkedImpl(request);
+        if (!impl.awaitingFirstSpecCompletion())
+        {
+            return ContextCacheCoordinatorStatus::kOk;
+        }
+        ELLM_CHECK(impl.hasPendingDeviceWork(), "EAGLE initialization terminalization requires pending draft work");
+        ContextCacheCoordinatorStatus const syncStatus = mCoordinator.synchronizeRequest(request);
+        if (syncStatus != ContextCacheCoordinatorStatus::kOk)
+        {
+            return syncStatus;
+        }
+        mCoordinator.publishFrozenSpecPrefill(impl);
+        impl.endSpecDraftInit();
+        return ContextCacheCoordinatorStatus::kOk;
+    }
+};
+
+std::unique_ptr<ContextCacheCoordinator::PublicationPolicy> ContextCacheCoordinator::makePublicationPolicy(
+    ContextCacheExecutionMode mode)
+{
+    if (mode == ContextCacheExecutionMode::kEAGLE)
+    {
+        return std::make_unique<EagleSpecPolicy>(*this);
+    }
+    if (mode == ContextCacheExecutionMode::kMTP)
+    {
+        return std::make_unique<HybridMtpPolicy>(*this);
+    }
+    if (isHybridDeployment())
+    {
+        return std::make_unique<HybridSnapshotPolicy>(*this);
+    }
+    return std::make_unique<BaseEndpointPolicy>(*this);
+}
 
 ContextCacheCoordinator::RequestHandle::RequestHandle(std::unique_ptr<Impl> impl) noexcept
     : mImpl(std::move(impl))
@@ -323,7 +787,8 @@ ContextCacheCoordinator::ContextCacheCoordinator(ContextCacheConfig const& confi
     ContextCacheDeploymentKind deploymentKind, ContextCachePhysicalResources resources, cudaStream_t stream,
     StreamSynchronizer synchronizer)
     : mDeploymentKind(deploymentKind)
-    , mManager(kTOKENS_PER_PAGE, makeResourceCapacities(resources, mDeploymentKind, config), config.maxRecords)
+    , mManager(
+          kTOKENS_PER_PAGE, makeResourceCapacities(resources, mDeploymentKind, deployment, config), config.maxRecords)
     , mBaseCache(resources.baseCache)
     , mBasePageTable(resources.basePageTable)
     , mDraftCache(resources.draftCache)
@@ -378,12 +843,24 @@ ContextCacheCoordinator::ContextCacheCoordinator(ContextCacheConfig const& confi
         int32_t const recurrentSlots = mManager.pools().capacity(ResourceType::kRecurrentSnapshot);
         int32_t const partialKvSlots = mManager.pools().capacity(ResourceType::kPartialKvSnapshot);
         ELLM_CHECK(recurrentSlots > 0, "Hybrid context reuse requires at least one recurrent snapshot slot");
-        if (mDeploymentKind == ContextCacheDeploymentKind::kHybrid)
+        if (mDeploymentKind == ContextCacheDeploymentKind::kHybrid
+            || mDeploymentKind == ContextCacheDeploymentKind::kHybridMtp)
         {
             ELLM_CHECK(
                 partialKvSlots > 0, "Hybrid attention context reuse requires at least one partial-KV snapshot slot");
         }
-        mHybridSnapshots = std::make_unique<HybridSnapshotStorage>(mBaseCache, recurrentSlots, partialKvSlots);
+        if (mDeploymentKind == ContextCacheDeploymentKind::kHybridMtp)
+        {
+            // Hybrid+MTP additionally snapshots the paired draft KV pages and one base-model hidden row per checkpoint
+            // (the successor-dependent boundary hidden state); makeResourceCapacities prices both into the slot counts.
+            ELLM_CHECK(mDraftCache != nullptr, "Hybrid+MTP context reuse requires validated draft cache resources");
+            mHybridSnapshots = std::make_unique<HybridSnapshotStorage>(mBaseCache, recurrentSlots, partialKvSlots,
+                mDraftCache, deployment.base.hiddenSize, kBOUNDARY_HIDDEN_TYPE);
+        }
+        else
+        {
+            mHybridSnapshots = std::make_unique<HybridSnapshotStorage>(mBaseCache, recurrentSlots, partialKvSlots);
+        }
     }
 
     if (!mSynchronizer)
@@ -417,8 +894,7 @@ ContextCacheCoordinator::AcquireSequenceResult ContextCacheCoordinator::acquireS
         int32_t const inputPages = pageCountForStateLength(static_cast<int32_t>(admission.tokenIds.size()));
         ELLM_CHECK(inputPages <= mBasePageTable.maxPagesPerSeq(),
             "Context cache input exceeds the engine page-table capacity");
-        ELLM_CHECK(
-            executionMode != ContextCacheExecutionMode::kEAGLE || inputPages <= mDraftPageTable->maxPagesPerSeq(),
+        ELLM_CHECK(!runsPairedDraftWorkingSet(executionMode) || inputPages <= mDraftPageTable->maxPagesPerSeq(),
             "Context cache input exceeds the draft engine page-table capacity");
     }
     auto const planningStart = std::chrono::steady_clock::now();
@@ -437,6 +913,13 @@ ContextCacheCoordinator::AcquireSequenceResult ContextCacheCoordinator::acquireS
         }
     }
     auto acquire = [&](ContextCacheLookupPolicy policy) {
+        if (mDeploymentKind == ContextCacheDeploymentKind::kHybridMtp)
+        {
+            // Hybrid+MTP binds the base recurrent/attention path and the equally long coherent draft path at an exact
+            // checkpoint. The candidate list is built identically to the hybrid branch above.
+            return mManager.acquireHybridMtp(
+                hybridCandidates, hashes, static_cast<int32_t>(admission.tokenIds.size()), policy);
+        }
         if (isHybridDeployment())
         {
             return mManager.acquireHybrid(hybridCandidates, hashes, static_cast<int32_t>(admission.tokenIds.size()),
@@ -478,10 +961,14 @@ ContextCacheCoordinator::BeginRequestResult ContextCacheCoordinator::beginReques
             || admission.commitPolicy == ContextCacheCommitPolicy::kPrefillStateOnly,
         "Context cache admission has an invalid commit policy");
     ELLM_CHECK(admission.executionMode == ContextCacheExecutionMode::kVanilla
-            || admission.executionMode == ContextCacheExecutionMode::kEAGLE,
+            || admission.executionMode == ContextCacheExecutionMode::kEAGLE
+            || admission.executionMode == ContextCacheExecutionMode::kMTP,
         "Context cache admission has an invalid execution mode");
     ELLM_CHECK(admission.executionMode != ContextCacheExecutionMode::kEAGLE || isSpecDeployment(),
         "EAGLE context-cache execution requires an EAGLE deployment");
+    ELLM_CHECK(admission.executionMode != ContextCacheExecutionMode::kMTP
+            || mDeploymentKind == ContextCacheDeploymentKind::kHybridMtp,
+        "MTP context-cache execution requires a Hybrid+MTP deployment");
     if (mPoisoned)
     {
         return BeginRequestResult{ContextCacheCoordinatorStatus::kPoisoned, std::nullopt};
@@ -497,6 +984,7 @@ ContextCacheCoordinator::BeginRequestResult ContextCacheCoordinator::beginReques
     auto request = std::make_unique<RequestHandle::Impl>(*this, stream);
     activeRollback.dismiss();
     request->executionMode = admission.executionMode;
+    mPublicationPolicy = makePublicationPolicy(admission.executionMode);
     int32_t maxBatchSize = mBaseCache.getKVCacheManager().getConfig().maxBatchSize;
     if (admission.executionMode == ContextCacheExecutionMode::kEAGLE)
     {
@@ -524,6 +1012,7 @@ ContextCacheCoordinator::BeginRequestResult ContextCacheCoordinator::beginReques
         sequence.reuseTokenLength = acquired.plan.reuseTokenLength;
         sequence.lookupPolicy = admission.lookupPolicy;
         sequence.commitPolicy = admission.commitPolicy;
+        sequence.replayTailLength = admission.replayTailLength;
         sequence.committedStateLength = acquired.plan.reuseTokenLength;
         sequence.commonStateLength = acquired.plan.reuseTokenLength;
         request->sequences.push_back(std::move(sequence));
@@ -567,7 +1056,7 @@ ContextCacheCoordinator::RequestHandle::Impl& ContextCacheCoordinator::checkedIm
 ContextCacheCoordinatorStatus ContextCacheCoordinator::preparePrefill(RequestHandle& request)
 {
     RequestHandle::Impl& impl = checkedImpl(request);
-    ELLM_CHECK(impl.phase == RequestHandle::Impl::Phase::kAdmitted && !impl.deviceWorkPending,
+    ELLM_CHECK(impl.admitted() && !impl.hasPendingDeviceWork(),
         "Context cache prefill preparation requires a newly admitted request");
 
     std::vector<KVPageTableRowUpdate> rows;
@@ -576,7 +1065,7 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::preparePrefill(RequestHan
     {
         rows.reserve(impl.sequences.size());
     }
-    if (isSpecRequest(impl))
+    if (runsPairedDraftWorkingSet(impl.executionMode))
     {
         draftRows.reserve(impl.sequences.size());
     }
@@ -592,24 +1081,24 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::preparePrefill(RequestHan
             rows.push_back(KVPageTableRowUpdate{static_cast<int32_t>(slot), pages.empty() ? nullptr : pages.data(),
                 static_cast<int32_t>(pages.size())});
         }
-        if (isSpecRequest(impl))
+        if (runsPairedDraftWorkingSet(impl.executionMode))
         {
             auto const& pages = sequence.lease.draftPages();
             ELLM_CHECK(pages.size() == sequence.lease.basePages().size(),
-                "EAGLE context-cache prefill requires equal base and draft page paths");
+                "Paired-draft context-cache prefill requires equal base and draft page paths");
             draftRows.push_back(KVPageTableRowUpdate{static_cast<int32_t>(slot), pages.empty() ? nullptr : pages.data(),
                 static_cast<int32_t>(pages.size())});
         }
         reuseLengths[slot] = sequence.reuseTokenLength;
     }
 
-    impl.deviceWorkPending = true;
+    impl.beginPrefill();
     if (deploymentHasAttention())
     {
         mBasePageTable.setRows(rows);
         mBasePageTable.upload(impl.stream);
     }
-    if (isSpecRequest(impl))
+    if (runsPairedDraftWorkingSet(impl.executionMode))
     {
         mDraftPageTable->setRows(draftRows);
         mDraftPageTable->upload(impl.stream);
@@ -631,30 +1120,51 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::preparePrefill(RequestHan
             if (std::optional<int32_t> const partialSnapshot = sequence.lease.partialKvSnapshotSlot();
                 partialSnapshot.has_value())
             {
-                int32_t const validTokenCount = sequence.reuseTokenLength % kTOKENS_PER_PAGE;
-                size_t const destinationIndex = static_cast<size_t>(sequence.reuseTokenLength / kTOKENS_PER_PAGE);
+                // Hybrid+MTP always keeps the boundary token (reuseLength - 1) in a private partial page so its draft
+                // KV can be rewritten by the fold: index the boundary page as (reuseLength - 1) / P (mirrors ref
+                // llmInferenceRuntime.cpp :3011-3027). Plain hybrid uses the natural page split.
+                bool const isMtp = mDeploymentKind == ContextCacheDeploymentKind::kHybridMtp;
+                size_t const destinationIndex = isMtp
+                    ? static_cast<size_t>((sequence.reuseTokenLength - 1) / kTOKENS_PER_PAGE)
+                    : static_cast<size_t>(sequence.reuseTokenLength / kTOKENS_PER_PAGE);
+                int32_t const validTokenCount
+                    = sequence.reuseTokenLength - static_cast<int32_t>(destinationIndex) * kTOKENS_PER_PAGE;
                 ELLM_CHECK(validTokenCount > 0 && destinationIndex < sequence.lease.basePages().size(),
                     "Hybrid partial-KV restore has no private destination page");
-                mHybridSnapshots->restorePartialKv(
-                    *partialSnapshot, sequence.lease.basePages()[destinationIndex], validTokenCount, impl.stream);
+                if (isMtp)
+                {
+                    // Restore the paired draft partial page into the lease's draft boundary page. The boundary draft
+                    // slot itself is recomputed later by the runtime fold; here we only restore the page contents.
+                    ELLM_CHECK(destinationIndex < sequence.lease.draftPages().size(),
+                        "Hybrid MTP partial-KV restore has no private draft destination page");
+                    mHybridSnapshots->restorePartialKv(*partialSnapshot, sequence.lease.basePages()[destinationIndex],
+                        sequence.lease.draftPages()[destinationIndex], validTokenCount, impl.stream);
+                }
+                else
+                {
+                    mHybridSnapshots->restorePartialKv(
+                        *partialSnapshot, sequence.lease.basePages()[destinationIndex], validTokenCount, impl.stream);
+                }
             }
             ++mMetrics.hybridRestores;
         }
     }
     mBaseCache.resetForNewSequences(*mHostReuseLengths, impl.stream);
-    if (isSpecRequest(impl))
+    // Any paired-draft request (EAGLE or Hybrid+MTP) must reset the draft cache's per-request active batch size / KV
+    // lengths here too; otherwise the draft cache keeps the previous request's compacted batch size and the draft-side
+    // commitSequenceLength fails on the next request.
+    if (runsPairedDraftWorkingSet(impl.executionMode))
     {
         mDraftCache->resetForNewSequences(*mHostReuseLengths, impl.stream);
     }
-    impl.phase = RequestHandle::Impl::Phase::kExecuting;
     return ContextCacheCoordinatorStatus::kOk;
 }
 
 ContextCacheCoordinatorStatus ContextCacheCoordinator::enqueuePrefillCaptures(RequestHandle& request)
 {
     RequestHandle::Impl& impl = checkedImpl(request);
-    ELLM_CHECK(impl.phase == RequestHandle::Impl::Phase::kExecuting && impl.deviceWorkPending,
-        "Context cache prefill capture requires pending prefill work");
+    ELLM_CHECK(
+        impl.executing() && impl.hasPendingDeviceWork(), "Context cache prefill capture requires pending prefill work");
     if (!isHybridDeployment())
     {
         return ContextCacheCoordinatorStatus::kOk;
@@ -821,7 +1331,8 @@ void ContextCacheCoordinator::publishReadyEndpoint(RequestHandle::Impl& request,
 void ContextCacheCoordinator::publishSpecEndpoint(
     RequestHandle::Impl& request, int32_t slot, int32_t commonStateLength, PublicationPoint point)
 {
-    ELLM_CHECK(isSpecRequest(request), "Speculative endpoint publication requires an EAGLE request");
+    ELLM_CHECK(
+        usesFrozenSpecPublication(request.executionMode), "Speculative endpoint publication requires an EAGLE request");
     auto& sequence = request.sequences[static_cast<size_t>(slot)];
     ELLM_CHECK(commonStateLength >= sequence.publishedFullBlockCount * kTOKENS_PER_PAGE
             && commonStateLength <= sequence.committedStateLength,
@@ -864,7 +1375,8 @@ void ContextCacheCoordinator::recordPublication(PublishStatus status) noexcept
 
 void ContextCacheCoordinator::publishFrozenSpecPrefill(RequestHandle::Impl& request)
 {
-    ELLM_CHECK(isSpecRequest(request), "Frozen speculative publication requires an EAGLE request");
+    ELLM_CHECK(
+        usesFrozenSpecPublication(request.executionMode), "Frozen speculative publication requires an EAGLE request");
     for (int32_t slot = 0; slot < static_cast<int32_t>(request.sequences.size()); ++slot)
     {
         auto& sequence = request.sequences[static_cast<size_t>(slot)];
@@ -878,30 +1390,86 @@ void ContextCacheCoordinator::publishFrozenSpecPrefill(RequestHandle::Impl& requ
     }
 }
 
-ContextCacheCoordinatorStatus ContextCacheCoordinator::terminalizeSpecInitialization(RequestHandle& request)
+void ContextCacheCoordinator::validateEagleDecodeAdvances(RequestHandle::Impl const& request,
+    std::vector<ContextCacheSequenceAdvance> const& advances, std::vector<int32_t> const* commonStateLengths) const
 {
-    RequestHandle::Impl& impl = checkedImpl(request);
-    if (!impl.specAwaitingFirstCompletion)
+    ELLM_CHECK(commonStateLengths != nullptr && commonStateLengths->size() == request.sequences.size(),
+        "EAGLE decode completion requires one common state length per sequence");
+    for (size_t slot = 0; slot < request.sequences.size(); ++slot)
     {
-        return ContextCacheCoordinatorStatus::kOk;
+        auto const& sequence = request.sequences[slot];
+        auto const& delta = advances[slot];
+        int32_t const commonLength = (*commonStateLengths)[slot];
+        int64_t const expectedCommittedStateLength
+            = static_cast<int64_t>(sequence.committedStateLength) + static_cast<int64_t>(delta.acceptedTokenCount);
+        int64_t const expectedTokenCount = static_cast<int64_t>(sequence.committedStateLength) + 1;
+        ELLM_CHECK(delta.acceptedTokenCount > 0 && expectedCommittedStateLength <= std::numeric_limits<int32_t>::max()
+                && delta.committedStateLength == expectedCommittedStateLength && expectedTokenCount >= 0
+                && sequence.tokenIds.size() == static_cast<size_t>(expectedTokenCount),
+            "EAGLE decode progress violates the committed-plus-lookahead invariant");
+        ELLM_CHECK(commonLength >= sequence.commonStateLength && commonLength <= delta.committedStateLength,
+            "EAGLE common state is not a monotonic base-state prefix");
     }
-    ELLM_CHECK(isSpecRequest(impl) && impl.deviceWorkPending,
-        "EAGLE initialization terminalization requires pending draft work");
-    ContextCacheCoordinatorStatus const syncStatus = synchronizeRequest(request);
-    if (syncStatus != ContextCacheCoordinatorStatus::kOk)
+}
+
+void ContextCacheCoordinator::validateVanillaDecodeAdvances(RequestHandle::Impl const& request,
+    std::vector<ContextCacheSequenceAdvance> const& advances, std::vector<int32_t> const* commonStateLengths) const
+{
+    ELLM_CHECK(commonStateLengths == nullptr || commonStateLengths->empty(),
+        "Vanilla decode supplied speculative common-state lengths");
+    validateCommittedLookaheadAdvances(request, advances, /*tokensPerStep=*/TokensPerDecodeStep::kExactlyOne);
+}
+
+void ContextCacheCoordinator::validateMtpDecodeAdvances(RequestHandle::Impl const& request,
+    std::vector<ContextCacheSequenceAdvance> const& advances, std::vector<int32_t> const* commonStateLengths) const
+{
+    // MTP speculative-decodes without EAGLE's common-state tracking, so it supplies no common-state lengths, but it
+    // shares EAGLE's committed-plus-lookahead bookkeeping and accepts a variable number of tokens per step.
+    ELLM_CHECK(
+        commonStateLengths == nullptr || commonStateLengths->empty(), "MTP decode supplied EAGLE common-state lengths");
+    validateCommittedLookaheadAdvances(request, advances, /*tokensPerStep=*/TokensPerDecodeStep::kAcceptedCount);
+}
+
+void ContextCacheCoordinator::validateCommittedLookaheadAdvances(RequestHandle::Impl const& request,
+    std::vector<ContextCacheSequenceAdvance> const& advances, TokensPerDecodeStep tokensPerStep) const
+{
+    // Both flavors hold tokenIds as the committed prefix plus exactly one lookahead token. They differ only in how
+    // far committedStateLength moves per step: a speculative step commits everything it accepted, a vanilla step
+    // commits the single sampled token.
+    bool const multiToken = tokensPerStep == TokensPerDecodeStep::kAcceptedCount;
+    for (size_t slot = 0; slot < request.sequences.size(); ++slot)
     {
-        return syncStatus;
+        auto const& sequence = request.sequences[slot];
+        auto const& delta = advances[slot];
+        int64_t const expectedCommittedStateLength = static_cast<int64_t>(sequence.committedStateLength)
+            + (multiToken ? static_cast<int64_t>(delta.acceptedTokenCount) : 1);
+        int64_t const expectedTokenCount = static_cast<int64_t>(sequence.committedStateLength) + 1;
+        ELLM_CHECK((multiToken ? delta.acceptedTokenCount > 0 : delta.acceptedTokenCount == 1)
+                && expectedCommittedStateLength <= std::numeric_limits<int32_t>::max()
+                && delta.committedStateLength == expectedCommittedStateLength
+                && sequence.tokenIds.size() == static_cast<size_t>(expectedTokenCount),
+            "Context cache decode progress violates the committed-plus-lookahead invariant");
     }
-    publishFrozenSpecPrefill(impl);
-    impl.specAwaitingFirstCompletion = false;
-    return ContextCacheCoordinatorStatus::kOk;
+}
+
+void ContextCacheCoordinator::assertUniqueCompletedSlots(
+    RequestHandle::Impl const& request, std::vector<int32_t> const& publishableCompletedSlots) const
+{
+    std::vector<uint8_t> published(request.sequences.size(), 0U);
+    for (int32_t const slot : publishableCompletedSlots)
+    {
+        ELLM_CHECK(slot >= 0 && slot < static_cast<int32_t>(request.sequences.size()),
+            "Context cache completed slot is outside the active batch");
+        ELLM_CHECK(published[static_cast<size_t>(slot)] == 0U, "Context cache completed slot appears more than once");
+        published[static_cast<size_t>(slot)] = 1U;
+    }
 }
 
 ContextCacheCoordinatorStatus ContextCacheCoordinator::finalizePrefillPublication(RequestHandle& request,
     std::vector<ContextCacheSequenceAdvance> const& advances, std::vector<int32_t> const* commonStateLengths)
 {
     RequestHandle::Impl& impl = checkedImpl(request);
-    ELLM_CHECK(impl.phase == RequestHandle::Impl::Phase::kExecuting && impl.deviceWorkPending,
+    ELLM_CHECK(impl.executing() && impl.hasPendingDeviceWork(),
         "Context cache prefill finalization requires pending prefill work");
     ELLM_CHECK(
         advances.size() == impl.sequences.size(), "Context cache prefill advances must describe every active sequence");
@@ -913,57 +1481,40 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::finalizePrefillPublicatio
                 && delta.committedStateLength == static_cast<int32_t>(sequence.tokenIds.size()),
             "Context cache prefill progress does not describe a complete input plus one lookahead");
     }
-    if (isSpecRequest(impl))
-    {
-        ELLM_CHECK(commonStateLengths != nullptr && commonStateLengths->size() == impl.sequences.size(),
-            "EAGLE prefill finalization requires one common state length per sequence");
-    }
-    else
-    {
-        ELLM_CHECK(commonStateLengths == nullptr || commonStateLengths->empty(),
-            "Non-speculative prefill supplied speculative common-state lengths");
-        impl.deviceWorkPending = false;
-    }
-    applyAdvances(impl, advances);
-    if (isSpecRequest(impl))
-    {
-        for (size_t slot = 0; slot < impl.sequences.size(); ++slot)
-        {
-            auto& sequence = impl.sequences[slot];
-            int32_t const commonLength = (*commonStateLengths)[slot];
-            ELLM_CHECK(commonLength == sequence.committedStateLength,
-                "EAGLE draft initialization did not materialize the complete prompt boundary");
-            sequence.commonStateLength = commonLength;
-            sequence.frozenSpecPrefillLength = sequence.committedStateLength;
-        }
-        impl.specAwaitingFirstCompletion = true;
-    }
-    else if (isHybridDeployment())
-    {
-        for (auto& sequence : impl.sequences)
-        {
-            mManager.releaseRestoredHybridSnapshots(sequence.lease);
-        }
-        publishReadyHybridEndpoints(impl);
-    }
-    else
-    {
-        for (int32_t slot = 0; slot < static_cast<int32_t>(impl.sequences.size()); ++slot)
-        {
-            publishReadyEndpoint(impl, slot, PublicationPoint::kPrefillEnd);
-        }
-    }
+    mPublicationPolicy->onPrefillFinalized(request, advances, commonStateLengths);
     return ContextCacheCoordinatorStatus::kOk;
+}
+
+ContextCacheCoordinatorStatus ContextCacheCoordinator::publishHybridMtpEndpoint(RequestHandle& request, int32_t slot,
+    int32_t residentStateLength, Tensor const& baseHiddenStates, int32_t boundaryHiddenRow)
+{
+    checkedImpl(request);
+    ELLM_CHECK(mDeploymentKind == ContextCacheDeploymentKind::kHybridMtp && mHybridSnapshots != nullptr,
+        "Hybrid+MTP endpoint publication requires a Hybrid+MTP deployment with snapshot storage");
+    return mPublicationPolicy->publishMtpBoundary(
+        request, slot, residentStateLength, baseHiddenStates, boundaryHiddenRow);
+}
+
+ContextCacheCoordinatorStatus ContextCacheCoordinator::restoreHybridMtpBoundaryHidden(
+    RequestHandle& request, int32_t slot, Tensor& baseHiddenStates, int32_t destinationRow)
+{
+    checkedImpl(request);
+    ELLM_CHECK(mDeploymentKind == ContextCacheDeploymentKind::kHybridMtp && mHybridSnapshots != nullptr,
+        "Hybrid+MTP boundary-hidden restore requires a Hybrid+MTP deployment with snapshot storage");
+    return mPublicationPolicy->restoreMtpBoundary(request, slot, baseHiddenStates, destinationRow);
 }
 
 ContextCacheCoordinatorStatus ContextCacheCoordinator::prepareDecodeStep(RequestHandle& request)
 {
     RequestHandle::Impl& impl = checkedImpl(request);
-    ELLM_CHECK(impl.phase == RequestHandle::Impl::Phase::kExecuting
-            && (!impl.deviceWorkPending || (isSpecRequest(impl) && impl.specAwaitingFirstCompletion)),
+    ELLM_CHECK(impl.executing()
+            && (!impl.hasPendingDeviceWork()
+                || (usesFrozenSpecPublication(impl.executionMode) && impl.awaitingFirstSpecCompletion())),
         "Context cache decode preparation requires terminal prior work");
 
-    if (isSpecRequest(impl))
+    // EAGLE and Hybrid+MTP both grow the paired base+draft working set (growSpecPages) and upload both page tables.
+    // A Hybrid+MTP lease is kHybridMtp, which growBasePages rejects, so it must take this speculative decode path.
+    if (runsPairedDraftWorkingSet(impl.executionMode))
     {
         struct PageDemand
         {
@@ -981,7 +1532,7 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::prepareDecodeStep(Request
             int32_t const draftPages = pageCountForStateLength(sequence.committedStateLength + mSpecDraftWorkingTokens);
             if (basePages > mBasePageTable.maxPagesPerSeq() || draftPages > mDraftPageTable->maxPagesPerSeq())
             {
-                impl.phase = RequestHandle::Impl::Phase::kFinishing;
+                impl.markFinishing();
                 return ContextCacheCoordinatorStatus::kRequestFailed;
             }
             demands.push_back(PageDemand{basePages, draftPages});
@@ -1000,7 +1551,7 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::prepareDecodeStep(Request
                 = demands[slot].draftPages - static_cast<int32_t>(sequence.lease.draftPages().size());
             if (!mManager.growSpecPages(sequence.lease, std::max(0, baseGrowth), std::max(0, draftGrowth)))
             {
-                impl.phase = RequestHandle::Impl::Phase::kFinishing;
+                impl.markFinishing();
                 return ContextCacheCoordinatorStatus::kRequestFailed;
             }
             if (baseGrowth > 0)
@@ -1016,7 +1567,7 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::prepareDecodeStep(Request
                     static_cast<int32_t>(slot), draftPages.data(), static_cast<int32_t>(draftPages.size())});
             }
         }
-        impl.deviceWorkPending = true;
+        impl.markDeviceWorkEnqueued();
         if (!baseRows.empty())
         {
             mBasePageTable.setRows(baseRows);
@@ -1045,13 +1596,13 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::prepareDecodeStep(Request
             int32_t const requiredPages = pageCountForStateLength(sequence.committedStateLength + 1);
             if (requiredPages > mBasePageTable.maxPagesPerSeq())
             {
-                impl.phase = RequestHandle::Impl::Phase::kFinishing;
+                impl.markFinishing();
                 return ContextCacheCoordinatorStatus::kRequestFailed;
             }
             int32_t const currentPages = static_cast<int32_t>(sequence.lease.basePages().size());
             if (requiredPages > currentPages && !mManager.growBasePages(sequence.lease, requiredPages - currentPages))
             {
-                impl.phase = RequestHandle::Impl::Phase::kFinishing;
+                impl.markFinishing();
                 return ContextCacheCoordinatorStatus::kRequestFailed;
             }
             if (requiredPages > currentPages)
@@ -1067,7 +1618,7 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::prepareDecodeStep(Request
             mBasePageTable.upload(impl.stream);
         }
     }
-    impl.deviceWorkPending = true;
+    impl.markDeviceWorkEnqueued();
     return ContextCacheCoordinatorStatus::kOk;
 }
 
@@ -1076,131 +1627,29 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::completeDecodeStep(Reques
     std::vector<int32_t> const* commonStateLengths)
 {
     RequestHandle::Impl& impl = checkedImpl(request);
-    ELLM_CHECK(impl.phase == RequestHandle::Impl::Phase::kExecuting && impl.deviceWorkPending,
+    ELLM_CHECK(impl.executing() && impl.hasPendingDeviceWork(),
         "Context cache decode completion requires pending decode work");
     ELLM_CHECK(
         advances.size() == impl.sequences.size(), "Context cache decode advances must describe every active sequence");
-    if (isSpecRequest(impl))
-    {
-        ELLM_CHECK(commonStateLengths != nullptr && commonStateLengths->size() == impl.sequences.size(),
-            "EAGLE decode completion requires one common state length per sequence");
-        for (size_t slot = 0; slot < impl.sequences.size(); ++slot)
-        {
-            auto const& sequence = impl.sequences[slot];
-            auto const& delta = advances[slot];
-            int32_t const commonLength = (*commonStateLengths)[slot];
-            int64_t const expectedCommittedStateLength
-                = static_cast<int64_t>(sequence.committedStateLength) + static_cast<int64_t>(delta.acceptedTokenCount);
-            int64_t const expectedTokenCount = static_cast<int64_t>(sequence.committedStateLength) + 1;
-            ELLM_CHECK(delta.acceptedTokenCount > 0
-                    && expectedCommittedStateLength <= std::numeric_limits<int32_t>::max()
-                    && delta.committedStateLength == expectedCommittedStateLength && expectedTokenCount >= 0
-                    && sequence.tokenIds.size() == static_cast<size_t>(expectedTokenCount),
-                "EAGLE decode progress violates the committed-plus-lookahead invariant");
-            ELLM_CHECK(commonLength >= sequence.commonStateLength && commonLength <= delta.committedStateLength,
-                "EAGLE common state is not a monotonic base-state prefix");
-        }
-    }
-    else
-    {
-        ELLM_CHECK(commonStateLengths == nullptr || commonStateLengths->empty(),
-            "Non-speculative decode supplied speculative common-state lengths");
-        for (size_t slot = 0; slot < impl.sequences.size(); ++slot)
-        {
-            auto const& sequence = impl.sequences[slot];
-            auto const& delta = advances[slot];
-            int64_t const expectedStateLength = static_cast<int64_t>(sequence.committedStateLength) + 1;
-            ELLM_CHECK(delta.acceptedTokenCount == 1 && expectedStateLength <= std::numeric_limits<int32_t>::max()
-                    && delta.committedStateLength == expectedStateLength
-                    && sequence.tokenIds.size() == static_cast<size_t>(expectedStateLength),
-                "Context cache vanilla decode progress violates the committed-plus-lookahead invariant");
-        }
-    }
-    applyAdvances(impl, advances);
-    if (isSpecRequest(impl))
-    {
-        for (size_t slot = 0; slot < impl.sequences.size(); ++slot)
-        {
-            impl.sequences[slot].commonStateLength = (*commonStateLengths)[slot];
-        }
-        // EAGLE verification already performs the round synchronization. It also proves the ordered draft
-        // initialization and any page-table uploads that preceded the first verification.
-        impl.deviceWorkPending = false;
-        impl.specAwaitingFirstCompletion = false;
-        publishFrozenSpecPrefill(impl);
-    }
-    std::vector<uint8_t> published(impl.sequences.size(), 0U);
-    for (int32_t const slot : publishableCompletedSlots)
-    {
-        ELLM_CHECK(slot >= 0 && slot < static_cast<int32_t>(impl.sequences.size()),
-            "Context cache completed slot is outside the active batch");
-        ELLM_CHECK(published[static_cast<size_t>(slot)] == 0U, "Context cache completed slot appears more than once");
-        published[static_cast<size_t>(slot)] = 1U;
-        if (isHybridDeployment())
-        {
-            int32_t const exactLength = impl.sequences[static_cast<size_t>(slot)].committedStateLength;
-            reserveHybridCapture(impl, slot, exactLength, PublicationPoint::kDecodeEnd);
-        }
-        else if (isSpecRequest(impl))
-        {
-            auto const& sequence = impl.sequences[static_cast<size_t>(slot)];
-            publishSpecEndpoint(impl, slot, sequence.commonStateLength, PublicationPoint::kDecodeEnd);
-        }
-    }
-
-    if (isSpecRequest(impl))
-    {
-        return ContextCacheCoordinatorStatus::kOk;
-    }
-    if (isHybridDeployment())
-    {
-        bool const hasCaptures = std::any_of(impl.sequences.begin(), impl.sequences.end(),
-            [](auto const& sequence) { return sequence.stagedHybridPublication.has_value(); });
-        if (hasCaptures)
-        {
-            enqueueHybridCaptures(impl);
-            ++mMetrics.hybridCaptureSynchronizations;
-            ContextCacheCoordinatorStatus const syncStatus = synchronizeRequest(request);
-            if (syncStatus != ContextCacheCoordinatorStatus::kOk)
-            {
-                return syncStatus;
-            }
-            publishReadyHybridEndpoints(impl);
-        }
-        else
-        {
-            impl.deviceWorkPending = false;
-        }
-    }
-    else
-    {
-        impl.deviceWorkPending = false;
-        for (int32_t const slot : publishableCompletedSlots)
-        {
-            publishReadyEndpoint(impl, slot, PublicationPoint::kDecodeEnd);
-        }
-    }
-    return ContextCacheCoordinatorStatus::kOk;
+    return mPublicationPolicy->onDecodeCompleted(request, advances, publishableCompletedSlots, commonStateLengths);
 }
 
 ContextCacheCoordinatorStatus ContextCacheCoordinator::beginBatchCompaction(
     RequestHandle& request, std::vector<int32_t> const& oldToNew, int32_t newBatchSize, Tensor& deviceBatchMapping)
 {
     RequestHandle::Impl& impl = checkedImpl(request);
-    if (isSpecRequest(impl))
+    // EAGLE finalizes its two-phase draft init before compaction; other flavors no-op.
+    ContextCacheCoordinatorStatus const terminalStatus = mPublicationPolicy->onTerminalize(request);
+    if (terminalStatus != ContextCacheCoordinatorStatus::kOk)
     {
-        ContextCacheCoordinatorStatus const terminalStatus = terminalizeSpecInitialization(request);
-        if (terminalStatus != ContextCacheCoordinatorStatus::kOk)
-        {
-            return terminalStatus;
-        }
+        return terminalStatus;
     }
-    ELLM_CHECK(impl.phase == RequestHandle::Impl::Phase::kExecuting && !impl.deviceWorkPending,
+    ELLM_CHECK(impl.executing() && !impl.hasPendingDeviceWork(),
         "Context cache compaction preparation requires terminal model work");
     int32_t const oldBatchSize = static_cast<int32_t>(impl.sequences.size());
     validateCompactionMapping(oldToNew, oldBatchSize, newBatchSize);
 
-    impl.deviceWorkPending = true;
+    impl.markDeviceWorkEnqueued();
     impl.pendingCompactionMapping = oldToNew;
     impl.pendingCompactionBatchSize = newBatchSize;
     impl.pendingDeviceBatchMapping = &deviceBatchMapping;
@@ -1213,7 +1662,7 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::beginBatchCompaction(
 ContextCacheCoordinatorStatus ContextCacheCoordinator::synchronizeRequest(RequestHandle& request)
 {
     RequestHandle::Impl& impl = checkedImpl(request);
-    if (!impl.deviceWorkPending)
+    if (!impl.hasPendingDeviceWork())
     {
         return ContextCacheCoordinatorStatus::kOk;
     }
@@ -1223,15 +1672,15 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::synchronizeRequest(Reques
         quarantine(request);
         return ContextCacheCoordinatorStatus::kPoisoned;
     }
-    impl.deviceWorkPending = false;
+    impl.markDeviceWorkSynchronized();
     return ContextCacheCoordinatorStatus::kOk;
 }
 
 ContextCacheCoordinatorStatus ContextCacheCoordinator::compactBatch(RequestHandle& request)
 {
     RequestHandle::Impl& impl = checkedImpl(request);
-    ELLM_CHECK(impl.phase == RequestHandle::Impl::Phase::kExecuting && impl.deviceWorkPending,
-        "Context cache compaction requires prepared pending work");
+    ELLM_CHECK(
+        impl.executing() && impl.hasPendingDeviceWork(), "Context cache compaction requires prepared pending work");
     ELLM_CHECK(impl.pendingCompactionBatchSize >= 0 && impl.pendingDeviceBatchMapping != nullptr,
         "Context cache compaction is missing its authoritative mapping");
     std::vector<int32_t> const& oldToNew = impl.pendingCompactionMapping;
@@ -1251,13 +1700,15 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::compactBatch(RequestHandl
         mBasePageTable.compactRows(oldToNew, newBatchSize);
         mBasePageTable.upload(impl.stream);
     }
-    if (isSpecRequest(impl))
+    // Any request that grew a paired draft page path at decode (EAGLE or Hybrid+MTP) must compact the draft page table
+    // and draft cache alongside the base side; otherwise the draft rows/state desynchronize from the survivor batch.
+    if (runsPairedDraftWorkingSet(impl.executionMode))
     {
         mDraftPageTable->compactRows(oldToNew, newBatchSize);
         mDraftPageTable->upload(impl.stream);
     }
     mBaseCache.compactBatchSlotState(deviceBatchMapping, oldBatchSize, newBatchSize, impl.stream);
-    if (isSpecRequest(impl))
+    if (runsPairedDraftWorkingSet(impl.executionMode))
     {
         mDraftCache->compactBatchSlotState(deviceBatchMapping, oldBatchSize, newBatchSize, impl.stream);
     }
@@ -1281,13 +1732,13 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::compactBatch(RequestHandl
     impl.pendingCompactionBatchSize = -1;
     impl.pendingDeviceBatchMapping = nullptr;
     mBaseCache.setActiveBatchSize(newBatchSize);
-    if (isSpecRequest(impl))
+    if (runsPairedDraftWorkingSet(impl.executionMode))
     {
         mDraftCache->setActiveBatchSize(newBatchSize);
     }
     if (newBatchSize == 0)
     {
-        impl.phase = RequestHandle::Impl::Phase::kFinishing;
+        impl.markFinishing();
     }
     return ContextCacheCoordinatorStatus::kOk;
 }
@@ -1308,13 +1759,11 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::finish(RequestHandle& req
     {
         return ContextCacheCoordinatorStatus::kOk;
     }
-    if (isSpecRequest(checkedImpl(request)))
+    // EAGLE finalizes its two-phase draft init at completion; other flavors no-op.
+    ContextCacheCoordinatorStatus const terminalStatus = mPublicationPolicy->onTerminalize(request);
+    if (terminalStatus != ContextCacheCoordinatorStatus::kOk)
     {
-        ContextCacheCoordinatorStatus const terminalStatus = terminalizeSpecInitialization(request);
-        if (terminalStatus != ContextCacheCoordinatorStatus::kOk)
-        {
-            return terminalStatus;
-        }
+        return terminalStatus;
     }
     ContextCacheCoordinatorStatus const syncStatus = synchronizeRequest(request);
     if (syncStatus != ContextCacheCoordinatorStatus::kOk)
@@ -1332,7 +1781,7 @@ void ContextCacheCoordinator::abandon(std::unique_ptr<RequestHandle::Impl> reque
     {
         return;
     }
-    if (!request->deviceWorkPending)
+    if (!request->hasPendingDeviceWork())
     {
         request.reset();
         return;
@@ -1349,7 +1798,7 @@ void ContextCacheCoordinator::abandon(std::unique_ptr<RequestHandle::Impl> reque
     }
     if (status == cudaSuccess)
     {
-        request->deviceWorkPending = false;
+        request->markDeviceWorkSynchronized();
         request.reset();
         return;
     }
@@ -1379,7 +1828,7 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::shutdown() noexcept
         {
             return ContextCacheCoordinatorStatus::kPoisoned;
         }
-        mQuarantinedRequest->deviceWorkPending = false;
+        mQuarantinedRequest->markDeviceWorkSynchronized();
         mQuarantinedRequest.reset();
     }
     if (mRequestActive)
@@ -1421,9 +1870,24 @@ bool ContextCacheCoordinator::isSpecDeployment() const noexcept
     return isSpecKind(mDeploymentKind);
 }
 
-bool ContextCacheCoordinator::isSpecRequest(RequestHandle::Impl const& request) const noexcept
+// See contextCacheCoordinator.h for the capability-predicate rationale. Each maps ContextCacheExecutionMode to one
+// named capability and owns every call site that depends on it.
+
+bool ContextCacheCoordinator::runsPairedDraftWorkingSet(ContextCacheExecutionMode mode) const noexcept
 {
-    return request.executionMode == ContextCacheExecutionMode::kEAGLE;
+    // EAGLE and Hybrid+MTP both hold a paired base/draft lease (kSpec / kHybridMtp) and grow both page paths at decode
+    // time via growSpecPages, sized by mSpecVerifySize / mSpecDraftWorkingTokens. Governs admission-time draft
+    // capacity, draft page-table upload and draft-cache reset at prefill, paired page growth at decode, and draft
+    // page-table / draft-cache compaction on eviction.
+    return mode == ContextCacheExecutionMode::kEAGLE || mode == ContextCacheExecutionMode::kMTP;
+}
+
+bool ContextCacheCoordinator::usesFrozenSpecPublication(ContextCacheExecutionMode mode) const noexcept
+{
+    // EAGLE's two-phase draft initialization publishes a frozen prefill endpoint only after the first verification
+    // round terminalizes the ordered draft init (common-state tracking, frozenSpecPrefillLength,
+    // terminalizeSpecInitialization). Hybrid+MTP publishes via the hybrid snapshot endpoint path, no frozen phase.
+    return mode == ContextCacheExecutionMode::kEAGLE;
 }
 
 bool ContextCacheCoordinator::deploymentHasAttention() const noexcept
