@@ -27,7 +27,7 @@ wheel_packaging_precheck:
   tags: [cpu-k8s]
   image: python:3.12-bookworm
   script:
-    - python packaging/wheel_cli.py ci-precheck
+    - python3 packaging/wheel_cli.py ci-precheck
   artifacts:
     paths: [artifacts/provenance/source.json]
     expire_in: 30 days
@@ -52,7 +52,7 @@ wheel_python_base:
     - apt-get update && apt-get install -y --no-install-recommends git
     - python -m pip install "tomli==2.3.0; python_version < '3.11'"
   script:
-    - python packaging/wheel_cli.py ci-build-base
+    - python3 packaging/wheel_cli.py ci-build-base
   artifacts:
     paths: [artifacts/base/]
     expire_in: 14 days
@@ -68,7 +68,7 @@ wheel_python_base:
     - job: build_cutedsl_docker_matrix
       artifacts: true
   script:
-    - python packaging/wheel_cli.py ci-build-payload
+    - python3 packaging/wheel_cli.py ci-build-payload
   artifacts:
     paths: [artifacts/payloads/]
     expire_in: 14 days
@@ -88,7 +88,7 @@ wheel_assemble:
       - CPU_ARCH: [x86_64, aarch64]
         PYTHON_ABI: [cp310, cp311, cp312]
   script:
-    - python packaging/wheel_cli.py ci-assemble
+    - python3 packaging/wheel_cli.py ci-assemble
   artifacts:
     paths: [dist/]
     expire_in: 30 days
@@ -102,7 +102,7 @@ wheel_assemble:
     - job: wheel_assemble
       artifacts: true
   script:
-    - python packaging/wheel_cli.py ci-integration
+    - python3 packaging/wheel_cli.py ci-integration
   timeout: 3h
   interruptible: true
   artifacts:
@@ -121,7 +121,7 @@ wheel_heterogeneous_boundary:
   variables:
     WHEEL_HETEROGENEOUS_TRT_PACKAGE_DIR: $WHEEL_TRT10_X86_UBUNTU2404_CU13_DIR
   script:
-    - python packaging/wheel_cli.py ci-heterogeneous-boundary
+    - python3 packaging/wheel_cli.py ci-heterogeneous-boundary
   artifacts:
     paths: [artifacts/integration/heterogeneous-boundary.json]
     expire_in: 30 days
@@ -139,7 +139,7 @@ wheel_integration_gate:
     - job: wheel_heterogeneous_boundary
       artifacts: true
   script:
-    - python packaging/wheel_cli.py ci-integration-gate
+    - python3 packaging/wheel_cli.py ci-integration-gate
   artifacts:
     paths: [artifacts/integration/gate.json]
     expire_in: 90 days
