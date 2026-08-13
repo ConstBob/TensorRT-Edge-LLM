@@ -67,7 +67,7 @@ def __getattr__(name: str) -> Any:
 
 
 def __dir__():
-    return sorted(set(globals()) | _EXPORT_API_NAMES)
+    return sorted(set(globals()) | _EXPORT_API_NAME_SET)
 
 
 __all__ = ["__version__", *_EXPORT_API_NAMES]

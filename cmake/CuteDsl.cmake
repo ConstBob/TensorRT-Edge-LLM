@@ -322,10 +322,9 @@ function(cute_dsl_setup)
 
   if(_n_groups EQUAL 0)
     message(
-      WARNING
+      FATAL_ERROR
         "CuTe DSL: metadata.json has empty 'groups' array in ${_artifact_dir}/. "
         "Re-run build_cutedsl.py to regenerate artifacts.")
-    return()
   endif()
 
   math(EXPR _last_idx "${_n_groups} - 1")
@@ -348,10 +347,9 @@ function(cute_dsl_setup)
 
   if(NOT _active_groups)
     message(
-      WARNING
+      FATAL_ERROR
         "CuTe DSL: ENABLE_CUTE_DSL='${ENABLE_CUTE_DSL}' matched no groups in "
-        "${_metadata} (available: ${_meta_json}). Nothing will be linked.")
-    return()
+        "${_metadata} (available: ${_meta_json}).")
   endif()
 
   # Shim / --wrap branches follow the toolkit version the project uses:

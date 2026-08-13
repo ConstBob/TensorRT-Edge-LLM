@@ -1,7 +1,8 @@
 build/
-build*
+/build*/
 engines/
-onnx*
+*.onnx
+*.onnx.data
 feature-spec/
 dist/
 *.egg-info
