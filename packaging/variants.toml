@@ -358,7 +358,7 @@ embedded_target = "gb10"
 cmake_args = ["-DAARCH64_BUILD=ON", "-DENABLE_CUTE_DSL=ALL"]
 ci_runner = "local-spark"
 ci_image = "$WHEEL_IMAGE_DGX_SPARK"
-ci_trt_package = "$WHEEL_TRT10_DGX_SPARK_DIR"
+ci_trt_package = "/usr"
 ci_remote = false
 ci_gpu_uuid = "$WHEEL_GPU_UUID_SM121"
 
