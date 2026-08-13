@@ -84,6 +84,7 @@ _LLM_FP8_PAGED = _LLM_FP8 + ["--paged_kv"]
 _LLM_DENSE_PAGED = ["--is_persistent", "--export_only", "--paged_kv"]
 _LLM_DENSE_FP8_PAGED = _LLM_DENSE_PAGED + ["--in_dtype", "Float8E4M3FN"]
 _VIT = ["--is_persistent", "--export_only", "--vit_mode"]
+_VIT_FP8 = _VIT + ["--in_dtype", "Float8E4M3FN"]
 
 
 @dataclass
@@ -550,11 +551,54 @@ KERNEL_VARIANTS = [
         script_args=["--q_shape", "1,1024,14,80", "--k_shape", "1,1024,14,80"] + _VIT,
     ),
     KernelVariant(
+        name="vit_fmha_d96",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,14,96", "--k_shape", "1,1024,14,96"] + _VIT,
+    ),
+    KernelVariant(
         name="vit_fmha_d128",
         group="fmha",
         supported_sms=[100, 101, 110],
         script="fmha_cutedsl_blackwell/fmha.py",
         script_args=["--q_shape", "1,1024,14,128", "--k_shape", "1,1024,14,128"] + _VIT,
+    ),
+    # ViT FP8 input → FP16 output.
+    # Supports d ∈ {64, 80, 96, 128}.  d=80 pads the MMA tiler K to 96.
+    # d=72 has no direct variant: SM100 TMA requires the innermost GMEM
+    # stride to be 16-byte aligned, d=72 models zero-pad Q/K/V to d=80 and pass the real 1/sqrt(72)
+    # softmax scale.
+    KernelVariant(
+        name="vit_fmha_d64_fp8",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,14,64", "--k_shape", "1,1024,14,64"] + _VIT_FP8 + ["--kv_stage", "2"],
+    ),
+    KernelVariant(
+        name="vit_fmha_d80_fp8",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        # Pinned to the measured optimum: the padded K=96 smem tiles need a
+        # deeper KV pipeline than the narrower dims (shallow staging costs
+        # ~7% at long sequence lengths).
+        script_args=["--q_shape", "1,1024,14,80", "--k_shape", "1,1024,14,80"] + _VIT_FP8 + ["--kv_stage", "4"],
+    ),
+    KernelVariant(
+        name="vit_fmha_d96_fp8",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,14,96", "--k_shape", "1,1024,14,96"] + _VIT_FP8,
+    ),
+    KernelVariant(
+        name="vit_fmha_d128_fp8",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,14,128", "--k_shape", "1,1024,14,128"] + _VIT_FP8 + ["--kv_stage", "3"],
     ),
     # --- FMHA-v2 baseline (SM80/86/87/89/90/100/101/110/120/121) ---
     # These variants keep their fmha_v2 symbol names to preserve the generated

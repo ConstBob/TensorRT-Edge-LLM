@@ -1422,6 +1422,7 @@ TEST(CuteDslFMHARunnerTest, vitAccuracy)
         {{0, 32, 60, 88, 128}, 14, 64, 128},
         {{0, 16, 64}, 14, 72, 128},
         {{0, 24, 80, 144}, 14, 80, 160},
+        {{0, 40, 96, 200}, 14, 96, 256},
         {{0, 100, 200, 300}, 14, 128, 512},
         {{0, 16, 48}, 8, 64, 48, 1.0F},
         {{0, 24, 64}, 8, 80, 64, 0.37F},
@@ -1635,5 +1636,272 @@ TEST(CuteDslFMHARunnerTest, llmFp8LongSequenceAccuracy)
     runLlmFp8LongSequenceAccuracyCase(32, 2, 128);
     runLlmFp8LongSequenceAccuracyCase(16, 2, 256);
 }
+
+// ==== ViT FP8 (input FP8 E4M3, output FP16) ====
+
+#if SUPPORTS_FP8
+// Per-element check at the same tolerance fmha.py's Python validation uses (atol=0.1, rtol=1e-5, see
+// fmha.py:3242-3245).
+void expectHalfOutputsCloseAtol(
+    rt::Tensor const& actualTensor, rt::Tensor const& expectedTensor, std::string const& label, float atol, float rtol)
+{
+    ASSERT_EQ(actualTensor.getShape().volume(), expectedTensor.getShape().volume()) << label;
+
+    auto const actual = copyDeviceToHost<half>(actualTensor);
+    auto const expected = copyDeviceToHost<half>(expectedTensor);
+    auto const& shape = actualTensor.getShape();
+
+    bool nanDetected = false;
+    int64_t const totalElements = static_cast<int64_t>(actual.size());
+
+    for (int64_t idx = 0; idx < totalElements; ++idx)
+    {
+        float const actualValue = __half2float(actual[static_cast<size_t>(idx)]);
+        float const expectedValue = __half2float(expected[static_cast<size_t>(idx)]);
+
+        ASSERT_TRUE(isclose(actual[static_cast<size_t>(idx)], expected[static_cast<size_t>(idx)], rtol, atol))
+            << label << " mismatch at index=" << formatTensorIndex(shape, idx) << " flat_index=" << idx
+            << " expected=" << expectedValue << " actual=" << actualValue;
+
+        nanDetected = nanDetected || std::isnan(actualValue);
+    }
+    EXPECT_FALSE(nanDetected) << label;
+}
+
+void runViTFp8AccuracyCase(std::vector<int32_t> const& cuSeqLens, int32_t numHeads, int32_t headDim, int32_t maxSeqLen)
+{
+    int32_t const batchSize = static_cast<int32_t>(cuSeqLens.size()) - 1;
+    int32_t const totalSeqLen = cuSeqLens.back();
+
+    size_t const qkvSize = static_cast<size_t>(totalSeqLen) * numHeads * headDim;
+
+    // FP16 source data in [-1, 1]; per-tensor dequant scales picked so values fit
+    // comfortably in FP8 E4M3 range (max ≈ 448).
+    std::vector<half> qSourceFp16(qkvSize);
+    std::vector<half> kSourceFp16(qkvSize);
+    std::vector<half> vSourceFp16(qkvSize);
+    uniformFloatInitialization(qSourceFp16, -1.0f, 1.0f);
+    uniformFloatInitialization(kSourceFp16, -1.0f, 1.0f);
+    uniformFloatInitialization(vSourceFp16, -1.0f, 1.0f);
+
+    float const qScale = 0.05f;
+    float const kScale = 0.05f;
+    float const vScale = 0.05f;
+
+    // Quantize once; reference and kernel both consume the same FP8-rounded values
+    // (FP16 reference reads the dequantized form; FP8 kernel reads the raw FP8).
+    auto const qFp8 = quantizeHalfToFp8(qSourceFp16, qScale);
+    auto const kFp8 = quantizeHalfToFp8(kSourceFp16, kScale);
+    auto const vFp8 = quantizeHalfToFp8(vSourceFp16, vScale);
+    auto const qDqFp16 = dequantizeFp8ToHalf(qFp8, qScale);
+    auto const kDqFp16 = dequantizeFp8ToHalf(kFp8, kScale);
+    auto const vDqFp16 = dequantizeFp8ToHalf(vFp8, vScale);
+
+    rt::Tensor qFp8Tensor({totalSeqLen, numHeads, headDim}, rt::DeviceType::kGPU, DataType::kFP8);
+    rt::Tensor kFp8Tensor({totalSeqLen, numHeads, headDim}, rt::DeviceType::kGPU, DataType::kFP8);
+    rt::Tensor vFp8Tensor({totalSeqLen, numHeads, headDim}, rt::DeviceType::kGPU, DataType::kFP8);
+    rt::Tensor qDqFp16Tensor({totalSeqLen, numHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor kDqFp16Tensor({totalSeqLen, numHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor vDqFp16Tensor({totalSeqLen, numHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor outputReference({totalSeqLen, numHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor outputCuteDsl({totalSeqLen, numHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor cuSeqLensTensor({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
+
+    copyHostToDevice(qFp8Tensor, qFp8);
+    copyHostToDevice(kFp8Tensor, kFp8);
+    copyHostToDevice(vFp8Tensor, vFp8);
+    copyHostToDevice(qDqFp16Tensor, qDqFp16);
+    copyHostToDevice(kDqFp16Tensor, kDqFp16);
+    copyHostToDevice(vDqFp16Tensor, vDqFp16);
+    copyHostToDevice(cuSeqLensTensor, cuSeqLens);
+
+    cudaStream_t stream = nullptr;
+
+    rt::launchFmhaReferenceCompact(qDqFp16Tensor, kDqFp16Tensor, vDqFp16Tensor, outputReference, cuSeqLensTensor,
+        maxSeqLen, false, 1.0F / std::sqrt(static_cast<float>(headDim)), stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaGetLastError());
+
+    CuteDslFMHARunner runner(numHeads, numHeads, headDim);
+    runner.run(qFp8Tensor.rawPointer(), kFp8Tensor.rawPointer(), vFp8Tensor.rawPointer(),
+        outputCuteDsl.dataPointer<half>(), cuSeqLensTensor.dataPointer<int32_t>(), totalSeqLen, maxSeqLen, batchSize,
+        stream, /*attentionScale=*/1.0F / std::sqrt(static_cast<float>(headDim)), /*fp8Input=*/true, qScale, kScale,
+        vScale);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaGetLastError());
+
+    expectHalfOutputsCloseAtol(outputCuteDsl, outputReference,
+        "ViT FP8 CuTe DSL FMHA headDim=" + std::to_string(headDim) + " numHeads=" + std::to_string(numHeads),
+        /*atol=*/0.1f, /*rtol=*/1e-5f);
+}
+
+//! d=72 contract case (Phi-4 SigLIP): FP8 cannot TMA-load 72-byte rows, so
+//! callers zero-pad Q/K/V to d=80 and pass the real 1/sqrt(72) softmax
+//! scale. This must be numerically EXACT vs true d=72 attention: zero
+//! columns do not change the QK dots, and V zero columns produce zero O
+//! columns. Reference runs at native d=72; the FP8 kernel runs at d=80 on
+//! padded inputs; the first 72 output columns must match and the padded 8
+//! must be zero.
+void runViTFp8PaddedHeadDimCase(
+    std::vector<int32_t> const& cuSeqLens, int32_t numHeads, int32_t realHeadDim, int32_t maxSeqLen)
+{
+    int32_t const paddedHeadDim = 80;
+    int32_t const batchSize = static_cast<int32_t>(cuSeqLens.size()) - 1;
+    int32_t const totalSeqLen = cuSeqLens.back();
+    float const softmaxScale = 1.0F / std::sqrt(static_cast<float>(realHeadDim));
+
+    size_t const realSize = static_cast<size_t>(totalSeqLen) * numHeads * realHeadDim;
+
+    std::vector<half> qSourceFp16(realSize);
+    std::vector<half> kSourceFp16(realSize);
+    std::vector<half> vSourceFp16(realSize);
+    uniformFloatInitialization(qSourceFp16, -1.0f, 1.0f);
+    uniformFloatInitialization(kSourceFp16, -1.0f, 1.0f);
+    uniformFloatInitialization(vSourceFp16, -1.0f, 1.0f);
+
+    float const qScale = 0.05f;
+    float const kScale = 0.05f;
+    float const vScale = 0.05f;
+
+    auto const qFp8 = quantizeHalfToFp8(qSourceFp16, qScale);
+    auto const kFp8 = quantizeHalfToFp8(kSourceFp16, kScale);
+    auto const vFp8 = quantizeHalfToFp8(vSourceFp16, vScale);
+    auto const qDqFp16 = dequantizeFp8ToHalf(qFp8, qScale);
+    auto const kDqFp16 = dequantizeFp8ToHalf(kFp8, kScale);
+    auto const vDqFp16 = dequantizeFp8ToHalf(vFp8, vScale);
+
+    // Zero-pad the FP8-rounded rows from realHeadDim to paddedHeadDim
+    // (FP8 zero encodes exactly, matching the zero-padded weight rows the
+    // export produces).
+    auto padRows = [&](std::vector<__nv_fp8_e4m3> const& src) {
+        std::vector<__nv_fp8_e4m3> dst(
+            static_cast<size_t>(totalSeqLen) * numHeads * paddedHeadDim, __nv_fp8_e4m3(0.0f));
+        for (int64_t row = 0; row < static_cast<int64_t>(totalSeqLen) * numHeads; ++row)
+        {
+            std::copy(src.begin() + row * realHeadDim, src.begin() + (row + 1) * realHeadDim,
+                dst.begin() + row * paddedHeadDim);
+        }
+        return dst;
+    };
+    auto const qFp8Padded = padRows(qFp8);
+    auto const kFp8Padded = padRows(kFp8);
+    auto const vFp8Padded = padRows(vFp8);
+
+    rt::Tensor qFp8Tensor({totalSeqLen, numHeads, paddedHeadDim}, rt::DeviceType::kGPU, DataType::kFP8);
+    rt::Tensor kFp8Tensor({totalSeqLen, numHeads, paddedHeadDim}, rt::DeviceType::kGPU, DataType::kFP8);
+    rt::Tensor vFp8Tensor({totalSeqLen, numHeads, paddedHeadDim}, rt::DeviceType::kGPU, DataType::kFP8);
+    rt::Tensor qDqFp16Tensor({totalSeqLen, numHeads, realHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor kDqFp16Tensor({totalSeqLen, numHeads, realHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor vDqFp16Tensor({totalSeqLen, numHeads, realHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor outputReference({totalSeqLen, numHeads, realHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor outputCuteDsl({totalSeqLen, numHeads, paddedHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor cuSeqLensTensor({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
+
+    copyHostToDevice(qFp8Tensor, qFp8Padded);
+    copyHostToDevice(kFp8Tensor, kFp8Padded);
+    copyHostToDevice(vFp8Tensor, vFp8Padded);
+    copyHostToDevice(qDqFp16Tensor, qDqFp16);
+    copyHostToDevice(kDqFp16Tensor, kDqFp16);
+    copyHostToDevice(vDqFp16Tensor, vDqFp16);
+    copyHostToDevice(cuSeqLensTensor, cuSeqLens);
+
+    cudaStream_t stream = nullptr;
+
+    // Reference: true d=72 attention on the same FP8-rounded values.
+    rt::launchFmhaReferenceCompact(qDqFp16Tensor, kDqFp16Tensor, vDqFp16Tensor, outputReference, cuSeqLensTensor,
+        maxSeqLen, false, softmaxScale, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaGetLastError());
+
+    // Kernel: d=80 FP8 variant on the padded inputs with the d=72 scale.
+    CuteDslFMHARunner runner(numHeads, numHeads, paddedHeadDim);
+    runner.run(qFp8Tensor.rawPointer(), kFp8Tensor.rawPointer(), vFp8Tensor.rawPointer(),
+        outputCuteDsl.dataPointer<half>(), cuSeqLensTensor.dataPointer<int32_t>(), totalSeqLen, maxSeqLen, batchSize,
+        stream, softmaxScale, /*fp8Input=*/true, qScale, kScale, vScale);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaGetLastError());
+
+    // Compare the first realHeadDim columns against the true-d72 reference and
+    // require the padded columns to be exactly zero.
+    auto const actual = copyDeviceToHost<half>(outputCuteDsl);
+    auto const expected = copyDeviceToHost<half>(outputReference);
+    float maxAbsErr = 0.0f;
+    float maxPadAbs = 0.0f;
+    for (int64_t row = 0; row < static_cast<int64_t>(totalSeqLen) * numHeads; ++row)
+    {
+        for (int32_t c = 0; c < realHeadDim; ++c)
+        {
+            float const a = __half2float(actual[row * paddedHeadDim + c]);
+            float const e = __half2float(expected[row * realHeadDim + c]);
+            maxAbsErr = std::max(maxAbsErr, std::abs(a - e));
+        }
+        for (int32_t c = realHeadDim; c < paddedHeadDim; ++c)
+        {
+            maxPadAbs = std::max(maxPadAbs, std::abs(__half2float(actual[row * paddedHeadDim + c])));
+        }
+    }
+    EXPECT_LE(maxAbsErr, 0.1f) << "d=" << realHeadDim << " contract: first " << realHeadDim
+                               << " columns diverge from the native reference";
+    EXPECT_EQ(maxPadAbs, 0.0f) << "d=" << realHeadDim << " contract: padded columns must be exactly zero";
+}
+
+#endif // SUPPORTS_FP8
+
+#if SUPPORTS_FP8
+TEST(CuteDslFMHARunnerTest, vitFp8Accuracy)
+{
+    int32_t const rawSmVersion = getSMVersion();
+    if (!isSupportedCuteDslTestSm(rawSmVersion))
+    {
+        GTEST_SKIP() << "CuTe DSL FMHA unit tests only run on SM100/101/110. Current SM=" << rawSmVersion;
+    }
+
+    struct ViTFp8Case
+    {
+        std::vector<int32_t> cuSeqLens;
+        int32_t numHeads;
+        int32_t headDim;
+        int32_t maxSeqLen;
+    };
+
+    // d=80 pads the MMA tiler K to 96 inside the kernel. d=72 has no direct
+    // FP8 kernel (TMA needs 16B-aligned strides; 72 FP8 bytes are not) —
+    // d=72 callers zero-pad to d=80 and pass the real softmax scale.
+    std::vector<ViTFp8Case> const cases{
+        {{0, 32, 60, 88, 128}, 14, 64, 128},
+        {{0, 48, 120, 196}, 16, 80, 196},
+        {{0, 40, 96, 200}, 16, 96, 256},
+        {{0, 100, 200, 300}, 14, 128, 512},
+    };
+
+    for (auto const& testCase : cases)
+    {
+        std::string cuSeqLensStr = "[";
+        for (size_t i = 0; i < testCase.cuSeqLens.size(); ++i)
+        {
+            if (i)
+                cuSeqLensStr += ",";
+            cuSeqLensStr += std::to_string(testCase.cuSeqLens[i]);
+        }
+        cuSeqLensStr += "]";
+        SCOPED_TRACE(::testing::Message() << "numHeads=" << testCase.numHeads << " headDim=" << testCase.headDim
+                                          << " maxSeqLen=" << testCase.maxSeqLen << " cuSeqLens=" << cuSeqLensStr);
+        runViTFp8AccuracyCase(testCase.cuSeqLens, testCase.numHeads, testCase.headDim, testCase.maxSeqLen);
+    }
+}
+
+TEST(CuteDslFMHARunnerTest, vitFp8PaddedHeadDim72)
+{
+    int32_t const rawSmVersion = getSMVersion();
+    if (!isSupportedCuteDslTestSm(rawSmVersion))
+    {
+        GTEST_SKIP() << "CuTe DSL FMHA unit tests only run on SM100/101/110. Current SM=" << rawSmVersion;
+    }
+    // Phi-4 SigLIP contract: zero-pad d=72 to d=80 + real 1/sqrt(72) scale
+    // must reproduce true d=72 attention through the FP8 d=80 kernel.
+    runViTFp8PaddedHeadDimCase({0, 48, 120, 196}, 16, 72, 196);
+    runViTFp8PaddedHeadDimCase({0, 100, 200, 300}, 16, 72, 512);
+}
+#endif // SUPPORTS_FP8
 
 #endif
