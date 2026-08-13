@@ -86,6 +86,7 @@ enum ProfileBenchOptionId : int
     BLOCK_SIZE = 835,
     CANDIDATE_TOPK = 837,
     CHECKPOINT_DIR = 838,
+    ACCEPT_LEN = 839,
 };
 
 struct ProfileBenchArgs
@@ -113,6 +114,7 @@ struct ProfileBenchArgs
     // Speculative decoding parameters - no defaults
     int32_t verifyTreeSize{-1}; // For spec_verify
     int32_t draftTreeSize{-1};  // For spec_draft_proposal/spec_draft_prefill
+    int32_t acceptLen{-1};      // For spec_draft_accept (tokens caught up per pass; default: draftStep+1)
 
     int32_t osl{1};        // Output sequence length (LLM OSL per batch, default: 1)
     int32_t acceptRate{5}; // Avg accepted tokens per spec-decode iteration (default: 5)
@@ -142,6 +144,7 @@ struct ProfileBenchArgs
         p.pastKVLen = pastKVLen;
         p.verifyTreeSize = verifyTreeSize;
         p.draftTreeSize = draftTreeSize;
+        p.acceptLen = acceptLen;
         p.osl = osl;
         p.imageHeight = imageHeight;
         p.imageWidth = imageWidth;
@@ -171,6 +174,8 @@ void printUsage(char const* programName)
     std::cerr
         << "                              spec_verify       - Speculative decoding base model verification (EAGLE/MTP)"
         << std::endl;
+    std::cerr << "                              spec_draft_accept - Speculative decoding draft accept-token"
+              << " catch-up pass (EAGLE/MTP)" << std::endl;
     std::cerr << "                              spec_draft_proposal - Speculative decoding draft proposal (EAGLE/MTP)"
               << std::endl;
     std::cerr << "                              spec_draft_prefill - Speculative decoding draft prefill (EAGLE/MTP)"
@@ -199,6 +204,10 @@ void printUsage(char const* programName)
     std::cerr << "  For spec_draft_proposal mode:" << std::endl;
     std::cerr << "    --draftTreeSize         Draft tree size. Required." << std::endl;
     std::cerr << "    --pastKVLen             Past KV cache length. Required." << std::endl;
+    std::cerr << "  For spec_draft_accept mode:" << std::endl;
+    std::cerr << "    --acceptLen             Tokens caught up per accept pass (default: draftStep+1"
+              << " = production's fixed depth)." << std::endl;
+    std::cerr << "    --pastKVLen             Past KV cache length per batch. Required." << std::endl;
     std::cerr << "  For spec_draft_prefill mode:" << std::endl;
     std::cerr << "    --inputLen              Input sequence length. Required." << std::endl;
     std::cerr << "    --reuseKVLen            Reused KV cache length. Optional, default=0." << std::endl;
@@ -280,6 +289,7 @@ bool parseArgs(ProfileBenchArgs& args, int argc, char* argv[])
         {"pastKVLen", required_argument, 0, ProfileBenchOptionId::PAST_KV_LEN},
         {"verifyTreeSize", required_argument, 0, ProfileBenchOptionId::VERIFY_TREE_SIZE},
         {"draftTreeSize", required_argument, 0, ProfileBenchOptionId::DRAFT_TREE_SIZE},
+        {"acceptLen", required_argument, 0, ProfileBenchOptionId::ACCEPT_LEN},
         {"profile", no_argument, 0, ProfileBenchOptionId::PROFILE},
         {"outputDir", required_argument, 0, ProfileBenchOptionId::OUTPUT_DIR},
         {"osl", required_argument, 0, ProfileBenchOptionId::OSL},
@@ -358,6 +368,10 @@ bool parseArgs(ProfileBenchArgs& args, int argc, char* argv[])
                 {
                     args.mode = BenchMode::kEAGLE_DRAFT_PREFILL;
                 }
+                else if (modeStr == "spec_draft_accept" || modeStr == "eagle_draft_accept")
+                {
+                    args.mode = BenchMode::kEAGLE_DRAFT_ACCEPT;
+                }
                 else if (modeStr == "visual")
                 {
                     args.mode = BenchMode::kVISUAL;
@@ -414,6 +428,14 @@ bool parseArgs(ProfileBenchArgs& args, int argc, char* argv[])
                 if (args.draftTreeSize <= 0)
                 {
                     LOG_ERROR("Invalid draftTreeSize: must be positive");
+                    return false;
+                }
+                break;
+            case ProfileBenchOptionId::ACCEPT_LEN:
+                args.acceptLen = std::stoi(optarg);
+                if (args.acceptLen <= 0)
+                {
+                    LOG_ERROR("Invalid acceptLen: must be positive");
                     return false;
                 }
                 break;
@@ -581,6 +603,13 @@ bool validateArgs(ProfileBenchArgs const& args)
             return false;
         }
         break;
+    case BenchMode::kEAGLE_DRAFT_ACCEPT:
+        if (args.pastKVLen < 0)
+        {
+            LOG_ERROR("--pastKVLen is required for spec_draft_accept mode");
+            return false;
+        }
+        break;
     case BenchMode::kVISUAL:
         if (args.imageHeight <= 0 || args.imageWidth <= 0)
         {
@@ -666,13 +695,14 @@ static bool needsExecutor(BenchMode mode)
 bool isDraftEngineMode(BenchMode mode)
 {
     return mode == BenchMode::kEAGLE_DRAFT_PROPOSAL || mode == BenchMode::kEAGLE_DRAFT_PREFILL
-        || mode == BenchMode::kDFLASH_DRAFT_PROPOSAL || mode == BenchMode::kDFLASH_DRAFT_FIRST_ROUND;
+        || mode == BenchMode::kEAGLE_DRAFT_ACCEPT || mode == BenchMode::kDFLASH_DRAFT_PROPOSAL
+        || mode == BenchMode::kDFLASH_DRAFT_FIRST_ROUND;
 }
 
 bool isSpecDecodeMode(BenchMode mode)
 {
     return mode == BenchMode::kEAGLE_VERIFY || mode == BenchMode::kEAGLE_DRAFT_PROPOSAL
-        || mode == BenchMode::kEAGLE_DRAFT_PREFILL || isDFlashMode(mode);
+        || mode == BenchMode::kEAGLE_DRAFT_PREFILL || mode == BenchMode::kEAGLE_DRAFT_ACCEPT || isDFlashMode(mode);
 }
 
 // ==================== main ====================
@@ -1399,6 +1429,66 @@ int main(int argc, char** argv)
                 {
                     resources->cacheManagers[kvCacheIndex]->commitSequenceLength(args.acceptRate, stream);
                 }
+            };
+        }
+    }
+    else if (args.mode == BenchMode::kEAGLE_DRAFT_ACCEPT)
+    {
+        // The draft accept-token catch-up pass: one draft-engine execute over
+        // the accepted tokens (production runs it at maxAcceptDepth =
+        // draftStep+1 every iteration — see MTPDecoder::runDraftModelAcceptToken).
+        // --acceptLen sweeps the depth to expose how weight-streaming-bound
+        // the pass is; default mirrors production.
+        int32_t const acceptLen = args.acceptLen > 0 ? args.acceptLen : args.draftStep + 1;
+        args.acceptLen = acceptLen;
+        modeName = "Spec Draft Accept";
+        LOG_INFO("Spec Draft Accept mode: AcceptLen=%d, PastKVLen=%d", acceptLen, args.pastKVLen);
+        LOG_INFO(args.noCudaGraph ? "CUDA graph disabled; using non-CUDA-graph execution" : "CUDA graph enabled");
+
+        pastKVLenVec.assign(B, args.pastKVLen);
+
+        int32_t const draftHiddenSize = deployment.draft->hiddenSize;
+        check::check(io->inputsEmbeds.reshape({B, acceptLen, draftHiddenSize}), "inputsEmbeds reshape failed");
+
+        // selectTokenIndices: the accept pass emits logits for ONE selected
+        // token per batch entry (the frontier).
+        check::check(io->selectTokenIndices.reshape({B, 1}), "selectTokenIndices reshape failed");
+        CUDA_CHECK(cudaMemsetAsync(
+            io->selectTokenIndices.rawPointer(), 0, io->selectTokenIndices.getMemoryCapacity(), stream));
+
+        check::check(io->contextLengths.reshape({B}), "contextLengths reshape failed");
+        {
+            std::vector<int32_t> ctxVec(B, args.pastKVLen + acceptLen);
+            CUDA_CHECK(cudaMemcpyAsync(
+                io->contextLengths.rawPointer(), ctxVec.data(), B * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        }
+
+        auto const dims = deployment.draft->acceptDims(B, acceptLen);
+
+        resetState = [&]() {
+            std::memcpy(reuseKVCacheLengths.rawPointer(), pastKVLenVec.data(), pastKVLenVec.size() * sizeof(int32_t));
+            resources->cacheManagers[kvCacheIndex]->resetForNewSequences(reuseKVCacheLengths, stream);
+        };
+        step = [&, dims]() {
+            if (!executor->prepare(kDecodeProfile, dims, tensorMap, stream))
+                return false;
+            return executor->execute(stream);
+        };
+        captureGraph = [&, dims]() {
+            resetState();
+            if (!executor->prepare(kDecodeProfile, dims, tensorMap, stream))
+                return false;
+            return executor->captureGraph(stream);
+        };
+
+        if (args.osl > 1)
+        {
+            useSequentialE2E = true;
+            // One accept pass per spec-decode iteration (minus the first, but
+            // keep per-iteration cadence for simple tokens/sec math).
+            decodeSteps = (args.osl - 1 + args.acceptRate - 1) / args.acceptRate;
+            postStep = [&](int32_t) {
+                resources->cacheManagers[kvCacheIndex]->commitSequenceLength(args.acceptRate, stream);
             };
         }
     }
