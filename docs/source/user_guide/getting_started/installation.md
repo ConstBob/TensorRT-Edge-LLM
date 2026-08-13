@@ -412,7 +412,7 @@ Build time: ~1-2 minutes depending on hardware.
 
 ## Next Steps
 
-After installation, proceed to the [Quick Start Guide](quick-start-guide.md) for a complete end-to-end workflow, or see the [Examples](../examples/) for detailed pipeline stages and advanced use cases.
+After installation, proceed to the [Quick Start Guide](quick-start-guide.md) for a complete end-to-end workflow, or see the [Examples](../examples/index.md) for detailed pipeline stages and advanced use cases.
 
 ---
 
