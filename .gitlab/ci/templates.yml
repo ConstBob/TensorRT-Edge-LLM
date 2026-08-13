@@ -147,6 +147,7 @@
 
 .checkpoint_export_template:
   extends:
+    - .ci_test_submodules
     - .gitlab_junit_report
   script:
     - |
