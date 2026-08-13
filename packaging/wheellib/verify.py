@@ -404,8 +404,10 @@ def _audit_binary_dependencies(payload: Mapping[str, Any], extension: Path,
         _audit_local_dependencies(plugin, False)
 
 
-def _audit_payload_size(package_stage: Path, size_budget_path: Path) -> None:
-    budget = int(load_toml(size_budget_path)["payload"]["unpacked_bytes"])
+def _audit_payload_size(package_stage: Path, size_budget_path: Path,
+                        cpu_arch: str) -> None:
+    budget = int(
+        load_toml(size_budget_path)["payload"][cpu_arch]["unpacked_bytes"])
     unpacked = sum(path.stat().st_size for path in package_stage.rglob("*")
                    if path.is_file())
     if unpacked > budget:
@@ -439,7 +441,8 @@ def verify(stage: Path,
     if require_device_images:
         _audit_device_images(extension, int(payload["gpu_sm"]))
         _audit_device_images(plugin, int(payload["gpu_sm"]))
-    _audit_payload_size(package_stage, size_budget_path)
+    _audit_payload_size(package_stage, size_budget_path,
+                        str(payload["cpu_arch"]))
     return payload
 
 

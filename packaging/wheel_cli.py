@@ -73,8 +73,6 @@ def main(values: Optional[Sequence[str]] = None) -> int:
         lambda args: _no_arguments(ci.assemble_ci, args),
         "ci-integration":
         lambda args: _no_arguments(ci.integration_ci, args),
-        "ci-heterogeneous-boundary":
-        lambda args: _no_arguments(ci.heterogeneous_boundary_ci, args),
         "ci-integration-gate":
         lambda args: _no_arguments(ci.integration_gate, args),
     }

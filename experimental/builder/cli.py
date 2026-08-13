@@ -20,6 +20,7 @@ import os
 from dataclasses import replace
 from typing import Iterable, Optional, Sequence, Tuple, Union
 
+from tensorrt_edgellm._native import NativeManifestNotFoundError
 from tensorrt_edgellm._native.load import resolve_payload
 
 LOGGER = logging.getLogger("experimental.builder")
@@ -229,7 +230,10 @@ def _build(args: argparse.Namespace) -> None:
 
     plugin_path = args.plugin_path
     if plugin_path is None:
-        plugin_path = str(resolve_payload().plugin)
+        try:
+            plugin_path = str(resolve_payload().plugin)
+        except NativeManifestNotFoundError:
+            plugin_path = "build/libNvInfer_edgellm_plugin.so"
     args = _copy_args(args, plugin_path=plugin_path)
     bundle, components = _resolve_build_selection(args)
     plugin_handle = load_plugin_library(plugin_path)

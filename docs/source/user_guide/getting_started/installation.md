@@ -1,9 +1,9 @@
 # Installation
 
-## CI-built wheel installation
+## Wheel installation
 
-TensorRT Edge-LLM CI assembles one x86_64 and one aarch64 wheel for each
-supported CPython minor version. Each wheel contains the checkpoint/export
+TensorRT Edge-LLM provides one x86_64 and one aarch64 wheel for each supported
+CPython minor version. Each wheel contains the checkpoint/export
 frontend, the `tensorrt-edgellm-build` engine builder, the Python runtime API,
 and every qualified native payload for that CPU architecture. Payload selection
 happens at runtime; users do not choose an SM during installation.
@@ -14,10 +14,22 @@ into the EdgeLLM wheel. See the
 [wheel qualification table](support-matrix.md#wheel-qualification) for exact
 platform rows.
 
-### Install a wheel artifact
+### Install from the NVIDIA Python index
 
-After `wheel_integration_gate` succeeds, download the matching wheel from the
-`wheel_assemble` job artifacts and install it into a clean environment:
+When a release wheel is available, pip selects the matching CPU architecture
+and CPython ABI:
+
+```bash
+python -m pip install --extra-index-url https://pypi.nvidia.com \
+    tensorrt-edgellm
+```
+
+Wheel publication is release infrastructure and is independent of the source
+build procedure below.
+
+### Install a wheel file
+
+Install a locally built or downloaded wheel into a clean environment:
 
 ```bash
 python -m pip install --extra-index-url https://pypi.nvidia.com \
@@ -28,6 +40,72 @@ The local path supplies TensorRT Edge-LLM; the NVIDIA index supplies compatible
 external dependencies. No model, GPU, SDK, architecture, or SM option is passed
 to pip. Pip validates the wheel against the host CPU architecture and CPython
 ABI.
+
+### Build wheel files from source
+
+Clone the requested revision with submodules, create a build environment, and
+install the packaging-only toolchain:
+
+```bash
+git clone --recurse-submodules https://github.com/NVIDIA/TensorRT-Edge-LLM.git
+cd TensorRT-Edge-LLM
+python3.12 -m venv .venv-wheel
+source .venv-wheel/bin/activate
+python -m pip install -r packaging/wheel-toolchain-requirements.txt
+python packaging/wheel_cli.py validate-matrix
+python packaging/wheel_cli.py validate-source --require-clean
+```
+
+The repository exposes every wheel build stage through
+`python packaging/wheel_cli.py`. First build one Python base wheel:
+
+```bash
+PYTHON_ABI=cp312
+python packaging/wheel_cli.py build-base \
+    --output-dir "artifacts/base/$PYTHON_ABI"
+```
+
+Next, produce the CuTe DSL archive described in `kernelSrcs/README.md`. In the
+build environment matching each row in `packaging/variants.toml`, build and
+verify that native payload:
+
+```bash
+VARIANT=x86-ubuntu2404-cu13-sm120
+TRT_PACKAGE_DIR=/path/to/TensorRT
+
+python packaging/wheel_cli.py prepare-cutedsl \
+    --variant "$VARIANT" \
+    --artifact-dir kernelSrcs/cuteDSLPrebuilt
+python packaging/wheel_cli.py build-payload \
+    --variant "$VARIANT" \
+    --python-abi "$PYTHON_ABI" \
+    --trt-package-dir "$TRT_PACKAGE_DIR" \
+    --output-dir "artifacts/payloads/$VARIANT-$PYTHON_ABI"
+python packaging/wheel_cli.py verify-payload \
+    --stage "artifacts/payloads/$VARIANT-$PYTHON_ABI"
+```
+
+Cross-compiled aarch64 rows additionally pass `--toolchain-file`,
+`--target-sysroot`, and `--target-python-include-dir`. Repeat the payload step
+for every row of the requested CPU architecture; a complete architecture wheel
+intentionally contains all qualified CUDA, TensorRT, platform, and SM payloads.
+Then assemble it:
+
+```bash
+CPU_ARCH=x86_64
+BASE_WHEEL=$(find "artifacts/base/$PYTHON_ABI" -maxdepth 1 -name '*.whl' -print -quit)
+python packaging/wheel_cli.py assemble \
+    --base-wheel "$BASE_WHEEL" \
+    --payload-root artifacts/payloads \
+    --cpu-arch "$CPU_ARCH" \
+    --python-abi "$PYTHON_ABI" \
+    --output-dir "dist/$CPU_ARCH/$PYTHON_ABI"
+```
+
+`packaging/docker/Dockerfile` is the reproducible reference environment for an
+x86_64 Ubuntu 24.04/CUDA 13 payload. Its `BASE_IMAGE` default is a concrete
+supported build base, not a placeholder; override it only when building a
+different matrix environment.
 
 ### Build an engine and run a prompt
 

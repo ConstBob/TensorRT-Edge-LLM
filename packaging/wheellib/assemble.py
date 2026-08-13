@@ -404,7 +404,7 @@ def main(argv=None) -> None:
             raise RuntimeError(
                 f"Expected one assembled wheel, found {produced}.")
     wheel = produced[0]
-    budgets = load_toml(args.size_budget)["wheel"]
+    budgets = load_toml(args.size_budget)["wheel"][args.cpu_arch]
     try:
         if wheel.stat().st_size > int(budgets["compressed_bytes"]):
             raise RuntimeError(

@@ -35,8 +35,11 @@ MATRIX_VARIANT_FIELDS = frozenset({
     "cuda_ctk_version",
     "embedded_target",
     "cmake_args",
-    "ci_runner",
-    "ci_image",
+    "ci_build_runner",
+    "ci_build_image",
+    "ci_build_mode",
+    "ci_test_runner",
+    "ci_test_image",
     "ci_trt_package",
     "ci_remote",
 })

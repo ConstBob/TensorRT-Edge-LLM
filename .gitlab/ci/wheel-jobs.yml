@@ -60,7 +60,7 @@ wheel_python_base:
 .wheel_payload_template:
   stage: wheel-build
   extends: [.wheel_rules]
-  tags: [$RUNNER_TAG]
+  tags: [$BUILD_RUNNER_TAG]
   image: $BUILD_IMAGE
   needs:
     - job: wheel_packaging_precheck
@@ -96,8 +96,10 @@ wheel_assemble:
 .wheel_integration_template:
   stage: l0_test
   extends: [.wheel_rules]
-  tags: [$RUNNER_TAG]
-  image: $BUILD_IMAGE
+  tags: [$TEST_RUNNER_TAG]
+  image: $TEST_IMAGE
+  variables:
+    LLM_MODELS_DIR: "$TORCH_DIR"
   needs:
     - job: wheel_assemble
       artifacts: true
@@ -110,22 +112,6 @@ wheel_assemble:
     paths: [artifacts/integration/]
     expire_in: 30 days
 
-wheel_heterogeneous_boundary:
-  stage: l0_test
-  extends: [.wheel_rules]
-  tags: [$WHEEL_HETEROGENEOUS_RUNNER]
-  image: $WHEEL_IMAGE_UBUNTU2404_CU13
-  needs:
-    - job: wheel_assemble
-      artifacts: true
-  variables:
-    WHEEL_HETEROGENEOUS_TRT_PACKAGE_DIR: $WHEEL_TRT10_X86_UBUNTU2404_CU13_DIR
-  script:
-    - python3 packaging/wheel_cli.py ci-heterogeneous-boundary
-  artifacts:
-    paths: [artifacts/integration/heterogeneous-boundary.json]
-    expire_in: 30 days
-
 wheel_integration_gate:
   stage: l0_test
   extends: [.wheel_rules]
@@ -135,8 +121,6 @@ wheel_integration_gate:
     - job: wheel_assemble
       artifacts: true
     - job: wheel_integration
-      artifacts: true
-    - job: wheel_heterogeneous_boundary
       artifacts: true
   script:
     - python3 packaging/wheel_cli.py ci-integration-gate

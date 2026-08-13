@@ -387,24 +387,36 @@ def _validate_variant_platform(row: Mapping[str, Any]) -> None:
 
 def _validate_variant_ci(row: Mapping[str, Any]) -> None:
     variant_id = str(row["variant_id"])
-    common = ("ci_runner", "ci_image", "ci_trt_package")
+    common = (
+        "ci_build_runner",
+        "ci_build_image",
+        "ci_build_mode",
+        "ci_test_runner",
+        "ci_test_image",
+        "ci_trt_package",
+    )
     missing = [field for field in common if not row.get(field)]
+    build_mode = row.get("ci_build_mode")
+    if build_mode not in {"native", "cross"}:
+        raise RuntimeError(
+            f"Variant {variant_id} ci_build_mode must be native or cross.")
+    if build_mode == "cross":
+        missing.extend(field for field in (
+            "ci_toolchain",
+            "ci_sysroot",
+            "ci_python_headers",
+        ) if not row.get(field))
     remote = row.get("ci_remote")
     if not isinstance(remote, bool):
         raise RuntimeError(f"Variant {variant_id} ci_remote must be Boolean.")
     if remote:
         required = (
-            "ci_toolchain",
-            "ci_sysroot",
-            "ci_python_headers",
             "ci_board_ip",
             "ci_board_user",
             "ci_target_trt_wheel",
             "ci_target_model_dir",
         )
-    else:
-        required = ("ci_gpu_uuid", )
-    missing.extend(field for field in required if not row.get(field))
+        missing.extend(field for field in required if not row.get(field))
     if missing:
         raise RuntimeError(
             f"Variant {variant_id} is missing CI fields: {sorted(missing)}.")
