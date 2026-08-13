@@ -329,6 +329,13 @@ TensorRegistry buildRegistryForSpecDecodeDraft(DeploymentConfig const& bundle)
     reg.addTensor({binding_names::kKVCacheStartIndex, TensorIO::kInput, nvinfer1::DataType::kINT32,
         {sym(&InferenceDims::startIndexLen)}});
 
+    // kv_page_table: [batch, 2, maxPagesPerSeq] INT32. AttentionPlugin cross-checks this
+    // row count against the packed QKV batch, so it must track the active batch rather
+    // than fall back to the page table's full [maxBatch, ...] extent.
+    int32_t const maxPagesPerSeq = rt::computeMaxPagesPerSeq(cfg.maxKVCacheCapacity);
+    reg.addTensor({binding_names::kKVPageTable, TensorIO::kInput, nvinfer1::DataType::kINT32,
+        {sym(&InferenceDims::batch), fixed(2), fixed(maxPagesPerSeq)}});
+
     if (cfg.contextMaskSelectorEnabled)
     {
         reg.addTensor({binding_names::kContextMaskSelector, TensorIO::kInput, nvinfer1::DataType::kINT32,

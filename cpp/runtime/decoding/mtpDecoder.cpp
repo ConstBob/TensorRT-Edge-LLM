@@ -174,14 +174,40 @@ void MTPDecoder::setContextMemory(Tensor& memory)
     }
 }
 
+bool MTPDecoder::initializeForGeneration(DecodingInferenceContext& context)
+{
+    // Default MTP keeps its decode-round-0 draft prefill; only the Hybrid+MTP endpoint-reuse path runs the draft
+    // prefill here (pre-publication), mirroring EagleDecoder::initializeForGeneration. The runtime folds the reused
+    // checkpoint boundary into baseHiddenStates and prepends the boundary token before this call, so the standard
+    // runDraftModelPrefill body is reused unchanged.
+    if (!context.hybridMtpEndpointReuse || context.speculativeDraftPrefillComplete)
+    {
+        return true;
+    }
+    if (!runDraftModelPrefill(context))
+    {
+        LOG_ERROR("Failed to run the Hybrid+MTP pre-publication draft prefill.");
+        return false;
+    }
+    context.speculativeDraftPrefillComplete = true;
+    return true;
+}
+
 bool MTPDecoder::decodeStep(DecodingInferenceContext& context)
 {
+    // Draft KV for a round's accepted tokens is written lazily, by the *next* round's accept-token pass, so the draft
+    // cache trails the base cache by the last accepted span (see ContextCacheCommitPolicy::kPrefillStateOnly).
     if (context.generationRound == 0)
     {
-        if (!runDraftModelPrefill(context))
+        // Skip when the Hybrid+MTP endpoint-reuse path already ran the draft prefill in initializeForGeneration.
+        if (!context.speculativeDraftPrefillComplete)
         {
-            LOG_ERROR("Failed to execute prefill step for draft model.");
-            return false;
+            if (!runDraftModelPrefill(context))
+            {
+                LOG_ERROR("Failed to execute prefill step for draft model.");
+                return false;
+            }
+            context.speculativeDraftPrefillComplete = true;
         }
     }
     else if (!runDraftModelAcceptToken(context))
@@ -1044,11 +1070,15 @@ void MTPDecoder::resetForNewSequences(Tensor& reuseLengths, cudaStream_t stream)
 void MTPDecoder::onBatchEvict(std::vector<int32_t> const&, int32_t oldActiveBatch, int32_t newActiveBatch,
     Tensor& deviceBatchMapping, cudaStream_t stream, BatchCompactionMode mode)
 {
-    ELLM_CHECK(
-        mode == BatchCompactionMode::kLegacyPhysicalKv, "MTP does not support managed context-cache batch compaction.");
-
-    mDraftCacheManager.compactBatch(deviceBatchMapping, oldActiveBatch, newActiveBatch, stream);
-    mDraftCacheManager.setActiveBatchSize(newActiveBatch);
+    // In managed-page (context-reuse) mode the coordinator compacts the draft KV page-table rows during its own
+    // compactBatch, so the decoder must NOT also compact the physical draft cache; it only compacts its own per-slot
+    // working state below. In legacy mode the decoder owns the physical draft KV compaction. Mirrors
+    // EagleDecoder::onBatchEvict.
+    if (mode == BatchCompactionMode::kLegacyPhysicalKv)
+    {
+        mDraftCacheManager.compactBatch(deviceBatchMapping, oldActiveBatch, newActiveBatch, stream);
+        mDraftCacheManager.setActiveBatchSize(newActiveBatch);
+    }
 
     if (mRuntime.base.pipelineIO.baseHiddenStates.getShape().getNumDims() == 3
         && mRuntime.base.pipelineIO.baseHiddenStates.getShape()[0] == oldActiveBatch && newActiveBatch > 0)

@@ -31,6 +31,7 @@ enum class ContextCacheDeploymentKind : uint8_t
     kHybrid,
     kPureRecurrent,
     kEAGLE,
+    kHybridMtp,
 };
 
 //! Validate the logical deployment contract and return its execution family.

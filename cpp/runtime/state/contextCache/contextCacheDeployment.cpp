@@ -48,9 +48,12 @@ void validateStateContract(LLMEngineConfig const& config, char const* label)
 
     if (config.numAttentionLayers > 0)
     {
-        ELLM_CHECK(config.kvCacheDtype == nvinfer1::DataType::kHALF,
-            std::string(label)
-                + " uses a KV dtype outside the supported non-identity page-table boundary (FP16 KV only).");
+        // Context reuse snapshots and rebinds KV pages by raw bytes (HybridSnapshotStorage byte-copy + page-table
+        // rebind), so it is agnostic to the KV element type; FP8 KV pages reuse correctly (validated on the
+        // feat/token-hit-rate lineage, and KVCacheManager itself admits both dtypes). Keep the guard restricted to the
+        // two supported cache dtypes.
+        ELLM_CHECK(config.kvCacheDtype == nvinfer1::DataType::kHALF || config.kvCacheDtype == nvinfer1::DataType::kFP8,
+            std::string(label) + " uses a KV dtype outside the supported context-reuse boundary (FP16 or FP8 KV).");
         // SWA changes the kernel read mask, not physical retention: context reuse requires a full logical allocation
         // for every attention layer so cached pages remain valid when rebound across requests.
         int64_t const minimumActivePages
@@ -145,11 +148,24 @@ ContextCacheDeploymentKind validateContextCacheDeployment(DeploymentConfig const
     }
 
     case SpecDecodeMode::kMTP:
+    {
+        ELLM_CHECK(deployment.base.numLinearAttnLayers > 0 && deployment.base.numAttentionLayers > 0,
+            "MTP context reuse requires a hybrid base with both attention and recurrent layers.");
+        ELLM_CHECK(deployment.base.isSpecDecodeBase && deployment.draft.has_value() && deployment.specConfig.has_value()
+                && deployment.draft->specDecodeType == SpecDecodeMode::kMTP && !deployment.draft->isSpecDecodeBase,
+            "MTP context-cache deployment requires matching base-role/draft-role engines and speculative "
+            "configuration.");
+        validateStateContract(*deployment.draft, "draft engine");
+        ELLM_CHECK(deployment.draft->hasOwnKVCache && !deployment.draft->sharesTargetKV,
+            "MTP context reuse requires a draft engine with its own independent KV cache.");
+        return ContextCacheDeploymentKind::kHybridMtp;
+    }
+
     case SpecDecodeMode::kDFlash:
     case SpecDecodeMode::kJetSpec:
     case SpecDecodeMode::kGemma4MTP:
     case SpecDecodeMode::kDSpark:
-        ELLM_CHECK(false, "Context reuse does not support MTP, DFlash, JetSpec, DSpark, or Gemma4 MTP deployments.");
+        ELLM_CHECK(false, "Context reuse does not support DFlash, JetSpec, DSpark, or Gemma4 MTP deployments.");
     }
     ELLM_CHECK(false, "Unknown speculative decoding mode in context-cache deployment validation.");
 }

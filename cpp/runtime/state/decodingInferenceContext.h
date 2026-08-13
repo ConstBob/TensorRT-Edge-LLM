@@ -120,6 +120,16 @@ struct DecodingInferenceContext
 
     bool outputThinkerEmbeddings{false}; //!< Whether to capture hidden states for the Talker pipeline
 
+    //! Hybrid+MTP context-reuse endpoint path is active for this request. Set by the runtime before the folded draft
+    //! prefill so MTPDecoder::initializeForGeneration runs the draft prefill pre-publication (default MTP keeps its
+    //! decode-round-0 draft prefill when this is false).
+    bool hybridMtpEndpointReuse{false};
+    //! Guards the speculative draft prefill so it runs exactly once, whether triggered pre-publication (Hybrid+MTP
+    //! endpoint reuse) or in decode round 0 (default speculative path).
+    bool speculativeDraftPrefillComplete{false};
+    //! Hybrid+MTP boundary-replay tail length for the two-chunk prefill (0 = single-chunk). Carried from the request.
+    int32_t contextCacheReplayTailLength{0};
+
     //! Optional per-token callback invoked after each accepted token update.
     std::optional<TokenCallback> onTokenGenerated;
     std::vector<int32_t> callbackEmittedTokenCounts; //!< Per-slot count of tokenIds already sent to callback.

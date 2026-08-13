@@ -282,7 +282,13 @@ private:
     std::unique_ptr<SharedResources> mSharedResources; //!< KV caches / RoPE / LoRA / context memory
     //! Declared after SharedResources so shutdown and destruction release cache ownership before physical buffers.
     std::unique_ptr<ContextCacheCoordinator> mContextCache;
-    std::unique_ptr<PipelineIO> mPipelineIO;   //!< Per-pipeline I/O tensors
+    std::unique_ptr<PipelineIO> mPipelineIO; //!< Per-pipeline I/O tensors
+    //! Scratch [maxSeq, baseOutputHiddenDim] used to shift baseHiddenStates down one row when folding a reused
+    //! Hybrid+MTP checkpoint boundary into the draft prefill. Allocated only for Hybrid+MTP deployments.
+    rt::Tensor mBoundaryFoldScratch;
+    //! baseHiddenStates' max-sequence rows. The fold writes chunkLength + 1 rows, so it needs one spare row on top of
+    //! the chunk it shifts; runHybridMtpPrefill checks the chunk against this bound before reshaping.
+    int32_t mBoundaryFoldMaxRows{0};
     TensorMap mBaseTensorMap;                  //!< Base engine binding map
     std::filesystem::path mCheckpointDir;      //!< Provider checkpoint used during startup weight loading
     std::filesystem::path mDraftCheckpointDir; //!< Separate provider draft checkpoint, empty for integrated drafts
@@ -362,7 +368,16 @@ private:
     // Key functions to drive the runtime, defined in a consumer-producer pattern.
     // Consume tokenized IDS as input and produce hidden states for the whole sequence and first generated token.
     //! @throws std::runtime_error if a CUDA error occurs
-    bool runBaseModelPrefill(DecodingInferenceContext& context, ContextCacheRequest* contextCacheRequest = nullptr);
+    bool runBaseModelPrefill(DecodingInferenceContext& context, ContextCacheRequest* contextCacheRequest = nullptr,
+        bool sampleOutput = true);
+
+    //! Hybrid+MTP endpoint-reuse prefill. Mirrors the reference llmInferenceRuntime.cpp::runHybridMtpPrefill: a
+    //! two-chunk base prefill publishing at the stable predecessor boundary, folding the reused checkpoint's boundary
+    //! hidden into the draft prefill on a cache hit, and driving the coordinator's dedicated MTP publish entrypoint.
+    //! Only reachable when shouldUseHybridMtpEndpointReuse() already established that the cache is live for this
+    //! request, so lookup and publication are both enabled here by construction.
+    bool runHybridMtpPrefill(
+        DecodingInferenceContext& context, DecodingStrategy& strategy, ContextCacheRequest& contextCacheRequest);
 
     //! Validate request shape/runtime compatibility.
     bool validateRequestConfig(LLMGenerationRequest const& request);

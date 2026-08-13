@@ -73,14 +73,20 @@ bool contextCacheOperationSucceeded(ContextCacheCoordinatorStatus status, char c
 std::optional<ContextCacheRequest> ContextCacheRequest::begin(ContextCacheCoordinator& coordinator,
     LLMGenerationRequest const& request, DecodingInferenceContext const& context, DecodingStrategyKind strategyKind)
 {
-    ELLM_CHECK(strategyKind == DecodingStrategyKind::kVanilla || strategyKind == DecodingStrategyKind::kEAGLE,
-        "Context cache supports only vanilla or EAGLE request execution.");
+    ELLM_CHECK(strategyKind == DecodingStrategyKind::kVanilla || strategyKind == DecodingStrategyKind::kEAGLE
+            || strategyKind == DecodingStrategyKind::kMTP,
+        "Context cache supports only vanilla, EAGLE, or MTP request execution.");
 
     ContextCacheBatchAdmission admission;
-    admission.executionMode = strategyKind == DecodingStrategyKind::kEAGLE ? ContextCacheExecutionMode::kEAGLE
-                                                                           : ContextCacheExecutionMode::kVanilla;
+    switch (strategyKind)
+    {
+    case DecodingStrategyKind::kEAGLE: admission.executionMode = ContextCacheExecutionMode::kEAGLE; break;
+    case DecodingStrategyKind::kMTP: admission.executionMode = ContextCacheExecutionMode::kMTP; break;
+    default: admission.executionMode = ContextCacheExecutionMode::kVanilla; break;
+    }
     admission.lookupPolicy = contextCacheLookupPolicy(request, context.outputThinkerEmbeddings);
     admission.commitPolicy = request.contextCacheCommitPolicy;
+    admission.replayTailLength = request.contextCacheReplayTailLength;
     admission.sequences.reserve(context.rawBatchedInputIds.size());
     for (std::vector<int32_t> const& tokenIds : context.rawBatchedInputIds)
     {
@@ -106,6 +112,26 @@ ContextCacheRequest::ContextCacheRequest(
 std::vector<int32_t> const& ContextCacheRequest::prefillStarts() const noexcept
 {
     return mPrefillStarts;
+}
+
+int32_t ContextCacheRequest::reuseTokenLength(int32_t slot) const noexcept
+{
+    return mPrefillStarts[static_cast<size_t>(slot)];
+}
+
+bool ContextCacheRequest::publishHybridMtpEndpoint(
+    int32_t slot, int32_t residentStateLength, Tensor const& baseHiddenStates, int32_t boundaryHiddenRow)
+{
+    return contextCacheOperationSucceeded(
+        mCoordinator.publishHybridMtpEndpoint(mRequest, slot, residentStateLength, baseHiddenStates, boundaryHiddenRow),
+        "Hybrid+MTP endpoint publication");
+}
+
+bool ContextCacheRequest::restoreHybridMtpBoundaryHidden(int32_t slot, Tensor& baseHiddenStates, int32_t destinationRow)
+{
+    return contextCacheOperationSucceeded(
+        mCoordinator.restoreHybridMtpBoundaryHidden(mRequest, slot, baseHiddenStates, destinationRow),
+        "Hybrid+MTP boundary-hidden restore");
 }
 
 bool ContextCacheRequest::preparePrefill()

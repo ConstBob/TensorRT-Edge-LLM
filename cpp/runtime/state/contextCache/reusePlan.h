@@ -48,6 +48,8 @@ enum class ReusePlanMode : uint8_t
     kVanilla,
     //! Exact atomic recurrent/conv and optional partial-KV checkpoint reuse.
     kHybrid,
+    //! Hybrid base paired with a coherent MTP draft path at an exact recurrent/partial-KV checkpoint.
+    kHybridMtp,
     //! Initial speculative implementation: greedy, non-hybrid EAGLE.
     kSpec,
 };
@@ -115,6 +117,13 @@ ReusePlan makeVanillaReusePlan(std::vector<BlockHash> const& inputFullBlockHashe
 //! strictly shorter than the input wins. A missing snapshot member makes that candidate a complete miss.
 ReusePlan makeHybridReusePlan(std::vector<HybridCheckpointCandidate> const& candidates,
     std::vector<BlockHash> const& inputFullBlockHashes, int32_t inputTokenCount, int32_t pageSize, bool hasAttention,
+    CacheRecordStore const& records, ContextCacheLookupPolicy lookupPolicy = ContextCacheLookupPolicy::kUseCache);
+
+//! Build an exact hybrid+MTP reuse plan. Like makeHybridReusePlan but the winning checkpoint retains its boundary
+//! token (exactLength - 1) in a private partial page, always carries a partial-KV snapshot, and requires a coherent
+//! draft page path equally long as the base path. A hit binds both base and draft cached pages.
+ReusePlan makeHybridMtpReusePlan(std::vector<HybridCheckpointCandidate> const& candidates,
+    std::vector<BlockHash> const& inputFullBlockHashes, int32_t inputTokenCount, int32_t pageSize,
     CacheRecordStore const& records, ContextCacheLookupPolicy lookupPolicy = ContextCacheLookupPolicy::kUseCache);
 
 //! Build a speculative reuse plan without mutating cache metadata.

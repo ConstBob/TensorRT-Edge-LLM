@@ -578,6 +578,18 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
         ELLM_CHECK(contextCacheDeploymentKind.has_value(), "Context-cache deployment was not validated");
         mContextCache = std::make_unique<ContextCacheCoordinator>(
             contextCacheConfig, mDeployment, *contextCacheDeploymentKind, cacheResources, stream);
+
+        if (*contextCacheDeploymentKind == ContextCacheDeploymentKind::kHybridMtp)
+        {
+            // Scratch to shift base hidden states down one row when folding a reused checkpoint boundary into the draft
+            // prefill; sized to match baseHiddenStates' [maxSeq, baseOutputHiddenDim] (ref llmInferenceRuntime.cpp
+            // :670-672). The draft reads baseHiddenStates directly, so match its width and dtype.
+            rt::Coords const bhShape = mPipelineIO->baseHiddenStates.getShape();
+            mBoundaryFoldScratch = rt::Tensor({bhShape[1], bhShape[2]}, rt::DeviceType::kGPU,
+                mPipelineIO->baseHiddenStates.getDataType(), "LLMInferenceRuntime::mBoundaryFoldScratch");
+            // The fold occupies one row beyond the chunk it shifts, so it needs a spare row in baseHiddenStates.
+            mBoundaryFoldMaxRows = math::cast<int32_t>(bhShape[1]);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1041,8 +1053,39 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
         return false;
     }
 
+    // Hybrid+MTP endpoint reuse recomputes the successor-dependent boundary draft slot from a saved base hidden state,
+    // so a checkpoint reuses across turns regardless of the token that follows it. Enabled only when the request looks
+    // up or publishes state (not a bypass request) and the deployment is MTP over a hybrid base.
+    bool const requestCacheEnabled = contextCacheRequest.has_value()
+        && request.contextCacheLookupPolicy != ContextCacheLookupPolicy::kBypass && !request.generateAudio
+        && !context.outputThinkerEmbeddings;
+    bool const hybridMtpContextReuse = shouldUseHybridMtpEndpointReuse(
+        decodingStrategy.kind(), mDeployment.base.numLinearAttnLayers > 0, requestCacheEnabled, requestCacheEnabled);
+    if (hybridMtpContextReuse)
+    {
+        bool const textOnly = !context.visualEmbeddings.has_value() && !context.audioEmbeddings.has_value();
+        if (context.activeBatchSize != 1 || !textOnly || request.recurrentCaptureInterval != 0
+            || request.contextCacheCommitPolicy != ContextCacheCommitPolicy::kPrefillStateOnly)
+        {
+            LOG_ERROR(
+                "Hybrid MTP context reuse requires a text-only batch of one, endpoint-only capture, and "
+                "PREFILL_STATE_ONLY commit policy");
+            return false;
+        }
+    }
+
     // Prefill from the base model; subsequent iterations are delegated to the selected strategy.
-    bool const prefillStatus = runBaseModelPrefill(context, managedRequest);
+    bool prefillStatus;
+    if (hybridMtpContextReuse)
+    {
+        context.hybridMtpEndpointReuse = true;
+        context.contextCacheReplayTailLength = request.contextCacheReplayTailLength;
+        prefillStatus = runHybridMtpPrefill(context, decodingStrategy, *contextCacheRequest);
+    }
+    else
+    {
+        prefillStatus = runBaseModelPrefill(context, managedRequest);
+    }
     if (!prefillStatus)
     {
         LOG_ERROR("Failed to execute prefill step for base model.");
@@ -1676,8 +1719,225 @@ bool LLMInferenceRuntime::multiModalRuntimePreprocess(
     return true;
 }
 
+bool LLMInferenceRuntime::runHybridMtpPrefill(
+    DecodingInferenceContext& context, DecodingStrategy& strategy, ContextCacheRequest& contextCacheRequest)
+{
+    // Adapted from reference llmInferenceRuntime.cpp::runHybridMtpPrefill (:2515-2702). The reference reads
+    // context.sequenceCacheStates + mHybridSnapshotStorage directly; on this target the cache lifecycle is owned by the
+    // coordinator, so publication/restore go through the adapter and the reuse length comes from the admission plan.
+    // The fold (row shift + boundary-hidden restore + boundary-token prepend) runs here in the runtime, exactly as in
+    // the reference, because the coordinator is only reachable from the runtime side (not from MTPDecoder).
+    ELLM_CHECK(context.activeBatchSize == 1, "Hybrid MTP endpoint prefill requires one combined cache sequence");
+
+    int32_t const reuseLength = contextCacheRequest.reuseTokenLength(0);
+    int32_t const inputLength = math::cast<int32_t>(context.rawBatchedInputIds[0].size());
+    int32_t const replayTailLength = context.contextCacheReplayTailLength;
+    int32_t const suffixLenOrig = context.effectivePrefillLengths[0];
+    LOG_DEBUG("Hybrid+MTP prefill: inputLength=%d reuseLength=%d basePrefill=%d", inputLength, reuseLength,
+        inputLength - reuseLength);
+
+    int32_t const boundaryHiddenDim = mDeployment.specConfig->baseOutputHiddenDim;
+    size_t const rowBytes
+        = static_cast<size_t>(boundaryHiddenDim) * rt::utils::getTypeSize(mPipelineIO->baseHiddenStates.getDataType());
+
+    // Run the (folded) draft prefill through the strategy's initialize-for-generation override. Resetting the guard
+    // lets it run again where the reference re-invokes prepareFirstDecodeStep (mirrors ref :2560/:2626). The final
+    // invocation leaves speculativeDraftPrefillComplete = true so the outer initializeForGeneration and decode round 0
+    // both skip it. Driving a re-run through a guard flag is a workaround for DecodingStrategy having no explicit
+    // "run the draft prefill now" entry point; see issue #655 for the intended interface.
+    auto runFoldedDraftPrefill = [&]() -> bool {
+        context.speculativeDraftPrefillComplete = false;
+        return strategy.initializeForGeneration(context);
+    };
+
+    // Shift baseHiddenStates' first chunkLength rows down by one and restore the reused checkpoint's boundary hidden
+    // into row 0, so the draft prefill sees [base_hidden[boundary], base_hidden[boundary+1 ..]]. Writing chunkLength+1
+    // rows needs one spare row over the chunk itself; that invariant is local to this fold, so check it here rather
+    // than relying on engine-level sizing of baseHiddenStates.
+    auto foldBoundaryHiddenIntoRow0 = [&](int32_t chunkLength) -> bool {
+        ELLM_CHECK(chunkLength + 1 <= mBoundaryFoldMaxRows,
+            "Hybrid+MTP boundary fold needs one row beyond the prefill chunk in baseHiddenStates");
+        check::check(
+            mPipelineIO->baseHiddenStates.reshape({1, chunkLength + 1, boundaryHiddenDim}), "Tensor reshape failed");
+        CUDA_CHECK(cudaMemcpyAsync(mBoundaryFoldScratch.rawPointer(), mPipelineIO->baseHiddenStates.rawPointer(),
+            static_cast<size_t>(chunkLength) * rowBytes, cudaMemcpyDeviceToDevice, context.stream));
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(mPipelineIO->baseHiddenStates.rawPointer()) + rowBytes,
+            mBoundaryFoldScratch.rawPointer(), static_cast<size_t>(chunkLength) * rowBytes, cudaMemcpyDeviceToDevice,
+            context.stream));
+        return contextCacheRequest.restoreHybridMtpBoundaryHidden(0, mPipelineIO->baseHiddenStates, 0);
+    };
+
+    // The generation-prompt tail is volatile when the chat template appends tokens that the next turn's render of the
+    // same history does not reproduce (for example Qwen3's `<think>\n\n</think>\n\n` under enable_thinking=false).
+    // Those tokens must not enter the published checkpoint, so the prefill splits into a stable predecessor chunk plus
+    // a replayed tail. The tail length is measured server-side (tool_chat_template.format_with_replay_tail).
+    bool const hasVolatileTail = replayTailLength > 0 && suffixLenOrig > replayTailLength;
+
+    // Cold sequence with a volatile generation-prompt tail: publish the checkpoint at the STABLE boundary
+    // predecessorLength = inputLength - replayTailLength (two-chunk prefill), not at the full inputLength (ref :2534).
+    if (reuseLength == 0 && hasVolatileTail)
+    {
+        std::vector<int32_t> const completeSuffix = context.tokenIds[0];
+        int32_t const predecessorLength = inputLength - replayTailLength;
+        int32_t const predecessorChunkLength = suffixLenOrig - replayTailLength;
+        auto const replayBegin = completeSuffix.end() - replayTailLength;
+
+        // Chunk 1: base prefill of the predecessor [0, predecessorLength), no sampling.
+        context.tokenIds[0].assign(completeSuffix.begin(), replayBegin);
+        context.effectivePrefillLengths[0] = predecessorChunkLength;
+        if (!runBaseModelPrefill(context, /*contextCacheRequest=*/nullptr, /*sampleOutput=*/false))
+        {
+            return false;
+        }
+        // Non-sampling chunk must sync before MTP repacks the shared pinned token buffer.
+        CUDA_CHECK(cudaStreamSynchronize(context.stream));
+        // Provide the boundary's next token so the predecessor draft prefill covers the boundary slot, then publish.
+        context.tokenIds[0].push_back(*replayBegin);
+        if (!runFoldedDraftPrefill())
+        {
+            return false;
+        }
+        if (!contextCacheRequest.publishHybridMtpEndpoint(
+                0, predecessorLength, mPipelineIO->baseHiddenStates, context.effectivePrefillLengths[0] - 1))
+        {
+            return false;
+        }
+
+        // Chunk 2: replay the volatile tail [predecessorLength, inputLength) with sampling, then restore bookkeeping.
+        context.tokenIds[0].assign(replayBegin, completeSuffix.end());
+        context.effectivePrefillLengths[0] = replayTailLength;
+        if (!runBaseModelPrefill(context, /*contextCacheRequest=*/nullptr, /*sampleOutput=*/true))
+        {
+            return false;
+        }
+        int32_t const sampledToken = context.tokenIds[0].back();
+        if (!runFoldedDraftPrefill())
+        {
+            return false;
+        }
+        context.tokenIds[0] = completeSuffix;
+        context.tokenIds[0].push_back(sampledToken);
+        context.effectivePrefillLengths[0] = suffixLenOrig;
+        return true;
+    }
+
+    // Hit sequence with a volatile tail: publish at the stable predecessorLength like the cold path, but first
+    // reconstruct the reused checkpoint's boundary draft slot via the consume-side fold (ref :2581).
+    if (reuseLength > 0 && hasVolatileTail)
+    {
+        std::vector<int32_t> const completeSuffix = context.tokenIds[0];
+        int32_t const predecessorLength = inputLength - replayTailLength;
+        int32_t const predecessorChunkLength = suffixLenOrig - replayTailLength;
+        auto const replayBegin = completeSuffix.end() - replayTailLength;
+
+        // Chunk 1: base prefill of the predecessor [reuseLength, predecessorLength), no sampling.
+        context.tokenIds[0].assign(completeSuffix.begin(), replayBegin);
+        context.effectivePrefillLengths[0] = predecessorChunkLength;
+        if (!runBaseModelPrefill(context, /*contextCacheRequest=*/nullptr, /*sampleOutput=*/false))
+        {
+            return false;
+        }
+        CUDA_CHECK(cudaStreamSynchronize(context.stream));
+
+        // Fold the reused checkpoint's boundary hidden into the predecessor draft prefill, reconstructing the reused
+        // draft slot [reuseLength-1] (ref :2602-2621).
+        if (!foldBoundaryHiddenIntoRow0(predecessorChunkLength))
+        {
+            return false;
+        }
+
+        int32_t const boundaryToken = context.rawBatchedInputIds[0][static_cast<size_t>(reuseLength - 1)];
+        context.tokenIds[0].insert(context.tokenIds[0].begin(), boundaryToken);
+        context.effectivePrefillLengths[0] = predecessorChunkLength + 1;
+        if (!runFoldedDraftPrefill())
+        {
+            return false;
+        }
+        if (!contextCacheRequest.publishHybridMtpEndpoint(
+                0, predecessorLength, mPipelineIO->baseHiddenStates, context.effectivePrefillLengths[0] - 1))
+        {
+            return false;
+        }
+        context.tokenIds[0].erase(context.tokenIds[0].begin());
+        context.effectivePrefillLengths[0] = predecessorChunkLength;
+
+        // Chunk 2: replay the volatile tail [predecessorLength, inputLength) with sampling, then restore bookkeeping.
+        context.tokenIds[0].assign(replayBegin, completeSuffix.end());
+        context.effectivePrefillLengths[0] = replayTailLength;
+        if (!runBaseModelPrefill(context, /*contextCacheRequest=*/nullptr, /*sampleOutput=*/true))
+        {
+            return false;
+        }
+        int32_t const sampledToken = context.tokenIds[0].back();
+        if (!runFoldedDraftPrefill())
+        {
+            return false;
+        }
+        context.tokenIds[0] = completeSuffix;
+        context.tokenIds[0].push_back(sampledToken);
+        context.effectivePrefillLengths[0] = suffixLenOrig;
+        return true;
+    }
+
+    // Base prefill of the suffix (the full prompt when cold). Reuses base KV [0, reuseLength) and samples the first
+    // output token, appending it to tokenIds (ref :2646).
+    if (!runBaseModelPrefill(context, /*contextCacheRequest=*/nullptr, /*sampleOutput=*/true))
+    {
+        return false;
+    }
+
+    if (reuseLength == 0)
+    {
+        // Cold sequence: no reused checkpoint boundary to fold in (ref :2651).
+        if (!runFoldedDraftPrefill())
+        {
+            return false;
+        }
+        if (!contextCacheRequest.publishHybridMtpEndpoint(
+                0, inputLength, mPipelineIO->baseHiddenStates, context.effectivePrefillLengths[0] - 1))
+        {
+            return false;
+        }
+        return true;
+    }
+
+    // On a hit the restore path reused draft KV only up to reuseLength-1. Fold the boundary into the suffix draft
+    // prefill as a *context* position: prepend the checkpoint's saved base boundary hidden (base_hidden[reuseLength-1])
+    // and token[reuseLength-1] so the single draft prefill covers [reuseLength-1, inputLength) and writes a correct,
+    // successor-aware boundary KV (ref :2662-2701).
+    int32_t const suffixLen = context.effectivePrefillLengths[0];
+
+    // Shift the base suffix hidden states [0, suffixLen) down one row and place the restored boundary hidden state at
+    // row 0, giving the draft [base_hidden[reuseLength-1], base_hidden[reuseLength..inputLength)].
+    if (!foldBoundaryHiddenIntoRow0(suffixLen))
+    {
+        return false;
+    }
+
+    // Prepend token[reuseLength-1] and extend the prefill length by one. runDraftModelPrefill pairs draft slot k with
+    // (baseHiddenStates[k], tokenIds[k+1]); with the shifted hidden states and this prepend, draft slot reuseLength-1+k
+    // consumes (base_hidden[reuseLength-1+k], token[reuseLength+k]) as required.
+    int32_t const boundaryToken = context.rawBatchedInputIds[0][static_cast<size_t>(reuseLength - 1)];
+    context.tokenIds[0].insert(context.tokenIds[0].begin(), boundaryToken);
+    context.effectivePrefillLengths[0] = suffixLen + 1;
+    if (!runFoldedDraftPrefill())
+    {
+        return false;
+    }
+    // Publish while effectivePrefillLengths still reflects the folded prefill (the boundary-hidden capture reads the
+    // last shifted row), then restore the suffix-only execution bookkeeping for the decode loop.
+    if (!contextCacheRequest.publishHybridMtpEndpoint(
+            0, inputLength, mPipelineIO->baseHiddenStates, context.effectivePrefillLengths[0] - 1))
+    {
+        return false;
+    }
+    context.tokenIds[0].erase(context.tokenIds[0].begin());
+    context.effectivePrefillLengths[0] = suffixLen;
+    return true;
+}
+
 bool LLMInferenceRuntime::runBaseModelPrefill(
-    DecodingInferenceContext& context, ContextCacheRequest* contextCacheRequest)
+    DecodingInferenceContext& context, ContextCacheRequest* contextCacheRequest, bool sampleOutput)
 {
     TIME_STAGE(metrics::StageNames::kLLM_PREFILL, context.stream);
     NVTX_SCOPED_RANGE(nvtx_base_prefill,
@@ -1835,6 +2095,14 @@ bool LLMInferenceRuntime::runBaseModelPrefill(
     }
 
     if (mDeployment.base.isDiffusionBackbone)
+    {
+        return true;
+    }
+
+    // Hybrid+MTP two-chunk prefill runs its predecessor chunk with sampling disabled: leave the recurrent state at the
+    // stable boundary and produce no output token (mirrors reference runBaseModelPrefill sampleOutput=false). The
+    // caller synchronizes before repacking the shared pinned token buffer.
+    if (!sampleOutput)
     {
         return true;
     }
@@ -2080,9 +2348,10 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(DecodingInferenceContext& con
 
     if (contextCachePrefillStarts != nullptr)
     {
-        ELLM_CHECK(
-            mContextCache != nullptr && (!needsStrategyKVCache || strategy.kind() == DecodingStrategyKind::kEAGLE),
-            "Managed context-cache prefill supports only vanilla or EAGLE decoding strategies");
+        ELLM_CHECK(mContextCache != nullptr
+                && (!needsStrategyKVCache || strategy.kind() == DecodingStrategyKind::kEAGLE
+                    || strategy.kind() == DecodingStrategyKind::kMTP),
+            "Managed context-cache prefill supports only vanilla, EAGLE, or MTP decoding strategies");
         ELLM_CHECK(static_cast<int32_t>(contextCachePrefillStarts->size()) == activeBatchSize,
             "Managed context-cache execution recipe must describe every active sequence");
         for (int32_t i = 0; i < activeBatchSize; ++i)

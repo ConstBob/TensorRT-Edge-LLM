@@ -28,7 +28,8 @@ except ImportError:  # Python 3.10
     import tomli as tomllib
 
 from experimental.server.config import (ApiConfig, ContextCacheConfig,
-                                        ServerConfigError, parse_server_config)
+                                        ServerConfigError, SpeculativeConfig,
+                                        parse_server_config)
 from experimental.server.parsing.reasoning import REASONING_PARSERS
 
 
@@ -282,6 +283,22 @@ def test_native_mtp_uses_base_checkpoint():
     spec = config.model.speculative_config
     assert spec.method == "mtp"
     assert not spec.draft_model
+
+
+@pytest.mark.parametrize("payload", [
+    '{"method":"mtp","num_speculative_tokens":2}',
+    '{"method":"mtp"}',
+    '{"method":"eagle3","model":"org/draft-ckpt"}',
+])
+def test_speculative_config_parse_is_idempotent(payload):
+    """LLM.__init__ re-parses whatever parse_server_config already produced."""
+    once = SpeculativeConfig.parse(payload)
+    assert SpeculativeConfig.parse(once) == once
+
+
+def test_speculative_config_still_rejects_a_blank_draft_model():
+    with pytest.raises(ServerConfigError, match="checkpoint path"):
+        SpeculativeConfig.parse('{"method":"mtp","model":"  "}')
 
 
 def test_rejects_unknown_speculative_keys():

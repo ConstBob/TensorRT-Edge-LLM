@@ -80,6 +80,22 @@ DeploymentConfig makeEagleDeployment()
     return deployment;
 }
 
+DeploymentConfig makeHybridMtpDeployment()
+{
+    DeploymentConfig deployment;
+    deployment.base = makeHybridConfig();
+    deployment.base.specDecodeType = SpecDecodeMode::kMTP;
+    deployment.base.isSpecDecodeBase = true;
+    deployment.draft = makeAttentionConfig(/*attentionLayers=*/2);
+    deployment.draft->specDecodeType = SpecDecodeMode::kMTP;
+    deployment.draft->isSpecDecodeBase = false;
+    deployment.draft->hasOwnKVCache = true;
+    deployment.draft->sharesTargetKV = false;
+    deployment.draft->baseModelHiddenSize = deployment.base.hiddenSize;
+    deployment.specConfig = SpecDecodeConfig{};
+    return deployment;
+}
+
 } // namespace
 
 TEST(ContextCacheDeploymentTests, ClassifiesSupportedVanillaHybridAndPureRecurrentDeployments)
@@ -107,8 +123,9 @@ TEST(ContextCacheDeploymentTests, RejectsUnsupportedDtypeAndVisionAttention)
 {
     DeploymentConfig deployment{makeAttentionConfig(), std::nullopt, std::nullopt};
 
+    // FP8 KV cache is a supported reuse dtype (alongside kHALF); it must NOT be rejected.
     deployment.base.kvCacheDtype = nvinfer1::DataType::kFP8;
-    EXPECT_THROW(validateContextCacheDeployment(deployment), std::runtime_error);
+    EXPECT_NO_THROW(validateContextCacheDeployment(deployment));
 
     deployment.base = makeAttentionConfig();
     deployment.base.kvCacheDtype = nvinfer1::DataType::kBF16;
@@ -173,6 +190,25 @@ TEST(ContextCacheDeploymentTests, RejectsUnmanagedSpecModesAndHybridEagle)
     hybridEagle.base.specDecodeType = SpecDecodeMode::kEAGLE;
     hybridEagle.base.isSpecDecodeBase = true;
     EXPECT_THROW(validateContextCacheDeployment(hybridEagle), std::runtime_error);
+}
+
+TEST(ContextCacheDeploymentTests, ClassifiesHybridMtpAndRejectsAttentionOnlyMtpBase)
+{
+    DeploymentConfig deployment = makeHybridMtpDeployment();
+    EXPECT_EQ(validateContextCacheDeployment(deployment), ContextCacheDeploymentKind::kHybridMtp);
+
+    // An attention-only (non-hybrid) MTP base is still outside the supported matrix.
+    DeploymentConfig attentionOnlyMtp = makeHybridMtpDeployment();
+    attentionOnlyMtp.base = makeAttentionConfig();
+    attentionOnlyMtp.base.specDecodeType = SpecDecodeMode::kMTP;
+    attentionOnlyMtp.base.isSpecDecodeBase = true;
+    EXPECT_THROW(validateContextCacheDeployment(attentionOnlyMtp), std::runtime_error);
+
+    // A hybrid+MTP draft without its own independent KV cache is rejected.
+    DeploymentConfig sharedKvMtp = makeHybridMtpDeployment();
+    sharedKvMtp.draft->hasOwnKVCache = false;
+    sharedKvMtp.draft->sharesTargetKV = true;
+    EXPECT_THROW(validateContextCacheDeployment(sharedKvMtp), std::runtime_error);
 }
 
 TEST(ContextCacheDeploymentTests, ClassifiesSupportedEagleAndRejectsInvalidConditioning)

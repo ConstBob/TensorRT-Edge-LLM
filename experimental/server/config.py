@@ -46,7 +46,10 @@ class SpeculativeConfig:
             raw = {
                 "method": value.method,
                 "num_speculative_tokens": value.num_speculative_tokens,
-                "model": value.draft_model,
+                # An absent draft model is stored as "", which re-parsing would
+                # reject as a malformed model id. MTP is the only method that
+                # legitimately has none, so re-parsing must round-trip.
+                "model": value.draft_model or None,
             }
         elif isinstance(value, str):
             try:

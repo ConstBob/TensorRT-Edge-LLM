@@ -270,6 +270,70 @@ TEST(ContextCacheReusePlanTests, HybridPlanningRequiresOneCompleteExactCheckpoin
     EXPECT_EQ(skipsIncomplete.hybridRecord, std::optional<RecordId>{inserted.id});
 }
 
+TEST(ContextCacheReusePlanTests, HybridMtpPlanningBindsBaseAndDraftAtExactCheckpoint)
+{
+    constexpr int32_t kHYBRID_PAGE_SIZE = 4;
+    constexpr BlockHash kEXACT_DIGEST{0xBBBBBBBBBBBBBBB0ULL, 0xCCCCCCCCCCCCCCC0ULL};
+
+    // fullBlockCount == (exactLength - 1) / pageSize == (6 - 1) / 4 == 1; totalInputPages == ceil(10 / 4) == 3.
+    CacheRecord record;
+    record.key = CacheRecordKey{kEXACT_DIGEST, 1};
+    record.logicalBlockHashes = {kHASH_A};
+    record.basePagePath = {7};
+    record.draftPagePath = {8};
+    record.recurrentSnapshotSlot = 3;
+    record.partialKvSnapshotSlot = 4;
+    record.exactCheckpointLength = 6;
+
+    CacheRecordStore records(4);
+    RecordInsertResult const inserted = records.insert(record);
+    ASSERT_TRUE(inserted.inserted);
+
+    ReusePlan const hit = makeHybridMtpReusePlan({{6, kEXACT_DIGEST}}, {kHASH_A, kHASH_B},
+        /*inputTokenCount=*/10, kHYBRID_PAGE_SIZE, records);
+    EXPECT_EQ(hit.mode, ReusePlanMode::kHybridMtp);
+    EXPECT_TRUE(hit.hybridHasAttention);
+    EXPECT_EQ(hit.matchedTokenLength, 6);
+    EXPECT_EQ(hit.reuseTokenLength, 6);
+    EXPECT_EQ(hit.matchedBlockHashes, std::vector<BlockHash>{kHASH_A});
+    EXPECT_EQ(hit.basePageBindings, std::vector<PageId>{7});
+    EXPECT_EQ(hit.draftPageBindings, std::vector<PageId>{8});
+    EXPECT_EQ(hit.hybridRecord, std::optional<RecordId>{inserted.id});
+    EXPECT_EQ(hit.recurrentSnapshotBinding, std::optional<int32_t>{3});
+    EXPECT_EQ(hit.partialKvSnapshotBinding, std::optional<int32_t>{4});
+    // privatePageCount == totalInputPages - fullBlockCount == 3 - 1 == 2, shared by base and draft demand.
+    expectDemand(hit.demand, ResourceDemand{2, 2, 0, 0});
+}
+
+TEST(ContextCacheReusePlanTests, HybridMtpPlanningSkipsRecordWithoutDraftPath)
+{
+    constexpr int32_t kHYBRID_PAGE_SIZE = 4;
+    constexpr BlockHash kEXACT_DIGEST{0xBBBBBBBBBBBBBBB0ULL, 0xCCCCCCCCCCCCCCC0ULL};
+
+    // Same checkpoint as the positive case but with an EMPTY draft path: the candidate must be rejected.
+    CacheRecord record;
+    record.key = CacheRecordKey{kEXACT_DIGEST, 1};
+    record.logicalBlockHashes = {kHASH_A};
+    record.basePagePath = {7};
+    record.recurrentSnapshotSlot = 3;
+    record.partialKvSnapshotSlot = 4;
+    record.exactCheckpointLength = 6;
+
+    CacheRecordStore records(4);
+    ASSERT_TRUE(records.insert(record).inserted);
+
+    ReusePlan const cold = makeHybridMtpReusePlan({{6, kEXACT_DIGEST}}, {kHASH_A, kHASH_B},
+        /*inputTokenCount=*/10, kHYBRID_PAGE_SIZE, records);
+    EXPECT_EQ(cold.mode, ReusePlanMode::kHybridMtp);
+    EXPECT_EQ(cold.kind, ReusePlanKind::kNoReusablePrefix);
+    EXPECT_EQ(cold.reuseTokenLength, 0);
+    EXPECT_FALSE(cold.hybridRecord.has_value());
+    EXPECT_TRUE(cold.basePageBindings.empty());
+    EXPECT_TRUE(cold.draftPageBindings.empty());
+    // totalInputPages == 3; MTP cold reserves the full input for BOTH base and draft pools (speculative deployment).
+    expectDemand(cold.demand, ResourceDemand{3, 3, 0, 0});
+}
+
 TEST(ContextCacheReusePlanTests, PlanningDoesNotChangePoolRefsOrRecordRecency)
 {
     ResourcePools pools(ResourceDemand{4, 2, 1, 1});

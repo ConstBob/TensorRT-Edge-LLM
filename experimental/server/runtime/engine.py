@@ -562,6 +562,14 @@ class LLM:
         self._admission_sem = threading.Semaphore(1)
         self._infer_lock = threading.Lock()
         self._close_lock = threading.Lock()
+        # Context-reuse observability: the counters as of the last logged
+        # request, so each request can report its own delta. Guarded because the
+        # streaming path calls the C++ runtime from a background thread.
+        self._ctx_reuse_metric_lock = threading.Lock()
+        self._prev_ctx_reused_tokens = 0
+        self._prev_ctx_matched_tokens = 0
+        self._prev_ctx_hit_sequences = 0
+        self._prev_ctx_admitted_sequences = 0
         self._closed = False
         self._runtime = None
 
@@ -793,8 +801,14 @@ class LLM:
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         tool_config: Optional[ToolConfig] = None,
         enable_thinking: bool = False,
+        derive_replay_tail: bool = False,
     ):
-        """Prepare messages for the C++ runtime."""
+        """Prepare messages for the C++ runtime.
+
+        Returns the replay-tail length alongside the prepared messages. It is
+        non-zero only when the caller asked for it, which is what lets a
+        Hybrid+MTP checkpoint be reused across turns.
+        """
         tool_config = tool_config or validate_tool_request(
             messages, tools, tool_choice)
         template_tools = (tool_config.tools
@@ -809,14 +823,27 @@ class LLM:
             if tool_config.tool_choice != "none":
                 template_tool_choice = self._tool_choice_for_template(
                     tool_config)
-            prompt = self._get_tool_template_formatter().format(
-                messages,
-                tools=template_tools,
-                tool_choice=template_tool_choice,
-                parallel_tool_calls=tool_config.parallel_tool_calls,
-                add_generation_prompt=True,
-                enable_thinking=enable_thinking,
-            )
+            formatter = self._get_tool_template_formatter()
+            replay_tail_length = 0
+            if derive_replay_tail:
+                # Derive the multi-turn replay tail from the tokenized template
+                # so a Hybrid+MTP checkpoint can be reused across turns.
+                prompt, replay_tail_length = formatter.format_with_replay_tail(
+                    messages,
+                    tools=template_tools,
+                    tool_choice=template_tool_choice,
+                    parallel_tool_calls=tool_config.parallel_tool_calls,
+                    enable_thinking=enable_thinking,
+                )
+            else:
+                prompt = formatter.format(
+                    messages,
+                    tools=template_tools,
+                    tool_choice=template_tool_choice,
+                    parallel_tool_calls=tool_config.parallel_tool_calls,
+                    add_generation_prompt=True,
+                    enable_thinking=enable_thinking,
+                )
             cpp_messages = _convert_messages_to_cpp(
                 self._rt,
                 [{
@@ -824,10 +851,11 @@ class LLM:
                     "content": prompt,
                 }],
             )
-            return cpp_messages, image_buffers, False, False
+            return (cpp_messages, image_buffers, False, False,
+                    replay_tail_length)
 
         cpp_messages = _convert_messages_to_cpp(self._rt, messages)
-        return cpp_messages, image_buffers, True, True
+        return cpp_messages, image_buffers, True, True, 0
 
     def _make_generation_request(
         self,
@@ -842,14 +870,25 @@ class LLM:
         normalized_logit_bias = _normalize_logit_bias(params.logit_bias)
         tool_config = tool_config or validate_tool_request(
             messages, tools, tool_choice)
-        cpp_messages, image_buffers, apply_template, add_prompt = (
-            self._prepare_messages_for_runtime(
-                messages,
-                tools=tool_config.tools,
-                tool_choice=tool_config.tool_choice,
-                tool_config=tool_config,
-                enable_thinking=params.enable_thinking,
-            ))
+        # The replay tail only matters for a prefill-state-only commit against a
+        # draft model with reuse enabled: that is the deployment whose
+        # checkpoint must land on a turn boundary the next render reproduces.
+        # The server tests build bare objects that skip __init__, so read the
+        # config defensively and let the `and` chain short-circuit before it
+        # reaches the attributes only a constructed LLM has.
+        cache_config = getattr(self, "_context_cache_config", None)
+        derive_replay_tail = (cache_config is not None and cache_config.enabled
+                              and not params.cache_generated_tokens
+                              and self.has_draft_model)
+        (cpp_messages, image_buffers, apply_template, add_prompt,
+         replay_tail_length) = (self._prepare_messages_for_runtime(
+             messages,
+             tools=tool_config.tools,
+             tool_choice=tool_config.tool_choice,
+             tool_config=tool_config,
+             enable_thinking=params.enable_thinking,
+             derive_replay_tail=derive_replay_tail,
+         ))
 
         audio_buffers = _load_audio_buffers(self._rt, messages)
 
@@ -872,6 +911,7 @@ class LLM:
         request.disable_spec_decode = params.disable_spec_decode
         request.num_logprobs = params.num_logprobs
         _set_context_cache_request_policies(self._rt, request, params)
+        request.context_cache_replay_tail_length = replay_tail_length
         return request
 
     def _count_prepared_prompt_tokens(self, request) -> Optional[int]:
@@ -964,11 +1004,65 @@ class LLM:
         if self._closed or self._runtime is None:
             raise RuntimeError("Edge-LLM runtime is closed")
 
+    @staticmethod
+    def _ratio(num: int, denom: int) -> float:
+        return num / denom if denom > 0 else 0.0
+
+    def _log_context_reuse_metrics(self) -> None:
+        """Emit an INFO line making context-cache reuse visible.
+
+        ``get_context_cache_metrics()`` returns cumulative coordinator counters
+        for the whole server run, so the per-request figures are the delta since
+        the previous logged request. ContextCacheMetrics carries no total-prompt
+        -token field, so the headline hit rate is sequence-level
+        (hit_sequences / admitted_sequences); reused/matched token counts are
+        reported alongside to show token-level reuse is actually happening.
+        """
+        cc = self._runtime.get_context_cache_metrics()
+        if cc is None:
+            return
+        with self._ctx_reuse_metric_lock:
+            cum_reused = int(cc.reused_tokens)
+            cum_matched = int(cc.matched_tokens)
+            cum_hit_seqs = int(cc.hit_sequences)
+            cum_admitted = int(cc.admitted_sequences)
+            req_reused = cum_reused - self._prev_ctx_reused_tokens
+            req_matched = cum_matched - self._prev_ctx_matched_tokens
+            req_hit_seqs = cum_hit_seqs - self._prev_ctx_hit_sequences
+            req_admitted = cum_admitted - self._prev_ctx_admitted_sequences
+            self._prev_ctx_reused_tokens = cum_reused
+            self._prev_ctx_matched_tokens = cum_matched
+            self._prev_ctx_hit_sequences = cum_hit_seqs
+            self._prev_ctx_admitted_sequences = cum_admitted
+        logger.info(
+            "[context-reuse] request: reused=%d matched=%d hitSeqs=%d/%d "
+            "hitRate=%.4f | cumulative: reused=%d matched=%d hitSeqs=%d/%d "
+            "hitRate=%.4f records=%d hybridRestores=%d",
+            req_reused,
+            req_matched,
+            req_hit_seqs,
+            req_admitted,
+            self._ratio(req_hit_seqs, req_admitted),
+            cum_reused,
+            cum_matched,
+            cum_hit_seqs,
+            cum_admitted,
+            self._ratio(cum_hit_seqs, cum_admitted),
+            int(cc.current_records),
+            int(cc.hybrid_restores),
+        )
+
     def _handle_request(self, request):
         """Serialized entry to the C++ runtime."""
         with self._infer_guard():
             self._ensure_open()
-            return self._runtime.handle_request(request)
+            response = self._runtime.handle_request(request)
+        # Callable on duck-typed non-LLM objects in the server tests, which have
+        # no config to inherit a class default from.
+        cache_config = getattr(self, "_context_cache_config", None)
+        if cache_config is not None and cache_config.enabled:
+            self._log_context_reuse_metrics()
+        return response
 
     def close(self) -> None:
         """Drain active work and release native engines and device memory."""

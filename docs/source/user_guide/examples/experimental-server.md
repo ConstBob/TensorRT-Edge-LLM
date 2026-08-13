@@ -154,15 +154,23 @@ The OpenAI chat request exposes the same controls as strict boolean
 `reuse_context` and `cache_generated_tokens` fields.
 
 The native support boundary is text-only execution: vanilla attention,
-recurrent/hybrid models, and EAGLE with independent base and draft caches. Any
-attention KV cache must use FP16.
+recurrent/hybrid models, EAGLE with independent base and draft caches, and MTP
+on a hybrid base. Any attention KV cache must use FP16.
 Hybrid and pure-recurrent models also require positive recurrent snapshot pool
 capacity; hybrid models require partial-KV snapshot capacity. Configure those
 preallocated device pools with
 `--context-cache-recurrent-snapshot-pool-bytes` and
-`--context-cache-partial-kv-snapshot-pool-bytes`. MTP, DFlash, DSpark, JetSpec,
+`--context-cache-partial-kv-snapshot-pool-bytes`. DFlash, DSpark, JetSpec,
 Gemma MTP, block diffusion, and multimodal execution are rejected at runtime
 rather than silently running without reuse.
+
+MTP on a hybrid base reuses only what prefill produced, so it needs
+`cache_generated_tokens=False` on the request; a batch of one and text-only
+input are required as for every reusing request. With a chat template that
+folds a thinking marker into the generation prompt (Qwen3 under
+`enable_thinking=false`, for example), the server publishes the checkpoint
+before that marker and replays the few unstable tail tokens, so the record
+stays valid as a prefix of the next turn.
 
 One enabled runtime is one trusted cache domain. The native cache does not have
 a per-request tenant or salt key, so use separate server processes for mutually

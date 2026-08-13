@@ -255,6 +255,73 @@ TEST(ContextCacheManagerTests, HybridCheckpointPublishesAndAcquiresAllStateAtomi
     hitLease.release();
 }
 
+TEST(ContextCacheManagerTests, HybridMtpCheckpointPublishesAndAcquiresPairedBaseAndDraftState)
+{
+    constexpr BlockHash kEXACT_DIGEST{0x9494949494949494ULL, 0xA4A4A4A4A4A4A4A4ULL};
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{8, 8, 2, 2}, 2);
+
+    // Cold hybrid+MTP acquire: a speculative deployment reserves the full input in both the base and draft pools.
+    AcquireResult coldResult = manager.acquireHybridMtp({}, {kHASH_A}, /*inputTokenCount=*/6);
+    ReusePlan const& cold = coldResult.plan;
+    EXPECT_EQ(cold.mode, ReusePlanMode::kHybridMtp);
+    EXPECT_EQ(cold.demand.baseKvPages, 2);
+    EXPECT_EQ(cold.demand.draftKvPages, 2);
+    CacheRequestLease coldLease = takeLease(coldResult);
+    ASSERT_EQ(coldLease.basePages(), std::vector<PageId>({0, 1}));
+    ASSERT_EQ(coldLease.draftPages(), std::vector<PageId>({0, 1}));
+
+    // MTP always bundles a partial-KV snapshot alongside the recurrent snapshot.
+    std::optional<HybridSnapshotReservation> const snapshots = manager.reserveHybridSnapshots(coldLease, true);
+    ASSERT_TRUE(snapshots.has_value());
+    EXPECT_EQ(snapshots->recurrentSnapshotSlot, 0);
+    EXPECT_EQ(snapshots->partialKvSnapshotSlot, std::optional<int32_t>{0});
+
+    // exactLength 6 with pageSize 4 keeps the boundary token (index 5) private, so only (6 - 1) / 4 == 1 full block is
+    // published for both base and draft state.
+    HybridCheckpointKey const checkpoint{kEXACT_DIGEST, 6};
+    PublishResult const published
+        = manager.publishHybridMtp(coldLease, HybridPublishRequest{{kHASH_A}, checkpoint, *snapshots});
+    ASSERT_EQ(published.status, PublishStatus::kPublished);
+    ASSERT_TRUE(published.record.has_value());
+    EXPECT_EQ(published.publishedBaseFullBlockCount, 1);
+    EXPECT_EQ(published.canonicalBasePages, std::vector<PageId>{0});
+    manager.retireHybridSnapshotReservation(coldLease, *snapshots);
+    coldLease.release();
+
+    // The published record carries paired base/draft paths of size (exactLength - 1) / pageSize plus both snapshots.
+    CacheRecord const& record = manager.records().get(*published.record);
+    EXPECT_EQ(record.hybridKey(), std::optional<HybridCheckpointKey>{checkpoint});
+    ASSERT_EQ(record.draftPagePath.size(), static_cast<size_t>((6 - 1) / kPAGE_SIZE));
+    EXPECT_FALSE(record.draftPagePath.empty());
+    EXPECT_EQ(record.draftPagePath, std::vector<PageId>{0});
+    EXPECT_EQ(record.basePagePath, std::vector<PageId>{0});
+    EXPECT_EQ(record.recurrentSnapshotSlot, std::optional<int32_t>{0});
+    EXPECT_EQ(record.partialKvSnapshotSlot, std::optional<int32_t>{0});
+    EXPECT_EQ(record.exactCheckpointLength, std::optional<int32_t>{6});
+
+    // Hit: the exact checkpoint rebinds the cached base AND draft page paths plus both snapshot slots.
+    AcquireResult hitResult
+        = manager.acquireHybridMtp({{6, kEXACT_DIGEST}}, {kHASH_A, kHASH_B}, /*inputTokenCount=*/10);
+    ReusePlan const& hit = hitResult.plan;
+    EXPECT_EQ(hit.mode, ReusePlanMode::kHybridMtp);
+    ASSERT_EQ(hit.reuseTokenLength, 6);
+    ASSERT_EQ(hitResult.status, AcquireStatus::kAcquired);
+    EXPECT_EQ(hit.basePageBindings, std::vector<PageId>{0});
+    EXPECT_EQ(hit.draftPageBindings, std::vector<PageId>{0});
+    CacheRequestLease hitLease = takeLease(hitResult);
+    ASSERT_FALSE(hitLease.basePages().empty());
+    ASSERT_FALSE(hitLease.draftPages().empty());
+    EXPECT_EQ(hitLease.basePages().front(), 0);
+    EXPECT_EQ(hitLease.draftPages().front(), 0);
+    EXPECT_EQ(hitLease.basePages().size(), hitLease.draftPages().size());
+    EXPECT_EQ(hitLease.recurrentSnapshotSlot(), std::optional<int32_t>{0});
+    EXPECT_EQ(hitLease.partialKvSnapshotSlot(), std::optional<int32_t>{0});
+    manager.releaseRestoredHybridSnapshots(hitLease);
+    EXPECT_FALSE(hitLease.recurrentSnapshotSlot().has_value());
+    EXPECT_FALSE(hitLease.partialKvSnapshotSlot().has_value());
+    hitLease.release();
+}
+
 TEST(ContextCacheManagerTests, PureRecurrentCheckpointNeedsNoBaseOrPartialPage)
 {
     constexpr BlockHash kEXACT_DIGEST{0x9292929292929292ULL, 0xA2A2A2A2A2A2A2A2ULL};

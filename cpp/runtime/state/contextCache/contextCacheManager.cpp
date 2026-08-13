@@ -376,6 +376,13 @@ AcquireResult ContextCacheManager::acquireHybrid(std::vector<HybridCheckpointCan
         candidates, inputFullBlockHashes, inputTokenCount, mPageSize, hasAttention, mRecords, lookupPolicy));
 }
 
+AcquireResult ContextCacheManager::acquireHybridMtp(std::vector<HybridCheckpointCandidate> const& candidates,
+    std::vector<BlockHash> const& inputFullBlockHashes, int32_t inputTokenCount, ContextCacheLookupPolicy lookupPolicy)
+{
+    return acquire(
+        makeHybridMtpReusePlan(candidates, inputFullBlockHashes, inputTokenCount, mPageSize, mRecords, lookupPolicy));
+}
+
 std::vector<int32_t> ContextCacheManager::hybridCandidateLengths(int32_t inputTokenCount) const
 {
     return mRecords.hybridCandidateLengths(inputTokenCount);
@@ -489,7 +496,8 @@ bool ContextCacheManager::growBasePages(CacheRequestLease& lease, int32_t count)
 bool ContextCacheManager::growSpecPages(CacheRequestLease& lease, int32_t baseCount, int32_t draftCount)
 {
     ELLM_CHECK(lease.valid() && lease.mManager == this, "Context cache lease does not belong to this manager");
-    ELLM_CHECK(lease.mMode == ReusePlanMode::kSpec, "Speculative context cache growth requires an EAGLE lease");
+    ELLM_CHECK(lease.mMode == ReusePlanMode::kSpec || lease.mMode == ReusePlanMode::kHybridMtp,
+        "Paired base/draft context cache growth requires an EAGLE or hybrid+MTP lease");
     ELLM_CHECK(baseCount >= 0 && draftCount >= 0, "Context cache growth counts must be non-negative");
     return growPages(lease, ResourceDemand{baseCount, draftCount, 0, 0});
 }
@@ -498,7 +506,8 @@ std::optional<HybridSnapshotReservation> ContextCacheManager::reserveHybridSnaps
     CacheRequestLease& lease, bool needsPartialKvSnapshot)
 {
     ELLM_CHECK(lease.valid() && lease.mManager == this, "Context cache lease does not belong to this manager");
-    ELLM_CHECK(lease.mMode == ReusePlanMode::kHybrid, "Hybrid snapshot reservation requires an exact-checkpoint lease");
+    ELLM_CHECK(lease.mMode == ReusePlanMode::kHybrid || lease.mMode == ReusePlanMode::kHybridMtp,
+        "Hybrid snapshot reservation requires an exact-checkpoint lease");
     ELLM_CHECK(!needsPartialKvSnapshot || lease.mHybridHasAttention,
         "Pure-recurrent context cache cannot reserve a partial KV snapshot");
 
@@ -532,7 +541,8 @@ std::optional<HybridSnapshotReservation> ContextCacheManager::reserveHybridSnaps
 
 void ContextCacheManager::releaseRestoredHybridSnapshots(CacheRequestLease& lease)
 {
-    ELLM_CHECK(lease.valid() && lease.mManager == this && lease.mMode == ReusePlanMode::kHybrid,
+    ELLM_CHECK(lease.valid() && lease.mManager == this
+            && (lease.mMode == ReusePlanMode::kHybrid || lease.mMode == ReusePlanMode::kHybridMtp),
         "Restored hybrid snapshots require an exact-checkpoint lease");
     if (lease.mRecurrentSnapshotBinding.has_value())
     {
@@ -549,7 +559,8 @@ void ContextCacheManager::releaseRestoredHybridSnapshots(CacheRequestLease& leas
 void ContextCacheManager::retireHybridSnapshotReservation(
     CacheRequestLease& lease, HybridSnapshotReservation const& reservation)
 {
-    ELLM_CHECK(lease.valid() && lease.mManager == this && lease.mMode == ReusePlanMode::kHybrid,
+    ELLM_CHECK(lease.valid() && lease.mManager == this
+            && (lease.mMode == ReusePlanMode::kHybrid || lease.mMode == ReusePlanMode::kHybridMtp),
         "Hybrid snapshot retirement requires an exact-checkpoint lease");
     releaseLeaseResource(lease, ResourceId{ResourceType::kRecurrentSnapshot, reservation.recurrentSnapshotSlot});
     if (reservation.partialKvSnapshotSlot.has_value())
@@ -801,6 +812,77 @@ PublishResult ContextCacheManager::publishHybrid(CacheRequestLease& lease, Hybri
     record.key = CacheRecordKey{request.checkpoint.exactPrefixDigest, static_cast<int32_t>(fullBlockCount)};
     record.logicalBlockHashes = request.fullBlockHashes;
     record.basePagePath = projection.canonicalPages;
+    record.recurrentSnapshotSlot = request.snapshots.recurrentSnapshotSlot;
+    record.partialKvSnapshotSlot = request.snapshots.partialKvSnapshotSlot;
+    record.exactCheckpointLength = request.checkpoint.exactLength;
+
+    PreparedPublication publication;
+    publication.canonicalBasePages = projection.canonicalPages;
+    publication.missingBaseMappings = std::move(projection.missingMappings);
+    publication.record = std::move(record);
+    publication.cacheResources = publication.record.resources();
+    publication.recordLimitVictim = selectRecordLimitVictim(mRecords);
+    publication.publishedBaseFullBlockCount = static_cast<int32_t>(fullBlockCount);
+    return commitPreparedPublication(std::move(publication));
+}
+
+PublishResult ContextCacheManager::publishHybridMtp(CacheRequestLease& lease, HybridPublishRequest const& request)
+{
+    ELLM_CHECK(lease.valid() && lease.mManager == this, "Context cache lease does not belong to this manager");
+    ELLM_CHECK(
+        lease.mMode == ReusePlanMode::kHybridMtp, "Hybrid+MTP context cache publication requires a combined lease");
+
+    ELLM_CHECK(
+        request.checkpoint.exactLength > 0, "Hybrid+MTP context cache publication identity does not match its lease");
+    // The boundary token (exactLength - 1) is always retained in a private partial page so a consumer can rewrite its
+    // draft KV without mutating a shared reused page; reserve one fewer full block than exactLength/pageSize would.
+    size_t const fullBlockCount = static_cast<size_t>((request.checkpoint.exactLength - 1) / mPageSize);
+    ELLM_CHECK(request.fullBlockHashes.size() == fullBlockCount,
+        "Hybrid+MTP context cache publication requires every complete logical block before its exact boundary");
+    // MTP always publishes a partial page, so both snapshots must always be present.
+    bool const needsPartialSnapshot = true;
+    ELLM_CHECK(request.snapshots.recurrentSnapshotSlot >= 0
+            && request.snapshots.partialKvSnapshotSlot.has_value() == needsPartialSnapshot,
+        "Hybrid+MTP context cache publication has an incomplete snapshot set");
+    ELLM_CHECK(fullBlockCount <= lease.mBasePages.size() && fullBlockCount <= lease.mDraftPages.size(),
+        "Hybrid+MTP context cache publication exceeds its paired base/draft page paths");
+
+    auto ownsActiveResource = [&](ResourceId const& resource) {
+        return std::find(lease.mActiveResources.begin(), lease.mActiveResources.end(), resource)
+            != lease.mActiveResources.end();
+    };
+    ELLM_CHECK(
+        ownsActiveResource(ResourceId{ResourceType::kRecurrentSnapshot, request.snapshots.recurrentSnapshotSlot}),
+        "Hybrid+MTP context cache lease does not own the recurrent snapshot reservation");
+    ELLM_CHECK(
+        ownsActiveResource(ResourceId{ResourceType::kPartialKvSnapshot, *request.snapshots.partialKvSnapshotSlot}),
+        "Hybrid+MTP context cache lease does not own the bundled partial KV snapshot reservation");
+
+    size_t const matchedBlockCount = std::min(fullBlockCount, lease.mMatchedBlockHashes.size());
+    ELLM_CHECK(std::equal(request.fullBlockHashes.begin(),
+                   request.fullBlockHashes.begin() + static_cast<std::ptrdiff_t>(matchedBlockCount),
+                   lease.mMatchedBlockHashes.begin()),
+        "Hybrid+MTP context cache publication does not match the acquired logical prefix");
+
+    std::optional<RecordId> const existing = mRecords.findHybrid(request.checkpoint);
+    if (existing.has_value())
+    {
+        CacheRecord const& record = mRecords.get(*existing);
+        mRecords.touch(*existing);
+        return PublishResult{
+            PublishStatus::kExistingRecord, existing, record.basePagePath, static_cast<int32_t>(fullBlockCount)};
+    }
+
+    BaseProjection projection = prepareBaseProjection(mBaseIndex, request.fullBlockHashes, lease.mBasePages);
+
+    std::vector<PageId> draftPages(
+        lease.mDraftPages.begin(), lease.mDraftPages.begin() + static_cast<std::ptrdiff_t>(fullBlockCount));
+
+    CacheRecord record;
+    record.key = CacheRecordKey{request.checkpoint.exactPrefixDigest, static_cast<int32_t>(fullBlockCount)};
+    record.logicalBlockHashes = request.fullBlockHashes;
+    record.basePagePath = projection.canonicalPages;
+    record.draftPagePath = std::move(draftPages);
     record.recurrentSnapshotSlot = request.snapshots.recurrentSnapshotSlot;
     record.partialKvSnapshotSlot = request.snapshots.partialKvSnapshotSlot;
     record.exactCheckpointLength = request.checkpoint.exactLength;

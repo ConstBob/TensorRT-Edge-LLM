@@ -171,6 +171,11 @@ public:
     AcquireResult acquireHybrid(std::vector<HybridCheckpointCandidate> const& candidates,
         std::vector<BlockHash> const& inputFullBlockHashes, int32_t inputTokenCount, bool hasAttention,
         ContextCacheLookupPolicy lookupPolicy = ContextCacheLookupPolicy::kUseCache);
+    //! Acquire a combined hybrid base + MTP draft lease at an exact recurrent/partial-KV checkpoint. A hit rebinds both
+    //! the cached base pages and the equally long coherent draft page path. MTP always retains a private partial page.
+    AcquireResult acquireHybridMtp(std::vector<HybridCheckpointCandidate> const& candidates,
+        std::vector<BlockHash> const& inputFullBlockHashes, int32_t inputTokenCount,
+        ContextCacheLookupPolicy lookupPolicy = ContextCacheLookupPolicy::kUseCache);
     std::vector<int32_t> hybridCandidateLengths(int32_t inputTokenCount) const;
     //! The caller must first select greedy, non-hybrid EAGLE on a supported full-attention or full-allocation SWA
     //! deployment; the manager cannot infer sampling policy or model topology.
@@ -192,6 +197,9 @@ public:
     PublishResult publish(CacheRequestLease& lease, PublishRequest const& request);
     //! Commit one already-captured exact hybrid checkpoint. The caller must make snapshot writes terminal first.
     PublishResult publishHybrid(CacheRequestLease& lease, HybridPublishRequest const& request);
+    //! Commit one already-captured exact hybrid+MTP checkpoint, retaining both the base path and the equally long
+    //! coherent draft path through the (exactLength - 1) boundary. The caller must make snapshot writes terminal first.
+    PublishResult publishHybridMtp(CacheRequestLease& lease, HybridPublishRequest const& request);
 
     ResourcePools const& pools() const noexcept;
     BaseBlockIndex const& baseIndex() const noexcept;

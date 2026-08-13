@@ -58,6 +58,16 @@ enum class DecodingStrategyKind : int32_t
     kBlockDiffusion,
 };
 
+//! Return whether this request should use the stable Hybrid-MTP endpoint path. Mirrors the reference
+//! decodingStrategy.h::shouldUseHybridMtpEndpointReuse: true iff the selected strategy is MTP, the deployment has a
+//! hybrid base (numLinearAttnLayers > 0), and the context cache will either look up or publish state for the request.
+constexpr bool shouldUseHybridMtpEndpointReuse(DecodingStrategyKind selectedStrategy, bool hybridBase,
+    bool contextCacheLookupEnabled, bool contextCachePublicationEnabled) noexcept
+{
+    return selectedStrategy == DecodingStrategyKind::kMTP && hybridBase
+        && (contextCacheLookupEnabled || contextCachePublicationEnabled);
+}
+
 //! Selects whether decoder-owned cache state is physically compacted or only its slot metadata is moved.
 enum class BatchCompactionMode : uint8_t
 {
