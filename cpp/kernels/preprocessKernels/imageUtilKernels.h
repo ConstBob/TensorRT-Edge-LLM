@@ -213,6 +213,46 @@ struct Phi4MMGN
 constexpr int64_t kTokensPerBlockPhi4 = 256;
 constexpr int64_t kTokensPerSidePhi4 = 16;
 
+//! The kernel will transpose block-split CHW pixels to patch format for the Nemotron-Omni VIT
+//! (the runtime patch-embedder GEMM input). Groups of T consecutive frames are packed into one
+//! row set; per-patch element order is (t, c, py, px) C-major, matching RADIO Im2Patches on
+//! T-channel-stacked frames (T == 1 for still image tiles).
+//! Inputs:
+//!     blockPixels [GPU, Half]: [numFrames, channels, height, width]
+//!         numFrames must be a multiple of temporalPatchSize
+//!     temporalPatchSize: Frames packed per patch row (T)
+//!     patchSize: Patch size for the vision transformer (P)
+//!     stream: CUDA stream for execution
+//! Outputs:
+//!     inputPatches [GPU, Half]: [numFrames/T * numPatches, T*channels*P*P]
+//!         numPatches = (height/P) * (width/P)
+//! \throws std::runtime_error if tensors have invalid shape, data type or location
+void transposeToPatchNemotronViT(rt::Tensor const& blockPixels, rt::Tensor& inputPatches,
+    int64_t const temporalPatchSize, int64_t const patchSize, cudaStream_t stream);
+
+//! The kernel adds a per-grid position embedding to every block of patch
+//! embeddings (broadcast over the block dimension).
+//! Inputs:
+//!     patchEmbeds [GPU, Half]: [numBlocks, numPatches, hidden] (modified in place)
+//!     posEmbed [GPU, Half]: [numPatches, hidden]
+//!     stream: CUDA stream for execution
+//! \throws std::runtime_error if tensors have invalid shape, data type or location
+void addPosEmbedNemotronViT(rt::Tensor& patchEmbeds, rt::Tensor const& posEmbed, cudaStream_t stream);
+
+//! The kernel computes Efficient Video Sampling dissimilarity scores over the
+//! projected video embeddings: score[g][s] = 1 - cos(embeds[g][s], embeds[g-1][s])
+//! for temporal groups g > 0, and the keep-always sentinel 255 for g == 0.
+//! (Row compaction by the retained indices reuses kernel::embeddingLookup.)
+//! Inputs:
+//!     embeds [GPU, Half]: [numGroups * tokensPerGroup, hidden]
+//!     tokensPerGroup: Spatial token count per temporal group
+//!     stream: CUDA stream for execution
+//! Outputs:
+//!     scores [GPU, Float]: [numGroups * tokensPerGroup]
+//! \throws std::runtime_error if tensors have invalid shape, data type or location
+void evsScoresNemotronViT(
+    rt::Tensor const& embeds, rt::Tensor& scores, int64_t const tokensPerGroup, cudaStream_t stream);
+
 //! phi4mmPostprocessVisionTokens
 //! Purpose:
 //!   Construct the Phi-4MM HD image token sequence for a batch by gathering

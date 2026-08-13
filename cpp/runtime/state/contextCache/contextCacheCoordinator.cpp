@@ -122,11 +122,12 @@ bool hasBlockIdentity(BlockKeyExtras const& extras) noexcept
         || extras.customEmbeddingDigest.has_value() || extras.isolationDigest.has_value();
 }
 
-std::vector<BlockHash> hashRequestFullBlocks(int32_t const* tokens, size_t tokenCount, BlockKeyExtras const& extras)
+std::vector<BlockHash> hashRequestFullBlocks(
+    int32_t const* tokens, size_t tokenCount, BlockKeyExtras const& extras, Hash128 const* perPositionMediaHash)
 {
     if (!hasBlockIdentity(extras))
     {
-        return hashFullBlocks(tokens, tokenCount, kTOKENS_PER_PAGE);
+        return hashFullBlocks(tokens, tokenCount, kTOKENS_PER_PAGE, {}, perPositionMediaHash);
     }
 
     size_t const pageSize = static_cast<size_t>(kTOKENS_PER_PAGE);
@@ -136,14 +137,17 @@ std::vector<BlockHash> hashRequestFullBlocks(int32_t const* tokens, size_t token
     BlockHash parent = kCHAIN_ROOT;
     for (size_t block = 0; block < blockCount; ++block)
     {
-        parent = hashBlock(parent, tokens + block * pageSize, pageSize, extras);
+        Hash128 const* blockMediaHash
+            = perPositionMediaHash != nullptr ? perPositionMediaHash + block * pageSize : nullptr;
+        parent = hashBlock(parent, tokens + block * pageSize, pageSize, extras, blockMediaHash);
         hashes.push_back(parent);
     }
     return hashes;
 }
 
 BlockHash hashHybridCandidatePrefix(int32_t const* tokens, int32_t exactLength,
-    std::vector<BlockHash> const& fullBlockHashes, BlockKeyExtras const& extras)
+    std::vector<BlockHash> const& fullBlockHashes, BlockKeyExtras const& extras,
+    Hash128 const* perPositionMediaHash = nullptr)
 {
     ELLM_CHECK(exactLength > 0, "Hybrid context cache candidate length must be positive");
     size_t const pageSize = static_cast<size_t>(kTOKENS_PER_PAGE);
@@ -161,15 +165,74 @@ BlockHash hashHybridCandidatePrefix(int32_t const* tokens, int32_t exactLength,
 
     // The complete prefix is already represented by the chained full-block hash; extend it only with the partial tail.
     BlockHash const parent = precedingFullBlocks == 0U ? kCHAIN_ROOT : fullBlockHashes[precedingFullBlocks - 1U];
-    return hashBlock(parent, tokens + precedingFullBlocks * pageSize, partialTokenCount, extras);
+    Hash128 const* tailMediaHash
+        = perPositionMediaHash != nullptr ? perPositionMediaHash + precedingFullBlocks * pageSize : nullptr;
+    return hashBlock(parent, tokens + precedingFullBlocks * pageSize, partialTokenCount, extras, tailMediaHash);
 }
 
-BlockHash hashRequestExactPrefix(int32_t const* tokens, size_t tokenCount, BlockKeyExtras const& extras)
+BlockHash hashRequestExactPrefix(int32_t const* tokens, size_t tokenCount, BlockKeyExtras const& extras,
+    Hash128 const* perPositionMediaHash = nullptr)
 {
-    std::vector<BlockHash> const fullBlockHashes = hashRequestFullBlocks(tokens, tokenCount, extras);
+    std::vector<BlockHash> const fullBlockHashes
+        = hashRequestFullBlocks(tokens, tokenCount, extras, perPositionMediaHash);
     return tokenCount % static_cast<size_t>(kTOKENS_PER_PAGE) == 0U
         ? (fullBlockHashes.empty() ? kCHAIN_ROOT : fullBlockHashes.back())
-        : hashHybridCandidatePrefix(tokens, static_cast<int32_t>(tokenCount), fullBlockHashes, extras);
+        : hashHybridCandidatePrefix(
+              tokens, static_cast<int32_t>(tokenCount), fullBlockHashes, extras, perPositionMediaHash);
+}
+
+//! Trim trailing reused pages from a vanilla reuse plan when media tokens span across the reuse boundary.
+//!
+//! Without an encoder embedding cache, the runtime cannot slice cached ViT/audio embeddings to provide only the
+//! suffix portion. If the reuse boundary falls inside a contiguous media run, the suffix would contain media
+//! placeholders whose embedding indices don't start at zero in the full encoder output. This trims back until
+//! the boundary no longer splits a media run.
+void trimMediaBoundaryPages(ReusePlan& plan, Hash128 const* perPositionMediaHash, size_t tokenCount)
+{
+    if (perPositionMediaHash == nullptr || plan.basePageBindings.empty())
+    {
+        return;
+    }
+
+    int32_t const pageSize = kTOKENS_PER_PAGE;
+    Hash128 const kZERO{};
+
+    while (!plan.basePageBindings.empty())
+    {
+        int32_t const reuseLen = static_cast<int32_t>(plan.basePageBindings.size()) * pageSize;
+        // Check if the token at the reuse boundary (first suffix token) is a media token.
+        bool const suffixStartsWithMedia
+            = static_cast<size_t>(reuseLen) < tokenCount && perPositionMediaHash[reuseLen] != kZERO;
+        // Check if the last token of the last reused page is a media token.
+        bool const lastReusedIsMedia = reuseLen > 0 && perPositionMediaHash[reuseLen - 1] != kZERO;
+
+        if (suffixStartsWithMedia && lastReusedIsMedia)
+        {
+            // Media run spans across the reuse boundary — trim the last page.
+            plan.basePageBindings.pop_back();
+            plan.matchedBlockHashes.pop_back();
+        }
+        else
+        {
+            break;
+        }
+    }
+
+    // Update plan fields to reflect trimmed state.
+    int64_t const reusablePageCount = static_cast<int64_t>(plan.basePageBindings.size());
+    int64_t const totalInputPages
+        = (static_cast<int64_t>(tokenCount) + static_cast<int64_t>(pageSize) - 1) / static_cast<int64_t>(pageSize);
+    plan.reuseTokenLength = static_cast<int32_t>(reusablePageCount * static_cast<int64_t>(pageSize));
+    plan.matchedTokenLength = plan.reuseTokenLength;
+    plan.demand.baseKvPages = static_cast<int32_t>(totalInputPages - reusablePageCount);
+    if (plan.basePageBindings.empty())
+    {
+        plan.kind = ReusePlanKind::kNoReusablePrefix;
+    }
+    else
+    {
+        plan.kind = ReusePlanKind::kStandard;
+    }
 }
 
 int32_t pageCountForStateLength(int32_t stateLength)
@@ -280,6 +343,7 @@ struct ContextCacheCoordinator::RequestHandle::Impl
         CacheRequestLease lease;
         std::vector<int32_t> tokenIds;
         BlockKeyExtras keyExtras;
+        std::vector<Hash128> perPositionMediaHash;
         int32_t reuseTokenLength{};
         ContextCacheLookupPolicy lookupPolicy{ContextCacheLookupPolicy::kUseCache};
         ContextCacheCommitPolicy commitPolicy{ContextCacheCommitPolicy::kIncludingGeneratedTokens};
@@ -626,8 +690,10 @@ public:
         impl.markDeviceWorkEnqueued();
 
         size_t const fullTokenCount = fullBlockCount * static_cast<size_t>(kTOKENS_PER_PAGE);
+        Hash128 const* seqMediaPtr
+            = sequence.perPositionMediaHash.empty() ? nullptr : sequence.perPositionMediaHash.data();
         std::vector<BlockHash> hashes
-            = hashRequestFullBlocks(sequence.tokenIds.data(), fullTokenCount, sequence.keyExtras);
+            = hashRequestFullBlocks(sequence.tokenIds.data(), fullTokenCount, sequence.keyExtras, seqMediaPtr);
         HybridCheckpointKey const checkpoint{hashRequestExactPrefix(sequence.tokenIds.data(),
                                                  static_cast<size_t>(residentStateLength), sequence.keyExtras),
             residentStateLength};
@@ -898,8 +964,10 @@ ContextCacheCoordinator::AcquireSequenceResult ContextCacheCoordinator::acquireS
             "Context cache input exceeds the draft engine page-table capacity");
     }
     auto const planningStart = std::chrono::steady_clock::now();
-    std::vector<BlockHash> const hashes
-        = hashRequestFullBlocks(admission.tokenIds.data(), admission.tokenIds.size(), admission.keyExtras);
+    Hash128 const* mediaHashPtr
+        = admission.perPositionMediaHash.empty() ? nullptr : admission.perPositionMediaHash.data();
+    std::vector<BlockHash> const hashes = hashRequestFullBlocks(
+        admission.tokenIds.data(), admission.tokenIds.size(), admission.keyExtras, mediaHashPtr);
     std::vector<HybridCheckpointCandidate> hybridCandidates;
     if (isHybridDeployment() && lookupPolicy == ContextCacheLookupPolicy::kUseCache)
     {
@@ -909,7 +977,8 @@ ContextCacheCoordinator::AcquireSequenceResult ContextCacheCoordinator::acquireS
         for (int32_t const candidateLength : candidateLengths)
         {
             hybridCandidates.push_back(HybridCheckpointCandidate{candidateLength,
-                hashHybridCandidatePrefix(admission.tokenIds.data(), candidateLength, hashes, admission.keyExtras)});
+                hashHybridCandidatePrefix(
+                    admission.tokenIds.data(), candidateLength, hashes, admission.keyExtras, mediaHashPtr)});
         }
     }
     auto acquire = [&](ContextCacheLookupPolicy policy) {
@@ -942,6 +1011,14 @@ ContextCacheCoordinator::AcquireSequenceResult ContextCacheCoordinator::acquireS
     {
         acquired = acquire(ContextCacheLookupPolicy::kBypass);
         forcedCold = true;
+    }
+
+    // When media-aware hashing is active, trim trailing reused pages that would split a contiguous media run
+    // across the reuse boundary. Without an encoder embedding cache, the runtime cannot supply correctly-offset
+    // embeddings for partial media context in the suffix.
+    if (!admission.perPositionMediaHash.empty() && acquired.plan.reuseTokenLength > 0)
+    {
+        trimMediaBoundaryPages(acquired.plan, admission.perPositionMediaHash.data(), admission.tokenIds.size());
     }
 
     auto const planningEnd = std::chrono::steady_clock::now();
@@ -1009,6 +1086,7 @@ ContextCacheCoordinator::BeginRequestResult ContextCacheCoordinator::beginReques
         sequence.lease = std::move(*acquired.lease);
         sequence.tokenIds = sequenceAdmission.tokenIds;
         sequence.keyExtras = sequenceAdmission.keyExtras;
+        sequence.perPositionMediaHash = sequenceAdmission.perPositionMediaHash;
         sequence.reuseTokenLength = acquired.plan.reuseTokenLength;
         sequence.lookupPolicy = admission.lookupPolicy;
         sequence.commitPolicy = admission.commitPolicy;
@@ -1018,6 +1096,7 @@ ContextCacheCoordinator::BeginRequestResult ContextCacheCoordinator::beginReques
         request->sequences.push_back(std::move(sequence));
         prefillStarts.push_back(acquired.plan.reuseTokenLength);
         ++mMetrics.admittedSequences;
+        mMetrics.mediaAwareSequences += static_cast<uint64_t>(!sequenceAdmission.perPositionMediaHash.empty());
         mMetrics.matchedTokens += static_cast<uint64_t>(acquired.plan.matchedTokenLength);
         mMetrics.reusedTokens += static_cast<uint64_t>(acquired.plan.reuseTokenLength);
         mMetrics.hitSequences += static_cast<uint64_t>(acquired.plan.matchedTokenLength > 0);
@@ -1247,8 +1326,10 @@ void ContextCacheCoordinator::reserveHybridCapture(
         return;
     }
 
-    HybridCheckpointKey const checkpoint{
-        hashRequestExactPrefix(sequence.tokenIds.data(), static_cast<size_t>(exactLength), sequence.keyExtras),
+    Hash128 const* exactMediaPtr
+        = sequence.perPositionMediaHash.empty() ? nullptr : sequence.perPositionMediaHash.data();
+    HybridCheckpointKey const checkpoint{hashRequestExactPrefix(sequence.tokenIds.data(),
+                                             static_cast<size_t>(exactLength), sequence.keyExtras, exactMediaPtr),
         exactLength};
     sequence.stagedHybridPublication = RequestHandle::Impl::StagedHybridPublication{checkpoint, *reservation, point};
 }
@@ -1292,8 +1373,10 @@ void ContextCacheCoordinator::publishReadyHybridEndpoints(RequestHandle::Impl& r
             "Hybrid context snapshot exceeds the ready committed boundary");
         size_t const fullTokenCount = static_cast<size_t>(staged.checkpoint.exactLength / kTOKENS_PER_PAGE)
             * static_cast<size_t>(kTOKENS_PER_PAGE);
+        Hash128 const* seqMediaPtr
+            = sequence.perPositionMediaHash.empty() ? nullptr : sequence.perPositionMediaHash.data();
         std::vector<BlockHash> hashes
-            = hashRequestFullBlocks(sequence.tokenIds.data(), fullTokenCount, sequence.keyExtras);
+            = hashRequestFullBlocks(sequence.tokenIds.data(), fullTokenCount, sequence.keyExtras, seqMediaPtr);
         PublishResult const result = mManager.publishHybrid(
             sequence.lease, HybridPublishRequest{std::move(hashes), staged.checkpoint, staged.snapshots});
         recordPublication(result.status);
@@ -1321,7 +1404,9 @@ void ContextCacheCoordinator::publishReadyEndpoint(RequestHandle::Impl& request,
     }
 
     size_t const tokenCount = static_cast<size_t>(publishBlocks) * static_cast<size_t>(kTOKENS_PER_PAGE);
-    std::vector<BlockHash> hashes = hashRequestFullBlocks(sequence.tokenIds.data(), tokenCount, sequence.keyExtras);
+    Hash128 const* pubMediaPtr = sequence.perPositionMediaHash.empty() ? nullptr : sequence.perPositionMediaHash.data();
+    std::vector<BlockHash> hashes
+        = hashRequestFullBlocks(sequence.tokenIds.data(), tokenCount, sequence.keyExtras, pubMediaPtr);
     PublishResult const result
         = mManager.publish(sequence.lease, PublishRequest{std::move(hashes), sequence.committedStateLength});
     recordPublication(result.status);
@@ -1350,7 +1435,10 @@ void ContextCacheCoordinator::publishSpecEndpoint(
         return;
     }
     size_t const tokenCount = static_cast<size_t>(publishBlocks) * static_cast<size_t>(kTOKENS_PER_PAGE);
-    std::vector<BlockHash> hashes = hashRequestFullBlocks(sequence.tokenIds.data(), tokenCount, sequence.keyExtras);
+    Hash128 const* specMediaPtr
+        = sequence.perPositionMediaHash.empty() ? nullptr : sequence.perPositionMediaHash.data();
+    std::vector<BlockHash> hashes
+        = hashRequestFullBlocks(sequence.tokenIds.data(), tokenCount, sequence.keyExtras, specMediaPtr);
     PublishResult const result = mManager.publish(sequence.lease, PublishRequest{std::move(hashes), commonStateLength});
     recordPublication(result.status);
     sequence.publishedFullBlockCount = result.publishedBaseFullBlockCount;

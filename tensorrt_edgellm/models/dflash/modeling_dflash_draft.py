@@ -393,7 +393,10 @@ class DFlashDraftModel(nn.Module):
                               hidden_size,
                               bias=False,
                               module_name="fc")
-        if not isinstance(self.fc, FP16Linear):
+        self.fc_native_precision = getattr(config,
+                                           "dflash_fc_native_precision", False)
+        if not self.fc_native_precision and not isinstance(
+                self.fc, FP16Linear):
             raise ValueError(
                 "DFlash draft fc projector must remain dense FP16 for the "
                 "full-FP32 target-hidden projection. Exclude module 'fc' "
@@ -434,14 +437,17 @@ class DFlashDraftModel(nn.Module):
         """
         B, BS, _ = inputs_embeds.shape
 
-        # Project multi-layer hidden states: [B, L, Nl*H] -> [B, L, H]
-        # Qwen3-8B target_hidden can spike above abs=2e4 for some first-token
-        # channels. The visible pre-RMSNorm FC result must remain FP32; casting
-        # an already-overflowed FP16 FC output back to FP32 is too late.
-        bias = (self.fc.bias.to(torch.float32)
-                if self.fc.bias is not None else None)
-        h_delta_acc = F.linear(target_hidden_concat.to(torch.float32),
-                               self.fc.weight.to(torch.float32), bias)
+        # Project multi-layer hidden states: [B, L, Nl*H] -> [B, L, H].
+        if self.fc_native_precision:
+            h_delta_acc = self.fc(target_hidden_concat.to(torch.float16))
+        else:
+            # Qwen3-8B target_hidden can spike above abs=2e4; the visible
+            # pre-RMSNorm FC result must remain FP32 (an already-overflowed FP16
+            # FC output cannot be recovered by a later up-cast).
+            bias = (self.fc.bias.to(torch.float32)
+                    if self.fc.bias is not None else None)
+            h_delta_acc = F.linear(target_hidden_concat.to(torch.float32),
+                                   self.fc.weight.to(torch.float32), bias)
         h_delta = self.hidden_norm(h_delta_acc).to(inputs_embeds.dtype)
 
         # Run through decoder layers

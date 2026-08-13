@@ -65,6 +65,29 @@ public:
         mPolicyRunner->setUseCudaGraph(enable);
     }
 
+    //! \brief Select the video-subsample path for subsequent generatePolicy() calls. factor == 1
+    //! (default) is the regular path; factor > 1 runs the optimized path over fewer GEN video frames
+    //! (see Cosmos3PolicyRunner::setVideoSubsampleFactor). Only the GEN denoise extent changes; the VAE
+    //! conditioning encode and UND prefill are unaffected.
+    void setVideoSubsampleFactor(int32_t factor)
+    {
+        mPolicyRunner->setVideoSubsampleFactor(factor);
+    }
+
+    //! \brief Select the action-chunk length for subsequent generatePolicy() calls (0 = engine canonical
+    //! max, unchanged default; positive = clamped into the engine's built action range). See
+    //! Cosmos3PolicyRunner::setActionChunkSize.
+    void setActionChunkSize(int32_t chunk)
+    {
+        mPolicyRunner->setActionChunkSize(chunk);
+    }
+
+    //! \brief Enable guidance-interval CFG on the GEN loop (see Cosmos3PolicyRunner::setGuidance).
+    //! guidance == 1 (default) disables it. When enabled, generatePolicy must be given uncondEmbeds.
+    //! Enabling CFG (guidance != 1) lazily allocates the second (unconditional) UND K/V set; a no-op
+    //! re-enable does not re-allocate.
+    void setGuidance(float guidance, float intervalLo, float intervalHi);
+
     //! \brief Policy component contract (action chunk size, raw action dim, domain, ...).
     Cosmos3PolicyConfig const& policyConfig() const noexcept
     {
@@ -73,18 +96,25 @@ public:
 
     //! \brief Run the full policy pipeline and return the action chunk [B, actionChunkSize, rawActionDim].
     //! \param pixelValues  Device FLOAT32 conditioning-pixel tensor [B,3,t_in,H,W] (preprocessed).
-    //! \param inputsEmbeds Device FLOAT16 prompt embeddings [B,S,hidden] (embed_tokens applied upstream).
-    std::vector<float> generatePolicy(
-        rt::Tensor const& pixelValues, rt::Tensor const& inputsEmbeds, cudaStream_t stream);
+    //! \param inputsEmbeds Device FLOAT16 conditional prompt embeddings [B,S,hidden] (embed_tokens upstream).
+    //! \param uncondEmbeds Optional FLOAT16 unconditional (empty-prompt) embeddings [B,S',hidden] for CFG;
+    //!                     nullptr (or guidance == 1) runs the single-forward conditional path.
+    std::vector<float> generatePolicy(rt::Tensor const& pixelValues, rt::Tensor const& inputsEmbeds,
+        rt::Tensor const* uncondEmbeds, cudaStream_t stream);
 
 private:
-    //! \brief Run the UND prefill engine over the prompt embeddings, filling mUndK/mUndV.
-    void prefillUnd(rt::Tensor const& inputsEmbeds, cudaStream_t stream);
+    //! \brief Run the UND prefill engine over the prompt embeddings, writing per-layer K/V into the
+    //! given target buffers (mUndK/mUndV for the conditional pass, mUndKUncond/mUndVUncond for CFG).
+    void prefillUnd(rt::Tensor const& inputsEmbeds, std::vector<rt::Tensor>& undK, std::vector<rt::Tensor>& undV,
+        cudaStream_t stream);
     //! \brief Allocate the shared context-memory pool and bind it to all three engines.
     void allocateSharedContextMemory();
     //! \brief Allocate all UND prefill I/O buffers at the engine-profile maximum sequence length,
     //! precompute the prefix-safe rope cos/sin + position ids, and bind every address once.
     void allocateUndBuffers(cudaStream_t stream);
+    //! \brief Allocate the second (unconditional, empty-prompt) UND K/V set used only by guidance-interval
+    //! CFG. Called from setGuidance only when CFG is enabled (guidance != 1); guarded against double-alloc.
+    void allocateUncondBuffers();
 
     // UND prefill engine (owned here; prefill-only tower emitting per-layer K/V as graph outputs).
     std::unique_ptr<nvinfer1::IRuntime> mTextRuntime{nullptr};
@@ -107,9 +137,15 @@ private:
 
     rt::Tensor mSharedContextMemory;
 
+    float mGuidance{1.0F}; //!< CFG scale; 1 disables the unconditional pass.
+
     // Per-layer seq-major UND K/V (FLOAT16), allocated once at [maxB,maxS,...] and reshaped per request.
-    std::vector<rt::Tensor> mUndK;  //!< [B,S,numKVHeads,headDim] per layer
-    std::vector<rt::Tensor> mUndV;  //!< [B,S,numKVHeads,headDim] per layer
+    std::vector<rt::Tensor> mUndK; //!< conditional [B,S,numKVHeads,headDim] per layer
+    std::vector<rt::Tensor> mUndV; //!< conditional [B,S,numKVHeads,headDim] per layer
+    // Unconditional (empty-prompt) UND K/V per layer, allocated ONLY when guidance-interval CFG is
+    // enabled (via setGuidance -> allocateUncondBuffers); empty on the default guidance == 1 path.
+    std::vector<rt::Tensor> mUndKUncond;
+    std::vector<rt::Tensor> mUndVUncond;
     rt::Tensor mTextRopeCosSin;     //!< text-only mRoPE cache, packed [B,S,headDim] (refilled on shape change).
     rt::Tensor mAttentionPosId;     //!< iota positions, packed [B,S] INT32 (refilled on shape change).
     rt::Tensor mAttentionPosIdHost; //!< pinned host staging for mAttentionPosId (allocated once at max shape).

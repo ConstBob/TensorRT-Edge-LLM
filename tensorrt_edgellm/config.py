@@ -68,6 +68,10 @@ QUANT_FP16 = "fp16"
 QUANT_FP8 = "fp8"
 QUANT_MXFP8 = "mxfp8"
 QUANT_NVFP4 = "nvfp4"
+# Weight-only NVFP4 (W4A16): ModelOpt ``W4A16_NVFP4`` — 4-bit float weights,
+# FP16 activations. Distinct from QUANT_NVFP4 (W4A4); routed to the dense/MoE
+# Marlin FP16xE2M1 kernels.
+QUANT_NVFP4_A16 = "nvfp4_a16"
 QUANT_INT4_AWQ = "int4_awq"
 QUANT_INT4_AWQ_MODELOPT = "int4_awq_modelopt"
 QUANT_INT4_GPTQ = "int4_gptq"
@@ -88,6 +92,14 @@ LAYER_GDN = "gdn"  # GatedDeltaNet linear attention (Qwen3.5)
 LAYER_MOE = "moe"
 
 _VALID_ATTENTION_LAYER_TYPES = ("sliding_attention", "full_attention")
+
+# NemotronH ``hybrid_override_pattern`` / ``mtp_hybrid_override_pattern`` chars.
+_HYBRID_PATTERN_MAP = {
+    "M": LAYER_MAMBA,
+    "-": LAYER_MLP,
+    "*": LAYER_ATTN,
+    "E": LAYER_MOE,
+}
 
 _DIFFUSION_GEMMA_MODEL_TYPES = frozenset({
     "diffusion_gemma",
@@ -119,6 +131,10 @@ def _is_gemma4_model_type(model_type: str) -> bool:
     model_type = str(model_type)
     return (model_type.startswith("gemma4")
             or _is_diffusion_gemma_model_type(model_type))
+
+
+def _is_gemma4_assistant_model_type(model_type: str) -> bool:
+    return str(model_type) in ("gemma4_assistant", "gemma4_unified_assistant")
 
 
 def _check_num_attention_heads(num_attn_heads: int) -> None:
@@ -664,6 +680,14 @@ class ModelConfig:
     # ------------------------------------------ MTP config
     mtp_num_hidden_layers: Optional[int] = None
     mtp_use_dedicated_embeddings: bool = False
+    # Nemotron-H MTP: the draft module is a hybrid stack whose layer types come
+    # from this pattern (e.g. "*E" -> [attention, MoE]); ``mtp_num_hidden_layers``
+    # is then its length. ``num_nextn_predict_layers`` (the count of MTP prediction
+    # modules) is folded in during parsing.
+    mtp_hybrid_override_pattern: Optional[str] = None
+    # The same draft stack, resolved from either the pattern above or the
+    # ``mtp_layers_block_type`` list.
+    mtp_layer_types: List[str] = field(default_factory=list)
     # When True, the standard CausalLM is exported as the MTP base model variant
     # with tree-attention inputs (attention_mask, attention_pos_id) and
     # an extra hidden_states output.
@@ -709,6 +733,11 @@ class ModelConfig:
     dflash_target_layer_ids: List[int] = field(default_factory=list)
     dflash_block_size: int = 16
     dflash_mask_token_id: int = 248070
+    # Run the fc feature projector at the checkpoint's native precision (e.g.
+    # NVFP4) instead of the default dense-FP16 + FP32 projection. Enabled only
+    # for targets measured to keep target-hidden well inside FP16 range
+    # (Nemotron-3.5). Qwen3-8B keeps the FP32 guard (target-hidden ~abs 2e4).
+    dflash_fc_native_precision: bool = False
     # ------------------------------------------ JetSpec config
     # JetSpec uses the DFlash/DDTree cached-draft contract with causal proposal
     # attention inside the draft block. The DFlash-prefixed fields are still
@@ -823,9 +852,10 @@ class ModelConfig:
     def is_mtp_draft(self) -> bool:
         """True for a derived MTP draft config built from a base checkpoint."""
         return bool(self.mtp_num_hidden_layers is not None
-                    and self.gdn_cfg is None and not self.mtp_base
-                    and not self.is_eagle3_draft and not self.is_dflash_draft
-                    and not self.is_jetspec_draft and not self.is_dspark_draft)
+                    and self.gdn_cfg is None and self.mamba_cfg is None
+                    and not self.mtp_base and not self.is_eagle3_draft
+                    and not self.is_dflash_draft and not self.is_jetspec_draft
+                    and not self.is_dspark_draft)
 
     @property
     def is_gemma4_mtp_draft(self) -> bool:
@@ -970,8 +1000,9 @@ class ModelConfig:
         root_model_type = root.get("model_type", "")
         model_type = llm_dict.get("model_type", "llama")
         is_diffusion_gemma = _is_diffusion_gemma_config(root, llm_dict)
-        if root_model_type == "gemma4_assistant":
-            model_type = root_model_type
+        is_gemma4_assistant = _is_gemma4_assistant_model_type(root_model_type)
+        if is_gemma4_assistant:
+            model_type = "gemma4_assistant"
         elif is_diffusion_gemma:
             model_type = "diffusion_gemma"
         hidden_size = llm_dict["hidden_size"]
@@ -1028,6 +1059,14 @@ class ModelConfig:
         mtp_num_hidden_layers = llm_dict.get("mtp_num_hidden_layers")
         if mtp_num_hidden_layers is not None:
             mtp_num_hidden_layers = int(mtp_num_hidden_layers)
+        mtp_hybrid_override_pattern = llm_dict.get(
+            "mtp_hybrid_override_pattern")
+        mtp_layer_types = _parse_mtp_layer_types(llm_dict)
+        num_nextn_predict_layers = int(
+            llm_dict.get("num_nextn_predict_layers", 0) or 0)
+        if (mtp_num_hidden_layers is None and num_nextn_predict_layers > 0
+                and mtp_layer_types):
+            mtp_num_hidden_layers = len(mtp_layer_types)
         mtp_use_dedicated_embeddings = bool(
             llm_dict.get("mtp_use_dedicated_embeddings", False))
         _validate_mtp_constraints(
@@ -1180,18 +1219,19 @@ class ModelConfig:
             attn_output_gate=bool(llm_dict.get("attn_output_gate", False)),
             mtp_num_hidden_layers=mtp_num_hidden_layers,
             mtp_use_dedicated_embeddings=mtp_use_dedicated_embeddings,
+            mtp_hybrid_override_pattern=mtp_hybrid_override_pattern,
+            mtp_layer_types=mtp_layer_types,
             mtp_base=bool(llm_dict.get("mtp_base", False)),
             root_model_type=root_model_type,
             raw_layer_types=raw_layer_types,
             rope_parameters=llm_dict.get("rope_parameters", None),
             backbone_hidden_size=int(
                 llm_dict.get("backbone_hidden_size", 0) or 0),
-            assistant_hidden_size=(hidden_size if root_model_type
-                                   == "gemma4_assistant" else 0),
-            shares_target_kv=(root_model_type == "gemma4_assistant"),
-            has_own_kv_cache=(root_model_type != "gemma4_assistant"),
-            constant_draft_positions=(root_model_type == "gemma4_assistant"),
-            returns_feedback_hidden=(root_model_type == "gemma4_assistant"),
+            assistant_hidden_size=(hidden_size if is_gemma4_assistant else 0),
+            shares_target_kv=is_gemma4_assistant,
+            has_own_kv_cache=not is_gemma4_assistant,
+            constant_draft_positions=is_gemma4_assistant,
+            returns_feedback_hidden=is_gemma4_assistant,
             use_ordered_embeddings=bool(
                 llm_dict.get("use_ordered_embeddings", False)),
             num_centroids=int(llm_dict.get("num_centroids", 0) or 0),
@@ -1206,6 +1246,10 @@ class ModelConfig:
             jetspec_block_size=jetspec_block_size,
             jetspec_mask_token_id=jetspec_mask_token_id,
             jetspec_causal_head=jetspec_causal_head,
+            dflash_target_layer_ids=list(
+                (llm_dict.get("dflash_config", {})
+                 or {}).get("target_layer_ids")
+                or llm_dict.get("eagle_aux_hidden_state_layer_ids") or []),
             dspark_base=bool(llm_dict.get("dspark_base", False)),
             num_deepstack_features=_parse_num_deepstack_features(
                 llm_dict, model_type, root_config=root),
@@ -1292,6 +1336,32 @@ def make_mtp_draft_config(base_config: ModelConfig) -> ModelConfig:
     if mtp_num_hidden_layers is None:
         raise ValueError(
             "MTP draft config requires mtp_num_hidden_layers in the base config."
+        )
+
+    # Nemotron-H: Exclude all draft ``layers.*`` modules from quantization;
+    # the untouched lm_head keeps the base quant type.
+    if (base_config.model_type or "").lower().startswith("nemotron_h"):
+        draft_layer_types = list(base_config.mtp_layer_types)
+        if len(draft_layer_types) != mtp_num_hidden_layers:
+            declared = (base_config.mtp_hybrid_override_pattern
+                        or base_config.mtp_layer_types)
+            raise ValueError(
+                f"MTP draft stack {declared!r} yields "
+                f"{len(draft_layer_types)} layers != mtp_num_hidden_layers "
+                f"{mtp_num_hidden_layers}")
+        draft_quant = replace(
+            base_config.quant,
+            excluded=list(base_config.quant.excluded) + ["layers.*"],
+        )
+        return replace(
+            base_config,
+            num_hidden_layers=mtp_num_hidden_layers,
+            layer_types=draft_layer_types,
+            mamba_cfg=None,
+            gdn_cfg=None,
+            mtp_base=False,
+            quant=draft_quant,
+            tie_word_embeddings=False,
         )
 
     # The draft is quantized iff its FFN compute weights are quantized
@@ -1467,6 +1537,12 @@ def make_dflash_draft_config(
     # Parse quantization config from the draft checkpoint directory.
     # For FP16 draft checkpoints this returns QuantConfig() (no quant).
     quant = _parse_quant(draft_dir, llm_dict)
+    # The fc feature projector must stay dense FP16 (the draft model asserts
+    # this). Finalized NVFP4 drafts ship a packed fc; excluding it here keeps
+    # ``make_linear`` producing FP16Linear, and the loader dequantizes the
+    # packed checkpoint tensors into it (see ``model.py``).
+    if "fc" not in quant.excluded:
+        quant.excluded = list(quant.excluded) + ["fc"]
 
     model_type = llm_dict.get("model_type", "qwen3")
     _check_num_attention_heads(llm_dict["num_attention_heads"])
@@ -1674,9 +1750,16 @@ def _validate_mtp_constraints(
     """Validate the currently supported MTP config subset."""
     if mtp_num_hidden_layers is None and not mtp_use_dedicated_embeddings:
         return
+    if (model_type or "").lower().startswith("nemotron_h"):
+        if mtp_use_dedicated_embeddings:
+            raise NotImplementedError(
+                "Dedicated MTP embeddings are not supported for Nemotron-H MTP."
+            )
+        return
     if model_type not in _QWEN3_5_MTP_CONFIG_MODEL_TYPES:
         raise NotImplementedError(
-            "MTP config parsing is only supported for Qwen3.5 checkpoints.")
+            "MTP config parsing is only supported for Qwen3.5 and Nemotron-H "
+            "checkpoints.")
     if mtp_num_hidden_layers != 1:
         raise NotImplementedError(
             "Only mtp_num_hidden_layers == 1 is supported for Qwen3.5 MTP.")
@@ -1693,45 +1776,69 @@ def _parse_raw_layer_types(config: dict) -> List[str]:
     return [str(layer_type) for layer_type in raw]
 
 
+def _is_nemotron_h_config(config: dict) -> bool:
+    return (config.get("model_type") or "").lower().startswith("nemotron_h")
+
+
+def _canonical_layer_type(block_type: str, is_nemotron_h: bool) -> str:
+    """Map one checkpoint block-type name onto a canonical layer label.
+
+    ``"linear_attention"`` is ambiguous: it covers any sub-quadratic mixer, so
+    it denotes Mamba2 for NemotronH and GatedDeltaNet for Qwen3.5. The model
+    family therefore resolves it, along with ``"full_attention"``, which Gemma4
+    keeps verbatim for per-layer head_dim dispatch.
+    """
+    bt = str(block_type).lower()
+    if bt == "linear_attention":
+        return LAYER_MAMBA if is_nemotron_h else LAYER_GDN
+    if "mamba" in bt:
+        return LAYER_MAMBA
+    if bt == "moe":
+        return LAYER_MOE
+    if "mlp" in bt:
+        return LAYER_MLP
+    if bt in _VALID_ATTENTION_LAYER_TYPES:
+        return LAYER_ATTN if is_nemotron_h else bt
+    return LAYER_ATTN
+
+
+def _parse_mtp_layer_types(config: dict) -> List[str]:
+    """Return the MTP draft stack's per-layer block types.
+
+    NemotronH declares the stack either as ``mtp_layers_block_type`` (a list,
+    which transformers >= 5.14 rewrites into the ``linear_attention`` /
+    ``full_attention`` spelling) or as the legacy ``mtp_hybrid_override_pattern``
+    string (e.g. ``"*E"``).
+    """
+    raw = config.get("mtp_layers_block_type")
+    if raw:
+        is_nemotron_h = _is_nemotron_h_config(config)
+        return [_canonical_layer_type(bt, is_nemotron_h) for bt in raw]
+    pattern = config.get("mtp_hybrid_override_pattern") or ""
+    return [
+        _HYBRID_PATTERN_MAP[ch] for ch in pattern if ch in _HYBRID_PATTERN_MAP
+    ]
+
+
 def _parse_layer_types(config: dict) -> List[str]:
     """Return per-layer block type list from config.
 
-    Reads ``layers_block_type`` or ``layer_types`` directly if present.
-    For models using ``hybrid_override_pattern`` (e.g. NemotronH), parses the
-    pattern string where ``M`` = mamba, ``-`` = mlp, ``*`` = attention.
-    Falls back to all attention layers.
-
-    Qwen3.5 uses ``layer_types`` with values ``"linear_attention"`` (GDN)
-    and ``"full_attention"``.
+    Reads ``layers_block_type`` or ``layer_types`` directly if present, each
+    entry resolved by :func:`_canonical_layer_type`. For models using
+    ``hybrid_override_pattern`` (e.g. NemotronH), parses the pattern string
+    where ``M`` = mamba, ``-`` = mlp, ``*`` = attention. Falls back to all
+    attention layers.
     """
     raw = config.get("layers_block_type") or config.get("layer_types")
     if raw is not None:
-        result = []
-        for bt in raw:
-            bt_lower = str(bt).lower()
-            if bt_lower == "linear_attention":
-                result.append(LAYER_GDN)
-            elif "mamba" in bt_lower:
-                result.append(LAYER_MAMBA)
-            elif bt_lower == "moe":
-                result.append(LAYER_MOE)
-            elif "mlp" in bt_lower:
-                result.append(LAYER_MLP)
-            elif bt_lower in ("sliding_attention", "full_attention"):
-                # Gemma4: preserve raw string for per-layer head_dim dispatch
-                result.append(bt_lower)
-            else:
-                result.append(LAYER_ATTN)
-        return result
+        is_nemotron_h = _is_nemotron_h_config(config)
+        return [_canonical_layer_type(bt, is_nemotron_h) for bt in raw]
     pattern = config.get("hybrid_override_pattern")
     if pattern is not None:
-        _PATTERN_MAP = {
-            "M": LAYER_MAMBA,
-            "-": LAYER_MLP,
-            "*": LAYER_ATTN,
-            "E": LAYER_MOE,
-        }
-        return [_PATTERN_MAP[ch] for ch in pattern if ch in _PATTERN_MAP]
+        return [
+            _HYBRID_PATTERN_MAP[ch] for ch in pattern
+            if ch in _HYBRID_PATTERN_MAP
+        ]
     n = config["num_hidden_layers"]
     return [LAYER_ATTN] * n
 
@@ -2330,8 +2437,18 @@ def _parse_mixed_precision(quantized_layers: dict) -> "tuple[str, int, dict]":
             algo_group_size[algo] = int(layer_cfg.get("group_size", 1))
     if not algo_count:
         return QUANT_FP16, 1, {}
+
+    def _mixed_quant_type(algo: str) -> str:
+        # ModelOpt tags weight-only NVFP4 as ``W4A16_NVFP4``; the generic mapper
+        # collapses it to plain (W4A4) ``nvfp4``. Preserve the A16 distinction so
+        # weight-only experts/lm_head route to the NVFP4-A16 Marlin path.
+        qt = _algo_to_quant_type(algo)
+        if qt == QUANT_NVFP4 and "W4A16" in algo.upper():
+            return QUANT_NVFP4_A16
+        return qt
+
     dominant_algo = algo_count.most_common(1)[0][0]
-    dominant_type = _algo_to_quant_type(dominant_algo)
+    dominant_type = _mixed_quant_type(dominant_algo)
     dominant_group_size = algo_group_size.get(dominant_algo, 1)
     # Expand fused projection keys (``self_attn.qkv_proj``,
     # ``mlp.gate_up_proj``) into the split names ``make_linear`` looks up
@@ -2340,7 +2457,7 @@ def _parse_mixed_precision(quantized_layers: dict) -> "tuple[str, int, dict]":
     for name, layer_cfg in quantized_layers.items():
         algo = layer_cfg.get("quant_algo", "").upper()
         short_name = _normalize_module_name(name)
-        quant_type = _algo_to_quant_type(algo)
+        quant_type = _mixed_quant_type(algo)
         if short_name.endswith(".self_attn.qkv_proj"):
             prefix = short_name[:-len("qkv_proj")]
             for proj in ("q_proj", "k_proj", "v_proj"):

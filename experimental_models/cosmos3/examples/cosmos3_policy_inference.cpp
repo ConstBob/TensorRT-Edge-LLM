@@ -92,13 +92,19 @@ enum OptionId : int
     PROMPT_FILE = 912,
     ITERS = 915,
     WARMUP = 916,
-    CUDAGRAPH = 917
+    CUDAGRAPH = 917,
+    GUIDANCE = 918,
+    VIDEO_SUBSAMPLE = 919,
+    ALTERNATE_VSF = 920,
+    ACTION_CHUNK = 921,
+    VIDEO = 922
 };
 
 struct Args
 {
     std::string engineDir;
     std::string imagePath;               //!< PNG/JPG conditioning observation (shared across the batch)
+    std::string videoPath;               //!< comma-separated observation frames; i2v conditions on the most recent one
     std::vector<std::string> prompts;    //!< text instructions; batch = prompt count
     std::string domain{"droid_lerobot"}; //!< action domain
     std::string viewPoint{"ego_view"};   //!< camera viewpoint for the policy prompt framing
@@ -111,6 +117,10 @@ struct Args
     int32_t iters{1};
     int32_t warmup{2};
     bool cudagraph{false};
+    float guidance{1.0F};            //!< CFG scale; 1.0 = off (single conditional forward). 3.0 matches the reference.
+    int32_t videoSubsampleFactor{1}; //!< 1 = regular path (default); 4 = optimized (fewer GEN video frames).
+    int32_t actionChunk{0};          //!< 0 = engine canonical/max chunk (default); positive = clamped request.
+    bool alternateVsf{false};        //!< test/benchmark only: alternate vsf 1<->videoSubsampleFactor per round.
     bool help{false};
 };
 
@@ -126,7 +136,14 @@ void printUsage(char const* programName)
     std::cerr << "  --help       Display this help message" << std::endl;
     std::cerr << "  --engineDir  Directory with und_prefill/, vae_encoder/, gen/ engines" << std::endl;
     std::cerr << "               (+ text_tokenizer/ and embed_tokens.safetensors). Required." << std::endl;
-    std::cerr << "  --image      Conditioning observation (PNG/JPG), shared across the batch. Required." << std::endl;
+    std::cerr << "  --image      Conditioning observation (PNG/JPG), shared across the batch. Required unless --video."
+              << std::endl;
+    std::cerr << "  --video      Observation frames as a comma-separated PNG/JPG list (oldest..most-recent)."
+              << std::endl;
+    std::cerr << "               The policy conditions image-to-video (i2v): the most-recent frame is the single"
+              << std::endl;
+    std::cerr << "               conditioning observation; earlier frames are ignored. Mutually exclusive with --image."
+              << std::endl;
     std::cerr << "  --prompt     Text instruction. Repeat for a batched request (batch = prompt count;" << std::endl;
     std::cerr << "               requires engines built with --maxBatchSize >= count). Required." << std::endl;
     std::cerr << "  --output     Action chunk output. DEFAULT is JSON (the inference-response" << std::endl;
@@ -142,18 +159,44 @@ void printUsage(char const* programName)
     std::cerr << "  --iters      Benchmark iterations. Default = 1" << std::endl;
     std::cerr << "  --warmup     Benchmark warmup rounds. Default = 2" << std::endl;
     std::cerr << "  --cudagraph  Capture/replay the per-step GEN forward as a CUDA graph." << std::endl;
+    std::cerr << "  --guidance   Classifier-free guidance scale (guidance-interval CFG). Default 1.0 = off;"
+              << std::endl;
+    std::cerr << "               3.0 matches the reference (CFG on the first step, interval [960,1001])." << std::endl;
+    std::cerr << "  --video-subsample-factor  GEN video-subsample path: ANY integer >= 1 (1 = regular, default;"
+              << std::endl;
+    std::cerr << "               higher = more video subsample -> fewer GEN video tokens). One dynamic engine serves"
+              << std::endl;
+    std::cerr << "               every factor; a factor below the engine's built profile is clamped to its minimum."
+              << std::endl;
+    std::cerr << "               NOTE: vsf > 1 needs a subsample-trained checkpoint to be accuracy-correct; on a"
+              << std::endl;
+    std::cerr << "               regular checkpoint it is speed-representative only." << std::endl;
+    std::cerr << "  --alternate-vsf  Test/benchmark only: flip vsf 1<->(--video-subsample-factor) every round."
+              << std::endl;
+    std::cerr << "               With --cudagraph, verifies the per-extent CUDA-graph cache captures each extent"
+              << std::endl;
+    std::cerr << "               once then only replays. Requires --video-subsample-factor > 1. Not for deployment."
+              << std::endl;
+    std::cerr << "  --action-chunk-size  Action-chunk length (0 = engine canonical/max, default). A positive"
+              << std::endl;
+    std::cerr << "               value is clamped into the engine's built action range; the output chunk follows it."
+              << std::endl;
 }
 
 bool parseArgs(Args& args, int argc, char** argv)
 {
-    static struct option options[] = {{"help", no_argument, nullptr, HELP},
-        {"engineDir", required_argument, nullptr, ENGINE_DIR}, {"image", required_argument, nullptr, IMAGE},
-        {"prompt", required_argument, nullptr, PROMPT}, {"domain", required_argument, nullptr, DOMAIN},
-        {"viewPoint", required_argument, nullptr, VIEW_POINT}, {"rawPrompt", no_argument, nullptr, RAW_PROMPT},
-        {"promptFile", required_argument, nullptr, PROMPT_FILE}, {"output", required_argument, nullptr, OUTPUT},
-        {"steps", required_argument, nullptr, STEPS}, {"seed", required_argument, nullptr, SEED},
-        {"iters", required_argument, nullptr, ITERS}, {"warmup", required_argument, nullptr, WARMUP},
-        {"cudagraph", no_argument, nullptr, CUDAGRAPH}, {nullptr, 0, nullptr, 0}};
+    static struct option options[]
+        = {{"help", no_argument, nullptr, HELP}, {"engineDir", required_argument, nullptr, ENGINE_DIR},
+            {"image", required_argument, nullptr, IMAGE}, {"video", required_argument, nullptr, VIDEO},
+            {"prompt", required_argument, nullptr, PROMPT}, {"domain", required_argument, nullptr, DOMAIN},
+            {"viewPoint", required_argument, nullptr, VIEW_POINT}, {"rawPrompt", no_argument, nullptr, RAW_PROMPT},
+            {"promptFile", required_argument, nullptr, PROMPT_FILE}, {"output", required_argument, nullptr, OUTPUT},
+            {"steps", required_argument, nullptr, STEPS}, {"seed", required_argument, nullptr, SEED},
+            {"iters", required_argument, nullptr, ITERS}, {"warmup", required_argument, nullptr, WARMUP},
+            {"cudagraph", no_argument, nullptr, CUDAGRAPH}, {"guidance", required_argument, nullptr, GUIDANCE},
+            {"video-subsample-factor", required_argument, nullptr, VIDEO_SUBSAMPLE},
+            {"alternate-vsf", no_argument, nullptr, ALTERNATE_VSF},
+            {"action-chunk-size", required_argument, nullptr, ACTION_CHUNK}, {nullptr, 0, nullptr, 0}};
     int opt;
     while ((opt = getopt_long(argc, argv, "", options, nullptr)) != -1)
     {
@@ -162,6 +205,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         case HELP: args.help = true; return true;
         case ENGINE_DIR: args.engineDir = optarg ? optarg : ""; break;
         case IMAGE: args.imagePath = optarg ? optarg : ""; break;
+        case VIDEO: args.videoPath = optarg ? optarg : ""; break;
         case PROMPT:
             if (optarg != nullptr)
             {
@@ -178,10 +222,16 @@ bool parseArgs(Args& args, int argc, char** argv)
         case ITERS: args.iters = optarg ? std::stoi(optarg) : args.iters; break;
         case WARMUP: args.warmup = optarg ? std::stoi(optarg) : args.warmup; break;
         case CUDAGRAPH: args.cudagraph = true; break;
+        case GUIDANCE: args.guidance = optarg ? std::stof(optarg) : args.guidance; break;
+        case VIDEO_SUBSAMPLE: args.videoSubsampleFactor = optarg ? std::stoi(optarg) : args.videoSubsampleFactor; break;
+        case ALTERNATE_VSF: args.alternateVsf = true; break;
+        case ACTION_CHUNK: args.actionChunk = optarg ? std::stoi(optarg) : args.actionChunk; break;
         default: return false;
         }
     }
-    return !args.engineDir.empty() && !args.imagePath.empty() && (!args.prompts.empty() || !args.promptFile.empty());
+    // Exactly one conditioning source: --image (single frame) xor --video (frame list).
+    bool const oneSource = args.imagePath.empty() != args.videoPath.empty();
+    return !args.engineDir.empty() && oneSource && (!args.prompts.empty() || !args.promptFile.empty());
 }
 
 //! Read the [B,3,F,H,W] pixel-clip shape from the vae_encoder component contract.
@@ -332,8 +382,13 @@ void writeActionSafetensors(std::string const& path, std::vector<float> const& a
 //! RoboLab wrapper); for batch > 1 it is [B][chunk][dim]. "shape" is always [B, chunk, dim].
 void writeActionJson(std::string const& path, std::vector<float> const& action, int32_t batch, int32_t chunk,
     int32_t dim, std::string const& domain, int32_t steps, std::vector<std::string> const& prompts, bool finite,
-    int32_t seqLen)
+    int32_t seqLen, int32_t videoSubsampleFactor)
 {
+    // droid_lerobot delivers the gripper (final action dim) in the dataset's
+    // open/close convention; the raw model channel is inverted, so flip it back
+    // at the JSON boundary. Mirrors the reference DROID action interface
+    // (action_np[:, -1] = 1 - action_np[:, -1]); the raw .safetensors path stays raw.
+    bool const invertGripper = (domain == "droid_lerobot") && dim > 0;
     auto chunkRows = [&](int32_t b) {
         Json rows = Json::array();
         for (int32_t c = 0; c < chunk; ++c)
@@ -341,7 +396,12 @@ void writeActionJson(std::string const& path, std::vector<float> const& action, 
             Json row = Json::array();
             for (int32_t d = 0; d < dim; ++d)
             {
-                row.push_back(action[(static_cast<size_t>(b) * chunk + c) * dim + d]);
+                float value = action[(static_cast<size_t>(b) * chunk + c) * dim + d];
+                if (invertGripper && d == dim - 1)
+                {
+                    value = 1.0F - value;
+                }
+                row.push_back(value);
             }
             rows.push_back(std::move(row));
         }
@@ -369,7 +429,7 @@ void writeActionJson(std::string const& path, std::vector<float> const& action, 
     j["domain"] = domain;
     j["num_inference_steps"] = steps;
     j["finite"] = finite;
-    j["meta"] = {{"seq_len", seqLen}};
+    j["meta"] = {{"seq_len", seqLen}, {"video_subsample_factor", videoSubsampleFactor}};
 
     std::ofstream of(path);
     of << j.dump(2) << "\n";
@@ -427,9 +487,36 @@ int main(int argc, char** argv)
         // ------------------------------------------------------------------ //
         // (a) Conditioning frame -> pixel clip [B,3,F,H,W] in [-1,1].         //
         // ------------------------------------------------------------------ //
-        rt::imageUtils::ImageData const img = rt::imageUtils::loadImageFromFile(args.imagePath);
-        LOG_INFO("Loaded image %s (%ldx%ld), resizing to %dx%d and normalizing to pixel_values.",
-            args.imagePath.c_str(), img.width, img.height, clipW, clipH);
+        // The policy conditions image-to-video (i2v): a single observation frame is the
+        // conditioning input (only latent frame 0 is kept clean; the rest of the clip is
+        // denoised). --video supplies an observation clip (oldest..most-recent); the policy
+        // conditions on the most-recent frame, matching the reference i2v regime.
+        std::string condFramePath = args.imagePath;
+        if (condFramePath.empty())
+        {
+            std::vector<std::string> frames;
+            for (size_t start = 0; start <= args.videoPath.size();)
+            {
+                size_t const comma = args.videoPath.find(',', start);
+                size_t const end = (comma == std::string::npos) ? args.videoPath.size() : comma;
+                if (end > start)
+                {
+                    frames.push_back(args.videoPath.substr(start, end - start));
+                }
+                if (comma == std::string::npos)
+                {
+                    break;
+                }
+                start = comma + 1;
+            }
+            ELLM_CHECK(!frames.empty(), "--video requires at least one frame path");
+            condFramePath = frames.back();
+            LOG_INFO("Video input: %zu observation frame(s); conditioning i2v on the most-recent frame %s.",
+                frames.size(), condFramePath.c_str());
+        }
+        rt::imageUtils::ImageData const img = rt::imageUtils::loadImageFromFile(condFramePath);
+        LOG_INFO("Loaded conditioning frame %s (%ldx%ld), resizing to %dx%d and normalizing to pixel_values.",
+            condFramePath.c_str(), img.width, img.height, clipW, clipH);
         rt::imageUtils::ImageData resized(
             rt::Tensor({1, clipH, clipW, 3}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8, "cosmos3::resized"));
         rt::imageUtils::ImageData const& frame
@@ -458,8 +545,10 @@ int main(int argc, char** argv)
         }
         rt::Tensor pixelTensor({batch, 3, pixelFrames, clipH, clipW}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT,
             "cosmos3::pixelValues");
-        CUDA_CHECK(cudaMemcpyAsync(
-            pixelTensor.rawPointer(), clip.data(), clip.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+        // One-time host->device setup copies below source from pageable std::vectors, so they use the
+        // synchronous cudaMemcpy: cudaMemcpyAsync on pageable memory silently falls back to a sync copy.
+        CUDA_CHECK(
+            cudaMemcpy(pixelTensor.rawPointer(), clip.data(), clip.size() * sizeof(float), cudaMemcpyHostToDevice));
 
         // ------------------------------------------------------------------ //
         // (b) Prompt(s) -> token ids (co-located tokenizer).                  //
@@ -528,12 +617,57 @@ int main(int argc, char** argv)
             idsHost.insert(idsHost.end(), promptIds.begin(), promptIds.end());
         }
         rt::Tensor idsTensor({batch, seqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "cosmos3::inputIds");
-        CUDA_CHECK(cudaMemcpyAsync(
-            idsTensor.rawPointer(), idsHost.data(), idsHost.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpy(
+            idsTensor.rawPointer(), idsHost.data(), idsHost.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
         rt::Tensor inputsEmbeds(
             {batch, seqLen, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "cosmos3::inputsEmbeds");
         kernel::embeddingLookup(idsTensor, table, std::nullopt, inputsEmbeds, stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        // ------------------------------------------------------------------ //
+        // (c') Unconditional (empty-prompt) embeddings for guidance-interval  //
+        //      CFG. The reference drops the text caption for the uncond pass; //
+        //      we tokenize the same chat-template scaffold with an empty      //
+        //      instruction (broadcast across the batch).                      //
+        // ------------------------------------------------------------------ //
+        bool const useCfg = args.guidance != 1.0F;
+        rt::Tensor uncondEmbeds;
+        if (useCfg)
+        {
+            rt::LLMGenerationRequest::Request ureq;
+            rt::Message umsg;
+            umsg.role = "user";
+            umsg.contents.push_back({"text", std::string{}});
+            ureq.messages.push_back(std::move(umsg));
+            rt::LLMGenerationRequest::FormattedRequest uformatted;
+            ELLM_CHECK(tok.applyChatTemplate(ureq, uformatted, /*applyChatTemplate=*/true,
+                           /*addGenerationPrompt=*/true, /*enableThinking=*/true),
+                "Failed to apply the chat template to the unconditional (empty) prompt");
+            std::vector<tokenizer::Rank> uids
+                = tok.encode(uformatted.formattedCompleteRequest, /*addBos=*/false, /*addEos=*/false);
+            uids.push_back(tok.getEosId());
+            std::vector<tokenizer::Rank> const usog
+                = tok.encode("<|vision_start|>", /*addBos=*/false, /*addEos=*/false);
+            ELLM_CHECK(usog.size() == 1, "Tokenizer must map <|vision_start|> to a single id");
+            uids.push_back(usog.front());
+            int32_t const uSeqLen = static_cast<int32_t>(uids.size());
+            std::vector<int32_t> uIdsHost;
+            uIdsHost.reserve(static_cast<size_t>(batch) * uSeqLen);
+            for (int32_t b = 0; b < batch; ++b)
+            {
+                uIdsHost.insert(uIdsHost.end(), uids.begin(), uids.end());
+            }
+            rt::Tensor uIdsTensor(
+                {batch, uSeqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "cosmos3::uncondIds");
+            CUDA_CHECK(cudaMemcpy(
+                uIdsTensor.rawPointer(), uIdsHost.data(), uIdsHost.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+            uncondEmbeds = rt::Tensor(
+                {batch, uSeqLen, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "cosmos3::uncondEmbeds");
+            kernel::embeddingLookup(uIdsTensor, table, std::nullopt, uncondEmbeds, stream);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            LOG_INFO(
+                "Guidance-interval CFG on (guidance=%.2f): unconditional prompt = %d tokens.", args.guidance, uSeqLen);
+        }
 
         // ------------------------------------------------------------------ //
         // (d) VAE encode -> UND prefill -> GEN diffusion loop -> action chunk //
@@ -542,22 +676,67 @@ int main(int argc, char** argv)
         runtime.setNoiseSeed(args.seed);
         runtime.setNumInferenceSteps(args.steps);
         runtime.setUseCudaGraph(args.cudagraph);
+        runtime.setGuidance(args.guidance, /*intervalLo=*/960.0F, /*intervalHi=*/1001.0F);
+        ELLM_CHECK(args.videoSubsampleFactor >= 1,
+            "--video-subsample-factor must be >= 1 (1 = regular; higher = more subsample, clamped to the engine "
+            "range)");
+        runtime.setVideoSubsampleFactor(args.videoSubsampleFactor);
+        ELLM_CHECK(args.actionChunk >= 0, "--action-chunk-size must be >= 0 (0 = engine canonical/max chunk)");
+        runtime.setActionChunkSize(args.actionChunk);
+        if (args.videoSubsampleFactor != 1)
+        {
+            LOG_WARNING(
+                "Optimized video-subsample path (factor %d): speed-representative only; correct actions "
+                "require a subsample-trained checkpoint.",
+                args.videoSubsampleFactor);
+        }
+        rt::Tensor const* const uncondPtr = useCfg ? &uncondEmbeds : nullptr;
+
+        // --alternate-vsf (test/benchmark only) flips the video-subsample factor 1<->videoSubsampleFactor
+        // every round. With --cudagraph this exercises the per-extent graph cache: each extent captures once
+        // (logged by the runner) and every later round of that extent replays without re-capturing, so
+        // switching must not spike the latency.
+        ELLM_CHECK(!args.alternateVsf || args.videoSubsampleFactor > 1,
+            "--alternate-vsf requires --video-subsample-factor > 1 to alternate against");
+        int32_t round = 0;
+        auto vsfForRound = [&](int32_t k) -> int32_t { return (k % 2 == 0) ? 1 : args.videoSubsampleFactor; };
 
         std::vector<float> action;
         for (int32_t w = 0; w < args.warmup; ++w)
         {
-            action = runtime.generatePolicy(pixelTensor, inputsEmbeds, stream);
+            if (args.alternateVsf)
+            {
+                runtime.setVideoSubsampleFactor(vsfForRound(round++));
+            }
+            action = runtime.generatePolicy(pixelTensor, inputsEmbeds, uncondPtr, stream);
         }
         std::vector<double> walls;
+        std::vector<double> wallsVsfLow;  //!< --alternate-vsf rounds at vsf == 1.
+        std::vector<double> wallsVsfHigh; //!< --alternate-vsf rounds at vsf == videoSubsampleFactor.
         walls.reserve(args.iters);
         for (int32_t it = 0; it < args.iters; ++it)
         {
+            int32_t const vsf = args.alternateVsf ? vsfForRound(round++) : args.videoSubsampleFactor;
+            if (args.alternateVsf)
+            {
+                runtime.setVideoSubsampleFactor(vsf);
+            }
             auto const t0 = std::chrono::high_resolution_clock::now();
-            action = runtime.generatePolicy(pixelTensor, inputsEmbeds, stream);
+            action = runtime.generatePolicy(pixelTensor, inputsEmbeds, uncondPtr, stream);
             cudaStreamSynchronize(stream);
             auto const t1 = std::chrono::high_resolution_clock::now();
-            walls.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+            double const ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            walls.push_back(ms);
+            if (args.alternateVsf)
+            {
+                (vsf == 1 ? wallsVsfLow : wallsVsfHigh).push_back(ms);
+                LOG_INFO("alternate round %d: vsf %d -> %.2f ms", it, vsf, ms);
+            }
         }
+        auto median = [](std::vector<double> v) -> double {
+            std::sort(v.begin(), v.end());
+            return v.empty() ? 0.0 : v[v.size() / 2];
+        };
         if (!walls.empty())
         {
             std::vector<double> sorted = walls;
@@ -567,6 +746,12 @@ int main(int argc, char** argv)
                 "warmup %d",
                 batch, sorted[sorted.size() / 2], args.iters, sorted.front(), sorted.back(), args.warmup);
         }
+        if (args.alternateVsf)
+        {
+            LOG_INFO("Alternating vsf medians: vsf=1 %.2f ms (%zu rounds), vsf=%d %.2f ms (%zu rounds)",
+                median(wallsVsfLow), wallsVsfLow.size(), args.videoSubsampleFactor, median(wallsVsfHigh),
+                wallsVsfHigh.size());
+        }
 
         ELLM_CHECK(!action.empty(), "Policy generation returned no action.");
 
@@ -574,7 +759,9 @@ int main(int argc, char** argv)
         // (e) Emit the action chunk (B, chunk, dim).                          //
         // ------------------------------------------------------------------ //
         int32_t const rawActionDim = runtime.policyConfig().rawActionDim;
-        int32_t const chunk = runtime.policyConfig().actionChunkSize;
+        // The returned action chunk follows the (possibly clamped) per-request action length, so derive
+        // it from the flattened action size rather than the engine's canonical chunk.
+        int32_t const chunk = static_cast<int32_t>(action.size() / (static_cast<size_t>(batch) * rawActionDim));
         bool finite = true;
         float amin = 0.0f, amax = 0.0f;
         for (size_t i = 0; i < action.size(); ++i)
@@ -610,7 +797,7 @@ int main(int argc, char** argv)
             else
             {
                 writeActionJson(args.output, action, batch, chunk, rawActionDim, args.domain, args.steps, args.prompts,
-                    finite, seqLen);
+                    finite, seqLen, args.videoSubsampleFactor);
             }
         }
     }

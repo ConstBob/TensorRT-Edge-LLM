@@ -360,6 +360,13 @@ def export_visual_onnx(
             os.path.dirname(os.path.abspath(output_path)))
         logger.info("Saved Phi-4mm GN projection sidecar: %s", sidecar_path)
 
+    # Nemotron-Omni sidecar tensors (runtime-executed patch embedder GEMM
+    # weights + raw pos_embed; see modeling_nemotron_omni_visual docstring).
+    if family == "nemotron_omni":
+        sidecar_path = visual_model.save_onnx_sidecar(
+            os.path.dirname(os.path.abspath(output_path)))
+        logger.info("Saved Nemotron-Omni embedder sidecar: %s", sidecar_path)
+
 
 # ---------------------------------------------------------------------------
 # Audio encoder export

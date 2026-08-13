@@ -31,9 +31,10 @@ import torch
 
 from ..._version import __version__
 from ...onnx.export_encoder import _run_dynamo_export
-from .modeling_gen import (ACTION_CHUNK_SIZE, DEFAULT_FPS, DEFAULT_NUM_FRAMES,
-                           build_cosmos3_gen, gen_config_from_transformer,
-                           make_gen_config)
+from .modeling_gen import (ACTION_CHUNK_SIZE, DEFAULT_FPS,
+                           DEFAULT_MAX_VIDEO_SUBSAMPLE_FACTOR,
+                           DEFAULT_NUM_FRAMES, build_cosmos3_gen,
+                           gen_config_from_transformer, make_gen_config)
 from .modeling_und_prefill import (build_cosmos3_und_prefill,
                                    make_und_prefill_config)
 from .modeling_vae_encoder import (VAE_HEIGHT, VAE_WIDTH,
@@ -102,13 +103,17 @@ def _write_tokenizer_artifacts(checkpoint: str, output_dir: str) -> None:
     logger.info("Tokenizer artifacts complete: %s", tokenizer_dst)
 
 
-def export_gen(checkpoint: str,
-               out_dir: str,
-               max_und_len: int,
-               dtype: torch.dtype,
-               action_chunk_size: "int | None" = None,
-               num_frames: "int | None" = None,
-               fps: float = DEFAULT_FPS) -> None:
+def export_gen(
+        checkpoint: str,
+        out_dir: str,
+        max_und_len: int,
+        dtype: torch.dtype,
+        action_chunk_size: "int | None" = None,
+        num_frames: "int | None" = None,
+        fps: float = DEFAULT_FPS,
+        max_video_subsample_factor: int = DEFAULT_MAX_VIDEO_SUBSAMPLE_FACTOR,
+        min_action_chunk: "int | None" = None,
+        max_action_chunk: "int | None" = None) -> None:
     """Export the GEN diffusion expert."""
     tcfg = load_config_json(checkpoint, "transformer")
     _, gen_weights = split_transformer_weights(_transformer_dir(checkpoint))
@@ -121,8 +126,15 @@ def export_gen(checkpoint: str,
     os.makedirs(out_dir, exist_ok=True)
     _run_dynamo_export(model, args, os.path.join(out_dir, "model.onnx"),
                        input_names, output_names, dynamic_shapes)
-    _write_component_config(out_dir,
-                            make_gen_config(cfg, tcfg, max_und_len, fps=fps))
+    _write_component_config(
+        out_dir,
+        make_gen_config(cfg,
+                        tcfg,
+                        max_und_len,
+                        fps=fps,
+                        max_video_subsample_factor=max_video_subsample_factor,
+                        min_action_chunk=min_action_chunk,
+                        max_action_chunk=max_action_chunk))
     logger.info("GEN export complete: %s", out_dir)
 
 
@@ -168,7 +180,11 @@ def export_cosmos3_components(checkpoint: str,
                               dtype: torch.dtype = torch.float16,
                               num_frames: int = DEFAULT_NUM_FRAMES,
                               action_chunk_size: int = ACTION_CHUNK_SIZE,
-                              fps: float = DEFAULT_FPS) -> None:
+                              fps: float = DEFAULT_FPS,
+                              max_video_subsample_factor: int = (
+                                  DEFAULT_MAX_VIDEO_SUBSAMPLE_FACTOR),
+                              min_action_chunk: "int | None" = None,
+                              max_action_chunk: "int | None" = None) -> None:
     """Export Cosmos3 policy components from a HF/diffusers checkpoint.
 
     The defaults are the canonical policy request: one input image,
@@ -192,7 +208,10 @@ def export_cosmos3_components(checkpoint: str,
                        dtype,
                        action_chunk_size=action_chunk_size,
                        num_frames=num_frames,
-                       fps=fps)
+                       fps=fps,
+                       max_video_subsample_factor=max_video_subsample_factor,
+                       min_action_chunk=min_action_chunk,
+                       max_action_chunk=max_action_chunk)
         elif component == "und_prefill":
             export_und_prefill(checkpoint, out_dir, dtype, max_und_len)
         elif component == "vae_encoder":

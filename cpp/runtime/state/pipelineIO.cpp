@@ -227,8 +227,23 @@ static void buildTensorMapImpl(TensorMap& map, PipelineIO& io, SharedResources& 
             // so this branch wouldn't fire for it regardless.
             if (mambaMgr.hasIntermediateRecurrentStates())
             {
-                map.set(binding_names::formatIntermediateRecurrentStateName(localMambaIdx),
-                    mambaMgr.getIntermediateRecurrentState(localMambaIdx));
+                if (mambaMgr.recurrentUsesReplay())
+                {
+                    // Mamba: bind the three replay-stash outputs (dA/u/B). The accepted recurrent
+                    // state is reconstructed from these after verification.
+                    map.set(binding_names::formatReplayDaStateName(localMambaIdx),
+                        mambaMgr.getReplayDaState(localMambaIdx));
+                    map.set(
+                        binding_names::formatReplayUStateName(localMambaIdx), mambaMgr.getReplayUState(localMambaIdx));
+                    map.set(
+                        binding_names::formatReplayBStateName(localMambaIdx), mambaMgr.getReplayBState(localMambaIdx));
+                }
+                else
+                {
+                    // GDN/DDTree: bind the per-token full-state snapshot output.
+                    map.set(binding_names::formatIntermediateRecurrentStateName(localMambaIdx),
+                        mambaMgr.getIntermediateRecurrentState(localMambaIdx));
+                }
             }
             if (mambaMgr.hasIntermediateConvStates())
             {

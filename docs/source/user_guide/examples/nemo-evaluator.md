@@ -8,7 +8,7 @@ server. Export and build the engine before starting this workflow.
 From the TensorRT Edge-LLM repository:
 
 ```bash
-pip install -r requirements-server.txt
+python -m pip install -e ".[server]"
 pip install -r requirements-nemo-evaluator.txt
 ```
 

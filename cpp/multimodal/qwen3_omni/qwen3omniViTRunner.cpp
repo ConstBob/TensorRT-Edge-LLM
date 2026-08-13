@@ -68,12 +68,17 @@ bool Qwen3OmniViTRunner::validateExtraConfig(nlohmann::json const& jsonConfig)
     return true;
 }
 
+bool Qwen3OmniViTRunner::usesFractionalMRopePositions() const
+{
+    return true;
+}
+
 void Qwen3OmniViTRunner::getMRopePositionIds(std::vector<std::vector<int32_t>> const& batchInputIds,
     std::vector<VisionSpan> const& spans, std::vector<int64_t> const& spansPerRequest) noexcept
 {
     // Mirrors HF Qwen3-Omni get_rope_index: per-frame temporal step = secondPerGrid * position_id_per_seconds;
     // span advance = st_idx = max(all span positions)+1.
-    int64_t* mropePositionIdsPtr = mMropePositionIdsHost.dataPointer<int64_t>();
+    float* mropePositionIdsPtr = mMropePositionIdsHost.dataPointer<float>();
     int64_t const maxPositionEmbeddings = mMropePositionIdsHost.getShape()[2];
     int64_t totalImageIdx = 0;
     int64_t batchOffset = 0;
@@ -87,7 +92,7 @@ void Qwen3OmniViTRunner::getMRopePositionIds(std::vector<std::vector<int32_t>> c
         auto start = inputIds.begin();
         auto end = inputIds.end();
         auto it = inputIds.begin();
-        int64_t startIdx = 0;
+        float startIdx = 0.0f;
         int64_t remainingStartPos = 0;
 
         auto searchFrom = start;
@@ -114,10 +119,9 @@ void Qwen3OmniViTRunner::getMRopePositionIds(std::vector<std::vector<int32_t>> c
             int64_t const llmGridT = block.llmGridT;
             int64_t const llmGridH = block.llmGridH;
             int64_t const llmGridW = block.llmGridW;
-            // Float temporal step. Positions are stored as int64, so each t*timeInterval is
-            // truncated per position; HF keeps the float value all the way into RoPE, so exact
-            // parity needs float position support in the cos/sin generation.
-            double const timeInterval = block.secondPerGrid * mPositionIdPerSecond;
+            // float32 order matches HF's (t*spg)*pips; pre-multiplying spg*pips drifts ~1 ULP at non-integer fps.
+            float const spg = block.secondPerGrid;
+            float const pips = static_cast<float>(mPositionIdPerSecond);
             ++totalImageIdx;
 
             for (int64_t t = 0; t < llmGridT; ++t)
@@ -128,7 +132,7 @@ void Qwen3OmniViTRunner::getMRopePositionIds(std::vector<std::vector<int32_t>> c
                     {
                         int64_t idx = remainingStartPos + textLen + t * llmGridH * llmGridW + h * llmGridW + w;
                         mropePositionIdsPtr[batchOffset + 0 * maxPositionEmbeddings + idx]
-                            = static_cast<int64_t>(t * timeInterval) + textLen + startIdx;
+                            = static_cast<float>(t) * spg * pips + textLen + startIdx;
                         mropePositionIdsPtr[batchOffset + 1 * maxPositionEmbeddings + idx] = h + textLen + startIdx;
                         mropePositionIdsPtr[batchOffset + 2 * maxPositionEmbeddings + idx] = w + textLen + startIdx;
                     }
@@ -136,17 +140,20 @@ void Qwen3OmniViTRunner::getMRopePositionIds(std::vector<std::vector<int32_t>> c
             }
 
             start = it + 1 + llmGridT * llmGridH * llmGridW;
-            // Advance counts the temporal extent too (unlike the base/Qwen2.5 spatial-only
-            // advance), truncated consistently with the per-position ids above.
-            int64_t const lastT = static_cast<int64_t>((llmGridT - 1) * timeInterval);
-            int64_t const advance = std::max(std::max(llmGridH, llmGridW), lastT + 1);
+            // Advance = max span position + 1 (HF st_idx), including the float temporal extent;
+            // kept fractional so post-block text keeps HF-matching positions.
+            float const lastT = static_cast<float>(llmGridT - 1) * spg * pips;
+            float const advance = std::max({static_cast<float>(llmGridH), static_cast<float>(llmGridW), lastT + 1.0f});
             startIdx += advance + textLen;
             remainingStartPos = start - inputIds.begin();
             searchFrom = start;
         }
 
-        int64_t const maxMropePositionId = startIdx + inputIds.size() - remainingStartPos - 1;
-        mMropeRopeDeltasPerBatch.push_back(maxMropePositionId + 1 - inputIds.size());
+        // Rope delta stays int64 (base contract; only Alpamayo's Qwen3-VL integer path consumes it,
+        // Omni decode reads the prefilled cos/sin cache).
+        int64_t const maxMropePositionId
+            = static_cast<int64_t>(startIdx) + static_cast<int64_t>(inputIds.size()) - remainingStartPos - 1;
+        mMropeRopeDeltasPerBatch.push_back(maxMropePositionId + 1 - static_cast<int64_t>(inputIds.size()));
 
         int64_t textLen = maxPositionEmbeddings - remainingStartPos;
         for (int64_t i = 0; i < 3; ++i)

@@ -203,7 +203,7 @@ build/examples/llm/llm_bench \
 One invocation builds both `spec_base.engine` and `spec_draft.engine`, plus the
 target checkpoint's non-LLM components.
 
-EAGLE3, DFlash, dSpark, and Gemma4 MTP use paired checkpoints:
+EAGLE3, DFlash, DSpark, and Gemma4 MTP use paired checkpoints:
 
 ```bash
 .venv/bin/tensorrt-edgellm-build \
@@ -256,7 +256,7 @@ build/examples/llm/llm_inference \
   --specDecode
 ```
 
-`--draftCheckpointDir` applies to EAGLE3, DFlash, dSpark, and Gemma4 MTP. It is
+`--draftCheckpointDir` applies to EAGLE3, DFlash, DSpark, and Gemma4 MTP. It is
 rejected for native Qwen MTP because its draft layers are in
 `--checkpointDir`.
 
@@ -282,7 +282,7 @@ The explicit registry includes Llama, Mistral, Qwen2, Qwen3, Qwen3-MoE,
 Qwen2/2.5/3-VL, Qwen3.5 dense and MoE, Qwen3-ASR, Qwen3-Omni,
 Qwen3-Omni-Next, Qwen3-TTS, InternVL3/3.5, Phi-4 Multimodal,
 Nemotron-H/Omni, Gemma4 and Gemma4 Unified, DiffusionGemma, Cosmos3, and
-Alpamayo. EAGLE3, MTP, DFlash, dSpark, and Gemma4 assistant drafts use
+Alpamayo. EAGLE3, MTP, DFlash, DSpark, and Gemma4 assistant drafts use
 model-owned speculative definitions. Unsupported `model_type` values fail
 before TensorRT network creation and list the registered choices.
 
@@ -299,8 +299,7 @@ CI coverage. An implemented row can still have model-specific restrictions.
 | FP8 KV cache | Implemented from checkpoint metadata | Not yet |
 | FP8 embedding and reduced vocabulary | Implemented | Not yet |
 | Runtime LoRA inputs | Implemented | Not yet |
-| EAGLE3 | Implemented | Qwen3 on A30 |
-| EAGLE3, Qwen3.5 MTP, DFlash, dSpark, and Gemma4 MTP | Implemented | EAGLE3 on A30 |
+| EAGLE3, Qwen3.5 MTP, DFlash, DSpark, and Gemma4 MTP | Implemented | EAGLE3 with Qwen3 on A30 |
 | DiffusionGemma block diffusion | Implemented | Not yet |
 | Visual, audio, TTS, omni, action, and Cosmos3 policy components | Implemented for registered families | Not yet |
 | Tensor parallel graph generation | Implemented per rank | Not yet |

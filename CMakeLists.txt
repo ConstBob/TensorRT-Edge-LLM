@@ -17,7 +17,7 @@ cmake_minimum_required(VERSION 3.20 FATAL_ERROR)
 
 project(
   tensorrt_edgellm_sdk
-  VERSION 0.9.1
+  VERSION 0.10.0
   LANGUAGES C CXX CUDA)
 
 # Specify the C++ standard and flags

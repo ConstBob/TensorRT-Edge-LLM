@@ -37,6 +37,8 @@ struct ContextCacheMetrics
 {
     uint64_t admittedSequences{};
     uint64_t hitSequences{};
+    //! Sequences whose block hash incorporated per-position media content hashes.
+    uint64_t mediaAwareSequences{};
     //! Sequences whose final executable lookup policy was bypass, including forced-cold retries.
     uint64_t lookupBypassSequences{};
     uint64_t forcedColdSequences{};

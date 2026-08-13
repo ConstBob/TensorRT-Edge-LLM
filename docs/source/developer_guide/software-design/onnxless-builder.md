@@ -329,8 +329,8 @@ Then:
 4. Verify one-command `--components all` output paths and sidecars.
 5. Add a focused end-to-end test that compiles the engine, executes the
    corresponding C++ runtime, and checks output accuracy.
-6. Update the support and known-gap table in the
-   [user guide](../../user_guide/getting_started/direct-engine-builder.md).
+6. Update the [supported model matrix](../../user_guide/getting_started/supported-models.md)
+   only after the model's complete runtime contract is validated.
 
 ## Validation
 
@@ -344,7 +344,5 @@ individual helper classes:
 5. Validate modality-specific output contracts.
 6. Run the existing dataset accuracy check.
 
-Automatic coverage currently includes FP16 and EAGLE3 on A30, plus FP8 and
-NVFP4 direct builds on RTX 5090. The complete implementation/CI matrix and
-known ToT gaps are maintained in the user guide so missing coverage is visible
-rather than implied.
+Keep frontend tests focused on complete engine-build and runtime paths. Unit
+tests for isolated helpers do not substitute for a model-level output check.

@@ -24,6 +24,8 @@
 #include "common/version.h"
 #include "multimodal/common/imageUtils.h"
 
+#include <cmath>
+
 using namespace trt_edgellm;
 
 namespace trt_edgellm
@@ -107,21 +109,26 @@ bool VisualBuilder::build()
         LOG_INFO("Created directory %s for saving Visual engine.", mEngineDir.string().c_str());
     }
 
-    // Phi-4MM specific: Copy GN projection weights
-    if (mModelType == multimodal::ModelType::PHI4MM)
-    {
-        constexpr char const* kPhi4mmGnProjFile = "phi4mm_gn_proj.safetensors";
-        std::string src = (mOnnxDir / kPhi4mmGnProjFile).string();
-        std::string dst = (mEngineDir / kPhi4mmGnProjFile).string();
-        if (file_io::copyFile(src, dst))
+    // Copy the model's required weight file (GN projection / patch embedder) next to the engine so
+    // the runtime finds it under the engine dir in the standard onnx_dir -> engine_dir flow.
+    auto copyRequiredWeightFile = [this](char const* filename) -> bool {
+        std::string const dst = (mEngineDir / filename).string();
+        if (!file_io::copyFile((mOnnxDir / filename).string(), dst))
         {
-            LOG_INFO("Copied Phi4MM GN projection weights to %s", dst.c_str());
-        }
-        else
-        {
-            LOG_ERROR("Failed to copy Phi4MM GN projection weights to %s", dst.c_str());
+            LOG_ERROR("Failed to copy required weight file %s to %s", filename, dst.c_str());
             return false;
         }
+        LOG_INFO("Copied required weight file to %s", dst.c_str());
+        return true;
+    };
+    if (mModelType == multimodal::ModelType::PHI4MM && !copyRequiredWeightFile("phi4mm_gn_proj.safetensors"))
+    {
+        return false;
+    }
+    if (mModelType == multimodal::ModelType::NEMOTRON_OMNI_VISION_ENCODER
+        && !copyRequiredWeightFile("nemotron_omni_embedder.safetensors"))
+    {
+        return false;
     }
 
     // Build and save engine
@@ -471,10 +478,28 @@ bool VisualBuilder::setupNemotronOmniViTProfile(nvinfer1::IOptimizationProfile& 
     int64_t minNumBlocks = std::max<int64_t>(1, mBuilderConfig.minImageTokens / kTokensPerBlock);
     int64_t optNumBlocks = (minNumBlocks + maxNumBlocks) / 2;
 
+    // Engine input is patch embeddings [blocks, patches, vitHidden] (the embedder GEMM runs in the
+    // runtime), not pixels; patch count is dynamic (video uses aspect-preserving grids).
+    if (!mModelConfig.contains("vit_hidden_size"))
+    {
+        LOG_ERROR(
+            "Nemotron-Omni: vit_hidden_size not found in config.json — re-export the visual model "
+            "(the ONNX boundary moved: the engine now consumes patch embeddings, not pixels)");
+        return false;
+    }
+    int64_t const vitHidden = mModelConfig["vit_hidden_size"].get<int64_t>();
+    int64_t const scale = static_cast<int64_t>(std::llround(1.0 / downsampleRatio));
+    int64_t const maxPatches = (mImageSizeH / patchSize) * (mImageSizeW / patchSize);
+    int64_t const minPatches = scale * scale;
+
     result &= setOptimizationProfile(&profile, binding_names::kVisualInput,
-        createDims({minNumBlocks, mNumChannels, mImageSizeH, mImageSizeW}),
-        createDims({optNumBlocks, mNumChannels, mImageSizeH, mImageSizeW}),
-        createDims({maxNumBlocks, mNumChannels, mImageSizeH, mImageSizeW}));
+        createDims({minNumBlocks, minPatches, vitHidden}), createDims({optNumBlocks, maxPatches, vitHidden}),
+        createDims({maxNumBlocks, maxPatches, vitHidden}));
+
+    result &= setOptimizationProfile(&profile, binding_names::kVisualShuffleIndices,
+        createDims({minPatches / (scale * scale), scale * scale}),
+        createDims({maxPatches / (scale * scale), scale * scale}),
+        createDims({maxPatches / (scale * scale), scale * scale}));
 
     if (!result)
     {

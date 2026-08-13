@@ -19,14 +19,18 @@
 
 #include "common/checkMacros.h"
 #include "common/logger.h"
+#include "runtime/audioUtils.h"
 #include "runtime/decoding/decodingStrategy.h"
+#include "runtime/imageUtils.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/state/contextCache/blockHash.h"
 #include "runtime/state/decodingInferenceContext.h"
 #include "runtime/streaming.h"
 
+#include <algorithm>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace trt_edgellm
@@ -43,8 +47,116 @@ ContextCacheLookupPolicy contextCacheLookupPolicy(LLMGenerationRequest const& re
     return requiresBypass ? ContextCacheLookupPolicy::kBypass : ContextCacheLookupPolicy::kUseCache;
 }
 
-ContextCacheSequenceAdmission makeContextCacheSequenceAdmission(
-    std::vector<int32_t> const& tokenIds, std::string const& loraWeightsName)
+bool isMediaToken(int32_t tokenId, std::vector<int32_t> const& mediaTokenIds)
+{
+    return std::find(mediaTokenIds.begin(), mediaTokenIds.end(), tokenId) != mediaTokenIds.end();
+}
+
+std::vector<Hash128> buildPerPositionMediaHash(std::vector<int32_t> const& tokenIds,
+    std::vector<int32_t> const& mediaTokenIds, std::vector<imageUtils::ImageData> const& imageBuffers,
+    std::vector<audioUtils::AudioData> const& audioBuffers)
+{
+    if (mediaTokenIds.empty())
+    {
+        return {};
+    }
+
+    std::vector<Hash128> imageHashes;
+    imageHashes.reserve(imageBuffers.size());
+    for (auto const& image : imageBuffers)
+    {
+        size_t const totalBytes = static_cast<size_t>(image.bytesPerFrame()) * static_cast<size_t>(image.frames);
+        std::string_view const bytes(reinterpret_cast<char const*>(image.data()), totalBytes);
+        imageHashes.push_back(hashOpaqueIdentity(bytes));
+    }
+
+    std::vector<Hash128> audioHashes;
+    audioHashes.reserve(audioBuffers.size());
+    for (auto const& audio : audioBuffers)
+    {
+        if (audio.pcm && !audio.pcm->samples.empty())
+        {
+            size_t const totalBytes = audio.pcm->samples.size() * sizeof(float);
+            std::string_view const bytes(reinterpret_cast<char const*>(audio.pcm->samples.data()), totalBytes);
+            audioHashes.push_back(hashOpaqueIdentity(bytes));
+        }
+        else
+        {
+            audioHashes.push_back(hashOpaqueIdentity(audio.melSpectrogramPath));
+        }
+    }
+
+    int32_t const imageTokenId = (!mediaTokenIds.empty()) ? mediaTokenIds[0] : -1;
+    int32_t const audioTokenId = (mediaTokenIds.size() > 1) ? mediaTokenIds[1] : -1;
+
+    std::vector<Hash128> perPositionHash(tokenIds.size(), Hash128{});
+    size_t imageIdx = 0;
+    size_t audioIdx = 0;
+    bool previousWasMedia = false;
+    int32_t previousMediaTokenId = -1;
+
+    for (size_t i = 0; i < tokenIds.size(); ++i)
+    {
+        int32_t const token = tokenIds[i];
+        bool const currentIsMedia = isMediaToken(token, mediaTokenIds);
+
+        if (currentIsMedia)
+        {
+            // Transition between different media types (e.g. image run → audio run) without an
+            // intervening non-media token: close out the previous modality's run.
+            if (previousWasMedia && token != previousMediaTokenId)
+            {
+                if (previousMediaTokenId == imageTokenId)
+                {
+                    ++imageIdx;
+                }
+                else if (previousMediaTokenId == audioTokenId)
+                {
+                    ++audioIdx;
+                }
+            }
+
+            if (token == imageTokenId && imageIdx < imageHashes.size())
+            {
+                perPositionHash[i] = imageHashes[imageIdx];
+            }
+            else if (token == audioTokenId && audioIdx < audioHashes.size())
+            {
+                perPositionHash[i] = audioHashes[audioIdx];
+            }
+            previousWasMedia = true;
+            previousMediaTokenId = token;
+        }
+        else
+        {
+            if (previousWasMedia)
+            {
+                if (previousMediaTokenId == imageTokenId)
+                {
+                    ++imageIdx;
+                }
+                else if (previousMediaTokenId == audioTokenId)
+                {
+                    ++audioIdx;
+                }
+            }
+            previousWasMedia = false;
+            previousMediaTokenId = -1;
+        }
+    }
+
+    bool const hasAnyMedia
+        = std::any_of(perPositionHash.begin(), perPositionHash.end(), [](Hash128 const& h) { return h != Hash128{}; });
+    if (!hasAnyMedia)
+    {
+        return {};
+    }
+    return perPositionHash;
+}
+
+ContextCacheSequenceAdmission makeContextCacheSequenceAdmission(std::vector<int32_t> const& tokenIds,
+    std::string const& loraWeightsName, std::vector<int32_t> const& mediaTokenIds,
+    std::vector<imageUtils::ImageData> const& imageBuffers, std::vector<audioUtils::AudioData> const& audioBuffers)
 {
     ContextCacheSequenceAdmission admission;
     admission.tokenIds = tokenIds;
@@ -54,6 +166,7 @@ ContextCacheSequenceAdmission makeContextCacheSequenceAdmission(
         AdapterKey const adapter{hashOpaqueIdentity(loraWeightsName), 0};
         admission.keyExtras.adapter = adapter;
     }
+    admission.perPositionMediaHash = buildPerPositionMediaHash(tokenIds, mediaTokenIds, imageBuffers, audioBuffers);
     return admission;
 }
 
@@ -71,11 +184,15 @@ bool contextCacheOperationSucceeded(ContextCacheCoordinatorStatus status, char c
 } // namespace
 
 std::optional<ContextCacheRequest> ContextCacheRequest::begin(ContextCacheCoordinator& coordinator,
-    LLMGenerationRequest const& request, DecodingInferenceContext const& context, DecodingStrategyKind strategyKind)
+    LLMGenerationRequest const& request, DecodingInferenceContext const& context, DecodingStrategyKind strategyKind,
+    std::vector<int32_t> const& mediaTokenIds)
 {
     ELLM_CHECK(strategyKind == DecodingStrategyKind::kVanilla || strategyKind == DecodingStrategyKind::kEAGLE
             || strategyKind == DecodingStrategyKind::kMTP,
         "Context cache supports only vanilla, EAGLE, or MTP request execution.");
+
+    static std::vector<imageUtils::ImageData> const kEmptyImageBuffers;
+    static std::vector<audioUtils::AudioData> const kEmptyAudioBuffers;
 
     ContextCacheBatchAdmission admission;
     switch (strategyKind)
@@ -88,9 +205,14 @@ std::optional<ContextCacheRequest> ContextCacheRequest::begin(ContextCacheCoordi
     admission.commitPolicy = request.contextCacheCommitPolicy;
     admission.replayTailLength = request.contextCacheReplayTailLength;
     admission.sequences.reserve(context.rawBatchedInputIds.size());
-    for (std::vector<int32_t> const& tokenIds : context.rawBatchedInputIds)
+    for (size_t seqIdx = 0; seqIdx < context.rawBatchedInputIds.size(); ++seqIdx)
     {
-        admission.sequences.push_back(makeContextCacheSequenceAdmission(tokenIds, context.loraWeightsName));
+        std::vector<imageUtils::ImageData> const& images
+            = (seqIdx < request.requests.size()) ? request.requests[seqIdx].imageBuffers : kEmptyImageBuffers;
+        std::vector<audioUtils::AudioData> const& audio
+            = (seqIdx < request.requests.size()) ? request.requests[seqIdx].audioBuffers : kEmptyAudioBuffers;
+        admission.sequences.push_back(makeContextCacheSequenceAdmission(
+            context.rawBatchedInputIds[seqIdx], context.loraWeightsName, mediaTokenIds, images, audio));
     }
 
     ContextCacheCoordinator::BeginRequestResult admitted = coordinator.beginRequest(admission, context.stream);
