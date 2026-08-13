@@ -50,6 +50,7 @@ wheel_python_base:
       artifacts: true
   before_script:
     - apt-get update && apt-get install -y --no-install-recommends git
+    - python -m pip install "tomli==2.3.0; python_version < '3.11'"
   script:
     - python packaging/wheel_cli.py ci-build-base
   artifacts:
