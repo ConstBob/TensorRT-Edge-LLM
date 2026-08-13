@@ -16,6 +16,7 @@
  */
 
 #include "runtime/decoding/mtpDecoder.h"
+#include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
 #include "common/logger.h"
@@ -40,6 +41,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <filesystem>
 #include <functional>
 #include <optional>
 #include <string>
@@ -154,9 +156,57 @@ MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, SpecDecodeDraftingConfig
         CUDA_CHECK(cudaMemsetAsync(mDraftRootTokenId.rawPointer(), 0, mDraftRootTokenId.getMemoryCapacity(), stream));
     }
 
-    // MTP: identity vocab mapping (zero-fill)
-    CUDA_CHECK(
-        cudaMemsetAsync(mDraftVocabMappingTable.rawPointer(), 0, mDraftVocabMappingTable.getMemoryCapacity(), stream));
+    if (mRuntime.deployment.draft->reducedVocabSize > 0)
+    {
+        // Chain-mode reduced draft vocabulary. The proposal-translation
+        // kernels (initializeDraftTreeTables / computeCuScoresAndTranslateToken)
+        // already consume this table with OFFSET semantics
+        // (baseTokenId = draftIdx + T[draftIdx]); the export sidecar
+        // draft_vocab_map.safetensors is a DIRECT map (full = T[reduced]).
+        // Convert once at load, like EagleDecoder normalizes d2t.
+        ELLM_CHECK(!mUseTree,
+            "MTP tree drafting does not support a reduced draft vocabulary: "
+            "ddtreeBuild is not wired for the draft vocab map (chain mode, "
+            "draftingTopK=1, is supported)");
+        auto const draftVocabMapPath = engineDir / binding_names::kDraftVocabMapFileName;
+        ELLM_CHECK(std::filesystem::exists(draftVocabMapPath),
+            "Draft engine declares reduced_vocab_size > 0 but " + std::string(binding_names::kDraftVocabMapFileName)
+                + " is missing from engine directory");
+        std::vector<Tensor> vocabMapTensors;
+        ELLM_CHECK(safetensors::loadSafetensors(draftVocabMapPath, vocabMapTensors, stream),
+            "Failed to load " + std::string(binding_names::kDraftVocabMapFileName) + " from engine directory");
+        check::check(vocabMapTensors.size() == 1,
+            std::string(binding_names::kDraftVocabMapFileName) + " should contain exactly one tensor");
+        check::check(vocabMapTensors[0].getShape().getNumDims() == 1, "draft vocab_map tensor should be 1D");
+        int32_t const reducedVocabSize = static_cast<int32_t>(vocabMapTensors[0].getShape()[0]);
+        check::check(reducedVocabSize == mRuntime.deployment.draft->outputVocabSize,
+            "draft vocab_map tensor length should match the draft model reduced vocab size");
+
+        int32_t const baseVocabSize = mRuntime.deployment.base.vocabSize;
+        std::vector<int32_t> hostMap(static_cast<size_t>(reducedVocabSize));
+        CUDA_CHECK(cudaMemcpyAsync(hostMap.data(), vocabMapTensors[0].dataPointer<int32_t>(),
+            static_cast<size_t>(reducedVocabSize) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        for (int32_t draftTokenId = 0; draftTokenId < reducedVocabSize; ++draftTokenId)
+        {
+            int32_t const fullTokenId = hostMap[static_cast<size_t>(draftTokenId)];
+            check::check(fullTokenId >= 0 && fullTokenId < baseVocabSize,
+                "draft vocab_map entries must be valid base-vocab token ids");
+            hostMap[static_cast<size_t>(draftTokenId)] = fullTokenId - draftTokenId;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(mDraftVocabMappingTable.dataPointer<int32_t>(), hostMap.data(),
+            static_cast<size_t>(reducedVocabSize) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        LOG_INFO(
+            "MTPDecoder: reduced draft vocabulary active (%d of %d base tokens); "
+            "loaded %s as an offset table",
+            reducedVocabSize, baseVocabSize, binding_names::kDraftVocabMapFileName);
+    }
+    else
+    {
+        // MTP full-vocab: identity vocab mapping (zero-fill offsets)
+        CUDA_CHECK(cudaMemsetAsync(
+            mDraftVocabMappingTable.rawPointer(), 0, mDraftVocabMappingTable.getMemoryCapacity(), stream));
+    }
 }
 
 DecodingKvHeadroom MTPDecoder::requiredKvHeadroom() const

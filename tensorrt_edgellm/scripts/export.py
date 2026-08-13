@@ -1335,8 +1335,14 @@ def _export_diffusion_gemma(model_dir: str,
 
 def _export_mtp_draft(model_dir: str,
                       draft_out_dir: str,
-                      externalize_weights: "list[str] | None" = None) -> None:
-    """Export the MTP draft model."""
+                      externalize_weights: "list[str] | None" = None,
+                      draft_reduced_vocab_dir: str = "") -> None:
+    """Export the MTP draft model, optionally with a reduced lm_head vocabulary.
+
+    Chain mode only — the runtime rejects tree drafting with a reduced draft
+    vocabulary. The slice applies to this export's own model instance, so a
+    checkpoint that borrows the base lm_head is safe too.
+    """
     os.makedirs(draft_out_dir, exist_ok=True)
     output_path = os.path.join(draft_out_dir, "model.onnx")
 
@@ -1350,6 +1356,28 @@ def _export_mtp_draft(model_dir: str,
         logger.exception("[MTP Draft] Failed to load checkpoint")
         raise SystemExit(1) from exc
 
+    # --- Optional: reduce draft lm_head vocabulary ---
+    full_size = model.config.vocab_size
+    reduced_size = None
+    if draft_reduced_vocab_dir:
+        if not hasattr(model, "lm_head"):
+            logger.error(
+                "[MTP Draft] Vocab reduction requires the draft model to "
+                "carry an lm_head module")
+            raise SystemExit(1)
+        logger.info("[MTP Draft] Applying vocab reduction from %s",
+                    draft_reduced_vocab_dir)
+        try:
+            from ..vocab_reduction.onnx_export import \
+                apply_reduced_vocab_from_dir
+            apply_reduced_vocab_from_dir(model, draft_reduced_vocab_dir)
+            reduced_size = model.config.reduced_vocab_size
+            logger.info("[MTP Draft] lm_head reduced: %d → %d", full_size,
+                        reduced_size)
+        except (OSError, ValueError, RuntimeError, ImportError) as exc:
+            logger.exception("[MTP Draft] Vocab reduction failed")
+            raise SystemExit(1) from exc
+
     logger.info("[MTP Draft] Exporting to %s", output_path)
     try:
         from ..onnx.export import export_onnx
@@ -1360,6 +1388,32 @@ def _export_mtp_draft(model_dir: str,
     except (OSError, ValueError, RuntimeError) as exc:
         logger.exception("[MTP Draft] ONNX export failed")
         raise SystemExit(1) from exc
+
+    # --- Save draft vocab map sidecar for the C++ runtime ---
+    if draft_reduced_vocab_dir:
+        from tensorrt_edgellm._safetensors_io import \
+            save_file as _save_safetensors
+
+        from ..vocab_reduction.constants import (DRAFT_VOCAB_INFO_NAME,
+                                                 DRAFT_VOCAB_MAP_NAME)
+        vocab_map = model._reduced_vocab_map_for_runtime
+
+        map_path = os.path.join(draft_out_dir, DRAFT_VOCAB_MAP_NAME)
+        _save_safetensors({"vocab_map": vocab_map.cpu().to(torch.int32)},
+                          map_path)
+        logger.info("[MTP Draft] Wrote draft vocab map: %s (%d tokens)",
+                    map_path, vocab_map.numel())
+
+        with open(os.path.join(draft_out_dir, DRAFT_VOCAB_INFO_NAME),
+                  "w") as fh:
+            json.dump(
+                {
+                    "vocab_size": full_size,
+                    "reduced_vocab_size": reduced_size,
+                    "source": draft_reduced_vocab_dir
+                },
+                fh,
+                indent=2)
 
     logger.info("[MTP Draft] Done: %s", output_path)
 
@@ -4045,9 +4099,11 @@ def main() -> None:
         default="",
         metavar="DIR",
         help=
-        ("Directory containing vocab_map.safetensors for the DFlash draft model "
-         "(from tensorrt_edgellm/scripts/reduce_vocab.py). "
-         "Reduces the DFlash draft lm_head output dimension."),
+        ("Directory containing vocab_map.safetensors for a spec-decode draft "
+         "model (from tensorrt_edgellm/scripts/reduce_vocab.py). Reduces the "
+         "draft lm_head output dimension. Supported for DFlash, JetSpec, and "
+         "chain-MTP drafts (MTP requires the checkpoint's own mtp.lm_head.*; "
+         "tree-MTP is rejected by the runtime)."),
     )
     p.add_argument(
         "--mtp",
@@ -4654,7 +4710,10 @@ def main() -> None:
              quantization_override=getattr(args, 'quantization', None))),
         (args.mtp and not gemma4_mtp_requested
          and _allow("mtp_draft"), "mtp_draft", lambda out: _export_mtp_draft(
-             model_dir, out, externalize_weights=externalize_weights)),
+             model_dir,
+             out,
+             externalize_weights=externalize_weights,
+             draft_reduced_vocab_dir=args.draft_reduced_vocab_dir)),
         (gemma4_mtp_requested and _allow("mtp_draft"),
          "mtp_draft", lambda out: _export_gemma4_mtp_draft(
              model_dir, out, gemma4_mtp_assistant_dir, gemma4_kv_sharing_map)),
