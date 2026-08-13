@@ -439,6 +439,10 @@ TensorRegistry buildRegistryForDFlashDraft(DeploymentConfig const& bundle)
     reg.addTensor({binding_names::kKVCacheStartIndex, TensorIO::kInput, nvinfer1::DataType::kINT32,
         {sym(&InferenceDims::startIndexLen)}});
 
+    int32_t const maxPagesPerSeq = rt::computeMaxPagesPerSeq(cfg.maxKVCacheCapacity);
+    reg.addTensor({binding_names::kKVPageTable, TensorIO::kInput, nvinfer1::DataType::kINT32,
+        {sym(&InferenceDims::batch), fixed(2), fixed(maxPagesPerSeq)}});
+
     // dflash_delta_lengths: [batch] INT32 — per-batch delta lengths for multi-batch
     reg.addTensor({binding_names::kDFlashDeltaLengths, TensorIO::kInput, nvinfer1::DataType::kINT32,
         {sym(&InferenceDims::batch)}});
@@ -505,6 +509,10 @@ TensorRegistry buildRegistryForGemma4MTPDraft(DeploymentConfig const& bundle)
     // context_lengths: [B] target KV lengths.
     reg.addTensor(
         {binding_names::kContextLengths, TensorIO::kInput, nvinfer1::DataType::kINT32, {sym(&InferenceDims::batch)}});
+
+    int32_t const maxPagesPerSeq = rt::computeMaxPagesPerSeq(draftCfg.maxKVCacheCapacity);
+    reg.addTensor({binding_names::kKVPageTable, TensorIO::kInput, nvinfer1::DataType::kINT32,
+        {sym(&InferenceDims::batch), fixed(2), fixed(maxPagesPerSeq)}});
 
     addRopeTensorSpecs(reg, draftCfg);
 

@@ -2348,6 +2348,8 @@ class TestConfig:
             # Add test case mappings here, for example:
             "llm_basic":
             "tests/test_cases/llm_basic.json",
+            "ragged_batch":
+            "tests/test_cases/ragged_batch.json",
             "llm_logit_bias":
             "tests/test_cases/llm_logit_bias.json",
             "llm_lora":
