@@ -91,7 +91,8 @@ public:
     //! Returns true if this runner can handle the given configuration.
     //!
     //! SM80+: dim ∈ {64, 128}, dstate ∈ {64, 128} (SM80 cp.async kernel, runs on all GPUs).
-    //! SM100+: additionally, dim == 64 && dstate == 128 uses Blackwell TMA/wgmma persistent kernel.
+    //! SM100-110: dim == 64 uses the Blackwell persistent kernel.
+    //! SM100/101/110: dim == 80, dstate == 128 is handled by two packed dim == 64 slabs.
     static bool canImplement(int32_t dim, int32_t dstate, int32_t smVersion);
 
     //! Load only the module selected by \p params. The plugin calls this before
@@ -110,6 +111,7 @@ private:
 
 #ifdef CUTE_DSL_SSD_BLACKWELL_ENABLED
     int runPrefillBlackwell(SSDParams const& params, cudaStream_t stream);
+    int runPrefillBlackwellD80Slabs(SSDParams const& params, cudaStream_t stream);
 #endif
 
     // SM80 modules — one per (dim, dstate) combination

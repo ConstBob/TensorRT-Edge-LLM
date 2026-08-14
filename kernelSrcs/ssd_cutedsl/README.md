@@ -16,7 +16,7 @@ Local modifications:
 - **End-to-end varlen support** -- kernel always-varlen at AOT (`has_varlen=True`); plugin plumbs `context_lengths` to runner; metadata (seq_idx / chunk_indices / chunk_offsets / seq_chunk_cumsum) built fully on-device (CUDA-graph friendly, no D2H sync)
 - **`has_init_states` Blackwell variants** -- accept caller-provided initial SSM state at chunk 0; powers chunked prefill / continuous batching unit tests; default zero-state variant is the production fast path
 - **Blackwell N=64 support** — fixed TMA partition shape mismatch in FlashInfer kernel to support dstate=64
-- **C++ plugin integration** — CuteDslSSDRunner with multi-module dispatch, AOT static library pattern matching FMHA/GDN
+- **C++ plugin integration** — CuteDslSSDRunner with multi-module dispatch and a Blackwell D80/N128 slab adapter, using the AOT static library pattern matching FMHA/GDN
 - **Dependency removal** — removed PyTorch; uses CuPy/NumPy for standalone testing
 
 ## Kernel Variants
@@ -47,6 +47,16 @@ SM120+ (GB10/GB20) lacks TMEM/wgmma and uses the non-Blackwell fallback.
 
 Blackwell native kernels are limited to DIM=64 due to SM100 TMEM capacity
 (512 columns). DIM=128 models use the non-Blackwell fallback on Blackwell GPUs.
+
+D80/N128 does not add an AOT kernel variant. On SM100, SM101, and SM110,
+`CuteDslSSDRunner` packs dimensions 0..63 and 64..79 into one reusable D64
+workspace, zero-fills the second slab's unused lanes, executes the existing
+D64/N128 kernel twice, and unpacks the valid output and final state. The two
+slabs are ordered on the caller's CUDA stream and remain CUDA-graph
+capture-compatible. Other architectures report D80 unsupported, so the Mamba
+plugin uses its serial prefill path. Once `canImplement()` reports support,
+module-load or execution failure is fatal; it never falls back after claiming
+the CuTe DSL route.
 
 `has_init_states` is a compile-time constexpr: `false` is the production fast
 path (state arrives zeroed); `true` adds an extra TMA pipeline stage to load
@@ -128,8 +138,9 @@ architecture, and initial-state AOT variant on its first use and keeps it
 resident for process lifetime. The plugin calls
 `ensureKernelModules(SSDParams, stream)` before its output-state copy; `run()`
 repeats that guard defensively. On SM100 through SM110, D=64 uses the
-Blackwell native kernel; all other configurations use the non-Blackwell
-implementation.
+Blackwell native kernel. D80/N128 uses the two-slab adapter only on SM100,
+SM101, and SM110. D128 uses the non-Blackwell implementation; unsupported
+configurations remain on the plugin's serial prefill path.
 
 Plugin (`cpp/plugins/mamba/mambaPlugin.cpp`): integrates via the SSD runner.
 
