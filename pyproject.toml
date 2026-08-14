@@ -110,7 +110,30 @@ wheel.exclude = [
     "experimental/server/setup_pybind.py",
 ]
 cmake.args = ["-DEDGELLM_PYTHON_ONLY_WHEEL=ON"]
-sdist.include = ["packaging/**", "CMakeLists.txt", "LICENSE"]
+sdist.include = ["/packaging/**", "/CMakeLists.txt", "/LICENSE"]
+sdist.exclude = [
+    ".gitlab/**",
+    ".gitlab-ci.yml",
+    ".claude/**",
+    ".greptile/**",
+    ".venv*/**",
+    "AGENTS.local.md",
+    "CODEOWNERS",
+    "DO_NOT_RELEASE",
+    "TODO.md",
+    "TODOS.md",
+    "artifacts/**",
+    "build/**",
+    "codex-logs/**",
+    "design/**",
+    "docs/source/user_guide/examples/omni_internal.md",
+    "oss_release_manifest.json",
+    "scripts/README.md",
+    "scripts/check_oss_release_sanitizer.py",
+    "scripts/strip_internal_release.py",
+    "sonar-project.properties",
+    "venv/**",
+]
 
 [tool.scikit-build.metadata.version]
 provider = "scikit_build_core.metadata.regex"

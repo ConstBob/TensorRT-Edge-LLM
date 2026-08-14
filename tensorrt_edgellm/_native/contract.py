@@ -35,13 +35,6 @@ MATRIX_VARIANT_FIELDS = frozenset({
     "cuda_ctk_version",
     "embedded_target",
     "cmake_args",
-    "ci_build_runner",
-    "ci_build_image",
-    "ci_build_mode",
-    "ci_test_runner",
-    "ci_test_image",
-    "ci_trt_package",
-    "ci_remote",
 })
 RUNTIME_VARIANT_FIELDS = frozenset({
     "variant_id",
@@ -77,6 +70,11 @@ def validate_matrix_variant(value: Mapping[str, Any]) -> Dict[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError("Variant row must be a table.")
     _required(value, MATRIX_VARIANT_FIELDS, "Variant row")
+    unexpected = sorted(set(value) - MATRIX_VARIANT_FIELDS)
+    if unexpected:
+        raise ValueError(
+            f"Variant row contains unsupported fields: {', '.join(unexpected)}."
+        )
     row = dict(value)
     if row["platform_probe_source"] not in PROBE_SOURCES:
         raise ValueError(

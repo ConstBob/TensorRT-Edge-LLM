@@ -61,7 +61,7 @@ def _arguments(argv=None) -> argparse.Namespace:
     parser.add_argument("--no-device-image-check",
                         action="store_true",
                         help=("Development-only: skip cuobjdump; "
-                              "qualification CI must not use this."))
+                              "do not use for release artifacts."))
     return parser.parse_args(argv)
 
 

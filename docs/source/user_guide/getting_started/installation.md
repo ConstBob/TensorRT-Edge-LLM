@@ -43,8 +43,8 @@ ABI.
 
 ### Build wheel files from source
 
-Clone the requested revision with submodules, create a build environment, and
-install the packaging-only toolchain:
+Clone the requested revision with submodules and install the build-only
+packaging toolchain using the CPython minor version for the wheel:
 
 ```bash
 git clone --recurse-submodules https://github.com/NVIDIA/TensorRT-Edge-LLM.git
@@ -53,59 +53,57 @@ python3.12 -m venv .venv-wheel
 source .venv-wheel/bin/activate
 python -m pip install -r packaging/wheel-toolchain-requirements.txt
 python packaging/wheel_cli.py validate-matrix
-python packaging/wheel_cli.py validate-source --require-clean
 ```
 
-The repository exposes every wheel build stage through
-`python packaging/wheel_cli.py`. First build one Python base wheel:
+Generate the matching CuTe DSL archive by following `kernelSrcs/README.md`, or
+place the archive and checksum in `kernelSrcs/cuteDSLPrebuilt`. To build a wheel
+for the current machine, expose one GPU architecture and provide the compatible
+TensorRT SDK:
 
 ```bash
-PYTHON_ABI=cp312
-python packaging/wheel_cli.py build-base \
-    --output-dir "artifacts/base/$PYTHON_ABI"
-```
+nvidia-smi --query-gpu=uuid,name,compute_cap --format=csv,noheader
+export TRT_PACKAGE_DIR=/path/to/TensorRT
+export LD_LIBRARY_PATH="$TRT_PACKAGE_DIR/lib:${LD_LIBRARY_PATH:-}"
 
-Next, produce the CuTe DSL archive described in `kernelSrcs/README.md`. In the
-build environment matching each row in `packaging/variants.toml`, build and
-verify that native payload:
-
-```bash
-VARIANT=x86-ubuntu2404-cu13-sm120
-TRT_PACKAGE_DIR=/path/to/TensorRT
-
-python packaging/wheel_cli.py prepare-cutedsl \
-    --variant "$VARIANT" \
-    --artifact-dir kernelSrcs/cuteDSLPrebuilt
-python packaging/wheel_cli.py build-payload \
-    --variant "$VARIANT" \
-    --python-abi "$PYTHON_ABI" \
+CUDA_VISIBLE_DEVICES=GPU-<UUID> \
+python packaging/wheel_cli.py build-wheel \
+    --local \
     --trt-package-dir "$TRT_PACKAGE_DIR" \
-    --output-dir "artifacts/payloads/$VARIANT-$PYTHON_ABI"
-python packaging/wheel_cli.py verify-payload \
-    --stage "artifacts/payloads/$VARIANT-$PYTHON_ABI"
+    --output-dir dist/local
 ```
 
-Cross-compiled aarch64 rows additionally pass `--toolchain-file`,
-`--target-sysroot`, and `--target-python-include-dir`. Repeat the payload step
-for every row of the requested CPU architecture; a complete architecture wheel
-intentionally contains all qualified CUDA, TensorRT, platform, and SM payloads.
-Then assemble it:
+To include a compatible set of GPUs, repeat `--variant`:
 
 ```bash
-CPU_ARCH=x86_64
-BASE_WHEEL=$(find "artifacts/base/$PYTHON_ABI" -maxdepth 1 -name '*.whl' -print -quit)
-python packaging/wheel_cli.py assemble \
-    --base-wheel "$BASE_WHEEL" \
-    --payload-root artifacts/payloads \
-    --cpu-arch "$CPU_ARCH" \
-    --python-abi "$PYTHON_ABI" \
-    --output-dir "dist/$CPU_ARCH/$PYTHON_ABI"
+python packaging/wheel_cli.py build-wheel \
+    --variant x86-ubuntu2404-cu13-sm86 \
+    --variant x86-ubuntu2404-cu13-sm100 \
+    --trt-package-dir /path/to/TensorRT-10 \
+    --output-dir dist/selected
 ```
 
-`packaging/docker/Dockerfile` is the reproducible reference environment for an
-x86_64 Ubuntu 24.04/CUDA 13 payload. Its `BASE_IMAGE` default is a concrete
-supported build base, not a placeholder; override it only when building a
-different matrix environment.
+Selected variants must use the same platform, CUDA, TensorRT, and toolchain
+context. The resulting wheel has a deterministic subset build tag and reports a
+clear unsupported-platform error if no included payload matches the target.
+Cross-compiled aarch64 payloads additionally require `--toolchain-file`,
+`--target-sysroot`, and `--target-python-include-dir`.
+
+A complete architecture wheel contains payloads built in several target SDK
+environments. Build and verify each row using the low-level commands in
+[`packaging/README.md`](../../../../packaging/README.md), collect the payload
+stages, and assemble them from the same clean source revision:
+
+```bash
+python packaging/wheel_cli.py build-wheel \
+    --all-for-arch x86_64 \
+    --payload-root /path/to/verified/payloads \
+    --output-dir dist/x86_64
+```
+
+Complete assembly rejects missing, extra, or revision-mismatched payloads.
+`packaging/docker/Dockerfile` provides a public reference environment for
+x86_64 Ubuntu 24.04/CUDA 13 builds. Packaging tools are not installed as runtime
+dependencies.
 
 ### Build an engine and run a prompt
 

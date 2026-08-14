@@ -9,6 +9,10 @@
         - .gitmodules
         - .gitlab/ci/wheel-jobs.yml
         - .gitlab/ci/wheel-generated.yml
+        - .gitlab/ci/wheel-qualification.toml
+        - .gitlab/ci/scripts/wheel_ci.py
+        - .gitlab/ci/scripts/wheel_ci_lib/**/*
+        - .gitlab/ci/scripts/wheel_ci.sh
         - packaging/**/*
         - tensorrt_edgellm/_native/**/*
         - tensorrt_edgellm/runtime.py
@@ -27,7 +31,7 @@ wheel_packaging_precheck:
   tags: [cpu-k8s]
   image: python:3.12-bookworm
   script:
-    - python3 packaging/wheel_cli.py ci-precheck
+    - sh .gitlab/ci/scripts/wheel_ci.sh ci-precheck
   artifacts:
     paths: [artifacts/provenance/source.json]
     expire_in: 30 days
@@ -52,7 +56,7 @@ wheel_python_base:
     - apt-get update && apt-get install -y --no-install-recommends git
     - python -m pip install "tomli==2.3.0; python_version < '3.11'"
   script:
-    - python3 packaging/wheel_cli.py ci-build-base
+    - sh .gitlab/ci/scripts/wheel_ci.sh ci-build-base
   artifacts:
     paths: [artifacts/base/]
     expire_in: 14 days
@@ -69,6 +73,7 @@ wheel_python_base:
       artifacts: true
   script:
     - sh .gitlab/ci/scripts/wheel_ci.sh ci-build-payload
+  timeout: 2h
   artifacts:
     paths: [artifacts/payloads/]
     expire_in: 14 days
@@ -83,12 +88,9 @@ wheel_assemble:
       artifacts: true
     - job: wheel_native_payloads
       artifacts: true
-  parallel:
-    matrix:
-      - CPU_ARCH: [x86_64, aarch64]
-        PYTHON_ABI: [cp310, cp311, cp312]
   script:
-    - python3 packaging/wheel_cli.py ci-assemble
+    - sh .gitlab/ci/scripts/wheel_ci.sh ci-assemble
+  timeout: 2h
   artifacts:
     paths: [dist/]
     expire_in: 30 days
@@ -105,7 +107,7 @@ wheel_assemble:
       artifacts: true
   script:
     - sh .gitlab/ci/scripts/wheel_ci.sh ci-integration
-  timeout: 3h
+  timeout: 4h
   interruptible: true
   artifacts:
     when: always
@@ -123,7 +125,7 @@ wheel_integration_gate:
     - job: wheel_integration
       artifacts: true
   script:
-    - python3 packaging/wheel_cli.py ci-integration-gate
+    - sh .gitlab/ci/scripts/wheel_ci.sh ci-integration-gate
   artifacts:
     paths: [artifacts/integration/gate.json]
     expire_in: 90 days

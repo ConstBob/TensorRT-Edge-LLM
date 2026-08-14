@@ -57,7 +57,13 @@
       "TensorParallelShmResources",
       "syncShmHostBarrier",
       "AllReducePathType::kShm",
-      "test_shm_allreduce"
+      "test_shm_allreduce",
+      "gitlab-master.nvidia.com",
+      "artifactory.nvidia.com",
+      "urm.nvidia.com",
+      "cpu-general-k8s",
+      "local-spark",
+      "-nvks"
     ]
   }
 }

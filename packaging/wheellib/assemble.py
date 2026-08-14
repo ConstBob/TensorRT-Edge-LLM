@@ -44,6 +44,13 @@ def _arguments(argv=None) -> argparse.Namespace:
                         choices=("x86_64", "aarch64"),
                         required=True)
     parser.add_argument("--python-abi", required=True)
+    parser.add_argument(
+        "--variant",
+        action="append",
+        dest="variants",
+        help=
+        "Include one variant; repeat for a subset wheel. Omit for the complete architecture."
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--matrix",
                         type=Path,
@@ -58,7 +65,7 @@ def _arguments(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--no-device-image-check",
         action="store_true",
-        help="Development-only; qualification CI must not use this.")
+        help="Development-only; do not use for release artifacts.")
     parser.add_argument(
         "--expected-sha256",
         help="Fail unless the assembled wheel has this digest.")
@@ -222,7 +229,7 @@ def _audit_wheel_contents(names: Set[str]) -> None:
     ]
     if forbidden:
         raise RuntimeError(
-            f"Final wheel contains CI-only/native build files: {forbidden}.")
+            f"Final wheel contains build-only native files: {forbidden}.")
 
 
 def _audit_record(archive: zipfile.ZipFile, names: Set[str],
@@ -294,26 +301,60 @@ def _audit_final_wheel(wheel: Path, cpu_arch: str, python_abi: str,
         _audit_unpacked_size(archive, unpacked_budget)
 
 
+def _selected_variant_ids(rows: Iterable[Dict[str, Any]], cpu_arch: str,
+                          requested: List[str]) -> Tuple[Set[str], Set[str]]:
+    architecture_ids = {
+        str(row["variant_id"])
+        for row in rows if row["cpu_arch"] == cpu_arch
+    }
+    if not architecture_ids:
+        raise RuntimeError(f"The matrix has no variants for {cpu_arch}.")
+    if not requested:
+        return architecture_ids, architecture_ids
+    selected = set(requested)
+    if len(selected) != len(requested):
+        raise RuntimeError("Each requested variant must be unique.")
+    invalid = selected - architecture_ids
+    if invalid:
+        raise RuntimeError(
+            f"Variants are not qualified for {cpu_arch}: {sorted(invalid)}.")
+    return selected, architecture_ids
+
+
+def _tag_subset_wheel(wheel: Path, python_abi: str, selected: Set[str],
+                      architecture: Set[str]) -> Path:
+    if selected == architecture:
+        return wheel
+    digest = hashlib.sha256("\n".join(sorted(selected)).encode()).hexdigest()
+    marker = f"-{python_abi}-{python_abi}-"
+    if wheel.name.count(marker) != 1:
+        raise RuntimeError(f"Cannot add a subset build tag to {wheel.name}.")
+    tagged_name = wheel.name.replace(marker, f"-1subset{digest[:8]}{marker}",
+                                     1)
+    tagged = wheel.with_name(tagged_name)
+    wheel.rename(tagged)
+    return tagged
+
+
 def main(argv=None) -> None:
-    """Verify a complete partition, inject it, retag it, and pack one wheel."""
+    """Verify selected payloads, inject them, retag them, and pack one wheel."""
     args = _arguments(argv)
     base_wheel = args.base_wheel.resolve(strict=True)
     base = _base_metadata(base_wheel)
     matrix, rows = load_matrix(args.matrix.resolve())
     if args.python_abi not in matrix["qualified_python_abis"]:
         raise RuntimeError(f"Unqualified Python ABI {args.python_abi!r}.")
-    expected_ids = {
-        row["variant_id"]
-        for row in rows if row["cpu_arch"] == args.cpu_arch
-    }
+    expected_ids, architecture_ids = _selected_variant_ids(
+        rows, args.cpu_arch, args.variants or [])
     payloads: List[Dict[str, Any]] = []
     stages: Dict[str, Path] = {}
     for metadata_path in sorted(
             args.payload_root.resolve().rglob("payload.json")):
         stage = metadata_path.parent
         payload = _read_json(metadata_path)
-        if payload.get("cpu_arch") != args.cpu_arch or payload.get(
-                "python_abi") != args.python_abi:
+        if (payload.get("cpu_arch") != args.cpu_arch
+                or payload.get("python_abi") != args.python_abi
+                or str(payload.get("variant_id")) not in expected_ids):
             continue
         verified = verify(stage,
                           args.allowlist,
@@ -403,7 +444,8 @@ def main(argv=None) -> None:
         if len(produced) != 1:
             raise RuntimeError(
                 f"Expected one assembled wheel, found {produced}.")
-    wheel = produced[0]
+    wheel = _tag_subset_wheel(produced[0], args.python_abi, expected_ids,
+                              architecture_ids)
     budgets = load_toml(args.size_budget)["wheel"][args.cpu_arch]
     try:
         if wheel.stat().st_size > int(budgets["compressed_bytes"]):

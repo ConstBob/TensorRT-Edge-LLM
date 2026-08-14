@@ -57,8 +57,7 @@ def _verified_archive(artifact_dir: Path, name: str) -> Path:
         raise RuntimeError(
             "CuTe DSL artifact input is incomplete. Missing: "
             f"{missing_paths}. Generate the matching archive and checksum "
-            "with kernelSrcs/build_cutedsl_tarballs.sh or download the "
-            "build_cutedsl_docker_matrix CI artifact.")
+            "with kernelSrcs/build_cutedsl_tarballs.sh.")
     checksum = checksum_path.read_text(encoding="utf-8").strip().split()
     if (len(checksum) != 2 or checksum[1].lstrip("*") != name
             or not re.fullmatch(r"[0-9a-f]{64}", checksum[0])):

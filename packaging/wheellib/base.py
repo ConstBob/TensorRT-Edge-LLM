@@ -43,7 +43,7 @@ def _arguments(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--allow-dirty-source",
         action="store_true",
-        help="Development-only override; qualification CI must not use this.")
+        help="Development-only override; do not use for release artifacts.")
     return parser.parse_args(argv)
 
 

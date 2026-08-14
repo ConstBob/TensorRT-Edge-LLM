@@ -2654,8 +2654,8 @@ def main():
         default=None,
         help="Version of the target-architecture nvidia-cutlass-dsl-libs-cuXX wheel "
              "to download for cross builds. Default: the installed CuTe DSL version. "
-             "Set this when using an internal compiler wheel whose package version "
-             "differs from the published runtime-libs wheel.",
+             "Set this when the compiler package version differs from the "
+             "target runtime-libs wheel version.",
     )
     p.add_argument("--verbose", action="store_true", help="Show per-variant kernel script output.")
     p.add_argument("--clean", action="store_true", help="Remove the target artifact dir before building.")
