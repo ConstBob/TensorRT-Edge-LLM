@@ -24,10 +24,6 @@ wheel_native_payloads:
         BUILD_RUNNER_TAG: "a30-edgellm-nvks"
         BUILD_IMAGE: "$WHEEL_IMAGE_UBUNTU2404_CU13"
       - PYTHON_ABI: [cp310, cp311, cp312]
-        VARIANT: "x86-ubuntu2404-cu12-sm120"
-        BUILD_RUNNER_TAG: "a30-edgellm-nvks"
-        BUILD_IMAGE: "$WHEEL_IMAGE_UBUNTU2404_CU12"
-      - PYTHON_ABI: [cp310, cp311, cp312]
         VARIANT: "jetson-orin-jp62-cu12-sm87"
         BUILD_RUNNER_TAG: "a30-edgellm-nvks"
         BUILD_IMAGE: "$WHEEL_IMAGE_JETPACK62"
@@ -71,10 +67,6 @@ wheel_native_payloads:
         VARIANT: "x86-ubuntu2404-cu13-sm120-trt11"
         BUILD_RUNNER_TAG: "a30-edgellm-nvks"
         BUILD_IMAGE: "$WHEEL_IMAGE_UBUNTU2404_CU13"
-      - PYTHON_ABI: [cp310, cp311, cp312]
-        VARIANT: "x86-ubuntu2404-cu12-sm120-trt11"
-        BUILD_RUNNER_TAG: "a30-edgellm-nvks"
-        BUILD_IMAGE: "$WHEEL_IMAGE_UBUNTU2404_CU12"
 
 wheel_integration:
   extends: [.wheel_integration_template]
@@ -96,10 +88,6 @@ wheel_integration:
         VARIANT: "x86-ubuntu2404-cu13-sm120"
         TEST_RUNNER_TAG: "rtx5080-edgellm-nvks"
         TEST_IMAGE: "$WHEEL_IMAGE_UBUNTU2404_CU13"
-      - PYTHON_ABI: [cp310, cp311, cp312]
-        VARIANT: "x86-ubuntu2404-cu12-sm120"
-        TEST_RUNNER_TAG: "rtx5080-edgellm-nvks"
-        TEST_IMAGE: "$WHEEL_IMAGE_UBUNTU2404_CU12"
       - PYTHON_ABI: [cp310, cp311, cp312]
         VARIANT: "jetson-orin-jp62-cu12-sm87"
         TEST_RUNNER_TAG: "p3730-k8s"
@@ -144,7 +132,3 @@ wheel_integration:
         VARIANT: "x86-ubuntu2404-cu13-sm120-trt11"
         TEST_RUNNER_TAG: "rtx5080-edgellm-nvks"
         TEST_IMAGE: "$WHEEL_IMAGE_UBUNTU2404_CU13"
-      - PYTHON_ABI: [cp310, cp311, cp312]
-        VARIANT: "x86-ubuntu2404-cu12-sm120-trt11"
-        TEST_RUNNER_TAG: "rtx5080-edgellm-nvks"
-        TEST_IMAGE: "$WHEEL_IMAGE_UBUNTU2404_CU12"

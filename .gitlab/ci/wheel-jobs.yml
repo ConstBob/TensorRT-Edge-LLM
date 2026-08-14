@@ -68,7 +68,7 @@ wheel_python_base:
     - job: build_cutedsl_docker_matrix
       artifacts: true
   script:
-    - python3 packaging/wheel_cli.py ci-build-payload
+    - sh .gitlab/ci/scripts/wheel_ci.sh ci-build-payload
   artifacts:
     paths: [artifacts/payloads/]
     expire_in: 14 days
@@ -104,7 +104,7 @@ wheel_assemble:
     - job: wheel_assemble
       artifacts: true
   script:
-    - python3 packaging/wheel_cli.py ci-integration
+    - sh .gitlab/ci/scripts/wheel_ci.sh ci-integration
   timeout: 3h
   interruptible: true
   artifacts:

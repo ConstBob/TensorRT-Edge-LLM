@@ -140,10 +140,21 @@ def _audit_elf(path: Path, cpu_arch: str, allowed: Set[str]) -> Set[str]:
 
 
 def _audit_device_images(path: Path, gpu_sm: int) -> None:
-    output = _tool_output(["cuobjdump", "--list-elf", os.fspath(path)])
-    if not re.search(rf"sm[_-]?{gpu_sm}(?:\D|$)", output, re.IGNORECASE):
+    executable = _audit_tool("cuobjdump")
+    result = subprocess.run(
+        [executable, "--dump-elf", os.fspath(path)],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT)
+    pattern = rf"arch\s*=\s*sm[_-]?{gpu_sm}(?:a)?(?:\D|$)"
+    if re.search(pattern, result.stdout, re.IGNORECASE):
+        return
+    if result.returncode != 0:
         raise RuntimeError(
-            f"{path} contains no listed SM{gpu_sm} device image.")
+            f"Audit command failed (cuobjdump --dump-elf {path}):\n"
+            f"{result.stdout}")
+    raise RuntimeError(f"{path} contains no listed SM{gpu_sm} device image.")
 
 
 def _audit_dependency_roots(needed: Set[str], roots: Sequence[Path]) -> None:

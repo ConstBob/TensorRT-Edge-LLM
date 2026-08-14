@@ -217,11 +217,18 @@ def _pybind11_cmake_dir() -> Path:
     return cmake_dir
 
 
+def _cuda_architecture(row: Mapping[str, Any]) -> str:
+    sm = int(row["gpu_sm"])
+    suffix = "a" if sm in {100, 101, 110, 121} else ""
+    return f"{sm}{suffix}"
+
+
 def _cmake_configure_command(args: argparse.Namespace, repo_root: Path,
                              build_dir: Path, trt_package_dir: Path,
                              row: Mapping[str, Any],
                              payload_rel: Path) -> List[str]:
     abi_digits = args.python_abi[2:]
+    cuda_architecture = _cuda_architecture(row)
     extension_name = (
         f"_edgellm_runtime.cpython-{abi_digits}-{row['cpu_arch']}-linux-gnu.so"
     )
@@ -232,6 +239,7 @@ def _cmake_configure_command(args: argparse.Namespace, repo_root: Path,
         "-B",
         os.fspath(build_dir),
         "-DCMAKE_BUILD_TYPE=Release",
+        f"-DCMAKE_CUDA_ARCHITECTURES={cuda_architecture}",
         "-DBUILD_PYTHON_BINDINGS=ON",
         f"-DTRT_PACKAGE_DIR={trt_package_dir}",
         f"-DCUDA_CTK_VERSION={row['cuda_ctk_version']}",

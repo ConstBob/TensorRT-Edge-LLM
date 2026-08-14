@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path, PurePosixPath
 from typing import Dict, List, Mapping, Optional, Tuple
 
@@ -38,6 +39,12 @@ _ABI_INTERPRETERS = {
 }
 _GENERATED_CI = REPO_ROOT / ".gitlab" / "ci" / "wheel-generated.yml"
 _MAX_NEEDED_JOB_NAME = 128
+_UV_REQUIREMENT = "uv==0.8.14"
+_TARGET_PYTHON_UBUNTU_RELEASE = {
+    "3.10": "jammy",
+    "3.11": "jammy",
+    "3.12": "noble",
+}
 _BUILD_ENVIRONMENT = {
     "TRT_PACKAGE_DIR": "ci_trt_package",
     "WHEEL_TOOLCHAIN_FILE": "ci_toolchain",
@@ -160,10 +167,37 @@ def _install_toolchain(python: str = sys.executable) -> None:
                 cwd=REPO_ROOT)
 
 
+def _toolchain_python(python: str, python_abi: str) -> str:
+    environment = REPO_ROOT / "venv" / f"wheel-{python_abi}"
+    shutil.rmtree(environment, ignore_errors=True)
+    run_checked([python, "-m", "venv", str(environment)])
+    isolated_python = str(environment / "bin" / "python")
+    _install_toolchain(isolated_python)
+    return isolated_python
+
+
+def _update_submodules() -> None:
+    error = None
+    for attempt in range(1, 4):
+        try:
+            run_checked(
+                ["git", "submodule", "update", "--init", "--recursive"],
+                cwd=REPO_ROOT)
+            return
+        except RuntimeError as current:
+            error = current
+            if attempt < 3:
+                delay = 15 * attempt
+                print(f"Submodule update failed; retrying in {delay}s.",
+                      file=sys.stderr)
+                time.sleep(delay)
+    assert error is not None
+    raise error
+
+
 def precheck() -> None:
     """Validate source, matrix, generated CI, and exact submodules."""
-    run_checked(["git", "submodule", "update", "--init", "--recursive"],
-                cwd=REPO_ROOT)
+    _update_submodules()
     _install_toolchain()
     source.main([
         "--output",
@@ -180,8 +214,7 @@ def build_base_ci() -> None:
     if actual != python_abi:
         raise RuntimeError(
             f"Scheduled ABI {python_abi} does not match interpreter {actual}.")
-    run_checked(["git", "submodule", "update", "--init", "--recursive"],
-                cwd=REPO_ROOT)
+    _update_submodules()
     _install_toolchain()
     base.main([
         "--output-dir",
@@ -206,16 +239,33 @@ def _python_for_abi(python_abi: str) -> str:
     return executable
 
 
-def _bootstrap_cross_python(row: Mapping[str, object],
-                            python_abi: str) -> None:
-    if row["ci_build_mode"] != "cross":
-        return
-    try:
-        _python_for_abi(python_abi)
-        return
-    except RuntimeError:
-        pass
-    version = _ABI_INTERPRETERS[python_abi].removeprefix("python")
+def _managed_python(version: str) -> str:
+    bootstrap = REPO_ROOT / "venv" / "python-bootstrap"
+    bootstrap_python = bootstrap / "bin" / "python"
+    uv = bootstrap / "bin" / "uv"
+    if not uv.is_file():
+        shutil.rmtree(bootstrap, ignore_errors=True)
+        run_checked([sys.executable, "-m", "venv", str(bootstrap)])
+        run_checked(
+            [str(bootstrap_python), "-m", "pip", "install", _UV_REQUIREMENT])
+    install_root = REPO_ROOT / "venv" / "managed-python"
+    environment = dict(os.environ)
+    environment["UV_PYTHON_INSTALL_DIR"] = str(install_root)
+    run_checked([str(uv), "python", "install", version], env=environment)
+    candidates = sorted(install_root.rglob(f"python{version}"))
+    executables = [path for path in candidates if path.parent.name == "bin"]
+    if len(executables) != 1:
+        raise RuntimeError(
+            f"Expected one managed Python {version}, found {executables}.")
+    return str(executables[0])
+
+
+def _install_host_python(version: str) -> str:
+    executable = shutil.which(f"python{version}")
+    if executable is not None:
+        return executable
+    if os.geteuid() != 0:
+        return _managed_python(version)
     run_checked(["apt-get", "update"])
     run_checked([
         "apt-get", "install", "-y", "--no-install-recommends",
@@ -227,6 +277,132 @@ def _bootstrap_cross_python(row: Mapping[str, object],
         "apt-get", "install", "-y", "--no-install-recommends",
         f"python{version}", f"python{version}-dev", f"python{version}-venv"
     ])
+    return _python_for_abi(f"cp{version.replace('.', '')}")
+
+
+def _scope_deb_source_to_host(path: Path) -> None:
+    if not path.is_file():
+        return
+    changed = False
+    lines = []
+    for line in path.read_text(encoding="utf-8").splitlines(keepends=True):
+        stripped = line.lstrip()
+        prefix = line[:len(line) - len(stripped)]
+        if stripped.startswith("deb ") and not stripped.startswith("deb ["):
+            line = prefix + "deb [arch=amd64] " + stripped.removeprefix("deb ")
+            changed = True
+        lines.append(line)
+    if changed:
+        path.write_text("".join(lines), encoding="utf-8")
+
+
+def _scope_deb822_source_to_host(path: Path) -> None:
+    if not path.is_file():
+        return
+    changed = False
+    stanzas = []
+    for stanza in path.read_text(encoding="utf-8").split("\n\n"):
+        lines = stanza.splitlines()
+        types_index = next((index for index, line in enumerate(lines)
+                            if line.lower().startswith("types:")), None)
+        has_architectures = any(line.lower().startswith("architectures:")
+                                for line in lines)
+        if types_index is not None and not has_architectures:
+            lines.insert(types_index + 1, "Architectures: amd64")
+            changed = True
+        stanzas.append("\n".join(lines))
+    if changed:
+        path.write_text("\n\n".join(stanzas).rstrip() + "\n", encoding="utf-8")
+
+
+def _install_target_python_headers(version: str, headers: Path) -> Path:
+    target_config = (headers.parent / "aarch64-linux-gnu" / headers.name /
+                     "pyconfig.h")
+    if target_config.is_file():
+        return headers
+    for source in [
+            Path("/etc/apt/sources.list"),
+            *Path("/etc/apt/sources.list.d").glob("*.list")
+    ]:
+        _scope_deb_source_to_host(source)
+    for source in Path("/etc/apt/sources.list.d").glob("*.sources"):
+        _scope_deb822_source_to_host(source)
+    try:
+        target_release = _TARGET_PYTHON_UBUNTU_RELEASE[version]
+    except KeyError as error:
+        raise RuntimeError(
+            f"No arm64 CPython header source is configured for {version}."
+        ) from error
+    # CPython extension ABI is stable within a minor release. Select an Ubuntu
+    # release that publishes that minor for arm64, independently of the build image.
+    ports = Path("/etc/apt/sources.list.d/ubuntu-ports-arm64.list")
+    ports.write_text(
+        "\n".join(f"deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports "
+                  f"{release} main restricted universe multiverse"
+                  for release in (target_release, f"{target_release}-updates",
+                                  f"{target_release}-security")) + "\n",
+        encoding="utf-8")
+    run_checked(["dpkg", "--add-architecture", "arm64"])
+    run_checked(["apt-get", "update"])
+    target_root = Path(
+        tempfile.gettempdir()) / f"edgellm-python{version}-arm64"
+    target_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="edgellm-python-deb-") as value:
+        download_dir = Path(value)
+        download_dir.chmod(0o777)
+        run_checked(["apt-get", "download", f"libpython{version}-dev:arm64"],
+                    cwd=download_dir)
+        packages = list(download_dir.glob("*.deb"))
+        if len(packages) != 1:
+            raise RuntimeError(
+                f"Expected one target CPython development package: {packages}."
+            )
+        run_checked(
+            ["dpkg-deb", "--extract",
+             str(packages[0]),
+             str(target_root)])
+    include_root = target_root / "usr" / "include"
+    staged_headers = include_root / headers.name
+    target_link = staged_headers / "aarch64-linux-gnu"
+    target_link.unlink(missing_ok=True)
+    target_link.symlink_to(include_root / "aarch64-linux-gnu",
+                           target_is_directory=True)
+    staged_config = target_link / headers.name / "pyconfig.h"
+    if not (staged_headers /
+            "Python.h").is_file() or not staged_config.is_file():
+        raise RuntimeError(
+            f"Target CPython headers are incomplete under {staged_headers}.")
+    return staged_headers
+
+
+def _bootstrap_build_python(row: Mapping[str, object], python_abi: str) -> str:
+    version = _ABI_INTERPRETERS[python_abi].removeprefix("python")
+    build_python = _install_host_python(version)
+    if row["ci_build_mode"] == "cross":
+        header_template = str(row["ci_python_headers"])
+        headers = Path(
+            header_template.format(python_abi=python_abi,
+                                   python_version=version))
+        staged_headers = _install_target_python_headers(version, headers)
+        os.environ["WHEEL_TARGET_PYTHON_INCLUDE_ROOT"] = str(staged_headers)
+    return _toolchain_python(build_python, python_abi)
+
+
+def _normalized_trt_package(trt_dir: Path) -> Path:
+    if (trt_dir / "include" / "NvInfer.h").is_file():
+        return trt_dir
+    include_candidates = sorted((trt_dir / "include").glob("*/NvInfer.h"))
+    library_candidates = sorted((trt_dir / "lib").glob("*/libnvinfer.so"))
+    if len(include_candidates) != 1 or len(library_candidates) != 1:
+        return trt_dir
+    staged = REPO_ROOT / "artifacts" / "trt-packages" / _host_arch()
+    shutil.rmtree(staged, ignore_errors=True)
+    staged.mkdir(parents=True)
+    (staged / "include").symlink_to(include_candidates[0].parent,
+                                    target_is_directory=True)
+    (staged / "lib").symlink_to(library_candidates[0].parent,
+                                target_is_directory=True)
+    return staged
 
 
 def _variant_row(variant: str) -> Mapping[str, object]:
@@ -304,18 +480,16 @@ def build_payload_ci() -> None:
     variant = required_environment("VARIANT")
     row = _variant_row(variant)
     _apply_variant_environment(row, _BUILD_ENVIRONMENT)
-    _bootstrap_cross_python(row, python_abi)
-    trt_dir = Path(required_environment("TRT_PACKAGE_DIR")).resolve()
-    python_bin = _python_for_abi(python_abi)
-    _install_toolchain(python_bin)
+    python_bin = _bootstrap_build_python(row, python_abi)
+    trt_dir = _normalized_trt_package(
+        Path(required_environment("TRT_PACKAGE_DIR")).resolve())
     output = REPO_ROOT / "artifacts" / "payloads" / f"{variant}-{python_abi}"
     build_extra, verify_extra = _cross_arguments(row, python_abi, trt_dir)
     environment = dict(os.environ)
     environment["LD_LIBRARY_PATH"] = ":".join(
         value for value in (str(trt_dir / "lib"),
                             environment.get("LD_LIBRARY_PATH", "")) if value)
-    run_checked(["git", "submodule", "update", "--init", "--recursive"],
-                cwd=REPO_ROOT)
+    _update_submodules()
     run_checked([
         python_bin,
         str(REPO_ROOT / "packaging" / "wheel_cli.py"),
@@ -368,8 +542,7 @@ def assemble_ci() -> None:
     """Assemble and checksum one architecture/ABI wheel."""
     cpu_arch = required_environment("CPU_ARCH")
     python_abi = required_environment("PYTHON_ABI")
-    run_checked(["git", "submodule", "update", "--init", "--recursive"],
-                cwd=REPO_ROOT)
+    _update_submodules()
     _install_toolchain()
     bases = sorted(
         (REPO_ROOT / "artifacts" / "base" / python_abi).glob("*.whl"))
@@ -469,8 +642,10 @@ def _integration_environment(trt_dir: Path,
 def _local_integration(row: Mapping[str, object], python_abi: str, wheel: Path,
                        result: Path) -> None:
     variant = str(row["variant_id"])
-    python_bin = _python_for_abi(python_abi)
-    trt_dir = Path(required_environment("TRT_PACKAGE_DIR")).resolve()
+    version = _ABI_INTERPRETERS[python_abi].removeprefix("python")
+    python_bin = _install_host_python(version)
+    trt_dir = _normalized_trt_package(
+        Path(required_environment("TRT_PACKAGE_DIR")).resolve())
     model_dir = _model_dir()
     environment = _integration_environment(trt_dir, int(row["gpu_sm"]))
     with tempfile.TemporaryDirectory(
@@ -482,14 +657,27 @@ def _local_integration(row: Mapping[str, object], python_abi: str, wheel: Path,
         run_checked(
             [str(interpreter), "-m", "pip", "install", "--upgrade", "pip"],
             env=environment)
-        run_checked([
-            str(interpreter),
-            "-m",
-            "pip",
-            "install",
-            str(_trt_python_wheel(trt_dir, python_abi)),
-        ],
-                    env=environment)
+        trt_requirement = row.get("ci_test_trt_requirement")
+        if trt_requirement:
+            trt_install = [
+                str(interpreter),
+                "-m",
+                "pip",
+                "install",
+                "--extra-index-url",
+                os.environ.get("WHEEL_EXTRA_INDEX_URL",
+                               "https://pypi.nvidia.com"),
+                str(trt_requirement),
+            ]
+        else:
+            trt_install = [
+                str(interpreter),
+                "-m",
+                "pip",
+                "install",
+                str(_trt_python_wheel(trt_dir, python_abi)),
+            ]
+        run_checked(trt_install, env=environment)
         install = [
             str(interpreter),
             "-m",

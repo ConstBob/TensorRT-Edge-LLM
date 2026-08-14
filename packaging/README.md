@@ -40,8 +40,12 @@ share tensorrt_edgellm/_native/contract.py.
 Wheel CI installs each final wheel in a clean environment, builds a
 Qwen2.5-0.5B engine through the installed CLI, and runs a prompt through the
 installed runtime for every variant and ABI. Build images and remote targets
-must provide all three qualified CPython minors; remote TensorRT wheel paths
-use a `{python_abi}` placeholder. Remote jobs default to the board user home; a
+must provide all three qualified CPython minors. Container jobs bootstrap
+missing minors from the configured PPA; unprivileged native shell runners use a
+pinned `uv` installation to provision managed CPython without `sudo`. System
+TensorRT installations may use the standard multiarch include and library
+layout. Remote TensorRT wheel paths use a `{python_abi}` placeholder. Remote
+jobs default to the board user home; a
 variant may set `ci_target_work_dir` when qualification needs another filesystem
 (D7L uses `/mnt/bigspace`). Qualification requires all evidence.
 
@@ -61,4 +65,6 @@ uses setuptools, includes C++/CUDA sources as package data, and
 through PyTorch. EdgeLLM cannot assume a compiler toolchain on edge targets, so
 it keeps scikit-build for the standard Python/CMake boundary and adds only the
 repository-specific aggregation needed to place precompiled platform/SM
-payloads in one architecture-wide wheel.
+payloads in one architecture-wide wheel. Each native payload compiles only the
+SM declared by its matrix row; assembly combines those payloads into the final
+architecture-wide wheel.

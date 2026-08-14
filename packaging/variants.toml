@@ -40,11 +40,6 @@ cuda_major = 13
 [[cutedsl_artifacts]]
 cpu_arch = "x86_64"
 gpu_sm = 120
-cuda_major = 12
-
-[[cutedsl_artifacts]]
-cpu_arch = "x86_64"
-gpu_sm = 120
 cuda_major = 13
 
 [[cutedsl_artifacts]]
@@ -140,7 +135,7 @@ cuda_runtime_soname = "libcudart.so.13"
 tensorrt_runtime_soname = "libnvinfer.so.10"
 gpu_sm = 100
 cute_dsl_artifact_tag = "sm_100"
-cuda_ctk_version = "13.0"
+cuda_ctk_version = "13.2"
 embedded_target = ""
 cmake_args = ["-DENABLE_CUTE_DSL=ALL"]
 ci_build_runner = "a30-edgellm-nvks"
@@ -162,7 +157,7 @@ cuda_runtime_soname = "libcudart.so.13"
 tensorrt_runtime_soname = "libnvinfer.so.10"
 gpu_sm = 120
 cute_dsl_artifact_tag = "sm_120"
-cuda_ctk_version = "13.0"
+cuda_ctk_version = "13.2"
 embedded_target = ""
 cmake_args = ["-DENABLE_CUTE_DSL=ALL"]
 ci_build_runner = "a30-edgellm-nvks"
@@ -171,28 +166,6 @@ ci_build_mode = "native"
 ci_test_runner = "rtx5080-edgellm-nvks"
 ci_test_image = "$WHEEL_IMAGE_UBUNTU2404_CU13"
 ci_trt_package = "$WHEEL_TRT10_X86_UBUNTU2404_CU13_DIR"
-ci_remote = false
-
-[[variants]]
-variant_id = "x86-ubuntu2404-cu12-sm120"
-platform_family = "ubuntu"
-platform_probe_source = "os-release"
-platform_probe_values = ["ubuntu:24.04"]
-platform_release = "24.04"
-cpu_arch = "x86_64"
-cuda_runtime_soname = "libcudart.so.12"
-tensorrt_runtime_soname = "libnvinfer.so.10"
-gpu_sm = 120
-cute_dsl_artifact_tag = "sm_120"
-cuda_ctk_version = "12.8"
-embedded_target = ""
-cmake_args = ["-DENABLE_CUTE_DSL=ALL"]
-ci_build_runner = "a30-edgellm-nvks"
-ci_build_image = "$WHEEL_IMAGE_UBUNTU2404_CU12"
-ci_build_mode = "native"
-ci_test_runner = "rtx5080-edgellm-nvks"
-ci_test_image = "$WHEEL_IMAGE_UBUNTU2404_CU12"
-ci_trt_package = "$WHEEL_TRT10_X86_UBUNTU2404_CU12_DIR"
 ci_remote = false
 
 [[variants]]
@@ -353,7 +326,11 @@ gpu_sm = 110
 cute_dsl_artifact_tag = "sm_110"
 cuda_ctk_version = "13.3"
 embedded_target = "auto-thor"
-cmake_args = ["-DAARCH64_BUILD=ON", "-DENABLE_CUTE_DSL=ALL"]
+cmake_args = [
+  "-DAARCH64_BUILD=ON",
+  "-DENABLE_CUTE_DSL=ALL",
+  "-DCUDA_TARGET_DIR=/usr/local/cuda/n1/targets/aarch64-linux",
+]
 ci_build_runner = "a30-edgellm-nvks"
 ci_build_image = "$WHEEL_IMAGE_DRIVE72"
 ci_build_mode = "cross"
@@ -390,6 +367,7 @@ ci_build_mode = "native"
 ci_test_runner = "local-spark"
 ci_test_image = "$WHEEL_IMAGE_DGX_SPARK"
 ci_trt_package = "/usr"
+ci_test_trt_requirement = "tensorrt==10.16.1.11"
 ci_remote = false
 
 [[variants]]
@@ -403,7 +381,7 @@ cuda_runtime_soname = "libcudart.so.13"
 tensorrt_runtime_soname = "libnvinfer.so.11"
 gpu_sm = 80
 cute_dsl_artifact_tag = "sm_80"
-cuda_ctk_version = "13.0"
+cuda_ctk_version = "13.2"
 embedded_target = ""
 cmake_args = ["-DENABLE_CUTE_DSL=ALL"]
 ci_build_runner = "a30-edgellm-nvks"
@@ -447,7 +425,7 @@ cuda_runtime_soname = "libcudart.so.13"
 tensorrt_runtime_soname = "libnvinfer.so.11"
 gpu_sm = 100
 cute_dsl_artifact_tag = "sm_100"
-cuda_ctk_version = "13.0"
+cuda_ctk_version = "13.2"
 embedded_target = ""
 cmake_args = ["-DENABLE_CUTE_DSL=ALL"]
 ci_build_runner = "a30-edgellm-nvks"
@@ -469,7 +447,7 @@ cuda_runtime_soname = "libcudart.so.13"
 tensorrt_runtime_soname = "libnvinfer.so.11"
 gpu_sm = 120
 cute_dsl_artifact_tag = "sm_120"
-cuda_ctk_version = "13.0"
+cuda_ctk_version = "13.2"
 embedded_target = ""
 cmake_args = ["-DENABLE_CUTE_DSL=ALL"]
 ci_build_runner = "a30-edgellm-nvks"
@@ -478,26 +456,4 @@ ci_build_mode = "native"
 ci_test_runner = "rtx5080-edgellm-nvks"
 ci_test_image = "$WHEEL_IMAGE_UBUNTU2404_CU13"
 ci_trt_package = "$WHEEL_TRT11_X86_UBUNTU2404_CU13_DIR"
-ci_remote = false
-
-[[variants]]
-variant_id = "x86-ubuntu2404-cu12-sm120-trt11"
-platform_family = "ubuntu"
-platform_probe_source = "os-release"
-platform_probe_values = ["ubuntu:24.04"]
-platform_release = "24.04"
-cpu_arch = "x86_64"
-cuda_runtime_soname = "libcudart.so.12"
-tensorrt_runtime_soname = "libnvinfer.so.11"
-gpu_sm = 120
-cute_dsl_artifact_tag = "sm_120"
-cuda_ctk_version = "12.8"
-embedded_target = ""
-cmake_args = ["-DENABLE_CUTE_DSL=ALL"]
-ci_build_runner = "a30-edgellm-nvks"
-ci_build_image = "$WHEEL_IMAGE_UBUNTU2404_CU12"
-ci_build_mode = "native"
-ci_test_runner = "rtx5080-edgellm-nvks"
-ci_test_image = "$WHEEL_IMAGE_UBUNTU2404_CU12"
-ci_trt_package = "$WHEEL_TRT11_X86_UBUNTU2404_CU12_DIR"
 ci_remote = false
