@@ -48,6 +48,11 @@ def _speculative_build_args(config: TestConfig) -> List[str]:
             "--spec-type", "dflash", "--draft-model-dir",
             config.get_dflash_draft_model_dir()
         ]
+    if config.is_jetspec:
+        return [
+            "--spec-type", "jetspec", "--draft-model-dir",
+            config.get_jetspec_draft_model_dir()
+        ]
     if config.is_eagle:
         return [
             "--spec-type", "eagle3", "--draft-model-dir",
@@ -101,7 +106,7 @@ def _build_command(config: TestConfig, model_dir: str, engine_dir: str,
     return command
 
 
-def _runtime_command(config: TestConfig, engine_dir: str,
+def _runtime_command(config: TestConfig, model_dir: str, engine_dir: str,
                      executables: Dict[str, str]) -> List[str]:
     common = [
         f"--inputFile={config.get_test_case_file()}",
@@ -114,6 +119,7 @@ def _runtime_command(config: TestConfig, engine_dir: str,
             f"--talkerEngineDir={os.path.join(engine_dir, 'talker')}",
             f"--code2wavEngineDir={os.path.join(engine_dir, 'code2wav')}",
             f"--tokenizerDir={os.path.join(engine_dir, 'talker')}",
+            f"--checkpointDir={model_dir}",
             f"--outputAudioDir={config.get_output_audio_dir()}",
             *common,
         ]
@@ -122,17 +128,19 @@ def _runtime_command(config: TestConfig, engine_dir: str,
             executables["action_inference"],
             f"--engineDir={engine_dir}",
             f"--multimodalEngineDir={engine_dir}",
+            f"--checkpointDir={model_dir}",
             *common,
         ]
 
     command = [
         executables["llm_inference"],
         f"--engineDir={engine_dir}",
+        f"--checkpointDir={model_dir}",
         *common,
     ]
     if config.model_type in (ModelType.VLM, ModelType.ASR, ModelType.OMNI):
         command.append(f"--multimodalEngineDir={engine_dir}")
-    if config.is_eagle or config.is_mtp or config.is_dflash:
+    if config.is_eagle or config.is_mtp or config.is_dflash or config.is_jetspec:
         command.extend([
             "--specDecode",
             f"--specDraftTopK={config.eagle_draft_top_k}",
@@ -161,7 +169,8 @@ def _assert_component_engines(model_dir: str, engine_dir: str,
     from experimental.builder.core.config import BundleConfig
 
     bundle = BundleConfig.from_pretrained(model_dir)
-    speculative = bool(config.is_eagle or config.is_mtp or config.is_dflash)
+    speculative = bool(config.is_eagle or config.is_mtp or config.is_dflash
+                       or config.is_jetspec)
     expected = []
     for component in bundle.components:
         spec = contracts.component_spec(component)
@@ -247,8 +256,8 @@ def test_build_and_run(test_param: str, executable_files: Dict[str, str],
     """Build every checkpoint component once, then execute its runtime once."""
     model_type = infer_checkpoint_export_model_type(test_param)
     config = TestConfig.from_param_string(test_param, model_type,
-                                          TaskType.INFERENCE, env_config)
-    config.llm_models_dir = env_config.llm_models_dir
+                                          TaskType.CHECKPOINT_BUILD,
+                                          env_config)
     config.check_trt_native_attn()
     model_dir = config.get_torch_model_dir()
     engine_dir = _engine_dir(config)
@@ -264,7 +273,7 @@ def test_build_and_run(test_param: str, executable_files: Dict[str, str],
              7200, env_config, test_logger)
         _assert_component_engines(model_dir, engine_dir, config)
 
-        _run(_runtime_command(config, engine_dir, executable_files),
+        _run(_runtime_command(config, model_dir, engine_dir, executable_files),
              "single end-to-end runtime execution", 6000, env_config,
              test_logger)
 

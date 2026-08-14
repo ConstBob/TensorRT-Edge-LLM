@@ -22,6 +22,7 @@
 #include "common/trtUtils.h"
 #include "runtime/hybridCacheManager.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "runtime/state/externalWeightManager.h"
 #include "tokenizer/tokenizer.h"
 
 #include <NvInfer.h>
@@ -60,6 +61,7 @@ class Alpamayo1ActionRunner
 public:
     //! \brief Load action engine, config, and allocate tensors
     //! \param engineDir Path to directory containing action.engine and config.json
+    //! \param checkpointDir Original model checkpoint used for runtime weights
     //! \param stream CUDA stream for operations
     //! \param kvCacheConfig KV cache layout from the LLM (from KVCacheManager::Config())
     //! \param basePageTableIsIdentity Whether the base cache manager's KV page table is (and is
@@ -71,7 +73,7 @@ public:
     //!         if `basePageTableIsIdentity` is false.
     //!
     //! config.json must include rope_theta and num_hidden_layers (decoder layer count)
-    Alpamayo1ActionRunner(std::string const& engineDir, cudaStream_t stream,
+    Alpamayo1ActionRunner(std::string const& engineDir, std::string const& checkpointDir, cudaStream_t stream,
         KVCacheManager::Config const& kvCacheConfig, bool basePageTableIsIdentity);
 
     ~Alpamayo1ActionRunner() noexcept = default;
@@ -151,10 +153,8 @@ private:
     //! \return Pointer to the host buffer containing the KV cache lengths
     int32_t const* getActualKVLengths(cudaStream_t stream, int32_t activeBatchSize);
 
-    //! \brief Deinterleave combined [maxBatchSize, 2, H, S, D] (KV Cache layout from attention plugin) for one layer
-    //! into owned buffers and return refs to them. The Alpamayo action expert's exported graph consumes separate K/V
-    //! caches of shape [2, maxBatchSize, H, S, D] (the TRT native attention op layout), so this runner repacks the
-    //! plugin-path combined buffer into that layout.
+    //! \brief Copy one layer's physical active-slot K/V views into owned head-major buffers.
+    //! The Alpamayo action expert's exported graph consumes separate K/V caches in the TRT native attention layout.
     //!
     //! CONTRACT: this reads KV from physical slot row `b` of the combined pool
     //! directly -- it does not receive or consult the base cache manager's KVPageTable. It is
@@ -182,6 +182,7 @@ private:
     std::unique_ptr<nvinfer1::IRuntime> mRuntime{nullptr};
     std::unique_ptr<nvinfer1::ICudaEngine> mEngine{nullptr};
     std::unique_ptr<nvinfer1::IExecutionContext> mContext{nullptr};
+    std::unique_ptr<ExternalWeightManager> mExternalWeights{nullptr};
 
     rt::Tensor mNoiseTrajectoryDevice;
     rt::Tensor mNoiseTrajectoryHost;

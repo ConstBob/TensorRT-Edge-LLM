@@ -47,61 +47,44 @@ void incrementLengthTensor(rt::Tensor& lengthTensor, int32_t increment, cudaStre
 //! \throws std::runtime_error if tensor has wrong location, shape or data type
 void incrementLengthTensor(rt::Tensor& lengthTensor, rt::Tensor const& newIncrementTensor, cudaStream_t stream);
 
-//! \brief Single-layer variant: instantiate KV cache for one layer from a saved tensor.
-//!
-//! \param[in,out] dstKVCacheLayer  [maxBatchSize, 2, numKVHeads, maxSequenceLength, headDim]
-//! \param[in] srcKVCacheTensor     [2, numKVHeads, sequenceLength, headDim]
-//! \param[in] batchIdx Target batch index in the destination buffer
-//! \param[in] stream CUDA stream
-void instantiateKVCacheLayerFromTensor(
-    rt::Tensor& dstKVCacheLayer, rt::Tensor const& srcKVCacheTensor, int32_t batchIdx, cudaStream_t stream);
-
-//! \brief Single-layer variant: save KV cache for one layer into a tensor.
-//!
-//! \param[out] dstKVCacheTensor    [2, numKVHeads, sequenceLength, headDim]
-//! \param[in] srcKVCacheLayer      [maxBatchSize, 2, numKVHeads, maxSequenceLength, headDim]
-//! \param[in] batchIdx Source batch index in the buffer
-//! \param[in] stream CUDA stream
-void saveKVCacheLayerIntoTensor(
-    rt::Tensor& dstKVCacheTensor, rt::Tensor const& srcKVCacheLayer, int32_t batchIdx, cudaStream_t stream);
-
 /// @brief Batched save: copy multiple layers' KV cache into per-layer tensors in a single launch.
-/// All layers must share the same headDim. srcLayerInfos[i].data points to a two-pool NHD
-/// [2, maxBatch, capPadded, numKVHeads_i, headDim] pool; dstLayerInfos[i].data points to a
-/// [2, seqLen, numKVHeads_i, headDim] saved tensor (K plane then V plane).
+/// All layers must share the same headDim. srcLayerInfos[i].data points to the canonical
+/// [2, numPages, kTOKENS_PER_PAGE, numKVHeads_i, headDim] page pool; active-slot rows have
+/// capPadded tokens. dstLayerInfos[i].data points to a [2, seqLen, numKVHeads_i, headDim]
+/// saved tensor (K plane then V plane).
 /// @param srcLayerInfos  [numLayers] GPU array — source cache pools
 /// @param dstLayerInfos  [numLayers] GPU array — destination saved tensors
 /// @param numLayers      Number of layers in this batch
 /// @param headDim        Head dimension (same for all layers)
-/// @param maxBatchSize   Allocation batch of the source cache (V-half offset = maxBatchSize*capPadded*H*D)
+/// @param kvPoolPages    Physical K-page count of the source cache (V-half offset = kvPoolPages*128*H*D)
 /// @param batchIdx       Batch index to save from
 /// @param sequenceLength Number of tokens to copy
 /// @param stream         CUDA stream
 void saveKVCacheBatched(KVLayerInfo const* srcLayerInfos, KVLayerInfo const* dstLayerInfos, int32_t numLayers,
-    int32_t headDim, int32_t maxBatchSize, int32_t batchIdx, int32_t sequenceLength, cudaStream_t stream);
+    int32_t headDim, int32_t kvPoolPages, int32_t batchIdx, int32_t sequenceLength, cudaStream_t stream);
 
 /// @brief Batched restore: load multiple layers' KV cache from per-layer tensors in a single launch.
 /// All layers must share the same headDim. srcLayerInfos[i].data points to a [2, seqLen, numKVHeads_i,
-/// headDim] saved tensor (K plane then V plane); dstLayerInfos[i].data points to a two-pool NHD
-/// [2, maxBatch, capPadded, numKVHeads_i, headDim] pool.
+/// headDim] saved tensor (K plane then V plane); dstLayerInfos[i].data points to the canonical
+/// [2, numPages, kTOKENS_PER_PAGE, numKVHeads_i, headDim] page pool.
 /// @param dstLayerInfos  [numLayers] GPU array — destination cache pools
 /// @param srcLayerInfos  [numLayers] GPU array — source saved tensors
 /// @param numLayers      Number of layers in this batch
 /// @param headDim        Head dimension (same for all layers)
-/// @param maxBatchSize   Allocation batch of the destination cache (V-half offset = maxBatchSize*capPadded*H*D)
+/// @param kvPoolPages    Physical K-page count of the destination cache (V-half offset = kvPoolPages*128*H*D)
 /// @param batchIdx       Batch index to restore into
 /// @param sequenceLength Number of tokens to copy
 /// @param stream         CUDA stream
 void instantiateKVCacheBatched(KVLayerInfo const* dstLayerInfos, KVLayerInfo const* srcLayerInfos, int32_t numLayers,
-    int32_t headDim, int32_t maxBatchSize, int32_t batchIdx, int32_t sequenceLength, cudaStream_t stream);
+    int32_t headDim, int32_t kvPoolPages, int32_t batchIdx, int32_t sequenceLength, cudaStream_t stream);
 
 //! \brief Gathers logical pages 0..ceil(seqLen/128) of every slot from a paged K/V page pool into dense
-//! split K/V workspaces, for FMHA_v2-style / FFPA consumers that require a contiguous [B, seqLen, H, D]
-//! FP16 view. The destination is ALWAYS FP16 (half): an FP8 pool is dequantized with the K/V scales so
-//! the downstream `dataPointer<half>()` consumers never reinterpret FP8 bytes as half.
+//! split K/V workspaces, for FMHA-v2 FP8, padding, and vision-block consumers that require a contiguous
+//! [B, seqLen, H, D] FP16 view. The destination is ALWAYS FP16 (half): an FP8 pool is dequantized with the
+//! K/V scales, so downstream `dataPointer<half>()` consumers never reinterpret FP8 bytes as half.
 //!
-//! `pool` is a single flat page array (the Task-1 [2, maxBatch, capPadded, H, D] allocation
-//! reinterpreted as pages); per KVPageTable's convention, V page ids are always K page id + numPages,
+//! `pool` is a single flat page array representing the canonical [2, numPages, 128, H, D] pool;
+//! per KVPageTable's convention, V page ids are always K page id + numPages,
 //! so both halves index directly into the same `pool` base -- there is no separate V-half pointer.
 //!
 //! Bad-page semantics: any page-table entry of -1 (unmapped) zero-fills its destination span, whether

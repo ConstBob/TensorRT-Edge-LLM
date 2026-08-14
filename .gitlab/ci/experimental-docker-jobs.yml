@@ -4,20 +4,19 @@
 
 l0_experimental_docker_jedha:
   stage: l0_test
+  extends:
+    - .device_controller_environment
+    - .ci_internal_submodules
   needs:
     - job: build_cutedsl_docker_matrix
       artifacts: true
   tags:
     - jedha-edgellm-nvks
-  image: "ubuntu:24.04"
   variables:
     BOARD_USER: "tensorrt_user"
     BOARD_IP: "192.168.55.1"
     REMOTE_WORKSPACE: "/home/tensorrt_user/tensorrt-edge-llm-docker-${CI_PIPELINE_ID}-${CI_JOB_ID}"
     EXPERIMENTAL_DOCKER_IMAGE: "tensorrt-edge-llm:experimental-${CI_COMMIT_SHORT_SHA}"
-  before_script:
-    - apt-get update -qq
-    - apt-get install -y -qq --no-install-recommends openssh-client sshpass rsync
   script:
     - echo "Pipeline start time:$(date)"
     - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
@@ -25,11 +24,14 @@ l0_experimental_docker_jedha:
   after_script:
     - bash .gitlab/ci/scripts/experimental_docker_board.sh cleanup || true
     - echo "Pipeline end time:$(date)"
+    - !reference [.cleanup_engine_storage, after_script]
     - !reference [.record_runner_usage, after_script]
   rules:
     - if: $L1 == "true"
       when: never
-    - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
+    # Stability must test TOT even when an MR requests [skip tests].
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $L0_STABILITY == "true"
+    - if: $EDGE_LLM_SKIP_TESTS == "true"
       when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       changes:

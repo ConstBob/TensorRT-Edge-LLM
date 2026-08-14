@@ -67,6 +67,33 @@ __global__ void buildMarlinIndicesKernel(int32_t const* slotsByExpertWorkspace, 
     }
 }
 
+// Build the degenerate Marlin routing arrays for a dense (single-expert, topK=1) GEMM.
+__global__ void buildDenseMarlinIndicesKernel(int32_t* sortedTokenIds, int32_t* expertIds, int32_t* numTokensPostPadded,
+    float* topkWeights, int32_t numTokens, int32_t paddedRows, int32_t moeBlockSize)
+{
+    int32_t const idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t const stride = gridDim.x * blockDim.x;
+
+    // sortedTokenIds is the identity map with padded-tail slots masked by the out-of-range sentinel numTokens
+    // (== numTokens*topK for topK=1). topkWeights is filled with 1.0f only to keep the shared Marlin signature valid.
+    for (int32_t i = idx; i < paddedRows; i += stride)
+    {
+        sortedTokenIds[i] = i < numTokens ? i : numTokens;
+        topkWeights[i] = 1.0f;
+    }
+
+    int32_t const numBlocks = paddedRows / moeBlockSize;
+    for (int32_t b = idx; b < numBlocks; b += stride)
+    {
+        expertIds[b] = 0;
+    }
+
+    if (idx == 0)
+    {
+        numTokensPostPadded[0] = paddedRows;
+    }
+}
+
 namespace
 {
 
@@ -147,6 +174,16 @@ void launchBuildMarlinIndicesKernel(int32_t const* slotsByExpertWorkspace, int32
     buildMarlinIndicesKernel<<<numExperts, 256, 0, stream>>>(slotsByExpertWorkspace, slotsPerExpertWorkspace,
         paddedCounts, paddedOffsets, topkWeights, sortedTokenIds, topkWeightsFlat, expertIds, numTokens, topK,
         numExperts, moeBlockSize);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launchBuildDenseMarlinIndicesKernel(int32_t* sortedTokenIds, int32_t* expertIds, int32_t* numTokensPostPadded,
+    float* topkWeights, int32_t numTokens, int32_t paddedRows, int32_t moeBlockSize, cudaStream_t stream)
+{
+    constexpr int32_t kThreadsPerBlock = 256;
+    int32_t const grid = static_cast<int32_t>(trt_edgellm::divUp(std::max(paddedRows, 1), kThreadsPerBlock));
+    buildDenseMarlinIndicesKernel<<<grid, kThreadsPerBlock, 0, stream>>>(
+        sortedTokenIds, expertIds, numTokensPostPadded, topkWeights, numTokens, paddedRows, moeBlockSize);
     CUDA_CHECK(cudaGetLastError());
 }
 

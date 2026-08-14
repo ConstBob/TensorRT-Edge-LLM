@@ -40,53 +40,6 @@ namespace trt_edgellm
 {
 namespace builder
 {
-#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 13)
-namespace
-{
-
-void appendLunowudFlag(std::string& flags, std::string const& flag)
-{
-    if (flags.find(flag) != std::string::npos)
-    {
-        return;
-    }
-    if (!flags.empty())
-    {
-        flags += ' ';
-    }
-    flags += flag;
-}
-
-std::string applyMyelinCompileWorkarounds(int32_t maxBatchSize)
-{
-    std::string lunowudFlags;
-    char const* existingLunowud = std::getenv("__LUNOWUD");
-    if (existingLunowud)
-    {
-        lunowudFlags = existingLunowud;
-    }
-#if NV_TENSORRT_MAJOR == 10 && (NV_TENSORRT_MINOR == 13 || NV_TENSORRT_MINOR == 14)
-    appendLunowudFlag(lunowudFlags, "-peep:match_dual_gemm=off");
-#endif
-#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 15)
-    appendLunowudFlag(lunowudFlags, "-mlir:autotune:num_threads=1");
-    appendLunowudFlag(lunowudFlags, "-mlir:collective:fp4=off");
-    appendLunowudFlag(lunowudFlags, "-cask_fusion:async_policy=1");
-    if (maxBatchSize == 1)
-    {
-        appendLunowudFlag(lunowudFlags, "-peep:fc_h_fusion=off");
-    }
-#endif
-    if (existingLunowud || !lunowudFlags.empty())
-    {
-        setenv("__LUNOWUD", lunowudFlags.c_str(), 1);
-    }
-    return lunowudFlags;
-}
-
-} // namespace
-#endif
-
 namespace
 {
 
@@ -112,8 +65,8 @@ bool isSpecDecodeDraft(Json const& config, char const* type)
 
 bool isValidSpecDecodeType(std::string const& type)
 {
-    return type == "none" || type == "mtp" || type == "eagle3" || type == "dflash" || type == "dspark"
-        || type == "gemma4_mtp";
+    return type == "none" || type == "mtp" || type == "eagle3" || type == "dflash" || type == "jetspec"
+        || type == "dspark" || type == "gemma4_mtp";
 }
 
 bool isValidEngineRole(std::string const& role)
@@ -170,13 +123,11 @@ bool LLMBuilder::build()
     std::string trtVersion = std::to_string(NV_TENSORRT_MAJOR) + "." + std::to_string(NV_TENSORRT_MINOR) + "."
         + std::to_string(NV_TENSORRT_PATCH);
     LOG_INFO("Using TRT_VERSION=%s", trtVersion.c_str());
-#if NV_TENSORRT_MAJOR >= 11 || NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 13
-    std::string const lunowudFlags = applyMyelinCompileWorkarounds(mBuilderConfig.maxBatchSize);
+    std::string const lunowudFlags = applyCompileWorkarounds(mBuilderConfig.maxBatchSize);
     if (!lunowudFlags.empty())
     {
         LOG_INFO("Using __LUNOWUD=%s", lunowudFlags.c_str());
     }
-#endif
 
     // Load plugin library
     auto pluginHandles = loadEdgellmPluginLib();
@@ -184,6 +135,23 @@ bool LLMBuilder::build()
     // Parse model config
     if (!parseConfig())
     {
+        return false;
+    }
+
+    int64_t const minimumActivePages
+        = rt::computeMinimumKvPoolPages(mBuilderConfig.maxBatchSize, mBuilderConfig.maxKVCacheCapacity);
+    int64_t const kvPoolPages = mBuilderConfig.resolvedKVPoolPages();
+    bool const hasExtraRetainedPages = kvPoolPages > minimumActivePages;
+    std::string const mode = specDecodeType(mModelConfig);
+    bool const supportsCrossRequestRetention
+        = mNbKVCacheInputs > 0 && (mode == "none" || (mode == "eagle3" && mNumLinearAttnLayers == 0));
+    if (hasExtraRetainedPages && !supportsCrossRequestRetention)
+    {
+        LOG_ERROR(
+            "maxKVPoolPages=%ld adds extra retained pages for cross-request retention, but the engine configuration "
+            "(engine_role=%s, spec_decode_type=%s, num_linear_attn_layers=%d) does not support cross-request "
+            "retention. Use maxKVPoolPages=0 (resolved minimum active pages=%ld).",
+            kvPoolPages, engineRole(mModelConfig).c_str(), mode.c_str(), mNumLinearAttnLayers, minimumActivePages);
         return false;
     }
 
@@ -212,33 +180,6 @@ bool LLMBuilder::build()
     if (!parser)
     {
         return false;
-    }
-
-    // DFlash/DSpark drafts use DFlashTargetKVCacheUpdate, which needs pages_per_slot
-    // (capPadded / kTOKENS_PER_PAGE) to split its pool-shaped past_key_value binding's
-    // numPages back into (maxBatch, cap). That fact is builder-only
-    // (mBuilderConfig.maxKVCacheCapacity), unavailable at ONNX-export time, and this
-    // plugin's concrete class is intentionally not linked into the builder (plugins are
-    // opaque .so modules, loaded via EDGELLM_PLUGIN_PATH -- see common/trtUtils.h).
-    // Resolve the plugin's exported configuration hook via dlsym on the already-loaded
-    // handle instead of adding a new link dependency.
-    if (isSpecDecodeDraft(mModelConfig, "dflash") || isSpecDecodeDraft(mModelConfig, "dspark"))
-    {
-        using ConfigurePagesPerSlotFn = bool (*)(nvinfer1::INetworkDefinition*, int32_t);
-        auto* configureFn = reinterpret_cast<ConfigurePagesPerSlotFn>(
-            dlsym(pluginHandles.get(), "edgellm_dflash_configure_pages_per_slot"));
-        if (configureFn == nullptr)
-        {
-            LOG_ERROR(
-                "Failed to resolve edgellm_dflash_configure_pages_per_slot from the plugin library: %s", dlerror());
-            return false;
-        }
-        int32_t const pagesPerSlot = rt::computeMaxPagesPerSeq(static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
-        if (!configureFn(network.get(), pagesPerSlot))
-        {
-            LOG_ERROR("Failed to configure DFlashTargetKVCacheUpdate plugin pages_per_slot=%d", pagesPerSlot);
-            return false;
-        }
     }
 
     // Print network information
@@ -375,7 +316,8 @@ bool LLMBuilder::parseConfig()
     std::string const role = engineRole(mModelConfig);
     if (!isValidSpecDecodeType(specType))
     {
-        LOG_ERROR("Invalid spec_decode_type='%s'. Expected one of: none, mtp, eagle3, dflash, dspark, gemma4_mtp.",
+        LOG_ERROR(
+            "Invalid spec_decode_type='%s'. Expected one of: none, mtp, eagle3, dflash, jetspec, dspark, gemma4_mtp.",
             specType.c_str());
         return false;
     }
@@ -423,7 +365,8 @@ bool LLMBuilder::parseConfig()
         mTargetModelOutputHiddenDim = mHiddenSize;
     }
     else if ((isSpecDecodeDraft(mModelConfig, "eagle3") || isSpecDecodeDraft(mModelConfig, "dflash")
-                 || isSpecDecodeDraft(mModelConfig, "dspark") || isSpecDecodeDraft(mModelConfig, "gemma4_mtp"))
+                 || isSpecDecodeDraft(mModelConfig, "jetspec") || isSpecDecodeDraft(mModelConfig, "dspark")
+                 || isSpecDecodeDraft(mModelConfig, "gemma4_mtp"))
         && mModelConfig.contains("base_model_hidden_size"))
     {
         mTargetModelOutputHiddenDim = mModelConfig["base_model_hidden_size"].get<int32_t>();
@@ -492,8 +435,22 @@ bool LLMBuilder::parseConfig()
     mConvDim = mModelConfig.value("conv_dim", 0);
     mConvKernel = mModelConfig.value("conv_kernel", 0);
 
-    // For hybrid models, only attention layers have KV caches
-    if (mNumLinearAttnLayers > 0)
+    // Only attention layers own a KV cache. Prefer the authoritative
+    // per-attention-layer kv_layer_configs count; it is the only signal that is
+    // correct for hybrid drafts whose non-attention layers are neither mamba nor
+    // linear-attention (e.g. the MTP attention+MoE draft, num_linear_attn == 0).
+    if (mModelConfig.contains("kv_layer_configs") && mModelConfig["kv_layer_configs"].is_array())
+    {
+        mNbKVCacheInputs = 0;
+        for (auto const& layerConfig : mModelConfig["kv_layer_configs"])
+        {
+            if (layerConfig.is_object())
+            {
+                ++mNbKVCacheInputs;
+            }
+        }
+    }
+    else if (mNumLinearAttnLayers > 0)
     {
         mNbKVCacheInputs = mModelConfig.value("num_attention_layers", mModelConfig["num_hidden_layers"].get<int32_t>());
     }
@@ -553,12 +510,12 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
 
     bool result = true;
 
-    if (isSpecDecodeDraft(mModelConfig, "dflash"))
+    if (isSpecDecodeDraft(mModelConfig, "dflash") || isSpecDecodeDraft(mModelConfig, "jetspec"))
     {
         result &= setupDFlashDraftProfiles(*contextProfile, *generationProfile);
         if (!result)
         {
-            LOG_ERROR("Failed to setup DFlash draft optimization profiles");
+            LOG_ERROR("Failed to setup DFlash/JetSpec draft optimization profiles");
             return false;
         }
         LOG_DEBUG("%s", printOptimizationProfile(contextProfile, "context_profile", &network).c_str());
@@ -616,9 +573,9 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
         result &= setupVanillaProfiles(*contextProfile, *generationProfile);
     }
 
-    // Setup hybrid state profiles for MTP/DFlash/DSpark base models.
+    // Setup hybrid state profiles for MTP/DFlash/JetSpec/DSpark base models.
     if (isSpecDecodeBase(mModelConfig, "mtp") || isSpecDecodeBase(mModelConfig, "dflash")
-        || isSpecDecodeBase(mModelConfig, "dspark"))
+        || isSpecDecodeBase(mModelConfig, "jetspec") || isSpecDecodeBase(mModelConfig, "dspark"))
     {
         result &= setupIntermediateRecurrentStateProfiles(*contextProfile, *generationProfile);
         result &= setupIntermediateConvStateProfiles(*contextProfile, *generationProfile);
@@ -943,8 +900,7 @@ bool LLMBuilder::setupDFlashDraftProfiles(
         // kvcache_start_index: [batch]
         ok &= setOptimizationProfile(&profile, binding_names::kKVCacheStartIndex, createDims({1}),
             createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
-        // kv_page_table: [batch, 2, maxPagesPerSeq] int32. Proposal self-attention's page
-        // table (default identity); the draft's own KV cache above has no page table.
+        // kv_page_table: [batch, 2, maxPagesPerSeq] int32 for proposal self-attention and target-KV updates.
         int32_t const maxPagesPerSeq
             = rt::computeMaxPagesPerSeq(static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
         ok &= setOptimizationProfile(&profile, binding_names::kKVPageTable, createDims({1, 2, maxPagesPerSeq}),
@@ -961,14 +917,10 @@ bool LLMBuilder::setupDFlashDraftProfiles(
         ok &= setOptimizationProfile(&profile, binding_names::kAttentionPosId, createDims({1, 1}),
             createDims({mBuilderConfig.maxBatchSize, optDraftTokens}),
             createDims({mBuilderConfig.maxBatchSize, maxDraftTokens}));
-        // KV cache per-layer: DFlash's own combined draft cache, now unified on the paged-pool
-        // contract shared with the AttentionPlugin binding: [2, numPages, kTOKENS_PER_PAGE,
+        // DFlash draft KV cache uses the paged-pool contract shared with the AttentionPlugin binding:
+        // [2, numPages, kTOKENS_PER_PAGE,
         // numKVHeads, headDim] (single fixed numPages value, same as setupKVCacheProfiles).
-        // DFlashTargetKVCacheUpdatePlugin recovers maxBatch/cap at enqueue time from numPages and
-        // the pages_per_slot attribute the builder configures via edgellm_dflash_configure_pages_per_slot
-        // (see build()); this cache still has no page table of its own.
-        int64_t const numPages = rt::computeKvPoolFloorPages(
-            static_cast<int32_t>(mBuilderConfig.maxBatchSize), static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
+        int64_t const numPages = mBuilderConfig.resolvedKVPoolPages();
         for (int32_t i = 0; i < mNbKVCacheInputs; ++i)
         {
             int64_t layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
@@ -1037,8 +989,7 @@ bool LLMBuilder::setupGemma4MTPDraftProfiles(nvinfer1::IOptimizationProfile& con
         // KV cache per-layer: the assistant binds the TARGET model's paged pool tensors
         // directly ([2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim]), so the profile
         // uses the same fixed page count as the target's setupKVCacheProfiles.
-        int64_t const numPages = rt::computeKvPoolFloorPages(
-            static_cast<int32_t>(mBuilderConfig.maxBatchSize), static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
+        int64_t const numPages = mBuilderConfig.resolvedKVPoolPages();
         for (int i = 0; i < mNbKVCacheInputs; ++i)
         {
             int64_t const layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
@@ -1099,7 +1050,7 @@ bool LLMBuilder::setupDSparkDraftProfiles(
         ok &= setOptimizationProfile(&profile, binding_names::kKVCacheStartIndex, createDims({1}),
             createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
         // kv_page_table: [batch, 2, maxPagesPerSeq] int32. Proposal self-attention's page
-        // table (default identity); the draft's own KV cache above has no page table.
+        // table for proposal self-attention and target-KV updates.
         int32_t const maxPagesPerSeq
             = rt::computeMaxPagesPerSeq(static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
         ok &= setOptimizationProfile(&profile, binding_names::kKVPageTable, createDims({1, 2, maxPagesPerSeq}),
@@ -1118,11 +1069,7 @@ bool LLMBuilder::setupDSparkDraftProfiles(
             createDims({mBuilderConfig.maxBatchSize, maxDraftTokens}));
         // KV cache per-layer: DSpark's own combined draft cache uses the same paged-pool
         // contract as AttentionPlugin: [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim].
-        // DFlashTargetKVCacheUpdatePlugin recovers maxBatch/cap at enqueue time from numPages
-        // and the pages_per_slot attribute configured above; this cache still has no page table
-        // of its own.
-        int64_t const numPages = rt::computeKvPoolFloorPages(
-            static_cast<int32_t>(mBuilderConfig.maxBatchSize), static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
+        int64_t const numPages = mBuilderConfig.resolvedKVPoolPages();
         for (int32_t i = 0; i < mNbKVCacheInputs; ++i)
         {
             int64_t layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
@@ -1268,7 +1215,7 @@ bool LLMBuilder::setupLmHeadWeightProfiles(nvinfer1::IOptimizationProfile& conte
 {
     bool result = true;
 
-    // Detect if lm_head_weight input exists (CodePredictor model)
+    // Detect if lm_head_weight input exists (gemma4 assistant)
     bool hasLmHeadWeight = false;
     for (int32_t idx = 0; idx < network.getNbInputs(); idx++)
     {
@@ -1389,14 +1336,13 @@ bool LLMBuilder::setupKVCacheProfiles(
 {
     bool result = true;
     // Plugin path: paged pool binding [2, numPages, kTOKENS_PER_PAGE, num_kv_heads, head_dim].
-    // numPages is fixed at the active-capacity floor (maxBatchSize * ceil(maxKVCacheCapacity /
-    // kTOKENS_PER_PAGE)) for the life of the engine — it is not resized per inference step.
+    // numPages is the exact engine-authoritative pool count for the life of the engine.
+    // maxKVPoolPages=0 resolves to the minimum active pages; a larger supported value adds pages retained
+    // across requests.
     // "Empty vs non-empty" cache is conveyed by kvcache_start_index's own profile, not by this
     // tensor's shape (the plugin reads numPages from dims.d[1], so the binding must always be
-    // pool-shaped). Retention headroom beyond the floor is a follow-up that accepts a full
-    // engine rebuild (owner decision, 2026-07-05).
-    int64_t const numPages = rt::computeKvPoolFloorPages(
-        static_cast<int32_t>(mBuilderConfig.maxBatchSize), static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
+    // pool-shaped).
+    int64_t const numPages = mBuilderConfig.resolvedKVPoolPages();
     for (int i = 0; i < mNbKVCacheInputs; ++i)
     {
         // Per-layer dims mirror the runtime registry (kv_layer_configs): head size varies on
@@ -1536,7 +1482,8 @@ bool LLMBuilder::setupIntermediateConvStateProfiles(
         result &= setOptimizationProfile(&generationProfile, name.c_str(), minGenShape, optGenShape, maxGenShape);
     }
 
-    LOG_DEBUG("Set up intermediate conv state profiles for %d recurrent layers (MTP/DFlash)", mNumLinearAttnLayers);
+    LOG_DEBUG(
+        "Set up intermediate conv state profiles for %d recurrent layers (MTP/DFlash/JetSpec)", mNumLinearAttnLayers);
     return result;
 }
 
@@ -1550,7 +1497,7 @@ bool LLMBuilder::setupLinearAttentionSpecVerifyProfiles(nvinfer1::IOptimizationP
 
     if (!hasInputBinding(network, binding_names::kSpecVerifyPhaseMarker))
     {
-        LOG_ERROR("Hybrid MTP/DFlash base engine is missing input '%s'. Re-export the ONNX model.",
+        LOG_ERROR("Hybrid MTP/DFlash/JetSpec base engine is missing input '%s'. Re-export the ONNX model.",
             binding_names::kSpecVerifyPhaseMarker);
         return false;
     }
@@ -1769,7 +1716,8 @@ bool LLMBuilder::copyTokenizerFiles()
 
 bool LLMBuilder::copyEagleFiles()
 {
-    // Copy d2t.safetensors for Eagle3 draft models only. MTP/DFlash drafts share vocab with base and have no d2t.
+    // Copy d2t.safetensors for Eagle3 draft models only. MTP/DFlash/JetSpec drafts share vocab with base and have no
+    // d2t.
     if (isSpecDecodeDraft(mModelConfig, "eagle3"))
     {
         std::string const d2tPath = (mOnnxDir / "d2t.safetensors").string();

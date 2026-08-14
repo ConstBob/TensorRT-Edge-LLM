@@ -17,8 +17,11 @@
 
 #pragma once
 
+#include "kernels/decodeAttentionKernels/decoderXQAJitCompiler.h"
+
 #include <NvInferRuntime.h>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <optional>
 #include <string>
@@ -44,13 +47,6 @@ enum class ContextFMHABackend
 //!
 //! This plugin implements efficient attention mechanisms including context attention (prefill)
 //! and decode attention with KV cache support.
-//!
-//! BREAKING ABI NOTE (paged-KV substrate): this plugin's required input count changed from 7 to 8
-//! (added `kv_page_table`, see kIN_KV_PAGE_TABLE_IDX) and the tree-attention optional inputs shifted
-//! accordingly. The plugin version string was deliberately NOT bumped -- this project always
-//! regenerates ONNX and rebuilds engines together with the runtime, so an ABI break here is
-//! accepted rather than versioned. Any ONNX/engine older than this change must be re-exported and
-//! rebuilt; it will not load correctly against this plugin.
 class AttentionPlugin : public nvinfer1::IPluginV3,
                         public nvinfer1::IPluginV3OneCore,
                         public nvinfer1::IPluginV3OneBuildV2,
@@ -115,9 +111,23 @@ public:
 
     void setPluginNamespace(char const* pluginNamespace) noexcept;
 
+    //! \brief NVRTC-compile the XQA decode kernels this layer needs and stage them for serialization.
+    //! \note No-op when the configuration has no XQA decode kernel; the layer may still be
+    //!       served by a prefill-only backend.
+    void compileXQAJitKernelForBuild();
+
+    //! \brief Register every serialized XQA kernel under the key it was compiled for.
+    void loadSerializedXQAJitKernel();
+
+    //! \brief Whether the engine carried any serialized XQA JIT kernel for this layer.
+    bool hasSerializedXQAJitKernels() const noexcept
+    {
+        return !mXqaJitKernels.empty();
+    }
+
 private:
-    //! Produce split K/V FP16 for prefill consumers that cannot read the paged pool directly
-    //! (FMHA-v2 CuTe DSL cache-readback paths and FFPA d512). Always device-gathers the page table into
+    //! Produce split K/V FP16 for independent prefill consumers that cannot read the paged pool directly
+    //! (FMHA-v2 FP8, padding, and vision-block). Always device-gathers the page table into
     //! @p workspacePtr
     //! (no in-place alias): the gather follows any page table (identity or scrambled) correctly
     //! and identically in debug and release, and dequantizes an FP8 pool to FP16 using @p kScale /
@@ -139,22 +149,10 @@ private:
     int32_t enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream);
 
-    //! Launch the CuTe DSL FFPA d512 causal attention kernel with per-batch varlen masking.
-    void dispatchFFPAKernel(half const* q, half const* k, half const* v, half* o, int32_t const* cuSeqLenQ,
-        int32_t const* cuSeqLenK, int32_t batchSize, int32_t seqlenQ, int32_t seqlenK, cudaStream_t stream);
+    //! Whether the paged CuTe DSL D512 bidirectional-mask prefill kernel is available.
+    bool canUseCuteDslBidirectionalForPrefill() const noexcept;
 
-    //! Prefill routing under vision-block attention: the FFPA d512
-    //! vision-block overlay kernel serves full-causal headSize=512 layers;
-    //! sliding d256 layers use FMHA-v2 CuTe DSL. There is no fallback:
-    //! enforceVisionBlockKernelSupport() makes the required kernel explicit.
-    bool canUseFFPAOverlayForVisionPrefill() const noexcept;
-
-    //! Hard construction-time validation of the vision-block kernel set:
-    //! FFPA d512 vision-block overlay (full-causal d512 prefill), FMHA-v2
-    //! CuTe DSL d256, plus XQA decode.
-    //! Throws (via ELLM_CHECK) naming the missing kernel/artifact and the SM
-    //! — vision-block attention has no fallback path, so a clear build/
-    //! load-time error beats a silently wrong deployment.
+    //! Validate that a vision-block prefill backend and XQA decode backend are available.
     void enforceVisionBlockKernelSupport() const;
 
     //! Resolve one qk_norm gamma engine-weight input to a device pointer
@@ -163,6 +161,9 @@ private:
         nvinfer1::PluginTensorDesc const* inputDesc, void const* const* inputs, int32_t inputIdx) const;
 
 protected:
+    trt_edgellm::XQAJitKey getXQAJitKey() const noexcept;
+    bool canCompileXQAJitKernel() const noexcept;
+
     std::string mLayerName; //!< Plugin layer name
     std::string mNamespace; //!< Plugin namespace
 
@@ -212,21 +213,25 @@ protected:
 
     ContextFMHABackend mContextFMHABackend{ContextFMHABackend::kNONE};
 
+    //! NVRTC-compiled XQA decode kernels, each paired with the key it was compiled for.
+    //! One entry for a plain decode layer, two when tree attention also needs a spec-decode kernel.
+    std::vector<trt_edgellm::XQAJitKernel> mXqaJitKernels;
+    //! Serialized form of mXqaJitKernels. Held as a member because getFieldsToSerialize
+    //! hands TensorRT a pointer into it.
+    std::vector<uint8_t> mXqaJitBlob;
+
     //! Whether FMHA context kernels are available for this configuration.
     bool mCanImplementFMHA{true};
 
-    //! Whether FFPA d512 causal kernel is available for headSize=512 context attention.
-    bool mCanImplementFFPA{false};
+    //! Whether the FP16 D512 paged CuTe DSL bidirectional-mask kernel is available.
+    bool mCanImplementCuteDslBidirectionalFMHA{false};
 
-    //! Whether the FMHA-v2 CuTe DSL d256 vision-block context variant is active.
+    //! Whether the FMHA-v2 CuTe DSL d256/d512 vision-block context variant is active.
     bool mUseFMHAV2VisionBlockFMHA{false};
 
-    //! Whether the selected CuTe DSL backend has loaded a dense PADDING context
+    //! Whether the selected CuTe DSL backend supports a dense PADDING context
     //! kernel for runtime-selected non-causal DiffusionGemma denoise attention.
     bool mCanImplementPaddingFMHA{false};
-
-    //! Whether XQA decode kernels are available.
-    bool mCanImplementXQA{false};
 
     std::vector<nvinfer1::PluginField> mDataToSerialize;
     nvinfer1::PluginFieldCollection mFCToSerialize{};

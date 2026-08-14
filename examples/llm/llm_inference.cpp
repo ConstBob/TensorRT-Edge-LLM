@@ -21,18 +21,20 @@
 #include "common/trtUtils.h"
 #include "common/utf8.h"
 #include "memoryMonitor.h"
-#include "multimodal/code2WavRunner.h"
+#include "multimodal/qwen3_omni/code2WavRunner.h"
 #include "profileFormatter.h"
 #include "profiling/metrics.h"
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
 #include "requestFileParser.h"
+#include "runtime/config/llmEngineConfig.h"
 #include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/qwen3OmniTTSRuntime.h"
 #include "runtime/streaming.h"
 #include "tokenizer/tokenizer.h"
 #include <algorithm>
+#include <charconv>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -40,8 +42,11 @@
 #include <iomanip>
 #include <iostream>
 #include <nlohmann/json.hpp>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -78,7 +83,18 @@ enum LLMInferenceOptionId : int
     DSPARK_SCHEDULER = 923,
     DSPARK_CONFIDENCE_THRESHOLD = 924,
     DSPARK_MIN_PROPOSAL_LEN = 925,
-    DSPARK_MAX_PROPOSAL_LEN = 926
+    DSPARK_MAX_PROPOSAL_LEN = 926,
+    ENABLE_CONTEXT_REUSE = 927,
+    CONTEXT_CACHE_MAX_RECORDS = 928,
+    CONTEXT_CACHE_RECURRENT_SNAPSHOT_POOL_BYTES = 929,
+    CONTEXT_CACHE_PARTIAL_KV_SNAPSHOT_POOL_BYTES = 930,
+    CHECKPOINT_DIR = 931,
+    DRAFT_CHECKPOINT_DIR = 932,
+    VISUAL_PRUNE = 933,
+    DART_REDUCTION_RATIO = 934,
+    DART_PIVOT_IMAGE_TOKENS = 935,
+    DART_PIVOT_TEXT_TOKENS = 936,
+    VISUAL_PRUNE_ALGO = 937
 };
 
 // Struct to hold speculative decoding arguments (used by both EAGLE and MTP)
@@ -90,13 +106,16 @@ struct SpecDecodeArgs
     // For tree-based strategies this is the branching factor; for chain-style
     // strategies it is the number of candidates retained per draft step.
     int32_t draftTopK{10};
+    bool draftTopKSet{false};
 
     // Number of drafting steps to perform with the draft model.
     // Each step extends the current draft proposal.
     int32_t draftStep{6};
+    bool draftStepSet{false};
 
     // Number of tokens in the base verification input.
     int32_t verifySize{60};
+    bool verifySizeSet{false};
 
     // DFlash-only draft horizon. 0 means infer from the engine config.
     int32_t dflashBlockSize{0};
@@ -112,6 +131,8 @@ struct LLMInferenceArgs
     bool help{false};
     std::string engineDir;
     std::string multimodalEngineDir{""};
+    std::string checkpointDir{""};
+    std::string draftCheckpointDir{""};
     std::string inputFile;
     std::string outputFile{""};
     std::string profileOutputFile{""};
@@ -125,6 +146,7 @@ struct LLMInferenceArgs
     int64_t maxGenerateLength{-1}; // -1 means use value from input file
     int32_t numLogprobs{-1};       // -1 means use value from input file
     SpecDecodeArgs specDecodeArgs;
+    rt::ContextCacheConfig contextCacheConfig;
 
     // Qwen3-Omni audio output options
     bool enableAudioOutput{false};
@@ -138,6 +160,10 @@ struct LLMInferenceArgs
     float talkerTopP{1.0f};
     float talkerRepetitionPenalty{1.05f};
 
+    // Visual-token pruning (embedding-level, VLM prefill only; disabled by default).
+    // Selection algorithm defaults to "dart"; see --visualPruneAlgo.
+    rt::VisualPrunerConfig visualPrunerConfig;
+
     // Thinker-Talker streaming mode (single CUDA stream interleaved).
     // All fields below can be set either via CLI flag or the top-level
     // "streaming": { "enable", "codec_chunk_frames", "talker_prefill_threshold" }
@@ -148,6 +174,143 @@ struct LLMInferenceArgs
     int32_t talkerPrefillThreshold{4}; //!< Start Talker prefill after this many Thinker assistant tokens
 };
 
+namespace
+{
+
+std::filesystem::path getBaseConfigPath(std::string const& engineDir)
+{
+    std::filesystem::path const dir{engineDir};
+    std::filesystem::path const configPath = dir / "config.json";
+    if (std::filesystem::is_regular_file(configPath))
+    {
+        return configPath;
+    }
+    return dir / "base_config.json";
+}
+
+std::filesystem::path getDraftConfigPath(std::string const& engineDir)
+{
+    return std::filesystem::path{engineDir} / "draft_config.json";
+}
+
+int32_t maxVerifySizeOrDefault(rt::LLMEngineConfig const& config, int32_t fallback)
+{
+    return config.maxVerifyTreeSize > 0 ? config.maxVerifyTreeSize : fallback;
+}
+
+int32_t dsparkVerifySizeOrDefault(std::string const& engineDir)
+{
+    std::filesystem::path const draftConfigPath = getDraftConfigPath(engineDir);
+    if (!std::filesystem::is_regular_file(draftConfigPath))
+    {
+        return 8;
+    }
+
+    rt::LLMEngineConfig const draftConfig = rt::parseDraftEngineConfig(draftConfigPath);
+    return draftConfig.specDraftBlockSize > 0 ? draftConfig.specDraftBlockSize + 1 : 8;
+}
+
+int32_t cachedBlockDraftBlockSizeOrThrow(
+    std::string const& engineDir, rt::LLMEngineConfig const& baseConfig, int32_t explicitBlockSize)
+{
+    if (explicitBlockSize > 0)
+    {
+        return explicitBlockSize;
+    }
+
+    std::filesystem::path const draftConfigPath = getDraftConfigPath(engineDir);
+    if (std::filesystem::is_regular_file(draftConfigPath))
+    {
+        rt::LLMEngineConfig const draftConfig = rt::parseDraftEngineConfig(draftConfigPath);
+        if (draftConfig.specDraftBlockSize > 0)
+        {
+            return draftConfig.specDraftBlockSize;
+        }
+    }
+    if (baseConfig.specDraftBlockSize > 0)
+    {
+        return baseConfig.specDraftBlockSize;
+    }
+
+    throw std::runtime_error(
+        "unable to resolve DFlash/JetSpec block size from CLI, draft_config.json, or base config.");
+}
+
+bool applyEngineSpecDecodeDefaults(LLMInferenceArgs& args)
+{
+    if (!args.specDecodeArgs.enabled)
+    {
+        return true;
+    }
+
+    try
+    {
+        rt::LLMEngineConfig const baseConfig = rt::parseEngineConfig(getBaseConfigPath(args.engineDir));
+        SpecDecodeArgs& specArgs = args.specDecodeArgs;
+        switch (baseConfig.specDecodeType)
+        {
+        case rt::SpecDecodeMode::kDFlash:
+        case rt::SpecDecodeMode::kJetSpec:
+        {
+            if (!specArgs.draftTopKSet)
+            {
+                specArgs.draftTopK = 1;
+            }
+            if (!specArgs.draftStepSet)
+            {
+                specArgs.draftStep = 1;
+            }
+            int32_t const blockSize
+                = cachedBlockDraftBlockSizeOrThrow(args.engineDir, baseConfig, specArgs.dflashBlockSize);
+            if (specArgs.dflashBlockSize == 0)
+            {
+                specArgs.dflashBlockSize = blockSize;
+            }
+            if (!specArgs.verifySizeSet)
+            {
+                specArgs.verifySize = specArgs.draftTopK > 1 ? maxVerifySizeOrDefault(baseConfig, 128) : blockSize;
+            }
+            break;
+        }
+        case rt::SpecDecodeMode::kDSpark:
+            if (!specArgs.draftTopKSet)
+            {
+                specArgs.draftTopK = 1;
+            }
+            if (!specArgs.draftStepSet)
+            {
+                specArgs.draftStep = 1;
+            }
+            if (!specArgs.verifySizeSet)
+            {
+                specArgs.verifySize = dsparkVerifySizeOrDefault(args.engineDir);
+            }
+            break;
+        default: break;
+        }
+
+        bool const isCachedBlockDraft = baseConfig.specDecodeType == rt::SpecDecodeMode::kDFlash
+            || baseConfig.specDecodeType == rt::SpecDecodeMode::kJetSpec;
+        LOG_INFO("Spec decode engine mode: %s", rt::specDecodeModeName(baseConfig.specDecodeType));
+        LOG_INFO("Resolved spec draft topK: %d", specArgs.draftTopK);
+        LOG_INFO("Resolved spec draft step: %d", specArgs.draftStep);
+        LOG_INFO("Resolved spec verify size: %d", specArgs.verifySize);
+        if (isCachedBlockDraft)
+        {
+            LOG_INFO("Resolved DFlash/JetSpec block size: %d", specArgs.dflashBlockSize);
+        }
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("Failed to resolve speculative decoding defaults from engine config: %s", e.what());
+        return false;
+    }
+
+    return true;
+}
+
+} // namespace
+
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
@@ -156,16 +319,21 @@ void printUsage(char const* programName)
                  "[--dumpProfile] [--profileOutputFile=<path to profile output file>] [--warmup=<number>] [--debug] "
                  "[--dumpOutput] [--batchSize=<number>] [--maxGenerateLength=<number>] [--specDecode] "
                  "[--specDraftTopK=<number>] [--specDraftStep=<number>] "
-                 "[--specVerifySize=<number>] [--dflashBlockSize=<number>] "
+                 "[--specVerifySize=<number>] [--dflashBlockSize=<number>|--jetspecBlockSize=<number>] "
                  "[--dsparkScheduler=off|threshold|sps] "
                  "[--dsparkConfidenceThreshold=<float>] "
-                 "[--dsparkMinProposalLen=<number>] [--dsparkMaxProposalLen=<number>]"
+                 "[--dsparkMinProposalLen=<number>] [--dsparkMaxProposalLen=<number>] "
+                 "[--visualPrune] [--dartReductionRatio=<float>] "
+                 "[--dartPivotImageTokens=<number>] [--dartPivotTextTokens=<number>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --help                    Display this help message" << std::endl;
     std::cerr << "  --inputFile               Path to input JSON file with requests" << std::endl;
     std::cerr << "  --engineDir               Path to engine directory" << std::endl;
     std::cerr << "  --multimodalEngineDir     Path to multimodal engine directory (optional)" << std::endl;
+    std::cerr << "  --checkpointDir           HF/ModelOpt checkpoint dir (required for runtime weight loading)"
+              << std::endl;
+    std::cerr << "  --draftCheckpointDir      Separate checkpoint for paired speculative drafts" << std::endl;
     std::cerr << "  --outputFile              Path to output JSON file (optional)" << std::endl;
     std::cerr << "  --dumpProfile             Dump profiling summary to console" << std::endl;
     std::cerr << "  --profileOutputFile       Path to profile JSON output file (optional)" << std::endl;
@@ -179,24 +347,51 @@ void printUsage(char const* programName)
     std::cerr
         << "  --numLogprobs             Number of top log-probabilities to return per token (0 = disabled, max 50)"
         << std::endl;
-    std::cerr << "  --specDecode              Enable speculative decoding (EAGLE, MTP, or DFlash)" << std::endl;
-    std::cerr << "  --specDraftTopK           Number of tokens selected per drafting step (default: 10)" << std::endl;
-    std::cerr << "                            For DFlash: candidateTopK; 1 is linear, >1 enables branching DDTree"
+    std::cerr << "  --specDecode              Enable speculative decoding (EAGLE, MTP, DFlash, JetSpec, or DSpark)"
               << std::endl;
-    std::cerr << "  --specDraftStep           Number of drafting steps to perform (default: 6)" << std::endl;
+    std::cerr << "  --specDraftTopK           Number of tokens selected per drafting step (default: 10)" << std::endl;
+    std::cerr << "                            DFlash/JetSpec/DSpark default to 1 when omitted" << std::endl;
     std::cerr
-        << "                            Each step extends the current draft proposal; DFlash requires this to be 1"
+        << "                            For DFlash/JetSpec: candidateTopK; 1 is linear, >1 enables branching DDTree"
         << std::endl;
+    std::cerr << "  --specDraftStep           Number of drafting steps to perform (default: 6)" << std::endl;
+    std::cerr << "                            Each step extends the current draft proposal; DFlash/JetSpec/DSpark "
+                 "require this to be 1"
+              << std::endl;
     std::cerr << "  --specVerifySize          Number of tokens in the base verification input (default: 60)"
               << std::endl;
+    std::cerr
+        << "                            DFlash/JetSpec linear default to block size; DDTree defaults to base budget"
+        << std::endl;
     std::cerr << "  --dsparkScheduler         DSpark scheduler mode: off, threshold, or sps (default: off)"
               << std::endl;
     std::cerr << "  --dsparkConfidenceThreshold  DSpark threshold scheduler survival threshold in [0,1]" << std::endl;
     std::cerr << "  --dsparkMinProposalLen    DSpark scheduler minimum proposal length (default: 1)" << std::endl;
     std::cerr << "  --dsparkMaxProposalLen    DSpark scheduler maximum proposal length (default: full block)"
               << std::endl;
-    std::cerr << "  --dflashBlockSize         DFlash proposal block size; 0 means infer from engine config"
+    std::cerr << "  --dflashBlockSize         DFlash/JetSpec proposal block size; 0 means infer from engine config"
               << std::endl;
+    std::cerr << "\nContext Reuse Options:" << std::endl;
+    std::cerr << "  --enableContextReuse      Enable process-local content-addressed context reuse" << std::endl;
+    std::cerr << "  --contextCacheMaxRecords  Maximum retained context records (default: 1024)" << std::endl;
+    std::cerr << "  --contextCacheRecurrentSnapshotPoolBytes" << std::endl;
+    std::cerr << "                            Device byte budget for recurrent/conv snapshots (default: 0;"
+              << " required for hybrid reuse)" << std::endl;
+    std::cerr << "  --contextCachePartialKVSnapshotPoolBytes" << std::endl;
+    std::cerr << "                            Device byte budget for partial-KV snapshots (default: 0;"
+              << " required for hybrid attention reuse)" << std::endl;
+    std::cerr << "                            KV retention capacity is configured at build time with"
+              << " --maxKVPoolPages" << std::endl;
+    std::cerr << "\nVisual-Token Pruning Options:" << std::endl;
+    std::cerr << "  --visualPrune             Enable visual-token pruning (mRoPE VLM prefill, batch 1)" << std::endl;
+    std::cerr << "  --visualPruneAlgo         Prune selection algorithm (default: dart); custom algorithms"
+              << std::endl;
+    std::cerr << "                            can be added via rt::registerVisualPruner()" << std::endl;
+    std::cerr << "  --dartReductionRatio      Fraction of visual tokens to remove, in (0, 1) (default: 0.25)"
+              << std::endl;
+    std::cerr << "  --dartPivotImageTokens    Number of image pivot tokens for DART selection (default: 4)"
+              << std::endl;
+    std::cerr << "  --dartPivotTextTokens     Number of text pivot tokens for DART selection (default: 4)" << std::endl;
     std::cerr << "\nQwen3-Omni Audio Output Options:" << std::endl;
     std::cerr << "  --enableAudioOutput       Enable audio output from Thinker hidden states" << std::endl;
     std::cerr << "  --talkerEngineDir         Path to Talker engine directory" << std::endl;
@@ -204,12 +399,35 @@ void printUsage(char const* programName)
     std::cerr << "  --outputAudioDir          Directory to save generated audio (.wav) files" << std::endl;
 }
 
+namespace
+{
+
+template <typename IntegerType>
+bool parseNonNegativeIntegerOption(char const* optionName, char const* value, IntegerType& output)
+{
+    static_assert(std::is_integral_v<IntegerType> && std::is_signed_v<IntegerType>);
+    std::string_view const text{value == nullptr ? "" : value};
+    IntegerType parsed{};
+    auto const [end, error] = std::from_chars(text.data(), text.data() + text.size(), parsed);
+    if (error != std::errc{} || end != text.data() + text.size() || parsed < 0)
+    {
+        LOG_ERROR("Invalid --%s value: %s (must be a non-negative integer)", optionName, text.data());
+        return false;
+    }
+    output = parsed;
+    return true;
+}
+
+} // namespace
+
 bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
 {
     static struct option inferenceOptions[] = {{"help", no_argument, 0, LLMInferenceOptionId::HELP},
         {"inputFile", required_argument, 0, LLMInferenceOptionId::INPUT_FILE},
         {"engineDir", required_argument, 0, LLMInferenceOptionId::ENGINE_DIR},
         {"multimodalEngineDir", required_argument, 0, LLMInferenceOptionId::MULTIMODAL_ENGINE_DIR},
+        {"checkpointDir", required_argument, 0, LLMInferenceOptionId::CHECKPOINT_DIR},
+        {"draftCheckpointDir", required_argument, 0, LLMInferenceOptionId::DRAFT_CHECKPOINT_DIR},
         {"outputFile", required_argument, 0, LLMInferenceOptionId::OUTPUT_FILE},
         {"debug", no_argument, 0, LLMInferenceOptionId::DEBUG},
         {"dumpProfile", no_argument, 0, LLMInferenceOptionId::DUMP_PROFILE},
@@ -226,6 +444,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"specVerifyTreeSize", required_argument, 0, LLMInferenceOptionId::SPEC_VERIFY_SIZE},
         {"eagleVerifyTreeSize", required_argument, 0, LLMInferenceOptionId::SPEC_VERIFY_SIZE}, // deprecated alias
         {"dflashBlockSize", required_argument, 0, LLMInferenceOptionId::DFLASH_BLOCK_SIZE},
+        {"jetspecBlockSize", required_argument, 0, LLMInferenceOptionId::DFLASH_BLOCK_SIZE},
         {"batchSize", required_argument, 0, LLMInferenceOptionId::BATCH_SIZE},
         {"maxGenerateLength", required_argument, 0, LLMInferenceOptionId::MAX_GENERATE_LENGTH},
         {"numLogprobs", required_argument, 0, LLMInferenceOptionId::NUM_LOGPROBS},
@@ -237,7 +456,18 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"dsparkScheduler", required_argument, 0, LLMInferenceOptionId::DSPARK_SCHEDULER},
         {"dsparkConfidenceThreshold", required_argument, 0, LLMInferenceOptionId::DSPARK_CONFIDENCE_THRESHOLD},
         {"dsparkMinProposalLen", required_argument, 0, LLMInferenceOptionId::DSPARK_MIN_PROPOSAL_LEN},
-        {"dsparkMaxProposalLen", required_argument, 0, LLMInferenceOptionId::DSPARK_MAX_PROPOSAL_LEN}, {0, 0, 0, 0}};
+        {"dsparkMaxProposalLen", required_argument, 0, LLMInferenceOptionId::DSPARK_MAX_PROPOSAL_LEN},
+        {"enableContextReuse", no_argument, 0, LLMInferenceOptionId::ENABLE_CONTEXT_REUSE},
+        {"contextCacheMaxRecords", required_argument, 0, LLMInferenceOptionId::CONTEXT_CACHE_MAX_RECORDS},
+        {"contextCacheRecurrentSnapshotPoolBytes", required_argument, 0,
+            LLMInferenceOptionId::CONTEXT_CACHE_RECURRENT_SNAPSHOT_POOL_BYTES},
+        {"contextCachePartialKVSnapshotPoolBytes", required_argument, 0,
+            LLMInferenceOptionId::CONTEXT_CACHE_PARTIAL_KV_SNAPSHOT_POOL_BYTES},
+        {"visualPrune", no_argument, 0, LLMInferenceOptionId::VISUAL_PRUNE},
+        {"visualPruneAlgo", required_argument, 0, LLMInferenceOptionId::VISUAL_PRUNE_ALGO},
+        {"dartReductionRatio", required_argument, 0, LLMInferenceOptionId::DART_REDUCTION_RATIO},
+        {"dartPivotImageTokens", required_argument, 0, LLMInferenceOptionId::DART_PIVOT_IMAGE_TOKENS},
+        {"dartPivotTextTokens", required_argument, 0, LLMInferenceOptionId::DART_PIVOT_TEXT_TOKENS}, {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", inferenceOptions, nullptr)) != -1)
@@ -248,6 +478,8 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         case LLMInferenceOptionId::INPUT_FILE: args.inputFile = optarg; break;
         case LLMInferenceOptionId::ENGINE_DIR: args.engineDir = optarg; break;
         case LLMInferenceOptionId::MULTIMODAL_ENGINE_DIR: args.multimodalEngineDir = optarg; break;
+        case LLMInferenceOptionId::CHECKPOINT_DIR: args.checkpointDir = optarg; break;
+        case LLMInferenceOptionId::DRAFT_CHECKPOINT_DIR: args.draftCheckpointDir = optarg; break;
         case LLMInferenceOptionId::OUTPUT_FILE: args.outputFile = optarg; break;
         case LLMInferenceOptionId::DEBUG: args.debug = true; break;
         case LLMInferenceOptionId::DUMP_PROFILE: args.dumpProfile = true; break;
@@ -274,6 +506,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
             try
             {
                 args.specDecodeArgs.draftTopK = std::stoi(optarg);
+                args.specDecodeArgs.draftTopKSet = true;
                 if (args.specDecodeArgs.draftTopK <= 0)
                 {
                     LOG_ERROR("Invalid specDraftTopK value: %s (must be positive)", optarg);
@@ -290,6 +523,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
             try
             {
                 args.specDecodeArgs.draftStep = std::stoi(optarg);
+                args.specDecodeArgs.draftStepSet = true;
                 if (args.specDecodeArgs.draftStep <= 0)
                 {
                     LOG_ERROR("Invalid specDraftStep value: %s (must be positive)", optarg);
@@ -306,9 +540,10 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
             try
             {
                 args.specDecodeArgs.verifySize = std::stoi(optarg);
-                if (args.specDecodeArgs.verifySize <= 0)
+                args.specDecodeArgs.verifySizeSet = true;
+                if (args.specDecodeArgs.verifySize < 0)
                 {
-                    LOG_ERROR("Invalid specVerifySize value: %s (must be positive)", optarg);
+                    LOG_ERROR("Invalid specVerifySize value: %s (must be non-negative)", optarg);
                     return false;
                 }
             }
@@ -324,13 +559,13 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
                 args.specDecodeArgs.dflashBlockSize = std::stoi(optarg);
                 if (args.specDecodeArgs.dflashBlockSize < 0)
                 {
-                    LOG_ERROR("Invalid dflashBlockSize value: %s (must be non-negative)", optarg);
+                    LOG_ERROR("Invalid dflashBlockSize/jetspecBlockSize value: %s (must be non-negative)", optarg);
                     return false;
                 }
             }
             catch (std::exception const& e)
             {
-                LOG_ERROR("Invalid dflashBlockSize value: %s", optarg);
+                LOG_ERROR("Invalid dflashBlockSize/jetspecBlockSize value: %s", optarg);
                 return false;
             }
             break;
@@ -438,6 +673,56 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
+        case LLMInferenceOptionId::VISUAL_PRUNE: args.visualPrunerConfig.enabled = true; break;
+        case LLMInferenceOptionId::VISUAL_PRUNE_ALGO: args.visualPrunerConfig.algorithm = optarg; break;
+        case LLMInferenceOptionId::DART_REDUCTION_RATIO:
+            try
+            {
+                args.visualPrunerConfig.reductionRatio = std::stof(optarg);
+                if (args.visualPrunerConfig.reductionRatio <= 0.0F || args.visualPrunerConfig.reductionRatio >= 1.0F)
+                {
+                    LOG_ERROR("Invalid dartReductionRatio value: %s (must be in (0, 1))", optarg);
+                    return false;
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Invalid dartReductionRatio value: %s", optarg);
+                return false;
+            }
+            break;
+        case LLMInferenceOptionId::DART_PIVOT_IMAGE_TOKENS:
+            try
+            {
+                args.visualPrunerConfig.pivotImageTokens = std::stoi(optarg);
+                if (args.visualPrunerConfig.pivotImageTokens < 0)
+                {
+                    LOG_ERROR("Invalid dartPivotImageTokens value: %s (must be non-negative)", optarg);
+                    return false;
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Invalid dartPivotImageTokens value: %s", optarg);
+                return false;
+            }
+            break;
+        case LLMInferenceOptionId::DART_PIVOT_TEXT_TOKENS:
+            try
+            {
+                args.visualPrunerConfig.pivotTextTokens = std::stoi(optarg);
+                if (args.visualPrunerConfig.pivotTextTokens < 0)
+                {
+                    LOG_ERROR("Invalid dartPivotTextTokens value: %s (must be non-negative)", optarg);
+                    return false;
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Invalid dartPivotTextTokens value: %s", optarg);
+                return false;
+            }
+            break;
         case LLMInferenceOptionId::TALKER_ENGINE_DIR: args.talkerEngineDir = optarg; break;
         case LLMInferenceOptionId::CODE2WAV_ENGINE_DIR: args.code2wavEngineDir = optarg; break;
         case LLMInferenceOptionId::OUTPUT_AUDIO_DIR: args.outputAudioDir = optarg; break;
@@ -455,6 +740,27 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
             catch (std::exception const& e)
             {
                 LOG_ERROR("Invalid numLogprobs value: %s", optarg);
+                return false;
+            }
+            break;
+        case LLMInferenceOptionId::ENABLE_CONTEXT_REUSE: args.contextCacheConfig.enabled = true; break;
+        case LLMInferenceOptionId::CONTEXT_CACHE_MAX_RECORDS:
+            if (!parseNonNegativeIntegerOption("contextCacheMaxRecords", optarg, args.contextCacheConfig.maxRecords))
+            {
+                return false;
+            }
+            break;
+        case LLMInferenceOptionId::CONTEXT_CACHE_RECURRENT_SNAPSHOT_POOL_BYTES:
+            if (!parseNonNegativeIntegerOption("contextCacheRecurrentSnapshotPoolBytes", optarg,
+                    args.contextCacheConfig.recurrentSnapshotPoolBytes))
+            {
+                return false;
+            }
+            break;
+        case LLMInferenceOptionId::CONTEXT_CACHE_PARTIAL_KV_SNAPSHOT_POOL_BYTES:
+            if (!parseNonNegativeIntegerOption("contextCachePartialKVSnapshotPoolBytes", optarg,
+                    args.contextCacheConfig.partialKvSnapshotPoolBytes))
+            {
                 return false;
             }
             break;
@@ -509,14 +815,24 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
     if (args.specDecodeArgs.enabled)
     {
         LOG_INFO("Speculative decoding enabled");
-        LOG_INFO("Spec draft topK: %d", args.specDecodeArgs.draftTopK);
-        LOG_INFO("Spec draft step: %d", args.specDecodeArgs.draftStep);
-        LOG_INFO("Spec verify size: %d", args.specDecodeArgs.verifySize);
-        LOG_INFO("DFlash block size: %d", args.specDecodeArgs.dflashBlockSize);
         LOG_INFO("DSpark scheduler mode: %d", static_cast<int32_t>(args.specDecodeArgs.dsparkSchedulerMode));
         LOG_INFO("DSpark confidence threshold: %.4f", args.specDecodeArgs.dsparkConfidenceThreshold);
         LOG_INFO("DSpark proposal length range: [%d, %d]", args.specDecodeArgs.dsparkMinProposalLen,
             args.specDecodeArgs.dsparkMaxProposalLen);
+    }
+    else if (!args.draftCheckpointDir.empty())
+    {
+        LOG_ERROR("--draftCheckpointDir requires --specDecode");
+        return false;
+    }
+
+    if (args.contextCacheConfig.enabled)
+    {
+        LOG_INFO("Context reuse enabled");
+        LOG_INFO("Context cache config: maxRecords=%d recurrentSnapshotPoolBytes=%lld partialKVSnapshotPoolBytes=%lld",
+            args.contextCacheConfig.maxRecords,
+            static_cast<long long>(args.contextCacheConfig.recurrentSnapshotPoolBytes),
+            static_cast<long long>(args.contextCacheConfig.partialKvSnapshotPoolBytes));
     }
 
     if (args.enableAudioOutput)
@@ -623,6 +939,10 @@ int main(int argc, char* argv[])
         printUsage(argv[0]);
         return EXIT_SUCCESS;
     }
+    if (!applyEngineSpecDecodeDefaults(args))
+    {
+        return EXIT_FAILURE;
+    }
     bool profilerEnabled = args.dumpProfile;
     MemoryMonitor memoryMonitor;
     // Start memory monitoring at the beginning if profiling is enabled
@@ -672,8 +992,9 @@ int main(int argc, char* argv[])
         draftingConfig.dsparkMaxProposalLen = args.specDecodeArgs.dsparkMaxProposalLen;
         try
         {
-            runtime = std::make_unique<rt::LLMInferenceRuntime>(
-                args.engineDir, args.multimodalEngineDir, loraWeightsMap, draftingConfig, stream);
+            runtime
+                = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir, args.multimodalEngineDir, loraWeightsMap,
+                    draftingConfig, stream, args.contextCacheConfig, args.checkpointDir, args.draftCheckpointDir);
         }
         catch (std::exception const& e)
         {
@@ -686,12 +1007,25 @@ int main(int argc, char* argv[])
         // Standard vanilla-only mode (no draft model)
         try
         {
-            runtime = std::make_unique<rt::LLMInferenceRuntime>(
-                args.engineDir, args.multimodalEngineDir, loraWeightsMap, stream);
+            runtime = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir, args.multimodalEngineDir,
+                loraWeightsMap, stream, args.contextCacheConfig, args.checkpointDir);
         }
         catch (std::exception const& e)
         {
             LOG_ERROR("Failed to initialize runtime: %s", e.what());
+            return EXIT_FAILURE;
+        }
+    }
+
+    if (args.visualPrunerConfig.enabled)
+    {
+        try
+        {
+            runtime->setVisualPrunerConfig(args.visualPrunerConfig);
+        }
+        catch (std::exception const& e)
+        {
+            LOG_ERROR("Failed to enable visual-token pruning: %s", e.what());
             return EXIT_FAILURE;
         }
     }
@@ -710,8 +1044,8 @@ int main(int argc, char* argv[])
         {
             std::filesystem::path const codePredictorDir
                 = std::filesystem::path(args.talkerEngineDir).parent_path() / "code_predictor";
-            ttsRuntime = std::make_unique<rt::Qwen3OmniTTSRuntime>(
-                args.talkerEngineDir, codePredictorDir.string(), args.engineDir, /*cloneEncoderDir=*/"", stream);
+            ttsRuntime = std::make_unique<rt::Qwen3OmniTTSRuntime>(args.talkerEngineDir, codePredictorDir.string(),
+                args.engineDir, /*cloneEncoderDir=*/"", stream, args.checkpointDir);
             LOG_INFO("TTS runtime initialized for audio output");
         }
         catch (std::exception const& e)
@@ -728,7 +1062,7 @@ int main(int argc, char* argv[])
         {
             try
             {
-                code2wavRunner = std::make_unique<rt::Code2WavRunner>(code2wavDir.string(), stream);
+                code2wavRunner = std::make_unique<rt::Code2WavRunner>(code2wavDir.string(), stream, args.checkpointDir);
                 LOG_INFO("Code2Wav runner initialized");
             }
             catch (std::exception const& e)
@@ -755,6 +1089,11 @@ int main(int argc, char* argv[])
         setProfilingEnabled(false);
         LOG_INFO("Starting warmup with %d runs using the first request...", args.warmup);
         auto& firstRequest = batchedRequests[0];
+        rt::ContextCacheLookupPolicy const originalLookupPolicy = firstRequest.contextCacheLookupPolicy;
+        if (args.contextCacheConfig.enabled)
+        {
+            firstRequest.contextCacheLookupPolicy = rt::ContextCacheLookupPolicy::kBypass;
+        }
 
         for (int32_t warmupRun = 0; warmupRun < args.warmup; ++warmupRun)
         {
@@ -763,10 +1102,12 @@ int main(int argc, char* argv[])
 
             if (!requestStatus)
             {
+                firstRequest.contextCacheLookupPolicy = originalLookupPolicy;
                 LOG_ERROR("Warmup run %d/%d failed", warmupRun + 1, args.warmup);
                 return EXIT_FAILURE;
             }
         }
+        firstRequest.contextCacheLookupPolicy = originalLookupPolicy;
         LOG_INFO("Warmup of %d runs completed. Starting actual benchmark runs...", args.warmup);
     }
 
@@ -1186,6 +1527,10 @@ int main(int argc, char* argv[])
         auto prefillMetrics = runtime->getPrefillMetrics();
         auto multimodalMetrics = runtime->getMultimodalMetrics();
         outputPrefillProfile(profileOutput, prefillMetrics);
+        if (auto const contextCacheMetrics = runtime->getContextCacheMetrics(); contextCacheMetrics.has_value())
+        {
+            outputContextCacheProfile(profileOutput, *contextCacheMetrics);
+        }
         if (args.specDecodeArgs.enabled)
         {
             auto specDecodeGenerationMetrics = runtime->getSpecDecodeGenerationMetrics();
@@ -1216,6 +1561,10 @@ int main(int argc, char* argv[])
 
             // Add high-level metrics from unified runtime
             addJsonPrefillSummary(profileJson, runtime->getPrefillMetrics());
+            if (auto const contextCacheMetrics = runtime->getContextCacheMetrics(); contextCacheMetrics.has_value())
+            {
+                addJsonContextCacheSummary(profileJson, *contextCacheMetrics);
+            }
             if (args.specDecodeArgs.enabled)
             {
                 addJsonSpecDecodeGenerationSummary(profileJson, runtime->getSpecDecodeGenerationMetrics(),

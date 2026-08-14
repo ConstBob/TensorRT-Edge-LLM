@@ -96,7 +96,7 @@ CuteDslInt4Variant const& cuteDslInt4VariantAt(int32_t index)
 
 bool cuteDslInt4VariantValid(CuteDslInt4Variant const& v, int32_t N, int32_t K)
 {
-    if (N % 64 != 0 || K % 64 != 0)
+    if (N <= 0 || K <= 0 || K % 64 != 0)
     {
         return false;
     }

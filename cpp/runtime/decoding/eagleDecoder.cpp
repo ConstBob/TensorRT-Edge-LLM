@@ -31,6 +31,7 @@
 #include "profiling/timer.h"
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/decoding/decoderUtils.h"
+#include "runtime/decoding/logitBias.h"
 #include "runtime/preprocess/embeddingPreprocessor.h"
 #include "sampler/sampling.h"
 
@@ -38,6 +39,7 @@
 #include <cassert>
 #include <cmath>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -53,15 +55,16 @@ constexpr int32_t kDecodeProfile{1};
 } // namespace
 
 EagleDecoder::EagleDecoder(DecodingRuntimeContext& runtime, std::filesystem::path const& engineDir,
-    SpecDecodeDraftingConfig const& draftingConfig, cudaStream_t stream)
+    SpecDecodeDraftingConfig const& draftingConfig, std::unique_ptr<EngineExecutor> draftExecutor, cudaStream_t stream)
     : mRuntime(runtime)
     , mDraftCacheManager(*runtime.base.sharedResources.cacheManagers[1])
+    , mDraftExecutor(std::move(draftExecutor))
 {
     check::check(mRuntime.deployment.draft.has_value(), "SpecDecode drafting strategy requires a draft model config.");
     check::check(
         mRuntime.deployment.specConfig.has_value(), "SpecDecode drafting strategy requires a drafting config.");
 
-    mDraftExecutor = decoder_utils::loadDraftEngine(engineDir, mRuntime.deployment);
+    ELLM_CHECK(mDraftExecutor != nullptr, "EAGLE decoding requires a validated draft engine.");
 
     int32_t const maxRuntimeBatchSize = mRuntime.maxRuntimeBatchSize;
     int32_t const effectiveMaxDraftProposalSize = mRuntime.deployment.effectiveMaxDraftProposalSize();
@@ -81,7 +84,8 @@ EagleDecoder::EagleDecoder(DecodingRuntimeContext& runtime, std::filesystem::pat
     // Publish externalized draft-engine weights into the draft tensor map,
     // mirroring the base engine. Loaded from draft_config.json; a
     // no-op when the draft model has no externalized weights.
-    mDraftExternalWeightManager.load(engineDir, engineDir / "draft_config.json", stream);
+    mDraftExternalWeightManager.load(
+        engineDir, engineDir / "draft_config.json", stream, mRuntime.draftCheckpointDir, mRuntime.checkpointDir);
     mDraftExternalWeightManager.validateAgainstEngine(*mDraftExecutor, "draft");
     mDraftExternalWeightManager.registerTensorMapEntries(mDraftTensorMap);
 
@@ -206,7 +210,7 @@ void EagleDecoder::setContextMemory(Tensor& memory)
 
 bool EagleDecoder::decodeStep(DecodingInferenceContext& context)
 {
-    if (context.generationRound == 0)
+    if (context.generationRound == 0 && !mDraftPrefillOutputsPending)
     {
         if (!runDraftModelPrefill(context))
         {
@@ -214,10 +218,25 @@ bool EagleDecoder::decodeStep(DecodingInferenceContext& context)
             return false;
         }
     }
-    else if (!runDraftModelAcceptToken(context))
+    else if (context.generationRound > 0 && !runDraftModelAcceptToken(context))
     {
         LOG_ERROR("Failed to execute accept token step for draft model.");
         return false;
+    }
+    if (context.generationRound > 0 && !mCommonMaterializedStateLengths.empty())
+    {
+        ELLM_CHECK(mCommonMaterializedStateLengths.size() == static_cast<size_t>(context.activeBatchSize)
+                && mPendingDraftAcceptLengths.size() == static_cast<size_t>(context.activeBatchSize),
+            "EAGLE common-state tracking does not match the active batch");
+        for (int32_t slot = 0; slot < context.activeBatchSize; ++slot)
+        {
+            int32_t const accepted = mPendingDraftAcceptLengths[static_cast<size_t>(slot)];
+            ELLM_CHECK(accepted >= 0
+                    && mCommonMaterializedStateLengths[static_cast<size_t>(slot)]
+                        <= std::numeric_limits<int32_t>::max() - accepted,
+                "EAGLE common-state length overflow");
+            mCommonMaterializedStateLengths[static_cast<size_t>(slot)] += accepted;
+        }
     }
 
     if (!constructDraftProposal(context))
@@ -225,6 +244,7 @@ bool EagleDecoder::decodeStep(DecodingInferenceContext& context)
         LOG_ERROR("Failed to construct draft proposal.");
         return false;
     }
+    mDraftPrefillOutputsPending = false;
 
     if (!runBaseModelVerification(context))
     {
@@ -232,6 +252,35 @@ bool EagleDecoder::decodeStep(DecodingInferenceContext& context)
         return false;
     }
     return true;
+}
+
+bool EagleDecoder::initializeForGeneration(DecodingInferenceContext& context)
+{
+    mDraftPrefillOutputsPending = false;
+    mCommonMaterializedStateLengths.resize(static_cast<size_t>(context.activeBatchSize));
+    mPendingDraftAcceptLengths.assign(static_cast<size_t>(context.activeBatchSize), 0);
+    for (int32_t slot = 0; slot < context.activeBatchSize; ++slot)
+    {
+        size_t const inputLength = context.rawBatchedInputIds[static_cast<size_t>(slot)].size();
+        int32_t const effectivePrefillLength = context.effectivePrefillLengths[static_cast<size_t>(slot)];
+        ELLM_CHECK(inputLength <= static_cast<size_t>(std::numeric_limits<int32_t>::max())
+                && effectivePrefillLength >= 0 && static_cast<size_t>(effectivePrefillLength) <= inputLength,
+            "EAGLE prefill length is outside the input sequence");
+        mCommonMaterializedStateLengths[static_cast<size_t>(slot)] = static_cast<int32_t>(inputLength);
+    }
+
+    if (!runDraftModelPrefill(context))
+    {
+        LOG_ERROR("Failed to initialize the EAGLE draft model for generation.");
+        return false;
+    }
+    mDraftPrefillOutputsPending = true;
+    return true;
+}
+
+std::vector<int32_t> const& EagleDecoder::commonMaterializedStateLengths() const noexcept
+{
+    return mCommonMaterializedStateLengths;
 }
 
 bool EagleDecoder::runDraftModelPrefill(DecodingInferenceContext& context)
@@ -559,6 +608,14 @@ bool EagleDecoder::runBaseModelVerification(DecodingInferenceContext& context)
         return false;
     }
 
+    // GCOVR_EXCL_START
+    if (context.hasLogitBias)
+    {
+        applyLogitBiasRepeatedRows(mRuntime.logitBias, mRuntime.base.pipelineIO.outputLogits, context,
+            mRuntime.deployment.specConfig->verifySize, context.stream);
+    }
+    // GCOVR_EXCL_STOP
+
     int32_t const maxAcceptDepth = mRuntime.deployment.specConfig->draftingStep + 1;
     check::check(mAcceptedTokenIds.reshape({activeBatchSize, maxAcceptDepth}), "Tensor reshape failed");
     check::check(mAcceptedTokenIndices.reshape({activeBatchSize, maxAcceptDepth}), "Tensor reshape failed");
@@ -581,13 +638,10 @@ bool EagleDecoder::runBaseModelVerification(DecodingInferenceContext& context)
                      {activeBatchSize, mRuntime.deployment.specConfig->verifySize, baseOutputHiddenDim}),
         "Tensor reshape failed");
 
-    // Pass the base cache manager's real page table (same source as the AttentionPlugin binding,
-    // see pipelineIO.cpp's kKVPageTable set) rather than the nullptr/identity default. Every base
-    // table is identity-mapped today (SharedResources::kvPageTables), so this is currently
-    // byte-equivalent to the old nullptr call, but wires the production path for future non-identity
-    // EAGLE reuse instead of silently mis-addressing accepted-KV writes once reuse lands.
+    // Accepted-KV writes must follow the same page table as the base AttentionPlugin binding.
     auto const& basePageTable = *mRuntime.base.sharedResources.kvPageTables[0];
     int32_t const* basePageTablePtr = basePageTable.kernelView().dataPointer<int32_t>();
+    int32_t const baseNumPages = kvMgrBase.numPages();
     int32_t const baseMaxPagesPerSeq = basePageTable.maxPagesPerSeq();
 
     decoder_utils::clampAcceptLengthsToRemainingGeneration(context, mHostAcceptLengths, mAcceptLength, context.stream);
@@ -596,7 +650,7 @@ bool EagleDecoder::runBaseModelVerification(DecodingInferenceContext& context)
     {
         kernel::eagleBaseCommitKVCache(mAcceptedTokenIndices, mAcceptLength, kvCacheLengths, group.deviceLayerInfos,
             group.numLayers, group.headDim, group.maxKVHeads, activeBatchSize, maxAcceptDepth, kvCacheType,
-            context.stream, basePageTablePtr, baseMaxPagesPerSeq);
+            context.stream, basePageTablePtr, baseNumPages, baseMaxPagesPerSeq);
     }
 
     kernel::eagleBaseAssembleHiddenState(
@@ -625,6 +679,8 @@ bool EagleDecoder::runBaseModelVerification(DecodingInferenceContext& context)
 
     decoder_utils::appendAcceptedTokens(context, mHostAcceptLengths, mHostAcceptedTokenIds, mAcceptLength,
         mAcceptedTokenIds, maxAcceptDepth, mRuntime.tokenizer, context.stream);
+    int32_t const* const hostAcceptLengths = mHostAcceptLengths.dataPointer<int32_t>();
+    mPendingDraftAcceptLengths.assign(hostAcceptLengths, hostAcceptLengths + activeBatchSize);
 
     if (context.numLogprobs > 0)
     {
@@ -918,13 +974,58 @@ void EagleDecoder::saveSystemPromptKVCache(SystemPromptCacheKey const& key, std:
 void EagleDecoder::resetForNewSequences(Tensor& reuseLengths, cudaStream_t stream)
 {
     mDraftCacheManager.resetForNewSequences(reuseLengths, stream);
+    mCommonMaterializedStateLengths.clear();
+    mPendingDraftAcceptLengths.clear();
+    mDraftPrefillOutputsPending = false;
 }
 
-void EagleDecoder::onBatchEvict(std::vector<int32_t> const&, int32_t oldActiveBatch, int32_t newActiveBatch,
-    Tensor& deviceBatchMapping, cudaStream_t stream)
+void EagleDecoder::onBatchEvict(std::vector<int32_t> const& batchMapping, int32_t oldActiveBatch,
+    int32_t newActiveBatch, Tensor& deviceBatchMapping, cudaStream_t stream, BatchCompactionMode mode)
 {
-    mDraftCacheManager.compactBatch(deviceBatchMapping, oldActiveBatch, newActiveBatch, stream);
-    mDraftCacheManager.setActiveBatchSize(newActiveBatch);
+    if (mode == BatchCompactionMode::kLegacyPhysicalKv)
+    {
+        mDraftCacheManager.compactBatch(deviceBatchMapping, oldActiveBatch, newActiveBatch, stream);
+        mDraftCacheManager.setActiveBatchSize(newActiveBatch);
+    }
+
+    auto compactHostLengths = [&](std::vector<int32_t>& values) {
+        if (values.empty())
+        {
+            return;
+        }
+        ELLM_CHECK(values.size() == static_cast<size_t>(oldActiveBatch),
+            "EAGLE host state does not match the old active batch");
+        std::vector<int32_t> compacted(static_cast<size_t>(newActiveBatch));
+        for (int32_t oldSlot = 0; oldSlot < oldActiveBatch; ++oldSlot)
+        {
+            int32_t const newSlot = batchMapping[static_cast<size_t>(oldSlot)];
+            if (newSlot >= 0)
+            {
+                compacted[static_cast<size_t>(newSlot)] = values[static_cast<size_t>(oldSlot)];
+            }
+        }
+        values = std::move(compacted);
+    };
+    compactHostLengths(mCommonMaterializedStateLengths);
+    compactHostLengths(mPendingDraftAcceptLengths);
+
+    if (mDraftPrefillOutputsPending)
+    {
+        auto compactDraftPrefillOutput = [&](Tensor& tensor, char const* name) {
+            auto const shape = tensor.getShape();
+            ELLM_CHECK(shape.getNumDims() == 2 && shape[0] == oldActiveBatch,
+                std::string("EAGLE ") + name + " does not match the prefill batch");
+            if (newActiveBatch > 0)
+            {
+                kernel::compactTensorBatch(tensor, deviceBatchMapping, tensor, oldActiveBatch, newActiveBatch, stream);
+                check::check(
+                    tensor.reshape({newActiveBatch, shape[1]}), std::string("Failed to compact EAGLE ") + name);
+            }
+        };
+        compactDraftPrefillOutput(mRuntime.base.pipelineIO.outputLogits, "draft-prefill logits");
+        compactDraftPrefillOutput(mRuntime.base.pipelineIO.draftHiddenStatesOut, "draft-prefill hidden state");
+        mDraftPrefillOutputsPending = newActiveBatch > 0;
+    }
 
     if (mRuntime.base.pipelineIO.baseHiddenStates.getShape().getNumDims() == 3
         && mRuntime.base.pipelineIO.baseHiddenStates.getShape()[0] == oldActiveBatch && newActiveBatch > 0)

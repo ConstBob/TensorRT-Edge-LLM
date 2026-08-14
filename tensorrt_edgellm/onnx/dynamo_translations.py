@@ -321,6 +321,26 @@ def _int4_groupwise_gemm_v2_translation(
 
 
 @script()
+def _nvfp4_a16_gemm_translation(
+    activation: onnxscript.FLOAT16,
+    qweights: onnxscript.INT8,
+    block_scales: onnxscript.INT8,
+    global_scale: onnxscript.FLOAT16,
+    gemm_n: int,
+    gemm_k: int,
+) -> onnxscript.FLOAT16:
+    return _trt_edgellm.Nvfp4A16GemmPlugin(
+        activation,
+        qweights,
+        block_scales,
+        global_scale,
+        gemm_n=gemm_n,
+        gemm_k=gemm_k,
+        max_m=0,
+    )
+
+
+@script()
 def _int8_sq_act_qdq_translation(
     hidden_states: onnxscript.FLOAT16,
     scale: onnxscript.FLOAT,
@@ -663,6 +683,7 @@ def _update_ssm_state_translation(
     dt_bias: onnxscript.FLOAT16,
     state: onnxscript.FLOAT16,
     context_lengths: onnxscript.INT32,
+    state_start_index: onnxscript.INT32,
     dt_softplus: int,
     ngroups: int,
     chunk_size: int = 0,
@@ -677,12 +698,54 @@ def _update_ssm_state_translation(
         dt_bias,
         state,
         context_lengths,
+        state_start_index,
         dt_softplus=dt_softplus,
         ngroups=ngroups,
         chunk_size=chunk_size,
         _outputs=2,
     )
     return output, state_out
+
+
+@script()
+def _update_ssm_state_with_intermediate_translation(
+    hidden_states: onnxscript.FLOAT16,
+    ssm_a: onnxscript.FLOAT,
+    ssm_b: onnxscript.FLOAT16,
+    ssm_c: onnxscript.FLOAT16,
+    ssm_d: onnxscript.FLOAT16,
+    dt: onnxscript.FLOAT16,
+    dt_bias: onnxscript.FLOAT16,
+    state: onnxscript.FLOAT16,
+    context_lengths: onnxscript.INT32,
+    state_start_index: onnxscript.INT32,
+    spec_verify_phase_marker: onnxscript.INT32,
+    dt_softplus: int,
+    ngroups: int,
+    chunk_size: int = 0,
+) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT16, onnxscript.FLOAT,
+           onnxscript.FLOAT, onnxscript.FLOAT]:
+    # Spec-verify replay stash (dA / u / B) is FP32; the token output and state
+    # output follow the FP16 x/state types.
+    output, state_out, replay_da, replay_u, replay_b = _trt_edgellm.update_ssm_state(
+        hidden_states,
+        ssm_a,
+        ssm_b,
+        ssm_c,
+        ssm_d,
+        dt,
+        dt_bias,
+        state,
+        context_lengths,
+        state_start_index,
+        spec_verify_phase_marker,
+        dt_softplus=dt_softplus,
+        ngroups=ngroups,
+        chunk_size=chunk_size,
+        use_spec_verify_state=1,
+        _outputs=5,
+    )
+    return output, state_out, replay_da, replay_u, replay_b
 
 
 # ---------------------------------------------------------------------------
@@ -881,6 +944,53 @@ def _int4_moe_plugin_translation(
 
 
 @script()
+def _nvfp4_a16_moe_plugin_translation(
+    router_logits: onnxscript.FLOAT,
+    hidden_states: onnxscript.FLOAT16,
+    fc1_qweights: onnxscript.INT8,
+    fc1_block_scales: onnxscript.INT8,
+    fc1_global_scales: onnxscript.FLOAT16,
+    fc2_qweights: onnxscript.INT8,
+    fc2_block_scales: onnxscript.INT8,
+    fc2_global_scales: onnxscript.FLOAT16,
+    e_score_correction_bias: onnxscript.FLOAT,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    moe_inter_size: int,
+    activation_type: int,
+    n_group: int,
+    topk_group: int,
+    norm_topk_prob: int,
+    routed_scaling_factor: float,
+    routing_mode: int,
+    max_routed_rows: int,
+) -> onnxscript.FLOAT16:
+    return _trt_edgellm.Nvfp4A16MoePlugin(
+        router_logits,
+        hidden_states,
+        fc1_qweights,
+        fc1_block_scales,
+        fc1_global_scales,
+        fc2_qweights,
+        fc2_block_scales,
+        fc2_global_scales,
+        e_score_correction_bias,
+        num_experts=num_experts,
+        top_k=top_k,
+        hidden_size=hidden_size,
+        moe_inter_size=moe_inter_size,
+        activation_type=activation_type,
+        n_group=n_group,
+        topk_group=topk_group,
+        norm_topk_prob=norm_topk_prob,
+        routed_scaling_factor=routed_scaling_factor,
+        routing_mode=routing_mode,
+        max_routed_rows=max_routed_rows,
+    )
+
+
+@script()
 def _nvfp4_moe_plugin_translation(
     router_logits: onnxscript.FLOAT,
     hidden_states: onnxscript.FLOAT16,
@@ -1027,6 +1137,45 @@ def _fp16_moe_plugin_translation(
     return output
 
 
+@script()
+def _fp16_moe_plugin_sigmoid_translation(
+    router_logits: onnxscript.FLOAT,
+    hidden_states: onnxscript.FLOAT16,
+    fc1_weights: onnxscript.FLOAT16,
+    fc2_weights: onnxscript.FLOAT16,
+    e_score_correction_bias: onnxscript.FLOAT,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    moe_inter_size: int,
+    activation_type: int,
+    n_group: int,
+    topk_group: int,
+    norm_topk_prob: int,
+    routed_scaling_factor: float,
+    max_routed_rows: int,
+) -> onnxscript.FLOAT16:
+    output = _trt_edgellm.Fp16MoePlugin(
+        router_logits,
+        hidden_states,
+        fc1_weights,
+        fc2_weights,
+        e_score_correction_bias,
+        num_experts=num_experts,
+        top_k=top_k,
+        hidden_size=hidden_size,
+        moe_inter_size=moe_inter_size,
+        activation_type=activation_type,
+        norm_topk_prob=norm_topk_prob,
+        max_routed_rows=max_routed_rows,
+        n_group=n_group,
+        topk_group=topk_group,
+        routed_scaling_factor=routed_scaling_factor,
+        routing_mode=1,
+    )
+    return output
+
+
 # ---------------------------------------------------------------------------
 # FusedNvfp4GemmAllReducePlugin (row-parallel NVFP4 GEMM + AllReduce)
 # ---------------------------------------------------------------------------
@@ -1074,6 +1223,7 @@ def _dflash_target_kv_cache_update_translation(
     rope_cos_sin: onnxscript.FLOAT,
     delta_start_positions: onnxscript.INT32,
     delta_lengths: onnxscript.INT32,
+    kv_page_table: onnxscript.INT32,
 ) -> onnxscript.FLOAT16:
     """DFlash target KV cache update: apply RoPE to k_delta, write k+v into cache."""
     present_kv = _trt_edgellm.DFlashTargetKVCacheUpdate(
@@ -1083,6 +1233,7 @@ def _dflash_target_kv_cache_update_translation(
         rope_cos_sin,
         delta_start_positions,
         delta_lengths,
+        kv_page_table,
     )
     return present_kv
 
@@ -1156,6 +1307,8 @@ def build_custom_translation_table() -> dict:
         _int4_groupwise_gemm_translation,
         torch.ops.trt.int4_groupwise_gemm_v2.default:
         _int4_groupwise_gemm_v2_translation,
+        torch.ops.trt.nvfp4_a16_gemm.default:
+        _nvfp4_a16_gemm_translation,
         torch.ops.trt.int8_sq_act_qdq.default:
         _int8_sq_act_qdq_translation,
         torch.ops.trt.int8_sq_weight_dq.default:
@@ -1166,6 +1319,8 @@ def build_custom_translation_table() -> dict:
         _causal_conv1d_intermediate_dispatch,
         torch.ops.trt_edgellm.update_ssm_state.default:
         _update_ssm_state_translation,
+        torch.ops.trt_edgellm.update_ssm_state_with_intermediate.default:
+        _update_ssm_state_with_intermediate_translation,
         torch.ops.trt_edgellm.gated_delta_net.default:
         _gated_delta_net_dispatch,
         torch.ops.trt_edgellm.gated_delta_net_with_intermediate.default:
@@ -1180,10 +1335,14 @@ def build_custom_translation_table() -> dict:
         _int4_moe_plugin_translation,
         torch.ops.trt_edgellm.Nvfp4MoePlugin.default:
         _nvfp4_moe_plugin_translation,
+        torch.ops.trt_edgellm.Nvfp4A16MoePlugin.default:
+        _nvfp4_a16_moe_plugin_translation,
         torch.ops.trt_edgellm.NvFP4MoEPluginGeforce.default:
         _nvfp4_moe_plugin_geforce_translation,
         torch.ops.trt_edgellm.Fp16MoePlugin.default:
         _fp16_moe_plugin_translation,
+        torch.ops.trt_edgellm.Fp16MoePluginSigmoid.default:
+        _fp16_moe_plugin_sigmoid_translation,
         torch.ops.trt_edgellm.dflash_target_kv_cache_update.default:
         _dflash_target_kv_cache_update_translation,
         # TRT native attention ops (used by Alpamayo)

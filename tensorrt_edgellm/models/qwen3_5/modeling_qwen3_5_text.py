@@ -59,11 +59,12 @@ import torch.nn.functional as F
 
 from ...config import LAYER_GDN, GdnConfig, ModelConfig
 from ..default.modeling_default import MLP, OnnxSpec, RMSNorm
-from ..linear import (FP16Linear, NVFP4LinearMethod, ReplicatedLinear,
-                      is_nvfp4_linear, make_linear)
+from ..linear import (AWQLinear, FP16Linear, GPTQLinear,
+                      ModelOptAWQPrepackedLinear, NVFP4LinearMethod,
+                      ReplicatedLinear, is_nvfp4_linear, make_linear)
 from ..ops import (KV_PAGE_SIZE, attention_plugin, causal_conv1d,
                    causal_conv1d_with_intermediate, gated_delta_net,
-                   gated_delta_net_with_intermediate)
+                   gated_delta_net_with_intermediate, int4_gemm_plugin_version)
 
 __all__ = ["Qwen3_5CausalLM"]
 
@@ -216,6 +217,11 @@ class GdnMixer(nn.Module):
         if hasattr(self, "in_proj_fused"):
             fused_out = self.in_proj_fused(hidden_states)
             mixed_qkv, z, b, a = fused_out.split(self._fused_splits, dim=-1)
+        elif hasattr(self, "in_proj_qkvz"):
+            qkvz_out = self.in_proj_qkvz(hidden_states)
+            mixed_qkv, z = qkvz_out.split(self._fused_splits[:2], dim=-1)
+            ba_out = self.in_proj_ba(hidden_states)
+            b, a = ba_out.split(self._fused_splits[2:], dim=-1)
         else:
             mixed_qkv = self.in_proj_qkv(hidden_states)
             z = self.in_proj_z(hidden_states)
@@ -357,6 +363,9 @@ class GatedAttention(nn.Module):
                                   num_kv_heads * head_dim,
                                   bias=config.attention_bias,
                                   module_name=f"{module_prefix}.v_proj")
+        self._materialize_int4_v = (isinstance(
+            self.v_proj, (AWQLinear, GPTQLinear, ModelOptAWQPrepackedLinear))
+                                    and int4_gemm_plugin_version() == 2)
 
         if self.enable_fp8_kv_cache:
             self.q_proj.register_buffer("q_scale", torch.ones(1))
@@ -394,6 +403,14 @@ class GatedAttention(nn.Module):
 
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
+
+        if self._materialize_int4_v:
+            # A direct V2 plugin -> Concat edge lets TRT virtualize the plugin
+            # output as a strided slice, although the plugin's LINEAR output is
+            # contiguous.  This live-row mask is exactly one for valid requests
+            # and gives TRT a native producer that can honor the Concat stride.
+            active_rows = (context_lengths > 0).to(value_states.dtype)
+            value_states = value_states * active_rows.reshape(batch_size, 1, 1)
 
         # QK norm (on reshaped per-head tensors)
         query_states = self.q_norm(query_states)
@@ -653,11 +670,12 @@ def _is_dflash_base_export(config: ModelConfig) -> bool:
 def _is_spec_tree_base_export(config: ModelConfig) -> bool:
     """Return True when exporting DDTree metadata for Qwen3.5 hybrid state.
 
-    Both the DFlash DDTree base and the MTP tree base consume the same
+    DFlash, JetSpec, and MTP tree bases consume the same
     ``tree_parent_ids`` / ``tree_depths`` verify inputs.
     """
-    return bool(getattr(config, "dflash_tree_base", False)) or bool(
-        getattr(config, "mtp_tree_base", False))
+    return (bool(getattr(config, "dflash_tree_base", False))
+            or bool(getattr(config, "jetspec_tree_base", False))
+            or bool(getattr(config, "mtp_tree_base", False)))
 
 
 def _make_flat_wrapper_hybrid(model: nn.Module,
@@ -795,6 +813,45 @@ def fuse_gdn_input_projections(model: nn.Module) -> int:
             pass  # always fusible
         elif is_nvfp4_linear(first_proj):
             if not _can_fuse_nvfp4_scales(mixer):
+                # Mixed layout (NVFP4 qkv/z + unquantized FP16 b/a): fuse
+                # same-dtype pairs only — qkv+z into one NVFP4 GEMM, b+a
+                # into one FP16 GEMM.  Pure concatenation, no re-quantization.
+                qkv, zp = mixer.in_proj_qkv, mixer.in_proj_z
+                bp, ap = mixer.in_proj_b, mixer.in_proj_a
+                pairable = (is_nvfp4_linear(zp) and isinstance(bp, FP16Linear)
+                            and isinstance(ap, FP16Linear) and all(
+                                torch.equal(getattr(qkv, s), getattr(zp, s))
+                                for s in _NVFP4_SCALAR_SCALE_SUFFIXES))
+                if pairable:
+                    splits = mixer._fused_splits
+                    method = NVFP4LinearMethod(
+                        group_size=qkv.quant_method.group_size)
+                    qkvz = ReplicatedLinear(qkv.in_features,
+                                            splits[0] + splits[1],
+                                            bias=False,
+                                            dtype=torch.float16,
+                                            mapping=qkv.mapping,
+                                            quant_method=method)
+                    qkvz._buffers["weight"] = torch.cat(
+                        [qkv.weight, zp.weight], dim=0)
+                    qkvz._buffers["weight_scale"] = torch.cat(
+                        [qkv.weight_scale, zp.weight_scale], dim=0)
+                    qkvz._buffers["weight_scale_2"] = \
+                        qkv.weight_scale_2.clone()
+                    qkvz._buffers["input_scale"] = qkv.input_scale.clone()
+                    ba = FP16Linear(qkv.in_features, splits[2] + splits[3])
+                    ba.weight = nn.Parameter(torch.cat(
+                        [bp.weight.data, ap.weight.data], dim=0),
+                                             requires_grad=False)
+                    mixer.in_proj_qkvz = qkvz
+                    mixer.in_proj_ba = ba
+                    for proj_name in _GDN_PROJ_NAMES:
+                        delattr(mixer, proj_name)
+                    fused_count += 1
+                    logger.debug(
+                        "Pair-fused GDN projections (NVFP4 qkvz + FP16 ba) "
+                        "for %s", name)
+                    continue
                 logger.warning(
                     "GDN fusion skipped for %s: NVFP4 scalar scales "
                     "differ across projections. Re-quantize with "

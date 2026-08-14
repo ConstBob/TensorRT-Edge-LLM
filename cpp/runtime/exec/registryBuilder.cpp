@@ -32,18 +32,17 @@ namespace rt
 
 //! Page count for paged-pool KV-cache bindings
 //! [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim]. A single fixed value per engine
-//! (not resized per inference step): the active-capacity floor, matching the builder profile
-//! and KVCacheManager::numPages() (see sharedResources.cpp).
+//! (not resized per inference step), matching the serialized builder profile and
+//! KVCacheManager::numPages() (see sharedResources.cpp).
 constexpr int32_t kTokensPerPage = rt::kTOKENS_PER_PAGE;
 
 static int32_t computeNumPages(LLMEngineConfig const& cfg)
 {
-    return rt::computeKvPoolFloorPages(cfg.maxSupportedBatchSize, cfg.maxKVCacheCapacity);
-}
-
-static int32_t computeFloorNumPages(int32_t maxBatchSize, int32_t maxKVCacheCapacity)
-{
-    return rt::computeKvPoolFloorPages(maxBatchSize, maxKVCacheCapacity);
+    int64_t const minimumActivePages = rt::computeMinimumKvPoolPages(cfg.maxSupportedBatchSize, cfg.maxKVCacheCapacity);
+    ELLM_CHECK(cfg.kvPoolPages >= minimumActivePages && cfg.kvPoolPages <= rt::kMAX_KV_POOL_PAGES,
+        "KV pool page count (" + std::to_string(cfg.kvPoolPages) + ") is outside [" + std::to_string(minimumActivePages)
+            + ", " + std::to_string(rt::kMAX_KV_POOL_PAGES) + "].");
+    return cfg.kvPoolPages;
 }
 
 void addRopeTensorSpecs(TensorRegistry& reg, LLMEngineConfig const& cfg)
@@ -206,19 +205,41 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
             addMambaTensor(binding_names::kConvStateTemplate, TensorIO::kInput, cfg.convStateDtype, convShape);
             addMambaTensor(binding_names::kPresentConvStateTemplate, TensorIO::kOutput, cfg.convStateDtype, convShape);
 
-            // Hybrid MTP/DFlash base only: per-layer intermediate state outputs
-            // written during prefill/verification so accepted recurrent/conv
-            // state snapshots can be committed after speculative verification.
+            // Hybrid MTP/DFlash/JetSpec/DSpark base: per-layer intermediate state outputs
+            // written during prefill/verification so accepted recurrent/conv state snapshots
+            // can be committed after speculative verification.
+            // recurrentSpecVerifyUsesReplay selects which output set the engine declares
+            // (replay stash vs full-state snapshot).
             //
             // intermediate_recurrent_state_%d: [batch, seqLen, recurrentNumHeads, recurrentHeadDim, recurrentStateSize]
             // intermediate_conv_state_%d:      [batch, seqLen, convDim, convKernel]
-            if (cfg.specDecodeType == SpecDecodeMode::kMTP || cfg.specDecodeType == SpecDecodeMode::kDFlash
+            if (cfg.specDecodeType == SpecDecodeMode::kMTP || isCachedBlockDraftMode(cfg.specDecodeType)
                 || cfg.specDecodeType == SpecDecodeMode::kDSpark)
             {
-                std::vector<ShapeDim> const interRecShape{sym(&InferenceDims::batch), sym(&InferenceDims::seqLen),
-                    fixed(cfg.recurrentStateNumHeads), fixed(cfg.recurrentStateHeadDim), fixed(cfg.recurrentStateSize)};
-                addMambaTensor(binding_names::kIntermediateRecurrentStateTemplate, TensorIO::kOutput,
-                    cfg.recurrentStateDtype, interRecShape);
+                bool const useReplay = cfg.recurrentSpecVerifyUsesReplay;
+                if (useReplay)
+                {
+                    // replay_da_state_%d: [batch, seqLen, recurrentNumHeads]
+                    addMambaTensor(binding_names::kReplayDaStateTemplate, TensorIO::kOutput, nvinfer1::DataType::kFLOAT,
+                        {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(cfg.recurrentStateNumHeads)});
+                    // replay_u_state_%d: [batch, seqLen, recurrentNumHeads, recurrentHeadDim]
+                    addMambaTensor(binding_names::kReplayUStateTemplate, TensorIO::kOutput, nvinfer1::DataType::kFLOAT,
+                        {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(cfg.recurrentStateNumHeads),
+                            fixed(cfg.recurrentStateHeadDim)});
+                    // replay_b_state_%d: [batch, seqLen, recurrentNumGroups, recurrentStateSize]
+                    addMambaTensor(binding_names::kReplayBStateTemplate, TensorIO::kOutput, nvinfer1::DataType::kFLOAT,
+                        {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(cfg.recurrentStateNumGroups),
+                            fixed(cfg.recurrentStateSize)});
+                }
+                else
+                {
+                    // intermediate_recurrent_state_%d: [batch, seqLen, recurrentNumHeads, recurrentHeadDim, dstate]
+                    std::vector<ShapeDim> const interRecShape{sym(&InferenceDims::batch), sym(&InferenceDims::seqLen),
+                        fixed(cfg.recurrentStateNumHeads), fixed(cfg.recurrentStateHeadDim),
+                        fixed(cfg.recurrentStateSize)};
+                    addMambaTensor(binding_names::kIntermediateRecurrentStateTemplate, TensorIO::kOutput,
+                        cfg.recurrentStateDtype, interRecShape);
+                }
                 if (cfg.convDim > 0 && cfg.convKernel > 0)
                 {
                     std::vector<ShapeDim> const interConvShape{sym(&InferenceDims::batch), sym(&InferenceDims::seqLen),
@@ -269,7 +290,7 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
         reg.addTensor({binding_names::kAttentionPosId, TensorIO::kInput, nvinfer1::DataType::kINT32,
             {sym(&InferenceDims::batch), sym(&InferenceDims::attnMaskSeqLen)}});
 
-        if ((cfg.specDecodeType == SpecDecodeMode::kMTP || cfg.specDecodeType == SpecDecodeMode::kDFlash)
+        if ((cfg.specDecodeType == SpecDecodeMode::kMTP || isCachedBlockDraftMode(cfg.specDecodeType))
             && cfg.numLinearAttnLayers > 0)
         {
             reg.addTensor({binding_names::kSpecVerifyPhaseMarker, TensorIO::kInput, nvinfer1::DataType::kINT32,
@@ -329,6 +350,13 @@ TensorRegistry buildRegistryForSpecDecodeDraft(DeploymentConfig const& bundle)
     // KV cache); [batch] for proposal / accept.
     reg.addTensor({binding_names::kKVCacheStartIndex, TensorIO::kInput, nvinfer1::DataType::kINT32,
         {sym(&InferenceDims::startIndexLen)}});
+
+    // kv_page_table: [batch, 2, maxPagesPerSeq] INT32. AttentionPlugin cross-checks this
+    // row count against the packed QKV batch, so it must track the active batch rather
+    // than fall back to the page table's full [maxBatch, ...] extent.
+    int32_t const maxPagesPerSeq = rt::computeMaxPagesPerSeq(cfg.maxKVCacheCapacity);
+    reg.addTensor({binding_names::kKVPageTable, TensorIO::kInput, nvinfer1::DataType::kINT32,
+        {sym(&InferenceDims::batch), fixed(2), fixed(maxPagesPerSeq)}});
 
     if (cfg.contextMaskSelectorEnabled)
     {
@@ -459,14 +487,9 @@ TensorRegistry buildRegistryForDFlashDraft(DeploymentConfig const& bundle)
                 continue;
             }
             auto const& lc = cfg.kvLayerConfigs[localAttnIdx];
-            // DFlash's own combined draft cache: unified on the paged-pool contract shared with
-            // the main model and EAGLE/MTP drafts — [2, numPages, kTOKENS_PER_PAGE, numKVHeads,
-            // headDim] — but NOT extended by the pool-capacity profile range:
-            // DFlashTargetKVCacheUpdatePlugin recovers maxBatch/cap at enqueue time by dividing
-            // numPages by the builder-configured pages_per_slot attribute, so this binding always
-            // stays at the active-capacity floor (see computeFloorNumPages). This cache still has
-            // no page table of its own (identity-contiguous, reuse opt-out).
-            int32_t const numPages = computeFloorNumPages(cfg.maxSupportedBatchSize, cfg.maxKVCacheCapacity);
+            // DFlash's own combined draft cache uses the same paged-pool contract and the exact
+            // serialized engine page count.
+            int32_t const numPages = cfg.kvPoolPages;
             std::vector<ShapeDim> const shape{
                 fixed(2), fixed(numPages), fixed(kTokensPerPage), fixed(lc.numKVHeads), fixed(lc.headDim)};
             auto addKVCacheTensor = [&](char const* tmpl, TensorIO io) {
@@ -603,10 +626,8 @@ TensorRegistry buildRegistryForDSparkDraft(DeploymentConfig const& bundle)
                 continue;
             }
             auto const& lc = cfg.kvLayerConfigs[localAttnIdx];
-            // DSpark's own combined draft cache uses the same paged-pool contract as DFlash:
-            // [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim]. The update plugin maps
-            // this fixed page count back to (maxBatch, cap) using pages_per_slot from build time.
-            int32_t const numPages = computeFloorNumPages(cfg.maxSupportedBatchSize, cfg.maxKVCacheCapacity);
+            // DSpark uses the exact serialized engine page count.
+            int32_t const numPages = cfg.kvPoolPages;
             std::vector<ShapeDim> const shape{
                 fixed(2), fixed(numPages), fixed(kTokensPerPage), fixed(lc.numKVHeads), fixed(lc.headDim)};
             auto addKVCacheTensor = [&](char const* tmpl, TensorIO io) {

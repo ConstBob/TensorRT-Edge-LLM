@@ -308,16 +308,33 @@ TEST_F(SamplingTest, TemperatureZeroParameterOverride)
     }
 }
 
-TEST_F(SamplingTest, ShouldUseNonGreedySampling)
+TEST(SamplingUtilsTest, ShouldUseNonGreedySampling)
 {
     EXPECT_FALSE(trt_edgellm::shouldUseNonGreedySampling(1.0f, 0, 1.0f));
-    EXPECT_FALSE(trt_edgellm::shouldUseNonGreedySampling(0.0f, 0, 1.0f));
     EXPECT_FALSE(trt_edgellm::shouldUseNonGreedySampling(0.7f, 1, 0.95f)); // topK=1 forces greedy
     EXPECT_FALSE(trt_edgellm::shouldUseNonGreedySampling(1.2f, 1, 0.5f));  // topK=1 forces greedy
     EXPECT_TRUE(trt_edgellm::shouldUseNonGreedySampling(0.7f, 0, 1.0f));
     EXPECT_TRUE(trt_edgellm::shouldUseNonGreedySampling(1.2f, 0, 1.0f));
     EXPECT_TRUE(trt_edgellm::shouldUseNonGreedySampling(1.0f, 2, 1.0f));
     EXPECT_TRUE(trt_edgellm::shouldUseNonGreedySampling(1.0f, 0, 0.95f));
+}
+
+TEST(SamplingUtilsTest, NearZeroTemperatureForcesGreedySampling)
+{
+    constexpr float kNEAR_ZERO_TEMPERATURE = 5e-4F;
+    constexpr float kNORMALIZATION_THRESHOLD = 1e-3F;
+
+    EXPECT_FALSE(trt_edgellm::shouldUseNonGreedySampling(0.0F, 0, 1.0F));
+    EXPECT_FALSE(trt_edgellm::shouldUseNonGreedySampling(kNEAR_ZERO_TEMPERATURE, 2, 1.0F));
+    EXPECT_FALSE(trt_edgellm::shouldUseNonGreedySampling(kNEAR_ZERO_TEMPERATURE, 0, 0.95F));
+    EXPECT_FALSE(trt_edgellm::shouldUseNonGreedySampling(kNEAR_ZERO_TEMPERATURE, 2, 0.95F));
+
+    // Invalid negative temperatures are not normalized here; SamplingParams rejects them.
+    EXPECT_TRUE(trt_edgellm::shouldUseNonGreedySampling(-1.0F, 2, 1.0F));
+
+    // SamplingParams only normalizes temperatures strictly below the threshold.
+    EXPECT_TRUE(trt_edgellm::shouldUseNonGreedySampling(kNORMALIZATION_THRESHOLD, 2, 1.0F));
+    EXPECT_TRUE(trt_edgellm::shouldUseNonGreedySampling(kNORMALIZATION_THRESHOLD, 0, 0.95F));
 }
 
 TEST_F(SamplingTest, ApplyLogitBiasAffectsGreedySamplingPerBatch)
@@ -377,6 +394,47 @@ TEST_F(SamplingTest, ApplyLogitBiasCanBanGreedyTopToken)
     auto const gpuResults = copyDeviceToHost<int32_t>(selectedIndicesTensor);
     ASSERT_EQ(gpuResults.size(), 1U);
     EXPECT_EQ(gpuResults[0], 1);
+}
+
+TEST_F(SamplingTest, ApplyLogitBiasRepeatedRowsUsesOwningBatchSlot)
+{
+    constexpr int32_t kBATCH_SIZE = 2;
+    constexpr int32_t kROWS_PER_SLOT = 2;
+    constexpr int32_t kVOCAB_SIZE = 5;
+    rt::Tensor logitsTensor(
+        {kBATCH_SIZE * kROWS_PER_SLOT, kVOCAB_SIZE}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    copyHostToDevice<float>(logitsTensor, std::vector<float>(kBATCH_SIZE * kROWS_PER_SLOT * kVOCAB_SIZE, 0.0F));
+
+    // CSR bias layout: slot i owns entries [biasOffsets[i], biasOffsets[i + 1]).
+    // Each entry adds biasValues[j] to token biasTokenIds[j] for that slot.
+    rt::Tensor biasTokenIds({3}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor biasValues({3}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor biasOffsets({kBATCH_SIZE + 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice<int32_t>(biasTokenIds, {1, 0, 4});
+    copyHostToDevice<float>(biasValues, {3.0F, -2.0F, 5.0F});
+    copyHostToDevice<int32_t>(biasOffsets, {0, 1, 3});
+
+    applyLogitBiasRepeatedRows(logitsTensor, biasTokenIds, biasValues, biasOffsets, kROWS_PER_SLOT, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // clang-format off
+    std::vector<float> const expected{
+        // flattened row 0, slot 0
+        0.0F, 3.0F, 0.0F, 0.0F, 0.0F,
+        // flattened row 1, slot 0
+        0.0F, 3.0F, 0.0F, 0.0F, 0.0F,
+        // flattened row 2, slot 1
+        -2.0F, 0.0F, 0.0F, 0.0F, 5.0F,
+        // flattened row 3, slot 1
+        -2.0F, 0.0F, 0.0F, 0.0F, 5.0F,
+    };
+    // clang-format on
+    auto const actual = copyDeviceToHost<float>(logitsTensor);
+    ASSERT_EQ(actual.size(), expected.size());
+    for (size_t i = 0; i < expected.size(); ++i)
+    {
+        EXPECT_FLOAT_EQ(actual[i], expected[i]) << "flat index " << i;
+    }
 }
 
 TEST_F(SamplingTest, SelectArgmaxAndComputeEntropy)

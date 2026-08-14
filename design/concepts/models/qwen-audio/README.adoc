@@ -52,8 +52,8 @@ Do not duplicate that table here.
 | link:../../../../tensorrt_edgellm/models/qwen3_tts/modeling_qwen3_tts_talker.py[modeling_qwen3_tts_talker.py] | Qwen3-TTS talker decoder.
 | link:../../../../tensorrt_edgellm/models/qwen3_tts/modeling_code_predictor.py[modeling_code_predictor.py] | TTS code-predictor decoder path.
 | link:../../../../tensorrt_edgellm/models/qwen3_omni/[qwen3_omni/] | Qwen3-Omni text, visual, audio, and Code2Wav export paths.
-| link:../../../../cpp/multimodal/audioRunner.h[audioRunner.h] | Audio preprocessing/runtime runner.
-| link:../../../../cpp/multimodal/code2WavRunner.h[code2WavRunner.h] | Speech-code to waveform runtime path.
+| link:../../../../cpp/multimodal/qwen3_omni/audioRunner.h[audioRunner.h] | Audio preprocessing/runtime runner.
+| link:../../../../cpp/multimodal/qwen3_omni/code2WavRunner.h[code2WavRunner.h] | Speech-code to waveform runtime path.
 | link:../../../../tensorrt_edgellm/chat_template.py[chat_template.py] | Chat-template extraction and audio placeholder handling.
 |===
 

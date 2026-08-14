@@ -16,8 +16,9 @@
 
 import json
 import os
+from dataclasses import replace
 
-from ...core import contracts
+from ...core import contracts, quantization, weight_policy
 
 _TALKER_TYPES = frozenset((
     "qwen3_omni_talker",
@@ -71,6 +72,14 @@ def component_config(root: dict, component: contracts.Component) -> dict:
     raise ValueError(f"Qwen3-Omni has no {component.value} configuration")
 
 
+def component_weight_policy(args, policy):
+    """Keep dynamic Code2Wav dense weights out of TensorRT's Myelin path."""
+    if args.resolved_component != contracts.Component.CODE2WAV:
+        return policy
+    return policy.without((weight_policy.EXTERNAL_WEIGHT_FP16, ),
+                          strict=bool(args.externalize_weights))
+
+
 def prepare_text_config(config: dict, root: dict,
                         component: contracts.Component,
                         model_dir: str) -> dict:
@@ -80,6 +89,30 @@ def prepare_text_config(config: dict, root: dict,
         visual = thinker.get("vision_config") or root.get(
             "vision_config") or {}
         deepstack = visual.get("deepstack_visual_indexes")
-        config.setdefault("num_deepstack_features",
-                          len(deepstack) if isinstance(deepstack, list) else 3)
+        default_features = (len(deepstack) if isinstance(deepstack, list) else
+                            (3 if visual else 0))
+        config.setdefault("num_deepstack_features", default_features)
     return config
+
+
+def configure_base(config, **kwargs) -> None:
+    """Enable the native MTP feedback contract on the thinker."""
+    config.mtp_base = True
+
+
+def configure_draft(config, **kwargs) -> None:
+    """Select the checkpoint's unquantized full-attention MTP layers."""
+    if config.mtp_num_hidden_layers is None:
+        raise ValueError("Qwen3-Omni MTP draft requires mtp_num_hidden_layers")
+    config.num_hidden_layers = config.mtp_num_hidden_layers
+    config.layer_types = ["attention"] * config.num_hidden_layers
+    config.attention_layer_types = ["full_attention"
+                                    ] * config.num_hidden_layers
+    config.gdn_cfg = None
+    config.mtp_base = False
+    config.tie_word_embeddings = False
+    config.quant = replace(config.quant,
+                           quant_type=quantization.QUANT_FP16,
+                           excluded=(),
+                           layer_overrides={},
+                           is_mixed_precision=False)

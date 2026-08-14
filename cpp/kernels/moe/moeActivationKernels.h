@@ -26,20 +26,29 @@ namespace trt_edgellm
 namespace kernel
 {
 
+// Kernel-level activation type IDs for moeActivation().
+enum MoeActivationType : int32_t
+{
+    kMoeSwiGlu = 2,
+    kMoeRelu2 = 4,
+    kMoeGeGlu = 5,
+};
+
 /**
  * @brief Apply an FP16 or BF16 MoE activation.
  *
  * Supported activation types:
- * - 2: SwiGLU. The input is [numTokens, 2 * intermediateDim], with all gate values followed by all up values.
- * - 4: ReLU2. The input is [numTokens, intermediateDim].
+ * - kMoeSwiGlu: SwiGLU. The input is [numTokens, 2 * intermediateDim], with all gate values followed by all up values.
+ * - kMoeRelu2: ReLU2. The input is [numTokens, intermediateDim].
+ * - kMoeGeGlu: GeGLU. The input is [numTokens, 2 * intermediateDim], with all gate values followed by all up values.
  *
- * FP16 and BF16 support both activation types. The input and output data types must match.
+ * FP16 and BF16 support all activation types. The input and output data types must match.
  *
  * @param input Input tensor (FP16 or BF16, GPU).
  * @param output Output tensor [numTokens, intermediateDim] with the same data type as input.
  * @param numTokens Number of routed token slots.
  * @param intermediateDim Intermediate dimension.
- * @param activationType Activation type (2 for SwiGLU or 4 for ReLU2).
+ * @param activationType Activation type from MoeActivationType enum.
  * @param stream CUDA stream.
  *
  * @throws std::runtime_error If the tensor shapes, data types, devices, alignment, or activation type are invalid.

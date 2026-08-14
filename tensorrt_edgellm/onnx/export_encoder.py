@@ -98,6 +98,9 @@ _VISUAL_REGISTRY: dict[str, str] = {
     "gemma4_unified": "gemma4_unified",
     "NemotronH_Nano_VL_V2": "nemotron_omni",
     "NemotronH_Nano_Omni_Reasoning_V3": "nemotron_omni",
+    # Cosmos3-Edge reasoner: SigLIP2 packed-patch ViT + Qwen3-VL-style
+    # PatchMerger, exported on the qwen3_vl visual ONNX I/O contract.
+    "cosmos3_edge": "cosmos3_reasoner",
 }
 
 # Maps family → dotted module path inside tensorrt_edgellm
@@ -124,6 +127,8 @@ _VISUAL_FAMILY_MODULE: dict[str, str] = {
     "tensorrt_edgellm.models.gemma4.modeling_gemma4_unified_visual",
     "nemotron_omni":
     "tensorrt_edgellm.models.nemotron_omni.modeling_nemotron_omni_visual",
+    "cosmos3_reasoner":
+    "tensorrt_edgellm.models.cosmos3_reasoner.modeling_cosmos3_reasoner_visual",
 }
 
 # Maps family → build function name in that module
@@ -139,6 +144,7 @@ _VISUAL_FAMILY_BUILD_FN: dict[str, str] = {
     "gemma4": "build_gemma4_visual",
     "gemma4_unified": "build_gemma4_unified_visual",
     "nemotron_omni": "build_nemotron_omni_visual",
+    "cosmos3_reasoner": "build_cosmos3_reasoner_visual",
 }
 
 # ---------------------------------------------------------------------------
@@ -146,6 +152,7 @@ _VISUAL_FAMILY_BUILD_FN: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 _AUDIO_MODEL_TYPES: frozenset[str] = frozenset([
+    "nemotron3_5_asr",
     "qwen3_asr",
     "qwen3_omni",
     "qwen3_omni_thinker",
@@ -188,10 +195,11 @@ def _get_visual_config(model_type: str, config: dict) -> dict:
         return (config.get("vision_config")
                 or config.get("thinker_config", {}).get("vision_config")
                 or config)
-    if (model_type in ("internvl", "internvl_chat", "gemma4", "gemma4_unified")
+    if (model_type in ("internvl", "internvl_chat", "gemma4", "gemma4_unified",
+                       "cosmos3_edge")
             or model_type in _NEMOTRON_OMNI_MODEL_TYPES):
-        # InternVL / Gemma4 / Nemotron-Omni need the full config
-        # (vision + text + projection/runtime fields).
+        # InternVL / Gemma4 / Nemotron-Omni / Cosmos3-Edge need the full
+        # config (vision + text + projection/runtime fields).
         return config
     if model_type in ("phi4mm", "phi4_multimodal"):
         # Phi-4mm visual config is hardcoded (not in config.json).
@@ -226,9 +234,18 @@ def _run_dynamo_export(
     model.eval()
     translation_table = build_custom_translation_table()
 
-    assert len(dynamo_inputs) == len(onnx_input_names) and \
-        len(dynamo_inputs) == len(dynamic_shapes), \
-        f"dynamo_inputs: {len(dynamo_inputs)}, onnx_input_names: {len(onnx_input_names)}, dynamic_shapes: {len(dynamic_shapes)}"
+    def _count_export_leaves(value, *, root: bool = False) -> int:
+        if root and isinstance(value, dict):
+            return len(value)
+        if isinstance(value, (tuple, list)):
+            return sum(_count_export_leaves(v) for v in value)
+        return 1
+
+    num_dynamo_inputs = _count_export_leaves(dynamo_inputs, root=True)
+    num_dynamic_shapes = _count_export_leaves(dynamic_shapes, root=True)
+    assert num_dynamo_inputs == len(onnx_input_names) and \
+        num_dynamo_inputs == num_dynamic_shapes, \
+        f"dynamo_inputs: {num_dynamo_inputs}, onnx_input_names: {len(onnx_input_names)}, dynamic_shapes: {num_dynamic_shapes}"
 
     if isinstance(dynamo_inputs, dict):
         args = ()
@@ -343,6 +360,13 @@ def export_visual_onnx(
             os.path.dirname(os.path.abspath(output_path)))
         logger.info("Saved Phi-4mm GN projection sidecar: %s", sidecar_path)
 
+    # Nemotron-Omni sidecar tensors (runtime-executed patch embedder GEMM
+    # weights + raw pos_embed; see modeling_nemotron_omni_visual docstring).
+    if family == "nemotron_omni":
+        sidecar_path = visual_model.save_onnx_sidecar(
+            os.path.dirname(os.path.abspath(output_path)))
+        logger.info("Saved Nemotron-Omni embedder sidecar: %s", sidecar_path)
+
 
 # ---------------------------------------------------------------------------
 # Audio encoder export
@@ -399,7 +423,15 @@ def export_audio_onnx(
 
     build_fn = None
     extra_kwargs = {}
-    if model_type in _NEMOTRON_OMNI_MODEL_TYPES:
+    if model_type == "nemotron3_5_asr":
+        # FastConformer encoder for the RNN-T ASR model. Output frames feed
+        # the RNN-T joint network (see modeling_nemotron3_5_asr_decoder.py),
+        # not LLM prompt embeddings.
+        from ..models.nemotron3_5_asr.modeling_nemotron3_5_asr_audio import \
+            build_nemotron3_5_asr_audio
+        logger.info("Building Nemotron-3.5-ASR FastConformer encoder ...")
+        build_fn = build_nemotron3_5_asr_audio
+    elif model_type in _NEMOTRON_OMNI_MODEL_TYPES:
         from ..models.nemotron_omni.modeling_nemotron_omni_audio import \
             build_nemotron_omni_audio
         logger.info("Building Nemotron-Omni audio encoder ...")

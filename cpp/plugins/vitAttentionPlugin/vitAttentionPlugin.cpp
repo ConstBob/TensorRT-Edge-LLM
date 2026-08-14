@@ -25,13 +25,11 @@
 #include "kernels/contextAttentionKernels/utilKernels.h"
 #include "plugins/utils/pluginUtils.h"
 
-#ifdef CUTE_DSL_FMHA_ENABLED
+#ifdef CUTE_DSL_FMHA_BLACKWELL_ENABLED
 #include "kernels/contextAttentionKernels/cuteDslFMHARunner.h"
 #endif
 
-#ifdef CUTE_DSL_FMHA_V2_ENABLED
 #include "kernels/contextAttentionKernels/cuteDslFMHAV2Runner.h"
-#endif
 
 #include <cassert>
 #include <cstdint>
@@ -71,24 +69,19 @@ struct ViTFMHAKernelSelection
     bool canImplement{false};
 };
 
-ViTFMHAKernelSelection loadViTFMHAKernels(int32_t headSize, int32_t smVersion, nvinfer1::DataType dataType)
+ViTFMHAKernelSelection selectViTFMHAKernels(int32_t headSize, int32_t smVersion, nvinfer1::DataType dataType)
 {
-#ifdef CUTE_DSL_FMHA_ENABLED
-    if (CuteDslFMHARunner::canImplementViT(headSize, smVersion) && CuteDslFMHARunner::loadViTKernelModule())
+#ifdef CUTE_DSL_FMHA_BLACKWELL_ENABLED
+    if (CuteDslFMHARunner::canImplementViT(headSize, smVersion))
     {
-        LOG_DEBUG("CuTe DSL ViT FMHA kernel loaded for SM%d", smVersion);
         return {ViTFMHABackend::kCUTE_DSL_FMHA_BLACKWELL, true};
     }
 #endif
 
-#ifdef CUTE_DSL_FMHA_V2_ENABLED
-    if (CuteDslFMHAV2Runner::canImplementViT(headSize, smVersion, dataType)
-        && CuteDslFMHAV2Runner::loadViTKernelModule())
+    if (CuteDslFMHAV2Runner::canImplementViT(headSize, smVersion, dataType))
     {
-        LOG_DEBUG("FMHA-v2 CuTe DSL ViT FMHA kernel loaded for SM%d", smVersion);
         return {ViTFMHABackend::kCUTE_DSL_FMHA_V2, true};
     }
-#endif
 
     return {};
 }
@@ -100,17 +93,21 @@ std::vector<PluginField> ViTAttentionPluginCreator::mPluginAttributes;
 
 REGISTER_TENSORRT_PLUGIN(ViTAttentionPluginCreator);
 
-ViTAttentionPlugin::ViTAttentionPlugin(
-    std::string const& name, int32_t numHeads, int32_t headSize, std::optional<float> attentionScale)
+ViTAttentionPlugin::ViTAttentionPlugin(std::string const& name, int32_t numHeads, int32_t headSize,
+    std::optional<float> attentionScale, std::vector<float> const& qkvScales)
     : mLayerName(name)
     , mNumHeads(numHeads)
     , mHeadSize(headSize)
     , mAttentionScale(resolveAttentionScale(attentionScale, headSize))
+    , mQkvScales(qkvScales)
 {
+    ELLM_CHECK(mQkvScales.size() == 3,
+        "ViTAttentionPlugin: qkv_scales has " + std::to_string(mQkvScales.size()) + " elements (expected 3).");
+
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
 
-    ViTFMHAKernelSelection const fmhaSelection = loadViTFMHAKernels(mHeadSize, mSMVersion, mDataType);
+    ViTFMHAKernelSelection const fmhaSelection = selectViTFMHAKernels(mHeadSize, mSMVersion, mDataType);
     mFMHABackend = fmhaSelection.backend;
 
     if (!fmhaSelection.canImplement)
@@ -129,10 +126,23 @@ ViTAttentionPlugin::ViTAttentionPlugin(std::string const& name, PluginFieldColle
 {
     ELLM_CHECK(mNumHeads > 0 && mHeadSize > 0, "ViTAttentionPlugin requires both num_heads and head_size > 0.");
 
+    // Parse qkv_scales float array (3 entries: [qScale, kScale, vScale]).
+    for (int32_t i = 0; i < fc->nbFields; ++i)
+    {
+        if (std::string("qkv_scales") == fc->fields[i].name)
+        {
+            auto const* data = static_cast<float const*>(fc->fields[i].data);
+            mQkvScales.assign(data, data + fc->fields[i].length);
+            break;
+        }
+    }
+    ELLM_CHECK(mQkvScales.size() == 3,
+        "ViTAttentionPlugin: qkv_scales has " + std::to_string(mQkvScales.size()) + " elements (expected 3).");
+
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
 
-    ViTFMHAKernelSelection const fmhaSelection = loadViTFMHAKernels(mHeadSize, mSMVersion, mDataType);
+    ViTFMHAKernelSelection const fmhaSelection = selectViTFMHAKernels(mHeadSize, mSMVersion, mDataType);
     mFMHABackend = fmhaSelection.backend;
     if (!fmhaSelection.canImplement)
     {
@@ -172,7 +182,7 @@ IPluginV3* ViTAttentionPlugin::clone() noexcept
 {
     try
     {
-        auto* p = new ViTAttentionPlugin(mLayerName, mNumHeads, mHeadSize, mAttentionScale);
+        auto* p = new ViTAttentionPlugin(mLayerName, mNumHeads, mHeadSize, mAttentionScale, mQkvScales);
         p->setPluginNamespace(mNamespace.c_str());
         return p;
     }
@@ -216,13 +226,13 @@ int32_t ViTAttentionPlugin::getNbOutputs() const noexcept
 }
 
 int32_t ViTAttentionPlugin::getOutputDataTypes(DataType* outputTypes, [[maybe_unused]] int32_t nbOutputs,
-    DataType const* inputTypes, [[maybe_unused]] int32_t nbInputs) const noexcept
+    [[maybe_unused]] DataType const* inputTypes, [[maybe_unused]] int32_t nbInputs) const noexcept
 {
     try
     {
         assert(nbOutputs == kNUM_REQUIRED_OUTPUTS);
-        // Output[0] (attention) follows Q input dtype (HALF).
-        outputTypes[kOUT_ATTENTION_IDX] = inputTypes[kIN_Q_IDX];
+        // Attention output is always FP16; plugin computes FP8 internally but dequants to FP16.
+        outputTypes[kOUT_ATTENTION_IDX] = DataType::kHALF;
         return 0;
     }
     catch (std::exception const& e)
@@ -263,9 +273,12 @@ bool ViTAttentionPlugin::supportsFormatCombination(
     // Support context/generation phase outputs:
     //      attention result (linear FP16) with shape [total_S, H, D]
     // Q, K, V, and output all have the same shape [total_S, H, D]
+    // FP8 Q/K/V are accepted whenever the configuration has an FP8 kernel; the
+    // actual mode is chosen by the graph's tensor dtypes (QuantizeLinear
+    // upstream => FP8).
     auto checkQKVO = [this](PluginTensorDesc const& tensorDesc) {
         bool status{true};
-        status &= tensorDesc.type == DataType::kHALF;
+        status &= (tensorDesc.type == DataType::kHALF || (supportsFp8Mha() && tensorDesc.type == DataType::kFP8));
         status &= tensorDesc.format == TensorFormat::kLINEAR;
         status &= tensorDesc.dims.nbDims == 3;
         auto const tensorDim = tensorDesc.dims;
@@ -311,8 +324,8 @@ bool ViTAttentionPlugin::supportsFormatCombination(
         switch (pos)
         {
         case kIN_Q_IDX: result = checkQKVO(inOut[0].desc); break;
-        case kIN_K_IDX: result = checkQKVO(inOut[1].desc); break;
-        case kIN_V_IDX: result = checkQKVO(inOut[2].desc); break;
+        case kIN_K_IDX: result = checkQKVO(inOut[1].desc) && inOut[1].desc.type == inOut[kIN_Q_IDX].desc.type; break;
+        case kIN_V_IDX: result = checkQKVO(inOut[2].desc) && inOut[2].desc.type == inOut[kIN_Q_IDX].desc.type; break;
         case kIN_CU_SEQLENS_IDX: result = checkCuSeqLens(inOut[3].desc); break;
         case kIN_MAX_SEQLEN_CARRIER_IDX: result = checkMaxSeqLenCarrier(inOut[4].desc); break;
         default: break;
@@ -323,7 +336,10 @@ bool ViTAttentionPlugin::supportsFormatCombination(
         int32_t outPos = pos - nbInputs;
         switch (outPos)
         {
-        case kOUT_ATTENTION_IDX: result = checkQKVO(inOut[pos].desc); break;
+        case kOUT_ATTENTION_IDX:
+            // Attention output is always FP16, also for FP8 Q/K/V.
+            result = checkQKVO(inOut[pos].desc) && inOut[pos].desc.type == DataType::kHALF;
+            break;
         default: break;
         }
     }
@@ -338,9 +354,8 @@ int32_t ViTAttentionPlugin::configurePlugin([[maybe_unused]] DynamicPluginTensor
     return 0; // No need to configure anything since we will only use the runtime tensor shapes.
 }
 
-size_t ViTAttentionPlugin::getWorkspaceSize([[maybe_unused]] DynamicPluginTensorDesc const* inputs,
-    [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] DynamicPluginTensorDesc const* outputs,
-    [[maybe_unused]] int32_t nbOutputs) const noexcept
+size_t ViTAttentionPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, [[maybe_unused]] int32_t nbInputs,
+    [[maybe_unused]] DynamicPluginTensorDesc const* outputs, [[maybe_unused]] int32_t nbOutputs) const noexcept
 {
     return 0;
 }
@@ -351,7 +366,7 @@ size_t ViTAttentionPlugin::getWorkspaceSize([[maybe_unused]] DynamicPluginTensor
 
 int32_t ViTAttentionPlugin::enqueue(PluginTensorDesc const* inputDesc,
     [[maybe_unused]] PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs,
-    [[maybe_unused]] void* workspace, cudaStream_t stream) noexcept
+    void* workspace, cudaStream_t stream) noexcept
 {
     // Construct non-owned tensor objects from I/O data pointers and shapes.
     // Q, K, V inputs in the graph will be in same shape [total_S, H, D].
@@ -369,28 +384,45 @@ int32_t ViTAttentionPlugin::enqueue(PluginTensorDesc const* inputDesc,
     rt::Tensor attentionOutputTensor(outputs[kOUT_ATTENTION_IDX], rt::Coords{attentionOutputDesc.dims},
         rt::DeviceType::kGPU, attentionOutputDesc.type);
 
-#if defined(CUTE_DSL_FMHA_ENABLED) || defined(CUTE_DSL_FMHA_V2_ENABLED)
     PluginTensorDesc const& maxSeqLenCarrierDesc = inputDesc[kIN_MAX_SEQLEN_CARRIER_IDX];
     int32_t runtimeMaxSeqLen = static_cast<int32_t>(maxSeqLenCarrierDesc.dims.d[0]);
     int32_t runtimeBatchSize = static_cast<int32_t>(cuSeqLensInputDesc.dims.d[0]) - 1;
-#endif
 
-#ifdef CUTE_DSL_FMHA_ENABLED
+#ifdef CUTE_DSL_FMHA_BLACKWELL_ENABLED
     if (mFMHABackend == ViTFMHABackend::kCUTE_DSL_FMHA_BLACKWELL)
     {
         int32_t totalSeqLen = static_cast<int32_t>(qInputDesc.dims.d[0]);
         CuteDslFMHARunner runner(mNumHeads, mNumHeads, mHeadSize);
-        runner.run(qInputTensor.dataPointer<half>(), kInputTensor.dataPointer<half>(), vInputTensor.dataPointer<half>(),
-            attentionOutputTensor.dataPointer<half>(), cuSeqLensTensor.dataPointer<int32_t>(), totalSeqLen,
-            runtimeMaxSeqLen, runtimeBatchSize, stream, mAttentionScale);
-        return 0;
+        if (!runner.preflightViT(stream))
+        {
+            return -1;
+        }
+        if (qInputDesc.type == DataType::kFP8)
+        {
+            // Q/K/V arrive pre-quantized as FP8 via upstream QuantizeLinear nodes.
+            return runner.run(inputs[kIN_Q_IDX], inputs[kIN_K_IDX], inputs[kIN_V_IDX],
+                       attentionOutputTensor.dataPointer<half>(), cuSeqLensTensor.dataPointer<int32_t>(), totalSeqLen,
+                       runtimeMaxSeqLen, runtimeBatchSize, stream, mAttentionScale, /*fp8Input=*/true, mQkvScales[0],
+                       mQkvScales[1], mQkvScales[2])
+                ? 0
+                : -1;
+        }
+        return runner.run(qInputTensor.dataPointer<half>(), kInputTensor.dataPointer<half>(),
+                   vInputTensor.dataPointer<half>(), attentionOutputTensor.dataPointer<half>(),
+                   cuSeqLensTensor.dataPointer<int32_t>(), totalSeqLen, runtimeMaxSeqLen, runtimeBatchSize, stream,
+                   mAttentionScale)
+            ? 0
+            : -1;
     }
 #endif
-#ifdef CUTE_DSL_FMHA_V2_ENABLED
     if (mFMHABackend == ViTFMHABackend::kCUTE_DSL_FMHA_V2)
     {
         int32_t const totalSeqLen = static_cast<int32_t>(qInputDesc.dims.d[0]);
         CuteDslFMHAV2Runner runner(mNumHeads, mNumHeads, mHeadSize);
+        if (!runner.preflightViT(stream))
+        {
+            return -1;
+        }
         if (!runner.run(qInputTensor.dataPointer<half>(), kInputTensor.dataPointer<half>(),
                 vInputTensor.dataPointer<half>(), attentionOutputTensor.dataPointer<half>(),
                 cuSeqLensTensor.dataPointer<int32_t>(), totalSeqLen, runtimeMaxSeqLen, runtimeBatchSize, stream,
@@ -400,7 +432,6 @@ int32_t ViTAttentionPlugin::enqueue(PluginTensorDesc const* inputDesc,
         }
         return 0;
     }
-#endif
     LOG_ERROR("No ViT FMHA backend is available for plugin '%s'.", mLayerName.c_str());
     return -1;
 }
@@ -423,6 +454,8 @@ PluginFieldCollection const* ViTAttentionPlugin::getFieldsToSerialize() noexcept
     mDataToSerialize.emplace_back("num_heads", &mNumHeads, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("head_size", &mHeadSize, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("attention_scale", &mAttentionScale, PluginFieldType::kFLOAT32, 1);
+    mDataToSerialize.emplace_back(
+        "qkv_scales", mQkvScales.data(), PluginFieldType::kFLOAT32, static_cast<int32_t>(mQkvScales.size()));
     mFCToSerialize.nbFields = static_cast<int32_t>(mDataToSerialize.size());
     mFCToSerialize.fields = mDataToSerialize.data();
     return &mFCToSerialize;
@@ -441,6 +474,7 @@ ViTAttentionPluginCreator::ViTAttentionPluginCreator()
     mPluginAttributes.emplace_back(PluginField("num_heads", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("head_size", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("attention_scale", nullptr, PluginFieldType::kFLOAT32, 0));
+    mPluginAttributes.emplace_back(PluginField("qkv_scales", nullptr, PluginFieldType::kFLOAT32, 0));
     mFieldCollection.nbFields = mPluginAttributes.size();
     mFieldCollection.fields = mPluginAttributes.data();
 }

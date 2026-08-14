@@ -22,6 +22,7 @@
 #include "memoryMonitor.h"
 #include "profiling/layerProfiler.h"
 #include "profiling/timer.h"
+#include "runtime/state/contextCache/contextCacheMetrics.h"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -298,6 +299,10 @@ void outputPrefillProfile(std::ostream& output, metrics::LLMPrefillMetrics const
         output << "=== LLM Prefill ===" << std::endl;
         output << "Reused Tokens: " << prefillMetrics.reusedTokens << std::endl;
         output << "Computed Tokens: " << prefillMetrics.computedTokens << std::endl;
+        if (prefillMetrics.prunedTokens > 0)
+        {
+            output << "Pruned Tokens (visual-token pruning): " << prefillMetrics.prunedTokens << std::endl;
+        }
         output << "Average Tokens per Run: " << std::fixed << std::setprecision(2)
                << getPrefillAverageTokensPerRun(prefillMetrics) << std::endl;
         output << "Average Time per Run: " << std::fixed << std::setprecision(4)
@@ -308,6 +313,33 @@ void outputPrefillProfile(std::ostream& output, metrics::LLMPrefillMetrics const
                << getPrefillAverageTimePerToken(prefillMetrics) << " ms" << std::endl;
         appendStageTimingData(output, metrics::StageNames::kLLM_PREFILL, "LLM Prefill");
     }
+}
+
+void outputContextCacheProfile(std::ostream& output, rt::ContextCacheMetrics const& cacheMetrics)
+{
+    output << "=== Context Cache ===" << std::endl;
+    output << "Sequences: admitted=" << cacheMetrics.admittedSequences << ", hits=" << cacheMetrics.hitSequences
+           << ", media_aware=" << cacheMetrics.mediaAwareSequences
+           << ", lookup_bypass=" << cacheMetrics.lookupBypassSequences
+           << ", forced_cold=" << cacheMetrics.forcedColdSequences << std::endl;
+    output << "Tokens: matched=" << cacheMetrics.matchedTokens << ", reused=" << cacheMetrics.reusedTokens << std::endl;
+    output << "Plans: standard=" << cacheMetrics.standardPlans
+           << ", no_reusable_prefix=" << cacheMetrics.noReusablePrefixPlans
+           << ", full_input_rewind=" << cacheMetrics.fullInputRewindPlans << std::endl;
+    output << "Publications: attempts=" << cacheMetrics.publicationAttempts
+           << ", committed=" << cacheMetrics.committedPublications << ", existing=" << cacheMetrics.existingPublications
+           << std::endl;
+    output << "Records: current=" << cacheMetrics.currentRecords << ", evicted=" << cacheMetrics.evictedRecords
+           << std::endl;
+    output << "Base KV pages: free=" << cacheMetrics.baseKvPages.free
+           << ", capacity=" << cacheMetrics.baseKvPages.capacity << std::endl;
+    output << "Draft KV pages: free=" << cacheMetrics.draftKvPages.free
+           << ", capacity=" << cacheMetrics.draftKvPages.capacity << std::endl;
+    output << "Recurrent snapshots: free=" << cacheMetrics.recurrentSnapshots.free
+           << ", capacity=" << cacheMetrics.recurrentSnapshots.capacity << std::endl;
+    output << "Partial KV snapshots: free=" << cacheMetrics.partialKvSnapshots.free
+           << ", capacity=" << cacheMetrics.partialKvSnapshots.capacity << std::endl;
+    output << "Degradation: hybrid_snapshot_pressure_skips=" << cacheMetrics.hybridSnapshotPressureSkips << std::endl;
 }
 
 void outputGenerationProfile(std::ostream& output, metrics::LLMGenerationMetrics const& generationMetrics)
@@ -453,38 +485,64 @@ void outputOmniProfile(std::ostream& output, metrics::OmniTalkerMetrics const& t
 void outputMemoryProfile(std::ostream& output, MemoryMonitor const& memoryMonitor)
 {
     output << "=== Memory Usage ===" << std::endl;
-
-    if (memoryMonitor.isIntegratedGPU())
-    {
-        // iGPU: Only show unified memory
-        size_t peakUnifiedMemoryBytes = memoryMonitor.getPeakUnifiedMemory();
-        output << "Peak Unified Memory: " << std::fixed << std::setprecision(2)
-               << rt::utils::toMB(peakUnifiedMemoryBytes) << " MB (" << peakUnifiedMemoryBytes << " bytes)"
-               << std::endl;
-    }
-    else
-    {
-        // dGPU: Show both GPU and CPU memory
-        size_t peakGpuMemoryBytes = memoryMonitor.getPeakGpuMemory();
-        size_t peakCpuMemoryBytes = memoryMonitor.getPeakCpuMemory();
-        output << "Peak GPU Memory: " << std::fixed << std::setprecision(2) << rt::utils::toMB(peakGpuMemoryBytes)
-               << " MB (" << peakGpuMemoryBytes << " bytes)" << std::endl;
-        output << "Peak CPU Memory: " << std::fixed << std::setprecision(2) << rt::utils::toMB(peakCpuMemoryBytes)
-               << " MB (" << peakCpuMemoryBytes << " bytes)" << std::endl;
-    }
+    size_t const peakGpuMemoryBytes = memoryMonitor.getPeakGpuMemory();
+    size_t const peakCpuMemoryBytes = memoryMonitor.getPeakCpuMemory();
+    output << "Peak GPU Memory: " << std::fixed << std::setprecision(2) << rt::utils::toMB(peakGpuMemoryBytes)
+           << " MB (" << peakGpuMemoryBytes << " bytes)" << std::endl;
+    output << "Peak CPU Memory: " << std::fixed << std::setprecision(2) << rt::utils::toMB(peakCpuMemoryBytes)
+           << " MB (" << peakCpuMemoryBytes << " bytes)" << std::endl;
+    output << "GPU Memory Metric: " << memoryMonitor.getGpuMemoryMetric() << std::endl;
 }
 
 void addJsonPrefillSummary(nlohmann::json& summary, metrics::LLMPrefillMetrics const& prefillMetrics)
 {
     if (prefillMetrics.getTotalRuns() > 0)
     {
-        summary["prefill"] = {{"total_runs", prefillMetrics.getTotalRuns()},
-            {"reused_tokens", prefillMetrics.reusedTokens}, {"computed_tokens", prefillMetrics.computedTokens},
-            {"average_tokens_per_run", getPrefillAverageTokensPerRun(prefillMetrics)},
-            {"average_time_per_run_ms", getPrefillAverageTimePerRun(prefillMetrics)},
-            {"tokens_per_second", getPrefillTokensPerSecond(prefillMetrics)},
-            {"average_time_per_token_ms", getPrefillAverageTimePerToken(prefillMetrics)}};
+        summary["prefill"]
+            = {{"total_runs", prefillMetrics.getTotalRuns()}, {"reused_tokens", prefillMetrics.reusedTokens},
+                {"computed_tokens", prefillMetrics.computedTokens}, {"pruned_tokens", prefillMetrics.prunedTokens},
+                {"average_tokens_per_run", getPrefillAverageTokensPerRun(prefillMetrics)},
+                {"average_time_per_run_ms", getPrefillAverageTimePerRun(prefillMetrics)},
+                {"tokens_per_second", getPrefillTokensPerSecond(prefillMetrics)},
+                {"average_time_per_token_ms", getPrefillAverageTimePerToken(prefillMetrics)}};
     }
+}
+
+void addJsonContextCacheSummary(nlohmann::json& summary, rt::ContextCacheMetrics const& cacheMetrics)
+{
+    auto pool = [](rt::ContextCachePoolMetrics const& metrics) {
+        return nlohmann::json{{"free", metrics.free}, {"capacity", metrics.capacity}};
+    };
+    summary["context_cache"] = {{"admitted_sequences", cacheMetrics.admittedSequences},
+        {"hit_sequences", cacheMetrics.hitSequences}, {"media_aware_sequences", cacheMetrics.mediaAwareSequences},
+        {"lookup_bypass_sequences", cacheMetrics.lookupBypassSequences},
+        {"forced_cold_sequences", cacheMetrics.forcedColdSequences}, {"matched_tokens", cacheMetrics.matchedTokens},
+        {"reused_tokens", cacheMetrics.reusedTokens},
+        {"plans",
+            {{"standard", cacheMetrics.standardPlans}, {"no_reusable_prefix", cacheMetrics.noReusablePrefixPlans},
+                {"full_input_rewind", cacheMetrics.fullInputRewindPlans}}},
+        {"publications",
+            {{"attempts", cacheMetrics.publicationAttempts}, {"committed", cacheMetrics.committedPublications},
+                {"existing", cacheMetrics.existingPublications},
+                {"successful_endpoints", cacheMetrics.publishedEndpoints}}},
+        {"hybrid",
+            {{"restores", cacheMetrics.hybridRestores},
+                {"snapshot_pressure_skips", cacheMetrics.hybridSnapshotPressureSkips},
+                {"capture_synchronizations", cacheMetrics.hybridCaptureSynchronizations}}},
+        {"speculative",
+            {{"full_page_replays", cacheMetrics.specFullPageReplays},
+                {"pair_publications", cacheMetrics.specPairPublications}}},
+        {"planning_nanoseconds", cacheMetrics.planningNanoseconds},
+        {"records", {{"current", cacheMetrics.currentRecords}, {"evicted", cacheMetrics.evictedRecords}}},
+        {"resource_pools",
+            {{"base_kv_pages", pool(cacheMetrics.baseKvPages)}, {"draft_kv_pages", pool(cacheMetrics.draftKvPages)},
+                {"recurrent_snapshots", pool(cacheMetrics.recurrentSnapshots)},
+                {"partial_kv_snapshots", pool(cacheMetrics.partialKvSnapshots)}}},
+        {"reclaimed_resources",
+            {{"base_kv_pages", cacheMetrics.reclaimedBaseKvPages},
+                {"draft_kv_pages", cacheMetrics.reclaimedDraftKvPages},
+                {"recurrent_snapshots", cacheMetrics.reclaimedRecurrentSnapshots},
+                {"partial_kv_snapshots", cacheMetrics.reclaimedPartialKvSnapshots}}}};
 }
 
 void addJsonGenerationSummary(nlohmann::json& summary, metrics::LLMGenerationMetrics const& generationMetrics)
@@ -635,23 +693,13 @@ void addJsonTimingStages(nlohmann::json& summary)
 
 void addJsonMemorySummary(nlohmann::json& summary, MemoryMonitor const& memoryMonitor)
 {
-    if (memoryMonitor.isIntegratedGPU())
-    {
-        // iGPU: Only add unified memory
-        size_t peakUnifiedMemoryBytes = memoryMonitor.getPeakUnifiedMemory();
-        summary["peak_unified_memory_bytes"] = peakUnifiedMemoryBytes;
-        summary["peak_unified_memory_mb"] = rt::utils::toMB(peakUnifiedMemoryBytes);
-    }
-    else
-    {
-        // dGPU: Add both GPU and CPU memory
-        size_t peakGpuMemoryBytes = memoryMonitor.getPeakGpuMemory();
-        size_t peakCpuMemoryBytes = memoryMonitor.getPeakCpuMemory();
-        summary["peak_gpu_memory_bytes"] = peakGpuMemoryBytes;
-        summary["peak_gpu_memory_mb"] = rt::utils::toMB(peakGpuMemoryBytes);
-        summary["peak_cpu_memory_bytes"] = peakCpuMemoryBytes;
-        summary["peak_cpu_memory_mb"] = rt::utils::toMB(peakCpuMemoryBytes);
-    }
+    size_t const peakGpuMemoryBytes = memoryMonitor.getPeakGpuMemory();
+    size_t const peakCpuMemoryBytes = memoryMonitor.getPeakCpuMemory();
+    summary["peak_gpu_memory_bytes"] = peakGpuMemoryBytes;
+    summary["peak_gpu_memory_mb"] = rt::utils::toMB(peakGpuMemoryBytes);
+    summary["peak_cpu_memory_bytes"] = peakCpuMemoryBytes;
+    summary["peak_cpu_memory_mb"] = rt::utils::toMB(peakCpuMemoryBytes);
+    summary["gpu_memory_metric"] = memoryMonitor.getGpuMemoryMetric();
 }
 
 /**

@@ -25,20 +25,39 @@
 
 #include <cmath>
 #include <cstring>
-#include <mutex>
 
 namespace trt_edgellm
 {
 
-gdn_decode_Kernel_Module_t CuteDslGDNRunner::sDecodeModule = {};
-gdn_prefill_Kernel_Module_t CuteDslGDNRunner::sPrefillModule = {};
-#ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
-gdn_prefill_blackwell_Kernel_Module_t CuteDslGDNRunner::sBlackwellPrefillModule = {};
-#endif
-gdn_decode_mtp_cache_Kernel_Module_t CuteDslGDNRunner::sMTPDecodeCacheModule = {};
-bool CuteDslGDNRunner::sLoaded = false;
+namespace
+{
 
-static std::mutex sGDNMutex;
+#ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
+bool isBlackwellSm(int32_t smVersion)
+{
+    return smVersion == 100 || smVersion == 101 || smVersion == 110;
+}
+#endif
+
+#ifdef CUTE_DSL_GDN_BLACKWELL_GEFORCE_ENABLED
+bool isBlackwellGeforceSm(int32_t smVersion)
+{
+    return smVersion == 120 || smVersion == 121;
+}
+#endif
+
+} // namespace
+
+detail::LazyKernelModule<gdn_decode_Kernel_Module_t> CuteDslGDNRunner::sDecodeModule{};
+detail::LazyKernelModule<gdn_prefill_Kernel_Module_t> CuteDslGDNRunner::sPrefillModule{};
+#ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
+detail::LazyKernelModule<gdn_prefill_blackwell_Kernel_Module_t> CuteDslGDNRunner::sBlackwellPrefillModule{};
+#endif
+#ifdef CUTE_DSL_GDN_BLACKWELL_GEFORCE_ENABLED
+detail::LazyKernelModule<gdn_prefill_blackwell_geforce_Kernel_Module_t>
+    CuteDslGDNRunner::sBlackwellGeforcePrefillModule{};
+#endif
+detail::LazyKernelModule<gdn_decode_mtp_cache_Kernel_Module_t> CuteDslGDNRunner::sMTPDecodeCacheModule{};
 
 #define SET_4D_TENSOR(tensor, data_ptr, dim0, dim1, dim2, dim3)                                                        \
     do                                                                                                                 \
@@ -85,54 +104,44 @@ bool CuteDslGDNRunner::canImplement(int32_t kDim, int32_t vDim, int32_t smVersio
     return (smVersion >= 80) && (kDim == 128) && (vDim == 128);
 }
 
-bool CuteDslGDNRunner::loadKernelModules()
+bool CuteDslGDNRunner::ensureKernelModules(GDNParams const& params, cudaStream_t stream)
 {
-    std::lock_guard<std::mutex> lock(sGDNMutex);
-    if (sLoaded)
+    if (params.use_mtp)
     {
-        return true;
+        return detail::ensureModuleLoaded<gdn_decode_mtp_cache_Kernel_Module_Load,
+            gdn_decode_mtp_cache_Kernel_Module_Unload>(sMTPDecodeCacheModule, "gdn_decode_mtp_cache", stream);
     }
-    try
+    if (params.seq_len == 1)
     {
-        gdn_decode_Kernel_Module_Load(&sDecodeModule);
-        gdn_prefill_Kernel_Module_Load(&sPrefillModule);
-#ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
-        gdn_prefill_blackwell_Kernel_Module_Load(&sBlackwellPrefillModule);
+        return detail::ensureModuleLoaded<gdn_decode_Kernel_Module_Load, gdn_decode_Kernel_Module_Unload>(
+            sDecodeModule, "gdn_decode", stream);
+    }
+#ifdef CUTE_DSL_GDN_BLACKWELL_GEFORCE_ENABLED
+    if (isBlackwellGeforceSm(params.smVersion) && params.h > 0 && params.hv % params.h == 0)
+    {
+        return detail::ensureModuleLoaded<gdn_prefill_blackwell_geforce_Kernel_Module_Load,
+            gdn_prefill_blackwell_geforce_Kernel_Module_Unload>(
+            sBlackwellGeforcePrefillModule, "gdn_prefill_blackwell_geforce", stream);
+    }
 #endif
-        gdn_decode_mtp_cache_Kernel_Module_Load(&sMTPDecodeCacheModule);
-        LOG_DEBUG(
-            "CuTe DSL GDN kernel modules loaded (decode + prefill + MTP"
 #ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
-            " + blackwell"
-#endif
-            ")");
-        sLoaded = true;
-        return true;
-    }
-    catch (...)
+    if (isBlackwellSm(params.smVersion))
     {
-        LOG_ERROR("Failed to load CuTe DSL GDN kernel modules");
-        return false;
+        return detail::ensureModuleLoaded<gdn_prefill_blackwell_Kernel_Module_Load,
+            gdn_prefill_blackwell_Kernel_Module_Unload>(sBlackwellPrefillModule, "gdn_prefill_blackwell", stream);
     }
-}
-
-void CuteDslGDNRunner::unloadKernelModules()
-{
-    std::lock_guard<std::mutex> lock(sGDNMutex);
-    if (sLoaded)
-    {
-        gdn_decode_Kernel_Module_Unload(&sDecodeModule);
-        gdn_prefill_Kernel_Module_Unload(&sPrefillModule);
-#ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
-        gdn_prefill_blackwell_Kernel_Module_Unload(&sBlackwellPrefillModule);
 #endif
-        gdn_decode_mtp_cache_Kernel_Module_Unload(&sMTPDecodeCacheModule);
-        sLoaded = false;
-    }
+    return detail::ensureModuleLoaded<gdn_prefill_Kernel_Module_Load, gdn_prefill_Kernel_Module_Unload>(
+        sPrefillModule, "gdn_prefill", stream);
 }
 
 int CuteDslGDNRunner::run(GDNParams const& params, cudaStream_t stream)
 {
+    if (!ensureKernelModules(params, stream))
+    {
+        return -1;
+    }
+
     // MTP decode takes priority: handles any seq_len for speculative-decoding verification.
     if (params.use_mtp)
     {
@@ -142,8 +151,14 @@ int CuteDslGDNRunner::run(GDNParams const& params, cudaStream_t stream)
     {
         return runDecode(params, stream);
     }
+#ifdef CUTE_DSL_GDN_BLACKWELL_GEFORCE_ENABLED
+    if (isBlackwellGeforceSm(params.smVersion) && params.h > 0 && params.hv % params.h == 0)
+    {
+        return runPrefillBlackwellGeforce(params, stream);
+    }
+#endif
 #ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
-    if (params.smVersion >= 100)
+    if (isBlackwellSm(params.smVersion))
     {
         return runPrefillBlackwell(params, stream);
     }
@@ -153,11 +168,6 @@ int CuteDslGDNRunner::run(GDNParams const& params, cudaStream_t stream)
 
 int CuteDslGDNRunner::runDecode(GDNParams const& params, cudaStream_t stream)
 {
-    if (!sLoaded)
-    {
-        LOG_ERROR("CuTe DSL GDN decode kernel module not loaded.");
-        return -1;
-    }
     int32_t const n = params.n;
     int32_t const h = params.h;
     int32_t const hv = params.hv;
@@ -203,19 +213,12 @@ int CuteDslGDNRunner::runDecode(GDNParams const& params, cudaStream_t stream)
     gdn_decode_Tensor_o_t oTensor{};
     SET_4D_TENSOR(oTensor, params.o, n, 1, hv, v);
 
-    cute_dsl_gdn_decode_wrapper(&sDecodeModule, &qTensor, &kTensor, &vTensor, &aTensor, &bTensor, &A_logTensor,
-        &dt_biasTensor, &h0_sourceTensor, &contextLengthsTensor, &oTensor, stream);
-
-    return 0;
+    return cute_dsl_gdn_decode_wrapper(&sDecodeModule.module, &qTensor, &kTensor, &vTensor, &aTensor, &bTensor,
+        &A_logTensor, &dt_biasTensor, &h0_sourceTensor, &contextLengthsTensor, &oTensor, stream);
 }
 
 int CuteDslGDNRunner::runPrefill(GDNParams const& params, cudaStream_t stream)
 {
-    if (!sLoaded)
-    {
-        LOG_ERROR("CuTe DSL GDN prefill kernel module not loaded.");
-        return -1;
-    }
     int32_t const n = params.n;
     int32_t const seq_len = params.seq_len;
     int32_t const h = params.h;
@@ -256,20 +259,13 @@ int CuteDslGDNRunner::runPrefill(GDNParams const& params, cudaStream_t stream)
     gdn_prefill_Tensor_o_t oTensor{};
     SET_4D_TENSOR(oTensor, params.o, n, seq_len, hv, v);
 
-    cute_dsl_gdn_prefill_wrapper(&sPrefillModule, &qTensor, &kTensor, &vTensor, &aTensor, &bTensor, &A_logTensor,
-        &dt_biasTensor, &h0_sourceTensor, &contextLengthsTensor, &oTensor, seq_len, stream);
-
-    return 0;
+    return cute_dsl_gdn_prefill_wrapper(&sPrefillModule.module, &qTensor, &kTensor, &vTensor, &aTensor, &bTensor,
+        &A_logTensor, &dt_biasTensor, &h0_sourceTensor, &contextLengthsTensor, &oTensor, seq_len, stream);
 }
 
 int CuteDslGDNRunner::runPrefillBlackwell(GDNParams const& params, cudaStream_t stream)
 {
 #ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
-    if (!sLoaded)
-    {
-        LOG_ERROR("CuTe DSL GDN Blackwell prefill kernel module not loaded.");
-        return -1;
-    }
     int32_t const n = params.n;
     int32_t const seq_len = params.seq_len;
     int32_t const h = params.h;
@@ -343,9 +339,13 @@ int CuteDslGDNRunner::runPrefillBlackwell(GDNParams const& params, cudaStream_t 
     SET_4D_TENSOR(oTensor, params.o, n, seq_len, hv, v);
 
     // Step 2: Run the Blackwell prefill kernel.
-    cute_dsl_gdn_prefill_blackwell_wrapper(&sBlackwellPrefillModule, &qTensor, &kTensor, &vTensor, &aTensor, &bTensor,
-        &A_logTensor, &dt_biasTensor, &h0InTensor, &h0OutTensor, &oTensor, &cuSeqLensTensor,
-        getDeviceMultiProcessorCount(), stream);
+    int32_t const result = cute_dsl_gdn_prefill_blackwell_wrapper(&sBlackwellPrefillModule.module, &qTensor, &kTensor,
+        &vTensor, &aTensor, &bTensor, &A_logTensor, &dt_biasTensor, &h0InTensor, &h0OutTensor, &oTensor,
+        &cuSeqLensTensor, getDeviceMultiProcessorCount(), stream);
+    if (result != 0)
+    {
+        return result;
+    }
 
     // Step 3: Transpose V-major output state back to K-major into scratch.
     launchGdnStateTranspose(params.h0_source, params.h0_scratch, numStateBlocks, k, stream);
@@ -359,14 +359,84 @@ int CuteDslGDNRunner::runPrefillBlackwell(GDNParams const& params, cudaStream_t 
 #endif
 }
 
-int CuteDslGDNRunner::runDecodeMTP(GDNParams const& params, cudaStream_t stream)
+int CuteDslGDNRunner::runPrefillBlackwellGeforce(GDNParams const& params, cudaStream_t stream)
 {
-    if (!sLoaded)
+#ifdef CUTE_DSL_GDN_BLACKWELL_GEFORCE_ENABLED
+    if (params.tensormap_scratch == nullptr)
     {
-        LOG_ERROR("CuTe DSL GDN MTP decode kernel module not loaded.");
+        LOG_ERROR("GDN Blackwell GeForce prefill requires tensor-map scratch.");
         return -1;
     }
 
+    int32_t const n = params.n;
+    int32_t const seqLen = params.seq_len;
+    int32_t const h = params.h;
+    int32_t const hv = params.hv;
+    int32_t const k = params.k_dim;
+    int32_t const v = params.v_dim;
+    int32_t const smCount = getDeviceMultiProcessorCount();
+    if (smCount > kBlackwellGeforceMaxSMCount)
+    {
+        LOG_ERROR(
+            "GDN Blackwell GeForce prefill supports at most %d SMs, got %d.", kBlackwellGeforceMaxSMCount, smCount);
+        return -1;
+    }
+
+    // Match the existing optimized Blackwell path: all consumers must observe
+    // the same normalized Q/K values.
+    launchGdnL2NormQK(params.q, params.k, n, seqLen, h, k, stream);
+
+    gdn_prefill_blackwell_geforce_Tensor_q_t qTensor{};
+    SET_4D_TENSOR(qTensor, params.q, n, seqLen, h, k);
+    gdn_prefill_blackwell_geforce_Tensor_k_t kTensor{};
+    SET_4D_TENSOR(kTensor, params.k, n, seqLen, h, k);
+    gdn_prefill_blackwell_geforce_Tensor_v_t vTensor{};
+    SET_4D_TENSOR(vTensor, params.v, n, seqLen, hv, v);
+    gdn_prefill_blackwell_geforce_Tensor_a_t aTensor{};
+    SET_3D_TENSOR(aTensor, params.a, n, seqLen, hv);
+    gdn_prefill_blackwell_geforce_Tensor_b_t bTensor{};
+    SET_3D_TENSOR(bTensor, params.b, n, seqLen, hv);
+
+    gdn_prefill_blackwell_geforce_Tensor_A_log_t ALogTensor{};
+    SET_1D_TENSOR(ALogTensor, params.A_log, hv);
+    gdn_prefill_blackwell_geforce_Tensor_dt_bias_t dtBiasTensor{};
+    SET_1D_TENSOR(dtBiasTensor, params.dt_bias, hv);
+
+    // This kernel is in-place safe: each CTA exclusively owns one [n, hv]
+    // state slice, loads it into registers, and writes it back only after
+    // processing all sequence blocks.
+    gdn_prefill_blackwell_geforce_Tensor_h0_in_t h0InTensor{};
+    h0InTensor.data = params.h0_source;
+    h0InTensor.dynamic_shapes[0] = n;
+    h0InTensor.dynamic_shapes[1] = hv;
+    h0InTensor.dynamic_strides[0] = static_cast<int64_t>(hv) * k * v;
+
+    gdn_prefill_blackwell_geforce_Tensor_h0_out_t h0OutTensor{};
+    h0OutTensor.data = params.h0_source;
+    h0OutTensor.dynamic_shapes[0] = n;
+    h0OutTensor.dynamic_shapes[1] = hv;
+    h0OutTensor.dynamic_strides[0] = static_cast<int64_t>(hv) * k * v;
+
+    gdn_prefill_blackwell_geforce_Tensor_context_lengths_t contextLengthsTensor{};
+    SET_1D_TENSOR(contextLengthsTensor, params.context_lengths, n);
+    gdn_prefill_blackwell_geforce_Tensor_o_t oTensor{};
+    SET_4D_TENSOR(oTensor, params.o, n, seqLen, hv, v);
+
+    gdn_prefill_blackwell_geforce_Tensor_tensormap_scratch_t tensormapScratchTensor{};
+    SET_1D_TENSOR(tensormapScratchTensor, params.tensormap_scratch,
+        kBlackwellGeforceMaxSMCount * kBlackwellGeforceTensorMapDescriptorBytes);
+
+    return cute_dsl_gdn_prefill_blackwell_geforce_wrapper(&sBlackwellGeforcePrefillModule.module, &qTensor, &kTensor,
+        &vTensor, &aTensor, &bTensor, &ALogTensor, &dtBiasTensor, &h0InTensor, &h0OutTensor, &contextLengthsTensor,
+        &oTensor, &tensormapScratchTensor, stream);
+#else
+    LOG_ERROR("Blackwell GeForce GDN prefill not compiled in this build.");
+    return -1;
+#endif
+}
+
+int CuteDslGDNRunner::runDecodeMTP(GDNParams const& params, cudaStream_t stream)
+{
     int32_t const n = params.n;
     int32_t const seq_len = params.seq_len;
     int32_t const h = params.h;
@@ -441,10 +511,8 @@ int CuteDslGDNRunner::runDecodeMTP(GDNParams const& params, cudaStream_t stream)
     intermTensor.dynamic_strides[2] = static_cast<int64_t>(k) * v;
     intermTensor.dynamic_strides[3] = static_cast<int64_t>(v);
 
-    cute_dsl_gdn_decode_mtp_cache_wrapper(&sMTPDecodeCacheModule, &h0Tensor, &qTensor, &kTensor, &vTensor, &aTensor,
-        &bTensor, &A_logTensor, &dt_biasTensor, &oTensor, &intermTensor, seq_len, stream);
-
-    return 0;
+    return cute_dsl_gdn_decode_mtp_cache_wrapper(&sMTPDecodeCacheModule.module, &h0Tensor, &qTensor, &kTensor, &vTensor,
+        &aTensor, &bTensor, &A_logTensor, &dt_biasTensor, &oTensor, &intermTensor, seq_len, stream);
 }
 
 } // namespace trt_edgellm

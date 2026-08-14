@@ -21,6 +21,7 @@
 #include "common/cudaMacros.h"
 #include "common/logger.h"
 #include "common/tensor.h"
+#include "common/trtUtils.h"
 // {$edge-llm-internal-release begin}
 #include "kernels/multiDeviceKernels/shmAllReduce.h"
 // {$edge-llm-internal-release end}
@@ -68,6 +69,178 @@ using NcclAllReduceFn = int (*)(void const*, void*, size_t, int, int, void*, cud
 constexpr int32_t kNcclFloat16 = 6;
 constexpr int32_t kNcclSum = 0;
 constexpr int32_t kNcclSuccess = 0;
+
+#if SUPPORTS_FP8
+struct FusedAllReduceExecutionContext
+{
+    kernels::CuteDslGemmNvFp4Runner* gemmRunner;
+    void const* const* inputs;
+    void* const* outputs;
+    uint8_t const* globalActScaleTiled;
+    uint8_t const* weightScaleTiled;
+    int32_t m;
+    int32_t n;
+    int32_t k;
+    int32_t tpSize;
+    int32_t deviceId;
+    int64_t outputElements;
+    cudaStream_t stream;
+};
+
+// {$edge-llm-internal-release begin}
+AllReduceExecutionStatus executeSmallShmFusedAllReducePath(
+    kernels::ShmAllReduceState* state, int32_t rank, FusedAllReduceExecutionContext const& context)
+{
+    half* rankSlot = (rank == 0) ? state->shmBuf : state->shmBuf1;
+    auto* gemmOutputFp8 = reinterpret_cast<uint8_t*>(rankSlot);
+    cudaError_t const error = context.gemmRunner->runFp8(context.inputs[kFP4_ACT_IDX], context.inputs[kFP4_WEIGHT_IDX],
+        context.globalActScaleTiled, context.weightScaleTiled, gemmOutputFp8, context.m, context.n, context.k,
+        context.stream);
+    if (error != cudaSuccess)
+    {
+        LOG_ERROR(
+            "FusedNvfp4GemmAllReducePlugin: FP8 CuTe DSL GEMM (SHM decode) failed: %s", cudaGetErrorString(error));
+        return AllReduceExecutionStatus::kFailure;
+    }
+
+    cudaError_t const allReduceError = kernels::shmAllReduceExecFusedFp8(
+        state, context.outputs[kOUT_TENSOR_IDX], context.outputElements, rank, context.stream);
+    if (allReduceError != cudaSuccess)
+    {
+        LOG_ERROR(
+            "FusedNvfp4GemmAllReducePlugin: FP8 SHM kernel launch failed: %s", cudaGetErrorString(allReduceError));
+        return AllReduceExecutionStatus::kFailure;
+    }
+    return AllReduceExecutionStatus::kSuccess;
+}
+
+AllReduceExecutionStatus executeLargeShmFusedAllReducePath(
+    kernels::ShmAllReduceState* state, int32_t rank, FusedAllReduceExecutionContext const& context)
+{
+    half* gemmOutputFp16 = (rank == 0) ? state->shmBuf : state->shmBuf1;
+    cudaError_t const error = context.gemmRunner->run(context.inputs[kFP4_ACT_IDX], context.inputs[kFP4_WEIGHT_IDX],
+        context.globalActScaleTiled, context.weightScaleTiled, gemmOutputFp16, context.m, context.n, context.k,
+        context.stream);
+    if (error != cudaSuccess)
+    {
+        LOG_ERROR(
+            "FusedNvfp4GemmAllReducePlugin: FP16 CuTe DSL GEMM (SHM prefill) failed: %s", cudaGetErrorString(error));
+        return AllReduceExecutionStatus::kFailure;
+    }
+
+    cudaError_t const allReduceError = kernels::shmAllReduceMultiCtaFp16(
+        state, context.outputs[kOUT_TENSOR_IDX], context.outputElements, rank, context.stream);
+    if (allReduceError != cudaSuccess)
+    {
+        LOG_ERROR(
+            "FusedNvfp4GemmAllReducePlugin: FP16 SHM kernel launch failed: %s", cudaGetErrorString(allReduceError));
+        return AllReduceExecutionStatus::kFailure;
+    }
+    return AllReduceExecutionStatus::kSuccess;
+}
+
+AllReduceExecutionStatus executeShmFusedAllReducePath(
+    ShmAllReducePathRegistration const& registration, FusedAllReduceExecutionContext const& context)
+{
+    auto* state = registration.state;
+    int32_t const rank = registration.rank;
+    if (state == nullptr || rank < 0 || context.tpSize != kernels::kShmAllReduceWorldSize
+        || context.tpSize != state->tpSize)
+    {
+        return AllReduceExecutionStatus::kUnavailable;
+    }
+
+    int64_t const fp16Capacity = state->maxElements;
+    int64_t const fp8Capacity = state->maxElements * static_cast<int64_t>(sizeof(half));
+    bool const useSmallPath
+        = context.outputElements <= state->fp8SmallPathElementThreshold && context.outputElements <= fp8Capacity;
+    bool const useLargePath = !useSmallPath && context.outputElements <= fp16Capacity;
+    if (!useSmallPath && !useLargePath)
+    {
+        return AllReduceExecutionStatus::kUnavailable;
+    }
+
+    if (useLargePath)
+    {
+        cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+        cudaError_t const captureError = cudaStreamIsCapturing(context.stream, &captureStatus);
+        if (captureError != cudaSuccess)
+        {
+            LOG_ERROR(
+                "FusedNvfp4GemmAllReducePlugin: cudaStreamIsCapturing failed: %s", cudaGetErrorString(captureError));
+            return AllReduceExecutionStatus::kFailure;
+        }
+        if (captureStatus != cudaStreamCaptureStatusNone)
+        {
+            LOG_DEBUG("FusedNvfp4GemmAllReducePlugin: multi-CTA SHM path is unavailable during CUDA Graph capture");
+            return AllReduceExecutionStatus::kUnavailable;
+        }
+    }
+
+    static std::atomic<bool> sShmPathLogged{false};
+    if (!sShmPathLogged.exchange(true, std::memory_order_relaxed))
+    {
+        LOG_INFO("FusedNvfp4GemmAllReducePlugin: using SHM path");
+    }
+
+    if (!kernels::syncShmHostBarrier(state, rank))
+    {
+        return AllReduceExecutionStatus::kFailure;
+    }
+    cudaError_t const waitError = kernels::shmAllReduceWaitRead(state, rank, context.stream);
+    if (waitError != cudaSuccess)
+    {
+        LOG_ERROR("FusedNvfp4GemmAllReducePlugin: SHM wait kernel launch failed: %s", cudaGetErrorString(waitError));
+        return AllReduceExecutionStatus::kFailure;
+    }
+    if (useSmallPath)
+    {
+        return executeSmallShmFusedAllReducePath(state, rank, context);
+    }
+    return executeLargeShmFusedAllReducePath(state, rank, context);
+}
+
+// {$edge-llm-internal-release end}
+AllReduceExecutionStatus executeGemmNcclAllReducePath(
+    NcclAllReducePathRegistration const& registration, FusedAllReduceExecutionContext const& context)
+{
+    if (context.tpSize > 1 && (registration.communicator == nullptr || registration.allReduceFunction == nullptr))
+    {
+        return AllReduceExecutionStatus::kUnavailable;
+    }
+
+    static std::atomic<bool> sNcclPathLogged{false};
+    if (!sNcclPathLogged.exchange(true, std::memory_order_relaxed))
+    {
+        LOG_INFO("FusedNvfp4GemmAllReducePlugin: using GEMM + ncclAllReduce path");
+    }
+
+    cudaError_t const gemmError = context.gemmRunner->run(context.inputs[kFP4_ACT_IDX], context.inputs[kFP4_WEIGHT_IDX],
+        context.globalActScaleTiled, context.weightScaleTiled, context.outputs[kOUT_TENSOR_IDX], context.m, context.n,
+        context.k, context.stream);
+    if (gemmError != cudaSuccess)
+    {
+        LOG_ERROR("FusedNvfp4GemmAllReducePlugin: FP16 CuTe DSL GEMM (NCCL fallback) failed: %s",
+            cudaGetErrorString(gemmError));
+        return AllReduceExecutionStatus::kFailure;
+    }
+
+    if (context.tpSize <= 1)
+    {
+        return AllReduceExecutionStatus::kSuccess;
+    }
+
+    auto const ncclAllReduce = reinterpret_cast<NcclAllReduceFn>(registration.allReduceFunction);
+    int32_t const result = ncclAllReduce(context.outputs[kOUT_TENSOR_IDX], context.outputs[kOUT_TENSOR_IDX],
+        context.outputElements, kNcclFloat16, kNcclSum, registration.communicator, context.stream);
+    if (result != kNcclSuccess)
+    {
+        LOG_ERROR("FusedNvfp4GemmAllReducePlugin: NCCL allReduce failed (%d) on device %d", result, context.deviceId);
+        return AllReduceExecutionStatus::kFailure;
+    }
+    return AllReduceExecutionStatus::kSuccess;
+}
+#endif // SUPPORTS_FP8
 
 } // namespace
 
@@ -216,13 +389,13 @@ bool FusedNvfp4GemmAllReducePlugin::supportsFormatCombination(
     {
         return desc.type == DataType::kHALF;
     }
-    if (pos == kFP4_ACT_IDX)
+    if (pos == kFP4_ACT_IDX || pos == kFP4_WEIGHT_IDX)
     {
-        return desc.type == DataType::kFP4 || desc.type == DataType::kINT8 || desc.type == DataType::kFP8;
-    }
-    if (pos == kFP4_WEIGHT_IDX)
-    {
-        return desc.type == DataType::kFP4 || desc.type == DataType::kINT8 || desc.type == DataType::kFP8;
+        return desc.type == DataType::kINT8 || desc.type == DataType::kFP8
+#if IS_TRT_RTX || NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 8)
+            || desc.type == DataType::kFP4
+#endif
+            ;
     }
     if (pos == kFP4_ACT_SCALE_IDX)
     {
@@ -341,11 +514,7 @@ int32_t FusedNvfp4GemmAllReducePlugin::enqueue(PluginTensorDesc const* inputDesc
         int currentDevice = -1;
         CUDA_CHECK(cudaGetDevice(&currentDevice));
 
-        // {$edge-llm-internal-release begin}
-        kernels::ShmAllReduceState* shmState = nullptr;
-        int32_t shmRank = -1;
-        getShmAllReduceRegistrationForDevice(currentDevice, &shmState, &shmRank);
-        // {$edge-llm-internal-release end}
+        AllReducePathRegistrations const registrations = snapshotAllReducePathRegistrationsForDevice(currentDevice);
         int64_t const outElements = M * N;
 
         // Cache weight scale UE4M3 + SfAtom tiled layout when the stream is not
@@ -438,86 +607,37 @@ int32_t FusedNvfp4GemmAllReducePlugin::enqueue(PluginTensorDesc const* inputDesc
             weightSFB = weightScaleTiled;
         }
 
+        FusedAllReduceExecutionContext const executionContext{mGemmRunner, inputs, outputs, globalActScaleTiled,
+            weightSFB, m, N, K, mTpSize, currentDevice, outElements, stream};
+        AllReduceExecutionStatus status = AllReduceExecutionStatus::kUnavailable;
+
         // {$edge-llm-internal-release begin}
-        int64_t const shmFp16Capacity = shmState ? shmState->maxElements : 0;
-        int64_t const shmFp8Capacity = shmState ? shmState->maxElements * static_cast<int64_t>(sizeof(half)) : 0;
-        int64_t const shmFp8Threshold = shmState ? shmState->fp8SmallPathElementThreshold : 0;
-        bool const useSmallPath = outElements <= shmFp8Threshold && outElements <= shmFp8Capacity;
-        bool const useLargeShmPath = !useSmallPath && outElements <= shmFp16Capacity;
-        static std::atomic<bool> sShmPathLogged{false};
-
-        if (shmState != nullptr && shmRank >= 0 && mTpSize == 2 && (useSmallPath || useLargeShmPath))
+        status = executeShmFusedAllReducePath(registrations.shm, executionContext);
+        if (status == AllReduceExecutionStatus::kSuccess)
         {
-            if (!sShmPathLogged.exchange(true, std::memory_order_relaxed))
-            {
-                LOG_INFO("FusedNvfp4GemmAllReducePlugin: using SHM path");
-            }
-            int32_t const rank = shmRank;
-            syncShmHostBarrier(shmState, rank);
-            kernels::shmAllReduceWaitRead(shmState, rank, stream);
-
-            if (useSmallPath)
-            {
-                half* rankSlot = (rank == 0) ? shmState->shmBuf : shmState->shmBuf1;
-                uint8_t* gemmOutputFp8 = reinterpret_cast<uint8_t*>(rankSlot);
-                cudaError_t err = mGemmRunner->runFp8(inputs[kFP4_ACT_IDX], inputs[kFP4_WEIGHT_IDX],
-                    globalActScaleTiled, weightSFB, gemmOutputFp8, m, N, K, stream);
-                if (err != cudaSuccess)
-                {
-                    LOG_ERROR("FusedNvfp4GemmAllReducePlugin: FP8 CuTe DSL GEMM (SHM decode) failed: %s",
-                        cudaGetErrorString(err));
-                    return -1;
-                }
-                kernels::shmAllReduceExecFusedFp8(shmState, outputs[kOUT_TENSOR_IDX], outElements, rank, stream);
-            }
-            else
-            {
-                half* gemmOutputFp16 = (rank == 0) ? shmState->shmBuf : shmState->shmBuf1;
-                cudaError_t err = mGemmRunner->run(inputs[kFP4_ACT_IDX], inputs[kFP4_WEIGHT_IDX], globalActScaleTiled,
-                    weightSFB, gemmOutputFp16, m, N, K, stream);
-                if (err != cudaSuccess)
-                {
-                    LOG_ERROR("FusedNvfp4GemmAllReducePlugin: FP16 CuTe DSL GEMM (SHM prefill) failed: %s",
-                        cudaGetErrorString(err));
-                    return -1;
-                }
-                kernels::shmAllReduceMultiCtaFp16(shmState, outputs[kOUT_TENSOR_IDX], outElements, rank, stream);
-            }
-
             return 0;
         }
-
-        // {$edge-llm-internal-release end}
-        static std::atomic<bool> sNcclPathLogged{false};
-        if (!sNcclPathLogged.exchange(true, std::memory_order_relaxed))
+        if (status == AllReduceExecutionStatus::kFailure)
         {
-            LOG_INFO("FusedNvfp4GemmAllReducePlugin: using GEMM + ncclAllReduce path");
+            return -1;
         }
+        // {$edge-llm-internal-release end}
 
-        cudaError_t err = mGemmRunner->run(inputs[kFP4_ACT_IDX], inputs[kFP4_WEIGHT_IDX], globalActScaleTiled,
-            weightSFB, outputs[kOUT_TENSOR_IDX], m, N, K, stream);
-        if (err != cudaSuccess)
+        status = executeGemmNcclAllReducePath(registrations.nccl, executionContext);
+        if (status == AllReduceExecutionStatus::kSuccess)
         {
-            LOG_ERROR("FusedNvfp4GemmAllReducePlugin: FP16 CuTe DSL GEMM (NCCL fallback) failed: %s",
-                cudaGetErrorString(err));
+            return 0;
+        }
+        if (status == AllReduceExecutionStatus::kFailure)
+        {
             return -1;
         }
 
-        void* ncclComm = nullptr;
-        void* ncclFnRaw = nullptr;
-        getNcclRegistrationForDevice(currentDevice, &ncclComm, &ncclFnRaw);
-        auto ncclFn = reinterpret_cast<NcclAllReduceFn>(ncclFnRaw);
-        if (ncclComm && ncclFn && mTpSize > 1)
-        {
-            int32_t ncclResult = ncclFn(outputs[kOUT_TENSOR_IDX], outputs[kOUT_TENSOR_IDX], outElements, kNcclFloat16,
-                kNcclSum, ncclComm, stream);
-            if (ncclResult != kNcclSuccess)
-            {
-                LOG_ERROR("FusedNvfp4GemmAllReducePlugin: NCCL allReduce failed (%d)", ncclResult);
-                return -1;
-            }
-        }
-        return 0;
+        LOG_ERROR(
+            "FusedNvfp4GemmAllReducePlugin: no execution path is available for TP size %d on device %d; "
+            "the required NCCL path is not registered",
+            mTpSize, currentDevice);
+        return -1;
 #endif // SUPPORTS_FP8
     }
     catch (std::exception const& e)

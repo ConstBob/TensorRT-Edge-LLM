@@ -86,34 +86,34 @@ selects specialized kernels for the active phase and platform. The exact
 coverage is owned by the `canImplement()` / kernel-loading code paths listed
 below; update this table when those checks change.
 
-Context and ViT attention require a matching CuTe DSL artifact, an enabled
-kernel group, and CUDA Toolkit 12 or newer. There is no legacy embedded-cubin
-fallback. Builds with `ENABLE_CUTE_DSL=OFF`, including the CUDA 11.4 DriveOS 6
-cross-build, remain compile checks but do not provide a context-attention
-runtime backend.
+Context and ViT attention require a matching CuTe DSL artifact and CUDA Toolkit
+12 or newer. The FMHA-v2 kernels are always built and linked; there is no
+artifact-free or legacy embedded-cubin fallback.
 
 [cols="1,2,3,3", options="header"]
 |===
 | Implementation | Used For | Availability / constraints | Source of truth
 
-| CuTe DSL context FMHA
-| Prefill/context attention
-| Built only when `CUTE_DSL_FMHA_ENABLED` is set (`ENABLE_CUTE_DSL=fmha` or
-  `ALL`) and a matching CuTe DSL artifact is linked. Current LLM variants
-  support SM100, SM101, and SM110; head dim 64, 128, 256, or 512; FP16 or FP8
-  input; causal/sliding masks; and dense PADDING masks for head dim 256 or 512.
+| CuTe DSL FMHA (FMHA-v2)
+| Prefill/context and ViT attention
+| Required unconditionally. FP16 artifacts support SM80, SM86, SM87, SM89,
+  SM100, SM101, SM110, SM120, and SM121. Causal or sliding context attention
+  supports head dim 64, 128, or 256; dense PADDING attention supports head dim
+  256; packed ViT attention supports head dim 64, 72, 80, or 128.
+| `cpp/kernels/contextAttentionKernels/cuteDslFMHAV2Runner.cpp`,
+  `kernelSrcs/fmha_v2_cutedsl/fmha.py`,
+  `cmake/CuteDsl.cmake`
+
+| CuTe DSL FMHA (optimized Blackwell)
+| Preferred prefill/context and ViT attention path on supported Blackwell GPUs
+| Built when `CUTE_DSL_FMHA_BLACKWELL_ENABLED` is set in addition to the
+  FMHA-v2 kernels. Current LLM variants support SM100, SM101, and SM110;
+  head dim 64, 128, 256, or 512; FP16 or FP8 input; causal/sliding masks; and
+  dense PADDING masks for head dim 256 or 512. Runtime selection tries these
+  optimized kernels before FMHA-v2.
 | `cpp/kernels/contextAttentionKernels/cuteDslFMHARunner.h`,
   `cpp/kernels/contextAttentionKernels/cuteDslFMHARunner.cpp`,
   `cmake/CuteDsl.cmake`
-
-| FMHA-v2 CuTe DSL
-| Prefill/context and ViT attention outside the optimized Blackwell path
-| FP16 causal or sliding context attention supports head dim 64, 128, or 256;
-  dense PADDING attention with independent Q/KV lengths supports head dim 256;
-  packed ViT attention supports head dim 64, 72, 80, or 128. Matching CuTe DSL
-  artifacts are generated for the target SM.
-| `cpp/kernels/contextAttentionKernels/cuteDslFMHAV2Runner.cpp`,
-  `kernelSrcs/fmha_v2_cutedsl/fmha.py`
 
 | Decode XQA (`cpp/kernels/decodeAttentionKernels/`)
 | Token-by-token decode and tree/speculative decode
@@ -132,11 +132,13 @@ runtime backend.
 | `ViTAttentionPlugin` (`cpp/plugins/vitAttentionPlugin/`)
 | Vision-transformer attention
 | Separate visual-encoder path, not decoder KV-cache attention. CuTe DSL ViT
-  FMHA currently supports SM >= 100 and head dim 64, 72, 80, or 128, with
-  FMHA_v2 fallback when unavailable.
+  FMHA uses the FMHA-v2 kernels for head dim 64, 72, 80, or 128 and prefers
+  the optimized kernels on SM100, SM101, and SM110 when they can implement
+  the shape.
 | `cpp/plugins/vitAttentionPlugin/`,
   `cpp/kernels/contextAttentionKernels/cuteDslFMHARunner.h`,
-  `cpp/kernels/contextAttentionKernels/cuteDslFMHARunner.cpp`
+  `cpp/kernels/contextAttentionKernels/cuteDslFMHARunner.cpp`,
+  `cpp/kernels/contextAttentionKernels/cuteDslFMHAV2Runner.cpp`
 |===
 
 == Variant Documents

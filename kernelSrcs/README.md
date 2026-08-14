@@ -31,8 +31,8 @@ checked into git by default.
 
 These dependencies are required **only** when you regenerate an artifact through
 the [CuTe DSL kernel development workflow](#cute-dsl-kernel-development-workflow).
-A normal CuTe DSL-enabled build consumes a matching
-[prebuilt artifact](cuteDSLPrebuilt/) and needs no Python environment or GPU.
+A normal CuTe DSL-enabled build consumes a matching prebuilt artifact from
+`kernelSrcs/cuteDSLPrebuilt/` and needs no Python environment or GPU.
 
 Use a separate virtual environment for each CuTe DSL compiler flavor. See
 [Option B: Incremental Build in a Local Virtual Environment](#option-b-incremental-build-in-a-local-virtual-environment)
@@ -40,7 +40,7 @@ for installation commands and CUDA 12/13 host-runtime guidance.
 
 | Dependency | Version | Notes |
 |---|---|---|
-| `nvidia-cutlass-dsl` | `4.6.1` | Pinned; isolate cu12 and cu13 compiler backends by environment |
+| `nvidia-cutlass-dsl` | `4.7.0` | Pinned; isolate cu12 and cu13 compiler backends by environment |
 | `cupy-cuda12x` | `12.3.0` | CUDA 12 build host |
 | `cupy-cuda13x` | `13.6.0` | CUDA 13 build host |
 | `cuda-python` | matches the build host | Required by every group's AOT export |
@@ -67,7 +67,7 @@ The image build installs dependencies only. Kernel generation runs under
 ```bash
 # Context = kernelSrcs/ (small, self-contained); the repo root would drag
 # local build trees into the docker context.
-CUTE_DSL_BUILDER_VERSION=4.6.1
+CUTE_DSL_BUILDER_VERSION=4.7.0
 docker build \
   -f kernelSrcs/Dockerfile.cutedsl \
   --build-arg "CUTE_DSL_BUILDER_VERSION=${CUTE_DSL_BUILDER_VERSION}" \
@@ -86,11 +86,13 @@ The default matrix generates these tarballs and matching `.sha256` files under
 
 ```text
 cutedsl_x86_64_sm_80_cuda13.tar.gz
+cutedsl_x86_64_sm_90_cuda13.tar.gz
 cutedsl_x86_64_sm_100_cuda13.tar.gz
 cutedsl_x86_64_sm_120_cuda13.tar.gz
 cutedsl_x86_64_sm_120_cuda12.tar.gz
 cutedsl_aarch64_sm_87_cuda13.tar.gz
 cutedsl_aarch64_sm_87_cuda12.tar.gz
+cutedsl_aarch64_sm_90_cuda13.tar.gz
 cutedsl_aarch64_sm_101_cuda12.tar.gz
 cutedsl_aarch64_sm_110_cuda13.tar.gz
 cutedsl_aarch64_sm_121_cuda12.tar.gz
@@ -123,8 +125,9 @@ Normal builds skip it entirely: CMake extracts the matching prebuilt tarball fro
 `kernelSrcs/cuteDSLPrebuilt/` automatically. A prebuilt tarball does not contain
 your source changes, so it is never a valid way to test them.
 
-Pick one of the two manual build environments below, generate the affected group
-into `cpp/kernels/cuteDSLArtifact/<arch>/<sm>/`, then configure CMake and run the
+Pick one of the two manual build environments below. For a new or clean
+artifact, generate `fmha` together with the affected group into
+`cpp/kernels/cuteDSLArtifact/<arch>/<sm>/`, then configure CMake and run the
 relevant build and runtime tests. The remaining pieces of the workflow live in
 dedicated sections:
 
@@ -146,7 +149,7 @@ require rebuilding the image, and bind-mount the expanded artifact directory so
 the generated objects and headers update the tree consumed by CMake:
 
 ```bash
-CUTE_DSL_BUILDER_VERSION=4.6.1
+CUTE_DSL_BUILDER_VERSION=4.7.0
 docker build \
   -f kernelSrcs/Dockerfile.cutedsl \
   --build-arg "CUTE_DSL_BUILDER_VERSION=${CUTE_DSL_BUILDER_VERSION}" \
@@ -167,10 +170,13 @@ docker run --rm --gpus all \
     --output_dir /artifacts
 ```
 
-Change `--kernels` to the affected group. Selection is currently group-level,
-not individual-variant-level. For a CUDA 12 artifact, use the `cu12` interpreter,
-pass `--cuda-version 12`, and configure CMake with the matching CUDA 12
-toolchain before rebuilding the group.
+For a non-FMHA change in a new or clean output, use
+`--kernels fmha,<affected-group>` so the artifact remains runnable. If the
+expanded artifact already contains the complete FMHA baseline, an incremental
+build may select only the affected group and omit `--clean`; metadata is merged.
+Selection is group-level, not individual-variant-level. For a CUDA 12 artifact,
+use the `cu12` interpreter, pass `--cuda-version 12`, and configure CMake with
+the matching CUDA 12 toolchain before rebuilding the group.
 
 ### Option B: Incremental Build in a Local Virtual Environment
 
@@ -182,7 +188,7 @@ python3 -m venv .venv-cutedsl-cu13
 source .venv-cutedsl-cu13/bin/activate
 python -m pip install --upgrade pip wheel
 
-export CUTE_DSL_VERSION=4.6.1
+export CUTE_DSL_VERSION=4.7.0
 python -m pip install \
   "nvidia-cutlass-dsl[cu13]==${CUTE_DSL_VERSION}" \
   cupy-cuda13x==13.6.0 \
@@ -220,7 +226,7 @@ a clean full-matrix rebuild so stale archive members cannot be retained.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--kernels GROUPS` | `ALL` | A registered group such as `f16_moe`, `ffpa`, `fmha`, `gdn`, `gemm`, `gemm_nvfp4`, `int4_fp16_gemm`, `nvfp4_moe`, `nvfp4_fused_moe`, or `ssd`; a comma-separated list; or `ALL`. Variants whose `supported_sms` excludes the target SM are skipped. |
+| `--kernels GROUPS` | `ALL` | A registered group such as `f16_moe`, `fmha`, `gdn`, `gemm`, `gemm_nvfp4`, `int4_fp16_gemm`, `nvfp4_moe`, `nvfp4_fused_moe`, or `ssd`; a comma-separated list; or `ALL`. `fmha` is the attention family: the FMHA-v2 kernels plus the optimized Blackwell kernels on SM100/SM101/SM110. Variants whose `supported_sms` excludes the target SM are skipped. |
 | `--gpu_arch SM` | auto-detected | Target GPU SM (e.g. `sm_100`); auto-detected via cupy / nvidia-smi when omitted. The CuTe DSL compile architecture is derived automatically, including the required Blackwell `a` suffix. |
 | `--arch ARCH` | auto-detected | Target CPU arch `x86_64` or `aarch64`. If it differs from the build host, kernels are cross-compiled (target host objects). |
 | `--cuda-version VERSION` | host CUDA | Artifact CUDA flavor used to select `cu12` or `cu13` runtime objects. |
@@ -241,13 +247,18 @@ cmake .. -DENABLE_CUTE_DSL=gemm
 cmake .. -DENABLE_CUTE_DSL="fmha;gdn;gemm"
 ```
 
-`ENABLE_CUTE_DSL` defaults to `OFF`. `cmake/CuteDsl.cmake` then:
+`ENABLE_CUTE_DSL` defaults to `fmha`, the Context/ViT attention kernels. On
+SM100/SM101/SM110 the same family also activates the optimized Blackwell
+kernels when its variants are present. Every selection implicitly includes
+`fmha`, because the attention runner is compiled unconditionally.
+
+`cmake/CuteDsl.cmake` then:
 
 1. Detects the host/target CPU architecture.
 2. Resolves the artifact tag from `CUTE_DSL_ARTIFACT_TAG` or the target platform
    when unambiguous.
 3. Reads `metadata.json` to determine which groups/variants are available and
-   sets the matching `CUTE_DSL_<GROUP>_ENABLED` compile definitions.
+   sets the matching compile definitions.
 4. Validates `libcutedsl_{arch}.a` and `include/cutedsl_all.h` exist, then links
    the self-contained kernel archive. The CuTe DSL static runtime shim objects
    are already embedded in that archive, so CMake does not link
@@ -309,8 +320,7 @@ cmake .. \
 
 See the group-specific READMEs for kernel coverage and standalone testing:
 
-- `kernelSrcs/fmha_cutedsl_blackwell/README.md` — Blackwell/Thor fused multi-head attention (LLM + ViT)
-- `kernelSrcs/ffpa_cutedsl/README.md` — Ampere-floor FFPA-style FMHA forward
+- `kernelSrcs/fmha_cutedsl_blackwell/README.md` — optimized Blackwell/Thor fused multi-head attention (LLM + ViT)
 - `kernelSrcs/f16_moe_cutedsl/README.md` — Cross-platform FP16 grouped MoE GEMM
 - `kernelSrcs/gdn_cutedsl/README.md` — Gated Delta Net decode/prefill
 - `kernelSrcs/ssd_cutedsl/README.md` — Mamba2 SSD prefill

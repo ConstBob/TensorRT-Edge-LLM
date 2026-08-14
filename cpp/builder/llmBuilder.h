@@ -17,8 +17,12 @@
 
 #pragma once
 
+#include "common/checkMacros.h"
+#include "common/pagedKvTypes.h"
+
 #include <NvInfer.h>
 #include <filesystem>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <sstream>
 #include <string>
@@ -45,6 +49,34 @@ struct LLMBuilderConfig
     int64_t maxVerifyTreeSize{60};    //!< Maximum length of input_ids passed into spec base model for verification
     int64_t maxDraftTreeSize{60};     //!< Maximum length of input_ids passed into spec draft model for draft generation
     bool profilingDetailed{false};    //!< Enable detailed profiling verbosity for layer info extraction
+    //! Exact physical K-page count for the engine's KV pool. Zero selects the minimum active pages.
+    //! Kept after the original aggregate fields so existing positional initializers remain source-compatible.
+    int64_t maxKVPoolPages{0};
+
+    //! Resolve the exact physical K-page count serialized into the engine binding shape.
+    //! @return `maxKVPoolPages`, or the minimum active pages when it is zero
+    //! @throws std::runtime_error for invalid dimensions, overflow, or a below-minimum override
+    int64_t resolvedKVPoolPages() const
+    {
+        ELLM_CHECK(maxBatchSize > 0 && maxBatchSize <= std::numeric_limits<int32_t>::max(),
+            "LLMBuilderConfig: maxBatchSize must fit a positive int32.");
+        ELLM_CHECK(maxKVCacheCapacity > 0 && maxKVCacheCapacity <= rt::kMAX_KV_CACHE_CAPACITY,
+            "LLMBuilderConfig: maxKVCacheCapacity must remain int32 after page alignment (maximum "
+                + std::to_string(rt::kMAX_KV_CACHE_CAPACITY) + ").");
+        int64_t const minimumActivePages = rt::computeMinimumKvPoolPages(maxBatchSize, maxKVCacheCapacity);
+        ELLM_CHECK(minimumActivePages <= rt::kMAX_KV_POOL_PAGES,
+            "LLMBuilderConfig: minimum active pages (" + std::to_string(minimumActivePages) + ")"
+                + " exceeds the largest int32-addressable paged-KV pool " + std::to_string(rt::kMAX_KV_POOL_PAGES)
+                + ".");
+        ELLM_CHECK(maxKVPoolPages == 0 || maxKVPoolPages >= minimumActivePages,
+            "LLMBuilderConfig: maxKVPoolPages (" + std::to_string(maxKVPoolPages)
+                + ") must be zero or at least the minimum active pages (" + std::to_string(minimumActivePages) + ").");
+        ELLM_CHECK(maxKVPoolPages <= rt::kMAX_KV_POOL_PAGES,
+            "LLMBuilderConfig: maxKVPoolPages (" + std::to_string(maxKVPoolPages)
+                + ") exceeds the largest int32-addressable paged-KV pool (" + std::to_string(rt::kMAX_KV_POOL_PAGES)
+                + ").");
+        return maxKVPoolPages == 0 ? minimumActivePages : maxKVPoolPages;
+    }
 
     //! Convert configuration to JSON format for serialization.
     //! @return JSON object containing all configuration parameters
@@ -57,6 +89,7 @@ struct LLMBuilderConfig
         json["max_batch_size"] = maxBatchSize;
         json["max_lora_rank"] = maxLoraRank;
         json["max_kv_cache_capacity"] = maxKVCacheCapacity;
+        json["max_kv_pool_pages"] = resolvedKVPoolPages();
         // Only include speculative-decoding limits for the engine role that owns them.
         if (specBase)
         {
@@ -108,6 +141,10 @@ struct LLMBuilderConfig
         {
             config.maxKVCacheCapacity = json["max_kv_cache_capacity"];
         }
+        if (json.contains("max_kv_pool_pages"))
+        {
+            config.maxKVPoolPages = json["max_kv_pool_pages"];
+        }
         if (json.contains("max_verify_tree_size"))
         {
             config.maxVerifyTreeSize = json["max_verify_tree_size"];
@@ -131,6 +168,7 @@ struct LLMBuilderConfig
         oss << "  maxBatchSize: " << maxBatchSize << "\n";
         oss << "  maxLoraRank: " << maxLoraRank << "\n";
         oss << "  maxKVCacheCapacity: " << maxKVCacheCapacity << "\n";
+        oss << "  maxKVPoolPages: " << resolvedKVPoolPages() << "\n";
         // Only show speculative-decoding limits for the engine role that owns them.
         if (specBase)
         {
@@ -332,7 +370,7 @@ private:
 
     //! Set up optimization profiles for MTP intermediate recurrent state output tensors.
     //! These are per-step checkpoints of GDN recurrent states during tree verification.
-    //! Only needed for hybrid MTP/DFlash/DSpark base verification engines.
+    //! Only needed for hybrid MTP/DFlash/JetSpec/DSpark base verification engines.
     //! @param contextProfile Optimization profile for context processing
     //! @param generationProfile Optimization profile for generation processing
     //! @return true if setup was successful, false otherwise
@@ -341,7 +379,7 @@ private:
 
     //! Set up optimization profiles for MTP intermediate conv state output tensors.
     //! These are per-step checkpoints of conv1d states during tree verification.
-    //! Only needed for hybrid MTP/DFlash/DSpark base verification engines.
+    //! Only needed for hybrid MTP/DFlash/JetSpec/DSpark base verification engines.
     //! @param contextProfile Optimization profile for context processing
     //! @param generationProfile Optimization profile for generation processing
     //! @return true if setup was successful, false otherwise

@@ -19,25 +19,38 @@
 
 #include "common/logger.h"
 #include "runtime/decoding/blockDiffusionDecoder.h"
+#include "runtime/decoding/dflashDecodeUtils.h"
 #include "runtime/decoding/dflashDecoder.h"
 #include "runtime/decoding/dsparkDecoder.h"
 #include "runtime/decoding/eagleDecoder.h"
 #include "runtime/decoding/gemma4MTPDecoder.h"
 #include "runtime/decoding/mtpDecoder.h"
 #include "runtime/decoding/vanillaDecoder.h"
+#include "sampler/sampling.h"
 
 #include <algorithm>
 #include <stdexcept>
+#include <utility>
 
 namespace trt_edgellm
 {
 namespace rt
 {
-DecoderRegistry::DecoderRegistry(DecodingRuntimeContext& runtime, DecoderRegistryConfig const& config)
-    : mDefaultDecoder([&runtime, &config]() -> std::unique_ptr<DecodingStrategy> {
+
+bool shouldSelectDefaultDecoder(
+    DecodingStrategyKind speculativeDecoderKind, LLMGenerationRequest const& request) noexcept
+{
+    // EAGLE verification currently assumes greedy sampling; vanilla preserves non-greedy request semantics.
+    bool const nonGreedyEagleFallback = speculativeDecoderKind == DecodingStrategyKind::kEAGLE
+        && shouldUseNonGreedySampling(request.temperature, request.topK, request.topP);
+    return request.disableSpecDecode || nonGreedyEagleFallback;
+}
+
+DecoderRegistry::DecoderRegistry(DecodingRuntimeContext& runtime, DecoderRegistryInit init)
+    : mDefaultDecoder([&runtime, &init]() -> std::unique_ptr<DecodingStrategy> {
         if (runtime.deployment.base.isDiffusionBackbone)
         {
-            return std::make_unique<BlockDiffusionDecoder>(runtime, config.engineDir, config.stream);
+            return std::make_unique<BlockDiffusionDecoder>(runtime, init.engineDir, init.stream);
         }
         return std::make_unique<VanillaDecoder>(runtime);
     }())
@@ -46,29 +59,33 @@ DecoderRegistry::DecoderRegistry(DecodingRuntimeContext& runtime, DecoderRegistr
     {
         LOG_INFO("Selected block_diffusion decoding strategy.");
     }
-    if (config.draftingConfig.has_value())
+    if (init.draftingConfig.has_value())
     {
         switch (runtime.deployment.specDecodeMode())
         {
         case SpecDecodeMode::kMTP:
-            mSpeculativeDecoder
-                = std::make_unique<MTPDecoder>(runtime, config.engineDir, *config.draftingConfig, config.stream);
+            mSpeculativeDecoder = std::make_unique<MTPDecoder>(
+                runtime, init.engineDir, *init.draftingConfig, std::move(init.draftExecutor), init.stream);
             break;
         case SpecDecodeMode::kEAGLE:
-            mSpeculativeDecoder
-                = std::make_unique<EagleDecoder>(runtime, config.engineDir, *config.draftingConfig, config.stream);
+            mSpeculativeDecoder = std::make_unique<EagleDecoder>(
+                runtime, init.engineDir, *init.draftingConfig, std::move(init.draftExecutor), init.stream);
             break;
         case SpecDecodeMode::kDFlash:
-            mSpeculativeDecoder
-                = std::make_unique<DFlashDecoder>(runtime, config.engineDir, *config.draftingConfig, config.stream);
+        case SpecDecodeMode::kJetSpec:
+        {
+            auto blockDraftConfig = dflash_utils::makeCachedBlockDraftRuntimeConfig(runtime.deployment);
+            mSpeculativeDecoder = std::make_unique<DFlashDecoder>(
+                runtime, init.engineDir, std::move(blockDraftConfig), std::move(init.draftExecutor), init.stream);
             break;
+        }
         case SpecDecodeMode::kGemma4MTP:
-            mSpeculativeDecoder
-                = std::make_unique<Gemma4MTPDecoder>(runtime, config.engineDir, *config.draftingConfig, config.stream);
+            mSpeculativeDecoder = std::make_unique<Gemma4MTPDecoder>(
+                runtime, init.engineDir, *init.draftingConfig, std::move(init.draftExecutor), init.stream);
             break;
         case SpecDecodeMode::kDSpark:
-            mSpeculativeDecoder
-                = std::make_unique<DSparkDecoder>(runtime, config.engineDir, *config.draftingConfig, config.stream);
+            mSpeculativeDecoder = std::make_unique<DSparkDecoder>(
+                runtime, init.engineDir, *init.draftingConfig, std::move(init.draftExecutor), init.stream);
             break;
         case SpecDecodeMode::kNONE:
             throw std::runtime_error("SpecDecode drafting config was set but no mode is active.");
@@ -79,7 +96,7 @@ DecoderRegistry::DecoderRegistry(DecodingRuntimeContext& runtime, DecoderRegistr
 
 DecodingStrategy& DecoderRegistry::select(LLMGenerationRequest const& request) const noexcept
 {
-    if (!mSpeculativeDecoder || request.disableSpecDecode)
+    if (!mSpeculativeDecoder || shouldSelectDefaultDecoder(mSpeculativeDecoder->kind(), request))
     {
         return *mDefaultDecoder;
     }
@@ -94,10 +111,11 @@ DecodingStrategy& DecoderRegistry::cachePrimingStrategy() const noexcept
 
 bool DecoderRegistry::captureCudaGraphs(cudaStream_t stream) const
 {
-    bool const skipDefaultCapture = mSpeculativeDecoder && mSpeculativeDecoder->kind() == DecodingStrategyKind::kDFlash;
+    bool const skipDefaultCapture
+        = mSpeculativeDecoder && mSpeculativeDecoder->capabilities().ownsBaseVerificationCudaGraphs;
     if (skipDefaultCapture)
     {
-        LOG_INFO("Skipping vanilla CUDA graph capture for DFlash speculative runtime.");
+        LOG_INFO("Skipping vanilla CUDA graph capture for %s speculative runtime.", mSpeculativeDecoder->name());
     }
     bool const defaultCaptureStatus
         = (!skipDefaultCapture && mDefaultDecoder) ? mDefaultDecoder->captureCudaGraphs(stream) : true;

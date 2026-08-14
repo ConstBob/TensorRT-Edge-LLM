@@ -49,31 +49,30 @@ int64_t validateAndCountInputPages(
 
 } // namespace
 
-ReusePlan makeVanillaReusePlan(CacheDomainId domain, std::vector<BlockHash> const& inputFullBlockHashes,
-    int32_t inputTokenCount, int32_t pageSize, BaseBlockIndex const& index, LookupPolicy lookupPolicy)
+ReusePlan makeVanillaReusePlan(std::vector<BlockHash> const& inputFullBlockHashes, int32_t inputTokenCount,
+    int32_t pageSize, BaseBlockIndex const& index, ContextCacheLookupPolicy lookupPolicy)
 {
-    ELLM_CHECK(lookupPolicy == LookupPolicy::kUseCache || lookupPolicy == LookupPolicy::kBypass,
+    ELLM_CHECK(lookupPolicy == ContextCacheLookupPolicy::kUseCache || lookupPolicy == ContextCacheLookupPolicy::kBypass,
         "Context cache plan has an invalid lookup policy");
     int64_t const totalInputPages = validateAndCountInputPages(inputFullBlockHashes, inputTokenCount, pageSize);
 
     ReusePlan plan;
-    plan.domain = domain;
-    plan.lookupPolicy = lookupPolicy;
-    plan.inputTokenCount = inputTokenCount;
     if (inputTokenCount == 0)
     {
         return plan;
     }
 
-    if (lookupPolicy == LookupPolicy::kBypass)
+    if (lookupPolicy == ContextCacheLookupPolicy::kBypass)
     {
         plan.kind = ReusePlanKind::kNoReusablePrefix;
         plan.demand.baseKvPages = static_cast<int32_t>(totalInputPages);
         return plan;
     }
-    BaseLookupResult lookup = index.lookupPrefix(domain, inputFullBlockHashes);
+    BaseLookupResult lookup = index.lookupPrefix(inputFullBlockHashes);
     plan.matchedBlockHashes = std::move(lookup.matchedHashes);
     plan.basePageBindings = std::move(lookup.pageIds);
+    plan.matchedTokenLength
+        = static_cast<int32_t>(static_cast<int64_t>(plan.basePageBindings.size()) * static_cast<int64_t>(pageSize));
 
     bool const fullInputMatch = static_cast<int64_t>(plan.basePageBindings.size()) == totalInputPages;
     if (inputTokenCount % pageSize == 0 && fullInputMatch)
@@ -93,29 +92,24 @@ ReusePlan makeVanillaReusePlan(CacheDomainId domain, std::vector<BlockHash> cons
     return plan;
 }
 
-ReusePlan makeHybridReusePlan(CacheDomainId domain, RecurrentStateSchemaId schema,
-    std::vector<HybridCheckpointCandidate> const& candidates, std::vector<BlockHash> const& inputFullBlockHashes,
-    int32_t inputTokenCount, int32_t pageSize, bool hasAttention, CacheRecordStore const& records,
-    LookupPolicy lookupPolicy)
+ReusePlan makeHybridReusePlan(std::vector<HybridCheckpointCandidate> const& candidates,
+    std::vector<BlockHash> const& inputFullBlockHashes, int32_t inputTokenCount, int32_t pageSize, bool hasAttention,
+    CacheRecordStore const& records, ContextCacheLookupPolicy lookupPolicy)
 {
-    ELLM_CHECK(lookupPolicy == LookupPolicy::kUseCache || lookupPolicy == LookupPolicy::kBypass,
+    ELLM_CHECK(lookupPolicy == ContextCacheLookupPolicy::kUseCache || lookupPolicy == ContextCacheLookupPolicy::kBypass,
         "Context cache plan has an invalid lookup policy");
     int64_t const totalInputPages = validateAndCountInputPages(inputFullBlockHashes, inputTokenCount, pageSize);
 
     ReusePlan plan;
     plan.mode = ReusePlanMode::kHybrid;
-    plan.lookupPolicy = lookupPolicy;
-    plan.domain = domain;
-    plan.inputTokenCount = inputTokenCount;
     plan.hybridHasAttention = hasAttention;
-    plan.recurrentStateSchema = schema;
 
     auto makeCold = [&]() {
         plan.kind = inputTokenCount == 0 ? ReusePlanKind::kStandard : ReusePlanKind::kNoReusablePrefix;
         plan.demand.baseKvPages = hasAttention ? static_cast<int32_t>(totalInputPages) : 0;
         return plan;
     };
-    if (inputTokenCount == 0 || lookupPolicy == LookupPolicy::kBypass)
+    if (inputTokenCount == 0 || lookupPolicy == ContextCacheLookupPolicy::kBypass)
     {
         return makeCold();
     }
@@ -129,7 +123,7 @@ ReusePlan makeHybridReusePlan(CacheDomainId domain, RecurrentStateSchemaId schem
         {
             continue;
         }
-        HybridCheckpointKey const key{domain, candidate.exactPrefixDigest, candidate.exactLength, schema};
+        HybridCheckpointKey const key{candidate.exactPrefixDigest, candidate.exactLength};
         std::optional<RecordId> const recordId = records.findHybrid(key);
         if (!recordId.has_value())
         {
@@ -145,10 +139,8 @@ ReusePlan makeHybridReusePlan(CacheDomainId domain, RecurrentStateSchemaId schem
         bool const partial = candidate.exactLength % pageSize != 0;
         bool const snapshotSetComplete = record.recurrentSnapshotSlot.has_value()
             && record.partialKvSnapshotSlot.has_value() == (hasAttention && partial);
-        bool const attentionPathComplete = hasAttention
-            ? record.baseFullBlockCount == static_cast<int32_t>(fullBlockCount)
-                && record.basePagePath.size() == fullBlockCount
-            : record.baseFullBlockCount == 0 && record.basePagePath.empty();
+        bool const attentionPathComplete
+            = hasAttention ? record.basePagePath.size() == fullBlockCount : record.basePagePath.empty();
         if (!logicalPrefixMatches || !snapshotSetComplete || !attentionPathComplete
             || (!hasAttention && record.partialKvSnapshotSlot.has_value()))
         {
@@ -165,6 +157,7 @@ ReusePlan makeHybridReusePlan(CacheDomainId domain, RecurrentStateSchemaId schem
             plan.basePageBindings = record.basePagePath;
         }
         plan.reuseTokenLength = candidate.exactLength;
+        plan.matchedTokenLength = candidate.exactLength;
         plan.demand.baseKvPages
             = hasAttention ? static_cast<int32_t>(totalInputPages - static_cast<int64_t>(fullBlockCount)) : 0;
         return plan;
@@ -172,40 +165,109 @@ ReusePlan makeHybridReusePlan(CacheDomainId domain, RecurrentStateSchemaId schem
     return makeCold();
 }
 
-ReusePlan makeSpecReusePlan(SpecDecodeMode mode, CacheDomainId domain, DraftEngineSignature draftSignature,
+ReusePlan makeHybridMtpReusePlan(std::vector<HybridCheckpointCandidate> const& candidates,
     std::vector<BlockHash> const& inputFullBlockHashes, int32_t inputTokenCount, int32_t pageSize,
-    bool supportsOneTokenReplay, BaseBlockIndex const& baseIndex, DraftPathIndex const& draftIndex,
-    CacheRecordStore const& records, LookupPolicy lookupPolicy)
+    CacheRecordStore const& records, ContextCacheLookupPolicy lookupPolicy)
 {
-    ELLM_CHECK(mode == SpecDecodeMode::kEAGLE, "Context cache speculative reuse currently supports only EAGLE");
-    ELLM_CHECK(lookupPolicy == LookupPolicy::kUseCache || lookupPolicy == LookupPolicy::kBypass,
+    ELLM_CHECK(lookupPolicy == ContextCacheLookupPolicy::kUseCache || lookupPolicy == ContextCacheLookupPolicy::kBypass,
         "Context cache plan has an invalid lookup policy");
     int64_t const totalInputPages = validateAndCountInputPages(inputFullBlockHashes, inputTokenCount, pageSize);
 
     ReusePlan plan;
-    plan.mode = ReusePlanMode::kSpecEagle;
-    plan.lookupPolicy = lookupPolicy;
-    plan.domain = domain;
-    plan.draftSignature = draftSignature;
-    plan.inputTokenCount = inputTokenCount;
+    plan.mode = ReusePlanMode::kHybridMtp;
+    plan.hybridHasAttention = true;
+
+    auto makeCold = [&]() {
+        plan.kind = inputTokenCount == 0 ? ReusePlanKind::kStandard : ReusePlanKind::kNoReusablePrefix;
+        // MTP is a speculative deployment: a cold request still runs the draft engine over the full input, so the draft
+        // pool needs the same full-input reservation as the base pool (mirrors makeSpecReusePlan's cold demand).
+        plan.demand.baseKvPages = static_cast<int32_t>(totalInputPages);
+        plan.demand.draftKvPages = static_cast<int32_t>(totalInputPages);
+        return plan;
+    };
+    if (inputTokenCount == 0 || lookupPolicy == ContextCacheLookupPolicy::kBypass)
+    {
+        return makeCold();
+    }
+
+    std::vector<HybridCheckpointCandidate> ordered = candidates;
+    std::sort(ordered.begin(), ordered.end(),
+        [](auto const& lhs, auto const& rhs) { return lhs.exactLength > rhs.exactLength; });
+    for (HybridCheckpointCandidate const& candidate : ordered)
+    {
+        if (candidate.exactLength <= 0 || candidate.exactLength >= inputTokenCount)
+        {
+            continue;
+        }
+        HybridCheckpointKey const key{candidate.exactPrefixDigest, candidate.exactLength};
+        std::optional<RecordId> const recordId = records.findHybrid(key);
+        if (!recordId.has_value())
+        {
+            continue;
+        }
+
+        CacheRecord const& record = records.get(*recordId);
+        // The boundary token (exactLength - 1) is always retained in a private partial page, so reserve one fewer full
+        // block than exactLength/pageSize; page-aligned checkpoints keep their boundary private too.
+        size_t const fullBlockCount = static_cast<size_t>((candidate.exactLength - 1) / pageSize);
+        bool const logicalPrefixMatches = record.logicalBlockHashes.size() == fullBlockCount
+            && fullBlockCount <= inputFullBlockHashes.size()
+            && std::equal(
+                record.logicalBlockHashes.begin(), record.logicalBlockHashes.end(), inputFullBlockHashes.begin());
+        // MTP always publishes a partial page, so both snapshots must be present.
+        bool const snapshotSetComplete
+            = record.recurrentSnapshotSlot.has_value() && record.partialKvSnapshotSlot.has_value();
+        bool const basePathComplete = record.basePagePath.size() == fullBlockCount;
+        bool const draftPathComplete = record.draftPagePath.size() == fullBlockCount;
+        if (!logicalPrefixMatches || !snapshotSetComplete || !basePathComplete || !draftPathComplete)
+        {
+            continue;
+        }
+
+        plan.hybridCheckpoint = key;
+        plan.hybridRecord = *recordId;
+        plan.recurrentSnapshotBinding = record.recurrentSnapshotSlot;
+        plan.partialKvSnapshotBinding = record.partialKvSnapshotSlot;
+        plan.matchedBlockHashes = record.logicalBlockHashes;
+        plan.basePageBindings = record.basePagePath;
+        plan.draftPageBindings = record.draftPagePath;
+        plan.reuseTokenLength = candidate.exactLength;
+        plan.matchedTokenLength = candidate.exactLength;
+        int32_t const privatePageCount = static_cast<int32_t>(totalInputPages - static_cast<int64_t>(fullBlockCount));
+        plan.demand.baseKvPages = privatePageCount;
+        plan.demand.draftKvPages = privatePageCount;
+        return plan;
+    }
+    return makeCold();
+}
+
+ReusePlan makeSpecReusePlan(std::vector<BlockHash> const& inputFullBlockHashes, int32_t inputTokenCount,
+    int32_t pageSize, BaseBlockIndex const& baseIndex, DraftPathIndex const& draftIndex,
+    CacheRecordStore const& records, ContextCacheLookupPolicy lookupPolicy)
+{
+    ELLM_CHECK(lookupPolicy == ContextCacheLookupPolicy::kUseCache || lookupPolicy == ContextCacheLookupPolicy::kBypass,
+        "Context cache plan has an invalid lookup policy");
+    int64_t const totalInputPages = validateAndCountInputPages(inputFullBlockHashes, inputTokenCount, pageSize);
+
+    ReusePlan plan;
+    plan.mode = ReusePlanMode::kSpec;
     if (inputTokenCount == 0)
     {
         return plan;
     }
 
-    if (lookupPolicy == LookupPolicy::kBypass)
+    if (lookupPolicy == ContextCacheLookupPolicy::kBypass)
     {
         plan.kind = ReusePlanKind::kNoReusablePrefix;
         plan.demand.baseKvPages = static_cast<int32_t>(totalInputPages);
         plan.demand.draftKvPages = static_cast<int32_t>(totalInputPages);
         return plan;
     }
-    BaseLookupResult const baseLookup = baseIndex.lookupPrefix(domain, inputFullBlockHashes);
+    BaseLookupResult const baseLookup = baseIndex.lookupPrefix(inputFullBlockHashes);
     ELLM_CHECK(baseLookup.pageIds.size() <= static_cast<size_t>(std::numeric_limits<int32_t>::max()),
         "Context cache base prefix contains too many pages");
     int32_t const baseBlockCount = static_cast<int32_t>(baseLookup.pageIds.size());
-    std::optional<DraftPathMatch> const draftMatch
-        = draftIndex.lookupLongest(draftSignature, domain, inputFullBlockHashes, baseBlockCount);
+    std::optional<DraftPathMatch> const draftMatch = draftIndex.lookupLongest(inputFullBlockHashes, baseBlockCount);
     if (!draftMatch.has_value())
     {
         plan.kind = ReusePlanKind::kNoReusablePrefix;
@@ -216,13 +278,13 @@ ReusePlan makeSpecReusePlan(SpecDecodeMode mode, CacheDomainId domain, DraftEngi
 
     CacheRecord const& record = records.get(draftMatch->record);
     int32_t const pairedBlockCount = draftMatch->pathBlockCount;
-    ELLM_CHECK(record.draftSignature == plan.draftSignature && pairedBlockCount > 0
-            && pairedBlockCount <= baseBlockCount
+    ELLM_CHECK(pairedBlockCount > 0 && pairedBlockCount <= baseBlockCount
             && static_cast<size_t>(pairedBlockCount) <= record.draftPagePath.size()
             && static_cast<size_t>(pairedBlockCount) <= record.logicalBlockHashes.size()
             && record.logicalBlockHashes[static_cast<size_t>(pairedBlockCount - 1)]
                 == inputFullBlockHashes[static_cast<size_t>(pairedBlockCount - 1)],
         "Context cache draft path index does not describe a coherent record prefix");
+    plan.matchedTokenLength = static_cast<int32_t>(static_cast<int64_t>(pairedBlockCount) * pageSize);
 
     size_t const pairedCount = static_cast<size_t>(pairedBlockCount);
     plan.draftRecord = record.id;
@@ -235,40 +297,29 @@ ReusePlan makeSpecReusePlan(SpecDecodeMode mode, CacheDomainId domain, DraftEngi
 
     bool const fullInputMatch
         = inputTokenCount % pageSize == 0 && static_cast<int64_t>(pairedBlockCount) == totalInputPages;
-    if (fullInputMatch || !supportsOneTokenReplay)
+    if (pairedBlockCount > 1)
     {
-        if (pairedBlockCount > 1)
-        {
-            plan.specReplayDependency = SpecReplayDependency{plan.matchedBlockHashes.back(), pairedBlockCount};
-        }
-        plan.matchedBlockHashes.pop_back();
-        plan.basePageBindings.pop_back();
-        plan.draftPageBindings.pop_back();
-        plan.specReplayMode = SpecReplayMode::kFullPage;
-        if (fullInputMatch)
-        {
-            plan.kind = ReusePlanKind::kFullInputRewind;
-        }
-        else if (plan.basePageBindings.empty())
-        {
-            plan.kind = ReusePlanKind::kNoReusablePrefix;
-        }
+        plan.specReplayDependency = SpecReplayDependency{plan.matchedBlockHashes.back(), pairedBlockCount};
     }
-    else
+    plan.matchedBlockHashes.pop_back();
+    plan.basePageBindings.pop_back();
+    plan.draftPageBindings.pop_back();
+    plan.specReplayMode = SpecReplayMode::kFullPage;
+    if (fullInputMatch)
     {
-        plan.baseCowSources.push_back(plan.basePageBindings.back());
-        plan.draftCowSources.push_back(plan.draftPageBindings.back());
-        plan.specReplayMode = SpecReplayMode::kOneToken;
+        plan.kind = ReusePlanKind::kFullInputRewind;
+    }
+    else if (plan.basePageBindings.empty())
+    {
+        plan.kind = ReusePlanKind::kNoReusablePrefix;
     }
 
     if (plan.basePageBindings.empty())
     {
         plan.draftRecord.reset();
     }
-    int64_t const sharedPageCount = static_cast<int64_t>(plan.basePageBindings.size() - plan.baseCowSources.size());
-    plan.reuseTokenLength = plan.specReplayMode == SpecReplayMode::kOneToken
-        ? static_cast<int32_t>(static_cast<int64_t>(pairedBlockCount) * pageSize - 1)
-        : static_cast<int32_t>(sharedPageCount * pageSize);
+    int64_t const sharedPageCount = static_cast<int64_t>(plan.basePageBindings.size());
+    plan.reuseTokenLength = static_cast<int32_t>(sharedPageCount * pageSize);
     int64_t const privatePageCount = totalInputPages - sharedPageCount;
     plan.demand.baseKvPages = static_cast<int32_t>(privatePageCount);
     plan.demand.draftKvPages = static_cast<int32_t>(privatePageCount);

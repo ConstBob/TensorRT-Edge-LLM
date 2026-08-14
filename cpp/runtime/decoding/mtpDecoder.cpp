@@ -22,6 +22,7 @@
 #include "common/mathUtils.h"
 #include "common/safetensorsUtils.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
+#include "kernels/gdnKernels/gdnTreeChunkKernels.h"
 #include "kernels/posEncoding/applyRopeWriteKV.h"
 #include "kernels/speculative/batchEvictKernels.h"
 #include "kernels/speculative/ddtreeKernels.h"
@@ -32,6 +33,7 @@
 #include "profiling/timer.h"
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/decoding/decoderUtils.h"
+#include "runtime/decoding/logitBias.h"
 #include "runtime/preprocess/embeddingPreprocessor.h"
 #include "sampler/sampling.h"
 
@@ -54,9 +56,10 @@ constexpr int32_t kDecodeProfile{1};
 } // namespace
 
 MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, std::filesystem::path const& engineDir,
-    SpecDecodeDraftingConfig const& draftingConfig, cudaStream_t stream)
+    SpecDecodeDraftingConfig const& draftingConfig, std::unique_ptr<EngineExecutor> draftExecutor, cudaStream_t stream)
     : mRuntime(runtime)
     , mDraftCacheManager(*runtime.base.sharedResources.cacheManagers[1])
+    , mDraftExecutor(std::move(draftExecutor))
 {
     check::check(mRuntime.deployment.draft.has_value(), "SpecDecode drafting strategy requires a draft model config.");
     check::check(
@@ -64,7 +67,7 @@ MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, std::filesystem::path co
     check::check(runtime.deployment.base.specDecodeType == SpecDecodeMode::kMTP,
         "MTP decoding requires a base engine exported with spec_decode_type=mtp and engine_role=base.");
 
-    mDraftExecutor = decoder_utils::loadDraftEngine(engineDir, mRuntime.deployment);
+    ELLM_CHECK(mDraftExecutor != nullptr, "MTP decoding requires a validated draft engine.");
 
     int32_t const maxRuntimeBatchSize = mRuntime.maxRuntimeBatchSize;
     int32_t const effectiveMaxDraftProposalSize = mRuntime.deployment.effectiveMaxDraftProposalSize();
@@ -91,7 +94,7 @@ MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, std::filesystem::path co
     // Publish externalized draft-engine weights into the draft tensor map,
     // mirroring the base engine. Loaded from draft_config.json; a no-op when
     // the draft was exported without --externalize-weights.
-    mDraftExternalWeightManager.load(engineDir, engineDir / "draft_config.json", stream);
+    mDraftExternalWeightManager.load(engineDir, engineDir / "draft_config.json", stream, mRuntime.checkpointDir);
     mDraftExternalWeightManager.validateAgainstEngine(*mDraftExecutor, "draft");
     mDraftExternalWeightManager.registerTensorMapEntries(mDraftTensorMap);
 
@@ -171,14 +174,40 @@ void MTPDecoder::setContextMemory(Tensor& memory)
     }
 }
 
+bool MTPDecoder::initializeForGeneration(DecodingInferenceContext& context)
+{
+    // Default MTP keeps its decode-round-0 draft prefill; only the Hybrid+MTP endpoint-reuse path runs the draft
+    // prefill here (pre-publication), mirroring EagleDecoder::initializeForGeneration. The runtime folds the reused
+    // checkpoint boundary into baseHiddenStates and prepends the boundary token before this call, so the standard
+    // runDraftModelPrefill body is reused unchanged.
+    if (!context.hybridMtpEndpointReuse || context.speculativeDraftPrefillComplete)
+    {
+        return true;
+    }
+    if (!runDraftModelPrefill(context))
+    {
+        LOG_ERROR("Failed to run the Hybrid+MTP pre-publication draft prefill.");
+        return false;
+    }
+    context.speculativeDraftPrefillComplete = true;
+    return true;
+}
+
 bool MTPDecoder::decodeStep(DecodingInferenceContext& context)
 {
+    // Draft KV for a round's accepted tokens is written lazily, by the *next* round's accept-token pass, so the draft
+    // cache trails the base cache by the last accepted span (see ContextCacheCommitPolicy::kPrefillStateOnly).
     if (context.generationRound == 0)
     {
-        if (!runDraftModelPrefill(context))
+        // Skip when the Hybrid+MTP endpoint-reuse path already ran the draft prefill in initializeForGeneration.
+        if (!context.speculativeDraftPrefillComplete)
         {
-            LOG_ERROR("Failed to execute prefill step for draft model.");
-            return false;
+            if (!runDraftModelPrefill(context))
+            {
+                LOG_ERROR("Failed to execute prefill step for draft model.");
+                return false;
+            }
+            context.speculativeDraftPrefillComplete = true;
         }
     }
     else if (!runDraftModelAcceptToken(context))
@@ -625,6 +654,14 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
         return false;
     }
 
+    // GCOVR_EXCL_START
+    if (context.hasLogitBias)
+    {
+        applyLogitBiasRepeatedRows(mRuntime.logitBias, mRuntime.base.pipelineIO.outputLogits, context,
+            mRuntime.deployment.specConfig->verifySize, context.stream);
+    }
+    // GCOVR_EXCL_STOP
+
     // A tree with fewer verify nodes than the full chain depth caps the acceptable
     // path length at verifySize.
     int32_t const chainAcceptDepth = mRuntime.deployment.specConfig->draftingStep + 1;
@@ -652,9 +689,10 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
                      {activeBatchSize, mRuntime.deployment.specConfig->verifySize, baseOutputHiddenDim}),
         "Tensor reshape failed");
 
-    // MTP intentionally still uses the identity-only default (no page table passed) here -- unlike
-    // eagleDecoder.cpp, MTP reuse is deferred so this call is not wired to the real
-    // base page table yet. Revisit together with EAGLE if/when MTP gains non-identity reuse support.
+    auto const& basePageTable = *mRuntime.base.sharedResources.kvPageTables[0];
+    int32_t const* basePageTablePtr = basePageTable.kernelView().dataPointer<int32_t>();
+    int32_t const baseNumPages = kvMgrBase.numPages();
+    int32_t const baseMaxPagesPerSeq = basePageTable.maxPagesPerSeq();
 
     decoder_utils::clampAcceptLengthsToRemainingGeneration(context, mHostAcceptLengths, mAcceptLength, context.stream);
 
@@ -662,7 +700,7 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
     {
         kernel::eagleBaseCommitKVCache(mAcceptedTokenIndices, mAcceptLength, kvCacheLengths, group.deviceLayerInfos,
             group.numLayers, group.headDim, group.maxKVHeads, activeBatchSize, maxAcceptDepth, kvCacheType,
-            context.stream);
+            context.stream, basePageTablePtr, baseNumPages, baseMaxPagesPerSeq);
     }
     kernel::eagleBaseAssembleHiddenState(
         mAcceptedTokenIndices, mAcceptLength, mRuntime.base.pipelineIO.baseHiddenStates, context.stream);
@@ -672,11 +710,15 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
     auto& mambaMgr = mRuntime.base.cacheManager.getMambaCacheManager();
     if (mUseTree)
     {
-        // Tree verify materializes one hybrid state checkpoint per verify node; commit
-        // only the last accepted node's recurrent/conv states.
         if (mambaMgr.hasIntermediateRecurrentStates() || mambaMgr.hasIntermediateConvStates())
         {
-            mambaMgr.scatterAcceptedTreeStates(mAcceptedTokenIndices, mAcceptLength, context.stream);
+            int32_t const verifySize = mRuntime.deployment.specConfig->verifySize;
+            check::check(kernel::gdnTreeChunkVerifyEnabled(verifySize),
+                "MTP DDTree GDN chunk-form verify supports at most kGDN_TREE_CHUNK_MAX_NODES verify nodes");
+            // Chunk-form verify is stateless: recurrent states commit by replaying
+            // the accepted path; conv states scatter. Must use the same predicate
+            // as the plugin.
+            mambaMgr.replayCommitAcceptedTreeStates(mAcceptedTokenIndices, mAcceptLength, context.stream);
         }
     }
     else
@@ -1026,10 +1068,17 @@ void MTPDecoder::resetForNewSequences(Tensor& reuseLengths, cudaStream_t stream)
 }
 
 void MTPDecoder::onBatchEvict(std::vector<int32_t> const&, int32_t oldActiveBatch, int32_t newActiveBatch,
-    Tensor& deviceBatchMapping, cudaStream_t stream)
+    Tensor& deviceBatchMapping, cudaStream_t stream, BatchCompactionMode mode)
 {
-    mDraftCacheManager.compactBatch(deviceBatchMapping, oldActiveBatch, newActiveBatch, stream);
-    mDraftCacheManager.setActiveBatchSize(newActiveBatch);
+    // In managed-page (context-reuse) mode the coordinator compacts the draft KV page-table rows during its own
+    // compactBatch, so the decoder must NOT also compact the physical draft cache; it only compacts its own per-slot
+    // working state below. In legacy mode the decoder owns the physical draft KV compaction. Mirrors
+    // EagleDecoder::onBatchEvict.
+    if (mode == BatchCompactionMode::kLegacyPhysicalKv)
+    {
+        mDraftCacheManager.compactBatch(deviceBatchMapping, oldActiveBatch, newActiveBatch, stream);
+        mDraftCacheManager.setActiveBatchSize(newActiveBatch);
+    }
 
     if (mRuntime.base.pipelineIO.baseHiddenStates.getShape().getNumDims() == 3
         && mRuntime.base.pipelineIO.baseHiddenStates.getShape()[0] == oldActiveBatch && newActiveBatch > 0)

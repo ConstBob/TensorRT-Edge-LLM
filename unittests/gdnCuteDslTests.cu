@@ -35,10 +35,26 @@ using namespace trt_edgellm;
 // SM helpers
 // ---------------------------------------------------------------------------
 
-/** True if the SM version supports the Blackwell GDN prefill kernel (SM100+). */
+/** True if the SM version supports an optimized Blackwell GDN prefill kernel. */
 static inline bool isBlackwellSM(int32_t sm)
 {
-    return sm >= 100;
+    return sm == 100 || sm == 101 || sm == 110 || sm == 120 || sm == 121;
+}
+
+static inline bool isBlackwellGeforceSM(int32_t sm)
+{
+    return sm == 120 || sm == 121;
+}
+
+static void* allocTensorMapScratch(int32_t smVersion)
+{
+    if (!isBlackwellGeforceSM(smVersion))
+        return nullptr;
+    void* scratch = nullptr;
+    size_t const bytes = static_cast<size_t>(CuteDslGDNRunner::kBlackwellGeforceMaxSMCount)
+        * CuteDslGDNRunner::kBlackwellGeforceTensorMapDescriptorBytes;
+    CUDA_CHECK(cudaMalloc(&scratch, bytes));
+    return scratch;
 }
 
 /** One step of a seeded LCG PRNG; returns a float in [-0.5, 0.5). */
@@ -366,9 +382,6 @@ void runGDNDecodeTest()
     params.k_dim = k;
     params.v_dim = v;
 
-    bool loaded = CuteDslGDNRunner::loadKernelModules();
-    ASSERT_TRUE(loaded) << "Failed to load GDN kernel modules";
-
     CuteDslGDNRunner runner;
     int ret = runner.run(params, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -416,7 +429,7 @@ void runGDNDecodeTest()
 
 void runGDNPrefillTest()
 {
-    // Detect SM version: runner dispatches to Blackwell kernel on SM100+, sequential otherwise.
+    // Detect SM version: optimized prefill runs on SM100/101/110 and SM120/121, sequential otherwise.
     int32_t const smVersion = getSMVersion();
     bool const onBlackwell = isBlackwellSM(smVersion);
 
@@ -554,6 +567,7 @@ void runGDNPrefillTest()
     void* d_h0_scratch = nullptr;
     if (onBlackwell)
         CUDA_CHECK(cudaMalloc(&d_h0_scratch, h0Bytes));
+    void* d_tensormap_scratch = allocTensorMapScratch(smVersion);
 
     GDNParams params{};
     params.q = d_q;
@@ -567,6 +581,7 @@ void runGDNPrefillTest()
     params.context_lengths = d_context_lengths;
     params.cu_seqlens = d_cu_seqlens;
     params.h0_scratch = d_h0_scratch;
+    params.tensormap_scratch = d_tensormap_scratch;
     params.o = d_o;
     params.n = n;
     params.seq_len = seq_len;
@@ -575,9 +590,6 @@ void runGDNPrefillTest()
     params.k_dim = k;
     params.v_dim = v;
     params.smVersion = smVersion;
-
-    bool loaded = CuteDslGDNRunner::loadKernelModules();
-    ASSERT_TRUE(loaded) << "Failed to load GDN kernel modules";
 
     CuteDslGDNRunner runner;
     int ret = runner.run(params, nullptr);
@@ -627,12 +639,14 @@ void runGDNPrefillTest()
         CUDA_CHECK(cudaFree(d_cu_seqlens));
     if (d_h0_scratch)
         CUDA_CHECK(cudaFree(d_h0_scratch));
+    if (d_tensormap_scratch)
+        CUDA_CHECK(cudaFree(d_tensormap_scratch));
     CUDA_CHECK(cudaFree(d_o));
 }
 
 /**
  * SM-aware padding test: context_lengths < seq_len for some batch items.
- * On SM100+ the runner dispatches to Blackwell kernel (cu_seqlens masking).
+ * On SM100/101/110 and SM120/121 the runner dispatches to an optimized Blackwell kernel.
  * On SM80   the runner dispatches to sequential kernel (context_lengths masking).
  * Verifies: output at padding positions is 0 (or close to 0), valid positions match reference.
  */
@@ -739,6 +753,8 @@ void runGDNPrefillPaddingTest()
     CUDA_CHECK(cudaMemcpy(d_dt_bias, h_dt_h.data(), hv * sizeof(half), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_h0_src, h_h0.data(), h0Len * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_ctx, h_ctx.data(), n * sizeof(int32_t), cudaMemcpyHostToDevice));
+    std::vector<half> const h_o_sentinel(oLen, floatToHalf(1.f));
+    CUDA_CHECK(cudaMemcpy(d_o, h_o_sentinel.data(), oLen * sizeof(half), cudaMemcpyHostToDevice));
 
     void* d_cu_seqlens = nullptr;
     if (onBlackwell)
@@ -747,6 +763,7 @@ void runGDNPrefillPaddingTest()
     void* d_h0_scratch = nullptr;
     if (onBlackwell)
         CUDA_CHECK(cudaMalloc(&d_h0_scratch, h0Len * sizeof(float)));
+    void* d_tensormap_scratch = allocTensorMapScratch(smVersion);
 
     GDNParams params{};
     params.q = d_q;
@@ -760,6 +777,7 @@ void runGDNPrefillPaddingTest()
     params.context_lengths = d_ctx;
     params.cu_seqlens = d_cu_seqlens;
     params.h0_scratch = d_h0_scratch;
+    params.tensormap_scratch = d_tensormap_scratch;
     params.o = d_o;
     params.n = n;
     params.seq_len = seq_len;
@@ -768,9 +786,6 @@ void runGDNPrefillPaddingTest()
     params.k_dim = k;
     params.v_dim = v;
     params.smVersion = smVersion;
-
-    bool loaded = CuteDslGDNRunner::loadKernelModules();
-    ASSERT_TRUE(loaded) << "Failed to load GDN kernel modules";
 
     CuteDslGDNRunner runner;
     int ret = runner.run(params, nullptr);
@@ -833,6 +848,8 @@ void runGDNPrefillPaddingTest()
         CUDA_CHECK(cudaFree(d_cu_seqlens));
     if (d_h0_scratch)
         CUDA_CHECK(cudaFree(d_h0_scratch));
+    if (d_tensormap_scratch)
+        CUDA_CHECK(cudaFree(d_tensormap_scratch));
     CUDA_CHECK(cudaFree(d_o));
 }
 
@@ -1074,9 +1091,6 @@ static void runGDNDecodeMTPTestConfig(int32_t seq_len, bool with_cache)
     params.v_dim = v;
     params.smVersion = getSMVersion();
 
-    bool loaded = CuteDslGDNRunner::loadKernelModules();
-    ASSERT_TRUE(loaded) << "Failed to load GDN kernel modules";
-
     CuteDslGDNRunner runner;
     int32_t const ret = runner.run(params, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -1160,16 +1174,16 @@ TEST(GDNCuteDsl, PrefillPadding)
 }
 
 /**
- * Blackwell prefill with the exact Qwen3.5-4B parameters: n=1, h=16, hv=32, seq_len=164 (non-multiple of 128).
- * This configuration triggers grouped value attention (h_r=2) and tail masking (164 % 128 = 36).
+ * GDN prefill with the exact Qwen3.5-4B parameters: n=1, h=16, hv=32, seq_len=164.
+ * This configuration triggers grouped value attention (h_r=2) and tail masking on optimized Blackwell paths.
  */
-void runGDNPrefillQwen35Test()
+void runGDNPrefillQwen35Test(float atol = 5e-2f, float rtol = 5e-2f)
 {
     int32_t const smVersion = getSMVersion();
     bool const onBlackwell = isBlackwellSM(smVersion);
     if (!onBlackwell)
     {
-        GTEST_SKIP() << "Qwen3.5-4B prefill test requires Blackwell (SM100+), skipping on SM" << smVersion;
+        GTEST_SKIP() << "Qwen3.5-4B prefill test requires SM100/101/110 or SM120/121, skipping on SM" << smVersion;
         return;
     }
 
@@ -1249,6 +1263,7 @@ void runGDNPrefillQwen35Test()
     void* d_cu_seqlens = allocCuSeqlens(d_ctx, n);
     void* d_h0_scratch = nullptr;
     CUDA_CHECK(cudaMalloc(&d_h0_scratch, h0Len * sizeof(float)));
+    void* d_tensormap_scratch = allocTensorMapScratch(smVersion);
 
     GDNParams params{};
     params.q = d_q;
@@ -1262,6 +1277,7 @@ void runGDNPrefillQwen35Test()
     params.context_lengths = d_ctx;
     params.cu_seqlens = d_cu_seqlens;
     params.h0_scratch = d_h0_scratch;
+    params.tensormap_scratch = d_tensormap_scratch;
     params.o = d_o;
     params.n = n;
     params.seq_len = seq_len;
@@ -1271,13 +1287,10 @@ void runGDNPrefillQwen35Test()
     params.v_dim = v;
     params.smVersion = smVersion;
 
-    bool loaded = CuteDslGDNRunner::loadKernelModules();
-    ASSERT_TRUE(loaded) << "Failed to load GDN kernel modules";
-
     CuteDslGDNRunner runner;
     int ret = runner.run(params, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
-    EXPECT_EQ(ret, 0) << "GDN Blackwell prefill (Qwen3.5-4B params) run failed";
+    EXPECT_EQ(ret, 0) << "GDN prefill (Qwen3.5-4B params) run failed";
 
     std::vector<half> h_o_h(oLen);
     CUDA_CHECK(cudaMemcpy(h_o_h.data(), d_o, oLen * sizeof(half), cudaMemcpyDeviceToHost));
@@ -1295,16 +1308,14 @@ void runGDNPrefillQwen35Test()
     float maxAbsOut = 0.f;
     for (size_t i = 0; i < oLen; ++i)
         maxAbsOut = std::max(maxAbsOut, std::abs(h_o[i]));
-    printf("  Blackwell Qwen3.5-4B: max |output| = %.6f\n", maxAbsOut);
-    EXPECT_GT(maxAbsOut, 1e-4f) << "Blackwell output is all zeros/near-zero";
+    printf("  GDN Qwen3.5-4B: max |output| = %.6f\n", maxAbsOut);
+    EXPECT_GT(maxAbsOut, 1e-4f) << "GDN output is all zeros/near-zero";
 
     float maxAbsRef = 0.f;
     for (size_t i = 0; i < oLen; ++i)
         maxAbsRef = std::max(maxAbsRef, std::abs(o_ref[i]));
     printf("  Reference: max |output| = %.6f\n", maxAbsRef);
 
-    float const atol = 5e-2f;
-    float const rtol = 5e-2f;
     size_t mismatches = 0;
     for (size_t i = 0; i < oLen && mismatches < 10; ++i)
     {
@@ -1314,7 +1325,7 @@ void runGDNPrefillQwen35Test()
             ++mismatches;
         }
     }
-    EXPECT_EQ(mismatches, 0u) << "Blackwell Qwen3.5-4B output mismatches found";
+    EXPECT_EQ(mismatches, 0u) << "GDN Qwen3.5-4B output mismatches found";
 
     // Check state
     std::vector<float> h_h0_out(h0Len);
@@ -1328,7 +1339,7 @@ void runGDNPrefillQwen35Test()
             ++stateMismatches;
         }
     }
-    EXPECT_EQ(stateMismatches, 0u) << "Blackwell Qwen3.5-4B state mismatches found";
+    EXPECT_EQ(stateMismatches, 0u) << "GDN Qwen3.5-4B state mismatches found";
 
     CUDA_CHECK(cudaFree(d_q));
     CUDA_CHECK(cudaFree(d_k));
@@ -1341,6 +1352,8 @@ void runGDNPrefillQwen35Test()
     CUDA_CHECK(cudaFree(d_ctx));
     CUDA_CHECK(cudaFree(d_cu_seqlens));
     CUDA_CHECK(cudaFree(d_h0_scratch));
+    if (d_tensormap_scratch)
+        CUDA_CHECK(cudaFree(d_tensormap_scratch));
     CUDA_CHECK(cudaFree(d_o));
 }
 
@@ -1358,7 +1371,7 @@ void runGDNBlackwellVsSequentialTest()
     int32_t const smVersion = getSMVersion();
     if (!isBlackwellSM(smVersion))
     {
-        GTEST_SKIP() << "Blackwell vs Sequential test requires SM100+";
+        GTEST_SKIP() << "Blackwell vs Sequential test requires SM100/101/110 or SM120/121";
         return;
     }
 
@@ -1441,6 +1454,7 @@ void runGDNBlackwellVsSequentialTest()
     void* d_cu_seqlens = allocCuSeqlens(d_ctx, n);
     void* d_h0_scratch = nullptr;
     CUDA_CHECK(cudaMalloc(&d_h0_scratch, h0Len * sizeof(float)));
+    void* d_tensormap_scratch = allocTensorMapScratch(smVersion);
 
     GDNParams bwParams{};
     bwParams.q = d_q;
@@ -1454,6 +1468,7 @@ void runGDNBlackwellVsSequentialTest()
     bwParams.context_lengths = d_ctx;
     bwParams.cu_seqlens = d_cu_seqlens;
     bwParams.h0_scratch = d_h0_scratch;
+    bwParams.tensormap_scratch = d_tensormap_scratch;
     bwParams.o = d_o_bw;
     bwParams.n = n;
     bwParams.seq_len = seq_len;
@@ -1463,8 +1478,6 @@ void runGDNBlackwellVsSequentialTest()
     bwParams.v_dim = v;
     bwParams.smVersion = smVersion;
 
-    bool loaded = CuteDslGDNRunner::loadKernelModules();
-    ASSERT_TRUE(loaded);
     CuteDslGDNRunner runner;
     int ret = runner.run(bwParams, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -1546,6 +1559,8 @@ void runGDNBlackwellVsSequentialTest()
     CUDA_CHECK(cudaFree(d_o_bw));
     CUDA_CHECK(cudaFree(d_cu_seqlens));
     CUDA_CHECK(cudaFree(d_h0_scratch));
+    if (d_tensormap_scratch)
+        CUDA_CHECK(cudaFree(d_tensormap_scratch));
     CUDA_CHECK(cudaFree(d_h0_seq));
     CUDA_CHECK(cudaFree(d_o_seq));
 }
@@ -1553,6 +1568,13 @@ void runGDNBlackwellVsSequentialTest()
 TEST(GDNCuteDsl, BlackwellVsSequential)
 {
     runGDNBlackwellVsSequentialTest();
+}
+
+TEST(GDNCuteDsl, PrefillQwen35BlackwellGeforce)
+{
+    if (!isBlackwellGeforceSM(getSMVersion()))
+        GTEST_SKIP() << "Blackwell GeForce-specific coverage requires SM120 or SM121";
+    runGDNPrefillQwen35Test(1e-4f, 1e-4f);
 }
 
 TEST(GDNCuteDsl, CanImplement)

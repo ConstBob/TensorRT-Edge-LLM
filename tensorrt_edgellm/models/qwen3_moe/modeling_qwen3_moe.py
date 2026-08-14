@@ -623,6 +623,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
         kv_page_table: torch.Tensor,
+        skip_softmax_scale: "torch.Tensor | None" = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
         attn_output, present_key_value = self.self_attn(
@@ -632,6 +633,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             context_lengths,
             kvcache_start_index,
             kv_page_table,
+            skip_softmax_scale=skip_softmax_scale,
         )
         hidden_states = residual + attn_output
 
@@ -692,6 +694,7 @@ class Qwen3MoeTransformer(nn.Module):
         kvcache_start_index: torch.Tensor,
         kv_page_table: torch.Tensor,
         deepstack_embeds: Tuple[torch.Tensor, ...] = (),
+        skip_softmax_scale: "torch.Tensor | None" = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]:
         hidden_states = inputs_embeds
         present_key_values_list: List[torch.Tensor] = []
@@ -711,6 +714,7 @@ class Qwen3MoeTransformer(nn.Module):
                 context_lengths,
                 kvcache_start_index,
                 kv_page_table,
+                skip_softmax_scale=skip_softmax_scale,
             )
             present_key_values_list.append(next_key_value)
 
@@ -859,15 +863,17 @@ class Qwen3MoeCausalLM(nn.Module):
                         device=device) for _ in range(Nd)
         ]
 
+        skip_softmax_scale = torch.zeros(1, dtype=torch.int8, device=device)
         args = (inputs_embeds, *past_key_values_list, rope_rotary_cos_sin,
                 context_lengths, kvcache_start_index, kv_page_table,
-                last_token_ids, *deepstack_embeds_list)
+                last_token_ids, *deepstack_embeds_list, skip_softmax_scale)
 
         input_names = (
             ["inputs_embeds"] + [f"past_key_values_{i}" for i in range(Na)] + [
                 "rope_rotary_cos_sin", "context_lengths",
                 "kvcache_start_index", "kv_page_table", "last_token_ids"
-            ] + [f"deepstack_embeds_{i}" for i in range(Nd)])
+            ] + [f"deepstack_embeds_{i}"
+                 for i in range(Nd)] + ["skip_softmax_scale"])
         output_names = (["logits"] +
                         [f"present_key_values_{i}" for i in range(Na)])
         if self.emit_hidden_states:
@@ -882,6 +888,9 @@ class Qwen3MoeCausalLM(nn.Module):
         page_batch = torch.export.Dim("page_batch", min=1, max=256)
         max_pages = torch.export.Dim("max_pages_per_seq", min=1, max=32768)
         num_pages = torch.export.Dim("num_pages", min=1, max=1048576)
+        skip_dim = torch.export.Dim("skip_softmax_scale_len",
+                                    min=0,
+                                    max=1048576)
 
         all_shapes: list = [{0: batch, 1: seq}]  # inputs_embeds
         for _ in range(Na):
@@ -894,6 +903,7 @@ class Qwen3MoeCausalLM(nn.Module):
         all_shapes.append({0: batch})  # last_token_ids
         for _ in range(Nd):
             all_shapes.append({0: batch, 1: seq})  # deepstack_embeds_i
+        all_shapes.append({0: skip_dim})  # skip_softmax_scale
 
         wrapped = _make_flat_wrapper(
             self, Na, Nd, emit_hidden_states=self.emit_hidden_states)
@@ -906,15 +916,16 @@ class Qwen3MoeCausalLM(nn.Module):
                         dynamic_shapes=all_shapes)
 
     def forward(
-            self,
-            inputs_embeds: torch.Tensor,
-            past_key_values: Tuple[torch.Tensor, ...],
-            rope_rotary_cos_sin: torch.Tensor,
-            context_lengths: torch.Tensor,
-            kvcache_start_index: torch.Tensor,
-            kv_page_table: torch.Tensor,
-            last_token_ids: torch.Tensor,
-            deepstack_embeds: Tuple[torch.Tensor, ...] = (),
+        self,
+        inputs_embeds: torch.Tensor,
+        past_key_values: Tuple[torch.Tensor, ...],
+        rope_rotary_cos_sin: torch.Tensor,
+        context_lengths: torch.Tensor,
+        kvcache_start_index: torch.Tensor,
+        kv_page_table: torch.Tensor,
+        last_token_ids: torch.Tensor,
+        deepstack_embeds: Tuple[torch.Tensor, ...] = (),
+        skip_softmax_scale: "torch.Tensor | None" = None,
     ) -> Tuple:
         hidden_states, present_key_values = self.model(
             inputs_embeds,
@@ -924,6 +935,7 @@ class Qwen3MoeCausalLM(nn.Module):
             kvcache_start_index,
             kv_page_table,
             deepstack_embeds,
+            skip_softmax_scale=skip_softmax_scale,
         )
         # Select hidden states for specified token positions before lm_head.
         selected_hidden_states = torch.ops.trt.gather_nd(

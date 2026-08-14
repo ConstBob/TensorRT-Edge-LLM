@@ -36,13 +36,13 @@ import torch.nn.functional as F
 
 from ..config import (QUANT_FP8, QUANT_FP16, QUANT_INT4_AWQ,
                       QUANT_INT4_AWQ_MODELOPT, QUANT_INT4_GPTQ, QUANT_INT8_SQ,
-                      QUANT_MXFP8, QUANT_NVFP4, Mapping, ModelConfig,
-                      module_quant_type)
+                      QUANT_MXFP8, QUANT_NVFP4, QUANT_NVFP4_A16, Mapping,
+                      ModelConfig, module_quant_type)
 from .ops import (fp8_dequantize, fp8_quantize, fused_nvfp4_gemm_allreduce,
                   int4_gemm_plugin_version, int4_groupwise_gemm,
                   int4_groupwise_gemm_v2, int8_sq_act_qdq, int8_sq_weight_dq,
-                  mxfp8_act_qdq, mxfp8_weight_dq, nvfp4_act_qdq,
-                  nvfp4_dequantize)
+                  mxfp8_act_qdq, mxfp8_weight_dq, nvfp4_a16_gemm,
+                  nvfp4_act_qdq, nvfp4_dequantize)
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +81,7 @@ __all__ = [
     "MXFP8Linear",
     "AWQLinear",
     "ModelOptAWQPrepackedLinear",
+    "NVFP4A16MarlinLinear",
     "GPTQLinear",
     "INT8SQLinear",
     "TPMode",
@@ -592,6 +593,75 @@ class ModelOptAWQPrepackedLinear(LinearBase):
 
 
 # ---------------------------------------------------------------------------
+# NVFP4A16MarlinLinear  (compressed-tensors NVFP4 W4A16, dense Marlin)
+# ---------------------------------------------------------------------------
+
+
+class NVFP4A16MarlinLinear(LinearBase):
+    """Dense NVFP4 (W4A16) linear backed by the Marlin ``Nvfp4A16GemmPlugin``.
+
+    Checkpoint buffers (ModelOpt ``W4A16_NVFP4``) load raw and are transformed
+    in place by :func:`repacking.repack_nvfp4_a16_marlin_linear`:
+
+      ``weight``         [N, K//2]  uint8  -> ``qweight``      [1, K//16, 8*N_pad] int8
+      ``weight_scale``   [N, K//16] f8e4m3 -> ``block_scales`` [1, K//16, N_pad]    int8
+      ``weight_scale_2`` scalar     f32    -> ``global_scale`` [1]                   fp16
+
+    ``out_features`` is the logical N; the plugin emits the padded width and the
+    forward slices back to ``out_features``.
+
+    Activations stay FP16 end-to-end: the Marlin kernel has an FP16 (half2)
+    E2M1 path, so no BF16 cast is needed. ``global_scale`` is repacked as FP16
+    (pre-scaled by ``2**7``).
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        group_size: int = 16,
+        bias: bool = False,
+    ) -> None:
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.group_size = group_size
+        # Raw ModelOpt checkpoint buffers (populated by the loader, then repacked).
+        self.register_buffer(
+            "weight",
+            torch.zeros(out_features, in_features // 2, dtype=torch.uint8))
+        self.register_buffer(
+            "weight_scale",
+            torch.zeros(out_features,
+                        in_features // group_size,
+                        dtype=torch.float8_e4m3fn))
+        self.register_buffer("weight_scale_2",
+                             torch.ones(1, dtype=torch.float32))
+        # Padded output width, overwritten by the repacking step.
+        self.n_padded = out_features
+        if bias:
+            self.register_buffer("bias", torch.empty(out_features))
+        else:
+            self.bias = None
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        _require_fp16_input(hidden_states, "NVFP4A16MarlinLinear")
+        out = nvfp4_a16_gemm(
+            hidden_states,
+            self.qweight,
+            self.block_scales,
+            self.global_scale,
+            self.n_padded,
+            self.in_features,
+        )
+        if self.n_padded != self.out_features:
+            out = out[..., :self.out_features]
+        if self.bias is not None:
+            out = out + self.bias.to(torch.float16)
+        return out
+
+
+# ---------------------------------------------------------------------------
 # GPTQLinear
 # ---------------------------------------------------------------------------
 
@@ -789,6 +859,9 @@ def make_linear(
     elif quant_type == QUANT_INT4_AWQ_MODELOPT:
         layer = ModelOptAWQPrepackedLinear(in_features, out_features,
                                            config.quant.group_size, bias)
+    elif quant_type == QUANT_NVFP4_A16:
+        layer = NVFP4A16MarlinLinear(in_features, out_features,
+                                     config.quant.group_size, bias)
     elif quant_type == QUANT_INT4_GPTQ:
         layer = GPTQLinear(in_features, out_features, config.quant.group_size,
                            config.quant.gptq_zero_point_offset, bias)

@@ -20,6 +20,9 @@
 #include <cmath>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#if SUPPORTS_FP8
+#include <cuda_fp8.h>
+#endif
 #include <cuda_runtime.h>
 #include <functional>
 #include <gtest/gtest.h>
@@ -92,40 +95,6 @@ typename std::enable_if<std::is_arithmetic<T>::value, std::ostream&>::type opera
     os << "]";
     return os;
 }
-
-class KvCacheIndexer
-{
-public:
-    KvCacheIndexer(
-        int32_t const batchSize, int32_t const kvHeadNum, int32_t const kvCacheCapacity, int32_t const headSize)
-    {
-        mBatchSize = batchSize;
-        mKvHeadNum = kvHeadNum;
-        mKvCacheCapacity = kvCacheCapacity;
-        mHeadSize = headSize;
-    }
-
-    int32_t indexK(int32_t const b, int32_t const hk, int32_t const cacheIdx, int32_t const d)
-    {
-        // Linear KVCache has layout of [B, 2, Hkv, S_capacity, D].
-        return b * 2 * mKvHeadNum * mKvCacheCapacity * mHeadSize + hk * mKvCacheCapacity * mHeadSize
-            + cacheIdx * mHeadSize + d;
-    }
-
-    int32_t indexV(int32_t const b, int32_t const hv, int32_t const cacheIdx, int32_t const d)
-    {
-        // Linear KVCache has layout of [B, 2, Hkv, S_capacity, D].
-        // V cache need to offset the whole kCache buffer for the sequence.
-        return b * 2 * mKvHeadNum * mKvCacheCapacity * mHeadSize + (mKvHeadNum + hv) * mKvCacheCapacity * mHeadSize
-            + cacheIdx * mHeadSize + d;
-    }
-
-private:
-    int32_t mBatchSize;
-    int32_t mKvHeadNum;
-    int32_t mKvCacheCapacity;
-    int32_t mHeadSize;
-};
 
 template <typename T>
 static std::pair<float, float> getTolerance()
@@ -225,3 +194,27 @@ inline std::string formatTensorIndex(trt_edgellm::rt::Coords const& shape, int64
     oss << "]";
     return oss.str();
 }
+
+#if SUPPORTS_FP8
+// Per-tensor quantize FP16 → FP8 E4M3: fp8 ≈ fp16 / scale (saturating cast).
+inline std::vector<__nv_fp8_e4m3> quantizeHalfToFp8(std::vector<half> const& src, float scale)
+{
+    std::vector<__nv_fp8_e4m3> dst(src.size());
+    for (size_t i = 0; i < src.size(); ++i)
+    {
+        dst[i] = static_cast<__nv_fp8_e4m3>(__half2float(src[i]) / scale);
+    }
+    return dst;
+}
+
+// Per-tensor dequantize FP8 → FP16: fp16 = fp8 * scale.
+inline std::vector<half> dequantizeFp8ToHalf(std::vector<__nv_fp8_e4m3> const& src, float scale)
+{
+    std::vector<half> dst(src.size());
+    for (size_t i = 0; i < src.size(); ++i)
+    {
+        dst[i] = __float2half(static_cast<float>(src[i]) * scale);
+    }
+    return dst;
+}
+#endif // SUPPORTS_FP8

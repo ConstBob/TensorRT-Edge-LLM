@@ -16,6 +16,7 @@
 
 import numpy as np
 
+from ...core.weights import ParameterSpec
 from ...weight_packing import nvfp4 as nvfp4_pack
 
 _PREFIXES = {
@@ -33,12 +34,20 @@ _WRAPPERS = (
 )
 
 
+def writes_runtime_embedding(args) -> bool:
+    """MoE MTP drafts consume the target model's embedding sidecar."""
+    return not (args.resolved_spec_role.value == "draft"
+                and args.spec_type == "mtp")
+
+
 def resolve_candidates(name: str, *, component: str, spec_type: str,
                        spec_role: str, quant_type: str):
     """Map frontend tensor names to Qwen3.5 MoE component checkpoints."""
-    del spec_type, spec_role
     prefixes = _PREFIXES.get(component, ())
-    candidates = [prefix + name for prefix in prefixes]
+    candidates = []
+    if spec_role == "draft" and spec_type == "mtp":
+        candidates.append(f"mtp.{name}")
+    candidates.extend(prefix + name for prefix in prefixes)
     if component == "llm" and name.startswith("model."):
         nested_name = name[len("model."):]
         candidates.extend(prefix + nested_name for prefix in prefixes)
@@ -59,40 +68,208 @@ def normalize_checkpoint_name(name: str) -> str:
 def repack_nvfp4_experts(load_expert, num_experts: int, hidden_size: int,
                          intermediate_size: int, group_size: int,
                          fc1_layout: str):
-    """Pack this family's SwiGLU experts for the Edge-LLM MoE operation."""
-    if fc1_layout not in ("interleave", "concat"):
-        raise ValueError(f"unsupported FC1 layout {fc1_layout!r}")
+    """Arrange Qwen3.5 provider-packed experts without requantization."""
+    return nvfp4_pack.pack_gated_nvfp4_experts(
+        load_expert,
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        group_size,
+        fc1_layout,
+    )
 
-    def build_fc1(gate, up):
-        if fc1_layout == "concat":
-            return np.concatenate([up, gate],
-                                  axis=0).reshape(2 * intermediate_size,
-                                                  hidden_size)
-        rows = 64
-        if intermediate_size % rows:
-            raise ValueError("moe_intermediate_size must be a multiple of 64")
-        chunks = intermediate_size // rows
-        up_chunks = up.reshape(chunks, rows, hidden_size)
-        gate_chunks = gate.reshape(chunks, rows, hidden_size)
-        return np.stack([up_chunks, gate_chunks],
-                        axis=1).reshape(2 * intermediate_size, hidden_size)
 
-    fc1_weights, fc1_scales = [], []
-    fc2_weights, fc2_scales = [], []
-    for expert_index in range(num_experts):
-        expert = load_expert(expert_index)
-        fc1 = build_fc1(expert["gate"], expert["up"])
-        weight, scale = nvfp4_pack.pack_nvfp4_moe_weight(fc1, group_size)
-        fc1_weights.append(weight)
-        fc1_scales.append(scale)
-        weight, scale = nvfp4_pack.pack_nvfp4_moe_weight(
-            expert["down"], group_size)
-        fc2_weights.append(weight)
-        fc2_scales.append(scale)
+def load_gptq_expert_projection(weights, experts_prefix: str,
+                                expert_index: int, projection: str):
+    """Load one Qwen3.5 GPTQ expert projection in provider layout."""
+    prefix = f"{experts_prefix}.{expert_index}.{projection}"
+    if weights.has(prefix + ".g_idx"):
+        group_index = weights.array(prefix + ".g_idx").reshape(-1)
+        expected = np.arange(group_index.size) // weights.group_size
+        if not np.array_equal(group_index, expected):
+            raise ValueError(
+                f"Qwen3.5 MoE does not support act-order GPTQ: {prefix}")
+    qzeros = (weights.array(prefix + ".qzeros")
+              if weights.has(prefix + ".qzeros") else np.empty(
+                  (1, 0), dtype=np.int32))
+    return (weights.array(prefix + ".qweight"), qzeros,
+            weights.f16(prefix + ".scales"))
 
-    ones = np.ones(num_experts, dtype=np.float32)
-    return (np.stack(fc1_weights), np.stack(fc1_scales), ones,
-            np.stack(fc2_weights), np.stack(fc2_scales), ones.copy())
+
+def int4_expert_bindings(weights, experts_prefix: str, num_experts: int,
+                         group_size: int, zero_point_offset: int) -> dict:
+    """Map Qwen3.5 per-expert GPTQ tensors to Int4MoePlugin inputs."""
+
+    def projection_names(projections, leaves):
+        return [
+            f"{experts_prefix}.{expert}.{projection}.{leaf}"
+            for expert in range(num_experts) for projection in projections
+            for leaf in leaves
+        ]
+
+    common = {
+        "num_experts": num_experts,
+        "group_size": group_size,
+        "zero_point_offset": zero_point_offset,
+    }
+    return {
+        "fc_gate_up_qweights":
+        weights.checkpoint_binding(
+            projection_names(("gate_proj", "up_proj"),
+                             ("qweight", "qzeros", "g_idx")), "plugin",
+            "int4_moe_gate_up", **common),
+        "fc_gate_up_scales":
+        weights.checkpoint_binding(
+            projection_names(("gate_proj", "up_proj"), ("scales", )), "plugin",
+            "int4_moe_gate_up_scales", **common),
+        "fc_down_qweights":
+        weights.checkpoint_binding(
+            projection_names(("down_proj", ), ("qweight", "qzeros", "g_idx")),
+            "plugin", "int4_moe_down", **common),
+        "fc_down_scales":
+        weights.checkpoint_binding(
+            projection_names(("down_proj", ), ("scales", )), "plugin",
+            "int4_moe_down_scales", **common),
+    }
+
+
+def int4_expert_specs(weights, experts_prefix: str, num_experts: int) -> dict:
+    """Describe final Marlin MoE buffers without reading expert payloads."""
+    gate_qweight = weights.parameter_spec(
+        f"{experts_prefix}.0.gate_proj.qweight", np.int32)
+    gate_scales = weights.parameter_spec(
+        f"{experts_prefix}.0.gate_proj.scales", np.float16)
+    down_qweight = weights.parameter_spec(
+        f"{experts_prefix}.0.down_proj.qweight", np.int32)
+    down_scales = weights.parameter_spec(
+        f"{experts_prefix}.0.down_proj.scales", np.float16)
+    hidden_size = gate_qweight.shape[0] * 8
+    intermediate_size = gate_qweight.shape[1]
+    down_input_size = down_qweight.shape[0] * 8
+    down_output_size = down_qweight.shape[1]
+    return {
+        "fc_gate_up_qweights":
+        ParameterSpec((num_experts, hidden_size // 16, 16 * intermediate_size),
+                      np.int8),
+        "fc_gate_up_scales":
+        ParameterSpec(
+            (num_experts, gate_scales.shape[0], 2 * intermediate_size),
+            np.float16),
+        "fc_down_qweights":
+        ParameterSpec(
+            (num_experts, down_input_size // 16, 8 * down_output_size),
+            np.int8),
+        "fc_down_scales":
+        ParameterSpec((num_experts, down_scales.shape[0], down_output_size),
+                      np.float16),
+    }
+
+
+def nvfp4_expert_bindings(weights, experts_prefix: str, num_experts: int,
+                          sm12x: bool) -> dict:
+    """Map Qwen3.5 provider-packed NVFP4 experts to plugin inputs."""
+    records = {}
+    for expert in range(num_experts):
+        for projection in ("up_proj", "gate_proj", "down_proj"):
+            records[expert, projection] = weights.nvfp4_checkpoint_names(
+                f"{experts_prefix}.{expert}.{projection}")
+
+    def fields(projections, order):
+        return [
+            records[expert, projection][field] for expert in range(num_experts)
+            for field in order for projection in projections
+        ]
+
+    fc1_reciprocal = {
+        records[expert, projection][3]
+        for expert in range(num_experts)
+        for projection in ("up_proj", "gate_proj")
+    }
+    fc2_reciprocal = {
+        records[expert, "down_proj"][3]
+        for expert in range(num_experts)
+    }
+    if len(fc1_reciprocal) != 1 or len(fc2_reciprocal) != 1:
+        raise ValueError(
+            "Qwen3.5 NVFP4 experts use inconsistent alpha formats")
+    fc1_reciprocal = fc1_reciprocal.pop()
+    fc2_reciprocal = fc2_reciprocal.pop()
+
+    common = {
+        "num_experts": num_experts,
+        "fc1_layout": "concat" if sm12x else "interleave",
+    }
+    gate_up = ("up_proj", "gate_proj")
+    down = ("down_proj", )
+    return {
+        "fc1_qweights":
+        weights.checkpoint_binding(fields(gate_up, (0, 1, 2)),
+                                   "nvfp4_qweight",
+                                   "nvfp4_gated_fc1_qweight",
+                                   reciprocal_alpha=fc1_reciprocal,
+                                   **common),
+        "fc1_blocks_scale":
+        weights.checkpoint_binding(fields(gate_up, (0, 1, 2)),
+                                   "nvfp4_scale_linear",
+                                   "nvfp4_gated_fc1_scale",
+                                   reciprocal_alpha=fc1_reciprocal,
+                                   **common),
+        "fc1_alpha":
+        weights.checkpoint_binding([], "generated", "fill", fill_value=1.0),
+        "fc2_qweights":
+        weights.checkpoint_binding(fields(down, (0, 1, 2)),
+                                   "nvfp4_qweight",
+                                   "nvfp4_gated_fc2_qweight",
+                                   reciprocal_alpha=fc2_reciprocal,
+                                   **common),
+        "fc2_blocks_scale":
+        weights.checkpoint_binding(fields(down, (0, 1, 2)),
+                                   "nvfp4_scale_linear",
+                                   "nvfp4_gated_fc2_scale",
+                                   reciprocal_alpha=fc2_reciprocal,
+                                   **common),
+        "fc2_alpha":
+        weights.checkpoint_binding([], "generated", "fill", fill_value=1.0),
+        "input_global_scale":
+        weights.checkpoint_binding([], "generated", "fill", fill_value=1.0),
+        "down_input_scale":
+        weights.checkpoint_binding([], "generated", "fill", fill_value=1.0),
+        "e_score_correction_bias":
+        weights.checkpoint_binding([], "generated", "fill", fill_value=0.0),
+    }
+
+
+def nvfp4_expert_specs(weights, experts_prefix: str, num_experts: int) -> dict:
+    """Describe architecture-specific NVFP4 MoE buffers from headers only."""
+    up_names = weights.nvfp4_checkpoint_names(f"{experts_prefix}.0.up_proj")
+    down_names = weights.nvfp4_checkpoint_names(
+        f"{experts_prefix}.0.down_proj")
+    up_weight = weights.store.shape(up_names[0])
+    up_scale = weights.store.shape(up_names[1])
+    down_weight = weights.store.shape(down_names[0])
+    down_scale = weights.store.shape(down_names[1])
+    return {
+        "fc1_qweights":
+        ParameterSpec((num_experts, 2 * up_weight[0], up_weight[1]), np.int8),
+        "fc1_blocks_scale":
+        ParameterSpec((num_experts, (2 * up_scale[0] + 127) // 128,
+                       (up_scale[1] + 3) // 4, 32, 4, 4), np.int8),
+        "fc1_alpha":
+        ParameterSpec((num_experts, ), np.float32),
+        "fc2_qweights":
+        ParameterSpec((num_experts, *down_weight), np.int8),
+        "fc2_blocks_scale":
+        ParameterSpec((num_experts, (down_scale[0] + 127) // 128,
+                       (down_scale[1] + 3) // 4, 32, 4, 4), np.int8),
+        "fc2_alpha":
+        ParameterSpec((num_experts, ), np.float32),
+        "input_global_scale":
+        ParameterSpec((num_experts, ), np.float32),
+        "down_input_scale":
+        ParameterSpec((num_experts, ), np.float32),
+        "e_score_correction_bias":
+        ParameterSpec((num_experts, ), np.float32),
+    }
 
 
 _GDN_INPUT_PROJECTIONS = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")

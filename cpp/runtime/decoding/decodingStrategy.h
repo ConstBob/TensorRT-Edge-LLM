@@ -35,6 +35,7 @@
 #include "tokenizer/tokenizer.h"
 
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <string>
 #include <vector>
@@ -55,6 +56,28 @@ enum class DecodingStrategyKind : int32_t
     kGemma4MTP,
     kDSpark,
     kBlockDiffusion,
+};
+
+//! Return whether this request should use the stable Hybrid-MTP endpoint path. Mirrors the reference
+//! decodingStrategy.h::shouldUseHybridMtpEndpointReuse: true iff the selected strategy is MTP, the deployment has a
+//! hybrid base (numLinearAttnLayers > 0), and the context cache will either look up or publish state for the request.
+constexpr bool shouldUseHybridMtpEndpointReuse(DecodingStrategyKind selectedStrategy, bool hybridBase,
+    bool contextCacheLookupEnabled, bool contextCachePublicationEnabled) noexcept
+{
+    return selectedStrategy == DecodingStrategyKind::kMTP && hybridBase
+        && (contextCacheLookupEnabled || contextCachePublicationEnabled);
+}
+
+//! Selects whether decoder-owned cache state is physically compacted or only its slot metadata is moved.
+enum class BatchCompactionMode : uint8_t
+{
+    kLegacyPhysicalKv,
+    kManagedPageRows,
+};
+
+struct DecodingStrategyCapabilities
+{
+    bool ownsBaseVerificationCudaGraphs{false};
 };
 
 struct SamplingBuffers
@@ -79,7 +102,7 @@ struct LogprobsBuffers
     Tensor& hostLogprobsIndices;   //!< CPU pinned [logprobsMaxBatch, kMaxLogprobsK]
     //! GPU [maxBatch * maxAcceptDepth, vocab] accepted verify rows gathered before extraction.
     //! Used by the spec-decode verify paths whose accepted rows are non-contiguous in the
-    //! output logits (EAGLE / MTP / DFlash); Gemma4 MTP's sequential chain reads logits directly.
+    //! output logits (EAGLE / MTP / DFlash / JetSpec); Gemma4 MTP's sequential chain reads logits directly.
     Tensor& gatheredLogits;
 };
 
@@ -110,6 +133,8 @@ struct DecodingRuntimeContext
 {
     DeploymentConfig& deployment;
     int32_t maxRuntimeBatchSize;
+    std::filesystem::path const& checkpointDir;
+    std::filesystem::path const& draftCheckpointDir;
 
     BaseEngineResources base;
     PreprocessResources preprocess;
@@ -127,9 +152,28 @@ public:
     virtual DecodingStrategyKind kind() const noexcept = 0;
     virtual char const* name() const noexcept = 0;
     virtual bool isSpeculative() const noexcept = 0;
+    virtual DecodingStrategyCapabilities capabilities() const noexcept
+    {
+        return {};
+    }
 
     virtual bool decodeStep(DecodingInferenceContext& context) = 0;
     virtual bool captureCudaGraphs(cudaStream_t stream) = 0;
+
+    //! Initialize decoder-private generation state after base prefill. Non-speculative strategies are no-ops.
+    virtual bool initializeForGeneration(DecodingInferenceContext&)
+    {
+        return true;
+    }
+
+    //! Greatest per-slot logical prefix whose continuation state is materialized by every model in this strategy.
+    //! Physical model-state tails may extend beyond this boundary. This reports decoding progress only;
+    //! context-cache policy decides whether that prefix can be published.
+    virtual std::vector<int32_t> const& commonMaterializedStateLengths() const noexcept
+    {
+        static std::vector<int32_t> const kEMPTY;
+        return kEMPTY;
+    }
 
     virtual int64_t getRequiredContextMemorySize() const noexcept = 0;
     virtual void setContextMemory(Tensor&) = 0;
@@ -144,7 +188,8 @@ public:
         std::vector<tokenizer::Rank> const&, int32_t, cudaStream_t) = 0;
 
     virtual void resetForNewSequences(Tensor&, cudaStream_t) = 0;
-    virtual void onBatchEvict(std::vector<int32_t> const&, int32_t, int32_t, Tensor&, cudaStream_t) = 0;
+    virtual void onBatchEvict(std::vector<int32_t> const&, int32_t, int32_t, Tensor&, cudaStream_t, BatchCompactionMode)
+        = 0;
 };
 
 } // namespace rt

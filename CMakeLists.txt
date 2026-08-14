@@ -17,7 +17,7 @@ cmake_minimum_required(VERSION 3.20 FATAL_ERROR)
 
 project(
   tensorrt_edgellm_sdk
-  VERSION 0.9.1
+  VERSION 0.10.0
   LANGUAGES C CXX CUDA)
 
 # Specify the C++ standard and flags
@@ -36,6 +36,16 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--no-undefined")
 # Code coverage with gcov (for SonarQube analysis)
 option(ENABLE_COVERAGE "Enable gcov code coverage instrumentation" OFF)
 include(${CMAKE_SOURCE_DIR}/cmake/CodeCoverage.cmake)
+
+# Declare unit-test options before cpp/ so its library targets can enable
+# test-only instrumentation when requested.
+option(BUILD_UNIT_TESTS "Enable building unit tests" OFF)
+option(ENABLE_CUTEDSL_MODULE_TEST_HOOK
+       "Enable deterministic CuTe DSL module-load failure injection" OFF)
+if(ENABLE_CUTEDSL_MODULE_TEST_HOOK AND NOT BUILD_UNIT_TESTS)
+  message(
+    FATAL_ERROR "ENABLE_CUTEDSL_MODULE_TEST_HOOK requires BUILD_UNIT_TESTS=ON")
+endif()
 
 macro(set_ifndef var val)
   if(NOT DEFINED ${var})
@@ -73,7 +83,7 @@ set_ifndef(CUDA_CTK_VERSION 12.8)
 set_ifndef(CUDA_DIR /usr/local/cuda-${CUDA_CTK_VERSION})
 
 if(NOT AARCH64_BUILD)
-  set(CMAKE_CUDA_ARCHITECTURES 80;86;89)
+  set(CMAKE_CUDA_ARCHITECTURES 80;86;89;90)
   if(CUDA_CTK_VERSION VERSION_GREATER_EQUAL 12.8)
     list(APPEND CMAKE_CUDA_ARCHITECTURES 100a 120)
   endif()
@@ -117,6 +127,8 @@ set(CUDA_INCLUDE_DIR ${CUDA_RUNTIME_API_INCLUDE_DIR}
                      ${CURAND_KERNEL_INCLUDE_DIR})
 
 set(CUDA_USE_STATIC_CUDA_RUNTIME OFF)
+
+include(${CMAKE_SOURCE_DIR}/cmake/FindNVRTC.cmake)
 
 # NVTX profiling support option (default: OFF)
 option(ENABLE_NVTX_PROFILING "Enable NVTX profiling support" OFF)
@@ -170,24 +182,13 @@ target_link_libraries(
 target_link_options(commonLibraryExt INTERFACE
                     "-Wl,--unresolved-symbols=ignore-in-shared-libs")
 
-# Build Core libraries of the project. attentionPlugin shared library and
-# edgellmCore/edgellmBuilder static library will be generated.
-add_subdirectory(cpp)
-
-# Build C++ examples to showcase the usage
-add_subdirectory(examples)
-
-option(BUILD_UNIT_TESTS "Enable building unit tests" OFF)
-option(BUILD_PYTHON_BINDINGS "Enable building Python pybind11 bindings" OFF)
-
 # CuTe DSL unified kernel option — declare here so it is always defined before
 # any subdirectory or include references it.
 # cmake-format: off
 # Choices:
-#   OFF              -- no CuTe DSL kernels
+#   fmha             -- FP16 Context/ViT FMHA, plus the optimized Blackwell
+#                       variants when the artifact has them
 #   ALL              -- enable every kernel group below
-#   fmha             -- FMHA Blackwell attention
-#   fmha_v2          -- portable FP16 Context/ViT FMHA
 #   gdn              -- gated delta net (Mamba2-style hybrid SSM)
 #   f16_moe          -- target-specific FP16 grouped MoE for Ampere,
 #                       Blackwell DC, and Blackwell GeForce
@@ -198,11 +199,29 @@ option(BUILD_PYTHON_BINDINGS "Enable building Python pybind11 bindings" OFF)
 #   semicolon-separated group list (e.g. -DENABLE_CUTE_DSL=fmha;gdn)
 # cmake-format: on
 set(ENABLE_CUTE_DSL
-    "OFF"
+    "fmha"
     CACHE
       STRING
-      "CuTe DSL kernels: OFF (default), ALL, or semicolon-separated group list (fmha;fmha_v2;gdn;f16_moe)"
+      "CuTe DSL kernels: fmha (default), ALL, or semicolon-separated group list (fmha;gdn;f16_moe)"
 )
+
+# Build Core libraries of the project. attentionPlugin shared library and
+# edgellmCore/edgellmBuilder static library will be generated.
+add_subdirectory(cpp)
+
+# Build C++ examples to showcase the usage
+add_subdirectory(examples)
+
+# Experimental models (opt-in). These are not first-class models; they live in a
+# separate tree and link against the core edgellm libraries. Cosmos3 is the
+# first.
+option(BUILD_EXPERIMENTAL_MODELS
+       "Enable building experimental models (e.g. cosmos3)" OFF)
+if(BUILD_EXPERIMENTAL_MODELS)
+  add_subdirectory(experimental_models)
+endif()
+
+option(BUILD_PYTHON_BINDINGS "Enable building Python pybind11 bindings" OFF)
 
 if(BUILD_UNIT_TESTS)
   set(BUILD_GMOCK
@@ -217,13 +236,25 @@ if(BUILD_UNIT_TESTS)
   # Define project root path for tests to access resources
   target_compile_definitions(unitTest
                              PRIVATE PROJECT_ROOT_DIR="${CMAKE_SOURCE_DIR}")
-  target_link_libraries(
-    unitTest PRIVATE gtest gtest_main edgellmCore commonLibraryExt exampleUtils
-                     ${CUDA_DRIVER_LINK_LIB})
-  if(NOT ENABLE_CUTE_DSL STREQUAL "OFF")
-    include(${CMAKE_SOURCE_DIR}/cmake/CuteDsl.cmake)
-    cute_dsl_setup(LINK_TARGETS unitTest)
+  if(ENABLE_CUTEDSL_MODULE_TEST_HOOK)
+    target_compile_definitions(unitTest PRIVATE ENABLE_CUTEDSL_MODULE_TEST_HOOK)
   endif()
+  # Resource-registration tests resolve the plugin's exported lifecycle ABI.
+  add_dependencies(unitTest NvInfer_edgellm_plugin)
+  # edgellmXqaJit is not part of edgellmCore: the XQA JIT lives in the plugin.
+  # unitTest links it explicitly because xqaJitTestUtils.cpp JITs kernels
+  # directly for the decoder-runner tests.
+  target_link_libraries(
+    unitTest
+    PRIVATE gtest
+            gtest_main
+            edgellmCore
+            edgellmXqaJit
+            commonLibraryExt
+            exampleUtils
+            ${CUDA_DRIVER_LINK_LIB})
+  include(${CMAKE_SOURCE_DIR}/cmake/CuteDsl.cmake)
+  cute_dsl_setup(LINK_TARGETS unitTest)
   add_cross_build_link_options(unitTest)
   add_subdirectory(unittests)
 endif()

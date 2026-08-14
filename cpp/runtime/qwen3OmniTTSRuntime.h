@@ -33,6 +33,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace trt_edgellm
@@ -130,6 +131,7 @@ public:
      * @param talkerEngineDir Directory containing talker engine, MLP weights, embedding table, etc.
      * @param codePredictorEngineDir Directory containing code_predictor engine and codec embeddings
      * @param tokenizerDir Directory containing tokenizer files. If empty, defaults to talkerEngineDir/../
+     * @param checkpointDir HF/ModelOpt checkpoint used by checkpoint-backed Talker weights
      * @param stream CUDA stream for operations
      * @throws std::runtime_error on any initialization failure
      */
@@ -137,7 +139,8 @@ public:
     //!        engines (speaker_encoder.engine / speech_tokenizer_encoder.engine, Base
     //!        checkpoints). Empty disables voice cloning.
     Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
-        std::string const& tokenizerDir, std::string const& cloneEncoderDir, cudaStream_t stream);
+        std::string const& tokenizerDir, std::string const& cloneEncoderDir, cudaStream_t stream,
+        std::string const& checkpointDir = "");
 
     //! @brief Destructor
     ~Qwen3OmniTTSRuntime();
@@ -459,6 +462,18 @@ public:
      */
     int32_t resolveLanguageId(std::string const& languageName, std::string const& speakerName) const;
 
+    //! Speaker names accepted by TalkerGenerationRequest::speakerName.
+    std::vector<std::string> getSpeakerNames() const
+    {
+        std::vector<std::string> names;
+        names.reserve(mSpeakerIdMap.size());
+        for (auto const& entry : mSpeakerIdMap)
+        {
+            names.push_back(entry.first);
+        }
+        return names;
+    }
+
 private:
     // ========== Internal Methods ==========
 
@@ -483,7 +498,7 @@ private:
     //! @param outputCodesPerBatch     [activeBS][mNumCodesPerFrame] generated codes per batch.
     bool runCodePredictorGenerationForFrame(int32_t activeBatchSize, std::vector<int32_t> const& codecTokensPerBatch,
         rt::Tensor const& talkerLastHiddenBatched, SamplingParams const& samplingParams,
-        std::vector<std::vector<int32_t>>& outputCodesPerBatch, cudaStream_t stream, int32_t globalFrame = 0);
+        std::vector<std::vector<int32_t>>& outputCodesPerBatch, cudaStream_t stream);
 
     //! Compute residual connection for one batch element.
     //! @param codecHiddensThisBatch  Per-batch view into mCodecHiddensBuffer: [1, mNumCodesPerFrame, talkerH].
@@ -758,7 +773,8 @@ private:
      * @param codePredictorEngineDir Directory containing code predictor engine files
      * @return True on success, false on failure
      */
-    bool initializeEngineRunners(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir);
+    bool initializeEngineRunners(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
+        std::string const& checkpointDir);
 
     /*!
      * @brief Load CodePredictor lm_head weights and small_to_mtp_projection
@@ -834,7 +850,7 @@ private:
     std::unique_ptr<EngineExecutor> mCodePredictorExec;       //!< CodePredictor engine executor
     std::unique_ptr<SharedResources> mCodePredictorSharedRes; //!< CodePredictor cache + RoPE + zero buffer
     std::unique_ptr<PipelineIO> mCodePredictorPipelineIO;     //!< CodePredictor per-step pipeline buffers
-    TensorMap mCodePredictorTensorMap; //!< CodePredictor engine binding map (lm_head_weight rewired per RVQ head)
+    TensorMap mCodePredictorTensorMap;                        //!< CodePredictor engine binding map (step-invariant)
     std::unique_ptr<StepPreparer> mCodePredictorStepPreparer; //!< CodePredictor prefill/decode metadata preparer
 
     //! Shared GPU execution context memory for Talker and CodePredictor (kUSER_MANAGED).
@@ -918,10 +934,10 @@ private:
     std::vector<rt::Tensor>
         mCodePredictorEmbeddingTables; //!< CodePredictor embedding tables (mNumRvqLayers) [codebookSize, hiddenSize]
 
-    // CodePredictor LM Heads (bound via setLmHeadWeight before each decode step)
-    // ONNX has lm_head_weight as a dynamic input tensor, switched per RVQ layer
-    std::vector<rt::Tensor>
-        mCodePredictorLmHeadWeights; //!< CodePredictor lm_head weights (mNumRvqLayers) [vocabSize, hiddenSize]
+    // CodePredictor lm_heads stacked [mNumRvqLayers, vocabSize, hiddenSize]; the engine
+    // gathers the active head by the device lm_head_idx, so bindings stay step-invariant.
+    rt::Tensor mCodePredictorLmHeads;
+    rt::Tensor mCpLmHeadIdx; //!< Device head index [1] INT32 (0 = prefill, then 1..mNumRvqLayers-1)
 
     // TTS special token embeddings (initialized from thinker embedding table)
     // Initialized in constructor from Thinker embedding table
@@ -953,9 +969,7 @@ private:
     rt::Tensor mSeenSeedHostScratch;   //!< Pinned host scratch [maxBS] for async H2D seeding of the seen buffer
 
     // CodePredictor workspace (batch=1 for per-batch CodePredictor calls)
-    rt::Tensor mCodePredictorLogits; //!< CodePredictor output logits [1, codebookSize] FP32
-    std::vector<rt::Tensor>
-        mCodePredictorLogitsPerHead;            //!< Per-lm_head logits (distinct buffers → distinct graph-cache slots)
+    rt::Tensor mCodePredictorLogits;            //!< CodePredictor output logits [maxBS, codebookSize] FP32
     rt::Tensor mCodePredictorSelectedIndices;   //!< Selected code indices [1, 1] INT32
     rt::Tensor mCodePredictorPrefillInput;      //!< Prefill input [1, 2, cpHidden] FP16
     rt::Tensor mCodePredictorCodecIds;          //!< Codec token IDs [1, 1] INT32
@@ -1022,7 +1036,7 @@ private:
      * Resets CP KV cache and stages per-batch context lengths.
      *
      * @param inputsEmbeds Codec token embeddings [batch, seqLen, cpHidden] — caller builds the batched buffer.
-     * @param lmHeadIdx Which lm_head_weight to bind (0..mNumRvqLayers-1).
+     * @param lmHeadIdx Must be 0 (prefill always predicts with head 0).
      * @param outputLogits Output logits [batch, codebookSize] (engine output).
      * @param outputHiddenStates Output hidden states for residual / next step.
      * @param stream CUDA stream.
@@ -1031,19 +1045,11 @@ private:
         rt::Tensor& outputHiddenStates, cudaStream_t stream);
 
     /*!
-     * @brief Execute CodePredictor decoding step (single token per batch).
-     *
-     * Pure engine wrapper. Batch dim derived from inputsEmbeds.getShape()[0]. Caller is
-     * responsible for embedding lookup / projection before calling.
-     *
-     * @param inputsEmbeds [batch, 1, cpHidden] codec embedding for current step.
-     * @param lmHeadIdx Which lm_head_weight to bind (0..mNumRvqLayers-1).
-     * @param outputLogits [batch, codebookSize] (engine output).
-     * @param outputHiddenStates Output hidden states for next step.
-     * @param stream CUDA stream.
+     * @brief Set the step-invariant CP decode bindings (stacked lm_heads + device
+     *        lm_head_idx + shared logits) and switch to the decode profile. One call
+     *        covers the whole per-frame decode loop.
      */
-    bool executeCodePredictorDecodingStep(rt::Tensor const& inputsEmbeds, int32_t lmHeadIdx, rt::Tensor& outputLogits,
-        rt::Tensor& outputHiddenStates, cudaStream_t stream);
+    bool prepareCpDecodeBindings(int32_t activeBatchSize, cudaStream_t stream);
 
     /*!
      * @brief Load Talker weights from safetensors files

@@ -20,8 +20,10 @@
 #include "common/cudaUtils.h"
 #include "common/logger.h"
 #include "plugins/utils/pluginUtils.h"
-#ifdef CUTE_DSL_GDN_ENABLED
+#if defined(CUTE_DSL_GDN_ENABLED) || defined(CUTE_DSL_GDN_BLACKWELL_GEFORCE_ENABLED)
 #include "kernels/gdnKernels/cuteDslGDNRunner.h"
+#endif
+#ifdef CUTE_DSL_GDN_ENABLED
 #include "kernels/gdnKernels/gdnKernelUtils.cuh"
 #endif
 
@@ -98,15 +100,6 @@ GatedDeltaNetPlugin::GatedDeltaNetPlugin(
             mKDim, mVDim, mSMVersion);
         throw std::runtime_error("Cannot implement the GatedDeltaNetPlugin configuration (CuTe DSL GDN).");
     }
-
-    if (!CuteDslGDNRunner::loadKernelModules())
-    {
-        LOG_ERROR(
-            "Failed to load CuTe DSL GDN kernel modules (gdn_decode / gdn_prefill AOT). "
-            "Check that the engine was built with ENABLE_CUTE_DSL=gdn (or ALL), AOT .o/.h are present and match the "
-            "exported API, and the CUDA driver is compatible.");
-        throw std::runtime_error("Cannot load CuTe DSL GDN kernel modules for GatedDeltaNetPlugin.");
-    }
 }
 #else
 GatedDeltaNetPlugin::GatedDeltaNetPlugin(
@@ -133,7 +126,6 @@ GatedDeltaNetPlugin::GatedDeltaNetPlugin(std::string const& name, PluginFieldCol
 
 #ifdef CUTE_DSL_GDN_ENABLED
     mSMVersion = getSMVersion();
-    CuteDslGDNRunner::loadKernelModules();
 #else
     LOG_ERROR("GatedDeltaNet plugin is not available: build with CUTE_DSL_GDN_ENABLED to enable it.");
     throw std::runtime_error("GatedDeltaNet plugin is not available: build with CUTE_DSL_GDN_ENABLED to enable it.");
@@ -370,6 +362,14 @@ size_t GatedDeltaNetPlugin::getWorkspaceSize([[maybe_unused]] DynamicPluginTenso
     total = cuSeqPadded + h0ScratchBytes;
 #endif
 
+#ifdef CUTE_DSL_GDN_BLACKWELL_GEFORCE_ENABLED
+    // Workspace sizes are serialized with the engine, so reserve a fixed
+    // architecture-wide upper bound rather than the build GPU's SM count.
+    size_t const blackwellGeforceTensorMapBytes = static_cast<size_t>(CuteDslGDNRunner::kBlackwellGeforceMaxSMCount)
+        * CuteDslGDNRunner::kBlackwellGeforceTensorMapDescriptorBytes;
+    total = std::max(total, blackwellGeforceTensorMapBytes);
+#endif
+
     if (mUseDDTree)
     {
         int32_t const maxN = static_cast<int32_t>(inputs[kIN_Q_IDX].max.d[0]);
@@ -407,8 +407,6 @@ int32_t GatedDeltaNetPlugin::getAliasedInput(int32_t outputIndex) noexcept
 int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* /* outputDesc */,
     void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
 {
-    CuteDslGDNRunner::loadKernelModules();
-
     int64_t const* qDims = inputDesc[kIN_Q_IDX].dims.d;
     int32_t const n = static_cast<int32_t>(qDims[0]);
     int32_t const seq_len = static_cast<int32_t>(qDims[1]);
@@ -454,6 +452,18 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
                 depthDesc.dims.nbDims > 1 ? static_cast<long long>(depthDesc.dims.d[1]) : -1LL);
             return -1;
         }
+    }
+
+    GDNParams params{};
+    params.seq_len = seq_len;
+    params.h = h;
+    params.hv = hv;
+    params.smVersion = mSMVersion;
+    params.use_mtp = mtpActive;
+    if (!ddtreeActive && !CuteDslGDNRunner::ensureKernelModules(params, stream))
+    {
+        LOG_ERROR("gated_delta_net: failed to load the selected CuTe DSL GDN module");
+        return -1;
     }
 
     // h0 is batch-dense [n, hv, k, v]
@@ -517,7 +527,6 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
         return 0;
     }
 
-    GDNParams params{};
     params.q = const_cast<void*>(inputs[kIN_Q_IDX]);
     params.k = const_cast<void*>(inputs[kIN_K_IDX]);
     params.v = const_cast<void*>(inputs[kIN_V_IDX]);
@@ -547,7 +556,7 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
 #ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
         // Blackwell prefill: carve cu_seqlens and h0 scratch out of the pre-allocated workspace.
         //   workspace layout: [cu_seqlens: (n+1)*int32, pad to 128B] [h0_scratch: n*hv*k*v*f32]
-        if (seq_len > 1 && mSMVersion >= 100)
+        if (seq_len > 1 && (mSMVersion == 100 || mSMVersion == 101 || mSMVersion == 110))
         {
             size_t const cuSeqBytes = static_cast<size_t>(n + 1) * sizeof(int32_t);
             size_t const cuSeqPadded = (cuSeqBytes + 127u) & ~static_cast<size_t>(127u);
@@ -556,6 +565,12 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
             launchGdnCalCuSeqLens(inputs[kIN_CONTEXT_LENGTHS_IDX], bwBase, n, stream);
             params.cu_seqlens = bwBase;
             params.h0_scratch = bwBase + cuSeqPadded;
+        }
+#endif
+#ifdef CUTE_DSL_GDN_BLACKWELL_GEFORCE_ENABLED
+        if (seq_len > 1 && (mSMVersion == 120 || mSMVersion == 121))
+        {
+            params.tensormap_scratch = workspace;
         }
 #endif
     }

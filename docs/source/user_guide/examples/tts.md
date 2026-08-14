@@ -2,24 +2,17 @@
 
 This guide covers the full pipeline for running Qwen3-TTS: export on x86 host, engine build on device, and inference.
 
-### Supported Models
+The [supported model list](../getting_started/supported-models.md#speech-generation)
+contains the validated CustomVoice, VoiceDesign, and Base checkpoints. They
+share the Talker, CodePredictor, and Code2Wav pipeline; the runtime selects the
+prompt contract from `tts_model_type` in the engine configuration.
 
-| Checkpoint family | Sizes | Voice control | Extra features | Verified |
-|---|---|---|---|---|
-| [CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) | 0.6B / 1.7B | 9 preset speakers | language conditioning (12 languages + dialect routing), instruction control | 0.6B + 1.7B E2E |
-| [VoiceDesign](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign) | 1.7B | designed from a natural-language instruction (no presets) | language conditioning | 1.7B E2E |
-| [Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) | 0.6B / 1.7B | cloned from reference audio (x-vector / ICL) | on-device reference encoders | 1.7B E2E |
-
-All three families share the same Talker / CodePredictor / Code2Wav pipeline and the same
-export, build, and inference commands; they differ only in the prompt recipe the runtime
-assembles (selected automatically from the engine config's `tts_model_type`).
-
-### Precision & Quantization
+## Precision & Quantization
 
 | Component | Precision | Notes |
 |---|---|---|
 | Talker | FP16 | Quantized Talker checkpoints are not supported for Qwen3-TTS yet |
-| CodePredictor | FP16, **FP8** | Quantize with `tensorrt-edgellm-quantize ... --cp_quantization fp8` (MR !967: the calibration loop has a dedicated TTS-standalone path, text→Talker→CP; `down_proj` / `lm_head` / KV-cache BMM stay FP16). E2E-verified on the TTS bench: FP8 CP WER 2.17% vs FP16 2.05% on B100 (Δ within noise, 0/20 catastrophic) |
+| CodePredictor | FP16, **FP8** | Quantize with `tensorrt-edgellm-quantize ... --cp_quantization fp8`; `down_proj`, LM heads, and KV-cache BMM remain FP16 |
 | Code2Wav | FP16 | |
 | Clone encoders (Base) | FP16 build from FP32 ONNX | x-vector cosine 1.0 / codes 100% vs reference at FP16 |
 
@@ -35,18 +28,18 @@ Qwen3-TTS has three components: Talker, CodePredictor, and Code2Wav. Export all 
 
 ```bash
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
-export TTS_MODEL=Qwen3-TTS-12Hz-1.7B-CustomVoice
-export ONNX_OUTPUT_DIR=$WORKSPACE_DIR/$TTS_MODEL/onnx
+export MODEL_ID=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+export MODEL_ROOT=$WORKSPACE_DIR/Qwen3-TTS-12Hz-1.7B-CustomVoice
 
 tensorrt-edgellm-export \
-    Qwen/$TTS_MODEL \
-    $ONNX_OUTPUT_DIR
+    "$MODEL_ID" \
+    "$MODEL_ROOT/onnx"
 ```
 
 ### Expected Export Output
 
 ```
-$ONNX_OUTPUT_DIR/
+$MODEL_ROOT/onnx/
 ├── llm/
 │   ├── model.onnx + model.onnx.data       # Talker ONNX
 │   ├── config.json                        # model_type: qwen3_tts_talker
@@ -70,7 +63,8 @@ $ONNX_OUTPUT_DIR/
 ### Transfer to Device
 
 ```bash
-scp -r $ONNX_OUTPUT_DIR <user>@<device>:~/tensorrt-edgellm-workspace/$TTS_MODEL/
+scp -r "$MODEL_ROOT/onnx" \
+    <user>@<device>:~/tensorrt-edgellm-workspace/Qwen3-TTS-12Hz-1.7B-CustomVoice/
 ```
 
 ---
@@ -82,9 +76,9 @@ Three engine builds are required. Run these on the edge device.
 ```bash
 cd /path/to/TensorRT-Edge-LLM
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
-export TTS_MODEL=Qwen3-TTS-12Hz-1.7B-CustomVoice
-export ONNX=$WORKSPACE_DIR/$TTS_MODEL/onnx
-export ENG=$WORKSPACE_DIR/$TTS_MODEL/engines
+export MODEL_ROOT=$WORKSPACE_DIR/Qwen3-TTS-12Hz-1.7B-CustomVoice
+export ONNX=$MODEL_ROOT/onnx
+export ENG=$MODEL_ROOT/engines
 
 # 1. Build Talker LLM engine
 ./build/examples/llm/llm_build \
@@ -267,8 +261,8 @@ the reference implementation's hardcoded `code_predictor.generate` defaults
 ```bash
 cd /path/to/TensorRT-Edge-LLM
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
-export TTS_MODEL=Qwen3-TTS-12Hz-1.7B-CustomVoice
-export ENG=$WORKSPACE_DIR/$TTS_MODEL/engines
+export MODEL_ROOT=$WORKSPACE_DIR/Qwen3-TTS-12Hz-1.7B-CustomVoice
+export ENG=$MODEL_ROOT/engines
 
 ./build/examples/omni/qwen3_tts_inference \
     --talkerEngineDir   $ENG/talker \
@@ -302,13 +296,12 @@ Generated `.wav` files are named `audio_req{N}.wav` (one per request). The outpu
 ### Streaming Mode (audio output)
 
 Pass `--streaming --chunkFrames=<N>` to vocode RVQ codes inline as the Talker generates
-them, rather than waiting for the full sequence (added in MR !896 together with the
-Talker/CodePredictor runtime-framework unification). Each request receives its own
+them, rather than waiting for the full sequence. Each request receives its own
 `onChunkReady` callback inside the runtime (`bs >= 1` supported, per-batch independent);
 the CLI synchronously vocodes each chunk via Code2Wav and appends the PCM to a
 per-request WAV buffer.
 
-Accuracy and latency characteristics (measured in MR !896):
+Streaming behavior:
 
 - **RVQ codes are bit-exact** vs the non-streaming path for every chunk size — streaming
   is purely an emission-layer change; WER is unchanged.
@@ -334,8 +327,8 @@ Works with every checkpoint family and voice-control feature above (speaker / la
 instruct / VoiceDesign / clone). Text input is consumed whole per request; streaming
 *text* input (feeding a request's text incrementally) is not supported yet.
 
-> **Not the same as Qwen3-Omni streaming.** Since MR !896 both paths share the same
-> Talker/CodePredictor engine framework and chunk-emit accumulator internally, but they
+> **Not the same as Qwen3-Omni streaming.** Both paths share the Talker/CodePredictor
+> engine framework and chunk accumulator, but they
 > expose different streaming concepts with different configuration surfaces:
 >
 > | | Qwen3-TTS (`qwen3_tts_inference`) | Qwen3-Omni (`llm_inference`) |
@@ -343,5 +336,3 @@ instruct / VoiceDesign / clone). Text input is consumed whole per request; strea
 > | What streams | audio output only (chunked vocoding of a fixed text) | the full Thinker→Talker pipeline (speech synthesis starts while the Thinker is still generating text) |
 > | Enabled via | CLI: `--streaming --chunkFrames=<N>` | input JSON: `"streaming": {"enable": true, "codec_chunk_frames": <N>, "talker_prefill_threshold": <M>}` |
 > | Chunk knob | `--chunkFrames` | `codec_chunk_frames` |
->
-> Unifying the two surfaces (same JSON block / flag names) is tracked as a follow-up.

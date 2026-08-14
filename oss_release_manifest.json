@@ -14,6 +14,8 @@
     "delete_paths": [
       "cpp/kernels/multiDeviceKernels/shmAllReduce.cu",
       "cpp/kernels/multiDeviceKernels/shmAllReduce.h",
+      "cpp/runtime/multiDevice/backends/shm/tensorParallelShmResources.cpp",
+      "cpp/runtime/multiDevice/backends/shm/tensorParallelShmResources.h",
       "unittests/shmAllReduceTests.cu"
     ],
     "strip_paths": [
@@ -21,11 +23,21 @@
       "cmake/CuteDsl.cmake",
       "kernelSrcs/build_cutedsl.py",
       "kernelSrcs/gemm_cutedsl/gemm_blackwell_nvfp4_ws.py",
+      "cpp/common/allReducePath.h",
       "cpp/kernels/multiDeviceKernels/cuteDslGemmNvFp4Runner.h",
       "cpp/plugins/allReducePlugin/allReducePlugin.cpp",
       "cpp/plugins/allReducePlugin/allReducePlugin.h",
       "cpp/plugins/fusedNvfp4GemmAllReducePlugin/fusedNvfp4GemmAllReducePlugin.cpp",
-      "cpp/plugins/fusedNvfp4GemmAllReducePlugin/fusedNvfp4GemmAllReducePlugin.h"
+      "cpp/plugins/fusedNvfp4GemmAllReducePlugin/fusedNvfp4GemmAllReducePlugin.h",
+      "cpp/runtime/multiDevice/multiDevicePluginResourceFactory.cpp",
+      "cpp/runtime/multiDevice/multiDevicePluginResourceFactory.h",
+      "cpp/runtime/multiDevice/multiDevicePluginCommRegistry.cpp",
+      "cpp/runtime/multiDevice/multiDevicePluginCommRegistry.h",
+      "cpp/runtime/multiDevice/tensorParallelPluginResources.cpp",
+      "cpp/runtime/multiDevice/tensorParallelPluginResources.h",
+      "cpp/runtime/multiDevice/parallelConfig.cpp",
+      "cpp/runtime/multiDevice/parallelConfig.h",
+      "unittests/parallelConfigTest.cpp"
     ],
     "forbidden_patterns": [
       "edge-llm-internal-release",
@@ -37,7 +49,10 @@
       "shmMaxElements",
       "shmAllReduceElementThreshold",
       "shmFp8SmallPathElementThreshold",
-      "shmSessionName"
+      "shmSessionName",
+      "TensorParallelShmResources",
+      "syncShmHostBarrier",
+      "AllReducePathType::kShm"
     ]
   }
 }

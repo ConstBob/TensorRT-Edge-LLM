@@ -2,85 +2,54 @@
 # SETUP JOBS
 # ==============================================================================
 
-# Pre-commit code quality checks
-pre_commit_checks:
-  stage: precheck
-  variables:
-    CUDA_VERSION: "12.9"
-  tags:
-    - cpu-k8s
+init_l0_storage:
+  stage: setup
   script:
-    - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
-    - echo "Installing dependencies"
-    - export DEBIAN_FRONTEND=noninteractive
-    - apt update -qq >/dev/null 2>&1
-    - apt install -y -qq python3 python3-pip python3-venv git >/dev/null 2>&1
-    - echo "Installing pre-commit hooks"
-    - python3 -m venv venv && source venv/bin/activate
-    - pip3 install -q pre-commit
-    - pre-commit install
-    - echo "Running pre-commit checks on all files"
-    - pre-commit run --all-files --show-diff-on-failure || (echo "❌ Pre-commit checks failed!" && echo "💡 To fix this locally, run:" && echo "   pip install pre-commit" && echo "   pre-commit install" && echo "   pre-commit run --all-files" && exit 1)
-    - echo "✅ Pre-commit checks passed!"
-    - deactivate
-    - echo "Pipeline end time:$(date)"
-  extends: .setup_common_rules
-  interruptible: true
+    - python3 .gitlab/ci/scripts/ci_storage.py prepare-storage
+  resource_group: "$L0_STORAGE_RESOURCE_GROUP"
+  environment:
+    name: "$L0_ENVIRONMENT_NAME"
+    action: start
+    on_stop: delete_l0_storage
+    auto_stop_in: "$L0_STORAGE_RETENTION"
+  extends:
+    - .l0_storage_lifecycle
+    - .l0_rules
 
-# Quantization sanity (GPU / A30): run the quantization unit tests (which
-# actually quantize small real models) in the py3.12 TensorRT base image.
-# `needs: []` so it is independent of the CuTe-DSL builder / setup stage.
-quantization_sanity:
-  stage: l0_test
-  needs: []
-  tags:
-    - a30-edgellm-nvks
-  variables:
-    CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-  image: "$IMAGE"
+prune_l0_pipeline_workspaces:
+  stage: setup
   script:
-    - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
-    - nvidia-smi -L
-    - export LLM_SDK_DIR=$(pwd)
-    - export PYTHONPATH=$LLM_SDK_DIR:$PYTHONPATH
-    - pip3 install -q -r tests/requirements.txt torch
-    # conftest.from_environment requires these paths; the unit tests do not use them.
-    - export ONNX_DIR=$(pwd)/.ci_qc_onnx LLM_MODELS_DIR=$(pwd)/.ci_qc_models EDGELLM_DATA_DIR=$(pwd)/.ci_qc_data
-    - mkdir -p "$ONNX_DIR" "$LLM_MODELS_DIR" "$EDGELLM_DATA_DIR"
-    - python3 -m pytest tests/python-unittests/test_quantize.py -v --color=yes
-  extends: .setup_common_rules
+    - python3 .gitlab/ci/scripts/ci_storage.py prune-pipeline-workspaces
+  resource_group: "${L0_STORAGE_RESOURCE_GROUP}-prune"
+  extends:
+    - .l0_storage_lifecycle
+    - .l0_rules
   interruptible: true
+  allow_failure: true
 
-# Cache cleanup for L0 directory
-l0_cache_cleanup:
+delete_l0_storage:
+  stage: setup
+  when: manual
+  allow_failure: true
+  interruptible: false
+  dependencies: []
+  script:
+    - python3 .gitlab/ci/scripts/ci_storage.py delete-storage
+  resource_group: "$L0_STORAGE_RESOURCE_GROUP"
+  environment:
+    name: "$L0_ENVIRONMENT_NAME"
+    action: stop
+  extends:
+    - .l0_storage_lifecycle
+    - .l0_rules
+
+prune_github_pr_storage:
   stage: setup
   tags:
     - a30-edgellm-nvks
   script:
-    - echo "Pipeline start time:$(date)"
-    - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
-    - echo "Starting cache cleanup for old L0 MR pipeline directories in $EDGE_LLM_CACHE_DIR/L0"
-    - echo "Current contents in $EDGE_LLM_CACHE_DIR/L0:"
-    - ls -la "$EDGE_LLM_CACHE_DIR/L0" || echo "Directory is empty or inaccessible"
-    - echo "Removing old pipeline directories and keeping only the latest pipeline per MR..."
-    - |
-      for MR_CACHE_DIR in "$EDGE_LLM_CACHE_DIR/L0"/MR_*; do
-        [ -d "$MR_CACHE_DIR" ] || continue
-        # Only consider numeric (pipeline ID) directories; skip any non-numeric dirs.
-        LATEST_PIPELINE=$(find "$MR_CACHE_DIR" -mindepth 1 -maxdepth 1 -type d -printf "%f\n" | awk '/^[0-9]+$/ { print }' | sort -n | tail -1)
-        [ -n "$LATEST_PIPELINE" ] || continue
-        echo "Keeping latest pipeline cache $MR_CACHE_DIR/$LATEST_PIPELINE"
-        find "$MR_CACHE_DIR" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended -regex '.*/[0-9]+' ! -name "$LATEST_PIPELINE" -exec rm -rf {} \; -print || true
-      done
     - echo "Removing GitHub PR cache directories older than 3 days..."
     - find "$EDGE_LLM_CACHE_DIR/L0" -maxdepth 1 -type d -name "github_pr_*" -mtime +3 -exec rm -rf {} \; -print || true
-    - echo "Removing old CuTeDSL artifact directories older than 3 days..."
-    - CUTE_DSL_LATEST=$(basename "$(readlink "$EDGE_LLM_CACHE_DIR/L0/cutedsl_artifacts/main/latest" 2>/dev/null)" 2>/dev/null || true)
-    - if [ -n "$CUTE_DSL_LATEST" ]; then find "$EDGE_LLM_CACHE_DIR/L0/cutedsl_artifacts" -mindepth 2 -maxdepth 2 -type d -mtime +3 ! -name "$CUTE_DSL_LATEST" -exec rm -rf {} \; -print || true; else echo "No CuTeDSL latest symlink found; skipping CuTeDSL artifact cleanup"; fi
-    - echo "Cleanup completed. Remaining contents in $EDGE_LLM_CACHE_DIR/L0:"
-    - ls -la "$EDGE_LLM_CACHE_DIR/L0" || echo "Directory is empty or inaccessible"
-    - echo "Pipeline end time:$(date)"
   extends: .l0_rules
   interruptible: true
   allow_failure: true

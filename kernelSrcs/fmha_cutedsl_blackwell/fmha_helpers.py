@@ -14,8 +14,9 @@ from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
+from cutlass._mlir.dialects import llvm, vector
 from cutlass.cute.typing import Boolean
-from cutlass.cutlass_dsl import (Float32, Int32, extract_mlir_values, min,
+from cutlass.cutlass_dsl import (Float32, Int32, T, dsl_user_op, extract_mlir_values, min,
                                  new_from_mlir_values)
 from cutlass.utils import WorkTileInfo
 from cutlass.utils.hardware_info import HardwareInfo
@@ -369,6 +370,8 @@ class MaskEnum(enum.Enum):
     - RESIDUAL_MASK: Residual mask for handling variable sequence lengths
     - WINDOW_MASK: Window mask for attention which also includes causal and no mask
     - WINDOW_MASK_INFERENCE: Same as the window mask, but has the limitation that the end of q is aligned with the end of k
+    - BIDIRECTIONAL: Bottom-right-aligned window mask unioned with an optional
+      inclusive bidirectional interval for each query row
     - WINDOW_MASK_BWD: Window mask for backward pass
     - WINDOW_MASK_BWD_INFERENCE: Same as the window mask for backward pass, but has the limitation that the end of q is aligned with the end of k
     """
@@ -377,6 +380,7 @@ class MaskEnum(enum.Enum):
     RESIDUAL_MASK_BWD = enum.auto()
     WINDOW_MASK = enum.auto()
     WINDOW_MASK_INFERENCE = enum.auto()
+    BIDIRECTIONAL = enum.auto()
     WINDOW_MASK_BWD = enum.auto()
     WINDOW_MASK_BWD_INFERENCE = enum.auto()
 
@@ -429,7 +433,8 @@ class FusedMask:
         """
         result = 0
         offset = 0
-        if cutlass.const_expr(mask_type is MaskEnum.WINDOW_MASK_INFERENCE):
+        if cutlass.const_expr(mask_type is MaskEnum.WINDOW_MASK_INFERENCE
+                              or mask_type is MaskEnum.BIDIRECTIONAL):
             offset = seqlen_k - seqlen_q
         if cutlass.const_expr(mask_type is MaskEnum.WINDOW_MASK_BWD_INFERENCE):
             offset = seqlen_q - seqlen_k
@@ -438,7 +443,8 @@ class FusedMask:
         if cutlass.const_expr(mask_type is MaskEnum.RESIDUAL_MASK_BWD):
             result = cute.ceil_div(seqlen_q, tile_shape[0])
         if cutlass.const_expr(mask_type == MaskEnum.WINDOW_MASK
-                              or mask_type == MaskEnum.WINDOW_MASK_INFERENCE):
+                              or mask_type == MaskEnum.WINDOW_MASK_INFERENCE
+                              or mask_type == MaskEnum.BIDIRECTIONAL):
             if cutlass.const_expr(window_size_right is None):
                 result = cute.ceil_div(seqlen_k, tile_shape[1])
             else:
@@ -500,17 +506,26 @@ class FusedMask:
         """
         result = 0
         offset = 0
-        if cutlass.const_expr(mask_type is MaskEnum.WINDOW_MASK_INFERENCE):
+        if cutlass.const_expr(mask_type is MaskEnum.WINDOW_MASK_INFERENCE
+                              or mask_type is MaskEnum.BIDIRECTIONAL):
             offset = seqlen_k - seqlen_q
         if cutlass.const_expr(mask_type is MaskEnum.WINDOW_MASK_BWD_INFERENCE):
             offset = seqlen_q - seqlen_k
         if cutlass.const_expr(mask_type is MaskEnum.WINDOW_MASK
-                              or mask_type is MaskEnum.WINDOW_MASK_INFERENCE):
+                              or mask_type is MaskEnum.WINDOW_MASK_INFERENCE
+                              or mask_type is MaskEnum.BIDIRECTIONAL):
             if cutlass.const_expr(window_size_left is not None):
-                min_idx_q = blk_coord[0] * tile_shape[0]
-                idx_k = min_idx_q + offset - window_size_left
-                tmp_blocks_k = idx_k // tile_shape[1]
-                result = max(tmp_blocks_k, result)
+                if cutlass.const_expr(mask_type is MaskEnum.BIDIRECTIONAL):
+                    if window_size_left < seqlen_k:
+                        min_idx_q = blk_coord[0] * tile_shape[0]
+                        idx_k = min_idx_q + offset - window_size_left
+                        tmp_blocks_k = idx_k // tile_shape[1]
+                        result = max(tmp_blocks_k, result)
+                else:
+                    min_idx_q = blk_coord[0] * tile_shape[0]
+                    idx_k = min_idx_q + offset - window_size_left
+                    tmp_blocks_k = idx_k // tile_shape[1]
+                    result = max(tmp_blocks_k, result)
         if cutlass.const_expr(
                 mask_type is MaskEnum.WINDOW_MASK_BWD
                 or mask_type is MaskEnum.WINDOW_MASK_BWD_INFERENCE):
@@ -520,6 +535,64 @@ class FusedMask:
                 tmp_blocks_q = idx_q // tile_shape[0]
                 result = max(tmp_blocks_q, result)
         return result
+
+    @cute.jit
+    def get_trip_span(
+        mask_type: MaskEnum,
+        blk_coord: cute.Coord,
+        tile_shape: cute.Shape,
+        seqlen_q: Int32,
+        seqlen_k: Int32,
+        window_size_left: Optional[Int32] = None,
+        window_size_right: Optional[Int32] = None,
+        bidirectional_begin: Optional[Int32] = None,
+        bidirectional_end: Optional[Int32] = None,
+    ) -> Tuple[Int32, Int32]:
+        """Return the KV tile start and count for one query tile.
+
+        BIDIRECTIONAL starts from the bottom-right-aligned causal/sliding span,
+        then unions it with the optional block interval. The begin and end
+        values may come from different query rows: the first row in a query
+        tile is sufficient to extend traversal left, and the last valid row is
+        sufficient to extend it right.
+        """
+        start = FusedMask.get_trip_start(
+            mask_type,
+            blk_coord,
+            tile_shape,
+            seqlen_q,
+            seqlen_k,
+            window_size_left,
+            window_size_right,
+        )
+        count = FusedMask.get_trip_count(
+            mask_type,
+            blk_coord,
+            tile_shape,
+            seqlen_q,
+            seqlen_k,
+            window_size_left,
+            window_size_right,
+        )
+        if cutlass.const_expr(mask_type is MaskEnum.BIDIRECTIONAL):
+            if cutlass.const_expr(bidirectional_begin is None
+                                  or bidirectional_end is None):
+                raise ValueError(
+                    "BIDIRECTIONAL requires bidirectional_begin and bidirectional_end"
+                )
+            end = start + count
+            if bidirectional_begin >= 0:
+                start = min(start, bidirectional_begin // tile_shape[1])
+            if bidirectional_end >= 0:
+                end = max(
+                    end,
+                    cute.ceil_div(bidirectional_end + 1, tile_shape[1]),
+                )
+            max_k_tiles = cute.ceil_div(seqlen_k, tile_shape[1])
+            start = max(start, Int32(0))
+            end = min(end, max_k_tiles)
+            count = max(end - start, Int32(0))
+        return start, count
 
     @cute.jit
     def get_leading_mask_id(
@@ -552,6 +625,10 @@ class FusedMask:
         :return: Tuple of (begin, end) tile idx for the leading mask.
         :rtype: Tuple[Int32, Int32]
         """
+        if cutlass.const_expr(mask_type is MaskEnum.BIDIRECTIONAL):
+            raise ValueError(
+                "BIDIRECTIONAL requires get_trip_span and per-score apply_mask"
+            )
         offset = 0
         if cutlass.const_expr(mask_type is MaskEnum.WINDOW_MASK_INFERENCE):
             offset = seqlen_k - seqlen_q
@@ -630,6 +707,10 @@ class FusedMask:
         :return: Tuple of (begin, end) tile idx for the trailing mask.
         :rtype: Tuple[Int32, Int32]
         """
+        if cutlass.const_expr(mask_type is MaskEnum.BIDIRECTIONAL):
+            raise ValueError(
+                "BIDIRECTIONAL requires get_trip_span and per-score apply_mask"
+            )
         offset = 0
         if cutlass.const_expr(mask_type is MaskEnum.WINDOW_MASK_INFERENCE):
             offset = seqlen_k - seqlen_q
@@ -890,6 +971,8 @@ class FusedMask:
             index_k,
         ),
         assume_fragment_single_row: cutlass.Constexpr = False,
+        bidirectional_begin: Optional[Int32] = None,
+        bidirectional_end: Optional[Int32] = None,
     ):
         """
         Apply the appropriate mask to the attention scores.
@@ -915,16 +998,120 @@ class FusedMask:
             thread's whole fragment lies in a single S-matrix row, i.e. index_q
             is identical for every element.
         :type assume_fragment_single_row: cutlass.Constexpr
+        :param bidirectional_begin: Inclusive per-row block begin for
+            BIDIRECTIONAL.
+        :type bidirectional_begin: Optional[Int32]
+        :param bidirectional_end: Inclusive per-row block end for
+            BIDIRECTIONAL.
+        :type bidirectional_end: Optional[Int32]
         """
 
         tidx, tidy, tidx = cute.arch.thread_idx()
         offset = 0
         offset = (seqlen_k - seqlen_q if cutlass.const_expr(
             mask_type is MaskEnum.WINDOW_MASK_INFERENCE
-            or mask_type is MaskEnum.WINDOW_MASK_BWD_INFERENCE) else 0)
-        if cutlass.const_expr(assume_fragment_single_row
-                              and window_size_left is None
-                              and window_size_right is not None):
+            or mask_type is MaskEnum.WINDOW_MASK_BWD_INFERENCE
+            or mask_type is MaskEnum.BIDIRECTIONAL) else 0)
+        if cutlass.const_expr(mask_type is MaskEnum.BIDIRECTIONAL):
+            if cutlass.const_expr(bidirectional_begin is None
+                                  or bidirectional_end is None):
+                raise ValueError(
+                    "BIDIRECTIONAL requires bidirectional_begin and bidirectional_end"
+                )
+            # The runtime-window artifact also serves global layers. Hoist the
+            # uniform full-left-window decision outside the per-score loop so
+            # global layers retain the causal-only fast path.
+            if cutlass.const_expr(window_size_left is not None
+                                  and window_size_right is not None):
+                if window_size_left >= seqlen_k:
+                    if cutlass.const_expr(assume_fragment_single_row):
+                        index_q0, _k0 = index_transform(*index_qk[0])
+                        if index_q0 >= seqlen_q:
+                            for i in cutlass.range_constexpr(cute.size(acc_qk)):
+                                acc_qk[i] = -Float32.inf
+                        else:
+                            k_bound = min(
+                                index_q0 + offset + window_size_right,
+                                seqlen_k - 1,
+                            )
+                            bounded_bidirectional_end = min(
+                                bidirectional_end, seqlen_k - 1
+                            )
+                            for i in cutlass.range_constexpr(cute.size(acc_qk)):
+                                _q, index_k = index_transform(*index_qk[i])
+                                if index_k > k_bound:
+                                    if (
+                                        bidirectional_begin < 0
+                                        or index_k < bidirectional_begin
+                                        or index_k > bounded_bidirectional_end
+                                    ):
+                                        acc_qk[i] = -Float32.inf
+                    else:
+                        for i in cutlass.range_constexpr(cute.size(acc_qk)):
+                            index_q, index_k = index_transform(*index_qk[i])
+                            if index_k >= seqlen_k or index_q >= seqlen_q:
+                                acc_qk[i] = -Float32.inf
+                            elif (
+                                index_k
+                                > index_q + offset + window_size_right
+                            ):
+                                if (
+                                    bidirectional_begin < 0
+                                    or index_k < bidirectional_begin
+                                    or index_k > bidirectional_end
+                                ):
+                                    acc_qk[i] = -Float32.inf
+                else:
+                    for i in cutlass.range_constexpr(cute.size(acc_qk)):
+                        index_q, index_k = index_transform(*index_qk[i])
+                        if index_k >= seqlen_k or index_q >= seqlen_q:
+                            acc_qk[i] = -Float32.inf
+                        else:
+                            max_k_index = min(
+                                index_q + offset + window_size_right, seqlen_k
+                            )
+                            min_k_index = max(
+                                0, index_q + offset - window_size_left
+                            )
+                            if (
+                                index_k > max_k_index
+                                or index_k < min_k_index
+                            ):
+                                if (
+                                    bidirectional_begin < 0
+                                    or index_k < bidirectional_begin
+                                    or index_k > bidirectional_end
+                                ):
+                                    acc_qk[i] = -Float32.inf
+            else:
+                for i in cutlass.range_constexpr(cute.size(acc_qk)):
+                    index_q, index_k = index_transform(*index_qk[i])
+                    if index_k >= seqlen_k or index_q >= seqlen_q:
+                        acc_qk[i] = -Float32.inf
+                    else:
+                        outside_window = False
+                        if cutlass.const_expr(window_size_left is None
+                                              and window_size_right is not None):
+                            outside_window = (
+                                index_q + offset + window_size_right < index_k
+                            )
+                        elif cutlass.const_expr(
+                            window_size_left is not None
+                            and window_size_right is None
+                        ):
+                            outside_window = (
+                                index_q + offset - window_size_left > index_k
+                            )
+                        if outside_window:
+                            if (
+                                bidirectional_begin < 0
+                                or index_k < bidirectional_begin
+                                or index_k > bidirectional_end
+                            ):
+                                acc_qk[i] = -Float32.inf
+        elif cutlass.const_expr(assume_fragment_single_row
+                                and window_size_left is None
+                                and window_size_right is not None):
             # Hoisted scalar causal fast path. index_q is constant across the
             # fragment (caller-promised, see the parameter doc), which lets
             # the generic path's per-element work collapse three times:
@@ -984,3 +1171,31 @@ class FusedMask:
                                       or mask_type == MaskEnum.RESIDUAL_MASK_BWD):
                     if index_k >= seqlen_k or index_q >= seqlen_q:
                         acc_qk[i] = -Float32.inf
+
+
+@cute.jit
+def cvt_f32x4_to_f8x4(fp32x4, fp8x4, *, loc=None, ip=None):
+    src = fp32x4.load()
+    vec = src.ir_value(loc=loc, ip=ip) if hasattr(src, "ir_value") else src
+    src0 = Float32(vector.extract(vec, [], [0])).ir_value(loc=loc, ip=ip)
+    src1 = Float32(vector.extract(vec, [], [1])).ir_value(loc=loc, ip=ip)
+    src2 = Float32(vector.extract(vec, [], [2])).ir_value(loc=loc, ip=ip)
+    src3 = Float32(vector.extract(vec, [], [3])).ir_value(loc=loc, ip=ip)
+    packed = llvm.inline_asm(
+        T.i32(),
+        [src0, src1, src2, src3],
+        "{\n"
+        "  .reg .b16 lo;\n"
+        "  .reg .b16 hi;\n"
+        "  cvt.rn.satfinite.e4m3x2.f32 lo, $2, $1;\n"
+        "  cvt.rn.satfinite.e4m3x2.f32 hi, $4, $3;\n"
+        "  mov.b32 $0, {lo, hi};\n"
+        "}",
+        "=r,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    cute.recast_tensor(fp8x4, cutlass.Int32)[0] = cutlass.Int32(packed)
+
+

@@ -42,7 +42,7 @@ class NemotronHMamba2Mixer(Module):
         self.out_proj = Linear(ctx, self.key("out_proj"))
 
     def forward(self, hidden_states, conv_state, recurrent_state,
-                context_lengths):
+                context_lengths, state_start_index):
         mamba = self.cfg.mamba_cfg
         d_inner = mamba.intermediate_size
         d_state = mamba.n_groups * mamba.ssm_state_size
@@ -74,9 +74,10 @@ class NemotronHMamba2Mixer(Module):
         dt_bias = F.constant(self.weights.f16(self.key("dt_bias")), "dt_bias")
         output, recurrent_state_out = F.update_ssm_state(
             x, a, b, c, d, dt, dt_bias, recurrent_state, context_lengths,
-            d_inner, mamba.ssm_state_size, mamba.num_heads, mamba.n_groups)
+            state_start_index, d_inner, mamba.ssm_state_size, mamba.num_heads,
+            mamba.n_groups)
         output = output.reshape((0, 0, d_inner))
-        gated = (output.cast(trt.float32) * gate.cast(trt.float32).silu())
+        gated = (output * gate.silu()).cast(trt.float32)
         group_size = d_inner // mamba.n_groups
         grouped = gated.reshape((0, 0, mamba.n_groups, group_size))
         normalized = F.rms_norm(grouped,
@@ -122,7 +123,8 @@ class NemotronHMoE(Module):
         router_logits = self.gate(hidden_states)
         routed = (self.latent_in(hidden_states)
                   if self.latent_in is not None else hidden_states)
-        routed = self.experts(routed, router_logits, self.gate.correction)
+        routed = self.experts(routed, router_logits, self.gate.correction,
+                              self.gate.correction_key)
         if self.latent_out is not None:
             routed = self.latent_out(routed)
         shared = self.shared_experts(hidden_states)
@@ -162,7 +164,8 @@ class NemotronHBlock(Module):
         normalized = self.input_norm(hidden_states)
         if self.layer_type == config.LAYER_MAMBA:
             mixed, conv_out, recurrent_out = self.mixer(
-                normalized, conv_state, recurrent_state, context_lengths)
+                normalized, conv_state, recurrent_state, context_lengths,
+                cache_start)
             present = (conv_out, recurrent_out)
         elif self.layer_type == config.LAYER_ATTN:
             mixed, present = self.mixer(normalized, past_key_value, rope,
@@ -272,7 +275,8 @@ class NemotronHForCausalLM(NetworkModule):
                     hidden_states,
                     io["context_lengths"],
                     conv_state=io["conv_states"][state_index],
-                    recurrent_state=io["recurrent_states"][state_index])
+                    recurrent_state=io["recurrent_states"][state_index],
+                    cache_start=io["cache_start"])
                 present_conv.append(states[0])
                 present_recurrent.append(states[1])
                 if len(states) > 2 and states[2] is not None:

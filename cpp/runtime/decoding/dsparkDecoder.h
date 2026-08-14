@@ -19,6 +19,7 @@
 
 #include "common/hashUtils.h"
 #include "runtime/decoding/decodingStrategy.h"
+#include "runtime/state/externalWeightManager.h"
 
 #include <filesystem>
 #include <memory>
@@ -32,7 +33,8 @@ class DSparkDecoder final : public DecodingStrategy
 {
 public:
     DSparkDecoder(DecodingRuntimeContext& runtime, std::filesystem::path const& engineDir,
-        SpecDecodeDraftingConfig const& draftingConfig, cudaStream_t stream);
+        SpecDecodeDraftingConfig const& draftingConfig, std::unique_ptr<EngineExecutor> draftExecutor,
+        cudaStream_t stream);
 
     DecodingStrategyKind kind() const noexcept override
     {
@@ -63,11 +65,15 @@ public:
 
     void resetForNewSequences(Tensor& reuseLengths, cudaStream_t stream) override;
     void onBatchEvict(std::vector<int32_t> const& batchMapping, int32_t oldActiveBatch, int32_t newActiveBatch,
-        Tensor& deviceBatchMapping, cudaStream_t stream) override;
+        Tensor& deviceBatchMapping, cudaStream_t stream, BatchCompactionMode mode) override;
 
 private:
     bool runDraftForward(DecodingInferenceContext& context);
     bool runBaseVerification(DecodingInferenceContext& context);
+    bool buildTreeVerifyInputs(int32_t activeBatchSize, cudaStream_t stream, bool useConfidence);
+    void commitAcceptedTreePath(DecodingInferenceContext& context, int32_t verifySize, int32_t maxAcceptLength);
+    void dsparkBiasMarkovGreedy(DecodingInferenceContext& context, int32_t activeBatchSize, int32_t proposalLen);
+    void dsparkBiasMarkovSample(DecodingInferenceContext& context, int32_t activeBatchSize, int32_t proposalLen);
     void loadHeadSidecars(std::filesystem::path const& engineDir, cudaStream_t stream);
 
     DecodingRuntimeContext& mRuntime;
@@ -77,6 +83,7 @@ private:
 
     std::unique_ptr<EngineExecutor> mDraftExecutor;
     TensorMap mDraftTensorMap;
+    ExternalWeightManager mDraftExternalWeightManager;
 
     //! Draft engine I/O tensors
     Tensor mDraftInputsEmbeds; //!< [B, proposalLen, draftHiddenSize] FP16
@@ -123,12 +130,20 @@ private:
     //! Pre-allocated argmax scratch buffer for dsparkGreedyAccept [maxBatch * verifyLen] INT32
     Tensor mArgmaxScratch;
 
-    //! Markov head partial argmax scratch [maxBatch, ceil(vocab/8)]
-    Tensor mMarkovPartialValues;
-    Tensor mMarkovPartialIndices;
-
     //! Last accepted token per batch [maxBatch] INT32 (GPU)
     Tensor mLastAcceptedTokens;
+
+    //! DDTree drafting state (draftingTopK > 1): the fanout happens in ddtreeBuild
+    //! after drafting, on the stacked per-depth Markov-corrected logits.
+    Tensor mStackedMarkovLogits;  //!< [maxBatch, blockSize+1, vocabSize] FP32, row 0 = root placeholder
+    Tensor mTreeTokenIds;         //!< [maxBatch, verifySize] INT32 flattened tree token ids
+    Tensor mTreeNodeDepths;       //!< [maxBatch, verifySize] INT32 node depths (root = 0)
+    Tensor mTreeParentIds;        //!< [maxBatch, verifySize] INT32 parent node indices
+    Tensor mTreeNodeScores;       //!< [maxBatch, verifySize] FP32 prefix log-prob scores
+    Tensor mValidCounts;          //!< [maxBatch] INT32 valid node counts
+    Tensor mVerifyTreeMask;       //!< [maxBatch, verifySize, verifySize] INT8 unpacked accept mask
+    Tensor mTreeBuildWorkspace;   //!< ddtreeBuild scratch
+    Tensor mAcceptedTokenIndices; //!< [maxBatch, verifySize] INT32 accepted verify-node indices
 
     //! DSpark Markov/confidence sidecars
     Tensor mMarkovW1;         //!< [vocabSize, markovRank] FP16
@@ -142,6 +157,8 @@ private:
     hash_utils::HashMap<SystemPromptCacheKey, SystemPromptKVCache> mSystemPromptKVCacheDraft;
 
     //! DSpark-specific parameters
+    bool mUseTree{false};          //!< draftingTopK > 1 selects DDTree drafting
+    bool mUseTreeScheduler{false}; //!< scheduler!=off in tree mode: log(conf) bias on ddtree growth scores
     int32_t mProposalLen{7};
     int32_t mVerifyLen{8};
     int32_t mCurrentProposalLen{7};

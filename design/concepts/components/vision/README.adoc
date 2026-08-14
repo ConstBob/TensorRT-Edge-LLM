@@ -84,16 +84,16 @@ flowchart LR
 | `tensorrt_edgellm/models/phi4mm/modeling_phi4mm_visual.py`
 | Phi-4 multimodal visual encoder export wrapper.
 
-| `cpp/multimodal/multimodalRunner.{h,cpp}`
+| `cpp/multimodal/common/multimodalRunner.{h,cpp}`
 | Runtime multimodal runner dispatch.
 
-| `cpp/multimodal/qwenViTRunner.{h,cpp}`
+| `cpp/multimodal/qwen2/qwenViTRunner.{h,cpp}`
 | Qwen-family visual runtime runner.
 
-| `cpp/multimodal/internViTRunner.{h,cpp}`
+| `cpp/multimodal/internvl/internViTRunner.{h,cpp}`
 | InternVL visual runtime runner.
 
-| `cpp/multimodal/phi4mmViTRunner.{h,cpp}`
+| `cpp/multimodal/phi4mm/phi4mmViTRunner.{h,cpp}`
 | Phi-4 multimodal visual runtime runner.
 |===
 

@@ -79,18 +79,6 @@ HybridCacheManager::HybridCacheManager(Config const& config, cudaStream_t stream
     // Pre-build per-headDim groups for batched kernel launches.
     if (mKVCache.numLayers() > 0)
     {
-        // The batched system-prompt capture/restore kernels (saveKVCacheBatched /
-        // instantiateKVCacheBatched, see captureKVCache/restoreKVCache) derive each layer's V-half
-        // offset as maxBatch*capPadded*H*D from KVLayerInfo — i.e. they assume numPages == the
-        // active-capacity floor. All pool sizing is floor-only today; keep this invariant check
-        // so a future retention-capacity change cannot silently corrupt V-half reads here.
-        int32_t const floorPages
-            = computeKvPoolFloorPages(mConfig.kvConfig.maxBatchSize, mConfig.kvConfig.maxSequenceLength);
-        check::check(mKVCache.numPages() == floorPages,
-            "HybridCacheManager: system-prompt capture/restore assumes the pool sits at the "
-            "active-capacity floor (numPages="
-                + std::to_string(mKVCache.numPages()) + ", floor=" + std::to_string(floorPages) + ").");
-
         // Group KV layers by headDim, preserving insertion order via an auxiliary vector.
         std::unordered_map<int32_t, size_t> headDimToGroupIdx;
         for (int32_t i = 0; i < mKVCache.numLayers(); ++i)
@@ -110,15 +98,11 @@ HybridCacheManager::HybridCacheManager(Config const& config, cudaStream_t stream
             group.maxKVHeads = std::max(group.maxKVHeads, lc.numKVHeads);
             group.numLayers++;
 
-            // NHD pool [2, maxBatch, capPadded, H, D]: the per-row token capacity is capPadded
-            // (maxSequenceLength rounded up to a whole number of kTOKENS_PER_PAGE-token pages), NOT
-            // maxSequenceLength. The batched copy/commit kernels stride by this value, so it must be
-            // capPadded; maxBatch is needed to derive the V-half offset (maxBatch*capPadded*H*D).
+            // The active-slot K/V views use capPadded tokens per row.
             kernel::KVLayerInfo info{};
-            info.data = mKVCache.getCombinedKVCache(i).rawPointer();
+            info.data = mKVCache.kPoolPtr(i);
             info.numKVHeads = lc.numKVHeads;
             info.maxSeqLen = mKVCache.maxCapPadded();
-            info.maxBatch = mConfig.kvConfig.maxBatchSize;
             group.hostInfos.push_back(info);
         }
 
@@ -200,16 +184,6 @@ rt::Tensor& HybridCacheManager::getCombinedKVCache(int32_t absLayerIdx)
     check::check(
         localIdx >= 0, "getCombinedKVCache: layer " + std::to_string(absLayerIdx) + " is not an attention layer.");
     return mKVCache.getCombinedKVCache(localIdx);
-}
-
-rt::Tensor& HybridCacheManager::getCombinedKVCachePoolView(int32_t absLayerIdx)
-{
-    check::check(absLayerIdx >= 0 && absLayerIdx < static_cast<int32_t>(mAbsToKVIndex.size()),
-        "getCombinedKVCachePoolView: absLayerIdx " + std::to_string(absLayerIdx) + " out of range.");
-    int32_t const localIdx = mAbsToKVIndex[absLayerIdx];
-    check::check(localIdx >= 0,
-        "getCombinedKVCachePoolView: layer " + std::to_string(absLayerIdx) + " is not an attention layer.");
-    return mKVCache.getCombinedKVCachePoolView(localIdx);
 }
 
 std::pair<rt::Tensor, rt::Tensor> HybridCacheManager::getSeparateKVCache(int32_t absLayerIdx)
@@ -360,21 +334,21 @@ bool HybridCacheManager::getKVCacheAllEmpty() const noexcept
 void HybridCacheManager::compactBatch(
     rt::Tensor const& batchMapping, int32_t oldBatch, int32_t newBatch, cudaStream_t stream)
 {
-    // NHD pool layout: each attention layer is [2, maxBatch, capPadded, H, D] with the K/V split
-    // OUTERMOST, so the K-half and V-half are each a contiguous [maxBatch, capPadded, H, D] pool, and
-    // a row's live tokens are its [0, liveLen) prefix (capPadded is the padded token capacity). Phase-1
-    // keeps compaction-based eviction with row == physical slot: a survivor's row moves within its own
-    // slot's pool, but only its live prefix — not the full capPadded*H*D row — is copied. One grouped
-    // launch per headDim group covers all its layers and both halves (reusing the pre-uploaded
-    // deviceLayerInfos); the static identity page table stays valid without modification (row stays
-    // == slot). mDeviceKVCacheLengths (still in its pre-compaction, per-oldBatch-slot state here)
-    // gives each row's live length.
+    // Active-slot K/V views have [maxBatch, capPadded, H, D] shape. Compaction moves only each
+    // survivor's live prefix while the identity page table retains row == slot.
     for (auto const& group : mHeadDimGroups)
     {
         auto const* layerInfos = static_cast<kernel::KVLayerInfo const*>(group.deviceLayerInfos.rawPointer());
         kernel::compactKVCacheBatched(layerInfos, batchMapping, mDeviceKVCacheLengths, group.numLayers, group.headDim,
-            mConfig.kvConfig.kvCacheType, oldBatch, newBatch, stream);
+            mKVCache.numPages(), mConfig.kvConfig.kvCacheType, oldBatch, newBatch, stream);
     }
+
+    compactBatchSlotState(batchMapping, oldBatch, newBatch, stream);
+}
+
+void HybridCacheManager::compactBatchSlotState(
+    rt::Tensor const& batchMapping, int32_t oldBatch, int32_t newBatch, cudaStream_t stream)
+{
 
     // Compact the shared KV cache lengths tensor separately after all layers are done.
     kernel::compactTensorBatch(mDeviceKVCacheLengths, batchMapping, mDeviceKVCacheLengths, oldBatch, newBatch, stream);
@@ -443,7 +417,6 @@ std::vector<rt::Tensor> HybridCacheManager::captureKVCache(
             dstInfos[g].data = result[kvIdx].rawPointer();
             dstInfos[g].numKVHeads = lc.numKVHeads;
             dstInfos[g].maxSeqLen = sequenceLength; // destination tensor's "maxSeqLen" == sequenceLength
-            dstInfos[g].maxBatch = 1;               // saved tensor has no batch dim; unused by this kernel path
         }
 
         size_t const infoBytes = dstInfos.size() * sizeof(kernel::KVLayerInfo);
@@ -453,7 +426,7 @@ std::vector<rt::Tensor> HybridCacheManager::captureKVCache(
         auto const* srcLayerInfos = static_cast<kernel::KVLayerInfo const*>(group.deviceLayerInfos.rawPointer());
         auto const* dstLayerInfos = static_cast<kernel::KVLayerInfo const*>(group.deviceScratchInfos.rawPointer());
 
-        kernel::saveKVCacheBatched(srcLayerInfos, dstLayerInfos, group.numLayers, group.headDim, mConfig.maxBatchSize,
+        kernel::saveKVCacheBatched(srcLayerInfos, dstLayerInfos, group.numLayers, group.headDim, mKVCache.numPages(),
             batchIdx, sequenceLength, stream);
     }
 
@@ -480,7 +453,6 @@ void HybridCacheManager::restoreKVCache(std::vector<rt::Tensor> const& saved, in
             srcInfos[g].data = const_cast<void*>(saved[kvIdx].rawPointer());
             srcInfos[g].numKVHeads = lc.numKVHeads;
             srcInfos[g].maxSeqLen = srcShape[1]; // sequenceLength from the saved tensor [2, seqLen, H, D]
-            srcInfos[g].maxBatch = 1;            // saved tensor has no batch dim; unused by this kernel path
         }
 
         size_t const infoBytes = srcInfos.size() * sizeof(kernel::KVLayerInfo);
@@ -493,7 +465,7 @@ void HybridCacheManager::restoreKVCache(std::vector<rt::Tensor> const& saved, in
         int32_t const sequenceLength = saved[group.localKVIndices[0]].getShape()[1];
 
         kernel::instantiateKVCacheBatched(dstLayerInfos, srcLayerInfos, group.numLayers, group.headDim,
-            mConfig.maxBatchSize, batchIdx, sequenceLength, stream);
+            mKVCache.numPages(), batchIdx, sequenceLength, stream);
     }
 }
 

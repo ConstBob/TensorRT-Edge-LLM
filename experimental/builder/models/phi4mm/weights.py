@@ -41,7 +41,16 @@ def resolve_candidates(name: str, *, component: str, spec_type: str,
     del spec_type, spec_role
     prefixes = _PREFIXES.get(component, ())
     names = [name]
-    if component == "llm" and name.endswith((".weight", ".bias")):
+    if component == "llm" and name.endswith((
+            ".weight",
+            ".weight_packed",
+            ".weight_scale",
+            ".weight_scale_2",
+            ".weight_global_scale",
+            ".input_scale",
+            ".input_global_scale",
+            ".bias",
+    )):
         stem, suffix = name.rsplit(".", 1)
         if stem.endswith(("qkv_proj", "o_proj", "gate_up_proj", "down_proj")):
             names.append(f"{stem}.base_layer.{suffix}")

@@ -26,21 +26,9 @@ namespace kernel
 {
 
 /*!
- * @brief Greedy DSpark vanilla Markov proposal.
- *
- * For each batch element this walks the proposal block sequentially:
- *   corrected_logits_k[v] = backbone_logits_k[v] + dot(markov_w1[prev], markov_w2[v])
- *   token_k = argmax(corrected_logits_k)
- *   prev = token_k
- *
- * The public DeepSpec Qwen3 DSpark checkpoints use markov_head_type="vanilla",
- * with both Markov weights saved as FP16 sidecar tensors in shape [vocab, rank].
+ * @brief Number of vocab blocks the Markov kernels partition the vocabulary into.
  */
 int32_t dsparkMarkovPartialCount(int32_t vocabSize);
-
-void dsparkVanillaMarkovGreedy(rt::Tensor const& backboneLogits, rt::Tensor const& markovW1, rt::Tensor const& markovW2,
-    rt::Tensor const& firstPrevTokens, rt::Tensor& draftTokenIds, rt::Tensor& partialValues, rt::Tensor& partialIndices,
-    int32_t batchSize, int32_t proposalLen, int32_t vocabSize, int32_t markovRank, cudaStream_t stream);
 
 /*!
  * @brief Build DSpark base-verify input IDs.
@@ -89,6 +77,16 @@ void dsparkComputeConfidenceAndSPSProposalLengths(rt::Tensor const& draftHiddenS
     rt::Tensor const& draftTokenIds, rt::Tensor& confidenceScores, rt::Tensor& proposalLengths, int32_t batchSize,
     int32_t proposalLen, int32_t hiddenSize, int32_t markovRank, bool confidenceWithMarkov, float survivalFloor,
     int32_t minProposalLen, int32_t maxProposalLen, cudaStream_t stream);
+
+/*!
+ * @brief Compute DSpark per-step acceptance confidence scores only (no scheduling).
+ *
+ * Used by DDTree drafting to bias tree growth; confidenceScores is [batch, proposalLen].
+ */
+void dsparkComputeConfidenceScores(rt::Tensor const& draftHiddenStates, rt::Tensor const& markovW1,
+    rt::Tensor const& confidenceWeight, rt::Tensor const& confidenceBias, rt::Tensor const& firstPrevTokens,
+    rt::Tensor const& draftTokenIds, rt::Tensor& confidenceScores, int32_t batchSize, int32_t proposalLen,
+    int32_t hiddenSize, int32_t markovRank, bool confidenceWithMarkov, cudaStream_t stream);
 
 /*!
  * @brief Convert logits to the sampling probability distribution used by DSpark.
@@ -144,6 +142,12 @@ void dsparkStoreDraftStepProbabilities(rt::Tensor const& probabilityScratch, rt:
  */
 void dsparkNormalizeTopKRows(rt::Tensor const& topKValues, rt::Tensor& topKProbabilities, int32_t rows, int32_t topK,
     float temperature, cudaStream_t stream);
+
+/*!
+ * @brief Store one selected top-1 token per batch row into draftTokenIds [B, P].
+ */
+void dsparkStoreDraftStepTop1(rt::Tensor const& top1Indices, rt::Tensor& draftTokenIds, int32_t batchSize, int32_t step,
+    int32_t proposalLen, cudaStream_t stream);
 
 /*!
  * @brief Sample one DSpark draft token from selected top-k logits and store sparse draft probabilities/indices.

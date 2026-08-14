@@ -334,6 +334,18 @@ inline constexpr char const* kIntermediateConvStateTemplate = "intermediate_conv
  */
 inline constexpr char const* kIntermediateRecurrentStateTemplate = "intermediate_recurrent_state";
 
+/*!
+ * @brief Mamba spec-verify replay-stash output templates (FP32). Instead of a per-token full-state
+ * snapshot, the Mamba plugin stashes the minimal per-token replay inputs; the runtime reconstructs
+ * the accepted recurrent state from them after verification.
+ *   dA: [batch, seq_len, recurrentNumHeads]
+ *   u:  [batch, seq_len, recurrentNumHeads, recurrentHeadDim]
+ *   B:  [batch, seq_len, recurrentNumGroups, recurrentStateSize]
+ */
+inline constexpr char const* kReplayDaStateTemplate = "replay_da_state";
+inline constexpr char const* kReplayUStateTemplate = "replay_u_state";
+inline constexpr char const* kReplayBStateTemplate = "replay_b_state";
+
 /*! @} */
 
 /*! @name Eagle Speculative Decoding Bindings
@@ -416,6 +428,14 @@ inline constexpr char const* kTreeDepths = "tree_depths";
  * Shape: [sequence_length, input_dim] for Qwen-VL, [num_blocks, channels, height, width] for InternVL
  */
 inline constexpr char const* kVisualInput = "input";
+
+/*!
+ * @brief Pixel-shuffle gather indices for the Nemotron-Omni visual engine
+ *
+ * Shape: [num_out_tokens, scale^2] (INT64). Grid-dependent, computed by the
+ * runtime so one engine serves square image tiles and non-square video grids.
+ */
+inline constexpr char const* kVisualShuffleIndices = "shuffle_indices";
 
 /*!
  * @brief Visual output tensor from vision transformers
@@ -618,6 +638,16 @@ inline constexpr char const* kAudioOutput = "last_hidden_state";
  */
 inline constexpr char const* kLmHeadWeight = "lm_head_weight";
 
+/*!
+ * @brief Stacked CodePredictor lm_heads + device-selected head index
+ *
+ * lm_heads: [num_heads, vocab_size, hidden_size] (FLOAT16), lm_head_idx: [1] (INT32).
+ * The head is gathered inside the engine, so bindings stay step-invariant and one
+ * CUDA graph serves every decode step.
+ */
+inline constexpr char const* kLmHeads = "lm_heads";
+inline constexpr char const* kLmHeadIdx = "lm_head_idx";
+
 /*! @} */
 
 /*! @name Code2Wav Vocoder Bindings (Qwen3-Omni)
@@ -790,6 +820,25 @@ inline std::string formatIntermediateRecurrentStateName(int32_t recurrentLayerId
 inline std::string formatIntermediateConvStateName(int32_t recurrentLayerIdx)
 {
     return std::string(kIntermediateConvStateTemplate) + "_" + std::to_string(recurrentLayerIdx);
+}
+
+/*!
+ * @brief Format the Mamba spec-verify replay-stash binding names (dA / u / B).
+ * @param recurrentLayerIdx The recurrent layer index (0-based)
+ */
+inline std::string formatReplayDaStateName(int32_t recurrentLayerIdx)
+{
+    return std::string(kReplayDaStateTemplate) + "_" + std::to_string(recurrentLayerIdx);
+}
+
+inline std::string formatReplayUStateName(int32_t recurrentLayerIdx)
+{
+    return std::string(kReplayUStateTemplate) + "_" + std::to_string(recurrentLayerIdx);
+}
+
+inline std::string formatReplayBStateName(int32_t recurrentLayerIdx)
+{
+    return std::string(kReplayBStateTemplate) + "_" + std::to_string(recurrentLayerIdx);
 }
 
 /*!

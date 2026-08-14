@@ -21,7 +21,8 @@ from typing import Optional
 
 import pytest
 from conftest import EnvironmentConfig, RemoteConfig
-from pytest_helpers import run_command, timer_context
+from pytest_helpers import (record_library_size_report, run_command,
+                            timer_context)
 
 from .utils.device import DeviceConfig
 
@@ -60,7 +61,10 @@ def _build_project(env_config: EnvironmentConfig,
     build_dir = env_config.build_dir
 
     # Build cmake command with required components only
-    cmake_cmd = ['cmake', '..', '-DBUILD_UNIT_TESTS=ON']
+    cmake_cmd = [
+        'cmake', '..', '-DBUILD_UNIT_TESTS=ON',
+        '-DENABLE_CUTEDSL_MODULE_TEST_HOOK=ON'
+    ]
 
     # Opt-in for jobs whose test lists import the pybind runtime (the
     # preprocessing suites); resolved from the pytest interpreter's pybind11.
@@ -107,7 +111,7 @@ def _build_project(env_config: EnvironmentConfig,
     # do not enable that group without a native SM86 artifact.
     x86_cutedsl_selections = {
         80: ('sm_80', 'ALL'),
-        86: ('sm_80', r'ffpa\;fmha_v2\;gdn\;gemm\;int4_fp16_gemm\;ssd'),
+        86: ('sm_80', r'fmha\;gdn\;gemm\;int4_fp16_gemm\;ssd'),
         100: ('sm_100', 'ALL'),
         120: ('sm_120', 'ALL'),
     }
@@ -141,6 +145,20 @@ def _build_project(env_config: EnvironmentConfig,
 
     if not success:
         pytest.fail("Build failed")
+
+    # Record how big the library this job just built is. Informational: a
+    # failure here must not fail a build that otherwise succeeded.
+    size_result = run_command(cmd=[
+        'python3', 'scripts/report_library_size.py', '--build-dir', build_dir,
+        '--label', device_config.target
+    ],
+                              remote_config=remote_config,
+                              timeout=120,
+                              logger=test_logger)
+    if size_result['success']:
+        record_library_size_report(size_result['output'])
+    else:
+        test_logger.warning("Library size report failed; continuing")
 
     expected_files = [
         'unitTest',

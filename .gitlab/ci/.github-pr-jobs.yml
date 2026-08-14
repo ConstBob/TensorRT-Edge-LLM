@@ -26,6 +26,7 @@
 
 .github_pr_cleanup:
   after_script:
+    - !reference [.cleanup_engine_storage, after_script]
     - echo "Cleaning up GitHub PR clone directory"
     - rm -rf /tmp/github_pr_${CI_PIPELINE_ID}
     - echo "Cleanup complete"
@@ -34,7 +35,7 @@ github_pr_l0_checkpoint_export_ampere:
   stage: l0_test
   variables:
     CUDA_VERSION: "12.9"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/github_pr_$CI_PIPELINE_ID"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/checkpoint_export_ampere"
     PRIORITY: l0_checkpoint_export_ampere
@@ -55,7 +56,7 @@ github_pr_l0_a30:
     - github_pr_l0_checkpoint_export_ampere
   variables:
     CUDA_VERSION: "12.9"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/github_pr_$CI_PIPELINE_ID"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/a30"
     PRIORITY: l0_pipeline_a30

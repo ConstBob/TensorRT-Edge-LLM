@@ -21,12 +21,15 @@
 #include "common/tensor.h"
 #include "runtime/audioUtils.h"
 #include "runtime/imageUtils.h"
+#include "runtime/state/contextCache/contextCacheConfig.h"
 
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
+#ifndef __CUDACC__
 #include <nlohmann/json.hpp>
+#endif // !__CUDACC__
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -141,7 +144,7 @@ struct LLMGenerationRequest
     bool addGenerationPrompt{true};
     // Whether to enable thinking mode for models that support it. Default is disabled.
     bool enableThinking{false};
-    // Always disable speculative decoding for this request even if Eagle Draft engine is loaded.
+    // Disable speculative decoding for this request when the loaded engine contract supports vanilla fallback.
     bool disableSpecDecode{false};
 
     //! Number of top log-probabilities to return per generated token (0 = disabled, max = kMaxLogprobsK).
@@ -165,6 +168,19 @@ struct LLMGenerationRequest
     //! Called after cudaStreamSynchronize inside the decode loop.
     //! When nullopt (default), zero overhead — no callback is invoked.
     std::optional<TokenCallback> onTokenGenerated;
+
+    //! Per-request context-cache lookup behavior. This is effective only when the runtime cache is enabled.
+    ContextCacheLookupPolicy contextCacheLookupPolicy{ContextCacheLookupPolicy::kUseCache};
+
+    //! Ready endpoints to retain when the context cache is enabled.
+    ContextCacheCommitPolicy contextCacheCommitPolicy{ContextCacheCommitPolicy::kIncludingGeneratedTokens};
+
+    //! Hybrid+MTP boundary-replay tail length carried into the context cache. Not consumed yet.
+    int32_t contextCacheReplayTailLength{0};
+
+    //! Periodic recurrent-state capture interval (0 disables). Hybrid+MTP endpoint reuse requires this to be 0 so the
+    //! recurrent snapshot lands only at the stable predecessor boundary (mirrors reference request validation).
+    int32_t recurrentCaptureInterval{0};
 };
 
 /*! \brief LLM Generation Response structure
@@ -183,6 +199,9 @@ struct LLMGenerationResponse
 
     //! Why each request halted (EOS, length, stop string, cancel, error); see `runtime/streaming.h`.
     std::vector<FinishReason> finishReasons;
+
+    //! Prompt length per request, counted after chat templating and media expansion.
+    std::vector<int32_t> inputTokenCounts;
 };
 
 /*! \brief RoPE (Rotary Position Embedding) type enumeration
@@ -195,6 +214,7 @@ enum class RopeType
     kLongRope,     //!< Long RoPE type used by Phi-4
     kMRope,        //!< MRope type used by Qwen2-VL
     kNoRope,       //!< No positional encoding (e.g., Nemotron-Nano)
+    kYarn,         //!< YaRN NTK-by-parts scaling
 };
 
 /*! \brief Long-Rope specific parameters */
@@ -203,6 +223,16 @@ struct LongRopeParams
     int32_t originalMaxPositionEmbeddings{-1}; //!< Original maximum position embeddings from training
     std::vector<float> longFactor;             //!< Long factor array for each rotary dimension
     std::vector<float> shortFactor;            //!< Short factor array for each rotary dimension
+};
+
+/*! \brief YaRN specific parameters (NTK-by-parts interpolation) */
+struct YarnParams
+{
+    int32_t originalMaxPositionEmbeddings{-1}; //!< Pre-YaRN training length; the interpolation reference
+    float factor{1.0F};                        //!< Context-extension factor (rope_scaling.factor)
+    float betaFast{32.0F};                     //!< High-frequency correction boundary (rotations)
+    float betaSlow{1.0F};                      //!< Low-frequency correction boundary (rotations)
+    float mscale{1.0F};                        //!< Attention magnitude scale applied to cos/sin
 };
 
 /*! \brief RoPE configuration structure with optional Long-Rope parameters
@@ -217,8 +247,10 @@ struct RopeConfig
     float partialRotaryFactor{1.0F};          //!< Fraction of head angles rotated by proportional RoPE
     int32_t maxPositionEmbeddings{32768};     //!< Maximum position embeddings supported
     std::optional<LongRopeParams> longRope{}; //!< Long-Rope specific parameters
+    std::optional<YarnParams> yarn{};         //!< YaRN specific parameters
 };
 
+#ifndef __CUDACC__
 /*! \brief Collect rope configuration from the model config
  *
  *  Parses the common RoPE fields as well as LongRoPE-specific parameters when the
@@ -230,6 +262,7 @@ struct RopeConfig
  *  \throws nlohmann::json::type_error if JSON value types don't match expected types
  */
 RopeConfig collectRopeConfig(nlohmann::json const& config);
+#endif // !__CUDACC__
 
 /*! \brief Initialize the rope cos/sin cache tensor for persistent type of RoPE (default, longrope)
  *

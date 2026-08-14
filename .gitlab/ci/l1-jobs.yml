@@ -17,7 +17,7 @@ l1_dataset_prep:
   stage: l1_test
   variables:
     CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
     EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
     TEST_LOG_DIR: "$L1_CACHE_DIR/dataset_prep/logs"
@@ -38,8 +38,8 @@ l1_dataset_prep:
     - export DATA="$EDGELLM_DATA_DIR/updated_datasets"
     - mkdir -p "$DATA" "$TEST_LOG_DIR"
     - cd $LLM_SDK_DIR
-    - pip install -r tests/requirements.txt
-    - pip install -r examples/accuracy/requirements.txt
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install dataset test dependencies" -- pip install -r tests/requirements.txt
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install dataset accuracy dependencies" -- pip install -r examples/accuracy/requirements.txt
     - cd examples/accuracy/scripts
     # Text / multiple choice (LLM accuracy)
     - python prepare_dataset.py --dataset MMLU --output_dir "$DATA/MMLU_five_shot" --num_shot 5 2>&1 | tee "$TEST_LOG_DIR/mmlu_5.log"
@@ -76,7 +76,7 @@ l1_ampere_export:
   stage: l1_test
   variables:
     CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
     # QA-hub pre-quantized HF checkpoints (GPTQ / NVFP4 suffix-named models)
     # let `is_prequantized()` short-circuit and skip the local quant step.
@@ -99,7 +99,7 @@ l1_ampere_export_special:
   stage: l1_test
   variables:
     CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
     # QA-hub pre-quantized HF checkpoints (GPTQ / NVFP4 suffix-named models)
     # let `is_prequantized()` short-circuit and skip the local quant step.
@@ -122,7 +122,7 @@ l1_blackwell_export_small:
   stage: l1_test
   variables:
     CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
     # QA-hub pre-quantized HF checkpoints (GPTQ / NVFP4 suffix-named models)
     # let `is_prequantized()` short-circuit and skip the local quant step.
@@ -145,7 +145,7 @@ l1_blackwell_export_large:
   stage: l1_test
   variables:
     CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
     # QA-hub pre-quantized HF checkpoints (GPTQ / NVFP4 suffix-named models)
     # let `is_prequantized()` short-circuit and skip the local quant step.
@@ -168,7 +168,7 @@ l1_blackwell_export_moe:
   stage: l1_test
   variables:
     CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
     # QA-hub pre-quantized HF checkpoints (GPTQ / NVFP4 suffix-named models)
     # let `is_prequantized()` short-circuit and skip the local quant step.
@@ -191,7 +191,7 @@ l1_blackwell_export_eagle:
   stage: l1_test
   variables:
     CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
     # QA-hub pre-quantized HF checkpoints (GPTQ / NVFP4 suffix-named models)
     # let `is_prequantized()` short-circuit and skip the local quant step.
@@ -216,7 +216,7 @@ l1_audio_export:
     - l1_ampere_export
   variables:
     CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
     # QA-hub pre-quantized HF checkpoints (GPTQ / NVFP4 suffix-named models)
     # let `is_prequantized()` short-circuit and skip the local quant step.
@@ -250,7 +250,7 @@ l1_a30_llm:
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
     LLM_MODELS_DIR: "$TORCH_DIR"
     EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
@@ -280,7 +280,7 @@ l1_a30_vlm:
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
     LLM_MODELS_DIR: "$TORCH_DIR"
     EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
@@ -311,7 +311,7 @@ l1_a30_eagle:
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
     LLM_MODELS_DIR: "$TORCH_DIR"
     EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
@@ -341,7 +341,7 @@ l1_rtx3090_trt11_llm:
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
     LLM_MODELS_DIR: "$TORCH_DIR"
     EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
@@ -372,7 +372,7 @@ l1_rtx3090_trt11_vlm:
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
     LLM_MODELS_DIR: "$TORCH_DIR"
     EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
@@ -405,7 +405,7 @@ l1_rtx5080_llm:
     CUDA_VERSION: "12.9"
     TRT_CUDA_VERSION: "12.9"
     TRT_VERSION: "10.13.3.9"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
     LLM_MODELS_DIR: "$TORCH_DIR"
     EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
@@ -437,7 +437,7 @@ l1_rtx5080_vlm:
     CUDA_VERSION: "12.9"
     TRT_CUDA_VERSION: "12.9"
     TRT_VERSION: "10.13.3.9"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
     LLM_MODELS_DIR: "$TORCH_DIR"
     EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
@@ -468,7 +468,7 @@ l1_rtx5090_llm:
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
     LLM_MODELS_DIR: "$TORCH_DIR"
     EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
@@ -499,7 +499,7 @@ l1_rtx5090_vlm:
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
     LLM_MODELS_DIR: "$TORCH_DIR"
     EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
@@ -531,7 +531,7 @@ l1_rtx5090_eagle:
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
     LLM_MODELS_DIR: "$TORCH_DIR"
     EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
@@ -567,11 +567,19 @@ l1_rtx5090_eagle:
       if [ ! -d "$VLMEVALKIT_DIR/.git" ]; then
         echo "Cloning VLMEvalKit into $VLMEVALKIT_DIR"
         mkdir -p "$(dirname "$VLMEVALKIT_DIR")"
-        git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/VLMEvalKit-mirror.git "$VLMEVALKIT_DIR" \
-          || git clone https://github.com/open-compass/VLMEvalKit.git "$VLMEVALKIT_DIR"
+        bash "$CI_PROJECT_DIR/.gitlab/ci/scripts/ci_run.sh" \
+          "$CI_GIT_TIMEOUT_SECONDS" "Clone VLMEvalKit mirror" -- \
+          git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/VLMEvalKit-mirror.git "$VLMEVALKIT_DIR"
       fi
-    - cd "$VLMEVALKIT_DIR" && git fetch --all -q && git checkout "$VLMEVALKIT_COMMIT" && cd -
-    - pip3 install -q -r "$VLMEVALKIT_DIR/requirements.txt"
+    - |
+      (
+        cd "$VLMEVALKIT_DIR"
+        bash "$CI_PROJECT_DIR/.gitlab/ci/scripts/ci_run.sh" \
+          "$CI_GIT_TIMEOUT_SECONDS" "Fetch VLMEvalKit revisions" -- \
+          git fetch --all
+        git checkout "$VLMEVALKIT_COMMIT"
+      )
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install VLMEvalKit dependencies" -- pip3 install -r "$VLMEVALKIT_DIR/requirements.txt"
 
 l1_b100_qwen:
   stage: l1_test
@@ -583,7 +591,7 @@ l1_b100_qwen:
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
     LLM_MODELS_DIR: "$TORCH_DIR"
     EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
@@ -619,7 +627,7 @@ l1_b100_misc:
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
     LLM_MODELS_DIR: "$TORCH_DIR"
     EDGELLM_DATA_DIR: "$L1_CACHE_DIR"
@@ -661,7 +669,7 @@ l1_spark:
     PRIORITY: l1_pipeline_spark
     ONNX_DIR: "$L1_CACHE_DIR/l1_blackwell_exports/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
-    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
+    ENGINE_DIR: "$L1_CACHE_DIR/l1_spark/engines"
     TRT_PACKAGE_DIR: "/usr"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_spark.csv"
   tags:
@@ -673,22 +681,22 @@ l1_spark:
     - export LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH
     - echo "CUDA version:$(nvcc --version | grep release)"
     - echo "TRT version:$(dpkg -l | grep tensorrt-libs | awk '{print $3}')"
-    - mkdir -p "$TEST_LOG_DIR" "$ENGINE_DIR"
+    - mkdir -p "$TEST_LOG_DIR" "$ENGINE_DIR" "$CI_PROJECT_DIR/.ci-reports"
     - rm -rf "$TEST_LOG_DIR"/* "$ENGINE_DIR"/*
     - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
-    - rm -rf 3rdParty/googletest 3rdParty/nlohmannJson venv/l1-spark
-    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
-    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
+    - rm -rf venv/l1-spark
     - python3 -m venv --system-site-packages venv/l1-spark
     - source venv/l1-spark/bin/activate
-    - pip3 install -q -r tests/requirements.txt
-    - pip3 install -q -r examples/accuracy/requirements.txt
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install pytest dependencies" -- pip3 install -r tests/requirements.txt
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install accuracy dependencies" -- pip3 install -r examples/accuracy/requirements.txt
     - if [ -n "$BASELINE_CSV" ]; then mkdir -p "$(dirname "$BASELINE_CSV")"; fi
-    - python3 -m pytest tests/ --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
+    - python3 -m pytest tests/ --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml="$CI_PROJECT_DIR/.ci-reports/test_report_$PRIORITY.xml"
     - ls -la "$TEST_LOG_DIR"
     - deactivate
     - echo "Pipeline end time:$(date)"
   extends:
+    - .ci_test_submodules
+    - .gitlab_junit_report
     - .l1_rules
     - .l1_environment
   interruptible: false
@@ -717,7 +725,6 @@ l1_drive_thor_1_llm:
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_drive_thor_1.csv"
   tags:
     - thor_drive-nvks
-  image: "ubuntu:24.04"
   extends:
     - .device_test_template
     - .l1_rules
@@ -748,7 +755,6 @@ l1_drive_thor_1_vlm:
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_drive_thor_1.csv"
   tags:
     - thor_drive-nvks
-  image: "ubuntu:24.04"
   extends:
     - .device_test_template
     - .l1_rules
@@ -779,7 +785,6 @@ l1_drive_thor_1_eagle:
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_drive_thor_1.csv"
   tags:
     - thor_drive-nvks
-  image: "ubuntu:24.04"
   extends:
     - .device_test_template
     - .l1_rules
@@ -810,7 +815,6 @@ l1_drive_thor_2_llm:
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_drive_thor_2.csv"
   tags:
     - thor_ts4_724-nvks
-  image: "ubuntu:24.04"
   extends:
     - .device_test_template
     - .l1_rules
@@ -841,7 +845,6 @@ l1_drive_thor_2_vlm:
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_drive_thor_2.csv"
   tags:
     - thor_ts4_724-nvks
-  image: "ubuntu:24.04"
   extends:
     - .device_test_template
     - .l1_rules
@@ -873,7 +876,6 @@ l1_drive_thor_2_eagle:
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_drive_thor_2.csv"
   tags:
     - thor_ts4_724-nvks
-  image: "ubuntu:24.04"
   extends:
     - .device_test_template
     - .l1_rules
@@ -903,7 +905,6 @@ l1_drive_thor_2_extras:
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_drive_thor_2.csv"
   tags:
     - thor_ts4_724-nvks
-  image: "ubuntu:24.04"
   extends:
     - .device_test_template
     - .l1_rules
@@ -934,7 +935,6 @@ l1_drive_thor_2_extras_blackwell:
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_drive_thor_2.csv"
   tags:
     - thor_ts4_724-nvks
-  image: "ubuntu:24.04"
   extends:
     - .device_test_template
     - .l1_rules
@@ -965,7 +965,6 @@ l1_jedha_vlm:
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_jedha.csv"
   tags:
     - jedha-edgellm-nvks
-  image: "ubuntu:24.04"
   extends:
     - .device_test_template
     - .l1_rules
@@ -998,7 +997,6 @@ l1_jedha_llm_eagle:
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_jedha.csv"
   tags:
     - jedha-edgellm-nvks
-  image: "ubuntu:24.04"
   extends:
     - .device_test_template
     - .l1_rules
@@ -1027,7 +1025,6 @@ l1_jetson_orin_llm:
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_jetson_orin.csv"
   tags:
     - p3730-k8s
-  image: "ubuntu:24.04"
   extends:
     - .device_test_template
     - .l1_rules
@@ -1056,7 +1053,6 @@ l1_jetson_orin_vlm:
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_jetson_orin.csv"
   tags:
     - p3730-k8s
-  image: "ubuntu:24.04"
   extends:
     - .device_test_template
     - .l1_rules
@@ -1086,7 +1082,6 @@ l1_jetson_orin_eagle:
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/l1_jetson_orin.csv"
   tags:
     - p3730-k8s
-  image: "ubuntu:24.04"
   extends:
     - .device_test_template
     - .l1_rules
@@ -1096,11 +1091,13 @@ l1_jetson_orin_eagle:
 # ==============================================================================
 # CLEANUP — Triggered when L1 pipeline environment is stopped
 # (auto-stop after 6 days per .l1_environment, or manually from GitLab UI).
-# Mirrors the L0 cleanup pattern in cleanup_l0_mr_cache.
+# Mirrors the L0 environment-stop pattern in delete_l0_storage.
 # ==============================================================================
 
 cleanup_l1_pipeline_cache:
   stage: .post
+  extends: .l1_rules
+  interruptible: false
   dependencies: []
   variables:
     GIT_STRATEGY: none

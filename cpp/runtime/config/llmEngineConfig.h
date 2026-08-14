@@ -43,9 +43,13 @@ enum class SpecDecodeMode : int32_t
     kEAGLE,
     kMTP,
     kDFlash,
+    kJetSpec,
     kGemma4MTP,
     kDSpark,
 };
+
+char const* specDecodeModeName(SpecDecodeMode mode) noexcept;
+bool isCachedBlockDraftMode(SpecDecodeMode mode) noexcept;
 
 //! Gemma4 MTP assistant-layer to target-layer shared-KV mapping.
 struct Gemma4MTPKVSharingEntry
@@ -72,6 +76,7 @@ struct LLMEngineConfig
     int32_t maxSupportedInputLength{};   //!< Maximum supported input length
     int32_t maxKVCacheCapacity{};        //!< Maximum KV cache capacity (sequence length)
     int64_t skipSoftmaxScaleOverride{0}; //!< skip-softmax scale-factor override (0 = disabled)
+    int32_t kvPoolPages{};               //!< Exact physical K-page count serialized in KV binding shapes
     int32_t rotaryDim{};                 //!< Rotary embedding dimension
     int32_t numDecoderLayers{};          //!< Total decoder layers (attention + linear)
     int32_t vocabSize{};                 //!< Full vocabulary size
@@ -135,12 +140,16 @@ struct LLMEngineConfig
     bool useVisionBidirectionalAttention{false};
 
     // --- Hybrid model (Mamba/GDN) state dimensions ---
-    int32_t numLinearAttnLayers{0};    //!< Number of linear attention / recurrent layers
-    int32_t recurrentStateNumHeads{0}; //!< Recurrent state heads (hv for GDN, mamba_num_heads for Mamba)
-    int32_t recurrentStateHeadDim{0};  //!< Recurrent state head dimension
-    int32_t recurrentStateSize{0};     //!< Recurrent state dimension (v for GDN, dstate for Mamba)
-    int32_t convDim{0};                //!< Conv1d channel dimension
-    int32_t convKernel{0};             //!< Conv1d kernel width
+    int32_t numLinearAttnLayers{0};     //!< Number of linear attention / recurrent layers
+    int32_t recurrentStateNumHeads{0};  //!< Recurrent state heads (hv for GDN, mamba_num_heads for Mamba)
+    int32_t recurrentStateHeadDim{0};   //!< Recurrent state head dimension
+    int32_t recurrentStateSize{0};      //!< Recurrent state dimension (v for GDN, dstate for Mamba)
+    int32_t recurrentStateNumGroups{0}; //!< Mamba B/C group count (spec-verify replay-B extent; 0 for GDN)
+    //! MTP spec-verify recurrent-state commit mode, parsed from `recurrent_spec_verify_mode`
+    //! ("replay" → true, "snapshot"/absent → false).
+    bool recurrentSpecVerifyUsesReplay{false};
+    int32_t convDim{0};    //!< Conv1d channel dimension
+    int32_t convKernel{0}; //!< Conv1d kernel width
 
     // --- SpecDecode engine limits (per-engine) ---
     //! Max seq_len the base engine accepts for proposal verification. Parsed from
@@ -164,14 +173,20 @@ struct LLMEngineConfig
     //! `DeploymentConfig::specDecode->baseOutputHiddenDim`.
     int32_t baseModelHiddenSize{0};
 
-    //! Cached draft proposal block size for DFlash/DSpark. Parsed from the
-    //! mode-specific config object (`dflash_config` or `dspark_config`).
+    //! Cached draft proposal block size for DFlash/JetSpec/DSpark. Parsed from the
+    //! mode-specific config object (`dflash_config`, `jetspec_config`, or `dspark_config`).
     int32_t specDraftBlockSize{0};
 
-    //! Mask token ID used to seed cached draft input blocks for DFlash/DSpark.
+    //! Mask token ID used to seed cached draft input blocks for DFlash/JetSpec/DSpark.
     int32_t specDraftMaskTokenId{0};
 
+    //! Whether cached draft proposal self-attention is causal. JetSpec uses causal rows.
+    bool specDraftCausalHead{false};
+
     //! Target decoder-layer IDs whose hidden states are concatenated for cached drafts.
+    //! EAGLE base engines own this contract through `eagle_hidden_state_layers`;
+    //! DFlash/DSpark keep their mode-specific target-layer metadata on the engine
+    //! that exports it.
     std::vector<int32_t> specTargetLayerIds{};
 
     // --- Gemma4 MTP shared-target-KV metadata ---
@@ -295,6 +310,9 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath);
 
 //! Format the config as a human-readable string (for logging).
 std::string formatEngineConfig(LLMEngineConfig const& config);
+
+bool isCachedBlockDraftBase(LLMEngineConfig const& config) noexcept;
+bool isCachedBlockDraftDraft(LLMEngineConfig const& config) noexcept;
 
 //! Cross-check an engine's KV / recurrent / conv binding dtypes against their
 //! parsed-config counterparts. The parsed config is the source of truth; this

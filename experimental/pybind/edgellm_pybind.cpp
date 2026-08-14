@@ -22,12 +22,14 @@
 #include <pybind11/stl.h>
 #include <pybind11/stl/filesystem.h>
 
+#include "builder/audioBuilder.h"
 #include "builder/llmBuilder.h"
 #include "builder/visualBuilder.h"
 #include "common/checkMacros.h"
 #include "common/logger.h"
 #include "common/tensor.h"
 #include "common/trtUtils.h"
+#include "multimodal/qwen3_omni/code2WavRunner.h"
 #include "profiling/metrics.h"
 #include "runtime/audioLoader.h"
 #include "runtime/audioUtils.h"
@@ -35,11 +37,16 @@
 #include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/melSpectrogram.h"
+#include "runtime/qwen3OmniTTSRuntime.h"
+#include "runtime/streaming.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -101,29 +108,158 @@ private:
     cudaStream_t mStream{nullptr};
 };
 
+//! Talker / streaming knobs for one Omni audio request. Defaults match
+//! examples/llm/llm_inference.cpp.
+struct OmniAudioParams
+{
+    float talkerTemperature{0.9f};
+    int32_t talkerTopK{50};
+    float talkerTopP{1.0f};
+    float repetitionPenalty{1.05f};
+    int32_t maxAudioLength{4096};
+    std::string speakerName{""};
+    int32_t codecChunkFrames{10};      //!< Vocode every N Talker frames.
+    int32_t talkerPrefillThreshold{4}; //!< Thinker tokens before Talker prefill.
+};
+
+//! Convert a CPU-resident FP16/FP32 waveform tensor ([-1, 1]) to int16 PCM bytes.
+std::string waveformToPcm16(rt::Tensor const& waveform)
+{
+    constexpr float kPcm16MaxAmplitude = 32767.0f;
+    ELLM_CHECK(waveform.getDeviceType() == rt::DeviceType::kCPU, "waveform must be CPU-resident");
+    int64_t const numDims = waveform.getShape().getNumDims();
+    int64_t const numSamples = waveform.getShape()[numDims - 1];
+    bool const isFP32 = (waveform.getDataType() == nvinfer1::DataType::kFLOAT);
+    float const* fp32Data = isFP32 ? static_cast<float const*>(waveform.rawPointer()) : nullptr;
+    __half const* fp16Data = isFP32 ? nullptr : static_cast<__half const*>(waveform.rawPointer());
+
+    std::string out(static_cast<size_t>(numSamples) * sizeof(int16_t), '\0');
+    auto* dst = reinterpret_cast<int16_t*>(out.data());
+    for (int64_t i = 0; i < numSamples; ++i)
+    {
+        float const sample = isFP32 ? fp32Data[i] : __half2float(fp16Data[i]);
+        float const clamped = std::max(-1.0f, std::min(1.0f, sample));
+        dst[i] = static_cast<int16_t>(clamped * kPcm16MaxAmplitude);
+    }
+    return out;
+}
+
+//! Build the RVQ-chunk callback shared by the Omni streaming and standalone
+//! TTS paths: transpose to layer-major, vocode, push PCM. `vocodeFailed` must
+//! outlive the generation call; once set, later chunks are skipped and the
+//! caller raises after generation returns.
+Qwen3OmniTTSRuntime::AudioChunkCallback makeChunkVocodeCallback(Code2WavRunner& code2wav, cudaStream_t stream,
+    std::shared_ptr<AudioStreamChannel> const& audioChannel, bool& vocodeFailed)
+{
+    return [&code2wav, stream, audioChannel, &vocodeFailed](
+               std::vector<std::vector<int32_t>> const& chunkCodes, bool isFinal) {
+        AudioChunk chunk;
+        chunk.isFinal = isFinal;
+        bool const skip = audioChannel->isCancelled() || vocodeFailed;
+        if (!skip && !chunkCodes.empty() && !chunkCodes[0].empty())
+        {
+            size_t const numFrames = chunkCodes.size();
+            size_t const numLayers = chunkCodes[0].size();
+            std::vector<std::vector<int32_t>> transposed(numLayers, std::vector<int32_t>(numFrames));
+            for (size_t f = 0; f < numFrames; ++f)
+            {
+                for (size_t l = 0; l < numLayers; ++l)
+                {
+                    transposed[l][f] = chunkCodes[f][l];
+                }
+            }
+            audioUtils::AudioData chunkAudio;
+            if (code2wav.generateWaveform(transposed, chunkAudio, stream) && chunkAudio.hasWaveform)
+            {
+                chunk.pcm16 = waveformToPcm16(*chunkAudio.waveform);
+                chunk.numFrames = static_cast<int32_t>(numFrames);
+            }
+            else
+            {
+                LOG_ERROR("Code2Wav vocoding failed on a %zu-frame chunk; aborting audio stream", numFrames);
+                vocodeFailed = true;
+            }
+        }
+        audioChannel->push(std::move(chunk));
+        if (isFinal)
+        {
+            audioChannel->finish();
+        }
+    };
+}
+
+//! Run one standalone TTS request (Qwen3-TTS-style: text → Talker →
+//! CodePredictor → Code2Wav → channel, no Thinker pass). Returns the number
+//! of codec frames generated. Shared by PyLLMRuntime and PyTTSRuntime.
+int32_t runStandaloneTTS(Qwen3OmniTTSRuntime& ttsRuntime, Code2WavRunner& code2wav, cudaStream_t stream,
+    std::string const& text, OmniAudioParams const& params, std::shared_ptr<AudioStreamChannel> const& audioChannel)
+{
+    ELLM_CHECK(audioChannel != nullptr, "audio_channel must not be null");
+    ELLM_CHECK(!audioChannel->isFinished(), "audio_channel is already finished");
+    ELLM_CHECK(params.codecChunkFrames > 0, "codec_chunk_frames must be > 0");
+
+    Qwen3OmniTTSRuntime::TalkerGenerationRequest talkerReq;
+    talkerReq.maxAudioLength = params.maxAudioLength;
+    talkerReq.talkerTemperature = params.talkerTemperature;
+    talkerReq.talkerTopK = params.talkerTopK;
+    talkerReq.talkerTopP = params.talkerTopP;
+    talkerReq.repetitionPenalty = params.repetitionPenalty;
+    talkerReq.speakerName = params.speakerName;
+    // TTS reads the text as assistant speech (see docs/…/tts.md input format).
+    Message message;
+    message.role = "assistant";
+    message.contents.push_back({"text", text});
+    talkerReq.messages.push_back(std::move(message));
+    talkerReq.streamingChunkFrames = params.codecChunkFrames;
+    bool vocodeFailed = false;
+    talkerReq.onChunkReady = makeChunkVocodeCallback(code2wav, stream, audioChannel, vocodeFailed);
+
+    Qwen3OmniTTSRuntime::TalkerGenerationResponse talkerResponse;
+    bool success = false;
+    try
+    {
+        success = ttsRuntime.handleAudioGeneration(talkerReq, talkerResponse, stream);
+    }
+    catch (...)
+    {
+        audioChannel->finish();
+        throw;
+    }
+    // Covers failure paths where the isFinal callback never fired.
+    audioChannel->finish();
+    ELLM_CHECK(success, "TTS generation failed");
+    ELLM_CHECK(!vocodeFailed, "Code2Wav vocoding failed mid-stream; audio output is incomplete");
+    return talkerResponse.batchRvqCodes.empty() ? 0 : static_cast<int32_t>(talkerResponse.batchRvqCodes[0].size());
+}
+
 //! Unified Python wrapper for LLMInferenceRuntime.
-//! Supports both vanilla decoding (no draft model) and Eagle speculative decoding
+//! Supports both vanilla decoding and the runtime's speculative decoders
 //! through constructor overloading — mirrors the C++ unified runtime.
 class PyLLMRuntime
 {
 public:
-    //! Vanilla constructor (no speculative decoding).
+    //! Vanilla constructor (no speculative decoding). The trailing
+    //! contextCacheConfig defaults to a disabled config, leaving the existing
+    //! identity-page runtime path unchanged when callers omit it.
     PyLLMRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
-        std::unordered_map<std::string, std::string> const& loraWeightsMap)
+        std::unordered_map<std::string, std::string> const& loraWeightsMap, std::string const& checkpointDir,
+        ContextCacheConfig const& contextCacheConfig)
     {
         mPluginHandle = loadEdgellmPluginLib();
-        mRuntime = std::make_unique<LLMInferenceRuntime>(engineDir, multimodalEngineDir, loraWeightsMap, mStream.get());
+        mRuntime = std::make_unique<LLMInferenceRuntime>(
+            engineDir, multimodalEngineDir, loraWeightsMap, mStream.get(), contextCacheConfig, checkpointDir);
     }
 
-    //! Eagle speculative decoding constructor.
+    //! Speculative decoding constructor.
     PyLLMRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, int32_t draftTopK, int32_t draftStep,
-        int32_t verifyTreeSize)
+        int32_t verifyTreeSize, std::string const& checkpointDir, std::string const& draftCheckpointDir,
+        ContextCacheConfig const& contextCacheConfig)
     {
         mPluginHandle = loadEdgellmPluginLib();
         SpecDecodeDraftingConfig draftingConfig{draftTopK, draftStep, verifyTreeSize};
-        mRuntime = std::make_unique<LLMInferenceRuntime>(
-            engineDir, multimodalEngineDir, loraWeightsMap, draftingConfig, mStream.get());
+        mRuntime = std::make_unique<LLMInferenceRuntime>(engineDir, multimodalEngineDir, loraWeightsMap, draftingConfig,
+            mStream.get(), contextCacheConfig, checkpointDir, draftCheckpointDir);
     }
 
     LLMGenerationResponse handleRequest(LLMGenerationRequest const& request)
@@ -132,6 +268,97 @@ public:
         bool const success = mRuntime->handleRequest(request, response, mStream.get());
         ELLM_CHECK(success, "Failed to handle generation request");
         return response;
+    }
+
+    //! Load the Qwen3-Omni audio-output stack (Talker + CodePredictor + Code2Wav).
+    //! tokenizerDir is normally the Thinker engine dir.
+    void loadOmni(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
+        std::string const& code2wavEngineDir, std::string const& tokenizerDir, std::string const& checkpointDir)
+    {
+        // Voice-clone reference encoders are not wired into the server yet.
+        mTtsRuntime = std::make_unique<Qwen3OmniTTSRuntime>(talkerEngineDir, codePredictorEngineDir, tokenizerDir,
+            /*cloneEncoderDir=*/"", mStream.get(), checkpointDir);
+        mCode2wavRunner = std::make_unique<Code2WavRunner>(code2wavEngineDir, mStream.get(), checkpointDir);
+        if (!mTtsRuntime->captureDecodingCUDAGraph(mStream.get()))
+        {
+            LOG_WARNING("CUDA graph capture failed for TTS decoding, proceeding without.");
+        }
+    }
+
+    //! Thinker-Talker streaming generation. Text streams through the request's
+    //! stream_channels as usual; vocoded PCM chunks stream through audioChannel.
+    //! Runs synchronously — call from a worker thread and pop both channels.
+    LLMGenerationResponse handleRequestStreamingAudio(LLMGenerationRequest& request,
+        std::shared_ptr<AudioStreamChannel> const& audioChannel, OmniAudioParams const& params)
+    {
+        ELLM_CHECK(
+            mTtsRuntime != nullptr && mCode2wavRunner != nullptr, "Omni runtime not loaded. Call load_omni() first.");
+        ELLM_CHECK(audioChannel != nullptr, "audio_channel must not be null");
+        ELLM_CHECK(!audioChannel->isFinished(), "audio_channel is already finished");
+
+        request.generateAudio = true;
+
+        Qwen3OmniTTSRuntime::OmniGenerationRequest omniReq;
+        omniReq.talkerTemperature = params.talkerTemperature;
+        omniReq.talkerTopK = params.talkerTopK;
+        omniReq.talkerTopP = params.talkerTopP;
+        omniReq.repetitionPenalty = params.repetitionPenalty;
+        omniReq.maxAudioLength = params.maxAudioLength;
+        omniReq.speakerName = params.speakerName;
+
+        Qwen3OmniTTSRuntime::ThinkerTalkerStreamingConfig streamCfg;
+        streamCfg.talkerPrefillThreshold = params.talkerPrefillThreshold;
+        streamCfg.codecChunkFrames = params.codecChunkFrames;
+        bool vocodeFailed = false;
+        streamCfg.onAudioChunkReady
+            = makeChunkVocodeCallback(*mCode2wavRunner, mStream.get(), audioChannel, vocodeFailed);
+
+        LLMGenerationResponse thinkerResponse;
+        Qwen3OmniTTSRuntime::TalkerGenerationResponse talkerResponse;
+        bool success = false;
+        try
+        {
+            success = mTtsRuntime->handleStreamingGeneration(
+                *mRuntime, request, thinkerResponse, streamCfg, omniReq, talkerResponse, mStream.get());
+        }
+        catch (...)
+        {
+            audioChannel->finish();
+            throw;
+        }
+        // Covers failure paths where the isFinal callback never fired.
+        audioChannel->finish();
+        ELLM_CHECK(success, "Streaming Omni generation failed");
+        ELLM_CHECK(!vocodeFailed, "Code2Wav vocoding failed mid-stream; audio output is incomplete");
+        // success=false with zero frames is the legit degenerate case (thinker
+        // reply shorter than the prefill threshold) — deliver text with empty
+        // audio. With frames already emitted it means the Talker errored and
+        // the audio is truncated, which must not pass silently.
+        bool const talkerTruncated = !talkerResponse.success && !talkerResponse.numFramesPerSample.empty()
+            && talkerResponse.numFramesPerSample[0] > 0;
+        ELLM_CHECK(!talkerTruncated, "Talker generation failed mid-stream; audio output is truncated");
+        return thinkerResponse;
+    }
+
+    //! Standalone TTS on the loaded Omni stack: synthesize speech for `text`
+    //! directly, without a Thinker generation pass.
+    int32_t handleRequestTTS(
+        std::string const& text, OmniAudioParams const& params, std::shared_ptr<AudioStreamChannel> const& audioChannel)
+    {
+        ELLM_CHECK(
+            mTtsRuntime != nullptr && mCode2wavRunner != nullptr, "Omni runtime not loaded. Call load_omni() first.");
+        return runStandaloneTTS(*mTtsRuntime, *mCode2wavRunner, mStream.get(), text, params, audioChannel);
+    }
+
+    std::vector<std::string> getSpeakerNames() const
+    {
+        ELLM_CHECK(mTtsRuntime != nullptr, "Omni runtime not loaded. Call load_omni() first.");
+        return mTtsRuntime->getSpeakerNames();
+    }
+
+    std::vector<int32_t> countPromptTokens(LLMGenerationRequest const& request) const
+    {
+        return mRuntime->countPromptTokens(request);
     }
 
     bool captureDecodingCudaGraph()
@@ -169,10 +396,56 @@ public:
         return mRuntime->getMultimodalMetrics();
     }
 
+    std::optional<ContextCacheMetrics> getContextCacheMetrics() const
+    {
+        return mRuntime->getContextCacheMetrics();
+    }
+
 private:
     CudaStreamWrapper mStream;
     std::unique_ptr<void, DlDeleter> mPluginHandle;
     std::unique_ptr<LLMInferenceRuntime> mRuntime;
+    std::unique_ptr<Qwen3OmniTTSRuntime> mTtsRuntime;
+    std::unique_ptr<Code2WavRunner> mCode2wavRunner;
+};
+
+//! TTS-only runtime for Qwen3-TTS-style deployments: Talker + CodePredictor +
+//! Code2Wav, no Thinker engine. An empty tokenizer_dir falls back to the
+//! talker dir, which carries the tokenizer files in the standard export
+//! layout.
+class PyTTSRuntime
+{
+public:
+    PyTTSRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
+        std::string const& code2wavEngineDir, std::string const& tokenizerDir, std::string const& checkpointDir)
+    {
+        mPluginHandle = loadEdgellmPluginLib();
+        std::string const& tokenizer = tokenizerDir.empty() ? talkerEngineDir : tokenizerDir;
+        mTtsRuntime = std::make_unique<Qwen3OmniTTSRuntime>(
+            talkerEngineDir, codePredictorEngineDir, tokenizer, /*cloneEncoderDir=*/"", mStream.get(), checkpointDir);
+        mCode2wavRunner = std::make_unique<Code2WavRunner>(code2wavEngineDir, mStream.get(), checkpointDir);
+        if (!mTtsRuntime->captureDecodingCUDAGraph(mStream.get()))
+        {
+            LOG_WARNING("CUDA graph capture failed for TTS decoding, proceeding without.");
+        }
+    }
+
+    int32_t handleRequestTTS(
+        std::string const& text, OmniAudioParams const& params, std::shared_ptr<AudioStreamChannel> const& audioChannel)
+    {
+        return runStandaloneTTS(*mTtsRuntime, *mCode2wavRunner, mStream.get(), text, params, audioChannel);
+    }
+
+    std::vector<std::string> getSpeakerNames() const
+    {
+        return mTtsRuntime->getSpeakerNames();
+    }
+
+private:
+    CudaStreamWrapper mStream;
+    std::unique_ptr<void, DlDeleter> mPluginHandle;
+    std::unique_ptr<Qwen3OmniTTSRuntime> mTtsRuntime;
+    std::unique_ptr<Code2WavRunner> mCode2wavRunner;
 };
 
 imageUtils::ImageData loadImageFromPath(std::string const& path)
@@ -190,10 +463,11 @@ imageUtils::ImageData loadImageFromBytes(py::bytes const& data)
 //! Decodes via vendored miniaudio (16 kHz mono FP32) and hands raw PCM off to
 //! the runner; mel extraction happens inside the audio runner per its
 //! ``audio/config.json``.
-audioUtils::AudioData loadAudioBufferFromBytes(py::bytes data)
+//! Takes std::string (not py::bytes) so the argument caster copies the bytes
+//! while the GIL is held; the pure-C++ body then runs under gil_scoped_release.
+audioUtils::AudioData loadAudioBufferFromBytes(std::string const& dataStr)
 {
     constexpr int32_t kTargetSampleRate = 16000;
-    std::string dataStr = data;
     audioUtils::AudioData audio;
     if (!audioUtils::loadAudioDataFromBytes(
             reinterpret_cast<uint8_t const*>(dataStr.data()), dataStr.size(), kTargetSampleRate, audio))
@@ -312,6 +586,48 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readonly("total_image_tokens", &metrics::MultimodalMetrics::totalImageTokens)
         .def("get_total_runs", &metrics::MultimodalMetrics::getTotalRuns);
 
+    py::class_<ContextCachePoolMetrics>(m, "ContextCachePoolMetrics")
+        .def_readonly("free", &ContextCachePoolMetrics::free)
+        .def_readonly("capacity", &ContextCachePoolMetrics::capacity);
+
+    py::class_<ContextCacheMetrics>(m, "ContextCacheMetrics")
+        .def_readonly("admitted_sequences", &ContextCacheMetrics::admittedSequences)
+        .def_readonly("hit_sequences", &ContextCacheMetrics::hitSequences)
+        .def_readonly("lookup_bypass_sequences", &ContextCacheMetrics::lookupBypassSequences)
+        .def_readonly("forced_cold_sequences", &ContextCacheMetrics::forcedColdSequences)
+        .def_readonly("standard_plans", &ContextCacheMetrics::standardPlans)
+        .def_readonly("no_reusable_prefix_plans", &ContextCacheMetrics::noReusablePrefixPlans)
+        .def_readonly("full_input_rewind_plans", &ContextCacheMetrics::fullInputRewindPlans)
+        .def_readonly("matched_tokens", &ContextCacheMetrics::matchedTokens)
+        .def_readonly("reused_tokens", &ContextCacheMetrics::reusedTokens)
+        .def_readonly("publication_attempts", &ContextCacheMetrics::publicationAttempts)
+        .def_readonly("committed_publications", &ContextCacheMetrics::committedPublications)
+        .def_readonly("existing_publications", &ContextCacheMetrics::existingPublications)
+        .def_readonly("published_endpoints", &ContextCacheMetrics::publishedEndpoints)
+        .def_readonly("hybrid_restores", &ContextCacheMetrics::hybridRestores)
+        .def_readonly("hybrid_snapshot_pressure_skips", &ContextCacheMetrics::hybridSnapshotPressureSkips)
+        .def_readonly("hybrid_capture_synchronizations", &ContextCacheMetrics::hybridCaptureSynchronizations)
+        .def_readonly("spec_full_page_replays", &ContextCacheMetrics::specFullPageReplays)
+        .def_readonly("spec_pair_publications", &ContextCacheMetrics::specPairPublications)
+        .def_readonly("planning_nanoseconds", &ContextCacheMetrics::planningNanoseconds)
+        .def_readonly("current_records", &ContextCacheMetrics::currentRecords)
+        .def_readonly("base_kv_pages", &ContextCacheMetrics::baseKvPages)
+        .def_readonly("draft_kv_pages", &ContextCacheMetrics::draftKvPages)
+        .def_readonly("recurrent_snapshots", &ContextCacheMetrics::recurrentSnapshots)
+        .def_readonly("partial_kv_snapshots", &ContextCacheMetrics::partialKvSnapshots)
+        .def_readonly("evicted_records", &ContextCacheMetrics::evictedRecords)
+        .def_readonly("reclaimed_base_kv_pages", &ContextCacheMetrics::reclaimedBaseKvPages)
+        .def_readonly("reclaimed_draft_kv_pages", &ContextCacheMetrics::reclaimedDraftKvPages)
+        .def_readonly("reclaimed_recurrent_snapshots", &ContextCacheMetrics::reclaimedRecurrentSnapshots)
+        .def_readonly("reclaimed_partial_kv_snapshots", &ContextCacheMetrics::reclaimedPartialKvSnapshots);
+
+    py::class_<ContextCacheConfig>(m, "ContextCacheConfig")
+        .def(py::init<>())
+        .def_readwrite("enabled", &ContextCacheConfig::enabled)
+        .def_readwrite("max_records", &ContextCacheConfig::maxRecords)
+        .def_readwrite("recurrent_snapshot_pool_bytes", &ContextCacheConfig::recurrentSnapshotPoolBytes)
+        .def_readwrite("partial_kv_snapshot_pool_bytes", &ContextCacheConfig::partialKvSnapshotPoolBytes);
+
     // ========================================================================
     // Image utilities
     // ========================================================================
@@ -321,6 +637,8 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readonly("height", &imageUtils::ImageData::height)
         .def_readonly("channels", &imageUtils::ImageData::channels)
         .def_readonly("frames", &imageUtils::ImageData::frames)
+        .def_readonly("is_video", &imageUtils::ImageData::isVideo)
+        .def_readonly("timestamps", &imageUtils::ImageData::timestamps)
         .def_readwrite("fps", &imageUtils::ImageData::fps)
         .def_readwrite("do_resize", &imageUtils::ImageData::doResize);
 
@@ -328,12 +646,23 @@ PYBIND11_MODULE(_edgellm_runtime, m)
     m.def("load_image_from_bytes", &loadImageFromBytes, py::arg("data"), "Load image from bytes");
     m.def(
         "load_video_from_paths",
-        [](std::vector<std::string> const& framePaths, double fps) {
+        [](std::vector<std::string> const& framePaths, double fps, std::vector<double> const& timestamps) {
             check::check(std::isfinite(fps) && fps > 0.0, "fps must be a positive finite number");
-            return imageUtils::loadVideoFromFrames(framePaths, fps);
+            check::check(timestamps.empty() || timestamps.size() == framePaths.size(),
+                "timestamps must be empty or have one entry per frame");
+            for (double const ts : timestamps)
+            {
+                check::check(std::isfinite(ts), "timestamps must be finite");
+            }
+            imageUtils::ImageData video = imageUtils::loadVideoFromFrames(framePaths, fps);
+            video.timestamps = timestamps;
+            return video;
         },
-        py::arg("frame_paths"), py::arg("fps") = 1.0,
+        py::arg("frame_paths"), py::arg("fps") = 1.0, py::arg("timestamps") = std::vector<double>{},
+        py::call_guard<py::gil_scoped_release>(),
         "Load a video by stacking identically-sized image files into one (T, H, W, 3) ImageData");
+    // No gil_scoped_release for load_video_from_array: its body reads the
+    // py::array buffer, which requires the GIL.
     m.def("load_video_from_array", &loadVideoFromArray, py::arg("array"), py::arg("fps") = 1.0,
         py::arg("timestamps") = std::vector<double>{}, "Build a video ImageData from a (T, H, W, 3) uint8 numpy array");
 
@@ -342,9 +671,16 @@ PYBIND11_MODULE(_edgellm_runtime, m)
     // ========================================================================
     py::class_<audioUtils::AudioData>(m, "AudioData")
         .def(py::init<>())
-        .def_readwrite("sample_rate", &audioUtils::AudioData::sampleRate);
+        .def_readwrite("sample_rate", &audioUtils::AudioData::sampleRate)
+        .def_property_readonly(
+            "num_samples",
+            [](audioUtils::AudioData const& audio) {
+                return audio.pcm ? static_cast<int64_t>(audio.pcm->samples.size()) : int64_t{0};
+            },
+            "Number of decoded PCM samples (0 when no PCM is attached)");
 
     m.def("load_audio_buffer_from_bytes", &loadAudioBufferFromBytes, py::arg("data"),
+        py::call_guard<py::gil_scoped_release>(),
         "Build an AudioData from raw encoded audio bytes (wav/mp3/flac). "
         "Decodes to mono FP32 PCM @ 16 kHz via miniaudio; the audio runner "
         "extracts mel internally per its audio/config.json.");
@@ -440,6 +776,7 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def(py::init<>())
         .def_readonly("token_ids", &StreamChunk::tokenIds)
         .def_readonly("text", &StreamChunk::text)
+        .def_readonly("prompt_token_count", &StreamChunk::promptTokenCount)
         .def_readonly("finished", &StreamChunk::finished)
         .def_readonly("reason", &StreamChunk::reason)
         .def_readonly("logprobs", &StreamChunk::logprobs);
@@ -461,8 +798,49 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def("get_skip_special_tokens", &StreamChannel::getSkipSpecialTokens);
 
     // ========================================================================
+    // Omni audio streaming
+    // ========================================================================
+    py::class_<AudioChunk>(m, "AudioChunk")
+        .def_property_readonly(
+            "pcm16", [](AudioChunk const& c) { return py::bytes(c.pcm16); }, "Little-endian int16 mono PCM samples")
+        .def_readonly("is_final", &AudioChunk::isFinal)
+        .def_readonly("num_frames", &AudioChunk::numFrames);
+
+    py::class_<AudioStreamChannel, std::shared_ptr<AudioStreamChannel>>(m, "AudioStreamChannel")
+        .def(py::init<>())
+        .def("try_pop", [](AudioStreamChannel& self) { return self.waitPop(std::chrono::milliseconds{0}); })
+        .def(
+            "wait_pop",
+            [](AudioStreamChannel& self, int64_t timeoutMs) {
+                return self.waitPop(std::chrono::milliseconds{timeoutMs});
+            },
+            py::arg("timeout_ms"), py::call_guard<py::gil_scoped_release>())
+        .def("is_finished", &AudioStreamChannel::isFinished)
+        .def("is_cancelled", &AudioStreamChannel::isCancelled)
+        .def("cancel", &AudioStreamChannel::cancel);
+
+    py::class_<OmniAudioParams>(m, "OmniAudioParams")
+        .def(py::init<>())
+        .def_readwrite("talker_temperature", &OmniAudioParams::talkerTemperature)
+        .def_readwrite("talker_top_k", &OmniAudioParams::talkerTopK)
+        .def_readwrite("talker_top_p", &OmniAudioParams::talkerTopP)
+        .def_readwrite("repetition_penalty", &OmniAudioParams::repetitionPenalty)
+        .def_readwrite("max_audio_length", &OmniAudioParams::maxAudioLength)
+        .def_readwrite("speaker_name", &OmniAudioParams::speakerName)
+        .def_readwrite("codec_chunk_frames", &OmniAudioParams::codecChunkFrames)
+        .def_readwrite("talker_prefill_threshold", &OmniAudioParams::talkerPrefillThreshold);
+
+    // ========================================================================
     // Request / Response (continued)
     // ========================================================================
+    py::enum_<ContextCacheLookupPolicy>(m, "ContextCacheLookupPolicy")
+        .value("USE_CACHE", ContextCacheLookupPolicy::kUseCache)
+        .value("BYPASS", ContextCacheLookupPolicy::kBypass);
+
+    py::enum_<ContextCacheCommitPolicy>(m, "ContextCacheCommitPolicy")
+        .value("INCLUDING_GENERATED_TOKENS", ContextCacheCommitPolicy::kIncludingGeneratedTokens)
+        .value("PREFILL_STATE_ONLY", ContextCacheCommitPolicy::kPrefillStateOnly);
+
     py::class_<LLMGenerationRequest>(m, "LLMGenerationRequest")
         .def(py::init<>())
         .def_readwrite("requests", &LLMGenerationRequest::requests)
@@ -477,32 +855,51 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readwrite("add_generation_prompt", &LLMGenerationRequest::addGenerationPrompt)
         .def_readwrite("enable_thinking", &LLMGenerationRequest::enableThinking)
         .def_readwrite("disable_spec_decode", &LLMGenerationRequest::disableSpecDecode)
+        .def_readwrite("recurrent_capture_interval", &LLMGenerationRequest::recurrentCaptureInterval)
         .def_readwrite("stream_channels", &LLMGenerationRequest::streamChannels)
-        .def_readwrite("num_logprobs", &LLMGenerationRequest::numLogprobs);
+        .def_readwrite("num_logprobs", &LLMGenerationRequest::numLogprobs)
+        .def_readwrite("context_cache_lookup_policy", &LLMGenerationRequest::contextCacheLookupPolicy)
+        .def_readwrite("context_cache_commit_policy", &LLMGenerationRequest::contextCacheCommitPolicy)
+        .def_readwrite("context_cache_replay_tail_length", &LLMGenerationRequest::contextCacheReplayTailLength);
 
     py::class_<LLMGenerationResponse>(m, "LLMGenerationResponse")
         .def(py::init<>())
         .def_readwrite("output_ids", &LLMGenerationResponse::outputIds)
         .def_readwrite("output_texts", &LLMGenerationResponse::outputTexts)
         .def_readwrite("logprobs", &LLMGenerationResponse::logprobs)
-        .def_readonly("finish_reasons", &LLMGenerationResponse::finishReasons);
+        .def_readonly("finish_reasons", &LLMGenerationResponse::finishReasons)
+        .def_readonly("prompt_token_counts", &LLMGenerationResponse::inputTokenCounts);
 
     // ========================================================================
     // Runtime: unified (vanilla + Eagle speculative decoding)
     // ========================================================================
-    py::class_<PyLLMRuntime>(m, "LLMRuntime",
-        "Unified LLM inference runtime. Supports both vanilla decoding and Eagle speculative decoding.")
-        .def(py::init<std::string const&, std::string const&, std::unordered_map<std::string, std::string> const&>(),
+    py::class_<PyLLMRuntime>(m, "LLMRuntime", "Unified LLM inference runtime with optional speculative decoding.")
+        .def(py::init<std::string const&, std::string const&, std::unordered_map<std::string, std::string> const&,
+                 std::string const&, ContextCacheConfig const&>(),
             py::arg("engine_dir"), py::arg("multimodal_engine_dir") = "",
             py::arg("lora_weights_map") = std::unordered_map<std::string, std::string>{},
+            py::arg("checkpoint_dir") = "", py::arg("context_cache_config") = ContextCacheConfig{},
             "Construct for vanilla (non-speculative) decoding")
         .def(py::init<std::string const&, std::string const&, std::unordered_map<std::string, std::string> const&,
-                 int32_t, int32_t, int32_t>(),
+                 int32_t, int32_t, int32_t, std::string const&, std::string const&, ContextCacheConfig const&>(),
             py::arg("engine_dir"), py::arg("multimodal_engine_dir"), py::arg("lora_weights_map"),
-            py::arg("draft_top_k"), py::arg("draft_step"), py::arg("verify_tree_size"),
-            "Construct for Eagle speculative decoding")
+            py::arg("draft_top_k"), py::arg("draft_step"), py::arg("verify_tree_size"), py::arg("checkpoint_dir") = "",
+            py::arg("draft_checkpoint_dir") = "", py::arg("context_cache_config") = ContextCacheConfig{},
+            "Construct for speculative decoding")
         .def("handle_request", &PyLLMRuntime::handleRequest, py::arg("request"),
             py::call_guard<py::gil_scoped_release>(), "Process a generation request and return the response")
+        .def("load_omni", &PyLLMRuntime::loadOmni, py::arg("talker_engine_dir"), py::arg("code_predictor_engine_dir"),
+            py::arg("code2wav_engine_dir"), py::arg("tokenizer_dir"), py::arg("checkpoint_dir") = "",
+            "Load the Qwen3-Omni audio-output stack (Talker + CodePredictor + Code2Wav)")
+        .def("handle_request_streaming_audio", &PyLLMRuntime::handleRequestStreamingAudio, py::arg("request"),
+            py::arg("audio_channel"), py::arg("params"), py::call_guard<py::gil_scoped_release>(),
+            "Thinker-Talker streaming generation with PCM chunks pushed to audio_channel")
+        .def("handle_request_tts", &PyLLMRuntime::handleRequestTTS, py::arg("text"), py::arg("params"),
+            py::arg("audio_channel"), py::call_guard<py::gil_scoped_release>(),
+            "Standalone TTS on the loaded Omni stack; returns the number of codec frames generated")
+        .def("get_speaker_names", &PyLLMRuntime::getSpeakerNames)
+        .def("count_prompt_tokens", &PyLLMRuntime::countPromptTokens, py::arg("request"),
+            py::call_guard<py::gil_scoped_release>(), "Handle an explicit text token-count request")
         .def("capture_decoding_cuda_graph", &PyLLMRuntime::captureDecodingCudaGraph,
             "Capture CUDA graphs for optimized decoding")
         .def("save_system_prompt_kv_cache", &PyLLMRuntime::saveSystemPromptKVCache, py::arg("prompt"),
@@ -514,7 +911,19 @@ PYBIND11_MODULE(_edgellm_runtime, m)
             py::return_value_policy::reference_internal)
         .def("get_eagle_generation_metrics", &PyLLMRuntime::getSpecDecodeGenerationMetrics,
             py::return_value_policy::reference_internal) // deprecated alias
-        .def("get_multimodal_metrics", &PyLLMRuntime::getMultimodalMetrics);
+        .def("get_multimodal_metrics", &PyLLMRuntime::getMultimodalMetrics)
+        .def("get_context_cache_metrics", &PyLLMRuntime::getContextCacheMetrics);
+
+    py::class_<PyTTSRuntime>(
+        m, "TTSRuntime", "TTS-only runtime (Qwen3-TTS-style): Talker + CodePredictor + Code2Wav, no Thinker engine")
+        .def(py::init<std::string const&, std::string const&, std::string const&, std::string const&,
+                 std::string const&>(),
+            py::arg("talker_engine_dir"), py::arg("code_predictor_engine_dir"), py::arg("code2wav_engine_dir"),
+            py::arg("tokenizer_dir") = "", py::arg("checkpoint_dir") = "", py::call_guard<py::gil_scoped_release>())
+        .def("handle_request_tts", &PyTTSRuntime::handleRequestTTS, py::arg("text"), py::arg("params"),
+            py::arg("audio_channel"), py::call_guard<py::gil_scoped_release>(),
+            "Synthesize speech for text; PCM chunks stream to audio_channel; returns codec frame count")
+        .def("get_speaker_names", &PyTTSRuntime::getSpeakerNames);
 
     // ========================================================================
     // Builder: LLM
@@ -556,6 +965,23 @@ PYBIND11_MODULE(_edgellm_runtime, m)
             py::init<std::filesystem::path const&, std::filesystem::path const&, builder::VisualBuilderConfig const&>(),
             py::arg("onnx_dir"), py::arg("engine_dir"), py::arg("config"))
         .def("build", &builder::VisualBuilder::build, "Build the TensorRT visual engine. Returns True on success.");
+
+    // ========================================================================
+    // Builder: Audio
+    // ========================================================================
+    py::class_<builder::AudioBuilderConfig>(
+        m, "AudioBuilderConfig", "Configuration for building TensorRT audio encoder engines from ONNX.")
+        .def(py::init<>())
+        .def_readwrite("min_time_steps", &builder::AudioBuilderConfig::minTimeSteps)
+        .def_readwrite("max_time_steps", &builder::AudioBuilderConfig::maxTimeSteps)
+        .def_readwrite("use_trt_native_audio_attn", &builder::AudioBuilderConfig::useTrtNativeAudioAttn)
+        .def("__repr__", &builder::AudioBuilderConfig::toString);
+
+    py::class_<builder::AudioBuilder>(
+        m, "AudioBuilder", "Build a TensorRT engine for an audio encoder from an ONNX directory.")
+        .def(py::init<std::filesystem::path const&, std::filesystem::path const&, builder::AudioBuilderConfig const&>(),
+            py::arg("onnx_dir"), py::arg("engine_dir"), py::arg("config"))
+        .def("build", &builder::AudioBuilder::build, "Build the TensorRT audio engine. Returns True on success.");
 
     // ========================================================================
     // Convenience: create_generation_request

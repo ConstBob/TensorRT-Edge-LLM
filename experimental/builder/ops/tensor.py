@@ -255,6 +255,22 @@ class Tensor:
         return self._wrap(current_net().unary(self._value,
                                               trt.UnaryOperation.SIN))
 
+    def cos(self) -> "Tensor":
+        return self._wrap(current_net().unary(self._value,
+                                              trt.UnaryOperation.COS))
+
+    def sqrt(self) -> "Tensor":
+        return self._wrap(current_net().unary(self._value,
+                                              trt.UnaryOperation.SQRT))
+
+    def log(self) -> "Tensor":
+        return self._wrap(current_net().unary(self._value,
+                                              trt.UnaryOperation.LOG))
+
+    def elu(self) -> "Tensor":
+        return self._wrap(current_net().activation(self._value,
+                                                   trt.ActivationType.ELU))
+
     def gelu(self) -> "Tensor":
         return self._wrap(current_net().gelu(self._value))
 

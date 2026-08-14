@@ -43,6 +43,36 @@ namespace rt
 
 using Json = nlohmann::json;
 
+char const* specDecodeModeName(SpecDecodeMode mode) noexcept
+{
+    switch (mode)
+    {
+    case SpecDecodeMode::kNONE: return "none";
+    case SpecDecodeMode::kEAGLE: return "eagle3";
+    case SpecDecodeMode::kMTP: return "mtp";
+    case SpecDecodeMode::kDFlash: return "dflash";
+    case SpecDecodeMode::kJetSpec: return "jetspec";
+    case SpecDecodeMode::kGemma4MTP: return "gemma4_mtp";
+    case SpecDecodeMode::kDSpark: return "dspark";
+    }
+    return "unknown";
+}
+
+bool isCachedBlockDraftMode(SpecDecodeMode mode) noexcept
+{
+    return mode == SpecDecodeMode::kDFlash || mode == SpecDecodeMode::kJetSpec;
+}
+
+bool isCachedBlockDraftBase(LLMEngineConfig const& config) noexcept
+{
+    return config.isSpecDecodeBase && isCachedBlockDraftMode(config.specDecodeType);
+}
+
+bool isCachedBlockDraftDraft(LLMEngineConfig const& config) noexcept
+{
+    return !config.isSpecDecodeBase && isCachedBlockDraftMode(config.specDecodeType);
+}
+
 namespace
 {
 
@@ -126,6 +156,10 @@ SpecDecodeMode parseSpecDecodeMode(Json const& configJson)
     {
         return SpecDecodeMode::kDFlash;
     }
+    if (specDecodeType == "jetspec")
+    {
+        return SpecDecodeMode::kJetSpec;
+    }
     if (specDecodeType == "gemma4_mtp")
     {
         return SpecDecodeMode::kGemma4MTP;
@@ -135,7 +169,7 @@ SpecDecodeMode parseSpecDecodeMode(Json const& configJson)
         return SpecDecodeMode::kDSpark;
     }
     throw std::runtime_error("parseEngineConfig: invalid spec_decode_type '" + specDecodeType
-        + "'. Allowed values: none, mtp, eagle3, dflash, dspark, gemma4_mtp.");
+        + "'. Allowed values: none, mtp, eagle3, dflash, jetspec, dspark, gemma4_mtp.");
 }
 
 std::string parseEngineRole(Json const& configJson)
@@ -199,6 +233,40 @@ void parseDFlashFields(
     if (targetLayerValidationUpperBound.has_value())
     {
         validateSpecTargetLayerIds(cfg.specTargetLayerIds, *targetLayerValidationUpperBound, "DFlash", "base");
+    }
+}
+
+void parseJetSpecFields(
+    Json const& configJson, LLMEngineConfig& cfg, std::optional<int32_t> targetLayerValidationUpperBound = std::nullopt)
+{
+    if (cfg.specDecodeType != SpecDecodeMode::kJetSpec)
+    {
+        return;
+    }
+
+    Json const empty = Json::object();
+    Json const& jetSpecConfig = configJson.contains("jetspec_config")
+        ? configJson["jetspec_config"]
+        : (configJson.contains("dflash_config") ? configJson["dflash_config"] : empty);
+
+    cfg.specDraftBlockSize = jetSpecConfig.value("block_size", configJson.value("block_size", 16));
+    cfg.specDraftMaskTokenId = jetSpecConfig.value("mask_token_id", configJson.value("mask_token_id", 151669));
+    cfg.specDraftCausalHead = jetSpecConfig.value("causal_head", configJson.value("causal_head", true));
+    ELLM_CHECK(cfg.specDraftBlockSize > 0,
+        "parseEngineConfig: invalid JetSpec block_size: " + std::to_string(cfg.specDraftBlockSize)
+            + " (must be positive)");
+    ELLM_CHECK(cfg.specDraftMaskTokenId >= 0,
+        "parseEngineConfig: invalid JetSpec mask_token_id: " + std::to_string(cfg.specDraftMaskTokenId)
+            + " (must be non-negative)");
+    ELLM_CHECK(cfg.specDraftCausalHead,
+        "parseEngineConfig: JetSpec requires jetspec_config.causal_head=true for causal proposal attention.");
+
+    char const* configName = configJson.contains("jetspec_config") ? "jetspec_config" : "dflash_config";
+    parseSpecTargetLayerIds(jetSpecConfig, configName, cfg);
+    ELLM_CHECK(!cfg.specTargetLayerIds.empty(), "parseEngineConfig: JetSpec requires non-empty target_layer_ids");
+    if (targetLayerValidationUpperBound.has_value())
+    {
+        validateSpecTargetLayerIds(cfg.specTargetLayerIds, *targetLayerValidationUpperBound, "JetSpec", "base");
     }
 }
 
@@ -280,11 +348,6 @@ void parseDSparkFields(
     {
         validateSpecTargetLayerIds(cfg.specTargetLayerIds, *targetLayerValidationUpperBound, "DSpark", "base");
     }
-}
-
-bool isDFlashDraftConfig(LLMEngineConfig const& config)
-{
-    return config.specDecodeType == SpecDecodeMode::kDFlash && !config.isSpecDecodeBase;
 }
 
 bool isGemma4MTPDraftConfig(LLMEngineConfig const& config)
@@ -391,6 +454,22 @@ void parseCoreFields(Json const& configJson, LLMEngineConfig& cfg)
     requirePositive(cfg.maxSupportedBatchSize, "max_batch_size");
     requirePositive(cfg.maxSupportedInputLength, "max_input_len");
     requirePositive(cfg.maxKVCacheCapacity, "max_kv_cache_capacity");
+    ELLM_CHECK(cfg.maxKVCacheCapacity <= kMAX_KV_CACHE_CAPACITY,
+        "parseEngineConfig: max_kv_cache_capacity (" + std::to_string(cfg.maxKVCacheCapacity)
+            + ") exceeds the largest value that remains int32 after page alignment ("
+            + std::to_string(kMAX_KV_CACHE_CAPACITY) + ")");
+    int64_t const minimumActivePages = computeMinimumKvPoolPages(cfg.maxSupportedBatchSize, cfg.maxKVCacheCapacity);
+    int64_t const serializedKvPoolPages = getRequired<int64_t>(bc, "max_kv_pool_pages");
+    ELLM_CHECK(minimumActivePages <= kMAX_KV_POOL_PAGES,
+        "parseEngineConfig: minimum active pages (" + std::to_string(minimumActivePages) + ")"
+            + " exceeds the largest int32-addressable paged-KV pool " + std::to_string(kMAX_KV_POOL_PAGES) + ".");
+    ELLM_CHECK(serializedKvPoolPages >= minimumActivePages,
+        "parseEngineConfig: max_kv_pool_pages (" + std::to_string(serializedKvPoolPages)
+            + ") cannot be smaller than the minimum active pages (" + std::to_string(minimumActivePages) + ")");
+    ELLM_CHECK(serializedKvPoolPages <= kMAX_KV_POOL_PAGES,
+        "parseEngineConfig: max_kv_pool_pages (" + std::to_string(serializedKvPoolPages)
+            + ") exceeds the largest int32-addressable paged-KV pool (" + std::to_string(kMAX_KV_POOL_PAGES) + ")");
+    cfg.kvPoolPages = static_cast<int32_t>(serializedKvPoolPages);
     ELLM_CHECK(cfg.maxSupportedInputLength <= cfg.maxKVCacheCapacity,
         "parseEngineConfig: max_input_len (" + std::to_string(cfg.maxSupportedInputLength)
             + ") cannot be greater than max_kv_cache_capacity (" + std::to_string(cfg.maxKVCacheCapacity) + ")");
@@ -539,8 +618,8 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     if (cfg.isSpecDecodeBase)
     {
         ELLM_CHECK(cfg.specDecodeType != SpecDecodeMode::kNONE,
-            "parseEngineConfig: engine_role=base requires spec_decode_type to be mtp, eagle3, dflash, dspark, or "
-            "gemma4_mtp.");
+            "parseEngineConfig: engine_role=base requires spec_decode_type to be mtp, eagle3, dflash, jetspec, "
+            "dspark, or gemma4_mtp.");
     }
     else
     {
@@ -601,12 +680,30 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     cfg.numLinearAttnLayers = configJson.value("num_linear_attn_layers", 0);
     cfg.numAttentionLayers = configJson.value("num_attention_layers", cfg.numDecoderLayers);
     cfg.recurrentStateNumHeads = configJson.value("recurrent_state_num_heads", 0);
+    cfg.recurrentStateNumGroups = configJson.value("recurrent_state_num_groups", 0);
+    // Explicit MTP spec-verify commit mode: "replay" (Mamba SSM) vs "snapshot" (GDN/DDTree).
+    std::string const recurrentSpecVerifyMode = configJson.value("recurrent_spec_verify_mode", std::string{"snapshot"});
+    ELLM_CHECK(recurrentSpecVerifyMode == "replay" || recurrentSpecVerifyMode == "snapshot",
+        "parseEngineConfig: invalid recurrent_spec_verify_mode '" + recurrentSpecVerifyMode
+            + "'; expected \"replay\" or \"snapshot\".");
+    cfg.recurrentSpecVerifyUsesReplay = (recurrentSpecVerifyMode == "replay");
     cfg.recurrentStateHeadDim = configJson.value("recurrent_state_head_dim", 0);
     cfg.recurrentStateSize = configJson.value("recurrent_state_size", 0);
     cfg.convDim = configJson.value("conv_dim", 0);
     cfg.convKernel = configJson.value("conv_kernel", 0);
     parseDFlashFields(configJson, cfg, cfg.numDecoderLayers);
+    parseJetSpecFields(configJson, cfg, cfg.numDecoderLayers);
     parseDSparkFields(configJson, cfg, cfg.numDecoderLayers);
+    if (cfg.isSpecDecodeBase && cfg.specDecodeType == SpecDecodeMode::kEAGLE
+        && configJson.contains("eagle_hidden_state_layers"))
+    {
+        Json const& layerIds = configJson["eagle_hidden_state_layers"];
+        ELLM_CHECK(layerIds.is_array(), "parseEngineConfig: eagle_hidden_state_layers must be an array when present.");
+        for (auto const& layerId : layerIds)
+        {
+            cfg.specTargetLayerIds.push_back(layerId.get<int32_t>());
+        }
+    }
 
     auto const& bc = configJson["builder_config"];
     cfg.maxSupportedLoraRank = bc.value("max_lora_rank", 0);
@@ -661,8 +758,9 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
         requirePositive(cfg.maxVerifyTreeSize, "max_verify_tree_size");
         if (cfg.specDecodeType == SpecDecodeMode::kGemma4MTP)
         {
-            ELLM_CHECK(cfg.modelType == "gemma4" || cfg.modelType == "gemma4_text",
-                "parseEngineConfig: gemma4_mtp base config must set model to gemma4 or gemma4_text.");
+            ELLM_CHECK(cfg.modelType == "gemma4" || cfg.modelType == "gemma4_text" || cfg.modelType == "gemma4_unified"
+                    || cfg.modelType == "gemma4_unified_text",
+                "parseEngineConfig: gemma4_mtp base config must identify a Gemma4 target model.");
             ELLM_CHECK(cfg.baseModelHiddenSize == 0 || cfg.baseModelHiddenSize == cfg.hiddenSize,
                 "parseEngineConfig: gemma4_mtp base_model_hidden_size must match hidden_size.");
         }
@@ -733,8 +831,8 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath)
     std::string const engineRole = parseEngineRole(configJson);
     ELLM_CHECK(engineRole == "draft", "parseDraftEngineConfig: draft config must set engine_role=draft.");
     ELLM_CHECK(cfg.specDecodeType != SpecDecodeMode::kNONE,
-        "parseDraftEngineConfig: engine_role=draft requires spec_decode_type to be mtp, eagle3, dflash, dspark, or "
-        "gemma4_mtp.");
+        "parseDraftEngineConfig: engine_role=draft requires spec_decode_type to be mtp, eagle3, dflash, jetspec, "
+        "dspark, or gemma4_mtp.");
 
     // Shared core fields (layers, kv heads, head_dim, hidden_size, kv_cache_dtype,
     // batch/input/kv limits, RoPE, common positivity checks).
@@ -742,7 +840,11 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath)
     parseGemma4MTPFields(configJson, cfg);
 
     // --- Draft-specific ---
-    cfg.numAttentionLayers = cfg.numDecoderLayers;
+    // A hybrid draft (e.g. Nemotron-H MTP: attention + MoE) has fewer KV-bearing
+    // attention layers than total layers, so honor an explicit
+    // ``num_attention_layers`` (matches parseEngineConfig); default to the
+    // decoder-layer count for single-type drafts that omit it.
+    cfg.numAttentionLayers = configJson.value("num_attention_layers", cfg.numDecoderLayers);
     // Match the engine's `rope_rotary_cos_sin` binding shape. Most partial
     // rotary models expose a smaller binding via `partial_rotary_factor`, while
     // proportional RoPE keeps a headDim-sized binding and treats the non-rotated
@@ -752,6 +854,7 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath)
     cfg.reducedVocabSize = configJson.value(binding_names::kReducedVocabSizeKey, 0);
     cfg.outputVocabSize = (cfg.reducedVocabSize > 0) ? cfg.reducedVocabSize : cfg.vocabSize;
     parseDFlashFields(configJson, cfg);
+    parseJetSpecFields(configJson, cfg);
     parseDSparkFields(configJson, cfg);
 
     // Draft engines do not own speculative base verification bindings.
@@ -815,7 +918,7 @@ std::string formatEngineConfig(LLMEngineConfig const& cfg)
        << " numAttentionLayers=" << cfg.numAttentionLayers << " numKVHeads=" << cfg.numKVHeads
        << " headDim=" << cfg.headDim << " rotaryDim=" << cfg.rotaryDim << " maxBatch=" << cfg.maxSupportedBatchSize
        << " maxInputLen=" << cfg.maxSupportedInputLength << " maxKVCapacity=" << cfg.maxKVCacheCapacity
-       << " pleEnabled=" << cfg.pleEnabled << " numPleInputs=" << cfg.numPleInputs
+       << " kvPoolPages=" << cfg.kvPoolPages << " pleEnabled=" << cfg.pleEnabled << " numPleInputs=" << cfg.numPleInputs
        << " pleHiddenSize=" << cfg.pleHiddenSize << " isSpecDecodeBase=" << cfg.isSpecDecodeBase
        << " specDecodeType=" << static_cast<int>(cfg.specDecodeType) << " loraRank=" << cfg.maxSupportedLoraRank;
     if (cfg.useDualRope)
@@ -840,10 +943,14 @@ std::string formatEngineConfig(LLMEngineConfig const& cfg)
     {
         ss << " maxDraftTreeSize=" << cfg.maxDraftTreeSize;
     }
-    if (cfg.specDecodeType == SpecDecodeMode::kDFlash || cfg.specDecodeType == SpecDecodeMode::kDSpark)
+    if (isCachedBlockDraftMode(cfg.specDecodeType) || cfg.specDecodeType == SpecDecodeMode::kDSpark)
     {
         ss << " specDraftBlockSize=" << cfg.specDraftBlockSize << " specDraftMaskTokenId=" << cfg.specDraftMaskTokenId
            << " specTargetLayerIds=" << cfg.specTargetLayerIds.size();
+    }
+    if (cfg.specDecodeType == SpecDecodeMode::kJetSpec)
+    {
+        ss << " specDraftCausalHead=" << cfg.specDraftCausalHead;
     }
     if (cfg.specDecodeType == SpecDecodeMode::kDSpark)
     {
@@ -1039,13 +1146,103 @@ InferenceDims LLMEngineConfig::acceptDims(int64_t batch, int64_t acceptLen) cons
     };
 }
 
+void validatePagedKVBindings(LLMEngineConfig const& config, EngineExecutor const& executor, char const* engineLabel)
+{
+    if (config.numAttentionLayers == 0)
+    {
+        return;
+    }
+
+    ELLM_CHECK(static_cast<int32_t>(config.kvLayerConfigs.size()) == config.numAttentionLayers,
+        std::string("KV layer metadata mismatch (") + engineLabel + "): expected "
+            + std::to_string(config.numAttentionLayers) + " entries, got "
+            + std::to_string(config.kvLayerConfigs.size()) + ".");
+    int32_t const numProfiles = executor.getEngine().getNbOptimizationProfiles();
+    ELLM_CHECK(numProfiles > 0, std::string("Engine has no optimization profiles (") + engineLabel + ").");
+
+    for (int32_t layerIdx = 0; layerIdx < config.numAttentionLayers; ++layerIdx)
+    {
+        std::string const bindingName = binding_names::formatKVCacheName(layerIdx, /*isPast=*/true);
+        ELLM_CHECK(executor.hasIOTensor(bindingName.c_str()),
+            std::string("Missing KV cache binding (") + engineLabel + "): expected '" + bindingName + "'.");
+        nvinfer1::DataType const engineDtype = executor.getBindingDataType(bindingName.c_str());
+        ELLM_CHECK(engineDtype == config.kvCacheDtype,
+            std::string("KV cache dtype mismatch (") + engineLabel + "): config says "
+                + getDataTypeString(config.kvCacheDtype) + ", engine reports " + getDataTypeString(engineDtype)
+                + " for binding '" + bindingName + "'.");
+
+        KVLayerConfig const& layer = config.kvLayerConfigs[layerIdx];
+        for (int32_t profileIdx = 0; profileIdx < numProfiles; ++profileIdx)
+        {
+            for (nvinfer1::OptProfileSelector const selector : {nvinfer1::OptProfileSelector::kMIN,
+                     nvinfer1::OptProfileSelector::kOPT, nvinfer1::OptProfileSelector::kMAX})
+            {
+                nvinfer1::Dims const shape = executor.getProfileShape(bindingName.c_str(), profileIdx, selector);
+                ELLM_CHECK(shape.nbDims == 5 && shape.d[0] == 2 && shape.d[1] == config.kvPoolPages
+                        && shape.d[2] == kTOKENS_PER_PAGE && shape.d[3] == layer.numKVHeads
+                        && shape.d[4] == layer.headDim,
+                    std::string("Paged KV profile mismatch (") + engineLabel + ") for binding '" + bindingName
+                        + "': expected [2," + std::to_string(config.kvPoolPages) + ","
+                        + std::to_string(kTOKENS_PER_PAGE) + "," + std::to_string(layer.numKVHeads) + ","
+                        + std::to_string(layer.headDim) + "] for every profile selector.");
+            }
+        }
+    }
+}
+
+namespace
+{
+
+//! Validate the current mutable page-table engine ABI.
+void validatePageTableBinding(LLMEngineConfig const& config, EngineExecutor const& executor, char const* engineLabel)
+{
+    if (config.numAttentionLayers == 0)
+    {
+        return;
+    }
+
+    char const* const bindingName = binding_names::kKVPageTable;
+    ELLM_CHECK(executor.hasIOTensor(bindingName),
+        std::string("Missing page-table binding (") + engineLabel + "): expected '" + bindingName
+            + "' from the current engine toolchain.");
+    ELLM_CHECK(executor.getEngine().getTensorIOMode(bindingName) == nvinfer1::TensorIOMode::kINPUT,
+        std::string("Page-table binding (") + engineLabel + ") must be an input.");
+    ELLM_CHECK(executor.getBindingDataType(bindingName) == nvinfer1::DataType::kINT32,
+        std::string("Page-table binding (") + engineLabel + ") must have INT32 dtype.");
+
+    int32_t const numProfiles = executor.getEngine().getNbOptimizationProfiles();
+    ELLM_CHECK(numProfiles > 0, std::string("Engine has no optimization profiles (") + engineLabel + ").");
+    int32_t const maxPagesPerSequence = computeMaxPagesPerSeq(config.maxKVCacheCapacity);
+    for (int32_t profileIdx = 0; profileIdx < numProfiles; ++profileIdx)
+    {
+        for (nvinfer1::OptProfileSelector const selector : {nvinfer1::OptProfileSelector::kMIN,
+                 nvinfer1::OptProfileSelector::kOPT, nvinfer1::OptProfileSelector::kMAX})
+        {
+            int32_t const expectedBatch
+                = selector == nvinfer1::OptProfileSelector::kMIN ? 1 : config.maxSupportedBatchSize;
+            nvinfer1::Dims const shape = executor.getProfileShape(bindingName, profileIdx, selector);
+            ELLM_CHECK(shape.nbDims == 3 && shape.d[0] == expectedBatch && shape.d[1] == 2
+                    && shape.d[2] == maxPagesPerSequence,
+                std::string("Page-table profile mismatch (") + engineLabel + ") for binding '" + bindingName
+                    + "': expected [" + std::to_string(expectedBatch) + ",2," + std::to_string(maxPagesPerSequence)
+                    + "]. Re-export and rebuild the engine.");
+        }
+    }
+}
+
+} // namespace
+
 void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& executor, char const* engineLabel)
 {
-    if (isDFlashDraftConfig(config))
+    validatePagedKVBindings(config, executor, engineLabel);
+    validatePageTableBinding(config, executor, engineLabel);
+
+    if (isCachedBlockDraftDraft(config))
     {
-        // DFlash cached draft engines require KV cache bindings (cached-KV path).
+        char const* modeName = config.specDecodeType == SpecDecodeMode::kJetSpec ? "JetSpec" : "DFlash";
+        // Cached draft engines require KV cache bindings (cached-KV path).
         // Validate required bindings exist and have correct dtype.
-        LOG_INFO("DFlash draft engine (%s): validating cached-path bindings.", engineLabel);
+        LOG_INFO("%s draft engine (%s): validating cached-path bindings.", modeName, engineLabel);
 
         // Required cached-path bindings (fail if missing → old explicit DFlash engine)
         static char const* const kRequiredBindings[] = {
@@ -1062,8 +1259,8 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
         for (auto const* name : kRequiredBindings)
         {
             ELLM_CHECK(executor.hasIOTensor(name),
-                std::string("DFlash cached draft engine (") + engineLabel + ") is missing required binding '" + name
-                    + "'. This engine may be from the old explicit DFlash path. Re-export and rebuild.");
+                std::string(modeName) + " cached draft engine (" + engineLabel + ") is missing required binding '"
+                    + name + "'. This engine may be from the old explicit cached-draft path. Re-export and rebuild.");
         }
 
         // Require KV cache layer 0
@@ -1072,10 +1269,10 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
             std::string const kvPastName = binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/true);
             std::string const kvPresentName = binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/false);
             ELLM_CHECK(executor.hasIOTensor(kvPastName.c_str()),
-                std::string("DFlash cached draft engine (") + engineLabel + ") missing KV cache binding '" + kvPastName
-                    + "'. Old explicit DFlash engines are not compatible. Re-export and rebuild.");
+                std::string(modeName) + " cached draft engine (" + engineLabel + ") missing KV cache binding '"
+                    + kvPastName + "'. Old explicit cached-draft engines are not compatible. Re-export and rebuild.");
             ELLM_CHECK(executor.hasIOTensor(kvPresentName.c_str()),
-                std::string("DFlash cached draft engine (") + engineLabel + ") missing KV cache binding '"
+                std::string(modeName) + " cached draft engine (" + engineLabel + ") missing KV cache binding '"
                     + kvPresentName + "'.");
 
             auto const engineDtype = executor.getBindingDataType(kvPastName.c_str());
@@ -1158,11 +1355,12 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
                         std::string("Gemma4 MTP shared KV binding '") + kvPastName + "' must be rank-5.");
                     // Paged pool binding [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim];
                     // numPages (dim 1) is engine-specific.
-                    ELLM_CHECK(shape.d[0] == 2 && shape.d[2] == kTOKENS_PER_PAGE && shape.d[3] == kvConfig.numKVHeads
-                            && shape.d[4] == kvConfig.headDim,
+                    ELLM_CHECK(shape.d[0] == 2 && shape.d[1] == config.kvPoolPages && shape.d[2] == kTOKENS_PER_PAGE
+                            && shape.d[3] == kvConfig.numKVHeads && shape.d[4] == kvConfig.headDim,
                         std::string("Gemma4 MTP shared KV profile shape mismatch for binding '") + kvPastName
-                            + "': expected static dims [2,*," + std::to_string(kTOKENS_PER_PAGE) + ","
-                            + std::to_string(kvConfig.numKVHeads) + "," + std::to_string(kvConfig.headDim) + "].");
+                            + "': expected static dims [2," + std::to_string(config.kvPoolPages) + ","
+                            + std::to_string(kTOKENS_PER_PAGE) + "," + std::to_string(kvConfig.numKVHeads) + ","
+                            + std::to_string(kvConfig.headDim) + "].");
                 }
             }
         }
@@ -1253,16 +1451,17 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
                 + " for binding '" + convBindingName + "'. Re-export the engine with matching conv_state_dtype.");
 
         if (config.isSpecDecodeBase && config.numLinearAttnLayers > 0
-            && (config.specDecodeType == SpecDecodeMode::kMTP || config.specDecodeType == SpecDecodeMode::kDFlash))
+            && (config.specDecodeType == SpecDecodeMode::kMTP || isCachedBlockDraftMode(config.specDecodeType)))
         {
             ELLM_CHECK(executor.hasIOTensor(binding_names::kSpecVerifyPhaseMarker),
                 std::string("Missing spec-verify phase marker binding (") + engineLabel + "): expected '"
-                    + binding_names::kSpecVerifyPhaseMarker + "'. Re-export the hybrid MTP/DFlash base engine.");
+                    + binding_names::kSpecVerifyPhaseMarker
+                    + "'. Re-export the hybrid MTP/cached block-draft base engine.");
             auto const markerEngineDtype = executor.getBindingDataType(binding_names::kSpecVerifyPhaseMarker);
             ELLM_CHECK(markerEngineDtype == nvinfer1::DataType::kINT32,
                 std::string("Spec-verify phase marker dtype mismatch (") + engineLabel + "): engine reports "
                     + getDataTypeString(markerEngineDtype) + " for binding '" + binding_names::kSpecVerifyPhaseMarker
-                    + "'. Re-export the hybrid MTP/DFlash base engine.");
+                    + "'. Re-export the hybrid MTP/cached block-draft base engine.");
         }
     }
 }

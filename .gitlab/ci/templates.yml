@@ -2,6 +2,22 @@
 # SHARED TEMPLATES
 # ==============================================================================
 
+# Keep the public upstream URLs canonical in .gitmodules while CI fetches the
+# same pinned commits from NVIDIA's internal mirrors.
+.ci_internal_submodules:
+  hooks:
+    pre_get_sources_script:
+      - git config --global url."https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git".insteadOf "https://github.com/google/googletest.git"
+      - git config --global url."https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git".insteadOf "https://github.com/nlohmann/json.git"
+      - git config --global url."https://gitlab-master.nvidia.com/ftp/GitHubSync/NVTX-mirror.git".insteadOf "https://github.com/NVIDIA/NVTX.git"
+  variables:
+    GIT_SUBMODULE_STRATEGY: recursive
+
+.ci_test_submodules:
+  extends: .ci_internal_submodules
+  variables:
+    GIT_SUBMODULE_PATHS: "3rdParty/googletest 3rdParty/nlohmannJson"
+
 # ==============================================================================
 # RULE TEMPLATES
 # ==============================================================================
@@ -10,25 +26,23 @@
   rules:
     - if: $L1 == "true"
       when: never
-    - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
+    # Stability must test TOT even when an MR requests [skip tests].
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $L0_STABILITY == "true"
+      variables:
+        L0_STORAGE_KIND: "stability"
+        L0_ENVIRONMENT_NAME: "l0/stability_${CI_PIPELINE_ID}"
+        L0_STORAGE_RESOURCE_GROUP: "l0-stability-${CI_PIPELINE_ID}"
+        L0_STORAGE_RETENTION: "2 days"
+        L0_ONNX_REUSE: "0"
+    - if: $EDGE_LLM_SKIP_TESTS == "true"
       when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-
-.l0_manual_rules:
-  rules:
-    - if: $L1 == "true"
-      when: never
-    - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
-      when: never
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-      when: manual
-      allow_failure: true
-
-.l0_environment:
-  environment:
-    name: l0_cache/mr_$CI_MERGE_REQUEST_IID
-    on_stop: cleanup_l0_mr_cache
-    auto_stop_in: 30 days
+      variables:
+        L0_STORAGE_KIND: "mr"
+        L0_ENVIRONMENT_NAME: "l0/mr_${CI_MERGE_REQUEST_IID}"
+        L0_STORAGE_RESOURCE_GROUP: "l0-mr-${CI_MERGE_REQUEST_IID}"
+        L0_STORAGE_RETENTION: "30 days"
+        L0_ONNX_REUSE: "1"
 
 .l1_environment:
   environment:
@@ -40,133 +54,84 @@
   rules:
     - if: $L1 == "true"
 
-.setup_common_rules:
+.mr_and_l1_rules:
   rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    # Explicit suites run even when an MR requests [skip tests].
     - if: $L1 == "true"
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $L0_STABILITY == "true"
+    - if: $EDGE_LLM_SKIP_TESTS == "true"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
 # ==============================================================================
 # SCRIPT TEMPLATES
 # ==============================================================================
 
-.record_runner_usage:
+.l0_storage_paths:
+  variables:
+    L0_STORAGE_ENV_FILE: "$CI_PROJECT_DIR/.ci-l0-storage-${CI_JOB_ID}.env"
+  before_script:
+    - |
+      python3 .gitlab/ci/scripts/ci_storage.py prepare-job \
+        --environment-file "$L0_STORAGE_ENV_FILE"
+      . "$L0_STORAGE_ENV_FILE"
+
+.l0_blackwell_exports:
+  variables:
+    L0_ONNX_CACHE_RELATIVE_PATH: "checkpoint_export/onnx"
+
+.l0_ampere_exports:
+  variables:
+    L0_ONNX_CACHE_RELATIVE_PATH: "checkpoint_export_ampere/onnx"
+
+.cleanup_engine_storage:
+  # Add [retain engines] to the commit message to preserve engine output.
   after_script:
     - |
       set +e
-
-      usage_root="${RUNNER_USAGE_DIR:-${EDGE_LLM_CACHE_DIR:-/scratch.edge_llm_cache}/runner_usage}"
-      project_slug="${CI_PROJECT_PATH_SLUG:-tensorrt-edge-llm}"
-      pipeline_id="${CI_PIPELINE_ID:-manual}"
-      job_id="${CI_JOB_ID:-unknown}"
-      out_dir="${usage_root}/${project_slug}/${pipeline_id}"
-      out_file="${out_dir}/${job_id}.json"
-
-      mkdir -p "$out_dir" 2>/dev/null || {
-        echo "WARN: cannot create runner usage dir $out_dir"
-        exit 0
-      }
-
-      now_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
-
-      to_epoch() {
-        if [ -z "$1" ]; then
-          printf ''
-          return
-        fi
-        date -u -d "$1" +%s 2>/dev/null || printf ''
-      }
-
-      duration() {
-        start="$1"
-        end="$2"
-        if [ -n "$start" ] && [ -n "$end" ]; then
-          printf '%s' "$((end - start))"
+      if [ -n "${L0_STORAGE_ENV_FILE:-}" ] && [ -f "$L0_STORAGE_ENV_FILE" ]; then
+        . "$L0_STORAGE_ENV_FILE"
+      fi
+      if [ -n "${ENGINE_DIR:-}" ]; then
+        if command -v python3 >/dev/null 2>&1; then
+          python3 "$CI_PROJECT_DIR/.gitlab/ci/scripts/ci_engine_storage.py" || true
         else
-          printf 'null'
+          echo "WARNING: Cannot apply engine cleanup policy because python3 is unavailable" >&2
         fi
-      }
-
-      json_escape() {
-        printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
-      }
-
-      json_string() {
-        if [ -n "$1" ]; then
-          printf '"%s"' "$(json_escape "$1")"
-        else
-          printf 'null'
-        fi
-      }
-
-      json_number() {
-        if printf '%s' "$1" | grep -Eq '^[0-9]+([.][0-9]+)?$'; then
-          printf '%s' "$1"
-        else
-          printf 'null'
-        fi
-      }
-
-      pipeline_epoch="$(to_epoch "${CI_PIPELINE_CREATED_AT:-}")"
-      job_started_epoch="$(to_epoch "${CI_JOB_STARTED_AT:-}")"
-      job_finished_epoch="$(to_epoch "$now_utc")"
-      pipeline_to_job_start_seconds="$(duration "$pipeline_epoch" "$job_started_epoch")"
-      run_seconds="$(duration "$job_started_epoch" "$job_finished_epoch")"
-      queue_seconds="${CI_JOB_QUEUED_DURATION:-}"
-      if [ -z "$queue_seconds" ] && [ "$pipeline_to_job_start_seconds" != "null" ]; then
-        queue_seconds="$pipeline_to_job_start_seconds"
       fi
 
-      runner_hostname="$(hostname 2>/dev/null || true)"
-      runner_node="${NODE_NAME:-$runner_hostname}"
+.l0_a30_trtrtx_exports:
+  variables:
+    L0_ONNX_CACHE_RELATIVE_PATH: "checkpoint_export_a30_trtrtx/onnx"
 
-      tmp_file="${out_file}.tmp.$$"
-      cat > "$tmp_file" <<JSON
-      {
-        "schema_version": 1,
-        "project": $(json_string "${CI_PROJECT_PATH:-}"),
-        "ref": $(json_string "${CI_COMMIT_REF_NAME:-}"),
-        "commit_sha": $(json_string "${CI_COMMIT_SHA:-}"),
-        "pipeline_id": $(json_string "${CI_PIPELINE_ID:-}"),
-        "pipeline_iid": $(json_string "${CI_PIPELINE_IID:-}"),
-        "pipeline_source": $(json_string "${CI_PIPELINE_SOURCE:-}"),
-        "pipeline_url": $(json_string "${CI_PIPELINE_URL:-}"),
-        "pipeline_created_at": $(json_string "${CI_PIPELINE_CREATED_AT:-}"),
-        "job_id": $(json_string "${CI_JOB_ID:-}"),
-        "job_name": $(json_string "${CI_JOB_NAME:-}"),
-        "job_stage": $(json_string "${CI_JOB_STAGE:-}"),
-        "job_url": $(json_string "${CI_JOB_URL:-}"),
-        "job_status": $(json_string "${CI_JOB_STATUS:-}"),
-        "job_started_at": $(json_string "${CI_JOB_STARTED_AT:-}"),
-        "job_finished_at": $(json_string "$now_utc"),
-        "queue_seconds": $(json_number "$queue_seconds"),
-        "pipeline_to_job_start_seconds": $pipeline_to_job_start_seconds,
-        "run_seconds": $run_seconds,
-        "runner_id": $(json_string "${CI_RUNNER_ID:-}"),
-        "runner_description": $(json_string "${CI_RUNNER_DESCRIPTION:-}"),
-        "runner_tags": $(json_string "${CI_RUNNER_TAGS:-}"),
-        "runner_executable_arch": $(json_string "${CI_RUNNER_EXECUTABLE_ARCH:-}"),
-        "runner_node": $(json_string "$runner_node"),
-        "runner_hostname": $(json_string "$runner_hostname"),
-        "runner_concurrent_id": $(json_string "${CI_CONCURRENT_ID:-}"),
-        "runner_concurrent_project_id": $(json_string "${CI_CONCURRENT_PROJECT_ID:-}"),
-        "board_ip": $(json_string "${BOARD_IP:-}"),
-        "board_user": $(json_string "${BOARD_USER:-}"),
-        "remote_workspace": $(json_string "${REMOTE_WORKSPACE:-}"),
-        "embedded_target": $(json_string "${EMBEDDED_TARGET:-}"),
-        "image": $(json_string "${IMAGE:-${CI_JOB_IMAGE:-}}"),
-        "experimental_docker_image": $(json_string "${EXPERIMENTAL_DOCKER_IMAGE:-}"),
-        "trt_package_dir": $(json_string "${TRT_PACKAGE_DIR:-}"),
-        "cuda_version": $(json_string "${CUDA_VERSION:-}")
-      }
-      JSON
+.l0_storage_lifecycle:
+  image:
+    name: "$L0_STORAGE_IMAGE"
+    entrypoint: [""]
+  tags:
+    - cpu-k8s
+  variables:
+    GIT_STRATEGY: none
+  before_script:
+    - apk add --no-cache git
+    - git init
+    - git remote add origin "$CI_REPOSITORY_URL"
+    - git fetch --depth=1 --no-tags origin "$CI_COMMIT_SHA"
+    - git sparse-checkout set .gitlab/ci/scripts
+    - git checkout --detach FETCH_HEAD
 
-      mv -f "$tmp_file" "$out_file" 2>/dev/null || {
-        echo "WARN: cannot write runner usage file $out_file"
-        rm -f "$tmp_file" 2>/dev/null
-        exit 0
-      }
+.record_runner_usage:
+  after_script:
+    - sh "$CI_PROJECT_DIR/.gitlab/ci/scripts/record_runner_usage.sh" || true
 
-      echo "Runner usage written to $out_file"
+.gitlab_junit_report:
+  artifacts:
+    when: always
+    expire_in: 14 days
+    paths:
+      - .ci-reports/
+    reports:
+      junit: .ci-reports/*.xml
 
 .sanity_python_check_template:
   script:
@@ -174,34 +139,41 @@
     - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
     - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
     - echo "Installing TensorRT Edge-LLM in editable mode for sanity check"
-    - pip3 install -e .
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install Edge LLM editable package" -- pip3 install -e .
     - echo "✅ TensorRT Edge-LLM installation successful!"
     - echo "Verifying installation..."
     - python3 -c 'import tensorrt_edgellm; print(tensorrt_edgellm.__version__)'
     - echo "Pipeline end time:$(date)"
 
 .checkpoint_export_template:
+  extends:
+    - .gitlab_junit_report
   script:
     - |
       echo "Pipeline start time:$(date)"
       echo "Node name: ${NODE_NAME:-$(hostname)}"
       export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
-      mkdir -p "$ONNX_DIR" "$TEST_LOG_DIR"
+      export JUNIT_REPORT="$CI_PROJECT_DIR/.ci-reports/test_report_$PRIORITY.xml"
+      mkdir -p "$ONNX_DIR" "$TEST_LOG_DIR" "$CI_PROJECT_DIR/.ci-reports"
+      rm -f "$JUNIT_REPORT"
     - |
       # ── Smart ONNX reuse decision ─────────────────────────────────────────
-      # Opt-in via ONNX_REUSE=1 (set only on L0 export jobs, which point ONNX_DIR
-      # at a stable per-MR cache that survives the numeric-pipeline-dir cleanup).
-      # Callers that leave ONNX_REUSE unset (e.g. L1 export) always re-export, so
-      # their behavior is unchanged.
-      # Re-export only when: [reexport] in the commit message, OR exporter/cache
-      # contract inputs changed since the commit that produced the cached ONNX.
-      # Runtime-only tests/CI/C++ changes never trigger it.
+      # MR L0 jobs opt into reuse and share a cache throughout the MR lifecycle.
+      # Scheduled stability and L1 exports leave reuse disabled so every run
+      # exercises the exporter.
+      # Re-export only when the ci:force-checkpoint-export MR label is present,
+      # or exporter/cache contract inputs changed since the cached ONNX was produced.
+      # Cache reuse intentionally follows source-branch history; target-only
+      # changes do not invalidate the existing cache.
       NEED_EXPORT=1
       META="$ONNX_DIR/.export_meta"
+      CACHE_COMMIT_SHA="${CI_MERGE_REQUEST_SOURCE_BRANCH_SHA:-${CI_COMMIT_SHA:-}}"
       if [ "${ONNX_REUSE:-0}" != "1" ]; then
         echo "ONNX reuse disabled (ONNX_REUSE!=1) — exporting."
-      elif echo "$CI_COMMIT_MESSAGE" | grep -qiE '\[reexport\]'; then
-        echo "[reexport] found in commit message — forcing re-export."
+      elif [ "${CI_PIPELINE_SOURCE:-}" = "merge_request_event" ] \
+          && printf '%s\n' "${CI_MERGE_REQUEST_LABELS:-}" \
+            | grep -qE '(^|,)ci:force-checkpoint-export(,|$)'; then
+        echo "ci:force-checkpoint-export MR label found — forcing checkpoint export."
       elif [ ! -s "$META" ] || [ -z "$(ls -A "$ONNX_DIR" 2>/dev/null | grep -v '^\.export_meta$')" ]; then
         echo "No usable cached ONNX (missing cache or metadata) — exporting."
       elif ! command -v git >/dev/null 2>&1; then
@@ -209,11 +181,15 @@
       else
         PREV_SHA="$(cat "$META")"
         EXPORT_CACHE_INPUTS="tensorrt_edgellm tests/defs/config.py tests/defs/test_checkpoint_export.py tests/defs/utils/checkpoint_export_helpers.py tests/test_lists/${PRIORITY}.yml .gitlab/ci/templates.yml"
-        if ! git cat-file -e "${PREV_SHA}^{commit}" 2>/dev/null; then
+        if [ -z "$CACHE_COMMIT_SHA" ]; then
+          echo "Current cache commit is unavailable — exporting."
+        elif ! git cat-file -e "${PREV_SHA}^{commit}" 2>/dev/null; then
           echo "Cached export commit $PREV_SHA not reachable (shallow clone?) — exporting."
-        elif git diff --name-only "$PREV_SHA" "$CI_COMMIT_SHA" -- $EXPORT_CACHE_INPUTS | grep -qE '\.(py|ya?ml)$'; then
+        elif ! git cat-file -e "${CACHE_COMMIT_SHA}^{commit}" 2>/dev/null; then
+          echo "Current cache commit $CACHE_COMMIT_SHA not reachable (shallow clone?) — exporting."
+        elif git diff --name-only "$PREV_SHA" "$CACHE_COMMIT_SHA" -- $EXPORT_CACHE_INPUTS | grep -qE '\.(py|ya?ml)$'; then
           echo "Checkpoint export cache inputs changed since cached export — exporting:"
-          git diff --name-only "$PREV_SHA" "$CI_COMMIT_SHA" -- $EXPORT_CACHE_INPUTS | grep -E '\.(py|ya?ml)$' | sed 's/^/  changed: /'
+          git diff --name-only "$PREV_SHA" "$CACHE_COMMIT_SHA" -- $EXPORT_CACHE_INPUTS | grep -E '\.(py|ya?ml)$' | sed 's/^/  changed: /'
         else
           echo "No checkpoint export cache input changes since cached export ($PREV_SHA) — REUSING cached ONNX."
           NEED_EXPORT=0
@@ -223,72 +199,113 @@
       if [ "$NEED_EXPORT" = "0" ]; then
         echo "Reusing cached ONNX at $ONNX_DIR:"
         ls -la "$ONNX_DIR"
+        {
+          printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
+          printf '%s\n' \
+            '<testsuites name="checkpoint export" tests="1" failures="0" errors="0" skipped="1">'
+          printf '  <testsuite name="%s" tests="1" failures="0" errors="0" skipped="1" time="0">\n' \
+            "$PRIORITY"
+          printf '%s\n' '    <testcase classname="checkpoint_export" name="cache_reuse" time="0">'
+          SKIP_REASON="Export tests were not executed; ONNX from source commit $PREV_SHA"
+          SKIP_REASON="$SKIP_REASON was reused for source commit $CACHE_COMMIT_SHA."
+          printf '      <skipped message="Cached ONNX reused">%s</skipped>\n' "$SKIP_REASON"
+          printf '%s\n' '    </testcase>'
+          printf '%s\n' '  </testsuite>'
+          printf '%s\n' '</testsuites>'
+        } > "$JUNIT_REPORT"
+        echo "Recorded checkpoint export as skipped in $JUNIT_REPORT (cached source commit: $PREV_SHA)."
         echo "Pipeline end time:$(date)"
         exit 0
       fi
-    - echo "Installing dependencies"
-    - export DEBIAN_FRONTEND=noninteractive
-    - apt update -qq >/dev/null 2>&1
-    - apt install -y -qq python3 python3-pip git curl >/dev/null 2>&1
+    - echo "Verifying CI image dependencies"
+    - python3 --version
+    - pip3 --version
+    - git --version
+    - curl --version
     - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
     - echo "Installing package dependencies"
     - cd $LLM_SDK_DIR
-    - pip3 install -q build
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install Python build tooling" -- pip3 install build
     - python3 -m build --wheel --outdir dist .
     - export EDGE_LLM_WHEEL=$(python3 -c 'import glob; print(glob.glob("dist/*.whl")[0])')
-    - pip3 install "${EDGE_LLM_WHEEL}[tools]"
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install Edge LLM tool dependencies" -- pip3 install "${EDGE_LLM_WHEEL}[tools]"
     - python3 -c 'import torchvision; print(f"torchvision {torchvision.__version__}")'
     - echo "Installing pytest dependencies"
-    - pip3 install -q -r tests/requirements.txt
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install pytest dependencies" -- pip3 install -r tests/requirements.txt
     - echo "Checkpoint exporter dependencies are provided by the package wheel"
     - export PYTHONPATH=$LLM_SDK_DIR:$PYTHONPATH
-    # Re-export from a clean cache so models dropped from the test list don't linger.
-    - if [ "${ONNX_REUSE:-0}" = "1" ]; then echo "Cleaning stale ONNX before re-export"; rm -rf "$ONNX_DIR"/*; mkdir -p "$ONNX_DIR"; fi
+    # Invalidate before mutating the cache so cancellation cannot publish partial output as reusable.
+    - |
+      if [ "${ONNX_REUSE:-0}" = "1" ]; then
+        echo "Invalidating cached ONNX before re-export"
+        rm -f "$META" "$META.tmp"
+        rm -rf "$ONNX_DIR"/*
+        mkdir -p "$ONNX_DIR"
+      fi
     - echo "Running checkpoint export tests with pytest. Time:$(date)"
-    - python3 -m pytest tests --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
+    - |
+      python3 -m pytest tests \
+        --priority="$PRIORITY" \
+        -v \
+        --color=yes \
+        --html="$TEST_LOG_DIR/test_report_$PRIORITY.html" \
+        --self-contained-html \
+        --junitxml="$JUNIT_REPORT"
+    - echo "HTML report saved to $TEST_LOG_DIR; JUnit report saved to $CI_PROJECT_DIR/.ci-reports"
     - echo "Models exported to cache directory $ONNX_DIR"
     - ls -la $ONNX_DIR
-    # Record the commit that produced this ONNX so later pipelines can decide reuse.
-    - if [ "${ONNX_REUSE:-0}" = "1" ]; then echo "$CI_COMMIT_SHA" > "$ONNX_DIR/.export_meta"; echo "Recorded export commit $CI_COMMIT_SHA in $ONNX_DIR/.export_meta"; fi
+    # Publish cache validity only after the complete export succeeds.
+    - |
+      if [ "${ONNX_REUSE:-0}" = "1" ]; then
+        printf '%s\n' "$CACHE_COMMIT_SHA" > "$META.tmp"
+        mv -f "$META.tmp" "$META"
+        echo "Recorded export source commit $CACHE_COMMIT_SHA in $META"
+      fi
     - echo "Pipeline end time:$(date)"
   interruptible: true
 
 .x86_test_template:
+  extends:
+    - .ci_test_submodules
+    - .gitlab_junit_report
+  variables:
+    L0_JOB_WRITES_ENGINES: "1"
   script:
     - echo "Pipeline start time:$(date)"
     - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
-    - mkdir -p $TEST_LOG_DIR $ENGINE_DIR
+    - mkdir -p $TEST_LOG_DIR $ENGINE_DIR "$CI_PROJECT_DIR/.ci-reports"
     - rm -rf $TEST_LOG_DIR/* $ENGINE_DIR/*
     - chmod -R 777 $TEST_LOG_DIR
-    - echo "Installing dependencies"
-    - export DEBIAN_FRONTEND=noninteractive
-    - apt update -qq >/dev/null 2>&1
-    - apt install -y -qq python3 python3-pip git >/dev/null 2>&1
+    - echo "Verifying CI image dependencies"
+    - python3 --version
+    - pip3 --version
+    - git --version
     - echo "Checking TRT x86_64 package"
     - if [ ! -d "$TRT_PACKAGE_DIR" ]; then echo "TensorRT x86_64 cache not found at $TRT_PACKAGE_DIR"; exit 1; fi
     - echo "Using TensorRT x86_64 package directly from cache"
     - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
-    # clone googletest and nlohmannJson from internal mirror to avoid git submodule network issues
-    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
-    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
     - echo "Installing pytest dependencies"
-    - pip3 install -q -r tests/requirements.txt
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install pytest dependencies" -- pip3 install -r tests/requirements.txt
     - echo "Installing accuracy dependencies"
-    - pip3 install -q -r examples/accuracy/requirements.txt
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install accuracy dependencies" -- pip3 install -r examples/accuracy/requirements.txt
     - echo "Installing TensorRT Python package from cache"
-    - pip3 install -q $TRT_PACKAGE_DIR/python/tensorrt-$TRT_VERSION*-cp312*.whl
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install TensorRT Python package" -- pip3 install $TRT_PACKAGE_DIR/python/${TRT_WHEEL_GLOB}.whl
     - echo "Installing python cuda dependencies"
-    - pip3 install -q pycuda
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install PyCUDA" -- pip3 install pycuda
     - export LD_LIBRARY_PATH=$TRT_PACKAGE_DIR/lib:$LD_LIBRARY_PATH
     - echo "Setting up test environment"
     - if [ -n "$BASELINE_CSV" ]; then mkdir -p "$(dirname "$BASELINE_CSV")"; fi
     - echo "Running pipeline tests with pytest. Time:$(date)"
-    - python3 -m pytest tests/ --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
-    - echo "Command execution logs and pytest reports saved to $TEST_LOG_DIR"
+    - python3 -m pytest tests/ --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml="$CI_PROJECT_DIR/.ci-reports/test_report_$PRIORITY.xml"
+    - echo "HTML report saved to $TEST_LOG_DIR; JUnit report saved to $CI_PROJECT_DIR/.ci-reports"
     - ls -la $TEST_LOG_DIR
     - echo "Pipeline end time:$(date)"
 
 .nemo_eval_x86_template:
+  extends:
+    - .ci_test_submodules
+  variables:
+    L0_JOB_WRITES_ENGINES: "1"
   artifacts:
     when: always
     expire_in: 14 days
@@ -301,30 +318,16 @@
     - |
       : "${TEST_LOG_DIR:?TEST_LOG_DIR must be set}"
       : "${ENGINE_DIR:?ENGINE_DIR must be set}"
-      : "${EDGE_LLM_CACHE_DIR:?EDGE_LLM_CACHE_DIR must be set}"
-      : "${CI_MERGE_REQUEST_IID:?CI_MERGE_REQUEST_IID must be set}"
-      : "${NEMO_EVAL_ONNX_CACHE_NAME:?NEMO_EVAL_ONNX_CACHE_NAME must be set}"
-      export ONNX_DIR="$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/$NEMO_EVAL_ONNX_CACHE_NAME/onnx"
+      : "${ONNX_DIR:?ONNX_DIR must be set}"
       echo "Using ONNX cache: $ONNX_DIR"
       if [ ! -d "$ONNX_DIR" ]; then
         echo "ONNX cache not found at $ONNX_DIR"
         exit 1
       fi
-    - mkdir -p "$TEST_LOG_DIR" "$ENGINE_DIR"
-    - rm -rf "${TEST_LOG_DIR:?}"/* "${ENGINE_DIR:?}"/*
-    - chmod -R 777 "$TEST_LOG_DIR"
-    - echo "Installing dependencies"
-    - export DEBIAN_FRONTEND=noninteractive
-    - apt update -qq >/dev/null 2>&1
-    - apt install -y -qq python3 python3-pip python3-venv git curl >/dev/null 2>&1
     - echo "Checking TRT x86_64 package"
     - if [ ! -d "$TRT_PACKAGE_DIR" ]; then echo "TensorRT x86_64 cache not found at $TRT_PACKAGE_DIR"; exit 1; fi
     - echo "Using TensorRT x86_64 package directly from cache"
     - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
-    # Clone from NVIDIA internal mirrors to avoid CI submodule network issues.
-    # Public upstreams: github.com/google/googletest and github.com/nlohmann/json.
-    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
-    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
     - echo "Installing pytest dependencies"
     - pip3 install -q -r tests/requirements.txt
     - echo "Installing TensorRT Python package from cache"
@@ -378,108 +381,126 @@
     - echo "Pipeline end time:$(date)"
 
 .x86_unit_test_template:
+  extends:
+    - .ci_test_submodules
+    - .gitlab_junit_report
   script:
     - echo "Pipeline start time:$(date)"
     - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
-    - mkdir -p $TEST_LOG_DIR $ENGINE_DIR $ONNX_DIR
-    - rm -rf $TEST_LOG_DIR/* $ENGINE_DIR/* $ONNX_DIR/*
+    - mkdir -p $TEST_LOG_DIR "$CI_PROJECT_DIR/.ci-reports"
+    - rm -rf $TEST_LOG_DIR/*
     - chmod -R 777 $TEST_LOG_DIR
-    - echo "Installing dependencies"
-    - export DEBIAN_FRONTEND=noninteractive
-    - apt update -qq >/dev/null 2>&1
-    - apt install -y -qq python3 python3-pip git >/dev/null 2>&1
+    - echo "Verifying CI image dependencies"
+    - python3 --version
+    - pip3 --version
+    - git --version
     - echo "Checking TRT x86_64 package"
     - if [ ! -d "$TRT_PACKAGE_DIR" ]; then echo "TensorRT x86_64 cache not found at $TRT_PACKAGE_DIR"; exit 1; fi
     - echo "Using TensorRT x86_64 package directly from cache"
     - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
-    # clone googletest and nlohmannJson from internal mirror to avoid git submodule network issues
-    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
-    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
     - echo "Installing test dependencies"
-    - pip3 install -q -r tests/requirements.txt -r tests/requirements-ut.txt
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install unit-test dependencies" -- pip3 install -r tests/requirements.txt -r tests/requirements-ut.txt
     - echo "Installing TensorRT Python package from cache"
-    - pip3 install -q $TRT_PACKAGE_DIR/python/tensorrt-$TRT_VERSION*-cp312*.whl
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install TensorRT Python package" -- pip3 install $TRT_PACKAGE_DIR/python/${TRT_WHEEL_GLOB}.whl
     - export LD_LIBRARY_PATH=$TRT_PACKAGE_DIR/lib:$LD_LIBRARY_PATH
     # test_build_project_with_pybind (l0_python_ut list) builds _edgellm_runtime.
     - export PYTHONPATH="$PWD/build/pybind${PYTHONPATH:+:$PYTHONPATH}"
+    # Fail loudly if the runner env is broken (no torch/TRT/GPU); otherwise the
+    # harness skips every test at the module level and the job goes green empty.
+    - python3 -c "import tensorrt, torch; assert torch.cuda.is_available(), 'CUDA not available'"
     - echo "Running unit tests with pytest. Time:$(date)"
     # Test selection is driven by the tests/test_lists/$PRIORITY.yml list.
-    - python3 -m pytest tests/ --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
-    - echo "Command execution logs and pytest reports saved to $TEST_LOG_DIR"
+    - python3 -m pytest tests/ --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml="$CI_PROJECT_DIR/.ci-reports/test_report_$PRIORITY.xml"
+    - echo "HTML report saved to $TEST_LOG_DIR; JUnit report saved to $CI_PROJECT_DIR/.ci-reports"
     - ls -la $TEST_LOG_DIR
     - echo "Pipeline end time:$(date)"
-  
+
+.device_controller_environment:
+  image: "$DEVICE_CONTROLLER_IMAGE"
+  variables:
+    # Prevent SSH from forwarding an unsupported locale to device boards.
+    LANG: "C"
+    LC_ALL: "C"
+
 .device_test_template:
+  extends:
+    - .device_controller_environment
+    - .ci_test_submodules
+    - .gitlab_junit_report
+  variables:
+    REMOTE_WORKSPACE: "/home/${BOARD_USER}/tensorrt-edge-llm-${CI_JOB_ID}"
+    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
+    L0_JOB_WRITES_ENGINES: "1"
+    CI_APT_INSTALL_TIMEOUT_SECONDS: "1200"
+    CI_PIP_INSTALL_TIMEOUT_SECONDS: "2400"
   script:
+    - ': "${BOARD_USER:?Device jobs must define BOARD_USER}"'
     - echo "Pipeline start time:$(date)"
     - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
     - export BOARD_IP=${BOARD_IP:-192.168.55.1}
     - echo "Board IP:$BOARD_IP"
-    - mkdir -p $TEST_LOG_DIR
+    - mkdir -p $TEST_LOG_DIR "$CI_PROJECT_DIR/.ci-reports"
     - rm -rf $TEST_LOG_DIR/*
     - chmod -R 777 $TEST_LOG_DIR
-    - echo "Installing dependencies"
-    - export DEBIAN_FRONTEND=noninteractive
-    - apt update -qq >/dev/null 2>&1
-    - apt install -y -qq git openssh-client sshpass rsync python3 python3-pip python3-venv >/dev/null 2>&1
     - echo "Copying password to device scripts"
     - sed -i -e "s/{BOARDPASSWORD}/${BOARD_PASSWORD_NVKS}/g" .gitlab/ci/scripts/device_init.sh
-    # clean up the packages in the board
-    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP 'bash -s' < .gitlab/ci/scripts/device_init.sh
-    - if [ $? -ne 0 ]; then echo "Error occurred during initializing"; exit 1; fi
-    - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
-    # clone googletest and nlohmannJson from internal mirror to avoid git submodule network issues
-    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
-    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
-    - export REMOTE_WORKSPACE=${REMOTE_WORKSPACE:-/home/$BOARD_USER/tensorrt-edge-llm-${CI_JOB_ID:-manual}}
-    - export ENGINE_DIR=${ENGINE_DIR:-$REMOTE_WORKSPACE/engines}
+    - ': "${ENGINE_DIR:?Device pipeline jobs must define ENGINE_DIR}"'
     - |
       case "$REMOTE_WORKSPACE" in
         /home/$BOARD_USER/tensorrt-edge-llm*) ;;
         *) echo "Unsafe REMOTE_WORKSPACE=$REMOTE_WORKSPACE"; exit 1 ;;
       esac
-    - echo "Creating isolated remote workspace $REMOTE_WORKSPACE and syncing repo from host to board"
-    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "rm -rf '$REMOTE_WORKSPACE' && mkdir -p '$REMOTE_WORKSPACE' '$ENGINE_DIR'"
+    - export REMOTE_CI_SCRIPT_DIR="$REMOTE_WORKSPACE/.gitlab/ci/scripts"
+    - echo "Creating isolated remote workspace $REMOTE_WORKSPACE"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "umask 0000 && rm -rf -- '$REMOTE_WORKSPACE' && mkdir -p '$REMOTE_CI_SCRIPT_DIR' '$ENGINE_DIR'"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" scp -o StrictHostKeyChecking=no .gitlab/ci/scripts/ci_apt.sh .gitlab/ci/scripts/ci_run.sh "$BOARD_USER@$BOARD_IP:$REMOTE_CI_SCRIPT_DIR/"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "chmod 755 '$REMOTE_CI_SCRIPT_DIR/ci_apt.sh' '$REMOTE_CI_SCRIPT_DIR/ci_run.sh'"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "REMOTE_WORKSPACE='$REMOTE_WORKSPACE' CI_APT_SCRIPT='$REMOTE_CI_SCRIPT_DIR/ci_apt.sh' bash -s" < .gitlab/ci/scripts/device_init.sh
+    - if [ $? -ne 0 ]; then echo "Error occurred during initializing"; exit 1; fi
+    - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
+    - echo "Syncing repo from host to $REMOTE_WORKSPACE"
     - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -av -e "ssh -o StrictHostKeyChecking=no" $LLM_SDK_DIR/ $BOARD_USER@$BOARD_IP:$REMOTE_WORKSPACE/
     - echo "Setting file permissions to 755 to prevent permission issues"
     - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "chmod -R 755 $REMOTE_WORKSPACE"
     - echo "Installing pytest dependencies in a virtual environment"
     - python3 -m venv venv && source venv/bin/activate
-    - pip3 install -q -r tests/requirements.txt
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install pytest dependencies" -- pip3 install -r tests/requirements.txt
     - echo "Installing accuracy dependencies"
-    - pip3 install -q -r examples/accuracy/requirements.txt
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install accuracy dependencies" -- pip3 install -r examples/accuracy/requirements.txt
     - if [ -n "$BASELINE_CSV" ]; then mkdir -p "$(dirname "$BASELINE_CSV")"; fi
     - echo "Setup complete. Running pipeline tests on device with pytest. Time:$(date)"
-    - python3 -m pytest tests/ --priority=$PRIORITY --execution-mode=remote --remote-host=$BOARD_IP --remote-user=$BOARD_USER --remote-password="$BOARD_PASSWORD_NVKS" --remote-workspace=$REMOTE_WORKSPACE -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
-    - if [ $? -ne 0 ]; then echo "Error occurred during testing"; exit 1; fi
-    - echo "Command execution logs and pytest reports saved to $TEST_LOG_DIR. Cleaning up remote workspace."
-    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "rm -rf $REMOTE_WORKSPACE"
+    - python3 -m pytest tests/ --priority=$PRIORITY --execution-mode=remote --remote-host=$BOARD_IP --remote-user=$BOARD_USER --remote-password="$BOARD_PASSWORD_NVKS" --remote-workspace=$REMOTE_WORKSPACE -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml="$CI_PROJECT_DIR/.ci-reports/test_report_$PRIORITY.xml"
+    - echo "HTML report saved to $TEST_LOG_DIR; JUnit report saved to $CI_PROJECT_DIR/.ci-reports"
     - ls -la $TEST_LOG_DIR
     - deactivate
     - echo "Pipeline end time:$(date)"
+  after_script:
+    - if [ -f "$L0_STORAGE_ENV_FILE" ]; then . "$L0_STORAGE_ENV_FILE"; fi
+    - python3 .gitlab/ci/scripts/device_job_finalize.py || true
+    - !reference [.cleanup_engine_storage, after_script]
+    - !reference [.record_runner_usage, after_script]
 
 # Plugin python unit tests on an aarch64 board. Unlike .device_test_template
 # (pytest on the host driving the board over ssh), the unit tests call the
 # TensorRT Python API and torch CUDA directly, so pytest itself runs on the
 # board (see .gitlab/ci/scripts/device_unit_tests.sh).
 .device_unit_test_template:
+  extends:
+    - .device_controller_environment
+    - .ci_test_submodules
+    - .gitlab_junit_report
+  variables:
+    REMOTE_WORKSPACE: "/home/${BOARD_USER}/tensorrt-edge-llm-ut-${CI_JOB_ID}"
   script:
+    - ': "${BOARD_USER:?Device jobs must define BOARD_USER}"'
     - echo "Pipeline start time:$(date)"
     - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
     - export BOARD_IP=${BOARD_IP:-192.168.55.1}
     - echo "Board IP:$BOARD_IP"
-    - mkdir -p $TEST_LOG_DIR
+    - mkdir -p $TEST_LOG_DIR "$CI_PROJECT_DIR/.ci-reports"
     - rm -rf $TEST_LOG_DIR/*
     - chmod -R 777 $TEST_LOG_DIR
-    - echo "Installing dependencies"
-    - export DEBIAN_FRONTEND=noninteractive
-    - apt update -qq >/dev/null 2>&1
-    - apt install -y -qq git openssh-client sshpass rsync >/dev/null 2>&1
     - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
-    # clone googletest and nlohmannJson from internal mirror to avoid git submodule network issues
-    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
-    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
-    - export REMOTE_WORKSPACE=${REMOTE_WORKSPACE:-/home/$BOARD_USER/tensorrt-edge-llm-ut-${CI_JOB_ID:-manual}}
     - |
       case "$REMOTE_WORKSPACE" in
         /home/$BOARD_USER/tensorrt-edge-llm*) ;;
@@ -490,14 +511,23 @@
     - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -a -e "ssh -o StrictHostKeyChecking=no" $LLM_SDK_DIR/ $BOARD_USER@$BOARD_IP:$REMOTE_WORKSPACE/
     - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "chmod -R 755 $REMOTE_WORKSPACE"
     - echo "Running plugin unit tests on the board. Time:$(date)"
-    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "REMOTE_WORKSPACE='$REMOTE_WORKSPACE' TRT_PACKAGE_DIR='$TRT_PACKAGE_DIR' PRIORITY='$PRIORITY' bash -s" < .gitlab/ci/scripts/device_unit_tests.sh
-    - echo "Fetching pytest reports from the board"
-    - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -a -e "ssh -o StrictHostKeyChecking=no" $BOARD_USER@$BOARD_IP:$REMOTE_WORKSPACE/logs/ $TEST_LOG_DIR/
-    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "rm -rf '$REMOTE_WORKSPACE'"
-    - ls -la $TEST_LOG_DIR
-    - echo "Pipeline end time:$(date)"
+    - |
+      sshpass -p "$BOARD_PASSWORD_NVKS" \
+        ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP \
+        "REMOTE_WORKSPACE='$REMOTE_WORKSPACE' TRT_PACKAGE_DIR='$TRT_PACKAGE_DIR' PRIORITY='$PRIORITY' JUNIT_PREFIX='$CI_JOB_NAME_SLUG' CI_PIP_INSTALL_TIMEOUT_SECONDS='$CI_PIP_INSTALL_TIMEOUT_SECONDS' bash -s" \
+        < .gitlab/ci/scripts/device_unit_tests.sh
+  after_script:
+    - if [ -f "$L0_STORAGE_ENV_FILE" ]; then . "$L0_STORAGE_ENV_FILE"; fi
+    - python3 .gitlab/ci/scripts/device_job_finalize.py --fetch-reports || true
+    - !reference [.cleanup_engine_storage, after_script]
+    - !reference [.record_runner_usage, after_script]
 
 .cross_build_template:
+  extends:
+    - .ci_internal_submodules
+  artifacts:
+    reports:
+      metrics: ci-artifacts/lib-size/lib_size_metrics.txt
   script:
     - echo "Pipeline start time:$(date)"
     - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
@@ -505,8 +535,6 @@
     - echo "Checking TRT package"
     - if [ ! -d "$TRT_PACKAGE_DIR" ]; then echo "TensorRT package not found at $TRT_PACKAGE_DIR"; exit 1; fi
     - echo "Using TensorRT package from cache at $TRT_PACKAGE_DIR"
-    - echo "Updating git submodules"
-    - git submodule update --init --recursive
     - echo "Creating build directory"
     - mkdir -p build
     - cd build
@@ -516,8 +544,15 @@
         -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake 
         -DEMBEDDED_TARGET=$EMBEDDED_TARGET
         -DCUDA_CTK_VERSION=$CUDA_VERSION
-        -DENABLE_CUTE_DSL=${ENABLE_CUTE_DSL:-OFF}
+        -DENABLE_CUTE_DSL=${ENABLE_CUTE_DSL:-fmha}
     - echo "Building the project"
     - make -j$(nproc)
     - echo "Cross-build completed successfully"
+    - echo "Reporting library size"
+    - python3 ../scripts/report_library_size.py
+        --build-dir .
+        --source-dir ..
+        --label $EMBEDDED_TARGET
+        --output-dir ../ci-artifacts/lib-size
+        || echo "WARNING - library size report failed"
     - echo "Pipeline end time:$(date)"

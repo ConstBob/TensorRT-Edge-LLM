@@ -50,8 +50,9 @@ rules, emitting a clear error when they are violated.
 
 - [`nvfp4MoePlugin.h`](nvfp4MoePlugin.h) / [`nvfp4MoePlugin.cpp`](nvfp4MoePlugin.cpp) — the `IPluginV3` implementation.
 - [`../../kernels/moe/nvfp4_cutedsl/cuteDslNvfp4MoeSm110Runner.{h,cpp}`](../../kernels/moe/nvfp4_cutedsl/)
-  — the SM100/101/110 AOT-module owner: module load/unload,
-  shape-check, workspace layout, and split FC1 / FC2 dispatch.
+  — the SM100/101/110 AOT-module owner: per-variant lazy loading,
+  shape checks, workspace layout, and split FC1 / FC2 dispatch. Loaded
+  modules remain resident for process lifetime.
 - [`../../../kernelSrcs/nvfp4_moe_cutedsl/README.md`](../../../kernelSrcs/nvfp4_moe_cutedsl/README.md)
   — split FC1/FC2 kernel variants, AOT build flow, and data-layout notes.
 
@@ -106,8 +107,8 @@ and rebuild.
 
 ## Validation
 
-The split-path plugin accuracy entry is
-[the SM100/101/110 plugin accuracy test](../../../tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py).
+The split-path backend is covered by the
+[SM100/101/110 runner smoke and accuracy tests](../../../unittests/nvfp4MoeCuteDslSm110Tests.cu).
 Avoid validating production routing by instantiating Python-only helper
 modules directly; model integration should be tested at the export path
 that explicitly emits `Nvfp4MoePlugin` for an SM100/101/110 target.
@@ -115,7 +116,6 @@ that explicitly emits `Nvfp4MoePlugin` for an SM100/101/110 target.
 ### Thor sign-off checklist (runner-test equivalent)
 
 1. Manually generate the `nvfp4_moe` artifact with the shared workflow.
-2. `mount-thor-sshfs` the workspace onto Thor.
+2. Copy or mount the workspace on Thor.
 3. Build the plugin with `-DENABLE_CUTE_DSL=nvfp4_moe -DCMAKE_CUDA_ARCHITECTURES=110a`.
-4. Run the split-path plugin accuracy test
-   (`tests/python-unittests/test_nvfp4_moe_sm110_plugin_accuracy.py`).
+4. Run `./build/unitTest --gtest_filter='CuteDslNvfp4MoeSm110Test.*'`.

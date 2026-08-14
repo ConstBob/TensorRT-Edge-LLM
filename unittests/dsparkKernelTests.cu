@@ -180,69 +180,6 @@ TEST(DSparkKernels, FillUniformsIsDeterministicAndBounded)
     EXPECT_TRUE(sawOffsetDifference);
 }
 
-TEST(DSparkKernels, VanillaMarkovGreedyBatchTileMatchesReference)
-{
-    cudaStream_t stream = nullptr;
-    constexpr int32_t batchSize = 5;
-    constexpr int32_t proposalLen = 2;
-    constexpr int32_t vocabSize = 37;
-    constexpr int32_t markovRank = 5;
-    constexpr int32_t markovTokensPerPartialBlock = 16;
-    int32_t const partialCount = dsparkMarkovPartialCount(vocabSize);
-
-    std::vector<float> backboneValues(batchSize * proposalLen * vocabSize);
-    for (int32_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
-    {
-        for (int32_t step = 0; step < proposalLen; ++step)
-        {
-            for (int32_t vocabIdx = 0; vocabIdx < vocabSize; ++vocabIdx)
-            {
-                float const base = static_cast<float>(((batchIdx + 3) * (step + 5) * (vocabIdx + 7)) % 17) * 0.125F;
-                float const blockBias = (vocabIdx / markovTokensPerPartialBlock == batchIdx % 3) ? 0.75F : -0.25F;
-                backboneValues[(batchIdx * proposalLen + step) * vocabSize + vocabIdx] = base + blockBias;
-            }
-        }
-    }
-
-    std::vector<float> markovW1Float(vocabSize * markovRank);
-    std::vector<float> markovW2Float(vocabSize * markovRank);
-    for (int32_t vocabIdx = 0; vocabIdx < vocabSize; ++vocabIdx)
-    {
-        for (int32_t rankIdx = 0; rankIdx < markovRank; ++rankIdx)
-        {
-            markovW1Float[vocabIdx * markovRank + rankIdx]
-                = static_cast<float>(((vocabIdx + 1) * (rankIdx + 2)) % 11 - 5) * 0.125F;
-            markovW2Float[vocabIdx * markovRank + rankIdx]
-                = static_cast<float>(((vocabIdx + 3) * (rankIdx + 4)) % 13 - 6) * 0.125F;
-        }
-    }
-
-    auto const markovW1Values = toHalf(markovW1Float);
-    auto const markovW2Values = toHalf(markovW2Float);
-    std::vector<int32_t> const firstPrevTokenValues{0, 7, 14, 21, 28};
-
-    auto backboneLogits = rt::Tensor({batchSize, proposalLen, vocabSize}, rt::DeviceType::kGPU, DataType::kFLOAT);
-    auto markovW1 = rt::Tensor({vocabSize, markovRank}, rt::DeviceType::kGPU, DataType::kHALF);
-    auto markovW2 = rt::Tensor({vocabSize, markovRank}, rt::DeviceType::kGPU, DataType::kHALF);
-    auto firstPrevTokens = rt::Tensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
-    auto draftTokenIds = rt::Tensor({batchSize, proposalLen}, rt::DeviceType::kGPU, DataType::kINT32);
-    auto partialValues = rt::Tensor({batchSize, partialCount}, rt::DeviceType::kGPU, DataType::kFLOAT);
-    auto partialIndices = rt::Tensor({batchSize, partialCount}, rt::DeviceType::kGPU, DataType::kINT32);
-
-    copyHostToDevice<float>(backboneLogits, backboneValues);
-    copyHostToDevice<half>(markovW1, markovW1Values);
-    copyHostToDevice<half>(markovW2, markovW2Values);
-    copyHostToDevice<int32_t>(firstPrevTokens, firstPrevTokenValues);
-
-    dsparkVanillaMarkovGreedy(backboneLogits, markovW1, markovW2, firstPrevTokens, draftTokenIds, partialValues,
-        partialIndices, batchSize, proposalLen, vocabSize, markovRank, stream);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    EXPECT_EQ(copyDeviceToHost<int32_t>(draftTokenIds),
-        greedyMarkovReference(backboneValues, markovW1Values, markovW2Values, firstPrevTokenValues, batchSize,
-            proposalLen, vocabSize, markovRank));
-}
-
 TEST(DSparkKernels, VanillaMarkovSampleMaterializesDistribution)
 {
     cudaStream_t stream = nullptr;

@@ -1,13 +1,23 @@
 # ==============================================================================
-# L0 TESTS - Merge Request Triggered
-# Per-pipeline cache:  /scratch.edge_llm_cache/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}/
-#                      (engines, logs, per-runner caches; pruned by l0_cache_cleanup,
-#                       which keeps only the newest NUMERIC pipeline dir per MR.)
-# Reusable ONNX cache: /scratch.edge_llm_cache/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/
-#                      Deliberately NON-numeric so it survives the pipeline-dir cleanup,
-#                      letting later pipelines of the same MR reuse exported ONNX. The
-#                      export jobs set ONNX_REUSE=1 and skip re-export unless the commit
-#                      has [Reexport] or changes tensorrt_edgellm Python (see templates.yml).
+# L0 TESTS - Merge requests and tagged stability schedules
+#
+# Merge request storage:
+#   Workspace: /scratch.edge_llm_cache/L0/MR_<iid>/workspace/pipeline_<id>/
+#   ONNX:      /scratch.edge_llm_cache/L0/MR_<iid>/onnx_cache/
+#   ONNX exports are reused unless the ci:force-checkpoint-export MR label is
+#   present or exporter inputs change.
+#
+# Stability storage (scheduled with L0_STABILITY=true):
+#   Root: /scratch.edge_llm_cache/L0/STABILITY/
+#         <UTC-created-at>_pipeline_<id>/
+#   Jobs write directly beneath workspace/ because each stability root belongs
+#   to exactly one pipeline.
+#   ONNX exports are regenerated for every stability pipeline.
+#   Each root is deleted by its environment lifecycle after two days.
+#
+# Every non-exempt job receives an isolated job_<id>_<slug> directory beneath
+# its pipeline workspace. Initialization gates storage users, while an
+# independent best-effort job prunes superseded MR pipeline workspaces.
 # ==============================================================================
 
 include:
@@ -16,42 +26,68 @@ include:
 # Checkpoint export for Blackwell pre-quantized models
 l0_checkpoint_export:
   stage: l0_test
+  resource_group: "${L0_STORAGE_RESOURCE_GROUP}-onnx-blackwell"
+  needs:
+    - job: init_l0_storage
+      artifacts: false
   variables:
     CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
-    TEST_CACHE_DIR: "$L0_CACHE_DIR/checkpoint_export"
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     PRIORITY: l0_checkpoint_export
-    ONNX_REUSE: "1"
-    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export/onnx"
-    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    ONNX_REUSE: "$L0_ONNX_REUSE"
   tags:
     - a30-edgellm-nvks
   image: "$IMAGE"
   extends:
+    - .l0_storage_paths
+    - .l0_blackwell_exports
     - .checkpoint_export_template
     - .l0_rules
-    - .l0_environment
 
 # Checkpoint export for Ampere pre-quantized models
 l0_checkpoint_export_ampere:
   stage: l0_test
+  resource_group: "${L0_STORAGE_RESOURCE_GROUP}-onnx-ampere"
+  needs:
+    - job: init_l0_storage
+      artifacts: false
   variables:
     CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
-    TEST_CACHE_DIR: "$L0_CACHE_DIR/checkpoint_export_ampere"
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     PRIORITY: l0_checkpoint_export_ampere
-    ONNX_REUSE: "1"
-    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export_ampere/onnx"
-    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    ONNX_REUSE: "$L0_ONNX_REUSE"
   tags:
     - a30-edgellm-nvks
   image: "$IMAGE"
   extends:
+    - .l0_storage_paths
+    - .l0_ampere_exports
     - .checkpoint_export_template
     - .l0_rules
-    - .l0_environment
+
+# Checkpoint export for the TRT-RTX A30 pipeline. Exports Qwen3.5-0.8B int4_awq
+# with the AWQ Int4GroupwiseGemmPlugin (V1); the TRT-RTX ONNX parser does not
+# import the default cuteDSL V2 op, so this ONNX is TRT-RTX-specific and kept in
+# its own cache rather than shared with l0_checkpoint_export_ampere.
+l0_checkpoint_export_a30_trtrtx:
+  stage: l0_test
+  resource_group: "${L0_STORAGE_RESOURCE_GROUP}-onnx-a30-trtrtx"
+  needs:
+    - job: init_l0_storage
+      artifacts: false
+  variables:
+    CUDA_VERSION: "13.2"
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    PRIORITY: l0_checkpoint_export_a30_trtrtx
+    ONNX_REUSE: "$L0_ONNX_REUSE"
+  tags:
+    - a30-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .l0_storage_paths
+    - .l0_a30_trtrtx_exports
+    - .checkpoint_export_template
+    - .l0_rules
 
 # Building and testing with A30 Linux
 l0_a30:
@@ -63,26 +99,23 @@ l0_a30:
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
-    TEST_CACHE_DIR: "$L0_CACHE_DIR/a30"
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     PRIORITY: l0_pipeline_a30
-    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export_ampere/onnx"
-    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
-    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/a30.csv"
   tags:
     - a30-edgellm-nvks
   image: "$IMAGE"
   extends:
+    - .l0_storage_paths
+    - .l0_ampere_exports
     - .x86_test_template
     - .l0_rules
-    - .l0_environment
   interruptible: true
 
 l0_nemo_eval_a30:
   stage: l0_test
+  when: manual
   needs:
     - l0_checkpoint_export_ampere
     - job: build_cutedsl_docker_matrix
@@ -90,28 +123,17 @@ l0_nemo_eval_a30:
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
-    TEST_CACHE_DIR: "$L0_CACHE_DIR/nemo_eval_a30"
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     PRIORITY: l0_nemo_eval_qwen2_5_0_5b
-    NEMO_EVAL_ONNX_CACHE_NAME: checkpoint_export_ampere
-    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
-    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
   tags:
     - a30-edgellm-nvks
   image: "$IMAGE"
   extends:
+    - .l0_storage_paths
+    - .l0_ampere_exports
     - .nemo_eval_x86_template
-    - .l0_environment
-  rules:
-    - if: $L1 == "true"
-      when: never
-    - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
-      when: never
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-      when: manual
-      allow_failure: true
+    - .l0_rules
   allow_failure: true
   interruptible: true
 
@@ -125,48 +147,69 @@ l0_a30_trt11:
     CUDA_VERSION: "13.2"
     TRT_VERSION: "$TRT11_VERSION"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
-    TEST_CACHE_DIR: "$L0_CACHE_DIR/a30_trt11"
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     PRIORITY: l0_pipeline_a30
-    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export_ampere/onnx"
-    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
-    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/a30_trt11.csv"
   tags:
     - a30-edgellm-nvks
   image: "$IMAGE"
   extends:
+    - .l0_storage_paths
+    - .l0_ampere_exports
     - .x86_test_template
     - .l0_rules
-    - .l0_environment
   interruptible: true
 
 # Focused coverage for the experimental ONNX-less frontend. This uses
 # the standard L0 build/runtime template but does not consume exported ONNX.
 l0_builder_a30:
   stage: l0_test
+  needs:
+    - job: init_l0_storage
+      artifacts: false
+    - job: build_cutedsl_docker_matrix
+      artifacts: true
   variables:
     CUDA_VERSION: "13.2"
     TRT_VERSION: "$TRT11_VERSION"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
-    TEST_CACHE_DIR: "$L0_CACHE_DIR/builder_a30"
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     PRIORITY: l0_builder_a30
-    ONNX_DIR: "$TEST_CACHE_DIR/unused_onnx"
-    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
-    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/a30_trt11.csv"
   tags:
     - a30-edgellm-nvks
   image: "$IMAGE"
   extends:
+    - .l0_storage_paths
     - .x86_test_template
     - .l0_rules
-    - .l0_environment
+  interruptible: true
+
+# Building and testing with A30 Linux against TRT-RTX instead of Enterprise TRT.
+# Consumes the TRT-RTX-specific ONNX produced by l0_checkpoint_export_a30_trtrtx.
+l0_a30_trtrtx:
+  stage: l0_test
+  needs:
+    - l0_checkpoint_export_a30_trtrtx
+    - job: build_cutedsl_docker_matrix
+      artifacts: true
+  variables:
+    CUDA_VERSION: "13.2"
+    TRT_RTX_VERSION: "1.7.0.28"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    PRIORITY: l0_pipeline_a30_trtrtx
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/TensorRT-RTX/$TRT_RTX_VERSION/TensorRT-RTX-$TRT_RTX_VERSION-x86_64_rocky8_cuda13.4"
+    TRT_WHEEL_GLOB: "tensorrt_rtx-$TRT_RTX_VERSION*-cp312*"
+  tags:
+    - a30-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .l0_storage_paths
+    - .l0_a30_trtrtx_exports
+    - .x86_test_template
+    - .l0_rules
   interruptible: true
 
 l0_rtx3090:
@@ -178,22 +221,18 @@ l0_rtx3090:
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
-    TEST_CACHE_DIR: "$L0_CACHE_DIR/rtx3090"
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     PRIORITY: l0_pipeline_rtx3090
-    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export_ampere/onnx"
-    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
-    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/rtx3090.csv"
   tags:
     - rtx3090-edgellm-nvks
   image: "$IMAGE"
   extends:
+    - .l0_storage_paths
+    - .l0_ampere_exports
     - .x86_test_template
     - .l0_rules
-    - .l0_environment
   interruptible: true
 
 # Building and testing with RTX5080 Linux
@@ -208,22 +247,18 @@ l0_rtx5080:
       CUDA_VERSION: "12.9"
       TRT_CUDA_VERSION: "12.9"
       TRT_VERSION: "10.13.3.9"
-      IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-      L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
-      TEST_CACHE_DIR: "$L0_CACHE_DIR/rtx5080"
+      IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
       PRIORITY: l0_pipeline_rtx5080
-      ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export/onnx"
-      TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
-      ENGINE_DIR: "$TEST_CACHE_DIR/engines"
       TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
       BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/rtx5080.csv"
     tags:
       - rtx5080-edgellm-nvks
     image: "$IMAGE"
     extends:
+      - .l0_storage_paths
+      - .l0_blackwell_exports
       - .x86_test_template
       - .l0_rules
-      - .l0_environment
     interruptible: true
 
 # Building and testing with B100 Linux (x86 Blackwell, SM100)
@@ -237,22 +272,18 @@ l0_b100:
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
-    TEST_CACHE_DIR: "$L0_CACHE_DIR/b100"
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     PRIORITY: l0_pipeline_b100
-    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export/onnx"
-    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
-    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/b100.csv"
   tags:
     - b100-edgellm-nvks
   image: "$IMAGE"
   extends:
+    - .l0_storage_paths
+    - .l0_blackwell_exports
     - .x86_test_template
-    - .l0_manual_rules
-    - .l0_environment
+    - .l0_rules
   interruptible: true
 
 # Building and testing with RTX 5090 Linux (x86 Blackwell, SM120)
@@ -265,26 +296,23 @@ l0_rtx5090:
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
-    TEST_CACHE_DIR: "$L0_CACHE_DIR/rtx5090"
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     PRIORITY: l0_pipeline_rtx5090
-    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export/onnx"
-    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
-    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/rtx5090.csv"
   tags:
     - rtx5090-edgellm-nvks
   image: "$IMAGE"
   extends:
+    - .l0_storage_paths
+    - .l0_blackwell_exports
     - .x86_test_template
     - .l0_rules
-    - .l0_environment
   interruptible: true
 
 l0_nemo_eval_rtx5090:
   stage: l0_test
+  when: manual
   needs:
     - l0_checkpoint_export
     - job: build_cutedsl_docker_matrix
@@ -292,48 +320,56 @@ l0_nemo_eval_rtx5090:
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
-    TEST_CACHE_DIR: "$L0_CACHE_DIR/nemo_eval_rtx5090"
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     PRIORITY: l0_nemo_eval_nemotron_3_nano_4b
-    NEMO_EVAL_ONNX_CACHE_NAME: checkpoint_export
-    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
-    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
   tags:
     - rtx5090-edgellm-nvks
   image: "$IMAGE"
   extends:
+    - .l0_storage_paths
+    - .l0_blackwell_exports
     - .nemo_eval_x86_template
-    - .l0_environment
-  rules:
-    - if: $L1 == "true"
-      when: never
-    - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
-      when: never
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-      when: manual
-      allow_failure: true
+    - .l0_rules
   allow_failure: true
   interruptible: true
 
-# Unit tests for low-level components (attention kernels, etc.). Automatic x86
-# SKUs stage sm_80 and sm_120 artifacts; B100/sm_100 stays available as manual
-# jobs below while the B100 runner is unstable.
+# Quantization sanity (GPU / A30): run the quantization unit tests (which
+# actually quantize small real models) in the py3.12 TensorRT base image.
+quantization_sanity:
+  stage: l0_test
+  tags:
+    - a30-edgellm-nvks
+  variables:
+    CUDA_VERSION: "13.2"
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+  image: "$IMAGE"
+  script:
+    - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
+    - nvidia-smi -L
+    - export LLM_SDK_DIR=$(pwd)
+    - export PYTHONPATH=$LLM_SDK_DIR:$PYTHONPATH
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install quantization test dependencies" -- pip3 install -r tests/requirements.txt torch
+    # conftest.from_environment requires these paths; the unit tests do not use them.
+    - export ONNX_DIR=$(pwd)/.ci_qc_onnx LLM_MODELS_DIR=$(pwd)/.ci_qc_models EDGELLM_DATA_DIR=$(pwd)/.ci_qc_data
+    - mkdir -p "$ONNX_DIR" "$LLM_MODELS_DIR" "$EDGELLM_DATA_DIR"
+    - python3 -m pytest tests/python-unittests/test_quantize.py -v --color=yes
+  extends: .mr_and_l1_rules
+  interruptible: true
+
+# Unit tests for low-level components (attention kernels, etc.).
 l0_unit_tests_x86:
   stage: l0_test
   needs:
+    - job: init_l0_storage
+      artifacts: false
     - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     CUDA_VERSION: "13.2"
     TRT_VERSION: "$TRT10_X86_VERSION"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/unit_tests_x86"
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     PRIORITY: l0_python_ut
-    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
-    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
-    ONNX_DIR: "$TEST_CACHE_DIR/onnx"
     TRT_CUDA_VERSION: "13.2"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
   parallel:
@@ -346,26 +382,24 @@ l0_unit_tests_x86:
     - ${RUNNER_TAG}
   image: "$IMAGE"
   extends:
+    - .l0_storage_paths
     - .x86_unit_test_template
     - .l0_rules
-    - .l0_environment
   interruptible: true
 
 l0_unit_tests_x86_trt11:
   stage: l0_test
   needs:
+    - job: init_l0_storage
+      artifacts: false
     - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     CUDA_VERSION: "13.2"
     TRT_VERSION: "$TRT11_VERSION"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/unit_tests_x86_trt11"
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     PRIORITY: l0_python_ut
-    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
-    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
-    ONNX_DIR: "$TEST_CACHE_DIR/onnx"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
   parallel:
     matrix:
@@ -377,70 +411,66 @@ l0_unit_tests_x86_trt11:
     - ${RUNNER_TAG}
   image: "$IMAGE"
   extends:
+    - .l0_storage_paths
     - .x86_unit_test_template
     - .l0_rules
-    - .l0_environment
   interruptible: true
 
 l0_unit_tests_x86_b100:
   stage: l0_test
   allow_failure: true
   needs:
+    - job: init_l0_storage
+      artifacts: false
     - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     CUDA_VERSION: "13.2"
     TRT_VERSION: "$TRT10_X86_VERSION"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/unit_tests_x86_b100"
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     PRIORITY: l0_python_ut
-    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
-    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
-    ONNX_DIR: "$TEST_CACHE_DIR/onnx"
     TRT_CUDA_VERSION: "13.2"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
   tags:
     - b100-edgellm-nvks
   image: "$IMAGE"
   extends:
+    - .l0_storage_paths
     - .x86_unit_test_template
-    - .l0_manual_rules
-    - .l0_environment
+    - .l0_rules
   interruptible: true
 
 l0_unit_tests_x86_trt11_b100:
   stage: l0_test
   allow_failure: true
   needs:
+    - job: init_l0_storage
+      artifacts: false
     - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
     CUDA_VERSION: "13.2"
     TRT_VERSION: "$TRT11_VERSION"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/unit_tests_x86_trt11_b100"
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     PRIORITY: l0_python_ut
-    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
-    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
-    ONNX_DIR: "$TEST_CACHE_DIR/onnx"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
   tags:
     - b100-edgellm-nvks
   image: "$IMAGE"
   extends:
+    - .l0_storage_paths
     - .x86_unit_test_template
-    - .l0_manual_rules
-    - .l0_environment
+    - .l0_rules
   interruptible: true
 
 # Plugin unit tests on Jetson/Drive Thor (SM110). pytest runs on the board
-# itself (TensorRT Python API + torch CUDA need the GPU); allow_failure until
-# the board python environment is proven out in CI.
+# itself (TensorRT Python API + torch CUDA need the GPU).
 l0_unit_tests_thor:
   stage: l0_test
-  allow_failure: true
   needs:
+    - job: init_l0_storage
+      artifacts: false
     - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
@@ -448,25 +478,23 @@ l0_unit_tests_thor:
     CUDA_VERSION: "13.0"
     TRT_VERSION: "10.16.0.72"
     TRT_CUDA_VERSION: "13.2"
-    TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/unit_tests_thor"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$TRT_CUDA_VERSION"
     PRIORITY: l0_python_ut
-    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BOARD_IP: "192.168.55.1"
   tags:
     - thor_drive-nvks
-  image: "ubuntu:24.04"
   extends:
+    - .l0_storage_paths
     - .device_unit_test_template
     - .l0_rules
-    - .l0_environment
   interruptible: true
 
 # Plugin unit tests on Jetson Orin (SM87), same board-side pytest flow.
 l0_unit_tests_orin:
   stage: l0_test
-  allow_failure: true
   needs:
+    - job: init_l0_storage
+      artifacts: false
     - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
@@ -474,17 +502,14 @@ l0_unit_tests_orin:
     CUDA_VERSION: "13.2"
     # TRT_VERSION comes from the global default, same as l0_jetson_orin.
     TRT_CUDA_VERSION: "13.2"
-    TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/unit_tests_orin"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.aarch64.cuda-$TRT_CUDA_VERSION"
     PRIORITY: l0_python_ut
-    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
   tags:
     - p3730-k8s
-  image: "ubuntu:24.04"
   extends:
+    - .l0_storage_paths
     - .device_unit_test_template
     - .l0_rules
-    - .l0_environment
   interruptible: true
 
 # Building and testing with Jetson Orin
@@ -498,20 +523,16 @@ l0_jetson_orin:
     BOARD_USER: "tensorrt_user"
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
-    TEST_CACHE_DIR: "$L0_CACHE_DIR/jetson_orin"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.aarch64.cuda-$TRT_CUDA_VERSION"
     PRIORITY: l0_pipeline_orin
-    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export_ampere/onnx"
-    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/jetson_orin.csv"
   tags:
     - p3730-k8s
-  image: "ubuntu:24.04"
   extends:
+    - .l0_storage_paths
+    - .l0_ampere_exports
     - .device_test_template
     - .l0_rules
-    - .l0_environment
   interruptible: true
 
 # Building and testing with Drive Thor 1 (SM110 Blackwell)
@@ -526,21 +547,17 @@ l0_drive_thor_1:
     CUDA_VERSION: "13.0"
     TRT_VERSION: "10.16.0.72"
     TRT_CUDA_VERSION: "13.2"
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
-    TEST_CACHE_DIR: "$L0_CACHE_DIR/drive_thor_1"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$TRT_CUDA_VERSION"
     PRIORITY: l0_pipeline_thor_1
-    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export/onnx"
-    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/drive_thor_1.csv"
     BOARD_IP: "192.168.55.1"
   tags:
     - thor_drive-nvks
-  image: "ubuntu:24.04"
   extends:
+    - .l0_storage_paths
+    - .l0_blackwell_exports
     - .device_test_template
     - .l0_rules
-    - .l0_environment
   interruptible: true
 
 l0_drive_thor_1_trt11:
@@ -554,21 +571,17 @@ l0_drive_thor_1_trt11:
     CUDA_VERSION: "13.0"
     TRT_VERSION: "$TRT11_VERSION"
     TRT_CUDA_VERSION: "13.2"
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
-    TEST_CACHE_DIR: "$L0_CACHE_DIR/drive_thor_1_trt11"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$TRT_CUDA_VERSION"
     PRIORITY: l0_pipeline_thor_1_trt11
-    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export/onnx"
-    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/drive_thor_1_trt11.csv"
     BOARD_IP: "192.168.55.1"
   tags:
     - thor_drive-nvks
-  image: "ubuntu:24.04"
   extends:
+    - .l0_storage_paths
+    - .l0_blackwell_exports
     - .device_test_template
     - .l0_rules
-    - .l0_environment
   interruptible: true
 
 # Building and testing with Drive Thor 2 (SM110 Blackwell) - FP8 + EAGLE VLM
@@ -583,21 +596,17 @@ l0_drive_thor_2:
     CUDA_VERSION: "13.0"
     TRT_VERSION: "10.16.0.72"
     TRT_CUDA_VERSION: "13.2"
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
-    TEST_CACHE_DIR: "$L0_CACHE_DIR/drive_thor_2"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$TRT_CUDA_VERSION"
     PRIORITY: l0_pipeline_thor_2
-    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export/onnx"
-    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/drive_thor_2.csv"
     BOARD_IP: "192.168.55.1"
   tags:
     - thor_ts4_724-nvks
-  image: "ubuntu:24.04"
   extends:
+    - .l0_storage_paths
+    - .l0_blackwell_exports
     - .device_test_template
     - .l0_rules
-    - .l0_environment
   interruptible: true
 
 l0_drive_thor_2_trt11:
@@ -611,21 +620,17 @@ l0_drive_thor_2_trt11:
     CUDA_VERSION: "13.0"
     TRT_VERSION: "$TRT11_VERSION"
     TRT_CUDA_VERSION: "13.2"
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
-    TEST_CACHE_DIR: "$L0_CACHE_DIR/drive_thor_2_trt11"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$TRT_CUDA_VERSION"
     PRIORITY: l0_pipeline_thor_2_trt11
-    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export/onnx"
-    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/drive_thor_2_trt11.csv"
     BOARD_IP: "192.168.55.1"
   tags:
     - thor_ts4_724-nvks
-  image: "ubuntu:24.04"
   extends:
+    - .l0_storage_paths
+    - .l0_blackwell_exports
     - .device_test_template
     - .l0_rules
-    - .l0_environment
   interruptible: true
 
 # Building and testing with Jedha board (large memory — takes bigger models, accuracy tests, EAGLE)
@@ -640,113 +645,106 @@ l0_jedha:
     CUDA_VERSION: "12.8"
     TRT_VERSION: "10.16.0.72"
     TRT_CUDA_VERSION: "13.2"
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
-    TEST_CACHE_DIR: "$L0_CACHE_DIR/jedha"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.aarch64.cuda-$TRT_CUDA_VERSION"
     PRIORITY: l0_pipeline_jedha
-    ONNX_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/onnx_cache/checkpoint_export/onnx"
-    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/jedha.csv"
   tags:
     - jedha-edgellm-nvks
-  image: "ubuntu:24.04"
   extends:
+    - .l0_storage_paths
+    - .l0_blackwell_exports
     - .device_test_template
     - .l0_rules
-    - .l0_environment
   interruptible: true
 
-# JetPack 6 cross-build (CUDA 12.6, no CuTeDSL artifacts yet)
+# JetPack 6 cross-build (CUDA 12.6)
 "l0_cross_build_jp6_cuda12.6":
   stage: l0_test
   variables:
     CUDA_VERSION: "12.6"
     TRT_VERSION: "10.13.3.9"
     TRT_CUDA_VERSION: "12.9"
-    IMAGE: "urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:rel-10.3-cross-aarch64-l4t-cuda12.6"
+    IMAGE: "artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:rel-10.3-cross-aarch64-l4t-cuda12.6"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.aarch64.cuda-$TRT_CUDA_VERSION"
     EMBEDDED_TARGET: jetson-orin
-    ENABLE_CUTE_DSL: "OFF"
   tags:
     - a30-edgellm-nvks
   image: "$IMAGE"
   extends:
     - .cross_build_template
     - .l0_rules
-    - .l0_environment
   interruptible: true
 
-# DriveOS 6 Linux cross-build (CUDA 11.4, no CuTeDSL artifacts yet)
+# JetPack 6 cross-build against the TensorRT 10.3 that JP6 ships (CUDA 12.6)
+"l0_cross_build_jp6_trt10.3_cuda12.6":
+  stage: l0_test
+  variables:
+    CUDA_VERSION: "12.6"
+    TRT_VERSION: "10.3.0.31"
+    TRT_CUDA_VERSION: "12.5"
+    IMAGE: "artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:rel-10.3-cross-aarch64-l4t-cuda12.6"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-10.3.0.31/TensorRT-10.3.0.31-aarch64-cuda-12.5"
+    EMBEDDED_TARGET: jetson-orin
+  tags:
+    - a30-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .cross_build_template
+    - .l0_rules
+  interruptible: true
+
+# DriveOS 6 Linux cross-build (CUDA 11.4)
+#
+# Upstream nvidia-cutlass-dsl ships only cu12/cu13 wheels, so this job cannot
+# generate CuTe DSL kernels. It pulls a prebuilt sm_87/cuda11 artifact from the
+# project's generic package registry instead. Regenerate and re-publish whenever
+# kernelSrcs/fmha_v2_cutedsl/fmha.py or kernelSrcs/gdn_cutedsl/*.py changes.
 "l0_cross_build_d6l_cuda11.4":
   stage: l0_test
   variables:
     CUDA_VERSION: "11.4"
     TRT_VERSION: "10.13.3.9"
     TRT_CUDA_VERSION: "11.4"
-    IMAGE: "urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:rel-10.10-cross-aarch64-d6l-cuda11.4"
+    IMAGE: "artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:rel-10.10-cross-aarch64-d6l-cuda11.4"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d6l.cuda-$TRT_CUDA_VERSION"
     EMBEDDED_TARGET: jetson-orin
-    ENABLE_CUTE_DSL: "OFF"
+    ENABLE_CUTE_DSL: "fmha;gdn"
+    CUTEDSL_PREBUILT_VERSION: "1.4.0-sm87-cuda11"
   tags:
     - a30-edgellm-nvks
   image: "$IMAGE"
+  before_script:
+    # EMBEDDED_TARGET=jetson-orin infers sm_87 and CUDA_VERSION=11.4 gives cuda
+    # major 11, so cute_dsl_setup() looks for exactly this filename under
+    # kernelSrcs/cuteDSLPrebuilt/ and extracts it instead of generating kernels.
+    - mkdir -p kernelSrcs/cuteDSLPrebuilt
+    - |
+      base="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/cutedsl-prebuilt/$CUTEDSL_PREBUILT_VERSION"
+      tarball="kernelSrcs/cuteDSLPrebuilt/cutedsl_aarch64_sm_87_cuda11.tar.gz"
+      curl --fail --silent --show-error --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+        "$base/cutedsl_aarch64_sm_87_cuda11.tar.gz" -o "$tarball"
+      curl --fail --silent --show-error --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+        "$base/cutedsl_aarch64_sm_87_cuda11.tar.gz.sha256" -o "$tarball.sha256"
+      (cd kernelSrcs/cuteDSLPrebuilt && sha256sum -c cutedsl_aarch64_sm_87_cuda11.tar.gz.sha256)
   extends:
     - .cross_build_template
     - .l0_rules
-    - .l0_environment
   interruptible: true
 
-# DriveOS 7 Linux cross-build (CUDA 12.8, no CuTeDSL artifacts yet)
+# DriveOS 7 Linux cross-build (CUDA 12.8)
 "l0_cross_build_d7l_cuda12.8":
   stage: l0_test
   variables:
     CUDA_VERSION: "12.8"
     TRT_VERSION: "10.13.3.9"
     TRT_CUDA_VERSION: "12.8"
-    IMAGE: "urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:rel-10.10-cross-aarch64-d7l-cuda12.8"
+    IMAGE: "artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:rel-10.10-cross-aarch64-d7l-cuda12.8"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$TRT_CUDA_VERSION"
     EMBEDDED_TARGET: auto-thor
-    ENABLE_CUTE_DSL: "OFF"
   tags:
     - a30-edgellm-nvks
   image: "$IMAGE"
   extends:
     - .cross_build_template
     - .l0_rules
-    - .l0_environment
   interruptible: true
-
-# Cleanup job - Triggered when MR environment is stopped (merged/closed)
-cleanup_l0_mr_cache:
-  stage: .post
-  dependencies: []
-  variables:
-    GIT_STRATEGY: none
-  tags:
-    - a30-edgellm-nvks
-  script:
-    - echo "Cleaning up L0 cache for MR ${CI_MERGE_REQUEST_IID}"
-    # Safety check: ensure CI_MERGE_REQUEST_IID is set
-    - |
-      if [ -z "$CI_MERGE_REQUEST_IID" ]; then
-        echo "ERROR: CI_MERGE_REQUEST_IID is not set!"
-        echo "This cleanup job requires a merge request context."
-        exit 1
-      fi
-    - MR_CACHE_DIR="${EDGE_LLM_CACHE_DIR}/L0/MR_${CI_MERGE_REQUEST_IID}"
-    - |
-      if [ -d "$MR_CACHE_DIR" ]; then
-        echo "Found MR cache directory: $MR_CACHE_DIR"
-        echo "Disk usage before cleanup:"
-        du -sh "$MR_CACHE_DIR" || true
-        echo "Removing $MR_CACHE_DIR..."
-        rm -rf "$MR_CACHE_DIR"
-        echo "✅ Cleanup completed successfully for MR ${CI_MERGE_REQUEST_IID}"
-      else
-        echo "ℹ️  No cache directory found at $MR_CACHE_DIR (already cleaned or no cache created)"
-      fi
-  environment:
-    name: l0_cache/mr_$CI_MERGE_REQUEST_IID
-    action: stop
-  when: manual
-  allow_failure: true

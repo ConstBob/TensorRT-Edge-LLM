@@ -20,7 +20,7 @@
 #include "action/alpamayo1ActionRunner.h"
 #include "common/hashUtils.h"
 #include "common/tensor.h"
-#include "multimodal/multimodalRunner.h"
+#include "multimodal/common/multimodalRunner.h"
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
 #include "runtime/config/deploymentConfig.h"
@@ -34,12 +34,17 @@
 #include "runtime/preprocess/embeddingPreprocessor.h"
 #include "runtime/preprocess/gemma4EmbeddingPreprocessor.h"
 #include "runtime/preprocess/stepPreparer.h"
+#include "runtime/preprocess/visualTokenPruner.h"
+#include "runtime/state/contextCache/contextCacheConfig.h"
+#include "runtime/state/contextCache/contextCacheMetrics.h"
 #include "runtime/state/decodingInferenceContext.h"
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/sharedResources.h"
 #include "runtime/state/systemPromptKVCache.h"
 #include "runtime/streaming.h"
 #include "tokenizer/tokenizer.h"
+#include <atomic>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <tuple>
@@ -50,6 +55,9 @@ namespace trt_edgellm
 {
 namespace rt
 {
+class ContextCacheCoordinator;
+class ContextCacheRequest;
+
 /*!
  * @brief Unified LLM inference runtime with optional speculative decoding
  *
@@ -57,6 +65,10 @@ namespace rt
  * When constructed without a drafting config, operates as a pure vanilla decoding runtime
  * with zero draft-model memory overhead.
  * Coordinates base model, optional draft model, and multimodal processing (vision + audio).
+ *
+ * @note This class is not thread-safe. Callers must externally serialize every method invocation and the object
+ * lifetime. handleRequest() defensively rejects accidental overlapping calls before mutating runtime state, but that
+ * gate does not authorize concurrent use of this object.
  */
 class LLMInferenceRuntime
 {
@@ -68,11 +80,16 @@ public:
      * @param loraWeightsMap Map of LoRA weight names to file paths
      * @param draftingConfig Speculative decoding drafting configuration
      * @param stream CUDA stream for operations
+     * @param contextCacheConfig Context-cache configuration
+     * @param checkpointDir HF/ModelOpt checkpoint directory for runtime weight loading
+     * @param draftCheckpointDir Separate draft checkpoint directory for paired speculative models
      * @throws std::runtime_error if directories do not contain expected data, or runner initialization fails
      */
     LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap,
-        SpecDecodeDraftingConfig const& draftingConfig, cudaStream_t stream);
+        SpecDecodeDraftingConfig const& draftingConfig, cudaStream_t stream,
+        ContextCacheConfig const& contextCacheConfig = {}, std::string const& checkpointDir = "",
+        std::string const& draftCheckpointDir = "");
 
     /*!
      * @brief Construct runtime for vanilla-only decoding (no draft model)
@@ -80,13 +97,16 @@ public:
      * @param multimodalEngineDir Directory containing multimodal engine files
      * @param loraWeightsMap Map of LoRA weight names to file paths
      * @param stream CUDA stream for operations
+     * @param contextCacheConfig Context-cache configuration
+     * @param checkpointDir HF/ModelOpt checkpoint directory for runtime weight loading
      * @throws std::runtime_error if directories do not contain expected data, or runner initialization fails
      */
     LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
-        std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
+        std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream,
+        ContextCacheConfig const& contextCacheConfig = {}, std::string const& checkpointDir = "");
 
     //! @brief Destructor
-    ~LLMInferenceRuntime() noexcept = default;
+    ~LLMInferenceRuntime() noexcept;
 
     //! @brief Capture CUDA graphs for decoding stages to optimize performance.
     //!
@@ -108,9 +128,20 @@ public:
      * @param stream CUDA stream
      * @return True on success, false on failure
      * @throws std::runtime_error if an LLM or CUDA operation fails
+     * @note Calls on the same runtime must be externally serialized. An accidental overlap with another
+     * handleRequest() is rejected before runtime or response state is mutated; this is not a general thread-safety
+     * guarantee.
      */
     bool handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream,
         bool outputThinkerEmbeddings = false);
+
+    /*! \brief Return the input size for an explicit text token-count request.
+     *
+     * Generation paths report the input IDs they already produced and do not
+     * call this method. Multimodal token counts require encoder preprocessing
+     * and are therefore unavailable through this tokenizer-only operation.
+     */
+    std::vector<int32_t> countPromptTokens(LLMGenerationRequest const& request) const;
 
     /*!
      * @brief Generate and save system prompt KV cache (public API matching standard runtime signature)
@@ -127,6 +158,19 @@ public:
      *  \param seed Random seed value; has no effect if no action runner is loaded
      */
     void setActionNoiseSeed(int32_t seed) noexcept;
+
+    /*! \brief Enable visual-token pruning (embedding-level, prefill only).
+     *
+     *  Must be called before the first request. Constructs the pruner — with the selection
+     *  algorithm named by `config.algorithm` ("dart" by default; see registerTokenSelector
+     *  for plugging in custom algorithms) — when the config is enabled and the base engine
+     *  is an mRoPE VLM (image token id present); otherwise logs a warning and leaves pruning
+     *  disabled. Runtime gates (batch 1, fresh KV cache, no spec decode, ...) are applied per
+     *  request in runBaseModelPrefill.
+     *
+     *  \param config Pruning parameters (algorithm, reduction ratio, guards, DART pivots)
+     */
+    void setVisualPrunerConfig(VisualPrunerConfig const& config);
 
     //! Get LLM prefill stage metrics
     metrics::LLMPrefillMetrics const& getPrefillMetrics() const noexcept
@@ -150,6 +194,9 @@ public:
     {
         return mGenerationMetrics;
     }
+
+    //! Get context-cache metrics, or nullopt when the runtime cache is disabled.
+    std::optional<ContextCacheMetrics> getContextCacheMetrics() const noexcept;
 
     //! Get multimodal metrics (returns empty metrics if no multimodal runner)
     metrics::MultimodalMetrics getMultimodalMetrics() const noexcept
@@ -213,7 +260,9 @@ private:
     //! @brief Common initialization logic shared between both constructors
     void initializeCommon(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap,
-        std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream);
+        std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream,
+        ContextCacheConfig const& contextCacheConfig, std::string const& checkpointDir,
+        std::string const& draftCheckpointDir);
 
     //! @brief Capture a CUDA graph on the base executor for the default (no-adapter)
     //! state, then one additional graph per registered LoRA adapter. Returns the
@@ -224,19 +273,31 @@ private:
     //! @brief Build the strategy runtime reference bundle after common resources are allocated.
     void buildDecodingRuntimeContext();
 
-    rt::Tensor mSharedExecContextMemory{}; //!< Shared device memory for all execution contexts
-    int32_t mMaxRuntimeBatchSize{1};       //!< Maximum runtime batch size
+    std::atomic<bool> mHandleRequestInProgress{false}; //!< Defensive overlap gate, not a thread-safety contract.
+    rt::Tensor mSharedExecContextMemory{};             //!< Shared device memory for all execution contexts
+    int32_t mMaxRuntimeBatchSize{1};                   //!< Maximum runtime batch size
 
     DeploymentConfig mDeployment{};                    //!< Parsed base+draft configs + consolidated strategy settings
     std::unique_ptr<EngineExecutor> mBaseExecutor;     //!< Base model TRT wrapper
     std::unique_ptr<SharedResources> mSharedResources; //!< KV caches / RoPE / LoRA / context memory
-    std::unique_ptr<PipelineIO> mPipelineIO;           //!< Per-pipeline I/O tensors
-    TensorMap mBaseTensorMap;                          //!< Base engine binding map
-    LogitBias mLogitBias; //!< Runtime-owned resources that outlive decoding objects borrowing them
+    //! Declared after SharedResources so shutdown and destruction release cache ownership before physical buffers.
+    std::unique_ptr<ContextCacheCoordinator> mContextCache;
+    std::unique_ptr<PipelineIO> mPipelineIO; //!< Per-pipeline I/O tensors
+    //! Scratch [maxSeq, baseOutputHiddenDim] used to shift baseHiddenStates down one row when folding a reused
+    //! Hybrid+MTP checkpoint boundary into the draft prefill. Allocated only for Hybrid+MTP deployments.
+    rt::Tensor mBoundaryFoldScratch;
+    //! baseHiddenStates' max-sequence rows. The fold writes chunkLength + 1 rows, so it needs one spare row on top of
+    //! the chunk it shifts; runHybridMtpPrefill checks the chunk against this bound before reshaping.
+    int32_t mBoundaryFoldMaxRows{0};
+    TensorMap mBaseTensorMap;                  //!< Base engine binding map
+    std::filesystem::path mCheckpointDir;      //!< Provider checkpoint used during startup weight loading
+    std::filesystem::path mDraftCheckpointDir; //!< Separate provider draft checkpoint, empty for integrated drafts
+    LogitBias mLogitBias;                      //!< Runtime-owned resources that outlive decoding objects borrowing them
     std::unique_ptr<DecodingRuntimeContext> mDecodingRuntimeContext;
     std::unique_ptr<DecoderRegistry> mDecoderRegistry;
     std::unique_ptr<StepPreparer> mStepPreparer;             //!< Per-step sequence preprocessor
     std::unique_ptr<EmbeddingPreprocessor> mEmbeddingPre;    //!< Embedding-lookup preprocessor
+    std::unique_ptr<VisualTokenPruner> mVisualPruner;        //!< Visual-token pruner (optional)
     std::unique_ptr<Gemma4EmbeddingPreprocessor> mGemma4Ple; //!< Gemma4 PLE token-identity preprocessor
     //! Base-engine deepstack binding (nullptr when the base engine was built
     //! without deepstack features). Swaps between `io.deepstackEmbeds[i]`
@@ -307,7 +368,16 @@ private:
     // Key functions to drive the runtime, defined in a consumer-producer pattern.
     // Consume tokenized IDS as input and produce hidden states for the whole sequence and first generated token.
     //! @throws std::runtime_error if a CUDA error occurs
-    bool runBaseModelPrefill(DecodingInferenceContext& context);
+    bool runBaseModelPrefill(DecodingInferenceContext& context, ContextCacheRequest* contextCacheRequest = nullptr,
+        bool sampleOutput = true);
+
+    //! Hybrid+MTP endpoint-reuse prefill. Mirrors the reference llmInferenceRuntime.cpp::runHybridMtpPrefill: a
+    //! two-chunk base prefill publishing at the stable predecessor boundary, folding the reused checkpoint's boundary
+    //! hidden into the draft prefill on a cache hit, and driving the coordinator's dedicated MTP publish entrypoint.
+    //! Only reachable when shouldUseHybridMtpEndpointReuse() already established that the cache is live for this
+    //! request, so lookup and publication are both enabled here by construction.
+    bool runHybridMtpPrefill(
+        DecodingInferenceContext& context, DecodingStrategy& strategy, ContextCacheRequest& contextCacheRequest);
 
     //! Validate request shape/runtime compatibility.
     bool validateRequestConfig(LLMGenerationRequest const& request);
@@ -326,14 +396,16 @@ private:
     // Consume batched input ids and the hash table of system prompt KVCache, produce the padded input ids and input
     // lengths. Instantiate the KVCache from the hash table if the system prompt has been cached.
     //! @throws std::runtime_error if system prompt is malformed
-    bool setUpForPrefillExecution(DecodingInferenceContext& context, DecodingStrategy& strategy);
+    bool setUpForPrefillExecution(DecodingInferenceContext& context, DecodingStrategy& strategy,
+        std::vector<int32_t> const* contextCachePrefillStarts = nullptr);
 
     // Batch eviction support
     //! @brief Perform batch eviction
     //! @param context Inference context
     //! @return True on success, false on failure
     //! @throws std::runtime_error if a CUDA error occurs
-    bool performBatchEvict(DecodingInferenceContext& context, DecodingStrategy& strategy);
+    bool performBatchEvict(DecodingInferenceContext& context, DecodingStrategy& strategy,
+        std::vector<int8_t>& thinkingDone, ContextCacheRequest* contextCacheRequest);
 
     // Stage-specific metrics
     metrics::LLMPrefillMetrics mPrefillMetrics;

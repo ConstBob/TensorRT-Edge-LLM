@@ -149,12 +149,22 @@ class DeviceConfig:
     mtp_num_hidden_layers: Optional[int] = None
     mtp_use_dedicated_embeddings: bool = False
     eagle_base: bool = False
+    eagle3_target_layer_ids: List[int] = field(default_factory=list)
     mtp_base: bool = False
+    mtp_tree_base: bool = False
     dflash_base: bool = False
     dflash_tree_base: bool = False
     dflash_target_layer_ids: List[int] = field(default_factory=list)
     dflash_block_size: int = 16
     dflash_mask_token_id: int = 248070
+    dspark_base: bool = False
+    dspark_target_layer_ids: List[int] = field(default_factory=list)
+    dspark_block_size: int = 7
+    dspark_mask_token_id: int = 151669
+    dspark_enable_confidence_head: bool = False
+    dspark_confidence_head_with_markov: bool = False
+    dspark_markov_head_type: str = ""
+    dspark_markov_rank: int = 0
     draft_vocab_size: Optional[int] = None
     target_hidden_size: Optional[int] = None
 
@@ -177,6 +187,7 @@ class DeviceConfig:
     num_kv_shared_layers: int = 0
     use_double_wide_mlp: bool = False
     enable_moe_block: bool = False
+    self_conditioning_size: int = 0
 
     # runtime vocabulary
     reduced_vocab_size: Optional[int] = None
@@ -429,7 +440,11 @@ class DeviceConfig:
             mtp_use_dedicated_embeddings=bool(
                 llm.get("mtp_use_dedicated_embeddings", False)),
             eagle_base=bool(llm.get("eagle_base", False)),
+            eagle3_target_layer_ids=list(
+                llm.get("eagle3_target_layer_ids",
+                        root.get("eagle3_target_layer_ids", [])) or []),
             mtp_base=bool(llm.get("mtp_base", False)),
+            mtp_tree_base=bool(llm.get("mtp_tree_base", False)),
             dflash_base=bool(llm.get("dflash_base", False)),
             dflash_tree_base=bool(llm.get("dflash_tree_base", False)),
             dflash_target_layer_ids=list(
@@ -444,6 +459,32 @@ class DeviceConfig:
                 (llm.get("dflash_config")
                  or {}).get("mask_token_id",
                             llm.get("dflash_mask_token_id", 248070))),
+            dspark_base=bool(llm.get("dspark_base", False)),
+            dspark_target_layer_ids=list((llm.get("dspark_config") or {}).get(
+                "target_layer_ids",
+                llm.get("dspark_target_layer_ids",
+                        llm.get("target_layer_ids", [])))),
+            dspark_block_size=int((llm.get("dspark_config") or {}).get(
+                "block_size",
+                llm.get("dspark_block_size", llm.get("block_size", 7)))),
+            dspark_mask_token_id=int((llm.get("dspark_config") or {}).get(
+                "mask_token_id",
+                llm.get("dspark_mask_token_id",
+                        llm.get("mask_token_id", 151669)))),
+            dspark_enable_confidence_head=bool(
+                (llm.get("dspark_config")
+                 or {}).get("enable_confidence_head",
+                            llm.get("enable_confidence_head", False))),
+            dspark_confidence_head_with_markov=bool(
+                (llm.get("dspark_config")
+                 or {}).get("confidence_head_with_markov",
+                            llm.get("confidence_head_with_markov", False))),
+            dspark_markov_head_type=str(
+                (llm.get("dspark_config")
+                 or {}).get("markov_head_type",
+                            llm.get("markov_head_type", ""))),
+            dspark_markov_rank=int((llm.get("dspark_config") or {}).get(
+                "markov_rank", llm.get("markov_rank", 0)) or 0),
             draft_vocab_size=(int(llm["draft_vocab_size"])
                               if llm.get("draft_vocab_size") is not None else
                               None),
@@ -490,6 +531,10 @@ class DeviceConfig:
             num_kv_shared_layers=int(llm.get("num_kv_shared_layers", 0) or 0),
             use_double_wide_mlp=bool(llm.get("use_double_wide_mlp", False)),
             enable_moe_block=bool(llm.get("enable_moe_block", False)),
+            self_conditioning_size=int(
+                llm.get("self_conditioning_size",
+                        root.get("self_conditioning_size", intermediate_size))
+                or intermediate_size),
             raw_root=root,
             raw_component=selected,
             mamba_cfg=mamba_cfg,

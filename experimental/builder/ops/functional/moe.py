@@ -22,11 +22,17 @@ from enum import IntEnum
 
 import numpy as np
 
+from ...core.weights import ParameterSpec
 from ..tensor import Tensor
 from ._operation import operation, parameter
-from .core import constant
 
-__all__ = ["MoeActivation", "MoeRouting", "int4_moe", "nvfp4_moe"]
+__all__ = [
+    "MoeActivation",
+    "MoeRouting",
+    "fp16_moe",
+    "int4_moe",
+    "nvfp4_moe",
+]
 
 
 class MoeActivation(IntEnum):
@@ -48,25 +54,84 @@ _IO_DTYPE_FP16 = 1
 _MAX_ROUTED_ROWS_AUTO = 0
 
 
-def int4_moe(router_logits: Tensor, hidden_states: Tensor, weights: dict,
-             num_experts: int, top_k: int, hidden_size: int,
-             moe_inter_size: int, group_size: int, *,
-             weight_prefix: str) -> Tensor:
+def _parameter_value(value, dtype):
+    if isinstance(value, ParameterSpec):
+        if value.dtype != np.dtype(dtype):
+            raise TypeError(
+                f"parameter metadata dtype {value.dtype} is not {np.dtype(dtype)}"
+            )
+        return value
+    return np.ascontiguousarray(value, dtype=dtype)
+
+
+def fp16_moe(router_logits: Tensor,
+             hidden_states: Tensor,
+             weights: dict,
+             num_experts: int,
+             top_k: int,
+             hidden_size: int,
+             moe_inter_size: int,
+             *,
+             weight_prefix: str,
+             weight_bindings: dict,
+             norm_topk_prob: int = 1) -> Tensor:
+    """Run the FP16 grouped-GEMM MoE implementation."""
+    inputs = [
+        router_logits,
+        hidden_states,
+        parameter(weight_prefix + ".fc1_weights",
+                  _parameter_value(weights["fc1_weights"], np.float16),
+                  "fp16",
+                  recipe=weight_bindings["fc1_weights"]),
+        parameter(weight_prefix + ".fc2_weights",
+                  _parameter_value(weights["fc2_weights"], np.float16),
+                  "fp16",
+                  recipe=weight_bindings["fc2_weights"]),
+    ]
+    return operation("fp16_moe",
+                     inputs,
+                     num_experts=num_experts,
+                     top_k=top_k,
+                     hidden_size=hidden_size,
+                     moe_inter_size=moe_inter_size,
+                     activation_type=int(MoeActivation.SWIGLU),
+                     norm_topk_prob=norm_topk_prob,
+                     max_routed_rows=_MAX_ROUTED_ROWS_AUTO)
+
+
+def int4_moe(router_logits: Tensor,
+             hidden_states: Tensor,
+             weights: dict,
+             num_experts: int,
+             top_k: int,
+             hidden_size: int,
+             moe_inter_size: int,
+             group_size: int,
+             *,
+             weight_prefix: str,
+             weight_bindings: dict,
+             zero_point_offset: int = 1) -> Tensor:
     """Run GPTQ-Marlin mixture-of-experts."""
 
     inputs = [
         router_logits,
         hidden_states,
         parameter(weight_prefix + ".fc_gate_up_qweights",
-                  weights["fc_gate_up_qweights"].astype(np.int8, copy=False),
-                  "int4_moe"),
-        constant(weights["fc_gate_up_scales"].astype(np.float16),
-                 "fc_gate_up_scales"),
+                  _parameter_value(weights["fc_gate_up_qweights"], np.int8),
+                  "int4_moe",
+                  recipe=weight_bindings["fc_gate_up_qweights"]),
+        parameter(weight_prefix + ".fc_gate_up_scales",
+                  _parameter_value(weights["fc_gate_up_scales"], np.float16),
+                  "int4_moe",
+                  recipe=weight_bindings["fc_gate_up_scales"]),
         parameter(weight_prefix + ".fc_down_qweights",
-                  weights["fc_down_qweights"].astype(np.int8,
-                                                     copy=False), "int4_moe"),
-        constant(weights["fc_down_scales"].astype(np.float16),
-                 "fc_down_scales"),
+                  _parameter_value(weights["fc_down_qweights"], np.int8),
+                  "int4_moe",
+                  recipe=weight_bindings["fc_down_qweights"]),
+        parameter(weight_prefix + ".fc_down_scales",
+                  _parameter_value(weights["fc_down_scales"], np.float16),
+                  "int4_moe",
+                  recipe=weight_bindings["fc_down_scales"]),
     ]
     return operation("int4_moe",
                      inputs,
@@ -78,18 +143,33 @@ def int4_moe(router_logits: Tensor, hidden_states: Tensor, weights: dict,
                      quantization_group_size=group_size)
 
 
-def nvfp4_moe(router_logits: Tensor, hidden_states: Tensor, moe_weights: dict,
-              num_experts: int, top_k: int, hidden_size: int,
-              moe_inter_size: int, activation_type: MoeActivation,
-              n_group: int, topk_group: int, norm_topk_prob: int,
-              routed_scaling_factor: float, routing_mode: MoeRouting,
-              sm12x: bool, *, weight_prefix: str) -> Tensor:
+def nvfp4_moe(router_logits: Tensor,
+              hidden_states: Tensor,
+              moe_weights: dict,
+              num_experts: int,
+              top_k: int,
+              hidden_size: int,
+              moe_inter_size: int,
+              activation_type: MoeActivation,
+              n_group: int,
+              topk_group: int,
+              norm_topk_prob: int,
+              routed_scaling_factor: float,
+              routing_mode: MoeRouting,
+              sm12x: bool,
+              *,
+              weight_prefix: str,
+              weight_bindings: "dict[str, dict] | None" = None) -> Tensor:
     """Run NVFP4 mixture-of-experts and return ``[B,S,H]`` FP16.
 
     ``moe_weights`` provides the 9 constant inputs as numpy arrays:
     ``fc1_qweights, fc1_blocks_scale, fc1_alpha, fc2_qweights,
     fc2_blocks_scale, fc2_alpha, input_global_scale, down_input_scale,
     e_score_correction_bias``.
+
+    Model families provide checkpoint bindings when their provider layout can
+    be rebuilt at runtime. Padded or fused expert banks omit them and remain
+    constants in checkpoint-direct builds.
     """
 
     order = [
@@ -103,10 +183,12 @@ def nvfp4_moe(router_logits: Tensor, hidden_states: Tensor, moe_weights: dict,
         ("down_input_scale", np.float32),
         ("e_score_correction_bias", np.float32),
     ]
+    bindings = weight_bindings or {}
     weight_inputs = [
         parameter(weight_prefix + "." + name,
-                  np.ascontiguousarray(moe_weights[name], dt), "nvfp4_moe")
-        for name, dt in order
+                  _parameter_value(moe_weights[name], dt),
+                  "nvfp4_moe",
+                  recipe=bindings.get(name)) for name, dt in order
     ]
     inputs = [router_logits, hidden_states] + weight_inputs
     operation_name = "nvfp4_moe_sm12x" if sm12x else "nvfp4_moe"

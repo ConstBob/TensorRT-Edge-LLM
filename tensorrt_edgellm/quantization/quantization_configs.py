@@ -175,6 +175,7 @@ def build_quant_config(
     visual_quantization: Optional[str] = None,
     audio_quantization: Optional[str] = None,
     cp_quantization: Optional[str] = None,
+    fuse_gdn_qkvzba_scales: bool = False,
 ) -> Dict[str, Any]:
     """Build a composite ModelOpt quantization config from method names.
 
@@ -192,6 +193,13 @@ def build_quant_config(
         audio_quantization:    Audio-tower precision; ``None`` leaves it off.
         cp_quantization:       Qwen3-Omni CodePredictor precision; ``None``
                                leaves it off.
+        fuse_gdn_qkvzba_scales: Re-enable NVFP4 quantization of the GDN
+                               ``in_proj_b``/``in_proj_a`` projections (which
+                               stock ModelOpt >=0.45 configs disable for
+                               kernel-tiling compatibility on other backends).
+                               Their per-tensor scales are then shared with
+                               ``in_proj_qkv`` post-calibration so export can
+                               fuse all four projections into a single GEMM.
     """
     if quantization is None:
         cfg: Dict[str, Any] = {
@@ -260,6 +268,12 @@ def build_quant_config(
             entries += _enable_entries(visual_quantization,
                                        f"*{prefix}*weight_quantizer",
                                        f"*{prefix}*input_quantizer")
+        # Embedding tables inside visual towers (e.g. Qwen3-VL
+        # ``visual.pos_embed``) match the prefix glob but have no FP8
+        # export/runtime path — keep them fp16 (disable after enable so it
+        # wins).
+        entries += _disable_entries(
+            [f"*{prefix}*pos_embed*" for prefix in _VISUAL_PREFIXES])
 
     if audio_quantization is not None:
         if audio_quantization not in _AUDIO_METHODS:
@@ -274,5 +288,16 @@ def build_quant_config(
     # CP override last so its excludes win over the generic enables and q_bmm.
     if cp_quantization is not None:
         entries += _cp_entries(cp_quantization)
+
+    # GDN b/a re-enable last so it wins over the stock config's disables.
+    if fuse_gdn_qkvzba_scales:
+        if quantization != "nvfp4":
+            raise ValueError(
+                "fuse_gdn_qkvzba_scales requires --quantization nvfp4, got "
+                f"{quantization!r}")
+        for proj in ("in_proj_b", "in_proj_a"):
+            entries += _enable_entries(
+                "nvfp4", f"*linear_attn.{proj}.weight_quantizer",
+                f"*linear_attn.{proj}.input_quantizer")
 
     return cfg

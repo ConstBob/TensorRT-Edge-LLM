@@ -17,5 +17,5 @@ add_library(exampleUtils STATIC ${EXAMPLE_UTILS_CPP_SOURCES}
 target_include_directories(exampleUtils PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
                                                ${COMMON_INCLUDE_DIRS})
 
-target_link_libraries(exampleUtils PRIVATE commonLibraryExt)
+target_link_libraries(exampleUtils PRIVATE commonLibraryExt ${CMAKE_DL_LIBS})
 target_link_libraries(exampleUtils INTERFACE edgellmCore)

@@ -562,3 +562,55 @@ def test_quantize_and_export_hf_checkpoint():
 def test_unsupported_methods_raise(kwargs):
     with pytest.raises(ValueError):
         build_quant_config(**kwargs)
+
+
+# --------------------------------------------------------------------------- #
+# GDN qkvzba scale sharing (hybrid NVFP4)
+# --------------------------------------------------------------------------- #
+class _TinyGdnMixer(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.in_proj_qkv = nn.Linear(_DIM, 3 * _DIM, bias=False)
+        self.in_proj_z = nn.Linear(_DIM, _DIM, bias=False)
+        self.in_proj_b = nn.Linear(_DIM, _DIM, bias=False)
+        self.in_proj_a = nn.Linear(_DIM, _DIM, bias=False)
+
+    def forward(self, x):
+        return (self.in_proj_qkv(x).sum() + self.in_proj_z(x).sum() +
+                self.in_proj_b(x).sum() + self.in_proj_a(x).sum())
+
+
+class _TinyGdnModel(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.linear_attn = _TinyGdnMixer()
+
+    def forward(self, x):
+        return self.linear_attn(x)
+
+
+def test_fuse_gdn_qkvzba_scales_unifies_group_amax():
+    from tensorrt_edgellm.quantization.quantize import _share_gdn_qkvzba_scales
+    model = _TinyGdnModel().eval()
+    cfg = build_quant_config("nvfp4", fuse_gdn_qkvzba_scales=True)
+    mtq.quantize(model, cfg, forward_loop=_calib_hidden)
+    mixer = model.linear_attn
+    projs = (mixer.in_proj_qkv, mixer.in_proj_z, mixer.in_proj_b,
+             mixer.in_proj_a)
+    for proj in (mixer.in_proj_b, mixer.in_proj_a):
+        en, bits, cal = _wq(proj)
+        assert en and cal and bits == (2, 1)
+    group_wmax = torch.max(
+        torch.stack([p.weight_quantizer.amax for p in projs]))
+    assert _share_gdn_qkvzba_scales(model) == 1
+    for proj in projs:
+        assert torch.equal(proj.weight_quantizer.amax, group_wmax)
+        assert torch.equal(proj.input_quantizer.amax,
+                           mixer.in_proj_qkv.input_quantizer.amax)
+
+
+def test_fuse_gdn_qkvzba_scales_requires_nvfp4():
+    with pytest.raises(ValueError, match="requires --quantization nvfp4"):
+        build_quant_config("fp8", fuse_gdn_qkvzba_scales=True)

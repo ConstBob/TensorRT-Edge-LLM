@@ -34,11 +34,11 @@ bool needsBaseVerifyIntermediateStates(DeploymentConfig const& bundle)
     {
         return false;
     }
-
     switch (bundle.base.specDecodeType)
     {
     case SpecDecodeMode::kMTP:
     case SpecDecodeMode::kDFlash:
+    case SpecDecodeMode::kJetSpec:
     case SpecDecodeMode::kDSpark: return true;
     case SpecDecodeMode::kGemma4MTP:
     case SpecDecodeMode::kEAGLE:
@@ -51,7 +51,7 @@ namespace
 {
 bool isDFlashDDTreeShape(DeploymentConfig const& bundle)
 {
-    return bundle.specConfig.has_value() && bundle.base.specDecodeType == SpecDecodeMode::kDFlash
+    return bundle.specConfig.has_value() && isCachedBlockDraftMode(bundle.base.specDecodeType)
         && bundle.specConfig->draftingTopK > 1;
 }
 
@@ -61,7 +61,7 @@ int32_t baseVerifyIntermediateSeqLen(DeploymentConfig const& bundle)
     {
         return 0;
     }
-    if (bundle.base.specDecodeType != SpecDecodeMode::kDFlash)
+    if (!isCachedBlockDraftMode(bundle.base.specDecodeType))
     {
         return bundle.specConfig->maxVerifySize;
     }
@@ -75,8 +75,7 @@ void allocateZeroBuffer(SharedResources& res, int64_t bytes)
     CUDA_CHECK(cudaMemset(res.zeroBuffer.rawPointer(), 0, res.zeroBuffer.getMemoryCapacity()));
 }
 
-//! Build a static-identity page table sized from `kv` (reuse-off: fully static — see
-//! `SharedResources::kvPageTables`).
+//! Build the initially identity-mapped page table sized from `kv`.
 std::unique_ptr<KVPageTable> makeIdentityPageTable(KVCacheManager const& kv, cudaStream_t stream)
 {
     auto table
@@ -100,7 +99,7 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
         /*.maxSequenceLength=*/cfg.maxKVCacheCapacity,
         /*.layerConfigs=*/cfg.kvLayerConfigs,
         /*.kvCacheType=*/cfg.kvCacheDtype,
-        /*.numPages=*/rt::computeKvPoolFloorPages(cfg.maxSupportedBatchSize, cfg.maxKVCacheCapacity),
+        /*.numPages=*/cfg.kvPoolPages,
     };
     rt::MambaCacheManager::Config mambaCfg{
         /*.numRecurrentLayers=*/cfg.numLinearAttnLayers,
@@ -113,6 +112,8 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
         /*.maxIntermediateSeqLen=*/0,
         /*.recurrentStateType=*/cfg.recurrentStateDtype,
         /*.convStateType=*/cfg.convStateDtype,
+        /*.recurrentStateNumGroups=*/cfg.recurrentStateNumGroups,
+        /*.specVerifyUsesReplay=*/cfg.recurrentSpecVerifyUsesReplay,
     };
     rt::HybridCacheManager::Config hybridCfg{
         /*.layerTypes=*/cfg.layerTypes,
@@ -206,8 +207,7 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.maxSequenceLength=*/bundle.base.maxKVCacheCapacity,
             /*.layerConfigs=*/bundle.base.kvLayerConfigs,
             /*.kvCacheType=*/bundle.base.kvCacheDtype,
-            /*.numPages=*/
-            rt::computeKvPoolFloorPages(bundle.base.maxSupportedBatchSize, bundle.base.maxKVCacheCapacity),
+            /*.numPages=*/bundle.base.kvPoolPages,
         };
         rt::MambaCacheManager::Config mambaCfg{
             /*.numRecurrentLayers=*/bundle.base.numLinearAttnLayers,
@@ -220,6 +220,8 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.maxIntermediateSeqLen=*/baseMaxIntermediateSeqLen,
             /*.recurrentStateType=*/bundle.base.recurrentStateDtype,
             /*.convStateType=*/bundle.base.convStateDtype,
+            /*.recurrentStateNumGroups=*/bundle.base.recurrentStateNumGroups,
+            /*.specVerifyUsesReplay=*/bundle.base.recurrentSpecVerifyUsesReplay,
         };
         rt::HybridCacheManager::Config hybridCfg{
             /*.layerTypes=*/bundle.base.layerTypes,
@@ -247,8 +249,7 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.maxSequenceLength=*/bundle.draft->maxKVCacheCapacity,
             /*.layerConfigs=*/bundle.draft->kvLayerConfigs,
             /*.kvCacheType=*/bundle.draft->kvCacheDtype,
-            /*.numPages=*/
-            rt::computeKvPoolFloorPages(bundle.draft->maxSupportedBatchSize, bundle.draft->maxKVCacheCapacity),
+            /*.numPages=*/bundle.draft->kvPoolPages,
         };
         rt::MambaCacheManager::Config mambaCfg{
             /*.numRecurrentLayers=*/0,

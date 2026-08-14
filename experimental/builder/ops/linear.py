@@ -62,7 +62,10 @@ class Linear(Module):
     def forward(self, hidden_states, rank: Optional[int] = None):
         rank = self.rank if rank is None else rank
         if not self.tensor_parallel:
-            output = F.linear(hidden_states, self.prefix, rank)
+            output = F.linear_from_weights(hidden_states,
+                                           self.weight_descriptor(),
+                                           rank,
+                                           name=self.prefix)
             return self._apply_static_adapter(hidden_states, output,
                                               "replicated", rank)
 
@@ -82,6 +85,19 @@ class Linear(Module):
             output = F.all_reduce(output, self.cfg.tp_size)
         return output
 
+    def forward_f32(self, hidden_states, rank: Optional[int] = None):
+        """Apply an FP16 checkpoint projection with FP32 accumulation."""
+        if self.has_adapter():
+            raise ValueError(
+                f"{self.prefix}: FP32 projection does not support adapters")
+        rank = self.rank if rank is None else rank
+        output = F.linear_f32_from_weights(hidden_states,
+                                           self.weight_descriptor(),
+                                           self.prefix, rank)
+        if self._tp_mode() == "row" and self.cfg.tp_size > 1:
+            output = F.all_reduce(output, self.cfg.tp_size)
+        return output
+
     def quant_type(self) -> str:
         """Return the compiled precision selected for this projection."""
         mode = self.ctx.options.dense_quant
@@ -89,11 +105,17 @@ class Linear(Module):
             return "fp16"
         if mode == "nvfp4-qdq" and self.weights.is_nvfp4(self.prefix):
             return "nvfp4"
-        return self.cfg.module_quant_type(self.prefix)
+        return self.weights.module_quant_type(
+            self.prefix,
+            tie_word_embeddings=bool(
+                getattr(self.cfg, "tie_word_embeddings", False)))
 
     def weight_descriptor(self):
         """Load and tensor-parallel shard the base projection weights."""
-        descriptor = self.weights.linear(self.prefix, self.quant_type())
+        descriptor = self.weights.linear_descriptor(self.prefix,
+                                                    self.quant_type())
+        if not self.tensor_parallel:
+            return descriptor
         tp_mode = self._tp_mode()
         return self.weights.shard_linear(descriptor, tp_mode, self.cfg.tp_size,
                                          self.cfg.tp_rank)
@@ -109,7 +131,7 @@ class Linear(Module):
         if adapter is None:
             return output
         adapter_a, adapter_b, scale = adapter
-        if self.cfg.tp_size > 1:
+        if self.tensor_parallel and self.cfg.tp_size > 1:
             if tp_mode == "column":
                 adapter_b = np.split(adapter_b, self.cfg.tp_size,
                                      axis=0)[self.cfg.tp_rank]
@@ -126,6 +148,8 @@ class Linear(Module):
         return promoted.cast(output.dtype)
 
     def _tp_mode(self) -> str:
+        if not self.tensor_parallel:
+            return "replicated"
         if self.explicit_tp_mode is not None:
             return self.explicit_tp_mode
         if self.cfg.tp_size == 1:

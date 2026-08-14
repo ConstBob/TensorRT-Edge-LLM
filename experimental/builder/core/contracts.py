@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, FrozenSet, Iterable, Tuple
 
+from . import weight_policy
+
 __all__ = [
     "Component",
     "ComponentSpec",
@@ -36,12 +38,18 @@ class Component(str, Enum):
     """Engine component built by one runner invocation."""
 
     LLM = "llm"
+    DLLM = "dllm"
     TALKER = "talker"
     CODE_PREDICTOR = "code-predictor"
     VISUAL = "visual"
     AUDIO = "audio"
     CODE2WAV = "code2wav"
+    SPEAKER_ENCODER = "speaker-encoder"
+    SPEECH_TOKENIZER_ENCODER = "speech-tokenizer-encoder"
     ACTION = "action"
+    UND_PREFILL = "und-prefill"
+    GEN = "gen"
+    VAE_ENCODER = "vae-encoder"
 
 
 class SpecRole(str, Enum):
@@ -123,6 +131,8 @@ class ComponentSpec:
     engine_filename: str
     required_plugins: Tuple[str, ...] = ()
     supports_spec_role: bool = False
+    # Weight kinds this component's C++ runner binds at initialization.
+    external_weight_kinds: Tuple[str, ...] = ()
 
     def output_dir(self, requested_dir: str) -> str:
         """Return the runtime directory for this component."""
@@ -163,41 +173,84 @@ class ComponentSpec:
         return os.path.join(self.output_dir(requested_dir), filename)
 
 
+_ENGINE_WEIGHT_KINDS = tuple(
+    kind for kind in weight_policy.EXTERNAL_WEIGHT_KINDS
+    if kind != weight_policy.EXTERNAL_WEIGHT_EMBEDDING)
+
 _COMPONENT_SPECS: Dict[Component, ComponentSpec] = {
     Component.LLM:
     ComponentSpec(Component.LLM,
                   "",
                   "llm.engine",
                   required_plugins=("AttentionPlugin", ),
-                  supports_spec_role=True),
+                  supports_spec_role=True,
+                  external_weight_kinds=weight_policy.EXTERNAL_WEIGHT_KINDS),
+    Component.DLLM:
+    ComponentSpec(Component.DLLM,
+                  "",
+                  "dllm.engine",
+                  required_plugins=("AttentionPlugin", ),
+                  external_weight_kinds=weight_policy.EXTERNAL_WEIGHT_KINDS),
     Component.TALKER:
     ComponentSpec(Component.TALKER,
                   "talker",
                   "llm.engine",
-                  required_plugins=("AttentionPlugin", )),
+                  required_plugins=("AttentionPlugin", ),
+                  external_weight_kinds=_ENGINE_WEIGHT_KINDS),
     Component.CODE_PREDICTOR:
     ComponentSpec(Component.CODE_PREDICTOR,
                   "code_predictor",
                   "llm.engine",
-                  required_plugins=("AttentionPlugin", )),
+                  required_plugins=("AttentionPlugin", ),
+                  external_weight_kinds=_ENGINE_WEIGHT_KINDS),
     Component.VISUAL:
-    ComponentSpec(Component.VISUAL, "visual", "visual.engine"),
+    ComponentSpec(Component.VISUAL,
+                  "visual",
+                  "visual.engine",
+                  external_weight_kinds=_ENGINE_WEIGHT_KINDS),
     Component.AUDIO:
-    ComponentSpec(Component.AUDIO, "audio", "audio_encoder.engine"),
+    ComponentSpec(Component.AUDIO,
+                  "audio",
+                  "audio_encoder.engine",
+                  external_weight_kinds=_ENGINE_WEIGHT_KINDS),
     Component.CODE2WAV:
-    ComponentSpec(Component.CODE2WAV, "code2wav", "code2wav.engine"),
+    ComponentSpec(Component.CODE2WAV,
+                  "code2wav",
+                  "code2wav.engine",
+                  external_weight_kinds=_ENGINE_WEIGHT_KINDS),
+    Component.SPEAKER_ENCODER:
+    ComponentSpec(Component.SPEAKER_ENCODER, "clone_encoders",
+                  "speaker_encoder.engine"),
+    Component.SPEECH_TOKENIZER_ENCODER:
+    ComponentSpec(Component.SPEECH_TOKENIZER_ENCODER, "clone_encoders",
+                  "speech_tokenizer_encoder.engine"),
     Component.ACTION:
-    ComponentSpec(Component.ACTION, "action", "action.engine"),
+    ComponentSpec(Component.ACTION,
+                  "action",
+                  "action.engine",
+                  external_weight_kinds=_ENGINE_WEIGHT_KINDS),
+    Component.UND_PREFILL:
+    ComponentSpec(Component.UND_PREFILL, "und_prefill", "und_prefill.engine"),
+    Component.GEN:
+    ComponentSpec(Component.GEN, "gen", "gen.engine"),
+    Component.VAE_ENCODER:
+    ComponentSpec(Component.VAE_ENCODER, "vae_encoder", "vae_encoder.engine"),
 }
 
 _COMPONENT_BUILD_ORDER: Tuple[Component, ...] = (
+    Component.DLLM,
     Component.LLM,
     Component.VISUAL,
     Component.AUDIO,
     Component.TALKER,
     Component.CODE_PREDICTOR,
     Component.CODE2WAV,
+    Component.SPEAKER_ENCODER,
+    Component.SPEECH_TOKENIZER_ENCODER,
     Component.ACTION,
+    Component.UND_PREFILL,
+    Component.GEN,
+    Component.VAE_ENCODER,
 )
 
 
@@ -225,22 +278,33 @@ def _normalize_component_name(name: str) -> Component:
         "code-predictor": Component.CODE_PREDICTOR,
         "text": Component.LLM,
         "language": Component.LLM,
+        "diffusion": Component.DLLM,
+        "backbone": Component.DLLM,
         "vision": Component.VISUAL,
         "image": Component.VISUAL,
         "speech": Component.AUDIO,
         "vocoder": Component.CODE2WAV,
+        "speaker": Component.SPEAKER_ENCODER,
+        "speech-tokenizer": Component.SPEECH_TOKENIZER_ENCODER,
+        "understanding-prefill": Component.UND_PREFILL,
+        "policy": Component.GEN,
+        "vae": Component.VAE_ENCODER,
     }
     if normalized in aliases:
         return aliases[normalized]
     return Component(normalized)
 
 
-def resolve_components(root_model_type: str,
-                       requested: Iterable[str]) -> Tuple[Component, ...]:
+def resolve_components(
+        root_model_type: str,
+        requested: Iterable[str],
+        available: "Iterable[Component] | None" = None
+) -> Tuple[Component, ...]:
     """Resolve an ``all``/list CLI selection to buildable components."""
     tokens = tuple(token.strip().lower().replace("_", "-")
                    for token in requested if token.strip())
-    available = available_components(root_model_type)
+    available = frozenset(available if available is not None else
+                          available_components(root_model_type))
     if not tokens or tokens == ("all", ):
         selected = available
     elif "all" in tokens:

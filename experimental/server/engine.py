@@ -42,7 +42,7 @@ import math
 import os
 import sys
 import threading
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Sequence, Union
 
@@ -66,16 +66,14 @@ _LOGIT_BIAS_SPEC_DECODE_ERROR = (
     "logit_bias is not supported while speculative decoding is enabled; "
     "set disable_spec_decode=true or use a vanilla engine")
 
-_VLM_MODEL_TYPES = frozenset([
-    "qwen3_vl",
-    "qwen3_omni",
-    "qwen3_5",
-    "qwen2_5_vl",
-    "internvl",
-    "internvl_chat",
-    "phi4mm",
-    "phi4_multimodal",
-])
+
+def _exporter_model_types():
+    """Visual/audio classification read from the exporter, so the server cannot
+    drift behind it. The sets are orthogonal: an Omni checkpoint is in both."""
+    from tensorrt_edgellm.scripts import export as _export
+
+    return _export._VLM_MODEL_TYPES, _export._AUDIO_MODEL_TYPES
+
 
 # ---------------------------------------------------------------------------
 # Public data classes
@@ -137,13 +135,172 @@ class CompletionOutput:
 
 @dataclass
 class StreamDelta:
-    """Single delta from a streaming generation."""
+    """Single delta from a streaming generation.
+
+    Text deltas carry ``text``/``token_ids``; audio deltas (Omni streaming)
+    carry ``audio_bytes`` (int16 LE mono PCM) instead. ``finished`` marks the
+    end of the text stream; generator exhaustion ends the audio stream.
+    """
 
     text: str = ""
     token_ids: List[int] = field(default_factory=list)
     finished: bool = False
     finish_reason: Optional[str] = None
     logprobs: List[List[LogprobEntry]] = field(default_factory=list)
+    audio_bytes: Optional[bytes] = None
+
+
+@dataclass
+class AudioParams:
+    """Talker / vocoder knobs for one Omni audio-output request."""
+
+    voice: str = ""
+    talker_temperature: float = 0.9
+    talker_top_k: int = 50
+    talker_top_p: float = 1.0
+    repetition_penalty: float = 1.05
+    max_audio_length: int = 4096
+    codec_chunk_frames: int = 10
+    talker_prefill_threshold: int = 4
+
+
+#: Sample rate of Omni Code2Wav PCM output.
+OMNI_AUDIO_SAMPLE_RATE = 24000
+
+
+def _native_audio_params(rt, audio: "AudioParams"):
+    """Convert the AudioParams dataclass to the pybind OmniAudioParams."""
+    omni_params = rt.OmniAudioParams()
+    omni_params.speaker_name = audio.voice
+    for name, value in asdict(audio).items():
+        if name != "voice":
+            setattr(omni_params, name, value)
+    return omni_params
+
+
+def _pump_channels(rt,
+                   run,
+                   text_channel,
+                   audio_channel,
+                   sem=None,
+                   admission_handoff=None):
+    """Drive one generation in a worker thread, yielding StreamDeltas.
+
+    Shared by the Omni dual-stream path (both channels) and the standalone
+    TTS path (``text_channel=None``). The drain-once retry after
+    is_finished()/is_cancelled() closes the race where the producer finishes
+    between an empty pop and the check. ``sem``/``admission_handoff`` follow
+    the generate_stream contract: the worker owns the admission gate and
+    releases it when the C++ call returns.
+    """
+    error_holder = [None]
+
+    def _run():
+        try:
+            run()
+        except Exception as error:  # noqa: BLE001 - re-raised below
+            error_holder[0] = error
+            if text_channel is not None:
+                text_channel.cancel()
+            audio_channel.cancel()
+        finally:
+            if sem is not None:
+                sem.release()
+            if admission_handoff is not None:
+                admission_handoff.release()
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    if admission_handoff is not None:
+        # The worker owns the gate now: a join timeout below must not
+        # release it while the C++ call is still running.
+        admission_handoff.worker_started()
+
+    text_done = text_channel is None
+    audio_done = False
+    try:
+        while not (text_done and audio_done):
+            if not text_done:
+                chunk = text_channel.wait_pop(timeout_ms=20)
+                if chunk is None and (text_channel.is_finished()
+                                      or text_channel.is_cancelled()):
+                    chunk = text_channel.try_pop()
+                    if chunk is None:
+                        text_done = True
+                if chunk is not None:
+                    reason = finish_reason_name(
+                        rt, chunk.reason) if chunk.finished else None
+                    yield StreamDelta(
+                        text=chunk.text,
+                        token_ids=list(chunk.token_ids),
+                        finished=chunk.finished,
+                        finish_reason=reason,
+                        logprobs=_convert_logprobs(chunk.logprobs),
+                    )
+                    text_done = chunk.finished
+
+            if not audio_done:
+                # Text drives pacing while it flows (non-blocking audio poll);
+                # once text ends, block on audio instead.
+                audio_chunk = audio_channel.wait_pop(
+                    timeout_ms=100 if text_done else 0)
+                if audio_chunk is None and (audio_channel.is_finished()
+                                            or audio_channel.is_cancelled()):
+                    audio_chunk = audio_channel.try_pop()
+                    if audio_chunk is None:
+                        audio_done = True
+                if audio_chunk is not None:
+                    if audio_chunk.pcm16:
+                        yield StreamDelta(audio_bytes=audio_chunk.pcm16)
+                    audio_done = audio_chunk.is_final
+    finally:
+        # Reached normally or via generator close (client disconnect).
+        # Cancelling the text channel stops the Thinker decode loop; the
+        # audio cancel stops vocoding.
+        if not (text_done and audio_done):
+            if text_channel is not None:
+                text_channel.cancel()
+            audio_channel.cancel()
+        worker.join(timeout=30.0)
+    if error_holder[0] is not None:
+        raise error_holder[0]
+
+
+def _stream_tts(rt,
+                runtime,
+                text: str,
+                audio: "AudioParams",
+                sem,
+                admission_handoff=None,
+                infer_guard=None) -> Generator["StreamDelta", None, None]:
+    """Run one standalone TTS request; yields audio-only StreamDeltas.
+
+    ``runtime`` is any pybind object exposing ``handle_request_tts``
+    (LLMRuntime with the Omni stack loaded, or the TTS-only TTSRuntime).
+    Gate ownership follows generate_stream: ``sem`` is acquired here for
+    direct Python callers, while the HTTP layer instead takes it
+    non-blocking and hands it over as ``admission_handoff``. ``infer_guard``
+    serializes against text inference sharing the same CUDA stream (unused
+    by the TTS-only runtime, which serves no text).
+    """
+    omni_params = _native_audio_params(rt, audio)
+    audio_channel = rt.AudioStreamChannel()
+    if sem is not None:
+        sem.acquire()
+
+    def _run():
+        if infer_guard is None:
+            runtime.handle_request_tts(text, omni_params, audio_channel)
+            return
+        with infer_guard:
+            runtime.handle_request_tts(text, omni_params, audio_channel)
+
+    yield from _pump_channels(rt,
+                              _run,
+                              None,
+                              audio_channel,
+                              sem=sem,
+                              admission_handoff=admission_handoff)
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +320,20 @@ def _resolve_model_dir(model: str) -> str:
             "pip install huggingface_hub") from exc
     logger.info("Downloading %s from Hugging Face Hub ...", model)
     return snapshot_download(model)
+
+
+def _derive_model_id(model: str, onnx_dir: str, engine_dir: str) -> str:
+    """Return a clean id to advertise via /v1/models and echo in responses.
+
+    A local checkpoint/ONNX/engine path (e.g. ``--model /path/to/Qwen3-8B-FP8``)
+    would otherwise leak the full filesystem path as the model id; use its
+    directory name. A HuggingFace id (``Qwen/Qwen3-1.7B``) is already clean and
+    is kept as-is.
+    """
+    src = model or onnx_dir or engine_dir or ""
+    if src and (os.path.isabs(src) or os.path.isdir(src)):
+        return os.path.basename(os.path.normpath(src))
+    return src
 
 
 def _artifacts_dir_for_model(model_dir: str) -> str:
@@ -199,13 +370,13 @@ def _engine_config_tag(
 
 def _is_multimodal(model_dir: str) -> bool:
     """Visual-encoder model_type in config.json (audio model types are
-    detected separately via _AUDIO_MODEL_TYPES)."""
+    detected separately via the exporter audio set)."""
     cfg_path = os.path.join(model_dir, "config.json")
     if not os.path.exists(cfg_path):
         return False
     with open(cfg_path) as f:
         cfg = json.load(f)
-    return cfg.get("model_type", "") in _VLM_MODEL_TYPES
+    return cfg.get("model_type", "") in _exporter_model_types()[0]
 
 
 def _read_model_type(model_dir: str) -> str:
@@ -406,12 +577,16 @@ class LLM:
     directory layouts.
     """
 
+    #: Distinguishes full LLM servers from TTS-only ones in the API layer.
+    text_capable = True
+
     def __init__(
         self,
         model: str = "",
         *,
         onnx_dir: str = "",
         visual_onnx_dir: str = "",
+        audio_onnx_dir: str = "",
         engine_dir: str = "",
         multimodal_engine_dir: str = "",
         visual_engine_dir: str = "",
@@ -422,6 +597,9 @@ class LLM:
         draft_top_k: int = 10,
         draft_step: int = 6,
         verify_tree_size: int = 60,
+        talker_engine_dir: str = "",
+        code_predictor_engine_dir: str = "",
+        code2wav_engine_dir: str = "",
     ):
         sources = sum(bool(s) for s in (model, onnx_dir, engine_dir))
         if sources != 1:
@@ -432,6 +610,10 @@ class LLM:
             raise ValueError(
                 "'visual_onnx_dir' is only supported with 'onnx_dir'; "
                 "use 'visual_engine_dir' with 'engine_dir'.")
+        if audio_onnx_dir and not onnx_dir:
+            raise ValueError(
+                "'audio_onnx_dir' is only supported with 'onnx_dir'; "
+                "use 'multimodal_engine_dir' with 'engine_dir'.")
         if visual_engine_dir and not engine_dir:
             raise ValueError(
                 "'visual_engine_dir' is only supported with 'engine_dir'.")
@@ -440,8 +622,11 @@ class LLM:
         # (the encoder slot now also serves audio).
         multimodal_engine_dir = multimodal_engine_dir or visual_engine_dir
 
-        self._model_id = (model or os.path.basename(onnx_dir)
-                          or os.path.basename(engine_dir))
+        self._model_id = _derive_model_id(model, onnx_dir, engine_dir)
+        self._omni_capable = False
+        self._talker_engine_dir = talker_engine_dir
+        self._code_predictor_engine_dir = code_predictor_engine_dir
+        self._code2wav_engine_dir = code2wav_engine_dir
         self._eagle_engine_dir = eagle_engine_dir
         self._draft_top_k = draft_top_k
         self._draft_step = draft_step
@@ -458,6 +643,8 @@ class LLM:
             self._init_from_onnx(
                 onnx_dir,
                 visual_onnx_dir=visual_onnx_dir,
+                audio_onnx_dir=audio_onnx_dir,
+                multimodal_engine_dir=multimodal_engine_dir,
                 max_input_len=max_input_len,
                 max_batch_size=max_batch_size,
                 max_kv_cache_capacity=max_kv_cache_capacity,
@@ -465,6 +652,7 @@ class LLM:
         else:
             self._init_from_model(
                 model,
+                multimodal_engine_dir=multimodal_engine_dir,
                 max_input_len=max_input_len,
                 max_batch_size=max_batch_size,
                 max_kv_cache_capacity=max_kv_cache_capacity,
@@ -524,8 +712,8 @@ class LLM:
 
         if multimodal_engine_dir:
             if not validate_multimodal_engine_dir(multimodal_engine_dir):
-                raise ValueError(
-                    f"visual.engine not found in: {multimodal_engine_dir}")
+                raise ValueError(f"no visual or audio encoder engine "
+                                 f"found in: {multimodal_engine_dir}")
             self._multimodal_engine_dir = multimodal_engine_dir
             self._is_multimodal = True
         else:
@@ -542,18 +730,30 @@ class LLM:
         onnx_dir: str,
         *,
         visual_onnx_dir: str,
+        audio_onnx_dir: str = "",
+        multimodal_engine_dir: str = "",
         max_input_len: int,
         max_batch_size: int,
         max_kv_cache_capacity: int,
     ) -> None:
         """Build engine from ONNX directories (no export)."""
+        from .engine_layout import validate_multimodal_engine_dir
         self._max_input_len = max_input_len
         self._max_batch_size = max_batch_size
         self._max_kv_cache_capacity = max_kv_cache_capacity
         self._onnx_dir = onnx_dir
         self._visual_onnx_dir = visual_onnx_dir
+        self._audio_onnx_dir = audio_onnx_dir
         self._model_dir = onnx_dir
-        self._is_multimodal = bool(visual_onnx_dir)
+        self._is_multimodal = bool(visual_onnx_dir or audio_onnx_dir
+                                   or multimodal_engine_dir)
+
+        # Validated up front: a typo must not surface only after the LLM engine
+        # build, which can take tens of minutes.
+        if multimodal_engine_dir and not validate_multimodal_engine_dir(
+                multimodal_engine_dir):
+            raise ValueError(f"no visual or audio encoder engine "
+                             f"found in: {multimodal_engine_dir}")
 
         cfg_tag = _engine_config_tag(max_input_len, max_batch_size,
                                      max_kv_cache_capacity)
@@ -570,26 +770,50 @@ class LLM:
             logger.info("Using cached engine: %s", self._engine_dir)
 
         self._multimodal_engine_dir = ""
-        if self._is_multimodal:
+        if multimodal_engine_dir:
+            # A user-supplied prebuilt encoder wins over auto-built artifacts.
+            self._multimodal_engine_dir = multimodal_engine_dir
+        elif visual_onnx_dir or audio_onnx_dir:
+            # One shared root: the C++ runtime reads visual.engine from it and
+            # the audio encoder from its audio/ subdirectory.
             self._multimodal_engine_dir = os.path.join(artifacts, "engine",
-                                                       cfg_tag, "visual")
-            if not os.path.exists(
-                    os.path.join(self._multimodal_engine_dir,
-                                 "visual.engine")):
-                self._build_visual_engine()
-            else:
-                logger.info("Using cached visual engine: %s",
-                            self._multimodal_engine_dir)
+                                                       cfg_tag, "multimodal")
+            if visual_onnx_dir:
+                if not os.path.exists(
+                        os.path.join(self._multimodal_engine_dir,
+                                     "visual.engine")):
+                    self._build_visual_engine()
+                else:
+                    logger.info("Using cached visual engine: %s",
+                                self._multimodal_engine_dir)
+            if audio_onnx_dir:
+                if not os.path.exists(
+                        os.path.join(self._multimodal_engine_dir, "audio",
+                                     "audio_encoder.engine")):
+                    self._build_audio_engine()
+                else:
+                    logger.info("Using cached audio engine: %s",
+                                self._multimodal_engine_dir)
 
     def _init_from_model(
         self,
         model: str,
         *,
+        multimodal_engine_dir: str = "",
         max_input_len: int,
         max_batch_size: int,
         max_kv_cache_capacity: int,
     ) -> None:
         """Export ONNX + build engine from HuggingFace checkpoint."""
+        from .engine_layout import validate_multimodal_engine_dir
+
+        # Validated before the LLM ONNX export below, which can take tens of
+        # minutes; _init_from_onnx re-checks for its own direct callers.
+        if multimodal_engine_dir and not validate_multimodal_engine_dir(
+                multimodal_engine_dir):
+            raise ValueError(f"no visual or audio encoder engine "
+                             f"found in: {multimodal_engine_dir}")
+
         self._max_input_len = max_input_len
         self._max_batch_size = max_batch_size
         self._max_kv_cache_capacity = max_kv_cache_capacity
@@ -599,17 +823,23 @@ class LLM:
         artifacts = _artifacts_dir_for_model(self._model_dir)
         self._is_multimodal = _is_multimodal(self._model_dir)
         self._model_type = _read_model_type(self._model_dir)
+        self._is_audio_model = self._model_type in _exporter_model_types()[1]
         if self._is_multimodal:
             logger.info("Detected VLM model (type=%s)", self._model_type)
+        elif self._is_audio_model:
+            logger.info("Detected audio model (type=%s)", self._model_type)
 
         self._onnx_dir = os.path.join(artifacts, "onnx", "llm")
         if not os.path.exists(os.path.join(self._onnx_dir, "model.onnx")):
             self._export_onnx()
         else:
             logger.info("Using cached ONNX: %s", self._onnx_dir)
+            self._patch_multimodal_token_ids()
 
+        # A prebuilt multimodal engine dir wins, so exporting encoder ONNX would
+        # only be discarded by _init_from_onnx.
         self._visual_onnx_dir = ""
-        if self._is_multimodal:
+        if self._is_multimodal and not multimodal_engine_dir:
             self._visual_onnx_dir = os.path.join(artifacts, "onnx", "visual")
             if not os.path.exists(
                     os.path.join(self._visual_onnx_dir, "model.onnx")):
@@ -618,10 +848,22 @@ class LLM:
                 logger.info("Using cached visual ONNX: %s",
                             self._visual_onnx_dir)
 
+        self._audio_onnx_dir = ""
+        if self._is_audio_model and not multimodal_engine_dir:
+            self._audio_onnx_dir = os.path.join(artifacts, "onnx", "audio")
+            if not os.path.exists(
+                    os.path.join(self._audio_onnx_dir, "model.onnx")):
+                self._export_audio_onnx()
+            else:
+                logger.info("Using cached audio ONNX: %s",
+                            self._audio_onnx_dir)
+
         # Delegate to _init_from_onnx for the build step
         self._init_from_onnx(
             self._onnx_dir,
             visual_onnx_dir=self._visual_onnx_dir,
+            audio_onnx_dir=self._audio_onnx_dir,
+            multimodal_engine_dir=multimodal_engine_dir,
             max_input_len=max_input_len,
             max_batch_size=max_batch_size,
             max_kv_cache_capacity=max_kv_cache_capacity,
@@ -657,7 +899,35 @@ class LLM:
                 {},
             )
         self._runtime.capture_decoding_cuda_graph()
+        self._load_omni_runtime()
         logger.info("Engine loaded and ready.")
+
+    def _load_omni_runtime(self) -> None:
+        """Load the Qwen3-Omni audio-output stack when its engines exist."""
+        from .engine_layout import find_omni_engine_dirs
+
+        dirs = {
+            "talker": self._talker_engine_dir,
+            "code_predictor": self._code_predictor_engine_dir,
+            "code2wav": self._code2wav_engine_dir,
+        }
+        explicit = any(dirs.values())
+        if not all(dirs.values()):
+            auto = find_omni_engine_dirs(self._engine_dir) or {}
+            dirs = {k: v or auto.get(k, "") for k, v in dirs.items()}
+            if not all(dirs.values()):
+                if explicit:
+                    raise ValueError(
+                        "Omni engine dirs partially specified and the rest "
+                        f"could not be auto-detected: {dirs}")
+                return
+            logger.info("Auto-detected Omni engines: talker=%s",
+                        dirs["talker"])
+
+        self._runtime.load_omni(dirs["talker"], dirs["code_predictor"],
+                                dirs["code2wav"], self._engine_dir)
+        self._omni_capable = True
+        logger.info("Omni audio output ready.")
 
     # ------------------------------------------------------------------
     # Pipeline stages
@@ -675,25 +945,34 @@ class LLM:
         output_path = os.path.join(self._onnx_dir, "model.onnx")
         export_onnx(model, output_path, model_dir=self._model_dir)
 
-        # Patch image_token_id for VLM models
+        self._patch_multimodal_token_ids()
+        logger.info("ONNX export complete: %s", output_path)
+
+    def _patch_multimodal_token_ids(self) -> None:
+        """Write the media placeholder ids into the LLM config. Idempotent, and
+        re-run on a cached ONNX: a config predating the encoder carries no id,
+        which the runtime reads as -1 and silently drops the embeddings."""
         if self._is_multimodal:
             _ensure_export_package()
             from tensorrt_edgellm.scripts.export import _find_token_id
             image_token_id = _find_token_id(self._model_dir, "<|image_pad|>")
-            if image_token_id is not None:
-                cfg_path = os.path.join(self._onnx_dir, "config.json")
-                if os.path.exists(cfg_path):
-                    with open(cfg_path) as f:
-                        cfg = json.load(f)
+            cfg_path = os.path.join(self._onnx_dir, "config.json")
+            if image_token_id is not None and os.path.exists(cfg_path):
+                with open(cfg_path) as f:
+                    cfg = json.load(f)
+                if cfg.get("image_token_id") != image_token_id:
                     cfg["image_token_id"] = image_token_id
                     with open(cfg_path, "w") as f:
                         json.dump(cfg, f, indent=2)
-                    logger.info(
-                        "Patched image_token_id=%d into LLM config",
-                        image_token_id,
-                    )
+                    logger.info("Patched image_token_id=%d into LLM config",
+                                image_token_id)
 
-        logger.info("ONNX export complete: %s", output_path)
+        if getattr(self, "_is_audio_model", False):
+            _ensure_export_package()
+            from tensorrt_edgellm.scripts.export import \
+                _patch_multimodal_token_ids
+            _patch_multimodal_token_ids(self._model_dir, self._onnx_dir,
+                                        self._model_type)
 
     def _export_visual_onnx(self) -> None:
         """Export the visual encoder to ONNX via tensorrt_edgellm."""
@@ -706,6 +985,7 @@ class LLM:
         import torch
 
         _ensure_export_package()
+        from tensorrt_edgellm.model import load_model_config
         from tensorrt_edgellm.scripts.export import (_export_visual,
                                                      _load_all_weights,
                                                      _load_config)
@@ -719,10 +999,45 @@ class LLM:
             config,
             self._model_type,
             torch.float16,
+            load_model_config(self._model_dir),
         )
         logger.info(
             "Visual ONNX export complete: %s",
             self._visual_onnx_dir,
+        )
+
+    def _export_audio_onnx(self) -> None:
+        """Export the audio encoder to ONNX via tensorrt_edgellm."""
+        logger.info(
+            "Exporting audio ONNX to %s ...",
+            self._audio_onnx_dir,
+        )
+        os.makedirs(self._audio_onnx_dir, exist_ok=True)
+
+        import torch
+
+        _ensure_export_package()
+        from tensorrt_edgellm.model import load_model_config
+        from tensorrt_edgellm.scripts.export import (_export_audio,
+                                                     _load_all_weights,
+                                                     _load_config)
+
+        config = _load_config(self._model_dir)
+        weights = _load_all_weights(self._model_dir)
+        # Passing the ModelConfig lets _export_audio subset it to the audio
+        # tower, so an NVFP4 backbone still exports an FP16 encoder.
+        _export_audio(
+            self._model_dir,
+            self._audio_onnx_dir,
+            weights,
+            config,
+            self._model_type,
+            torch.float16,
+            load_model_config(self._model_dir),
+        )
+        logger.info(
+            "Audio ONNX export complete: %s",
+            self._audio_onnx_dir,
         )
 
     def _build_engine(self) -> None:
@@ -787,6 +1102,36 @@ class LLM:
             self._multimodal_engine_dir,
         )
 
+    def _build_audio_engine(self) -> None:
+        """Build a TensorRT engine for the audio encoder.
+
+        The engine and its config.json land in the audio/ subdirectory the
+        C++ runtime expects under the multimodal engine dir.
+        """
+        audio_engine_dir = os.path.join(self._multimodal_engine_dir, "audio")
+        logger.info(
+            "Building audio TensorRT engine: %s -> %s",
+            self._audio_onnx_dir,
+            audio_engine_dir,
+        )
+        os.makedirs(audio_engine_dir, exist_ok=True)
+
+        rt = _import_runtime()
+        config = rt.AudioBuilderConfig()
+        builder = rt.AudioBuilder(
+            self._audio_onnx_dir,
+            self._multimodal_engine_dir,  # AudioBuilder appends audio/ itself
+            config,
+        )
+        if not builder.build():
+            raise RuntimeError(f"Audio TensorRT engine build failed. "
+                               f"ONNX dir: {self._audio_onnx_dir}, "
+                               f"engine dir: {audio_engine_dir}")
+        logger.info(
+            "Audio engine build complete: %s",
+            self._multimodal_engine_dir,
+        )
+
     def _tool_template_dirs(self) -> List[str]:
         dirs = [self._model_dir, self._engine_dir]
         if hasattr(self, "_onnx_dir"):
@@ -833,8 +1178,8 @@ class LLM:
         return cfg
 
     def _video_model_family(self) -> str:
-        """Frame-sampling family ("qwen" / "internvl") from the visual engine's
-        model_type. Types without a video path (phi4mm, gemma, ...) are
+        """Frame-sampling family ("qwen" / "internvl" / "nemotron") from the
+        visual engine's model_type. Types without a video path (phi4mm, ...) are
         rejected: their runners read only the first frame."""
         cached = getattr(self, "_video_family_cache", None)
         if cached is not None:
@@ -852,6 +1197,8 @@ class LLM:
                       or os.path.isfile(os.path.join(root, "visual.engine")))
         if "internvl" in model_type and has_visual:
             family = "internvl"
+        elif "nemotron" in model_type and not is_audio_type and has_visual:
+            family = "nemotron"
         elif (model_type.startswith(qwen_video_types) and not is_audio_type
               and has_visual):
             family = "qwen"
@@ -861,8 +1208,8 @@ class LLM:
             raise ValueError(
                 f"video input is not supported for model_type={model_type!r}"
                 " on this multimodal engine; supported families: Qwen-VL "
-                "(qwen2_vl/qwen2_5_vl/qwen3_vl/qwen3_5/qwen3_omni) and "
-                "InternVL")
+                "(qwen2_vl/qwen2_5_vl/qwen3_vl/qwen3_5/qwen3_omni), InternVL, "
+                "and Nemotron-Omni")
         self._video_family_cache = family
         return family
 
@@ -899,14 +1246,23 @@ class LLM:
                 int(builder["max_image_tokens"]),
                 "max_image_tokens_per_image":
                 int(builder.get("max_image_tokens_per_image", 0)),
-                "max_cu_seqlen_entries":
-                int(builder.get("max_cu_seqlen_entries", 0)),
+                "max_cu_seqlen_groups":
+                int(builder.get("max_cu_seqlen_groups", 0)),
                 "patch_size":
                 int(pre.get("patch_size", 0)),
                 "merge_size":
                 int(pre.get("merge_size", 0)),
                 "temporal_patch_size":
                 int(pre.get("temporal_patch_size", 2)),
+                # Nemotron-Omni video geometry (top-level visual config.json).
+                "video_pruning_rate":
+                float(cfg.get("video_pruning_rate", 0.0)),
+                "video_temporal_patch_size":
+                int(cfg.get("video_temporal_patch_size", 2)),
+                "video_target_num_patches":
+                int(cfg.get("video_target_num_patches", 1024)),
+                "downsample_ratio":
+                float(cfg.get("downsample_ratio", 0.5)),
             }
         self._video_limits_cache = limits
         return limits
@@ -953,6 +1309,42 @@ class LLM:
 
         cpp_messages = _convert_messages_to_cpp(self._rt, messages)
         return cpp_messages, image_buffers, True, True
+
+    def count_prompt_tokens(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        tools: Optional[Sequence[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        tool_config: Optional[ToolConfig] = None,
+        enable_thinking: bool = False,
+    ) -> Optional[int]:
+        """Best-effort prompt token count via the HF tokenizer: exact for
+        tool-templated requests, within a few tokens for plain ones (HF vs
+        C++ template). Multimodal placeholders are counted once, not expanded,
+        so multimodal prompts are undercounted. None when counting is
+        unavailable."""
+        try:
+            tool_config = tool_config or validate_tool_request(
+                messages, tools, tool_choice)
+            template_tools = (tool_config.tools
+                              if tool_config.tool_choice != "none" else [])
+            template_tool_choice = None
+            if template_tools and tool_config.tool_choice != "none":
+                template_tool_choice = self._tool_choice_for_template(
+                    tool_config)
+            formatter = self._get_tool_template_formatter()
+            prompt = formatter.format(
+                messages,
+                tools=template_tools,
+                tool_choice=template_tool_choice,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+            return formatter.count_tokens(prompt)
+        except Exception:
+            logger.debug("Prompt token counting unavailable", exc_info=True)
+            return None
 
     def _make_generation_request(
         self,
@@ -1043,14 +1435,25 @@ class LLM:
                                                threading.Semaphore(1))
         return sem
 
-    def _handle_request(self, request):
-        """Serialized entry to the C++ runtime."""
+    def _infer_guard(self):
+        """Lock serializing every entry into the C++ runtime.
+
+        The batcher runs on its own worker and takes only this lock, never
+        the admission semaphore, so the audio paths — which call the runtime
+        directly rather than through _handle_request — must take it too.
+        """
         lock = self.__dict__.get("_infer_lock")
         if lock is None:
             with LLM._infer_lock_guard:
                 lock = self.__dict__.setdefault("_infer_lock",
                                                 threading.Lock())
-        with lock:
+        return lock
+
+    def _handle_request(self, request):
+        """Serialized entry to the C++ runtime."""
+        # Called unbound on duck-typed objects too, so reach the guard
+        # through the class rather than the instance.
+        with LLM._infer_guard(self):
             return self._runtime.handle_request(request)
 
     def generate(
@@ -1198,11 +1601,17 @@ class LLM:
                     admission_handoff.release()
 
         worker = threading.Thread(target=_run, daemon=True)
-        worker.start()
+        # Transfer gate ownership before start(): the worker owns it the moment
+        # it may run (a join timeout below must not release it while the C++
+        # call still runs); a start() failure hands it back to the HTTP layer.
         if admission_handoff is not None:
-            # The worker owns the gate now: a join timeout below must not
-            # release it while the C++ call is still running.
             admission_handoff.worker_started()
+        try:
+            worker.start()
+        except BaseException:
+            if admission_handoff is not None:
+                admission_handoff.worker_start_failed()
+            raise
 
         try:
             while True:
@@ -1233,9 +1642,102 @@ class LLM:
         if error_holder[0] is not None:
             raise error_holder[0]
 
+    def generate_stream_with_audio(
+        self,
+        messages: List[Dict[str, Any]],
+        sampling_params: Optional[SamplingParams] = None,
+        *,
+        audio_params: Optional[AudioParams] = None,
+        prebuilt_request: Optional[Any] = None,
+        admission_handoff: Optional[Any] = None,
+    ) -> Generator[StreamDelta, None, None]:
+        """Stream text and audio deltas for a single Omni request.
+
+        Runs the Thinker-Talker streaming pipeline in a background thread.
+        Text deltas arrive through a ``StreamChannel`` and PCM chunks through
+        an ``AudioStreamChannel``; the two are interleaved into one generator.
+        Admission follows generate_stream: the HTTP layer owns the gate when
+        it passes ``prebuilt_request``; otherwise it is acquired here.
+        """
+        if not self.omni_capable:
+            raise ValueError("Omni audio output not available: talker / "
+                             "code_predictor / code2wav engines not loaded.")
+        params = sampling_params or SamplingParams()
+
+        channel = self._rt.StreamChannel.create()
+        channel.set_skip_special_tokens(True)
+        audio_channel = self._rt.AudioStreamChannel()
+        omni_params = _native_audio_params(self._rt, audio_params
+                                           or AudioParams())
+        # The HTTP layer takes the slot non-blocking and hands it over (with
+        # or without a prebuilt request); direct Python callers acquire here.
+        owns_gate = (prebuilt_request is not None
+                     or admission_handoff is not None)
+        sem = None if owns_gate else self._admission()
+        if sem is not None:
+            sem.acquire()
+        try:
+            if prebuilt_request is not None:
+                request = prebuilt_request
+                request.stream_channels = [channel]
+            else:
+                request = self._make_generation_request(
+                    messages,
+                    params,
+                    stream_channel=channel,
+                )
+        except BaseException:
+            if sem is not None:
+                sem.release()
+            raise
+
+        def _run():
+            # Same serialization as _handle_request: the batcher holds only
+            # this lock, so without it batched text would run concurrently.
+            with self._infer_guard():
+                self._runtime.handle_request_streaming_audio(
+                    request, audio_channel, omni_params)
+
+        yield from _pump_channels(self._rt,
+                                  _run,
+                                  channel,
+                                  audio_channel,
+                                  sem=sem,
+                                  admission_handoff=admission_handoff)
+
     # ------------------------------------------------------------------
     # Server API
     # ------------------------------------------------------------------
+
+    def generate_speech_stream(
+        self,
+        text: str,
+        audio_params: Optional[AudioParams] = None,
+        *,
+        admission_handoff: Optional[Any] = None,
+    ) -> Generator[StreamDelta, None, None]:
+        """Standalone TTS on the Omni stack: synthesize ``text`` directly.
+
+        No Thinker generation pass — the input text goes straight to the
+        Talker. Yields audio-only StreamDeltas.
+        """
+        if not self.omni_capable:
+            raise ValueError("TTS not available: Omni audio engines "
+                             "(talker/code_predictor/code2wav) not loaded")
+        sem = None if admission_handoff is not None else self._admission()
+        yield from _stream_tts(self._rt,
+                               self._runtime,
+                               text,
+                               audio_params or AudioParams(),
+                               sem,
+                               admission_handoff=admission_handoff,
+                               infer_guard=self._infer_guard())
+
+    def list_voices(self) -> List[str]:
+        """Speaker names accepted as ``voice``; empty when not Omni-capable."""
+        if not self.omni_capable:
+            return []
+        return sorted(self._runtime.get_speaker_names())
 
     def serve(self,
               host: str = "0.0.0.0",
@@ -1243,7 +1745,9 @@ class LLM:
               *,
               enable_batching: bool = False,
               batch_timeout_ms: float = 10.0,
-              max_queue_batch_size: Optional[int] = None) -> None:
+              max_queue_batch_size: Optional[int] = None,
+              request_queue_size: Optional[int] = None,
+              allowed_local_media_path: Optional[str] = None) -> None:
         """Start an OpenAI-compatible HTTP server.
 
         Args:
@@ -1252,8 +1756,13 @@ class LLM:
             enable_batching: Batch compatible non-streaming HTTP requests.
             batch_timeout_ms: Maximum time to wait for compatible requests.
             max_queue_batch_size: Optional cap for queued HTTP micro-batches.
+            request_queue_size: Max concurrently admitted requests (queued +
+                running) before the server returns backpressure. None uses the
+                server default.
+            allowed_local_media_path: Directory HTTP clients may reference local
+                media from. Unset rejects bare paths and ``file://`` URLs.
         """
-        from .api_server import run_server
+        from .api_server import _DEFAULT_REQUEST_QUEUE_SIZE, run_server
 
         run_server(
             self,
@@ -1262,6 +1771,9 @@ class LLM:
             enable_batching=enable_batching,
             batch_timeout_ms=batch_timeout_ms,
             max_queue_batch_size=max_queue_batch_size,
+            request_queue_size=(request_queue_size if request_queue_size
+                                is not None else _DEFAULT_REQUEST_QUEUE_SIZE),
+            allowed_local_media_path=allowed_local_media_path,
         )
 
     # ------------------------------------------------------------------
@@ -1287,6 +1799,97 @@ class LLM:
     def has_draft_model(self) -> bool:
         """Whether Eagle speculative decoding is active."""
         return self._runtime.has_draft_model()
+
+    @property
+    def omni_capable(self) -> bool:
+        """Whether the Omni audio-output stack is loaded."""
+        return self._omni_capable
+
+
+class TTS:
+    """TTS-only serving for Qwen3-TTS-style engine sets.
+
+    Loads Talker + CodePredictor + Code2Wav without a Thinker/text engine.
+    ``serve()`` exposes ``/v1/audio/speech``; chat endpoints return 400.
+
+    Example::
+
+        from experimental.server import TTS
+
+        tts = TTS(talker_engine_dir="/engines/qwen3-tts/talker")
+        tts.serve(port=8000)
+
+    ``code_predictor_engine_dir`` / ``code2wav_engine_dir`` default to the
+    talker directory's siblings; ``tokenizer_dir`` defaults to the talker
+    directory itself (the standard export layout ships tokenizer files there).
+    """
+
+    text_capable = False
+    omni_capable = True
+    has_draft_model = False
+
+    def __init__(
+        self,
+        talker_engine_dir: str,
+        code_predictor_engine_dir: Optional[str] = None,
+        code2wav_engine_dir: Optional[str] = None,
+        tokenizer_dir: str = "",
+        model: Optional[str] = None,
+    ) -> None:
+        talker_engine_dir = os.path.abspath(talker_engine_dir)
+        base = os.path.dirname(talker_engine_dir)
+        code_predictor_engine_dir = (code_predictor_engine_dir
+                                     or os.path.join(base, "code_predictor"))
+        code2wav_engine_dir = (code2wav_engine_dir
+                               or os.path.join(base, "code2wav"))
+        for name, path in (("talker", talker_engine_dir),
+                           ("code_predictor", code_predictor_engine_dir),
+                           ("code2wav", code2wav_engine_dir)):
+            if not os.path.isdir(path):
+                raise ValueError(f"{name} engine dir not found: {path}")
+
+        self.model_dir = talker_engine_dir
+        self._model_id = model or os.path.basename(base) or "tts"
+        self._rt = _import_runtime()
+        logger.info("Loading TTS engines (talker=%s) ...", talker_engine_dir)
+        self._runtime = self._rt.TTSRuntime(
+            talker_engine_dir=talker_engine_dir,
+            code_predictor_engine_dir=code_predictor_engine_dir,
+            code2wav_engine_dir=code2wav_engine_dir,
+            tokenizer_dir=tokenizer_dir,
+        )
+        logger.info("TTS runtime ready")
+        self._admission_sem = threading.Semaphore(1)
+
+    def _admission(self):
+        """Per-instance admission gate (mirrors LLM._admission)."""
+        return self._admission_sem
+
+    def generate_speech_stream(
+        self,
+        text: str,
+        audio_params: Optional[AudioParams] = None,
+        *,
+        admission_handoff: Optional[Any] = None,
+    ) -> Generator[StreamDelta, None, None]:
+        """Synthesize ``text``; yields audio-only StreamDeltas."""
+        sem = None if admission_handoff is not None else self._admission()
+        yield from _stream_tts(self._rt,
+                               self._runtime,
+                               text,
+                               audio_params or AudioParams(),
+                               sem,
+                               admission_handoff=admission_handoff)
+
+    def list_voices(self) -> List[str]:
+        """Speaker names accepted as ``voice``."""
+        return sorted(self._runtime.get_speaker_names())
+
+    def serve(self, host: str = "0.0.0.0", port: int = 8000) -> None:
+        """Start the HTTP server (speech endpoint only)."""
+        from .api_server import run_server
+
+        run_server(self, host=host, port=port)
 
 
 # ---------------------------------------------------------------------------
@@ -1383,9 +1986,25 @@ def _load_image_buffers(rt_module,
     has_video = any(
         item.get("type") in ("video", "video_url") for item in items)
     family = video_family_fn() if has_video else "qwen"
+    if has_video and family == "nemotron":
+        # The C++ Nemotron video path handles exactly one video and no mixed-in
+        # images per request (batch of one); reject other layouts here rather
+        # than letting them fail inside the runner.
+        n_videos = sum(1 for it in items
+                       if it.get("type") in ("video", "video_url"))
+        n_images = sum(1 for it in items
+                       if it.get("type") in ("image", "image_url"))
+        if n_videos > 1 or n_images > 0:
+            raise ValueError(
+                "Nemotron-Omni video requests support exactly one video and no "
+                f"images (got {n_videos} videos, {n_images} images)")
     limits = video_frame_limits_fn() if has_video else {}
     budget = limits.get("max_image_tokens") if limits else None
     video_tokens = 0
+    # Pre-pruning token count for the engine-minimum check: the ViT processes
+    # every tubelet, so Nemotron's EVS-pruned estimate would understate what the
+    # min-profile actually receives. Non-EVS families track the same value.
+    video_raw_tokens = 0
     # Request-wide decoded-pixel budget: several videos each under the
     # per-video ceiling must not jointly exhaust host memory.
     pixel_budget = None
@@ -1393,7 +2012,7 @@ def _load_image_buffers(rt_module,
     # cu_seqlens binding): builder-recorded capacity, else the legacy formula.
     cu_budget = None
     if limits and family != "internvl":
-        cu_budget = (limits.get("max_cu_seqlen_entries")
+        cu_budget = (limits.get("max_cu_seqlen_groups")
                      or limits["max_image_tokens"] //
                      max(1, limits.get("min_image_tokens", 1)))
     image_upper = 0
@@ -1441,6 +2060,15 @@ def _load_image_buffers(rt_module,
                 cu_budget=cu_budget)
             images.append(buffer)
             video_tokens += est_tokens
+            raw_tokens = est_tokens
+            if family == "nemotron":
+                from .video_sampling import _nemotron_tubelet_geometry
+                geom = _nemotron_tubelet_geometry(limits)
+                if geom:
+                    t_frames, tokens_per_tubelet, _q = geom
+                    raw_tokens = (-(-buffer.frames // t_frames)) \
+                        * tokens_per_tubelet
+            video_raw_tokens += raw_tokens
             pixel_budget -= used_px
             if cu_budget is not None:
                 cu_budget -= used_groups
@@ -1458,12 +2086,12 @@ def _load_image_buffers(rt_module,
             "request media need more visual tokens than the engine's "
             f"budget of {limits['max_image_tokens']}; reduce the media in "
             "the request")
-    if (video_tokens or image_upper) and limits and \
+    if (video_raw_tokens or image_upper) and limits and \
             limits.get("min_image_tokens"):
-        # The engine minimum is request-wide; reject only when the upper estimate
-        # falls short -- only do_resize=false media can genuinely undershoot
-        # (resized media are floored per item).
-        upper_tokens = video_tokens + image_upper
+        # The engine minimum is request-wide; the upper estimate is pre-EVS
+        # (raw tubelets for Nemotron). It can fall short for a too-short clip or
+        # do_resize=false media; resized per-item images are floored above this.
+        upper_tokens = video_raw_tokens + image_upper
         if upper_tokens < limits["min_image_tokens"]:
             raise ValueError(
                 f"request media yield ~{upper_tokens} visual tokens but the "

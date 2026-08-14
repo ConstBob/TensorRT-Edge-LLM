@@ -17,6 +17,7 @@
 import argparse
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 import zipfile
@@ -33,6 +34,41 @@ assert _SPEC is not None and _SPEC.loader is not None
 build_cutedsl = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = build_cutedsl
 _SPEC.loader.exec_module(build_cutedsl)
+
+_FMHA_V2_SUPPORTED_SMS = [80, 86, 87, 89, 90, 100, 101, 110, 120, 121]
+_FMHA_V2_DENSE_VARIANTS = {
+    "fmha_v2_d64",
+    "fmha_v2_d64_small",
+    "fmha_v2_d128",
+    "fmha_v2_d256",
+    "fmha_v2_d64_sw",
+    "fmha_v2_d128_sw",
+    "fmha_v2_d256_sw",
+    "fmha_v2_d512",
+    "fmha_v2_d512_sw",
+}
+_FMHA_V2_PAGED_VARIANTS = {
+    "fmha_v2_d64_paged",
+    "fmha_v2_d64_small_paged",
+    "fmha_v2_d128_paged",
+    "fmha_v2_d256_paged",
+    "fmha_v2_d512_paged",
+    "fmha_v2_d64_sw_paged",
+    "fmha_v2_d128_sw_paged",
+    "fmha_v2_d256_sw_paged",
+    "fmha_v2_d512_sw_paged",
+}
+_FMHA_V2_SPECIAL_VARIANTS = {
+    "fmha_v2_d256_padding",
+    "fmha_v2_vit_d64",
+    "fmha_v2_vit_d72",
+    "fmha_v2_vit_d80",
+    "fmha_v2_vit_d128",
+    "fmha_v2_d256_bidirectional",
+    "fmha_v2_d512_bidirectional",
+}
+_FMHA_V2_VARIANTS = (_FMHA_V2_DENSE_VARIANTS | _FMHA_V2_PAGED_VARIANTS
+                     | _FMHA_V2_SPECIAL_VARIANTS)
 
 
 def _write_fake_elf(path: Path, machine: int) -> None:
@@ -53,15 +89,15 @@ def _write_fake_archive(path: Path, machine: int) -> Path:
 
 
 def test_cutlass_dsl_version_accepts_pinned_dev_and_local_versions():
-    assert build_cutedsl._cutlass_dsl_version_matches("4.6.1")
-    assert build_cutedsl._cutlass_dsl_version_matches("4.6.1+local")
-    assert build_cutedsl._cutlass_dsl_version_matches("4.6.1.dev0")
+    assert build_cutedsl._cutlass_dsl_version_matches("4.7.0")
+    assert build_cutedsl._cutlass_dsl_version_matches("4.7.0+local")
+    assert build_cutedsl._cutlass_dsl_version_matches("4.7.0.dev0")
     assert build_cutedsl._cutlass_dsl_version_matches(
-        "4.6.1.dev20260630+local")
+        "4.7.0.dev20260630+local")
 
     assert not build_cutedsl._cutlass_dsl_version_matches("4.5.2")
-    assert not build_cutedsl._cutlass_dsl_version_matches("4.6.0")
-    assert not build_cutedsl._cutlass_dsl_version_matches("4.6.1rc1")
+    assert not build_cutedsl._cutlass_dsl_version_matches("4.6.1")
+    assert not build_cutedsl._cutlass_dsl_version_matches("4.7.0rc1")
 
 
 def test_find_static_runtime_archive_prefers_cuda_variant_layout(tmp_path):
@@ -105,7 +141,7 @@ def test_resolve_static_runtime_archive_uses_installed_matching_archive(
         "x86_64",
         pkg_dir,
         "13.0",
-        "4.6.1",
+        "4.7.0",
         tmp_path / "staging",
     )
     assert resolved == archive
@@ -119,7 +155,7 @@ def test_resolve_static_runtime_archive_cross_downloads_target_wheel(
         build_cutedsl._ELF_MACHINE["x86_64"],
     )
 
-    wheel = tmp_path / "nvidia_cutlass_dsl_libs_cu13-4.6.1-cp312-cp312-manylinux_2_28_aarch64.whl"
+    wheel = tmp_path / "nvidia_cutlass_dsl_libs_cu13-4.7.0-cp312-cp312-manylinux_2_28_aarch64.whl"
     archive_in_wheel = tmp_path / "wheel_src" / "nvidia_cutlass_dsl" / "cu13" / "lib" / "libcuda_dialect_runtime_static.a"
     _write_fake_archive(archive_in_wheel,
                         build_cutedsl._ELF_MACHINE["aarch64"])
@@ -137,7 +173,7 @@ def test_resolve_static_runtime_archive_cross_downloads_target_wheel(
         "x86_64",
         pkg_dir,
         "13.0",
-        "4.6.1",
+        "4.7.0",
         tmp_path / "staging",
     )
     assert resolved.name == "libcuda_dialect_runtime_static.a"
@@ -158,7 +194,7 @@ def test_download_runtime_libs_wheel_uses_configured_wheelhouse(
         destination = Path(cmd[cmd.index("-d") + 1])
         destination.mkdir(parents=True, exist_ok=True)
         wheel = destination / (
-            "nvidia_cutlass_dsl_libs_cu12-4.6.1-cp312-cp312-"
+            "nvidia_cutlass_dsl_libs_cu12-4.7.0-cp312-cp312-"
             "manylinux_2_28_aarch64.whl")
         wheel.write_bytes(b"wheel")
         return subprocess.CompletedProcess(cmd, 0, "", "")
@@ -166,8 +202,8 @@ def test_download_runtime_libs_wheel_uses_configured_wheelhouse(
     monkeypatch.setattr(build_cutedsl.subprocess, "run", fake_run)
 
     wheel = build_cutedsl._download_runtime_libs_wheel("aarch64", "12",
-                                                       "4.6.1", download_dir)
-    assert wheel.name.startswith("nvidia_cutlass_dsl_libs_cu12-4.6.1")
+                                                       "4.7.0", download_dir)
+    assert wheel.name.startswith("nvidia_cutlass_dsl_libs_cu12-4.7.0")
 
 
 def test_tarball_builder_lists_mixed_cuda_matrix():
@@ -192,7 +228,7 @@ def test_tarball_builder_lists_mixed_cuda_matrix():
 
 
 @pytest.mark.parametrize("cuda_major", ["12", "13"])
-def test_tarball_builder_default_matrix_includes_a30(cuda_major):
+def test_tarball_builder_default_matrix_includes_expected_targets(cuda_major):
     script = _REPO_ROOT / "kernelSrcs" / "build_cutedsl_tarballs.sh"
     env = os.environ.copy()
     env.pop("CUTE_DSL_MATRIX", None)
@@ -205,8 +241,10 @@ def test_tarball_builder_default_matrix_includes_a30(cuda_major):
                             text=True,
                             env=env)
 
-    assert f"cutedsl_x86_64_sm_80_cuda{cuda_major}.tar.gz" in (
-        result.stdout.splitlines())
+    tarballs = result.stdout.splitlines()
+    assert f"cutedsl_x86_64_sm_80_cuda{cuda_major}.tar.gz" in tarballs
+    if cuda_major == "13":
+        assert "cutedsl_aarch64_sm_90_cuda13.tar.gz" in tarballs
 
 
 def test_tarball_builder_docker_matrix_matches_ci_targets():
@@ -219,11 +257,13 @@ def test_tarball_builder_docker_matrix_matches_ci_targets():
 
     assert matrix.split(",") == [
         "x86_64:sm_80:13",
+        "x86_64:sm_90:13",
         "x86_64:sm_100:13",
         "x86_64:sm_120:13",
         "x86_64:sm_120:12",
         "aarch64:sm_87:13",
         "aarch64:sm_87:12",
+        "aarch64:sm_90:13",
         "aarch64:sm_101:12",
         "aarch64:sm_110:13",
         "aarch64:sm_121:12",
@@ -231,48 +271,143 @@ def test_tarball_builder_docker_matrix_matches_ci_targets():
     ]
 
 
-@pytest.mark.parametrize(
-    ("sm", "expected"), [(80, "sm_80"), (87, "sm_87"), (100, "sm_100a"),
-                         (110, "sm_110a"), (120, "sm_120a"), (121, "sm_121a")])
+@pytest.mark.parametrize(("sm", "expected"),
+                         [(80, "sm_80"), (87, "sm_87"), (90, "sm_90"),
+                          (100, "sm_100a"), (110, "sm_110a"), (120, "sm_120a"),
+                          (121, "sm_121a")])
 def test_default_compile_gpu_arch_is_derived_from_target_sm(sm, expected):
     assert build_cutedsl.default_compile_gpu_arch(sm) == expected
 
 
-@pytest.mark.parametrize("sm", [80, 86, 87, 89, 100, 101, 110, 120, 121])
+@pytest.mark.parametrize("sm", _FMHA_V2_SUPPORTED_SMS)
 def test_fmha_v2_registry_is_complete_for_supported_sms(sm):
-    variants = build_cutedsl.select_variants(sm, "fmha_v2")
+    variants = build_cutedsl.select_variants(sm, "fmha")
+    fmha_v2_variants = [
+        variant for variant in variants
+        if variant.script == "fmha_v2_cutedsl/fmha.py"
+    ]
 
+    assert {variant.name for variant in fmha_v2_variants} == _FMHA_V2_VARIANTS
+    assert all(variant.group == "fmha" for variant in fmha_v2_variants)
+    assert all("--export_only" in variant.script_args
+               for variant in fmha_v2_variants)
+
+    dense_variants = [
+        variant for variant in fmha_v2_variants
+        if variant.name in _FMHA_V2_DENSE_VARIANTS
+    ]
     assert {variant.name
-            for variant in variants} == {
-                "fmha_v2_d64",
-                "fmha_v2_d64_small",
-                "fmha_v2_d128",
-                "fmha_v2_d256",
-                "fmha_v2_d256_padding",
-                "fmha_v2_d64_sw",
-                "fmha_v2_d128_sw",
-                "fmha_v2_d256_sw",
-                "fmha_v2_vit_d64",
-                "fmha_v2_vit_d72",
-                "fmha_v2_vit_d80",
-                "fmha_v2_vit_d128",
-                "fmha_v2_d256_visionblock",
-            }
-    assert all(variant.script == "fmha_v2_cutedsl/fmha.py"
-               for variant in variants)
-    assert all("--export_only" in variant.script_args for variant in variants)
-    padding_variant = next(variant for variant in variants
+            for variant in dense_variants} == _FMHA_V2_DENSE_VARIANTS
+    assert all("--fmha_v2_context" in variant.script_args
+               for variant in dense_variants)
+    assert all("--paged_kv" not in variant.script_args
+               for variant in dense_variants)
+
+    paged_variants = [
+        variant for variant in fmha_v2_variants
+        if variant.name in _FMHA_V2_PAGED_VARIANTS
+    ]
+    assert {variant.name
+            for variant in paged_variants} == _FMHA_V2_PAGED_VARIANTS
+    assert all("--paged_kv" in variant.script_args
+               for variant in paged_variants)
+    assert all("--fmha_v2_context" not in variant.script_args
+               for variant in paged_variants)
+    sliding_paged_variants = {
+        variant.name
+        for variant in paged_variants
+        if "--window_size_left" in variant.script_args
+    }
+    assert sliding_paged_variants == {
+        "fmha_v2_d64_sw_paged",
+        "fmha_v2_d128_sw_paged",
+        "fmha_v2_d256_sw_paged",
+        "fmha_v2_d512_sw_paged",
+    }
+
+    padding_variant = next(variant for variant in fmha_v2_variants
                            if variant.name == "fmha_v2_d256_padding")
     assert "--is_causal" not in padding_variant.script_args
     assert "--fmha_v2_context" not in padding_variant.script_args
 
+    assert not any("_fp8" in variant.name for variant in fmha_v2_variants)
+    assert not any("--kv_dtype" in variant.script_args
+                   for variant in fmha_v2_variants)
 
-# SM110 uses the FA4-based `fmha` kernels for normal attention, but retains
-# `fmha_v2` for the D256 vision-block mode.
-@pytest.mark.parametrize("sm", [90, 103])
-def test_fmha_v2_registry_rejects_unsupported_sms(sm):
+    optimized_variants = [
+        variant for variant in variants
+        if variant.script == "fmha_cutedsl_blackwell/fmha.py"
+    ]
+    assert bool(optimized_variants) == (sm in [100, 101, 110])
+
+
+@pytest.mark.parametrize("sm", [100, 101, 110])
+def test_fmha_registry_has_one_d512_bidirectional_variant(sm):
+    variants = build_cutedsl.select_variants(sm, "fmha")
+    bidirectional_variants = [
+        variant for variant in variants if variant.name.startswith("fmha_d512")
+        and "bidirectional" in variant.name
+    ]
+
+    assert [variant.name for variant in bidirectional_variants
+            ] == ["fmha_d512_paged_bidirectional"]
+    assert "--bidirectional" in bidirectional_variants[0].script_args
+    assert "--window_size" in bidirectional_variants[0].script_args
+    assert all("visionblock" not in variant.name for variant in variants
+               if variant.name.startswith("fmha_d512"))
+
+
+def test_fmha_v2_d512_registry_uses_32x32_tiles_and_two_warps():
+    d512_variants = [
+        variant for variant in build_cutedsl.KERNEL_VARIANTS if
+        variant.script == "fmha_v2_cutedsl/fmha.py" and "d512" in variant.name
+    ]
+
+    assert {variant.name
+            for variant in d512_variants} == {
+                "fmha_v2_d512",
+                "fmha_v2_d512_sw",
+                "fmha_v2_d512_bidirectional",
+                "fmha_v2_d512_paged",
+                "fmha_v2_d512_sw_paged",
+            }
+    assert all(variant.supported_sms == _FMHA_V2_SUPPORTED_SMS
+               for variant in d512_variants)
+    for variant in d512_variants:
+        assert variant.script_args[variant.script_args.index("--head_dim") +
+                                   1] == "512"
+        assert variant.script_args[variant.script_args.index("--m_block_size")
+                                   + 1] == "32"
+        assert variant.script_args[variant.script_args.index("--n_block_size")
+                                   + 1] == "32"
+        assert variant.script_args[variant.script_args.index("--num_threads") +
+                                   1] == "64"
+
+
+@pytest.mark.parametrize("sm", [103])
+def test_fmha_registry_rejects_unsupported_sms(sm):
     with pytest.raises(ValueError, match="No variants"):
-        build_cutedsl.select_variants(sm, "fmha_v2")
+        build_cutedsl.select_variants(sm, "fmha")
+
+
+def test_fmha_v2_per_variant_compile_definitions_are_absent():
+    pattern = re.compile(r"\bCUTE_DSL_FMHA_V2_[A-Z0-9_]+\b")
+    offenders = []
+    candidate_paths = [_REPO_ROOT / "CMakeLists.txt"]
+    for root in ("cmake", "cpp", "kernelSrcs"):
+        for path in (_REPO_ROOT / root).rglob("*"):
+            if path.suffix not in {
+                    ".cmake", ".txt", ".cpp", ".cu", ".cuh", ".h", ".hpp",
+                    ".py"
+            }:
+                continue
+            candidate_paths.append(path)
+
+    for path in candidate_paths:
+        if pattern.search(path.read_text(encoding="utf-8", errors="ignore")):
+            offenders.append(path.relative_to(_REPO_ROOT).as_posix())
+
+    assert offenders == []
 
 
 def test_build_allows_f16_moe_for_foreign_target_sm(tmp_path, monkeypatch):
@@ -307,7 +442,7 @@ _BASE_METADATA = {
     "compile_gpu_arch": "sm_100a",
     "host_target": "",
     "cuda_package_variant": "cu12",
-    "cutlass_dsl_version": "4.6.1",
+    "cutlass_dsl_version": "4.7.0",
     "groups": ["gdn"],
     "variants": ["gdn_decode", "gdn_prefill"],
 }

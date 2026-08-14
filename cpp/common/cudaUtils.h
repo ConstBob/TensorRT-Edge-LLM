@@ -18,6 +18,7 @@
 #pragma once
 
 #include "common/checkMacros.h"
+#include "common/logger.h"
 #include <cstdint>
 #include <cuda_runtime.h>
 
@@ -110,5 +111,87 @@ inline cudaError_t instantiateCudaGraph(cudaGraphExec_t* exec, cudaGraph_t graph
     return cudaGraphInstantiate(exec, graph, 0);
 #endif
 }
+
+/*!
+ * @brief Detect available CUDA devices without nvidia-smi.
+ *
+ * Uses the CUDA runtime API only, which keeps the helper usable on platforms
+ * where nvidia-smi is unavailable.
+ *
+ * @return Number of available CUDA devices, or 0 if CUDA runtime discovery fails.
+ */
+inline int32_t detectCudaDeviceCount() noexcept
+{
+    int deviceCount = 0;
+    cudaError_t const err = cudaGetDeviceCount(&deviceCount);
+    if (err != cudaSuccess)
+    {
+        LOG_WARNING("Failed to query CUDA device count: %s", cudaGetErrorString(err));
+        return 0;
+    }
+    return static_cast<int32_t>(deviceCount);
+}
+
+/*!
+ * @brief Return true when @p deviceId names an available CUDA runtime device.
+ */
+inline bool isValidCudaDeviceId(int32_t deviceId) noexcept
+{
+    if (deviceId < 0)
+    {
+        return false;
+    }
+
+    int32_t const deviceCount = detectCudaDeviceCount();
+    if (deviceId >= deviceCount)
+    {
+        LOG_WARNING("Invalid CUDA device id %d; detected %d CUDA devices.", deviceId, deviceCount);
+        return false;
+    }
+    return true;
+}
+
+/*!
+ * @brief Temporarily switch the active CUDA device for the current thread.
+ *
+ * Use this instead of a raw cudaSetDevice when scoped initialization must run on
+ * a target device without leaking that thread-local device change back to the
+ * caller. Construction throws through CUDA_CHECK when the current or requested
+ * device cannot be selected; destruction is noexcept and intentionally ignores
+ * restore failures.
+ */
+class CudaDeviceGuard
+{
+public:
+    explicit CudaDeviceGuard(int32_t device)
+        : mTargetDevice(static_cast<int>(device))
+    {
+        CUDA_CHECK(cudaGetDevice(&mPreviousDevice));
+        if (mPreviousDevice != mTargetDevice)
+        {
+            CUDA_CHECK(cudaSetDevice(mTargetDevice));
+        }
+    }
+
+    ~CudaDeviceGuard() noexcept
+    {
+        if (mPreviousDevice >= 0 && mPreviousDevice != mTargetDevice)
+        {
+            cudaError_t const error = cudaSetDevice(mPreviousDevice);
+            if (error != cudaSuccess)
+            {
+                LOG_ERROR("Failed to restore CUDA device %d after scoped switch to device %d: %s", mPreviousDevice,
+                    mTargetDevice, cudaGetErrorString(error));
+            }
+        }
+    }
+
+    CudaDeviceGuard(CudaDeviceGuard const&) = delete;
+    CudaDeviceGuard& operator=(CudaDeviceGuard const&) = delete;
+
+private:
+    int mPreviousDevice{-1};
+    int mTargetDevice{-1};
+};
 
 } // namespace trt_edgellm

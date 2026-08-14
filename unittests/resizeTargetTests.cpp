@@ -19,7 +19,7 @@
 //! Regenerate the tables with unittests/resources/gen_resize_target_golden.py (see its docstring for
 //! which values are HF-reference goldens and which are regression pins).
 
-#include "multimodal/imageUtils.h"
+#include "multimodal/common/imageUtils.h"
 
 #include <gtest/gtest.h>
 
@@ -71,7 +71,7 @@ std::tuple<int64_t, int64_t> smartResize2D(int64_t h, int64_t w)
 
 std::tuple<int64_t, int64_t> smartResize3D(int64_t t, int64_t h, int64_t w)
 {
-    return iu::qwenSmartResize3D(t, h, w, k3DPatch, k3DMerge, k3DMinTok, k3DMaxTok, k3DTemporal);
+    return iu::qwenSmartResize3D(t, /*isVideo=*/true, h, w, k3DPatch, k3DMerge, k3DMinTok, k3DMaxTok, k3DTemporal);
 }
 
 } // namespace
@@ -143,9 +143,12 @@ TEST(QwenSmartResizeTest, ThrowsOnExcessiveAspectRatio)
     EXPECT_THROW(smartResize2D(2810, 10), std::runtime_error);
 }
 
-//! Goldens from HF transformers qwen3_vl video_processing smart_resize (see generator script).
+//! Goldens from HF transformers qwen3_vl video_processing smart_resize with the video pixel bounds
+//! (HF's video defaults carry the temporalPatchSize factor: max_pixels = 16*16*2*2*2*6144, i.e.
+//! maxTokens * temporalPatchSize * factor^2 — tokens = budget / (temporalPatchSize * factor^2)).
 //! Covers: t exactly on/off temporalPatchSize multiples (tBar rounding), the beta-from-raw-frames
-//! asymmetry (beta uses numFrames*h*w, not tBar), up/down-scale regimes, and still images (t=1).
+//! asymmetry (beta uses numFrames*h*w, not tBar), up/down-scale regimes, and 1-frame videos
+//! (HF applies the temporal budget to any video: t=1 still gets tBar = temporalPatchSize).
 TEST(Qwen3VLSmartResize3DTest, MatchesHFReferenceGoldens)
 {
     Golden3D const goldens[] = {
@@ -154,15 +157,15 @@ TEST(Qwen3VLSmartResize3DTest, MatchesHFReferenceGoldens)
         {3, 224, 224, 224, 224},
         {4, 224, 224, 224, 224},
         {8, 512, 512, 512, 512},
-        {16, 720, 1280, 448, 832},
-        {3, 1080, 1920, 1056, 1920},
+        {16, 720, 1280, 640, 1152},
+        {3, 1080, 1920, 1088, 1920},
         {2, 480, 360, 480, 352},
         {5, 256, 256, 256, 256},
         {1, 1024, 1024, 1024, 1024},
         {32, 224, 224, 224, 224},
         {2, 800, 600, 800, 608},
         {7, 96, 96, 96, 96},
-        {2, 2048, 2048, 1760, 1760},
+        {2, 2048, 2048, 2048, 2048},
     };
     for (auto const& g : goldens)
     {
@@ -180,8 +183,8 @@ TEST(Qwen3VLSmartResize3DTest, DivergesFrom2DForVideo)
     auto const [h3d, w3d] = smartResize3D(16, 720, 1280);
     EXPECT_EQ(h2d, 704);
     EXPECT_EQ(w2d, 1280);
-    EXPECT_EQ(h3d, 448);
-    EXPECT_EQ(w3d, 832);
+    EXPECT_EQ(h3d, 640);
+    EXPECT_EQ(w3d, 1152);
 }
 
 //! Regression pins for the Gemma4 budget-fill formula (values pinned from the pre-extraction
@@ -257,4 +260,102 @@ TEST(Gemma4UnifiedResizeTargetTest, ThrowsOnNonPositiveDims)
 {
     EXPECT_THROW(iu::gemma4UnifiedResizeTarget(0, 100, 256, 48, 64), std::runtime_error);
     EXPECT_THROW(iu::gemma4UnifiedResizeTarget(100, 0, 256, 48, 64), std::runtime_error);
+}
+
+// --- Qwen3-VL profile-window regressions (narrow [min, max] engine windows the
+// wide-profile HF goldens above cannot exercise) ---
+
+namespace qwen_profile_window
+{
+
+// patchSize=16, mergeSize=2 -> factor=32; temporalPatchSize=2 (Qwen3-VL defaults).
+std::tuple<int64_t, int64_t> resize3d(
+    int64_t numFrames, bool isVideo, int64_t h, int64_t w, int64_t minTokens, int64_t maxTokens)
+{
+    return iu::qwenSmartResize3D(numFrames, isVideo, h, w, 16, 2, minTokens, maxTokens, 2);
+}
+
+// Visual tokens produced by a resized video: tBar * h * w / (temporalPatchSize * factor^2).
+int64_t videoTokens(int64_t numFrames, int64_t h, int64_t w)
+{
+    int64_t const tBar = (numFrames + 1) / 2 * 2;
+    return tBar * h * w / (2 * 32 * 32);
+}
+
+} // namespace qwen_profile_window
+
+TEST(QwenSmartResize, WindowStraddlingQuantizationStaysInsideProfile)
+{
+    // The HF shrink quantizes in whole factor steps; with 146 frames one step moves the budget by more than the
+    // whole [min, max] window, so a naive floor lands below the minimum and must fall back to a feasible shape.
+    auto const [h, w] = qwen_profile_window::resize3d(146, true, 360, 640, 256, 512);
+    int64_t const tokens = qwen_profile_window::videoTokens(146, h, w);
+    EXPECT_GE(tokens, 256);
+    EXPECT_LE(tokens, 512);
+}
+
+TEST(QwenSmartResize, OddFrameVideoStaysInsideProfile)
+{
+    // Odd frame counts pad tBar above numFrames, so the HF shrink (beta from raw frames) under-shrinks and the
+    // tBar re-shrink must bring the result back under the cap.
+    auto const [h, w] = qwen_profile_window::resize3d(145, true, 360, 640, 256, 512);
+    int64_t const tokens = qwen_profile_window::videoTokens(145, h, w);
+    EXPECT_GE(tokens, 256);
+    EXPECT_LE(tokens, 512);
+
+    auto const [h1, w1] = qwen_profile_window::resize3d(1, true, 1024, 1024, 4, 512);
+    EXPECT_LE(qwen_profile_window::videoTokens(1, h1, w1), 512);
+}
+
+TEST(QwenSmartResize, SingleFrameVideoUsesTemporalBudget)
+{
+    // HF's video path applies t_bar = ceil(1/2)*2 = 2 even for a single frame; the image path uses t_bar = 1.
+    // The two paths must diverge for the same pixel input.
+    auto const video = qwen_profile_window::resize3d(1, true, 32, 96, 256, 512);
+    auto const image = qwen_profile_window::resize3d(1, false, 32, 96, 256, 512);
+    EXPECT_NE(video, image);
+    int64_t const tokens = qwen_profile_window::videoTokens(1, std::get<0>(video), std::get<1>(video));
+    EXPECT_GE(tokens, 256);
+    EXPECT_LE(tokens, 512);
+}
+
+TEST(QwenSmartResize, ExtremeWideVideoStaysUnderMaxProfile)
+{
+    // The max(factor, ...) clamp on the short side pushes the budget back above the cap for extreme aspect
+    // ratios; the result must still respect the hard profile maximum.
+    auto const [h, w] = qwen_profile_window::resize3d(64, true, 100, 2000, 4, 512);
+    int64_t const tokens = qwen_profile_window::videoTokens(64, h, w);
+    EXPECT_GE(tokens, 4);
+    EXPECT_LE(tokens, 512);
+}
+
+TEST(QwenSmartResize, MinEqualsMaxFindsExactBudget)
+{
+    // A zero-width profile window is satisfiable only by an exact factor-grid product; the fallback must find it
+    // rather than reject the input.
+    auto const [h, w] = qwen_profile_window::resize3d(1, true, 1024, 1024, 512, 512);
+    EXPECT_EQ(qwen_profile_window::videoTokens(1, h, w), 512);
+}
+
+TEST(QwenSmartResize, FractionalAspectRatioRejected)
+{
+    // 2001:10 = 200.1 exceeds the 200 limit; integer division would truncate
+    // it to 200 and wrongly accept the input (HF uses float division).
+    EXPECT_THROW(qwen_profile_window::resize3d(2, true, 10, 2001, 4, 6144), std::runtime_error);
+    EXPECT_THROW(iu::qwenSmartResize(10, 2001, 14, 2, 4, 512), std::runtime_error);
+}
+
+TEST(QwenSmartResize, NoFeasibleShapeThrows)
+{
+    // 4096 frames need more tokens than the profile maximum even at the smallest spatial shape.
+    EXPECT_THROW(qwen_profile_window::resize3d(4096, true, 32, 32, 4, 512), std::runtime_error);
+}
+
+TEST(QwenSmartResize, CuSeqlenBoundCoversTemporalGroups)
+{
+    // 66 frames -> 33 temporal groups; the profile must accommodate one entry per group even when the per-image
+    // token budget alone would suggest far fewer entries.
+    int64_t const groups = (66 + 1) / 2;
+    EXPECT_LE(groups, iu::maxCuSeqlenGroups(512));
+    EXPECT_GE(iu::maxCuSeqlenGroups(1), 1);
 }

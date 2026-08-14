@@ -19,11 +19,13 @@
 
 #include "common/checkMacros.h"
 #include "common/pagedKvTypes.h"
+#include "kernels/speculative/ddtreeKernels.h"
 
 #include "common/logger.h"
 #include "common/trtUtils.h"
 
 #include <algorithm>
+#include <limits>
 #include <string>
 
 namespace trt_edgellm
@@ -84,6 +86,41 @@ void validateCachedDraftTargetLayerIds(LLMEngineConfig const& base, LLMEngineCon
     }
 }
 
+void requireMinimumActiveKVPool(LLMEngineConfig const& config, char const* engineLabel)
+{
+    int64_t const computedMinimumActivePages
+        = computeMinimumKvPoolPages(config.maxSupportedBatchSize, config.maxKVCacheCapacity);
+    ELLM_CHECK(computedMinimumActivePages <= kMAX_KV_POOL_PAGES,
+        std::string(engineLabel) + " minimum active pages exceed the largest int32-addressable paged-KV pool.");
+    int32_t const minimumActivePages = static_cast<int32_t>(computedMinimumActivePages);
+    ELLM_CHECK(config.kvPoolPages == minimumActivePages,
+        std::string(engineLabel)
+            + " does not support cross-request retention and requires max_kv_pool_pages to equal the "
+              "minimum active pages ("
+            + std::to_string(minimumActivePages) + "); got " + std::to_string(config.kvPoolPages) + ".");
+}
+
+void validateKVPoolMode(DeploymentConfig const& deployment)
+{
+    SpecDecodeMode const mode = deployment.base.specDecodeType;
+    bool const nonHybridEagle = mode == SpecDecodeMode::kEAGLE && deployment.base.numLinearAttnLayers == 0;
+    bool const baseSupportsCrossRequestRetention
+        = !deployment.base.kvLayerConfigs.empty() && (mode == SpecDecodeMode::kNONE || nonHybridEagle);
+    if (!baseSupportsCrossRequestRetention)
+    {
+        requireMinimumActiveKVPool(deployment.base, "base engine");
+    }
+
+    if (deployment.draft.has_value())
+    {
+        bool const draftSupportsCrossRequestRetention = !deployment.draft->kvLayerConfigs.empty() && nonHybridEagle;
+        if (!draftSupportsCrossRequestRetention)
+        {
+            requireMinimumActiveKVPool(*deployment.draft, "draft engine");
+        }
+    }
+}
+
 void validateGemma4MTPConfig(LLMEngineConfig const& base, LLMEngineConfig& draft)
 {
     ELLM_CHECK(
@@ -110,19 +147,17 @@ void validateGemma4MTPConfig(LLMEngineConfig const& base, LLMEngineConfig& draft
     // binds the TARGET's pool and page table to those bindings. Unequal build limits therefore
     // cannot be reconciled at runtime (there is no min() escape hatch as there is for batch size),
     // so reject them here with the numbers instead of failing deep inside TensorRT shape checks.
-    int32_t const basePoolPages = rt::computeKvPoolFloorPages(base.maxSupportedBatchSize, base.maxKVCacheCapacity);
-    int32_t const draftPoolPages = rt::computeKvPoolFloorPages(draft.maxSupportedBatchSize, draft.maxKVCacheCapacity);
     int32_t const basePagesPerSeq = rt::computeMaxPagesPerSeq(base.maxKVCacheCapacity);
     int32_t const draftPagesPerSeq = rt::computeMaxPagesPerSeq(draft.maxKVCacheCapacity);
-    ELLM_CHECK(basePoolPages == draftPoolPages && basePagesPerSeq == draftPagesPerSeq,
+    ELLM_CHECK(base.kvPoolPages == draft.kvPoolPages && basePagesPerSeq == draftPagesPerSeq,
         "Gemma4 MTP shared-KV pool geometry mismatch: base engine (maxBatchSize="
             + std::to_string(base.maxSupportedBatchSize) + ", maxKVCacheCapacity="
-            + std::to_string(base.maxKVCacheCapacity) + ") implies numPages=" + std::to_string(basePoolPages)
+            + std::to_string(base.maxKVCacheCapacity) + ") has numPages=" + std::to_string(base.kvPoolPages)
             + "/maxPagesPerSeq=" + std::to_string(basePagesPerSeq)
             + ", assistant engine (maxBatchSize=" + std::to_string(draft.maxSupportedBatchSize)
-            + ", maxKVCacheCapacity=" + std::to_string(draft.maxKVCacheCapacity) + ") implies numPages="
-            + std::to_string(draftPoolPages) + "/maxPagesPerSeq=" + std::to_string(draftPagesPerSeq)
-            + ". Rebuild the assistant engine with the target's --maxBatchSize/--maxKVCacheCapacity.");
+            + ", maxKVCacheCapacity=" + std::to_string(draft.maxKVCacheCapacity) + ") has numPages="
+            + std::to_string(draft.kvPoolPages) + "/maxPagesPerSeq=" + std::to_string(draftPagesPerSeq)
+            + ". Rebuild the assistant engine with matching pool pages and page-table width.");
     ELLM_CHECK(static_cast<int32_t>(draft.gemma4MTPKVSharingMap.size()) == draft.numAttentionLayers,
         "Gemma4 MTP kv_sharing_map size (" + std::to_string(draft.gemma4MTPKVSharingMap.size())
             + ") must equal draft attention layer count (" + std::to_string(draft.numAttentionLayers) + ").");
@@ -242,7 +277,8 @@ int32_t DeploymentConfig::maxAcceptedTokensPerRound() const
     case SpecDecodeMode::kEAGLE:
     case SpecDecodeMode::kMTP:
     case SpecDecodeMode::kGemma4MTP: return specConfig->draftingStep + 1;
-    case SpecDecodeMode::kDFlash: return std::min(specConfig->verifySize, specConfig->dflashBlockSize);
+    case SpecDecodeMode::kDFlash:
+    case SpecDecodeMode::kJetSpec: return std::min(specConfig->verifySize, specConfig->dflashBlockSize);
     case SpecDecodeMode::kDSpark: return specConfig->verifySize;
     }
     ELLM_CHECK(false, "maxAcceptedTokensPerRound: unhandled SpecDecodeMode");
@@ -272,9 +308,12 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
         cfg.draft = parseDraftEngineConfig(*draftConfigPath);
     }
 
-    if (cfg.base.specDecodeType == SpecDecodeMode::kDFlash && cfg.draft.has_value())
+    validateKVPoolMode(cfg);
+
+    if (isCachedBlockDraftMode(cfg.base.specDecodeType) && cfg.draft.has_value())
     {
-        validateCachedDraftTargetLayerIds(cfg.base, *cfg.draft, "DFlash");
+        validateCachedDraftTargetLayerIds(
+            cfg.base, *cfg.draft, cfg.base.specDecodeType == SpecDecodeMode::kJetSpec ? "JetSpec" : "DFlash");
     }
     if (cfg.base.specDecodeType == SpecDecodeMode::kGemma4MTP && cfg.draft.has_value())
     {
@@ -285,12 +324,9 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
         validateCachedDraftTargetLayerIds(cfg.base, *cfg.draft, "DSpark");
     }
 
-    // No cross-engine consistency check needed: each engine's builder_config
-    // carries only its own sequence budget. The base emits
+    // No cross-engine consistency check is needed for speculative tree budgets: the base emits
     // `max_verify_tree_size` (its verification budget); the draft emits
-    // `max_draft_tree_size` (its proposal budget). There are no capacity
-    // fields shared across the two configs, so there is nothing to
-    // cross-check. Consumers read each field from the owning side.
+    // `max_draft_tree_size` (its proposal budget). Consumers read each field from the owning side.
 
     // --- Build consolidated SpecDecodeConfig and validate drafting limits ---
     if (draftingConfig.has_value())
@@ -309,15 +345,17 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
         };
         requirePositiveField(draftingConfig->draftingTopK, "draftingTopK");
         requirePositiveField(draftingConfig->draftingStep, "draftingStep");
-        bool const isLinearDFlash
-            = cfg.base.specDecodeType == SpecDecodeMode::kDFlash && draftingConfig->draftingTopK == 1;
-        if (!isLinearDFlash || draftingConfig->verifySize < 0)
+        ELLM_CHECK(static_cast<int64_t>(draftingConfig->draftingStep) + 1 <= std::numeric_limits<int32_t>::max(),
+            "drafting.draftingStep is too large to represent the accepted-token depth draftingStep+1.");
+        bool const isCachedBlockDraft = isCachedBlockDraftMode(cfg.base.specDecodeType);
+        bool const isLinearCachedBlockDraft = isCachedBlockDraft && draftingConfig->draftingTopK == 1;
+        if (!isLinearCachedBlockDraft || draftingConfig->verifySize < 0)
         {
             requirePositiveField(draftingConfig->verifySize, "verifySize");
         }
         ELLM_CHECK(draftingConfig->dflashBlockSize >= 0,
             "drafting.dflashBlockSize=" + std::to_string(draftingConfig->dflashBlockSize)
-                + " must be non-negative; use 0 to infer from DFlash engine config.");
+                + " must be non-negative; use 0 to infer from DFlash/JetSpec engine config.");
 
         SpecDecodeConfig specConfig;
         // baseOutputHiddenDim comes from the draft config's `base_model_hidden_size`
@@ -336,100 +374,105 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
         specConfig.dsparkMinProposalLen = draftingConfig->dsparkMinProposalLen;
         specConfig.dsparkMaxProposalLen = draftingConfig->dsparkMaxProposalLen;
 
-        if (cfg.base.specDecodeType == SpecDecodeMode::kDFlash)
+        if (isCachedBlockDraft)
         {
-            static constexpr int32_t kDFlashDDTreeMaxVerifySize = 128;
-            static constexpr int32_t kDFlashDDTreeMaxCandidateTopK = 8;
-            static constexpr int32_t kDFlashDDTreeMaxAcceptedPathLength = 16;
-            static constexpr int32_t kDFlashHybridMaxBlockSize = 16;
+            static constexpr int32_t kDFlashJetSpecDDTreeMaxAcceptedPathLength = 32;
+            static constexpr int32_t kDFlashJetSpecHybridMaxBlockSize = 16;
+            char const* modeName = cfg.base.specDecodeType == SpecDecodeMode::kJetSpec ? "JetSpec" : "DFlash";
+            char const* configName
+                = cfg.base.specDecodeType == SpecDecodeMode::kJetSpec ? "jetspec_config" : "dflash_config";
 
             specConfig.dflashBlockSize = resolveDFlashBlockSize(cfg.base, *cfg.draft, *draftingConfig);
             ELLM_CHECK(specConfig.dflashBlockSize > 0,
-                "DFlash requires resolved dflashBlockSize > 0. Set dflashBlockSize or export a draft "
-                "dflash_config.block_size.");
+                std::string(modeName) + " requires resolved dflashBlockSize > 0. Set dflashBlockSize or export a draft "
+                    + configName + ".block_size.");
 
             ELLM_CHECK(specConfig.draftingStep == 1,
-                "DFlash supports draftingStep=1 only because one DFlash draft forward emits the full block. Use "
-                "dflashBlockSize to control the DFlash draft horizon.");
+                std::string(modeName)
+                    + " supports draftingStep=1 only because one draft forward emits the full block. Use "
+                      "dflashBlockSize to control the draft horizon.");
             ELLM_CHECK(specConfig.dflashBlockSize <= specConfig.maxDraftProposalSize,
-                "DFlash dflashBlockSize=" + std::to_string(specConfig.dflashBlockSize)
+                std::string(modeName) + " dflashBlockSize=" + std::to_string(specConfig.dflashBlockSize)
                     + " exceeds draft.maxDraftTreeSize=" + std::to_string(specConfig.maxDraftProposalSize)
-                    + ". DFlash drafts one full block per iteration.");
+                    + ". The draft emits one full block per iteration.");
 
             bool const useBranchingTree = specConfig.draftingTopK > 1;
             if (!useBranchingTree)
             {
                 ELLM_CHECK(specConfig.dflashBlockSize >= 2,
-                    "DFlash linear requires dflashBlockSize >= 2 because the base verify window is [anchor] + "
-                    "draft tokens.");
+                    std::string(modeName)
+                        + " linear requires dflashBlockSize >= 2 because the base verify window is [anchor] + "
+                          "draft tokens.");
                 if (specConfig.verifySize > 0 && specConfig.verifySize != specConfig.dflashBlockSize)
                 {
                     LOG_WARNING(
-                        "DFlash linear uses dflashBlockSize as the base verify window; overriding verifySize=%d to "
+                        "%s linear uses dflashBlockSize as the base verify window; overriding verifySize=%d to "
                         "dflashBlockSize=%d for compatibility.",
-                        specConfig.verifySize, specConfig.dflashBlockSize);
+                        modeName, specConfig.verifySize, specConfig.dflashBlockSize);
                 }
                 specConfig.verifySize = specConfig.dflashBlockSize;
             }
             else
             {
                 ELLM_CHECK(specConfig.dflashBlockSize >= 2,
-                    "DFlash branching DDTree requires dflashBlockSize >= 2 because node 0 is the root and the "
-                    "remaining draft positions provide child candidates.");
+                    std::string(modeName)
+                        + " branching DDTree requires dflashBlockSize >= 2 because node 0 is the root and the "
+                          "remaining draft positions provide child candidates.");
                 ELLM_CHECK(specConfig.draftingTopK < specConfig.verifySize,
-                    "DFlash DDTree candidateTopK=" + std::to_string(specConfig.draftingTopK)
+                    std::string(modeName) + " DDTree candidateTopK=" + std::to_string(specConfig.draftingTopK)
                         + " must be less than verifySize=" + std::to_string(specConfig.verifySize)
                         + " because the root consumes one verification node.");
-                ELLM_CHECK(specConfig.draftingTopK <= kDFlashDDTreeMaxCandidateTopK,
-                    "DFlash DDTree candidateTopK=" + std::to_string(specConfig.draftingTopK)
+                ELLM_CHECK(specConfig.draftingTopK <= kernel::kDDTreeMaxCandidateTopK,
+                    std::string(modeName) + " DDTree candidateTopK=" + std::to_string(specConfig.draftingTopK)
                         + " exceeds the current DDTree candidateTopK limit of "
-                        + std::to_string(kDFlashDDTreeMaxCandidateTopK) + ".");
+                        + std::to_string(kernel::kDDTreeMaxCandidateTopK) + ".");
                 ELLM_CHECK(specConfig.draftingTopK <= cfg.draft->outputVocabSize,
-                    "DFlash draftingTopK=" + std::to_string(specConfig.draftingTopK)
+                    std::string(modeName) + " draftingTopK=" + std::to_string(specConfig.draftingTopK)
                         + " exceeds draft output vocabulary size=" + std::to_string(cfg.draft->outputVocabSize) + ".");
-                ELLM_CHECK(specConfig.verifySize <= kDFlashDDTreeMaxVerifySize,
-                    "DFlash DDTree verifySize=" + std::to_string(specConfig.verifySize)
-                        + " exceeds node budget limit of " + std::to_string(kDFlashDDTreeMaxVerifySize) + ".");
+                ELLM_CHECK(specConfig.verifySize <= kernel::kDDTreeMaxVerifySize,
+                    std::string(modeName) + " DDTree verifySize=" + std::to_string(specConfig.verifySize)
+                        + " exceeds node budget limit of " + std::to_string(kernel::kDDTreeMaxVerifySize) + ".");
                 int32_t const maxAcceptedPathLength = std::min(specConfig.dflashBlockSize, specConfig.verifySize);
-                ELLM_CHECK(maxAcceptedPathLength <= kDFlashDDTreeMaxAcceptedPathLength,
-                    "DFlash DDTree max accepted path length=" + std::to_string(maxAcceptedPathLength)
-                        + " exceeds indexed commit path limit of " + std::to_string(kDFlashDDTreeMaxAcceptedPathLength)
-                        + ".");
+                ELLM_CHECK(maxAcceptedPathLength <= kDFlashJetSpecDDTreeMaxAcceptedPathLength,
+                    std::string(modeName) + " DDTree max accepted path length=" + std::to_string(maxAcceptedPathLength)
+                        + " exceeds indexed commit path limit of "
+                        + std::to_string(kDFlashJetSpecDDTreeMaxAcceptedPathLength) + ".");
             }
             bool const hasLinearAttnLayers = (cfg.base.numLinearAttnLayers > 0);
             if (hasLinearAttnLayers)
             {
-                ELLM_CHECK(specConfig.dflashBlockSize <= kDFlashHybridMaxBlockSize,
-                    "DFlash dflashBlockSize=" + std::to_string(specConfig.dflashBlockSize)
+                ELLM_CHECK(specConfig.dflashBlockSize <= kDFlashJetSpecHybridMaxBlockSize,
+                    std::string(modeName) + " dflashBlockSize=" + std::to_string(specConfig.dflashBlockSize)
                         + " exceeds Qwen3.5 GDN/causal-conv intermediate-state depth limit of "
-                        + std::to_string(kDFlashHybridMaxBlockSize) + ".");
+                        + std::to_string(kDFlashJetSpecHybridMaxBlockSize) + ".");
             }
         }
         else
         {
-            // In practice both `draftingStep` and `draftingTopK` are <= ~64 (bounded
-            // downstream by `maxDraftProposalSize`, which is tens, not millions), so
-            // int32 multiplication is overflow-safe; keeping it in int32 avoids
-            // widening noise.
-            bool const mtpTree = cfg.base.specDecodeType == SpecDecodeMode::kMTP && specConfig.draftingTopK > 1;
-            int32_t const requiredDraftInputSize
-                = mtpTree ? specConfig.draftingStep : specConfig.draftingStep * specConfig.draftingTopK;
+            // For MTP/DSpark tree drafting, draftingTopK is the DDTree candidate fanout
+            // applied after drafting, not a draft-input multiplier.
+            bool const fanoutTree = (cfg.base.specDecodeType == SpecDecodeMode::kMTP
+                                        || cfg.base.specDecodeType == SpecDecodeMode::kDSpark)
+                && specConfig.draftingTopK > 1;
+            int64_t const requiredDraftInputSize = fanoutTree
+                ? static_cast<int64_t>(specConfig.draftingStep)
+                : static_cast<int64_t>(specConfig.draftingStep) * static_cast<int64_t>(specConfig.draftingTopK);
 
             ELLM_CHECK(requiredDraftInputSize <= specConfig.maxDraftProposalSize,
                 "drafting.draftingStep=" + std::to_string(specConfig.draftingStep) + " * drafting.draftingTopK="
                     + std::to_string(specConfig.draftingTopK) + " = " + std::to_string(requiredDraftInputSize)
                     + " exceeds draft.maxDraftTreeSize=" + std::to_string(specConfig.maxDraftProposalSize)
                     + ". Drafting configuration exceeds engine proposal size capability.");
-            ELLM_CHECK(
-                specConfig.dflashBlockSize == 0, "dflashBlockSize can only be set when spec_decode_type=dflash.");
+            ELLM_CHECK(specConfig.dflashBlockSize == 0,
+                "dflashBlockSize can only be set when spec_decode_type=dflash or jetspec.");
 
             if (cfg.base.specDecodeType == SpecDecodeMode::kMTP)
             {
                 // MTP base verification currently reuses EAGLE utility kernels for accept, KV commit,
-                // and hidden-state compaction. Those kernels support maxDepth <= 9. Each round
+                // and hidden-state compaction. Those kernels support maxDepth <= 16. Each round
                 // accepts at most draftingStep matched proposals plus one bonus token, for both
                 // the linear chain and tree drafting, so the same depth bound applies to either mode.
-                static constexpr int32_t kMTPMaxAcceptDepthForCurrentEagleUtilityKernels = 9;
+                static constexpr int32_t kMTPMaxAcceptDepthForCurrentEagleUtilityKernels = 16;
                 int32_t const maxAcceptDepth = specConfig.draftingStep + 1;
                 ELLM_CHECK(maxAcceptDepth <= kMTPMaxAcceptDepthForCurrentEagleUtilityKernels,
                     "MTP max accept depth (draftingStep+1)=" + std::to_string(maxAcceptDepth)
@@ -511,22 +554,66 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
         if (cfg.base.specDecodeType == SpecDecodeMode::kDSpark)
         {
             static constexpr int32_t kDSparkMaxVerifySizeForCurrentUtilityKernels = 17;
-            int32_t const proposalLen = specConfig.verifySize - 1;
-            ELLM_CHECK(specConfig.draftingTopK == 1 && specConfig.draftingStep == 1,
-                "DSpark Phase 1 supports draftingTopK=1 and draftingStep=1 only.");
-            ELLM_CHECK(proposalLen > 0,
-                "DSpark verifySize must be at least 2 because base verification is [anchor] + draft tokens.");
+            // Tree-mode limits come from the shared DDTree build kernel (ddtreeKernels.h).
+            static constexpr int32_t kDSparkTreeMaxVerifySize = 128;
+            static constexpr int32_t kDSparkTreeMaxCandidateFanout = 8;
+            static constexpr int32_t kDSparkTreeMaxAcceptedPathLength = 16;
+
+            ELLM_CHECK(
+                specConfig.draftingStep == 1, "DSpark drafts one full block per iteration; draftingStep must be 1.");
+            ELLM_CHECK(cfg.draft.has_value(), "DSpark requires a draft engine.");
+
+            bool const useTree = specConfig.draftingTopK > 1;
+            // Tree decouples the proposal from the verify window: the draft always
+            // emits the full block and verifySize is the tree node budget.
+            int32_t const proposalLen = useTree ? cfg.draft->specDraftBlockSize : specConfig.verifySize - 1;
+
+            if (!useTree)
+            {
+                ELLM_CHECK(proposalLen > 0,
+                    "DSpark verifySize must be at least 2 because base verification is [anchor] + draft tokens.");
+                ELLM_CHECK(proposalLen <= cfg.draft->specDraftBlockSize,
+                    "DSpark proposalLen=" + std::to_string(proposalLen)
+                        + " exceeds dspark_config.block_size=" + std::to_string(cfg.draft->specDraftBlockSize) + ".");
+                ELLM_CHECK(specConfig.verifySize <= kDSparkMaxVerifySizeForCurrentUtilityKernels,
+                    "DSpark verifySize=" + std::to_string(specConfig.verifySize)
+                        + " exceeds current DSpark utility kernel max depth of "
+                        + std::to_string(kDSparkMaxVerifySizeForCurrentUtilityKernels) + ".");
+            }
+            else
+            {
+                ELLM_CHECK(specConfig.draftingTopK < specConfig.verifySize,
+                    "DSpark DDTree candidateTopK=" + std::to_string(specConfig.draftingTopK)
+                        + " must be less than verifySize=" + std::to_string(specConfig.verifySize)
+                        + " because the root consumes one verification node.");
+                ELLM_CHECK(specConfig.draftingTopK <= kDSparkTreeMaxCandidateFanout,
+                    "DSpark DDTree candidateTopK=" + std::to_string(specConfig.draftingTopK)
+                        + " exceeds the current DDTree candidateTopK limit of "
+                        + std::to_string(kDSparkTreeMaxCandidateFanout) + ".");
+                ELLM_CHECK(specConfig.draftingTopK <= cfg.draft->outputVocabSize,
+                    "DSpark DDTree candidateTopK=" + std::to_string(specConfig.draftingTopK)
+                        + " exceeds draft output vocabulary size=" + std::to_string(cfg.draft->outputVocabSize) + ".");
+                ELLM_CHECK(specConfig.verifySize <= kDSparkTreeMaxVerifySize,
+                    "DSpark DDTree verifySize=" + std::to_string(specConfig.verifySize)
+                        + " exceeds node budget limit of " + std::to_string(kDSparkTreeMaxVerifySize) + ".");
+                int32_t const maxAcceptedPathLength = std::min(proposalLen + 1, specConfig.verifySize);
+                ELLM_CHECK(maxAcceptedPathLength <= kDSparkTreeMaxAcceptedPathLength,
+                    "DSpark DDTree max accepted path length=" + std::to_string(maxAcceptedPathLength)
+                        + " exceeds indexed commit path limit of " + std::to_string(kDSparkTreeMaxAcceptedPathLength)
+                        + ".");
+                // threshold enables confidence-guided growth; SPS schedules verify
+                // cost, which a fixed node budget cannot trade.
+                ELLM_CHECK(specConfig.dsparkSchedulerMode != DSparkSchedulerMode::kSPS,
+                    "DSpark DDTree has a fixed verify budget; SPS does not apply. Use threshold to enable "
+                    "confidence-guided growth, or off.");
+                ELLM_CHECK(specConfig.dsparkConfidenceThreshold < 1.0F,
+                    "DSpark DDTree survival threshold must be in [0, 1): the root always survives, so a "
+                    "floor of 1 would forbid all growth.");
+            }
             ELLM_CHECK(proposalLen <= specConfig.maxDraftProposalSize,
                 "DSpark proposalLen=" + std::to_string(proposalLen)
                     + " exceeds draft.maxDraftTreeSize=" + std::to_string(specConfig.maxDraftProposalSize)
-                    + ". DSpark drafts verifySize-1 tokens per iteration.");
-            ELLM_CHECK(cfg.draft.has_value() && proposalLen <= cfg.draft->specDraftBlockSize,
-                "DSpark proposalLen=" + std::to_string(proposalLen)
-                    + " exceeds dspark_config.block_size=" + std::to_string(cfg.draft->specDraftBlockSize) + ".");
-            ELLM_CHECK(specConfig.verifySize <= kDSparkMaxVerifySizeForCurrentUtilityKernels,
-                "DSpark verifySize=" + std::to_string(specConfig.verifySize)
-                    + " exceeds current DSpark utility kernel max depth of "
-                    + std::to_string(kDSparkMaxVerifySizeForCurrentUtilityKernels) + ".");
+                    + ". The draft engine profile must cover the drafted block.");
 
             if (specConfig.dsparkSchedulerMode != DSparkSchedulerMode::kOff)
             {

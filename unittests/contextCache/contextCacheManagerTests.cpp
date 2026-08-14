@@ -41,9 +41,6 @@ namespace
 {
 
 constexpr int32_t kPAGE_SIZE = 4;
-constexpr CacheDomainId kDOMAIN{0x1010101010101010ULL, 0x2020202020202020ULL};
-constexpr DraftEngineSignature kDRAFT_SIGNATURE{0x3030303030303030ULL, 0x4040404040404040ULL};
-constexpr DraftEngineSignature kOTHER_DRAFT_SIGNATURE{0x5050505050505050ULL, 0x6060606060606060ULL};
 constexpr BlockHash kHASH_A{0x1111111111111111ULL, 0xAAAAAAAAAAAAAAAAULL};
 constexpr BlockHash kHASH_B{0x2222222222222222ULL, 0xBBBBBBBBBBBBBBBBULL};
 constexpr BlockHash kHASH_C{0x3333333333333333ULL, 0xCCCCCCCCCCCCCCCCULL};
@@ -76,8 +73,7 @@ CacheRequestLease takeLease(AcquireResult& result)
 
 CacheRequestLease acquirePrivatePages(ContextCacheManager& manager, int32_t count)
 {
-    ReusePlan const plan = manager.planVanilla(kDOMAIN, {}, count * kPAGE_SIZE);
-    AcquireResult result = manager.acquire(plan);
+    AcquireResult result = manager.acquireVanilla({}, count * kPAGE_SIZE);
     return takeLease(result);
 }
 
@@ -85,9 +81,8 @@ PublishedRecord publishPrivateRecord(ContextCacheManager& manager, std::vector<B
 {
     CacheRequestLease lease = acquirePrivatePages(manager, static_cast<int32_t>(hashes.size()));
     std::vector<PageId> const producerPages = lease.basePages();
-    PublishStatus const status = manager.publish(lease,
-        PublishRequest{hashes, static_cast<int32_t>(hashes.size()) * kPAGE_SIZE, PublicationPoint::kPrefillEnd,
-            CommitPolicy::kIncludingGeneratedTokens});
+    PublishStatus const status
+        = manager.publish(lease, PublishRequest{hashes, static_cast<int32_t>(hashes.size()) * kPAGE_SIZE}).status;
     std::vector<RecordId> const lru = manager.records().lruToMru();
     if (lru.empty())
     {
@@ -97,18 +92,14 @@ PublishedRecord publishPrivateRecord(ContextCacheManager& manager, std::vector<B
     return PublishedRecord{status, producerPages, lru.back()};
 }
 
-PublishedSpecRecord publishPrivateSpecRecord(
-    ContextCacheManager& manager, DraftEngineSignature signature, std::vector<BlockHash> hashes)
+PublishedSpecRecord publishPrivateSpecRecord(ContextCacheManager& manager, std::vector<BlockHash> hashes)
 {
-    ReusePlan const plan = manager.planSpec(
-        SpecDecodeMode::kEAGLE, kDOMAIN, signature, hashes, static_cast<int32_t>(hashes.size()) * kPAGE_SIZE, true);
-    AcquireResult result = manager.acquire(plan);
+    AcquireResult result = manager.acquireSpec(hashes, static_cast<int32_t>(hashes.size()) * kPAGE_SIZE);
     CacheRequestLease lease = takeLease(result);
     std::vector<PageId> const producerBasePages = lease.basePages();
     std::vector<PageId> const producerDraftPages = lease.draftPages();
-    PublishStatus const status = manager.publish(lease,
-        PublishRequest{hashes, static_cast<int32_t>(hashes.size()) * kPAGE_SIZE, PublicationPoint::kPrefillEnd,
-            CommitPolicy::kIncludingGeneratedTokens, static_cast<int32_t>(hashes.size()) * kPAGE_SIZE});
+    PublishStatus const status
+        = manager.publish(lease, PublishRequest{hashes, static_cast<int32_t>(hashes.size()) * kPAGE_SIZE}).status;
     std::vector<RecordId> const lru = manager.records().lruToMru();
     if (lru.empty())
     {
@@ -161,48 +152,44 @@ TEST(ContextCacheManagerTests, AcquirePinsHitsBeforeEvictionAndAllocatesPrivateP
     ASSERT_EQ(manager.records().lruToMru(), std::vector<RecordId>({first.id, second.id}));
     expectOnlyBaseState(manager, {0, 0}, {1, 1}, 0);
 
-    ReusePlan const plan = manager.planVanilla(kDOMAIN, {kHASH_A}, kPAGE_SIZE + 1);
+    AcquireResult result = manager.acquireVanilla({kHASH_A}, kPAGE_SIZE + 1);
+    ReusePlan const& plan = result.plan;
     ASSERT_EQ(plan.basePageBindings, std::vector<PageId>{0});
     ASSERT_EQ(plan.demand.baseKvPages, 1);
-    AcquireResult result = manager.acquire(plan);
 
     ASSERT_TRUE(result.lease.has_value());
     EXPECT_EQ(result.status, AcquireStatus::kAcquired);
     CacheRequestLease lease = takeLease(result);
     EXPECT_TRUE(lease.valid());
-    EXPECT_EQ(lease.reuseTokenLength(), kPAGE_SIZE);
+    EXPECT_EQ(plan.reuseTokenLength, kPAGE_SIZE);
     EXPECT_EQ(lease.basePages(), std::vector<PageId>({0, 1}));
     EXPECT_TRUE(manager.records().lruToMru().empty());
-    EXPECT_FALSE(manager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_A}).has_value());
-    EXPECT_FALSE(manager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_B}).has_value());
+    EXPECT_FALSE(manager.baseIndex().lookup(kHASH_A).has_value());
+    EXPECT_FALSE(manager.baseIndex().lookup(kHASH_B).has_value());
     expectOnlyBaseState(manager, {1, 1}, {0, 0}, 0);
 
     lease.release();
 
     EXPECT_FALSE(lease.valid());
     EXPECT_TRUE(lease.basePages().empty());
-    EXPECT_EQ(lease.reuseTokenLength(), 0);
     expectOnlyBaseState(manager, {0, 0}, {0, 0}, 2);
 }
 
-TEST(ContextCacheManagerTests, BypassPlanningBuildsAndAcquiresAForcedColdPlan)
+TEST(ContextCacheManagerTests, BypassAcquireBuildsAForcedColdPlan)
 {
     ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{1, 0, 0, 0}, 1);
     PublishedRecord const cached = publishPrivateRecord(manager, {kHASH_A});
     ASSERT_EQ(cached.status, PublishStatus::kPublished);
     ASSERT_EQ(manager.pools().freeCount(ResourceType::kBaseKvPage), 0);
 
-    ReusePlan const hit = manager.planVanilla(kDOMAIN, {kHASH_A}, kPAGE_SIZE, LookupPolicy::kUseCache);
-    EXPECT_EQ(hit.kind, ReusePlanKind::kFullInputRewind);
-
-    ReusePlan const cold = manager.planVanilla(kDOMAIN, {kHASH_A}, kPAGE_SIZE, LookupPolicy::kBypass);
+    AcquireResult result = manager.acquireVanilla({kHASH_A}, kPAGE_SIZE, ContextCacheLookupPolicy::kBypass);
+    ReusePlan const& cold = result.plan;
     EXPECT_EQ(cold.kind, ReusePlanKind::kNoReusablePrefix);
     EXPECT_EQ(cold.reuseTokenLength, 0);
     EXPECT_TRUE(cold.matchedBlockHashes.empty());
     EXPECT_TRUE(cold.basePageBindings.empty());
     EXPECT_EQ(cold.demand.baseKvPages, 1);
 
-    AcquireResult result = manager.acquire(cold);
     ASSERT_EQ(result.status, AcquireStatus::kAcquired);
     CacheRequestLease lease = takeLease(result);
     EXPECT_EQ(lease.basePages(), std::vector<PageId>{cached.producerPages.front()});
@@ -210,17 +197,26 @@ TEST(ContextCacheManagerTests, BypassPlanningBuildsAndAcquiresAForcedColdPlan)
     EXPECT_EQ(manager.baseIndex().size(), 0U);
 }
 
+TEST(ContextCacheManagerTests, StandardPublicationRejectsHybridLease)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{1, 0, 0, 0}, 1);
+    AcquireResult result = manager.acquireHybrid({}, {kHASH_A}, /*inputTokenCount=*/kPAGE_SIZE, /*hasAttention=*/true);
+    CacheRequestLease lease = takeLease(result);
+
+    EXPECT_THROW((void) manager.publish(lease, PublishRequest{{kHASH_A}, kPAGE_SIZE}), std::runtime_error);
+    EXPECT_TRUE(manager.records().lruToMru().empty());
+    lease.release();
+}
+
 TEST(ContextCacheManagerTests, HybridCheckpointPublishesAndAcquiresAllStateAtomically)
 {
-    constexpr RecurrentStateSchemaId kSCHEMA{0x7171717171717171ULL, 0x8181818181818181ULL};
     constexpr BlockHash kEXACT_DIGEST{0x9191919191919191ULL, 0xA1A1A1A1A1A1A1A1ULL};
     ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{4, 0, 2, 2}, 2);
 
-    ReusePlan const cold = manager.planHybrid(kDOMAIN, kSCHEMA, {}, {kHASH_A}, /*inputTokenCount=*/6,
-        /*hasAttention=*/true);
+    AcquireResult coldResult = manager.acquireHybrid({}, {kHASH_A}, /*inputTokenCount=*/6, /*hasAttention=*/true);
+    ReusePlan const& cold = coldResult.plan;
     EXPECT_EQ(cold.mode, ReusePlanMode::kHybrid);
     EXPECT_EQ(cold.demand.baseKvPages, 2);
-    AcquireResult coldResult = manager.acquire(cold);
     CacheRequestLease coldLease = takeLease(coldResult);
     ASSERT_EQ(coldLease.basePages(), std::vector<PageId>({0, 1}));
 
@@ -229,13 +225,11 @@ TEST(ContextCacheManagerTests, HybridCheckpointPublishesAndAcquiresAllStateAtomi
     EXPECT_EQ(snapshots->recurrentSnapshotSlot, 0);
     EXPECT_EQ(snapshots->partialKvSnapshotSlot, std::optional<int32_t>{0});
 
-    HybridCheckpointKey const checkpoint{kDOMAIN, kEXACT_DIGEST, 6, kSCHEMA};
-    PublishResult const published = manager.publishHybridDetailed(coldLease,
-        HybridPublishRequest{
-            {kHASH_A}, checkpoint, PublicationPoint::kPrefillEnd, CommitPolicy::kIncludingGeneratedTokens, *snapshots});
+    HybridCheckpointKey const checkpoint{kEXACT_DIGEST, 6};
+    PublishResult const published
+        = manager.publishHybrid(coldLease, HybridPublishRequest{{kHASH_A}, checkpoint, *snapshots});
     ASSERT_EQ(published.status, PublishStatus::kPublished);
     ASSERT_TRUE(published.record.has_value());
-    EXPECT_TRUE(published.lineageComplete);
     EXPECT_EQ(published.canonicalBasePages, std::vector<PageId>{0});
     manager.retireHybridSnapshotReservation(coldLease, *snapshots);
     coldLease.release();
@@ -246,10 +240,10 @@ TEST(ContextCacheManagerTests, HybridCheckpointPublishesAndAcquiresAllStateAtomi
     EXPECT_EQ(record.recurrentSnapshotSlot, std::optional<int32_t>{0});
     EXPECT_EQ(record.partialKvSnapshotSlot, std::optional<int32_t>{0});
 
-    ReusePlan const hit = manager.planHybrid(kDOMAIN, kSCHEMA, {{6, kEXACT_DIGEST}}, {kHASH_A, kHASH_B},
-        /*inputTokenCount=*/10, /*hasAttention=*/true);
+    AcquireResult hitResult = manager.acquireHybrid(
+        {{6, kEXACT_DIGEST}}, {kHASH_A, kHASH_B}, /*inputTokenCount=*/10, /*hasAttention=*/true);
+    ReusePlan const& hit = hitResult.plan;
     ASSERT_EQ(hit.reuseTokenLength, 6);
-    AcquireResult hitResult = manager.acquire(hit);
     ASSERT_EQ(hitResult.status, AcquireStatus::kAcquired);
     CacheRequestLease hitLease = takeLease(hitResult);
     EXPECT_EQ(hitLease.basePages(), std::vector<PageId>({0, 2, 3}));
@@ -261,89 +255,164 @@ TEST(ContextCacheManagerTests, HybridCheckpointPublishesAndAcquiresAllStateAtomi
     hitLease.release();
 }
 
+TEST(ContextCacheManagerTests, HybridMtpCheckpointPublishesAndAcquiresPairedBaseAndDraftState)
+{
+    constexpr BlockHash kEXACT_DIGEST{0x9494949494949494ULL, 0xA4A4A4A4A4A4A4A4ULL};
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{8, 8, 2, 2}, 2);
+
+    // Cold hybrid+MTP acquire: a speculative deployment reserves the full input in both the base and draft pools.
+    AcquireResult coldResult = manager.acquireHybridMtp({}, {kHASH_A}, /*inputTokenCount=*/6);
+    ReusePlan const& cold = coldResult.plan;
+    EXPECT_EQ(cold.mode, ReusePlanMode::kHybridMtp);
+    EXPECT_EQ(cold.demand.baseKvPages, 2);
+    EXPECT_EQ(cold.demand.draftKvPages, 2);
+    CacheRequestLease coldLease = takeLease(coldResult);
+    ASSERT_EQ(coldLease.basePages(), std::vector<PageId>({0, 1}));
+    ASSERT_EQ(coldLease.draftPages(), std::vector<PageId>({0, 1}));
+
+    // MTP always bundles a partial-KV snapshot alongside the recurrent snapshot.
+    std::optional<HybridSnapshotReservation> const snapshots = manager.reserveHybridSnapshots(coldLease, true);
+    ASSERT_TRUE(snapshots.has_value());
+    EXPECT_EQ(snapshots->recurrentSnapshotSlot, 0);
+    EXPECT_EQ(snapshots->partialKvSnapshotSlot, std::optional<int32_t>{0});
+
+    // exactLength 6 with pageSize 4 keeps the boundary token (index 5) private, so only (6 - 1) / 4 == 1 full block is
+    // published for both base and draft state.
+    HybridCheckpointKey const checkpoint{kEXACT_DIGEST, 6};
+    PublishResult const published
+        = manager.publishHybridMtp(coldLease, HybridPublishRequest{{kHASH_A}, checkpoint, *snapshots});
+    ASSERT_EQ(published.status, PublishStatus::kPublished);
+    ASSERT_TRUE(published.record.has_value());
+    EXPECT_EQ(published.publishedBaseFullBlockCount, 1);
+    EXPECT_EQ(published.canonicalBasePages, std::vector<PageId>{0});
+    manager.retireHybridSnapshotReservation(coldLease, *snapshots);
+    coldLease.release();
+
+    // The published record carries paired base/draft paths of size (exactLength - 1) / pageSize plus both snapshots.
+    CacheRecord const& record = manager.records().get(*published.record);
+    EXPECT_EQ(record.hybridKey(), std::optional<HybridCheckpointKey>{checkpoint});
+    ASSERT_EQ(record.draftPagePath.size(), static_cast<size_t>((6 - 1) / kPAGE_SIZE));
+    EXPECT_FALSE(record.draftPagePath.empty());
+    EXPECT_EQ(record.draftPagePath, std::vector<PageId>{0});
+    EXPECT_EQ(record.basePagePath, std::vector<PageId>{0});
+    EXPECT_EQ(record.recurrentSnapshotSlot, std::optional<int32_t>{0});
+    EXPECT_EQ(record.partialKvSnapshotSlot, std::optional<int32_t>{0});
+    EXPECT_EQ(record.exactCheckpointLength, std::optional<int32_t>{6});
+
+    // Hit: the exact checkpoint rebinds the cached base AND draft page paths plus both snapshot slots.
+    AcquireResult hitResult
+        = manager.acquireHybridMtp({{6, kEXACT_DIGEST}}, {kHASH_A, kHASH_B}, /*inputTokenCount=*/10);
+    ReusePlan const& hit = hitResult.plan;
+    EXPECT_EQ(hit.mode, ReusePlanMode::kHybridMtp);
+    ASSERT_EQ(hit.reuseTokenLength, 6);
+    ASSERT_EQ(hitResult.status, AcquireStatus::kAcquired);
+    EXPECT_EQ(hit.basePageBindings, std::vector<PageId>{0});
+    EXPECT_EQ(hit.draftPageBindings, std::vector<PageId>{0});
+    CacheRequestLease hitLease = takeLease(hitResult);
+    ASSERT_FALSE(hitLease.basePages().empty());
+    ASSERT_FALSE(hitLease.draftPages().empty());
+    EXPECT_EQ(hitLease.basePages().front(), 0);
+    EXPECT_EQ(hitLease.draftPages().front(), 0);
+    EXPECT_EQ(hitLease.basePages().size(), hitLease.draftPages().size());
+    EXPECT_EQ(hitLease.recurrentSnapshotSlot(), std::optional<int32_t>{0});
+    EXPECT_EQ(hitLease.partialKvSnapshotSlot(), std::optional<int32_t>{0});
+    manager.releaseRestoredHybridSnapshots(hitLease);
+    EXPECT_FALSE(hitLease.recurrentSnapshotSlot().has_value());
+    EXPECT_FALSE(hitLease.partialKvSnapshotSlot().has_value());
+    hitLease.release();
+}
+
 TEST(ContextCacheManagerTests, PureRecurrentCheckpointNeedsNoBaseOrPartialPage)
 {
-    constexpr RecurrentStateSchemaId kSCHEMA{0x7272727272727272ULL, 0x8282828282828282ULL};
     constexpr BlockHash kEXACT_DIGEST{0x9292929292929292ULL, 0xA2A2A2A2A2A2A2A2ULL};
     ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{0, 0, 2, 0}, 2);
 
-    ReusePlan const cold = manager.planHybrid(kDOMAIN, kSCHEMA, {}, {}, /*inputTokenCount=*/3, /*hasAttention=*/false);
-    AcquireResult coldResult = manager.acquire(cold);
+    AcquireResult coldResult = manager.acquireHybrid({}, {}, /*inputTokenCount=*/3, /*hasAttention=*/false);
     CacheRequestLease coldLease = takeLease(coldResult);
     EXPECT_TRUE(coldLease.basePages().empty());
     std::optional<HybridSnapshotReservation> const snapshots = manager.reserveHybridSnapshots(coldLease, false);
     ASSERT_TRUE(snapshots.has_value());
     ASSERT_FALSE(snapshots->partialKvSnapshotSlot.has_value());
 
-    HybridCheckpointKey const checkpoint{kDOMAIN, kEXACT_DIGEST, 3, kSCHEMA};
-    PublishResult const published = manager.publishHybridDetailed(coldLease,
-        HybridPublishRequest{
-            {}, checkpoint, PublicationPoint::kPrefillEnd, CommitPolicy::kIncludingGeneratedTokens, *snapshots});
+    HybridCheckpointKey const checkpoint{kEXACT_DIGEST, 3};
+    PublishResult const published = manager.publishHybrid(coldLease, HybridPublishRequest{{}, checkpoint, *snapshots});
     ASSERT_EQ(published.status, PublishStatus::kPublished);
     manager.retireHybridSnapshotReservation(coldLease, *snapshots);
     coldLease.release();
 
-    ReusePlan const hit = manager.planHybrid(kDOMAIN, kSCHEMA, {{3, kEXACT_DIGEST}}, {kHASH_A},
-        /*inputTokenCount=*/5, /*hasAttention=*/false);
+    AcquireResult hitResult
+        = manager.acquireHybrid({{3, kEXACT_DIGEST}}, {kHASH_A}, /*inputTokenCount=*/5, /*hasAttention=*/false);
+    ReusePlan const& hit = hitResult.plan;
     EXPECT_EQ(hit.reuseTokenLength, 3);
     EXPECT_TRUE(hit.basePageBindings.empty());
     EXPECT_EQ(hit.demand.baseKvPages, 0);
-    AcquireResult hitResult = manager.acquire(hit);
     CacheRequestLease hitLease = takeLease(hitResult);
     EXPECT_TRUE(hitLease.basePages().empty());
     EXPECT_TRUE(hitLease.recurrentSnapshotSlot().has_value());
     EXPECT_FALSE(hitLease.partialKvSnapshotSlot().has_value());
 }
 
-TEST(ContextCacheManagerTests, HybridPublicationStopsBeforeDescendantsOfAPrivateDuplicate)
+TEST(ContextCacheManagerTests, HybridPublicationProjectsCanonicalOverlapAndRetainsDescendant)
 {
-    constexpr RecurrentStateSchemaId kSCHEMA{0x7373737373737373ULL, 0x8383838383838383ULL};
     constexpr BlockHash kEXACT_DIGEST{0x9393939393939393ULL, 0xA3A3A3A3A3A3A3A3ULL};
     ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{5, 0, 2, 0}, 4);
     PublishedRecord const cached = publishPrivateRecord(manager, {kHASH_A});
     ASSERT_EQ(cached.producerPages, std::vector<PageId>{0});
 
-    ReusePlan const cold = manager.planHybrid(kDOMAIN, kSCHEMA, {}, {kHASH_A, kHASH_B}, 2 * kPAGE_SIZE,
-        /*hasAttention=*/true, LookupPolicy::kBypass);
-    AcquireResult coldResult = manager.acquire(cold);
+    AcquireResult coldResult = manager.acquireHybrid(
+        {}, {kHASH_A, kHASH_B}, 2 * kPAGE_SIZE, /*hasAttention=*/true, ContextCacheLookupPolicy::kBypass);
     CacheRequestLease coldLease = takeLease(coldResult);
     ASSERT_EQ(coldLease.basePages(), std::vector<PageId>({1, 2}));
     std::optional<HybridSnapshotReservation> const snapshots = manager.reserveHybridSnapshots(coldLease, false);
     ASSERT_TRUE(snapshots.has_value());
 
-    HybridCheckpointKey const checkpoint{kDOMAIN, kEXACT_DIGEST, 2 * kPAGE_SIZE, kSCHEMA};
-    PublishResult const published = manager.publishHybridDetailed(coldLease,
-        HybridPublishRequest{{kHASH_A, kHASH_B}, checkpoint, PublicationPoint::kPrefillEnd,
-            CommitPolicy::kIncludingGeneratedTokens, *snapshots});
+    HybridCheckpointKey const checkpoint{kEXACT_DIGEST, 2 * kPAGE_SIZE};
+    PublishResult const published
+        = manager.publishHybrid(coldLease, HybridPublishRequest{{kHASH_A, kHASH_B}, checkpoint, *snapshots});
 
-    EXPECT_EQ(published.status, PublishStatus::kExistingRecord);
-    EXPECT_FALSE(published.lineageComplete);
-    EXPECT_EQ(published.publishedBaseFullBlockCount, 1);
-    EXPECT_EQ(published.canonicalBasePages, std::vector<PageId>{0});
-    EXPECT_FALSE(manager.records().findHybrid(checkpoint).has_value());
+    ASSERT_EQ(published.status, PublishStatus::kPublished);
+    ASSERT_TRUE(published.record.has_value());
+    EXPECT_EQ(published.publishedBaseFullBlockCount, 2);
+    EXPECT_EQ(published.canonicalBasePages, std::vector<PageId>({0, 2}));
+    EXPECT_EQ(coldLease.basePages(), std::vector<PageId>({1, 2}));
+    EXPECT_EQ(manager.records().findHybrid(checkpoint), published.record);
+    EXPECT_EQ(manager.records().get(*published.record).basePagePath, std::vector<PageId>({0, 2}));
+    EXPECT_EQ(manager.baseIndex().lookup(kHASH_B), std::optional<PageId>{2});
+    expectPoolState(manager, ResourceType::kBaseKvPage, {0, 1, 1, 0, 0}, {2, 0, 1, 0, 0}, 2);
+    expectPoolState(manager, ResourceType::kRecurrentSnapshot, {1, 0}, {1, 0}, 1);
+
+    manager.retireHybridSnapshotReservation(coldLease, *snapshots);
+    coldLease.release();
+
+    expectPoolState(manager, ResourceType::kBaseKvPage, {0, 0, 0, 0, 0}, {2, 0, 1, 0, 0}, 3);
+    expectPoolState(manager, ResourceType::kRecurrentSnapshot, {0, 0}, {1, 0}, 1);
 }
 
-TEST(ContextCacheManagerTests, PublicationStopsBeforeDescendantsOfAPrivateDuplicate)
+TEST(ContextCacheManagerTests, PublicationProjectsCanonicalOverlapWithoutRebindingLease)
 {
     ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{4, 0, 0, 0}, 4);
     PublishedRecord const cached = publishPrivateRecord(manager, {kHASH_A});
     ASSERT_EQ(cached.producerPages, std::vector<PageId>{0});
 
-    ReusePlan const cold = manager.planVanilla(kDOMAIN, {kHASH_A, kHASH_B}, 2 * kPAGE_SIZE, LookupPolicy::kBypass);
-    AcquireResult result = manager.acquire(cold);
+    AcquireResult result
+        = manager.acquireVanilla({kHASH_A, kHASH_B}, 2 * kPAGE_SIZE, ContextCacheLookupPolicy::kBypass);
     CacheRequestLease lease = takeLease(result);
     ASSERT_EQ(lease.basePages(), std::vector<PageId>({1, 2}));
 
-    PublishResult const published = manager.publishDetailed(lease,
-        PublishRequest{{kHASH_A, kHASH_B}, 2 * kPAGE_SIZE, PublicationPoint::kPrefillEnd,
-            CommitPolicy::kIncludingGeneratedTokens});
+    PublishResult const published = manager.publish(lease, PublishRequest{{kHASH_A, kHASH_B}, 2 * kPAGE_SIZE});
 
-    EXPECT_EQ(published.status, PublishStatus::kExistingRecord);
-    EXPECT_FALSE(published.lineageComplete);
-    EXPECT_EQ(published.publishedBaseFullBlockCount, 1);
-    EXPECT_EQ(published.canonicalBasePages, std::vector<PageId>{0});
-    EXPECT_FALSE(manager.records().find(CacheRecordKey{kDOMAIN, kHASH_B, 2}).has_value());
-    EXPECT_FALSE(manager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_B}).has_value());
+    ASSERT_EQ(published.status, PublishStatus::kPublished);
+    ASSERT_TRUE(published.record.has_value());
+    EXPECT_EQ(published.publishedBaseFullBlockCount, 2);
+    EXPECT_EQ(published.canonicalBasePages, std::vector<PageId>({0, 2}));
+    EXPECT_EQ(lease.basePages(), std::vector<PageId>({1, 2}));
+    EXPECT_EQ(manager.records().get(*published.record).basePagePath, std::vector<PageId>({0, 2}));
+    EXPECT_EQ(manager.baseIndex().lookup(kHASH_B), std::optional<PageId>{2});
+    expectOnlyBaseState(manager, {0, 1, 1, 0}, {2, 0, 1, 0}, 1);
+
+    lease.release();
+
+    expectOnlyBaseState(manager, {0, 0, 0, 0}, {2, 0, 1, 0}, 2);
 }
 
 TEST(ContextCacheManagerTests, LeaseDestructorReleasesEveryUnpublishedResource)
@@ -351,11 +420,7 @@ TEST(ContextCacheManagerTests, LeaseDestructorReleasesEveryUnpublishedResource)
     ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{2, 1, 1, 1}, 1);
 
     {
-        ReusePlan plan = manager.planVanilla(kDOMAIN, {}, kPAGE_SIZE);
-        plan.demand.draftKvPages = 1;
-        plan.demand.recurrentSnapshotSlots = 1;
-        plan.demand.partialKvSnapshotSlots = 1;
-        AcquireResult result = manager.acquire(plan);
+        AcquireResult result = manager.acquireSpec({}, kPAGE_SIZE);
         ASSERT_TRUE(result.lease.has_value());
         CacheRequestLease source = takeLease(result);
         ASSERT_FALSE(result.lease->valid());
@@ -374,12 +439,22 @@ TEST(ContextCacheManagerTests, LeaseDestructorReleasesEveryUnpublishedResource)
         EXPECT_EQ(destination.basePages(), std::vector<PageId>{0});
         expectPoolState(manager, ResourceType::kBaseKvPage, {1, 0}, {0, 0}, 1);
         expectPoolState(manager, ResourceType::kDraftKvPage, {1}, {0}, 0);
-        expectPoolState(manager, ResourceType::kRecurrentSnapshot, {1}, {0}, 0);
-        expectPoolState(manager, ResourceType::kPartialKvSnapshot, {1}, {0}, 0);
+        expectPoolState(manager, ResourceType::kRecurrentSnapshot, {0}, {0}, 1);
+        expectPoolState(manager, ResourceType::kPartialKvSnapshot, {0}, {0}, 1);
     }
 
     expectPoolState(manager, ResourceType::kBaseKvPage, {0, 0}, {0, 0}, 2);
     expectPoolState(manager, ResourceType::kDraftKvPage, {0}, {0}, 1);
+
+    {
+        AcquireResult result = manager.acquireHybrid({}, {}, kPAGE_SIZE, /*hasAttention=*/true);
+        CacheRequestLease lease = takeLease(result);
+        std::optional<HybridSnapshotReservation> const snapshots = manager.reserveHybridSnapshots(lease, true);
+        ASSERT_TRUE(snapshots.has_value());
+        expectPoolState(manager, ResourceType::kRecurrentSnapshot, {1}, {0}, 0);
+        expectPoolState(manager, ResourceType::kPartialKvSnapshot, {1}, {0}, 0);
+    }
+
     expectPoolState(manager, ResourceType::kRecurrentSnapshot, {0}, {0}, 1);
     expectPoolState(manager, ResourceType::kPartialKvSnapshot, {0}, {0}, 1);
 
@@ -401,59 +476,36 @@ TEST(ContextCacheManagerTests, InfeasibleAcquireRollsBackPinsWithoutEviction)
     PublishedRecord const cached = publishPrivateRecord(manager, {kHASH_A});
     ASSERT_EQ(cached.status, PublishStatus::kPublished);
     ASSERT_EQ(cached.producerPages, std::vector<PageId>{0});
-    ReusePlan const plan = manager.planVanilla(kDOMAIN, {kHASH_A}, kPAGE_SIZE + 1);
-
-    AcquireResult const infeasible = manager.acquire(plan);
+    AcquireResult const infeasible = manager.acquireVanilla({kHASH_A}, kPAGE_SIZE + 1);
 
     EXPECT_FALSE(infeasible.lease.has_value());
     EXPECT_EQ(infeasible.status, AcquireStatus::kInsufficientCapacity);
     EXPECT_EQ(manager.records().lruToMru(), std::vector<RecordId>{cached.id});
-    EXPECT_EQ(manager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_A}), std::optional<PageId>{0});
+    EXPECT_EQ(manager.baseIndex().lookup(kHASH_A), std::optional<PageId>{0});
     expectOnlyBaseState(manager, {0}, {1}, 0);
+}
 
-    ReusePlan malformed = plan;
-    malformed.matchedBlockHashes.push_back(kHASH_B);
-    EXPECT_THROW((void) manager.acquire(malformed), std::runtime_error);
+TEST(ContextCacheManagerTests, EvictionMetricsCountOnlyResourcesReturnedToFreeLists)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{2, 0, 0, 0}, 1);
+    publishPrivateRecord(manager, {kHASH_A});
+    publishPrivateRecord(manager, {kHASH_B});
 
-    malformed = plan;
-    malformed.baseCowSources.push_back(0);
-    EXPECT_THROW((void) manager.acquire(malformed), std::runtime_error);
+    ContextCacheManagerMetrics const& retainedMetrics = manager.metrics();
+    EXPECT_EQ(retainedMetrics.evictedRecords, 1U);
+    EXPECT_EQ(retainedMetrics.reclaimedBaseKvPages, 1U);
+    EXPECT_EQ(retainedMetrics.reclaimedDraftKvPages, 0U);
+    EXPECT_EQ(retainedMetrics.reclaimedRecurrentSnapshots, 0U);
+    EXPECT_EQ(retainedMetrics.reclaimedPartialKvSnapshots, 0U);
 
-    malformed = plan;
-    malformed.demand.draftKvPages = -1;
-    EXPECT_THROW((void) manager.acquire(malformed), std::runtime_error);
-
-    malformed = plan;
-    malformed.demand.baseKvPages = 0;
-    EXPECT_THROW((void) manager.acquire(malformed), std::runtime_error);
-
-    malformed = plan;
-    malformed.inputTokenCount = kPAGE_SIZE;
-    malformed.demand.baseKvPages = 0;
-    malformed.kind = ReusePlanKind::kStandard;
-    EXPECT_THROW((void) manager.acquire(malformed), std::runtime_error);
-
-    EXPECT_EQ(manager.records().lruToMru(), std::vector<RecordId>{cached.id});
-    EXPECT_EQ(manager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_A}), std::optional<PageId>{0});
-    expectOnlyBaseState(manager, {0}, {1}, 0);
-
-    ContextCacheManager staleManager(kPAGE_SIZE, ResourceDemand{2, 0, 0, 0}, 1);
-    PublishedRecord const staleRecord = publishPrivateRecord(staleManager, {kHASH_A});
-    ASSERT_EQ(staleRecord.status, PublishStatus::kPublished);
-    ReusePlan const stalePlan = staleManager.planVanilla(kDOMAIN, {kHASH_A}, kPAGE_SIZE + 1);
-    ASSERT_EQ(stalePlan.basePageBindings, std::vector<PageId>{0});
-    PublishedRecord const replacement = publishPrivateRecord(staleManager, {kHASH_B});
-    ASSERT_EQ(replacement.status, PublishStatus::kPublished);
-    ASSERT_EQ(replacement.producerPages, std::vector<PageId>{1});
-    ASSERT_FALSE(staleManager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_A}).has_value());
-
-    AcquireResult const stale = staleManager.acquire(stalePlan);
-
-    EXPECT_FALSE(stale.lease.has_value());
-    EXPECT_EQ(stale.status, AcquireStatus::kStalePlan);
-    EXPECT_EQ(staleManager.records().lruToMru(), std::vector<RecordId>{replacement.id});
-    EXPECT_EQ(staleManager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_B}), std::optional<PageId>{1});
-    expectOnlyBaseState(staleManager, {0, 0}, {0, 1}, 1);
+    ContextCacheManager transientManager(kPAGE_SIZE, ResourceDemand{1, 0, 0, 0}, 0);
+    CacheRequestLease transient = acquirePrivatePages(transientManager, 1);
+    EXPECT_EQ(
+        transientManager.publish(transient, PublishRequest{{kHASH_A}, kPAGE_SIZE}).status, PublishStatus::kPublished);
+    EXPECT_EQ(transientManager.metrics().evictedRecords, 1U);
+    EXPECT_EQ(transientManager.metrics().reclaimedBaseKvPages, 0U);
+    transient.release();
+    EXPECT_EQ(transientManager.metrics().reclaimedBaseKvPages, 0U);
 }
 
 TEST(ContextCacheManagerTests, PublishAddsCacheRefsBeforeDroppingActivity)
@@ -463,26 +515,23 @@ TEST(ContextCacheManagerTests, PublishAddsCacheRefsBeforeDroppingActivity)
     ASSERT_EQ(lease.basePages(), std::vector<PageId>{0});
     expectOnlyBaseState(manager, {1}, {0}, 0);
 
-    PublishRequest const negativeLength{
-        {kHASH_A}, -1, PublicationPoint::kPrefillEnd, CommitPolicy::kIncludingGeneratedTokens};
+    PublishRequest const negativeLength{{kHASH_A}, -1};
     EXPECT_THROW((void) manager.publish(lease, negativeLength), std::runtime_error);
-    PublishRequest const noFullBlock{
-        {kHASH_A}, kPAGE_SIZE - 1, PublicationPoint::kPrefillEnd, CommitPolicy::kIncludingGeneratedTokens};
+    PublishRequest const noFullBlock{{kHASH_A}, kPAGE_SIZE - 1};
     EXPECT_THROW((void) manager.publish(lease, noFullBlock), std::runtime_error);
     EXPECT_TRUE(manager.records().lruToMru().empty());
     expectOnlyBaseState(manager, {1}, {0}, 0);
 
-    PublishStatus const status = manager.publish(lease,
-        PublishRequest{{kHASH_A}, kPAGE_SIZE, PublicationPoint::kPrefillEnd, CommitPolicy::kIncludingGeneratedTokens});
+    PublishStatus const status = manager.publish(lease, PublishRequest{{kHASH_A}, kPAGE_SIZE}).status;
 
     EXPECT_EQ(status, PublishStatus::kPublished);
     ASSERT_EQ(manager.records().size(), 1U);
     RecordId const id = manager.records().lruToMru().front();
-    CacheRecordKey const key{kDOMAIN, kHASH_A, 1};
+    CacheRecordKey const key{kHASH_A, 1};
     EXPECT_EQ(manager.records().find(key), std::optional<RecordId>{id});
     EXPECT_EQ(manager.records().get(id).logicalBlockHashes, std::vector<BlockHash>{kHASH_A});
     EXPECT_EQ(manager.records().get(id).basePagePath, std::vector<PageId>{0});
-    EXPECT_EQ(manager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_A}), std::optional<PageId>{0});
+    EXPECT_EQ(manager.baseIndex().lookup(kHASH_A), std::optional<PageId>{0});
     EXPECT_TRUE(lease.valid());
     expectOnlyBaseState(manager, {1}, {1}, 0);
 
@@ -492,49 +541,49 @@ TEST(ContextCacheManagerTests, PublishAddsCacheRefsBeforeDroppingActivity)
     expectOnlyBaseState(manager, {0}, {1}, 0);
 }
 
-TEST(ContextCacheManagerTests, DuplicatePublicationDoesNotAttachPrivateDescendants)
+TEST(ContextCacheManagerTests, LaterPublicationUsesCanonicalPageChosenByEarlierProducer)
 {
     ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{3, 0, 0, 0}, 3);
-    PublishedRecord const first = publishPrivateRecord(manager, {kHASH_A});
-    ASSERT_EQ(first.status, PublishStatus::kPublished);
-    ASSERT_EQ(first.producerPages, std::vector<PageId>{0});
+    CacheRequestLease firstProducer = acquirePrivatePages(manager, 1);
+    CacheRequestLease secondProducer = acquirePrivatePages(manager, 2);
+    ASSERT_EQ(firstProducer.basePages(), std::vector<PageId>{0});
+    ASSERT_EQ(secondProducer.basePages(), std::vector<PageId>({1, 2}));
 
-    CacheRequestLease duplicateProducer = acquirePrivatePages(manager, 2);
-    ASSERT_EQ(duplicateProducer.basePages(), std::vector<PageId>({1, 2}));
-    PublishStatus const status = manager.publish(duplicateProducer,
-        PublishRequest{{kHASH_A, kHASH_B}, 2 * kPAGE_SIZE, PublicationPoint::kPrefillEnd,
-            CommitPolicy::kIncludingGeneratedTokens});
+    PublishStatus const firstStatus = manager.publish(firstProducer, PublishRequest{{kHASH_A}, kPAGE_SIZE}).status;
+    PublishResult const second = manager.publish(secondProducer, PublishRequest{{kHASH_A, kHASH_B}, 2 * kPAGE_SIZE});
 
-    EXPECT_EQ(status, PublishStatus::kExistingRecord);
-    ASSERT_EQ(manager.records().size(), 1U);
-    EXPECT_FALSE(manager.records().find(CacheRecordKey{kDOMAIN, kHASH_B, 2}).has_value());
-    EXPECT_EQ(manager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_A}), std::optional<PageId>{0});
-    EXPECT_FALSE(manager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_B}).has_value());
-    EXPECT_EQ(manager.baseIndex().size(), 1U);
-    expectOnlyBaseState(manager, {0, 1, 1}, {1, 0, 0}, 0);
+    EXPECT_EQ(firstStatus, PublishStatus::kPublished);
+    ASSERT_EQ(second.status, PublishStatus::kPublished);
+    ASSERT_TRUE(second.record.has_value());
+    EXPECT_EQ(second.canonicalBasePages, std::vector<PageId>({0, 2}));
+    EXPECT_EQ(secondProducer.basePages(), std::vector<PageId>({1, 2}));
+    EXPECT_EQ(manager.records().get(*second.record).basePagePath, std::vector<PageId>({0, 2}));
+    EXPECT_EQ(manager.baseIndex().lookup(kHASH_A), std::optional<PageId>{0});
+    EXPECT_EQ(manager.baseIndex().lookup(kHASH_B), std::optional<PageId>{2});
+    EXPECT_EQ(manager.baseIndex().size(), 2U);
+    expectOnlyBaseState(manager, {1, 1, 1}, {2, 0, 1}, 0);
 
-    duplicateProducer.release();
+    firstProducer.release();
+    secondProducer.release();
 
-    EXPECT_FALSE(duplicateProducer.valid());
-    EXPECT_EQ(manager.records().lruToMru(), std::vector<RecordId>{first.id});
-    expectOnlyBaseState(manager, {0, 0, 0}, {1, 0, 0}, 2);
+    expectOnlyBaseState(manager, {0, 0, 0}, {2, 0, 1}, 1);
+}
 
+TEST(ContextCacheManagerTests, PublicationRollbackRestoresRefsAfterBaseMappingConflict)
+{
     ContextCacheManager rollbackManager(kPAGE_SIZE, ResourceDemand{1, 0, 0, 0}, 2);
     CacheRequestLease conflictingLease = acquirePrivatePages(rollbackManager, 1);
     ASSERT_EQ(conflictingLease.basePages(), std::vector<PageId>{0});
-    ASSERT_EQ(rollbackManager.publish(conflictingLease,
-                  PublishRequest{
-                      {kHASH_C}, kPAGE_SIZE, PublicationPoint::kPrefillEnd, CommitPolicy::kIncludingGeneratedTokens}),
+    ASSERT_EQ(rollbackManager.publish(conflictingLease, PublishRequest{{kHASH_C}, kPAGE_SIZE}).status,
         PublishStatus::kPublished);
     RecordId const canonicalRecord = rollbackManager.records().lruToMru().front();
-    PublishRequest const conflictingPublication{
-        {kHASH_D}, kPAGE_SIZE, PublicationPoint::kPrefillEnd, CommitPolicy::kIncludingGeneratedTokens};
+    PublishRequest const conflictingPublication{{kHASH_D}, kPAGE_SIZE};
 
     EXPECT_THROW((void) rollbackManager.publish(conflictingLease, conflictingPublication), std::runtime_error);
 
     EXPECT_EQ(rollbackManager.records().lruToMru(), std::vector<RecordId>{canonicalRecord});
-    EXPECT_EQ(rollbackManager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_C}), std::optional<PageId>{0});
-    EXPECT_FALSE(rollbackManager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_D}).has_value());
+    EXPECT_EQ(rollbackManager.baseIndex().lookup(kHASH_C), std::optional<PageId>{0});
+    EXPECT_FALSE(rollbackManager.baseIndex().lookup(kHASH_D).has_value());
     expectOnlyBaseState(rollbackManager, {1}, {1}, 0);
 
     conflictingLease.release();
@@ -549,15 +598,14 @@ TEST(ContextCacheManagerTests, EvictingOneBranchPreservesSharedAncestorPages)
     ASSERT_EQ(firstBranch.status, PublishStatus::kPublished);
     ASSERT_EQ(firstBranch.producerPages, std::vector<PageId>({0, 1, 2}));
 
-    ReusePlan const secondPlan = manager.planVanilla(kDOMAIN, {kHASH_A, kHASH_B, kHASH_D}, 3 * kPAGE_SIZE);
+    AcquireResult secondResult = manager.acquireVanilla({kHASH_A, kHASH_B, kHASH_D}, 3 * kPAGE_SIZE);
+    ReusePlan const& secondPlan = secondResult.plan;
     ASSERT_EQ(secondPlan.basePageBindings, std::vector<PageId>({0, 1}));
-    AcquireResult secondResult = manager.acquire(secondPlan);
     ASSERT_TRUE(secondResult.lease.has_value());
     CacheRequestLease secondLease = takeLease(secondResult);
     ASSERT_EQ(secondLease.basePages(), std::vector<PageId>({0, 1, 3}));
-    PublishStatus const secondStatus = manager.publish(secondLease,
-        PublishRequest{{kHASH_A, kHASH_B, kHASH_D}, 3 * kPAGE_SIZE, PublicationPoint::kPrefillEnd,
-            CommitPolicy::kIncludingGeneratedTokens});
+    PublishStatus const secondStatus
+        = manager.publish(secondLease, PublishRequest{{kHASH_A, kHASH_B, kHASH_D}, 3 * kPAGE_SIZE}).status;
     ASSERT_EQ(secondStatus, PublishStatus::kPublished);
     RecordId const secondBranch = manager.records().lruToMru().back();
     secondLease.release();
@@ -568,21 +616,21 @@ TEST(ContextCacheManagerTests, EvictingOneBranchPreservesSharedAncestorPages)
     CacheRequestLease replacementLease = acquirePrivatePages(manager, 1);
     ASSERT_EQ(replacementLease.basePages(), std::vector<PageId>{2});
     EXPECT_EQ(manager.records().lruToMru(), std::vector<RecordId>{secondBranch});
-    EXPECT_EQ(manager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_A}), std::optional<PageId>{0});
-    EXPECT_EQ(manager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_B}), std::optional<PageId>{1});
-    EXPECT_FALSE(manager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_C}).has_value());
-    EXPECT_EQ(manager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_D}), std::optional<PageId>{3});
+    EXPECT_EQ(manager.baseIndex().lookup(kHASH_A), std::optional<PageId>{0});
+    EXPECT_EQ(manager.baseIndex().lookup(kHASH_B), std::optional<PageId>{1});
+    EXPECT_FALSE(manager.baseIndex().lookup(kHASH_C).has_value());
+    EXPECT_EQ(manager.baseIndex().lookup(kHASH_D), std::optional<PageId>{3});
     expectOnlyBaseState(manager, {0, 0, 1, 0}, {1, 1, 0, 1}, 0);
 
-    PublishStatus const replacementStatus = manager.publish(replacementLease,
-        PublishRequest{{kHASH_E}, kPAGE_SIZE, PublicationPoint::kPrefillEnd, CommitPolicy::kIncludingGeneratedTokens});
+    PublishStatus const replacementStatus
+        = manager.publish(replacementLease, PublishRequest{{kHASH_E}, kPAGE_SIZE}).status;
     ASSERT_EQ(replacementStatus, PublishStatus::kPublished);
     RecordId const replacement = manager.records().lruToMru().back();
     replacementLease.release();
 
     EXPECT_EQ(manager.records().lruToMru(), std::vector<RecordId>({secondBranch, replacement}));
     EXPECT_EQ(manager.records().get(secondBranch).basePagePath, std::vector<PageId>({0, 1, 3}));
-    EXPECT_EQ(manager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_E}), std::optional<PageId>{2});
+    EXPECT_EQ(manager.baseIndex().lookup(kHASH_E), std::optional<PageId>{2});
     expectOnlyBaseState(manager, {0, 0, 0, 0}, {1, 1, 1, 1}, 0);
 }
 
@@ -596,9 +644,7 @@ TEST(ContextCacheManagerTests, BlockHitDoesNotTouchOwningRecordRecency)
     std::vector<RecordId> const originalLru{first.id, second.id};
     ASSERT_EQ(manager.records().lruToMru(), originalLru);
 
-    ReusePlan const plan = manager.planVanilla(kDOMAIN, {kHASH_A}, kPAGE_SIZE + 1);
-    EXPECT_EQ(manager.records().lruToMru(), originalLru);
-    AcquireResult result = manager.acquire(plan);
+    AcquireResult result = manager.acquireVanilla({kHASH_A}, kPAGE_SIZE + 1);
     ASSERT_TRUE(result.lease.has_value());
     CacheRequestLease lease = takeLease(result);
 
@@ -606,8 +652,7 @@ TEST(ContextCacheManagerTests, BlockHitDoesNotTouchOwningRecordRecency)
     EXPECT_EQ(manager.records().lruToMru(), originalLru);
     expectOnlyBaseState(manager, {0, 1, 1}, {1, 1, 0}, 0);
 
-    PublishRequest const mismatchedPrefix{
-        {kHASH_C}, kPAGE_SIZE, PublicationPoint::kPrefillEnd, CommitPolicy::kIncludingGeneratedTokens};
+    PublishRequest const mismatchedPrefix{{kHASH_C}, kPAGE_SIZE};
     EXPECT_THROW((void) manager.publish(lease, mismatchedPrefix), std::runtime_error);
 
     EXPECT_TRUE(lease.valid());
@@ -615,15 +660,15 @@ TEST(ContextCacheManagerTests, BlockHitDoesNotTouchOwningRecordRecency)
     EXPECT_EQ(manager.records().lruToMru(), originalLru);
     EXPECT_EQ(manager.records().get(first.id).basePagePath, std::vector<PageId>{0});
     EXPECT_EQ(manager.records().get(second.id).basePagePath, std::vector<PageId>{1});
-    EXPECT_EQ(manager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_C}), std::optional<PageId>{0});
-    EXPECT_EQ(manager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_A}), std::optional<PageId>{1});
+    EXPECT_EQ(manager.baseIndex().lookup(kHASH_C), std::optional<PageId>{0});
+    EXPECT_EQ(manager.baseIndex().lookup(kHASH_A), std::optional<PageId>{1});
     EXPECT_EQ(manager.baseIndex().size(), 2U);
     expectOnlyBaseState(manager, {0, 1, 1}, {1, 1, 0}, 0);
 
     lease.release();
 
     EXPECT_EQ(manager.records().lruToMru(), originalLru);
-    EXPECT_EQ(manager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_A}), std::optional<PageId>{1});
+    EXPECT_EQ(manager.baseIndex().lookup(kHASH_A), std::optional<PageId>{1});
     expectOnlyBaseState(manager, {0, 0, 0}, {1, 1, 0}, 1);
 }
 
@@ -636,22 +681,21 @@ TEST(ContextCacheManagerTests, ExactDuplicatePublicationMovesExistingRecordToMru
     ASSERT_EQ(second.status, PublishStatus::kPublished);
     ASSERT_EQ(manager.records().lruToMru(), std::vector<RecordId>({first.id, second.id}));
 
-    ReusePlan const duplicatePlan = manager.planVanilla(kDOMAIN, {kHASH_A}, kPAGE_SIZE);
+    AcquireResult duplicateResult = manager.acquireVanilla({kHASH_A}, kPAGE_SIZE);
+    ReusePlan const& duplicatePlan = duplicateResult.plan;
     ASSERT_EQ(duplicatePlan.kind, ReusePlanKind::kFullInputRewind);
-    AcquireResult duplicateResult = manager.acquire(duplicatePlan);
     ASSERT_TRUE(duplicateResult.lease.has_value());
     EXPECT_EQ(duplicateResult.status, AcquireStatus::kAcquired);
     CacheRequestLease duplicateLease = takeLease(duplicateResult);
     ASSERT_EQ(duplicateLease.basePages(), std::vector<PageId>{2});
 
-    PublishStatus const status = manager.publish(duplicateLease,
-        PublishRequest{{kHASH_A}, kPAGE_SIZE, PublicationPoint::kPrefillEnd, CommitPolicy::kIncludingGeneratedTokens});
+    PublishStatus const status = manager.publish(duplicateLease, PublishRequest{{kHASH_A}, kPAGE_SIZE}).status;
 
     EXPECT_EQ(status, PublishStatus::kExistingRecord);
     EXPECT_EQ(manager.records().lruToMru(), std::vector<RecordId>({second.id, first.id}));
     EXPECT_EQ(manager.records().size(), 2U);
     EXPECT_EQ(manager.records().get(first.id).basePagePath, std::vector<PageId>{0});
-    EXPECT_EQ(manager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_A}), std::optional<PageId>{0});
+    EXPECT_EQ(manager.baseIndex().lookup(kHASH_A), std::optional<PageId>{0});
     EXPECT_EQ(manager.baseIndex().size(), 2U);
     expectOnlyBaseState(manager, {0, 0, 1}, {1, 1, 0}, 0);
 
@@ -660,49 +704,27 @@ TEST(ContextCacheManagerTests, ExactDuplicatePublicationMovesExistingRecordToMru
     expectOnlyBaseState(manager, {0, 0, 0}, {1, 1, 0}, 1);
 }
 
-TEST(ContextCacheManagerTests, RebindBasePrefixTransfersTheLeaseActiveReference)
+TEST(ContextCacheManagerTests, ExistingRecordPublicationDoesNotRebindActiveLease)
 {
     ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{2, 0, 0, 0}, 2);
     PublishedRecord const cached = publishPrivateRecord(manager, {kHASH_A});
     ASSERT_EQ(cached.producerPages, std::vector<PageId>{0});
 
-    ReusePlan const duplicate = manager.planVanilla(kDOMAIN, {kHASH_A}, kPAGE_SIZE);
-    AcquireResult acquired = manager.acquire(duplicate);
+    AcquireResult acquired = manager.acquireVanilla({kHASH_A}, kPAGE_SIZE);
     CacheRequestLease lease = takeLease(acquired);
     ASSERT_EQ(lease.basePages(), std::vector<PageId>{1});
     expectOnlyBaseState(manager, {0, 1}, {1, 0}, 0);
 
-    PublishResult const published = manager.publishDetailed(lease,
-        PublishRequest{{kHASH_A}, kPAGE_SIZE, PublicationPoint::kPrefillEnd, CommitPolicy::kIncludingGeneratedTokens});
-    ASSERT_FALSE(published.lineageComplete);
+    PublishResult const published = manager.publish(lease, PublishRequest{{kHASH_A}, kPAGE_SIZE});
+    ASSERT_EQ(published.status, PublishStatus::kExistingRecord);
     ASSERT_EQ(published.canonicalBasePages, std::vector<PageId>{0});
 
-    manager.rebindBasePrefix(lease, published.canonicalBasePages);
-
-    EXPECT_EQ(lease.basePages(), std::vector<PageId>{0});
-    expectOnlyBaseState(manager, {1, 0}, {1, 0}, 1);
-}
-
-TEST(ContextCacheManagerTests, PrefillStateOnlySkipsDecodePublication)
-{
-    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{1, 0, 0, 0}, 1);
-    CacheRequestLease lease = acquirePrivatePages(manager, 1);
-    ASSERT_EQ(lease.basePages(), std::vector<PageId>{0});
-    PublishRequest const skipped{{kHASH_A}, -1, PublicationPoint::kDecodeEnd, CommitPolicy::kPrefillStateOnly};
-
-    CacheRequestLease invalidLease;
-    EXPECT_THROW((void) manager.publish(invalidLease, skipped), std::runtime_error);
-    PublishStatus const status = manager.publish(lease, skipped);
-
-    EXPECT_EQ(status, PublishStatus::kSkippedByPolicy);
-    EXPECT_TRUE(manager.records().lruToMru().empty());
-    EXPECT_EQ(manager.baseIndex().size(), 0U);
-    EXPECT_TRUE(lease.valid());
-    expectOnlyBaseState(manager, {1}, {0}, 0);
+    EXPECT_EQ(lease.basePages(), std::vector<PageId>{1});
+    expectOnlyBaseState(manager, {0, 1}, {1, 0}, 0);
 
     lease.release();
 
-    expectOnlyBaseState(manager, {0}, {0}, 1);
+    expectOnlyBaseState(manager, {0, 0}, {1, 0}, 1);
 }
 
 TEST(ContextCacheManagerTests, DynamicGrowthAtomicallyAddsRequestedPages)
@@ -750,8 +772,7 @@ TEST(ContextCacheManagerTests, RecordLimitEvictsTheLruRecord)
 
     CacheRequestLease thirdLease = acquirePrivatePages(manager, 1);
     ASSERT_EQ(thirdLease.basePages(), std::vector<PageId>{2});
-    PublishStatus const status = manager.publish(thirdLease,
-        PublishRequest{{kHASH_C}, kPAGE_SIZE, PublicationPoint::kPrefillEnd, CommitPolicy::kIncludingGeneratedTokens});
+    PublishStatus const status = manager.publish(thirdLease, PublishRequest{{kHASH_C}, kPAGE_SIZE}).status;
 
     EXPECT_EQ(status, PublishStatus::kPublished);
     ASSERT_EQ(manager.records().size(), 2U);
@@ -760,11 +781,11 @@ TEST(ContextCacheManagerTests, RecordLimitEvictsTheLruRecord)
     EXPECT_EQ(lru.front(), second.id);
     EXPECT_NE(lru.back(), first.id);
     EXPECT_NE(lru.back(), second.id);
-    EXPECT_FALSE(manager.records().find(CacheRecordKey{kDOMAIN, kHASH_A, 1}).has_value());
-    EXPECT_EQ(manager.records().find(CacheRecordKey{kDOMAIN, kHASH_B, 1}), std::optional<RecordId>{second.id});
-    EXPECT_FALSE(manager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_A}).has_value());
-    EXPECT_EQ(manager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_B}), std::optional<PageId>{1});
-    EXPECT_EQ(manager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_C}), std::optional<PageId>{2});
+    EXPECT_FALSE(manager.records().find(CacheRecordKey{kHASH_A, 1}).has_value());
+    EXPECT_EQ(manager.records().find(CacheRecordKey{kHASH_B, 1}), std::optional<RecordId>{second.id});
+    EXPECT_FALSE(manager.baseIndex().lookup(kHASH_A).has_value());
+    EXPECT_EQ(manager.baseIndex().lookup(kHASH_B), std::optional<PageId>{1});
+    EXPECT_EQ(manager.baseIndex().lookup(kHASH_C), std::optional<PageId>{2});
     expectOnlyBaseState(manager, {0, 0, 1}, {0, 1, 1}, 1);
 
     thirdLease.release();
@@ -773,8 +794,7 @@ TEST(ContextCacheManagerTests, RecordLimitEvictsTheLruRecord)
 
     ContextCacheManager zeroLimit(kPAGE_SIZE, ResourceDemand{1, 0, 0, 0}, 0);
     CacheRequestLease transient = acquirePrivatePages(zeroLimit, 1);
-    PublishStatus const zeroStatus = zeroLimit.publish(transient,
-        PublishRequest{{kHASH_D}, kPAGE_SIZE, PublicationPoint::kPrefillEnd, CommitPolicy::kIncludingGeneratedTokens});
+    PublishStatus const zeroStatus = zeroLimit.publish(transient, PublishRequest{{kHASH_D}, kPAGE_SIZE}).status;
     EXPECT_EQ(zeroStatus, PublishStatus::kPublished);
     EXPECT_TRUE(zeroLimit.records().lruToMru().empty());
     EXPECT_EQ(zeroLimit.baseIndex().size(), 0U);
@@ -785,247 +805,217 @@ TEST(ContextCacheManagerTests, RecordLimitEvictsTheLruRecord)
     expectOnlyBaseState(zeroLimit, {0}, {0}, 1);
 }
 
-TEST(ContextCacheManagerTests, SpecAcquirePublishesPairedStateAndReturnsCowBindings)
+TEST(ContextCacheManagerTests, SpecAcquirePublishesPairedStateAndReplaysOneFullPage)
 {
     ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{4, 4, 0, 0}, 2);
-    PublishedSpecRecord const published = publishPrivateSpecRecord(manager, kDRAFT_SIGNATURE, {kHASH_A, kHASH_B});
+    PublishedSpecRecord const published = publishPrivateSpecRecord(manager, {kHASH_A, kHASH_B});
     ASSERT_EQ(published.status, PublishStatus::kPublished);
     ASSERT_EQ(published.producerBasePages, std::vector<PageId>({0, 1}));
     ASSERT_EQ(published.producerDraftPages, std::vector<PageId>({0, 1}));
 
     CacheRecord const& record = manager.records().get(published.id);
     EXPECT_EQ(record.basePagePath, std::vector<PageId>({0, 1}));
-    EXPECT_EQ(record.draftSignature, std::optional<DraftEngineSignature>{kDRAFT_SIGNATURE});
     EXPECT_EQ(record.draftPagePath, std::vector<PageId>({0, 1}));
-    EXPECT_EQ(record.pairedDraftFullBlockCount, 2);
-    EXPECT_EQ(manager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_A}), std::optional<PageId>{0});
-    EXPECT_EQ(manager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_B}), std::optional<PageId>{1});
-    EXPECT_EQ(manager.draftIndex().lookupLongest(kDRAFT_SIGNATURE, kDOMAIN, {kHASH_A, kHASH_B}, 2),
+    EXPECT_EQ(manager.baseIndex().lookup(kHASH_A), std::optional<PageId>{0});
+    EXPECT_EQ(manager.baseIndex().lookup(kHASH_B), std::optional<PageId>{1});
+    EXPECT_EQ(manager.draftIndex().lookupLongest({kHASH_A, kHASH_B}, 2),
         (std::optional<DraftPathMatch>{DraftPathMatch{published.id, 2}}));
     expectPoolState(manager, ResourceType::kBaseKvPage, {0, 0, 0, 0}, {1, 1, 0, 0}, 2);
     expectPoolState(manager, ResourceType::kDraftKvPage, {0, 0, 0, 0}, {1, 1, 0, 0}, 2);
 
-    ReusePlan const vanilla = manager.planVanilla(kDOMAIN, {kHASH_A, kHASH_B}, 2 * kPAGE_SIZE + 1);
-    EXPECT_EQ(vanilla.basePageBindings, std::vector<PageId>({0, 1}));
-    EXPECT_EQ(vanilla.reuseTokenLength, 2 * kPAGE_SIZE);
-
-    ReusePlan const spec = manager.planSpec(
-        SpecDecodeMode::kEAGLE, kDOMAIN, kDRAFT_SIGNATURE, {kHASH_A, kHASH_B}, 2 * kPAGE_SIZE + 1, true);
-    EXPECT_EQ(spec.baseCowSources, std::vector<PageId>{1});
-    EXPECT_EQ(spec.draftCowSources, std::vector<PageId>{1});
-    AcquireResult result = manager.acquire(spec);
+    AcquireResult result = manager.acquireSpec({kHASH_A, kHASH_B}, 2 * kPAGE_SIZE + 1);
+    ReusePlan const& spec = result.plan;
+    EXPECT_EQ(spec.basePageBindings, std::vector<PageId>{0});
+    EXPECT_EQ(spec.draftPageBindings, std::vector<PageId>{0});
+    EXPECT_EQ(spec.specReplayMode, SpecReplayMode::kFullPage);
     ASSERT_EQ(result.status, AcquireStatus::kAcquired);
     CacheRequestLease lease = takeLease(result);
 
     EXPECT_EQ(lease.basePages(), std::vector<PageId>({0, 2, 3}));
     EXPECT_EQ(lease.draftPages(), std::vector<PageId>({0, 2, 3}));
-    EXPECT_EQ(lease.baseCowSources(), std::vector<PageId>{1});
-    EXPECT_EQ(lease.draftCowSources(), std::vector<PageId>{1});
-    EXPECT_EQ(lease.reuseTokenLength(), 2 * kPAGE_SIZE - 1);
-    expectPoolState(manager, ResourceType::kBaseKvPage, {1, 1, 1, 1}, {1, 1, 0, 0}, 0);
-    expectPoolState(manager, ResourceType::kDraftKvPage, {1, 1, 1, 1}, {1, 1, 0, 0}, 0);
+    EXPECT_EQ(spec.reuseTokenLength, kPAGE_SIZE);
+    expectPoolState(manager, ResourceType::kBaseKvPage, {1, 0, 1, 1}, {1, 1, 0, 0}, 0);
+    expectPoolState(manager, ResourceType::kDraftKvPage, {1, 0, 1, 1}, {1, 1, 0, 0}, 0);
 
     lease.release();
     expectPoolState(manager, ResourceType::kBaseKvPage, {0, 0, 0, 0}, {1, 1, 0, 0}, 2);
     expectPoolState(manager, ResourceType::kDraftKvPage, {0, 0, 0, 0}, {1, 1, 0, 0}, 2);
 }
 
-TEST(ContextCacheManagerTests, SpecDraftUpgradeRequiresTheCanonicalPhysicalBasePath)
+TEST(ContextCacheManagerTests, VanillaPublicationPreservesPairedRecordForLaterSpecReuse)
+{
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{4, 4, 0, 0}, 2);
+    PublishedSpecRecord const published = publishPrivateSpecRecord(manager, {kHASH_A, kHASH_B});
+    ASSERT_EQ(published.status, PublishStatus::kPublished);
+
+    AcquireResult vanillaResult = manager.acquireVanilla({kHASH_A, kHASH_B}, 2 * kPAGE_SIZE + 1);
+    ASSERT_EQ(vanillaResult.status, AcquireStatus::kAcquired);
+    CacheRequestLease vanillaLease = takeLease(vanillaResult);
+    ASSERT_TRUE(vanillaLease.draftPages().empty());
+    EXPECT_EQ(manager.publish(vanillaLease, PublishRequest{{kHASH_A, kHASH_B}, 2 * kPAGE_SIZE}).status,
+        PublishStatus::kExistingRecord);
+    vanillaLease.release();
+
+    ASSERT_EQ(manager.records().size(), 1U);
+    CacheRecord const& retained = manager.records().get(published.id);
+    EXPECT_EQ(retained.draftPagePath, published.producerDraftPages);
+    EXPECT_EQ(manager.draftIndex().lookupLongest({kHASH_A, kHASH_B}, 2),
+        (std::optional<DraftPathMatch>{DraftPathMatch{published.id, 2}}));
+
+    AcquireResult specResult = manager.acquireSpec({kHASH_A, kHASH_B}, 2 * kPAGE_SIZE + 1);
+    ReusePlan const& specPlan = specResult.plan;
+    EXPECT_EQ(specPlan.draftRecord, std::optional<RecordId>{published.id});
+    EXPECT_EQ(specPlan.draftPageBindings, std::vector<PageId>{published.producerDraftPages.front()});
+    takeLease(specResult).release();
+}
+
+TEST(ContextCacheManagerTests, SpecDraftUpgradeUsesCanonicalProjectedBasePath)
 {
     ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{6, 4, 0, 0}, 2);
-    ReusePlan const coldSpec
-        = manager.planSpec(SpecDecodeMode::kEAGLE, kDOMAIN, kDRAFT_SIGNATURE, {kHASH_A, kHASH_B}, 2 * kPAGE_SIZE, true);
-    ASSERT_EQ(coldSpec.kind, ReusePlanKind::kNoReusablePrefix);
-    AcquireResult firstResult = manager.acquire(coldSpec);
-    CacheRequestLease firstLease = takeLease(firstResult);
-    ASSERT_EQ(firstLease.basePages(), std::vector<PageId>({0, 1}));
-    ASSERT_EQ(firstLease.draftPages(), std::vector<PageId>({0, 1}));
+    AcquireResult baseResult = manager.acquireVanilla({kHASH_A, kHASH_B}, 2 * kPAGE_SIZE);
+    CacheRequestLease baseLease = takeLease(baseResult);
+    ASSERT_EQ(baseLease.basePages(), std::vector<PageId>({0, 1}));
+    ASSERT_EQ(manager.publish(baseLease, PublishRequest{{kHASH_A, kHASH_B}, 2 * kPAGE_SIZE}).status,
+        PublishStatus::kPublished);
+    baseLease.release();
 
-    PublishStatus const baseOnly = manager.publish(firstLease,
-        PublishRequest{{kHASH_A, kHASH_B}, 2 * kPAGE_SIZE, PublicationPoint::kPrefillEnd,
-            CommitPolicy::kIncludingGeneratedTokens, 0});
-    ASSERT_EQ(baseOnly, PublishStatus::kPublished);
     RecordId const recordId = manager.records().lruToMru().front();
-    ASSERT_FALSE(manager.records().get(recordId).draftSignature.has_value());
+    ASSERT_TRUE(manager.records().get(recordId).draftPagePath.empty());
 
-    PublishStatus const upgrade = manager.publish(firstLease,
-        PublishRequest{{kHASH_A, kHASH_B}, 2 * kPAGE_SIZE, PublicationPoint::kPrefillEnd,
-            CommitPolicy::kIncludingGeneratedTokens, 2 * kPAGE_SIZE});
-    EXPECT_EQ(upgrade, PublishStatus::kPublished);
-    firstLease.release();
+    AcquireResult specResult = manager.acquireSpec({kHASH_A, kHASH_B}, 2 * kPAGE_SIZE);
+    ASSERT_EQ(specResult.plan.kind, ReusePlanKind::kNoReusablePrefix);
+    CacheRequestLease specLease = takeLease(specResult);
+    ASSERT_EQ(specLease.basePages(), std::vector<PageId>({2, 3}));
+    ASSERT_EQ(specLease.draftPages(), std::vector<PageId>({0, 1}));
+
+    PublishResult const upgrade = manager.publish(specLease, PublishRequest{{kHASH_A, kHASH_B}, 2 * kPAGE_SIZE});
+    EXPECT_EQ(upgrade.status, PublishStatus::kPublished);
+    EXPECT_EQ(upgrade.record, std::optional<RecordId>{recordId});
+    EXPECT_EQ(upgrade.canonicalBasePages, std::vector<PageId>({0, 1}));
+    EXPECT_EQ(specLease.basePages(), std::vector<PageId>({2, 3}));
+    specLease.release();
 
     ASSERT_EQ(manager.records().size(), 1U);
     EXPECT_EQ(manager.records().lruToMru(), std::vector<RecordId>{recordId});
     EXPECT_EQ(manager.records().get(recordId).basePagePath, std::vector<PageId>({0, 1}));
-    EXPECT_EQ(manager.records().get(recordId).draftSignature, std::optional<DraftEngineSignature>{kDRAFT_SIGNATURE});
     EXPECT_EQ(manager.records().get(recordId).draftPagePath, std::vector<PageId>({0, 1}));
+    EXPECT_EQ(manager.draftIndex().lookupLongest({kHASH_A, kHASH_B}, 2),
+        (std::optional<DraftPathMatch>{DraftPathMatch{recordId, 2}}));
     expectPoolState(manager, ResourceType::kBaseKvPage, {0, 0, 0, 0, 0, 0}, {1, 1, 0, 0, 0, 0}, 4);
     expectPoolState(manager, ResourceType::kDraftKvPage, {0, 0, 0, 0}, {1, 1, 0, 0}, 2);
-
-    ReusePlan const replacementPlan = manager.planSpec(
-        SpecDecodeMode::kEAGLE, kDOMAIN, kOTHER_DRAFT_SIGNATURE, {kHASH_A, kHASH_B}, 2 * kPAGE_SIZE, true);
-    ASSERT_EQ(replacementPlan.kind, ReusePlanKind::kNoReusablePrefix);
-    AcquireResult replacementResult = manager.acquire(replacementPlan);
-    CacheRequestLease replacementLease = takeLease(replacementResult);
-    ASSERT_EQ(replacementLease.draftPages(), std::vector<PageId>({2, 3}));
-
-    PublishResult const replacement = manager.publishDetailed(replacementLease,
-        PublishRequest{{kHASH_A, kHASH_B}, 2 * kPAGE_SIZE, PublicationPoint::kPrefillEnd,
-            CommitPolicy::kIncludingGeneratedTokens, 2 * kPAGE_SIZE});
-    EXPECT_EQ(replacement.status, PublishStatus::kExistingRecord);
-    EXPECT_FALSE(replacement.lineageComplete);
-    EXPECT_EQ(replacement.publishedBaseFullBlockCount, 1);
-    replacementLease.release();
-
-    CacheRecord const& retained = manager.records().get(recordId);
-    EXPECT_EQ(retained.draftSignature, std::optional<DraftEngineSignature>{kDRAFT_SIGNATURE});
-    EXPECT_EQ(retained.draftPagePath, std::vector<PageId>({0, 1}));
-    EXPECT_EQ(manager.draftIndex().lookupLongest(kDRAFT_SIGNATURE, kDOMAIN, {kHASH_A, kHASH_B}, 2),
-        (std::optional<DraftPathMatch>{DraftPathMatch{recordId, 2}}));
-    EXPECT_FALSE(
-        manager.draftIndex().lookupLongest(kOTHER_DRAFT_SIGNATURE, kDOMAIN, {kHASH_A, kHASH_B}, 2).has_value());
-    expectPoolState(manager, ResourceType::kDraftKvPage, {0, 0, 0, 0}, {1, 1, 0, 0}, 2);
 }
 
-TEST(ContextCacheManagerTests, SpecPublicationTracksCommittedDraftBoundarySeparately)
+TEST(ContextCacheManagerTests, EvictingUpgradedSpecRecordReleasesDraftIndexAndReferences)
 {
-    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{6, 6, 0, 0}, 2);
-    ReusePlan const cold = manager.planSpec(
-        SpecDecodeMode::kEAGLE, kDOMAIN, kDRAFT_SIGNATURE, {kHASH_A, kHASH_B, kHASH_C}, 3 * kPAGE_SIZE, true);
-    AcquireResult coldResult = manager.acquire(cold);
-    CacheRequestLease coldLease = takeLease(coldResult);
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{4, 4, 0, 0}, 1);
+    PublishedRecord const baseOnly = publishPrivateRecord(manager, {kHASH_A, kHASH_B});
+    ASSERT_TRUE(manager.records().get(baseOnly.id).draftPagePath.empty());
 
-    PublishStatus const partialDraft = manager.publish(coldLease,
-        PublishRequest{{kHASH_A, kHASH_B, kHASH_C}, 3 * kPAGE_SIZE, PublicationPoint::kDecodeEnd,
-            CommitPolicy::kIncludingGeneratedTokens, 2 * kPAGE_SIZE});
-    EXPECT_EQ(partialDraft, PublishStatus::kPublished);
-    coldLease.release();
+    AcquireResult upgradeResult = manager.acquireSpec({kHASH_A, kHASH_B}, 2 * kPAGE_SIZE);
+    CacheRequestLease upgradeLease = takeLease(upgradeResult);
+    std::vector<PageId> const upgradedDraftPages = upgradeLease.draftPages();
+    ASSERT_EQ(manager.publish(upgradeLease, PublishRequest{{kHASH_A, kHASH_B}, 2 * kPAGE_SIZE}).status,
+        PublishStatus::kPublished);
+    upgradeLease.release();
 
-    ASSERT_EQ(manager.records().size(), 1U);
-    RecordId const recordId = manager.records().lruToMru().front();
-    CacheRecord const& partial = manager.records().get(recordId);
-    EXPECT_EQ(partial.baseFullBlockCount, 3);
-    EXPECT_EQ(partial.basePagePath, std::vector<PageId>({0, 1, 2}));
-    EXPECT_EQ(partial.pairedDraftFullBlockCount, 2);
-    EXPECT_EQ(partial.draftPagePath, std::vector<PageId>({0, 1}));
-    EXPECT_EQ(manager.draftIndex().lookupLongest(kDRAFT_SIGNATURE, kDOMAIN, {kHASH_A, kHASH_B, kHASH_C}, 3),
-        (std::optional<DraftPathMatch>{DraftPathMatch{recordId, 2}}));
+    ASSERT_EQ(manager.records().get(baseOnly.id).draftPagePath, upgradedDraftPages);
+    ASSERT_EQ(manager.draftIndex().lookupLongest({kHASH_A, kHASH_B}, 2),
+        (std::optional<DraftPathMatch>{DraftPathMatch{baseOnly.id, 2}}));
+    for (PageId const page : upgradedDraftPages)
+    {
+        ASSERT_EQ(manager.pools().cacheRefCount(ResourceId{ResourceType::kDraftKvPage, page}), 1);
+    }
 
-    ReusePlan const vanilla = manager.planVanilla(kDOMAIN, {kHASH_A, kHASH_B, kHASH_C}, 3 * kPAGE_SIZE + 1);
-    EXPECT_EQ(vanilla.basePageBindings, std::vector<PageId>({0, 1, 2}));
-    ReusePlan const spec = manager.planSpec(
-        SpecDecodeMode::kEAGLE, kDOMAIN, kDRAFT_SIGNATURE, {kHASH_A, kHASH_B, kHASH_C}, 3 * kPAGE_SIZE + 1, true);
-    EXPECT_EQ(spec.draftRecord, std::optional<RecordId>{recordId});
-    EXPECT_EQ(spec.draftPageBindings, std::vector<PageId>({0, 1}));
-    EXPECT_EQ(spec.reuseTokenLength, 2 * kPAGE_SIZE - 1);
-
-    ReusePlan const extend = manager.planSpec(
-        SpecDecodeMode::kEAGLE, kDOMAIN, kDRAFT_SIGNATURE, {kHASH_A, kHASH_B, kHASH_C}, 3 * kPAGE_SIZE, true);
-    AcquireResult extendResult = manager.acquire(extend);
-    CacheRequestLease extendLease = takeLease(extendResult);
-    PublishResult const fullDraft = manager.publishDetailed(extendLease,
-        PublishRequest{{kHASH_A, kHASH_B, kHASH_C}, 3 * kPAGE_SIZE, PublicationPoint::kDecodeEnd,
-            CommitPolicy::kIncludingGeneratedTokens, 3 * kPAGE_SIZE});
-    EXPECT_EQ(fullDraft.status, PublishStatus::kExistingRecord);
-    EXPECT_FALSE(fullDraft.lineageComplete);
-    EXPECT_EQ(fullDraft.publishedBaseFullBlockCount, 3);
-    extendLease.release();
-
-    CacheRecord const& complete = manager.records().get(recordId);
-    EXPECT_EQ(complete.basePagePath, std::vector<PageId>({0, 1, 2}));
-    EXPECT_EQ(complete.pairedDraftFullBlockCount, 2);
-    EXPECT_EQ(complete.draftPagePath.size(), 2U);
-    EXPECT_EQ(manager.draftIndex().lookupLongest(kDRAFT_SIGNATURE, kDOMAIN, {kHASH_A, kHASH_B, kHASH_C}, 3),
-        (std::optional<DraftPathMatch>{DraftPathMatch{recordId, 2}}));
+    PublishedSpecRecord const replacement = publishPrivateSpecRecord(manager, {kHASH_C});
+    ASSERT_EQ(replacement.status, PublishStatus::kPublished);
+    EXPECT_FALSE(manager.records().contains(baseOnly.id));
+    EXPECT_FALSE(manager.draftIndex().lookupLongest({kHASH_A, kHASH_B}, 2).has_value());
+    EXPECT_EQ(manager.draftIndex().lookupLongest({kHASH_C}, 1),
+        (std::optional<DraftPathMatch>{DraftPathMatch{replacement.id, 1}}));
+    for (PageId const page : upgradedDraftPages)
+    {
+        EXPECT_EQ(manager.pools().activeRefCount(ResourceId{ResourceType::kDraftKvPage, page}), 0);
+        EXPECT_EQ(manager.pools().cacheRefCount(ResourceId{ResourceType::kDraftKvPage, page}), 0);
+    }
+    EXPECT_EQ(manager.pools().freeCount(ResourceType::kDraftKvPage), 3);
 }
 
-TEST(ContextCacheManagerTests, SpecPublicationWithNoFullDraftPageRetainsBaseOnly)
+TEST(ContextCacheManagerTests, SpecPublicationUsesCommonMaterializedBoundary)
 {
-    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{2, 2, 0, 0}, 1);
-    ReusePlan const plan
-        = manager.planSpec(SpecDecodeMode::kEAGLE, kDOMAIN, kDRAFT_SIGNATURE, {kHASH_A}, kPAGE_SIZE, true);
-    AcquireResult result = manager.acquire(plan);
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{4, 4, 0, 0}, 2);
+    AcquireResult result = manager.acquireSpec({kHASH_A, kHASH_B}, 2 * kPAGE_SIZE);
     CacheRequestLease lease = takeLease(result);
 
-    PublishStatus const status = manager.publish(lease,
-        PublishRequest{{kHASH_A}, kPAGE_SIZE, PublicationPoint::kDecodeEnd, CommitPolicy::kIncludingGeneratedTokens,
-            kPAGE_SIZE - 1});
-    EXPECT_EQ(status, PublishStatus::kPublished);
+    PublishResult const published = manager.publish(lease, PublishRequest{{kHASH_A, kHASH_B}, kPAGE_SIZE});
+    EXPECT_EQ(published.status, PublishStatus::kPublished);
+    EXPECT_EQ(published.publishedBaseFullBlockCount, 1);
     lease.release();
 
     ASSERT_EQ(manager.records().size(), 1U);
-    CacheRecord const& record = manager.records().get(manager.records().lruToMru().front());
+    RecordId const recordId = manager.records().lruToMru().front();
+    CacheRecord const& record = manager.records().get(recordId);
     EXPECT_EQ(record.basePagePath, std::vector<PageId>{0});
-    EXPECT_FALSE(record.draftSignature.has_value());
-    EXPECT_TRUE(record.draftPagePath.empty());
-    EXPECT_EQ(record.pairedDraftFullBlockCount, 0);
-    EXPECT_FALSE(manager.draftIndex().lookupLongest(kDRAFT_SIGNATURE, kDOMAIN, {kHASH_A}, 1).has_value());
-
-    ReusePlan const vanilla = manager.planVanilla(kDOMAIN, {kHASH_A}, kPAGE_SIZE + 1);
-    EXPECT_EQ(vanilla.basePageBindings, std::vector<PageId>{0});
-    ReusePlan const spec
-        = manager.planSpec(SpecDecodeMode::kEAGLE, kDOMAIN, kDRAFT_SIGNATURE, {kHASH_A}, kPAGE_SIZE + 1, true);
-    EXPECT_EQ(spec.kind, ReusePlanKind::kNoReusablePrefix);
-    EXPECT_TRUE(spec.basePageBindings.empty());
-    expectPoolState(manager, ResourceType::kBaseKvPage, {0, 0}, {1, 0}, 1);
-    expectPoolState(manager, ResourceType::kDraftKvPage, {0, 0}, {0, 0}, 2);
+    EXPECT_EQ(record.draftPagePath, std::vector<PageId>{0});
+    EXPECT_EQ(manager.draftIndex().lookupLongest({kHASH_A, kHASH_B}, 2),
+        (std::optional<DraftPathMatch>{DraftPathMatch{recordId, 1}}));
+    expectPoolState(manager, ResourceType::kBaseKvPage, {0, 0, 0, 0}, {1, 0, 0, 0}, 3);
+    expectPoolState(manager, ResourceType::kDraftKvPage, {0, 0, 0, 0}, {1, 0, 0, 0}, 3);
 }
 
-TEST(ContextCacheManagerTests, SpecFullPageReplayRequiresRebindBeforePublishingDescendants)
+TEST(ContextCacheManagerTests, SpecFullPageReplayPublishesProjectedBaseWithoutRebinding)
 {
     ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{6, 6, 0, 0}, 2);
-    PublishedSpecRecord const prefix = publishPrivateSpecRecord(manager, kDRAFT_SIGNATURE, {kHASH_A, kHASH_B});
+    PublishedSpecRecord const prefix = publishPrivateSpecRecord(manager, {kHASH_A, kHASH_B});
 
-    ReusePlan const plan = manager.planSpec(
-        SpecDecodeMode::kEAGLE, kDOMAIN, kDRAFT_SIGNATURE, {kHASH_A, kHASH_B, kHASH_C}, 3 * kPAGE_SIZE, false);
+    AcquireResult result = manager.acquireSpec({kHASH_A, kHASH_B, kHASH_C}, 3 * kPAGE_SIZE);
+    ReusePlan const& plan = result.plan;
     ASSERT_EQ(plan.specReplayMode, SpecReplayMode::kFullPage);
     ASSERT_EQ(plan.reuseTokenLength, kPAGE_SIZE);
-    AcquireResult result = manager.acquire(plan);
     CacheRequestLease lease = takeLease(result);
     ASSERT_EQ(lease.basePages(), std::vector<PageId>({0, 2, 3}));
     ASSERT_EQ(lease.draftPages(), std::vector<PageId>({0, 2, 3}));
 
-    PublishResult const published = manager.publishDetailed(lease,
-        PublishRequest{{kHASH_A, kHASH_B, kHASH_C}, 3 * kPAGE_SIZE, PublicationPoint::kPrefillEnd,
-            CommitPolicy::kIncludingGeneratedTokens, 3 * kPAGE_SIZE});
-    EXPECT_EQ(published.status, PublishStatus::kExistingRecord);
-    EXPECT_FALSE(published.lineageComplete);
-    EXPECT_EQ(published.publishedBaseFullBlockCount, 2);
-    EXPECT_EQ(published.canonicalBasePages, std::vector<PageId>({0, 1}));
+    PublishResult const published = manager.publish(lease, PublishRequest{{kHASH_A, kHASH_B, kHASH_C}, 3 * kPAGE_SIZE});
+    ASSERT_EQ(published.status, PublishStatus::kPublished);
+    ASSERT_TRUE(published.record.has_value());
+    EXPECT_EQ(published.publishedBaseFullBlockCount, 3);
+    EXPECT_EQ(published.canonicalBasePages, std::vector<PageId>({0, 1, 3}));
+    EXPECT_EQ(lease.basePages(), std::vector<PageId>({0, 2, 3}));
+    EXPECT_EQ(lease.draftPages(), std::vector<PageId>({0, 2, 3}));
     lease.release();
 
-    EXPECT_EQ(manager.records().lruToMru(), std::vector<RecordId>{prefix.id});
-    EXPECT_FALSE(manager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_C}).has_value());
-    EXPECT_EQ(manager.draftIndex().lookupLongest(kDRAFT_SIGNATURE, kDOMAIN, {kHASH_A, kHASH_B, kHASH_C}, 3),
-        (std::optional<DraftPathMatch>{DraftPathMatch{prefix.id, 2}}));
+    EXPECT_EQ(manager.records().lruToMru(), std::vector<RecordId>({prefix.id, *published.record}));
+    EXPECT_EQ(manager.records().get(*published.record).basePagePath, std::vector<PageId>({0, 1, 3}));
+    EXPECT_EQ(manager.records().get(*published.record).draftPagePath, std::vector<PageId>({0, 2, 3}));
+    EXPECT_EQ(manager.baseIndex().lookup(kHASH_C), std::optional<PageId>{3});
+    EXPECT_EQ(manager.draftIndex().lookupLongest({kHASH_A, kHASH_B, kHASH_C}, 3),
+        (std::optional<DraftPathMatch>{DraftPathMatch{*published.record, 3}}));
     EXPECT_EQ(manager.records().get(prefix.id).draftPagePath, std::vector<PageId>({0, 1}));
+    expectPoolState(manager, ResourceType::kBaseKvPage, {0, 0, 0, 0, 0, 0}, {2, 2, 0, 1, 0, 0}, 3);
+    expectPoolState(manager, ResourceType::kDraftKvPage, {0, 0, 0, 0, 0, 0}, {2, 1, 1, 1, 0, 0}, 2);
 }
 
 TEST(ContextCacheManagerTests, SpecFullPageReplayRejectsChangedShiftedTokenDependency)
 {
     ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{6, 6, 0, 0}, 2);
-    PublishedSpecRecord const prefix = publishPrivateSpecRecord(manager, kDRAFT_SIGNATURE, {kHASH_A, kHASH_B});
+    PublishedSpecRecord const prefix = publishPrivateSpecRecord(manager, {kHASH_A, kHASH_B});
 
-    ReusePlan const plan = manager.planSpec(
-        SpecDecodeMode::kEAGLE, kDOMAIN, kDRAFT_SIGNATURE, {kHASH_A, kHASH_B, kHASH_C}, 3 * kPAGE_SIZE, false);
+    AcquireResult result = manager.acquireSpec({kHASH_A, kHASH_B, kHASH_C}, 3 * kPAGE_SIZE);
+    ReusePlan const& plan = result.plan;
     ASSERT_EQ(plan.specReplayMode, SpecReplayMode::kFullPage);
-    AcquireResult result = manager.acquire(plan);
     CacheRequestLease lease = takeLease(result);
 
-    EXPECT_THROW((void) manager.publish(lease,
-                     PublishRequest{{kHASH_A, kHASH_D, kHASH_E}, 3 * kPAGE_SIZE, PublicationPoint::kPrefillEnd,
-                         CommitPolicy::kIncludingGeneratedTokens, 3 * kPAGE_SIZE}),
-        std::runtime_error);
+    EXPECT_THROW(
+        (void) manager.publish(lease, PublishRequest{{kHASH_A, kHASH_D, kHASH_E}, 3 * kPAGE_SIZE}), std::runtime_error);
     EXPECT_EQ(manager.records().lruToMru(), std::vector<RecordId>{prefix.id});
-    EXPECT_FALSE(manager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_D}).has_value());
-    EXPECT_FALSE(manager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_E}).has_value());
+    EXPECT_FALSE(manager.baseIndex().lookup(kHASH_D).has_value());
+    EXPECT_FALSE(manager.baseIndex().lookup(kHASH_E).has_value());
 }
 
 TEST(ContextCacheManagerTests, SpecGrowthIsAtomicAcrossBaseAndDraftPools)
 {
     ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{3, 2, 0, 0}, 1);
-    ReusePlan const plan = manager.planSpec(SpecDecodeMode::kEAGLE, kDOMAIN, kDRAFT_SIGNATURE, {}, 1, true);
-    AcquireResult result = manager.acquire(plan);
+    AcquireResult result = manager.acquireSpec({}, 1);
     CacheRequestLease lease = takeLease(result);
     ASSERT_EQ(lease.basePages(), std::vector<PageId>{0});
     ASSERT_EQ(lease.draftPages(), std::vector<PageId>{0});
@@ -1048,153 +1038,72 @@ TEST(ContextCacheManagerTests, SpecGrowthIsAtomicAcrossBaseAndDraftPools)
 
 TEST(ContextCacheManagerTests, SpecHitIsTreatedAsMruDuringPressureEviction)
 {
-    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{3, 3, 0, 0}, 2);
-    PublishedSpecRecord const first = publishPrivateSpecRecord(manager, kDRAFT_SIGNATURE, {kHASH_A});
-    PublishedSpecRecord const second = publishPrivateSpecRecord(manager, kDRAFT_SIGNATURE, {kHASH_B});
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{4, 4, 0, 0}, 2);
+    PublishedSpecRecord const first = publishPrivateSpecRecord(manager, {kHASH_A, kHASH_B});
+    PublishedSpecRecord const second = publishPrivateSpecRecord(manager, {kHASH_C});
     ASSERT_EQ(manager.records().lruToMru(), std::vector<RecordId>({first.id, second.id}));
 
-    ReusePlan const hit
-        = manager.planSpec(SpecDecodeMode::kEAGLE, kDOMAIN, kDRAFT_SIGNATURE, {kHASH_A}, kPAGE_SIZE + 1, true);
+    AcquireResult result = manager.acquireSpec({kHASH_A, kHASH_B}, 2 * kPAGE_SIZE + 1);
+    ReusePlan const& hit = result.plan;
     ASSERT_EQ(hit.draftRecord, std::optional<RecordId>{first.id});
     ASSERT_EQ(hit.demand.baseKvPages, 2);
     ASSERT_EQ(hit.demand.draftKvPages, 2);
 
-    AcquireResult result = manager.acquire(hit);
     ASSERT_EQ(result.status, AcquireStatus::kAcquired);
     CacheRequestLease lease = takeLease(result);
 
     EXPECT_EQ(manager.records().lruToMru(), std::vector<RecordId>{first.id});
     EXPECT_TRUE(manager.records().contains(first.id));
     EXPECT_FALSE(manager.records().contains(second.id));
-    EXPECT_EQ(manager.draftIndex().lookupLongest(kDRAFT_SIGNATURE, kDOMAIN, {kHASH_A}, 1),
-        (std::optional<DraftPathMatch>{DraftPathMatch{first.id, 1}}));
-    EXPECT_FALSE(manager.draftIndex().lookupLongest(kDRAFT_SIGNATURE, kDOMAIN, {kHASH_B}, 1).has_value());
+    EXPECT_EQ(manager.draftIndex().lookupLongest({kHASH_A, kHASH_B}, 2),
+        (std::optional<DraftPathMatch>{DraftPathMatch{first.id, 2}}));
+    EXPECT_FALSE(manager.draftIndex().lookupLongest({kHASH_C}, 1).has_value());
 
     lease.release();
-    expectPoolState(manager, ResourceType::kBaseKvPage, {0, 0, 0}, {1, 0, 0}, 2);
-    expectPoolState(manager, ResourceType::kDraftKvPage, {0, 0, 0}, {1, 0, 0}, 2);
+    expectPoolState(manager, ResourceType::kBaseKvPage, {0, 0, 0, 0}, {1, 1, 0, 0}, 2);
+    expectPoolState(manager, ResourceType::kDraftKvPage, {0, 0, 0, 0}, {1, 1, 0, 0}, 2);
 }
 
 TEST(ContextCacheManagerTests, InfeasibleSpecAcquirePreservesLruAndTypedReferences)
 {
-    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{2, 2, 0, 0}, 2);
-    PublishedSpecRecord const first = publishPrivateSpecRecord(manager, kDRAFT_SIGNATURE, {kHASH_A});
-    PublishedSpecRecord const second = publishPrivateSpecRecord(manager, kDRAFT_SIGNATURE, {kHASH_B});
+    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{3, 3, 0, 0}, 2);
+    PublishedSpecRecord const first = publishPrivateSpecRecord(manager, {kHASH_A, kHASH_B});
+    PublishedSpecRecord const second = publishPrivateSpecRecord(manager, {kHASH_C});
     std::vector<RecordId> const lruBefore{first.id, second.id};
     ASSERT_EQ(manager.records().lruToMru(), lruBefore);
 
-    ReusePlan const hit
-        = manager.planSpec(SpecDecodeMode::kEAGLE, kDOMAIN, kDRAFT_SIGNATURE, {kHASH_A}, kPAGE_SIZE + 1, true);
+    AcquireResult result = manager.acquireSpec({kHASH_A, kHASH_B, kHASH_C}, 3 * kPAGE_SIZE + 1);
+    ReusePlan const& hit = result.plan;
     ASSERT_EQ(hit.draftRecord, std::optional<RecordId>{first.id});
-    ASSERT_EQ(hit.demand.baseKvPages, 2);
-    ASSERT_EQ(hit.demand.draftKvPages, 2);
-
-    AcquireResult result = manager.acquire(hit);
+    ASSERT_EQ(hit.demand.baseKvPages, 3);
+    ASSERT_EQ(hit.demand.draftKvPages, 3);
 
     EXPECT_EQ(result.status, AcquireStatus::kInsufficientCapacity);
     EXPECT_FALSE(result.lease.has_value());
     EXPECT_EQ(manager.records().lruToMru(), lruBefore);
-    EXPECT_EQ(manager.draftIndex().lookupLongest(kDRAFT_SIGNATURE, kDOMAIN, {kHASH_A}, 1),
-        (std::optional<DraftPathMatch>{DraftPathMatch{first.id, 1}}));
-    EXPECT_EQ(manager.draftIndex().lookupLongest(kDRAFT_SIGNATURE, kDOMAIN, {kHASH_B}, 1),
+    EXPECT_EQ(manager.draftIndex().lookupLongest({kHASH_A, kHASH_B}, 2),
+        (std::optional<DraftPathMatch>{DraftPathMatch{first.id, 2}}));
+    EXPECT_EQ(manager.draftIndex().lookupLongest({kHASH_C}, 1),
         (std::optional<DraftPathMatch>{DraftPathMatch{second.id, 1}}));
-    expectPoolState(manager, ResourceType::kBaseKvPage, {0, 0}, {1, 1}, 0);
-    expectPoolState(manager, ResourceType::kDraftKvPage, {0, 0}, {1, 1}, 0);
+    expectPoolState(manager, ResourceType::kBaseKvPage, {0, 0, 0}, {1, 1, 1}, 0);
+    expectPoolState(manager, ResourceType::kDraftKvPage, {0, 0, 0}, {1, 1, 1}, 0);
 }
 
-TEST(ContextCacheManagerTests, SpecEvictionRemovesBothIndicesAndMakesOldPlanStale)
+TEST(ContextCacheManagerTests, SpecEvictionRemovesBothIndices)
 {
     ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{3, 3, 0, 0}, 1);
-    PublishedSpecRecord const first = publishPrivateSpecRecord(manager, kDRAFT_SIGNATURE, {kHASH_A});
-    ReusePlan const stalePlan
-        = manager.planSpec(SpecDecodeMode::kEAGLE, kDOMAIN, kDRAFT_SIGNATURE, {kHASH_A}, kPAGE_SIZE + 1, true);
-    ASSERT_EQ(stalePlan.draftRecord, std::optional<RecordId>{first.id});
+    PublishedSpecRecord const first = publishPrivateSpecRecord(manager, {kHASH_A, kHASH_B});
 
-    PublishedSpecRecord const second = publishPrivateSpecRecord(manager, kDRAFT_SIGNATURE, {kHASH_B});
+    PublishedSpecRecord const second = publishPrivateSpecRecord(manager, {kHASH_C});
     ASSERT_EQ(second.status, PublishStatus::kPublished);
     ASSERT_NE(second.id, first.id);
 
-    EXPECT_FALSE(manager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_A}).has_value());
-    EXPECT_FALSE(manager.draftIndex().lookupLongest(kDRAFT_SIGNATURE, kDOMAIN, {kHASH_A}, 1).has_value());
-    EXPECT_EQ(manager.baseIndex().lookup(BaseBlockKey{kDOMAIN, kHASH_B}), std::optional<PageId>{1});
-    EXPECT_EQ(manager.draftIndex().lookupLongest(kDRAFT_SIGNATURE, kDOMAIN, {kHASH_B}, 1),
+    EXPECT_FALSE(manager.baseIndex().lookup(kHASH_A).has_value());
+    EXPECT_FALSE(manager.baseIndex().lookup(kHASH_B).has_value());
+    EXPECT_FALSE(manager.draftIndex().lookupLongest({kHASH_A, kHASH_B}, 2).has_value());
+    EXPECT_EQ(manager.baseIndex().lookup(kHASH_C), std::optional<PageId>{2});
+    EXPECT_EQ(manager.draftIndex().lookupLongest({kHASH_C}, 1),
         (std::optional<DraftPathMatch>{DraftPathMatch{second.id, 1}}));
-    expectPoolState(manager, ResourceType::kBaseKvPage, {0, 0, 0}, {0, 1, 0}, 2);
-    expectPoolState(manager, ResourceType::kDraftKvPage, {0, 0, 0}, {0, 1, 0}, 2);
-
-    AcquireResult const stale = manager.acquire(stalePlan);
-    EXPECT_EQ(stale.status, AcquireStatus::kStalePlan);
-    EXPECT_FALSE(stale.lease.has_value());
-    expectPoolState(manager, ResourceType::kBaseKvPage, {0, 0, 0}, {0, 1, 0}, 2);
-    expectPoolState(manager, ResourceType::kDraftKvPage, {0, 0, 0}, {0, 1, 0}, 2);
-}
-
-TEST(ContextCacheManagerTests, SpecPlanValidationRejectsMissingOrBypassedReplay)
-{
-    ContextCacheManager manager(kPAGE_SIZE, ResourceDemand{4, 4, 0, 0}, 2);
-    PublishedSpecRecord const published = publishPrivateSpecRecord(manager, kDRAFT_SIGNATURE, {kHASH_A, kHASH_B});
-    ASSERT_EQ(published.status, PublishStatus::kPublished);
-
-    ReusePlan bypassedReplay = manager.planSpec(
-        SpecDecodeMode::kEAGLE, kDOMAIN, kDRAFT_SIGNATURE, {kHASH_A, kHASH_B}, 2 * kPAGE_SIZE + 1, true);
-    ASSERT_EQ(bypassedReplay.specReplayMode, SpecReplayMode::kOneToken);
-    bypassedReplay.baseCowSources.clear();
-    bypassedReplay.draftCowSources.clear();
-    bypassedReplay.specReplayMode = SpecReplayMode::kNone;
-    bypassedReplay.reuseTokenLength = 2 * kPAGE_SIZE;
-    bypassedReplay.demand = ResourceDemand{1, 1, 0, 0};
-    ASSERT_THROW((void) manager.acquire(bypassedReplay), std::runtime_error);
-
-    ReusePlan fullPage = manager.planSpec(
-        SpecDecodeMode::kEAGLE, kDOMAIN, kDRAFT_SIGNATURE, {kHASH_A, kHASH_B, kHASH_C}, 3 * kPAGE_SIZE, false);
-    ASSERT_TRUE(fullPage.specReplayDependency.has_value());
-    ReusePlan missingDependency = fullPage;
-    missingDependency.specReplayDependency.reset();
-    EXPECT_THROW((void) manager.acquire(missingDependency), std::runtime_error);
-
-    ReusePlan changedDependency = fullPage;
-    changedDependency.specReplayDependency->terminalHash = kHASH_D;
-    AcquireResult const staleDependency = manager.acquire(changedDependency);
-    EXPECT_EQ(staleDependency.status, AcquireStatus::kStalePlan);
-    EXPECT_FALSE(staleDependency.lease.has_value());
-
-    ReusePlan missingBindings = manager.planSpec(SpecDecodeMode::kEAGLE, kDOMAIN, kOTHER_DRAFT_SIGNATURE, {}, 1, true);
-    ASSERT_TRUE(missingBindings.basePageBindings.empty());
-    ASSERT_TRUE(missingBindings.draftPageBindings.empty());
-    missingBindings.baseCowSources = {0};
-    missingBindings.draftCowSources = {0};
-    missingBindings.specReplayMode = SpecReplayMode::kOneToken;
-    EXPECT_THROW((void) manager.acquire(missingBindings), std::runtime_error);
-
-    ReusePlan unknownMode = manager.planSpec(SpecDecodeMode::kEAGLE, kDOMAIN, kOTHER_DRAFT_SIGNATURE, {}, 1, true);
-    unknownMode.mode = static_cast<ReusePlanMode>(std::numeric_limits<uint8_t>::max());
-    EXPECT_THROW((void) manager.acquire(unknownMode), std::runtime_error);
-
-    ReusePlan unknownReplay = manager.planSpec(SpecDecodeMode::kEAGLE, kDOMAIN, kOTHER_DRAFT_SIGNATURE, {}, 1, true);
-    unknownReplay.specReplayMode = static_cast<SpecReplayMode>(std::numeric_limits<uint8_t>::max());
-    EXPECT_THROW((void) manager.acquire(unknownReplay), std::runtime_error);
-}
-
-TEST(ContextCacheManagerTests, PublicationRequiresModeAppropriateDraftBoundary)
-{
-    ContextCacheManager vanillaManager(kPAGE_SIZE, ResourceDemand{1, 0, 0, 0}, 1);
-    CacheRequestLease vanillaLease = acquirePrivatePages(vanillaManager, 1);
-    EXPECT_THROW((void) vanillaManager.publish(vanillaLease,
-                     PublishRequest{{kHASH_A}, kPAGE_SIZE, PublicationPoint::kPrefillEnd,
-                         CommitPolicy::kIncludingGeneratedTokens, kPAGE_SIZE}),
-        std::runtime_error);
-
-    ContextCacheManager specManager(kPAGE_SIZE, ResourceDemand{1, 1, 0, 0}, 1);
-    ReusePlan const specPlan
-        = specManager.planSpec(SpecDecodeMode::kEAGLE, kDOMAIN, kDRAFT_SIGNATURE, {kHASH_A}, kPAGE_SIZE, true);
-    AcquireResult specResult = specManager.acquire(specPlan);
-    CacheRequestLease specLease = takeLease(specResult);
-    EXPECT_THROW((void) specManager.publish(specLease,
-                     PublishRequest{{kHASH_A}, kPAGE_SIZE, PublicationPoint::kPrefillEnd,
-                         CommitPolicy::kIncludingGeneratedTokens}),
-        std::runtime_error);
-    EXPECT_THROW((void) specManager.publish(specLease,
-                     PublishRequest{{kHASH_A}, kPAGE_SIZE, PublicationPoint::kPrefillEnd,
-                         CommitPolicy::kIncludingGeneratedTokens, kPAGE_SIZE + 1}),
-        std::runtime_error);
+    expectPoolState(manager, ResourceType::kBaseKvPage, {0, 0, 0}, {0, 0, 1}, 2);
+    expectPoolState(manager, ResourceType::kDraftKvPage, {0, 0, 0}, {0, 0, 1}, 2);
 }

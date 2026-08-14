@@ -19,6 +19,7 @@ fallback for VLMs), runs ModelOpt quantization, and writes a unified safetensors
 checkpoint consumable by the checkpoint-based ``tensorrt_edgellm`` exporter.
 """
 
+import gc
 import json
 import os
 import shutil
@@ -100,6 +101,36 @@ def _is_phi4mm_model(model_dir: str) -> bool:
         return model_type in ("phi4mm", "phi4_multimodal")
     except (OSError, ValueError):
         return False
+
+
+def _pre_register_phi4mm_attention_for_kv_quant(
+        model: torch.nn.Module) -> None:
+    # ModelOpt's register_hf_attentions_on_the_fly short-circuits when ANY
+    # attention in the model uses the new ALL_ATTENTION_FUNCTIONS interface
+    # (SiglipAttention in the visual encoder), so Phi4MMAttention (text
+    # decoder, older-style trust_remote_code module) is never registered for
+    # KV-cache BMM quantization.  Pre-register it explicitly before mtq.quantize.
+    import logging
+
+    from modelopt.torch.quantization.conversion import QuantModuleRegistry
+    from modelopt.torch.quantization.plugins.attention import \
+        register_attention_for_kv_quant
+    logger = logging.getLogger(__name__)
+    registered: set[type] = set()
+    for _, module in model.named_modules():
+        attn_type = type(module)
+        # trust_remote_code classes are loaded under 'transformers_modules';
+        # match on __module__ so this survives class renames.
+        if (getattr(attn_type, "__module__",
+                    "").startswith("transformers_modules")
+                and hasattr(module, "k_proj") and attn_type not in registered
+                and QuantModuleRegistry.get(attn_type) is None):
+            register_attention_for_kv_quant(attn_type)
+            registered.add(attn_type)
+    if not registered:
+        logger.warning(
+            "_pre_register_phi4mm_attention_for_kv_quant: no trust_remote_code "
+            "attention modules found; KV-cache pre-registration skipped")
 
 
 def _copy_phi4mm_processor_files(model_dir: str, output_dir: str) -> None:
@@ -256,7 +287,10 @@ def _load_model(model_dir, dtype="fp16", device="cuda"):
                     model_dir,
                     torch_dtype=torch_dtype,
                     trust_remote_code=True,
+                    low_cpu_mem_usage=True,
                 ).to(device)
+                gc.collect(
+                )  # release safetensor mmap handles after GPU transfer
                 break
             except (ValueError, KeyError) as e:
                 last_err = e
@@ -490,6 +524,17 @@ def _fix_generation_config_for_strict_validate(model) -> None:
         gc.do_sample = True
 
 
+def _is_moe_model(model):
+    """Return True if the model has MoE (mixture-of-experts) layers."""
+    config = model.config
+    if hasattr(config, "text_config"):
+        config = config.text_config
+    if getattr(config, "num_experts", None) or getattr(
+            config, "num_local_experts", None):
+        return True
+    return any("experts" in n for n, _ in model.named_modules())
+
+
 def _is_hybrid_model(model):
     """Return True if the model has hybrid Mamba+Attention layers.
 
@@ -508,6 +553,39 @@ def _is_hybrid_model(model):
     return False
 
 
+def _share_gdn_qkvzba_scales(model) -> int:
+    """Unify per-tensor scales across the 4 GDN input projections.
+
+    Groups ``in_proj_qkv``/``z``/``b``/``a`` of every GDN mixer and runs
+    ModelOpt's :func:`preprocess_linear_fusion` on the group — the same
+    scale-unification ModelOpt export applies to fused layers (input and
+    weight amax each unified to the group max).  Identical per-tensor
+    scales are the precondition for the exporter to concatenate the four
+    projections into a single NVFP4 GEMM.  ModelOpt's own shared-input
+    detection cannot be used here: its dummy forward misgroups projections
+    on hybrid Mamba/GDN models (see ``_skip_resmooth_for_hybrid``), so the
+    groups are formed explicitly by module structure.  Returns the number
+    of mixers updated.
+    """
+    from modelopt.torch.export.quant_utils import preprocess_linear_fusion
+
+    shared = 0
+    for _, module in model.named_modules():
+        projs = [
+            getattr(module, n, None)
+            for n in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
+        ]
+        if any(p is None for p in projs):
+            continue
+        if not all(
+                getattr(getattr(p, "weight_quantizer", None), "is_enabled",
+                        False) for p in projs):
+            continue
+        preprocess_linear_fusion(projs)
+        shared += 1
+    return shared
+
+
 @contextmanager
 def _skip_resmooth_for_hybrid(model, quantization: str = ""):
     """WAR for ModelOpt resmoothing bugs on selected custom models.
@@ -520,6 +598,16 @@ def _skip_resmooth_for_hybrid(model, quantization: str = ""):
     incorrectly fused, corrupting the int4 weights.  For Phi-4 multimodal,
     the dummy forward is incompatible with the required ``input_mode``.
 
+    For dense INT4-AWQ models resmoothing is lossy: replacing each linear's
+    calibrated pre_quant_scale with the q/k/v (and gate/up) average and
+    re-quantizing the int4 weights against it deviates from the calibrated
+    model enough to collapse small-model accuracy (Qwen3-0.6B answers
+    English prompts in Chinese; ROUGE-1 0.09 vs 0.42 without resmoothing).
+    The exported checkpoint keeps each linear's own pre_quant_scale, which
+    the Edge-LLM export/runtime path fully supports.  MoE INT4-AWQ models
+    are exempt: expert weight stacking at export requires the shared scales
+    that resmoothing produces.
+
     NVFP4 is exempt: resmoothing works correctly for NVFP4 and is required
     to equalise per-tensor scales across GDN input projections that share
     the same input activation, enabling fusion into a single GEMM.
@@ -530,15 +618,18 @@ def _skip_resmooth_for_hybrid(model, quantization: str = ""):
     TODO: Remove once ModelOpt fixes these model paths upstream.
     """
     model_type = getattr(getattr(model, "config", None), "model_type", "")
+    quantization = quantization.lower()
     # NVFP4 on hybrid models: resmoothing is safe and required for GDN
     # input projection fusion — do NOT skip.
-    is_nvfp4 = quantization.lower() in ("nvfp4", "fp4")
+    is_nvfp4 = quantization in ("nvfp4", "fp4")
+    is_int4_awq = quantization == "int4_awq"
     # Multimodal wrappers have no top-level ``forward``; resmooth's dummy
     # ``model(fake_input)`` crashes on them. Resmooth is a no-op without
     # AWQ pre_quant_scales, so skipping is safe here.
     should_skip = ((_is_hybrid_model(model) and not is_nvfp4)
                    or model_type in ("phi4mm", "phi4_multimodal", "qwen3_omni",
-                                     "qwen3_omni_moe", "qwen3_omni_next"))
+                                     "qwen3_omni_moe", "qwen3_omni_next")
+                   or (is_int4_awq and not _is_moe_model(model)))
     if not should_skip:
         yield
         return
@@ -635,6 +726,7 @@ def quantize_and_export(
     image_dataset: Union[str, ImageDataset, None] = None,
     audio_dataset: Union[str, AudioDataset, None] = None,
     num_samples: int = 512,
+    fuse_gdn_qkvzba_scales: bool = False,
 ) -> str:
     """Load a HuggingFace model, quantize it, and export a unified checkpoint.
 
@@ -789,6 +881,7 @@ def quantize_and_export(
             visual_quantization=visual_quantization,
             audio_quantization=audio_quantization,
             cp_quantization=cp_quantization,
+            fuse_gdn_qkvzba_scales=fuse_gdn_qkvzba_scales,
         )
         # When INT4 is exported to the cuteDSL GEMM kernel's fragment layout, repack
         # requires N%64==0 && K%64==0. Small hybrid/GDN projections (e.g. Qwen3.5
@@ -801,12 +894,15 @@ def quantize_and_export(
                         module,
                         torch.nn.Linear) and (module.out_features % 64 != 0
                                               or module.in_features % 64 != 0):
-                    quant_cfg["quant_cfg"][f"*{name}.weight_quantizer"] = {
-                        "enable": False
-                    }
+                    quant_cfg["quant_cfg"].append({
+                        "quantizer_name": f"*{name}.weight_quantizer",
+                        "enable": False,
+                    })
                     print(
                         f"[int4] skipping {name}: weight [{module.out_features}, "
                         f"{module.in_features}] not 64-aligned (kept fp16)")
+        if kv_cache_quantization is not None and _is_phi4mm_model(model_dir):
+            _pre_register_phi4mm_attention_for_kv_quant(model)
         if cp_quantization is not None and is_qwen3_next_omni(model):
             # Qwen3-Omni Next (dense + MoE share the class): the Talker fires
             # the CP inside its own generate loop, so calibration drives the
@@ -916,6 +1012,9 @@ def quantize_and_export(
             mtq.quantize(model,
                          quant_cfg,
                          forward_loop=lambda m: _calibrate(m, loader))
+        if fuse_gdn_qkvzba_scales:
+            n_shared = _share_gdn_qkvzba_scales(model)
+            print(f"GDN qkvzba scale sharing: {n_shared} layer(s)")
         mtq.print_quant_summary(model)
 
     print(f"Quantization: {time.time() - t0:.1f}s")

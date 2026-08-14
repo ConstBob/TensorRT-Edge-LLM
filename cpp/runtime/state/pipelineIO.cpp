@@ -205,12 +205,9 @@ static void buildTensorMapImpl(TensorMap& map, PipelineIO& io, SharedResources& 
                 ? cfg.kvSharingDonors[localAttnIdx]
                 : -1;
 
-            // Plugin (combined KV): bind to donor's tensor if shared, else own tensor. Bind the
-            // pool-shaped view — the AttentionPlugin engine binding contract is the paged pool
-            // [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim], not the internal slot-shaped
-            // allocation (see KVCacheManager::getCombinedKVCachePoolView()).
-            auto& combinedKV = (donorIdx >= 0) ? kvMgr.getCombinedKVCachePoolView(donorIdx)
-                                               : kvMgr.getCombinedKVCachePoolView(localAttnIdx);
+            // Plugin (combined KV): bind to donor's pool if shared, else own pool.
+            auto& combinedKV
+                = (donorIdx >= 0) ? kvMgr.getCombinedKVCache(donorIdx) : kvMgr.getCombinedKVCache(localAttnIdx);
             map.set(binding_names::formatKVCacheName(localAttnIdx, /*isPast=*/true), combinedKV);
             map.set(binding_names::formatKVCacheName(localAttnIdx, /*isPast=*/false), combinedKV); // alias: in-place
             ++localAttnIdx;
@@ -230,8 +227,23 @@ static void buildTensorMapImpl(TensorMap& map, PipelineIO& io, SharedResources& 
             // so this branch wouldn't fire for it regardless.
             if (mambaMgr.hasIntermediateRecurrentStates())
             {
-                map.set(binding_names::formatIntermediateRecurrentStateName(localMambaIdx),
-                    mambaMgr.getIntermediateRecurrentState(localMambaIdx));
+                if (mambaMgr.recurrentUsesReplay())
+                {
+                    // Mamba: bind the three replay-stash outputs (dA/u/B). The accepted recurrent
+                    // state is reconstructed from these after verification.
+                    map.set(binding_names::formatReplayDaStateName(localMambaIdx),
+                        mambaMgr.getReplayDaState(localMambaIdx));
+                    map.set(
+                        binding_names::formatReplayUStateName(localMambaIdx), mambaMgr.getReplayUState(localMambaIdx));
+                    map.set(
+                        binding_names::formatReplayBStateName(localMambaIdx), mambaMgr.getReplayBState(localMambaIdx));
+                }
+                else
+                {
+                    // GDN/DDTree: bind the per-token full-state snapshot output.
+                    map.set(binding_names::formatIntermediateRecurrentStateName(localMambaIdx),
+                        mambaMgr.getIntermediateRecurrentState(localMambaIdx));
+                }
             }
             if (mambaMgr.hasIntermediateConvStates())
             {
@@ -253,8 +265,8 @@ static void buildTensorMapImpl(TensorMap& map, PipelineIO& io, SharedResources& 
     // per-step rebind.
     map.set(binding_names::kKVCacheStartIndex, cacheMgr.getKVCacheLengths());
 
-    // kv_page_table: static identity mapping (cross-request reuse is off), one table per cache
-    // manager, uploaded once at SharedResources construction — see SharedResources::kvPageTables.
+    // kv_page_table: one stable-address table per cache manager. It remains identity-mapped on the legacy path and is
+    // updated in place by the context-cache coordinator.
     map.set(binding_names::kKVPageTable, res.kvPageTables[kvCacheIndex]->kernelView());
 
     // Deepstack: initial bind is the shared zero buffer (sized large enough
@@ -393,7 +405,7 @@ void buildTensorMapForGemma4MTPDraft(
     map.set(binding_names::kKVPageTable, res.kvPageTables[0]->kernelView());
     for (auto const& entry : draftCfg.gemma4MTPKVSharingMap)
     {
-        rt::Tensor& targetKV = baseCacheManager.getCombinedKVCachePoolView(entry.targetAbsoluteLayerIdx);
+        rt::Tensor& targetKV = baseCacheManager.getCombinedKVCache(entry.targetAbsoluteLayerIdx);
         map.set(binding_names::formatKVCacheName(entry.assistantLayerIdx, /*isPast=*/true), targetKV);
     }
 }
@@ -486,11 +498,11 @@ PipelineIO PipelineIO::createForSpecDecode(
     io.outputLogits = rt::Tensor(
         {maxLogitsSize, maxVocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "PipelineIO::outputLogits");
 
-    // Allocate hidden states for SpecDecode. DFlash binds the draft target-hidden
-    // input directly to baseHiddenStates, so it does not need the generic
-    // EAGLE/MTP draft hidden-state ping-pong buffers.
+    // Allocate hidden states for SpecDecode. Cached block-draft modes bind the
+    // draft target-hidden input to compact base hidden states, so they do not
+    // need the generic EAGLE/MTP draft hidden-state ping-pong buffers.
     allocateSpecDecodeHiddenStates(io, maxRuntimeBatchSize, maxTensorSeqLen, baseOutputHiddenDim,
-        draftRuntimeHiddenSize, nvinfer1::DataType::kHALF, bundle.specDecodeMode() != SpecDecodeMode::kDFlash);
+        draftRuntimeHiddenSize, nvinfer1::DataType::kHALF, !isCachedBlockDraftMode(bundle.specDecodeMode()));
 
     if (hasDeepstackFeatures(bundle.base))
     {
@@ -537,7 +549,7 @@ PipelineIO PipelineIO::createForSpecDecode(
     CUDA_CHECK(cudaMemsetAsync(io.skipSoftmaxScale.rawPointer(), 0, io.skipSoftmaxScale.getMemoryCapacity(), stream));
 
     bool const useSpecTree
-        = (bundle.specDecodeMode() == SpecDecodeMode::kDFlash || bundle.specDecodeMode() == SpecDecodeMode::kMTP)
+        = (isCachedBlockDraftMode(bundle.specDecodeMode()) || bundle.specDecodeMode() == SpecDecodeMode::kMTP)
         && bundle.specConfig->draftingTopK > 1;
     if (useSpecTree)
     {

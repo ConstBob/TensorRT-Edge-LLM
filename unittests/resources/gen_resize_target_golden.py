@@ -76,7 +76,10 @@ def gen_qwen_3d():
     # Qwen3-VL-style config: factor = patchSize(16) * mergeSize(2) = 32, temporalPatchSize=2,
     # minImageTokens=4, maxImageTokensPerImage=6144 (HF default).
     factor, temporal_factor = 32, 2
-    min_pixels, max_pixels = 4 * factor * factor, 6144 * factor * factor
+    # Token bounds -> 3D pixel budget must carry the temporal factor:
+    # tokens = t_bar*h*w / (temporal_factor * factor^2), matching the C++.
+    min_pixels = 4 * temporal_factor * factor * factor
+    max_pixels = 6144 * temporal_factor * factor * factor
     cases = [
         (1, 64, 64),
         (2, 224, 224),

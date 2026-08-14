@@ -35,32 +35,28 @@ namespace rt
 
 //! Exact lookup identity for one published sequence-state checkpoint.
 //!
-//! The terminal chained hash plus full-block count identifies the logical endpoint inside one compatibility domain.
+//! The terminal chained hash plus full-block count identifies one logical endpoint in this runtime-local cache.
 struct CacheRecordKey
 {
-    CacheDomainId domain{};
     BlockHash terminalHash{};
     int32_t fullBlockCount{};
 };
 
 inline bool operator==(CacheRecordKey const& lhs, CacheRecordKey const& rhs) noexcept
 {
-    return lhs.domain == rhs.domain && lhs.terminalHash == rhs.terminalHash && lhs.fullBlockCount == rhs.fullBlockCount;
+    return lhs.terminalHash == rhs.terminalHash && lhs.fullBlockCount == rhs.fullBlockCount;
 }
 
 //! Exact identity of an atomic recurrent checkpoint.
 struct HybridCheckpointKey
 {
-    CacheDomainId domain{};
     BlockHash exactPrefixDigest{};
     int32_t exactLength{};
-    RecurrentStateSchemaId schema{};
 };
 
 inline bool operator==(HybridCheckpointKey const& lhs, HybridCheckpointKey const& rhs) noexcept
 {
-    return lhs.domain == rhs.domain && lhs.exactPrefixDigest == rhs.exactPrefixDigest
-        && lhs.exactLength == rhs.exactLength && lhs.schema == rhs.schema;
+    return lhs.exactPrefixDigest == rhs.exactPrefixDigest && lhs.exactLength == rhs.exactLength;
 }
 
 } // namespace rt
@@ -75,9 +71,7 @@ struct hash<trt_edgellm::rt::CacheRecordKey>
     size_t operator()(trt_edgellm::rt::CacheRecordKey const& key) const noexcept
     {
         constexpr size_t kHASH_COMBINE_CONSTANT = static_cast<size_t>(0x9E3779B97F4A7C15ULL);
-        size_t combined = hash<trt_edgellm::rt::Hash128>{}(key.domain);
-        size_t const terminalHash = hash<trt_edgellm::rt::Hash128>{}(key.terminalHash);
-        combined ^= terminalHash + kHASH_COMBINE_CONSTANT + (combined << 6U) + (combined >> 2U);
+        size_t combined = hash<trt_edgellm::rt::Hash128>{}(key.terminalHash);
         size_t const fullBlockCountHash = hash<int32_t>{}(key.fullBlockCount);
         combined ^= fullBlockCountHash + kHASH_COMBINE_CONSTANT + (combined << 6U) + (combined >> 2U);
         return combined;
@@ -90,12 +84,10 @@ struct hash<trt_edgellm::rt::HybridCheckpointKey>
     size_t operator()(trt_edgellm::rt::HybridCheckpointKey const& key) const noexcept
     {
         constexpr size_t kHASH_COMBINE_CONSTANT = static_cast<size_t>(0x9E3779B97F4A7C15ULL);
-        size_t combined = hash<trt_edgellm::rt::Hash128>{}(key.domain);
+        size_t combined = hash<trt_edgellm::rt::Hash128>{}(key.exactPrefixDigest);
         auto combine
             = [&](size_t value) { combined ^= value + kHASH_COMBINE_CONSTANT + (combined << 6U) + (combined >> 2U); };
-        combine(hash<trt_edgellm::rt::Hash128>{}(key.exactPrefixDigest));
         combine(hash<int32_t>{}(key.exactLength));
-        combine(hash<trt_edgellm::rt::Hash128>{}(key.schema));
         return combined;
     }
 };
@@ -109,25 +101,19 @@ namespace rt
 
 //! Complete reusable state retained at one publication endpoint.
 //!
-//! A record stores a full base path, at most one signature-bound draft path, and any recurrent or partial-page
-//! snapshots. The accepted draft path may end before the base path. ContextCacheManager gives each listed resource one
-//! cache reference, so evicting a branch releases only that record's ownership while shared ancestors remain resident
-//! through other records.
+//! A record stores a full base path, an optional equally long coherent draft path, and any recurrent or partial-page
+//! snapshots. ContextCacheManager gives each listed resource one cache reference, so evicting a branch releases only
+//! that record's ownership while shared ancestors remain resident through other records.
 struct CacheRecord
 {
     RecordId id{};
     CacheRecordKey key{};
     std::vector<BlockHash> logicalBlockHashes;
     std::vector<PageId> basePagePath;
-    std::optional<DraftEngineSignature> draftSignature;
     std::vector<PageId> draftPagePath;
     std::optional<int32_t> recurrentSnapshotSlot;
     std::optional<int32_t> partialKvSnapshotSlot;
-    int32_t baseFullBlockCount{};
-    int32_t pairedDraftFullBlockCount{};
     std::optional<int32_t> exactCheckpointLength;
-    std::optional<BlockHash> exactCheckpointDigest;
-    std::optional<RecurrentStateSchemaId> recurrentStateSchema;
 
     std::vector<ResourceId> resources() const;
     std::optional<HybridCheckpointKey> hybridKey() const;
@@ -159,13 +145,11 @@ public:
     std::optional<RecordId> find(CacheRecordKey const& key) const;
     std::optional<RecordId> findHybrid(HybridCheckpointKey const& key) const;
     //! Ready checkpoint lengths in descending order, excluding exact-input and longer endpoints.
-    std::vector<int32_t> hybridCandidateLengths(
-        CacheDomainId domain, RecurrentStateSchemaId schema, int32_t inputTokenCount) const;
+    std::vector<int32_t> hybridCandidateLengths(int32_t inputTokenCount) const;
     CacheRecord const& get(RecordId id) const;
     bool contains(RecordId id) const noexcept;
-    //! Replace the optional coherent draft state without changing base identity or record ownership.
-    void setDraftState(
-        RecordId id, DraftEngineSignature signature, std::vector<PageId> draftPagePath, int32_t pairedFullBlockCount);
+    //! Attach coherent draft state to a base-only record without changing base identity or record ownership.
+    void setDraftState(RecordId id, std::vector<PageId> draftPagePath);
     void touch(RecordId id);
     CacheRecord erase(RecordId id);
     std::vector<RecordId> lruToMru() const;

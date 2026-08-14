@@ -44,7 +44,7 @@ echo "Board hostname: $(hostname)"
 sudo_run docker version
 sudo_run docker build --network=host --shm-size=8g -f experimental/docker/Dockerfile -t "$EXPERIMENTAL_DOCKER_IMAGE" .
 sudo_run docker run --runtime nvidia --rm --network host --shm-size=8g "$EXPERIMENTAL_DOCKER_IMAGE" python3 -m experimental.server --help
-sudo_run docker run --runtime nvidia --rm --network host --shm-size=8g "$EXPERIMENTAL_DOCKER_IMAGE" python3 -c 'from experimental.server.engine import _import_runtime; print(_import_runtime().__name__)'
+sudo_run docker run --runtime nvidia --rm --network host --shm-size=8g "$EXPERIMENTAL_DOCKER_IMAGE" python3 -c 'from experimental.server.runtime.engine import _import_runtime; print(_import_runtime().__name__)'
 BOARD_SCRIPT
 }
 

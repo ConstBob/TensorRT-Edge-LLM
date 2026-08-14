@@ -29,18 +29,30 @@ def hidden_state_feedback(hidden_states,
     """Select the provider-defined hidden states consumed by a draft model."""
     if (allow_eagle3 and config.spec_decode_type == "eagle3"
             and len(all_hidden_states) >= 5):
-        indices = (1, len(all_hidden_states) // 2 - 1,
-                   len(all_hidden_states) - 5)
+        layer_ids = config.eagle3_target_layer_ids or (
+            2,
+            len(all_hidden_states) // 2,
+            len(all_hidden_states) - 4,
+        )
+        indices = tuple(index - 1 for index in layer_ids)
+        if any(index < 0 or index >= len(all_hidden_states)
+               for index in indices):
+            raise ValueError("EAGLE3 target-layer IDs are out of range")
         return F.concatenate(
             tuple(all_hidden_states[index] for index in indices), 2)
-    if config.spec_decode_type == "dflash":
-        indices = config.dflash_target_layer_ids or [1, 8, 15, 22, 29]
+    if config.spec_decode_type in ("dflash", "dspark"):
+        if config.spec_decode_type == "dspark":
+            indices = config.dspark_target_layer_ids
+            algorithm = "DSpark"
+        else:
+            indices = config.dflash_target_layer_ids or [1, 8, 15, 22, 29]
+            algorithm = "DFlash"
         selected = [
             all_hidden_states[index] for index in indices
             if index < len(all_hidden_states)
         ]
         if not selected:
-            raise ValueError("DFlash target layer IDs are out of range")
+            raise ValueError(f"{algorithm} target layer IDs are out of range")
         return F.concatenate(tuple(selected), 2)
     return hidden_states
 

@@ -30,13 +30,115 @@ function(edgellm_set_hidden_visibility target)
                                              VISIBILITY_INLINES_HIDDEN ON)
 endfunction()
 
-include(${CMAKE_SOURCE_DIR}/cmake/XQACubins.cmake)
-edgellm_xqa_cubins_setup()
+# ------------------------------------------------------------------------------
+# FMHA Cubin Conditional Compilation Exclude SM architectures that are not in
+# CMAKE_CUDA_ARCHITECTURES to reduce binary size. Only cubins for the target
+# architectures will be compiled.
+# ------------------------------------------------------------------------------
+set(FMHA_ALL_SM_VERSIONS
+    80
+    86
+    87
+    89
+    100
+    101
+    120
+    121)
+set(FMHA_EXCLUDE_DEFINITIONS "")
+
+# Build a list of required FMHA SM versions based on target architectures. Some
+# SM versions reuse cubins from other SM versions at runtime. Strip the
+# accelerated/virtual/real suffixes (e.g. 100a, 101a, 110a, 90-real) so the
+# IN_LIST checks below compare against plain numeric SM versions.
+set(REQUIRED_FMHA_SM_VERSIONS "")
+foreach(arch ${CMAKE_CUDA_ARCHITECTURES})
+  string(REGEX REPLACE "[^0-9].*$" "" arch_num "${arch}")
+  list(APPEND REQUIRED_FMHA_SM_VERSIONS ${arch_num})
+endforeach()
+list(REMOVE_DUPLICATES REQUIRED_FMHA_SM_VERSIONS)
+
+# SM 110 uses SM 101 FMHA cubins at runtime
+if(110 IN_LIST REQUIRED_FMHA_SM_VERSIONS AND NOT 101 IN_LIST
+                                             REQUIRED_FMHA_SM_VERSIONS)
+  list(APPEND REQUIRED_FMHA_SM_VERSIONS 101)
+endif()
+
+# Exclude SM versions that are not required
+foreach(SM_VER ${FMHA_ALL_SM_VERSIONS})
+  if(NOT SM_VER IN_LIST REQUIRED_FMHA_SM_VERSIONS)
+    list(APPEND FMHA_EXCLUDE_DEFINITIONS "EXCLUDE_SM_${SM_VER}")
+  endif()
+endforeach()
+
+if(FMHA_EXCLUDE_DEFINITIONS)
+  message(
+    STATUS
+      "FMHA Kernels: Excluding SM architectures: ${FMHA_EXCLUDE_DEFINITIONS}")
+else()
+  message(STATUS "FMHA Kernels: Compiling cubins for all SM architectures")
+endif()
+
+# Generate embedded XQA sources (kernel source + CUDA headers baked into a .cpp)
+# consumed by the NVRTC JIT in decoderXQAJitCompiler.cpp.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set(XQA_EMBEDDED_SOURCES_OUTPUT
+    "${CMAKE_BINARY_DIR}/generated/xqaEmbeddedSources.cpp")
+set(XQA_EMBED_SCRIPT "${CMAKE_SOURCE_DIR}/kernelSrcs/xqa/gen_cpp_header.py")
+file(GLOB XQA_SOURCE_FILES "${CMAKE_SOURCE_DIR}/kernelSrcs/xqa/*.cu"
+     "${CMAKE_SOURCE_DIR}/kernelSrcs/xqa/*.cuh"
+     "${CMAKE_SOURCE_DIR}/kernelSrcs/xqa/*.h")
+
+# The generated TU embeds CUDA toolkit headers verbatim, so it is stale after a
+# toolkit change even when no repo file moved. Depend on the headers themselves
+# and stamp the toolkit version into the rule.
+set(XQA_EMBEDDED_CUDA_HEADER_DEPS "")
+foreach(
+  _xqa_cuda_header
+  cuda_bf16.h
+  cuda_bf16.hpp
+  cuda_fp16.h
+  cuda_fp16.hpp
+  cuda_fp8.h
+  cuda_fp8.hpp
+  cuda_fp4.h
+  cuda_fp4.hpp
+  cuda_fp6.h
+  cuda_fp6.hpp)
+  if(EXISTS "${CUDA_RUNTIME_API_INCLUDE_DIR}/${_xqa_cuda_header}")
+    list(APPEND XQA_EMBEDDED_CUDA_HEADER_DEPS
+         "${CUDA_RUNTIME_API_INCLUDE_DIR}/${_xqa_cuda_header}")
+  endif()
+endforeach()
+
+add_custom_command(
+  OUTPUT ${XQA_EMBEDDED_SOURCES_OUTPUT}
+  COMMAND ${CMAKE_COMMAND} -E echo
+          "XQA embedded sources for CUDA ${CMAKE_CUDA_COMPILER_VERSION}"
+  COMMAND
+    ${Python3_EXECUTABLE} ${XQA_EMBED_SCRIPT} -o ${XQA_EMBEDDED_SOURCES_OUTPUT}
+    --xqa_dir ${CMAKE_SOURCE_DIR}/kernelSrcs/xqa --cpp_dir
+    ${CMAKE_SOURCE_DIR}/cpp --cuda_include_dir ${CUDA_RUNTIME_API_INCLUDE_DIR}
+  DEPENDS
+    ${XQA_SOURCE_FILES} ${XQA_EMBED_SCRIPT} ${XQA_EMBEDDED_CUDA_HEADER_DEPS}
+    "${CMAKE_SOURCE_DIR}/cpp/common/cudaMacros.h"
+    "${CMAKE_SOURCE_DIR}/cpp/kernels/decodeAttentionKernels/xqaKernelTypes.h"
+  COMMENT "Generating embedded XQA sources for NVRTC"
+  VERBATIM)
+
+# Funnel generation through a custom target rather than letting consumers depend
+# on the output file directly. The Makefile generator copies the generation rule
+# into the build.make of every target that lists the file as a source, so with
+# more than one consumer `make -j` runs the generator concurrently against the
+# same output. Only edgellmXqaJit consumes it today, so this is insurance
+# against the next consumer rather than a live fix.
+add_custom_target(generateXqaEmbeddedSources
+                  DEPENDS ${XQA_EMBEDDED_SOURCES_OUTPUT})
+set_source_files_properties(${XQA_EMBEDDED_SOURCES_OUTPUT} PROPERTIES GENERATED
+                                                                      TRUE)
 
 # Generate Core C++ static library for LLM-SDK
 file(GLOB_RECURSE COMMON_CPP_SRCS "common/*.cpp")
 file(GLOB_RECURSE KERNELS_CPP_SRCS "kernels/*.cpp")
-edgellm_xqa_add_generated_sources(KERNELS_CPP_SRCS)
 file(GLOB_RECURSE KERNELS_CU_SRCS "kernels/*.cu")
 # Exclude MoE Marlin ops/instantiations - compiled only via include from
 # moeMarlin.cu.
@@ -47,6 +149,16 @@ list(
   REGEX
   "marlin_moe_wna16/(ops|sm80_kernel_(float16_u4_float16|float16_fe2m1_float16|bfloat16_fe2m1_bfloat16))\\.cu$"
 )
+# The NVRTC JIT belongs to the plugin, not to the kernel/runtime libraries: it
+# runs only during engine build, and it is the sole reason the ~1.15 MiB of
+# embedded kernel source and the NVRTC dependency would otherwise land in every
+# executable that links edgellmCore. Keep it out of both archives and give it
+# its own target below.
+set(XQA_JIT_CPP_SRCS
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernels/decodeAttentionKernels/decoderXQAJitCompiler.cpp"
+)
+list(REMOVE_ITEM KERNELS_CPP_SRCS ${XQA_JIT_CPP_SRCS})
+
 file(GLOB_RECURSE SAMPLER_CPP_SRCS "sampler/*.cpp")
 file(GLOB_RECURSE SAMPLER_CU_SRCS "sampler/*.cu")
 file(GLOB_RECURSE MULTIMODAL_CPP_SRCS "multimodal/*.cpp")
@@ -59,10 +171,28 @@ file(GLOB_RECURSE MOE_MARLIN_CU_SRCS "kernels/moe/moe_marlin/*.cu")
 set_source_files_properties(${MOE_MARLIN_CU_SRCS} PROPERTIES COMPILE_FLAGS
                                                              "-rdc=true")
 
+# XQA NVRTC JIT: the embedded kernel source blob plus the NVRTC driver. Linked
+# only by NvInfer_edgellm_plugin (which JITs at TensorRTPhase::kBUILD) and by
+# unitTest (which JITs directly). decoderXQARunner needs only the XQAJitKey POD
+# and getXQAJitMTileSize from decoderXQAJitCompiler.h, both header-only, so the
+# kernel and runtime libraries carry no link dependency on this target.
+add_library(edgellmXqaJit STATIC ${XQA_JIT_CPP_SRCS}
+                                 ${XQA_EMBEDDED_SOURCES_OUTPUT})
+target_include_directories(edgellmXqaJit PRIVATE ${COMMON_INCLUDE_DIRS}
+                                                 ${NVRTC_INCLUDE_DIR})
+target_link_libraries(edgellmXqaJit PRIVATE ${NVRTC_LIB})
+add_dependencies(edgellmXqaJit generateXqaEmbeddedSources)
+edgellm_set_hidden_visibility(edgellmXqaJit)
+
 add_library(edgellmKernels STATIC ${KERNELS_CPP_SRCS} ${KERNELS_CU_SRCS}
                                   ${COMMON_CPP_SRCS})
 target_include_directories(edgellmKernels PRIVATE ${COMMON_INCLUDE_DIRS})
-edgellm_xqa_configure_target(edgellmKernels)
+if(ENABLE_CUTEDSL_MODULE_TEST_HOOK)
+  target_compile_definitions(edgellmKernels
+                             PRIVATE ENABLE_CUTEDSL_MODULE_TEST_HOOK)
+endif()
+# Apply FMHA SM exclusion definitions
+target_compile_definitions(edgellmKernels PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
 # Enable separable compilation for MoE Marlin kernel templates
 set_target_properties(edgellmKernels PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 edgellm_set_hidden_visibility(edgellmKernels)
@@ -83,8 +213,13 @@ add_library(
   ${PROFILER_CPP_SRCS}
   ${TOKENIZER_CPP_SRCS})
 target_include_directories(edgellmCore PRIVATE ${COMMON_INCLUDE_DIRS})
-edgellm_xqa_configure_target(edgellmCore)
+if(ENABLE_CUTEDSL_MODULE_TEST_HOOK)
+  target_compile_definitions(edgellmCore
+                             PRIVATE ENABLE_CUTEDSL_MODULE_TEST_HOOK)
+endif()
 target_link_libraries(edgellmCore PRIVATE dl)
+# Apply FMHA SM exclusion definitions
+target_compile_definitions(edgellmCore PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
 # Enable separable compilation for MoE Marlin kernel templates
 set_target_properties(edgellmCore PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 edgellm_set_hidden_visibility(edgellmCore)
@@ -106,7 +241,7 @@ set_target_properties(NvInfer_edgellm_plugin PROPERTIES LIBRARY_OUTPUT_DIRECTORY
 target_include_directories(NvInfer_edgellm_plugin
                            PRIVATE ${COMMON_INCLUDE_DIRS})
 target_link_libraries(
-  NvInfer_edgellm_plugin PRIVATE commonLibraryExt edgellmKernels
+  NvInfer_edgellm_plugin PRIVATE commonLibraryExt edgellmKernels edgellmXqaJit
                                  ${CUDA_DRIVER_LINK_LIB} ${CUDART_LIB})
 add_cross_build_link_options(NvInfer_edgellm_plugin)
 edgellm_set_hidden_visibility(NvInfer_edgellm_plugin)
@@ -117,7 +252,8 @@ target_link_options(NvInfer_edgellm_plugin PRIVATE "-Wl,--exclude-libs,ALL")
 # CuTe DSL unified kernels: link locally generated static library. Artifacts are
 # generated by: python kernelSrcs/build_cutedsl.py --gpu_arch <sm_NN>. Set
 # ENABLE_CUTE_DSL to enable one of:
-#   fmha             -- FMHA Blackwell attention
+#   fmha             -- Context/ViT FMHA, plus the optimized Blackwell
+#                       variants when the artifact has them
 #   gdn              -- gated delta net (Mamba2-style hybrid SSM)
 #   f16_moe          -- target-specific FP16 grouped MoE for Ampere,
 #                       Blackwell DC, and Blackwell GeForce
@@ -125,10 +261,8 @@ target_link_options(NvInfer_edgellm_plugin PRIVATE "-Wl,--exclude-libs,ALL")
 #                       SM110-only ``Nvfp4MoePlugin``
 #   nvfp4_fused_moe  -- SM12x (consumer Blackwell / Spark GB10) fused NVFP4
 #                       MoE; consumed by ``NvFP4MoEPluginGeforce``
-# or a semicolon-separated list (e.g. fmha;gdn), or ALL, or OFF. See the
-# top-level CMakeLists.txt for the canonical option list.
+# or a semicolon-separated list (e.g. fmha;gdn), or ALL. fmha is always linked.
+# See the top-level CMakeLists.txt for the canonical option list.
 # cmake-format: on
-if(NOT ENABLE_CUTE_DSL STREQUAL "OFF")
-  include(${CMAKE_SOURCE_DIR}/cmake/CuteDsl.cmake)
-  cute_dsl_setup(LINK_TARGETS edgellmKernels edgellmCore NvInfer_edgellm_plugin)
-endif()
+include(${CMAKE_SOURCE_DIR}/cmake/CuteDsl.cmake)
+cute_dsl_setup(LINK_TARGETS edgellmKernels edgellmCore NvInfer_edgellm_plugin)

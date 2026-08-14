@@ -15,16 +15,10 @@
  * limitations under the License.
  */
 
-// Round-trip test for the [B, 2, maxPagesPerSeq] page-table-aware applyRopeWriteKV write path
-// (part of the paged-KV substrate).
-//
-// The page table carries K page ids in row [b*2+0] and the derived V page ids (K + numPages)
-// in row [b*2+1]. Both halves address the SAME flat pool buffer -- a single combined tensor of
-// shape [B, 2, Hkv, capPadded, D] happens to have exactly 2 * numPages * P * Hkv * D elements
-// (numPages = B * maxPagesPerSeq, P = 128), so it doubles as the flat page pool addressed as
-// [nPagesTotal, P, Hkv, D]:
-//     addr = pool + ((page * P + inPage) * Hkv + h) * D + d
-// A negative page-table entry (kUNUSED_PAGE_ENTRY) skips the write for that half.
+// Round-trip test for the [B, 2, maxPagesPerSeq] page-table-aware applyRopeWriteKV write path.
+// The K row carries page ids in [0, numPages); the V row carries their flattened ids offset by
+// numPages into the V plane of a [2, numPages, P, Hkv, D] pool. An unmapped or out-of-plane entry
+// skips that cache plane's write.
 
 #include <gtest/gtest.h>
 
@@ -53,11 +47,10 @@ int32_t padToPage(int32_t v)
     return ((v + kPageSize - 1) / kPageSize) * kPageSize;
 }
 
-// Flat element index into the combined [nPagesTotal, P, Hkv, D] pool for (page, inPage, h, d).
-int64_t pagedPoolIndex(int32_t const page, int32_t const inPage, int32_t const h, int32_t const d,
-    int32_t const numKVHeads, int32_t const headDim)
+int64_t pagedPoolIndex(int32_t const cachePlane, int32_t const page, int32_t const inPage, int32_t const h,
+    int32_t const d, int32_t const numPages, int32_t const numKVHeads, int32_t const headDim)
 {
-    return ((static_cast<int64_t>(page) * kPageSize + inPage) * numKVHeads + h) * headDim + d;
+    return (((static_cast<int64_t>(cachePlane) * numPages + page) * kPageSize + inPage) * numKVHeads + h) * headDim + d;
 }
 
 struct AttnParams
@@ -71,7 +64,7 @@ struct AttnParams
 enum class Variant
 {
     kSplitQKV, // launchApplyRopeWriteKVSplitQKV
-    kLegacy    // launchApplyRopeWriteKV (writeKInPlace=true)
+    kInPlace   // launchApplyRopeWriteKV (writeKInPlace=true)
 };
 
 enum class TableMode
@@ -152,10 +145,8 @@ void TestWriteKvPagedPrefill(int32_t const batchSize, AttnParams const& attnPara
     rt::Tensor kvCacheEndLensTensor(rt::Coords{batchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
     copyHostToDevice(kvCacheEndLensTensor, kvCacheEndLens);
 
-    // The combined tensor [B, 2, Hkv, capPadded, D] has exactly 2 * numPages * P * Hkv * D
-    // elements, so it doubles as the flat [nPagesTotal, P, Hkv, D] pool addressed by the page table.
     rt::Tensor kvPoolTensor(
-        rt::Coords{batchSize, 2, numKVHeads, capPadded, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+        rt::Coords{2, numPages, kPageSize, numKVHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
     int64_t const poolVolume = kvPoolTensor.getShape().volume();
     std::vector<half> zeros(static_cast<size_t>(poolVolume), __float2half(0.0f));
     copyHostToDevice(kvPoolTensor, zeros);
@@ -171,8 +162,7 @@ void TestWriteKvPagedPrefill(int32_t const batchSize, AttnParams const& attnPara
         std::reverse(kPageIds.begin(), kPageIds.end());
     }
 
-    // Page table [B, 2, maxPagesPerSeq]: row (b*2+0) carries K page ids, row (b*2+1) the derived V
-    // ids (K + numPages).
+    // Page table [B, 2, maxPagesPerSeq]: V ids are K ids offset by numPages.
     std::vector<int32_t> pageTableHost(static_cast<size_t>(batchSize) * 2 * maxPagesPerSeq);
     for (int32_t b = 0; b < batchSize; ++b)
     {
@@ -216,8 +206,10 @@ void TestWriteKvPagedPrefill(int32_t const batchSize, AttnParams const& attnPara
                 int32_t const refOffset = b * qSeqLen * numKVHeads * headDim + s * numKVHeads * headDim + h * headDim;
                 for (int32_t d = 0; d < headDim; ++d)
                 {
-                    int64_t const kIdx = pagedPoolIndex(kPage, inPage, h, d, numKVHeads, headDim);
-                    int64_t const vIdx = pagedPoolIndex(vPage, inPage, h, d, numKVHeads, headDim);
+                    int64_t const kIdx = pagedPoolIndex(
+                        /*cachePlane=*/0, kPage, inPage, h, d, numPages, numKVHeads, headDim);
+                    int64_t const vIdx = pagedPoolIndex(
+                        /*cachePlane=*/1, vPage - numPages, inPage, h, d, numPages, numKVHeads, headDim);
                     ASSERT_TRUE(isclose(poolOut[kIdx], kReference[refOffset + d], 1e-3, 4e-3))
                         << "K mismatch b=" << b << " s=" << s << " h=" << h << " d=" << d;
                     ASSERT_TRUE(isclose(poolOut[vIdx], vReference[refOffset + d], 1e-3, 4e-3))
@@ -238,16 +230,22 @@ TEST(WriteKvPaged, SplitQKVIdentitySpansPageBoundaryStaggeredStart)
         Variant::kSplitQKV, TableMode::kIdentity);
 }
 
-TEST(WriteKvPaged, LegacyIdentitySpansPageBoundaryStaggeredStart)
+TEST(WriteKvPaged, InPlaceIdentitySpansPageBoundaryStaggeredStart)
 {
     TestWriteKvPagedPrefill(2, {16, 4, 64, 64}, /*maxSeq=*/200, /*qSeqLen=*/6, /*kvCacheStart=*/{126, 50},
-        Variant::kLegacy, TableMode::kIdentity);
+        Variant::kInPlace, TableMode::kIdentity);
 }
 
-TEST(WriteKvPaged, LegacyScrambledTablePlacesWritesOnScrambledPages)
+TEST(WriteKvPaged, InPlaceScrambledTablePlacesWritesOnScrambledPages)
 {
     TestWriteKvPagedPrefill(2, {16, 4, 64, 64}, /*maxSeq=*/200, /*qSeqLen=*/6, /*kvCacheStart=*/{126, 50},
-        Variant::kLegacy, TableMode::kScrambled);
+        Variant::kInPlace, TableMode::kScrambled);
+}
+
+TEST(WriteKvPaged, SplitQKVScrambledTablePlacesWritesOnScrambledPages)
+{
+    TestWriteKvPagedPrefill(2, {16, 4, 64, 64}, /*maxSeq=*/200, /*qSeqLen=*/6, /*kvCacheStart=*/{126, 50},
+        Variant::kSplitQKV, TableMode::kScrambled);
 }
 
 TEST(WriteKvPaged, NegativeEntryInLiveRangeSkipsWrite)
@@ -311,13 +309,12 @@ TEST(WriteKvPaged, NegativeEntryInLiveRangeSkipsWrite)
     copyHostToDevice(kvCacheEndLensTensor, kvCacheEndLens);
 
     rt::Tensor kvPoolTensor(
-        rt::Coords{batchSize, 2, numKVHeads, capPadded, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+        rt::Coords{2, numPages, kPageSize, numKVHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
     int64_t const poolVolume = kvPoolTensor.getShape().volume();
     std::vector<half> canaryFill(static_cast<size_t>(poolVolume), kCanary);
     copyHostToDevice(kvPoolTensor, canaryFill);
 
-    // Page table [1, 2, 2]: page 0 is identity (K=0, V=0+numPages); page 1 is the sentinel in
-    // both halves.
+    // Page table [1, 2, 2]: page 0 is identity in both planes; page 1 is the sentinel in both halves.
     std::vector<int32_t> pageTableHost{0, rt::kUNUSED_PAGE_ENTRY, numPages, rt::kUNUSED_PAGE_ENTRY};
     rt::Tensor pageTableTensor(
         rt::Coords{batchSize, 2, maxPagesPerSeq}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
@@ -338,8 +335,10 @@ TEST(WriteKvPaged, NegativeEntryInLiveRangeSkipsWrite)
             int32_t const refOffset = s * numKVHeads * headDim + h * headDim;
             for (int32_t d = 0; d < headDim; ++d)
             {
-                int64_t const kIdx = pagedPoolIndex(/*page=*/0, s, h, d, numKVHeads, headDim);
-                int64_t const vIdx = pagedPoolIndex(numPages, s, h, d, numKVHeads, headDim);
+                int64_t const kIdx = pagedPoolIndex(
+                    /*cachePlane=*/0, /*page=*/0, s, h, d, numPages, numKVHeads, headDim);
+                int64_t const vIdx = pagedPoolIndex(
+                    /*cachePlane=*/1, /*page=*/0, s, h, d, numPages, numKVHeads, headDim);
                 ASSERT_TRUE(isclose(poolOut[kIdx], kReference[refOffset + d], 1e-3, 4e-3))
                     << "K mismatch s=" << s << " h=" << h << " d=" << d;
                 ASSERT_TRUE(isclose(poolOut[vIdx], vInput[refOffset + d], 1e-3, 4e-3))
@@ -348,16 +347,17 @@ TEST(WriteKvPaged, NegativeEntryInLiveRangeSkipsWrite)
         }
     }
 
-    // Page 1 (the sentinel page's physical slots: page ids 1 and numPages+1) must be untouched:
-    // the canary must survive since positions [128,200) all resolve to the -1 table entry.
+    // Page 1 must be untouched because positions [128,200) resolve to the -1 table entry.
     for (int32_t inPage = 0; inPage < kPageSize; ++inPage)
     {
         for (int32_t h = 0; h < numKVHeads; ++h)
         {
             for (int32_t d = 0; d < headDim; ++d)
             {
-                int64_t const kIdx = pagedPoolIndex(/*page=*/1, inPage, h, d, numKVHeads, headDim);
-                int64_t const vIdx = pagedPoolIndex(numPages + 1, inPage, h, d, numKVHeads, headDim);
+                int64_t const kIdx = pagedPoolIndex(
+                    /*cachePlane=*/0, /*page=*/1, inPage, h, d, numPages, numKVHeads, headDim);
+                int64_t const vIdx = pagedPoolIndex(
+                    /*cachePlane=*/1, /*page=*/1, inPage, h, d, numPages, numKVHeads, headDim);
                 ASSERT_TRUE(isclose(poolOut[kIdx], kCanary, 1e-6, 1e-6))
                     << "K canary clobbered inPage=" << inPage << " h=" << h << " d=" << d;
                 ASSERT_TRUE(isclose(poolOut[vIdx], kCanary, 1e-6, 1e-6))
@@ -422,7 +422,7 @@ TEST(WriteKvPaged, PaddingTokenWithNegativePageEntryIsSkipped)
     copyHostToDevice(tokenPosIdsTensor, tokenPosIds);
 
     rt::Tensor kvPoolTensor(
-        rt::Coords{batchSize, 2, numKVHeads, capPadded, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+        rt::Coords{2, numPages, kPageSize, numKVHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
     int64_t const poolVolume = kvPoolTensor.getShape().volume();
     std::vector<half> canaryFill(static_cast<size_t>(poolVolume), kCanary);
     copyHostToDevice(kvPoolTensor, canaryFill);
@@ -445,23 +445,19 @@ TEST(WriteKvPaged, PaddingTokenWithNegativePageEntryIsSkipped)
     {
         for (int32_t d = 0; d < headDim; ++d)
         {
-            int64_t const kIdx = pagedPoolIndex(/*page=*/1, /*inPage=*/0, h, d, numKVHeads, headDim);
-            int64_t const vIdx = pagedPoolIndex(numPages + 1, /*inPage=*/0, h, d, numKVHeads, headDim);
+            int64_t const kIdx = pagedPoolIndex(
+                /*cachePlane=*/0, /*page=*/1, /*inPage=*/0, h, d, numPages, numKVHeads, headDim);
+            int64_t const vIdx = pagedPoolIndex(
+                /*cachePlane=*/1, /*page=*/1, /*inPage=*/0, h, d, numPages, numKVHeads, headDim);
             EXPECT_TRUE(isclose(poolOut[kIdx], kCanary, 1e-6, 1e-6)) << "K canary clobbered h=" << h << " d=" << d;
             EXPECT_TRUE(isclose(poolOut[vIdx], kCanary, 1e-6, 1e-6)) << "V canary clobbered h=" << h << " d=" << d;
         }
     }
 }
 
-TEST(WriteKvPaged, RetentionPagesBeyondFloorKeepWriteAndGatherCorrect)
+TEST(WriteKvPaged, ExtraRetainedPagesKeepWriteAndGatherCorrect)
 {
-    // Robustness: the pool may be allocated with pages beyond the
-    // active-capacity floor (poolNumPages = floor + extra). Identity slots still occupy the FIRST
-    // floor pages of each half; the V-half of the (now larger) pool starts at poolNumPages, not at
-    // the floor -- exactly what KVPageTable::setIdentity()/deriveV() compute when constructed with
-    // the real (possibly-larger) numPages (see sharedResources.cpp::makeIdentityPageTable). This is
-    // a smoke test that a write followed by a gather (read back) round-trips correctly on such a
-    // pool: the write path is page-id-driven and must not assume poolNumPages == floor.
+    // Identity slots occupy the minimum active pages while the pool retains additional pages.
     cudaStream_t stream{nullptr};
 
     int32_t const batchSize = 1;
@@ -473,9 +469,9 @@ TEST(WriteKvPaged, RetentionPagesBeyondFloorKeepWriteAndGatherCorrect)
     int32_t const maxSeq = 128;
     int32_t const capPadded = padToPage(maxSeq);
     int32_t const maxPagesPerSeq = capPadded / kPageSize;
-    int32_t const floorPages = batchSize * maxPagesPerSeq;
-    int32_t const extraRetentionPages = 3;
-    int32_t const poolNumPages = floorPages + extraRetentionPages; // > floor
+    int32_t const minimumActivePages = batchSize * maxPagesPerSeq;
+    int32_t const extraRetainedPages = 3;
+    int32_t const poolNumPages = minimumActivePages + extraRetainedPages;
     ASSERT_EQ(maxPagesPerSeq, 1);
 
     float const ropeTheta = 10000.0f;
@@ -515,20 +511,14 @@ TEST(WriteKvPaged, RetentionPagesBeyondFloorKeepWriteAndGatherCorrect)
     rt::Tensor kvCacheEndLensTensor(rt::Coords{batchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
     copyHostToDevice(kvCacheEndLensTensor, kvCacheEndLens);
 
-    // Pool declared as [batchSize, 2, Hkv, poolNumPages*P, D] (launchApplyRopeWriteKV validates
-    // dims[0] == batchSize even in page-table mode) with exactly 2 * poolNumPages * P * Hkv * D
-    // elements -- poolNumPages pages per half, extraRetentionPages of which are unused tail pages
-    // beyond the identity-mapped floor (matches KVCacheManager::getCombinedKVCachePoolView() when
-    // Config::numPages > the floor).
-    rt::Tensor kvPoolTensor(rt::Coords{batchSize, 2, numKVHeads, poolNumPages * kPageSize, headDim},
-        rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    // The pool retains extra pages beyond the identity-mapped active pages.
+    rt::Tensor kvPoolTensor(
+        rt::Coords{2, poolNumPages, kPageSize, numKVHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
     int64_t const poolVolume = kvPoolTensor.getShape().volume();
     std::vector<half> canaryFill(static_cast<size_t>(poolVolume), kCanary);
     copyHostToDevice(kvPoolTensor, canaryFill);
 
-    // Identity page table, but V ids derived from poolNumPages (the real pool size), not floorPages
-    // -- exactly KVPageTable::deriveV(k, numPages=poolNumPages).
-    std::vector<int32_t> const pageTableHost{/*K=*/0, /*V=*/0 + poolNumPages};
+    std::vector<int32_t> const pageTableHost{/*K=*/0, /*V=*/poolNumPages};
     rt::Tensor pageTableTensor(
         rt::Coords{batchSize, 2, maxPagesPerSeq}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
     copyHostToDevice(pageTableTensor, pageTableHost);
@@ -538,8 +528,7 @@ TEST(WriteKvPaged, RetentionPagesBeyondFloorKeepWriteAndGatherCorrect)
         stream, /*writeKInPlace=*/true, pageTable, maxPagesPerSeq);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    // Gather (read back) and verify the write landed at page 0 (K) / page poolNumPages (V) -- NOT
-    // at page floorPages, which is where a floor-only V-offset formula would incorrectly place it.
+    // Verify the write landed at page 0 in both planes, not at an offset based only on active pages.
     auto const poolOut = copyDeviceToHost<half>(kvPoolTensor);
     for (int32_t s = 0; s < qSeqLen; ++s)
     {
@@ -548,8 +537,10 @@ TEST(WriteKvPaged, RetentionPagesBeyondFloorKeepWriteAndGatherCorrect)
             int32_t const refOffset = s * numKVHeads * headDim + h * headDim;
             for (int32_t d = 0; d < headDim; ++d)
             {
-                int64_t const kIdx = pagedPoolIndex(/*page=*/0, s, h, d, numKVHeads, headDim);
-                int64_t const vIdx = pagedPoolIndex(poolNumPages, s, h, d, numKVHeads, headDim);
+                int64_t const kIdx = pagedPoolIndex(
+                    /*cachePlane=*/0, /*page=*/0, s, h, d, poolNumPages, numKVHeads, headDim);
+                int64_t const vIdx = pagedPoolIndex(
+                    /*cachePlane=*/1, /*page=*/0, s, h, d, poolNumPages, numKVHeads, headDim);
                 ASSERT_TRUE(isclose(poolOut[kIdx], kReference[refOffset + d], 1e-3, 4e-3))
                     << "K mismatch s=" << s << " h=" << h << " d=" << d;
                 ASSERT_TRUE(isclose(poolOut[vIdx], vInput[refOffset + d], 1e-3, 4e-3))
@@ -558,9 +549,8 @@ TEST(WriteKvPaged, RetentionPagesBeyondFloorKeepWriteAndGatherCorrect)
         }
     }
 
-    // The unused retention pages (indices [floorPages, poolNumPages) in EACH half) must be
-    // untouched -- writes only ever target identity-mapped floor pages.
-    for (int32_t page = floorPages; page < poolNumPages; ++page)
+    // The extra retained pages [minimumActivePages, poolNumPages) are untouched by identity writes.
+    for (int32_t page = minimumActivePages; page < poolNumPages; ++page)
     {
         for (int32_t inPage = 0; inPage < kPageSize; ++inPage)
         {
@@ -568,12 +558,14 @@ TEST(WriteKvPaged, RetentionPagesBeyondFloorKeepWriteAndGatherCorrect)
             {
                 for (int32_t d = 0; d < headDim; ++d)
                 {
-                    int64_t const kIdx = pagedPoolIndex(page, inPage, h, d, numKVHeads, headDim);
-                    int64_t const vIdx = pagedPoolIndex(poolNumPages + page, inPage, h, d, numKVHeads, headDim);
+                    int64_t const kIdx = pagedPoolIndex(
+                        /*cachePlane=*/0, page, inPage, h, d, poolNumPages, numKVHeads, headDim);
+                    int64_t const vIdx = pagedPoolIndex(
+                        /*cachePlane=*/1, page, inPage, h, d, poolNumPages, numKVHeads, headDim);
                     EXPECT_TRUE(isclose(poolOut[kIdx], kCanary, 1e-6, 1e-6))
-                        << "K retention page clobbered page=" << page << " inPage=" << inPage;
+                        << "extra retained K page clobbered page=" << page << " inPage=" << inPage;
                     EXPECT_TRUE(isclose(poolOut[vIdx], kCanary, 1e-6, 1e-6))
-                        << "V retention page clobbered page=" << page << " inPage=" << inPage;
+                        << "extra retained V page clobbered page=" << page << " inPage=" << inPage;
                 }
             }
         }

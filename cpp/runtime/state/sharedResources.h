@@ -44,13 +44,9 @@ struct SharedResources
     //! unique_ptr because HybridCacheManager is move-only.
     std::vector<std::unique_ptr<HybridCacheManager>> cacheManagers;
 
-    //! One KVPageTable per cache manager, index-aligned with `cacheManagers`. Cross-request
-    //! reuse is off / fully static (the runtime always prepares the page table, identity when
-    //! reuse is off): every table is built with
-    //! `setIdentity()` and uploaded once here. Batch compaction (`HybridCacheManager::
-    //! compactBatch`) moves each survivor's KV row as a whole within its own slot's pool
-    //! region — row stays == slot — so the identity mapping never goes stale and is
-    //! intentionally never re-uploaded after this construction-time upload.
+    //! One KVPageTable per cache manager, index-aligned with `cacheManagers`. Each table starts as an uploaded identity
+    //! mapping. The legacy runtime keeps that mapping static and physically compacts slot rows; the context cache
+    //! instead updates and compacts logical page-table rows while leaving physical KV pages in place.
     std::vector<std::unique_ptr<KVPageTable>> kvPageTables;
 
     RopeCache ropePool;

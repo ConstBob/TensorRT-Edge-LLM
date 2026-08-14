@@ -17,6 +17,8 @@
 
 #include "runtime/exec/registryBuilder.h"
 #include "common/bindingNames.h"
+#include "common/checkMacros.h"
+#include "common/pagedKvTypes.h"
 #include "runtime/hybridCacheManager.h"
 #include "runtime/kvCacheManager.h"
 #include <algorithm>
@@ -71,6 +73,9 @@ LLMEngineConfig makeBasicLLMConfig()
     cfg.maxSupportedBatchSize = 4;
     cfg.maxSupportedInputLength = 2048;
     cfg.maxKVCacheCapacity = 4096;
+    int64_t const minimumActivePages = computeMinimumKvPoolPages(cfg.maxSupportedBatchSize, cfg.maxKVCacheCapacity);
+    ELLM_CHECK(minimumActivePages <= kMAX_KV_POOL_PAGES, "Test KV pool page count must fit int32.");
+    cfg.kvPoolPages = static_cast<int32_t>(minimumActivePages);
     populateHybridFieldsFromScalars(cfg);
     return cfg;
 }
@@ -188,6 +193,20 @@ TEST(RegistryBuilderTest, DiffusionBackboneUnifiedConditioningAddsInputs)
     EXPECT_EQ(nextFeedback->shape[0].symbol, &InferenceDims::batch);
     EXPECT_EQ(nextFeedback->shape[1].symbol, &InferenceDims::selectLen);
     EXPECT_EQ(nextFeedback->shape[2].value, cfg.hiddenSize);
+}
+
+TEST(RegistryBuilderTest, KVCacheBindingUsesEnginePoolPages)
+{
+    LLMEngineConfig cfg = makeBasicLLMConfig();
+    cfg.kvPoolPages += 7;
+
+    auto const specs = buildRegistryForLLM(cfg).allExpandedSpecs();
+    auto const it = std::find_if(
+        specs.begin(), specs.end(), [](TensorSpec const& spec) { return spec.name == "past_key_values_0"; });
+
+    ASSERT_NE(it, specs.end());
+    ASSERT_EQ(it->shape.size(), 5U);
+    EXPECT_EQ(it->shape[1].value, cfg.kvPoolPages);
 }
 
 TEST(RegistryBuilderTest, StandardLLMHasCorrectSpecAttributes)
@@ -565,6 +584,7 @@ TEST(RegistryBuilderTest, DraftEngineHasExpectedTensors)
     // (0 for initial-prefill sentinel, batch otherwise). Draft engine always
     // uses plugin attention so this applies unconditionally.
     EXPECT_TRUE(hasName(names, "kvcache_start_index"));
+    EXPECT_TRUE(hasName(names, "kv_page_table"));
     EXPECT_TRUE(hasName(names, "rope_rotary_cos_sin"));
     EXPECT_TRUE(hasName(names, "attention_mask"));
     EXPECT_TRUE(hasName(names, "attention_pos_id"));
@@ -579,8 +599,8 @@ TEST(RegistryBuilderTest, DraftEngineHasExpectedTensors)
     EXPECT_TRUE(hasName(names, "present_key_values_0"));
     EXPECT_TRUE(hasName(names, "present_key_values_3"));
 
-    // 11 core/output (incl. kvcache_start_index) + 8 KV = 19
-    EXPECT_EQ(names.size(), 19u);
+    // 12 core/output (incl. kvcache_start_index and kv_page_table) + 8 KV = 20
+    EXPECT_EQ(names.size(), 20u);
 }
 
 TEST(RegistryBuilderTest, DraftEngineSpecShapesAreCorrect)
@@ -641,6 +661,36 @@ TEST(RegistryBuilderTest, DraftEngineKVCacheUsesPluginPath)
     ASSERT_NE(kvIt, specs.end());
     EXPECT_EQ(kvIt->shape.size(), 5u);
     EXPECT_EQ(kvIt->shape[0].value, 2); // combined K+V dimension (leading, pool contract)
+}
+
+TEST(RegistryBuilderTest, DraftEngineKVPageTableRowsTrackActiveBatch)
+{
+    LLMEngineConfig cfg = makeBasicLLMConfig();
+    cfg.numAttentionLayers = 2;
+    cfg.numDecoderLayers = 2;
+    cfg.isSpecDecodeBase = true;
+
+    populateHybridFieldsFromScalars(cfg);
+    DeploymentConfig bundle;
+    bundle.draft = cfg;
+    SpecDecodeConfig specConfig{};
+    specConfig.baseOutputHiddenDim = 12288;
+    specConfig.draftHiddenSize = 2048;
+    bundle.specConfig = specConfig;
+    auto reg = buildRegistryForSpecDecodeDraft(bundle);
+    auto specs = reg.allExpandedSpecs();
+
+    auto ptIt = std::find_if(specs.begin(), specs.end(), [](TensorSpec const& s) { return s.name == "kv_page_table"; });
+    ASSERT_NE(ptIt, specs.end());
+    EXPECT_EQ(ptIt->io, TensorIO::kInput);
+    EXPECT_EQ(ptIt->dtype, nvinfer1::DataType::kINT32);
+    ASSERT_EQ(ptIt->shape.size(), 3u);
+    // AttentionPlugin rejects a page table whose row count differs from the packed QKV batch, so
+    // this dimension must stay symbolic. Without a spec here the executor falls back to the page
+    // table's own [maxBatchSize, ...] extent, which only matches when maxBatchSize is 1.
+    EXPECT_EQ(ptIt->shape[0].symbol, &InferenceDims::batch);
+    EXPECT_EQ(ptIt->shape[1].value, 2);
+    EXPECT_EQ(ptIt->shape[2].value, computeMaxPagesPerSeq(cfg.maxKVCacheCapacity));
 }
 
 // =====================================================================

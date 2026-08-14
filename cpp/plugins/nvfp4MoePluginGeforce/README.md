@@ -82,7 +82,7 @@ difference is purely the per-enqueue execution pattern:
 ## Files
 
 - [`nvfp4MoePluginGeforce.h`](nvfp4MoePluginGeforce.h) / [`nvfp4MoePluginGeforce.cpp`](nvfp4MoePluginGeforce.cpp) — the `IPluginV3` implementation.
-- [`../../kernels/moe/nvfp4_cutedsl/cuteDslNvfp4MoeRunner.{h,cpp}`](../../kernels/moe/nvfp4_cutedsl/) — the AOT-module owner: module load/unload, shape-check, workspace layout, and wrapper dispatch. The runner is allocation-free on the enqueue path; the plugin owns the per-instance identity expert-id table (via `IGpuAllocator` in `attachToContext`) and threads it in through `CuteDslNvfp4MoeParams::weightExpertIds` / `globalToLocalExpertIds`.
+- [`../../kernels/moe/nvfp4_cutedsl/cuteDslNvfp4MoeRunner.{h,cpp}`](../../kernels/moe/nvfp4_cutedsl/) — the AOT-module owner: per-variant lazy loading, shape checks, workspace layout, and wrapper dispatch. Loaded modules remain resident for process lifetime. The runner is allocation-free on the enqueue path; the plugin owns the per-instance identity expert-id table (via `IGpuAllocator` in `attachToContext`) and threads it in through `CuteDslNvfp4MoeParams::weightExpertIds` / `globalToLocalExpertIds`.
 - [`../../../kernelSrcs/nvfp4_fused_moe_cutedsl/README.md`](../../../kernelSrcs/nvfp4_fused_moe_cutedsl/README.md) — kernel variants, AOT build flow, and data-layout notes.
 
 ## ONNX input surface

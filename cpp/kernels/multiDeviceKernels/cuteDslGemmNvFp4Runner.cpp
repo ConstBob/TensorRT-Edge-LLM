@@ -32,6 +32,7 @@ namespace trt_edgellm
 namespace kernels
 {
 
+#ifdef CUTE_DSL_GEMM_NVFP4_ENABLED
 #ifdef CUTE_DSL_GEMM_BLACKWELL_NVFP4_FP16_TN64_ENABLED
 gemm_blackwell_nvfp4_fp16_tn64_Kernel_Module_t CuteDslGemmNvFp4Runner::sModFp16Tn64{};
 #endif
@@ -56,6 +57,7 @@ gemm_blackwell_nvfp4_ws_fp8_tn64_Kernel_Module_t CuteDslGemmNvFp4Runner::sModWsF
 #ifdef CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP8_TN128_ENABLED
 gemm_blackwell_nvfp4_ws_fp8_tn128_Kernel_Module_t CuteDslGemmNvFp4Runner::sModWsFp8Tn128{};
 #endif
+#endif // CUTE_DSL_GEMM_NVFP4_ENABLED
 std::mutex CuteDslGemmNvFp4Runner::sMutex{};
 bool CuteDslGemmNvFp4Runner::sLoaded = false;
 

@@ -89,7 +89,7 @@ flowchart LR
 | Talker/CodePredictor runtime, projection weights, nested generation loop, and
   RVQ code output.
 
-| `cpp/multimodal/code2WavRunner.{h,cpp}`
+| `cpp/multimodal/qwen3_omni/code2WavRunner.{h,cpp}`
 | Optional speech-code to waveform inference.
 |===
 

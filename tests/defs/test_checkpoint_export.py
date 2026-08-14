@@ -30,6 +30,8 @@ import pytest
 from conftest import EnvironmentConfig
 from pytest_helpers import run_command, timer_context
 
+from tensorrt_edgellm import config as edgellm_config
+
 from .config import (GEMMA4_MTP_ASSISTANT_MODELS_MAP, ModelType, TaskType,
                      TestConfig, infer_checkpoint_export_model_type,
                      strip_model_quant_suffixes)
@@ -52,6 +54,10 @@ _EXTW_FILE_BY_KIND = {
     "nvfp4_moe": "external_nvfp4_moe_weights.safetensors",
     "lm_head": "external_lm_head_weight.safetensors",
 }
+
+_DFLASH_TARGET_KV_UPDATE_OP = "DFlashTargetKVCacheUpdate"
+_DFLASH_TARGET_KV_UPDATE_INPUT_COUNT = 7
+_DFLASH_TARGET_KV_PAGE_TABLE_INPUT_INDEX = 6
 
 
 def _extw_cli_kinds(extw_token):
@@ -119,6 +125,58 @@ def _onnx_graph_input_names(onnx_path):
     return {value_info.name for value_info in model.graph.input}
 
 
+def _requires_ddtree_state_inputs(model_dir):
+    cfg = edgellm_config.ModelConfig.from_pretrained(
+        model_dir, lambda head_dim: 1.0 / (float(head_dim)**0.5))
+    return cfg.is_hybrid
+
+
+def _verify_tree_base_inputs(mode, onnx_path, model_dir):
+    input_names = _onnx_graph_input_names(onnx_path)
+    expected_attention_inputs = {"attention_pos_id", "attention_mask"}
+    missing = expected_attention_inputs - input_names
+    if missing:
+        pytest.fail(
+            f"{mode} tree-base ONNX missing inputs {sorted(missing)}: {onnx_path}"
+        )
+
+    if not _requires_ddtree_state_inputs(model_dir):
+        return
+
+    expected_state_inputs = {"tree_parent_ids", "tree_depths"}
+    missing = expected_state_inputs - input_names
+    if missing:
+        pytest.fail(
+            f"{mode} hybrid tree-base ONNX missing inputs {sorted(missing)}: {onnx_path}"
+        )
+
+
+def _assert_dflash_target_kv_update_contract(onnx_path):
+    import onnx
+
+    model = onnx.load(onnx_path, load_external_data=False)
+    nodes = [
+        node for node in model.graph.node
+        if node.op_type == _DFLASH_TARGET_KV_UPDATE_OP
+    ]
+    if not nodes:
+        pytest.fail(
+            f"{onnx_path} contains no {_DFLASH_TARGET_KV_UPDATE_OP} nodes")
+
+    for node in nodes:
+        if len(node.input) != _DFLASH_TARGET_KV_UPDATE_INPUT_COUNT:
+            pytest.fail(
+                f"{_DFLASH_TARGET_KV_UPDATE_OP} node {node.name!r} has "
+                f"{len(node.input)} inputs; expected "
+                f"{_DFLASH_TARGET_KV_UPDATE_INPUT_COUNT}")
+        page_table_input = node.input[_DFLASH_TARGET_KV_PAGE_TABLE_INPUT_INDEX]
+        if page_table_input != "kv_page_table":
+            pytest.fail(
+                f"{_DFLASH_TARGET_KV_UPDATE_OP} node {node.name!r} input "
+                f"{_DFLASH_TARGET_KV_PAGE_TABLE_INPUT_INDEX} must be "
+                f"'kv_page_table', got {page_table_input!r}")
+
+
 def test_checkpoint_export(test_param: str, test_logger,
                            env_config: EnvironmentConfig):
     """Export a pre-quantized model via tensorrt_edgellm.scripts.export."""
@@ -154,6 +212,9 @@ def test_checkpoint_export(test_param: str, test_logger,
         extw_kinds = _extw_cli_kinds(config.externalize_weights)
         if extw_kinds:
             export_cmd += ["--externalize-weights", *extw_kinds]
+
+        if config.int4_gemm_plugin_v1:
+            export_cmd += ["--int4-gemm-plugin-version", "1"]
 
         env_vars = {}
         if config.trt_native_attn:
@@ -479,17 +540,107 @@ def test_checkpoint_dflash_export(test_param: str, test_logger,
     if not os.path.exists(base_onnx):
         pytest.fail(f"DFlash base ONNX not found: {base_onnx}")
     if use_tree_base:
-        input_names = _onnx_graph_input_names(base_onnx)
-        expected_tree_inputs = {"tree_parent_ids", "tree_depths"}
-        missing = expected_tree_inputs - input_names
-        if missing:
-            pytest.fail(
-                f"DFlash tree-base ONNX missing inputs {sorted(missing)}: {base_onnx}"
-            )
+        _verify_tree_base_inputs("DFlash", base_onnx, base_torch_dir)
 
     draft_onnx = os.path.join(draft_onnx_dir, "model.onnx")
     if not os.path.exists(draft_onnx):
         pytest.fail(f"DFlash draft ONNX not found: {draft_onnx}")
+    _assert_dflash_target_kv_update_contract(draft_onnx)
+
+
+def test_checkpoint_jetspec_export(test_param: str, test_logger,
+                                   env_config: EnvironmentConfig):
+    """Export JetSpec base + draft models via tensorrt_edgellm.scripts.export."""
+
+    config = TestConfig.from_param_string(
+        test_param, infer_checkpoint_export_model_type(test_param),
+        TaskType.EXPORT, env_config)
+    export_env_vars = config.get_export_env_vars() or None
+
+    base_torch_dir = config.get_torch_model_dir()
+    if not os.path.exists(base_torch_dir):
+        raise FileNotFoundError(
+            f"Base model checkpoint not found: {base_torch_dir}")
+
+    draft_torch_dir = config.get_jetspec_draft_model_dir()
+    if not os.path.exists(draft_torch_dir):
+        raise FileNotFoundError(
+            f"JetSpec draft model checkpoint not found: {draft_torch_dir}")
+
+    config.model_name = strip_model_quant_suffixes(config.model_name)
+
+    llm_onnx_dir = config.get_llm_onnx_dir()
+    draft_onnx_dir = config.get_draft_onnx_dir()
+    os.makedirs(llm_onnx_dir, exist_ok=True)
+    os.makedirs(draft_onnx_dir, exist_ok=True)
+
+    tmp_base = tempfile.mkdtemp(prefix="jetspec_base_export_")
+    tmp_draft = tempfile.mkdtemp(prefix="jetspec_draft_export_")
+    use_tree_base = config.is_jetspec_tree
+    base_export_flag = "--jetspec-tree-base" if use_tree_base else "--jetspec-base"
+
+    try:
+        base_cmd = [
+            "python3",
+            "-m",
+            "tensorrt_edgellm.scripts.export",
+            base_torch_dir,
+            tmp_base,
+            base_export_flag,
+            "--jetspec-draft-dir",
+            draft_torch_dir,
+        ]
+        _run_checkpoint_export(
+            base_cmd,
+            1200,
+            test_logger,
+            f"Exporting JetSpec base {config.model_name} via the checkpoint exporter",
+            env_vars=export_env_vars)
+
+        base_llm_out = os.path.join(tmp_base, "llm")
+        if not os.path.isdir(base_llm_out):
+            pytest.fail(
+                f"JetSpec base export did not produce llm/ in {tmp_base}")
+        shutil.copytree(base_llm_out, llm_onnx_dir, dirs_exist_ok=True)
+
+        draft_cmd = [
+            "python3",
+            "-m",
+            "tensorrt_edgellm.scripts.export",
+            base_torch_dir,
+            tmp_draft,
+            "--jetspec-draft",
+            "--jetspec-draft-dir",
+            draft_torch_dir,
+        ]
+        _run_checkpoint_export(
+            draft_cmd,
+            1200,
+            test_logger,
+            f"Exporting JetSpec draft {config.draft_model_id} via the checkpoint exporter",
+            env_vars=export_env_vars)
+
+        draft_output = os.path.join(tmp_draft, "jetspec_draft")
+        if not os.path.isdir(draft_output):
+            pytest.fail(
+                f"JetSpec draft export did not produce jetspec_draft/ in {tmp_draft}"
+            )
+        shutil.copytree(draft_output, draft_onnx_dir, dirs_exist_ok=True)
+
+    finally:
+        shutil.rmtree(tmp_base, ignore_errors=True)
+        shutil.rmtree(tmp_draft, ignore_errors=True)
+
+    base_onnx = os.path.join(llm_onnx_dir, "model.onnx")
+    if not os.path.exists(base_onnx):
+        pytest.fail(f"JetSpec base ONNX not found: {base_onnx}")
+    if use_tree_base:
+        _verify_tree_base_inputs("JetSpec", base_onnx, base_torch_dir)
+
+    draft_onnx = os.path.join(draft_onnx_dir, "model.onnx")
+    if not os.path.exists(draft_onnx):
+        pytest.fail(f"JetSpec draft ONNX not found: {draft_onnx}")
+    _assert_dflash_target_kv_update_contract(draft_onnx)
 
 
 def test_checkpoint_dspark_export(test_param: str, test_logger,
@@ -577,6 +728,7 @@ def test_checkpoint_dspark_export(test_param: str, test_logger,
     draft_onnx = os.path.join(draft_onnx_dir, "model.onnx")
     if not os.path.exists(draft_onnx):
         pytest.fail(f"DSpark draft ONNX not found: {draft_onnx}")
+    _assert_dflash_target_kv_update_contract(draft_onnx)
 
     heads_path = os.path.join(draft_onnx_dir, "dspark_heads.safetensors")
     if not os.path.exists(heads_path):

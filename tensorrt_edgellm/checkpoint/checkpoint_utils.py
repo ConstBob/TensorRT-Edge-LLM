@@ -48,6 +48,8 @@ RUNTIME_TOKENIZER_FILENAMES: Tuple[str, ...] = (
     "tokenizer.model",
     "special_tokens_map.json",
     "processed_chat_template.json",
+    "chat_template.jinja",
+    "chat_template.json",
 )
 
 
@@ -312,6 +314,8 @@ def _determine_spec_decode_type(config) -> str:
         return "eagle3"
     if config.is_dflash_draft or config.dflash_base:
         return "dflash"
+    if config.is_jetspec_draft or config.jetspec_base:
+        return "jetspec"
     if config.is_dspark_draft or config.dspark_base:
         return "dspark"
     if config.is_mtp_draft or config.mtp_base:
@@ -322,11 +326,12 @@ def _determine_spec_decode_type(config) -> str:
 def _determine_engine_role(config) -> str:
     """Return the engine role within the speculative decoding deployment."""
     if (config.is_eagle3_draft or config.is_dflash_draft
-            or config.is_dspark_draft or config.is_mtp_draft
-            or config.gemma4_mtp_draft):
+            or config.is_jetspec_draft or config.is_dspark_draft
+            or config.is_mtp_draft or config.gemma4_mtp_draft):
         return "draft"
-    if (config.eagle_base or config.dflash_base or config.dspark_base
-            or config.mtp_base or config.gemma4_mtp_base):
+    if (config.eagle_base or config.dflash_base or config.jetspec_base
+            or config.dspark_base or config.mtp_base
+            or config.gemma4_mtp_base):
         return "base"
     return "llm"
 
@@ -385,9 +390,10 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
         "use_vision_bidirectional_attention":
         bool(config.use_vision_bidirectional_attention
              and not (config.eagle_base or config.dflash_base
-                      or config.dspark_base or config.mtp_base
-                      or config.gemma4_mtp_base or config.is_eagle3_draft
-                      or config.is_dflash_draft or config.is_dspark_draft
+                      or config.jetspec_base or config.dspark_base
+                      or config.mtp_base or config.gemma4_mtp_base
+                      or config.is_eagle3_draft or config.is_dflash_draft
+                      or config.is_jetspec_draft or config.is_dspark_draft
                       or config.is_mtp_draft or config.gemma4_mtp_draft)),
         "rms_norm_eps":
         float(config.rms_norm_eps),
@@ -537,6 +543,10 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
             mc.head_dim,
             "recurrent_state_size":
             mc.ssm_state_size,
+            "recurrent_state_num_groups":
+            mc.n_groups,
+            "recurrent_spec_verify_mode":
+            "replay",
             "conv_dim":
             mc.conv_dim,
             "conv_kernel":
@@ -554,15 +564,22 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
             "recurrent_state_num_heads": gc.num_value_heads,
             "recurrent_state_head_dim": gc.key_head_dim,
             "recurrent_state_size": gc.value_head_dim,
+            "recurrent_spec_verify_mode": "snapshot",
             "conv_dim": gc.conv_dim,
             "conv_kernel": gc.conv_kernel,
             "use_rope": config.num_attn_layers > 0,
         })
 
+    if (not config.is_hybrid
+            and config.num_attn_layers != config.num_hidden_layers):
+        out["num_attention_layers"] = config.num_attn_layers
+
     # Emit canonical per-layer config consumed by the C++ HybridCacheManager.
     # Only attention and linear-attention layers carry KV/recurrent state and
-    # must appear in the per-layer routing table. MLP layers are skipped.
-    if config.is_hybrid and config.layer_types:
+    # must appear in the per-layer routing table. MLP/MoE layers are skipped.
+    _emit_kv_table = config.layer_types and (
+        config.is_hybrid or config.num_attn_layers != config.num_hidden_layers)
+    if _emit_kv_table:
         from ..config import (_VALID_ATTENTION_LAYER_TYPES, LAYER_ATTN,
                               LAYER_GDN, LAYER_MAMBA)
 
@@ -701,6 +718,30 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
                 "target_layer_ids": list(config.dflash_target_layer_ids),
                 "block_size": config.dflash_block_size,
                 "mask_token_id": config.dflash_mask_token_id,
+            },
+        })
+
+    if config.is_jetspec_draft:
+        out.update({
+            "draft_vocab_size":
+            config.vocab_size,
+            "base_model_hidden_size":
+            len(config.jetspec_target_layer_ids) * config.hidden_size,
+            "jetspec_config": {
+                "target_layer_ids": list(config.jetspec_target_layer_ids),
+                "block_size": config.jetspec_block_size,
+                "mask_token_id": config.jetspec_mask_token_id,
+                "causal_head": bool(config.jetspec_causal_head),
+            },
+        })
+
+    if config.jetspec_base:
+        out.update({
+            "jetspec_config": {
+                "target_layer_ids": list(config.jetspec_target_layer_ids),
+                "block_size": config.jetspec_block_size,
+                "mask_token_id": config.jetspec_mask_token_id,
+                "causal_head": bool(config.jetspec_causal_head),
             },
         })
 

@@ -26,9 +26,10 @@ _PREFIXES = {
 def checkpoint_dir(model_dir: str, component: str) -> str:
     """Select the speech-tokenizer checkpoint for Code2Wav."""
     speech_tokenizer = os.path.join(model_dir, "speech_tokenizer")
-    if (component == "code2wav" and os.path.isdir(speech_tokenizer) and any(
-            name.endswith(".safetensors")
-            for name in os.listdir(speech_tokenizer))):
+    if (component in ("code2wav", "speech-tokenizer-encoder")
+            and os.path.isdir(speech_tokenizer) and any(
+                name.endswith(".safetensors")
+                for name in os.listdir(speech_tokenizer))):
         return speech_tokenizer
     return model_dir
 

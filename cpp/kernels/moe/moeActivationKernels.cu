@@ -32,8 +32,6 @@ using format::fmtstr;
 
 // 128-bit aligned vector type for coalesced loads and stores of eight FP16 or BF16 elements.
 constexpr int32_t kElemPerVec = 8;
-constexpr int32_t kSwiGluActivationType = 2;
-constexpr int32_t kRelu2ActivationType = 4;
 constexpr int32_t kGatedInputMultiplier = 2;
 
 template <typename T>
@@ -69,6 +67,14 @@ struct ActivationMath<half>
         float const relu = inputFloat < 0.0F ? 0.0F : inputFloat;
         return __float2half_rn(relu * relu);
     }
+
+    static __device__ __forceinline__ half geGlu(half gate, half up)
+    {
+        float const gateFloat = __half2float(gate);
+        float const cdf
+            = 0.5F * (1.0F + tanhf(0.7978845608F * (gateFloat + 0.044715F * gateFloat * gateFloat * gateFloat)));
+        return __float2half(gateFloat * cdf * __half2float(up));
+    }
 };
 
 template <>
@@ -87,6 +93,15 @@ struct ActivationMath<__nv_bfloat16>
         float const inputFloat = __bfloat162float(input);
         float const relu = inputFloat < 0.0F ? 0.0F : inputFloat;
         return __float2bfloat16_rn(relu * relu);
+    }
+
+    static __device__ __forceinline__ __nv_bfloat16 geGlu(__nv_bfloat16 gate, __nv_bfloat16 up)
+    {
+        float const gateFloat = __bfloat162float(gate);
+        float const upFloat = __bfloat162float(up);
+        float const cdf
+            = 0.5F * (1.0F + tanhf(0.7978845608F * (gateFloat + 0.044715F * gateFloat * gateFloat * gateFloat)));
+        return __float2bfloat16_rn(gateFloat * cdf * upFloat);
     }
 };
 
@@ -157,6 +172,43 @@ __global__ void relu2Kernel(
     }
 }
 
+// ====================== GeGLU Kernel ======================
+
+template <typename T>
+__global__ void geGluKernel(
+    Vec8<T> const* __restrict__ input, Vec8<T>* __restrict__ output, int64_t numVecsPerRow, int64_t numTokens)
+{
+    int64_t const tokenIdx = blockIdx.x;
+    if (tokenIdx >= numTokens)
+    {
+        return;
+    }
+
+    int64_t const gateStart = tokenIdx * kGatedInputMultiplier * numVecsPerRow;
+    int64_t const upStart = gateStart + numVecsPerRow;
+    int64_t const outStart = tokenIdx * numVecsPerRow;
+
+    int64_t const tid = threadIdx.x;
+    int64_t const stride = blockDim.x;
+
+    for (int64_t i = tid; i < numVecsPerRow; i += stride)
+    {
+        Vec8<T> gateVec = input[gateStart + i];
+        Vec8<T> upVec = input[upStart + i];
+        Vec8<T> outVec;
+
+#pragma unroll
+        for (int32_t j = 0; j < kElemPerVec; j++)
+        {
+            outVec[j] = ActivationMath<T>::geGlu(gateVec[j], upVec[j]);
+        }
+
+        output[outStart + i] = outVec;
+    }
+}
+
+// ====================== Launch Helper ======================
+
 template <typename T>
 void launchMoeActivation(rt::Tensor const& input, rt::Tensor& output, int64_t numTokens, int64_t intermediateDim,
     int32_t activationType, char const* inputName, cudaStream_t stream)
@@ -174,13 +226,17 @@ void launchMoeActivation(rt::Tensor const& input, rt::Tensor& output, int64_t nu
     auto* outputVec = reinterpret_cast<VectorType*>(outputRawPtr);
     int64_t const blocks = numTokens;
     int32_t const threads = 1024;
-    if (activationType == kSwiGluActivationType)
+    if (activationType == MoeActivationType::kMoeSwiGlu)
     {
         swiGluKernel<T><<<blocks, threads, 0, stream>>>(inputVec, outputVec, numVecsPerRow, numTokens);
     }
-    else if (activationType == kRelu2ActivationType)
+    else if (activationType == MoeActivationType::kMoeRelu2)
     {
         relu2Kernel<T><<<blocks, threads, 0, stream>>>(inputVec, outputVec, numVecsPerRow, numTokens);
+    }
+    else if (activationType == MoeActivationType::kMoeGeGlu)
+    {
+        geGluKernel<T><<<blocks, threads, 0, stream>>>(inputVec, outputVec, numVecsPerRow, numTokens);
     }
 }
 
@@ -189,14 +245,16 @@ void launchMoeActivation(rt::Tensor const& input, rt::Tensor& output, int64_t nu
 void moeActivation(rt::Tensor const& input, rt::Tensor& output, int64_t numTokens, int64_t intermediateDim,
     int32_t activationType, cudaStream_t stream)
 {
-    check::check(activationType == kSwiGluActivationType || activationType == kRelu2ActivationType,
-        fmtstr("Unsupported MoE activation type %d; expected %d (SwiGLU) or %d (ReLU2)", activationType,
-            kSwiGluActivationType, kRelu2ActivationType));
+    check::check(activationType == MoeActivationType::kMoeSwiGlu || activationType == MoeActivationType::kMoeRelu2
+            || activationType == MoeActivationType::kMoeGeGlu,
+        fmtstr("Unsupported MoE activation type %d; expected %d (SwiGLU), %d (ReLU2), or %d (GeGLU)", activationType,
+            MoeActivationType::kMoeSwiGlu, MoeActivationType::kMoeRelu2, MoeActivationType::kMoeGeGlu));
 
+    bool const isGated
+        = (activationType == MoeActivationType::kMoeSwiGlu || activationType == MoeActivationType::kMoeGeGlu);
     auto const inputShape = input.getShape();
     auto const outputShape = output.getShape();
-    int64_t const expectedInputDim
-        = activationType == kSwiGluActivationType ? kGatedInputMultiplier * intermediateDim : intermediateDim;
+    int64_t const expectedInputDim = isGated ? kGatedInputMultiplier * intermediateDim : intermediateDim;
 
     check::check(inputShape.getNumDims() == 2, "input must be a 2D tensor");
     check::check(outputShape.getNumDims() == 2, "output must be a 2D tensor");
