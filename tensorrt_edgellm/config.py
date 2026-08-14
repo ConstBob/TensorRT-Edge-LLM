@@ -31,6 +31,7 @@ Supported quantization formats
     fp16   - plain bfloat16/float16 weights (no quantization)
     fp8    - FP8 E4M3 per-tensor static quantization
     nvfp4  - NVFP4 per-group quantization with FP8 group scales
+    nvfp4_a16 - weight-only NVFP4 (W4A16) for official unquantized lm_head
     int4_awq            - AWQ INT4 group quantization (column-packed int32 checkpoints)
     int4_awq_modelopt   - W4A16_AWQ pre-packed uint8 ``[out//2, in]`` checkpoints
     int4_gptq           - GPTQ INT4 group quantization
@@ -2232,8 +2233,65 @@ def _detect_modelopt_unquantized_linears(model_dir: str) -> List[str]:
     return _with_gdn_fused_exclusions(sorted(excluded))
 
 
+def _promote_official_nvfp4_lm_head_to_a16(model_dir: str, config: dict,
+                                           quant: QuantConfig) -> QuantConfig:
+    """Route an unquantized official ``lm_head`` to NVFP4 W4A16 Marlin.
+
+    Official ``*-NVFP4`` checkpoints leave ``lm_head`` in ``exclude_modules``
+    (or omit ``lm_head.weight_scale``), so :func:`module_quant_type` would
+    otherwise pick FP16. Issue 703 wants weight-only NVFP4 + FP16 activations
+    instead of the W4A4 ``--lm_head_quantization nvfp4`` recipe.
+
+    Tied embeddings stay FP16. Already-quantized or explicitly overridden
+    heads are left alone. ``K`` must be divisible by 64 so Marlin can run;
+    ``N`` is padded to 128 at repack time.
+    """
+    if os.environ.get("EDGELLM_KEEP_OFFICIAL_NVFP4_LM_HEAD", "").strip() in (
+            "1", "true", "TRUE", "yes", "YES"):
+        return quant
+    # Official *-NVFP4 may be plain NVFP4 or MIXED_PRECISION whose dominant
+    # type is NVFP4 / W4A16-NVFP4. Only rewrite heads that would otherwise
+    # stay FP16 (excluded, or mixed-precision with no override).
+    if quant.quant_type not in (QUANT_NVFP4, QUANT_NVFP4_A16):
+        return quant
+    existing = quant.layer_overrides.get("lm_head")
+    if existing in (QUANT_NVFP4, QUANT_NVFP4_A16, QUANT_FP8, QUANT_MXFP8,
+                    QUANT_INT4_AWQ, QUANT_INT4_AWQ_MODELOPT, QUANT_INT4_GPTQ,
+                    QUANT_INT8_SQ):
+        return quant
+    needs_promote = ("lm_head" in quant.excluded) or (
+        quant.is_mixed_precision and existing is None)
+    if not needs_promote:
+        return quant
+    if bool(config.get("tie_word_embeddings", False)):
+        return quant
+    hidden = int(config.get("hidden_size", 0) or 0)
+    if hidden == 0:
+        text = config.get("text_config") or {}
+        hidden = int(text.get("hidden_size", 0) or 0)
+    if hidden > 0 and hidden % 64 != 0:
+        return quant
+    excluded = [
+        name for name in quant.excluded
+        if name != "lm_head" and not name.endswith(".lm_head")
+    ]
+    overrides = dict(quant.layer_overrides)
+    overrides["lm_head"] = QUANT_NVFP4_A16
+    group_size = 16 if quant.group_size in (0, 1) else quant.group_size
+    return replace(quant,
+                   excluded=excluded,
+                   layer_overrides=overrides,
+                   group_size=group_size)
+
+
 def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
     """Determine quantisation config from hf_quant_config.json or config.json."""
+    return _promote_official_nvfp4_lm_head_to_a16(
+        model_dir, config, _parse_quant_from_checkpoint(model_dir, config))
+
+
+def _parse_quant_from_checkpoint(model_dir: str, config: dict) -> QuantConfig:
+    """Parse checkpoint quant metadata without the official-lm_head A16 policy."""
 
     # ---- Sidecar hf_quant_config.json ---------------------------------------
     hf_path = os.path.join(model_dir, "hf_quant_config.json")
