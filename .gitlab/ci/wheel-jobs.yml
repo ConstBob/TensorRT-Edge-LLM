@@ -82,7 +82,7 @@ wheel_assemble:
   stage: wheel-assemble
   extends: [.wheel_rules]
   tags: [cpu-k8s]
-  image: python:3.12-bookworm
+  image: $WHEEL_IMAGE_UBUNTU2404_CU13
   needs:
     - job: wheel_python_base
       artifacts: true
