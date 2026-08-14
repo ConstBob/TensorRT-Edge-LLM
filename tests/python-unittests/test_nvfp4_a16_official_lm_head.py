@@ -93,4 +93,5 @@ def test_repack_nvfp4_a16_gated_moe_shapes():
     assert tuple(fc1_s.shape) == (experts, hidden // 16, 2 * inter)
     assert tuple(fc1_g.shape) == (experts, )
     assert tuple(fc2_q.shape) == (experts, inter // 16, 8 * hidden)
+    assert tuple(fc2_s.shape) == (experts, inter // 16, hidden)
     assert tuple(fc2_g.shape) == (experts, )
