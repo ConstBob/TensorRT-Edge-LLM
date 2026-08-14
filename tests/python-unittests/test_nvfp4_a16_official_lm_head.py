@@ -47,7 +47,7 @@ def test_mixed_precision_w4a16_lm_head_is_nvfp4_a16():
 
 def test_parse_quant_keeps_excluded_fp16_lm_head():
     """Nemotron-style excluded FP16/BF16 heads stay excluded; no self-pack."""
-    quant = config._parse_quant_from_checkpoint(
+    quant = config._parse_quant(
         "/unused", {
             "quantization_config": {
                 "quant_algo": "NVFP4",
@@ -73,9 +73,9 @@ def _fake_nvfp4_a16(n, k, group_size=16):
 
 
 def test_repack_nvfp4_a16_gated_moe_shapes():
-    torch = pytest.importorskip("torch")
-    from tensorrt_edgellm.checkpoint.repacking import (
-        repack_nvfp4_a16_marlin_gated_moe_experts)
+    pytest.importorskip("torch")
+    from tensorrt_edgellm.checkpoint.repacking import \
+        repack_nvfp4_a16_marlin_gated_moe_experts
 
     hidden, inter, experts = 128, 128, 2
     gate = [_fake_nvfp4_a16(inter, hidden) for _ in range(experts)]

@@ -219,7 +219,6 @@ class Qwen3SparseMoeBlock(nn.Module):
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
         self.moe_intermediate_size = config.moe_intermediate_size
-        self._padded_moe_intermediate_size = self.moe_intermediate_size
         self.hidden_size = config.hidden_size
         self.group_size = config.quant.group_size
         self.zero_point_offset = config.quant.gptq_zero_point_offset
@@ -234,7 +233,7 @@ class Qwen3SparseMoeBlock(nn.Module):
             self.activation_type = _NVFP4_ACTIVATION_SWIGLU
         else:
             self.activation_type = _INT4_ACTIVATION_SILU
-        self._a16_moe_inter_padded = (
+        self._padded_moe_intermediate_size = (
             ((self.moe_intermediate_size + 127) // 128) *
             128 if self._use_nvfp4_a16_moe else self.moe_intermediate_size)
         # Plugin attributes consumed by ``Nvfp4MoePlugin``.
@@ -513,8 +512,8 @@ class Qwen3SparseMoeBlock(nn.Module):
 
     def _prepare_nvfp4_a16_moe_weights(self) -> None:
         """Stack routed-expert NVFP4 (W4A16) weights for ``Nvfp4A16MoePlugin``."""
-        from ...checkpoint.repacking import (
-            repack_nvfp4_a16_marlin_gated_moe_experts)
+        from ...checkpoint.repacking import \
+            repack_nvfp4_a16_marlin_gated_moe_experts
 
         self.gate_linear = nn.Linear(self.hidden_size,
                                      self.num_experts,
@@ -522,25 +521,29 @@ class Qwen3SparseMoeBlock(nn.Module):
                                      dtype=torch.float16)
         self.gate_linear.weight.data = self.gate.weight.data
 
-        def gather(attr):
-            return [getattr(e, attr)._buffers["weight"]
-                    for e in self.experts], [
-                        getattr(e, attr)._buffers["weight_scale"]
-                        for e in self.experts
-                    ], [
-                        getattr(e, attr)._buffers["weight_scale_2"]
-                        for e in self.experts
-                    ]
+        gate_p, gate_s, gate_g = [], [], []
+        up_p, up_s, up_g = [], [], []
+        down_p, down_s, down_g = [], [], []
+        for expert in self.experts:
+            gate = expert.gate_proj._buffers
+            gate_p.append(gate["weight"])
+            gate_s.append(gate["weight_scale"])
+            gate_g.append(gate["weight_scale_2"])
 
-        gate_p, gate_s, gate_g = gather("gate_proj")
-        up_p, up_s, up_g = gather("up_proj")
-        down_p, down_s, down_g = gather("down_proj")
+            up = expert.up_proj._buffers
+            up_p.append(up["weight"])
+            up_s.append(up["weight_scale"])
+            up_g.append(up["weight_scale_2"])
+
+            down = expert.down_proj._buffers
+            down_p.append(down["weight"])
+            down_s.append(down["weight_scale"])
+            down_g.append(down["weight_scale_2"])
         (fc1_qweights, fc1_block_scales, fc1_global, fc2_qweights,
-         fc2_block_scales, fc2_global) = (
-             repack_nvfp4_a16_marlin_gated_moe_experts(
-                 gate_p, gate_s, gate_g, up_p, up_s, up_g, down_p, down_s,
-                 down_g, self._a16_moe_inter_padded))
-        self._padded_moe_intermediate_size = self._a16_moe_inter_padded
+         fc2_block_scales,
+         fc2_global) = (repack_nvfp4_a16_marlin_gated_moe_experts(
+             gate_p, gate_s, gate_g, up_p, up_s, up_g, down_p, down_s, down_g,
+             self._padded_moe_intermediate_size))
 
         device = self.gate.weight.device
         self.register_buffer("fc1_qweights",
@@ -620,7 +623,7 @@ class Qwen3SparseMoeBlock(nn.Module):
                 self.num_experts,
                 self.top_k,
                 self.hidden_size,
-                self._a16_moe_inter_padded,
+                self._padded_moe_intermediate_size,
                 self.activation_type,
                 _NVFP4_MOE_N_GROUP_FLAT,
                 _NVFP4_MOE_TOPK_GROUP_FLAT,

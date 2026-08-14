@@ -460,7 +460,8 @@ def _repack_nvfp4_a16_marlin_linears(model: nn.Module) -> None:
         ws = module._buffers.get("weight_scale")
         wg = module._buffers.get("weight_scale_2")
         if wp is None:
-            logger.warning("NVFP4A16MarlinLinear missing weight; skipping repack")
+            logger.warning(
+                "NVFP4A16MarlinLinear missing weight; skipping repack")
             continue
         if wp.dtype in (torch.float16, torch.bfloat16, torch.float32):
             logger.warning(
@@ -1088,9 +1089,8 @@ def repack_nvfp4_a16_marlin_gated_moe_experts(
         q_up, s_up, g_up, _, n_up = repack_nvfp4_a16_marlin_linear(
             up_packed[e], up_scale[e], up_global[e], pad_n_to=128)
         if n_gate != moe_inter_padded or n_up != moe_inter_padded:
-            raise ValueError(
-                f"SwiGLU FC1 padded N gate={n_gate} up={n_up} != "
-                f"moe_inter_padded {moe_inter_padded}")
+            raise ValueError(f"SwiGLU FC1 padded N gate={n_gate} up={n_up} != "
+                             f"moe_inter_padded {moe_inter_padded}")
         if not torch.equal(g_gate.reshape(-1), g_up.reshape(-1)):
             raise ValueError(
                 "Nvfp4A16MoePlugin SwiGLU needs one FC1 global scale; "

@@ -691,9 +691,8 @@ def test_create_plugin_accepts_256_experts():
     creator = trt.get_plugin_registry().get_creator(_PLUGIN_NAME,
                                                     _PLUGIN_VERSION, "")
     assert creator is not None
-    plugin = creator.create_plugin(
-        _PLUGIN_NAME,
-        trt.PluginFieldCollection(
-            _plugin_fields(replace(_QWEN_CASE, num_experts=256))),
-        trt.TensorRTPhase.BUILD)
+    fields = _plugin_fields(replace(_QWEN_CASE, num_experts=256))
+    plugin = creator.create_plugin(_PLUGIN_NAME,
+                                   trt.PluginFieldCollection(fields),
+                                   trt.TensorRTPhase.BUILD)
     assert plugin is not None

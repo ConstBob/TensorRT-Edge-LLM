@@ -2241,12 +2241,6 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
     :data:`QUANT_NVFP4_A16`. Excluded FP16/BF16 heads stay FP16; export does
     not invent packed NVFP4 for them.
     """
-    return _parse_quant_from_checkpoint(model_dir, config)
-
-
-def _parse_quant_from_checkpoint(model_dir: str, config: dict) -> QuantConfig:
-    """Parse checkpoint quant metadata as stored (no in-export lm_head rewrite)."""
-
     # ---- Sidecar hf_quant_config.json ---------------------------------------
     hf_path = os.path.join(model_dir, "hf_quant_config.json")
     if os.path.exists(hf_path):
