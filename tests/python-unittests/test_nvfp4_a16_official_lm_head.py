@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Official *-NVFP4 lm_head promotion to NVFP4 W4A16 (issue 703)."""
+"""Checkpoint-provided NVFP4 W4A16 lm_head (issue 703 / Qwen3.6-style)."""
 
 import os
 import sys
@@ -27,101 +27,62 @@ if _REPO_ROOT not in sys.path:
 from tensorrt_edgellm import config
 
 
-def test_promote_official_nvfp4_lm_head():
-    quant = config.QuantConfig(quant_type=config.QUANT_NVFP4,
-                               group_size=16,
-                               excluded=["lm_head", "visual"])
-    promoted = config._promote_official_nvfp4_lm_head_to_a16(
-        "/unused", {
-            "hidden_size": 2048,
-            "vocab_size": 248320,
-            "tie_word_embeddings": False
-        }, quant)
-    assert "lm_head" not in promoted.excluded
-    assert "visual" in promoted.excluded
-    assert promoted.layer_overrides["lm_head"] == config.QUANT_NVFP4_A16
-
-
-def test_skip_tied_and_already_quantized_lm_head():
-    tied = config._promote_official_nvfp4_lm_head_to_a16(
-        "/unused", {
-            "hidden_size": 2048,
-            "tie_word_embeddings": True
+def test_mixed_precision_w4a16_lm_head_is_nvfp4_a16():
+    """Qwen3.6-35B-A3B-NVFP4 already lists lm_head as W4A16_NVFP4."""
+    dominant, group_size, overrides = config._parse_mixed_precision({
+        "layers.0.mlp.experts": {
+            "quant_algo": "W4A16_NVFP4",
+            "group_size": 16
         },
-        config.QuantConfig(quant_type=config.QUANT_NVFP4,
-                           excluded=["lm_head"]))
-    assert tied.layer_overrides.get("lm_head") is None
-    assert "lm_head" in tied.excluded
-
-    explicit = config._promote_official_nvfp4_lm_head_to_a16(
-        "/unused", {"hidden_size": 2048},
-        config.QuantConfig(quant_type=config.QUANT_NVFP4,
-                           excluded=["lm_head"],
-                           layer_overrides={"lm_head": config.QUANT_NVFP4}))
-    assert explicit.layer_overrides["lm_head"] == config.QUANT_NVFP4
+        "lm_head": {
+            "quant_algo": "W4A16_NVFP4",
+            "group_size": 16
+        },
+    })
+    assert dominant == config.QUANT_NVFP4_A16
+    assert group_size == 16
+    assert overrides["lm_head"] == config.QUANT_NVFP4_A16
+    assert overrides["layers.0.mlp.experts"] == config.QUANT_NVFP4_A16
 
 
-def test_promote_mixed_precision_unlisted_lm_head():
-    quant = config.QuantConfig(quant_type=config.QUANT_NVFP4_A16,
-                               group_size=16,
-                               is_mixed_precision=True,
-                               layer_overrides={"layers.0.mlp.experts":
-                                                config.QUANT_NVFP4_A16})
-    promoted = config._promote_official_nvfp4_lm_head_to_a16(
-        "/unused", {"hidden_size": 2048}, quant)
-    assert promoted.layer_overrides["lm_head"] == config.QUANT_NVFP4_A16
+def test_parse_quant_keeps_excluded_fp16_lm_head():
+    """Nemotron-style excluded FP16/BF16 heads stay excluded; no self-pack."""
+    quant = config._parse_quant_from_checkpoint(
+        "/unused", {
+            "quantization_config": {
+                "quant_algo": "NVFP4",
+                "group_size": 16,
+                "ignore": ["lm_head", "visual"],
+            }
+        })
+    assert "lm_head" in quant.excluded
+    assert quant.layer_overrides.get("lm_head") is None
 
 
-def test_keep_official_nvfp4_lm_head_env(monkeypatch):
-    monkeypatch.setenv("EDGELLM_KEEP_OFFICIAL_NVFP4_LM_HEAD", "1")
-    quant = config.QuantConfig(quant_type=config.QUANT_NVFP4,
-                               excluded=["lm_head"])
-    kept = config._promote_official_nvfp4_lm_head_to_a16(
-        "/unused", {"hidden_size": 2048}, quant)
-    assert "lm_head" in kept.excluded
-    assert kept.layer_overrides.get("lm_head") is None
+def test_parse_quant_does_not_invent_lm_head_override():
+    quant = config._parse_quant("/unused", {"hidden_size": 2048})
+    assert quant.layer_overrides.get("lm_head") is None
 
 
-def test_quantize_fp16_lm_head_roundtrip():
+def _fake_nvfp4_a16(n, k, group_size=16):
     torch = pytest.importorskip("torch")
-    numpy = pytest.importorskip("numpy")  # noqa: F841
-    from tensorrt_edgellm.checkpoint.repacking import (
-        decode_modelopt_nvfp4, quantize_fp16_to_modelopt_nvfp4)
-
-    torch.manual_seed(0)
-    weight = torch.randn(128, 64, dtype=torch.float16)
-    packed, scale, scale2 = quantize_fp16_to_modelopt_nvfp4(weight)
-    assert packed.shape == (128, 32)
-    assert scale.shape == (128, 4)
-    recovered = torch.from_numpy(
-        decode_modelopt_nvfp4(packed, scale, scale2, group_size=16))
-    # Group-16 E2M1 is coarse; check the reconstruction stays close.
-    rel = (recovered - weight.float()).abs() / weight.float().abs().clamp_min(
-        1e-3)
-    assert float(rel.median()) < 0.15
+    packed = torch.zeros(n, k // 2, dtype=torch.uint8)
+    scale = torch.ones(n, k // group_size, dtype=torch.float8_e4m3fn)
+    scale2 = torch.ones(1, dtype=torch.float32)
+    return packed, scale, scale2
 
 
 def test_repack_nvfp4_a16_gated_moe_shapes():
     torch = pytest.importorskip("torch")
     from tensorrt_edgellm.checkpoint.repacking import (
-        quantize_fp16_to_modelopt_nvfp4,
         repack_nvfp4_a16_marlin_gated_moe_experts)
 
-    torch.manual_seed(1)
     hidden, inter, experts = 128, 128, 2
-    gate, up, down = [], [], []
-    for _ in range(experts):
-        g = quantize_fp16_to_modelopt_nvfp4(
-            torch.randn(inter, hidden, dtype=torch.float16))
-        u = quantize_fp16_to_modelopt_nvfp4(
-            torch.randn(inter, hidden, dtype=torch.float16))
-        # Plugin takes one FC1 global; keep gate/up identical.
-        u = (u[0], u[1], g[2])
-        d = quantize_fp16_to_modelopt_nvfp4(
-            torch.randn(hidden, inter, dtype=torch.float16))
-        gate.append(g)
-        up.append(u)
-        down.append(d)
+    gate = [_fake_nvfp4_a16(inter, hidden) for _ in range(experts)]
+    up = [_fake_nvfp4_a16(inter, hidden) for _ in range(experts)]
+    # Plugin takes one FC1 global; keep gate/up identical.
+    up = [(u[0], u[1], g[2]) for u, g in zip(up, gate)]
+    down = [_fake_nvfp4_a16(hidden, inter) for _ in range(experts)]
     fc1_q, fc1_s, fc1_g, fc2_q, fc2_s, fc2_g = (
         repack_nvfp4_a16_marlin_gated_moe_experts(
             [t[0] for t in gate], [t[1] for t in gate], [t[2] for t in gate],

@@ -39,7 +39,6 @@ __all__ = [
     "repack_awq_to_plugin",
     "repack_gptq_to_plugin",
     "decode_modelopt_nvfp4",
-    "quantize_fp16_to_modelopt_nvfp4",
     "unpack_nvfp4_codes",
     "repack_nvfp4_a16_marlin_linear",
     "repack_nvfp4_a16_marlin_moe_experts",
@@ -464,9 +463,11 @@ def _repack_nvfp4_a16_marlin_linears(model: nn.Module) -> None:
             logger.warning("NVFP4A16MarlinLinear missing weight; skipping repack")
             continue
         if wp.dtype in (torch.float16, torch.bfloat16, torch.float32):
-            # Official *-NVFP4 checkpoints leave lm_head as dense FP16.
-            wp, ws, wg = quantize_fp16_to_modelopt_nvfp4(
-                wp, group_size=int(getattr(module, "group_size", 16) or 16))
+            logger.warning(
+                "NVFP4A16MarlinLinear has dense %s weight; refusing to "
+                "quantize in-export. Checkpoint must provide packed NVFP4 "
+                "(uint8 weight + e4m3 scales). Skipping repack.", wp.dtype)
+            continue
         if ws is None or wg is None:
             logger.warning("NVFP4A16MarlinLinear missing packed buffers; "
                            "skipping repack")
@@ -834,51 +835,6 @@ def pack_int4_awq_marlin(
 # the block E4M3 scale supplies the remaining 2^7.
 _NVFP4_MARLIN_GLOBAL_SCALE_EXP = 7
 _NVFP4_GROUP_SIZE = 16
-_FP4_E2M1_MAX = 6.0
-_FP8_E4M3_MAX = 448.0
-_FP4_E2M1_LEVELS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-
-
-def quantize_fp16_to_modelopt_nvfp4(
-    weight: torch.Tensor,
-    group_size: int = _NVFP4_GROUP_SIZE,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Quantize a dense FP16/BF16/FP32 linear to ModelOpt NVFP4 W4A16 buffers.
-
-    Official ``*-NVFP4`` checkpoints store ``lm_head.weight`` as ``[N, K]``
-    float16. The Marlin plugin needs packed E2M1 + FP8 block scales + a
-    per-tensor ``weight_scale_2`` multiplier (no activation quantizer).
-
-    Returns ``(weight_packed [N, K/2] uint8, weight_scale [N, K/16] e4m3,
-    weight_scale_2 [1] fp32)``.
-    """
-    if weight.ndim != 2:
-        raise ValueError(
-            f"NVFP4 A16 quantize expects [N, K], got {tuple(weight.shape)}")
-    n, k = weight.shape
-    if group_size <= 0 or k % group_size != 0:
-        raise ValueError(
-            f"K={k} must be divisible by NVFP4 group_size={group_size}")
-    w = weight.detach().to(torch.float32)
-    blocks = w.reshape(n, k // group_size, group_size)
-    block_amax = blocks.abs().amax(dim=-1).clamp_min(1e-12)
-    tensor_amax = w.abs().max().clamp_min(1e-12)
-    weight_scale_2 = (tensor_amax /
-                      (_FP4_E2M1_MAX * _FP8_E4M3_MAX)).clamp_min(1e-12)
-    scale_f32 = block_amax / _FP4_E2M1_MAX
-    weight_scale = (scale_f32 / weight_scale_2).to(torch.float8_e4m3fn)
-    # Reconstruct the dequant scale after e4m3 rounding so codes match decode.
-    scale_used = weight_scale.to(torch.float32) * weight_scale_2
-    normed = blocks / scale_used.unsqueeze(-1).clamp_min(1e-12)
-    levels = torch.tensor(_FP4_E2M1_LEVELS, dtype=torch.float32, device=w.device)
-    sign = (normed < 0).to(torch.uint8) * 8
-    mag_code = (normed.abs().unsqueeze(-1) - levels).abs().argmin(dim=-1).to(
-        torch.uint8)
-    nibbles = (sign | mag_code).reshape(n, k)
-    packed = (nibbles[:, 0::2] & 0x0F) | ((nibbles[:, 1::2] & 0x0F) << 4)
-    return packed.contiguous(), weight_scale.contiguous(), weight_scale_2.reshape(
-        1).to(torch.float32)
-
 
 
 def _nvfp4_marlin_e4m3_scale_perm() -> "torch.Tensor":

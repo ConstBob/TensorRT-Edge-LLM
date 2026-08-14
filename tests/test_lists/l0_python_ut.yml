@@ -117,11 +117,9 @@ tests:
   - tests/python-unittests/test_nvfp4_a16_gemm_plugin.py::test_dense_nvfp4_a16_gemm_decode_and_prefill
   - tests/python-unittests/test_nvfp4_a16_gemm_plugin.py::test_dense_nvfp4_a16_gemm_auto_max_m
   - tests/python-unittests/test_nvfp4_a16_gemm_plugin.py::test_build_rejects_misaligned_dimensions
-  - tests/python-unittests/test_nvfp4_a16_official_lm_head.py::test_promote_official_nvfp4_lm_head
-  - tests/python-unittests/test_nvfp4_a16_official_lm_head.py::test_skip_tied_and_already_quantized_lm_head
-  - tests/python-unittests/test_nvfp4_a16_official_lm_head.py::test_promote_mixed_precision_unlisted_lm_head
-  - tests/python-unittests/test_nvfp4_a16_official_lm_head.py::test_keep_official_nvfp4_lm_head_env
-  - tests/python-unittests/test_nvfp4_a16_official_lm_head.py::test_quantize_fp16_lm_head_roundtrip
+  - tests/python-unittests/test_nvfp4_a16_official_lm_head.py::test_mixed_precision_w4a16_lm_head_is_nvfp4_a16
+  - tests/python-unittests/test_nvfp4_a16_official_lm_head.py::test_parse_quant_keeps_excluded_fp16_lm_head
+  - tests/python-unittests/test_nvfp4_a16_official_lm_head.py::test_parse_quant_does_not_invent_lm_head_override
   - tests/python-unittests/test_nvfp4_a16_official_lm_head.py::test_repack_nvfp4_a16_gated_moe_shapes
 
   # FP16 MoE plugin tests (softmax + sigmoid-group-topk routing)
