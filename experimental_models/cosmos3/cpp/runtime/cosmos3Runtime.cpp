@@ -112,6 +112,9 @@ void Cosmos3Runtime::allocateUndBuffers(cudaStream_t stream)
     ELLM_CHECK(mMaxUndBatch > 0 && mMaxUndLen > 0, "und_prefill engine reports a non-positive profile maximum");
     int32_t const batch = mMaxUndBatch;
 
+    // Only the conditional K/V set is allocated here. The second (unconditional, empty-prompt) K/V set
+    // is allocated lazily by setGuidance -> allocateUncondBuffers, so the default guidance == 1 path does
+    // not double UND K/V memory with an always-on buffer it never uses.
     mUndK.reserve(static_cast<size_t>(mNumLayers));
     mUndV.reserve(static_cast<size_t>(mNumLayers));
     for (int32_t i = 0; i < mNumLayers; ++i)
@@ -133,22 +136,50 @@ void Cosmos3Runtime::allocateUndBuffers(cudaStream_t stream)
     mAttentionPosIdHost
         = rt::Tensor({batch, mMaxUndLen}, rt::DeviceType::kCPU, DataType::kINT32, "cosmos3::attnPosIdHost");
 
-    // Bind every constant address once; only inputs_embeds changes per request.
+    // Bind the shared constant addresses once; inputs_embeds and the und_k/und_v OUTPUT addresses (which
+    // target set to fill) are (re)bound per prefill call in prefillUnd.
     bool ok = true;
     ok &= mTextContext->setTensorAddress(trt_edgellm::binding_names::kRopeCosSin, mTextRopeCosSin.rawPointer());
     ok &= mTextContext->setTensorAddress(trt_edgellm::binding_names::kAttentionPosId, mAttentionPosId.rawPointer());
-    for (int32_t i = 0; i < mNumLayers; ++i)
-    {
-        ok &= mTextContext->setTensorAddress(
-            cosmos3::binding_names::formatUndKName(i).c_str(), mUndK[static_cast<size_t>(i)].rawPointer());
-        ok &= mTextContext->setTensorAddress(
-            cosmos3::binding_names::formatUndVName(i).c_str(), mUndV[static_cast<size_t>(i)].rawPointer());
-    }
     ok &= mTextContext->setTensorAddress("hidden_states", mUndHidden.rawPointer());
     ELLM_CHECK(ok, "Cosmos3Runtime failed to bind und_prefill tensor addresses");
 }
 
-void Cosmos3Runtime::prefillUnd(rt::Tensor const& inputsEmbeds, cudaStream_t stream)
+void Cosmos3Runtime::setGuidance(float guidance, float intervalLo, float intervalHi)
+{
+    mGuidance = guidance;
+    // Allocate the second UND K/V set only when CFG is actually enabled; the default guidance == 1 path
+    // must not carry a redundant always-on buffer (edge-target memory budget).
+    if (guidance != 1.0F)
+    {
+        allocateUncondBuffers();
+    }
+    mPolicyRunner->setGuidance(guidance, intervalLo, intervalHi);
+}
+
+void Cosmos3Runtime::allocateUncondBuffers()
+{
+    // Guard against re-allocation if setGuidance is called more than once with CFG enabled.
+    if (!mUndKUncond.empty())
+    {
+        return;
+    }
+    // Second K/V set for the CFG unconditional (empty-prompt) pass; written by a separate prefillUnd.
+    // Same profile-maximum extent and layout as the conditional set (mUndK/mUndV).
+    int32_t const batch = mMaxUndBatch;
+    mUndKUncond.reserve(static_cast<size_t>(mNumLayers));
+    mUndVUncond.reserve(static_cast<size_t>(mNumLayers));
+    for (int32_t i = 0; i < mNumLayers; ++i)
+    {
+        mUndKUncond.emplace_back(rt::Coords{batch, mMaxUndLen, mNumKVHeads, mHeadDim}, rt::DeviceType::kGPU,
+            DataType::kHALF, "cosmos3::undKUncond");
+        mUndVUncond.emplace_back(rt::Coords{batch, mMaxUndLen, mNumKVHeads, mHeadDim}, rt::DeviceType::kGPU,
+            DataType::kHALF, "cosmos3::undVUncond");
+    }
+}
+
+void Cosmos3Runtime::prefillUnd(
+    rt::Tensor const& inputsEmbeds, std::vector<rt::Tensor>& undK, std::vector<rt::Tensor>& undV, cudaStream_t stream)
 {
     NVTX_SCOPED_RANGE(undRange, "cosmos3::und_prefill");
 
@@ -182,16 +213,21 @@ void Cosmos3Runtime::prefillUnd(rt::Tensor const& inputsEmbeds, cudaStream_t str
         mRopeFilledLen = seqLen;
     }
 
-    // Metadata-only reshape of the preallocated K/V so downstream consumers see [B,S,H,D].
+    // Metadata-only reshape of the target K/V so downstream consumers see [B,S,H,D], and point the
+    // engine's und_k/und_v OUTPUT bindings at this call's target set (conditional vs unconditional).
+    bool ok = true;
     for (int32_t i = 0; i < mNumLayers; ++i)
     {
-        ELLM_CHECK(mUndK[static_cast<size_t>(i)].reshape(rt::Coords{batch, seqLen, mNumKVHeads, mHeadDim}),
+        ELLM_CHECK(undK[static_cast<size_t>(i)].reshape(rt::Coords{batch, seqLen, mNumKVHeads, mHeadDim}),
             "und_k reshape failed");
-        ELLM_CHECK(mUndV[static_cast<size_t>(i)].reshape(rt::Coords{batch, seqLen, mNumKVHeads, mHeadDim}),
+        ELLM_CHECK(undV[static_cast<size_t>(i)].reshape(rt::Coords{batch, seqLen, mNumKVHeads, mHeadDim}),
             "und_v reshape failed");
+        ok &= mTextContext->setTensorAddress(
+            cosmos3::binding_names::formatUndKName(i).c_str(), undK[static_cast<size_t>(i)].rawPointer());
+        ok &= mTextContext->setTensorAddress(
+            cosmos3::binding_names::formatUndVName(i).c_str(), undV[static_cast<size_t>(i)].rawPointer());
     }
 
-    bool ok = true;
     ok &= mTextContext->setInputShape(trt_edgellm::binding_names::kInputsEmbeds, Dims{3, {batch, seqLen, mHiddenSize}});
     ok &= mTextContext->setInputShape(trt_edgellm::binding_names::kRopeCosSin, Dims{3, {batch, seqLen, mHeadDim}});
     ok &= mTextContext->setInputShape(trt_edgellm::binding_names::kAttentionPosId, Dims{2, {batch, seqLen}});
@@ -210,11 +246,36 @@ void Cosmos3Runtime::prefillUnd(rt::Tensor const& inputsEmbeds, cudaStream_t str
 }
 
 std::vector<float> Cosmos3Runtime::generatePolicy(
-    rt::Tensor const& pixelValues, rt::Tensor const& inputsEmbeds, cudaStream_t stream)
+    rt::Tensor const& pixelValues, rt::Tensor const& inputsEmbeds, rt::Tensor const* uncondEmbeds, cudaStream_t stream)
 {
     rt::Tensor const& condLatent = mVaeRunner->encode(pixelValues, stream);
-    prefillUnd(inputsEmbeds, stream);
-    return mPolicyRunner->generate(condLatent, mUndK, mUndV, stream);
+    prefillUnd(inputsEmbeds, mUndK, mUndV, stream);
+
+    // Guidance-interval CFG: prefill the empty-prompt (unconditional) context into the second K/V set
+    // and hand both to the GEN loop. Without CFG the unconditional vectors are empty and generate()
+    // takes its single-forward path.
+    if (mGuidance != 1.0F && uncondEmbeds != nullptr)
+    {
+        prefillUnd(*uncondEmbeds, mUndKUncond, mUndVUncond, stream);
+        return mPolicyRunner->generate(condLatent, mUndK, mUndV, mUndKUncond, mUndVUncond, stream);
+    }
+    if (mGuidance != 1.0F)
+    {
+        // Guidance was requested but no unconditional context was supplied, so CFG cannot run and the
+        // single conditional forward below is guidance=1 behavior. Warn once so a misconfigured caller
+        // (setGuidance(!=1) but uncondEmbeds == nullptr) is not silently served degraded actions.
+        static bool warned = false;
+        if (!warned)
+        {
+            LOG_WARNING(
+                "Guidance %.2f requested but uncondEmbeds is null; running the single conditional forward "
+                "(guidance=1 behavior). Provide unconditional embeddings to enable guidance-interval CFG.",
+                mGuidance);
+            warned = true;
+        }
+    }
+    // Non-CFG path: bind empty uncond K/V sets to the const& parameters (no persistent buffer needed).
+    return mPolicyRunner->generate(condLatent, mUndK, mUndV, {}, {}, stream);
 }
 
 } // namespace cosmos3

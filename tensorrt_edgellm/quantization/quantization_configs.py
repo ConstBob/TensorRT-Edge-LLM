@@ -268,6 +268,12 @@ def build_quant_config(
             entries += _enable_entries(visual_quantization,
                                        f"*{prefix}*weight_quantizer",
                                        f"*{prefix}*input_quantizer")
+        # Embedding tables inside visual towers (e.g. Qwen3-VL
+        # ``visual.pos_embed``) match the prefix glob but have no FP8
+        # export/runtime path — keep them fp16 (disable after enable so it
+        # wins).
+        entries += _disable_entries(
+            [f"*{prefix}*pos_embed*" for prefix in _VISUAL_PREFIXES])
 
     if audio_quantization is not None:
         if audio_quantization not in _AUDIO_METHODS:

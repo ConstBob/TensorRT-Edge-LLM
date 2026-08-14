@@ -543,6 +543,10 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
             mc.head_dim,
             "recurrent_state_size":
             mc.ssm_state_size,
+            "recurrent_state_num_groups":
+            mc.n_groups,
+            "recurrent_spec_verify_mode":
+            "replay",
             "conv_dim":
             mc.conv_dim,
             "conv_kernel":
@@ -560,15 +564,22 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
             "recurrent_state_num_heads": gc.num_value_heads,
             "recurrent_state_head_dim": gc.key_head_dim,
             "recurrent_state_size": gc.value_head_dim,
+            "recurrent_spec_verify_mode": "snapshot",
             "conv_dim": gc.conv_dim,
             "conv_kernel": gc.conv_kernel,
             "use_rope": config.num_attn_layers > 0,
         })
 
+    if (not config.is_hybrid
+            and config.num_attn_layers != config.num_hidden_layers):
+        out["num_attention_layers"] = config.num_attn_layers
+
     # Emit canonical per-layer config consumed by the C++ HybridCacheManager.
     # Only attention and linear-attention layers carry KV/recurrent state and
-    # must appear in the per-layer routing table. MLP layers are skipped.
-    if config.is_hybrid and config.layer_types:
+    # must appear in the per-layer routing table. MLP/MoE layers are skipped.
+    _emit_kv_table = config.layer_types and (
+        config.is_hybrid or config.num_attn_layers != config.num_hidden_layers)
+    if _emit_kv_table:
         from ..config import (_VALID_ATTENTION_LAYER_TYPES, LAYER_ATTN,
                               LAYER_GDN, LAYER_MAMBA)
 

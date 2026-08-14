@@ -214,6 +214,7 @@ enum class RopeType
     kLongRope,     //!< Long RoPE type used by Phi-4
     kMRope,        //!< MRope type used by Qwen2-VL
     kNoRope,       //!< No positional encoding (e.g., Nemotron-Nano)
+    kYarn,         //!< YaRN NTK-by-parts scaling
 };
 
 /*! \brief Long-Rope specific parameters */
@@ -222,6 +223,16 @@ struct LongRopeParams
     int32_t originalMaxPositionEmbeddings{-1}; //!< Original maximum position embeddings from training
     std::vector<float> longFactor;             //!< Long factor array for each rotary dimension
     std::vector<float> shortFactor;            //!< Short factor array for each rotary dimension
+};
+
+/*! \brief YaRN specific parameters (NTK-by-parts interpolation) */
+struct YarnParams
+{
+    int32_t originalMaxPositionEmbeddings{-1}; //!< Pre-YaRN training length; the interpolation reference
+    float factor{1.0F};                        //!< Context-extension factor (rope_scaling.factor)
+    float betaFast{32.0F};                     //!< High-frequency correction boundary (rotations)
+    float betaSlow{1.0F};                      //!< Low-frequency correction boundary (rotations)
+    float mscale{1.0F};                        //!< Attention magnitude scale applied to cos/sin
 };
 
 /*! \brief RoPE configuration structure with optional Long-Rope parameters
@@ -236,6 +247,7 @@ struct RopeConfig
     float partialRotaryFactor{1.0F};          //!< Fraction of head angles rotated by proportional RoPE
     int32_t maxPositionEmbeddings{32768};     //!< Maximum position embeddings supported
     std::optional<LongRopeParams> longRope{}; //!< Long-Rope specific parameters
+    std::optional<YarnParams> yarn{};         //!< YaRN specific parameters
 };
 
 #ifndef __CUDACC__

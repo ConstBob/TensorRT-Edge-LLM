@@ -841,6 +841,45 @@ def _(hidden_states, qweight, scales, gemm_n, gemm_k, group_size):
 
 
 # ---------------------------------------------------------------------------
+# Custom op: trt::nvfp4_a16_gemm  (dense FP16-A / NVFP4-W4 Marlin GEMM)
+#
+# Inputs are already in Marlin-packed layout (see
+# ``repacking.repack_nvfp4_a16_marlin_linear``): ``qweights`` are the INT8 view
+# of the Marlin-permuted E2M1 codes, ``block_scales`` are the Marlin-permuted
+# raw E4M3 bytes, and ``global_scale`` is the FP16 per-tensor scale pre-scaled
+# by 2**7. ``gemm_n`` is the Marlin-padded output width; the caller slices the
+# logical width. Export-only (zero eager stub); numeric validation is the
+# golden checkpoint test, mirroring ``int4_groupwise_gemm``.
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt::nvfp4_a16_gemm", mutates_args=())
+def nvfp4_a16_gemm(
+    activation: torch.Tensor,  # [*, gemm_k] float16
+    qweights: torch.Tensor,  # [1, gemm_k//16, 8*gemm_n] int8
+    block_scales: torch.Tensor,  # [1, gemm_k//16, gemm_n] int8
+    global_scale: torch.Tensor,  # [1] float16
+    gemm_n: int,
+    gemm_k: int,
+) -> torch.Tensor:
+    """Stub: dense NVFP4 W4A16 Marlin GEMM - returns zero tensor of output shape."""
+    *leading, _ = activation.shape
+    return torch.zeros(*leading,
+                       gemm_n,
+                       dtype=activation.dtype,
+                       device=activation.device)
+
+
+@nvfp4_a16_gemm.register_fake
+def _(activation, qweights, block_scales, global_scale, gemm_n, gemm_k):
+    *leading, _ = activation.shape
+    return torch.empty(*leading,
+                       gemm_n,
+                       dtype=activation.dtype,
+                       device=activation.device)
+
+
+# ---------------------------------------------------------------------------
 # INT8 SmoothQuant fake-quant eager helpers (numeric-validation golden)
 #
 # W8A8: symmetric per-tensor INT8 activation, symmetric per-channel INT8 weight.
@@ -1045,6 +1084,90 @@ def _(hidden_states,
       ngroups,
       chunk_size=0):
     return torch.empty_like(hidden_states), state.clone()
+
+
+# ---------------------------------------------------------------------------
+# Custom op: trt_edgellm::update_ssm_state_with_intermediate
+#   Mamba2 SSM update that also emits the per-token replay stash for MTP
+#   spec-verify. Adds a shape-only spec_verify_phase_marker input (length 0 =
+#   ordinary, 1 = verify). During verify the committed state is left read-only
+#   and the recurrent state is reconstructed from the replay stash after accept.
+#   Emits three FP32 replay outputs (dA / u / B) instead of a full-state snapshot.
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt_edgellm::update_ssm_state_with_intermediate",
+                         mutates_args=())
+def update_ssm_state_with_intermediate(
+    hidden_states: torch.Tensor,  # [batch, seq_len, num_heads, head_dim]
+    ssm_a: torch.Tensor,  # [num_heads] float32
+    ssm_b: torch.Tensor,  # [batch, seq_len, n_groups, ssm_state_size]
+    ssm_c: torch.Tensor,  # [batch, seq_len, n_groups, ssm_state_size]
+    ssm_d: torch.Tensor,  # [num_heads] float16
+    dt: torch.Tensor,  # [batch, seq_len, num_heads]
+    dt_bias: torch.Tensor,  # [num_heads] float16
+    state: torch.Tensor,  # [batch, num_heads, head_dim, ssm_state_size]
+    context_lengths: torch.Tensor,  # [batch] int32
+    state_start_index: torch.
+    Tensor,  # [0] cold / [batch] restored (unused in verify)
+    spec_verify_phase_marker: torch.Tensor,  # [0 or 1] int32 (shape-only)
+    dt_softplus: int,
+    ngroups: int,
+    chunk_size: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+           torch.Tensor]:
+    """Stub: SSM update with the per-token replay stash (dA / u / B, FP32)."""
+    b, s, nh, hd = hidden_states.shape
+    ds = state.shape[3]
+    replay_da = torch.zeros(b, s, nh, dtype=torch.float32, device=state.device)
+    replay_u = torch.zeros(b,
+                           s,
+                           nh,
+                           hd,
+                           dtype=torch.float32,
+                           device=state.device)
+    replay_b = torch.zeros(b,
+                           s,
+                           ngroups,
+                           ds,
+                           dtype=torch.float32,
+                           device=state.device)
+    return (torch.zeros_like(hidden_states), state.clone(), replay_da,
+            replay_u, replay_b)
+
+
+@update_ssm_state_with_intermediate.register_fake
+def _(hidden_states,
+      ssm_a,
+      ssm_b,
+      ssm_c,
+      ssm_d,
+      dt,
+      dt_bias,
+      state,
+      context_lengths,
+      state_start_index,
+      spec_verify_phase_marker,
+      dt_softplus,
+      ngroups,
+      chunk_size=0):
+    b, s, nh, hd = hidden_states.shape
+    ds = state.shape[3]
+    replay_da = torch.empty(b, s, nh, dtype=torch.float32, device=state.device)
+    replay_u = torch.empty(b,
+                           s,
+                           nh,
+                           hd,
+                           dtype=torch.float32,
+                           device=state.device)
+    replay_b = torch.empty(b,
+                           s,
+                           ngroups,
+                           ds,
+                           dtype=torch.float32,
+                           device=state.device)
+    return (torch.empty_like(hidden_states), state.clone(), replay_da,
+            replay_u, replay_b)
 
 
 # ---------------------------------------------------------------------------
@@ -1327,6 +1450,47 @@ def _(router_logits, hidden_states, fc1_qweights, fc1_blocks_scale, fc1_alpha,
 
 
 # ---------------------------------------------------------------------------
+# Custom op: trt_edgellm::Nvfp4A16MoePlugin
+#   Marlin FP16-A / NVFP4-W4 MoE (weight-only).
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt_edgellm::Nvfp4A16MoePlugin", mutates_args=())
+def nvfp4_a16_moe_plugin(
+    router_logits: torch.Tensor,  # [numTokens, num_experts] float32
+    hidden_states: torch.Tensor,  # [B, S, hidden_size] float16
+    fc1_qweights: torch.Tensor,  # [E, hidden/16, 8*fc1_out] int8
+    fc1_block_scales: torch.Tensor,  # [E, hidden/16, fc1_out] int8
+    fc1_global_scales: torch.Tensor,  # [E] float16
+    fc2_qweights: torch.Tensor,  # [E, moe_inter/16, 8*hidden] int8
+    fc2_block_scales: torch.Tensor,  # [E, moe_inter/16, hidden] int8
+    fc2_global_scales: torch.Tensor,  # [E] float16
+    e_score_correction_bias: torch.Tensor,  # [E] float32
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    moe_inter_size: int,
+    activation_type: int,
+    n_group: int,
+    topk_group: int,
+    norm_topk_prob: int,
+    routed_scaling_factor: float,
+    routing_mode: int,
+    max_routed_rows: int,
+) -> torch.Tensor:
+    return torch.zeros_like(hidden_states)
+
+
+@nvfp4_a16_moe_plugin.register_fake
+def _(router_logits, hidden_states, fc1_qweights, fc1_block_scales,
+      fc1_global_scales, fc2_qweights, fc2_block_scales, fc2_global_scales,
+      e_score_correction_bias, num_experts, top_k, hidden_size, moe_inter_size,
+      activation_type, n_group, topk_group, norm_topk_prob,
+      routed_scaling_factor, routing_mode, max_routed_rows):
+    return torch.empty_like(hidden_states)
+
+
+# ---------------------------------------------------------------------------
 # Custom op: trt_edgellm::NvFP4MoEPluginGeforce
 #   SM12x (consumer Blackwell) fused NVFP4 MoE. Same signature as
 #   ``nvfp4_moe_plugin``; FC1 weights must be in the plain ``[up, gate]``
@@ -1403,6 +1567,45 @@ def fp16_moe_plugin(
 def _(router_logits, hidden_states, fc1_weights, fc2_weights, num_experts,
       top_k, hidden_size, moe_inter_size, activation_type, norm_topk_prob,
       max_routed_rows):
+    return torch.empty_like(hidden_states)
+
+
+# ---------------------------------------------------------------------------
+# Custom op: trt_edgellm::Fp16MoePluginSigmoid
+#   Same FP16 grouped-GEMM plugin (Fp16MoePlugin) as ``fp16_moe_plugin`` but
+#   with DeepSeek/Nemotron-H sigmoid-group-topk routing: adds the
+#   ``e_score_correction_bias`` input and the n_group / topk_group /
+#   routed_scaling_factor attributes.
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt_edgellm::Fp16MoePluginSigmoid", mutates_args=())
+def fp16_moe_plugin_sigmoid(
+    router_logits: torch.Tensor,  # [numTokens, num_experts] float32
+    hidden_states: torch.Tensor,  # [B, S, hidden_size] float16
+    fc1_weights: torch.
+    Tensor,  # [E, moe_inter, hidden] float16 (ReLU2, ungated)
+    fc2_weights: torch.Tensor,  # [E, hidden, moe_inter] float16
+    e_score_correction_bias: torch.Tensor,  # [E] float32
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    moe_inter_size: int,
+    activation_type: int,
+    n_group: int,
+    topk_group: int,
+    norm_topk_prob: int,
+    routed_scaling_factor: float,
+    max_routed_rows: int,
+) -> torch.Tensor:
+    return torch.zeros_like(hidden_states)
+
+
+@fp16_moe_plugin_sigmoid.register_fake
+def _(router_logits, hidden_states, fc1_weights, fc2_weights,
+      e_score_correction_bias, num_experts, top_k, hidden_size, moe_inter_size,
+      activation_type, n_group, topk_group, norm_topk_prob,
+      routed_scaling_factor, max_routed_rows):
     return torch.empty_like(hidden_states)
 
 

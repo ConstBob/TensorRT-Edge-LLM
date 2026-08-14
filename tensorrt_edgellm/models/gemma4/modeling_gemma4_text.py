@@ -25,24 +25,28 @@ import torch.nn as nn
 from transformers.activations import ACT2FN
 
 from ...checkpoint import checkpoint_utils
-from ...config import QUANT_NVFP4, ModelConfig
+from ...config import (QUANT_INT4_AWQ, QUANT_INT4_AWQ_MODELOPT,
+                       QUANT_INT4_GPTQ, QUANT_NVFP4, ModelConfig)
 from ..default.modeling_default import (MLP, Attention, CausalLM, DecoderLayer,
                                         OnnxSpec, RMSNorm)
 from ..linear import TPMode, make_linear
-from ..ops import (KV_PAGE_SIZE, attention_plugin, nvfp4_moe_plugin,
-                   nvfp4_moe_plugin_geforce, use_geforce_nvfp4_moe)
+from ..ops import (KV_PAGE_SIZE, attention_plugin, int4_moe_plugin,
+                   nvfp4_moe_plugin, nvfp4_moe_plugin_geforce,
+                   use_geforce_nvfp4_moe)
 
 __all__ = [
     "Gemma4Attention",
     "Gemma4ForCausalLM",
     "Gemma4DecoderLayer",
     "Gemma4DenseMoEBlock",
+    "Gemma4Int4MoEBlock",
     "Gemma4NvFP4MoEBlock",
     "Gemma4NvFP4MoEExperts",
     "Gemma4Transformer",
     "Gemma4ValueRMSNorm",
     "GEMMA4_NVFP4_KEY_REMAP",
     "_gemma4_dense_moe_routing",
+    "GEMMA4_FUSED_BF16_KEY_REMAP",
 ]
 
 # Plugin constants for ``Nvfp4MoePlugin`` (same as Qwen3 MoE).
@@ -53,6 +57,9 @@ _NVFP4_MOE_IO_DTYPE_FP16 = 1
 _NVFP4_MOE_MAX_ROUTED_ROWS_AUTO = 0
 _NVFP4_MOE_N_GROUP_FLAT = 1
 _NVFP4_MOE_TOPK_GROUP_FLAT = 1
+
+# Int4MoePlugin activation type for GeGLU (matches C++ kACTIVATION_GEGLU = 5).
+_INT4_ACTIVATION_GEGLU = 5
 
 # These are dummy tensor extents used only to seed torch.export/ONNX export.
 # Runtime limits are controlled by dynamic_shapes and the builder profiles.
@@ -844,6 +851,242 @@ class Gemma4NvFP4MoEBlock(nn.Module):
         )
 
 
+class Gemma4FusedBF16MoEExperts(nn.Module):
+    """Fused BF16 expert weights for QAT-unquantized Gemma4 MoE checkpoint.
+
+    Stores gate_up_proj [E, 2*inter, hidden] and down_proj [E, hidden, inter]
+    as plain parameters, matching the checkpoint's fused tensor layout.
+    """
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        E = config.num_experts
+        H = config.hidden_size
+        I = config.moe_intermediate_size
+        # Register as parameters so state_dict loading can populate them.
+        self.gate_up_proj = nn.Parameter(
+            torch.empty(E, 2 * I, H, dtype=torch.bfloat16))
+        self.down_proj = nn.Parameter(
+            torch.empty(E, H, I, dtype=torch.bfloat16))
+
+
+class Gemma4Int4MoEBlock(nn.Module):
+    """INT4 AWQ MoE block for Gemma4 26B-A4B using ``Int4MoePlugin``.
+
+    For BF16 QAT-unquantized checkpoints: loads fused BF16 expert weights,
+    then applies per-group INT4 RTN quantization and packs to Marlin format
+    during _prepare_moe_weights().
+
+    For pre-quantized INT4 checkpoints (GPTQ/AWQ): loads per-expert quantized
+    weights and repacks to Marlin format.
+    """
+
+    def __init__(self, config: ModelConfig, layer_idx: int = 0) -> None:
+        super().__init__()
+        self.config = config
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+        self.moe_intermediate_size = config.moe_intermediate_size
+        self.hidden_size = config.hidden_size
+        _gs = getattr(config.quant, 'group_size', 128)
+        # Default group_size=1 means "unset" for BF16 QAT → pick largest
+        # power-of-2 that divides both hidden_size and moe_intermediate_size.
+        if _gs <= 1:
+            _gs = 128
+            while _gs > 1 and (config.hidden_size % _gs != 0
+                               or config.moe_intermediate_size % _gs != 0):
+                _gs //= 2
+        self.group_size = _gs
+        self.zero_point_offset = getattr(config.quant,
+                                         'gptq_zero_point_offset', 1)
+        self.activation_type = _INT4_ACTIVATION_GEGLU
+        self.quantize_experts_from_bf16 = getattr(config,
+                                                  '_needs_moe_quantization',
+                                                  False)
+
+        self.router = Gemma4Router(config, layer_idx)
+        if self.quantize_experts_from_bf16:
+            self.experts = Gemma4FusedBF16MoEExperts(config)
+        else:
+            self.experts = Gemma4NvFP4MoEExperts(config)
+
+    def _prepare_moe_weights(self) -> None:
+        """Quantize (if BF16) and repack expert weights to Marlin INT4 format.
+
+        Called by :func:`~checkpoint.repacking._stack_moe_experts`.
+        """
+
+        # Promote router projection to Linear for standard MatMul trace.
+        self.gate_linear = make_linear(self.config,
+                                       self.hidden_size,
+                                       self.num_experts,
+                                       bias=False,
+                                       module_name="moe_block.gate_linear")
+        self.gate_linear.weight.data = self.router.proj.weight.data
+
+        if self.quantize_experts_from_bf16:
+            self._prepare_from_fused_bf16()
+        else:
+            self._prepare_from_gptq()
+
+        # per_expert_scale → raw scale applied post-renorm by plugin
+        self.register_buffer("e_score_correction_bias",
+                             self.router.per_expert_scale.data.float())
+
+        # Discard expert modules after repacking.
+        self.experts = nn.ModuleList()
+
+    def _quantize_int4_rtn(self, weight: torch.Tensor) -> tuple:
+        """Apply per-group INT4 RTN (Round-To-Nearest) quantization.
+
+        Args:
+            weight: [N, K] float tensor (already transposed for Marlin: N=out, K=in)
+
+        Returns:
+            (qweight_uint [N, K] int16, scales [N, K//group] fp16)
+            qweight values are unsigned [0, 15] with zero_point=8
+            (Marlin dequant: (q - 8) * scale)
+        """
+        N, K = weight.shape
+        G = self.group_size
+        assert K % G == 0, f"K={K} must be divisible by group_size={G}"
+
+        # Reshape to [N, K//G, G] for per-group quantization.
+        w = weight.float().reshape(N, K // G, G)
+
+        # Symmetric quantization: scale = max(abs(group)) / 7
+        # Signed range: [-8, 7], unsigned = signed + 8 → [0, 15]
+        absmax = w.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10)
+        scales = absmax / 7.0  # [N, K//G, 1]
+
+        # Quantize to signed [-8, 7], then offset to unsigned [0, 15]
+        qw_signed = (w / scales).round().clamp(-8, 7)
+        qw = (qw_signed + 8).to(torch.int16)  # [N, K//G, G] unsigned [0, 15]
+        qw = qw.reshape(N, K)  # [N, K]
+        scales = scales.squeeze(-1).half()  # [N, K//G]
+
+        return qw, scales
+
+    def _prepare_from_fused_bf16(self) -> None:
+        """Quantize fused BF16 expert weights to INT4 and pack to Marlin."""
+        from ...checkpoint.repacking import pack_int4_awq_marlin
+
+        gate_up = self.experts.gate_up_proj.data  # [E, 2*I, H]
+        down = self.experts.down_proj.data  # [E, H, I]
+
+        E = self.num_experts
+        gate_up_w_list = []
+        gate_up_s_list = []
+        down_w_list = []
+        down_s_list = []
+
+        for e in range(E):
+            # gate_up_proj: [2*I, H] — already in [N, K] form for Marlin
+            gu_qw, gu_s = self._quantize_int4_rtn(gate_up[e])
+            gate_up_w_list.append(gu_qw)
+            gate_up_s_list.append(gu_s)
+
+            # down_proj: [H, I] — already in [N, K] form for Marlin
+            d_qw, d_s = self._quantize_int4_rtn(down[e])
+            down_w_list.append(d_qw)
+            down_s_list.append(d_s)
+
+        # Stack: [E, N, K] for weights, [E, N, K//G] for scales
+        gate_up_w = torch.stack(gate_up_w_list, dim=0)
+        gate_up_s = torch.stack(gate_up_s_list, dim=0)
+        down_w = torch.stack(down_w_list, dim=0)
+        down_s = torch.stack(down_s_list, dim=0)
+
+        gu_marlin_w, gu_marlin_s = pack_int4_awq_marlin(
+            gate_up_w, gate_up_s, self.group_size)
+        dn_marlin_w, dn_marlin_s = pack_int4_awq_marlin(
+            down_w, down_s, self.group_size)
+
+        device = self.router.proj.weight.device
+        self.register_buffer(
+            "fc_gate_up_qweights",
+            gu_marlin_w.view(torch.int8).to(device).contiguous())
+        self.register_buffer("fc_gate_up_scales",
+                             gu_marlin_s.to(device).contiguous())
+        self.register_buffer(
+            "fc_down_qweights",
+            dn_marlin_w.view(torch.int8).to(device).contiguous())
+        self.register_buffer("fc_down_scales",
+                             dn_marlin_s.to(device).contiguous())
+
+    def _prepare_from_gptq(self) -> None:
+        """Extract pre-quantized GPTQ weights and repack to Marlin."""
+        from ...checkpoint.repacking import (_extract_gptq_for_marlin,
+                                             pack_int4_awq_marlin)
+
+        gate_up_weights_list = []
+        gate_up_scales_list = []
+        down_weights_list = []
+        down_scales_list = []
+
+        for expert in self.experts:
+            gw, gs = _extract_gptq_for_marlin(expert.gate_proj,
+                                              self.group_size,
+                                              self.zero_point_offset)
+            uw, us = _extract_gptq_for_marlin(expert.up_proj, self.group_size,
+                                              self.zero_point_offset)
+            gate_up_weights_list.append(torch.cat([gw, uw], dim=0))
+            gate_up_scales_list.append(torch.cat([gs, us], dim=0))
+
+            dw, ds = _extract_gptq_for_marlin(expert.down_proj,
+                                              self.group_size,
+                                              self.zero_point_offset)
+            down_weights_list.append(dw)
+            down_scales_list.append(ds)
+
+        gate_up_w = torch.stack(gate_up_weights_list, dim=0)
+        gate_up_s = torch.stack(gate_up_scales_list, dim=0)
+        down_w = torch.stack(down_weights_list, dim=0)
+        down_s = torch.stack(down_scales_list, dim=0)
+
+        gu_marlin_w, gu_marlin_s = pack_int4_awq_marlin(
+            gate_up_w, gate_up_s, self.group_size)
+        dn_marlin_w, dn_marlin_s = pack_int4_awq_marlin(
+            down_w, down_s, self.group_size)
+
+        self.register_buffer("fc_gate_up_qweights",
+                             gu_marlin_w.view(torch.int8).contiguous())
+        self.register_buffer("fc_gate_up_scales", gu_marlin_s.contiguous())
+        self.register_buffer("fc_down_qweights",
+                             dn_marlin_w.view(torch.int8).contiguous())
+        self.register_buffer("fc_down_scales", dn_marlin_s.contiguous())
+
+    def forward(self, expert_input: torch.Tensor,
+                residual: torch.Tensor) -> torch.Tensor:
+        """Route via Int4MoePlugin: router_logits → INT4 expert GEMMs.
+
+        Args:
+            expert_input: [num_tokens, H] — pre-normed expert input (2D).
+            residual: [B, S, H] — pre-MLP residual used for routing.
+        """
+        hidden_flat = residual.reshape(-1, self.hidden_size)
+        # Router: RMSNorm + scale + proj → raw logits (softmax done by plugin)
+        normed = self.router.norm(hidden_flat)
+        scaled = normed * (self.router.scale *
+                           self.router.scalar_root_size).to(normed.dtype)
+        router_logits = self.gate_linear(scaled).float()
+
+        return int4_moe_plugin(
+            router_logits,
+            expert_input.unsqueeze(0),  # Plugin expects 3D [B, T, H]
+            self.fc_gate_up_qweights,
+            self.fc_gate_up_scales,
+            self.fc_down_qweights,
+            self.fc_down_scales,
+            self.num_experts,
+            self.top_k,
+            self.hidden_size,
+            self.moe_intermediate_size,
+            self.activation_type,
+            self.group_size,
+        )
+
+
 class Gemma4DecoderLayer(DecoderLayer):
     """Gemma4 decoder layer with per-layer input injection."""
 
@@ -869,6 +1112,9 @@ class Gemma4DecoderLayer(DecoderLayer):
         # residual stream per-layer (early layers have very small values ~0.06-0.09).
         self.register_buffer("layer_scalar", torch.ones(1))
 
+        _INT4_QUANT_TYPES = (QUANT_INT4_AWQ, QUANT_INT4_AWQ_MODELOPT,
+                             QUANT_INT4_GPTQ)
+
         # MoE block: parallel routed experts alongside dense MLP (Gemma4 26B).
         # NVFP4 checkpoints use the TRT plugin; dense weights use a reference
         # fallback for export smoke tests and non-quantized checkpoints.
@@ -876,6 +1122,9 @@ class Gemma4DecoderLayer(DecoderLayer):
         if self.enable_moe_block:
             if config.quant.quant_type == QUANT_NVFP4:
                 self.moe_block = Gemma4NvFP4MoEBlock(config, layer_idx)
+            elif (config.quant.quant_type in _INT4_QUANT_TYPES
+                  or getattr(config, '_use_int4_moe_plugin', False)):
+                self.moe_block = Gemma4Int4MoEBlock(config, layer_idx)
             else:
                 self.moe_block = Gemma4DenseMoEBlock(config, layer_idx)
             self.post_feedforward_layernorm_1 = RMSNorm(
@@ -1528,4 +1777,34 @@ def GEMMA4_NVFP4_KEY_REMAP(key: str) -> "str | None":
     """
     key = _ROUTER_RE.sub(r"\1moe_block.router.", key)
     key = _EXPERTS_RE.sub(r"\1moe_block.experts._experts.\2.", key)
+    return key
+
+
+# Fused BF16 expert keys (QAT-unquantized Gemma4):
+#   layers.{i}.experts.gate_up_proj → layers.{i}.moe_block.experts.gate_up_proj
+#   layers.{i}.experts.down_proj    → layers.{i}.moe_block.experts.down_proj
+# Note: after prefix stripping, key may have "model." prefix.
+_FUSED_EXPERTS_RE = re.compile(
+    r"((?:model\.)?layers\.\d+\.)experts\.(gate_up_proj|down_proj)")
+
+
+def GEMMA4_FUSED_BF16_KEY_REMAP(key: str) -> "str | None":
+    """Remap BF16 QAT-unquantized Gemma4 MoE checkpoint keys.
+
+    Checkpoint layout (google/gemma-4-26B-A4B-it-qat-q4_0-unquantized):
+        model.language_model.layers.{i}.router.proj.weight
+        model.language_model.layers.{i}.router.scale
+        model.language_model.layers.{i}.router.per_expert_scale
+        model.language_model.layers.{i}.experts.gate_up_proj
+        model.language_model.layers.{i}.experts.down_proj
+
+    Model tree (with Gemma4Int4MoEBlock + Gemma4FusedBF16MoEExperts):
+        model.layers.{i}.moe_block.router.proj.weight
+        model.layers.{i}.moe_block.router.scale
+        model.layers.{i}.moe_block.router.per_expert_scale
+        model.layers.{i}.moe_block.experts.gate_up_proj
+        model.layers.{i}.moe_block.experts.down_proj
+    """
+    key = _ROUTER_RE.sub(r"\1moe_block.router.", key)
+    key = _FUSED_EXPERTS_RE.sub(r"\1moe_block.experts.\2", key)
     return key

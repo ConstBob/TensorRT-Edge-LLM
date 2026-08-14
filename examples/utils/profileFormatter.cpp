@@ -319,6 +319,7 @@ void outputContextCacheProfile(std::ostream& output, rt::ContextCacheMetrics con
 {
     output << "=== Context Cache ===" << std::endl;
     output << "Sequences: admitted=" << cacheMetrics.admittedSequences << ", hits=" << cacheMetrics.hitSequences
+           << ", media_aware=" << cacheMetrics.mediaAwareSequences
            << ", lookup_bypass=" << cacheMetrics.lookupBypassSequences
            << ", forced_cold=" << cacheMetrics.forcedColdSequences << std::endl;
     output << "Tokens: matched=" << cacheMetrics.matchedTokens << ", reused=" << cacheMetrics.reusedTokens << std::endl;
@@ -513,7 +514,8 @@ void addJsonContextCacheSummary(nlohmann::json& summary, rt::ContextCacheMetrics
         return nlohmann::json{{"free", metrics.free}, {"capacity", metrics.capacity}};
     };
     summary["context_cache"] = {{"admitted_sequences", cacheMetrics.admittedSequences},
-        {"hit_sequences", cacheMetrics.hitSequences}, {"lookup_bypass_sequences", cacheMetrics.lookupBypassSequences},
+        {"hit_sequences", cacheMetrics.hitSequences}, {"media_aware_sequences", cacheMetrics.mediaAwareSequences},
+        {"lookup_bypass_sequences", cacheMetrics.lookupBypassSequences},
         {"forced_cold_sequences", cacheMetrics.forcedColdSequences}, {"matched_tokens", cacheMetrics.matchedTokens},
         {"reused_tokens", cacheMetrics.reusedTokens},
         {"plans",

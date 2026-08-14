@@ -557,6 +557,11 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
                 "audio": {
                     "format": "<so_start><so_embedding><so_end>"
                 },
+                # Bare marker; the runner expands it into the per-tubelet Frame-label layout at
+                # textPreprocess time, once timestamps and EVS-pruned counts are known.
+                "video": {
+                    "format": "<image>"
+                },
             }
         elif is_vlm:
             user_text_only = MultimodalUserMessage()

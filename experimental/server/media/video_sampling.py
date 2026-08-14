@@ -66,6 +66,10 @@ MAX_DECODE_PIXELS = 256 * 1024 * 1024
 MAX_SOURCE_BYTES = 256 * 1024 * 1024  # encoded payload (data: URLs)
 MAX_SOURCE_FRAMES = 54000  # ~30 min @ 30 fps
 
+# Nemotron-Omni video defaults (checkpoint video_io.py / configuration.py).
+NEMOTRON_DEFAULT_FPS = 1.0
+NEMOTRON_TEMPORAL_PATCH = 2  # T frames packed per tubelet
+
 
 def _round_by_factor(n: float, factor: int) -> int:
     return round(n / factor) * factor
@@ -159,6 +163,36 @@ def sample_indices_internvl(total_frames: int,
     return out
 
 
+def sample_indices_nemotron(total_frames: int,
+                            video_fps: float,
+                            *,
+                            target_fps: Optional[float] = None,
+                            nframes: Optional[int] = None,
+                            max_frames: Optional[int] = None) -> List[int]:
+    """Nemotron-Omni frame indices, mirroring the checkpoint's
+    ``video_io.sample_video_frames_to_data_urls``: sample ``int(duration * fps)``
+    frames (``fps`` defaults to ``NEMOTRON_DEFAULT_FPS``; explicit ``nframes``
+    overrides the fps rule), uniformly via ``linspace`` + dedup."""
+    import numpy as np
+    if total_frames <= 0:
+        return []
+    if nframes is not None:
+        desired = int(nframes)
+    else:
+        fps = target_fps if target_fps is not None else NEMOTRON_DEFAULT_FPS
+        duration = total_frames / video_fps if video_fps > 0 else 0.0
+        desired = int(duration * fps)
+    if max_frames is not None:
+        desired = min(desired, int(max_frames))
+    if desired >= total_frames:
+        return list(range(total_frames))
+    if desired <= 1:
+        return [0]
+    return list(
+        np.unique(
+            np.round(np.linspace(0, total_frames - 1, desired)).astype(int)))
+
+
 def internvl_nframes(total_frames: int,
                      video_fps: float,
                      *,
@@ -195,6 +229,15 @@ def effective_fps(nframes: int, total_frames: int, video_fps: float) -> float:
     return nframes / duration if duration > 0 else float(DEFAULT_FPS)
 
 
+def _frame_timestamps(family: str, idxs, video_fps: float) -> List[float]:
+    """Per-frame label timestamps in seconds. Nemotron mirrors vLLM's
+    ``idx * floor(1000/fps)`` ms quantization; other families use ``idx/fps``."""
+    if family == "nemotron":
+        per_ms = int(1000.0 / video_fps) if video_fps > 0 else 0
+        return [int(i) * per_ms / 1000.0 for i in idxs]
+    return [i / video_fps for i in idxs]
+
+
 def _describe_source(source: str) -> str:
     """Bounded description of a video source for error messages: a data URL
     can be hundreds of MB and must never be echoed back."""
@@ -217,7 +260,8 @@ def _raw_video_frame_tokens(family: str, count: int, width: int, height: int,
                             limits: dict) -> int:
     """Visual tokens of a do_resize=false video: InternVL frames must be exactly
     one 448 block (C++ derives frames as tokens/256); Qwen frames must be
-    factor-aligned, accounted by input size."""
+    factor-aligned, accounted by input size. Nemotron always resizes, so it
+    never reaches this path."""
     if family == "internvl":
         if width != 448 or height != 448:
             raise ValueError("do_resize=false InternVL video frames must be "
@@ -250,8 +294,9 @@ def _check_cu_budget(frames: int, family: str, limits: dict,
                      cu_budget) -> None:
     """Reject when this media's cu_seqlens entries (one per Qwen temporal group)
     exceed the remaining request budget. Applies to every Qwen intake incl.
-    do_resize=false; InternVL has no cu_seqlens binding and is exempt."""
-    if cu_budget is None or family == "internvl":
+    do_resize=false; InternVL/Nemotron have no cu_seqlens binding and are
+    exempt."""
+    if cu_budget is None or family in ("internvl", "nemotron"):
         return
     tps = max(1, (limits or {}).get("temporal_patch_size", 2))
     groups = -(-frames // tps)
@@ -462,6 +507,39 @@ def _estimate_qwen3d_video_tokens(nframes: int,
                (t_bar * h_bar * w_bar) // (temporal_factor * factor * factor))
 
 
+def _nemotron_tubelet_geometry(limits: dict):
+    """Nemotron-Omni per-tubelet geometry from engine limits: ``(T frames per
+    tubelet, tokens per tubelet, EVS keep rate q)``, or ``None`` when the limits
+    lack the video fields. Tokens per tubelet = ``video_target_num_patches /
+    downsample^2``."""
+    t = max(1, limits.get("video_temporal_patch_size",
+                          NEMOTRON_TEMPORAL_PATCH))
+    target = limits.get("video_target_num_patches", 0)
+    ratio = limits.get("downsample_ratio", 0)
+    if target <= 0 or ratio <= 0:
+        return None
+    scale = max(1, int(round(1.0 / ratio)))
+    tokens_per_tubelet = target // (scale * scale)
+    if tokens_per_tubelet <= 0:
+        return None
+    q = limits.get("video_pruning_rate", 0.0) or 0.0
+    return t, tokens_per_tubelet, q
+
+
+def _estimate_nemotron_video_tokens(nframes: int, limits: dict) -> int:
+    """Coarse estimate of a Nemotron-Omni video's EVS-pruned visual tokens:
+    ceil(frames / T) tubelets, each ``video_target_num_patches / downsample^2``
+    tokens, scaled by the ``(1 - video_pruning_rate)`` EVS keep fraction."""
+    geom = _nemotron_tubelet_geometry(limits)
+    if geom is None or nframes <= 0:
+        return 0
+    t, tokens_per_tubelet, q = geom
+    tubelets = -(-nframes // t)
+    # EVS keeps at least one full tubelet's worth of tokens (matches the C++ numKeep floor).
+    return max(tokens_per_tubelet,
+               int(tubelets * tokens_per_tubelet * (1.0 - q)))
+
+
 def clamp_nframes_to_profile(
         nframes: int,
         family: str,
@@ -475,9 +553,9 @@ def clamp_nframes_to_profile(
     token budget (all media share one profile); defaults to the engine
     total. Returns ``(nframes, estimated_tokens)``, or ``(nframes, 0)``
     when ``limits`` is empty."""
-    if family != "internvl":
-        # Only the Qwen smart resize enforces maxRatio=200 in C++; the
-        # InternVL grid resize accepts any ratio.
+    if family not in ("internvl", "nemotron"):
+        # Only the Qwen smart resize enforces maxRatio=200 in C++; the InternVL
+        # grid resize and the aspect-preserving Nemotron resize accept any ratio.
         _check_aspect_ratio(width, height)
     if not limits:
         return nframes, 0
@@ -497,6 +575,21 @@ def clamp_nframes_to_profile(
         max_blocks = max(1, cap // block_tokens)
         n = min(nframes, max_blocks)
         return n, n * block_tokens
+    if family == "nemotron":
+        # Aspect-preserving frames pack T per tubelet; each tubelet is
+        # video_target_num_patches/downsample^2 tokens, EVS-pruned to
+        # (1 - video_pruning_rate). Clamp frames so the estimate fits the cap.
+        geom = _nemotron_tubelet_geometry(limits)
+        if geom is None:
+            return nframes, 0
+        t, tokens_per_tubelet, q = geom
+        # The engine processes every tubelet pre-EVS, so the tubelet count is bounded by the block
+        # profile (max_image_tokens / tokens_per_tubelet), independent of the post-EVS keep rate.
+        engine_tubelets = max(1, max_total // tokens_per_tubelet)
+        kept = max(1, int(tokens_per_tubelet * (1.0 - q)))
+        max_tubelets = min(engine_tubelets, max(1, cap // kept))
+        n = min(nframes, max_tubelets * t)
+        return n, _estimate_nemotron_video_tokens(n, limits)
     model_type = limits.get("model_type", "")
     per_image = limits.get("max_image_tokens_per_image", 0)
     if "qwen3_vl" in model_type or "qwen3_5" in model_type:
@@ -527,6 +620,10 @@ def clamp_nframes_to_profile(
         return nframes, 0
     tps = max(1, limits.get("temporal_patch_size", 2))
     max_groups = cap // frame_tokens
+    # Each temporal group is one cu_seqlens entry; clamp gracefully to the
+    # shared group budget (like the 3D branch) instead of erroring downstream.
+    if cu_budget is not None:
+        max_groups = min(max_groups, cu_budget)
     if max_groups < 1:
         raise ValueError(
             "video frames need "
@@ -648,6 +745,13 @@ def sample_video(source: str,
                                  target_fps=target_fps,
                                  nframes=nframes,
                                  max_frames=max_frames)
+        elif family == "nemotron":
+            n = len(
+                sample_indices_nemotron(total,
+                                        video_fps,
+                                        target_fps=target_fps,
+                                        nframes=nframes,
+                                        max_frames=max_frames))
         else:
             n = smart_nframes(total,
                               video_fps,
@@ -675,9 +779,12 @@ def sample_video(source: str,
         # exhausted capacity must not scan the whole source first); the
         # decoded count can only be <= n, so no post-decode recheck needed.
         _check_cu_budget(n, family, frame_limits or {}, cu_budget)
-        wanted = set(
-            sample_indices_internvl(total, n) if family ==
-            "internvl" else sample_indices(total, n))
+        if family == "internvl":
+            wanted = set(sample_indices_internvl(total, n))
+        elif family == "nemotron":
+            wanted = set(sample_indices_nemotron(total, video_fps, nframes=n))
+        else:
+            wanted = set(sample_indices(total, n))
         # Charge planned decode work by the distinct sampled positions (a
         # single-frame video plans n=2 but decodes one frame).
         decode_px = len(wanted) * (stream.width or 0) * (stream.height or 0)
@@ -752,7 +859,7 @@ def sample_video(source: str,
                     "nframes/fps or the resolution")
         else:
             est_tokens = _raw_video_tokens(len(idxs), fw, fh)
-    timestamps = [i / video_fps for i in idxs]
+    timestamps = _frame_timestamps(family, idxs, video_fps)
     # Charge by the actual decoded frame size (rotation/filter chains can
     # differ from the container metadata used for the pre-decode check).
     decoded_px = len(idxs) * fh * fw
@@ -820,6 +927,12 @@ def load_video_buffer(rt_module,
     or a clip reference (``video`` / ``video_url``) decoded + sampled here.
     Returns ``(buffer, est_tokens, used_px, used_groups)``."""
     do_resize = bool(item.get("do_resize", True))
+    if family == "nemotron" and not do_resize:
+        # The Nemotron-Omni runner always smart-resizes to the target grid, so
+        # do_resize=false cannot be honored; reject rather than silently resize.
+        raise ValueError(
+            "Nemotron-Omni video does not support do_resize=false; the runner "
+            "always resizes frames to the target patch grid")
     frame_paths = item.get("frames")
     if frame_paths is not None:
         if (not isinstance(frame_paths, (list, tuple)) or not frame_paths
@@ -843,7 +956,7 @@ def load_video_buffer(rt_module,
                 raise ValueError(
                     "video frames must share one size; frame 0 is "
                     f"{width}x{height} but {p!r} is {size[0]}x{size[1]}")
-        if do_resize and family != "internvl":
+        if do_resize and family not in ("internvl", "nemotron"):
             # The C++ smart resize enforces maxRatio=200 regardless of
             # whether profile limits are available for estimation.
             _check_aspect_ratio(width, height)
@@ -877,7 +990,15 @@ def load_video_buffer(rt_module,
                     f"{cap} remain in the engine budget; reduce frames or "
                     "other media in the request")
         elif cap is not None:
-            if family == "internvl":
+            if family == "nemotron":
+                # Aspect-preserving tubelet estimate; no cu_seqlens binding.
+                est = _estimate_nemotron_video_tokens(len(frame_paths), limits)
+                if est > cap:
+                    raise ValueError(
+                        f"{len(frame_paths)} pre-sampled frames need ~{est} "
+                        f"visual tokens but only {cap} remain in the engine "
+                        "budget; reduce the frame count or other media")
+            elif family == "internvl":
                 max_blocks = cap // 256
                 if len(frame_paths) > max_blocks:
                     raise ValueError(
@@ -937,16 +1058,18 @@ def load_video_buffer(rt_module,
                     est = min(
                         limits.get("max_image_tokens_per_image", 0) or cap,
                         cap)
+        ts = _frame_timestamps(family, range(len(frame_paths)), fps_val)
         try:
             buffer = rt_module.load_video_from_paths(list(frame_paths),
-                                                     fps_val)
+                                                     fps_val,
+                                                     timestamps=ts)
         except RuntimeError as exc:
             # The C++ loader rejects undecodable frames or mismatched sizes;
             # user-supplied files -> client error, not a 500.
             raise ValueError(f"failed to load video frames: {exc}") from exc
         buffer.do_resize = do_resize
-        if family == "internvl":
-            cu_used = 0  # no cu_seqlens binding on InternVL engines
+        if family in ("internvl", "nemotron"):
+            cu_used = 0  # no cu_seqlens binding on InternVL / Nemotron engines
         else:
             tps = max(1, limits.get("temporal_patch_size", 2))
             cu_used = -(-len(frame_paths) // tps)
@@ -965,9 +1088,10 @@ def load_video_buffer(rt_module,
     except (TypeError, ValueError) as exc:
         raise ValueError(
             f"nframes/min_frames/max_frames must be integers: {exc}") from exc
+    default_fps = NEMOTRON_DEFAULT_FPS if family == "nemotron" else DEFAULT_FPS
     frames, fps, timestamps, est, decoded_px = sample_video(
         _extract_video_source(item),
-        target_fps=_positive_float(item.get("fps", DEFAULT_FPS), "fps"),
+        target_fps=_positive_float(item.get("fps", default_fps), "fps"),
         nframes=nframes,
         min_frames=min_frames,
         max_frames=max_frames,
@@ -982,8 +1106,8 @@ def load_video_buffer(rt_module,
     buffer.do_resize = do_resize
     lim = frame_limits or {}
     n_frames = len(timestamps)
-    if family == "internvl":
-        cu_used = 0  # no cu_seqlens binding on InternVL engines
+    if family in ("internvl", "nemotron"):
+        cu_used = 0  # no cu_seqlens binding on InternVL / Nemotron engines
     else:
         tps = max(1, lim.get("temporal_patch_size", 2))
         cu_used = -(-n_frames // tps)  # one entry per temporal group

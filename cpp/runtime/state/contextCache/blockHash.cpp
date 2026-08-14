@@ -61,6 +61,7 @@ enum class Tag : uint8_t
     kAbsent,
     kPresent,
     kOpaqueIdentity,
+    kMediaToken,
 };
 
 void fnvByte(FnvValue& state, uint8_t value) noexcept
@@ -141,7 +142,8 @@ Hash128 hashOpaqueIdentity(std::string_view bytes)
     return finishHash(state);
 }
 
-BlockHash hashBlock(BlockHash parent, int32_t const* tokens, size_t count, BlockKeyExtras const& extras)
+BlockHash hashBlock(BlockHash parent, int32_t const* tokens, size_t count, BlockKeyExtras const& extras,
+    Hash128 const* perPositionMediaHash)
 {
     ELLM_CHECK(tokens != nullptr || count == 0U, "Cannot hash context cache tokens from a null pointer");
 
@@ -153,7 +155,15 @@ BlockHash hashBlock(BlockHash parent, int32_t const* tokens, size_t count, Block
     fnvU64(state, static_cast<uint64_t>(count));
     for (size_t index = 0; index < count; ++index)
     {
-        fnvI32(state, tokens[index]);
+        if (perPositionMediaHash != nullptr && perPositionMediaHash[index] != Hash128{})
+        {
+            fnvTag(state, Tag::kMediaToken);
+            fnvHash(state, perPositionMediaHash[index]);
+        }
+        else
+        {
+            fnvI32(state, tokens[index]);
+        }
     }
 
     fnvTag(state, Tag::kMedia);
@@ -190,8 +200,8 @@ BlockHash hashBlock(BlockHash parent, int32_t const* tokens, size_t count, Block
     return finishHash(state);
 }
 
-std::vector<BlockHash> hashFullBlocks(
-    int32_t const* tokens, size_t tokenCount, int32_t pageSize, std::vector<BlockKeyExtras> const& extrasPerBlock)
+std::vector<BlockHash> hashFullBlocks(int32_t const* tokens, size_t tokenCount, int32_t pageSize,
+    std::vector<BlockKeyExtras> const& extrasPerBlock, Hash128 const* perPositionMediaHash)
 {
     ELLM_CHECK(pageSize > 0, "Context cache page size must be positive");
 
@@ -208,7 +218,9 @@ std::vector<BlockHash> hashFullBlocks(
     for (size_t block = 0; block < blockCount; ++block)
     {
         BlockKeyExtras const& extras = extrasPerBlock.empty() ? emptyExtras : extrasPerBlock[block];
-        parent = hashBlock(parent, tokens + block * pageTokenCount, pageTokenCount, extras);
+        Hash128 const* blockMediaHash
+            = perPositionMediaHash != nullptr ? perPositionMediaHash + block * pageTokenCount : nullptr;
+        parent = hashBlock(parent, tokens + block * pageTokenCount, pageTokenCount, extras, blockMediaHash);
         hashes.push_back(parent);
     }
     return hashes;

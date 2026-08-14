@@ -142,6 +142,158 @@ class _FakeLLM:
         self.close_count += 1
 
 
+def _engine():
+    from experimental.server.runtime import engine
+    return engine
+
+
+# ---------------------------------------------------------------------------
+# Nemotron-Omni video model-family + engine-minimum accounting
+# (ported to the modular runtime.engine / media.video_sampling API)
+# ---------------------------------------------------------------------------
+
+
+class _FakeVideoBuffer:
+    """ImageData stand-in exposing the fields the min-profile check reads."""
+
+    def __init__(self, video, frames):
+        self.video = video
+        self.frames = frames
+
+
+def test_video_model_family_nemotron(tmp_path):
+    # A visual engine whose config.json model_type is the Nemotron-Omni vision
+    # encoder resolves to the "nemotron" frame-sampling family.
+    eng = _engine()
+    root = tmp_path / "nemo"
+    root.mkdir()
+    (root / "visual").mkdir()
+    (root / "visual" / "config.json"
+     ).write_text('{"model_type": "nemotron_omni_vision_encoder"}')
+    (root / "visual" / "visual.engine").touch()
+    llm = eng.LLM.__new__(eng.LLM)
+    llm._media_dir = str(root)
+    assert llm._video_model_family() == "nemotron"
+
+
+def test_load_image_buffers_nemotron_minimum():
+    # A Nemotron video buffer is built and its EVS token estimate is honored
+    # against the request-wide engine minimum (no cu_seqlens binding).
+    eng = _engine()
+    limits = {
+        "model_type": "nemotron_omni_vision_encoder",
+        "min_image_tokens": 256,
+        "max_image_tokens": 4096,
+        "max_image_tokens_per_image": 4096,
+        "video_pruning_rate": 0.0,
+        "video_temporal_patch_size": 2,
+        "video_target_num_patches": 1024,
+        "downsample_ratio": 0.5,
+    }
+
+    def fake_load_video_buffer(rt,
+                               item,
+                               family,
+                               frame_limits=None,
+                               budget=None,
+                               pixel_budget=None,
+                               cu_budget=None):
+        # 8 frames = 4 tubelets (T=2), 4*256 EVS tokens, no cu_seqlens groups.
+        return _FakeVideoBuffer(item["video"], frames=8), 4 * 256, 0, 0
+
+    import experimental.server.media.video_sampling as vs_mod
+    orig = vs_mod.load_video_buffer
+    vs_mod.load_video_buffer = fake_load_video_buffer
+    try:
+        bufs = eng._load_image_buffers(
+            None, [{
+                "role": "user",
+                "content": [{
+                    "type": "video",
+                    "video": "a.mp4"
+                }]
+            }], lambda: "nemotron", lambda: limits)
+        assert [b.video for b in bufs] == ["a.mp4"]
+    finally:
+        vs_mod.load_video_buffer = orig
+
+
+def test_load_image_buffers_nemotron_minimum_uses_raw_tubelets():
+    # The ViT processes every tubelet, so the engine-minimum check must use the
+    # pre-EVS tubelet count, not the pruned estimate: a heavily-pruned clip whose
+    # raw tubelets clear the minimum must not be rejected.
+    eng = _engine()
+    limits = {
+        "model_type": "nemotron_omni_vision_encoder",
+        "min_image_tokens": 1024,
+        "max_image_tokens": 8192,
+        "max_image_tokens_per_image": 8192,
+        "video_pruning_rate": 0.7,
+        "video_temporal_patch_size": 2,
+        "video_target_num_patches": 1024,
+        "downsample_ratio": 0.5,
+    }
+
+    def fake_load_video_buffer(rt,
+                               item,
+                               family,
+                               frame_limits=None,
+                               budget=None,
+                               pixel_budget=None,
+                               cu_budget=None):
+        # 8 frames = 4 tubelets: raw 1024 >= min, but EVS(0.7) prunes to ~307.
+        return _FakeVideoBuffer(item["video"], frames=8), 307, 0, 0
+
+    import experimental.server.media.video_sampling as vs_mod
+    orig = vs_mod.load_video_buffer
+    vs_mod.load_video_buffer = fake_load_video_buffer
+    try:
+        bufs = eng._load_image_buffers(
+            None, [{
+                "role": "user",
+                "content": [{
+                    "type": "video",
+                    "video": "a.mp4"
+                }]
+            }], lambda: "nemotron", lambda: limits)
+        assert [b.video for b in bufs] == ["a.mp4"]
+    finally:
+        vs_mod.load_video_buffer = orig
+
+
+def test_load_image_buffers_nemotron_rejects_multiple_and_mixed():
+    # The C++ Nemotron video path is single-video, no mixed images, batch 1; the
+    # server rejects other layouts up front instead of crashing the runner.
+    eng = _engine()
+    two_videos = [{
+        "role":
+        "user",
+        "content": [{
+            "type": "video",
+            "video": "a.mp4"
+        }, {
+            "type": "video",
+            "video": "b.mp4"
+        }],
+    }]
+    with pytest.raises(ValueError, match="exactly one video"):
+        eng._load_image_buffers(None, two_videos, lambda: "nemotron",
+                                lambda: {})
+    mixed = [{
+        "role":
+        "user",
+        "content": [{
+            "type": "image",
+            "image": "x.jpg"
+        }, {
+            "type": "video",
+            "video": "a.mp4"
+        }],
+    }]
+    with pytest.raises(ValueError, match="exactly one video"):
+        eng._load_image_buffers(None, mixed, lambda: "nemotron", lambda: {})
+
+
 @pytest.fixture
 def client_and_llm(tmp_path):
     pytest.importorskip("fastapi")

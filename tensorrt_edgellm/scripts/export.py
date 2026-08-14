@@ -102,6 +102,11 @@ _GEMMA4_MODEL_TYPES = frozenset([
     "gemma4_unified_text",
 ])
 
+_GEMMA4_ASSISTANT_MODEL_TYPES = frozenset([
+    "gemma4_assistant",
+    "gemma4_unified_assistant",
+])
+
 _VLM_MODEL_TYPES = frozenset([
     "qwen3_vl",
     "qwen3_omni",
@@ -362,7 +367,15 @@ def _has_mtp(config: dict) -> bool:
                       dict) and sub.get("mtp_num_hidden_layers") is not None:
             return True
     text_cfg = _get_llm_text_config(config)
-    return bool(text_cfg.get("mtp_num_hidden_layers") is not None)
+    if text_cfg.get("mtp_num_hidden_layers") is not None:
+        return True
+    # Nemotron-H (DeepSeek-V3 naming): one or more MTP prediction modules whose
+    # layer stack is given by ``mtp_hybrid_override_pattern`` or, on newer
+    # checkpoints, the ``mtp_layers_block_type`` list.
+    return bool(
+        int(text_cfg.get("num_nextn_predict_layers", 0) or 0) > 0
+        and (text_cfg.get("mtp_hybrid_override_pattern")
+             or text_cfg.get("mtp_layers_block_type")))
 
 
 def _normalize_gemma4_layer_type(layer_type: str) -> str:
@@ -546,13 +559,13 @@ def _validate_gemma4_mtp_pair(target_dir: str,
     target_text = _get_llm_text_config(target_config)
     assistant_text = _get_llm_text_config(assistant_config)
 
-    if target_text.get("model_type") not in ("gemma4", "gemma4_text"):
+    if target_text.get("model_type") not in _GEMMA4_MODEL_TYPES:
         raise ValueError(
-            "Gemma4 MTP target must have model_type gemma4/gemma4_text in text_config."
+            "Gemma4 MTP target must have a Gemma4 model_type in text_config.")
+    if assistant_config.get("model_type") not in _GEMMA4_ASSISTANT_MODEL_TYPES:
+        raise ValueError(
+            "Gemma4 MTP assistant must have a Gemma4 assistant root model_type."
         )
-    if assistant_config.get("model_type") != "gemma4_assistant":
-        raise ValueError(
-            "Gemma4 MTP assistant must have root model_type gemma4_assistant.")
     if int(target_text.get("hidden_size", 0)) != int(
             assistant_config.get("backbone_hidden_size", 0)):
         raise ValueError(
@@ -938,7 +951,8 @@ def _export_llm(model_dir: str,
                 externalize_weights: "list[str] | None" = None,
                 tp_size: int = 1,
                 num_decoder_layers: "int | None" = None,
-                skip_softmax_scale_factor: "float | None" = None) -> None:
+                skip_softmax_scale_factor: "float | None" = None,
+                quantization_override: "str | None" = None) -> None:
     """Export LLM backbone via the standard tensorrt_edgellm pipeline.
 
     When ``tp_size > 1``, exports ``tp_size`` per-rank ONNX files named
@@ -968,20 +982,27 @@ def _export_llm(model_dir: str,
         from ..models.qwen3_moe import MODELOPT_KEY_REMAP
         key_remap = MODELOPT_KEY_REMAP
 
-    # Gemma4 NVFP4 MoE: checkpoint stores router/experts at layer level but
+    # Gemma4 MoE: checkpoint stores router/experts at layer level but
     # model tree nests them under moe_block with _experts indirection.
-    # Only activate when the checkpoint is NVFP4-quantized (otherwise the
-    # FP16 dense path uses router/experts directly on the layer).
+    # Activate when the checkpoint has MoE (quantized or BF16 QAT).
+    _needs_moe_quantization = False
     if key_remap is None and model_type in _GEMMA4_MODEL_TYPES:
-        if _is_nvfp4_checkpoint(model_dir):
-            config_path = os.path.join(model_dir, "config.json")
-            with open(config_path) as f:
-                _cfg = json.load(f)
-            _llm = _cfg.get("text_config", _cfg)
-            # Only MoE checkpoints (e.g. 26B-A4B) nest router/experts under
-            # moe_block and need the remap; dense NVFP4 checkpoints (E2B/E4B/
-            # 31B) have enable_moe_block=False and export directly.
-            if _llm.get("enable_moe_block", False):
+        config_path = os.path.join(model_dir, "config.json")
+        with open(config_path) as f:
+            _cfg = json.load(f)
+        _llm = _cfg.get("text_config", _cfg)
+        if _llm.get("enable_moe_block", False):
+            _is_nvfp4 = _is_nvfp4_checkpoint(model_dir)
+            _has_int4_cfg = os.path.isfile(
+                os.path.join(model_dir, "hf_quant_config.json"))
+            _needs_moe_quantization = (not _is_nvfp4 and not _has_int4_cfg)
+            if _needs_moe_quantization:
+                # BF16 QAT-unquantized: fused expert tensors
+                from ..models.gemma4.modeling_gemma4_text import \
+                    GEMMA4_FUSED_BF16_KEY_REMAP
+                key_remap = GEMMA4_FUSED_BF16_KEY_REMAP
+            else:
+                # NVFP4 or INT4 AWQ: per-expert quantized weights
                 from ..models.gemma4.modeling_gemma4_text import \
                     GEMMA4_NVFP4_KEY_REMAP
                 key_remap = GEMMA4_NVFP4_KEY_REMAP
@@ -1003,6 +1024,16 @@ def _export_llm(model_dir: str,
         logger.info("[LLM] Loading checkpoint from %s", model_dir)
         try:
             from ..model import AutoModel
+
+            # Build config overrides for on-the-fly quantization of BF16 MoE
+            # checkpoints (e.g. --quantization int4_awq on a QAT-unquantized ckpt).
+            _extra_configs = None
+            if quantization_override == "int4_awq" and _needs_moe_quantization:
+                _extra_configs = {
+                    "_needs_moe_quantization": True,
+                    "_use_int4_moe_plugin": True,
+                }
+
             model = AutoModel.from_pretrained(
                 model_dir,
                 device="cpu",
@@ -1024,6 +1055,7 @@ def _export_llm(model_dir: str,
                 tp_size=world,
                 tp_rank=rank,
                 num_decoder_layers=num_decoder_layers,
+                extra_configs=_extra_configs,
             )
         except (OSError, ValueError, RuntimeError, ImportError) as exc:
             logger.exception("[LLM] Failed to load checkpoint")
@@ -1066,6 +1098,16 @@ def _export_llm(model_dir: str,
         except (OSError, ValueError, RuntimeError) as exc:
             logger.exception("[LLM] ONNX export failed")
             raise SystemExit(1) from exc
+
+        # DFlash: the draft's proposal query embeds the mask token via this base
+        # engine's shared embedding table, so fold the draft's trained mask row
+        # into it (no-op when the row is shared with the base).
+        if dflash_draft_dir and world == 1:
+            from ..checkpoint.checkpoint_utils import _runtime_embedding_scale
+            _patch_dflash_mask_embedding(
+                llm_out_dir,
+                dflash_draft_dir,
+                embedding_scale=_runtime_embedding_scale(model))
 
         # Free this rank's model before building the next one
         del model
@@ -1447,6 +1489,90 @@ def _export_jetspec_draft(model_dir: str,
                 indent=2)
 
     logger.info("[JetSpec Draft] Done: %s", output_path)
+
+
+def _patch_dflash_mask_embedding(llm_out_dir: str,
+                                 dflash_draft_dir: str,
+                                 embedding_scale: float = 1.0) -> None:
+    """Fold the DFlash draft's trained mask-token embedding into the base sidecar.
+
+    The runtime embeds the draft proposal query ``[anchor, mask, ...]`` by
+    looking ``mask_token_id`` up in the base engine's shared
+    ``embedding.safetensors`` (``dflashDecoder.cpp`` ``runDraftForward``). Some
+    DFlash checkpoints (e.g. Nemotron-3.5) ship a distinct trained embedding for
+    that reserved token in the draft's own ``embed_tokens`` — typically the only
+    row that differs from the base table. Patch only that single row; when the
+    draft's mask row is shared with the base (the common Qwen-style case) this is
+    a no-op.
+    """
+    import glob
+
+    from safetensors import safe_open
+
+    from tensorrt_edgellm._safetensors_io import save_file
+
+    emb_path = os.path.join(llm_out_dir, "embedding.safetensors")
+    if not os.path.exists(emb_path):
+        logger.warning("[DFlash] %s missing; cannot fold draft mask embedding",
+                       emb_path)
+        return
+
+    draft_cfg = _load_config(dflash_draft_dir)
+    dcfg = draft_cfg.get("dflash_config", {}) or {}
+    mask_id = dcfg.get("mask_token_id", draft_cfg.get("mask_token_id"))
+    if mask_id is None:
+        logger.warning("[DFlash] draft config has no mask_token_id; skipping "
+                       "mask embedding fold")
+        return
+    mask_id = int(mask_id)
+
+    # embed_tokens is excluded from draft quantization, so the row is dense.
+    draft_vec = None
+    for shard in sorted(
+            glob.glob(os.path.join(dflash_draft_dir, "*.safetensors"))):
+        with safe_open(shard, framework="pt", device="cpu") as f:
+            keys = set(f.keys())
+            for key in ("embed_tokens.weight", "model.embed_tokens.weight"):
+                if key in keys:
+                    draft_vec = f.get_slice(key)[mask_id:mask_id +
+                                                 1].squeeze(0).to(
+                                                     torch.float32)
+                    break
+        if draft_vec is not None:
+            break
+    if draft_vec is None:
+        logger.info("[DFlash] draft checkpoint has no embed_tokens; mask "
+                    "embedding is shared with the base (no fold needed)")
+        return
+
+    with safe_open(emb_path, framework="pt", device="cpu") as f:
+        if "embedding_scale" in set(f.keys()):
+            raise ValueError(
+                "DFlash mask-embedding fold does not support FP8 "
+                "embedding.safetensors; re-export the base without "
+                "--fp8-embedding.")
+        weight = f.get_tensor("embedding")
+
+    patched_row = (draft_vec * embedding_scale).to(weight.dtype)
+    if torch.allclose(weight[mask_id].to(torch.float32),
+                      patched_row.to(torch.float32),
+                      atol=1e-3,
+                      rtol=0.0):
+        logger.info(
+            "[DFlash] draft mask embedding (id=%d) matches base; no fold needed",
+            mask_id)
+        return
+
+    weight[mask_id] = patched_row
+    # Write to a temp file and atomically rename so an interrupted patch never
+    # leaves the base engine's embedding sidecar half-written; a re-run then
+    # recovers without re-exporting the base.
+    tmp_path = emb_path + ".tmp"
+    save_file({"embedding": weight.contiguous()}, tmp_path)
+    os.replace(tmp_path, emb_path)
+    logger.info(
+        "[DFlash] Folded draft mask embedding (id=%d) into base "
+        "embedding.safetensors", mask_id)
 
 
 _DSPARK_HEAD_TENSOR_KEYS = {
@@ -1890,12 +2016,25 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
         vis_cfg_out["vision_config"][
             "model_type"] = "nemotron_omni_vision_encoder"
         # NemotronOmniViTRunner reads these top-level fields; visualBuilder
-        # additionally reads patch_size and downsample_ratio.
+        # additionally reads patch_size, downsample_ratio and vit_hidden_size.
         for key in ("llm_config", "img_context_token_id", "img_start_token_id",
                     "img_end_token_id", "force_image_size", "norm_mean",
-                    "norm_std", "patch_size", "downsample_ratio"):
+                    "norm_std", "patch_size", "downsample_ratio",
+                    "vit_hidden_size", "video_pruning_rate"):
             if key in config:
                 vis_cfg_out[key] = config[key]
+        # Video sizing lives under vision_config in the official checkpoint (and
+        # in vLLM); resolve_video_cfg falls back to top level for older
+        # artifacts, then the HF defaults (temporal_patch_size omitted -> 2).
+        # Shared with the runtime model build so both agree on T.
+        from ..models.nemotron_omni.modeling_nemotron_omni_visual import \
+            resolve_video_cfg
+        vis_cfg_out["video_temporal_patch_size"] = (resolve_video_cfg(
+            config, "video_temporal_patch_size", None) or 2)
+        vis_cfg_out["video_target_num_patches"] = resolve_video_cfg(
+            config, "video_target_num_patches", 1024)
+        vis_cfg_out["video_maintain_aspect_ratio"] = resolve_video_cfg(
+            config, "video_maintain_aspect_ratio", True)
     if os.environ.get("USE_TRT_NATIVE_ATTN") == "1":
         vis_cfg_out["use_trt_native_vit_attn"] = True
     cfg_out_path = os.path.join(visual_out_dir, "config.json")
@@ -3570,6 +3709,43 @@ def main() -> None:
               "(None) uses the checkpoint's canonical value (5)."),
     )
     p.add_argument(
+        "--max-video-subsample-factor",
+        "--max_video_subsample_factor",
+        dest="max_video_subsample_factor",
+        type=int,
+        default=None,
+        help=(
+            "Cosmos3 policy only: largest video-subsample factor the GEN "
+            "engine's DYNAMIC video-token profile must admit. The profile "
+            "spans [latent_t(max_vsf) .. latent_t(1)]; a larger value widens "
+            "the flexible range (e.g. 8 for finer subsampling) at the cost of "
+            "a looser optimization profile. Default (None) uses 4."),
+    )
+    p.add_argument(
+        "--min-action-chunk",
+        "--min_action_chunk",
+        dest="min_action_chunk",
+        type=int,
+        default=None,
+        help=(
+            "Cosmos3 policy only: smallest action-chunk length the GEN "
+            "engine's DYNAMIC action-token axis must admit. Default (None) = "
+            "the canonical chunk (action axis fixed). Set below the chunk to "
+            "serve shorter action requests from one engine (e.g. 16)."),
+    )
+    p.add_argument(
+        "--max-action-chunk",
+        "--max_action_chunk",
+        dest="max_action_chunk",
+        type=int,
+        default=None,
+        help=(
+            "Cosmos3 policy only: largest action-chunk length the GEN engine's "
+            "DYNAMIC action-token axis must admit. Default (None) = the "
+            "canonical chunk. Widen to serve longer action requests without a "
+            "rebuild (keep it sane, e.g. <= 48, to bound tactic search)."),
+    )
+    p.add_argument(
         "--eagle-base",
         action="store_true",
         help=
@@ -3780,10 +3956,18 @@ def main() -> None:
         type=int,
         choices=[1, 2],
         default=2,
-        help=("INT4 groupwise GEMM plugin backend to export with."
+        help=("INT4 groupwise GEMM plugin backend to export with. "
               "2 (default) targets the cuteDSL Int4GroupwiseGemmPluginV2 with "
               "fragment-layout weights; 1 targets the legacy "
               "Int4GroupwiseGemmPlugin with AWQ-swizzled weights."),
+    )
+    p.add_argument(
+        "--quantization",
+        default=None,
+        choices=["int4_awq", "nvfp4"],
+        help=("Override quantization type for BF16/FP16 checkpoints. "
+              "Applies on-the-fly quantization during export (e.g. INT4 RTN "
+              "for QAT models stored in BF16)."),
     )
     args = p.parse_args()
 
@@ -3820,7 +4004,11 @@ def main() -> None:
                 k: v
                 for k, v in (("action_chunk_size", args.action_chunk_size),
                              ("num_frames", args.num_frames), ("fps",
-                                                               args.fps))
+                                                               args.fps),
+                             ("max_video_subsample_factor",
+                              args.max_video_subsample_factor),
+                             ("min_action_chunk", args.min_action_chunk),
+                             ("max_action_chunk", args.max_action_chunk))
                 if v is not None
             }
             export_cosmos3_components(model_dir,
@@ -4169,7 +4357,8 @@ def main() -> None:
              externalize_weights=externalize_weights,
              tp_size=args.tp_size,
              num_decoder_layers=args.num_decoder_layer,
-             skip_softmax_scale_factor=args.skip_softmax_scale_factor)),
+             skip_softmax_scale_factor=args.skip_softmax_scale_factor,
+             quantization_override=getattr(args, 'quantization', None))),
         (args.mtp and not gemma4_mtp_requested
          and _allow("mtp_draft"), "mtp_draft", lambda out: _export_mtp_draft(
              model_dir, out, externalize_weights=externalize_weights)),

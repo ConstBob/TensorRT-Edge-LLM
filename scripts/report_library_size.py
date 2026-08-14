@@ -17,7 +17,7 @@
 
 Prints a table of the produced artifacts and, for the plugin shared library, a
 breakdown of where the bytes went (XQA embedded cubins, CuTe DSL AOT kernel
-blobs, nvcc fatbin, host code). Optionally writes a JSON summary and a GitLab
+blobs, nvcc fatbin, host code). Optionally writes a JSON summary and an
 OpenMetrics report so every CI build records its library size.
 
 The ELF is parsed directly, so this works on a cross-build machine without
@@ -211,7 +211,7 @@ def render(report: dict, label: str) -> str:
 
 
 def metrics(report: dict, label: str) -> str:
-    """GitLab OpenMetrics report, surfaced as metrics diffs on merge requests."""
+    """OpenMetrics report of per-artifact and per-component sizes."""
     lines = [
         "# HELP edgellm_artifact_bytes Size of a built Edge-LLM artifact.",
         "# TYPE edgellm_artifact_bytes gauge",

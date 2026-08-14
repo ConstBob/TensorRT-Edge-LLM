@@ -34,9 +34,9 @@ from .checkpoint.checkpoint_utils import load_checkpoint_config_dicts
 from .checkpoint.loader import load_weights
 from .config import (QUANT_FP16, QUANT_INT4_AWQ, QUANT_INT4_AWQ_MODELOPT,
                      QUANT_INT4_GPTQ, QUANT_MXFP8, QUANT_NVFP4, ModelConfig,
-                     make_dflash_draft_config, make_dspark_draft_config,
-                     make_jetspec_draft_config, make_mtp_draft_config,
-                     module_quant_type)
+                     _is_gemma4_assistant_model_type, make_dflash_draft_config,
+                     make_dspark_draft_config, make_jetspec_draft_config,
+                     make_mtp_draft_config, module_quant_type)
 
 __all__ = [
     "AutoModel", "load_model_config", "register_attention_scale_default",
@@ -161,7 +161,8 @@ class AutoModel:
                         gemma4_mtp_draft: bool = False,
                         gemma4_kv_sharing_map: "list[dict] | None" = None,
                         gemma4_target_kv_cache_quant: "str | None" = None,
-                        num_decoder_layers: "int | None" = None) -> nn.Module:
+                        num_decoder_layers: "int | None" = None,
+                        extra_configs: "dict | None" = None) -> nn.Module:
         """Construct and load a model from *model_dir*.
 
         Reads ``config.json`` via :class:`~config.ModelConfig`, looks up the
@@ -241,6 +242,9 @@ class AutoModel:
         from .models.default.modeling_default import CausalLM
 
         config = load_model_config(model_dir)
+        if extra_configs:
+            for key, value in extra_configs.items():
+                setattr(config, key, value)
         # Qwen3-Omni Next ships both dense and sparse-MoE thinkers under the
         # same ``qwen3_omni_next_text`` model_type (the HF config is not
         # rewritten for the MoE variant). Detect MoE by ``num_experts > 0`` and
@@ -406,16 +410,21 @@ class AutoModel:
             if key_remap is None:
                 key_remap = _eagle3_key_remap
         elif variant == "mtp_draft":
+            is_nemotron_h_mtp = config.is_nemotron_h
             # TODO: support other model types
-            if not _is_qwen3_5_mtp_draft_supported(config.model_type):
+            if not (is_nemotron_h_mtp
+                    or _is_qwen3_5_mtp_draft_supported(config.model_type)):
                 raise NotImplementedError(
                     "MTP draft is only supported for qwen3_5_text / "
-                    "qwen3_5_moe_text / qwen3_omni_next_text_moe "
-                    f"checkpoints; got {config.model_type!r}.")
+                    "qwen3_5_moe_text / qwen3_omni_next_text_moe / "
+                    f"Nemotron-H checkpoints; got {config.model_type!r}.")
             draft_model_type = config.model_type
             tie_word_embeddings = config.tie_word_embeddings
             config = make_mtp_draft_config(config)
-            if draft_model_type == "qwen3_omni_next_text_moe":
+            if is_nemotron_h_mtp:
+                from .models.nemotron_h import NemotronHMtpDraftModel
+                model_class = NemotronHMtpDraftModel
+            elif draft_model_type == "qwen3_omni_next_text_moe":
                 from .models.qwen3_omni_next import \
                     Qwen3OmniNextMoeMtpDraftModel
                 model_class = Qwen3OmniNextMoeMtpDraftModel
@@ -452,6 +461,14 @@ class AutoModel:
             config = make_dflash_draft_config(
                 dflash_draft_dir,
                 _default_attention_scale_for_model_dir(dflash_draft_dir))
+            if base_config.model_type == "nemotron_h":
+                # Nemotron-3.5 target-hidden stays far inside FP16; run fc at the
+                # checkpoint's native NVFP4 rather than the dense-FP16 + FP32
+                # projection that guards Qwen3-8B (target-hidden ~abs 2e4).
+                config.dflash_fc_native_precision = True
+                config.quant.excluded = [
+                    e for e in config.quant.excluded if e != "fc"
+                ]
             if not draft_has_lm_head:
                 config = _inherit_dflash_lm_head_quant(config, base_config)
             model_class = DFlashDraftModel
@@ -478,9 +495,9 @@ class AutoModel:
             if key_remap is None:
                 key_remap = _dflash_key_remap
         elif variant == "gemma4_mtp_draft":
-            if config.root_model_type != "gemma4_assistant":
+            if not _is_gemma4_assistant_model_type(config.root_model_type):
                 raise ValueError(
-                    "Gemma4 MTP draft requires a gemma4_assistant checkpoint.")
+                    "Gemma4 MTP draft requires a Gemma4 assistant checkpoint.")
             from .models.gemma4 import Gemma4AssistantForCausalLM
             config.gemma4_mtp_draft = True
             config.shares_target_kv = True
@@ -505,17 +522,17 @@ class AutoModel:
             if key_remap is None:
                 key_remap = _dspark_key_remap
         else:
-            if (variant == "mtp_base"
+            if (variant == "mtp_base" and not config.is_nemotron_h
                     and not _is_qwen3_5_mtp_base_supported(config.model_type)):
                 raise NotImplementedError(
-                    "Qwen3.5 MTP base is only supported for qwen3_5_text "
-                    "qwen3_5_moe, or qwen3_5_moe_text checkpoints; "
-                    f"got {config.model_type!r}.")
+                    "MTP base is only supported for Qwen3.5 (text/MoE) and "
+                    f"Nemotron-H checkpoints; got {config.model_type!r}.")
             if variant == "gemma4_mtp_base":
-                if config.model_type not in ("gemma4", "gemma4_text"):
+                if config.model_type not in ("gemma4", "gemma4_text",
+                                             "gemma4_unified",
+                                             "gemma4_unified_text"):
                     raise ValueError(
-                        "Gemma4 MTP base requires a gemma4/gemma4_text target checkpoint."
-                    )
+                        "Gemma4 MTP base requires a Gemma4 target checkpoint.")
                 from .models.gemma4 import Gemma4ForCausalLM
                 config.gemma4_mtp_base = True
                 model_class = Gemma4ForCausalLM

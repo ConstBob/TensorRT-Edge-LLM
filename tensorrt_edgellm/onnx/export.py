@@ -545,6 +545,8 @@ def _initializer_dtype_fixup_required(
             for input_idx in (4, 7, 8, 9, 10):
                 if len(node.input) > input_idx:
                     plugin_fp32_init_names.add(node.input[input_idx])
+        if node.op_type == "Fp16MoePlugin" and len(node.input) > 4:
+            plugin_fp32_init_names.add(node.input[4])
 
     init_map = {init.name: init for init in model.graph.initializer}
     elem_types: dict[str, int] = {}
@@ -820,6 +822,10 @@ def _fix_initializer_dtypes(
             for input_idx in (4, 7, 8, 9, 10):
                 if len(node.input) > input_idx:
                     plugin_fp32_init_names.add(node.input[input_idx])
+        if node.op_type == "Nvfp4A16MoePlugin" and len(node.input) > 8:
+            plugin_fp32_init_names.add(node.input[8])
+        if node.op_type == "Fp16MoePlugin" and len(node.input) > 4:
+            plugin_fp32_init_names.add(node.input[4])
 
     init_map = {init.name: init for init in model.graph.initializer}
     elem_types: dict[str, int] = {}

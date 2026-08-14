@@ -4319,10 +4319,7 @@ bool Qwen3OmniTTSRuntime::handleStreamingGeneration(LLMInferenceRuntime& thinker
 
             kernel::invokeTalkerLogitAdjust(mSeenCodecTokensBuf, mTalkerLogits, mTalkerConfig.talkerSuppressStart,
                 mTalkerConfig.talkerVocabSize, codecEosId, numSeenTokens, repetitionPenalty, stream);
-            // Streaming Talker runs at batch=1; size selectedIndices to match talkerSamplingParams
-            // (allocated at {maxBS, 1}, must be {1, 1} for the sampler's shape check). Mirrors
-            // MR !842's fix(runtime): reshape mTalkerSelectedIndices to {1,1} before streaming
-            // Talker sampling.
+            // Streaming Talker runs at batch=1, so selectedIndices must match the sampler's {1, 1} input shape.
             check::check(mTalkerSelectedIndices.reshape({1, 1}), "Tensor reshape failed");
             trt_edgellm::topKtopPSamplingFromLogits(
                 mTalkerLogits, mTalkerSelectedIndices, talkerSamplingParams, mSamplingWorkspace, stream);

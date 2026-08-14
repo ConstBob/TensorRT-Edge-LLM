@@ -31,8 +31,8 @@ checked into git by default.
 
 These dependencies are required **only** when you regenerate an artifact through
 the [CuTe DSL kernel development workflow](#cute-dsl-kernel-development-workflow).
-A normal CuTe DSL-enabled build consumes a matching
-[prebuilt artifact](cuteDSLPrebuilt/) and needs no Python environment or GPU.
+A normal CuTe DSL-enabled build consumes a matching prebuilt artifact from
+`kernelSrcs/cuteDSLPrebuilt/` and needs no Python environment or GPU.
 
 Use a separate virtual environment for each CuTe DSL compiler flavor. See
 [Option B: Incremental Build in a Local Virtual Environment](#option-b-incremental-build-in-a-local-virtual-environment)

@@ -25,10 +25,38 @@ Usage:
 from __future__ import annotations
 
 import base64
+import os
 
 import pytest
 
 import experimental.server.media.video_sampling as vs
+
+
+def _load_edgellm_runtime():
+    """Resolve the pybind extension the way the server does: a bare import,
+    else glob EDGELLM_PYBIND_DIR (CI sets that, not PYTHONPATH). Returns the
+    module or None when the extension is not built anywhere."""
+    import importlib
+    import importlib.util
+    importlib.invalidate_caches()
+    try:
+        import _edgellm_runtime as rt
+        return rt
+    except ImportError:
+        pass
+    pybind_dir = os.environ.get("EDGELLM_PYBIND_DIR")
+    if not pybind_dir:
+        return None
+    import glob
+    so_files = glob.glob(os.path.join(pybind_dir, "*_edgellm_runtime*.so"))
+    if not so_files:
+        return None
+    spec = importlib.util.spec_from_file_location("_edgellm_runtime",
+                                                  so_files[0])
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
 
 # --- smart_nframes (frame-count selection) ---------------------------------
 
@@ -142,6 +170,17 @@ _INTERNVL_LIMITS = {
     "min_image_tokens": 1024,  # 4 blocks
     "max_image_tokens": 4096,  # 16 blocks
     "max_image_tokens_per_image": 512,
+}
+
+_NEMOTRON_LIMITS = {
+    "model_type": "nemotron_omni_vision_encoder",
+    "min_image_tokens": 256,
+    "max_image_tokens": 4096,
+    "max_image_tokens_per_image": 4096,
+    "video_pruning_rate": 0.0,
+    "video_temporal_patch_size": 2,
+    "video_target_num_patches": 1024,  # 256 tokens/tubelet after /downsample^2
+    "downsample_ratio": 0.5,
 }
 
 
@@ -516,6 +555,25 @@ def test_raw_frames_path_matrix(tmp_path):
     assert est == 8  # tBar*64*64 // (2*32*32)
 
 
+def test_frames_path_fills_timestamps(tmp_path):
+    # The frames-path must attach per-frame label timestamps so the runner
+    # bounds its Frame labels; check both an even and an odd frame count for
+    # the Nemotron (quantized) and default (idx/fps) formulas.
+    pytest.importorskip("av")
+    pytest.importorskip("numpy")
+    frame = tmp_path / "f.mp4"
+    _write_synthetic_clip(frame, n_frames=1, size=64, fps=1)
+    for family, count, fps in (("nemotron", 3, 2.0), ("qwen", 4, 2.0)):
+        buffer, _, _, _ = vs.load_video_buffer(_FakeRt(), {
+            "type": "video",
+            "frames": [str(frame)] * count,
+            "fps": fps,
+        }, family)
+        expected = vs._frame_timestamps(family, range(count), fps)
+        assert list(buffer.timestamps) == expected
+        assert len(buffer.timestamps) == count
+
+
 def test_frames_path_rejects_mismatched_sizes(tmp_path):
     # Mixed frame sizes fail up front with a client error (the C++ loader
     # would reject them later with an opaque RuntimeError), and the pixel
@@ -883,11 +941,15 @@ class _FakeRt:
 
     def load_video_from_array(self, frames, fps, timestamps=()):
         self.calls.append(("array", frames, fps))
-        return self._Buf("array", frames, fps)
+        buf = self._Buf("array", frames, fps)
+        buf.timestamps = list(timestamps)
+        return buf
 
-    def load_video_from_paths(self, paths, fps):
+    def load_video_from_paths(self, paths, fps, timestamps=()):
         self.calls.append(("paths", list(paths), fps))
-        return self._Buf("paths", list(paths), fps)
+        buf = self._Buf("paths", list(paths), fps)
+        buf.timestamps = list(timestamps)
+        return buf
 
 
 def test_content_item_source_validation():
@@ -1115,6 +1177,148 @@ def test_sample_indices_internvl_matches_hf(total, kw):
     assert ours == ref, f"ours={ours} ref={ref} kw={kw}"
 
 
+def _sample_indices_nemotron_ref(total_frames,
+                                 video_fps,
+                                 *,
+                                 target_fps=None,
+                                 nframes=None,
+                                 max_frames=None):
+    """Inline port of the checkpoint video_io.py index selection."""
+    np = pytest.importorskip("numpy")
+    if total_frames <= 0:
+        return []
+    if nframes is not None:
+        desired = int(nframes)
+    else:
+        fps = target_fps if target_fps is not None else 1.0
+        duration = total_frames / video_fps if video_fps > 0 else 0.0
+        desired = int(duration * fps)
+    if max_frames is not None:
+        desired = min(desired, int(max_frames))
+    if desired >= total_frames:
+        return list(range(total_frames))
+    if desired <= 1:
+        return [0]
+    return list(
+        np.unique(
+            np.round(np.linspace(0, total_frames - 1, desired)).astype(int)))
+
+
+@pytest.mark.parametrize(
+    "total,video_fps,kw",
+    [
+        (300, 30.0, {}),  # 10 s @ default 1 fps -> 10 frames
+        (300, 30.0, {
+            "target_fps": 2.0
+        }),
+        (37, 30.0, {}),  # sub-2 s odd total
+        (25, 30.0, {}),  # <1 s -> desired 0 -> [0]
+        (30, 30.0, {
+            "nframes": 6
+        }),  # explicit nframes overrides fps
+        (30, 30.0, {
+            "nframes": 100
+        }),  # nframes > total -> every frame
+        (300, 30.0, {
+            "target_fps": 1.0,
+            "max_frames": 4
+        }),  # max cap
+    ])
+def test_sample_indices_nemotron_matches_hf(total, video_fps, kw):
+    pytest.importorskip("numpy")
+    ref = _sample_indices_nemotron_ref(total, video_fps, **kw)
+    ours = vs.sample_indices_nemotron(total, video_fps, **kw)
+    assert ours == ref, f"ours={ours} ref={ref} kw={kw}"
+
+
+def test_sample_indices_nemotron_dedup_cap_and_explicit():
+    pytest.importorskip("numpy")
+    # <1 s source -> desired 0 -> single leading frame.
+    assert vs.sample_indices_nemotron(25, 30.0) == [0]
+    # desired == total returns every frame.
+    assert vs.sample_indices_nemotron(10, 1.0) == list(range(10))
+    # Explicit nframes overrides the fps rule and is uniform + sorted.
+    idx = vs.sample_indices_nemotron(30, 30.0, nframes=6)
+    assert len(idx) == 6 and idx[0] == 0 and idx[-1] == 29 and idx == sorted(
+        idx)
+    # nframes above the source count collapses (dedup) to every frame.
+    assert vs.sample_indices_nemotron(4, 1.0, nframes=100) == [0, 1, 2, 3]
+    # max_frames caps the fps-derived count.
+    assert len(
+        vs.sample_indices_nemotron(300, 30.0, target_fps=1.0,
+                                   max_frames=4)) == 4
+
+
+def test_clamp_nemotron_video_budget():
+    # 8 frames -> 4 tubelets (T=2); 1024 patches / downsample^2 (4) = 256
+    # tokens/tubelet, no pruning -> 1024 tokens; fits the 4096-token engine.
+    n, est = vs.clamp_nframes_to_profile(8, "nemotron", 640, 360,
+                                         _NEMOTRON_LIMITS)
+    assert n == 8
+    assert est == 4 * 256
+    # A tight budget clamps the frame count: 512 tokens holds 2 tubelets = 4.
+    small = dict(_NEMOTRON_LIMITS, max_image_tokens=512)
+    n2, est2 = vs.clamp_nframes_to_profile(100, "nemotron", 640, 360, small)
+    assert (n2, est2) == (4, 512)
+    # EVS pruning does NOT raise the tubelet count: the engine processes every
+    # tubelet pre-EVS, so the block budget is unchanged by the pruning rate.
+    pruned = dict(_NEMOTRON_LIMITS,
+                  max_image_tokens=512,
+                  video_pruning_rate=0.5)
+    n3, _ = vs.clamp_nframes_to_profile(100, "nemotron", 640, 360, pruned)
+    assert n3 == 4
+
+
+def test_clamp_nemotron_missing_video_keys():
+    # Absent Nemotron geometry -> no clamp (like the empty-limits case).
+    limits = {
+        "model_type": "nemotron_omni_vision_encoder",
+        "min_image_tokens": 1,
+        "max_image_tokens": 4096,
+    }
+    assert vs.clamp_nframes_to_profile(8, "nemotron", 640, 360,
+                                       limits) == (8, 0)
+
+
+def test_nemotron_ratio_not_limited():
+    # Nemotron resize is aspect-preserving: extreme ratios must not be rejected
+    # up front (exempt from maxRatio=200, like InternVL).
+    n, est = vs.clamp_nframes_to_profile(4, "nemotron", 2010, 10,
+                                         _NEMOTRON_LIMITS)
+    assert n == 4 and est == 2 * 256
+
+
+def test_sample_video_nemotron_timestamps(tmp_path):
+    # Nemotron timestamps use the vLLM formula int(idx)*int(1000/fps)/1000,
+    # NOT qwen's idx/fps; both sample the same uniform indices.
+    pytest.importorskip("av")
+    pytest.importorskip("numpy")
+    clip = tmp_path / "n.mp4"
+    _write_synthetic_clip(clip, n_frames=30, size=64, fps=30)
+    _, _, ts_n, _, _ = vs.sample_video(str(clip), nframes=6, family="nemotron")
+    _, _, ts_q, _, _ = vs.sample_video(str(clip), nframes=6, family="qwen")
+    idxs = vs.sample_indices_nemotron(30, 30.0, nframes=6)
+    per_ms = int(1000.0 / 30.0)
+    assert ts_n == pytest.approx([int(i) * per_ms / 1000.0 for i in idxs])
+    assert ts_n != pytest.approx(ts_q)
+
+
+def test_load_video_buffer_nemotron_rejects_do_resize_false(tmp_path):
+    # The Nemotron-Omni runner always smart-resizes, so do_resize=false is a
+    # client error rather than a silently-resized clip.
+    pytest.importorskip("av")
+    clip = tmp_path / "n.mp4"
+    _write_synthetic_clip(clip, n_frames=4, size=64, fps=2)
+    with pytest.raises(ValueError, match="do_resize=false"):
+        vs.load_video_buffer(_FakeRt(), {
+            "type": "video",
+            "video": str(clip),
+            "do_resize": False
+        },
+                             "nemotron",
+                             frame_limits=_NEMOTRON_LIMITS)
+
+
 def test_mid_stream_resolution_change_rejected(tmp_path, monkeypatch):
     # The (T, H, W, 3) stack requires uniform frames; a source whose frames
     # decode at differing sizes must be a client error, not a numpy
@@ -1199,11 +1403,8 @@ def test_pybind_video_rejects_non_finite_time_values():
     # Direct pybind API: inf fps / nan timestamps must be rejected at the
     # binding (the HTTP server validates earlier; this is defense-in-depth
     # for the raw C++/pybind surface).
-    import importlib
-    importlib.invalidate_caches()
-    try:
-        import _edgellm_runtime as rt
-    except ImportError:
+    rt = _load_edgellm_runtime()
+    if rt is None:
         pytest.skip("_edgellm_runtime pybind extension is not importable; "
                     "build with -DBUILD_PYTHON_BINDINGS=ON")
     np = pytest.importorskip("numpy")
@@ -1328,3 +1529,28 @@ def test_raw_per_group_token_cap(tmp_path):
         vs.estimate_image_tokens(str(over), "qwen", limits, do_resize=False)
     assert vs.estimate_image_tokens(str(ok), "qwen", limits,
                                     do_resize=False) == 486
+
+
+def test_resolve_video_cfg_precedence():
+    """Video sizing prefers vision_config, then top level, then the default;
+    export and the runtime model build share this so their T agree."""
+    pytest.importorskip("torch")
+    from tensorrt_edgellm.models.nemotron_omni.modeling_nemotron_omni_visual import \
+        resolve_video_cfg
+
+    # vision_config wins over a stale top-level value (official checkpoint).
+    cfg = {
+        "video_temporal_patch_size": 2,
+        "vision_config": {
+            "video_temporal_patch_size": 4
+        },
+    }
+    assert resolve_video_cfg(cfg, "video_temporal_patch_size", None) == 4
+    # top-level fallback when vision_config omits the key (older artifact).
+    assert resolve_video_cfg({"video_target_num_patches": 2048},
+                             "video_target_num_patches", 1024) == 2048
+    # default when neither level carries it.
+    assert resolve_video_cfg({}, "video_maintain_aspect_ratio", True) is True
+    # vision_config present but missing the key -> top level / default.
+    assert resolve_video_cfg({"vision_config": {}}, "video_target_num_patches",
+                             1024) == 1024
