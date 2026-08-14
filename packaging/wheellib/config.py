@@ -85,6 +85,24 @@ def required_environment(name: str) -> str:
     return value
 
 
+def cuda_driver_stub(row: Mapping[str, Any]) -> Optional[Path]:
+    """Return the target CUDA driver stub when the toolkit provides one."""
+    cuda_dir = Path(
+        os.environ.get("CUDA_DIR",
+                       f"/usr/local/cuda-{row['cuda_ctk_version']}"))
+    target_arch = {
+        "x86_64": "x86_64-linux",
+        "aarch64": "aarch64-linux",
+    }[str(row["cpu_arch"])]
+    candidates = (
+        cuda_dir / "lib64" / "stubs" / "libcuda.so",
+        cuda_dir / "lib" / "stubs" / "libcuda.so",
+        cuda_dir / "targets" / target_arch / "lib" / "stubs" / "libcuda.so",
+    )
+    return next((path.resolve() for path in candidates if path.is_file()),
+                None)
+
+
 def load_toml(path: Path) -> Dict[str, Any]:
     """Load TOML from *path* and return its top-level mapping."""
     try:

@@ -28,7 +28,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Tuple
 
-from .config import (REPO_ROOT, load_matrix, package_version,
+from .config import (REPO_ROOT, cuda_driver_stub, load_matrix, package_version,
                      require_clean_source, require_variant, run_checked,
                      sha256, source_revision, source_snapshot, write_json)
 
@@ -250,6 +250,9 @@ def _cmake_configure_command(args: argparse.Namespace, repo_root: Path,
         f"-Dpybind11_DIR={_pybind11_cmake_dir()}",
         f"-DEDGELLM_WHEEL_EXTENSION_NAME={extension_name}",
     ]
+    driver_stub = cuda_driver_stub(row)
+    if driver_stub is not None:
+        command.append(f"-DCUDA_DRIVER_LIB={driver_stub}")
     command.extend(_cross_cmake_options(args, row))
     command.extend(str(value) for value in row["cmake_args"])
     return command

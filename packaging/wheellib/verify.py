@@ -24,11 +24,12 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, Mapping, Sequence, Set, Tuple
 
-from .config import (CONTRACT, REPO_ROOT, load_matrix, load_toml,
-                     require_variant, sha256)
+from .config import (CONTRACT, REPO_ROOT, cuda_driver_stub, load_matrix,
+                     load_toml, require_variant, sha256)
 
 _REQUIRED = set(CONTRACT.RUNTIME_VARIANT_FIELDS) | {
     "schema_version",
@@ -103,7 +104,8 @@ def _audit_tool(name: str) -> str:
     raise RuntimeError(f"Required audit tool {name!r} is not installed.")
 
 
-def _tool_output(argv: Iterable[str]) -> str:
+def _tool_output(argv: Iterable[str],
+                 environment: Mapping[str, str] | None = None) -> str:
     command = list(argv)
     executable = _audit_tool(command[0])
     try:
@@ -111,7 +113,8 @@ def _tool_output(argv: Iterable[str]) -> str:
                                 check=True,
                                 text=True,
                                 stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT)
+                                stderr=subprocess.STDOUT,
+                                env=environment)
     except subprocess.CalledProcessError as error:
         raise RuntimeError(
             f"Audit command failed ({' '.join(command)}):\n{error.stdout}"
@@ -354,10 +357,10 @@ def _audit_cutedsl_evidence(metadata: Mapping[str, Any],
         raise RuntimeError("CuTe evidence has an invalid archive digest.")
 
 
-def _audit_local_dependencies(binary: Path,
-                              allow_python_symbols: bool) -> None:
+def _audit_local_dependencies(binary: Path, allow_python_symbols: bool,
+                              environment: Mapping[str, str] | None) -> None:
     dependency_tree = _tool_output(
-        ["auditwheel", "lddtree", os.fspath(binary)])
+        ["auditwheel", "lddtree", os.fspath(binary)], environment)
     lowered_tree = dependency_tree.lower()
     if ("not found" in lowered_tree
             or re.search(r'["\']path["\']\s*:\s*(?:null|none)', lowered_tree)):
@@ -365,7 +368,7 @@ def _audit_local_dependencies(binary: Path,
             f"Target dependency audit found unresolved libraries for {binary}:\n"
             f"{dependency_tree}")
 
-    ldd_output = _tool_output(["ldd", "-r", os.fspath(binary)])
+    ldd_output = _tool_output(["ldd", "-r", os.fspath(binary)], environment)
     if "not found" in ldd_output:
         raise RuntimeError(
             f"Target dependency resolution failed for {binary}:\n{ldd_output}")
@@ -385,12 +388,19 @@ def _audit_local_dependencies(binary: Path,
 
 
 def _audit_binary_dependencies(payload: Mapping[str, Any], extension: Path,
-                               plugin: Path, allowlist_path: Path,
+                               plugin: Path, row: Mapping[str, Any],
+                               allowlist_path: Path,
                                dependency_roots: Sequence[Path],
                                require_dependency_resolution: bool) -> None:
     allowlist = load_toml(allowlist_path)
-    allowed = set(allowlist.get("common", {}).get("allowed", []))
+    common = allowlist.get("common", {})
+    allowed = set(common.get("allowed", []))
     allowed.update(allowlist.get(payload["cpu_arch"], {}).get("allowed", []))
+    platform_provided = set(common.get("platform_provided", []))
+    if not platform_provided.issubset(allowed):
+        raise RuntimeError(
+            "Platform-provided dependencies must also be allowlisted: "
+            f"{sorted(platform_provided - allowed)}.")
     needed = _audit_elf(extension, str(payload["cpu_arch"]), allowed)
     needed.update(_audit_elf(plugin, str(payload["cpu_arch"]), allowed))
     required_dsos = {
@@ -409,10 +419,23 @@ def _audit_binary_dependencies(payload: Mapping[str, Any], extension: Path,
     }.get(host_machine, host_machine)
     if host_arch != payload["cpu_arch"]:
         if dependency_roots:
-            _audit_dependency_roots(needed, dependency_roots)
+            _audit_dependency_roots(needed - platform_provided,
+                                    dependency_roots)
     else:
-        _audit_local_dependencies(extension, True)
-        _audit_local_dependencies(plugin, False)
+        environment = None
+        with tempfile.TemporaryDirectory(
+                prefix="edgellm-driver-stub-") as temporary:
+            driver_stub = cuda_driver_stub(row)
+            if ("libcuda.so.1" in platform_provided
+                    and driver_stub is not None):
+                Path(temporary, "libcuda.so.1").symlink_to(driver_stub)
+                environment = dict(os.environ)
+                environment["LD_LIBRARY_PATH"] = ":".join(
+                    value for value in (temporary,
+                                        environment.get("LD_LIBRARY_PATH", ""))
+                    if value)
+            _audit_local_dependencies(extension, True, environment)
+            _audit_local_dependencies(plugin, False, environment)
 
 
 def _audit_payload_size(package_stage: Path, size_budget_path: Path,
@@ -447,7 +470,7 @@ def verify(stage: Path,
         raise RuntimeError(
             "Payload is missing the canonical, unmodified LICENSE file.")
     _audit_cutedsl_evidence(cutedsl_metadata, evidence)
-    _audit_binary_dependencies(payload, extension, plugin, allowlist_path,
+    _audit_binary_dependencies(payload, extension, plugin, row, allowlist_path,
                                dependency_roots, require_dependency_resolution)
     if require_device_images:
         _audit_device_images(extension, int(payload["gpu_sm"]))

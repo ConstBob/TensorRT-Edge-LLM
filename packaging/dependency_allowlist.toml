@@ -26,6 +26,7 @@ allowed = [
   "librt.so.1",
   "libstdc++.so.6",
 ]
+platform_provided = ["libcuda.so.1"]
 
 [x86_64]
 allowed = []
