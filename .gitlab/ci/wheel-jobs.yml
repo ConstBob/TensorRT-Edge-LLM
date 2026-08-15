@@ -81,7 +81,7 @@ wheel_python_base:
 wheel_assemble:
   stage: wheel-assemble
   extends: [.wheel_rules]
-  tags: [cpu-k8s]
+  tags: [cpu-general-k8s]
   image: $WHEEL_IMAGE_UBUNTU2404_CU13
   needs:
     - job: wheel_python_base
