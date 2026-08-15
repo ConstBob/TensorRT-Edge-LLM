@@ -32,16 +32,22 @@ def _model_dir() -> pathlib.Path:
     explicit = os.environ.get("WHEEL_MODEL_DIR")
     if explicit:
         return pathlib.Path(explicit).resolve(strict=True)
-    root = pathlib.Path(config.required_environment("LLM_MODELS_DIR"))
-    candidates = (
+    roots = tuple(
+        pathlib.Path(value) for value in (
+            os.environ.get("LLM_MODELS_DIR"),
+            "/scratch.trt_llm_data/llm-models",
+            "/home/scratch.trt_llm_data/llm-models",
+        ) if value)
+    candidates = tuple(candidate for root in roots for candidate in (
         root / "Qwen2.5-0.5B-Instruct",
         root / "Qwen" / "Qwen2.5-0.5B-Instruct",
-    )
+    ))
     for candidate in candidates:
         if candidate.is_dir():
             return candidate.resolve()
     raise RuntimeError(
-        "Set WHEEL_MODEL_DIR to the Qwen2.5-0.5B-Instruct checkpoint.")
+        "Set WHEEL_MODEL_DIR to the Qwen2.5-0.5B-Instruct checkpoint. "
+        f"Searched: {', '.join(str(path) for path in candidates)}")
 
 
 def _trt_python_wheel(trt_dir: pathlib.Path, python_abi: str) -> pathlib.Path:
@@ -176,15 +182,20 @@ def _local_integration(row: typing.Mapping[str, object], python_abi: str,
     config.write_json(result, evidence)
 
 
-def _ssh_prefix(password: str, operation: str) -> typing.List[str]:
+def _ssh_prefix(operation: str) -> typing.List[str]:
     return [
         "sshpass",
-        "-p",
-        password,
+        "-e",
         operation,
         "-o",
         "StrictHostKeyChecking=no",
     ]
+
+
+def _ssh_environment(password: str) -> typing.Dict[str, str]:
+    environment = dict(os.environ)
+    environment["SSHPASS"] = password
+    return environment
 
 
 def _remote_integration(variant: str, python_abi: str, wheel: pathlib.Path,
@@ -208,18 +219,40 @@ def _remote_integration(variant: str, python_abi: str, wheel: pathlib.Path,
     remote = str(
         pathlib.PurePosixPath(remote_root) / f"edgellm-wheel-{job_id}")
     script = config.REPO_ROOT / "examples" / "python" / "installed_wheel_build_and_infer.py"
-    ssh = _ssh_prefix(password, "ssh")
-    scp = _ssh_prefix(password, "scp")
+    ssh_environment = _ssh_environment(password)
+    ssh = _ssh_prefix("ssh")
+    scp = _ssh_prefix("scp")
     config.run_checked([
         *ssh,
         target,
         f"rm -rf {shlex.quote(remote)} && mkdir -p {shlex.quote(remote)}",
-    ])
+    ],
+                       env=ssh_environment)
     try:
         config.run_checked(
             [*scp, str(wheel),
-             str(script), f"{target}:{remote}/"])
-        python_bin = common.ABI_INTERPRETERS[python_abi]
+             str(script), f"{target}:{remote}/"],
+            env=ssh_environment)
+        python_bin = "python3"
+        probe = subprocess.run([
+            *ssh,
+            target,
+            f"{python_bin} -c " + shlex.quote(
+                "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')"
+            ),
+        ],
+                               check=False,
+                               env=ssh_environment,
+                               stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE,
+                               text=True)
+        if probe.returncode != 0:
+            raise RuntimeError("Cannot identify the target Python ABI.")
+        target_abi = probe.stdout.strip()
+        if target_abi != python_abi:
+            raise RuntimeError(
+                f"Target {python_bin} provides {target_abi}, not {python_abi}."
+            )
         command = " && ".join([
             f"{python_bin} -m venv --without-pip {shlex.quote(remote + '/venv')}",
             (f"{python_bin} -m pip install --ignore-installed "
@@ -235,15 +268,17 @@ def _remote_integration(variant: str, python_abi: str, wheel: pathlib.Path,
              f"--expected-variant {shlex.quote(variant)} "
              f"--result {shlex.quote(remote + '/result.json')}"),
         ])
-        config.run_checked([*ssh, target, command])
+        config.run_checked([*ssh, target, command], env=ssh_environment)
         result.parent.mkdir(parents=True, exist_ok=True)
         config.run_checked(
             [*scp, f"{target}:{remote}/result.json",
-             str(result)])
+             str(result)],
+            env=ssh_environment)
     finally:
         subprocess.run(
             [*ssh, target, f"rm -rf {shlex.quote(remote)}"],
             check=False,
+            env=ssh_environment,
         )
     evidence = json.loads(result.read_text(encoding="utf-8"))
     evidence.update({
@@ -272,9 +307,12 @@ def _integrate_wheel(row: typing.Mapping[str, object],
 
 
 def integration_ci() -> None:
-    """Install, build, and infer with every ABI wheel for one variant."""
+    """Install, build, and infer with every configured ABI wheel."""
+    qualification, _ = matrix.load_qualification()
     row = matrix.variant_row(config.required_environment("VARIANT"))
-    for python_abi in common.ABI_INTERPRETERS:
+    python_abis = row.get("ci_test_python_abis",
+                          qualification["qualified_python_abis"])
+    for python_abi in python_abis:
         _integrate_wheel(row, python_abi)
 
 
@@ -300,7 +338,8 @@ def integration_gate() -> None:
     expected = {
         (str(row["variant_id"]), abi): row
         for row in rows
-        for abi in qualification["qualified_python_abis"]
+        for abi in row.get("ci_test_python_abis",
+                           qualification["qualified_python_abis"])
     }
     evidence_dir = config.REPO_ROOT / "artifacts" / "integration"
     found = {}

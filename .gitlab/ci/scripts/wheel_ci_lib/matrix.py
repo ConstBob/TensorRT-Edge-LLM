@@ -36,6 +36,7 @@ _CI_FIELDS = frozenset({
     "ci_target_trt_wheel",
     "ci_target_work_dir",
     "ci_test_image",
+    "ci_test_python_abis",
     "ci_test_runner",
     "ci_test_trt_requirement",
     "ci_toolchain",
@@ -97,11 +98,21 @@ def _validate_qualification_row(value: typing.Any,
             "ci_board_user",
             "ci_target_trt_wheel",
             "ci_target_model_dir",
+            "ci_test_python_abis",
         ) if not row.get(field))
         if missing:
             raise RuntimeError(
                 f"Variant {variant_id} is missing remote-test fields: {missing}."
             )
+    test_python_abis = row.get("ci_test_python_abis")
+    if test_python_abis is not None and (
+            not isinstance(test_python_abis, list) or not test_python_abis
+            or any(not isinstance(item, str) or not item
+                   for item in test_python_abis)
+            or len(set(test_python_abis)) != len(test_python_abis)):
+        raise RuntimeError(
+            f"Variant {variant_id} ci_test_python_abis must be a non-empty list of unique strings."
+        )
     return row
 
 
@@ -121,6 +132,14 @@ def load_qualification() -> typing.Tuple[typing.Dict[
         _validate_qualification_row(value, index)
         for index, value in enumerate(values)
     ]
+    qualified_python_abis = set(matrix["qualified_python_abis"])
+    for row in qualification:
+        requested = set(row.get("ci_test_python_abis", qualified_python_abis))
+        unsupported = sorted(requested - qualified_python_abis)
+        if unsupported:
+            raise RuntimeError(
+                f"Variant {row['variant_id']} requests unsupported test Python ABIs: {unsupported}."
+            )
     by_id = {str(row["variant_id"]): row for row in qualification}
     if len(by_id) != len(qualification):
         raise RuntimeError(
