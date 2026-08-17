@@ -105,8 +105,14 @@ Gemma4MTPDecoder::Gemma4MTPDecoder(DecodingRuntimeContext& runtime, std::filesys
 bool Gemma4MTPDecoder::decodeStep(DecodingInferenceContext& context)
 {
     NVTX_SCOPED_RANGE(nvtx_gemma4_mtp_decode, "Gemma4MTPDecoder::decodeStep", nvtx_colors::GREEN);
-    return prepareSeed(context) && runAssistantDraftChain(context) && runBaseVerification(context)
-        && acceptAndCommit(context) && updateNextSeed(context);
+    return runDraftProposal(context) && runBaseVerification(context) && acceptAndCommit(context)
+        && updateNextSeed(context);
+}
+
+bool Gemma4MTPDecoder::runDraftProposal(DecodingInferenceContext& context)
+{
+    TIME_STAGE(metrics::StageNames::kSPEC_DECODE_DRAFT_PROPOSAL, context.stream);
+    return prepareSeed(context) && runAssistantDraftChain(context);
 }
 
 bool Gemma4MTPDecoder::captureCudaGraphs(cudaStream_t stream)
@@ -319,7 +325,6 @@ void Gemma4MTPDecoder::onBatchEvict(std::vector<int32_t> const& batchMapping, in
 
 bool Gemma4MTPDecoder::prepareSeed(DecodingInferenceContext& context)
 {
-    TIME_STAGE(metrics::StageNames::kSPEC_DECODE_DRAFT_PROPOSAL, context.stream);
     int32_t const activeBatchSize = context.activeBatchSize;
     int32_t const baseHiddenSize = mRuntime.deployment.specConfig->baseOutputHiddenDim;
     int32_t const draftingStep = mRuntime.deployment.specConfig->draftingStep;
@@ -409,7 +414,6 @@ bool Gemma4MTPDecoder::prepareSeed(DecodingInferenceContext& context)
 
 bool Gemma4MTPDecoder::runAssistantDraftChain(DecodingInferenceContext& context)
 {
-    TIME_STAGE(metrics::StageNames::kSPEC_DECODE_DRAFT_PROPOSAL, context.stream);
     NVTX_SCOPED_RANGE(nvtx_gemma4_mtp_draft, "Gemma4MTPDecoder::runAssistantDraftChain", nvtx_colors::DARK_ORANGE);
 
     if (!mDraftExecutor)

@@ -74,6 +74,8 @@ public:
         Tensor& deviceBatchMapping, cudaStream_t stream, BatchCompactionMode mode) override;
 
 private:
+    //! Seed preparation + assistant draft chain, timed as one draft-proposal stage.
+    bool runDraftProposal(DecodingInferenceContext& context);
     bool prepareSeed(DecodingInferenceContext& context);
     bool runAssistantDraftChain(DecodingInferenceContext& context);
     bool runBaseVerification(DecodingInferenceContext& context);

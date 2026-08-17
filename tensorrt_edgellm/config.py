@@ -31,6 +31,7 @@ Supported quantization formats
     fp16   - plain bfloat16/float16 weights (no quantization)
     fp8    - FP8 E4M3 per-tensor static quantization
     nvfp4  - NVFP4 per-group quantization with FP8 group scales
+    nvfp4_a16 - weight-only NVFP4 (W4A16 / ModelOpt ``W4A16_NVFP4``)
     int4_awq            - AWQ INT4 group quantization (column-packed int32 checkpoints)
     int4_awq_modelopt   - W4A16_AWQ pre-packed uint8 ``[out//2, in]`` checkpoints
     int4_gptq           - GPTQ INT4 group quantization
@@ -2233,8 +2234,13 @@ def _detect_modelopt_unquantized_linears(model_dir: str) -> List[str]:
 
 
 def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
-    """Determine quantisation config from hf_quant_config.json or config.json."""
+    """Determine quantisation config from hf_quant_config.json or config.json.
 
+    Checkpoint-provided W4A16 ``lm_head`` (``W4A16_NVFP4`` in
+    ``quantized_layers``, e.g. Qwen3.6-35B-A3B-NVFP4) maps to
+    :data:`QUANT_NVFP4_A16`. Excluded FP16/BF16 heads stay FP16; export does
+    not invent packed NVFP4 for them.
+    """
     # ---- Sidecar hf_quant_config.json ---------------------------------------
     hf_path = os.path.join(model_dir, "hf_quant_config.json")
     if os.path.exists(hf_path):

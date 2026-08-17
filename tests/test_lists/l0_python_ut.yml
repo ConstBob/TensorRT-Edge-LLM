@@ -110,11 +110,17 @@ tests:
   - tests/python-unittests/test_nvfp4_a16_moe_plugin.py::test_build_rejects_wrong_hidden_state_dtype
   - tests/python-unittests/test_nvfp4_a16_moe_plugin.py::test_build_rejects_nonpositive_sigmoid_routed_scaling_factor
   - tests/python-unittests/test_nvfp4_a16_moe_plugin.py::test_build_rejects_misaligned_dimensions
+  - tests/python-unittests/test_nvfp4_a16_moe_plugin.py::test_build_rejects_unsupported_num_experts
+  - tests/python-unittests/test_nvfp4_a16_moe_plugin.py::test_create_plugin_accepts_256_experts
 
   # Marlin dense NVFP4 (W4A16) GEMM plugin tests
   - tests/python-unittests/test_nvfp4_a16_gemm_plugin.py::test_dense_nvfp4_a16_gemm_decode_and_prefill
   - tests/python-unittests/test_nvfp4_a16_gemm_plugin.py::test_dense_nvfp4_a16_gemm_auto_max_m
   - tests/python-unittests/test_nvfp4_a16_gemm_plugin.py::test_build_rejects_misaligned_dimensions
+  - tests/python-unittests/test_nvfp4_a16_official_lm_head.py::test_mixed_precision_w4a16_lm_head_is_nvfp4_a16
+  - tests/python-unittests/test_nvfp4_a16_official_lm_head.py::test_parse_quant_keeps_excluded_fp16_lm_head
+  - tests/python-unittests/test_nvfp4_a16_official_lm_head.py::test_parse_quant_does_not_invent_lm_head_override
+  - tests/python-unittests/test_nvfp4_a16_official_lm_head.py::test_repack_nvfp4_a16_gated_moe_shapes
 
   # FP16 MoE plugin tests (softmax + sigmoid-group-topk routing)
   - tests/python-unittests/test_fp16_moe_plugin.py::test_fp16_moe_decode_and_prefill_dynamic_engine

@@ -26,6 +26,7 @@ from pathlib import Path
 
 import pygit2
 from docutils import nodes
+from sphinx.ext.autodoc.mock import mock as _mock
 
 # Add necessary directories to Python path
 sys.path.insert(0, str(Path(__file__).parent))  # For importing helper module
@@ -157,6 +158,13 @@ autodoc_mock_imports = [
     'tqdm',
     'safetensors',
 ]
+
+# Sphinx discovers module members after its import-mock context exits.
+# Resolve the lazy export API while the mocks are active so autodoc can see it.
+with _mock(autodoc_mock_imports):
+    import tensorrt_edgellm as _tensorrt_edgellm
+
+    _tensorrt_edgellm._load_export_api()
 
 myst_url_schemes = {
     "http":
