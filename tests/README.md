@@ -83,6 +83,7 @@ Runtime: ModelName-Precision-[LmHeadPrecision-]MaxSeqLen-MaxBatchSize-MaxInputLe
 - `mxlr64` - Max LoRA rank (optional)
 - `mnit128`, `mxit1024`, `mxpiit512` - Min/max image tokens (VLM only)
 - `vitfp8` - Visual precision (VLM only)
+- `vitmhafp8` - Visual attention (ViT MHA) in FP8; requires `vitfp8` (VLM only)
 
 **Benchmark:**
 - `bs1` - Batch size, `isl2048` - Input seq len, `osl128` - Output seq len

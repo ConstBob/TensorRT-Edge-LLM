@@ -43,7 +43,7 @@ from transformers import (AutoModel, AutoModelForCausalLM,
 
 from .datasets import (AudioDataset, ImageDataset, TextDataset, dataset_name,
                        resolve_dataset)
-from .quantization_configs import build_quant_config
+from .quantization_configs import _VISUAL_PREFIXES, build_quant_config
 from .qwen3_asr_loader import (asr_calibration_dataloader, is_qwen3_asr_model,
                                load_qwen3_asr_joint_for_calibration,
                                postprocess_qwen3_asr_checkpoint)
@@ -499,6 +499,37 @@ def _remove_stale_safetensors_index(output_dir: str) -> None:
         os.remove(index_path)
 
 
+def _surface_visual_q_scales(model: torch.nn.Module) -> None:
+    """Save visual attention Q's calibrated scale as a top-level buffer.
+
+    ModelOpt's ``postprocess_state_dict`` (``modelopt/torch/export/quant_utils.py``)
+    renames ``k_bmm_quantizer._amax -> k_proj.k_scale`` (and v_bmm analogue) at
+    save time, but has no Q rename — so ``q_bmm_quantizer._amax`` (matched by the
+    ``_amax`` skip-key) is silently dropped from the saved state_dict. Register a
+    ``q_scale = amax / 448`` buffer directly on the parent attention module so
+    it survives ``save_pretrained -> safetensors -> load_state_dict``. The name
+    "q_scale" contains none of modelopt's skip-keys, so it passes through
+    ``postprocess_state_dict`` unchanged.
+
+    LLM attention modules (whose ``q_bmm_quantizer`` is enabled by
+    ``FP8_ATTN`` when ``--kv_cache_quantization fp8``) follow the legacy
+    ``qScale=1.0`` convention, so we filter by visual prefix to avoid
+    materializing buffers the LLM loader doesn't expect.
+    """
+    FP8_E4M3_MAX = 448.0
+    for name, module in model.named_modules():
+        if not any(p in name for p in _VISUAL_PREFIXES):
+            continue
+        q_q = getattr(module, "q_bmm_quantizer", None)
+        if q_q is None:
+            continue
+        amax = getattr(q_q, "_amax", None)
+        if amax is None:
+            continue
+        scale = (amax.detach().float() / FP8_E4M3_MAX).reshape(())
+        module.register_buffer("q_scale", scale)
+
+
 def _fix_generation_config_for_strict_validate(model) -> None:
     """WAR for transformers >= 5.x ``GenerationConfig.validate(strict=True)``.
 
@@ -717,6 +748,7 @@ def quantize_and_export(
     lm_head_quantization: Optional[str] = None,
     visual_quantization: Optional[str] = None,
     cp_quantization: Optional[str] = None,
+    visual_mha_quantization: Optional[str] = None,
     kv_cache_quantization: Optional[str] = None,
     audio_quantization: Optional[str] = None,
     dtype: str = "fp16",
@@ -879,6 +911,7 @@ def quantize_and_export(
             lm_head_quantization,
             kv_cache_quantization,
             visual_quantization=visual_quantization,
+            visual_mha_quantization=visual_mha_quantization,
             audio_quantization=audio_quantization,
             cp_quantization=cp_quantization,
             fuse_gdn_qkvzba_scales=fuse_gdn_qkvzba_scales,
@@ -1016,6 +1049,8 @@ def quantize_and_export(
             n_shared = _share_gdn_qkvzba_scales(model)
             print(f"GDN qkvzba scale sharing: {n_shared} layer(s)")
         mtq.print_quant_summary(model)
+        if visual_mha_quantization == "fp8":
+            _surface_visual_q_scales(model)
 
     print(f"Quantization: {time.time() - t0:.1f}s")
 

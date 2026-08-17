@@ -405,6 +405,10 @@ class QuantConfig:
     gptq_zero_point_offset: int = 1
     # kv_cache_quant: "fp8" when KV-cache is quantised, None otherwise
     kv_cache_quant: Optional[str] = None
+    # visual_mha_quant: "fp8" when the ViT visual attention (Q*K^T / P*V
+    # matmuls) is quantised, None otherwise. Orthogonal to kv_cache_quant
+    # (which only gates the LLM KV cache).
+    visual_mha_quant: Optional[str] = None
     # module names excluded from quantisation (typically ["lm_head"])
     excluded: List[str] = field(default_factory=list)
     # Per-layer quant type overrides for MIXED_PRECISION checkpoints.
@@ -2263,7 +2267,8 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
             return QuantConfig(
                 quant_type=dominant,
                 group_size=group_size,
-                kv_cache_quant=_kv_norm(q.get("kv_cache_quant_algo", "")),
+                kv_cache_quant=_detect_llm_kv_cache_fp8(model_dir),
+                visual_mha_quant=_detect_visual_mha_fp8(model_dir),
                 excluded=_effective_excluded_modules(
                     model_dir, list(q.get("exclude_modules", []))),
                 layer_overrides=layer_overrides,
@@ -2281,7 +2286,8 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
         return QuantConfig(
             quant_type=qt,
             group_size=gs,
-            kv_cache_quant=_kv_norm(q.get("kv_cache_quant_algo", "")),
+            kv_cache_quant=_detect_llm_kv_cache_fp8(model_dir),
+            visual_mha_quant=_detect_visual_mha_fp8(model_dir),
             excluded=excluded,
         )
 
@@ -2475,3 +2481,63 @@ def _kv_norm(s: Optional[str]) -> Optional[str]:
     if not s:
         return None
     return s.strip().lower() or None
+
+
+# Keep in sync with quantization_configs._VISUAL_PREFIXES (not imported here:
+# that module pulls in modelopt, too heavy for config parsing).
+_VISUAL_PATH_HINTS = ("visual", "vision_tower", "vision_model",
+                      "multi_modal_projector", "mlp1", "image_embed",
+                      "embed_vision")
+
+
+def _safetensor_keys(model_dir: str) -> Optional[List[str]]:
+    """Return all tensor keys from sharded or single-file safetensors."""
+    index_path = os.path.join(model_dir, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            return list(json.load(f).get("weight_map", {}).keys())
+    st_path = os.path.join(model_dir, "model.safetensors")
+    if not os.path.exists(st_path):
+        return None
+    from safetensors import safe_open
+    with safe_open(st_path, framework="pt") as f:
+        return list(f.keys())
+
+
+def _detect_visual_mha_fp8(model_dir: str) -> Optional[str]:
+    """Return ``"fp8"`` iff the checkpoint carries visual-MHA Q/K/V scales.
+
+    Self-describing detection: the presence of ``<visual_prefix>*.q_scale``
+    buffers in the safetensors is the ground-truth signal that ViT FP8
+    MHA was calibrated. Avoids trusting modelopt's hf_quant_config.json
+    metadata (which has no ``visual_mha_quant_algo`` slot and conflates
+    ViT q/k/v_bmm with the LLM KV cache).
+    """
+    keys = _safetensor_keys(model_dir)
+    if keys is None:
+        return None
+    for k in keys:
+        if k.endswith(".q_scale") and any(h in k for h in _VISUAL_PATH_HINTS):
+            return "fp8"
+    return None
+
+
+def _detect_llm_kv_cache_fp8(model_dir: str) -> Optional[str]:
+    """Return ``"fp8"`` iff the checkpoint carries LLM KV-cache K/V scales.
+
+    Self-describing detection: an ``<llm_attn>.k_proj.k_scale`` buffer
+    outside of any visual / vision subtree is the ground-truth signal.
+    Modelopt's ``hf_quant_config.json:kv_cache_quant_algo`` field would
+    say "FP8" even when only ViT MHA was requested (because its writer
+    trips on any enabled ``k_bmm_quantizer``, including the visual one);
+    ignoring that field and looking at the checkpoint directly avoids
+    the false positive.
+    """
+    keys = _safetensor_keys(model_dir)
+    if keys is None:
+        return None
+    for k in keys:
+        if k.endswith(".k_proj.k_scale") and not any(
+                h in k for h in _VISUAL_PATH_HINTS):
+            return "fp8"
+    return None

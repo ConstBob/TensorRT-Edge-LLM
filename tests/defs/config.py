@@ -550,6 +550,10 @@ class TestConfig:
     llm_precision: str
     lm_head_precision: Optional[str] = None
     visual_precision: Optional[str] = None
+    # ViT MHA precision (Q*K^T / P*V in fp8). Requires visual_precision=fp8:
+    # the q/k/v bmm dequant scales are calibrated by the same multimodal
+    # calibration loop that visual-tower quantization drives.
+    visual_mha_precision: Optional[str] = None
     audio_precision: Optional[str] = None
     # extw_<value> token: ffn / lm / moe / nvfp4_moe / ffn_lm / all
     externalize_weights: Optional[str] = None
@@ -833,6 +837,12 @@ class TestConfig:
                           TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
                           TaskType.INFERENCE
                       }, {ModelType.VLM, ModelType.OMNI, ModelType.VLA},
+                      is_required=False),
+        ParameterSpec("visual_mha_precision",
+                      "vitmha", {
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
+                          TaskType.INFERENCE
+                      }, {ModelType.VLM},
                       is_required=False),
         ParameterSpec("max_kv_cache_capacity",
                       "mxkvc", {
@@ -1162,6 +1172,9 @@ class TestConfig:
                 parsed_params['text_token_length'] = int(part[3:])
             elif part.startswith('itl'):
                 parsed_params['image_token_length'] = int(part[3:])
+            # Exact match must precede the startswith('vit') branch below.
+            elif part == 'vitmhafp8':
+                parsed_params['visual_mha_precision'] = 'fp8'
             elif part.startswith('vit'):
                 visual_precision = part[3:]
                 if visual_precision in VALID_VISUAL_PRECISIONS:
@@ -1226,6 +1239,11 @@ class TestConfig:
         if not visual_precision and model_type in (ModelType.VLM,
                                                    ModelType.OMNI):
             parsed_params['visual_precision'] = "fp16"
+        if (parsed_params.get('visual_mha_precision') == 'fp8'
+                and parsed_params.get('visual_precision') != 'fp8'):
+            raise ValueError(
+                f"vitmhafp8 requires vitfp8 (q/k/v bmm scales are calibrated "
+                f"by the visual-tower quantization pass): {param_str}")
         if model_type in (ModelType.TTS, ModelType.ASR, ModelType.OMNI
                           ) and 'audio_precision' not in parsed_params:
             parsed_params['audio_precision'] = "fp16"
@@ -1498,6 +1516,8 @@ class TestConfig:
                 f"-LM{self._canonical_quant_suffix(self.lm_head_precision)}")
         if self.visual_precision == "fp8":
             model_id += "-VITFP8"
+        if self.visual_mha_precision == "fp8":
+            model_id += "-VITMHAFP8"
         if self.audio_precision == "fp8":
             model_id += "-AUDFP8"
         if self.fp8_kv_cache:
@@ -1552,6 +1572,8 @@ class TestConfig:
             suffixes = []
             if any(p.lower() == "vitfp8" for p in modifier_parts):
                 suffixes.append("VITFP8")
+            if any(p.lower() == "vitmhafp8" for p in modifier_parts):
+                suffixes.append("VITMHAFP8")
             if any(p.lower() == "fp8kv" for p in modifier_parts):
                 suffixes.append("FP8-KV")
             return "-".join(suffixes) if suffixes else None
@@ -1566,6 +1588,8 @@ class TestConfig:
                 model_id += "-LMNVFP4"
             elif lower == "vitfp8":
                 model_id += "-VITFP8"
+            elif lower == "vitmhafp8":
+                model_id += "-VITMHAFP8"
             elif lower == "fp8kv":
                 model_id += "-FP8-KV"
         return model_id
@@ -1617,6 +1641,9 @@ class TestConfig:
         extras = []
         if self.visual_precision == "fp8" and "vitfp8" not in mod_lower:
             extras.append("VITFP8")
+        if (self.visual_mha_precision == "fp8"
+                and "vitmhafp8" not in mod_lower):
+            extras.append("VITMHAFP8")
         if self.audio_precision == "fp8":
             extras.append("AUDFP8")
         if self.fp8_kv_cache and "fp8kv" not in mod_lower:
@@ -2226,6 +2253,8 @@ class TestConfig:
     def get_visual_onnx_dir(self, precision: str) -> str:
         """Get visual ONNX model directory"""
         name = f"visual-{precision}"
+        if self.visual_mha_precision == "fp8":
+            name += "-mhafp8"
         if self.trt_native_attn:
             name += "-trt11"
         return os.path.join(self.get_onnx_base_dir(), name)
@@ -2297,10 +2326,12 @@ class TestConfig:
 
     def get_visual_engine_dir(self) -> str:
         """Get visual engine directory"""
-        name = (f"visual-{self.visual_precision}"
-                f"-mnit{self.min_image_tokens}"
-                f"-mxit{self.max_image_tokens}"
-                f"-mxpiit{self.max_image_tokens_per_image}")
+        name = f"visual-{self.visual_precision}"
+        if self.visual_mha_precision == "fp8":
+            name += "-mhafp8"
+        name += (f"-mnit{self.min_image_tokens}"
+                 f"-mxit{self.max_image_tokens}"
+                 f"-mxpiit{self.max_image_tokens_per_image}")
         if self.trt_native_attn:
             name += "-trt11"
         return os.path.join(self.get_engine_base_dir(), name)
