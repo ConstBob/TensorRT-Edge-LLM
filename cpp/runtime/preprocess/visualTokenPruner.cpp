@@ -18,6 +18,7 @@
 #include "runtime/preprocess/visualTokenPruner.h"
 
 #include "common/checkMacros.h"
+#include "common/logger.h"
 #include "kernels/dart/dartGatherKernels.h"
 #include "runtime/preprocess/dartPruner.h"
 
@@ -25,6 +26,7 @@
 #include <cmath>
 #include <map>
 #include <mutex>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 
@@ -44,28 +46,136 @@ VisualTokenPruner::VisualTokenPruner(VisualPrunerConfig const& config, LLMEngine
     , mHiddenSize(engineConfig.hiddenSize)
     , mRotaryDim(engineConfig.rotaryDim)
     , mMaxKVCacheCapacity(engineConfig.maxKVCacheCapacity)
+    , mMaxBatchSize(std::max(1, engineConfig.maxSupportedBatchSize))
 {
     check::check(mConfig.reductionRatio > 0.0F && mConfig.reductionRatio < 1.0F, "reductionRatio must be in (0, 1)");
     check::check(mImageTokenId >= 0, "visual-token pruning requires a VLM engine with an image token id");
 
     int32_t const maxInputLen = engineConfig.maxSupportedInputLength;
-    mKeepIdxDevice = Tensor(
-        {mMaxKVCacheCapacity}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "VisualTokenPruner::keepIdxDevice");
-    mKeepIdxHost
-        = Tensor({mMaxKVCacheCapacity}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "VisualTokenPruner::keepIdxHost");
+    mKeepIdxDevice = Tensor({mMaxBatchSize, mMaxKVCacheCapacity}, DeviceType::kGPU, nvinfer1::DataType::kINT32,
+        "VisualTokenPruner::keepIdxDevice");
+    mKeepIdxHost = Tensor({mMaxBatchSize, mMaxKVCacheCapacity}, DeviceType::kCPU, nvinfer1::DataType::kINT32,
+        "VisualTokenPruner::keepIdxHost");
     int64_t const embedPlaneBytes = static_cast<int64_t>(maxInputLen) * mHiddenSize * sizeof(half);
     int64_t const ropePlaneBytes = static_cast<int64_t>(mMaxKVCacheCapacity) * mRotaryDim * sizeof(float);
     mGatherScratch = Tensor({std::max(embedPlaneBytes, ropePlaneBytes)}, DeviceType::kGPU, nvinfer1::DataType::kINT8,
         "VisualTokenPruner::gatherScratch");
+
+    // Batched-flow vectors are fully preallocated so the prefill hot path never touches the heap.
+    mSlotKeepLists.resize(mMaxBatchSize);
+    for (auto& keepList : mSlotKeepLists)
+    {
+        keepList.reserve(maxInputLen);
+    }
+    mOldLens.reserve(mMaxBatchSize);
+    mNewLens.reserve(mMaxBatchSize);
+    mKeepIndicesHost.reserve(maxInputLen);
+    mImagePositions.reserve(maxInputLen);
+    mTextPositions.reserve(maxInputLen);
 }
 
 int32_t VisualTokenPruner::pruneForPrefill(
     std::vector<int32_t> const& hostTokenIds, PipelineIO& io, int32_t origLen, cudaStream_t stream)
 {
     check::check(static_cast<int32_t>(hostTokenIds.size()) == origLen, "token ids length mismatch");
-    check::check(io.inputsEmbeds.getShape()[0] == 1, "visual-token pruning supports batch size 1 only");
+    check::check(io.inputsEmbeds.getShape()[0] == 1, "pruneForPrefill expects batch size 1");
     check::check(io.inputsEmbeds.getShape()[1] == origLen, "inputsEmbeds length mismatch");
 
+    Tensor const embedsView(
+        io.inputsEmbeds.rawPointer(), {origLen, mHiddenSize}, DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    return selectForSlot(hostTokenIds, embedsView, io, origLen, stream);
+}
+
+int32_t VisualTokenPruner::pruneBatchForPrefill(std::vector<std::vector<int32_t>> const& hostTokenIds, PipelineIO& io,
+    std::vector<int32_t>& effectiveLens, int32_t maxLen, std::vector<int32_t>& prunedTokensOut, cudaStream_t stream)
+{
+    int32_t const batch = static_cast<int32_t>(io.inputsEmbeds.getShape()[0]);
+    check::check(batch >= 1 && batch <= mMaxBatchSize, "batch size out of range for visual-token pruning");
+    check::check(
+        static_cast<int32_t>(hostTokenIds.size()) >= batch && static_cast<int32_t>(effectiveLens.size()) >= batch,
+        "token ids / effective lengths must cover the batch");
+    check::check(io.inputsEmbeds.getShape()[1] == maxLen, "inputsEmbeds length mismatch");
+
+    prunedTokensOut.assign(batch, 0);
+    if (batch == 1)
+    {
+        int32_t const prunedLen = pruneForPrefill(hostTokenIds[0], io, maxLen, stream);
+        prunedTokensOut[0] = maxLen - prunedLen;
+        effectiveLens[0] = prunedLen;
+        return prunedLen;
+    }
+
+    // A slot whose token ids don't cover exactly this prefill's effective length (chunked
+    // continuation) can't be partitioned by modality — skip the whole batch rather than fail.
+    for (int32_t i = 0; i < batch; ++i)
+    {
+        if (static_cast<int32_t>(hostTokenIds[i].size()) != effectiveLens[i] || effectiveLens[i] > maxLen)
+        {
+            LOG_WARNING("Visual-token pruning skipped: slot %d token ids do not cover the full prefill.", i);
+            return maxLen;
+        }
+    }
+
+    // Per-slot selection with deferred compaction: prune() sees each slot's contiguous
+    // [len, hidden] plane with slot-local positions, and compactToKeepList() records the keep
+    // list instead of gathering. The repack to the new row pitch happens once, below.
+    for (int32_t i = 0; i < batch; ++i)
+    {
+        mSlotKeepLists[i].clear(); // capacity reserved in the constructor; no reallocation
+    }
+    mDeferCompaction = true;
+    mNewLens.assign(effectiveLens.begin(), effectiveLens.begin() + batch);
+    std::vector<int32_t>& newLens = mNewLens;
+    try
+    {
+        for (int32_t i = 0; i < batch; ++i)
+        {
+            mCurrentSlot = i;
+            int32_t const len = effectiveLens[i];
+            void* slotPtr
+                = static_cast<half*>(io.inputsEmbeds.rawPointer()) + static_cast<int64_t>(i) * maxLen * mHiddenSize;
+            Tensor const slotView(slotPtr, {len, mHiddenSize}, DeviceType::kGPU, nvinfer1::DataType::kHALF);
+            int32_t const slotPrunedLen = selectForSlot(hostTokenIds[i], slotView, io, len, stream);
+            // Algorithms that shorten a request without routing the result through
+            // compactToKeepList() (e.g. direct-rewrite token mergers) cannot participate in
+            // the batched repack — their in-place buffer edits assume the batch-1 layout.
+            check::check(slotPrunedLen == len || static_cast<int32_t>(mSlotKeepLists[i].size()) == slotPrunedLen,
+                std::string(name()) + " does not support batched pruning (bypassed compactToKeepList)");
+            newLens[i] = slotPrunedLen;
+        }
+    }
+    catch (...)
+    {
+        mDeferCompaction = false;
+        throw;
+    }
+    mDeferCompaction = false;
+
+    int32_t newMaxLen = 0;
+    bool anyPruned = false;
+    for (int32_t i = 0; i < batch; ++i)
+    {
+        newMaxLen = std::max(newMaxLen, newLens[i]);
+        anyPruned = anyPruned || newLens[i] < effectiveLens[i];
+    }
+    if (!anyPruned)
+    {
+        return maxLen;
+    }
+
+    mOldLens.assign(effectiveLens.begin(), effectiveLens.begin() + batch);
+    executeBatchCompaction(io, mOldLens, newLens, maxLen, newMaxLen, stream);
+    for (int32_t i = 0; i < batch; ++i)
+    {
+        prunedTokensOut[i] = effectiveLens[i] - newLens[i];
+        effectiveLens[i] = newLens[i];
+    }
+    return newMaxLen;
+}
+
+int32_t VisualTokenPruner::selectForSlot(std::vector<int32_t> const& hostTokenIds, Tensor const& embedsView,
+    PipelineIO& io, int32_t origLen, cudaStream_t stream)
+{
     // Partition positions by modality.
     mImagePositions.clear();
     mTextPositions.clear();
@@ -105,8 +215,6 @@ int32_t VisualTokenPruner::pruneForPrefill(
         return origLen;
     }
 
-    Tensor const embedsView(
-        io.inputsEmbeds.rawPointer(), {origLen, mHiddenSize}, DeviceType::kGPU, nvinfer1::DataType::kHALF);
     PruneRequest req;
     req.embeds = &embedsView;
     req.imagePositions = &mImagePositions;
@@ -155,6 +263,14 @@ int32_t VisualTokenPruner::compactToKeepList(
     if (prunedLen >= origLen)
     {
         return origLen;
+    }
+    if (mDeferCompaction)
+    {
+        // Batched flow: record the slot's keep list; executeBatchCompaction() performs the
+        // gathers for all slots at once after every slot has been selected. assign() reuses
+        // the constructor-reserved capacity, keeping this allocation-free.
+        mSlotKeepLists[mCurrentSlot].assign(mKeepIndicesHost.begin(), mKeepIndicesHost.end());
+        return prunedLen;
     }
     int32_t const numPruned = origLen - prunedLen;
 
@@ -205,6 +321,98 @@ int32_t VisualTokenPruner::compactToKeepList(
     }
 
     return prunedLen;
+}
+
+void VisualTokenPruner::executeBatchCompaction(PipelineIO& io, std::vector<int32_t> const& oldLens,
+    std::vector<int32_t> const& newLens, int32_t oldMaxLen, int32_t newMaxLen, cudaStream_t stream)
+{
+    int32_t const batch = static_cast<int32_t>(oldLens.size());
+    int64_t const embedRowBytes = static_cast<int64_t>(mHiddenSize) * sizeof(half);
+    int64_t const ropeRowBytes = static_cast<int64_t>(mRotaryDim) * sizeof(float);
+    bool const hasRope = !io.mropeCosSin.isEmpty();
+    if (hasRope)
+    {
+        // Only the row pitch (shape[1]) drives the per-slot pointer math below; shape[0] may
+        // still be the allocation-time max batch on paths that never reshape mropeCosSin.
+        check::check(io.mropeCosSin.getShape()[1] == mMaxKVCacheCapacity, "mropeCosSin capacity mismatch");
+    }
+    for (Tensor const& deepstack : io.deepstackEmbeds)
+    {
+        check::check(
+            deepstack.getShape()[0] == batch && deepstack.getShape()[1] == oldMaxLen, "deepstackEmbeds shape mismatch");
+    }
+
+    // Slots are repacked in ascending order so writes at the new (smaller) row pitch never
+    // touch a not-yet-consumed slot's source rows: slot i's destination ends at
+    // (i + 1) * newMaxLen <= (i + 1) * oldMaxLen, the start of slot i + 1's source plane.
+    for (int32_t i = 0; i < batch; ++i)
+    {
+        int32_t const oldLen = oldLens[i];
+        int32_t const newLen = newLens[i];
+        int32_t const numPruned = oldLen - newLen;
+        // Skip slots with nothing to do: empty, or unpruned and already at their final offset
+        // (slot 0 always is; every unpruned slot is when the row pitch does not change).
+        if (newLen == 0 || (numPruned == 0 && (i == 0 || newMaxLen == oldMaxLen)))
+        {
+            continue;
+        }
+
+        // Per-slot pinned/device index regions: reusing one region across slots would let the
+        // CPU overwrite an earlier slot's list before its async H2D copy has executed.
+        int32_t* keepHost = mKeepIdxHost.dataPointer<int32_t>() + static_cast<int64_t>(i) * mMaxKVCacheCapacity;
+        int32_t* keepDevice = mKeepIdxDevice.dataPointer<int32_t>() + static_cast<int64_t>(i) * mMaxKVCacheCapacity;
+        int32_t uploadRows = newLen;
+        if (numPruned > 0)
+        {
+            std::vector<int32_t> const& keepList = mSlotKeepLists[i];
+            std::copy(keepList.begin(), keepList.end(), keepHost);
+            // Rope-extended rows: shift the continuation positions [oldLen, cap) down so decode
+            // reads the positions right after the unpruned sequence (see compactToKeepList).
+            int32_t const ropeRows = mMaxKVCacheCapacity - numPruned;
+            for (int32_t r = newLen; r < ropeRows; ++r)
+            {
+                keepHost[r] = oldLen + (r - newLen);
+            }
+            uploadRows = ropeRows;
+        }
+        else
+        {
+            std::iota(keepHost, keepHost + newLen, 0); // identity: the slot only moves pitch
+        }
+        CUDA_CHECK(cudaMemcpyAsync(
+            keepDevice, keepHost, static_cast<size_t>(uploadRows) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+
+        auto const repackEmbedPlane = [&](Tensor& tensor) {
+            auto* base = static_cast<uint8_t*>(tensor.rawPointer());
+            uint8_t const* src = base + static_cast<int64_t>(i) * oldMaxLen * embedRowBytes;
+            uint8_t* dst = base + static_cast<int64_t>(i) * newMaxLen * embedRowBytes;
+            kernel::gatherRows(mGatherScratch.rawPointer(), src, keepDevice, newLen, embedRowBytes, stream);
+            CUDA_CHECK(cudaMemcpyAsync(dst, mGatherScratch.rawPointer(), static_cast<size_t>(newLen) * embedRowBytes,
+                cudaMemcpyDeviceToDevice, stream));
+        };
+        repackEmbedPlane(io.inputsEmbeds);
+        for (Tensor& deepstack : io.deepstackEmbeds)
+        {
+            repackEmbedPlane(deepstack);
+        }
+
+        if (numPruned > 0 && hasRope)
+        {
+            // Rope pitch (KV-cache capacity) is unchanged; the gather is in-plane.
+            auto* plane = static_cast<uint8_t*>(io.mropeCosSin.rawPointer())
+                + static_cast<int64_t>(i) * mMaxKVCacheCapacity * ropeRowBytes;
+            int32_t const ropeRows = mMaxKVCacheCapacity - numPruned;
+            kernel::gatherRows(mGatherScratch.rawPointer(), plane, keepDevice, ropeRows, ropeRowBytes, stream);
+            CUDA_CHECK(cudaMemcpyAsync(plane, mGatherScratch.rawPointer(), static_cast<size_t>(ropeRows) * ropeRowBytes,
+                cudaMemcpyDeviceToDevice, stream));
+        }
+    }
+
+    check::check(io.inputsEmbeds.reshape({batch, newMaxLen, mHiddenSize}), "Tensor reshape failed");
+    for (Tensor& deepstack : io.deepstackEmbeds)
+    {
+        check::check(deepstack.reshape({batch, newMaxLen, mHiddenSize}), "Tensor reshape failed");
+    }
 }
 
 // ---------------------------------------------------------------------------

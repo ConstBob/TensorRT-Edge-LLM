@@ -83,20 +83,28 @@ struct PruneRequest
     int32_t origLen{0};
 };
 
-//! Abstract prefill-time visual-token pruner (batch 1).
+//! Abstract prefill-time visual-token pruner.
 //!
-//! The non-virtual pruneForPrefill() owns everything algorithms must not diverge on: the
-//! enablement guards (minVisualTokens, target-is-a-reduction), modality partitioning, and the
-//! target computation. Subclasses implement prune() — with full freedom over what "pruning"
-//! means (subset selection, token merging, per-image quotas, ...) — and typically finish by
-//! calling compactToKeepList(), which owns the invariant-laden buffer compaction: all text
-//! tokens are always kept; kept tokens retain their original absolute RoPE positions; decode
-//! continues at the position after the unpruned sequence (matching the HF DART reference).
+//! The non-virtual pruneForPrefill() / pruneBatchForPrefill() own everything algorithms must
+//! not diverge on: the enablement guards (minVisualTokens, target-is-a-reduction), modality
+//! partitioning, and the target computation. Subclasses implement prune() — with full freedom
+//! over what "pruning" means (subset selection, token merging, per-image quotas, ...) — and
+//! finish by calling compactToKeepList(), which owns the invariant-laden buffer compaction:
+//! all text tokens are always kept; kept tokens retain their original absolute RoPE positions;
+//! decode continues at the position after the unpruned sequence (matching the HF DART
+//! reference).
+//!
+//! Batching: prune() is always invoked with a single-slot view (PruneRequest.embeds is that
+//! slot's contiguous [len, hidden] plane; all positions are slot-local), so algorithms are
+//! batch-agnostic. In the batched flow compactToKeepList() records the slot's keep list
+//! instead of compacting immediately; once every slot is selected, the base repacks all
+//! batch planes to the new (pruned) row pitch in one pass. Consequently batched pruning
+//! requires the algorithm to route its result through compactToKeepList().
 //!
 //! Instances are created through createVisualTokenPruner() and reused across requests, so
 //! per-request device work buffers should be preallocated in the constructor. The caller is
 //! responsible for the runtime gates (fresh KV cache, mRoPE engine, no spec decode, ...) and
-//! for shrinking the context lengths to the returned pruned length.
+//! for shrinking the context lengths to the returned pruned lengths.
 class VisualTokenPruner
 {
 public:
@@ -119,6 +127,28 @@ public:
     //!         (no/too-few visual tokens, or the target keep count is not a reduction).
     int32_t pruneForPrefill(
         std::vector<int32_t> const& hostTokenIds, PipelineIO& io, int32_t origLen, cudaStream_t stream);
+
+    //! Prune the assembled prefill inputs for a batch of requests. The batch size is taken
+    //! from `io.inputsEmbeds` shape [batch, maxLen, hiddenSize].
+    //!
+    //! Selects per slot (slots without enough visual tokens are left unpruned), then repacks
+    //! every batch plane of `inputsEmbeds` / `deepstackEmbeds` to the new maximum length and
+    //! gathers each pruned slot's mRoPE rows. `effectiveLens` is updated in place to the
+    //! per-slot pruned lengths and `prunedTokensOut` receives the per-slot removed counts.
+    //! Returns `maxLen` unchanged when nothing was pruned, or when any slot's token ids don't
+    //! cover its effective length (chunked continuation — modality partitioning is impossible).
+    //!
+    //! \param hostTokenIds Per-slot expanded token ids (size >= batch; slot i must satisfy
+    //!                     hostTokenIds[i].size() == effectiveLens[i]).
+    //! \param io Pipeline buffers; `inputsEmbeds` must currently be [batch, maxLen, hiddenSize].
+    //! \param effectiveLens Per-slot prefill lengths (size >= batch); updated in place.
+    //! \param maxLen Current padded prefill length (== max of effectiveLens).
+    //! \param prunedTokensOut Per-slot number of removed tokens (resized to batch).
+    //! \param stream CUDA stream all device work runs on.
+    //! \return The new padded prefill length (== max of the updated effectiveLens).
+    int32_t pruneBatchForPrefill(std::vector<std::vector<int32_t>> const& hostTokenIds, PipelineIO& io,
+        std::vector<int32_t>& effectiveLens, int32_t maxLen, std::vector<int32_t>& prunedTokensOut,
+        cudaStream_t stream);
 
     VisualPrunerConfig const& config() const noexcept
     {
@@ -145,18 +175,41 @@ protected:
         PipelineIO& io, std::vector<int32_t> const& retainedImageIndices, PruneRequest const& req, cudaStream_t stream);
 
 private:
+    //! Guards + modality partitioning + algorithm invocation for one slot. `embedsView` is the
+    //! slot's contiguous [origLen, hiddenSize] plane; positions handed to prune() are slot-local.
+    int32_t selectForSlot(std::vector<int32_t> const& hostTokenIds, Tensor const& embedsView, PipelineIO& io,
+        int32_t origLen, cudaStream_t stream);
+
+    //! Repack every batch plane of inputsEmbeds / deepstackEmbeds from row pitch `oldMaxLen`
+    //! to `newMaxLen` (dropping each pruned slot's removed rows) and gather pruned slots'
+    //! mRoPE rows in place. Consumes mSlotKeepLists.
+    void executeBatchCompaction(PipelineIO& io, std::vector<int32_t> const& oldLens,
+        std::vector<int32_t> const& newLens, int32_t oldMaxLen, int32_t newMaxLen, cudaStream_t stream);
+
     VisualPrunerConfig mConfig;
     int32_t mImageTokenId{-1};
     int32_t mHiddenSize{0};
     int32_t mRotaryDim{0};
     int32_t mMaxKVCacheCapacity{0};
+    int32_t mMaxBatchSize{1};
+
+    //! Batched-flow state: while set, compactToKeepList() validates and records the current
+    //! slot's keep list into mSlotKeepLists instead of compacting immediately. All batched-flow
+    //! vectors are sized/reserved once in the constructor so the prefill hot path never
+    //! allocates: the outer mSlotKeepLists is fixed at mMaxBatchSize and the inner buffers
+    //! (bounded by maxSupportedInputLength) are cleared and reused across requests.
+    bool mDeferCompaction{false};
+    int32_t mCurrentSlot{0};
+    std::vector<std::vector<int32_t>> mSlotKeepLists;
+    std::vector<int32_t> mOldLens; //!< per-request scratch (reused)
+    std::vector<int32_t> mNewLens; //!< per-request scratch (reused)
 
     std::vector<int32_t> mImagePositions;  //!< per-request scratch (reused)
     std::vector<int32_t> mTextPositions;   //!< per-request scratch (reused)
     std::vector<ImageSpan> mImageSpans;    //!< per-request scratch (reused)
     std::vector<int32_t> mKeepIndicesHost; //!< final sorted keep list (text + retained images)
-    Tensor mKeepIdxDevice;                 //!< [maxKVCacheCapacity] INT32
-    Tensor mKeepIdxHost;                   //!< pinned mirror
+    Tensor mKeepIdxDevice;                 //!< [maxBatchSize * maxKVCacheCapacity] INT32, one region per slot
+    Tensor mKeepIdxHost;                   //!< pinned mirror (per-slot regions avoid H2D reuse races)
 
     //! Gather scratch (large enough for one [maxInputLen, hiddenSize] FP16 plane and for the
     //! [maxKVCacheCapacity, rotaryDim] FP32 rope plane).
