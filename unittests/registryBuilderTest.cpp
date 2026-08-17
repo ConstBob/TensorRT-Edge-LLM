@@ -663,34 +663,64 @@ TEST(RegistryBuilderTest, DraftEngineKVCacheUsesPluginPath)
     EXPECT_EQ(kvIt->shape[0].value, 2); // combined K+V dimension (leading, pool contract)
 }
 
-TEST(RegistryBuilderTest, DraftEngineKVPageTableRowsTrackActiveBatch)
+TEST(RegistryBuilderTest, SpecDraftRegistriesKVPageTableRowsTrackActiveBatch)
 {
-    LLMEngineConfig cfg = makeBasicLLMConfig();
-    cfg.numAttentionLayers = 2;
-    cfg.numDecoderLayers = 2;
-    cfg.isSpecDecodeBase = true;
+    LLMEngineConfig draft = makeBasicLLMConfig();
+    draft.numAttentionLayers = 2;
+    draft.numDecoderLayers = 2;
+    draft.maxDraftTreeSize = 16;
 
-    populateHybridFieldsFromScalars(cfg);
+    populateHybridFieldsFromScalars(draft);
     DeploymentConfig bundle;
-    bundle.draft = cfg;
     SpecDecodeConfig specConfig{};
     specConfig.baseOutputHiddenDim = 12288;
     specConfig.draftHiddenSize = 2048;
     bundle.specConfig = specConfig;
-    auto reg = buildRegistryForSpecDecodeDraft(bundle);
-    auto specs = reg.allExpandedSpecs();
 
-    auto ptIt = std::find_if(specs.begin(), specs.end(), [](TensorSpec const& s) { return s.name == "kv_page_table"; });
-    ASSERT_NE(ptIt, specs.end());
-    EXPECT_EQ(ptIt->io, TensorIO::kInput);
-    EXPECT_EQ(ptIt->dtype, nvinfer1::DataType::kINT32);
-    ASSERT_EQ(ptIt->shape.size(), 3u);
-    // AttentionPlugin rejects a page table whose row count differs from the packed QKV batch, so
-    // this dimension must stay symbolic. Without a spec here the executor falls back to the page
-    // table's own [maxBatchSize, ...] extent, which only matches when maxBatchSize is 1.
-    EXPECT_EQ(ptIt->shape[0].symbol, &InferenceDims::batch);
-    EXPECT_EQ(ptIt->shape[1].value, 2);
-    EXPECT_EQ(ptIt->shape[2].value, computeMaxPagesPerSeq(cfg.maxKVCacheCapacity));
+    auto checkPageTable = [&](TensorRegistry const& reg, char const* registryName) {
+        SCOPED_TRACE(registryName);
+        auto specs = reg.allExpandedSpecs();
+        auto pageTableIt = std::find_if(
+            specs.begin(), specs.end(), [](TensorSpec const& spec) { return spec.name == "kv_page_table"; });
+        ASSERT_NE(pageTableIt, specs.end());
+        EXPECT_EQ(pageTableIt->io, TensorIO::kInput);
+        EXPECT_EQ(pageTableIt->dtype, nvinfer1::DataType::kINT32);
+        ASSERT_EQ(pageTableIt->shape.size(), 3u);
+        EXPECT_EQ(pageTableIt->shape[0].symbol, &InferenceDims::batch);
+        EXPECT_EQ(pageTableIt->shape[1].value, 2);
+        EXPECT_EQ(pageTableIt->shape[2].value, computeMaxPagesPerSeq(draft.maxKVCacheCapacity));
+
+        for (int64_t const activeBatch : {1, 2})
+        {
+            InferenceDims const dims = draft.proposalDims(activeBatch, /*proposalSize=*/6, /*draftTopK=*/12);
+            auto const resolved = reg.resolveShape(pageTableIt->shape, dims);
+            ASSERT_EQ(resolved.nbDims, 3);
+            EXPECT_EQ(resolved.d[0], activeBatch);
+            EXPECT_NE(resolved.d[0], draft.maxSupportedBatchSize);
+            EXPECT_EQ(resolved.d[1], 2);
+            EXPECT_EQ(resolved.d[2], computeMaxPagesPerSeq(draft.maxKVCacheCapacity));
+        }
+    };
+
+    draft.specDecodeType = SpecDecodeMode::kEAGLE;
+    bundle.base.specDecodeType = draft.specDecodeType;
+    bundle.draft = draft;
+    checkPageTable(buildRegistryForSpecDecodeDraft(bundle), "EAGLE/MTP");
+
+    draft.specDecodeType = SpecDecodeMode::kDFlash;
+    bundle.base.specDecodeType = draft.specDecodeType;
+    bundle.draft = draft;
+    checkPageTable(buildRegistryForDFlashDraft(bundle), "DFlash/JetSpec");
+
+    draft.specDecodeType = SpecDecodeMode::kGemma4MTP;
+    bundle.base.specDecodeType = draft.specDecodeType;
+    bundle.draft = draft;
+    checkPageTable(buildRegistryForGemma4MTPDraft(bundle), "Gemma4 MTP");
+
+    draft.specDecodeType = SpecDecodeMode::kDSpark;
+    bundle.base.specDecodeType = draft.specDecodeType;
+    bundle.draft = draft;
+    checkPageTable(buildRegistryForDSparkDraft(bundle), "DSpark");
 }
 
 // =====================================================================
