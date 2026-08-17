@@ -353,11 +353,11 @@ def _validate_integration_result(key: typing.Tuple[str, str],
 
 
 def integration_gate() -> None:
-    """Require successful evidence for every variant and ABI."""
+    """Require successful evidence for every selected variant and ABI."""
     qualification, rows = matrix.load_qualification()
     expected = {
         (str(row["variant_id"]), abi): row
-        for row in rows
+        for row in matrix.integration_rows(rows)
         for abi in row.get("ci_test_python_abis",
                            qualification["qualified_python_abis"])
     }

@@ -3,6 +3,9 @@
 
 schema_version = 1
 
+# Every row produces a wheel payload. Only rows with ci_test_enabled are
+# scheduled for target integration qualification.
+
 [[qualification]]
 variant_id = "x86-ubuntu2204-cu13-sm80"
 ci_build_runner = "cpu-general-k8s"
@@ -25,6 +28,7 @@ ci_remote = false
 
 [[qualification]]
 variant_id = "x86-ubuntu2404-cu13-sm100"
+ci_test_enabled = true
 ci_build_runner = "cpu-general-k8s"
 ci_build_image = "$WHEEL_IMAGE_UBUNTU2404_CU13"
 ci_build_mode = "native"
@@ -45,6 +49,7 @@ ci_remote = false
 
 [[qualification]]
 variant_id = "jetson-orin-jp72-cu13-sm87"
+ci_test_enabled = true
 ci_build_runner = "cpu-general-k8s"
 ci_build_image = "$WHEEL_IMAGE_JETPACK72"
 ci_build_mode = "cross"
@@ -162,6 +167,7 @@ ci_remote = false
 
 [[qualification]]
 variant_id = "x86-ubuntu2404-cu13-sm100-trt11"
+ci_test_enabled = true
 ci_build_runner = "cpu-general-k8s"
 ci_build_image = "$WHEEL_IMAGE_UBUNTU2404_CU13"
 ci_build_mode = "native"

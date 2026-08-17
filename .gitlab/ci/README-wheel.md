@@ -22,8 +22,9 @@ sh .gitlab/ci/scripts/wheel_ci.sh ci-precheck
 ```
 
 The generated `wheel-generated.yml` contains the concrete build and integration
-matrices. Do not edit it directly. Payload build jobs consume the public matrix
-joined with the internal qualification file; target jobs install the assembled
-wheel in a fresh environment and exercise installed engine build and inference.
-The integration gate requires evidence for every public variant and qualified
-Python ABI before the pipeline can succeed.
+matrices. Do not edit it directly. Payload build jobs consume every public matrix
+row joined with the internal qualification file. Rows with `ci_test_enabled =
+true` install the assembled wheel in a fresh target environment and exercise
+installed engine build and inference. The integration gate requires evidence for
+every selected variant and its qualified Python ABIs before the pipeline can
+succeed.

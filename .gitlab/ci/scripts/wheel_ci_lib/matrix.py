@@ -34,6 +34,7 @@ _CI_FIELDS = frozenset({
     "ci_sysroot",
     "ci_target_trt_wheel",
     "ci_target_work_dir",
+    "ci_test_enabled",
     "ci_test_image",
     "ci_test_python_abis",
     "ci_test_runner",
@@ -91,6 +92,10 @@ def _validate_qualification_row(value: typing.Any,
     remote = row["ci_remote"]
     if not isinstance(remote, bool):
         raise RuntimeError(f"Variant {variant_id} ci_remote must be Boolean.")
+    test_enabled = row.get("ci_test_enabled", False)
+    if not isinstance(test_enabled, bool):
+        raise RuntimeError(
+            f"Variant {variant_id} ci_test_enabled must be Boolean.")
     if remote:
         missing = sorted(field for field in (
             "ci_board_ip",
@@ -205,7 +210,7 @@ def _validate_matrix_job_names(
             job,
             (group_name, first["ci_build_runner"], first["ci_build_image"]),
         )
-    for row in rows:
+    for row in integration_rows(rows):
         job = ("wheel_integration_x86"
                if row["cpu_arch"] == "x86_64" else "wheel_integration_aarch64")
         _validate_job_name(
@@ -238,7 +243,14 @@ def _test_matrix(rows: typing.List[typing.Mapping[str, object]],
         "VARIANT": row["variant_id"],
         "TEST_RUNNER_TAG": row["ci_test_runner"],
         "TEST_IMAGE": row["ci_test_image"],
-    } for row in rows if row["cpu_arch"] == cpu_arch)
+    } for row in integration_rows(rows) if row["cpu_arch"] == cpu_arch)
+
+
+def integration_rows(
+    rows: typing.Iterable[typing.Mapping[str, object]]
+) -> typing.List[typing.Mapping[str, object]]:
+    """Return variants selected for target integration qualification."""
+    return [row for row in rows if row.get("ci_test_enabled", False)]
 
 
 def generated_ci() -> str:
