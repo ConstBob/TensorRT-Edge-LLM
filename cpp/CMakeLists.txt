@@ -182,6 +182,7 @@ target_include_directories(edgellmXqaJit PRIVATE ${COMMON_INCLUDE_DIRS}
                                                  ${NVRTC_INCLUDE_DIR})
 target_link_libraries(edgellmXqaJit PRIVATE ${NVRTC_LIB})
 add_dependencies(edgellmXqaJit generateXqaEmbeddedSources)
+edgellm_apply_qnx_warning_suppressions(edgellmXqaJit)
 edgellm_set_hidden_visibility(edgellmXqaJit)
 
 add_library(edgellmKernels STATIC ${KERNELS_CPP_SRCS} ${KERNELS_CU_SRCS}
@@ -193,6 +194,7 @@ if(ENABLE_CUTEDSL_MODULE_TEST_HOOK)
 endif()
 # Apply FMHA SM exclusion definitions
 target_compile_definitions(edgellmKernels PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
+edgellm_apply_qnx_warning_suppressions(edgellmKernels)
 # Enable separable compilation for MoE Marlin kernel templates
 set_target_properties(edgellmKernels PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 edgellm_set_hidden_visibility(edgellmKernels)
@@ -217,9 +219,10 @@ if(ENABLE_CUTEDSL_MODULE_TEST_HOOK)
   target_compile_definitions(edgellmCore
                              PRIVATE ENABLE_CUTEDSL_MODULE_TEST_HOOK)
 endif()
-target_link_libraries(edgellmCore PRIVATE dl)
+target_link_libraries(edgellmCore PRIVATE ${CMAKE_DL_LIBS})
 # Apply FMHA SM exclusion definitions
 target_compile_definitions(edgellmCore PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
+edgellm_apply_qnx_warning_suppressions(edgellmCore)
 # Enable separable compilation for MoE Marlin kernel templates
 set_target_properties(edgellmCore PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 edgellm_set_hidden_visibility(edgellmCore)
@@ -229,7 +232,9 @@ file(GLOB_RECURSE BUILDER_CPP_SRCS "builder/*.cpp")
 add_library(edgellmBuilder STATIC ${BUILDER_CPP_SRCS} ${COMMON_CPP_SRCS})
 target_include_directories(edgellmBuilder PRIVATE ${ONNX_PARSER_INCLUDE_DIR}
                                                   ${COMMON_INCLUDE_DIRS})
-target_link_libraries(edgellmBuilder PRIVATE ${NV_ONNX_PARSER_LIB} dl)
+target_link_libraries(edgellmBuilder PRIVATE ${NV_ONNX_PARSER_LIB}
+                                             ${CMAKE_DL_LIBS})
+edgellm_apply_qnx_warning_suppressions(edgellmBuilder)
 edgellm_set_hidden_visibility(edgellmBuilder)
 
 # Generate the TensorRT plugin shared libraries
@@ -244,6 +249,7 @@ target_link_libraries(
   NvInfer_edgellm_plugin PRIVATE commonLibraryExt edgellmKernels edgellmXqaJit
                                  ${CUDA_DRIVER_LINK_LIB} ${CUDART_LIB})
 add_cross_build_link_options(NvInfer_edgellm_plugin)
+edgellm_apply_qnx_warning_suppressions(NvInfer_edgellm_plugin)
 edgellm_set_hidden_visibility(NvInfer_edgellm_plugin)
 # Also drop symbols pulled in from static archives (edgellmKernels, CuTe DSL).
 target_link_options(NvInfer_edgellm_plugin PRIVATE "-Wl,--exclude-libs,ALL")
