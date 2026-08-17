@@ -31,7 +31,7 @@ mutually compatible TensorRT and CUDA packages.
 
 ## Wheel Qualification
 
-CI assembles one x86_64 and one aarch64 wheel artifact for each qualified GIL
+CI assembles one x86_64 and one aarch64 wheel artifact for each qualified
 CPython minor: 3.10, 3.11, and 3.12. Native payload selection is exact; the
 loader does not guess a nearest SM or TensorRT major.
 
@@ -39,16 +39,16 @@ loader does not guess a nearest SM or TensorRT major.
 |---|---|
 | x86_64 | Ubuntu 22.04, CUDA 13, SM80, TensorRT 10 or 11 |
 | x86_64 | Ubuntu 24.04, CUDA 13, SM86/SM100/SM120, TensorRT 10 or 11 |
-| x86_64 | Ubuntu 24.04, CUDA 12, SM120, TensorRT 10 or 11 |
 | aarch64 | Jetson Orin: JetPack 6.2 (CUDA 12, SM87) and JetPack 7.2 (CUDA 13, SM87), platform TensorRT 10 |
 | aarch64 | Jetson Thor: JetPack 7.0/7.1/7.2, CUDA 13, SM110, platform TensorRT 10 |
 | aarch64 | DRIVE Thor: DriveOS 7.2, CUDA 13, SM110, platform TensorRT 10 |
 | aarch64 | DGX Spark current stack, CUDA 13, SM121, platform TensorRT 10 |
 
-Every listed row is qualified for CPython 3.10, 3.11, and 3.12 by
-installing the final wheel in a clean environment, building a small model
-through the installed builder, and running inference through the installed
-runtime. The integration gate fails unless all row/ABI lanes pass.
+CI builds every architecture wheel for CPython 3.10, 3.11, and 3.12. Target
+qualification installs the final wheel into a clean environment using the
+Python ABI provided by that system, builds a small model through the installed
+high-level API, and runs inference through the installed runtime. The
+integration gate fails unless every configured target lane passes.
 
 The wheel contract matches the observed platform release, CUDA and TensorRT
 SONAMEs, and GPU SM exactly. It does not claim NVIDIA driver-version ranges;

@@ -19,14 +19,12 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
-import subprocess
 import sys
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Tuple
 
-import experimental.builder
+import experimental.server as server_api
 import tensorrt_edgellm
-import tensorrt_edgellm.runtime as runtime_api
 from tensorrt_edgellm._native.load import resolve_payload
 
 
@@ -42,64 +40,48 @@ def _arguments(values: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 
 def _require_installed_package() -> Path:
-    package = Path(tensorrt_edgellm.__file__).resolve(strict=True)
     environment = Path(sys.prefix).resolve(strict=True)
-    if not package.is_relative_to(environment):
-        raise RuntimeError(
-            f"Imported tensorrt_edgellm from {package}, outside {environment}."
-        )
-    builder = Path(experimental.builder.__file__).resolve(strict=True)
-    if not builder.is_relative_to(environment):
-        raise RuntimeError(
-            f"Imported experimental.builder from {builder}, outside {environment}."
-        )
+    package = Path(tensorrt_edgellm.__file__).resolve(strict=True)
+    server = Path(server_api.__file__).resolve(strict=True)
+    for name, path in (("tensorrt_edgellm", package), ("experimental.server",
+                                                       server)):
+        if not path.is_relative_to(environment):
+            raise RuntimeError(
+                f"Imported {name} from {path}, outside {environment}.")
     return package
 
 
-def _build_engine(model_dir: Path, engine_dir: Path) -> None:
-    command = Path(sys.executable).with_name("tensorrt-edgellm-build")
-    if not command.is_file():
-        discovered = shutil.which("tensorrt-edgellm-build")
-        if discovered:
-            command = Path(discovered)
-    if not command.is_file():
-        raise RuntimeError(
-            "The tensorrt-edgellm-build entry point is missing.")
+def _build_and_infer(model_dir: Path, engine_dir: Path, prompt: str,
+                     max_tokens: int) -> Tuple[str, int]:
     shutil.rmtree(engine_dir, ignore_errors=True)
-    subprocess.run([
-        str(command),
-        "--model-dir",
-        str(model_dir),
-        "--engine-dir",
-        str(engine_dir),
-        "--components",
-        "all",
-        "--max-input-len",
-        "128",
-        "--max-kv-cache-capacity",
-        "256",
-        "--max-batch-size",
-        "1",
-    ],
-                   check=True)
+    llm = server_api.LLM(
+        model=str(model_dir),
+        cache_dir=str(engine_dir),
+        clear_engine_cache=True,
+        max_input_len=128,
+        max_kv_cache_capacity=256,
+        max_batch_size=1,
+    )
+    try:
+        outputs = llm.generate(
+            [prompt],
+            server_api.SamplingParams(
+                temperature=0.7,
+                top_p=0.9,
+                top_k=50,
+                max_tokens=max_tokens,
+            ),
+        )
+    finally:
+        llm.close()
+
     engines = list(engine_dir.rglob("*.engine"))
     if not engines or any(path.stat().st_size == 0 for path in engines):
-        raise RuntimeError("The installed builder produced no usable engine.")
-
-
-def _request(runtime_module, prompt: str, max_tokens: int):
-    message = runtime_module.create_text_message("user", prompt)
-    request = runtime_module.LLMGenerationRequest()
-    request.requests = [runtime_module.Request(messages=[message])]
-    request.temperature = 0.7
-    request.top_p = 0.9
-    request.top_k = 50
-    request.max_generate_length = max_tokens
-    request.apply_chat_template = True
-    request.add_generation_prompt = True
-    request.enable_thinking = False
-    request.disable_spec_decode = False
-    return request
+        raise RuntimeError(
+            "The installed high-level API produced no usable engine.")
+    if len(outputs) != 1 or not outputs[0].text or not outputs[0].token_ids:
+        raise RuntimeError("EdgeLLM returned no generated output.")
+    return outputs[0].text, len(outputs[0].token_ids)
 
 
 def main(values: Optional[Sequence[str]] = None) -> int:
@@ -115,23 +97,20 @@ def main(values: Optional[Sequence[str]] = None) -> int:
             f"Selected {payload.variant_id}, expected {args.expected_variant}."
         )
 
-    _build_engine(model_dir, engine_dir)
-    runtime_module = runtime_api.load()
-    runtime = runtime_module.LLMRuntime(str(engine_dir), "", {})
-    runtime.capture_decoding_cuda_graph()
-    response = runtime.handle_request(
-        _request(runtime_module, args.prompt, args.max_tokens))
-    if not response.output_texts or not response.output_ids:
-        raise RuntimeError("EdgeLLM returned no generated output.")
-
+    output_text, output_token_count = _build_and_infer(
+        model_dir,
+        engine_dir,
+        args.prompt,
+        args.max_tokens,
+    )
     result = {
         "package": str(package),
         "variant_id": payload.variant_id,
         "extension": str(payload.extension),
         "plugin": str(payload.plugin),
         "engine_dir": str(engine_dir),
-        "output_text": response.output_texts[0],
-        "output_token_count": len(response.output_ids[0]),
+        "output_text": output_text,
+        "output_token_count": output_token_count,
     }
     if args.result:
         args.result.parent.mkdir(parents=True, exist_ok=True)
