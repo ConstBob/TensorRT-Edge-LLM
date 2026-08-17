@@ -1,8 +1,8 @@
 # TensorRT Edge-LLM wheel tooling
 
 The source tree can build a wheel for the current machine, a compatible subset
-of qualified GPUs, or every qualified payload for one CPU architecture. Normal
-package installation does not install these build-only tools.
+of configured GPUs, or every configured payload for one CPU architecture.
+Normal package installation does not install these build-only tools.
 
 ## Prerequisites
 
@@ -22,6 +22,53 @@ The payload build also requires a compatible CUDA toolkit, TensorRT SDK, C/C++
 compiler, and CuTe DSL archive. Generate the archive as documented in
 [`kernelSrcs/README.md`](../kernelSrcs/README.md), or place an archive and its
 `.sha256` file in `kernelSrcs/cuteDSLPrebuilt`.
+
+### Reference x86_64 build container
+
+`packaging/docker/Dockerfile` provides the Python and C/C++ wheel toolchain. It
+does not include TensorRT or CuTe DSL archives, and its CUDA development base
+must match the selected row in `packaging/variants.toml`.
+
+Build the image from the repository root, selecting a public CUDA development
+image with the required Ubuntu and CUDA versions:
+
+```bash
+export WHEEL_BASE_IMAGE=nvidia/cuda:CUDA_TAG-devel-ubuntu24.04
+docker build \
+    --build-arg "BASE_IMAGE=$WHEEL_BASE_IMAGE" \
+    -f packaging/docker/Dockerfile \
+    -t tensorrt-edgellm-wheel-builder \
+    .
+```
+
+Mount the source checkout and a compatible TensorRT SDK into the container.
+The matching CuTe DSL archive and checksum must already exist under
+`kernelSrcs/cuteDSLPrebuilt` in the checkout:
+
+```bash
+export TRT_PACKAGE_DIR=/absolute/path/to/TensorRT
+docker run --rm --gpus all \
+    --user "$(id -u):$(id -g)" \
+    -e CUDA_VISIBLE_DEVICES="GPU-<UUID>" \
+    -e HOME=/tmp \
+    -v "$PWD:/workspace" \
+    -v "$TRT_PACKAGE_DIR:/opt/tensorrt:ro" \
+    -w /workspace \
+    tensorrt-edgellm-wheel-builder \
+    bash -lc '
+        export TRT_PACKAGE_DIR=/opt/tensorrt
+        export LD_LIBRARY_PATH="$TRT_PACKAGE_DIR/lib:${LD_LIBRARY_PATH:-}"
+        python packaging/wheel_cli.py build-wheel \
+            --local \
+            --trt-package-dir "$TRT_PACKAGE_DIR" \
+            --output-dir dist/local
+    '
+```
+
+This reference image supports native x86_64 builds. An aarch64 cross build
+requires an appropriate platform SDK image or environment that supplies the
+target toolchain, sysroot, TensorRT SDK, and Python headers; overriding
+`BASE_IMAGE` alone is not sufficient.
 
 ## Build for the current target
 
@@ -112,7 +159,3 @@ The build commands require clean output directories and a clean tracked source
 checkout by default. Use distinct `--work-dir` and `--output-dir` paths for a
 new run. `--allow-dirty-source` and `--no-device-image-check` are explicit
 development overrides and must not be used for release artifacts.
-
-`packaging/docker/Dockerfile` provides a public reference x86_64 Ubuntu
-24.04/CUDA 13 environment. Override `BASE_IMAGE` for another supported native
-or cross-build environment.

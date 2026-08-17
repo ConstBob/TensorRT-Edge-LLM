@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Reproducible Python toolchain shared by wheel build and qualification images.
+# Reproducible Python toolchain shared by wheel build environments.
 auditwheel==6.4.2
 build==1.3.0
 cmake==3.31.6

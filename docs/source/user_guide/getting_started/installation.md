@@ -4,96 +4,125 @@
 
 | Workflow | Use it when | Data flow |
 |---|---|---|
-| Python wheel | The application builds engines directly from checkpoints and uses the Python API or optional HTTP server on a qualified target. | Hugging Face checkpoint → checkpoint-direct builder → TensorRT engine → Python inference |
+| Python wheel | The application builds engines directly from checkpoints and uses the Python API or optional HTTP server on a configured target. | Hugging Face checkpoint → checkpoint-direct builder → TensorRT engine → Python inference |
 | ONNX and C++ source deployment | The deployment consumes the C++ API, or separates host conversion from target engine build. | Hugging Face checkpoint → optional quantization → ONNX export → C++ engine build → C++ inference |
 
-The wheel workflow is the recommended one-command Python path on qualified
-x86_64, Jetson, DRIVE, and DGX Spark systems. The source workflow remains
-available for C++ applications and ONNX-based deployments.
+The wheel workflow is the recommended Python path on configured x86_64,
+Jetson, DRIVE, and DGX Spark systems. After obtaining a matching wheel file,
+installation is one command. The source workflow remains available for C++
+applications and ONNX-based deployments.
 
 ## Python wheel deployment
 
-The release design maximizes what is carried in one architecture wheel so the
-normal user flow is a single package command. TensorRT Edge-LLM provides one
+The packaging design maximizes what is carried in one architecture wheel so the
+normal user flow is a single installation command. The tooling produces one
 x86_64 and one aarch64 wheel for each supported CPython minor version. Each
 wheel contains the Python frontend, checkpoint-direct builder, runtime API,
-server implementation, and every qualified native payload for that CPU
+server implementation, and every configured native payload for that CPU
 architecture. Payload selection happens at runtime; users do not choose an SM
 or TensorRT major during installation.
 
 The x86_64 wheel contains more native payloads because it covers several GPU
 SMs and TensorRT majors. The aarch64 wheel covers the intended edge deployment
 paths with fewer payload rows. Developers who need a smaller custom artifact
-can build a subset wheel without changing the published one-command contract.
+can build a subset wheel without changing the architecture-wide release
+contract.
 
 ### Platform prerequisites
 
-Install the CUDA and TensorRT versions supplied by the qualified platform before
+Install the CUDA and TensorRT versions supplied by the configured platform before
 the EdgeLLM wheel. The NVIDIA driver, CUDA runtime, TensorRT runtime and Python
 binding, and model checkpoints are not duplicated in the wheel. TensorRT is not
 a declared pip dependency because pip cannot select the platform-qualified
 TensorRT major from the detected SDK and GPU; declaring a broad range could
 replace a compatible platform package with an incompatible major. See the
-[wheel qualification table](support-matrix.md#wheel-qualification) for exact
+[wheel packaging matrix](support-matrix.md#wheel-packaging-matrix) for exact
 platform rows.
 
-### Install from the NVIDIA Python index
+### Current wheel availability
 
-When release publication is available, pip selects the matching CPU
-architecture and CPython ABI:
-
-```bash
-python -m pip install --extra-index-url https://pypi.nvidia.com \
-    tensorrt-edgellm
-```
-
-That base command installs the complete checkpoint-direct build and Python
-inference path. Optional dependencies remain available for workflows that need
-them without forcing HTTP, media, PyTorch, or ONNX packages into every runtime
-environment:
-
-```bash
-# OpenAI-compatible HTTP server and checkpoint download
-python -m pip install --extra-index-url https://pypi.nvidia.com \
-    "tensorrt-edgellm[server]"
-
-# PyTorch/ONNX export frontend
-python -m pip install --extra-index-url https://pypi.nvidia.com \
-    "tensorrt-edgellm[export]"
-
-# Export, quantization, LoRA, vocabulary, and audio tools
-python -m pip install --extra-index-url https://pypi.nvidia.com \
-    "tensorrt-edgellm[tools]"
-```
-
-Wheel publication is release infrastructure and is independent of the source
-build procedure.
+TensorRT Edge-LLM wheels are not currently published to a Python package index.
+Build a matching wheel from source as described below, then install that file
+directly.
 
 ### Install a wheel file
 
 Install a locally built or downloaded wheel into a clean environment:
 
 ```bash
-python -m pip install --extra-index-url https://pypi.nvidia.com \
-    /path/to/tensorrt_edgellm-<version>-cp312-cp312-<platform>.whl
+export EDGELLM_WHEEL=/absolute/path/to/tensorrt_edgellm-0.10.0-cp312-cp312-linux_x86_64.whl
+python -m pip install "$EDGELLM_WHEEL"
 ```
 
-The local path supplies TensorRT Edge-LLM; the NVIDIA index supplies declared
-external dependencies. Pip validates the wheel against the host CPU
-architecture and CPython ABI. EdgeLLM then validates the platform release,
-CUDA and TensorRT SONAMEs, and visible GPU SM before loading native code.
+The base wheel installs the complete checkpoint-direct engine build and Python
+inference path. Pip resolves its declared Python dependencies and validates the
+wheel against the host CPU architecture and CPython ABI. EdgeLLM then validates
+the platform release, CUDA and TensorRT SONAMEs, and visible GPU SM before
+loading native code.
+
+Optional dependencies remain available without forcing HTTP, media, PyTorch,
+or ONNX packages into every runtime environment. Use a PEP 508 direct reference
+to request an extra from a local wheel:
+
+```bash
+# OpenAI-compatible HTTP server and checkpoint download
+python -m pip install \
+    "tensorrt-edgellm[server] @ file://$EDGELLM_WHEEL"
+
+# PyTorch/ONNX export frontend
+python -m pip install \
+    "tensorrt-edgellm[export] @ file://$EDGELLM_WHEEL"
+
+# Export, quantization, LoRA, vocabulary, and audio tools
+python -m pip install \
+    "tensorrt-edgellm[tools] @ file://$EDGELLM_WHEEL"
+```
 
 ### Build an engine and run a prompt
 
-The repository provides a standalone first-user test that imports only the
+Save the following standalone script as `run_edgellm.py`. It imports only the
 installed package, builds a TensorRT engine through the public
 `experimental.server.LLM` API, and runs one prompt through the selected native
 payload:
 
+```python
+import sys
+from pathlib import Path
+
+from experimental.server import LLM, SamplingParams
+
+
+model_dir = Path(sys.argv[1]).resolve(strict=True)
+engine_dir = Path(sys.argv[2]).resolve()
+llm = LLM(
+    model=str(model_dir),
+    cache_dir=str(engine_dir),
+    clear_engine_cache=True,
+    max_input_len=128,
+    max_kv_cache_capacity=256,
+    max_batch_size=1,
+)
+try:
+    outputs = llm.generate(
+        ["Please introduce NVIDIA."],
+        SamplingParams(
+            temperature=0.7,
+            top_p=0.9,
+            top_k=50,
+            max_tokens=32,
+        ),
+    )
+finally:
+    llm.close()
+
+print(outputs[0].text)
+```
+
+Run it with a local checkpoint and an engine-cache directory:
+
 ```bash
-python examples/python/installed_wheel_build_and_infer.py \
-    /path/to/Qwen2.5-0.5B-Instruct /tmp/edgellm-engine \
-    --prompt "Please introduce NVIDIA."
+python run_edgellm.py \
+    /path/to/Qwen2.5-0.5B-Instruct /tmp/edgellm-engine
 ```
 
 Keep the model checkpoint at its build-time path while using the engine;
@@ -109,11 +138,9 @@ using the stable UUID reported by `nvidia-smi`:
 nvidia-smi --query-gpu=uuid,name,compute_cap --format=csv,noheader
 
 CUDA_VISIBLE_DEVICES="GPU-<SM86-UUID>" \
-    python examples/python/installed_wheel_build_and_infer.py \
-    /path/to/model /tmp/engine-sm86
+    python run_edgellm.py /path/to/model /tmp/engine-sm86
 CUDA_VISIBLE_DEVICES="GPU-<SM120-UUID>" \
-    python examples/python/installed_wheel_build_and_infer.py \
-    /path/to/model /tmp/engine-sm120
+    python run_edgellm.py /path/to/model /tmp/engine-sm120
 ```
 
 `CUDA_VISIBLE_DEVICES` remaps the selected physical GPU to CUDA device `0`
