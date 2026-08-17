@@ -37,6 +37,7 @@ import onnxscript
 import torch
 from onnxscript import opset21 as _op21
 from onnxscript import script
+from onnxscript.onnx_types import Union as OnnxUnion
 
 # Custom ONNX domains
 _trt = onnxscript.values.Opset("trt", 1)
@@ -775,19 +776,26 @@ def _gather_nd_translation(
 # ViT attention op
 # ---------------------------------------------------------------------------
 
+_QKV_T = OnnxUnion[onnxscript.FLOAT16, onnxscript.FLOAT8E4M3FN]
+
 
 @script()
 def _vit_attention_plugin_translation(
-    query_states: onnxscript.FLOAT16,
-    key_states: onnxscript.FLOAT16,
-    value_states: onnxscript.FLOAT16,
+    query_states: _QKV_T,
+    key_states: _QKV_T,
+    value_states: _QKV_T,
     cu_seqlens: onnxscript.INT32,
     max_seqlen_carrier: onnxscript.INT32,
     num_heads: int,
     head_size: int,
     attention_scale: float,
+    qkv_scales: Sequence[float],
 ) -> onnxscript.FLOAT16:
-    """ViT ragged self-attention without KV cache."""
+    """ViT ragged self-attention without KV cache.
+
+    Q/K/V are FLOAT16 (FP16 MHA) or FLOAT8E4M3FN (FP8 MHA via preceding
+    QuantizeLinear nodes fused by TRT with upstream RoPE/V-path ops).
+    """
     return _trt_edgellm.ViTAttentionPlugin(
         query_states,
         key_states,
@@ -797,7 +805,30 @@ def _vit_attention_plugin_translation(
         num_heads=num_heads,
         head_size=head_size,
         attention_scale=attention_scale,
+        qkv_scales=qkv_scales,
     )
+
+
+def _vit_attention_plugin_dispatch(
+    query_states,
+    key_states,
+    value_states,
+    cu_seqlens,
+    max_seqlen_carrier,
+    num_heads: int,
+    head_size: int,
+    attention_scale: float,
+    qkv_scales=None,
+):
+    # FP16-MHA callers omit qkv_scales (torch-op default None); the ONNX
+    # attribute is FLOATS, so normalize to the identity scales here.
+    if qkv_scales is None:
+        qkv_scales = [1.0, 1.0, 1.0]
+    return _vit_attention_plugin_translation(query_states, key_states,
+                                             value_states, cu_seqlens,
+                                             max_seqlen_carrier, num_heads,
+                                             head_size, attention_scale,
+                                             qkv_scales)
 
 
 # ---------------------------------------------------------------------------
@@ -1326,7 +1357,7 @@ def build_custom_translation_table() -> dict:
         torch.ops.trt_edgellm.gated_delta_net_with_intermediate.default:
         _gated_delta_net_intermediate_dispatch,
         torch.ops.trt.vit_attention_plugin.default:
-        _vit_attention_plugin_translation,
+        _vit_attention_plugin_dispatch,
         torch.ops.trt.trt_ragged_attention.default:
         _trt_ragged_attention_translation,
         torch.ops.trt.gather_nd.default:

@@ -141,6 +141,8 @@ def _llm_quant_shell(
         args.append("--image_dataset=mmmu")
         env.append(
             f"EDGELLM_QUANT_DATASET_MMMU={config.get_mmmu_dataset_dir()}")
+        if config.visual_mha_precision == "fp8":
+            args.append("--visual_mha_quantization=fp8")
     if needs_audio_quant:
         args.append("--audio_quantization=fp8")
         args.append("--audio_dataset=librispeech")

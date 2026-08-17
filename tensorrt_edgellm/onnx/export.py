@@ -683,8 +683,8 @@ def _permissive_inline_opset():
         InlinePass._instantiate_call = _orig  # type: ignore[method-assign]
 
 
-def _setup_fp8kv_scales_for_export(model: "CausalLM") -> None:
-    """Pre-cache FP8 KV scales as Python floats before torch.export tracing.
+def setup_fp8_qkv_scales_for_export(model: "torch.nn.Module") -> None:
+    """Pre-cache FP8 Q/K/V scales as Python floats before torch.export tracing.
 
     During tracing, calling ``.item()`` on a tensor buffer creates a
     data-dependent symbolic expression that ``torch.export`` cannot guard on.
@@ -692,15 +692,25 @@ def _setup_fp8kv_scales_for_export(model: "CausalLM") -> None:
     as plain Python attributes on each attention module, they appear as
     compile-time constants during export.
 
+    Triggers on either ``enable_fp8_kv_cache`` (LLM) or ``enable_fp8_mha``
+    (ViT visual MHA) — both signal a calibrated checkpoint with
+    ``k_proj.k_scale`` / ``v_proj.v_scale`` to surface.
+
     Stored attribute: ``module._qkv_scales_float = [q, k, v]``
-      - q_scale : ``q_proj.q_scale`` buffer value if present, else 1.0
+      - q_scale : module-level ``q_scale`` buffer if present (visual MHA;
+                  surfaced by ``_surface_visual_q_scales`` in the
+                  quantization frontend), else ``q_proj.q_scale`` (LLM
+                  convention), else 1.0
       - k_scale : ``k_proj.k_scale`` buffer value if present, else 1.0
       - v_scale : ``v_proj.v_scale`` buffer value if present, else 1.0
     """
     for module in model.modules():
-        if not getattr(module, "enable_fp8_kv_cache", False):
+        if not (getattr(module, "enable_fp8_kv_cache", False)
+                or getattr(module, "enable_fp8_mha", False)):
             continue
-        q_buf = getattr(getattr(module, "q_proj", None), "q_scale", None)
+        q_buf = getattr(module, "q_scale", None)
+        if q_buf is None:
+            q_buf = getattr(getattr(module, "q_proj", None), "q_scale", None)
         k_buf = getattr(getattr(module, "k_proj", None), "k_scale", None)
         v_buf = getattr(getattr(module, "v_proj", None), "v_scale", None)
         if v_buf is None and getattr(module, "attention_k_eq_v", False):
@@ -1009,7 +1019,7 @@ def _export_model(
     optimize: bool = True,
     externalize_weights=None,
 ) -> "list[dict[str, object]]":
-    _setup_fp8kv_scales_for_export(model)
+    setup_fp8_qkv_scales_for_export(model)
     _capture_qk_norm_gammas_for_export(model)
     spec = model.onnx_export_spec()
 

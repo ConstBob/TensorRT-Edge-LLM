@@ -1748,9 +1748,11 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
     ``qwen3_omni`` / ``qwen3_omni_moe`` model_types and runs the
     remap inside its own ``build_qwen3_omni_visual``.
     """
-    model_config = _tower_model_config(
-        model_config, weights,
-        ("visual.", "thinker.visual.", "model.visual.", "vision_tower."))
+    from ..quantization.quantization_configs import _VISUAL_PREFIXES
+    tower_prefixes = tuple(f"{root}{p}." for p in _VISUAL_PREFIXES
+                           for root in ("", "model.", "thinker.",
+                                        "model.embed_tokens_extend."))
+    model_config = _tower_model_config(model_config, weights, tower_prefixes)
     os.makedirs(visual_out_dir, exist_ok=True)
     output_path = os.path.join(visual_out_dir, "model.onnx")
 
@@ -2068,8 +2070,8 @@ def _export_audio(model_dir: str,
     """Export audio encoder via from-scratch tensorrt_edgellm pipeline."""
     if model_config is not None:
         model_config = _tower_model_config(
-            model_config, weights,
-            ("audio_tower.", "thinker.audio_tower.", "audio_embed."))
+            model_config, weights, ("audio_tower.", "thinker.audio_tower.",
+                                    "model.audio_tower.", "audio_embed."))
     os.makedirs(audio_out_dir, exist_ok=True)
     output_path = os.path.join(audio_out_dir, "model.onnx")
 

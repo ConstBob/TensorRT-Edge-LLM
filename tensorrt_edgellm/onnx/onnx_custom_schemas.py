@@ -325,6 +325,15 @@ _vit_attention_plugin_schema = OpSchema(
             description="Absolute multiplier applied to QK^T before softmax.",
             required=False,
         ),
+        OpSchema.Attribute(
+            name="qkv_scales",
+            type=OpSchema.AttrType.FLOATS,
+            description=
+            "Per-tensor FP8 dequant scales [q, k, v]; used when Q/K/V arrive "
+            "as FLOAT8E4M3FN (the plugin infers FP8 mode from the tensor "
+            "dtype), identity otherwise.",
+            required=False,
+        ),
     ],
 )
 

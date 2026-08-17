@@ -68,6 +68,12 @@ def _add_common_args(parser):
               "validated. When unset the visual tower stays at fp16 "),
     )
     parser.add_argument(
+        "--visual_mha_quantization",
+        default=None,
+        choices=["fp8"],
+        help=("Run the visual attention (Q*K^T and P*V matmuls) in FP8."),
+    )
+    parser.add_argument(
         "--audio_quantization",
         default=None,
         choices=["fp8"],
@@ -151,6 +157,7 @@ def main():
             quantization=args.quantization,
             lm_head_quantization=args.lm_head_quantization,
             visual_quantization=args.visual_quantization,
+            visual_mha_quantization=args.visual_mha_quantization,
             audio_quantization=args.audio_quantization,
             cp_quantization=args.cp_quantization,
             kv_cache_quantization=args.kv_cache_quantization,

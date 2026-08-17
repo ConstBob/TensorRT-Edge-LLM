@@ -103,6 +103,11 @@ ViTAttentionPlugin::ViTAttentionPlugin(std::string const& name, int32_t numHeads
 {
     ELLM_CHECK(mQkvScales.size() == 3,
         "ViTAttentionPlugin: qkv_scales has " + std::to_string(mQkvScales.size()) + " elements (expected 3).");
+    for (float const scale : mQkvScales)
+    {
+        ELLM_CHECK(
+            scale > 0.F, "ViTAttentionPlugin: qkv_scales entries must be positive, got " + std::to_string(scale) + ".");
+    }
 
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
@@ -138,6 +143,11 @@ ViTAttentionPlugin::ViTAttentionPlugin(std::string const& name, PluginFieldColle
     }
     ELLM_CHECK(mQkvScales.size() == 3,
         "ViTAttentionPlugin: qkv_scales has " + std::to_string(mQkvScales.size()) + " elements (expected 3).");
+    for (float const scale : mQkvScales)
+    {
+        ELLM_CHECK(
+            scale > 0.F, "ViTAttentionPlugin: qkv_scales entries must be positive, got " + std::to_string(scale) + ".");
+    }
 
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);

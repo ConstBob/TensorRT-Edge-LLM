@@ -88,6 +88,7 @@ tests:
 
   # Qwen3-VL-4B-Instruct
   - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-VL-4B-Instruct-fp8-vitfp8]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-VL-4B-Instruct-fp8-vitfp8-vitmhafp8]
   - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-VL-4B-Instruct-mxfp8]
   - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-VL-4B-Instruct-nvfp4-lmnvfp4-vitfp8]
   - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-VL-4B-Instruct-nvfp4-vitfp8]
