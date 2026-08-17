@@ -10,6 +10,9 @@
 tests:
   - tests/defs/test_common.py::test_build_project_with_pybind
 
+  # Package import and introspection contracts
+  - tests/python-unittests/test_package_api.py
+
   # ONNX-less builder checkpoint contracts
   - tests/python-unittests/test_direct_builder_checkpoint_contract.py
 

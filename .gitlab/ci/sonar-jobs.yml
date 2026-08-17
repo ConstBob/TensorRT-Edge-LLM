@@ -42,7 +42,7 @@ get-sonar-scanner:
       - sonar-scanner/
       - sonar-jre/
       - sonar-scanner.status
-    expire_in: 4 hours
+    expire_in: 1 day
 
   script:
     - |
