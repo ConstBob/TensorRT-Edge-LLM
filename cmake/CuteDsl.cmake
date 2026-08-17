@@ -48,6 +48,7 @@
 #   CUTE_DSL_GDN_ENABLED   — set when the gdn group is active
 #   CUTE_DSL_F16_MOE_ENABLED — set when the f16_moe group is active
 #   CUTE_DSL_SSD_ENABLED   — set when the ssd group is active
+#   CUTE_DSL_RMSNORM_ENABLED — set when the rmsnorm group is active
 #   CUTE_DSL_GEMM_ENABLED  — set when any gemm variant is active
 # ---------------------------------------------------------------------------
 # cmake-format: on
@@ -56,7 +57,7 @@ set(ENABLE_CUTE_DSL
     "fmha"
     CACHE
       STRING
-      "CuTe DSL kernels: OFF, ALL, or semicolon-separated group list (fmha;gdn)"
+      "CuTe DSL kernels: OFF, ALL, or semicolon-separated group list (fmha;gdn;rmsnorm)"
 )
 
 set(CUTE_DSL_ARTIFACT_TAG
@@ -438,15 +439,15 @@ function(cute_dsl_setup)
     endforeach()
   endif()
 
-  # The FP16 MoE runner links one exact-SM artifact. Parse the artifact SM for
-  # its compile-time exact-SM guard.
-  if("f16_moe" IN_LIST _active_groups)
+  # The FP16 MoE and RMSNorm runners link one exact-SM artifact. Parse the
+  # artifact SM for their compile-time guards.
+  if("f16_moe" IN_LIST _active_groups OR "rmsnorm" IN_LIST _active_groups)
     if(NOT _meta_gpu_arch_err AND _meta_gpu_arch MATCHES "^sm_([0-9]+)$")
       set(_meta_sm "${CMAKE_MATCH_1}")
     else()
       message(
         FATAL_ERROR
-          "CuTe DSL f16_moe metadata gpu_arch must have form sm_<NN>, got '${_meta_gpu_arch}' in ${_metadata}."
+          "CuTe DSL exact-SM metadata gpu_arch must have form sm_<NN>, got '${_meta_gpu_arch}' in ${_metadata}."
       )
     endif()
   endif()
@@ -529,6 +530,12 @@ function(cute_dsl_setup)
     foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
       target_compile_definitions(
         ${_tgt} PRIVATE "CUTE_DSL_F16_MOE_ARTIFACT_SM=${_meta_sm}")
+    endforeach()
+  endif()
+  if("rmsnorm" IN_LIST _active_groups)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_RMSNORM_ARTIFACT_SM=${_meta_sm}")
     endforeach()
   endif()
 

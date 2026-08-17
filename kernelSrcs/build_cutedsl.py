@@ -27,6 +27,7 @@ Kernel groups:
   f16_moe          — FP16 grouped FC1/FC2 MoE (Ampere / Blackwell / SM12x)
   nvfp4_moe        — split FC1/FC2 NVFP4 MoE (currently SM110/Thor only)
   nvfp4_fused_moe  — End-to-end NvFP4 fused MoE (Blackwell GeForce)
+  rmsnorm          — FP16/BF16 RMSNorm for production hidden sizes
 
 Usage (run from the repo root):
   python kernelSrcs/build_cutedsl.py                      # build all groups for this GPU
@@ -94,8 +95,9 @@ class KernelVariant:
     Attributes:
         name:          Unique identifier — used as --file_name / --function_prefix.
         group:         Logical group ("gdn", "fmha", "f16_moe",
-                       "nvfp4_fused_moe", "nvfp4_moe", "ssd", or "gemm").
-                       cmake sets CUTE_DSL_<GROUP>_ENABLED for integrated groups.
+                       "nvfp4_fused_moe", "nvfp4_moe", "rmsnorm", "ssd",
+                       or "gemm"). cmake sets CUTE_DSL_<GROUP>_ENABLED for
+                       integrated groups.
         supported_sms: Explicit SM whitelist. With --kernels ALL, only variants whose
                        supported_sms contains the detected/requested SM are compiled.
         script:        Kernel script path relative to kernelSrcs/.
@@ -128,6 +130,7 @@ class KernelVariant:
 #   f16_moe          — FP16 grouped FC1/FC2 MoE (Ampere/Blackwell/SM12x)
 #   nvfp4_moe        — split FC1/FC2 NVFP4 MoE (currently SM110/Thor only)
 #   nvfp4_fused_moe  — End-to-end NvFP4 fused MoE (Blackwell GeForce)
+#   rmsnorm          — FP16/BF16 RMSNorm for production hidden sizes
 # ---------------------------------------------------------------------------
 KERNEL_VARIANTS = [
     # --- GDN group ---
@@ -1568,6 +1571,31 @@ KERNEL_VARIANTS = [
 ]
 
 
+# RMSNorm is specialized by storage dtype, hidden size, and weight-before-cast
+# mode. The row count and epsilon remain runtime arguments in each AOT ABI.
+_RMSNORM_SUPPORTED_SMS = [80, 86, 87, 90, 100, 101, 110, 120, 121]
+_RMSNORM_HIDDEN_SIZES = [4096, 5120, 7168, 8192]
+_RMSNORM_WEIGHT_BEFORE_CAST_MODES = [0, 1]
+for _rmsnorm_dtype in ("fp16", "bf16"):
+    for _rmsnorm_hidden_size in _RMSNORM_HIDDEN_SIZES:
+        for _rmsnorm_weight_before_cast in _RMSNORM_WEIGHT_BEFORE_CAST_MODES:
+            KERNEL_VARIANTS.append(
+                KernelVariant(
+                    name=(f"rmsnorm_{_rmsnorm_dtype}_h{_rmsnorm_hidden_size}"
+                          f"_wbc{_rmsnorm_weight_before_cast}"),
+                    group="rmsnorm",
+                    supported_sms=_RMSNORM_SUPPORTED_SMS,
+                    script="rmsnorm_cutedsl/rmsnorm.py",
+                    script_args=[
+                        "--dtype", _rmsnorm_dtype,
+                        "--hidden_size", str(_rmsnorm_hidden_size),
+                        "--weight_before_cast", str(_rmsnorm_weight_before_cast),
+                        "--export_only",
+                    ],
+                )
+            )
+
+
 # ---------------------------------------------------------------------------
 # int4_fp16_gemm group — W4A16 INT4-weight FP16 GEMM.  Ampere instruction floor
 # (cp.async + mma.sync 16x8x16 + ldmatrix), forward-compatible to SM80 and newer
@@ -2588,7 +2616,7 @@ def main():
         default="ALL",
         help="Which kernels to build: ALL (default), a group name "
              "(fmha | gdn | f16_moe | nvfp4_moe | "
-             "nvfp4_fused_moe | ssd | gemm | int4_fp16_gemm), or a comma-separated list "
+             "nvfp4_fused_moe | rmsnorm | ssd | gemm | int4_fp16_gemm), or a comma-separated list "
              "of group names. "
              "Variants whose supported_sms does not include the target SM are skipped.",
     )
