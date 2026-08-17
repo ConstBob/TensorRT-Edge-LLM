@@ -233,15 +233,18 @@ bool DFlashDecoder::decodeStep(DecodingInferenceContext& context)
     NVTX_SCOPED_RANGE(nvtx_dflash_decode, "DFlashDecoder::decodeStep", nvtx_colors::GREEN);
     cudaGetLastError();
 
-    if (!runDraftForward(context))
     {
-        LOG_ERROR("DFlashDecoder: draft forward failed.");
-        return false;
-    }
-    if (!prepareBlockDraftVerifyInputs(context))
-    {
-        LOG_ERROR("DFlashDecoder: verify input preparation failed.");
-        return false;
+        TIME_STAGE(metrics::StageNames::kSPEC_DECODE_DRAFT_PROPOSAL, context.stream);
+        if (!runDraftForward(context))
+        {
+            LOG_ERROR("DFlashDecoder: draft forward failed.");
+            return false;
+        }
+        if (!prepareBlockDraftVerifyInputs(context))
+        {
+            LOG_ERROR("DFlashDecoder: verify input preparation failed.");
+            return false;
+        }
     }
 
     if (!runBaseVerification(context))
@@ -255,7 +258,6 @@ bool DFlashDecoder::decodeStep(DecodingInferenceContext& context)
 
 bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
 {
-    TIME_STAGE(metrics::StageNames::kSPEC_DECODE_DRAFT_PROPOSAL, context.stream);
     NVTX_SCOPED_RANGE(nvtx_dflash_draft, "DFlashDecoder::runDraftForward", nvtx_colors::DARK_ORANGE);
 
     if (!mDraftExecutor)
@@ -437,7 +439,6 @@ bool DFlashDecoder::prepareBlockDraftVerifyInputs(DecodingInferenceContext& cont
 
 bool DFlashDecoder::buildTreeVerifyInputs(DecodingInferenceContext& context)
 {
-    TIME_STAGE(metrics::StageNames::kSPEC_DECODE_DRAFT_PROPOSAL, context.stream);
     NVTX_SCOPED_RANGE(nvtx_dflash_ddtree_build, "DFlashDecoder::buildTreeVerifyInputs", nvtx_colors::LIGHT_ORANGE);
 
     int32_t const activeBatchSize = context.activeBatchSize;
