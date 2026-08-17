@@ -31,8 +31,11 @@ import onnx
 
 from tensorrt_edgellm.config import ModelConfig
 from tensorrt_edgellm.models.default.modeling_default import CausalLM
-from tensorrt_edgellm.models.ops import KV_PAGE_SIZE
+from tensorrt_edgellm.models.ops import (KV_PAGE_SIZE,
+                                         dflash_target_kv_cache_update)
 from tensorrt_edgellm.onnx.export import _export_model
+from tensorrt_edgellm.onnx.onnx_custom_schemas import \
+    register_tensorrt_edgellm_onnx_custom_schemas
 
 _NUM_REQUIRED_ATTENTION_INPUTS = 6
 
@@ -189,6 +192,59 @@ def test_attention_plugin_call_sites_pass_kv_page_table():
                 "call site predates the paged-KV ABI or binds arguments in "
                 "the wrong order")
     assert not failures, "\n".join(failures)
+
+
+def test_dflash_target_kv_update_requires_page_table_argument():
+    parameters = [
+        argument.name for argument in
+        dflash_target_kv_cache_update._opoverload._schema.arguments
+    ]
+    assert parameters == [
+        "k_delta",
+        "v_delta",
+        "past_key_value",
+        "rope_cos_sin",
+        "delta_start_positions",
+        "delta_lengths",
+        "kv_page_table",
+    ]
+
+
+def test_dflash_target_kv_update_schema_keeps_name_and_has_seven_inputs():
+    register_tensorrt_edgellm_onnx_custom_schemas()
+    schemas = [
+        schema for schema in onnx.defs.get_all_schemas_with_history()
+        if schema.name == "DFlashTargetKVCacheUpdate"
+        and schema.domain == "trt_edgellm"
+    ]
+    assert len(schemas) == 1
+    schema = schemas[0]
+    assert [parameter.name for parameter in schema.inputs] == [
+        "k_delta",
+        "v_delta",
+        "past_key_value",
+        "rope_cos_sin",
+        "delta_start_positions",
+        "delta_lengths",
+        "kv_page_table",
+    ]
+
+
+def test_dflash_target_kv_update_call_sites_pass_page_table():
+    failures = []
+    for path in sorted(_MODELS_DIR.rglob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "dflash_target_kv_cache_update"):
+                continue
+            if len(node.args) < 7 or "page_table" not in ast.unparse(
+                    node.args[6]):
+                failures.append(
+                    f"{path}:{node.lineno}: dflash_target_kv_cache_update "
+                    "argument 7 must be kv_page_table")
+    assert not failures, "\\n".join(failures)
 
 
 def test_attention_plugin_direct_call_sites_pass_required_static_flags():

@@ -27,6 +27,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 using namespace trt_edgellm::rt;
@@ -48,6 +49,11 @@ BlockKeyExtras makeExtras()
     extras.customEmbeddingDigest = Hash128{0x9192939495969798ULL, 0xA1A2A3A4A5A6A7A8ULL};
     extras.isolationDigest = Hash128{0xB1B2B3B4B5B6B7B8ULL, 0xC1C2C3C4C5C6C7C8ULL};
     return extras;
+}
+
+SpecPagedStateRecord makePagedSpecState(std::vector<PageId> pagePath)
+{
+    return SpecPagedStateRecord{std::move(pagePath)};
 }
 
 } // namespace
@@ -382,7 +388,7 @@ TEST(ContextCacheBlockIndexTests, FirstCommitterWinsAndReverseEraseIsExact)
     EXPECT_EQ(index.size(), 1U);
 }
 
-TEST(ContextCacheBlockIndexTests, DraftLookupSelectsOneCoherentRecordPath)
+TEST(ContextCacheBlockIndexTests, SpecPagedLookupSelectsOneCoherentRecordPath)
 {
     BlockHash const firstHash{0x0101010101010101ULL, 0x0202020202020202ULL};
     BlockHash const secondHash{0x0303030303030303ULL, 0x0404040404040404ULL};
@@ -394,29 +400,28 @@ TEST(ContextCacheBlockIndexTests, DraftLookupSelectsOneCoherentRecordPath)
     firstRecord.key = CacheRecordKey{firstLeafHash, 3};
     firstRecord.logicalBlockHashes = {firstHash, secondHash, firstLeafHash};
     firstRecord.basePagePath = {1, 2, 3};
-    firstRecord.draftPagePath = {4, 5, 6};
+    firstRecord.specState = makePagedSpecState({4, 5, 6});
 
     CacheRecord secondRecord = firstRecord;
     secondRecord.id = 12;
     secondRecord.key = CacheRecordKey{secondLeafHash, 3};
     secondRecord.logicalBlockHashes.back() = secondLeafHash;
     secondRecord.basePagePath = {1, 2, 7};
-    secondRecord.draftPagePath = {8, 9, 10};
+    secondRecord.specState = makePagedSpecState({8, 9, 10});
 
-    DraftPathIndex index;
+    SpecPagedStateIndex index;
     CacheRecord incompleteRecord = firstRecord;
     incompleteRecord.id = 13;
-    incompleteRecord.draftPagePath.pop_back();
+    incompleteRecord.specState = makePagedSpecState({4, 5});
     EXPECT_THROW(index.insert(incompleteRecord), std::runtime_error);
     index.insert(firstRecord);
     index.insert(secondRecord);
 
-    DraftPathMatch const firstLeaf{firstRecord.id, 3};
-    DraftPathMatch const secondLeaf{secondRecord.id, 3};
-    EXPECT_EQ(index.lookupLongest(firstRecord.logicalBlockHashes, 3), std::optional<DraftPathMatch>{firstLeaf});
-    EXPECT_EQ(index.lookupLongest(secondRecord.logicalBlockHashes, 3), std::optional<DraftPathMatch>{secondLeaf});
-
-    std::optional<DraftPathMatch> const sharedPrefix = index.lookupLongest({firstHash, secondHash, Hash128{}}, 3);
+    SpecPagedStateMatch const firstLeaf{firstRecord.id, 3};
+    SpecPagedStateMatch const secondLeaf{secondRecord.id, 3};
+    EXPECT_EQ(index.lookupLongest(firstRecord.logicalBlockHashes, 3), std::optional<SpecPagedStateMatch>{firstLeaf});
+    EXPECT_EQ(index.lookupLongest(secondRecord.logicalBlockHashes, 3), std::optional<SpecPagedStateMatch>{secondLeaf});
+    std::optional<SpecPagedStateMatch> const sharedPrefix = index.lookupLongest({firstHash, secondHash, Hash128{}}, 3);
     ASSERT_TRUE(sharedPrefix.has_value());
     EXPECT_EQ(sharedPrefix->pathBlockCount, 2);
     EXPECT_TRUE(sharedPrefix->record == firstRecord.id || sharedPrefix->record == secondRecord.id);
@@ -426,14 +431,14 @@ TEST(ContextCacheBlockIndexTests, DraftLookupSelectsOneCoherentRecordPath)
 
     EXPECT_FALSE(index.contains(secondLeafHash, secondLeaf));
     EXPECT_EQ(index.lookupLongest({firstHash, secondHash}, 2),
-        (std::optional<DraftPathMatch>{DraftPathMatch{firstRecord.id, 2}}));
-    EXPECT_EQ(index.lookupLongest(firstRecord.logicalBlockHashes, 3), std::optional<DraftPathMatch>{firstLeaf});
+        (std::optional<SpecPagedStateMatch>{SpecPagedStateMatch{firstRecord.id, 2}}));
+    EXPECT_EQ(index.lookupLongest(firstRecord.logicalBlockHashes, 3), std::optional<SpecPagedStateMatch>{firstLeaf});
 
     index.erase(firstRecord);
     EXPECT_FALSE(index.lookupLongest(firstRecord.logicalBlockHashes, 3).has_value());
 }
 
-TEST(ContextCacheBlockIndexTests, DraftIndexKeepsRepeatedHashesAsDistinctBoundaries)
+TEST(ContextCacheBlockIndexTests, SpecPagedIndexKeepsRepeatedHashesAsDistinctBoundaries)
 {
     BlockHash const repeatedHash{0x0101010101010101ULL, 0x0202020202020202ULL};
     CacheRecord record;
@@ -441,16 +446,16 @@ TEST(ContextCacheBlockIndexTests, DraftIndexKeepsRepeatedHashesAsDistinctBoundar
     record.key = CacheRecordKey{repeatedHash, 3};
     record.logicalBlockHashes = {repeatedHash, repeatedHash, repeatedHash};
     record.basePagePath = {1, 2, 3};
-    record.draftPagePath = {4, 5, 6};
+    record.specState = makePagedSpecState({4, 5, 6});
 
-    DraftPathIndex index;
+    SpecPagedStateIndex index;
     index.insert(record);
 
-    EXPECT_TRUE(index.contains(repeatedHash, DraftPathMatch{record.id, 1}));
-    EXPECT_TRUE(index.contains(repeatedHash, DraftPathMatch{record.id, 2}));
-    EXPECT_TRUE(index.contains(repeatedHash, DraftPathMatch{record.id, 3}));
+    EXPECT_TRUE(index.contains(repeatedHash, SpecPagedStateMatch{record.id, 1}));
+    EXPECT_TRUE(index.contains(repeatedHash, SpecPagedStateMatch{record.id, 2}));
+    EXPECT_TRUE(index.contains(repeatedHash, SpecPagedStateMatch{record.id, 3}));
     EXPECT_EQ(index.lookupLongest(record.logicalBlockHashes, 3),
-        (std::optional<DraftPathMatch>{DraftPathMatch{record.id, 3}}));
+        (std::optional<SpecPagedStateMatch>{SpecPagedStateMatch{record.id, 3}}));
 
     index.erase(record);
     EXPECT_FALSE(index.lookupLongest(record.logicalBlockHashes, 3).has_value());

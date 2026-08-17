@@ -32,7 +32,6 @@ namespace rt
 struct DecodingInferenceContext;
 struct LLMGenerationRequest;
 class Tensor;
-enum class DecodingStrategyKind : int32_t;
 
 //! Owns one admitted runtime request and binds it to the context-cache coordinator lifecycle.
 class ContextCacheRequest final
@@ -43,7 +42,7 @@ public:
     //! @param mediaTokenIds Placeholder token IDs for media modalities (e.g. image, audio).
     //!        Positions matching any of these IDs are content-hashed for cache differentiation.
     static std::optional<ContextCacheRequest> begin(ContextCacheCoordinator& coordinator,
-        LLMGenerationRequest const& request, DecodingInferenceContext const& context, DecodingStrategyKind strategyKind,
+        LLMGenerationRequest const& request, DecodingInferenceContext const& context, bool speculativeRequest,
         std::vector<int32_t> const& mediaTokenIds = {});
 
     ContextCacheRequest(ContextCacheRequest&&) noexcept = default;

@@ -90,6 +90,58 @@ TEST(DFlashRuntimeKernels, TargetKVCacheUpdateRoutesNonIdentityPages)
         /* V page */ 4, kSecondStart % rt::kTOKENS_PER_PAGE, std::vector<half>(vHost.begin() + kHeadDim, vHost.end()));
 }
 
+TEST(DFlashRuntimeKernels, TargetKVCacheUpdateRoutesIndependentKAndVPages)
+{
+    cudaStream_t stream{nullptr};
+    constexpr int32_t kBatchSize{1};
+    constexpr int32_t kDeltaLen{1};
+    constexpr int32_t kNumKVHeads{1};
+    constexpr int32_t kHeadDim{8};
+    constexpr int32_t kNumPages{2};
+    constexpr int32_t kMaxPagesPerSeq{1};
+    size_t const poolElements = static_cast<size_t>(2 * kNumPages * rt::kTOKENS_PER_PAGE * kNumKVHeads * kHeadDim);
+
+    rt::Tensor delta({kBatchSize, kDeltaLen, kNumKVHeads, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor kvPool(
+        {2, kNumPages, rt::kTOKENS_PER_PAGE, kNumKVHeads, kHeadDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor ropeCosSin({1, 1, 1}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    rt::Tensor deltaStarts({kBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor deltaLengths({kBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor pageTable({kBatchSize, 2, kMaxPagesPerSeq}, rt::DeviceType::kGPU, DataType::kINT32);
+
+    copyHostToDevice(delta, std::vector<half>(kHeadDim, __float2half(1.F)));
+    copyHostToDevice(kvPool, std::vector<half>(poolElements, __float2half(-1.F)));
+    copyHostToDevice<int32_t>(deltaStarts, {0});
+    copyHostToDevice<int32_t>(deltaLengths, {kDeltaLen});
+    copyHostToDevice<int32_t>(pageTable, {/* K page */ 1, /* independently mapped V page */ kNumPages});
+
+    kernel::launchDFlashTargetKVCacheUpdate(delta.dataPointer<half>(), delta.dataPointer<half>(),
+        kvPool.dataPointer<half>(), ropeCosSin.dataPointer<float>(), deltaStarts.dataPointer<int32_t>(),
+        deltaLengths.dataPointer<int32_t>(), pageTable.dataPointer<int32_t>(), kBatchSize, kDeltaLen, kNumKVHeads,
+        kHeadDim, 0, 1, 1, kNumPages, kMaxPagesPerSeq, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<half> const poolHost = copyDeviceToHost<half>(kvPool);
+    auto expectToken = [&](int32_t flattenedPage) {
+        size_t const offset = static_cast<size_t>(flattenedPage) * rt::kTOKENS_PER_PAGE * kNumKVHeads * kHeadDim;
+        for (int32_t dim = 0; dim < kHeadDim; ++dim)
+        {
+            EXPECT_EQ(__half2float(poolHost[offset + dim]), 1.F);
+        }
+    };
+    expectToken(/* K page */ 1);
+    expectToken(/* V page */ kNumPages);
+
+    for (int32_t flattenedPage : {0, 3})
+    {
+        size_t const offset = static_cast<size_t>(flattenedPage) * rt::kTOKENS_PER_PAGE * kNumKVHeads * kHeadDim;
+        for (int32_t dim = 0; dim < kHeadDim; ++dim)
+        {
+            EXPECT_EQ(__half2float(poolHost[offset + dim]), -1.F);
+        }
+    }
+}
+
 TEST(DFlashRuntimeKernels, CheckRopeCapacityAcceptsNonPageAlignedCapacity)
 {
     // maxKVCacheCapacity=4000 (not a multiple of 128) -> capPadded=4096. This must not throw.

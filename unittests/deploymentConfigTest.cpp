@@ -351,16 +351,59 @@ TEST_F(DeploymentConfigTest, NonHybridEagleSupportsBaseAndDraftCrossRequestReten
     EXPECT_EQ(deployment.draft->kvPoolPages, 10);
 }
 
-TEST_F(DeploymentConfigTest, ModesWithoutCrossRequestRetentionRejectExtraRetainedPages)
+TEST_F(DeploymentConfigTest, EagleTopologyValidationAppliesToAllDeployments)
+{
+    Json base = makeBaseConfig(/*maxVerify=*/8);
+    Json draft = makeDraftConfig(/*maxVerify=*/0, /*maxDraft=*/8);
+    auto validate = [&](Json const& candidateBase, Json const& candidateDraft) {
+        auto const basePath = writeJsonToTempFile(candidateBase, "base");
+        auto const draftPath = writeJsonToTempFile(candidateDraft, "draft");
+        return createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath}, std::nullopt);
+    };
+    EXPECT_NO_THROW(validate(base, draft));
+
+    base["eagle_hidden_state_layers"] = Json::array();
+    EXPECT_THROW(validate(base, draft), std::runtime_error);
+
+    base = makeBaseConfig(/*maxVerify=*/8);
+    base["eagle_hidden_state_layers"] = {0, 5, 5};
+    EXPECT_THROW(validate(base, draft), std::runtime_error);
+
+    base = makeBaseConfig(/*maxVerify=*/8);
+    base["eagle_hidden_state_layers"] = {0, 5, 12};
+    EXPECT_THROW(validate(base, draft), std::runtime_error);
+
+    base = makeBaseConfig(/*maxVerify=*/8);
+    draft["base_model_hidden_size"] = 768 * 2;
+    EXPECT_THROW(validate(base, draft), std::runtime_error);
+}
+
+TEST_F(DeploymentConfigTest, RetainedKVPoolSupportIsIndependentOfRuntimeReuseForGemma4MTP)
 {
     Json mtpBase = makeMTPBaseConfig(/*maxVerifyTreeSize=*/8);
-    Json const mtpDraft = makeMTPDraftConfig(/*maxDraftTreeSize=*/8);
+    Json mtpDraft = makeMTPDraftConfig(/*maxDraftTreeSize=*/8);
     mtpBase["builder_config"]["max_kv_pool_pages"] = 9;
+    mtpDraft["builder_config"]["max_kv_pool_pages"] = 10;
     auto const mtpBasePath = writeJsonToTempFile(mtpBase, "base");
     auto const mtpDraftPath = writeJsonToTempFile(mtpDraft, "draft");
     EXPECT_THROW(createDeploymentConfig(mtpBasePath, std::optional<std::filesystem::path>{mtpDraftPath}, std::nullopt),
         std::runtime_error);
 
+    Json gemmaBase = makeGemma4MTPBaseConfig();
+    Json gemmaDraft = makeGemma4MTPDraftConfig();
+    gemmaBase["builder_config"]["max_kv_pool_pages"] = 9;
+    gemmaDraft["builder_config"]["max_kv_pool_pages"] = 9;
+    auto const gemmaBasePath = writeJsonToTempFile(gemmaBase, "base");
+    auto const gemmaDraftPath = writeJsonToTempFile(gemmaDraft, "draft");
+    DeploymentConfig const gemma
+        = createDeploymentConfig(gemmaBasePath, std::optional<std::filesystem::path>{gemmaDraftPath}, std::nullopt);
+    EXPECT_EQ(gemma.base.kvPoolPages, 9);
+    ASSERT_TRUE(gemma.draft.has_value());
+    EXPECT_EQ(gemma.draft->kvPoolPages, 9);
+}
+
+TEST_F(DeploymentConfigTest, RetainedKVPoolSupportIsIndependentOfRuntimeReuseForDFlash)
+{
     Json hybridEagleBase = makeHybridEagleBaseConfig(/*maxVerifyTreeSize=*/8);
     Json const eagleDraft = makeDraftConfig(/*maxVerifyTreeSize=*/0, /*maxDraftTreeSize=*/8);
     hybridEagleBase["builder_config"]["max_kv_pool_pages"] = 9;
@@ -369,15 +412,15 @@ TEST_F(DeploymentConfigTest, ModesWithoutCrossRequestRetentionRejectExtraRetaine
     EXPECT_THROW(
         createDeploymentConfig(hybridEagleBasePath, std::optional<std::filesystem::path>{eagleDraftPath}, std::nullopt),
         std::runtime_error);
-
     Json const dflashBase = makeDenseDFlashBaseConfig(/*maxVerifyTreeSize=*/16);
     Json dflashDraft = makeDFlashDraftConfig(/*maxDraftTreeSize=*/16);
     dflashDraft["builder_config"]["max_kv_pool_pages"] = 9;
     auto const dflashBasePath = writeJsonToTempFile(dflashBase, "base");
     auto const dflashDraftPath = writeJsonToTempFile(dflashDraft, "draft");
-    EXPECT_THROW(
-        createDeploymentConfig(dflashBasePath, std::optional<std::filesystem::path>{dflashDraftPath}, std::nullopt),
-        std::runtime_error);
+    DeploymentConfig const dflash
+        = createDeploymentConfig(dflashBasePath, std::optional<std::filesystem::path>{dflashDraftPath}, std::nullopt);
+    ASSERT_TRUE(dflash.draft.has_value());
+    EXPECT_EQ(dflash.draft->kvPoolPages, 9);
 }
 
 TEST_F(DeploymentConfigTest, SpecDecodeBundle)

@@ -20,7 +20,6 @@
 #include "common/checkMacros.h"
 #include "common/logger.h"
 #include "runtime/audioUtils.h"
-#include "runtime/decoding/decodingStrategy.h"
 #include "runtime/imageUtils.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/state/contextCache/blockHash.h"
@@ -28,6 +27,7 @@
 #include "runtime/streaming.h"
 
 #include <algorithm>
+#include <exception>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -184,23 +184,14 @@ bool contextCacheOperationSucceeded(ContextCacheCoordinatorStatus status, char c
 } // namespace
 
 std::optional<ContextCacheRequest> ContextCacheRequest::begin(ContextCacheCoordinator& coordinator,
-    LLMGenerationRequest const& request, DecodingInferenceContext const& context, DecodingStrategyKind strategyKind,
+    LLMGenerationRequest const& request, DecodingInferenceContext const& context, bool speculativeRequest,
     std::vector<int32_t> const& mediaTokenIds)
 {
-    ELLM_CHECK(strategyKind == DecodingStrategyKind::kVanilla || strategyKind == DecodingStrategyKind::kEAGLE
-            || strategyKind == DecodingStrategyKind::kMTP,
-        "Context cache supports only vanilla, EAGLE, or MTP request execution.");
-
     static std::vector<imageUtils::ImageData> const kEmptyImageBuffers;
     static std::vector<audioUtils::AudioData> const kEmptyAudioBuffers;
 
     ContextCacheBatchAdmission admission;
-    switch (strategyKind)
-    {
-    case DecodingStrategyKind::kEAGLE: admission.executionMode = ContextCacheExecutionMode::kEAGLE; break;
-    case DecodingStrategyKind::kMTP: admission.executionMode = ContextCacheExecutionMode::kMTP; break;
-    default: admission.executionMode = ContextCacheExecutionMode::kVanilla; break;
-    }
+    admission.speculativeRequest = speculativeRequest;
     admission.lookupPolicy = contextCacheLookupPolicy(request, context.outputThinkerEmbeddings);
     admission.commitPolicy = request.contextCacheCommitPolicy;
     admission.replayTailLength = request.contextCacheReplayTailLength;
@@ -255,7 +246,6 @@ bool ContextCacheRequest::restoreHybridMtpBoundaryHidden(int32_t slot, Tensor& b
         mCoordinator.restoreHybridMtpBoundaryHidden(mRequest, slot, baseHiddenStates, destinationRow),
         "Hybrid+MTP boundary-hidden restore");
 }
-
 bool ContextCacheRequest::preparePrefill()
 {
     return contextCacheOperationSucceeded(mCoordinator.preparePrefill(mRequest), "prefill preparation");

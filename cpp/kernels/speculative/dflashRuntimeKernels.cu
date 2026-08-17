@@ -151,33 +151,32 @@ __global__ void dflashTargetKVCacheUpdateKernel(half const* __restrict__ kDelta,
     int32_t const inPageOffset = pos % rt::kTOKENS_PER_PAGE;
     int32_t const kPage = pageTable[(b * 2) * maxPagesPerSeq + pageIndex];
     int32_t const vPage = pageTable[(b * 2 + 1) * maxPagesPerSeq + pageIndex];
-    int64_t const tokenStride = static_cast<int64_t>(numKVHeads) * headDim;
-    if (kPage >= 0 && kPage < numPages)
+    if (kPage < 0 || kPage >= numPages || vPage < numPages || vPage >= 2 * numPages)
     {
-        int64_t const kBase = (static_cast<int64_t>(kPage) * rt::kTOKENS_PER_PAGE + inPageOffset) * tokenStride
-            + static_cast<int64_t>(h) * headDim;
+        return;
+    }
+    int64_t const tokenStride = static_cast<int64_t>(numKVHeads) * headDim;
+    int64_t const kBase = (static_cast<int64_t>(kPage) * rt::kTOKENS_PER_PAGE + inPageOffset) * tokenStride
+        + static_cast<int64_t>(h) * headDim;
 #pragma unroll
-        for (int32_t i = 0; i < kVecSize; ++i)
+    for (int32_t i = 0; i < kVecSize; ++i)
+    {
+        int32_t const idx = elemOffset + i;
+        if (idx < headDim)
         {
-            int32_t const idx = elemOffset + i;
-            if (idx < headDim)
-            {
-                kvCache[kBase + idx] = kRoped[i];
-            }
+            kvCache[kBase + idx] = kRoped[i];
         }
     }
-    if (vPage >= numPages && static_cast<int64_t>(vPage) < 2 * static_cast<int64_t>(numPages))
-    {
-        int64_t const vBase = (static_cast<int64_t>(vPage) * rt::kTOKENS_PER_PAGE + inPageOffset) * tokenStride
-            + static_cast<int64_t>(h) * headDim;
+
+    int64_t const vBase = (static_cast<int64_t>(vPage) * rt::kTOKENS_PER_PAGE + inPageOffset) * tokenStride
+        + static_cast<int64_t>(h) * headDim;
 #pragma unroll
-        for (int32_t i = 0; i < kVecSize; ++i)
+    for (int32_t i = 0; i < kVecSize; ++i)
+    {
+        int32_t const idx = elemOffset + i;
+        if (idx < headDim)
         {
-            int32_t const idx = elemOffset + i;
-            if (idx < headDim)
-            {
-                kvCache[vBase + idx] = vVals[i];
-            }
+            kvCache[vBase + idx] = vVals[i];
         }
     }
 }

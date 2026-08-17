@@ -410,6 +410,10 @@ def _generate_draft_build_commands(
         f"--maxBatchSize={config.max_batch_size}", "--specDraft",
         f"--maxDraftTreeSize={config.max_draft_tree_size}"
     ])
+
+    if config.max_kv_pool_pages is not None:
+        draft_cmd.append(f"--maxKVPoolPages={config.max_kv_pool_pages}")
+
     commands.append((draft_cmd, 1200))
 
     return commands

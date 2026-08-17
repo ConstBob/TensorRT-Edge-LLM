@@ -143,8 +143,9 @@ bool LLMBuilder::build()
     int64_t const kvPoolPages = mBuilderConfig.resolvedKVPoolPages();
     bool const hasExtraRetainedPages = kvPoolPages > minimumActivePages;
     std::string const mode = specDecodeType(mModelConfig);
-    bool const supportsCrossRequestRetention
-        = mNbKVCacheInputs > 0 && (mode == "none" || (mode == "eagle3" && mNumLinearAttnLayers == 0));
+    bool const attentionOnlyReusableSpec = mNumLinearAttnLayers == 0
+        && (mode == "eagle3" || mode == "gemma4_mtp" || mode == "dflash" || mode == "jetspec" || mode == "dspark");
+    bool const supportsCrossRequestRetention = mNbKVCacheInputs > 0 && (mode == "none" || attentionOnlyReusableSpec);
     if (hasExtraRetainedPages && !supportsCrossRequestRetention)
     {
         LOG_ERROR(

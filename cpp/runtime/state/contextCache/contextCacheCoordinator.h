@@ -60,20 +60,11 @@ struct ContextCacheSequenceAdmission
     std::vector<Hash128> perPositionMediaHash;
 };
 
-//! Decoder mode selected before cache lookup. A deployment with EAGLE engines may execute either mode per request;
-//! vanilla may reuse the base side of a paired record, while EAGLE requires a paired base/draft hit.
-enum class ContextCacheExecutionMode : uint8_t
-{
-    kVanilla,
-    kEAGLE,
-    kMTP,
-};
-
 //! One serialized runtime request. Bypass still uses managed private pages but neither looks up nor publishes state.
 struct ContextCacheBatchAdmission
 {
     std::vector<ContextCacheSequenceAdmission> sequences;
-    ContextCacheExecutionMode executionMode{ContextCacheExecutionMode::kVanilla};
+    bool speculativeRequest{};
     ContextCacheLookupPolicy lookupPolicy{ContextCacheLookupPolicy::kUseCache};
     ContextCacheCommitPolicy commitPolicy{ContextCacheCommitPolicy::kIncludingGeneratedTokens};
     //! Carried-through Hybrid+MTP replay tail length. Not consumed by this stage.
@@ -140,7 +131,7 @@ public:
     };
 
     ContextCacheCoordinator(ContextCacheConfig const& config, DeploymentConfig const& deployment,
-        ContextCacheDeploymentKind deploymentKind, ContextCachePhysicalResources resources, cudaStream_t stream,
+        ContextCacheDeploymentProfile profile, ContextCachePhysicalResources resources, cudaStream_t stream,
         StreamSynchronizer synchronizer = {});
     ~ContextCacheCoordinator() noexcept;
     ContextCacheCoordinator(ContextCacheCoordinator const&) = delete;
@@ -185,6 +176,7 @@ public:
     ContextCacheCoordinatorStatus shutdown() noexcept;
 
     ContextCacheMetrics metrics() const noexcept;
+    int32_t speculativeKVReserve() const noexcept;
     ContextCacheManager const& manager() const noexcept;
 
 private:
@@ -204,11 +196,12 @@ private:
     class HybridSnapshotPolicy;
     class HybridMtpPolicy;
     class EagleSpecPolicy;
+    class SharedKvSpecPolicy;
 
-    std::unique_ptr<PublicationPolicy> makePublicationPolicy(ContextCacheExecutionMode mode);
+    std::unique_ptr<PublicationPolicy> makePublicationPolicy(bool speculativeRequest);
 
-    AcquireSequenceResult acquireSequence(ContextCacheSequenceAdmission const& admission,
-        ContextCacheExecutionMode executionMode, ContextCacheLookupPolicy lookupPolicy);
+    AcquireSequenceResult acquireSequence(
+        ContextCacheSequenceAdmission const& admission, bool speculativeRequest, ContextCacheLookupPolicy lookupPolicy);
     ContextCacheCoordinatorStatus applyAdvances(
         RequestHandle::Impl& request, std::vector<ContextCacheSequenceAdvance> const& advances);
     //! How far committedStateLength advances per decode step, which is the only difference between the vanilla and
@@ -241,9 +234,13 @@ private:
     void publishFrozenSpecPrefill(RequestHandle::Impl& request);
     RequestHandle::Impl& checkedImpl(RequestHandle& request) const;
     bool isHybridDeployment() const noexcept;
+    bool isPureRecurrentDeployment() const noexcept;
+    bool usesCheckpointReuse() const noexcept;
     bool isSpecDeployment() const noexcept;
+    bool ownsPagedSpecState() const noexcept;
+    bool isSpecRequest(RequestHandle::Impl const& request) const noexcept;
     //! Request capability predicates. The context-cache subsystem is decoder-agnostic: the adapter collapses the
-    //! decoder identity into ContextCacheExecutionMode at admission (contextCacheRequestAdapter.cpp). Lifecycle sites
+    //! decoder identity into the per-request speculativeRequest bit at admission. Lifecycle sites
     //! must not test that identity (== kEAGLE / == kMTP) directly -- each names the *capability* it depends on, so a
     //! future decoder that gains or loses a capability changes one predicate body, not a scavenger hunt across call
     //! sites. One capability owns every site that depends on it; splitting a capability across two predicates with the
@@ -254,17 +251,17 @@ private:
     //! compacted on eviction) and the draft cache must be reset at prefill. Leased draft pages are not reachable until
     //! the table names them -- it is identity-mapped otherwise, and restoring snapshot *contents* into a leased page
     //! does not publish the mapping that gets the engine there.
-    bool runsPairedDraftWorkingSet(ContextCacheExecutionMode mode) const noexcept;
+    bool runsPairedDraftWorkingSet(RequestHandle::Impl const& request) const noexcept;
     //! EAGLE's two-phase draft initialization publishes a frozen prefill endpoint after the first verification round
     //! terminalizes the ordered draft init. Hybrid+MTP publishes via the hybrid snapshot endpoint path, no frozen
     //! phase.
-    bool usesFrozenSpecPublication(ContextCacheExecutionMode mode) const noexcept;
+    bool usesFrozenSpecPublication(RequestHandle::Impl const& request) const noexcept;
     bool deploymentHasAttention() const noexcept;
     ContextCacheCoordinatorStatus synchronizeRequest(RequestHandle& request);
     void abandon(std::unique_ptr<RequestHandle::Impl> request) noexcept;
     void quarantine(RequestHandle& request) noexcept;
 
-    ContextCacheDeploymentKind mDeploymentKind{};
+    ContextCacheDeploymentProfile mProfile;
     ContextCacheManager mManager;
     std::unique_ptr<HybridSnapshotStorage> mHybridSnapshots;
     HybridCacheManager& mBaseCache;

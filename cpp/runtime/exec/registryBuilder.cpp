@@ -65,6 +65,15 @@ void addRopeTensorSpecs(TensorRegistry& reg, LLMEngineConfig const& cfg)
     addRopeTensor(binding_names::kRopeCosSin, cfg.rotaryDim);
 }
 
+//! Add the dynamic page-table binding. AttentionPlugin cross-checks its row count against the packed QKV batch,
+//! so the first dimension must track the active batch rather than the full physical table extent.
+void addKVPageTableSpec(TensorRegistry& reg, LLMEngineConfig const& cfg)
+{
+    int32_t const maxPagesPerSeq = rt::computeMaxPagesPerSeq(cfg.maxKVCacheCapacity);
+    reg.addTensor({binding_names::kKVPageTable, TensorIO::kInput, nvinfer1::DataType::kINT32,
+        {sym(&InferenceDims::batch), fixed(2), fixed(maxPagesPerSeq)}});
+}
+
 TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int32_t> specDecodeBaseOutputHiddenDim)
 {
     TensorRegistry reg;
@@ -139,9 +148,8 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
     // the bound address and the engine branches to the initial-prefill path.
     reg.addTensor({binding_names::kKVCacheStartIndex, TensorIO::kInput, nvinfer1::DataType::kINT32,
         {sym(&InferenceDims::startIndexLen)}});
-    int32_t const maxPagesPerSeq = rt::computeMaxPagesPerSeq(cfg.maxKVCacheCapacity);
-    reg.addTensor({binding_names::kKVPageTable, TensorIO::kInput, nvinfer1::DataType::kINT32,
-        {sym(&InferenceDims::batch), fixed(2), fixed(maxPagesPerSeq)}});
+
+    addKVPageTableSpec(reg, cfg);
 
     if (cfg.useVisionBidirectionalAttention)
     {
@@ -351,12 +359,7 @@ TensorRegistry buildRegistryForSpecDecodeDraft(DeploymentConfig const& bundle)
     reg.addTensor({binding_names::kKVCacheStartIndex, TensorIO::kInput, nvinfer1::DataType::kINT32,
         {sym(&InferenceDims::startIndexLen)}});
 
-    // kv_page_table: [batch, 2, maxPagesPerSeq] INT32. AttentionPlugin cross-checks this
-    // row count against the packed QKV batch, so it must track the active batch rather
-    // than fall back to the page table's full [maxBatch, ...] extent.
-    int32_t const maxPagesPerSeq = rt::computeMaxPagesPerSeq(cfg.maxKVCacheCapacity);
-    reg.addTensor({binding_names::kKVPageTable, TensorIO::kInput, nvinfer1::DataType::kINT32,
-        {sym(&InferenceDims::batch), fixed(2), fixed(maxPagesPerSeq)}});
+    addKVPageTableSpec(reg, cfg);
 
     if (cfg.contextMaskSelectorEnabled)
     {
@@ -457,6 +460,8 @@ TensorRegistry buildRegistryForDFlashDraft(DeploymentConfig const& bundle)
     reg.addTensor(
         {binding_names::kContextLengths, TensorIO::kInput, nvinfer1::DataType::kINT32, {sym(&InferenceDims::batch)}});
 
+    addKVPageTableSpec(reg, cfg);
+
     // kvcache_start_index: [startIndexLen] INT32
     reg.addTensor({binding_names::kKVCacheStartIndex, TensorIO::kInput, nvinfer1::DataType::kINT32,
         {sym(&InferenceDims::startIndexLen)}});
@@ -532,9 +537,7 @@ TensorRegistry buildRegistryForGemma4MTPDraft(DeploymentConfig const& bundle)
     reg.addTensor(
         {binding_names::kContextLengths, TensorIO::kInput, nvinfer1::DataType::kINT32, {sym(&InferenceDims::batch)}});
 
-    int32_t const maxPagesPerSeq = rt::computeMaxPagesPerSeq(draftCfg.maxKVCacheCapacity);
-    reg.addTensor({binding_names::kKVPageTable, TensorIO::kInput, nvinfer1::DataType::kINT32,
-        {sym(&InferenceDims::batch), fixed(2), fixed(maxPagesPerSeq)}});
+    addKVPageTableSpec(reg, bundle.base);
 
     addRopeTensorSpecs(reg, draftCfg);
 
@@ -603,10 +606,7 @@ TensorRegistry buildRegistryForDSparkDraft(DeploymentConfig const& bundle)
     reg.addTensor({binding_names::kKVCacheStartIndex, TensorIO::kInput, nvinfer1::DataType::kINT32,
         {sym(&InferenceDims::startIndexLen)}});
 
-    // kv_page_table: [batch, 2, maxPagesPerSeq] INT32
-    int32_t const maxPagesPerSeq = rt::computeMaxPagesPerSeq(cfg.maxKVCacheCapacity);
-    reg.addTensor({binding_names::kKVPageTable, TensorIO::kInput, nvinfer1::DataType::kINT32,
-        {sym(&InferenceDims::batch), fixed(2), fixed(maxPagesPerSeq)}});
+    addKVPageTableSpec(reg, cfg);
 
     // dflash_delta_lengths: [batch] INT32
     reg.addTensor({binding_names::kDFlashDeltaLengths, TensorIO::kInput, nvinfer1::DataType::kINT32,

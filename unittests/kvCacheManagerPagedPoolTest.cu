@@ -25,6 +25,11 @@
 #include "runtime/kvCacheManager.h"
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
 using namespace trt_edgellm;
 using namespace nvinfer1;
 

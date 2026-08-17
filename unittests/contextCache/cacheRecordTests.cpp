@@ -52,6 +52,20 @@ CacheRecord makeRecord(std::vector<BlockHash> logicalBlockHashes, std::vector<Pa
     return record;
 }
 
+SpecPagedStateRecord makePagedSpecState(std::vector<PageId> pagePath)
+{
+    return SpecPagedStateRecord{std::move(pagePath)};
+}
+
+std::vector<PageId> specPagePath(CacheRecord const& record)
+{
+    if (!record.specState.has_value())
+    {
+        return {};
+    }
+    return record.specState->pagePath;
+}
+
 } // namespace
 
 TEST(ContextCacheRecordStoreTests, RecordOwnsItsCompleteBasePath)
@@ -64,7 +78,7 @@ TEST(ContextCacheRecordStoreTests, RecordOwnsItsCompleteBasePath)
     CacheRecord record = makeRecord({kHASH_A, kHASH_B, kHASH_C}, {10, 11, 12});
     constexpr RecordId kCALLER_RECORD_ID = 91;
     record.id = kCALLER_RECORD_ID;
-    record.draftPagePath = {20, 21, 22};
+    record.specState = makePagedSpecState({20, 21, 22});
     record.recurrentSnapshotSlot = 30;
     record.partialKvSnapshotSlot = 40;
     record.exactCheckpointLength = 96;
@@ -81,7 +95,7 @@ TEST(ContextCacheRecordStoreTests, RecordOwnsItsCompleteBasePath)
 
     record.logicalBlockHashes.clear();
     record.basePagePath.assign({90});
-    record.draftPagePath.assign({91});
+    record.specState = makePagedSpecState({91});
     record.recurrentSnapshotSlot = 92;
     record.partialKvSnapshotSlot = 93;
 
@@ -89,7 +103,8 @@ TEST(ContextCacheRecordStoreTests, RecordOwnsItsCompleteBasePath)
     EXPECT_EQ(stored.id, inserted.id);
     EXPECT_EQ(stored.logicalBlockHashes, std::vector<BlockHash>({kHASH_A, kHASH_B, kHASH_C}));
     EXPECT_EQ(stored.basePagePath, std::vector<PageId>({10, 11, 12}));
-    EXPECT_EQ(stored.draftPagePath, std::vector<PageId>({20, 21, 22}));
+    ASSERT_TRUE(stored.specState.has_value());
+    EXPECT_EQ(specPagePath(stored), std::vector<PageId>({20, 21, 22}));
     EXPECT_EQ(stored.recurrentSnapshotSlot, std::optional<int32_t>{30});
     EXPECT_EQ(stored.partialKvSnapshotSlot, std::optional<int32_t>{40});
     EXPECT_EQ(stored.exactCheckpointLength, std::optional<int32_t>{96});
@@ -124,11 +139,11 @@ TEST(ContextCacheRecordStoreTests, RecordOwnsItsCompleteBasePath)
     expectInvalid(std::move(invalid));
 
     invalid = valid;
-    invalid.draftPagePath.pop_back();
+    invalid.specState->pagePath.pop_back();
     expectInvalid(std::move(invalid));
 
     invalid = valid;
-    invalid.draftPagePath = {20, 21, 22, 23};
+    invalid.specState = makePagedSpecState({20, 21, 22, 23});
     expectInvalid(std::move(invalid));
 
     invalid = valid;
@@ -136,7 +151,7 @@ TEST(ContextCacheRecordStoreTests, RecordOwnsItsCompleteBasePath)
     expectInvalid(std::move(invalid));
 
     invalid = valid;
-    invalid.draftPagePath[1] = -1;
+    invalid.specState->pagePath[1] = -1;
     expectInvalid(std::move(invalid));
 
     invalid = valid;
@@ -167,7 +182,7 @@ TEST(ContextCacheRecordStoreTests, ExactDuplicateReturnsExistingRecord)
 
     CacheRecord duplicate = makeRecord({kHASH_A, kHASH_B}, {90, 91});
     duplicate.id = 999;
-    duplicate.draftPagePath = {92, 93};
+    duplicate.specState = makePagedSpecState({92, 93});
     duplicate.partialKvSnapshotSlot = 94;
     duplicate.recurrentSnapshotSlot = 95;
     duplicate.exactCheckpointLength = 96;
@@ -180,7 +195,7 @@ TEST(ContextCacheRecordStoreTests, ExactDuplicateReturnsExistingRecord)
     EXPECT_EQ(store.lruToMru(), std::vector<RecordId>({otherInsert.id, firstInsert.id}));
     CacheRecord const& stored = store.get(firstInsert.id);
     EXPECT_EQ(stored.basePagePath, std::vector<PageId>({10, 11}));
-    EXPECT_TRUE(stored.draftPagePath.empty());
+    EXPECT_FALSE(stored.specState.has_value());
     EXPECT_EQ(stored.recurrentSnapshotSlot, std::optional<int32_t>{12});
     EXPECT_FALSE(stored.partialKvSnapshotSlot.has_value());
     EXPECT_FALSE(stored.exactCheckpointLength.has_value());
@@ -276,7 +291,7 @@ TEST(ContextCacheRecordStoreTests, EraseRemovesExactKeyAndLruEntry)
     CacheRecordStore store(3);
     RecordInsertResult const first = store.insert(makeRecord({kHASH_A}, {10}));
     CacheRecord middleRecord = makeRecord({kHASH_A, kHASH_B}, {10, 11});
-    middleRecord.draftPagePath = {20, 21};
+    middleRecord.specState = makePagedSpecState({20, 21});
     middleRecord.recurrentSnapshotSlot = 30;
     middleRecord.partialKvSnapshotSlot = 40;
     middleRecord.exactCheckpointLength = 64;
@@ -293,7 +308,7 @@ TEST(ContextCacheRecordStoreTests, EraseRemovesExactKeyAndLruEntry)
     EXPECT_TRUE(erased.key == middleKey);
     EXPECT_EQ(erased.logicalBlockHashes, std::vector<BlockHash>({kHASH_A, kHASH_B}));
     EXPECT_EQ(erased.basePagePath, std::vector<PageId>({10, 11}));
-    EXPECT_EQ(erased.draftPagePath, std::vector<PageId>({20, 21}));
+    EXPECT_EQ(specPagePath(erased), std::vector<PageId>({20, 21}));
     EXPECT_EQ(erased.recurrentSnapshotSlot, std::optional<int32_t>{30});
     EXPECT_EQ(erased.partialKvSnapshotSlot, std::optional<int32_t>{40});
     EXPECT_EQ(erased.exactCheckpointLength, std::optional<int32_t>{64});
@@ -343,7 +358,7 @@ TEST(ContextCacheRecordStoreTests, BranchRecordsRetainSharedAncestorsIndependent
     EXPECT_EQ(store.size(), 1U);
 }
 
-TEST(ContextCacheRecordStoreTests, AddingDraftStatePreservesBaseIdentityAndPromotesRecord)
+TEST(ContextCacheRecordStoreTests, AddingSpecStatePreservesBaseIdentityAndPromotesRecord)
 {
     CacheRecordStore store(2);
     RecordInsertResult const first = store.insert(makeRecord({kHASH_A, kHASH_B}, {10, 11}));
@@ -352,20 +367,21 @@ TEST(ContextCacheRecordStoreTests, AddingDraftStatePreservesBaseIdentityAndPromo
     ASSERT_TRUE(second.inserted);
     ASSERT_EQ(store.lruToMru(), std::vector<RecordId>({first.id, second.id}));
 
-    EXPECT_THROW(store.setDraftState(first.id, {20}), std::runtime_error);
-    EXPECT_THROW(store.setDraftState(first.id, {20, -1}), std::runtime_error);
-    EXPECT_TRUE(store.get(first.id).draftPagePath.empty());
+    EXPECT_THROW(store.setSpecState(first.id, makePagedSpecState({20})), std::runtime_error);
+    EXPECT_THROW(store.setSpecState(first.id, makePagedSpecState({20, -1})), std::runtime_error);
+    EXPECT_FALSE(store.get(first.id).specState.has_value());
 
-    store.setDraftState(first.id, {20, 21});
+    store.setSpecState(first.id, makePagedSpecState({20, 21}));
 
     CacheRecord const& upgraded = store.get(first.id);
     EXPECT_EQ(upgraded.key, (CacheRecordKey{kHASH_B, 2}));
     EXPECT_EQ(upgraded.logicalBlockHashes, std::vector<BlockHash>({kHASH_A, kHASH_B}));
     EXPECT_EQ(upgraded.basePagePath, std::vector<PageId>({10, 11}));
-    EXPECT_EQ(upgraded.draftPagePath, std::vector<PageId>({20, 21}));
+    EXPECT_EQ(specPagePath(upgraded), std::vector<PageId>({20, 21}));
     EXPECT_EQ(store.lruToMru(), std::vector<RecordId>({second.id, first.id}));
 
-    EXPECT_THROW(store.setDraftState(first.id, {30, 31}), std::runtime_error);
-    EXPECT_EQ(store.get(first.id).draftPagePath, std::vector<PageId>({20, 21}));
+    store.setSpecState(first.id, makePagedSpecState({20, 21}));
+    EXPECT_THROW(store.setSpecState(first.id, makePagedSpecState({30, 31})), std::runtime_error);
+    EXPECT_EQ(specPagePath(store.get(first.id)), std::vector<PageId>({20, 21}));
     EXPECT_EQ(store.get(first.id).basePagePath, std::vector<PageId>({10, 11}));
 }

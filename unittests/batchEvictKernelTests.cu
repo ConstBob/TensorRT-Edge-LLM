@@ -181,6 +181,49 @@ TEST(BatchEvictKernels, CompactTensorBatchInPlace)
 }
 
 // ============================================================================
+TEST(BatchEvictKernels, CompactTensorBatchSupportsInt64Indices)
+{
+    cudaStream_t stream{};
+    CUDA_CHECK(cudaStreamCreate(&stream));
+
+    constexpr int32_t kOldBatch = 4;
+    constexpr int32_t kNewBatch = 2;
+    rt::Tensor mapping({kOldBatch}, rt::DeviceType::kGPU, DataType::kINT32);
+    copyHostToDevice(mapping, std::vector<int32_t>{-1, 0, -1, 1});
+
+    rt::Tensor indices({kOldBatch, 2}, rt::DeviceType::kGPU, DataType::kINT64);
+    copyHostToDevice(indices, std::vector<int64_t>{10, 11, 20, 21, 30, 31, 40, 41});
+
+    compactTensorBatch(indices, mapping, indices, kOldBatch, kNewBatch, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<int64_t> const compacted = copyDeviceToHost<int64_t>(indices);
+    EXPECT_EQ(std::vector<int64_t>(compacted.begin(), compacted.begin() + 4), (std::vector<int64_t>{20, 21, 40, 41}));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}
+
+TEST(BatchEvictKernels, CompactTensorBatchSupportsInt8TreeMask)
+{
+    cudaStream_t stream{};
+    CUDA_CHECK(cudaStreamCreate(&stream));
+
+    constexpr int32_t kOldBatch = 4;
+    constexpr int32_t kNewBatch = 2;
+    rt::Tensor mapping({kOldBatch}, rt::DeviceType::kGPU, DataType::kINT32);
+    copyHostToDevice(mapping, std::vector<int32_t>{-1, 0, -1, 1});
+
+    rt::Tensor mask({kOldBatch, 2, 2}, rt::DeviceType::kGPU, DataType::kINT8);
+    copyHostToDevice(mask, std::vector<int8_t>{0, 1, 2, 3, 10, 11, 12, 13, 20, 21, 22, 23, 30, 31, 32, 33});
+
+    compactTensorBatch(mask, mapping, mask, kOldBatch, kNewBatch, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<int8_t> const compacted = copyDeviceToHost<int8_t>(mask);
+    EXPECT_EQ(std::vector<int8_t>(compacted.begin(), compacted.begin() + 8),
+        (std::vector<int8_t>{10, 11, 12, 13, 30, 31, 32, 33}));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}
+
 // Performance Test: compactTensorBatch (In-place)
 // ============================================================================
 TEST(BatchEvictKernels, DISABLED_CompactTensorBatchPerformance)
