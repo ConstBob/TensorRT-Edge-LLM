@@ -33,6 +33,29 @@ set(CMAKE_CUDA_FLAGS
 )
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--no-undefined")
 
+function(edgellm_apply_qnx_warning_suppressions target)
+  if(QNX_BUILD)
+    # Suppress QNX 8 system-header false positives on affected project targets.
+    set(_qnx_warning_suppressions
+        -Wno-array-bounds
+        -Wno-maybe-uninitialized
+        -Wno-dangling-pointer
+        -Wno-free-nonheap-object
+        -Wno-stringop-overflow
+        -Wno-return-type
+        -Wno-stringop-overread)
+    target_compile_options(
+      ${target}
+      PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:${_qnx_warning_suppressions}>)
+
+    set(_qnx_cuda_warning_suppressions ${_qnx_warning_suppressions})
+    list(TRANSFORM _qnx_cuda_warning_suppressions PREPEND "-Xcompiler=")
+    target_compile_options(
+      ${target}
+      PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${_qnx_cuda_warning_suppressions}>)
+  endif()
+endfunction()
+
 # Code coverage with gcov (for SonarQube analysis)
 option(ENABLE_COVERAGE "Enable gcov code coverage instrumentation" OFF)
 include(${CMAKE_SOURCE_DIR}/cmake/CodeCoverage.cmake)
@@ -124,7 +147,7 @@ find_path(
   PATH_SUFFIXES include)
 
 set(CUDA_INCLUDE_DIR ${CUDA_RUNTIME_API_INCLUDE_DIR}
-                     ${CURAND_KERNEL_INCLUDE_DIR})
+                     ${CURAND_KERNEL_INCLUDE_DIR} ${CUDA_PLATFORM_INCLUDE_DIR})
 
 set(CUDA_USE_STATIC_CUDA_RUNTIME OFF)
 

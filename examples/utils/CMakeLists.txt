@@ -1,5 +1,6 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
-# All rights reserved. SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION &
+# AFFILIATES. All rights reserved. SPDX-License-Identifier:
+# LicenseRef-NvidiaProprietary
 #
 # NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
 # property and proprietary rights in and to this material, related documentation
@@ -19,3 +20,4 @@ target_include_directories(exampleUtils PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
 
 target_link_libraries(exampleUtils PRIVATE commonLibraryExt ${CMAKE_DL_LIBS})
 target_link_libraries(exampleUtils INTERFACE edgellmCore)
+edgellm_apply_qnx_warning_suppressions(exampleUtils)
