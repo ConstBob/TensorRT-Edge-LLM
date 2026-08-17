@@ -63,6 +63,10 @@ def _arguments(argv=None) -> argparse.Namespace:
     parser.add_argument("--build-jobs",
                         type=_positive_int,
                         help="Maximum parallel CMake build processes.")
+    parser.add_argument(
+        "--compiler-launcher",
+        type=Path,
+        help="Optional compiler launcher shared by C, C++, and CUDA builds.")
     parser.add_argument("--matrix",
                         type=Path,
                         default=REPO_ROOT / "packaging" / "variants.toml")
@@ -238,6 +242,9 @@ def _cmake_configure_command(args: argparse.Namespace, repo_root: Path,
         os.fspath(repo_root),
         "-B",
         os.fspath(build_dir),
+        "-UPython_*",
+        "-U_Python_*",
+        "-UPYTHON_*",
         "-DCMAKE_BUILD_TYPE=Release",
         f"-DCMAKE_CUDA_ARCHITECTURES={cuda_architecture}",
         "-DBUILD_PYTHON_BINDINGS=ON",
@@ -253,6 +260,13 @@ def _cmake_configure_command(args: argparse.Namespace, repo_root: Path,
     driver_stub = cuda_driver_stub(row)
     if driver_stub is not None:
         command.append(f"-DCUDA_DRIVER_LIB={driver_stub}")
+    if args.compiler_launcher is not None:
+        launcher = args.compiler_launcher.resolve(strict=True)
+        if not os.access(launcher, os.X_OK):
+            raise RuntimeError(
+                f"Compiler launcher is not executable: {launcher}.")
+        command.extend(f"-DCMAKE_{language}_COMPILER_LAUNCHER={launcher}"
+                       for language in ("C", "CXX", "CUDA"))
     command.extend(_cross_cmake_options(args, row))
     command.extend(str(value) for value in row["cmake_args"])
     return command

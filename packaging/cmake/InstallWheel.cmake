@@ -47,23 +47,6 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_link_options(NvInfer_edgellm_plugin PRIVATE "-Wl,--no-undefined")
 endif()
 
-# CuTe DSL AOT headers use the CUDA 12.8 runtime type even when the generated
-# code targets JetPack 6.2. Apply the existing driver-API adapter only to
-# sources that include the FP16 MoE AOT header.
-if(CUDA_CTK_VERSION VERSION_GREATER_EQUAL 12.0 AND CUDA_CTK_VERSION
-                                                   VERSION_LESS 12.8)
-  set(_EDGELLM_CUDA_LIBRARY_COMPAT
-      "-include${CMAKE_CURRENT_LIST_DIR}/CudaLibraryCompat.h")
-  set_source_files_properties(
-    "${CMAKE_SOURCE_DIR}/cpp/kernels/moe/f16_cutedsl/cuteDslF16MoeRunner.cpp"
-    TARGET_DIRECTORY edgellmCore PROPERTIES COMPILE_OPTIONS
-                                            "${_EDGELLM_CUDA_LIBRARY_COMPAT}")
-  set_source_files_properties(
-    "${CMAKE_SOURCE_DIR}/cpp/plugins/fp16MoePlugin/fp16MoePlugin.cpp"
-    TARGET_DIRECTORY NvInfer_edgellm_plugin
-    PROPERTIES COMPILE_OPTIONS "${_EDGELLM_CUDA_LIBRARY_COMPAT}")
-endif()
-
 set(_EDGELLM_WHEEL_LINK_MAP_DIR "${CMAKE_BINARY_DIR}/wheel-link-maps")
 file(MAKE_DIRECTORY "${_EDGELLM_WHEEL_LINK_MAP_DIR}")
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

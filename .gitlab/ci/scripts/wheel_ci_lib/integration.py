@@ -325,8 +325,15 @@ def integration_ci() -> None:
     row = matrix.variant_row(config.required_environment("VARIANT"))
     python_abis = row.get("ci_test_python_abis",
                           qualification["qualified_python_abis"])
+    if not row["ci_remote"]:
+        versions = tuple(
+            common.ABI_INTERPRETERS[python_abi].removeprefix("python")
+            for python_abi in python_abis)
+        with common.phase(f"integration {row['variant_id']}: host Pythons"):
+            python_setup.prepare_host_pythons(versions)
     for python_abi in python_abis:
-        _integrate_wheel(row, python_abi)
+        with common.phase(f"integration {row['variant_id']}/{python_abi}"):
+            _integrate_wheel(row, python_abi)
 
 
 def _validate_integration_result(key: typing.Tuple[str, str],

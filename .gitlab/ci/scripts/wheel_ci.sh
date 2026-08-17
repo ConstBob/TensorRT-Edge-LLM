@@ -8,5 +8,6 @@ if [ "$(python3 -c 'import sys; print(sys.version_info[:2] < (3, 11))')" = "True
     python3 -m pip install 'tomli==2.2.1'
 fi
 
-PYTHONPATH="${PWD}/packaging${PYTHONPATH:+:${PYTHONPATH}}" \
+PYTHONUNBUFFERED=1 \
+    PYTHONPATH="${PWD}/packaging${PYTHONPATH:+:${PYTHONPATH}}" \
     exec python3 .gitlab/ci/scripts/wheel_ci.py "$@"

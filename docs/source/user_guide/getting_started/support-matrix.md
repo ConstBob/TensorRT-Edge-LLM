@@ -18,7 +18,6 @@ This page lists supported software stacks and KV cache reuse combinations. See
 | NVIDIA DRIVE Thor | Official | DriveOS 7.2 | 13.3 | DriveOS SDK package | SDK container, then deploy `build/` | Model-dependent |
 | NVIDIA DGX Spark (GB10) | Official | DGX Spark software stack | 13.0 | System package | Device | Model-dependent |
 | Jetson Orin | Official | JetPack 7.2 | 13.2 | JetPack package | Device | FP16, INT8, and INT4 only |
-| Jetson Orin | Compatible | JetPack 6.2+ | 12.6 | JetPack package | Device | FP16, INT8, and INT4 only |
 | x86-64 Linux GPU | Developer | Ubuntu 22.04 / 24.04 | 12.x or 13.x | Compatible user package | Workstation | Development and validation |
 
 `Official` combinations are release-tested deployment targets. `Compatible`
@@ -40,7 +39,7 @@ is exact; the loader does not guess a nearest SM or TensorRT major.
 | x86_64 | Ubuntu 22.04, CUDA 13, SM80, TensorRT 10 |
 | x86_64 | Ubuntu 24.04, CUDA 13, SM86/SM100/SM120, TensorRT 10 |
 | x86_64 | Ubuntu 24.04, CUDA 13, SM80/SM86/SM100/SM120, TensorRT 11 |
-| aarch64 | Jetson Orin: JetPack 6.2 (CUDA 12, SM87) and JetPack 7.2 (CUDA 13, SM87), platform TensorRT 10 |
+| aarch64 | Jetson Orin: JetPack 7.2, CUDA 13, SM87, platform TensorRT 10 |
 | aarch64 | Jetson Thor: JetPack 7.0/7.1/7.2, CUDA 13, SM110, platform TensorRT 10 |
 | aarch64 | DRIVE Thor: DriveOS 7.2, CUDA 13, SM110, platform TensorRT 10 |
 | aarch64 | DGX Spark current stack, CUDA 13, SM121, platform TensorRT 10 |

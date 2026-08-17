@@ -9,7 +9,6 @@ qualified_tensorrt_majors = [10, 11]
 required_platform_releases = [
   "ubuntu:22.04",
   "ubuntu:24.04",
-  "jetson:jp62",
   "jetson:jp70",
   "jetson:jp71",
   "jetson:jp72",
@@ -41,11 +40,6 @@ cuda_major = 13
 cpu_arch = "x86_64"
 gpu_sm = 120
 cuda_major = 13
-
-[[cutedsl_artifacts]]
-cpu_arch = "aarch64"
-gpu_sm = 87
-cuda_major = 12
 
 [[cutedsl_artifacts]]
 cpu_arch = "aarch64"
@@ -142,21 +136,6 @@ cute_dsl_artifact_tag = "sm_120"
 cuda_ctk_version = "13.2"
 embedded_target = ""
 cmake_args = ["-DENABLE_CUTE_DSL=ALL"]
-
-[[variants]]
-variant_id = "jetson-orin-jp62-cu12-sm87"
-platform_family = "jetson"
-platform_probe_source = "l4t"
-platform_probe_values = ["R36.4"]
-platform_release = "jp62"
-cpu_arch = "aarch64"
-cuda_runtime_soname = "libcudart.so.12"
-tensorrt_runtime_soname = "libnvinfer.so.10"
-gpu_sm = 87
-cute_dsl_artifact_tag = "sm_87"
-cuda_ctk_version = "12.6"
-embedded_target = "jetson-orin"
-cmake_args = ["-DAARCH64_BUILD=ON", "-DENABLE_CUTE_DSL=ALL"]
 
 [[variants]]
 variant_id = "jetson-orin-jp72-cu13-sm87"

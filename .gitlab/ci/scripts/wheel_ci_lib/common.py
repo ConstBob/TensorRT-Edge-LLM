@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import pathlib
 import platform
@@ -50,8 +51,34 @@ LOCAL_INTEGRATION_ENVIRONMENT = {
     "TRT_PACKAGE_DIR": "ci_trt_package",
 }
 
+_TOOLCHAIN_REQUIREMENTS = {
+    "assembly": "wheel-assembly-requirements.txt",
+    "base": "wheel-base-requirements.txt",
+    "payload": "wheel-payload-requirements.txt",
+}
 
-def install_toolchain(python: str = sys.executable) -> None:
+
+@contextlib.contextmanager
+def phase(name: str) -> typing.Iterator[None]:
+    """Print an unbuffered duration for one CI phase."""
+    started = time.monotonic()
+    print(f"[wheel-ci] START {name}", flush=True)
+    try:
+        yield
+    except Exception:
+        elapsed = time.monotonic() - started
+        print(f"[wheel-ci] FAIL {name} ({elapsed:.1f}s)", flush=True)
+        raise
+    elapsed = time.monotonic() - started
+    print(f"[wheel-ci] DONE {name} ({elapsed:.1f}s)", flush=True)
+
+
+def install_toolchain(profile: str, python: str = sys.executable) -> None:
+    try:
+        requirements = _TOOLCHAIN_REQUIREMENTS[profile]
+    except KeyError as error:
+        raise RuntimeError(
+            f"Unknown wheel toolchain profile {profile!r}.") from error
     pip = subprocess.run([python, "-m", "pip", "--version"],
                          text=True,
                          stdout=subprocess.DEVNULL,
@@ -60,19 +87,46 @@ def install_toolchain(python: str = sys.executable) -> None:
         config.run_checked([python, "-m", "ensurepip", "--upgrade"])
     config.run_checked([
         python, "-m", "pip", "install", "--requirement",
-        str(config.REPO_ROOT / "packaging" /
-            "wheel-toolchain-requirements.txt")
+        str(config.REPO_ROOT / "packaging" / requirements)
     ],
                        cwd=config.REPO_ROOT)
 
 
-def toolchain_python(python: str, python_abi: str) -> str:
+def toolchain_python(python: str, python_abi: str, profile: str) -> str:
     environment = config.REPO_ROOT / "venv" / f"wheel-{python_abi}"
     shutil.rmtree(environment, ignore_errors=True)
     config.run_checked([python, "-m", "venv", str(environment)])
     isolated_python = str(environment / "bin" / "python")
-    install_toolchain(isolated_python)
+    install_toolchain(profile, isolated_python)
     return isolated_python
+
+
+def compiler_cache() -> typing.Optional[str]:
+    """Configure a job-local ccache when the build host provides it."""
+    executable = shutil.which("ccache")
+    if executable is None:
+        print(
+            "[wheel-ci] ccache is unavailable; compiler caching is disabled.",
+            flush=True)
+        return None
+    cache_dir = config.REPO_ROOT / "venv" / "wheel-compiler-cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["CCACHE_DIR"] = str(cache_dir)
+    os.environ["CCACHE_BASEDIR"] = str(config.REPO_ROOT)
+    config.run_checked([executable, "--zero-stats"])
+    compilers = tuple(path for name in ("cc", "c++")
+                      if (path := shutil.which(name)) is not None)
+    if any(
+            pathlib.Path(path).resolve() == pathlib.Path(executable).resolve()
+            for path in compilers):
+        return None
+    return executable
+
+
+def report_compiler_cache() -> None:
+    executable = shutil.which("ccache")
+    if executable is not None and "CCACHE_DIR" in os.environ:
+        config.run_checked([executable, "--show-stats"])
 
 
 def update_submodules() -> None:

@@ -13,7 +13,14 @@
         - .gitlab/ci/scripts/wheel_ci.py
         - .gitlab/ci/scripts/wheel_ci_lib/**/*
         - .gitlab/ci/scripts/wheel_ci.sh
-        - packaging/**/*
+        - packaging/cmake/**/*
+        - packaging/docker/**/*
+        - packaging/wheellib/**/*
+        - packaging/dependency_allowlist.toml
+        - packaging/size_budget.toml
+        - packaging/variants.toml
+        - packaging/wheel-*-requirements.txt
+        - packaging/wheel_cli.py
         - tensorrt_edgellm/_native/**/*
         - tensorrt_edgellm/runtime.py
         - CMakeLists.txt
@@ -30,6 +37,7 @@ wheel_packaging_precheck:
   extends: [.wheel_rules]
   tags: [cpu-k8s]
   image: python:3.12-bookworm
+  interruptible: true
   script:
     - sh .gitlab/ci/scripts/wheel_ci.sh ci-precheck
   artifacts:
@@ -49,6 +57,7 @@ wheel_python_base:
       - PYTHON_IMAGE: python:3.12-slim-bookworm
         PYTHON_ABI: cp312
   image: $PYTHON_IMAGE
+  interruptible: true
   needs:
     - job: wheel_packaging_precheck
       artifacts: true
@@ -66,6 +75,7 @@ wheel_python_base:
   extends: [.wheel_rules]
   tags: [$BUILD_RUNNER_TAG]
   image: $BUILD_IMAGE
+  interruptible: true
   needs:
     - job: wheel_packaging_precheck
       artifacts: true
@@ -78,16 +88,12 @@ wheel_python_base:
     paths: [artifacts/payloads/]
     expire_in: 14 days
 
-wheel_assemble:
+.wheel_assemble_template:
   stage: wheel-assemble
   extends: [.wheel_rules]
   tags: [cpu-general-k8s]
   image: $WHEEL_IMAGE_UBUNTU2404_CU13
-  needs:
-    - job: wheel_python_base
-      artifacts: true
-    - job: wheel_native_payloads
-      artifacts: true
+  interruptible: true
   script:
     - sh .gitlab/ci/scripts/wheel_ci.sh ci-assemble
   timeout: 2h
@@ -102,9 +108,6 @@ wheel_assemble:
   image: $TEST_IMAGE
   variables:
     LLM_MODELS_DIR: "$TORCH_DIR"
-  needs:
-    - job: wheel_assemble
-      artifacts: true
   script:
     - sh .gitlab/ci/scripts/wheel_ci.sh ci-integration
   timeout: 4h
@@ -119,10 +122,15 @@ wheel_integration_gate:
   extends: [.wheel_rules]
   tags: [cpu-k8s]
   image: python:3.12-bookworm
+  interruptible: true
   needs:
-    - job: wheel_assemble
+    - job: wheel_assemble_x86
       artifacts: true
-    - job: wheel_integration
+    - job: wheel_assemble_aarch64
+      artifacts: true
+    - job: wheel_integration_x86
+      artifacts: true
+    - job: wheel_integration_aarch64
       artifacts: true
   script:
     - sh .gitlab/ci/scripts/wheel_ci.sh ci-integration-gate

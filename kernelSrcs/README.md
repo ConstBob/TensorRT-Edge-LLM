@@ -91,7 +91,6 @@ cutedsl_x86_64_sm_90_cuda13.tar.gz
 cutedsl_x86_64_sm_100_cuda13.tar.gz
 cutedsl_x86_64_sm_120_cuda13.tar.gz
 cutedsl_aarch64_sm_87_cuda13.tar.gz
-cutedsl_aarch64_sm_87_cuda12.tar.gz
 cutedsl_aarch64_sm_90_cuda13.tar.gz
 cutedsl_aarch64_sm_101_cuda12.tar.gz
 cutedsl_aarch64_sm_110_cuda13.tar.gz

@@ -32,6 +32,7 @@ _TARGET_PYTHON_UBUNTU_RELEASE = {
     "3.11": "jammy",
     "3.12": "noble",
 }
+_PROVISIONED_PYTHONS: typing.Dict[str, str] = {}
 
 
 def python_for_abi(python_abi: str) -> str:
@@ -75,23 +76,63 @@ def managed_python(version: str) -> str:
 
 
 def install_host_python(version: str) -> str:
-    executable = shutil.which(f"python{version}")
-    if executable is not None:
-        return executable
-    if os.geteuid() != 0:
-        return managed_python(version)
+    return prepare_host_pythons((version, ))[version]
+
+
+def _install_apt_host_tools(versions: typing.Sequence[str],
+                            install_ccache: bool) -> None:
+    packages = []
+    if install_ccache and shutil.which("ccache") is None:
+        packages.append("ccache")
+    if versions:
+        packages.append("software-properties-common")
+    if not packages:
+        return
     config.run_checked(["apt-get", "update"])
-    config.run_checked([
-        "apt-get", "install", "-y", "--no-install-recommends",
-        "software-properties-common"
-    ])
+    config.run_checked(
+        ["apt-get", "install", "-y", "--no-install-recommends", *packages])
+    if not versions:
+        return
     config.run_checked(["add-apt-repository", "-y", "ppa:deadsnakes/ppa"])
     config.run_checked(["apt-get", "update"])
+    python_packages = []
+    for version in versions:
+        python_packages.extend((f"python{version}", f"python{version}-dev",
+                                f"python{version}-venv"))
     config.run_checked([
-        "apt-get", "install", "-y", "--no-install-recommends",
-        f"python{version}", f"python{version}-dev", f"python{version}-venv"
+        "apt-get", "install", "-y", "--no-install-recommends", *python_packages
     ])
-    return python_for_abi(f"cp{version.replace('.', '')}")
+
+
+def prepare_host_pythons(
+        versions: typing.Sequence[str],
+        *,
+        install_ccache: bool = False) -> typing.Dict[str, str]:
+    """Provision requested host interpreters in one package-manager pass."""
+    ordered = tuple(dict.fromkeys(versions))
+    executables = {
+        version:
+        shutil.which(f"python{version}") or _PROVISIONED_PYTHONS.get(version)
+        for version in ordered
+    }
+    missing = tuple(version for version, executable in executables.items()
+                    if executable is None)
+    if os.geteuid() == 0:
+        _install_apt_host_tools(missing, install_ccache)
+    else:
+        if install_ccache and shutil.which("ccache") is None:
+            print(
+                "[wheel-ci] Cannot install ccache without root; continuing without it.",
+                flush=True)
+        for version in missing:
+            executables[version] = managed_python(version)
+    for version in ordered:
+        if executables[version] is None:
+            executables[version] = python_for_abi(
+                f"cp{version.replace('.', '')}")
+    resolved = typing.cast(typing.Dict[str, str], executables)
+    _PROVISIONED_PYTHONS.update(resolved)
+    return resolved
 
 
 def _scope_deb_source_to_host(path: pathlib.Path) -> None:
@@ -129,12 +170,16 @@ def _scope_deb822_source_to_host(path: pathlib.Path) -> None:
         path.write_text("\n\n".join(stanzas).rstrip() + "\n", encoding="utf-8")
 
 
-def _install_target_python_headers(version: str,
-                                   headers: pathlib.Path) -> pathlib.Path:
-    target_config = (headers.parent / "aarch64-linux-gnu" / headers.name /
-                     "pyconfig.h")
-    if target_config.is_file():
-        return headers
+def _configure_target_python_sources(
+        values: typing.Sequence[typing.Tuple[str, pathlib.Path]]) -> None:
+    missing_versions = []
+    for version, headers in values:
+        target_config = (headers.parent / "aarch64-linux-gnu" / headers.name /
+                         "pyconfig.h")
+        if not target_config.is_file():
+            missing_versions.append(version)
+    if not missing_versions:
+        return
     for source in [
             pathlib.Path("/etc/apt/sources.list"),
             *pathlib.Path("/etc/apt/sources.list.d").glob("*.list")
@@ -142,23 +187,32 @@ def _install_target_python_headers(version: str,
         _scope_deb_source_to_host(source)
     for source in pathlib.Path("/etc/apt/sources.list.d").glob("*.sources"):
         _scope_deb822_source_to_host(source)
-    try:
-        target_release = _TARGET_PYTHON_UBUNTU_RELEASE[version]
-    except KeyError as error:
-        raise RuntimeError(
-            f"No arm64 CPython header source is configured for {version}."
-        ) from error
-    # CPython extension ABI is stable within a minor release. Select an Ubuntu
-    # release that publishes that minor for arm64, independently of the build image.
+    releases = []
+    for version in missing_versions:
+        try:
+            releases.append(_TARGET_PYTHON_UBUNTU_RELEASE[version])
+        except KeyError as error:
+            raise RuntimeError(
+                f"No arm64 CPython header source is configured for {version}."
+            ) from error
     ports = pathlib.Path("/etc/apt/sources.list.d/ubuntu-ports-arm64.list")
     ports.write_text(
         "\n".join(f"deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports "
                   f"{release} main restricted universe multiverse"
+                  for target_release in sorted(set(releases))
                   for release in (target_release, f"{target_release}-updates",
                                   f"{target_release}-security")) + "\n",
         encoding="utf-8")
     config.run_checked(["dpkg", "--add-architecture", "arm64"])
     config.run_checked(["apt-get", "update"])
+
+
+def _install_target_python_headers(version: str,
+                                   headers: pathlib.Path) -> pathlib.Path:
+    target_config = (headers.parent / "aarch64-linux-gnu" / headers.name /
+                     "pyconfig.h")
+    if target_config.is_file():
+        return headers
     target_root = pathlib.Path(
         tempfile.gettempdir()) / f"edgellm-python{version}-arm64"
     target_root.mkdir(parents=True, exist_ok=True)
@@ -191,16 +245,33 @@ def _install_target_python_headers(version: str,
     return staged_headers
 
 
-def bootstrap_build_python(
-        row: typing.Mapping[str, object],
-        python_abi: str) -> typing.Tuple[str, typing.Optional[pathlib.Path]]:
-    version = common.ABI_INTERPRETERS[python_abi].removeprefix("python")
-    build_python = install_host_python(version)
-    staged_headers = None
+def bootstrap_build_pythons(
+    row: typing.Mapping[str, object], python_abis: typing.Sequence[str]
+) -> typing.Dict[str, typing.Tuple[str, typing.Optional[pathlib.Path]]]:
+    """Create lean payload-build environments for all requested ABIs."""
+    versions = {
+        python_abi: common.ABI_INTERPRETERS[python_abi].removeprefix("python")
+        for python_abi in python_abis
+    }
+    host_pythons = prepare_host_pythons(tuple(versions.values()),
+                                        install_ccache=True)
+    target_headers: typing.Dict[str, pathlib.Path] = {}
     if row["ci_build_mode"] == "cross":
         header_template = str(row["ci_python_headers"])
-        headers = pathlib.Path(
-            header_template.format(python_abi=python_abi,
-                                   python_version=version))
-        staged_headers = _install_target_python_headers(version, headers)
-    return common.toolchain_python(build_python, python_abi), staged_headers
+        for python_abi, version in versions.items():
+            target_headers[python_abi] = pathlib.Path(
+                header_template.format(python_abi=python_abi,
+                                       python_version=version))
+        _configure_target_python_sources(
+            tuple((versions[python_abi], headers)
+                  for python_abi, headers in target_headers.items()))
+
+    environments = {}
+    for python_abi, version in versions.items():
+        staged_headers = None
+        if python_abi in target_headers:
+            staged_headers = _install_target_python_headers(
+                version, target_headers[python_abi])
+        environments[python_abi] = (common.toolchain_python(
+            host_pythons[version], python_abi, "payload"), staged_headers)
+    return environments

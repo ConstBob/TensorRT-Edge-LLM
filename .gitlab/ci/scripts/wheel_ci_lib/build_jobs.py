@@ -16,8 +16,10 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import pathlib
+import shutil
 import sys
 import typing
 
@@ -27,15 +29,16 @@ from wheellib import assemble, base, config, source
 
 def precheck() -> None:
     """Validate source, matrix, generated CI, and exact submodules."""
-    common.update_submodules()
-    common.install_toolchain()
-    source.main([
-        "--output",
-        str(config.REPO_ROOT / "artifacts" / "provenance" / "source.json")
-    ])
-    config.load_matrix(config.REPO_ROOT / "packaging" / "variants.toml")
-    matrix.load_qualification()
-    matrix.generate_ci(check=True)
+    with common.phase("precheck: submodules"):
+        common.update_submodules()
+    with common.phase("precheck: source and matrix"):
+        source.main([
+            "--output",
+            str(config.REPO_ROOT / "artifacts" / "provenance" / "source.json")
+        ])
+        config.load_matrix(config.REPO_ROOT / "packaging" / "variants.toml")
+        matrix.load_qualification()
+        matrix.generate_ci(check=True)
 
 
 def build_base_ci() -> None:
@@ -45,12 +48,15 @@ def build_base_ci() -> None:
     if actual != python_abi:
         raise RuntimeError(
             f"Scheduled ABI {python_abi} does not match interpreter {actual}.")
-    common.update_submodules()
-    common.install_toolchain()
-    base.main([
-        "--output-dir",
-        str(config.REPO_ROOT / "artifacts" / "base" / python_abi),
-    ])
+    with common.phase(f"base {python_abi}: submodules"):
+        common.update_submodules()
+    with common.phase(f"base {python_abi}: toolchain"):
+        common.install_toolchain("base")
+    with common.phase(f"base {python_abi}: build"):
+        base.main([
+            "--output-dir",
+            str(config.REPO_ROOT / "artifacts" / "base" / python_abi),
+        ])
 
 
 def _cross_arguments(
@@ -115,7 +121,8 @@ def _prepare_cutedsl(python_bin: str, variant: str,
 def _build_payload(row: typing.Mapping[str, object], python_abi: str,
                    python_bin: str,
                    staged_headers: typing.Optional[pathlib.Path],
-                   trt_dir: pathlib.Path) -> None:
+                   trt_dir: pathlib.Path, build_dir: pathlib.Path,
+                   compiler_launcher: typing.Optional[str]) -> None:
     variant = str(row["variant_id"])
     common.apply_variant_environment(row, common.BUILD_ENVIRONMENT)
     if staged_headers is not None:
@@ -133,9 +140,13 @@ def _build_payload(row: typing.Mapping[str, object], python_abi: str,
         python_abi,
         "--trt-package-dir",
         str(trt_dir),
+        "--build-dir",
+        str(build_dir),
         *build_extra,
         "--output-dir",
         str(output),
+        *([] if compiler_launcher is None else
+          ["--compiler-launcher", compiler_launcher]),
     ],
                        cwd=config.REPO_ROOT,
                        env=environment)
@@ -159,18 +170,27 @@ def build_payload_ci() -> None:
     common.apply_variant_environment(first, common.BUILD_ENVIRONMENT)
     trt_dir = common.normalized_trt_package(
         pathlib.Path(config.required_environment("TRT_PACKAGE_DIR")).resolve())
-    common.update_submodules()
-    build_pythons = {
-        python_abi: python_setup.bootstrap_build_python(first, python_abi)
-        for python_abi in common.ABI_INTERPRETERS
-    }
+    with common.phase(f"payload {group_name}: submodules"):
+        common.update_submodules()
+    with common.phase(f"payload {group_name}: Python toolchains"):
+        build_pythons = python_setup.bootstrap_build_pythons(
+            first, tuple(common.ABI_INTERPRETERS))
+    compiler_launcher = common.compiler_cache()
     prepare_python = build_pythons["cp312"][0]
     for row in rows:
         variant = str(row["variant_id"])
-        _prepare_cutedsl(prepare_python, variant, trt_dir)
+        # Native targets do not depend on CPython. Reconfiguring one build tree
+        # per ABI preserves them while relinking only the extension module.
+        build_dir = config.REPO_ROOT / "build" / "wheel-ci" / variant
+        shutil.rmtree(build_dir, ignore_errors=True)
+        with common.phase(f"payload {variant}: CuTeDSL"):
+            _prepare_cutedsl(prepare_python, variant, trt_dir)
         for python_abi, (python_bin, staged_headers) in build_pythons.items():
-            _build_payload(row, python_abi, python_bin, staged_headers,
-                           trt_dir)
+            with common.phase(
+                    f"payload {variant}/{python_abi}: build and verify"):
+                _build_payload(row, python_abi, python_bin, staged_headers,
+                               trt_dir, build_dir, compiler_launcher)
+    common.report_compiler_cache()
 
 
 def _assemble_wheel(cpu_arch: str, python_abi: str) -> None:
@@ -197,9 +217,31 @@ def _assemble_wheel(cpu_arch: str, python_abi: str) -> None:
 
 
 def assemble_ci() -> None:
-    """Assemble and checksum every architecture/ABI wheel."""
-    common.update_submodules()
-    common.install_toolchain()
-    for cpu_arch in ("x86_64", "aarch64"):
-        for python_abi in common.ABI_INTERPRETERS:
+    """Assemble and checksum one architecture's ABI wheels concurrently."""
+    cpu_arch = config.required_environment("WHEEL_ARCH")
+    if cpu_arch not in {"x86_64", "aarch64"}:
+        raise RuntimeError(f"Unsupported assembly architecture {cpu_arch!r}.")
+    try:
+        workers = int(os.environ.get("WHEEL_ASSEMBLY_JOBS", "2"))
+    except ValueError as error:
+        raise RuntimeError(
+            "WHEEL_ASSEMBLY_JOBS must be an integer.") from error
+    if workers < 1:
+        raise RuntimeError("WHEEL_ASSEMBLY_JOBS must be positive.")
+    with common.phase(f"assembly {cpu_arch}: submodules"):
+        common.update_submodules()
+    with common.phase(f"assembly {cpu_arch}: toolchain"):
+        common.install_toolchain("assembly")
+
+    def assemble_one(python_abi: str) -> None:
+        with common.phase(f"assembly {cpu_arch}/{python_abi}"):
             _assemble_wheel(cpu_arch, python_abi)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(
+            workers, len(common.ABI_INTERPRETERS))) as executor:
+        futures = [
+            executor.submit(assemble_one, python_abi)
+            for python_abi in common.ABI_INTERPRETERS
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            future.result()
