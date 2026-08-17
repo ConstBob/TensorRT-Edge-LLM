@@ -43,7 +43,6 @@ REMOTE_INTEGRATION_ENVIRONMENT = {
     "BOARD_IP": "ci_board_ip",
     "BOARD_USER": "ci_board_user",
     "WHEEL_TARGET_TRT_WHEEL": "ci_target_trt_wheel",
-    "WHEEL_TARGET_MODEL_DIR": "ci_target_model_dir",
     "WHEEL_TARGET_WORK_DIR": "ci_target_work_dir",
 }
 LOCAL_INTEGRATION_ENVIRONMENT = {

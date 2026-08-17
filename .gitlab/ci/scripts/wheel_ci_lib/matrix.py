@@ -32,7 +32,6 @@ _CI_FIELDS = frozenset({
     "ci_python_headers",
     "ci_remote",
     "ci_sysroot",
-    "ci_target_model_dir",
     "ci_target_trt_wheel",
     "ci_target_work_dir",
     "ci_test_image",
@@ -97,7 +96,6 @@ def _validate_qualification_row(value: typing.Any,
             "ci_board_ip",
             "ci_board_user",
             "ci_target_trt_wheel",
-            "ci_target_model_dir",
             "ci_test_python_abis",
         ) if not row.get(field))
         if missing:

@@ -198,6 +198,17 @@ def _ssh_environment(password: str) -> typing.Dict[str, str]:
     return environment
 
 
+def _copy_remote_model(scp: typing.Sequence[str], target: str, remote: str,
+                       model_dir: pathlib.Path,
+                       environment: typing.Mapping[str, str]) -> str:
+    target_model = str(pathlib.PurePosixPath(remote) / "model")
+    print(f"Copying model checkpoint to {target}:{target_model}")
+    config.run_checked(
+        [*scp, "-r", str(model_dir), f"{target}:{target_model}"],
+        env=environment)
+    return target_model
+
+
 def _remote_integration(variant: str, python_abi: str, wheel: pathlib.Path,
                         result: pathlib.Path) -> None:
     board_user = config.required_environment("BOARD_USER")
@@ -209,7 +220,7 @@ def _remote_integration(variant: str, python_abi: str, wheel: pathlib.Path,
             "WHEEL_TARGET_TRT_WHEEL must contain the {python_abi} placeholder."
         )
     target_trt = target_trt_template.replace("{python_abi}", python_abi)
-    target_model = config.required_environment("WHEEL_TARGET_MODEL_DIR")
+    model_dir = _model_dir()
     job_id = config.required_environment("CI_JOB_ID")
     target = f"{board_user}@{board_ip}"
     remote_root = os.environ.get("WHEEL_TARGET_WORK_DIR",
@@ -253,6 +264,8 @@ def _remote_integration(variant: str, python_abi: str, wheel: pathlib.Path,
             raise RuntimeError(
                 f"Target {python_bin} provides {target_abi}, not {python_abi}."
             )
+        target_model = _copy_remote_model(scp, target, remote, model_dir,
+                                          ssh_environment)
         command = " && ".join([
             f"{python_bin} -m venv --without-pip {shlex.quote(remote + '/venv')}",
             (f"{python_bin} -m pip install --ignore-installed "
