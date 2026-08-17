@@ -69,6 +69,10 @@ _FMHA_V2_SPECIAL_VARIANTS = {
 }
 _FMHA_V2_VARIANTS = (_FMHA_V2_DENSE_VARIANTS | _FMHA_V2_PAGED_VARIANTS
                      | _FMHA_V2_SPECIAL_VARIANTS)
+_RMSNORM_SUPPORTED_SMS = [80, 86, 87, 90, 100, 101, 110, 120, 121]
+_RMSNORM_HIDDEN_SIZES = {4096, 5120, 7168, 8192}
+_RMSNORM_DTYPES = {"fp16", "bf16"}
+_RMSNORM_WEIGHT_BEFORE_CAST_MODES = {0, 1}
 
 
 def _write_fake_elf(path: Path, machine: int) -> None:
@@ -388,6 +392,46 @@ def test_fmha_v2_d512_registry_uses_32x32_tiles_and_two_warps():
 def test_fmha_registry_rejects_unsupported_sms(sm):
     with pytest.raises(ValueError, match="No variants"):
         build_cutedsl.select_variants(sm, "fmha")
+
+
+@pytest.mark.parametrize("sm", _RMSNORM_SUPPORTED_SMS)
+def test_rmsnorm_registry_has_all_compile_time_variants(sm):
+    variants = build_cutedsl.select_variants(sm, "rmsnorm")
+
+    assert len(variants) == (len(_RMSNORM_DTYPES) *
+                             len(_RMSNORM_HIDDEN_SIZES) *
+                             len(_RMSNORM_WEIGHT_BEFORE_CAST_MODES))
+    assert all(variant.group == "rmsnorm" for variant in variants)
+    assert all(variant.supported_sms == _RMSNORM_SUPPORTED_SMS
+               for variant in variants)
+    assert all(variant.script == "rmsnorm_cutedsl/rmsnorm.py"
+               for variant in variants)
+
+    configurations = set()
+    for variant in variants:
+        dtype = variant.script_args[variant.script_args.index("--dtype") + 1]
+        hidden_size = int(
+            variant.script_args[variant.script_args.index("--hidden_size") +
+                                1])
+        weight_before_cast = int(variant.script_args[
+            variant.script_args.index("--weight_before_cast") + 1])
+        configurations.add((dtype, hidden_size, weight_before_cast))
+        assert variant.name == (f"rmsnorm_{dtype}_h{hidden_size}"
+                                f"_wbc{weight_before_cast}")
+        assert "--export_only" in variant.script_args
+
+    assert configurations == {
+        (dtype, hidden_size, weight_before_cast)
+        for dtype in _RMSNORM_DTYPES
+        for hidden_size in _RMSNORM_HIDDEN_SIZES
+        for weight_before_cast in _RMSNORM_WEIGHT_BEFORE_CAST_MODES
+    }
+
+
+@pytest.mark.parametrize("sm", [89, 103])
+def test_rmsnorm_registry_rejects_unqualified_sms(sm):
+    with pytest.raises(ValueError, match="No variants"):
+        build_cutedsl.select_variants(sm, "rmsnorm")
 
 
 def test_fmha_v2_per_variant_compile_definitions_are_absent():
