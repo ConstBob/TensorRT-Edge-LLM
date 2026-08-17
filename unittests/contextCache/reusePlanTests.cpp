@@ -20,6 +20,7 @@
 #include "runtime/state/contextCache/blockIndex.h"
 #include "runtime/state/contextCache/cacheRecord.h"
 #include "runtime/state/contextCache/resourcePools.h"
+#include "runtime/state/contextCache/specStatePlan.h"
 
 #include <gtest/gtest.h>
 
@@ -89,24 +90,27 @@ CacheRecord makeRecord(BlockHash hash, std::vector<PageId> basePages, std::vecto
     record.key = CacheRecordKey{hash, 1};
     record.logicalBlockHashes = {hash};
     record.basePagePath = std::move(basePages);
-    record.draftPagePath = std::move(draftPages);
+    if (!draftPages.empty())
+    {
+        record.specState = SpecPagedStateRecord{std::move(draftPages)};
+    }
     return record;
 }
 
-RecordId insertDraftRecord(CacheRecordStore& records, DraftPathIndex& draftIndex, std::vector<BlockHash> logicalHashes,
+RecordId insertSpecRecord(CacheRecordStore& records, SpecStateIndex& specIndex, std::vector<BlockHash> logicalHashes,
     std::vector<PageId> basePages, std::vector<PageId> draftPages)
 {
     CacheRecord record;
     record.key = CacheRecordKey{logicalHashes.back(), static_cast<int32_t>(logicalHashes.size())};
     record.logicalBlockHashes = std::move(logicalHashes);
     record.basePagePath = std::move(basePages);
-    record.draftPagePath = std::move(draftPages);
+    record.specState = SpecPagedStateRecord{std::move(draftPages)};
     RecordInsertResult const inserted = records.insert(std::move(record));
     if (!inserted.inserted)
     {
-        throw std::runtime_error("Test draft record insertion was not unique");
+        throw std::runtime_error("Test spec record insertion was not unique");
     }
-    draftIndex.insert(records.get(inserted.id));
+    specIndex.paged().insert(records.get(inserted.id));
     return inserted.id;
 }
 
@@ -124,10 +128,21 @@ void expectRecordEqual(CacheRecord const& actual, CacheRecord const& expected)
     EXPECT_EQ(actual.key, expected.key);
     EXPECT_EQ(actual.logicalBlockHashes, expected.logicalBlockHashes);
     EXPECT_EQ(actual.basePagePath, expected.basePagePath);
-    EXPECT_EQ(actual.draftPagePath, expected.draftPagePath);
+    EXPECT_EQ(actual.specState, expected.specState);
     EXPECT_EQ(actual.recurrentSnapshotSlot, expected.recurrentSnapshotSlot);
     EXPECT_EQ(actual.partialKvSnapshotSlot, expected.partialKvSnapshotSlot);
     EXPECT_EQ(actual.exactCheckpointLength, expected.exactCheckpointLength);
+}
+
+ReusePlan makeEagleReusePlan(std::vector<BlockHash> const& inputFullBlockHashes, int32_t inputTokenCount,
+    BaseBlockIndex const& baseIndex, SpecStateIndex const& specIndex, CacheRecordStore const& records,
+    ContextCacheLookupPolicy lookupPolicy = ContextCacheLookupPolicy::kUseCache)
+{
+    SpecReuseContract const contract{
+        /*ownsPagedSpecState=*/true, /*futureDependencyTokens=*/1, /*speculativeWorkingTokens=*/2};
+    return makeSpecReusePlan(SpecReusePlanInput{inputFullBlockHashes, inputTokenCount, kPAGE_SIZE, lookupPolicy,
+                                 baseIndex, specIndex, records},
+        contract);
 }
 
 } // namespace
@@ -280,7 +295,7 @@ TEST(ContextCacheReusePlanTests, HybridMtpPlanningBindsBaseAndDraftAtExactCheckp
     record.key = CacheRecordKey{kEXACT_DIGEST, 1};
     record.logicalBlockHashes = {kHASH_A};
     record.basePagePath = {7};
-    record.draftPagePath = {8};
+    record.specState = SpecPagedStateRecord{{8}};
     record.recurrentSnapshotSlot = 3;
     record.partialKvSnapshotSlot = 4;
     record.exactCheckpointLength = 6;
@@ -297,7 +312,7 @@ TEST(ContextCacheReusePlanTests, HybridMtpPlanningBindsBaseAndDraftAtExactCheckp
     EXPECT_EQ(hit.reuseTokenLength, 6);
     EXPECT_EQ(hit.matchedBlockHashes, std::vector<BlockHash>{kHASH_A});
     EXPECT_EQ(hit.basePageBindings, std::vector<PageId>{7});
-    EXPECT_EQ(hit.draftPageBindings, std::vector<PageId>{8});
+    EXPECT_EQ(hit.specPageBindings, std::vector<PageId>{8});
     EXPECT_EQ(hit.hybridRecord, std::optional<RecordId>{inserted.id});
     EXPECT_EQ(hit.recurrentSnapshotBinding, std::optional<int32_t>{3});
     EXPECT_EQ(hit.partialKvSnapshotBinding, std::optional<int32_t>{4});
@@ -329,7 +344,7 @@ TEST(ContextCacheReusePlanTests, HybridMtpPlanningSkipsRecordWithoutDraftPath)
     EXPECT_EQ(cold.reuseTokenLength, 0);
     EXPECT_FALSE(cold.hybridRecord.has_value());
     EXPECT_TRUE(cold.basePageBindings.empty());
-    EXPECT_TRUE(cold.draftPageBindings.empty());
+    EXPECT_TRUE(cold.specPageBindings.empty());
     // totalInputPages == 3; MTP cold reserves the full input for BOTH base and draft pools (speculative deployment).
     expectDemand(cold.demand, ResourceDemand{3, 3, 0, 0});
 }
@@ -410,17 +425,16 @@ TEST(ContextCacheReusePlanTests, SpecPlanningIgnoresBaseOnlyHits)
     BaseBlockIndex baseIndex;
     EXPECT_TRUE(baseIndex.insert(kHASH_A, 5).inserted);
     EXPECT_TRUE(baseIndex.insert(kHASH_B, 7).inserted);
-    DraftPathIndex draftIndex;
+    SpecStateIndex specIndex;
     CacheRecordStore records(1);
 
-    ReusePlan const plan
-        = makeSpecReusePlan({kHASH_A, kHASH_B}, 2 * kPAGE_SIZE + 1, kPAGE_SIZE, baseIndex, draftIndex, records);
+    ReusePlan const plan = makeEagleReusePlan({kHASH_A, kHASH_B}, 2 * kPAGE_SIZE + 1, baseIndex, specIndex, records);
 
     EXPECT_EQ(plan.mode, ReusePlanMode::kSpec);
-    EXPECT_FALSE(plan.draftRecord.has_value());
+    EXPECT_FALSE(plan.specRecord.has_value());
     EXPECT_TRUE(plan.matchedBlockHashes.empty());
     EXPECT_TRUE(plan.basePageBindings.empty());
-    EXPECT_TRUE(plan.draftPageBindings.empty());
+    EXPECT_TRUE(plan.specPageBindings.empty());
     EXPECT_FALSE(plan.specReplayDependency.has_value());
     EXPECT_EQ(plan.reuseTokenLength, 0);
     EXPECT_EQ(plan.specReplayMode, SpecReplayMode::kNone);
@@ -433,20 +447,19 @@ TEST(ContextCacheReusePlanTests, SpecPlanningUsesOneCoherentPathAndOneFullPageRe
     BaseBlockIndex baseIndex;
     EXPECT_TRUE(baseIndex.insert(kHASH_A, 17).inserted);
     EXPECT_TRUE(baseIndex.insert(kHASH_B, 19).inserted);
-    DraftPathIndex draftIndex;
+    SpecStateIndex specIndex;
     CacheRecordStore records(1);
-    RecordId const record = insertDraftRecord(records, draftIndex, {kHASH_A, kHASH_B}, {17, 19}, {23, 29});
+    RecordId const record = insertSpecRecord(records, specIndex, {kHASH_A, kHASH_B}, {17, 19}, {23, 29});
 
-    ReusePlan const plan
-        = makeSpecReusePlan({kHASH_A, kHASH_B}, 2 * kPAGE_SIZE + 1, kPAGE_SIZE, baseIndex, draftIndex, records);
+    ReusePlan const plan = makeEagleReusePlan({kHASH_A, kHASH_B}, 2 * kPAGE_SIZE + 1, baseIndex, specIndex, records);
 
-    EXPECT_EQ(plan.draftRecord, std::optional<RecordId>{record});
+    EXPECT_EQ(plan.specRecord, std::optional<RecordId>{record});
     EXPECT_EQ(plan.matchedBlockHashes, std::vector<BlockHash>{kHASH_A});
     EXPECT_EQ(plan.basePageBindings, std::vector<PageId>{17});
-    EXPECT_EQ(plan.draftPageBindings, std::vector<PageId>{23});
+    EXPECT_EQ(plan.specPageBindings, std::vector<PageId>{23});
     ASSERT_TRUE(plan.specReplayDependency.has_value());
-    EXPECT_EQ(plan.specReplayDependency->terminalHash, kHASH_B);
     EXPECT_EQ(plan.specReplayDependency->pathBlockCount, 2);
+    EXPECT_EQ(plan.specReplayDependency->terminalHash, kHASH_B);
     EXPECT_EQ(plan.matchedTokenLength, 2 * kPAGE_SIZE);
     EXPECT_EQ(plan.reuseTokenLength, kPAGE_SIZE);
     EXPECT_EQ(plan.specReplayMode, SpecReplayMode::kFullPage);
@@ -459,29 +472,28 @@ TEST(ContextCacheReusePlanTests, SpecPlanningExactInputRewindsOneFullPage)
     BaseBlockIndex baseIndex;
     EXPECT_TRUE(baseIndex.insert(kHASH_A, 31).inserted);
     EXPECT_TRUE(baseIndex.insert(kHASH_B, 37).inserted);
-    DraftPathIndex draftIndex;
+    SpecStateIndex specIndex;
     CacheRecordStore records(1);
-    RecordId const record = insertDraftRecord(records, draftIndex, {kHASH_A, kHASH_B}, {31, 37}, {41, 43});
+    RecordId const record = insertSpecRecord(records, specIndex, {kHASH_A, kHASH_B}, {31, 37}, {41, 43});
 
-    ReusePlan const plan
-        = makeSpecReusePlan({kHASH_A, kHASH_B}, 2 * kPAGE_SIZE, kPAGE_SIZE, baseIndex, draftIndex, records);
+    ReusePlan const plan = makeEagleReusePlan({kHASH_A, kHASH_B}, 2 * kPAGE_SIZE, baseIndex, specIndex, records);
 
-    EXPECT_EQ(plan.draftRecord, std::optional<RecordId>{record});
+    EXPECT_EQ(plan.specRecord, std::optional<RecordId>{record});
     EXPECT_EQ(plan.matchedBlockHashes, std::vector<BlockHash>{kHASH_A});
     EXPECT_EQ(plan.basePageBindings, std::vector<PageId>{31});
-    EXPECT_EQ(plan.draftPageBindings, std::vector<PageId>{41});
+    EXPECT_EQ(plan.specPageBindings, std::vector<PageId>{41});
     ASSERT_TRUE(plan.specReplayDependency.has_value());
-    EXPECT_EQ(plan.specReplayDependency->terminalHash, kHASH_B);
     EXPECT_EQ(plan.specReplayDependency->pathBlockCount, 2);
+    EXPECT_EQ(plan.specReplayDependency->terminalHash, kHASH_B);
     EXPECT_EQ(plan.matchedTokenLength, 2 * kPAGE_SIZE);
     EXPECT_EQ(plan.reuseTokenLength, kPAGE_SIZE);
     EXPECT_EQ(plan.specReplayMode, SpecReplayMode::kFullPage);
     EXPECT_EQ(plan.kind, ReusePlanKind::kFullInputRewind);
     expectDemand(plan.demand, ResourceDemand{1, 1, 0, 0});
 
-    ReusePlan const singleBlock = makeSpecReusePlan({kHASH_A}, kPAGE_SIZE, kPAGE_SIZE, baseIndex, draftIndex, records);
+    ReusePlan const singleBlock = makeEagleReusePlan({kHASH_A}, kPAGE_SIZE, baseIndex, specIndex, records);
     EXPECT_TRUE(singleBlock.basePageBindings.empty());
-    EXPECT_TRUE(singleBlock.draftPageBindings.empty());
-    EXPECT_FALSE(singleBlock.draftRecord.has_value());
+    EXPECT_TRUE(singleBlock.specPageBindings.empty());
+    EXPECT_FALSE(singleBlock.specRecord.has_value());
     EXPECT_FALSE(singleBlock.specReplayDependency.has_value());
 }

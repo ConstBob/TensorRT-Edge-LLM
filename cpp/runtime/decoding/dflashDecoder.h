@@ -20,6 +20,7 @@
 #include "common/hashUtils.h"
 #include "runtime/decoding/decodingStrategy.h"
 #include "runtime/decoding/dflashDecodeUtils.h"
+#include "runtime/decoding/specCommonStateTracker.h"
 #include "runtime/state/externalWeightManager.h"
 
 #include <filesystem>
@@ -59,6 +60,8 @@ public:
 
     bool decodeStep(DecodingInferenceContext& context) override;
     bool captureCudaGraphs(cudaStream_t stream) override;
+    bool initializeForGeneration(DecodingInferenceContext& context) override;
+    std::vector<int32_t> const& commonMaterializedStateLengths() const noexcept override;
 
     int64_t getRequiredContextMemorySize() const noexcept override;
     void setContextMemory(Tensor& memory) override;
@@ -142,7 +145,9 @@ private:
     Tensor mAcceptLength;         //!< [B] INT32
     Tensor mHostAcceptLengths;    //!< [B] INT32 (CPU)
     Tensor mHostAcceptedTokenIds; //!< [B, maxAcceptBufferSize] INT32 (CPU)
-    Tensor mBuildWorkspace;       //!< DDTree build workspace bytes
+
+    SpecCommonStateTracker mCommonStateTracker;
+    Tensor mBuildWorkspace; //!< DDTree build workspace bytes
 
     //! Draft vocab map [reducedVocabSize] INT32 (GPU). Active when draft
     //! lm_head uses a reduced vocabulary. Sized to zero otherwise.

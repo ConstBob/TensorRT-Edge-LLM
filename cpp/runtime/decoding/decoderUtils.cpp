@@ -71,6 +71,11 @@ void appendAcceptedTokens(DecodingInferenceContext& context, Tensor& hostAcceptL
 
     for (int32_t batchIdx = 0; batchIdx < activeBatchSize; ++batchIdx)
     {
+        if (context.finishedStates[batchIdx])
+        {
+            hostAcceptLengthsData[batchIdx] = 0;
+            continue;
+        }
         int32_t const acceptLength = hostAcceptLengthsData[batchIdx];
         int32_t appended = 0;
         for (int32_t i = 0; i < acceptLength; i++)

@@ -76,7 +76,29 @@ DeploymentConfig makeEagleDeployment()
     deployment.draft = makeAttentionConfig(/*attentionLayers=*/2);
     deployment.draft->specDecodeType = SpecDecodeMode::kEAGLE;
     deployment.draft->baseModelHiddenSize = deployment.base.hiddenSize * 3;
-    deployment.specConfig = SpecDecodeConfig{};
+    SpecDecodeConfig specConfig;
+    specConfig.draftingTopK = 1;
+    specConfig.draftingStep = 2;
+    specConfig.verifySize = 4;
+    deployment.specConfig = specConfig;
+    return deployment;
+}
+
+DeploymentConfig makeGemma4MTPDeployment()
+{
+    DeploymentConfig deployment;
+    deployment.base = makeAttentionConfig();
+    deployment.base.specDecodeType = SpecDecodeMode::kGemma4MTP;
+    deployment.base.isSpecDecodeBase = true;
+    deployment.draft = makeAttentionConfig();
+    deployment.draft->specDecodeType = SpecDecodeMode::kGemma4MTP;
+    deployment.draft->hasOwnKVCache = false;
+    deployment.draft->sharesTargetKV = true;
+    SpecDecodeConfig specConfig;
+    specConfig.draftingTopK = 1;
+    specConfig.draftingStep = 4;
+    specConfig.verifySize = 5;
+    deployment.specConfig = specConfig;
     return deployment;
 }
 
@@ -88,11 +110,14 @@ DeploymentConfig makeHybridMtpDeployment()
     deployment.base.isSpecDecodeBase = true;
     deployment.draft = makeAttentionConfig(/*attentionLayers=*/2);
     deployment.draft->specDecodeType = SpecDecodeMode::kMTP;
-    deployment.draft->isSpecDecodeBase = false;
     deployment.draft->hasOwnKVCache = true;
     deployment.draft->sharesTargetKV = false;
     deployment.draft->baseModelHiddenSize = deployment.base.hiddenSize;
-    deployment.specConfig = SpecDecodeConfig{};
+    SpecDecodeConfig specConfig;
+    specConfig.draftingTopK = 2;
+    specConfig.draftingStep = 3;
+    specConfig.verifySize = 5;
+    deployment.specConfig = specConfig;
     return deployment;
 }
 
@@ -101,14 +126,20 @@ DeploymentConfig makeHybridMtpDeployment()
 TEST(ContextCacheDeploymentTests, ClassifiesSupportedVanillaHybridAndPureRecurrentDeployments)
 {
     DeploymentConfig vanilla{makeAttentionConfig(), std::nullopt, std::nullopt};
-    EXPECT_EQ(validateContextCacheDeployment(vanilla), ContextCacheDeploymentKind::kVanilla);
+    ContextCacheDeploymentProfile const vanillaProfile = validateContextCacheDeployment(vanilla);
+    EXPECT_EQ(vanillaProfile.baseStateKind, ContextCacheModelStateKind::kAttentionOnly);
+    EXPECT_FALSE(vanillaProfile.specReuseContract.has_value());
 
     DeploymentConfig hybrid{makeHybridConfig(), std::nullopt, std::nullopt};
-    EXPECT_EQ(validateContextCacheDeployment(hybrid), ContextCacheDeploymentKind::kHybrid);
+    ContextCacheDeploymentProfile const hybridProfile = validateContextCacheDeployment(hybrid);
+    EXPECT_EQ(hybridProfile.baseStateKind, ContextCacheModelStateKind::kHybrid);
+    EXPECT_FALSE(hybridProfile.specReuseContract.has_value());
 
     LLMEngineConfig recurrent = makeHybridConfig(/*attentionLayers=*/0, /*recurrentLayers=*/3);
     DeploymentConfig pureRecurrent{recurrent, std::nullopt, std::nullopt};
-    EXPECT_EQ(validateContextCacheDeployment(pureRecurrent), ContextCacheDeploymentKind::kPureRecurrent);
+    ContextCacheDeploymentProfile const recurrentProfile = validateContextCacheDeployment(pureRecurrent);
+    EXPECT_EQ(recurrentProfile.baseStateKind, ContextCacheModelStateKind::kPureRecurrent);
+    EXPECT_FALSE(recurrentProfile.specReuseContract.has_value());
 }
 
 TEST(ContextCacheDeploymentTests, RejectsBlockDiffusion)
@@ -119,11 +150,10 @@ TEST(ContextCacheDeploymentTests, RejectsBlockDiffusion)
     EXPECT_THROW(validateContextCacheDeployment(deployment), std::runtime_error);
 }
 
-TEST(ContextCacheDeploymentTests, RejectsUnsupportedDtypeAndVisionAttention)
+TEST(ContextCacheDeploymentTests, SupportsFp8AndRejectsUnsupportedDtypeAndVisionAttention)
 {
     DeploymentConfig deployment{makeAttentionConfig(), std::nullopt, std::nullopt};
 
-    // FP8 KV cache is a supported reuse dtype (alongside kHALF); it must NOT be rejected.
     deployment.base.kvCacheDtype = nvinfer1::DataType::kFP8;
     EXPECT_NO_THROW(validateContextCacheDeployment(deployment));
 
@@ -168,21 +198,28 @@ TEST(ContextCacheDeploymentTests, RejectsUnsafeKvDonorGraphsAndLayouts)
     EXPECT_THROW(validateContextCacheDeployment(deployment), std::runtime_error);
 }
 
-TEST(ContextCacheDeploymentTests, RejectsUnmanagedSpecModesAndHybridEagle)
+TEST(ContextCacheDeploymentTests, AdmitsPageTableAwareSpecModesAndRejectsHybridEagle)
 {
-    std::array<SpecDecodeMode, 5> const unsupportedModes{
-        SpecDecodeMode::kMTP,
+    std::array<SpecDecodeMode, 3> const supportedModes{
         SpecDecodeMode::kDFlash,
         SpecDecodeMode::kJetSpec,
-        SpecDecodeMode::kGemma4MTP,
         SpecDecodeMode::kDSpark,
     };
-    for (SpecDecodeMode const mode : unsupportedModes)
+    for (SpecDecodeMode const mode : supportedModes)
     {
         DeploymentConfig deployment = makeEagleDeployment();
         deployment.base.specDecodeType = mode;
         deployment.draft->specDecodeType = mode;
-        EXPECT_THROW(validateContextCacheDeployment(deployment), std::runtime_error);
+        if (mode == SpecDecodeMode::kDSpark)
+        {
+            deployment.draft->specDraftBlockSize = 4;
+        }
+        else
+        {
+            deployment.specConfig->dflashBlockSize = 4;
+        }
+        ContextCacheDeploymentProfile const profile = validateContextCacheDeployment(deployment);
+        ASSERT_TRUE(profile.specReuseContract.has_value());
     }
 
     DeploymentConfig hybridEagle = makeEagleDeployment();
@@ -192,42 +229,86 @@ TEST(ContextCacheDeploymentTests, RejectsUnmanagedSpecModesAndHybridEagle)
     EXPECT_THROW(validateContextCacheDeployment(hybridEagle), std::runtime_error);
 }
 
-TEST(ContextCacheDeploymentTests, ClassifiesHybridMtpAndRejectsAttentionOnlyMtpBase)
+TEST(ContextCacheDeploymentTests, AdmitsHybridMtpAndRejectsAttentionOnlyOrSharedKvMtp)
 {
-    DeploymentConfig deployment = makeHybridMtpDeployment();
-    EXPECT_EQ(validateContextCacheDeployment(deployment), ContextCacheDeploymentKind::kHybridMtp);
+    ContextCacheDeploymentProfile const profile = validateContextCacheDeployment(makeHybridMtpDeployment());
+    EXPECT_EQ(profile.baseStateKind, ContextCacheModelStateKind::kHybrid);
+    ASSERT_TRUE(profile.specReuseContract.has_value());
+    EXPECT_TRUE(profile.specReuseContract->ownsPagedSpecState);
+    EXPECT_EQ(profile.specReuseContract->futureDependencyTokens, 1);
+    EXPECT_EQ(profile.specReuseContract->speculativeWorkingTokens, 6);
 
-    // An attention-only (non-hybrid) MTP base is still outside the supported matrix.
-    DeploymentConfig attentionOnlyMtp = makeHybridMtpDeployment();
-    attentionOnlyMtp.base = makeAttentionConfig();
-    attentionOnlyMtp.base.specDecodeType = SpecDecodeMode::kMTP;
-    attentionOnlyMtp.base.isSpecDecodeBase = true;
-    EXPECT_THROW(validateContextCacheDeployment(attentionOnlyMtp), std::runtime_error);
+    DeploymentConfig attentionOnly = makeHybridMtpDeployment();
+    attentionOnly.base = makeAttentionConfig();
+    attentionOnly.base.specDecodeType = SpecDecodeMode::kMTP;
+    attentionOnly.base.isSpecDecodeBase = true;
+    EXPECT_THROW(validateContextCacheDeployment(attentionOnly), std::runtime_error);
 
-    // A hybrid+MTP draft without its own independent KV cache is rejected.
-    DeploymentConfig sharedKvMtp = makeHybridMtpDeployment();
-    sharedKvMtp.draft->hasOwnKVCache = false;
-    sharedKvMtp.draft->sharesTargetKV = true;
-    EXPECT_THROW(validateContextCacheDeployment(sharedKvMtp), std::runtime_error);
+    DeploymentConfig sharedKv = makeHybridMtpDeployment();
+    sharedKv.draft->hasOwnKVCache = false;
+    sharedKv.draft->sharesTargetKV = true;
+    EXPECT_THROW(validateContextCacheDeployment(sharedKv), std::runtime_error);
 }
 
-TEST(ContextCacheDeploymentTests, ClassifiesSupportedEagleAndRejectsInvalidConditioning)
+TEST(ContextCacheDeploymentTests, ResolvesPerMethodSpeculativeWorkingTokens)
+{
+    DeploymentConfig eagle = makeEagleDeployment();
+    SpecReuseContract const eagleContract = *validateContextCacheDeployment(eagle).specReuseContract;
+    EXPECT_TRUE(eagleContract.ownsPagedSpecState);
+    EXPECT_EQ(eagleContract.futureDependencyTokens, 1);
+    EXPECT_EQ(eagleContract.speculativeWorkingTokens, 2);
+
+    for (SpecDecodeMode const mode : {SpecDecodeMode::kDFlash, SpecDecodeMode::kJetSpec})
+    {
+        DeploymentConfig blockDraft = makeEagleDeployment();
+        blockDraft.base.specDecodeType = mode;
+        blockDraft.draft->specDecodeType = mode;
+        blockDraft.specConfig->dflashBlockSize = 7;
+        SpecReuseContract const contract = *validateContextCacheDeployment(blockDraft).specReuseContract;
+        EXPECT_TRUE(contract.ownsPagedSpecState);
+        EXPECT_EQ(contract.futureDependencyTokens, 0);
+        EXPECT_EQ(contract.speculativeWorkingTokens, 7);
+    }
+
+    DeploymentConfig dspark = makeEagleDeployment();
+    dspark.base.specDecodeType = SpecDecodeMode::kDSpark;
+    dspark.draft->specDecodeType = SpecDecodeMode::kDSpark;
+    dspark.draft->specDraftBlockSize = 9;
+    SpecReuseContract const dsparkContract = *validateContextCacheDeployment(dspark).specReuseContract;
+    EXPECT_TRUE(dsparkContract.ownsPagedSpecState);
+    EXPECT_EQ(dsparkContract.futureDependencyTokens, 0);
+    EXPECT_EQ(dsparkContract.speculativeWorkingTokens, 9);
+
+    SpecReuseContract const gemmaContract
+        = *validateContextCacheDeployment(makeGemma4MTPDeployment()).specReuseContract;
+    EXPECT_FALSE(gemmaContract.ownsPagedSpecState);
+    EXPECT_EQ(gemmaContract.futureDependencyTokens, 0);
+    EXPECT_EQ(gemmaContract.speculativeWorkingTokens, 0);
+}
+
+TEST(ContextCacheDeploymentTests, ClassifiesSupportedEagle)
 {
     DeploymentConfig deployment = makeEagleDeployment();
-    EXPECT_EQ(validateContextCacheDeployment(deployment), ContextCacheDeploymentKind::kEAGLE);
+    ContextCacheDeploymentProfile const profile = validateContextCacheDeployment(deployment);
+    ASSERT_TRUE(profile.specReuseContract.has_value());
+    EXPECT_EQ(profile.baseStateKind, ContextCacheModelStateKind::kAttentionOnly);
+    EXPECT_TRUE(profile.specReuseContract->ownsPagedSpecState);
+    EXPECT_EQ(profile.specReuseContract->futureDependencyTokens, 1);
+}
 
-    deployment.base.specTargetLayerIds.clear();
-    EXPECT_THROW(validateContextCacheDeployment(deployment), std::runtime_error);
+TEST(ContextCacheDeploymentTests, AdmitsEagleTreeConfiguration)
+{
+    DeploymentConfig deployment = makeEagleDeployment();
+    deployment.specConfig->draftingTopK = 2;
 
-    deployment = makeEagleDeployment();
-    deployment.base.specTargetLayerIds = {0, 2, 2};
-    EXPECT_THROW(validateContextCacheDeployment(deployment), std::runtime_error);
+    EXPECT_NO_THROW(validateContextCacheDeployment(deployment));
+}
 
-    deployment = makeEagleDeployment();
-    deployment.base.specTargetLayerIds = {0, 2, 4};
-    EXPECT_THROW(validateContextCacheDeployment(deployment), std::runtime_error);
+TEST(ContextCacheDeploymentTests, AdmitsAttentionOnlyGemma4MTPWithoutPagedSpecState)
+{
+    ContextCacheDeploymentProfile const profile = validateContextCacheDeployment(makeGemma4MTPDeployment());
 
-    deployment = makeEagleDeployment();
-    deployment.draft->baseModelHiddenSize -= deployment.base.hiddenSize;
-    EXPECT_THROW(validateContextCacheDeployment(deployment), std::runtime_error);
+    EXPECT_EQ(profile.baseStateKind, ContextCacheModelStateKind::kAttentionOnly);
+    ASSERT_TRUE(profile.specReuseContract.has_value());
+    EXPECT_FALSE(profile.specReuseContract->ownsPagedSpecState);
 }

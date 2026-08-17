@@ -584,7 +584,7 @@ TEST(RegistryBuilderTest, DraftEngineHasExpectedTensors)
     // (0 for initial-prefill sentinel, batch otherwise). Draft engine always
     // uses plugin attention so this applies unconditionally.
     EXPECT_TRUE(hasName(names, "kvcache_start_index"));
-    EXPECT_TRUE(hasName(names, "kv_page_table"));
+    EXPECT_TRUE(hasName(names, trt_edgellm::binding_names::kKVPageTable));
     EXPECT_TRUE(hasName(names, "rope_rotary_cos_sin"));
     EXPECT_TRUE(hasName(names, "attention_mask"));
     EXPECT_TRUE(hasName(names, "attention_pos_id"));
@@ -672,9 +672,10 @@ TEST(RegistryBuilderTest, SpecDraftRegistriesKVPageTableRowsTrackActiveBatch)
 
     populateHybridFieldsFromScalars(draft);
     DeploymentConfig bundle;
+    bundle.base = makeBasicLLMConfig();
     SpecDecodeConfig specConfig{};
-    specConfig.baseOutputHiddenDim = 12288;
-    specConfig.draftHiddenSize = 2048;
+    specConfig.baseOutputHiddenDim = 4096;
+    specConfig.draftHiddenSize = 4096;
     bundle.specConfig = specConfig;
 
     auto checkPageTable = [&](TensorRegistry const& reg, char const* registryName) {

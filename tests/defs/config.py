@@ -2361,6 +2361,8 @@ class TestConfig:
             "tests/test_cases/llm_lora.json",
             "llm_context_reuse":
             "tests/test_cases/llm_context_reuse.json",
+            "llm_spec_prefill_evict":
+            "tests/test_cases/llm_spec_prefill_evict.json",
             "asr_basic":
             "tests/test_cases/asr_basic.json",
             "librispeech_clean_test":

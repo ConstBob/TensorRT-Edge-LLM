@@ -120,8 +120,10 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
     mDraftTensorMap.set(binding_names::kContextLengths, mDraftContextLengths);
     mDraftTensorMap.set(binding_names::kDFlashDeltaLengths, mDraftDeltaLens);
 
-    // DFlash's draft cache uses the same [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim]
-    // paged-pool contract as the base model and other draft modes.
+    // KV cache bindings: bind to draft cache manager's combined KV cache (index 1). Unified on
+    // the paged-pool view — the engine's past/present_key_values_i binding for DFlash's own draft
+    // cache is the same [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim] contract as the main
+    // model and EAGLE/MTP drafts.
     auto& kvMgr = mDraftCacheManager.getKVCacheManager();
     LLMEngineConfig const& draftCfg = *deployment.draft;
     int32_t localAttnIdx = 0;
@@ -138,7 +140,7 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
     }
     mDraftTensorMap.set(binding_names::kKVCacheStartIndex, mDraftCacheManager.getKVCacheLengths());
 
-    // Draft page table (shared resource index 1).
+    // The draft target update and proposal attention share the managed draft page table.
     mDraftTensorMap.set(binding_names::kKVPageTable, mRuntime.base.sharedResources.kvPageTables[1]->kernelView());
 
     if (draftCfg.ropeConfig.type == RopeType::kMRope)
@@ -235,25 +237,48 @@ bool DFlashDecoder::decodeStep(DecodingInferenceContext& context)
 
     {
         TIME_STAGE(metrics::StageNames::kSPEC_DECODE_DRAFT_PROPOSAL, context.stream);
-        if (!runDraftForward(context))
+        bool const usePendingPrefillProposal
+            = mCommonStateTracker.shouldUsePendingPrefillProposal(context.generationRound);
+        if (!usePendingPrefillProposal && !runDraftForward(context))
         {
             LOG_ERROR("DFlashDecoder: draft forward failed.");
             return false;
         }
+        mCommonStateTracker.materializePending(context.generationRound, context.activeBatchSize);
         if (!prepareBlockDraftVerifyInputs(context))
         {
             LOG_ERROR("DFlashDecoder: verify input preparation failed.");
             return false;
         }
     }
+    mCommonStateTracker.consumeDraftPrefillOutputs();
 
     if (!runBaseVerification(context))
     {
         LOG_ERROR("DFlashDecoder: base verification failed.");
         return false;
     }
+    mCommonStateTracker.recordAccepted(mHostAcceptLengths.dataPointer<int32_t>(), context.activeBatchSize);
 
     return true;
+}
+
+bool DFlashDecoder::initializeForGeneration(DecodingInferenceContext& context)
+{
+    mCommonStateTracker.initialize(context);
+
+    if (!runDraftForward(context))
+    {
+        LOG_ERROR("DFlashDecoder: failed to initialize draft state for generation.");
+        return false;
+    }
+    mCommonStateTracker.markDraftPrefillOutputsPending();
+    return true;
+}
+
+std::vector<int32_t> const& DFlashDecoder::commonMaterializedStateLengths() const noexcept
+{
+    return mCommonStateTracker.commonMaterializedStateLengths();
 }
 
 bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
@@ -822,16 +847,16 @@ void DFlashDecoder::commitAcceptedTreePath(
     auto& kvMgrBase = cacheMgrBase.getKVCacheManager();
     auto const kvHeadDimGroups = cacheMgrBase.getKVHeadDimGroups();
     auto const kvCacheType = kvMgrBase.getConfig().kvCacheType;
+    auto const& basePageTable = *mRuntime.base.sharedResources.kvPageTables[0];
+    int32_t const* basePageTablePtr = basePageTable.kernelView().dataPointer<int32_t>();
+    int32_t const baseNumPages = kvMgrBase.numPages();
+    int32_t const baseMaxPagesPerSeq = basePageTable.maxPagesPerSeq();
     auto& mambaMgr = cacheMgrBase.getMambaCacheManager();
     bool const hasHybridStates = mambaMgr.hasIntermediateRecurrentStates() || mambaMgr.hasIntermediateConvStates();
 
     check::check(mRuntime.base.pipelineIO.baseHiddenStates.reshape(
                      {activeBatchSize, verifySize, mBlockDraft.baseOutputHiddenDim}),
         "Tensor reshape failed");
-    auto const& basePageTable = *mRuntime.base.sharedResources.kvPageTables[0];
-    int32_t const* basePageTablePtr = basePageTable.kernelView().dataPointer<int32_t>();
-    int32_t const baseNumPages = kvMgrBase.numPages();
-    int32_t const baseMaxPagesPerSeq = basePageTable.maxPagesPerSeq();
     // Branching-tree accept can skip nodes, so commit compacts accepted KV rows using accepted verify indices.
     for (auto const& group : kvHeadDimGroups)
     {
@@ -1106,16 +1131,78 @@ void DFlashDecoder::saveSystemPromptKVCache(SystemPromptCacheKey const& key, std
 void DFlashDecoder::resetForNewSequences(Tensor& reuseLengths, cudaStream_t stream)
 {
     mDraftCacheManager.resetForNewSequences(reuseLengths, stream);
+    mCommonStateTracker.reset();
 }
 
-void DFlashDecoder::onBatchEvict(std::vector<int32_t> const& /* batchMapping */, int32_t oldActiveBatch,
+void DFlashDecoder::onBatchEvict(std::vector<int32_t> const& batchMapping, int32_t oldActiveBatch,
     int32_t newActiveBatch, Tensor& deviceBatchMapping, cudaStream_t stream, BatchCompactionMode mode)
 {
-    ELLM_CHECK(mode == BatchCompactionMode::kLegacyPhysicalKv,
-        "DFlash does not support managed context-cache batch compaction.");
+    ELLM_CHECK(batchMapping.size() == static_cast<size_t>(oldActiveBatch),
+        "DFlash batch mapping does not match the old active batch");
+    if (mode == BatchCompactionMode::kLegacyPhysicalKv)
+    {
+        mDraftCacheManager.compactBatch(deviceBatchMapping, oldActiveBatch, newActiveBatch, stream);
+        mDraftCacheManager.setActiveBatchSize(newActiveBatch);
+    }
+    else
+    {
+        ELLM_CHECK(mode == BatchCompactionMode::kManagedPageRows, "DFlash received an invalid batch compaction mode");
+    }
 
-    mDraftCacheManager.compactBatch(deviceBatchMapping, oldActiveBatch, newActiveBatch, stream);
-    mDraftCacheManager.setActiveBatchSize(newActiveBatch);
+    mCommonStateTracker.compact(batchMapping, oldActiveBatch, newActiveBatch);
+    if (newActiveBatch == 0)
+    {
+        return;
+    }
+
+    auto compactHostTensor = [&](Tensor& tensor) {
+        if (tensor.isEmpty() || tensor.getShape().getNumDims() == 0 || tensor.getShape()[0] != oldActiveBatch)
+        {
+            return;
+        }
+        std::vector<int32_t> compacted(static_cast<size_t>(newActiveBatch));
+        int32_t const* source = tensor.dataPointer<int32_t>();
+        for (int32_t oldSlot = 0; oldSlot < oldActiveBatch; ++oldSlot)
+        {
+            int32_t const newSlot = batchMapping[static_cast<size_t>(oldSlot)];
+            if (newSlot >= 0)
+            {
+                compacted[static_cast<size_t>(newSlot)] = source[oldSlot];
+            }
+        }
+        std::copy(compacted.begin(), compacted.end(), tensor.dataPointer<int32_t>());
+        check::check(tensor.reshape({newActiveBatch}), "Tensor reshape failed");
+    };
+    compactHostTensor(mHostAcceptLengths);
+
+    auto compactDeviceTensor = [&](Tensor& tensor) {
+        if (tensor.isEmpty() || tensor.getShape().getNumDims() == 0 || tensor.getShape()[0] != oldActiveBatch
+            || newActiveBatch == 0)
+        {
+            return;
+        }
+        Coords const oldShape = tensor.getShape();
+        kernel::compactTensorBatch(tensor, deviceBatchMapping, tensor, oldActiveBatch, newActiveBatch, stream);
+        std::vector<int64_t> newShape;
+        newShape.reserve(oldShape.getNumDims());
+        newShape.push_back(newActiveBatch);
+        for (int32_t dim = 1; dim < oldShape.getNumDims(); ++dim)
+        {
+            newShape.push_back(oldShape[dim]);
+        }
+        check::check(tensor.reshape(newShape), "Tensor reshape failed");
+    };
+    compactDeviceTensor(mRuntime.base.pipelineIO.baseHiddenStates);
+    if (mCommonStateTracker.draftPrefillOutputsPending())
+    {
+        compactDeviceTensor(mDraftOutputLogits);
+        compactDeviceTensor(mLastAcceptedTokens);
+    }
+    else
+    {
+        // Acceptance lengths are first written by base verification, after the pending-prefill proposal is consumed.
+        compactDeviceTensor(mAcceptLength);
+    }
 }
 
 } // namespace rt

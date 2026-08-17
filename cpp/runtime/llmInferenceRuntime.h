@@ -286,6 +286,7 @@ private:
     //! Scratch [maxSeq, baseOutputHiddenDim] used to shift baseHiddenStates down one row when folding a reused
     //! Hybrid+MTP checkpoint boundary into the draft prefill. Allocated only for Hybrid+MTP deployments.
     rt::Tensor mBoundaryFoldScratch;
+    bool mHybridMtpContextReuseDeployment{};
     //! baseHiddenStates' max-sequence rows. The fold writes chunkLength + 1 rows, so it needs one spare row on top of
     //! the chunk it shifts; runHybridMtpPrefill checks the chunk against this bound before reshaping.
     int32_t mBoundaryFoldMaxRows{0};

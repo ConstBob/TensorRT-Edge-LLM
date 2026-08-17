@@ -202,11 +202,10 @@ protected:
         EXPECT_EQ(cudaStreamDestroy(mStream), cudaSuccess);
     }
 
-    std::optional<ContextCacheRequest> begin(
-        DecodingInferenceContext const& context, DecodingStrategyKind kind = DecodingStrategyKind::kVanilla)
+    std::optional<ContextCacheRequest> begin(DecodingInferenceContext const& context, bool speculativeRequest = false)
     {
         LLMGenerationRequest request{};
-        return ContextCacheRequest::begin(*mCoordinator, request, context, kind);
+        return ContextCacheRequest::begin(*mCoordinator, request, context, speculativeRequest);
     }
 
     cudaStream_t mStream{};
@@ -325,11 +324,10 @@ TEST_F(ContextCacheRequestTests, EarlyDestructionAbandonsPendingRequest)
     ASSERT_TRUE(next->finish());
 }
 
-TEST_F(ContextCacheRequestTests, RejectsUnsupportedExecutionModeBeforeAdmission)
+TEST_F(ContextCacheRequestTests, AdmissionUsesValidatedCoordinatorContract)
 {
     DecodingInferenceContext context = makeContext({makeTokens(8)}, mStream);
-    EXPECT_THROW(begin(context, DecodingStrategyKind::kMTP), std::runtime_error);
-
+    EXPECT_THROW(static_cast<void>(begin(context, true)), std::runtime_error);
     auto vanilla = begin(context);
     ASSERT_TRUE(vanilla.has_value());
     ASSERT_TRUE(vanilla->finish());
@@ -373,7 +371,7 @@ protected:
     std::optional<ContextCacheRequest> begin(DecodingInferenceContext const& context)
     {
         LLMGenerationRequest request{};
-        return ContextCacheRequest::begin(*mCoordinator, request, context, DecodingStrategyKind::kVanilla);
+        return ContextCacheRequest::begin(*mCoordinator, request, context, false);
     }
 
     cudaStream_t mStream{};
@@ -435,10 +433,10 @@ protected:
         EXPECT_EQ(cudaStreamDestroy(mStream), cudaSuccess);
     }
 
-    std::optional<ContextCacheRequest> begin(DecodingInferenceContext const& context)
+    std::optional<ContextCacheRequest> begin(DecodingInferenceContext const& context, bool speculativeRequest = true)
     {
         LLMGenerationRequest request{};
-        return ContextCacheRequest::begin(*mCoordinator, request, context, DecodingStrategyKind::kEAGLE);
+        return ContextCacheRequest::begin(*mCoordinator, request, context, speculativeRequest);
     }
 
     cudaStream_t mStream{};
@@ -449,6 +447,20 @@ protected:
     std::unique_ptr<KVPageTable> mDraftPageTable;
     std::unique_ptr<ContextCacheCoordinator> mCoordinator;
 };
+
+TEST_F(ContextCacheRequestEagleTests, VanillaRequestDoesNotAcquireDraftState)
+{
+    ContextCacheMetrics const before = mCoordinator->metrics();
+    DecodingInferenceContext context = makeContext({makeTokens(2 * kTOKENS_PER_PAGE)}, mStream);
+
+    auto request = begin(context, false);
+
+    ASSERT_TRUE(request.has_value());
+    ContextCacheMetrics const admitted = mCoordinator->metrics();
+    EXPECT_LT(admitted.baseKvPages.free, before.baseKvPages.free);
+    EXPECT_EQ(admitted.draftKvPages.free, before.draftKvPages.free);
+    ASSERT_TRUE(request->finish());
+}
 
 TEST_F(ContextCacheRequestEagleTests, ForwardsCommonMaterializedStateAndUsesPairedReplay)
 {

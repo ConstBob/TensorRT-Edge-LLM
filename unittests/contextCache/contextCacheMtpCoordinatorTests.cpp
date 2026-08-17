@@ -204,11 +204,11 @@ protected:
             validateContextCacheDeployment(mDeployment), resources, mStream, std::move(synchronizer));
     }
 
-    ContextCacheCoordinator::AdmissionResult begin(
-        std::vector<int32_t> tokens, ContextCacheLookupPolicy lookupPolicy = ContextCacheLookupPolicy::kUseCache)
+    ContextCacheCoordinator::AdmissionResult begin(std::vector<int32_t> tokens,
+        ContextCacheLookupPolicy lookupPolicy = ContextCacheLookupPolicy::kUseCache, bool speculativeRequest = true)
     {
         ContextCacheBatchAdmission admission;
-        admission.executionMode = ContextCacheExecutionMode::kMTP;
+        admission.speculativeRequest = speculativeRequest;
         admission.lookupPolicy = lookupPolicy;
         admission.sequences.push_back(ContextCacheSequenceAdmission{std::move(tokens), {}});
         ContextCacheCoordinator::BeginRequestResult result = mCoordinator->beginRequest(admission, mStream);
@@ -326,7 +326,9 @@ protected:
 // The kHybridMtp deployment must construct with a draft cache and boundary-hidden snapshot storage.
 TEST_F(ContextCacheMtpCoordinatorTests, ConstructsHybridMtpDeployment)
 {
-    EXPECT_EQ(validateContextCacheDeployment(mDeployment), ContextCacheDeploymentKind::kHybridMtp);
+    ContextCacheDeploymentProfile const profile = validateContextCacheDeployment(mDeployment);
+    EXPECT_EQ(profile.baseStateKind, ContextCacheModelStateKind::kHybrid);
+    EXPECT_TRUE(profile.isSpeculative());
     ASSERT_NE(mCoordinator, nullptr);
     EXPECT_EQ(mCoordinator->manager().records().size(), 0U);
 }
@@ -377,6 +379,29 @@ TEST_F(ContextCacheMtpCoordinatorTests, PublishEndpointBecomesReusableAndRestore
     expectHiddenRow(0, kBoundaryRow, 0x51);
     EXPECT_EQ(mCoordinator->metrics().hybridRestores, 1U);
     EXPECT_EQ(mCoordinator->finish(consumer.request), ContextCacheCoordinatorStatus::kOk);
+}
+
+TEST_F(ContextCacheMtpCoordinatorTests, VanillaRequestOnMtpDeploymentRestoresOnlyBaseHybridState)
+{
+    constexpr int32_t kInputLength{kTOKENS_PER_PAGE + 1};
+    constexpr int32_t kResidentLength{kInputLength};
+    constexpr int32_t kBoundaryRow{kInputLength - 1};
+
+    auto producer = begin(makeTokens(kInputLength));
+    ASSERT_EQ(mCoordinator->preparePrefill(producer.request), ContextCacheCoordinatorStatus::kOk);
+    seedRecurrent(0x31, 0x61);
+    seedHiddenRow(0, kBoundaryRow, 0x51);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    ASSERT_EQ(mCoordinator->publishHybridMtpEndpoint(producer.request, 0, kResidentLength, *mHidden, kBoundaryRow),
+        ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(mCoordinator->finish(producer.request), ContextCacheCoordinatorStatus::kOk);
+
+    auto vanillaConsumer
+        = begin(makeTokens(kInputLength + 1), ContextCacheLookupPolicy::kUseCache, /*speculativeRequest=*/false);
+    ASSERT_EQ(vanillaConsumer.prefillStarts, std::vector<int32_t>{kResidentLength});
+    EXPECT_EQ(mCoordinator->preparePrefill(vanillaConsumer.request), ContextCacheCoordinatorStatus::kOk);
+    EXPECT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    EXPECT_EQ(mCoordinator->finish(vanillaConsumer.request), ContextCacheCoordinatorStatus::kOk);
 }
 
 // The publish guard skips empty prefixes and bypass requests without creating a record.

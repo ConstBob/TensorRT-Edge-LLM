@@ -48,6 +48,12 @@ std::vector<int32_t> makeTokens(int32_t count)
     return tokens;
 }
 
+std::vector<PageId> const& eaglePagePath(CacheRecord const& record)
+{
+    ELLM_CHECK(record.specState.has_value(), "Test expected an EAGLE spec-state record");
+    return record.specState->pagePath;
+}
+
 LLMEngineConfig makeAttentionConfig(char const* modelType, int32_t layers)
 {
     LLMEngineConfig config;
@@ -138,22 +144,21 @@ protected:
     void createCoordinator(ContextCacheCoordinator::StreamSynchronizer synchronizer = {})
     {
         ContextCachePhysicalResources resources{*mBaseCache, *mBasePageTable, mDraftCache.get(), mDraftPageTable.get()};
-        mCoordinator
-            = std::make_unique<ContextCacheCoordinator>(ContextCacheConfig{/*.enabled=*/true, /*.maxRecords=*/16},
-                mDeployment, validateContextCacheDeployment(mDeployment), resources, mStream, std::move(synchronizer));
+        ContextCacheConfig config{/*.enabled=*/true, /*.maxRecords=*/16};
+        mCoordinator = std::make_unique<ContextCacheCoordinator>(config, mDeployment,
+            validateContextCacheDeployment(mDeployment), resources, mStream, std::move(synchronizer));
     }
 
-    ContextCacheCoordinator::AdmissionResult begin(
-        std::vector<int32_t> tokens, ContextCacheExecutionMode executionMode = ContextCacheExecutionMode::kEAGLE)
+    ContextCacheCoordinator::AdmissionResult begin(std::vector<int32_t> tokens, bool speculativeRequest = true)
     {
-        return beginBatch({std::move(tokens)}, executionMode);
+        return beginBatch({std::move(tokens)}, speculativeRequest);
     }
 
-    ContextCacheCoordinator::AdmissionResult beginBatch(std::vector<std::vector<int32_t>> batch,
-        ContextCacheExecutionMode executionMode = ContextCacheExecutionMode::kEAGLE)
+    ContextCacheCoordinator::AdmissionResult beginBatch(
+        std::vector<std::vector<int32_t>> batch, bool speculativeRequest = true)
     {
         ContextCacheBatchAdmission admission;
-        admission.executionMode = executionMode;
+        admission.speculativeRequest = speculativeRequest;
         for (auto& tokens : batch)
         {
             admission.sequences.push_back(ContextCacheSequenceAdmission{std::move(tokens), {}});
@@ -222,7 +227,7 @@ TEST_F(ContextCacheSpecCoordinatorTests, FirstVerificationPublishesPairAndNextRe
     CacheRecord const& record
         = mCoordinator->manager().records().get(mCoordinator->manager().records().lruToMru().front());
     EXPECT_EQ(record.basePagePath.size(), 2U);
-    EXPECT_EQ(record.draftPagePath.size(), 2U);
+    EXPECT_EQ(eaglePagePath(record).size(), 2U);
     EXPECT_EQ(mCoordinator->finish(producer.request), ContextCacheCoordinatorStatus::kOk);
 
     std::vector<int32_t> continuation = makeTokens(kInputLength);
@@ -248,7 +253,7 @@ TEST_F(ContextCacheSpecCoordinatorTests, DecodeEndPublishesOnlyTheCommonBaseDraf
     CacheRecord const& record
         = mCoordinator->manager().records().get(mCoordinator->manager().records().lruToMru().back());
     EXPECT_EQ(record.basePagePath.size(), 2U);
-    EXPECT_EQ(record.draftPagePath.size(), 2U);
+    EXPECT_EQ(eaglePagePath(record).size(), 2U);
     EXPECT_FALSE(record.exactCheckpointLength.has_value());
     EXPECT_EQ(mCoordinator->finish(producer.request), ContextCacheCoordinatorStatus::kOk);
 }
@@ -305,7 +310,7 @@ TEST_F(ContextCacheSpecCoordinatorTests, VanillaRequestReusesBaseSideOfPairedRec
     std::vector<int32_t> continuation = makeTokens(kInputLength);
     continuation.push_back(77);
     ContextCacheMetrics const metricsBeforeVanillaConsumer = mCoordinator->metrics();
-    auto consumer = begin(std::move(continuation), ContextCacheExecutionMode::kVanilla);
+    auto consumer = begin(std::move(continuation), false);
     EXPECT_EQ(consumer.prefillStarts, std::vector<int32_t>{kInputLength});
     ContextCacheMetrics const metricsAfterVanillaConsumer = mCoordinator->metrics();
     EXPECT_EQ(metricsAfterVanillaConsumer.matchedTokens,
@@ -363,10 +368,39 @@ TEST_F(ContextCacheSpecCoordinatorTests, FirstRoundCompactionRemovesTerminalSlot
     EXPECT_EQ(mCoordinator->finish(request.request), ContextCacheCoordinatorStatus::kOk);
 }
 
+TEST_F(ContextCacheSpecCoordinatorTests, BatchRowsResolveDifferentPairedReuseLengthsIndependently)
+{
+    constexpr int32_t kShortLength{2 * kTOKENS_PER_PAGE};
+    constexpr int32_t kLongLength{3 * kTOKENS_PER_PAGE};
+
+    auto shortProducer = begin(makeTokens(kShortLength));
+    freezePrefill(shortProducer, kShortLength);
+    completeDecode(shortProducer, {41, 42}, kShortLength + 2, kShortLength, false);
+    ASSERT_EQ(mCoordinator->finish(shortProducer.request), ContextCacheCoordinatorStatus::kOk);
+
+    auto longProducer = begin(makeTokens(kLongLength));
+    freezePrefill(longProducer, kLongLength);
+    completeDecode(longProducer, {43, 44}, kLongLength + 2, kLongLength, false);
+    ASSERT_EQ(mCoordinator->finish(longProducer.request), ContextCacheCoordinatorStatus::kOk);
+
+    std::vector<int32_t> shortContinuation = makeTokens(kShortLength);
+    shortContinuation.push_back(71);
+    std::vector<int32_t> longContinuation = makeTokens(kLongLength);
+    longContinuation.push_back(72);
+    auto consumer = beginBatch({std::move(shortContinuation), std::move(longContinuation)});
+
+    EXPECT_EQ(consumer.prefillStarts, (std::vector<int32_t>{kTOKENS_PER_PAGE, 2 * kTOKENS_PER_PAGE}));
+    EXPECT_NE(mBasePageTable->hostRow(0)[0], mBasePageTable->hostRow(1)[0]);
+    EXPECT_NE(mBasePageTable->hostRow(0)[1], mBasePageTable->hostRow(1)[1]);
+    EXPECT_NE(mDraftPageTable->hostRow(0)[0], mDraftPageTable->hostRow(1)[0]);
+    EXPECT_NE(mDraftPageTable->hostRow(0)[1], mDraftPageTable->hostRow(1)[1]);
+    EXPECT_EQ(mCoordinator->finish(consumer.request), ContextCacheCoordinatorStatus::kOk);
+}
+
 TEST_F(ContextCacheSpecCoordinatorTests, EagleRequestDoesNotConsumeBaseOnlyRecord)
 {
     constexpr int32_t kInputLength{2 * kTOKENS_PER_PAGE};
-    auto producer = begin(makeTokens(kInputLength), ContextCacheExecutionMode::kVanilla);
+    auto producer = begin(makeTokens(kInputLength), false);
     finalizeVanillaPrefill(producer, kInputLength);
     EXPECT_EQ(mCoordinator->finish(producer.request), ContextCacheCoordinatorStatus::kOk);
 
@@ -374,7 +408,7 @@ TEST_F(ContextCacheSpecCoordinatorTests, EagleRequestDoesNotConsumeBaseOnlyRecor
     CacheRecord const& record
         = mCoordinator->manager().records().get(mCoordinator->manager().records().lruToMru().front());
     EXPECT_EQ(record.basePagePath.size(), 2U);
-    EXPECT_TRUE(record.draftPagePath.empty());
+    EXPECT_FALSE(record.specState.has_value());
 
     std::vector<int32_t> continuation = makeTokens(kInputLength);
     continuation.push_back(77);
@@ -385,6 +419,154 @@ TEST_F(ContextCacheSpecCoordinatorTests, EagleRequestDoesNotConsumeBaseOnlyRecor
     EXPECT_EQ(metricsAfterConsumer.matchedTokens, metricsBeforeConsumer.matchedTokens);
     EXPECT_EQ(metricsAfterConsumer.specFullPageReplays, metricsBeforeConsumer.specFullPageReplays);
     EXPECT_EQ(mCoordinator->finish(consumer.request), ContextCacheCoordinatorStatus::kOk);
+}
+
+class ContextCacheGemma4MtpCoordinatorTests : public ::testing::Test
+{
+protected:
+    void SetUp() override
+    {
+        ASSERT_EQ(cudaStreamCreate(&mStream), cudaSuccess);
+        mDeployment.base = makeAttentionConfig("gemma4-mtp-coordinator-base", 3);
+        mDeployment.base.specDecodeType = SpecDecodeMode::kGemma4MTP;
+        mDeployment.base.isSpecDecodeBase = true;
+        mDeployment.draft = makeAttentionConfig("gemma4-mtp-coordinator-assistant", 1);
+        mDeployment.draft->specDecodeType = SpecDecodeMode::kGemma4MTP;
+        mDeployment.draft->hasOwnKVCache = false;
+        mDeployment.draft->sharesTargetKV = true;
+        SpecDecodeConfig spec;
+        spec.draftingTopK = 1;
+        spec.draftingStep = 4;
+        spec.verifySize = 5;
+        mDeployment.specConfig = spec;
+
+        mBaseCache = std::make_unique<HybridCacheManager>(makeCacheConfig(mDeployment.base), mStream);
+        KVCacheManager const& kv = mBaseCache->getKVCacheManager();
+        mBasePageTable = std::make_unique<KVPageTable>(kMAX_BATCH, pagesPerSlot(kv.maxCapPadded()), kv.numPages());
+        mBasePageTable->setIdentity();
+        mBasePageTable->upload(mStream);
+        ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+        ContextCachePhysicalResources resources{*mBaseCache, *mBasePageTable, nullptr, nullptr};
+        mCoordinator
+            = std::make_unique<ContextCacheCoordinator>(ContextCacheConfig{/*.enabled=*/true, /*.maxRecords=*/16},
+                mDeployment, validateContextCacheDeployment(mDeployment), resources, mStream);
+    }
+
+    void TearDown() override
+    {
+        if (mCoordinator != nullptr)
+        {
+            EXPECT_EQ(mCoordinator->shutdown(), ContextCacheCoordinatorStatus::kOk);
+        }
+        mCoordinator.reset();
+        mBasePageTable.reset();
+        mBaseCache.reset();
+        EXPECT_EQ(cudaStreamDestroy(mStream), cudaSuccess);
+    }
+
+    ContextCacheCoordinator::AdmissionResult begin(std::vector<int32_t> tokens)
+    {
+        ContextCacheBatchAdmission admission;
+        admission.speculativeRequest = true;
+        admission.sequences.push_back(ContextCacheSequenceAdmission{std::move(tokens), {}});
+        ContextCacheCoordinator::BeginRequestResult result = mCoordinator->beginRequest(admission, mStream);
+        EXPECT_EQ(result.status, ContextCacheCoordinatorStatus::kOk);
+        EXPECT_TRUE(result.admission.has_value());
+        return std::move(*result.admission);
+    }
+
+    void publishPrefill(ContextCacheCoordinator::AdmissionResult& admission, int32_t inputLength)
+    {
+        ASSERT_EQ(mCoordinator->preparePrefill(admission.request), ContextCacheCoordinatorStatus::kOk);
+        ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+        int32_t lookahead = 9001;
+        std::vector<ContextCacheSequenceAdvance> advances{ContextCacheSequenceAdvance{&lookahead, 1, inputLength}};
+        std::vector<int32_t> commonLengths{inputLength};
+        ASSERT_EQ(mCoordinator->finalizePrefillPublication(admission.request, advances, &commonLengths),
+            ContextCacheCoordinatorStatus::kOk);
+    }
+
+    cudaStream_t mStream{};
+    DeploymentConfig mDeployment;
+    std::unique_ptr<HybridCacheManager> mBaseCache;
+    std::unique_ptr<KVPageTable> mBasePageTable;
+    std::unique_ptr<ContextCacheCoordinator> mCoordinator;
+};
+
+TEST_F(ContextCacheGemma4MtpCoordinatorTests, PrefillUsesCommittedBaseBoundaryWithoutAssistantStateLengths)
+{
+    constexpr int32_t kInputLength{kTOKENS_PER_PAGE};
+    auto request = begin(makeTokens(kInputLength));
+    ASSERT_EQ(mCoordinator->preparePrefill(request.request), ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+
+    int32_t lookahead = 9001;
+    std::vector<ContextCacheSequenceAdvance> advances{ContextCacheSequenceAdvance{&lookahead, 1, kInputLength}};
+    EXPECT_EQ(mCoordinator->finalizePrefillPublication(request.request, advances), ContextCacheCoordinatorStatus::kOk);
+}
+
+TEST_F(ContextCacheGemma4MtpCoordinatorTests, DecodeUsesCommittedBaseBoundaryWithoutAssistantStateLengths)
+{
+    constexpr int32_t kInputLength{kTOKENS_PER_PAGE};
+    auto request = begin(makeTokens(kInputLength));
+    ASSERT_EQ(mCoordinator->preparePrefill(request.request), ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    int32_t lookahead = 9001;
+    std::vector<ContextCacheSequenceAdvance> prefillAdvances{ContextCacheSequenceAdvance{&lookahead, 1, kInputLength}};
+    ASSERT_EQ(
+        mCoordinator->finalizePrefillPublication(request.request, prefillAdvances), ContextCacheCoordinatorStatus::kOk);
+
+    ASSERT_EQ(mCoordinator->prepareDecodeStep(request.request), ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    std::vector<int32_t> accepted{41, 42};
+    std::vector<ContextCacheSequenceAdvance> decodeAdvances{ContextCacheSequenceAdvance{
+        accepted.data(), static_cast<int32_t>(accepted.size()), kInputLength + static_cast<int32_t>(accepted.size())}};
+    EXPECT_EQ(
+        mCoordinator->completeDecodeStep(request.request, decodeAdvances, {}), ContextCacheCoordinatorStatus::kOk);
+}
+
+TEST_F(ContextCacheGemma4MtpCoordinatorTests, DecodeReservesFullVerifyWindowAcrossPageBoundary)
+{
+    constexpr int32_t kInputLength{kTOKENS_PER_PAGE - 1};
+    auto request = begin(makeTokens(kInputLength));
+    ASSERT_EQ(mCoordinator->preparePrefill(request.request), ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    int32_t lookahead = 9001;
+    std::vector<ContextCacheSequenceAdvance> prefillAdvances{ContextCacheSequenceAdvance{&lookahead, 1, kInputLength}};
+    ASSERT_EQ(
+        mCoordinator->finalizePrefillPublication(request.request, prefillAdvances), ContextCacheCoordinatorStatus::kOk);
+
+    ContextCacheMetrics const before = mCoordinator->metrics();
+    ASSERT_EQ(before.baseKvPages.capacity - before.baseKvPages.free, 1);
+    ASSERT_EQ(mCoordinator->prepareDecodeStep(request.request), ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    ContextCacheMetrics const after = mCoordinator->metrics();
+    EXPECT_EQ(after.baseKvPages.capacity - after.baseKvPages.free, 2);
+}
+
+TEST_F(ContextCacheGemma4MtpCoordinatorTests, BaseOnlyRecordSupportsPartialAndExactFullInputHits)
+{
+    constexpr int32_t kInputLength{2 * kTOKENS_PER_PAGE};
+    auto producer = begin(makeTokens(kInputLength));
+    publishPrefill(producer, kInputLength);
+    ASSERT_EQ(mCoordinator->finish(producer.request), ContextCacheCoordinatorStatus::kOk);
+
+    ASSERT_EQ(mCoordinator->manager().records().size(), 1U);
+    CacheRecord const& record
+        = mCoordinator->manager().records().get(mCoordinator->manager().records().lruToMru().front());
+    EXPECT_FALSE(record.specState.has_value());
+    EXPECT_EQ(mCoordinator->metrics().draftKvPages.capacity, 0);
+
+    auto exactHit = begin(makeTokens(kInputLength));
+    EXPECT_EQ(exactHit.prefillStarts, std::vector<int32_t>{kTOKENS_PER_PAGE});
+    EXPECT_EQ(mCoordinator->finish(exactHit.request), ContextCacheCoordinatorStatus::kOk);
+
+    std::vector<int32_t> continuation = makeTokens(kInputLength);
+    continuation.push_back(77);
+    auto partialHit = begin(std::move(continuation));
+    EXPECT_EQ(partialHit.prefillStarts, std::vector<int32_t>{kInputLength});
+    EXPECT_EQ(mCoordinator->finish(partialHit.request), ContextCacheCoordinatorStatus::kOk);
+    EXPECT_GE(mCoordinator->metrics().reusedTokens, static_cast<uint64_t>(3 * kTOKENS_PER_PAGE));
 }
 
 } // namespace

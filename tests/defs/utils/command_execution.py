@@ -131,6 +131,29 @@ def _check_context_reuse_cold_hit_equivalence(config: TestConfig) -> None:
         )
 
 
+def _check_spec_prefill_evict_equivalence(config: TestConfig) -> None:
+    """Require a survivor compacted after a first-token stop to match a later uncompacted replay."""
+    with open(config.get_output_json_file(), encoding='utf-8') as output_file:
+        responses = json.load(output_file).get('responses', [])
+    if len(responses) != 4:
+        raise RuntimeError(
+            "The speculative prefill-eviction fixture must produce exactly four responses, "
+            f"got {len(responses)}.")
+
+    stopped, compacted_survivor, replayed_survivor, _ = responses
+    if stopped.get('finish_reason') != 'stop-words' or len(
+            stopped.get('logprobs', [])) != 1:
+        raise RuntimeError(
+            "The speculative prefill-eviction fixture did not stop slot 0 on its first token."
+        )
+
+    for field in ('output_text', 'finish_reason', 'logprobs'):
+        if compacted_survivor.get(field) != replayed_survivor.get(field):
+            raise RuntimeError(
+                f"The compacted survivor differs from its replayed baseline in {field}."
+            )
+
+
 def _source_test_case_file(config: TestConfig) -> Optional[str]:
     """Return the canonical (un-rewritten) test case JSON path, ignoring any
     per-config preprocessed override that this module may have already set.
@@ -482,6 +505,8 @@ def execute_e2e_bench_test(
         if config.context_reuse:
             if config.test_case == 'llm_context_reuse':
                 _check_context_reuse_cold_hit_equivalence(config)
+            elif config.test_case == 'llm_spec_prefill_evict':
+                _check_spec_prefill_evict_equivalence(config)
             final_result['context_reuse_reused_tokens'] = (
                 _read_context_reuse_profile(config, logger, remote_config))
 
@@ -569,6 +594,8 @@ def execute_inference_test(
         if config.context_reuse:
             if config.test_case == 'llm_context_reuse':
                 _check_context_reuse_cold_hit_equivalence(config)
+            elif config.test_case == 'llm_spec_prefill_evict':
+                _check_spec_prefill_evict_equivalence(config)
             final_result['context_reuse_reused_tokens'] = (
                 _read_context_reuse_profile(config, logger, remote_config))
 

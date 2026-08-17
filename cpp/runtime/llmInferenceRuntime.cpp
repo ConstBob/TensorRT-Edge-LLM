@@ -240,10 +240,10 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
             "Native MTP draft weights are part of --checkpointDir; do not pass --draftCheckpointDir.");
         mDraftCheckpointDir = mCheckpointDir;
     }
-    std::optional<ContextCacheDeploymentKind> contextCacheDeploymentKind;
+    std::optional<ContextCacheDeploymentProfile> contextCacheDeploymentProfile;
     if (contextCacheConfig.enabled)
     {
-        contextCacheDeploymentKind = validateContextCacheDeployment(mDeployment);
+        contextCacheDeploymentProfile = validateContextCacheDeployment(mDeployment);
     }
 
     std::filesystem::path const baseEnginePath = draftingConfig.has_value()
@@ -574,19 +574,17 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
             = mSharedResources->kvPageTables.size() == 2 ? mSharedResources->kvPageTables[1].get() : nullptr;
         ContextCachePhysicalResources cacheResources{
             *mSharedResources->cacheManagers[0], *mSharedResources->kvPageTables[0], draftCache, draftPageTable};
-        ELLM_CHECK(contextCacheDeploymentKind.has_value(), "Context-cache deployment was not validated");
+        ELLM_CHECK(contextCacheDeploymentProfile.has_value(), "Context-cache deployment was not validated");
         mContextCache = std::make_unique<ContextCacheCoordinator>(
-            contextCacheConfig, mDeployment, *contextCacheDeploymentKind, cacheResources, stream);
+            contextCacheConfig, mDeployment, *contextCacheDeploymentProfile, cacheResources, stream);
 
-        if (*contextCacheDeploymentKind == ContextCacheDeploymentKind::kHybridMtp)
+        mHybridMtpContextReuseDeployment
+            = contextCacheDeploymentProfile->isHybrid() && contextCacheDeploymentProfile->isSpeculative();
+        if (contextCacheDeploymentProfile->isHybrid() && contextCacheDeploymentProfile->isSpeculative())
         {
-            // Scratch to shift base hidden states down one row when folding a reused checkpoint boundary into the draft
-            // prefill; sized to match baseHiddenStates' [maxSeq, baseOutputHiddenDim] (ref llmInferenceRuntime.cpp
-            // :670-672). The draft reads baseHiddenStates directly, so match its width and dtype.
             rt::Coords const bhShape = mPipelineIO->baseHiddenStates.getShape();
             mBoundaryFoldScratch = rt::Tensor({bhShape[1], bhShape[2]}, rt::DeviceType::kGPU,
                 mPipelineIO->baseHiddenStates.getDataType(), "LLMInferenceRuntime::mBoundaryFoldScratch");
-            // The fold occupies one row beyond the chunk it shifts, so it needs a spare row in baseHiddenStates.
             mBoundaryFoldMaxRows = math::cast<int32_t>(bhShape[1]);
         }
     }
@@ -929,19 +927,14 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     int32_t kvcReserve = 0;
     if (enableSpecDecode)
     {
-        // Preserve the historical reserve for unmanaged speculative strategies. Managed EAGLE preflights exact
-        // base-verification and draft-proposal working sets, so its admission clamp must use the same geometry.
+        // Preserve the historical reserve for unmanaged speculative strategies. Managed context reuse preflights
+        // exact base-verification and assistant working sets, so its admission clamp uses configured geometry.
         constexpr int32_t kLEGACY_SPEC_KV_CACHE_RESERVE{100};
         kvcReserve = kLEGACY_SPEC_KV_CACHE_RESERVE;
-        if (mContextCache != nullptr && decodingStrategy.kind() == DecodingStrategyKind::kEAGLE)
+        if (mContextCache != nullptr && decodingStrategy.isSpeculative() && !mHybridMtpContextReuseDeployment)
         {
-            ELLM_CHECK(mDeployment.specConfig.has_value(), "EAGLE decoding requires speculative configuration");
-            int64_t const draftWorkingTokens = static_cast<int64_t>(mDeployment.specConfig->draftingStep)
-                * static_cast<int64_t>(mDeployment.specConfig->draftingTopK);
-            int64_t const reserve = std::max<int64_t>(mDeployment.specConfig->verifySize, draftWorkingTokens);
-            ELLM_CHECK(reserve > 0 && reserve <= static_cast<int64_t>(std::numeric_limits<int32_t>::max()),
-                "EAGLE KV-cache working-set reserve exceeds int32");
-            kvcReserve = static_cast<int32_t>(reserve);
+            kvcReserve = mContextCache->speculativeKVReserve();
+            ELLM_CHECK(kvcReserve > 0, "Speculative KV-cache working-set reserve must be positive");
         }
         else if (decodingStrategy.kind() == DecodingStrategyKind::kDSpark)
         {
@@ -993,8 +986,8 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
     std::optional<ContextCacheRequest> contextCacheRequest;
     if (mContextCache != nullptr)
     {
-        std::optional<ContextCacheRequest> admitted
-            = ContextCacheRequest::begin(*mContextCache, request, context, decodingStrategy.kind(), mediaTokenIds);
+        std::optional<ContextCacheRequest> admitted = ContextCacheRequest::begin(
+            *mContextCache, request, context, decodingStrategy.isSpeculative(), mediaTokenIds);
         if (!admitted.has_value())
         {
             return false;
@@ -1070,7 +1063,7 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
         && request.contextCacheLookupPolicy != ContextCacheLookupPolicy::kBypass && !request.generateAudio
         && !context.outputThinkerEmbeddings;
     bool const hybridMtpContextReuse = shouldUseHybridMtpEndpointReuse(
-        decodingStrategy.kind(), mDeployment.base.numLinearAttnLayers > 0, requestCacheEnabled, requestCacheEnabled);
+        decodingStrategy.kind(), mHybridMtpContextReuseDeployment, requestCacheEnabled, requestCacheEnabled);
     if (hybridMtpContextReuse)
     {
         bool const textOnly = !context.visualEmbeddings.has_value() && !context.audioEmbeddings.has_value();
@@ -1305,12 +1298,10 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
         updateFinishStates();
         emitChunks(context, *mTokenizer);
 
-        // Managed vanilla and EAGLE requests may remove individual slots that finished on the prefill token before
-        // decoding starts. Unmanaged requests and other speculative strategies retain the legacy all-finished-only
-        // path; their first-round state is outside this integration's partial-compaction contract.
-        bool const supportsPartialPrefillEviction = managedRequest != nullptr
-            && (decodingStrategy.kind() == DecodingStrategyKind::kVanilla
-                || decodingStrategy.kind() == DecodingStrategyKind::kEAGLE);
+        // Managed page rows can be compacted without moving physical KV. Keep the unmanaged lifecycle unchanged;
+        // Qwen-style MTP cannot compact its recurrent draft state after partial prefill eviction.
+        bool const supportsPartialPrefillEviction
+            = managedRequest != nullptr && decodingStrategy.kind() != DecodingStrategyKind::kMTP;
         if (context.activeBatchSize > 0 && (supportsPartialPrefillEviction || checkAllFinished()))
         {
             bool const batchEvictStatus = performBatchEvict(context, decodingStrategy, thinkingDone, managedRequest);
@@ -2109,9 +2100,6 @@ bool LLMInferenceRuntime::runBaseModelPrefill(
         return true;
     }
 
-    // Hybrid+MTP two-chunk prefill runs its predecessor chunk with sampling disabled: leave the recurrent state at the
-    // stable boundary and produce no output token (mirrors reference runBaseModelPrefill sampleOutput=false). The
-    // caller synchronizes before repacking the shared pinned token buffer.
     if (!sampleOutput)
     {
         return true;
@@ -2358,10 +2346,8 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(DecodingInferenceContext& con
 
     if (contextCachePrefillStarts != nullptr)
     {
-        ELLM_CHECK(mContextCache != nullptr
-                && (!needsStrategyKVCache || strategy.kind() == DecodingStrategyKind::kEAGLE
-                    || strategy.kind() == DecodingStrategyKind::kMTP),
-            "Managed context-cache prefill supports only vanilla, EAGLE, or MTP decoding strategies");
+        ELLM_CHECK(mContextCache != nullptr,
+            "Managed context-cache prefill requires an initialized context-cache coordinator");
         ELLM_CHECK(static_cast<int32_t>(contextCachePrefillStarts->size()) == activeBatchSize,
             "Managed context-cache execution recipe must describe every active sequence");
         for (int32_t i = 0; i < activeBatchSize; ++i)
@@ -2758,10 +2744,8 @@ bool LLMInferenceRuntime::performBatchEvict(DecodingInferenceContext& context, D
     }
 
     rt::compactVector(batchMapping, context.finishedStates);
-    if (managedContextCache)
+    if (contextCacheRequest != nullptr)
     {
-        // Scope this MR's additional host-state compaction to coordinator-managed requests so disabling context reuse
-        // preserves the legacy path.
         rt::compactVector(batchMapping, thinkingDone);
     }
     rt::compactVector(batchMapping, context.currentGenerateLengths);

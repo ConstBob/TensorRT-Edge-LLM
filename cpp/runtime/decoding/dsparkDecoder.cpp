@@ -42,6 +42,7 @@
 #include <filesystem>
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace trt_edgellm
@@ -181,7 +182,9 @@ DSparkDecoder::DSparkDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
     mDraftTensorMap.set(binding_names::kContextLengths, mDraftContextLengths);
     mDraftTensorMap.set(binding_names::kDFlashDeltaLengths, mDraftDeltaLens);
 
-    // KV cache bindings: DSpark uses the same paged-pool contract as DFlash.
+    // KV cache bindings: bind to draft cache manager's combined KV cache (index 1). DSpark
+    // uses the same cached-draft path as DFlash, so the engine expects the paged-pool view
+    // [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim], not the legacy slot-shaped alias.
     {
         auto& kvMgr = mDraftCacheManager.getKVCacheManager();
         int32_t localAttnIdx = 0;
@@ -200,7 +203,7 @@ DSparkDecoder::DSparkDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
 
     mDraftTensorMap.set(binding_names::kKVCacheStartIndex, mDraftCacheManager.getKVCacheLengths());
 
-    // Draft page table (shared resource index 1).
+    // The draft target update and proposal attention share the managed draft page table.
     mDraftTensorMap.set(binding_names::kKVPageTable, mRuntime.base.sharedResources.kvPageTables[1]->kernelView());
 
     if (draftCfg.ropeConfig.type == RopeType::kMRope)
@@ -353,19 +356,41 @@ bool DSparkDecoder::decodeStep(DecodingInferenceContext& context)
     NVTX_SCOPED_RANGE(nvtx_dspark_decode, "DSparkDecoder::decodeStep", nvtx_colors::GREEN);
     cudaGetLastError();
 
-    if (!runDraftForward(context))
+    bool const usePendingPrefillProposal = mCommonStateTracker.shouldUsePendingPrefillProposal(context.generationRound);
+    if (!usePendingPrefillProposal && !runDraftForward(context))
     {
         LOG_ERROR("DSparkDecoder: draft forward failed.");
         return false;
     }
+    mCommonStateTracker.materializePending(context.generationRound, context.activeBatchSize);
+    mCommonStateTracker.consumeDraftPrefillOutputs();
 
     if (!runBaseVerification(context))
     {
         LOG_ERROR("DSparkDecoder: base verification failed.");
         return false;
     }
+    mCommonStateTracker.recordAccepted(mHostAcceptLengths.dataPointer<int32_t>(), context.activeBatchSize);
 
     return true;
+}
+
+bool DSparkDecoder::initializeForGeneration(DecodingInferenceContext& context)
+{
+    mCommonStateTracker.initialize(context);
+
+    if (!runDraftForward(context))
+    {
+        LOG_ERROR("DSparkDecoder: failed to initialize draft state for generation.");
+        return false;
+    }
+    mCommonStateTracker.markDraftPrefillOutputsPending();
+    return true;
+}
+
+std::vector<int32_t> const& DSparkDecoder::commonMaterializedStateLengths() const noexcept
+{
+    return mCommonStateTracker.commonMaterializedStateLengths();
 }
 
 // Keep these orchestration helpers in the decoder layer because logit-bias application
@@ -958,15 +983,15 @@ void DSparkDecoder::commitAcceptedTreePath(
     auto& kvMgrBase = cacheMgrBase.getKVCacheManager();
     auto const kvHeadDimGroups = cacheMgrBase.getKVHeadDimGroups();
     auto const kvCacheType = kvMgrBase.getConfig().kvCacheType;
+    auto const& basePageTable = *mRuntime.base.sharedResources.kvPageTables[0];
+    int32_t const* basePageTablePtr = basePageTable.kernelView().dataPointer<int32_t>();
+    int32_t const baseNumPages = kvMgrBase.numPages();
+    int32_t const baseMaxPagesPerSeq = basePageTable.maxPagesPerSeq();
     auto& mambaMgr = cacheMgrBase.getMambaCacheManager();
     bool const hasHybridStates = mambaMgr.hasIntermediateRecurrentStates() || mambaMgr.hasIntermediateConvStates();
 
     check::check(mRuntime.base.pipelineIO.baseHiddenStates.reshape({activeBatchSize, verifySize, mBaseOutputHiddenDim}),
         "Tensor reshape failed");
-    auto const& basePageTable = *mRuntime.base.sharedResources.kvPageTables[0];
-    int32_t const* basePageTablePtr = basePageTable.kernelView().dataPointer<int32_t>();
-    int32_t const baseNumPages = kvMgrBase.numPages();
-    int32_t const baseMaxPagesPerSeq = basePageTable.maxPagesPerSeq();
     // Branching-tree accept can skip nodes, so commit compacts accepted KV rows using accepted verify indices.
     for (auto const& group : kvHeadDimGroups)
     {
@@ -1261,18 +1286,100 @@ void DSparkDecoder::saveSystemPromptKVCache(SystemPromptCacheKey const& key, std
 
 void DSparkDecoder::resetForNewSequences(Tensor& reuseLengths, cudaStream_t stream)
 {
-    mLastBaseVerifyHiddenStride = 0;
     mDraftCacheManager.resetForNewSequences(reuseLengths, stream);
+    mCommonStateTracker.reset();
+    mLastBaseVerifyHiddenStride = 0;
 }
 
-void DSparkDecoder::onBatchEvict(std::vector<int32_t> const& /* batchMapping */, int32_t oldActiveBatch,
+void DSparkDecoder::onBatchEvict(std::vector<int32_t> const& batchMapping, int32_t oldActiveBatch,
     int32_t newActiveBatch, Tensor& deviceBatchMapping, cudaStream_t stream, BatchCompactionMode mode)
 {
-    ELLM_CHECK(mode == BatchCompactionMode::kLegacyPhysicalKv,
-        "DSpark does not support managed context-cache batch compaction.");
+    ELLM_CHECK(batchMapping.size() == static_cast<size_t>(oldActiveBatch),
+        "DSpark batch mapping does not match the old active batch");
+    if (mode == BatchCompactionMode::kLegacyPhysicalKv)
+    {
+        mDraftCacheManager.compactBatch(deviceBatchMapping, oldActiveBatch, newActiveBatch, stream);
+        mDraftCacheManager.setActiveBatchSize(newActiveBatch);
+    }
+    else
+    {
+        ELLM_CHECK(mode == BatchCompactionMode::kManagedPageRows, "DSpark received an invalid batch compaction mode");
+    }
 
-    mDraftCacheManager.compactBatch(deviceBatchMapping, oldActiveBatch, newActiveBatch, stream);
-    mDraftCacheManager.setActiveBatchSize(newActiveBatch);
+    mCommonStateTracker.compact(batchMapping, oldActiveBatch, newActiveBatch);
+    if (newActiveBatch == 0)
+    {
+        return;
+    }
+
+    auto compactHostTensor = [&](Tensor& tensor) {
+        if (tensor.isEmpty() || tensor.getShape().getNumDims() == 0 || tensor.getShape()[0] != oldActiveBatch)
+        {
+            return;
+        }
+        std::vector<int32_t> compacted(static_cast<size_t>(newActiveBatch));
+        int32_t const* source = tensor.dataPointer<int32_t>();
+        for (int32_t oldSlot = 0; oldSlot < oldActiveBatch; ++oldSlot)
+        {
+            int32_t const newSlot = batchMapping[static_cast<size_t>(oldSlot)];
+            if (newSlot >= 0)
+            {
+                compacted[static_cast<size_t>(newSlot)] = source[oldSlot];
+            }
+        }
+        std::copy(compacted.begin(), compacted.end(), tensor.dataPointer<int32_t>());
+        check::check(tensor.reshape({newActiveBatch}), "Tensor reshape failed");
+    };
+    compactHostTensor(mHostAcceptLengths);
+
+    auto compactDeviceTensor = [&](Tensor& tensor) {
+        if (tensor.isEmpty() || tensor.getShape().getNumDims() == 0 || tensor.getShape()[0] != oldActiveBatch
+            || newActiveBatch == 0)
+        {
+            return;
+        }
+        Coords const oldShape = tensor.getShape();
+        kernel::compactTensorBatch(tensor, deviceBatchMapping, tensor, oldActiveBatch, newActiveBatch, stream);
+        std::vector<int64_t> newShape;
+        newShape.reserve(oldShape.getNumDims());
+        newShape.push_back(newActiveBatch);
+        for (int32_t dim = 1; dim < oldShape.getNumDims(); ++dim)
+        {
+            newShape.push_back(oldShape[dim]);
+        }
+        check::check(tensor.reshape(newShape), "Tensor reshape failed");
+    };
+    compactDeviceTensor(mRuntime.base.pipelineIO.baseHiddenStates);
+    if (mCommonStateTracker.draftPrefillOutputsPending())
+    {
+        compactDeviceTensor(mDraftOutputLogits);
+        compactDeviceTensor(mDraftHiddenStates);
+        compactDeviceTensor(mDraftTokenIds);
+        compactDeviceTensor(mVerifyTokenIds);
+        compactDeviceTensor(mDraftProbabilities);
+        compactDeviceTensor(mDraftTopKProbabilities);
+        compactDeviceTensor(mDraftTopKIndices);
+        compactDeviceTensor(mConfidenceScores);
+        compactDeviceTensor(mProposalLengths);
+        compactDeviceTensor(mLastAcceptedTokens);
+        compactDeviceTensor(mStackedMarkovLogits);
+        compactDeviceTensor(mTreeTokenIds);
+        compactDeviceTensor(mTreeNodeDepths);
+        compactDeviceTensor(mTreeParentIds);
+        compactDeviceTensor(mTreeNodeScores);
+        compactDeviceTensor(mValidCounts);
+        compactDeviceTensor(mVerifyTreeMask);
+        compactDeviceTensor(mRuntime.preprocess.idsInput);
+        compactDeviceTensor(mRuntime.base.pipelineIO.specDecodePositionIds);
+        compactDeviceTensor(mRuntime.base.pipelineIO.packedAttentionMask);
+        compactDeviceTensor(mRuntime.base.pipelineIO.contextLengths);
+        compactDeviceTensor(mRuntime.base.pipelineIO.selectTokenIndices);
+    }
+    else
+    {
+        // Acceptance lengths are first written by base verification, after the pending-prefill proposal is consumed.
+        compactDeviceTensor(mAcceptLength);
+    }
 }
 
 } // namespace rt

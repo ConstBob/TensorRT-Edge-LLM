@@ -207,8 +207,8 @@ ReusePlan makeHybridMtpReusePlan(std::vector<HybridCheckpointCandidate> const& c
         }
 
         CacheRecord const& record = records.get(*recordId);
-        // The boundary token (exactLength - 1) is always retained in a private partial page, so reserve one fewer full
-        // block than exactLength/pageSize; page-aligned checkpoints keep their boundary private too.
+        // This is the local form of SpecReuseContract::futureDependencyTokens == 1; keep the boundary token private.
+        // Hybrid MTP checkpoint arithmetic intentionally remains local to this shipping path.
         size_t const fullBlockCount = static_cast<size_t>((candidate.exactLength - 1) / pageSize);
         bool const logicalPrefixMatches = record.logicalBlockHashes.size() == fullBlockCount
             && fullBlockCount <= inputFullBlockHashes.size()
@@ -218,7 +218,8 @@ ReusePlan makeHybridMtpReusePlan(std::vector<HybridCheckpointCandidate> const& c
         bool const snapshotSetComplete
             = record.recurrentSnapshotSlot.has_value() && record.partialKvSnapshotSlot.has_value();
         bool const basePathComplete = record.basePagePath.size() == fullBlockCount;
-        bool const draftPathComplete = record.draftPagePath.size() == fullBlockCount;
+        bool const draftPathComplete
+            = record.specState.has_value() && record.specState->pagePath.size() == fullBlockCount;
         if (!logicalPrefixMatches || !snapshotSetComplete || !basePathComplete || !draftPathComplete)
         {
             continue;
@@ -230,7 +231,7 @@ ReusePlan makeHybridMtpReusePlan(std::vector<HybridCheckpointCandidate> const& c
         plan.partialKvSnapshotBinding = record.partialKvSnapshotSlot;
         plan.matchedBlockHashes = record.logicalBlockHashes;
         plan.basePageBindings = record.basePagePath;
-        plan.draftPageBindings = record.draftPagePath;
+        plan.specPageBindings = record.specState->pagePath;
         plan.reuseTokenLength = candidate.exactLength;
         plan.matchedTokenLength = candidate.exactLength;
         int32_t const privatePageCount = static_cast<int32_t>(totalInputPages - static_cast<int64_t>(fullBlockCount));
@@ -240,91 +241,5 @@ ReusePlan makeHybridMtpReusePlan(std::vector<HybridCheckpointCandidate> const& c
     }
     return makeCold();
 }
-
-ReusePlan makeSpecReusePlan(std::vector<BlockHash> const& inputFullBlockHashes, int32_t inputTokenCount,
-    int32_t pageSize, BaseBlockIndex const& baseIndex, DraftPathIndex const& draftIndex,
-    CacheRecordStore const& records, ContextCacheLookupPolicy lookupPolicy)
-{
-    ELLM_CHECK(lookupPolicy == ContextCacheLookupPolicy::kUseCache || lookupPolicy == ContextCacheLookupPolicy::kBypass,
-        "Context cache plan has an invalid lookup policy");
-    int64_t const totalInputPages = validateAndCountInputPages(inputFullBlockHashes, inputTokenCount, pageSize);
-
-    ReusePlan plan;
-    plan.mode = ReusePlanMode::kSpec;
-    if (inputTokenCount == 0)
-    {
-        return plan;
-    }
-
-    if (lookupPolicy == ContextCacheLookupPolicy::kBypass)
-    {
-        plan.kind = ReusePlanKind::kNoReusablePrefix;
-        plan.demand.baseKvPages = static_cast<int32_t>(totalInputPages);
-        plan.demand.draftKvPages = static_cast<int32_t>(totalInputPages);
-        return plan;
-    }
-    BaseLookupResult const baseLookup = baseIndex.lookupPrefix(inputFullBlockHashes);
-    ELLM_CHECK(baseLookup.pageIds.size() <= static_cast<size_t>(std::numeric_limits<int32_t>::max()),
-        "Context cache base prefix contains too many pages");
-    int32_t const baseBlockCount = static_cast<int32_t>(baseLookup.pageIds.size());
-    std::optional<DraftPathMatch> const draftMatch = draftIndex.lookupLongest(inputFullBlockHashes, baseBlockCount);
-    if (!draftMatch.has_value())
-    {
-        plan.kind = ReusePlanKind::kNoReusablePrefix;
-        plan.demand.baseKvPages = static_cast<int32_t>(totalInputPages);
-        plan.demand.draftKvPages = static_cast<int32_t>(totalInputPages);
-        return plan;
-    }
-
-    CacheRecord const& record = records.get(draftMatch->record);
-    int32_t const pairedBlockCount = draftMatch->pathBlockCount;
-    ELLM_CHECK(pairedBlockCount > 0 && pairedBlockCount <= baseBlockCount
-            && static_cast<size_t>(pairedBlockCount) <= record.draftPagePath.size()
-            && static_cast<size_t>(pairedBlockCount) <= record.logicalBlockHashes.size()
-            && record.logicalBlockHashes[static_cast<size_t>(pairedBlockCount - 1)]
-                == inputFullBlockHashes[static_cast<size_t>(pairedBlockCount - 1)],
-        "Context cache draft path index does not describe a coherent record prefix");
-    plan.matchedTokenLength = static_cast<int32_t>(static_cast<int64_t>(pairedBlockCount) * pageSize);
-
-    size_t const pairedCount = static_cast<size_t>(pairedBlockCount);
-    plan.draftRecord = record.id;
-    plan.matchedBlockHashes.assign(
-        inputFullBlockHashes.begin(), inputFullBlockHashes.begin() + static_cast<std::ptrdiff_t>(pairedCount));
-    plan.basePageBindings.assign(
-        baseLookup.pageIds.begin(), baseLookup.pageIds.begin() + static_cast<std::ptrdiff_t>(pairedCount));
-    plan.draftPageBindings.assign(
-        record.draftPagePath.begin(), record.draftPagePath.begin() + static_cast<std::ptrdiff_t>(pairedCount));
-
-    bool const fullInputMatch
-        = inputTokenCount % pageSize == 0 && static_cast<int64_t>(pairedBlockCount) == totalInputPages;
-    if (pairedBlockCount > 1)
-    {
-        plan.specReplayDependency = SpecReplayDependency{plan.matchedBlockHashes.back(), pairedBlockCount};
-    }
-    plan.matchedBlockHashes.pop_back();
-    plan.basePageBindings.pop_back();
-    plan.draftPageBindings.pop_back();
-    plan.specReplayMode = SpecReplayMode::kFullPage;
-    if (fullInputMatch)
-    {
-        plan.kind = ReusePlanKind::kFullInputRewind;
-    }
-    else if (plan.basePageBindings.empty())
-    {
-        plan.kind = ReusePlanKind::kNoReusablePrefix;
-    }
-
-    if (plan.basePageBindings.empty())
-    {
-        plan.draftRecord.reset();
-    }
-    int64_t const sharedPageCount = static_cast<int64_t>(plan.basePageBindings.size());
-    plan.reuseTokenLength = static_cast<int32_t>(sharedPageCount * pageSize);
-    int64_t const privatePageCount = totalInputPages - sharedPageCount;
-    plan.demand.baseKvPages = static_cast<int32_t>(privatePageCount);
-    plan.demand.draftKvPages = static_cast<int32_t>(privatePageCount);
-    return plan;
-}
-
 } // namespace rt
 } // namespace trt_edgellm

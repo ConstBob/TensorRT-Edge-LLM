@@ -48,7 +48,7 @@ struct RecordState
     CacheRecordKey key{};
     std::vector<BlockHash> logicalBlockHashes;
     std::vector<PageId> basePagePath;
-    std::vector<PageId> draftPagePath;
+    std::optional<SpecPagedStateRecord> specState;
     std::optional<int32_t> recurrentSnapshotSlot;
     std::optional<int32_t> partialKvSnapshotSlot;
     std::optional<int32_t> exactCheckpointLength;
@@ -59,7 +59,7 @@ struct RecordState
 bool operator==(RecordState const& lhs, RecordState const& rhs)
 {
     return lhs.id == rhs.id && lhs.key == rhs.key && lhs.logicalBlockHashes == rhs.logicalBlockHashes
-        && lhs.basePagePath == rhs.basePagePath && lhs.draftPagePath == rhs.draftPagePath
+        && lhs.basePagePath == rhs.basePagePath && lhs.specState == rhs.specState
         && lhs.recurrentSnapshotSlot == rhs.recurrentSnapshotSlot
         && lhs.partialKvSnapshotSlot == rhs.partialKvSnapshotSlot
         && lhs.exactCheckpointLength == rhs.exactCheckpointLength && lhs.resources == rhs.resources
@@ -86,12 +86,13 @@ bool operator==(PlannerState const& lhs, PlannerState const& rhs)
 CacheRecord makeRecord(BlockHash logicalHash, std::vector<ResourceId> const& resources)
 {
     CacheRecord record;
+    std::vector<PageId> specPagePath;
     for (ResourceId const& resource : resources)
     {
         switch (resource.type)
         {
         case ResourceType::kBaseKvPage: record.basePagePath.push_back(resource.index); break;
-        case ResourceType::kDraftKvPage: record.draftPagePath.push_back(resource.index); break;
+        case ResourceType::kDraftKvPage: specPagePath.push_back(resource.index); break;
         case ResourceType::kRecurrentSnapshot: record.recurrentSnapshotSlot = resource.index; break;
         case ResourceType::kPartialKvSnapshot: record.partialKvSnapshotSlot = resource.index; break;
         }
@@ -102,6 +103,10 @@ CacheRecord makeRecord(BlockHash logicalHash, std::vector<ResourceId> const& res
     if (logicalBlockCount == 0 && record.recurrentSnapshotSlot.has_value())
     {
         record.exactCheckpointLength = 1;
+    }
+    if (!specPagePath.empty())
+    {
+        record.specState = SpecPagedStateRecord{std::move(specPagePath)};
     }
     return record;
 }
@@ -169,7 +174,7 @@ PlannerState captureState(ResourcePools const& pools, CacheRecordStore const& re
     {
         CacheRecord const& record = records.get(id);
         state.recordsInLruOrder.push_back(RecordState{record.id, record.key, record.logicalBlockHashes,
-            record.basePagePath, record.draftPagePath, record.recurrentSnapshotSlot, record.partialKvSnapshotSlot,
+            record.basePagePath, record.specState, record.recurrentSnapshotSlot, record.partialKvSnapshotSlot,
             record.exactCheckpointLength, record.resources(), records.find(record.key)});
     }
     return state;

@@ -86,6 +86,20 @@ void validateCachedDraftTargetLayerIds(LLMEngineConfig const& base, LLMEngineCon
     }
 }
 
+void validateEagleConfig(LLMEngineConfig const& base, LLMEngineConfig const& draft)
+{
+    ELLM_CHECK(!base.specTargetLayerIds.empty(), "EAGLE requires an explicit base conditioning-layer contract.");
+    std::vector<int32_t> sortedTargetLayers = base.specTargetLayerIds;
+    std::sort(sortedTargetLayers.begin(), sortedTargetLayers.end());
+    ELLM_CHECK(sortedTargetLayers.front() >= 0 && sortedTargetLayers.back() < base.numDecoderLayers
+            && std::adjacent_find(sortedTargetLayers.begin(), sortedTargetLayers.end()) == sortedTargetLayers.end(),
+        "EAGLE conditioning layer IDs must be unique and within the base decoder-layer range.");
+    int64_t const expectedConditioningSize
+        = static_cast<int64_t>(base.hiddenSize) * static_cast<int64_t>(base.specTargetLayerIds.size());
+    ELLM_CHECK(draft.baseModelHiddenSize == expectedConditioningSize,
+        "EAGLE base_model_hidden_size does not match the base hidden size and conditioning-layer count.");
+}
+
 void requireMinimumActiveKVPool(LLMEngineConfig const& config, char const* engineLabel)
 {
     int64_t const computedMinimumActivePages
@@ -104,8 +118,11 @@ void validateKVPoolMode(DeploymentConfig const& deployment)
 {
     SpecDecodeMode const mode = deployment.base.specDecodeType;
     bool const nonHybridEagle = mode == SpecDecodeMode::kEAGLE && deployment.base.numLinearAttnLayers == 0;
-    bool const baseSupportsCrossRequestRetention
-        = !deployment.base.kvLayerConfigs.empty() && (mode == SpecDecodeMode::kNONE || nonHybridEagle);
+    bool const attentionOnlyManagedSpec = deployment.base.numLinearAttnLayers == 0
+        && (mode == SpecDecodeMode::kGemma4MTP || mode == SpecDecodeMode::kDFlash || mode == SpecDecodeMode::kJetSpec
+            || mode == SpecDecodeMode::kDSpark);
+    bool const baseSupportsCrossRequestRetention = !deployment.base.kvLayerConfigs.empty()
+        && (mode == SpecDecodeMode::kNONE || nonHybridEagle || attentionOnlyManagedSpec);
     if (!baseSupportsCrossRequestRetention)
     {
         requireMinimumActiveKVPool(deployment.base, "base engine");
@@ -113,7 +130,8 @@ void validateKVPoolMode(DeploymentConfig const& deployment)
 
     if (deployment.draft.has_value())
     {
-        bool const draftSupportsCrossRequestRetention = !deployment.draft->kvLayerConfigs.empty() && nonHybridEagle;
+        bool const draftSupportsCrossRequestRetention
+            = !deployment.draft->kvLayerConfigs.empty() && (nonHybridEagle || attentionOnlyManagedSpec);
         if (!draftSupportsCrossRequestRetention)
         {
             requireMinimumActiveKVPool(*deployment.draft, "draft engine");
@@ -309,6 +327,11 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
     }
 
     validateKVPoolMode(cfg);
+
+    if (cfg.base.specDecodeType == SpecDecodeMode::kEAGLE && cfg.draft.has_value())
+    {
+        validateEagleConfig(cfg.base, *cfg.draft);
+    }
 
     if (isCachedBlockDraftMode(cfg.base.specDecodeType) && cfg.draft.has_value())
     {

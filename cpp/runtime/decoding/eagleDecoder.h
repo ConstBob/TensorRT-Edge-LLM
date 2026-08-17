@@ -19,6 +19,7 @@
 
 #include "common/hashUtils.h"
 #include "runtime/decoding/decodingStrategy.h"
+#include "runtime/decoding/specCommonStateTracker.h"
 #include "runtime/state/externalWeightManager.h"
 
 #include <filesystem>
@@ -100,12 +101,7 @@ private:
     Tensor mAcceptLength;
     Tensor mHostAcceptLengths;
     Tensor mHostAcceptedTokenIds;
-    //! Per-slot greatest logical prefix whose continuation state is materialized by both base and draft models.
-    std::vector<int32_t> mCommonMaterializedStateLengths;
-    //! Per-slot accepted lengths from the previous verification, pending draft-state materialization.
-    std::vector<int32_t> mPendingDraftAcceptLengths;
-    //! Draft-prefill logits and hidden state are waiting for first-proposal construction.
-    bool mDraftPrefillOutputsPending{};
+    SpecCommonStateTracker mCommonStateTracker;
 
     hash_utils::HashMap<SystemPromptCacheKey, SystemPromptKVCache> mSystemPromptKVCacheDraft;
 };

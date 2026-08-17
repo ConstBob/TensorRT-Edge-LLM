@@ -264,11 +264,8 @@ void Gemma4MTPDecoder::resetForNewSequences(Tensor&, cudaStream_t)
 }
 
 void Gemma4MTPDecoder::onBatchEvict(std::vector<int32_t> const& batchMapping, int32_t oldActiveBatch,
-    int32_t newActiveBatch, Tensor& deviceBatchMapping, cudaStream_t stream, BatchCompactionMode mode)
+    int32_t newActiveBatch, Tensor& deviceBatchMapping, cudaStream_t stream, BatchCompactionMode /* mode */)
 {
-    ELLM_CHECK(mode == BatchCompactionMode::kLegacyPhysicalKv,
-        "Gemma4 MTP does not support managed context-cache batch compaction.");
-
     if (newActiveBatch <= 0)
     {
         return;

@@ -116,6 +116,14 @@ void compactTensorBatch(rt::Tensor const& src, rt::Tensor const& batchMapping, r
         compactTensorBatchKernel<int32_t><<<gridDim, blockDim, 0, stream>>>(
             src.dataPointer<int32_t>(), batchMappingPtr, dst.dataPointer<int32_t>(), oldActiveBatch, batchStrideInt);
         break;
+    case nvinfer1::DataType::kINT64:
+        compactTensorBatchKernel<int64_t><<<gridDim, blockDim, 0, stream>>>(
+            src.dataPointer<int64_t>(), batchMappingPtr, dst.dataPointer<int64_t>(), oldActiveBatch, batchStrideInt);
+        break;
+    case nvinfer1::DataType::kINT8:
+        compactTensorBatchKernel<int8_t><<<gridDim, blockDim, 0, stream>>>(
+            src.dataPointer<int8_t>(), batchMappingPtr, dst.dataPointer<int8_t>(), oldActiveBatch, batchStrideInt);
+        break;
     // FP8 is 1-byte POD storage; copy it byte-wise via uint8_t.
     case nvinfer1::DataType::kFP8:
         compactTensorBatchKernel<uint8_t>
@@ -124,7 +132,8 @@ void compactTensorBatch(rt::Tensor const& src, rt::Tensor const& batchMapping, r
         break;
     default:
         throw std::invalid_argument(format::fmtstr(
-            "compactTensorBatch: Unsupported data type=%d. Only HALF, FLOAT, INT32, and FP8 are supported.",
+            "compactTensorBatch: Unsupported data type=%d. Only HALF, FLOAT, INT32, INT64, INT8, and FP8 are "
+            "supported.",
             static_cast<int>(dataType)));
     }
 

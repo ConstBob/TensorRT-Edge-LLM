@@ -261,3 +261,4 @@ tests:
   - tests/python-unittests/test_pipeline_context_reuse.py::test_context_reuse_profile_requires_positive_reused_tokens
   - tests/python-unittests/test_pipeline_context_reuse.py::test_context_reuse_fixture_has_strict_prefix_seed
   - tests/python-unittests/test_pipeline_context_reuse.py::test_context_reuse_cold_and_hit_outputs_are_token_identical
+  - tests/python-unittests/test_pipeline_context_reuse.py::test_spec_prefill_evict_fixture_and_survivor_equivalence
