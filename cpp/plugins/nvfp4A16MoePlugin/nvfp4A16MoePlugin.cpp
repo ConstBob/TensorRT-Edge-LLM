@@ -74,7 +74,7 @@ constexpr int32_t kActivationRelu2{4};
 constexpr int32_t kRoutingSoftmaxTopk{0};
 constexpr int32_t kRoutingSigmoidGroupTopk{1};
 constexpr int32_t kNvfp4GroupSize{16};
-constexpr int32_t kRequiredNumExperts{128};
+constexpr int32_t kSupportedNumExperts[]{128, 256};
 constexpr int32_t kMaxTopK{8};
 constexpr int32_t kDecodeBlockSize{8};
 constexpr int32_t kPrefillBlockSize{32};
@@ -315,9 +315,10 @@ Nvfp4A16MoePlugin::~Nvfp4A16MoePlugin() noexcept = default;
 
 void Nvfp4A16MoePlugin::validateAttributes() const
 {
-    if (mNumExperts != kRequiredNumExperts)
+    if (std::find(std::begin(kSupportedNumExperts), std::end(kSupportedNumExperts), mNumExperts)
+        == std::end(kSupportedNumExperts))
     {
-        throw std::invalid_argument("Nvfp4A16MoePlugin: num_experts must be 128");
+        throw std::invalid_argument("Nvfp4A16MoePlugin: num_experts must be one of {128, 256}");
     }
     if (mTopK <= 0 || mTopK > kMaxTopK)
     {
