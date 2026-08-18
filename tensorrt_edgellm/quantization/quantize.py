@@ -745,6 +745,12 @@ def quantize_and_export(
     with a pointer to the customization guide.
     """
     from ..chat_template import _get_model_type
+    from .models.eagle3_draft import _resolve_model_dir
+
+    # ``model_dir`` may be a HuggingFace hub id; resolve it once so the
+    # path-based consumers below (weight globs, processor-file copies, the
+    # unified-export index probe) see a real directory.
+    model_dir = _resolve_model_dir(model_dir)
 
     # Qwen3-Omni needs a joint Thinker+Talker multimodal calibration chain
     # the generic single-model path below can't express; delegate the full
