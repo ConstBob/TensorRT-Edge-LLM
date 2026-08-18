@@ -376,6 +376,12 @@ class MtpDraftModel(nn.Module):
                             mtp_state_dict["lm_head.weight"] = f.get_tensor(
                                 key)
 
+        if not any(k != "lm_head.weight" for k in mtp_state_dict):
+            raise RuntimeError(
+                f"No 'mtp.*' tensors found under {model_dir} — nothing to "
+                "load for the draft head; check that the checkpoint is "
+                "complete and carries the MTP draft weights.")
+
         _split_fused_mtp_weights(mtp_state_dict, model)
 
         missing, unexpected = model.load_state_dict(mtp_state_dict,
