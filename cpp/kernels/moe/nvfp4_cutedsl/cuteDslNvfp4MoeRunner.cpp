@@ -195,12 +195,12 @@ inline int32_t alignUpInt(int32_t value, int32_t alignment)
     return ((value + alignment - 1) / alignment) * alignment;
 }
 
-inline void zeroWorkspaceRange(std::byte* workspace, size_t begin, size_t end, cudaStream_t stream)
+//! Phase 0 initializes every other workspace buffer and output before its first resident-grid barrier.
+inline void zeroGridBarrier(
+    std::byte* workspace, size_t countOffset, size_t epochOffset, size_t barrierBytes, cudaStream_t stream)
 {
-    if (end > begin)
-    {
-        CUDA_CHECK(cudaMemsetAsync(workspace + begin, 0, end - begin, stream));
-    }
+    size_t const end = epochOffset + barrierBytes;
+    CUDA_CHECK(cudaMemsetAsync(workspace + countOffset, 0, end - countOffset, stream));
 }
 
 //! Describes the byte layout of the decode backend's workspace. total is the running
@@ -552,9 +552,7 @@ int32_t CuteDslNvfp4MoeRunner::runDecode(CuteDslNvfp4MoeParams const& params, vo
 
     std::byte* ws = static_cast<std::byte*>(workspace);
 
-    // Pre-enqueue init: zero the buffers the kernel reads as "clear" state.
-    // packed_input / packed_input_scale do not need zeroing (kernel overwrites).
-    zeroWorkspaceRange(ws, L.rowCounts, L.activeExpertCount + L.barrierBytes, stream);
+    zeroGridBarrier(ws, L.barrierCount, L.barrierEpoch, L.barrierBytes, stream);
 
     // weight_expert_ids and global_to_local_expert are the identity map
     // (single-device: state_E == weight_E == numExperts). The plugin owns
@@ -573,14 +571,6 @@ int32_t CuteDslNvfp4MoeRunner::runDecode(CuteDslNvfp4MoeParams const& params, vo
     }
     int32_t* const weightExpertIdsPtr = const_cast<int32_t*>(params.weightExpertIds);
     int32_t* const globalToLocalExpertPtr = const_cast<int32_t*>(params.globalToLocalExpertIds);
-
-    // Zero the caller-provided output so the kernel's scatter-add writes land cleanly.
-    size_t const outputBytes
-        = static_cast<size_t>(params.numTokens) * static_cast<size_t>(params.hiddenSize) * sizeof(__half);
-    if (params.output != nullptr && outputBytes > 0)
-    {
-        CUDA_CHECK(cudaMemsetAsync(params.output, 0, outputBytes, stream));
-    }
 
     void* const barrierCountT = offsetPtr(workspace, L.barrierCount);
     void* const barrierEpochT = offsetPtr(workspace, L.barrierEpoch);
@@ -730,17 +720,7 @@ int32_t CuteDslNvfp4MoeRunner::runPrefill(CuteDslNvfp4MoeParams const& params, v
 
     std::byte* ws = static_cast<std::byte*>(workspace);
 
-    // Zero every atomic-counter / prefix-sum buffer. Starting non-zero causes
-    // producer/consumer deadlock inside the task queue.
-    zeroWorkspaceRange(ws, L.rowCounts, L.tileWriteCount + L.tileWriteCountBytes, stream);
-
-    // Zero output (scatter-add destination).
-    size_t const outputBytes
-        = static_cast<size_t>(params.numTokens) * static_cast<size_t>(params.hiddenSize) * sizeof(__half);
-    if (params.output != nullptr && outputBytes > 0)
-    {
-        CUDA_CHECK(cudaMemsetAsync(params.output, 0, outputBytes, stream));
-    }
+    zeroGridBarrier(ws, L.barrierCount, L.barrierEpoch, L.barrierBytes, stream);
 
     void* const barrierCountT = offsetPtr(workspace, L.barrierCount);
     void* const barrierEpochT = offsetPtr(workspace, L.barrierEpoch);

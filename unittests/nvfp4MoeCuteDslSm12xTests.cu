@@ -51,6 +51,7 @@ constexpr int32_t kSfVecSize = 16;
 constexpr int32_t kRowTile = 128;
 constexpr int32_t kNumExperts = 128;
 constexpr int32_t kTopK = 8;
+constexpr size_t kRunnerRepeats = 2;
 
 constexpr std::array<float, 16> kFp4Levels{
     0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f, -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
@@ -465,12 +466,13 @@ std::vector<float> computeReference(CaseData const& c)
 }
 
 // ---------------------------------------------------------------------------
-// Runner driver: upload inputs, run the kernel, return FP32 output [T*H].
+// Runner driver: upload inputs, run the kernel twice on the same allocations,
+// and return the FP32 outputs [T*H].
 // ---------------------------------------------------------------------------
 struct RunResult
 {
-    int32_t status;
-    std::vector<float> outputFp32;
+    int32_t status{};
+    std::array<std::vector<float>, kRunnerRepeats> outputsFp32;
 };
 
 RunResult runCase(CaseData const& c)
@@ -536,8 +538,6 @@ RunResult runCase(CaseData const& c)
         weightExpertIds.rawPointer(), identity.data(), identity.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(globalToLocalExpertIds.rawPointer(), identity.data(), identity.size() * sizeof(int32_t),
         cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(output.rawPointer(), 0, static_cast<size_t>(T) * H * sizeof(__half)));
-
     int32_t const maxRoutedRows = T * kTopK;
     size_t const workspaceBytes
         = CuteDslNvfp4MoeRunner::getWorkspaceSize(T, maxRoutedRows, kNumExperts, kTopK, H, I, c.config.backend);
@@ -571,19 +571,32 @@ RunResult runCase(CaseData const& c)
     params.ioDtype = CuteDslMoeIoDtype::kFP16;
     params.backend = c.config.backend;
 
+    constexpr int32_t kPoisonByte = 0xA5;
+    size_t const outputBytes = static_cast<size_t>(T) * H * sizeof(__half);
     cudaStream_t stream = nullptr;
-    int32_t const ret = CuteDslNvfp4MoeRunner{}.run(params, workspace, stream);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
+    RunResult result{};
     std::vector<__half> hostFp16(static_cast<size_t>(T) * H);
-    CUDA_CHECK(
-        cudaMemcpy(hostFp16.data(), output.rawPointer(), hostFp16.size() * sizeof(__half), cudaMemcpyDeviceToHost));
-    std::vector<float> hostFp32(hostFp16.size());
-    for (size_t i = 0; i < hostFp16.size(); ++i)
+    for (size_t repeat = 0; repeat < kRunnerRepeats; ++repeat)
     {
-        hostFp32[i] = __half2float(hostFp16[i]);
+        CUDA_CHECK(cudaMemsetAsync(output.rawPointer(), kPoisonByte, outputBytes, stream));
+        CUDA_CHECK(cudaMemsetAsync(workspace, kPoisonByte, workspaceBytes, stream));
+        result.status = CuteDslNvfp4MoeRunner{}.run(params, workspace, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (result.status != 0)
+        {
+            return result;
+        }
+
+        CUDA_CHECK(
+            cudaMemcpy(hostFp16.data(), output.rawPointer(), hostFp16.size() * sizeof(__half), cudaMemcpyDeviceToHost));
+        auto& outputFp32 = result.outputsFp32[repeat];
+        outputFp32.resize(hostFp16.size());
+        for (size_t i = 0; i < hostFp16.size(); ++i)
+        {
+            outputFp32[i] = __half2float(hostFp16[i]);
+        }
     }
-    return {ret, std::move(hostFp32)};
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -702,17 +715,22 @@ TEST(CuteDslNvfp4MoeSm12xTest, smoke)
         CaseData c = buildCase(cfg);
         RunResult const result = runCase(c);
         ASSERT_EQ(result.status, 0) << "runner returned non-zero status for " << cfg.name;
-        ASSERT_EQ(result.outputFp32.size(), static_cast<size_t>(cfg.numTokens) * cfg.hiddenSize);
-        bool allZero = true;
-        for (float v : result.outputFp32)
+        for (size_t repeat = 0; repeat < kRunnerRepeats; ++repeat)
         {
-            ASSERT_TRUE(std::isfinite(v)) << "non-finite output in " << cfg.name;
-            if (v != 0.0f)
+            SCOPED_TRACE(::testing::Message() << "repeat=" << repeat);
+            auto const& outputFp32 = result.outputsFp32[repeat];
+            ASSERT_EQ(outputFp32.size(), static_cast<size_t>(cfg.numTokens) * cfg.hiddenSize);
+            bool allZero = true;
+            for (float v : outputFp32)
             {
-                allZero = false;
+                ASSERT_TRUE(std::isfinite(v)) << "non-finite output in " << cfg.name;
+                if (v != 0.0f)
+                {
+                    allZero = false;
+                }
             }
+            ASSERT_FALSE(allZero) << "output is all-zero for " << cfg.name;
         }
-        ASSERT_FALSE(allZero) << "output is all-zero for " << cfg.name;
     }
 }
 
@@ -746,15 +764,20 @@ TEST(CuteDslNvfp4MoeSm12xTest, accuracy)
         std::vector<float> const ref = computeReference(c);
         RunResult const result = runCase(c);
         ASSERT_EQ(result.status, 0) << "runner returned non-zero status for " << cfg.name;
-        ASSERT_EQ(result.outputFp32.size(), ref.size());
+        for (size_t repeat = 0; repeat < kRunnerRepeats; ++repeat)
+        {
+            SCOPED_TRACE(::testing::Message() << "repeat=" << repeat);
+            auto const& outputFp32 = result.outputsFp32[repeat];
+            ASSERT_EQ(outputFp32.size(), ref.size());
 
-        Summary const s = summarize(result.outputFp32, ref, cfg.numTokens, cfg.hiddenSize);
-        std::cout << "[" << cfg.name << "] median_cos=" << s.medianCosine << " mag_ratio=" << s.magRatio
-                  << " max_abs=" << s.maxAbs << std::endl;
-        EXPECT_GE(s.medianCosine, kMinCosine)
-            << "median cosine " << s.medianCosine << " below threshold " << kMinCosine << " for " << cfg.name;
-        EXPECT_GE(s.magRatio, kMinMagRatio)
-            << "magnitude ratio " << s.magRatio << " indicates a wholesale magnitude collapse for " << cfg.name;
+            Summary const s = summarize(outputFp32, ref, cfg.numTokens, cfg.hiddenSize);
+            std::cout << "[" << cfg.name << "][repeat=" << repeat << "] median_cos=" << s.medianCosine
+                      << " mag_ratio=" << s.magRatio << " max_abs=" << s.maxAbs << std::endl;
+            EXPECT_GE(s.medianCosine, kMinCosine)
+                << "median cosine " << s.medianCosine << " below threshold " << kMinCosine << " for " << cfg.name;
+            EXPECT_GE(s.magRatio, kMinMagRatio)
+                << "magnitude ratio " << s.magRatio << " indicates a wholesale magnitude collapse for " << cfg.name;
+        }
     }
 }
 
