@@ -91,104 +91,31 @@ std::vector<int32_t> LLMInferenceRuntime::countPromptTokens(LLMGenerationRequest
     return counts;
 }
 
-namespace
-{
-bool needsCachedBlockDraftDDTreeHybridBindings(DeploymentConfig const& deployment)
-{
-    return deployment.specConfig.has_value() && isCachedBlockDraftMode(deployment.specDecodeMode())
-        && deployment.specConfig->draftingTopK > 1 && deployment.base.numLinearAttnLayers > 0;
-}
-
-void validateCachedBlockDraftTreeMetadataBindings(
-    DeploymentConfig const& deployment, EngineExecutor const& baseExecutor)
-{
-    if (!deployment.specConfig.has_value() || !isCachedBlockDraftMode(deployment.specDecodeMode()))
-    {
-        return;
-    }
-
-    char const* modeName = deployment.specDecodeMode() == SpecDecodeMode::kJetSpec ? "JetSpec" : "DFlash";
-    char const* treeBaseFlag
-        = deployment.specDecodeMode() == SpecDecodeMode::kJetSpec ? "--jetspec-tree-base" : "--dflash-tree-base";
-    char const* linearBaseFlag
-        = deployment.specDecodeMode() == SpecDecodeMode::kJetSpec ? "--jetspec-base" : "--dflash-base";
-
-    bool const hasTreeParentIds = baseExecutor.hasIOTensor(binding_names::kTreeParentIds);
-    bool const hasTreeDepths = baseExecutor.hasIOTensor(binding_names::kTreeDepths);
-    bool const hasTreeMetadata = hasTreeParentIds || hasTreeDepths;
-    bool const usesDDTree = deployment.specConfig->draftingTopK > 1;
-    if (hasTreeMetadata)
-    {
-        ELLM_CHECK(hasTreeParentIds && hasTreeDepths,
-            std::string(modeName) + " tree-base engine must expose both INT32 tree metadata bindings '"
-                + binding_names::kTreeParentIds + "' and '" + binding_names::kTreeDepths + "'.");
-        ELLM_CHECK(baseExecutor.getBindingDataType(binding_names::kTreeParentIds) == DataType::kINT32
-                && baseExecutor.getBindingDataType(binding_names::kTreeDepths) == DataType::kINT32,
-            std::string(modeName) + " tree-base engine tree metadata bindings must be INT32: '"
-                + binding_names::kTreeParentIds + "' and '" + binding_names::kTreeDepths + "'.");
-        ELLM_CHECK(usesDDTree,
-            std::string(modeName) + " base engine was exported with " + treeBaseFlag
-                + ", but runtime is configured for linear mode because specDraftTopK=1. "
-                  "Use --specDraftTopK > 1 for DDTree, or re-export the base model with "
-                + linearBaseFlag + ".");
-    }
-
-    if (!needsCachedBlockDraftDDTreeHybridBindings(deployment))
-    {
-        return;
-    }
-
-    ELLM_CHECK(hasTreeParentIds && hasTreeDepths,
-        std::string(modeName) + " DDTree hybrid base engine requires INT32 tree metadata bindings '"
-            + binding_names::kTreeParentIds + "' and '" + binding_names::kTreeDepths
-            + "'. Re-export the base model with " + treeBaseFlag + ", then rebuild spec_base.engine.");
-}
-
-void validateMtpTreeMetadataBindings(DeploymentConfig const& deployment, EngineExecutor const& baseExecutor)
-{
-    if (!deployment.specConfig.has_value() || deployment.specDecodeMode() != SpecDecodeMode::kMTP
-        || deployment.base.numLinearAttnLayers == 0)
-    {
-        return;
-    }
-
-    bool const hasTreeParentIds = baseExecutor.hasIOTensor(binding_names::kTreeParentIds);
-    bool const hasTreeDepths = baseExecutor.hasIOTensor(binding_names::kTreeDepths);
-    bool const usesDDTree = deployment.specConfig->draftingTopK > 1;
-    ELLM_CHECK(hasTreeParentIds == hasTreeDepths,
-        std::string("MTP tree-base engine must expose both INT32 tree metadata bindings '")
-            + binding_names::kTreeParentIds + "' and '" + binding_names::kTreeDepths + "'.");
-    if (hasTreeParentIds)
-    {
-        ELLM_CHECK(baseExecutor.getBindingDataType(binding_names::kTreeParentIds) == DataType::kINT32
-                && baseExecutor.getBindingDataType(binding_names::kTreeDepths) == DataType::kINT32,
-            std::string("MTP tree-base engine tree metadata bindings must be INT32: '") + binding_names::kTreeParentIds
-                + "' and '" + binding_names::kTreeDepths + "'.");
-    }
-    ELLM_CHECK(usesDDTree == hasTreeParentIds,
-        usesDDTree ? "Hybrid MTP DDTree requires a tree-base engine. Rebuild with --tree-base before using "
-                     "--specDraftTopK > 1."
-                   : "Hybrid MTP base engine was built with --tree-base, but runtime is configured for linear MTP. "
-                     "Use --specDraftTopK > 1, or rebuild without --tree-base.");
-}
-
-} // namespace
-
 LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
     std::unordered_map<std::string, std::string> const& loraWeightsMap, SpecDecodeDraftingConfig const& draftingConfig,
     cudaStream_t stream, ContextCacheConfig const& contextCacheConfig, std::string const& checkpointDir,
     std::string const& draftCheckpointDir)
 {
-    initializeCommon(engineDir, multimodalEngineDir, loraWeightsMap, draftingConfig, stream, contextCacheConfig,
-        checkpointDir, draftCheckpointDir);
+    initializeCommon(
+        ModelArtifacts::loadFromEngineDir(engineDir, draftingConfig, checkpointDir, draftCheckpointDir, stream),
+        engineDir, multimodalEngineDir, loraWeightsMap, draftingConfig, stream, contextCacheConfig);
 }
 
 LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
     std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream,
     ContextCacheConfig const& contextCacheConfig, std::string const& checkpointDir)
 {
-    initializeCommon(
-        engineDir, multimodalEngineDir, loraWeightsMap, std::nullopt, stream, contextCacheConfig, checkpointDir, "");
+    initializeCommon(ModelArtifacts::loadFromEngineDir(engineDir, std::nullopt, checkpointDir, "", stream), engineDir,
+        multimodalEngineDir, loraWeightsMap, std::nullopt, stream, contextCacheConfig);
+}
+
+LLMInferenceRuntime::LLMInferenceRuntime(ModelArtifacts&& artifacts, std::string const& engineDir,
+    std::string const& multimodalEngineDir, std::unordered_map<std::string, std::string> const& loraWeightsMap,
+    std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream,
+    ContextCacheConfig const& contextCacheConfig)
+{
+    initializeCommon(std::move(artifacts), engineDir, multimodalEngineDir, loraWeightsMap, draftingConfig, stream,
+        contextCacheConfig);
 }
 
 LLMInferenceRuntime::~LLMInferenceRuntime() noexcept
@@ -200,99 +127,42 @@ LLMInferenceRuntime::~LLMInferenceRuntime() noexcept
     }
 }
 
-void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::string const& multimodalEngineDir,
-    std::unordered_map<std::string, std::string> const& loraWeightsMap,
+void LLMInferenceRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string const& engineDir,
+    std::string const& multimodalEngineDir, std::unordered_map<std::string, std::string> const& loraWeightsMap,
     std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream,
-    ContextCacheConfig const& contextCacheConfig, std::string const& checkpointDir,
-    std::string const& draftCheckpointDir)
+    ContextCacheConfig const& contextCacheConfig)
 {
-    std::filesystem::path const engineDirPath{engineDir};
-    std::filesystem::path const baseConfigPath
-        = draftingConfig.has_value() ? engineDirPath / "base_config.json" : engineDirPath / "config.json";
-    mCheckpointDir = checkpointDir;
-    mDraftCheckpointDir = draftCheckpointDir;
+    mDeployment = std::move(artifacts.deployment);
+    mBaseExecutor = std::move(artifacts.baseExecutor);
+    mEmbedding = std::move(artifacts.embedding);
+    mTokenizer = std::move(artifacts.tokenizer);
+    mCheckpointDir = std::move(artifacts.checkpointDir);
+    mDraftCheckpointDir = std::move(artifacts.draftCheckpointDir);
+    ExternalWeightManager preparedWeights = std::move(artifacts.weights);
+    // Ownership of the draft engine and its weights is transferred to the selected decoder further down.
+    std::unique_ptr<EngineExecutor> draftExecutor = std::move(artifacts.draftExecutor);
+    ExternalWeightManager draftWeights = std::move(artifacts.draftWeights);
+    auto pleEmbedding = std::move(artifacts.pleEmbedding);
+    auto vocabMap = std::move(artifacts.vocabMap);
 
-    // Finish checkpoint reads and weight conversion before any engine can run.
-    ExternalWeightManager preparedWeights;
-    preparedWeights.load(engineDirPath, baseConfigPath, stream, mCheckpointDir);
-    if (auto embedding = preparedWeights.takeEmbedding())
-    {
-        mEmbedding.table = std::move(*embedding);
-    }
-    else
-    {
-        mEmbedding = loadEmbeddingTable(engineDirPath / "embedding.safetensors", stream);
-    }
-    auto pleEmbedding = preparedWeights.takePleEmbedding();
-
-    // -----------------------------------------------------------------------
-    // 3. Parse engine configurations and attach user drafting (bundle factory
-    //    performs cross-engine consistency and drafting-vs-capacity checks).
-    // -----------------------------------------------------------------------
-    std::optional<std::filesystem::path> const draftConfigPath = draftingConfig.has_value()
-        ? std::optional<std::filesystem::path>{engineDirPath / "draft_config.json"}
-        : std::nullopt;
-
-    mDeployment = createDeploymentConfig(baseConfigPath, draftConfigPath, draftingConfig);
-    if (draftingConfig.has_value() && mDeployment.specDecodeMode() == SpecDecodeMode::kMTP)
-    {
-        ELLM_CHECK(mDraftCheckpointDir.empty(),
-            "Native MTP draft weights are part of --checkpointDir; do not pass --draftCheckpointDir.");
-        mDraftCheckpointDir = mCheckpointDir;
-    }
     std::optional<ContextCacheDeploymentProfile> contextCacheDeploymentProfile;
     if (contextCacheConfig.enabled)
     {
         contextCacheDeploymentProfile = validateContextCacheDeployment(mDeployment);
     }
 
-    std::filesystem::path const baseEnginePath = draftingConfig.has_value()
-        ? engineDirPath / "spec_base.engine"
-        : (mDeployment.base.isDiffusionBackbone ? engineDirPath / "dllm.engine" : engineDirPath / "llm.engine");
-
     ELLM_CHECK(mDeployment.base.isDiffusionBackbone || mDeployment.base.numDeepstackFeatures <= 0
             || !multimodalEngineDir.empty(),
         "--multimodalEngineDir is required for VLM engine.");
 
     // -----------------------------------------------------------------------
-    // 3. Construct Runners (registries built internally from the parsed configs).
-    // -----------------------------------------------------------------------
-    try
-    {
-        std::optional<int32_t> const specDecodeBaseOutputHiddenDim = mDeployment.specConfig.has_value()
-            ? std::optional<int32_t>{mDeployment.specConfig->baseOutputHiddenDim}
-            : std::nullopt;
-        mBaseExecutor = EngineExecutor::createForLLM(baseEnginePath, mDeployment.base, specDecodeBaseOutputHiddenDim);
-    }
-    catch (std::exception const& e)
-    {
-        LOG_ERROR("Failed to initialize base EngineExecutor: %s", e.what());
-        throw std::runtime_error("Failed to initialize base EngineExecutor: " + std::string(e.what()));
-    }
-    LOG_INFO("Base EngineExecutor successfully loaded from %s.", baseEnginePath.c_str());
-
-    // -----------------------------------------------------------------------
-    // 4. Validate engine binding dtypes against the parsed configs.
-    // -----------------------------------------------------------------------
-    validateAgainstEngine(mDeployment.base, *mBaseExecutor, "base");
-    validateCachedBlockDraftTreeMetadataBindings(mDeployment, *mBaseExecutor);
-    validateMtpTreeMetadataBindings(mDeployment, *mBaseExecutor);
-
-    // Validate the draft engine ABI before its sidecar geometry is used to allocate
-    // physical cache resources. Ownership is transferred to the selected decoder.
-    std::unique_ptr<EngineExecutor> draftExecutor;
-    if (draftingConfig.has_value())
-    {
-        draftExecutor = decoder_utils::loadDraftEngine(engineDirPath, mDeployment);
-    }
-    // -----------------------------------------------------------------------
-    // 5. Set runtime batch size.
+    // 1. Set runtime batch size.
     // -----------------------------------------------------------------------
     mMaxRuntimeBatchSize = mDeployment.maxRuntimeBatchSize();
     LOG_INFO("Runtime batch size set to: %d (from engine bundle)", mMaxRuntimeBatchSize);
 
     // -----------------------------------------------------------------------
-    // 6. SharedResources + PipelineIO. PipelineIO is held via unique_ptr so
+    // 2. SharedResources + PipelineIO. PipelineIO is held via unique_ptr so
     //    its address is stable for the TensorMap pointers below (TensorMap
     //    stores non-owning Tensor* into PipelineIO members).
     // -----------------------------------------------------------------------
@@ -310,10 +180,9 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
         mPipelineIO = std::make_unique<PipelineIO>(PipelineIO::createForLLM(mDeployment.base, stream));
     }
     *mSharedResources->externalWeightManager = std::move(preparedWeights);
-    mSharedResources->externalWeightManager->validateAgainstEngine(*mBaseExecutor, "base");
 
     // -----------------------------------------------------------------------
-    // 7. Build base TensorMap (kvCacheIndex=0) and publish static external
+    // 3. Build base TensorMap (kvCacheIndex=0) and publish static external
     //    weight bindings. Speculative decoders add tree-mask / position IDs
     //    to this same map further down.
     // -----------------------------------------------------------------------
@@ -329,7 +198,7 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     mSharedResources->externalWeightManager->registerTensorMapEntries(mBaseTensorMap);
 
     // -----------------------------------------------------------------------
-    // 8. LoRA: register engine bindings and seed the base tensor map with
+    // 4. LoRA: register engine bindings and seed the base tensor map with
     //    dummy / active adapter tensors. Only the base engine carries LoRA
     //    bindings — draft does not.
     // -----------------------------------------------------------------------
@@ -340,7 +209,7 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     }
 
     // -----------------------------------------------------------------------
-    // 9. Preprocessors.
+    // 5. Preprocessors.
     // -----------------------------------------------------------------------
     mStepPreparer = std::make_unique<StepPreparer>(mDeployment.base);
     mEmbeddingPre = std::make_unique<EmbeddingPreprocessor>(mEmbedding, mDeployment.base);
@@ -350,8 +219,8 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     }
 
     // -----------------------------------------------------------------------
-    // 10. Allocate runtime-local tensors (sampling workspace, host pinned scratch,
-    //     batch-eviction mapping). Strategy-specific tensors are owned by strategies.
+    // 6. Allocate runtime-local tensors (sampling workspace, host pinned scratch,
+    //    batch-eviction mapping). Strategy-specific tensors are owned by strategies.
     // -----------------------------------------------------------------------
     int32_t const effectiveMaxProposalSize = hasDraft ? mDeployment.effectiveMaxDraftProposalSize() : 1;
     int32_t const effectiveDraftTopK = hasDraft ? draftingConfig->draftingTopK : 1;
@@ -453,56 +322,26 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     LOG_INFO("Runtime tensors successfully allocated.");
 
     // -----------------------------------------------------------------------
-    // 11. Load optional base model reduced-vocab mapping table.
+    // 7. Publish the reduced-vocab mapping table into the logit bias, which had
+    //    to be allocated first.
     // -----------------------------------------------------------------------
-    if (mDeployment.base.reducedVocabSize > 0)
+    if (vocabMap.has_value())
     {
-        LOG_INFO("Loading vocabulary mapping table for base model reduced vocab size: %d -> %d",
-            mDeployment.base.reducedVocabSize, mDeployment.base.vocabSize);
-        std::filesystem::path const vocabMapPath = std::filesystem::path(engineDir) / binding_names::kVocabMapFileName;
-
-        std::vector<rt::Tensor> vocabMapTensors;
-        ELLM_CHECK(safetensors::loadSafetensors(vocabMapPath, vocabMapTensors, stream),
-            "Failed to load " + std::string(binding_names::kVocabMapFileName) + " from model directory: " + engineDir);
-
-        check::check(vocabMapTensors.size() == 1,
-            std::string(binding_names::kVocabMapFileName) + " should contain exactly one tensor");
-        check::check(vocabMapTensors[0].getShape().getNumDims() == 1, "vocab_map tensor should be 1D");
-        check::check(vocabMapTensors[0].getShape()[0] == mDeployment.base.reducedVocabSize,
-            "vocab_map tensor length should match base model reduced vocab size");
-        check::check(vocabMapTensors[0].getDataType() == DataType::kINT32, "vocab_map tensor should be INT32");
-        mBaseVocabMappingTable = std::move(vocabMapTensors[0]);
+        mBaseVocabMappingTable = std::move(*vocabMap);
         setLogitBiasVocabMap(
             mLogitBias, mBaseVocabMappingTable, mDeployment.base.vocabSize, mDeployment.base.reducedVocabSize, stream);
-        LOG_INFO("Base model vocabulary mapping table successfully loaded.");
     }
 
     // -----------------------------------------------------------------------
-    // 12. Tokenizer.
-    // -----------------------------------------------------------------------
-    mTokenizer = std::make_unique<tokenizer::Tokenizer>();
-    LOG_INFO("Start loading tokenizer from model directory: %s", engineDir.c_str());
-    ELLM_CHECK(mTokenizer->loadFromHF(engineDir), "Failed to load tokenizer from model directory: " + engineDir);
-    LOG_INFO("Tokenizer successfully loaded from model directory: %s", engineDir.c_str());
-
-    // Set additional EOS token IDs from parsed config (e.g. Gemma4 has eos_token_id: [1, 106])
-    if (!mDeployment.base.eosTokenIds.empty())
-    {
-        std::vector<tokenizer::Rank> additionalEos(
-            mDeployment.base.eosTokenIds.begin(), mDeployment.base.eosTokenIds.end());
-        mTokenizer->setAdditionalEosIds(additionalEos);
-        LOG_INFO("Loaded %zu EOS token IDs from config", additionalEos.size());
-    }
-
-    // -----------------------------------------------------------------------
-    // 13. Decoding strategies.
+    // 8. Decoding strategies.
     // -----------------------------------------------------------------------
     buildDecodingRuntimeContext();
     mDecoderRegistry = std::make_unique<DecoderRegistry>(*mDecodingRuntimeContext,
-        DecoderRegistryInit{std::filesystem::path(engineDir), draftingConfig, std::move(draftExecutor), stream});
+        DecoderRegistryInit{std::filesystem::path(engineDir), draftingConfig, std::move(draftExecutor),
+            std::move(draftWeights), stream});
 
     // -----------------------------------------------------------------------
-    // 14. Optional multimodal runners.
+    // 9. Optional multimodal runners.
     // -----------------------------------------------------------------------
     if (!multimodalEngineDir.empty())
     {
@@ -518,7 +357,7 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
             }
             LOG_DEBUG("Attempting to load %s runner from %s", name.c_str(), dir.c_str());
             auto runner = MultimodalRunner::create(dir, mDeployment.base.maxSupportedBatchSize,
-                mDeployment.base.maxKVCacheCapacity, stream, checkpointDir);
+                mDeployment.base.maxKVCacheCapacity, stream, mCheckpointDir.string());
             LOG_INFO("%s runner successfully initialized", name.c_str());
             return runner;
         };
@@ -538,7 +377,7 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
         {
             std::string actionDir = multimodalEngineDir + "/action";
             LOG_INFO("Attempting to load Action runner from %s", actionDir.c_str());
-            mActionRunner = std::make_unique<Alpamayo1ActionRunner>(actionDir, checkpointDir, stream,
+            mActionRunner = std::make_unique<Alpamayo1ActionRunner>(actionDir, mCheckpointDir.string(), stream,
                 mSharedResources->cacheManagers[0]->getKVCacheManager().getConfig(),
                 mSharedResources->kvPageTables[0]->isIdentity());
             LOG_INFO("Alpamayo 1 action expert loaded.");
@@ -590,7 +429,7 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
     }
 
     // -----------------------------------------------------------------------
-    // 15. Shared execution context memory for all engines (base, optional
+    // 10. Shared execution context memory for all engines (base, optional
     //     draft, and optional vision/audio). All engines execute serially so
     //     they can share a single buffer sized to the max requirement.
     // -----------------------------------------------------------------------

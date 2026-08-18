@@ -195,7 +195,7 @@ FileNotFoundError: ONNX model not found
 
 **Build Executables Not Found:**
 ```bash
-Unit test executable not found: build/unitTest
+Unit test executable not found: build/unittests/unitTestRuntime
 ```
 → Ensure project is built with `cmake .. -DBUILD_UNIT_TESTS=ON`
 

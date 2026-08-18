@@ -33,9 +33,17 @@ using namespace trt_edgellm::rt;
 namespace
 {
 
+//! The plugin is built into the build tree's root while the test executables sit
+//! in a subdirectory, so deriving the path from /proc/self/exe would look in the
+//! wrong place. EDGELLM_PLUGIN_PATH is the linker's own answer, passed down by
+//! unittests/CMakeLists.txt; the executable-relative form stays as the fallback
+//! for a binary run outside that build.
 std::string const& pluginLibraryPath()
 {
     static std::string const path = [] {
+#ifdef EDGELLM_PLUGIN_PATH
+        return std::string{EDGELLM_PLUGIN_PATH};
+#else
         std::array<char, PATH_MAX> executablePath{};
         ssize_t const size = readlink("/proc/self/exe", executablePath.data(), executablePath.size() - 1);
         if (size <= 0)
@@ -50,6 +58,7 @@ std::string const& pluginLibraryPath()
             return std::string{"./libNvInfer_edgellm_plugin.so"};
         }
         return executable.substr(0, separator + 1) + "libNvInfer_edgellm_plugin.so";
+#endif
     }();
     return path;
 }

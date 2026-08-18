@@ -39,7 +39,7 @@
 #include "kernels/decodeAttentionKernels/decoderXQARunner.h"
 #include "references.h"
 #include "testUtils.h"
-#include "unittests/xqaJitTestUtils.h"
+#include "xqaJitTestUtils.h"
 
 using namespace nvinfer1;
 using namespace trt_edgellm;

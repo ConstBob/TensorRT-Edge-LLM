@@ -64,28 +64,28 @@ DecoderRegistry::DecoderRegistry(DecodingRuntimeContext& runtime, DecoderRegistr
         switch (runtime.deployment.specDecodeMode())
         {
         case SpecDecodeMode::kMTP:
-            mSpeculativeDecoder = std::make_unique<MTPDecoder>(
-                runtime, init.engineDir, *init.draftingConfig, std::move(init.draftExecutor), init.stream);
+            mSpeculativeDecoder = std::make_unique<MTPDecoder>(runtime, *init.draftingConfig,
+                std::move(init.draftExecutor), std::move(init.draftWeights), init.stream);
             break;
         case SpecDecodeMode::kEAGLE:
-            mSpeculativeDecoder = std::make_unique<EagleDecoder>(
-                runtime, init.engineDir, *init.draftingConfig, std::move(init.draftExecutor), init.stream);
+            mSpeculativeDecoder = std::make_unique<EagleDecoder>(runtime, init.engineDir, *init.draftingConfig,
+                std::move(init.draftExecutor), std::move(init.draftWeights), init.stream);
             break;
         case SpecDecodeMode::kDFlash:
         case SpecDecodeMode::kJetSpec:
         {
             auto blockDraftConfig = dflash_utils::makeCachedBlockDraftRuntimeConfig(runtime.deployment);
-            mSpeculativeDecoder = std::make_unique<DFlashDecoder>(
-                runtime, init.engineDir, std::move(blockDraftConfig), std::move(init.draftExecutor), init.stream);
+            mSpeculativeDecoder = std::make_unique<DFlashDecoder>(runtime, init.engineDir, std::move(blockDraftConfig),
+                std::move(init.draftExecutor), std::move(init.draftWeights), init.stream);
             break;
         }
         case SpecDecodeMode::kGemma4MTP:
-            mSpeculativeDecoder = std::make_unique<Gemma4MTPDecoder>(
-                runtime, init.engineDir, *init.draftingConfig, std::move(init.draftExecutor), init.stream);
+            mSpeculativeDecoder = std::make_unique<Gemma4MTPDecoder>(runtime, *init.draftingConfig,
+                std::move(init.draftExecutor), std::move(init.draftWeights), init.stream);
             break;
         case SpecDecodeMode::kDSpark:
-            mSpeculativeDecoder = std::make_unique<DSparkDecoder>(
-                runtime, init.engineDir, *init.draftingConfig, std::move(init.draftExecutor), init.stream);
+            mSpeculativeDecoder = std::make_unique<DSparkDecoder>(runtime, init.engineDir, *init.draftingConfig,
+                std::move(init.draftExecutor), std::move(init.draftWeights), init.stream);
             break;
         case SpecDecodeMode::kNONE:
             throw std::runtime_error("SpecDecode drafting config was set but no mode is active.");

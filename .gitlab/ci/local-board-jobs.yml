@@ -44,7 +44,11 @@ l0_local_spark_build_and_test:
         --output-dir ../ci-artifacts/lib-size
         || echo "WARNING - library size report failed"
     - echo "Build completed. Running unit tests"
-    - ./unitTest
+    # Each group is its own executable; ctest runs them and reports per-group.
+    # Serial on purpose: these boards have far less device memory than an x86
+    # dev box, and concurrent groups would contend for it. Locally, add
+    # --parallel $(nproc).
+    - ctest --output-on-failure
     - echo "Pipeline end time:$(date)"
   extends:
     - .ci_internal_submodules

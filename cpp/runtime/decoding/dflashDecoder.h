@@ -36,7 +36,7 @@ class DFlashDecoder final : public DecodingStrategy
 public:
     DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::path const& engineDir,
         dflash_utils::CachedBlockDraftRuntimeConfig blockDraftConfig, std::unique_ptr<EngineExecutor> draftExecutor,
-        cudaStream_t stream);
+        ExternalWeightManager draftWeights, cudaStream_t stream);
 
     DecodingStrategyKind kind() const noexcept override
     {
