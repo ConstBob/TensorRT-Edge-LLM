@@ -23,6 +23,7 @@ pipeline, so downstream engine build and inference tests can consume it.
 import json
 import os
 import shutil
+import sys
 import tempfile
 
 import pytest
@@ -201,7 +202,7 @@ def test_checkpoint_export(test_param: str, test_logger,
         # PYTHONPATH must include repository root so the source package imports.
         # The CI job sets this via PYTHONPATH=$LLM_SDK_DIR:$PYTHONPATH.
         export_cmd = [
-            "python3",
+            sys.executable,
             "-m",
             "tensorrt_edgellm.scripts.export",
             torch_dir,
