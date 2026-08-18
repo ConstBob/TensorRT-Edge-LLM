@@ -160,22 +160,76 @@ def _audit_device_images(path: Path, gpu_sm: int) -> None:
     raise RuntimeError(f"{path} contains no listed SM{gpu_sm} device image.")
 
 
-def _audit_dependency_roots(needed: Set[str], roots: Sequence[Path]) -> None:
-    """Require every DT_NEEDED name to exist in an explicit target root."""
-    available: Set[str] = set()
+_MULTIARCH_TRIPLES = {
+    "aarch64": "aarch64-linux-gnu",
+    "x86_64": "x86_64-linux-gnu",
+}
+_CUDA_TARGETS = {
+    "aarch64": ("aarch64-linux", "sbsa-linux"),
+    "x86_64": ("x86_64-linux", ),
+}
+
+
+def _target_library_directories(root: Path, cpu_arch: str) -> Tuple[Path, ...]:
+    """Return bounded target library directories below one SDK root."""
+    try:
+        multiarch = _MULTIARCH_TRIPLES[cpu_arch]
+        cuda_targets = _CUDA_TARGETS[cpu_arch]
+    except KeyError as error:
+        raise RuntimeError(
+            f"Unsupported dependency-root architecture {cpu_arch!r}."
+        ) from error
+    relative = (
+        Path("."),
+        Path("lib"),
+        Path("lib64"),
+        Path("lib") / multiarch,
+        Path("usr/lib"),
+        Path("usr/lib64"),
+        Path("usr/lib") / multiarch,
+        Path("usr/lib") / multiarch / "nvidia",
+        Path("usr/lib") / multiarch / "nvidia/current",
+        Path("usr/lib") / multiarch / "tegra",
+        Path("usr/lib") / multiarch / "tegra-egl",
+        Path("usr") / multiarch / "lib",
+        Path("usr") / multiarch / "lib64",
+        Path("usr/local/cuda/lib64"),
+        Path("targets") / multiarch / "lib",
+    )
+    candidates = [root / value for value in relative]
+    for cuda_target in cuda_targets:
+        candidates.append(root / "usr/local/cuda/targets" / cuda_target /
+                          "lib")
+        candidates.append(root / "targets" / cuda_target / "lib")
+    candidates.extend(root.glob("usr/local/cuda*/lib64"))
+    for cuda_target in cuda_targets:
+        candidates.extend(
+            root.glob(f"usr/local/cuda*/targets/{cuda_target}/lib"))
+    return tuple(dict.fromkeys(path for path in candidates if path.is_dir()))
+
+
+def _audit_dependency_roots(needed: Set[str], roots: Sequence[Path],
+                            cpu_arch: str) -> None:
+    """Require every DT_NEEDED name in bounded target library directories."""
+    directories = []
     for root in roots:
         resolved = root.resolve(strict=True)
         if not resolved.is_dir():
             raise RuntimeError(
                 f"Dependency root is not a directory: {resolved}.")
-        for path in resolved.rglob("*"):
-            if ".so" in path.name and (path.is_file() or path.is_symlink()):
-                available.add(path.name)
+        directories.extend(_target_library_directories(resolved, cpu_arch))
+    directories = list(dict.fromkeys(directories))
+    available = {
+        name
+        for name in needed
+        if any((directory / name).is_file() or (directory / name).is_symlink()
+               for directory in directories)
+    }
     missing = sorted(needed - available)
     if missing:
         raise RuntimeError(
             "Target dependency roots do not provide DT_NEEDED entries: "
-            f"{missing}.")
+            f"{missing}; searched={[str(path) for path in directories]}.")
 
 
 def _validate_payload_metadata(
@@ -420,7 +474,7 @@ def _audit_binary_dependencies(payload: Mapping[str, Any], extension: Path,
     if host_arch != payload["cpu_arch"]:
         if dependency_roots:
             _audit_dependency_roots(needed - platform_provided,
-                                    dependency_roots)
+                                    dependency_roots, str(payload["cpu_arch"]))
     else:
         environment = None
         with tempfile.TemporaryDirectory(

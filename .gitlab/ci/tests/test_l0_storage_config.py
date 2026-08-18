@@ -37,8 +37,6 @@ INHERITABLE_CONFIGS = TEMPLATES
 
 STORAGE_EXEMPT_JOBS = {
     "quantization_sanity",
-    "l0_cross_build_jp6_cuda12.6",
-    "l0_cross_build_jp6_trt10.3_cuda12.6",
     "l0_cross_build_d6l_cuda11.4",
     "l0_cross_build_d7l_cuda12.8",
 }

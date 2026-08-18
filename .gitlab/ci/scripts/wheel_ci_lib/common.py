@@ -102,7 +102,7 @@ def toolchain_python(python: str, python_abi: str, profile: str) -> str:
 
 
 def compiler_cache() -> typing.Optional[str]:
-    """Configure a job-local ccache when the build host provides it."""
+    """Configure a CI-restored ccache when the build host provides it."""
     executable = shutil.which("ccache")
     if executable is None:
         print(
@@ -113,6 +113,9 @@ def compiler_cache() -> typing.Optional[str]:
     cache_dir.mkdir(parents=True, exist_ok=True)
     os.environ["CCACHE_DIR"] = str(cache_dir)
     os.environ["CCACHE_BASEDIR"] = str(config.REPO_ROOT)
+    os.environ["CCACHE_COMPILERCHECK"] = "content"
+    os.environ["CCACHE_COMPRESS"] = "true"
+    config.run_checked([executable, "--max-size", "2G"])
     config.run_checked([executable, "--zero-stats"])
     compilers = tuple(path for name in ("cc", "c++")
                       if (path := shutil.which(name)) is not None)

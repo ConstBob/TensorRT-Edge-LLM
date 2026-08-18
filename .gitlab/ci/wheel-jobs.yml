@@ -81,6 +81,10 @@ wheel_python_base:
       artifacts: true
     - job: build_cutedsl_docker_matrix
       artifacts: true
+  cache:
+    policy: pull-push
+    key: "wheel-compiler-$BUILD_GROUP"
+    paths: [venv/wheel-compiler-cache/]
   script:
     - sh .gitlab/ci/scripts/wheel_ci.sh ci-build-payload
   timeout: 2h
