@@ -107,7 +107,8 @@ class BuildArgs:
         Kinds are on by default, so an incompatible build setting narrows the
         policy and logs it. Explicitly requested kinds raise instead.
         """
-        strict = bool(self.externalize_weights)
+        explicit = bool(self.externalize_weights)
+        strict = explicit
         requested = WeightPolicy.from_request(self.externalize_weights)
         policy = requested
         spec = contracts.component_spec(self.resolved_component)
@@ -117,9 +118,23 @@ class BuildArgs:
         # unsupported kind here so one command can still build every component.
         policy = policy.without(unsupported)
         if self.tp_size > 1:
-            # The runtime reads whole checkpoint tensors, not rank shards.
-            policy = policy.without(weight_policy.EXTERNAL_WEIGHT_KINDS,
-                                    strict=strict)
+            tp_strict = (explicit and weight_policy.EXTERNAL_WEIGHT_ALL
+                         not in self.externalize_weights)
+            # Small FP16 normalization tensors save negligible plan space but
+            # materially increase the per-rank TensorRT input set. Keep them
+            # baked for the default TP policy; an explicit request still wins.
+            if not explicit:
+                policy = policy.without((weight_policy.EXTERNAL_WEIGHT_FP16, ))
+            # TP load-time sharding covers identity FP16, embeddings, the LM
+            # head, and NVFP4 weights consumed by the fused TP plugin. Dense
+            # NVFP4 projections lowered through TensorRT-native GEMMs remain
+            # rank-local engine constants.
+            unsupported_tp = (
+                weight_policy.EXTERNAL_WEIGHT_INT4_FFN,
+                weight_policy.EXTERNAL_WEIGHT_INT4_MOE,
+                weight_policy.EXTERNAL_WEIGHT_NVFP4_MOE,
+            )
+            policy = policy.without(unsupported_tp, strict=tp_strict)
         if self.fp8_embedding:
             policy = policy.without(
                 (weight_policy.EXTERNAL_WEIGHT_EMBEDDING, ), strict=strict)
@@ -373,7 +388,8 @@ def build_engine(args: BuildArgs,
         raise RuntimeError("build_serialized_network returned None")
 
     spec = contracts.component_spec(args.resolved_component)
-    engine_path = spec.output_path(args.engine_dir, args.resolved_spec_role)
+    engine_path = spec.output_path(args.engine_dir, args.resolved_spec_role,
+                                   args.tp_size, args.tp_rank)
     os.makedirs(os.path.dirname(engine_path), exist_ok=True)
     with open(engine_path, "wb") as f:
         f.write(bytes(serialized))  # IHostMemory -> buffer

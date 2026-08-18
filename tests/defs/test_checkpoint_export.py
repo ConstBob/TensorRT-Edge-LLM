@@ -934,7 +934,7 @@ def test_llm_loader_tp_export(test_param: str, test_logger,
     """Export per-rank ONNX for TP=2 via tensorrt_edgellm.scripts.export --tp-size 2.
 
     Validates:
-      - Per-rank files exist: model_tp2_rank{0,1}.onnx and matching .data
+      - Per-rank files exist: model_world2_rank{0,1}.onnx and matching .data
       - Each rank's external-data file has distinct content (regression
         guard for the per-rank filename collision in onnx/export.py
         _fix_initializer_dtypes — without the fix both ranks share
@@ -982,7 +982,7 @@ def test_llm_loader_tp_export(test_param: str, test_logger,
     # Validate per-rank files exist and external-data files are distinct.
     rank_files = []
     for rank in (0, 1):
-        onnx_path = os.path.join(llm_onnx_dir, f"model_tp2_rank{rank}.onnx")
+        onnx_path = os.path.join(llm_onnx_dir, f"model_world2_rank{rank}.onnx")
         data_path = onnx_path + ".data"
         if not os.path.exists(onnx_path):
             pytest.fail(f"Missing per-rank ONNX: {onnx_path}")

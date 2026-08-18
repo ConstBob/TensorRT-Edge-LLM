@@ -21,6 +21,9 @@
 #include "common/trtUtils.h"
 #include "common/utf8.h"
 #include "memoryMonitor.h"
+// {$edge-llm-internal-release begin}
+#include "kernels/multiDeviceKernels/shmAllReduce.h"
+// {$edge-llm-internal-release end}
 #include "multimodal/qwen3_omni/code2WavRunner.h"
 #include "profileFormatter.h"
 #include "profiling/metrics.h"
@@ -30,11 +33,13 @@
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "runtime/multiDevice/ncclCollectiveBackend.h"
 #include "runtime/qwen3OmniTTSRuntime.h"
 #include "runtime/streaming.h"
 #include "tokenizer/tokenizer.h"
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -42,6 +47,8 @@
 #include <iomanip>
 #include <iostream>
 #include <nlohmann/json.hpp>
+#include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -50,6 +57,10 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#if defined(EDGELLM_ENABLE_MULTI_DEVICE_MPI)
+#include <mpi.h>
+#endif
 
 using namespace trt_edgellm;
 using Json = nlohmann::json;
@@ -90,11 +101,15 @@ enum LLMInferenceOptionId : int
     CONTEXT_CACHE_PARTIAL_KV_SNAPSHOT_POOL_BYTES = 930,
     CHECKPOINT_DIR = 931,
     DRAFT_CHECKPOINT_DIR = 932,
-    VISUAL_PRUNE = 933,
-    DART_REDUCTION_RATIO = 934,
-    DART_PIVOT_IMAGE_TOKENS = 935,
-    DART_PIVOT_TEXT_TOKENS = 936,
-    VISUAL_PRUNE_ALGO = 937
+    TP_SIZE = 933,
+    // {$edge-llm-internal-release begin}
+    DISABLE_SHM = 934,
+    // {$edge-llm-internal-release end}
+    VISUAL_PRUNE = 935,
+    DART_REDUCTION_RATIO = 936,
+    DART_PIVOT_IMAGE_TOKENS = 937,
+    DART_PIVOT_TEXT_TOKENS = 938,
+    VISUAL_PRUNE_ALGO = 939
 };
 
 // Struct to hold speculative decoding arguments (used by both EAGLE and MTP)
@@ -161,7 +176,6 @@ struct LLMInferenceArgs
     float talkerRepetitionPenalty{1.05f};
 
     // Visual-token pruning (embedding-level, VLM prefill only; disabled by default).
-    // Selection algorithm defaults to "dart"; see --visualPruneAlgo.
     rt::VisualPrunerConfig visualPrunerConfig;
 
     // Thinker-Talker streaming mode (single CUDA stream interleaved).
@@ -172,6 +186,11 @@ struct LLMInferenceArgs
     bool enableThinkerTalkerStreaming{false};
     int32_t codecChunkFrames{10};      //!< Vocode every N Talker frames during streaming (0 = disabled)
     int32_t talkerPrefillThreshold{4}; //!< Start Talker prefill after this many Thinker assistant tokens
+
+    int32_t tpSize{1};
+    // {$edge-llm-internal-release begin}
+    bool disableShm{false};
+    // {$edge-llm-internal-release end}
 };
 
 namespace
@@ -317,13 +336,17 @@ void printUsage(char const* programName)
               << " [--help] [--engineDir=<path to engine directory>] [--multimodalEngineDir=<path to multimodal engine "
                  "directory>] [--inputFile=<path to input file>] [--outputFile=<path to output file>] "
                  "[--dumpProfile] [--profileOutputFile=<path to profile output file>] [--warmup=<number>] [--debug] "
-                 "[--dumpOutput] [--batchSize=<number>] [--maxGenerateLength=<number>] [--specDecode] "
-                 "[--specDraftTopK=<number>] [--specDraftStep=<number>] "
+                 "[--dumpOutput] [--batchSize=<number>] [--maxGenerateLength=<number>] "
+                 "[--tpSize=<number>]";
+    // {$edge-llm-internal-release begin}
+    std::cerr << " [--disableShm]";
+    // {$edge-llm-internal-release end}
+    std::cerr << " [--specDecode] [--specDraftTopK=<number>] [--specDraftStep=<number>] "
                  "[--specVerifySize=<number>] [--dflashBlockSize=<number>|--jetspecBlockSize=<number>] "
                  "[--dsparkScheduler=off|threshold|sps] "
                  "[--dsparkConfidenceThreshold=<float>] "
                  "[--dsparkMinProposalLen=<number>] [--dsparkMaxProposalLen=<number>] "
-                 "[--visualPrune] [--dartReductionRatio=<float>] "
+                 "[--visualPrune] [--visualPruneAlgo=<name>] [--dartReductionRatio=<float>] "
                  "[--dartPivotImageTokens=<number>] [--dartPivotTextTokens=<number>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
@@ -384,9 +407,7 @@ void printUsage(char const* programName)
               << " --maxKVPoolPages" << std::endl;
     std::cerr << "\nVisual-Token Pruning Options:" << std::endl;
     std::cerr << "  --visualPrune             Enable visual-token pruning (mRoPE VLM prefill, batch 1)" << std::endl;
-    std::cerr << "  --visualPruneAlgo         Prune selection algorithm (default: dart); custom algorithms"
-              << std::endl;
-    std::cerr << "                            can be added via rt::registerVisualPruner()" << std::endl;
+    std::cerr << "  --visualPruneAlgo         Prune selection algorithm (default: dart)" << std::endl;
     std::cerr << "  --dartReductionRatio      Fraction of visual tokens to remove, in (0, 1) (default: 0.25)"
               << std::endl;
     std::cerr << "  --dartPivotImageTokens    Number of image pivot tokens for DART selection (default: 4)"
@@ -453,6 +474,10 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"code2wavEngineDir", required_argument, 0, LLMInferenceOptionId::CODE2WAV_ENGINE_DIR},
         {"outputAudioDir", required_argument, 0, LLMInferenceOptionId::OUTPUT_AUDIO_DIR},
         {"enableThinkerTalkerStreaming", no_argument, 0, LLMInferenceOptionId::ENABLE_THINKER_TALKER_STREAMING},
+        {"tpSize", required_argument, 0, LLMInferenceOptionId::TP_SIZE},
+        // {$edge-llm-internal-release begin}
+        {"disableShm", no_argument, 0, LLMInferenceOptionId::DISABLE_SHM},
+        // {$edge-llm-internal-release end}
         {"dsparkScheduler", required_argument, 0, LLMInferenceOptionId::DSPARK_SCHEDULER},
         {"dsparkConfidenceThreshold", required_argument, 0, LLMInferenceOptionId::DSPARK_CONFIDENCE_THRESHOLD},
         {"dsparkMinProposalLen", required_argument, 0, LLMInferenceOptionId::DSPARK_MIN_PROPOSAL_LEN},
@@ -764,6 +789,25 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
+        case LLMInferenceOptionId::TP_SIZE:
+            try
+            {
+                args.tpSize = std::stoi(optarg);
+                if (args.tpSize <= 0)
+                {
+                    LOG_ERROR("Invalid tpSize value: %s (must be positive)", optarg);
+                    return false;
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Invalid tpSize value: %s", optarg);
+                return false;
+            }
+            break;
+        // {$edge-llm-internal-release begin}
+        case LLMInferenceOptionId::DISABLE_SHM: args.disableShm = true; break;
+        // {$edge-llm-internal-release end}
         default: return false;
         }
     }
@@ -811,7 +855,16 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
     {
         LOG_INFO("Warmup runs: %d", args.warmup);
     }
-
+    if (args.tpSize > 1)
+    {
+        LOG_INFO("Tensor parallel launch requested: tpSize=%d", args.tpSize);
+    }
+    // {$edge-llm-internal-release begin}
+    if (args.disableShm)
+    {
+        LOG_INFO("Threaded parallel SHM AllReduce registration disabled");
+    }
+    // {$edge-llm-internal-release end}
     if (args.specDecodeArgs.enabled)
     {
         LOG_INFO("Speculative decoding enabled");
@@ -925,32 +978,512 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
     return result;
 }
 
+#if defined(EDGELLM_ENABLE_MULTI_DEVICE)
+namespace
+{
+
+#if defined(EDGELLM_ENABLE_MULTI_DEVICE_MPI)
+[[noreturn]] void abortMpiWorld(int32_t processRank, int32_t worldSize, char const* phase, char const* detail)
+{
+    LOG_ERROR("[Rank %d/%d] Fatal %s failure: %s. Aborting the MPI world.", processRank, worldSize, phase, detail);
+    int32_t const abortResult = MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+    if (abortResult != MPI_SUCCESS)
+    {
+        LOG_ERROR("[Rank %d/%d] MPI_Abort failed with error %d.", processRank, worldSize, abortResult);
+    }
+    std::abort();
+}
+#endif
+
+bool allProcessesSucceeded(bool localOk)
+{
+#if defined(EDGELLM_ENABLE_MULTI_DEVICE_MPI)
+    int32_t const localStatus = localOk ? 1 : 0;
+    int32_t globalStatus = 0;
+    MPI_Allreduce(&localStatus, &globalStatus, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    return globalStatus != 0;
+#else
+    return localOk;
+#endif
+}
+
+std::vector<RankMemorySummary> collectRankMemorySummaries(
+    MemoryMonitor const& memoryMonitor, rt::ParallelLaunchMode launchMode, int32_t tpSize, int32_t processRank)
+{
+#if defined(EDGELLM_ENABLE_MULTI_DEVICE_MPI)
+    if (launchMode != rt::ParallelLaunchMode::kMpi || tpSize <= 1)
+    {
+        return {};
+    }
+
+    struct RankMemorySample
+    {
+        int32_t rank{0};
+        int32_t device{0};
+        size_t peakGpuMemoryBytes{0};
+        size_t peakCpuMemoryBytes{0};
+    };
+
+    int32_t device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    RankMemorySample localSample{
+        processRank, device, memoryMonitor.getPeakGpuMemory(), memoryMonitor.getPeakCpuMemory()};
+
+    std::vector<RankMemorySample> rankSamples;
+    if (processRank == 0)
+    {
+        rankSamples.resize(static_cast<size_t>(tpSize));
+    }
+    void* receiveBuffer = processRank == 0 ? static_cast<void*>(rankSamples.data()) : nullptr;
+    MPI_Gather(&localSample, static_cast<int32_t>(sizeof(RankMemorySample)), MPI_BYTE, receiveBuffer,
+        static_cast<int32_t>(sizeof(RankMemorySample)), MPI_BYTE, 0, MPI_COMM_WORLD);
+
+    if (processRank != 0)
+    {
+        return {};
+    }
+
+    std::vector<RankMemorySummary> rankMemory;
+    rankMemory.reserve(rankSamples.size());
+    for (RankMemorySample const& sample : rankSamples)
+    {
+        rankMemory.push_back(
+            RankMemorySummary{sample.rank, sample.device, sample.peakGpuMemoryBytes, sample.peakCpuMemoryBytes});
+    }
+    return rankMemory;
+#else
+    (void) memoryMonitor;
+    (void) launchMode;
+    (void) tpSize;
+    (void) processRank;
+    return {};
+#endif
+}
+
+#if defined(EDGELLM_ENABLE_MULTI_DEVICE_MPI)
+std::vector<rt::ParallelBackendHandles> createMpiBackendHandles(int32_t tpSize, int32_t tpRank)
+{
+    std::vector<rt::ParallelBackendHandles> backendGroups;
+    if (tpSize <= 1)
+    {
+        return backendGroups;
+    }
+
+    try
+    {
+        rt::NcclUniqueId uniqueId{};
+        if (tpRank == 0)
+        {
+            rt::NcclCollectiveBackend::getUniqueId(uniqueId);
+        }
+        if (MPI_Bcast(&uniqueId, static_cast<int32_t>(sizeof(rt::NcclUniqueId)), MPI_BYTE, 0, MPI_COMM_WORLD)
+            != MPI_SUCCESS)
+        {
+            abortMpiWorld(tpRank, tpSize, "NCCL bootstrap", "MPI failed to broadcast the NCCL unique ID");
+        }
+
+        void* ncclComm = nullptr;
+        rt::NcclCollectiveBackend::initRank(&ncclComm, tpSize, uniqueId, tpRank);
+
+        std::vector<void*> tensorHandles(static_cast<size_t>(tpSize), nullptr);
+        tensorHandles[static_cast<size_t>(tpRank)] = ncclComm;
+        backendGroups.push_back(rt::ParallelBackendHandles{rt::ParallelType::kTensor, std::move(tensorHandles), true});
+    }
+    catch (std::exception const& e)
+    {
+        abortMpiWorld(tpRank, tpSize, "NCCL bootstrap", e.what());
+    }
+    catch (...)
+    {
+        abortMpiWorld(tpRank, tpSize, "NCCL bootstrap", "unknown exception");
+    }
+    return backendGroups;
+}
+#endif
+
+int runParallelInference(LLMInferenceArgs const& args,
+    std::unordered_map<std::string, std::string> const& loraWeightsMap,
+    std::vector<rt::LLMGenerationRequest>& batchedRequests, rt::ParallelLaunchMode launchMode, int32_t processRank,
+    int32_t processDevice, std::vector<rt::ParallelBackendHandles> backendHandles)
+{
+    if (args.enableAudioOutput || args.enableThinkerTalkerStreaming)
+    {
+        LOG_ERROR("Parallel inference does not support Qwen3-Omni audio output yet.");
+        return EXIT_FAILURE;
+    }
+    if (args.specDecodeArgs.enabled)
+    {
+        LOG_ERROR("Tensor-parallel speculative decoding is not supported; omit --specDecode or run with --tpSize 1.");
+        return EXIT_FAILURE;
+    }
+    if (args.contextCacheConfig.enabled)
+    {
+        LOG_ERROR(
+            "Tensor-parallel context reuse is not supported yet; omit --enableContextReuse or run with --tpSize 1.");
+        return EXIT_FAILURE;
+    }
+
+    rt::ParallelConfig parallelConfig{};
+    parallelConfig.tensorParallelSize = args.tpSize;
+    parallelConfig.launchMode = launchMode;
+    // {$edge-llm-internal-release begin}
+    parallelConfig.shmAllReduceConfig.enableShmAllReduce = !args.disableShm;
+    // {$edge-llm-internal-release end}
+
+    MemoryMonitor memoryMonitor;
+    if (args.dumpProfile)
+    {
+        memoryMonitor.start();
+    }
+
+    std::unique_ptr<rt::LLMInferenceRuntime> runtime;
+    try
+    {
+        rt::LLMInferenceRuntime::ParallelExecutionConfig runtimeConfig{};
+        runtimeConfig.parallelConfig = parallelConfig;
+        runtimeConfig.checkpointDir = args.checkpointDir;
+        runtimeConfig.draftCheckpointDir = args.draftCheckpointDir;
+        if (launchMode == rt::ParallelLaunchMode::kMpi)
+        {
+            runtimeConfig.localRanks = {processRank};
+            runtimeConfig.localRankDevices.emplace(processRank, processDevice);
+            runtimeConfig.backendHandles = std::move(backendHandles);
+        }
+        runtime = std::make_unique<rt::LLMInferenceRuntime>(
+            args.engineDir, args.multimodalEngineDir, loraWeightsMap, std::move(runtimeConfig));
+        if (args.visualPrunerConfig.enabled)
+        {
+            runtime->setVisualPrunerConfig(args.visualPrunerConfig);
+        }
+        bool const captureOk = allProcessesSucceeded(runtime->captureDecodingCUDAGraph(nullptr));
+        if (!captureOk)
+        {
+            LOG_WARNING("Failed to capture CUDA graph for one or more parallel ranks; using normal execution.");
+        }
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("Failed to initialize parallel execution: %s", e.what());
+#if defined(EDGELLM_ENABLE_MULTI_DEVICE_MPI)
+        if (launchMode == rt::ParallelLaunchMode::kMpi)
+        {
+            abortMpiWorld(processRank, args.tpSize, "parallel runtime initialization", e.what());
+        }
+#endif
+        return EXIT_FAILURE;
+    }
+
+    bool const isOutputRank = runtime->ownsGlobalRank(0);
+    for (int32_t warmupRun = 0; warmupRun < args.warmup; ++warmupRun)
+    {
+        rt::LLMGenerationResponse warmupResponse;
+        if (!allProcessesSucceeded(runtime->handleRequest(batchedRequests.front(), warmupResponse, nullptr)))
+        {
+            LOG_ERROR("Parallel warmup run %d/%d failed.", warmupRun + 1, args.warmup);
+            return EXIT_FAILURE;
+        }
+    }
+
+    nlohmann::json outputData;
+    if (isOutputRank)
+    {
+        outputData["input_file"] = args.inputFile;
+        outputData["tp_size"] = args.tpSize;
+        outputData["launch_mode"] = rt::parallelLaunchModeName(launchMode);
+        outputData["responses"] = nlohmann::json::array();
+    }
+
+    size_t failedCount = 0;
+    int64_t totalGeneratedTokens = 0;
+    auto const benchmarkStart = std::chrono::high_resolution_clock::now();
+
+    for (size_t requestIdx = 0; requestIdx < batchedRequests.size(); ++requestIdx)
+    {
+        setProfilingEnabled(args.dumpProfile);
+        rt::LLMGenerationResponse response;
+        bool const requestOk
+            = allProcessesSucceeded(runtime->handleRequest(batchedRequests[requestIdx], response, nullptr));
+        if (!requestOk)
+        {
+            ++failedCount;
+            LOG_ERROR("Parallel request %zu failed.", requestIdx);
+            continue;
+        }
+        if (!isOutputRank)
+        {
+            continue;
+        }
+
+        rt::LLMGenerationRequest const& rank0Request = batchedRequests[requestIdx];
+        for (size_t batchIdx = 0; batchIdx < batchedRequests[requestIdx].requests.size(); ++batchIdx)
+        {
+            nlohmann::json responseJson;
+            bool const hasOutputText = requestOk && batchIdx < response.outputTexts.size();
+            std::string const outputText = hasOutputText ? response.outputTexts[batchIdx] : "Request failed";
+            auto const* formattedRequest = batchIdx < rank0Request.formattedRequests.size()
+                ? &rank0Request.formattedRequests[batchIdx]
+                : nullptr;
+
+            responseJson["output_text"] = sanitizeUtf8ForJson(outputText);
+            responseJson["request_idx"] = requestIdx;
+            responseJson["batch_idx"] = batchIdx;
+            nlohmann::json messagesJson = nlohmann::json::array();
+            for (auto const& msg : batchedRequests[requestIdx].requests[batchIdx].messages)
+            {
+                nlohmann::json msgJson;
+                msgJson["role"] = msg.role;
+                msgJson["content"] = nlohmann::json::array();
+                for (auto const& content : msg.contents)
+                {
+                    nlohmann::json contentJson;
+                    contentJson["type"] = content.type;
+                    if (content.type == "text")
+                    {
+                        contentJson["text"] = content.content;
+                    }
+                    else if (content.type == "image")
+                    {
+                        contentJson["image"] = content.content;
+                    }
+                    else if (content.type == "video")
+                    {
+                        contentJson["video"] = content.content;
+                    }
+                    msgJson["content"].push_back(contentJson);
+                }
+                messagesJson.push_back(msgJson);
+            }
+            responseJson["messages"] = messagesJson;
+            responseJson["formatted_system_prompt"] = formattedRequest ? formattedRequest->formattedSystemPrompt : "";
+            responseJson["formatted_complete_request"]
+                = formattedRequest ? formattedRequest->formattedCompleteRequest : "";
+            outputData["responses"].push_back(responseJson);
+
+            if (requestOk && batchIdx < response.outputIds.size())
+            {
+                totalGeneratedTokens += static_cast<int64_t>(response.outputIds[batchIdx].size());
+            }
+            if (args.dumpOutput && hasOutputText)
+            {
+                LOG_INFO("[parallel %s] Response %zu batch %zu: %s", rt::parallelLaunchModeName(launchMode), requestIdx,
+                    batchIdx, outputText.c_str());
+            }
+        }
+    }
+
+    auto const benchmarkEnd = std::chrono::high_resolution_clock::now();
+    double const wallClockMs = std::chrono::duration<double, std::milli>(benchmarkEnd - benchmarkStart).count();
+    double const wallClockTokPerSec
+        = (wallClockMs > 0.0 && totalGeneratedTokens > 0) ? totalGeneratedTokens * 1000.0 / wallClockMs : 0.0;
+    double const wallClockMsPerTok = totalGeneratedTokens > 0 ? wallClockMs / totalGeneratedTokens : 0.0;
+    nlohmann::json wallClockData;
+    if (isOutputRank)
+    {
+        wallClockData = {{"tp_size", args.tpSize}, {"generated_tokens", totalGeneratedTokens},
+            {"total_time_ms", wallClockMs}, {"tokens_per_second", wallClockTokPerSec},
+            {"ms_per_token", wallClockMsPerTok}, {"failed_requests", failedCount}};
+    }
+
+    std::vector<RankMemorySummary> rankMemory;
+    if (args.dumpProfile)
+    {
+        setProfilingEnabled(false);
+        memoryMonitor.stop();
+        rankMemory = collectRankMemorySummaries(memoryMonitor, launchMode, args.tpSize, processRank);
+    }
+
+    if (args.dumpProfile && isOutputRank)
+    {
+        std::ostringstream profileOutput;
+        profileOutput << std::endl;
+        profileOutput << "=== Parallel Execution Performance Summary (" << rt::parallelLaunchModeName(launchMode)
+                      << ") ===" << std::endl;
+        outputPrefillProfile(profileOutput, runtime->getPrefillMetrics());
+        if (args.specDecodeArgs.enabled)
+        {
+            outputSpecDecodeGenerationProfile(profileOutput, runtime->getSpecDecodeGenerationMetrics(),
+                runtime->getSpeculativeDecodingStrategyName());
+        }
+        else
+        {
+            outputGenerationProfile(profileOutput, runtime->getGenerationMetrics());
+        }
+        outputMultimodalProfile(profileOutput, runtime->getMultimodalMetrics());
+        outputMemoryProfile(profileOutput, memoryMonitor);
+        profileOutput << "=== Wall-Clock (end-to-end, prefill + generation) ===" << std::endl;
+        profileOutput << "TP Size: " << args.tpSize << std::endl;
+        profileOutput << "Total Generated Tokens: " << totalGeneratedTokens << std::endl;
+        profileOutput << "Total Wall-Clock Time: " << std::fixed << std::setprecision(2) << wallClockMs << " ms"
+                      << std::endl;
+        profileOutput << "Wall-Clock Tokens/Second: " << std::fixed << std::setprecision(1) << wallClockTokPerSec
+                      << std::endl;
+        profileOutput << "Wall-Clock ms/Token: " << std::fixed << std::setprecision(3) << wallClockMsPerTok
+                      << std::endl;
+        profileOutput << "=====================================" << std::endl;
+        LOG_INFO("%s", profileOutput.str().c_str());
+    }
+
+    if (isOutputRank && !args.profileOutputFile.empty())
+    {
+        try
+        {
+            nlohmann::json profileJson;
+            addJsonPrefillSummary(profileJson, runtime->getPrefillMetrics());
+            if (args.specDecodeArgs.enabled)
+            {
+                addJsonSpecDecodeGenerationSummary(profileJson, runtime->getSpecDecodeGenerationMetrics(),
+                    runtime->getSpeculativeDecodingStrategyName());
+            }
+            else
+            {
+                addJsonGenerationSummary(profileJson, runtime->getGenerationMetrics());
+            }
+            addJsonMultimodalSummary(profileJson, runtime->getMultimodalMetrics());
+            addJsonTimingStages(profileJson);
+            addJsonMemorySummary(
+                profileJson, memoryMonitor, args.tpSize, rt::parallelLaunchModeName(launchMode), rankMemory);
+            profileJson["wall_clock"] = wallClockData;
+
+            std::ofstream profileFile(args.profileOutputFile);
+            if (!profileFile.is_open())
+            {
+                LOG_ERROR("Failed to open profile output file: %s", args.profileOutputFile.c_str());
+                return EXIT_FAILURE;
+            }
+            profileFile << profileJson.dump(2);
+        }
+        catch (std::exception const& e)
+        {
+            LOG_ERROR("Failed to write profile output file: %s", e.what());
+            return EXIT_FAILURE;
+        }
+    }
+
+    if (isOutputRank)
+    {
+        try
+        {
+            std::ofstream outputFile(args.outputFile);
+            if (!outputFile.is_open())
+            {
+                LOG_ERROR("Failed to open output file: %s", args.outputFile.c_str());
+                return EXIT_FAILURE;
+            }
+            outputFile << outputData.dump(2);
+        }
+        catch (std::exception const& e)
+        {
+            LOG_ERROR("Failed to write output file: %s", e.what());
+            return EXIT_FAILURE;
+        }
+
+        LOG_INFO("Parallel %s complete: %zu/%zu requests successful, %.2f ms, %.2f tok/s, %.3f ms/token.",
+            rt::parallelLaunchModeName(launchMode), batchedRequests.size() - failedCount, batchedRequests.size(),
+            wallClockMs, wallClockTokPerSec, wallClockMsPerTok);
+    }
+
+    return failedCount == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+} // namespace
+#endif
+
 int main(int argc, char* argv[])
 {
+    int tpSize = 1;
+    int tpRank = 0;
+#if defined(EDGELLM_ENABLE_MULTI_DEVICE)
+    int processDevice = 0;
+#endif
+
+#if defined(EDGELLM_ENABLE_MULTI_DEVICE_MPI)
+    if (MPI_Init(&argc, &argv) != MPI_SUCCESS)
+    {
+        LOG_ERROR("Failed to initialize MPI.");
+        return EXIT_FAILURE;
+    }
+    MPI_Comm_size(MPI_COMM_WORLD, &tpSize);
+    MPI_Comm_rank(MPI_COMM_WORLD, &tpRank);
+
+    MPI_Comm localComm = MPI_COMM_NULL;
+    if (MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, tpRank, MPI_INFO_NULL, &localComm) != MPI_SUCCESS)
+    {
+        abortMpiWorld(tpRank, tpSize, "MPI device discovery", "MPI_Comm_split_type failed");
+    }
+    if (MPI_Comm_rank(localComm, &processDevice) != MPI_SUCCESS || MPI_Comm_free(&localComm) != MPI_SUCCESS)
+    {
+        abortMpiWorld(tpRank, tpSize, "MPI device discovery", "failed to resolve or release the node-local rank");
+    }
+
+    try
+    {
+        int deviceCount = 0;
+        CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
+        if (processDevice >= deviceCount)
+        {
+            throw std::runtime_error(
+                format::fmtstr("Node-local rank %d requires CUDA device %d, but this host exposes only %d device(s).",
+                    processDevice, processDevice, deviceCount));
+        }
+        CUDA_CHECK(cudaSetDevice(processDevice));
+    }
+    catch (std::exception const& e)
+    {
+        abortMpiWorld(tpRank, tpSize, "CUDA device selection", e.what());
+    }
+    if (tpSize > 1)
+    {
+        LOG_INFO("[Rank %d/%d] MPI initialized on node-local CUDA device %d.", tpRank, tpSize, processDevice);
+    }
+    else
+    {
+        LOG_INFO("MPI initialized with one process; threaded launch remains available for --tpSize > 1.");
+    }
+#endif
+
     NVTX_SCOPED_RANGE(nvtx_main, "llm_inference");
     LLMInferenceArgs args;
     if (!parseLLMInferenceArgs(args, argc, argv))
     {
         printUsage(argv[0]);
+#if defined(EDGELLM_ENABLE_MULTI_DEVICE_MPI)
+        if (tpSize > 1)
+        {
+            abortMpiWorld(tpRank, tpSize, "argument parsing", "one rank rejected the command line");
+        }
+        MPI_Finalize();
+#endif
         return EXIT_FAILURE;
     }
     if (args.help)
     {
         printUsage(argv[0]);
+#if defined(EDGELLM_ENABLE_MULTI_DEVICE_MPI)
+        MPI_Finalize();
+#endif
         return EXIT_SUCCESS;
     }
     if (!applyEngineSpecDecodeDefaults(args))
     {
+#if defined(EDGELLM_ENABLE_MULTI_DEVICE_MPI)
+        if (tpSize > 1)
+        {
+            abortMpiWorld(tpRank, tpSize, "runtime option preparation", "failed to resolve engine defaults");
+        }
+        MPI_Finalize();
+#endif
         return EXIT_FAILURE;
     }
-    bool profilerEnabled = args.dumpProfile;
-    MemoryMonitor memoryMonitor;
-    // Start memory monitoring at the beginning if profiling is enabled
-    if (profilerEnabled)
+#if defined(EDGELLM_ENABLE_MULTI_DEVICE_MPI)
+    if (tpSize > 1)
     {
-        memoryMonitor.start();
+        if (args.tpSize > 1 && args.tpSize != tpSize)
+        {
+            abortMpiWorld(tpRank, tpSize, "parallel configuration", "--tpSize does not match the MPI world size");
+        }
+        args.tpSize = tpSize;
     }
-
+#endif
     auto pluginHandles = loadEdgellmPluginLib();
     // load input file and parse to requests
     std::unordered_map<std::string, std::string> loraWeightsMap;
@@ -965,19 +1498,77 @@ int main(int argc, char* argv[])
     catch (std::exception const& e)
     {
         LOG_ERROR("Failed to parse input file: %s", e.what());
+#if defined(EDGELLM_ENABLE_MULTI_DEVICE_MPI)
+        if (tpSize > 1)
+        {
+            abortMpiWorld(tpRank, tpSize, "input preparation", e.what());
+        }
+        MPI_Finalize();
+#endif
         return EXIT_FAILURE;
     }
 
     if (batchedRequests.empty())
     {
         LOG_ERROR("No valid requests found in input file.");
+#if defined(EDGELLM_ENABLE_MULTI_DEVICE_MPI)
+        if (tpSize > 1)
+        {
+            abortMpiWorld(tpRank, tpSize, "input preparation", "no valid requests were parsed");
+        }
+        MPI_Finalize();
+#endif
         return EXIT_FAILURE;
+    }
+
+#if defined(EDGELLM_ENABLE_MULTI_DEVICE)
+    if (args.tpSize > 1)
+    {
+        rt::ParallelLaunchMode launchMode = rt::ParallelLaunchMode::kThread;
+        int32_t processRank = 0;
+        std::vector<rt::ParallelBackendHandles> backendHandles;
+#if defined(EDGELLM_ENABLE_MULTI_DEVICE_MPI)
+        if (tpSize > 1)
+        {
+            launchMode = rt::ParallelLaunchMode::kMpi;
+            processRank = tpRank;
+            backendHandles = createMpiBackendHandles(args.tpSize, tpRank);
+        }
+#endif
+        int const result = runParallelInference(
+            args, loraWeightsMap, batchedRequests, launchMode, processRank, processDevice, std::move(backendHandles));
+#if defined(EDGELLM_ENABLE_MULTI_DEVICE_MPI)
+        MPI_Finalize();
+#endif
+        return result;
+    }
+#elif !defined(EDGELLM_ENABLE_MULTI_DEVICE)
+    if (args.tpSize > 1)
+    {
+        LOG_ERROR("--tpSize > 1 requires building llm_inference with ENABLE_MULTI_DEVICE=ON.");
+        return EXIT_FAILURE;
+    }
+#endif
+
+    bool profilerEnabled = args.dumpProfile;
+    MemoryMonitor memoryMonitor;
+    // Start memory monitoring at the beginning if profiling is enabled
+    if (profilerEnabled)
+    {
+        memoryMonitor.start();
     }
 
     // Create unified runtime (handles both vanilla and speculative decoding modes)
     std::unique_ptr<rt::LLMInferenceRuntime> runtime{nullptr};
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    auto cleanupAfterStreamCreate = [&]() {
+        runtime.reset();
+        CUDA_CHECK(cudaStreamDestroy(stream));
+#if defined(EDGELLM_ENABLE_MULTI_DEVICE_MPI)
+        MPI_Finalize();
+#endif
+    };
 
     if (args.specDecodeArgs.enabled)
     {
@@ -999,6 +1590,7 @@ int main(int argc, char* argv[])
         catch (std::exception const& e)
         {
             LOG_ERROR("Failed to initialize runtime with speculative decoding: %s", e.what());
+            cleanupAfterStreamCreate();
             return EXIT_FAILURE;
         }
     }
@@ -1013,6 +1605,7 @@ int main(int argc, char* argv[])
         catch (std::exception const& e)
         {
             LOG_ERROR("Failed to initialize runtime: %s", e.what());
+            cleanupAfterStreamCreate();
             return EXIT_FAILURE;
         }
     }
@@ -1026,6 +1619,7 @@ int main(int argc, char* argv[])
         catch (std::exception const& e)
         {
             LOG_ERROR("Failed to enable visual-token pruning: %s", e.what());
+            cleanupAfterStreamCreate();
             return EXIT_FAILURE;
         }
     }
@@ -1098,12 +1692,13 @@ int main(int argc, char* argv[])
         for (int32_t warmupRun = 0; warmupRun < args.warmup; ++warmupRun)
         {
             rt::LLMGenerationResponse warmupResponse;
-            bool requestStatus = runtime->handleRequest(firstRequest, warmupResponse, stream);
+            bool requestStatus = runtime->handleRequest(firstRequest, warmupResponse, stream, false);
 
             if (!requestStatus)
             {
                 firstRequest.contextCacheLookupPolicy = originalLookupPolicy;
                 LOG_ERROR("Warmup run %d/%d failed", warmupRun + 1, args.warmup);
+                cleanupAfterStreamCreate();
                 return EXIT_FAILURE;
             }
         }
@@ -1128,6 +1723,9 @@ int main(int argc, char* argv[])
     // batchSize consecutive requests into one batched request, so downstream consumers
     // (e.g. calculate_wer_score.py) must receive the flat index, not the batch index.
     size_t flatRequestIdx = 0;
+
+    // Wall-clock timing for end-to-end latency measurement (includes AllReduce, MPI sync, CPU overhead)
+    auto benchmarkStart = std::chrono::high_resolution_clock::now();
 
     // Process each request with progress indication
     LOG_INFO("Processing %zu batched requests...", batchedRequests.size());
@@ -1399,7 +1997,7 @@ int main(int argc, char* argv[])
 
         if (requestStatus)
         {
-            if (args.dumpOutput)
+            if (args.dumpOutput && tpRank == 0)
             {
                 for (size_t batchIdx = 0; batchIdx < response.outputTexts.size(); ++batchIdx)
                 {
@@ -1504,6 +2102,8 @@ int main(int argc, char* argv[])
         }
     }
 
+    auto benchmarkEnd = std::chrono::high_resolution_clock::now();
+
     // Final processing summary
     LOG_INFO("Processing complete: %zu/%zu batched requests successful", batchedRequests.size() - failedCount,
         batchedRequests.size());
@@ -1519,7 +2119,7 @@ int main(int argc, char* argv[])
         memoryMonitor.stop();
     }
 
-    if (args.dumpProfile)
+    if (args.dumpProfile && (tpRank == 0))
     {
         std::ostringstream profileOutput;
         profileOutput << std::endl;
@@ -1548,91 +2148,138 @@ int main(int argc, char* argv[])
             outputOmniProfile(profileOutput, ttsRuntime->getOmniTalkerMetrics(), ttsRuntime->getOmniLatencyMetrics());
         }
         outputMemoryProfile(profileOutput, memoryMonitor);
+
+        {
+            int64_t totalGeneratedTokens = args.specDecodeArgs.enabled
+                ? runtime->getSpecDecodeGenerationMetrics().totalGeneratedTokens
+                : runtime->getGenerationMetrics().generatedTokens;
+
+            double wallClockMs = std::chrono::duration<double, std::milli>(benchmarkEnd - benchmarkStart).count();
+            double wallClockTokPerSec
+                = (wallClockMs > 0 && totalGeneratedTokens > 0) ? (totalGeneratedTokens * 1000.0 / wallClockMs) : 0;
+            double wallClockMsPerTok = (totalGeneratedTokens > 0) ? (wallClockMs / totalGeneratedTokens) : 0;
+
+            profileOutput << "=== Wall-Clock (end-to-end, prefill + generation) ===" << std::endl;
+            profileOutput << "TP Size: " << tpSize << std::endl;
+            profileOutput << "Total Generated Tokens: " << totalGeneratedTokens << std::endl;
+            profileOutput << "Total Wall-Clock Time: " << std::fixed << std::setprecision(2) << wallClockMs << " ms"
+                          << std::endl;
+            profileOutput << "Wall-Clock Tokens/Second: " << std::fixed << std::setprecision(1) << wallClockTokPerSec
+                          << std::endl;
+            profileOutput << "Wall-Clock ms/Token: " << std::fixed << std::setprecision(3) << wallClockMsPerTok
+                          << std::endl;
+        }
+
         profileOutput << "=====================================" << std::endl;
         LOG_INFO("%s", profileOutput.str().c_str());
     }
 
-    // Export profile to JSON file
-    if (!args.profileOutputFile.empty())
+    // Only rank 0 writes output files to avoid race conditions in parallel mode.
+    // tpRank is 0 for single-device, so this is always true in that case.
+    if (tpRank == 0)
     {
+        // Export profile to JSON file
+        if (!args.profileOutputFile.empty())
+        {
+            try
+            {
+                nlohmann::json profileJson;
+
+                // Add high-level metrics from unified runtime
+                addJsonPrefillSummary(profileJson, runtime->getPrefillMetrics());
+                if (auto const contextCacheMetrics = runtime->getContextCacheMetrics(); contextCacheMetrics.has_value())
+                {
+                    addJsonContextCacheSummary(profileJson, *contextCacheMetrics);
+                }
+                if (args.specDecodeArgs.enabled)
+                {
+                    addJsonSpecDecodeGenerationSummary(profileJson, runtime->getSpecDecodeGenerationMetrics(),
+                        runtime->getSpeculativeDecodingStrategyName());
+                }
+                else
+                {
+                    addJsonGenerationSummary(profileJson, runtime->getGenerationMetrics());
+                }
+                addJsonMultimodalSummary(profileJson, runtime->getMultimodalMetrics());
+
+                // Add detailed timing stages
+                addJsonTimingStages(profileJson);
+
+                // Add memory usage
+                addJsonMemorySummary(profileJson, memoryMonitor);
+
+                {
+                    int64_t totalGeneratedTokens = args.specDecodeArgs.enabled
+                        ? runtime->getSpecDecodeGenerationMetrics().totalGeneratedTokens
+                        : runtime->getGenerationMetrics().generatedTokens;
+
+                    double wallClockMs
+                        = std::chrono::duration<double, std::milli>(benchmarkEnd - benchmarkStart).count();
+                    double wallClockTokPerSec = (wallClockMs > 0 && totalGeneratedTokens > 0)
+                        ? (totalGeneratedTokens * 1000.0 / wallClockMs)
+                        : 0;
+                    double wallClockMsPerTok = (totalGeneratedTokens > 0) ? (wallClockMs / totalGeneratedTokens) : 0;
+
+                    profileJson["wall_clock"] = {{"tp_size", tpSize}, {"generated_tokens", totalGeneratedTokens},
+                        {"total_time_ms", wallClockMs}, {"tokens_per_second", wallClockTokPerSec},
+                        {"ms_per_token", wallClockMsPerTok}};
+                }
+
+                std::ofstream profileFile(args.profileOutputFile);
+                if (profileFile.is_open())
+                {
+                    profileFile << profileJson.dump(2); // Pretty print with 2 space indentation
+                    profileFile.close();
+                    LOG_INFO("Profile data exported to: %s", args.profileOutputFile.c_str());
+                }
+                else
+                {
+                    LOG_ERROR("Failed to open profile output file: %s", args.profileOutputFile.c_str());
+                    cleanupAfterStreamCreate();
+                    return EXIT_FAILURE;
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Failed to write profile output file: %s", e.what());
+                cleanupAfterStreamCreate();
+                return EXIT_FAILURE;
+            }
+        }
+
+        // Export to JSON file
         try
         {
-            nlohmann::json profileJson;
-
-            // Add high-level metrics from unified runtime
-            addJsonPrefillSummary(profileJson, runtime->getPrefillMetrics());
-            if (auto const contextCacheMetrics = runtime->getContextCacheMetrics(); contextCacheMetrics.has_value())
+            std::ofstream outputFile(args.outputFile);
+            if (outputFile.is_open())
             {
-                addJsonContextCacheSummary(profileJson, *contextCacheMetrics);
-            }
-            if (args.specDecodeArgs.enabled)
-            {
-                addJsonSpecDecodeGenerationSummary(profileJson, runtime->getSpecDecodeGenerationMetrics(),
-                    runtime->getSpeculativeDecodingStrategyName());
+                outputFile << outputData.dump(4); // Pretty print with 4 spaces indentation
+                outputFile.close();
+                LOG_INFO("All responses exported to: %s", args.outputFile.c_str());
             }
             else
             {
-                addJsonGenerationSummary(profileJson, runtime->getGenerationMetrics());
-            }
-            addJsonMultimodalSummary(profileJson, runtime->getMultimodalMetrics());
-            if (ttsRuntime)
-            {
-                addJsonTalkerSummary(profileJson, ttsRuntime->getMetrics());
-            }
-
-            // Add detailed timing stages
-            addJsonTimingStages(profileJson);
-
-            if (ttsRuntime)
-            {
-                addJsonOmniStageExtensions(
-                    profileJson, ttsRuntime->getOmniTalkerMetrics(), ttsRuntime->getOmniLatencyMetrics());
-            }
-
-            // Add memory usage
-            addJsonMemorySummary(profileJson, memoryMonitor);
-
-            std::ofstream profileFile(args.profileOutputFile);
-            if (profileFile.is_open())
-            {
-                profileFile << profileJson.dump(2); // Pretty print with 2 space indentation
-                profileFile.close();
-                LOG_INFO("Profile data exported to: %s", args.profileOutputFile.c_str());
-            }
-            else
-            {
-                LOG_ERROR("Failed to open profile output file: %s", args.profileOutputFile.c_str());
+                LOG_ERROR("Failed to open output file: %s", args.outputFile.c_str());
+                cleanupAfterStreamCreate();
                 return EXIT_FAILURE;
             }
         }
         catch (std::exception const& e)
         {
-            LOG_ERROR("Failed to write profile output file: %s", e.what());
+            LOG_ERROR("Failed to write output file: %s", e.what());
+            cleanupAfterStreamCreate();
             return EXIT_FAILURE;
         }
     }
 
-    // Export to JSON file
-    try
-    {
-        std::ofstream outputFile(args.outputFile);
-        if (outputFile.is_open())
-        {
-            outputFile << outputData.dump(4); // Pretty print with 4 spaces indentation
-            outputFile.close();
-            LOG_INFO("All responses exported to: %s", args.outputFile.c_str());
-        }
-        else
-        {
-            LOG_ERROR("Failed to open output file: %s", args.outputFile.c_str());
-            return EXIT_FAILURE;
-        }
-    }
-    catch (std::exception const& e)
-    {
-        LOG_ERROR("Failed to write output file: %s", e.what());
-        return EXIT_FAILURE;
-    }
+    // Explicitly destroy the runtime before MPI teardown.
+    // Runtime-owned TP communication must remain valid while TRT/plugin resources are released.
+    runtime.reset();
+    CUDA_CHECK(cudaStreamDestroy(stream));
+
+#if defined(EDGELLM_ENABLE_MULTI_DEVICE_MPI)
+    MPI_Finalize();
+#endif
 
     // Return false if any request failed
     return hasFailedRequest ? EXIT_FAILURE : EXIT_SUCCESS;

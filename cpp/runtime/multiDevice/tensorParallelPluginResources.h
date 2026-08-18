@@ -21,7 +21,6 @@
 
 #include <cstdint>
 #include <memory>
-#include <string>
 #include <vector>
 
 namespace trt_edgellm
@@ -41,7 +40,6 @@ struct TensorParallelPluginResourcesConfig
     bool ownsNcclComms{true}; //!< Transfer ownership of non-empty externally supplied NCCL communicators.
     // {$edge-llm-internal-release begin}
     ShmAllReduceConfig shmAllReduceConfig{};
-    std::string shmSessionName{}; //!< POSIX SHM session name for local TP resources.
     // {$edge-llm-internal-release end}
 };
 

@@ -24,7 +24,7 @@ namespace trt_edgellm
 {
 
 //! \cond INTERNAL
-//! Global profiling control flag accessors (defined in timer.cpp)
+//! Thread-local profiling control flag accessors (defined in timer.cpp)
 //! When false, no profiling data (metrics or timing) will be recorded
 bool getProfilingEnabled() noexcept;
 void setProfilingEnabled(bool enabled) noexcept;

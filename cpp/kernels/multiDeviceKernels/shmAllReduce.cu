@@ -25,11 +25,10 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
-#include <fcntl.h> // shm_open, O_CREAT, O_RDWR
 #include <limits>
-#include <sys/mman.h> // mmap, munmap, MAP_SHARED
-#include <sys/stat.h> // fstat, struct stat
-#include <unistd.h>   // ftruncate, close, usleep
+#include <linux/mempolicy.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 namespace trt_edgellm
 {
@@ -39,6 +38,74 @@ namespace kernels
 namespace
 {
 constexpr uint64_t kShmHostBarrierFailureBit{uint64_t{1} << 63};
+
+cudaError_t allocatePinnedOnNumaNode(void** hostPtr, size_t size, int32_t node, char const* label) noexcept
+{
+    *hostPtr = nullptr;
+    constexpr unsigned int kHostFlags = cudaHostAllocMapped | cudaHostAllocPortable;
+#if defined(SYS_get_mempolicy) && defined(SYS_set_mempolicy)
+    if (node >= 0 && node < static_cast<int32_t>(sizeof(unsigned long) * 8))
+    {
+        int oldMode = MPOL_DEFAULT;
+        unsigned long oldMask = 0;
+        long const getPolicyRc = syscall(SYS_get_mempolicy, &oldMode, &oldMask, sizeof(oldMask) * 8, nullptr, 0UL);
+        if (getPolicyRc == 0)
+        {
+            unsigned long const nodeMask = 1UL << node;
+            long const setPolicyRc = syscall(SYS_set_mempolicy, MPOL_BIND, &nodeMask, sizeof(nodeMask) * 8);
+            if (setPolicyRc == 0)
+            {
+                cudaError_t const error = cudaHostAlloc(hostPtr, size, kHostFlags);
+                long const restoreRc = syscall(
+                    SYS_set_mempolicy, oldMode, oldMode == MPOL_DEFAULT ? nullptr : &oldMask, sizeof(oldMask) * 8);
+                if (restoreRc != 0)
+                {
+                    LOG_WARNING("ShmAllReduce: failed to restore NUMA policy after allocating %s: %s", label,
+                        std::strerror(errno));
+                }
+                if (error == cudaSuccess)
+                {
+                    memset(*hostPtr, 0, size);
+                }
+                return error;
+            }
+            LOG_WARNING("ShmAllReduce: set_mempolicy(%s, node=%d) failed: %s; using default placement.", label, node,
+                std::strerror(errno));
+        }
+        else
+        {
+            LOG_WARNING("ShmAllReduce: get_mempolicy before allocating %s failed: %s; using default placement.", label,
+                std::strerror(errno));
+        }
+    }
+#else
+    (void) node;
+#endif
+
+    cudaError_t const error = cudaHostAlloc(hostPtr, size, kHostFlags);
+    if (error == cudaSuccess)
+    {
+        memset(*hostPtr, 0, size);
+    }
+    return error;
+}
+
+void freePinnedAllocations(ShmAllReduceState* state) noexcept
+{
+    if (state->controlHost != nullptr)
+    {
+        cudaFreeHost(state->controlHost);
+        state->controlHost = nullptr;
+    }
+    for (int32_t rank = 0; rank < kShmAllReduceWorldSize; ++rank)
+    {
+        if (state->shmBufHost[rank] != nullptr)
+        {
+            cudaFreeHost(state->shmBufHost[rank]);
+            state->shmBufHost[rank] = nullptr;
+        }
+    }
+}
 
 bool mapDevicePointer(void** devicePtr, void* hostPtr, char const* label) noexcept
 {
@@ -537,20 +604,14 @@ __global__ void shmReduceMultiCtaFp16Kernel(half* __restrict__ output, half cons
 // Host API
 // ---------------------------------------------------------------------------
 
-ShmAllReduceState* shmAllReduceInit(int32_t tpSize, int64_t maxElements, int64_t allReduceElementThreshold,
-    int64_t fp8SmallPathElementThreshold, char const* sessionName)
+ShmAllReduceState* shmAllReduceInit(
+    int32_t tpSize, int64_t maxElements, int64_t allReduceElementThreshold, int64_t fp8SmallPathElementThreshold)
 {
     if (tpSize != kShmAllReduceWorldSize)
     {
         LOG_ERROR("ShmAllReduce: only tpSize=%d is supported, got %d", kShmAllReduceWorldSize, tpSize);
         return nullptr;
     }
-    if (sessionName == nullptr || sessionName[0] == 0 || sessionName[0] != '/')
-    {
-        LOG_ERROR("ShmAllReduce: sessionName must be non-empty and begin with '/'.");
-        return nullptr;
-    }
-
     auto* state = new ShmAllReduceState();
     state->tpSize = tpSize;
     state->maxElements = maxElements;
@@ -573,131 +634,34 @@ ShmAllReduceState* shmAllReduceInit(int32_t tpSize, int64_t maxElements, int64_t
         maxTiles = 1;
     state->maxTiles = maxTiles;
 
-    // Cross-process SHM allocation. Both ranks map the same shared-memory region.
-    int currentDevice = -1;
-    cudaError_t const deviceErr = cudaGetDevice(&currentDevice);
-    if (deviceErr != cudaSuccess)
-    {
-        LOG_ERROR("ShmAllReduce: cudaGetDevice failed: %s", cudaGetErrorString(deviceErr));
-        delete state;
-        return nullptr;
-    }
-    int32_t rank = currentDevice; // device 0 = rank 0, device 1 = rank 1
-    if (rank < 0 || rank >= tpSize)
-    {
-        LOG_ERROR("ShmAllReduce: current CUDA device %d is outside tpSize=%d rank mapping", rank, tpSize);
-        delete state;
-        return nullptr;
-    }
-
-    size_t perRankBytes = static_cast<size_t>(maxElements) * sizeof(half);
-    size_t barrierBytes = 4 * sizeof(unsigned int);
-    size_t tileBarBytes = static_cast<size_t>(state->maxTiles) * 2 * sizeof(unsigned int);
-    size_t hostBarrierBytes = sizeof(uint64_t);                // hostBarrierState
-    size_t const hostBarrierUnalignedOffset = 2 * perRankBytes // shmBuf (rank 0) + shmBuf1 (rank 1)
-        + barrierBytes                                         // barriers[4]
-        + tileBarBytes                                         // tileBarriers
-        + tileBarBytes                                         // readBarriers
-        + 2 * sizeof(unsigned int);                            // completionCounter[2]
+    size_t const perRankBytes = static_cast<size_t>(maxElements) * sizeof(half);
+    size_t const barrierBytes = 4 * sizeof(unsigned int);
+    size_t const tileBarBytes = static_cast<size_t>(state->maxTiles) * 2 * sizeof(unsigned int);
+    size_t const hostBarrierBytes = sizeof(uint64_t);
+    size_t const hostBarrierUnalignedOffset
+        = barrierBytes + tileBarBytes + tileBarBytes + 2 * sizeof(unsigned int); // completionCounter[2]
     size_t const hostBarrierPadding
         = (alignof(uint64_t) - hostBarrierUnalignedOffset % alignof(uint64_t)) % alignof(uint64_t);
-    size_t const totalBytes = hostBarrierUnalignedOffset + hostBarrierPadding + hostBarrierBytes;
+    size_t const controlBytes = hostBarrierUnalignedOffset + hostBarrierPadding + hostBarrierBytes;
 
-    char const* shmName = strdup(sessionName);
-    if (shmName == nullptr)
+    cudaError_t error = allocatePinnedOnNumaNode(&state->shmBufHost[0], perRankBytes, 0, "rank-0 slot");
+    if (error == cudaSuccess)
     {
-        LOG_ERROR("ShmAllReduce: failed to duplicate SHM session name '%s'", sessionName);
+        error = allocatePinnedOnNumaNode(&state->shmBufHost[1], perRankBytes, 1, "rank-1 slot");
+    }
+    if (error == cudaSuccess)
+    {
+        error = allocatePinnedOnNumaNode(&state->controlHost, controlBytes, 0, "control data");
+    }
+    if (error != cudaSuccess)
+    {
+        LOG_ERROR("ShmAllReduce: pinned allocation failed: %s", cudaGetErrorString(error));
+        freePinnedAllocations(state);
         delete state;
         return nullptr;
     }
 
-    int fd = -1;
-    if (rank == 0)
-    {
-        // Rank 0 creates (or recreates) the shm file and sets its size.
-        shm_unlink(shmName); // remove stale handle from a previous run
-        fd = shm_open(shmName, O_CREAT | O_RDWR, 0666);
-        if (fd < 0)
-        {
-            LOG_ERROR("ShmAllReduce: shm_open(%s) failed: %s", shmName, std::strerror(errno));
-            free(const_cast<char*>(shmName));
-            delete state;
-            return nullptr;
-        }
-        if (ftruncate(fd, static_cast<off_t>(totalBytes)) != 0)
-        {
-            LOG_ERROR("ShmAllReduce: ftruncate(%s, %ld bytes) failed: %s", shmName, static_cast<long>(totalBytes),
-                std::strerror(errno));
-            close(fd);
-            free(const_cast<char*>(shmName));
-            delete state;
-            return nullptr;
-        }
-    }
-    else
-    {
-        // Rank 1 spins until rank 0 creates the file and sets its size.
-        for (int retry = 0; retry < 2000; ++retry)
-        {
-            fd = shm_open(shmName, O_RDWR, 0666);
-            if (fd >= 0)
-            {
-                struct stat st{};
-                if (fstat(fd, &st) != 0)
-                {
-                    close(fd);
-                    fd = -1;
-                    usleep(500);
-                    continue;
-                }
-                if (static_cast<size_t>(st.st_size) >= totalBytes)
-                    break;
-                close(fd);
-                fd = -1;
-            }
-            usleep(500); // 0.5 ms
-        }
-        if (fd < 0)
-        {
-            LOG_ERROR("ShmAllReduce: timed out waiting for SHM session %s (%ld bytes)", shmName,
-                static_cast<long>(totalBytes));
-            free(const_cast<char*>(shmName));
-            delete state;
-            return nullptr;
-        }
-    }
-
-    void* ptr = mmap(nullptr, totalBytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    close(fd);
-    if (ptr == MAP_FAILED)
-    {
-        LOG_ERROR("ShmAllReduce: mmap(%ld bytes) failed for %s: %s", static_cast<long>(totalBytes), shmName,
-            std::strerror(errno));
-        free(const_cast<char*>(shmName));
-        delete state;
-        return nullptr;
-    }
-
-    // Register the entire shared region for GPU access.
-    cudaError_t regErr = cudaHostRegister(ptr, totalBytes, cudaHostRegisterMapped | cudaHostRegisterPortable);
-    if (regErr != cudaSuccess)
-    {
-        LOG_ERROR("ShmAllReduce: cudaHostRegister for %s (%ld bytes) failed: %s", shmName,
-            static_cast<long>(totalBytes), cudaGetErrorString(regErr));
-        munmap(ptr, totalBytes);
-        free(const_cast<char*>(shmName));
-        delete state;
-        return nullptr;
-    }
-
-    // Carve up the shared region into sub-arrays.
-    char* base = reinterpret_cast<char*>(ptr);
-    char* cursor = base;
-
-    half* bufRank0 = reinterpret_cast<half*>(cursor);
-    cursor += perRankBytes;
-    half* bufRank1 = reinterpret_cast<half*>(cursor);
-    cursor += perRankBytes;
+    char* cursor = static_cast<char*>(state->controlHost);
     unsigned int* barr = reinterpret_cast<unsigned int*>(cursor);
     cursor += barrierBytes;
     unsigned int* tileBars = reinterpret_cast<unsigned int*>(cursor);
@@ -710,40 +674,27 @@ ShmAllReduceState* shmAllReduceInit(int32_t tpSize, int64_t maxElements, int64_t
     uint64_t volatile* hostBarr = reinterpret_cast<uint64_t volatile*>(cursor);
     cursor += hostBarrierBytes;
 
-    // Rank 0 zeros the shared region (rank 1 will see the zeroed memory).
-    if (rank == 0)
-        memset(base, 0, totalBytes);
-
-    // Get GPU device pointers for both slots (visible from this rank's GPU).
-    bool const mapped = mapDevicePointer(reinterpret_cast<void**>(&state->shmBuf), bufRank0, "shmBuf")
-        && mapDevicePointer(reinterpret_cast<void**>(&state->shmBuf1), bufRank1, "shmBuf1")
+    bool const mapped = mapDevicePointer(reinterpret_cast<void**>(&state->shmBuf), state->shmBufHost[0], "shmBuf")
+        && mapDevicePointer(reinterpret_cast<void**>(&state->shmBuf1), state->shmBufHost[1], "shmBuf1")
         && mapDevicePointer(reinterpret_cast<void**>(&state->barriers), barr, "barriers")
         && mapDevicePointer(reinterpret_cast<void**>(&state->tileBarriers), tileBars, "tileBarriers")
         && mapDevicePointer(reinterpret_cast<void**>(&state->readBarriers), readBars, "readBarriers")
         && mapDevicePointer(reinterpret_cast<void**>(&state->completionCounter), compCtr, "completionCounter");
     if (!mapped)
     {
-        cudaHostUnregister(ptr);
-        munmap(ptr, totalBytes);
-        free(const_cast<char*>(shmName));
+        freePinnedAllocations(state);
         delete state;
         return nullptr;
     }
 
-    // Host barrier lives in the mmap'd region (CPU-only, no device pointer needed).
     state->hostBarrierState = hostBarr;
-
-    // Store bookkeeping for destroy().
-    state->mmapPtr = ptr;
-    state->mmapBytes = totalBytes;
-    state->shmName = shmName;
-    state->shmRank = rank;
 
     LOG_INFO(
         "ShmAllReduce: initialized (%s): tpSize=%d, maxElements=%ld, allReduceElementThreshold=%ld, "
         "fp8SmallPathElementThreshold=%ld, bufSize=%.1f KB, maxTiles=%d",
-        "POSIX shm", tpSize, static_cast<long>(maxElements), static_cast<long>(state->allReduceElementThreshold),
-        static_cast<long>(state->fp8SmallPathElementThreshold), perRankBytes * 2 / 1024.0, maxTiles);
+        "NUMA-local pinned memory", tpSize, static_cast<long>(maxElements),
+        static_cast<long>(state->allReduceElementThreshold), static_cast<long>(state->fp8SmallPathElementThreshold),
+        perRankBytes * 2 / 1024.0, maxTiles);
 
     return state;
 }
@@ -917,15 +868,7 @@ void shmAllReduceDestroy(ShmAllReduceState* state)
     if (state == nullptr)
         return;
 
-    if (state->mmapPtr != nullptr)
-    {
-        cudaHostUnregister(state->mmapPtr);
-        munmap(state->mmapPtr, state->mmapBytes);
-        if (state->shmRank == 0 && state->shmName != nullptr)
-            shm_unlink(state->shmName);
-        free(const_cast<char*>(state->shmName));
-        state->shmName = nullptr;
-    }
+    freePinnedAllocations(state);
     delete state;
 }
 

@@ -22,6 +22,7 @@
 #include "common/fileUtils.h"
 #include "common/logger.h"
 #include "common/pagedKvTypes.h"
+#include "common/parallelArtifactNames.h"
 #include "common/ropeUtils.h"
 #include "common/trtUtils.h"
 #include "common/version.h"
@@ -32,6 +33,8 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <unordered_set>
 #include <vector>
 
 using namespace trt_edgellm;
@@ -108,6 +111,160 @@ std::optional<int64_t> getStaticInputDim(
     return std::nullopt;
 }
 
+parallel_artifacts::RankArtifactContext makeArtifactContext(LLMBuilderConfig const& config)
+{
+    return parallel_artifacts::RankArtifactContext{
+        static_cast<int32_t>(config.tpSize), static_cast<int32_t>(config.tpRank)};
+}
+
+int32_t configRank(LLMBuilderConfig const& config)
+{
+    return static_cast<int32_t>(config.tpRank);
+}
+
+bool validateRankConfigs(Json const& config, LLMBuilderConfig const& builderConfig)
+{
+    if (builderConfig.tpSize < 1)
+    {
+        LOG_ERROR("tpSize must be positive, got %lld.", static_cast<long long>(builderConfig.tpSize));
+        return false;
+    }
+    if (builderConfig.tpRank < 0 || builderConfig.tpRank >= builderConfig.tpSize)
+    {
+        LOG_ERROR("tpRank must be in [0, tpSize), got tpRank=%lld tpSize=%lld.",
+            static_cast<long long>(builderConfig.tpRank), static_cast<long long>(builderConfig.tpSize));
+        return false;
+    }
+
+    if (!config.contains("rank_configs"))
+    {
+        if (builderConfig.tpSize > 1)
+        {
+            LOG_ERROR("Multi-device build requires rank_configs, but config.json has none (tpSize=%lld).",
+                static_cast<long long>(builderConfig.tpSize));
+            return false;
+        }
+        return true;
+    }
+
+    Json const& rankConfigs = config["rank_configs"];
+    if (!rankConfigs.is_array())
+    {
+        LOG_ERROR("rank_configs must be an array when present in config.json");
+        return false;
+    }
+    if (rankConfigs.size() != static_cast<size_t>(builderConfig.tpSize))
+    {
+        LOG_ERROR("rank_configs length (%zu) must match tpSize (%lld).", rankConfigs.size(),
+            static_cast<long long>(builderConfig.tpSize));
+        return false;
+    }
+
+    std::unordered_set<int64_t> ranks;
+    for (auto const& rankConfig : rankConfigs)
+    {
+        if (!rankConfig.is_object() || !rankConfig.contains("rank") || !rankConfig["rank"].is_number_integer())
+        {
+            LOG_ERROR("Each rank_configs entry must be an object with an integer rank field.");
+            return false;
+        }
+        int64_t const rank = rankConfig["rank"].get<int64_t>();
+        if (rank < 0 || rank >= builderConfig.tpSize)
+        {
+            LOG_ERROR("rank_configs rank %lld is outside [0, tpSize=%lld).", static_cast<long long>(rank),
+                static_cast<long long>(builderConfig.tpSize));
+            return false;
+        }
+        if (!ranks.insert(rank).second)
+        {
+            LOG_ERROR("rank_configs contains duplicate rank %lld.", static_cast<long long>(rank));
+            return false;
+        }
+        if (rankConfig.contains("config_overrides") && !rankConfig["config_overrides"].is_object())
+        {
+            LOG_ERROR(
+                "rank_configs[%lld].config_overrides must be an object when present.", static_cast<long long>(rank));
+            return false;
+        }
+    }
+    return true;
+}
+
+bool applyRankConfigOverrides(Json& config, int32_t rank)
+{
+    if (!config.contains("rank_configs"))
+    {
+        return true;
+    }
+    if (!config["rank_configs"].is_array())
+    {
+        LOG_ERROR("rank_configs must be an array when present in config.json");
+        return false;
+    }
+    for (auto const& rankConfig : config["rank_configs"])
+    {
+        if (!rankConfig.is_object())
+        {
+            LOG_ERROR("Each rank_configs entry must be an object.");
+            return false;
+        }
+        if (rankConfig.value("rank", -1) != rank)
+        {
+            continue;
+        }
+        Json const overrides = rankConfig.value("config_overrides", Json::object());
+        if (!overrides.is_object())
+        {
+            LOG_ERROR("rank_configs[%d].config_overrides must be an object when present.", rank);
+            return false;
+        }
+        for (auto it = overrides.begin(); it != overrides.end(); ++it)
+        {
+            config[it.key()] = it.value();
+        }
+        return true;
+    }
+    LOG_ERROR("No rank_configs entry found for rank %d.", rank);
+    return false;
+}
+
+std::string getInputConfigFileName(LLMBuilderConfig const& config)
+{
+    return parallel_artifacts::configFileName(makeArtifactContext(config));
+}
+
+std::string getOutputConfigFileName(LLMBuilderConfig const& config)
+{
+    if (config.specDraft)
+    {
+        return "draft_config.json";
+    }
+    if (config.specBase)
+    {
+        return "base_config.json";
+    }
+    return parallel_artifacts::configFileName(makeArtifactContext(config));
+}
+
+std::string getEngineFileName(LLMBuilderConfig const& config)
+{
+    if (config.specDraft)
+    {
+        return "spec_draft.engine";
+    }
+    if (config.specBase)
+    {
+        return "spec_base.engine";
+    }
+    return parallel_artifacts::engineFileName(makeArtifactContext(config));
+}
+
+std::string getOnnxFilePath(std::filesystem::path const& onnxDir, LLMBuilderConfig const& config)
+{
+    parallel_artifacts::RankArtifactContext const context = makeArtifactContext(config);
+    return (onnxDir / parallel_artifacts::onnxFileName(context)).string();
+}
+
 } // namespace
 
 LLMBuilder::LLMBuilder(
@@ -170,6 +327,11 @@ bool LLMBuilder::build()
         onnxFilePath = (mOnnxDir / "lora_model.onnx").string();
         LOG_INFO("Parsing LoRA-enabled ONNX model: %s", onnxFilePath.c_str());
     }
+    else if (mBuilderConfig.tpSize > 1)
+    {
+        onnxFilePath = getOnnxFilePath(mOnnxDir, mBuilderConfig);
+        LOG_INFO("Parsing rank-local ONNX model: %s", onnxFilePath.c_str());
+    }
     else
     {
         onnxFilePath = (mOnnxDir / "model.onnx").string();
@@ -210,35 +372,20 @@ bool LLMBuilder::build()
         return false;
     }
 
-    // Create engine directory
-    if (!std::filesystem::exists(mEngineDir))
+    std::error_code errorCode;
+    bool const createdEngineDir = std::filesystem::create_directories(mEngineDir, errorCode);
+    if (errorCode)
     {
-        if (!std::filesystem::create_directories(mEngineDir))
-        {
-            LOG_ERROR("Failed to create directory %s", mEngineDir.string().c_str());
-            return false;
-        }
+        LOG_ERROR("Failed to create directory %s: %s", mEngineDir.string().c_str(), errorCode.message().c_str());
+        return false;
+    }
+    if (createdEngineDir)
+    {
         LOG_INFO("Created directory %s for saving LLM engine.", mEngineDir.string().c_str());
     }
 
     // Determine engine file name
-    std::string engineFileName;
-    if (mBuilderConfig.specDraft)
-    {
-        engineFileName = "spec_draft.engine";
-    }
-    else if (mBuilderConfig.specBase)
-    {
-        engineFileName = "spec_base.engine";
-    }
-    else if (mIsDiffusionBackbone)
-    {
-        engineFileName = "dllm.engine";
-    }
-    else
-    {
-        engineFileName = "llm.engine";
-    }
+    std::string const engineFileName = mIsDiffusionBackbone ? "dllm.engine" : getEngineFileName(mBuilderConfig);
 
     // Build and save engine
     std::string const engineFilePath = (mEngineDir / engineFileName).string();
@@ -262,35 +409,39 @@ bool LLMBuilder::build()
         LOG_INFO("Detected %d deepstack embedding inputs in network (Qwen3VL model)", mNumDeepstackFeatures);
     }
 
-    // Copy files and save builder config
-    if (!copyConfig())
+    // The world-level config is shared across ranks. Only rank 0 writes it.
+    if ((mBuilderConfig.tpSize == 1 || mBuilderConfig.tpRank == 0) && !copyConfig())
     {
         return false;
     }
 
-    if (!copyTokenizerFiles())
+    // Shared files are identical across ranks. Only rank 0 copies them to avoid race conditions.
+    if (mBuilderConfig.tpRank == 0 || mBuilderConfig.tpSize == 1)
     {
-        return false;
-    }
+        if (!copyTokenizerFiles())
+        {
+            return false;
+        }
 
-    if (!copyEagleFiles())
-    {
-        return false;
-    }
+        if (!copyEagleFiles())
+        {
+            return false;
+        }
 
-    if (!copyDSparkFiles())
-    {
-        return false;
-    }
+        if (!copyDSparkFiles())
+        {
+            return false;
+        }
 
-    if (!copyVocabMappingFiles())
-    {
-        return false;
-    }
+        if (!copyVocabMappingFiles())
+        {
+            return false;
+        }
 
-    if (!copyEmbeddingFile())
-    {
-        return false;
+        if (!copyEmbeddingFile())
+        {
+            return false;
+        }
     }
 
     if (!copyExternalWeightFiles())
@@ -303,8 +454,18 @@ bool LLMBuilder::build()
 
 bool LLMBuilder::parseConfig()
 {
-    std::string const jsonPath = (mOnnxDir / "config.json").string();
+    std::string const jsonPath = (mOnnxDir / getInputConfigFileName(mBuilderConfig)).string();
     if (!loadJsonConfig(jsonPath, mModelConfig))
+    {
+        return false;
+    }
+    if (!validateRankConfigs(mModelConfig, mBuilderConfig))
+    {
+        return false;
+    }
+    mSharedModelConfig = mModelConfig;
+
+    if (!applyRankConfigOverrides(mModelConfig, configRank(mBuilderConfig)))
     {
         return false;
     }
@@ -1552,26 +1713,34 @@ std::string externalWeightDstName(std::string const& filename, bool specDraft)
 
 bool LLMBuilder::copyConfig()
 {
-    // Determine config file name based on model type
-    std::string configFileName;
-    if (mBuilderConfig.specDraft)
-    {
-        configFileName = "draft_config.json";
-    }
-    else if (mBuilderConfig.specBase)
-    {
-        configFileName = "base_config.json";
-    }
-    else
-    {
-        configFileName = "config.json";
-    }
+    std::string const configFileName = getOutputConfigFileName(mBuilderConfig);
 
     std::string const targetConfigPath = (mEngineDir / configFileName).string();
 
-    // Create a copy of mModelConfig and add builder config
-    Json configWithBuilder = mModelConfig;
+    Json configWithBuilder = mSharedModelConfig;
     configWithBuilder["builder_config"] = mBuilderConfig.toJson();
+
+    if (configWithBuilder.contains("rank_configs"))
+    {
+        if (!configWithBuilder["rank_configs"].is_array())
+        {
+            LOG_ERROR("rank_configs must be an array when present in config.json");
+            return false;
+        }
+        int32_t const artifactWorldSize
+            = std::max<int32_t>(1, static_cast<int32_t>(configWithBuilder["rank_configs"].size()));
+        for (auto& rankConfig : configWithBuilder["rank_configs"])
+        {
+            if (!rankConfig.is_object() || !rankConfig.contains("rank"))
+            {
+                LOG_ERROR("Each rank_configs entry must be an object with a rank field.");
+                return false;
+            }
+            int32_t const rank = rankConfig["rank"].get<int32_t>();
+            parallel_artifacts::RankArtifactContext const context{artifactWorldSize, rank};
+            rankConfig["engine"] = parallel_artifacts::engineFileName(context);
+        }
+    }
 
     // Keep external weight file references in sync with the names written by
     // copyExternalWeightFiles() (draft files get the "draft_" prefix) so the runtime loads the right file.

@@ -61,7 +61,7 @@ from ...config import LAYER_GDN, GdnConfig, ModelConfig
 from ..default.modeling_default import MLP, OnnxSpec, RMSNorm
 from ..linear import (AWQLinear, FP16Linear, GPTQLinear,
                       ModelOptAWQPrepackedLinear, NVFP4LinearMethod,
-                      ReplicatedLinear, is_nvfp4_linear, make_linear)
+                      ReplicatedLinear, TPMode, is_nvfp4_linear, make_linear)
 from ..ops import (KV_PAGE_SIZE, attention_plugin, causal_conv1d,
                    causal_conv1d_with_intermediate, gated_delta_net,
                    gated_delta_net_with_intermediate, int4_gemm_plugin_version)
@@ -352,17 +352,20 @@ class GatedAttention(nn.Module):
                                   hidden_size,
                                   num_heads * head_dim * 2,
                                   bias=config.attention_bias,
-                                  module_name=f"{module_prefix}.q_proj")
+                                  module_name=f"{module_prefix}.q_proj",
+                                  tp_mode=TPMode.COL)
         self.k_proj = make_linear(config,
                                   hidden_size,
                                   num_kv_heads * head_dim,
                                   bias=config.attention_bias,
-                                  module_name=f"{module_prefix}.k_proj")
+                                  module_name=f"{module_prefix}.k_proj",
+                                  tp_mode=TPMode.COL)
         self.v_proj = make_linear(config,
                                   hidden_size,
                                   num_kv_heads * head_dim,
                                   bias=config.attention_bias,
-                                  module_name=f"{module_prefix}.v_proj")
+                                  module_name=f"{module_prefix}.v_proj",
+                                  tp_mode=TPMode.COL)
         self._materialize_int4_v = (isinstance(
             self.v_proj, (AWQLinear, GPTQLinear, ModelOptAWQPrepackedLinear))
                                     and int4_gemm_plugin_version() == 2)
@@ -375,7 +378,8 @@ class GatedAttention(nn.Module):
         self.o_proj = make_linear(config,
                                   num_heads * head_dim,
                                   hidden_size,
-                                  module_name=f"{module_prefix}.o_proj")
+                                  module_name=f"{module_prefix}.o_proj",
+                                  tp_mode=TPMode.ROW)
 
         # Qwen3.5 full attention always has QK norm (residual-weight convention)
         self.q_norm = Qwen3_5RMSNorm(head_dim, eps=config.rms_norm_eps)

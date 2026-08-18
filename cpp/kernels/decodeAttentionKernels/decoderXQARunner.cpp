@@ -76,11 +76,12 @@ struct XQAKernelLoadHashKey
     int32_t sm;
     bool specDecode;
     bool pagedKVCache;
+    int32_t deviceId; //!< CUDA device ID for per-device kernel isolation.
 
     bool operator==(XQAKernelLoadHashKey const& other) const noexcept
     {
         return data_type == other.data_type && kv_data_type == other.kv_data_type && sm == other.sm
-            && specDecode == other.specDecode && pagedKVCache == other.pagedKVCache;
+            && specDecode == other.specDecode && pagedKVCache == other.pagedKVCache && deviceId == other.deviceId;
     }
 };
 
@@ -97,6 +98,7 @@ struct XQAKernelLoadHasher
         key ^= s.specDecode;
         key <<= 4;
         key ^= s.pagedKVCache;
+        key ^= (static_cast<size_t>(s.deviceId) << 24);
         return key;
     }
 };
@@ -559,12 +561,12 @@ class XQAKernelLoader
 public:
     //! @throws std::runtime_error if a CUDA driver error occurs
     XQAKernelList* getXQAKernelList(
-        XQADataType dataType, XQADataType kvDataType, int32_t sm, bool specDecode, bool pagedKVCache)
+        XQADataType dataType, XQADataType kvDataType, int32_t sm, bool specDecode, bool pagedKVCache, int32_t deviceId)
     {
         static std::mutex s_mutex;
         std::lock_guard<std::mutex> lg(s_mutex);
 
-        XQAKernelLoadHashKey hash_key{dataType, kvDataType, sm, specDecode, pagedKVCache};
+        XQAKernelLoadHashKey hash_key{dataType, kvDataType, sm, specDecode, pagedKVCache, deviceId};
 
         auto findIter = mKernels.find(hash_key);
         if (findIter == mKernels.end())
@@ -592,7 +594,9 @@ private:
 inline XQAKernelList* getXQAKernels(
     XQADataType dataType, XQADataType kvDataType, int32_t sm, bool specDecode, bool pagedKVCache)
 {
-    return XQAKernelLoader::Get().getXQAKernelList(dataType, kvDataType, sm, specDecode, pagedKVCache);
+    int32_t deviceId = 0;
+    CUDA_CHECK(cudaGetDevice(&deviceId));
+    return XQAKernelLoader::Get().getXQAKernelList(dataType, kvDataType, sm, specDecode, pagedKVCache, deviceId);
 }
 
 } // namespace

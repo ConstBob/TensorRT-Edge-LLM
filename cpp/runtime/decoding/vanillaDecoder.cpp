@@ -136,6 +136,13 @@ bool VanillaDecoder::decodeStep(DecodingInferenceContext& context)
         mapReducedVocabToFullVocab(mRuntime.sampling.indices, mRuntime.sampling.baseVocabMappingTable, context.stream);
     }
 
+    if (mRuntime.tokenBroadcast
+        && !mRuntime.tokenBroadcast(mRuntime.sampling.indices.rawPointer(), activeBatchSize, context.stream))
+    {
+        LOG_ERROR("Failed to broadcast vanilla decode sampled tokens for parallel rank %d.", mRuntime.parallelRank);
+        return false;
+    }
+
     // Enqueue logprobs extraction + D2H before the round's single synchronization so the
     // copies ride the same sync as the sampled-token D2H below.
     if (context.numLogprobs > 0)

@@ -17,21 +17,26 @@
 
 #pragma once
 
-#include "runtime/multiDevice/multiDevicePluginResources.h"
-#include "runtime/multiDevice/parallelConfig.h"
-
 #include <cstdint>
-#include <memory>
-#include <vector>
+#include <string>
 
 namespace trt_edgellm
 {
-namespace rt
+namespace parallel_artifacts
 {
 
-//! Create and register the SHM execution-path resources for one local tensor-parallel group.
-std::unique_ptr<PluginAllReducePathResources> createTensorParallelShmResources(int32_t tpSize,
-    std::vector<int32_t> localRanks, std::vector<int32_t> localDevices, ShmAllReduceConfig const& config);
+//! Describes one rank's artifact identity.
+struct RankArtifactContext
+{
+    int32_t worldSize{1};  //!< Full parallel world size.
+    int32_t globalRank{0}; //!< Global rank within the full parallel world.
+};
 
-} // namespace rt
+std::string onnxFileName(RankArtifactContext const& context);
+
+std::string configFileName(RankArtifactContext const& context);
+
+std::string engineFileName(RankArtifactContext const& context);
+
+} // namespace parallel_artifacts
 } // namespace trt_edgellm

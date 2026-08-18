@@ -32,29 +32,25 @@ inline constexpr int32_t kShmAllReduceWorldSize{2};
 constexpr int64_t kDefaultShmFp8SmallPathElementThreshold{8192};
 
 /// Opaque state for SHM-based AllReduce on Thor unified memory.
-/// Bypasses NCCL by using managed memory buffers + device-side barriers.
-/// The single-CTA paths are CUDA Graph compatible: their monotonic device
-/// barrier counters remain correct across graph replays. Multi-CTA paths are
-/// not graph safe and must only be selected outside CUDA Graph capture.
+/// Bypasses NCCL by using NUMA-local mapped pinned buffers and device-side barriers.
+/// The monotonic barrier and completion counters remain correct across CUDA
+/// Graph replays when both ranks launch matching graph instances in lockstep.
 struct ShmAllReduceState
 {
-    half* shmBuf;                         //!< Rank 0's SHM slot [maxElements], NUMA node 0
-    half* shmBuf1;                        //!< Rank 1's SHM slot [maxElements], NUMA node 1
-    unsigned int* barriers;               //!< [4] pinned — write[0..1], read[0..1] counters
-    unsigned int* tileBarriers;           //!< [maxTiles * 2] pinned — per-tile write-done counters
-    unsigned int* readBarriers;           //!< [maxTiles * 2] pinned — per-tile read-done counters
-    unsigned int* completionCounter;      //!< [2] pinned — multi-CTA reduce completion (one per rank)
-    int64_t maxElements;                  //!< Max half elements per AllReduce call
-    int64_t allReduceElementThreshold;    //!< Max FP16 elements routed to generic SHM AllReduce
-    int64_t fp8SmallPathElementThreshold; //!< FP8 fused-GEMM SHM path threshold; 0 disables FP8 SHM
-    int32_t tpSize;                       //!< Number of ranks (must be 2)
-    int32_t maxTiles;                     //!< Max output tiles for tile-pipelined reduce
-    // Bookkeeping for mpirun cross-process SHM cleanup:
-    void* mmapPtr{nullptr};       //!< Raw mmap pointer (for munmap on destroy)
-    size_t mmapBytes{0};          //!< Total mmap'd size
-    char const* shmName{nullptr}; //!< POSIX shm name (rank 0 unlinks on destroy)
-    int32_t shmRank{-1};          //!< Which mpirun rank this process is
-    // Host-side barrier for cross-process sync (lives in POSIX shm, not process-local).
+    half* shmBuf;                          //!< Rank 0's SHM slot [maxElements], NUMA node 0
+    half* shmBuf1;                         //!< Rank 1's SHM slot [maxElements], NUMA node 1
+    unsigned int* barriers;                //!< [4] pinned — write[0..1], read[0..1] counters
+    unsigned int* tileBarriers;            //!< [maxTiles * 2] pinned — per-tile write-done counters
+    unsigned int* readBarriers;            //!< [maxTiles * 2] pinned — per-tile read-done counters
+    unsigned int* completionCounter;       //!< [2] pinned — multi-CTA reduce completion (one per rank)
+    int64_t maxElements;                   //!< Max half elements per AllReduce call
+    int64_t allReduceElementThreshold;     //!< Max FP16 elements routed to generic SHM AllReduce
+    int64_t fp8SmallPathElementThreshold;  //!< Attention-output FP8 SHM threshold; 0 disables FP8 SHM
+    int32_t tpSize;                        //!< Number of ranks (must be 2)
+    int32_t maxTiles;                      //!< Max output tiles for tile-pipelined reduce
+    void* shmBufHost[2]{nullptr, nullptr}; //!< Host pointers for the rank-local pinned slots
+    void* controlHost{nullptr};            //!< Host pointer for the pinned control allocation
+    // Host-side barrier shared by the two rank worker threads.
     // The high bit is a terminal failure marker; lower bits are arrival tickets.
     uint64_t volatile* hostBarrierState{nullptr}; //!< Shared, aligned atomic ticket/failure state
 };
@@ -74,15 +70,14 @@ bool syncShmHostBarrier(ShmAllReduceState* state, int32_t rank,
 /// @param tpSize Must be 2
 /// @param maxElements Largest payload in FP16 elements (e.g., 256K for 32B model prefill)
 /// @param allReduceElementThreshold Largest generic FP16 payload routed to SHM; <=0 means maxElements
-/// @param fp8SmallPathElementThreshold Largest fused-plugin payload using FP8 SHM; 0 disables FP8 SHM
-/// @param sessionName POSIX shared-memory name. Must be non-empty and begin with '/'.
+/// @param fp8SmallPathElementThreshold Largest attention-output payload using FP8 SHM; 0 disables FP8 SHM
 /// @return Heap-allocated state (caller owns). nullptr on failure.
-ShmAllReduceState* shmAllReduceInit(int32_t tpSize, int64_t maxElements, int64_t allReduceElementThreshold,
-    int64_t fp8SmallPathElementThreshold, char const* sessionName);
+ShmAllReduceState* shmAllReduceInit(
+    int32_t tpSize, int64_t maxElements, int64_t allReduceElementThreshold, int64_t fp8SmallPathElementThreshold);
 
 /// Launch the SHM AllReduce kernel on the given stream.
 /// Payloads up to kShmSingleCtaMaxElements use the graph-safe single-CTA path.
-/// Larger payloads use a multi-CTA path and must not be launched during capture.
+/// Larger payloads use a multi-CTA path whose graph replay requires rank lockstep.
 /// @param state Initialized SHM state
 /// @param input Device pointer to this rank's input (FP16)
 /// @param output Device pointer for result (may equal input for in-place)
@@ -126,14 +121,14 @@ cudaError_t shmAllReduceExecFusedFp8(
 
 /// Multi-CTA FP8 AllReduce for large payloads.
 /// Two-kernel approach: barrier kernel (1 CTA) + grid-stride reduce (N CTAs).
-/// NOT graph-safe. Use only for non-captured paths.
+/// Graph replay requires both ranks to launch matching graph instances in lockstep.
 /// @return cudaSuccess, or the first CUDA kernel launch error
 cudaError_t shmAllReduceMultiCtaFp8(
     ShmAllReduceState* state, void* output, int64_t numElements, int32_t rank, cudaStream_t stream);
 
 /// Multi-CTA FP16 AllReduce for large payloads.
 /// Same two-kernel approach as FP8 but operates on FP16 data in shmBuf.
-/// NOT graph-safe. Use only for non-captured paths.
+/// Graph replay requires both ranks to launch matching graph instances in lockstep.
 /// @return cudaSuccess, or the first CUDA kernel launch error
 cudaError_t shmAllReduceMultiCtaFp16(
     ShmAllReduceState* state, void* output, int64_t numElements, int32_t rank, cudaStream_t stream);

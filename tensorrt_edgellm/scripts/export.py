@@ -782,16 +782,18 @@ def _collect_user_token_id(model_dir: str, root: dict) -> dict:
     return {}
 
 
-def _patch_multimodal_token_ids(model_dir: str, llm_out_dir: str,
-                                model_type: str) -> None:
-    """Inject multimodal special-token IDs into the exported LLM's ``config.json``.
+def _patch_multimodal_token_ids(model_dir: str,
+                                llm_out_dir: str,
+                                model_type: str,
+                                config_filename: str = "config.json") -> None:
+    """Inject multimodal special-token IDs into the exported LLM runtime config.
 
     Dispatches to the family-specific collector in priority order:
     thinker_config → Nemotron rename → tokenizer fallback.  Any IDs a
     later collector returns that aren't already set by an earlier one are
     merged in (handles hybrid layouts).
     """
-    cfg_path = os.path.join(llm_out_dir, "config.json")
+    cfg_path = os.path.join(llm_out_dir, config_filename)
     if not os.path.exists(cfg_path):
         return
 
@@ -930,6 +932,34 @@ def _cosmos3_edge_llm_key_remap(key: str) -> "Optional[str]":
     return key
 
 
+def _rank_suffix(world: int, rank: int) -> str:
+    if world <= 1:
+        return ""
+    return f"_world{world}_rank{rank}"
+
+
+def _world_suffix(world: int) -> str:
+    if world <= 1:
+        return ""
+    return f"_world{world}"
+
+
+def _is_speculative_model_config(config: "ModelConfig") -> bool:
+    return any(
+        bool(getattr(config, name, False)) for name in (
+            "is_eagle3_draft",
+            "eagle_base",
+            "is_dflash_draft",
+            "dflash_base",
+            "is_dspark_draft",
+            "dspark_base",
+            "is_mtp_draft",
+            "mtp_base",
+            "gemma4_mtp_draft",
+            "gemma4_mtp_base",
+        ))
+
+
 def _export_llm(model_dir: str,
                 llm_out_dir: str,
                 model_type: str = "",
@@ -956,7 +986,7 @@ def _export_llm(model_dir: str,
     """Export LLM backbone via the standard tensorrt_edgellm pipeline.
 
     When ``tp_size > 1``, exports ``tp_size`` per-rank ONNX files named
-    ``model_tp{N}_rank{R}.onnx`` (matches ``cpp/builder/llmBuilder.cpp``).
+    ``model_world{N}_rank{R}.onnx``.
     Each rank reloads the checkpoint fresh and shards weights to its
     slice on assignment.
     """
@@ -1007,17 +1037,12 @@ def _export_llm(model_dir: str,
                     GEMMA4_NVFP4_KEY_REMAP
                 key_remap = GEMMA4_NVFP4_KEY_REMAP
 
-    if tp_size <= 1:
-        ranks = [(0, 1)]
-        out_paths = [os.path.join(llm_out_dir, "model.onnx")]
-    else:
-        ranks = [(r, tp_size) for r in range(tp_size)]
-        out_paths = [
-            os.path.join(llm_out_dir, f"model_tp{tp_size}_rank{r}.onnx")
-            for r in range(tp_size)
-        ]
+    ranks = [(0, 1)] if tp_size <= 1 else [(r, tp_size)
+                                           for r in range(tp_size)]
 
-    for (rank, world), output_path in zip(ranks, out_paths):
+    for rank, world in ranks:
+        output_path = os.path.join(llm_out_dir,
+                                   f"model{_rank_suffix(world, rank)}.onnx")
         if world > 1:
             logger.info("[LLM] === rank %d / %d ===", rank, world)
 
@@ -1057,6 +1082,10 @@ def _export_llm(model_dir: str,
                 num_decoder_layers=num_decoder_layers,
                 extra_configs=_extra_configs,
             )
+            if world > 1 and _is_speculative_model_config(model.config):
+                raise ValueError(
+                    "Tensor-parallel speculative decoding export is not supported."
+                )
         except (OSError, ValueError, RuntimeError, ImportError) as exc:
             logger.exception("[LLM] Failed to load checkpoint")
             raise SystemExit(1) from exc
@@ -1080,11 +1109,13 @@ def _export_llm(model_dir: str,
                     "attention variant is not wired for skip-softmax yet)",
                     skip_softmax_scale_factor)
 
-        # Per-rank runtime config so each rank artifact is self-describing.
+        # Runtime config is shared at world scope; ONNX files remain rank-local.
         # Single-device exports keep the conventional "config.json".
-        config_filename = ("config.json" if world == 1 else
-                           f"config_tp{world}_rank{rank}.json")
+        config_filename = f"config{_world_suffix(world)}.json"
 
+        # Embedding and tokenizer files are shared across ranks, so write
+        # them once. Every rank may rewrite the shared config; rank metadata is
+        # canonicalized so common equal-split TP exports remain stable.
         logger.info("[LLM] Exporting to %s", output_path)
         try:
             from ..onnx.export import export_onnx
@@ -1094,7 +1125,8 @@ def _export_llm(model_dir: str,
                         fp8_embedding=fp8_embedding,
                         reduced_vocab_dir=reduced_vocab_dir,
                         externalize_weights=externalize_weights,
-                        config_filename=config_filename)
+                        config_filename=config_filename,
+                        write_shared_artifacts=(rank == 0))
         except (OSError, ValueError, RuntimeError) as exc:
             logger.exception("[LLM] ONNX export failed")
             raise SystemExit(1) from exc
@@ -1120,7 +1152,10 @@ def _export_llm(model_dir: str,
     # Source of truth: ``thinker_config`` (Qwen3-Omni) or root config
     # (Qwen-VL / Nemotron-Omni).  Naming conventions vary across checkpoints
     # — see :func:`_patch_multimodal_token_ids` for the fallback chain.
-    _patch_multimodal_token_ids(model_dir, llm_out_dir, model_type)
+    _patch_multimodal_token_ids(model_dir,
+                                llm_out_dir,
+                                model_type,
+                                config_filename=config_filename)
 
     # Standalone Talker checkpoints route through ``_export_llm`` (not the
     # qwen3_tts ``_export_talker``) because their model_type isn't in the
@@ -3921,10 +3956,10 @@ def main() -> None:
         dest="tp_size",
         type=int,
         default=1,
-        help=(
-            "Tensor-parallel world size (default: 1 = single device). "
-            "When >1, exports per-rank LLM ONNX files named "
-            "model_tp{N}_rank{R}.onnx (matching cpp/builder/llmBuilder.cpp)."),
+        help=
+        ("Tensor-parallel world size (default: 1 = single device). "
+         "When >1, exports per-rank LLM ONNX files named model_world{N}_rank{R}.onnx."
+         ),
     )
     p.add_argument(
         "--talker-sidecar-from",
@@ -4062,6 +4097,17 @@ def main() -> None:
 
     if args.mtp_tree_base:
         args.mtp = True
+    if args.tp_size > 1 and (args.eagle_base or args.mtp or args.dflash_base
+                             or args.dflash_tree_base or args.dflash_draft
+                             or args.dspark_base or args.dspark_draft
+                             or gemma4_mtp_requested):
+        p.error(
+            "Tensor-parallel speculative decoding export is not supported.")
+    if args.tp_size > 1 and externalize_weights:
+        p.error(
+            "--externalize-weights is not supported with --tp-size > 1 because its weight files and manifest "
+            "are not rank-local yet")
+
     if args.eagle_base and args.mtp:
         p.error("--eagle-base and --mtp cannot be enabled together")
     if args.eagle_draft_dir and not args.eagle_base:

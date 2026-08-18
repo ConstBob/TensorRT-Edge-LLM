@@ -41,6 +41,8 @@
 #include <cctype>
 #include <chrono>
 #include <cuda_runtime.h>
+#include <filesystem>
+#include <fstream>
 #include <nlohmann/json.hpp>
 #include <unordered_set>
 

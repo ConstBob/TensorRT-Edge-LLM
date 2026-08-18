@@ -90,8 +90,8 @@ TensorParallelPluginResources::TensorParallelPluginResources(TensorParallelPlugi
     {
         try
         {
-            mAllReducePaths.push_back(createTensorParallelShmResources(
-                config.tpSize, mLocalRanks, mLocalDevices, config.shmAllReduceConfig, config.shmSessionName));
+            mAllReducePaths.push_back(
+                createTensorParallelShmResources(config.tpSize, mLocalRanks, mLocalDevices, config.shmAllReduceConfig));
         }
         catch (std::bad_alloc const&)
         {

@@ -142,6 +142,10 @@ struct DecodingRuntimeContext
     LogitBias& logitBias;
     SamplingBuffers sampling;
     LogprobsBuffers logprobs;
+
+    //! Optional sampled-token synchronization callback. Rank 0 sends; peer ranks receive.
+    std::function<bool(void* buffer, int32_t count, cudaStream_t stream)> tokenBroadcast{};
+    int32_t parallelRank{-1};
 };
 
 class DecodingStrategy

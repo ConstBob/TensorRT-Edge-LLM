@@ -202,6 +202,70 @@ TEST_F(LLMEngineConfigTest, KVCapacityRejectsPageAlignmentOverflow)
     EXPECT_THROW(parseEngineConfig(path), std::runtime_error);
 }
 
+TEST_F(LLMEngineConfigTest, RankConfigsApplyOverridesForRequestedRank)
+{
+    Json json = makeMinimalConfig();
+    json["builder_config"]["tp_size"] = 2;
+    json["rank_configs"] = Json::array({
+        Json{{"rank", 0}, {"config_overrides", Json{{"num_key_value_heads", 2}}}},
+        Json{{"rank", 1}, {"config_overrides", Json{{"num_key_value_heads", 1}}}},
+    });
+    auto const path = writeJsonToTempFile(json);
+
+    LLMEngineConfig const cfg = parseEngineConfig(path, /*rank=*/1, /*expectedWorldSize=*/2);
+    EXPECT_EQ(cfg.numKVHeads, 1);
+}
+
+TEST_F(LLMEngineConfigTest, RankConfigsRequireUniqueRanks)
+{
+    Json json = makeMinimalConfig();
+    json["builder_config"]["tp_size"] = 2;
+    json["rank_configs"] = Json::array({Json{{"rank", 0}}, Json{{"rank", 0}}});
+    auto const path = writeJsonToTempFile(json);
+
+    EXPECT_THROW(parseEngineConfig(path, /*rank=*/0, /*expectedWorldSize=*/2), std::runtime_error);
+}
+
+TEST_F(LLMEngineConfigTest, RankConfigCountMustMatchTensorParallelSize)
+{
+    Json json = makeMinimalConfig();
+    json["builder_config"]["tp_size"] = 1;
+    json["rank_configs"] = Json::array({Json{{"rank", 0}}, Json{{"rank", 1}}});
+    auto const path = writeJsonToTempFile(json);
+
+    EXPECT_THROW(parseEngineConfig(path, /*rank=*/0, /*expectedWorldSize=*/2), std::runtime_error);
+}
+
+TEST_F(LLMEngineConfigTest, RankConfigCountMustMatchRuntimeWorldSize)
+{
+    Json json = makeMinimalConfig();
+    json["builder_config"]["tp_size"] = 2;
+    json["rank_configs"] = Json::array({Json{{"rank", 0}}, Json{{"rank", 1}}});
+    auto const path = writeJsonToTempFile(json);
+
+    EXPECT_THROW(parseEngineConfig(path, /*rank=*/0, /*expectedWorldSize=*/1), std::runtime_error);
+}
+
+// rank_configs describes rank-local differences and is required only when more than one rank participates.
+TEST_F(LLMEngineConfigTest, SingleDeviceConfigLoadsWithoutRankConfigs)
+{
+    Json json = makeMinimalConfig();
+    json["builder_config"]["tp_size"] = 1;
+    auto const path = writeJsonToTempFile(json);
+
+    LLMEngineConfig const cfg = parseEngineConfig(path, /*rank=*/0, /*expectedWorldSize=*/1);
+    EXPECT_EQ(cfg.numKVHeads, 4);
+}
+
+TEST_F(LLMEngineConfigTest, TensorParallelConfigRequiresRankConfigs)
+{
+    Json json = makeMinimalConfig();
+    json["builder_config"]["tp_size"] = 2;
+    auto const path = writeJsonToTempFile(json);
+
+    EXPECT_THROW(parseEngineConfig(path, /*rank=*/0, /*expectedWorldSize=*/2), std::runtime_error);
+}
+
 TEST_F(LLMEngineConfigTest, ReducedVocabSize)
 {
     Json json = makeMinimalConfig();

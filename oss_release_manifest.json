@@ -29,14 +29,18 @@
       "cpp/plugins/allReducePlugin/allReducePlugin.h",
       "cpp/plugins/fusedNvfp4GemmAllReducePlugin/fusedNvfp4GemmAllReducePlugin.cpp",
       "cpp/plugins/fusedNvfp4GemmAllReducePlugin/fusedNvfp4GemmAllReducePlugin.h",
-      "cpp/runtime/multiDevice/multiDevicePluginResourceFactory.cpp",
-      "cpp/runtime/multiDevice/multiDevicePluginResourceFactory.h",
       "cpp/runtime/multiDevice/multiDevicePluginCommRegistry.cpp",
       "cpp/runtime/multiDevice/multiDevicePluginCommRegistry.h",
-      "cpp/runtime/multiDevice/tensorParallelPluginResources.cpp",
-      "cpp/runtime/multiDevice/tensorParallelPluginResources.h",
+      "cpp/runtime/multiDevice/multiDevicePluginResourceFactory.cpp",
+      "cpp/runtime/multiDevice/multiDevicePluginResourceFactory.h",
       "cpp/runtime/multiDevice/parallelConfig.cpp",
       "cpp/runtime/multiDevice/parallelConfig.h",
+      "cpp/runtime/multiDevice/runtimeCoordinator.cpp",
+      "cpp/runtime/multiDevice/runtimeCoordinator.h",
+      "cpp/runtime/multiDevice/tensorParallelPluginResources.cpp",
+      "cpp/runtime/multiDevice/tensorParallelPluginResources.h",
+      "docs/source/user_guide/features/multi-device.md",
+      "examples/llm/llm_inference.cpp",
       "unittests/parallelConfigTest.cpp"
     ],
     "forbidden_patterns": [
@@ -45,14 +49,15 @@
       "ShmAllReduce",
       "EDGELLM_SHM",
       "SuperThor",
+      "pinThreadToNumaNode",
       "enableShmAllReduce",
       "shmMaxElements",
       "shmAllReduceElementThreshold",
       "shmFp8SmallPathElementThreshold",
-      "shmSessionName",
       "TensorParallelShmResources",
       "syncShmHostBarrier",
-      "AllReducePathType::kShm"
+      "AllReducePathType::kShm",
+      "test_shm_allreduce"
     ]
   }
 }

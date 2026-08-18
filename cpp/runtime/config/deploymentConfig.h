@@ -168,7 +168,8 @@ struct DeploymentConfig
 //! @throws std::runtime_error on any validation failure or parse failure.
 DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigPath,
     std::optional<std::filesystem::path> const& draftConfigPath,
-    std::optional<SpecDecodeDraftingConfig> const& draftingConfig);
+    std::optional<SpecDecodeDraftingConfig> const& draftingConfig, std::optional<int32_t> rank = std::nullopt,
+    std::optional<int32_t> expectedWorldSize = std::nullopt);
 
 } // namespace rt
 } // namespace trt_edgellm

@@ -127,11 +127,12 @@ struct LLMGenerationRequest
     //! \endcond
     std::vector<Request> requests; //!< Vector of requests for a batch
     mutable std::vector<FormattedRequest>
-        formattedRequests;                 //!< Formatted requests (mutable to allow runtime modification)
-    float temperature;                     //!< Temperature parameter for sampling
-    float topP;                            //!< Top-p (nucleus) sampling parameter
-    int64_t topK;                          //!< Top-k sampling parameter
-    int64_t maxGenerateLength;             //!< Max length of the generated tokens
+        formattedRequests; //!< Formatted requests (mutable to allow runtime modification)
+    std::vector<std::vector<int32_t>> preTokenizedInputIds; //!< Optional pre-tokenized text inputs, one per request.
+    float temperature;                                      //!< Temperature parameter for sampling
+    float topP;                                             //!< Top-p (nucleus) sampling parameter
+    int64_t topK;                                           //!< Top-k sampling parameter
+    int64_t maxGenerateLength;                              //!< Max length of the generated tokens
     int32_t diffusionMaxDenoisingSteps{0}; //!< Optional DiffusionGemma denoise-step override (0 = runtime default)
     std::string loraWeightsName{""};       //!< Name of the LoRA weights. Default to empty string for no LoRA weights
 
