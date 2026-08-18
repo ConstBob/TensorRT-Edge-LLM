@@ -305,7 +305,8 @@ int32_t DeploymentConfig::maxAcceptedTokensPerRound() const
 
 DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigPath,
     std::optional<std::filesystem::path> const& draftConfigPath,
-    std::optional<SpecDecodeDraftingConfig> const& draftingConfig)
+    std::optional<SpecDecodeDraftingConfig> const& draftingConfig, std::optional<int32_t> rank,
+    std::optional<int32_t> expectedWorldSize)
 {
     DeploymentConfig cfg;
 
@@ -315,7 +316,7 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
         "SpecDecode drafting requires a draft engine config.");
 
     // --- Parse base ---
-    cfg.base = parseEngineConfig(baseConfigPath);
+    cfg.base = parseEngineConfig(baseConfigPath, rank, expectedWorldSize);
 
     ELLM_CHECK(!cfg.base.isDiffusionBackbone || !draftingConfig.has_value(),
         "DiffusionGemma block diffusion engines do not support speculative decoding drafting.");

@@ -65,10 +65,11 @@ struct ParallelBackendHandles
 //! Optional SHM all-reduce enablement and sizing configuration.
 struct ShmAllReduceConfig
 {
-    bool enableShmAllReduce{true};                 //!< Enable local SHM all-reduce fast path when supported.
-    int64_t shmMaxElements{0};                     //!< SHM all-reduce capacity override in FP16 elements.
-    int64_t shmAllReduceElementThreshold{0};       //!< FP16 SHM-vs-NCCL threshold; <=0 means shmMaxElements.
-    int64_t shmFp8SmallPathElementThreshold{8192}; //!< Fused plugin FP8 SHM threshold; 0 disables FP8 SHM.
+    bool enableShmAllReduce{true}; //!< Enable local SHM all-reduce fast path when supported.
+    int64_t shmMaxElements{0};     //!< Capacity in FP16 elements; 0 derives it from the engine's maximum input shape.
+    int64_t shmAllReduceElementThreshold{0};       //!< FP16 SHM-vs-NCCL threshold; 0 uses the derived capacity.
+    int64_t shmFp8SmallPathElementThreshold{8192}; //!< Attention-output FP8 decode threshold; 0 keeps FP16. This
+                                                   //!< is an internal execution policy, not a user configuration.
 };
 
 // {$edge-llm-internal-release end}

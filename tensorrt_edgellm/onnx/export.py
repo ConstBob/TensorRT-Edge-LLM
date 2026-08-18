@@ -78,6 +78,7 @@ def export_onnx(
     reduced_vocab_dir: str = "",
     externalize_weights=None,
     config_filename: str = "config.json",
+    write_shared_artifacts: bool = True,
 ) -> None:
     """Export *model* to ONNX using the dynamo exporter.
 
@@ -101,8 +102,11 @@ def export_onnx(
                              ``nvfp4_moe``, ``lm_head``, and ``all``.
         config_filename: Filename for the runtime config beside the ONNX.
                          Use ``"config.json"`` for single-device exports
-                         or ``"config_tp{N}_rank{R}.json"`` for per-rank
-                         TP exports so each rank is self-describing.
+                         or ``"config_world{N}.json"`` for multi-rank
+                         exports.
+        write_shared_artifacts: Emit shared embedding/tokenizer files. Set to
+                                False on non-rank-0 per-rank exports to avoid
+                                redundant rewrites of identical sidecar files.
     """
     out_dir = os.path.dirname(os.path.abspath(output_path))
     os.makedirs(out_dir, exist_ok=True)
@@ -123,7 +127,8 @@ def export_onnx(
                             out_dir,
                             fp8_embedding=fp8_embedding,
                             reduced_vocab_dir=reduced_vocab_dir,
-                            config_filename=config_filename)
+                            config_filename=config_filename,
+                            write_shared_artifacts=write_shared_artifacts)
     if external_weight_files:
         patch_external_weight_manifest(out_dir, external_weight_files)
 
@@ -994,7 +999,7 @@ def _fix_initializer_dtypes(
     # opens the file in r+b mode and appends new tensors at the end, so the
     # old data would remain as unreferenced garbage, doubling the file size.
     # Derive the data filename from onnx_path so per-rank TP exports
-    # (model_tp{N}_rank{R}.onnx) get distinct .data files instead of
+    # (model_world{N}_rank{R}.onnx) get distinct .data files instead of
     # all overwriting the same model.onnx.data.
     data_file = os.path.basename(onnx_path) + ".data"
     ext_path = os.path.join(os.path.dirname(onnx_path), data_file)

@@ -21,7 +21,6 @@
 
 #include <cstdint>
 #include <memory>
-#include <string>
 #include <vector>
 
 namespace trt_edgellm
@@ -40,7 +39,6 @@ struct MultiDevicePluginResourceConfig
     bool ownsBackendHandles{true}; //!< Transfer ownership of non-empty externally supplied backend handles.
     // {$edge-llm-internal-release begin}
     ShmAllReduceConfig shmAllReduceConfig{};
-    std::string shmSessionName{}; //!< POSIX SHM session name for local TP resources.
     // {$edge-llm-internal-release end}
 };
 

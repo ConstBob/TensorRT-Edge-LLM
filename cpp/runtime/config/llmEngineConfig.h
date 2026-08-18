@@ -291,7 +291,8 @@ struct LLMEngineConfig
 //! @param configPath  Path to `config.json`.
 //! @return Parsed configuration.
 //! @throws std::runtime_error if file cannot be opened/parsed or required fields are missing.
-LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath);
+LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath, std::optional<int32_t> rank = std::nullopt,
+    std::optional<int32_t> expectedWorldSize = std::nullopt);
 
 //! Parse a SpecDecode draft engine's `config.json` into an `LLMEngineConfig`.
 //!

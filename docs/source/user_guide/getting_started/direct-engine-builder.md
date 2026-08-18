@@ -113,6 +113,17 @@ different recorded identity is rejected before CUDA page registration. Each
 engine build reports checkpoint-identity, TensorRT, and remaining frontend
 time separately.
 
+Tensor-parallel builds keep TensorRT-native dense weights and small FP16
+normalization parameters in each rank engine. Checkpoint-backed embeddings
+stay outside the plan, and eligible FP16 output heads can do likewise. For
+supported NVFP4 models, fused `o_proj` and `down_proj` plugins carry
+rank-neutral recipes for packed weights and block scales. Each runtime rank
+loads only its local input-axis shard and registers those immutable buffers as
+plugin resources; they do not add TensorRT input bindings. Tensors required by
+every rank, including the current Qwen embedding contract, remain replicated.
+This preserves the TensorRT-native lowering used by the single-device NVFP4
+path while avoiding full copies of the shardable fused-plugin tensors.
+
 ## Run The Engines
 
 Use the same C++ runtime and request JSON used by the ONNX workflow. A
@@ -178,10 +189,12 @@ See the [examples](../examples/index.md) for each runtime's request format.
 `--checkpointDir` is required. During runtime initialization, Edge-LLM maps
 provider safetensors or indexed contiguous tensor ranges from PyTorch ZIP
 `.bin` checkpoints, performs all requested casts, transposes, packing, scale
-conversion, and direct final-layout writes, synchronizes the preparation
-stream, and releases the checkpoint mappings. The inference path sees only
-immutable final-layout TensorRT inputs and performs no weight conversion or
-allocation.
+conversion, and direct final-layout writes. It then synchronizes the
+preparation stream and releases the checkpoint mappings. Most prepared tensors
+are immutable TensorRT inputs. Fused NVFP4 tensor-parallel `o_proj` and
+`down_proj` weights are immutable plugin resources addressed by a serialized
+resource id instead, so they do not enlarge the TensorRT binding table. The
+inference path performs no weight conversion or allocation.
 
 For tied FP16/BF16 token embeddings and output projections with identical
 runtime conversion contracts, both runtime tensors share one weight-arena
@@ -274,7 +287,9 @@ rejected for native Qwen MTP because its draft layers are in
 
 Tensor parallelism currently builds one rank per invocation. Invoke the command
 once for each `--tp-rank` and place the rank artifacts according to the normal
-multi-GPU runtime layout.
+multi-GPU runtime layout. Tensor-parallel direct builds currently support the
+LLM component without speculative decoding; tensor-parallel speculative
+decoding is not supported.
 
 ## Support And Validation Status
 

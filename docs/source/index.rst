@@ -41,6 +41,7 @@ and action models on NVIDIA edge platforms.
 
    user_guide/features/lora.md
    user_guide/features/quantization.md
+   user_guide/features/multi-device.md
    user_guide/features/reduce-vocab.md
    user_guide/features/FP8KV.md
    user_guide/features/fp8-embedding.md

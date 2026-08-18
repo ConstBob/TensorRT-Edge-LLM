@@ -360,6 +360,86 @@ bool isDSparkDraftConfig(LLMEngineConfig const& config)
     return config.specDecodeType == SpecDecodeMode::kDSpark && !config.isSpecDecodeBase;
 }
 
+void validateAndApplyRankConfigOverrides(
+    Json& configJson, std::optional<int32_t> rank, std::optional<int32_t> expectedWorldSize, char const* parserName)
+{
+    std::string const errorPrefix = std::string(parserName) + ": ";
+    ELLM_CHECK(!expectedWorldSize.has_value() || *expectedWorldSize > 0,
+        errorPrefix + "expected world size must be positive, got " + std::to_string(*expectedWorldSize) + ".");
+
+    std::optional<int32_t> serializedTpSize;
+    if (configJson.contains("builder_config") && configJson["builder_config"].is_object()
+        && configJson["builder_config"].contains("tp_size"))
+    {
+        Json const& tpSizeJson = configJson["builder_config"]["tp_size"];
+        ELLM_CHECK(tpSizeJson.is_number_integer(), errorPrefix + "builder_config.tp_size must be an integer.");
+        serializedTpSize = tpSizeJson.get<int32_t>();
+        ELLM_CHECK(*serializedTpSize > 0,
+            errorPrefix + "builder_config.tp_size must be positive, got " + std::to_string(*serializedTpSize) + ".");
+    }
+
+    if (!configJson.contains("rank_configs"))
+    {
+        bool const requiresRankConfigs = (expectedWorldSize.has_value() && *expectedWorldSize > 1)
+            || (serializedTpSize.has_value() && *serializedTpSize > 1);
+        ELLM_CHECK(!requiresRankConfigs, errorPrefix + "multi-device config requires rank_configs.");
+        ELLM_CHECK(
+            !expectedWorldSize.has_value() || !serializedTpSize.has_value() || *expectedWorldSize == *serializedTpSize,
+            errorPrefix + "builder_config.tp_size (" + std::to_string(*serializedTpSize)
+                + ") does not match runtime world size (" + std::to_string(*expectedWorldSize) + ").");
+        return;
+    }
+
+    ELLM_CHECK(configJson["rank_configs"].is_array(), errorPrefix + "rank_configs must be an array when present.");
+    ELLM_CHECK(serializedTpSize.has_value(),
+        errorPrefix + "config with rank_configs must contain integer builder_config.tp_size.");
+
+    Json const& rankConfigs = configJson["rank_configs"];
+    int32_t const rankConfigCount = static_cast<int32_t>(rankConfigs.size());
+    ELLM_CHECK(rankConfigCount > 0, errorPrefix + "rank_configs must not be empty.");
+    ELLM_CHECK(*serializedTpSize == rankConfigCount,
+        errorPrefix + "rank_configs length (" + std::to_string(rankConfigCount)
+            + ") does not match builder_config.tp_size (" + std::to_string(*serializedTpSize) + ").");
+    ELLM_CHECK(!expectedWorldSize.has_value() || *expectedWorldSize == rankConfigCount,
+        errorPrefix + "rank_configs length (" + std::to_string(rankConfigCount)
+            + ") does not match runtime world size (" + std::to_string(*expectedWorldSize) + ").");
+    ELLM_CHECK(!rank.has_value() || (*rank >= 0 && *rank < rankConfigCount),
+        errorPrefix + "requested rank " + std::to_string(*rank) + " is outside [0, " + std::to_string(rankConfigCount)
+            + ").");
+
+    std::vector<bool> seenRanks(static_cast<size_t>(rankConfigCount), false);
+    Json selectedOverrides = Json::object();
+    bool selectedRankFound = !rank.has_value();
+    for (auto const& rankConfig : rankConfigs)
+    {
+        ELLM_CHECK(rankConfig.is_object() && rankConfig.contains("rank") && rankConfig["rank"].is_number_integer(),
+            errorPrefix + "each rank_configs entry must be an object with an integer rank field.");
+        int32_t const entryRank = rankConfig["rank"].get<int32_t>();
+        ELLM_CHECK(entryRank >= 0 && entryRank < rankConfigCount,
+            errorPrefix + "rank_configs rank " + std::to_string(entryRank) + " is outside [0, "
+                + std::to_string(rankConfigCount) + ").");
+        ELLM_CHECK(!seenRanks[static_cast<size_t>(entryRank)],
+            errorPrefix + "rank_configs contains duplicate rank " + std::to_string(entryRank) + ".");
+        seenRanks[static_cast<size_t>(entryRank)] = true;
+
+        ELLM_CHECK(!rankConfig.contains("config_overrides") || rankConfig["config_overrides"].is_object(),
+            errorPrefix + "rank_configs[" + std::to_string(entryRank)
+                + "].config_overrides must be an object when present.");
+        if (rank.has_value() && entryRank == *rank)
+        {
+            selectedRankFound = true;
+            selectedOverrides = rankConfig.value("config_overrides", Json::object());
+        }
+    }
+
+    ELLM_CHECK(selectedRankFound,
+        errorPrefix + "config contains rank_configs but no entry for rank " + std::to_string(*rank) + ".");
+    for (auto it = selectedOverrides.begin(); it != selectedOverrides.end(); ++it)
+    {
+        configJson[it.key()] = it.value();
+    }
+}
+
 //! Helper: parse explicit sliding/full RoPE config blocks when present.
 void parseDualRopeFields(Json const& configJson, LLMEngineConfig& cfg)
 {
@@ -586,7 +666,8 @@ void populateLayerTypes(Json const& configJson, LLMEngineConfig& cfg)
 
 } // namespace
 
-LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
+LLMEngineConfig parseEngineConfig(
+    std::filesystem::path const& configPath, std::optional<int32_t> rank, std::optional<int32_t> expectedWorldSize)
 {
     LOG_INFO("reading %s", configPath.string().c_str());
 
@@ -603,6 +684,7 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
         throw std::runtime_error("parseEngineConfig: JSON parse error in " + configPath.string() + ": " + e.what());
     }
     ifs.close();
+    validateAndApplyRankConfigOverrides(configJson, rank, expectedWorldSize, "parseEngineConfig");
 
     // Optional version check.
     std::string const modelVersion = configJson.value(binding_names::kEdgellmVersion, "");
@@ -824,7 +906,6 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath)
             "parseDraftEngineConfig: JSON parse error in " + configPath.string() + ": " + e.what());
     }
     ifs.close();
-
     LLMEngineConfig cfg;
 
     cfg.specDecodeType = parseSpecDecodeMode(configJson);

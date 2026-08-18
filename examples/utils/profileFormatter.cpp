@@ -702,6 +702,46 @@ void addJsonMemorySummary(nlohmann::json& summary, MemoryMonitor const& memoryMo
     summary["gpu_memory_metric"] = memoryMonitor.getGpuMemoryMetric();
 }
 
+void addJsonMemorySummary(nlohmann::json& summary, MemoryMonitor const& memoryMonitor, int32_t tpSize,
+    std::string const& launchMode, std::vector<RankMemorySummary> const& rankMemory)
+{
+    addJsonMemorySummary(summary, memoryMonitor);
+
+    nlohmann::json memoryJson{
+        {"launch_mode", launchMode}, {"tp_size", tpSize}, {"gpu_memory_metric", memoryMonitor.getGpuMemoryMetric()}};
+    nlohmann::json rankMemoryJson = nlohmann::json::array();
+    size_t totalRankGpuMemoryBytes = 0;
+    size_t maxRankGpuMemoryBytes = 0;
+    size_t totalRankCpuMemoryBytes = 0;
+    size_t maxRankCpuMemoryBytes = 0;
+    for (RankMemorySummary const& rank : rankMemory)
+    {
+        rankMemoryJson.push_back(
+            {{"rank", rank.rank}, {"device", rank.device}, {"peak_gpu_memory_bytes", rank.peakGpuMemoryBytes},
+                {"peak_gpu_memory_mb", rt::utils::toMB(rank.peakGpuMemoryBytes)},
+                {"peak_cpu_memory_bytes", rank.peakCpuMemoryBytes},
+                {"peak_cpu_memory_mb", rt::utils::toMB(rank.peakCpuMemoryBytes)}});
+        totalRankGpuMemoryBytes += rank.peakGpuMemoryBytes;
+        maxRankGpuMemoryBytes = std::max(maxRankGpuMemoryBytes, rank.peakGpuMemoryBytes);
+        totalRankCpuMemoryBytes += rank.peakCpuMemoryBytes;
+        maxRankCpuMemoryBytes = std::max(maxRankCpuMemoryBytes, rank.peakCpuMemoryBytes);
+    }
+
+    if (!rankMemoryJson.empty())
+    {
+        memoryJson["rank_memory"] = std::move(rankMemoryJson);
+        memoryJson["peak_total_rank_gpu_memory_bytes"] = totalRankGpuMemoryBytes;
+        memoryJson["peak_total_rank_gpu_memory_mb"] = rt::utils::toMB(totalRankGpuMemoryBytes);
+        memoryJson["peak_max_rank_gpu_memory_bytes"] = maxRankGpuMemoryBytes;
+        memoryJson["peak_max_rank_gpu_memory_mb"] = rt::utils::toMB(maxRankGpuMemoryBytes);
+        memoryJson["peak_total_rank_cpu_memory_bytes"] = totalRankCpuMemoryBytes;
+        memoryJson["peak_total_rank_cpu_memory_mb"] = rt::utils::toMB(totalRankCpuMemoryBytes);
+        memoryJson["peak_max_rank_cpu_memory_bytes"] = maxRankCpuMemoryBytes;
+        memoryJson["peak_max_rank_cpu_memory_mb"] = rt::utils::toMB(maxRankCpuMemoryBytes);
+    }
+    summary["memory"] = std::move(memoryJson);
+}
+
 /**
  * @brief Sanitize a string to ensure it contains valid UTF-8 before JSON serialization
  *

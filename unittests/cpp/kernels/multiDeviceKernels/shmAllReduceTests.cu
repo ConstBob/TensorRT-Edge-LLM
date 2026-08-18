@@ -23,11 +23,12 @@
 
 #include <gtest/gtest.h>
 
+#include "common/cudaUtils.h"
 #include "kernels/multiDeviceKernels/shmAllReduce.h"
 
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
-#include <cstdio>
 #include <cstring>
 #include <cuda_fp16.h>
 #include <exception>
@@ -35,7 +36,6 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <unistd.h>
 #include <vector>
 
 using namespace trt_edgellm::kernels;
@@ -200,22 +200,60 @@ void runReduceTest(ShmAllReduceState* state, int32_t rank, ThreadBarrier& barrie
     barrier.wait();
 }
 
-void runRank(int32_t rank, char const* shmName, ThreadBarrier& barrier, RankResult& result)
+void runGraphReplayTest(ShmAllReduceState* state, int32_t rank, ThreadBarrier& barrier)
 {
-    ShmAllReduceState* state{nullptr};
+    constexpr int32_t kReplayCount{8};
+    cudaStream_t stream{};
+    cudaGraph_t graph{};
+    cudaGraphExec_t graphExec{};
+    half* dOutput{nullptr};
+
+    CHECK_CUDA_RANK(cudaStreamCreate(&stream), rank);
+    CHECK_CUDA_RANK(cudaMalloc(&dOutput, kMaxElements * sizeof(half)), rank);
+    CHECK_CUDA_RANK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), rank);
+    CHECK_CUDA_RANK(shmAllReduceMultiCtaFp16(state, dOutput, kMaxElements, rank, stream), rank);
+    CHECK_CUDA_RANK(cudaStreamEndCapture(stream, &graph), rank);
+    CHECK_CUDA_RANK(trt_edgellm::instantiateCudaGraph(&graphExec, graph), rank);
+
+    barrier.wait();
+    for (int32_t replay = 0; replay < kReplayCount; ++replay)
+    {
+        CHECK_CUDA_RANK(cudaGraphLaunch(graphExec, stream), rank);
+        CHECK_CUDA_RANK(cudaStreamSynchronize(stream), rank);
+        barrier.wait();
+    }
+
+    std::vector<half> hostOut(kMaxElements);
+    CHECK_CUDA_RANK(cudaMemcpy(hostOut.data(), dOutput, kMaxElements * sizeof(half), cudaMemcpyDeviceToHost), rank);
+    for (int32_t i = 0; i < kMaxElements; ++i)
+    {
+        float const value = __half2float(hostOut[i]);
+        if (std::fabs(value - kReduceExpectedValue) > kTolerance)
+        {
+            throw std::runtime_error("graph replay allreduce mismatch at element " + std::to_string(i) + ": got "
+                + std::to_string(value) + ", expected " + std::to_string(kReduceExpectedValue));
+        }
+    }
+
+    CHECK_CUDA_RANK(cudaGraphExecDestroy(graphExec), rank);
+    CHECK_CUDA_RANK(cudaGraphDestroy(graph), rank);
+    CHECK_CUDA_RANK(cudaFree(dOutput), rank);
+    CHECK_CUDA_RANK(cudaStreamDestroy(stream), rank);
+    barrier.wait();
+}
+
+void runRank(int32_t rank, ShmAllReduceState* state, ThreadBarrier& barrier, RankResult& result)
+{
     try
     {
         CHECK_CUDA_RANK(cudaSetDevice(rank), rank);
-        state = shmAllReduceInit(kWorldSize, kMaxElements, /*allReduceElementThreshold=*/0,
-            kDefaultShmFp8SmallPathElementThreshold, shmName);
-        if (state == nullptr)
-        {
-            throw std::runtime_error("shmAllReduceInit failed");
-        }
-
         barrier.wait();
         runVisibilityTest(state, rank, barrier);
         runReduceTest(state, rank, barrier);
+        // RuntimeCoordinator captures TP ranks in lockstep. Mixed captured/eager peers are unsupported because
+        // collectives must execute the same path and launch order on every rank, so this test intentionally captures
+        // both ranks.
+        runGraphReplayTest(state, rank, barrier);
         barrier.wait();
 
         result.passed = true;
@@ -230,16 +268,50 @@ void runRank(int32_t rank, char const* shmName, ThreadBarrier& barrier, RankResu
         result.error = "unknown failure";
         barrier.abort();
     }
-
-    if (state != nullptr)
-    {
-        shmAllReduceDestroy(state);
-    }
 }
 
 } // namespace
 
-TEST(ShmAllReduceTest, ThreadedFp16MultiCta)
+TEST(ShmAllReduceTest, HostRendezvousTimeoutPublishesFailureToLatePeer)
+{
+    alignas(uint64_t) uint64_t barrierState{};
+    ShmAllReduceState state{};
+    state.hostBarrierState = &barrierState;
+
+    constexpr uint64_t kFailureBit{uint64_t{1} << 63};
+    EXPECT_FALSE(syncShmHostBarrier(&state, 0, std::chrono::milliseconds{1}));
+    EXPECT_NE(barrierState & kFailureBit, uint64_t{0});
+    uint64_t const failedState = barrierState;
+
+    auto const start = std::chrono::steady_clock::now();
+    // A published failure lets a late peer return immediately instead of waiting for its own timeout.
+    EXPECT_FALSE(syncShmHostBarrier(&state, 1, std::chrono::seconds{1}));
+    auto const elapsed
+        = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+
+    EXPECT_LT(elapsed.count(), 500);
+    EXPECT_EQ(barrierState, failedState);
+}
+
+TEST(ShmAllReduceTest, HostRendezvousCompletesWhenBothRanksArrive)
+{
+    alignas(uint64_t) uint64_t barrierState{};
+    ShmAllReduceState state{};
+    state.hostBarrierState = &barrierState;
+
+    bool rank0Result{false};
+    bool rank1Result{false};
+    std::thread rank0([&]() { rank0Result = syncShmHostBarrier(&state, 0, std::chrono::seconds{1}); });
+    std::thread rank1([&]() { rank1Result = syncShmHostBarrier(&state, 1, std::chrono::seconds{1}); });
+    rank0.join();
+    rank1.join();
+
+    EXPECT_TRUE(rank0Result);
+    EXPECT_TRUE(rank1Result);
+    EXPECT_EQ(barrierState, uint64_t{2});
+}
+
+TEST(ShmAllReduceTest, ThreadedFp16MultiCtaAndGraphReplay)
 {
     int deviceCount{0};
     CHECK_CUDA_RANK(cudaGetDeviceCount(&deviceCount), 0);
@@ -248,15 +320,18 @@ TEST(ShmAllReduceTest, ThreadedFp16MultiCta)
         GTEST_SKIP() << "requires at least " << kWorldSize << " CUDA devices, found " << deviceCount;
     }
 
-    char shmName[128];
-    std::snprintf(shmName, sizeof(shmName), "/edgellm_shm_ar_threaded_%d", static_cast<int>(getpid()));
+    CHECK_CUDA_RANK(cudaSetDevice(0), 0);
+    ShmAllReduceState* state = shmAllReduceInit(
+        kWorldSize, kMaxElements, /*allReduceElementThreshold=*/0, kDefaultShmFp8SmallPathElementThreshold);
+    ASSERT_NE(state, nullptr);
+
     ThreadBarrier barrier(kWorldSize);
     std::vector<RankResult> results(kWorldSize);
     std::vector<std::thread> workers;
     workers.reserve(kWorldSize);
     for (int32_t rank = 0; rank < kWorldSize; ++rank)
     {
-        workers.emplace_back([rank, shmName, &barrier, &results]() { runRank(rank, shmName, barrier, results[rank]); });
+        workers.emplace_back([rank, state, &barrier, &results]() { runRank(rank, state, barrier, results[rank]); });
     }
 
     for (std::thread& worker : workers)
@@ -268,4 +343,5 @@ TEST(ShmAllReduceTest, ThreadedFp16MultiCta)
     {
         EXPECT_TRUE(results[rank].passed) << "rank " << rank << " failed: " << results[rank].error;
     }
+    shmAllReduceDestroy(state);
 }

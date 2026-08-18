@@ -43,7 +43,7 @@ std::unique_ptr<MultiDevicePluginResources> createTensorParallelPluginResources(
         config.groupConfig.size, config.localRanks, config.localDevices, config.backendHandles,
         config.ownsBackendHandles,
         // {$edge-llm-internal-release begin}
-        config.shmAllReduceConfig, config.shmSessionName
+        config.shmAllReduceConfig
         // {$edge-llm-internal-release end}
     };
     return std::make_unique<TensorParallelPluginResources>(resourcesConfig);

@@ -38,12 +38,11 @@ class TensorParallelShmResources final : public PluginAllReducePathResources
 {
 public:
     TensorParallelShmResources(int32_t tpSize, std::vector<int32_t> localRanks, std::vector<int32_t> localDevices,
-        ShmAllReduceConfig const& shmAllReduceConfig, std::string shmSessionName)
+        ShmAllReduceConfig const& shmAllReduceConfig)
         : mTpSize(tpSize)
         , mLocalRanks(std::move(localRanks))
         , mLocalDevices(std::move(localDevices))
         , mShmAllReduceConfig(shmAllReduceConfig)
-        , mShmSessionName(std::move(shmSessionName))
     {
         try
         {
@@ -132,8 +131,7 @@ private:
 
         CudaDeviceGuard deviceGuard(mLocalDevices.front());
         mShmState = kernels::shmAllReduceInit(mTpSize, mShmAllReduceConfig.shmMaxElements,
-            mShmAllReduceConfig.shmAllReduceElementThreshold, mShmAllReduceConfig.shmFp8SmallPathElementThreshold,
-            mShmSessionName.c_str());
+            mShmAllReduceConfig.shmAllReduceElementThreshold, mShmAllReduceConfig.shmFp8SmallPathElementThreshold);
         ELLM_CHECK(mShmState != nullptr, "shmAllReduceInit failed.");
     }
 
@@ -150,7 +148,6 @@ private:
     std::vector<int32_t> mLocalRanks{};
     std::vector<int32_t> mLocalDevices{};
     ShmAllReduceConfig mShmAllReduceConfig{};
-    std::string mShmSessionName{};
     kernels::ShmAllReduceState* mShmState{nullptr};
     size_t mRegisteredCount{0};
 };
@@ -158,11 +155,9 @@ private:
 } // namespace
 
 std::unique_ptr<PluginAllReducePathResources> createTensorParallelShmResources(int32_t tpSize,
-    std::vector<int32_t> localRanks, std::vector<int32_t> localDevices, ShmAllReduceConfig const& config,
-    std::string sessionName)
+    std::vector<int32_t> localRanks, std::vector<int32_t> localDevices, ShmAllReduceConfig const& config)
 {
-    return std::make_unique<TensorParallelShmResources>(
-        tpSize, std::move(localRanks), std::move(localDevices), config, std::move(sessionName));
+    return std::make_unique<TensorParallelShmResources>(tpSize, std::move(localRanks), std::move(localDevices), config);
 }
 
 } // namespace rt

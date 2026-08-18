@@ -17,6 +17,7 @@
 import argparse
 import logging
 import os
+from dataclasses import replace
 from typing import Iterable, Optional, Sequence, Tuple, Union
 
 LOGGER = logging.getLogger("experimental.builder")
@@ -93,6 +94,15 @@ def _resolve_build_selection(args: argparse.Namespace) -> Tuple[object, Tuple]:
     if not components:
         raise ValueError(f"{bundle.root_model_type!r} has no buildable "
                          "components")
+    if args.tp_size > 1:
+        if components != (contracts.Component.LLM, ):
+            raise ValueError(
+                "tensor-parallel direct builds currently support only the llm component"
+            )
+        if args.spec_type != "none":
+            raise ValueError(
+                "tensor-parallel speculative decoding is not supported; omit --spec-type"
+            )
     configuration = model_registry.configuration_module_for(
         bundle.root_model_type)
     validate_build = getattr(configuration, "validate_build", None)
@@ -186,14 +196,22 @@ def _build_one(args: argparse.Namespace, bundle, component,
                           cfg,
                           bundle=bundle,
                           plugin_handle=plugin_handle)
+    if build_args.tp_size > 1 and build_args.tp_rank != 0:
+        return result.engine_path
+
+    artifact_cfg = cfg
+    if build_args.tp_size > 1:
+        artifact_cfg = load_device_config(
+            replace(build_args, tp_size=1, tp_rank=0))
     artifact_writer = model_registry.artifact_writer_for(
         bundle.root_model_type, build_args.spec_type,
         build_args.resolved_spec_role)
-    artifact_writer.write_artifacts(bundle, cfg, build_args, args.engine_dir)
+    artifact_writer.write_artifacts(bundle, artifact_cfg, build_args,
+                                    args.engine_dir)
     if result.checkpoint_weight_bindings:
         from .core.artifacts import patch_external_weight_config
         config_path = contracts.component_spec(component).config_path(
-            args.engine_dir, build_args.resolved_spec_role)
+            args.engine_dir, build_args.resolved_spec_role, build_args.tp_size)
         patch_external_weight_config(
             config_path,
             result.checkpoint_weight_bindings,
@@ -287,7 +305,9 @@ def _add_build_args(parser: argparse.ArgumentParser) -> None:
         action="append",
         choices=weight_policy.EXTERNAL_WEIGHT_CHOICES,
         help=("Limit which weights leave the engine, repeatable. Defaults to "
-              "every kind. FP8 and MXFP8 weights are always baked in."))
+              "every supported kind, except that TP builds keep small FP16 "
+              "parameters baked for runtime performance. FP8 and MXFP8 "
+              "weights are always baked in."))
     parser.add_argument("--profiling-detailed", action="store_true")
     parser.set_defaults(spec_role=contracts.SpecRole.NONE.value,
                         target_model_dir=None)

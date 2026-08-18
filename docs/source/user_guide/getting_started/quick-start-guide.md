@@ -161,4 +161,6 @@ for streaming, batching, audio, video, and tool-calling options.
 See [Input JSON Format](../format/input-format.md) for C++ request fields,
 [Examples](../examples/index.md) for other model contracts, and
 [Direct Engine Builder](direct-engine-builder.md) for the experimental
-checkpoint-to-engine frontend.
+checkpoint-to-engine frontend. See
+[Multi-Device Inference](../features/multi-device.md) for TP2 export,
+per-rank engine builds, and local multi-GPU execution.
