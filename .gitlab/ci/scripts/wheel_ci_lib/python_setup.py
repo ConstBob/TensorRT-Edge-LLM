@@ -112,7 +112,7 @@ def prepare_host_pythons(
     ordered = tuple(dict.fromkeys(versions))
     executables = {
         version:
-        shutil.which(f"python{version}") or _PROVISIONED_PYTHONS.get(version)
+        _PROVISIONED_PYTHONS.get(version) or shutil.which(f"python{version}")
         for version in ordered
     }
     missing = tuple(version for version, executable in executables.items()
