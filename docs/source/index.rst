@@ -94,6 +94,7 @@ and action models on NVIDIA edge platforms.
    :maxdepth: 2
    :caption: Testing
 
+   developer_guide/testing/runtime-unit-tests.md
    developer_guide/testing/code-coverage.md
    developer_guide/testing/few-layer-validation.md
 

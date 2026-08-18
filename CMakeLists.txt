@@ -248,38 +248,17 @@ endif()
 option(BUILD_PYTHON_BINDINGS "Enable building Python pybind11 bindings" OFF)
 
 if(BUILD_UNIT_TESTS)
+  # FORCE, because a build tree configured before gmock was enabled already
+  # caches OFF, and a plain `set(... CACHE ...)` would leave it there — the
+  # failure is then a missing gmock/gmock.h, not a stale-cache message.
   set(BUILD_GMOCK
-      OFF
-      CACHE BOOL "Disable Google Mock")
+      ON
+      CACHE BOOL "Enable Google Mock" FORCE)
   add_subdirectory(${CMAKE_SOURCE_DIR}/3rdParty/googletest)
-  file(GLOB_RECURSE UNIT_TESTS_SRCS ${CMAKE_SOURCE_DIR}/unittests/*.cpp
-       ${CMAKE_SOURCE_DIR}/unittests/*.cu)
-  add_executable(unitTest ${UNIT_TESTS_SRCS})
-  target_include_directories(unitTest PRIVATE ${COMMON_INCLUDE_DIRS}
-                                              ${CMAKE_SOURCE_DIR})
-  # Define project root path for tests to access resources
-  target_compile_definitions(unitTest
-                             PRIVATE PROJECT_ROOT_DIR="${CMAKE_SOURCE_DIR}")
-  if(ENABLE_CUTEDSL_MODULE_TEST_HOOK)
-    target_compile_definitions(unitTest PRIVATE ENABLE_CUTEDSL_MODULE_TEST_HOOK)
-  endif()
-  # Resource-registration tests resolve the plugin's exported lifecycle ABI.
-  add_dependencies(unitTest NvInfer_edgellm_plugin)
-  # edgellmXqaJit is not part of edgellmCore: the XQA JIT lives in the plugin.
-  # unitTest links it explicitly because xqaJitTestUtils.cpp JITs kernels
-  # directly for the decoder-runner tests.
-  target_link_libraries(
-    unitTest
-    PRIVATE gtest
-            gtest_main
-            edgellmCore
-            edgellmXqaJit
-            commonLibraryExt
-            exampleUtils
-            ${CUDA_DRIVER_LINK_LIB})
   include(${CMAKE_SOURCE_DIR}/cmake/CuteDsl.cmake)
-  cute_dsl_setup(LINK_TARGETS unitTest)
-  add_cross_build_link_options(unitTest)
+  enable_testing()
+  # Targets, grouping and per-target wiring all live in
+  # unittests/CMakeLists.txt.
   add_subdirectory(unittests)
 endif()
 

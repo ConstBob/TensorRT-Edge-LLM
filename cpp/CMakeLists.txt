@@ -173,7 +173,7 @@ set_source_files_properties(${MOE_MARLIN_CU_SRCS} PROPERTIES COMPILE_FLAGS
 
 # XQA NVRTC JIT: the embedded kernel source blob plus the NVRTC driver. Linked
 # only by NvInfer_edgellm_plugin (which JITs at TensorRTPhase::kBUILD) and by
-# unitTest (which JITs directly). decoderXQARunner needs only the XQAJitKey POD
+# the unit tests (which JIT directly). decoderXQARunner needs only the XQAJitKey
 # and getXQAJitMTileSize from decoderXQAJitCompiler.h, both header-only, so the
 # kernel and runtime libraries carry no link dependency on this target.
 add_library(edgellmXqaJit STATIC ${XQA_JIT_CPP_SRCS}

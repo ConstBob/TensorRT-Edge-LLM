@@ -36,7 +36,7 @@ class EagleDecoder final : public DecodingStrategy
 public:
     EagleDecoder(DecodingRuntimeContext& runtime, std::filesystem::path const& engineDir,
         SpecDecodeDraftingConfig const& draftingConfig, std::unique_ptr<EngineExecutor> draftExecutor,
-        cudaStream_t stream);
+        ExternalWeightManager draftWeights, cudaStream_t stream);
 
     DecodingStrategyKind kind() const noexcept override
     {

@@ -97,7 +97,8 @@ void validateMatrix(Tensor const& tensor, std::string const& name, int64_t rows,
 } // namespace
 
 DSparkDecoder::DSparkDecoder(DecodingRuntimeContext& runtime, std::filesystem::path const& engineDir,
-    SpecDecodeDraftingConfig const& draftingConfig, std::unique_ptr<EngineExecutor> draftExecutor, cudaStream_t stream)
+    SpecDecodeDraftingConfig const& draftingConfig, std::unique_ptr<EngineExecutor> draftExecutor,
+    ExternalWeightManager draftWeights, cudaStream_t stream)
     : mRuntime(runtime)
     , mDraftCacheManager(*runtime.base.sharedResources.cacheManagers[1])
     , mDraftExecutor(std::move(draftExecutor))
@@ -217,9 +218,7 @@ DSparkDecoder::DSparkDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
                 draftCfg.ropeConfig, draftCfg.rotaryDim, baseCfg.maxKVCacheCapacity, nullptr));
     }
 
-    mDraftExternalWeightManager.load(
-        engineDir, engineDir / "draft_config.json", stream, mRuntime.draftCheckpointDir, mRuntime.checkpointDir);
-    mDraftExternalWeightManager.validateAgainstEngine(*mDraftExecutor, "dspark_draft");
+    mDraftExternalWeightManager = std::move(draftWeights);
     mDraftExternalWeightManager.registerTensorMapEntries(mDraftTensorMap);
 
     mDraftTokenIds

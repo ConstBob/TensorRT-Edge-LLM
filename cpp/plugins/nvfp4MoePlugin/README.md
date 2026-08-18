@@ -118,4 +118,4 @@ that explicitly emits `Nvfp4MoePlugin` for an SM100/101/110 target.
 1. Manually generate the `nvfp4_moe` artifact with the shared workflow.
 2. Copy or mount the workspace on Thor.
 3. Build the plugin with `-DENABLE_CUTE_DSL=nvfp4_moe -DCMAKE_CUDA_ARCHITECTURES=110a`.
-4. Run `./build/unitTest --gtest_filter='CuteDslNvfp4MoeSm110Test.*'`.
+4. Run `./build/unittests/unitTestKernelsMoe --gtest_filter='CuteDslNvfp4MoeSm110Test.*'`.

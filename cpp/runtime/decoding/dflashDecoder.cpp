@@ -75,7 +75,7 @@ void setPackedAncestorBit(
 
 DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::path const& engineDir,
     dflash_utils::CachedBlockDraftRuntimeConfig blockDraftConfig, std::unique_ptr<EngineExecutor> draftExecutor,
-    cudaStream_t stream)
+    ExternalWeightManager draftWeights, cudaStream_t stream)
     : mRuntime(runtime)
     , mDraftCacheManager(*runtime.base.sharedResources.cacheManagers[1])
     , mBlockDraft(std::move(blockDraftConfig))
@@ -153,9 +153,7 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
             mRuntime.base.sharedResources.ropePool.getOrCreate(
                 draftCfg.ropeConfig, draftCfg.rotaryDim, baseCfg.maxKVCacheCapacity, nullptr));
     }
-    mDraftExternalWeightManager.load(
-        engineDir, engineDir / "draft_config.json", stream, mRuntime.draftCheckpointDir, mRuntime.checkpointDir);
-    mDraftExternalWeightManager.validateAgainstEngine(*mDraftExecutor, "dflash_draft");
+    mDraftExternalWeightManager = std::move(draftWeights);
     mDraftExternalWeightManager.registerTensorMapEntries(mDraftTensorMap);
 
     mDraftTokenIds = Tensor(

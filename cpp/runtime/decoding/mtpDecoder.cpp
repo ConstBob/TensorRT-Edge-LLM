@@ -55,8 +55,8 @@ constexpr int32_t kPrefillProfile{0};
 constexpr int32_t kDecodeProfile{1};
 } // namespace
 
-MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, std::filesystem::path const& engineDir,
-    SpecDecodeDraftingConfig const& draftingConfig, std::unique_ptr<EngineExecutor> draftExecutor, cudaStream_t stream)
+MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, SpecDecodeDraftingConfig const& draftingConfig,
+    std::unique_ptr<EngineExecutor> draftExecutor, ExternalWeightManager draftWeights, cudaStream_t stream)
     : mRuntime(runtime)
     , mDraftCacheManager(*runtime.base.sharedResources.cacheManagers[1])
     , mDraftExecutor(std::move(draftExecutor))
@@ -91,11 +91,9 @@ MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, std::filesystem::path co
     buildTensorMapForSpecDecodeDraft(
         mDraftTensorMap, mRuntime.base.pipelineIO, mRuntime.base.sharedResources, *mRuntime.deployment.draft);
 
-    // Publish externalized draft-engine weights into the draft tensor map,
-    // mirroring the base engine. Loaded from draft_config.json; a no-op when
-    // the draft was exported without --externalize-weights.
-    mDraftExternalWeightManager.load(engineDir, engineDir / "draft_config.json", stream, mRuntime.checkpointDir);
-    mDraftExternalWeightManager.validateAgainstEngine(*mDraftExecutor, "draft");
+    // Publish externalized draft-engine weights into the draft tensor map, mirroring the base engine. A no-op
+    // when the draft was exported without --externalize-weights.
+    mDraftExternalWeightManager = std::move(draftWeights);
     mDraftExternalWeightManager.registerTensorMapEntries(mDraftTensorMap);
 
     mDraftTokenIdsFullTable = Tensor({maxRuntimeBatchSize, draftFullTableLength}, DeviceType::kGPU,

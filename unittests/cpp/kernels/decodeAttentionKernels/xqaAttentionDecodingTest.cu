@@ -27,7 +27,7 @@
 #include "kernels/decodeAttentionKernels/decoderXQARunner.h"
 #include "references.h"
 #include "testUtils.h"
-#include "unittests/xqaJitTestUtils.h"
+#include "xqaJitTestUtils.h"
 
 #include <algorithm>
 #include <cmath>

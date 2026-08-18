@@ -31,6 +31,7 @@
 #include "runtime/exec/tensorMap.h"
 #include "runtime/features/deepstackBinding.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "runtime/modelArtifacts.h"
 #include "runtime/preprocess/embeddingPreprocessor.h"
 #include "runtime/preprocess/gemma4EmbeddingPreprocessor.h"
 #include "runtime/preprocess/stepPreparer.h"
@@ -104,6 +105,26 @@ public:
     LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream,
         ContextCacheConfig const& contextCacheConfig = {}, std::string const& checkpointDir = "");
+
+    /*!
+     * @brief Construct around artifacts the caller already produced.
+     *
+     * The two constructors above are this one preceded by `ModelArtifacts::loadFromEngineDir`. Passing artifacts
+     * directly removes the requirement that a serialized engine and its sidecar files exist, which is what lets the
+     * runtime be exercised against a substitute EngineExecutor.
+     *
+     * @param artifacts Deployment config, engines, weights, embeddings and tokenizer
+     * @param engineDir Directory the optional components still open for themselves (speculative decoders, Gemma4 PLE)
+     * @param multimodalEngineDir Directory containing multimodal engine files; empty to load no encoders
+     * @param loraWeightsMap Map of LoRA weight names to file paths
+     * @param draftingConfig Speculative decoding drafting configuration; must be set iff `artifacts` carry a draft
+     * @param stream CUDA stream for operations
+     * @param contextCacheConfig Context-cache configuration
+     */
+    LLMInferenceRuntime(ModelArtifacts&& artifacts, std::string const& engineDir,
+        std::string const& multimodalEngineDir, std::unordered_map<std::string, std::string> const& loraWeightsMap,
+        std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream,
+        ContextCacheConfig const& contextCacheConfig = {});
 
     //! @brief Destructor
     ~LLMInferenceRuntime() noexcept;
@@ -257,12 +278,15 @@ public:
     }
 
 private:
-    //! @brief Common initialization logic shared between both constructors
-    void initializeCommon(std::string const& engineDir, std::string const& multimodalEngineDir,
-        std::unordered_map<std::string, std::string> const& loraWeightsMap,
+    //! @brief Assemble the runtime around already-loaded artifacts.
+    //!
+    //! Allocates and wires; it does not read the model directory itself, apart from the optional components that
+    //! still open their own files (speculative decoders, Gemma4 PLE, multimodal encoders), which is why `engineDir`
+    //! is still a parameter.
+    void initializeCommon(ModelArtifacts&& artifacts, std::string const& engineDir,
+        std::string const& multimodalEngineDir, std::unordered_map<std::string, std::string> const& loraWeightsMap,
         std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream,
-        ContextCacheConfig const& contextCacheConfig, std::string const& checkpointDir,
-        std::string const& draftCheckpointDir);
+        ContextCacheConfig const& contextCacheConfig);
 
     //! @brief Capture a CUDA graph on the base executor for the default (no-adapter)
     //! state, then one additional graph per registered LoRA adapter. Returns the

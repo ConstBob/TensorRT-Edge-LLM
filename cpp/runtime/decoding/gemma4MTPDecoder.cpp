@@ -49,8 +49,8 @@ namespace
 constexpr int32_t kDecodeProfile{1};
 } // namespace
 
-Gemma4MTPDecoder::Gemma4MTPDecoder(DecodingRuntimeContext& runtime, std::filesystem::path const& engineDir,
-    SpecDecodeDraftingConfig const& draftingConfig, std::unique_ptr<EngineExecutor> draftExecutor, cudaStream_t stream)
+Gemma4MTPDecoder::Gemma4MTPDecoder(DecodingRuntimeContext& runtime, SpecDecodeDraftingConfig const& draftingConfig,
+    std::unique_ptr<EngineExecutor> draftExecutor, ExternalWeightManager draftWeights, cudaStream_t /* stream */)
     : mRuntime(runtime)
     , mDraftExecutor(std::move(draftExecutor))
 {
@@ -67,9 +67,7 @@ Gemma4MTPDecoder::Gemma4MTPDecoder(DecodingRuntimeContext& runtime, std::filesys
     buildTensorMapForGemma4MTPDraft(
         mDraftTensorMap, mRuntime.base.pipelineIO, mRuntime.base.sharedResources, mRuntime.deployment);
 
-    mDraftExternalWeightManager.load(
-        engineDir, engineDir / "draft_config.json", stream, mRuntime.draftCheckpointDir, mRuntime.checkpointDir);
-    mDraftExternalWeightManager.validateAgainstEngine(*mDraftExecutor, "gemma4_mtp_draft");
+    mDraftExternalWeightManager = std::move(draftWeights);
     mDraftExternalWeightManager.registerTensorMapEntries(mDraftTensorMap);
 
     int32_t const maxRuntimeBatchSize = mRuntime.maxRuntimeBatchSize;

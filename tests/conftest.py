@@ -208,7 +208,9 @@ def executable_files(env_config):
         f"{build_dir}/examples/multimodal/action_inference",
         'qwen3_tts_inference':
         f"{build_dir}/examples/omni/qwen3_tts_inference",
-        'unit_test': f"{build_dir}/unitTest"
+        # The unit tests are several ctest-registered executables; this points
+        # at the directory ctest is invoked from, not a single binary.
+        'unit_test': f"{build_dir}"
     }
 
 
