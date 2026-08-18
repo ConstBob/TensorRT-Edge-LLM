@@ -82,8 +82,6 @@ l0_super_thor:
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$TRT_CUDA_VERSION"
     PRIORITY: l0_pipeline_super_thor
     EDGELLM_NCCL_SO_PATH: "$EDGE_LLM_CACHE_DIR/nccl/tegra-thor/lib/libnccl.so.2.29.2"
-    BUILD_TIMEOUT_SECONDS: "1800"
-    UNIT_TEST_TIMEOUT_SECONDS: "3600"
     NCCL_CUMEM_ENABLE: "0"
     NCCL_IB_DISABLE: "1"
     NCCL_MNNVL_ENABLE: "0"
