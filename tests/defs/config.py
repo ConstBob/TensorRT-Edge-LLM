@@ -316,6 +316,8 @@ LLM_MODELS_DIR_MAP = {
     "Qwen3.5-27B",
     "Qwen3.6-27B":
     "Qwen3.6-27B",
+    "Qwen3.8-27B":
+    "Qwen3.8-27B",
     # Gemma4 E-models. CI runners may see the public base checkpoint under
     # /scratch.trt_llm_data/llm-models/gemma, while paired MTP assistant
     # checkpoints are usually staged under /scratch.edge_llm_cache/source_models.
@@ -1286,7 +1288,8 @@ class TestConfig:
         if self.model_type != ModelType.LLM:
             return False
         return (self.model_name.startswith("Qwen3.5-")
-                or self.model_name.startswith("Qwen3.6-"))
+                or self.model_name.startswith("Qwen3.6-")
+                or self.model_name.startswith("Qwen3.8-"))
 
     def _supports_llm_audio_precision(self) -> bool:
         """Allow audio precision for LLM entries that include an audio tower."""

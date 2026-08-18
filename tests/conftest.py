@@ -389,7 +389,7 @@ def _preferred_model_quantization_test_name(test_param: str) -> str:
     if "tts" in lower:
         return "test_tts_model_quantization"
     vlm_hints = ("-vl-", "internvl", "multimodal", "cosmos", "vitfp8",
-                 "qwen3.5-", "qwen3.6-")
+                 "qwen3.5-", "qwen3.6-", "qwen3.8-")
     if any(hint in lower for hint in vlm_hints):
         return "test_vlm_model_quantization"
     return "test_llm_model_quantization"
