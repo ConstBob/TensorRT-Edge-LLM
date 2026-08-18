@@ -91,10 +91,22 @@ def _read_key_values(path: Path) -> Dict[str, str]:
 
 def _device_model_probe() -> Optional[Tuple[str, str]]:
     path = Path("/proc/device-tree/model")
+    if path.is_file():
+        model = path.read_text(encoding="utf-8",
+                               errors="replace").strip("\x00\n ")
+        if model:
+            return "device-model", model
+
+    # DGX Spark is ACPI/DMI based and does not expose a device-tree model.
+    path = Path("/sys/class/dmi/id/product_name")
     if not path.is_file():
         return None
-    model = path.read_text(encoding="utf-8", errors="replace").strip("\x00\n ")
-    return ("device-model", model) if model else None
+    model = path.read_text(encoding="utf-8", errors="replace").strip()
+    normalized = re.sub(r"[_-]+", " ", model)
+    if any(marker in normalized.casefold()
+           for marker in _DGX_SPARK_MODEL_MARKERS):
+        return "device-model", normalized
+    return None
 
 
 def _drive_probe() -> Optional[Tuple[str, str]]:
