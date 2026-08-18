@@ -78,6 +78,6 @@ wheel_integration_aarch64:
       artifacts: true
   parallel:
     matrix:
-      - VARIANT: "jetson-orin-jp72-cu13-sm87"
-        TEST_RUNNER_TAG: "p3730-k8s"
-        TEST_IMAGE: "$DEVICE_CONTROLLER_IMAGE"
+      - VARIANT: "dgx-spark-cu13-sm121"
+        TEST_RUNNER_TAG: "local-spark"
+        TEST_IMAGE: "$WHEEL_IMAGE_DGX_SPARK"

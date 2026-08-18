@@ -49,7 +49,9 @@ ci_remote = false
 
 [[qualification]]
 variant_id = "jetson-orin-jp72-cu13-sm87"
-ci_test_enabled = true
+# TODO: Re-enable Orin qualification after p3730-k8s is upgraded from L4T
+# R39.1 to R39.2.x. The JetPack 7.2 payload intentionally requires R39.2:
+# https://docs.nvidia.com/jetson/agx-orin-devkit/user-guide/setup_jetpack.html
 ci_build_runner = "cpu-general-k8s"
 ci_build_image = "$WHEEL_IMAGE_JETPACK72"
 ci_build_mode = "cross"
@@ -136,6 +138,7 @@ ci_board_user = "$WHEEL_BOARD_USER_DRIVE72"
 
 [[qualification]]
 variant_id = "dgx-spark-cu13-sm121"
+ci_test_enabled = true
 ci_build_runner = "local-spark"
 ci_build_image = "$WHEEL_IMAGE_DGX_SPARK"
 ci_build_mode = "native"

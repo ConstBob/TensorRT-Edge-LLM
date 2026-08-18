@@ -41,6 +41,15 @@ cpu_arch = "x86_64"
 gpu_sm = 120
 cuda_major = 13
 
+# TODO: Remove after RTX5080 source-build validation migrates to CUDA 13.
+# This artifact exists only for the CUDA 12.9 fallback required until the
+# TensorRT 10.15 CUDA TILE/Myelin fix reaches the qualified TensorRT branch;
+# no CUDA 12 wheel payload is published.
+[[cutedsl_artifacts]]
+cpu_arch = "x86_64"
+gpu_sm = 120
+cuda_major = 12
+
 [[cutedsl_artifacts]]
 cpu_arch = "aarch64"
 gpu_sm = 87
