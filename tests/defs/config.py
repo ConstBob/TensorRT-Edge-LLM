@@ -465,6 +465,9 @@ class TestConfig:
     max_input_len: Optional[int] = None
     max_seq_len: Optional[int] = None
     max_lora_rank: Optional[int] = None
+    tp_size: Optional[int] = None
+    md_launch_mode: Optional[str] = None
+    allreduce_backend: Optional[str] = None
 
     # EAGLE specific build parameters
     max_verify_tree_size: Optional[int] = None
@@ -580,6 +583,20 @@ class TestConfig:
                           ModelType.LLM, ModelType.VLM, ModelType.TTS,
                           ModelType.ASR, ModelType.OMNI
                       },
+                      is_required=False),
+        ParameterSpec("tp_size",
+                      "tp", {
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
+                          TaskType.INFERENCE
+                      }, {ModelType.LLM},
+                      is_required=False),
+        ParameterSpec("md_launch_mode",
+                      "md", {TaskType.E2E_BENCH, TaskType.INFERENCE},
+                      {ModelType.LLM},
+                      is_required=False),
+        ParameterSpec("allreduce_backend",
+                      "ar", {TaskType.E2E_BENCH, TaskType.INFERENCE},
+                      {ModelType.LLM},
                       is_required=False),
 
         # Export-specific parameters
@@ -1036,6 +1053,12 @@ class TestConfig:
                 parsed_params['max_kv_pool_pages'] = int(part[5:])
             elif part.startswith('mxlr'):
                 parsed_params['max_lora_rank'] = int(part[4:])
+            elif part.startswith('tp') and part[2:].isdigit():
+                parsed_params['tp_size'] = int(part[2:])
+            elif part in ("mdthread", "mdmpi"):
+                parsed_params['md_launch_mode'] = part[2:]
+            elif part in ("arshm", "arnccl"):
+                parsed_params['allreduce_backend'] = part[2:]
             # For benchmark parameters
             elif part.startswith('bs'):
                 parsed_params['batch_size'] = int(part[2:])
@@ -1225,6 +1248,15 @@ class TestConfig:
             else:  # Runtime tasks
                 if self.max_lora_rank is None:
                     self.max_lora_rank = 0
+                if self.tp_size is None:
+                    self.tp_size = 1
+                if self.md_launch_mode is None:
+                    self.md_launch_mode = "thread"
+
+                # {$edge-llm-internal-release begin}
+                if self.tp_size > 1 and self.allreduce_backend is None:
+                    self.allreduce_backend = "shm"
+                # {$edge-llm-internal-release end}
                 if self.lora is None:
                     self.lora = self.max_lora_rank > 0
                 if self.fp8_kv_cache is None:
