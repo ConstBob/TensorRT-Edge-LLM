@@ -119,11 +119,16 @@ def _pre_register_phi4mm_attention_for_kv_quant(
     registered: set[type] = set()
     for _, module in model.named_modules():
         attn_type = type(module)
-        # trust_remote_code classes are loaded under 'transformers_modules';
-        # match on __module__ so this survives class renames.
-        if (getattr(attn_type, "__module__",
-                    "").startswith("transformers_modules")
-                and hasattr(module, "k_proj") and attn_type not in registered
+        # Match Phi4MMAttention by class name: the Phi4MM text decoder fuses
+        # q/k/v into a single qkv_proj, so a ``hasattr(module, "k_proj")`` gate
+        # never fires for it and it is left unregistered (hf_quant_config.json
+        # is then omitted). Keep a generic trust_remote_code fallback for other
+        # custom attentions that expose separate q/k/v projections.
+        is_phi4mm_attn = attn_type.__name__ == "Phi4MMAttention"
+        is_trc_kv_attn = (getattr(attn_type, "__module__",
+                                  "").startswith("transformers_modules")
+                          and hasattr(module, "k_proj"))
+        if ((is_phi4mm_attn or is_trc_kv_attn) and attn_type not in registered
                 and QuantModuleRegistry.get(attn_type) is None):
             register_attention_for_kv_quant(attn_type)
             registered.add(attn_type)

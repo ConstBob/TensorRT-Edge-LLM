@@ -1183,6 +1183,30 @@ def decode_modelopt_nvfp4(
     return dense.astype(np.float32)
 
 
+def _decode_or_passthrough_nvfp4(proj: nn.Module,
+                                 group_size: int = 16) -> np.ndarray:
+    """Return a gated-expert projection as dense fp32 ``[out, in]``.
+
+    Pre-quantized NVFP4 MoE checkpoints keep small gate/router-style
+    projections in float16/bfloat16 while packing the heavy experts to NVFP4.
+    Such a weight loads into an NVFP4-typed linear (so ``is_nvfp4_linear`` is
+    True) but its buffer stays float, not packed int8/uint8. Decode only the
+    genuinely packed weights; pass a float weight through unchanged so it is
+    re-packed downstream by ``_pack_nvfp4_moe_weight``. Any other dtype is
+    unexpected and raised so the failure surfaces here rather than as a
+    downstream precision/shape mismatch.
+    """
+    w = proj.weight
+    if w.dtype in (torch.int8, torch.uint8):
+        return decode_modelopt_nvfp4(w, proj.weight_scale, proj.weight_scale_2,
+                                     group_size)
+    if w.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError(
+            f"unexpected gated-MoE projection weight dtype {w.dtype}; expected "
+            "packed int8/uint8 or unquantized float16/bfloat16")
+    return w.detach().to(torch.float32).cpu().numpy()
+
+
 def _round_dense_to_bf16(dense: np.ndarray) -> np.ndarray:
     """Round a dense fp32 weight through BF16 while returning fp32 storage."""
     dense_t = torch.from_numpy(np.ascontiguousarray(dense, dtype=np.float32))
@@ -1435,12 +1459,9 @@ def repack_nvfp4_gated_moe_experts(
                 and is_nvfp4_linear(down)):
             raise TypeError("Gated NVFP4 MoE experts must use NVFP4 quant")
 
-        gate_dense = decode_modelopt_nvfp4(gate.weight, gate.weight_scale,
-                                           gate.weight_scale_2, group_size)
-        up_dense = decode_modelopt_nvfp4(up.weight, up.weight_scale,
-                                         up.weight_scale_2, group_size)
-        down_dense = decode_modelopt_nvfp4(down.weight, down.weight_scale,
-                                           down.weight_scale_2, group_size)
+        gate_dense = _decode_or_passthrough_nvfp4(gate, group_size)
+        up_dense = _decode_or_passthrough_nvfp4(up, group_size)
+        down_dense = _decode_or_passthrough_nvfp4(down, group_size)
 
         gate_dense, up_dense, down_dense = _pad_nvfp4_gated_moe_dense_weights(
             gate_dense, up_dense, down_dense, hidden_size, moe_inter_size,
