@@ -208,6 +208,8 @@ void printUsage(char const* programName)
     std::cerr << "    --acceptLen             Tokens caught up per accept pass (default: draftStep+1"
               << " = production's fixed depth)." << std::endl;
     std::cerr << "    --pastKVLen             Past KV cache length per batch. Required." << std::endl;
+    std::cerr << "    --verifyTreeSize        Optional; defaults to draftStep+1 (chain-MTP engines"
+              << " require verifySize == draftStep+1)." << std::endl;
     std::cerr << "  For spec_draft_prefill mode:" << std::endl;
     std::cerr << "    --inputLen              Input sequence length. Required." << std::endl;
     std::cerr << "    --reuseKVLen            Reused KV cache length. Optional, default=0." << std::endl;
@@ -263,6 +265,9 @@ void printUsage(char const* programName)
     std::cerr << "  # Spec-decode verify mode" << std::endl;
     std::cerr << "  " << programName << " --engineDir ./engines --mode spec_verify --verifyTreeSize 60 --pastKVLen 128"
               << std::endl;
+    std::cerr << std::endl;
+    std::cerr << "  # Spec-decode draft accept-token catch-up mode" << std::endl;
+    std::cerr << "  " << programName << " --engineDir ./engines --mode spec_draft_accept --pastKVLen 128" << std::endl;
     std::cerr << std::endl;
     std::cerr << "  # Spec-decode draft proposal mode" << std::endl;
     std::cerr << "  " << programName
@@ -727,6 +732,25 @@ int main(int argc, char** argv)
     {
         printUsage(argv[0]);
         return EXIT_FAILURE;
+    }
+
+    // spec_draft_accept defaults are fully arg-determined (chain geometry), so
+    // resolve them here: before the drafting-config synthesis — the MTP
+    // linear-chain gate requires verifySize == draftingStep+1, so the
+    // documented pastKVLen-only invocation must not leave verifyTreeSize
+    // at -1 — and before logBenchConfig, so the config header prints the
+    // effective values rather than the -1 sentinels.
+    if (args.mode == BenchMode::kEAGLE_DRAFT_ACCEPT)
+    {
+        int32_t const chainStep = std::max(args.draftStep, 1); // mirrors the drafting-config synthesis
+        if (args.acceptLen <= 0)
+        {
+            args.acceptLen = chainStep + 1; // production's fixed catch-up depth
+        }
+        if (args.verifyTreeSize <= 0)
+        {
+            args.verifyTreeSize = chainStep + 1;
+        }
     }
 
     if (args.debug)
@@ -1438,9 +1462,9 @@ int main(int argc, char** argv)
         // the accepted tokens (production runs it at maxAcceptDepth =
         // draftStep+1 every iteration — see MTPDecoder::runDraftModelAcceptToken).
         // --acceptLen sweeps the depth to expose how weight-streaming-bound
-        // the pass is; default mirrors production.
-        int32_t const acceptLen = args.acceptLen > 0 ? args.acceptLen : args.draftStep + 1;
-        args.acceptLen = acceptLen;
+        // the pass is; the default (draftStep+1, production's fixed depth) is
+        // resolved right after validateArgs so logBenchConfig prints it.
+        int32_t const acceptLen = args.acceptLen;
         modeName = "Spec Draft Accept";
         LOG_INFO("Spec Draft Accept mode: AcceptLen=%d, PastKVLen=%d", acceptLen, args.pastKVLen);
         LOG_INFO(args.noCudaGraph ? "CUDA graph disabled; using non-CUDA-graph execution" : "CUDA graph enabled");
