@@ -109,7 +109,8 @@ enum LLMInferenceOptionId : int
     DART_REDUCTION_RATIO = 936,
     DART_PIVOT_IMAGE_TOKENS = 937,
     DART_PIVOT_TEXT_TOKENS = 938,
-    VISUAL_PRUNE_ALGO = 939
+    VISUAL_PRUNE_ALGO = 939,
+    ENCODER_CACHE_BUDGET_BYTES = 940
 };
 
 // Struct to hold speculative decoding arguments (used by both EAGLE and MTP)
@@ -405,6 +406,8 @@ void printUsage(char const* programName)
               << " required for hybrid attention reuse)" << std::endl;
     std::cerr << "                            KV retention capacity is configured at build time with"
               << " --maxKVPoolPages" << std::endl;
+    std::cerr << "  --encoderCacheBudgetBytes  Device byte budget for encoder embedding cache (default: 256 MiB;"
+              << " 0 disables)" << std::endl;
     std::cerr << "\nVisual-Token Pruning Options:" << std::endl;
     std::cerr << "  --visualPrune             Enable visual-token pruning (mRoPE VLM prefill, batch 1)" << std::endl;
     std::cerr << "  --visualPruneAlgo         Prune selection algorithm (default: dart)" << std::endl;
@@ -492,7 +495,9 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"visualPruneAlgo", required_argument, 0, LLMInferenceOptionId::VISUAL_PRUNE_ALGO},
         {"dartReductionRatio", required_argument, 0, LLMInferenceOptionId::DART_REDUCTION_RATIO},
         {"dartPivotImageTokens", required_argument, 0, LLMInferenceOptionId::DART_PIVOT_IMAGE_TOKENS},
-        {"dartPivotTextTokens", required_argument, 0, LLMInferenceOptionId::DART_PIVOT_TEXT_TOKENS}, {0, 0, 0, 0}};
+        {"dartPivotTextTokens", required_argument, 0, LLMInferenceOptionId::DART_PIVOT_TEXT_TOKENS},
+        {"encoderCacheBudgetBytes", required_argument, 0, LLMInferenceOptionId::ENCODER_CACHE_BUDGET_BYTES},
+        {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", inferenceOptions, nullptr)) != -1)
@@ -808,6 +813,13 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         // {$edge-llm-internal-release begin}
         case LLMInferenceOptionId::DISABLE_SHM: args.disableShm = true; break;
         // {$edge-llm-internal-release end}
+        case LLMInferenceOptionId::ENCODER_CACHE_BUDGET_BYTES:
+            if (!parseNonNegativeIntegerOption(
+                    "encoderCacheBudgetBytes", optarg, args.contextCacheConfig.encoderEmbeddingCacheBudgetBytes))
+            {
+                return false;
+            }
+            break;
         default: return false;
         }
     }

@@ -90,7 +90,7 @@ public:
     //! \return True if preprocessing succeeded, false otherwise
     bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
         tokenizer::Tokenizer const* tokenizer, [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut,
-        cudaStream_t stream, bool imageOnly = false) override;
+        cudaStream_t stream, bool imageOnly = false, bool skipEncoderWork = false) override;
 
     //! \brief Run inference on the vision encoder
     //! \param[in] stream CUDA stream for execution
@@ -117,6 +117,8 @@ private:
     //! \throws std::runtime_error if image size is unexpected, or number of blocks is excessive
     void imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths,
         std::vector<int64_t>& numImages, cudaStream_t stream);
+    void imagePreprocessTokenLengthsOnly(rt::LLMGenerationRequest const& request,
+        std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages);
 
     //! \brief Preprocess a video frame stack and run the visual engine
     //!

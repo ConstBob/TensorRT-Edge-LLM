@@ -188,6 +188,28 @@ bool Gemma4UnifiedAudioRunner::allocateBuffer([[maybe_unused]] cudaStream_t stre
     return true;
 }
 
+void Gemma4UnifiedAudioRunner::frameAudioTokenLengthsOnly(rt::LLMGenerationRequest const& request,
+    std::vector<int64_t>& audioTokenLengths, std::vector<int64_t>& audiosPerRequest)
+{
+    int64_t totalFrames = 0;
+    for (auto const& req : request.requests)
+    {
+        audiosPerRequest.push_back(static_cast<int64_t>(req.audioBuffers.size()));
+        for (auto const& audio : req.audioBuffers)
+        {
+            ELLM_CHECK(audio.pcm != nullptr, "Gemma4 Unified AudioData.pcm is null");
+            int64_t const sampleCount = static_cast<int64_t>(audio.pcm->samples.size());
+            int64_t const frameCount = (sampleCount + mConfig.samplesPerFrame - 1) / mConfig.samplesPerFrame;
+            totalFrames += frameCount;
+            audioTokenLengths.push_back(frameCount);
+        }
+    }
+    if (totalFrames > 0)
+    {
+        check::check(mOutputEmbedding.reshape({totalFrames, mConfig.outputHiddenSize}), "Tensor reshape failed");
+    }
+}
+
 void Gemma4UnifiedAudioRunner::frameAudio(rt::LLMGenerationRequest const& request,
     std::vector<int64_t>& audioTokenLengths, std::vector<int64_t>& audiosPerRequest, cudaStream_t stream)
 {
@@ -288,18 +310,26 @@ void Gemma4UnifiedAudioRunner::textPreprocess(rt::LLMGenerationRequest const& re
 
 bool Gemma4UnifiedAudioRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly)
+    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly, bool skipEncoderWork)
 {
     try
     {
         TIME_STAGE(metrics::StageNames::kMULTIMODAL_PROCESSING, stream);
         std::vector<int64_t> audioTokenLengths;
         std::vector<int64_t> audiosPerRequest;
-        frameAudio(request, audioTokenLengths, audiosPerRequest, stream);
+        if (skipEncoderWork)
+        {
+            frameAudioTokenLengthsOnly(request, audioTokenLengths, audiosPerRequest);
+        }
+        else
+        {
+            frameAudio(request, audioTokenLengths, audiosPerRequest, stream);
+        }
         if (!imageOnly)
         {
             textPreprocess(request, batchedInputIds, audioTokenLengths, audiosPerRequest, tokenizer);
         }
+        mLastMediaTokenLengths = audioTokenLengths;
         return true;
     }
     catch (std::exception const& e)

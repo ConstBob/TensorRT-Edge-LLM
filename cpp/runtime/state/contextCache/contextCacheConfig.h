@@ -54,6 +54,8 @@ struct ContextCacheConfig
     int64_t recurrentSnapshotPoolBytes{};
     //! Device-memory budget for preallocated partial attention-KV checkpoints.
     int64_t partialKvSnapshotPoolBytes{};
+    //! Device-memory budget for encoder embedding cache (ViT/audio). Zero disables.
+    int64_t encoderEmbeddingCacheBudgetBytes{256LL * 1024 * 1024};
 };
 
 } // namespace rt

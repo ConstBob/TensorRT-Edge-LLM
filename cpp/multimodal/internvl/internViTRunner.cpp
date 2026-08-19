@@ -208,6 +208,49 @@ void InternViTRunner::formatPatch(imageUtils::ImageData const& image, std::vecto
     totalNumBlocks += curNumBlocks;
 }
 
+void InternViTRunner::imagePreprocessTokenLengthsOnly(
+    rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages)
+{
+    int64_t totalNumBlocks = 0;
+    for (auto const& req : request.requests)
+    {
+        int64_t numImage = 0;
+        for (auto const& image : req.imageBuffers)
+        {
+            if (image.isVideo)
+            {
+                int64_t const videoTokens = image.frames * 256;
+                imageTokenLengths.push_back(videoTokens);
+                ++numImage;
+                totalNumBlocks += image.frames;
+                continue;
+            }
+            auto [resizedHeight, resizedWidth] = image.doResize
+                ? imageUtils::computeBestBlockGridForResize(image.height, image.width, mConfig.minImageTokensPerImage,
+                      mConfig.maxImageTokensPerImage, mConfig.blockImageSizeH, mConfig.blockImageSizeW)
+                : std::make_tuple(image.height, image.width);
+            int64_t const mainBlocks
+                = (resizedHeight / mConfig.blockImageSizeH) * (resizedWidth / mConfig.blockImageSizeW);
+            int64_t tokens = mainBlocks * 256;
+            if (mainBlocks > 1 || mConfig.minNumBlocks > 1)
+            {
+                tokens += 256; // thumbnail
+            }
+            imageTokenLengths.push_back(tokens);
+            ++numImage;
+            totalNumBlocks += mainBlocks + ((mainBlocks > 1 || mConfig.minNumBlocks > 1) ? 1 : 0);
+        }
+        numImages.emplace_back(numImage);
+    }
+
+    // Reshape output embedding to match expected size (needed for cache memcpy destination).
+    if (totalNumBlocks > 0)
+    {
+        int64_t const totalImageTokens = totalNumBlocks * 256;
+        check::check(mOutputEmbedding.reshape({totalImageTokens, mConfig.outHiddenSize}), "Tensor reshape failed");
+    }
+}
+
 void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths,
     std::vector<int64_t>& numImages, cudaStream_t stream)
 {
@@ -408,14 +451,21 @@ void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
 
 bool InternViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly)
+    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly, bool skipEncoderWork)
 {
     std::vector<int64_t> imageTokenLengths;
     std::vector<int64_t> numImages;
 
     try
     {
-        imagePreprocess(request, imageTokenLengths, numImages, stream);
+        if (skipEncoderWork)
+        {
+            imagePreprocessTokenLengthsOnly(request, imageTokenLengths, numImages);
+        }
+        else
+        {
+            imagePreprocess(request, imageTokenLengths, numImages, stream);
+        }
         if (!imageOnly)
         {
             textPreprocess(request, batchedInputIds, numImages, imageTokenLengths, tokenizer);
@@ -438,6 +488,7 @@ bool InternViTRunner::preprocess(rt::LLMGenerationRequest const& request,
         return false;
     }
 
+    mLastMediaTokenLengths = imageTokenLengths;
     return true;
 }
 

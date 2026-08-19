@@ -299,7 +299,8 @@ bool Qwen3OmniAudioRunner::allocateBuffer([[maybe_unused]] cudaStream_t stream)
 
 bool Qwen3OmniAudioRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, [[maybe_unused]] bool imageOnly)
+    rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, [[maybe_unused]] bool imageOnly,
+    [[maybe_unused]] bool skipEncoderWork)
 {
     if (!mropeCosSinOut.has_value())
     {
@@ -341,6 +342,7 @@ bool Qwen3OmniAudioRunner::preprocess(rt::LLMGenerationRequest const& request,
         return false;
     }
 
+    mLastMediaTokenLengths = audioTokenLengths;
     return true;
 }
 

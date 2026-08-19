@@ -292,6 +292,30 @@ void Gemma4UnifiedVisionRunner::formatImage(rt::imageUtils::ImageData const& ima
     imageTokenLengths.push_back(patchCount);
 }
 
+void Gemma4UnifiedVisionRunner::imagePreprocessTokenLengthsOnly(rt::LLMGenerationRequest const& request,
+    std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& imagesPerRequest)
+{
+    int64_t totalPatches = 0;
+    for (auto const& req : request.requests)
+    {
+        imagesPerRequest.push_back(static_cast<int64_t>(req.imageBuffers.size()));
+        for (auto const& image : req.imageBuffers)
+        {
+            auto const [h, w] = image.doResize
+                ? rt::imageUtils::gemma4UnifiedResizeTarget(image.height, image.width, mConfig.maxPatchesPerImage,
+                      mConfig.modelPatchSize, mConfig.positionEmbeddingSize)
+                : std::make_tuple(image.height, image.width);
+            int64_t const patchCount = (h / mConfig.modelPatchSize) * (w / mConfig.modelPatchSize);
+            totalPatches += patchCount;
+            imageTokenLengths.push_back(patchCount);
+        }
+    }
+    if (totalPatches > 0)
+    {
+        check::check(mOutputEmbedding.reshape({totalPatches, mConfig.outputHiddenSize}), "Tensor reshape failed");
+    }
+}
+
 void Gemma4UnifiedVisionRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
     std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& imagesPerRequest, cudaStream_t stream)
 {
@@ -393,17 +417,25 @@ void Gemma4UnifiedVisionRunner::textPreprocess(rt::LLMGenerationRequest const& r
 
 bool Gemma4UnifiedVisionRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly)
+    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly, bool skipEncoderWork)
 {
     try
     {
         std::vector<int64_t> imageTokenLengths;
         std::vector<int64_t> imagesPerRequest;
-        imagePreprocess(request, imageTokenLengths, imagesPerRequest, stream);
+        if (skipEncoderWork)
+        {
+            imagePreprocessTokenLengthsOnly(request, imageTokenLengths, imagesPerRequest);
+        }
+        else
+        {
+            imagePreprocess(request, imageTokenLengths, imagesPerRequest, stream);
+        }
         if (!imageOnly)
         {
             textPreprocess(request, batchedInputIds, imageTokenLengths, imagesPerRequest, tokenizer);
         }
+        mLastMediaTokenLengths = imageTokenLengths;
         return true;
     }
     catch (std::exception const& e)

@@ -116,12 +116,18 @@ std::vector<Hash128> buildPerPositionMediaHash(std::vector<int32_t> const& token
                 }
             }
 
-            if (token == imageTokenId && imageIdx < imageHashes.size())
+            if (token == imageTokenId)
             {
+                ELLM_CHECK(imageIdx < imageHashes.size(),
+                    "Image token placeholder at position " + std::to_string(i) + " exceeds provided image count ("
+                        + std::to_string(imageHashes.size()) + ")");
                 perPositionHash[i] = imageHashes[imageIdx];
             }
-            else if (token == audioTokenId && audioIdx < audioHashes.size())
+            else if (token == audioTokenId)
             {
+                ELLM_CHECK(audioIdx < audioHashes.size(),
+                    "Audio token placeholder at position " + std::to_string(i) + " exceeds provided audio count ("
+                        + std::to_string(audioHashes.size()) + ")");
                 perPositionHash[i] = audioHashes[audioIdx];
             }
             previousWasMedia = true;

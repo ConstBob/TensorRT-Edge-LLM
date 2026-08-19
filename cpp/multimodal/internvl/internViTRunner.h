@@ -75,7 +75,7 @@ public:
     //! \return True if preprocessing succeeded, false otherwise
     bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
         tokenizer::Tokenizer const* tokenizer, [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut,
-        cudaStream_t stream, bool imageOnly = false) override;
+        cudaStream_t stream, bool imageOnly = false, bool skipEncoderWork = false) override;
 
     //! \brief Run inference on the vision encoder
     //! \param[in] stream CUDA stream for execution
@@ -123,6 +123,11 @@ private:
     //! \throws std::runtime_error if image size is unexpected, or number of blocks is excessive
     void imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths,
         std::vector<int64_t>& numImages, cudaStream_t stream);
+
+    //! \brief Compute token lengths from image dimensions without GPU pixel work.
+    //! Used on encoder embedding cache hits to derive placeholder token counts.
+    void imagePreprocessTokenLengthsOnly(rt::LLMGenerationRequest const& request,
+        std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages);
 
     InternViTConfig mConfig;             //!< InternViT configuration
     rt::Tensor mVitInput{};              //!< Vision encoder input tensor

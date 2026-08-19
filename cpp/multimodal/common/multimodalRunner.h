@@ -117,11 +117,14 @@ public:
      * @param stream CUDA stream
      * @param imageOnly When true, only run image preprocessing (skip text tokenization and RoPE
      *        generation). Used for benchmarking where only the visual engine inputs need to be set up.
+     * @param skipEncoderWork When true, skip GPU pixel operations (resize, normalize, patchify) and
+     *        only compute token-length metadata + text tokenization. Used on encoder embedding cache
+     *        hits where the cached embedding will be copied directly.
      * @return True on success, false on failure
      */
     virtual bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
         tokenizer::Tokenizer const* tokenizer, [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut,
-        cudaStream_t stream, bool imageOnly = false) = 0;
+        cudaStream_t stream, bool imageOnly = false, bool skipEncoderWork = false) = 0;
 
     /*!
      * @brief Used for KVCache saving where we need to conduct the tokenization of the system prompt and generate
@@ -179,6 +182,13 @@ public:
         return mMultimodalMetrics;
     }
 
+    //! @brief Per-media-item token lengths from the last preprocess() call.
+    //! One entry per image/audio clip, in the order they appear across all batch requests.
+    std::vector<int64_t> const& getLastMediaTokenLengths() const noexcept
+    {
+        return mLastMediaTokenLengths;
+    }
+
     /*!
      * @brief Load this encoder's externalized weights and bind them to its context
      *
@@ -205,6 +215,7 @@ protected:
     std::unique_ptr<nvinfer1::IExecutionContext> mAudioContext; //!< Audio execution context
     rt::Tensor mOutputEmbedding;                                //!< Output embeddings
     metrics::MultimodalMetrics mMultimodalMetrics;              //!< Performance metrics
+    std::vector<int64_t> mLastMediaTokenLengths;                //!< Per-item token lengths from last preprocess
     //! Owns the encoder's externalized weights; the context points into them.
     std::unique_ptr<ExternalWeightManager> mExternalWeights;
     bool mExternalWeightsLoaded{false}; //!< Guards the idempotent load

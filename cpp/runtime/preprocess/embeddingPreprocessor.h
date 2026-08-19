@@ -55,13 +55,16 @@ public:
     //! round-trip: zero D2H/H2D), cached in `mMultimodalIndices`, and reused by a subsequent
     //! `prepareDeepstack`/`assembleDeepstack` for the same tokens.
     //!
-    //! @param tokenIds     GPU tensor of token IDs [batchSize, seqLen].
-    //! @param visionEmbeds Optional vision (image) embeddings.
-    //! @param audioEmbeds  Optional audio embeddings.
-    //! @param io           Pipeline I/O – `inputsEmbeds` is written.
-    //! @param stream       CUDA stream for execution.
+    //! @param tokenIds          GPU tensor of token IDs [batchSize, seqLen].
+    //! @param visionEmbeds      Optional vision (image) embeddings.
+    //! @param audioEmbeds       Optional audio embeddings.
+    //! @param io                Pipeline I/O – `inputsEmbeds` is written.
+    //! @param stream            CUDA stream for execution.
+    //! @param imageBaseOffsets  Device pointer to per-batch image index offsets, or nullptr.
+    //! @param audioBaseOffsets  Device pointer to per-batch audio index offsets, or nullptr.
     void embed(Tensor const& tokenIds, OptionalInputTensor visionEmbeds, OptionalInputTensor audioEmbeds,
-        PipelineIO& io, cudaStream_t stream);
+        PipelineIO& io, cudaStream_t stream, int32_t const* imageBaseOffsets = nullptr,
+        int32_t const* audioBaseOffsets = nullptr);
 
     //! Assemble deepstack features at image placeholder positions.
     //!

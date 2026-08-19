@@ -63,7 +63,7 @@ public:
     //! \brief Preprocess multimodal input including audio and text
     bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
         tokenizer::Tokenizer const* tokenizer, [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut,
-        cudaStream_t stream, bool imageOnly = false) override;
+        cudaStream_t stream, bool imageOnly = false, bool skipEncoderWork = false) override;
 
     //! \brief Run inference (no-op, encoding done per-clip in preprocess)
     bool infer(cudaStream_t stream) override;

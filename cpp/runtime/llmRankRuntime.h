@@ -39,6 +39,7 @@
 #include "runtime/preprocess/visualTokenPruner.h"
 #include "runtime/state/contextCache/contextCacheConfig.h"
 #include "runtime/state/contextCache/contextCacheMetrics.h"
+#include "runtime/state/contextCache/encoderEmbeddingCache.h"
 #include "runtime/state/decodingInferenceContext.h"
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/sharedResources.h"
@@ -301,6 +302,7 @@ private:
     std::unique_ptr<MultimodalRunner> mAudioRunner{nullptr};       //!< Audio multimodal runner (optional)
     std::unique_ptr<Alpamayo1ActionRunner> mActionRunner{nullptr}; //!< Action/diffusion head runner (optional)
     tokenizer::Tokenizer* mTokenizer{nullptr};                     //!< Shared tokenizer owned by RuntimeCoordinator
+    std::unique_ptr<EncoderEmbeddingCache> mEncoderEmbeddingCache; //!< Content-addressed encoder output cache
     hash_utils::HashMap<std::tuple<std::string, std::string>, SystemPromptKVCache>
         mSystemPromptKVCacheBase;          //!< System prompt KVCache for base model
     std::string mEmptyLoraWeightsName{""}; //!< Empty LoRA weights name for default case
