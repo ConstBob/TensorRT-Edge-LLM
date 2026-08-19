@@ -398,6 +398,7 @@
     - if [ ! -d "$TRT_PACKAGE_DIR" ]; then echo "TensorRT x86_64 cache not found at $TRT_PACKAGE_DIR"; exit 1; fi
     - echo "Using TensorRT x86_64 package directly from cache"
     - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Upgrade pip to 26.2.1" -- python3 -m pip install --upgrade "pip==26.2.1"
     - echo "Installing test dependencies"
     - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install unit-test dependencies" -- pip3 install -r tests/requirements.txt -r tests/requirements-ut.txt
     - echo "Installing TensorRT Python package from cache"
