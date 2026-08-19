@@ -24,7 +24,7 @@ is caught.
 
 Both prefill code paths are exercised:
   * single-step loop      (2 <= seq_len < 128)
-  * CuTeDSL SSD chunk-scan (seq_len >= 128; generic dim in {64,128}, plus Blackwell D80/N128 slabs)
+  * CuTeDSL SSD chunk-scan (seq_len >= 128; generic dim in {64,128}, plus Blackwell D80/N128)
 
 Nemotron-realistic dims: head_dim=64, ssm_state=128, n_groups=8. bs kept <= 4.
 Run:
@@ -126,18 +126,17 @@ def selective_scan_ref(
 SSD_CHUNK = 128  # CuTeDSL SSD chunk size; seq_len >= 128 selects that path
 
 
-def _supports_d80_slabs():
+def _supports_d80_blackwell():
     if not DEPENDENCIES_AVAILABLE or not torch.cuda.is_available():
         return False
     major, minor = torch.cuda.get_device_capability()
     return major * 10 + minor in (100, 101, 110)
 
 
-REQUIRES_D80_SLABS = pytest.mark.skipif(
-    not _supports_d80_slabs(),
+REQUIRES_D80_BLACKWELL = pytest.mark.skipif(
+    not _supports_d80_blackwell(),
     reason=
-    "D80 SSD slabs require compiled Blackwell artifacts on SM100, SM101, or SM110"
-)
+    "D80 SSD requires compiled Blackwell artifacts on SM100, SM101, or SM110")
 
 
 @dataclass
@@ -525,7 +524,7 @@ def _nemotron_d80_cfg(max_seq):
                        max_seq=max_seq)
 
 
-@REQUIRES_D80_SLABS
+@REQUIRES_D80_BLACKWELL
 def test_d80_prefill_routing_boundary():
     cfg = _d80_cfg(max_seq=129)
     runner = MambaRunner(cfg, prefill=True)
@@ -546,7 +545,7 @@ def test_d80_prefill_routing_boundary():
         _check(cfg, out, state_out, ref_y, ref_state, ctx, 6e-2, 6e-2)
 
 
-@REQUIRES_D80_SLABS
+@REQUIRES_D80_BLACKWELL
 def test_nemotron_d80_prefill_decode_handoff():
     prefill_len = 128
     cfg = _nemotron_d80_cfg(max_seq=prefill_len)
@@ -583,7 +582,7 @@ def test_nemotron_d80_prefill_decode_handoff():
     assert_close("d80-handoff-state", ref_state, state, 6e-2, 6e-2)
 
 
-@REQUIRES_D80_SLABS
+@REQUIRES_D80_BLACKWELL
 def test_d80_prefill_cuda_graph():
     seq = 128
     cfg = _d80_cfg(max_seq=seq)

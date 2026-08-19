@@ -1140,7 +1140,7 @@ INSTANTIATE_TEST_SUITE_P(GuardedInput, SsdCuteDslBlackwellTmaBounds,
         GuardedSsdInput::kX, GuardedSsdInput::kDt, GuardedSsdInput::kB, GuardedSsdInput::kC, GuardedSsdInput::kAll),
     [](testing::TestParamInfo<GuardedSsdInput> const& info) { return guardedSsdInputName(info.param); });
 
-int runSsdD80SlabBoundsCase()
+int runSsdD80BoundsCase()
 {
     try
     {
@@ -1218,20 +1218,20 @@ int runSsdD80SlabBoundsCase()
         cudaError_t const syncStatus = cudaDeviceSynchronize();
         if (runStatus != 0)
         {
-            std::cerr << "CuteDslSSDRunner::run failed for guarded D80 slabs\n";
+            std::cerr << "CuteDslSSDRunner::run failed for guarded D80\n";
             return 1;
         }
         if (syncStatus != cudaSuccess)
         {
-            std::cerr << "D80 slab adapter accessed beyond an exact tensor or workspace: "
-                      << cudaGetErrorString(syncStatus) << "\n";
+            std::cerr << "D80 kernel accessed beyond an exact tensor or workspace: " << cudaGetErrorString(syncStatus)
+                      << "\n";
             return 1;
         }
         return 0;
     }
     catch (std::exception const& e)
     {
-        std::cerr << "D80 slab bounds case failed: " << e.what() << "\n";
+        std::cerr << "D80 bounds case failed: " << e.what() << "\n";
         return 1;
     }
 }
@@ -1245,7 +1245,7 @@ TEST(SsdCuteDslBlackwellD80Bounds, ExactBuffersDoNotOverflow)
     int32_t const smVersion = prop.major * 10 + prop.minor;
     if (!CuteDslSSDRunner::canImplement(80, 128, smVersion))
     {
-        GTEST_SKIP() << "D80 slab adapter requires SM100, SM101, or SM110";
+        GTEST_SKIP() << "D80 kernel requires SM100, SM101, or SM110";
     }
 
     CUDA_DRIVER_CHECK(cuInit(0));
@@ -1262,7 +1262,7 @@ TEST(SsdCuteDslBlackwellD80Bounds, ExactBuffersDoNotOverflow)
     ::testing::FLAGS_gtest_death_test_style = "threadsafe";
     ASSERT_EXIT(
         {
-            int const exitCode = runSsdD80SlabBoundsCase();
+            int const exitCode = runSsdD80BoundsCase();
             std::_Exit(exitCode);
         },
         ::testing::ExitedWithCode(0), "");
@@ -1494,7 +1494,7 @@ INSTANTIATE_TEST_SUITE_P(SsdCuteDslBlackwell, SsdCuteDslBlackwellTest,
         SsdCuteDslTestConfig{1, 1024, 8, 128, 128, 1},
         // D=128, N=64: SM80 fallback
         SsdCuteDslTestConfig{1, 128, 8, 128, 64, 1}, SsdCuteDslTestConfig{1, 256, 8, 128, 64, 1},
-        // D=80, N=128: two packed D=64 Blackwell slabs. Covers the routing boundary,
+        // D=80, N=128: one launch with two D=64 scheduler work tiles. Covers the routing boundary,
         // a partial chunk, multi-chunk execution, poisoned ragged padding, restored state,
         // and the exact Nemotron-3 Nano H=96/G=8 shape.
         SsdCuteDslTestConfig{1, 128, 8, 80, 128, 1}, SsdCuteDslTestConfig{1, 129, 8, 80, 128, 1},

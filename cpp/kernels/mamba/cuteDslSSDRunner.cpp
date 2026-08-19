@@ -23,7 +23,6 @@
 #include "common/logger.h"
 #include "ssdVarlenMetadata.h"
 
-#include <algorithm>
 #include <cmath>
 
 namespace trt_edgellm
@@ -37,9 +36,6 @@ constexpr int32_t kCHUNK_SIZE{128};
 #if defined(CUTE_DSL_SSD_BLACKWELL_ENABLED)
 constexpr int32_t kD80_DIM{80};
 constexpr int32_t kD80_DSTATE{128};
-constexpr int32_t kSLAB_DIM{64};
-constexpr int32_t kD80_SLAB_COUNT{2};
-constexpr size_t kWORKSPACE_ALIGNMENT{256};
 #endif
 
 bool isGenericConfiguration(int32_t dim, int32_t dstate)
@@ -87,11 +83,6 @@ size_t getGenericWorkspaceSize(
 }
 
 #if defined(CUTE_DSL_SSD_BLACKWELL_ENABLED)
-size_t alignUp(size_t value, size_t alignment)
-{
-    return ((value + alignment - 1) / alignment) * alignment;
-}
-
 size_t getBlackwellWorkspaceSize(int32_t batch, int32_t seqLen, int32_t nheads, int32_t dim)
 {
     int32_t const nchunks = (seqLen + kCHUNK_SIZE - 1) / kCHUNK_SIZE;
@@ -110,46 +101,6 @@ size_t getBlackwellWorkspaceSize(int32_t batch, int32_t seqLen, int32_t nheads, 
     return size;
 }
 
-struct D80WorkspaceLayout
-{
-    size_t xSlab{};
-    size_t outputSlab{};
-    size_t stateSlab{};
-    size_t blackwell{};
-    size_t total{};
-};
-
-D80WorkspaceLayout getD80WorkspaceLayout(int32_t batch, int32_t seqLen, int32_t nheads, int32_t dstate)
-{
-    size_t const tokenRows = static_cast<size_t>(batch) * seqLen * nheads;
-    size_t const xSlabBytes = tokenRows * kSLAB_DIM * sizeof(__half);
-    size_t const stateSlabBytes = static_cast<size_t>(batch) * nheads * kSLAB_DIM * dstate * sizeof(__half);
-
-    D80WorkspaceLayout layout{};
-    size_t cursor{};
-    auto place = [&cursor](size_t& offset, size_t bytes) {
-        cursor = alignUp(cursor, kWORKSPACE_ALIGNMENT);
-        offset = cursor;
-        cursor += bytes;
-    };
-    place(layout.xSlab, xSlabBytes);
-    place(layout.outputSlab, xSlabBytes);
-    place(layout.stateSlab, stateSlabBytes);
-    place(layout.blackwell, getBlackwellWorkspaceSize(batch, seqLen, nheads, kSLAB_DIM));
-    layout.total = alignUp(cursor, kWORKSPACE_ALIGNMENT);
-    return layout;
-}
-
-bool checkCuda(cudaError_t error, char const* operation) noexcept
-{
-    if (error == cudaSuccess)
-    {
-        return true;
-    }
-    LOG_ERROR("CuTe DSL SSD D80 slab adapter: %s failed: %s (%s)", operation, cudaGetErrorName(error),
-        cudaGetErrorString(error));
-    return false;
-}
 #endif
 
 } // namespace
@@ -162,6 +113,9 @@ detail::LazyKernelModule<ssd_prefill_d64_n64_Kernel_Module_t> CuteDslSSDRunner::
 detail::LazyKernelModule<ssd_prefill_blackwell_d64_n128_Kernel_Module_t> CuteDslSSDRunner::sBlackwellD64N128Module{};
 detail::LazyKernelModule<ssd_prefill_blackwell_d64_n128_init_states_Kernel_Module_t>
     CuteDslSSDRunner::sBlackwellD64N128InitStatesModule{};
+detail::LazyKernelModule<ssd_prefill_blackwell_d80_n128_Kernel_Module_t> CuteDslSSDRunner::sBlackwellD80N128Module{};
+detail::LazyKernelModule<ssd_prefill_blackwell_d80_n128_init_states_Kernel_Module_t>
+    CuteDslSSDRunner::sBlackwellD80N128InitStatesModule{};
 detail::LazyKernelModule<ssd_prefill_blackwell_d64_n64_Kernel_Module_t> CuteDslSSDRunner::sBlackwellD64N64Module{};
 detail::LazyKernelModule<ssd_prefill_blackwell_d64_n64_init_states_Kernel_Module_t>
     CuteDslSSDRunner::sBlackwellD64N64InitStatesModule{};
@@ -238,13 +192,13 @@ bool CuteDslSSDRunner::ensureKernelModules(SSDParams const& params, cudaStream_t
     {
         if (params.has_init_states)
         {
-            return detail::ensureModuleLoaded<ssd_prefill_blackwell_d64_n128_init_states_Kernel_Module_Load,
-                ssd_prefill_blackwell_d64_n128_init_states_Kernel_Module_Unload>(
-                sBlackwellD64N128InitStatesModule, "ssd_prefill_blackwell_d64_n128_init_states", stream);
+            return detail::ensureModuleLoaded<ssd_prefill_blackwell_d80_n128_init_states_Kernel_Module_Load,
+                ssd_prefill_blackwell_d80_n128_init_states_Kernel_Module_Unload>(
+                sBlackwellD80N128InitStatesModule, "ssd_prefill_blackwell_d80_n128_init_states", stream);
         }
-        return detail::ensureModuleLoaded<ssd_prefill_blackwell_d64_n128_Kernel_Module_Load,
-            ssd_prefill_blackwell_d64_n128_Kernel_Module_Unload>(
-            sBlackwellD64N128Module, "ssd_prefill_blackwell_d64_n128", stream);
+        return detail::ensureModuleLoaded<ssd_prefill_blackwell_d80_n128_Kernel_Module_Load,
+            ssd_prefill_blackwell_d80_n128_Kernel_Module_Unload>(
+            sBlackwellD80N128Module, "ssd_prefill_blackwell_d80_n128", stream);
     }
     if (params.smVersion >= 100 && params.smVersion < 120 && params.dim == 64)
     {
@@ -307,7 +261,7 @@ int CuteDslSSDRunner::run(SSDParams const& params, cudaStream_t stream)
 #ifdef CUTE_DSL_SSD_BLACKWELL_ENABLED
     if (isD80BlackwellConfiguration(params.dim, params.dstate, params.smVersion))
     {
-        return runPrefillBlackwellD80Slabs(params, stream);
+        return runPrefillBlackwell(params, stream);
     }
     // SM100-110 with D=64: use Blackwell persistent kernel (TMA/wgmma/TMEM).
     // SM120+ lacks TMEM/wgmma — falls through to SM80 kernel.
@@ -465,7 +419,7 @@ int CuteDslSSDRunner::runPrefill(SSDParams const& params, cudaStream_t stream)
 #ifdef CUTE_DSL_SSD_BLACKWELL_ENABLED
 
 // Macro to fill tensor structs and call the Blackwell wrapper for a given variant prefix.
-// All Blackwell D=64 variants share the same struct layout: only the type name prefix differs.
+// All Blackwell variants share the same struct layout: only the type name prefix differs.
 // Relies on local variables: params, n, seq_len, nheads, dim, dstate, ngroups, nchunks, stream.
 // Plugin contract is padded [B,S,...]+context_lengths; runner reshapes to [1,B*S,...] via
 // stride change (zero data movement), passes context_lengths as valid_lens for end-of-seq clamp.
@@ -607,8 +561,16 @@ int CuteDslSSDRunner::runPrefillBlackwell(SSDParams const& params, cudaStream_t 
     int32_t const ngroups = params.ngroups;
     int32_t const nchunks = (seq_len + 127) / 128;
 
-    // Dispatch on (dstate, has_init_states).
-    if (dstate == 128)
+    // Dispatch on (dim, dstate, has_init_states).
+    if (dim == 80 && dstate == 128)
+    {
+        if (params.has_init_states)
+            CALL_SSD_PREFILL_BLACKWELL(
+                ssd_prefill_blackwell_d80_n128_init_states, sBlackwellD80N128InitStatesModule.module);
+        else
+            CALL_SSD_PREFILL_BLACKWELL(ssd_prefill_blackwell_d80_n128, sBlackwellD80N128Module.module);
+    }
+    else if (dim == 64 && dstate == 128)
     {
         if (params.has_init_states)
             CALL_SSD_PREFILL_BLACKWELL(
@@ -616,7 +578,7 @@ int CuteDslSSDRunner::runPrefillBlackwell(SSDParams const& params, cudaStream_t 
         else
             CALL_SSD_PREFILL_BLACKWELL(ssd_prefill_blackwell_d64_n128, sBlackwellD64N128Module.module);
     }
-    else if (dstate == 64)
+    else if (dim == 64 && dstate == 64)
     {
         if (params.has_init_states)
             CALL_SSD_PREFILL_BLACKWELL(
@@ -625,103 +587,8 @@ int CuteDslSSDRunner::runPrefillBlackwell(SSDParams const& params, cudaStream_t 
             CALL_SSD_PREFILL_BLACKWELL(ssd_prefill_blackwell_d64_n64, sBlackwellD64N64Module.module);
     }
 
-    LOG_ERROR("CuTe DSL SSD Blackwell prefill: unsupported dstate=%d", dstate);
+    LOG_ERROR("CuTe DSL SSD Blackwell prefill: unsupported dim=%d dstate=%d", dim, dstate);
     return -1;
-}
-
-int CuteDslSSDRunner::runPrefillBlackwellD80Slabs(SSDParams const& params, cudaStream_t stream)
-{
-    if (params.workspace == nullptr)
-    {
-        LOG_ERROR("CuTe DSL SSD D80 slab adapter: workspace is null");
-        return -1;
-    }
-
-    D80WorkspaceLayout const layout = getD80WorkspaceLayout(params.batch, params.seq_len, params.nheads, params.dstate);
-    char* const workspace = static_cast<char*>(params.workspace);
-    void* const xSlab = workspace + layout.xSlab;
-    void* const outputSlab = workspace + layout.outputSlab;
-    void* const stateSlab = workspace + layout.stateSlab;
-    void* const blackwellWorkspace = workspace + layout.blackwell;
-
-    size_t const tokenRows = static_cast<size_t>(params.batch) * params.seq_len * params.nheads;
-    size_t const xSlabBytes = tokenRows * kSLAB_DIM * sizeof(__half);
-    size_t const stateSlabBytes
-        = static_cast<size_t>(params.batch) * params.nheads * kSLAB_DIM * params.dstate * sizeof(__half);
-    size_t const dstateBytes = static_cast<size_t>(params.dstate) * sizeof(__half);
-    size_t const stateSlices = static_cast<size_t>(params.batch) * params.nheads;
-
-    for (int32_t slabIndex = 0; slabIndex < kD80_SLAB_COUNT; ++slabIndex)
-    {
-        int32_t const dimOffset = slabIndex * kSLAB_DIM;
-        int32_t const slabWidth = std::min(kSLAB_DIM, kD80_DIM - dimOffset);
-        if (!checkCuda(cudaMemsetAsync(xSlab, 0, xSlabBytes, stream), "cudaMemsetAsync(x slab)")
-            || !checkCuda(cudaMemsetAsync(outputSlab, 0, xSlabBytes, stream), "cudaMemsetAsync(output slab)")
-            || !checkCuda(cudaMemsetAsync(stateSlab, 0, stateSlabBytes, stream), "cudaMemsetAsync(state slab)"))
-        {
-            return -1;
-        }
-
-        void const* const xSource
-            = static_cast<char const*>(params.x) + static_cast<size_t>(dimOffset) * sizeof(__half);
-        if (!checkCuda(cudaMemcpy2DAsync(xSlab, kSLAB_DIM * sizeof(__half), xSource, kD80_DIM * sizeof(__half),
-                           slabWidth * sizeof(__half), tokenRows, cudaMemcpyDeviceToDevice, stream),
-                "cudaMemcpy2DAsync(pack x)"))
-        {
-            return -1;
-        }
-
-        if (params.has_init_states)
-        {
-            cudaMemcpy3DParms statePack{};
-            statePack.srcPtr
-                = make_cudaPitchedPtr(static_cast<char*>(params.state) + static_cast<size_t>(dimOffset) * dstateBytes,
-                    dstateBytes, dstateBytes, kD80_DIM);
-            statePack.dstPtr = make_cudaPitchedPtr(stateSlab, dstateBytes, dstateBytes, kSLAB_DIM);
-            statePack.extent = make_cudaExtent(dstateBytes, slabWidth, stateSlices);
-            statePack.kind = cudaMemcpyDeviceToDevice;
-            if (!checkCuda(cudaMemcpy3DAsync(&statePack, stream), "cudaMemcpy3DAsync(pack state)"))
-            {
-                return -1;
-            }
-        }
-
-        SSDParams slabParams = params;
-        slabParams.x = xSlab;
-        slabParams.state = stateSlab;
-        slabParams.output = outputSlab;
-        slabParams.workspace = blackwellWorkspace;
-        slabParams.dim = kSLAB_DIM;
-        int const rc = runPrefillBlackwell(slabParams, stream);
-        if (rc != 0)
-        {
-            LOG_ERROR("CuTe DSL SSD D80 slab adapter: Blackwell slab %d failed with error %d", slabIndex, rc);
-            return rc;
-        }
-
-        void* const outputDestination
-            = static_cast<char*>(params.output) + static_cast<size_t>(dimOffset) * sizeof(__half);
-        if (!checkCuda(
-                cudaMemcpy2DAsync(outputDestination, kD80_DIM * sizeof(__half), outputSlab, kSLAB_DIM * sizeof(__half),
-                    slabWidth * sizeof(__half), tokenRows, cudaMemcpyDeviceToDevice, stream),
-                "cudaMemcpy2DAsync(unpack output)"))
-        {
-            return -1;
-        }
-
-        cudaMemcpy3DParms stateUnpack{};
-        stateUnpack.srcPtr = make_cudaPitchedPtr(stateSlab, dstateBytes, dstateBytes, kSLAB_DIM);
-        stateUnpack.dstPtr
-            = make_cudaPitchedPtr(static_cast<char*>(params.state) + static_cast<size_t>(dimOffset) * dstateBytes,
-                dstateBytes, dstateBytes, kD80_DIM);
-        stateUnpack.extent = make_cudaExtent(dstateBytes, slabWidth, stateSlices);
-        stateUnpack.kind = cudaMemcpyDeviceToDevice;
-        if (!checkCuda(cudaMemcpy3DAsync(&stateUnpack, stream), "cudaMemcpy3DAsync(unpack state)"))
-        {
-            return -1;
-        }
-    }
-    return 0;
 }
 
 #undef CALL_SSD_PREFILL_BLACKWELL
@@ -738,7 +605,7 @@ size_t CuteDslSSDRunner::getWorkspaceSize(
 #ifdef CUTE_DSL_SSD_BLACKWELL_ENABLED
     if (dim == kD80_DIM && dstate == kD80_DSTATE)
     {
-        return getD80WorkspaceLayout(batch, seqLen, nheads, dstate).total;
+        return getBlackwellWorkspaceSize(batch, seqLen, nheads, dim);
     }
     return std::max(getGenericWorkspaceSize(batch, seqLen, nheads, dim, dstate, ngroups),
         getBlackwellWorkspaceSize(batch, seqLen, nheads, dim));

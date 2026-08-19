@@ -507,13 +507,21 @@ function(cute_dsl_setup)
     )
   endif()
 
-  # Check for Blackwell SSD variants and set a clean define.
-  set(_ssd_bw_found FALSE)
-  foreach(_ssd_bw_name "ssd_prefill_blackwell_d64_n128"
-                       "ssd_prefill_blackwell_d64_n64")
+  # The Blackwell SSD runner references the full variant set under one define.
+  # Keep the path disabled when an older or incomplete artifact pack is used.
+  set(_ssd_bw_found TRUE)
+  foreach(
+    _ssd_bw_name
+    "ssd_prefill_blackwell_d64_n128"
+    "ssd_prefill_blackwell_d64_n128_init_states"
+    "ssd_prefill_blackwell_d80_n128"
+    "ssd_prefill_blackwell_d80_n128_init_states"
+    "ssd_prefill_blackwell_d64_n64"
+    "ssd_prefill_blackwell_d64_n64_init_states")
     list(FIND _variants "${_ssd_bw_name}" _ssd_bw_idx)
-    if(NOT ${_ssd_bw_idx} EQUAL -1)
-      set(_ssd_bw_found TRUE)
+    if(${_ssd_bw_idx} EQUAL -1)
+      set(_ssd_bw_found FALSE)
+      break()
     endif()
   endforeach()
   if(_ssd_bw_found)
