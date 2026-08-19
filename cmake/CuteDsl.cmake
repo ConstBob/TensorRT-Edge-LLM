@@ -49,6 +49,8 @@
 #   CUTE_DSL_F16_MOE_ENABLED — set when the f16_moe group is active
 #   CUTE_DSL_SSD_ENABLED   — set when the ssd group is active
 #   CUTE_DSL_RMSNORM_ENABLED — set when the rmsnorm group is active
+#   CUTE_DSL_NVFP4_A16_BLACKWELL_GEMM_ENABLED — set when the SM110 dense W4A16
+#                                                GEMM group is active
 #   CUTE_DSL_GEMM_ENABLED  — set when any gemm variant is active
 # ---------------------------------------------------------------------------
 # cmake-format: on
@@ -993,6 +995,42 @@ function(cute_dsl_setup)
       STATUS
         "CuTe DSL: gemm_blackwell_nvfp4_ws_fp8_tn128 — CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP8_TN128_ENABLED set"
     )
+  endif()
+
+  # Dense SM110 W4A16 variants. The group supports both IO dtypes and dispatch
+  # relies on all six token tiles, so an active group must provide both complete
+  # sets. An inactive group must not leak variant-derived feature guards.
+  if("nvfp4_a16_blackwell_gemm" IN_LIST _active_groups)
+    set(_nvfp4_a16_tiles 8 16 32 64 128 256)
+    list(LENGTH _nvfp4_a16_tiles _nvfp4_a16_expected_count)
+    foreach(_nvfp4_a16_dtype fp16 bf16)
+      string(TOUPPER "${_nvfp4_a16_dtype}" _nvfp4_a16_dtype_upper)
+      set(_nvfp4_a16_found_variants)
+      set(_nvfp4_a16_missing_variants)
+      foreach(_nvfp4_a16_tile ${_nvfp4_a16_tiles})
+        set(_nvfp4_a16_variant
+            "nvfp4_a16_blackwell_gemm_${_nvfp4_a16_dtype}_tm128_tn${_nvfp4_a16_tile}_tk64"
+        )
+        list(FIND _variants "${_nvfp4_a16_variant}" _nvfp4_a16_idx)
+        if(NOT ${_nvfp4_a16_idx} EQUAL -1)
+          list(APPEND _nvfp4_a16_found_variants "${_nvfp4_a16_variant}")
+        else()
+          list(APPEND _nvfp4_a16_missing_variants "${_nvfp4_a16_variant}")
+        endif()
+      endforeach()
+
+      list(LENGTH _nvfp4_a16_found_variants _nvfp4_a16_found_count)
+      if(NOT _nvfp4_a16_found_count EQUAL _nvfp4_a16_expected_count)
+        message(
+          FATAL_ERROR
+            "CuTe DSL: incomplete ${_nvfp4_a16_dtype_upper} dense W4A16 artifact set in ${_metadata}.\n"
+            "Found: ${_nvfp4_a16_found_variants}\n"
+            "Missing: ${_nvfp4_a16_missing_variants}\n"
+            "Regenerate the nvfp4_a16_blackwell_gemm group with both dtypes and all token tiles."
+        )
+      endif()
+
+    endforeach()
   endif()
 
   # Umbrella CUTE_DSL_GEMM_ENABLED — set if ANY gemm variant was found. Source

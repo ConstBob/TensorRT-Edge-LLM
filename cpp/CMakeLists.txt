@@ -78,22 +78,25 @@ else()
   message(STATUS "FMHA Kernels: Compiling cubins for all SM architectures")
 endif()
 
-# Generate embedded XQA sources (kernel source + CUDA headers baked into a .cpp)
-# consumed by the NVRTC JIT in decoderXQAJitCompiler.cpp.
+# Generate plugin JIT sources (kernel sources + CUDA headers baked into a .cpp).
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
-set(XQA_EMBEDDED_SOURCES_OUTPUT
-    "${CMAKE_BINARY_DIR}/generated/xqaEmbeddedSources.cpp")
-set(XQA_EMBED_SCRIPT "${CMAKE_SOURCE_DIR}/kernelSrcs/xqa/gen_cpp_header.py")
+set(PLUGIN_JIT_EMBEDDED_SOURCES_OUTPUT
+    "${CMAKE_BINARY_DIR}/generated/pluginJitEmbeddedSources.cpp")
+set(PLUGIN_JIT_EMBED_SCRIPT
+    "${CMAKE_SOURCE_DIR}/kernelSrcs/jit_utils/gen_cpp_header.py")
 file(GLOB XQA_SOURCE_FILES "${CMAKE_SOURCE_DIR}/kernelSrcs/xqa/*.cu"
      "${CMAKE_SOURCE_DIR}/kernelSrcs/xqa/*.cuh"
      "${CMAKE_SOURCE_DIR}/kernelSrcs/xqa/*.h")
+set(NVFP4_A16_BLACKWELL_GEMV_JIT_SOURCE_FILES
+    "${CMAKE_SOURCE_DIR}/kernelSrcs/nvfp4A16BlackwellGemv/nvfp4A16BlackwellGemv.cu"
+)
 
 # The generated TU embeds CUDA toolkit headers verbatim, so it is stale after a
 # toolkit change even when no repo file moved. Depend on the headers themselves
 # and stamp the toolkit version into the rule.
-set(XQA_EMBEDDED_CUDA_HEADER_DEPS "")
+set(PLUGIN_JIT_EMBEDDED_CUDA_HEADER_DEPS "")
 foreach(
-  _xqa_cuda_header
+  _plugin_jit_cuda_header
   cuda_bf16.h
   cuda_bf16.hpp
   cuda_fp16.h
@@ -104,37 +107,38 @@ foreach(
   cuda_fp4.hpp
   cuda_fp6.h
   cuda_fp6.hpp)
-  if(EXISTS "${CUDA_RUNTIME_API_INCLUDE_DIR}/${_xqa_cuda_header}")
-    list(APPEND XQA_EMBEDDED_CUDA_HEADER_DEPS
-         "${CUDA_RUNTIME_API_INCLUDE_DIR}/${_xqa_cuda_header}")
+  if(EXISTS "${CUDA_RUNTIME_API_INCLUDE_DIR}/${_plugin_jit_cuda_header}")
+    list(APPEND PLUGIN_JIT_EMBEDDED_CUDA_HEADER_DEPS
+         "${CUDA_RUNTIME_API_INCLUDE_DIR}/${_plugin_jit_cuda_header}")
   endif()
 endforeach()
 
 add_custom_command(
-  OUTPUT ${XQA_EMBEDDED_SOURCES_OUTPUT}
+  OUTPUT ${PLUGIN_JIT_EMBEDDED_SOURCES_OUTPUT}
   COMMAND ${CMAKE_COMMAND} -E echo
-          "XQA embedded sources for CUDA ${CMAKE_CUDA_COMPILER_VERSION}"
+          "Plugin JIT embedded sources for CUDA ${CMAKE_CUDA_COMPILER_VERSION}"
   COMMAND
-    ${Python3_EXECUTABLE} ${XQA_EMBED_SCRIPT} -o ${XQA_EMBEDDED_SOURCES_OUTPUT}
-    --xqa_dir ${CMAKE_SOURCE_DIR}/kernelSrcs/xqa --cpp_dir
+    ${Python3_EXECUTABLE} ${PLUGIN_JIT_EMBED_SCRIPT} -o
+    ${PLUGIN_JIT_EMBEDDED_SOURCES_OUTPUT} --xqa_dir
+    ${CMAKE_SOURCE_DIR}/kernelSrcs/xqa --gemv_dir
+    ${CMAKE_SOURCE_DIR}/kernelSrcs/nvfp4A16BlackwellGemv --cpp_dir
     ${CMAKE_SOURCE_DIR}/cpp --cuda_include_dir ${CUDA_RUNTIME_API_INCLUDE_DIR}
   DEPENDS
-    ${XQA_SOURCE_FILES} ${XQA_EMBED_SCRIPT} ${XQA_EMBEDDED_CUDA_HEADER_DEPS}
+    ${XQA_SOURCE_FILES}
+    ${NVFP4_A16_BLACKWELL_GEMV_JIT_SOURCE_FILES}
+    ${PLUGIN_JIT_EMBED_SCRIPT}
+    ${PLUGIN_JIT_EMBEDDED_CUDA_HEADER_DEPS}
     "${CMAKE_SOURCE_DIR}/cpp/common/cudaMacros.h"
     "${CMAKE_SOURCE_DIR}/cpp/kernels/decodeAttentionKernels/xqaKernelTypes.h"
-  COMMENT "Generating embedded XQA sources for NVRTC"
+  COMMENT "Generating embedded plugin JIT sources for NVRTC"
   VERBATIM)
 
-# Funnel generation through a custom target rather than letting consumers depend
-# on the output file directly. The Makefile generator copies the generation rule
-# into the build.make of every target that lists the file as a source, so with
-# more than one consumer `make -j` runs the generator concurrently against the
-# same output. Only edgellmXqaJit consumes it today, so this is insurance
-# against the next consumer rather than a live fix.
-add_custom_target(generateXqaEmbeddedSources
-                  DEPENDS ${XQA_EMBEDDED_SOURCES_OUTPUT})
-set_source_files_properties(${XQA_EMBEDDED_SOURCES_OUTPUT} PROPERTIES GENERATED
-                                                                      TRUE)
+# Keep the generator single-owner even when multiple final targets consume the
+# static JIT archive.
+add_custom_target(generatePluginJitEmbeddedSources
+                  DEPENDS ${PLUGIN_JIT_EMBEDDED_SOURCES_OUTPUT})
+set_source_files_properties(${PLUGIN_JIT_EMBEDDED_SOURCES_OUTPUT}
+                            PROPERTIES GENERATED TRUE)
 
 # Generate Core C++ static library for LLM-SDK
 file(GLOB_RECURSE COMMON_CPP_SRCS "common/*.cpp")
@@ -149,15 +153,15 @@ list(
   REGEX
   "marlin_moe_wna16/(ops|sm80_kernel_(float16_u4_float16|float16_fe2m1_float16|bfloat16_fe2m1_bfloat16))\\.cu$"
 )
-# The NVRTC JIT belongs to the plugin, not to the kernel/runtime libraries: it
-# runs only during engine build, and it is the sole reason the ~1.15 MiB of
-# embedded kernel source and the NVRTC dependency would otherwise land in every
-# executable that links edgellmCore. Keep it out of both archives and give it
-# its own target below.
-set(XQA_JIT_CPP_SRCS
+# JIT compilation and module loading belong to the plugin, not the core kernel
+# archives. Unit tests link this target explicitly for direct compiler coverage.
+set(PLUGIN_JIT_CPP_SRCS
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernels/PluginJitKernels/pluginJitCompiler.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/kernels/decodeAttentionKernels/decoderXQAJitCompiler.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernels/nvfp4A16BlackwellGemv/nvfp4A16BlackwellGemvJitCompiler.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernels/nvfp4A16BlackwellGemv/nvfp4A16BlackwellGemvJitRunner.cpp"
 )
-list(REMOVE_ITEM KERNELS_CPP_SRCS ${XQA_JIT_CPP_SRCS})
+list(REMOVE_ITEM KERNELS_CPP_SRCS ${PLUGIN_JIT_CPP_SRCS})
 
 file(GLOB_RECURSE SAMPLER_CPP_SRCS "sampler/*.cpp")
 file(GLOB_RECURSE SAMPLER_CU_SRCS "sampler/*.cu")
@@ -171,19 +175,16 @@ file(GLOB_RECURSE MOE_MARLIN_CU_SRCS "kernels/moe/moe_marlin/*.cu")
 set_source_files_properties(${MOE_MARLIN_CU_SRCS} PROPERTIES COMPILE_FLAGS
                                                              "-rdc=true")
 
-# XQA NVRTC JIT: the embedded kernel source blob plus the NVRTC driver. Linked
-# only by NvInfer_edgellm_plugin (which JITs at TensorRTPhase::kBUILD) and by
-# the unit tests (which JIT directly). decoderXQARunner needs only the XQAJitKey
-# and getXQAJitMTileSize from decoderXQAJitCompiler.h, both header-only, so the
-# kernel and runtime libraries carry no link dependency on this target.
-add_library(edgellmXqaJit STATIC ${XQA_JIT_CPP_SRCS}
-                                 ${XQA_EMBEDDED_SOURCES_OUTPUT})
-target_include_directories(edgellmXqaJit PRIVATE ${COMMON_INCLUDE_DIRS}
-                                                 ${NVRTC_INCLUDE_DIR})
-target_link_libraries(edgellmXqaJit PRIVATE ${NVRTC_LIB})
-add_dependencies(edgellmXqaJit generateXqaEmbeddedSources)
-edgellm_apply_qnx_warning_suppressions(edgellmXqaJit)
-edgellm_set_hidden_visibility(edgellmXqaJit)
+# Build-time NVRTC compilers and runtime CUDA Driver module loaders.
+add_library(edgellmPluginJit STATIC ${PLUGIN_JIT_CPP_SRCS}
+                                    ${PLUGIN_JIT_EMBEDDED_SOURCES_OUTPUT})
+target_include_directories(edgellmPluginJit PRIVATE ${COMMON_INCLUDE_DIRS}
+                                                    ${NVRTC_INCLUDE_DIR})
+target_link_libraries(
+  edgellmPluginJit PRIVATE ${NVRTC_LIB} ${CUDA_DRIVER_LINK_LIB} ${CUDART_LIB})
+add_dependencies(edgellmPluginJit generatePluginJitEmbeddedSources)
+edgellm_apply_qnx_warning_suppressions(edgellmPluginJit)
+edgellm_set_hidden_visibility(edgellmPluginJit)
 
 add_library(edgellmKernels STATIC ${KERNELS_CPP_SRCS} ${KERNELS_CU_SRCS}
                                   ${COMMON_CPP_SRCS})
@@ -246,8 +247,9 @@ set_target_properties(NvInfer_edgellm_plugin PROPERTIES LIBRARY_OUTPUT_DIRECTORY
 target_include_directories(NvInfer_edgellm_plugin
                            PRIVATE ${COMMON_INCLUDE_DIRS})
 target_link_libraries(
-  NvInfer_edgellm_plugin PRIVATE commonLibraryExt edgellmKernels edgellmXqaJit
-                                 ${CUDA_DRIVER_LINK_LIB} ${CUDART_LIB})
+  NvInfer_edgellm_plugin
+  PRIVATE commonLibraryExt edgellmKernels edgellmPluginJit
+          ${CUDA_DRIVER_LINK_LIB} ${CUDART_LIB})
 add_cross_build_link_options(NvInfer_edgellm_plugin)
 edgellm_apply_qnx_warning_suppressions(NvInfer_edgellm_plugin)
 edgellm_set_hidden_visibility(NvInfer_edgellm_plugin)

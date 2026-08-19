@@ -17,26 +17,17 @@
 
 #include "decoderXQAJitCompiler.h"
 
-#include "common/logger.h"
 #include "common/stringUtils.h"
-#include "xqaEmbeddedSources.h"
+#include "kernels/PluginJitKernels/pluginJitCompileCache.h"
+#include "kernels/PluginJitKernels/pluginJitCompiler.h"
 #include "xqaKernelTypes.h"
 
 #include <algorithm>
 #include <array>
-#include <chrono>
-#include <exception>
-#include <future>
-#include <memory>
-#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
-#include <unordered_map>
-#include <utility>
 #include <vector>
-
-#include <nvrtc.h>
 
 namespace trt_edgellm
 {
@@ -90,21 +81,14 @@ std::string getGpuArchitectureOption(int32_t sm)
     constexpr int32_t kSM101{101};
     constexpr int32_t kCUDA13_MAJOR{13};
 
-    int32_t nvrtcMajor{0};
-    int32_t nvrtcMinor{0};
-    nvrtcResult const versionResult = nvrtcVersion(&nvrtcMajor, &nvrtcMinor);
-    if (versionResult != NVRTC_SUCCESS)
-    {
-        throw std::runtime_error(
-            format::fmtstr("Failed to query NVRTC version: %s", nvrtcGetErrorString(versionResult)));
-    }
     if (sm == kSM100)
     {
         return "--gpu-architecture=sm_100a";
     }
     if (sm == kSM101)
     {
-        return nvrtcMajor >= kCUDA13_MAJOR ? "--gpu-architecture=sm_110a" : "--gpu-architecture=sm_101a";
+        return getPluginJitNvrtcMajorVersion() >= kCUDA13_MAJOR ? "--gpu-architecture=sm_110a"
+                                                                : "--gpu-architecture=sm_101a";
     }
     return "--gpu-architecture=sm_" + std::to_string(sm);
 }
@@ -154,111 +138,6 @@ std::string keyToString(XQAJitKey const& key)
         "spec_decode=%d",
         key.sm, static_cast<int32_t>(key.dataType), static_cast<int32_t>(key.kvDataType), key.headSize, key.qHeadsPerKv,
         key.tokensPerPage, key.slidingWindow ? 1 : 0, key.specDecode ? 1 : 0);
-}
-
-void checkNvrtc(nvrtcResult result, char const* call)
-{
-    if (result != NVRTC_SUCCESS)
-    {
-        throw std::runtime_error(format::fmtstr("NVRTC call failed in %s: %s", call, nvrtcGetErrorString(result)));
-    }
-}
-
-struct NvrtcProgramDeleter
-{
-    void operator()(std::remove_pointer_t<nvrtcProgram>* program) const noexcept
-    {
-        if (program != nullptr)
-        {
-            nvrtcProgram handle{program};
-            nvrtcDestroyProgram(&handle);
-        }
-    }
-};
-
-using NvrtcProgramPtr = std::unique_ptr<std::remove_pointer_t<nvrtcProgram>, NvrtcProgramDeleter>;
-
-std::string getProgramLog(nvrtcProgram program)
-{
-    size_t logSize{0};
-    checkNvrtc(nvrtcGetProgramLogSize(program, &logSize), "nvrtcGetProgramLogSize");
-    if (logSize == 0)
-    {
-        return {};
-    }
-    std::string log(logSize, '\0');
-    checkNvrtc(nvrtcGetProgramLog(program, log.data()), "nvrtcGetProgramLog");
-    return log;
-}
-
-std::vector<uint8_t> getCompiledModuleImage(nvrtcProgram program)
-{
-    size_t cubinSize{0};
-    nvrtcResult const cubinSizeResult = nvrtcGetCUBINSize(program, &cubinSize);
-    if (cubinSizeResult == NVRTC_SUCCESS && cubinSize > 0)
-    {
-        std::vector<uint8_t> cubin(cubinSize);
-        checkNvrtc(nvrtcGetCUBIN(program, reinterpret_cast<char*>(cubin.data())), "nvrtcGetCUBIN");
-        return cubin;
-    }
-
-    size_t ptxSize{0};
-    checkNvrtc(nvrtcGetPTXSize(program, &ptxSize), "nvrtcGetPTXSize");
-    std::vector<uint8_t> ptx(ptxSize);
-    checkNvrtc(nvrtcGetPTX(program, reinterpret_cast<char*>(ptx.data())), "nvrtcGetPTX");
-    return ptx;
-}
-
-XQAJitResult compileXQAKernelImpl(XQAJitKey const& key)
-{
-    auto const& embedded = getXQAEmbeddedSources();
-
-    // Build NVRTC virtual header arrays from embedded sources.
-    std::vector<char const*> headerContents;
-    std::vector<char const*> headerNames;
-    headerContents.reserve(embedded.headers.size());
-    headerNames.reserve(embedded.headers.size());
-    for (auto const& [name, content] : embedded.headers)
-    {
-        headerNames.push_back(name);
-        headerContents.push_back(content);
-    }
-
-    std::vector<std::string> const optionStrings = buildNvrtcOptions(key);
-    std::vector<char const*> options;
-    options.reserve(optionStrings.size());
-    for (std::string const& option : optionStrings)
-    {
-        options.push_back(option.c_str());
-    }
-
-    nvrtcProgram rawProgram{};
-    checkNvrtc(nvrtcCreateProgram(&rawProgram, embedded.mainSource, "mha.cu",
-                   static_cast<int32_t>(headerContents.size()), headerContents.data(), headerNames.data()),
-        "nvrtcCreateProgram");
-    NvrtcProgramPtr const program(rawProgram);
-
-    auto const compileStart = std::chrono::steady_clock::now();
-    nvrtcResult const compileResult
-        = nvrtcCompileProgram(program.get(), static_cast<int32_t>(options.size()), options.data());
-    auto const compileEnd = std::chrono::steady_clock::now();
-    auto const compileMs = std::chrono::duration_cast<std::chrono::milliseconds>(compileEnd - compileStart).count();
-
-    std::string const compileLog = getProgramLog(program.get());
-    if (compileResult != NVRTC_SUCCESS)
-    {
-        throw std::runtime_error("Failed to NVRTC compile XQA kernel for " + keyToString(key) + "\n" + compileLog);
-    }
-    if (!compileLog.empty())
-    {
-        LOG_DEBUG("NVRTC XQA compile log for %s:\n%s", keyToString(key).c_str(), compileLog.c_str());
-    }
-
-    XQAJitResult result;
-    result.cubin = getCompiledModuleImage(program.get());
-    LOG_INFO("Compiled XQA kernel with NVRTC for %s (%zu bytes, %lld ms)", keyToString(key).c_str(),
-        result.cubin.size(), static_cast<long long>(compileMs));
-    return result;
 }
 
 //! Format version for the serialized XQA JIT kernel blob. Bump on any layout change.
@@ -418,52 +297,13 @@ bool canCompileXQAKernel(int32_t numQHeads, int32_t numKVHeads, int32_t headSize
 
 XQAJitResult compileXQAKernel(XQAJitKey const& key)
 {
-    static std::mutex sCacheMutex;
-    // Cache futures so same-key callers share one NVRTC compile while different keys can still compile in parallel.
-    static std::unordered_map<XQAJitKey, std::shared_future<XQAJitResult>, XQAJitKeyHasher> sCache;
-
-    std::shared_future<XQAJitResult> future;
-    std::promise<XQAJitResult> promise;
-    bool compileThisThread{false};
-    {
-        std::lock_guard<std::mutex> lock(sCacheMutex);
-        auto const findIter = sCache.find(key);
-        if (findIter != sCache.end())
-        {
-            future = findIter->second;
-        }
-        else
-        {
-            // Publish the in-flight compile before releasing the lock so same-key callers wait for it.
-            compileThisThread = true;
-            future = promise.get_future().share();
-            sCache.emplace(key, future);
-        }
-    }
-
-    if (!compileThisThread)
-    {
-        return future.get();
-    }
-
-    try
-    {
-        XQAJitResult result = compileXQAKernelImpl(key);
-        promise.set_value(std::move(result));
-    }
-    catch (...)
-    {
-        std::exception_ptr const exception = std::current_exception();
-        {
-            std::lock_guard<std::mutex> lock(sCacheMutex);
-            // Remove failed in-flight compiles so a later call can retry.
-            sCache.erase(key);
-        }
-        promise.set_exception(exception);
-        std::rethrow_exception(exception);
-    }
-
-    return future.get();
+    static PluginJitCompileCache<XQAJitKey, XQAJitResult, XQAJitKeyHasher> sCache;
+    return sCache.getOrCompile(key, [&key] {
+        XQAJitResult result;
+        result.cubin = compilePluginJitKernel(
+            PluginJitProgram::kXQA, buildNvrtcOptions(key), "XQA kernel for " + keyToString(key));
+        return result;
+    });
 }
 
 } // namespace trt_edgellm

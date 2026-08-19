@@ -17,26 +17,18 @@
 
 #pragma once
 
+#include "pluginJitEmbeddedSources.h"
+
 #include <cstdint>
-#include <utility>
+#include <string>
 #include <vector>
 
 namespace trt_edgellm
 {
 
-//! \brief Embedded XQA kernel source files for NVRTC compilation.
-//!
-//! All source files (XQA kernels, project headers, CUDA toolkit headers) are embedded
-//! at build time so that NVRTC compilation does not depend on any filesystem paths.
-struct XQAEmbeddedSources
-{
-    char const* mainSource; //!< Content of mha.cu (the NVRTC entry point)
-    //! Virtual headers passed to nvrtcCreateProgram: {includeName, content}
-    std::vector<std::pair<char const*, char const*>> headers;
-};
+int32_t getPluginJitNvrtcMajorVersion();
 
-//! \brief Get the embedded XQA source files.
-//! \return Reference to a singleton containing all embedded source content.
-XQAEmbeddedSources const& getXQAEmbeddedSources();
+std::vector<uint8_t> compilePluginJitKernel(
+    PluginJitProgram program, std::vector<std::string> const& options, std::string const& description);
 
 } // namespace trt_edgellm

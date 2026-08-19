@@ -86,14 +86,14 @@ function(edgellm_add_unit_test)
   target_compile_definitions(
     ${ARG_NAME}
     PRIVATE EDGELLM_PLUGIN_PATH="$<TARGET_FILE:NvInfer_edgellm_plugin>")
-  # edgellmXqaJit is not part of edgellmCore: the XQA JIT lives in the plugin.
-  # The decoder-runner tests JIT kernels directly, so it is linked explicitly.
-  # edgellmCore whole-archive: the device link only pulls an archive member that
-  # something references from device code, while the host link pulls any member
-  # whose host wrapper a test calls. Those two sets differ per group, and the
-  # members only the host link pulled are exactly the ones left with an
-  # unresolved `__cudaRegisterLinkedBinary_*`. Forcing every member in makes the
-  # two sets the same.
+  # Plugin JIT support is not part of edgellmCore. Tests link it explicitly for
+  # direct XQA and NVFP4-A16 GEMV compiler coverage. edgellmCore whole-archive:
+  # the device link only pulls an archive member that something references from
+  # device code, while the host link pulls any member whose host wrapper a test
+  # calls. Those two sets differ per group, and the members only the host link
+  # pulled are exactly the ones left with an unresolved
+  # `__cudaRegisterLinkedBinary_*`. Forcing every member in makes the two sets
+  # the same.
   target_link_libraries(
     ${ARG_NAME}
     PRIVATE gtest
@@ -103,7 +103,7 @@ function(edgellm_add_unit_test)
             -Wl,--whole-archive
             edgellmCore
             -Wl,--no-whole-archive
-            edgellmXqaJit
+            edgellmPluginJit
             commonLibraryExt
             exampleUtils
             ${CUDA_DRIVER_LINK_LIB})
@@ -169,7 +169,11 @@ edgellm_add_unit_test(
   cpp/kernels/int4GroupwiseGemmKernels
   cpp/kernels/kvCacheUtilKernels
   cpp/kernels/multiDeviceKernels
+  cpp/kernels/nvfp4A16BlackwellGemm
+  cpp/kernels/nvfp4A16BlackwellGemv
   cpp/kernels/dart)
+
+edgellm_add_unit_test(NAME unitTestPlugins DIRS cpp/plugins/nvfp4A16GemmPlugin)
 
 edgellm_add_unit_test(NAME unitTestCuteDslKernels DIRS
                       kernelSrcs/int4_fp16_gemm_cutedsl)
