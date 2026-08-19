@@ -57,6 +57,8 @@ struct XQALaunchParams
 
     float const* attentionSinks = nullptr; //!< Attention sinks parameter
 
+    bool enablePdl{true}; //!< Enable programmatic dependent launch when supported
+
     //! MHA parameters to locate a kernel to launch
     int32_t numQheads = 0;  //!< Number of query heads
     int32_t numKVheads = 0; //!< Number of key-value heads
