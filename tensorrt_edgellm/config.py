@@ -2306,7 +2306,8 @@ def _parse_quant(model_dir: str,
         if algo == "MIXED_PRECISION":
             quantized_layers = q.get("quantized_layers", {})
             dominant, group_size, layer_overrides = _parse_mixed_precision(
-                quantized_layers)
+                quantized_layers,
+                config.get("model_type") or "")
             return QuantConfig(
                 quant_type=dominant,
                 group_size=group_size,
@@ -2473,7 +2474,8 @@ def _algo_to_quant_type(algo: str) -> str:
     return QUANT_FP16
 
 
-def _parse_mixed_precision(quantized_layers: dict) -> "tuple[str, int, dict]":
+def _parse_mixed_precision(quantized_layers: dict,
+                           model_type: str = "") -> "tuple[str, int, dict]":
     """Parse MIXED_PRECISION quantized_layers dict.
 
     Returns ``(dominant_quant_type, dominant_group_size, layer_overrides)``.
@@ -2495,11 +2497,11 @@ def _parse_mixed_precision(quantized_layers: dict) -> "tuple[str, int, dict]":
         return QUANT_FP16, 1, {}
 
     def _mixed_quant_type(algo: str) -> str:
-        # ModelOpt tags weight-only NVFP4 as ``W4A16_NVFP4``; the generic mapper
-        # collapses it to plain (W4A4) ``nvfp4``. Preserve the A16 distinction so
-        # weight-only experts/lm_head route to the NVFP4-A16 Marlin path.
+        # Nemotron-H W4A16 layers require the Marlin path; other model families
+        # use their established NVFP4 export paths.
         qt = _algo_to_quant_type(algo)
-        if qt == QUANT_NVFP4 and "W4A16" in algo.upper():
+        if (qt == QUANT_NVFP4 and "W4A16" in algo.upper()
+                and model_type.lower().startswith("nemotron_h")):
             return QUANT_NVFP4_A16
         return qt
 
