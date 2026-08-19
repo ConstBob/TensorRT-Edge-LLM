@@ -112,10 +112,10 @@ endif()
 if(NOT NVRTC_INCLUDE_DIR OR NOT NVRTC_LIB)
   message(
     FATAL_ERROR
-      "XQA build-time NVRTC JIT requires nvrtc.h and libnvrtc.so "
+      "Plugin build-time NVRTC JIT requires nvrtc.h and libnvrtc.so "
       "or libnvrtc_static.a. "
       "Set NVRTC_ROOT_DIR or CUDA_DIR/CUDA_TARGET_DIR to a CUDA Toolkit with NVRTC."
   )
 endif()
 
-message(STATUS "XQA NVRTC JIT ENABLED (${NVRTC_LIB_TYPE}): ${NVRTC_LIB}")
+message(STATUS "Plugin NVRTC JIT ENABLED (${NVRTC_LIB_TYPE}): ${NVRTC_LIB}")

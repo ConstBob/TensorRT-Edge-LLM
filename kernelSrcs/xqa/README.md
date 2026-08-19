@@ -12,14 +12,14 @@ Do not check generated XQA cubin blobs into the source tree.
 
 ## Source Embedding
 
-`gen_cpp_header.py` bakes the XQA sources, the two project headers they include
+`kernelSrcs/jit_utils/gen_cpp_header.py` bakes the XQA sources, the two project headers they include
 (`common/cudaMacros.h`, `kernels/decodeAttentionKernels/xqaKernelTypes.h`) and
 the CUDA toolkit headers they reach into a single generated
-`xqaEmbeddedSources.cpp`. Every file is handed to `nvrtcCreateProgram` as a
+`pluginJitEmbeddedSources.cpp`. Every file is handed to `nvrtcCreateProgram` as a
 virtual header, so NVRTC compilation never touches the filesystem.
 
-CMake drives the script through the `generateXqaEmbeddedSources` target -- do
-not invoke it by hand and do not check the generated `.cpp` in. Its module
+CMake drives the script through the `generatePluginJitEmbeddedSources` target --
+do not invoke it by hand and do not check the generated `.cpp` in. Its module
 docstring calls out the two parts that are load-bearing.
 
 If a new XQA configuration reaches a CUDA header that is not yet embedded, NVRTC
