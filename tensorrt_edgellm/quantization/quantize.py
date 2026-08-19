@@ -414,6 +414,58 @@ def _mtp_num_hidden_layers(model: torch.nn.Module) -> int:
     return int(getattr(text_config, "mtp_num_hidden_layers", 0) or 0)
 
 
+def _has_mtp_weights(model_dir: str) -> Optional[bool]:
+    """Whether *model_dir* ships ``mtp.*`` draft tensors, or None if unknowable.
+
+    ``mtp_num_hidden_layers`` describes the architecture, not the file: an Omni
+    checkpoint can declare the head and ship none of its weights. Quantizing on
+    the config alone would then calibrate a randomly initialised draft.
+
+    None means the tensor names could not be read at all — no safetensors in the
+    directory. That is not the same as "no MTP": the weights may arrive by some
+    other route (a caller that patches loading, a non-safetensors format), so
+    callers must not treat it as absence.
+    """
+    index = os.path.join(model_dir, "model.safetensors.index.json")
+    if os.path.isfile(index):
+        with open(index, encoding="utf-8") as f:
+            keys = json.load(f).get("weight_map", {})
+        return any(".mtp." in k or k.startswith("mtp.") for k in keys)
+
+    single = os.path.join(model_dir, "model.safetensors")
+    if os.path.isfile(single):
+        from safetensors import safe_open
+        with safe_open(single, framework="pt") as f:
+            return any(".mtp." in k or k.startswith("mtp.") for k in f.keys())
+    return None
+
+
+def _resolve_mtp_dir(mtp_draft_dir: Optional[str],
+                     model_dir: str) -> Optional[str]:
+    """Return the directory holding the MTP weights, or None to skip.
+
+    An explicit ``--mtp_draft_dir`` is the caller asserting the weights are
+    there, so a missing head is a user error and raises. Falling back to
+    *model_dir* only means the config declared a head, which checkpoints do
+    without shipping one, so that case skips with a diagnostic instead.
+    """
+    mtp_dir = mtp_draft_dir or model_dir
+    present = _has_mtp_weights(mtp_dir)
+    if mtp_draft_dir is not None:
+        # The caller named this directory, so anything short of a confirmed
+        # ``mtp.*`` set — including an unreadable or mistyped path — is theirs
+        # to fix.
+        if present:
+            return mtp_dir
+        raise ValueError(
+            f"--mtp_draft_dir: {mtp_dir} ships no readable 'mtp.*' weights")
+    if present is False:
+        print(f"Skipping MTP quantization: {mtp_dir} declares an MTP head "
+              "but ships no 'mtp.*' weights.")
+        return None
+    return mtp_dir
+
+
 def _calibrate(model, dataloader):
     """Forward-loop calibration pass."""
     for data in tqdm(dataloader, desc="Calibrating"):
@@ -759,6 +811,7 @@ def quantize_and_export(
     dtype: str = "fp16",
     device: str = "cuda",
     *,
+    mtp_draft_dir: Optional[str] = None,
     text_dataset: Union[str, TextDataset, None] = None,
     image_dataset: Union[str, ImageDataset, None] = None,
     audio_dataset: Union[str, AudioDataset, None] = None,
@@ -840,6 +893,7 @@ def quantize_and_export(
         return quantize_and_export_omni(
             model_dir=model_dir,
             output_dir=output_dir,
+            mtp_draft_dir=mtp_draft_dir,
             quantization=quantization,
             lm_head_quantization=lm_head_quantization,
             kv_cache_quantization=kv_cache_quantization,
@@ -867,17 +921,21 @@ def quantize_and_export(
     mtp_layers = _mtp_num_hidden_layers(model)
     mtp_quantized = False
     mtp_state_dict: dict[str, torch.Tensor] = {}
+    mtp_dir = None
     if (mtp_layers > 0 and quantization is not None
             and not base_already_quantized):
+        mtp_dir = _resolve_mtp_dir(mtp_draft_dir, model_dir)
+    if mtp_dir is not None:
         text_ds = resolve_dataset(text_dataset, "text")
         from .models.mtp_draft import (export_quantized_mtp_state_dict,
                                        quantize_mtp_from_base)
-        print(f"Detected {mtp_layers} MTP layer(s); quantizing MTP draft "
-              "before base model.")
+
+        print(f"Detected {mtp_layers} MTP layer(s); quantizing MTP "
+              f"draft (weights from {mtp_dir}) before base model.")
         quantized_mtp_draft = quantize_mtp_from_base(
             base_model=model,
             tokenizer=tokenizer,
-            model_dir=model_dir,
+            model_dir=mtp_dir,
             quantization=quantization,
             lm_head_quantization=lm_head_quantization,
             kv_cache_quantization=kv_cache_quantization,

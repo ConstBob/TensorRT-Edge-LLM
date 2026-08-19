@@ -2654,6 +2654,35 @@ def _stage_component_weight_index(model_dir: str, tmp_dir: str,
         json.dump({"weight_map": filtered}, f)
 
 
+def _sub_llm_has_quantized_weights(model_dir: str, key_prefix: str) -> bool:
+    """True if *model_dir* ships any quantized tensor under *key_prefix*.
+
+    NVFP4/FP8 linears carry a ``weight_scale`` sidecar; AWQ/GPTQ instead pack
+    the weight itself as ``qweight`` and carry no ``weight_scale``, so both
+    markers have to be checked or those sub-LLMs read as fully FP16. Reads the
+    safetensors index / shard headers only.
+    """
+    import glob
+    import struct
+    markers = (".weight_scale", ".qweight")
+
+    def _hit(keys) -> bool:
+        return any(
+            k.startswith(key_prefix) and k.endswith(markers) for k in keys)
+
+    index = os.path.join(model_dir, "model.safetensors.index.json")
+    if os.path.isfile(index):
+        with open(index) as f:
+            return _hit(json.load(f).get("weight_map", {}))
+    for sf in sorted(glob.glob(os.path.join(model_dir, "*.safetensors"))):
+        with open(sf, "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            hdr = json.loads(f.read(n))
+        if _hit(hdr):
+            return True
+    return False
+
+
 def _maybe_stage_hf_quant_config(model_dir: str, tmp_dir: str, key_prefix: str,
                                  key_remap) -> bool:
     """Rewrite ``hf_quant_config.json``'s ``exclude_modules`` for a sub-LLM.
@@ -2665,6 +2694,14 @@ def _maybe_stage_hf_quant_config(model_dir: str, tmp_dir: str, key_prefix: str,
     """
     hf_qc_src = os.path.join(model_dir, "hf_quant_config.json")
     if not os.path.isfile(hf_qc_src):
+        # Modelopt roots keep the quant metadata in config.json's
+        # ``quantization_config`` instead (exact module names, not a ``*``
+        # glob). A sub-LLM is fully FP16 iff it ships no quantized tensor, so
+        # detect that directly: no ``{key_prefix}*.weight_scale`` in the
+        # checkpoint means the inherited quantization_config must be dropped.
+        if key_prefix and not _sub_llm_has_quantized_weights(
+                model_dir, key_prefix):
+            return True
         return False
     if not key_prefix:
         # No sub-LLM namespace: the exclusion patterns already match the
@@ -2684,8 +2721,13 @@ def _maybe_stage_hf_quant_config(model_dir: str, tmp_dir: str, key_prefix: str,
             pat = pat[len(key_prefix):]
         elif pat.startswith(stripped_prefix):
             pat = pat[len(stripped_prefix):]
-        elif not ("*" in pat or pat == ""):
-            continue  # belongs to a different sub-LLM
+        elif not (pat.startswith("*") or pat == ""):
+            # A leading ``*`` makes the glob sub-LLM agnostic (e.g. ``*lm_head*``);
+            # anything else that is not our prefix names another sub-LLM. Testing
+            # for ``*`` anywhere would keep ``talker.…linear_attn*`` in the
+            # thinker's list, where prefix normalisation collapses it onto the
+            # thinker's own modules.
+            continue
         if key_remap is not None and pat:
             remapped = key_remap(pat)
             if remapped is not None:

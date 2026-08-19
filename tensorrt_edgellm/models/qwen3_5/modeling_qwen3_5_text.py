@@ -265,11 +265,11 @@ class GdnMixer(nn.Module):
         # 3. Split into Q, K, V and reshape to head dims
         query, key, value = mixed_qkv.split(
             [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-        query = query.reshape(batch_size, seq_len, self.num_k_heads,
-                              self.k_dim)
-        key = key.reshape(batch_size, seq_len, self.num_k_heads, self.k_dim)
-        value = value.reshape(batch_size, seq_len, self.num_v_heads,
-                              self.v_dim)
+        # Unflatten only the head dim: naming batch/seq_len here makes
+        # torch.export add a ``seq_len != 1`` guard and reject decode shapes.
+        query = query.unflatten(-1, (self.num_k_heads, self.k_dim))
+        key = key.unflatten(-1, (self.num_k_heads, self.k_dim))
+        value = value.unflatten(-1, (self.num_v_heads, self.v_dim))
 
         # 4. GDN plugin (handles g/beta, QK L2 norm, H/HV head mapping)
         A_log_f32 = self.A_log.to(torch.float32)
