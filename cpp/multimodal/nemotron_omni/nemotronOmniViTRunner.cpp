@@ -572,6 +572,43 @@ void NemotronOmniViTRunner::formatPatch(rt::imageUtils::ImageData const& image, 
     totalNumBlocks += curNumBlocks;
 }
 
+void NemotronOmniViTRunner::imagePreprocessTokenLengthsOnly(
+    rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages)
+{
+    mTotalNumBlocks = 0;
+    for (auto const& req : request.requests)
+    {
+        int64_t numImage = 0;
+        for (auto const& image : req.imageBuffers)
+        {
+            auto const [h, w] = image.doResize
+                ? imageUtils::computeBestBlockGridForResize(image.height, image.width, mConfig.minImageTokensPerImage,
+                      mConfig.maxImageTokensPerImage, mConfig.blockImageSizeH, mConfig.blockImageSizeW)
+                : std::make_tuple(image.height, image.width);
+            int64_t const mainBlocks = (h / mConfig.blockImageSizeH) * (w / mConfig.blockImageSizeW);
+            int64_t tokens = mainBlocks * mConfig.tokensPerBlock;
+            if (mainBlocks > 1)
+            {
+                tokens += mConfig.tokensPerBlock; // thumbnail
+                mTotalNumBlocks += mainBlocks + 1;
+            }
+            else
+            {
+                mTotalNumBlocks += mainBlocks;
+            }
+            imageTokenLengths.push_back(tokens);
+            ++numImage;
+        }
+        numImages.emplace_back(numImage);
+    }
+
+    if (mTotalNumBlocks > 0)
+    {
+        int64_t const totalImageTokens = mTotalNumBlocks * mConfig.tokensPerBlock;
+        check::check(mOutputEmbedding.reshape({totalImageTokens, mConfig.outHiddenSize}), "Tensor reshape failed");
+    }
+}
+
 void NemotronOmniViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
     std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages, cudaStream_t stream)
 {
@@ -1003,7 +1040,7 @@ void NemotronOmniViTRunner::textPreprocess(rt::LLMGenerationRequest const& reque
 
 bool NemotronOmniViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly)
+    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly, bool skipEncoderWork)
 {
     std::vector<int64_t> imageTokenLengths;
     std::vector<int64_t> numImages;
@@ -1018,9 +1055,14 @@ bool NemotronOmniViTRunner::preprocess(rt::LLMGenerationRequest const& request,
                 hasVideo |= image.isVideo;
             }
         }
+
         mRequestHasVideo = hasVideo;
 
-        if (hasVideo)
+        if (skipEncoderWork)
+        {
+            imagePreprocessTokenLengthsOnly(request, imageTokenLengths, numImages);
+        }
+        else if (hasVideo)
         {
             videoPreprocess(request, imageTokenLengths, numImages, stream);
         }
@@ -1050,6 +1092,7 @@ bool NemotronOmniViTRunner::preprocess(rt::LLMGenerationRequest const& request,
         return false;
     }
 
+    mLastMediaTokenLengths = imageTokenLengths;
     return true;
 }
 

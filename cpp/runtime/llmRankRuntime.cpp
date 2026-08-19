@@ -38,6 +38,7 @@
 #include "runtime/decoding/decoderRegistry.h"
 #include "runtime/decoding/decoderUtils.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "runtime/state/contextCache/blockHash.h"
 #include "runtime/state/contextCache/contextCacheCoordinator.h"
 #include "sampler/sampling.h"
 #include <algorithm>
@@ -50,6 +51,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -672,6 +674,15 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
         static_cast<size_t>(sharedContextMemorySize), static_cast<size_t>(baseContextMemorySize),
         static_cast<size_t>(strategyContextMemorySize), static_cast<size_t>(visionContextMemorySize),
         static_cast<size_t>(audioContextMemorySize), static_cast<size_t>(actionContextMemorySize));
+
+    // Encoder embedding cache — content-addressed GPU cache for ViT/audio encoder outputs.
+    if (mVisionRunner || mAudioRunner)
+    {
+        auto const budgetBytes = contextCacheConfig.encoderEmbeddingCacheBudgetBytes;
+        mEncoderEmbeddingCache = std::make_unique<EncoderEmbeddingCache>(budgetBytes);
+        LOG_INFO("Encoder embedding cache initialized with %zu MiB budget.",
+            static_cast<size_t>(budgetBytes / (1024 * 1024)));
+    }
 }
 
 void LLMRankRuntime::ensureLogprobsCapacity(int32_t logprobsRows, int32_t topK)
@@ -1772,34 +1783,202 @@ bool LLMRankRuntime::multiModalRuntimePreprocess(
     // Process audio inputs (if present)
     if (hasAudio && mAudioRunner)
     {
-        LOG_INFO("Processing audio inputs");
-        if (!mAudioRunner->preprocess(request, batchedInputIds, mTokenizer, mropeCosSinOut, stream))
+        bool audioCacheHit = false;
+        std::vector<Hash128> audioHashes;
+
+        if (mEncoderEmbeddingCache)
         {
-            LOG_ERROR("Audio preprocessing failed. This request cannot be handled.");
-            return false;
+            bool hashable = true;
+            for (auto const& req : request.requests)
+            {
+                for (auto const& audio : req.audioBuffers)
+                {
+                    if (audio.pcm && !audio.pcm->samples.empty())
+                    {
+                        auto const* rawPtr = reinterpret_cast<char const*>(audio.pcm->samples.data());
+                        size_t const rawBytes = audio.pcm->samples.size() * sizeof(float);
+                        audioHashes.push_back(hashOpaqueIdentity(std::string_view(rawPtr, rawBytes)));
+                    }
+                    else
+                    {
+                        hashable = false;
+                    }
+                }
+            }
+            if (!hashable)
+            {
+                audioHashes.clear();
+            }
         }
 
-        if (!mAudioRunner->infer(stream))
+        bool allHit = mEncoderEmbeddingCache && !audioHashes.empty();
+        std::vector<std::reference_wrapper<rt::Tensor const>> cachedAudio;
+        if (allHit)
         {
-            LOG_ERROR("Audio inference failed. This request cannot be handled.");
-            return false;
+            for (auto const& h : audioHashes)
+            {
+                auto r = mEncoderEmbeddingCache->lookup(h);
+                if (!r)
+                {
+                    allHit = false;
+                    break;
+                }
+                cachedAudio.push_back(std::cref(r->get()));
+            }
+        }
+
+        if (allHit)
+        {
+            LOG_INFO("Encoder embedding cache HIT for all %zu audio clips — skipping audio encoder execution",
+                audioHashes.size());
+            if (!mAudioRunner->preprocess(request, batchedInputIds, mTokenizer, mropeCosSinOut, stream, false, true))
+            {
+                LOG_ERROR("Audio text preprocessing failed on cache hit.");
+                return false;
+            }
+            rt::Tensor& output = mAudioRunner->getOutputEmbedding();
+            int64_t byteOffset = 0;
+            for (auto const& entry : cachedAudio)
+            {
+                int64_t const bytes = entry.get().getMemoryCapacity();
+                CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(output.rawPointer()) + byteOffset,
+                    entry.get().rawPointer(), bytes, cudaMemcpyDeviceToDevice, stream));
+                byteOffset += bytes;
+            }
+            audioCacheHit = true;
+        }
+
+        if (!audioCacheHit)
+        {
+            if (!mAudioRunner->preprocess(request, batchedInputIds, mTokenizer, mropeCosSinOut, stream))
+            {
+                LOG_ERROR("Audio preprocessing failed. This request cannot be handled.");
+                return false;
+            }
+
+            if (!mAudioRunner->infer(stream))
+            {
+                LOG_ERROR("Audio inference failed. This request cannot be handled.");
+                return false;
+            }
+
+            if (mEncoderEmbeddingCache && !audioHashes.empty())
+            {
+                rt::Tensor const& output = mAudioRunner->getOutputEmbedding();
+                auto const& tokenLengths = mAudioRunner->getLastMediaTokenLengths();
+                int64_t const hiddenSize = output.getShape()[1];
+                size_t const typeSize = rt::utils::getTypeSize(output.getDataType());
+                int64_t byteOffset = 0;
+                for (size_t i = 0; i < audioHashes.size(); ++i)
+                {
+                    int64_t const numTok = tokenLengths[i];
+                    mEncoderEmbeddingCache->storeSlice(audioHashes[i],
+                        static_cast<char const*>(output.rawPointer()) + byteOffset, numTok, hiddenSize,
+                        output.getDataType(), stream);
+                    byteOffset += numTok * hiddenSize * static_cast<int64_t>(typeSize);
+                }
+            }
         }
     }
 
     // Process vision inputs (if present)
     if (hasVision && mVisionRunner)
     {
-        LOG_INFO("Processing vision inputs");
-        if (!mVisionRunner->preprocess(request, batchedInputIds, mTokenizer, mropeCosSinOut, stream))
+        bool visionCacheHit = false;
+        std::vector<Hash128> imageHashes;
+
+        if (mEncoderEmbeddingCache)
         {
-            LOG_ERROR("Vision preprocessing failed. This request cannot be handled.");
-            return false;
+            bool hashable = true;
+            for (auto const& req : request.requests)
+            {
+                for (auto const& img : req.imageBuffers)
+                {
+                    if (img.buffer && !img.buffer->isEmpty())
+                    {
+                        auto const* rawPtr = reinterpret_cast<char const*>(img.data());
+                        size_t const rawBytes = static_cast<size_t>(img.bytesPerFrame()) * img.frames;
+                        imageHashes.push_back(hashOpaqueIdentity(std::string_view(rawPtr, rawBytes)));
+                    }
+                    else
+                    {
+                        hashable = false;
+                    }
+                }
+            }
+            if (!hashable)
+            {
+                imageHashes.clear();
+            }
         }
 
-        if (!mVisionRunner->infer(stream))
+        bool allHit = mEncoderEmbeddingCache && !imageHashes.empty();
+        std::vector<std::reference_wrapper<rt::Tensor const>> cachedVision;
+        if (allHit)
         {
-            LOG_ERROR("Vision inference failed. This request cannot be handled.");
-            return false;
+            for (auto const& h : imageHashes)
+            {
+                auto r = mEncoderEmbeddingCache->lookup(h);
+                if (!r)
+                {
+                    allHit = false;
+                    break;
+                }
+                cachedVision.push_back(std::cref(r->get()));
+            }
+        }
+
+        if (allHit)
+        {
+            LOG_INFO(
+                "Encoder embedding cache HIT for all %zu images — skipping ViT encoder execution", imageHashes.size());
+            if (!mVisionRunner->preprocess(request, batchedInputIds, mTokenizer, mropeCosSinOut, stream, false, true))
+            {
+                LOG_ERROR("Vision text preprocessing failed on cache hit.");
+                return false;
+            }
+            rt::Tensor& output = mVisionRunner->getOutputEmbedding();
+            int64_t byteOffset = 0;
+            for (auto const& entry : cachedVision)
+            {
+                int64_t const bytes = entry.get().getMemoryCapacity();
+                CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(output.rawPointer()) + byteOffset,
+                    entry.get().rawPointer(), bytes, cudaMemcpyDeviceToDevice, stream));
+                byteOffset += bytes;
+            }
+            visionCacheHit = true;
+        }
+
+        if (!visionCacheHit)
+        {
+            if (!mVisionRunner->preprocess(request, batchedInputIds, mTokenizer, mropeCosSinOut, stream))
+            {
+                LOG_ERROR("Vision preprocessing failed. This request cannot be handled.");
+                return false;
+            }
+
+            if (!mVisionRunner->infer(stream))
+            {
+                LOG_ERROR("Vision inference failed. This request cannot be handled.");
+                return false;
+            }
+
+            if (mEncoderEmbeddingCache && !imageHashes.empty())
+            {
+                rt::Tensor const& output = mVisionRunner->getOutputEmbedding();
+                auto const& tokenLengths = mVisionRunner->getLastMediaTokenLengths();
+                int64_t const hiddenSize = output.getShape()[1];
+                size_t const typeSize = rt::utils::getTypeSize(output.getDataType());
+                int64_t byteOffset = 0;
+                for (size_t i = 0; i < imageHashes.size(); ++i)
+                {
+                    int64_t const numTok = tokenLengths[i];
+                    mEncoderEmbeddingCache->storeSlice(imageHashes[i],
+                        static_cast<char const*>(output.rawPointer()) + byteOffset, numTok, hiddenSize,
+                        output.getDataType(), stream);
+                    byteOffset += numTok * hiddenSize * static_cast<int64_t>(typeSize);
+                }
+            }
         }
     }
 

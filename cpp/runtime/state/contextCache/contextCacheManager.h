@@ -202,6 +202,10 @@ public:
     //! coherent draft path through the (exactLength - 1) boundary. The caller must make snapshot writes terminal first.
     PublishResult publishHybridMtp(CacheRequestLease& lease, HybridPublishRequest const& request);
 
+    //! Acquire resources for an externally-constructed reuse plan. The caller may trim or adjust the plan (e.g. media
+    //! boundary trimming) before committing it to lease allocation.
+    AcquireResult acquire(ReusePlan plan);
+
     ResourcePools const& pools() const noexcept;
     BaseBlockIndex const& baseIndex() const noexcept;
     SpecStateIndex const& specIndex() const noexcept;
@@ -214,7 +218,6 @@ private:
     struct PreparedPublication;
 
     void releaseLease(CacheRequestLease& lease) noexcept;
-    AcquireResult acquire(ReusePlan plan);
     bool growPages(CacheRequestLease& lease, ResourceDemand const& demand);
     PublishResult commitPreparedPublication(PreparedPublication publication);
     void evictRecord(RecordId id);

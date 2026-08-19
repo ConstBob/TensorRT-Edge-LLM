@@ -855,7 +855,7 @@ class TestConfig:
         ParameterSpec("max_kv_pool_pages",
                       "mxkvp",
                       {TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE},
-                      {ModelType.LLM},
+                      {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("audio_precision",
                       "aud", {
@@ -885,15 +885,15 @@ class TestConfig:
                       is_required=False),
         ParameterSpec("context_reuse",
                       "ctxreuse", {TaskType.E2E_BENCH, TaskType.INFERENCE},
-                      {ModelType.LLM},
+                      {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("context_cache_recurrent_snapshot_pool_bytes",
                       "ccrsb", {TaskType.E2E_BENCH, TaskType.INFERENCE},
-                      {ModelType.LLM},
+                      {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("context_cache_partial_kv_snapshot_pool_bytes",
                       "ccpkvsb", {TaskType.E2E_BENCH, TaskType.INFERENCE},
-                      {ModelType.LLM},
+                      {ModelType.LLM, ModelType.VLM},
                       is_required=False),
 
         # Vocabulary reduction parameters
@@ -2413,6 +2413,8 @@ class TestConfig:
             "tests/test_cases/vlm_basic.json",
             "vlm_lora":
             "tests/test_cases/vlm_lora.json",
+            "vlm_context_reuse":
+            "tests/test_cases/vlm_context_reuse.json",
             "alpamayo_action_chat":
             f"{self.edgellm_data_dir}/updated_datasets/alpamayo_action_chat/input.json",
             "alpamayo_action_644":

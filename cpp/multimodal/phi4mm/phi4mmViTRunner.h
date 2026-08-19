@@ -77,7 +77,7 @@ public:
     //! \return True if preprocessing succeeded, false otherwise
     bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
         tokenizer::Tokenizer const* tokenizer, [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut,
-        cudaStream_t stream, bool imageOnly = false) override;
+        cudaStream_t stream, bool imageOnly = false, bool skipEncoderWork = false) override;
 
     //! \brief Run inference on the vision encoder and perform HD postprocess
     //! \param[in] stream CUDA stream for execution
@@ -106,6 +106,8 @@ private:
     void imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths,
         std::vector<int64_t>& numImages, std::vector<std::vector<std::vector<int64_t>>>& imagesBlockGridHW,
         cudaStream_t stream);
+    void imagePreprocessTokenLengthsOnly(rt::LLMGenerationRequest const& request,
+        std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages);
 
     //! \brief Preprocess text portion of the request
     //! \param[in] request LLM generation request

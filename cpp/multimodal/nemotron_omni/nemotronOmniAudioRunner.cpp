@@ -646,7 +646,8 @@ void NemotronOmniAudioRunner::textPreprocess(rt::LLMGenerationRequest const& req
 
 bool NemotronOmniAudioRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, [[maybe_unused]] bool imageOnly)
+    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, [[maybe_unused]] bool imageOnly,
+    [[maybe_unused]] bool skipEncoderWork)
 {
     std::vector<int64_t> audioTokenLengths;
 
@@ -676,6 +677,7 @@ bool NemotronOmniAudioRunner::preprocess(rt::LLMGenerationRequest const& request
         return false;
     }
 
+    mLastMediaTokenLengths = audioTokenLengths;
     return true;
 }
 

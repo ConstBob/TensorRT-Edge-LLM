@@ -61,7 +61,7 @@ public:
 
     bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
         tokenizer::Tokenizer const* tokenizer, [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut,
-        cudaStream_t stream, bool imageOnly = false) override;
+        cudaStream_t stream, bool imageOnly = false, bool skipEncoderWork = false) override;
 
     bool infer(cudaStream_t stream) noexcept override;
 
@@ -82,6 +82,10 @@ private:
 
     void imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<ImageGrid>& imageGrids,
         std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages, cudaStream_t stream);
+
+    //! \brief Compute token lengths from image dimensions without GPU pixel work.
+    void imagePreprocessTokenLengthsOnly(rt::LLMGenerationRequest const& request,
+        std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages);
 
     void textPreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchInputIds,
         std::vector<int64_t> const& numImages, std::vector<int64_t> const& imageTokenLengths,

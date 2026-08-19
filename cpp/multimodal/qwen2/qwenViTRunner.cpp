@@ -406,6 +406,35 @@ std::tuple<int64_t, int64_t> QwenViTRunner::getResizedImageSize(int64_t const /*
         mConfig.minImageTokensPerImage, mConfig.maxImageTokensPerImage, maxRatio);
 }
 
+void QwenViTRunner::imagePreprocessSpansOnly(
+    rt::LLMGenerationRequest const& request, std::vector<VisionSpan>& spans, std::vector<int64_t>& spansPerRequest)
+{
+    int64_t totalSeqLength = 0;
+    for (auto const& req : request.requests)
+    {
+        size_t const spansBefore = spans.size();
+        for (auto const& image : req.imageBuffers)
+        {
+            auto const meta = image.doResize
+                ? image.resizedMeta(
+                      std::get<0>(getResizedImageSize(image.frames, image.isVideo, image.height, image.width)),
+                      std::get<1>(getResizedImageSize(image.frames, image.isVideo, image.height, image.width)))
+                : image.resizedMeta(image.height, image.width);
+            auto const [seqLen, unused] = computeVisionSpans(meta, totalSeqLength, spans);
+            static_cast<void>(unused);
+            totalSeqLength += seqLen;
+        }
+        spansPerRequest.push_back(static_cast<int64_t>(spans.size() - spansBefore));
+    }
+
+    // Reshape output embedding so the cache memcpy has a valid destination.
+    if (totalSeqLength > 0)
+    {
+        int64_t const totalImageTokens = totalSeqLength / (mConfig.mergeSize * mConfig.mergeSize);
+        check::check(mOutputEmbedding.reshape({totalImageTokens, mConfig.outHiddenSize}), "Tensor reshape failed");
+    }
+}
+
 void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<VisionSpan>& spans,
     std::vector<int64_t>& spansPerRequest, cudaStream_t stream)
 {
@@ -718,14 +747,21 @@ void QwenViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
 
 bool QwenViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly)
+    rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly, bool skipEncoderWork)
 {
     std::vector<VisionSpan> spans; // per-request vision layout; lives only across this call
     std::vector<int64_t> spansPerRequest;
 
     try
     {
-        imagePreprocess(request, spans, spansPerRequest, stream);
+        if (skipEncoderWork)
+        {
+            imagePreprocessSpansOnly(request, spans, spansPerRequest);
+        }
+        else
+        {
+            imagePreprocess(request, spans, spansPerRequest, stream);
+        }
         if (!imageOnly)
         {
             if (!mropeCosSinOut.has_value())
@@ -754,6 +790,12 @@ bool QwenViTRunner::preprocess(rt::LLMGenerationRequest const& request,
         return false;
     }
 
+    mLastMediaTokenLengths.clear();
+    mLastMediaTokenLengths.reserve(spans.size());
+    for (auto const& s : spans)
+    {
+        mLastMediaTokenLengths.push_back(s.llm.numTokens);
+    }
     return true;
 }
 

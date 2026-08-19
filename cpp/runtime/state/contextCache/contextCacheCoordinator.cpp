@@ -23,6 +23,7 @@
 #include "common/tensor.h"
 #include "runtime/hybridCacheManager.h"
 #include "runtime/state/contextCache/hybridSnapshotStorage.h"
+#include "runtime/state/contextCache/reusePlan.h"
 #include "runtime/state/kvPageTable.h"
 
 #include <algorithm>
@@ -109,8 +110,8 @@ bool hasBlockIdentity(BlockKeyExtras const& extras) noexcept
         || extras.customEmbeddingDigest.has_value() || extras.isolationDigest.has_value();
 }
 
-std::vector<BlockHash> hashRequestFullBlocks(
-    int32_t const* tokens, size_t tokenCount, BlockKeyExtras const& extras, Hash128 const* perPositionMediaHash)
+std::vector<BlockHash> hashRequestFullBlocks(int32_t const* tokens, size_t tokenCount, BlockKeyExtras const& extras,
+    Hash128 const* perPositionMediaHash = nullptr)
 {
     if (!hasBlockIdentity(extras))
     {
@@ -166,60 +167,6 @@ BlockHash hashRequestExactPrefix(int32_t const* tokens, size_t tokenCount, Block
         ? (fullBlockHashes.empty() ? kCHAIN_ROOT : fullBlockHashes.back())
         : hashHybridCandidatePrefix(
               tokens, static_cast<int32_t>(tokenCount), fullBlockHashes, extras, perPositionMediaHash);
-}
-
-//! Trim trailing reused pages from a vanilla reuse plan when media tokens span across the reuse boundary.
-//!
-//! Without an encoder embedding cache, the runtime cannot slice cached ViT/audio embeddings to provide only the
-//! suffix portion. If the reuse boundary falls inside a contiguous media run, the suffix would contain media
-//! placeholders whose embedding indices don't start at zero in the full encoder output. This trims back until
-//! the boundary no longer splits a media run.
-void trimMediaBoundaryPages(ReusePlan& plan, Hash128 const* perPositionMediaHash, size_t tokenCount)
-{
-    if (perPositionMediaHash == nullptr || plan.basePageBindings.empty())
-    {
-        return;
-    }
-
-    int32_t const pageSize = kTOKENS_PER_PAGE;
-    Hash128 const kZERO{};
-
-    while (!plan.basePageBindings.empty())
-    {
-        int32_t const reuseLen = static_cast<int32_t>(plan.basePageBindings.size()) * pageSize;
-        // Check if the token at the reuse boundary (first suffix token) is a media token.
-        bool const suffixStartsWithMedia
-            = static_cast<size_t>(reuseLen) < tokenCount && perPositionMediaHash[reuseLen] != kZERO;
-        // Check if the last token of the last reused page is a media token.
-        bool const lastReusedIsMedia = reuseLen > 0 && perPositionMediaHash[reuseLen - 1] != kZERO;
-
-        if (suffixStartsWithMedia && lastReusedIsMedia)
-        {
-            // Media run spans across the reuse boundary — trim the last page.
-            plan.basePageBindings.pop_back();
-            plan.matchedBlockHashes.pop_back();
-        }
-        else
-        {
-            break;
-        }
-    }
-
-    // Update plan fields to reflect trimmed state.
-    int64_t const reusablePageCount = static_cast<int64_t>(plan.basePageBindings.size());
-    int64_t const totalInputPages
-        = (static_cast<int64_t>(tokenCount) + static_cast<int64_t>(pageSize) - 1) / static_cast<int64_t>(pageSize);
-    plan.reuseTokenLength = static_cast<int32_t>(reusablePageCount * static_cast<int64_t>(pageSize));
-    plan.matchedTokenLength = plan.reuseTokenLength;
-    plan.demand.baseKvPages = static_cast<int32_t>(totalInputPages - reusablePageCount);
-    if (plan.basePageBindings.empty())
-    {
-        plan.kind = ReusePlanKind::kNoReusablePrefix;
-    }
-    else
-    {
-        plan.kind = ReusePlanKind::kStandard;
-    }
 }
 
 int32_t pageCountForStateLength(int32_t stateLength)
@@ -281,6 +228,50 @@ private:
 };
 
 } // namespace
+
+void trimMediaBoundaryPages(ReusePlan& plan, Hash128 const* perPositionMediaHash, size_t tokenCount)
+{
+    if (perPositionMediaHash == nullptr || plan.basePageBindings.empty())
+    {
+        return;
+    }
+
+    int32_t const pageSize = kTOKENS_PER_PAGE;
+    Hash128 const kZERO{};
+
+    while (!plan.basePageBindings.empty())
+    {
+        int32_t const reuseLen = static_cast<int32_t>(plan.basePageBindings.size()) * pageSize;
+        bool const suffixStartsWithMedia
+            = static_cast<size_t>(reuseLen) < tokenCount && perPositionMediaHash[reuseLen] != kZERO;
+        bool const lastReusedIsMedia = reuseLen > 0 && perPositionMediaHash[reuseLen - 1] != kZERO;
+
+        if (suffixStartsWithMedia && lastReusedIsMedia)
+        {
+            plan.basePageBindings.pop_back();
+            plan.matchedBlockHashes.pop_back();
+        }
+        else
+        {
+            break;
+        }
+    }
+
+    int64_t const reusablePageCount = static_cast<int64_t>(plan.basePageBindings.size());
+    int64_t const totalInputPages
+        = (static_cast<int64_t>(tokenCount) + static_cast<int64_t>(pageSize) - 1) / static_cast<int64_t>(pageSize);
+    plan.reuseTokenLength = static_cast<int32_t>(reusablePageCount * static_cast<int64_t>(pageSize));
+    plan.matchedTokenLength = plan.reuseTokenLength;
+    plan.demand.baseKvPages = static_cast<int32_t>(totalInputPages - reusablePageCount);
+    if (plan.basePageBindings.empty())
+    {
+        plan.kind = ReusePlanKind::kNoReusablePrefix;
+    }
+    else
+    {
+        plan.kind = ReusePlanKind::kStandard;
+    }
+}
 
 struct ContextCacheCoordinator::RequestHandle::Impl
 {
@@ -1020,44 +1011,74 @@ ContextCacheCoordinator::AcquireSequenceResult ContextCacheCoordinator::acquireS
                     admission.tokenIds.data(), candidateLength, hashes, admission.keyExtras, mediaHashPtr)});
         }
     }
-    auto acquire = [&](ContextCacheLookupPolicy policy) {
+    int32_t const inputTokenCount = static_cast<int32_t>(admission.tokenIds.size());
+    // Speculative decoding uses acquireSpec which combines planning and resource acquisition in one call; handle it
+    // separately from the plan-then-acquire flow used by vanilla and hybrid paths.
+    bool const isSpecOnly = speculativeRequest && !mProfile.isHybrid();
+    auto makePlan = [&](ContextCacheLookupPolicy policy) {
         if (speculativeRequest && mProfile.isHybrid())
         {
             // Hybrid+MTP binds the base recurrent/attention path and the equally long coherent draft path at an exact
             // checkpoint. The candidate list is built identically to the hybrid branch above.
-            return mManager.acquireHybridMtp(
-                hybridCandidates, hashes, static_cast<int32_t>(admission.tokenIds.size()), policy);
+            return makeHybridMtpReusePlan(
+                hybridCandidates, hashes, inputTokenCount, kTOKENS_PER_PAGE, mManager.records(), policy);
         }
         if (usesCheckpointReuse())
         {
-            return mManager.acquireHybrid(hybridCandidates, hashes, static_cast<int32_t>(admission.tokenIds.size()),
-                deploymentHasAttention(), policy);
+            return makeHybridReusePlan(hybridCandidates, hashes, inputTokenCount, kTOKENS_PER_PAGE,
+                deploymentHasAttention(), mManager.records(), policy);
         }
-        if (speculativeRequest)
-        {
-            ELLM_CHECK(isSpecDeployment(), "Speculative cache planning requires a speculative deployment contract");
-            return mManager.acquireSpec(hashes, static_cast<int32_t>(admission.tokenIds.size()), policy);
-        }
-        return mManager.acquireVanilla(hashes, static_cast<int32_t>(admission.tokenIds.size()), policy);
+        return makeVanillaReusePlan(hashes, inputTokenCount, kTOKENS_PER_PAGE, mManager.baseIndex(), policy);
     };
 
-    AcquireResult acquired = acquire(lookupPolicy);
-    bool const cacheDerivedPlan
-        = acquired.plan.reuseTokenLength > 0 || acquired.plan.kind == ReusePlanKind::kFullInputRewind;
+    AcquireResult acquired;
     bool forcedCold = false;
-    if (acquired.status == AcquireStatus::kInsufficientCapacity && cacheDerivedPlan
-        && lookupPolicy == ContextCacheLookupPolicy::kUseCache)
+    if (isSpecOnly)
     {
-        acquired = acquire(ContextCacheLookupPolicy::kBypass);
-        forcedCold = true;
+        ELLM_CHECK(isSpecDeployment(), "Speculative cache planning requires a speculative deployment contract");
+        acquired = mManager.acquireSpec(hashes, static_cast<int32_t>(admission.tokenIds.size()), lookupPolicy);
+        bool const cacheDerivedPlan
+            = acquired.plan.reuseTokenLength > 0 || acquired.plan.kind == ReusePlanKind::kFullInputRewind;
+        if (acquired.status == AcquireStatus::kInsufficientCapacity && cacheDerivedPlan
+            && lookupPolicy == ContextCacheLookupPolicy::kUseCache)
+        {
+            acquired = mManager.acquireSpec(
+                hashes, static_cast<int32_t>(admission.tokenIds.size()), ContextCacheLookupPolicy::kBypass);
+            forcedCold = true;
+        }
     }
-
-    // When media-aware hashing is active, trim trailing reused pages that would split a contiguous media run
-    // across the reuse boundary. Without an encoder embedding cache, the runtime cannot supply correctly-offset
-    // embeddings for partial media context in the suffix.
-    if (!admission.perPositionMediaHash.empty() && acquired.plan.reuseTokenLength > 0)
+    else
     {
-        trimMediaBoundaryPages(acquired.plan, admission.perPositionMediaHash.data(), admission.tokenIds.size());
+        ReusePlan plan = makePlan(lookupPolicy);
+        LOG_INFO("Context cache lookup: %d matched pages, %d matched tokens, %zu total hashes, mediaHash=%s",
+            static_cast<int32_t>(plan.basePageBindings.size()), plan.matchedTokenLength, hashes.size(),
+            admission.perPositionMediaHash.empty() ? "empty" : "present");
+
+        // Trim trailing reused pages that would split a contiguous media run across the reuse boundary before
+        // acquiring resources, so the lease is allocated with the correct reduced binding set and demand.
+        if (!admission.perPositionMediaHash.empty() && plan.reuseTokenLength > 0)
+        {
+            int32_t const preTrimPages = static_cast<int32_t>(plan.basePageBindings.size());
+            trimMediaBoundaryPages(plan, admission.perPositionMediaHash.data(), admission.tokenIds.size());
+            int32_t const postTrimPages = static_cast<int32_t>(plan.basePageBindings.size());
+            if (preTrimPages != postTrimPages)
+            {
+                LOG_INFO("Context cache media trim: %d matched pages -> %d reusable pages (trimmed %d)", preTrimPages,
+                    postTrimPages, preTrimPages - postTrimPages);
+            }
+        }
+
+        acquired = mManager.acquire(std::move(plan));
+        bool const cacheDerivedPlan
+            = acquired.plan.reuseTokenLength > 0 || acquired.plan.kind == ReusePlanKind::kFullInputRewind;
+        if (acquired.status == AcquireStatus::kInsufficientCapacity && cacheDerivedPlan
+            && lookupPolicy == ContextCacheLookupPolicy::kUseCache)
+        {
+            ReusePlan coldPlan = makePlan(ContextCacheLookupPolicy::kBypass);
+            // No media trim needed on bypass — reuseTokenLength is 0 for a cold plan.
+            acquired = mManager.acquire(std::move(coldPlan));
+            forcedCold = true;
+        }
     }
 
     auto const planningEnd = std::chrono::steady_clock::now();
@@ -1127,6 +1148,9 @@ ContextCacheCoordinator::BeginRequestResult ContextCacheCoordinator::beginReques
         sequence.commonStateLength = acquired.plan.reuseTokenLength;
         request->sequences.push_back(std::move(sequence));
         prefillStarts.push_back(acquired.plan.reuseTokenLength);
+        LOG_INFO("Context cache: sequence %zu reuse %d/%zu tokens (%d pages)", request->sequences.size() - 1,
+            acquired.plan.reuseTokenLength, sequenceAdmission.tokenIds.size(),
+            acquired.plan.reuseTokenLength / kTOKENS_PER_PAGE);
         ++mMetrics.admittedSequences;
         mMetrics.mediaAwareSequences += static_cast<uint64_t>(!sequenceAdmission.perPositionMediaHash.empty());
         mMetrics.matchedTokens += static_cast<uint64_t>(acquired.plan.matchedTokenLength);

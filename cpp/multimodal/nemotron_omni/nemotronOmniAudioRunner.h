@@ -69,7 +69,7 @@ public:
     //! \return True if preprocessing succeeded, false otherwise
     bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
         tokenizer::Tokenizer const* tokenizer, [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut,
-        cudaStream_t stream, bool imageOnly = false) override;
+        cudaStream_t stream, bool imageOnly = false, bool skipEncoderWork = false) override;
 
     //! \brief Run inference on the audio encoder
     //! \param[in] stream CUDA stream for execution

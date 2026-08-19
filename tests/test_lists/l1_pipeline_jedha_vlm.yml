@@ -51,6 +51,9 @@ tests:
   - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Qwen3-VL-4B-Instruct-fp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280]
   - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-4B-Instruct-fp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mmmu_pro_4-bs1]
   - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-4B-Instruct-fp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs1]
+  # Qwen3-VL-4B-Instruct - fp8 + media-aware context cache
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Qwen3-VL-4B-Instruct-fp8-mxsl8192-mxbs1-mxil7168-mnit128-mxit6400-mxpiit1280-mxkvp256]
+  - tests/defs/test_vlm_context_cache.py::TestVLMContextCache::test_inference[Qwen3-VL-4B-Instruct-fp8-mxsl8192-mxbs1-mxil7168-mnit128-mxit6400-mxpiit1280-mxkvp256-ctxreuse-vlm_context_reuse]
   # Qwen3-VL-2B-Instruct - vocab reduction nvfp4
   - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Qwen3-VL-2B-Instruct-nvfp4-mxsl8192-rvs16384-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280]
   - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-2B-Instruct-nvfp4-mxsl8192-rvs16384-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs1]

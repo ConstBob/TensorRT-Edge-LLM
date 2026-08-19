@@ -348,6 +348,36 @@ void Gemma4ViTRunner::generatePoolingWeights(
     }
 }
 
+void Gemma4ViTRunner::imagePreprocessTokenLengthsOnly(
+    rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages)
+{
+    int64_t totalSoftTokens = 0;
+    for (auto const& req : request.requests)
+    {
+        int64_t numImage = 0;
+        for (auto const& image : req.imageBuffers)
+        {
+            auto [resizedHeight, resizedWidth] = image.doResize
+                ? rt::imageUtils::gemma4ResizeTarget(image.height, image.width, mConfig.maxImageTokensPerImage,
+                      mConfig.poolingKernelSize, mConfig.patchSize)
+                : std::make_tuple(image.height, image.width);
+            int64_t const patchHeight = resizedHeight / mConfig.patchSize;
+            int64_t const patchWidth = resizedWidth / mConfig.patchSize;
+            int64_t const softTokens
+                = (patchHeight * patchWidth) / (mConfig.poolingKernelSize * mConfig.poolingKernelSize);
+            imageTokenLengths.emplace_back(softTokens);
+            totalSoftTokens += softTokens;
+            ++numImage;
+        }
+        numImages.emplace_back(numImage);
+    }
+
+    if (totalSoftTokens > 0)
+    {
+        check::check(mOutputEmbedding.reshape({totalSoftTokens, mConfig.outHiddenSize}), "Tensor reshape failed");
+    }
+}
+
 void Gemma4ViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<ImageGrid>& imageGrids,
     std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages, cudaStream_t stream)
 {
@@ -526,7 +556,7 @@ void Gemma4ViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
 
 bool Gemma4ViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly)
+    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly, bool skipEncoderWork)
 {
     std::vector<ImageGrid> imageGrids;
     std::vector<int64_t> imageTokenLengths;
@@ -534,7 +564,14 @@ bool Gemma4ViTRunner::preprocess(rt::LLMGenerationRequest const& request,
 
     try
     {
-        imagePreprocess(request, imageGrids, imageTokenLengths, numImages, stream);
+        if (skipEncoderWork)
+        {
+            imagePreprocessTokenLengthsOnly(request, imageTokenLengths, numImages);
+        }
+        else
+        {
+            imagePreprocess(request, imageGrids, imageTokenLengths, numImages, stream);
+        }
         if (!imageOnly)
         {
             textPreprocess(request, batchedInputIds, numImages, imageTokenLengths, tokenizer);
@@ -557,6 +594,7 @@ bool Gemma4ViTRunner::preprocess(rt::LLMGenerationRequest const& request,
         return false;
     }
 
+    mLastMediaTokenLengths = imageTokenLengths;
     return true;
 }
 

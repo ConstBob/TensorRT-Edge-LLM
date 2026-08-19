@@ -300,6 +300,48 @@ void Phi4MMViTRunner::formatPatch(imageUtils::ImageData const& image, std::vecto
     totalNumBlocks += curNumBlocks;
 }
 
+void Phi4MMViTRunner::imagePreprocessTokenLengthsOnly(
+    rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages)
+{
+    int64_t totalNumBlocks = 0;
+    int64_t totalHBlocks = 0;
+    for (auto const& req : request.requests)
+    {
+        int64_t numImage = 0;
+        for (auto const& image : req.imageBuffers)
+        {
+            // Thumbnail (1 block)
+            int64_t const glbLen = mConfig.tokensPerSide * (mConfig.tokensPerSide + 1) + 1;
+            imageTokenLengths.push_back(glbLen);
+            ++numImage;
+            ++totalNumBlocks;
+
+            // Sub-crops
+            auto const [h, w] = image.doResize
+                ? imageUtils::computeBestBlockGridForResize(image.height, image.width, mConfig.minImageTokensPerImage,
+                      mConfig.maxImageTokensPerImage, mConfig.blockImageSizeH, mConfig.blockImageSizeW)
+                : std::make_tuple(image.height, image.width);
+            int64_t const hBlocks = h / mConfig.blockImageSizeH;
+            int64_t const wBlocks = w / mConfig.blockImageSizeW;
+            int64_t const subLen = mConfig.tokensPerSide * hBlocks * (mConfig.tokensPerSide * wBlocks + 1);
+            imageTokenLengths.back() += subLen;
+            totalNumBlocks += hBlocks * wBlocks;
+            totalHBlocks += hBlocks;
+        }
+        numImages.emplace_back(numImage);
+    }
+
+    if (totalNumBlocks > 0)
+    {
+        int64_t const totalImageTokens = totalNumBlocks * 256;
+        int64_t const imageCount = std::accumulate(numImages.begin(), numImages.end(), static_cast<int64_t>(0));
+        int64_t const glbExtraPerImage = mConfig.tokensPerSide + 1;
+        int64_t const conservativeExtra = mConfig.tokensPerSide * totalHBlocks + glbExtraPerImage * imageCount;
+        int64_t const totalOutTokens = totalImageTokens + conservativeExtra;
+        check::check(mOutputEmbedding.reshape({totalOutTokens, mConfig.outHiddenSize}), "mOutputEmbedding reshape");
+    }
+}
+
 void Phi4MMViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths,
     std::vector<int64_t>& numImages, std::vector<std::vector<std::vector<int64_t>>>& imagesBlockGridHW,
     cudaStream_t stream)
@@ -439,14 +481,21 @@ void Phi4MMViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
 
 bool Phi4MMViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly)
+    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly, bool skipEncoderWork)
 {
     std::vector<int64_t> imageTokenLengths;
     std::vector<int64_t> numImages;
     mImagesBlockGridHW.clear();
     try
     {
-        imagePreprocess(request, imageTokenLengths, numImages, mImagesBlockGridHW, stream);
+        if (skipEncoderWork)
+        {
+            imagePreprocessTokenLengthsOnly(request, imageTokenLengths, numImages);
+        }
+        else
+        {
+            imagePreprocess(request, imageTokenLengths, numImages, mImagesBlockGridHW, stream);
+        }
         if (!imageOnly)
         {
             textPreprocess(request, batchedInputIds, numImages, imageTokenLengths, tokenizer);
@@ -469,6 +518,7 @@ bool Phi4MMViTRunner::preprocess(rt::LLMGenerationRequest const& request,
         return false;
     }
 
+    mLastMediaTokenLengths = imageTokenLengths;
     return true;
 }
 

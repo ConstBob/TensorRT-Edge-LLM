@@ -96,6 +96,41 @@ def _read_context_reuse_profile(
     return reused_tokens
 
 
+def _check_vlm_context_reuse_profile(
+        config: TestConfig,
+        logger,
+        remote_config: Optional[RemoteConfig] = None) -> None:
+    """Validate media-aware context cache metrics against expected values."""
+    profile_path = _sync_remote_output_file(config.get_profile_json_file(),
+                                            remote_config, logger)
+    with open(profile_path, encoding='utf-8') as profile_file:
+        profile = json.load(profile_file)
+
+    with open(config.get_test_case_file(), encoding='utf-8') as tc_file:
+        expected = json.load(tc_file).get('expected_context_cache', {})
+
+    cc = profile.get('context_cache', {})
+    errors = []
+
+    if expected.get('media_aware_sequences') is not None:
+        actual = cc.get('media_aware_sequences', 0)
+        want = expected['media_aware_sequences']
+        if actual < want:
+            errors.append(
+                f"media_aware_sequences: got {actual}, want >= {want}")
+
+    if expected.get('hit_sequences') is not None:
+        actual = cc.get('hit_sequences', 0)
+        want = expected['hit_sequences']
+        if actual < want:
+            errors.append(f"hit_sequences: got {actual}, want >= {want}")
+
+    if errors:
+        raise RuntimeError(
+            "VLM context cache profile failed expectations:\n  " +
+            "\n  ".join(errors))
+
+
 def _check_context_reuse_cold_hit_equivalence(config: TestConfig) -> None:
     """Require the cold full prompt and prefix-reused full prompt to match."""
     with open(config.get_output_json_file(), encoding='utf-8') as output_file:
@@ -507,6 +542,8 @@ def execute_e2e_bench_test(
                 _check_context_reuse_cold_hit_equivalence(config)
             elif config.test_case == 'llm_spec_prefill_evict':
                 _check_spec_prefill_evict_equivalence(config)
+            elif config.test_case == 'vlm_context_reuse':
+                _check_vlm_context_reuse_profile(config, logger, remote_config)
             final_result['context_reuse_reused_tokens'] = (
                 _read_context_reuse_profile(config, logger, remote_config))
 
@@ -596,6 +633,8 @@ def execute_inference_test(
                 _check_context_reuse_cold_hit_equivalence(config)
             elif config.test_case == 'llm_spec_prefill_evict':
                 _check_spec_prefill_evict_equivalence(config)
+            elif config.test_case == 'vlm_context_reuse':
+                _check_vlm_context_reuse_profile(config, logger, remote_config)
             final_result['context_reuse_reused_tokens'] = (
                 _read_context_reuse_profile(config, logger, remote_config))
 

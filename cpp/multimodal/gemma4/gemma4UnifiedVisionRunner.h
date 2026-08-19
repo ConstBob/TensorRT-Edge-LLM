@@ -50,7 +50,7 @@ public:
 
     bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
         tokenizer::Tokenizer const* tokenizer, rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream,
-        bool imageOnly = false) override;
+        bool imageOnly = false, bool skipEncoderWork = false) override;
     bool infer(cudaStream_t stream) noexcept override;
     bool validateAndFillConfig(std::string const& engineDir) override;
     bool allocateBuffer(cudaStream_t stream) override;
@@ -60,6 +60,8 @@ private:
         std::vector<int64_t>& imageTokenLengths, cudaStream_t stream);
     void imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths,
         std::vector<int64_t>& imagesPerRequest, cudaStream_t stream);
+    void imagePreprocessTokenLengthsOnly(rt::LLMGenerationRequest const& request,
+        std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& imagesPerRequest);
     void textPreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
         std::vector<int64_t> const& imageTokenLengths, std::vector<int64_t> const& imagesPerRequest,
         tokenizer::Tokenizer const* tokenizer);

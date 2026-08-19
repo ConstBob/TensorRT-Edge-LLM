@@ -122,7 +122,7 @@ public:
     //! \throws std::runtime_error if sequence length is invalid, or a CUDA error occurs
     bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
         tokenizer::Tokenizer const* tokenizer, rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream,
-        bool imageOnly = false) override;
+        bool imageOnly = false, bool skipEncoderWork = false) override;
 
     //! \brief Encode the system prompt and generate ND-RoPE parameters for the system prompt for KVCache saving.
     //! \param[in] systemPrompt System prompt string
@@ -264,6 +264,11 @@ protected:
     //! \throws std::runtime_error if a CUDA error occurs
     void imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<VisionSpan>& spans,
         std::vector<int64_t>& spansPerRequest, cudaStream_t stream);
+
+    //! Compute vision spans (token layout metadata) without performing any GPU pixel work.
+    //! Used on embedding cache hit to provide text preprocessing with the correct span geometry.
+    void imagePreprocessSpansOnly(
+        rt::LLMGenerationRequest const& request, std::vector<VisionSpan>& spans, std::vector<int64_t>& spansPerRequest);
 
     QwenViTConfig mConfig{};              //!< Qwen-VL configuration
     rt::Tensor mVitInput{};               //!< Vision encoder input tensor
