@@ -1018,7 +1018,13 @@ class ModelConfig:
         num_global_kv_heads = int(
             llm_dict.get("num_global_key_value_heads", 0) or 0)
 
-        quant = _parse_quant(model_dir, llm_dict)
+        # Omni roots keep one ignore list for thinker + talker; scope it to the
+        # sub-model this config represents (talker/CP go through their own
+        # staged sub-config instead).
+        submodel_prefix = ""
+        if root.get("thinker_config") is not None and llm_dict is not root:
+            submodel_prefix = "thinker."
+        quant = _parse_quant(model_dir, llm_dict, submodel_prefix)
         raw_layer_types = _parse_raw_layer_types(llm_dict)
         layer_types = _parse_layer_types(llm_dict)
         attention_layer_types = _parse_attention_layer_types(
@@ -2175,7 +2181,9 @@ def _effective_excluded_modules(model_dir: str,
     return _with_gdn_fused_exclusions(normalized)
 
 
-def _detect_modelopt_unquantized_linears(model_dir: str) -> List[str]:
+def _detect_modelopt_unquantized_linears(model_dir: str,
+                                         submodel_prefix: str = ""
+                                         ) -> List[str]:
     """Return module_name strings of Linears the ModelOpt checkpoint left unquantized.
 
     A ModelOpt-quantized Linear stores both ``<name>.weight`` (packed) and
@@ -2208,6 +2216,12 @@ def _detect_modelopt_unquantized_linears(model_dir: str) -> List[str]:
     if not all_keys:
         return []
 
+    # Omni roots hold every sub-model's tensors. Restrict the scan, or another
+    # sub-model's unquantized Linears would be normalised onto this one's
+    # module names and silently unquantize them.
+    if submodel_prefix:
+        all_keys = [k for k in all_keys if k.startswith(submodel_prefix)]
+
     weight_modules = {
         k.rsplit(".", 1)[0]
         for k in all_keys if k.endswith(".weight")
@@ -2237,7 +2251,29 @@ def _detect_modelopt_unquantized_linears(model_dir: str) -> List[str]:
     return _with_gdn_fused_exclusions(sorted(excluded))
 
 
-def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
+def _scope_exclusions(patterns: List[str], submodel_prefix: str) -> List[str]:
+    """Keep only exclusions that apply to *submodel_prefix*, prefix stripped.
+
+    Omni roots share one ignore list across thinker/talker, and short-name
+    normalisation later drops both prefixes. A talker-scoped glob such as
+    ``talker.model.layers.0.mlp.shared_expert*`` would therefore also unquantize
+    the thinker's own shared_expert. A leading ``*`` marks a submodel-agnostic
+    glob and is kept as-is.
+    """
+    if not submodel_prefix:
+        return patterns
+    scoped = []
+    for pat in patterns:
+        if pat.startswith(submodel_prefix):
+            scoped.append(pat[len(submodel_prefix):])
+        elif pat.startswith("*") or pat == "":
+            scoped.append(pat)
+    return scoped
+
+
+def _parse_quant(model_dir: str,
+                 config: dict,
+                 submodel_prefix: str = "") -> QuantConfig:
     """Determine quantisation config from hf_quant_config.json or config.json.
 
     Checkpoint-provided W4A16 ``lm_head`` (``W4A16_NVFP4`` in
@@ -2257,10 +2293,11 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
             # then augment with submodules ModelOpt actually left unquantized
             # (false negatives — typically visual tower / audio encoder).
             excluded = _effective_excluded_modules(
-                model_dir, list(q.get("exclude_modules", [])))
-            excluded.extend(
-                m for m in _detect_modelopt_unquantized_linears(model_dir)
-                if m not in excluded)
+                model_dir,
+                _scope_exclusions(list(q.get("exclude_modules", [])),
+                                  submodel_prefix))
+            excluded.extend(m for m in _detect_modelopt_unquantized_linears(
+                model_dir, submodel_prefix) if m not in excluded)
             return QuantConfig(
                 quant_type=QUANT_INT4_AWQ_MODELOPT,
                 group_size=int(q.get("group_size", 128)),
@@ -2276,7 +2313,9 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
                 kv_cache_quant=_detect_llm_kv_cache_fp8(model_dir),
                 visual_mha_quant=_detect_visual_mha_fp8(model_dir),
                 excluded=_effective_excluded_modules(
-                    model_dir, list(q.get("exclude_modules", []))),
+                    model_dir,
+                    _scope_exclusions(list(q.get("exclude_modules", [])),
+                                      submodel_prefix)),
                 layer_overrides=layer_overrides,
                 is_mixed_precision=True,
             )
@@ -2285,10 +2324,11 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
         if qt == QUANT_MXFP8 and gs == 1:
             gs = 32  # MXFP8 default block_size
         excluded = _effective_excluded_modules(
-            model_dir, list(q.get("exclude_modules", [])))
-        excluded.extend(
-            m for m in _detect_modelopt_unquantized_linears(model_dir)
-            if m not in excluded)
+            model_dir,
+            _scope_exclusions(list(q.get("exclude_modules", [])),
+                              submodel_prefix))
+        excluded.extend(m for m in _detect_modelopt_unquantized_linears(
+            model_dir, submodel_prefix) if m not in excluded)
         return QuantConfig(
             quant_type=qt,
             group_size=gs,
@@ -2310,7 +2350,9 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
                 quant_type=QUANT_INT4_AWQ_MODELOPT,
                 group_size=int(qc.get("group_size", 128)),
                 excluded=_effective_excluded_modules(
-                    model_dir, list(qc.get("ignore", []))),
+                    model_dir,
+                    _scope_exclusions(list(qc.get("ignore", [])),
+                                      submodel_prefix)),
             )
         group_size = 1
         cg = qc.get("config_groups", {})
@@ -2333,8 +2375,10 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
             quant_type=quant_type,
             group_size=group_size,
             kv_cache_quant=kv_str,
-            excluded=_effective_excluded_modules(model_dir,
-                                                 list(qc.get("ignore", []))),
+            excluded=_effective_excluded_modules(
+                model_dir,
+                _scope_exclusions(list(qc.get("ignore", [])),
+                                  submodel_prefix)),
         )
 
     # quant_method == awq (column-packed int4 checkpoints)

@@ -560,6 +560,52 @@ tensor — acceptance collapses to ~1.44 and E2E runs slower than
 baseline. Teacher-forced hidden→lm_head agreement (~0.93 when healthy)
 is the quick sanity probe.
 
+#### MTP and the Talker on one Thinker engine (`accept_hidden_states`)
+
+The pitfall above is a collision, not just a mistake: the draft's contract
+is the post-norm hidden and the Talker's is `hidden_states[accept_hidden_layer]`
+(mid-stack, pre-norm), and an MTP base engine has only one `hidden_states`
+output to give. Serving both from one forward needs a second output, which
+is what `accept_hidden_states` is — the same pair HF exposes as
+`outputs.hidden_states[18]` and `[-1]`.
+
+| output | source | consumer |
+|---|---|---|
+| `hidden_states` | after all 28 layers **and** the final norm | MTP draft |
+| `accept_hidden_states` | layer 18's output, **before** the final norm | Talker |
+
+Emitted only when the export is an MTP base **and**
+`1 <= accept_hidden_layer <= min(num_hidden_layers, len(layer_types))`; the
+`min` matters because the backbone's capture loop is
+`zip(layers, layer_types)`, so bounding on `num_hidden_layers` alone would
+let a short `layer_types` pass the gate while the loop never captures — the
+two outputs would then alias the same tensor. A non-spec export is
+unaffected: it emits two outputs and `hidden_states` still carries the
+mid-stack tensor.
+
+Runtime binding (`state/pipelineIO.cpp`):
+
+```
+isSpecDecodeBase -> "hidden_states"        = baseHiddenStates   (draft reads)
+                    "accept_hidden_states" = outputHiddenStates (Talker reads)
+otherwise        -> "hidden_states"        = outputHiddenStates (Talker reads)
+```
+
+`outputHiddenStates` is always "the Talker's copy"; only the binding name
+changes. Wiring the Talker to `hidden_states` on a spec base hands it a
+post-final-norm tensor — degraded audio, no error. Allocation follows
+`mBaseExecutor->hasIOTensor(kAcceptHiddenStates)`: allocating regardless
+would make `outputHiddenStates.isEmpty()` stop meaning "nothing will fill
+this", and the Talker would read uninitialised device memory instead of
+failing. `llm_bench` must pass the same `hasIOTensor` result, because
+`TensorRegistry::bindAll` fails on any engine I/O missing from the map.
+
+Cost of the extra output, measured: 102.37 vs 103.06 tok/s (inside this
+board's ~9% run-to-run spread), TRT activation memory byte-identical. The
+only real charge is one `batch × max_input_len × hidden × 2 B` buffer
+(~16 MB at batch 1 / 4096), and only on a spec-base engine that also has a
+Talker.
+
 Measured on B100 (23A2.6B, NVFP4 Thinker). Acceptance rate is strongly
 prompt-dependent — it tracks how predictable the continuation is, not
 the language: on a 4-prompt mix the per-prompt rate ranged 2.02 (an
@@ -572,6 +618,80 @@ unchanged (358 vs 355 tok/s), i.e. the backbone did not regress; the
 acceptance delta lives entirely in the prompt spread and the draft
 implementation. Report acceptance as a range with the prompt set, not a
 single number.
+
+### Trap: `mtp_num_hidden_layers` describes the architecture, not the file
+
+0315 declares `mtp_num_hidden_layers=1` and ships **zero** `thinker.mtp.*`
+tensors. Gating MTP quantization on the config alone therefore enters the
+MTP path on a checkpoint that has no MTP weights, loads nothing, and
+calibrates a randomly initialised 1.35 B-parameter draft — which then gets
+quantized and written out as `thinker.mtp.*`. Nothing in the output marks it
+as garbage.
+
+Two independent gates are required, and both now apply:
+
+- `_mtp_num_hidden_layers(model.thinker) > 0` — the architecture declares a head
+- `_has_mtp_weights(mtp_dir)` — the checkpoint actually ships `mtp.*` tensors
+
+When the first passes and the second fails, the run prints
+`Skipping MTP quantization: <dir> declares an MTP head but ships no 'mtp.*'
+weights.` and continues with backbone quantization. Independently,
+`MtpDraftModel.from_pretrained` now **raises** if any weight outside
+`{embed_tokens, rotary_emb, lm_head}` stays unloaded, so an unrecognised
+checkpoint layout fails at load instead of at quality-review time. Those
+three are legitimately absent: `embed_tokens` is shared from the base,
+`rotary_emb` is computed, and Omni ships no `mtp.lm_head` (the draft borrows
+the base head at export, or `--lm_head_quantization` copies the real weights
+in later).
+
+Observed behaviour, current branch:
+
+```
+from_pretrained(0422) -> LOADED: 1353M params, expert0.gate_proj nonzero=True
+from_pretrained(0315) -> RuntimeError: MTP draft model has 785 unloaded weights
+```
+
+The already-shipped 0315 requant outputs predate this code path and were
+checked clean: `thinker.mtp.*` count is 0 in both `q35_0315_gdnq` and
+`q35_0315_lmq_nvfp4`, and the loader warning never fired in their logs.
+
+### Quantizing the MTP head and the Talker from 0422
+
+Neither flow has been executed end-to-end yet — the commands below follow
+from the code paths and from what the checkpoints are known to contain, and
+are **not** backed by a measured run. Treat them as the starting point, not as
+a validated recipe.
+
+**Ordering constraint.** The MTP draft calibrates against the Thinker's
+final post-norm hidden states, so it must be quantized **before** the Thinker
+backbone. `quantize_and_export_omni` already does this internally; it matters
+when composing flows by hand.
+
+**MTP.** The head lives in 0422 but calibration needs an *unquantized*
+Thinker, which only 0315 has. `--mtp_draft_dir` decouples the two:
+
+```bash
+tensorrt-edgellm-quantize llm \
+    --model_dir      $CKPT_0315 \
+    --mtp_draft_dir  $CKPT_0422 \
+    --output_dir     $OUT \
+    --quantization nvfp4 --num_samples 512 \
+    [--lm_head_quantization nvfp4]
+```
+
+`mtp_dir = mtp_draft_dir or model_dir`; dense-vs-MoE dispatch reads
+`num_experts` from the *draft* checkpoint's config, so the draft source
+decides the architecture even when it differs from the calibration base.
+
+**Talker.** 0422's Thinker is already NVFP4, which rules out the unified
+flow (it needs an unquantized backbone to calibrate against). The
+swap-in path: load 0315 (all BF16), replace its Talker with 0422's BF16
+Talker, append `*thinker.*` disable globs to `quant_cfg`, calibrate
+**text-only** with `zh_en_mixed`, `_export_submodel` the Talker, and merge
+the result back into 0422. Text-only is a workaround for the B100 venvs
+lacking a cu130-matched torchvision, not a quality choice — see
+*Talker NVFP4 calibration* above for why mixed-language coverage is
+mandatory either way.
 
 ### Next MoE recommended pipeline — Thinker read-through, Talker quantized
 

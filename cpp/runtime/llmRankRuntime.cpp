@@ -371,8 +371,8 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
     {
         mSharedResources
             = SharedResources::createForSpecDecode(mDeployment, mMaxRuntimeBatchSize, loraWeightsMap, stream);
-        mPipelineIO
-            = std::make_unique<PipelineIO>(PipelineIO::createForSpecDecode(mDeployment, mMaxRuntimeBatchSize, stream));
+        mPipelineIO = std::make_unique<PipelineIO>(PipelineIO::createForSpecDecode(
+            mDeployment, mMaxRuntimeBatchSize, stream, mBaseExecutor->hasIOTensor(binding_names::kAcceptHiddenStates)));
     }
     else
     {
@@ -1231,6 +1231,15 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
     // are reshaped to `{B, 1, H}` and overwritten by every decode iteration.
     if (outputThinkerEmbeddings)
     {
+        ELLM_CHECK(!mPipelineIO->outputHiddenStates.isEmpty(),
+            std::string("Thinker hidden-state capture requested but the base engine exposes no "
+                        "accept-layer output; re-export the thinker so it emits '")
+                + binding_names::kAcceptHiddenStates + "'.");
+        // -1 is the documented "use the post-norm output" sentinel and is fine,
+        // but 0 is the slot the input embeddings are written to just below, so
+        // it would silently clobber them.
+        ELLM_CHECK(
+            request.acceptHiddenLayer != 0, "acceptHiddenLayer 0 collides with the input-embeddings registry slot.");
         int32_t const prefillSequenceLength
             = *std::max_element(context.effectivePrefillLengths.begin(), context.effectivePrefillLengths.end());
         mPipelineIO->streamingPrefill.populateFromPrefill(mPipelineIO->inputsEmbeds, mPipelineIO->outputHiddenStates,

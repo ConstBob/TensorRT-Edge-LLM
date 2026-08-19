@@ -181,6 +181,21 @@ class Qwen3_5GatedAttention(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def _num_experts(config) -> int:
+    """Routed-expert count under whichever key the checkpoint family uses.
+
+    ``num_experts`` is an ``attribute_map`` alias for ``num_local_experts`` on
+    some HF configs, but not all of them declare the map — ``Qwen3OmniNextTextConfig``
+    ships an empty one — so reading a single key silently reports a sparse-MoE
+    head as dense. Mirrors the parsing in :mod:`tensorrt_edgellm.config`.
+    """
+    for key in ("num_experts", "num_local_experts"):
+        value = getattr(config, key, None)
+        if value:
+            return int(value)
+    return 0
+
+
 class MtpSparseMoeBlock(nn.Module):
     """Qwen3.5 sparse-MoE block used by the MTP calibration model."""
 
@@ -188,7 +203,7 @@ class MtpSparseMoeBlock(nn.Module):
         super().__init__()
         hidden_size = config.hidden_size
         intermediate_size = int(config.moe_intermediate_size)
-        self.num_experts = int(config.num_experts)
+        self.num_experts = _num_experts(config)
         self.top_k = int(config.num_experts_per_tok)
 
         if not 0 < self.top_k <= self.num_experts:
@@ -255,7 +270,7 @@ class MtpDecoderLayer(nn.Module):
                                                attention_scale)
         self.post_attention_layernorm = Qwen3_5RMSNorm(hidden_size,
                                                        eps=rms_norm_eps)
-        if int(getattr(config, "num_experts", 0) or 0) > 0:
+        if _num_experts(config) > 0:
             self.mlp = MtpSparseMoeBlock(config)
         else:
             self.mlp = SwiGLUMLP(hidden_size, config.intermediate_size)
@@ -357,6 +372,11 @@ class MtpDraftModel(nn.Module):
         checkpoint's ``lm_head.weight`` (or tied from ``embed_tokens``).
         """
         config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+        # Descend to the text config that declares the MTP head: Omni nests it
+        # under ``thinker_config.text_config``; other multimodal models expose
+        # a direct ``text_config``; plain LLMs are already at that level.
+        if hasattr(config, "thinker_config"):
+            config = config.thinker_config
         if hasattr(config, "text_config"):
             config = config.text_config
         model = cls(config)
@@ -365,9 +385,12 @@ class MtpDraftModel(nn.Module):
         for sf_path in sorted(Path(model_dir).glob("*.safetensors")):
             with safe_open(str(sf_path), framework="pt", device=device) as f:
                 for key in f.keys():
-                    if key.startswith("mtp."):
-                        new_key = key[len("mtp."):]
-                        mtp_state_dict[new_key] = f.get_tensor(key)
+                    # Standalone LLMs store the head as ``mtp.*``; Omni
+                    # checkpoints nest it under the Thinker (``thinker.mtp.*``).
+                    prefix = next((p for p in ("mtp.", "thinker.mtp.")
+                                   if key.startswith(p)), None)
+                    if prefix is not None:
+                        mtp_state_dict[key[len(prefix):]] = f.get_tensor(key)
                     elif key == "lm_head.weight":
                         mtp_state_dict["lm_head.weight"] = f.get_tensor(key)
                     elif key in ("model.embed_tokens.weight",
@@ -386,7 +409,12 @@ class MtpDraftModel(nn.Module):
 
         missing, unexpected = model.load_state_dict(mtp_state_dict,
                                                     strict=False)
-        real_missing = [k for k in missing if not k.startswith("rotary_emb")]
+        # Omni checkpoints ship no ``mtp.lm_head``: the draft borrows the
+        # base head at export, or --lm_head_quantization copies it in.
+        expected_absent = ("rotary_emb", "lm_head")
+        real_missing = [
+            k for k in missing if not k.startswith(expected_absent)
+        ]
         if real_missing:
             raise RuntimeError(
                 f"MTP draft has {len(real_missing)} unloaded weight(s); "
@@ -486,9 +514,22 @@ def quantize_mtp_from_base(
 
     _share_embed_tokens(base_model, mtp_draft)
 
+    # Omni checkpoints ship no ``mtp.lm_head``, so the draft's copy is still at
+    # its random init here. Quantizing that would calibrate on noise; the real
+    # head is the base's, which the draft borrows at export anyway.
+    if lm_head_quantization is not None:
+        base_lm = getattr(base_model, "lm_head", None) or getattr(
+            getattr(base_model, "model", None), "lm_head", None)
+        if base_lm is not None and hasattr(mtp_draft, "lm_head"):
+            with torch.no_grad():
+                mtp_draft.lm_head.weight.copy_(
+                    base_lm.weight.to(mtp_draft.lm_head.weight))
+            print("Loaded base LM head into the MTP draft for quantization.")
+
     quant_cfg = build_quant_config(quantization, lm_head_quantization,
                                    kv_cache_quantization)
-    if isinstance(mtp_draft.layers[0].mlp, MtpSparseMoeBlock):
+    is_moe = isinstance(mtp_draft.layers[0].mlp, MtpSparseMoeBlock)
+    if is_moe:
         quant_cfg["quant_cfg"].extend({
             "quantizer_name": pattern,
             "enable": False,
@@ -516,6 +557,16 @@ def quantize_mtp_from_base(
             draft(data, last_hidden)
 
     mtq.quantize(mtp_draft, quant_cfg, forward_loop=_calib)
+
+    if is_moe:
+        # Top-k routing leaves un-fired experts without a calibration amax, and
+        # NVFP4 export reads weight_scale_2 from it; derive one from the weights.
+        from ..qwen3_omni import _backfill_missing_amax
+        n_filled = _backfill_missing_amax(mtp_draft)
+        if n_filled:
+            print(f"Backfilled {n_filled} MTP amax buffer(s) from weights "
+                  "(top-k routing left them uncalibrated).")
+
     mtq.print_quant_summary(mtp_draft)
     return mtp_draft
 

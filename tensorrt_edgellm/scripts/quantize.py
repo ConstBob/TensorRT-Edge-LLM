@@ -139,6 +139,15 @@ def main():
               "in_proj_b/in_proj_a projections (disabled by stock ModelOpt "
               ">=0.45 configs) and share in_proj_qkv's per-tensor scales so "
               "export fuses qkv/z/b/a into a single NVFP4 GEMM."))
+    llm_parser.add_argument(
+        "--mtp_draft_dir",
+        default=None,
+        help=
+        ("Optional separate checkpoint providing the MTP draft weights "
+         "(``mtp.*``). Use when the MTP head lives in a different checkpoint "
+         "than the calibration base -- e.g. a BF16 base that can run the "
+         "forward pass plus a checkpoint that carries the MTP weights. "
+         "Defaults to --model_dir (MTP embedded in the base)."))
     _add_common_args(llm_parser)
 
     draft_parser = sub.add_parser(
@@ -153,6 +162,7 @@ def main():
         from ..quantization.quantize import quantize_and_export
         quantize_and_export(
             model_dir=args.model_dir,
+            mtp_draft_dir=args.mtp_draft_dir,
             output_dir=args.output_dir,
             quantization=args.quantization,
             lm_head_quantization=args.lm_head_quantization,

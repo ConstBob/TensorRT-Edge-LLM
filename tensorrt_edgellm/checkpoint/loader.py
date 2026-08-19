@@ -54,6 +54,16 @@ __all__ = ["load_weights", "load_submodule_weights"]
 _FUSED_INPUT_CHANNEL_ATTRS = {"pre_quant_scale"}
 
 
+def _splits_unchanged(attr_suffix: str, tensor: torch.Tensor) -> bool:
+    """True when an attribute is invariant to an output-dim split.
+
+    Per-input-channel vectors (AWQ ``pre_quant_scale``) and per-tensor
+    scalars (NVFP4 ``weight_scale_2`` / ``input_scale``) carry no output
+    dimension, so both halves take the same tensor.
+    """
+    return attr_suffix in _FUSED_INPUT_CHANNEL_ATTRS or tensor.dim() == 0
+
+
 def _is_awq_prepacked_weight(tensor: torch.Tensor, attr_suffix: str,
                              expected_N: int) -> bool:
     """True when *tensor* is the AWQ ModelOpt prepacked ``weight`` buffer.
@@ -645,7 +655,7 @@ def _try_split_fused_tensor(model: nn.Module,
         per_head_qkvz = 2 * head_k_dim + 2 * head_v_dim * gqa
         expected_N = num_k_heads * per_head_qkvz
 
-        if attr_suffix in _FUSED_INPUT_CHANNEL_ATTRS:
+        if _splits_unchanged(attr_suffix, tensor):
             ok = _set_tensor(model,
                              f"{prefix}.linear_attn.in_proj_qkv.{attr_suffix}",
                              tensor,
@@ -730,7 +740,7 @@ def _try_split_fused_tensor(model: nn.Module,
         per_head_ba = 2 * gqa
         expected_N = num_k_heads * per_head_ba
 
-        if attr_suffix in _FUSED_INPUT_CHANNEL_ATTRS:
+        if _splits_unchanged(attr_suffix, tensor):
             ok = _set_tensor(model,
                              f"{prefix}.linear_attn.in_proj_b.{attr_suffix}",
                              tensor,
