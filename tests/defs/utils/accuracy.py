@@ -51,8 +51,8 @@ def check_accuracy_with_dataset(output_json_file,
 
     # Datasets that use correctness/accuracy (with "answer" field)
     CORRECTNESS_DATASETS = [
-        "mmlu_0", "mmlu_5", "mmlu_pro", "mmmu", "mmmu_pro_4", "mmmu_pro_10",
-        "mmmu_pro_vision", "OmniBench"
+        "mmlu_0", "mmlu_5", "mmlu_5_lite", "mmlu_pro", "mmmu", "mmmu_pro_4",
+        "mmmu_pro_10", "mmmu_pro_vision", "OmniBench"
     ]
 
     # Datasets that use WER (Word Error Rate) for ASR / LibriSpeech
@@ -83,6 +83,7 @@ def check_accuracy_with_dataset(output_json_file,
     ACCURACY_THRESHOLDS = {
         "mmlu_0": 0.30,  # 0-shot MMLU
         "mmlu_5": 0.35,  # 5-shot MMLU - expect better with examples
+        "mmlu_5_lite": 0.35,  # 5-shot MMLU Lite
         "mmlu_pro": 0.12,  # MMLU Pro - harder, lower threshold
         "mmmu": 0.30,  # Multimodal understanding
         "mmmu_pro_4": 0.30,  # MMMU Pro with 4 options

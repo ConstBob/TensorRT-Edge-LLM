@@ -46,7 +46,8 @@ from example_datasets.humaneval import convert_humaneval_dataset
 from example_datasets.librispeech import convert_librispeech_dataset
 from example_datasets.math500 import convert_math500_dataset
 from example_datasets.mmbench import convert_mmbench_dataset
-from example_datasets.mmlu import convert_mmlu_dataset
+from example_datasets.mmlu import (convert_mmlu_dataset,
+                                   create_mmlu_lite_dataset)
 from example_datasets.mmlu_pro import convert_mmlu_pro_dataset
 from example_datasets.mmmu import (convert_mmmu_dataset,
                                    convert_mmmu_pro_dataset)
@@ -79,6 +80,9 @@ DEFAULT_DATASETS = {
 # Datasets that require manual download — no HuggingFace auto-download.
 # Values are user-facing error messages with download instructions.
 LOCAL_ONLY_DATASETS = {
+    "MMLU_Lite":
+    ("MMLU_Lite requires --dataset_name_or_dir pointing to an existing "
+     "MMLU Full mmlu_dataset.json file."),
     "SeedTTSEval":
     ("SeedTTSEval requires --dataset_name_or_dir pointing to a .lst file "
      "(e.g. zh/meta.lst, en/meta.lst). Download from: "
@@ -94,6 +98,7 @@ DEFAULT_MAX_GENERATE_LENGTHS = {
     "LibriSpeech": 256,
     "MATH500": 512,
     "MMLU": 1,
+    "MMLU_Lite": 1,
     "MMLU_Pro": 1,
     "MMMU": 20,
     "MMMU_VLMEvalkit": 8192,
@@ -176,8 +181,8 @@ def main():
                         choices=[
                             "AIME", "COCO", "GSM8K", "HumanEval",
                             "LibriSpeech", "MATH500", "MMBench", "MMLU",
-                            "MMLU_Pro", "MMMU", "MMMU_VLMEvalkit", "MMMU_Pro",
-                            "MMStar", "MTBench", "SeedTTSEval",
+                            "MMLU_Lite", "MMLU_Pro", "MMMU", "MMMU_VLMEvalkit",
+                            "MMMU_Pro", "MMStar", "MTBench", "SeedTTSEval",
                             "MiniMaxMultilingual", "OmniBench"
                         ],
                         help="Dataset type to convert")
@@ -263,6 +268,14 @@ def main():
                         default=None,
                         required=False,
                         help="Limit number of samples for quick testing")
+    parser.add_argument(
+        "--lite_sample_count",
+        type=int,
+        default=2000,
+        required=False,
+        help=("Total rows for MMLU_Lite. Rows are selected as fixed "
+              "per-subject prefixes with deterministic remainder allocation "
+              "(default: 2000)."))
 
     parser.add_argument(
         "--disable_chat_template",
@@ -301,6 +314,14 @@ def main():
                                  dataset_name_or_dir=dataset_path,
                                  output_dir=args.output_dir,
                                  num_shot=args.num_shot)
+
+        elif args.dataset == "MMLU_Lite":
+            dataset_file, manifest_file = create_mmlu_lite_dataset(
+                input_file=dataset_path,
+                output_dir=args.output_dir,
+                sample_count=args.lite_sample_count)
+            print(f"Wrote Lite dataset to {dataset_file}")
+            print(f"Wrote reproducibility manifest to {manifest_file}")
 
         elif args.dataset == "MMLU_Pro":
             convert_mmlu_pro_dataset(config=config,

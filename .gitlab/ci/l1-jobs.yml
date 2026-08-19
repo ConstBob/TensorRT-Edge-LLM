@@ -43,6 +43,7 @@ l1_dataset_prep:
     - cd examples/accuracy/scripts
     # Text / multiple choice (LLM accuracy)
     - python prepare_dataset.py --dataset MMLU --output_dir "$DATA/MMLU_five_shot" --num_shot 5 2>&1 | tee "$TEST_LOG_DIR/mmlu_5.log"
+    - python prepare_dataset.py --dataset MMLU_Lite --dataset_name_or_dir "$DATA/MMLU_five_shot/mmlu_dataset.json" --output_dir "$DATA/MMLU_five_shot-lite" --lite_sample_count 2000 2>&1 | tee "$TEST_LOG_DIR/mmlu_5_lite.log"
     - python prepare_dataset.py --dataset MMLU --output_dir "$DATA/MMLU_zero_shot" --num_shot 0 2>&1 | tee "$TEST_LOG_DIR/mmlu_0.log"
     - python prepare_dataset.py --dataset MMLU_Pro --output_dir "$DATA/MMLU_Pro" --num_shot 5 2>&1 | tee "$TEST_LOG_DIR/mmlu_pro.log"
     - python prepare_dataset.py --dataset MTBench --output_dir "$DATA/updated_MTBench" 2>&1 | tee "$TEST_LOG_DIR/mtbench.log"
